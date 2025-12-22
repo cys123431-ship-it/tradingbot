@@ -1,0 +1,150 @@
+{
+    "api": {
+        "use_testnet": true,
+        "mainnet": {
+            "api_key": "YOUR_MAINNET_API_KEY",
+            "secret_key": "YOUR_MAINNET_SECRET_KEY"
+        },
+        "testnet": {
+            "api_key": "YOUR_TESTNET_API_KEY",
+            "secret_key": "YOUR_TESTNET_SECRET_KEY"
+        }
+    },
+    "telegram": {
+        "token": "YOUR_TELEGRAM_BOT_TOKEN",
+        "chat_id": "YOUR_TELEGRAM_CHAT_ID",
+        "reporting": {
+            "use_dashboard_mode": true,
+            "hourly_report_enabled": false
+        }
+    },
+    "system_settings": {
+        "active_engine": "signal",
+        "trade_direction": "both",
+        "monitoring_interval_seconds": 10,
+        "show_dashboard": true
+    },
+    "signal_engine": {
+        "watchlist": [
+            "ETH/USDT"
+        ],
+        "common_settings": {
+            "leverage": 5,
+            "timeframe": "8h",
+            "entry_timeframe": "8h",
+            "exit_timeframe": "6h",
+            "risk_per_trade_pct": 50.0,
+            "target_roe_pct": 50.0,
+            "stop_loss_pct": 25.0,
+            "daily_loss_limit": 10000.0,
+            "tp_sl_enabled": false,
+            "r2_entry_enabled": false,
+            "r2_exit_enabled": false,
+            "hurst_entry_enabled": false,
+            "hurst_exit_enabled": false,
+            "chop_entry_enabled": false,
+            "chop_exit_enabled": false,
+            "r2_threshold": 0.25,
+            "hurst_threshold": 0.55,
+            "chop_threshold": 50.0,
+            "scanner_enabled": false
+        },
+        "strategy_params": {
+            "active_strategy": "sma",
+            "entry_mode": "position",
+            "kalman_filter": {
+                "entry_enabled": false,
+                "exit_enabled": false,
+                "observation_covariance": 0.1,
+                "transition_covariance": 0.05
+            },
+            "Triple_SMA": {
+                "fast_sma": 3,
+                "slow_sma": 10
+            },
+            "HMA": {
+                "fast_period": 9,
+                "slow_period": 21
+            },
+            "MicroVBO": {
+                "atr_period": 14,
+                "breakout_multiplier": 0.5,
+                "tp_atr_multiplier": 1.0,
+                "sl_atr_multiplier": 0.5,
+                "volume_compare_periods": 5,
+                "description": "초단기 변동성 돌파 - ATR 기반 진입/청산"
+            },
+            "FractalFisher": {
+                "hurst_period": 100,
+                "hurst_threshold": 0.55,
+                "fisher_period": 10,
+                "fisher_long_threshold": -1.5,
+                "fisher_short_threshold": 1.5,
+                "atr_period": 14,
+                "atr_trailing_multiplier": 2.0,
+                "description": "Hurst 추세필터 + Fisher Transform 진입 + ATR Trailing Stop"
+            }
+        }
+    },
+    "shannon_engine": {
+        "target_symbol": "BTC/USDT",
+        "leverage": 5,
+        "timeframe": "8h",
+        "daily_loss_limit": 10000.0,
+        "asset_allocation": {
+            "target_ratio": 0.5,
+            "allowed_deviation_pct": 2.0
+        },
+        "trend_filter": {
+            "enabled": true,
+            "ema_period": 200,
+            "description": "200 EMA 위=롱만, 아래=숏만"
+        },
+        "atr_settings": {
+            "enabled": true,
+            "period": 14,
+            "grid_multiplier": 0.5,
+            "description": "ATR * multiplier = 그리드 간격"
+        },
+        "drawdown_protection": {
+            "enabled": true,
+            "threshold_pct": 3.0,
+            "reduction_factor": 0.5,
+            "description": "일일 손실 3% 도달 시 포지션 50% 축소"
+        },
+        "grid_trading": {
+            "enabled": true,
+            "grid_levels": 5,
+            "order_size_usdt": 450.0
+        },
+        "risk_monitor": {
+            "max_mmr_alert_pct": 25.0
+        }
+    },
+    "dual_thrust_engine": {
+        "target_symbol": "BTC/USDT",
+        "leverage": 5,
+        "timeframe": "4h",
+        "n_days": 4,
+        "k2": 0.5,
+        "stop_loss_pct": 5.0,
+        "daily_loss_limit": 10000.0,
+        "risk_per_trade_pct": 50.0,
+        "k1": 0.5
+    },
+    "dual_mode_engine": {
+        "target_symbol": "BTC/USDT",
+        "leverage": 5,
+        "mode": "standard",
+        "risk_per_trade_pct": 50.0,
+        "scalping_tf": "5m",
+        "standard_tf": "8h",
+        "stop_loss_pct": 10.0,
+        "daily_loss_limit": 10000.0,
+        "target_roe_pct": 20.0
+    },
+    "logging": {
+        "db_path": "trades_history.db",
+        "debug_mode": true
+    }
+}
