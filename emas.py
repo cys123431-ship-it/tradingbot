@@ -4431,23 +4431,24 @@ class MainController:
                                 entry_st = d.get('entry_filters', {})
                                 exit_st = d.get('exit_filters', {})
                                 
-                                def get_st_text(st_dict, cfg_key, val_key, pass_key, threshold):
-                                    if not f_cfg.get(cfg_key, {}).get('en_entry' if 'entry' in cfg_key else 'en_exit', False):
+                                def get_st_text(st_dict, cfg_key, val_key, pass_key, is_entry=True):
+                                    en_key = 'en_entry' if is_entry else 'en_exit'
+                                    if not f_cfg.get(cfg_key, {}).get(en_key, False):
                                         return "⚪"
                                     val = st_dict.get(val_key, 0.0)
-                                    if val == 0.0 and 'exit' in cfg_key: return "⏳"
+                                    if val == 0.0 and not is_entry: return "⏳"
                                     return "🟢" if st_dict.get(pass_key, False) else "🔴"
 
                                 # 필터 상태 한 줄 요약
                                 # Entry 필터들
-                                e_r2 = get_st_text(entry_st, 'r2', 'r2_val', 'r2_pass', 0)
-                                e_h = get_st_text(entry_st, 'hurst', 'hurst_val', 'hurst_pass', 0)
-                                e_c = get_st_text(entry_st, 'chop', 'chop_val', 'chop_pass', 0)
+                                e_r2 = get_st_text(entry_st, 'r2', 'r2_val', 'r2_pass', is_entry=True)
+                                e_h = get_st_text(entry_st, 'hurst', 'hurst_val', 'hurst_pass', is_entry=True)
+                                e_c = get_st_text(entry_st, 'chop', 'chop_val', 'chop_pass', is_entry=True)
                                 
                                 # Exit 필터들
-                                x_r2 = get_st_text(exit_st, 'r2', 'r2_val', 'r2_pass', 0)
-                                x_h = get_st_text(exit_st, 'hurst', 'hurst_val', 'hurst_pass', 0)
-                                x_c = get_st_text(exit_st, 'chop', 'chop_val', 'chop_pass', 0)
+                                x_r2 = get_st_text(exit_st, 'r2', 'r2_val', 'r2_pass', is_entry=False)
+                                x_h = get_st_text(exit_st, 'hurst', 'hurst_val', 'hurst_pass', is_entry=False)
+                                x_c = get_st_text(exit_st, 'chop', 'chop_val', 'chop_pass', is_entry=False)
                                 
                                 msg += f"└ In: R2{e_r2} H{e_h} C{e_c} | Out: R2{x_r2} H{x_h} C{x_c}\n"
                                 
