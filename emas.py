@@ -372,35 +372,55 @@ class BaseEngine:
             logger.error(f"Leverage setting error: {e}")
 
     async def get_server_position(self, symbol, use_cache=True):
-        """포지션 조회 (캐시 적용)"""
+        """포지션 조회 (심볼별 캐시 적용)"""
         now = time.time()
-        if use_cache and self.position_cache and (now - self.position_cache_time) < self.POSITION_CACHE_TTL:
-            return self.position_cache
+        
+        # [Fix] Lazy Init for Dictionary Cache (Backward Compatibility)
+        if not isinstance(self.position_cache, dict):
+            self.position_cache = {}
+
+        # Check Cache
+        if use_cache:
+            cache_entry = self.position_cache.get(symbol)
+            if cache_entry:
+                cached_pos, cached_ts = cache_entry
+                if (now - cached_ts) < self.POSITION_CACHE_TTL:
+                    return cached_pos
         
         try:
+            # fetch_positions는 모든 포지션을 가져올 수도 있고, params로 특정할 수도 있음
+            # exchange.fetch_positions([symbol]) 사용 권장
             positions = await asyncio.to_thread(self.exchange.fetch_positions, [symbol])
             
             # 심볼 정규화 (BTC/USDT -> BTCUSDT)
             base_symbol = symbol.replace('/', '')
             
+            found_pos = None
             for p in positions:
                 pos_symbol = p.get('symbol', '')
-                # 다양한 형식 매칭: BTC/USDT, BTC/USDT:USDT, BTCUSDT
+                # 다양한 형식 매칭
                 pos_base = pos_symbol.replace('/', '').replace(':USDT', '')
                 
                 if pos_base == base_symbol or pos_symbol == symbol or pos_symbol == f"{symbol}:USDT":
+                    # 수량 0 이상인 것만 유효 포지션으로 간주? 
+                    # fetch_positions는 보통 열려있는 것만 주거나, 0인 것도 줄 수 있음.
+                    # 여기선 contracts != 0 체크
                     if abs(float(p.get('contracts', 0))) > 0:
-                        self.position_cache = p
-                        self.position_cache_time = now
+                        found_pos = p
                         logger.debug(f"Position found: {p['symbol']} contracts={p['contracts']}")
-                        return p
+                        break
             
-            self.position_cache = None
-            self.position_cache_time = now
-            return None
+            # Update Cache (Key by Symbol)
+            self.position_cache[symbol] = (found_pos, now)
+            return found_pos
+
         except Exception as e:
             logger.error(f"Position fetch error: {e}")
-            return self.position_cache  # 에러 시 캐시 반환
+            # 에러 시 캐시가 있으면 반환, 없으면 None
+            cache_entry = self.position_cache.get(symbol)
+            if cache_entry:
+                return cache_entry[0]
+            return None
 
     async def get_balance_info(self):
         try:
