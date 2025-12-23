@@ -912,9 +912,9 @@ class SignalEngine(BaseEngine):
                 return
             
             current_price = float(ohlcv_p[-1][4])
-            
-            # Update Status
-            await self.check_status(symbol, current_price)
+        
+            # [Fix] Update Status and get local pos_side to avoid race condition
+            pos_side = await self.check_status(symbol, current_price)
             
             # 2. Check Primary TF (Entry Logic)
             last_closed_p = ohlcv_p[-2]
@@ -935,8 +935,6 @@ class SignalEngine(BaseEngine):
                 await self.process_primary_candle(symbol, k_p)
                 
             # 3. Check Exit TF (Exit Logic)
-            pos_side = self.ctrl.status_data.get('pos_side', 'NONE')
-            
             strategy_params = cfg.get('strategy_params', {})
             entry_mode = strategy_params.get('entry_mode', 'cross').lower()
             active_strategy = strategy_params.get('active_strategy', 'sma').lower()
@@ -953,10 +951,16 @@ class SignalEngine(BaseEngine):
                     if symbol not in self.last_processed_exit_candle_ts:
                         self.last_processed_exit_candle_ts[symbol] = 0
 
-                    if ts_e > self.last_processed_exit_candle_ts[symbol]:
-                        logger.info(f"🕯️ [Exit {exit_tf}] {symbol} New Candle: {ts_e} close={last_closed_e[4]}")
+                    # [Initial Sync] 만약 봇 재시작 등으로 아직 계산 기록이 없고 포지션이 있다면 즉시 1회 계산
+                    is_first_sync = (self.last_processed_exit_candle_ts[symbol] == 0)
+                    
+                    if ts_e > self.last_processed_exit_candle_ts[symbol] or is_first_sync:
+                        if is_first_sync:
+                            logger.info(f"🔄 [Initial Sync] {symbol} Position detected on restart, processing filters...")
+                        else:
+                            logger.info(f"🕯️ [Exit {exit_tf}] {symbol} New Candle: {ts_e} close={last_closed_e[4]}")
+                            
                         self.last_processed_exit_candle_ts[symbol] = ts_e
-                        
                         await self.process_exit_candle(symbol, exit_tf, pos_side)
 
         except Exception as e:
@@ -1083,7 +1087,7 @@ class SignalEngine(BaseEngine):
             entry_mode = strategy_params.get('entry_mode', 'cross').upper()
             
             # Cross/Position 모드에서는 Kalman 필터가 로직상 강제 사용되므로 상태 표시도 활성화 (SMA/HMA)
-            if active_strategy in ['SMA', 'HMA'] and entry_mode in ['CROSS', 'POSITION']:
+            if active_strategy in ['SMA', 'HMA'] and entry_mode in ['CROSS', 'POSITION']:\
                 kalman_enabled = True
             
             # MicroVBO State
@@ -1091,11 +1095,13 @@ class SignalEngine(BaseEngine):
             # FractalFisher State
             fisher_state = self.fisher_states.get(symbol, {})
             
-            self.ctrl.status_data = {
+            # [Fix] Multi-symbol Status Data
+            pos_side = pos['side'].upper() if pos else 'NONE'
+            symbol_status = {
                 'engine': 'Signal', 'symbol': symbol, 'price': price,
                 'total_equity': total, 'free_usdt': free, 'mmr': mmr,
                 'daily_count': count, 'daily_pnl': daily_pnl,
-                'pos_side': pos['side'].upper() if pos else 'NONE',
+                'pos_side': pos_side,
                 'entry_price': float(pos['entryPrice']) if pos else 0.0,
                 'coin_amt': float(pos['contracts']) if pos else 0.0,
                 'pnl_pct': float(pos['percentage']) if pos else 0.0,
@@ -1116,17 +1122,16 @@ class SignalEngine(BaseEngine):
                 'fisher_entry_atr': fisher_state.get('entry_atr')
             }
             
-            # [New] Merge Last Filter Status (Persistence)
-            # Retrieve specific symbol status or empty dict
+            # Merge Last Filter Status (Persistence)
             entry_status = self.last_entry_filter_status.get(symbol, {})
             exit_status = self.last_exit_filter_status.get(symbol, {})
             
-            self.ctrl.status_data['entry_filters'] = entry_status
-            self.ctrl.status_data['exit_filters'] = exit_status
+            symbol_status['entry_filters'] = entry_status
+            symbol_status['exit_filters'] = exit_status
             
-            # [New] Real-time Filter Config (Read from current config)
+            # Real-time Filter Config
             comm_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
-            self.ctrl.status_data['filter_config'] = {
+            symbol_status['filter_config'] = {
                 'r2': {
                     'en_entry': comm_cfg.get('r2_entry_enabled', True), 
                     'en_exit': comm_cfg.get('r2_exit_enabled', True),
@@ -1142,15 +1147,18 @@ class SignalEngine(BaseEngine):
                     'en_exit': comm_cfg.get('chop_exit_enabled', True),
                     'th': comm_cfg.get('chop_threshold', 50.0)
                 },
-                # Add Kalman Config for display convenience
                 'kalman': {
                     'en_entry': strategy_params.get('kalman_filter', {}).get('entry_enabled', False),
                     'en_exit': strategy_params.get('kalman_filter', {}).get('exit_enabled', False)
                 }
             }
 
+            self.ctrl.status_data[symbol] = symbol_status
+            
             # MMR 경고 체크
             await self.check_mmr_alert(mmr)
+            
+            return pos_side
             
             if self.ctrl.is_paused or not pos:
                 return
@@ -2194,8 +2202,8 @@ class ShannonEngine(BaseEngine):
             diff = coin_val - (total * self.ratio)
             diff_pct = (diff / total * 100) if total > 0 else 0
 
-            # 상태 데이터 업데이트
-            self.ctrl.status_data = {
+            # 상태 데이터 업데이트 (Symbol Keyed)
+            self.ctrl.status_data[symbol] = {
                 'engine': 'Shannon', 'symbol': symbol, 'price': price,
                 'total_equity': total, 'free_usdt': free, 'mmr': mmr,
                 'daily_count': count, 'daily_pnl': daily_pnl,
@@ -2658,8 +2666,8 @@ class DualThrustEngine(BaseEngine):
             count, daily_pnl = self.db.get_daily_stats()
             pos = await self.get_server_position(symbol)
             
-            # 상태 데이터 업데이트
-            self.ctrl.status_data = {
+            # 상태 데이터 업데이트 (Symbol Keyed)
+            self.ctrl.status_data[symbol] = {
                 'engine': 'DualThrust', 'symbol': symbol, 'price': price,
                 'total_equity': total, 'free_usdt': free, 'mmr': mmr,
                 'daily_count': count, 'daily_pnl': daily_pnl,
@@ -3017,7 +3025,7 @@ class DualModeFractalEngine(BaseEngine):
         count, daily_pnl = self.db.get_daily_stats()
         pos = await self.get_server_position(symbol)
         
-        self.ctrl.status_data = {
+        self.ctrl.status_data[symbol] = {
             'engine': 'DualMode', 'symbol': symbol, 'price': price,
             'total_equity': total, 'free_usdt': free, 'mmr': mmr,
             'daily_count': count, 'daily_pnl': daily_pnl,
@@ -4381,262 +4389,91 @@ class MainController:
                     self.blink_state = not self.blink_state
                     blink = "🟢" if self.blink_state else "⚪"
                     pause_indicator = " ⏸" if self.is_paused else ""
-                    d = self.status_data
                     
-                    if not d:
-                        eng = self.cfg.get('system_settings', {}).get('active_engine', 'LOADING').upper()
-                        # 수동으로 상태 갱신 시도
-                        if self.active_engine:
-                            try:
-                                sym = self._get_current_symbol()
-                                total, free, mmr = await self.active_engine.get_balance_info()
-                                self.status_data = {
-                                    'engine': eng, 'symbol': sym, 'price': 0,
-                                    'total_equity': total, 'free_usdt': free, 'mmr': mmr,
-                                    'pos_side': 'NONE', 'daily_count': 0, 'daily_pnl': 0
-                                }
-                                d = self.status_data
-                            except Exception as e:
-                                logger.debug(f"Manual status fetch failed: {e}")
+                    all_data = self.status_data # Dict[symbol, status_dict]
                     
-                    # msg 변수 초기화
-                    if not d:
+                    if not all_data:
+                        # Fallback: 정보가 하나도 없을 때
                         eng = self.cfg.get('system_settings', {}).get('active_engine', 'LOADING').upper()
                         msg = f"{blink} **[{eng}] Dashboard**{pause_indicator} [{datetime.now().strftime('%H:%M:%S')}]\n⏳ 데이터 수신 대기 중..."
                     else:
-                        # 항상 config의 active_engine 사용 (캐시된 status_data가 아닌 실제 설정)
                         eng = self.cfg.get('system_settings', {}).get('active_engine', 'unknown').upper()
                         msg = f"{blink} **[{eng}] Dashboard**{pause_indicator} [{datetime.now().strftime('%H:%M:%S')}]\n\n"
-                        msg += f"💰 **Asset**\n"
-                        msg += f"Eq: `${d.get('total_equity', 0):.2f}` | Free: `${d.get('free_usdt', 0):.2f}`\n"
-                        msg += f"MMR: `{d.get('mmr', 0):.2f}%`\n\n"
                         
-                        # 포지션 정보
-                        msg += f"🚀 **Pos** ({d.get('symbol', 'N/A')})\n"
-                        if d.get('pos_side') != 'NONE':
-                            pnl = d.get('pnl_pct', 0)
-                            pnl_emoji = "📈" if pnl >= 0 else "📉"
-                            msg += f"{d.get('pos_side')} @ {d.get('entry_price', 0):.2f}\n"
-                            msg += f"Amt: `{d.get('coin_amt', 0):.4f}`\n"
-                            msg += f"{pnl_emoji} PnL: `{d.get('pnl_usdt', 0):+.2f}` (`{pnl:+.2f}%`)\n"
-                        else:
-                            msg += "NONE @ 0.00\nAmt: `0.0000`\nPnL: `0.00` (`0.00%`)\n"
+                        # 1. 공통 정보 (첫 번째 데이터에서 추출)
+                        first_symbol = list(all_data.keys())[0]
+                        d_first = all_data[first_symbol]
                         
-                        # 일일 통계
-                        msg += f"\n📊 **Today**: {d.get('daily_count', 0)}건 / `${d.get('daily_pnl', 0):+.2f}`"
-                        
-                        # Shannon 전용 정보
-                        if eng.upper() == 'SHANNON':
-                            # 200 EMA 및 추세 정보
-                            if d.get('ema_200'):
-                                trend = d.get('trend', 'N/A')
-                                trend_emoji = "🟢" if trend == 'long' else "🔴" if trend == 'short' else "⚪"
-                                msg += f"\n\n📈 **Indicators**"
-                                msg += f"\n200 EMA: `{d.get('ema_200', 0):.2f}`"
-                                msg += f"\nTrend: {trend_emoji} `{trend.upper() if trend else 'N/A'}`"
-                                if d.get('atr'):
-                                    msg += f"\nATR: `{d.get('atr', 0):.2f}`"
-                            
-                            # 그리드 주문 수
-                            if 'grid_orders' in d:
-                                msg += f"\n🔲 Grid: {d.get('grid_orders', 0)}개"
-                        
-                        # Signal 전용 정보
-                        elif eng.upper() == 'SIGNAL':
-                            msg += f"\n\n📈 **Strategy**"
-                            msg += f"\n{d.get('active_strategy', 'SMA')} | {d.get('entry_mode', 'CROSS')}"
-                            
-                            # [New] Detailed Filter Display
-                            filter_cfg = d.get('filter_config', {})
-                            entry_st = d.get('entry_filters', {})
-                            exit_st = d.get('exit_filters', {})
-                            
-                            # Helper for Kalman Text
-                            def get_kalman_text(vel):
-                                if vel > 0: return "🟢LONG"
-                                elif vel < 0: return "🔴SHORT"
-                                return "⚪️NEUTRAL"
-                            
-                            # Helper for Pass/Fail Light
-                            def get_light(is_pass):
-                                return "🟢ON" if is_pass else "🔴OFF"
+                        msg += f"💰 **Asset Summary**\n"
+                        msg += f"Eq: `${d_first.get('total_equity', 0):.2f}` | Free: `${d_first.get('free_usdt', 0):.2f}`\n"
+                        msg += f"MMR: `{d_first.get('mmr', 0):.2f}%` | PnL: `${d_first.get('daily_pnl', 0):+.2f}`\n"
+                        msg += "━━━━━━━━━━━━━━━━━━\n"
 
-                            # 1. Entry Filter Section
-                            if filter_cfg:
-                                msg += f"\n\n🛡️ **Entry Filter**"
-                                
-                                # Kalman (Entry)
-                                k_en = filter_cfg['kalman']['en_entry']
-                                if k_en:
-                                    k_vel = entry_st.get('kalman_vel', 0.0)
-                                    # Kalman Pass Logic defaults: Long requires >0, Short requires <0. 
-                                    # But here we just show state. Pass/Fail depends on signal direction which we don't know here easily 
-                                    # without context. But we can show current state.
-                                    # User asked for: "Kalman (ShortRed/LongGreen) (Light Red(off)/Green(on)) Value"
-                                    # Since Entry Direction depends on the Cross signal, we can't definitively say "Green Light" 
-                                    # unless we know the intended direction.
-                                    # However, we can simply show the current status.
-                                    # Let's show: Kalman: 🟢LONG (vel)
-                                    msg += f"\nKalman: {get_kalman_text(k_vel)} (v:{k_vel:.4f})"
-                                else:
-                                    msg += f"\nKalman: ⚪️OFF"
-
-                                # R2 (Entry)
-                                r2_c = filter_cfg['r2']
-                                if r2_c['en_entry']:
-                                    val = entry_st.get('r2_val', 0.0)
-                                    passed = entry_st.get('r2_pass', False)
-                                    msg += f"\nR2: {get_light(passed)} `{val:.2f}` (th:{r2_c['th']})"
-                                else:
-                                     msg += f"\nR2: ⚪️OFF"
-
-                                # Hurst (Entry)
-                                h_c = filter_cfg['hurst']
-                                if h_c['en_entry']:
-                                    val = entry_st.get('hurst_val', 0.0)
-                                    passed = entry_st.get('hurst_pass', False)
-                                    msg += f"\nHurst: {get_light(passed)} `{val:.2f}` (th:{h_c['th']})"
-                                else:
-                                     msg += f"\nHurst: ⚪️OFF"
-                                     
-                                # Chop (Entry)
-                                c_c = filter_cfg['chop']
-                                if c_c['en_entry']:
-                                    val = entry_st.get('chop_val', 0.0)
-                                    passed = entry_st.get('chop_pass', False)
-                                    msg += f"\nChop: {get_light(passed)} `{val:.1f}` (th:{c_c['th']})"
-                                else:
-                                     msg += f"\nChop: ⚪️OFF"
-
-                            # 2. Exit Filter Section
-                            if filter_cfg:
-                                msg += f"\n\n🛡️ **Exit Filter**"
-                                
-                                # Kalman (Exit)
-                                k_en = filter_cfg['kalman']['en_exit']
-                                if k_en:
-                                    k_vel = exit_st.get('kalman_vel', 0.0)
-                                    k_pass = exit_st.get('kalman_pass', False)
-                                    # Exit Kalman Logic is implied: Long Position -> Needs Bearish Kalman to Exit? 
-                                    # Or just showing current state.
-                                    msg += f"\nKalman: {get_kalman_text(k_vel)} (v:{k_vel:.4f})"
-                                else:
-                                    msg += f"\nKalman: ⚪️OFF"
-
-                                # R2 (Exit)
-                                r2_c = filter_cfg['r2']
-                                if r2_c['en_exit']:
-                                    val = exit_st.get('r2_val', 0.0)
-                                    passed = exit_st.get('r2_pass', False)
-                                    msg += f"\nR2: {get_light(passed)} `{val:.2f}`"
-                                else:
-                                     msg += f"\nR2: ⚪️OFF"
-
-                                # Hurst (Exit)
-                                h_c = filter_cfg['hurst']
-                                if h_c['en_exit']:
-                                    val = exit_st.get('hurst_val', 0.0)
-                                    passed = exit_st.get('hurst_pass', False)
-                                    msg += f"\nHurst: {get_light(passed)} `{val:.2f}`"
-                                else:
-                                     msg += f"\nHurst: ⚪️OFF"
-                                     
-                                # Chop (Exit)
-                                c_c = filter_cfg['chop']
-                                if c_c['en_exit']:
-                                    val = exit_st.get('chop_val', 0.0)
-                                    passed = exit_st.get('chop_pass', False)
-                                    
-                                    # [Display Fix] If val is 0.0 and enabled, it likely hasn't calculated yet
-                                    if val == 0.0:
-                                        msg += f"\nChop: ⏳Pending"
-                                    else:
-                                        msg += f"\nChop: {get_light(passed)} `{val:.1f}`"
-                                else:
-                                     msg += f"\nChop: ⚪️OFF"
+                        # 2. 각 심볼별 정보 (Concise Listing)
+                        for symbol, d in all_data.items():
+                            cur_price = d.get('price', 0)
+                            pos_side = d.get('pos_side', 'NONE')
                             
-                            # MicroVBO 전용 대시보드
-                            if d.get('active_strategy') == 'MICROVBO':
-                                vbo = d.get('vbo_breakout_level')
-                                if vbo:
-                                    current_price = d.get('price', 0)
-                                    long_lvl = vbo.get('long', 0)
-                                    short_lvl = vbo.get('short', 0)
-                                    atr_val = vbo.get('atr', 0)
-                                    
-                                    # 현재가 위치 표시
-                                    if current_price > long_lvl:
-                                        pos_ind = "🟢 LONG ZONE"
-                                    elif current_price < short_lvl:
-                                        pos_ind = "🔴 SHORT ZONE"
-                                    else:
-                                        pos_ind = "⚪ NEUTRAL"
-                                    
-                                    msg += f"\n\n📊 **VBO Breakout**"
-                                    msg += f"\n{pos_ind}"
-                                    msg += f"\n🔼 Long: `{long_lvl:.2f}`"
-                                    msg += f"\n🔽 Short: `{short_lvl:.2f}`"
-                                    msg += f"\n📏 ATR: `{atr_val:.2f}`"
-                                    
-                                    # 포지션 있으면 TP/SL 표시
-                                    entry_atr = d.get('vbo_entry_atr')
-                                    if entry_atr and d.get('pos_side') != 'NONE':
-                                        entry_p = d.get('entry_price', 0)
-                                        if d.get('pos_side') == 'LONG':
-                                            tp = entry_p + entry_atr
-                                            sl = entry_p - (entry_atr * 0.5)
-                                        else:
-                                            tp = entry_p - entry_atr
-                                            sl = entry_p + (entry_atr * 0.5)
-                                        msg += f"\n🎯 TP: `{tp:.2f}` | SL: `{sl:.2f}`"
+                            # 포지션 헤더
+                            p_emoji = "🟩" if pos_side == 'LONG' else "🟥" if pos_side == 'SHORT' else "⚪"
+                            msg += f"{p_emoji} **{symbol}** | {pos_side}\n"
                             
-                            # FractalFisher 전용 대시보드
-                            elif d.get('active_strategy') == 'FRACTALFISHER':
-                                hurst = d.get('fisher_hurst')
-                                fisher = d.get('fisher_value')
-                                trailing = d.get('fisher_trailing_stop')
+                            if pos_side != 'NONE':
+                                pnl = d.get('pnl_pct', 0)
+                                pnl_emoji = "📈" if pnl >= 0 else "📉"
+                                msg += f"└ PnL: `{d.get('pnl_usdt', 0):+.2f}` (`{pnl:+.2f}%`)\n"
+                                msg += f"└ Entry: `{d.get('entry_price', 0):.2f}`\n"
+                            
+                            # 엔진/전략별 상세 필터 ( concised )
+                            d_eng = d.get('engine', '').upper()
+                            if d_eng == 'SIGNAL':
+                                f_cfg = d.get('filter_config', {})
+                                entry_st = d.get('entry_filters', {})
+                                exit_st = d.get('exit_filters', {})
                                 
-                                msg += f"\n\n📊 **Fractal Fisher**"
+                                def get_st_text(st_dict, cfg_key, val_key, pass_key, threshold):
+                                    if not f_cfg.get(cfg_key, {}).get('en_entry' if 'entry' in cfg_key else 'en_exit', False):
+                                        return "⚪"
+                                    val = st_dict.get(val_key, 0.0)
+                                    if val == 0.0 and 'exit' in cfg_key: return "⏳"
+                                    return "🟢" if st_dict.get(pass_key, False) else "🔴"
+
+                                # 필터 상태 한 줄 요약
+                                # Entry 필터들
+                                e_r2 = get_st_text(entry_st, 'r2', 'r2_val', 'r2_pass', 0)
+                                e_h = get_st_text(entry_st, 'hurst', 'hurst_val', 'hurst_pass', 0)
+                                e_c = get_st_text(entry_st, 'chop', 'chop_val', 'chop_pass', 0)
                                 
-                                # Hurst 상태
-                                if hurst is not None:
-                                    h_emoji = "🟢" if hurst >= 0.55 else "🔴"
-                                    h_status = "TREND" if hurst >= 0.55 else "RANGE"
-                                    msg += f"\n{h_emoji} Hurst: `{hurst:.4f}` ({h_status})"
+                                # Exit 필터들
+                                x_r2 = get_st_text(exit_st, 'r2', 'r2_val', 'r2_pass', 0)
+                                x_h = get_st_text(exit_st, 'hurst', 'hurst_val', 'hurst_pass', 0)
+                                x_c = get_st_text(exit_st, 'chop', 'chop_val', 'chop_pass', 0)
                                 
-                                # Fisher 값
-                                if fisher is not None:
-                                    f_emoji = "🟢" if fisher < -1.5 else "🔴" if fisher > 1.5 else "⚪"
-                                    msg += f"\n{f_emoji} Fisher: `{fisher:.4f}`"
+                                msg += f"└ In: R2{e_r2} H{e_h} C{e_c} | Out: R2{x_r2} H{x_h} C{x_c}\n"
                                 
-                                # Trailing Stop (포지션 있을 때만)
-                                if trailing and d.get('pos_side') != 'NONE':
-                                    msg += f"\n📍 Trailing Stop: `{trailing:.2f}`"
-                        
-                        # Dual Thrust 전용 정보
-                        elif eng.upper() == 'DUALTHRUST':
-                            msg += f"\n\n📊 **Triggers**"
-                            if d.get('long_trigger') and d.get('short_trigger'):
-                                current_price = d.get('price', 0)
-                                long_t = d.get('long_trigger', 0)
-                                short_t = d.get('short_trigger', 0)
-                                
-                                # 현재가 대비 트리거 위치 표시
-                                if current_price > long_t:
-                                    pos_indicator = "🟢 ABOVE LONG"
-                                elif current_price < short_t:
-                                    pos_indicator = "🔴 BELOW SHORT"
-                                else:
-                                    pos_indicator = "⚪ IN RANGE"
-                                
-                                msg += f"\n{pos_indicator}"
-                                msg += f"\n🔼 Long: `{long_t:.2f}`"
-                                msg += f"\n🔽 Short: `{short_t:.2f}`"
-                                msg += f"\n📏 Range: `{d.get('range', 0):.2f}`"
-                                if d.get('today_open'):
-                                    msg += f"\n📅 Open: `{d.get('today_open', 0):.2f}`"
-                            else:
-                                msg += "\n⏳ Calculating triggers..."
+                                # 전략 전용 정보 (MicroVBO/FractalFisher)
+                                active_strat = d.get('active_strategy', '')
+                                if active_strat == 'MICROVBO':
+                                    vbo = d.get('vbo_breakout_level', {})
+                                    if vbo:
+                                        msg += f"└ VBO: `L:{vbo.get('long',0):.1f}/S:{vbo.get('short',0):.1f}`\n"
+                                elif active_strat == 'FRACTALFISHER':
+                                    msg += f"└ FF: `H:{d.get('fisher_hurst',0):.2f}/F:{d.get('fisher_value',0):.2f}`\n"
+                                    if d.get('fisher_trailing_stop') and pos_side != 'NONE':
+                                        msg += f"└ TS: `{d.get('fisher_trailing_stop', 0):.2f}`\n"
+
+                            elif d_eng == 'SHANNON':
+                                msg += f"└ Trend: `{d.get('trend', 'N/A')}` | EMA: `{d.get('ema_200', 0):.1f}`\n"
+                                msg += f"└ Grid: `{d.get('grid_orders', 0)}` | Diff: `{d.get('diff_pct', 0):.1f}%`\n"
+
+                            elif d_eng == 'DUALTHRUST':
+                                msg += f"└ Triggers: `L:{d.get('long_trigger',0):.1f}/S:{d.get('short_trigger',0):.1f}`\n"
+
+                            elif d_eng == 'DUALMODE':
+                                msg += f"└ Mode: `{d.get('dm_mode', 'N/A')}` | TF: `{d.get('dm_tf')}`\n"
+
+                            msg += "\n" # 코인 간 간격
+
 
                     # 메시지 전송/수정
                     if self.dashboard_msg_id:
