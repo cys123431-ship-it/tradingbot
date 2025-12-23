@@ -1024,9 +1024,8 @@ class SignalEngine(BaseEngine):
                 
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 
-                # 강제로 entry_mode='cross'
+                # 설정 메뉴에서 선택한 entry_mode 사용 (유연성)
                 scan_params = strategy_params.copy()
-                scan_params['entry_mode'] = 'cross' 
                 active_strategy = scan_params.get('active_strategy', 'sma').lower()
                 if active_strategy not in ['sma', 'hma']:
                     active_strategy = 'sma' # Safety fallback
@@ -1086,7 +1085,7 @@ class SignalEngine(BaseEngine):
             active_strategy = strategy_params.get('active_strategy', 'sma').upper()
             entry_mode = strategy_params.get('entry_mode', 'cross').upper()
             
-            # Cross/Position 모드에서는 Kalman 필터가 로직상 강제 사용되므로 상태 표시도 활성화 (SMA/HMA)
+            # Cross/Position 모드에서 Kalman 필터가 로직상 강제 사용되므로 상태 표시도 활성화 (SMA/HMA)
             if active_strategy in ['SMA', 'HMA'] and entry_mode in ['CROSS', 'POSITION']:\
                 kalman_enabled = True
             
@@ -1430,127 +1429,74 @@ class SignalEngine(BaseEngine):
                 if c_f > c_s: # Alignment becomes bullish
                     raw_exit_short = True
             
+            # 신호가 없더라도 필터 값은 계산해서 대시보드에 업데이트 (⏳ Pending 방지)
+            await self._update_exit_filter_values(symbol, df, current_side)
             if not raw_exit_long and not raw_exit_short:
-                # No raw exit signal -> No need to check filters
                 return
 
-            # ===== 2. Calculate Exit Filters on Exit TF =====
-            common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
-            
-            # A. Kalman Filter
-            kalman_cfg = strategy_params.get('kalman_filter', {})
-            kalman_exit_enabled = kalman_cfg.get('exit_enabled', False)
-            kalman_vel = self._calculate_kalman_values(df, kalman_cfg)
-            
-            # B. R2 Filter
-            r2_exit_enabled = common_cfg.get('r2_exit_enabled', True)
-            r2_thresh = common_cfg.get('r2_threshold', 0.25)
-            curr_r2 = 0.0
-            if len(df) >= 14:
-                df['idx_seq'] = np.arange(len(df))
-                curr_r2 = (df['close'].rolling(14).corr(df['idx_seq']).iloc[-2]) ** 2
-                if np.isnan(curr_r2): curr_r2 = 0.0
-            
-            # C. Hurst Filter
-            hurst_exit_enabled = common_cfg.get('hurst_exit_enabled', True)
-            hurst_thresh = common_cfg.get('hurst_threshold', 0.55)
-            curr_hurst = 0.5
-            if len(df) >= 100 and hurst_exit_enabled:
-                try:
-                    from hurst import compute_Hc
-                    curr_hurst, _, _ = compute_Hc(df['close'].values[-100:], kind='price', simplified=True)
-                except: pass
-            
-            # D. Chop Filter
-            chop_exit_enabled = common_cfg.get('chop_exit_enabled', True)
-            chop_thresh = common_cfg.get('chop_threshold', 50.0)
-            curr_chop = 50.0
-            if len(df) >= 14 and chop_exit_enabled:
-                try:
-                    chop = df.ta.chop(length=14)
-                    if chop is not None: 
-                        curr_chop = chop.iloc[-2]
-                        logger.info(f"✅ Chop Calculated: {curr_chop:.2f} (Thresh: {chop_thresh})")
-                    else:
-                        logger.warning("⚠️ Chop calculation returned None")
-                except Exception as e:
-                    logger.error(f"❌ Chop calculation error (Exit): {e}")
+        # 신호가 있을 때도 업데이트 및 청산 로직 진행
+        await self._update_exit_filter_values(symbol, df, current_side)
+        
+        # ===== 3. Exit Filter logic check =====
+        can_exit = True
+        block_reasons = []
+        
+        # Re-fetch the calculated values for checking
+        st = self.last_exit_filter_status.get(symbol, {})
+        kalman_vel = st.get('kalman_vel', 0.0)
+        curr_r2 = st.get('r2_val', 0.0)
+        curr_hurst = st.get('hurst_val', 0.0)
+        curr_chop = st.get('chop_val', 50.0)
+        
+        kalman_cfg = strategy_params.get('kalman_filter', {})
+        kalman_exit_enabled = kalman_cfg.get('exit_enabled', False)
+        
+        common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+        r2_exit_enabled = common_cfg.get('r2_exit_enabled', True)
+        r2_thresh = common_cfg.get('r2_threshold', 0.25)
+        hurst_exit_enabled = common_cfg.get('hurst_exit_enabled', True)
+        hurst_thresh = common_cfg.get('hurst_threshold', 0.55)
+        chop_exit_enabled = common_cfg.get('chop_exit_enabled', True)
+        chop_thresh = common_cfg.get('chop_threshold', 50.0)
 
-            # [New] Update Status Data for Dashboard (Exit Filters)
-            # Store pass/fail status later after checking conditions
-            self.last_exit_filter_status[symbol] = {
-                'r2_val': curr_r2,
-                'hurst_val': curr_hurst,
-                'chop_val': curr_chop,
-                'kalman_vel': kalman_vel,
-                # Pass/Fail status defaults to False, updated below
-                'r2_pass': False,
-                'hurst_pass': False,
-                'chop_pass': False,
-                'kalman_pass': False,
-                'tf': tf
-            }
-            
-            # ===== 3. Check Filter Conditions =====
-            # Rule: If Filter ON -> Must confirm Trend (Strong Signal). If OFF -> Ignore.
-            # AND Logic: All enabled filters must pass.
-            
-            can_exit = True
-            block_reasons = []
-            
-            # 1. Kalman Check
-            if kalman_exit_enabled:
-                if current_side.lower() == 'long':
-                    # To Exit Long, Kalman must be Bearish (Velocity < 0)
-                    if kalman_vel >= 0:
-                        can_exit = False
-                        block_reasons.append(f"Kalman(Vel={kalman_vel:.4f})>=0")
-                elif current_side.lower() == 'short':
-                    # To Exit Short, Kalman must be Bullish (Velocity > 0)
-                    if kalman_vel <= 0:
-                        can_exit = False
-                        block_reasons.append(f"Kalman(Vel={kalman_vel:.4f})<=0")
-            
-            # 2. R2 Check (Trend Strength)
-            if r2_exit_enabled:
-                if curr_r2 < r2_thresh:
+        # 1. Kalman Check
+        if kalman_exit_enabled:
+            if current_side.lower() == 'long':
+                # To Exit Long, Kalman must be Bearish (Velocity < 0)
+                if kalman_vel >= 0:
                     can_exit = False
-                    block_reasons.append(f"R2({curr_r2:.2f})<{r2_thresh}")
-            
-            # 3. Hurst Check
-            if hurst_exit_enabled:
-                if curr_hurst < hurst_thresh:
+                    block_reasons.append(f"Kalman(Vel={kalman_vel:.4f})>=0")
+            elif current_side.lower() == 'short':
+                # To Exit Short, Kalman must be Bullish (Velocity > 0)
+                if kalman_vel <= 0:
                     can_exit = False
-                    block_reasons.append(f"Hurst({curr_hurst:.2f})<{hurst_thresh}")
+                    block_reasons.append(f"Kalman(Vel={kalman_vel:.4f})<=0")
+        
+        # 2. R2 Check (Trend Strength)
+        if r2_exit_enabled:
+            if curr_r2 < r2_thresh:
+                can_exit = False
+                block_reasons.append(f"R2({curr_r2:.2f})<{r2_thresh}")
+        
+        # 3. Hurst Check
+        if hurst_exit_enabled:
+            if curr_hurst < hurst_thresh:
+                can_exit = False
+                block_reasons.append(f"Hurst({curr_hurst:.2f})<{hurst_thresh}")
 
-            # 4. Chop Check
-            if chop_exit_enabled:
-                if curr_chop > chop_thresh:
-                    can_exit = False
-                    block_reasons.append(f"Chop({curr_chop:.1f})>{chop_thresh}")
-            
-            # [New] Update Pass/Fail Status based on logic above
-            # Note: The logic above sets can_exit=False if ANY fail.
-            # We want individual status. Re-evaluate strictly for display or use flags.
-            # Let's just re-evaluate simple boolean logic for display.
-            
-            st = self.last_exit_filter_status[symbol]
-            
-            # Kalman Pass?
-            k_pass = True
-            if kalman_exit_enabled:
-                if current_side.lower() == 'long' and kalman_vel >= 0: k_pass = False
-                elif current_side.lower() == 'short' and kalman_vel <= 0: k_pass = False
-            st['kalman_pass'] = k_pass
-            
-            # R2 Pass?
-            st['r2_pass'] = (not r2_exit_enabled) or (curr_r2 >= r2_thresh)
-            
-            # Hurst Pass?
-            st['hurst_pass'] = (not hurst_exit_enabled) or (curr_hurst >= hurst_thresh)
-            
-            # Chop Pass?
-            st['chop_pass'] = (not chop_exit_enabled) or (curr_chop <= chop_thresh)
+        # 4. Chop Check
+        if chop_exit_enabled:
+            if curr_chop > chop_thresh:
+                can_exit = False
+                block_reasons.append(f"Chop({curr_chop:.1f})>{chop_thresh}")
+        
+        # [New] Update Pass/Fail Status based on logic above
+        st['kalman_pass'] = (not kalman_exit_enabled) or \
+                          (current_side.lower() == 'long' and kalman_vel < 0) or \
+                          (current_side.lower() == 'short' and kalman_vel > 0)
+        st['r2_pass'] = (not r2_exit_enabled) or (curr_r2 >= r2_thresh)
+        st['hurst_pass'] = (not hurst_exit_enabled) or (curr_hurst >= hurst_thresh)
+        st['chop_pass'] = (not chop_exit_enabled) or (curr_chop <= chop_thresh)
             
             
             # ===== 4. Execute Exit =====
@@ -1858,6 +1804,67 @@ class SignalEngine(BaseEngine):
                 is_bearish = False
             
         return sig, is_bullish, is_bearish, strategy_name, entry_mode, kalman_entry_enabled
+
+    async def _update_exit_filter_values(self, symbol, df, current_side):
+        \"\"\"[Helper] Calculate exit filter values and update status without executing exit logic\"\"\"
+        try:
+            strategy_params = self.cfg.get('signal_engine', {}).get('strategy_params', {})
+            common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+            
+            # A. Kalman Filter
+            kalman_cfg = strategy_params.get('kalman_filter', {})
+            kalman_exit_enabled = kalman_cfg.get('exit_enabled', False)
+            kalman_vel = self._calculate_kalman_values(df, kalman_cfg)
+            
+            # B. R2 Filter
+            r2_exit_enabled = common_cfg.get('r2_exit_enabled', True)
+            r2_thresh = common_cfg.get('r2_threshold', 0.25)
+            curr_r2 = 0.0
+            if len(df) >= 14:
+                df['idx_seq'] = np.arange(len(df))
+                curr_r2 = (df['close'].rolling(14).corr(df['idx_seq']).iloc[-2]) ** 2
+                if np.isnan(curr_r2): curr_r2 = 0.0
+            
+            # C. Hurst Filter
+            hurst_exit_enabled = common_cfg.get('hurst_exit_enabled', True)
+            hurst_thresh = common_cfg.get('hurst_threshold', 0.55)
+            curr_hurst = 0.5
+            if len(df) >= 100 and hurst_exit_enabled:
+                try:
+                    from hurst import compute_Hc
+                    curr_hurst, _, _ = compute_Hc(df['close'].values[-100:], kind='price', simplified=True)
+                except: pass
+            
+            # D. Chop Filter
+            chop_exit_enabled = common_cfg.get('chop_exit_enabled', True)
+            chop_thresh = common_cfg.get('chop_threshold', 50.0)
+            curr_chop = 50.0
+            if len(df) >= 14 and chop_exit_enabled:
+                try:
+                    chop = df.ta.chop(length=14)
+                    if chop is not None: 
+                        curr_chop = chop.iloc[-2]
+                        if np.isnan(curr_chop): curr_chop = 50.0
+                    else:
+                        logger.warning("⚠️ Chop calculation returned None")
+                except Exception as e:
+                    logger.error(f"❌ Chop calculation error (Exit): {e}")
+
+            # Update Status Data for Dashboard
+            self.last_exit_filter_status[symbol] = {
+                'r2_val': curr_r2,
+                'hurst_val': curr_hurst,
+                'chop_val': curr_chop,
+                'kalman_vel': kalman_vel,
+                'r2_pass': (not r2_exit_enabled) or (curr_r2 >= r2_thresh),
+                'hurst_pass': (not hurst_exit_enabled) or (curr_hurst >= hurst_thresh),
+                'chop_pass': (not chop_exit_enabled) or (curr_chop <= chop_thresh),
+                'kalman_pass': (not kalman_exit_enabled) or \
+                              (current_side.lower() == 'long' and kalman_vel < 0) or \
+                              (current_side.lower() == 'short' and kalman_vel > 0)
+            }
+        except Exception as e:
+            logger.error(f"Error updating exit filter values for {symbol}: {e}")
 
     async def entry(self, symbol, side, price):
         try:
