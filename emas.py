@@ -1434,69 +1434,69 @@ class SignalEngine(BaseEngine):
             if not raw_exit_long and not raw_exit_short:
                 return
 
-        # 신호가 있을 때도 업데이트 및 청산 로직 진행
-        await self._update_exit_filter_values(symbol, df, current_side)
-        
-        # ===== 3. Exit Filter logic check =====
-        can_exit = True
-        block_reasons = []
-        
-        # Re-fetch the calculated values for checking
-        st = self.last_exit_filter_status.get(symbol, {})
-        kalman_vel = st.get('kalman_vel', 0.0)
-        curr_r2 = st.get('r2_val', 0.0)
-        curr_hurst = st.get('hurst_val', 0.0)
-        curr_chop = st.get('chop_val', 50.0)
-        
-        kalman_cfg = strategy_params.get('kalman_filter', {})
-        kalman_exit_enabled = kalman_cfg.get('exit_enabled', False)
-        
-        common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
-        r2_exit_enabled = common_cfg.get('r2_exit_enabled', True)
-        r2_thresh = common_cfg.get('r2_threshold', 0.25)
-        hurst_exit_enabled = common_cfg.get('hurst_exit_enabled', True)
-        hurst_thresh = common_cfg.get('hurst_threshold', 0.55)
-        chop_exit_enabled = common_cfg.get('chop_exit_enabled', True)
-        chop_thresh = common_cfg.get('chop_threshold', 50.0)
+            # 신호가 있을 때도 업데이트 및 청산 로직 진행
+            await self._update_exit_filter_values(symbol, df, current_side)
+            
+            # ===== 3. Exit Filter logic check =====
+            can_exit = True
+            block_reasons = []
+            
+            # Re-fetch the calculated values for checking
+            st = self.last_exit_filter_status.get(symbol, {})
+            kalman_vel = st.get('kalman_vel', 0.0)
+            curr_r2 = st.get('r2_val', 0.0)
+            curr_hurst = st.get('hurst_val', 0.0)
+            curr_chop = st.get('chop_val', 50.0)
+            
+            kalman_cfg = strategy_params.get('kalman_filter', {})
+            kalman_exit_enabled = kalman_cfg.get('exit_enabled', False)
+            
+            common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+            r2_exit_enabled = common_cfg.get('r2_exit_enabled', True)
+            r2_thresh = common_cfg.get('r2_threshold', 0.25)
+            hurst_exit_enabled = common_cfg.get('hurst_exit_enabled', True)
+            hurst_thresh = common_cfg.get('hurst_threshold', 0.55)
+            chop_exit_enabled = common_cfg.get('chop_exit_enabled', True)
+            chop_thresh = common_cfg.get('chop_threshold', 50.0)
 
-        # 1. Kalman Check
-        if kalman_exit_enabled:
-            if current_side.lower() == 'long':
-                # To Exit Long, Kalman must be Bearish (Velocity < 0)
-                if kalman_vel >= 0:
+            # 1. Kalman Check
+            if kalman_exit_enabled:
+                if current_side.lower() == 'long':
+                    # To Exit Long, Kalman must be Bearish (Velocity < 0)
+                    if kalman_vel >= 0:
+                        can_exit = False
+                        block_reasons.append(f"Kalman(Vel={kalman_vel:.4f})>=0")
+                elif current_side.lower() == 'short':
+                    # To Exit Short, Kalman must be Bullish (Velocity > 0)
+                    if kalman_vel <= 0:
+                        can_exit = False
+                        block_reasons.append(f"Kalman(Vel={kalman_vel:.4f})<=0")
+            
+            # 2. R2 Check (Trend Strength)
+            if r2_exit_enabled:
+                if curr_r2 < r2_thresh:
                     can_exit = False
-                    block_reasons.append(f"Kalman(Vel={kalman_vel:.4f})>=0")
-            elif current_side.lower() == 'short':
-                # To Exit Short, Kalman must be Bullish (Velocity > 0)
-                if kalman_vel <= 0:
+                    block_reasons.append(f"R2({curr_r2:.2f})<{r2_thresh}")
+            
+            # 3. Hurst Check
+            if hurst_exit_enabled:
+                if curr_hurst < hurst_thresh:
                     can_exit = False
-                    block_reasons.append(f"Kalman(Vel={kalman_vel:.4f})<=0")
-        
-        # 2. R2 Check (Trend Strength)
-        if r2_exit_enabled:
-            if curr_r2 < r2_thresh:
-                can_exit = False
-                block_reasons.append(f"R2({curr_r2:.2f})<{r2_thresh}")
-        
-        # 3. Hurst Check
-        if hurst_exit_enabled:
-            if curr_hurst < hurst_thresh:
-                can_exit = False
-                block_reasons.append(f"Hurst({curr_hurst:.2f})<{hurst_thresh}")
+                    block_reasons.append(f"Hurst({curr_hurst:.2f})<{hurst_thresh}")
 
-        # 4. Chop Check
-        if chop_exit_enabled:
-            if curr_chop > chop_thresh:
-                can_exit = False
-                block_reasons.append(f"Chop({curr_chop:.1f})>{chop_thresh}")
-        
-        # [New] Update Pass/Fail Status based on logic above
-        st['kalman_pass'] = (not kalman_exit_enabled) or \
-                          (current_side.lower() == 'long' and kalman_vel < 0) or \
-                          (current_side.lower() == 'short' and kalman_vel > 0)
-        st['r2_pass'] = (not r2_exit_enabled) or (curr_r2 >= r2_thresh)
-        st['hurst_pass'] = (not hurst_exit_enabled) or (curr_hurst >= hurst_thresh)
-        st['chop_pass'] = (not chop_exit_enabled) or (curr_chop <= chop_thresh)
+            # 4. Chop Check
+            if chop_exit_enabled:
+                if curr_chop > chop_thresh:
+                    can_exit = False
+                    block_reasons.append(f"Chop({curr_chop:.1f})>{chop_thresh}")
+            
+            # [New] Update Pass/Fail Status based on logic above
+            st['kalman_pass'] = (not kalman_exit_enabled) or \
+                              (current_side.lower() == 'long' and kalman_vel < 0) or \
+                              (current_side.lower() == 'short' and kalman_vel > 0)
+            st['r2_pass'] = (not r2_exit_enabled) or (curr_r2 >= r2_thresh)
+            st['hurst_pass'] = (not hurst_exit_enabled) or (curr_hurst >= hurst_thresh)
+            st['chop_pass'] = (not chop_exit_enabled) or (curr_chop <= chop_thresh)
             
             
             # ===== 4. Execute Exit =====
