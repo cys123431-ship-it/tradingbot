@@ -142,6 +142,13 @@ class TradingConfig:
                 'risk_per_trade_pct': 10.0,
                 'scalping_tf': '5m',
                 'standard_tf': '4h'
+            },
+            'tema_engine': {
+                'target_symbol': 'BTC/USDT',
+                'timeframe': '5m',
+                'rsi_period': 14,
+                'tema_period': 9,
+                'bollinger_window': 20
             }
         }
         changed = False
@@ -450,6 +457,258 @@ class BaseEngine:
                 await self.ctrl.notify(f"⚠️ **MMR 경고!** 현재 {mmr:.2f}% (한도: {max_mmr}%)")
             return True
         return False
+
+
+class TemaEngine(BaseEngine):
+    def __init__(self, controller):
+        super().__init__(controller)
+        self.last_candle_time = 0
+        self.consecutive_errors = 0
+        
+        # 기본 기술적 지표 캐시
+        self.ema1 = None
+        self.ema2 = None
+        self.ema3 = None
+    
+    def start(self):
+        super().start()
+        logger.info(f"🚀 [TEMA] Engine started")
+        
+    async def poll_tick(self):
+        if not self.running: return
+        
+        try:
+            # 1. 설정 로드 (공통 설정 사용)
+            cfg = self.cfg.get('tema_engine', {})
+            common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+            
+            symbol = cfg.get('target_symbol', 'BTC/USDT')
+            tf = cfg.get('timeframe', '5m')
+            
+            # 2. 캔들 데이터 조회
+            ohlcv = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, tf, limit=100)
+            if not ohlcv or len(ohlcv) < 50:
+                return
+                
+            last_closed = ohlcv[-2]
+            current_ts = int(last_closed[0])
+            current_close = float(last_closed[4])
+            
+            # 3. 새로운 캔들 마감 시 분석
+            if current_ts > self.last_candle_time:
+                logger.info(f"🕯️ [TEMA {tf}] {symbol} New Candle: close={current_close}")
+                self.last_candle_time = current_ts
+                
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                
+                # 지표 계산
+                df = self._calculate_indicators(df, cfg)
+                
+                # 신호 확인
+                signal, reason = self._check_entry_conditions(df, cfg)
+                
+                # 포지션 조회
+                pos = await self.get_server_position(symbol, use_cache=False)
+                pos_side = 'long' if pos and float(pos['contracts']) > 0 and float(pos['side'] if 'side' in pos else 1) > 0 else \
+                           'short' if pos and float(pos['contracts']) > 0 and float(pos['side'] if 'side' in pos else 1) < 0 else 'none'
+                
+                # 진입 감지
+                if signal and pos_side == 'none':
+                    logger.info(f"🚀 TEMA Signal Detected: {signal.upper()} ({reason})")
+                    current_price = float(ohlcv[-1][4])
+                    await self.entry(symbol, signal, current_price, common_cfg)
+                    
+                # 청산 감지 (포지션이 있을 때만)
+                elif pos_side != 'none':
+                     exit_signal, exit_reason = self._check_exit_conditions(df, pos_side, cfg)
+                     if exit_signal:
+                         logger.info(f"👋 TEMA Exit Signal: {exit_reason}")
+                         await self.exit_position(symbol, exit_reason)
+
+        except Exception as e:
+            self.consecutive_errors += 1
+            if self.consecutive_errors % 10 == 0:
+                logger.error(f"TemaEngine poll error: {e}")
+
+    def _calculate_indicators(self, df, cfg):
+        try:
+            rsi_period = cfg.get('rsi_period', 14)
+            tema_period = cfg.get('tema_period', 9)
+            bb_window = cfg.get('bollinger_window', 20)
+            
+            # RSI
+            df['rsi'] = ta.rsi(df['close'], length=rsi_period)
+            
+            # TEMA Calculation
+            # TEMA = (3 * EMA1) - (3 * EMA2) + EMA3
+            ema1 = ta.ema(df['close'], length=tema_period)
+            ema2 = ta.ema(ema1, length=tema_period)
+            ema3 = ta.ema(ema2, length=tema_period)
+            df['tema'] = (3 * ema1) - (3 * ema2) + ema3
+            
+            # Bollinger Bands
+            bb = ta.bbands(df['close'], length=bb_window, std=2.0)
+            # pandas_ta bbands returns multiple columns. We need standard names.
+            # Assuming default names: BBL_20_2.0, BBM_20_2.0, BBU_20_2.0
+            # We map them to simpler names
+            cols = bb.columns
+            df['bb_lower'] = bb[cols[0]]
+            df['bb_mid'] = bb[cols[1]]
+            df['bb_upper'] = bb[cols[2]]
+            
+            return df
+        except Exception as e:
+            logger.error(f"Indicator calculation error: {e}")
+            return df
+
+    def _check_entry_conditions(self, df, cfg):
+        # 전략: SampleStrategy.py 로직 구현
+        # Long: RSI > 30 & TEMA < BB_Mid & TEMA Rising
+        # Short: RSI > 70 & TEMA > BB_Mid & TEMA Falling
+        
+        try:
+            last = df.iloc[-2] # 직전 확정 봉
+            prev = df.iloc[-3] # 그 전 봉 (추세 확인용)
+            
+            # TEMA Rising/Falling check
+            tema_rising = last['tema'] > prev['tema']
+            tema_falling = last['tema'] < prev['tema']
+            
+            # Conditions
+            # 1. Long
+            if (last['rsi'] > 30 and 
+                last['tema'] <= last['bb_mid'] and 
+                tema_rising):
+                return 'long', f"RSI({last['rsi']:.1f})>30 & TEMA<Mid & Rising"
+                
+            # 2. Short
+            if (last['rsi'] > 70 and 
+                last['tema'] >= last['bb_mid'] and 
+                tema_falling):
+                return 'short', f"RSI({last['rsi']:.1f})>70 & TEMA>Mid & Falling"
+                
+            return None, None
+        except Exception:
+            return None, None
+
+    def _check_exit_conditions(self, df, pos_side, cfg):
+        # 전략: SampleStrategy.py 로직 구현
+        # Exit Long: RSI > 70 & TEMA > BB_Mid & TEMA Falling (과매수 + 꺾임)
+        # Exit Short: RSI < 30 & TEMA < BB_Mid & TEMA Rising (과매도 + 반등)
+        
+        try:
+            last = df.iloc[-2]
+            prev = df.iloc[-3]
+            
+            tema_rising = last['tema'] > prev['tema']
+            tema_falling = last['tema'] < prev['tema']
+            
+            if pos_side == 'long':
+                if (last['rsi'] > 70 and 
+                    last['tema'] > last['bb_mid'] and 
+                    tema_falling):
+                    return True, f"Long Exit: RSI({last['rsi']:.1f})>70 & TEMA>Mid & Falling"
+            
+            elif pos_side == 'short':
+                if (last['rsi'] < 30 and 
+                    last['tema'] < last['bb_mid'] and 
+                    tema_rising):
+                    return True, f"Short Exit: RSI({last['rsi']:.1f})<30 & TEMA<Mid & Rising"
+                    
+            return False, None
+        except Exception:
+            return False, None
+
+    async def entry(self, symbol, side, price, common_cfg):
+        try:
+            # 1. 자산 확인
+            total, free, _ = await self.get_balance_info()
+            if total <= 0: return
+
+            # 2. 투자 비중 (Risk %) - 공통 설정 사용
+            risk_pct = common_cfg.get('risk_per_trade_pct', 50.0)
+            leverage = common_cfg.get('leverage', 5)
+            
+            # USDT 투입 금액 계산
+            invest_amount = (total * (risk_pct / 100.0)) * leverage
+            
+            # 수량 계산
+            quantity = invest_amount / price
+            amount_str = self.safe_amount(symbol, quantity)
+            price_str = self.safe_price(symbol, price) # Limit 주문용 (현재가)
+            
+            logger.info(f"💰 TEMA Entry: {side.upper()} {symbol} Qty={amount_str} Price={price_str} (Lev {leverage}x)")
+            
+            # 3. 주문 전송
+            params = {'leverage': leverage}
+            
+            if side == 'long':
+                order = await asyncio.to_thread(self.exchange.create_market_buy_order, symbol, float(amount_str), params)
+            else:
+                order = await asyncio.to_thread(self.exchange.create_market_sell_order, symbol, float(amount_str), params)
+            
+            await self.ctrl.notify(f"🚀 **TEMA 진입**: {symbol} {side.upper()}\n가격: {price}\n수량: {amount_str}")
+            
+            # 4. TP/SL 설정 (공통 설정 사용)
+            tp_sl_enabled = common_cfg.get('tp_sl_enabled', False)
+            if tp_sl_enabled:
+                roe_target = common_cfg.get('target_roe_pct', 20.0) / 100.0
+                stop_loss = common_cfg.get('stop_loss_pct', 10.0) / 100.0
+                
+                # 주문 체결가 기준 TP/SL 계산
+                entry_price = float(order['average']) if order.get('average') else price
+                
+                if side == 'long':
+                    tp_price = entry_price * (1 + roe_target/leverage)
+                    sl_price = entry_price * (1 - stop_loss/leverage)
+                else:
+                    tp_price = entry_price * (1 - roe_target/leverage)
+                    sl_price = entry_price * (1 + stop_loss/leverage)
+                    
+                # 바이낸스 기준 TP/SL 주문 (STOP_MARKET / TAKE_PROFIT_MARKET)
+                try:
+                    # 1. Take Profit
+                    params_tp = {
+                        'stopPrice': self.safe_price(symbol, tp_price),
+                        'reduceOnly': True
+                    }
+                    if side == 'long':
+                        await asyncio.to_thread(self.exchange.create_order, symbol, 'TAKE_PROFIT_MARKET', 'sell', amount_str, None, params_tp)
+                    else:
+                        await asyncio.to_thread(self.exchange.create_order, symbol, 'TAKE_PROFIT_MARKET', 'buy', amount_str, None, params_tp)
+                    
+                    # 2. Stop Loss
+                    params_sl = {
+                        'stopPrice': self.safe_price(symbol, sl_price),
+                        'reduceOnly': True
+                    }
+                    if side == 'long':
+                        await asyncio.to_thread(self.exchange.create_order, symbol, 'STOP_MARKET', 'sell', amount_str, None, params_sl)
+                    else:
+                        await asyncio.to_thread(self.exchange.create_order, symbol, 'STOP_MARKET', 'buy', amount_str, None, params_sl)
+                    
+                    logger.info(f"✅ TP/SL Order Placed: TP={tp_price:.4f}, SL={sl_price:.4f}")
+                except Exception as e:
+                    logger.error(f"Failed to place TP/SL order: {e}")
+                    await self.ctrl.notify(f"⚠️ TP/SL 주문 실패: {e}")
+
+        except Exception as e:
+            logger.error(f"TEMA entry failed: {e}")
+            await self.ctrl.notify(f"❌ 진입 실패: {e}")
+
+    async def exit_position(self, symbol, reason):
+        try:
+            pos = await self.get_server_position(symbol, use_cache=False)
+            if not pos: return
+
+            amount = float(pos['contracts'])
+            side = 'sell' if float(pos['contracts']) > 0 else 'buy' # 포지션 반대 매매
+            
+            if amount > 0:
+                await asyncio.to_thread(self.exchange.create_market_order, symbol, side, amount)
+                await self.ctrl.notify(f"👋 **TEMA 청산**: {symbol} ({reason})")
+        except Exception as e:
+            logger.error(f"TEMA exit failed: {e}")
 
 
 class SignalEngine(BaseEngine):
@@ -986,6 +1245,10 @@ class SignalEngine(BaseEngine):
             ohlcv = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, tf, limit=300)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
+            # [CRITICAL] Ensure numeric types (Robust Loop)
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
             # ===== 전략 설정 로드 =====
             strategy_params = self.cfg.get('signal_engine', {}).get('strategy_params', {})
             active_strategy = strategy_params.get('active_strategy', 'sma').lower()
@@ -1086,6 +1349,9 @@ class SignalEngine(BaseEngine):
             # Fetch history for Exit TF
             ohlcv = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, tf, limit=300)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            # [CRITICAL] Ensure numeric types (Robust Loop)
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
             
             # ===== 1. Calculate Raw Signal (SMA/HMA Cross) on Exit TF =====
             strategy_params = self.cfg.get('signal_engine', {}).get('strategy_params', {})
@@ -1174,8 +1440,13 @@ class SignalEngine(BaseEngine):
             if len(df) >= 14 and chop_exit_enabled:
                 try:
                     chop = df.ta.chop(length=14)
-                    if chop is not None: curr_chop = chop.iloc[-2]
-                except: pass
+                    if chop is not None: 
+                        curr_chop = chop.iloc[-2]
+                        logger.info(f"✅ Chop Calculated: {curr_chop:.2f} (Thresh: {chop_thresh})")
+                    else:
+                        logger.warning("⚠️ Chop calculation returned None")
+                except Exception as e:
+                    logger.error(f"❌ Chop calculation error (Exit): {e}")
 
             # [New] Update Status Data for Dashboard (Exit Filters)
             # Store pass/fail status later after checking conditions
@@ -2765,7 +3036,8 @@ class MainController:
             'signal': SignalEngine(self), 
             'shannon': ShannonEngine(self), 
             'dualthrust': DualThrustEngine(self),
-            'dualmode': DualModeFractalEngine(self)
+            'dualmode': DualModeFractalEngine(self),
+            'tema': TemaEngine(self)
         }
         self.active_engine = None
         self.tg_app = None
@@ -2825,6 +3097,8 @@ class MainController:
             sym = self.cfg.get('dual_thrust_engine', {}).get('target_symbol', 'BTC/USDT')
         elif name == 'dualmode':
             sym = self.cfg.get('dual_mode_engine', {}).get('target_symbol', 'BTC/USDT')
+        elif name == 'tema':
+            sym = self.cfg.get('tema_engine', {}).get('target_symbol', 'BTC/USDT')
         else:
             watchlist = self.cfg.get('signal_engine', {}).get('watchlist', ['BTC/USDT'])
             sym = watchlist[0] if watchlist else 'BTC/USDT'
@@ -2841,6 +3115,8 @@ class MainController:
             return self.cfg.get('dual_thrust_engine', {}).get('target_symbol', 'BTC/USDT')
         elif eng == 'dualmode':
             return self.cfg.get('dual_mode_engine', {}).get('target_symbol', 'BTC/USDT')
+        elif eng == 'tema':
+            return self.cfg.get('tema_engine', {}).get('target_symbol', 'BTC/USDT')
         else:
             watchlist = self.cfg.get('signal_engine', {}).get('watchlist', ['BTC/USDT'])
             return watchlist[0] if watchlist else 'BTC/USDT'
@@ -3016,7 +3292,8 @@ class MainController:
 1. 레버리지 (`{lev}배`)
 2. 목표 ROE (`{sig_common.get('target_roe_pct', 20)}%`)
 3. 손절 (`{sig_common.get('stop_loss_pct', 10)}%`)
-4. 타임프레임 (`{sig_common.get('timeframe', '15m')}`)
+4. 진입 타임프레임 (`{sig_common.get('timeframe', '15m')}`)
+41. 청산 타임프레임 (`{sig_common.get('exit_timeframe', '4h')}`)
 5. 손실 제한 (`${sha.get('daily_loss_limit', 5000)}`)
 6. 진입 비율 (`{sig_common.get('risk_per_trade_pct', 50)}%`)
 7. 매매 방향 (`{direction_str}`)
@@ -3025,8 +3302,6 @@ class MainController:
 ━━━ Signal 전용 ━━━
 16. 전략 (`{active_strategy}`)
 18. 진입모드 (`{entry_mode}`) - SMA/HMA용
-40. 진입 TF (`{sig_common.get('entry_timeframe', '8h')}`)
-41. 청산 TF (`{sig_common.get('exit_timeframe', '4h')}`)
 10. SMA 기간 (`{fast_sma}/{slow_sma}`)
 17. HMA 기간 (`{hma_fast}/{hma_slow}`)
 20. VBO 설정 (ATR/돌파/TP/SL)
@@ -3084,7 +3359,8 @@ class MainController:
             '1': "📝 **레버리지** 값을 입력하세요 (1~5배, 예: 5)",
             '2': "📝 **목표 ROE** (%)를 입력하세요 (예: 20)",
             '3': "📝 **손절 비율** (%)를 입력하세요 (예: 5)",
-            '4': "📝 **타임프레임**을 입력하세요 (예: 1m, 3m, 5m, 15m, 1h)",
+            '4': "📝 **진입 타임프레임**을 입력하세요 (예: 15m)\n1m,2m,3m,5m,15m,30m | 1h,2h,4h | 1d",
+            '41': "📝 **청산 타임프레임**을 입력하세요 (예: 1h)\n1m,2m,3m,5m,15m,30m | 1h,2h,4h | 1d",
             '5': "📝 **일일 손실 제한** ($)을 입력하세요 (예: 1000)",
             '6': "💰 **진입 비율(%)**을 입력하세요 (예: 50 -> 자산의 50% 진입)",
             '7': "↕️ **매매 방향**을 선택하세요 (1=양방향, 2=롱만, 3=숏만)",
@@ -3102,7 +3378,6 @@ class MainController:
             '21': "📝 **FractalFisher 설정**을 입력하세요 (형식: hurst기간,hurst임계,fisher기간,trailing배수 예: 100,0.55,10,2.0)",
             '22': "📝 **네트워크 선택** (1=테스트넷, 2=메인넷)",
             '23': "📝 **거래량 급등 채굴 기능**을 켜시겠습니까? (1=ON, 0=OFF)",
-            '23': "📝 **거래량 급등 채굴 기능**을 켜시겠습니까? (1=ON, 0=OFF)",
             '26': "📝 **추세 필터($R^2$) 기능**을 켜시겠습니까? (1=ON, 0=OFF)", # Toggle이므로 실제로는 사용되지 않을 수 있으나 prompt dict 구색 맞춤
             '27': "📝 **$R^2$ 기준값**을 입력하세요 (0.1 ~ 0.5 권장)\n- 낮을수록(0.1): 진입 자주 함 (노이즈 허용)\n- 높을수록(0.4): 확실한 추세만 진입 (진입 감소)",
             '28': "📝 **Hurst 필터**를 켜시겠습니까? (1=ON, 0=OFF)", 
@@ -3110,8 +3385,6 @@ class MainController:
             '30': "📝 **CHOP 필터**를 켜시겠습니까? (1=ON, 0=OFF)",
             '31': "📝 **CHOP 기준값**을 입력하세요 (예: 50.0)\n- 100에 가까울수록 횡보(Choppy).\n- 설정값 **보다 크면** 진입 금지.",
             '35': "📝 **Dual Mode 변경** (1=Standard, 2=Scalping)",
-            '40': "📝 **진입 타임프레임**을 선택하세요\n1m,2m,3m,4m,5m,15m,30m | 1h,2h,4h,6h,8h,12h | 1d,3d | 1w | 1M",
-            '41': "📝 **청산 타임프레임**을 선택하세요\n1m,2m,3m,4m,5m,15m,30m | 1h,2h,4h,6h,8h,12h | 1d,3d | 1w | 1M"
         }
         if text == '7':
             keyboard = [
@@ -3145,6 +3418,10 @@ class MainController:
 4. ⚛️ **Dual Mode Engine**
    - Fractal Choppiness + Kalman
    - Scalping / Standard 모드
+
+5. 🌩️ **TEMA Engine**
+   - RSI + TEMA + Bollinger Strategy
+   - 빠른 반응 속도 (공통 설정 공유)
 """
             await update.message.reply_text(msg.strip(), parse_mode=ParseMode.MARKDOWN)
             return ENGINE_SELECT
@@ -3272,14 +3549,16 @@ class MainController:
         try:
             if choice == '1':
                 v = int(val)
-                # 레버리지 최대 5배 제한
-                if v < 1 or v > 5:
-                    await update.message.reply_text("❌ 레버리지는 1~5배 사이만 가능합니다.")
+                # 레버리지 최대 20배 제한 (사용자 요청: 5 -> 20)
+                if v < 1 or v > 20:
+                    await update.message.reply_text("❌ 레버리지는 1~20배 사이만 가능합니다.")
                     return SELECT
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'leverage'], v)
                 await self.cfg.update_value(['shannon_engine', 'leverage'], v)
                 await self.cfg.update_value(['dual_thrust_engine', 'leverage'], v)
                 await self.cfg.update_value(['dual_mode_engine', 'leverage'], v)
+                # TEMA는 common_settings를 참조하므로 별도 업데이트 불필요하지만, 
+                # 활성 엔진이 TEMA일 경우 market settings 즉시 적용 필요
                 if self.active_engine:
                     sym = self._get_current_symbol()
                     await self.active_engine.ensure_market_settings(sym)
@@ -3293,12 +3572,13 @@ class MainController:
                 await self.cfg.update_value(['dual_mode_engine', 'stop_loss_pct'], float(val))
             elif choice == '4':
                 # 타임프레임 유효성 검사
-                valid_tf = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d']
+                valid_tf = ['1m', '2m', '3m', '4m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
                 if val not in valid_tf:
-                    await update.message.reply_text(f"❌ 유효하지 않은 타임프레임. 사용 가능: {', '.join(valid_tf)}")
+                    await update.message.reply_text(f"❌ 유효하지 않은 타임프레임.\n사용 가능: {', '.join(valid_tf)}")
                     return SELECT
-                # Signal 및 Shannon 둘 다 타임프레임 변경
+                # 타임프레임 업데이트 (Common, Signal, Shannon 모두 적용)
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'timeframe'], val)
+                await self.cfg.update_value(['signal_engine', 'common_settings', 'entry_timeframe'], val) # Sync Entry TF
                 await self.cfg.update_value(['shannon_engine', 'timeframe'], val)
                 
                 # DualMode 타임프레임 변경 (현재 모드에 맞춰서)
@@ -3316,8 +3596,9 @@ class MainController:
                 # Signal 엔진 캐시도 초기화
                 signal_engine = self.engines.get('signal')
                 if signal_engine:
-                    signal_engine.last_processed_candle_ts = 0
-                    signal_engine.last_candle_time = 0
+                    signal_engine.last_processed_candle_ts = {}
+                    signal_engine.last_candle_time = {}
+                await update.message.reply_text(f"✅ 진입 타임프레임 변경: {val}")
                 # DualMode 엔진 캐시 초기화
                 dm_engine = self.engines.get('dualmode')
                 if dm_engine:
@@ -3599,21 +3880,6 @@ class MainController:
                 if dm_engine:
                     dm_engine._init_strategy()
             
-            # ======== Signal 진입/청산 타임프레임 ========
-            elif choice == '40':
-                # 진입 타임프레임 변경
-                valid_tf = ['1m', '2m', '3m', '4m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
-                if val not in valid_tf:
-                    await update.message.reply_text(f"❌ 유효하지 않은 타임프레임.\n사용 가능: {', '.join(valid_tf)}")
-                    return SELECT
-                await self.cfg.update_value(['signal_engine', 'common_settings', 'entry_timeframe'], val)
-                # Signal 엔진 캐시 초기화
-                signal_engine = self.engines.get('signal')
-                if signal_engine:
-                    signal_engine.last_processed_candle_ts = {}
-                    signal_engine.last_candle_time = {}
-                await update.message.reply_text(f"✅ 진입 타임프레임 변경: {val}")
-            
             elif choice == '41':
                 # 청산 타임프레임 변경
                 valid_tf = ['1m', '2m', '3m', '4m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
@@ -3628,7 +3894,7 @@ class MainController:
                 await update.message.reply_text(f"✅ 청산 타임프레임 변경: {val}")
             
             # 10~41 success message handled
-            if choice not in ['10', '11', '12', '14', '15', '16', '17', '18', '20', '21', '22', '23', '26', '27', '28', '29', '30', '31', '35', '40', '41']:
+            if choice not in ['10', '11', '12', '14', '15', '16', '17', '18', '20', '21', '22', '23', '26', '27', '28', '29', '30', '31', '35', '41']:
                 await update.message.reply_text(f"✅ 설정 완료: {val}")
             await self._restore_main_keyboard(update)
             await self.show_setup_menu(update)
@@ -3677,12 +3943,15 @@ class MainController:
                 await self.cfg.update_value(['dual_thrust_engine', 'target_symbol'], symbol)
             elif eng == 'dualmode':
                 await self.cfg.update_value(['dual_mode_engine', 'target_symbol'], symbol)
+            elif eng == 'tema':
+                await self.cfg.update_value(['tema_engine', 'target_symbol'], symbol)
             else:
                 # Signal 엔진: 메뉴에서 변경 시 Watchlist를 해당 심볼로 **대체** (기존 동작 유지)
                 # 다중 감시를 원하면 메뉴가 아니라 채팅창에서 추가해야 함을 안내
                 await self.cfg.update_value(['signal_engine', 'watchlist'], [symbol])
                 await update.message.reply_text("ℹ️ Signal 엔진의 감시 목록이 이 심볼로 초기화되었습니다.\n(추가를 원하시면 메뉴 밖에서 심볼을 입력하세요)")
             
+            # 마켓 설정 적용
             # 마켓 설정 적용
             if self.active_engine:
                 await self.active_engine.ensure_market_settings(symbol)
@@ -3713,6 +3982,15 @@ class MainController:
                 dt_engine.position_cache = None
                 dt_engine.trigger_date = None  # 트리거 재계산
                 logger.info(f"🔄 DualThrust engine cache cleared for new symbol: {symbol}")
+
+            # TEMA 엔진 캐시 초기화
+            tema_engine = self.engines.get('tema')
+            if tema_engine:
+                tema_engine.last_candle_time = 0
+                tema_engine.ema1 = None
+                tema_engine.ema2 = None
+                tema_engine.ema3 = None
+                logger.info(f"🔄 TEMA engine cache cleared for new symbol: {symbol}")
             
             await update.message.reply_text(f"✅ 심볼 변경 완료: {symbol}")
             await self._restore_main_keyboard(update)
@@ -3758,7 +4036,7 @@ class MainController:
         """엔진 교체 처리"""
         text = update.message.text.strip()
         
-        mode_map = {'1': 'signal', '2': 'shannon', '3': 'dualthrust', '4': 'dualmode'}
+        mode_map = {'1': 'signal', '2': 'shannon', '3': 'dualthrust', '4': 'dualmode', '5': 'tema'}
         
         if text in mode_map:
             mode = mode_map[text]
@@ -3794,7 +4072,7 @@ class MainController:
 
         async def strat_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             if not c.args:
-                await u.message.reply_text("사용법: /strat 번호\n1: Signal\n2: Shannon\n3: DualThrust\n4: DualMode")
+                await u.message.reply_text("사용법: /strat 번호\n1: Signal\n2: Shannon\n3: DualThrust\n4: DualMode\n5: TEMA")
                 return
             arg = c.args[0]
             if arg == '1':
@@ -4248,7 +4526,12 @@ class MainController:
                                 if c_c['en_exit']:
                                     val = exit_st.get('chop_val', 0.0)
                                     passed = exit_st.get('chop_pass', False)
-                                    msg += f"\nChop: {get_light(passed)} `{val:.1f}`"
+                                    
+                                    # [Display Fix] If val is 0.0 and enabled, it likely hasn't calculated yet
+                                    if val == 0.0:
+                                        msg += f"\nChop: ⏳Pending"
+                                    else:
+                                        msg += f"\nChop: {get_light(passed)} `{val:.1f}`"
                                 else:
                                      msg += f"\nChop: ⚪️OFF"
                             
