@@ -824,6 +824,14 @@ class SignalEngine(BaseEngine):
         try:
             self.last_activity = time.time()
             
+            # Common: Fetch Current Positions (Always monitor existing positions)
+            positions = await asyncio.to_thread(self.exchange.fetch_positions)
+            active_position_symbols = set()
+            for p in positions:
+                if float(p.get('contracts', 0)) > 0:
+                    sym = p['symbol'].replace(':USDT', '')
+                    active_position_symbols.add(sym)
+
             # Check Scanner Setting
             scanner_enabled = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('scanner_enabled', True)
             
@@ -831,6 +839,10 @@ class SignalEngine(BaseEngine):
             
             if scanner_enabled:
                 # === [Mode 1: Serial Scanner] ===
+                # 0. Add Existing Positions to Targets (Safety Net)
+                for sym in active_position_symbols:
+                    target_symbols.add(sym)
+
                 # 1. 만약 이미 잡고 있는 스캐너 코인이 있다면? -> 그것만 관리
                 if self.scanner_active_symbol:
                     # 포지션이 아직 살아있는지 확인
@@ -846,37 +858,47 @@ class SignalEngine(BaseEngine):
                 
                 # 2. 잡고 있는게 없다면? -> 스캔 실행
                 if not self.scanner_active_symbol:
-                    # 스캔 주기는 30분이나, "잡고 있는게 없을 때"는 즉시/빈번하게 스캔할지 결정
-                    # 여기서는 쿨타임(5분) 정도 주거나, 아니면 바로 진입 시도. 
-                    # user: "청산 후 다시 스캔시" -> 즉시 스캔이 맞음. 
-                    # 다만 너무 잦은 API 호출 방지를 위해 last_volume_scan 체크는 유지하되 쿨타임 짧게
+                    # 스캔 결과와 별개로 기존 포지션은 이미 target_symbols에 추가됨
                     
                     # 쿨타임 로직: 포지션 청산 직후라면 바로 스캔해야 함.
-                    # last_volume_scan을 0으로 만들어주는 로직이 필요하거나, 여기서 조건 완화
-                    if time.time() - self.last_volume_scan > 60: # 1분 쿨타임 (빈번한 스캔 방지)
+                    if time.time() - self.last_volume_scan > 60: # 1분 쿨타임
                         await self.scan_and_trade_high_volume()
                         self.last_volume_scan = time.time()
                     
-                    # 스캔 결과 진입했으면 target_symbols에 추가됨 (아래 scan 함수에서 설정)
+                    # 스캔 결과 진입했으면 target_symbols에 추가됨
                     if self.scanner_active_symbol:
                         target_symbols.add(self.scanner_active_symbol)
             else:
                 # === [Mode 2: Manual / Watchlist] ===
                 # Config Watchlist
                 config_symbols = set(self.cfg.get('signal_engine', {}).get('watchlist', []))
-                # Current Positions (Legacy/Manual)
-                positions = await asyncio.to_thread(self.exchange.fetch_positions)
-                active_position_symbols = set()
-                for p in positions:
-                    if float(p.get('contracts', 0)) > 0:
-                        sym = p['symbol'].replace(':USDT', '')
-                        active_position_symbols.add(sym)
                 
                 # Merge: Config + Chat Manual + Positions
                 target_symbols = self.active_symbols | config_symbols | active_position_symbols
-
+ 
             if not target_symbols:
+                if scanner_enabled:
+                    # [Fix] Provide status feedback during scanning (Target empty)
+                    total, free, mmr = await self.get_balance_info()
+                    count, daily_pnl = self.db.get_daily_stats()
+                    
+                    self.ctrl.status_data['SCANNER'] = {
+                        'engine': 'SIGNAL',
+                        'symbol': 'Scanning... 📡',
+                        'price': 0,
+                        'pos_side': 'NONE',
+                        'total_equity': total, 'free_usdt': free, 'mmr': mmr,
+                        'daily_count': count, 'daily_pnl': daily_pnl,
+                        'leverage': common_cfg.get('leverage', 20),
+                        'margin_mode': 'ISOLATED',
+                        'entry_tf': entry_tf,
+                        'exit_tf': common_cfg.get('exit_timeframe', '4h')
+                    }
                 return
+
+            # If targets exist, remove SCANNER placeholder to avoid duplicate display
+            if 'SCANNER' in self.ctrl.status_data:
+                del self.ctrl.status_data['SCANNER']
 
             # Configs
             cfg = self.cfg.get('signal_engine', {})
