@@ -1,6 +1,6 @@
 # emas_improved.py
 # [순수 폴링 버전]
-# Version: 2025-12-25-Final (Logic Fix Applied)
+# Version: 2025-12-25-Recovery (Emergency Access)
 # 1. WebSocket 제거 → 안정적인 폴링 방식으로 전환
 # 2. Signal/Shannon 엔진 모두 폴링 지원
 # 3. 모든 Critical 이슈 수정: chat_id 타입, 예외 로깅, async 핸들러
@@ -28,7 +28,12 @@ except ImportError:
     logging.warning("⚠️ hurst 패키지 없음. FractalFisher 전략 사용 불가. 설치: pip install hurst")
 from datetime import datetime, timezone, timedelta
 from collections import deque
-from dual_mode_fractal_strategy import DualModeFractalStrategy
+try:
+    from dual_mode_fractal_strategy import DualModeFractalStrategy
+    DUAL_MODE_AVAILABLE = True
+except ImportError:
+    DUAL_MODE_AVAILABLE = False
+    logging.warning("⚠️ dual_mode_fractal_strategy.py 파일이 없습니다. 해당 전략을 사용하려면 파일을 복구하세요.")
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
