@@ -115,6 +115,9 @@ class TradingConfig:
                     'target_roe_pct': 20.0,
                     'stop_loss_pct': 10.0,
                     'daily_loss_limit': 5000.0,
+                    'scanner_enabled': True,
+                    'scanner_timeframe': '15m', # [New] Dedicated Scanner TF
+                    'scanner_exit_timeframe': '1h', # [New] Dedicated Scanner Exit TF
                     'r2_entry_enabled': True,
                     'r2_exit_enabled': True,
                     'r2_threshold': 0.25,
@@ -502,6 +505,11 @@ class TemaEngine(BaseEngine):
     
     def start(self):
         super().start()
+        # 재시작 시 상태 초기화하여 즉시 분석 가능하게 함
+        self.last_candle_time = 0
+        self.ema1 = None
+        self.ema2 = None
+        self.ema3 = None
         logger.info(f"🚀 [TEMA] Engine started")
         
     async def poll_tick(self):
@@ -651,6 +659,22 @@ class TemaEngine(BaseEngine):
 
     async def entry(self, symbol, side, price, common_cfg):
         try:
+            # === [Single Position Enforcement] ===
+            try:
+                all_positions = await asyncio.to_thread(self.exchange.fetch_positions)
+                for p in all_positions:
+                    if float(p.get('contracts', 0)) > 0:
+                        active_sym = p.get('symbol', '').replace(':USDT', '').replace('/', '')
+                        target_sym = symbol.replace(':USDT', '').replace('/', '')
+                        
+                        if active_sym != target_sym:
+                            logger.warning(f"🚫 [Single Limit] Entry blocked: Already holding {p['symbol']}")
+                            await self.ctrl.notify(f"🚫 **진입 차단**: 단일 포지션 제한 (보유중: {p['symbol']})")
+                            return
+            except Exception as e:
+                logger.error(f"Single position check failed: {e}")
+                return
+
             # 1. 자산 확인
             total, free, _ = await self.get_balance_info()
             if total <= 0: return
@@ -782,15 +806,25 @@ class SignalEngine(BaseEngine):
     def start(self):
         super().start()
         self.last_activity = time.time()
+        # [Fix] 재개(RESUME) 시 상태 초기화하여 즉시 재진입 가능하도록 수정
+        self.last_candle_time = {}
+        self.last_candle_success = {}
+        self.last_processed_candle_ts = {}
+        self.last_processed_exit_candle_ts = {}
+        
         # 초기화
         config_watchlist = self.cfg.get('signal_engine', {}).get('watchlist', [])
         for s in config_watchlist:
             self.active_symbols.add(s)
         logger.info(f"🚀 [Signal] Engine started (Multi-Symbol Mode). Watching: {self.active_symbols}")
 
-    def _get_exit_timeframe(self):
-        """청산용 타임프레임 (User Defined)"""
+    def _get_exit_timeframe(self, symbol=None):
+        """청산용 타임프레임 (User Defined)
+           종목이 스캐너에 의해 잡힌 경우 전용 타임프레임 반환
+        """
         cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+        if symbol and symbol == self.scanner_active_symbol:
+            return cfg.get('scanner_exit_timeframe', '1h')
         return cfg.get('exit_timeframe', '4h')
 
     def _calculate_kalman_values(self, df, kalman_cfg):
@@ -976,7 +1010,7 @@ class SignalEngine(BaseEngine):
             
             # Cross/Position 모드에서만 Secondary TF 청산 로직 사용
             if (pos_side != 'NONE') and (active_strategy in ['sma', 'hma']) and (entry_mode in ['cross', 'position']):
-                exit_tf = self._get_exit_timeframe()
+                exit_tf = self._get_exit_timeframe(symbol)
                 
                 ohlcv_e = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, exit_tf, limit=5)
                 if ohlcv_e and len(ohlcv_e) >= 3:
@@ -1039,57 +1073,53 @@ class SignalEngine(BaseEngine):
                  logger.info("scanner: No candidates after filtering.")
                  return
 
-            # 3. 3차 필터: 그 중 거래대금 1등
+            # 3. 3차 필터: 그 중 거래대금 순으로 정렬하여 순차적으로 체크
             top_5_risers.sort(key=lambda x: x['vol'], reverse=True)
-            target_coin = top_5_risers[0]
             
-            symbol = target_coin['symbol']
-            logger.info(f"🎯 Scanner Target Selected: {symbol} (Vol: {target_coin['vol']/1_000_000:.1f}M, Rise: {target_coin['pct']:.2f}%)")
+            for target_coin in top_5_risers:
+                symbol = target_coin['symbol']
+                logger.info(f"🎯 Scanner Evaluating: {symbol} (Vol: {target_coin['vol']/1_000_000:.1f}M, Rise: {target_coin['pct']:.2f}%)")
 
-            # 4. 전략 실행
-            if self.ctrl.is_paused: return
-            
-            try:
-                cfg = self.cfg.get('signal_engine', {})
-                primary_tf = cfg.get('common_settings', {}).get('timeframe', '15m')
-                strategy_params = cfg.get('strategy_params', {})
+                # 4. 전략 실행
+                if self.ctrl.is_paused: return
                 
-                ohlcv = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, primary_tf, limit=300)
-                if not ohlcv: return
-                
-                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                
-                # 설정 메뉴에서 선택한 entry_mode 사용 (유연성)
-                scan_params = strategy_params.copy()
-                active_strategy = scan_params.get('active_strategy', 'sma').lower()
-                if active_strategy not in ['sma', 'hma']:
-                    active_strategy = 'sma' # Safety fallback
-                
-                sig, _, _, _, _, _ = await self._calculate_strategy_signal(symbol, df, scan_params, active_strategy)
-                
-                # 포지션 확인 (서버)
-                pos = await self.get_server_position(symbol, use_cache=False)
-                
-                if not pos and sig:
-                    logger.info(f"🚀 Scanner Locking In: {symbol} [{sig.upper()}] detected!")
-                    current_price = float(ohlcv[-1][4])
-                    await self.entry(symbol, sig, current_price)
+                try:
+                    cfg = self.cfg.get('signal_engine', {})
+                    scan_tf = cfg.get('common_settings', {}).get('scanner_timeframe', '15m')
+                    strategy_params = cfg.get('strategy_params', {})
                     
-                    # [Serial Mode] Lock this symbol
-                    self.scanner_active_symbol = symbol
+                    ohlcv = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, scan_tf, limit=300)
+                    if not ohlcv: continue
                     
-                    # [Important] Mark candle as processed to prevent double-entry by poll_tick
-                    # poll_tick이 곧바로 이 심볼을 폴링할 텐데, 이미 진입했음을 알리기 위해 타임스탬프 갱신
-                    current_ts = int(ohlcv[-1][0])
-                    self.last_processed_candle_ts[symbol] = current_ts
-                    self.last_candle_time[symbol] = current_ts
-                    self.last_candle_success[symbol] = True
-                    # active_symbols에 추가할 필요 없음 (poll_tick에서 scanner_active_symbol 관리)
-                else:
-                    logger.info(f"👀 Scanner Checked {symbol}: Waiting for signal (Sig={sig}, Pos={pos['side'] if pos else 'None'})")
+                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    scan_params = strategy_params.copy()
+                    active_strategy = scan_params.get('active_strategy', 'sma').lower()
+                    if active_strategy not in ['sma', 'hma']:
+                        active_strategy = 'sma'
+                    
+                    sig, _, _, _, _, _ = await self._calculate_strategy_signal(symbol, df, scan_params, active_strategy)
+                    
+                    if sig:
+                        # 포지션 확인 (서버)
+                        pos = await self.get_server_position(symbol, use_cache=False)
+                        
+                        if not pos:
+                            logger.info(f"🚀 Scanner Locking In: {symbol} [{sig.upper()}] detected!")
+                            current_price = float(ohlcv[-1][4])
+                            await self.entry(symbol, sig, current_price)
+                            
+                            self.scanner_active_symbol = symbol
+                            current_ts = int(ohlcv[-1][0])
+                            self.last_processed_candle_ts[symbol] = current_ts
+                            self.last_candle_time[symbol] = current_ts
+                            self.last_candle_success[symbol] = True
+                            break # Found a winner, exit loop
+                        else:
+                            logger.info(f"👀 Scanner Checked {symbol}: Position exists ({pos['side']})")
 
-            except Exception as e:
-                logger.error(f"Scanner strategy check failed for {symbol}: {e}")
+                except Exception as e:
+                    logger.error(f"Scanner strategy check failed for {symbol}: {e}")
+                    continue
                 
         except Exception as e:
             logger.error(f"Volume scanner error: {e}")
@@ -1436,7 +1466,7 @@ class SignalEngine(BaseEngine):
             else:
                 p = strategy_params.get('Triple_SMA', {})
                 fast_period = p.get('fast_sma', 3)
-                slow_period = p.get('slow_sma', 33)
+                slow_period = p.get('slow_sma', 10) # Fixed default to match config
                 df['f'] = ta.sma(df['close'], length=fast_period)
                 df['s'] = ta.sma(df['close'], length=slow_period)
                 strategy_name = "SMA(Exit)"
@@ -1452,10 +1482,12 @@ class SignalEngine(BaseEngine):
             # If Long -> Cross Down is exit signal
             if p_f > p_s and c_f < c_s:
                 raw_exit_long = True
+                logger.info(f"📉 [Exit Debug] {symbol} Dead Cross: {p_f:.2f}/{p_s:.2f} -> {c_f:.2f}/{c_s:.2f}")
             
             # If Short -> Cross Up is exit signal
             if p_f < p_s and c_f > c_s:
                 raw_exit_short = True
+                logger.info(f"📈 [Exit Debug] {symbol} Golden Cross: {p_f:.2f}/{p_s:.2f} -> {c_f:.2f}/{c_s:.2f}")
                 
             # Or Position Check? 
             # Usually 'Cross' strategy uses Cross for exit. 
@@ -1466,9 +1498,15 @@ class SignalEngine(BaseEngine):
             if current_side.lower() == 'long':
                 if c_f < c_s: # Alignment becomes bearish
                     raw_exit_long = True
+                    logger.info(f"🚫 [Exit Debug] {symbol} Bearish Alignment: {c_f:.2f} < {c_s:.2f}")
+                else:
+                    logger.debug(f"🔍 [Exit Debug] {symbol} Still Bullish: {c_f:.2f} > {c_s:.2f}")
             elif current_side.lower() == 'short':
                 if c_f > c_s: # Alignment becomes bullish
                     raw_exit_short = True
+                    logger.info(f"✅ [Exit Debug] {symbol} Bullish Alignment: {c_f:.2f} > {c_s:.2f}")
+                else:
+                    logger.debug(f"🔍 [Exit Debug] {symbol} Still Bearish: {c_f:.2f} < {c_s:.2f}")
             
             # 신호가 없더라도 필터 값은 계산해서 대시보드에 업데이트 (⏳ Pending 방지)
             await self._update_exit_filter_values(symbol, df, current_side)
@@ -1541,22 +1579,31 @@ class SignalEngine(BaseEngine):
             
             
             # ===== 4. Execute Exit =====
-            signal_type = "Signal"
-            if raw_exit_long and current_side.lower() == 'long':
-                signal_type = "Bearish_Cross"
-                if can_exit:
-                    logger.info(f"🔔 [Exit {tf}] {signal_type} Detected + Filters OK. EXIT LONG.")
-                    await self.exit_position(symbol, f"{strategy_name}_Exit_L")
-                else:
-                    logger.info(f"🛡️ [Exit {tf}] {signal_type} Detected but Blocked by Filters: {', '.join(block_reasons)}")
+            # Use specific logic for Position Strategy as requested by user
+            # Rule: Long Exit -> Bearish Alignment AND Chop Green
+            #       Short Exit -> Bullish Alignment AND Chop Green
             
-            elif raw_exit_short and current_side.lower() == 'short':
-                signal_type = "Bullish_Cross"
-                if can_exit:
-                    logger.info(f"🔔 [Exit {tf}] {signal_type} Detected + Filters OK. EXIT SHORT.")
-                    await self.exit_position(symbol, f"{strategy_name}_Exit_S")
+            can_exit_by_chop = not chop_exit_enabled or (curr_chop <= chop_thresh)
+            
+            if current_side.lower() == 'long':
+                if c_f < c_s: # Bearish Alignment
+                    if can_exit_by_chop:
+                        logger.info(f"🔔 [Exit {tf}] LONG Exit Triggered: Bearish Alignment AND Chop Green ({curr_chop:.1f})")
+                        await self.exit_position(symbol, f"{strategy_name}_Exit_L")
+                    else:
+                        logger.info(f"🛡️ [Exit {tf}] LONG Exit Blocked: Bearish Alignment but Chop is RED ({curr_chop:.1f})")
                 else:
-                    logger.info(f"🛡️ [Exit {tf}] {signal_type} Detected but Blocked by Filters: {', '.join(block_reasons)}")
+                    logger.debug(f"⏭ [Exit {tf}] LONG Exit Ignored: Still Bullish Alignment (Fast {c_f:.2f} > Slow {c_s:.2f})")
+            
+            elif current_side.lower() == 'short':
+                if c_f > c_s: # Bullish Alignment
+                    if can_exit_by_chop:
+                        logger.info(f"🔔 [Exit {tf}] SHORT Exit Triggered: Bullish Alignment AND Chop Green ({curr_chop:.1f})")
+                        await self.exit_position(symbol, f"{strategy_name}_Exit_S")
+                    else:
+                        logger.info(f"🛡️ [Exit {tf}] SHORT Exit Blocked: Bullish Alignment but Chop is RED ({curr_chop:.1f})")
+                else:
+                    logger.debug(f"⏭ [Exit {tf}] SHORT Exit Ignored: Still Bearish Alignment (Fast {c_f:.2f} < Slow {c_s:.2f})")
                 
         except Exception as e:
             logger.error(f"Process exit candle error: {e}")
@@ -1909,6 +1956,24 @@ class SignalEngine(BaseEngine):
 
     async def entry(self, symbol, side, price):
         try:
+            # === [Single Position Enforcement] ===
+            # 이미 다른 포지션이 있는지 확인 (전체 심볼 스캔)
+            # Volume Scanner 등 어떤 기능을 쓰더라도 이미 포지션이 있으면 추가 진입 차단
+            try:
+                all_positions = await asyncio.to_thread(self.exchange.fetch_positions)
+                for p in all_positions:
+                    if float(p.get('contracts', 0)) > 0:
+                        active_sym = p.get('symbol', '').replace(':USDT', '').replace('/', '')
+                        target_sym = symbol.replace(':USDT', '').replace('/', '')
+                        
+                        if active_sym != target_sym:
+                            logger.warning(f"🚫 [Single Limit] Entry blocked: Already holding {p['symbol']}")
+                            await self.ctrl.notify(f"🚫 **진입 차단**: 단일 포지션 제한 (보유중: {p['symbol']})")
+                            return
+            except Exception as e:
+                logger.error(f"Single position check failed: {e}")
+                return # 안전을 위해 확인 실패 시 진입 중단
+
             logger.info(f"📥 [Signal] Attempting {side.upper()} entry @ {price}")
             
             cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
@@ -2143,6 +2208,16 @@ class ShannonEngine(BaseEngine):
         self.atr_value = None
         self.trend_direction = None  # 'long', 'short', or None
         self.INDICATOR_UPDATE_INTERVAL = 10  # 10초마다 지표 갱신
+
+    def start(self):
+        super().start()
+        # 재시작 시 지표 캐시 초기화
+        self.last_logic_time = 0
+        self.last_indicator_update = 0
+        self.ema_200 = None
+        self.atr_value = None
+        self.trend_direction = None
+        logger.info(f"🚀 [Shannon] Engine started and cache cleared")
 
     async def poll_tick(self):
         """
@@ -2617,6 +2692,16 @@ class DualThrustEngine(BaseEngine):
         
         self.TRIGGER_UPDATE_INTERVAL = 60  # 60초마다 체크 (일 변경 확인)
 
+    def start(self):
+        super().start()
+        # 재시작 시 트리거 정보 초기화
+        self.last_heartbeat = 0
+        self.last_trigger_update = 0
+        self.trigger_date = None
+        self.long_trigger = None
+        self.short_trigger = None
+        logger.info(f"🚀 [DualThrust] Engine started and triggers reset")
+
     def _get_target_symbol(self):
         return self.cfg.get('dual_thrust_engine', {}).get('target_symbol', 'BTC/USDT')
 
@@ -2896,6 +2981,7 @@ class DualModeFractalEngine(BaseEngine):
 
     def start(self):
         super().start()
+        self.last_candle_ts = 0  # 타임스탬프 초기화 추가
         self._init_strategy()
 
     def _init_strategy(self):
@@ -3339,6 +3425,8 @@ class MainController:
         # Scanner 상태
         scanner_enabled = sig_common.get('scanner_enabled', True)
         scanner_status = "ON 📡" if scanner_enabled else "OFF"
+        scanner_tf = sig_common.get('scanner_timeframe', '15m')
+        scanner_exit_tf = sig_common.get('scanner_exit_timeframe', '1h')
 
         # Hourly Report Status
         hourly_report_status = "ON" if self.cfg.get('telegram', {}).get('reporting', {}).get('hourly_report_enabled', True) else "OFF"
@@ -3388,7 +3476,9 @@ class MainController:
 20. VBO 설정 (ATR/돌파/TP/SL)
 21. FractalFisher 설정 (Hurst/Fisher/Trailing)
 13. TP/SL 자동청산 (`{tp_sl_status}`)
-23. 거래량급등채굴 (`{scanner_status}`)
+23. 거래량급등채굴 (`{scanner_status}`) (`TF: {scanner_tf}`)
+24. 급등채굴 진입 프레임 설정
+25. 급등채굴 청산 프레임 설정 (`{scanner_exit_tf}`)
 
 **필터 (Entry / Exit)**
 26. R2 필터 (`{r2_entry}` / `{r2_exit}`) (기준: `{r2_threshold}`)
@@ -3413,7 +3503,7 @@ class MainController:
 
 ━━━ 시스템 ━━━
 22. 네트워크 전환 (`{network_status}`)
-25. 시간별 리포트 (`{hourly_report_status}`)
+42. 시간별 리포트 (`{hourly_report_status}`)
 
 
 ━━━ 제어 ━━━
@@ -3459,6 +3549,8 @@ class MainController:
             '21': "📝 **FractalFisher 설정**을 입력하세요 (형식: hurst기간,hurst임계,fisher기간,trailing배수 예: 100,0.55,10,2.0)",
             '22': "📝 **네트워크 선택** (1=테스트넷, 2=메인넷)",
             '23': "📝 **거래량 급등 채굴 기능**을 켜시겠습니까? (1=ON, 0=OFF)",
+            '24': "📝 **채굴 진입 타임프레임**을 입력하세요 (예: 5m)\n1m, 5m, 15m, 30m, 1h",
+            '25': "📝 **채굴 청산 타임프레임**을 입력하세요 (예: 1h)\n1m, 5m, 15m, 30m, 1h, 4h",
             '26': "📝 **추세 필터($R^2$) 기능**을 켜시겠습니까? (1=ON, 0=OFF)", # Toggle이므로 실제로는 사용되지 않을 수 있으나 prompt dict 구색 맞춤
             '27': "📝 **$R^2$ 기준값**을 입력하세요 (0.1 ~ 0.5 권장)\n- 낮을수록(0.1): 진입 자주 함 (노이즈 허용)\n- 높을수록(0.4): 확실한 추세만 진입 (진입 감소)",
             '28': "📝 **Hurst 필터**를 켜시겠습니까? (1=ON, 0=OFF)", 
@@ -3520,7 +3612,7 @@ class MainController:
             await update.message.reply_text(f"✅ TP/SL 자동청산: {status}")
             await self.show_setup_menu(update)
             return SELECT
-        elif text == '25':
+        elif text == '42':
             # Hourly Report Toggle
             curr = self.cfg.get('telegram', {}).get('reporting', {}).get('hourly_report_enabled', True)
             new_val = not curr
@@ -3564,6 +3656,12 @@ class MainController:
                 reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
             )
             return "KALMAN_SELECT"
+
+            return "KALMAN_SELECT"
+            
+        elif text == '24':
+            await update.message.reply_text(prompts['24'])
+            return INPUT
 
         elif text == '27':
             # R2 Threshold Input
@@ -3700,6 +3798,24 @@ class MainController:
                 await self.cfg.update_value(['dual_thrust_engine', 'risk_per_trade_pct'], v)
                 await self.cfg.update_value(['dual_mode_engine', 'risk_per_trade_pct'], v)
             
+            elif choice == '24':
+                # Scanner Entry Timeframe
+                valid_tf = ['1m', '2m', '3m', '5m', '15m', '30m', '1h', '4h']
+                if val not in valid_tf:
+                    await update.message.reply_text(f"❌ 유효하지 않은 타임프레임.\n추천: 1m, 5m, 15m")
+                    return SELECT
+                await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_timeframe'], val)
+                await update.message.reply_text(f"✅ 채굴 진입 타임프레임 변경: {val}")
+
+            elif choice == '25':
+                # Scanner Exit Timeframe
+                valid_tf = ['1m', '2m', '3m', '5m', '15m', '30m', '1h', '4h']
+                if val not in valid_tf:
+                    await update.message.reply_text(f"❌ 유효하지 않은 타임프레임.\n추천: 1m, 5m, 15m, 1h")
+                    return SELECT
+                await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_exit_timeframe'], val)
+                await update.message.reply_text(f"✅ 채굴 청산 타임프레임 변경: {val}")
+
             # ======== Signal (SMA) 전용 ========
             elif choice == '10':
                 # SMA 기간 변경 (형식: "2,10" 또는 "5,25")
