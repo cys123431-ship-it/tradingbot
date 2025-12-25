@@ -1,6 +1,6 @@
 # emas_improved.py
 # [순수 폴링 버전]
-# Version: 2025-12-25-v2 (Verification Marker)
+# Version: 2025-12-25-Final (Logic Fix Applied)
 # 1. WebSocket 제거 → 안정적인 폴링 방식으로 전환
 # 2. Signal/Shannon 엔진 모두 폴링 지원
 # 3. 모든 Critical 이슈 수정: chat_id 타입, 예외 로깅, async 핸들러
