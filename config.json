@@ -1,6 +1,6 @@
 {
     "api": {
-        "use_testnet": true,
+        "use_testnet": false,
         "mainnet": {
             "api_key": "tjFZTK2C0ntEqFdkmdV2L03lBR6Gy5sSN0J8AGUVkpOsVXzt9O7bp2iWazHGn5q4",
             "secret_key": "WPsbl8SBhfwBtdH0PWjQJgKmiRm15NNAUqsEnRPX3MDlQomaHdnyGK7evFyvOzVY"
