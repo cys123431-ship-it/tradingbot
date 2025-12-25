@@ -1088,14 +1088,17 @@ class SignalEngine(BaseEngine):
                     scan_tf = cfg.get('common_settings', {}).get('scanner_timeframe', '15m')
                     strategy_params = cfg.get('strategy_params', {})
                     
-                    ohlcv = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, scan_tf, limit=300)
-                    if not ohlcv: continue
-                    
-                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    # [MODIFIED] Always use entry_timeframe if scanner is evaluating for a position-like entry
                     scan_params = strategy_params.copy()
                     active_strategy = scan_params.get('active_strategy', 'sma').lower()
                     if active_strategy not in ['sma', 'hma']:
                         active_strategy = 'sma'
+                    
+                    # Use scanner_timeframe if set, but ensure we are thinking about consistency
+                    ohlcv = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, scan_tf, limit=300)
+                    if not ohlcv: continue
+                    
+                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     
                     sig, _, _, _, _, _ = await self._calculate_strategy_signal(symbol, df, scan_params, active_strategy)
                     
@@ -1339,7 +1342,9 @@ class SignalEngine(BaseEngine):
         try:
             await self.check_status(symbol, float(k['c']))
             
-            tf = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('timeframe', '15m')
+            # [MODIFIED] Prioritize entry_timeframe for fetching entry OHLCV
+            common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+            tf = common_cfg.get('entry_timeframe', common_cfg.get('timeframe', '15m'))
             ohlcv = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, tf, limit=300)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
@@ -1466,7 +1471,7 @@ class SignalEngine(BaseEngine):
             else:
                 p = strategy_params.get('Triple_SMA', {})
                 fast_period = p.get('fast_sma', 3)
-                slow_period = p.get('slow_sma', 10) # Fixed default to match config
+                slow_period = p.get('slow_sma', 10) # Fixed default to 10
                 df['f'] = ta.sma(df['close'], length=fast_period)
                 df['s'] = ta.sma(df['close'], length=slow_period)
                 strategy_name = "SMA(Exit)"
@@ -1749,7 +1754,7 @@ class SignalEngine(BaseEngine):
         elif active_strategy == 'sma':
             p = strategy_params.get('Triple_SMA', {})
             fast_period = p.get('fast_sma', 3)
-            slow_period = p.get('slow_sma', 33) # Default defaults
+            slow_period = p.get('slow_sma', 10) # Modified default from 33 to 10
             try:
                 df['f'] = ta.sma(df['close'], length=fast_period)
                 df['s'] = ta.sma(df['close'], length=slow_period)
@@ -4522,8 +4527,9 @@ class MainController:
                     if dm_engine and hasattr(dm_engine, 'poll_tick'):
                         await dm_engine.poll_tick()
                 
-                # 타임프레임에 따른 폴링 간격
-                tf = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('timeframe', '15m')
+                # [MODIFIED] Prioritize entry_timeframe for polling interval
+                sys_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+                tf = sys_cfg.get('entry_timeframe', sys_cfg.get('timeframe', '15m'))
                 poll_interval = self._get_poll_interval(tf)
                 await asyncio.sleep(poll_interval)
                 
