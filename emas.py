@@ -346,28 +346,38 @@ class BaseEngine:
             logger.error(f"Price precision error: {e}")
             return str(round(price, 2))
 
-    async def ensure_market_settings(self, symbol):
+    async def ensure_market_settings(self, symbol, leverage=None):
+        """마켓 설정 강제 적용 (격리 모드 + 레버리지)"""
+        # 1. Position Mode: One-way (Hedge Mode OFF)
         try:
             await asyncio.to_thread(self.exchange.set_position_mode, hedged=False, symbol=symbol)
         except Exception as e:
-            logger.warning(f"Position mode setting: {e}")
+            # 이미 설정되어 있거나 지원하지 않는 경우 무시 (로그 생략 가능)
+            pass
         
+        # 2. Margin Mode: ISOLATED (강제)
         try:
             await asyncio.to_thread(self.exchange.set_margin_mode, 'ISOLATED', symbol)
         except Exception as e:
-            logger.warning(f"Margin mode setting: {e}")
+            # 이미 격리 모드일 수 있음
+            pass
         
+        # 3. Leverage Setting
         try:
-            eng = self.cfg.get('system_settings', {}).get('active_engine', 'shannon')
-            if eng == 'shannon':
-                lev = self.cfg.get('shannon_engine', {}).get('leverage', 5)
-            elif eng == 'dualthrust':
-                lev = self.cfg.get('dual_thrust_engine', {}).get('leverage', 5)
-            else:
-                lev = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('leverage', 20)
+            # 인자로 전달된 레버리지가 없으면 설정에서 조회
+            if leverage is None:
+                eng = self.cfg.get('system_settings', {}).get('active_engine', 'shannon')
+                if eng == 'shannon':
+                    leverage = self.cfg.get('shannon_engine', {}).get('leverage', 5)
+                elif eng == 'dualthrust':
+                    leverage = self.cfg.get('dual_thrust_engine', {}).get('leverage', 5)
+                elif eng == 'dualmode':
+                    leverage = self.cfg.get('dual_mode_engine', {}).get('leverage', 5)
+                else:
+                    leverage = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('leverage', 20)
             
-            await asyncio.to_thread(self.exchange.set_leverage, lev, symbol)
-            logger.info(f"✅ {symbol} Settings: ISOLATED / {lev}x")
+            await asyncio.to_thread(self.exchange.set_leverage, leverage, symbol)
+            logger.info(f"✅ {symbol} Settings: ISOLATED / {leverage}x")
         except Exception as e:
             logger.error(f"Leverage setting error: {e}")
 
@@ -660,6 +670,9 @@ class TemaEngine(BaseEngine):
             logger.info(f"💰 TEMA Entry: {side.upper()} {symbol} Qty={amount_str} Price={price_str} (Lev {leverage}x)")
             
             # 3. 주문 전송
+            # [Enforce] Market Settings
+            await self.ensure_market_settings(symbol, leverage=leverage)
+            
             params = {'leverage': leverage}
             
             if side == 'long':
@@ -1086,7 +1099,7 @@ class SignalEngine(BaseEngine):
             entry_mode = strategy_params.get('entry_mode', 'cross').upper()
             
             # Cross/Position 모드에서 Kalman 필터가 로직상 강제 사용되므로 상태 표시도 활성화 (SMA/HMA)
-            if active_strategy in ['SMA', 'HMA'] and entry_mode in ['CROSS', 'POSITION']:\
+            if active_strategy in ['SMA', 'HMA'] and entry_mode in ['CROSS', 'POSITION']:
                 kalman_enabled = True
             
             # MicroVBO State
@@ -1151,6 +1164,12 @@ class SignalEngine(BaseEngine):
                     'en_exit': strategy_params.get('kalman_filter', {}).get('exit_enabled', False)
                 }
             }
+            
+            # [New] Status Display Enhancement
+            symbol_status['leverage'] = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('leverage', 20)
+            symbol_status['margin_mode'] = 'ISOLATED' # Enforced
+            symbol_status['entry_tf'] = comm_cfg.get('entry_timeframe', comm_cfg.get('timeframe', '8h'))
+            symbol_status['exit_tf'] = comm_cfg.get('exit_timeframe', '4h')
 
             self.ctrl.status_data[symbol] = symbol_status
             
@@ -1806,7 +1825,7 @@ class SignalEngine(BaseEngine):
         return sig, is_bullish, is_bearish, strategy_name, entry_mode, kalman_entry_enabled
 
     async def _update_exit_filter_values(self, symbol, df, current_side):
-        \"\"\"[Helper] Calculate exit filter values and update status without executing exit logic\"\"\"
+        """[Helper] Calculate exit filter values and update status without executing exit logic"""
         try:
             strategy_params = self.cfg.get('signal_engine', {}).get('strategy_params', {})
             common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
@@ -1891,7 +1910,10 @@ class SignalEngine(BaseEngine):
             
             logger.info(f"Entry params: qty={qty}, lev={lev}x, risk={risk_pct*100}%, raw_calc={(free * risk_pct * lev) / price}")
             
-            await asyncio.to_thread(self.exchange.set_leverage, lev, symbol)
+            # [Enforce] Market Settings (Isolated + Leverage)
+            await self.ensure_market_settings(symbol, leverage=lev)
+            
+            # await asyncio.to_thread(self.exchange.set_leverage, lev, symbol) # Redundant, handled above
             order = await asyncio.to_thread(
                 self.exchange.create_order, symbol, 'market', 
                 'buy' if side == 'long' else 'sell', qty
@@ -2740,8 +2762,9 @@ class DualThrustEngine(BaseEngine):
             lev = cfg.get('leverage', 5)
             risk_pct = cfg.get('risk_per_trade_pct', 50.0) / 100.0
             
-            # 레버리지 설정
-            await asyncio.to_thread(self.exchange.set_leverage, lev, symbol)
+            # 레버리지 설정 & 격리 모드 강제
+            await self.ensure_market_settings(symbol, leverage=lev)
+            # await asyncio.to_thread(self.exchange.set_leverage, lev, symbol)
             
             # 수량 계산
             bal = await asyncio.to_thread(self.exchange.fetch_balance)
@@ -2958,8 +2981,9 @@ class DualModeFractalEngine(BaseEngine):
         # 하지만 다른 설정들이 공통을 따르므로 레버리지도 공통을 읽는 것이 일관적임.
         lev = common_cfg.get('leverage', 5)
         
-        # 레버리지 설정
-        await asyncio.to_thread(self.exchange.set_leverage, lev, symbol)
+        # 레버리지 설정 & 격리 모드 강제
+        await self.ensure_market_settings(symbol, leverage=lev)
+        # await asyncio.to_thread(self.exchange.set_leverage, lev, symbol)
         
         cost = free_usdt * risk
         qty = self.safe_amount(symbol, (cost * lev) / price)
@@ -4404,83 +4428,7 @@ class MainController:
                         eng = self.cfg.get('system_settings', {}).get('active_engine', 'LOADING').upper()
                         msg = f"{blink} **[{eng}] Dashboard**{pause_indicator} [{datetime.now().strftime('%H:%M:%S')}]\n⏳ 데이터 수신 대기 중..."
                     else:
-                        eng = self.cfg.get('system_settings', {}).get('active_engine', 'unknown').upper()
-                        msg = f"{blink} **[{eng}] Dashboard**{pause_indicator} [{datetime.now().strftime('%H:%M:%S')}]\n\n"
-                        
-                        # 1. 공통 정보 (첫 번째 데이터에서 추출)
-                        first_symbol = list(all_data.keys())[0]
-                        d_first = all_data[first_symbol]
-                        
-                        msg += f"💰 **Asset Summary**\n"
-                        msg += f"Eq: `${d_first.get('total_equity', 0):.2f}` | Free: `${d_first.get('free_usdt', 0):.2f}`\n"
-                        msg += f"MMR: `{d_first.get('mmr', 0):.2f}%` | PnL: `${d_first.get('daily_pnl', 0):+.2f}`\n"
-                        msg += "━━━━━━━━━━━━━━━━━━\n"
-
-                        # 2. 각 심볼별 정보 (Concise Listing)
-                        for symbol, d in all_data.items():
-                            cur_price = d.get('price', 0)
-                            pos_side = d.get('pos_side', 'NONE')
-                            
-                            # 포지션 헤더
-                            p_emoji = "🟩" if pos_side == 'LONG' else "🟥" if pos_side == 'SHORT' else "⚪"
-                            msg += f"{p_emoji} **{symbol}** | {pos_side}\n"
-                            
-                            if pos_side != 'NONE':
-                                pnl = d.get('pnl_pct', 0)
-                                pnl_emoji = "📈" if pnl >= 0 else "📉"
-                                msg += f"└ PnL: `{d.get('pnl_usdt', 0):+.2f}` (`{pnl:+.2f}%`)\n"
-                                msg += f"└ Entry: `{d.get('entry_price', 0):.2f}`\n"
-                            
-                            # 엔진/전략별 상세 필터 ( concised )
-                            d_eng = d.get('engine', '').upper()
-                            if d_eng == 'SIGNAL':
-                                f_cfg = d.get('filter_config', {})
-                                entry_st = d.get('entry_filters', {})
-                                exit_st = d.get('exit_filters', {})
-                                
-                                def get_st_text(st_dict, cfg_key, val_key, pass_key, is_entry=True):
-                                    en_key = 'en_entry' if is_entry else 'en_exit'
-                                    if not f_cfg.get(cfg_key, {}).get(en_key, False):
-                                        return "⚪"
-                                    val = st_dict.get(val_key, 0.0)
-                                    if val == 0.0 and not is_entry: return "⏳"
-                                    return "🟢" if st_dict.get(pass_key, False) else "🔴"
-
-                                # 필터 상태 한 줄 요약
-                                # Entry 필터들
-                                e_r2 = get_st_text(entry_st, 'r2', 'r2_val', 'r2_pass', is_entry=True)
-                                e_h = get_st_text(entry_st, 'hurst', 'hurst_val', 'hurst_pass', is_entry=True)
-                                e_c = get_st_text(entry_st, 'chop', 'chop_val', 'chop_pass', is_entry=True)
-                                
-                                # Exit 필터들
-                                x_r2 = get_st_text(exit_st, 'r2', 'r2_val', 'r2_pass', is_entry=False)
-                                x_h = get_st_text(exit_st, 'hurst', 'hurst_val', 'hurst_pass', is_entry=False)
-                                x_c = get_st_text(exit_st, 'chop', 'chop_val', 'chop_pass', is_entry=False)
-                                
-                                msg += f"└ In: R2{e_r2} H{e_h} C{e_c} | Out: R2{x_r2} H{x_h} C{x_c}\n"
-                                
-                                # 전략 전용 정보 (MicroVBO/FractalFisher)
-                                active_strat = d.get('active_strategy', '')
-                                if active_strat == 'MICROVBO':
-                                    vbo = d.get('vbo_breakout_level', {})
-                                    if vbo:
-                                        msg += f"└ VBO: `L:{vbo.get('long',0):.1f}/S:{vbo.get('short',0):.1f}`\n"
-                                elif active_strat == 'FRACTALFISHER':
-                                    msg += f"└ FF: `H:{d.get('fisher_hurst',0):.2f}/F:{d.get('fisher_value',0):.2f}`\n"
-                                    if d.get('fisher_trailing_stop') and pos_side != 'NONE':
-                                        msg += f"└ TS: `{d.get('fisher_trailing_stop', 0):.2f}`\n"
-
-                            elif d_eng == 'SHANNON':
-                                msg += f"└ Trend: `{d.get('trend', 'N/A')}` | EMA: `{d.get('ema_200', 0):.1f}`\n"
-                                msg += f"└ Grid: `{d.get('grid_orders', 0)}` | Diff: `{d.get('diff_pct', 0):.1f}%`\n"
-
-                            elif d_eng == 'DUALTHRUST':
-                                msg += f"└ Triggers: `L:{d.get('long_trigger',0):.1f}/S:{d.get('short_trigger',0):.1f}`\n"
-
-                            elif d_eng == 'DUALMODE':
-                                msg += f"└ Mode: `{d.get('dm_mode', 'N/A')}` | TF: `{d.get('dm_tf')}`\n"
-
-                            msg += "\n" # 코인 간 간격
+                        msg = self._format_dashboard_message(all_data, blink, pause_indicator)
 
 
                     # 메시지 전송/수정
@@ -4536,6 +4484,106 @@ class MainController:
                 logger.error(f"Dashboard loop error: {e}")
                 await asyncio.sleep(10)
 
+
+    def _format_dashboard_message(self, all_data, blink, pause_indicator):
+        """대시보드 메시지 생성 (Enhanced with Margin/Lev/TF info)"""
+        try:
+            eng = self.cfg.get('system_settings', {}).get('active_engine', 'unknown').upper()
+            msg = f"{blink} **[{eng}] Dashboard**{pause_indicator} [{datetime.now().strftime('%H:%M:%S')}]\n\n"
+            
+            # 1. 공통 정보 (첫 번째 데이터에서 추출)
+            first_symbol = list(all_data.keys())[0]
+            d_first = all_data[first_symbol]
+            
+            msg += f"💰 **Asset Summary**\n"
+            msg += f"Eq: `${d_first.get('total_equity', 0):.2f}` | Free: `${d_first.get('free_usdt', 0):.2f}`\n"
+            msg += f"MMR: `{d_first.get('mmr', 0):.2f}%` | PnL: `${d_first.get('daily_pnl', 0):+.2f}`\n"
+            msg += "━━━━━━━━━━━━━━━━━━\n"
+
+            # 2. 각 심볼별 정보
+            for symbol, d in all_data.items():
+                cur_price = d.get('price', 0)
+                pos_side = d.get('pos_side', 'NONE')
+                
+                # 심볼 헤더
+                # [New] Add Margin Mode & Leverage Info to Header
+                lev = d.get('leverage', '?')
+                mm = d.get('margin_mode', 'ISO') # Forced ISO
+                mode_str = f"({mm} {lev}x)" if 'leverage' in d else ""
+                
+                p_emoji = "🟩" if pos_side == 'LONG' else "🟥" if pos_side == 'SHORT' else "⚪"
+                msg += f"{p_emoji} **{symbol}** {mode_str} | {pos_side}\n"
+                
+                if pos_side != 'NONE':
+                    pnl = d.get('pnl_pct', 0)
+                    pnl_emoji = "📈" if pnl >= 0 else "📉"
+                    msg += f"└ PnL: `{d.get('pnl_usdt', 0):+.2f}` (`{pnl:+.2f}%`)\n"
+                    # [New] Entry Price
+                    msg += f"└ Entry: `{d.get('entry_price', 0):.2f}` | Cur: `{cur_price:.2f}`\n"
+                else:
+                    msg += f"└ Cur: `{cur_price:.2f}`\n"
+
+                # 엔진/전략별 상세 필터
+                d_eng = d.get('engine', '').upper()
+                if d_eng == 'SIGNAL':
+                    # [New] Timeframes Information
+                    e_tf = d.get('entry_tf', '?')
+                    x_tf = d.get('exit_tf', '?')
+                    msg += f"└ TF: In[{e_tf}] / Out[{x_tf}]\n"
+                    
+                    f_cfg = d.get('filter_config', {})
+                    entry_st = d.get('entry_filters', {})
+                    exit_st = d.get('exit_filters', {})
+                    
+                    def get_st_text(st_dict, cfg_key, val_key, pass_key, is_entry=True):
+                        en_key = 'en_entry' if is_entry else 'en_exit'
+                        if not f_cfg.get(cfg_key, {}).get(en_key, False):
+                            return "⚪"
+                        val = st_dict.get(val_key, 0.0)
+                        if val == 0.0 and not is_entry: return "⏳" # Exit filter might be 0 if not calc
+                        return "✅" if st_dict.get(pass_key, False) else "⛔"
+
+                    # 필터 상태 (Entry / Exit 분리표시)
+                    # Entry
+                    e_r2 = get_st_text(entry_st, 'r2', 'r2_val', 'r2_pass', True)
+                    e_h = get_st_text(entry_st, 'hurst', 'hurst_val', 'hurst_pass', True)
+                    e_c = get_st_text(entry_st, 'chop', 'chop_val', 'chop_pass', True)
+                    
+                    # Exit
+                    x_r2 = get_st_text(exit_st, 'r2', 'r2_val', 'r2_pass', False)
+                    x_h = get_st_text(exit_st, 'hurst', 'hurst_val', 'hurst_pass', False)
+                    x_c = get_st_text(exit_st, 'chop', 'chop_val', 'chop_pass', False)
+                    
+                    msg += f"└ Filter(In): R2{e_r2} Hurst{e_h} Chop{e_c}\n"
+                    msg += f"└ Filter(Out): R2{x_r2} Hurst{x_h} Chop{x_c}\n"
+                    
+                    # 전략 전용 정보
+                    active_strat = d.get('active_strategy', '')
+                    if active_strat == 'MICROVBO':
+                        vbo = d.get('vbo_breakout_level', {})
+                        if vbo:
+                            msg += f"└ VBO: `L:{vbo.get('long',0):.1f}/S:{vbo.get('short',0):.1f}`\n"
+                    elif active_strat == 'FRACTALFISHER':
+                        msg += f"└ FF: `H:{d.get('fisher_hurst',0):.2f}/F:{d.get('fisher_value',0):.2f}`\n"
+                        if d.get('fisher_trailing_stop') and pos_side != 'NONE':
+                            msg += f"└ TS: `{d.get('fisher_trailing_stop', 0):.2f}`\n"
+
+                elif d_eng == 'SHANNON':
+                    msg += f"└ Trend: `{d.get('trend', 'N/A')}` | EMA: `{d.get('ema_200', 0):.1f}`\n"
+                    msg += f"└ Grid: `{d.get('grid_orders', 0)}` | Diff: `{d.get('diff_pct', 0):.1f}%`\n"
+
+                elif d_eng == 'DUALTHRUST':
+                    msg += f"└ Triggers: `L:{d.get('long_trigger',0):.1f}/S:{d.get('short_trigger',0):.1f}`\n"
+
+                elif d_eng == 'DUALMODE':
+                    msg += f"└ Mode: `{d.get('dm_mode', 'N/A')}` | TF: `{d.get('dm_tf')}`\n"
+
+                msg += "\n" # 코인 간 간격
+            
+            return msg
+        except Exception as e:
+            logger.error(f"Dashboard format error: {e}")
+            return "❌ 대시보드 포맷 오류"
 
     async def emergency_stop(self):
         """긴급 정지 - 모든 오픈 포지션 청산"""

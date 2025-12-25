@@ -143,6 +143,13 @@
         "daily_loss_limit": 10000.0,
         "target_roe_pct": 20.0
     },
+    "tema_engine": {
+        "target_symbol": "BTC/USDT",
+        "timeframe": "5m",
+        "rsi_period": 14,
+        "tema_period": 9,
+        "bollinger_window": 20
+    },
     "logging": {
         "db_path": "trades_history.db",
         "debug_mode": true
