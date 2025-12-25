@@ -2,17 +2,17 @@
     "api": {
         "use_testnet": true,
         "mainnet": {
-            "api_key": "YOUR_MAINNET_API_KEY",
-            "secret_key": "YOUR_MAINNET_SECRET_KEY"
+            "api_key": "tjFZTK2C0ntEqFdkmdV2L03lBR6Gy5sSN0J8AGUVkpOsVXzt9O7bp2iWazHGn5q4",
+            "secret_key": "WPsbl8SBhfwBtdH0PWjQJgKmiRm15NNAUqsEnRPX3MDlQomaHdnyGK7evFyvOzVY"
         },
         "testnet": {
-            "api_key": "YOUR_TESTNET_API_KEY",
-            "secret_key": "YOUR_TESTNET_SECRET_KEY"
+            "api_key": "DK98PN6MkJWxB4wVcVKBvfbJZw4Zz9kLAV8gwZw2fR1ItDYZTTohPWgihnuOBJ8x",
+            "secret_key": "Vbmrz1GO9g1gBG7vckNrSRCSnD9fGymVKlHnA1mzmXGBQBVBT3XAJmaSYC5oEEK9"
         }
     },
     "telegram": {
-        "token": "YOUR_TELEGRAM_BOT_TOKEN",
-        "chat_id": "YOUR_TELEGRAM_CHAT_ID",
+        "token": "8577778609:AAEuJg8_YHsckvUxzY_7Gwxh_YkUrnQhyIQ",
+        "chat_id": "6612324026",
         "reporting": {
             "use_dashboard_mode": true,
             "hourly_report_enabled": false
@@ -26,13 +26,13 @@
     },
     "signal_engine": {
         "watchlist": [
-            "ETH/USDT"
+            "XRP/USDT"
         ],
         "common_settings": {
             "leverage": 5,
-            "timeframe": "8h",
-            "entry_timeframe": "8h",
-            "exit_timeframe": "6h",
+            "timeframe": "2h",
+            "entry_timeframe": "2h",
+            "exit_timeframe": "1h",
             "risk_per_trade_pct": 50.0,
             "target_roe_pct": 50.0,
             "stop_loss_pct": 25.0,
@@ -43,11 +43,13 @@
             "hurst_entry_enabled": false,
             "hurst_exit_enabled": false,
             "chop_entry_enabled": false,
-            "chop_exit_enabled": false,
+            "chop_exit_enabled": true,
             "r2_threshold": 0.25,
             "hurst_threshold": 0.55,
             "chop_threshold": 50.0,
-            "scanner_enabled": false
+            "scanner_enabled": false,
+            "scanner_timeframe": "30m",
+            "scanner_exit_timeframe": "15m"
         },
         "strategy_params": {
             "active_strategy": "sma",
@@ -89,7 +91,7 @@
     "shannon_engine": {
         "target_symbol": "BTC/USDT",
         "leverage": 5,
-        "timeframe": "8h",
+        "timeframe": "2h",
         "daily_loss_limit": 10000.0,
         "asset_allocation": {
             "target_ratio": 0.5,
@@ -138,13 +140,13 @@
         "mode": "standard",
         "risk_per_trade_pct": 50.0,
         "scalping_tf": "5m",
-        "standard_tf": "8h",
+        "standard_tf": "2h",
         "stop_loss_pct": 10.0,
         "daily_loss_limit": 10000.0,
         "target_roe_pct": 20.0
     },
     "tema_engine": {
-        "target_symbol": "BTC/USDT",
+        "target_symbol": "XRP/USDT",
         "timeframe": "5m",
         "rsi_period": 14,
         "tema_period": 9,
