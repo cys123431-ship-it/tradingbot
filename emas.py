@@ -1979,6 +1979,12 @@ class SignalEngine(BaseEngine):
                     df['idx_seq'] = np.arange(len(df))
                 curr_cc = df['close'].rolling(cc_len).corr(df['idx_seq']).iloc[-2]
                 if np.isnan(curr_cc): curr_cc = 0.0
+            
+            # Debug: CC Pass calculation
+            cc_pass_result = (not cc_exit_enabled) or \
+                           (current_side.lower() == 'long' and curr_cc < -cc_thresh) or \
+                           (current_side.lower() == 'short' and curr_cc > cc_thresh)
+            logger.debug(f"[CC Debug] enabled={cc_exit_enabled}, side={current_side}, cc={curr_cc:.3f}, thresh={cc_thresh}, pass={cc_pass_result}")
 
             # Update Status Data for Dashboard
             self.last_exit_filter_status[symbol] = {
