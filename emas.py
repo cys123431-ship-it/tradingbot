@@ -132,7 +132,10 @@ class TradingConfig:
                     'hurst_threshold': 0.55,
                     'chop_entry_enabled': True,
                     'chop_exit_enabled': True,
-                    'chop_threshold': 50.0
+                    'chop_threshold': 50.0,
+                    'cc_exit_enabled': False,
+                    'cc_threshold': 0.70,
+                    'cc_length': 14
                 }
             },
             'dual_thrust_engine': {
@@ -1220,6 +1223,10 @@ class SignalEngine(BaseEngine):
                     'en_exit': comm_cfg.get('chop_exit_enabled', True),
                     'th': comm_cfg.get('chop_threshold', 50.0)
                 },
+                'cc': {
+                    'en_exit': comm_cfg.get('cc_exit_enabled', False),
+                    'th': comm_cfg.get('cc_threshold', 0.70)
+                },
                 'kalman': {
                     'en_entry': strategy_params.get('kalman_filter', {}).get('entry_enabled', False),
                     'en_exit': strategy_params.get('kalman_filter', {}).get('exit_enabled', False)
@@ -1574,11 +1581,18 @@ class SignalEngine(BaseEngine):
                     can_exit = False
                     block_reasons.append(f"Hurst({curr_hurst:.2f})<{hurst_thresh}")
 
-            # 4. Chop Check
-            if chop_exit_enabled:
-                if curr_chop > chop_thresh:
-                    can_exit = False
                     block_reasons.append(f"Chop({curr_chop:.1f})>{chop_thresh}")
+            
+            # 5. CC Check (Correlation)
+            cc_exit_enabled = common_cfg.get('cc_exit_enabled', False)
+            cc_thresh = common_cfg.get('cc_threshold', 0.70)
+            curr_cc = st.get('cc_val', 0.0)
+            can_exit_by_cc = False
+            if cc_exit_enabled:
+                if current_side.lower() == 'long' and curr_cc < -cc_thresh:
+                    can_exit_by_cc = True
+                elif current_side.lower() == 'short' and curr_cc > cc_thresh:
+                    can_exit_by_cc = True
             
             # [New] Update Pass/Fail Status based on logic above
             st['kalman_pass'] = (not kalman_exit_enabled) or \
@@ -1596,23 +1610,29 @@ class SignalEngine(BaseEngine):
             
             can_exit_by_chop = not chop_exit_enabled or (curr_chop <= chop_thresh)
             
+            # CC is an ALTERNATIVE to Chop (OR logic)
+            # Re-confirm CC pass status for specific side
+            cc_pass = can_exit_by_cc 
+
             if current_side.lower() == 'long':
-                if c_f < c_s: # Bearish Alignment
-                    if can_exit_by_chop:
-                        logger.info(f"🔔 [Exit {tf}] LONG Exit Triggered: Bearish Alignment AND Chop Green ({curr_chop:.1f})")
+                if c_f < c_s: # Bearish Alignment (Signal)
+                    if can_exit_by_chop or can_exit_by_cc:
+                        reason = "Chop Green" if can_exit_by_chop else "CC Trend"
+                        logger.info(f"🔔 [Exit {tf}] LONG Exit Triggered: Bearish Alignment AND {reason} (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
                         await self.exit_position(symbol, f"{strategy_name}_Exit_L")
                     else:
-                        logger.info(f"🛡️ [Exit {tf}] LONG Exit Blocked: Bearish Alignment but Chop is RED ({curr_chop:.1f})")
+                        logger.info(f"🛡️ [Exit {tf}] LONG Exit Blocked: Bearish Alignment but both Chop and CC are RED (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
                 else:
                     logger.debug(f"⏭ [Exit {tf}] LONG Exit Ignored: Still Bullish Alignment (Fast {c_f:.2f} > Slow {c_s:.2f})")
             
             elif current_side.lower() == 'short':
-                if c_f > c_s: # Bullish Alignment
-                    if can_exit_by_chop:
-                        logger.info(f"🔔 [Exit {tf}] SHORT Exit Triggered: Bullish Alignment AND Chop Green ({curr_chop:.1f})")
+                if c_f > c_s: # Bullish Alignment (Signal)
+                    if can_exit_by_chop or can_exit_by_cc:
+                        reason = "Chop Green" if can_exit_by_chop else "CC Trend"
+                        logger.info(f"🔔 [Exit {tf}] SHORT Exit Triggered: Bullish Alignment AND {reason} (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
                         await self.exit_position(symbol, f"{strategy_name}_Exit_S")
                     else:
-                        logger.info(f"🛡️ [Exit {tf}] SHORT Exit Blocked: Bullish Alignment but Chop is RED ({curr_chop:.1f})")
+                        logger.info(f"🛡️ [Exit {tf}] SHORT Exit Blocked: Bullish Alignment but both Chop and CC are RED (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
                 else:
                     logger.debug(f"⏭ [Exit {tf}] SHORT Exit Ignored: Still Bearish Alignment (Fast {c_f:.2f} < Slow {c_s:.2f})")
                 
@@ -1948,6 +1968,17 @@ class SignalEngine(BaseEngine):
                         logger.warning("⚠️ Chop calculation returned None")
                 except Exception as e:
                     logger.error(f"❌ Chop calculation error (Exit): {e}")
+            
+            # E. CC Filter (Correlation Coefficient)
+            cc_exit_enabled = common_cfg.get('cc_exit_enabled', False)
+            cc_thresh = common_cfg.get('cc_threshold', 0.70)
+            cc_len = common_cfg.get('cc_length', 14)
+            curr_cc = 0.0
+            if len(df) >= cc_len:
+                if 'idx_seq' not in df.columns:
+                    df['idx_seq'] = np.arange(len(df))
+                curr_cc = df['close'].rolling(cc_len).corr(df['idx_seq']).iloc[-2]
+                if np.isnan(curr_cc): curr_cc = 0.0
 
             # Update Status Data for Dashboard
             self.last_exit_filter_status[symbol] = {
@@ -1958,6 +1989,10 @@ class SignalEngine(BaseEngine):
                 'r2_pass': (not r2_exit_enabled) or (curr_r2 >= r2_thresh),
                 'hurst_pass': (not hurst_exit_enabled) or (curr_hurst >= hurst_thresh),
                 'chop_pass': (not chop_exit_enabled) or (curr_chop <= chop_thresh),
+                'cc_val': curr_cc,
+                'cc_pass': (not cc_exit_enabled) or \
+                           (current_side.lower() == 'long' and curr_cc < -cc_thresh) or \
+                           (current_side.lower() == 'short' and curr_cc > cc_thresh),
                 'kalman_pass': (not kalman_exit_enabled) or \
                               (current_side.lower() == 'long' and kalman_vel < 0) or \
                               (current_side.lower() == 'short' and kalman_vel > 0)
@@ -3455,9 +3490,11 @@ class MainController:
         chop_exit = "ON" if sig_common.get('chop_exit_enabled', True) else "OFF"
         chop_threshold = sig_common.get('chop_threshold', 50.0)
         
-        kalman_cfg = strategy_params.get('kalman_filter', {})
         kalman_entry = "ON" if kalman_cfg.get('entry_enabled', False) else "OFF"
         kalman_exit = "ON" if kalman_cfg.get('exit_enabled', False) else "OFF"
+        
+        cc_exit = "ON" if sig_common.get('cc_exit_enabled', False) else "OFF"
+        cc_threshold = sig_common.get('cc_threshold', 0.70)
         
         # 네트워크 상태
         use_testnet = self.cfg.get('api', {}).get('use_testnet', True)
@@ -3496,10 +3533,12 @@ class MainController:
 28. Hurst 필터 (`{hurst_entry}` / `{hurst_exit}`) (기준: `{hurst_threshold}`)
 30. CHOP 필터 (`{chop_entry}` / `{chop_exit}`) (기준: `{chop_threshold}`)
 32. Kalman 필터 (`{kalman_entry}` / `{kalman_exit}`)
+33. CC 필터 (Exit Only) (`{cc_exit}`) (기준: `{cc_threshold}`)
 
 27. R2 민감도 설정
 29. Hurst 민감도 설정
 31. CHOP 민감도 설정
+34. CC 민감도 설정
 
 ━━━ Shannon 전용 ━━━
 11. 자산 비율 (`{shannon_ratio}%`)
@@ -3568,6 +3607,8 @@ class MainController:
             '29': "📝 **Hurst 기준값**을 입력하세요 (예: 0.55)\n- 0.5 이하는 평균회귀(횡보), 0.5 이상은 추세.\n- 높을수록 강한 추세만 진입.",
             '30': "📝 **CHOP 필터**를 켜시겠습니까? (1=ON, 0=OFF)",
             '31': "📝 **CHOP 기준값**을 입력하세요 (예: 50.0)\n- 100에 가까울수록 횡보(Choppy).\n- 설정값 **보다 크면** 진입 금지.",
+            '33': "📝 **CC 필터**를 켜시겠습니까? (1=ON, 0=OFF)",
+            '34': "📝 **CC 설정**을 입력하세요 (예: 0.70 또는 0.70,14)\n- 형식: 임계값 또는 임계값,기간\n- 낮을수록 민감, 높을수록 강한 추세만 청산.",
             '35': "📝 **Dual Mode 변경** (1=Standard, 2=Scalping)",
         }
         if text == '7':
@@ -3669,6 +3710,16 @@ class MainController:
             return "KALMAN_SELECT"
 
             return "KALMAN_SELECT"
+            
+        elif text == '33':
+            # CC Filter Menu (Exit only)
+            curr = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('cc_exit_enabled', False)
+            new_val = not curr
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'cc_exit_enabled'], new_val)
+            status = "ON" if new_val else "OFF"
+            await update.message.reply_text(f"✅ CC 필터 (Exit): {status}")
+            await self.show_setup_menu(update)
+            return SELECT
             
         elif text == '24':
             await update.message.reply_text(prompts['24'])
@@ -4069,6 +4120,29 @@ class MainController:
                     return SELECT
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'chop_threshold'], v)
                 await update.message.reply_text(f"✅ CHOP 민감도 변경: {v}")
+            
+            elif choice == '34':
+                # CC Threshold & Length
+                parts = val.replace(' ', '').split(',')
+                if len(parts) == 1:
+                    v = float(parts[0])
+                    if v < 0.1 or v > 1.0:
+                        await update.message.reply_text("❌ 임계값은 0.1 ~ 1.0 사이여야 합니다.")
+                        return SELECT
+                    await self.cfg.update_value(['signal_engine', 'common_settings', 'cc_threshold'], v)
+                    await update.message.reply_text(f"✅ CC 민감도 변경: {v}")
+                elif len(parts) == 2:
+                    v = float(parts[0])
+                    l = int(parts[1])
+                    if v < 0.1 or v > 1.0 or l < 5 or l > 100:
+                        await update.message.reply_text("❌ 임계값(0.1~1.0), 기간(5~100)을 확인하세요.")
+                        return SELECT
+                    await self.cfg.update_value(['signal_engine', 'common_settings', 'cc_threshold'], v)
+                    await self.cfg.update_value(['signal_engine', 'common_settings', 'cc_length'], l)
+                    await update.message.reply_text(f"✅ CC 설정: 민감도={v}, 기간={l}봉")
+                else:
+                    await update.message.reply_text("❌ 형식: 임계값 또는 임계값,기간")
+                    return SELECT
 
             elif choice == '35':
                 # Dual Mode 변경
@@ -4102,7 +4176,7 @@ class MainController:
                 await update.message.reply_text(f"✅ 청산 타임프레임 변경: {val}")
             
             # 10~41 success message handled
-            if choice not in ['10', '11', '12', '14', '15', '16', '17', '18', '20', '21', '22', '23', '26', '27', '28', '29', '30', '31', '35', '41']:
+            if choice not in ['10', '11', '12', '14', '15', '16', '17', '18', '20', '21', '22', '23', '26', '27', '28', '29', '30', '31', '33', '34', '35', '41']:
                 await update.message.reply_text(f"✅ 설정 완료: {val}")
             await self._restore_main_keyboard(update)
             await self.show_setup_menu(update)
@@ -4703,9 +4777,11 @@ class MainController:
                     x_r2 = get_st_text(exit_st, 'r2', 'r2_val', 'r2_pass', False)
                     x_h = get_st_text(exit_st, 'hurst', 'hurst_val', 'hurst_pass', False)
                     x_c = get_st_text(exit_st, 'chop', 'chop_val', 'chop_pass', False)
+                    x_cc = get_st_text(exit_st, 'cc', 'cc_val', 'cc_pass', False)
+                    cc_val = exit_st.get('cc_val', 0.0)
                     
                     msg += f"└ Filter(In): R2{e_r2} Hurst{e_h} Chop{e_c}\n"
-                    msg += f"└ Filter(Out): R2{x_r2} Hurst{x_h} Chop{x_c}\n"
+                    msg += f"└ Filter(Out): R2{x_r2} Hurst{x_h} Chop{x_c} CC{x_cc}({cc_val:.2f})\n"
                     
                     # 전략 전용 정보
                     active_strat = d.get('active_strategy', '')
