@@ -3490,6 +3490,7 @@ class MainController:
         chop_exit = "ON" if sig_common.get('chop_exit_enabled', True) else "OFF"
         chop_threshold = sig_common.get('chop_threshold', 50.0)
         
+        kalman_cfg = strategy_params.get('kalman_filter', {})
         kalman_entry = "ON" if kalman_cfg.get('entry_enabled', False) else "OFF"
         kalman_exit = "ON" if kalman_cfg.get('exit_enabled', False) else "OFF"
         
