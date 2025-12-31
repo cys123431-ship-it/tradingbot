@@ -1058,7 +1058,8 @@ class SignalEngine(BaseEngine):
             # 1. 1차 필터: 거래금액 200M 이상
             candidates = []
             for symbol, data in tickers.items():
-                if '/USDT' in symbol:
+                # [Fix] 바이낸스 선물 심볼만 필터 (스팟 제외: BTC/USDT → X, BTC/USDT:USDT → O)
+                if '/USDT:USDT' in symbol:
                     quote_vol = float(data.get('quoteVolume', 0) or 0)
                     percentage = float(data.get('percentage', 0) or 0)
                     if quote_vol >= 200_000_000:
