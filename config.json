@@ -2,17 +2,17 @@
     "api": {
         "use_testnet": true,
         "mainnet": {
-            "api_key": "tjFZTK2C0ntEqFdkmdV2L03lBR6Gy5sSN0J8AGUVkpOsVXzt9O7bp2iWazHGn5q4",
-            "secret_key": "WPsbl8SBhfwBtdH0PWjQJgKmiRm15NNAUqsEnRPX3MDlQomaHdnyGK7evFyvOzVY"
+            "api_key": "",
+            "secret_key": ""
         },
         "testnet": {
-            "api_key": "DK98PN6MkJWxB4wVcVKBvfbJZw4Zz9kLAV8gwZw2fR1ItDYZTTohPWgihnuOBJ8x",
-            "secret_key": "Vbmrz1GO9g1gBG7vckNrSRCSnD9fGymVKlHnA1mzmXGBQBVBT3XAJmaSYC5oEEK9"
+            "api_key": "",
+            "secret_key": ""
         }
     },
     "telegram": {
-        "token": "8577778609:AAEuJg8_YHsckvUxzY_7Gwxh_YkUrnQhyIQ",
-        "chat_id": "6612324026",
+        "token": "",
+        "chat_id": "",
         "reporting": {
             "use_dashboard_mode": true,
             "hourly_report_enabled": false

@@ -461,9 +461,26 @@ class BaseEngine:
         """일일 손실 한도 체크 (미실현 손익 포함)"""
         _, daily_pnl = self.db.get_daily_stats()
         eng = self.cfg.get('system_settings', {}).get('active_engine', 'shannon')
-        
-        # 미실현 손익도 포함
-        unrealized_pnl = self.ctrl.status_data.get('pnl_usdt', 0) if self.ctrl.status_data else 0
+
+        # 미실현 손익도 포함 (멀티 심볼 상태 데이터 지원)
+        unrealized_pnl = 0.0
+        open_symbols = []
+        status_data = self.ctrl.status_data if isinstance(self.ctrl.status_data, dict) else {}
+
+        status_rows = []
+        if status_data.get('symbol') and status_data.get('pos_side') is not None:
+            # Legacy single-symbol format
+            status_rows = [status_data]
+        else:
+            status_rows = [v for v in status_data.values() if isinstance(v, dict)]
+
+        for row in status_rows:
+            unrealized_pnl += float(row.get('pnl_usdt', 0) or 0)
+            pos_side = str(row.get('pos_side', 'NONE')).upper()
+            symbol = row.get('symbol')
+            if symbol and pos_side != 'NONE':
+                open_symbols.append(symbol)
+
         total_daily_pnl = daily_pnl + unrealized_pnl
         
         if eng == 'shannon':
@@ -474,13 +491,13 @@ class BaseEngine:
         if total_daily_pnl < -limit:
             logger.warning(f"⚠️ Daily loss limit reached: {total_daily_pnl:.2f} (realized: {daily_pnl:.2f}, unrealized: {unrealized_pnl:.2f}) / Limit: -{limit}")
             # 포지션이 있으면 청산
-            if self.ctrl.status_data.get('pos_side') != 'NONE':
-                symbol = self.ctrl.status_data.get('symbol')
-                if symbol:
-                    await self.ctrl.notify(f"🛑 일일 손실 한도 도달! 포지션 청산 시작...")
-                    # 엔진에서 청산 처리
-                    if hasattr(self, 'exit_position'):
+            if open_symbols and hasattr(self, 'exit_position'):
+                await self.ctrl.notify("🛑 일일 손실 한도 도달! 포지션 청산 시작...")
+                for symbol in sorted(set(open_symbols)):
+                    try:
                         await self.exit_position(symbol, "DailyLossLimit")
+                    except Exception as e:
+                        logger.error(f"Daily loss limit forced exit failed for {symbol}: {e}")
             return True
         return False
 
@@ -556,8 +573,16 @@ class TemaEngine(BaseEngine):
                 
                 # 포지션 조회
                 pos = await self.get_server_position(symbol, use_cache=False)
-                pos_side = 'long' if pos and float(pos['contracts']) > 0 and float(pos['side'] if 'side' in pos else 1) > 0 else \
-                           'short' if pos and float(pos['contracts']) > 0 and float(pos['side'] if 'side' in pos else 1) < 0 else 'none'
+                if pos and abs(float(pos.get('contracts', 0) or 0)) > 0:
+                    p_side = str(pos.get('side', '')).lower()
+                    if p_side == 'long':
+                        pos_side = 'long'
+                    elif p_side == 'short':
+                        pos_side = 'short'
+                    else:
+                        pos_side = 'none'
+                else:
+                    pos_side = 'none'
                 
                 # 진입 감지
                 if signal and pos_side == 'none':
@@ -767,8 +792,9 @@ class TemaEngine(BaseEngine):
             pos = await self.get_server_position(symbol, use_cache=False)
             if not pos: return
 
-            amount = float(pos['contracts'])
-            side = 'sell' if float(pos['contracts']) > 0 else 'buy' # 포지션 반대 매매
+            amount = abs(float(pos.get('contracts', 0) or 0))
+            pos_side = str(pos.get('side', '')).lower()
+            side = 'sell' if pos_side == 'long' else 'buy'
             
             if amount > 0:
                 await asyncio.to_thread(self.exchange.create_market_order, symbol, side, amount)
@@ -866,6 +892,9 @@ class SignalEngine(BaseEngine):
         
         try:
             self.last_activity = time.time()
+            cfg = self.cfg.get('signal_engine', {})
+            common_cfg = cfg.get('common_settings', {})
+            entry_tf = common_cfg.get('entry_timeframe', common_cfg.get('timeframe', '8h'))
             
             # Common: Fetch Current Positions (Always monitor existing positions)
             positions = await asyncio.to_thread(self.exchange.fetch_positions)
@@ -876,7 +905,7 @@ class SignalEngine(BaseEngine):
                     active_position_symbols.add(sym)
 
             # Check Scanner Setting
-            scanner_enabled = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('scanner_enabled', True)
+            scanner_enabled = common_cfg.get('scanner_enabled', True)
             
             target_symbols = set()
             
@@ -943,12 +972,6 @@ class SignalEngine(BaseEngine):
             if 'SCANNER' in self.ctrl.status_data:
                 del self.ctrl.status_data['SCANNER']
 
-            # Configs
-            cfg = self.cfg.get('signal_engine', {})
-            common_cfg = cfg.get('common_settings', {})
-            # Entry timeframe (진입용)
-            entry_tf = common_cfg.get('entry_timeframe', common_cfg.get('timeframe', '8h'))
-            
             # Parallel Execution: Poll all symbols concurrently
             tasks = []
             for symbol in target_symbols:
@@ -2226,7 +2249,7 @@ class SignalEngine(BaseEngine):
                 
                 # reduceOnly 옵션으로 강제 청산
                 order = await asyncio.to_thread(
-                    self.exchange.create_order, symbol, 'market', side, qty,
+                    self.exchange.create_order, symbol, 'market', side, qty, None,
                     {'reduceOnly': True}
                 )
                 await self.ctrl.notify(f"✅ 강제 청산 성공!")
@@ -3035,17 +3058,24 @@ class DualModeFractalEngine(BaseEngine):
     def start(self):
         super().start()
         self.last_candle_ts = 0  # 타임스탬프 초기화 추가
-        self._init_strategy()
+        if not self._init_strategy():
+            self.running = False
 
     def _init_strategy(self):
+        if not DUAL_MODE_AVAILABLE:
+            logger.error("DualMode strategy module is not available.")
+            return False
         cfg = self.cfg.get('dual_mode_engine', {})
         mode = cfg.get('mode', 'standard')
         self.strategy = DualModeFractalStrategy(mode=mode)
         self.current_mode = mode
         logger.info(f"⚛️ [DualMode] Strategy initialized: {mode.upper()}")
+        return True
 
     async def poll_tick(self):
         if not self.running:
+            return
+        if not self.strategy:
             return
         
         try:
@@ -3054,7 +3084,8 @@ class DualModeFractalEngine(BaseEngine):
             
             # 모드 변경 감지 및 재초기화
             if cfg.get('mode') != self.current_mode:
-                self._init_strategy()
+                if not self._init_strategy():
+                    return
             
             # 타임프레임 결정
             if self.current_mode == 'scalping':
@@ -3175,24 +3206,52 @@ class DualModeFractalEngine(BaseEngine):
                     if side == 'long':
                         if tp_pct > 0:
                             tp_price = entry_price * (1 + tp_pct / 100 / lev)
-                            await asyncio.to_thread(self.exchange.create_order, symbol, 'limit', 'sell', qty, tp_price)
+                            await asyncio.to_thread(
+                                self.exchange.create_order,
+                                symbol,
+                                'limit',
+                                'sell',
+                                qty,
+                                tp_price,
+                                {'reduceOnly': True}
+                            )
                             msg += f" | TP: {tp_price:.2f}"
                         if sl_pct > 0:
                             sl_price = entry_price * (1 - sl_pct / 100 / lev)
-                            # Stop Market
-                            params = {'stopPrice': sl_price}
-                            await asyncio.to_thread(self.exchange.create_order, symbol, 'market', 'sell', qty, params=params)
+                            await asyncio.to_thread(
+                                self.exchange.create_order,
+                                symbol,
+                                'stop_market',
+                                'sell',
+                                qty,
+                                None,
+                                {'stopPrice': sl_price, 'reduceOnly': True}
+                            )
                             msg += f" | SL: {sl_price:.2f}"
                     else: # short
                         if tp_pct > 0:
                             tp_price = entry_price * (1 - tp_pct / 100 / lev)
-                            await asyncio.to_thread(self.exchange.create_order, symbol, 'limit', 'buy', qty, tp_price)
+                            await asyncio.to_thread(
+                                self.exchange.create_order,
+                                symbol,
+                                'limit',
+                                'buy',
+                                qty,
+                                tp_price,
+                                {'reduceOnly': True}
+                            )
                             msg += f" | TP: {tp_price:.2f}"
                         if sl_pct > 0:
                             sl_price = entry_price * (1 + sl_pct / 100 / lev)
-                            # Stop Market
-                            params = {'stopPrice': sl_price}
-                            await asyncio.to_thread(self.exchange.create_order, symbol, 'market', 'buy', qty, params=params)
+                            await asyncio.to_thread(
+                                self.exchange.create_order,
+                                symbol,
+                                'stop_market',
+                                'buy',
+                                qty,
+                                None,
+                                {'stopPrice': sl_price, 'reduceOnly': True}
+                            )
                             msg += f" | SL: {sl_price:.2f}"
                 except Exception as e:
                     logger.error(f"TP/SL Order Failed: {e}")
@@ -3204,8 +3263,9 @@ class DualModeFractalEngine(BaseEngine):
         pos = await self.get_server_position(symbol)
         if pos:
             qty = self.safe_amount(symbol, abs(float(pos['contracts'])))
+            side = 'sell' if pos['side'] == 'long' else 'buy'
             await asyncio.to_thread(
-                self.exchange.create_order, symbol, 'market', 'sell', qty
+                self.exchange.create_order, symbol, 'market', side, qty
             )
             pnl = float(pos.get('unrealizedPnl', 0))
             self.db.log_trade_close(symbol, pnl, 0, 0, reason)
@@ -3256,9 +3316,12 @@ class MainController:
             'signal': SignalEngine(self), 
             'shannon': ShannonEngine(self), 
             'dualthrust': DualThrustEngine(self),
-            'dualmode': DualModeFractalEngine(self),
             'tema': TemaEngine(self)
         }
+        if DUAL_MODE_AVAILABLE:
+            self.engines['dualmode'] = DualModeFractalEngine(self)
+        else:
+            logger.warning("DualMode engine disabled: dual_mode_fractal_strategy module not available.")
         self.active_engine = None
         self.tg_app = None
         self.status_data = {}
@@ -3298,6 +3361,11 @@ class MainController:
         )
 
     async def _switch_engine(self, name):
+        if name == 'dualmode' and not DUAL_MODE_AVAILABLE:
+            logger.warning("DualMode requested but module is unavailable. Falling back to SHANNON.")
+            await self.cfg.update_value(['system_settings', 'active_engine'], 'shannon')
+            name = 'shannon'
+
         if name not in self.engines:
             logger.error(f"Unknown engine: {name}")
             return
@@ -4319,7 +4387,6 @@ class MainController:
         
         await self._restore_main_keyboard(update)
         await self.show_setup_menu(update)
-        await self.show_setup_menu(update)
         return SELECT
 
     async def setup_engine_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4330,12 +4397,15 @@ class MainController:
         
         if text in mode_map:
             mode = mode_map[text]
-            await self.cfg.update_value(['system_settings', 'active_engine'], mode)
-            await self._switch_engine(mode)
-            self.dashboard_msg_id = None
-            await update.message.reply_text(f"✅ 엔진 변경 완료: {mode.upper()}")
+            if mode == 'dualmode' and not DUAL_MODE_AVAILABLE:
+                await update.message.reply_text("❌ DualMode 관련 모듈이 없어 사용할 수 없습니다.")
+            else:
+                await self.cfg.update_value(['system_settings', 'active_engine'], mode)
+                await self._switch_engine(mode)
+                self.dashboard_msg_id = None
+                await update.message.reply_text(f"✅ 엔진 변경 완료: {mode.upper()}")
         else:
-            await update.message.reply_text("❌ 잘못된 선택입니다. (1~4 입력)")
+            await update.message.reply_text("❌ 잘못된 선택입니다. (1~5 입력)")
         
         await self._restore_main_keyboard(update)
         await self.show_setup_menu(update)
@@ -4357,6 +4427,15 @@ class MainController:
         ]
         markup = ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
+        cid = self.cfg.get_chat_id()
+        if cid:
+            authorized_chat_filter = filters.Chat(chat_id=cid)
+        else:
+            logger.error("Invalid chat_id. Telegram handlers will ignore incoming messages.")
+            authorized_chat_filter = filters.Chat(chat_id=-1)
+
+        authorized_text_filter = filters.TEXT & ~filters.COMMAND & authorized_chat_filter
+
         async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await u.message.reply_text("🤖 봇 준비 완료", reply_markup=markup)
 
@@ -4364,17 +4443,14 @@ class MainController:
             if not c.args:
                 await u.message.reply_text("사용법: /strat 번호\n1: Signal\n2: Shannon\n3: DualThrust\n4: DualMode\n5: TEMA")
                 return
+            mode_map = {'1': 'signal', '2': 'shannon', '3': 'dualthrust', '4': 'dualmode', '5': 'tema'}
             arg = c.args[0]
-            if arg == '1':
-                mode = 'signal'
-            elif arg == '2':
-                mode = 'shannon'
-            elif arg == '3':
-                mode = 'dualthrust'
-            elif arg == '4':
-                mode = 'dualmode'
-            else:
-                await u.message.reply_text("❌ 잘못된 입력. 1~4 사이의 번호를 입력하세요.")
+            if arg not in mode_map:
+                await u.message.reply_text("❌ 잘못된 입력. 1~5 사이의 번호를 입력하세요.")
+                return
+            mode = mode_map[arg]
+            if mode == 'dualmode' and not DUAL_MODE_AVAILABLE:
+                await u.message.reply_text("❌ DualMode 관련 모듈이 없어 사용할 수 없습니다.")
                 return
             await self.cfg.update_value(['system_settings', 'active_engine'], mode)
             await self._switch_engine(mode)
@@ -4410,32 +4486,62 @@ class MainController:
 """
             await u.message.reply_text(msg.strip(), parse_mode=ParseMode.MARKDOWN)
 
+        async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            msg = """
+📚 **명령어 목록**
+
+🔧 **설정**
+/setup - 설정 메뉴
+/strat 1 - Signal 전략
+/strat 2 - Shannon 전략
+/strat 3 - DualThrust 전략
+/strat 4 - DualMode 전략
+/strat 5 - TEMA 전략
+
+📊 **정보**
+/status - 대시보드 갱신
+/stats - 매매 통계
+/log - 최근 로그
+
+🚨 **제어**
+/close - 긴급 청산
+🚨 STOP - 긴급 정지
+⏸ PAUSE - 일시정지
+▶ RESUME - 재개
+"""
+            await u.message.reply_text(msg.strip(), parse_mode=ParseMode.MARKDOWN)
+
         # 비상 버튼 핸들러 (최우선)
         emergency_handler = MessageHandler(
-            filters.Regex("STOP|PAUSE|RESUME|/status"), 
+            filters.Regex("STOP|PAUSE|RESUME|/status") & authorized_chat_filter,
             self.global_handler
         )
         self.tg_app.add_handler(emergency_handler, group=-1)
         
         # /start 명령어 핸들러 추가
-        self.tg_app.add_handler(CommandHandler("start", start_cmd))
+        self.tg_app.add_handler(CommandHandler("start", start_cmd, filters=authorized_chat_filter))
+        self.tg_app.add_handler(CommandHandler("strat", strat_cmd, filters=authorized_chat_filter))
+        self.tg_app.add_handler(CommandHandler("log", log_cmd, filters=authorized_chat_filter))
+        self.tg_app.add_handler(CommandHandler("close", close_cmd, filters=authorized_chat_filter))
+        self.tg_app.add_handler(CommandHandler("stats", stats_cmd, filters=authorized_chat_filter))
+        self.tg_app.add_handler(CommandHandler("help", help_cmd, filters=authorized_chat_filter))
 
         # 설정 대화 핸들러
         conv = ConversationHandler(
-            entry_points=[CommandHandler('setup', self.setup_entry)],
+            entry_points=[CommandHandler('setup', self.setup_entry, filters=authorized_chat_filter)],
             states={
-                SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.setup_select)],
-                INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.setup_input)],
-                SYMBOL_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.setup_symbol_input)],
-                DIRECTION_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.setup_direction_select)],
-                ENGINE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.setup_engine_select)],
-                "R2_SELECT": [MessageHandler(filters.TEXT & ~filters.COMMAND, self.setup_r2_select)],
-                "HURST_SELECT": [MessageHandler(filters.TEXT & ~filters.COMMAND, self.setup_hurst_select)],
-                "CHOP_SELECT": [MessageHandler(filters.TEXT & ~filters.COMMAND, self.setup_chop_select)],
-                "KALMAN_SELECT": [MessageHandler(filters.TEXT & ~filters.COMMAND, self.setup_kalman_select)]
+                SELECT: [MessageHandler(authorized_text_filter, self.setup_select)],
+                INPUT: [MessageHandler(authorized_text_filter, self.setup_input)],
+                SYMBOL_INPUT: [MessageHandler(authorized_text_filter, self.setup_symbol_input)],
+                DIRECTION_SELECT: [MessageHandler(authorized_text_filter, self.setup_direction_select)],
+                ENGINE_SELECT: [MessageHandler(authorized_text_filter, self.setup_engine_select)],
+                "R2_SELECT": [MessageHandler(authorized_text_filter, self.setup_r2_select)],
+                "HURST_SELECT": [MessageHandler(authorized_text_filter, self.setup_hurst_select)],
+                "CHOP_SELECT": [MessageHandler(authorized_text_filter, self.setup_chop_select)],
+                "KALMAN_SELECT": [MessageHandler(authorized_text_filter, self.setup_kalman_select)]
             },
             fallbacks=[
-                CommandHandler('setup', self.setup_entry),
+                CommandHandler('setup', self.setup_entry, filters=authorized_chat_filter),
                 emergency_handler
             ]
         )
@@ -4453,7 +4559,7 @@ class MainController:
                 
                 await self.handle_manual_symbol_input(u, text)
 
-        self.tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manual_symbol_handler))
+        self.tg_app.add_handler(MessageHandler(authorized_text_filter, manual_symbol_handler))
 
     async def setup_r2_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text
@@ -4515,38 +4621,6 @@ class MainController:
         await self.show_setup_menu(update)
         return SELECT
 
-        # CommandHandler("start") 이미 라인 1751에서 등록됨 - 중복 제거
-        self.tg_app.add_handler(CommandHandler("strat", strat_cmd))
-        self.tg_app.add_handler(CommandHandler("log", log_cmd))
-        self.tg_app.add_handler(CommandHandler("close", close_cmd))
-        self.tg_app.add_handler(CommandHandler("stats", stats_cmd))
-        
-        # /help 명령어
-        async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-            msg = """
-📚 **명령어 목록**
-
-🔧 **설정**
-/setup - 설정 메뉴
-/strat 1 - Signal (SMA) 전략
-/strat 2 - Shannon (자산배분) 전략
-/strat 3 - DualThrust (변동성돌파) 전략
-
-📊 **정보**
-/status - 대시보드 갱신
-/stats - 매매 통계
-/log - 최근 로그
-
-🚨 **제어**
-/close - 긴급 청산
-🚨 STOP - 긴급 정지
-⏸ PAUSE - 일시정지
-▶ RESUME - 재개
-"""
-            await u.message.reply_text(msg.strip(), parse_mode=ParseMode.MARKDOWN)
-        
-        self.tg_app.add_handler(CommandHandler("help", help_cmd))
-
     # ---------------- Hourly Report ----------------
     async def _hourly_report_loop(self):
         """시간별 리포트"""
@@ -4561,7 +4635,12 @@ class MainController:
                         self.last_hourly_report = time.time()
                         
                         daily_count, daily_pnl = self.db.get_daily_stats()
-                        d = self.status_data
+                        d = {}
+                        if isinstance(self.status_data, dict) and self.status_data:
+                            first_key = next(iter(self.status_data))
+                            first_val = self.status_data.get(first_key)
+                            if isinstance(first_val, dict):
+                                d = first_val
                         
                         msg = f"""
 ⏰ **시간별 리포트** [{now.strftime('%H:%M')}]
@@ -4614,6 +4693,12 @@ class MainController:
                     dm_engine = self.engines.get('dualmode')
                     if dm_engine and hasattr(dm_engine, 'poll_tick'):
                         await dm_engine.poll_tick()
+
+                elif eng == 'tema' and self.active_engine and self.active_engine.running:
+                    # TEMA 엔진 폴링
+                    tema_engine = self.engines.get('tema')
+                    if tema_engine and hasattr(tema_engine, 'poll_tick'):
+                        await tema_engine.poll_tick()
                 
                 # [MODIFIED] Prioritize entry_timeframe for polling interval
                 sys_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
@@ -4870,7 +4955,7 @@ class MainController:
                     # 여기서는 간단히 실행하되, 오류 시 로그 남김
                     
                     order = await asyncio.to_thread(
-                        self.exchange.create_order, sym, 'market', side, qty, {'reduceOnly': True}
+                        self.exchange.create_order, sym, 'market', side, qty, None, {'reduceOnly': True}
                     )
                     logger.info(f"✅ Emergency Close: {sym} {side} {qty}")
                     await self.notify(f"🔒 **{sym}** 청산 완료\nPnL: ${pnl:+.2f}")
