@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: SSH로 Azure 서버 배포
+      - name: Azure 서버에 배포하기
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.AZURE_HOST }}
@@ -21,15 +21,17 @@ jobs:
             echo "=== 배포 시작 ==="
             cd /home/azureuser/tradingbot
             
-            echo "=== Git Pull ==="
+            echo "=== 최신 코드 가져오기 ==="
             git pull origin main --no-rebase
             
-            echo "=== 기존 emas.py 프로세스 종료 ==="
+            echo "=== 기존 봇 종료 ==="
             pkill -f emas.py || true
             
             echo "=== 봇 재시작 ==="
             nohup python3 emas.py > emas.log 2>&1 &
             
-            echo "=== 배포 완료 ==="
-            echo "현재 실행 중인 emas.py:"
+            echo "=== 배포 완료! ==="
+            echo "실행 중인 프로세스:"
             ps aux | grep emas.py || echo "프로세스 없음"
+            echo "로그 파일 크기:"
+            ls -lh emas.log
