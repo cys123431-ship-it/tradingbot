@@ -33,21 +33,31 @@ jobs:
             ./venv/bin/python -m pip install -r requirements.txt
 
             echo "=== 기존 봇 종료 중 ==="
-            BOT_PIDS=$(pgrep -f "[p]ython.*[e]mas.py" || true)
-            if [ -n "$BOT_PIDS" ]; then
-              echo "$BOT_PIDS" | xargs -r kill
+            PID_FILE=/home/azureuser/tradingbot/emas.pid
+            if [ -f "$PID_FILE" ]; then
+              OLD_PID=$(cat "$PID_FILE" || true)
+              if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+                kill "$OLD_PID"
+              fi
+              rm -f "$PID_FILE"
               sleep 2
             fi
 
             echo "=== 봇 재시작 ==="
-            nohup ./venv/bin/python emas.py > emas.log 2>&1 < /dev/null &
+            nohup /home/azureuser/tradingbot/venv/bin/python /home/azureuser/tradingbot/emas.py > /home/azureuser/tradingbot/emas.log 2>&1 < /dev/null &
+            NEW_PID=$!
+            echo "$NEW_PID" > "$PID_FILE"
             sleep 3
 
             echo "=== 프로세스 확인 ==="
-            pgrep -af "[p]ython.*[e]mas.py" || (echo "프로세스 시작 실패"; tail -n 50 emas.log; exit 1)
+            if ! kill -0 "$NEW_PID" 2>/dev/null; then
+              echo "프로세스 시작 실패"
+              tail -n 50 /home/azureuser/tradingbot/emas.log
+              exit 1
+            fi
 
             echo "=== 배포 완료 ==="
             echo "실행 중인 emas.py 프로세스:"
-            pgrep -af "[p]ython.*[e]mas.py" || echo "프로세스 없음"
+            ps -p "$NEW_PID" -o pid=,cmd= || echo "프로세스 없음"
             echo "로그 마지막 10줄:"
-            tail -n 10 emas.log || echo "로그 파일 없음"
+            tail -n 10 /home/azureuser/tradingbot/emas.log || echo "로그 파일 없음"
