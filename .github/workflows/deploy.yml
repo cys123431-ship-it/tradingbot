@@ -15,6 +15,7 @@ jobs:
           host: ${{ secrets.AZURE_HOST }}
           username: ${{ secrets.AZURE_USERNAME }}
           key: ${{ secrets.AZURE_SSH_PRIVATE_KEY }}
+          script_stop: false   # ← 이 줄 추가 (중요!)
           script: |
             set -e
             
@@ -24,14 +25,17 @@ jobs:
             echo "=== 최신 코드 가져오기 ==="
             git pull origin main --no-rebase
             
-            echo "=== 기존 봇 종료 ==="
+            echo "=== 기존 봇 종료 중 ==="
             pkill -f emas.py || true
+            
+            echo "=== 잠시 대기 (종료 완료 대기) ==="
+            sleep 3
             
             echo "=== 봇 재시작 ==="
             nohup python3 emas.py > emas.log 2>&1 &
             
             echo "=== 배포 완료! ==="
-            echo "실행 중인 프로세스:"
+            echo "실행 중인 emas.py 프로세스:"
             ps aux | grep emas.py || echo "프로세스 없음"
-            echo "로그 파일 크기:"
-            ls -lh emas.log
+            echo "로그 마지막 10줄:"
+            tail -n 10 emas.log
