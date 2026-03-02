@@ -588,7 +588,7 @@ class BaseEngine:
             )
             # ?ъ??섏씠 ?덉쑝硫?泥?궛
             if open_symbols and hasattr(self, 'exit_position'):
-                await self.ctrl.notify("?썞 ?쇱씪 ?먯떎 ?쒕룄 ?꾨떖! ?ъ???泥?궛 ?쒖옉...")
+                await self.ctrl.notify("⚠️ 일일 손실 한도 도달! 보유 포지션 정리를 시작합니다.")
                 for symbol in sorted(set(open_symbols)):
                     try:
                         await self.exit_position(symbol, "DailyLossLimit")
@@ -609,7 +609,7 @@ class BaseEngine:
         if mmr >= max_mmr:
             if now - self._last_mmr_alert_time > 300:  # 5遺?
                 self._last_mmr_alert_time = now
-                await self.ctrl.notify(f"?좑툘 **MMR 寃쎄퀬!** ?꾩옱 {mmr:.2f}% (?쒕룄: {max_mmr}%)")
+                await self.ctrl.notify(f"⚠️ **MMR 경고!** 현재 {mmr:.2f}% (한도: {max_mmr}%)")
             return True
         return False
 
@@ -799,7 +799,7 @@ class TemaEngine(BaseEngine):
                         
                         if active_sym != target_sym:
                             logger.warning(f"?슟 [Single Limit] Entry blocked: Already holding {p['symbol']}")
-                            await self.ctrl.notify(f"?슟 **吏꾩엯 李⑤떒**: ?⑥씪 ?ъ????쒗븳 (蹂댁쑀以? {p['symbol']})")
+                            await self.ctrl.notify(f"⚠️ **진입 차단**: 단일 포지션 제한 (보유 중: {p['symbol']})")
                             return
             except Exception as e:
                 logger.error(f"Single position check failed: {e}")
@@ -834,7 +834,7 @@ class TemaEngine(BaseEngine):
             else:
                 order = await asyncio.to_thread(self.exchange.create_market_sell_order, symbol, float(amount_str), params)
             
-            await self.ctrl.notify(f"?? **TEMA 吏꾩엯**: {symbol} {side.upper()}\n媛寃? {price}\n?섎웾: {amount_str}")
+            await self.ctrl.notify(f"✅ **TEMA 진입**: {symbol} {side.upper()}\n가격: {price}\n수량: {amount_str}")
             
             # 4. TP/SL ?ㅼ젙 (怨듯넻 ?ㅼ젙 ?ъ슜)
             tp_sl_enabled = common_cfg.get('tp_sl_enabled', False)
@@ -877,11 +877,11 @@ class TemaEngine(BaseEngine):
                     logger.info(f"??TP/SL Order Placed: TP={tp_price:.4f}, SL={sl_price:.4f}")
                 except Exception as e:
                     logger.error(f"Failed to place TP/SL order: {e}")
-                    await self.ctrl.notify(f"?좑툘 TP/SL 二쇰Ц ?ㅽ뙣: {e}")
+                    await self.ctrl.notify(f"⚠️ TP/SL 주문 실패: {e}")
 
         except Exception as e:
             logger.error(f"TEMA entry failed: {e}")
-            await self.ctrl.notify(f"??吏꾩엯 ?ㅽ뙣: {e}")
+            await self.ctrl.notify(f"❌ 진입 실패: {e}")
 
     async def exit_position(self, symbol, reason):
         try:
@@ -894,7 +894,7 @@ class TemaEngine(BaseEngine):
             
             if amount > 0:
                 await asyncio.to_thread(self.exchange.create_market_order, symbol, side, amount)
-                await self.ctrl.notify(f"?몝 **TEMA 泥?궛**: {symbol} ({reason})")
+                await self.ctrl.notify(f"🔄 **TEMA 청산**: {symbol} ({reason})")
         except Exception as e:
             logger.error(f"TEMA exit failed: {e}")
 
@@ -933,6 +933,7 @@ class SignalEngine(BaseEngine):
         # [New] Filter Status Persistence (Dashboard)
         self.last_entry_filter_status = {} # symbol -> {r2_val, ...}
         self.last_exit_filter_status = {}  # symbol -> {r2_val, ...}
+        self.last_entry_reason = {}        # symbol -> latest entry decision reason
 
     def start(self):
         super().start()
@@ -1289,13 +1290,10 @@ class SignalEngine(BaseEngine):
             
             # ?꾨왂 ?곹깭 媛?몄삤湲?
             strategy_params = self.cfg.get('signal_engine', {}).get('strategy_params', {})
-            kalman_enabled = strategy_params.get('kalman_filter', {}).get('enabled', False)
+            kalman_cfg = strategy_params.get('kalman_filter', {})
+            kalman_enabled = bool(kalman_cfg.get('entry_enabled', False) or kalman_cfg.get('exit_enabled', False))
             active_strategy = strategy_params.get('active_strategy', 'sma').upper()
             entry_mode = strategy_params.get('entry_mode', 'cross').upper()
-            
-            # Cross/Position 紐⑤뱶?먯꽌 Kalman ?꾪꽣媛 濡쒖쭅??媛뺤젣 ?ъ슜?섎?濡??곹깭 ?쒖떆???쒖꽦??(SMA/HMA)
-            if active_strategy in ['SMA', 'HMA'] and entry_mode in ['CROSS', 'POSITION']:
-                kalman_enabled = True
             
             # MicroVBO State
             vbo_state = self.vbo_states.get(symbol, {})
@@ -1319,6 +1317,7 @@ class SignalEngine(BaseEngine):
                 'kalman_direction': self.kalman_states.get(symbol, {}).get('direction'),
                 'active_strategy': active_strategy,
                 'entry_mode': entry_mode,
+                'entry_reason': self.last_entry_reason.get(symbol, '대기'),
                 # MicroVBO ?꾩슜 ?꾨뱶
                 'vbo_breakout_level': vbo_state.get('breakout_level'),
                 'vbo_entry_atr': vbo_state.get('entry_atr'),
@@ -1507,6 +1506,7 @@ class SignalEngine(BaseEngine):
             d_mode = self.cfg.get('system_settings', {}).get('trade_direction', 'both')
             if sig and ((d_mode == 'long' and sig == 'short') or (d_mode == 'short' and sig == 'long')):
                 logger.info(f"??Signal {sig} blocked by direction filter: {d_mode}")
+                self.last_entry_reason[symbol] = f"방향 필터 차단 ({sig.upper()} vs {d_mode.upper()})"
                 sig = None
 
             # ?ъ????뺤씤
@@ -1552,11 +1552,13 @@ class SignalEngine(BaseEngine):
                 if pos:
                     # ?대? ?ъ??섏씠 ?덉쑝硫?Entry 泥댄겕 ????(Wait for Exit TF signal)
                     # ?? Pending Re-entry???꾩뿉??泥섎━??
+                    self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), 진입 대기"
                     logger.debug(f"ProcessPrimary: Position exists ({pos['side']}), waiting for Exit TF signal.")
                     
                 elif not pos and sig:
                     # ?ъ????놁쓬 + 吏꾩엯 ?좏샇 -> 吏꾩엯
                     strategy_label = "Cross" if entry_mode == 'cross' else "Position"
+                    self.last_entry_reason[symbol] = f"{strategy_label} 조건 충족 -> {sig.upper()} 진입"
                     logger.info(f"?? {strategy_label} (Primary): New entry {sig.upper()}")
                     await self.entry(symbol, sig, float(k['c']))
             
@@ -1789,6 +1791,7 @@ class SignalEngine(BaseEngine):
         sig = None
         is_bullish = False
         is_bearish = False
+        entry_reason = "신호 대기"
         
         # Init state dicts if needed
         if symbol not in self.vbo_states: self.vbo_states[symbol] = {}
@@ -1985,25 +1988,32 @@ class SignalEngine(BaseEngine):
                 if kalman_entry_enabled:
                     if kalman_bullish:
                         sig = 'long'
+                        entry_reason = f"{strategy_name} Cross Up + Kalman 통과"
                         logger.info(f"LONG signal: {strategy_name} Cross + Kalman Entry OK")
                     else:
+                        entry_reason = f"{strategy_name} Cross Up, Kalman 진입필터 미통과"
                         logger.info(f"?썳截?Filtered: {strategy_name} Cross Up but Kalman Entry Filter Blocked")
                 else:
                     sig = 'long'
+                    entry_reason = f"{strategy_name} Cross Up"
                     logger.info(f"LONG signal: {strategy_name} Cross (Kalman Filter OFF)")
             
             elif cross_down:
                 if kalman_entry_enabled:
                     if kalman_bearish:
                         sig = 'short'
+                        entry_reason = f"{strategy_name} Cross Down + Kalman 통과"
                         logger.info(f"SHORT signal: {strategy_name} Cross + Kalman Entry OK")
                     else:
+                        entry_reason = f"{strategy_name} Cross Down, Kalman 진입필터 미통과"
                         logger.info(f"?썳截?Filtered: {strategy_name} Cross Down but Kalman Entry Filter Blocked")
                 else:
                     sig = 'short'
+                    entry_reason = f"{strategy_name} Cross Down"
                     logger.info(f"SHORT signal: {strategy_name} Cross (Kalman Filter OFF)")
             
             else:
+                entry_reason = f"{strategy_name} 크로스 없음"
                 logger.debug(f"?뱣 No Cross: {strategy_name}")
         
         elif entry_mode == 'position':
@@ -2012,21 +2022,30 @@ class SignalEngine(BaseEngine):
                 if kalman_entry_enabled:
                     if kalman_bullish:
                         sig = 'long'
+                        entry_reason = f"{strategy_name} 정배열 + Kalman 통과"
                         logger.info(f"LONG signal: {strategy_name} Position + Kalman Entry OK")
+                    else:
+                        entry_reason = f"{strategy_name} 정배열, Kalman 진입필터 미통과"
                 else:
                     sig = 'long'
+                    entry_reason = f"{strategy_name} 정배열"
                     logger.info(f"LONG signal: {strategy_name} Position (Kalman Filter OFF)")
             
             elif ma_bearish:
                 if kalman_entry_enabled:
                     if kalman_bearish:
                         sig = 'short'
+                        entry_reason = f"{strategy_name} 역배열 + Kalman 통과"
                         logger.info(f"SHORT signal: {strategy_name} Position + Kalman Entry OK")
+                    else:
+                        entry_reason = f"{strategy_name} 역배열, Kalman 진입필터 미통과"
                 else:
                     sig = 'short'
+                    entry_reason = f"{strategy_name} 역배열"
                     logger.info(f"SHORT signal: {strategy_name} Position (Kalman Filter OFF)")
             
             else:
+                entry_reason = f"{strategy_name} 중립 구간"
                 # Position Mode but neither MA Bullish nor Bearish (Neutral/Whipsaw)
                 pass
                 # Position mode logs are handled inside the if blocks (filtered vs signal).
@@ -2062,7 +2081,9 @@ class SignalEngine(BaseEngine):
                 sig = None
                 is_bullish = False
                 is_bearish = False
-            
+                entry_reason = f"필터 차단: {', '.join(blocked_reasons)}"
+        
+        self.last_entry_reason[symbol] = entry_reason
         return sig, is_bullish, is_bearish, strategy_name, entry_mode, kalman_entry_enabled
 
     async def _update_exit_filter_values(self, symbol, df, current_side):
@@ -2161,7 +2182,7 @@ class SignalEngine(BaseEngine):
                         
                         if active_sym != target_sym:
                             logger.warning(f"?슟 [Single Limit] Entry blocked: Already holding {p['symbol']}")
-                            await self.ctrl.notify(f"?슟 **吏꾩엯 李⑤떒**: ?⑥씪 ?ъ????쒗븳 (蹂댁쑀以? {p['symbol']})")
+                            await self.ctrl.notify(f"⚠️ **진입 차단**: 단일 포지션 제한 (보유 중: {p['symbol']})")
                             return
             except Exception as e:
                 logger.error(f"Single position check failed: {e}")
@@ -2181,7 +2202,7 @@ class SignalEngine(BaseEngine):
             
             if free <= 0:
                 logger.warning(f"Insufficient balance: {free}")
-                await self.ctrl.notify(f"?좑툘 ?붽퀬 遺議? ${free:.2f}")
+                await self.ctrl.notify(f"⚠️ 잔고 부족: ${free:.2f}")
                 return
             
             # Risk-based sizing: cap by (a) risk budget at configured stop distance and (b) max margin notional.
@@ -2199,11 +2220,11 @@ class SignalEngine(BaseEngine):
             
             if float(qty) <= 0:
                 logger.warning(f"Invalid quantity: {qty} (free={free}, risk={risk_pct}, lev={lev}, price={price})")
-                await self.ctrl.notify(f"?좑툘 二쇰Ц ?섎웾 怨꾩궛 ?ㅻ쪟: {qty} (?붽퀬: {free:.2f})")
+                await self.ctrl.notify(f"⚠️ 주문 수량 계산 오류: {qty} (잔고: {free:.2f})")
                 return
             
             if bounded_risk_pct != req_risk_pct:
-                await self.ctrl.notify(f"?좑툘 Risk capped: {req_risk_pct:.1f}% -> {bounded_risk_pct:.1f}%")
+                await self.ctrl.notify(f"⚠️ 리스크 상한 적용: {req_risk_pct:.1f}% -> {bounded_risk_pct:.1f}%")
             logger.info(
                 f"Entry params: qty={qty}, lev={lev}x, risk={bounded_risk_pct:.1f}% "
                 f"(risk_budget={risk_budget:.2f}, max_notional={max_notional:.2f}, target_notional={target_notional:.2f})"
@@ -2223,7 +2244,7 @@ class SignalEngine(BaseEngine):
             self.position_cache_time = 0
             
             self.db.log_trade_entry(symbol, side, price, float(qty))
-            await self.ctrl.notify(f"?? [Signal] {side.upper()} {qty} @ {price:.2f}")
+            await self.ctrl.notify(f"✅ [Signal] {side.upper()} {qty} @ {price:.2f}")
             logger.info(f"??Entry order success: {order.get('id', 'N/A')}")
             
             # ?꾨왂 ?뚮씪誘명꽣 濡쒕뱶
@@ -2262,7 +2283,7 @@ class SignalEngine(BaseEngine):
                     else:
                         self.fisher_trailing_stop = actual_entry_price + (self.fisher_entry_atr * trailing_mult)
                     logger.info(f"?뮶 [FractalFisher] Entry state: price={actual_entry_price:.2f}, TrailingStop={self.fisher_trailing_stop:.2f}")
-                    await self.ctrl.notify(f"?뱧 Trailing Stop ?ㅼ젙: {self.fisher_trailing_stop:.2f}")
+                    await self.ctrl.notify(f"🧭 Trailing Stop 설정: {self.fisher_trailing_stop:.2f}")
             
             else:
                 # SMA/HMA: ?쇱꽱??湲곕컲 TP/SL 二쇰Ц
@@ -2286,7 +2307,7 @@ class SignalEngine(BaseEngine):
             logger.error(f"Signal entry error: {e}")
             import traceback
             traceback.print_exc()
-            await self.ctrl.notify(f"??吏꾩엯 ?ㅽ뙣: {e}")
+            await self.ctrl.notify(f"❌ 진입 실패: {e}")
 
     async def _place_tp_sl_orders(self, symbol, side, entry_price, qty, tp_distance, sl_distance):
         """嫄곕옒?뚯뿉 TP/SL 二쇰Ц 諛곗튂 (?ㅽ뵂?ㅻ뜑??蹂댁엫)"""
@@ -2325,7 +2346,7 @@ class SignalEngine(BaseEngine):
                 sl_order = None
             
             if tp_order or sl_order:
-                await self.ctrl.notify(f"?렞 TP: `{tp_price:.2f}` | ?썞 SL: `{sl_price:.2f}`")
+                await self.ctrl.notify(f"🎯 TP: `{tp_price:.2f}` | 🛑 SL: `{sl_price:.2f}`")
             
         except Exception as e:
             logger.error(f"TP/SL order placement error: {e}")
@@ -2373,11 +2394,11 @@ class SignalEngine(BaseEngine):
                 logger.error(f"Exit attempt {attempt + 1}/{max_retries} failed: {e}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(1)  # 1珥??湲????ъ떆??
-                    await self.ctrl.notify(f"?좑툘 泥?궛 ?ъ떆??以?.. ({attempt + 2}/{max_retries})")
+                    await self.ctrl.notify(f"⚠️ 청산 재시도 중... ({attempt + 2}/{max_retries})")
         
         if not order:
             logger.error(f"??Exit failed after {max_retries} attempts, trying force close...")
-            await self.ctrl.notify(f"?슚 泥?궛 ?ㅽ뙣! 媛뺤젣 泥?궛 ?쒕룄 以?..")
+            await self.ctrl.notify("🚨 청산 실패! 강제 청산을 시도합니다...")
             
             # 媛뺤젣 泥?궛: 紐⑤뱺 二쇰Ц 痍⑥냼 ??reduceOnly濡??ъ떆??
             try:
@@ -2389,10 +2410,10 @@ class SignalEngine(BaseEngine):
                     self.exchange.create_order, symbol, 'market', side, qty, None,
                     {'reduceOnly': True}
                 )
-                await self.ctrl.notify(f"??媛뺤젣 泥?궛 ?깃났!")
+                await self.ctrl.notify("✅ 강제 청산 성공")
             except Exception as force_e:
                 logger.error(f"Force close also failed: {force_e}")
-                await self.ctrl.notify(f"?슚?슚 媛뺤젣 泥?궛???ㅽ뙣! 利됱떆 ?섎룞 泥?궛 ?꾩슂: {force_e}")
+                await self.ctrl.notify(f"🚨 강제 청산도 실패했습니다. 즉시 수동 청산이 필요합니다: {force_e}")
                 return
         
         pnl = float(pos.get('unrealizedPnl', 0))
@@ -2404,7 +2425,7 @@ class SignalEngine(BaseEngine):
         self.position_cache_time = 0
         
         self.db.log_trade_close(symbol, pnl, pnl_pct, exit_price, reason)
-        await self.ctrl.notify(f"?㏏ [{reason}] PnL: {pnl:+.2f} ({pnl_pct:+.2f}%)")
+        await self.ctrl.notify(f"📊 [{reason}] PnL: {pnl:+.2f} ({pnl_pct:+.2f}%)")
         logger.info(f"??Exit order success: {order.get('id', 'N/A')}")
 
 
@@ -2605,7 +2626,7 @@ class ShannonEngine(BaseEngine):
                         )
                         self.position_cache = None
                         self.position_cache_time = 0
-                        await self.ctrl.notify(f"?? [Shannon] LONG 吏꾩엯 {entry_qty} @ {price:.2f} (200 EMA ?곹뼢)")
+                        await self.ctrl.notify(f"✅ [Shannon] LONG 진입 {entry_qty} @ {price:.2f} (200 EMA 상향)")
                         self.db.log_shannon(total, "ENTRY_LONG", price, float(entry_qty), total)
                         logger.info(f"Shannon initial LONG entry: {order}")
                         return
@@ -2617,7 +2638,7 @@ class ShannonEngine(BaseEngine):
                         )
                         self.position_cache = None
                         self.position_cache_time = 0
-                        await self.ctrl.notify(f"?? [Shannon] SHORT 吏꾩엯 {entry_qty} @ {price:.2f} (200 EMA ?섑뼢)")
+                        await self.ctrl.notify(f"✅ [Shannon] SHORT 진입 {entry_qty} @ {price:.2f} (200 EMA 하향)")
                         self.db.log_shannon(total, "ENTRY_SHORT", price, float(entry_qty), total)
                         logger.info(f"Shannon initial SHORT entry: {order}")
                         return
@@ -2724,7 +2745,7 @@ class ShannonEngine(BaseEngine):
                     self.exchange.create_order, symbol, 'market', close_side, close_qty
                 )
                 pnl = float(pos.get('unrealizedPnl', 0))
-                await self.ctrl.notify(f"?뵏 [Shannon] {pos['side'].upper()} 泥?궛 (諛⑺뼢 ?꾪꽣) PnL: {pnl:+.2f}")
+                await self.ctrl.notify(f"🔄 [Shannon] {pos['side'].upper()} 청산 (방향 필터) PnL: {pnl:+.2f}")
                 self.position_cache = None
                 self.position_cache_time = 0
                 return
@@ -2738,7 +2759,7 @@ class ShannonEngine(BaseEngine):
             )
             
             pnl = float(pos.get('unrealizedPnl', 0))
-            await self.ctrl.notify(f"?봽 [Shannon] {pos['side'].upper()} 泥?궛 (異붿꽭 諛섏쟾) PnL: {pnl:+.2f}")
+            await self.ctrl.notify(f"🔄 [Shannon] {pos['side'].upper()} 청산 (추세 반전) PnL: {pnl:+.2f}")
             
             # 泥?궛 ?꾨즺 ?湲?
             await asyncio.sleep(2.0)  # 2珥??湲?
@@ -2754,7 +2775,7 @@ class ShannonEngine(BaseEngine):
                 )
                 self.position_cache = None
                 self.position_cache_time = 0
-                await self.ctrl.notify(f"?? [Shannon] {new_direction.upper()} 吏꾩엯 {entry_qty} @ {price:.2f}")
+                await self.ctrl.notify(f"✅ [Shannon] {new_direction.upper()} 진입 {entry_qty} @ {price:.2f}")
                 self.db.log_shannon(total, f"REVERSE_{new_direction.upper()}", price, float(entry_qty), total)
                 
         except Exception as e:
@@ -3104,12 +3125,12 @@ class DualThrustEngine(BaseEngine):
             self.position_cache_time = 0
             
             self.db.log_trade_entry(symbol, side, price, float(qty))
-            await self.ctrl.notify(f"?? [DualThrust] {side.upper()} {qty} @ {price:.2f}")
+            await self.ctrl.notify(f"✅ [DualThrust] {side.upper()} {qty} @ {price:.2f}")
             logger.info(f"??[DualThrust] Entry: {side} {qty} @ {price}")
             
         except Exception as e:
             logger.error(f"DualThrust entry error: {e}")
-            await self.ctrl.notify(f"??[DualThrust] 吏꾩엯 ?ㅽ뙣: {e}")
+            await self.ctrl.notify(f"❌ [DualThrust] 진입 실패: {e}")
 
     async def _close_and_switch(self, symbol, pos, price, new_side, total_equity):
         """?ъ???泥?궛 ??諛섎? 諛⑺뼢 吏꾩엯"""
@@ -3132,7 +3153,7 @@ class DualThrustEngine(BaseEngine):
             )
             
             self.db.log_trade_close(symbol, pnl, float(pos.get('percentage', 0)), price, "Switch")
-            await self.ctrl.notify(f"?봽 [DualThrust] {pos['side'].upper()} 泥?궛 ??{new_side.upper()} ?ㅼ쐞移?| PnL: {pnl:+.2f}")
+            await self.ctrl.notify(f"🔄 [DualThrust] {pos['side'].upper()} 청산 -> {new_side.upper()} 전환 | PnL: {pnl:+.2f}")
             
             self.position_cache = None
             self.position_cache_time = 0
@@ -3170,7 +3191,7 @@ class DualThrustEngine(BaseEngine):
             self.position_cache_time = 0
             
             self.db.log_trade_close(symbol, pnl, pnl_pct, exit_price, reason)
-            await self.ctrl.notify(f"?㏏ [DualThrust] [{reason}] PnL: {pnl:+.2f} ({pnl_pct:+.2f}%)")
+            await self.ctrl.notify(f"📊 [DualThrust] [{reason}] PnL: {pnl:+.2f} ({pnl_pct:+.2f}%)")
             
         except Exception as e:
             logger.error(f"DualThrust exit error: {e}")
@@ -3332,7 +3353,7 @@ class DualModeFractalEngine(BaseEngine):
             tp_pct = common_cfg.get('target_roe_pct', 0.0)
             sl_pct = common_cfg.get('stop_loss_pct', 0.0)
             
-            msg = f"?? [DualMode] {side.upper()} 吏꾩엯: {qty} @ {entry_price}"
+            msg = f"✅ [DualMode] {side.upper()} 진입: {qty} @ {entry_price}"
             
             # TP/SL 二쇰Ц 諛곗튂 (鍮꾨룞湲??ㅻ쪟 諛⑹?瑜??꾪빐 try-except)
             if tp_pct > 0 or sl_pct > 0:
@@ -3392,7 +3413,7 @@ class DualModeFractalEngine(BaseEngine):
                             msg += f" | SL: {sl_price:.2f}"
                 except Exception as e:
                     logger.error(f"TP/SL Order Failed: {e}")
-                    msg += f" | ?좑툘 TP/SL Error"
+                    msg += " | ⚠️ TP/SL 오류"
 
             await self.ctrl.notify(msg)
 
@@ -3406,7 +3427,7 @@ class DualModeFractalEngine(BaseEngine):
             )
             pnl = float(pos.get('unrealizedPnl', 0))
             self.db.log_trade_close(symbol, pnl, 0, 0, reason)
-            await self.ctrl.notify(f"?㏏ [DualMode] 泥?궛 [{reason}]: PnL {pnl:.2f}")
+            await self.ctrl.notify(f"📊 [DualMode] 청산 [{reason}]: PnL {pnl:.2f}")
             self.position_cache = None
 
     async def _update_status(self, symbol, price, tf):
@@ -3439,15 +3460,8 @@ class MainController:
         api = self.cfg.get('api', {})
         creds = api.get('testnet', {}) if api.get('use_testnet', True) else api.get('mainnet', {})
         
-        self.exchange = ccxt.binance({
-            'apiKey': creds.get('api_key', ''),
-            'secret': creds.get('secret_key', ''),
-            'options': {'defaultType': 'future'},
-            'enableRateLimit': True
-        })
-        
-        if api.get('use_testnet', True):
-            self.exchange.set_sandbox_mode(True)
+        self.exchange = self._build_exchange(creds)
+        self._configure_exchange_network(self.exchange, api.get('use_testnet', True))
         
         self.engines = {
             CORE_ENGINE: SignalEngine(self)
@@ -3460,6 +3474,38 @@ class MainController:
         self.dashboard_msg_id = None
         self.blink_state = False
         self.last_hourly_report = 0
+
+    def _build_exchange(self, creds):
+        return ccxt.binance({
+            'apiKey': creds.get('api_key', ''),
+            'secret': creds.get('secret_key', ''),
+            'options': {'defaultType': 'future'},
+            'enableRateLimit': True
+        })
+
+    def _configure_exchange_network(self, exchange, use_testnet: bool):
+        if not use_testnet:
+            return "메인넷 💰"
+
+        try:
+            if hasattr(exchange, 'enable_demo_trading'):
+                exchange.enable_demo_trading(True)
+                logger.info("Exchange network configured: Binance Demo Trading")
+                return "테스트넷(데모) 🧪"
+            if hasattr(exchange, 'enableDemoTrading'):
+                exchange.enableDemoTrading(True)
+                logger.info("Exchange network configured: Binance Demo Trading")
+                return "테스트넷(데모) 🧪"
+        except Exception as e:
+            logger.warning(f"Failed to enable demo trading, fallback to sandbox mode: {e}")
+
+        try:
+            exchange.set_sandbox_mode(True)
+            logger.warning("Using legacy sandbox mode. Consider updating ccxt >= 4.5.6.")
+            return "테스트넷(샌드박스) 🧪"
+        except Exception as e:
+            logger.error(f"Failed to configure testnet mode: {e}")
+            raise
 
     async def run(self):
         logger.info("Bot starting... (Pure Polling Mode)")
@@ -3532,7 +3578,7 @@ class MainController:
         return watchlist[0] if watchlist else 'BTC/USDT'
 
     async def reinit_exchange(self, use_testnet: bool):
-        """嫄곕옒???곌껐 ?ъ큹湲고솕 (?뚯뒪?몃꽬/硫붿씤???꾪솚)"""
+        """거래소 연결 재초기화 (테스트넷/메인넷 전환)."""
         try:
             # 1. ?꾩옱 ?붿쭊 ?뺤?
             if self.active_engine:
@@ -3547,15 +3593,8 @@ class MainController:
             creds = api.get('testnet', {}) if use_testnet else api.get('mainnet', {})
             
             # 4. 嫄곕옒???ъ큹湲고솕
-            self.exchange = ccxt.binance({
-                'apiKey': creds.get('api_key', ''),
-                'secret': creds.get('secret_key', ''),
-                'options': {'defaultType': 'future'},
-                'enableRateLimit': True
-            })
-            
-            if use_testnet:
-                self.exchange.set_sandbox_mode(True)
+            self.exchange = self._build_exchange(creds)
+            network_name = self._configure_exchange_network(self.exchange, use_testnet)
             
             # 5. 留덉폆 ?뺣낫 濡쒕뱶
             await asyncio.to_thread(self.exchange.load_markets)
@@ -3570,8 +3609,7 @@ class MainController:
             eng_name = self.cfg.get('system_settings', {}).get('active_engine', CORE_ENGINE)
             await self._switch_engine(eng_name)
             
-            network_name = "?뚯뒪?몃꽬 ?㎦" if use_testnet else "硫붿씤???뮥"
-            logger.info(f"??Exchange reinitialized: {network_name}")
+            logger.info(f"Exchange reinitialized: {network_name}")
             return True, network_name
             
         except Exception as e:
@@ -3758,7 +3796,7 @@ class MainController:
         context.user_data['setup_choice'] = text
         
         prompts = {
-            '1': "📝 **레버리지** 값을 입력하세요 (1~5, 예: 5)",
+            '1': "📝 **레버리지** 값을 입력하세요 (1~20, 예: 5)",
             '2': "📝 **목표 ROE(%)** 값을 입력하세요 (예: 20)",
             '3': "📝 **손절 비율(%)** 값을 입력하세요 (예: 5)",
             '4': "📝 **진입 타임프레임** 입력 (예: 15m)\n1m,2m,3m,5m,15m,30m | 1h,2h,4h | 1d",
@@ -3778,7 +3816,7 @@ class MainController:
             '18': "📝 **진입 모드** 선택 (1=Cross, 2=Position)",
             '20': "📝 **VBO 설정** (legacy) 입력",
             '21': "📝 **FractalFisher 설정** (legacy) 입력",
-            '22': "📝 **네트워크 선택** (1=테스트넷, 2=메인넷)",
+            '22': "📝 **네트워크 선택** (1=테스트넷(데모), 2=메인넷)",
             '23': "📝 **거래량 급등 채굴 기능** (1=ON, 0=OFF)",
             '24': "📝 **채굴 진입 타임프레임** 입력 (예: 5m)\n1m, 5m, 15m, 30m, 1h",
             '25': "📝 **채굴 청산 타임프레임** 입력 (예: 1h)\n1m, 5m, 15m, 30m, 1h, 4h",
@@ -3790,7 +3828,7 @@ class MainController:
             '31': "📝 **CHOP 기준값** 입력 (예: 50.0)",
             '33': "📝 **CC Exit 필터**를 ON/OFF 합니다.",
             '34': "📝 **CC 설정** 입력 (예: 0.70 또는 0.70,14)",
-            '35': "📝 **Dual Mode 변경** (1=Standard, 2=Scalping)",
+            '35': "📝 **듀얼모드 변경** (1=스탠다드, 2=스캘핑)",
         }
         if text == '7':
             keyboard = [
@@ -3956,7 +3994,7 @@ class MainController:
                 v = int(val)
                 # ?덈쾭由ъ? 理쒕? 20諛??쒗븳 (?ъ슜???붿껌: 5 -> 20)
                 if v < 1 or v > 20:
-                    await update.message.reply_text("???덈쾭由ъ???1~20諛??ъ씠留?媛?ν빀?덈떎.")
+                    await update.message.reply_text("❌ 레버리지는 1~20 사이 값만 가능합니다.")
                     return SELECT
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'leverage'], v)
                 await self.cfg.update_value(['shannon_engine', 'leverage'], v)
@@ -3967,7 +4005,7 @@ class MainController:
                 if self.active_engine:
                     sym = self._get_current_symbol()
                     await self.active_engine.ensure_market_settings(sym)
-                await update.message.reply_text(f"???덈쾭由ъ? 蹂寃? {v}x")
+                await update.message.reply_text(f"✅ 레버리지 변경: {v}x")
             elif choice == '2':
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'target_roe_pct'], float(val))
                 await self.cfg.update_value(['dual_mode_engine', 'target_roe_pct'], float(val))
@@ -4019,7 +4057,7 @@ class MainController:
                 v = float(val)
                 max_risk = float(self.cfg.get('signal_engine', {}).get('common_settings', {}).get('max_risk_per_trade_pct', 20.0) or 20.0)
                 if v < 1 or v > max_risk:
-                    await update.message.reply_text(f"??1~{max_risk:.0f} ?ъ씠??媛믪쓣 ?낅젰?섏꽭??")
+                    await update.message.reply_text(f"❌ 1~{max_risk:.0f} 사이 값을 입력하세요.")
                     return SELECT
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'risk_per_trade_pct'], v)
                 await self.cfg.update_value(['dual_thrust_engine', 'risk_per_trade_pct'], v)
@@ -4029,41 +4067,41 @@ class MainController:
                 # Scanner Entry Timeframe
                 valid_tf = ['1m', '2m', '3m', '5m', '15m', '30m', '1h', '4h']
                 if val not in valid_tf:
-                    await update.message.reply_text(f"???좏슚?섏? ?딆? ??꾪봽?덉엫.\n異붿쿇: 1m, 5m, 15m")
+                    await update.message.reply_text("❌ 유효하지 않은 타임프레임입니다.\n추천: 1m, 5m, 15m")
                     return SELECT
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_timeframe'], val)
-                await update.message.reply_text(f"??梨꾧뎬 吏꾩엯 ??꾪봽?덉엫 蹂寃? {val}")
+                await update.message.reply_text(f"✅ 채굴 진입 타임프레임 변경: {val}")
 
             elif choice == '25':
                 # Scanner Exit Timeframe
                 valid_tf = ['1m', '2m', '3m', '5m', '15m', '30m', '1h', '4h']
                 if val not in valid_tf:
-                    await update.message.reply_text(f"???좏슚?섏? ?딆? ??꾪봽?덉엫.\n異붿쿇: 1m, 5m, 15m, 1h")
+                    await update.message.reply_text("❌ 유효하지 않은 타임프레임입니다.\n추천: 1m, 5m, 15m, 1h")
                     return SELECT
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_exit_timeframe'], val)
-                await update.message.reply_text(f"??梨꾧뎬 泥?궛 ??꾪봽?덉엫 蹂寃? {val}")
+                await update.message.reply_text(f"✅ 채굴 청산 타임프레임 변경: {val}")
 
             # ======== Signal (SMA) ?꾩슜 ========
             elif choice == '10':
                 # SMA 湲곌컙 蹂寃?(?뺤떇: "2,10" ?먮뒗 "5,25")
                 parts = val.replace(' ', '').split(',')
                 if len(parts) != 2:
-                    await update.message.reply_text("???뺤떇: fast,slow (?? 2,10)")
+                    await update.message.reply_text("❌ 형식: fast,slow (예: 2,10)")
                     return SELECT
                 fast, slow = int(parts[0]), int(parts[1])
                 if fast >= slow:
-                    await update.message.reply_text("??fast SMA媛 slow蹂대떎 ?묒븘???⑸땲??")
+                    await update.message.reply_text("❌ fast SMA는 slow SMA보다 작아야 합니다.")
                     return SELECT
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'Triple_SMA', 'fast_sma'], fast)
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'Triple_SMA', 'slow_sma'], slow)
-                await update.message.reply_text(f"??SMA 湲곌컙 蹂寃? {fast}/{slow}")
+                await update.message.reply_text(f"✅ SMA 기간 변경: {fast}/{slow}")
             
             # ======== Shannon ?꾩슜 ========
             elif choice == '11':
                 # ?먯궛 鍮꾩쑉 蹂寃?(?뺤떇: "50" = 50%)
                 v = float(val)
                 if v < 10 or v > 90:
-                    await update.message.reply_text("??10~90 ?ъ씠??媛믪쓣 ?낅젰?섏꽭??")
+                    await update.message.reply_text("❌ 10~90 사이 값을 입력하세요.")
                     return SELECT
                 ratio = v / 100.0
                 await self.cfg.update_value(['shannon_engine', 'asset_allocation', 'target_ratio'], ratio)
@@ -4071,23 +4109,23 @@ class MainController:
                 shannon_engine = self.engines.get('shannon')
                 if shannon_engine:
                     shannon_engine.ratio = ratio
-                await update.message.reply_text(f"??Shannon ?먯궛 鍮꾩쑉 蹂寃? {int(v)}%")
+                await update.message.reply_text(f"✅ Shannon 자산 비율 변경: {int(v)}%")
             
             elif choice == '12':
                 # Grid ?ㅼ젙 (?뺤떇: "on,200" ?먮뒗 "off")
                 val_lower = val.lower().strip()
                 if val_lower == 'off':
                     await self.cfg.update_value(['shannon_engine', 'grid_trading', 'enabled'], False)
-                    await update.message.reply_text("??Grid Trading: OFF")
+                    await update.message.reply_text("✅ Grid Trading: OFF")
                 else:
                     parts = val_lower.replace(' ', '').split(',')
                     if parts[0] == 'on' and len(parts) >= 2:
                         size = float(parts[1])
                         await self.cfg.update_value(['shannon_engine', 'grid_trading', 'enabled'], True)
                         await self.cfg.update_value(['shannon_engine', 'grid_trading', 'order_size_usdt'], size)
-                        await update.message.reply_text(f"??Grid Trading: ON, ${size}")
+                        await update.message.reply_text(f"✅ Grid Trading: ON, ${size}")
                     else:
-                        await update.message.reply_text("???뺤떇: on,湲덉븸 ?먮뒗 off (?? on,200)")
+                        await update.message.reply_text("❌ 형식: on,금액 또는 off (예: on,200)")
                         return SELECT
             
             # ======== Dual Thrust ?꾩슜 ========
@@ -4095,24 +4133,24 @@ class MainController:
                 # N Days 蹂寃?
                 v = int(val)
                 if v < 1 or v > 30:
-                    await update.message.reply_text("??1~30 ?ъ씠??媛믪쓣 ?낅젰?섏꽭??")
+                    await update.message.reply_text("❌ 1~30 사이 값을 입력하세요.")
                     return SELECT
                 await self.cfg.update_value(['dual_thrust_engine', 'n_days'], v)
                 # ?붿쭊 罹먯떆 珥덇린??(??N?쇰줈 ?몃━嫄??ш퀎??
                 dt_engine = self.engines.get('dualthrust')
                 if dt_engine:
                     dt_engine.trigger_date = None
-                await update.message.reply_text(f"??Dual Thrust N Days 蹂寃? {v}")
+                await update.message.reply_text(f"✅ Dual Thrust N Days 변경: {v}")
             
             elif choice == '15':
                 # K1/K2 蹂寃?(?뺤떇: "0.5,0.5" ?먮뒗 "0.4,0.6")
                 parts = val.replace(' ', '').split(',')
                 if len(parts) != 2:
-                    await update.message.reply_text("???뺤떇: k1,k2 (?? 0.5,0.5)")
+                    await update.message.reply_text("❌ 형식: k1,k2 (예: 0.5,0.5)")
                     return SELECT
                 k1, k2 = float(parts[0]), float(parts[1])
                 if k1 <= 0 or k1 > 1 or k2 <= 0 or k2 > 1:
-                    await update.message.reply_text("??K1, K2??0~1 ?ъ씠??媛믪씠?댁빞 ?⑸땲??")
+                    await update.message.reply_text("❌ K1, K2는 0~1 사이 값이어야 합니다.")
                     return SELECT
                 await self.cfg.update_value(['dual_thrust_engine', 'k1'], k1)
                 await self.cfg.update_value(['dual_thrust_engine', 'k2'], k2)
@@ -4120,7 +4158,7 @@ class MainController:
                 dt_engine = self.engines.get('dualthrust')
                 if dt_engine:
                     dt_engine.trigger_date = None
-                await update.message.reply_text(f"??Dual Thrust K1/K2 蹂寃? {k1}/{k2}")
+                await update.message.reply_text(f"✅ Dual Thrust K1/K2 변경: {k1}/{k2}")
             # ======== Signal ?좉퇋 ?듭뀡 ========
             elif choice == '16':
                 # ?꾨왂 蹂寃?(踰덊샇 ?먮뒗 ?대쫫?쇰줈 ?좏깮)
@@ -4145,9 +4183,9 @@ class MainController:
                         signal_engine.fisher_trailing_stop = None
                         signal_engine.fisher_hurst = None
                         signal_engine.fisher_value = None
-                    await update.message.reply_text(f"???꾨왂 蹂寃? {val_lower.upper()}")
+                    await update.message.reply_text(f"✅ 전략 변경: {val_lower.upper()}")
                 else:
-                    await update.message.reply_text("??1~2 ?먮뒗 sma/hma ?낅젰\n1=SMA, 2=HMA")
+                    await update.message.reply_text("❌ 1~2 또는 sma/hma를 입력하세요.\n1=SMA, 2=HMA")
                     return SELECT
             
             elif choice == '20':
@@ -4156,7 +4194,7 @@ class MainController:
                 # VBO ?ㅼ젙 蹂寃?(?뺤떇: "atr湲곌컙,?뚰뙆諛곗닔,TP諛곗닔,SL諛곗닔")
                 parts = val.replace(' ', '').split(',')
                 if len(parts) != 4:
-                    await update.message.reply_text("???뺤떇: atr,?뚰뙆,TP,SL (?? 14,0.5,1.0,0.5)")
+                    await update.message.reply_text("❌ 형식: atr,돌파,TP,SL (예: 14,0.5,1.0,0.5)")
                     return SELECT
                 try:
                     atr_period = int(parts[0])
@@ -4169,9 +4207,9 @@ class MainController:
                     await self.cfg.update_value(['signal_engine', 'strategy_params', 'MicroVBO', 'tp_atr_multiplier'], tp_mult)
                     await self.cfg.update_value(['signal_engine', 'strategy_params', 'MicroVBO', 'sl_atr_multiplier'], sl_mult)
                     
-                    await update.message.reply_text(f"??VBO ?ㅼ젙: ATR={atr_period}, ?뚰뙆={breakout_mult}, TP={tp_mult}x, SL={sl_mult}x")
+                    await update.message.reply_text(f"✅ VBO 설정: ATR={atr_period}, 돌파={breakout_mult}, TP={tp_mult}x, SL={sl_mult}x")
                 except ValueError:
-                    await update.message.reply_text("???щ컮瑜??レ옄瑜??낅젰?섏꽭??")
+                    await update.message.reply_text("❌ 올바른 숫자를 입력하세요.")
                     return SELECT
             
             elif choice == '21':
@@ -4180,7 +4218,7 @@ class MainController:
                 # FractalFisher ?ㅼ젙 蹂寃?(?뺤떇: "hurst湲곌컙,hurst?꾧퀎,fisher湲곌컙,trailing諛곗닔")
                 parts = val.replace(' ', '').split(',')
                 if len(parts) != 4:
-                    await update.message.reply_text("???뺤떇: hurst湲곌컙,hurst?꾧퀎,fisher湲곌컙,trailing諛곗닔 (?? 100,0.55,10,2.0)")
+                    await update.message.reply_text("❌ 형식: hurst기간,hurst임계,fisher기간,trailing배수 (예: 100,0.55,10,2.0)")
                     return SELECT
                 try:
                     hurst_period = int(parts[0])
@@ -4193,24 +4231,24 @@ class MainController:
                     await self.cfg.update_value(['signal_engine', 'strategy_params', 'FractalFisher', 'fisher_period'], fisher_period)
                     await self.cfg.update_value(['signal_engine', 'strategy_params', 'FractalFisher', 'atr_trailing_multiplier'], trailing_mult)
                     
-                    await update.message.reply_text(f"??FractalFisher: Hurst={hurst_period}遊?{hurst_threshold}, Fisher={fisher_period}, Trailing={trailing_mult}x ATR")
+                    await update.message.reply_text(f"✅ FractalFisher: Hurst={hurst_period}/{hurst_threshold}, Fisher={fisher_period}, Trailing={trailing_mult}x ATR")
                 except ValueError:
-                    await update.message.reply_text("???щ컮瑜??レ옄瑜??낅젰?섏꽭??")
+                    await update.message.reply_text("❌ 올바른 숫자를 입력하세요.")
                     return SELECT
             
             elif choice == '17':
                 # HMA 湲곌컙 蹂寃?(?뺤떇: "9,21")
                 parts = val.replace(' ', '').split(',')
                 if len(parts) != 2:
-                    await update.message.reply_text("???뺤떇: fast,slow (?? 9,21)")
+                    await update.message.reply_text("❌ 형식: fast,slow (예: 9,21)")
                     return SELECT
                 fast, slow = int(parts[0]), int(parts[1])
                 if fast >= slow:
-                    await update.message.reply_text("??fast HMA媛 slow蹂대떎 ?묒븘???⑸땲??")
+                    await update.message.reply_text("❌ fast HMA는 slow HMA보다 작아야 합니다.")
                     return SELECT
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'HMA', 'fast_period'], fast)
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'HMA', 'slow_period'], slow)
-                await update.message.reply_text(f"??HMA 湲곌컙 蹂寃? {fast}/{slow}")
+                await update.message.reply_text(f"✅ HMA 기간 변경: {fast}/{slow}")
             
             elif choice == '18':
                 # 吏꾩엯紐⑤뱶 蹂寃?(1=cross, 2=position)
@@ -4219,35 +4257,34 @@ class MainController:
                 elif val == '2':
                     val_lower = 'position'
                 else:
-                    await update.message.reply_text("??1(Cross) ?먮뒗 2(Position)瑜??낅젰?섏꽭??")
+                    await update.message.reply_text("❌ 1(Cross) 또는 2(Position)를 입력하세요.")
                     return SELECT
                 
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'entry_mode'], val_lower)
-                await update.message.reply_text(f"??吏꾩엯紐⑤뱶 蹂寃? {val_lower.upper()}")
+                await update.message.reply_text(f"✅ 진입모드 변경: {val_lower.upper()}")
             
             elif choice == '22':
-                # ?ㅽ듃?뚰겕 ?꾪솚 (1=?뚯뒪?몃꽬, 2=硫붿씤??
+                # 네트워크 전환 (1=테스트넷, 2=메인넷)
                 if val not in ['1', '2']:
-                    await update.message.reply_text("??1 ?먮뒗 2瑜??낅젰?섏꽭??\n1=?뚯뒪?몃꽬, 2=硫붿씤??")
+                    await update.message.reply_text("❌ 1 또는 2를 입력하세요.\n1=테스트넷(데모), 2=메인넷")
                     return SELECT
                 
                 use_testnet = val == '1'
                 current = self.cfg.get('api', {}).get('use_testnet', True)
                 
                 if use_testnet == current:
-                    network_name = "?뚯뒪?몃꽬 ?㎦" if use_testnet else "硫붿씤???뮥"
-                    await update.message.reply_text(f"?뱄툘 ?대? {network_name} ?ъ슜 以묒엯?덈떎.")
+                    network_name = "테스트넷(데모) 🧪" if use_testnet else "메인넷 💰"
+                    await update.message.reply_text(f"ℹ️ 이미 {network_name} 사용 중입니다.")
                 else:
-                    # ?꾪솚 ?뺤씤 硫붿떆吏
-                    target_name = "?뚯뒪?몃꽬 ?㎦" if use_testnet else "硫붿씤???뮥"
-                    await update.message.reply_text(f"?봽 {target_name}(??濡??꾪솚 以?..")
+                    target_name = "테스트넷(데모) 🧪" if use_testnet else "메인넷 💰"
+                    await update.message.reply_text(f"🔄 {target_name}으로 전환 중...")
                     
                     success, result = await self.reinit_exchange(use_testnet)
                     
                     if success:
-                        await update.message.reply_text(f"???ㅽ듃?뚰겕 ?꾪솚 ?꾨즺: {result}")
+                        await update.message.reply_text(f"✅ 네트워크 전환 완료: {result}")
                     else:
-                        await update.message.reply_text(f"???ㅽ듃?뚰겕 ?꾪솚 ?ㅽ뙣: {result}")
+                        await update.message.reply_text(f"❌ 네트워크 전환 실패: {result}")
             
             elif choice == '23':
                 # Scanner Toggle
@@ -4256,39 +4293,39 @@ class MainController:
                 elif val in ['0', 'off', 'OFF']:
                     new_val = False
                 else:
-                    await update.message.reply_text("??1(ON) ?먮뒗 0(OFF)瑜??낅젰?섏꽭??")
+                    await update.message.reply_text("❌ 1(ON) 또는 0(OFF)를 입력하세요.")
                     return SELECT
                 
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], new_val)
-                status = "ON ?뱻" if new_val else "OFF"
-                await update.message.reply_text(f"??嫄곕옒??湲됰벑 梨꾧뎬: {status}")
+                status = "ON 📡" if new_val else "OFF"
+                await update.message.reply_text(f"✅ 거래량 급등 채굴: {status}")
 
             elif choice == '27':
                 # R2 Threshold
                 v = float(val)
                 if v < 0.01 or v > 0.9:
-                    await update.message.reply_text("??0.01 ~ 0.9 ?ъ씠??媛믪쓣 ?낅젰?섏꽭??")
+                    await update.message.reply_text("❌ 0.01 ~ 0.9 사이 값을 입력하세요.")
                     return SELECT
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'r2_threshold'], v)
-                await update.message.reply_text(f"??異붿꽭 ?꾪꽣 誘쇨컧??蹂寃? {v}")
+                await update.message.reply_text(f"✅ R2 기준값 변경: {v}")
 
             elif choice == '29':
                 # Hurst Threshold
                 v = float(val)
                 if v < 0.0 or v > 1.0:
-                    await update.message.reply_text("??0.0 ~ 1.0 ?ъ씠??媛믪쓣 ?낅젰?섏꽭??")
+                    await update.message.reply_text("❌ 0.0 ~ 1.0 사이 값을 입력하세요.")
                     return SELECT
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'hurst_threshold'], v)
-                await update.message.reply_text(f"??Hurst 誘쇨컧??蹂寃? {v}")
+                await update.message.reply_text(f"✅ Hurst 기준값 변경: {v}")
 
             elif choice == '31':
                 # CHOP Threshold
                 v = float(val)
                 if v < 0 or v > 100:
-                    await update.message.reply_text("??0 ~ 100 ?ъ씠??媛믪쓣 ?낅젰?섏꽭??")
+                    await update.message.reply_text("❌ 0 ~ 100 사이 값을 입력하세요.")
                     return SELECT
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'chop_threshold'], v)
-                await update.message.reply_text(f"??CHOP 誘쇨컧??蹂寃? {v}")
+                await update.message.reply_text(f"✅ CHOP 기준값 변경: {v}")
             
             elif choice == '34':
                 # CC Threshold & Length
@@ -4296,35 +4333,37 @@ class MainController:
                 if len(parts) == 1:
                     v = float(parts[0])
                     if v < 0.1 or v > 1.0:
-                        await update.message.reply_text("???꾧퀎媛믪? 0.1 ~ 1.0 ?ъ씠?ъ빞 ?⑸땲??")
+                        await update.message.reply_text("❌ 임계값은 0.1 ~ 1.0 사이여야 합니다.")
                         return SELECT
                     await self.cfg.update_value(['signal_engine', 'common_settings', 'cc_threshold'], v)
-                    await update.message.reply_text(f"??CC 誘쇨컧??蹂寃? {v}")
+                    await update.message.reply_text(f"✅ CC 임계값 변경: {v}")
                 elif len(parts) == 2:
                     v = float(parts[0])
                     l = int(parts[1])
                     if v < 0.1 or v > 1.0 or l < 5 or l > 100:
-                        await update.message.reply_text("???꾧퀎媛?0.1~1.0), 湲곌컙(5~100)???뺤씤?섏꽭??")
+                        await update.message.reply_text("❌ 임계값(0.1~1.0), 기간(5~100)을 확인하세요.")
                         return SELECT
                     await self.cfg.update_value(['signal_engine', 'common_settings', 'cc_threshold'], v)
                     await self.cfg.update_value(['signal_engine', 'common_settings', 'cc_length'], l)
-                    await update.message.reply_text(f"??CC ?ㅼ젙: 誘쇨컧??{v}, 湲곌컙={l}")
+                    await update.message.reply_text(f"✅ CC 설정: 임계값={v}, 기간={l}")
                 else:
-                    await update.message.reply_text("???뺤떇: ?꾧퀎媛??먮뒗 ?꾧퀎媛?湲곌컙")
+                    await update.message.reply_text("❌ 형식: 임계값 또는 임계값,기간")
                     return SELECT
 
             elif choice == '35':
-                # Dual Mode 蹂寃?
+                # 듀얼모드 변경
                 if val == '1':
                     new_mode = 'standard'
+                    mode_label = '스탠다드'
                 elif val == '2':
                     new_mode = 'scalping'
+                    mode_label = '스캘핑'
                 else:
-                    await update.message.reply_text("??1(Standard) ?먮뒗 2(Scalping)???낅젰?섏꽭??")
+                    await update.message.reply_text("❌ 1(스탠다드) 또는 2(스캘핑)를 입력하세요.")
                     return SELECT
                 
                 await self.cfg.update_value(['dual_mode_engine', 'mode'], new_mode)
-                await update.message.reply_text(f"??Dual Mode 蹂寃? {new_mode.upper()}")
+                await update.message.reply_text(f"✅ 듀얼모드 변경: {mode_label}")
                 
                 # 利됱떆 ?ъ큹湲고솕 ?몃━嫄?(poll_tick?먯꽌 媛먯??섏?留?紐낆떆??由ъ뀑)
                 dm_engine = self.engines.get('dualmode')
@@ -4346,17 +4385,17 @@ class MainController:
             
             # 10~41 success message handled
             if choice not in ['10', '11', '12', '14', '15', '16', '17', '18', '20', '21', '22', '23', '26', '27', '28', '29', '30', '31', '33', '34', '35', '41']:
-                await update.message.reply_text(f"???ㅼ젙 ?꾨즺: {val}")
+                await update.message.reply_text(f"✅ 설정 완료: {val}")
             await self._restore_main_keyboard(update)
             await self.show_setup_menu(update)
             return SELECT
             
         except ValueError:
-            await update.message.reply_text("???щ컮瑜??レ옄瑜??낅젰?섏꽭??")
+            await update.message.reply_text("❌ 올바른 숫자를 입력하세요.")
             return SELECT
         except Exception as e:
             logger.error(f"Setup input error: {e}")
-            await update.message.reply_text(f"???ㅻ쪟: {e}")
+            await update.message.reply_text(f"❌ 오류: {e}")
             return SELECT
 
     async def setup_symbol_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4383,7 +4422,7 @@ class MainController:
             try:
                 await asyncio.to_thread(self.exchange.fetch_ticker, symbol)
             except Exception:
-                await update.message.reply_text(f"???좏슚?섏? ?딆? ?щ낵 ?먮뒗 嫄곕옒??誘몄??? {symbol}\n(?? BTC/USDT ?먮뒗 洹몃깷 BTC)")
+                await update.message.reply_text(f"❌ 유효하지 않은 심볼 또는 거래쌍입니다: {symbol}\n(예: BTC/USDT 또는 BTC)")
                 return SELECT
         
         try:
@@ -4400,7 +4439,7 @@ class MainController:
                 # Signal ?붿쭊: 硫붾돱?먯꽌 蹂寃???Watchlist瑜??대떦 ?щ낵濡?**?泥?* (湲곗〈 ?숈옉 ?좎?)
                 # ?ㅼ쨷 媛먯떆瑜??먰븯硫?硫붾돱媛 ?꾨땲??梨꾪똿李쎌뿉??異붽??댁빞 ?⑥쓣 ?덈궡
                 await self.cfg.update_value(['signal_engine', 'watchlist'], [symbol])
-                await update.message.reply_text("?뱄툘 Signal ?붿쭊??媛먯떆 紐⑸줉?????щ낵濡?珥덇린?붾릺?덉뒿?덈떎.\n(異붽?瑜??먰븯?쒕㈃ 硫붾돱 諛뽰뿉???щ낵???낅젰?섏꽭??")
+                await update.message.reply_text("ℹ️ Signal 엔진 감시 목록이 해당 심볼로 초기화되었습니다.\n(추가를 원하면 메뉴 밖에서 심볼을 입력하세요)")
             
             # 留덉폆 ?ㅼ젙 ?곸슜
             # 留덉폆 ?ㅼ젙 ?곸슜
@@ -4443,14 +4482,14 @@ class MainController:
                 tema_engine.ema3 = None
                 logger.info(f"?봽 TEMA engine cache cleared for new symbol: {symbol}")
             
-            await update.message.reply_text(f"???щ낵 蹂寃??꾨즺: {symbol}")
+            await update.message.reply_text(f"✅ 심볼 변경 완료: {symbol}")
             await self._restore_main_keyboard(update)
             await self.show_setup_menu(update)
             return SELECT
             
         except Exception as e:
             logger.error(f"Symbol change error: {e}")
-            await update.message.reply_text(f"???щ낵 蹂寃??ㅽ뙣: {e}")
+            await update.message.reply_text(f"❌ 심볼 변경 실패: {e}")
             return SELECT
 
     async def setup_direction_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4474,9 +4513,9 @@ class MainController:
         
         if direction:
             await self.cfg.update_value(['system_settings', 'trade_direction'], direction)
-            await update.message.reply_text(f"??留ㅻℓ 諛⑺뼢 蹂寃? {direction}")
+            await update.message.reply_text(f"✅ 매매 방향 변경: {direction}")
         else:
-            await update.message.reply_text("???좏슚?섏? ?딆? ?좏깮")
+            await update.message.reply_text("❌ 유효하지 않은 선택입니다.")
         
         await self._restore_main_keyboard(update)
         await self.show_setup_menu(update)
@@ -4689,7 +4728,7 @@ class MainController:
 
     # ---------------- Hourly Report ----------------
     async def _hourly_report_loop(self):
-        """?쒓컙蹂?由ы룷??"""
+        """시간별 리포트."""
         await asyncio.sleep(60)  # ?쒖옉 ?湲?
         
         while True:
@@ -4709,11 +4748,11 @@ class MainController:
                                 d = first_val
                         
                         msg = f"""
-??**?쒓컙蹂?由ы룷??* [{now.strftime('%H:%M')}]
+⏱ **시간별 리포트** [{now.strftime('%H:%M')}]
 
-?뮥 ?먯궛: ${d.get('total_equity', 0):.2f}
-?뱢 ?ㅻ뒛 ?먯씡: ${daily_pnl:+.2f} ({daily_count}嫄?
-?뱤 MMR: {d.get('mmr', 0):.2f}%
+💰 자산: ${d.get('total_equity', 0):.2f}
+📈 일일 손익: ${daily_pnl:+.2f} ({daily_count}건)
+🛡 MMR: {d.get('mmr', 0):.2f}%
 """
                         await self.notify(msg.strip())
                 
@@ -4807,9 +4846,13 @@ class MainController:
                     all_data = self.status_data # Dict[symbol, status_dict]
                     
                     if not all_data:
-                        # Fallback: ?뺣낫媛 ?섎굹???놁쓣 ??
+                        # Fallback: 엔진 상태 데이터가 아직 없을 때
                         eng = self.cfg.get('system_settings', {}).get('active_engine', 'LOADING').upper()
-                        msg = f"{blink} **[{eng}] Dashboard**{pause_indicator} [{datetime.now().strftime('%H:%M:%S')}]\n???곗씠???섏떊 ?湲?以?.."
+                        msg = (
+                            f"{blink} **[{eng}] 대시보드**{pause_indicator} "
+                            f"[{datetime.now().strftime('%H:%M:%S')}]\n"
+                            "데이터 수집 대기 중..."
+                        )
                     else:
                         msg = self._format_dashboard_message(all_data, blink, pause_indicator)
 
@@ -4904,7 +4947,9 @@ class MainController:
                 if d_eng == 'SIGNAL':
                     e_tf = d.get('entry_tf', '?')
                     x_tf = d.get('exit_tf', '?')
+                    entry_reason = d.get('entry_reason', '대기')
                     msg += f"⏱ TF: 진입 `{e_tf}` / 청산 `{x_tf}`\n"
+                    msg += f"📝 진입판정: `{entry_reason}`\n"
 
                     f_cfg = d.get('filter_config', {})
                     entry_st = d.get('entry_filters', {})
@@ -4950,7 +4995,8 @@ class MainController:
                     msg += f"트리거: `L:{d.get('long_trigger', 0):.1f} / S:{d.get('short_trigger', 0):.1f}`\n"
 
                 elif d_eng == 'DUALMODE':
-                    mode_name = d.get('dm_mode', 'N/A')
+                    mode_raw = str(d.get('dm_mode', 'N/A')).upper()
+                    mode_name = {'STANDARD': '스탠다드', 'SCALPING': '스캘핑'}.get(mode_raw, mode_raw)
                     msg += f"듀얼모드: `{mode_name}` | TF: `{d.get('dm_tf')}`\n"
 
                 msg += "\n"
@@ -4962,7 +5008,7 @@ class MainController:
 
     async def emergency_stop(self):
         """湲닿툒 ?뺤? - 紐⑤뱺 ?ㅽ뵂 ?ъ???泥?궛"""
-        logger.warning("?슚 Emergency stop triggered")
+        logger.warning("Emergency stop triggered")
         
         if self.active_engine:
             self.active_engine.stop()
@@ -4984,10 +5030,10 @@ class MainController:
                     await asyncio.to_thread(self.exchange.cancel_all_orders, sym)
                     logger.info(f"??All orders cancelled for {sym}")
                 except: pass
-                await self.notify("?뱄툘 泥?궛???ㅽ뵂 ?ъ??섏씠 ?놁뒿?덈떎. (遊??뺤???")
+                await self.notify("ℹ️ 청산할 오픈 포지션이 없습니다. (미체결 주문만 취소)")
                 return
 
-            await self.notify(f"?슚 **湲닿툒 ?뺤? ?ㅽ뻾**\n諛쒓껄???ъ??? {len(open_positions)}媛?-> ?쇨큵 泥?궛 ?쒖옉")
+            await self.notify(f"🚨 **긴급 정지 실행**\n발견된 포지션 {len(open_positions)}개를 즉시 청산합니다.")
 
             # 2. 紐⑤뱺 ?ㅽ뵂 ?ъ????쒖감 泥?궛
             for pos in open_positions:
@@ -5014,17 +5060,17 @@ class MainController:
                         self.exchange.create_order, sym, 'market', side, qty, None, {'reduceOnly': True}
                     )
                     logger.info(f"??Emergency Close: {sym} {side} {qty}")
-                    await self.notify(f"?뵏 **{sym}** 泥?궛 ?꾨즺\nPnL: ${pnl:+.2f}")
+                    await self.notify(f"✅ **{sym}** 청산 완료\nPnL: ${pnl:+.2f}")
                     
                 except Exception as e:
                     logger.error(f"Failed to close {sym}: {e}")
-                    await self.notify(f"??{sym} 泥?궛 ?ㅽ뙣: {e}")
+                    await self.notify(f"❌ {sym} 청산 실패: {e}")
             
-            await self.notify("?뢾 湲닿툒 ?뺤? ?덉감 ?꾨즺")
+            await self.notify("🧯 긴급 정지 처리 완료")
                     
         except Exception as e:
             logger.error(f"Emergency stop error: {e}")
-            await self.notify(f"??湲닿툒 ?뺤? 以??ㅻ쪟: {e}")
+            await self.notify(f"❌ 긴급 정지 중 오류: {e}")
 
     async def notify(self, text):
         """?뚮┝ ?꾩넚"""
