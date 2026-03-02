@@ -14,8 +14,7 @@ jobs:
         with:
           host: ${{ secrets.AZURE_HOST }}
           username: ${{ secrets.AZURE_USERNAME }}
-          key: ${{ secrets.AZURE_SSH_PRIVATE_KEY_BASE64 }}
-          key_format: base64   # ← 이 줄이 중요!
+          key: ${{ secrets.AZURE_SSH_PRIVATE_KEY }}
           script: |
             set -e
             
@@ -32,4 +31,4 @@ jobs:
             nohup python3 emas.py > emas.log 2>&1 &
             
             echo "=== 배포 완료 ==="
-            ps aux | grep emas.py
+            ps aux | grep emas.py || echo "프로세스 없음"
