@@ -21,12 +21,6 @@ import pandas as pd
 import pandas_ta as ta
 import numpy as np
 from pykalman import KalmanFilter as PyKalmanFilter
-try:
-    from hurst import compute_Hc
-    HURST_AVAILABLE = True
-except ImportError:
-    HURST_AVAILABLE = False
-    logging.warning("?좑툘 hurst ?⑦궎吏 ?놁쓬. FractalFisher ?꾨왂 ?ъ슜 遺덇?. ?ㅼ튂: pip install hurst")
 from datetime import datetime, timezone, timedelta
 from collections import deque
 try:
@@ -135,9 +129,6 @@ class TradingConfig:
                     'r2_entry_enabled': True,
                     'r2_exit_enabled': True,
                     'r2_threshold': 0.25,
-                    'hurst_entry_enabled': True,
-                    'hurst_exit_enabled': True,
-                    'hurst_threshold': 0.55,
                     'chop_entry_enabled': True,
                     'chop_exit_enabled': True,
                     'chop_threshold': 50.0,
@@ -221,6 +212,12 @@ class TradingConfig:
             common_cfg['risk_per_trade_pct'] = 1.0
             changed = True
 
+        # Hurst filter was removed from core strategy path.
+        for removed_key in ('hurst_entry_enabled', 'hurst_exit_enabled', 'hurst_threshold'):
+            if removed_key in common_cfg:
+                common_cfg.pop(removed_key, None)
+                changed = True
+
         daily_limit_pct = float(common_cfg.get('daily_loss_limit_pct', 5.0) or 0.0)
         if daily_limit_pct <= 0:
             common_cfg['daily_loss_limit_pct'] = 5.0
@@ -274,8 +271,6 @@ class TradingConfig:
                     "scanner_max_rise_pct": 8.0,
                     "r2_entry_enabled": True,
                     "r2_exit_enabled": True,
-                    "hurst_entry_enabled": True,
-                    "hurst_exit_enabled": True,
                     "chop_entry_enabled": True,
                     "chop_exit_enabled": True
                 },
@@ -1124,13 +1119,16 @@ class SignalEngine(BaseEngine):
             
             if ts_p > self.last_processed_candle_ts[symbol]:
                 logger.info(f"?빉截?[Primary {primary_tf}] {symbol} New Candle: {ts_p} close={last_closed_p[4]}")
-                self.last_processed_candle_ts[symbol] = ts_p
                 
                 k_p = {
                     't': ts_p, 'o': str(last_closed_p[1]), 'h': str(last_closed_p[2]),
                     'l': str(last_closed_p[3]), 'c': str(last_closed_p[4]), 'v': str(last_closed_p[5])
                 }
                 await self.process_primary_candle(symbol, k_p)
+                if self.last_candle_success.get(symbol, False):
+                    self.last_processed_candle_ts[symbol] = ts_p
+                else:
+                    logger.warning(f"Primary candle processing failed, will retry: {symbol} {ts_p}")
                 
             # 3. Check Exit TF (Exit Logic)
             strategy_params = cfg.get('strategy_params', {})
@@ -1158,8 +1156,11 @@ class SignalEngine(BaseEngine):
                         else:
                             logger.info(f"?빉截?[Exit {exit_tf}] {symbol} New Candle: {ts_e} close={last_closed_e[4]}")
                             
-                        self.last_processed_exit_candle_ts[symbol] = ts_e
-                        await self.process_exit_candle(symbol, exit_tf, pos_side)
+                        exit_ok = await self.process_exit_candle(symbol, exit_tf, pos_side)
+                        if exit_ok:
+                            self.last_processed_exit_candle_ts[symbol] = ts_e
+                        else:
+                            logger.warning(f"Exit candle processing failed, will retry: {symbol} {ts_e}")
 
         except Exception as e:
             logger.error(f"Poll symbol {symbol} error: {e}")
@@ -1343,11 +1344,6 @@ class SignalEngine(BaseEngine):
                     'en_exit': comm_cfg.get('r2_exit_enabled', True),
                     'th': comm_cfg.get('r2_threshold', 0.25)
                 },
-                'hurst': {
-                    'en_entry': comm_cfg.get('hurst_entry_enabled', True), 
-                    'en_exit': comm_cfg.get('hurst_exit_enabled', True),
-                    'th': comm_cfg.get('hurst_threshold', 0.55)
-                },
                 'chop': {
                     'en_entry': comm_cfg.get('chop_entry_enabled', True), 
                     'en_exit': comm_cfg.get('chop_exit_enabled', True),
@@ -1375,73 +1371,6 @@ class SignalEngine(BaseEngine):
             await self.check_mmr_alert(mmr)
             
             return pos_side
-            
-            if self.ctrl.is_paused or not pos:
-                return
-            
-            cfg = comm_cfg # Alias for below use
-            
-            # ===== MicroVBO: 嫄곕옒??二쇰Ц TP/SL ?ъ슜 =====
-            # 嫄곕옒?뚯뿉??吏곸젒 TP/SL 泥닿껐??(?ㅽ뵂?ㅻ뜑???쒖떆??
-            if active_strategy == 'MICROVBO':
-                if vbo_state.get('entry_price') and vbo_state.get('entry_atr') and pos:
-                    pnl = float(pos['percentage'])
-                    logger.debug(f"[MicroVBO] Position PnL: {pnl:+.2f}% - TP/SL via exchange orders")
-                return  # MicroVBO??嫄곕옒??二쇰Ц TP/SL ?ъ슜
-            
-            # ===== FractalFisher ?꾩슜 ATR Trailing Stop =====
-            if active_strategy == 'FRACTALFISHER':
-                entry_price = fisher_state.get('entry_price')
-                entry_atr = fisher_state.get('entry_atr')
-                trailing_stop = fisher_state.get('trailing_stop')
-                
-                if entry_price and entry_atr:
-                    ff_cfg = strategy_params.get('FractalFisher', {})
-                    trailing_mult = ff_cfg.get('atr_trailing_multiplier', 2.0)
-                    
-                    if pos['side'] == 'long':
-                        # Trailing Stop 怨꾩궛 (??긽 ?щ━湲곕쭔)
-                        new_stop = price - (entry_atr * trailing_mult)
-                        if trailing_stop is None:
-                            trailing_stop = new_stop
-                        else:
-                            trailing_stop = max(trailing_stop, new_stop)
-                        
-                        # ?곹깭 ?낅뜲?댄듃
-                        if symbol not in self.fisher_states: self.fisher_states[symbol] = {}
-                        self.fisher_states[symbol]['trailing_stop'] = trailing_stop
-                        
-                        if price <= trailing_stop:
-                            logger.info(f"?썞 [FractalFisher] Trailing Stop Hit: {price:.2f} <= {trailing_stop:.2f}")
-                            await self.exit_position(symbol, "Fisher_TrailingStop")
-                            self.fisher_states[symbol] = {} # state reset
-                    
-                    elif pos['side'] == 'short':
-                        # Trailing Stop 怨꾩궛 (??긽 ?대━湲곕쭔)
-                        new_stop = price + (entry_atr * trailing_mult)
-                        if trailing_stop is None:
-                            trailing_stop = new_stop
-                        else:
-                            trailing_stop = min(trailing_stop, new_stop)
-                        
-                        # ?곹깭 ?낅뜲?댄듃
-                        if symbol not in self.fisher_states: self.fisher_states[symbol] = {}
-                        self.fisher_states[symbol]['trailing_stop'] = trailing_stop
-                        
-                        if price >= trailing_stop:
-                            logger.info(f"?썞 [FractalFisher] Trailing Stop Hit: {price:.2f} >= {trailing_stop:.2f}")
-                            await self.exit_position(symbol, "Fisher_TrailingStop")
-                            self.fisher_states[symbol] = {} # state reset
-                    
-                return  # FractalFisher??Trailing Stop留??ъ슜
-            
-            # ===== SMA/HMA/MicroVBO: 嫄곕옒??二쇰Ц TP/SL ?ъ슜 =====
-            # 嫄곕옒?뚯뿉??吏곸젒 TP/SL 泥닿껐??(?ㅽ뵂?ㅻ뜑???쒖떆??
-            # ?뚰봽?몄썾??紐⑤땲?곕쭅 遺덊븘??
-            # (諛깆뾽??濡쒓렇留??④?)
-            if pos:
-                pnl = float(pos['percentage'])
-                logger.debug(f"Position PnL monitoring: {pnl:+.2f}% - TP/SL via exchange orders")
                 
         except Exception as e:
             logger.error(f"Signal check_status error: {e}")
@@ -1592,7 +1521,7 @@ class SignalEngine(BaseEngine):
 
     async def process_exit_candle(self, symbol, tf, current_side):
         """[New] Process secondary timeframe candle for EXIT signals
-           Applies EXIT filters (Kalman, R2, Hurst, Chop) independently.
+           Applies EXIT filters (Kalman, R2, Chop) independently.
         """
         try:
             # Fetch history for Exit TF
@@ -1662,10 +1591,7 @@ class SignalEngine(BaseEngine):
             # ?좏샇媛 ?녿뜑?쇰룄 ?꾪꽣 媛믪? 怨꾩궛?댁꽌 ??쒕낫?쒖뿉 ?낅뜲?댄듃 (??Pending 諛⑹?)
             await self._update_exit_filter_values(symbol, df, current_side)
             if not raw_exit_long and not raw_exit_short:
-                return
-
-            # ?좏샇媛 ?덉쓣 ?뚮룄 ?낅뜲?댄듃 諛?泥?궛 濡쒖쭅 吏꾪뻾
-            await self._update_exit_filter_values(symbol, df, current_side)
+                return True
             
             # ===== 3. Exit Filter logic check =====
             can_exit = True
@@ -1675,7 +1601,6 @@ class SignalEngine(BaseEngine):
             st = self.last_exit_filter_status.get(symbol, {})
             kalman_vel = st.get('kalman_vel', 0.0)
             curr_r2 = st.get('r2_val', 0.0)
-            curr_hurst = st.get('hurst_val', 0.0)
             curr_chop = st.get('chop_val', 50.0)
             
             kalman_cfg = strategy_params.get('kalman_filter', {})
@@ -1684,8 +1609,6 @@ class SignalEngine(BaseEngine):
             common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
             r2_exit_enabled = common_cfg.get('r2_exit_enabled', True)
             r2_thresh = common_cfg.get('r2_threshold', 0.25)
-            hurst_exit_enabled = common_cfg.get('hurst_exit_enabled', True)
-            hurst_thresh = common_cfg.get('hurst_threshold', 0.55)
             chop_exit_enabled = common_cfg.get('chop_exit_enabled', True)
             chop_thresh = common_cfg.get('chop_threshold', 50.0)
 
@@ -1707,19 +1630,13 @@ class SignalEngine(BaseEngine):
                 if curr_r2 < r2_thresh:
                     can_exit = False
                     block_reasons.append(f"R2({curr_r2:.2f})<{r2_thresh}")
-            
-            # 3. Hurst Check
-            if hurst_exit_enabled:
-                if curr_hurst < hurst_thresh:
-                    can_exit = False
-                    block_reasons.append(f"Hurst({curr_hurst:.2f})<{hurst_thresh}")
 
-            # 4. CHOP Check
+            # 3. CHOP Check
             can_exit_by_chop = not chop_exit_enabled or (curr_chop <= chop_thresh)
             if chop_exit_enabled and not can_exit_by_chop:
                 block_reasons.append(f"Chop({curr_chop:.1f})>{chop_thresh}")
             
-            # 5. CC Check (Correlation)
+            # 4. CC Check (Correlation)
             cc_exit_enabled = common_cfg.get('cc_exit_enabled', False)
             cc_thresh = common_cfg.get('cc_threshold', 0.70)
             curr_cc = st.get('cc_val', 0.0)
@@ -1735,7 +1652,6 @@ class SignalEngine(BaseEngine):
                               (current_side.lower() == 'long' and kalman_vel < 0) or \
                               (current_side.lower() == 'short' and kalman_vel > 0)
             st['r2_pass'] = (not r2_exit_enabled) or (curr_r2 >= r2_thresh)
-            st['hurst_pass'] = (not hurst_exit_enabled) or (curr_hurst >= hurst_thresh)
             st['chop_pass'] = (not chop_exit_enabled) or (curr_chop <= chop_thresh)
             
             
@@ -1771,11 +1687,13 @@ class SignalEngine(BaseEngine):
                         logger.info(f"?썳截?[Exit {tf}] SHORT Exit Blocked: {why} (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
                 else:
                     logger.debug(f"??[Exit {tf}] SHORT Exit Ignored: Still Bearish Alignment (Fast {c_f:.2f} < Slow {c_s:.2f})")
+            return True
                 
         except Exception as e:
             logger.error(f"Process exit candle error: {e}")
             import traceback
             traceback.print_exc()
+            return False
 
     async def _calculate_strategy_signal(self, symbol, df, strategy_params, active_strategy):
         """
@@ -1839,30 +1757,8 @@ class SignalEngine(BaseEngine):
             # Entry Check
             if r2_entry_enabled and curr_r2 < r2_thresh:
                 is_r2_pass = False
-        
-        # 2. Hurst Exponent (Trend vs Mean Reversion)
-        hurst_entry_enabled = common_cfg.get('hurst_entry_enabled', True)
-        hurst_thresh = common_cfg.get('hurst_threshold', 0.55)
-        curr_hurst = 0.5
-        is_hurst_pass = True
-        
-        if len(df) >= 100:
-            try:
-                from hurst import compute_Hc
-                # Calculate Hurst on last 100 candles (close price)
-                # simplified=True is faster
-                H, _, _ = compute_Hc(df['close'].values[-100:], kind='price', simplified=True)
-                curr_hurst = H
-                
-                if hurst_entry_enabled and curr_hurst < hurst_thresh:
-                    # Hurst < 0.5 (Mean Reverting), < Thresh -> Trend Weak
-                    is_hurst_pass = False
-            except ImportError:
-                 logger.warning("Package 'hurst' not installed. Hurst filter skipped.")
-            except Exception as e:
-                 logger.warning(f"Hurst calculation error: {e}")
-                 
-        # 3. Choppiness Index (Trend vs Chop)
+
+        # 2. Choppiness Index (Trend vs Chop)
         chop_entry_enabled = common_cfg.get('chop_entry_enabled', True)
         chop_thresh = common_cfg.get('chop_threshold', 50.0)
         curr_chop = 50.0
@@ -1885,20 +1781,17 @@ class SignalEngine(BaseEngine):
         # Update Status Data (Real-time monitoring)
         self.last_entry_filter_status[symbol] = {
             'r2_val': curr_r2,
-            'hurst_val': curr_hurst,
             'chop_val': curr_chop,
             'r2_pass': is_r2_pass,
-            'hurst_pass': is_hurst_pass,
             'chop_pass': is_chop_pass
         }
         
         # Visual Logging
         r2_icon = "OK" if is_r2_pass else "NO"
-        hurst_icon = "OK" if is_hurst_pass else "NO"
         chop_icon = "OK" if is_chop_pass else "NO"
         
         if active_strategy in ['sma', 'hma']:
-             logger.info(f"?썳截?Filters (Entry): R2({curr_r2:.2f}{r2_icon}) Hurst({curr_hurst:.2f}{hurst_icon}) CHOP({curr_chop:.1f}{chop_icon})")
+             logger.info(f"?썳截?Filters (Entry): R2({curr_r2:.2f}{r2_icon}) CHOP({curr_chop:.1f}{chop_icon})")
              # Log Kalman too if used
              
         # ... MicroVBO / FractalFisher skipped (no changes needed) ...
@@ -2071,8 +1964,6 @@ class SignalEngine(BaseEngine):
             blocked_reasons = []
             if not is_r2_pass:
                 blocked_reasons.append(f"R2({curr_r2:.2f})<{r2_thresh}")
-            if not is_hurst_pass:
-                blocked_reasons.append(f"Hurst({curr_hurst:.2f})<{hurst_thresh}")
             if not is_chop_pass:
                 blocked_reasons.append(f"CHOP({curr_chop:.1f})>{chop_thresh}")
             
@@ -2106,17 +1997,7 @@ class SignalEngine(BaseEngine):
                 curr_r2 = (df['close'].rolling(14).corr(df['idx_seq']).iloc[-2]) ** 2
                 if np.isnan(curr_r2): curr_r2 = 0.0
             
-            # C. Hurst Filter
-            hurst_exit_enabled = common_cfg.get('hurst_exit_enabled', True)
-            hurst_thresh = common_cfg.get('hurst_threshold', 0.55)
-            curr_hurst = 0.5
-            if len(df) >= 100 and hurst_exit_enabled:
-                try:
-                    from hurst import compute_Hc
-                    curr_hurst, _, _ = compute_Hc(df['close'].values[-100:], kind='price', simplified=True)
-                except: pass
-            
-            # D. Chop Filter
+            # C. Chop Filter
             chop_exit_enabled = common_cfg.get('chop_exit_enabled', True)
             chop_thresh = common_cfg.get('chop_threshold', 50.0)
             curr_chop = 50.0
@@ -2131,7 +2012,7 @@ class SignalEngine(BaseEngine):
                 except Exception as e:
                     logger.error(f"??Chop calculation error (Exit): {e}")
             
-            # E. CC Filter (Correlation Coefficient)
+            # D. CC Filter (Correlation Coefficient)
             cc_exit_enabled = common_cfg.get('cc_exit_enabled', False)
             cc_thresh = common_cfg.get('cc_threshold', 0.70)
             cc_len = common_cfg.get('cc_length', 14)
@@ -2151,11 +2032,9 @@ class SignalEngine(BaseEngine):
             # Update Status Data for Dashboard
             self.last_exit_filter_status[symbol] = {
                 'r2_val': curr_r2,
-                'hurst_val': curr_hurst,
                 'chop_val': curr_chop,
                 'kalman_vel': kalman_vel,
                 'r2_pass': (not r2_exit_enabled) or (curr_r2 >= r2_thresh),
-                'hurst_pass': (not hurst_exit_enabled) or (curr_hurst >= hurst_thresh),
                 'chop_pass': (not chop_exit_enabled) or (curr_chop <= chop_thresh),
                 'cc_val': curr_cc,
                 'cc_pass': (not cc_exit_enabled) or \
@@ -3716,11 +3595,7 @@ class MainController:
         r2_entry = "ON" if sig_common.get('r2_entry_enabled', True) else "OFF"
         r2_exit = "ON" if sig_common.get('r2_exit_enabled', True) else "OFF"
         r2_threshold = sig_common.get('r2_threshold', 0.25)
-        
-        hurst_entry = "ON" if sig_common.get('hurst_entry_enabled', True) else "OFF"
-        hurst_exit = "ON" if sig_common.get('hurst_exit_enabled', True) else "OFF"
-        hurst_threshold = sig_common.get('hurst_threshold', 0.55)
-        
+
         chop_entry = "ON" if sig_common.get('chop_entry_enabled', True) else "OFF"
         chop_exit = "ON" if sig_common.get('chop_exit_enabled', True) else "OFF"
         chop_threshold = sig_common.get('chop_threshold', 50.0)
@@ -3764,12 +3639,10 @@ class MainController:
 
 **필터 (Entry / Exit)**
 26. R2 (`{r2_entry}` / `{r2_exit}`) 기준 `{r2_threshold}`
-28. Hurst (`{hurst_entry}` / `{hurst_exit}`) 기준 `{hurst_threshold}`
 30. CHOP (`{chop_entry}` / `{chop_exit}`) 기준 `{chop_threshold}`
 32. Kalman (`{kalman_entry}` / `{kalman_exit}`)
 33. CC Exit (`{cc_exit}`) 기준 `{cc_threshold}`
 27. R2 민감도
-29. Hurst 민감도
 31. CHOP 민감도
 34. CC 민감도
 
@@ -3822,8 +3695,6 @@ class MainController:
             '25': "📝 **채굴 청산 타임프레임** 입력 (예: 1h)\n1m, 5m, 15m, 30m, 1h, 4h",
             '26': "📝 **R2 필터** 메뉴로 이동합니다.",
             '27': "📝 **R2 기준값** 입력 (0.1 ~ 0.5 권장)",
-            '28': "📝 **Hurst 필터** 메뉴로 이동합니다.",
-            '29': "📝 **Hurst 기준값** 입력 (예: 0.55)",
             '30': "📝 **CHOP 필터** 메뉴로 이동합니다.",
             '31': "📝 **CHOP 기준값** 입력 (예: 50.0)",
             '33': "📝 **CC Exit 필터**를 ON/OFF 합니다.",
@@ -3884,14 +3755,9 @@ class MainController:
             )
             return "R2_SELECT"
 
-        elif text == '28':
-            # Hurst Filter Menu
-            keyboard = [[KeyboardButton("1. Entry Toggle"), KeyboardButton("2. Exit Toggle")]]
-            await update.message.reply_text(
-                "🌊 **Hurst 필터 설정**\n1. Entry 토글\n2. Exit 토글",
-                reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-            )
-            return "HURST_SELECT"
+        elif text in ('28', '29'):
+            await update.message.reply_text("ℹ️ Hurst 필터는 코드에서 제거되었습니다.")
+            return SELECT
 
         elif text == '30':
             # Chop Filter Menu
@@ -3930,8 +3796,6 @@ class MainController:
         elif text == '27':
             # R2 Threshold Input
             await update.message.reply_text(prompts['27'])
-            return INPUT
-        elif text == '29':
             return INPUT
         elif text == '31':
             return INPUT
@@ -4309,15 +4173,6 @@ class MainController:
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'r2_threshold'], v)
                 await update.message.reply_text(f"✅ R2 기준값 변경: {v}")
 
-            elif choice == '29':
-                # Hurst Threshold
-                v = float(val)
-                if v < 0.0 or v > 1.0:
-                    await update.message.reply_text("❌ 0.0 ~ 1.0 사이 값을 입력하세요.")
-                    return SELECT
-                await self.cfg.update_value(['signal_engine', 'common_settings', 'hurst_threshold'], v)
-                await update.message.reply_text(f"✅ Hurst 기준값 변경: {v}")
-
             elif choice == '31':
                 # CHOP Threshold
                 v = float(val)
@@ -4384,7 +4239,7 @@ class MainController:
                 await update.message.reply_text(f"✅ 청산 타임프레임 변경: {val}")
             
             # 10~41 success message handled
-            if choice not in ['10', '11', '12', '14', '15', '16', '17', '18', '20', '21', '22', '23', '26', '27', '28', '29', '30', '31', '33', '34', '35', '41']:
+            if choice not in ['10', '11', '12', '14', '15', '16', '17', '18', '20', '21', '22', '23', '26', '27', '28', '30', '31', '33', '34', '35', '41']:
                 await update.message.reply_text(f"✅ 설정 완료: {val}")
             await self._restore_main_keyboard(update)
             await self.show_setup_menu(update)
@@ -4645,7 +4500,6 @@ class MainController:
                 DIRECTION_SELECT: [MessageHandler(text_filter, self.setup_direction_select)],
                 ENGINE_SELECT: [MessageHandler(text_filter, self.setup_engine_select)],
                 "R2_SELECT": [MessageHandler(text_filter, self.setup_r2_select)],
-                "HURST_SELECT": [MessageHandler(text_filter, self.setup_hurst_select)],
                 "CHOP_SELECT": [MessageHandler(text_filter, self.setup_chop_select)],
                 "KALMAN_SELECT": [MessageHandler(text_filter, self.setup_kalman_select)]
             },
@@ -4676,21 +4530,6 @@ class MainController:
             curr = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('r2_exit_enabled', True)
             await self.cfg.update_value(['signal_engine', 'common_settings', 'r2_exit_enabled'], not curr)
             await update.message.reply_text(f"✅ R2 Exit: {'ON' if not curr else 'OFF'}")
-        
-        await self._restore_main_keyboard(update)
-        await self.show_setup_menu(update)
-        return SELECT
-
-    async def setup_hurst_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text
-        if "1" in text:
-            curr = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('hurst_entry_enabled', True)
-            await self.cfg.update_value(['signal_engine', 'common_settings', 'hurst_entry_enabled'], not curr)
-            await update.message.reply_text(f"✅ Hurst Entry: {'ON' if not curr else 'OFF'}")
-        elif "2" in text:
-            curr = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('hurst_exit_enabled', True)
-            await self.cfg.update_value(['signal_engine', 'common_settings', 'hurst_exit_enabled'], not curr)
-            await update.message.reply_text(f"✅ Hurst Exit: {'ON' if not curr else 'OFF'}")
         
         await self._restore_main_keyboard(update)
         await self.show_setup_menu(update)
@@ -4965,17 +4804,15 @@ class MainController:
                         return "PASS" if st_dict.get(pass_key, False) else "FAIL"
 
                     e_r2 = get_st_text(entry_st, 'r2', 'r2_val', 'r2_pass', True)
-                    e_h = get_st_text(entry_st, 'hurst', 'hurst_val', 'hurst_pass', True)
                     e_c = get_st_text(entry_st, 'chop', 'chop_val', 'chop_pass', True)
 
                     x_r2 = get_st_text(exit_st, 'r2', 'r2_val', 'r2_pass', False)
-                    x_h = get_st_text(exit_st, 'hurst', 'hurst_val', 'hurst_pass', False)
                     x_c = get_st_text(exit_st, 'chop', 'chop_val', 'chop_pass', False)
                     x_cc = get_st_text(exit_st, 'cc', 'cc_val', 'cc_pass', False)
                     cc_val = exit_st.get('cc_val', 0.0)
 
-                    msg += f"🧪 필터(진입): R2 {e_r2} | Hurst {e_h} | CHOP {e_c}\n"
-                    msg += f"🧪 필터(청산): R2 {x_r2} | Hurst {x_h} | CHOP {x_c} | CC {x_cc}({cc_val:.2f})\n"
+                    msg += f"🧪 필터(진입): R2 {e_r2} | CHOP {e_c}\n"
+                    msg += f"🧪 필터(청산): R2 {x_r2} | CHOP {x_c} | CC {x_cc}({cc_val:.2f})\n"
 
                     active_strat = d.get('active_strategy', '')
                     if active_strat == 'MICROVBO':
