@@ -3976,40 +3976,40 @@ class MainController:
                 await self.cfg.update_value(['dual_thrust_engine', 'stop_loss_pct'], float(val))
                 await self.cfg.update_value(['dual_mode_engine', 'stop_loss_pct'], float(val))
             elif choice == '4':
-                # ??꾪봽?덉엫 ?좏슚??寃??
+                # 타임프레임 유효성 검사
                 valid_tf = ['1m', '2m', '3m', '4m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
                 if val not in valid_tf:
-                    await update.message.reply_text(f"???좏슚?섏? ?딆? ??꾪봽?덉엫.\n?ъ슜 媛?? {', '.join(valid_tf)}")
+                    await update.message.reply_text(f"❌ 유효하지 않은 타임프레임입니다.\n사용 가능: {', '.join(valid_tf)}")
                     return SELECT
-                # ??꾪봽?덉엫 ?낅뜲?댄듃 (Common, Signal, Shannon 紐⑤몢 ?곸슜)
+                # 타임프레임 업데이트 (Common, Signal, Shannon 동기화)
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'timeframe'], val)
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'entry_timeframe'], val) # Sync Entry TF
                 await self.cfg.update_value(['shannon_engine', 'timeframe'], val)
                 
-                # DualMode ??꾪봽?덉엫 蹂寃?(?꾩옱 紐⑤뱶??留욎떠??
+                # DualMode 타임프레임도 모드에 따라 동기화
                 dm_mode = self.cfg.get('dual_mode_engine', {}).get('mode', 'standard')
                 if dm_mode == 'scalping':
                     await self.cfg.update_value(['dual_mode_engine', 'scalping_tf'], val)
                 else:
                     await self.cfg.update_value(['dual_mode_engine', 'standard_tf'], val)
 
-                # Shannon ?붿쭊??200 EMA 罹먯떆 珥덇린??(????꾪봽?덉엫 利됱떆 ?곸슜)
+                # Shannon 엔진 200 EMA 캐시 초기화 (변경 TF 즉시 반영)
                 if self.active_engine and hasattr(self.active_engine, 'ema_200'):
                     self.active_engine.ema_200 = None
                     self.active_engine.trend_direction = None
                     self.active_engine.last_indicator_update = 0
-                # Signal ?붿쭊 罹먯떆??珥덇린??
+                # Signal 엔진 캐시 초기화
                 signal_engine = self.engines.get('signal')
                 if signal_engine:
                     signal_engine.last_processed_candle_ts = {}
                     signal_engine.last_candle_time = {}
-                await update.message.reply_text(f"??吏꾩엯 ??꾪봽?덉엫 蹂寃? {val}")
-                # DualMode ?붿쭊 罹먯떆 珥덇린??
+                await update.message.reply_text(f"✅ 진입 타임프레임 변경: {val}")
+
+                # DualMode 엔진 캐시 초기화
                 dm_engine = self.engines.get('dualmode')
                 if dm_engine:
                     dm_engine.last_candle_ts = 0
-                
-                await update.message.reply_text(f"????꾪봽?덉엫 蹂寃? {val} (DualMode: {dm_mode} TF ?곸슜)")
+
             elif choice == '5':
                 await self.cfg.update_value(['shannon_engine', 'daily_loss_limit'], float(val))
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'daily_loss_limit'], float(val))
@@ -4332,17 +4332,17 @@ class MainController:
                     dm_engine._init_strategy()
             
             elif choice == '41':
-                # 泥?궛 ??꾪봽?덉엫 蹂寃?
+                # 청산 타임프레임 변경
                 valid_tf = ['1m', '2m', '3m', '4m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
                 if val not in valid_tf:
-                    await update.message.reply_text(f"???좏슚?섏? ?딆? ??꾪봽?덉엫.\n?ъ슜 媛?? {', '.join(valid_tf)}")
+                    await update.message.reply_text(f"❌ 유효하지 않은 타임프레임입니다.\n사용 가능: {', '.join(valid_tf)}")
                     return SELECT
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'exit_timeframe'], val)
-                # Signal ?붿쭊 罹먯떆 珥덇린??
+                # Signal 엔진 캐시 초기화
                 signal_engine = self.engines.get('signal')
                 if signal_engine:
                     signal_engine.last_processed_exit_candle_ts = {}
-                await update.message.reply_text(f"??泥?궛 ??꾪봽?덉엫 蹂寃? {val}")
+                await update.message.reply_text(f"✅ 청산 타임프레임 변경: {val}")
             
             # 10~41 success message handled
             if choice not in ['10', '11', '12', '14', '15', '16', '17', '18', '20', '21', '22', '23', '26', '27', '28', '29', '30', '31', '33', '34', '35', '41']:
@@ -4869,55 +4869,47 @@ class MainController:
 
 
     def _format_dashboard_message(self, all_data, blink, pause_indicator):
-        """??쒕낫??硫붿떆吏 ?앹꽦 (Enhanced with Margin/Lev/TF info)"""
+        """텔레그램 대시보드 메시지 생성."""
         try:
             eng = self.cfg.get('system_settings', {}).get('active_engine', 'unknown').upper()
-            msg = f"{blink} **[{eng}] Dashboard**{pause_indicator} [{datetime.now().strftime('%H:%M:%S')}]\n\n"
-            
-            # 1. 怨듯넻 ?뺣낫 (泥?踰덉㎏ ?곗씠?곗뿉??異붿텧)
+            msg = f"{blink} **[{eng}] 대시보드**{pause_indicator} [{datetime.now().strftime('%H:%M:%S')}]\n\n"
+
             first_symbol = list(all_data.keys())[0]
             d_first = all_data[first_symbol]
-            
-            msg += f"?뮥 **Asset Summary**\n"
-            msg += f"Eq: `${d_first.get('total_equity', 0):.2f}` | Free: `${d_first.get('free_usdt', 0):.2f}`\n"
-            msg += f"MMR: `{d_first.get('mmr', 0):.2f}%` | PnL: `${d_first.get('daily_pnl', 0):+.2f}`\n"
-            msg += "?곣봺?곣봺?곣봺?곣봺?곣봺?곣봺?곣봺?곣봺?곣봺\n"
 
-            # 2. 媛??щ낵蹂??뺣낫
+            msg += "💰 **자산 요약**\n"
+            msg += f"총자산: `${d_first.get('total_equity', 0):.2f}` | 가용자산: `${d_first.get('free_usdt', 0):.2f}`\n"
+            msg += f"MMR: `{d_first.get('mmr', 0):.2f}%` | 일일 PnL: `${d_first.get('daily_pnl', 0):+.2f}`\n"
+            msg += "━━━━━━━━━━\n"
+
             for symbol, d in all_data.items():
                 cur_price = d.get('price', 0)
                 pos_side = d.get('pos_side', 'NONE')
-                
-                # ?щ낵 ?ㅻ뜑
-                # [New] Add Margin Mode & Leverage Info to Header
                 lev = d.get('leverage', '?')
-                mm = d.get('margin_mode', 'ISO') # Forced ISO
+                mm = d.get('margin_mode', 'ISO')
                 mode_str = f"({mm} {lev}x)" if 'leverage' in d else ""
-                
-                p_emoji = "L" if pos_side == 'LONG' else "S" if pos_side == 'SHORT' else "-"
-                msg += f"{p_emoji} **{symbol}** {mode_str} | {pos_side}\n"
-                
-                if pos_side != 'NONE':
-                    pnl = d.get('pnl_pct', 0)
-                    pnl_emoji = "?뱢" if pnl >= 0 else "?뱣"
-                    msg += f"??PnL: `{d.get('pnl_usdt', 0):+.2f}` (`{pnl:+.2f}%`)\n"
-                    # [New] Entry Price
-                    msg += f"??Entry: `{d.get('entry_price', 0):.2f}` | Cur: `{cur_price:.2f}`\n"
-                else:
-                    msg += f"??Cur: `{cur_price:.2f}`\n"
 
-                # ?붿쭊/?꾨왂蹂??곸꽭 ?꾪꽣
+                pos_icon = "🟢" if pos_side == 'LONG' else "🔴" if pos_side == 'SHORT' else "⚪"
+                msg += f"{pos_icon} **{symbol}** {mode_str} | `{pos_side}`\n"
+
+                if pos_side != 'NONE':
+                    pnl_pct = d.get('pnl_pct', 0)
+                    pnl_icon = "📈" if pnl_pct >= 0 else "📉"
+                    msg += f"{pnl_icon} PnL: `{d.get('pnl_usdt', 0):+.2f}` (`{pnl_pct:+.2f}%`)\n"
+                    msg += f"진입가: `{d.get('entry_price', 0):.2f}` | 현재가: `{cur_price:.2f}`\n"
+                else:
+                    msg += f"현재가: `{cur_price:.2f}`\n"
+
                 d_eng = d.get('engine', '').upper()
                 if d_eng == 'SIGNAL':
-                    # [New] Timeframes Information
                     e_tf = d.get('entry_tf', '?')
                     x_tf = d.get('exit_tf', '?')
-                    msg += f"??TF: In[{e_tf}] / Out[{x_tf}]\n"
-                    
+                    msg += f"⏱ TF: 진입 `{e_tf}` / 청산 `{x_tf}`\n"
+
                     f_cfg = d.get('filter_config', {})
                     entry_st = d.get('entry_filters', {})
                     exit_st = d.get('exit_filters', {})
-                    
+
                     def get_st_text(st_dict, cfg_key, val_key, pass_key, is_entry=True):
                         en_key = 'en_entry' if is_entry else 'en_exit'
                         if not f_cfg.get(cfg_key, {}).get(en_key, False):
@@ -4927,49 +4919,46 @@ class MainController:
                             return "~"
                         return "PASS" if st_dict.get(pass_key, False) else "FAIL"
 
-                    # ?꾪꽣 ?곹깭 (Entry / Exit 遺꾨━?쒖떆)
-                    # Entry
                     e_r2 = get_st_text(entry_st, 'r2', 'r2_val', 'r2_pass', True)
                     e_h = get_st_text(entry_st, 'hurst', 'hurst_val', 'hurst_pass', True)
                     e_c = get_st_text(entry_st, 'chop', 'chop_val', 'chop_pass', True)
-                    
-                    # Exit
+
                     x_r2 = get_st_text(exit_st, 'r2', 'r2_val', 'r2_pass', False)
                     x_h = get_st_text(exit_st, 'hurst', 'hurst_val', 'hurst_pass', False)
                     x_c = get_st_text(exit_st, 'chop', 'chop_val', 'chop_pass', False)
                     x_cc = get_st_text(exit_st, 'cc', 'cc_val', 'cc_pass', False)
                     cc_val = exit_st.get('cc_val', 0.0)
-                    
-                    msg += f"??Filter(In): R2{e_r2} Hurst{e_h} Chop{e_c}\n"
-                    msg += f"??Filter(Out): R2{x_r2} Hurst{x_h} Chop{x_c} CC{x_cc}({cc_val:.2f})\n"
-                    
-                    # ?꾨왂 ?꾩슜 ?뺣낫
+
+                    msg += f"🧪 필터(진입): R2 {e_r2} | Hurst {e_h} | CHOP {e_c}\n"
+                    msg += f"🧪 필터(청산): R2 {x_r2} | Hurst {x_h} | CHOP {x_c} | CC {x_cc}({cc_val:.2f})\n"
+
                     active_strat = d.get('active_strategy', '')
                     if active_strat == 'MICROVBO':
                         vbo = d.get('vbo_breakout_level', {})
                         if vbo:
-                            msg += f"??VBO: `L:{vbo.get('long',0):.1f}/S:{vbo.get('short',0):.1f}`\n"
+                            msg += f"VBO: `L:{vbo.get('long', 0):.1f} / S:{vbo.get('short', 0):.1f}`\n"
                     elif active_strat == 'FRACTALFISHER':
-                        msg += f"??FF: `H:{d.get('fisher_hurst',0):.2f}/F:{d.get('fisher_value',0):.2f}`\n"
+                        msg += f"FF: `H:{d.get('fisher_hurst', 0):.2f} / F:{d.get('fisher_value', 0):.2f}`\n"
                         if d.get('fisher_trailing_stop') and pos_side != 'NONE':
-                            msg += f"??TS: `{d.get('fisher_trailing_stop', 0):.2f}`\n"
+                            msg += f"TS: `{d.get('fisher_trailing_stop', 0):.2f}`\n"
 
                 elif d_eng == 'SHANNON':
-                    msg += f"??Trend: `{d.get('trend', 'N/A')}` | EMA: `{d.get('ema_200', 0):.1f}`\n"
-                    msg += f"??Grid: `{d.get('grid_orders', 0)}` | Diff: `{d.get('diff_pct', 0):.1f}%`\n"
+                    msg += f"추세: `{d.get('trend', 'N/A')}` | EMA200: `{d.get('ema_200', 0):.1f}`\n"
+                    msg += f"그리드: `{d.get('grid_orders', 0)}` | Diff: `{d.get('diff_pct', 0):.1f}%`\n"
 
                 elif d_eng == 'DUALTHRUST':
-                    msg += f"??Triggers: `L:{d.get('long_trigger',0):.1f}/S:{d.get('short_trigger',0):.1f}`\n"
+                    msg += f"트리거: `L:{d.get('long_trigger', 0):.1f} / S:{d.get('short_trigger', 0):.1f}`\n"
 
                 elif d_eng == 'DUALMODE':
-                    msg += f"??Mode: `{d.get('dm_mode', 'N/A')}` | TF: `{d.get('dm_tf')}`\n"
+                    mode_name = d.get('dm_mode', 'N/A')
+                    msg += f"듀얼모드: `{mode_name}` | TF: `{d.get('dm_tf')}`\n"
 
-                msg += "\n" # 肄붿씤 媛?媛꾧꺽
-            
+                msg += "\n"
+
             return msg
         except Exception as e:
             logger.error(f"Dashboard format error: {e}")
-            return "????쒕낫???щ㎎ ?ㅻ쪟"
+            return "❌ 대시보드 메시지 생성 오류"
 
     async def emergency_stop(self):
         """湲닿툒 ?뺤? - 紐⑤뱺 ?ㅽ뵂 ?ъ???泥?궛"""
