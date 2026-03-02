@@ -33,18 +33,21 @@ jobs:
             ./venv/bin/python -m pip install -r requirements.txt
 
             echo "=== 기존 봇 종료 중 ==="
-            pkill -f "python.*emas.py" || true
-            sleep 2
+            BOT_PIDS=$(pgrep -f "[p]ython.*[e]mas.py" || true)
+            if [ -n "$BOT_PIDS" ]; then
+              echo "$BOT_PIDS" | xargs -r kill
+              sleep 2
+            fi
 
             echo "=== 봇 재시작 ==="
             nohup ./venv/bin/python emas.py > emas.log 2>&1 < /dev/null &
             sleep 3
 
             echo "=== 프로세스 확인 ==="
-            pgrep -af "python.*emas.py" || (echo "프로세스 시작 실패"; tail -n 50 emas.log; exit 1)
+            pgrep -af "[p]ython.*[e]mas.py" || (echo "프로세스 시작 실패"; tail -n 50 emas.log; exit 1)
 
             echo "=== 배포 완료 ==="
             echo "실행 중인 emas.py 프로세스:"
-            pgrep -af "python.*emas.py" || echo "프로세스 없음"
+            pgrep -af "[p]ython.*[e]mas.py" || echo "프로세스 없음"
             echo "로그 마지막 10줄:"
             tail -n 10 emas.log || echo "로그 파일 없음"
