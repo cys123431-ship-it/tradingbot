@@ -15,10 +15,8 @@ jobs:
           host: ${{ secrets.AZURE_HOST }}
           username: ${{ secrets.AZURE_USERNAME }}
           key: ${{ secrets.AZURE_SSH_PRIVATE_KEY }}
-          script_stop: false   # ← 이 줄 추가 (중요!)
+          script_stop: false
           script: |
-            set -e
-            
             echo "=== 배포 시작 ==="
             cd /home/azureuser/tradingbot
             
@@ -27,15 +25,14 @@ jobs:
             
             echo "=== 기존 봇 종료 중 ==="
             pkill -f emas.py || true
-            
-            echo "=== 잠시 대기 (종료 완료 대기) ==="
-            sleep 3
+            sleep 4   # 종료 대기 시간 증가
             
             echo "=== 봇 재시작 ==="
             nohup python3 emas.py > emas.log 2>&1 &
+            disown -h   # 백그라운드 완전 분리
             
             echo "=== 배포 완료! ==="
-            echo "실행 중인 emas.py 프로세스:"
+            echo "실행 중인 emas.py:"
             ps aux | grep emas.py || echo "프로세스 없음"
             echo "로그 마지막 10줄:"
             tail -n 10 emas.log
