@@ -115,7 +115,7 @@ class TradingConfig:
                     'entry_timeframe': '8h',
                     'exit_timeframe': '4h',
                     'risk_per_trade_pct': 10.0,
-                    'max_risk_per_trade_pct': 20.0,
+                    'max_risk_per_trade_pct': 100.0,
                     'target_roe_pct': 20.0,
                     'stop_loss_pct': 10.0,
                     'daily_loss_limit': 5000.0,
@@ -200,10 +200,19 @@ class TradingConfig:
             changed = True
 
         common_cfg = signal_cfg.setdefault('common_settings', {})
-        max_risk_pct = float(common_cfg.get('max_risk_per_trade_pct', 20.0) or 20.0)
+        max_risk_pct = float(common_cfg.get('max_risk_per_trade_pct', 100.0) or 100.0)
         if max_risk_pct < 1.0:
-            common_cfg['max_risk_per_trade_pct'] = 1.0
             max_risk_pct = 1.0
+            common_cfg['max_risk_per_trade_pct'] = max_risk_pct
+            changed = True
+        if max_risk_pct > 100.0:
+            max_risk_pct = 100.0
+            common_cfg['max_risk_per_trade_pct'] = max_risk_pct
+            changed = True
+        # Keep global cap at 100% so Telegram setup can always allow up to 100.
+        if max_risk_pct < 100.0:
+            max_risk_pct = 100.0
+            common_cfg['max_risk_per_trade_pct'] = max_risk_pct
             changed = True
 
         risk_pct = float(common_cfg.get('risk_per_trade_pct', 10.0) or 10.0)
@@ -275,7 +284,7 @@ class TradingConfig:
                     "entry_timeframe": "15m",
                     "exit_timeframe": "15m",
                     "risk_per_trade_pct": 10.0,
-                    "max_risk_per_trade_pct": 20.0,
+                    "max_risk_per_trade_pct": 100.0,
                     "target_roe_pct": 20.0, "stop_loss_pct": 10.0,
                     "daily_loss_limit": 5000.0,
                     "daily_loss_limit_pct": 5.0,
@@ -2099,8 +2108,9 @@ class SignalEngine(BaseEngine):
             cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
             lev = int(max(1.0, float(cfg.get('leverage', 10) or 10)))
             req_risk_pct = float(cfg.get('risk_per_trade_pct', 10.0) or 10.0)
-            max_risk_pct = float(cfg.get('max_risk_per_trade_pct', 20.0) or 20.0)
-            bounded_risk_pct = min(max(req_risk_pct, 1.0), max(max_risk_pct, 1.0))
+            max_risk_pct = float(cfg.get('max_risk_per_trade_pct', 100.0) or 100.0)
+            max_risk_pct = min(100.0, max(1.0, max_risk_pct))
+            bounded_risk_pct = min(max(req_risk_pct, 1.0), max_risk_pct)
             risk_pct = bounded_risk_pct / 100.0
             
             bal = await asyncio.to_thread(self.exchange.fetch_balance)
@@ -3828,7 +3838,7 @@ class MainController:
             '4': "📝 **진입 타임프레임** 입력 (예: 15m)\n1m,2m,3m,5m,15m,30m | 1h,2h,4h | 1d",
             '41': "📝 **청산 타임프레임** 입력 (예: 1h)\n1m,2m,3m,5m,15m,30m | 1h,2h,4h | 1d",
             '5': "📝 **일일 손실 제한($)** 입력 (예: 1000)",
-            '6': "📝 **진입 비율(%)** 입력 (예: 50)",
+            '6': "📝 **진입 비율(%)** 입력 (1~100, 예: 50)",
             '7': "↕️ **매매 방향** 선택 (양방향/롱만/숏만)",
             '8': "💱 **심볼** 입력 또는 선택\n1: BTC  2: ETH  3: SOL\n또는 직접 입력 (예: DOGE, XRP, PEPE)",
             '9': "▶️ 매매 시작/중지를 바꾸려면 1 또는 0 입력",
@@ -4102,7 +4112,8 @@ class MainController:
                 await self.cfg.update_value(['dual_mode_engine', 'daily_loss_limit'], float(val))
             elif choice == '6':
                 v = float(val)
-                max_risk = float(self.cfg.get('signal_engine', {}).get('common_settings', {}).get('max_risk_per_trade_pct', 20.0) or 20.0)
+                max_risk = float(self.cfg.get('signal_engine', {}).get('common_settings', {}).get('max_risk_per_trade_pct', 100.0) or 100.0)
+                max_risk = min(100.0, max(1.0, max_risk))
                 if v < 1 or v > max_risk:
                     await update.message.reply_text(f"❌ 1~{max_risk:.0f} 사이 값을 입력하세요.")
                     return SELECT
