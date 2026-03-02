@@ -19,16 +19,17 @@ jobs:
             set -e
             
             echo "=== 배포 시작 ==="
-            cd /home/azureuser
+            cd /home/azureuser/tradingbot
             
             echo "=== Git Pull ==="
             git pull origin main --no-rebase
             
-            echo "=== 기존 프로세스 종료 ==="
+            echo "=== 기존 emas.py 프로세스 종료 ==="
             pkill -f emas.py || true
             
             echo "=== 봇 재시작 ==="
             nohup python3 emas.py > emas.log 2>&1 &
             
             echo "=== 배포 완료 ==="
+            echo "현재 실행 중인 emas.py:"
             ps aux | grep emas.py || echo "프로세스 없음"
