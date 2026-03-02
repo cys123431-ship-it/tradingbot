@@ -121,6 +121,8 @@ class TradingConfig:
                     'daily_loss_limit': 5000.0,
                     'daily_loss_limit_pct': 5.0,
                     'tp_sl_enabled': True,
+                    'take_profit_enabled': True,
+                    'stop_loss_enabled': True,
                     'scanner_enabled': False,
                     'scanner_timeframe': '15m', # [New] Dedicated Scanner TF
                     'scanner_exit_timeframe': '1h', # [New] Dedicated Scanner Exit TF
@@ -212,6 +214,20 @@ class TradingConfig:
             common_cfg['risk_per_trade_pct'] = 1.0
             changed = True
 
+        tp_sl_master = bool(common_cfg.get('tp_sl_enabled', True))
+        tp_enabled = bool(common_cfg.get('take_profit_enabled', True))
+        sl_enabled = bool(common_cfg.get('stop_loss_enabled', True))
+        if not tp_sl_master and (tp_enabled or sl_enabled):
+            common_cfg['take_profit_enabled'] = False
+            common_cfg['stop_loss_enabled'] = False
+            tp_enabled = False
+            sl_enabled = False
+            changed = True
+        desired_master = tp_enabled or sl_enabled
+        if tp_sl_master != desired_master:
+            common_cfg['tp_sl_enabled'] = desired_master
+            changed = True
+
         # Hurst filter was removed from core strategy path.
         for removed_key in ('hurst_entry_enabled', 'hurst_exit_enabled', 'hurst_threshold'):
             if removed_key in common_cfg:
@@ -264,6 +280,8 @@ class TradingConfig:
                     "daily_loss_limit": 5000.0,
                     "daily_loss_limit_pct": 5.0,
                     "tp_sl_enabled": True,
+                    "take_profit_enabled": True,
+                    "stop_loss_enabled": True,
                     "scanner_enabled": False,
                     "scanner_timeframe": "15m",
                     "scanner_exit_timeframe": "1h",
@@ -832,8 +850,10 @@ class TemaEngine(BaseEngine):
             await self.ctrl.notify(f"✅ **TEMA 진입**: {symbol} {side.upper()}\n가격: {price}\n수량: {amount_str}")
             
             # 4. TP/SL ?ㅼ젙 (怨듯넻 ?ㅼ젙 ?ъ슜)
-            tp_sl_enabled = common_cfg.get('tp_sl_enabled', False)
-            if tp_sl_enabled:
+            tp_master_enabled = bool(common_cfg.get('tp_sl_enabled', False))
+            tp_enabled = tp_master_enabled and bool(common_cfg.get('take_profit_enabled', True))
+            sl_enabled = tp_master_enabled and bool(common_cfg.get('stop_loss_enabled', True))
+            if tp_enabled or sl_enabled:
                 roe_target = common_cfg.get('target_roe_pct', 20.0) / 100.0
                 stop_loss = common_cfg.get('stop_loss_pct', 10.0) / 100.0
                 
@@ -849,27 +869,27 @@ class TemaEngine(BaseEngine):
                     
                 # 諛붿씠?몄뒪 湲곗? TP/SL 二쇰Ц (STOP_MARKET / TAKE_PROFIT_MARKET)
                 try:
-                    # 1. Take Profit
-                    params_tp = {
-                        'stopPrice': self.safe_price(symbol, tp_price),
-                        'reduceOnly': True
-                    }
-                    if side == 'long':
-                        await asyncio.to_thread(self.exchange.create_order, symbol, 'TAKE_PROFIT_MARKET', 'sell', amount_str, None, params_tp)
-                    else:
-                        await asyncio.to_thread(self.exchange.create_order, symbol, 'TAKE_PROFIT_MARKET', 'buy', amount_str, None, params_tp)
+                    if tp_enabled:
+                        params_tp = {
+                            'stopPrice': self.safe_price(symbol, tp_price),
+                            'reduceOnly': True
+                        }
+                        if side == 'long':
+                            await asyncio.to_thread(self.exchange.create_order, symbol, 'TAKE_PROFIT_MARKET', 'sell', amount_str, None, params_tp)
+                        else:
+                            await asyncio.to_thread(self.exchange.create_order, symbol, 'TAKE_PROFIT_MARKET', 'buy', amount_str, None, params_tp)
                     
-                    # 2. Stop Loss
-                    params_sl = {
-                        'stopPrice': self.safe_price(symbol, sl_price),
-                        'reduceOnly': True
-                    }
-                    if side == 'long':
-                        await asyncio.to_thread(self.exchange.create_order, symbol, 'STOP_MARKET', 'sell', amount_str, None, params_sl)
-                    else:
-                        await asyncio.to_thread(self.exchange.create_order, symbol, 'STOP_MARKET', 'buy', amount_str, None, params_sl)
+                    if sl_enabled:
+                        params_sl = {
+                            'stopPrice': self.safe_price(symbol, sl_price),
+                            'reduceOnly': True
+                        }
+                        if side == 'long':
+                            await asyncio.to_thread(self.exchange.create_order, symbol, 'STOP_MARKET', 'sell', amount_str, None, params_sl)
+                        else:
+                            await asyncio.to_thread(self.exchange.create_order, symbol, 'STOP_MARKET', 'buy', amount_str, None, params_sl)
                     
-                    logger.info(f"??TP/SL Order Placed: TP={tp_price:.4f}, SL={sl_price:.4f}")
+                    logger.info(f"??Protective orders placed: TP={'ON' if tp_enabled else 'OFF'}, SL={'ON' if sl_enabled else 'OFF'}")
                 except Exception as e:
                     logger.error(f"Failed to place TP/SL order: {e}")
                     await self.ctrl.notify(f"⚠️ TP/SL 주문 실패: {e}")
@@ -1357,6 +1377,13 @@ class SignalEngine(BaseEngine):
                     'en_entry': strategy_params.get('kalman_filter', {}).get('entry_enabled', False),
                     'en_exit': strategy_params.get('kalman_filter', {}).get('exit_enabled', False)
                 }
+            }
+            tp_master_enabled = bool(comm_cfg.get('tp_sl_enabled', True))
+            tp_enabled = tp_master_enabled and bool(comm_cfg.get('take_profit_enabled', True))
+            sl_enabled = tp_master_enabled and bool(comm_cfg.get('stop_loss_enabled', True))
+            symbol_status['protection_config'] = {
+                'tp_enabled': tp_enabled,
+                'sl_enabled': sl_enabled
             }
             
             # [New] Status Display Enhancement
@@ -2166,16 +2193,25 @@ class SignalEngine(BaseEngine):
             
             else:
                 # SMA/HMA: ?쇱꽱??湲곕컲 TP/SL 二쇰Ц
-                tp_sl_enabled = bool(cfg.get('tp_sl_enabled', True))
-                if tp_sl_enabled:
+                tp_master_enabled = bool(cfg.get('tp_sl_enabled', True))
+                tp_enabled = tp_master_enabled and bool(cfg.get('take_profit_enabled', True))
+                sl_enabled = tp_master_enabled and bool(cfg.get('stop_loss_enabled', True))
+                if tp_enabled or sl_enabled:
                     tp_pct = cfg.get('target_roe_pct', 20.0) / 100.0 / lev  # ROE瑜?媛寃?蹂?숇쪧濡?蹂??
                     sl_pct = cfg.get('stop_loss_pct', 10.0) / 100.0 / lev
-                    
-                    tp_distance = actual_entry_price * tp_pct
-                    sl_distance = actual_entry_price * sl_pct
-                    
-                    await self._place_tp_sl_orders(symbol, side, actual_entry_price, qty,
-                                                   tp_distance, sl_distance)
+
+                    tp_distance = (actual_entry_price * tp_pct) if (tp_enabled and tp_pct > 0) else None
+                    sl_distance = (actual_entry_price * sl_pct) if (sl_enabled and sl_pct > 0) else None
+
+                    if tp_distance is not None or sl_distance is not None:
+                        await self._place_tp_sl_orders(
+                            symbol,
+                            side,
+                            actual_entry_price,
+                            qty,
+                            tp_distance=tp_distance,
+                            sl_distance=sl_distance
+                        )
             
             if verify_pos:
                 logger.info(f"??Position verified: {verify_pos['side']} {verify_pos['contracts']}")
@@ -2188,44 +2224,58 @@ class SignalEngine(BaseEngine):
             traceback.print_exc()
             await self.ctrl.notify(f"❌ 진입 실패: {e}")
 
-    async def _place_tp_sl_orders(self, symbol, side, entry_price, qty, tp_distance, sl_distance):
+    async def _place_tp_sl_orders(self, symbol, side, entry_price, qty, tp_distance=None, sl_distance=None):
         """嫄곕옒?뚯뿉 TP/SL 二쇰Ц 諛곗튂 (?ㅽ뵂?ㅻ뜑??蹂댁엫)"""
         try:
+            tp_order = None
+            sl_order = None
+            tp_price = None
+            sl_price = None
+
             if side == 'long':
-                tp_price = self.safe_price(symbol, entry_price + tp_distance)
-                sl_price = self.safe_price(symbol, entry_price - sl_distance)
                 tp_side = 'sell'
                 sl_side = 'sell'
+                if tp_distance is not None and tp_distance > 0:
+                    tp_price = self.safe_price(symbol, entry_price + tp_distance)
+                if sl_distance is not None and sl_distance > 0:
+                    sl_price = self.safe_price(symbol, entry_price - sl_distance)
             else:
-                tp_price = self.safe_price(symbol, entry_price - tp_distance)
-                sl_price = self.safe_price(symbol, entry_price + sl_distance)
                 tp_side = 'buy'
                 sl_side = 'buy'
-            
+                if tp_distance is not None and tp_distance > 0:
+                    tp_price = self.safe_price(symbol, entry_price - tp_distance)
+                if sl_distance is not None and sl_distance > 0:
+                    sl_price = self.safe_price(symbol, entry_price + sl_distance)
+
             # Take Profit 二쇰Ц (吏?뺢? + reduceOnly)
-            try:
-                tp_order = await asyncio.to_thread(
-                    self.exchange.create_order, symbol, 'limit', tp_side, qty, tp_price,
-                    {'reduceOnly': True}
-                )
-                logger.info(f"??TP order placed: {tp_side.upper()} @ {tp_price}")
-            except Exception as tp_e:
-                logger.error(f"TP order failed: {tp_e}")
-                tp_order = None
-            
+            if tp_price is not None:
+                try:
+                    tp_order = await asyncio.to_thread(
+                        self.exchange.create_order, symbol, 'limit', tp_side, qty, tp_price,
+                        {'reduceOnly': True}
+                    )
+                    logger.info(f"??TP order placed: {tp_side.upper()} @ {tp_price}")
+                except Exception as tp_e:
+                    logger.error(f"TP order failed: {tp_e}")
+
             # Stop Loss 二쇰Ц (?ㅽ깙 留덉폆 + reduceOnly)
-            try:
-                sl_order = await asyncio.to_thread(
-                    self.exchange.create_order, symbol, 'stop_market', sl_side, qty, None,
-                    {'stopPrice': sl_price, 'reduceOnly': True}
-                )
-                logger.info(f"??SL order placed: {sl_side.upper()} @ {sl_price} (stop)")
-            except Exception as sl_e:
-                logger.error(f"SL order failed: {sl_e}")
-                sl_order = None
+            if sl_price is not None:
+                try:
+                    sl_order = await asyncio.to_thread(
+                        self.exchange.create_order, symbol, 'stop_market', sl_side, qty, None,
+                        {'stopPrice': sl_price, 'reduceOnly': True}
+                    )
+                    logger.info(f"??SL order placed: {sl_side.upper()} @ {sl_price} (stop)")
+                except Exception as sl_e:
+                    logger.error(f"SL order failed: {sl_e}")
             
-            if tp_order or sl_order:
-                await self.ctrl.notify(f"🎯 TP: `{tp_price:.2f}` | 🛑 SL: `{sl_price:.2f}`")
+            notice_parts = []
+            if tp_order and tp_price is not None:
+                notice_parts.append(f"🎯 TP: `{float(tp_price):.2f}`")
+            if sl_order and sl_price is not None:
+                notice_parts.append(f"🛑 SL: `{float(sl_price):.2f}`")
+            if notice_parts:
+                await self.ctrl.notify(" | ".join(notice_parts))
             
         except Exception as e:
             logger.error(f"TP/SL order placement error: {e}")
@@ -3229,8 +3279,11 @@ class DualModeFractalEngine(BaseEngine):
             self.db.log_trade_entry(symbol, side, entry_price, float(qty))
             
             # 2. TP/SL ?ㅼ젙 (怨듯넻 ?ㅼ젙 媛??ъ슜)
-            tp_pct = common_cfg.get('target_roe_pct', 0.0)
-            sl_pct = common_cfg.get('stop_loss_pct', 0.0)
+            tp_master_enabled = bool(common_cfg.get('tp_sl_enabled', True))
+            tp_enabled = tp_master_enabled and bool(common_cfg.get('take_profit_enabled', True))
+            sl_enabled = tp_master_enabled and bool(common_cfg.get('stop_loss_enabled', True))
+            tp_pct = common_cfg.get('target_roe_pct', 0.0) if tp_enabled else 0.0
+            sl_pct = common_cfg.get('stop_loss_pct', 0.0) if sl_enabled else 0.0
             
             msg = f"✅ [DualMode] {side.upper()} 진입: {qty} @ {entry_price}"
             
@@ -3523,6 +3576,100 @@ class MainController:
         
         return None
 
+    async def _sync_signal_protection_orders(self):
+        """현재 보유 포지션의 보호주문(TP/SL)을 최신 설정으로 동기화한다."""
+        try:
+            common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+            tp_master_enabled = bool(common_cfg.get('tp_sl_enabled', True))
+            tp_enabled = tp_master_enabled and bool(common_cfg.get('take_profit_enabled', True))
+            sl_enabled = tp_master_enabled and bool(common_cfg.get('stop_loss_enabled', True))
+
+            lev = max(1.0, float(common_cfg.get('leverage', 10) or 10))
+            tp_pct = float(common_cfg.get('target_roe_pct', 20.0) or 0.0) / 100.0 / lev
+            sl_pct = float(common_cfg.get('stop_loss_pct', 10.0) or 0.0) / 100.0 / lev
+
+            positions = await asyncio.to_thread(self.exchange.fetch_positions)
+            refreshed = 0
+            cancelled_only = 0
+
+            for p in positions:
+                contracts = abs(float(p.get('contracts', 0) or 0))
+                if contracts <= 0:
+                    continue
+
+                raw_symbol = str(p.get('symbol', ''))
+                symbol = raw_symbol.replace(':USDT', '')
+                side = str(p.get('side', '')).lower()
+                if side not in ('long', 'short'):
+                    continue
+
+                try:
+                    await asyncio.to_thread(self.exchange.cancel_all_orders, symbol)
+                except Exception as cancel_e:
+                    logger.warning(f"Protection sync: cancel_all_orders failed for {symbol}: {cancel_e}")
+
+                if not (tp_enabled or sl_enabled):
+                    cancelled_only += 1
+                    continue
+
+                entry_price = float(p.get('entryPrice') or p.get('markPrice') or 0.0)
+                if entry_price <= 0:
+                    logger.warning(f"Protection sync skipped for {symbol}: invalid entry price")
+                    continue
+
+                close_side = 'sell' if side == 'long' else 'buy'
+                try:
+                    qty = self.exchange.amount_to_precision(symbol, contracts)
+                except Exception:
+                    qty = str(round(contracts, 6))
+
+                if tp_enabled and tp_pct > 0:
+                    tp_price_raw = entry_price * (1 + tp_pct) if side == 'long' else entry_price * (1 - tp_pct)
+                    try:
+                        tp_price = self.exchange.price_to_precision(symbol, tp_price_raw)
+                    except Exception:
+                        tp_price = str(round(tp_price_raw, 6))
+                    try:
+                        await asyncio.to_thread(
+                            self.exchange.create_order,
+                            symbol,
+                            'limit',
+                            close_side,
+                            qty,
+                            tp_price,
+                            {'reduceOnly': True}
+                        )
+                    except Exception as tp_e:
+                        logger.warning(f"Protection sync TP failed for {symbol}: {tp_e}")
+
+                if sl_enabled and sl_pct > 0:
+                    sl_price_raw = entry_price * (1 - sl_pct) if side == 'long' else entry_price * (1 + sl_pct)
+                    try:
+                        sl_price = self.exchange.price_to_precision(symbol, sl_price_raw)
+                    except Exception:
+                        sl_price = str(round(sl_price_raw, 6))
+                    try:
+                        await asyncio.to_thread(
+                            self.exchange.create_order,
+                            symbol,
+                            'stop_market',
+                            close_side,
+                            qty,
+                            None,
+                            {'stopPrice': sl_price, 'reduceOnly': True}
+                        )
+                    except Exception as sl_e:
+                        logger.warning(f"Protection sync SL failed for {symbol}: {sl_e}")
+
+                refreshed += 1
+
+            logger.info(
+                f"Protection sync done: refreshed={refreshed}, "
+                f"cancelled_only={cancelled_only}, tp={tp_enabled}, sl={sl_enabled}"
+            )
+        except Exception as e:
+            logger.error(f"Protection order sync error: {e}")
+
     async def show_setup_menu(self, update: Update):
         sys_cfg = self.cfg.get('system_settings', {})
         sig = self.cfg.get('signal_engine', {})
@@ -3572,7 +3719,11 @@ class MainController:
         dm_tf = dm.get('scalping_tf', '5m') if dm_mode == 'SCALPING' else dm.get('standard_tf', '4h')
         
         # TP/SL ?곹깭
-        tp_sl_status = "ON" if sig_common.get('tp_sl_enabled', True) else "OFF"
+        tp_enabled = bool(sig_common.get('take_profit_enabled', sig_common.get('tp_sl_enabled', True)))
+        sl_enabled = bool(sig_common.get('stop_loss_enabled', sig_common.get('tp_sl_enabled', True)))
+        tp_sl_status = "ON" if (tp_enabled or sl_enabled) else "OFF"
+        tp_status = "ON" if tp_enabled else "OFF"
+        sl_status = "ON" if sl_enabled else "OFF"
         
         # Signal ?꾨왂 ?ㅼ젙 (異붽?)
         strategy_params = sig.get('strategy_params', {})
@@ -3633,6 +3784,8 @@ class MainController:
 10. SMA (`{fast_sma}/{slow_sma}`)
 17. HMA (`{hma_fast}/{hma_slow}`)
 13. TP/SL 자동청산 (`{tp_sl_status}`)
+36. ROE 자동청산 (`{tp_status}`)
+37. 손절 자동청산 (`{sl_status}`)
 23. 거래량 급등 채굴 (`{scanner_status}` / `{scanner_tf}`)
 24. 채굴 진입 TF
 25. 채굴 청산 TF (`{scanner_exit_tf}`)
@@ -3700,6 +3853,8 @@ class MainController:
             '33': "📝 **CC Exit 필터**를 ON/OFF 합니다.",
             '34': "📝 **CC 설정** 입력 (예: 0.70 또는 0.70,14)",
             '35': "📝 **듀얼모드 변경** (1=스탠다드, 2=스캘핑)",
+            '36': "📝 **ROE 자동청산** ON/OFF 토글",
+            '37': "📝 **손절 자동청산** ON/OFF 토글",
         }
         if text == '7':
             keyboard = [
@@ -3730,11 +3885,37 @@ class MainController:
             return SELECT
         elif text == '13':
             # TP/SL ?좉?
-            current = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('tp_sl_enabled', True)
+            common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+            current = bool(common_cfg.get('tp_sl_enabled', True))
             new_val = not current
             await self.cfg.update_value(['signal_engine', 'common_settings', 'tp_sl_enabled'], new_val)
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'take_profit_enabled'], new_val)
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'stop_loss_enabled'], new_val)
+            await self._sync_signal_protection_orders()
             status = "ON" if new_val else "OFF"
-            await update.message.reply_text(f"✅ TP/SL 자동청산: {status}")
+            await update.message.reply_text(f"✅ TP/SL 자동청산(전체): {status}")
+            await self.show_setup_menu(update)
+            return SELECT
+        elif text == '36':
+            common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+            current_tp = bool(common_cfg.get('take_profit_enabled', common_cfg.get('tp_sl_enabled', True)))
+            new_tp = not current_tp
+            curr_sl = bool(common_cfg.get('stop_loss_enabled', common_cfg.get('tp_sl_enabled', True)))
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'take_profit_enabled'], new_tp)
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'tp_sl_enabled'], bool(new_tp or curr_sl))
+            await self._sync_signal_protection_orders()
+            await update.message.reply_text(f"✅ ROE 자동청산: {'ON' if new_tp else 'OFF'}")
+            await self.show_setup_menu(update)
+            return SELECT
+        elif text == '37':
+            common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+            current_sl = bool(common_cfg.get('stop_loss_enabled', common_cfg.get('tp_sl_enabled', True)))
+            new_sl = not current_sl
+            curr_tp = bool(common_cfg.get('take_profit_enabled', common_cfg.get('tp_sl_enabled', True)))
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'stop_loss_enabled'], new_sl)
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'tp_sl_enabled'], bool(curr_tp or new_sl))
+            await self._sync_signal_protection_orders()
+            await update.message.reply_text(f"✅ 손절 자동청산: {'ON' if new_sl else 'OFF'}")
             await self.show_setup_menu(update)
             return SELECT
         elif text == '42':
@@ -3873,10 +4054,12 @@ class MainController:
             elif choice == '2':
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'target_roe_pct'], float(val))
                 await self.cfg.update_value(['dual_mode_engine', 'target_roe_pct'], float(val))
+                await self._sync_signal_protection_orders()
             elif choice == '3':
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'stop_loss_pct'], float(val))
                 await self.cfg.update_value(['dual_thrust_engine', 'stop_loss_pct'], float(val))
                 await self.cfg.update_value(['dual_mode_engine', 'stop_loss_pct'], float(val))
+                await self._sync_signal_protection_orders()
             elif choice == '4':
                 # 타임프레임 유효성 검사
                 valid_tf = ['1m', '2m', '3m', '4m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
@@ -4787,7 +4970,11 @@ class MainController:
                     e_tf = d.get('entry_tf', '?')
                     x_tf = d.get('exit_tf', '?')
                     entry_reason = d.get('entry_reason', '대기')
+                    protection_cfg = d.get('protection_config', {})
+                    tp_text = "ON" if protection_cfg.get('tp_enabled', False) else "OFF"
+                    sl_text = "ON" if protection_cfg.get('sl_enabled', False) else "OFF"
                     msg += f"⏱ TF: 진입 `{e_tf}` / 청산 `{x_tf}`\n"
+                    msg += f"🛡 보호주문: TP `{tp_text}` | SL `{sl_text}`\n"
                     msg += f"📝 진입판정: `{entry_reason}`\n"
 
                     f_cfg = d.get('filter_config', {})
