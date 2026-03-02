@@ -15,6 +15,7 @@ import asyncio
 import time
 import sys
 import traceback
+import re
 import ccxt
 import pandas as pd
 import pandas_ta as ta
@@ -3461,11 +3462,11 @@ class MainController:
         self.last_hourly_report = 0
 
     async def run(self):
-        logger.info("?윟 Bot Starting... (Pure Polling Mode)")
+        logger.info("Bot starting... (Pure Polling Mode)")
         
         if self.cfg.get('logging', {}).get('debug_mode', False):
             logger.setLevel(logging.DEBUG)
-            logger.info("?맄 Debug Mode Enabled")
+            logger.info("Debug mode enabled")
         
         token = self.cfg.get('telegram', {}).get('token', '')
         if not token:
@@ -3481,8 +3482,18 @@ class MainController:
         await self.tg_app.start()
         await self.tg_app.updater.start_polling()
         
-        # ?쒖옉 ???쇱떆?뺤? ?곹깭 ?뚮┝
-        await self.notify("??**遊??쒖옉??(?쇱떆?뺤? ?곹깭)**\n\n?ㅼ젙 議곗젅 ????RESUME???뚮윭二쇱꽭??")
+        # Startup notice in paused state with keyboard
+        await self.notify("⏸ **봇 시작됨 (일시정지 상태)**\n\n설정 확인 후 `▶ RESUME`을 눌러주세요.")
+        cid = self.cfg.get_chat_id()
+        if cid:
+            try:
+                await self.tg_app.bot.send_message(
+                    chat_id=cid,
+                    text="📱 메인 메뉴를 띄웠습니다.",
+                    reply_markup=self._build_main_keyboard()
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send main menu keyboard: {e}")
         
         await asyncio.gather(
             self._main_polling_loop(),  # [?대쭅 ?꾩슜] 硫붿씤 ?대쭅 猷⑦봽
@@ -3567,30 +3578,30 @@ class MainController:
             logger.error(f"Exchange reinit error: {e}")
             return False, str(e)
 
-    # ---------------- UI: 鍮꾩긽 踰꾪듉 理쒖슦??泥섎━ ----------------
+    # ---------------- UI: emergency controls ----------------
     async def global_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text if update.message else ""
         
         if "STOP" in text:
             await self.emergency_stop()
-            await update.message.reply_text("?썞 湲닿툒 ?뺤? ?꾨즺 - 紐⑤뱺 ?ъ???泥?궛")
+            await update.message.reply_text("🚨 긴급 정지 완료 - 모든 포지션 청산")
             return ConversationHandler.END
         elif "PAUSE" in text:
             self.is_paused = True
-            await update.message.reply_text("???쇱떆?뺤? (留ㅻℓ 以묐떒, 紐⑤땲?곕쭅 ?좎?)")
+            await update.message.reply_text("⏸ 일시정지 (매매 중단, 모니터링 유지)")
             return ConversationHandler.END
         elif "RESUME" in text:
             self.is_paused = False
-            # ?붿쭊??以묒???寃쎌슦 ?ъ떆??
+            # Restart engine if it is not running
             if self.active_engine and not self.active_engine.running:
                 self.active_engine.start()
-                await update.message.reply_text("??留ㅻℓ ?ш컻 (?붿쭊 ?ъ떆?묐맖)")
+                await update.message.reply_text("▶ 매매 재개 (엔진 재시작)")
             else:
-                await update.message.reply_text("??留ㅻℓ ?ш컻")
+                await update.message.reply_text("▶ 매매 재개")
             return ConversationHandler.END
         elif text == "/status":
             self.dashboard_msg_id = None
-            await update.message.reply_text("?봽 ??쒕낫??媛깆떊")
+            await update.message.reply_text("🔄 대시보드 갱신")
             return ConversationHandler.END
         
         return None
@@ -3618,7 +3629,7 @@ class MainController:
             watchlist = sig.get('watchlist', ['BTC/USDT'])
             symbol = watchlist[0] if watchlist else 'BTC/USDT'
             
-        status = "?뵶 OFF" if self.is_paused else "?윟 ON"
+        status = "🔴 OFF" if self.is_paused else "🟢 ON"
         direction_str = {'both': '양방향', 'long': '롱만', 'short': '숏만'}.get(direction, 'both')
         
         # ?덉쟾???ㅼ젙 ?묎렐
@@ -3656,7 +3667,7 @@ class MainController:
         
         # Scanner ?곹깭
         scanner_enabled = sig_common.get('scanner_enabled', True)
-        scanner_status = "ON ?뱻" if scanner_enabled else "OFF"
+        scanner_status = "ON 📡" if scanner_enabled else "OFF"
         scanner_tf = sig_common.get('scanner_timeframe', '15m')
         scanner_exit_tf = sig_common.get('scanner_exit_timeframe', '1h')
 
@@ -3683,67 +3694,53 @@ class MainController:
         cc_exit = "ON" if sig_common.get('cc_exit_enabled', False) else "OFF"
         cc_threshold = sig_common.get('cc_threshold', 0.70)
         
-        # ?ㅽ듃?뚰겕 ?곹깭
+        # Network status
         use_testnet = self.cfg.get('api', {}).get('use_testnet', True)
-        network_status = "?뚯뒪?몃꽬 ?㎦" if use_testnet else "硫붿씤???뮥"
+        network_status = "테스트넷 🧪" if use_testnet else "메인넷 💰"
         
         msg = f"""
-?뵩 **?ㅼ젙 硫붾돱** (踰덊샇 ?낅젰)
+🔧 **설정 메뉴** (번호 입력)
 
-**?꾩옱 ?곹깭**: {eng.upper()} | {symbol}
+**현재 상태**: `{eng.upper()}` | `{symbol}`
 
-?곣봺??怨듯넻 ?ㅼ젙 ?곣봺??
-1. ?덈쾭由ъ? (`{lev}諛?)
-2. 紐⑺몴 ROE (`{sig_common.get('target_roe_pct', 20)}%`)
-3. ?먯젅 (`{sig_common.get('stop_loss_pct', 10)}%`)
-4. 吏꾩엯 ??꾪봽?덉엫 (`{sig_common.get('timeframe', '15m')}`)
-41. 泥?궛 ??꾪봽?덉엫 (`{sig_common.get('exit_timeframe', '4h')}`)
-5. ?먯떎 ?쒗븳 (`${sig_common.get('daily_loss_limit', 5000)}`)
-6. 吏꾩엯 鍮꾩쑉 (`{sig_common.get('risk_per_trade_pct', 50)}%`)
-7. 留ㅻℓ 諛⑺뼢 (`{direction_str}`)
-8. ?щ낵 蹂寃?(`{symbol}`)
+**공통**
+1. 레버리지 (`{lev}x`)
+2. 목표 ROE (`{sig_common.get('target_roe_pct', 20)}%`)
+3. 손절 (`{sig_common.get('stop_loss_pct', 10)}%`)
+4. 진입 타임프레임 (`{sig_common.get('timeframe', '15m')}`)
+41. 청산 타임프레임 (`{sig_common.get('exit_timeframe', '4h')}`)
+5. 일일 손실 제한 (`${sig_common.get('daily_loss_limit', 5000)}`)
+6. 진입 비율 (`{sig_common.get('risk_per_trade_pct', 50)}%`)
+7. 매매 방향 (`{direction_str}`)
+8. 심볼 변경 (`{symbol}`)
 
-?곣봺??Signal ?꾩슜 ?곣봺??
-16. ?꾨왂 (`{active_strategy}`)
-18. 吏꾩엯紐⑤뱶 (`{entry_mode}`) - SMA/HMA??
-10. SMA 湲곌컙 (`{fast_sma}/{slow_sma}`)
-17. HMA 湲곌컙 (`{hma_fast}/{hma_slow}`)
-20. VBO ?ㅼ젙 (LEGACY 遺꾨━)
-21. FractalFisher ?ㅼ젙 (LEGACY 遺꾨━)
-13. TP/SL ?먮룞泥?궛 (`{tp_sl_status}`)
-23. 嫄곕옒?됯툒?깆콈援?(`{scanner_status}`) (`TF: {scanner_tf}`)
-24. 湲됰벑梨꾧뎬 吏꾩엯 ?꾨젅???ㅼ젙
-25. 湲됰벑梨꾧뎬 泥?궛 ?꾨젅???ㅼ젙 (`{scanner_exit_tf}`)
+**Signal**
+16. 전략 (`{active_strategy}`)
+18. 진입모드 (`{entry_mode}`)
+10. SMA (`{fast_sma}/{slow_sma}`)
+17. HMA (`{hma_fast}/{hma_slow}`)
+13. TP/SL 자동청산 (`{tp_sl_status}`)
+23. 거래량 급등 채굴 (`{scanner_status}` / `{scanner_tf}`)
+24. 채굴 진입 TF
+25. 채굴 청산 TF (`{scanner_exit_tf}`)
 
-**?꾪꽣 (Entry / Exit)**
-26. R2 ?꾪꽣 (`{r2_entry}` / `{r2_exit}`) (湲곗?: `{r2_threshold}`)
-28. Hurst ?꾪꽣 (`{hurst_entry}` / `{hurst_exit}`) (湲곗?: `{hurst_threshold}`)
-30. CHOP ?꾪꽣 (`{chop_entry}` / `{chop_exit}`) (湲곗?: `{chop_threshold}`)
-32. Kalman ?꾪꽣 (`{kalman_entry}` / `{kalman_exit}`)
-33. CC ?꾪꽣 (Exit Only) (`{cc_exit}`) (湲곗?: `{cc_threshold}`)
+**필터 (Entry / Exit)**
+26. R2 (`{r2_entry}` / `{r2_exit}`) 기준 `{r2_threshold}`
+28. Hurst (`{hurst_entry}` / `{hurst_exit}`) 기준 `{hurst_threshold}`
+30. CHOP (`{chop_entry}` / `{chop_exit}`) 기준 `{chop_threshold}`
+32. Kalman (`{kalman_entry}` / `{kalman_exit}`)
+33. CC Exit (`{cc_exit}`) 기준 `{cc_threshold}`
+27. R2 민감도
+29. Hurst 민감도
+31. CHOP 민감도
+34. CC 민감도
 
-27. R2 誘쇨컧???ㅼ젙
-29. Hurst 誘쇨컧???ㅼ젙
-31. CHOP 誘쇨컧???ㅼ젙
-34. CC 誘쇨컧???ㅼ젙
-
-?곣봺??Shannon ?꾩슜 (LEGACY) ?곣봺??11. ?먯궛 鍮꾩쑉 (`{shannon_ratio}%`)
-12. Grid ?ㅼ젙 (`{grid_enabled}`, ${grid_size})
-
-?곣봺??Dual Thrust ?꾩슜 (LEGACY) ?곣봺??14. N Days (`{dt_n}??)
-15. K1/K2 (`{dt_k1}/{dt_k2}`)
-
-?곣봺??Dual Mode ?꾩슜 (LEGACY) ?곣봺??35. 紐⑤뱶 蹂寃?({dm_mode}, {dm_tf})
-
-?곣봺???쒖뒪???곣봺??
-22. ?ㅽ듃?뚰겕 ?꾪솚 (`{network_status}`)
-42. ?쒓컙蹂?由ы룷??(`{hourly_report_status}`)
-
-
-?곣봺???쒖뼱 ?곣봺??
-00. ?? ?붿쭊 援먯껜 (?꾩옱: {eng.upper()})
-9. ?띰툘 留ㅻℓ?쒖옉/以묒? ({status})
-0. ?섍?湲?
+**기타**
+22. 네트워크 전환 (`{network_status}`)
+42. 시간별 리포트 (`{hourly_report_status}`)
+00. 엔진 교체 (현재: `{eng.upper()}`)
+9. 매매 시작/중지 (`{status}`)
+0. 나가기
 """
         await update.message.reply_text(msg.strip(), parse_mode=ParseMode.MARKDOWN)
 
@@ -3752,85 +3749,68 @@ class MainController:
         return SELECT
 
     async def setup_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text
+        text = update.message.text.strip()
         
         if text == '0':
-            await update.message.reply_text("???ㅼ젙 醫낅즺")
+            await update.message.reply_text("✅ 설정 종료")
             return ConversationHandler.END
         
         context.user_data['setup_choice'] = text
         
         prompts = {
-            '1': "?뱷 **?덈쾭由ъ?** 媛믪쓣 ?낅젰?섏꽭??(1~5諛? ?? 5)",
-            '2': "?뱷 **紐⑺몴 ROE** (%)瑜??낅젰?섏꽭??(?? 20)",
-            '3': "?뱷 **?먯젅 鍮꾩쑉** (%)瑜??낅젰?섏꽭??(?? 5)",
-            '4': "?뱷 **吏꾩엯 ??꾪봽?덉엫**???낅젰?섏꽭??(?? 15m)\n1m,2m,3m,5m,15m,30m | 1h,2h,4h | 1d",
-            '41': "?뱷 **泥?궛 ??꾪봽?덉엫**???낅젰?섏꽭??(?? 1h)\n1m,2m,3m,5m,15m,30m | 1h,2h,4h | 1d",
-            '5': "?뱷 **?쇱씪 ?먯떎 ?쒗븳** ($)???낅젰?섏꽭??(?? 1000)",
-            '6': "?뮥 **吏꾩엯 鍮꾩쑉(%)**???낅젰?섏꽭??(safety cap ?좏슜)",
-            '7': "?뺧툘 **留ㅻℓ 諛⑺뼢**???좏깮?섏꽭??(1=?묐갑?? 2=濡깅쭔, 3=?뤿쭔)",
-            '8': "?뮦 **蹂寃쏀븷 肄붿씤 ?щ낵**???낅젰?섍굅??踰덊샇瑜??좏깮?섏꽭??\n\n1: BTC  2: ETH  3: SOL\n?먮뒗 吏곸젒 ?낅젰 (?? **DOGE**, **XRP**, **PEPE**)",
-            '9': "?띰툘 留ㅻℓ瑜??쒖옉?섏떆寃좎뒿?덇퉴? (1=?쒖옉, 0=以묒?)",
-            '10': "?뱢 **SMA 湲곌컙**???낅젰?섏꽭??(?뺤떇: fast,slow ?? 2,10)",
-            '11': "?뱷 **?먯궛 鍮꾩쑉** (%)瑜??낅젰?섏꽭??(?? 50 = 50%)",
-            '12': "?뱷 **Grid ?ㅼ젙**???낅젰?섏꽭??(?? on,200 ?먮뒗 off)",
-            '14': "?뱷 **N Days** (Range 怨꾩궛 ?쇱닔)瑜??낅젰?섏꽭??(?? 4)",
-            '15': "?뱷 **K1/K2** (諛곗닔)瑜??낅젰?섏꽭??(?? 0.5,0.5 ?먮뒗 0.4,0.6)",
-            '16': "?뱷 **?꾨왂 ?좏깮** (1=SMA, 2=HMA)",
-            '17': "?뱷 **HMA 湲곌컙**???낅젰?섏꽭??(?? 9,21)",
-            '18': "?뱷 **吏꾩엯紐⑤뱶**瑜??좏깮?섏꽭??(1=Cross, 2=Position)",
-            '20': "?뱷 **VBO ?ㅼ젙**: LEGACY濡?遺꾨━??",
-            '21': "?뱷 **FractalFisher ?ㅼ젙**: LEGACY濡?遺꾨━??",
-            '22': "?뱷 **?ㅽ듃?뚰겕 ?좏깮** (1=?뚯뒪?몃꽬, 2=硫붿씤??",
-            '23': "?뱷 **嫄곕옒??湲됰벑 梨꾧뎬 湲곕뒫**??耳쒖떆寃좎뒿?덇퉴? (1=ON, 0=OFF)",
-            '24': "?뱷 **梨꾧뎬 吏꾩엯 ??꾪봽?덉엫**???낅젰?섏꽭??(?? 5m)\n1m, 5m, 15m, 30m, 1h",
-            '25': "?뱷 **梨꾧뎬 泥?궛 ??꾪봽?덉엫**???낅젰?섏꽭??(?? 1h)\n1m, 5m, 15m, 30m, 1h, 4h",
-            '26': "?뱷 **異붿꽭 ?꾪꽣($R^2$) 湲곕뒫**??耳쒖떆寃좎뒿?덇퉴? (1=ON, 0=OFF)", # Toggle?대?濡??ㅼ젣濡쒕뒗 ?ъ슜?섏? ?딆쓣 ???덉쑝??prompt dict 援ъ깋 留욎땄
-            '27': "?뱷 **$R^2$ 湲곗?媛?*???낅젰?섏꽭??(0.1 ~ 0.5 沅뚯옣)\n- ??쓣?섎줉(0.1): 吏꾩엯 ?먯＜ ??(?몄씠利??덉슜)\n- ?믪쓣?섎줉(0.4): ?뺤떎??異붿꽭留?吏꾩엯 (吏꾩엯 媛먯냼)",
-            '28': "?뱷 **Hurst ?꾪꽣**瑜?耳쒖떆寃좎뒿?덇퉴? (1=ON, 0=OFF)", 
-            '29': "?뱷 **Hurst 湲곗?媛?*???낅젰?섏꽭??(?? 0.55)\n- 0.5 ?댄븯???됯퇏?뚭?(?〓낫), 0.5 ?댁긽? 異붿꽭.\n- ?믪쓣?섎줉 媛뺥븳 異붿꽭留?吏꾩엯.",
-            '30': "?뱷 **CHOP ?꾪꽣**瑜?耳쒖떆寃좎뒿?덇퉴? (1=ON, 0=OFF)",
-            '31': "?뱷 **CHOP 湲곗?媛?*???낅젰?섏꽭??(?? 50.0)\n- 100??媛源뚯슱?섎줉 ?〓낫(Choppy).\n- ?ㅼ젙媛?**蹂대떎 ?щ㈃** 吏꾩엯 湲덉?.",
-            '33': "?뱷 **CC ?꾪꽣**瑜?耳쒖떆寃좎뒿?덇퉴? (1=ON, 0=OFF)",
-            '34': "?뱷 **CC ?ㅼ젙**???낅젰?섏꽭??(?? 0.70 ?먮뒗 0.70,14)\n- ?뺤떇: ?꾧퀎媛??먮뒗 ?꾧퀎媛?湲곌컙\n- ??쓣?섎줉 誘쇨컧, ?믪쓣?섎줉 媛뺥븳 異붿꽭留?泥?궛.",
-            '35': "?뱷 **Dual Mode 蹂寃?* (1=Standard, 2=Scalping)",
+            '1': "📝 **레버리지** 값을 입력하세요 (1~5, 예: 5)",
+            '2': "📝 **목표 ROE(%)** 값을 입력하세요 (예: 20)",
+            '3': "📝 **손절 비율(%)** 값을 입력하세요 (예: 5)",
+            '4': "📝 **진입 타임프레임** 입력 (예: 15m)\n1m,2m,3m,5m,15m,30m | 1h,2h,4h | 1d",
+            '41': "📝 **청산 타임프레임** 입력 (예: 1h)\n1m,2m,3m,5m,15m,30m | 1h,2h,4h | 1d",
+            '5': "📝 **일일 손실 제한($)** 입력 (예: 1000)",
+            '6': "📝 **진입 비율(%)** 입력 (예: 50)",
+            '7': "↕️ **매매 방향** 선택 (양방향/롱만/숏만)",
+            '8': "💱 **심볼** 입력 또는 선택\n1: BTC  2: ETH  3: SOL\n또는 직접 입력 (예: DOGE, XRP, PEPE)",
+            '9': "▶️ 매매 시작/중지를 바꾸려면 1 또는 0 입력",
+            '10': "📝 **SMA 기간** 입력 (형식: fast,slow 예: 2,10)",
+            '11': "📝 **자산 비율(%)** 입력 (예: 50)",
+            '12': "📝 **Grid 설정** 입력 (예: on,200 또는 off)",
+            '14': "📝 **N Days** 입력 (예: 4)",
+            '15': "📝 **K1/K2** 입력 (예: 0.5,0.5)",
+            '16': "📝 **전략 선택** (1=SMA, 2=HMA)",
+            '17': "📝 **HMA 기간** 입력 (예: 9,21)",
+            '18': "📝 **진입 모드** 선택 (1=Cross, 2=Position)",
+            '20': "📝 **VBO 설정** (legacy) 입력",
+            '21': "📝 **FractalFisher 설정** (legacy) 입력",
+            '22': "📝 **네트워크 선택** (1=테스트넷, 2=메인넷)",
+            '23': "📝 **거래량 급등 채굴 기능** (1=ON, 0=OFF)",
+            '24': "📝 **채굴 진입 타임프레임** 입력 (예: 5m)\n1m, 5m, 15m, 30m, 1h",
+            '25': "📝 **채굴 청산 타임프레임** 입력 (예: 1h)\n1m, 5m, 15m, 30m, 1h, 4h",
+            '26': "📝 **R2 필터** 메뉴로 이동합니다.",
+            '27': "📝 **R2 기준값** 입력 (0.1 ~ 0.5 권장)",
+            '28': "📝 **Hurst 필터** 메뉴로 이동합니다.",
+            '29': "📝 **Hurst 기준값** 입력 (예: 0.55)",
+            '30': "📝 **CHOP 필터** 메뉴로 이동합니다.",
+            '31': "📝 **CHOP 기준값** 입력 (예: 50.0)",
+            '33': "📝 **CC Exit 필터**를 ON/OFF 합니다.",
+            '34': "📝 **CC 설정** 입력 (예: 0.70 또는 0.70,14)",
+            '35': "📝 **Dual Mode 변경** (1=Standard, 2=Scalping)",
         }
         if text == '7':
             keyboard = [
-                [KeyboardButton("?묐갑??(Long+Short)")],
-                [KeyboardButton("濡깅쭔 (Long Only)")],
-                [KeyboardButton("?뤿쭔 (Short Only)")]
+                [KeyboardButton("양방향 (Long+Short)")],
+                [KeyboardButton("롱만 (Long Only)")],
+                [KeyboardButton("숏만 (Short Only)")]
             ]
             await update.message.reply_text(
-                "?뱷 **留ㅻℓ 諛⑺뼢** ?좏깮:",
+                "📝 **매매 방향** 선택:",
                 reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
                 parse_mode=ParseMode.MARKDOWN
             )
             return DIRECTION_SELECT
         elif text == '00':
             msg = """
-?? **?붿쭊 援먯껜**
-?ъ슜???붿쭊 踰덊샇瑜??좏깮?섏꽭??
+🔀 **엔진 교체**
 
-1. ?뱻 **Signal Engine**
-   - ?꾨왂 湲곕컲 (SMA, HMA, VBO ??
-   - ?ㅼ뼇???뚰듃肄붿씤 吏??
+현재 코어 모드에서는 아래만 사용합니다.
 
-2. ?뽳툘 **Shannon Engine**
-   - ?먯궛 諛곕텇 & 由щ갭?곗떛
-   - 蹂?숈꽦 ?쒖슜 (Grid Trading)
-
-3. ?뮙 **Dual Thrust Engine**
-   - 蹂?숈꽦 ?뚰뙆 ?꾨왂
-   - 異붿꽭 異붿쥌
-
-4. ?쏉툘 **Dual Mode Engine**
-   - Fractal Choppiness + Kalman
-   - Scalping / Standard 紐⑤뱶
-
-5. ?뙥截?**TEMA Engine**
-   - RSI + TEMA + Bollinger Strategy
-   - 鍮좊Ⅸ 諛섏쓳 ?띾룄 (怨듯넻 ?ㅼ젙 怨듭쑀)
+1. **Signal Engine**
 """
             await update.message.reply_text(msg.strip(), parse_mode=ParseMode.MARKDOWN)
             return ENGINE_SELECT
@@ -3845,7 +3825,7 @@ class MainController:
             new_val = not current
             await self.cfg.update_value(['signal_engine', 'common_settings', 'tp_sl_enabled'], new_val)
             status = "ON" if new_val else "OFF"
-            await update.message.reply_text(f"??TP/SL ?먮룞泥?궛: {status}")
+            await update.message.reply_text(f"✅ TP/SL 자동청산: {status}")
             await self.show_setup_menu(update)
             return SELECT
         elif text == '42':
@@ -3854,14 +3834,14 @@ class MainController:
             new_val = not curr
             await self.cfg.update_value(['telegram', 'reporting', 'hourly_report_enabled'], new_val)
             status = "ON" if new_val else "OFF"
-            await update.message.reply_text(f"?숋툘 ?쒓컙蹂?由ы룷?? {status}")
+            await update.message.reply_text(f"⚙️ 시간별 리포트: {status}")
             await self.show_setup_menu(update)
             return SELECT
         elif text == '26':
             # R2 Filter Menu
             keyboard = [[KeyboardButton("1. Entry Toggle"), KeyboardButton("2. Exit Toggle")]]
             await update.message.reply_text(
-                "?뱣 **R2 ?꾪꽣 ?ㅼ젙**:\n1. Entry ?꾪꽣 ?좉?\n2. Exit ?꾪꽣 ?좉?",
+                "📉 **R2 필터 설정**\n1. Entry 토글\n2. Exit 토글",
                 reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
             )
             return "R2_SELECT"
@@ -3870,7 +3850,7 @@ class MainController:
             # Hurst Filter Menu
             keyboard = [[KeyboardButton("1. Entry Toggle"), KeyboardButton("2. Exit Toggle")]]
             await update.message.reply_text(
-                "?뙄 **Hurst ?꾪꽣 ?ㅼ젙**:\n1. Entry ?꾪꽣 ?좉?\n2. Exit ?꾪꽣 ?좉?",
+                "🌊 **Hurst 필터 설정**\n1. Entry 토글\n2. Exit 토글",
                 reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
             )
             return "HURST_SELECT"
@@ -3879,7 +3859,7 @@ class MainController:
             # Chop Filter Menu
             keyboard = [[KeyboardButton("1. Entry Toggle"), KeyboardButton("2. Exit Toggle")]]
             await update.message.reply_text(
-                "?? **Chop ?꾪꽣 ?ㅼ젙**:\n1. Entry ?꾪꽣 ?좉?\n2. Exit ?꾪꽣 ?좉?",
+                "🌀 **CHOP 필터 설정**\n1. Entry 토글\n2. Exit 토글",
                 reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
             )
             return "CHOP_SELECT"
@@ -3888,7 +3868,7 @@ class MainController:
             # Kalman Filter Menu
             keyboard = [[KeyboardButton("1. Entry Toggle"), KeyboardButton("2. Exit Toggle")]]
             await update.message.reply_text(
-                "?? **Kalman ?꾪꽣 ?ㅼ젙**:\n1. Entry ?꾪꽣 ?좉?\n2. Exit ?꾪꽣 ?좉?",
+                "🚀 **Kalman 필터 설정**\n1. Entry 토글\n2. Exit 토글",
                 reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
             )
             return "KALMAN_SELECT"
@@ -3901,7 +3881,7 @@ class MainController:
             new_val = not curr
             await self.cfg.update_value(['signal_engine', 'common_settings', 'cc_exit_enabled'], new_val)
             status = "ON" if new_val else "OFF"
-            await update.message.reply_text(f"??CC ?꾪꽣 (Exit): {status}")
+            await update.message.reply_text(f"✅ CC 필터 (Exit): {status}")
             await self.show_setup_menu(update)
             return SELECT
             
@@ -3923,11 +3903,11 @@ class MainController:
                 return SYMBOL_INPUT
             return INPUT
         else:
-            await update.message.reply_text("???섎せ??踰덊샇?낅땲??")
+            await update.message.reply_text("❌ 잘못된 번호입니다.")
             return SELECT
 
     async def handle_manual_symbol_input(self, update: Update, symbol: str):
-        """[New] ?붾젅洹몃옩 ?섎룞 ?щ낵 ?낅젰 泥섎━"""
+        """Telegram manual symbol input handler."""
         try:
             # ?щ낵 ?щ㎎??(BTC -> BTC/USDT)
             if '/' not in symbol:
@@ -3937,35 +3917,35 @@ class MainController:
             # SignalEngine???쒖꽦?붾릺???덉뼱????
             eng_type = self.cfg.get('system_settings', {}).get('active_engine', CORE_ENGINE)
             if eng_type != 'signal':
-                await update.message.reply_text("?좑툘 ?꾩옱 Signal ?붿쭊???쒖꽦?붾릺???덉? ?딆뒿?덈떎. (/strat 1)")
+                await update.message.reply_text("⚠️ 현재 Signal 엔진이 활성화되어 있지 않습니다. (`/strat 1`)")
                 return
 
             signal_engine = self.engines.get('signal')
             if not signal_engine:
-                await update.message.reply_text("??Signal ?붿쭊??李얠쓣 ???놁뒿?덈떎.")
+                await update.message.reply_text("❌ Signal 엔진을 찾을 수 없습니다.")
                 return
 
             # ?щ낵 寃利?(exchange load_markets ?꾩슂?????덉쓬, ?ш린??try fetch ticker濡??泥?
             try:
                 await asyncio.to_thread(self.exchange.fetch_ticker, symbol)
             except Exception:
-                await update.message.reply_text(f"???좏슚?섏? ?딆? ?щ낵?낅땲?? {symbol}")
+                await update.message.reply_text(f"❌ 유효하지 않은 심볼입니다: `{symbol}`", parse_mode=ParseMode.MARKDOWN)
                 return
 
             # Active Symbols??異붽?
             if symbol not in signal_engine.active_symbols:
                 signal_engine.active_symbols.add(symbol)
-                await update.message.reply_text(f"??**{symbol}** 媛먯떆 ?쒖옉! (?섎룞 ?낅젰)")
+                await update.message.reply_text(f"✅ **{symbol}** 감시 시작 (수동 추가)", parse_mode=ParseMode.MARKDOWN)
                 logger.info(f"Manual symbol added: {symbol}")
                 
                 # 利됱떆 ?대쭅 ?몃━嫄?(?좏깮 ?ы빆)
                 # await signal_engine.poll_symbol(symbol) 
             else:
-                await update.message.reply_text(f"?뱄툘 ?대? 媛먯떆 以묒씤 ?щ낵?낅땲?? {symbol}")
+                await update.message.reply_text(f"ℹ️ 이미 감시 중인 심볼입니다: `{symbol}`", parse_mode=ParseMode.MARKDOWN)
 
         except Exception as e:
             logger.error(f"Manual input error: {e}")
-            await update.message.reply_text(f"??泥섎━ ?ㅽ뙣: {e}")
+            await update.message.reply_text(f"❌ 처리 실패: {e}")
 
     async def setup_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         choice = context.user_data.get('setup_choice')
@@ -4511,175 +4491,152 @@ class MainController:
         if text in mode_map:
             mode = mode_map[text]
             if mode == 'dualmode' and not DUAL_MODE_AVAILABLE:
-                await update.message.reply_text("??DualMode 愿??紐⑤뱢???놁뼱 ?ъ슜?????놁뒿?덈떎.")
+                await update.message.reply_text("❌ DualMode 관련 모듈이 없어 사용할 수 없습니다.")
             else:
                 await self.cfg.update_value(['system_settings', 'active_engine'], mode)
                 await self._switch_engine(mode)
                 self.dashboard_msg_id = None
-                await update.message.reply_text(f"???붿쭊 蹂寃??꾨즺: {mode.upper()}")
+                await update.message.reply_text(f"✅ 엔진 변경 완료: {mode.upper()}")
         else:
-            await update.message.reply_text("?뱄툘 Core 紐⑤뱶?먯꽌??1(Signal)留??ъ슜?⑸땲??")
+            await update.message.reply_text("ℹ️ 코어 모드에서는 `1 (Signal)`만 사용 가능합니다.", parse_mode=ParseMode.MARKDOWN)
         
         await self._restore_main_keyboard(update)
         await self.show_setup_menu(update)
         return SELECT
 
-    async def _restore_main_keyboard(self, update: Update):
-        """硫붿씤 ?ㅻ낫??蹂듭썝"""
+    def _build_main_keyboard(self):
         kb = [
-            [KeyboardButton("?슚 STOP"), KeyboardButton("??PAUSE"), KeyboardButton("??RESUME")],
-            [KeyboardButton("/setup"), KeyboardButton("/status"), KeyboardButton("/log")]
+            [KeyboardButton("🚨 STOP"), KeyboardButton("⏸ PAUSE"), KeyboardButton("▶ RESUME")],
+            [KeyboardButton("/setup"), KeyboardButton("/status"), KeyboardButton("/log"), KeyboardButton("/help")]
         ]
-        markup = ReplyKeyboardMarkup(kb, resize_keyboard=True)
-        await update.message.reply_text("?벑 硫붿씤 硫붾돱", reply_markup=markup)
+        return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+    async def _restore_main_keyboard(self, update: Update):
+        """Restore the main keyboard."""
+        await update.message.reply_text("📱 메인 메뉴", reply_markup=self._build_main_keyboard())
 
     async def _setup_telegram(self):
-        kb = [
-            [KeyboardButton("?슚 STOP"), KeyboardButton("??PAUSE"), KeyboardButton("??RESUME")],
-            [KeyboardButton("/setup"), KeyboardButton("/status"), KeyboardButton("/log")]
-        ]
-        markup = ReplyKeyboardMarkup(kb, resize_keyboard=True)
-
-        cid = self.cfg.get_chat_id()
-        if cid:
-            authorized_chat_filter = filters.Chat(chat_id=cid)
-        else:
-            logger.error("Invalid chat_id. Telegram handlers will ignore incoming messages.")
-            authorized_chat_filter = filters.Chat(chat_id=-1)
-
-        authorized_text_filter = filters.TEXT & ~filters.COMMAND & authorized_chat_filter
+        markup = self._build_main_keyboard()
+        text_filter = filters.TEXT & ~filters.COMMAND
 
         async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-            await u.message.reply_text("?쨼 遊?以鍮??꾨즺", reply_markup=markup)
+            # Re-bind chat_id to the current chat to avoid stale configuration lockout.
+            incoming_chat_id = u.effective_chat.id if u.effective_chat else 0
+            configured_chat_id = self.cfg.get_chat_id()
+            if incoming_chat_id and configured_chat_id != incoming_chat_id:
+                await self.cfg.update_value(['telegram', 'chat_id'], incoming_chat_id)
+                logger.info(f"Telegram chat_id updated: {incoming_chat_id}")
+            await u.message.reply_text("🤖 봇 준비 완료", reply_markup=markup)
 
         async def strat_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             if not c.args:
-                await u.message.reply_text("?ъ슜踰? /strat 踰덊샇\n1: Signal")
+                await u.message.reply_text("사용법: /strat 번호\n1: Signal")
                 return
             mode_map = {'1': CORE_ENGINE}
             arg = c.args[0]
             if arg not in mode_map:
-                await u.message.reply_text("???섎せ???낅젰. 1(Signal)留??ъ슜 媛?ν빀?덈떎.")
+                await u.message.reply_text("잘못된 입력입니다. 현재는 `1 (Signal)`만 사용 가능합니다.", parse_mode=ParseMode.MARKDOWN)
                 return
             mode = mode_map[arg]
-            if mode == 'dualmode' and not DUAL_MODE_AVAILABLE:
-                await u.message.reply_text("??DualMode 愿??紐⑤뱢???놁뼱 ?ъ슜?????놁뒿?덈떎.")
-                return
             await self.cfg.update_value(['system_settings', 'active_engine'], mode)
             await self._switch_engine(mode)
             self.dashboard_msg_id = None
-            await u.message.reply_text(f"???꾨왂 蹂寃? {mode.upper()}")
+            await u.message.reply_text(f"✅ 전략 변경: {mode.upper()}")
 
         async def log_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             logs = list(log_buffer)[-15:]
             if logs:
                 await u.message.reply_text("\n".join(logs))
             else:
-                await u.message.reply_text("?뱷 濡쒓렇媛 鍮꾩뼱?덉뒿?덈떎.")
+                await u.message.reply_text("📝 최근 로그가 없습니다.")
 
         async def close_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await self.emergency_stop()
-            await u.message.reply_text("?썞 湲닿툒 ?뺤? ?꾨즺")
+            await u.message.reply_text("🚨 긴급 정지 완료")
 
         async def stats_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-            """?듦퀎 紐낅졊??"""
             daily_count, daily_pnl = self.db.get_daily_stats()
             weekly_count, weekly_pnl = self.db.get_weekly_stats()
-            
             msg = f"""
-?뱤 **留ㅻℓ ?듦퀎**
+📊 **매매 통계**
 
-**?ㅻ뒛**
-- 嫄곕옒: {daily_count}嫄?
-- ?먯씡: ${daily_pnl:+.2f}
+**오늘**
+- 거래: {daily_count}건
+- 손익: ${daily_pnl:+.2f}
 
-**7?쇨컙**
-- 嫄곕옒: {weekly_count}嫄?
-- ?먯씡: ${weekly_pnl:+.2f}
+**7일**
+- 거래: {weekly_count}건
+- 손익: ${weekly_pnl:+.2f}
 """
             await u.message.reply_text(msg.strip(), parse_mode=ParseMode.MARKDOWN)
 
         async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             msg = """
-?뱴 **紐낅졊??紐⑸줉**
+📚 **명령어**
 
-?뵩 **?ㅼ젙**
-/setup - ?ㅼ젙 硫붾돱
-/strat 1 - Signal ?꾨왂
+/start - 메인 메뉴 표시
+/setup - 설정 메뉴
+/status - 대시보드 갱신
+/stats - 통계
+/log - 최근 로그
+/close - 긴급 청산
 
-?뱤 **?뺣낫**
-/status - ??쒕낫??媛깆떊
-/stats - 留ㅻℓ ?듦퀎
-/log - 理쒓렐 濡쒓렇
-
-?슚 **?쒖뼱**
-/close - 湲닿툒 泥?궛
-?슚 STOP - 湲닿툒 ?뺤?
-??PAUSE - ?쇱떆?뺤?
-??RESUME - ?ш컻
+🚨 STOP - 긴급 정지
+⏸ PAUSE - 일시정지
+▶ RESUME - 재개
 """
             await u.message.reply_text(msg.strip(), parse_mode=ParseMode.MARKDOWN)
 
-        # 鍮꾩긽 踰꾪듉 ?몃뱾??(理쒖슦??
-        emergency_handler = MessageHandler(
-            filters.Regex("STOP|PAUSE|RESUME|/status") & authorized_chat_filter,
-            self.global_handler
-        )
+        emergency_handler = MessageHandler(filters.Regex("STOP|PAUSE|RESUME|/status"), self.global_handler)
         self.tg_app.add_handler(emergency_handler, group=-1)
-        
-        # /start 紐낅졊???몃뱾??異붽?
-        self.tg_app.add_handler(CommandHandler("start", start_cmd, filters=authorized_chat_filter))
-        self.tg_app.add_handler(CommandHandler("strat", strat_cmd, filters=authorized_chat_filter))
-        self.tg_app.add_handler(CommandHandler("log", log_cmd, filters=authorized_chat_filter))
-        self.tg_app.add_handler(CommandHandler("close", close_cmd, filters=authorized_chat_filter))
-        self.tg_app.add_handler(CommandHandler("stats", stats_cmd, filters=authorized_chat_filter))
-        self.tg_app.add_handler(CommandHandler("help", help_cmd, filters=authorized_chat_filter))
 
-        # ?ㅼ젙 ????몃뱾??
+        self.tg_app.add_handler(CommandHandler("start", start_cmd))
+        self.tg_app.add_handler(CommandHandler("strat", strat_cmd))
+        self.tg_app.add_handler(CommandHandler("log", log_cmd))
+        self.tg_app.add_handler(CommandHandler("close", close_cmd))
+        self.tg_app.add_handler(CommandHandler("stats", stats_cmd))
+        self.tg_app.add_handler(CommandHandler("help", help_cmd))
+
         conv = ConversationHandler(
-            entry_points=[CommandHandler('setup', self.setup_entry, filters=authorized_chat_filter)],
+            entry_points=[CommandHandler('setup', self.setup_entry)],
             states={
-                SELECT: [MessageHandler(authorized_text_filter, self.setup_select)],
-                INPUT: [MessageHandler(authorized_text_filter, self.setup_input)],
-                SYMBOL_INPUT: [MessageHandler(authorized_text_filter, self.setup_symbol_input)],
-                DIRECTION_SELECT: [MessageHandler(authorized_text_filter, self.setup_direction_select)],
-                ENGINE_SELECT: [MessageHandler(authorized_text_filter, self.setup_engine_select)],
-                "R2_SELECT": [MessageHandler(authorized_text_filter, self.setup_r2_select)],
-                "HURST_SELECT": [MessageHandler(authorized_text_filter, self.setup_hurst_select)],
-                "CHOP_SELECT": [MessageHandler(authorized_text_filter, self.setup_chop_select)],
-                "KALMAN_SELECT": [MessageHandler(authorized_text_filter, self.setup_kalman_select)]
+                SELECT: [MessageHandler(text_filter, self.setup_select)],
+                INPUT: [MessageHandler(text_filter, self.setup_input)],
+                SYMBOL_INPUT: [MessageHandler(text_filter, self.setup_symbol_input)],
+                DIRECTION_SELECT: [MessageHandler(text_filter, self.setup_direction_select)],
+                ENGINE_SELECT: [MessageHandler(text_filter, self.setup_engine_select)],
+                "R2_SELECT": [MessageHandler(text_filter, self.setup_r2_select)],
+                "HURST_SELECT": [MessageHandler(text_filter, self.setup_hurst_select)],
+                "CHOP_SELECT": [MessageHandler(text_filter, self.setup_chop_select)],
+                "KALMAN_SELECT": [MessageHandler(text_filter, self.setup_kalman_select)]
             },
             fallbacks=[
-                CommandHandler('setup', self.setup_entry, filters=authorized_chat_filter),
+                CommandHandler('setup', self.setup_entry),
                 emergency_handler
             ]
         )
-        
+
         self.tg_app.add_handler(conv)
-        
-        # [New] ?섎룞 ?щ낵 ?낅젰 ?몃뱾??(?ㅼ젙 紐⑤뱶媛 ?꾨땺 ???숈옉)
+
         async def manual_symbol_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             text = u.message.text.strip().upper()
-            # 媛꾨떒???뺢퇋?앹쑝濡??щ낵 ?뺥깭?몄? ?뺤씤 (?뚰뙆踰?2~5湲???먮뒗 XXX/YYY ?뺤떇)
-            import re
             if re.match(r'^[A-Z0-9]{2,10}(/[A-Z0-9]{2,10})?(:[A-Z0-9]+)?$', text):
-                # /setup ??而ㅻ㎤?쒕뒗 ?쒖쇅
-                if text.startswith('/'): return
-                
+                if text.startswith('/'):
+                    return
                 await self.handle_manual_symbol_input(u, text)
 
-        self.tg_app.add_handler(MessageHandler(authorized_text_filter, manual_symbol_handler))
+        self.tg_app.add_handler(MessageHandler(text_filter, manual_symbol_handler))
 
     async def setup_r2_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text
         if "1" in text:
             curr = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('r2_entry_enabled', True)
             await self.cfg.update_value(['signal_engine', 'common_settings', 'r2_entry_enabled'], not curr)
-            await update.message.reply_text(f"??R2 Entry: {'ON' if not curr else 'OFF'}")
+            await update.message.reply_text(f"✅ R2 Entry: {'ON' if not curr else 'OFF'}")
         elif "2" in text:
             curr = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('r2_exit_enabled', True)
             await self.cfg.update_value(['signal_engine', 'common_settings', 'r2_exit_enabled'], not curr)
-            await update.message.reply_text(f"??R2 Exit: {'ON' if not curr else 'OFF'}")
+            await update.message.reply_text(f"✅ R2 Exit: {'ON' if not curr else 'OFF'}")
         
         await self._restore_main_keyboard(update)
         await self.show_setup_menu(update)
@@ -4690,11 +4647,11 @@ class MainController:
         if "1" in text:
             curr = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('hurst_entry_enabled', True)
             await self.cfg.update_value(['signal_engine', 'common_settings', 'hurst_entry_enabled'], not curr)
-            await update.message.reply_text(f"??Hurst Entry: {'ON' if not curr else 'OFF'}")
+            await update.message.reply_text(f"✅ Hurst Entry: {'ON' if not curr else 'OFF'}")
         elif "2" in text:
             curr = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('hurst_exit_enabled', True)
             await self.cfg.update_value(['signal_engine', 'common_settings', 'hurst_exit_enabled'], not curr)
-            await update.message.reply_text(f"??Hurst Exit: {'ON' if not curr else 'OFF'}")
+            await update.message.reply_text(f"✅ Hurst Exit: {'ON' if not curr else 'OFF'}")
         
         await self._restore_main_keyboard(update)
         await self.show_setup_menu(update)
@@ -4705,11 +4662,11 @@ class MainController:
         if "1" in text:
             curr = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('chop_entry_enabled', True)
             await self.cfg.update_value(['signal_engine', 'common_settings', 'chop_entry_enabled'], not curr)
-            await update.message.reply_text(f"??Chop Entry: {'ON' if not curr else 'OFF'}")
+            await update.message.reply_text(f"✅ CHOP Entry: {'ON' if not curr else 'OFF'}")
         elif "2" in text:
             curr = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('chop_exit_enabled', True)
             await self.cfg.update_value(['signal_engine', 'common_settings', 'chop_exit_enabled'], not curr)
-            await update.message.reply_text(f"??Chop Exit: {'ON' if not curr else 'OFF'}")
+            await update.message.reply_text(f"✅ CHOP Exit: {'ON' if not curr else 'OFF'}")
         
         await self._restore_main_keyboard(update)
         await self.show_setup_menu(update)
@@ -4720,11 +4677,11 @@ class MainController:
         if "1" in text:
             curr = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('kalman_filter', {}).get('entry_enabled', False)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'kalman_filter', 'entry_enabled'], not curr)
-            await update.message.reply_text(f"??Kalman Entry: {'ON' if not curr else 'OFF'}")
+            await update.message.reply_text(f"✅ Kalman Entry: {'ON' if not curr else 'OFF'}")
         elif "2" in text:
             curr = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('kalman_filter', {}).get('exit_enabled', False)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'kalman_filter', 'exit_enabled'], not curr)
-            await update.message.reply_text(f"??Kalman Exit: {'ON' if not curr else 'OFF'}")
+            await update.message.reply_text(f"✅ Kalman Exit: {'ON' if not curr else 'OFF'}")
             
         await self._restore_main_keyboard(update)
         await self.show_setup_menu(update)
