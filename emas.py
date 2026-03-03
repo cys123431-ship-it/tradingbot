@@ -2135,21 +2135,18 @@ class SignalEngine(BaseEngine):
                 await self.ctrl.notify(f"⚠️ 잔고 부족: ${free:.2f}")
                 return
             
-            # Risk-based sizing: cap by (a) risk budget at configured stop distance and (b) max margin notional.
-            stop_loss_pct = max(float(cfg.get('stop_loss_pct', 10.0) or 10.0), 0.1)
-            stop_move_pct = (stop_loss_pct / 100.0) / lev
-            risk_budget = free * risk_pct
-            max_notional = free * lev
-            if stop_move_pct > 0:
-                notional_by_risk = risk_budget / stop_move_pct
-            else:
-                notional_by_risk = max_notional
-            target_notional = min(notional_by_risk, max_notional)
+            # Position sizing (user-friendly):
+            # 1) Use configured % of current free USDT as margin.
+            # 2) Apply leverage to that margin to get position notional.
+            # 3) Keep a small safety buffer to avoid -2019 by fees/slippage.
+            margin_to_use = free * risk_pct
+            safety_buffer = 0.98
+            target_notional = margin_to_use * lev * safety_buffer
 
             qty = self.safe_amount(symbol, target_notional / price)
             
             if float(qty) <= 0:
-                logger.warning(f"Invalid quantity: {qty} (free={free}, risk={risk_pct}, lev={lev}, price={price})")
+                logger.warning(f"Invalid quantity: {qty} (free={free}, risk={risk_pct}, lev={lev}, price={price}, target_notional={target_notional})")
                 await self.ctrl.notify(f"⚠️ 주문 수량 계산 오류: {qty} (잔고: {free:.2f})")
                 return
             
@@ -2157,7 +2154,7 @@ class SignalEngine(BaseEngine):
                 await self.ctrl.notify(f"⚠️ 리스크 상한 적용: {req_risk_pct:.1f}% -> {bounded_risk_pct:.1f}%")
             logger.info(
                 f"Entry params: qty={qty}, lev={lev}x, risk={bounded_risk_pct:.1f}% "
-                f"(risk_budget={risk_budget:.2f}, max_notional={max_notional:.2f}, target_notional={target_notional:.2f})"
+                f"(free={free:.2f}, margin_to_use={margin_to_use:.2f}, target_notional={target_notional:.2f}, safety={safety_buffer:.2f})"
             )
             
             # [Enforce] Market Settings (Isolated + Leverage)
