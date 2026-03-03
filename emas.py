@@ -572,17 +572,32 @@ class BaseEngine:
         else:
             status_rows = [v for v in status_data.values() if isinstance(v, dict)]
 
+        active_symbols_on_exchange = set()
+        try:
+            positions = await asyncio.to_thread(self.exchange.fetch_positions)
+            for p in positions:
+                if abs(float(p.get('contracts', 0) or 0)) > 0:
+                    sym = str(p.get('symbol', '')).replace(':USDT', '')
+                    if sym:
+                        active_symbols_on_exchange.add(sym)
+        except Exception as e:
+            logger.warning(f"Daily loss check: fetch_positions failed, using status cache only ({e})")
+
         for row in status_rows:
-            unrealized_pnl += float(row.get('pnl_usdt', 0) or 0)
             pos_side = str(row.get('pos_side', 'NONE')).upper()
             symbol = row.get('symbol')
             if symbol and pos_side != 'NONE':
+                norm_symbol = str(symbol).replace(':USDT', '')
+                if active_symbols_on_exchange and norm_symbol not in active_symbols_on_exchange:
+                    continue
+                unrealized_pnl += float(row.get('pnl_usdt', 0) or 0)
                 open_symbols.append(symbol)
 
         total_daily_pnl = daily_pnl + unrealized_pnl
         total_equity = 0.0
         if status_rows:
-            total_equity = float(status_rows[0].get('total_equity', 0) or 0)
+            equities = [float(r.get('total_equity', 0) or 0) for r in status_rows]
+            total_equity = max(equities) if equities else 0.0
         if total_equity <= 0:
             total_equity, _, _ = await self.get_balance_info()
         
@@ -595,12 +610,13 @@ class BaseEngine:
             limit_abs = float(sig_cfg.get('daily_loss_limit', 5000) or 5000)
             limit_pct = float(sig_cfg.get('daily_loss_limit_pct', 0) or 0)
 
-        limits = []
+        # Telegram setup currently exposes absolute daily limit, so prioritize absolute limit.
         if limit_abs > 0:
-            limits.append(limit_abs)
-        if limit_pct > 0 and total_equity > 0:
-            limits.append(total_equity * (limit_pct / 100.0))
-        effective_limit = min(limits) if limits else 5000.0
+            effective_limit = limit_abs
+        elif limit_pct > 0 and total_equity > 0:
+            effective_limit = total_equity * (limit_pct / 100.0)
+        else:
+            effective_limit = 5000.0
 
         if total_daily_pnl < -effective_limit:
             logger.warning(
@@ -1670,18 +1686,24 @@ class SignalEngine(BaseEngine):
             # 3. CHOP Check
             can_exit_by_chop = not chop_exit_enabled or (curr_chop <= chop_thresh)
             if chop_exit_enabled and not can_exit_by_chop:
+                can_exit = False
                 block_reasons.append(f"Chop({curr_chop:.1f})>{chop_thresh}")
             
             # 4. CC Check (Correlation)
             cc_exit_enabled = common_cfg.get('cc_exit_enabled', False)
             cc_thresh = common_cfg.get('cc_threshold', 0.70)
             curr_cc = st.get('cc_val', 0.0)
-            can_exit_by_cc = False
+            can_exit_by_cc = (not cc_exit_enabled)
             if cc_exit_enabled:
-                if current_side.lower() == 'long' and curr_cc < -cc_thresh:
-                    can_exit_by_cc = True
-                elif current_side.lower() == 'short' and curr_cc > cc_thresh:
-                    can_exit_by_cc = True
+                if current_side.lower() == 'long':
+                    can_exit_by_cc = curr_cc < -cc_thresh
+                elif current_side.lower() == 'short':
+                    can_exit_by_cc = curr_cc > cc_thresh
+                else:
+                    can_exit_by_cc = False
+                if not can_exit_by_cc:
+                    can_exit = False
+                    block_reasons.append(f"CC({curr_cc:.2f}) fail")
             
             # [New] Update Pass/Fail Status based on logic above
             st['kalman_pass'] = (not kalman_exit_enabled) or \
@@ -1692,34 +1714,26 @@ class SignalEngine(BaseEngine):
             
             
             # ===== 5. Execute Exit =====
-            # Use specific logic for Position Strategy as requested by user
-            # Rule: Long Exit -> Bearish Alignment AND Chop Green
-            #       Short Exit -> Bullish Alignment AND Chop Green
-
-            # CC is an ALTERNATIVE to Chop (OR logic)
-            # Re-confirm CC pass status for specific side
-            cc_pass = can_exit_by_cc
+            # Enabled exit filters are all mandatory. If one fails, exit is blocked.
 
             if current_side.lower() == 'long':
                 if c_f < c_s: # Bearish Alignment (Signal)
-                    if can_exit and (can_exit_by_chop or can_exit_by_cc):
-                        reason = "Chop Green" if can_exit_by_chop else "CC Trend"
-                        logger.info(f"?뵒 [Exit {tf}] LONG Exit Triggered: Bearish Alignment AND {reason} (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
+                    if can_exit:
+                        logger.info(f"?뵒 [Exit {tf}] LONG Exit Triggered (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
                         await self.exit_position(symbol, f"{strategy_name}_Exit_L")
                     else:
-                        why = ", ".join(block_reasons) if block_reasons else "Chop/CC blocked"
+                        why = ", ".join(block_reasons) if block_reasons else "Filter blocked"
                         logger.info(f"?썳截?[Exit {tf}] LONG Exit Blocked: {why} (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
                 else:
                     logger.debug(f"??[Exit {tf}] LONG Exit Ignored: Still Bullish Alignment (Fast {c_f:.2f} > Slow {c_s:.2f})")
             
             elif current_side.lower() == 'short':
                 if c_f > c_s: # Bullish Alignment (Signal)
-                    if can_exit and (can_exit_by_chop or can_exit_by_cc):
-                        reason = "Chop Green" if can_exit_by_chop else "CC Trend"
-                        logger.info(f"?뵒 [Exit {tf}] SHORT Exit Triggered: Bullish Alignment AND {reason} (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
+                    if can_exit:
+                        logger.info(f"?뵒 [Exit {tf}] SHORT Exit Triggered (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
                         await self.exit_position(symbol, f"{strategy_name}_Exit_S")
                     else:
-                        why = ", ".join(block_reasons) if block_reasons else "Chop/CC blocked"
+                        why = ", ".join(block_reasons) if block_reasons else "Filter blocked"
                         logger.info(f"?썳截?[Exit {tf}] SHORT Exit Blocked: {why} (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
                 else:
                     logger.debug(f"??[Exit {tf}] SHORT Exit Ignored: Still Bearish Alignment (Fast {c_f:.2f} < Slow {c_s:.2f})")
@@ -3779,8 +3793,8 @@ class MainController:
 
 **공통**
 1. 레버리지 (`{lev}x`)
-2. 목표 ROE (`{sig_common.get('target_roe_pct', 20)}%`)
-3. 손절 (`{sig_common.get('stop_loss_pct', 10)}%`)
+2. 목표 ROE (`{sig_common.get('target_roe_pct', 20)}%` / `{tp_status}`)
+3. 손절 (`{sig_common.get('stop_loss_pct', 10)}%` / `{sl_status}`)
 4. 진입 타임프레임 (`{sig_common.get('timeframe', '15m')}`)
 41. 청산 타임프레임 (`{sig_common.get('exit_timeframe', '4h')}`)
 5. 일일 손실 제한 (`${sig_common.get('daily_loss_limit', 5000)}`)
@@ -3833,8 +3847,8 @@ class MainController:
         
         prompts = {
             '1': "📝 **레버리지** 값을 입력하세요 (1~20, 예: 5)",
-            '2': "📝 **목표 ROE(%)** 값을 입력하세요 (예: 20)",
-            '3': "📝 **손절 비율(%)** 값을 입력하세요 (예: 5)",
+            '2': "📝 **목표 ROE 설정**: 값(%) 또는 ON/OFF 입력 (예: 20, on, off)",
+            '3': "📝 **손절 설정**: 값(%) 또는 ON/OFF 입력 (예: 5, on, off)",
             '4': "📝 **진입 타임프레임** 입력 (예: 15m)\n1m,2m,3m,5m,15m,30m | 1h,2h,4h | 1d",
             '41': "📝 **청산 타임프레임** 입력 (예: 1h)\n1m,2m,3m,5m,15m,30m | 1h,2h,4h | 1d",
             '5': "📝 **일일 손실 제한($)** 입력 (예: 1000)",
@@ -4062,14 +4076,54 @@ class MainController:
                     await self.active_engine.ensure_market_settings(sym)
                 await update.message.reply_text(f"✅ 레버리지 변경: {v}x")
             elif choice == '2':
-                await self.cfg.update_value(['signal_engine', 'common_settings', 'target_roe_pct'], float(val))
-                await self.cfg.update_value(['dual_mode_engine', 'target_roe_pct'], float(val))
-                await self._sync_signal_protection_orders()
+                v_low = str(val).strip().lower()
+                common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+                if v_low in ('on', '1', 'true'):
+                    curr_sl = bool(common_cfg.get('stop_loss_enabled', common_cfg.get('tp_sl_enabled', True)))
+                    await self.cfg.update_value(['signal_engine', 'common_settings', 'take_profit_enabled'], True)
+                    await self.cfg.update_value(['signal_engine', 'common_settings', 'tp_sl_enabled'], bool(True or curr_sl))
+                    await self._sync_signal_protection_orders()
+                    await update.message.reply_text("✅ 목표 ROE 자동청산: ON")
+                elif v_low in ('off', '0', 'false'):
+                    curr_sl = bool(common_cfg.get('stop_loss_enabled', common_cfg.get('tp_sl_enabled', True)))
+                    await self.cfg.update_value(['signal_engine', 'common_settings', 'take_profit_enabled'], False)
+                    await self.cfg.update_value(['signal_engine', 'common_settings', 'tp_sl_enabled'], bool(False or curr_sl))
+                    await self._sync_signal_protection_orders()
+                    await update.message.reply_text("✅ 목표 ROE 자동청산: OFF")
+                else:
+                    v = float(val)
+                    if v < 0:
+                        await update.message.reply_text("❌ 목표 ROE는 0 이상으로 입력하세요.")
+                        return SELECT
+                    await self.cfg.update_value(['signal_engine', 'common_settings', 'target_roe_pct'], v)
+                    await self.cfg.update_value(['dual_mode_engine', 'target_roe_pct'], v)
+                    await self._sync_signal_protection_orders()
+                    await update.message.reply_text(f"✅ 목표 ROE 변경: {v}%")
             elif choice == '3':
-                await self.cfg.update_value(['signal_engine', 'common_settings', 'stop_loss_pct'], float(val))
-                await self.cfg.update_value(['dual_thrust_engine', 'stop_loss_pct'], float(val))
-                await self.cfg.update_value(['dual_mode_engine', 'stop_loss_pct'], float(val))
-                await self._sync_signal_protection_orders()
+                v_low = str(val).strip().lower()
+                common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+                if v_low in ('on', '1', 'true'):
+                    curr_tp = bool(common_cfg.get('take_profit_enabled', common_cfg.get('tp_sl_enabled', True)))
+                    await self.cfg.update_value(['signal_engine', 'common_settings', 'stop_loss_enabled'], True)
+                    await self.cfg.update_value(['signal_engine', 'common_settings', 'tp_sl_enabled'], bool(curr_tp or True))
+                    await self._sync_signal_protection_orders()
+                    await update.message.reply_text("✅ 손절 자동청산: ON")
+                elif v_low in ('off', '0', 'false'):
+                    curr_tp = bool(common_cfg.get('take_profit_enabled', common_cfg.get('tp_sl_enabled', True)))
+                    await self.cfg.update_value(['signal_engine', 'common_settings', 'stop_loss_enabled'], False)
+                    await self.cfg.update_value(['signal_engine', 'common_settings', 'tp_sl_enabled'], bool(curr_tp or False))
+                    await self._sync_signal_protection_orders()
+                    await update.message.reply_text("✅ 손절 자동청산: OFF")
+                else:
+                    v = float(val)
+                    if v < 0:
+                        await update.message.reply_text("❌ 손절 비율은 0 이상으로 입력하세요.")
+                        return SELECT
+                    await self.cfg.update_value(['signal_engine', 'common_settings', 'stop_loss_pct'], v)
+                    await self.cfg.update_value(['dual_thrust_engine', 'stop_loss_pct'], v)
+                    await self.cfg.update_value(['dual_mode_engine', 'stop_loss_pct'], v)
+                    await self._sync_signal_protection_orders()
+                    await update.message.reply_text(f"✅ 손절 비율 변경: {v}%")
             elif choice == '4':
                 # 타임프레임 유효성 검사
                 valid_tf = ['1m', '2m', '3m', '4m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
@@ -4433,7 +4487,7 @@ class MainController:
                 await update.message.reply_text(f"✅ 청산 타임프레임 변경: {val}")
             
             # 10~41 success message handled
-            if choice not in ['10', '11', '12', '14', '15', '16', '17', '18', '20', '21', '22', '23', '26', '27', '28', '30', '31', '33', '34', '35', '41']:
+            if choice not in ['2', '3', '10', '11', '12', '14', '15', '16', '17', '18', '20', '21', '22', '23', '26', '27', '28', '30', '31', '33', '34', '35', '41']:
                 await update.message.reply_text(f"✅ 설정 완료: {val}")
             await self._restore_main_keyboard(update)
             await self.show_setup_menu(update)
