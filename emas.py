@@ -1033,13 +1033,19 @@ class SignalEngine(BaseEngine):
             common_cfg = cfg.get('common_settings', {})
             entry_tf = common_cfg.get('entry_timeframe', common_cfg.get('timeframe', '8h'))
             
-            # Common: Fetch Current Positions (Always monitor existing positions)
-            positions = await asyncio.to_thread(self.exchange.fetch_positions)
             active_position_symbols = set()
-            for p in positions:
-                if float(p.get('contracts', 0)) > 0:
-                    sym = p['symbol'].replace(':USDT', '')
-                    active_position_symbols.add(sym)
+            # Common: Fetch current positions (best effort).
+            # If this call fails (e.g. permission/auth issue), do not stop status updates.
+            try:
+                positions = await asyncio.to_thread(self.exchange.fetch_positions)
+                for p in positions:
+                    if float(p.get('contracts', 0)) > 0:
+                        sym = p['symbol'].replace(':USDT', '')
+                        active_position_symbols.add(sym)
+            except Exception as e:
+                logger.warning(
+                    f"Signal poll_tick: fetch_positions failed, continuing without server positions ({e})"
+                )
 
             # Check Scanner Setting
             scanner_enabled = common_cfg.get('scanner_enabled', True)
@@ -1085,6 +1091,34 @@ class SignalEngine(BaseEngine):
                 # Merge: Config + Chat Manual + Positions
                 target_symbols = self.active_symbols | config_symbols | active_position_symbols
  
+            if self.ctrl.is_paused:
+                total, free, mmr = await self.get_balance_info()
+                count, daily_pnl = self.db.get_daily_stats()
+                paused_symbol = sorted(target_symbols)[0] if target_symbols else 'PAUSED'
+                self.ctrl.status_data = {
+                    'PAUSED': {
+                        'engine': 'SIGNAL',
+                        'symbol': paused_symbol,
+                        'price': 0,
+                        'pos_side': 'NONE',
+                        'total_equity': total,
+                        'free_usdt': free,
+                        'mmr': mmr,
+                        'daily_count': count,
+                        'daily_pnl': daily_pnl,
+                        'leverage': common_cfg.get('leverage', 20),
+                        'margin_mode': 'ISOLATED',
+                        'entry_tf': entry_tf,
+                        'exit_tf': common_cfg.get('exit_timeframe', '4h'),
+                        'entry_reason': '일시정지(PAUSE) 상태',
+                        'protection_config': {'tp_enabled': False, 'sl_enabled': False},
+                    }
+                }
+                return
+
+            if 'PAUSED' in self.ctrl.status_data:
+                del self.ctrl.status_data['PAUSED']
+
             if not target_symbols:
                 if scanner_enabled:
                     # [Fix] Provide status feedback during scanning (Target empty)
