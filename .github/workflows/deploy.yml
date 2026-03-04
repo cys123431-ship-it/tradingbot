@@ -16,17 +16,42 @@ jobs:
           username: ${{ secrets.AZURE_USERNAME }}
           key: ${{ secrets.AZURE_SSH_PRIVATE_KEY }}
           script: |
-            set -e
+            set -euo pipefail
 
             APP_DIR=/home/azureuser/tradingbot
             PID_FILE=/home/azureuser/emas.pid
             LOG_FILE=/home/azureuser/emas.log
+            CONFIG_BACKUP=/tmp/tradingbot-config.json
 
             echo "=== 배포 시작 ==="
             cd "$APP_DIR"
 
-            echo "=== 최신 코드 가져오기 ==="
-            git pull origin main --no-rebase
+            echo "=== 런타임 설정 백업 ==="
+            if [ -f config.json ]; then
+              cp config.json "$CONFIG_BACKUP"
+              echo "config.json 백업 완료"
+            else
+              rm -f "$CONFIG_BACKUP"
+              echo "config.json 없음 (백업 생략)"
+            fi
+
+            echo "=== 최신 코드 동기화 ==="
+            git fetch origin main
+            if git show-ref --verify --quiet refs/heads/main; then
+              git checkout -f main
+            else
+              git checkout -f -B main origin/main
+            fi
+            git reset --hard origin/main
+            git clean -fd
+
+            echo "=== 런타임 설정 복원 ==="
+            if [ -f "$CONFIG_BACKUP" ]; then
+              cp "$CONFIG_BACKUP" config.json
+              echo "config.json 복원 완료"
+            else
+              echo "복원할 config 백업 없음"
+            fi
 
             echo "=== Python 가상환경 준비 ==="
             if [ ! -d venv ]; then
