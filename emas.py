@@ -544,13 +544,78 @@ class BaseEngine:
 
     async def get_balance_info(self):
         try:
-            bal = await asyncio.to_thread(self.exchange.fetch_balance)
-            info = bal.get('info', {})
-            total = float(info.get('totalMarginBalance', 0))
-            if total == 0:
-                total = float(bal.get('USDT', {}).get('total', 0))
-            mmr = (float(info.get('totalMaintMargin', 0)) / total * 100) if total > 0 else 0.0
-            return total, float(bal.get('USDT', {}).get('free', 0)), mmr
+            # Binance futures balance schemas vary by account mode (single/multi asset, PM, etc).
+            # Parse multiple candidate fields to avoid showing 0 when funds exist.
+            try:
+                bal = await asyncio.to_thread(self.exchange.fetch_balance, {'type': 'future'})
+            except Exception:
+                bal = await asyncio.to_thread(self.exchange.fetch_balance)
+
+            info = bal.get('info', {}) if isinstance(bal, dict) else {}
+            usdt_bucket = bal.get('USDT', {}) if isinstance(bal, dict) else {}
+            total_map = bal.get('total', {}) if isinstance(bal, dict) else {}
+            free_map = bal.get('free', {}) if isinstance(bal, dict) else {}
+
+            usdt_asset = {}
+            assets = info.get('assets', []) if isinstance(info, dict) else []
+            if isinstance(assets, list):
+                for asset in assets:
+                    if str(asset.get('asset', '')).upper() == 'USDT':
+                        usdt_asset = asset
+                        break
+
+            def to_float_or_none(v):
+                try:
+                    if v is None or v == '':
+                        return None
+                    return float(v)
+                except (TypeError, ValueError):
+                    return None
+
+            def pick_value(candidates):
+                # Prefer positive values first, then first parseable numeric value.
+                parsed = [to_float_or_none(v) for v in candidates]
+                for v in parsed:
+                    if v is not None and v > 0:
+                        return v
+                for v in parsed:
+                    if v is not None:
+                        return v
+                return 0.0
+
+            total = pick_value([
+                info.get('totalMarginBalance'),
+                info.get('totalWalletBalance'),
+                info.get('totalCrossWalletBalance'),
+                usdt_asset.get('marginBalance'),
+                usdt_asset.get('walletBalance'),
+                usdt_bucket.get('total'),
+                total_map.get('USDT'),
+                info.get('availableBalance'),
+                usdt_asset.get('availableBalance'),
+                usdt_bucket.get('free'),
+                free_map.get('USDT'),
+            ])
+
+            free = pick_value([
+                info.get('availableBalance'),
+                usdt_asset.get('availableBalance'),
+                usdt_bucket.get('free'),
+                free_map.get('USDT'),
+                usdt_bucket.get('total'),
+                total_map.get('USDT'),
+            ])
+
+            if total <= 0 and free > 0:
+                total = free
+
+            maint_margin = pick_value([
+                info.get('totalMaintMargin'),
+                usdt_asset.get('maintMargin'),
+            ])
+            mmr = (maint_margin / total * 100) if total > 0 else 0.0
+
+            return float(total), float(free), float(mmr)
         except Exception as e:
             logger.error(f"Balance fetch error: {e}")
             return 0.0, 0.0, 0.0
@@ -2161,8 +2226,7 @@ class SignalEngine(BaseEngine):
             bounded_risk_pct = min(max(req_risk_pct, 1.0), max_risk_pct)
             risk_pct = bounded_risk_pct / 100.0
             
-            bal = await asyncio.to_thread(self.exchange.fetch_balance)
-            free = float(bal.get('USDT', {}).get('free', 0))
+            _, free, _ = await self.get_balance_info()
             
             if free <= 0:
                 logger.warning(f"Insufficient balance: {free}")
@@ -3092,8 +3156,7 @@ class DualThrustEngine(BaseEngine):
             # await asyncio.to_thread(self.exchange.set_leverage, lev, symbol)
             
             # ?섎웾 怨꾩궛
-            bal = await asyncio.to_thread(self.exchange.fetch_balance)
-            free = float(bal.get('USDT', {}).get('free', 0))
+            _, free, _ = await self.get_balance_info()
             qty = self.safe_amount(symbol, (free * risk_pct * lev) / price)
             
             if float(qty) <= 0:
