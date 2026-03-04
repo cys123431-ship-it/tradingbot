@@ -3504,11 +3504,27 @@ class DualModeFractalEngine(BaseEngine):
 # ---------------------------------------------------------
 class MainController:
     def __init__(self):
-        self.cfg = TradingConfig()
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(self.base_dir, 'config.json')
+        self.cfg = TradingConfig(config_path)
+        logger.info(f"Config path: {config_path}")
         self.db = DBManager(self.cfg.get('logging', {}).get('db_path', 'bot_database.db'))
         
         api = self.cfg.get('api', {})
         creds = api.get('testnet', {}) if api.get('use_testnet', True) else api.get('mainnet', {})
+        network_name = 'testnet' if api.get('use_testnet', True) else 'mainnet'
+        has_key = bool(str(creds.get('api_key', '')).strip())
+        has_secret = bool(str(creds.get('secret_key', '')).strip())
+        logger.info(
+            f"API credential check ({network_name}): "
+            f"key={'SET' if has_key else 'EMPTY'}, "
+            f"secret={'SET' if has_secret else 'EMPTY'}"
+        )
+        if not (has_key and has_secret):
+            logger.error(
+                f"Selected {network_name} API credentials are empty. "
+                "Private endpoints (balance/positions/orders) will fail."
+            )
         
         self.exchange = self._build_exchange(creds)
         self._configure_exchange_network(self.exchange, api.get('use_testnet', True))
