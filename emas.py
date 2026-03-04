@@ -2232,6 +2232,19 @@ class SignalEngine(BaseEngine):
                 logger.warning(f"Insufficient balance: {free}")
                 await self.ctrl.notify(f"⚠️ 잔고 부족: ${free:.2f}")
                 return
+
+            def _safe_float(v):
+                try:
+                    if v is None or v == '':
+                        return None
+                    f = float(v)
+                    return f if f > 0 else None
+                except (TypeError, ValueError):
+                    return None
+
+            def _pick_min_positive(values):
+                parsed = [x for x in (_safe_float(v) for v in values) if x is not None]
+                return min(parsed) if parsed else 0.0
             
             # Position sizing (user-friendly):
             # 1) Use configured % of current free USDT as margin.
@@ -2241,7 +2254,74 @@ class SignalEngine(BaseEngine):
             safety_buffer = 0.98
             target_notional = margin_to_use * lev * safety_buffer
 
+            # Exchange min notional check (prevents Binance -4164).
+            min_notional = 0.0
+            try:
+                markets = await asyncio.to_thread(self.exchange.load_markets)
+                market = markets.get(symbol) or markets.get(f"{symbol}:USDT") or {}
+                limits = market.get('limits', {}) if isinstance(market, dict) else {}
+                info = market.get('info', {}) if isinstance(market, dict) else {}
+                filters = info.get('filters', []) if isinstance(info, dict) else []
+                filter_values = []
+                if isinstance(filters, list):
+                    for f in filters:
+                        if not isinstance(f, dict):
+                            continue
+                        if f.get('filterType') in ('MIN_NOTIONAL', 'NOTIONAL'):
+                            filter_values.extend([f.get('notional'), f.get('minNotional')])
+                min_notional = _pick_min_positive([
+                    limits.get('cost', {}).get('min') if isinstance(limits.get('cost', {}), dict) else None,
+                    info.get('notional'),
+                    info.get('minNotional'),
+                    *filter_values,
+                ])
+            except Exception as e:
+                logger.debug(f"Entry min notional lookup failed for {symbol}: {e}")
+
+            # Binance futures fallback (some responses omit min notional filter fields).
+            if min_notional <= 0 and getattr(self.exchange, 'id', '') == 'binance':
+                default_type = str(getattr(self.exchange, 'options', {}).get('defaultType', '')).lower()
+                if default_type in ('future', 'futures'):
+                    min_notional = 100.0
+
+            max_notional = free * lev * safety_buffer
+            if min_notional > 0 and target_notional < min_notional:
+                # If balance/leverage can support exchange minimum, auto-bump notional.
+                if max_notional >= min_notional:
+                    target_notional = min_notional * 1.001  # small buffer for precision truncation
+                    margin_to_use = target_notional / max(lev * safety_buffer, 1e-9)
+                    implied_risk_pct = (margin_to_use / max(free, 1e-9)) * 100.0
+                    await self.ctrl.notify(
+                        f"ℹ️ 최소 주문금액 반영: {target_notional:.2f} USDT "
+                        f"(요구 {min_notional:.2f}, 계산 리스크 {implied_risk_pct:.1f}%)"
+                    )
+                else:
+                    required_risk_pct = (min_notional / max(max_notional, 1e-9)) * 100.0
+                    logger.warning(
+                        f"Entry blocked by min notional: target={target_notional:.2f}, "
+                        f"min={min_notional:.2f}, max={max_notional:.2f}, free={free:.2f}, lev={lev}"
+                    )
+                    await self.ctrl.notify(
+                        f"⚠️ 최소 주문금액 미달: 필요 {min_notional:.2f} USDT, 가능 {max_notional:.2f} USDT. "
+                        f"잔고를 늘리거나 레버리지를 높이세요(필요 리스크 약 {required_risk_pct:.1f}%)."
+                    )
+                    return
+
             qty = self.safe_amount(symbol, target_notional / price)
+            try:
+                qty_notional = float(qty) * float(price)
+            except (TypeError, ValueError):
+                qty_notional = 0.0
+            if min_notional > 0 and qty_notional < min_notional:
+                logger.warning(
+                    f"Entry quantity below min notional after precision: qty={qty}, "
+                    f"notional={qty_notional:.4f}, min={min_notional:.4f}"
+                )
+                await self.ctrl.notify(
+                    f"⚠️ 주문 수량 정밀도 때문에 최소 금액 미달({qty_notional:.2f} < {min_notional:.2f}). "
+                    "레버리지/진입비율을 높여주세요."
+                )
+                return
             
             if float(qty) <= 0:
                 logger.warning(f"Invalid quantity: {qty} (free={free}, risk={risk_pct}, lev={lev}, price={price}, target_notional={target_notional})")
