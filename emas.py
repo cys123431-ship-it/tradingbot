@@ -61,7 +61,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 CORE_ENGINE = 'signal'
-CORE_STRATEGIES = {'sma', 'hma'}
+MA_STRATEGIES = {'sma', 'hma'}
+PATTERN_STRATEGIES = {'cameron'}
+CORE_STRATEGIES = MA_STRATEGIES | PATTERN_STRATEGIES
 
 # ??뷀삎 ?곹깭
 SELECT, INPUT, SYMBOL_INPUT, DIRECTION_SELECT, ENGINE_SELECT = range(5)
@@ -137,6 +139,32 @@ class TradingConfig:
                     'cc_exit_enabled': False,
                     'cc_threshold': 0.70,
                     'cc_length': 14
+                },
+                'strategy_params': {
+                    'active_strategy': 'sma',
+                    'entry_mode': 'cross',
+                    'Triple_SMA': {'fast_sma': 2, 'slow_sma': 10},
+                    'HMA': {'fast_period': 9, 'slow_period': 21},
+                    'Cameron': {
+                        'rsi_period': 14,
+                        'rsi_oversold': 30,
+                        'rsi_overbought': 70,
+                        'bollinger_length': 20,
+                        'bollinger_std': 2.0,
+                        'macd_fast': 12,
+                        'macd_slow': 26,
+                        'macd_signal': 9,
+                        'extreme_lookback': 60,
+                        'macd_confirm_lookback': 3,
+                        'band_buffer_pct': 0.001,
+                        'risk_reward_ratio': 2.0
+                    },
+                    'kalman_filter': {
+                        'entry_enabled': False,
+                        'exit_enabled': False,
+                        'observation_covariance': 0.1,
+                        'transition_covariance': 0.05
+                    }
                 }
             },
             'dual_thrust_engine': {
@@ -189,6 +217,45 @@ class TradingConfig:
 
         signal_cfg = self.config.setdefault('signal_engine', {})
         strategy_params = signal_cfg.setdefault('strategy_params', {})
+        strategy_defaults = {
+            'Triple_SMA': {'fast_sma': 2, 'slow_sma': 10},
+            'HMA': {'fast_period': 9, 'slow_period': 21},
+            'Cameron': {
+                'rsi_period': 14,
+                'rsi_oversold': 30,
+                'rsi_overbought': 70,
+                'bollinger_length': 20,
+                'bollinger_std': 2.0,
+                'macd_fast': 12,
+                'macd_slow': 26,
+                'macd_signal': 9,
+                'extreme_lookback': 60,
+                'macd_confirm_lookback': 3,
+                'band_buffer_pct': 0.001,
+                'risk_reward_ratio': 2.0
+            },
+            'kalman_filter': {
+                'entry_enabled': False,
+                'exit_enabled': False,
+                'observation_covariance': 0.1,
+                'transition_covariance': 0.05
+            }
+        }
+        for key, default_val in strategy_defaults.items():
+            current_val = strategy_params.get(key)
+            if not isinstance(default_val, dict):
+                if key not in strategy_params:
+                    strategy_params[key] = default_val
+                    changed = True
+                continue
+            if not isinstance(current_val, dict):
+                strategy_params[key] = dict(default_val)
+                changed = True
+                continue
+            for sub_key, sub_val in default_val.items():
+                if sub_key not in current_val:
+                    current_val[sub_key] = sub_val
+                    changed = True
         active_strategy = str(strategy_params.get('active_strategy', 'sma')).lower()
         if active_strategy not in CORE_STRATEGIES:
             strategy_params['active_strategy'] = 'sma'
@@ -305,6 +372,21 @@ class TradingConfig:
                     "active_strategy": "sma",
                     "entry_mode": "cross",
                     "Triple_SMA": {"fast_sma": 2, "slow_sma": 10},
+                    "HMA": {"fast_period": 9, "slow_period": 21},
+                    "Cameron": {
+                        "rsi_period": 14,
+                        "rsi_oversold": 30,
+                        "rsi_overbought": 70,
+                        "bollinger_length": 20,
+                        "bollinger_std": 2.0,
+                        "macd_fast": 12,
+                        "macd_slow": 26,
+                        "macd_signal": 9,
+                        "extreme_lookback": 60,
+                        "macd_confirm_lookback": 3,
+                        "band_buffer_pct": 0.001,
+                        "risk_reward_ratio": 2.0
+                    },
                     "kalman_filter": {"entry_enabled": False, "exit_enabled": False, "observation_covariance": 0.1, "transition_covariance": 0.05}
                 }
             },
@@ -1070,6 +1152,7 @@ class SignalEngine(BaseEngine):
         
         # FractalFisher ?곹깭 罹먯떆
         self.fisher_states = {} # {symbol: {hurst, value, prev_value, entry_price, entry_atr, trailing_stop}}
+        self.cameron_states = {} # {symbol: {side, stop_price, entry_ref_price, signal_ts, ...}}
         
         # [New] Filter Status Persistence (Dashboard)
         self.last_entry_filter_status = {} # symbol -> {r2_val, ...}
@@ -1084,6 +1167,7 @@ class SignalEngine(BaseEngine):
         self.last_candle_success = {}
         self.last_processed_candle_ts = {}
         self.last_processed_exit_candle_ts = {}
+        self.cameron_states = {}
         
         # 珥덇린??
         config_watchlist = self.cfg.get('signal_engine', {}).get('watchlist', [])
@@ -1118,6 +1202,182 @@ class SignalEngine(BaseEngine):
         velocities = state_means[:, 1]
         c_vel = velocities[-2] # Completed candle
         return c_vel
+
+    def _get_indicator_column(self, frame, prefix, exclude_prefixes=()):
+        for col in frame.columns:
+            name = str(col)
+            if name.startswith(prefix) and not any(name.startswith(ex) for ex in exclude_prefixes):
+                return frame[col]
+        return None
+
+    def _is_bullish_engulfing(self, prev_row, curr_row, tol=0.0):
+        return (
+            prev_row['close'] < prev_row['open']
+            and curr_row['close'] > curr_row['open']
+            and curr_row['open'] <= prev_row['close'] + tol
+            and curr_row['close'] >= prev_row['open'] - tol
+        )
+
+    def _is_bearish_engulfing(self, prev_row, curr_row, tol=0.0):
+        return (
+            prev_row['close'] > prev_row['open']
+            and curr_row['close'] < curr_row['open']
+            and curr_row['open'] >= prev_row['close'] - tol
+            and curr_row['close'] <= prev_row['open'] + tol
+        )
+
+    def _has_recent_macd_cross(self, macd_line, signal_line, end_idx, direction, lookback):
+        start_idx = max(1, end_idx - max(1, int(lookback)) + 1)
+        for idx in range(start_idx, end_idx + 1):
+            prev_diff = macd_line.iloc[idx - 1] - signal_line.iloc[idx - 1]
+            curr_diff = macd_line.iloc[idx] - signal_line.iloc[idx]
+            if direction == 'up' and prev_diff <= 0 < curr_diff:
+                return True, idx
+            if direction == 'down' and prev_diff >= 0 > curr_diff:
+                return True, idx
+        return False, None
+
+    def _calculate_cameron_signal(self, df, strategy_params):
+        cfg = strategy_params.get('Cameron', {})
+        rsi_period = int(cfg.get('rsi_period', 14) or 14)
+        rsi_oversold = float(cfg.get('rsi_oversold', 30) or 30)
+        rsi_overbought = float(cfg.get('rsi_overbought', 70) or 70)
+        bb_length = int(cfg.get('bollinger_length', 20) or 20)
+        bb_std = float(cfg.get('bollinger_std', 2.0) or 2.0)
+        macd_fast = int(cfg.get('macd_fast', 12) or 12)
+        macd_slow = int(cfg.get('macd_slow', 26) or 26)
+        macd_signal = int(cfg.get('macd_signal', 9) or 9)
+        extreme_lookback = int(cfg.get('extreme_lookback', 60) or 60)
+        macd_confirm_lookback = int(cfg.get('macd_confirm_lookback', 3) or 3)
+        band_buffer_pct = float(cfg.get('band_buffer_pct', 0.001) or 0.0)
+
+        closed = df.iloc[:-1].copy().reset_index(drop=True)
+        min_bars = max(rsi_period + 5, bb_length + 5, macd_slow + macd_signal + 5, 40)
+        if len(closed) < min_bars:
+            return None, "CAMERON 데이터 부족", {}
+
+        closed['rsi'] = ta.rsi(closed['close'], length=rsi_period)
+        bb = ta.bbands(closed['close'], length=bb_length, std=bb_std)
+        macd = ta.macd(closed['close'], fast=macd_fast, slow=macd_slow, signal=macd_signal)
+
+        if bb is None or bb.empty or macd is None or macd.empty:
+            return None, "CAMERON 지표 계산 대기", {}
+
+        bb_lower = self._get_indicator_column(bb, 'BBL_')
+        bb_upper = self._get_indicator_column(bb, 'BBU_')
+        macd_line = self._get_indicator_column(macd, 'MACD_', exclude_prefixes=('MACDh_', 'MACDs_'))
+        signal_line = self._get_indicator_column(macd, 'MACDs_')
+        macd_hist = self._get_indicator_column(macd, 'MACDh_')
+
+        if any(series is None for series in (bb_lower, bb_upper, macd_line, signal_line)):
+            return None, "CAMERON 지표 컬럼 대기", {}
+
+        closed['bb_lower'] = bb_lower
+        closed['bb_upper'] = bb_upper
+        closed['macd'] = macd_line
+        closed['macd_signal'] = signal_line
+        closed['macd_hist'] = macd_hist if macd_hist is not None else (macd_line - signal_line)
+
+        trigger_idx = len(closed) - 1
+        prev_idx = trigger_idx - 1
+        if prev_idx < 0:
+            return None, "CAMERON 캔들 대기", {}
+
+        required_cols = ['open', 'high', 'low', 'close', 'rsi', 'bb_lower', 'bb_upper', 'macd', 'macd_signal']
+        if closed.loc[[prev_idx, trigger_idx], required_cols].isna().any().any():
+            return None, "CAMERON 지표 확정 대기", {}
+
+        trigger = closed.iloc[trigger_idx]
+        prev = closed.iloc[prev_idx]
+        reason = "CAMERON 조건 대기"
+
+        bullish_engulf = self._is_bullish_engulfing(prev, trigger)
+        if bullish_engulf and trigger['low'] >= trigger['bb_lower'] * (1 - band_buffer_pct):
+            has_cross_up, cross_idx = self._has_recent_macd_cross(
+                closed['macd'], closed['macd_signal'], trigger_idx, 'up', macd_confirm_lookback
+            )
+            if has_cross_up and trigger['macd'] > trigger['macd_signal']:
+                start_idx = max(0, trigger_idx - extreme_lookback)
+                for idx in range(trigger_idx - 2, start_idx - 1, -1):
+                    first = closed.iloc[idx]
+                    if pd.isna(first[['rsi', 'bb_lower']]).any():
+                        continue
+                    if first['rsi'] > rsi_oversold:
+                        continue
+                    if first['low'] > first['bb_lower'] * (1 + band_buffer_pct):
+                        continue
+                    if trigger['low'] >= first['low']:
+                        continue
+                    if trigger['rsi'] <= first['rsi']:
+                        continue
+                    if cross_idx is not None and cross_idx <= idx:
+                        continue
+
+                    entry_ref_price = (float(trigger['open']) + float(trigger['close'])) / 2.0
+                    detail = {
+                        'side': 'long',
+                        'stop_price': float(trigger['low']),
+                        'entry_ref_price': entry_ref_price,
+                        'signal_ts': int(trigger['timestamp']),
+                        'trigger_open': float(trigger['open']),
+                        'trigger_high': float(trigger['high']),
+                        'trigger_low': float(trigger['low']),
+                        'trigger_close': float(trigger['close']),
+                        'first_extreme_ts': int(first['timestamp']),
+                        'first_extreme_price': float(first['low']),
+                        'first_extreme_rsi': float(first['rsi']),
+                        'trigger_rsi': float(trigger['rsi'])
+                    }
+                    reason = (
+                        f"CAMERON LONG: BB하단 확장 -> 상승 다이버전스 -> "
+                        f"MACD 골든크로스 -> 장악형 양봉 (기준가 {entry_ref_price:.4f})"
+                    )
+                    return 'long', reason, detail
+
+        bearish_engulf = self._is_bearish_engulfing(prev, trigger)
+        if bearish_engulf and trigger['high'] <= trigger['bb_upper'] * (1 + band_buffer_pct):
+            has_cross_down, cross_idx = self._has_recent_macd_cross(
+                closed['macd'], closed['macd_signal'], trigger_idx, 'down', macd_confirm_lookback
+            )
+            if has_cross_down and trigger['macd'] < trigger['macd_signal']:
+                start_idx = max(0, trigger_idx - extreme_lookback)
+                for idx in range(trigger_idx - 2, start_idx - 1, -1):
+                    first = closed.iloc[idx]
+                    if pd.isna(first[['rsi', 'bb_upper']]).any():
+                        continue
+                    if first['rsi'] < rsi_overbought:
+                        continue
+                    if first['high'] < first['bb_upper'] * (1 - band_buffer_pct):
+                        continue
+                    if trigger['high'] <= first['high']:
+                        continue
+                    if trigger['rsi'] >= first['rsi']:
+                        continue
+                    if cross_idx is not None and cross_idx <= idx:
+                        continue
+
+                    entry_ref_price = (float(trigger['open']) + float(trigger['close'])) / 2.0
+                    detail = {
+                        'side': 'short',
+                        'stop_price': float(trigger['high']),
+                        'entry_ref_price': entry_ref_price,
+                        'signal_ts': int(trigger['timestamp']),
+                        'trigger_open': float(trigger['open']),
+                        'trigger_high': float(trigger['high']),
+                        'trigger_low': float(trigger['low']),
+                        'trigger_close': float(trigger['close']),
+                        'first_extreme_ts': int(first['timestamp']),
+                        'first_extreme_price': float(first['high']),
+                        'first_extreme_rsi': float(first['rsi']),
+                        'trigger_rsi': float(trigger['rsi'])
+                    }
+                    reason = (
+                        f"CAMERON SHORT: BB상단 확장 -> 하락 다이버전스 -> "
+                        f"MACD 데드크로스 -> 장악형 음봉 (기준가 {entry_ref_price:.4f})"
+                    )
+                    return 'short', reason, detail
+
+        return None, reason, {}
 
     async def poll_tick(self):
         """
@@ -1277,6 +1537,9 @@ class SignalEngine(BaseEngine):
         if not isinstance(self.vbo_states, dict):
             logger.error(f"?좑툘 State corrupted: vbo_states is {type(self.vbo_states)}, resetting.")
             self.vbo_states = {}
+        if not isinstance(self.cameron_states, dict):
+            logger.error(f"?좑툘 State corrupted: cameron_states is {type(self.cameron_states)}, resetting.")
+            self.cameron_states = {}
             
         try:
             # 1. OHLCV (Primary) - Basic monitoring
@@ -1316,7 +1579,14 @@ class SignalEngine(BaseEngine):
             active_strategy = strategy_params.get('active_strategy', 'sma').lower()
             
             # Cross/Position 紐⑤뱶?먯꽌留?Secondary TF 泥?궛 濡쒖쭅 ?ъ슜
-            if (pos_side != 'NONE') and (active_strategy in ['sma', 'hma']) and (entry_mode in ['cross', 'position']):
+            uses_secondary_exit = (
+                pos_side != 'NONE'
+                and (
+                    (active_strategy in MA_STRATEGIES and entry_mode in ['cross', 'position'])
+                    or active_strategy == 'cameron'
+                )
+            )
+            if uses_secondary_exit:
                 exit_tf = self._get_exit_timeframe(symbol)
                 
                 ohlcv_e = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, exit_tf, limit=5)
@@ -1413,7 +1683,7 @@ class SignalEngine(BaseEngine):
                     # [MODIFIED] Always use entry_timeframe if scanner is evaluating for a position-like entry
                     scan_params = strategy_params.copy()
                     active_strategy = scan_params.get('active_strategy', 'sma').lower()
-                    if active_strategy not in ['sma', 'hma']:
+                    if active_strategy not in CORE_STRATEGIES:
                         active_strategy = 'sma'
                     
                     # Use scanner_timeframe if set, but ensure we are thinking about consistency
@@ -1661,7 +1931,7 @@ class SignalEngine(BaseEngine):
             next_candle_ts = candle_time + self._timeframe_to_ms(tf)
 
             # ===== entry_mode???곕Ⅸ 吏꾩엯 泥섎━ (Exit???쒖쇅) =====
-            if entry_mode in ['cross', 'position']:
+            if (active_strategy in MA_STRATEGIES and entry_mode in ['cross', 'position']) or active_strategy == 'cameron':
                 # Cross/Position 紐⑤뱶: Primary TF?먯꽌??"吏꾩엯(Entry)"留?泥섎━
                 # 泥?궛(Exit)? Secondary TF candle (process_exit_candle)?먯꽌 泥섎━??
                 
@@ -1673,7 +1943,10 @@ class SignalEngine(BaseEngine):
                     
                 elif not pos and sig:
                     # ?ъ????놁쓬 + 吏꾩엯 ?좏샇 -> 吏꾩엯
-                    strategy_label = "Cross" if entry_mode == 'cross' else "Position"
+                    if active_strategy == 'cameron':
+                        strategy_label = strategy_name
+                    else:
+                        strategy_label = "Cross" if entry_mode == 'cross' else "Position"
                     self.last_entry_reason[symbol] = f"{strategy_label} 조건 충족 -> {sig.upper()} 진입"
                     logger.info(f"?? {strategy_label} (Primary): New entry {sig.upper()}")
                     await self.entry(symbol, sig, float(k['c']))
@@ -1718,62 +1991,63 @@ class SignalEngine(BaseEngine):
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             
-            # ===== 1. Calculate Raw Signal (SMA/HMA Cross) on Exit TF =====
+            # ===== 1. Calculate Raw Exit Signal =====
             strategy_params = self.cfg.get('signal_engine', {}).get('strategy_params', {})
             active_strategy = strategy_params.get('active_strategy', 'sma').lower()
-            
-            # Simple SMA/HMA Logic for Exit
-            if active_strategy == 'hma':
-                p = strategy_params.get('HMA', {})
-                fast_period = p.get('fast_period', 9)
-                slow_period = p.get('slow_period', 21)
-                df['f'] = ta.hma(df['close'], length=fast_period)
-                df['s'] = ta.hma(df['close'], length=slow_period)
-                strategy_name = "HMA(Exit)"
-            else:
-                p = strategy_params.get('Triple_SMA', {})
-                fast_period = p.get('fast_sma', 3)
-                slow_period = p.get('slow_sma', 10) # Fixed default to 10
-                df['f'] = ta.sma(df['close'], length=fast_period)
-                df['s'] = ta.sma(df['close'], length=slow_period)
-                strategy_name = "SMA(Exit)"
-
-            c_f, c_s = df['f'].iloc[-2], df['s'].iloc[-2]
-            p_f, p_s = df['f'].iloc[-3], df['s'].iloc[-3]
-            
-            # Raw Exit Signals (Opposite to position)
             raw_exit_long = False
             raw_exit_short = False
-            
-            # Check Cross (Standard Exit Trigger)
-            # If Long -> Cross Down is exit signal
-            if p_f > p_s and c_f < c_s:
-                raw_exit_long = True
-                logger.info(f"?뱣 [Exit Debug] {symbol} Dead Cross: {p_f:.2f}/{p_s:.2f} -> {c_f:.2f}/{c_s:.2f}")
-            
-            # If Short -> Cross Up is exit signal
-            if p_f < p_s and c_f > c_s:
-                raw_exit_short = True
-                logger.info(f"?뱢 [Exit Debug] {symbol} Golden Cross: {p_f:.2f}/{p_s:.2f} -> {c_f:.2f}/{c_s:.2f}")
-                
-            # Or Position Check? 
-            # Usually 'Cross' strategy uses Cross for exit. 
-            # 'Position' strategy uses Position (Alignment) for entry, but for exit? 
-            # If MA Alignment flips against position, treat as raw exit signal.
-            # Let's support both: Cross OR Alignment Flip
-            
-            if current_side.lower() == 'long':
-                if c_f < c_s: # Alignment becomes bearish
+            c_f = c_s = 0.0
+
+            if active_strategy == 'cameron':
+                strategy_name = "CAMERON(Exit)"
+                exit_sig, exit_reason, _ = self._calculate_cameron_signal(df, strategy_params)
+                raw_exit_long = current_side.lower() == 'long' and exit_sig == 'short'
+                raw_exit_short = current_side.lower() == 'short' and exit_sig == 'long'
+                if raw_exit_long or raw_exit_short:
+                    logger.info(f"[Exit Debug] {symbol} {strategy_name}: {exit_reason}")
+            else:
+                # Simple SMA/HMA Logic for Exit
+                if active_strategy == 'hma':
+                    p = strategy_params.get('HMA', {})
+                    fast_period = p.get('fast_period', 9)
+                    slow_period = p.get('slow_period', 21)
+                    df['f'] = ta.hma(df['close'], length=fast_period)
+                    df['s'] = ta.hma(df['close'], length=slow_period)
+                    strategy_name = "HMA(Exit)"
+                else:
+                    p = strategy_params.get('Triple_SMA', {})
+                    fast_period = p.get('fast_sma', 3)
+                    slow_period = p.get('slow_sma', 10) # Fixed default to 10
+                    df['f'] = ta.sma(df['close'], length=fast_period)
+                    df['s'] = ta.sma(df['close'], length=slow_period)
+                    strategy_name = "SMA(Exit)"
+
+                c_f, c_s = df['f'].iloc[-2], df['s'].iloc[-2]
+                p_f, p_s = df['f'].iloc[-3], df['s'].iloc[-3]
+
+                # Check Cross (Standard Exit Trigger)
+                # If Long -> Cross Down is exit signal
+                if p_f > p_s and c_f < c_s:
                     raw_exit_long = True
-                    logger.info(f"?슟 [Exit Debug] {symbol} Bearish Alignment: {c_f:.2f} < {c_s:.2f}")
-                else:
-                    logger.debug(f"?뵇 [Exit Debug] {symbol} Still Bullish: {c_f:.2f} > {c_s:.2f}")
-            elif current_side.lower() == 'short':
-                if c_f > c_s: # Alignment becomes bullish
+                    logger.info(f"?뱣 [Exit Debug] {symbol} Dead Cross: {p_f:.2f}/{p_s:.2f} -> {c_f:.2f}/{c_s:.2f}")
+
+                # If Short -> Cross Up is exit signal
+                if p_f < p_s and c_f > c_s:
                     raw_exit_short = True
-                    logger.info(f"??[Exit Debug] {symbol} Bullish Alignment: {c_f:.2f} > {c_s:.2f}")
-                else:
-                    logger.debug(f"?뵇 [Exit Debug] {symbol} Still Bearish: {c_f:.2f} < {c_s:.2f}")
+                    logger.info(f"?뱢 [Exit Debug] {symbol} Golden Cross: {p_f:.2f}/{p_s:.2f} -> {c_f:.2f}/{c_s:.2f}")
+
+                if current_side.lower() == 'long':
+                    if c_f < c_s: # Alignment becomes bearish
+                        raw_exit_long = True
+                        logger.info(f"?슟 [Exit Debug] {symbol} Bearish Alignment: {c_f:.2f} < {c_s:.2f}")
+                    else:
+                        logger.debug(f"?뵇 [Exit Debug] {symbol} Still Bullish: {c_f:.2f} > {c_s:.2f}")
+                elif current_side.lower() == 'short':
+                    if c_f > c_s: # Alignment becomes bullish
+                        raw_exit_short = True
+                        logger.info(f"??[Exit Debug] {symbol} Bullish Alignment: {c_f:.2f} > {c_s:.2f}")
+                    else:
+                        logger.debug(f"?뵇 [Exit Debug] {symbol} Still Bearish: {c_f:.2f} < {c_s:.2f}")
             
             # ?좏샇媛 ?녿뜑?쇰룄 ?꾪꽣 媛믪? 怨꾩궛?댁꽌 ??쒕낫?쒖뿉 ?낅뜲?댄듃 (??Pending 諛⑹?)
             await self._update_exit_filter_values(symbol, df, current_side)
@@ -1852,7 +2126,7 @@ class SignalEngine(BaseEngine):
             # Enabled exit filters are all mandatory. If one fails, exit is blocked.
 
             if current_side.lower() == 'long':
-                if c_f < c_s: # Bearish Alignment (Signal)
+                if raw_exit_long:
                     if can_exit:
                         logger.info(f"?뵒 [Exit {tf}] LONG Exit Triggered (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
                         await self.exit_position(symbol, f"{strategy_name}_Exit_L")
@@ -1860,10 +2134,10 @@ class SignalEngine(BaseEngine):
                         why = ", ".join(block_reasons) if block_reasons else "Filter blocked"
                         logger.info(f"?썳截?[Exit {tf}] LONG Exit Blocked: {why} (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
                 else:
-                    logger.debug(f"??[Exit {tf}] LONG Exit Ignored: Still Bullish Alignment (Fast {c_f:.2f} > Slow {c_s:.2f})")
+                    logger.debug(f"??[Exit {tf}] LONG Exit Ignored: raw exit signal not confirmed")
             
             elif current_side.lower() == 'short':
-                if c_f > c_s: # Bullish Alignment (Signal)
+                if raw_exit_short:
                     if can_exit:
                         logger.info(f"?뵒 [Exit {tf}] SHORT Exit Triggered (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
                         await self.exit_position(symbol, f"{strategy_name}_Exit_S")
@@ -1871,7 +2145,7 @@ class SignalEngine(BaseEngine):
                         why = ", ".join(block_reasons) if block_reasons else "Filter blocked"
                         logger.info(f"?썳截?[Exit {tf}] SHORT Exit Blocked: {why} (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
                 else:
-                    logger.debug(f"??[Exit {tf}] SHORT Exit Ignored: Still Bearish Alignment (Fast {c_f:.2f} < Slow {c_s:.2f})")
+                    logger.debug(f"??[Exit {tf}] SHORT Exit Ignored: raw exit signal not confirmed")
             return True
                 
         except Exception as e:
@@ -1899,6 +2173,7 @@ class SignalEngine(BaseEngine):
         # Init state dicts if needed
         if symbol not in self.vbo_states: self.vbo_states[symbol] = {}
         if symbol not in self.fisher_states: self.fisher_states[symbol] = {}
+        if symbol not in self.cameron_states: self.cameron_states[symbol] = {}
         if symbol not in self.kalman_states: self.kalman_states[symbol] = {'velocity': 0.0, 'direction': None}
 
         active_strategy = str(active_strategy).lower()
@@ -1975,19 +2250,22 @@ class SignalEngine(BaseEngine):
         r2_icon = "OK" if is_r2_pass else "NO"
         chop_icon = "OK" if is_chop_pass else "NO"
         
-        if active_strategy in ['sma', 'hma']:
+        if active_strategy in CORE_STRATEGIES:
              logger.info(f"?썳截?Filters (Entry): R2({curr_r2:.2f}{r2_icon}) CHOP({curr_chop:.1f}{chop_icon})")
              # Log Kalman too if used
              
         # ... MicroVBO / FractalFisher skipped (no changes needed) ...
         
-        # ===== 1. SMA/HMA 怨꾩궛 =====
+        # ===== 1. Strategy-specific calculation state =====
         strategy_name = active_strategy.upper()
         p_f = p_s = c_f = c_s = 0.0
         ma_bullish = False
         ma_bearish = False
         
-        if active_strategy == 'hma':
+        if active_strategy == 'cameron':
+            strategy_name = "CAMERON"
+
+        elif active_strategy == 'hma':
             p = strategy_params.get('HMA', {})
             fast_period = p.get('fast_period', 9)
             slow_period = p.get('slow_period', 21)
@@ -2011,7 +2289,7 @@ class SignalEngine(BaseEngine):
                 logger.error(f"SMA calculation error: {e}")
                 return None, False, False, strategy_name, entry_mode, False
         
-        if active_strategy in ['sma', 'hma']:
+        if active_strategy in MA_STRATEGIES:
             # [-1] is open/current candle (unconfirmed), [-2] is last closed candle
             if len(df) >= 3:
                 c_f = df['f'].iloc[-2]
@@ -2057,7 +2335,23 @@ class SignalEngine(BaseEngine):
         logger.info(f"?뱤 [Kalman] Velocity: {kalman_vel:.4f}, Direction: {self.kalman_states[symbol]['direction']}")
         
         # ===== 3. 吏꾩엯 紐⑤뱶蹂??좏샇 ?먮떒 (ENTRY SIGNAL) =====
-        if entry_mode == 'cross':
+        if active_strategy == 'cameron':
+            entry_mode = 'pattern'
+            sig, entry_reason, cameron_state = self._calculate_cameron_signal(df, strategy_params)
+            self.cameron_states[symbol] = cameron_state
+            is_bullish = sig == 'long'
+            is_bearish = sig == 'short'
+
+            if sig == 'long' and kalman_entry_enabled and not kalman_bullish:
+                entry_reason = "CAMERON LONG, Kalman 진입필터 미통과"
+                sig = None
+                is_bullish = False
+            elif sig == 'short' and kalman_entry_enabled and not kalman_bearish:
+                entry_reason = "CAMERON SHORT, Kalman 진입필터 미통과"
+                sig = None
+                is_bearish = False
+
+        elif entry_mode == 'cross':
             # SMA Cross Only Logic First
             cross_up = p_f < p_s and c_f > c_s
             cross_down = p_f > p_s and c_f < c_s
@@ -2141,11 +2435,12 @@ class SignalEngine(BaseEngine):
                 elif ma_bearish and kalman_entry_enabled and not kalman_bearish:
                      logger.debug(f"?썳截?Position Short Blocked by Kalman (Vel={kalman_vel:.4f})")
 
-        is_bullish = ma_bullish
-        is_bearish = ma_bearish
+        if active_strategy in MA_STRATEGIES:
+            is_bullish = ma_bullish
+            is_bearish = ma_bearish
         
         # ============ Apply Advanced Trends Filters to Entry Signal ============
-        if sig and active_strategy in ['sma', 'hma']:
+        if sig and active_strategy in CORE_STRATEGIES:
             blocked_reasons = []
             if not is_r2_pass:
                 blocked_reasons.append(f"R2({curr_r2:.2f})<{r2_thresh}")
@@ -2425,6 +2720,62 @@ class SignalEngine(BaseEngine):
                         self.fisher_trailing_stop = actual_entry_price + (self.fisher_entry_atr * trailing_mult)
                     logger.info(f"?뮶 [FractalFisher] Entry state: price={actual_entry_price:.2f}, TrailingStop={self.fisher_trailing_stop:.2f}")
                     await self.ctrl.notify(f"🧭 Trailing Stop 설정: {self.fisher_trailing_stop:.2f}")
+
+            elif active_strategy == 'cameron':
+                cam_state = self.cameron_states.get(symbol, {})
+                cam_cfg = strategy_params.get('Cameron', {})
+                rr_ratio = float(cam_cfg.get('risk_reward_ratio', 2.0) or 2.0)
+                stop_price = float(cam_state.get('stop_price', 0.0) or 0.0)
+                rr_applied = False
+
+                if side == 'long' and stop_price > 0:
+                    risk_distance = actual_entry_price - stop_price
+                elif side == 'short' and stop_price > 0:
+                    risk_distance = stop_price - actual_entry_price
+                else:
+                    risk_distance = 0.0
+
+                if risk_distance > 0:
+                    tp_distance = risk_distance * rr_ratio
+                    await self._place_tp_sl_orders(
+                        symbol,
+                        side,
+                        actual_entry_price,
+                        qty,
+                        tp_distance=tp_distance,
+                        sl_distance=risk_distance
+                    )
+                    rr_applied = True
+                    await self.ctrl.notify(
+                        f"🎯 CAMERON RR {rr_ratio:.1f}:1 적용 "
+                        f"(SL 기준 {risk_distance / max(actual_entry_price, 1e-9) * 100:.2f}%)"
+                    )
+                    logger.info(
+                        f"[CAMERON] RR protection set: entry={actual_entry_price:.4f}, "
+                        f"stop={stop_price:.4f}, risk={risk_distance:.4f}, rr={rr_ratio:.2f}"
+                    )
+
+                if not rr_applied:
+                    logger.warning(f"[CAMERON] Invalid stop anchor for {symbol}. Falling back to default TP/SL.")
+                    tp_master_enabled = bool(cfg.get('tp_sl_enabled', True))
+                    tp_enabled = tp_master_enabled and bool(cfg.get('take_profit_enabled', True))
+                    sl_enabled = tp_master_enabled and bool(cfg.get('stop_loss_enabled', True))
+                    if tp_enabled or sl_enabled:
+                        tp_pct = cfg.get('target_roe_pct', 20.0) / 100.0 / lev
+                        sl_pct = cfg.get('stop_loss_pct', 10.0) / 100.0 / lev
+
+                        tp_distance = (actual_entry_price * tp_pct) if (tp_enabled and tp_pct > 0) else None
+                        sl_distance = (actual_entry_price * sl_pct) if (sl_enabled and sl_pct > 0) else None
+
+                        if tp_distance is not None or sl_distance is not None:
+                            await self._place_tp_sl_orders(
+                                symbol,
+                                side,
+                                actual_entry_price,
+                                qty,
+                                tp_distance=tp_distance,
+                                sl_distance=sl_distance
+                            )
             
             else:
                 # SMA/HMA: ?쇱꽱??湲곕컲 TP/SL 二쇰Ц
@@ -3648,7 +3999,7 @@ class MainController:
         self.engines = {
             CORE_ENGINE: SignalEngine(self)
         }
-        logger.info("Core mode enabled: Signal(SMA/HMA) + risk controls only. Legacy engines archived.")
+        logger.info("Core mode enabled: Signal(SMA/HMA/CAMERON) + risk controls only. Legacy engines archived.")
         self.active_engine = None
         self.tg_app = None
         self.status_data = {}
@@ -4094,7 +4445,7 @@ class MainController:
             '12': "📝 **Grid 설정** 입력 (예: on,200 또는 off)",
             '14': "📝 **N Days** 입력 (예: 4)",
             '15': "📝 **K1/K2** 입력 (예: 0.5,0.5)",
-            '16': "📝 **전략 선택** (1=SMA, 2=HMA)",
+            '16': "📝 **전략 선택** (1=SMA, 2=HMA, 3=CAMERON)",
             '17': "📝 **HMA 기간** 입력 (예: 9,21)",
             '18': "📝 **진입 모드** 선택 (1=Cross, 2=Position)",
             '20': "📝 **VBO 설정** (legacy) 입력",
@@ -4507,14 +4858,14 @@ class MainController:
             # ======== Signal ?좉퇋 ?듭뀡 ========
             elif choice == '16':
                 # ?꾨왂 蹂寃?(踰덊샇 ?먮뒗 ?대쫫?쇰줈 ?좏깮)
-                strategy_map = {'1': 'sma', '2': 'hma'}
+                strategy_map = {'1': 'sma', '2': 'hma', '3': 'cameron'}
                 val_lower = val.lower().strip()
                 
                 # 踰덊샇 ?낅젰 ??蹂??
                 if val_lower in strategy_map:
                     val_lower = strategy_map[val_lower]
                 
-                if val_lower in ['sma', 'hma']:
+                if val_lower in CORE_STRATEGIES:
                     await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], val_lower)
                     signal_engine = self.engines.get('signal')
                     # ?꾨왂蹂??곹깭 珥덇린??
@@ -4528,13 +4879,15 @@ class MainController:
                         signal_engine.fisher_trailing_stop = None
                         signal_engine.fisher_hurst = None
                         signal_engine.fisher_value = None
+                    elif val_lower == 'cameron' and signal_engine:
+                        signal_engine.cameron_states = {}
                     await update.message.reply_text(f"✅ 전략 변경: {val_lower.upper()}")
                 else:
-                    await update.message.reply_text("❌ 1~2 또는 sma/hma를 입력하세요.\n1=SMA, 2=HMA")
+                    await update.message.reply_text("❌ 1~3 또는 sma/hma/cameron을 입력하세요.\n1=SMA, 2=HMA, 3=CAMERON")
                     return SELECT
             
             elif choice == '20':
-                await update.message.reply_text("MicroVBO is archived in legacy mode. Core mode uses SMA/HMA only.")
+                await update.message.reply_text("MicroVBO is archived in legacy mode. Core mode uses SMA/HMA/CAMERON only.")
                 return SELECT
                 # VBO ?ㅼ젙 蹂寃?(?뺤떇: "atr湲곌컙,?뚰뙆諛곗닔,TP諛곗닔,SL諛곗닔")
                 parts = val.replace(' ', '').split(',')
@@ -4558,7 +4911,7 @@ class MainController:
                     return SELECT
             
             elif choice == '21':
-                await update.message.reply_text("FractalFisher is archived in legacy mode. Core mode uses SMA/HMA only.")
+                await update.message.reply_text("FractalFisher is archived in legacy mode. Core mode uses SMA/HMA/CAMERON only.")
                 return SELECT
                 # FractalFisher ?ㅼ젙 蹂寃?(?뺤떇: "hurst湲곌컙,hurst?꾧퀎,fisher湲곌컙,trailing諛곗닔")
                 parts = val.replace(' ', '').split(',')
