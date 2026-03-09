@@ -374,6 +374,12 @@ class DBManager:
                 price REAL, quantity REAL, order_id TEXT,
                 status TEXT, created_at TEXT
             )""")
+            self.conn.execute("""CREATE TABLE IF NOT EXISTS status_history (
+                id INTEGER PRIMARY KEY,
+                created_at TEXT,
+                snapshot_key TEXT,
+                snapshot_text TEXT
+            )""")
             self.conn.commit()
 
     def log_shannon(self, equity, action, price, coin, usdt):
@@ -416,6 +422,36 @@ class DBManager:
             cur.execute("SELECT COUNT(*), SUM(pnl_usdt) FROM trades WHERE exit_time >= ?", (week_ago,))
             res = cur.fetchone()
             return (res[0] if res and res[0] else 0), (res[1] if res and res[1] else 0.0)
+
+    def log_status_snapshot(self, snapshot_key, snapshot_text, keep_rows=200):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT snapshot_key FROM status_history ORDER BY id DESC LIMIT 1")
+            latest = cur.fetchone()
+            if latest and latest[0] == snapshot_key:
+                return False
+
+            cur.execute(
+                "INSERT INTO status_history (created_at, snapshot_key, snapshot_text) VALUES (?,?,?)",
+                (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), snapshot_key, snapshot_text)
+            )
+            keep_rows = max(1, int(keep_rows))
+            self.conn.execute(
+                f"DELETE FROM status_history WHERE id NOT IN (SELECT id FROM status_history ORDER BY id DESC LIMIT {keep_rows})"
+            )
+            self.conn.commit()
+            return True
+
+    def get_recent_status_history(self, limit=5, offset=0):
+        limit = max(1, int(limit))
+        offset = max(0, int(offset))
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "SELECT created_at, snapshot_text FROM status_history ORDER BY id DESC LIMIT ? OFFSET ?",
+                (limit, offset)
+            )
+            return cur.fetchall()
 
 # ---------------------------------------------------------
 # 2. ?붿쭊 (Signal / Shannon)
@@ -3618,6 +3654,7 @@ class MainController:
         self.status_data = {}
         self.is_paused = True  # 遊??쒖옉 ???쇱떆?뺤? ?곹깭 (?ㅼ젙 議곗젅 ??RESUME)
         self.dashboard_msg_id = None
+        self.last_status_snapshot_key = None
         self.blink_state = False
         self.last_hourly_report = 0
 
@@ -3784,8 +3821,9 @@ class MainController:
                 await update.message.reply_text("▶ 매매 재개")
             return ConversationHandler.END
         elif text == "/status":
-            self.dashboard_msg_id = None
-            await update.message.reply_text("🔄 대시보드 갱신")
+            refreshed = await self._refresh_dashboard(force=True)
+            if not refreshed and update.message:
+                await update.message.reply_text("❌ 대시보드 갱신 실패")
             return ConversationHandler.END
         
         return None
@@ -4827,7 +4865,6 @@ class MainController:
             else:
                 await self.cfg.update_value(['system_settings', 'active_engine'], mode)
                 await self._switch_engine(mode)
-                self.dashboard_msg_id = None
                 await update.message.reply_text(f"✅ 엔진 변경 완료: {mode.upper()}")
         else:
             await update.message.reply_text("ℹ️ 코어 모드에서는 `1 (Signal)`만 사용 가능합니다.", parse_mode=ParseMode.MARKDOWN)
@@ -4839,7 +4876,8 @@ class MainController:
     def _build_main_keyboard(self):
         kb = [
             [KeyboardButton("🚨 STOP"), KeyboardButton("⏸ PAUSE"), KeyboardButton("▶ RESUME")],
-            [KeyboardButton("/setup"), KeyboardButton("/status"), KeyboardButton("/log"), KeyboardButton("/help")]
+            [KeyboardButton("/setup"), KeyboardButton("/status"), KeyboardButton("/history")],
+            [KeyboardButton("/log"), KeyboardButton("/help")]
         ]
         return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
@@ -4872,7 +4910,6 @@ class MainController:
             mode = mode_map[arg]
             await self.cfg.update_value(['system_settings', 'active_engine'], mode)
             await self._switch_engine(mode)
-            self.dashboard_msg_id = None
             await u.message.reply_text(f"✅ 전략 변경: {mode.upper()}")
 
         async def log_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -4881,6 +4918,31 @@ class MainController:
                 await u.message.reply_text("\n".join(logs))
             else:
                 await u.message.reply_text("📝 최근 로그가 없습니다.")
+
+        async def history_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            limit = 3
+            if c.args:
+                try:
+                    limit = int(c.args[0])
+                except ValueError:
+                    await u.message.reply_text("사용법: /history 또는 /history 3")
+                    return
+            limit = max(1, min(limit, 5))
+            rows = self.db.get_recent_status_history(limit=limit + 1)
+            prev_rows = rows[1:] if len(rows) > 1 else []
+            if not prev_rows:
+                await u.message.reply_text("📝 지난 상태 이력이 없습니다.")
+                return
+
+            await u.message.reply_text(
+                f"🕘 최근 상태 이력 {len(prev_rows)}건을 표시합니다. (`/history {limit}`)",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            for created_at, snapshot_text in prev_rows:
+                await u.message.reply_text(
+                    f"`{created_at}`\n{snapshot_text}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
 
         async def close_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await self.emergency_stop()
@@ -4909,6 +4971,7 @@ class MainController:
 /start - 메인 메뉴 표시
 /setup - 설정 메뉴
 /status - 대시보드 갱신
+/history - 지난 상태 조회
 /stats - 통계
 /log - 최근 로그
 /close - 긴급 청산
@@ -4924,6 +4987,7 @@ class MainController:
 
         self.tg_app.add_handler(CommandHandler("start", start_cmd))
         self.tg_app.add_handler(CommandHandler("strat", strat_cmd))
+        self.tg_app.add_handler(CommandHandler("history", history_cmd))
         self.tg_app.add_handler(CommandHandler("log", log_cmd))
         self.tg_app.add_handler(CommandHandler("close", close_cmd))
         self.tg_app.add_handler(CommandHandler("stats", stats_cmd))
@@ -5116,69 +5180,7 @@ class MainController:
         while True:
             try:
                 if self.cfg.get('system_settings', {}).get('show_dashboard', True):
-                    self.blink_state = not self.blink_state
-                    blink = "●" if self.blink_state else "○"
-                    pause_indicator = " [PAUSED]" if self.is_paused else ""
-                    
-                    all_data = self.status_data # Dict[symbol, status_dict]
-                    
-                    if not all_data:
-                        # Fallback: 엔진 상태 데이터가 아직 없을 때
-                        eng = self.cfg.get('system_settings', {}).get('active_engine', 'LOADING').upper()
-                        msg = (
-                            f"{blink} **[{eng}] 대시보드**{pause_indicator} "
-                            f"[{datetime.now().strftime('%H:%M:%S')}]\n"
-                            "데이터 수집 대기 중..."
-                        )
-                    else:
-                        msg = self._format_dashboard_message(all_data, blink, pause_indicator)
-
-
-                    # 硫붿떆吏 ?꾩넚/?섏젙
-                    if self.dashboard_msg_id:
-                        try:
-                            await self.tg_app.bot.edit_message_text(
-                                chat_id=cid,
-                                message_id=self.dashboard_msg_id,
-                                text=msg,
-                                parse_mode=ParseMode.MARKDOWN
-                            )
-                        except RetryAfter as e:
-                            logger.warning(f"Flood Wait: Sleeping {e.retry_after}s")
-                            await asyncio.sleep(e.retry_after)
-                            # ?ъ떆??
-                            try:
-                                await self.tg_app.bot.edit_message_text(
-                                    chat_id=cid,
-                                    message_id=self.dashboard_msg_id,
-                                    text=msg,
-                                    parse_mode=ParseMode.MARKDOWN
-                                )
-                            except Exception:
-                                self.dashboard_msg_id = None
-                        except BadRequest as e:
-                            if "Message is not modified" not in str(e):
-                                logger.warning(f"Dashboard edit error: {e}")
-                                # 硫붿떆吏 ??젣??寃쎌슦留?由ъ뀑 (?ㅻⅨ ?먮윭???좎?)
-                                if "message to edit not found" in str(e).lower():
-                                    self.dashboard_msg_id = None
-                        except Exception as e:
-                            logger.error(f"Dashboard error: {e}")
-                            # ?먮윭 ?쒖뿉??msg_id ?좎? (??硫붿떆吏 ??＜ 諛⑹?)
-                    else:
-                        try:
-                            m = await self.tg_app.bot.send_message(
-                                chat_id=cid,
-                                text=msg,
-                                parse_mode=ParseMode.MARKDOWN
-                            )
-                            self.dashboard_msg_id = m.message_id
-                        except RetryAfter as e:
-                            logger.warning(f"Send Flood Wait: {e.retry_after}s")
-                            await asyncio.sleep(min(e.retry_after, 60))  # 理쒕? 60珥??湲?
-                        except Exception as e:
-                            logger.error(f"Dashboard send error: {e}")
-                            await asyncio.sleep(30)  # ?먮윭 ??30珥??湲????ъ떆??
+                    await self._refresh_dashboard()
                 
                 interval = self.cfg.get('system_settings', {}).get('monitoring_interval_seconds', 10)
                 await asyncio.sleep(interval)
@@ -5188,12 +5190,93 @@ class MainController:
                 await asyncio.sleep(10)
 
 
-    def _format_dashboard_message(self, all_data, blink, pause_indicator):
-        """텔레그램 대시보드 메시지 생성."""
-        try:
-            eng = self.cfg.get('system_settings', {}).get('active_engine', 'unknown').upper()
-            msg = f"{blink} **[{eng}] 대시보드**{pause_indicator} [{datetime.now().strftime('%H:%M:%S')}]\n\n"
+    async def _refresh_dashboard(self, force=False):
+        if not force and not self.cfg.get('system_settings', {}).get('show_dashboard', True):
+            return False
 
+        self.blink_state = not self.blink_state
+        blink = "●" if self.blink_state else "○"
+        pause_indicator = " [PAUSED]" if self.is_paused else ""
+        all_data = self.status_data if isinstance(self.status_data, dict) else {}
+        live_text, history_text, snapshot_key = self._build_dashboard_messages(all_data, blink, pause_indicator)
+        self._record_status_snapshot(snapshot_key, history_text)
+        return await self._upsert_dashboard_message(live_text)
+
+    def _record_status_snapshot(self, snapshot_key, snapshot_text):
+        if not snapshot_key or snapshot_key == self.last_status_snapshot_key:
+            return
+        self.db.log_status_snapshot(snapshot_key, snapshot_text)
+        self.last_status_snapshot_key = snapshot_key
+
+    async def _upsert_dashboard_message(self, text):
+        cid = self.cfg.get_chat_id()
+        if not cid or not self.tg_app:
+            logger.error("Invalid chat_id - dashboard refresh skipped")
+            return False
+
+        if self.dashboard_msg_id:
+            try:
+                await self.tg_app.bot.edit_message_text(
+                    chat_id=cid,
+                    message_id=self.dashboard_msg_id,
+                    text=text,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return True
+            except RetryAfter as e:
+                logger.warning(f"Flood Wait: Sleeping {e.retry_after}s")
+                await asyncio.sleep(e.retry_after)
+                try:
+                    await self.tg_app.bot.edit_message_text(
+                        chat_id=cid,
+                        message_id=self.dashboard_msg_id,
+                        text=text,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    return True
+                except Exception as retry_error:
+                    logger.warning(f"Dashboard retry edit error: {retry_error}")
+                    self.dashboard_msg_id = None
+            except BadRequest as e:
+                if "Message is not modified" in str(e):
+                    return True
+                logger.warning(f"Dashboard edit error: {e}")
+                if "message to edit not found" in str(e).lower():
+                    self.dashboard_msg_id = None
+            except Exception as e:
+                logger.error(f"Dashboard error: {e}")
+
+        try:
+            m = await self.tg_app.bot.send_message(
+                chat_id=cid,
+                text=text,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            self.dashboard_msg_id = m.message_id
+            return True
+        except RetryAfter as e:
+            logger.warning(f"Send Flood Wait: {e.retry_after}s")
+            await asyncio.sleep(min(e.retry_after, 60))
+        except Exception as e:
+            logger.error(f"Dashboard send error: {e}")
+        return False
+
+    def _build_dashboard_messages(self, all_data, blink, pause_indicator):
+        eng = self.cfg.get('system_settings', {}).get('active_engine', 'unknown').upper()
+        now = datetime.now()
+        body = self._format_dashboard_body(all_data)
+        live_text = f"{blink} **[{eng}] 대시보드**{pause_indicator} [{now.strftime('%H:%M:%S')}]\n\n{body}"
+        history_text = f"**[{eng}] 상태 이력**{pause_indicator} [{now.strftime('%Y-%m-%d %H:%M:%S')}]\n\n{body}"
+        snapshot_key = f"{eng}|{pause_indicator}|{body}"
+        return live_text, history_text, snapshot_key
+
+    def _format_dashboard_body(self, all_data):
+        """텔레그램 대시보드 본문 생성."""
+        try:
+            if not all_data:
+                return "데이터 수집 대기 중..."
+
+            msg = ""
             first_symbol = list(all_data.keys())[0]
             d_first = all_data[first_symbol]
 
@@ -5280,10 +5363,15 @@ class MainController:
 
                 msg += "\n"
 
-            return msg
+            return msg.rstrip()
         except Exception as e:
             logger.error(f"Dashboard format error: {e}")
             return "❌ 대시보드 메시지 생성 오류"
+
+    def _format_dashboard_message(self, all_data, blink, pause_indicator):
+        """텔레그램 대시보드 메시지 생성."""
+        live_text, _, _ = self._build_dashboard_messages(all_data, blink, pause_indicator)
+        return live_text
 
     async def emergency_stop(self):
         """湲닿툒 ?뺤? - 紐⑤뱺 ?ㅽ뵂 ?ъ???泥?궛"""
