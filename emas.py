@@ -4340,6 +4340,9 @@ class MainController:
         hma_params = strategy_params.get('HMA', {})
         hma_fast = hma_params.get('fast_period', 9)
         hma_slow = hma_params.get('slow_period', 21)
+        watchlist_preview = ", ".join(watchlist[:4]) if isinstance(watchlist, list) and watchlist else symbol
+        if isinstance(watchlist, list) and len(watchlist) > 4:
+            watchlist_preview += " ..."
         
         # Scanner ?곹깭
         scanner_enabled = sig_common.get('scanner_enabled', True)
@@ -4385,6 +4388,7 @@ class MainController:
 6. 진입 비율 (`{sig_common.get('risk_per_trade_pct', 50)}%`)
 7. 매매 방향 (`{direction_str}`)
 8. 심볼 변경 (`{symbol}`)
+38. 감시 심볼 추가 (`{watchlist_preview}`)
 
 **Signal**
 16. 전략 (`{active_strategy}`)
@@ -4439,6 +4443,7 @@ class MainController:
             '6': "📝 **진입 비율(%)** 입력 (1~100, 예: 50)",
             '7': "↕️ **매매 방향** 선택 (양방향/롱만/숏만)",
             '8': "💱 **심볼** 입력 또는 선택\n1: BTC  2: ETH  3: SOL\n또는 직접 입력 (예: DOGE, XRP, PEPE)",
+            '38': "➕ **감시 심볼 추가**\n1: BTC  2: ETH  3: SOL\n또는 직접 입력 (예: DOGE, XRP, PEPE)",
             '9': "▶️ 매매 시작/중지를 바꾸려면 1 또는 0 입력",
             '10': "📝 **SMA 기간** 입력 (형식: fast,slow 예: 2,10)",
             '11': "📝 **자산 비율(%)** 입력 (예: 50)",
@@ -4590,7 +4595,7 @@ class MainController:
             return INPUT
         elif text in prompts:
             await update.message.reply_text(prompts[text], parse_mode=ParseMode.MARKDOWN)
-            if text == '8':
+            if text in {'8', '38'}:
                 return SYMBOL_INPUT
             return INPUT
         else:
@@ -5090,6 +5095,10 @@ class MainController:
     async def setup_symbol_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """?щ낵 蹂寃?泥섎━ - 1/2/3 ?⑥텞???먮뒗 吏곸젒 ?낅젰"""
         choice = update.message.text.strip().upper()
+        setup_choice = context.user_data.get('setup_choice')
+        new_watchlist = self.cfg.get('signal_engine', {}).get('watchlist', ['BTC/USDT'])
+        if not isinstance(new_watchlist, list):
+            new_watchlist = ['BTC/USDT']
         
         # 1/2/3 踰덊샇濡??щ낵 留ㅽ븨 (?⑥텞??
         symbol_map = {
@@ -5125,10 +5134,18 @@ class MainController:
             elif eng == 'tema':
                 await self.cfg.update_value(['tema_engine', 'target_symbol'], symbol)
             else:
-                # Signal ?붿쭊: 硫붾돱?먯꽌 蹂寃???Watchlist瑜??대떦 ?щ낵濡?**?泥?* (湲곗〈 ?숈옉 ?좎?)
-                # ?ㅼ쨷 媛먯떆瑜??먰븯硫?硫붾돱媛 ?꾨땲??梨꾪똿李쎌뿉??異붽??댁빞 ?⑥쓣 ?덈궡
-                await self.cfg.update_value(['signal_engine', 'watchlist'], [symbol])
-                await update.message.reply_text("ℹ️ Signal 엔진 감시 목록이 해당 심볼로 초기화되었습니다.\n(추가를 원하면 메뉴 밖에서 심볼을 입력하세요)")
+                if setup_choice == '38':
+                    if symbol not in new_watchlist:
+                        new_watchlist = new_watchlist + [symbol]
+                        await self.cfg.update_value(['signal_engine', 'watchlist'], new_watchlist)
+                        await update.message.reply_text(f"✅ 감시 심볼 추가: {symbol}")
+                    else:
+                        await update.message.reply_text(f"ℹ️ 이미 감시 목록에 있습니다: {symbol}")
+                else:
+                    # Signal ?붿쭊: 硫붾돱?먯꽌 蹂寃???Watchlist瑜??대떦 ?щ낵濡?**?泥?* (湲곗〈 ?숈옉 ?좎?)
+                    await self.cfg.update_value(['signal_engine', 'watchlist'], [symbol])
+                    new_watchlist = [symbol]
+                    await update.message.reply_text("ℹ️ Signal 엔진 감시 목록이 해당 심볼로 초기화되었습니다.")
             
             # 留덉폆 ?ㅼ젙 ?곸슜
             # 留덉폆 ?ㅼ젙 ?곸슜
@@ -5150,10 +5167,13 @@ class MainController:
             signal_engine = self.engines.get('signal')
             if signal_engine:
                 signal_engine.position_cache = None
-                signal_engine.last_candle_time = {} # Dict reset
-                signal_engine.last_processed_candle_ts = {} 
-                signal_engine.active_symbols.clear() # 湲곗〈 ?섎룞 紐⑸줉??珥덇린??(紐낇솗?깆쓣 ?꾪빐)
-                signal_engine.active_symbols.add(symbol)
+                if setup_choice == '38':
+                    signal_engine.active_symbols.add(symbol)
+                else:
+                    signal_engine.last_candle_time = {} # Dict reset
+                    signal_engine.last_processed_candle_ts = {}
+                    signal_engine.active_symbols.clear() # 湲곗〈 ?섎룞 紐⑸줉??珥덇린??(紐낇솗?깆쓣 ?꾪빐)
+                    signal_engine.active_symbols.add(symbol)
             
             # Dual Thrust ?붿쭊 罹먯떆??珥덇린??
             dt_engine = self.engines.get('dualthrust')
@@ -5171,7 +5191,11 @@ class MainController:
                 tema_engine.ema3 = None
                 logger.info(f"?봽 TEMA engine cache cleared for new symbol: {symbol}")
             
-            await update.message.reply_text(f"✅ 심볼 변경 완료: {symbol}")
+            if setup_choice == '38':
+                watchlist_text = ", ".join(new_watchlist)
+                await update.message.reply_text(f"✅ 감시 목록: {watchlist_text}")
+            else:
+                await update.message.reply_text(f"✅ 심볼 변경 완료: {symbol}")
             await self._restore_main_keyboard(update)
             await self.show_setup_menu(update)
             return SELECT
