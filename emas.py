@@ -3821,9 +3821,14 @@ class MainController:
                 await update.message.reply_text("▶ 매매 재개")
             return ConversationHandler.END
         elif text == "/status":
-            refreshed = await self._refresh_dashboard(force=True)
-            if not refreshed and update.message:
-                await update.message.reply_text("❌ 대시보드 갱신 실패")
+            all_data = self.status_data if isinstance(self.status_data, dict) else {}
+            status_text, history_text, snapshot_key = self._build_dashboard_messages(
+                all_data,
+                "●",
+                " [PAUSED]" if self.is_paused else ""
+            )
+            self._record_status_snapshot(snapshot_key, history_text)
+            await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
             return ConversationHandler.END
         
         return None
