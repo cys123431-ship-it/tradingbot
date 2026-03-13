@@ -62,7 +62,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 CORE_ENGINE = 'signal'
 MA_STRATEGIES = {'sma', 'hma'}
-PATTERN_STRATEGIES = {'cameron'}
+PATTERN_STRATEGIES = {'cameron', 'utbot'}
 CORE_STRATEGIES = MA_STRATEGIES | PATTERN_STRATEGIES
 
 # ??뷀삎 ?곹깭
@@ -145,6 +145,11 @@ class TradingConfig:
                     'entry_mode': 'cross',
                     'Triple_SMA': {'fast_sma': 2, 'slow_sma': 10},
                     'HMA': {'fast_period': 9, 'slow_period': 21},
+                    'UTBot': {
+                        'key_value': 1.0,
+                        'atr_period': 10,
+                        'use_heikin_ashi': False
+                    },
                     'Cameron': {
                         'rsi_period': 14,
                         'rsi_oversold': 30,
@@ -220,6 +225,11 @@ class TradingConfig:
         strategy_defaults = {
             'Triple_SMA': {'fast_sma': 2, 'slow_sma': 10},
             'HMA': {'fast_period': 9, 'slow_period': 21},
+            'UTBot': {
+                'key_value': 1.0,
+                'atr_period': 10,
+                'use_heikin_ashi': False
+            },
             'Cameron': {
                 'rsi_period': 14,
                 'rsi_oversold': 30,
@@ -373,6 +383,11 @@ class TradingConfig:
                     "entry_mode": "cross",
                     "Triple_SMA": {"fast_sma": 2, "slow_sma": 10},
                     "HMA": {"fast_period": 9, "slow_period": 21},
+                    "UTBot": {
+                        "key_value": 1.0,
+                        "atr_period": 10,
+                        "use_heikin_ashi": False
+                    },
                     "Cameron": {
                         "rsi_period": 14,
                         "rsi_oversold": 30,
@@ -1237,6 +1252,109 @@ class SignalEngine(BaseEngine):
                 return True, idx
         return False, None
 
+    def _calculate_utbot_signal(self, df, strategy_params):
+        cfg = strategy_params.get('UTBot', {})
+        key_value = float(cfg.get('key_value', 1.0) or 1.0)
+        atr_period = max(1, int(cfg.get('atr_period', 10) or 10))
+        use_heikin_ashi = bool(cfg.get('use_heikin_ashi', False))
+
+        closed = df.iloc[:-1].copy().reset_index(drop=True)
+        min_bars = max(atr_period + 3, 20)
+        if len(closed) < min_bars:
+            return None, "UTBOT 데이터 부족", {}
+
+        prev_close = closed['close'].shift(1)
+        true_range = pd.concat([
+            (closed['high'] - closed['low']).abs(),
+            (closed['high'] - prev_close).abs(),
+            (closed['low'] - prev_close).abs()
+        ], axis=1).max(axis=1)
+
+        atr_series = pd.Series(np.nan, index=closed.index, dtype=float)
+        if len(true_range) >= atr_period:
+            atr_series.iloc[atr_period - 1] = true_range.iloc[:atr_period].mean()
+            for idx in range(atr_period, len(true_range)):
+                atr_series.iloc[idx] = (
+                    (atr_series.iloc[idx - 1] * (atr_period - 1)) + true_range.iloc[idx]
+                ) / atr_period
+        if atr_series.isna().all():
+            return None, "UTBOT ATR 계산 대기", {}
+
+        if use_heikin_ashi:
+            src_series = (closed['open'] + closed['high'] + closed['low'] + closed['close']) / 4.0
+        else:
+            src_series = closed['close'].astype(float)
+
+        valid = pd.DataFrame({
+            'timestamp': closed['timestamp'],
+            'src': src_series.astype(float),
+            'atr': atr_series.astype(float)
+        }).dropna().reset_index(drop=True)
+        if len(valid) < 3:
+            return None, "UTBOT 지표 확정 대기", {}
+
+        valid['nloss'] = valid['atr'] * key_value
+        trail = []
+        for idx, row in valid.iterrows():
+            src_val = float(row['src'])
+            nloss_val = float(row['nloss'])
+            if idx == 0:
+                trail.append(src_val - nloss_val)
+                continue
+
+            prev_stop = float(trail[-1])
+            prev_src = float(valid.iloc[idx - 1]['src'])
+            if src_val > prev_stop and prev_src > prev_stop:
+                next_stop = max(prev_stop, src_val - nloss_val)
+            elif src_val < prev_stop and prev_src < prev_stop:
+                next_stop = min(prev_stop, src_val + nloss_val)
+            elif src_val > prev_stop:
+                next_stop = src_val - nloss_val
+            else:
+                next_stop = src_val + nloss_val
+            trail.append(next_stop)
+
+        valid['trail_stop'] = trail
+
+        prev_row = valid.iloc[-2]
+        curr_row = valid.iloc[-1]
+        prev_src = float(prev_row['src'])
+        curr_src = float(curr_row['src'])
+        prev_stop = float(prev_row['trail_stop'])
+        curr_stop = float(curr_row['trail_stop'])
+
+        buy = curr_src > curr_stop and prev_src <= prev_stop
+        sell = curr_src < curr_stop and prev_src >= prev_stop
+        detail = {
+            'key_value': key_value,
+            'atr_period': atr_period,
+            'use_heikin_ashi': use_heikin_ashi,
+            'curr_src': curr_src,
+            'curr_stop': curr_stop,
+            'curr_atr': float(curr_row['atr']),
+            'signal_ts': int(curr_row['timestamp'])
+        }
+
+        if buy:
+            reason = (
+                f"UTBOT LONG: src {curr_src:.4f} > stop {curr_stop:.4f} "
+                f"(key={key_value:.2f}, ATR={atr_period}, HA={'ON' if use_heikin_ashi else 'OFF'})"
+            )
+            return 'long', reason, detail
+
+        if sell:
+            reason = (
+                f"UTBOT SHORT: src {curr_src:.4f} < stop {curr_stop:.4f} "
+                f"(key={key_value:.2f}, ATR={atr_period}, HA={'ON' if use_heikin_ashi else 'OFF'})"
+            )
+            return 'short', reason, detail
+
+        reason = (
+            f"UTBOT 대기: src {curr_src:.4f} / stop {curr_stop:.4f} "
+            f"(key={key_value:.2f}, ATR={atr_period}, HA={'ON' if use_heikin_ashi else 'OFF'})"
+        )
+        return None, reason, detail
+
     def _calculate_cameron_signal(self, df, strategy_params):
         cfg = strategy_params.get('Cameron', {})
         rsi_period = int(cfg.get('rsi_period', 14) or 14)
@@ -1745,6 +1863,8 @@ class SignalEngine(BaseEngine):
             kalman_enabled = bool(kalman_cfg.get('entry_enabled', False) or kalman_cfg.get('exit_enabled', False))
             active_strategy = strategy_params.get('active_strategy', 'sma').upper()
             entry_mode = strategy_params.get('entry_mode', 'cross').upper()
+            if active_strategy == 'UTBOT':
+                entry_mode = 'UTBOT'
             
             # MicroVBO State
             vbo_state = self.vbo_states.get(symbol, {})
@@ -1884,6 +2004,9 @@ class SignalEngine(BaseEngine):
             # ===== ?꾨왂 ?ㅼ젙 濡쒕뱶 =====
             strategy_params = self.cfg.get('signal_engine', {}).get('strategy_params', {})
             active_strategy = strategy_params.get('active_strategy', 'sma').lower()
+            raw_strategy_sig = None
+            if active_strategy == 'utbot':
+                raw_strategy_sig, _, _ = self._calculate_utbot_signal(df, strategy_params)
             
             # ?꾨왂蹂??좏샇 怨꾩궛
             sig, is_bullish, is_bearish, strategy_name, entry_mode, kalman_enabled = await self._calculate_strategy_signal(symbol, df, strategy_params, active_strategy)
@@ -1931,7 +2054,32 @@ class SignalEngine(BaseEngine):
             next_candle_ts = candle_time + self._timeframe_to_ms(tf)
 
             # ===== entry_mode???곕Ⅸ 吏꾩엯 泥섎━ (Exit???쒖쇅) =====
-            if (active_strategy in MA_STRATEGIES and entry_mode in ['cross', 'position']) or active_strategy == 'cameron':
+            if active_strategy == 'utbot':
+                if pos and raw_strategy_sig and (
+                    (pos['side'] == 'long' and raw_strategy_sig == 'short') or
+                    (pos['side'] == 'short' and raw_strategy_sig == 'long')
+                ):
+                    logger.info(f"[UTBOT] Flip trigger: {pos['side']} -> {raw_strategy_sig}")
+                    await self.exit_position(symbol, f"{strategy_name}_Flip")
+                    await asyncio.sleep(1)
+                    self.position_cache = None
+                    check_pos = await self.get_server_position(symbol, use_cache=False)
+                    if not check_pos:
+                        if sig == raw_strategy_sig:
+                            self.last_entry_reason[symbol] = f"UTBOT 반전 신호 -> {sig.upper()} 재진입"
+                            await self.entry(symbol, sig, float(k['c']))
+                        else:
+                            self.last_entry_reason[symbol] = "UTBOT 반전 신호로 청산 완료, 재진입은 필터 또는 방향 설정으로 차단"
+                    else:
+                        logger.warning(f"[UTBOT] Flip re-entry skipped: position still open ({check_pos['side']})")
+                elif not pos and sig:
+                    self.last_entry_reason[symbol] = f"UTBOT 조건 충족 -> {sig.upper()} 진입"
+                    logger.info(f"[UTBOT] New entry {sig.upper()}")
+                    await self.entry(symbol, sig, float(k['c']))
+                elif pos:
+                    self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), UTBOT 반대신호 대기"
+
+            elif (active_strategy in MA_STRATEGIES and entry_mode in ['cross', 'position']) or active_strategy == 'cameron':
                 # Cross/Position 紐⑤뱶: Primary TF?먯꽌??"吏꾩엯(Entry)"留?泥섎━
                 # 泥?궛(Exit)? Secondary TF candle (process_exit_candle)?먯꽌 泥섎━??
                 
@@ -2001,6 +2149,13 @@ class SignalEngine(BaseEngine):
             if active_strategy == 'cameron':
                 strategy_name = "CAMERON(Exit)"
                 exit_sig, exit_reason, _ = self._calculate_cameron_signal(df, strategy_params)
+                raw_exit_long = current_side.lower() == 'long' and exit_sig == 'short'
+                raw_exit_short = current_side.lower() == 'short' and exit_sig == 'long'
+                if raw_exit_long or raw_exit_short:
+                    logger.info(f"[Exit Debug] {symbol} {strategy_name}: {exit_reason}")
+            elif active_strategy == 'utbot':
+                strategy_name = "UTBOT(Exit)"
+                exit_sig, exit_reason, _ = self._calculate_utbot_signal(df, strategy_params)
                 raw_exit_long = current_side.lower() == 'long' and exit_sig == 'short'
                 raw_exit_short = current_side.lower() == 'short' and exit_sig == 'long'
                 if raw_exit_long or raw_exit_short:
@@ -2262,7 +2417,10 @@ class SignalEngine(BaseEngine):
         ma_bullish = False
         ma_bearish = False
         
-        if active_strategy == 'cameron':
+        if active_strategy == 'utbot':
+            strategy_name = "UTBOT"
+
+        elif active_strategy == 'cameron':
             strategy_name = "CAMERON"
 
         elif active_strategy == 'hma':
@@ -2335,7 +2493,22 @@ class SignalEngine(BaseEngine):
         logger.info(f"?뱤 [Kalman] Velocity: {kalman_vel:.4f}, Direction: {self.kalman_states[symbol]['direction']}")
         
         # ===== 3. 吏꾩엯 紐⑤뱶蹂??좏샇 ?먮떒 (ENTRY SIGNAL) =====
-        if active_strategy == 'cameron':
+        if active_strategy == 'utbot':
+            entry_mode = 'utbot'
+            sig, entry_reason, _ = self._calculate_utbot_signal(df, strategy_params)
+            is_bullish = sig == 'long'
+            is_bearish = sig == 'short'
+
+            if sig == 'long' and kalman_entry_enabled and not kalman_bullish:
+                entry_reason = "UTBOT LONG, Kalman 진입필터 미통과"
+                sig = None
+                is_bullish = False
+            elif sig == 'short' and kalman_entry_enabled and not kalman_bearish:
+                entry_reason = "UTBOT SHORT, Kalman 진입필터 미통과"
+                sig = None
+                is_bearish = False
+
+        elif active_strategy == 'cameron':
             entry_mode = 'pattern'
             sig, entry_reason, cameron_state = self._calculate_cameron_signal(df, strategy_params)
             self.cameron_states[symbol] = cameron_state
@@ -4339,9 +4512,15 @@ class MainController:
         strategy_params = sig.get('strategy_params', {})
         active_strategy = strategy_params.get('active_strategy', 'sma').upper()
         entry_mode = strategy_params.get('entry_mode', 'cross').upper()
+        if active_strategy == 'UTBOT':
+            entry_mode = 'UTBOT'
         hma_params = strategy_params.get('HMA', {})
         hma_fast = hma_params.get('fast_period', 9)
         hma_slow = hma_params.get('slow_period', 21)
+        utbot_params = strategy_params.get('UTBot', {})
+        utbot_key = float(utbot_params.get('key_value', 1.0) or 1.0)
+        utbot_atr = int(utbot_params.get('atr_period', 10) or 10)
+        utbot_ha = "ON" if utbot_params.get('use_heikin_ashi', False) else "OFF"
         watchlist_preview = ", ".join(watchlist[:4]) if isinstance(watchlist, list) and watchlist else symbol
         if isinstance(watchlist, list) and len(watchlist) > 4:
             watchlist_preview += " ..."
@@ -4397,6 +4576,7 @@ class MainController:
 18. 진입모드 (`{entry_mode}`)
 10. SMA (`{fast_sma}/{slow_sma}`)
 17. HMA (`{hma_fast}/{hma_slow}`)
+19. UT Bot (`K={utbot_key:.2f}` / `ATR={utbot_atr}` / `HA={utbot_ha}`)
 13. TP/SL 자동청산 (`{tp_sl_status}`)
 36. ROE 자동청산 (`{tp_status}`)
 37. 손절 자동청산 (`{sl_status}`)
@@ -4452,9 +4632,10 @@ class MainController:
             '12': "📝 **Grid 설정** 입력 (예: on,200 또는 off)",
             '14': "📝 **N Days** 입력 (예: 4)",
             '15': "📝 **K1/K2** 입력 (예: 0.5,0.5)",
-            '16': "📝 **전략 선택** (1=SMA, 2=HMA, 3=CAMERON)",
+            '16': "📝 **전략 선택** (1=SMA, 2=HMA, 3=CAMERON, 4=UTBOT)",
             '17': "📝 **HMA 기간** 입력 (예: 9,21)",
             '18': "📝 **진입 모드** 선택 (1=Cross, 2=Position)",
+            '19': "📝 **UT Bot 설정** 입력 (형식: key,atr,on/off 예: 1,10,off)",
             '20': "📝 **VBO 설정** (legacy) 입력",
             '21': "📝 **FractalFisher 설정** (legacy) 입력",
             '22': "📝 **네트워크 선택** (1=테스트넷(데모), 2=메인넷)",
@@ -4865,7 +5046,7 @@ class MainController:
             # ======== Signal ?좉퇋 ?듭뀡 ========
             elif choice == '16':
                 # ?꾨왂 蹂寃?(踰덊샇 ?먮뒗 ?대쫫?쇰줈 ?좏깮)
-                strategy_map = {'1': 'sma', '2': 'hma', '3': 'cameron'}
+                strategy_map = {'1': 'sma', '2': 'hma', '3': 'cameron', '4': 'utbot'}
                 val_lower = val.lower().strip()
                 
                 # 踰덊샇 ?낅젰 ??蹂??
@@ -4888,9 +5069,11 @@ class MainController:
                         signal_engine.fisher_value = None
                     elif val_lower == 'cameron' and signal_engine:
                         signal_engine.cameron_states = {}
+                    elif val_lower == 'utbot' and signal_engine:
+                        signal_engine.last_processed_candle_ts = {}
                     await update.message.reply_text(f"✅ 전략 변경: {val_lower.upper()}")
                 else:
-                    await update.message.reply_text("❌ 1~3 또는 sma/hma/cameron을 입력하세요.\n1=SMA, 2=HMA, 3=CAMERON")
+                    await update.message.reply_text("❌ 1~4 또는 sma/hma/cameron/utbot을 입력하세요.\n1=SMA, 2=HMA, 3=CAMERON, 4=UTBOT")
                     return SELECT
             
             elif choice == '20':
@@ -4954,6 +5137,39 @@ class MainController:
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'HMA', 'fast_period'], fast)
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'HMA', 'slow_period'], slow)
                 await update.message.reply_text(f"✅ HMA 기간 변경: {fast}/{slow}")
+
+            elif choice == '19':
+                parts = val.replace(' ', '').split(',')
+                if len(parts) not in (2, 3):
+                    await update.message.reply_text("❌ 형식: key,atr,on/off (예: 1,10,off)")
+                    return SELECT
+
+                key_value = float(parts[0])
+                atr_period = int(parts[1])
+                if key_value <= 0 or atr_period < 1:
+                    await update.message.reply_text("❌ key는 0보다 커야 하고 ATR 기간은 1 이상이어야 합니다.")
+                    return SELECT
+
+                use_ha = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBot', {}).get('use_heikin_ashi', False)
+                if len(parts) == 3:
+                    ha_raw = parts[2].lower()
+                    if ha_raw in ('on', 'true', '1', 'yes'):
+                        use_ha = True
+                    elif ha_raw in ('off', 'false', '0', 'no'):
+                        use_ha = False
+                    else:
+                        await update.message.reply_text("❌ HA 옵션은 on/off 로 입력하세요.")
+                        return SELECT
+
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBot', 'key_value'], key_value)
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBot', 'atr_period'], atr_period)
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBot', 'use_heikin_ashi'], use_ha)
+                signal_engine = self.engines.get('signal')
+                if signal_engine:
+                    signal_engine.last_processed_candle_ts = {}
+                await update.message.reply_text(
+                    f"✅ UT Bot 설정 변경: key={key_value:.2f}, ATR={atr_period}, HA={'ON' if use_ha else 'OFF'}"
+                )
             
             elif choice == '18':
                 # 吏꾩엯紐⑤뱶 蹂寃?(1=cross, 2=position)
@@ -5080,7 +5296,7 @@ class MainController:
                 await update.message.reply_text(f"✅ 청산 타임프레임 변경: {val}")
             
             # 10~41 success message handled
-            if choice not in ['2', '3', '10', '11', '12', '14', '15', '16', '17', '18', '20', '21', '22', '23', '26', '27', '28', '30', '31', '33', '34', '35', '41']:
+            if choice not in ['2', '3', '10', '11', '12', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '26', '27', '28', '30', '31', '33', '34', '35', '41']:
                 await update.message.reply_text(f"✅ 설정 완료: {val}")
             await self._restore_main_keyboard(update)
             await self.show_setup_menu(update)
