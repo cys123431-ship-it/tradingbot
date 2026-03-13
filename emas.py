@@ -1347,7 +1347,8 @@ class SignalEngine(BaseEngine):
             'curr_src': curr_src,
             'curr_stop': curr_stop,
             'curr_atr': float(curr_row['atr']),
-            'signal_ts': int(curr_row['timestamp'])
+            'signal_ts': int(curr_row['timestamp']),
+            'bias_side': 'long' if curr_src > curr_stop else 'short' if curr_src < curr_stop else None
         }
 
         if buy:
@@ -1365,7 +1366,8 @@ class SignalEngine(BaseEngine):
             return 'short', reason, detail
 
         reason = (
-            f"UTBOT 대기: src {curr_src:.4f} / stop {curr_stop:.4f} "
+            f"UTBOT 상태 유지 ({detail['bias_side'].upper() if detail['bias_side'] else 'NONE'}): "
+            f"src {curr_src:.4f} / stop {curr_stop:.4f} "
             f"(key={key_value:.2f}, ATR={atr_period}, HA={'ON' if use_heikin_ashi else 'OFF'})"
         )
         return None, reason, detail
@@ -1901,7 +1903,9 @@ class SignalEngine(BaseEngine):
                     
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     
-                    sig, _, _, _, _, _ = await self._calculate_strategy_signal(symbol, df, scan_params, active_strategy)
+                    sig, _, _, _, _, _ = await self._calculate_strategy_signal(
+                        symbol, df, scan_params, active_strategy, allow_utbot_stateful=False
+                    )
                     
                     if sig:
                         # ?ъ????뺤씤 (?쒕쾭)
@@ -2149,7 +2153,36 @@ class SignalEngine(BaseEngine):
             next_candle_ts = candle_time + self._timeframe_to_ms(tf)
 
             # ===== entry_mode???곕Ⅸ 吏꾩엯 泥섎━ (Exit???쒖쇅) =====
-            if active_strategy in {'utbot', 'rsibb'}:
+            if active_strategy == 'utbot':
+                target_sig = sig
+                need_flip = pos and target_sig and (
+                    (pos['side'] == 'long' and target_sig == 'short') or
+                    (pos['side'] == 'short' and target_sig == 'long')
+                )
+
+                if need_flip:
+                    flip_label = "반전 신호" if raw_strategy_sig == target_sig else "상태 동기화"
+                    logger.info(f"[{strategy_name}] {flip_label}: {pos['side']} -> {target_sig}")
+                    await self.exit_position(symbol, f"{strategy_name}_Flip")
+                    await asyncio.sleep(1)
+                    self.position_cache = None
+                    check_pos = await self.get_server_position(symbol, use_cache=False)
+                    if not check_pos:
+                        if sig == target_sig:
+                            self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} -> {sig.upper()} 재진입"
+                            await self.entry(symbol, sig, float(k['c']))
+                        else:
+                            self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} 청산 완료, 재진입은 필터 또는 방향 설정으로 차단"
+                    else:
+                        logger.warning(f"[{strategy_name}] Flip re-entry skipped: position still open ({check_pos['side']})")
+                elif not pos and target_sig:
+                    self.last_entry_reason[symbol] = f"{strategy_name} 현재 상태 -> {target_sig.upper()} 진입"
+                    logger.info(f"[{strategy_name}] Stateful entry {target_sig.upper()}")
+                    await self.entry(symbol, target_sig, float(k['c']))
+                elif pos:
+                    self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {strategy_name} 반대신호 대기"
+
+            elif active_strategy == 'rsibb':
                 if pos and raw_strategy_sig and (
                     (pos['side'] == 'long' and raw_strategy_sig == 'short') or
                     (pos['side'] == 'short' and raw_strategy_sig == 'long')
@@ -2404,7 +2437,7 @@ class SignalEngine(BaseEngine):
             traceback.print_exc()
             return False
 
-    async def _calculate_strategy_signal(self, symbol, df, strategy_params, active_strategy):
+    async def _calculate_strategy_signal(self, symbol, df, strategy_params, active_strategy, allow_utbot_stateful=True):
         """
         ?꾨왂蹂??좏샇 怨꾩궛
         
@@ -2593,16 +2626,20 @@ class SignalEngine(BaseEngine):
         # ===== 3. 吏꾩엯 紐⑤뱶蹂??좏샇 ?먮떒 (ENTRY SIGNAL) =====
         if active_strategy == 'utbot':
             entry_mode = 'utbot'
-            sig, entry_reason, _ = self._calculate_utbot_signal(df, strategy_params)
+            sig, entry_reason, utbot_detail = self._calculate_utbot_signal(df, strategy_params)
+            if sig is None and allow_utbot_stateful:
+                bias_sig = utbot_detail.get('bias_side')
+                if bias_sig in {'long', 'short'}:
+                    sig = bias_sig
             is_bullish = sig == 'long'
             is_bearish = sig == 'short'
 
             if sig == 'long' and kalman_entry_enabled and not kalman_bullish:
-                entry_reason = "UTBOT LONG, Kalman 진입필터 미통과"
+                entry_reason = "UTBOT LONG 상태, Kalman 진입필터 미통과"
                 sig = None
                 is_bullish = False
             elif sig == 'short' and kalman_entry_enabled and not kalman_bearish:
-                entry_reason = "UTBOT SHORT, Kalman 진입필터 미통과"
+                entry_reason = "UTBOT SHORT 상태, Kalman 진입필터 미통과"
                 sig = None
                 is_bearish = False
 
