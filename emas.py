@@ -4286,6 +4286,9 @@ class MainController:
         dm = self.cfg.get('dual_mode_engine', {})
         eng = sys_cfg.get('active_engine', CORE_ENGINE)
         direction = sys_cfg.get('trade_direction', 'both')
+        watchlist = sig.get('watchlist', ['BTC/USDT'])
+        if not isinstance(watchlist, list) or not watchlist:
+            watchlist = ['BTC/USDT']
         
         if eng == 'shannon':
             lev = sha.get('leverage', 5)
@@ -4298,7 +4301,6 @@ class MainController:
             symbol = dm.get('target_symbol', 'BTC/USDT')
         else:
             lev = sig.get('common_settings', {}).get('leverage', 20)
-            watchlist = sig.get('watchlist', ['BTC/USDT'])
             symbol = watchlist[0] if watchlist else 'BTC/USDT'
             
         status = "🔴 OFF" if self.is_paused else "🟢 ON"

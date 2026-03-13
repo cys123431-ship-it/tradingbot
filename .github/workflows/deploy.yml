@@ -22,6 +22,7 @@ jobs:
             PID_FILE=/home/azureuser/emas.pid
             LOG_FILE=/home/azureuser/emas.log
             CONFIG_BACKUP=/tmp/tradingbot-config.json
+            BOT_CTL="$APP_DIR/scripts/bot_ctl.sh"
 
             echo "=== 배포 시작 ==="
             cd "$APP_DIR"
@@ -60,26 +61,23 @@ jobs:
 
             ./venv/bin/python -m pip install --upgrade pip
             ./venv/bin/python -m pip install -r requirements.txt
+            chmod +x "$BOT_CTL"
 
             echo "=== 기존 봇 종료 중 ==="
-            if [ -f "$PID_FILE" ]; then
-              OLD_PID=$(cat "$PID_FILE" || true)
-              if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-                kill "$OLD_PID"
-              fi
-              rm -f "$PID_FILE"
-              sleep 2
-            fi
+            PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" "$BOT_CTL" stop
 
             echo "=== 봇 재시작 ==="
-            : > "$LOG_FILE"
-            nohup "$APP_DIR/venv/bin/python" "$APP_DIR/emas.py" > "$LOG_FILE" 2>&1 < /dev/null &
-            NEW_PID=$!
-            echo "$NEW_PID" > "$PID_FILE"
-            sleep 3
+            PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" TRUNCATE_LOG=1 "$BOT_CTL" start
+
+            echo "=== 재부팅/헬스체크 자동복구 등록 ==="
+            (
+              crontab -l 2>/dev/null | grep -vF "$BOT_CTL" || true
+              printf '%s\n' "@reboot bash -lc 'sleep 30 && cd \"$APP_DIR\" && PID_FILE=\"$PID_FILE\" LOG_FILE=\"$LOG_FILE\" \"$BOT_CTL\" start'"
+              printf '%s\n' "*/5 * * * * bash -lc 'cd \"$APP_DIR\" && PID_FILE=\"$PID_FILE\" LOG_FILE=\"$LOG_FILE\" \"$BOT_CTL\" ensure'"
+            ) | crontab -
 
             echo "=== 프로세스 확인 ==="
-            if ! kill -0 "$NEW_PID" 2>/dev/null; then
+            if ! PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" "$BOT_CTL" status; then
               echo "프로세스 시작 실패"
               tail -n 50 "$LOG_FILE"
               exit 1
@@ -87,6 +85,6 @@ jobs:
 
             echo "=== 배포 완료 ==="
             echo "실행 중인 emas.py 프로세스:"
-            ps -p "$NEW_PID" -o pid=,cmd= || echo "프로세스 없음"
+            PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" "$BOT_CTL" status || echo "프로세스 없음"
             echo "로그 마지막 10줄:"
             tail -n 10 "$LOG_FILE" || echo "로그 파일 없음"
