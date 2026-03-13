@@ -62,7 +62,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 CORE_ENGINE = 'signal'
 MA_STRATEGIES = {'sma', 'hma'}
-PATTERN_STRATEGIES = {'cameron', 'utbot'}
+PATTERN_STRATEGIES = {'cameron', 'utbot', 'rsibb'}
 CORE_STRATEGIES = MA_STRATEGIES | PATTERN_STRATEGIES
 
 # ??뷀삎 ?곹깭
@@ -150,6 +150,11 @@ class TradingConfig:
                         'atr_period': 10,
                         'use_heikin_ashi': False
                     },
+                    'RSIBB': {
+                        'rsi_length': 6,
+                        'bb_length': 200,
+                        'bb_mult': 2.0
+                    },
                     'Cameron': {
                         'rsi_period': 14,
                         'rsi_oversold': 30,
@@ -229,6 +234,11 @@ class TradingConfig:
                 'key_value': 1.0,
                 'atr_period': 10,
                 'use_heikin_ashi': False
+            },
+            'RSIBB': {
+                'rsi_length': 6,
+                'bb_length': 200,
+                'bb_mult': 2.0
             },
             'Cameron': {
                 'rsi_period': 14,
@@ -387,6 +397,11 @@ class TradingConfig:
                         "key_value": 1.0,
                         "atr_period": 10,
                         "use_heikin_ashi": False
+                    },
+                    "RSIBB": {
+                        "rsi_length": 6,
+                        "bb_length": 200,
+                        "bb_mult": 2.0
                     },
                     "Cameron": {
                         "rsi_period": 14,
@@ -1355,6 +1370,82 @@ class SignalEngine(BaseEngine):
         )
         return None, reason, detail
 
+    def _calculate_rsibb_signal(self, df, strategy_params):
+        cfg = strategy_params.get('RSIBB', {})
+        rsi_length = max(1, int(cfg.get('rsi_length', 6) or 6))
+        bb_length = max(2, int(cfg.get('bb_length', 200) or 200))
+        bb_mult = float(cfg.get('bb_mult', 2.0) or 2.0)
+
+        closed = df.iloc[:-1].copy().reset_index(drop=True)
+        min_bars = max(bb_length + 3, rsi_length + 3, 30)
+        if len(closed) < min_bars:
+            return None, "RSIBB 데이터 부족", {}
+
+        close_series = closed['close'].astype(float)
+        rsi_series = ta.rsi(close_series, length=rsi_length)
+        bb_basis = ta.sma(close_series, length=bb_length)
+        bb_std = close_series.rolling(bb_length).std(ddof=0)
+        bb_upper = bb_basis + (bb_std * bb_mult)
+        bb_lower = bb_basis - (bb_std * bb_mult)
+
+        valid = pd.DataFrame({
+            'timestamp': closed['timestamp'],
+            'close': close_series,
+            'rsi': rsi_series,
+            'bb_basis': bb_basis,
+            'bb_upper': bb_upper,
+            'bb_lower': bb_lower
+        }).dropna().reset_index(drop=True)
+        if len(valid) < 2:
+            return None, "RSIBB 지표 확정 대기", {}
+
+        prev_row = valid.iloc[-2]
+        curr_row = valid.iloc[-1]
+        prev_rsi = float(prev_row['rsi'])
+        curr_rsi = float(curr_row['rsi'])
+        prev_close = float(prev_row['close'])
+        curr_close = float(curr_row['close'])
+        prev_upper = float(prev_row['bb_upper'])
+        curr_upper = float(curr_row['bb_upper'])
+        prev_lower = float(prev_row['bb_lower'])
+        curr_lower = float(curr_row['bb_lower'])
+
+        rsi_cross_up = prev_rsi <= 50.0 and curr_rsi > 50.0
+        rsi_cross_down = prev_rsi >= 50.0 and curr_rsi < 50.0
+        price_cross_up = prev_close <= prev_lower and curr_close > curr_lower
+        price_cross_down = prev_close >= prev_upper and curr_close < curr_upper
+
+        detail = {
+            'rsi_length': rsi_length,
+            'bb_length': bb_length,
+            'bb_mult': bb_mult,
+            'curr_rsi': curr_rsi,
+            'curr_close': curr_close,
+            'curr_upper': curr_upper,
+            'curr_lower': curr_lower,
+            'signal_ts': int(curr_row['timestamp'])
+        }
+
+        if rsi_cross_up and price_cross_up:
+            reason = (
+                f"RSIBB LONG: RSI 50 상향 + 하단밴드 상향돌파 "
+                f"(RSI={curr_rsi:.2f}, BB={bb_length}, x{bb_mult:.2f})"
+            )
+            return 'long', reason, detail
+
+        if rsi_cross_down and price_cross_down:
+            reason = (
+                f"RSIBB SHORT: RSI 50 하향 + 상단밴드 하향돌파 "
+                f"(RSI={curr_rsi:.2f}, BB={bb_length}, x{bb_mult:.2f})"
+            )
+            return 'short', reason, detail
+
+        reason = (
+            f"RSIBB 대기: RSI={curr_rsi:.2f}, "
+            f"Upper={curr_upper:.4f}, Lower={curr_lower:.4f}"
+        )
+        return None, reason, detail
+
     def _calculate_cameron_signal(self, df, strategy_params):
         cfg = strategy_params.get('Cameron', {})
         rsi_period = int(cfg.get('rsi_period', 14) or 14)
@@ -1865,6 +1956,8 @@ class SignalEngine(BaseEngine):
             entry_mode = strategy_params.get('entry_mode', 'cross').upper()
             if active_strategy == 'UTBOT':
                 entry_mode = 'UTBOT'
+            elif active_strategy == 'RSIBB':
+                entry_mode = 'RSIBB'
             
             # MicroVBO State
             vbo_state = self.vbo_states.get(symbol, {})
@@ -2007,6 +2100,8 @@ class SignalEngine(BaseEngine):
             raw_strategy_sig = None
             if active_strategy == 'utbot':
                 raw_strategy_sig, _, _ = self._calculate_utbot_signal(df, strategy_params)
+            elif active_strategy == 'rsibb':
+                raw_strategy_sig, _, _ = self._calculate_rsibb_signal(df, strategy_params)
             
             # ?꾨왂蹂??좏샇 怨꾩궛
             sig, is_bullish, is_bearish, strategy_name, entry_mode, kalman_enabled = await self._calculate_strategy_signal(symbol, df, strategy_params, active_strategy)
@@ -2054,30 +2149,30 @@ class SignalEngine(BaseEngine):
             next_candle_ts = candle_time + self._timeframe_to_ms(tf)
 
             # ===== entry_mode???곕Ⅸ 吏꾩엯 泥섎━ (Exit???쒖쇅) =====
-            if active_strategy == 'utbot':
+            if active_strategy in {'utbot', 'rsibb'}:
                 if pos and raw_strategy_sig and (
                     (pos['side'] == 'long' and raw_strategy_sig == 'short') or
                     (pos['side'] == 'short' and raw_strategy_sig == 'long')
                 ):
-                    logger.info(f"[UTBOT] Flip trigger: {pos['side']} -> {raw_strategy_sig}")
+                    logger.info(f"[{strategy_name}] Flip trigger: {pos['side']} -> {raw_strategy_sig}")
                     await self.exit_position(symbol, f"{strategy_name}_Flip")
                     await asyncio.sleep(1)
                     self.position_cache = None
                     check_pos = await self.get_server_position(symbol, use_cache=False)
                     if not check_pos:
                         if sig == raw_strategy_sig:
-                            self.last_entry_reason[symbol] = f"UTBOT 반전 신호 -> {sig.upper()} 재진입"
+                            self.last_entry_reason[symbol] = f"{strategy_name} 반전 신호 -> {sig.upper()} 재진입"
                             await self.entry(symbol, sig, float(k['c']))
                         else:
-                            self.last_entry_reason[symbol] = "UTBOT 반전 신호로 청산 완료, 재진입은 필터 또는 방향 설정으로 차단"
+                            self.last_entry_reason[symbol] = f"{strategy_name} 반전 신호로 청산 완료, 재진입은 필터 또는 방향 설정으로 차단"
                     else:
-                        logger.warning(f"[UTBOT] Flip re-entry skipped: position still open ({check_pos['side']})")
+                        logger.warning(f"[{strategy_name}] Flip re-entry skipped: position still open ({check_pos['side']})")
                 elif not pos and sig:
-                    self.last_entry_reason[symbol] = f"UTBOT 조건 충족 -> {sig.upper()} 진입"
-                    logger.info(f"[UTBOT] New entry {sig.upper()}")
+                    self.last_entry_reason[symbol] = f"{strategy_name} 조건 충족 -> {sig.upper()} 진입"
+                    logger.info(f"[{strategy_name}] New entry {sig.upper()}")
                     await self.entry(symbol, sig, float(k['c']))
                 elif pos:
-                    self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), UTBOT 반대신호 대기"
+                    self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {strategy_name} 반대신호 대기"
 
             elif (active_strategy in MA_STRATEGIES and entry_mode in ['cross', 'position']) or active_strategy == 'cameron':
                 # Cross/Position 紐⑤뱶: Primary TF?먯꽌??"吏꾩엯(Entry)"留?泥섎━
@@ -2420,6 +2515,9 @@ class SignalEngine(BaseEngine):
         if active_strategy == 'utbot':
             strategy_name = "UTBOT"
 
+        elif active_strategy == 'rsibb':
+            strategy_name = "RSIBB"
+
         elif active_strategy == 'cameron':
             strategy_name = "CAMERON"
 
@@ -2505,6 +2603,21 @@ class SignalEngine(BaseEngine):
                 is_bullish = False
             elif sig == 'short' and kalman_entry_enabled and not kalman_bearish:
                 entry_reason = "UTBOT SHORT, Kalman 진입필터 미통과"
+                sig = None
+                is_bearish = False
+
+        elif active_strategy == 'rsibb':
+            entry_mode = 'rsibb'
+            sig, entry_reason, _ = self._calculate_rsibb_signal(df, strategy_params)
+            is_bullish = sig == 'long'
+            is_bearish = sig == 'short'
+
+            if sig == 'long' and kalman_entry_enabled and not kalman_bullish:
+                entry_reason = "RSIBB LONG, Kalman 진입필터 미통과"
+                sig = None
+                is_bullish = False
+            elif sig == 'short' and kalman_entry_enabled and not kalman_bearish:
+                entry_reason = "RSIBB SHORT, Kalman 진입필터 미통과"
                 sig = None
                 is_bearish = False
 
@@ -4514,6 +4627,8 @@ class MainController:
         entry_mode = strategy_params.get('entry_mode', 'cross').upper()
         if active_strategy == 'UTBOT':
             entry_mode = 'UTBOT'
+        elif active_strategy == 'RSIBB':
+            entry_mode = 'RSIBB'
         hma_params = strategy_params.get('HMA', {})
         hma_fast = hma_params.get('fast_period', 9)
         hma_slow = hma_params.get('slow_period', 21)
@@ -4521,6 +4636,10 @@ class MainController:
         utbot_key = float(utbot_params.get('key_value', 1.0) or 1.0)
         utbot_atr = int(utbot_params.get('atr_period', 10) or 10)
         utbot_ha = "ON" if utbot_params.get('use_heikin_ashi', False) else "OFF"
+        rsibb_params = strategy_params.get('RSIBB', {})
+        rsibb_rsi = int(rsibb_params.get('rsi_length', 6) or 6)
+        rsibb_bb = int(rsibb_params.get('bb_length', 200) or 200)
+        rsibb_mult = float(rsibb_params.get('bb_mult', 2.0) or 2.0)
         watchlist_preview = ", ".join(watchlist[:4]) if isinstance(watchlist, list) and watchlist else symbol
         if isinstance(watchlist, list) and len(watchlist) > 4:
             watchlist_preview += " ..."
@@ -4577,6 +4696,7 @@ class MainController:
 10. SMA (`{fast_sma}/{slow_sma}`)
 17. HMA (`{hma_fast}/{hma_slow}`)
 19. UT Bot (`K={utbot_key:.2f}` / `ATR={utbot_atr}` / `HA={utbot_ha}`)
+20. RSI+BB (`RSI={rsibb_rsi}` / `BB={rsibb_bb}` / `x{rsibb_mult:.2f}`)
 13. TP/SL 자동청산 (`{tp_sl_status}`)
 36. ROE 자동청산 (`{tp_status}`)
 37. 손절 자동청산 (`{sl_status}`)
@@ -4632,11 +4752,11 @@ class MainController:
             '12': "📝 **Grid 설정** 입력 (예: on,200 또는 off)",
             '14': "📝 **N Days** 입력 (예: 4)",
             '15': "📝 **K1/K2** 입력 (예: 0.5,0.5)",
-            '16': "📝 **전략 선택** (1=SMA, 2=HMA, 3=CAMERON, 4=UTBOT)",
+            '16': "📝 **전략 선택** (1=SMA, 2=HMA, 3=CAMERON, 4=UTBOT, 5=RSIBB)",
             '17': "📝 **HMA 기간** 입력 (예: 9,21)",
             '18': "📝 **진입 모드** 선택 (1=Cross, 2=Position)",
             '19': "📝 **UT Bot 설정** 입력 (형식: key,atr,on/off 예: 1,10,off)",
-            '20': "📝 **VBO 설정** (legacy) 입력",
+            '20': "📝 **RSI+BB 설정** 입력 (형식: rsi_length,bb_length,bb_mult 예: 6,200,2)",
             '21': "📝 **FractalFisher 설정** (legacy) 입력",
             '22': "📝 **네트워크 선택** (1=테스트넷(데모), 2=메인넷)",
             '23': "📝 **거래량 급등 채굴 기능** (1=ON, 0=OFF)",
@@ -5046,7 +5166,7 @@ class MainController:
             # ======== Signal ?좉퇋 ?듭뀡 ========
             elif choice == '16':
                 # ?꾨왂 蹂寃?(踰덊샇 ?먮뒗 ?대쫫?쇰줈 ?좏깮)
-                strategy_map = {'1': 'sma', '2': 'hma', '3': 'cameron', '4': 'utbot'}
+                strategy_map = {'1': 'sma', '2': 'hma', '3': 'cameron', '4': 'utbot', '5': 'rsibb'}
                 val_lower = val.lower().strip()
                 
                 # 踰덊샇 ?낅젰 ??蹂??
@@ -5071,34 +5191,35 @@ class MainController:
                         signal_engine.cameron_states = {}
                     elif val_lower == 'utbot' and signal_engine:
                         signal_engine.last_processed_candle_ts = {}
+                    elif val_lower == 'rsibb' and signal_engine:
+                        signal_engine.last_processed_candle_ts = {}
                     await update.message.reply_text(f"✅ 전략 변경: {val_lower.upper()}")
                 else:
-                    await update.message.reply_text("❌ 1~4 또는 sma/hma/cameron/utbot을 입력하세요.\n1=SMA, 2=HMA, 3=CAMERON, 4=UTBOT")
+                    await update.message.reply_text("❌ 1~5 또는 sma/hma/cameron/utbot/rsibb를 입력하세요.\n1=SMA, 2=HMA, 3=CAMERON, 4=UTBOT, 5=RSIBB")
                     return SELECT
             
             elif choice == '20':
-                await update.message.reply_text("MicroVBO is archived in legacy mode. Core mode uses SMA/HMA/CAMERON only.")
-                return SELECT
-                # VBO ?ㅼ젙 蹂寃?(?뺤떇: "atr湲곌컙,?뚰뙆諛곗닔,TP諛곗닔,SL諛곗닔")
                 parts = val.replace(' ', '').split(',')
-                if len(parts) != 4:
-                    await update.message.reply_text("❌ 형식: atr,돌파,TP,SL (예: 14,0.5,1.0,0.5)")
+                if len(parts) != 3:
+                    await update.message.reply_text("❌ 형식: rsi_length,bb_length,bb_mult (예: 6,200,2)")
                     return SELECT
-                try:
-                    atr_period = int(parts[0])
-                    breakout_mult = float(parts[1])
-                    tp_mult = float(parts[2])
-                    sl_mult = float(parts[3])
-                    
-                    await self.cfg.update_value(['signal_engine', 'strategy_params', 'MicroVBO', 'atr_period'], atr_period)
-                    await self.cfg.update_value(['signal_engine', 'strategy_params', 'MicroVBO', 'breakout_multiplier'], breakout_mult)
-                    await self.cfg.update_value(['signal_engine', 'strategy_params', 'MicroVBO', 'tp_atr_multiplier'], tp_mult)
-                    await self.cfg.update_value(['signal_engine', 'strategy_params', 'MicroVBO', 'sl_atr_multiplier'], sl_mult)
-                    
-                    await update.message.reply_text(f"✅ VBO 설정: ATR={atr_period}, 돌파={breakout_mult}, TP={tp_mult}x, SL={sl_mult}x")
-                except ValueError:
-                    await update.message.reply_text("❌ 올바른 숫자를 입력하세요.")
+
+                rsi_length = int(parts[0])
+                bb_length = int(parts[1])
+                bb_mult = float(parts[2])
+                if rsi_length < 1 or bb_length < 2 or bb_mult <= 0:
+                    await update.message.reply_text("❌ RSI 기간은 1 이상, BB 기간은 2 이상, 배수는 0보다 커야 합니다.")
                     return SELECT
+
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'RSIBB', 'rsi_length'], rsi_length)
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'RSIBB', 'bb_length'], bb_length)
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'RSIBB', 'bb_mult'], bb_mult)
+                signal_engine = self.engines.get('signal')
+                if signal_engine:
+                    signal_engine.last_processed_candle_ts = {}
+                await update.message.reply_text(
+                    f"✅ RSI+BB 설정 변경: RSI={rsi_length}, BB={bb_length}, x{bb_mult:.2f}"
+                )
             
             elif choice == '21':
                 await update.message.reply_text("FractalFisher is archived in legacy mode. Core mode uses SMA/HMA/CAMERON only.")
