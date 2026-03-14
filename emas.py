@@ -2154,6 +2154,7 @@ class SignalEngine(BaseEngine):
             
             # ?꾨왂蹂??좏샇 怨꾩궛
             sig, is_bullish, is_bearish, strategy_name, entry_mode, kalman_enabled = await self._calculate_strategy_signal(symbol, df, strategy_params, active_strategy)
+            strategy_sig = sig
             
             # 留ㅻℓ 諛⑺뼢 ?꾪꽣
             d_mode = self.cfg.get('system_settings', {}).get('trade_direction', 'both')
@@ -2199,7 +2200,8 @@ class SignalEngine(BaseEngine):
 
             # ===== entry_mode???곕Ⅸ 吏꾩엯 泥섎━ (Exit???쒖쇅) =====
             if active_strategy == 'utbot':
-                target_sig = sig
+                target_sig = strategy_sig
+                entry_sig = sig
                 need_flip = pos and target_sig and (
                     (pos['side'] == 'long' and target_sig == 'short') or
                     (pos['side'] == 'short' and target_sig == 'long')
@@ -2213,17 +2215,19 @@ class SignalEngine(BaseEngine):
                     self.position_cache = None
                     check_pos = await self.get_server_position(symbol, use_cache=False)
                     if not check_pos:
-                        if sig == target_sig:
-                            self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} -> {sig.upper()} 재진입"
-                            await self.entry(symbol, sig, float(k['c']))
+                        if entry_sig == target_sig:
+                            self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} -> {entry_sig.upper()} 재진입"
+                            await self.entry(symbol, entry_sig, float(k['c']))
                         else:
                             self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} 청산 완료, 재진입은 필터 또는 방향 설정으로 차단"
                     else:
                         logger.warning(f"[{strategy_name}] Flip re-entry skipped: position still open ({check_pos['side']})")
+                elif not pos and entry_sig:
+                    self.last_entry_reason[symbol] = f"{strategy_name} 현재 상태 -> {entry_sig.upper()} 진입"
+                    logger.info(f"[{strategy_name}] Stateful entry {entry_sig.upper()}")
+                    await self.entry(symbol, entry_sig, float(k['c']))
                 elif not pos and target_sig:
-                    self.last_entry_reason[symbol] = f"{strategy_name} 현재 상태 -> {target_sig.upper()} 진입"
-                    logger.info(f"[{strategy_name}] Stateful entry {target_sig.upper()}")
-                    await self.entry(symbol, target_sig, float(k['c']))
+                    self.last_entry_reason[symbol] = f"{strategy_name} 현재 상태는 {target_sig.upper()}지만 진입은 방향 설정 또는 필터로 차단"
                 elif pos:
                     self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {strategy_name} 반대신호 대기"
 
