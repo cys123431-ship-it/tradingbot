@@ -1162,6 +1162,7 @@ class SignalEngine(BaseEngine):
         self.last_candle_time = {}
         self.last_candle_success = {} 
         self.last_processed_candle_ts = {}
+        self.last_state_sync_candle_ts = {}
         self.last_processed_exit_candle_ts = {}
         self.pending_reentry = {} # {symbol: {'side': 'long'|'short', 'target_time': ts}}
         
@@ -1196,6 +1197,7 @@ class SignalEngine(BaseEngine):
         self.last_candle_time = {}
         self.last_candle_success = {}
         self.last_processed_candle_ts = {}
+        self.last_state_sync_candle_ts = {}
         self.last_processed_exit_candle_ts = {}
         self.cameron_states = {}
         
@@ -1776,6 +1778,9 @@ class SignalEngine(BaseEngine):
         if not isinstance(self.last_processed_candle_ts, dict):
             logger.error(f"?좑툘 State corrupted: last_processed_candle_ts is {type(self.last_processed_candle_ts)}, resetting.")
             self.last_processed_candle_ts = {}
+        if not isinstance(self.last_state_sync_candle_ts, dict):
+            logger.error(f"?좑툘 State corrupted: last_state_sync_candle_ts is {type(self.last_state_sync_candle_ts)}, resetting.")
+            self.last_state_sync_candle_ts = {}
         if not isinstance(self.last_processed_exit_candle_ts, dict):
             logger.error(f"?좑툘 State corrupted: last_processed_exit_candle_ts is {type(self.last_processed_exit_candle_ts)}, resetting.")
             self.last_processed_exit_candle_ts = {}
@@ -1806,29 +1811,38 @@ class SignalEngine(BaseEngine):
             # 2. Check Primary TF (Entry Logic)
             last_closed_p = ohlcv_p[-2]
             ts_p = last_closed_p[0]
+            k_p = {
+                't': ts_p, 'o': str(last_closed_p[1]), 'h': str(last_closed_p[2]),
+                'l': str(last_closed_p[3]), 'c': str(last_closed_p[4]), 'v': str(last_closed_p[5])
+            }
             
             # ?щ낵蹂??곹깭 珥덇린??
             if symbol not in self.last_processed_candle_ts:
                 self.last_processed_candle_ts[symbol] = 0
-            
-            if ts_p > self.last_processed_candle_ts[symbol]:
-                logger.info(f"?빉截?[Primary {primary_tf}] {symbol} New Candle: {ts_p} close={last_closed_p[4]}")
-                
-                k_p = {
-                    't': ts_p, 'o': str(last_closed_p[1]), 'h': str(last_closed_p[2]),
-                    'l': str(last_closed_p[3]), 'c': str(last_closed_p[4]), 'v': str(last_closed_p[5])
-                }
-                await self.process_primary_candle(symbol, k_p)
-                if self.last_candle_success.get(symbol, False):
-                    self.last_processed_candle_ts[symbol] = ts_p
-                else:
-                    logger.warning(f"Primary candle processing failed, will retry: {symbol} {ts_p}")
-                
-            # 3. Check Exit TF (Exit Logic)
+            if symbol not in self.last_state_sync_candle_ts:
+                self.last_state_sync_candle_ts[symbol] = 0
+
             strategy_params = cfg.get('strategy_params', {})
             entry_mode = strategy_params.get('entry_mode', 'cross').lower()
             active_strategy = strategy_params.get('active_strategy', 'sma').lower()
+            uses_stateful_primary_sync = active_strategy in {'utbot', 'utrsibb'}
             
+            if ts_p > self.last_processed_candle_ts[symbol]:
+                logger.info(f"?빉截?[Primary {primary_tf}] {symbol} New Candle: {ts_p} close={last_closed_p[4]}")
+                await self.process_primary_candle(symbol, k_p)
+                if self.last_candle_success.get(symbol, False):
+                    self.last_processed_candle_ts[symbol] = ts_p
+                    if uses_stateful_primary_sync:
+                        self.last_state_sync_candle_ts[symbol] = ts_p
+                else:
+                    logger.warning(f"Primary candle processing failed, will retry: {symbol} {ts_p}")
+            elif uses_stateful_primary_sync and self.last_state_sync_candle_ts[symbol] < ts_p:
+                logger.info(f"?봽 [Primary {primary_tf}] {symbol} State sync on closed candle: {ts_p} close={last_closed_p[4]}")
+                await self.process_primary_candle(symbol, k_p, force=True)
+                if self.last_candle_success.get(symbol, False):
+                    self.last_state_sync_candle_ts[symbol] = ts_p
+                
+            # 3. Check Exit TF (Exit Logic)
             # Cross/Position 紐⑤뱶?먯꽌留?Secondary TF 泥?궛 濡쒖쭅 ?ъ슜
             uses_secondary_exit = (
                 pos_side != 'NONE'
@@ -2102,7 +2116,7 @@ class SignalEngine(BaseEngine):
         self.fisher_entry_atr = None
         self.fisher_trailing_stop = None
 
-    async def process_primary_candle(self, symbol, k):
+    async def process_primary_candle(self, symbol, k, force=False):
         candle_time = k['t']
         
         # ?щ낵蹂??곹깭 珥덇린??
@@ -2111,7 +2125,7 @@ class SignalEngine(BaseEngine):
             self.last_candle_success[symbol] = True
 
         # 以묐났 罹붾뱾 諛⑹? (媛숈? 罹붾뱾 ?ъ쿂由?李⑤떒) - ?깃났??寃쎌슦?먮쭔 ?ㅽ궢
-        if candle_time <= self.last_candle_time[symbol] and self.last_candle_success[symbol]:
+        if (not force) and candle_time <= self.last_candle_time[symbol] and self.last_candle_success[symbol]:
             logger.debug(f"??Skipping duplicate candle: {candle_time} <= {self.last_candle_time[symbol]}")
             return
         
