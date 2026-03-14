@@ -1163,6 +1163,7 @@ class SignalEngine(BaseEngine):
         self.last_candle_success = {} 
         self.last_processed_candle_ts = {}
         self.last_state_sync_candle_ts = {}
+        self.last_stateful_retry_ts = {}
         self.last_processed_exit_candle_ts = {}
         self.pending_reentry = {} # {symbol: {'side': 'long'|'short', 'target_time': ts}}
         
@@ -1198,6 +1199,7 @@ class SignalEngine(BaseEngine):
         self.last_candle_success = {}
         self.last_processed_candle_ts = {}
         self.last_state_sync_candle_ts = {}
+        self.last_stateful_retry_ts = {}
         self.last_processed_exit_candle_ts = {}
         self.cameron_states = {}
         
@@ -1653,7 +1655,7 @@ class SignalEngine(BaseEngine):
             try:
                 positions = await asyncio.to_thread(self.exchange.fetch_positions)
                 for p in positions:
-                    if float(p.get('contracts', 0)) > 0:
+                    if abs(float(p.get('contracts', 0) or 0)) > 0:
                         sym = p['symbol'].replace(':USDT', '')
                         active_position_symbols.add(sym)
             except Exception as e:
@@ -1781,6 +1783,9 @@ class SignalEngine(BaseEngine):
         if not isinstance(self.last_state_sync_candle_ts, dict):
             logger.error(f"?좑툘 State corrupted: last_state_sync_candle_ts is {type(self.last_state_sync_candle_ts)}, resetting.")
             self.last_state_sync_candle_ts = {}
+        if not isinstance(self.last_stateful_retry_ts, dict):
+            logger.error(f"?좑툘 State corrupted: last_stateful_retry_ts is {type(self.last_stateful_retry_ts)}, resetting.")
+            self.last_stateful_retry_ts = {}
         if not isinstance(self.last_processed_exit_candle_ts, dict):
             logger.error(f"?좑툘 State corrupted: last_processed_exit_candle_ts is {type(self.last_processed_exit_candle_ts)}, resetting.")
             self.last_processed_exit_candle_ts = {}
@@ -1821,15 +1826,19 @@ class SignalEngine(BaseEngine):
                 self.last_processed_candle_ts[symbol] = 0
             if symbol not in self.last_state_sync_candle_ts:
                 self.last_state_sync_candle_ts[symbol] = 0
+            if symbol not in self.last_stateful_retry_ts:
+                self.last_stateful_retry_ts[symbol] = 0.0
 
             strategy_params = cfg.get('strategy_params', {})
             entry_mode = strategy_params.get('entry_mode', 'cross').lower()
             active_strategy = strategy_params.get('active_strategy', 'sma').lower()
             uses_stateful_primary_sync = active_strategy in {'utbot', 'utrsibb'}
+            processed_primary_this_tick = False
             
             if ts_p > self.last_processed_candle_ts[symbol]:
                 logger.info(f"?빉截?[Primary {primary_tf}] {symbol} New Candle: {ts_p} close={last_closed_p[4]}")
                 await self.process_primary_candle(symbol, k_p)
+                processed_primary_this_tick = True
                 if self.last_candle_success.get(symbol, False):
                     self.last_processed_candle_ts[symbol] = ts_p
                     if uses_stateful_primary_sync:
@@ -1839,8 +1848,22 @@ class SignalEngine(BaseEngine):
             elif uses_stateful_primary_sync and self.last_state_sync_candle_ts[symbol] < ts_p:
                 logger.info(f"?봽 [Primary {primary_tf}] {symbol} State sync on closed candle: {ts_p} close={last_closed_p[4]}")
                 await self.process_primary_candle(symbol, k_p, force=True)
+                processed_primary_this_tick = True
                 if self.last_candle_success.get(symbol, False):
                     self.last_state_sync_candle_ts[symbol] = ts_p
+            elif uses_stateful_primary_sync and pos_side != 'NONE':
+                retry_interval = 15.0
+                now_ts = time.time()
+                if (not processed_primary_this_tick) and (now_ts - float(self.last_stateful_retry_ts.get(symbol, 0.0) or 0.0) >= retry_interval):
+                    logger.info(
+                        f"?봽 [Primary {primary_tf}] {symbol} Stateful reconcile retry: "
+                        f"candle={ts_p} pos={pos_side} close={last_closed_p[4]}"
+                    )
+                    self.last_stateful_retry_ts[symbol] = now_ts
+                    await self.process_primary_candle(symbol, k_p, force=True)
+                    if self.last_candle_success.get(symbol, False):
+                        self.last_state_sync_candle_ts[symbol] = ts_p
+                    pos_side = await self.check_status(symbol, current_price)
                 
             # 3. Check Exit TF (Exit Logic)
             # Cross/Position 紐⑤뱶?먯꽌留?Secondary TF 泥?궛 濡쒖쭅 ?ъ슜
@@ -2235,6 +2258,8 @@ class SignalEngine(BaseEngine):
                         else:
                             self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} 청산 완료, 재진입은 필터 또는 방향 설정으로 차단"
                     else:
+                        self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} 청산 미확인, 상태 재동기화 재시도 대기"
+                        self.last_stateful_retry_ts[symbol] = 0.0
                         logger.warning(f"[{strategy_name}] Flip re-entry skipped: position still open ({check_pos['side']})")
                 elif not pos and entry_sig:
                     self.last_entry_reason[symbol] = f"{strategy_name} 현재 상태 -> {entry_sig.upper()} 진입"
@@ -2266,6 +2291,8 @@ class SignalEngine(BaseEngine):
                         else:
                             self.last_entry_reason[symbol] = f"{strategy_name} UT 반전 청산 완료, {regime_sig.upper()} RSI+BB 타이밍 대기"
                     else:
+                        self.last_entry_reason[symbol] = f"{strategy_name} UT 반전 청산 미확인, 상태 재동기화 재시도 대기"
+                        self.last_stateful_retry_ts[symbol] = 0.0
                         logger.warning(f"[{strategy_name}] Hybrid re-entry skipped: position still open ({check_pos['side']})")
                 elif not pos and entry_sig:
                     self.last_entry_reason[symbol] = f"{strategy_name} 조건 충족 -> {entry_sig.upper()} 진입"
