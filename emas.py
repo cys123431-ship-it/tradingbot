@@ -574,6 +574,7 @@ class BaseEngine:
         self.cfg = controller.cfg
         self.db = controller.db
         self.exchange = controller.exchange
+        self.market_data_exchange = getattr(controller, 'market_data_exchange', self.exchange)
         self.running = False
         self.position_cache = None
         self.position_cache_time = 0
@@ -1808,7 +1809,7 @@ class SignalEngine(BaseEngine):
             
         try:
             # 1. OHLCV (Primary) - Basic monitoring
-            ohlcv_p = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, primary_tf, limit=5)
+            ohlcv_p = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, primary_tf, limit=5)
             if not ohlcv_p or len(ohlcv_p) < 3:
                 return
             
@@ -1883,7 +1884,7 @@ class SignalEngine(BaseEngine):
             if uses_secondary_exit:
                 exit_tf = self._get_exit_timeframe(symbol)
                 
-                ohlcv_e = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, exit_tf, limit=5)
+                ohlcv_e = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, exit_tf, limit=5)
                 if ohlcv_e and len(ohlcv_e) >= 3:
                     last_closed_e = ohlcv_e[-2]
                     ts_e = last_closed_e[0]
@@ -1918,7 +1919,7 @@ class SignalEngine(BaseEngine):
         """
         try:
             logger.info("?뱻 Scanning high volume markets (>200M USDT)...")
-            tickers = await asyncio.to_thread(self.exchange.fetch_tickers)
+            tickers = await asyncio.to_thread(self.market_data_exchange.fetch_tickers)
             
             # 1. 1李??꾪꽣: 嫄곕옒湲덉븸 200M ?댁긽
             candidates = []
@@ -1981,7 +1982,7 @@ class SignalEngine(BaseEngine):
                         active_strategy = 'sma'
                     
                     # Use scanner_timeframe if set, but ensure we are thinking about consistency
-                    ohlcv = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, scan_tf, limit=300)
+                    ohlcv = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, scan_tf, limit=300)
                     if not ohlcv: continue
                     
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -2061,6 +2062,8 @@ class SignalEngine(BaseEngine):
                 'daily_count': count, 'daily_pnl': daily_pnl,
                 'network': 'TESTNET' if self.cfg.get('api', {}).get('use_testnet', True) else 'MAINNET',
                 'exchange_id': getattr(self.exchange, 'id', 'unknown'),
+                'market_data_exchange_id': getattr(self.market_data_exchange, 'id', 'unknown'),
+                'market_data_source': getattr(self.ctrl, 'market_data_source_label', 'BINANCE FUTURES MAINNET PUBLIC'),
                 'pos_side': pos_side,
                 'entry_price': float(pos['entryPrice']) if pos else 0.0,
                 'coin_amt': float(pos['contracts']) if pos else 0.0,
@@ -2234,7 +2237,7 @@ class SignalEngine(BaseEngine):
             # [MODIFIED] Prioritize entry_timeframe for fetching entry OHLCV
             common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
             tf = common_cfg.get('entry_timeframe', common_cfg.get('timeframe', '15m'))
-            ohlcv = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, tf, limit=300)
+            ohlcv = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, tf, limit=300)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
             # [CRITICAL] Ensure numeric types (Robust Loop)
@@ -2566,7 +2569,7 @@ class SignalEngine(BaseEngine):
         """
         try:
             # Fetch history for Exit TF
-            ohlcv = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, tf, limit=300)
+            ohlcv = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, tf, limit=300)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             # [CRITICAL] Ensure numeric types (Robust Loop)
             for col in ['open', 'high', 'low', 'close', 'volume']:
@@ -4641,6 +4644,9 @@ class MainController:
         
         self.exchange = self._build_exchange(creds)
         self._configure_exchange_network(self.exchange, api.get('use_testnet', True))
+        self.market_data_exchange = self._build_public_market_data_exchange()
+        self.market_data_source_label = "BINANCE FUTURES MAINNET PUBLIC"
+        logger.info(f"Market data source configured: {self.market_data_source_label}")
         
         self.engines = {
             CORE_ENGINE: SignalEngine(self)
@@ -4659,6 +4665,12 @@ class MainController:
         return ccxt.binance({
             'apiKey': creds.get('api_key', ''),
             'secret': creds.get('secret_key', ''),
+            'options': {'defaultType': 'future'},
+            'enableRateLimit': True
+        })
+
+    def _build_public_market_data_exchange(self):
+        return ccxt.binance({
             'options': {'defaultType': 'future'},
             'enableRateLimit': True
         })
@@ -4775,6 +4787,7 @@ class MainController:
             # 4. 嫄곕옒???ъ큹湲고솕
             self.exchange = self._build_exchange(creds)
             network_name = self._configure_exchange_network(self.exchange, use_testnet)
+            self.market_data_exchange = self._build_public_market_data_exchange()
             
             # 5. 留덉폆 ?뺣낫 濡쒕뱶
             await asyncio.to_thread(self.exchange.load_markets)
@@ -4782,6 +4795,7 @@ class MainController:
             # 6. ?붿쭊?ㅼ뿉 ??exchange ?꾨떖
             for engine in self.engines.values():
                 engine.exchange = self.exchange
+                engine.market_data_exchange = self.market_data_exchange
                 engine.position_cache = None
                 engine.position_cache_time = 0
             
@@ -6392,8 +6406,11 @@ class MainController:
                     sl_text = "ON" if protection_cfg.get('sl_enabled', False) else "OFF"
                     network = d.get('network', '?')
                     exchange_id = d.get('exchange_id', '?')
+                    market_data_exchange_id = d.get('market_data_exchange_id', '?')
+                    market_data_source = d.get('market_data_source', 'BINANCE FUTURES MAINNET PUBLIC')
                     msg += f"⏱ TF: 진입 `{e_tf}` / 청산 `{x_tf}`\n"
                     msg += f"🌐 거래소: `{exchange_id}` | 네트워크 `{network}`\n"
+                    msg += f"📡 신호데이터: `{market_data_exchange_id}` | `{market_data_source}`\n"
                     msg += f"🛡 보호주문: TP `{tp_text}` | SL `{sl_text}`\n"
                     msg += f"📝 진입판정: `{entry_reason}`\n"
                     stateful_diag = d.get('stateful_diag', {})
