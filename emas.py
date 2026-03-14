@@ -1847,6 +1847,7 @@ class SignalEngine(BaseEngine):
                     self.last_processed_candle_ts[symbol] = ts_p
                     if uses_stateful_primary_sync:
                         self.last_state_sync_candle_ts[symbol] = ts_p
+                    pos_side = await self.check_status(symbol, current_price)
                 else:
                     logger.warning(f"Primary candle processing failed, will retry: {symbol} {ts_p}")
             elif uses_stateful_primary_sync and self.last_state_sync_candle_ts[symbol] < ts_p:
@@ -1855,6 +1856,7 @@ class SignalEngine(BaseEngine):
                 processed_primary_this_tick = True
                 if self.last_candle_success.get(symbol, False):
                     self.last_state_sync_candle_ts[symbol] = ts_p
+                    pos_side = await self.check_status(symbol, current_price)
             elif uses_stateful_primary_sync and pos_side != 'NONE':
                 retry_interval = 15.0
                 now_ts = time.time()
