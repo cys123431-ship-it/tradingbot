@@ -2188,6 +2188,10 @@ class SignalEngine(BaseEngine):
             lines.append(
                 f"src={float(info.get('src')):.4f} stop={float(info.get('stop')):.4f}"
             )
+        if info.get('signal_ts_human') or info.get('feed_last_ts_human'):
+            lines.append(
+                f"tf={info.get('tf_used', '?')} signal_ts={info.get('signal_ts_human', '?')} feed_last={info.get('feed_last_ts_human', '?')}"
+            )
         note = info.get('note')
         if note:
             lines.append(f"note={note}")
@@ -2269,6 +2273,8 @@ class SignalEngine(BaseEngine):
             current_side = pos['side'] if pos else 'NONE'
             logger.info(f"?뱧 Current position: {current_side}, Signal: {sig or 'NONE'}, Mode: {entry_mode}")
             if active_strategy in {'utbot', 'utrsibb'}:
+                signal_ts = raw_ut_detail.get('signal_ts')
+                feed_last_ts = int(df.iloc[-1]['timestamp']) if len(df) >= 1 else None
                 self._update_stateful_diag(
                     symbol,
                     stage='evaluate',
@@ -2282,6 +2288,12 @@ class SignalEngine(BaseEngine):
                     ut_ha='ON' if raw_ut_detail.get('use_heikin_ashi') else 'OFF',
                     src=raw_ut_detail.get('curr_src'),
                     stop=raw_ut_detail.get('curr_stop'),
+                    tf_used=tf,
+                    signal_ts=signal_ts,
+                    signal_ts_human=datetime.fromtimestamp(signal_ts / 1000).strftime('%m-%d %H:%M') if signal_ts else None,
+                    feed_last_ts=feed_last_ts,
+                    feed_last_ts_human=datetime.fromtimestamp(feed_last_ts / 1000).strftime('%m-%d %H:%M') if feed_last_ts else None,
+                    feed_last_close=float(df.iloc[-1]['close']) if len(df) >= 1 else None,
                     note=f"force={'Y' if force else 'N'} dir={d_mode}"
                 )
             
@@ -6372,6 +6384,12 @@ class MainController:
                             msg += (
                                 f"UT 값: src `{float(stateful_diag.get('src')):.2f}` | "
                                 f"stop `{float(stateful_diag.get('stop')):.2f}`\n"
+                            )
+                        if stateful_diag.get('signal_ts_human') or stateful_diag.get('feed_last_ts_human'):
+                            msg += (
+                                f"UT 캔들: tf `{stateful_diag.get('tf_used', '?')}` | "
+                                f"signal `{stateful_diag.get('signal_ts_human', '?')}` | "
+                                f"feed_last `{stateful_diag.get('feed_last_ts_human', '?')}`\n"
                             )
                         diag_note = stateful_diag.get('note')
                         if diag_note:
