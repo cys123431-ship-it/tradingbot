@@ -2059,6 +2059,8 @@ class SignalEngine(BaseEngine):
                 'engine': 'Signal', 'symbol': symbol, 'price': price,
                 'total_equity': total, 'free_usdt': free, 'mmr': mmr,
                 'daily_count': count, 'daily_pnl': daily_pnl,
+                'network': 'TESTNET' if self.cfg.get('api', {}).get('use_testnet', True) else 'MAINNET',
+                'exchange_id': getattr(self.exchange, 'id', 'unknown'),
                 'pos_side': pos_side,
                 'entry_price': float(pos['entryPrice']) if pos else 0.0,
                 'coin_amt': float(pos['contracts']) if pos else 0.0,
@@ -6369,7 +6371,10 @@ class MainController:
                     protection_cfg = d.get('protection_config', {})
                     tp_text = "ON" if protection_cfg.get('tp_enabled', False) else "OFF"
                     sl_text = "ON" if protection_cfg.get('sl_enabled', False) else "OFF"
+                    network = d.get('network', '?')
+                    exchange_id = d.get('exchange_id', '?')
                     msg += f"⏱ TF: 진입 `{e_tf}` / 청산 `{x_tf}`\n"
+                    msg += f"🌐 거래소: `{exchange_id}` | 네트워크 `{network}`\n"
                     msg += f"🛡 보호주문: TP `{tp_text}` | SL `{sl_text}`\n"
                     msg += f"📝 진입판정: `{entry_reason}`\n"
                     stateful_diag = d.get('stateful_diag', {})
