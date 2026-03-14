@@ -4804,7 +4804,13 @@ class MainController:
                 " [PAUSED]" if self.is_paused else ""
             )
             self._record_status_snapshot(snapshot_key, history_text)
-            await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
+            try:
+                await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
+            except BadRequest as md_err:
+                if "can't parse entities" in str(md_err).lower():
+                    await update.message.reply_text(status_text)
+                else:
+                    raise
             return ConversationHandler.END
         
         return None
