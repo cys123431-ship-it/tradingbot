@@ -6,10 +6,50 @@ PID_FILE="${PID_FILE:-$HOME/emas.pid}"
 LOG_FILE="${LOG_FILE:-$HOME/emas.log}"
 PYTHON_BIN="${PYTHON_BIN:-$APP_DIR/venv/bin/python}"
 BOT_ENTRY="${BOT_ENTRY:-$APP_DIR/emas.py}"
+STATE_DIR="${STATE_DIR:-$APP_DIR/runtime}"
+HEARTBEAT_FILE="${HEARTBEAT_FILE:-$STATE_DIR/bot_heartbeat.json}"
 ACTION="${1:-}"
 TRUNCATE_LOG="${TRUNCATE_LOG:-0}"
 
+heartbeat_age_seconds() {
+  if [[ ! -f "$HEARTBEAT_FILE" ]]; then
+    echo ""
+    return 0
+  fi
+
+  local hb_mtime=""
+  hb_mtime="$(stat -c %Y "$HEARTBEAT_FILE" 2>/dev/null || true)"
+  if [[ -z "$hb_mtime" ]]; then
+    hb_mtime="$(stat -f %m "$HEARTBEAT_FILE" 2>/dev/null || true)"
+  fi
+  if [[ -z "$hb_mtime" ]]; then
+    echo ""
+    return 0
+  fi
+
+  local now
+  now="$(date +%s)"
+  echo $(( now - hb_mtime ))
+}
+
+last_log_excerpt() {
+  if [[ ! -f "$LOG_FILE" ]]; then
+    echo ""
+    return 0
+  fi
+
+  tail -n 3 "$LOG_FILE" 2>/dev/null \
+    | tr '\r\n' '  ' \
+    | sed 's/[[:space:]]\+/ /g' \
+    | cut -c1-220
+}
+
 start_bot() {
+  local launch_reason="${BOT_LAUNCH_REASON:-manual_start}"
+  local last_heartbeat_age="${BOT_LAST_HEARTBEAT_AGE:-}"
+  local last_pid="${BOT_LAST_PID:-}"
+  local last_log_line="${BOT_LAST_LOG_LINE:-}"
+
   if [[ -f "$PID_FILE" ]]; then
     local old_pid
     old_pid="$(cat "$PID_FILE" || true)"
@@ -30,12 +70,19 @@ start_bot() {
     return 1
   fi
 
-  mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")"
+  mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")" "$STATE_DIR"
   if [[ "$TRUNCATE_LOG" == "1" ]]; then
     : > "$LOG_FILE"
   fi
 
-  nohup "$PYTHON_BIN" "$BOT_ENTRY" >> "$LOG_FILE" 2>&1 < /dev/null &
+  nohup env \
+    BOT_LAUNCH_REASON="$launch_reason" \
+    BOT_LAST_HEARTBEAT_AGE="$last_heartbeat_age" \
+    BOT_LAST_PID="$last_pid" \
+    BOT_LAST_LOG_LINE="$last_log_line" \
+    BOT_HEARTBEAT_FILE="$HEARTBEAT_FILE" \
+    BOT_START_TS="$(date -Is)" \
+    "$PYTHON_BIN" "$BOT_ENTRY" >> "$LOG_FILE" 2>&1 < /dev/null &
   local new_pid=$!
   echo "$new_pid" > "$PID_FILE"
   sleep 3
@@ -84,6 +131,15 @@ ensure_bot() {
     return 0
   fi
 
+  local last_pid=""
+  if [[ -f "$PID_FILE" ]]; then
+    last_pid="$(cat "$PID_FILE" || true)"
+  fi
+
+  BOT_LAUNCH_REASON="ensure_restart" \
+  BOT_LAST_HEARTBEAT_AGE="$(heartbeat_age_seconds)" \
+  BOT_LAST_PID="$last_pid" \
+  BOT_LAST_LOG_LINE="$(last_log_excerpt)" \
   start_bot
 }
 
@@ -96,7 +152,7 @@ case "$ACTION" in
     ;;
   restart)
     stop_bot
-    start_bot
+    BOT_LAUNCH_REASON="${BOT_LAUNCH_REASON:-manual_restart}" start_bot
     ;;
   status)
     status_bot

@@ -2077,6 +2077,7 @@ class SignalEngine(BaseEngine):
                 'entry_mode': entry_mode,
                 'entry_reason': self.last_entry_reason.get(symbol, '대기'),
                 'stateful_diag': self.last_stateful_diag.get(symbol, {}),
+                'runtime_diag': self.ctrl.get_runtime_diag(),
                 # MicroVBO ?꾩슜 ?꾨뱶
                 'vbo_breakout_level': vbo_state.get('breakout_level'),
                 'vbo_entry_atr': vbo_state.get('entry_atr'),
@@ -4621,10 +4622,29 @@ class DualModeFractalEngine(BaseEngine):
 class MainController:
     def __init__(self):
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.runtime_dir = os.path.join(self.base_dir, 'runtime')
+        os.makedirs(self.runtime_dir, exist_ok=True)
         config_path = os.path.join(self.base_dir, 'config.json')
         self.cfg = TradingConfig(config_path)
         logger.info(f"Config path: {config_path}")
         self.db = DBManager(self.cfg.get('logging', {}).get('db_path', 'bot_database.db'))
+        self.heartbeat_file = os.environ.get(
+            'BOT_HEARTBEAT_FILE',
+            os.path.join(self.runtime_dir, 'bot_heartbeat.json')
+        )
+        self.launch_reason = os.environ.get('BOT_LAUNCH_REASON', 'manual_start')
+        self.launch_started_at = os.environ.get(
+            'BOT_START_TS',
+            datetime.now().astimezone().isoformat(timespec='seconds')
+        )
+        last_heartbeat_age = os.environ.get('BOT_LAST_HEARTBEAT_AGE', '').strip()
+        try:
+            self.last_heartbeat_age = int(float(last_heartbeat_age)) if last_heartbeat_age else None
+        except ValueError:
+            self.last_heartbeat_age = None
+        self.last_pid_before_start = os.environ.get('BOT_LAST_PID', '').strip()
+        self.last_log_line = os.environ.get('BOT_LAST_LOG_LINE', '').replace('`', "'").strip()
+        self.process_start_ts = time.time()
         
         api = self.cfg.get('api', {})
         creds = api.get('testnet', {}) if api.get('use_testnet', True) else api.get('mainnet', {})
@@ -4699,6 +4719,58 @@ class MainController:
             logger.error(f"Failed to configure testnet mode: {e}")
             raise
 
+    def _format_duration(self, seconds):
+        if seconds is None:
+            return "-"
+        seconds = max(0, int(seconds))
+        hours, rem = divmod(seconds, 3600)
+        minutes, secs = divmod(rem, 60)
+        if hours >= 24:
+            days, hours = divmod(hours, 24)
+            return f"{days}d {hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    def _write_heartbeat(self):
+        payload = {
+            'ts': datetime.now().astimezone().isoformat(timespec='seconds'),
+            'epoch': int(time.time()),
+            'pid': os.getpid(),
+            'launch_reason': self.launch_reason,
+            'paused': self.is_paused,
+            'engine': self.cfg.get('system_settings', {}).get('active_engine', CORE_ENGINE),
+            'status_count': len(self.status_data) if isinstance(self.status_data, dict) else 0
+        }
+        try:
+            os.makedirs(os.path.dirname(self.heartbeat_file), exist_ok=True)
+            with open(self.heartbeat_file, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Heartbeat write error: {e}")
+
+    def get_runtime_diag(self):
+        return {
+            'launch_reason': self.launch_reason,
+            'launch_started_at': self.launch_started_at,
+            'uptime_human': self._format_duration(time.time() - self.process_start_ts),
+            'last_heartbeat_age': self.last_heartbeat_age,
+            'last_heartbeat_age_human': self._format_duration(self.last_heartbeat_age),
+            'last_pid_before_start': self.last_pid_before_start,
+            'last_log_line': self.last_log_line
+        }
+
+    def _build_startup_notice(self):
+        lines = ["⏸ **봇 시작됨 (일시정지 상태)**", ""]
+        lines.append(f"시작사유: `{self.launch_reason}`")
+        lines.append(f"시작시각: `{self.launch_started_at}`")
+        if self.last_heartbeat_age is not None:
+            lines.append(f"이전 heartbeat age: `{self._format_duration(self.last_heartbeat_age)}`")
+        if self.last_pid_before_start:
+            lines.append(f"이전 PID: `{self.last_pid_before_start}`")
+        if self.last_log_line:
+            lines.append(f"직전 로그: `{self.last_log_line}`")
+        lines.extend(["", "설정 확인 후 `▶ RESUME`을 눌러주세요."])
+        return "\n".join(lines)
+
     async def run(self):
         logger.info("Bot starting... (Pure Polling Mode)")
         
@@ -4719,9 +4791,10 @@ class MainController:
         await self.tg_app.initialize()
         await self.tg_app.start()
         await self.tg_app.updater.start_polling()
+        self._write_heartbeat()
         
         # Startup notice in paused state with keyboard
-        await self.notify("⏸ **봇 시작됨 (일시정지 상태)**\n\n설정 확인 후 `▶ RESUME`을 눌러주세요.")
+        await self.notify(self._build_startup_notice())
         cid = self.cfg.get_chat_id()
         if cid:
             try:
@@ -4736,7 +4809,8 @@ class MainController:
         await asyncio.gather(
             self._main_polling_loop(),  # [?대쭅 ?꾩슜] 硫붿씤 ?대쭅 猷⑦봽
             self._dashboard_loop(),
-            self._hourly_report_loop()
+            self._hourly_report_loop(),
+            self._heartbeat_loop()
         )
 
     async def _switch_engine(self, name):
@@ -6195,6 +6269,18 @@ class MainController:
                 logger.error(f"Hourly report error: {e}")
                 await asyncio.sleep(60)
 
+    async def _heartbeat_loop(self):
+        """런타임 heartbeat 파일 갱신."""
+        await asyncio.sleep(5)
+
+        while True:
+            try:
+                self._write_heartbeat()
+                await asyncio.sleep(60)
+            except Exception as e:
+                logger.error(f"Heartbeat loop error: {e}")
+                await asyncio.sleep(30)
+
     # ---------------- [?쒖닔 ?대쭅] 硫붿씤 ?대쭅 猷⑦봽 ----------------
     async def _main_polling_loop(self):
         """
@@ -6376,6 +6462,21 @@ class MainController:
             msg += "💰 **자산 요약**\n"
             msg += f"총자산: `${d_first.get('total_equity', 0):.2f}` | 가용자산: `${d_first.get('free_usdt', 0):.2f}`\n"
             msg += f"MMR: `{d_first.get('mmr', 0):.2f}%` | 일일 PnL: `${d_first.get('daily_pnl', 0):+.2f}`\n"
+            runtime_diag = d_first.get('runtime_diag', {})
+            if runtime_diag:
+                msg += (
+                    f"♻️ 런타임: `{runtime_diag.get('uptime_human', '-')}` | "
+                    f"시작 `{runtime_diag.get('launch_reason', '-')}`\n"
+                )
+                restart_bits = []
+                if runtime_diag.get('last_heartbeat_age') is not None:
+                    restart_bits.append(f"이전 heartbeat `{runtime_diag.get('last_heartbeat_age_human', '-')}`")
+                if runtime_diag.get('last_pid_before_start'):
+                    restart_bits.append(f"이전 PID `{runtime_diag.get('last_pid_before_start')}`")
+                if restart_bits:
+                    msg += f"🧷 최근 재시작: {' | '.join(restart_bits)}\n"
+                if runtime_diag.get('last_log_line'):
+                    msg += f"🪵 직전 로그: `{runtime_diag.get('last_log_line')}`\n"
             msg += "━━━━━━━━━━\n"
 
             for symbol, d in all_data.items():

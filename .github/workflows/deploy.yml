@@ -21,6 +21,7 @@ jobs:
             APP_DIR=/home/azureuser/tradingbot
             PID_FILE=/home/azureuser/emas.pid
             LOG_FILE=/home/azureuser/emas.log
+            STATE_DIR=/home/azureuser/tradingbot/runtime
             CONFIG_BACKUP=/tmp/tradingbot-config.json
             BOT_CTL="$APP_DIR/scripts/bot_ctl.sh"
 
@@ -67,17 +68,17 @@ jobs:
             PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" "$BOT_CTL" stop
 
             echo "=== 봇 재시작 ==="
-            PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" TRUNCATE_LOG=1 "$BOT_CTL" start
+            PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" STATE_DIR="$STATE_DIR" TRUNCATE_LOG=1 BOT_LAUNCH_REASON=deploy_start "$BOT_CTL" start
 
             echo "=== 재부팅/헬스체크 자동복구 등록 ==="
             (
               crontab -l 2>/dev/null | grep -vF "$BOT_CTL" || true
-              printf '%s\n' "@reboot bash -lc 'sleep 30 && cd \"$APP_DIR\" && PID_FILE=\"$PID_FILE\" LOG_FILE=\"$LOG_FILE\" \"$BOT_CTL\" start'"
-              printf '%s\n' "*/5 * * * * bash -lc 'cd \"$APP_DIR\" && PID_FILE=\"$PID_FILE\" LOG_FILE=\"$LOG_FILE\" \"$BOT_CTL\" ensure'"
+              printf '%s\n' "@reboot bash -lc 'sleep 30 && cd \"$APP_DIR\" && PID_FILE=\"$PID_FILE\" LOG_FILE=\"$LOG_FILE\" STATE_DIR=\"$STATE_DIR\" BOT_LAUNCH_REASON=reboot_start \"$BOT_CTL\" start'"
+              printf '%s\n' "*/5 * * * * bash -lc 'cd \"$APP_DIR\" && PID_FILE=\"$PID_FILE\" LOG_FILE=\"$LOG_FILE\" STATE_DIR=\"$STATE_DIR\" \"$BOT_CTL\" ensure'"
             ) | crontab -
 
             echo "=== 프로세스 확인 ==="
-            if ! PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" "$BOT_CTL" status; then
+            if ! PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" STATE_DIR="$STATE_DIR" "$BOT_CTL" status; then
               echo "프로세스 시작 실패"
               tail -n 50 "$LOG_FILE"
               exit 1
@@ -85,6 +86,6 @@ jobs:
 
             echo "=== 배포 완료 ==="
             echo "실행 중인 emas.py 프로세스:"
-            PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" "$BOT_CTL" status || echo "프로세스 없음"
+            PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" STATE_DIR="$STATE_DIR" "$BOT_CTL" status || echo "프로세스 없음"
             echo "로그 마지막 10줄:"
             tail -n 10 "$LOG_FILE" || echo "로그 파일 없음"
