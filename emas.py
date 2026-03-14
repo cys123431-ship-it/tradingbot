@@ -1164,6 +1164,8 @@ class SignalEngine(BaseEngine):
         self.last_processed_candle_ts = {}
         self.last_state_sync_candle_ts = {}
         self.last_stateful_retry_ts = {}
+        self.last_stateful_diag = {}
+        self.last_stateful_diag_notice = {}
         self.last_processed_exit_candle_ts = {}
         self.pending_reentry = {} # {symbol: {'side': 'long'|'short', 'target_time': ts}}
         
@@ -1200,6 +1202,8 @@ class SignalEngine(BaseEngine):
         self.last_processed_candle_ts = {}
         self.last_state_sync_candle_ts = {}
         self.last_stateful_retry_ts = {}
+        self.last_stateful_diag = {}
+        self.last_stateful_diag_notice = {}
         self.last_processed_exit_candle_ts = {}
         self.cameron_states = {}
         
@@ -2065,6 +2069,7 @@ class SignalEngine(BaseEngine):
                 'active_strategy': active_strategy,
                 'entry_mode': entry_mode,
                 'entry_reason': self.last_entry_reason.get(symbol, '대기'),
+                'stateful_diag': self.last_stateful_diag.get(symbol, {}),
                 # MicroVBO ?꾩슜 ?꾨뱶
                 'vbo_breakout_level': vbo_state.get('breakout_level'),
                 'vbo_entry_atr': vbo_state.get('entry_atr'),
@@ -2139,6 +2144,42 @@ class SignalEngine(BaseEngine):
         self.fisher_entry_atr = None
         self.fisher_trailing_stop = None
 
+    def _update_stateful_diag(self, symbol, **kwargs):
+        current = dict(self.last_stateful_diag.get(symbol, {}))
+        current.update(kwargs)
+        self.last_stateful_diag[symbol] = current
+
+    async def _notify_stateful_diag(self, symbol, force=False):
+        info = self.last_stateful_diag.get(symbol)
+        if not info:
+            return
+
+        payload = "|".join([
+            str(info.get('stage', '')),
+            str(info.get('strategy', '')),
+            str(info.get('raw_state', '')),
+            str(info.get('raw_signal', '')),
+            str(info.get('entry_sig', '')),
+            str(info.get('pos_side', '')),
+            str(info.get('note', '')),
+        ])
+        now = time.time()
+        prev = self.last_stateful_diag_notice.get(symbol, {})
+        if not force and prev.get('payload') == payload and (now - float(prev.get('ts', 0.0) or 0.0)) < 180:
+            return
+
+        self.last_stateful_diag_notice[symbol] = {'payload': payload, 'ts': now}
+        lines = [
+            f"🧪 UT 진단 {symbol}",
+            f"stage={info.get('stage', '?')} strategy={info.get('strategy', '?')}",
+            f"raw_state={info.get('raw_state', 'none')} raw_signal={info.get('raw_signal', 'none')}",
+            f"entry_sig={info.get('entry_sig', 'none')} pos={info.get('pos_side', 'NONE')}",
+        ]
+        note = info.get('note')
+        if note:
+            lines.append(f"note={note}")
+        await self.ctrl.notify("\n".join(lines))
+
     async def process_primary_candle(self, symbol, k, force=False):
         candle_time = k['t']
         
@@ -2211,6 +2252,17 @@ class SignalEngine(BaseEngine):
             
             current_side = pos['side'] if pos else 'NONE'
             logger.info(f"?뱧 Current position: {current_side}, Signal: {sig or 'NONE'}, Mode: {entry_mode}")
+            if active_strategy in {'utbot', 'utrsibb'}:
+                self._update_stateful_diag(
+                    symbol,
+                    stage='evaluate',
+                    strategy=active_strategy.upper(),
+                    raw_state=(raw_state_sig or 'none'),
+                    raw_signal=(raw_strategy_sig or 'none'),
+                    entry_sig=(sig or 'none'),
+                    pos_side=str(current_side).upper(),
+                    note=f"force={'Y' if force else 'N'} dir={d_mode}"
+                )
             
             # 6.5 Pending Re-entry Check (吏??吏꾩엯)
             # ?댁쟾 罹붾뱾?먯꽌 泥?궛 ???덉빟??吏꾩엯???덈뒗吏 ?뺤씤
@@ -2250,20 +2302,57 @@ class SignalEngine(BaseEngine):
 
                 if need_flip:
                     flip_label = "반전 신호" if raw_strategy_sig == target_sig else "상태 동기화"
+                    self._update_stateful_diag(
+                        symbol,
+                        stage='flip_detected',
+                        strategy=strategy_name,
+                        raw_state=(target_sig or 'none'),
+                        raw_signal=(raw_strategy_sig or 'none'),
+                        entry_sig=(entry_sig or 'none'),
+                        pos_side=str(pos['side']).upper(),
+                        note=flip_label
+                    )
+                    await self._notify_stateful_diag(symbol)
                     logger.info(f"[{strategy_name}] {flip_label}: {pos['side']} -> {target_sig}")
                     await self.exit_position(symbol, f"{strategy_name}_Flip")
                     await asyncio.sleep(1)
                     self.position_cache = None
                     check_pos = await self.get_server_position(symbol, use_cache=False)
                     if not check_pos:
+                        self._update_stateful_diag(
+                            symbol,
+                            stage='flip_exit_done',
+                            pos_side='NONE',
+                            note=f"{flip_label} exit complete"
+                        )
                         if entry_sig == target_sig:
                             self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} -> {entry_sig.upper()} 재진입"
                             await self.entry(symbol, entry_sig, float(k['c']))
+                            self._update_stateful_diag(
+                                symbol,
+                                stage='flip_reentered',
+                                entry_sig=entry_sig,
+                                pos_side=entry_sig.upper(),
+                                note='re-entry submitted'
+                            )
                         else:
                             self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} 청산 완료, 재진입은 필터 또는 방향 설정으로 차단"
+                            self._update_stateful_diag(
+                                symbol,
+                                stage='flip_exit_only',
+                                note='re-entry blocked by filter or direction'
+                            )
+                            await self._notify_stateful_diag(symbol)
                     else:
                         self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} 청산 미확인, 상태 재동기화 재시도 대기"
                         self.last_stateful_retry_ts[symbol] = 0.0
+                        self._update_stateful_diag(
+                            symbol,
+                            stage='flip_still_open',
+                            pos_side=str(check_pos['side']).upper(),
+                            note='position still open after exit attempt'
+                        )
+                        await self._notify_stateful_diag(symbol, force=True)
                         logger.warning(f"[{strategy_name}] Flip re-entry skipped: position still open ({check_pos['side']})")
                 elif not pos and entry_sig:
                     self.last_entry_reason[symbol] = f"{strategy_name} 현재 상태 -> {entry_sig.upper()} 진입"
@@ -2283,20 +2372,57 @@ class SignalEngine(BaseEngine):
                 )
 
                 if need_flip:
+                    self._update_stateful_diag(
+                        symbol,
+                        stage='flip_detected',
+                        strategy=strategy_name,
+                        raw_state=(regime_sig or 'none'),
+                        raw_signal=(raw_strategy_sig or 'none'),
+                        entry_sig=(entry_sig or 'none'),
+                        pos_side=str(pos['side']).upper(),
+                        note='UT regime flip'
+                    )
+                    await self._notify_stateful_diag(symbol)
                     logger.info(f"[{strategy_name}] UT regime flip: {pos['side']} -> {regime_sig}")
                     await self.exit_position(symbol, f"{strategy_name}_UTFlip")
                     await asyncio.sleep(1)
                     self.position_cache = None
                     check_pos = await self.get_server_position(symbol, use_cache=False)
                     if not check_pos:
+                        self._update_stateful_diag(
+                            symbol,
+                            stage='flip_exit_done',
+                            pos_side='NONE',
+                            note='UT flip exit complete'
+                        )
                         if entry_sig == regime_sig:
                             self.last_entry_reason[symbol] = f"{strategy_name} UT 반전 + RSI+BB 타이밍 -> {entry_sig.upper()} 재진입"
                             await self.entry(symbol, entry_sig, float(k['c']))
+                            self._update_stateful_diag(
+                                symbol,
+                                stage='flip_reentered',
+                                entry_sig=entry_sig,
+                                pos_side=entry_sig.upper(),
+                                note='re-entry submitted'
+                            )
                         else:
                             self.last_entry_reason[symbol] = f"{strategy_name} UT 반전 청산 완료, {regime_sig.upper()} RSI+BB 타이밍 대기"
+                            self._update_stateful_diag(
+                                symbol,
+                                stage='flip_exit_only',
+                                note='waiting for RSI+BB timing'
+                            )
+                            await self._notify_stateful_diag(symbol)
                     else:
                         self.last_entry_reason[symbol] = f"{strategy_name} UT 반전 청산 미확인, 상태 재동기화 재시도 대기"
                         self.last_stateful_retry_ts[symbol] = 0.0
+                        self._update_stateful_diag(
+                            symbol,
+                            stage='flip_still_open',
+                            pos_side=str(check_pos['side']).upper(),
+                            note='position still open after exit attempt'
+                        )
+                        await self._notify_stateful_diag(symbol, force=True)
                         logger.warning(f"[{strategy_name}] Hybrid re-entry skipped: position still open ({check_pos['side']})")
                 elif not pos and entry_sig:
                     self.last_entry_reason[symbol] = f"{strategy_name} 조건 충족 -> {entry_sig.upper()} 진입"
@@ -6207,6 +6333,17 @@ class MainController:
                     msg += f"⏱ TF: 진입 `{e_tf}` / 청산 `{x_tf}`\n"
                     msg += f"🛡 보호주문: TP `{tp_text}` | SL `{sl_text}`\n"
                     msg += f"📝 진입판정: `{entry_reason}`\n"
+                    stateful_diag = d.get('stateful_diag', {})
+                    if stateful_diag:
+                        msg += (
+                            f"🧪 상태진단: stage `{stateful_diag.get('stage', '-')}` | "
+                            f"raw `{stateful_diag.get('raw_state', '-')}` | "
+                            f"entry `{stateful_diag.get('entry_sig', '-')}` | "
+                            f"pos `{stateful_diag.get('pos_side', '-')}`\n"
+                        )
+                        diag_note = stateful_diag.get('note')
+                        if diag_note:
+                            msg += f"진단메모: `{diag_note}`\n"
 
                     f_cfg = d.get('filter_config', {})
                     entry_st = d.get('entry_filters', {})
