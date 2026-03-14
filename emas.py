@@ -2194,6 +2194,10 @@ class SignalEngine(BaseEngine):
             lines.append(
                 f"tf={info.get('tf_used', '?')} signal_ts={info.get('signal_ts_human', '?')} feed_last={info.get('feed_last_ts_human', '?')}"
             )
+        if info.get('closed_ohlc_text'):
+            lines.append(f"closed={info.get('closed_ohlc_text')}")
+        if info.get('live_ohlc_text'):
+            lines.append(f"live={info.get('live_ohlc_text')}")
         note = info.get('note')
         if note:
             lines.append(f"note={note}")
@@ -2277,6 +2281,19 @@ class SignalEngine(BaseEngine):
             if active_strategy in {'utbot', 'utrsibb'}:
                 signal_ts = raw_ut_detail.get('signal_ts')
                 feed_last_ts = int(df.iloc[-1]['timestamp']) if len(df) >= 1 else None
+                closed_row = df.iloc[-2] if len(df) >= 2 else None
+                live_row = df.iloc[-1] if len(df) >= 1 else None
+
+                def _fmt_ohlc(row):
+                    if row is None:
+                        return None
+                    ts = int(row['timestamp'])
+                    return (
+                        f"{datetime.fromtimestamp(ts / 1000).strftime('%m-%d %H:%M')} "
+                        f"O{float(row['open']):.2f} H{float(row['high']):.2f} "
+                        f"L{float(row['low']):.2f} C{float(row['close']):.2f}"
+                    )
+
                 self._update_stateful_diag(
                     symbol,
                     stage='evaluate',
@@ -2296,6 +2313,8 @@ class SignalEngine(BaseEngine):
                     feed_last_ts=feed_last_ts,
                     feed_last_ts_human=datetime.fromtimestamp(feed_last_ts / 1000).strftime('%m-%d %H:%M') if feed_last_ts else None,
                     feed_last_close=float(df.iloc[-1]['close']) if len(df) >= 1 else None,
+                    closed_ohlc_text=_fmt_ohlc(closed_row),
+                    live_ohlc_text=_fmt_ohlc(live_row),
                     note=f"force={'Y' if force else 'N'} dir={d_mode}"
                 )
             
@@ -6402,6 +6421,10 @@ class MainController:
                                 f"signal `{stateful_diag.get('signal_ts_human', '?')}` | "
                                 f"feed_last `{stateful_diag.get('feed_last_ts_human', '?')}`\n"
                             )
+                        if stateful_diag.get('closed_ohlc_text'):
+                            msg += f"UT 확정봉: `{stateful_diag.get('closed_ohlc_text')}`\n"
+                        if stateful_diag.get('live_ohlc_text'):
+                            msg += f"UT 진행봉: `{stateful_diag.get('live_ohlc_text')}`\n"
                         diag_note = stateful_diag.get('note')
                         if diag_note:
                             msg += f"진단메모: `{diag_note}`\n"
