@@ -2163,6 +2163,9 @@ class SignalEngine(BaseEngine):
             str(info.get('raw_signal', '')),
             str(info.get('entry_sig', '')),
             str(info.get('pos_side', '')),
+            str(info.get('ut_key', '')),
+            str(info.get('ut_atr', '')),
+            str(info.get('ut_ha', '')),
             str(info.get('note', '')),
         ])
         now = time.time()
@@ -2177,6 +2180,14 @@ class SignalEngine(BaseEngine):
             f"raw_state={info.get('raw_state', 'none')} raw_signal={info.get('raw_signal', 'none')}",
             f"entry_sig={info.get('entry_sig', 'none')} pos={info.get('pos_side', 'NONE')}",
         ]
+        if info.get('ut_key') is not None:
+            lines.append(
+                f"ut=K{info.get('ut_key')} ATR{info.get('ut_atr')} HA={info.get('ut_ha')}"
+            )
+        if info.get('src') is not None and info.get('stop') is not None:
+            lines.append(
+                f"src={float(info.get('src')):.4f} stop={float(info.get('stop')):.4f}"
+            )
         note = info.get('note')
         if note:
             lines.append(f"note={note}")
@@ -2225,13 +2236,16 @@ class SignalEngine(BaseEngine):
             active_strategy = strategy_params.get('active_strategy', 'sma').lower()
             raw_strategy_sig = None
             raw_state_sig = None
+            raw_ut_detail = {}
             if active_strategy == 'utbot':
                 raw_strategy_sig, _, ut_detail = self._calculate_utbot_signal(df, strategy_params)
                 raw_state_sig = raw_strategy_sig or ut_detail.get('bias_side')
+                raw_ut_detail = ut_detail or {}
             elif active_strategy == 'utrsibb':
                 _, _, hybrid_detail = self._calculate_utrsibb_signal(df, strategy_params)
                 raw_strategy_sig = hybrid_detail.get('ut_state')
                 raw_state_sig = raw_strategy_sig
+                raw_ut_detail = hybrid_detail.get('ut_detail') or {}
             elif active_strategy == 'rsibb':
                 raw_strategy_sig, _, _ = self._calculate_rsibb_signal(df, strategy_params)
                 raw_state_sig = raw_strategy_sig
@@ -2263,6 +2277,11 @@ class SignalEngine(BaseEngine):
                     raw_signal=(raw_strategy_sig or 'none'),
                     entry_sig=(sig or 'none'),
                     pos_side=str(current_side).upper(),
+                    ut_key=raw_ut_detail.get('key_value'),
+                    ut_atr=raw_ut_detail.get('atr_period'),
+                    ut_ha='ON' if raw_ut_detail.get('use_heikin_ashi') else 'OFF',
+                    src=raw_ut_detail.get('curr_src'),
+                    stop=raw_ut_detail.get('curr_stop'),
                     note=f"force={'Y' if force else 'N'} dir={d_mode}"
                 )
             
@@ -6343,6 +6362,17 @@ class MainController:
                             f"entry `{stateful_diag.get('entry_sig', '-')}` | "
                             f"pos `{stateful_diag.get('pos_side', '-')}`\n"
                         )
+                        if stateful_diag.get('ut_key') is not None:
+                            msg += (
+                                f"UT 설정: K `{stateful_diag.get('ut_key')}` | "
+                                f"ATR `{stateful_diag.get('ut_atr')}` | "
+                                f"HA `{stateful_diag.get('ut_ha', '-')}`\n"
+                            )
+                        if stateful_diag.get('src') is not None and stateful_diag.get('stop') is not None:
+                            msg += (
+                                f"UT 값: src `{float(stateful_diag.get('src')):.2f}` | "
+                                f"stop `{float(stateful_diag.get('stop')):.2f}`\n"
+                            )
                         diag_note = stateful_diag.get('note')
                         if diag_note:
                             msg += f"진단메모: `{diag_note}`\n"
