@@ -2181,13 +2181,17 @@ class SignalEngine(BaseEngine):
             strategy_params = self.cfg.get('signal_engine', {}).get('strategy_params', {})
             active_strategy = strategy_params.get('active_strategy', 'sma').lower()
             raw_strategy_sig = None
+            raw_state_sig = None
             if active_strategy == 'utbot':
-                raw_strategy_sig, _, _ = self._calculate_utbot_signal(df, strategy_params)
+                raw_strategy_sig, _, ut_detail = self._calculate_utbot_signal(df, strategy_params)
+                raw_state_sig = raw_strategy_sig or ut_detail.get('bias_side')
             elif active_strategy == 'utrsibb':
                 _, _, hybrid_detail = self._calculate_utrsibb_signal(df, strategy_params)
                 raw_strategy_sig = hybrid_detail.get('ut_state')
+                raw_state_sig = raw_strategy_sig
             elif active_strategy == 'rsibb':
                 raw_strategy_sig, _, _ = self._calculate_rsibb_signal(df, strategy_params)
+                raw_state_sig = raw_strategy_sig
             
             # ?꾨왂蹂??좏샇 怨꾩궛
             sig, is_bullish, is_bearish, strategy_name, entry_mode, kalman_enabled = await self._calculate_strategy_signal(symbol, df, strategy_params, active_strategy)
@@ -2237,7 +2241,7 @@ class SignalEngine(BaseEngine):
 
             # ===== entry_mode???곕Ⅸ 吏꾩엯 泥섎━ (Exit???쒖쇅) =====
             if active_strategy == 'utbot':
-                target_sig = strategy_sig
+                target_sig = raw_state_sig
                 entry_sig = sig
                 need_flip = pos and target_sig and (
                     (pos['side'] == 'long' and target_sig == 'short') or
@@ -2271,7 +2275,7 @@ class SignalEngine(BaseEngine):
                     self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {strategy_name} 반대신호 대기"
 
             elif active_strategy == 'utrsibb':
-                regime_sig = raw_strategy_sig
+                regime_sig = raw_state_sig
                 entry_sig = sig
                 need_flip = pos and regime_sig and (
                     (pos['side'] == 'long' and regime_sig == 'short') or
