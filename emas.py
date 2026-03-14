@@ -3335,7 +3335,8 @@ class SignalEngine(BaseEngine):
         for attempt in range(max_retries):
             try:
                 order = await asyncio.to_thread(
-                    self.exchange.create_order, symbol, 'market', side, qty
+                    self.exchange.create_order, symbol, 'market', side, qty, None,
+                    {'reduceOnly': True}
                 )
                 break  # ?깃났 ??猷⑦봽 ?덉텧
             except Exception as e:
