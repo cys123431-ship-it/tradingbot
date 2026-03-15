@@ -68,7 +68,27 @@ jobs:
             PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" "$BOT_CTL" stop
 
             echo "=== 봇 재시작 ==="
-            PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" STATE_DIR="$STATE_DIR" TRUNCATE_LOG=1 BOT_LAUNCH_REASON=deploy_start "$BOT_CTL" start
+            START_OK=0
+            for ATTEMPT in 1 2 3; do
+              echo "시작 시도 #$ATTEMPT"
+              if PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" STATE_DIR="$STATE_DIR" TRUNCATE_LOG=1 BOT_LAUNCH_REASON=deploy_start "$BOT_CTL" start; then
+                sleep 5
+                if PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" STATE_DIR="$STATE_DIR" "$BOT_CTL" status; then
+                  START_OK=1
+                  break
+                fi
+              fi
+              echo "시작 확인 실패, 최근 로그:"
+              tail -n 50 "$LOG_FILE" || true
+              PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" STATE_DIR="$STATE_DIR" "$BOT_CTL" stop || true
+              sleep 3
+            done
+
+            if [ "$START_OK" -ne 1 ]; then
+              echo "봇 재시작 실패"
+              tail -n 80 "$LOG_FILE" || true
+              exit 1
+            fi
 
             echo "=== 재부팅/헬스체크 자동복구 등록 ==="
             (
