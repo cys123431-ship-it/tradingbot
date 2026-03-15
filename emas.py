@@ -16,6 +16,9 @@ import time
 import sys
 import traceback
 import re
+import atexit
+import signal
+import faulthandler
 import ccxt
 import pandas as pd
 import pandas_ta as ta
@@ -60,6 +63,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+faulthandler.enable()
 CORE_ENGINE = 'signal'
 MA_STRATEGIES = {'sma', 'hma'}
 PATTERN_STRATEGIES = {'cameron', 'utbot', 'rsibb', 'utrsibb'}
@@ -4632,6 +4636,7 @@ class MainController:
             'BOT_HEARTBEAT_FILE',
             os.path.join(self.runtime_dir, 'bot_heartbeat.json')
         )
+        self.exit_file = os.path.join(self.runtime_dir, 'bot_last_exit.json')
         self.launch_reason = os.environ.get('BOT_LAUNCH_REASON', 'manual_start')
         self.launch_started_at = os.environ.get(
             'BOT_START_TS',
@@ -4645,6 +4650,8 @@ class MainController:
         self.last_pid_before_start = os.environ.get('BOT_LAST_PID', '').strip()
         self.last_log_line = os.environ.get('BOT_LAST_LOG_LINE', '').replace('`', "'").strip()
         self.process_start_ts = time.time()
+        self.last_exit_info = self._read_last_exit_info()
+        self._exit_recorded = False
         
         api = self.cfg.get('api', {})
         creds = api.get('testnet', {}) if api.get('use_testnet', True) else api.get('mainnet', {})
@@ -4730,6 +4737,39 @@ class MainController:
             return f"{days}d {hours:02d}:{minutes:02d}:{secs:02d}"
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
+    def _read_last_exit_info(self):
+        try:
+            if not os.path.exists(self.exit_file):
+                return {}
+            with open(self.exit_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            logger.warning(f"Exit marker read error: {e}")
+            return {}
+
+    def _get_rss_mb(self):
+        try:
+            with open('/proc/self/status', 'r', encoding='utf-8') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            return round(int(parts[1]) / 1024.0, 1)
+        except Exception:
+            return None
+        return None
+
+    def _get_effective_last_exit_info(self):
+        info = self.last_exit_info if isinstance(self.last_exit_info, dict) else {}
+        if not info:
+            return {}
+        prev_pid = str(self.last_pid_before_start or "").strip()
+        exit_pid = str(info.get('pid', '')).strip()
+        if prev_pid and exit_pid and prev_pid != exit_pid:
+            return {}
+        return info
+
     def _write_heartbeat(self):
         payload = {
             'ts': datetime.now().astimezone().isoformat(timespec='seconds'),
@@ -4738,7 +4778,8 @@ class MainController:
             'launch_reason': self.launch_reason,
             'paused': self.is_paused,
             'engine': self.cfg.get('system_settings', {}).get('active_engine', CORE_ENGINE),
-            'status_count': len(self.status_data) if isinstance(self.status_data, dict) else 0
+            'status_count': len(self.status_data) if isinstance(self.status_data, dict) else 0,
+            'rss_mb': self._get_rss_mb()
         }
         try:
             os.makedirs(os.path.dirname(self.heartbeat_file), exist_ok=True)
@@ -4747,7 +4788,28 @@ class MainController:
         except Exception as e:
             logger.error(f"Heartbeat write error: {e}")
 
+    def record_exit_marker(self, reason, detail=""):
+        if self._exit_recorded:
+            return
+        self._exit_recorded = True
+        payload = {
+            'ts': datetime.now().astimezone().isoformat(timespec='seconds'),
+            'pid': os.getpid(),
+            'reason': str(reason),
+            'detail': str(detail or "")[:500],
+            'uptime_sec': int(max(0, time.time() - self.process_start_ts)),
+            'rss_mb': self._get_rss_mb()
+        }
+        try:
+            os.makedirs(os.path.dirname(self.exit_file), exist_ok=True)
+            with open(self.exit_file, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False)
+            logger.info(f"Exit marker recorded: {payload}")
+        except Exception as e:
+            logger.error(f"Exit marker write error: {e}")
+
     def get_runtime_diag(self):
+        last_exit = self._get_effective_last_exit_info()
         return {
             'launch_reason': self.launch_reason,
             'launch_started_at': self.launch_started_at,
@@ -4755,7 +4817,13 @@ class MainController:
             'last_heartbeat_age': self.last_heartbeat_age,
             'last_heartbeat_age_human': self._format_duration(self.last_heartbeat_age),
             'last_pid_before_start': self.last_pid_before_start,
-            'last_log_line': self.last_log_line
+            'last_log_line': self.last_log_line,
+            'rss_mb': self._get_rss_mb(),
+            'last_exit_reason': last_exit.get('reason'),
+            'last_exit_ts': last_exit.get('ts'),
+            'last_exit_detail': last_exit.get('detail'),
+            'last_exit_uptime_human': self._format_duration(last_exit.get('uptime_sec')),
+            'last_exit_rss_mb': last_exit.get('rss_mb')
         }
 
     def _build_startup_notice(self):
@@ -4768,6 +4836,12 @@ class MainController:
             lines.append(f"이전 PID: `{self.last_pid_before_start}`")
         if self.last_log_line:
             lines.append(f"직전 로그: `{self.last_log_line}`")
+        last_exit = self._get_effective_last_exit_info()
+        if last_exit:
+            lines.append(
+                f"직전 종료: `{last_exit.get('reason', '-')}` "
+                f"@ `{last_exit.get('ts', '-')}`"
+            )
         lines.extend(["", "설정 확인 후 `▶ RESUME`을 눌러주세요."])
         return "\n".join(lines)
 
@@ -6416,6 +6490,8 @@ class MainController:
                 except Exception as retry_error:
                     logger.warning(f"Dashboard retry edit error: {retry_error}")
                     self.dashboard_msg_id = None
+            except TimedOut as e:
+                logger.warning(f"Dashboard edit timeout: {e}")
             except BadRequest as e:
                 if "Message is not modified" in str(e):
                     return True
@@ -6436,6 +6512,8 @@ class MainController:
         except RetryAfter as e:
             logger.warning(f"Send Flood Wait: {e.retry_after}s")
             await asyncio.sleep(min(e.retry_after, 60))
+        except TimedOut as e:
+            logger.warning(f"Dashboard send timeout: {e}")
         except Exception as e:
             logger.error(f"Dashboard send error: {e}")
         return False
@@ -6466,7 +6544,8 @@ class MainController:
             if runtime_diag:
                 msg += (
                     f"♻️ 런타임: `{runtime_diag.get('uptime_human', '-')}` | "
-                    f"시작 `{runtime_diag.get('launch_reason', '-')}`\n"
+                    f"시작 `{runtime_diag.get('launch_reason', '-')}` | "
+                    f"메모리 `{runtime_diag.get('rss_mb', '-')}`MB\n"
                 )
                 restart_bits = []
                 if runtime_diag.get('last_heartbeat_age') is not None:
@@ -6477,6 +6556,18 @@ class MainController:
                     msg += f"🧷 최근 재시작: {' | '.join(restart_bits)}\n"
                 if runtime_diag.get('last_log_line'):
                     msg += f"🪵 직전 로그: `{runtime_diag.get('last_log_line')}`\n"
+                if runtime_diag.get('last_exit_reason'):
+                    exit_bits = [
+                        f"사유 `{runtime_diag.get('last_exit_reason')}`",
+                        f"시각 `{runtime_diag.get('last_exit_ts', '-')}`"
+                    ]
+                    if runtime_diag.get('last_exit_uptime_human'):
+                        exit_bits.append(f"uptime `{runtime_diag.get('last_exit_uptime_human')}`")
+                    if runtime_diag.get('last_exit_rss_mb') is not None:
+                        exit_bits.append(f"mem `{runtime_diag.get('last_exit_rss_mb')}`MB")
+                    msg += f"🧯 직전 종료: {' | '.join(exit_bits)}\n"
+                if runtime_diag.get('last_exit_detail'):
+                    msg += f"🧾 종료상세: `{runtime_diag.get('last_exit_detail')}`\n"
             msg += "━━━━━━━━━━\n"
 
             for symbol, d in all_data.items():
@@ -6696,15 +6787,31 @@ class MainController:
 
 if __name__ == "__main__":
     controller = None
+
+    def _handle_exit_signal(signum, frame):
+        signame = signal.Signals(signum).name
+        if controller:
+            controller.record_exit_marker(f"signal_{signame.lower()}", f"received {signame}")
+        raise SystemExit(128 + signum)
+
     try:
         controller = MainController()
+        atexit.register(lambda: controller and controller.record_exit_marker("atexit", "process exiting"))
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, _handle_exit_signal)
         asyncio.run(controller.run())
     except KeyboardInterrupt:
+        if controller:
+            controller.record_exit_marker("keyboard_interrupt", "KeyboardInterrupt")
         print("\n?몝 Bye")
     except Exception as e:
+        if controller:
+            controller.record_exit_marker("fatal_exception", repr(e))
         logger.error(f"Fatal error: {e}")
         traceback.print_exc()
     finally:
+        if controller:
+            controller.record_exit_marker("process_finally", "finally block reached")
         # DB ?곌껐 醫낅즺
         if controller and hasattr(controller, 'db'):
             try:
