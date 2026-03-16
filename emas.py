@@ -4684,6 +4684,7 @@ class MainController:
         self.status_data = {}
         self.is_paused = True  # 遊??쒖옉 ???쇱떆?뺤? ?곹깭 (?ㅼ젙 議곗젅 ??RESUME)
         self.dashboard_msg_id = None
+        self.dashboard_plain_text_mode = False
         self.last_status_snapshot_key = None
         self.blink_state = False
         self.last_hourly_report = 0
@@ -6467,25 +6468,41 @@ class MainController:
             logger.error("Invalid chat_id - dashboard refresh skipped")
             return False
 
+        plain_text = text.replace('**', '').replace('`', '')
+
         if self.dashboard_msg_id:
             try:
-                await self.tg_app.bot.edit_message_text(
-                    chat_id=cid,
-                    message_id=self.dashboard_msg_id,
-                    text=text,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                return True
-            except RetryAfter as e:
-                logger.warning(f"Flood Wait: Sleeping {e.retry_after}s")
-                await asyncio.sleep(e.retry_after)
-                try:
+                if self.dashboard_plain_text_mode:
+                    await self.tg_app.bot.edit_message_text(
+                        chat_id=cid,
+                        message_id=self.dashboard_msg_id,
+                        text=plain_text
+                    )
+                else:
                     await self.tg_app.bot.edit_message_text(
                         chat_id=cid,
                         message_id=self.dashboard_msg_id,
                         text=text,
                         parse_mode=ParseMode.MARKDOWN
                     )
+                return True
+            except RetryAfter as e:
+                logger.warning(f"Flood Wait: Sleeping {e.retry_after}s")
+                await asyncio.sleep(e.retry_after)
+                try:
+                    if self.dashboard_plain_text_mode:
+                        await self.tg_app.bot.edit_message_text(
+                            chat_id=cid,
+                            message_id=self.dashboard_msg_id,
+                            text=plain_text
+                        )
+                    else:
+                        await self.tg_app.bot.edit_message_text(
+                            chat_id=cid,
+                            message_id=self.dashboard_msg_id,
+                            text=text,
+                            parse_mode=ParseMode.MARKDOWN
+                        )
                     return True
                 except Exception as retry_error:
                     logger.warning(f"Dashboard retry edit error: {retry_error}")
@@ -6495,6 +6512,20 @@ class MainController:
             except BadRequest as e:
                 if "Message is not modified" in str(e):
                     return True
+                if "can't parse entities" in str(e).lower():
+                    logger.warning("Dashboard markdown parse failed on edit; switching to plain text mode")
+                    self.dashboard_plain_text_mode = True
+                    try:
+                        await self.tg_app.bot.edit_message_text(
+                            chat_id=cid,
+                            message_id=self.dashboard_msg_id,
+                            text=plain_text
+                        )
+                        return True
+                    except Exception as plain_error:
+                        logger.warning(f"Dashboard plain text edit error: {plain_error}")
+                        self.dashboard_msg_id = None
+                        return False
                 logger.warning(f"Dashboard edit error: {e}")
                 if "message to edit not found" in str(e).lower():
                     self.dashboard_msg_id = None
@@ -6502,11 +6533,17 @@ class MainController:
                 logger.error(f"Dashboard error: {e}")
 
         try:
-            m = await self.tg_app.bot.send_message(
-                chat_id=cid,
-                text=text,
-                parse_mode=ParseMode.MARKDOWN
-            )
+            if self.dashboard_plain_text_mode:
+                m = await self.tg_app.bot.send_message(
+                    chat_id=cid,
+                    text=plain_text
+                )
+            else:
+                m = await self.tg_app.bot.send_message(
+                    chat_id=cid,
+                    text=text,
+                    parse_mode=ParseMode.MARKDOWN
+                )
             self.dashboard_msg_id = m.message_id
             return True
         except RetryAfter as e:
@@ -6514,6 +6551,18 @@ class MainController:
             await asyncio.sleep(min(e.retry_after, 60))
         except TimedOut as e:
             logger.warning(f"Dashboard send timeout: {e}")
+        except BadRequest as e:
+            if "can't parse entities" in str(e).lower():
+                logger.warning("Dashboard markdown parse failed on send; switching to plain text mode")
+                self.dashboard_plain_text_mode = True
+                try:
+                    m = await self.tg_app.bot.send_message(chat_id=cid, text=plain_text)
+                    self.dashboard_msg_id = m.message_id
+                    return True
+                except Exception as plain_error:
+                    logger.error(f"Dashboard plain text send error: {plain_error}")
+                    return False
+            logger.error(f"Dashboard send error: {e}")
         except Exception as e:
             logger.error(f"Dashboard send error: {e}")
         return False
