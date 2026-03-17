@@ -583,6 +583,9 @@ class BaseEngine:
         self.position_cache = None
         self.position_cache_time = 0
         self.POSITION_CACHE_TTL = 2.0  # 2珥?罹먯떆
+        self.all_positions_cache = None
+        self.all_positions_cache_time = 0
+        self.ALL_POSITIONS_CACHE_TTL = 15.0
 
     def start(self):
         self.running = True
@@ -695,6 +698,30 @@ class BaseEngine:
                 return cache_entry[0]
             return None
 
+    async def get_active_position_symbols(self, use_cache=True):
+        now = time.time()
+
+        if use_cache and isinstance(self.all_positions_cache, set):
+            if (now - self.all_positions_cache_time) < self.ALL_POSITIONS_CACHE_TTL:
+                return set(self.all_positions_cache)
+
+        try:
+            positions = await asyncio.to_thread(self.exchange.fetch_positions)
+            active_symbols = set()
+            for p in positions:
+                if abs(float(p.get('contracts', 0) or 0)) > 0:
+                    sym = str(p.get('symbol', '')).replace(':USDT', '')
+                    if sym:
+                        active_symbols.add(sym)
+            self.all_positions_cache = set(active_symbols)
+            self.all_positions_cache_time = now
+            return active_symbols
+        except Exception as e:
+            logger.warning(f"Active positions fetch error: {e}")
+            if isinstance(self.all_positions_cache, set):
+                return set(self.all_positions_cache)
+            return set()
+
     async def get_balance_info(self):
         try:
             # Binance futures balance schemas vary by account mode (single/multi asset, PM, etc).
@@ -792,12 +819,7 @@ class BaseEngine:
 
         active_symbols_on_exchange = set()
         try:
-            positions = await asyncio.to_thread(self.exchange.fetch_positions)
-            for p in positions:
-                if abs(float(p.get('contracts', 0) or 0)) > 0:
-                    sym = str(p.get('symbol', '')).replace(':USDT', '')
-                    if sym:
-                        active_symbols_on_exchange.add(sym)
+            active_symbols_on_exchange = await self.get_active_position_symbols(use_cache=True)
         except Exception as e:
             logger.warning(f"Daily loss check: fetch_positions failed, using status cache only ({e})")
 
@@ -1662,11 +1684,7 @@ class SignalEngine(BaseEngine):
             # Common: Fetch current positions (best effort).
             # If this call fails (e.g. permission/auth issue), do not stop status updates.
             try:
-                positions = await asyncio.to_thread(self.exchange.fetch_positions)
-                for p in positions:
-                    if abs(float(p.get('contracts', 0) or 0)) > 0:
-                        sym = p['symbol'].replace(':USDT', '')
-                        active_position_symbols.add(sym)
+                active_position_symbols = await self.get_active_position_symbols(use_cache=True)
             except Exception as e:
                 logger.warning(
                     f"Signal poll_tick: fetch_positions failed, continuing without server positions ({e})"
@@ -4684,7 +4702,7 @@ class MainController:
         self.status_data = {}
         self.is_paused = True  # 遊??쒖옉 ???쇱떆?뺤? ?곹깭 (?ㅼ젙 議곗젅 ??RESUME)
         self.dashboard_msg_id = None
-        self.dashboard_plain_text_mode = False
+        self.dashboard_plain_text_mode = True
         self.last_status_snapshot_key = None
         self.blink_state = False
         self.last_hourly_report = 0
@@ -4947,6 +4965,8 @@ class MainController:
                 engine.market_data_exchange = self.market_data_exchange
                 engine.position_cache = None
                 engine.position_cache_time = 0
+                engine.all_positions_cache = None
+                engine.all_positions_cache_time = 0
             
             # 7. ?쒖꽦 ?붿쭊 ?ъ떆??
             eng_name = self.cfg.get('system_settings', {}).get('active_engine', CORE_ENGINE)
