@@ -44,11 +44,36 @@ last_log_excerpt() {
     | cut -c1-220
 }
 
+heartbeat_paused_state() {
+  if [[ ! -f "$HEARTBEAT_FILE" ]]; then
+    echo ""
+    return 0
+  fi
+
+  python3 - "$HEARTBEAT_FILE" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    paused = data.get('paused', None)
+    if isinstance(paused, bool):
+        print('true' if paused else 'false')
+    else:
+        print('')
+except Exception:
+    print('')
+PY
+}
+
 start_bot() {
   local launch_reason="${BOT_LAUNCH_REASON:-manual_start}"
   local last_heartbeat_age="${BOT_LAST_HEARTBEAT_AGE:-}"
   local last_pid="${BOT_LAST_PID:-}"
   local last_log_line="${BOT_LAST_LOG_LINE:-}"
+  local prev_paused="${BOT_PREV_PAUSED:-}"
 
   if [[ -f "$PID_FILE" ]]; then
     local old_pid
@@ -80,6 +105,7 @@ start_bot() {
     BOT_LAST_HEARTBEAT_AGE="$last_heartbeat_age" \
     BOT_LAST_PID="$last_pid" \
     BOT_LAST_LOG_LINE="$last_log_line" \
+    BOT_PREV_PAUSED="$prev_paused" \
     BOT_HEARTBEAT_FILE="$HEARTBEAT_FILE" \
     BOT_START_TS="$(date -Is)" \
     "$PYTHON_BIN" "$BOT_ENTRY" >> "$LOG_FILE" 2>&1 < /dev/null &
@@ -140,6 +166,7 @@ ensure_bot() {
   BOT_LAST_HEARTBEAT_AGE="$(heartbeat_age_seconds)" \
   BOT_LAST_PID="$last_pid" \
   BOT_LAST_LOG_LINE="$(last_log_excerpt)" \
+  BOT_PREV_PAUSED="$(heartbeat_paused_state)" \
   start_bot
 }
 
@@ -152,7 +179,9 @@ case "$ACTION" in
     ;;
   restart)
     stop_bot
-    BOT_LAUNCH_REASON="${BOT_LAUNCH_REASON:-manual_restart}" start_bot
+    BOT_LAUNCH_REASON="${BOT_LAUNCH_REASON:-manual_restart}" \
+    BOT_PREV_PAUSED="$(heartbeat_paused_state)" \
+    start_bot
     ;;
   status)
     status_bot

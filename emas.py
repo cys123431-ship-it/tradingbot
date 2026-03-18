@@ -4667,6 +4667,13 @@ class MainController:
             self.last_heartbeat_age = None
         self.last_pid_before_start = os.environ.get('BOT_LAST_PID', '').strip()
         self.last_log_line = os.environ.get('BOT_LAST_LOG_LINE', '').replace('`', "'").strip()
+        prev_paused_raw = os.environ.get('BOT_PREV_PAUSED', '').strip().lower()
+        if prev_paused_raw in ('1', 'true', 'yes', 'on'):
+            self.prev_paused_state = True
+        elif prev_paused_raw in ('0', 'false', 'no', 'off'):
+            self.prev_paused_state = False
+        else:
+            self.prev_paused_state = None
         self.process_start_ts = time.time()
         self.last_exit_info = self._read_last_exit_info()
         self._exit_recorded = False
@@ -4700,7 +4707,14 @@ class MainController:
         self.active_engine = None
         self.tg_app = None
         self.status_data = {}
-        self.is_paused = True  # 遊??쒖옉 ???쇱떆?뺤? ?곹깭 (?ㅼ젙 議곗젅 ??RESUME)
+        self.is_paused = True  # 기본: 수동 시작 시 안전하게 일시정지
+        resume_reasons = {'ensure_restart', 'manual_restart', 'reboot_start', 'deploy_start'}
+        if self.launch_reason in resume_reasons and self.prev_paused_state is not None:
+            self.is_paused = self.prev_paused_state
+            logger.info(
+                f"Pause state restored from previous heartbeat: paused={self.is_paused} "
+                f"(launch_reason={self.launch_reason})"
+            )
         self.dashboard_msg_id = None
         self.dashboard_plain_text_mode = True
         self.last_status_snapshot_key = None
@@ -4846,13 +4860,16 @@ class MainController:
         }
 
     def _build_startup_notice(self):
-        lines = ["⏸ **봇 시작됨 (일시정지 상태)**", ""]
+        header = "⏸ **봇 시작됨 (일시정지 상태)**" if self.is_paused else "▶ **봇 시작됨 (자동 재개 상태)**"
+        lines = [header, ""]
         lines.append(f"시작사유: `{self.launch_reason}`")
         lines.append(f"시작시각: `{self.launch_started_at}`")
         if self.last_heartbeat_age is not None:
             lines.append(f"이전 heartbeat age: `{self._format_duration(self.last_heartbeat_age)}`")
         if self.last_pid_before_start:
             lines.append(f"이전 PID: `{self.last_pid_before_start}`")
+        if self.prev_paused_state is not None:
+            lines.append(f"이전 일시정지 상태: `{'ON' if self.prev_paused_state else 'OFF'}`")
         if self.last_log_line:
             lines.append(f"직전 로그: `{self.last_log_line}`")
         last_exit = self._get_effective_last_exit_info()
@@ -4861,7 +4878,10 @@ class MainController:
                 f"직전 종료: `{last_exit.get('reason', '-')}` "
                 f"@ `{last_exit.get('ts', '-')}`"
             )
-        lines.extend(["", "설정 확인 후 `▶ RESUME`을 눌러주세요."])
+        if self.is_paused:
+            lines.extend(["", "설정 확인 후 `▶ RESUME`을 눌러주세요."])
+        else:
+            lines.extend(["", "이전 실행 상태를 유지해 자동으로 재개되었습니다."])
         return "\n".join(lines)
 
     async def run(self):
@@ -4886,7 +4906,7 @@ class MainController:
         await self.tg_app.updater.start_polling()
         self._write_heartbeat()
         
-        # Startup notice in paused state with keyboard
+        # Startup notice + keyboard
         await self.notify(self._build_startup_notice())
         cid = self.cfg.get_chat_id()
         if cid:
