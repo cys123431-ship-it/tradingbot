@@ -68,6 +68,10 @@ CORE_ENGINE = 'signal'
 MA_STRATEGIES = {'sma', 'hma'}
 PATTERN_STRATEGIES = {'cameron', 'utbot', 'rsibb', 'utrsibb'}
 CORE_STRATEGIES = MA_STRATEGIES | PATTERN_STRATEGIES
+BINANCE_TESTNET = 'binance_testnet'
+BINANCE_MAINNET = 'binance_mainnet'
+UPBIT_MODE = 'upbit'
+SUPPORTED_EXCHANGE_MODES = {BINANCE_TESTNET, BINANCE_MAINNET, UPBIT_MODE}
 
 # ??뷀삎 ?곹깭
 SELECT, INPUT, SYMBOL_INPUT, DIRECTION_SELECT, ENGINE_SELECT = range(5)
@@ -98,6 +102,12 @@ class TradingConfig:
     def _ensure_defaults(self):
         """?꾨씫???꾨뱶 ?먮룞 異붽?"""
         defaults = {
+            'api': {
+                'exchange_mode': BINANCE_TESTNET,
+                'mainnet': {'api_key': '', 'secret_key': ''},
+                'testnet': {'api_key': '', 'secret_key': ''},
+                'upbit': {'api_key': '', 'secret_key': ''}
+            },
             'system_settings': {
                 'active_engine': CORE_ENGINE,
                 'trade_direction': 'both', 
@@ -181,6 +191,49 @@ class TradingConfig:
                     }
                 }
             },
+            'upbit': {
+                'watchlist': ['BTC/KRW'],
+                'common_settings': {
+                    'leverage': 1,
+                    'timeframe': '1h',
+                    'entry_timeframe': '1h',
+                    'exit_timeframe': '1h',
+                    'risk_per_trade_pct': 10.0,
+                    'max_risk_per_trade_pct': 100.0,
+                    'daily_loss_limit': 50000.0,
+                    'daily_loss_limit_pct': 5.0,
+                    'min_order_krw': 5000.0,
+                    'scanner_enabled': False,
+                    'scanner_timeframe': '15m',
+                    'scanner_exit_timeframe': '1h',
+                    'scanner_min_rise_pct': 0.5,
+                    'scanner_max_rise_pct': 8.0,
+                    'r2_entry_enabled': False,
+                    'r2_exit_enabled': False,
+                    'r2_threshold': 0.25,
+                    'chop_entry_enabled': False,
+                    'chop_exit_enabled': False,
+                    'chop_threshold': 50.0,
+                    'cc_exit_enabled': False,
+                    'cc_threshold': 0.70,
+                    'cc_length': 14
+                },
+                'strategy_params': {
+                    'active_strategy': 'utbot',
+                    'entry_mode': 'position',
+                    'UTBot': {
+                        'key_value': 1.0,
+                        'atr_period': 10,
+                        'use_heikin_ashi': False
+                    },
+                    'kalman_filter': {
+                        'entry_enabled': False,
+                        'exit_enabled': False,
+                        'observation_covariance': 0.1,
+                        'transition_covariance': 0.05
+                    }
+                }
+            },
             'dual_thrust_engine': {
                 'target_symbol': 'BTC/USDT',
                 'leverage': 5,
@@ -224,6 +277,16 @@ class TradingConfig:
                             changed = True
         
         # Enforce signal-only runtime policy while keeping legacy configs archived.
+        api_cfg = self.config.setdefault('api', {})
+        exchange_mode = str(api_cfg.get('exchange_mode', '')).lower()
+        if exchange_mode not in SUPPORTED_EXCHANGE_MODES:
+            exchange_mode = BINANCE_TESTNET if api_cfg.get('use_testnet', True) else BINANCE_MAINNET
+            api_cfg['exchange_mode'] = exchange_mode
+            changed = True
+        if exchange_mode == UPBIT_MODE and api_cfg.get('use_testnet', False):
+            api_cfg['use_testnet'] = False
+            changed = True
+
         system_cfg = self.config.setdefault('system_settings', {})
         if system_cfg.get('active_engine') != CORE_ENGINE:
             system_cfg['active_engine'] = CORE_ENGINE
@@ -351,6 +414,86 @@ class TradingConfig:
             common_cfg['scanner_min_rise_pct'] = max(0.1, scanner_max_rise * 0.25)
             changed = True
 
+        upbit_cfg = self.config.setdefault('upbit', {})
+        upbit_watchlist = upbit_cfg.get('watchlist')
+        if not isinstance(upbit_watchlist, list) or not upbit_watchlist:
+            upbit_cfg['watchlist'] = ['BTC/KRW']
+            changed = True
+
+        upbit_common = upbit_cfg.setdefault('common_settings', {})
+        upbit_common_defaults = {
+            'leverage': 1,
+            'timeframe': '1h',
+            'entry_timeframe': '1h',
+            'exit_timeframe': '1h',
+            'risk_per_trade_pct': 10.0,
+            'max_risk_per_trade_pct': 100.0,
+            'daily_loss_limit': 50000.0,
+            'daily_loss_limit_pct': 5.0,
+            'min_order_krw': 5000.0,
+            'scanner_enabled': False,
+            'scanner_timeframe': '15m',
+            'scanner_exit_timeframe': '1h',
+            'scanner_min_rise_pct': 0.5,
+            'scanner_max_rise_pct': 8.0,
+            'r2_entry_enabled': False,
+            'r2_exit_enabled': False,
+            'r2_threshold': 0.25,
+            'chop_entry_enabled': False,
+            'chop_exit_enabled': False,
+            'chop_threshold': 50.0,
+            'cc_exit_enabled': False,
+            'cc_threshold': 0.70,
+            'cc_length': 14
+        }
+        for key, value in upbit_common_defaults.items():
+            if key not in upbit_common:
+                upbit_common[key] = value
+                changed = True
+        if float(upbit_common.get('risk_per_trade_pct', 10.0) or 10.0) < 1.0:
+            upbit_common['risk_per_trade_pct'] = 1.0
+            changed = True
+        if float(upbit_common.get('max_risk_per_trade_pct', 100.0) or 100.0) < 1.0:
+            upbit_common['max_risk_per_trade_pct'] = 100.0
+            changed = True
+        if float(upbit_common.get('min_order_krw', 5000.0) or 0.0) < 5000.0:
+            upbit_common['min_order_krw'] = 5000.0
+            changed = True
+        if int(upbit_common.get('leverage', 1) or 1) != 1:
+            upbit_common['leverage'] = 1
+            changed = True
+
+        upbit_strategy = upbit_cfg.setdefault('strategy_params', {})
+        if str(upbit_strategy.get('active_strategy', 'utbot')).lower() != 'utbot':
+            upbit_strategy['active_strategy'] = 'utbot'
+            changed = True
+        if str(upbit_strategy.get('entry_mode', 'position')).lower() != 'position':
+            upbit_strategy['entry_mode'] = 'position'
+            changed = True
+        upbit_strategy_defaults = {
+            'UTBot': {
+                'key_value': 1.0,
+                'atr_period': 10,
+                'use_heikin_ashi': False
+            },
+            'kalman_filter': {
+                'entry_enabled': False,
+                'exit_enabled': False,
+                'observation_covariance': 0.1,
+                'transition_covariance': 0.05
+            }
+        }
+        for key, default_val in upbit_strategy_defaults.items():
+            current_val = upbit_strategy.get(key)
+            if not isinstance(current_val, dict):
+                upbit_strategy[key] = dict(default_val)
+                changed = True
+                continue
+            for sub_key, sub_val in default_val.items():
+                if sub_key not in current_val:
+                    current_val[sub_key] = sub_val
+                    changed = True
+
         if changed:
             self.save_config_sync()
 
@@ -358,8 +501,10 @@ class TradingConfig:
         self.config = {
             "api": {
                 "use_testnet": True,
+                "exchange_mode": BINANCE_TESTNET,
                 "mainnet": {"api_key": "", "secret_key": ""},
-                "testnet": {"api_key": "", "secret_key": ""}
+                "testnet": {"api_key": "", "secret_key": ""},
+                "upbit": {"api_key": "", "secret_key": ""}
             },
             "telegram": {"token": "", "chat_id": ""},
             "system_settings": {
@@ -422,6 +567,49 @@ class TradingConfig:
                         "risk_reward_ratio": 2.0
                     },
                     "kalman_filter": {"entry_enabled": False, "exit_enabled": False, "observation_covariance": 0.1, "transition_covariance": 0.05}
+                }
+            },
+            "upbit": {
+                "watchlist": ["BTC/KRW"],
+                "common_settings": {
+                    "leverage": 1,
+                    "timeframe": "1h",
+                    "entry_timeframe": "1h",
+                    "exit_timeframe": "1h",
+                    "risk_per_trade_pct": 10.0,
+                    "max_risk_per_trade_pct": 100.0,
+                    "daily_loss_limit": 50000.0,
+                    "daily_loss_limit_pct": 5.0,
+                    "min_order_krw": 5000.0,
+                    "scanner_enabled": False,
+                    "scanner_timeframe": "15m",
+                    "scanner_exit_timeframe": "1h",
+                    "scanner_min_rise_pct": 0.5,
+                    "scanner_max_rise_pct": 8.0,
+                    "r2_entry_enabled": False,
+                    "r2_exit_enabled": False,
+                    "r2_threshold": 0.25,
+                    "chop_entry_enabled": False,
+                    "chop_exit_enabled": False,
+                    "chop_threshold": 50.0,
+                    "cc_exit_enabled": False,
+                    "cc_threshold": 0.70,
+                    "cc_length": 14
+                },
+                "strategy_params": {
+                    "active_strategy": "utbot",
+                    "entry_mode": "position",
+                    "UTBot": {
+                        "key_value": 1.0,
+                        "atr_period": 10,
+                        "use_heikin_ashi": False
+                    },
+                    "kalman_filter": {
+                        "entry_enabled": False,
+                        "exit_enabled": False,
+                        "observation_covariance": 0.1,
+                        "transition_covariance": 0.05
+                    }
                 }
             },
             "shannon_engine": {
@@ -598,6 +786,24 @@ class BaseEngine:
     async def on_tick(self, data_type, data):
         pass
 
+    def is_upbit_mode(self):
+        return self.ctrl.is_upbit_mode()
+
+    def get_runtime_trade_config(self):
+        return self.ctrl.get_active_trade_config()
+
+    def get_runtime_common_settings(self):
+        return self.ctrl.get_active_common_settings()
+
+    def get_runtime_strategy_params(self):
+        return self.ctrl.get_active_strategy_params()
+
+    def get_runtime_watchlist(self):
+        return self.ctrl.get_active_watchlist()
+
+    def get_quote_currency(self):
+        return 'KRW' if self.is_upbit_mode() else 'USDT'
+
     def safe_amount(self, symbol, amount):
         try:
             return self.exchange.amount_to_precision(symbol, amount)
@@ -614,6 +820,10 @@ class BaseEngine:
 
     async def ensure_market_settings(self, symbol, leverage=None):
         """留덉폆 ?ㅼ젙 媛뺤젣 ?곸슜 (寃⑸━ 紐⑤뱶 + ?덈쾭由ъ?)"""
+        if self.is_upbit_mode():
+            logger.info(f"{symbol} Settings: UPBIT KRW spot / leverage fixed at 1x")
+            return
+
         # 1. Position Mode: One-way (Hedge Mode OFF)
         try:
             await asyncio.to_thread(self.exchange.set_position_mode, hedged=False, symbol=symbol)
@@ -628,7 +838,7 @@ class BaseEngine:
             # ?대? 寃⑸━ 紐⑤뱶?????덉쓬
             pass
         
-        # 3. Leverage Setting
+            # 3. Leverage Setting
         try:
             # ?몄옄濡??꾨떖???덈쾭由ъ?媛 ?놁쑝硫??ㅼ젙?먯꽌 議고쉶
             if leverage is None:
@@ -640,7 +850,7 @@ class BaseEngine:
                 elif eng == 'dualmode':
                     leverage = self.cfg.get('dual_mode_engine', {}).get('leverage', 5)
                 else:
-                    leverage = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('leverage', 20)
+                    leverage = self.get_runtime_common_settings().get('leverage', 20)
             
             await asyncio.to_thread(self.exchange.set_leverage, leverage, symbol)
             logger.info(f"??{symbol} Settings: ISOLATED / {leverage}x")
@@ -664,6 +874,49 @@ class BaseEngine:
                     return cached_pos
         
         try:
+            if self.is_upbit_mode():
+                bal = await asyncio.to_thread(self.exchange.fetch_balance)
+                total_map = bal.get('total', {}) if isinstance(bal, dict) else {}
+                info_rows = bal.get('info', []) if isinstance(bal, dict) else []
+                base = str(symbol).split('/')[0].upper()
+                contracts = float(total_map.get(base, 0) or 0)
+                if contracts <= 0:
+                    self.position_cache[symbol] = (None, now)
+                    return None
+
+                asset_info = {}
+                if isinstance(info_rows, list):
+                    for row in info_rows:
+                        if str(row.get('currency', '')).upper() == base:
+                            asset_info = row
+                            break
+
+                entry_price = float(asset_info.get('avg_buy_price') or 0.0)
+                current_price = 0.0
+                try:
+                    ticker = await asyncio.to_thread(self.market_data_exchange.fetch_ticker, symbol)
+                    current_price = float(ticker.get('last') or ticker.get('close') or 0.0)
+                except Exception as ticker_e:
+                    logger.warning(f"Upbit ticker fetch error for {symbol}: {ticker_e}")
+
+                pnl = 0.0
+                pnl_pct = 0.0
+                if entry_price > 0 and current_price > 0:
+                    pnl = (current_price - entry_price) * contracts
+                    pnl_pct = ((current_price / entry_price) - 1.0) * 100.0
+
+                found_pos = {
+                    'symbol': symbol,
+                    'side': 'long',
+                    'contracts': contracts,
+                    'entryPrice': entry_price,
+                    'markPrice': current_price,
+                    'unrealizedPnl': pnl,
+                    'percentage': pnl_pct
+                }
+                self.position_cache[symbol] = (found_pos, now)
+                return found_pos
+
             # fetch_positions??紐⑤뱺 ?ъ??섏쓣 媛?몄삱 ?섎룄 ?덇퀬, params濡??뱀젙???섎룄 ?덉쓬
             # exchange.fetch_positions([symbol]) ?ъ슜 沅뚯옣
             positions = await asyncio.to_thread(self.exchange.fetch_positions, [symbol])
@@ -706,6 +959,25 @@ class BaseEngine:
                 return set(self.all_positions_cache)
 
         try:
+            if self.is_upbit_mode():
+                bal = await asyncio.to_thread(self.exchange.fetch_balance)
+                total_map = bal.get('total', {}) if isinstance(bal, dict) else {}
+                active_symbols = set()
+                if isinstance(total_map, dict):
+                    for currency, amount in total_map.items():
+                        code = str(currency or '').upper()
+                        if code == 'KRW':
+                            continue
+                        try:
+                            qty = float(amount or 0)
+                        except (TypeError, ValueError):
+                            qty = 0.0
+                        if qty > 0:
+                            active_symbols.add(f"{code}/KRW")
+                self.all_positions_cache = set(active_symbols)
+                self.all_positions_cache_time = now
+                return active_symbols
+
             positions = await asyncio.to_thread(self.exchange.fetch_positions)
             active_symbols = set()
             for p in positions:
@@ -724,6 +996,51 @@ class BaseEngine:
 
     async def get_balance_info(self):
         try:
+            if self.is_upbit_mode():
+                bal = await asyncio.to_thread(self.exchange.fetch_balance)
+                info_rows = bal.get('info', []) if isinstance(bal, dict) else []
+                total_map = bal.get('total', {}) if isinstance(bal, dict) else {}
+                free_map = bal.get('free', {}) if isinstance(bal, dict) else {}
+
+                def _to_float(value):
+                    try:
+                        if value in (None, ''):
+                            return 0.0
+                        return float(value)
+                    except (TypeError, ValueError):
+                        return 0.0
+
+                total_krw = _to_float(total_map.get('KRW'))
+                free_krw = _to_float(free_map.get('KRW'))
+
+                if not total_krw and isinstance(info_rows, list):
+                    for row in info_rows:
+                        if str(row.get('currency', '')).upper() == 'KRW':
+                            total_krw = _to_float(row.get('balance')) + _to_float(row.get('locked'))
+                            free_krw = _to_float(row.get('balance'))
+                            break
+
+                total_equity = total_krw
+                if isinstance(total_map, dict):
+                    for currency, amount in total_map.items():
+                        code = str(currency or '').upper()
+                        if code == 'KRW':
+                            continue
+                        qty = _to_float(amount)
+                        if qty <= 0:
+                            continue
+                        try:
+                            ticker = await asyncio.to_thread(self.market_data_exchange.fetch_ticker, f"{code}/KRW")
+                            last_price = _to_float(ticker.get('last') or ticker.get('close'))
+                            total_equity += qty * last_price
+                        except Exception as ticker_e:
+                            logger.debug(f"Upbit balance valuation skipped for {code}/KRW: {ticker_e}")
+
+                if total_equity <= 0 and free_krw > 0:
+                    total_equity = free_krw
+
+                return float(total_equity), float(free_krw), 0.0
+
             # Binance futures balance schemas vary by account mode (single/multi asset, PM, etc).
             # Parse multiple candidate fields to avoid showing 0 when funds exist.
             try:
@@ -846,7 +1163,7 @@ class BaseEngine:
             limit_abs = float(sh_cfg.get('daily_loss_limit', 5000) or 5000)
             limit_pct = float(sh_cfg.get('daily_loss_limit_pct', 0) or 0)
         else:
-            sig_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+            sig_cfg = self.get_runtime_common_settings()
             limit_abs = float(sig_cfg.get('daily_loss_limit', 5000) or 5000)
             limit_pct = float(sig_cfg.get('daily_loss_limit_pct', 0) or 0)
 
@@ -1235,7 +1552,8 @@ class SignalEngine(BaseEngine):
         self.cameron_states = {}
         
         # 珥덇린??
-        config_watchlist = self.cfg.get('signal_engine', {}).get('watchlist', [])
+        self.active_symbols = set()
+        config_watchlist = self.get_runtime_watchlist()
         for s in config_watchlist:
             self.active_symbols.add(s)
         logger.info(f"?? [Signal] Engine started (Multi-Symbol Mode). Watching: {self.active_symbols}")
@@ -1244,7 +1562,7 @@ class SignalEngine(BaseEngine):
         """泥?궛????꾪봽?덉엫 (User Defined)
            醫낅ぉ???ㅼ틦?덉뿉 ?섑빐 ?≫엺 寃쎌슦 ?꾩슜 ??꾪봽?덉엫 諛섑솚
         """
-        cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+        cfg = self.get_runtime_common_settings()
         if symbol and symbol == self.scanner_active_symbol:
             return cfg.get('scanner_exit_timeframe', '1h')
         return cfg.get('exit_timeframe', '4h')
@@ -1676,8 +1994,8 @@ class SignalEngine(BaseEngine):
         
         try:
             self.last_activity = time.time()
-            cfg = self.cfg.get('signal_engine', {})
-            common_cfg = cfg.get('common_settings', {})
+            cfg = self.get_runtime_trade_config()
+            common_cfg = self.get_runtime_common_settings()
             entry_tf = common_cfg.get('entry_timeframe', common_cfg.get('timeframe', '8h'))
             
             active_position_symbols = set()
@@ -1729,7 +2047,7 @@ class SignalEngine(BaseEngine):
             else:
                 # === [Mode 2: Manual / Watchlist] ===
                 # Config Watchlist
-                config_symbols = set(self.cfg.get('signal_engine', {}).get('watchlist', []))
+                config_symbols = set(self.get_runtime_watchlist())
                 
                 # Merge: Config + Chat Manual + Positions
                 target_symbols = self.active_symbols | config_symbols | active_position_symbols
@@ -1750,7 +2068,7 @@ class SignalEngine(BaseEngine):
                         'daily_count': count,
                         'daily_pnl': daily_pnl,
                         'leverage': common_cfg.get('leverage', 20),
-                        'margin_mode': 'ISOLATED',
+                        'margin_mode': 'SPOT' if self.is_upbit_mode() else 'ISOLATED',
                         'entry_tf': entry_tf,
                         'exit_tf': common_cfg.get('exit_timeframe', '4h'),
                         'entry_reason': '일시정지(PAUSE) 상태',
@@ -1776,7 +2094,7 @@ class SignalEngine(BaseEngine):
                         'total_equity': total, 'free_usdt': free, 'mmr': mmr,
                         'daily_count': count, 'daily_pnl': daily_pnl,
                         'leverage': common_cfg.get('leverage', 20),
-                        'margin_mode': 'ISOLATED',
+                        'margin_mode': 'SPOT' if self.is_upbit_mode() else 'ISOLATED',
                         'entry_tf': entry_tf,
                         'exit_tf': common_cfg.get('exit_timeframe', '4h')
                     }
@@ -1940,6 +2258,10 @@ class SignalEngine(BaseEngine):
         Serial Mode: Finds ONE target -> Enters -> Sets self.scanner_active_symbol
         """
         try:
+            if self.is_upbit_mode():
+                logger.info("Scanner skipped: Upbit mode uses dedicated KRW UTBOT watchlist only.")
+                return
+
             logger.info("?뱻 Scanning high volume markets (>200M USDT)...")
             tickers = await asyncio.to_thread(self.market_data_exchange.fetch_tickers)
             
@@ -1982,8 +2304,8 @@ class SignalEngine(BaseEngine):
                 if self.ctrl.is_paused: return
                 
                 try:
-                    cfg = self.cfg.get('signal_engine', {})
-                    common_cfg = cfg.get('common_settings', {})
+                    cfg = self.get_runtime_trade_config()
+                    common_cfg = self.get_runtime_common_settings()
                     scan_tf = common_cfg.get('scanner_timeframe', '15m')
                     min_rise_pct = float(common_cfg.get('scanner_min_rise_pct', 0.5) or 0.0)
                     max_rise_pct = float(common_cfg.get('scanner_max_rise_pct', 8.0) or 8.0)
@@ -2059,7 +2381,8 @@ class SignalEngine(BaseEngine):
             pos = await self.get_server_position(symbol)
             
             # ?꾨왂 ?곹깭 媛?몄삤湲?
-            strategy_params = self.cfg.get('signal_engine', {}).get('strategy_params', {})
+            strategy_params = self.get_runtime_strategy_params()
+            comm_cfg = self.get_runtime_common_settings()
             kalman_cfg = strategy_params.get('kalman_filter', {})
             kalman_enabled = bool(kalman_cfg.get('entry_enabled', False) or kalman_cfg.get('exit_enabled', False))
             active_strategy = strategy_params.get('active_strategy', 'sma').upper()
@@ -2082,15 +2405,17 @@ class SignalEngine(BaseEngine):
                 'engine': 'Signal', 'symbol': symbol, 'price': price,
                 'total_equity': total, 'free_usdt': free, 'mmr': mmr,
                 'daily_count': count, 'daily_pnl': daily_pnl,
-                'network': 'TESTNET' if self.cfg.get('api', {}).get('use_testnet', True) else 'MAINNET',
-                'exchange_id': getattr(self.exchange, 'id', 'unknown'),
+                'network': self.ctrl.get_network_status_label(),
+                'exchange_id': self.ctrl.get_exchange_display_name(),
                 'market_data_exchange_id': getattr(self.market_data_exchange, 'id', 'unknown'),
-                'market_data_source': getattr(self.ctrl, 'market_data_source_label', 'BINANCE FUTURES MAINNET PUBLIC'),
+                'market_data_source': getattr(self.ctrl, 'market_data_source_label', self.ctrl.get_exchange_display_name()),
                 'pos_side': pos_side,
                 'entry_price': float(pos['entryPrice']) if pos else 0.0,
                 'coin_amt': float(pos['contracts']) if pos else 0.0,
                 'pnl_pct': float(pos['percentage']) if pos else 0.0,
                 'pnl_usdt': float(pos['unrealizedPnl']) if pos else 0.0,
+                'quote_currency': self.get_quote_currency(),
+                'is_spot': self.is_upbit_mode(),
                 # Signal ?꾩슜 ?꾨뱶
                 'kalman_enabled': kalman_enabled,
                 'kalman_velocity': self.kalman_states.get(symbol, {}).get('velocity', 0.0),
@@ -2118,7 +2443,6 @@ class SignalEngine(BaseEngine):
             symbol_status['exit_filters'] = exit_status
             
             # Real-time Filter Config
-            comm_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
             symbol_status['filter_config'] = {
                 'r2': {
                     'en_entry': comm_cfg.get('r2_entry_enabled', True), 
@@ -2139,7 +2463,7 @@ class SignalEngine(BaseEngine):
                     'en_exit': strategy_params.get('kalman_filter', {}).get('exit_enabled', False)
                 }
             }
-            tp_master_enabled = bool(comm_cfg.get('tp_sl_enabled', True))
+            tp_master_enabled = False if self.is_upbit_mode() else bool(comm_cfg.get('tp_sl_enabled', True))
             tp_enabled = tp_master_enabled and bool(comm_cfg.get('take_profit_enabled', True))
             sl_enabled = tp_master_enabled and bool(comm_cfg.get('stop_loss_enabled', True))
             symbol_status['protection_config'] = {
@@ -2148,8 +2472,8 @@ class SignalEngine(BaseEngine):
             }
             
             # [New] Status Display Enhancement
-            symbol_status['leverage'] = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('leverage', 20)
-            symbol_status['margin_mode'] = 'ISOLATED' # Enforced
+            symbol_status['leverage'] = comm_cfg.get('leverage', 1 if self.is_upbit_mode() else 20)
+            symbol_status['margin_mode'] = 'SPOT' if self.is_upbit_mode() else 'ISOLATED'
             symbol_status['entry_tf'] = comm_cfg.get('entry_timeframe', comm_cfg.get('timeframe', '8h'))
             symbol_status['exit_tf'] = comm_cfg.get('exit_timeframe', '4h')
 
@@ -2258,7 +2582,7 @@ class SignalEngine(BaseEngine):
             await self.check_status(symbol, float(k['c']))
             
             # [MODIFIED] Prioritize entry_timeframe for fetching entry OHLCV
-            common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+            common_cfg = self.get_runtime_common_settings()
             tf = common_cfg.get('entry_timeframe', common_cfg.get('timeframe', '15m'))
             ohlcv = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, tf, limit=300)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -2268,7 +2592,7 @@ class SignalEngine(BaseEngine):
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             
             # ===== ?꾨왂 ?ㅼ젙 濡쒕뱶 =====
-            strategy_params = self.cfg.get('signal_engine', {}).get('strategy_params', {})
+            strategy_params = self.get_runtime_strategy_params()
             active_strategy = strategy_params.get('active_strategy', 'sma').lower()
             raw_strategy_sig = None
             raw_state_sig = None
@@ -2291,7 +2615,7 @@ class SignalEngine(BaseEngine):
             strategy_sig = sig
             
             # 留ㅻℓ 諛⑺뼢 ?꾪꽣
-            d_mode = self.cfg.get('system_settings', {}).get('trade_direction', 'both')
+            d_mode = self.ctrl.get_effective_trade_direction()
             if sig and ((d_mode == 'long' and sig == 'short') or (d_mode == 'short' and sig == 'long')):
                 logger.info(f"??Signal {sig} blocked by direction filter: {d_mode}")
                 self.last_entry_reason[symbol] = f"방향 필터 차단 ({sig.upper()} vs {d_mode.upper()})"
@@ -2375,73 +2699,89 @@ class SignalEngine(BaseEngine):
             if active_strategy == 'utbot':
                 target_sig = raw_state_sig
                 entry_sig = sig
-                need_flip = pos and target_sig and (
-                    (pos['side'] == 'long' and target_sig == 'short') or
-                    (pos['side'] == 'short' and target_sig == 'long')
-                )
-
-                if need_flip:
-                    flip_label = "반전 신호" if raw_strategy_sig == target_sig else "상태 동기화"
-                    self._update_stateful_diag(
-                        symbol,
-                        stage='flip_detected',
-                        strategy=strategy_name,
-                        raw_state=(target_sig or 'none'),
-                        raw_signal=(raw_strategy_sig or 'none'),
-                        entry_sig=(entry_sig or 'none'),
-                        pos_side=str(pos['side']).upper(),
-                        note=flip_label
-                    )
-                    await self._notify_stateful_diag(symbol)
-                    logger.info(f"[{strategy_name}] {flip_label}: {pos['side']} -> {target_sig}")
-                    await self.exit_position(symbol, f"{strategy_name}_Flip")
-                    await asyncio.sleep(1)
-                    self.position_cache = None
-                    check_pos = await self.get_server_position(symbol, use_cache=False)
-                    if not check_pos:
-                        self._update_stateful_diag(
-                            symbol,
-                            stage='flip_exit_done',
-                            pos_side='NONE',
-                            note=f"{flip_label} exit complete"
-                        )
-                        if entry_sig == target_sig:
-                            self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} -> {entry_sig.upper()} 재진입"
-                            await self.entry(symbol, entry_sig, float(k['c']))
-                            self._update_stateful_diag(
-                                symbol,
-                                stage='flip_reentered',
-                                entry_sig=entry_sig,
-                                pos_side=entry_sig.upper(),
-                                note='re-entry submitted'
-                            )
-                        else:
-                            self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} 청산 완료, 재진입은 필터 또는 방향 설정으로 차단"
-                            self._update_stateful_diag(
-                                symbol,
-                                stage='flip_exit_only',
-                                note='re-entry blocked by filter or direction'
-                            )
-                            await self._notify_stateful_diag(symbol)
+                if self.is_upbit_mode():
+                    if pos and target_sig == 'short':
+                        self.last_entry_reason[symbol] = f"{strategy_name} SELL 상태 -> 현물 매도"
+                        logger.info(f"[{strategy_name}] Upbit spot exit trigger: LONG -> FLAT")
+                        await self.exit_position(symbol, f"{strategy_name}_Sell")
+                    elif not pos and entry_sig == 'long':
+                        self.last_entry_reason[symbol] = f"{strategy_name} BUY 상태 -> 현물 매수"
+                        logger.info(f"[{strategy_name}] Upbit spot entry LONG")
+                        await self.entry(symbol, 'long', float(k['c']))
+                    elif pos:
+                        self.last_entry_reason[symbol] = f"현물 보유 중, {strategy_name} SELL 반전 대기"
+                    elif target_sig == 'short':
+                        self.last_entry_reason[symbol] = f"{strategy_name} SELL 상태, 현물 대기"
                     else:
-                        self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} 청산 미확인, 상태 재동기화 재시도 대기"
-                        self.last_stateful_retry_ts[symbol] = 0.0
+                        self.last_entry_reason[symbol] = f"{strategy_name} BUY 대기"
+                else:
+                    need_flip = pos and target_sig and (
+                        (pos['side'] == 'long' and target_sig == 'short') or
+                        (pos['side'] == 'short' and target_sig == 'long')
+                    )
+
+                    if need_flip:
+                        flip_label = "반전 신호" if raw_strategy_sig == target_sig else "상태 동기화"
                         self._update_stateful_diag(
                             symbol,
-                            stage='flip_still_open',
-                            pos_side=str(check_pos['side']).upper(),
-                            note='position still open after exit attempt'
+                            stage='flip_detected',
+                            strategy=strategy_name,
+                            raw_state=(target_sig or 'none'),
+                            raw_signal=(raw_strategy_sig or 'none'),
+                            entry_sig=(entry_sig or 'none'),
+                            pos_side=str(pos['side']).upper(),
+                            note=flip_label
                         )
-                        await self._notify_stateful_diag(symbol, force=True)
-                        logger.warning(f"[{strategy_name}] Flip re-entry skipped: position still open ({check_pos['side']})")
-                elif not pos and entry_sig:
-                    self.last_entry_reason[symbol] = f"{strategy_name} 현재 상태 -> {entry_sig.upper()} 진입"
-                    logger.info(f"[{strategy_name}] Stateful entry {entry_sig.upper()}")
-                    await self.entry(symbol, entry_sig, float(k['c']))
-                elif not pos and target_sig:
-                    self.last_entry_reason[symbol] = f"{strategy_name} 현재 상태는 {target_sig.upper()}지만 진입은 방향 설정 또는 필터로 차단"
-                elif pos:
-                    self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {strategy_name} 반대신호 대기"
+                        await self._notify_stateful_diag(symbol)
+                        logger.info(f"[{strategy_name}] {flip_label}: {pos['side']} -> {target_sig}")
+                        await self.exit_position(symbol, f"{strategy_name}_Flip")
+                        await asyncio.sleep(1)
+                        self.position_cache = None
+                        check_pos = await self.get_server_position(symbol, use_cache=False)
+                        if not check_pos:
+                            self._update_stateful_diag(
+                                symbol,
+                                stage='flip_exit_done',
+                                pos_side='NONE',
+                                note=f"{flip_label} exit complete"
+                            )
+                            if entry_sig == target_sig:
+                                self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} -> {entry_sig.upper()} 재진입"
+                                await self.entry(symbol, entry_sig, float(k['c']))
+                                self._update_stateful_diag(
+                                    symbol,
+                                    stage='flip_reentered',
+                                    entry_sig=entry_sig,
+                                    pos_side=entry_sig.upper(),
+                                    note='re-entry submitted'
+                                )
+                            else:
+                                self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} 청산 완료, 재진입은 필터 또는 방향 설정으로 차단"
+                                self._update_stateful_diag(
+                                    symbol,
+                                    stage='flip_exit_only',
+                                    note='re-entry blocked by filter or direction'
+                                )
+                                await self._notify_stateful_diag(symbol)
+                        else:
+                            self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} 청산 미확인, 상태 재동기화 재시도 대기"
+                            self.last_stateful_retry_ts[symbol] = 0.0
+                            self._update_stateful_diag(
+                                symbol,
+                                stage='flip_still_open',
+                                pos_side=str(check_pos['side']).upper(),
+                                note='position still open after exit attempt'
+                            )
+                            await self._notify_stateful_diag(symbol, force=True)
+                            logger.warning(f"[{strategy_name}] Flip re-entry skipped: position still open ({check_pos['side']})")
+                    elif not pos and entry_sig:
+                        self.last_entry_reason[symbol] = f"{strategy_name} 현재 상태 -> {entry_sig.upper()} 진입"
+                        logger.info(f"[{strategy_name}] Stateful entry {entry_sig.upper()}")
+                        await self.entry(symbol, entry_sig, float(k['c']))
+                    elif not pos and target_sig:
+                        self.last_entry_reason[symbol] = f"{strategy_name} 현재 상태는 {target_sig.upper()}지만 진입은 방향 설정 또는 필터로 차단"
+                    elif pos:
+                        self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {strategy_name} 반대신호 대기"
 
             elif active_strategy == 'utrsibb':
                 regime_sig = raw_state_sig
@@ -2599,7 +2939,7 @@ class SignalEngine(BaseEngine):
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             
             # ===== 1. Calculate Raw Exit Signal =====
-            strategy_params = self.cfg.get('signal_engine', {}).get('strategy_params', {})
+            strategy_params = self.get_runtime_strategy_params()
             active_strategy = strategy_params.get('active_strategy', 'sma').lower()
             raw_exit_long = False
             raw_exit_short = False
@@ -2681,7 +3021,7 @@ class SignalEngine(BaseEngine):
             kalman_cfg = strategy_params.get('kalman_filter', {})
             kalman_exit_enabled = kalman_cfg.get('exit_enabled', False)
             
-            common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+            common_cfg = self.get_runtime_common_settings()
             r2_exit_enabled = common_cfg.get('r2_exit_enabled', True)
             r2_thresh = common_cfg.get('r2_threshold', 0.25)
             chop_exit_enabled = common_cfg.get('chop_exit_enabled', True)
@@ -2813,7 +3153,7 @@ class SignalEngine(BaseEngine):
         # New logic: Use kalman_entry_enabled for Entry signals.
         
         # ============ R2 Trend Quality Filter (Financial Engineering) ============
-        common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+        common_cfg = self.get_runtime_common_settings()
         
         # 1. R2 Filter (Trend Quality)
         r2_entry_enabled = common_cfg.get('r2_entry_enabled', True)
@@ -3131,8 +3471,8 @@ class SignalEngine(BaseEngine):
     async def _update_exit_filter_values(self, symbol, df, current_side):
         """[Helper] Calculate exit filter values and update status without executing exit logic"""
         try:
-            strategy_params = self.cfg.get('signal_engine', {}).get('strategy_params', {})
-            common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+            strategy_params = self.get_runtime_strategy_params()
+            common_cfg = self.get_runtime_common_settings()
             
             # A. Kalman Filter
             kalman_cfg = strategy_params.get('kalman_filter', {})
@@ -3200,6 +3540,10 @@ class SignalEngine(BaseEngine):
 
     async def entry(self, symbol, side, price):
         try:
+            if self.is_upbit_mode():
+                await self._entry_upbit_spot(symbol, side, price)
+                return
+
             # === [Single Position Enforcement] ===
             # ?대? ?ㅻⅨ ?ъ??섏씠 ?덈뒗吏 ?뺤씤 (?꾩껜 ?щ낵 ?ㅼ틪)
             # Volume Scanner ???대뼡 湲곕뒫???곕뜑?쇰룄 ?대? ?ъ??섏씠 ?덉쑝硫?異붽? 吏꾩엯 李⑤떒
@@ -3220,7 +3564,7 @@ class SignalEngine(BaseEngine):
 
             logger.info(f"?뱿 [Signal] Attempting {side.upper()} entry @ {price}")
             
-            cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+            cfg = self.get_runtime_common_settings()
             lev = int(max(1.0, float(cfg.get('leverage', 10) or 10)))
             req_risk_pct = float(cfg.get('risk_per_trade_pct', 10.0) or 10.0)
             max_risk_pct = float(cfg.get('max_risk_per_trade_pct', 100.0) or 100.0)
@@ -3355,7 +3699,7 @@ class SignalEngine(BaseEngine):
             logger.info(f"??Entry order success: {order.get('id', 'N/A')}")
             
             # ?꾨왂 ?뚮씪誘명꽣 濡쒕뱶
-            strategy_params = self.cfg.get('signal_engine', {}).get('strategy_params', {})
+            strategy_params = self.get_runtime_strategy_params()
             active_strategy = strategy_params.get('active_strategy', '').lower()
             
             # 吏꾩엯 ???ъ????뺤씤?섏뿬 ?뺥솗??吏꾩엯媛 ?뚯븙
@@ -3481,9 +3825,99 @@ class SignalEngine(BaseEngine):
             traceback.print_exc()
             await self.ctrl.notify(f"❌ 진입 실패: {e}")
 
+    async def _entry_upbit_spot(self, symbol, side, price):
+        if side != 'long':
+            logger.info(f"Upbit spot entry ignored: side={side}")
+            return
+
+        try:
+            cfg = self.get_runtime_common_settings()
+            min_order_krw = max(5000.0, float(cfg.get('min_order_krw', 5000.0) or 5000.0))
+            active_symbols = await self.get_active_position_symbols(use_cache=False)
+            for active_symbol in sorted(active_symbols):
+                if active_symbol != symbol:
+                    active_pos = await self.get_server_position(active_symbol, use_cache=False)
+                    active_qty = abs(float((active_pos or {}).get('contracts', 0) or 0))
+                    active_price = float((active_pos or {}).get('markPrice', 0) or (active_pos or {}).get('entryPrice', 0) or 0)
+                    active_notional = active_qty * active_price
+                    if active_notional < min_order_krw:
+                        logger.info(
+                            f"[Upbit] Dust holding ignored for entry block: {active_symbol} value={active_notional:,.0f} KRW"
+                        )
+                        continue
+                    display_active = self.ctrl.format_symbol_for_display(active_symbol)
+                    await self.ctrl.notify(f"⚠️ **진입 차단**: 업비트 단일 보유 제한 (보유 중: {display_active})")
+                    return
+
+            req_risk_pct = float(cfg.get('risk_per_trade_pct', 10.0) or 10.0)
+            max_risk_pct = float(cfg.get('max_risk_per_trade_pct', 100.0) or 100.0)
+            max_risk_pct = min(100.0, max(1.0, max_risk_pct))
+            bounded_risk_pct = min(max(req_risk_pct, 1.0), max_risk_pct)
+            risk_pct = bounded_risk_pct / 100.0
+
+            _, free_krw, _ = await self.get_balance_info()
+            if free_krw <= 0:
+                await self.ctrl.notify(f"⚠️ 업비트 KRW 잔고 부족: {free_krw:,.0f} KRW")
+                return
+
+            safety_buffer = 0.997
+            target_notional = free_krw * risk_pct * safety_buffer
+            if target_notional < min_order_krw:
+                if free_krw >= min_order_krw:
+                    target_notional = min_order_krw
+                else:
+                    await self.ctrl.notify(
+                        f"⚠️ 업비트 최소 주문금액 미달: 필요 {min_order_krw:,.0f} KRW, 가용 {free_krw:,.0f} KRW"
+                    )
+                    return
+
+            qty = self.safe_amount(symbol, target_notional / max(float(price), 1e-9))
+            if float(qty) <= 0:
+                await self.ctrl.notify(f"⚠️ 업비트 주문 수량 계산 오류: {qty}")
+                return
+
+            if bounded_risk_pct != req_risk_pct:
+                await self.ctrl.notify(f"⚠️ 업비트 리스크 상한 적용: {req_risk_pct:.1f}% -> {bounded_risk_pct:.1f}%")
+
+            await self.ensure_market_settings(symbol, leverage=1)
+            order = await asyncio.to_thread(
+                self.exchange.create_order,
+                symbol,
+                'market',
+                'buy',
+                float(qty),
+                float(price)
+            )
+
+            self.position_cache = None
+            self.position_cache_time = 0
+            self.db.log_trade_entry(symbol, 'long', price, float(qty))
+
+            display_symbol = self.ctrl.format_symbol_for_display(symbol)
+            await self.ctrl.notify(
+                f"✅ [Upbit] BUY {display_symbol} {qty}\n예상 체결가: {price:,.0f} KRW | 주문금액 약 {target_notional:,.0f} KRW"
+            )
+
+            await asyncio.sleep(1)
+            self.position_cache = None
+            verify_pos = await self.get_server_position(symbol, use_cache=False)
+            if verify_pos:
+                logger.info(
+                    f"[Upbit] Position verified: {display_symbol} qty={verify_pos['contracts']} avg={verify_pos['entryPrice']}"
+                )
+            else:
+                logger.warning(f"[Upbit] Position not found after buy: {display_symbol}, order={order}")
+        except Exception as e:
+            logger.error(f"Upbit spot entry error: {e}")
+            await self.ctrl.notify(f"❌ 업비트 매수 실패: {e}")
+
     async def _place_tp_sl_orders(self, symbol, side, entry_price, qty, tp_distance=None, sl_distance=None):
         """嫄곕옒?뚯뿉 TP/SL 二쇰Ц 諛곗튂 (?ㅽ뵂?ㅻ뜑??蹂댁엫)"""
         try:
+            if self.is_upbit_mode():
+                logger.info("TP/SL order placement skipped in Upbit spot mode.")
+                return
+
             tp_order = None
             sl_order = None
             tp_price = None
@@ -3539,6 +3973,9 @@ class SignalEngine(BaseEngine):
 
     async def exit_position(self, symbol, reason):
         logger.info(f"?뱾 [Signal] Attempting exit: {reason}")
+        if self.is_upbit_mode():
+            await self._exit_upbit_spot(symbol, reason)
+            return
         
         # 癒쇱? TP/SL 二쇰Ц 痍⑥냼 (?덈뒗 寃쎌슦)
         try:
@@ -3614,6 +4051,69 @@ class SignalEngine(BaseEngine):
         self.db.log_trade_close(symbol, pnl, pnl_pct, exit_price, reason)
         await self.ctrl.notify(f"📊 [{reason}] PnL: {pnl:+.2f} ({pnl_pct:+.2f}%)")
         logger.info(f"??Exit order success: {order.get('id', 'N/A')}")
+
+    async def _exit_upbit_spot(self, symbol, reason):
+        logger.info(f"[Upbit] Attempting spot exit: {reason}")
+
+        try:
+            try:
+                open_orders = await asyncio.to_thread(self.exchange.fetch_open_orders, symbol)
+                for open_order in open_orders or []:
+                    try:
+                        await asyncio.to_thread(self.exchange.cancel_order, open_order['id'], symbol)
+                    except Exception as cancel_e:
+                        logger.warning(f"Upbit open order cancel failed for {symbol}: {cancel_e}")
+            except Exception as fetch_e:
+                logger.debug(f"Upbit open-order fetch skipped for {symbol}: {fetch_e}")
+
+            self.position_cache = None
+            pos = await self.get_server_position(symbol, use_cache=False)
+            if not pos:
+                logger.info("No Upbit spot position to exit")
+                return
+
+            contracts = abs(float(pos.get('contracts', 0) or 0))
+            if contracts <= 0:
+                logger.info("No Upbit contracts to exit")
+                return
+
+            cfg = self.get_runtime_common_settings()
+            min_order_krw = max(5000.0, float(cfg.get('min_order_krw', 5000.0) or 5000.0))
+            est_price = float(pos.get('markPrice', 0) or pos.get('entryPrice', 0) or 0)
+            est_notional = contracts * est_price
+            if est_price > 0 and est_notional < min_order_krw:
+                display_symbol = self.ctrl.format_symbol_for_display(symbol)
+                await self.ctrl.notify(
+                    f"ℹ️ [Upbit {reason}] {display_symbol}\n보유 평가금액이 최소 주문금액 `{min_order_krw:,.0f} KRW` 미만이라 자동 매도가 불가합니다."
+                )
+                logger.info(f"[Upbit] Exit skipped below min notional: {symbol} value={est_notional:,.0f} KRW")
+                return
+
+            qty = self.safe_amount(symbol, contracts)
+            order = await asyncio.to_thread(
+                self.exchange.create_order,
+                symbol,
+                'market',
+                'sell',
+                float(qty)
+            )
+
+            pnl = float(pos.get('unrealizedPnl', 0) or 0)
+            pnl_pct = float(pos.get('percentage', 0) or 0)
+            exit_price = float(order.get('average', 0) or 0) or float(pos.get('markPrice', 0) or 0)
+
+            self.position_cache = None
+            self.position_cache_time = 0
+            self.db.log_trade_close(symbol, pnl, pnl_pct, exit_price, reason)
+
+            display_symbol = self.ctrl.format_symbol_for_display(symbol)
+            await self.ctrl.notify(
+                f"📊 [Upbit {reason}] {display_symbol}\nPnL: {pnl:+,.0f} KRW ({pnl_pct:+.2f}%)"
+            )
+            logger.info(f"[Upbit] Exit order success: {order.get('id', 'N/A')}")
+        except Exception as e:
+            logger.error(f"Upbit spot exit error: {e}")
+            await self.ctrl.notify(f"❌ 업비트 매도 실패: {e}")
 
 
 class ShannonEngine(BaseEngine):
@@ -4677,10 +5177,10 @@ class MainController:
         self.process_start_ts = time.time()
         self.last_exit_info = self._read_last_exit_info()
         self._exit_recorded = False
-        
-        api = self.cfg.get('api', {})
-        creds = api.get('testnet', {}) if api.get('use_testnet', True) else api.get('mainnet', {})
-        network_name = 'testnet' if api.get('use_testnet', True) else 'mainnet'
+
+        self.exchange_mode = self.get_exchange_mode()
+        creds = self._get_exchange_credentials(self.exchange_mode)
+        network_name = self.get_exchange_mode_label(self.exchange_mode)
         has_key = bool(str(creds.get('api_key', '')).strip())
         has_secret = bool(str(creds.get('secret_key', '')).strip())
         logger.info(
@@ -4694,10 +5194,10 @@ class MainController:
                 "Private endpoints (balance/positions/orders) will fail."
             )
         
-        self.exchange = self._build_exchange(creds)
-        self._configure_exchange_network(self.exchange, api.get('use_testnet', True))
-        self.market_data_exchange = self._build_public_market_data_exchange()
-        self.market_data_source_label = "BINANCE FUTURES MAINNET PUBLIC"
+        self.exchange = self._build_exchange(creds, self.exchange_mode)
+        self._configure_exchange_network(self.exchange, self.exchange_mode)
+        self.market_data_exchange = self._build_public_market_data_exchange(self.exchange_mode)
+        self.market_data_source_label = self._get_market_data_source_label(self.exchange_mode)
         logger.info(f"Market data source configured: {self.market_data_source_label}")
         
         self.engines = {
@@ -4721,7 +5221,133 @@ class MainController:
         self.blink_state = False
         self.last_hourly_report = 0
 
-    def _build_exchange(self, creds):
+    def get_exchange_mode(self):
+        api_cfg = self.cfg.get('api', {})
+        mode = str(api_cfg.get('exchange_mode', '')).lower()
+        if mode not in SUPPORTED_EXCHANGE_MODES:
+            mode = BINANCE_TESTNET if api_cfg.get('use_testnet', True) else BINANCE_MAINNET
+        return mode
+
+    def is_upbit_mode(self):
+        return self.get_exchange_mode() == UPBIT_MODE
+
+    def get_effective_trade_direction(self):
+        if self.is_upbit_mode():
+            return 'long'
+        return self.cfg.get('system_settings', {}).get('trade_direction', 'both')
+
+    def get_exchange_mode_label(self, exchange_mode=None):
+        mode = exchange_mode or self.get_exchange_mode()
+        labels = {
+            BINANCE_TESTNET: 'binance testnet',
+            BINANCE_MAINNET: 'binance mainnet',
+            UPBIT_MODE: 'upbit krw spot'
+        }
+        return labels.get(mode, mode)
+
+    def get_network_status_label(self, exchange_mode=None):
+        mode = exchange_mode or self.get_exchange_mode()
+        labels = {
+            BINANCE_TESTNET: '테스트넷(데모) 🧪',
+            BINANCE_MAINNET: '메인넷 💰',
+            UPBIT_MODE: '업비트 KRW 현물'
+        }
+        return labels.get(mode, mode)
+
+    def get_exchange_display_name(self, exchange_mode=None):
+        mode = exchange_mode or self.get_exchange_mode()
+        names = {
+            BINANCE_TESTNET: 'BINANCE FUTURES',
+            BINANCE_MAINNET: 'BINANCE FUTURES',
+            UPBIT_MODE: 'UPBIT SPOT'
+        }
+        return names.get(mode, mode.upper())
+
+    def _get_market_data_source_label(self, exchange_mode=None):
+        mode = exchange_mode or self.get_exchange_mode()
+        labels = {
+            BINANCE_TESTNET: 'BINANCE FUTURES TESTNET PUBLIC',
+            BINANCE_MAINNET: 'BINANCE FUTURES MAINNET PUBLIC',
+            UPBIT_MODE: 'UPBIT KRW SPOT PUBLIC'
+        }
+        return labels.get(mode, mode.upper())
+
+    def _get_exchange_credentials(self, exchange_mode=None):
+        mode = exchange_mode or self.get_exchange_mode()
+        api = self.cfg.get('api', {})
+        if mode == UPBIT_MODE:
+            return api.get('upbit', {})
+        if mode == BINANCE_TESTNET:
+            return api.get('testnet', {})
+        return api.get('mainnet', {})
+
+    def get_active_trade_section(self):
+        return 'upbit' if self.is_upbit_mode() else 'signal_engine'
+
+    def get_active_trade_config(self):
+        return self.cfg.get(self.get_active_trade_section(), {})
+
+    def get_active_common_settings(self):
+        return self.get_active_trade_config().get('common_settings', {})
+
+    def get_active_strategy_params(self):
+        strategy = dict(self.get_active_trade_config().get('strategy_params', {}))
+        if self.is_upbit_mode():
+            strategy['active_strategy'] = 'utbot'
+            strategy['entry_mode'] = 'position'
+        return strategy
+
+    def get_active_watchlist(self):
+        watchlist = self.get_active_trade_config().get('watchlist', [])
+        if not isinstance(watchlist, list) or not watchlist:
+            return ['BTC/KRW'] if self.is_upbit_mode() else ['BTC/USDT']
+        return list(watchlist)
+
+    def normalize_symbol_for_exchange(self, raw_symbol, exchange_mode=None):
+        mode = exchange_mode or self.get_exchange_mode()
+        text = str(raw_symbol or '').strip().upper()
+        if not text:
+            raise ValueError("빈 심볼은 사용할 수 없습니다.")
+
+        if mode == UPBIT_MODE:
+            text = text.replace(' ', '')
+            if text.startswith('KRW-'):
+                base = text.split('-', 1)[1]
+            elif '/' in text:
+                left, right = text.split('/', 1)
+                if left == 'KRW':
+                    base = right
+                elif right == 'KRW':
+                    base = left
+                else:
+                    raise ValueError("업비트는 KRW 마켓만 지원합니다.")
+            else:
+                base = text
+            if not re.fullmatch(r'[A-Z0-9]{2,15}', base or ''):
+                raise ValueError("업비트 코인은 영문/숫자 심볼로 입력하세요. 예: BTC, XRP, KRW-BTC")
+            return f"{base}/KRW"
+
+        if '/' in text:
+            return text
+        return f"{text}/USDT"
+
+    def format_symbol_for_display(self, symbol, exchange_mode=None):
+        mode = exchange_mode or self.get_exchange_mode()
+        raw = str(symbol or '')
+        if mode == UPBIT_MODE and '/' in raw:
+            base, quote = raw.split('/', 1)
+            if quote.upper() == 'KRW':
+                return f"KRW-{base.upper()}"
+        return raw
+
+    def _build_exchange(self, creds, exchange_mode=None):
+        mode = exchange_mode or self.get_exchange_mode()
+        if mode == UPBIT_MODE:
+            return ccxt.upbit({
+                'apiKey': creds.get('api_key', ''),
+                'secret': creds.get('secret_key', ''),
+                'enableRateLimit': True
+            })
         return ccxt.binance({
             'apiKey': creds.get('api_key', ''),
             'secret': creds.get('secret_key', ''),
@@ -4729,14 +5355,23 @@ class MainController:
             'enableRateLimit': True
         })
 
-    def _build_public_market_data_exchange(self):
+    def _build_public_market_data_exchange(self, exchange_mode=None):
+        mode = exchange_mode or self.get_exchange_mode()
+        if mode == UPBIT_MODE:
+            return ccxt.upbit({
+                'enableRateLimit': True
+            })
         return ccxt.binance({
             'options': {'defaultType': 'future'},
             'enableRateLimit': True
         })
 
-    def _configure_exchange_network(self, exchange, use_testnet: bool):
-        if not use_testnet:
+    def _configure_exchange_network(self, exchange, exchange_mode=None):
+        mode = exchange_mode or self.get_exchange_mode()
+        if mode == UPBIT_MODE:
+            return "업비트 KRW 현물"
+
+        if mode != BINANCE_TESTNET:
             return "메인넷 💰"
 
         try:
@@ -4862,6 +5497,7 @@ class MainController:
     def _build_startup_notice(self):
         header = "⏸ **봇 시작됨 (일시정지 상태)**" if self.is_paused else "▶ **봇 시작됨 (자동 재개 상태)**"
         lines = [header, ""]
+        lines.append(f"거래모드: `{self.get_exchange_display_name()}` / `{self.get_network_status_label()}`")
         lines.append(f"시작사유: `{self.launch_reason}`")
         lines.append(f"시작시각: `{self.launch_started_at}`")
         if self.last_heartbeat_age is not None:
@@ -4953,28 +5589,37 @@ class MainController:
 
     def _get_current_symbol(self):
         """?꾩옱 ?쒖꽦 ?붿쭊???щ낵 諛섑솚"""
-        watchlist = self.cfg.get('signal_engine', {}).get('watchlist', ['BTC/USDT'])
-        return watchlist[0] if watchlist else 'BTC/USDT'
+        watchlist = self.get_active_watchlist()
+        return watchlist[0] if watchlist else ('BTC/KRW' if self.is_upbit_mode() else 'BTC/USDT')
 
-    async def reinit_exchange(self, use_testnet: bool):
-        """거래소 연결 재초기화 (테스트넷/메인넷 전환)."""
+    async def reinit_exchange(self, target_mode):
+        """거래소 연결 재초기화."""
         try:
+            if isinstance(target_mode, bool):
+                exchange_mode = BINANCE_TESTNET if target_mode else BINANCE_MAINNET
+            else:
+                exchange_mode = str(target_mode or '').lower()
+            if exchange_mode not in SUPPORTED_EXCHANGE_MODES:
+                return False, f"지원하지 않는 거래모드: {target_mode}"
+
             # 1. ?꾩옱 ?붿쭊 ?뺤?
             if self.active_engine:
                 self.active_engine.stop()
                 logger.info("??Engine stopped for exchange reinit")
             
             # 2. ?ㅼ젙 ?낅뜲?댄듃
-            await self.cfg.update_value(['api', 'use_testnet'], use_testnet)
+            await self.cfg.update_value(['api', 'exchange_mode'], exchange_mode)
+            await self.cfg.update_value(['api', 'use_testnet'], exchange_mode == BINANCE_TESTNET)
             
             # 3. ??API ?먭꺽利앸챸 濡쒕뱶
-            api = self.cfg.get('api', {})
-            creds = api.get('testnet', {}) if use_testnet else api.get('mainnet', {})
+            self.exchange_mode = exchange_mode
+            creds = self._get_exchange_credentials(exchange_mode)
             
             # 4. 嫄곕옒???ъ큹湲고솕
-            self.exchange = self._build_exchange(creds)
-            network_name = self._configure_exchange_network(self.exchange, use_testnet)
-            self.market_data_exchange = self._build_public_market_data_exchange()
+            self.exchange = self._build_exchange(creds, exchange_mode)
+            network_name = self._configure_exchange_network(self.exchange, exchange_mode)
+            self.market_data_exchange = self._build_public_market_data_exchange(exchange_mode)
+            self.market_data_source_label = self._get_market_data_source_label(exchange_mode)
             
             # 5. 留덉폆 ?뺣낫 濡쒕뱶
             await asyncio.to_thread(self.exchange.load_markets)
@@ -5042,7 +5687,11 @@ class MainController:
     async def _sync_signal_protection_orders(self):
         """현재 보유 포지션의 보호주문(TP/SL)을 최신 설정으로 동기화한다."""
         try:
-            common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+            if self.is_upbit_mode():
+                logger.info("Protection sync skipped: Upbit spot mode does not use futures TP/SL orders.")
+                return
+
+            common_cfg = self.get_active_common_settings()
             tp_master_enabled = bool(common_cfg.get('tp_sl_enabled', True))
             tp_enabled = tp_master_enabled and bool(common_cfg.get('take_profit_enabled', True))
             sl_enabled = tp_master_enabled and bool(common_cfg.get('stop_loss_enabled', True))
@@ -5136,11 +5785,12 @@ class MainController:
     async def show_setup_menu(self, update: Update):
         sys_cfg = self.cfg.get('system_settings', {})
         sig = self.cfg.get('signal_engine', {})
+        up_cfg = self.cfg.get('upbit', {})
         sha = self.cfg.get('shannon_engine', {})
         dt = self.cfg.get('dual_thrust_engine', {})
         dm = self.cfg.get('dual_mode_engine', {})
         eng = sys_cfg.get('active_engine', CORE_ENGINE)
-        direction = sys_cfg.get('trade_direction', 'both')
+        direction = self.get_effective_trade_direction()
         watchlist = sig.get('watchlist', ['BTC/USDT'])
         if not isinstance(watchlist, list) or not watchlist:
             watchlist = ['BTC/USDT']
@@ -5160,6 +5810,42 @@ class MainController:
             
         status = "🔴 OFF" if self.is_paused else "🟢 ON"
         direction_str = {'both': '양방향', 'long': '롱만', 'short': '숏만'}.get(direction, 'both')
+
+        if self.is_upbit_mode():
+            up_watchlist = up_cfg.get('watchlist', ['BTC/KRW'])
+            if not isinstance(up_watchlist, list) or not up_watchlist:
+                up_watchlist = ['BTC/KRW']
+            up_common = up_cfg.get('common_settings', {})
+            up_strategy = up_cfg.get('strategy_params', {})
+            up_utbot = up_strategy.get('UTBot', {})
+            up_symbol = self.format_symbol_for_display(up_watchlist[0])
+            network_status = self.get_network_status_label()
+            hourly_report_status = "ON" if self.cfg.get('telegram', {}).get('reporting', {}).get('hourly_report_enabled', True) else "OFF"
+
+            msg = f"""
+🔧 **설정 메뉴** (번호 입력)
+
+**현재 상태**: `{eng.upper()}` | `{up_symbol}` | `UPBIT`
+
+**거래소**
+22. 거래소/네트워크 전환 (`{network_status}`)
+7. 매매 방향 (`롱만 고정`)
+
+**Upbit**
+43. 업비트 코인 (`{up_symbol}`)
+44. 업비트 UT Bot (`K={float(up_utbot.get('key_value', 1.0) or 1.0):.2f}` / `ATR={int(up_utbot.get('atr_period', 10) or 10)}` / `HA={'ON' if up_utbot.get('use_heikin_ashi', False) else 'OFF'}`)
+45. 업비트 진입 비율 (`{up_common.get('risk_per_trade_pct', 10)}%`)
+46. 업비트 진입 TF (`{up_common.get('entry_timeframe', up_common.get('timeframe', '1h'))}`)
+47. 업비트 청산 TF (`{up_common.get('exit_timeframe', '1h')}`)
+48. 업비트 일일 손실 제한 (`₩{float(up_common.get('daily_loss_limit', 50000) or 50000):,.0f}`)
+
+**운영**
+42. 시간별 리포트 (`{hourly_report_status}`)
+9. 매매 시작/중지 (`{status}`)
+0. 나가기
+"""
+            await update.message.reply_text(msg.strip(), parse_mode=ParseMode.MARKDOWN)
+            return
         
         # ?덉쟾???ㅼ젙 ?묎렐
         sig_common = sig.get('common_settings', {})
@@ -5241,8 +5927,7 @@ class MainController:
         cc_threshold = sig_common.get('cc_threshold', 0.70)
         
         # Network status
-        use_testnet = self.cfg.get('api', {}).get('use_testnet', True)
-        network_status = "테스트넷 🧪" if use_testnet else "메인넷 💰"
+        network_status = self.get_network_status_label()
         
         msg = f"""
 🔧 **설정 메뉴** (번호 입력)
@@ -5286,7 +5971,7 @@ class MainController:
 34. CC 민감도
 
 **기타**
-22. 네트워크 전환 (`{network_status}`)
+22. 거래소/네트워크 전환 (`{network_status}`)
 42. 시간별 리포트 (`{hourly_report_status}`)
 00. 엔진 교체 (현재: `{eng.upper()}`)
 9. 매매 시작/중지 (`{status}`)
@@ -5330,7 +6015,7 @@ class MainController:
             '19': "📝 **UT Bot 설정** 입력 (형식: key,atr,on/off 예: 1,10,off)",
             '20': "📝 **RSI+BB 설정** 입력 (형식: rsi_length,bb_length,bb_mult 예: 6,200,2)",
             '21': "ℹ️ **UT+RSI Hybrid**는 19번 UT Bot 설정과 20번 RSI+BB 설정을 함께 사용합니다.",
-            '22': "📝 **네트워크 선택** (1=테스트넷(데모), 2=메인넷)",
+            '22': "📝 **거래소/네트워크 선택** (1=바이낸스 테스트넷, 2=바이낸스 메인넷, 3=업비트 KRW 현물)",
             '23': "📝 **거래량 급등 채굴 기능** (1=ON, 0=OFF)",
             '24': "📝 **채굴 진입 타임프레임** 입력 (예: 5m)\n1m, 5m, 15m, 30m, 1h",
             '25': "📝 **채굴 청산 타임프레임** 입력 (예: 1h)\n1m, 5m, 15m, 30m, 1h, 4h",
@@ -5343,8 +6028,32 @@ class MainController:
             '35': "📝 **듀얼모드 변경** (1=스탠다드, 2=스캘핑)",
             '36': "📝 **ROE 자동청산** ON/OFF 토글",
             '37': "📝 **손절 자동청산** ON/OFF 토글",
+            '43': "📝 **업비트 코인** 입력\n예: BTC, XRP, KRW-BTC, BTC/KRW",
+            '44': "📝 **업비트 UT Bot 설정** 입력 (형식: key,atr,on/off 예: 1,10,off)",
+            '45': "📝 **업비트 진입 비율(%)** 입력 (1~100, 예: 25)",
+            '46': "📝 **업비트 진입 타임프레임** 입력 (예: 1h)\n1m,3m,5m,15m,30m | 1h,4h | 1d",
+            '47': "📝 **업비트 청산 타임프레임** 입력 (예: 1h)\n1m,3m,5m,15m,30m | 1h,4h | 1d",
+            '48': "📝 **업비트 일일 손실 제한(KRW)** 입력 (예: 50000)",
         }
+        if self.is_upbit_mode():
+            blocked_choices = {
+                '1', '2', '3', '4', '5', '6', '8', '10', '11', '12', '13', '14', '15',
+                '16', '17', '18', '19', '20', '21', '23', '24', '25', '26', '27', '30',
+                '31', '32', '33', '34', '35', '36', '37', '38', '41', '00'
+            }
+            if text in blocked_choices:
+                await update.message.reply_text("ℹ️ 업비트 모드에서는 업비트 전용 메뉴(22, 43~48)만 사용합니다.")
+                await self.show_setup_menu(update)
+                return SELECT
+        elif text in {'43', '44', '45', '46', '47', '48'}:
+            await update.message.reply_text("ℹ️ 업비트 전용 메뉴입니다. 먼저 22번에서 업비트 KRW 현물로 전환하세요.")
+            await self.show_setup_menu(update)
+            return SELECT
         if text == '7':
+            if self.is_upbit_mode():
+                await update.message.reply_text("ℹ️ 업비트 현물은 숏/레버리지가 없어 `롱만`으로 고정됩니다.")
+                await self.show_setup_menu(update)
+                return SELECT
             keyboard = [
                 [KeyboardButton("양방향 (Long+Short)")],
                 [KeyboardButton("롱만 (Long Only)")],
@@ -5481,7 +6190,7 @@ class MainController:
             return INPUT
         elif text in prompts:
             await update.message.reply_text(prompts[text], parse_mode=ParseMode.MARKDOWN)
-            if text in {'8', '38'}:
+            if text in {'8', '38', '43'}:
                 return SYMBOL_INPUT
             return INPUT
         else:
@@ -5491,9 +6200,7 @@ class MainController:
     async def handle_manual_symbol_input(self, update: Update, symbol: str):
         """Telegram manual symbol input handler."""
         try:
-            # ?щ낵 ?щ㎎??(BTC -> BTC/USDT)
-            if '/' not in symbol:
-                symbol = f"{symbol}/USDT"
+            symbol = self.normalize_symbol_for_exchange(symbol)
             
             # ?щ낵 ?좏슚??寃??(Exchange check)
             # SignalEngine???쒖꽦?붾릺???덉뼱????
@@ -5514,16 +6221,24 @@ class MainController:
                 await update.message.reply_text(f"❌ 유효하지 않은 심볼입니다: `{symbol}`", parse_mode=ParseMode.MARKDOWN)
                 return
 
-            # Active Symbols??異붽?
-            if symbol not in signal_engine.active_symbols:
+            display_symbol = self.format_symbol_for_display(symbol)
+            if self.is_upbit_mode():
+                await self.cfg.update_value(['upbit', 'watchlist'], [symbol])
+                signal_engine.active_symbols.clear()
                 signal_engine.active_symbols.add(symbol)
-                await update.message.reply_text(f"✅ **{symbol}** 감시 시작 (수동 추가)", parse_mode=ParseMode.MARKDOWN)
-                logger.info(f"Manual symbol added: {symbol}")
-                
-                # 利됱떆 ?대쭅 ?몃━嫄?(?좏깮 ?ы빆)
-                # await signal_engine.poll_symbol(symbol) 
+                signal_engine.last_candle_time = {}
+                signal_engine.last_processed_candle_ts = {}
+                signal_engine.last_processed_exit_candle_ts = {}
+                await update.message.reply_text(f"✅ 업비트 코인 변경: `{display_symbol}`", parse_mode=ParseMode.MARKDOWN)
+                logger.info(f"Upbit manual symbol set: {symbol}")
             else:
-                await update.message.reply_text(f"ℹ️ 이미 감시 중인 심볼입니다: `{symbol}`", parse_mode=ParseMode.MARKDOWN)
+                # Active Symbols??異붽?
+                if symbol not in signal_engine.active_symbols:
+                    signal_engine.active_symbols.add(symbol)
+                    await update.message.reply_text(f"✅ **{display_symbol}** 감시 시작 (수동 추가)", parse_mode=ParseMode.MARKDOWN)
+                    logger.info(f"Manual symbol added: {symbol}")
+                else:
+                    await update.message.reply_text(f"ℹ️ 이미 감시 중인 심볼입니다: `{display_symbol}`", parse_mode=ParseMode.MARKDOWN)
 
         except Exception as e:
             logger.error(f"Manual input error: {e}")
@@ -5649,6 +6364,15 @@ class MainController:
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'risk_per_trade_pct'], v)
                 await self.cfg.update_value(['dual_thrust_engine', 'risk_per_trade_pct'], v)
                 await self.cfg.update_value(['dual_mode_engine', 'risk_per_trade_pct'], v)
+            elif choice == '45':
+                v = float(val)
+                max_risk = float(self.cfg.get('upbit', {}).get('common_settings', {}).get('max_risk_per_trade_pct', 100.0) or 100.0)
+                max_risk = min(100.0, max(1.0, max_risk))
+                if v < 1 or v > max_risk:
+                    await update.message.reply_text(f"❌ 업비트 진입 비율은 1~{max_risk:.0f} 사이여야 합니다.")
+                    return SELECT
+                await self.cfg.update_value(['upbit', 'common_settings', 'risk_per_trade_pct'], v)
+                await update.message.reply_text(f"✅ 업비트 진입 비율 변경: {v}%")
             
             elif choice == '24':
                 # Scanner Entry Timeframe
@@ -5867,27 +6591,33 @@ class MainController:
                 await update.message.reply_text(f"✅ 진입모드 변경: {val_lower.upper()}")
             
             elif choice == '22':
-                # 네트워크 전환 (1=테스트넷, 2=메인넷)
-                if val not in ['1', '2']:
-                    await update.message.reply_text("❌ 1 또는 2를 입력하세요.\n1=테스트넷(데모), 2=메인넷")
+                mode_map = {
+                    '1': BINANCE_TESTNET,
+                    '2': BINANCE_MAINNET,
+                    '3': UPBIT_MODE
+                }
+                if val not in mode_map:
+                    await update.message.reply_text("❌ 1, 2, 3 중 하나를 입력하세요.\n1=바이낸스 테스트넷, 2=바이낸스 메인넷, 3=업비트 KRW 현물")
                     return SELECT
-                
-                use_testnet = val == '1'
-                current = self.cfg.get('api', {}).get('use_testnet', True)
-                
-                if use_testnet == current:
-                    network_name = "테스트넷(데모) 🧪" if use_testnet else "메인넷 💰"
-                    await update.message.reply_text(f"ℹ️ 이미 {network_name} 사용 중입니다.")
+
+                target_mode = mode_map[val]
+                current_mode = self.get_exchange_mode()
+
+                if target_mode == current_mode:
+                    await update.message.reply_text(f"ℹ️ 이미 {self.get_network_status_label(target_mode)} 사용 중입니다.")
                 else:
-                    target_name = "테스트넷(데모) 🧪" if use_testnet else "메인넷 💰"
+                    target_name = self.get_network_status_label(target_mode)
                     await update.message.reply_text(f"🔄 {target_name}으로 전환 중...")
-                    
-                    success, result = await self.reinit_exchange(use_testnet)
-                    
+
+                    if target_mode == UPBIT_MODE:
+                        await self.cfg.update_value(['system_settings', 'trade_direction'], 'long')
+
+                    success, result = await self.reinit_exchange(target_mode)
+
                     if success:
-                        await update.message.reply_text(f"✅ 네트워크 전환 완료: {result}")
+                        await update.message.reply_text(f"✅ 거래소 전환 완료: {result}")
                     else:
-                        await update.message.reply_text(f"❌ 네트워크 전환 실패: {result}")
+                        await update.message.reply_text(f"❌ 거래소 전환 실패: {result}")
             
             elif choice == '23':
                 # Scanner Toggle
@@ -5976,9 +6706,74 @@ class MainController:
                 if signal_engine:
                     signal_engine.last_processed_exit_candle_ts = {}
                 await update.message.reply_text(f"✅ 청산 타임프레임 변경: {val}")
+
+            elif choice == '44':
+                parts = val.replace(' ', '').split(',')
+                if len(parts) not in (2, 3):
+                    await update.message.reply_text("❌ 형식: key,atr,on/off (예: 1,10,off)")
+                    return SELECT
+
+                key_value = float(parts[0])
+                atr_period = int(parts[1])
+                if key_value <= 0 or atr_period < 1:
+                    await update.message.reply_text("❌ key는 0보다 커야 하고 ATR 기간은 1 이상이어야 합니다.")
+                    return SELECT
+
+                use_ha = self.cfg.get('upbit', {}).get('strategy_params', {}).get('UTBot', {}).get('use_heikin_ashi', False)
+                if len(parts) == 3:
+                    ha_raw = parts[2].lower()
+                    if ha_raw in ('on', 'true', '1', 'yes'):
+                        use_ha = True
+                    elif ha_raw in ('off', 'false', '0', 'no'):
+                        use_ha = False
+                    else:
+                        await update.message.reply_text("❌ HA 옵션은 on/off 로 입력하세요.")
+                        return SELECT
+
+                await self.cfg.update_value(['upbit', 'strategy_params', 'UTBot', 'key_value'], key_value)
+                await self.cfg.update_value(['upbit', 'strategy_params', 'UTBot', 'atr_period'], atr_period)
+                await self.cfg.update_value(['upbit', 'strategy_params', 'UTBot', 'use_heikin_ashi'], use_ha)
+                signal_engine = self.engines.get('signal')
+                if signal_engine:
+                    signal_engine.last_processed_candle_ts = {}
+                await update.message.reply_text(
+                    f"✅ 업비트 UT Bot 설정 변경: key={key_value:.2f}, ATR={atr_period}, HA={'ON' if use_ha else 'OFF'}"
+                )
+
+            elif choice == '46':
+                valid_tf = ['1m', '3m', '5m', '15m', '30m', '1h', '4h', '1d']
+                if val not in valid_tf:
+                    await update.message.reply_text(f"❌ 유효하지 않은 타임프레임입니다.\n사용 가능: {', '.join(valid_tf)}")
+                    return SELECT
+                await self.cfg.update_value(['upbit', 'common_settings', 'timeframe'], val)
+                await self.cfg.update_value(['upbit', 'common_settings', 'entry_timeframe'], val)
+                signal_engine = self.engines.get('signal')
+                if signal_engine:
+                    signal_engine.last_processed_candle_ts = {}
+                    signal_engine.last_candle_time = {}
+                await update.message.reply_text(f"✅ 업비트 진입 타임프레임 변경: {val}")
+
+            elif choice == '47':
+                valid_tf = ['1m', '3m', '5m', '15m', '30m', '1h', '4h', '1d']
+                if val not in valid_tf:
+                    await update.message.reply_text(f"❌ 유효하지 않은 타임프레임입니다.\n사용 가능: {', '.join(valid_tf)}")
+                    return SELECT
+                await self.cfg.update_value(['upbit', 'common_settings', 'exit_timeframe'], val)
+                signal_engine = self.engines.get('signal')
+                if signal_engine:
+                    signal_engine.last_processed_exit_candle_ts = {}
+                await update.message.reply_text(f"✅ 업비트 청산 타임프레임 변경: {val}")
+
+            elif choice == '48':
+                limit_krw = float(val)
+                if limit_krw <= 0:
+                    await update.message.reply_text("❌ 업비트 일일 손실 제한은 0보다 커야 합니다.")
+                    return SELECT
+                await self.cfg.update_value(['upbit', 'common_settings', 'daily_loss_limit'], limit_krw)
+                await update.message.reply_text(f"✅ 업비트 일일 손실 제한 변경: ₩{limit_krw:,.0f}")
             
             # 10~41 success message handled
-            if choice not in ['2', '3', '10', '11', '12', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '26', '27', '28', '30', '31', '33', '34', '35', '41']:
+            if choice not in ['2', '3', '10', '11', '12', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '26', '27', '28', '30', '31', '33', '34', '35', '41', '44', '45', '46', '47', '48']:
                 await update.message.reply_text(f"✅ 설정 완료: {val}")
             await self._restore_main_keyboard(update)
             await self.show_setup_menu(update)
@@ -5999,32 +6794,38 @@ class MainController:
         new_watchlist = self.cfg.get('signal_engine', {}).get('watchlist', ['BTC/USDT'])
         if not isinstance(new_watchlist, list):
             new_watchlist = ['BTC/USDT']
+        upbit_watchlist = self.cfg.get('upbit', {}).get('watchlist', ['BTC/KRW'])
+        if not isinstance(upbit_watchlist, list):
+            upbit_watchlist = ['BTC/KRW']
         
         # 1/2/3 踰덊샇濡??щ낵 留ㅽ븨 (?⑥텞??
-        symbol_map = {
-            '1': 'BTC/USDT',
-            '2': 'ETH/USDT',
-            '3': 'SOL/USDT'
-        }
+        symbol_map = (
+            {'1': 'BTC/KRW', '2': 'ETH/KRW', '3': 'SOL/KRW'}
+            if setup_choice == '43' or self.is_upbit_mode()
+            else {'1': 'BTC/USDT', '2': 'ETH/USDT', '3': 'SOL/USDT'}
+        )
         
         # ?⑥텞???먮뒗 吏곸젒 ?낅젰 ?ъ슜
         if choice in symbol_map:
             symbol = symbol_map[choice]
         else:
-            # 吏곸젒 ?낅젰??寃쎌슦 ?щ㎎ ?뺤씤
-            symbol = choice
-            if '/' not in symbol:
-                symbol = f"{symbol}/USDT"
-            
-            # ?좏슚??寃??(媛꾨떒??Ticker 議고쉶)
             try:
-                await asyncio.to_thread(self.exchange.fetch_ticker, symbol)
-            except Exception:
-                await update.message.reply_text(f"❌ 유효하지 않은 심볼 또는 거래쌍입니다: {symbol}\n(예: BTC/USDT 또는 BTC)")
+                normalize_mode = UPBIT_MODE if setup_choice == '43' else self.get_exchange_mode()
+                symbol = self.normalize_symbol_for_exchange(choice, exchange_mode=normalize_mode)
+            except ValueError as ve:
+                await update.message.reply_text(f"❌ {ve}")
                 return SELECT
+
+        # ?좏슚??寃??(媛꾨떒??Ticker 議고쉶)
+        try:
+            await asyncio.to_thread(self.exchange.fetch_ticker, symbol)
+        except Exception:
+            await update.message.reply_text(f"❌ 유효하지 않은 심볼 또는 거래쌍입니다: {symbol}")
+            return SELECT
         
         try:
             eng = self.cfg.get('system_settings', {}).get('active_engine', CORE_ENGINE)
+            display_symbol = self.format_symbol_for_display(symbol)
             if eng == 'shannon':
                 await self.cfg.update_value(['shannon_engine', 'target_symbol'], symbol)
             elif eng == 'dualthrust':
@@ -6033,14 +6834,18 @@ class MainController:
                 await self.cfg.update_value(['dual_mode_engine', 'target_symbol'], symbol)
             elif eng == 'tema':
                 await self.cfg.update_value(['tema_engine', 'target_symbol'], symbol)
+            elif setup_choice == '43':
+                await self.cfg.update_value(['upbit', 'watchlist'], [symbol])
+                upbit_watchlist = [symbol]
+                await update.message.reply_text(f"✅ 업비트 코인 변경: {display_symbol}")
             else:
                 if setup_choice == '38':
                     if symbol not in new_watchlist:
                         new_watchlist = new_watchlist + [symbol]
                         await self.cfg.update_value(['signal_engine', 'watchlist'], new_watchlist)
-                        await update.message.reply_text(f"✅ 감시 심볼 추가: {symbol}")
+                        await update.message.reply_text(f"✅ 감시 심볼 추가: {display_symbol}")
                     else:
-                        await update.message.reply_text(f"ℹ️ 이미 감시 목록에 있습니다: {symbol}")
+                        await update.message.reply_text(f"ℹ️ 이미 감시 목록에 있습니다: {display_symbol}")
                 else:
                     # Signal ?붿쭊: 硫붾돱?먯꽌 蹂寃???Watchlist瑜??대떦 ?щ낵濡?**?泥?* (湲곗〈 ?숈옉 ?좎?)
                     await self.cfg.update_value(['signal_engine', 'watchlist'], [symbol])
@@ -6069,6 +6874,12 @@ class MainController:
                 signal_engine.position_cache = None
                 if setup_choice == '38':
                     signal_engine.active_symbols.add(symbol)
+                elif setup_choice == '43':
+                    signal_engine.last_candle_time = {}
+                    signal_engine.last_processed_candle_ts = {}
+                    signal_engine.last_processed_exit_candle_ts = {}
+                    signal_engine.active_symbols.clear()
+                    signal_engine.active_symbols.add(symbol)
                 else:
                     signal_engine.last_candle_time = {} # Dict reset
                     signal_engine.last_processed_candle_ts = {}
@@ -6094,8 +6905,11 @@ class MainController:
             if setup_choice == '38':
                 watchlist_text = ", ".join(new_watchlist)
                 await update.message.reply_text(f"✅ 감시 목록: {watchlist_text}")
+            elif setup_choice == '43':
+                watchlist_text = ", ".join(self.format_symbol_for_display(s) for s in upbit_watchlist)
+                await update.message.reply_text(f"✅ 업비트 감시 코인: {watchlist_text}")
             else:
-                await update.message.reply_text(f"✅ 심볼 변경 완료: {symbol}")
+                await update.message.reply_text(f"✅ 심볼 변경 완료: {display_symbol}")
             await self._restore_main_keyboard(update)
             await self.show_setup_menu(update)
             return SELECT
@@ -6108,6 +6922,13 @@ class MainController:
     async def setup_direction_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """留ㅻℓ 諛⑺뼢 ?좏깮 泥섎━"""
         text = update.message.text
+
+        if self.is_upbit_mode():
+            await self.cfg.update_value(['system_settings', 'trade_direction'], 'long')
+            await update.message.reply_text("ℹ️ 업비트 KRW 현물은 숏이 없어 매매 방향이 `롱만`으로 고정됩니다.", parse_mode=ParseMode.MARKDOWN)
+            await self._restore_main_keyboard(update)
+            await self.show_setup_menu(update)
+            return SELECT
         
         direction_map = {
             '양방향': 'both',
@@ -6233,16 +7054,26 @@ class MainController:
         async def stats_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             daily_count, daily_pnl = self.db.get_daily_stats()
             weekly_count, weekly_pnl = self.db.get_weekly_stats()
+
+            quote_currency = 'KRW' if self.is_upbit_mode() else 'USDT'
+
+            def fmt_stats_pnl(value):
+                amount = float(value or 0)
+                prefix = '+' if amount >= 0 else ''
+                if quote_currency == 'KRW':
+                    return f"{prefix}₩{amount:,.0f}"
+                return f"{prefix}${amount:.2f}"
+
             msg = f"""
 📊 **매매 통계**
 
 **오늘**
 - 거래: {daily_count}건
-- 손익: ${daily_pnl:+.2f}
+- 손익: {fmt_stats_pnl(daily_pnl)}
 
 **7일**
 - 거래: {weekly_count}건
-- 손익: ${weekly_pnl:+.2f}
+- 손익: {fmt_stats_pnl(weekly_pnl)}
 """
             await u.message.reply_text(msg.strip(), parse_mode=ParseMode.MARKDOWN)
 
@@ -6297,7 +7128,7 @@ class MainController:
 
         async def manual_symbol_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             text = u.message.text.strip().upper()
-            if re.match(r'^[A-Z0-9]{2,10}(/[A-Z0-9]{2,10})?(:[A-Z0-9]+)?$', text):
+            if re.match(r'^[A-Z0-9]{2,15}([/-][A-Z0-9]{2,15})?(:[A-Z0-9]+)?$', text):
                 if text.startswith('/'):
                     return
                 await self.handle_manual_symbol_input(u, text)
@@ -6369,12 +7200,22 @@ class MainController:
                             first_val = self.status_data.get(first_key)
                             if isinstance(first_val, dict):
                                 d = first_val
+
+                        quote_currency = d.get('quote_currency', 'KRW' if self.is_upbit_mode() else 'USDT')
+
+                        def fmt_report_money(value, signed=False):
+                            amount = float(value or 0)
+                            if str(quote_currency).upper() == 'KRW':
+                                prefix = '+' if signed and amount >= 0 else ''
+                                return f"{prefix}₩{amount:,.0f}"
+                            prefix = '+' if signed and amount >= 0 else ''
+                            return f"{prefix}${amount:.2f}"
                         
                         msg = f"""
 ⏱ **시간별 리포트** [{now.strftime('%H:%M')}]
 
-💰 자산: ${d.get('total_equity', 0):.2f}
-📈 일일 손익: ${daily_pnl:+.2f} ({daily_count}건)
+💰 자산: {fmt_report_money(d.get('total_equity', 0))}
+📈 일일 손익: {fmt_report_money(daily_pnl, signed=True)} ({daily_count}건)
 🛡 MMR: {d.get('mmr', 0):.2f}%
 """
                         await self.notify(msg.strip())
@@ -6441,7 +7282,7 @@ class MainController:
                         await tema_engine.poll_tick()
                 
                 # [MODIFIED] Prioritize entry_timeframe for polling interval
-                sys_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
+                sys_cfg = self.get_active_common_settings()
                 tf = sys_cfg.get('entry_timeframe', sys_cfg.get('timeframe', '15m'))
                 poll_interval = self._get_poll_interval(tf)
                 await asyncio.sleep(poll_interval)
@@ -6622,13 +7463,36 @@ class MainController:
             if not all_data:
                 return "데이터 수집 대기 중..."
 
+            def fmt_money(value, quote_currency):
+                amount = float(value or 0)
+                if str(quote_currency).upper() == 'KRW':
+                    return f"₩{amount:,.0f}"
+                return f"${amount:.2f}"
+
+            def fmt_signed_money(value, quote_currency):
+                amount = float(value or 0)
+                prefix = '+' if amount >= 0 else ''
+                if str(quote_currency).upper() == 'KRW':
+                    return f"{prefix}₩{amount:,.0f}"
+                return f"{prefix}${amount:.2f}"
+
+            def fmt_price(value, quote_currency):
+                amount = float(value or 0)
+                if str(quote_currency).upper() == 'KRW':
+                    return f"{amount:,.0f}"
+                return f"{amount:.2f}"
+
             msg = ""
             first_symbol = list(all_data.keys())[0]
             d_first = all_data[first_symbol]
+            first_quote = d_first.get('quote_currency', 'KRW' if self.is_upbit_mode() else 'USDT')
 
             msg += "💰 **자산 요약**\n"
-            msg += f"총자산: `${d_first.get('total_equity', 0):.2f}` | 가용자산: `${d_first.get('free_usdt', 0):.2f}`\n"
-            msg += f"MMR: `{d_first.get('mmr', 0):.2f}%` | 일일 PnL: `${d_first.get('daily_pnl', 0):+.2f}`\n"
+            msg += (
+                f"총자산: `{fmt_money(d_first.get('total_equity', 0), first_quote)}` | "
+                f"가용자산: `{fmt_money(d_first.get('free_usdt', 0), first_quote)}`\n"
+            )
+            msg += f"MMR: `{d_first.get('mmr', 0):.2f}%` | 일일 PnL: `{fmt_signed_money(d_first.get('daily_pnl', 0), first_quote)}`\n"
             runtime_diag = d_first.get('runtime_diag', {})
             if runtime_diag:
                 msg += (
@@ -6664,18 +7528,23 @@ class MainController:
                 pos_side = d.get('pos_side', 'NONE')
                 lev = d.get('leverage', '?')
                 mm = d.get('margin_mode', 'ISO')
-                mode_str = f"({mm} {lev}x)" if 'leverage' in d else ""
+                quote_currency = d.get('quote_currency', first_quote)
+                symbol_label = self.format_symbol_for_display(symbol)
+                mode_str = "(SPOT)" if d.get('is_spot') else (f"({mm} {lev}x)" if 'leverage' in d else "")
 
                 pos_icon = "🟢" if pos_side == 'LONG' else "🔴" if pos_side == 'SHORT' else "⚪"
-                msg += f"{pos_icon} **{symbol}** {mode_str} | `{pos_side}`\n"
+                msg += f"{pos_icon} **{symbol_label}** {mode_str} | `{pos_side}`\n"
 
                 if pos_side != 'NONE':
                     pnl_pct = d.get('pnl_pct', 0)
                     pnl_icon = "📈" if pnl_pct >= 0 else "📉"
-                    msg += f"{pnl_icon} PnL: `{d.get('pnl_usdt', 0):+.2f}` (`{pnl_pct:+.2f}%`)\n"
-                    msg += f"진입가: `{d.get('entry_price', 0):.2f}` | 현재가: `{cur_price:.2f}`\n"
+                    msg += f"{pnl_icon} PnL: `{fmt_signed_money(d.get('pnl_usdt', 0), quote_currency)}` (`{pnl_pct:+.2f}%`)\n"
+                    msg += (
+                        f"진입가: `{fmt_price(d.get('entry_price', 0), quote_currency)}` | "
+                        f"현재가: `{fmt_price(cur_price, quote_currency)}`\n"
+                    )
                 else:
-                    msg += f"현재가: `{cur_price:.2f}`\n"
+                    msg += f"현재가: `{fmt_price(cur_price, quote_currency)}`\n"
 
                 d_eng = d.get('engine', '').upper()
                 if d_eng == 'SIGNAL':
@@ -6788,13 +7657,60 @@ class MainController:
     async def emergency_stop(self):
         """湲닿툒 ?뺤? - 紐⑤뱺 ?ㅽ뵂 ?ъ???泥?궛"""
         logger.warning("Emergency stop triggered")
-        
+
+        engine = self.active_engine or self.engines.get(CORE_ENGINE)
         if self.active_engine:
             self.active_engine.stop()
-        
+
         self.is_paused = True
-        
+
         try:
+            if self.is_upbit_mode():
+                upbit_engine = engine or self.engines.get(CORE_ENGINE)
+                open_symbols = set()
+                if upbit_engine:
+                    open_symbols = await upbit_engine.get_active_position_symbols(use_cache=False)
+
+                if not open_symbols:
+                    cancelled_orders = 0
+                    for sym in self.get_active_watchlist():
+                        try:
+                            open_orders = await asyncio.to_thread(self.exchange.fetch_open_orders, sym)
+                        except Exception as order_fetch_error:
+                            logger.warning(f"Open order fetch error for {sym}: {order_fetch_error}")
+                            continue
+
+                        for order in open_orders or []:
+                            order_id = order.get('id')
+                            if not order_id:
+                                continue
+                            try:
+                                await asyncio.to_thread(self.exchange.cancel_order, order_id, sym)
+                                cancelled_orders += 1
+                            except Exception as cancel_error:
+                                logger.warning(f"Cancel order error for {sym} / {order_id}: {cancel_error}")
+
+                    if cancelled_orders:
+                        await self.notify(f"ℹ️ 업비트 보유 코인은 없어서 미체결 주문 `{cancelled_orders}`건만 취소했습니다.")
+                    else:
+                        await self.notify("ℹ️ 청산할 업비트 보유 코인이 없습니다.")
+                    return
+
+                symbols_text = ", ".join(self.format_symbol_for_display(sym) for sym in sorted(open_symbols))
+                await self.notify(
+                    f"🚨 **긴급 정지 실행**\n업비트 보유 코인 `{len(open_symbols)}`개를 즉시 매도합니다.\n대상: `{symbols_text}`"
+                )
+
+                for sym in sorted(open_symbols):
+                    try:
+                        await upbit_engine.exit_position(sym, "EmergencyStop")
+                    except Exception as e:
+                        logger.error(f"Failed to close Upbit position {sym}: {e}")
+                        await self.notify(f"❌ {self.format_symbol_for_display(sym)} 청산 실패: {e}")
+
+                await self.notify("🧯 긴급 정지 처리 완료")
+                return
+
             # 1. ?ㅽ뵂??紐⑤뱺 ?ъ???議고쉶
             positions = await asyncio.to_thread(self.exchange.fetch_positions)
             open_positions = []
