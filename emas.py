@@ -804,6 +804,69 @@ class BaseEngine:
     def get_quote_currency(self):
         return 'KRW' if self.is_upbit_mode() else 'USDT'
 
+    def _to_float_safe(self, value):
+        try:
+            if value in (None, ''):
+                return 0.0
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _get_upbit_min_order_krw(self):
+        cfg = self.get_runtime_common_settings()
+        return max(5000.0, float(cfg.get('min_order_krw', 5000.0) or 5000.0))
+
+    def _extract_upbit_assets(self, balance_payload):
+        assets = {}
+        if not isinstance(balance_payload, dict):
+            return assets
+
+        info_rows = balance_payload.get('info', [])
+        if isinstance(info_rows, list):
+            for row in info_rows:
+                if not isinstance(row, dict):
+                    continue
+                code = str(row.get('currency', '')).upper().strip()
+                if not code:
+                    continue
+                free_amt = self._to_float_safe(row.get('balance'))
+                locked_amt = self._to_float_safe(row.get('locked'))
+                assets[code] = {
+                    'currency': code,
+                    'free': free_amt,
+                    'locked': locked_amt,
+                    'total': free_amt + locked_amt,
+                    'avg_buy_price': self._to_float_safe(row.get('avg_buy_price')),
+                    'unit_currency': str(row.get('unit_currency', '')).upper().strip(),
+                }
+
+        if assets:
+            return assets
+
+        total_map = balance_payload.get('total', {})
+        free_map = balance_payload.get('free', {})
+        used_map = balance_payload.get('used', {})
+        if isinstance(total_map, dict):
+            for code_raw, total_val in total_map.items():
+                code = str(code_raw or '').upper().strip()
+                if not code:
+                    continue
+                free_amt = self._to_float_safe(free_map.get(code))
+                locked_amt = self._to_float_safe(used_map.get(code))
+                total_amt = self._to_float_safe(total_val)
+                if total_amt <= 0:
+                    total_amt = free_amt + locked_amt
+                assets[code] = {
+                    'currency': code,
+                    'free': free_amt,
+                    'locked': locked_amt,
+                    'total': total_amt,
+                    'avg_buy_price': 0.0,
+                    'unit_currency': 'KRW',
+                }
+
+        return assets
+
     def safe_amount(self, symbol, amount):
         try:
             return self.exchange.amount_to_precision(symbol, amount)
@@ -876,20 +939,13 @@ class BaseEngine:
         try:
             if self.is_upbit_mode():
                 bal = await asyncio.to_thread(self.exchange.fetch_balance)
-                total_map = bal.get('total', {}) if isinstance(bal, dict) else {}
-                info_rows = bal.get('info', []) if isinstance(bal, dict) else []
+                assets = self._extract_upbit_assets(bal)
                 base = str(symbol).split('/')[0].upper()
-                contracts = float(total_map.get(base, 0) or 0)
+                asset_info = assets.get(base, {})
+                contracts = float(asset_info.get('total', 0) or 0)
                 if contracts <= 0:
                     self.position_cache[symbol] = (None, now)
                     return None
-
-                asset_info = {}
-                if isinstance(info_rows, list):
-                    for row in info_rows:
-                        if str(row.get('currency', '')).upper() == base:
-                            asset_info = row
-                            break
 
                 entry_price = float(asset_info.get('avg_buy_price') or 0.0)
                 current_price = 0.0
@@ -961,19 +1017,19 @@ class BaseEngine:
         try:
             if self.is_upbit_mode():
                 bal = await asyncio.to_thread(self.exchange.fetch_balance)
-                total_map = bal.get('total', {}) if isinstance(bal, dict) else {}
+                assets = self._extract_upbit_assets(bal)
                 active_symbols = set()
-                if isinstance(total_map, dict):
-                    for currency, amount in total_map.items():
-                        code = str(currency or '').upper()
-                        if code == 'KRW':
-                            continue
-                        try:
-                            qty = float(amount or 0)
-                        except (TypeError, ValueError):
-                            qty = 0.0
-                        if qty > 0:
-                            active_symbols.add(f"{code}/KRW")
+                min_order_krw = self._get_upbit_min_order_krw()
+                for code, asset in assets.items():
+                    if code == 'KRW':
+                        continue
+                    qty = float(asset.get('total', 0) or 0)
+                    if qty <= 0:
+                        continue
+                    est_value = qty * float(asset.get('avg_buy_price', 0) or 0)
+                    if est_value > 0 and est_value < min_order_krw:
+                        continue
+                    active_symbols.add(f"{code}/KRW")
                 self.all_positions_cache = set(active_symbols)
                 self.all_positions_cache_time = now
                 return active_symbols
@@ -998,43 +1054,30 @@ class BaseEngine:
         try:
             if self.is_upbit_mode():
                 bal = await asyncio.to_thread(self.exchange.fetch_balance)
-                info_rows = bal.get('info', []) if isinstance(bal, dict) else []
-                total_map = bal.get('total', {}) if isinstance(bal, dict) else {}
-                free_map = bal.get('free', {}) if isinstance(bal, dict) else {}
-
-                def _to_float(value):
-                    try:
-                        if value in (None, ''):
-                            return 0.0
-                        return float(value)
-                    except (TypeError, ValueError):
-                        return 0.0
-
-                total_krw = _to_float(total_map.get('KRW'))
-                free_krw = _to_float(free_map.get('KRW'))
-
-                if not total_krw and isinstance(info_rows, list):
-                    for row in info_rows:
-                        if str(row.get('currency', '')).upper() == 'KRW':
-                            total_krw = _to_float(row.get('balance')) + _to_float(row.get('locked'))
-                            free_krw = _to_float(row.get('balance'))
-                            break
+                assets = self._extract_upbit_assets(bal)
+                krw_asset = assets.get('KRW', {})
+                total_krw = self._to_float_safe(krw_asset.get('total'))
+                free_krw = self._to_float_safe(krw_asset.get('free'))
 
                 total_equity = total_krw
-                if isinstance(total_map, dict):
-                    for currency, amount in total_map.items():
-                        code = str(currency or '').upper()
-                        if code == 'KRW':
-                            continue
-                        qty = _to_float(amount)
-                        if qty <= 0:
-                            continue
-                        try:
-                            ticker = await asyncio.to_thread(self.market_data_exchange.fetch_ticker, f"{code}/KRW")
-                            last_price = _to_float(ticker.get('last') or ticker.get('close'))
+                for code, asset in assets.items():
+                    if code == 'KRW':
+                        continue
+                    qty = self._to_float_safe(asset.get('total'))
+                    if qty <= 0:
+                        continue
+                    try:
+                        ticker = await asyncio.to_thread(self.market_data_exchange.fetch_ticker, f"{code}/KRW")
+                        last_price = self._to_float_safe(ticker.get('last') or ticker.get('close'))
+                        if last_price > 0:
                             total_equity += qty * last_price
-                        except Exception as ticker_e:
-                            logger.debug(f"Upbit balance valuation skipped for {code}/KRW: {ticker_e}")
+                            continue
+                    except Exception as ticker_e:
+                        logger.debug(f"Upbit balance valuation skipped for {code}/KRW: {ticker_e}")
+
+                    fallback_price = self._to_float_safe(asset.get('avg_buy_price'))
+                    if fallback_price > 0:
+                        total_equity += qty * fallback_price
 
                 if total_equity <= 0 and free_krw > 0:
                     total_equity = free_krw
@@ -2103,6 +2146,14 @@ class SignalEngine(BaseEngine):
             # If targets exist, remove SCANNER placeholder to avoid duplicate display
             if 'SCANNER' in self.ctrl.status_data:
                 del self.ctrl.status_data['SCANNER']
+
+            active_status_keys = set(target_symbols) | {'PAUSED', 'SCANNER'}
+            stale_keys = [
+                key for key in list(self.ctrl.status_data.keys())
+                if key not in active_status_keys
+            ]
+            for stale_key in stale_keys:
+                self.ctrl.status_data.pop(stale_key, None)
 
             # Parallel Execution: Poll all symbols concurrently
             tasks = []
@@ -7486,8 +7537,12 @@ class MainController:
                 return f"{amount:.2f}"
 
             msg = ""
-            first_symbol = list(all_data.keys())[0]
-            d_first = all_data[first_symbol]
+            summary_candidates = [v for v in all_data.values() if isinstance(v, dict)]
+            d_first = max(
+                summary_candidates,
+                key=lambda row: float(row.get('total_equity', 0) or 0),
+                default=next(iter(all_data.values()))
+            )
             first_quote = d_first.get('quote_currency', 'KRW' if self.is_upbit_mode() else 'USDT')
 
             msg += "💰 **자산 요약**\n"
