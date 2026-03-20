@@ -2219,6 +2219,7 @@ class SignalEngine(BaseEngine):
                 and (
                     (active_strategy in MA_STRATEGIES and entry_mode in ['cross', 'position'])
                     or active_strategy == 'cameron'
+                    or (self.is_upbit_mode() and active_strategy == 'utbot')
                 )
             )
             if uses_secondary_exit:
@@ -2701,15 +2702,17 @@ class SignalEngine(BaseEngine):
                 entry_sig = sig
                 if self.is_upbit_mode():
                     if pos and target_sig == 'short':
-                        self.last_entry_reason[symbol] = f"{strategy_name} SELL 상태 -> 현물 매도"
-                        logger.info(f"[{strategy_name}] Upbit spot exit trigger: LONG -> FLAT")
-                        await self.exit_position(symbol, f"{strategy_name}_Sell")
+                        self.last_entry_reason[symbol] = (
+                            f"{strategy_name} SELL 상태 감지, 청산은 exit TF `{self._get_exit_timeframe(symbol)}` 확인 후 실행"
+                        )
                     elif not pos and entry_sig == 'long':
                         self.last_entry_reason[symbol] = f"{strategy_name} BUY 상태 -> 현물 매수"
                         logger.info(f"[{strategy_name}] Upbit spot entry LONG")
                         await self.entry(symbol, 'long', float(k['c']))
                     elif pos:
-                        self.last_entry_reason[symbol] = f"현물 보유 중, {strategy_name} SELL 반전 대기"
+                        self.last_entry_reason[symbol] = (
+                            f"현물 보유 중, 청산은 {strategy_name} exit TF `{self._get_exit_timeframe(symbol)}` 기준"
+                        )
                     elif target_sig == 'short':
                         self.last_entry_reason[symbol] = f"{strategy_name} SELL 상태, 현물 대기"
                     else:
