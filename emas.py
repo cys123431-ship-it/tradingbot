@@ -1610,6 +1610,34 @@ class SignalEngine(BaseEngine):
             return cfg.get('scanner_exit_timeframe', '1h')
         return cfg.get('exit_timeframe', '4h')
 
+    async def prime_symbol_to_next_closed_candle(self, symbol):
+        """When a symbol is newly selected, skip retroactive entry/exit on the latest closed candle."""
+        try:
+            common_cfg = self.get_runtime_common_settings()
+            entry_tf = common_cfg.get('entry_timeframe', common_cfg.get('timeframe', '15m'))
+            exit_tf = self._get_exit_timeframe(symbol)
+
+            entry_ohlcv = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, entry_tf, limit=5)
+            if entry_ohlcv and len(entry_ohlcv) >= 3:
+                entry_closed_ts = int(entry_ohlcv[-2][0])
+                self.last_processed_candle_ts[symbol] = entry_closed_ts
+                self.last_state_sync_candle_ts[symbol] = entry_closed_ts
+                self.last_candle_time[symbol] = entry_closed_ts
+                self.last_candle_success[symbol] = True
+                self.last_stateful_retry_ts[symbol] = time.time()
+
+            exit_ohlcv = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, exit_tf, limit=5)
+            if exit_ohlcv and len(exit_ohlcv) >= 3:
+                exit_closed_ts = int(exit_ohlcv[-2][0])
+                self.last_processed_exit_candle_ts[symbol] = exit_closed_ts
+
+            logger.info(
+                f"Primed symbol state for {symbol}: next action waits for future closed candle "
+                f"(entry_tf={entry_tf}, exit_tf={exit_tf})"
+            )
+        except Exception as e:
+            logger.warning(f"Prime symbol state failed for {symbol}: {e}")
+
     def _calculate_kalman_values(self, df, kalman_cfg):
         import numpy as np
         obs_cov = kalman_cfg.get('observation_covariance', 0.1)
@@ -6282,13 +6310,17 @@ class MainController:
                 signal_engine.active_symbols.add(symbol)
                 signal_engine.last_candle_time = {}
                 signal_engine.last_processed_candle_ts = {}
+                signal_engine.last_state_sync_candle_ts = {}
+                signal_engine.last_stateful_retry_ts = {}
                 signal_engine.last_processed_exit_candle_ts = {}
+                await signal_engine.prime_symbol_to_next_closed_candle(symbol)
                 await update.message.reply_text(f"✅ 업비트 코인 변경: `{display_symbol}`", parse_mode=ParseMode.MARKDOWN)
                 logger.info(f"Upbit manual symbol set: {symbol}")
             else:
                 # Active Symbols??異붽?
                 if symbol not in signal_engine.active_symbols:
                     signal_engine.active_symbols.add(symbol)
+                    await signal_engine.prime_symbol_to_next_closed_candle(symbol)
                     await update.message.reply_text(f"✅ **{display_symbol}** 감시 시작 (수동 추가)", parse_mode=ParseMode.MARKDOWN)
                     logger.info(f"Manual symbol added: {symbol}")
                 else:
@@ -6928,17 +6960,25 @@ class MainController:
                 signal_engine.position_cache = None
                 if setup_choice == '38':
                     signal_engine.active_symbols.add(symbol)
+                    await signal_engine.prime_symbol_to_next_closed_candle(symbol)
                 elif setup_choice == '43':
                     signal_engine.last_candle_time = {}
                     signal_engine.last_processed_candle_ts = {}
+                    signal_engine.last_state_sync_candle_ts = {}
+                    signal_engine.last_stateful_retry_ts = {}
                     signal_engine.last_processed_exit_candle_ts = {}
                     signal_engine.active_symbols.clear()
                     signal_engine.active_symbols.add(symbol)
+                    await signal_engine.prime_symbol_to_next_closed_candle(symbol)
                 else:
                     signal_engine.last_candle_time = {} # Dict reset
                     signal_engine.last_processed_candle_ts = {}
+                    signal_engine.last_state_sync_candle_ts = {}
+                    signal_engine.last_stateful_retry_ts = {}
+                    signal_engine.last_processed_exit_candle_ts = {}
                     signal_engine.active_symbols.clear() # 湲곗〈 ?섎룞 紐⑸줉??珥덇린??(紐낇솗?깆쓣 ?꾪빐)
                     signal_engine.active_symbols.add(symbol)
+                    await signal_engine.prime_symbol_to_next_closed_candle(symbol)
             
             # Dual Thrust ?붿쭊 罹먯떆??珥덇린??
             dt_engine = self.engines.get('dualthrust')
