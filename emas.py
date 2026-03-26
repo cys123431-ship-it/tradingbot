@@ -1572,6 +1572,8 @@ class SignalEngine(BaseEngine):
         self.last_stateful_diag_notice = {}
         self.last_processed_exit_candle_ts = {}
         self.pending_reentry = {} # {symbol: {'side': 'long'|'short', 'target_time': ts}}
+        self.ut_hybrid_timing_latches = {}
+        self.ut_hybrid_timing_consumed_ts = {}
         
         self.last_heartbeat = 0
         self.consecutive_errors = 0
@@ -1610,6 +1612,8 @@ class SignalEngine(BaseEngine):
         self.last_stateful_diag_notice = {}
         self.last_processed_exit_candle_ts = {}
         self.cameron_states = {}
+        self.ut_hybrid_timing_latches = {}
+        self.ut_hybrid_timing_consumed_ts = {}
         
         # 珥덇린??
         self.active_symbols = set()
@@ -1707,6 +1711,54 @@ class SignalEngine(BaseEngine):
             if direction == 'down' and prev_diff >= 0 > curr_diff:
                 return True, idx
         return False, None
+
+    def _get_ut_hybrid_latch_key(self, symbol, hybrid_strategy):
+        return f"{str(hybrid_strategy).lower()}::{symbol}"
+
+    def _remember_ut_hybrid_timing_signal(self, symbol, hybrid_strategy, timing_sig, timing_detail):
+        if str(hybrid_strategy).lower() not in {'utrsi', 'utbb'}:
+            return None
+        if timing_sig not in {'long', 'short'}:
+            return self.ut_hybrid_timing_latches.get(self._get_ut_hybrid_latch_key(symbol, hybrid_strategy))
+
+        signal_ts = int(timing_detail.get('signal_ts') or 0)
+        if signal_ts <= 0:
+            return self.ut_hybrid_timing_latches.get(self._get_ut_hybrid_latch_key(symbol, hybrid_strategy))
+
+        key = self._get_ut_hybrid_latch_key(symbol, hybrid_strategy)
+        current = self.ut_hybrid_timing_latches.get(key, {})
+        current_ts = int(current.get('signal_ts') or 0)
+        if signal_ts >= current_ts:
+            self.ut_hybrid_timing_latches[key] = {
+                'signal': timing_sig,
+                'signal_ts': signal_ts
+            }
+        return self.ut_hybrid_timing_latches.get(key)
+
+    def _get_ut_hybrid_timing_latch(self, symbol, hybrid_strategy):
+        return self.ut_hybrid_timing_latches.get(self._get_ut_hybrid_latch_key(symbol, hybrid_strategy))
+
+    def _is_ut_hybrid_timing_latch_available(self, symbol, hybrid_strategy, side=None):
+        latch = self._get_ut_hybrid_timing_latch(symbol, hybrid_strategy)
+        if not latch:
+            return False
+        if side and latch.get('signal') != side:
+            return False
+        key = self._get_ut_hybrid_latch_key(symbol, hybrid_strategy)
+        consumed_ts = int(self.ut_hybrid_timing_consumed_ts.get(key, 0) or 0)
+        latch_ts = int(latch.get('signal_ts', 0) or 0)
+        return latch_ts > consumed_ts
+
+    def _consume_ut_hybrid_timing_latch(self, symbol, hybrid_strategy, side=None):
+        if str(hybrid_strategy).lower() not in {'utrsi', 'utbb'}:
+            return
+        latch = self._get_ut_hybrid_timing_latch(symbol, hybrid_strategy)
+        if not latch:
+            return
+        if side and latch.get('signal') != side:
+            return
+        key = self._get_ut_hybrid_latch_key(symbol, hybrid_strategy)
+        self.ut_hybrid_timing_consumed_ts[key] = int(latch.get('signal_ts', 0) or 0)
 
     def _calculate_utbot_signal(self, df, strategy_params):
         cfg = strategy_params.get('UTBot', {})
@@ -1979,7 +2031,7 @@ class SignalEngine(BaseEngine):
         reason = f"RSIBB 대기: {rsi_reason} / {bb_reason}"
         return None, reason, detail
 
-    def _calculate_ut_hybrid_signal(self, df, strategy_params, hybrid_strategy):
+    def _calculate_ut_hybrid_signal(self, symbol, df, strategy_params, hybrid_strategy):
         hybrid_strategy = str(hybrid_strategy or '').lower()
         timing_label = UT_HYBRID_TIMING_LABELS.get(hybrid_strategy, 'Signal')
         strategy_label = STRATEGY_DISPLAY_NAMES.get(hybrid_strategy, hybrid_strategy.upper())
@@ -1994,8 +2046,24 @@ class SignalEngine(BaseEngine):
 
         ut_sig, ut_reason, ut_detail = self._calculate_utbot_signal(df, strategy_params)
         timing_sig, timing_reason, timing_detail = timing_calc(df, strategy_params)
+        latch = None
+        latch_available = False
+        if hybrid_strategy in {'utrsi', 'utbb'} and symbol:
+            latch = self._remember_ut_hybrid_timing_signal(symbol, hybrid_strategy, timing_sig, timing_detail)
+            latch_available = self._is_ut_hybrid_timing_latch_available(symbol, hybrid_strategy)
 
         ut_state = ut_sig or ut_detail.get('bias_side')
+        effective_timing_sig = timing_sig
+        timing_match_source = 'fresh' if timing_sig in {'long', 'short'} else None
+        if hybrid_strategy in {'utrsi', 'utbb'} and ut_state in {'long', 'short'}:
+            if not (timing_sig == ut_state):
+                if latch_available and latch and latch.get('signal') == ut_state:
+                    effective_timing_sig = ut_state
+                    timing_match_source = 'latched'
+                elif timing_sig not in {'long', 'short'}:
+                    effective_timing_sig = None
+                    timing_match_source = None
+
         detail = {
             'ut_state': ut_state,
             'ut_signal': ut_sig,
@@ -2003,8 +2071,13 @@ class SignalEngine(BaseEngine):
             'ut_signal_ts': ut_detail.get('signal_ts'),
             'timing_label': timing_label,
             'timing_signal': timing_sig,
+            'effective_timing_signal': effective_timing_sig,
+            'timing_match_source': timing_match_source,
             'timing_reason': timing_reason,
             'timing_signal_ts': timing_detail.get('signal_ts'),
+            'latched_timing_signal': latch.get('signal') if latch else None,
+            'latched_timing_signal_ts': latch.get('signal_ts') if latch else None,
+            'latched_timing_available': latch_available,
             'timing_detail': timing_detail,
             'ut_detail': ut_detail
         }
@@ -2012,11 +2085,17 @@ class SignalEngine(BaseEngine):
         if ut_state not in {'long', 'short'}:
             return None, f"{strategy_label} 대기: UT 상태 계산 대기", detail
 
-        if timing_sig == ut_state:
-            reason = (
-                f"{strategy_label} {ut_state.upper()}: UT {ut_state.upper()} 상태 + "
-                f"{timing_label} {ut_state.upper()} 타이밍 일치"
-            )
+        if effective_timing_sig == ut_state:
+            if timing_match_source == 'latched':
+                reason = (
+                    f"{strategy_label} {ut_state.upper()}: 저장된 {timing_label} {ut_state.upper()} "
+                    f"신호 + 현재 UT {ut_state.upper()} 상태 일치"
+                )
+            else:
+                reason = (
+                    f"{strategy_label} {ut_state.upper()}: UT {ut_state.upper()} 상태 + "
+                    f"{timing_label} {ut_state.upper()} 타이밍 일치"
+                )
             return ut_state, reason, detail
 
         if timing_sig and timing_sig != ut_state:
@@ -2026,20 +2105,27 @@ class SignalEngine(BaseEngine):
             )
             return None, reason, detail
 
+        if hybrid_strategy in {'utrsi', 'utbb'} and latch_available and latch and latch.get('signal') != ut_state:
+            reason = (
+                f"{strategy_label} 대기: UT {ut_state.upper()} 상태, "
+                f"저장된 {timing_label} {str(latch.get('signal')).upper()} 신호와 방향 불일치"
+            )
+            return None, reason, detail
+
         reason = (
             f"{strategy_label} 대기: UT {ut_state.upper()} 상태, "
             f"{timing_label} {ut_state.upper()} 타이밍 신호 대기"
         )
         return None, reason, detail
 
-    def _calculate_utrsibb_signal(self, df, strategy_params):
-        return self._calculate_ut_hybrid_signal(df, strategy_params, 'utrsibb')
+    def _calculate_utrsibb_signal(self, symbol, df, strategy_params):
+        return self._calculate_ut_hybrid_signal(symbol, df, strategy_params, 'utrsibb')
 
-    def _calculate_utrsi_signal(self, df, strategy_params):
-        return self._calculate_ut_hybrid_signal(df, strategy_params, 'utrsi')
+    def _calculate_utrsi_signal(self, symbol, df, strategy_params):
+        return self._calculate_ut_hybrid_signal(symbol, df, strategy_params, 'utrsi')
 
-    def _calculate_utbb_signal(self, df, strategy_params):
-        return self._calculate_ut_hybrid_signal(df, strategy_params, 'utbb')
+    def _calculate_utbb_signal(self, symbol, df, strategy_params):
+        return self._calculate_ut_hybrid_signal(symbol, df, strategy_params, 'utbb')
 
     def _calculate_cameron_signal(self, df, strategy_params):
         cfg = strategy_params.get('Cameron', {})
@@ -2813,7 +2899,7 @@ class SignalEngine(BaseEngine):
                     'utrsi': self._calculate_utrsi_signal,
                     'utbb': self._calculate_utbb_signal
                 }.get(active_strategy)
-                _, _, hybrid_detail = hybrid_calc(df, strategy_params)
+                _, _, hybrid_detail = hybrid_calc(symbol, df, strategy_params)
                 raw_strategy_sig = hybrid_detail.get('ut_state')
                 raw_state_sig = raw_strategy_sig
                 raw_ut_detail = hybrid_detail.get('ut_detail') or {}
@@ -2875,9 +2961,15 @@ class SignalEngine(BaseEngine):
                     signal_ts_human=datetime.fromtimestamp(signal_ts / 1000).strftime('%m-%d %H:%M') if signal_ts else None,
                     timing_label=raw_hybrid_detail.get('timing_label'),
                     timing_signal=(raw_hybrid_detail.get('timing_signal') or 'none') if raw_hybrid_detail.get('timing_label') else None,
+                    effective_timing_signal=(raw_hybrid_detail.get('effective_timing_signal') or 'none') if raw_hybrid_detail.get('timing_label') else None,
+                    timing_match_source=raw_hybrid_detail.get('timing_match_source'),
                     timing_signal_ts=timing_signal_ts,
                     timing_signal_ts_human=datetime.fromtimestamp(timing_signal_ts / 1000).strftime('%m-%d %H:%M') if timing_signal_ts else None,
                     timing_reason=raw_hybrid_detail.get('timing_reason'),
+                    latched_timing_signal=raw_hybrid_detail.get('latched_timing_signal'),
+                    latched_timing_available=raw_hybrid_detail.get('latched_timing_available'),
+                    latched_timing_signal_ts=raw_hybrid_detail.get('latched_timing_signal_ts'),
+                    latched_timing_signal_ts_human=datetime.fromtimestamp(raw_hybrid_detail.get('latched_timing_signal_ts') / 1000).strftime('%m-%d %H:%M') if raw_hybrid_detail.get('latched_timing_signal_ts') else None,
                     feed_last_ts=feed_last_ts,
                     feed_last_ts_human=datetime.fromtimestamp(feed_last_ts / 1000).strftime('%m-%d %H:%M') if feed_last_ts else None,
                     feed_last_close=float(df.iloc[-1]['close']) if len(df) >= 1 else None,
@@ -3041,6 +3133,7 @@ class SignalEngine(BaseEngine):
                                 f"{strategy_name} UT 반전 + {timing_label} 타이밍 -> {entry_sig.upper()} 재진입"
                             )
                             await self.entry(symbol, entry_sig, float(k['c']))
+                            self._consume_ut_hybrid_timing_latch(symbol, active_strategy, entry_sig)
                             self._update_stateful_diag(
                                 symbol,
                                 stage='flip_reentered',
@@ -3073,6 +3166,7 @@ class SignalEngine(BaseEngine):
                     self.last_entry_reason[symbol] = f"{strategy_name} 조건 충족 -> {entry_sig.upper()} 진입"
                     logger.info(f"[{strategy_name}] New entry {entry_sig.upper()}")
                     await self.entry(symbol, entry_sig, float(k['c']))
+                    self._consume_ut_hybrid_timing_latch(symbol, active_strategy, entry_sig)
                 elif not pos and regime_sig:
                     self.last_entry_reason[symbol] = (
                         f"{strategy_name} UT {regime_sig.upper()} 상태, {timing_label} 타이밍 대기"
@@ -3539,7 +3633,7 @@ class SignalEngine(BaseEngine):
                 'utrsi': self._calculate_utrsi_signal,
                 'utbb': self._calculate_utbb_signal
             }.get(active_strategy)
-            sig, entry_reason, hybrid_detail = hybrid_calc(df, strategy_params)
+            sig, entry_reason, hybrid_detail = hybrid_calc(symbol, df, strategy_params)
             ut_state = hybrid_detail.get('ut_state')
             is_bullish = ut_state == 'long'
             is_bearish = ut_state == 'short'
@@ -6734,6 +6828,8 @@ class MainController:
                         signal_engine.last_stateful_retry_ts = {}
                         signal_engine.last_stateful_diag = {}
                         signal_engine.last_stateful_diag_notice = {}
+                        signal_engine.ut_hybrid_timing_latches = {}
+                        signal_engine.ut_hybrid_timing_consumed_ts = {}
                     await update.message.reply_text(f"✅ 전략 변경: {val_lower.upper()}")
                 else:
                     await update.message.reply_text(
@@ -7825,7 +7921,19 @@ class MainController:
                             )
                             if stateful_diag.get('timing_signal_ts_human'):
                                 timing_line += f" | signal `{stateful_diag.get('timing_signal_ts_human')}`"
+                            if stateful_diag.get('effective_timing_signal') not in (None, 'none'):
+                                timing_line += f" | effective `{stateful_diag.get('effective_timing_signal')}`"
+                            if stateful_diag.get('timing_match_source'):
+                                timing_line += f" | source `{stateful_diag.get('timing_match_source')}`"
                             msg += timing_line + "\n"
+                        if stateful_diag.get('latched_timing_signal'):
+                            latched_line = (
+                                f"저장신호: `{stateful_diag.get('latched_timing_signal')}` | "
+                                f"usable `{stateful_diag.get('latched_timing_available')}`"
+                            )
+                            if stateful_diag.get('latched_timing_signal_ts_human'):
+                                latched_line += f" | ts `{stateful_diag.get('latched_timing_signal_ts_human')}`"
+                            msg += latched_line + "\n"
                         if stateful_diag.get('timing_reason'):
                             msg += f"타이밍판정: `{stateful_diag.get('timing_reason')}`\n"
                         if stateful_diag.get('ut_key') is not None:
