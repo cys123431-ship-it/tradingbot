@@ -3394,6 +3394,7 @@ class SignalEngine(BaseEngine):
 
             elif active_strategy == 'utbb':
                 ut_signal = raw_hybrid_detail.get('ut_signal')
+                ut_state = raw_hybrid_detail.get('ut_state')
                 bb_upper_breakout = bool(raw_hybrid_detail.get('bb_upper_breakout'))
                 bb_reentry_down = bool(raw_hybrid_detail.get('bb_reentry_down'))
                 bb_reentry_up = bool(raw_hybrid_detail.get('bb_reentry_up'))
@@ -3406,11 +3407,13 @@ class SignalEngine(BaseEngine):
                 special_short_active = self._is_utbb_special_short_active(symbol)
 
                 if pos and pos['side'] == 'long' and (
-                    ut_signal == 'short'
+                    ut_state == 'short'
                     or bb_reentry_down
                 ):
                     if ut_signal == 'short':
                         exit_note = "UT short signal"
+                    elif ut_state == 'short':
+                        exit_note = "UT short state"
                     else:
                         exit_note = "BB upper reentry down"
                     self._update_stateful_diag(
@@ -3437,7 +3440,7 @@ class SignalEngine(BaseEngine):
                             pos_side='NONE',
                             note=f'long exit complete ({exit_note})'
                         )
-                        if ut_signal == 'short' and entry_sig == 'short':
+                        if ut_state == 'short' and entry_sig == 'short':
                             if special_short_candidate:
                                 self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 후 특수 SHORT 재진입"
                                 self._set_utbb_special_short_state(symbol, raw_hybrid_detail.get('bb_lower_signal_ts'))
@@ -3473,7 +3476,7 @@ class SignalEngine(BaseEngine):
                         await self._notify_stateful_diag(symbol, force=True)
 
                 elif pos and pos['side'] == 'short' and (
-                    ut_signal == 'long'
+                    ut_state == 'long'
                     or ((not special_short_active) and bb_lower_breakout)
                     or (special_short_active and bb_reentry_up)
                 ):
@@ -3488,13 +3491,14 @@ class SignalEngine(BaseEngine):
                         note=(
                             'short exit by UT long signal'
                             if ut_signal == 'long'
-                            else ('short exit by BB lower reentry up' if special_short_active else 'short exit by BB lower breakout')
+                            else ('short exit by UT long state' if ut_state == 'long'
+                                  else ('short exit by BB lower reentry up' if special_short_active else 'short exit by BB lower breakout'))
                         )
                     )
                     await self._notify_stateful_diag(symbol)
                     logger.info(
                         f"[{strategy_name}] SHORT exit trigger: "
-                        f"{'UT long signal' if ut_signal == 'long' else ('BB lower reentry up' if special_short_active else 'BB lower breakout')}"
+                        f"{'UT long signal' if ut_signal == 'long' else ('UT long state' if ut_state == 'long' else ('BB lower reentry up' if special_short_active else 'BB lower breakout'))}"
                     )
                     await self.exit_position(symbol, f"{strategy_name}_ShortExit")
                     await asyncio.sleep(1)
@@ -3525,7 +3529,7 @@ class SignalEngine(BaseEngine):
                             )
                         else:
                             self.last_entry_reason[symbol] = (
-                                f"{strategy_name} 숏 청산 완료, {'LONG 신호' if ut_signal == 'long' else '다음 신호'} 대기"
+                                f"{strategy_name} 숏 청산 완료, {'LONG 신호' if ut_state == 'long' else '다음 신호'} 대기"
                             )
                             self._clear_utbb_special_long_state(symbol)
                             self._clear_utbb_special_short_state(symbol)
