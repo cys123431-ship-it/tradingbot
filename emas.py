@@ -5948,10 +5948,11 @@ class MainController:
                 "Private endpoints (balance/positions/orders) will fail."
             )
         
+        market_data_mode = self._get_market_data_exchange_mode(self.exchange_mode)
         self.exchange = self._build_exchange(creds, self.exchange_mode)
         self._configure_exchange_network(self.exchange, self.exchange_mode)
-        self.market_data_exchange = self._build_public_market_data_exchange(self.exchange_mode)
-        self._configure_exchange_network(self.market_data_exchange, self.exchange_mode)
+        self.market_data_exchange = self._build_public_market_data_exchange(market_data_mode)
+        self._configure_exchange_network(self.market_data_exchange, market_data_mode)
         self.market_data_source_label = self._get_market_data_source_label(self.exchange_mode)
         logger.info(f"Market data source configured: {self.market_data_source_label}")
         
@@ -6018,10 +6019,15 @@ class MainController:
         }
         return names.get(mode, mode.upper())
 
-    def _get_market_data_source_label(self, exchange_mode=None):
+    def _get_market_data_exchange_mode(self, exchange_mode=None):
         mode = exchange_mode or self.get_exchange_mode()
+        if mode == BINANCE_TESTNET:
+            return BINANCE_MAINNET
+        return mode
+
+    def _get_market_data_source_label(self, exchange_mode=None):
+        mode = self._get_market_data_exchange_mode(exchange_mode)
         labels = {
-            BINANCE_TESTNET: 'BINANCE FUTURES TESTNET PUBLIC',
             BINANCE_MAINNET: 'BINANCE FUTURES MAINNET PUBLIC',
             UPBIT_MODE: 'UPBIT KRW SPOT PUBLIC'
         }
@@ -6371,10 +6377,11 @@ class MainController:
             creds = self._get_exchange_credentials(exchange_mode)
             
             # 4. 嫄곕옒???ъ큹湲고솕
+            market_data_mode = self._get_market_data_exchange_mode(exchange_mode)
             self.exchange = self._build_exchange(creds, exchange_mode)
             network_name = self._configure_exchange_network(self.exchange, exchange_mode)
-            self.market_data_exchange = self._build_public_market_data_exchange(exchange_mode)
-            self._configure_exchange_network(self.market_data_exchange, exchange_mode)
+            self.market_data_exchange = self._build_public_market_data_exchange(market_data_mode)
+            self._configure_exchange_network(self.market_data_exchange, market_data_mode)
             self.market_data_source_label = self._get_market_data_source_label(exchange_mode)
             
             # 5. 留덉폆 ?뺣낫 濡쒕뱶
