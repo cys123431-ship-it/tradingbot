@@ -2355,21 +2355,31 @@ class SignalEngine(BaseEngine):
         ut_signal_ts = ut_detail.get('signal_ts')
         short_setup_available = self._is_utbb_short_setup_available(symbol, ut_signal_ts) if symbol else False
         short_mid_ready = bb_mid_sig == 'short'
-        special_short_candidate = short_mid_ready and bb_lower_sig == 'exit_short'
+        short_setup_entry_ready = bool(ut_sig == 'short' and short_setup_available)
+        short_mid_entry_ready = bool(ut_state == 'short' and short_mid_ready)
+        special_short_candidate = short_mid_entry_ready and bb_lower_sig == 'exit_short'
 
         entry_sig = None
         if ut_sig == 'long':
             entry_sig = 'long'
-        elif ut_sig == 'short' and (short_setup_available or short_mid_ready):
+        elif short_setup_entry_ready or short_mid_entry_ready:
             entry_sig = 'short'
 
         short_entry_reason = None
-        if ut_sig == 'short':
+        if ut_state == 'short':
             if special_short_candidate:
-                short_entry_reason = "BB 중간선 하향돌파 + BB 하단 하향돌파 + UT 숏신호 확인"
-            elif short_mid_ready:
-                short_entry_reason = "BB 중간선 하향돌파 + UT 숏신호 확인"
-            elif short_setup_available:
+                short_entry_reason = (
+                    "BB 중간선 하향돌파 + BB 하단 하향돌파 + UT 숏신호 확인"
+                    if ut_sig == 'short'
+                    else "BB 중간선 하향돌파 + BB 하단 하향돌파 + UT 숏상태 확인"
+                )
+            elif short_mid_entry_ready:
+                short_entry_reason = (
+                    "BB 중간선 하향돌파 + UT 숏신호 확인"
+                    if ut_sig == 'short'
+                    else "BB 중간선 하향돌파 + UT 숏상태 확인"
+                )
+            elif short_setup_entry_ready:
                 short_entry_reason = "BB 상단 재진입 셋업 이후 UT 숏신호 확인"
 
         detail = {
@@ -2379,10 +2389,10 @@ class SignalEngine(BaseEngine):
             'ut_signal_ts': ut_signal_ts,
             'timing_label': 'BB',
             'timing_signal': bb_sig or bb_mid_sig,
-            'effective_timing_signal': 'short' if (short_setup_available or short_mid_ready) else None,
-            'timing_match_source': 'mid_cross' if short_mid_ready else ('latched' if short_setup_available else None),
+            'effective_timing_signal': 'short' if (short_setup_entry_ready or short_mid_entry_ready) else None,
+            'timing_match_source': 'mid_cross' if short_mid_entry_ready else ('latched' if short_setup_entry_ready else None),
             'timing_reason': short_entry_reason or bb_reason,
-            'timing_signal_ts': (bb_mid_detail.get('signal_ts') if short_mid_ready else bb_detail.get('signal_ts')),
+            'timing_signal_ts': (bb_mid_detail.get('signal_ts') if short_mid_entry_ready else bb_detail.get('signal_ts')),
             'latched_timing_signal': short_setup.get('signal') if short_setup else None,
             'latched_timing_signal_ts': short_setup.get('signal_ts') if short_setup else None,
             'latched_timing_available': short_setup_available,
@@ -2413,8 +2423,9 @@ class SignalEngine(BaseEngine):
         if entry_sig == 'short':
             return 'short', f"UTBB SHORT: {short_entry_reason}", detail
 
-        if ut_sig == 'short' and not (short_setup_available or short_mid_ready):
-            return None, "UTBB 대기: UT 숏신호 감지, BB 상단 재진입 또는 중간선 하락 돌파 숏 셋업 대기", detail
+        if ut_state == 'short' and not (short_setup_entry_ready or short_mid_entry_ready):
+            wait_label = "UT 숏신호 감지" if ut_sig == 'short' else "UT 숏상태 유지"
+            return None, f"UTBB 대기: {wait_label}, BB 상단 재진입 또는 중간선 하락 돌파 숏 셋업 대기", detail
         if ut_sig == 'long':
             return None, "UTBB 대기: UT 롱신호 감지", detail
         return None, "UTBB 대기", detail
