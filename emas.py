@@ -5963,13 +5963,11 @@ class MainController:
         self.active_engine = None
         self.tg_app = None
         self.status_data = {}
-        self.is_paused = True  # 기본: 수동 시작 시 안전하게 일시정지
-        resume_reasons = {'ensure_restart', 'manual_restart', 'reboot_start', 'deploy_start'}
-        if self.launch_reason in resume_reasons and self.prev_paused_state is not None:
-            self.is_paused = self.prev_paused_state
+        self.is_paused = False  # 기본: 재시작/수동 시작 모두 자동 실행 상태로 시작
+        if self.prev_paused_state is not None:
             logger.info(
-                f"Pause state restored from previous heartbeat: paused={self.is_paused} "
-                f"(launch_reason={self.launch_reason})"
+                f"Startup pause override applied: paused={self.is_paused} "
+                f"(previous={self.prev_paused_state}, launch_reason={self.launch_reason})"
             )
         self.dashboard_msg_id = None
         self.dashboard_plain_text_mode = True
