@@ -6325,7 +6325,7 @@ class MainController:
             '17': "📝 **HMA 기간** 입력 (예: 9,21)",
             '18': "📝 **진입 모드** 선택 (1=Cross, 2=Position)",
             '19': "📝 **UT Bot 설정** 입력 (형식: key,atr,on/off 예: 1,10,off)",
-            '20': "📝 **RSI/BB 보조설정** 입력 (형식: rsi_length,bb_length,bb_mult 예: 6,200,2)",
+            '20': "RSI/BB 보조설정 입력\n형식: RSI길이,BB길이,BB배수\n예: 6,200,2",
             '21': "ℹ️ **UT Hybrid 안내**: UTRSI/UTBB/UTRSIBB는 19번 UT Bot 설정과 20번 RSI/BB 설정을 조합해 사용합니다.",
             '22': "📝 **거래소/네트워크 선택** (1=바이낸스 테스트넷, 2=바이낸스 메인넷, 3=업비트 KRW 현물)",
             '23': "📝 **거래량 급등 채굴 기능** (1=ON, 0=OFF)",
@@ -6502,7 +6502,10 @@ class MainController:
         elif text == '31':
             return INPUT
         elif text in prompts:
-            await update.message.reply_text(prompts[text], parse_mode=ParseMode.MARKDOWN)
+            if text == '20':
+                await update.message.reply_text(prompts[text])
+            else:
+                await update.message.reply_text(prompts[text], parse_mode=ParseMode.MARKDOWN)
             if text in {'8', '38', '43'}:
                 return SYMBOL_INPUT
             return INPUT
@@ -6857,6 +6860,12 @@ class MainController:
                 signal_engine = self.engines.get('signal')
                 if signal_engine:
                     signal_engine.last_processed_candle_ts = {}
+                    signal_engine.last_state_sync_candle_ts = {}
+                    signal_engine.last_stateful_retry_ts = {}
+                    signal_engine.last_stateful_diag = {}
+                    signal_engine.last_stateful_diag_notice = {}
+                    signal_engine.ut_hybrid_timing_latches = {}
+                    signal_engine.ut_hybrid_timing_consumed_ts = {}
                 await update.message.reply_text(
                     f"✅ RSI+BB 설정 변경: RSI={rsi_length}, BB={bb_length}, x{bb_mult:.2f}"
                 )
