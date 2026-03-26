@@ -3381,15 +3381,12 @@ class SignalEngine(BaseEngine):
 
                 if pos and pos['side'] == 'long' and (
                     ut_signal == 'short'
-                    or ((not special_long_active) and bb_upper_breakout)
-                    or (special_long_active and bb_reentry_down)
+                    or bb_reentry_down
                 ):
                     if ut_signal == 'short':
                         exit_note = "UT short signal"
-                    elif special_long_active and bb_reentry_down:
-                        exit_note = "BB upper reentry down after special long"
                     else:
-                        exit_note = "BB upper breakout"
+                        exit_note = "BB upper reentry down"
                     self._update_stateful_diag(
                         symbol,
                         stage='flip_detected',
@@ -6927,8 +6924,8 @@ class MainController:
                 "ℹ️ UT Hybrid 전략 안내\n"
                 "- UTRSI: UT 방향 + RSI 타이밍 조합\n"
                 "- UTRSIBB: UT 방향 + RSI/BB 동시 타이밍 조합\n"
-                "- UTBB LONG: 기본은 UT 롱신호 진입, UT 숏신호 또는 BB 상단 돌파 마감 시 청산\n"
-                "- UTBB 특수 LONG: 진입봉이 BB 상단 돌파였으면 이후 BB 상단 하향 돌파 마감 시 청산\n"
+                "- UTBB LONG: UT 롱신호 진입, UT 숏신호 또는 BB 상단 하향 돌파 마감 시 청산\n"
+                "- UTBB 특수 LONG: 진입봉이 BB 상단 돌파였어도 동일하게 BB 상단 하향 돌파 또는 UT 숏신호로 청산\n"
                 "- UTBB SHORT: BB 상단 재진입 셋업 후 UT 숏신호 또는 BB 중간선 하락 돌파 + UT 숏신호로 진입\n"
                 "- UTBB SHORT 청산: UT 롱신호 또는 BB 하단선 하향 돌파 마감 시 청산\n"
                 "- 모든 판단은 확정봉 기준"
