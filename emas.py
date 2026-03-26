@@ -66,8 +66,25 @@ logger = logging.getLogger(__name__)
 faulthandler.enable()
 CORE_ENGINE = 'signal'
 MA_STRATEGIES = {'sma', 'hma'}
-PATTERN_STRATEGIES = {'cameron', 'utbot', 'rsibb', 'utrsibb'}
+PATTERN_STRATEGIES = {'cameron', 'utbot', 'rsibb', 'utrsibb', 'utrsi', 'utbb'}
 CORE_STRATEGIES = MA_STRATEGIES | PATTERN_STRATEGIES
+UT_HYBRID_STRATEGIES = {'utrsibb', 'utrsi', 'utbb'}
+STATEFUL_UT_STRATEGIES = {'utbot'} | UT_HYBRID_STRATEGIES
+STRATEGY_DISPLAY_NAMES = {
+    'sma': 'SMA',
+    'hma': 'HMA',
+    'cameron': 'CAMERON',
+    'utbot': 'UTBOT',
+    'rsibb': 'RSIBB',
+    'utrsibb': 'UTRSIBB',
+    'utrsi': 'UTRSI',
+    'utbb': 'UTBB'
+}
+UT_HYBRID_TIMING_LABELS = {
+    'utrsibb': 'RSI+BB',
+    'utrsi': 'RSI',
+    'utbb': 'BB'
+}
 BINANCE_TESTNET = 'binance_testnet'
 BINANCE_MAINNET = 'binance_mainnet'
 UPBIT_MODE = 'upbit'
@@ -1796,19 +1813,63 @@ class SignalEngine(BaseEngine):
         )
         return None, reason, detail
 
-    def _calculate_rsibb_signal(self, df, strategy_params):
+    def _calculate_rsi_signal(self, df, strategy_params):
         cfg = strategy_params.get('RSIBB', {})
         rsi_length = max(1, int(cfg.get('rsi_length', 6) or 6))
+
+        closed = df.iloc[:-1].copy().reset_index(drop=True)
+        min_bars = max(rsi_length + 3, 30)
+        if len(closed) < min_bars:
+            return None, "RSI 데이터 부족", {}
+
+        close_series = closed['close'].astype(float)
+        rsi_series = ta.rsi(close_series, length=rsi_length)
+        valid = pd.DataFrame({
+            'timestamp': closed['timestamp'],
+            'close': close_series,
+            'rsi': rsi_series
+        }).dropna().reset_index(drop=True)
+        if len(valid) < 2:
+            return None, "RSI 지표 확정 대기", {}
+
+        prev_row = valid.iloc[-2]
+        curr_row = valid.iloc[-1]
+        prev_rsi = float(prev_row['rsi'])
+        curr_rsi = float(curr_row['rsi'])
+
+        rsi_cross_up = prev_rsi <= 50.0 and curr_rsi > 50.0
+        rsi_cross_down = prev_rsi >= 50.0 and curr_rsi < 50.0
+
+        detail = {
+            'rsi_length': rsi_length,
+            'prev_rsi': prev_rsi,
+            'curr_rsi': curr_rsi,
+            'curr_close': float(curr_row['close']),
+            'signal_ts': int(curr_row['timestamp'])
+        }
+
+        if rsi_cross_up:
+            reason = f"RSI LONG: RSI 50 상향돌파 (RSI={curr_rsi:.2f}, len={rsi_length})"
+            return 'long', reason, detail
+
+        if rsi_cross_down:
+            reason = f"RSI SHORT: RSI 50 하향돌파 (RSI={curr_rsi:.2f}, len={rsi_length})"
+            return 'short', reason, detail
+
+        reason = f"RSI 대기: RSI={curr_rsi:.2f}, len={rsi_length}"
+        return None, reason, detail
+
+    def _calculate_bb_signal(self, df, strategy_params):
+        cfg = strategy_params.get('RSIBB', {})
         bb_length = max(2, int(cfg.get('bb_length', 200) or 200))
         bb_mult = float(cfg.get('bb_mult', 2.0) or 2.0)
 
         closed = df.iloc[:-1].copy().reset_index(drop=True)
-        min_bars = max(bb_length + 3, rsi_length + 3, 30)
+        min_bars = max(bb_length + 3, 30)
         if len(closed) < min_bars:
-            return None, "RSIBB 데이터 부족", {}
+            return None, "BB 데이터 부족", {}
 
         close_series = closed['close'].astype(float)
-        rsi_series = ta.rsi(close_series, length=rsi_length)
         bb_basis = ta.sma(close_series, length=bb_length)
         bb_std = close_series.rolling(bb_length).std(ddof=0)
         bb_upper = bb_basis + (bb_std * bb_mult)
@@ -1817,18 +1878,15 @@ class SignalEngine(BaseEngine):
         valid = pd.DataFrame({
             'timestamp': closed['timestamp'],
             'close': close_series,
-            'rsi': rsi_series,
             'bb_basis': bb_basis,
             'bb_upper': bb_upper,
             'bb_lower': bb_lower
         }).dropna().reset_index(drop=True)
         if len(valid) < 2:
-            return None, "RSIBB 지표 확정 대기", {}
+            return None, "BB 지표 확정 대기", {}
 
         prev_row = valid.iloc[-2]
         curr_row = valid.iloc[-1]
-        prev_rsi = float(prev_row['rsi'])
-        curr_rsi = float(curr_row['rsi'])
         prev_close = float(prev_row['close'])
         curr_close = float(curr_row['close'])
         prev_upper = float(prev_row['bb_upper'])
@@ -1836,45 +1894,106 @@ class SignalEngine(BaseEngine):
         prev_lower = float(prev_row['bb_lower'])
         curr_lower = float(curr_row['bb_lower'])
 
-        rsi_cross_up = prev_rsi <= 50.0 and curr_rsi > 50.0
-        rsi_cross_down = prev_rsi >= 50.0 and curr_rsi < 50.0
         price_cross_up = prev_close <= prev_lower and curr_close > curr_lower
         price_cross_down = prev_close >= prev_upper and curr_close < curr_upper
 
         detail = {
-            'rsi_length': rsi_length,
             'bb_length': bb_length,
             'bb_mult': bb_mult,
-            'curr_rsi': curr_rsi,
             'curr_close': curr_close,
             'curr_upper': curr_upper,
             'curr_lower': curr_lower,
             'signal_ts': int(curr_row['timestamp'])
         }
 
-        if rsi_cross_up and price_cross_up:
+        if price_cross_up:
             reason = (
-                f"RSIBB LONG: RSI 50 상향 + 하단밴드 상향돌파 "
-                f"(RSI={curr_rsi:.2f}, BB={bb_length}, x{bb_mult:.2f})"
+                f"BB LONG: 하단밴드 상향돌파 "
+                f"(BB={bb_length}, x{bb_mult:.2f}, close={curr_close:.4f})"
             )
             return 'long', reason, detail
 
-        if rsi_cross_down and price_cross_down:
+        if price_cross_down:
+            reason = (
+                f"BB SHORT: 상단밴드 하향돌파 "
+                f"(BB={bb_length}, x{bb_mult:.2f}, close={curr_close:.4f})"
+            )
+            return 'short', reason, detail
+
+        reason = (
+            f"BB 대기: Upper={curr_upper:.4f}, "
+            f"Lower={curr_lower:.4f}, close={curr_close:.4f}"
+        )
+        return None, reason, detail
+
+    def _calculate_rsibb_signal(self, df, strategy_params):
+        rsi_sig, rsi_reason, rsi_detail = self._calculate_rsi_signal(df, strategy_params)
+        bb_sig, bb_reason, bb_detail = self._calculate_bb_signal(df, strategy_params)
+
+        detail = {
+            'rsi_length': rsi_detail.get('rsi_length'),
+            'bb_length': bb_detail.get('bb_length'),
+            'bb_mult': bb_detail.get('bb_mult'),
+            'curr_rsi': rsi_detail.get('curr_rsi'),
+            'curr_close': bb_detail.get('curr_close', rsi_detail.get('curr_close')),
+            'curr_upper': bb_detail.get('curr_upper'),
+            'curr_lower': bb_detail.get('curr_lower'),
+            'signal_ts': bb_detail.get('signal_ts') or rsi_detail.get('signal_ts'),
+            'rsi_signal': rsi_sig,
+            'bb_signal': bb_sig,
+            'rsi_reason': rsi_reason,
+            'bb_reason': bb_reason,
+            'rsi_detail': rsi_detail,
+            'bb_detail': bb_detail
+        }
+
+        if rsi_sig and bb_sig and rsi_sig == bb_sig:
+            curr_rsi = float(rsi_detail.get('curr_rsi', 0.0))
+            bb_length = int(bb_detail.get('bb_length', 0) or 0)
+            bb_mult = float(bb_detail.get('bb_mult', 0.0) or 0.0)
+            if rsi_sig == 'long':
+                reason = (
+                    f"RSIBB LONG: RSI 50 상향 + 하단밴드 상향돌파 "
+                    f"(RSI={curr_rsi:.2f}, BB={bb_length}, x{bb_mult:.2f})"
+                )
+                return 'long', reason, detail
+
             reason = (
                 f"RSIBB SHORT: RSI 50 하향 + 상단밴드 하향돌파 "
                 f"(RSI={curr_rsi:.2f}, BB={bb_length}, x{bb_mult:.2f})"
             )
             return 'short', reason, detail
 
-        reason = (
-            f"RSIBB 대기: RSI={curr_rsi:.2f}, "
-            f"Upper={curr_upper:.4f}, Lower={curr_lower:.4f}"
-        )
+        if rsi_sig and bb_sig and rsi_sig != bb_sig:
+            reason = f"RSIBB 대기: RSI {rsi_sig.upper()}, BB {bb_sig.upper()} 방향 불일치"
+            return None, reason, detail
+
+        if rsi_detail and bb_detail:
+            reason = (
+                f"RSIBB 대기: RSI={float(rsi_detail.get('curr_rsi', 0.0)):.2f}, "
+                f"Upper={float(bb_detail.get('curr_upper', 0.0)):.4f}, "
+                f"Lower={float(bb_detail.get('curr_lower', 0.0)):.4f}"
+            )
+            return None, reason, detail
+
+        reason = f"RSIBB 대기: {rsi_reason} / {bb_reason}"
         return None, reason, detail
 
-    def _calculate_utrsibb_signal(self, df, strategy_params):
+    def _calculate_ut_hybrid_signal(self, df, strategy_params, hybrid_strategy):
+        hybrid_strategy = str(hybrid_strategy or '').lower()
+        timing_label = UT_HYBRID_TIMING_LABELS.get(hybrid_strategy, 'Signal')
+        strategy_label = STRATEGY_DISPLAY_NAMES.get(hybrid_strategy, hybrid_strategy.upper())
+        timing_calc_map = {
+            'utrsibb': self._calculate_rsibb_signal,
+            'utrsi': self._calculate_rsi_signal,
+            'utbb': self._calculate_bb_signal
+        }
+        timing_calc = timing_calc_map.get(hybrid_strategy)
+        if timing_calc is None:
+            return None, f"{strategy_label} 계산기가 없습니다.", {}
+
         ut_sig, ut_reason, ut_detail = self._calculate_utbot_signal(df, strategy_params)
-        rsibb_sig, rsibb_reason, rsibb_detail = self._calculate_rsibb_signal(df, strategy_params)
+        timing_sig, timing_reason, timing_detail = timing_calc(df, strategy_params)
 
         ut_state = ut_sig or ut_detail.get('bias_side')
         detail = {
@@ -1882,35 +2001,45 @@ class SignalEngine(BaseEngine):
             'ut_signal': ut_sig,
             'ut_reason': ut_reason,
             'ut_signal_ts': ut_detail.get('signal_ts'),
-            'rsibb_signal': rsibb_sig,
-            'rsibb_reason': rsibb_reason,
-            'rsibb_signal_ts': rsibb_detail.get('signal_ts'),
-            'ut_detail': ut_detail,
-            'rsibb_detail': rsibb_detail
+            'timing_label': timing_label,
+            'timing_signal': timing_sig,
+            'timing_reason': timing_reason,
+            'timing_signal_ts': timing_detail.get('signal_ts'),
+            'timing_detail': timing_detail,
+            'ut_detail': ut_detail
         }
 
         if ut_state not in {'long', 'short'}:
-            return None, "UTRSIBB 대기: UT 상태 계산 대기", detail
+            return None, f"{strategy_label} 대기: UT 상태 계산 대기", detail
 
-        if rsibb_sig == ut_state:
+        if timing_sig == ut_state:
             reason = (
-                f"UTRSIBB {ut_state.upper()}: UT {ut_state.upper()} 상태 + "
-                f"RSI+BB {rsibb_sig.upper()} 타이밍 일치"
+                f"{strategy_label} {ut_state.upper()}: UT {ut_state.upper()} 상태 + "
+                f"{timing_label} {ut_state.upper()} 타이밍 일치"
             )
             return ut_state, reason, detail
 
-        if rsibb_sig and rsibb_sig != ut_state:
+        if timing_sig and timing_sig != ut_state:
             reason = (
-                f"UTRSIBB 대기: UT {ut_state.upper()} 상태, "
-                f"RSI+BB {rsibb_sig.upper()} 신호는 방향 불일치"
+                f"{strategy_label} 대기: UT {ut_state.upper()} 상태, "
+                f"{timing_label} {timing_sig.upper()} 신호는 방향 불일치"
             )
             return None, reason, detail
 
         reason = (
-            f"UTRSIBB 대기: UT {ut_state.upper()} 상태, "
-            f"RSI+BB {ut_state.upper()} 타이밍 신호 대기"
+            f"{strategy_label} 대기: UT {ut_state.upper()} 상태, "
+            f"{timing_label} {ut_state.upper()} 타이밍 신호 대기"
         )
         return None, reason, detail
+
+    def _calculate_utrsibb_signal(self, df, strategy_params):
+        return self._calculate_ut_hybrid_signal(df, strategy_params, 'utrsibb')
+
+    def _calculate_utrsi_signal(self, df, strategy_params):
+        return self._calculate_ut_hybrid_signal(df, strategy_params, 'utrsi')
+
+    def _calculate_utbb_signal(self, df, strategy_params):
+        return self._calculate_ut_hybrid_signal(df, strategy_params, 'utbb')
 
     def _calculate_cameron_signal(self, df, strategy_params):
         cfg = strategy_params.get('Cameron', {})
@@ -2256,7 +2385,7 @@ class SignalEngine(BaseEngine):
             strategy_params = cfg.get('strategy_params', {})
             entry_mode = strategy_params.get('entry_mode', 'cross').lower()
             active_strategy = strategy_params.get('active_strategy', 'sma').lower()
-            uses_stateful_primary_sync = active_strategy in {'utbot', 'utrsibb'}
+            uses_stateful_primary_sync = active_strategy in STATEFUL_UT_STRATEGIES
             processed_primary_this_tick = False
             
             if ts_p > self.last_processed_candle_ts[symbol]:
@@ -2467,12 +2596,8 @@ class SignalEngine(BaseEngine):
             kalman_enabled = bool(kalman_cfg.get('entry_enabled', False) or kalman_cfg.get('exit_enabled', False))
             active_strategy = strategy_params.get('active_strategy', 'sma').upper()
             entry_mode = strategy_params.get('entry_mode', 'cross').upper()
-            if active_strategy == 'UTBOT':
-                entry_mode = 'UTBOT'
-            elif active_strategy == 'UTRSIBB':
-                entry_mode = 'UTRSIBB'
-            elif active_strategy == 'RSIBB':
-                entry_mode = 'RSIBB'
+            if active_strategy in {'UTBOT', 'RSIBB', 'UTRSIBB', 'UTRSI', 'UTBB'}:
+                entry_mode = active_strategy
             
             # MicroVBO State
             vbo_state = self.vbo_states.get(symbol, {})
@@ -2677,15 +2802,22 @@ class SignalEngine(BaseEngine):
             raw_strategy_sig = None
             raw_state_sig = None
             raw_ut_detail = {}
+            raw_hybrid_detail = {}
             if active_strategy == 'utbot':
                 raw_strategy_sig, _, ut_detail = self._calculate_utbot_signal(df, strategy_params)
                 raw_state_sig = raw_strategy_sig or ut_detail.get('bias_side')
                 raw_ut_detail = ut_detail or {}
-            elif active_strategy == 'utrsibb':
-                _, _, hybrid_detail = self._calculate_utrsibb_signal(df, strategy_params)
+            elif active_strategy in UT_HYBRID_STRATEGIES:
+                hybrid_calc = {
+                    'utrsibb': self._calculate_utrsibb_signal,
+                    'utrsi': self._calculate_utrsi_signal,
+                    'utbb': self._calculate_utbb_signal
+                }.get(active_strategy)
+                _, _, hybrid_detail = hybrid_calc(df, strategy_params)
                 raw_strategy_sig = hybrid_detail.get('ut_state')
                 raw_state_sig = raw_strategy_sig
                 raw_ut_detail = hybrid_detail.get('ut_detail') or {}
+                raw_hybrid_detail = hybrid_detail or {}
             elif active_strategy == 'rsibb':
                 raw_strategy_sig, _, _ = self._calculate_rsibb_signal(df, strategy_params)
                 raw_state_sig = raw_strategy_sig
@@ -2708,8 +2840,9 @@ class SignalEngine(BaseEngine):
             
             current_side = pos['side'] if pos else 'NONE'
             logger.info(f"?뱧 Current position: {current_side}, Signal: {sig or 'NONE'}, Mode: {entry_mode}")
-            if active_strategy in {'utbot', 'utrsibb'}:
+            if active_strategy in STATEFUL_UT_STRATEGIES:
                 signal_ts = raw_ut_detail.get('signal_ts')
+                timing_signal_ts = raw_hybrid_detail.get('timing_signal_ts')
                 feed_last_ts = int(df.iloc[-1]['timestamp']) if len(df) >= 1 else None
                 closed_row = df.iloc[-2] if len(df) >= 2 else None
                 live_row = df.iloc[-1] if len(df) >= 1 else None
@@ -2740,6 +2873,11 @@ class SignalEngine(BaseEngine):
                     tf_used=tf,
                     signal_ts=signal_ts,
                     signal_ts_human=datetime.fromtimestamp(signal_ts / 1000).strftime('%m-%d %H:%M') if signal_ts else None,
+                    timing_label=raw_hybrid_detail.get('timing_label'),
+                    timing_signal=(raw_hybrid_detail.get('timing_signal') or 'none') if raw_hybrid_detail.get('timing_label') else None,
+                    timing_signal_ts=timing_signal_ts,
+                    timing_signal_ts_human=datetime.fromtimestamp(timing_signal_ts / 1000).strftime('%m-%d %H:%M') if timing_signal_ts else None,
+                    timing_reason=raw_hybrid_detail.get('timing_reason'),
                     feed_last_ts=feed_last_ts,
                     feed_last_ts_human=datetime.fromtimestamp(feed_last_ts / 1000).strftime('%m-%d %H:%M') if feed_last_ts else None,
                     feed_last_close=float(df.iloc[-1]['close']) if len(df) >= 1 else None,
@@ -2865,7 +3003,8 @@ class SignalEngine(BaseEngine):
                     elif pos:
                         self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {strategy_name} 반대신호 대기"
 
-            elif active_strategy == 'utrsibb':
+            elif active_strategy in UT_HYBRID_STRATEGIES:
+                timing_label = raw_hybrid_detail.get('timing_label', UT_HYBRID_TIMING_LABELS.get(active_strategy, 'signal'))
                 regime_sig = raw_state_sig
                 entry_sig = sig
                 need_flip = pos and regime_sig and (
@@ -2898,7 +3037,9 @@ class SignalEngine(BaseEngine):
                             note='UT flip exit complete'
                         )
                         if entry_sig == regime_sig:
-                            self.last_entry_reason[symbol] = f"{strategy_name} UT 반전 + RSI+BB 타이밍 -> {entry_sig.upper()} 재진입"
+                            self.last_entry_reason[symbol] = (
+                                f"{strategy_name} UT 반전 + {timing_label} 타이밍 -> {entry_sig.upper()} 재진입"
+                            )
                             await self.entry(symbol, entry_sig, float(k['c']))
                             self._update_stateful_diag(
                                 symbol,
@@ -2908,11 +3049,13 @@ class SignalEngine(BaseEngine):
                                 note='re-entry submitted'
                             )
                         else:
-                            self.last_entry_reason[symbol] = f"{strategy_name} UT 반전 청산 완료, {regime_sig.upper()} RSI+BB 타이밍 대기"
+                            self.last_entry_reason[symbol] = (
+                                f"{strategy_name} UT 반전 청산 완료, {regime_sig.upper()} {timing_label} 타이밍 대기"
+                            )
                             self._update_stateful_diag(
                                 symbol,
                                 stage='flip_exit_only',
-                                note='waiting for RSI+BB timing'
+                                note=f'waiting for {timing_label} timing'
                             )
                             await self._notify_stateful_diag(symbol)
                     else:
@@ -2931,7 +3074,9 @@ class SignalEngine(BaseEngine):
                     logger.info(f"[{strategy_name}] New entry {entry_sig.upper()}")
                     await self.entry(symbol, entry_sig, float(k['c']))
                 elif not pos and regime_sig:
-                    self.last_entry_reason[symbol] = f"{strategy_name} UT {regime_sig.upper()} 상태, RSI+BB 타이밍 대기"
+                    self.last_entry_reason[symbol] = (
+                        f"{strategy_name} UT {regime_sig.upper()} 상태, {timing_label} 타이밍 대기"
+                    )
                 elif pos:
                     self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {strategy_name} UT 반전 대기"
 
@@ -3293,24 +3438,12 @@ class SignalEngine(BaseEngine):
         # ... MicroVBO / FractalFisher skipped (no changes needed) ...
         
         # ===== 1. Strategy-specific calculation state =====
-        strategy_name = active_strategy.upper()
+        strategy_name = STRATEGY_DISPLAY_NAMES.get(active_strategy, active_strategy.upper())
         p_f = p_s = c_f = c_s = 0.0
         ma_bullish = False
         ma_bearish = False
-        
-        if active_strategy == 'utbot':
-            strategy_name = "UTBOT"
 
-        elif active_strategy == 'utrsibb':
-            strategy_name = "UTRSIBB"
-
-        elif active_strategy == 'rsibb':
-            strategy_name = "RSIBB"
-
-        elif active_strategy == 'cameron':
-            strategy_name = "CAMERON"
-
-        elif active_strategy == 'hma':
+        if active_strategy == 'hma':
             p = strategy_params.get('HMA', {})
             fast_period = p.get('fast_period', 9)
             slow_period = p.get('slow_period', 21)
@@ -3399,18 +3532,23 @@ class SignalEngine(BaseEngine):
                 sig = None
                 is_bearish = False
 
-        elif active_strategy == 'utrsibb':
-            entry_mode = 'utrsibb'
-            sig, entry_reason, hybrid_detail = self._calculate_utrsibb_signal(df, strategy_params)
+        elif active_strategy in UT_HYBRID_STRATEGIES:
+            entry_mode = active_strategy
+            hybrid_calc = {
+                'utrsibb': self._calculate_utrsibb_signal,
+                'utrsi': self._calculate_utrsi_signal,
+                'utbb': self._calculate_utbb_signal
+            }.get(active_strategy)
+            sig, entry_reason, hybrid_detail = hybrid_calc(df, strategy_params)
             ut_state = hybrid_detail.get('ut_state')
             is_bullish = ut_state == 'long'
             is_bearish = ut_state == 'short'
 
             if sig == 'long' and kalman_entry_enabled and not kalman_bullish:
-                entry_reason = "UTRSIBB LONG, Kalman 진입필터 미통과"
+                entry_reason = f"{strategy_name} LONG, Kalman 진입필터 미통과"
                 sig = None
             elif sig == 'short' and kalman_entry_enabled and not kalman_bearish:
-                entry_reason = "UTRSIBB SHORT, Kalman 진입필터 미통과"
+                entry_reason = f"{strategy_name} SHORT, Kalman 진입필터 미통과"
                 sig = None
 
         elif active_strategy == 'rsibb':
@@ -5279,6 +5417,7 @@ class MainController:
         self.exchange = self._build_exchange(creds, self.exchange_mode)
         self._configure_exchange_network(self.exchange, self.exchange_mode)
         self.market_data_exchange = self._build_public_market_data_exchange(self.exchange_mode)
+        self._configure_exchange_network(self.market_data_exchange, self.exchange_mode)
         self.market_data_source_label = self._get_market_data_source_label(self.exchange_mode)
         logger.info(f"Market data source configured: {self.market_data_source_label}")
         
@@ -5701,6 +5840,7 @@ class MainController:
             self.exchange = self._build_exchange(creds, exchange_mode)
             network_name = self._configure_exchange_network(self.exchange, exchange_mode)
             self.market_data_exchange = self._build_public_market_data_exchange(exchange_mode)
+            self._configure_exchange_network(self.market_data_exchange, exchange_mode)
             self.market_data_source_label = self._get_market_data_source_label(exchange_mode)
             
             # 5. 留덉폆 ?뺣낫 濡쒕뱶
@@ -5962,12 +6102,8 @@ class MainController:
         strategy_params = sig.get('strategy_params', {})
         active_strategy = strategy_params.get('active_strategy', 'sma').upper()
         entry_mode = strategy_params.get('entry_mode', 'cross').upper()
-        if active_strategy == 'UTBOT':
-            entry_mode = 'UTBOT'
-        elif active_strategy == 'UTRSIBB':
-            entry_mode = 'UTRSIBB'
-        elif active_strategy == 'RSIBB':
-            entry_mode = 'RSIBB'
+        if active_strategy in {'UTBOT', 'RSIBB', 'UTRSIBB', 'UTRSI', 'UTBB'}:
+            entry_mode = active_strategy
         hma_params = strategy_params.get('HMA', {})
         hma_fast = hma_params.get('fast_period', 9)
         hma_slow = hma_params.get('slow_period', 21)
@@ -6034,8 +6170,8 @@ class MainController:
 10. SMA (`{fast_sma}/{slow_sma}`)
 17. HMA (`{hma_fast}/{hma_slow}`)
 19. UT Bot (`K={utbot_key:.2f}` / `ATR={utbot_atr}` / `HA={utbot_ha}`)
-20. RSI+BB (`RSI={rsibb_rsi}` / `BB={rsibb_bb}` / `x{rsibb_mult:.2f}`)
-21. UT+RSI Hybrid (`19번 UT 방향` + `20번 RSI 타이밍`)
+20. RSI+BB 보조설정 (`RSI={rsibb_rsi}` / `BB={rsibb_bb}` / `x{rsibb_mult:.2f}`)
+21. UT Hybrid 안내 (`UTRSI / UTBB / UTRSIBB`)
 13. TP/SL 자동청산 (`{tp_sl_status}`)
 36. ROE 자동청산 (`{tp_status}`)
 37. 손절 자동청산 (`{sl_status}`)
@@ -6091,12 +6227,12 @@ class MainController:
             '12': "📝 **Grid 설정** 입력 (예: on,200 또는 off)",
             '14': "📝 **N Days** 입력 (예: 4)",
             '15': "📝 **K1/K2** 입력 (예: 0.5,0.5)",
-            '16': "📝 **전략 선택** (1=SMA, 2=HMA, 3=CAMERON, 4=UTBOT, 5=RSIBB, 6=UTRSIBB)",
+            '16': "📝 **전략 선택** (1=SMA, 2=HMA, 3=CAMERON, 4=UTBOT, 5=RSIBB, 6=UTRSIBB, 7=UTRSI, 8=UTBB)",
             '17': "📝 **HMA 기간** 입력 (예: 9,21)",
             '18': "📝 **진입 모드** 선택 (1=Cross, 2=Position)",
             '19': "📝 **UT Bot 설정** 입력 (형식: key,atr,on/off 예: 1,10,off)",
-            '20': "📝 **RSI+BB 설정** 입력 (형식: rsi_length,bb_length,bb_mult 예: 6,200,2)",
-            '21': "ℹ️ **UT+RSI Hybrid**는 19번 UT Bot 설정과 20번 RSI+BB 설정을 함께 사용합니다.",
+            '20': "📝 **RSI/BB 보조설정** 입력 (형식: rsi_length,bb_length,bb_mult 예: 6,200,2)",
+            '21': "ℹ️ **UT Hybrid 안내**: UTRSI/UTBB/UTRSIBB는 19번 UT Bot 설정과 20번 RSI/BB 설정을 조합해 사용합니다.",
             '22': "📝 **거래소/네트워크 선택** (1=바이낸스 테스트넷, 2=바이낸스 메인넷, 3=업비트 KRW 현물)",
             '23': "📝 **거래량 급등 채굴 기능** (1=ON, 0=OFF)",
             '24': "📝 **채굴 진입 타임프레임** 입력 (예: 5m)\n1m, 5m, 15m, 30m, 1h",
@@ -6251,11 +6387,12 @@ class MainController:
             
         elif text == '21':
             await update.message.reply_text(
-                "ℹ️ UTRSIBB 전략 안내\n"
-                "- 방향: 19번 UT Bot 현재 상태 사용\n"
-                "- 진입: 20번 RSI+BB 새 신호가 UT 방향과 일치할 때만 진입\n"
-                "- 청산: UT 방향이 반대로 바뀌면 즉시 청산\n"
-                "- 재진입: 반대 방향 RSI+BB 신호가 새로 뜰 때만 재진입"
+                "ℹ️ UT Hybrid 전략 안내\n"
+                "- 공통 방향: 19번 UT Bot 현재 상태 사용\n"
+                "- UTRSI: 20번 RSI 길이로 RSI 50 돌파 타이밍만 사용\n"
+                "- UTBB: 20번 BB 길이/배수로 밴드 복귀 타이밍만 사용\n"
+                "- UTRSIBB: RSI와 BB 타이밍이 동시에 같은 방향일 때만 진입\n"
+                "- 공통 청산: UT 방향이 반대로 바뀌면 즉시 청산"
             )
             await self.show_setup_menu(update)
             return SELECT
@@ -6559,7 +6696,16 @@ class MainController:
             # ======== Signal ?좉퇋 ?듭뀡 ========
             elif choice == '16':
                 # ?꾨왂 蹂寃?(踰덊샇 ?먮뒗 ?대쫫?쇰줈 ?좏깮)
-                strategy_map = {'1': 'sma', '2': 'hma', '3': 'cameron', '4': 'utbot', '5': 'rsibb', '6': 'utrsibb'}
+                strategy_map = {
+                    '1': 'sma',
+                    '2': 'hma',
+                    '3': 'cameron',
+                    '4': 'utbot',
+                    '5': 'rsibb',
+                    '6': 'utrsibb',
+                    '7': 'utrsi',
+                    '8': 'utbb'
+                }
                 val_lower = val.lower().strip()
                 
                 # 踰덊샇 ?낅젰 ??蹂??
@@ -6582,15 +6728,18 @@ class MainController:
                         signal_engine.fisher_value = None
                     elif val_lower == 'cameron' and signal_engine:
                         signal_engine.cameron_states = {}
-                    elif val_lower == 'utbot' and signal_engine:
+                    elif val_lower in (STATEFUL_UT_STRATEGIES | {'rsibb'}) and signal_engine:
                         signal_engine.last_processed_candle_ts = {}
-                    elif val_lower == 'utrsibb' and signal_engine:
-                        signal_engine.last_processed_candle_ts = {}
-                    elif val_lower == 'rsibb' and signal_engine:
-                        signal_engine.last_processed_candle_ts = {}
+                        signal_engine.last_state_sync_candle_ts = {}
+                        signal_engine.last_stateful_retry_ts = {}
+                        signal_engine.last_stateful_diag = {}
+                        signal_engine.last_stateful_diag_notice = {}
                     await update.message.reply_text(f"✅ 전략 변경: {val_lower.upper()}")
                 else:
-                    await update.message.reply_text("❌ 1~6 또는 sma/hma/cameron/utbot/rsibb/utrsibb를 입력하세요.\n1=SMA, 2=HMA, 3=CAMERON, 4=UTBOT, 5=RSIBB, 6=UTRSIBB")
+                    await update.message.reply_text(
+                        "❌ 1~8 또는 sma/hma/cameron/utbot/rsibb/utrsibb/utrsi/utbb를 입력하세요.\n"
+                        "1=SMA, 2=HMA, 3=CAMERON, 4=UTBOT, 5=RSIBB, 6=UTRSIBB, 7=UTRSI, 8=UTBB"
+                    )
                     return SELECT
             
             elif choice == '20':
@@ -7669,6 +7818,16 @@ class MainController:
                             f"entry `{stateful_diag.get('entry_sig', '-')}` | "
                             f"pos `{stateful_diag.get('pos_side', '-')}`\n"
                         )
+                        if stateful_diag.get('timing_label'):
+                            timing_line = (
+                                f"타이밍: `{stateful_diag.get('timing_label')}` | "
+                                f"raw `{stateful_diag.get('timing_signal', '-')}`"
+                            )
+                            if stateful_diag.get('timing_signal_ts_human'):
+                                timing_line += f" | signal `{stateful_diag.get('timing_signal_ts_human')}`"
+                            msg += timing_line + "\n"
+                        if stateful_diag.get('timing_reason'):
+                            msg += f"타이밍판정: `{stateful_diag.get('timing_reason')}`\n"
                         if stateful_diag.get('ut_key') is not None:
                             msg += (
                                 f"UT 설정: K `{stateful_diag.get('ut_key')}` | "
