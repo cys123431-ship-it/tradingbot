@@ -1803,6 +1803,11 @@ class SignalEngine(BaseEngine):
         key = self._get_ut_hybrid_latch_key(symbol, 'utbb_short_setup')
         self.ut_hybrid_timing_consumed_ts[key] = int(setup.get('signal_ts', 0) or 0)
 
+    def _clear_utbb_short_setup(self, symbol):
+        key = self._get_ut_hybrid_latch_key(symbol, 'utbb_short_setup')
+        self.ut_hybrid_timing_latches.pop(key, None)
+        self.ut_hybrid_timing_consumed_ts.pop(key, None)
+
     def _get_utbb_long_setup_key(self, symbol, source):
         return self._get_ut_hybrid_latch_key(symbol, f'utbb_long_{source}')
 
@@ -2609,6 +2614,8 @@ class SignalEngine(BaseEngine):
         if symbol:
             if ut_sig == 'short' or bb_sig == 'short':
                 self._clear_utbb_long_setup(symbol)
+            if ut_state == 'long' or bb_sig == 'long':
+                self._clear_utbb_short_setup(symbol)
             else:
                 if ut_long_fresh:
                     long_ut_setup = self._remember_utbb_long_setup(symbol, 'ut', ut_detail.get('signal_ts'))
@@ -2635,6 +2642,13 @@ class SignalEngine(BaseEngine):
             entry_sig = 'long'
         elif short_setup_entry_ready or short_mid_entry_ready or short_rebound_fail_ready:
             entry_sig = 'short'
+
+        if symbol and entry_sig == 'short':
+            self._clear_utbb_long_setup(symbol)
+            long_ut_setup = None
+            long_bb_setup = None
+            long_pair_window_ready = False
+            long_pair_entry_ready = False
 
         short_entry_reason = None
         if ut_state == 'short':
@@ -3812,6 +3826,7 @@ class SignalEngine(BaseEngine):
                                 )
                                 self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 후 {short_note} 재진입"
                                 self._clear_utbb_special_short_state(symbol)
+                            self._clear_utbb_long_setup(symbol)
                             await self.entry(symbol, 'short', float(k['c']))
                             if short_setup_ready:
                                 self._consume_utbb_short_setup(symbol)
@@ -3896,6 +3911,7 @@ class SignalEngine(BaseEngine):
                                     self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 LONG 재진입"
                                 self._clear_utbb_special_long_state(symbol)
                             self._clear_utbb_long_setup(symbol)
+                            self._clear_utbb_short_setup(symbol)
                             await self.entry(symbol, 'long', float(k['c']))
                             self._update_stateful_diag(
                                 symbol,
@@ -3944,6 +3960,7 @@ class SignalEngine(BaseEngine):
                             self.last_entry_reason[symbol] = f"{strategy_name} LONG 진입"
                         self._clear_utbb_special_long_state(symbol)
                     self._clear_utbb_long_setup(symbol)
+                    self._clear_utbb_short_setup(symbol)
                     self._clear_utbb_special_short_state(symbol)
                     logger.info(f"[{strategy_name}] New LONG entry")
                     await self.entry(symbol, 'long', float(k['c']))
@@ -3974,6 +3991,7 @@ class SignalEngine(BaseEngine):
                         ) if short_mid_ready else "BB 숏 셋업 + UT 숏신호"
                         self._clear_utbb_special_short_state(symbol)
                     self.last_entry_reason[symbol] = f"{strategy_name} {short_note} -> SHORT 진입"
+                    self._clear_utbb_long_setup(symbol)
                     self._clear_utbb_special_long_state(symbol)
                     logger.info(f"[{strategy_name}] New SHORT entry")
                     await self.entry(symbol, 'short', float(k['c']))
