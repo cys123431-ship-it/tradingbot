@@ -2198,6 +2198,62 @@ class SignalEngine(BaseEngine):
         reason = f"BB 하단 돌파 대기: Lower={curr_lower:.4f}, close={curr_close:.4f}"
         return None, reason, detail
 
+    def _calculate_bb_mid_two_bearish_exit_signal(self, df, strategy_params):
+        cfg = strategy_params.get('RSIBB', {})
+        bb_length = max(2, int(cfg.get('bb_length', 200) or 200))
+
+        closed = df.iloc[:-1].copy().reset_index(drop=True)
+        min_bars = max(bb_length + 4, 30)
+        if len(closed) < min_bars:
+            return None, "BB 중간선 위 음봉 2개 데이터 부족", {}
+
+        open_series = closed['open'].astype(float)
+        close_series = closed['close'].astype(float)
+        bb_basis = ta.sma(close_series, length=bb_length)
+
+        valid = pd.DataFrame({
+            'timestamp': closed['timestamp'],
+            'open': open_series,
+            'close': close_series,
+            'bb_basis': bb_basis
+        }).dropna().reset_index(drop=True)
+        if len(valid) < 2:
+            return None, "BB 중간선 위 음봉 2개 지표 확정 대기", {}
+
+        prev_row = valid.iloc[-2]
+        curr_row = valid.iloc[-1]
+        prev_open = float(prev_row['open'])
+        prev_close = float(prev_row['close'])
+        curr_open = float(curr_row['open'])
+        curr_close = float(curr_row['close'])
+        prev_basis = float(prev_row['bb_basis'])
+        curr_basis = float(curr_row['bb_basis'])
+
+        prev_bearish_above_mid = prev_close < prev_open and prev_open > prev_basis and prev_close > prev_basis
+        curr_bearish_above_mid = curr_close < curr_open and curr_open > curr_basis and curr_close > curr_basis
+        two_bearish_above_mid = prev_bearish_above_mid and curr_bearish_above_mid
+
+        detail = {
+            'bb_length': bb_length,
+            'prev_open': prev_open,
+            'prev_close': prev_close,
+            'prev_basis': prev_basis,
+            'curr_open': curr_open,
+            'curr_close': curr_close,
+            'curr_basis': curr_basis,
+            'signal_ts': int(curr_row['timestamp'])
+        }
+
+        if two_bearish_above_mid:
+            reason = (
+                f"BB MID 2BEAR EXIT: 중간선 위 음봉 2개 "
+                f"(BB={bb_length}, close={curr_close:.4f})"
+            )
+            return 'exit_long', reason, detail
+
+        reason = f"BB 중간선 위 음봉 2개 대기: Basis={curr_basis:.4f}, close={curr_close:.4f}"
+        return None, reason, detail
+
     def _calculate_rsibb_signal(self, df, strategy_params):
         rsi_sig, rsi_reason, rsi_detail = self._calculate_rsi_signal(df, strategy_params)
         bb_sig, bb_reason, bb_detail = self._calculate_bb_signal(df, strategy_params)
@@ -2351,6 +2407,7 @@ class SignalEngine(BaseEngine):
         bb_upper_sig, bb_upper_reason, bb_upper_detail = self._calculate_bb_upper_breakout_signal(df, strategy_params)
         bb_mid_sig, bb_mid_reason, bb_mid_detail = self._calculate_bb_mid_cross_down_signal(df, strategy_params)
         bb_lower_sig, bb_lower_reason, bb_lower_detail = self._calculate_bb_lower_breakout_signal(df, strategy_params)
+        bb_mid_two_bear_sig, bb_mid_two_bear_reason, bb_mid_two_bear_detail = self._calculate_bb_mid_two_bearish_exit_signal(df, strategy_params)
         short_setup = self._remember_utbb_short_setup(symbol, bb_sig, bb_detail) if symbol else None
         ut_signal_ts = ut_detail.get('signal_ts')
         short_setup_available = self._is_utbb_short_setup_available(symbol, ut_signal_ts) if symbol else False
@@ -2406,6 +2463,9 @@ class SignalEngine(BaseEngine):
             'bb_mid_reason': bb_mid_reason,
             'bb_mid_signal_ts': bb_mid_detail.get('signal_ts'),
             'bb_upper_breakout': bb_upper_sig == 'exit_long',
+            'bb_mid_two_bearish_exit': bb_mid_two_bear_sig == 'exit_long',
+            'bb_mid_two_bearish_reason': bb_mid_two_bear_reason,
+            'bb_mid_two_bearish_signal_ts': bb_mid_two_bear_detail.get('signal_ts'),
             'bb_reentry_up': bb_sig == 'long',
             'bb_reentry_down': bb_sig == 'short',
             'bb_upper_reason': bb_upper_reason,
@@ -3415,6 +3475,7 @@ class SignalEngine(BaseEngine):
                 ut_state = raw_hybrid_detail.get('ut_state')
                 bb_upper_breakout = bool(raw_hybrid_detail.get('bb_upper_breakout'))
                 bb_reentry_down = bool(raw_hybrid_detail.get('bb_reentry_down'))
+                bb_mid_two_bearish_exit = bool(raw_hybrid_detail.get('bb_mid_two_bearish_exit'))
                 bb_reentry_up = bool(raw_hybrid_detail.get('bb_reentry_up'))
                 bb_lower_breakout = bool(raw_hybrid_detail.get('bb_lower_breakout'))
                 short_setup_ready = bool(raw_hybrid_detail.get('bb_short_setup_ready'))
@@ -3427,13 +3488,16 @@ class SignalEngine(BaseEngine):
                 if pos and pos['side'] == 'long' and (
                     ut_state == 'short'
                     or bb_reentry_down
+                    or ((not special_long_active) and bb_mid_two_bearish_exit)
                 ):
                     if ut_signal == 'short':
                         exit_note = "UT short signal"
                     elif ut_state == 'short':
                         exit_note = "UT short state"
-                    else:
+                    elif bb_reentry_down:
                         exit_note = "BB upper reentry down"
+                    else:
+                        exit_note = "BB middle above two bearish candles"
                     self._update_stateful_diag(
                         symbol,
                         stage='flip_detected',
@@ -3619,6 +3683,8 @@ class SignalEngine(BaseEngine):
                 elif pos:
                     if pos['side'] == 'long' and special_long_active:
                         hold_note = "특수 LONG 하향돌파 청산 대기"
+                    elif pos['side'] == 'long':
+                        hold_note = "LONG 청산 조건 대기 (UT 숏상태 또는 BB 상단 하향 돌파 또는 중간선 위 음봉 2개)"
                     elif pos['side'] == 'short' and special_short_active:
                         hold_note = "특수 SHORT 하단 상향돌파 청산 대기"
                     elif pos['side'] == 'short':
@@ -7034,7 +7100,7 @@ class MainController:
                 "ℹ️ UT Hybrid 전략 안내\n"
                 "- UTRSI: UT 방향 + RSI 타이밍 조합\n"
                 "- UTRSIBB: UT 방향 + RSI/BB 동시 타이밍 조합\n"
-                "- UTBB LONG: UT 롱신호 또는 UT 롱상태 유지면 진입, UT 숏상태 또는 BB 상단 하향 돌파 마감 시 청산\n"
+                "- UTBB LONG: UT 롱신호 또는 UT 롱상태 유지면 진입, 일반롱은 UT 숏상태 또는 BB 상단 하향 돌파 또는 중간선 위 음봉 2개 시 청산\n"
                 "- UTBB 특수 LONG: 진입봉이 BB 상단 돌파여도 동일하게 BB 상단 하향 돌파 또는 UT 숏상태로 청산\n"
                 "- UTBB SHORT: BB 상단 재진입 셋업 후 UT 숏신호 또는 BB 중간선 하락 돌파 + UT 숏상태로 진입\n"
                 "- UTBB 특수 SHORT: 진입봉이 BB 중간선 하향 + BB 하단선 하향 돌파면 BB 하단선 상향 돌파 또는 UT 롱상태로 청산\n"
