@@ -1819,10 +1819,11 @@ class SignalEngine(BaseEngine):
         state = self._get_utbb_special_long_state(symbol)
         return bool(state and state.get('active'))
 
-    def _set_utbb_special_short_state(self, symbol, signal_ts=None):
+    def _set_utbb_special_short_state(self, symbol, signal_ts=None, mode='lower_reentry'):
         self.utbb_special_short_state[symbol] = {
             'active': True,
-            'signal_ts': int(signal_ts or 0)
+            'signal_ts': int(signal_ts or 0),
+            'mode': str(mode or 'lower_reentry')
         }
 
     def _clear_utbb_special_short_state(self, symbol):
@@ -1834,6 +1835,12 @@ class SignalEngine(BaseEngine):
     def _is_utbb_special_short_active(self, symbol):
         state = self._get_utbb_special_short_state(symbol)
         return bool(state and state.get('active'))
+
+    def _get_utbb_special_short_mode(self, symbol):
+        state = self._get_utbb_special_short_state(symbol)
+        if not state or not state.get('active'):
+            return None
+        return str(state.get('mode') or 'lower_reentry')
 
     def _calculate_utbot_signal(self, df, strategy_params):
         cfg = strategy_params.get('UTBot', {})
@@ -2147,6 +2154,49 @@ class SignalEngine(BaseEngine):
         reason = f"BB 중간선 하락 돌파 대기: Basis={curr_basis:.4f}, close={curr_close:.4f}"
         return None, reason, detail
 
+    def _calculate_bb_mid_cross_up_signal(self, df, strategy_params):
+        cfg = strategy_params.get('RSIBB', {})
+        bb_length = max(2, int(cfg.get('bb_length', 200) or 200))
+
+        closed = df.iloc[:-1].copy().reset_index(drop=True)
+        min_bars = max(bb_length + 3, 30)
+        if len(closed) < min_bars:
+            return None, "BB 중간선 상승 돌파 데이터 부족", {}
+
+        close_series = closed['close'].astype(float)
+        bb_basis = ta.sma(close_series, length=bb_length)
+        valid = pd.DataFrame({
+            'timestamp': closed['timestamp'],
+            'close': close_series,
+            'bb_basis': bb_basis
+        }).dropna().reset_index(drop=True)
+        if len(valid) < 2:
+            return None, "BB 중간선 상승 돌파 지표 확정 대기", {}
+
+        prev_row = valid.iloc[-2]
+        curr_row = valid.iloc[-1]
+        prev_close = float(prev_row['close'])
+        curr_close = float(curr_row['close'])
+        prev_basis = float(prev_row['bb_basis'])
+        curr_basis = float(curr_row['bb_basis'])
+        cross_up = prev_close <= prev_basis and curr_close > curr_basis
+
+        detail = {
+            'bb_length': bb_length,
+            'prev_close': prev_close,
+            'curr_close': curr_close,
+            'prev_basis': prev_basis,
+            'curr_basis': curr_basis,
+            'signal_ts': int(curr_row['timestamp'])
+        }
+
+        if cross_up:
+            reason = f"BB MID EXIT: 중간선 상향돌파 (BB={bb_length}, close={curr_close:.4f})"
+            return 'exit_short', reason, detail
+
+        reason = f"BB 중간선 상승 돌파 대기: Basis={curr_basis:.4f}, close={curr_close:.4f}"
+        return None, reason, detail
+
     def _calculate_bb_lower_breakout_signal(self, df, strategy_params):
         cfg = strategy_params.get('RSIBB', {})
         bb_length = max(2, int(cfg.get('bb_length', 200) or 200))
@@ -2196,6 +2246,76 @@ class SignalEngine(BaseEngine):
             return 'exit_short', reason, detail
 
         reason = f"BB 하단 돌파 대기: Lower={curr_lower:.4f}, close={curr_close:.4f}"
+        return None, reason, detail
+
+    def _calculate_bb_mid_rebound_fail_short_signal(self, df, strategy_params):
+        cfg = strategy_params.get('RSIBB', {})
+        bb_length = max(2, int(cfg.get('bb_length', 200) or 200))
+
+        closed = df.iloc[:-1].copy().reset_index(drop=True)
+        min_bars = max(bb_length + 6, 30)
+        if len(closed) < min_bars:
+            return None, "BB 중간선 아래 반등 실패 데이터 부족", {}
+
+        open_series = closed['open'].astype(float)
+        high_series = closed['high'].astype(float)
+        low_series = closed['low'].astype(float)
+        close_series = closed['close'].astype(float)
+        bb_basis = ta.sma(close_series, length=bb_length)
+
+        valid = pd.DataFrame({
+            'timestamp': closed['timestamp'],
+            'open': open_series,
+            'high': high_series,
+            'low': low_series,
+            'close': close_series,
+            'bb_basis': bb_basis
+        }).dropna().reset_index(drop=True)
+        if len(valid) < 3:
+            return None, "BB 중간선 아래 반등 실패 지표 확정 대기", {}
+
+        prev2 = valid.iloc[-3]
+        prev1 = valid.iloc[-2]
+        curr = valid.iloc[-1]
+
+        def _bullish_below_mid(row):
+            row_open = float(row['open'])
+            row_close = float(row['close'])
+            row_basis = float(row['bb_basis'])
+            return row_close > row_open and row_open < row_basis and row_close < row_basis
+
+        prev2_bull = _bullish_below_mid(prev2)
+        prev1_bull = _bullish_below_mid(prev1)
+        curr_open = float(curr['open'])
+        curr_close = float(curr['close'])
+        curr_basis = float(curr['bb_basis'])
+        curr_bear_below_mid = curr_close < curr_open and curr_open < curr_basis and curr_close < curr_basis
+        prev1_low = float(prev1['low'])
+        prev2_low = float(prev2['low'])
+
+        one_bull_setup = prev1_bull and curr_bear_below_mid and curr_close < prev1_low
+        two_bull_setup = prev2_bull and prev1_bull and curr_bear_below_mid and curr_close < prev1_low
+        setup_bull_count = 2 if two_bull_setup else (1 if one_bull_setup else 0)
+
+        detail = {
+            'bb_length': bb_length,
+            'setup_bull_count': setup_bull_count,
+            'prev1_low': prev1_low,
+            'prev2_low': prev2_low,
+            'curr_open': curr_open,
+            'curr_close': curr_close,
+            'curr_basis': curr_basis,
+            'signal_ts': int(curr['timestamp'])
+        }
+
+        if setup_bull_count > 0:
+            reason = (
+                f"BB MID REBOUND FAIL SHORT: 중간선 아래 양봉 {setup_bull_count}개 후 "
+                f"음봉 저점 이탈 (BB={bb_length}, close={curr_close:.4f})"
+            )
+            return 'short', reason, detail
+
+        reason = f"BB 중간선 아래 반등 실패 대기: Basis={curr_basis:.4f}, close={curr_close:.4f}"
         return None, reason, detail
 
     def _calculate_bb_mid_two_bearish_exit_signal(self, df, strategy_params):
@@ -2406,12 +2526,15 @@ class SignalEngine(BaseEngine):
         bb_sig, bb_reason, bb_detail = self._calculate_bb_signal(df, strategy_params)
         bb_upper_sig, bb_upper_reason, bb_upper_detail = self._calculate_bb_upper_breakout_signal(df, strategy_params)
         bb_mid_sig, bb_mid_reason, bb_mid_detail = self._calculate_bb_mid_cross_down_signal(df, strategy_params)
+        bb_mid_up_sig, bb_mid_up_reason, bb_mid_up_detail = self._calculate_bb_mid_cross_up_signal(df, strategy_params)
         bb_lower_sig, bb_lower_reason, bb_lower_detail = self._calculate_bb_lower_breakout_signal(df, strategy_params)
+        bb_mid_rebound_sig, bb_mid_rebound_reason, bb_mid_rebound_detail = self._calculate_bb_mid_rebound_fail_short_signal(df, strategy_params)
         bb_mid_two_bear_sig, bb_mid_two_bear_reason, bb_mid_two_bear_detail = self._calculate_bb_mid_two_bearish_exit_signal(df, strategy_params)
         short_setup = self._remember_utbb_short_setup(symbol, bb_sig, bb_detail) if symbol else None
         ut_signal_ts = ut_detail.get('signal_ts')
         short_setup_available = self._is_utbb_short_setup_available(symbol, ut_signal_ts) if symbol else False
         short_mid_ready = bb_mid_sig == 'short'
+        short_rebound_fail_ready = bool(ut_state == 'short' and bb_mid_rebound_sig == 'short')
         short_setup_entry_ready = bool(ut_sig == 'short' and short_setup_available)
         short_mid_entry_ready = bool(ut_state == 'short' and short_mid_ready)
         special_short_candidate = short_mid_entry_ready and bb_lower_sig == 'exit_short'
@@ -2421,7 +2544,7 @@ class SignalEngine(BaseEngine):
         entry_sig = None
         if long_entry_ready:
             entry_sig = 'long'
-        elif short_setup_entry_ready or short_mid_entry_ready:
+        elif short_setup_entry_ready or short_mid_entry_ready or short_rebound_fail_ready:
             entry_sig = 'short'
 
         short_entry_reason = None
@@ -2431,6 +2554,13 @@ class SignalEngine(BaseEngine):
                     "BB 중간선 하향돌파 + BB 하단 하향돌파 + UT 숏신호 확인"
                     if ut_sig == 'short'
                     else "BB 중간선 하향돌파 + BB 하단 하향돌파 + UT 숏상태 확인"
+                )
+            elif short_rebound_fail_ready:
+                rebound_bulls = int(bb_mid_rebound_detail.get('setup_bull_count') or 0)
+                short_entry_reason = (
+                    f"BB 중간선 아래 양봉 {rebound_bulls}개 후 반등 실패 + UT 숏신호 확인"
+                    if ut_sig == 'short'
+                    else f"BB 중간선 아래 양봉 {rebound_bulls}개 후 반등 실패 + UT 숏상태 확인"
                 )
             elif short_mid_entry_ready:
                 short_entry_reason = (
@@ -2447,11 +2577,21 @@ class SignalEngine(BaseEngine):
             'ut_reason': ut_reason,
             'ut_signal_ts': ut_signal_ts,
             'timing_label': 'BB',
-            'timing_signal': bb_sig or bb_mid_sig,
-            'effective_timing_signal': 'short' if (short_setup_entry_ready or short_mid_entry_ready) else None,
-            'timing_match_source': 'mid_cross' if short_mid_entry_ready else ('latched' if short_setup_entry_ready else None),
-            'timing_reason': short_entry_reason or bb_reason,
-            'timing_signal_ts': (bb_mid_detail.get('signal_ts') if short_mid_entry_ready else bb_detail.get('signal_ts')),
+            'timing_signal': bb_mid_rebound_sig or bb_sig or bb_mid_sig,
+            'effective_timing_signal': 'short' if (short_setup_entry_ready or short_mid_entry_ready or short_rebound_fail_ready) else None,
+            'timing_match_source': (
+                'mid_rebound_fail'
+                if short_rebound_fail_ready else (
+                    'mid_cross' if short_mid_entry_ready else ('latched' if short_setup_entry_ready else None)
+                )
+            ),
+            'timing_reason': short_entry_reason or (bb_mid_rebound_reason if bb_mid_rebound_sig == 'short' else bb_reason),
+            'timing_signal_ts': (
+                bb_mid_rebound_detail.get('signal_ts')
+                if short_rebound_fail_ready else (
+                    bb_mid_detail.get('signal_ts') if short_mid_entry_ready else bb_detail.get('signal_ts')
+                )
+            ),
             'latched_timing_signal': short_setup.get('signal') if short_setup else None,
             'latched_timing_signal_ts': short_setup.get('signal_ts') if short_setup else None,
             'latched_timing_available': short_setup_available,
@@ -2462,6 +2602,13 @@ class SignalEngine(BaseEngine):
             'bb_mid_short_ready': short_mid_ready,
             'bb_mid_reason': bb_mid_reason,
             'bb_mid_signal_ts': bb_mid_detail.get('signal_ts'),
+            'bb_mid_reentry_up': bb_mid_up_sig == 'exit_short',
+            'bb_mid_up_reason': bb_mid_up_reason,
+            'bb_mid_up_signal_ts': bb_mid_up_detail.get('signal_ts'),
+            'bb_mid_rebound_fail_ready': short_rebound_fail_ready,
+            'bb_mid_rebound_fail_reason': bb_mid_rebound_reason,
+            'bb_mid_rebound_fail_signal_ts': bb_mid_rebound_detail.get('signal_ts'),
+            'bb_mid_rebound_fail_bull_count': bb_mid_rebound_detail.get('setup_bull_count'),
             'bb_upper_breakout': bb_upper_sig == 'exit_long',
             'bb_mid_two_bearish_exit': bb_mid_two_bear_sig == 'exit_long',
             'bb_mid_two_bearish_reason': bb_mid_two_bear_reason,
@@ -3477,13 +3624,17 @@ class SignalEngine(BaseEngine):
                 bb_reentry_down = bool(raw_hybrid_detail.get('bb_reentry_down'))
                 bb_mid_two_bearish_exit = bool(raw_hybrid_detail.get('bb_mid_two_bearish_exit'))
                 bb_reentry_up = bool(raw_hybrid_detail.get('bb_reentry_up'))
+                bb_mid_reentry_up = bool(raw_hybrid_detail.get('bb_mid_reentry_up'))
                 bb_lower_breakout = bool(raw_hybrid_detail.get('bb_lower_breakout'))
                 short_setup_ready = bool(raw_hybrid_detail.get('bb_short_setup_ready'))
                 short_mid_ready = bool(raw_hybrid_detail.get('bb_mid_short_ready'))
+                short_rebound_fail_ready = bool(raw_hybrid_detail.get('bb_mid_rebound_fail_ready'))
+                short_rebound_fail_bull_count = int(raw_hybrid_detail.get('bb_mid_rebound_fail_bull_count') or 0)
                 special_short_candidate = bool(raw_hybrid_detail.get('bb_special_short_candidate'))
                 entry_sig = sig
                 special_long_active = self._is_utbb_special_long_active(symbol)
                 special_short_active = self._is_utbb_special_short_active(symbol)
+                special_short_mode = self._get_utbb_special_short_mode(symbol)
 
                 if pos and pos['side'] == 'long' and (
                     ut_state == 'short'
@@ -3528,7 +3679,19 @@ class SignalEngine(BaseEngine):
                                     self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 후 특수 SHORT 재진입"
                                 else:
                                     self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 후 UT 숏상태로 특수 SHORT 재진입"
-                                self._set_utbb_special_short_state(symbol, raw_hybrid_detail.get('bb_lower_signal_ts'))
+                                self._set_utbb_special_short_state(symbol, raw_hybrid_detail.get('bb_lower_signal_ts'), mode='lower_reentry')
+                            elif short_rebound_fail_ready:
+                                short_note = (
+                                    f"BB 중간선 아래 양봉 {short_rebound_fail_bull_count}개 후 반등 실패 + UT 숏신호"
+                                    if ut_signal == 'short'
+                                    else f"BB 중간선 아래 양봉 {short_rebound_fail_bull_count}개 후 반등 실패 + UT 숏상태"
+                                )
+                                self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 후 {short_note} 재진입"
+                                self._set_utbb_special_short_state(
+                                    symbol,
+                                    raw_hybrid_detail.get('bb_mid_rebound_fail_signal_ts'),
+                                    mode='mid_rebound_fail'
+                                )
                             else:
                                 short_note = (
                                     ("BB 중간선 하락 돌파 + UT 숏신호" if ut_signal == 'short' else "BB 중간선 하락 돌파 + UT 숏상태")
@@ -3563,8 +3726,19 @@ class SignalEngine(BaseEngine):
                 elif pos and pos['side'] == 'short' and (
                     ut_state == 'long'
                     or ((not special_short_active) and bb_lower_breakout)
-                    or (special_short_active and bb_reentry_up)
+                    or (special_short_mode == 'lower_reentry' and bb_reentry_up)
+                    or (special_short_mode == 'mid_rebound_fail' and bb_mid_reentry_up)
                 ):
+                    if ut_signal == 'long':
+                        short_exit_note = 'short exit by UT long signal'
+                    elif ut_state == 'long':
+                        short_exit_note = 'short exit by UT long state'
+                    elif special_short_mode == 'mid_rebound_fail':
+                        short_exit_note = 'short exit by BB middle reentry up'
+                    elif special_short_mode == 'lower_reentry':
+                        short_exit_note = 'short exit by BB lower reentry up'
+                    else:
+                        short_exit_note = 'short exit by BB lower breakout'
                     self._update_stateful_diag(
                         symbol,
                         stage='flip_detected',
@@ -3573,18 +3747,10 @@ class SignalEngine(BaseEngine):
                         raw_signal=(raw_strategy_sig or 'none'),
                         entry_sig=(entry_sig or 'none'),
                         pos_side=str(pos['side']).upper(),
-                        note=(
-                            'short exit by UT long signal'
-                            if ut_signal == 'long'
-                            else ('short exit by UT long state' if ut_state == 'long'
-                                  else ('short exit by BB lower reentry up' if special_short_active else 'short exit by BB lower breakout'))
-                        )
+                        note=short_exit_note
                     )
                     await self._notify_stateful_diag(symbol)
-                    logger.info(
-                        f"[{strategy_name}] SHORT exit trigger: "
-                        f"{'UT long signal' if ut_signal == 'long' else ('UT long state' if ut_state == 'long' else ('BB lower reentry up' if special_short_active else 'BB lower breakout'))}"
-                    )
+                    logger.info(f"[{strategy_name}] SHORT exit trigger: {short_exit_note.replace('short exit by ', '')}")
                     await self.exit_position(symbol, f"{strategy_name}_ShortExit")
                     await asyncio.sleep(1)
                     self.position_cache = None
@@ -3659,7 +3825,18 @@ class SignalEngine(BaseEngine):
                             if ut_signal == 'short'
                             else "BB 중간선 하락 돌파 + BB 하단 하향 돌파 + UT 숏상태"
                         )
-                        self._set_utbb_special_short_state(symbol, raw_hybrid_detail.get('bb_lower_signal_ts'))
+                        self._set_utbb_special_short_state(symbol, raw_hybrid_detail.get('bb_lower_signal_ts'), mode='lower_reentry')
+                    elif short_rebound_fail_ready:
+                        short_note = (
+                            f"BB 중간선 아래 양봉 {short_rebound_fail_bull_count}개 후 반등 실패 + UT 숏신호"
+                            if ut_signal == 'short'
+                            else f"BB 중간선 아래 양봉 {short_rebound_fail_bull_count}개 후 반등 실패 + UT 숏상태"
+                        )
+                        self._set_utbb_special_short_state(
+                            symbol,
+                            raw_hybrid_detail.get('bb_mid_rebound_fail_signal_ts'),
+                            mode='mid_rebound_fail'
+                        )
                     else:
                         short_note = (
                             "BB 중간선 하락 돌파 + UT 숏신호"
@@ -3685,6 +3862,8 @@ class SignalEngine(BaseEngine):
                         hold_note = "특수 LONG 하향돌파 청산 대기"
                     elif pos['side'] == 'long':
                         hold_note = "LONG 청산 조건 대기 (UT 숏상태 또는 BB 상단 하향 돌파 또는 중간선 위 음봉 2개)"
+                    elif pos['side'] == 'short' and special_short_mode == 'mid_rebound_fail':
+                        hold_note = "특수 SHORT 중간선 상향돌파 청산 대기"
                     elif pos['side'] == 'short' and special_short_active:
                         hold_note = "특수 SHORT 하단 상향돌파 청산 대기"
                     elif pos['side'] == 'short':
@@ -7102,9 +7281,10 @@ class MainController:
                 "- UTRSIBB: UT 방향 + RSI/BB 동시 타이밍 조합\n"
                 "- UTBB LONG: UT 롱신호 또는 UT 롱상태 유지면 진입, 일반롱은 UT 숏상태 또는 BB 상단 하향 돌파 또는 중간선 위 음봉 2개 시 청산\n"
                 "- UTBB 특수 LONG: 진입봉이 BB 상단 돌파여도 동일하게 BB 상단 하향 돌파 또는 UT 숏상태로 청산\n"
-                "- UTBB SHORT: BB 상단 재진입 셋업 후 UT 숏신호 또는 BB 중간선 하락 돌파 + UT 숏상태로 진입\n"
-                "- UTBB 특수 SHORT: 진입봉이 BB 중간선 하향 + BB 하단선 하향 돌파면 BB 하단선 상향 돌파 또는 UT 롱상태로 청산\n"
-                "- UTBB SHORT 청산: 일반은 UT 롱상태 또는 BB 하단선 하향 돌파, 특수는 BB 하단선 상향 돌파 또는 UT 롱상태\n"
+                "- UTBB SHORT: BB 상단 재진입 셋업 후 UT 숏신호, BB 중간선 하락 돌파 + UT 숏상태, 또는 중간선 아래 반등 실패 + UT 숏상태로 진입\n"
+                "- UTBB 특수 SHORT(하단돌파형): 진입봉이 BB 중간선 하향 + BB 하단선 하향 돌파면 BB 하단선 상향 돌파 또는 UT 롱상태로 청산\n"
+                "- UTBB 특수 SHORT(반등실패형): 중간선 아래 양봉 1~2개 뒤 저점 이탈 음봉이면 진입, BB 중간선 상향 돌파 또는 UT 롱상태로 청산\n"
+                "- UTBB SHORT 청산: 일반은 UT 롱상태 또는 BB 하단선 하향 돌파"
                 "- 모든 판단은 확정봉 기준"
             )
             await self.show_setup_menu(update)
