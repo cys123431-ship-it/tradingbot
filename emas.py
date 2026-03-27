@@ -1803,6 +1803,64 @@ class SignalEngine(BaseEngine):
         key = self._get_ut_hybrid_latch_key(symbol, 'utbb_short_setup')
         self.ut_hybrid_timing_consumed_ts[key] = int(setup.get('signal_ts', 0) or 0)
 
+    def _get_utbb_long_setup_key(self, symbol, source):
+        return self._get_ut_hybrid_latch_key(symbol, f'utbb_long_{source}')
+
+    def _remember_utbb_long_setup(self, symbol, source, signal_ts=None):
+        source = str(source or '').lower()
+        if source not in {'ut', 'bb'}:
+            return None
+        signal_ts = int(signal_ts or 0)
+        if signal_ts <= 0:
+            return self.ut_hybrid_timing_latches.get(self._get_utbb_long_setup_key(symbol, source))
+        key = self._get_utbb_long_setup_key(symbol, source)
+        current = self.ut_hybrid_timing_latches.get(key, {})
+        current_ts = int(current.get('signal_ts') or 0)
+        if signal_ts >= current_ts:
+            self.ut_hybrid_timing_latches[key] = {
+                'signal': 'long',
+                'signal_ts': signal_ts
+            }
+        return self.ut_hybrid_timing_latches.get(key)
+
+    def _get_utbb_long_setup(self, symbol, source):
+        return self.ut_hybrid_timing_latches.get(self._get_utbb_long_setup_key(symbol, source))
+
+    def _clear_utbb_long_setup(self, symbol, source=None):
+        if source is None:
+            self.ut_hybrid_timing_latches.pop(self._get_utbb_long_setup_key(symbol, 'ut'), None)
+            self.ut_hybrid_timing_latches.pop(self._get_utbb_long_setup_key(symbol, 'bb'), None)
+            return
+        self.ut_hybrid_timing_latches.pop(self._get_utbb_long_setup_key(symbol, source), None)
+
+    def _expire_utbb_long_setup(self, symbol, current_ts, candle_ms, max_bars=3):
+        current_ts = int(current_ts or 0)
+        candle_ms = int(candle_ms or 0)
+        max_bars = max(1, int(max_bars or 1))
+        if current_ts <= 0 or candle_ms <= 0:
+            return
+        expiry_window = candle_ms * max_bars
+        for source in ('ut', 'bb'):
+            setup = self._get_utbb_long_setup(symbol, source)
+            if not setup:
+                continue
+            setup_ts = int(setup.get('signal_ts') or 0)
+            if setup_ts <= 0 or (current_ts - setup_ts) > expiry_window:
+                self._clear_utbb_long_setup(symbol, source)
+
+    def _is_utbb_long_setup_ready(self, symbol, candle_ms, max_bars=3):
+        ut_setup = self._get_utbb_long_setup(symbol, 'ut')
+        bb_setup = self._get_utbb_long_setup(symbol, 'bb')
+        if not ut_setup or not bb_setup:
+            return False
+        ut_ts = int(ut_setup.get('signal_ts') or 0)
+        bb_ts = int(bb_setup.get('signal_ts') or 0)
+        candle_ms = int(candle_ms or 0)
+        max_bars = max(1, int(max_bars or 1))
+        if ut_ts <= 0 or bb_ts <= 0 or candle_ms <= 0:
+            return False
+        return abs(ut_ts - bb_ts) <= (candle_ms * max_bars)
+
     def _set_utbb_special_long_state(self, symbol, signal_ts=None):
         self.utbb_special_long_state[symbol] = {
             'active': True,
@@ -2530,6 +2588,39 @@ class SignalEngine(BaseEngine):
         bb_lower_sig, bb_lower_reason, bb_lower_detail = self._calculate_bb_lower_breakout_signal(df, strategy_params)
         bb_mid_rebound_sig, bb_mid_rebound_reason, bb_mid_rebound_detail = self._calculate_bb_mid_rebound_fail_short_signal(df, strategy_params)
         bb_mid_two_bear_sig, bb_mid_two_bear_reason, bb_mid_two_bear_detail = self._calculate_bb_mid_two_bearish_exit_signal(df, strategy_params)
+        closed = df.iloc[:-1].copy().reset_index(drop=True)
+        candle_ms = 0
+        if len(closed) >= 2:
+            try:
+                candle_ms = max(1, int(closed.iloc[-1]['timestamp']) - int(closed.iloc[-2]['timestamp']))
+            except (TypeError, ValueError, KeyError):
+                candle_ms = 0
+
+        ut_long_fresh = ut_sig == 'long'
+        bb_long_fresh = bb_sig == 'long'
+        current_closed_ts = max(
+            int(ut_detail.get('signal_ts') or 0),
+            int(bb_detail.get('signal_ts') or 0),
+            int(bb_mid_detail.get('signal_ts') or 0)
+        )
+
+        long_ut_setup = None
+        long_bb_setup = None
+        if symbol:
+            if ut_sig == 'short' or bb_sig == 'short':
+                self._clear_utbb_long_setup(symbol)
+            else:
+                if ut_long_fresh:
+                    long_ut_setup = self._remember_utbb_long_setup(symbol, 'ut', ut_detail.get('signal_ts'))
+                if bb_long_fresh:
+                    long_bb_setup = self._remember_utbb_long_setup(symbol, 'bb', bb_detail.get('signal_ts'))
+            self._expire_utbb_long_setup(symbol, current_closed_ts, candle_ms, max_bars=3)
+            long_ut_setup = self._get_utbb_long_setup(symbol, 'ut')
+            long_bb_setup = self._get_utbb_long_setup(symbol, 'bb')
+
+        long_pair_window_ready = self._is_utbb_long_setup_ready(symbol, candle_ms, max_bars=3) if symbol else False
+        long_pair_entry_ready = long_pair_window_ready and (ut_long_fresh or bb_long_fresh)
+        special_long_entry_ready = bool(ut_state == 'long' and bb_upper_sig == 'exit_long')
         short_setup = self._remember_utbb_short_setup(symbol, bb_sig, bb_detail) if symbol else None
         ut_signal_ts = ut_detail.get('signal_ts')
         short_setup_available = self._is_utbb_short_setup_available(symbol, ut_signal_ts) if symbol else False
@@ -2539,10 +2630,8 @@ class SignalEngine(BaseEngine):
         short_mid_entry_ready = bool(ut_state == 'short' and short_mid_ready)
         special_short_candidate = short_mid_entry_ready and bb_lower_sig == 'exit_short'
 
-        long_entry_ready = ut_state == 'long'
-
         entry_sig = None
-        if long_entry_ready:
+        if long_pair_entry_ready or special_long_entry_ready:
             entry_sig = 'long'
         elif short_setup_entry_ready or short_mid_entry_ready or short_rebound_fail_ready:
             entry_sig = 'short'
@@ -2613,6 +2702,21 @@ class SignalEngine(BaseEngine):
             'bb_mid_two_bearish_exit': bb_mid_two_bear_sig == 'exit_long',
             'bb_mid_two_bearish_reason': bb_mid_two_bear_reason,
             'bb_mid_two_bearish_signal_ts': bb_mid_two_bear_detail.get('signal_ts'),
+            'ut_long_fresh': ut_long_fresh,
+            'bb_long_fresh': bb_long_fresh,
+            'utbb_long_window_bars': 3,
+            'utbb_long_pair_ready': long_pair_entry_ready,
+            'utbb_long_pair_source': (
+                'same_candle'
+                if (ut_long_fresh and bb_long_fresh) else (
+                    'bb_first'
+                    if ut_long_fresh and long_bb_setup else (
+                        'ut_first' if bb_long_fresh and long_ut_setup else None
+                    )
+                )
+            ),
+            'utbb_long_ut_setup_ts': long_ut_setup.get('signal_ts') if long_ut_setup else None,
+            'utbb_long_bb_setup_ts': long_bb_setup.get('signal_ts') if long_bb_setup else None,
             'bb_reentry_up': bb_sig == 'long',
             'bb_reentry_down': bb_sig == 'short',
             'bb_upper_reason': bb_upper_reason,
@@ -2626,22 +2730,28 @@ class SignalEngine(BaseEngine):
         }
 
         if entry_sig == 'long':
-            if bb_upper_sig == 'exit_long':
+            if special_long_entry_ready:
                 if ut_sig == 'long':
                     return 'long', "UTBB LONG: UT 롱신호 + BB 상단 상향돌파 동시 발생", detail
                 return 'long', "UTBB LONG: UT 롱상태 유지 + BB 상단 상향돌파 확인", detail
-            if ut_sig == 'long':
-                return 'long', "UTBB LONG: UT 롱 진입신호 확인", detail
-            return 'long', "UTBB LONG: UT 롱상태 유지 확인", detail
+            if ut_long_fresh and bb_long_fresh:
+                return 'long', "UTBB LONG: UT 롱신호 + BB 롱신호 동시 확인", detail
+            if ut_long_fresh:
+                return 'long', "UTBB LONG: 저장된 BB 롱 + UT 롱신호 확인", detail
+            return 'long', "UTBB LONG: 저장된 UT 롱 + BB 롱신호 확인", detail
         if entry_sig == 'short':
             return 'short', f"UTBB SHORT: {short_entry_reason}", detail
 
+        if long_ut_setup and not long_bb_setup:
+            return None, "UTBB 대기: 저장된 UT 롱신호, 3봉 내 BB 롱신호 대기", detail
+        if long_bb_setup and not long_ut_setup:
+            return None, "UTBB 대기: 저장된 BB 롱신호, 3봉 내 UT 롱신호 대기", detail
         if ut_state == 'short' and not (short_setup_entry_ready or short_mid_entry_ready):
             wait_label = "UT 숏신호 감지" if ut_sig == 'short' else "UT 숏상태 유지"
             return None, f"UTBB 대기: {wait_label}, BB 상단 재진입 또는 중간선 하락 돌파 숏 셋업 대기", detail
         if ut_state == 'long':
             wait_label = "UT 롱신호 감지" if ut_sig == 'long' else "UT 롱상태 유지"
-            return None, f"UTBB 대기: {wait_label}", detail
+            return None, f"UTBB 대기: {wait_label}, BB 롱신호 대기", detail
         return None, "UTBB 대기", detail
 
     def _calculate_cameron_signal(self, df, strategy_params):
@@ -3620,6 +3730,9 @@ class SignalEngine(BaseEngine):
             elif active_strategy == 'utbb':
                 ut_signal = raw_hybrid_detail.get('ut_signal')
                 ut_state = raw_hybrid_detail.get('ut_state')
+                ut_long_fresh = bool(raw_hybrid_detail.get('ut_long_fresh'))
+                bb_long_fresh = bool(raw_hybrid_detail.get('bb_long_fresh'))
+                long_pair_source = raw_hybrid_detail.get('utbb_long_pair_source')
                 bb_upper_breakout = bool(raw_hybrid_detail.get('bb_upper_breakout'))
                 bb_reentry_down = bool(raw_hybrid_detail.get('bb_reentry_down'))
                 bb_mid_two_bearish_exit = bool(raw_hybrid_detail.get('bb_mid_two_bearish_exit'))
@@ -3771,11 +3884,18 @@ class SignalEngine(BaseEngine):
                                     self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 UT 롱상태로 특수 LONG 재진입"
                                 self._set_utbb_special_long_state(symbol, raw_hybrid_detail.get('bb_upper_signal_ts'))
                             else:
-                                if ut_signal == 'long':
-                                    self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 LONG 재진입"
+                                if long_pair_source == 'same_candle':
+                                    self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 UT/BB 롱 동시 확인 -> LONG 재진입"
+                                elif long_pair_source == 'bb_first':
+                                    self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 저장된 BB 롱 + UT 롱신호 -> LONG 재진입"
+                                elif long_pair_source == 'ut_first':
+                                    self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 저장된 UT 롱 + BB 롱신호 -> LONG 재진입"
+                                elif ut_long_fresh:
+                                    self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 UT 롱신호 -> LONG 재진입"
                                 else:
-                                    self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 UT 롱상태로 LONG 재진입"
+                                    self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 LONG 재진입"
                                 self._clear_utbb_special_long_state(symbol)
+                            self._clear_utbb_long_setup(symbol)
                             await self.entry(symbol, 'long', float(k['c']))
                             self._update_stateful_diag(
                                 symbol,
@@ -3810,11 +3930,20 @@ class SignalEngine(BaseEngine):
                             self.last_entry_reason[symbol] = f"{strategy_name} UT 롱상태 유지 + BB 상단돌파 -> 특수 LONG 진입"
                         self._set_utbb_special_long_state(symbol, raw_hybrid_detail.get('bb_upper_signal_ts'))
                     else:
-                        if ut_signal == 'long':
+                        if long_pair_source == 'same_candle':
+                            self.last_entry_reason[symbol] = f"{strategy_name} UT/BB 롱 동시 확인 -> LONG 진입"
+                        elif long_pair_source == 'bb_first':
+                            self.last_entry_reason[symbol] = f"{strategy_name} 저장된 BB 롱 + UT 롱신호 -> LONG 진입"
+                        elif long_pair_source == 'ut_first':
+                            self.last_entry_reason[symbol] = f"{strategy_name} 저장된 UT 롱 + BB 롱신호 -> LONG 진입"
+                        elif ut_long_fresh:
                             self.last_entry_reason[symbol] = f"{strategy_name} UT 롱신호 -> LONG 진입"
+                        elif bb_long_fresh:
+                            self.last_entry_reason[symbol] = f"{strategy_name} BB 롱신호 -> LONG 진입"
                         else:
-                            self.last_entry_reason[symbol] = f"{strategy_name} UT 롱상태 유지 -> LONG 진입"
+                            self.last_entry_reason[symbol] = f"{strategy_name} LONG 진입"
                         self._clear_utbb_special_long_state(symbol)
+                    self._clear_utbb_long_setup(symbol)
                     self._clear_utbb_special_short_state(symbol)
                     logger.info(f"[{strategy_name}] New LONG entry")
                     await self.entry(symbol, 'long', float(k['c']))
@@ -7279,12 +7408,13 @@ class MainController:
                 "ℹ️ UT Hybrid 전략 안내\n"
                 "- UTRSI: UT 방향 + RSI 타이밍 조합\n"
                 "- UTRSIBB: UT 방향 + RSI/BB 동시 타이밍 조합\n"
-                "- UTBB LONG: UT 롱신호 또는 UT 롱상태 유지면 진입, 일반롱은 UT 숏상태 또는 BB 상단 하향 돌파 또는 중간선 위 음봉 2개 시 청산\n"
-                "- UTBB 특수 LONG: 진입봉이 BB 상단 돌파여도 동일하게 BB 상단 하향 돌파 또는 UT 숏상태로 청산\n"
+                "- UTBB LONG: UT 롱신호와 BB 롱신호가 순서 무관 3봉 내 일치하면 진입, 중간에 UT 숏 또는 BB 숏이 나오면 저장 무효\n"
+                "- UTBB LONG 청산: 일반롱은 UT 숏상태 또는 BB 상단 하향 돌파 또는 중간선 위 음봉 2개, 특수롱은 BB 상단 하향 돌파 또는 UT 숏상태\n"
+                "- UTBB 특수 LONG: UT 롱상태에서 BB 상단 상향 돌파가 나오면 진입\n"
                 "- UTBB SHORT: BB 상단 재진입 셋업 후 UT 숏신호, BB 중간선 하락 돌파 + UT 숏상태, 또는 중간선 아래 반등 실패 + UT 숏상태로 진입\n"
                 "- UTBB 특수 SHORT(하단돌파형): 진입봉이 BB 중간선 하향 + BB 하단선 하향 돌파면 BB 하단선 상향 돌파 또는 UT 롱상태로 청산\n"
                 "- UTBB 특수 SHORT(반등실패형): 중간선 아래 양봉 1~2개 뒤 저점 이탈 음봉이면 진입, BB 중간선 상향 돌파 또는 UT 롱상태로 청산\n"
-                "- UTBB SHORT 청산: 일반은 UT 롱상태 또는 BB 하단선 하향 돌파"
+                "- UTBB SHORT 청산: 일반은 UT 롱상태 또는 BB 하단선 하향 돌파\n"
                 "- 모든 판단은 확정봉 기준"
             )
             await self.show_setup_menu(update)
