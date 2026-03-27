@@ -2359,8 +2359,10 @@ class SignalEngine(BaseEngine):
         short_mid_entry_ready = bool(ut_state == 'short' and short_mid_ready)
         special_short_candidate = short_mid_entry_ready and bb_lower_sig == 'exit_short'
 
+        long_entry_ready = ut_state == 'long'
+
         entry_sig = None
-        if ut_sig == 'long':
+        if long_entry_ready:
             entry_sig = 'long'
         elif short_setup_entry_ready or short_mid_entry_ready:
             entry_sig = 'short'
@@ -2418,16 +2420,21 @@ class SignalEngine(BaseEngine):
 
         if entry_sig == 'long':
             if bb_upper_sig == 'exit_long':
-                return 'long', "UTBB LONG: UT 롱신호 + BB 상단 상향돌파 동시 발생", detail
-            return 'long', "UTBB LONG: UT 롱 진입신호 확인", detail
+                if ut_sig == 'long':
+                    return 'long', "UTBB LONG: UT 롱신호 + BB 상단 상향돌파 동시 발생", detail
+                return 'long', "UTBB LONG: UT 롱상태 유지 + BB 상단 상향돌파 확인", detail
+            if ut_sig == 'long':
+                return 'long', "UTBB LONG: UT 롱 진입신호 확인", detail
+            return 'long', "UTBB LONG: UT 롱상태 유지 확인", detail
         if entry_sig == 'short':
             return 'short', f"UTBB SHORT: {short_entry_reason}", detail
 
         if ut_state == 'short' and not (short_setup_entry_ready or short_mid_entry_ready):
             wait_label = "UT 숏신호 감지" if ut_sig == 'short' else "UT 숏상태 유지"
             return None, f"UTBB 대기: {wait_label}, BB 상단 재진입 또는 중간선 하락 돌파 숏 셋업 대기", detail
-        if ut_sig == 'long':
-            return None, "UTBB 대기: UT 롱신호 감지", detail
+        if ut_state == 'long':
+            wait_label = "UT 롱신호 감지" if ut_sig == 'long' else "UT 롱상태 유지"
+            return None, f"UTBB 대기: {wait_label}", detail
         return None, "UTBB 대기", detail
 
     def _calculate_cameron_signal(self, df, strategy_params):
@@ -3453,11 +3460,14 @@ class SignalEngine(BaseEngine):
                         )
                         if ut_state == 'short' and entry_sig == 'short':
                             if special_short_candidate:
-                                self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 후 특수 SHORT 재진입"
+                                if ut_signal == 'short':
+                                    self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 후 특수 SHORT 재진입"
+                                else:
+                                    self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 후 UT 숏상태로 특수 SHORT 재진입"
                                 self._set_utbb_special_short_state(symbol, raw_hybrid_detail.get('bb_lower_signal_ts'))
                             else:
                                 short_note = (
-                                    "BB 중간선 하락 돌파 + UT 숏신호"
+                                    ("BB 중간선 하락 돌파 + UT 숏신호" if ut_signal == 'short' else "BB 중간선 하락 돌파 + UT 숏상태")
                                     if short_mid_ready else "UT 숏신호로 SHORT"
                                 )
                                 self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 후 {short_note} 재진입"
@@ -3525,10 +3535,16 @@ class SignalEngine(BaseEngine):
                         )
                         if entry_sig == 'long':
                             if bb_upper_breakout:
-                                self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 특수 LONG 재진입"
+                                if ut_signal == 'long':
+                                    self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 특수 LONG 재진입"
+                                else:
+                                    self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 UT 롱상태로 특수 LONG 재진입"
                                 self._set_utbb_special_long_state(symbol, raw_hybrid_detail.get('bb_upper_signal_ts'))
                             else:
-                                self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 LONG 재진입"
+                                if ut_signal == 'long':
+                                    self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 LONG 재진입"
+                                else:
+                                    self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 UT 롱상태로 LONG 재진입"
                                 self._clear_utbb_special_long_state(symbol)
                             await self.entry(symbol, 'long', float(k['c']))
                             self._update_stateful_diag(
@@ -3558,20 +3574,34 @@ class SignalEngine(BaseEngine):
 
                 elif not pos and entry_sig == 'long':
                     if bb_upper_breakout:
-                        self.last_entry_reason[symbol] = f"{strategy_name} UT 롱신호 + BB 상단돌파 -> 특수 LONG 진입"
+                        if ut_signal == 'long':
+                            self.last_entry_reason[symbol] = f"{strategy_name} UT 롱신호 + BB 상단돌파 -> 특수 LONG 진입"
+                        else:
+                            self.last_entry_reason[symbol] = f"{strategy_name} UT 롱상태 유지 + BB 상단돌파 -> 특수 LONG 진입"
                         self._set_utbb_special_long_state(symbol, raw_hybrid_detail.get('bb_upper_signal_ts'))
                     else:
-                        self.last_entry_reason[symbol] = f"{strategy_name} UT 롱신호 -> LONG 진입"
+                        if ut_signal == 'long':
+                            self.last_entry_reason[symbol] = f"{strategy_name} UT 롱신호 -> LONG 진입"
+                        else:
+                            self.last_entry_reason[symbol] = f"{strategy_name} UT 롱상태 유지 -> LONG 진입"
                         self._clear_utbb_special_long_state(symbol)
                     self._clear_utbb_special_short_state(symbol)
                     logger.info(f"[{strategy_name}] New LONG entry")
                     await self.entry(symbol, 'long', float(k['c']))
                 elif not pos and entry_sig == 'short':
                     if special_short_candidate:
-                        short_note = "BB 중간선 하락 돌파 + BB 하단 하향 돌파 + UT 숏신호"
+                        short_note = (
+                            "BB 중간선 하락 돌파 + BB 하단 하향 돌파 + UT 숏신호"
+                            if ut_signal == 'short'
+                            else "BB 중간선 하락 돌파 + BB 하단 하향 돌파 + UT 숏상태"
+                        )
                         self._set_utbb_special_short_state(symbol, raw_hybrid_detail.get('bb_lower_signal_ts'))
                     else:
-                        short_note = "BB 중간선 하락 돌파 + UT 숏신호" if short_mid_ready else "BB 숏 셋업 + UT 숏신호"
+                        short_note = (
+                            "BB 중간선 하락 돌파 + UT 숏신호"
+                            if ut_signal == 'short'
+                            else "BB 중간선 하락 돌파 + UT 숏상태"
+                        ) if short_mid_ready else "BB 숏 셋업 + UT 숏신호"
                         self._clear_utbb_special_short_state(symbol)
                     self.last_entry_reason[symbol] = f"{strategy_name} {short_note} -> SHORT 진입"
                     self._clear_utbb_special_long_state(symbol)
@@ -7004,11 +7034,11 @@ class MainController:
                 "ℹ️ UT Hybrid 전략 안내\n"
                 "- UTRSI: UT 방향 + RSI 타이밍 조합\n"
                 "- UTRSIBB: UT 방향 + RSI/BB 동시 타이밍 조합\n"
-                "- UTBB LONG: UT 롱신호 진입, UT 숏신호 또는 BB 상단 하향 돌파 마감 시 청산\n"
-                "- UTBB 특수 LONG: 진입봉이 BB 상단 돌파였어도 동일하게 BB 상단 하향 돌파 또는 UT 숏신호로 청산\n"
-                "- UTBB SHORT: BB 상단 재진입 셋업 후 UT 숏신호 또는 BB 중간선 하락 돌파 + UT 숏신호로 진입\n"
-                "- UTBB 특수 SHORT: 진입봉이 BB 중간선 하향 + BB 하단선 하향 돌파면 BB 하단선 상향 돌파 또는 UT 롱신호로 청산\n"
-                "- UTBB SHORT 청산: 일반은 UT 롱신호 또는 BB 하단선 하향 돌파, 특수는 BB 하단선 상향 돌파 또는 UT 롱신호\n"
+                "- UTBB LONG: UT 롱신호 또는 UT 롱상태 유지면 진입, UT 숏상태 또는 BB 상단 하향 돌파 마감 시 청산\n"
+                "- UTBB 특수 LONG: 진입봉이 BB 상단 돌파여도 동일하게 BB 상단 하향 돌파 또는 UT 숏상태로 청산\n"
+                "- UTBB SHORT: BB 상단 재진입 셋업 후 UT 숏신호 또는 BB 중간선 하락 돌파 + UT 숏상태로 진입\n"
+                "- UTBB 특수 SHORT: 진입봉이 BB 중간선 하향 + BB 하단선 하향 돌파면 BB 하단선 상향 돌파 또는 UT 롱상태로 청산\n"
+                "- UTBB SHORT 청산: 일반은 UT 롱상태 또는 BB 하단선 하향 돌파, 특수는 BB 하단선 상향 돌파 또는 UT 롱상태\n"
                 "- 모든 판단은 확정봉 기준"
             )
             await self.show_setup_menu(update)
