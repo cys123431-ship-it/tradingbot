@@ -65,9 +65,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 faulthandler.enable()
 CORE_ENGINE = 'signal'
-MA_STRATEGIES = {'sma', 'hma'}
-PATTERN_STRATEGIES = {'cameron', 'utbot', 'rsibb', 'utrsibb', 'utrsi', 'utbb'}
-CORE_STRATEGIES = MA_STRATEGIES | PATTERN_STRATEGIES
+UT_ONLY_STRATEGIES = {'utbot', 'utrsibb', 'utrsi', 'utbb'}
+MA_STRATEGIES = set()
+PATTERN_STRATEGIES = set(UT_ONLY_STRATEGIES)
+CORE_STRATEGIES = set(UT_ONLY_STRATEGIES)
 UT_HYBRID_STRATEGIES = {'utrsibb', 'utrsi', 'utbb'}
 STATEFUL_UT_STRATEGIES = {'utbot'} | UT_HYBRID_STRATEGIES
 STRATEGY_DISPLAY_NAMES = {
@@ -172,7 +173,7 @@ class TradingConfig:
                     'cc_length': 14
                 },
                 'strategy_params': {
-                    'active_strategy': 'sma',
+                    'active_strategy': 'utbot',
                     'entry_mode': 'cross',
                     'Triple_SMA': {'fast_sma': 2, 'slow_sma': 10},
                     'HMA': {'fast_period': 9, 'slow_period': 21},
@@ -360,9 +361,9 @@ class TradingConfig:
                 if sub_key not in current_val:
                     current_val[sub_key] = sub_val
                     changed = True
-        active_strategy = str(strategy_params.get('active_strategy', 'sma')).lower()
+        active_strategy = str(strategy_params.get('active_strategy', 'utbot')).lower()
         if active_strategy not in CORE_STRATEGIES:
-            strategy_params['active_strategy'] = 'sma'
+            strategy_params['active_strategy'] = 'utbot'
             changed = True
 
         entry_mode = str(strategy_params.get('entry_mode', 'cross')).lower()
@@ -3255,7 +3256,7 @@ class SignalEngine(BaseEngine):
 
             strategy_params = cfg.get('strategy_params', {})
             entry_mode = strategy_params.get('entry_mode', 'cross').lower()
-            active_strategy = strategy_params.get('active_strategy', 'sma').lower()
+            active_strategy = strategy_params.get('active_strategy', 'utbot').lower()
             uses_stateful_primary_sync = active_strategy in STATEFUL_UT_STRATEGIES
             processed_primary_this_tick = False
             
@@ -3401,9 +3402,9 @@ class SignalEngine(BaseEngine):
                     
                     # [MODIFIED] Always use entry_timeframe if scanner is evaluating for a position-like entry
                     scan_params = strategy_params.copy()
-                    active_strategy = scan_params.get('active_strategy', 'sma').lower()
+                    active_strategy = scan_params.get('active_strategy', 'utbot').lower()
                     if active_strategy not in CORE_STRATEGIES:
-                        active_strategy = 'sma'
+                        active_strategy = 'utbot'
                     
                     # Use scanner_timeframe if set, but ensure we are thinking about consistency
                     ohlcv = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, scan_tf, limit=300)
@@ -3463,9 +3464,7 @@ class SignalEngine(BaseEngine):
             # ?꾨왂 ?곹깭 媛?몄삤湲?
             strategy_params = self.get_runtime_strategy_params()
             comm_cfg = self.get_runtime_common_settings()
-            kalman_cfg = strategy_params.get('kalman_filter', {})
-            kalman_enabled = bool(kalman_cfg.get('entry_enabled', False) or kalman_cfg.get('exit_enabled', False))
-            active_strategy = strategy_params.get('active_strategy', 'sma').upper()
+            active_strategy = strategy_params.get('active_strategy', 'utbot').upper()
             entry_mode = strategy_params.get('entry_mode', 'cross').upper()
             if active_strategy in {'UTBOT', 'RSIBB', 'UTRSIBB', 'UTRSI', 'UTBB'}:
                 entry_mode = active_strategy
@@ -3493,9 +3492,9 @@ class SignalEngine(BaseEngine):
                 'quote_currency': self.get_quote_currency(),
                 'is_spot': self.is_upbit_mode(),
                 # Signal ?꾩슜 ?꾨뱶
-                'kalman_enabled': kalman_enabled,
-                'kalman_velocity': self.kalman_states.get(symbol, {}).get('velocity', 0.0),
-                'kalman_direction': self.kalman_states.get(symbol, {}).get('direction'),
+                'kalman_enabled': False,
+                'kalman_velocity': 0.0,
+                'kalman_direction': None,
                 'active_strategy': active_strategy,
                 'entry_mode': entry_mode,
                 'entry_reason': self.last_entry_reason.get(symbol, '대기'),
@@ -3511,34 +3510,9 @@ class SignalEngine(BaseEngine):
                 'fisher_entry_atr': fisher_state.get('entry_atr')
             }
             
-            # Merge Last Filter Status (Persistence)
-            entry_status = self.last_entry_filter_status.get(symbol, {})
-            exit_status = self.last_exit_filter_status.get(symbol, {})
-            
-            symbol_status['entry_filters'] = entry_status
-            symbol_status['exit_filters'] = exit_status
-            
-            # Real-time Filter Config
-            symbol_status['filter_config'] = {
-                'r2': {
-                    'en_entry': comm_cfg.get('r2_entry_enabled', True), 
-                    'en_exit': comm_cfg.get('r2_exit_enabled', True),
-                    'th': comm_cfg.get('r2_threshold', 0.25)
-                },
-                'chop': {
-                    'en_entry': comm_cfg.get('chop_entry_enabled', True), 
-                    'en_exit': comm_cfg.get('chop_exit_enabled', True),
-                    'th': comm_cfg.get('chop_threshold', 50.0)
-                },
-                'cc': {
-                    'en_exit': comm_cfg.get('cc_exit_enabled', False),
-                    'th': comm_cfg.get('cc_threshold', 0.70)
-                },
-                'kalman': {
-                    'en_entry': strategy_params.get('kalman_filter', {}).get('entry_enabled', False),
-                    'en_exit': strategy_params.get('kalman_filter', {}).get('exit_enabled', False)
-                }
-            }
+            symbol_status['entry_filters'] = {}
+            symbol_status['exit_filters'] = {}
+            symbol_status['filter_config'] = {}
             tp_master_enabled = False if self.is_upbit_mode() else bool(comm_cfg.get('tp_sl_enabled', True))
             tp_enabled = tp_master_enabled and bool(comm_cfg.get('take_profit_enabled', True))
             sl_enabled = tp_master_enabled and bool(comm_cfg.get('stop_loss_enabled', True))
@@ -4136,7 +4110,7 @@ class SignalEngine(BaseEngine):
             
             # ===== ?꾨왂 ?ㅼ젙 濡쒕뱶 =====
             strategy_params = self.get_runtime_strategy_params()
-            active_strategy = strategy_params.get('active_strategy', 'sma').lower()
+            active_strategy = strategy_params.get('active_strategy', 'utbot').lower()
             strategy_context = self._collect_primary_strategy_context(symbol, df, strategy_params, active_strategy)
             raw_strategy_sig = strategy_context['raw_strategy_sig']
             raw_state_sig = strategy_context['raw_state_sig']
@@ -4355,7 +4329,7 @@ class SignalEngine(BaseEngine):
             
             # ===== 1. Calculate Raw Exit Signal =====
             strategy_params = self.get_runtime_strategy_params()
-            active_strategy = strategy_params.get('active_strategy', 'sma').lower()
+            active_strategy = strategy_params.get('active_strategy', 'utbot').lower()
             raw_exit_long = False
             raw_exit_short = False
             c_f = c_s = 0.0
@@ -4526,12 +4500,7 @@ class SignalEngine(BaseEngine):
     async def _calculate_strategy_signal(self, symbol, df, strategy_params, active_strategy, allow_utbot_stateful=True, precomputed=None):
         """
         ?꾨왂蹂??좏샇 怨꾩궛
-        
-        ?ㅼ젙:
-        - active_strategy: 'sma', 'hma', ?먮뒗 'microvbo'
-        - entry_mode: 'cross' (援먯감) ?먮뒗 'position' (?꾩튂) - SMA/HMA??
-        - kalman_filter.enabled: True/False - SMA/HMA??
-        
+
         Returns: (signal, is_bullish, is_bearish, strategy_name, entry_mode, kalman_enabled)
         """
         sig = None
@@ -4553,160 +4522,17 @@ class SignalEngine(BaseEngine):
 
         active_strategy = str(active_strategy).lower()
         if active_strategy not in CORE_STRATEGIES:
-            logger.warning(f"Unsupported active_strategy '{active_strategy}' in core mode. Using SMA.")
-            active_strategy = 'sma'
+            logger.warning(f"Unsupported active_strategy '{active_strategy}' in core mode. Using UTBOT.")
+            active_strategy = 'utbot'
 
-        entry_mode = str(strategy_params.get('entry_mode', 'cross')).lower()
-        if entry_mode not in {'cross', 'position'}:
-            entry_mode = 'cross'
-        kalman_cfg = strategy_params.get('kalman_filter', {})
-        # [MODIFIED] Separate Entry/Exit Config
-        kalman_entry_enabled = kalman_cfg.get('entry_enabled', False)
-        kalman_exit_enabled = kalman_cfg.get('exit_enabled', False) # Used in exit logic, but read here for consistency
-        
-        # [MODIFIED] Only force for Position mode entry if Entry filter is enabled? 
-        # User said: "Apply Kalman regardless for Position/Cross Entry/Exit UNLESS toggled."
-        # Actually user said: "Kalman was unconditional... make it toggleable for Entry ON/OFF and Exit ON/OFF."
-        # So I will strictly follow the toggle. If user wants Position mode + Kalman OFF, so be it.
-        # However, Position mode fundamentally relies on some trend definition. But I will trust the toggle.
-        
-        # NOTE: Original code FORCED kalman for 'position' and 'cross' modes.
-        # New logic: Use kalman_entry_enabled for Entry signals.
-        
-        # ============ R2 Trend Quality Filter (Financial Engineering) ============
-        common_cfg = self.get_runtime_common_settings()
-        
-        # 1. R2 Filter (Trend Quality)
-        r2_entry_enabled = common_cfg.get('r2_entry_enabled', True)
-        r2_thresh = common_cfg.get('r2_threshold', 0.25)
-        curr_r2 = 0.0
-        is_r2_pass = True
-        
-        if len(df) >= 14:
-            df['idx_seq'] = np.arange(len(df))
-            roll_corr = df['close'].rolling(window=14).corr(df['idx_seq'])
-            df['r2'] = roll_corr ** 2
-            curr_r2 = df['r2'].iloc[-2]
-            if np.isnan(curr_r2): curr_r2 = 0.0
-            
-            # Entry Check
-            if r2_entry_enabled and curr_r2 < r2_thresh:
-                is_r2_pass = False
+        entry_mode = active_strategy
+        kalman_entry_enabled = False
+        self.last_entry_filter_status[symbol] = {}
+        self.kalman_states[symbol]['velocity'] = 0.0
+        self.kalman_states[symbol]['direction'] = None
 
-        # 2. Choppiness Index (Trend vs Chop)
-        chop_entry_enabled = common_cfg.get('chop_entry_enabled', True)
-        chop_thresh = common_cfg.get('chop_threshold', 50.0)
-        curr_chop = 50.0
-        is_chop_pass = True
-        
-        if len(df) >= 14:
-            try:
-                # pandas_ta chop: 100 * Log10(Sum(ATR, n) / (MaxHi - MinLo)) / Log10(n)
-                # Use standard 14 length
-                chop_series = df.ta.chop(length=14)
-                if chop_series is not None:
-                    curr_chop = chop_series.iloc[-2]
-                    if np.isnan(curr_chop): curr_chop = 50.0
-                    
-                    if chop_entry_enabled and curr_chop > chop_thresh:
-                        is_chop_pass = False
-            except Exception as e:
-                logger.warning(f"CHOP calculation error: {e}")
-
-        # Update Status Data (Real-time monitoring)
-        self.last_entry_filter_status[symbol] = {
-            'r2_val': curr_r2,
-            'chop_val': curr_chop,
-            'r2_pass': is_r2_pass,
-            'chop_pass': is_chop_pass
-        }
-        
-        # Visual Logging
-        r2_icon = "OK" if is_r2_pass else "NO"
-        chop_icon = "OK" if is_chop_pass else "NO"
-        
-        if active_strategy in CORE_STRATEGIES:
-             logger.info(f"?썳截?Filters (Entry): R2({curr_r2:.2f}{r2_icon}) CHOP({curr_chop:.1f}{chop_icon})")
-             # Log Kalman too if used
-             
-        # ... MicroVBO / FractalFisher skipped (no changes needed) ...
-        
-        # ===== 1. Strategy-specific calculation state =====
         strategy_name = STRATEGY_DISPLAY_NAMES.get(active_strategy, active_strategy.upper())
-        p_f = p_s = c_f = c_s = 0.0
-        ma_bullish = False
-        ma_bearish = False
 
-        if active_strategy == 'hma':
-            p = strategy_params.get('HMA', {})
-            fast_period = p.get('fast_period', 9)
-            slow_period = p.get('slow_period', 21)
-            try:
-                df['f'] = ta.hma(df['close'], length=fast_period)
-                df['s'] = ta.hma(df['close'], length=slow_period)
-                strategy_name = "HMA"
-            except Exception as e:
-                logger.error(f"HMA calculation error: {e}")
-                return None, False, False, strategy_name, entry_mode, False
-
-        elif active_strategy == 'sma':
-            p = strategy_params.get('Triple_SMA', {})
-            fast_period = p.get('fast_sma', 3)
-            slow_period = p.get('slow_sma', 10) # Modified default from 33 to 10
-            try:
-                df['f'] = ta.sma(df['close'], length=fast_period)
-                df['s'] = ta.sma(df['close'], length=slow_period)
-                strategy_name = "SMA"
-            except Exception as e:
-                logger.error(f"SMA calculation error: {e}")
-                return None, False, False, strategy_name, entry_mode, False
-        
-        if active_strategy in MA_STRATEGIES:
-            # [-1] is open/current candle (unconfirmed), [-2] is last closed candle
-            if len(df) >= 3:
-                c_f = df['f'].iloc[-2]
-                c_s = df['s'].iloc[-2]
-                p_f = df['f'].iloc[-3]
-                p_s = df['s'].iloc[-3]
-                
-                # Check alignment for Position Mode
-                ma_bullish = c_f > c_s
-                ma_bearish = c_f < c_s
-            else:
-                logger.warning(f"Not enough data for {strategy_name}: {len(df)}")
-                return None, False, False, strategy_name, entry_mode, False
-
-        # ===== 2. Kalman Filter 怨꾩궛 (?꾩슂?? =====
-        kalman_bullish = None
-        kalman_bearish = None
-        
-        # We assume we always calculate Kalman if Entry OR Exit is enabled, or just always for display
-        # But for logic, we check the flag.
-        
-        # Always calculate for status/display
-        kalman_vel = self._calculate_kalman_values(df, kalman_cfg)
-        self.kalman_states[symbol]['velocity'] = kalman_vel
-        
-        # Update entry status with Kalman info
-        if symbol in self.last_entry_filter_status:
-            self.last_entry_filter_status[symbol]['kalman_vel'] = kalman_vel
-        
-        if kalman_vel > 0:
-            self.kalman_states[symbol]['direction'] = 'long'
-            kalman_bullish = True
-            kalman_bearish = False
-        elif kalman_vel < 0:
-            self.kalman_states[symbol]['direction'] = 'short'
-            kalman_bullish = False
-            kalman_bearish = True
-        else:
-            self.kalman_states[symbol]['direction'] = None
-            kalman_bullish = False
-            kalman_bearish = False
-            
-        logger.info(f"?뱤 [Kalman] Velocity: {kalman_vel:.4f}, Direction: {self.kalman_states[symbol]['direction']}")
-        
-        # ===== 3. 吏꾩엯 紐⑤뱶蹂??좏샇 ?먮떒 (ENTRY SIGNAL) =====
         if active_strategy == 'utbot':
             entry_mode = 'utbot'
             sig, entry_reason, utbot_detail = precomputed.get('utbot') or self._calculate_utbot_signal(df, strategy_params)
@@ -4717,28 +4543,12 @@ class SignalEngine(BaseEngine):
             is_bullish = sig == 'long'
             is_bearish = sig == 'short'
 
-            if sig == 'long' and kalman_entry_enabled and not kalman_bullish:
-                entry_reason = "UTBOT LONG 상태, Kalman 진입필터 미통과"
-                sig = None
-                is_bullish = False
-            elif sig == 'short' and kalman_entry_enabled and not kalman_bearish:
-                entry_reason = "UTBOT SHORT 상태, Kalman 진입필터 미통과"
-                sig = None
-                is_bearish = False
-
         elif active_strategy == 'utbb':
             entry_mode = 'utbb'
             sig, entry_reason, hybrid_detail = precomputed.get('utbb') or self._calculate_utbb_signal(symbol, df, strategy_params)
             ut_state = hybrid_detail.get('ut_state')
             is_bullish = ut_state == 'long'
             is_bearish = ut_state == 'short'
-
-            if sig == 'long' and kalman_entry_enabled and not kalman_bullish:
-                entry_reason = "UTBB LONG, Kalman 진입필터 미통과"
-                sig = None
-            elif sig == 'short' and kalman_entry_enabled and not kalman_bearish:
-                entry_reason = "UTBB SHORT, Kalman 진입필터 미통과"
-                sig = None
 
         elif active_strategy in UT_HYBRID_STRATEGIES:
             entry_mode = active_strategy
@@ -4750,148 +4560,12 @@ class SignalEngine(BaseEngine):
             ut_state = hybrid_detail.get('ut_state')
             is_bullish = ut_state == 'long'
             is_bearish = ut_state == 'short'
-
-            if sig == 'long' and kalman_entry_enabled and not kalman_bullish:
-                entry_reason = f"{strategy_name} LONG, Kalman 진입필터 미통과"
-                sig = None
-            elif sig == 'short' and kalman_entry_enabled and not kalman_bearish:
-                entry_reason = f"{strategy_name} SHORT, Kalman 진입필터 미통과"
-                sig = None
-
         elif active_strategy == 'rsibb':
             entry_mode = 'rsibb'
             sig, entry_reason, _ = precomputed.get('rsibb') or self._calculate_rsibb_signal(df, strategy_params)
             is_bullish = sig == 'long'
             is_bearish = sig == 'short'
 
-            if sig == 'long' and kalman_entry_enabled and not kalman_bullish:
-                entry_reason = "RSIBB LONG, Kalman 진입필터 미통과"
-                sig = None
-                is_bullish = False
-            elif sig == 'short' and kalman_entry_enabled and not kalman_bearish:
-                entry_reason = "RSIBB SHORT, Kalman 진입필터 미통과"
-                sig = None
-                is_bearish = False
-
-        elif active_strategy == 'cameron':
-            entry_mode = 'pattern'
-            sig, entry_reason, cameron_state = self._calculate_cameron_signal(df, strategy_params)
-            self.cameron_states[symbol] = cameron_state
-            is_bullish = sig == 'long'
-            is_bearish = sig == 'short'
-
-            if sig == 'long' and kalman_entry_enabled and not kalman_bullish:
-                entry_reason = "CAMERON LONG, Kalman 진입필터 미통과"
-                sig = None
-                is_bullish = False
-            elif sig == 'short' and kalman_entry_enabled and not kalman_bearish:
-                entry_reason = "CAMERON SHORT, Kalman 진입필터 미통과"
-                sig = None
-                is_bearish = False
-
-        elif entry_mode == 'cross':
-            # SMA Cross Only Logic First
-            cross_up = p_f < p_s and c_f > c_s
-            cross_down = p_f > p_s and c_f < c_s
-            
-            if cross_up:
-                if kalman_entry_enabled:
-                    if kalman_bullish:
-                        sig = 'long'
-                        entry_reason = f"{strategy_name} Cross Up + Kalman 통과"
-                        logger.info(f"LONG signal: {strategy_name} Cross + Kalman Entry OK")
-                    else:
-                        entry_reason = f"{strategy_name} Cross Up, Kalman 진입필터 미통과"
-                        logger.info(f"?썳截?Filtered: {strategy_name} Cross Up but Kalman Entry Filter Blocked")
-                else:
-                    sig = 'long'
-                    entry_reason = f"{strategy_name} Cross Up"
-                    logger.info(f"LONG signal: {strategy_name} Cross (Kalman Filter OFF)")
-            
-            elif cross_down:
-                if kalman_entry_enabled:
-                    if kalman_bearish:
-                        sig = 'short'
-                        entry_reason = f"{strategy_name} Cross Down + Kalman 통과"
-                        logger.info(f"SHORT signal: {strategy_name} Cross + Kalman Entry OK")
-                    else:
-                        entry_reason = f"{strategy_name} Cross Down, Kalman 진입필터 미통과"
-                        logger.info(f"?썳截?Filtered: {strategy_name} Cross Down but Kalman Entry Filter Blocked")
-                else:
-                    sig = 'short'
-                    entry_reason = f"{strategy_name} Cross Down"
-                    logger.info(f"SHORT signal: {strategy_name} Cross (Kalman Filter OFF)")
-            
-            else:
-                entry_reason = f"{strategy_name} 크로스 없음"
-                logger.debug(f"?뱣 No Cross: {strategy_name}")
-        
-        elif entry_mode == 'position':
-            # Position Mode: MA Alignment
-            if ma_bullish:
-                if kalman_entry_enabled:
-                    if kalman_bullish:
-                        sig = 'long'
-                        entry_reason = f"{strategy_name} 정배열 + Kalman 통과"
-                        logger.info(f"LONG signal: {strategy_name} Position + Kalman Entry OK")
-                    else:
-                        entry_reason = f"{strategy_name} 정배열, Kalman 진입필터 미통과"
-                else:
-                    sig = 'long'
-                    entry_reason = f"{strategy_name} 정배열"
-                    logger.info(f"LONG signal: {strategy_name} Position (Kalman Filter OFF)")
-            
-            elif ma_bearish:
-                if kalman_entry_enabled:
-                    if kalman_bearish:
-                        sig = 'short'
-                        entry_reason = f"{strategy_name} 역배열 + Kalman 통과"
-                        logger.info(f"SHORT signal: {strategy_name} Position + Kalman Entry OK")
-                    else:
-                        entry_reason = f"{strategy_name} 역배열, Kalman 진입필터 미통과"
-                else:
-                    sig = 'short'
-                    entry_reason = f"{strategy_name} 역배열"
-                    logger.info(f"SHORT signal: {strategy_name} Position (Kalman Filter OFF)")
-            
-            else:
-                entry_reason = f"{strategy_name} 중립 구간"
-                # Position Mode but neither MA Bullish nor Bearish (Neutral/Whipsaw)
-                pass
-                # Position mode logs are handled inside the if blocks (filtered vs signal).
-                # If we are here, it means !ma_bullish and !ma_bearish (which shouldn't happen usually for bools unless equal)
-                # Or Kalman filter blocked it but we handled logging inside?
-                # Actually, in Position mode:
-                # if ma_bullish: ...
-                # elif ma_bearish: ...
-                # So if neither, we do nothing.
-                
-                if not ma_bullish and not ma_bearish:
-                     logger.debug(f"?뱣 Neutral Position (p_f={p_f:.2f}, p_s={p_s:.2f})")
-                elif ma_bullish and kalman_entry_enabled and not kalman_bullish:
-                     logger.debug(f"?썳截?Position Long Blocked by Kalman (Vel={kalman_vel:.4f})")
-                elif ma_bearish and kalman_entry_enabled and not kalman_bearish:
-                     logger.debug(f"?썳截?Position Short Blocked by Kalman (Vel={kalman_vel:.4f})")
-
-        if active_strategy in MA_STRATEGIES:
-            is_bullish = ma_bullish
-            is_bearish = ma_bearish
-        
-        # ============ Apply Advanced Trends Filters to Entry Signal ============
-        if sig and active_strategy in CORE_STRATEGIES:
-            blocked_reasons = []
-            if not is_r2_pass:
-                blocked_reasons.append(f"R2({curr_r2:.2f})<{r2_thresh}")
-            if not is_chop_pass:
-                blocked_reasons.append(f"CHOP({curr_chop:.1f})>{chop_thresh}")
-            
-            if blocked_reasons:
-                logger.info(f"?썳截?Entry Blocked by Filters: {', '.join(blocked_reasons)}")
-                sig = None
-                is_bullish = False
-                is_bearish = False
-                entry_reason = f"필터 차단: {', '.join(blocked_reasons)}"
-        
         self.last_entry_reason[symbol] = entry_reason
         return sig, is_bullish, is_bearish, strategy_name, entry_mode, kalman_entry_enabled
 
@@ -6727,6 +6401,8 @@ class MainController:
         if self.is_upbit_mode():
             strategy['active_strategy'] = 'utbot'
             strategy['entry_mode'] = 'position'
+        elif str(strategy.get('active_strategy', 'utbot')).lower() not in CORE_STRATEGIES:
+            strategy['active_strategy'] = 'utbot'
         return strategy
 
     def get_active_watchlist(self):
@@ -7324,13 +7000,8 @@ class MainController:
         
         # Signal ?꾨왂 ?ㅼ젙 (異붽?)
         strategy_params = sig.get('strategy_params', {})
-        active_strategy = strategy_params.get('active_strategy', 'sma').upper()
-        entry_mode = strategy_params.get('entry_mode', 'cross').upper()
-        if active_strategy in {'UTBOT', 'RSIBB', 'UTRSIBB', 'UTRSI', 'UTBB'}:
-            entry_mode = active_strategy
-        hma_params = strategy_params.get('HMA', {})
-        hma_fast = hma_params.get('fast_period', 9)
-        hma_slow = hma_params.get('slow_period', 21)
+        active_strategy = strategy_params.get('active_strategy', 'utbot').upper()
+        entry_mode = active_strategy
         utbot_params = strategy_params.get('UTBot', {})
         utbot_key = float(utbot_params.get('key_value', 1.0) or 1.0)
         utbot_atr = int(utbot_params.get('atr_period', 10) or 10)
@@ -7352,22 +7023,6 @@ class MainController:
         # Hourly Report Status
         hourly_report_status = "ON" if self.cfg.get('telegram', {}).get('reporting', {}).get('hourly_report_enabled', True) else "OFF"
 
-        # Filter Status (Split)
-        r2_entry = "ON" if sig_common.get('r2_entry_enabled', True) else "OFF"
-        r2_exit = "ON" if sig_common.get('r2_exit_enabled', True) else "OFF"
-        r2_threshold = sig_common.get('r2_threshold', 0.25)
-
-        chop_entry = "ON" if sig_common.get('chop_entry_enabled', True) else "OFF"
-        chop_exit = "ON" if sig_common.get('chop_exit_enabled', True) else "OFF"
-        chop_threshold = sig_common.get('chop_threshold', 50.0)
-        
-        kalman_cfg = strategy_params.get('kalman_filter', {})
-        kalman_entry = "ON" if kalman_cfg.get('entry_enabled', False) else "OFF"
-        kalman_exit = "ON" if kalman_cfg.get('exit_enabled', False) else "OFF"
-        
-        cc_exit = "ON" if sig_common.get('cc_exit_enabled', False) else "OFF"
-        cc_threshold = sig_common.get('cc_threshold', 0.70)
-        
         # Network status
         network_status = self.get_network_status_label()
         
@@ -7390,9 +7045,6 @@ class MainController:
 
 **Signal**
 16. 전략 (`{active_strategy}`)
-18. 진입모드 (`{entry_mode}`)
-10. SMA (`{fast_sma}/{slow_sma}`)
-17. HMA (`{hma_fast}/{hma_slow}`)
 19. UT Bot (`K={utbot_key:.2f}` / `ATR={utbot_atr}` / `HA={utbot_ha}`)
 20. RSI+BB 보조설정 (`RSI={rsibb_rsi}` / `BB={rsibb_bb}` / `x{rsibb_mult:.2f}`)
 21. UT Hybrid 안내 (`UTRSI / UTBB / UTRSIBB`)
@@ -7402,15 +7054,6 @@ class MainController:
 23. 거래량 급등 채굴 (`{scanner_status}` / `{scanner_tf}`)
 24. 채굴 진입 TF
 25. 채굴 청산 TF (`{scanner_exit_tf}`)
-
-**필터 (Entry / Exit)**
-26. R2 (`{r2_entry}` / `{r2_exit}`) 기준 `{r2_threshold}`
-30. CHOP (`{chop_entry}` / `{chop_exit}`) 기준 `{chop_threshold}`
-32. Kalman (`{kalman_entry}` / `{kalman_exit}`)
-33. CC Exit (`{cc_exit}`) 기준 `{cc_threshold}`
-27. R2 민감도
-31. CHOP 민감도
-34. CC 민감도
 
 **기타**
 22. 거래소/네트워크 전환 (`{network_status}`)
@@ -7446,14 +7089,11 @@ class MainController:
             '8': "💱 **심볼** 입력 또는 선택\n1: BTC  2: ETH  3: SOL\n또는 직접 입력 (예: DOGE, XRP, PEPE)",
             '38': "➕ **감시 심볼 추가**\n1: BTC  2: ETH  3: SOL\n또는 직접 입력 (예: DOGE, XRP, PEPE)",
             '9': "▶️ 매매 시작/중지를 바꾸려면 1 또는 0 입력",
-            '10': "📝 **SMA 기간** 입력 (형식: fast,slow 예: 2,10)",
             '11': "📝 **자산 비율(%)** 입력 (예: 50)",
             '12': "📝 **Grid 설정** 입력 (예: on,200 또는 off)",
             '14': "📝 **N Days** 입력 (예: 4)",
             '15': "📝 **K1/K2** 입력 (예: 0.5,0.5)",
-            '16': "📝 **전략 선택** (1=SMA, 2=HMA, 3=CAMERON, 4=UTBOT, 5=RSIBB, 6=UTRSIBB, 7=UTRSI, 8=UTBB)",
-            '17': "📝 **HMA 기간** 입력 (예: 9,21)",
-            '18': "📝 **진입 모드** 선택 (1=Cross, 2=Position)",
+            '16': "📝 **전략 선택** (1=UTBOT, 2=UTRSIBB, 3=UTRSI, 4=UTBB)",
             '19': "📝 **UT Bot 설정** 입력 (형식: key,atr,on/off 예: 1,10,off)",
             '20': "RSI/BB 보조설정 입력\n형식: RSI길이,BB길이,BB배수\n예: 6,200,2",
             '21': "ℹ️ **UT Hybrid 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙을 사용합니다.",
@@ -7461,12 +7101,6 @@ class MainController:
             '23': "📝 **거래량 급등 채굴 기능** (1=ON, 0=OFF)",
             '24': "📝 **채굴 진입 타임프레임** 입력 (예: 5m)\n1m, 5m, 15m, 30m, 1h",
             '25': "📝 **채굴 청산 타임프레임** 입력 (예: 1h)\n1m, 5m, 15m, 30m, 1h, 4h",
-            '26': "📝 **R2 필터** 메뉴로 이동합니다.",
-            '27': "📝 **R2 기준값** 입력 (0.1 ~ 0.5 권장)",
-            '30': "📝 **CHOP 필터** 메뉴로 이동합니다.",
-            '31': "📝 **CHOP 기준값** 입력 (예: 50.0)",
-            '33': "📝 **CC Exit 필터**를 ON/OFF 합니다.",
-            '34': "📝 **CC 설정** 입력 (예: 0.70 또는 0.70,14)",
             '35': "📝 **듀얼모드 변경** (1=스탠다드, 2=스캘핑)",
             '36': "📝 **ROE 자동청산** ON/OFF 토글",
             '37': "📝 **손절 자동청산** ON/OFF 토글",
@@ -7480,8 +7114,7 @@ class MainController:
         if self.is_upbit_mode():
             blocked_choices = {
                 '1', '2', '3', '4', '5', '6', '8', '10', '11', '12', '13', '14', '15',
-                '16', '17', '18', '19', '20', '21', '23', '24', '25', '26', '27', '30',
-                '31', '32', '33', '34', '35', '36', '37', '38', '41', '00'
+                '16', '19', '20', '21', '23', '24', '25', '35', '36', '37', '38', '41', '00'
             }
             if text in blocked_choices:
                 await update.message.reply_text("ℹ️ 업비트 모드에서는 업비트 전용 메뉴(22, 43~48)만 사용합니다.")
@@ -7566,47 +7199,8 @@ class MainController:
             await update.message.reply_text(f"⚙️ 시간별 리포트: {status}")
             await self.show_setup_menu(update)
             return SELECT
-        elif text == '26':
-            # R2 Filter Menu
-            keyboard = [[KeyboardButton("1. Entry Toggle"), KeyboardButton("2. Exit Toggle")]]
-            await update.message.reply_text(
-                "📉 **R2 필터 설정**\n1. Entry 토글\n2. Exit 토글",
-                reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-            )
-            return "R2_SELECT"
-
         elif text in ('28', '29'):
             await update.message.reply_text("ℹ️ Hurst 필터는 코드에서 제거되었습니다.")
-            return SELECT
-
-        elif text == '30':
-            # Chop Filter Menu
-            keyboard = [[KeyboardButton("1. Entry Toggle"), KeyboardButton("2. Exit Toggle")]]
-            await update.message.reply_text(
-                "🌀 **CHOP 필터 설정**\n1. Entry 토글\n2. Exit 토글",
-                reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-            )
-            return "CHOP_SELECT"
-
-        elif text == '32':
-            # Kalman Filter Menu
-            keyboard = [[KeyboardButton("1. Entry Toggle"), KeyboardButton("2. Exit Toggle")]]
-            await update.message.reply_text(
-                "🚀 **Kalman 필터 설정**\n1. Entry 토글\n2. Exit 토글",
-                reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-            )
-            return "KALMAN_SELECT"
-
-            return "KALMAN_SELECT"
-            
-        elif text == '33':
-            # CC Filter Menu (Exit only)
-            curr = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('cc_exit_enabled', False)
-            new_val = not curr
-            await self.cfg.update_value(['signal_engine', 'common_settings', 'cc_exit_enabled'], new_val)
-            status = "ON" if new_val else "OFF"
-            await update.message.reply_text(f"✅ CC 필터 (Exit): {status}")
-            await self.show_setup_menu(update)
             return SELECT
             
         elif text == '21':
@@ -7630,12 +7224,6 @@ class MainController:
             await update.message.reply_text(prompts['24'])
             return INPUT
 
-        elif text == '27':
-            # R2 Threshold Input
-            await update.message.reply_text(prompts['27'])
-            return INPUT
-        elif text == '31':
-            return INPUT
         elif text in prompts:
             if text == '20':
                 await update.message.reply_text(prompts[text])
@@ -7704,6 +7292,12 @@ class MainController:
         val = update.message.text
         
         try:
+            removed_strategy_filter_choices = {'10', '17', '18', '26', '27', '30', '31', '32', '33', '34'}
+            if choice in removed_strategy_filter_choices:
+                await update.message.reply_text("ℹ️ 해당 전략/필터 항목은 현재 코어 UT 설정에서 제거되었습니다.")
+                await self.show_setup_menu(update)
+                return SELECT
+
             if choice == '1':
                 v = int(val)
                 # ?덈쾭由ъ? 理쒕? 20諛??쒗븳 (?ъ슜???붿껌: 5 -> 20)
@@ -7929,14 +7523,10 @@ class MainController:
             elif choice == '16':
                 # ?꾨왂 蹂寃?(踰덊샇 ?먮뒗 ?대쫫?쇰줈 ?좏깮)
                 strategy_map = {
-                    '1': 'sma',
-                    '2': 'hma',
-                    '3': 'cameron',
-                    '4': 'utbot',
-                    '5': 'rsibb',
-                    '6': 'utrsibb',
-                    '7': 'utrsi',
-                    '8': 'utbb'
+                    '1': 'utbot',
+                    '2': 'utrsibb',
+                    '3': 'utrsi',
+                    '4': 'utbb'
                 }
                 val_lower = val.lower().strip()
                 
@@ -7944,23 +7534,10 @@ class MainController:
                 if val_lower in strategy_map:
                     val_lower = strategy_map[val_lower]
                 
-                if val_lower in CORE_STRATEGIES:
+                if val_lower in UT_ONLY_STRATEGIES:
                     await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], val_lower)
                     signal_engine = self.engines.get('signal')
-                    # ?꾨왂蹂??곹깭 珥덇린??
-                    if val_lower == 'microvbo' and signal_engine:
-                        signal_engine.vbo_entry_price = None
-                        signal_engine.vbo_entry_atr = None
-                        signal_engine.vbo_breakout_level = None
-                    elif val_lower == 'fractalfisher' and signal_engine:
-                        signal_engine.fisher_entry_price = None
-                        signal_engine.fisher_entry_atr = None
-                        signal_engine.fisher_trailing_stop = None
-                        signal_engine.fisher_hurst = None
-                        signal_engine.fisher_value = None
-                    elif val_lower == 'cameron' and signal_engine:
-                        signal_engine.cameron_states = {}
-                    elif val_lower in (STATEFUL_UT_STRATEGIES | {'rsibb'}) and signal_engine:
+                    if signal_engine:
                         self._reset_signal_engine_runtime_state(
                             reset_entry_cache=True,
                             reset_stateful_strategy=True
@@ -7968,8 +7545,8 @@ class MainController:
                     await update.message.reply_text(f"✅ 전략 변경: {val_lower.upper()}")
                 else:
                     await update.message.reply_text(
-                        "❌ 1~8 또는 sma/hma/cameron/utbot/rsibb/utrsibb/utrsi/utbb를 입력하세요.\n"
-                        "1=SMA, 2=HMA, 3=CAMERON, 4=UTBOT, 5=RSIBB, 6=UTRSIBB, 7=UTRSI, 8=UTBB"
+                        "❌ 1~4 또는 utbot/utrsibb/utrsi/utbb를 입력하세요.\n"
+                        "1=UTBOT, 2=UTRSIBB, 3=UTRSI, 4=UTBB"
                     )
                     return SELECT
             
@@ -8586,10 +8163,7 @@ class MainController:
                 INPUT: [MessageHandler(text_filter, self.setup_input)],
                 SYMBOL_INPUT: [MessageHandler(text_filter, self.setup_symbol_input)],
                 DIRECTION_SELECT: [MessageHandler(text_filter, self.setup_direction_select)],
-                ENGINE_SELECT: [MessageHandler(text_filter, self.setup_engine_select)],
-                "R2_SELECT": [MessageHandler(text_filter, self.setup_r2_select)],
-                "CHOP_SELECT": [MessageHandler(text_filter, self.setup_chop_select)],
-                "KALMAN_SELECT": [MessageHandler(text_filter, self.setup_kalman_select)]
+                ENGINE_SELECT: [MessageHandler(text_filter, self.setup_engine_select)]
             },
             fallbacks=[
                 CommandHandler('setup', self.setup_entry),
@@ -9096,28 +8670,29 @@ class MainController:
                             msg += f"진단메모: `{diag_note}`\n"
 
                     f_cfg = d.get('filter_config', {})
-                    entry_st = d.get('entry_filters', {})
-                    exit_st = d.get('exit_filters', {})
+                    if f_cfg:
+                        entry_st = d.get('entry_filters', {})
+                        exit_st = d.get('exit_filters', {})
 
-                    def get_st_text(st_dict, cfg_key, val_key, pass_key, is_entry=True):
-                        en_key = 'en_entry' if is_entry else 'en_exit'
-                        if not f_cfg.get(cfg_key, {}).get(en_key, False):
-                            return "-"
-                        val = st_dict.get(val_key, 0.0)
-                        if val == 0.0 and not is_entry:
-                            return "~"
-                        return "PASS" if st_dict.get(pass_key, False) else "FAIL"
+                        def get_st_text(st_dict, cfg_key, val_key, pass_key, is_entry=True):
+                            en_key = 'en_entry' if is_entry else 'en_exit'
+                            if not f_cfg.get(cfg_key, {}).get(en_key, False):
+                                return "-"
+                            val = st_dict.get(val_key, 0.0)
+                            if val == 0.0 and not is_entry:
+                                return "~"
+                            return "PASS" if st_dict.get(pass_key, False) else "FAIL"
 
-                    e_r2 = get_st_text(entry_st, 'r2', 'r2_val', 'r2_pass', True)
-                    e_c = get_st_text(entry_st, 'chop', 'chop_val', 'chop_pass', True)
+                        e_r2 = get_st_text(entry_st, 'r2', 'r2_val', 'r2_pass', True)
+                        e_c = get_st_text(entry_st, 'chop', 'chop_val', 'chop_pass', True)
 
-                    x_r2 = get_st_text(exit_st, 'r2', 'r2_val', 'r2_pass', False)
-                    x_c = get_st_text(exit_st, 'chop', 'chop_val', 'chop_pass', False)
-                    x_cc = get_st_text(exit_st, 'cc', 'cc_val', 'cc_pass', False)
-                    cc_val = exit_st.get('cc_val', 0.0)
+                        x_r2 = get_st_text(exit_st, 'r2', 'r2_val', 'r2_pass', False)
+                        x_c = get_st_text(exit_st, 'chop', 'chop_val', 'chop_pass', False)
+                        x_cc = get_st_text(exit_st, 'cc', 'cc_val', 'cc_pass', False)
+                        cc_val = exit_st.get('cc_val', 0.0)
 
-                    msg += f"🧪 필터(진입): R2 {e_r2} | CHOP {e_c}\n"
-                    msg += f"🧪 필터(청산): R2 {x_r2} | CHOP {x_c} | CC {x_cc}({cc_val:.2f})\n"
+                        msg += f"🧪 필터(진입): R2 {e_r2} | CHOP {e_c}\n"
+                        msg += f"🧪 필터(청산): R2 {x_r2} | CHOP {x_c} | CC {x_cc}({cc_val:.2f})\n"
 
                     active_strat = d.get('active_strategy', '')
                     if active_strat == 'MICROVBO':
