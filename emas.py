@@ -3823,6 +3823,279 @@ class SignalEngine(BaseEngine):
         elif pos:
             self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {strategy_name} 반대신호 대기"
 
+    def _build_utbb_long_exit_note(self, *, ut_signal=None, ut_state=None, bb_reentry_down=False):
+        if ut_signal == 'short':
+            return "UT short signal"
+        if ut_state == 'short':
+            return "UT short state"
+        if bb_reentry_down:
+            return "BB upper reentry down"
+        return "BB middle above two bearish candles"
+
+    def _build_utbb_short_exit_note(self, *, ut_signal=None, ut_state=None, special_short_mode=None):
+        if ut_signal == 'long':
+            return 'short exit by UT long signal'
+        if ut_state == 'long':
+            return 'short exit by UT long state'
+        if special_short_mode == 'mid_rebound_fail':
+            return 'short exit by BB middle reentry up'
+        if special_short_mode == 'lower_reentry':
+            return 'short exit by BB lower reentry up'
+        return 'short exit by BB lower breakout'
+
+    def _build_utbb_hold_note(self, strategy_name, pos_side, *, special_long_active=False, special_short_active=False, special_short_mode=None):
+        if pos_side == 'long' and special_long_active:
+            return "특수 LONG 하향돌파 청산 대기"
+        if pos_side == 'long':
+            return "LONG 청산 조건 대기 (UT 숏상태 또는 BB 상단 하향 돌파 또는 중간선 위 음봉 2개)"
+        if pos_side == 'short' and special_short_mode == 'mid_rebound_fail':
+            return "특수 SHORT 중간선 상향돌파 청산 대기"
+        if pos_side == 'short' and special_short_active:
+            return "특수 SHORT 하단 상향돌파 청산 대기"
+        if pos_side == 'short':
+            return f"{strategy_name} 청산 조건 대기 (UT 롱 또는 BB 하단 돌파)"
+        return f"{strategy_name} 청산 조건 대기"
+
+    async def _handle_utbb_primary_strategy(self, symbol, k, pos, strategy_name, raw_strategy_sig, raw_state_sig, raw_hybrid_detail, sig):
+        ut_signal = raw_hybrid_detail.get('ut_signal')
+        ut_state = raw_hybrid_detail.get('ut_state')
+        ut_long_fresh = bool(raw_hybrid_detail.get('ut_long_fresh'))
+        bb_long_fresh = bool(raw_hybrid_detail.get('bb_long_fresh'))
+        long_pair_source = raw_hybrid_detail.get('utbb_long_pair_source')
+        bb_upper_breakout = bool(raw_hybrid_detail.get('bb_upper_breakout'))
+        bb_reentry_down = bool(raw_hybrid_detail.get('bb_reentry_down'))
+        bb_mid_two_bearish_exit = bool(raw_hybrid_detail.get('bb_mid_two_bearish_exit'))
+        bb_reentry_up = bool(raw_hybrid_detail.get('bb_reentry_up'))
+        bb_mid_reentry_up = bool(raw_hybrid_detail.get('bb_mid_reentry_up'))
+        bb_lower_breakout = bool(raw_hybrid_detail.get('bb_lower_breakout'))
+        short_setup_ready = bool(raw_hybrid_detail.get('bb_short_setup_ready'))
+        short_mid_ready = bool(raw_hybrid_detail.get('bb_mid_short_ready'))
+        short_rebound_fail_ready = bool(raw_hybrid_detail.get('bb_mid_rebound_fail_ready'))
+        short_rebound_fail_bull_count = int(raw_hybrid_detail.get('bb_mid_rebound_fail_bull_count') or 0)
+        special_short_candidate = bool(raw_hybrid_detail.get('bb_special_short_candidate'))
+        entry_sig = sig
+        special_long_active = self._is_utbb_special_long_active(symbol)
+        special_short_active = self._is_utbb_special_short_active(symbol)
+        special_short_mode = self._get_utbb_special_short_mode(symbol)
+
+        if pos and pos['side'] == 'long' and (
+            ut_state == 'short'
+            or bb_reentry_down
+            or ((not special_long_active) and bb_mid_two_bearish_exit)
+        ):
+            exit_note = self._build_utbb_long_exit_note(
+                ut_signal=ut_signal,
+                ut_state=ut_state,
+                bb_reentry_down=bb_reentry_down
+            )
+            self._update_stateful_diag(
+                symbol,
+                stage='flip_detected',
+                strategy=strategy_name,
+                raw_state=(raw_state_sig or 'none'),
+                raw_signal=(raw_strategy_sig or 'none'),
+                entry_sig=(entry_sig or 'none'),
+                pos_side=str(pos['side']).upper(),
+                note=f'long exit by {exit_note} (special={special_long_active})'
+            )
+            await self._notify_stateful_diag(symbol)
+            logger.info(f"[{strategy_name}] LONG exit trigger: {exit_note}")
+            await self.exit_position(symbol, f"{strategy_name}_LongExit")
+            await asyncio.sleep(1)
+            self.position_cache = None
+            check_pos = await self.get_server_position(symbol, use_cache=False)
+            if not check_pos:
+                self._clear_utbb_special_long_state(symbol)
+                self._update_stateful_diag(
+                    symbol,
+                    stage='flip_exit_done',
+                    pos_side='NONE',
+                    note=f'long exit complete ({exit_note})'
+                )
+                if ut_state == 'short' and entry_sig == 'short':
+                    short_note = self._build_utbb_short_entry_note(
+                        ut_signal=ut_signal,
+                        short_mid_ready=short_mid_ready,
+                        short_rebound_fail_ready=short_rebound_fail_ready,
+                        short_rebound_fail_bull_count=short_rebound_fail_bull_count,
+                        special_short_candidate=special_short_candidate
+                    )
+                    if special_short_candidate:
+                        self.last_entry_reason[symbol] = (
+                            f"{strategy_name} 롱 청산 후 특수 SHORT 재진입"
+                            if ut_signal == 'short'
+                            else f"{strategy_name} 롱 청산 후 UT 숏상태로 특수 SHORT 재진입"
+                        )
+                    else:
+                        self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 후 {short_note} 재진입"
+                    self._apply_utbb_short_entry_state(
+                        symbol,
+                        raw_hybrid_detail,
+                        special_short_candidate=special_short_candidate,
+                        short_rebound_fail_ready=short_rebound_fail_ready
+                    )
+                    self._clear_utbb_long_setup(symbol)
+                    await self.entry(symbol, 'short', float(k['c']))
+                    if short_setup_ready:
+                        self._consume_utbb_short_setup(symbol)
+                    self._update_stateful_diag(
+                        symbol,
+                        stage='flip_reentered',
+                        entry_sig='short',
+                        pos_side='SHORT',
+                        note='re-entered short after long exit'
+                    )
+                else:
+                    self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 완료, 다음 진입 신호 대기"
+                    await self._notify_stateful_diag(symbol)
+            else:
+                self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 미확인, 상태 재동기화 재시도 대기"
+                self.last_stateful_retry_ts[symbol] = 0.0
+                self._update_stateful_diag(
+                    symbol,
+                    stage='flip_still_open',
+                    pos_side=str(check_pos['side']).upper(),
+                    note='position still open after long exit attempt'
+                )
+                await self._notify_stateful_diag(symbol, force=True)
+            return
+
+        if pos and pos['side'] == 'short' and (
+            ut_state == 'long'
+            or ((not special_short_active) and bb_lower_breakout)
+            or (special_short_mode == 'lower_reentry' and bb_reentry_up)
+            or (special_short_mode == 'mid_rebound_fail' and bb_mid_reentry_up)
+        ):
+            short_exit_note = self._build_utbb_short_exit_note(
+                ut_signal=ut_signal,
+                ut_state=ut_state,
+                special_short_mode=special_short_mode
+            )
+            self._update_stateful_diag(
+                symbol,
+                stage='flip_detected',
+                strategy=strategy_name,
+                raw_state=(raw_state_sig or 'none'),
+                raw_signal=(raw_strategy_sig or 'none'),
+                entry_sig=(entry_sig or 'none'),
+                pos_side=str(pos['side']).upper(),
+                note=short_exit_note
+            )
+            await self._notify_stateful_diag(symbol)
+            logger.info(f"[{strategy_name}] SHORT exit trigger: {short_exit_note.replace('short exit by ', '')}")
+            await self.exit_position(symbol, f"{strategy_name}_ShortExit")
+            await asyncio.sleep(1)
+            self.position_cache = None
+            check_pos = await self.get_server_position(symbol, use_cache=False)
+            if not check_pos:
+                self._clear_utbb_special_short_state(symbol)
+                self._update_stateful_diag(
+                    symbol,
+                    stage='flip_exit_done',
+                    pos_side='NONE',
+                    note='short exit complete'
+                )
+                if entry_sig == 'long':
+                    self.last_entry_reason[symbol] = self._build_utbb_long_entry_reason(
+                        strategy_name,
+                        ut_signal=ut_signal,
+                        long_pair_source=long_pair_source,
+                        ut_long_fresh=ut_long_fresh,
+                        bb_long_fresh=bb_long_fresh,
+                        bb_upper_breakout=bb_upper_breakout,
+                        reentry=True
+                    )
+                    self._apply_utbb_long_entry_state(symbol, raw_hybrid_detail, bb_upper_breakout)
+                    self._clear_utbb_long_setup(symbol)
+                    self._clear_utbb_short_setup(symbol)
+                    await self.entry(symbol, 'long', float(k['c']))
+                    self._update_stateful_diag(
+                        symbol,
+                        stage='flip_reentered',
+                        entry_sig='long',
+                        pos_side='LONG',
+                        note='re-entered long after short exit'
+                    )
+                else:
+                    self.last_entry_reason[symbol] = (
+                        f"{strategy_name} 숏 청산 완료, {'LONG 신호' if ut_state == 'long' else '다음 신호'} 대기"
+                    )
+                    self._clear_utbb_special_long_state(symbol)
+                    self._clear_utbb_special_short_state(symbol)
+                    await self._notify_stateful_diag(symbol)
+            else:
+                self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 미확인, 상태 재동기화 재시도 대기"
+                self.last_stateful_retry_ts[symbol] = 0.0
+                self._update_stateful_diag(
+                    symbol,
+                    stage='flip_still_open',
+                    pos_side=str(check_pos['side']).upper(),
+                    note='position still open after short exit attempt'
+                )
+                await self._notify_stateful_diag(symbol, force=True)
+            return
+
+        if not pos and entry_sig == 'long':
+            self.last_entry_reason[symbol] = self._build_utbb_long_entry_reason(
+                strategy_name,
+                ut_signal=ut_signal,
+                long_pair_source=long_pair_source,
+                ut_long_fresh=ut_long_fresh,
+                bb_long_fresh=bb_long_fresh,
+                bb_upper_breakout=bb_upper_breakout
+            )
+            self._apply_utbb_long_entry_state(symbol, raw_hybrid_detail, bb_upper_breakout)
+            self._clear_utbb_long_setup(symbol)
+            self._clear_utbb_short_setup(symbol)
+            self._clear_utbb_special_short_state(symbol)
+            logger.info(f"[{strategy_name}] New LONG entry")
+            await self.entry(symbol, 'long', float(k['c']))
+            return
+
+        if not pos and entry_sig == 'short':
+            short_note = self._build_utbb_short_entry_note(
+                ut_signal=ut_signal,
+                short_mid_ready=short_mid_ready,
+                short_rebound_fail_ready=short_rebound_fail_ready,
+                short_rebound_fail_bull_count=short_rebound_fail_bull_count,
+                special_short_candidate=special_short_candidate
+            )
+            self.last_entry_reason[symbol] = f"{strategy_name} {short_note} -> SHORT 진입"
+            self._apply_utbb_short_entry_state(
+                symbol,
+                raw_hybrid_detail,
+                special_short_candidate=special_short_candidate,
+                short_rebound_fail_ready=short_rebound_fail_ready
+            )
+            self._clear_utbb_long_setup(symbol)
+            self._clear_utbb_special_long_state(symbol)
+            logger.info(f"[{strategy_name}] New SHORT entry")
+            await self.entry(symbol, 'short', float(k['c']))
+            if short_setup_ready:
+                self._consume_utbb_short_setup(symbol)
+            return
+
+        if not pos and short_setup_ready:
+            self._clear_utbb_special_long_state(symbol)
+            self._clear_utbb_special_short_state(symbol)
+            self.last_entry_reason[symbol] = f"{strategy_name} BB 숏 셋업 저장 중, UT 숏신호 대기"
+            return
+
+        if not pos:
+            self._clear_utbb_special_long_state(symbol)
+            self._clear_utbb_special_short_state(symbol)
+            return
+
+        if pos:
+            hold_note = self._build_utbb_hold_note(
+                strategy_name,
+                pos['side'],
+                special_long_active=special_long_active,
+                special_short_active=special_short_active,
+                special_short_mode=special_short_mode
+            )
+            self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {hold_note}"
+
     async def process_primary_candle(self, symbol, k, force=False):
         candle_time = k['t']
         
@@ -3986,247 +4259,16 @@ class SignalEngine(BaseEngine):
                 )
 
             elif active_strategy == 'utbb':
-                ut_signal = raw_hybrid_detail.get('ut_signal')
-                ut_state = raw_hybrid_detail.get('ut_state')
-                ut_long_fresh = bool(raw_hybrid_detail.get('ut_long_fresh'))
-                bb_long_fresh = bool(raw_hybrid_detail.get('bb_long_fresh'))
-                long_pair_source = raw_hybrid_detail.get('utbb_long_pair_source')
-                bb_upper_breakout = bool(raw_hybrid_detail.get('bb_upper_breakout'))
-                bb_reentry_down = bool(raw_hybrid_detail.get('bb_reentry_down'))
-                bb_mid_two_bearish_exit = bool(raw_hybrid_detail.get('bb_mid_two_bearish_exit'))
-                bb_reentry_up = bool(raw_hybrid_detail.get('bb_reentry_up'))
-                bb_mid_reentry_up = bool(raw_hybrid_detail.get('bb_mid_reentry_up'))
-                bb_lower_breakout = bool(raw_hybrid_detail.get('bb_lower_breakout'))
-                short_setup_ready = bool(raw_hybrid_detail.get('bb_short_setup_ready'))
-                short_mid_ready = bool(raw_hybrid_detail.get('bb_mid_short_ready'))
-                short_rebound_fail_ready = bool(raw_hybrid_detail.get('bb_mid_rebound_fail_ready'))
-                short_rebound_fail_bull_count = int(raw_hybrid_detail.get('bb_mid_rebound_fail_bull_count') or 0)
-                special_short_candidate = bool(raw_hybrid_detail.get('bb_special_short_candidate'))
-                entry_sig = sig
-                special_long_active = self._is_utbb_special_long_active(symbol)
-                special_short_active = self._is_utbb_special_short_active(symbol)
-                special_short_mode = self._get_utbb_special_short_mode(symbol)
-
-                if pos and pos['side'] == 'long' and (
-                    ut_state == 'short'
-                    or bb_reentry_down
-                    or ((not special_long_active) and bb_mid_two_bearish_exit)
-                ):
-                    if ut_signal == 'short':
-                        exit_note = "UT short signal"
-                    elif ut_state == 'short':
-                        exit_note = "UT short state"
-                    elif bb_reentry_down:
-                        exit_note = "BB upper reentry down"
-                    else:
-                        exit_note = "BB middle above two bearish candles"
-                    self._update_stateful_diag(
-                        symbol,
-                        stage='flip_detected',
-                        strategy=strategy_name,
-                        raw_state=(raw_state_sig or 'none'),
-                        raw_signal=(raw_strategy_sig or 'none'),
-                        entry_sig=(entry_sig or 'none'),
-                        pos_side=str(pos['side']).upper(),
-                        note=f'long exit by {exit_note} (special={special_long_active})'
-                    )
-                    await self._notify_stateful_diag(symbol)
-                    logger.info(f"[{strategy_name}] LONG exit trigger: {exit_note}")
-                    await self.exit_position(symbol, f"{strategy_name}_LongExit")
-                    await asyncio.sleep(1)
-                    self.position_cache = None
-                    check_pos = await self.get_server_position(symbol, use_cache=False)
-                    if not check_pos:
-                        self._clear_utbb_special_long_state(symbol)
-                        self._update_stateful_diag(
-                            symbol,
-                            stage='flip_exit_done',
-                            pos_side='NONE',
-                            note=f'long exit complete ({exit_note})'
-                        )
-                        if ut_state == 'short' and entry_sig == 'short':
-                            short_note = self._build_utbb_short_entry_note(
-                                ut_signal=ut_signal,
-                                short_mid_ready=short_mid_ready,
-                                short_rebound_fail_ready=short_rebound_fail_ready,
-                                short_rebound_fail_bull_count=short_rebound_fail_bull_count,
-                                special_short_candidate=special_short_candidate
-                            )
-                            if special_short_candidate:
-                                self.last_entry_reason[symbol] = (
-                                    f"{strategy_name} 롱 청산 후 특수 SHORT 재진입"
-                                    if ut_signal == 'short'
-                                    else f"{strategy_name} 롱 청산 후 UT 숏상태로 특수 SHORT 재진입"
-                                )
-                            else:
-                                self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 후 {short_note} 재진입"
-                            self._apply_utbb_short_entry_state(
-                                symbol,
-                                raw_hybrid_detail,
-                                special_short_candidate=special_short_candidate,
-                                short_rebound_fail_ready=short_rebound_fail_ready
-                            )
-                            self._clear_utbb_long_setup(symbol)
-                            await self.entry(symbol, 'short', float(k['c']))
-                            if short_setup_ready:
-                                self._consume_utbb_short_setup(symbol)
-                            self._update_stateful_diag(
-                                symbol,
-                                stage='flip_reentered',
-                                entry_sig='short',
-                                pos_side='SHORT',
-                                note='re-entered short after long exit'
-                            )
-                        else:
-                            self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 완료, 다음 진입 신호 대기"
-                            await self._notify_stateful_diag(symbol)
-                    else:
-                        self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 미확인, 상태 재동기화 재시도 대기"
-                        self.last_stateful_retry_ts[symbol] = 0.0
-                        self._update_stateful_diag(
-                            symbol,
-                            stage='flip_still_open',
-                            pos_side=str(check_pos['side']).upper(),
-                            note='position still open after long exit attempt'
-                        )
-                        await self._notify_stateful_diag(symbol, force=True)
-
-                elif pos and pos['side'] == 'short' and (
-                    ut_state == 'long'
-                    or ((not special_short_active) and bb_lower_breakout)
-                    or (special_short_mode == 'lower_reentry' and bb_reentry_up)
-                    or (special_short_mode == 'mid_rebound_fail' and bb_mid_reentry_up)
-                ):
-                    if ut_signal == 'long':
-                        short_exit_note = 'short exit by UT long signal'
-                    elif ut_state == 'long':
-                        short_exit_note = 'short exit by UT long state'
-                    elif special_short_mode == 'mid_rebound_fail':
-                        short_exit_note = 'short exit by BB middle reentry up'
-                    elif special_short_mode == 'lower_reentry':
-                        short_exit_note = 'short exit by BB lower reentry up'
-                    else:
-                        short_exit_note = 'short exit by BB lower breakout'
-                    self._update_stateful_diag(
-                        symbol,
-                        stage='flip_detected',
-                        strategy=strategy_name,
-                        raw_state=(raw_state_sig or 'none'),
-                        raw_signal=(raw_strategy_sig or 'none'),
-                        entry_sig=(entry_sig or 'none'),
-                        pos_side=str(pos['side']).upper(),
-                        note=short_exit_note
-                    )
-                    await self._notify_stateful_diag(symbol)
-                    logger.info(f"[{strategy_name}] SHORT exit trigger: {short_exit_note.replace('short exit by ', '')}")
-                    await self.exit_position(symbol, f"{strategy_name}_ShortExit")
-                    await asyncio.sleep(1)
-                    self.position_cache = None
-                    check_pos = await self.get_server_position(symbol, use_cache=False)
-                    if not check_pos:
-                        self._clear_utbb_special_short_state(symbol)
-                        self._update_stateful_diag(
-                            symbol,
-                            stage='flip_exit_done',
-                            pos_side='NONE',
-                            note='short exit complete'
-                        )
-                        if entry_sig == 'long':
-                            self.last_entry_reason[symbol] = self._build_utbb_long_entry_reason(
-                                strategy_name,
-                                ut_signal=ut_signal,
-                                long_pair_source=long_pair_source,
-                                ut_long_fresh=ut_long_fresh,
-                                bb_long_fresh=bb_long_fresh,
-                                bb_upper_breakout=bb_upper_breakout,
-                                reentry=True
-                            )
-                            self._apply_utbb_long_entry_state(symbol, raw_hybrid_detail, bb_upper_breakout)
-                            self._clear_utbb_long_setup(symbol)
-                            self._clear_utbb_short_setup(symbol)
-                            await self.entry(symbol, 'long', float(k['c']))
-                            self._update_stateful_diag(
-                                symbol,
-                                stage='flip_reentered',
-                                entry_sig='long',
-                                pos_side='LONG',
-                                note='re-entered long after short exit'
-                            )
-                        else:
-                            self.last_entry_reason[symbol] = (
-                                f"{strategy_name} 숏 청산 완료, {'LONG 신호' if ut_state == 'long' else '다음 신호'} 대기"
-                            )
-                            self._clear_utbb_special_long_state(symbol)
-                            self._clear_utbb_special_short_state(symbol)
-                            await self._notify_stateful_diag(symbol)
-                    else:
-                        self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 미확인, 상태 재동기화 재시도 대기"
-                        self.last_stateful_retry_ts[symbol] = 0.0
-                        self._update_stateful_diag(
-                            symbol,
-                            stage='flip_still_open',
-                            pos_side=str(check_pos['side']).upper(),
-                            note='position still open after short exit attempt'
-                        )
-                        await self._notify_stateful_diag(symbol, force=True)
-
-                elif not pos and entry_sig == 'long':
-                    self.last_entry_reason[symbol] = self._build_utbb_long_entry_reason(
-                        strategy_name,
-                        ut_signal=ut_signal,
-                        long_pair_source=long_pair_source,
-                        ut_long_fresh=ut_long_fresh,
-                        bb_long_fresh=bb_long_fresh,
-                        bb_upper_breakout=bb_upper_breakout
-                    )
-                    self._apply_utbb_long_entry_state(symbol, raw_hybrid_detail, bb_upper_breakout)
-                    self._clear_utbb_long_setup(symbol)
-                    self._clear_utbb_short_setup(symbol)
-                    self._clear_utbb_special_short_state(symbol)
-                    logger.info(f"[{strategy_name}] New LONG entry")
-                    await self.entry(symbol, 'long', float(k['c']))
-                elif not pos and entry_sig == 'short':
-                    short_note = self._build_utbb_short_entry_note(
-                        ut_signal=ut_signal,
-                        short_mid_ready=short_mid_ready,
-                        short_rebound_fail_ready=short_rebound_fail_ready,
-                        short_rebound_fail_bull_count=short_rebound_fail_bull_count,
-                        special_short_candidate=special_short_candidate
-                    )
-                    self.last_entry_reason[symbol] = f"{strategy_name} {short_note} -> SHORT 진입"
-                    self._apply_utbb_short_entry_state(
-                        symbol,
-                        raw_hybrid_detail,
-                        special_short_candidate=special_short_candidate,
-                        short_rebound_fail_ready=short_rebound_fail_ready
-                    )
-                    self._clear_utbb_long_setup(symbol)
-                    self._clear_utbb_special_long_state(symbol)
-                    logger.info(f"[{strategy_name}] New SHORT entry")
-                    await self.entry(symbol, 'short', float(k['c']))
-                    if short_setup_ready:
-                        self._consume_utbb_short_setup(symbol)
-                elif not pos and short_setup_ready:
-                    self._clear_utbb_special_long_state(symbol)
-                    self._clear_utbb_special_short_state(symbol)
-                    self.last_entry_reason[symbol] = f"{strategy_name} BB 숏 셋업 저장 중, UT 숏신호 대기"
-                elif not pos:
-                    self._clear_utbb_special_long_state(symbol)
-                    self._clear_utbb_special_short_state(symbol)
-                elif pos:
-                    if pos['side'] == 'long' and special_long_active:
-                        hold_note = "특수 LONG 하향돌파 청산 대기"
-                    elif pos['side'] == 'long':
-                        hold_note = "LONG 청산 조건 대기 (UT 숏상태 또는 BB 상단 하향 돌파 또는 중간선 위 음봉 2개)"
-                    elif pos['side'] == 'short' and special_short_mode == 'mid_rebound_fail':
-                        hold_note = "특수 SHORT 중간선 상향돌파 청산 대기"
-                    elif pos['side'] == 'short' and special_short_active:
-                        hold_note = "특수 SHORT 하단 상향돌파 청산 대기"
-                    elif pos['side'] == 'short':
-                        hold_note = f"{strategy_name} 청산 조건 대기 (UT 롱 또는 BB 하단 돌파)"
-                    else:
-                        hold_note = f"{strategy_name} 청산 조건 대기"
-                    self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {hold_note}"
+                await self._handle_utbb_primary_strategy(
+                    symbol,
+                    k,
+                    pos,
+                    strategy_name,
+                    raw_strategy_sig,
+                    raw_state_sig,
+                    raw_hybrid_detail,
+                    sig
+                )
 
             elif active_strategy in UT_HYBRID_STRATEGIES:
                 await self._handle_ut_hybrid_primary_strategy(
