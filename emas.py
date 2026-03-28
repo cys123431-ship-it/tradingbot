@@ -1595,6 +1595,7 @@ class SignalEngine(BaseEngine):
         self.utbb_special_short_state = {}
         self.utsmc_pending_entries = {}
         self.utsmc_last_entry_signal_ts = {}
+        self.utsmc_entry_invalidation = {}
         
         self.last_heartbeat = 0
         self.consecutive_errors = 0
@@ -1661,6 +1662,7 @@ class SignalEngine(BaseEngine):
         self.utbb_special_short_state = {}
         self.utsmc_pending_entries = {}
         self.utsmc_last_entry_signal_ts = {}
+        self.utsmc_entry_invalidation = {}
 
     def reset_signal_runtime_state(self, *, reset_entry_cache=False, reset_exit_cache=False, reset_stateful_strategy=False):
         if reset_entry_cache:
@@ -2129,6 +2131,10 @@ class SignalEngine(BaseEngine):
 
         valid = pd.DataFrame({
             'timestamp': closed['timestamp'],
+            'open': closed['open'].astype(float),
+            'high': closed['high'].astype(float),
+            'low': closed['low'].astype(float),
+            'close': closed['close'].astype(float),
             'src': src_series.astype(float),
             'atr': atr_series.astype(float)
         }).dropna().reset_index(drop=True)
@@ -2175,6 +2181,10 @@ class SignalEngine(BaseEngine):
             'curr_stop': curr_stop,
             'curr_atr': float(curr_row['atr']),
             'signal_ts': int(curr_row['timestamp']),
+            'signal_open': float(curr_row['open']),
+            'signal_high': float(curr_row['high']),
+            'signal_low': float(curr_row['low']),
+            'signal_close': float(curr_row['close']),
             'bias_side': 'long' if curr_src > curr_stop else 'short' if curr_src < curr_stop else None
         }
 
@@ -2477,13 +2487,15 @@ class SignalEngine(BaseEngine):
         )
         return None, reason, detail
 
-    def _set_utsmc_pending_entry(self, symbol, side, signal_ts, execute_ts):
+    def _set_utsmc_pending_entry(self, symbol, side, signal_ts, execute_ts, signal_high=None, signal_low=None):
         if side not in {'long', 'short'}:
             return
         self.utsmc_pending_entries[symbol] = {
             'side': side,
             'signal_ts': int(signal_ts or 0),
-            'execute_ts': int(execute_ts or 0)
+            'execute_ts': int(execute_ts or 0),
+            'signal_high': float(signal_high) if signal_high is not None else None,
+            'signal_low': float(signal_low) if signal_low is not None else None
         }
 
     def _get_utsmc_pending_entry(self, symbol):
@@ -2491,6 +2503,22 @@ class SignalEngine(BaseEngine):
 
     def _clear_utsmc_pending_entry(self, symbol):
         self.utsmc_pending_entries.pop(symbol, None)
+
+    def _set_utsmc_entry_invalidation(self, symbol, side, signal_ts, signal_high=None, signal_low=None):
+        if side not in {'long', 'short'}:
+            return
+        self.utsmc_entry_invalidation[symbol] = {
+            'side': str(side).lower(),
+            'signal_ts': int(signal_ts or 0),
+            'signal_high': float(signal_high) if signal_high is not None else None,
+            'signal_low': float(signal_low) if signal_low is not None else None
+        }
+
+    def _get_utsmc_entry_invalidation(self, symbol):
+        return self.utsmc_entry_invalidation.get(symbol)
+
+    def _clear_utsmc_entry_invalidation(self, symbol):
+        self.utsmc_entry_invalidation.pop(symbol, None)
 
     async def _maybe_execute_utsmc_live_entry(self, symbol, live_candle_ts, live_price, pos_side, strategy_name='UTSMC'):
         pending = self._get_utsmc_pending_entry(symbol)
@@ -2521,10 +2549,20 @@ class SignalEngine(BaseEngine):
             strategy=strategy_name,
             entry_sig=entry_sig,
             pos_side=entry_sig.upper(),
-            note=f"live next-candle entry | live_ts={live_candle_ts}"
+            note=(
+                f"live next-candle entry | live_ts={live_candle_ts} | "
+                f"ut_signal_high={pending.get('signal_high')} | ut_signal_low={pending.get('signal_low')}"
+            )
         )
         logger.info(f"[{strategy_name}] live next-candle entry {entry_sig.upper()} @ {live_candle_ts}")
         self.utsmc_last_entry_signal_ts[symbol] = int(live_candle_ts)
+        self._set_utsmc_entry_invalidation(
+            symbol,
+            entry_sig,
+            pending.get('signal_ts'),
+            signal_high=pending.get('signal_high'),
+            signal_low=pending.get('signal_low')
+        )
         await self.entry(symbol, entry_sig, float(live_price))
         return entry_sig.upper()
 
@@ -4097,6 +4135,9 @@ class SignalEngine(BaseEngine):
         tf = self.get_runtime_common_settings().get('entry_timeframe', self.get_runtime_common_settings().get('timeframe', '15m'))
         candle_ms = self._timeframe_to_ms(tf)
         pending = self._get_utsmc_pending_entry(symbol)
+        ut_detail = raw_smc_detail.get('ut_detail') or {}
+        ut_signal_high = ut_detail.get('signal_high')
+        ut_signal_low = ut_detail.get('signal_low')
         smc_reason = raw_smc_detail.get('smc_reason') or raw_smc_detail.get('smc_internal_ob_reason')
         ob_tags = raw_smc_detail.get('ob_tags') or []
         ob_tag_text = ", ".join(ob_tags) if ob_tags else "-"
@@ -4121,9 +4162,18 @@ class SignalEngine(BaseEngine):
             self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {hold_note}"
             return
 
+        self._clear_utsmc_entry_invalidation(symbol)
+
         if pending and ut_signal and ut_signal != pending.get('side'):
             execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
-            self._set_utsmc_pending_entry(symbol, ut_signal, raw_smc_detail.get('ut_signal_ts'), execute_ts)
+            self._set_utsmc_pending_entry(
+                symbol,
+                ut_signal,
+                raw_smc_detail.get('ut_signal_ts'),
+                execute_ts,
+                signal_high=ut_signal_high,
+                signal_low=ut_signal_low
+            )
             self.last_entry_reason[symbol] = (
                 f"{strategy_name} 기존 {pending.get('side', '').upper()} 예약 취소, "
                 f"새 UT {ut_signal.upper()} 신호로 다음 봉 진행 중 진입 대기"
@@ -4146,7 +4196,14 @@ class SignalEngine(BaseEngine):
 
         if ut_signal in {'long', 'short'}:
             execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
-            self._set_utsmc_pending_entry(symbol, ut_signal, raw_smc_detail.get('ut_signal_ts'), execute_ts)
+            self._set_utsmc_pending_entry(
+                symbol,
+                ut_signal,
+                raw_smc_detail.get('ut_signal_ts'),
+                execute_ts,
+                signal_high=ut_signal_high,
+                signal_low=ut_signal_low
+            )
             self.last_entry_reason[symbol] = (
                 f"{strategy_name} UT {ut_signal.upper()} 확정, "
                 f"다음 봉 진행 중 {ut_signal.upper()} 진입 대기"
@@ -4851,8 +4908,37 @@ class SignalEngine(BaseEngine):
             if active_strategy == 'utsmc':
                 strategy_name = "UTSMC(Exit)"
                 smc_sig, exit_reason, smc_detail = self._calculate_smc_internal_ob_signal(df, strategy_params)
-                raw_exit_long = current_side.lower() == 'long' and bool(smc_detail.get('bearish_internal_ob_entry'))
-                raw_exit_short = current_side.lower() == 'short' and bool(smc_detail.get('bullish_internal_ob_entry'))
+                current_closed_ts = int(df.iloc[-2]['timestamp'])
+                current_closed_price = float(df.iloc[-2]['close'])
+                invalidation = self._get_utsmc_entry_invalidation(symbol) or {}
+                signal_high = invalidation.get('signal_high')
+                signal_low = invalidation.get('signal_low')
+                ut_invalidation_long = (
+                    current_side.lower() == 'long'
+                    and signal_low is not None
+                    and current_closed_price <= float(signal_low)
+                )
+                ut_invalidation_short = (
+                    current_side.lower() == 'short'
+                    and signal_high is not None
+                    and current_closed_price >= float(signal_high)
+                )
+                raw_exit_long = current_side.lower() == 'long' and (
+                    bool(smc_detail.get('bearish_internal_ob_entry')) or ut_invalidation_long
+                )
+                raw_exit_short = current_side.lower() == 'short' and (
+                    bool(smc_detail.get('bullish_internal_ob_entry')) or ut_invalidation_short
+                )
+                if ut_invalidation_long:
+                    exit_reason = (
+                        f"UTSMC LONG INVALIDATION: close {current_closed_price:.4f} <= "
+                        f"UT signal low {float(signal_low):.4f}"
+                    )
+                elif ut_invalidation_short:
+                    exit_reason = (
+                        f"UTSMC SHORT INVALIDATION: close {current_closed_price:.4f} >= "
+                        f"UT signal high {float(signal_high):.4f}"
+                    )
                 bypass_exit_filters = True
                 self._update_stateful_diag(
                     symbol,
@@ -4861,10 +4947,12 @@ class SignalEngine(BaseEngine):
                     smc_ob_tags=", ".join(smc_detail.get('ob_tags') or []) if smc_detail.get('ob_tags') else None,
                     smc_signal=smc_sig,
                     smc_reason=exit_reason,
-                    smc_tf=tf
+                    smc_tf=tf,
+                    utsmc_signal_high=signal_high,
+                    utsmc_signal_low=signal_low
                 )
                 last_utsmc_entry_ts = int(self.utsmc_last_entry_signal_ts.get(symbol, 0) or 0)
-                if last_utsmc_entry_ts and int(df.iloc[-2]['timestamp']) < last_utsmc_entry_ts:
+                if last_utsmc_entry_ts and current_closed_ts < last_utsmc_entry_ts:
                     raw_exit_long = False
                     raw_exit_short = False
                 if raw_exit_long or raw_exit_short:
@@ -7647,7 +7735,7 @@ class MainController:
             '16': "📝 **전략 선택** (1=UTBOT, 2=UTRSIBB, 3=UTRSI, 4=UTBB, 5=UTSMC)",
             '19': "📝 **UT Bot 설정** 입력 (형식: key,atr,on/off 예: 1,10,off)",
             '20': "RSI/BB 보조설정 입력\n형식: RSI길이,BB길이,BB배수\n예: 6,200,2",
-            '21': "ℹ️ **UT 전략 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙, UTSMC는 UT fresh 다음봉 진행중 진입 + internal OB 청산을 사용합니다.",
+            '21': "ℹ️ **UT 전략 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙, UTSMC는 UT fresh 다음봉 진행중 진입 + internal OB/UT 신호봉 무효화 청산을 사용합니다.",
             '22': "📝 **거래소/네트워크 선택** (1=바이낸스 테스트넷, 2=바이낸스 메인넷, 3=업비트 KRW 현물)",
             '23': "📝 **거래량 급등 채굴 기능** (1=ON, 0=OFF)",
             '24': "📝 **채굴 진입 타임프레임** 입력 (예: 5m)\n1m, 5m, 15m, 30m, 1h",
@@ -7766,9 +7854,9 @@ class MainController:
                 "- UTBB 특수 SHORT(하단돌파형): 진입봉이 BB 중간선 하향 + BB 하단선 하향 돌파면 BB 하단선 상향 돌파 또는 UT 롱상태로 청산\n"
                 "- UTBB 특수 SHORT(반등실패형): 중간선 아래 양봉 1~2개 뒤 저점 이탈 음봉이면 진입, BB 중간선 상향 돌파 또는 UT 롱상태로 청산\n"
                 "- UTBB SHORT 청산: 일반은 UT 롱상태 또는 BB 하단선 하향 돌파\n"
-                "- UTSMC: UT fresh signal 확정봉의 바로 다음 봉 진행 중에 진입, 청산은 exit TF internal OB 진입 마감 기준\n"
-                "- UTSMC LONG: UT 롱신호 확정 후 다음 봉 진행 중 LONG 진입, internal bearish OB 진입 마감 청산\n"
-                "- UTSMC SHORT: UT 숏신호 확정 후 다음 봉 진행 중 SHORT 진입, internal bullish OB 진입 마감 청산\n"
+                "- UTSMC: UT fresh signal 확정봉의 바로 다음 봉 진행 중에 진입, 청산은 exit TF internal OB 또는 UT 신호봉 무효화 마감 기준\n"
+                "- UTSMC LONG: UT 롱신호 확정 후 다음 봉 진행 중 LONG 진입, internal bearish OB 진입 마감 또는 UT 신호봉 저가 이탈 마감 청산\n"
+                "- UTSMC SHORT: UT 숏신호 확정 후 다음 봉 진행 중 SHORT 진입, internal bullish OB 진입 마감 또는 UT 신호봉 고가 돌파 마감 청산\n"
                 "- 모든 판단은 확정봉 기준"
             )
             await self.show_setup_menu(update)
@@ -9235,6 +9323,11 @@ class MainController:
                             msg += smc_entry_line + "\n"
                         if stateful_diag.get('utsmc_entry_smc_reason'):
                             msg += f"UTSMC entry 판정: `{stateful_diag.get('utsmc_entry_smc_reason')}`\n"
+                        if stateful_diag.get('utsmc_signal_high') is not None or stateful_diag.get('utsmc_signal_low') is not None:
+                            msg += (
+                                f"UTSMC invalidation: high `{float(stateful_diag.get('utsmc_signal_high') or 0.0):.2f}` | "
+                                f"low `{float(stateful_diag.get('utsmc_signal_low') or 0.0):.2f}`\n"
+                            )
                         if (
                             stateful_diag.get('smc_bullish_ob_entry') is not None
                             or stateful_diag.get('smc_bearish_ob_entry') is not None
