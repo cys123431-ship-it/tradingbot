@@ -1605,26 +1605,49 @@ class SignalEngine(BaseEngine):
         super().start()
         self.last_activity = time.time()
         # [Fix] ?ш컻(RESUME) ???곹깭 珥덇린?뷀븯??利됱떆 ?ъ쭊??媛?ν븯?꾨줉 ?섏젙
-        self.last_candle_time = {}
-        self.last_candle_success = {}
-        self.last_processed_candle_ts = {}
-        self.last_state_sync_candle_ts = {}
-        self.last_stateful_retry_ts = {}
-        self.last_stateful_diag = {}
-        self.last_stateful_diag_notice = {}
-        self.last_processed_exit_candle_ts = {}
+        self.reset_signal_runtime_state(
+            reset_entry_cache=True,
+            reset_exit_cache=True,
+            reset_stateful_strategy=True
+        )
         self.cameron_states = {}
-        self.ut_hybrid_timing_latches = {}
-        self.ut_hybrid_timing_consumed_ts = {}
-        self.utbb_special_long_state = {}
-        self.utbb_special_short_state = {}
-        
+
         # 珥덇린??
         self.active_symbols = set()
         config_watchlist = self.get_runtime_watchlist()
         for s in config_watchlist:
             self.active_symbols.add(s)
         logger.info(f"?? [Signal] Engine started (Multi-Symbol Mode). Watching: {self.active_symbols}")
+
+    def reset_entry_runtime_state(self):
+        self.last_candle_time = {}
+        self.last_candle_success = {}
+        self.last_processed_candle_ts = {}
+
+    def reset_exit_runtime_state(self):
+        self.last_processed_exit_candle_ts = {}
+
+    def reset_stateful_strategy_runtime_state(self):
+        self.last_state_sync_candle_ts = {}
+        self.last_stateful_retry_ts = {}
+        self.last_stateful_diag = {}
+        self.last_stateful_diag_notice = {}
+        self.last_entry_filter_status = {}
+        self.last_exit_filter_status = {}
+        self.last_entry_reason = {}
+        self.pending_reentry = {}
+        self.ut_hybrid_timing_latches = {}
+        self.ut_hybrid_timing_consumed_ts = {}
+        self.utbb_special_long_state = {}
+        self.utbb_special_short_state = {}
+
+    def reset_signal_runtime_state(self, *, reset_entry_cache=False, reset_exit_cache=False, reset_stateful_strategy=False):
+        if reset_entry_cache:
+            self.reset_entry_runtime_state()
+        if reset_exit_cache:
+            self.reset_exit_runtime_state()
+        if reset_stateful_strategy:
+            self.reset_stateful_strategy_runtime_state()
 
     def _get_exit_timeframe(self, symbol=None):
         """泥?궛????꾪봽?덉엫 (User Defined)
@@ -1904,6 +1927,87 @@ class SignalEngine(BaseEngine):
         if not state or not state.get('active'):
             return None
         return str(state.get('mode') or 'lower_reentry')
+
+    def _apply_utbb_long_entry_state(self, symbol, raw_hybrid_detail, bb_upper_breakout):
+        if bb_upper_breakout:
+            self._set_utbb_special_long_state(symbol, raw_hybrid_detail.get('bb_upper_signal_ts'))
+            return
+        self._clear_utbb_special_long_state(symbol)
+
+    def _apply_utbb_short_entry_state(self, symbol, raw_hybrid_detail, *, special_short_candidate=False, short_rebound_fail_ready=False):
+        if special_short_candidate:
+            self._set_utbb_special_short_state(symbol, raw_hybrid_detail.get('bb_lower_signal_ts'), mode='lower_reentry')
+            return
+        if short_rebound_fail_ready:
+            self._set_utbb_special_short_state(
+                symbol,
+                raw_hybrid_detail.get('bb_mid_rebound_fail_signal_ts'),
+                mode='mid_rebound_fail'
+            )
+            return
+        self._clear_utbb_special_short_state(symbol)
+
+    def _build_utbb_long_entry_reason(self, strategy_name, *, ut_signal=None, long_pair_source=None, ut_long_fresh=False, bb_long_fresh=False, bb_upper_breakout=False, reentry=False):
+        if bb_upper_breakout:
+            if reentry:
+                return (
+                    f"{strategy_name} 숏 청산 후 특수 LONG 재진입"
+                    if ut_signal == 'long'
+                    else f"{strategy_name} 숏 청산 후 UT 롱상태로 특수 LONG 재진입"
+                )
+            return (
+                f"{strategy_name} UT 롱신호 + BB 상단돌파 -> 특수 LONG 진입"
+                if ut_signal == 'long'
+                else f"{strategy_name} UT 롱상태 유지 + BB 상단돌파 -> 특수 LONG 진입"
+            )
+
+        if long_pair_source == 'same_candle':
+            return (
+                f"{strategy_name} 숏 청산 후 UT/BB 롱 동시 확인 -> LONG 재진입"
+                if reentry else f"{strategy_name} UT/BB 롱 동시 확인 -> LONG 진입"
+            )
+        if long_pair_source == 'bb_first':
+            return (
+                f"{strategy_name} 숏 청산 후 저장된 BB 롱 + UT 롱신호 -> LONG 재진입"
+                if reentry else f"{strategy_name} 저장된 BB 롱 + UT 롱신호 -> LONG 진입"
+            )
+        if long_pair_source == 'ut_first':
+            return (
+                f"{strategy_name} 숏 청산 후 저장된 UT 롱 + BB 롱신호 -> LONG 재진입"
+                if reentry else f"{strategy_name} 저장된 UT 롱 + BB 롱신호 -> LONG 진입"
+            )
+        if ut_long_fresh:
+            return (
+                f"{strategy_name} 숏 청산 후 UT 롱신호 -> LONG 재진입"
+                if reentry else f"{strategy_name} UT 롱신호 -> LONG 진입"
+            )
+        if bb_long_fresh:
+            return f"{strategy_name} BB 롱신호 -> LONG 진입"
+        return (
+            f"{strategy_name} 숏 청산 후 LONG 재진입"
+            if reentry else f"{strategy_name} LONG 진입"
+        )
+
+    def _build_utbb_short_entry_note(self, *, ut_signal=None, short_mid_ready=False, short_rebound_fail_ready=False, short_rebound_fail_bull_count=0, special_short_candidate=False):
+        if special_short_candidate:
+            return (
+                "BB 중간선 하락 돌파 + BB 하단 하향 돌파 + UT 숏신호"
+                if ut_signal == 'short'
+                else "BB 중간선 하락 돌파 + BB 하단 하향 돌파 + UT 숏상태"
+            )
+        if short_rebound_fail_ready:
+            return (
+                f"BB 중간선 아래 양봉 {short_rebound_fail_bull_count}개 후 반등 실패 + UT 숏신호"
+                if ut_signal == 'short'
+                else f"BB 중간선 아래 양봉 {short_rebound_fail_bull_count}개 후 반등 실패 + UT 숏상태"
+            )
+        if short_mid_ready:
+            return (
+                "BB 중간선 하락 돌파 + UT 숏신호"
+                if ut_signal == 'short'
+                else "BB 중간선 하락 돌파 + UT 숏상태"
+            )
+        return "BB 숏 셋업 + UT 숏신호"
 
     def _calculate_utbot_signal(self, df, strategy_params):
         cfg = strategy_params.get('UTBot', {})
@@ -3800,31 +3904,27 @@ class SignalEngine(BaseEngine):
                             note=f'long exit complete ({exit_note})'
                         )
                         if ut_state == 'short' and entry_sig == 'short':
+                            short_note = self._build_utbb_short_entry_note(
+                                ut_signal=ut_signal,
+                                short_mid_ready=short_mid_ready,
+                                short_rebound_fail_ready=short_rebound_fail_ready,
+                                short_rebound_fail_bull_count=short_rebound_fail_bull_count,
+                                special_short_candidate=special_short_candidate
+                            )
                             if special_short_candidate:
-                                if ut_signal == 'short':
-                                    self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 후 특수 SHORT 재진입"
-                                else:
-                                    self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 후 UT 숏상태로 특수 SHORT 재진입"
-                                self._set_utbb_special_short_state(symbol, raw_hybrid_detail.get('bb_lower_signal_ts'), mode='lower_reentry')
-                            elif short_rebound_fail_ready:
-                                short_note = (
-                                    f"BB 중간선 아래 양봉 {short_rebound_fail_bull_count}개 후 반등 실패 + UT 숏신호"
+                                self.last_entry_reason[symbol] = (
+                                    f"{strategy_name} 롱 청산 후 특수 SHORT 재진입"
                                     if ut_signal == 'short'
-                                    else f"BB 중간선 아래 양봉 {short_rebound_fail_bull_count}개 후 반등 실패 + UT 숏상태"
-                                )
-                                self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 후 {short_note} 재진입"
-                                self._set_utbb_special_short_state(
-                                    symbol,
-                                    raw_hybrid_detail.get('bb_mid_rebound_fail_signal_ts'),
-                                    mode='mid_rebound_fail'
+                                    else f"{strategy_name} 롱 청산 후 UT 숏상태로 특수 SHORT 재진입"
                                 )
                             else:
-                                short_note = (
-                                    ("BB 중간선 하락 돌파 + UT 숏신호" if ut_signal == 'short' else "BB 중간선 하락 돌파 + UT 숏상태")
-                                    if short_mid_ready else "UT 숏신호로 SHORT"
-                                )
                                 self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 후 {short_note} 재진입"
-                                self._clear_utbb_special_short_state(symbol)
+                            self._apply_utbb_short_entry_state(
+                                symbol,
+                                raw_hybrid_detail,
+                                special_short_candidate=special_short_candidate,
+                                short_rebound_fail_ready=short_rebound_fail_ready
+                            )
                             self._clear_utbb_long_setup(symbol)
                             await self.entry(symbol, 'short', float(k['c']))
                             if short_setup_ready:
@@ -3891,24 +3991,16 @@ class SignalEngine(BaseEngine):
                             note='short exit complete'
                         )
                         if entry_sig == 'long':
-                            if bb_upper_breakout:
-                                if ut_signal == 'long':
-                                    self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 특수 LONG 재진입"
-                                else:
-                                    self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 UT 롱상태로 특수 LONG 재진입"
-                                self._set_utbb_special_long_state(symbol, raw_hybrid_detail.get('bb_upper_signal_ts'))
-                            else:
-                                if long_pair_source == 'same_candle':
-                                    self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 UT/BB 롱 동시 확인 -> LONG 재진입"
-                                elif long_pair_source == 'bb_first':
-                                    self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 저장된 BB 롱 + UT 롱신호 -> LONG 재진입"
-                                elif long_pair_source == 'ut_first':
-                                    self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 저장된 UT 롱 + BB 롱신호 -> LONG 재진입"
-                                elif ut_long_fresh:
-                                    self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 UT 롱신호 -> LONG 재진입"
-                                else:
-                                    self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 후 LONG 재진입"
-                                self._clear_utbb_special_long_state(symbol)
+                            self.last_entry_reason[symbol] = self._build_utbb_long_entry_reason(
+                                strategy_name,
+                                ut_signal=ut_signal,
+                                long_pair_source=long_pair_source,
+                                ut_long_fresh=ut_long_fresh,
+                                bb_long_fresh=bb_long_fresh,
+                                bb_upper_breakout=bb_upper_breakout,
+                                reentry=True
+                            )
+                            self._apply_utbb_long_entry_state(symbol, raw_hybrid_detail, bb_upper_breakout)
                             self._clear_utbb_long_setup(symbol)
                             self._clear_utbb_short_setup(symbol)
                             await self.entry(symbol, 'long', float(k['c']))
@@ -3938,58 +4030,35 @@ class SignalEngine(BaseEngine):
                         await self._notify_stateful_diag(symbol, force=True)
 
                 elif not pos and entry_sig == 'long':
-                    if bb_upper_breakout:
-                        if ut_signal == 'long':
-                            self.last_entry_reason[symbol] = f"{strategy_name} UT 롱신호 + BB 상단돌파 -> 특수 LONG 진입"
-                        else:
-                            self.last_entry_reason[symbol] = f"{strategy_name} UT 롱상태 유지 + BB 상단돌파 -> 특수 LONG 진입"
-                        self._set_utbb_special_long_state(symbol, raw_hybrid_detail.get('bb_upper_signal_ts'))
-                    else:
-                        if long_pair_source == 'same_candle':
-                            self.last_entry_reason[symbol] = f"{strategy_name} UT/BB 롱 동시 확인 -> LONG 진입"
-                        elif long_pair_source == 'bb_first':
-                            self.last_entry_reason[symbol] = f"{strategy_name} 저장된 BB 롱 + UT 롱신호 -> LONG 진입"
-                        elif long_pair_source == 'ut_first':
-                            self.last_entry_reason[symbol] = f"{strategy_name} 저장된 UT 롱 + BB 롱신호 -> LONG 진입"
-                        elif ut_long_fresh:
-                            self.last_entry_reason[symbol] = f"{strategy_name} UT 롱신호 -> LONG 진입"
-                        elif bb_long_fresh:
-                            self.last_entry_reason[symbol] = f"{strategy_name} BB 롱신호 -> LONG 진입"
-                        else:
-                            self.last_entry_reason[symbol] = f"{strategy_name} LONG 진입"
-                        self._clear_utbb_special_long_state(symbol)
+                    self.last_entry_reason[symbol] = self._build_utbb_long_entry_reason(
+                        strategy_name,
+                        ut_signal=ut_signal,
+                        long_pair_source=long_pair_source,
+                        ut_long_fresh=ut_long_fresh,
+                        bb_long_fresh=bb_long_fresh,
+                        bb_upper_breakout=bb_upper_breakout
+                    )
+                    self._apply_utbb_long_entry_state(symbol, raw_hybrid_detail, bb_upper_breakout)
                     self._clear_utbb_long_setup(symbol)
                     self._clear_utbb_short_setup(symbol)
                     self._clear_utbb_special_short_state(symbol)
                     logger.info(f"[{strategy_name}] New LONG entry")
                     await self.entry(symbol, 'long', float(k['c']))
                 elif not pos and entry_sig == 'short':
-                    if special_short_candidate:
-                        short_note = (
-                            "BB 중간선 하락 돌파 + BB 하단 하향 돌파 + UT 숏신호"
-                            if ut_signal == 'short'
-                            else "BB 중간선 하락 돌파 + BB 하단 하향 돌파 + UT 숏상태"
-                        )
-                        self._set_utbb_special_short_state(symbol, raw_hybrid_detail.get('bb_lower_signal_ts'), mode='lower_reentry')
-                    elif short_rebound_fail_ready:
-                        short_note = (
-                            f"BB 중간선 아래 양봉 {short_rebound_fail_bull_count}개 후 반등 실패 + UT 숏신호"
-                            if ut_signal == 'short'
-                            else f"BB 중간선 아래 양봉 {short_rebound_fail_bull_count}개 후 반등 실패 + UT 숏상태"
-                        )
-                        self._set_utbb_special_short_state(
-                            symbol,
-                            raw_hybrid_detail.get('bb_mid_rebound_fail_signal_ts'),
-                            mode='mid_rebound_fail'
-                        )
-                    else:
-                        short_note = (
-                            "BB 중간선 하락 돌파 + UT 숏신호"
-                            if ut_signal == 'short'
-                            else "BB 중간선 하락 돌파 + UT 숏상태"
-                        ) if short_mid_ready else "BB 숏 셋업 + UT 숏신호"
-                        self._clear_utbb_special_short_state(symbol)
+                    short_note = self._build_utbb_short_entry_note(
+                        ut_signal=ut_signal,
+                        short_mid_ready=short_mid_ready,
+                        short_rebound_fail_ready=short_rebound_fail_ready,
+                        short_rebound_fail_bull_count=short_rebound_fail_bull_count,
+                        special_short_candidate=special_short_candidate
+                    )
                     self.last_entry_reason[symbol] = f"{strategy_name} {short_note} -> SHORT 진입"
+                    self._apply_utbb_short_entry_state(
+                        symbol,
+                        raw_hybrid_detail,
+                        special_short_candidate=special_short_candidate,
+                        short_rebound_fail_ready=short_rebound_fail_ready
+                    )
                     self._clear_utbb_long_setup(symbol)
                     self._clear_utbb_special_long_state(symbol)
                     logger.info(f"[{strategy_name}] New SHORT entry")
@@ -6563,26 +6632,11 @@ class MainController:
         if not signal_engine:
             return None
 
-        if reset_entry_cache:
-            signal_engine.last_processed_candle_ts = {}
-            signal_engine.last_candle_time = {}
-            signal_engine.last_candle_success = {}
-
-        if reset_exit_cache:
-            signal_engine.last_processed_exit_candle_ts = {}
-
-        if reset_stateful_strategy:
-            signal_engine.last_state_sync_candle_ts = {}
-            signal_engine.last_stateful_retry_ts = {}
-            signal_engine.last_stateful_diag = {}
-            signal_engine.last_stateful_diag_notice = {}
-            signal_engine.last_entry_reason = {}
-            signal_engine.pending_reentry = {}
-            signal_engine.ut_hybrid_timing_latches = {}
-            signal_engine.ut_hybrid_timing_consumed_ts = {}
-            signal_engine.utbb_special_long_state = {}
-            signal_engine.utbb_special_short_state = {}
-
+        signal_engine.reset_signal_runtime_state(
+            reset_entry_cache=reset_entry_cache,
+            reset_exit_cache=reset_exit_cache,
+            reset_stateful_strategy=reset_stateful_strategy
+        )
         return signal_engine
 
     def normalize_symbol_for_exchange(self, raw_symbol, exchange_mode=None):
@@ -7515,11 +7569,11 @@ class MainController:
                 await self.cfg.update_value(['upbit', 'watchlist'], [symbol])
                 signal_engine.active_symbols.clear()
                 signal_engine.active_symbols.add(symbol)
-                signal_engine.last_candle_time = {}
-                signal_engine.last_processed_candle_ts = {}
-                signal_engine.last_state_sync_candle_ts = {}
-                signal_engine.last_stateful_retry_ts = {}
-                signal_engine.last_processed_exit_candle_ts = {}
+                self._reset_signal_engine_runtime_state(
+                    reset_entry_cache=True,
+                    reset_exit_cache=True,
+                    reset_stateful_strategy=True
+                )
                 await signal_engine.prime_symbol_to_next_closed_candle(symbol)
                 await update.message.reply_text(f"✅ 업비트 코인 변경: `{display_symbol}`", parse_mode=ParseMode.MARKDOWN)
                 logger.info(f"Upbit manual symbol set: {symbol}")
@@ -8179,20 +8233,20 @@ class MainController:
                     signal_engine.active_symbols.add(symbol)
                     await signal_engine.prime_symbol_to_next_closed_candle(symbol)
                 elif setup_choice == '43':
-                    signal_engine.last_candle_time = {}
-                    signal_engine.last_processed_candle_ts = {}
-                    signal_engine.last_state_sync_candle_ts = {}
-                    signal_engine.last_stateful_retry_ts = {}
-                    signal_engine.last_processed_exit_candle_ts = {}
+                    self._reset_signal_engine_runtime_state(
+                        reset_entry_cache=True,
+                        reset_exit_cache=True,
+                        reset_stateful_strategy=True
+                    )
                     signal_engine.active_symbols.clear()
                     signal_engine.active_symbols.add(symbol)
                     await signal_engine.prime_symbol_to_next_closed_candle(symbol)
                 else:
-                    signal_engine.last_candle_time = {} # Dict reset
-                    signal_engine.last_processed_candle_ts = {}
-                    signal_engine.last_state_sync_candle_ts = {}
-                    signal_engine.last_stateful_retry_ts = {}
-                    signal_engine.last_processed_exit_candle_ts = {}
+                    self._reset_signal_engine_runtime_state(
+                        reset_entry_cache=True,
+                        reset_exit_cache=True,
+                        reset_stateful_strategy=True
+                    )
                     signal_engine.active_symbols.clear() # 湲곗〈 ?섎룞 紐⑸줉??珥덇린??(紐낇솗?깆쓣 ?꾪빐)
                     signal_engine.active_symbols.add(symbol)
                     await signal_engine.prime_symbol_to_next_closed_candle(symbol)
