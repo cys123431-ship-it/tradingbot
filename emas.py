@@ -1649,6 +1649,62 @@ class SignalEngine(BaseEngine):
         if reset_stateful_strategy:
             self.reset_stateful_strategy_runtime_state()
 
+    def _ensure_runtime_state_container(self, attr_name, default_factory=dict):
+        value = getattr(self, attr_name, None)
+        if not isinstance(value, dict):
+            logger.error(f"State corrupted: {attr_name} is {type(value)}, resetting.")
+            value = default_factory()
+            setattr(self, attr_name, value)
+        return value
+
+    def _ensure_runtime_state_containers(self, attr_names):
+        for attr_name in attr_names:
+            self._ensure_runtime_state_container(attr_name)
+
+    def _collect_primary_strategy_context(self, symbol, df, strategy_params, active_strategy):
+        context = {
+            'raw_strategy_sig': None,
+            'raw_state_sig': None,
+            'raw_ut_detail': {},
+            'raw_hybrid_detail': {},
+            'precomputed': {}
+        }
+
+        if active_strategy == 'utbot':
+            utbot_result = self._calculate_utbot_signal(df, strategy_params)
+            raw_strategy_sig, _, ut_detail = utbot_result
+            context['raw_strategy_sig'] = raw_strategy_sig
+            context['raw_state_sig'] = raw_strategy_sig or ut_detail.get('bias_side')
+            context['raw_ut_detail'] = ut_detail or {}
+            context['precomputed'][active_strategy] = utbot_result
+        elif active_strategy == 'utbb':
+            utbb_result = self._calculate_utbb_signal(symbol, df, strategy_params)
+            _, _, hybrid_detail = utbb_result
+            context['raw_strategy_sig'] = hybrid_detail.get('ut_signal')
+            context['raw_state_sig'] = hybrid_detail.get('ut_state')
+            context['raw_ut_detail'] = hybrid_detail.get('ut_detail') or {}
+            context['raw_hybrid_detail'] = hybrid_detail or {}
+            context['precomputed'][active_strategy] = utbb_result
+        elif active_strategy in UT_HYBRID_STRATEGIES:
+            hybrid_calc = {
+                'utrsibb': self._calculate_utrsibb_signal,
+                'utrsi': self._calculate_utrsi_signal
+            }.get(active_strategy)
+            hybrid_result = hybrid_calc(symbol, df, strategy_params)
+            _, _, hybrid_detail = hybrid_result
+            context['raw_strategy_sig'] = hybrid_detail.get('ut_state')
+            context['raw_state_sig'] = context['raw_strategy_sig']
+            context['raw_ut_detail'] = hybrid_detail.get('ut_detail') or {}
+            context['raw_hybrid_detail'] = hybrid_detail or {}
+            context['precomputed'][active_strategy] = hybrid_result
+        elif active_strategy == 'rsibb':
+            rsibb_result = self._calculate_rsibb_signal(df, strategy_params)
+            context['raw_strategy_sig'] = rsibb_result[0]
+            context['raw_state_sig'] = rsibb_result[0]
+            context['precomputed'][active_strategy] = rsibb_result
+
+        return context
+
     def _get_exit_timeframe(self, symbol=None):
         """泥?궛????꾪봽?덉엫 (User Defined)
            醫낅ぉ???ㅼ틦?덉뿉 ?섑빐 ?≫엺 寃쎌슦 ?꾩슜 ??꾪봽?덉엫 諛섑솚
@@ -3159,31 +3215,16 @@ class SignalEngine(BaseEngine):
 
     async def poll_symbol(self, symbol, primary_tf, cfg):
         """媛쒕퀎 ?щ낵 ?대쭅 濡쒖쭅"""
-        # Defensive Check: ?곹깭 蹂?섍? ?ㅼ뿼?섏뿀??寃쎌슦 蹂듦뎄
-        if not isinstance(self.last_processed_candle_ts, dict):
-            logger.error(f"?좑툘 State corrupted: last_processed_candle_ts is {type(self.last_processed_candle_ts)}, resetting.")
-            self.last_processed_candle_ts = {}
-        if not isinstance(self.last_state_sync_candle_ts, dict):
-            logger.error(f"?좑툘 State corrupted: last_state_sync_candle_ts is {type(self.last_state_sync_candle_ts)}, resetting.")
-            self.last_state_sync_candle_ts = {}
-        if not isinstance(self.last_stateful_retry_ts, dict):
-            logger.error(f"?좑툘 State corrupted: last_stateful_retry_ts is {type(self.last_stateful_retry_ts)}, resetting.")
-            self.last_stateful_retry_ts = {}
-        if not isinstance(self.last_processed_exit_candle_ts, dict):
-            logger.error(f"?좑툘 State corrupted: last_processed_exit_candle_ts is {type(self.last_processed_exit_candle_ts)}, resetting.")
-            self.last_processed_exit_candle_ts = {}
-        if not isinstance(self.last_candle_time, dict):
-            logger.error(f"?좑툘 State corrupted: last_candle_time is {type(self.last_candle_time)}, resetting.")
-            self.last_candle_time = {}
-        if not isinstance(self.fisher_states, dict):
-            logger.error(f"?좑툘 State corrupted: fisher_states is {type(self.fisher_states)}, resetting.")
-            self.fisher_states = {}
-        if not isinstance(self.vbo_states, dict):
-            logger.error(f"?좑툘 State corrupted: vbo_states is {type(self.vbo_states)}, resetting.")
-            self.vbo_states = {}
-        if not isinstance(self.cameron_states, dict):
-            logger.error(f"?좑툘 State corrupted: cameron_states is {type(self.cameron_states)}, resetting.")
-            self.cameron_states = {}
+        self._ensure_runtime_state_containers((
+            'last_processed_candle_ts',
+            'last_state_sync_candle_ts',
+            'last_stateful_retry_ts',
+            'last_processed_exit_candle_ts',
+            'last_candle_time',
+            'fisher_states',
+            'vbo_states',
+            'cameron_states'
+        ))
             
         try:
             # 1. OHLCV (Primary) - Basic monitoring
@@ -3629,36 +3670,20 @@ class SignalEngine(BaseEngine):
             # ===== ?꾨왂 ?ㅼ젙 濡쒕뱶 =====
             strategy_params = self.get_runtime_strategy_params()
             active_strategy = strategy_params.get('active_strategy', 'sma').lower()
-            raw_strategy_sig = None
-            raw_state_sig = None
-            raw_ut_detail = {}
-            raw_hybrid_detail = {}
-            if active_strategy == 'utbot':
-                raw_strategy_sig, _, ut_detail = self._calculate_utbot_signal(df, strategy_params)
-                raw_state_sig = raw_strategy_sig or ut_detail.get('bias_side')
-                raw_ut_detail = ut_detail or {}
-            elif active_strategy == 'utbb':
-                _, _, hybrid_detail = self._calculate_utbb_signal(symbol, df, strategy_params)
-                raw_strategy_sig = hybrid_detail.get('ut_signal')
-                raw_state_sig = hybrid_detail.get('ut_state')
-                raw_ut_detail = hybrid_detail.get('ut_detail') or {}
-                raw_hybrid_detail = hybrid_detail or {}
-            elif active_strategy in UT_HYBRID_STRATEGIES:
-                hybrid_calc = {
-                    'utrsibb': self._calculate_utrsibb_signal,
-                    'utrsi': self._calculate_utrsi_signal
-                }.get(active_strategy)
-                _, _, hybrid_detail = hybrid_calc(symbol, df, strategy_params)
-                raw_strategy_sig = hybrid_detail.get('ut_state')
-                raw_state_sig = raw_strategy_sig
-                raw_ut_detail = hybrid_detail.get('ut_detail') or {}
-                raw_hybrid_detail = hybrid_detail or {}
-            elif active_strategy == 'rsibb':
-                raw_strategy_sig, _, _ = self._calculate_rsibb_signal(df, strategy_params)
-                raw_state_sig = raw_strategy_sig
+            strategy_context = self._collect_primary_strategy_context(symbol, df, strategy_params, active_strategy)
+            raw_strategy_sig = strategy_context['raw_strategy_sig']
+            raw_state_sig = strategy_context['raw_state_sig']
+            raw_ut_detail = strategy_context['raw_ut_detail']
+            raw_hybrid_detail = strategy_context['raw_hybrid_detail']
             
             # ?꾨왂蹂??좏샇 怨꾩궛
-            sig, is_bullish, is_bearish, strategy_name, entry_mode, kalman_enabled = await self._calculate_strategy_signal(symbol, df, strategy_params, active_strategy)
+            sig, is_bullish, is_bearish, strategy_name, entry_mode, kalman_enabled = await self._calculate_strategy_signal(
+                symbol,
+                df,
+                strategy_params,
+                active_strategy,
+                precomputed=strategy_context['precomputed']
+            )
             strategy_sig = sig
             
             # 留ㅻℓ 諛⑺뼢 ?꾪꽣
@@ -4421,7 +4446,7 @@ class SignalEngine(BaseEngine):
             traceback.print_exc()
             return False
 
-    async def _calculate_strategy_signal(self, symbol, df, strategy_params, active_strategy, allow_utbot_stateful=True):
+    async def _calculate_strategy_signal(self, symbol, df, strategy_params, active_strategy, allow_utbot_stateful=True, precomputed=None):
         """
         ?꾨왂蹂??좏샇 怨꾩궛
         
@@ -4437,11 +4462,17 @@ class SignalEngine(BaseEngine):
         is_bearish = False
         entry_reason = "신호 대기"
         
+        precomputed = precomputed or {}
+
         # Init state dicts if needed
-        if symbol not in self.vbo_states: self.vbo_states[symbol] = {}
-        if symbol not in self.fisher_states: self.fisher_states[symbol] = {}
-        if symbol not in self.cameron_states: self.cameron_states[symbol] = {}
-        if symbol not in self.kalman_states: self.kalman_states[symbol] = {'velocity': 0.0, 'direction': None}
+        self._ensure_runtime_state_containers((
+            'vbo_states',
+            'fisher_states',
+            'cameron_states',
+            'kalman_states'
+        ))
+        if symbol not in self.kalman_states:
+            self.kalman_states[symbol] = {'velocity': 0.0, 'direction': None}
 
         active_strategy = str(active_strategy).lower()
         if active_strategy not in CORE_STRATEGIES:
@@ -4601,7 +4632,7 @@ class SignalEngine(BaseEngine):
         # ===== 3. 吏꾩엯 紐⑤뱶蹂??좏샇 ?먮떒 (ENTRY SIGNAL) =====
         if active_strategy == 'utbot':
             entry_mode = 'utbot'
-            sig, entry_reason, utbot_detail = self._calculate_utbot_signal(df, strategy_params)
+            sig, entry_reason, utbot_detail = precomputed.get('utbot') or self._calculate_utbot_signal(df, strategy_params)
             if sig is None and allow_utbot_stateful:
                 bias_sig = utbot_detail.get('bias_side')
                 if bias_sig in {'long', 'short'}:
@@ -4620,7 +4651,7 @@ class SignalEngine(BaseEngine):
 
         elif active_strategy == 'utbb':
             entry_mode = 'utbb'
-            sig, entry_reason, hybrid_detail = self._calculate_utbb_signal(symbol, df, strategy_params)
+            sig, entry_reason, hybrid_detail = precomputed.get('utbb') or self._calculate_utbb_signal(symbol, df, strategy_params)
             ut_state = hybrid_detail.get('ut_state')
             is_bullish = ut_state == 'long'
             is_bearish = ut_state == 'short'
@@ -4638,7 +4669,7 @@ class SignalEngine(BaseEngine):
                 'utrsibb': self._calculate_utrsibb_signal,
                 'utrsi': self._calculate_utrsi_signal
             }.get(active_strategy)
-            sig, entry_reason, hybrid_detail = hybrid_calc(symbol, df, strategy_params)
+            sig, entry_reason, hybrid_detail = precomputed.get(active_strategy) or hybrid_calc(symbol, df, strategy_params)
             ut_state = hybrid_detail.get('ut_state')
             is_bullish = ut_state == 'long'
             is_bearish = ut_state == 'short'
@@ -4652,7 +4683,7 @@ class SignalEngine(BaseEngine):
 
         elif active_strategy == 'rsibb':
             entry_mode = 'rsibb'
-            sig, entry_reason, _ = self._calculate_rsibb_signal(df, strategy_params)
+            sig, entry_reason, _ = precomputed.get('rsibb') or self._calculate_rsibb_signal(df, strategy_params)
             is_bullish = sig == 'long'
             is_bearish = sig == 'short'
 
