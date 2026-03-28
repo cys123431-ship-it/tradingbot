@@ -2616,11 +2616,10 @@ class SignalEngine(BaseEngine):
                 self._clear_utbb_long_setup(symbol)
             if ut_state == 'long' or bb_sig == 'long':
                 self._clear_utbb_short_setup(symbol)
-            else:
-                if ut_long_fresh:
-                    long_ut_setup = self._remember_utbb_long_setup(symbol, 'ut', ut_detail.get('signal_ts'))
-                if bb_long_fresh:
-                    long_bb_setup = self._remember_utbb_long_setup(symbol, 'bb', bb_detail.get('signal_ts'))
+            if ut_long_fresh:
+                long_ut_setup = self._remember_utbb_long_setup(symbol, 'ut', ut_detail.get('signal_ts'))
+            if bb_long_fresh:
+                long_bb_setup = self._remember_utbb_long_setup(symbol, 'bb', bb_detail.get('signal_ts'))
             self._expire_utbb_long_setup(symbol, current_closed_ts, candle_ms, max_bars=3)
             long_ut_setup = self._get_utbb_long_setup(symbol, 'ut')
             long_bb_setup = self._get_utbb_long_setup(symbol, 'bb')
