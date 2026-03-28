@@ -2492,6 +2492,42 @@ class SignalEngine(BaseEngine):
     def _clear_utsmc_pending_entry(self, symbol):
         self.utsmc_pending_entries.pop(symbol, None)
 
+    async def _maybe_execute_utsmc_live_entry(self, symbol, live_candle_ts, live_price, pos_side, strategy_name='UTSMC'):
+        pending = self._get_utsmc_pending_entry(symbol)
+        if pos_side != 'NONE':
+            if pending:
+                self._clear_utsmc_pending_entry(symbol)
+            return pos_side
+        if not pending:
+            return pos_side
+
+        execute_ts = int(pending.get('execute_ts') or 0)
+        if live_candle_ts < execute_ts:
+            return pos_side
+        if live_candle_ts > execute_ts:
+            self._clear_utsmc_pending_entry(symbol)
+            self.last_entry_reason[symbol] = f"{strategy_name} 다음 봉 진행 중 진입 기회 종료, fresh UT 신호 재대기"
+            return pos_side
+
+        entry_sig = str(pending.get('side') or '').lower()
+        self._clear_utsmc_pending_entry(symbol)
+        if entry_sig not in {'long', 'short'}:
+            return pos_side
+
+        self.last_entry_reason[symbol] = f"{strategy_name} 이전 UT {entry_sig.upper()} 신호 기준 다음 봉 진행 중 {entry_sig.upper()} 진입"
+        self._update_stateful_diag(
+            symbol,
+            stage='entry_submitted',
+            strategy=strategy_name,
+            entry_sig=entry_sig,
+            pos_side=entry_sig.upper(),
+            note=f"live next-candle entry | live_ts={live_candle_ts}"
+        )
+        logger.info(f"[{strategy_name}] live next-candle entry {entry_sig.upper()} @ {live_candle_ts}")
+        self.utsmc_last_entry_signal_ts[symbol] = int(live_candle_ts)
+        await self.entry(symbol, entry_sig, float(live_price))
+        return entry_sig.upper()
+
     def _calculate_utsmc_signal(self, df, strategy_params):
         ut_sig, ut_reason, ut_detail = self._calculate_utbot_signal(df, strategy_params)
         smc_sig, smc_reason, smc_detail = self._calculate_smc_internal_ob_signal(df, strategy_params)
@@ -2515,7 +2551,7 @@ class SignalEngine(BaseEngine):
         if ut_sig in {'long', 'short'}:
             reason = (
                 f"UTSMC {ut_sig.upper()} SIGNAL: "
-                f"다음 봉 {ut_sig.upper()} 진입 대기, 청산은 {exit_wait_label}"
+                f"다음 봉 진행 중 {ut_sig.upper()} 진입 대기, 청산은 {exit_wait_label}"
             )
         else:
             reason = f"UTSMC 상태 유지: UT {ut_state.upper()} 상태, 신규 진입은 fresh signal 다음 봉만 허용"
@@ -3641,6 +3677,16 @@ class SignalEngine(BaseEngine):
                     if self.last_candle_success.get(symbol, False):
                         self.last_state_sync_candle_ts[symbol] = ts_p
                     pos_side = await self.check_status(symbol, current_price)
+
+            if active_strategy == 'utsmc':
+                live_candle_ts = int(ohlcv_p[-1][0])
+                pos_side = await self._maybe_execute_utsmc_live_entry(
+                    symbol,
+                    live_candle_ts,
+                    current_price,
+                    pos_side,
+                    strategy_name='UTSMC'
+                )
                 
             # 3. Check Exit TF (Exit Logic)
             # Cross/Position 紐⑤뱶?먯꽌留?Secondary TF 泥?궛 濡쒖쭅 ?ъ슜
@@ -4080,7 +4126,7 @@ class SignalEngine(BaseEngine):
             self._set_utsmc_pending_entry(symbol, ut_signal, raw_smc_detail.get('ut_signal_ts'), execute_ts)
             self.last_entry_reason[symbol] = (
                 f"{strategy_name} 기존 {pending.get('side', '').upper()} 예약 취소, "
-                f"새 UT {ut_signal.upper()} 신호로 다음 봉 진입 대기"
+                f"새 UT {ut_signal.upper()} 신호로 다음 봉 진행 중 진입 대기"
             )
             self._update_stateful_diag(
                 symbol,
@@ -4094,32 +4140,16 @@ class SignalEngine(BaseEngine):
             )
             return
 
-        if pending and current_ts == int(pending.get('execute_ts') or 0):
-            entry_sig = str(pending.get('side') or '').lower()
+        if pending and current_ts >= int(pending.get('execute_ts') or 0):
             self._clear_utsmc_pending_entry(symbol)
-            if entry_sig in {'long', 'short'}:
-                self.last_entry_reason[symbol] = f"{strategy_name} 이전 UT {entry_sig.upper()} 신호 기준 다음 봉 {entry_sig.upper()} 진입"
-                self._update_stateful_diag(
-                    symbol,
-                    stage='entry_submitted',
-                    strategy=strategy_name,
-                    raw_state=(target_sig or 'none'),
-                    raw_signal=(ut_signal or 'none'),
-                    entry_sig=entry_sig,
-                    pos_side=entry_sig.upper(),
-                    note=f"delayed next-candle entry | ob={smc_reason or '-'}"
-                )
-                logger.info(f"[{strategy_name}] next-candle entry {entry_sig.upper()}")
-                self.utsmc_last_entry_signal_ts[symbol] = current_ts
-                await self.entry(symbol, entry_sig, float(k['c']))
-                return
+            self.last_entry_reason[symbol] = f"{strategy_name} 다음 봉 진행 중 진입 기회 종료, fresh UT 신호 재대기"
 
         if ut_signal in {'long', 'short'}:
             execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
             self._set_utsmc_pending_entry(symbol, ut_signal, raw_smc_detail.get('ut_signal_ts'), execute_ts)
             self.last_entry_reason[symbol] = (
                 f"{strategy_name} UT {ut_signal.upper()} 확정, "
-                f"다음 봉 {ut_signal.upper()} 진입 대기"
+                f"다음 봉 진행 중 {ut_signal.upper()} 진입 대기"
             )
             self._update_stateful_diag(
                 symbol,
@@ -4834,7 +4864,7 @@ class SignalEngine(BaseEngine):
                     smc_tf=tf
                 )
                 last_utsmc_entry_ts = int(self.utsmc_last_entry_signal_ts.get(symbol, 0) or 0)
-                if last_utsmc_entry_ts and int(df.iloc[-2]['timestamp']) == last_utsmc_entry_ts:
+                if last_utsmc_entry_ts and int(df.iloc[-2]['timestamp']) < last_utsmc_entry_ts:
                     raw_exit_long = False
                     raw_exit_short = False
                 if raw_exit_long or raw_exit_short:
@@ -7617,7 +7647,7 @@ class MainController:
             '16': "📝 **전략 선택** (1=UTBOT, 2=UTRSIBB, 3=UTRSI, 4=UTBB, 5=UTSMC)",
             '19': "📝 **UT Bot 설정** 입력 (형식: key,atr,on/off 예: 1,10,off)",
             '20': "RSI/BB 보조설정 입력\n형식: RSI길이,BB길이,BB배수\n예: 6,200,2",
-            '21': "ℹ️ **UT 전략 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙, UTSMC는 UT fresh 다음봉 진입 + internal OB 청산을 사용합니다.",
+            '21': "ℹ️ **UT 전략 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙, UTSMC는 UT fresh 다음봉 진행중 진입 + internal OB 청산을 사용합니다.",
             '22': "📝 **거래소/네트워크 선택** (1=바이낸스 테스트넷, 2=바이낸스 메인넷, 3=업비트 KRW 현물)",
             '23': "📝 **거래량 급등 채굴 기능** (1=ON, 0=OFF)",
             '24': "📝 **채굴 진입 타임프레임** 입력 (예: 5m)\n1m, 5m, 15m, 30m, 1h",
@@ -7736,9 +7766,9 @@ class MainController:
                 "- UTBB 특수 SHORT(하단돌파형): 진입봉이 BB 중간선 하향 + BB 하단선 하향 돌파면 BB 하단선 상향 돌파 또는 UT 롱상태로 청산\n"
                 "- UTBB 특수 SHORT(반등실패형): 중간선 아래 양봉 1~2개 뒤 저점 이탈 음봉이면 진입, BB 중간선 상향 돌파 또는 UT 롱상태로 청산\n"
                 "- UTBB SHORT 청산: 일반은 UT 롱상태 또는 BB 하단선 하향 돌파\n"
-                "- UTSMC: UT fresh signal 확정봉의 바로 다음 봉에만 진입, 청산은 exit TF internal OB 진입 마감 기준\n"
-                "- UTSMC LONG: UT 롱신호 확정 후 다음 봉 LONG 진입, internal bearish OB 진입 마감 청산\n"
-                "- UTSMC SHORT: UT 숏신호 확정 후 다음 봉 SHORT 진입, internal bullish OB 진입 마감 청산\n"
+                "- UTSMC: UT fresh signal 확정봉의 바로 다음 봉 진행 중에 진입, 청산은 exit TF internal OB 진입 마감 기준\n"
+                "- UTSMC LONG: UT 롱신호 확정 후 다음 봉 진행 중 LONG 진입, internal bearish OB 진입 마감 청산\n"
+                "- UTSMC SHORT: UT 숏신호 확정 후 다음 봉 진행 중 SHORT 진입, internal bullish OB 진입 마감 청산\n"
                 "- 모든 판단은 확정봉 기준"
             )
             await self.show_setup_menu(update)
