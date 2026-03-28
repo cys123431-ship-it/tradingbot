@@ -65,17 +65,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 faulthandler.enable()
 CORE_ENGINE = 'signal'
-UT_ONLY_STRATEGIES = {'utbot', 'utrsibb', 'utrsi', 'utbb'}
+UT_ONLY_STRATEGIES = {'utbot', 'utrsibb', 'utrsi', 'utbb', 'utsmc'}
 MA_STRATEGIES = set()
 PATTERN_STRATEGIES = set(UT_ONLY_STRATEGIES)
 CORE_STRATEGIES = set(UT_ONLY_STRATEGIES)
 UT_HYBRID_STRATEGIES = {'utrsibb', 'utrsi', 'utbb'}
-STATEFUL_UT_STRATEGIES = {'utbot'} | UT_HYBRID_STRATEGIES
+STATEFUL_UT_STRATEGIES = {'utbot', 'utsmc'} | UT_HYBRID_STRATEGIES
 STRATEGY_DISPLAY_NAMES = {
     'sma': 'SMA',
     'hma': 'HMA',
     'cameron': 'CAMERON',
     'utbot': 'UTBOT',
+    'utsmc': 'UTSMC',
     'rsibb': 'RSIBB',
     'utrsibb': 'UTRSIBB',
     'utrsi': 'UTRSI',
@@ -181,6 +182,11 @@ class TradingConfig:
                         'key_value': 1.0,
                         'atr_period': 10,
                         'use_heikin_ashi': False
+                    },
+                    'UTSMC': {
+                        'internal_length': 5,
+                        'swing_length': 50,
+                        'use_confluence_filter': False
                     },
                     'RSIBB': {
                         'rsi_length': 6,
@@ -319,6 +325,11 @@ class TradingConfig:
                 'key_value': 1.0,
                 'atr_period': 10,
                 'use_heikin_ashi': False
+            },
+            'UTSMC': {
+                'internal_length': 5,
+                'swing_length': 50,
+                'use_confluence_filter': False
             },
             'RSIBB': {
                 'rsi_length': 6,
@@ -556,7 +567,7 @@ class TradingConfig:
                     "chop_exit_enabled": True
                 },
                 "strategy_params": {
-                    "active_strategy": "sma",
+                    "active_strategy": "utbot",
                     "entry_mode": "cross",
                     "Triple_SMA": {"fast_sma": 2, "slow_sma": 10},
                     "HMA": {"fast_period": 9, "slow_period": 21},
@@ -564,6 +575,11 @@ class TradingConfig:
                         "key_value": 1.0,
                         "atr_period": 10,
                         "use_heikin_ashi": False
+                    },
+                    "UTSMC": {
+                        "internal_length": 5,
+                        "swing_length": 50,
+                        "use_confluence_filter": False
                     },
                     "RSIBB": {
                         "rsi_length": 6,
@@ -1678,6 +1694,14 @@ class SignalEngine(BaseEngine):
             context['raw_state_sig'] = raw_strategy_sig or ut_detail.get('bias_side')
             context['raw_ut_detail'] = ut_detail or {}
             context['precomputed'][active_strategy] = utbot_result
+        elif active_strategy == 'utsmc':
+            utsmc_result = self._calculate_utsmc_signal(df, strategy_params)
+            _, _, utsmc_detail = utsmc_result
+            context['raw_strategy_sig'] = utsmc_detail.get('ut_signal')
+            context['raw_state_sig'] = utsmc_detail.get('ut_state')
+            context['raw_ut_detail'] = utsmc_detail.get('ut_detail') or {}
+            context['raw_hybrid_detail'] = utsmc_detail or {}
+            context['precomputed'][active_strategy] = utsmc_result
         elif active_strategy == 'utbb':
             utbb_result = self._calculate_utbb_signal(symbol, df, strategy_params)
             _, _, hybrid_detail = utbb_result
@@ -2170,6 +2194,160 @@ class SignalEngine(BaseEngine):
             f"(key={key_value:.2f}, ATR={atr_period}, HA={'ON' if use_heikin_ashi else 'OFF'})"
         )
         return None, reason, detail
+
+    def _calculate_smc_structure_scope(self, closed, size, scope_name):
+        result = {
+            'scope_name': str(scope_name or '').lower(),
+            'size': max(2, int(size or 2)),
+            'trend_bias': 0,
+            'trend_label': 'neutral',
+            'bullish_types': [],
+            'bearish_types': [],
+            'pivot_high_level': None,
+            'pivot_low_level': None,
+            'pivot_high_ts': None,
+            'pivot_low_ts': None
+        }
+
+        if closed is None or len(closed) < (result['size'] + 3):
+            return result
+
+        highs = closed['high'].astype(float).tolist()
+        lows = closed['low'].astype(float).tolist()
+        closes = closed['close'].astype(float).tolist()
+        times = closed['timestamp'].astype(int).tolist()
+        n = len(closed)
+
+        pivot_high = None
+        pivot_low = None
+        trend_bias = 0
+
+        for bar_index in range(n):
+            confirm_idx = bar_index - result['size']
+            if confirm_idx >= 0:
+                future_highs = highs[confirm_idx + 1:bar_index + 1]
+                future_lows = lows[confirm_idx + 1:bar_index + 1]
+                center_high = highs[confirm_idx]
+                center_low = lows[confirm_idx]
+
+                if len(future_highs) == result['size'] and center_high > max(future_highs):
+                    pivot_high = {
+                        'level': center_high,
+                        'ts': times[confirm_idx],
+                        'crossed': False
+                    }
+                if len(future_lows) == result['size'] and center_low < min(future_lows):
+                    pivot_low = {
+                        'level': center_low,
+                        'ts': times[confirm_idx],
+                        'crossed': False
+                    }
+
+            close_price = closes[bar_index]
+            if pivot_high and not pivot_high.get('crossed') and close_price > float(pivot_high.get('level', 0.0)):
+                structure_type = 'choch' if trend_bias == -1 else 'bos'
+                trend_bias = 1
+                pivot_high['crossed'] = True
+                if bar_index == (n - 1):
+                    result['bullish_types'].append(f"{result['scope_name']}_{structure_type}")
+
+            if pivot_low and not pivot_low.get('crossed') and close_price < float(pivot_low.get('level', 0.0)):
+                structure_type = 'choch' if trend_bias == 1 else 'bos'
+                trend_bias = -1
+                pivot_low['crossed'] = True
+                if bar_index == (n - 1):
+                    result['bearish_types'].append(f"{result['scope_name']}_{structure_type}")
+
+        result['trend_bias'] = trend_bias
+        result['trend_label'] = 'bullish' if trend_bias == 1 else 'bearish' if trend_bias == -1 else 'neutral'
+        result['pivot_high_level'] = pivot_high.get('level') if pivot_high else None
+        result['pivot_low_level'] = pivot_low.get('level') if pivot_low else None
+        result['pivot_high_ts'] = pivot_high.get('ts') if pivot_high else None
+        result['pivot_low_ts'] = pivot_low.get('ts') if pivot_low else None
+        return result
+
+    def _calculate_smc_structure_signal(self, df, strategy_params):
+        cfg = strategy_params.get('UTSMC', {})
+        internal_length = max(2, int(cfg.get('internal_length', 5) or 5))
+        swing_length = max(internal_length + 1, int(cfg.get('swing_length', 50) or 50))
+
+        closed = df.iloc[:-1].copy().reset_index(drop=True)
+        min_bars = max(swing_length + 5, internal_length + 5, 40)
+        if len(closed) < min_bars:
+            return None, "SMC 구조 데이터 부족", {
+                'internal_length': internal_length,
+                'swing_length': swing_length,
+                'bullish_structure': False,
+                'bearish_structure': False,
+                'bullish_structure_types': [],
+                'bearish_structure_types': [],
+                'structure_tags': [],
+                'signal_ts': int(closed.iloc[-1]['timestamp']) if len(closed) else 0
+            }
+
+        internal_result = self._calculate_smc_structure_scope(closed, internal_length, 'internal')
+        swing_result = self._calculate_smc_structure_scope(closed, swing_length, 'swing')
+
+        bullish_types = list(internal_result.get('bullish_types', [])) + list(swing_result.get('bullish_types', []))
+        bearish_types = list(internal_result.get('bearish_types', [])) + list(swing_result.get('bearish_types', []))
+        bullish_structure = bool(bullish_types)
+        bearish_structure = bool(bearish_types)
+        structure_tags = bullish_types + bearish_types
+        signal_ts = int(closed.iloc[-1]['timestamp']) if len(closed) else 0
+
+        detail = {
+            'internal_length': internal_length,
+            'swing_length': swing_length,
+            'bullish_structure': bullish_structure,
+            'bearish_structure': bearish_structure,
+            'bullish_structure_types': bullish_types,
+            'bearish_structure_types': bearish_types,
+            'structure_tags': structure_tags,
+            'signal_ts': signal_ts,
+            'internal_trend_label': internal_result.get('trend_label'),
+            'swing_trend_label': swing_result.get('trend_label'),
+            'internal_pivot_high_level': internal_result.get('pivot_high_level'),
+            'internal_pivot_low_level': internal_result.get('pivot_low_level'),
+            'swing_pivot_high_level': swing_result.get('pivot_high_level'),
+            'swing_pivot_low_level': swing_result.get('pivot_low_level')
+        }
+
+        if bullish_structure:
+            reason = f"SMC BULLISH STRUCTURE: {', '.join(bullish_types)}"
+            return 'bullish', reason, detail
+
+        if bearish_structure:
+            reason = f"SMC BEARISH STRUCTURE: {', '.join(bearish_types)}"
+            return 'bearish', reason, detail
+
+        reason = (
+            f"SMC 대기: internal={internal_result.get('trend_label', 'neutral')}, "
+            f"swing={swing_result.get('trend_label', 'neutral')}"
+        )
+        return None, reason, detail
+
+    def _calculate_utsmc_signal(self, df, strategy_params):
+        ut_sig, ut_reason, ut_detail = self._calculate_utbot_signal(df, strategy_params)
+        smc_sig, smc_reason, smc_detail = self._calculate_smc_structure_signal(df, strategy_params)
+        ut_state = ut_sig or ut_detail.get('bias_side')
+
+        detail = {
+            'ut_state': ut_state,
+            'ut_signal': ut_sig,
+            'ut_reason': ut_reason,
+            'ut_signal_ts': ut_detail.get('signal_ts'),
+            'ut_detail': ut_detail,
+            'smc_signal': smc_sig,
+            'smc_reason': smc_reason,
+            **(smc_detail or {})
+        }
+
+        if ut_state not in {'long', 'short'}:
+            return None, "UTSMC 대기: UT 상태 계산 대기", detail
+
+        exit_wait_label = 'bearish structure' if ut_state == 'long' else 'bullish structure'
+        reason = f"UTSMC {ut_state.upper()}: UT {ut_state.upper()} 상태, {exit_wait_label} 청산 대기"
+        return ut_state, reason, detail
 
     def _calculate_rsi_signal(self, df, strategy_params):
         cfg = strategy_params.get('RSIBB', {})
@@ -3299,6 +3477,7 @@ class SignalEngine(BaseEngine):
                 and (
                     (active_strategy in MA_STRATEGIES and entry_mode in ['cross', 'position'])
                     or active_strategy == 'cameron'
+                    or active_strategy == 'utsmc'
                     or (self.is_upbit_mode() and active_strategy == 'utbot')
                 )
             )
@@ -3466,7 +3645,7 @@ class SignalEngine(BaseEngine):
             comm_cfg = self.get_runtime_common_settings()
             active_strategy = strategy_params.get('active_strategy', 'utbot').upper()
             entry_mode = strategy_params.get('entry_mode', 'cross').upper()
-            if active_strategy in {'UTBOT', 'RSIBB', 'UTRSIBB', 'UTRSI', 'UTBB'}:
+            if active_strategy in {'UTBOT', 'UTSMC', 'RSIBB', 'UTRSIBB', 'UTRSI', 'UTBB'}:
                 entry_mode = active_strategy
             
             # MicroVBO State
@@ -3692,6 +3871,45 @@ class SignalEngine(BaseEngine):
             self.last_entry_reason[symbol] = f"{strategy_name} 현재 상태는 {target_sig.upper()}지만 진입은 방향 설정 또는 필터로 차단"
         elif pos:
             self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {strategy_name} 반대신호 대기"
+
+    async def _handle_utsmc_primary_strategy(self, symbol, k, pos, strategy_name, raw_strategy_sig, raw_state_sig, raw_smc_detail, sig):
+        target_sig = raw_state_sig
+        entry_sig = sig
+        structure_tags = raw_smc_detail.get('structure_tags') or []
+        structure_tag_text = ", ".join(structure_tags) if structure_tags else "-"
+        bullish_structure = bool(raw_smc_detail.get('bullish_structure'))
+        bearish_structure = bool(raw_smc_detail.get('bearish_structure'))
+
+        if not pos and entry_sig in {'long', 'short'}:
+            self.last_entry_reason[symbol] = f"{strategy_name} UT {entry_sig.upper()} 상태 -> {entry_sig.upper()} 진입"
+            self._update_stateful_diag(
+                symbol,
+                stage='entry_submitted',
+                strategy=strategy_name,
+                raw_state=(target_sig or 'none'),
+                raw_signal=(raw_strategy_sig or 'none'),
+                entry_sig=entry_sig,
+                pos_side=entry_sig.upper(),
+                note=f"UT state entry submitted | smc_tags={structure_tag_text}"
+            )
+            logger.info(f"[{strategy_name}] UT state entry {entry_sig.upper()} (smc tags: {structure_tag_text})")
+            await self.entry(symbol, entry_sig, float(k['c']))
+            return
+
+        if not pos and target_sig in {'long', 'short'}:
+            self.last_entry_reason[symbol] = f"{strategy_name} 현재 상태는 {target_sig.upper()}지만 진입은 방향 설정으로 차단"
+            return
+
+        if pos:
+            if pos['side'] == 'long':
+                hold_note = "SMC bearish structure 청산 대기"
+                if bearish_structure:
+                    hold_note = f"SMC bearish structure 감지({structure_tag_text}), exit TF 청산 대기"
+            else:
+                hold_note = "SMC bullish structure 청산 대기"
+                if bullish_structure:
+                    hold_note = f"SMC bullish structure 감지({structure_tag_text}), exit TF 청산 대기"
+            self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {hold_note}"
 
     async def _handle_ut_hybrid_primary_strategy(self, symbol, k, pos, strategy_name, active_strategy, raw_strategy_sig, raw_state_sig, raw_hybrid_detail, sig):
         timing_label = raw_hybrid_detail.get('timing_label', UT_HYBRID_TIMING_LABELS.get(active_strategy, 'signal'))
@@ -4185,6 +4403,11 @@ class SignalEngine(BaseEngine):
                     latched_timing_available=raw_hybrid_detail.get('latched_timing_available'),
                     latched_timing_signal_ts=raw_hybrid_detail.get('latched_timing_signal_ts'),
                     latched_timing_signal_ts_human=datetime.fromtimestamp(raw_hybrid_detail.get('latched_timing_signal_ts') / 1000).strftime('%m-%d %H:%M') if raw_hybrid_detail.get('latched_timing_signal_ts') else None,
+                    smc_bullish_structure=raw_hybrid_detail.get('bullish_structure'),
+                    smc_bearish_structure=raw_hybrid_detail.get('bearish_structure'),
+                    smc_structure_tags=", ".join(raw_hybrid_detail.get('structure_tags') or []) if raw_hybrid_detail.get('structure_tags') else None,
+                    smc_signal=raw_hybrid_detail.get('smc_signal'),
+                    smc_reason=raw_hybrid_detail.get('smc_reason'),
                     feed_last_ts=feed_last_ts,
                     feed_last_ts_human=datetime.fromtimestamp(feed_last_ts / 1000).strftime('%m-%d %H:%M') if feed_last_ts else None,
                     feed_last_close=float(df.iloc[-1]['close']) if len(df) >= 1 else None,
@@ -4229,6 +4452,18 @@ class SignalEngine(BaseEngine):
                     strategy_name,
                     raw_strategy_sig,
                     raw_state_sig,
+                    sig
+                )
+
+            elif active_strategy == 'utsmc':
+                await self._handle_utsmc_primary_strategy(
+                    symbol,
+                    k,
+                    pos,
+                    strategy_name,
+                    raw_strategy_sig,
+                    raw_state_sig,
+                    raw_hybrid_detail,
                     sig
                 )
 
@@ -4332,9 +4567,18 @@ class SignalEngine(BaseEngine):
             active_strategy = strategy_params.get('active_strategy', 'utbot').lower()
             raw_exit_long = False
             raw_exit_short = False
+            bypass_exit_filters = False
             c_f = c_s = 0.0
 
-            if active_strategy == 'cameron':
+            if active_strategy == 'utsmc':
+                strategy_name = "UTSMC(Exit)"
+                smc_sig, exit_reason, smc_detail = self._calculate_smc_structure_signal(df, strategy_params)
+                raw_exit_long = current_side.lower() == 'long' and bool(smc_detail.get('bearish_structure'))
+                raw_exit_short = current_side.lower() == 'short' and bool(smc_detail.get('bullish_structure'))
+                bypass_exit_filters = True
+                if raw_exit_long or raw_exit_short:
+                    logger.info(f"[Exit Debug] {symbol} {strategy_name}: {exit_reason}")
+            elif active_strategy == 'cameron':
                 strategy_name = "CAMERON(Exit)"
                 exit_sig, exit_reason, _ = self._calculate_cameron_signal(df, strategy_params)
                 raw_exit_long = current_side.lower() == 'long' and exit_sig == 'short'
@@ -4395,6 +4639,15 @@ class SignalEngine(BaseEngine):
             # ?좏샇媛 ?녿뜑?쇰룄 ?꾪꽣 媛믪? 怨꾩궛?댁꽌 ??쒕낫?쒖뿉 ?낅뜲?댄듃 (??Pending 諛⑹?)
             await self._update_exit_filter_values(symbol, df, current_side)
             if not raw_exit_long and not raw_exit_short:
+                return True
+
+            if bypass_exit_filters:
+                if current_side.lower() == 'long' and raw_exit_long:
+                    logger.info(f"[Exit {tf}] LONG Exit Triggered by UTSMC bearish structure")
+                    await self.exit_position(symbol, f"{strategy_name}_BearishStructure")
+                elif current_side.lower() == 'short' and raw_exit_short:
+                    logger.info(f"[Exit {tf}] SHORT Exit Triggered by UTSMC bullish structure")
+                    await self.exit_position(symbol, f"{strategy_name}_BullishStructure")
                 return True
             
             # ===== 3. Exit Filter logic check =====
@@ -4542,6 +4795,13 @@ class SignalEngine(BaseEngine):
                     sig = bias_sig
             is_bullish = sig == 'long'
             is_bearish = sig == 'short'
+
+        elif active_strategy == 'utsmc':
+            entry_mode = 'utsmc'
+            sig, entry_reason, utsmc_detail = precomputed.get('utsmc') or self._calculate_utsmc_signal(df, strategy_params)
+            ut_state = utsmc_detail.get('ut_state')
+            is_bullish = ut_state == 'long'
+            is_bearish = ut_state == 'short'
 
         elif active_strategy == 'utbb':
             entry_mode = 'utbb'
@@ -7047,7 +7307,7 @@ class MainController:
 16. 전략 (`{active_strategy}`)
 19. UT Bot (`K={utbot_key:.2f}` / `ATR={utbot_atr}` / `HA={utbot_ha}`)
 20. RSI+BB 보조설정 (`RSI={rsibb_rsi}` / `BB={rsibb_bb}` / `x{rsibb_mult:.2f}`)
-21. UT Hybrid 안내 (`UTRSI / UTBB / UTRSIBB`)
+21. UT 전략 안내 (`UTBOT / UTRSI / UTBB / UTRSIBB / UTSMC`)
 13. TP/SL 자동청산 (`{tp_sl_status}`)
 36. ROE 자동청산 (`{tp_status}`)
 37. 손절 자동청산 (`{sl_status}`)
@@ -7093,10 +7353,10 @@ class MainController:
             '12': "📝 **Grid 설정** 입력 (예: on,200 또는 off)",
             '14': "📝 **N Days** 입력 (예: 4)",
             '15': "📝 **K1/K2** 입력 (예: 0.5,0.5)",
-            '16': "📝 **전략 선택** (1=UTBOT, 2=UTRSIBB, 3=UTRSI, 4=UTBB)",
+            '16': "📝 **전략 선택** (1=UTBOT, 2=UTRSIBB, 3=UTRSI, 4=UTBB, 5=UTSMC)",
             '19': "📝 **UT Bot 설정** 입력 (형식: key,atr,on/off 예: 1,10,off)",
             '20': "RSI/BB 보조설정 입력\n형식: RSI길이,BB길이,BB배수\n예: 6,200,2",
-            '21': "ℹ️ **UT Hybrid 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙을 사용합니다.",
+            '21': "ℹ️ **UT 전략 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙, UTSMC는 UT 진입 + SMC 청산을 사용합니다.",
             '22': "📝 **거래소/네트워크 선택** (1=바이낸스 테스트넷, 2=바이낸스 메인넷, 3=업비트 KRW 현물)",
             '23': "📝 **거래량 급등 채굴 기능** (1=ON, 0=OFF)",
             '24': "📝 **채굴 진입 타임프레임** 입력 (예: 5m)\n1m, 5m, 15m, 30m, 1h",
@@ -7215,6 +7475,9 @@ class MainController:
                 "- UTBB 특수 SHORT(하단돌파형): 진입봉이 BB 중간선 하향 + BB 하단선 하향 돌파면 BB 하단선 상향 돌파 또는 UT 롱상태로 청산\n"
                 "- UTBB 특수 SHORT(반등실패형): 중간선 아래 양봉 1~2개 뒤 저점 이탈 음봉이면 진입, BB 중간선 상향 돌파 또는 UT 롱상태로 청산\n"
                 "- UTBB SHORT 청산: 일반은 UT 롱상태 또는 BB 하단선 하향 돌파\n"
+                "- UTSMC: 진입은 UT 상태 유지, 청산은 exit TF SMC structure 기준\n"
+                "- UTSMC LONG: UT 롱상태면 진입, bearish structure 확정봉 청산\n"
+                "- UTSMC SHORT: UT 숏상태면 진입, bullish structure 확정봉 청산\n"
                 "- 모든 판단은 확정봉 기준"
             )
             await self.show_setup_menu(update)
@@ -7526,7 +7789,8 @@ class MainController:
                     '1': 'utbot',
                     '2': 'utrsibb',
                     '3': 'utrsi',
-                    '4': 'utbb'
+                    '4': 'utbb',
+                    '5': 'utsmc'
                 }
                 val_lower = val.lower().strip()
                 
@@ -7545,8 +7809,8 @@ class MainController:
                     await update.message.reply_text(f"✅ 전략 변경: {val_lower.upper()}")
                 else:
                     await update.message.reply_text(
-                        "❌ 1~4 또는 utbot/utrsibb/utrsi/utbb를 입력하세요.\n"
-                        "1=UTBOT, 2=UTRSIBB, 3=UTRSI, 4=UTBB"
+                        "❌ 1~5 또는 utbot/utrsibb/utrsi/utbb/utsmc를 입력하세요.\n"
+                        "1=UTBOT, 2=UTRSIBB, 3=UTRSI, 4=UTBB, 5=UTSMC"
                     )
                     return SELECT
             
@@ -8665,6 +8929,19 @@ class MainController:
                             msg += f"UT 확정봉: `{stateful_diag.get('closed_ohlc_text')}`\n"
                         if stateful_diag.get('live_ohlc_text'):
                             msg += f"UT 진행봉: `{stateful_diag.get('live_ohlc_text')}`\n"
+                        if (
+                            stateful_diag.get('smc_bullish_structure') is not None
+                            or stateful_diag.get('smc_bearish_structure') is not None
+                            or stateful_diag.get('smc_structure_tags')
+                        ):
+                            smc_bull = 'Y' if stateful_diag.get('smc_bullish_structure') else 'N'
+                            smc_bear = 'Y' if stateful_diag.get('smc_bearish_structure') else 'N'
+                            smc_line = f"SMC 구조: bull `{smc_bull}` | bear `{smc_bear}`"
+                            if stateful_diag.get('smc_structure_tags'):
+                                smc_line += f" | tags `{stateful_diag.get('smc_structure_tags')}`"
+                            msg += smc_line + "\n"
+                        if stateful_diag.get('smc_reason'):
+                            msg += f"SMC 판정: `{stateful_diag.get('smc_reason')}`\n"
                         diag_note = stateful_diag.get('note')
                         if diag_note:
                             msg += f"진단메모: `{diag_note}`\n"
