@@ -1593,6 +1593,8 @@ class SignalEngine(BaseEngine):
         self.ut_hybrid_timing_consumed_ts = {}
         self.utbb_special_long_state = {}
         self.utbb_special_short_state = {}
+        self.utsmc_pending_entries = {}
+        self.utsmc_last_entry_signal_ts = {}
         
         self.last_heartbeat = 0
         self.consecutive_errors = 0
@@ -1657,6 +1659,8 @@ class SignalEngine(BaseEngine):
         self.ut_hybrid_timing_consumed_ts = {}
         self.utbb_special_long_state = {}
         self.utbb_special_short_state = {}
+        self.utsmc_pending_entries = {}
+        self.utsmc_last_entry_signal_ts = {}
 
     def reset_signal_runtime_state(self, *, reset_entry_cache=False, reset_exit_cache=False, reset_stateful_strategy=False):
         if reset_entry_cache:
@@ -2326,9 +2330,171 @@ class SignalEngine(BaseEngine):
         )
         return None, reason, detail
 
+    def _calculate_smc_internal_ob_signal(self, df, strategy_params):
+        cfg = strategy_params.get('UTSMC', {})
+        internal_length = max(2, int(cfg.get('internal_length', 5) or 5))
+
+        closed = df.iloc[:-1].copy().reset_index(drop=True)
+        min_bars = max(internal_length + 10, 40)
+        if len(closed) < min_bars:
+            return None, "SMC internal OB 데이터 부족", {
+                'internal_length': internal_length,
+                'bullish_internal_ob_entry': False,
+                'bearish_internal_ob_entry': False,
+                'bullish_ob_top': None,
+                'bullish_ob_bottom': None,
+                'bearish_ob_top': None,
+                'bearish_ob_bottom': None,
+                'signal_ts': int(closed.iloc[-1]['timestamp']) if len(closed) else 0
+            }
+
+        highs = closed['high'].astype(float).tolist()
+        lows = closed['low'].astype(float).tolist()
+        closes = closed['close'].astype(float).tolist()
+        times = closed['timestamp'].astype(int).tolist()
+        n = len(closed)
+
+        pivot_high = None
+        pivot_low = None
+        trend_bias = 0
+        latest_bullish_ob = None
+        latest_bearish_ob = None
+
+        for bar_index in range(n):
+            confirm_idx = bar_index - internal_length
+            if confirm_idx >= 0:
+                future_highs = highs[confirm_idx + 1:bar_index + 1]
+                future_lows = lows[confirm_idx + 1:bar_index + 1]
+                center_high = highs[confirm_idx]
+                center_low = lows[confirm_idx]
+
+                if len(future_highs) == internal_length and center_high > max(future_highs):
+                    pivot_high = {
+                        'level': center_high,
+                        'ts': times[confirm_idx],
+                        'bar_index': confirm_idx,
+                        'crossed': False
+                    }
+                if len(future_lows) == internal_length and center_low < min(future_lows):
+                    pivot_low = {
+                        'level': center_low,
+                        'ts': times[confirm_idx],
+                        'bar_index': confirm_idx,
+                        'crossed': False
+                    }
+
+            high_price = highs[bar_index]
+            low_price = lows[bar_index]
+            close_price = closes[bar_index]
+
+            if latest_bearish_ob and high_price > float(latest_bearish_ob.get('top', 0.0)):
+                latest_bearish_ob = None
+            if latest_bullish_ob and low_price < float(latest_bullish_ob.get('bottom', 0.0)):
+                latest_bullish_ob = None
+
+            if pivot_high and not pivot_high.get('crossed') and close_price > float(pivot_high.get('level', 0.0)):
+                trend_bias = 1
+                pivot_high['crossed'] = True
+                start_idx = max(0, int(pivot_high.get('bar_index', bar_index)))
+                end_idx = bar_index
+                if start_idx <= end_idx:
+                    ob_slice = lows[start_idx:end_idx + 1]
+                    if ob_slice:
+                        rel_idx = ob_slice.index(min(ob_slice))
+                        ob_idx = start_idx + rel_idx
+                        latest_bullish_ob = {
+                            'top': highs[ob_idx],
+                            'bottom': lows[ob_idx],
+                            'origin_ts': times[ob_idx],
+                            'created_ts': times[bar_index],
+                            'label': 'internal_bullish_ob'
+                        }
+
+            if pivot_low and not pivot_low.get('crossed') and close_price < float(pivot_low.get('level', 0.0)):
+                trend_bias = -1
+                pivot_low['crossed'] = True
+                start_idx = max(0, int(pivot_low.get('bar_index', bar_index)))
+                end_idx = bar_index
+                if start_idx <= end_idx:
+                    ob_slice = highs[start_idx:end_idx + 1]
+                    if ob_slice:
+                        rel_idx = ob_slice.index(max(ob_slice))
+                        ob_idx = start_idx + rel_idx
+                        latest_bearish_ob = {
+                            'top': highs[ob_idx],
+                            'bottom': lows[ob_idx],
+                            'origin_ts': times[ob_idx],
+                            'created_ts': times[bar_index],
+                            'label': 'internal_bearish_ob'
+                        }
+
+        curr_close = closes[-1]
+        bullish_internal_ob_entry = bool(
+            latest_bullish_ob
+            and float(latest_bullish_ob.get('bottom', curr_close + 1.0)) <= curr_close <= float(latest_bullish_ob.get('top', curr_close - 1.0))
+        )
+        bearish_internal_ob_entry = bool(
+            latest_bearish_ob
+            and float(latest_bearish_ob.get('bottom', curr_close + 1.0)) <= curr_close <= float(latest_bearish_ob.get('top', curr_close - 1.0))
+        )
+
+        detail = {
+            'internal_length': internal_length,
+            'trend_label': 'bullish' if trend_bias == 1 else 'bearish' if trend_bias == -1 else 'neutral',
+            'signal_ts': int(times[-1]),
+            'curr_close': curr_close,
+            'bullish_internal_ob_entry': bullish_internal_ob_entry,
+            'bearish_internal_ob_entry': bearish_internal_ob_entry,
+            'bullish_ob_top': latest_bullish_ob.get('top') if latest_bullish_ob else None,
+            'bullish_ob_bottom': latest_bullish_ob.get('bottom') if latest_bullish_ob else None,
+            'bearish_ob_top': latest_bearish_ob.get('top') if latest_bearish_ob else None,
+            'bearish_ob_bottom': latest_bearish_ob.get('bottom') if latest_bearish_ob else None,
+            'bullish_ob_origin_ts': latest_bullish_ob.get('origin_ts') if latest_bullish_ob else None,
+            'bearish_ob_origin_ts': latest_bearish_ob.get('origin_ts') if latest_bearish_ob else None,
+            'ob_tags': [tag for tag, active in (
+                ('internal_bullish_ob_entry', bullish_internal_ob_entry),
+                ('internal_bearish_ob_entry', bearish_internal_ob_entry),
+            ) if active]
+        }
+
+        if bullish_internal_ob_entry:
+            reason = (
+                f"SMC INTERNAL BULLISH OB ENTRY: "
+                f"{float(latest_bullish_ob.get('bottom')):.4f} ~ {float(latest_bullish_ob.get('top')):.4f}"
+            )
+            return 'bullish_ob_entry', reason, detail
+
+        if bearish_internal_ob_entry:
+            reason = (
+                f"SMC INTERNAL BEARISH OB ENTRY: "
+                f"{float(latest_bearish_ob.get('bottom')):.4f} ~ {float(latest_bearish_ob.get('top')):.4f}"
+            )
+            return 'bearish_ob_entry', reason, detail
+
+        reason = (
+            f"SMC internal OB 대기: trend={detail['trend_label']}, "
+            f"bull_ob={'Y' if latest_bullish_ob else 'N'}, bear_ob={'Y' if latest_bearish_ob else 'N'}"
+        )
+        return None, reason, detail
+
+    def _set_utsmc_pending_entry(self, symbol, side, signal_ts, execute_ts):
+        if side not in {'long', 'short'}:
+            return
+        self.utsmc_pending_entries[symbol] = {
+            'side': side,
+            'signal_ts': int(signal_ts or 0),
+            'execute_ts': int(execute_ts or 0)
+        }
+
+    def _get_utsmc_pending_entry(self, symbol):
+        return self.utsmc_pending_entries.get(symbol)
+
+    def _clear_utsmc_pending_entry(self, symbol):
+        self.utsmc_pending_entries.pop(symbol, None)
+
     def _calculate_utsmc_signal(self, df, strategy_params):
         ut_sig, ut_reason, ut_detail = self._calculate_utbot_signal(df, strategy_params)
-        smc_sig, smc_reason, smc_detail = self._calculate_smc_structure_signal(df, strategy_params)
+        smc_sig, smc_reason, smc_detail = self._calculate_smc_internal_ob_signal(df, strategy_params)
         ut_state = ut_sig or ut_detail.get('bias_side')
 
         detail = {
@@ -2345,9 +2511,15 @@ class SignalEngine(BaseEngine):
         if ut_state not in {'long', 'short'}:
             return None, "UTSMC 대기: UT 상태 계산 대기", detail
 
-        exit_wait_label = 'bearish structure' if ut_state == 'long' else 'bullish structure'
-        reason = f"UTSMC {ut_state.upper()}: UT {ut_state.upper()} 상태, {exit_wait_label} 청산 대기"
-        return ut_state, reason, detail
+        exit_wait_label = 'internal bearish OB entry' if ut_state == 'long' else 'internal bullish OB entry'
+        if ut_sig in {'long', 'short'}:
+            reason = (
+                f"UTSMC {ut_sig.upper()} SIGNAL: "
+                f"다음 봉 {ut_sig.upper()} 진입 대기, 청산은 {exit_wait_label}"
+            )
+        else:
+            reason = f"UTSMC 상태 유지: UT {ut_state.upper()} 상태, 신규 진입은 fresh signal 다음 봉만 허용"
+        return ut_sig, reason, detail
 
     def _calculate_rsi_signal(self, df, strategy_params):
         cfg = strategy_params.get('RSIBB', {})
@@ -3874,42 +4046,105 @@ class SignalEngine(BaseEngine):
 
     async def _handle_utsmc_primary_strategy(self, symbol, k, pos, strategy_name, raw_strategy_sig, raw_state_sig, raw_smc_detail, sig):
         target_sig = raw_state_sig
-        entry_sig = sig
-        structure_tags = raw_smc_detail.get('structure_tags') or []
-        structure_tag_text = ", ".join(structure_tags) if structure_tags else "-"
-        bullish_structure = bool(raw_smc_detail.get('bullish_structure'))
-        bearish_structure = bool(raw_smc_detail.get('bearish_structure'))
+        ut_signal = raw_strategy_sig if raw_strategy_sig in {'long', 'short'} else None
+        current_ts = int(k.get('t') or 0)
+        tf = self.get_runtime_common_settings().get('entry_timeframe', self.get_runtime_common_settings().get('timeframe', '15m'))
+        candle_ms = self._timeframe_to_ms(tf)
+        pending = self._get_utsmc_pending_entry(symbol)
+        smc_reason = raw_smc_detail.get('smc_reason') or raw_smc_detail.get('smc_internal_ob_reason')
+        ob_tags = raw_smc_detail.get('ob_tags') or []
+        ob_tag_text = ", ".join(ob_tags) if ob_tags else "-"
+        bullish_ob_entry = bool(raw_smc_detail.get('bullish_internal_ob_entry'))
+        bearish_ob_entry = bool(raw_smc_detail.get('bearish_internal_ob_entry'))
 
-        if not pos and entry_sig in {'long', 'short'}:
-            self.last_entry_reason[symbol] = f"{strategy_name} UT {entry_sig.upper()} 상태 -> {entry_sig.upper()} 진입"
-            self._update_stateful_diag(
-                symbol,
-                stage='entry_submitted',
-                strategy=strategy_name,
-                raw_state=(target_sig or 'none'),
-                raw_signal=(raw_strategy_sig or 'none'),
-                entry_sig=entry_sig,
-                pos_side=entry_sig.upper(),
-                note=f"UT state entry submitted | smc_tags={structure_tag_text}"
-            )
-            logger.info(f"[{strategy_name}] UT state entry {entry_sig.upper()} (smc tags: {structure_tag_text})")
-            await self.entry(symbol, entry_sig, float(k['c']))
-            return
-
-        if not pos and target_sig in {'long', 'short'}:
-            self.last_entry_reason[symbol] = f"{strategy_name} 현재 상태는 {target_sig.upper()}지만 진입은 방향 설정으로 차단"
-            return
+        if pending and current_ts > int(pending.get('execute_ts') or 0):
+            self._clear_utsmc_pending_entry(symbol)
+            pending = None
 
         if pos:
+            self._clear_utsmc_pending_entry(symbol)
+            self.utsmc_last_entry_signal_ts[symbol] = int(self.utsmc_last_entry_signal_ts.get(symbol, 0) or 0)
             if pos['side'] == 'long':
-                hold_note = "SMC bearish structure 청산 대기"
-                if bearish_structure:
-                    hold_note = f"SMC bearish structure 감지({structure_tag_text}), exit TF 청산 대기"
+                hold_note = "SMC internal bearish OB 진입 마감 청산 대기"
+                if bearish_ob_entry:
+                    hold_note = f"SMC internal bearish OB 감지({ob_tag_text}), exit TF 청산 대기"
             else:
-                hold_note = "SMC bullish structure 청산 대기"
-                if bullish_structure:
-                    hold_note = f"SMC bullish structure 감지({structure_tag_text}), exit TF 청산 대기"
+                hold_note = "SMC internal bullish OB 진입 마감 청산 대기"
+                if bullish_ob_entry:
+                    hold_note = f"SMC internal bullish OB 감지({ob_tag_text}), exit TF 청산 대기"
             self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {hold_note}"
+            return
+
+        if pending and ut_signal and ut_signal != pending.get('side'):
+            execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
+            self._set_utsmc_pending_entry(symbol, ut_signal, raw_smc_detail.get('ut_signal_ts'), execute_ts)
+            self.last_entry_reason[symbol] = (
+                f"{strategy_name} 기존 {pending.get('side', '').upper()} 예약 취소, "
+                f"새 UT {ut_signal.upper()} 신호로 다음 봉 진입 대기"
+            )
+            self._update_stateful_diag(
+                symbol,
+                stage='entry_armed',
+                strategy=strategy_name,
+                raw_state=(target_sig or 'none'),
+                raw_signal=(ut_signal or 'none'),
+                entry_sig=(ut_signal or 'none'),
+                pos_side='NONE',
+                note=f"pending replaced | execute_ts={execute_ts} | ob={smc_reason or '-'}"
+            )
+            return
+
+        if pending and current_ts == int(pending.get('execute_ts') or 0):
+            entry_sig = str(pending.get('side') or '').lower()
+            self._clear_utsmc_pending_entry(symbol)
+            if entry_sig in {'long', 'short'}:
+                self.last_entry_reason[symbol] = f"{strategy_name} 이전 UT {entry_sig.upper()} 신호 기준 다음 봉 {entry_sig.upper()} 진입"
+                self._update_stateful_diag(
+                    symbol,
+                    stage='entry_submitted',
+                    strategy=strategy_name,
+                    raw_state=(target_sig or 'none'),
+                    raw_signal=(ut_signal or 'none'),
+                    entry_sig=entry_sig,
+                    pos_side=entry_sig.upper(),
+                    note=f"delayed next-candle entry | ob={smc_reason or '-'}"
+                )
+                logger.info(f"[{strategy_name}] next-candle entry {entry_sig.upper()}")
+                self.utsmc_last_entry_signal_ts[symbol] = current_ts
+                await self.entry(symbol, entry_sig, float(k['c']))
+                return
+
+        if ut_signal in {'long', 'short'}:
+            execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
+            self._set_utsmc_pending_entry(symbol, ut_signal, raw_smc_detail.get('ut_signal_ts'), execute_ts)
+            self.last_entry_reason[symbol] = (
+                f"{strategy_name} UT {ut_signal.upper()} 확정, "
+                f"다음 봉 {ut_signal.upper()} 진입 대기"
+            )
+            self._update_stateful_diag(
+                symbol,
+                stage='entry_armed',
+                strategy=strategy_name,
+                raw_state=(target_sig or 'none'),
+                raw_signal=(ut_signal or 'none'),
+                entry_sig=(ut_signal or 'none'),
+                pos_side='NONE',
+                note=f"pending next candle | execute_ts={execute_ts} | ob={smc_reason or '-'}"
+            )
+            return
+
+        if pending:
+            self.last_entry_reason[symbol] = (
+                f"{strategy_name} 예약된 {str(pending.get('side', '')).upper()} 진입 대기 "
+                f"(다음 봉 ts={int(pending.get('execute_ts') or 0)})"
+            )
+            return
+
+        if target_sig in {'long', 'short'}:
+            self.last_entry_reason[symbol] = (
+                f"{strategy_name} 현재 UT 상태는 {target_sig.upper()}지만 "
+                f"fresh signal 다음 봉에서만 진입"
+            )
 
     async def _handle_ut_hybrid_primary_strategy(self, symbol, k, pos, strategy_name, active_strategy, raw_strategy_sig, raw_state_sig, raw_hybrid_detail, sig):
         timing_label = raw_hybrid_detail.get('timing_label', UT_HYBRID_TIMING_LABELS.get(active_strategy, 'signal'))
@@ -4403,11 +4638,24 @@ class SignalEngine(BaseEngine):
                     latched_timing_available=raw_hybrid_detail.get('latched_timing_available'),
                     latched_timing_signal_ts=raw_hybrid_detail.get('latched_timing_signal_ts'),
                     latched_timing_signal_ts_human=datetime.fromtimestamp(raw_hybrid_detail.get('latched_timing_signal_ts') / 1000).strftime('%m-%d %H:%M') if raw_hybrid_detail.get('latched_timing_signal_ts') else None,
-                    smc_bullish_structure=raw_hybrid_detail.get('bullish_structure'),
-                    smc_bearish_structure=raw_hybrid_detail.get('bearish_structure'),
-                    smc_structure_tags=", ".join(raw_hybrid_detail.get('structure_tags') or []) if raw_hybrid_detail.get('structure_tags') else None,
-                    smc_signal=raw_hybrid_detail.get('smc_signal'),
-                    smc_reason=raw_hybrid_detail.get('smc_reason'),
+                    utsmc_entry_bullish_ob_entry=(
+                        raw_hybrid_detail.get('bullish_internal_ob_entry') if active_strategy == 'utsmc' else None
+                    ),
+                    utsmc_entry_bearish_ob_entry=(
+                        raw_hybrid_detail.get('bearish_internal_ob_entry') if active_strategy == 'utsmc' else None
+                    ),
+                    utsmc_entry_ob_tags=(
+                        ", ".join(raw_hybrid_detail.get('ob_tags') or [])
+                        if active_strategy == 'utsmc' and raw_hybrid_detail.get('ob_tags')
+                        else None
+                    ),
+                    utsmc_entry_smc_signal=(
+                        raw_hybrid_detail.get('smc_signal') if active_strategy == 'utsmc' else None
+                    ),
+                    utsmc_entry_smc_reason=(
+                        raw_hybrid_detail.get('smc_reason') if active_strategy == 'utsmc' else None
+                    ),
+                    utsmc_entry_tf=tf if active_strategy == 'utsmc' else None,
                     feed_last_ts=feed_last_ts,
                     feed_last_ts_human=datetime.fromtimestamp(feed_last_ts / 1000).strftime('%m-%d %H:%M') if feed_last_ts else None,
                     feed_last_close=float(df.iloc[-1]['close']) if len(df) >= 1 else None,
@@ -4572,10 +4820,23 @@ class SignalEngine(BaseEngine):
 
             if active_strategy == 'utsmc':
                 strategy_name = "UTSMC(Exit)"
-                smc_sig, exit_reason, smc_detail = self._calculate_smc_structure_signal(df, strategy_params)
-                raw_exit_long = current_side.lower() == 'long' and bool(smc_detail.get('bearish_structure'))
-                raw_exit_short = current_side.lower() == 'short' and bool(smc_detail.get('bullish_structure'))
+                smc_sig, exit_reason, smc_detail = self._calculate_smc_internal_ob_signal(df, strategy_params)
+                raw_exit_long = current_side.lower() == 'long' and bool(smc_detail.get('bearish_internal_ob_entry'))
+                raw_exit_short = current_side.lower() == 'short' and bool(smc_detail.get('bullish_internal_ob_entry'))
                 bypass_exit_filters = True
+                self._update_stateful_diag(
+                    symbol,
+                    smc_bullish_ob_entry=smc_detail.get('bullish_internal_ob_entry'),
+                    smc_bearish_ob_entry=smc_detail.get('bearish_internal_ob_entry'),
+                    smc_ob_tags=", ".join(smc_detail.get('ob_tags') or []) if smc_detail.get('ob_tags') else None,
+                    smc_signal=smc_sig,
+                    smc_reason=exit_reason,
+                    smc_tf=tf
+                )
+                last_utsmc_entry_ts = int(self.utsmc_last_entry_signal_ts.get(symbol, 0) or 0)
+                if last_utsmc_entry_ts and int(df.iloc[-2]['timestamp']) == last_utsmc_entry_ts:
+                    raw_exit_long = False
+                    raw_exit_short = False
                 if raw_exit_long or raw_exit_short:
                     logger.info(f"[Exit Debug] {symbol} {strategy_name}: {exit_reason}")
             elif active_strategy == 'cameron':
@@ -4643,11 +4904,11 @@ class SignalEngine(BaseEngine):
 
             if bypass_exit_filters:
                 if current_side.lower() == 'long' and raw_exit_long:
-                    logger.info(f"[Exit {tf}] LONG Exit Triggered by UTSMC bearish structure")
-                    await self.exit_position(symbol, f"{strategy_name}_BearishStructure")
+                    logger.info(f"[Exit {tf}] LONG Exit Triggered by UTSMC internal bearish OB entry")
+                    await self.exit_position(symbol, f"{strategy_name}_InternalBearishOBEntry")
                 elif current_side.lower() == 'short' and raw_exit_short:
-                    logger.info(f"[Exit {tf}] SHORT Exit Triggered by UTSMC bullish structure")
-                    await self.exit_position(symbol, f"{strategy_name}_BullishStructure")
+                    logger.info(f"[Exit {tf}] SHORT Exit Triggered by UTSMC internal bullish OB entry")
+                    await self.exit_position(symbol, f"{strategy_name}_InternalBullishOBEntry")
                 return True
             
             # ===== 3. Exit Filter logic check =====
@@ -7356,7 +7617,7 @@ class MainController:
             '16': "📝 **전략 선택** (1=UTBOT, 2=UTRSIBB, 3=UTRSI, 4=UTBB, 5=UTSMC)",
             '19': "📝 **UT Bot 설정** 입력 (형식: key,atr,on/off 예: 1,10,off)",
             '20': "RSI/BB 보조설정 입력\n형식: RSI길이,BB길이,BB배수\n예: 6,200,2",
-            '21': "ℹ️ **UT 전략 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙, UTSMC는 UT 진입 + SMC 청산을 사용합니다.",
+            '21': "ℹ️ **UT 전략 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙, UTSMC는 UT fresh 다음봉 진입 + internal OB 청산을 사용합니다.",
             '22': "📝 **거래소/네트워크 선택** (1=바이낸스 테스트넷, 2=바이낸스 메인넷, 3=업비트 KRW 현물)",
             '23': "📝 **거래량 급등 채굴 기능** (1=ON, 0=OFF)",
             '24': "📝 **채굴 진입 타임프레임** 입력 (예: 5m)\n1m, 5m, 15m, 30m, 1h",
@@ -7475,9 +7736,9 @@ class MainController:
                 "- UTBB 특수 SHORT(하단돌파형): 진입봉이 BB 중간선 하향 + BB 하단선 하향 돌파면 BB 하단선 상향 돌파 또는 UT 롱상태로 청산\n"
                 "- UTBB 특수 SHORT(반등실패형): 중간선 아래 양봉 1~2개 뒤 저점 이탈 음봉이면 진입, BB 중간선 상향 돌파 또는 UT 롱상태로 청산\n"
                 "- UTBB SHORT 청산: 일반은 UT 롱상태 또는 BB 하단선 하향 돌파\n"
-                "- UTSMC: 진입은 UT 상태 유지, 청산은 exit TF SMC structure 기준\n"
-                "- UTSMC LONG: UT 롱상태면 진입, bearish structure 확정봉 청산\n"
-                "- UTSMC SHORT: UT 숏상태면 진입, bullish structure 확정봉 청산\n"
+                "- UTSMC: UT fresh signal 확정봉의 바로 다음 봉에만 진입, 청산은 exit TF internal OB 진입 마감 기준\n"
+                "- UTSMC LONG: UT 롱신호 확정 후 다음 봉 LONG 진입, internal bearish OB 진입 마감 청산\n"
+                "- UTSMC SHORT: UT 숏신호 확정 후 다음 봉 SHORT 진입, internal bullish OB 진입 마감 청산\n"
                 "- 모든 판단은 확정봉 기준"
             )
             await self.show_setup_menu(update)
@@ -7804,6 +8065,7 @@ class MainController:
                     if signal_engine:
                         self._reset_signal_engine_runtime_state(
                             reset_entry_cache=True,
+                            reset_exit_cache=True,
                             reset_stateful_strategy=True
                         )
                     await update.message.reply_text(f"✅ 전략 변경: {val_lower.upper()}")
@@ -8930,18 +9192,33 @@ class MainController:
                         if stateful_diag.get('live_ohlc_text'):
                             msg += f"UT 진행봉: `{stateful_diag.get('live_ohlc_text')}`\n"
                         if (
-                            stateful_diag.get('smc_bullish_structure') is not None
-                            or stateful_diag.get('smc_bearish_structure') is not None
-                            or stateful_diag.get('smc_structure_tags')
+                            stateful_diag.get('utsmc_entry_bullish_ob_entry') is not None
+                            or stateful_diag.get('utsmc_entry_bearish_ob_entry') is not None
+                            or stateful_diag.get('utsmc_entry_ob_tags')
                         ):
-                            smc_bull = 'Y' if stateful_diag.get('smc_bullish_structure') else 'N'
-                            smc_bear = 'Y' if stateful_diag.get('smc_bearish_structure') else 'N'
-                            smc_line = f"SMC 구조: bull `{smc_bull}` | bear `{smc_bear}`"
-                            if stateful_diag.get('smc_structure_tags'):
-                                smc_line += f" | tags `{stateful_diag.get('smc_structure_tags')}`"
+                            smc_entry_bull = 'Y' if stateful_diag.get('utsmc_entry_bullish_ob_entry') else 'N'
+                            smc_entry_bear = 'Y' if stateful_diag.get('utsmc_entry_bearish_ob_entry') else 'N'
+                            smc_entry_tf = stateful_diag.get('utsmc_entry_tf')
+                            smc_entry_line = f"UTSMC entry OB{f'[{smc_entry_tf}]' if smc_entry_tf else ''}: bull `{smc_entry_bull}` | bear `{smc_entry_bear}`"
+                            if stateful_diag.get('utsmc_entry_ob_tags'):
+                                smc_entry_line += f" | tags `{stateful_diag.get('utsmc_entry_ob_tags')}`"
+                            msg += smc_entry_line + "\n"
+                        if stateful_diag.get('utsmc_entry_smc_reason'):
+                            msg += f"UTSMC entry 판정: `{stateful_diag.get('utsmc_entry_smc_reason')}`\n"
+                        if (
+                            stateful_diag.get('smc_bullish_ob_entry') is not None
+                            or stateful_diag.get('smc_bearish_ob_entry') is not None
+                            or stateful_diag.get('smc_ob_tags')
+                        ):
+                            smc_bull = 'Y' if stateful_diag.get('smc_bullish_ob_entry') else 'N'
+                            smc_bear = 'Y' if stateful_diag.get('smc_bearish_ob_entry') else 'N'
+                            smc_tf = stateful_diag.get('smc_tf')
+                            smc_line = f"UTSMC exit OB{f'[{smc_tf}]' if smc_tf else ''}: bull `{smc_bull}` | bear `{smc_bear}`"
+                            if stateful_diag.get('smc_ob_tags'):
+                                smc_line += f" | tags `{stateful_diag.get('smc_ob_tags')}`"
                             msg += smc_line + "\n"
                         if stateful_diag.get('smc_reason'):
-                            msg += f"SMC 판정: `{stateful_diag.get('smc_reason')}`\n"
+                            msg += f"UTSMC exit 판정: `{stateful_diag.get('smc_reason')}`\n"
                         diag_note = stateful_diag.get('note')
                         if diag_note:
                             msg += f"진단메모: `{diag_note}`\n"
