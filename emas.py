@@ -6558,6 +6558,33 @@ class MainController:
             return ['BTC/KRW'] if self.is_upbit_mode() else ['BTC/USDT']
         return list(watchlist)
 
+    def _reset_signal_engine_runtime_state(self, *, reset_entry_cache=False, reset_exit_cache=False, reset_stateful_strategy=False):
+        signal_engine = self.engines.get('signal')
+        if not signal_engine:
+            return None
+
+        if reset_entry_cache:
+            signal_engine.last_processed_candle_ts = {}
+            signal_engine.last_candle_time = {}
+            signal_engine.last_candle_success = {}
+
+        if reset_exit_cache:
+            signal_engine.last_processed_exit_candle_ts = {}
+
+        if reset_stateful_strategy:
+            signal_engine.last_state_sync_candle_ts = {}
+            signal_engine.last_stateful_retry_ts = {}
+            signal_engine.last_stateful_diag = {}
+            signal_engine.last_stateful_diag_notice = {}
+            signal_engine.last_entry_reason = {}
+            signal_engine.pending_reentry = {}
+            signal_engine.ut_hybrid_timing_latches = {}
+            signal_engine.ut_hybrid_timing_consumed_ts = {}
+            signal_engine.utbb_special_long_state = {}
+            signal_engine.utbb_special_short_state = {}
+
+        return signal_engine
+
     def normalize_symbol_for_exchange(self, raw_symbol, exchange_mode=None):
         mode = exchange_mode or self.get_exchange_mode()
         text = str(raw_symbol or '').strip().upper()
@@ -7604,10 +7631,10 @@ class MainController:
                     self.active_engine.trend_direction = None
                     self.active_engine.last_indicator_update = 0
                 # Signal 엔진 캐시 초기화
-                signal_engine = self.engines.get('signal')
-                if signal_engine:
-                    signal_engine.last_processed_candle_ts = {}
-                    signal_engine.last_candle_time = {}
+                self._reset_signal_engine_runtime_state(
+                    reset_entry_cache=True,
+                    reset_stateful_strategy=True
+                )
                 await update.message.reply_text(f"✅ 진입 타임프레임 변경: {val}")
 
                 # DualMode 엔진 캐시 초기화
@@ -7772,15 +7799,10 @@ class MainController:
                     elif val_lower == 'cameron' and signal_engine:
                         signal_engine.cameron_states = {}
                     elif val_lower in (STATEFUL_UT_STRATEGIES | {'rsibb'}) and signal_engine:
-                        signal_engine.last_processed_candle_ts = {}
-                        signal_engine.last_state_sync_candle_ts = {}
-                        signal_engine.last_stateful_retry_ts = {}
-                        signal_engine.last_stateful_diag = {}
-                        signal_engine.last_stateful_diag_notice = {}
-                        signal_engine.ut_hybrid_timing_latches = {}
-                        signal_engine.ut_hybrid_timing_consumed_ts = {}
-                        signal_engine.utbb_special_long_state = {}
-                        signal_engine.utbb_special_short_state = {}
+                        self._reset_signal_engine_runtime_state(
+                            reset_entry_cache=True,
+                            reset_stateful_strategy=True
+                        )
                     await update.message.reply_text(f"✅ 전략 변경: {val_lower.upper()}")
                 else:
                     await update.message.reply_text(
@@ -7805,17 +7827,10 @@ class MainController:
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'RSIBB', 'rsi_length'], rsi_length)
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'RSIBB', 'bb_length'], bb_length)
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'RSIBB', 'bb_mult'], bb_mult)
-                signal_engine = self.engines.get('signal')
-                if signal_engine:
-                    signal_engine.last_processed_candle_ts = {}
-                    signal_engine.last_state_sync_candle_ts = {}
-                    signal_engine.last_stateful_retry_ts = {}
-                    signal_engine.last_stateful_diag = {}
-                    signal_engine.last_stateful_diag_notice = {}
-                    signal_engine.ut_hybrid_timing_latches = {}
-                    signal_engine.ut_hybrid_timing_consumed_ts = {}
-                    signal_engine.utbb_special_long_state = {}
-                    signal_engine.utbb_special_short_state = {}
+                self._reset_signal_engine_runtime_state(
+                    reset_entry_cache=True,
+                    reset_stateful_strategy=True
+                )
                 await update.message.reply_text(
                     f"✅ RSI+BB 설정 변경: RSI={rsi_length}, BB={bb_length}, x{bb_mult:.2f}"
                 )
@@ -7860,9 +7875,10 @@ class MainController:
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBot', 'key_value'], key_value)
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBot', 'atr_period'], atr_period)
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBot', 'use_heikin_ashi'], use_ha)
-                signal_engine = self.engines.get('signal')
-                if signal_engine:
-                    signal_engine.last_processed_candle_ts = {}
+                self._reset_signal_engine_runtime_state(
+                    reset_entry_cache=True,
+                    reset_stateful_strategy=True
+                )
                 await update.message.reply_text(
                     f"✅ UT Bot 설정 변경: key={key_value:.2f}, ATR={atr_period}, HA={'ON' if use_ha else 'OFF'}"
                 )
@@ -7992,9 +8008,7 @@ class MainController:
                     return SELECT
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'exit_timeframe'], val)
                 # Signal 엔진 캐시 초기화
-                signal_engine = self.engines.get('signal')
-                if signal_engine:
-                    signal_engine.last_processed_exit_candle_ts = {}
+                self._reset_signal_engine_runtime_state(reset_exit_cache=True)
                 await update.message.reply_text(f"✅ 청산 타임프레임 변경: {val}")
 
             elif choice == '44':
@@ -8023,9 +8037,10 @@ class MainController:
                 await self.cfg.update_value(['upbit', 'strategy_params', 'UTBot', 'key_value'], key_value)
                 await self.cfg.update_value(['upbit', 'strategy_params', 'UTBot', 'atr_period'], atr_period)
                 await self.cfg.update_value(['upbit', 'strategy_params', 'UTBot', 'use_heikin_ashi'], use_ha)
-                signal_engine = self.engines.get('signal')
-                if signal_engine:
-                    signal_engine.last_processed_candle_ts = {}
+                self._reset_signal_engine_runtime_state(
+                    reset_entry_cache=True,
+                    reset_stateful_strategy=True
+                )
                 await update.message.reply_text(
                     f"✅ 업비트 UT Bot 설정 변경: key={key_value:.2f}, ATR={atr_period}, HA={'ON' if use_ha else 'OFF'}"
                 )
@@ -8037,10 +8052,10 @@ class MainController:
                     return SELECT
                 await self.cfg.update_value(['upbit', 'common_settings', 'timeframe'], val)
                 await self.cfg.update_value(['upbit', 'common_settings', 'entry_timeframe'], val)
-                signal_engine = self.engines.get('signal')
-                if signal_engine:
-                    signal_engine.last_processed_candle_ts = {}
-                    signal_engine.last_candle_time = {}
+                self._reset_signal_engine_runtime_state(
+                    reset_entry_cache=True,
+                    reset_stateful_strategy=True
+                )
                 await update.message.reply_text(f"✅ 업비트 진입 타임프레임 변경: {val}")
 
             elif choice == '47':
@@ -8049,9 +8064,7 @@ class MainController:
                     await update.message.reply_text(f"❌ 유효하지 않은 타임프레임입니다.\n사용 가능: {', '.join(valid_tf)}")
                     return SELECT
                 await self.cfg.update_value(['upbit', 'common_settings', 'exit_timeframe'], val)
-                signal_engine = self.engines.get('signal')
-                if signal_engine:
-                    signal_engine.last_processed_exit_candle_ts = {}
+                self._reset_signal_engine_runtime_state(reset_exit_cache=True)
                 await update.message.reply_text(f"✅ 업비트 청산 타임프레임 변경: {val}")
 
             elif choice == '48':
