@@ -176,6 +176,7 @@ class TradingConfig:
                 'strategy_params': {
                     'active_strategy': 'utbot',
                     'entry_mode': 'cross',
+                    'ut_entry_timing_mode': 'next_candle',
                     'Triple_SMA': {'fast_sma': 2, 'slow_sma': 10},
                     'HMA': {'fast_period': 9, 'slow_period': 21},
                     'UTBot': {
@@ -331,6 +332,7 @@ class TradingConfig:
                 'swing_length': 50,
                 'use_confluence_filter': False
             },
+            'ut_entry_timing_mode': 'next_candle',
             'RSIBB': {
                 'rsi_length': 6,
                 'bb_length': 200,
@@ -569,6 +571,7 @@ class TradingConfig:
                 "strategy_params": {
                     "active_strategy": "utbot",
                     "entry_mode": "cross",
+                    "ut_entry_timing_mode": "next_candle",
                     "Triple_SMA": {"fast_sma": 2, "slow_sma": 10},
                     "HMA": {"fast_period": 9, "slow_period": 21},
                     "UTBot": {
@@ -1593,6 +1596,8 @@ class SignalEngine(BaseEngine):
         self.ut_hybrid_timing_consumed_ts = {}
         self.utbb_special_long_state = {}
         self.utbb_special_short_state = {}
+        self.ut_pending_entries = {}
+        self.ut_strategy_signal_state = {}
         self.utsmc_pending_entries = {}
         self.utsmc_last_entry_signal_ts = {}
         self.utsmc_entry_invalidation = {}
@@ -1660,6 +1665,8 @@ class SignalEngine(BaseEngine):
         self.ut_hybrid_timing_consumed_ts = {}
         self.utbb_special_long_state = {}
         self.utbb_special_short_state = {}
+        self.ut_pending_entries = {}
+        self.ut_strategy_signal_state = {}
         self.utsmc_pending_entries = {}
         self.utsmc_last_entry_signal_ts = {}
         self.utsmc_entry_invalidation = {}
@@ -1683,6 +1690,17 @@ class SignalEngine(BaseEngine):
     def _ensure_runtime_state_containers(self, attr_names):
         for attr_name in attr_names:
             self._ensure_runtime_state_container(attr_name)
+
+    def _get_ut_entry_timing_mode(self):
+        strategy_params = self.get_runtime_strategy_params()
+        mode = str(strategy_params.get('ut_entry_timing_mode', 'next_candle') or 'next_candle').strip().lower()
+        if mode not in {'next_candle', 'persistent'}:
+            return 'next_candle'
+        return mode
+
+    def _get_ut_entry_timing_label(self, mode=None):
+        parsed_mode = str(mode or self._get_ut_entry_timing_mode()).strip().lower()
+        return '다음봉 진입' if parsed_mode == 'next_candle' else '신호유지 진입'
 
     def _collect_primary_strategy_context(self, symbol, df, strategy_params, active_strategy):
         context = {
@@ -1947,6 +1965,80 @@ class SignalEngine(BaseEngine):
             self.ut_hybrid_timing_latches.pop(self._get_utbb_long_setup_key(symbol, 'bb'), None)
             return
         self.ut_hybrid_timing_latches.pop(self._get_utbb_long_setup_key(symbol, source), None)
+
+    def _get_ut_strategy_signal_state_key(self, symbol, strategy_key):
+        return f"{str(strategy_key or '').lower()}::{symbol}"
+
+    def _remember_ut_strategy_signal_state(self, symbol, strategy_key, current_sig):
+        state_key = self._get_ut_strategy_signal_state_key(symbol, strategy_key)
+        parsed_sig = str(current_sig or '').lower()
+        if parsed_sig not in {'long', 'short'}:
+            self.ut_strategy_signal_state.pop(state_key, None)
+            return None
+
+        previous_sig = str(self.ut_strategy_signal_state.get(state_key) or '').lower()
+        self.ut_strategy_signal_state[state_key] = parsed_sig
+        return parsed_sig if parsed_sig != previous_sig else None
+
+    def _set_ut_pending_entry(self, symbol, side, signal_ts, execute_ts, strategy_name=None, hybrid_strategy=None):
+        if side not in {'long', 'short'}:
+            return
+        self.ut_pending_entries[symbol] = {
+            'side': side,
+            'signal_ts': int(signal_ts or 0),
+            'execute_ts': int(execute_ts or 0),
+            'strategy_name': str(strategy_name or 'UT'),
+            'hybrid_strategy': str(hybrid_strategy or '').lower() or None
+        }
+
+    def _get_ut_pending_entry(self, symbol):
+        return self.ut_pending_entries.get(symbol)
+
+    def _clear_ut_pending_entry(self, symbol):
+        self.ut_pending_entries.pop(symbol, None)
+
+    async def _maybe_execute_ut_live_entry(self, symbol, live_candle_ts, live_price, pos_side):
+        pending = self._get_ut_pending_entry(symbol)
+        if pos_side != 'NONE':
+            if pending:
+                self._clear_ut_pending_entry(symbol)
+            return pos_side
+        if not pending:
+            return pos_side
+
+        execute_ts = int(pending.get('execute_ts') or 0)
+        if live_candle_ts < execute_ts:
+            return pos_side
+
+        timing_mode = self._get_ut_entry_timing_mode()
+        if timing_mode == 'next_candle' and live_candle_ts > execute_ts:
+            self._clear_ut_pending_entry(symbol)
+            return pos_side
+
+        entry_sig = str(pending.get('side') or '').lower()
+        if entry_sig not in {'long', 'short'}:
+            self._clear_ut_pending_entry(symbol)
+            return pos_side
+
+        strategy_name = str(pending.get('strategy_name') or 'UT')
+        timing_label = self._get_ut_entry_timing_label(timing_mode)
+        self._clear_ut_pending_entry(symbol)
+        self.last_entry_reason[symbol] = f"{strategy_name} {timing_label} 기준 {entry_sig.upper()} 진입"
+        self._update_stateful_diag(
+            symbol,
+            stage='entry_submitted',
+            strategy=strategy_name,
+            entry_sig=entry_sig,
+            pos_side=entry_sig.upper(),
+            note=f"live {timing_mode} entry | live_ts={live_candle_ts} | armed_ts={execute_ts}"
+        )
+        logger.info(f"[{strategy_name}] live {timing_mode} entry {entry_sig.upper()} @ {live_candle_ts}")
+        await self.entry(symbol, entry_sig, float(live_price))
+
+        hybrid_strategy = str(pending.get('hybrid_strategy') or '').lower()
+        if hybrid_strategy:
+            self._consume_ut_hybrid_timing_latch(symbol, hybrid_strategy, entry_sig)
+        return entry_sig.upper()
 
     def _expire_utbb_long_setup(self, symbol, current_ts, candle_ms, max_bars=3):
         current_ts = int(current_ts or 0)
@@ -2727,17 +2819,20 @@ class SignalEngine(BaseEngine):
         execute_ts = int(pending.get('execute_ts') or 0)
         if live_candle_ts < execute_ts:
             return pos_side
-        if live_candle_ts > execute_ts:
+
+        timing_mode = self._get_ut_entry_timing_mode()
+        if timing_mode == 'next_candle' and live_candle_ts > execute_ts:
             self._clear_utsmc_pending_entry(symbol)
-            self.last_entry_reason[symbol] = f"{strategy_name} 다음 봉 진행 중 진입 기회 종료, fresh UT 신호 재대기"
             return pos_side
 
         entry_sig = str(pending.get('side') or '').lower()
-        self._clear_utsmc_pending_entry(symbol)
         if entry_sig not in {'long', 'short'}:
+            self._clear_utsmc_pending_entry(symbol)
             return pos_side
 
-        self.last_entry_reason[symbol] = f"{strategy_name} 이전 UT {entry_sig.upper()} 신호 기준 다음 봉 진행 중 {entry_sig.upper()} 진입"
+        timing_label = self._get_ut_entry_timing_label(timing_mode)
+        self._clear_utsmc_pending_entry(symbol)
+        self.last_entry_reason[symbol] = f"{strategy_name} {timing_label} 기준 {entry_sig.upper()} 진입"
         self._update_stateful_diag(
             symbol,
             stage='entry_submitted',
@@ -2745,11 +2840,11 @@ class SignalEngine(BaseEngine):
             entry_sig=entry_sig,
             pos_side=entry_sig.upper(),
             note=(
-                f"live next-candle entry | live_ts={live_candle_ts} | "
+                f"live {timing_mode} entry | live_ts={live_candle_ts} | armed_ts={execute_ts} | "
                 f"ut_signal_high={pending.get('signal_high')} | ut_signal_low={pending.get('signal_low')}"
             )
         )
-        logger.info(f"[{strategy_name}] live next-candle entry {entry_sig.upper()} @ {live_candle_ts}")
+        logger.info(f"[{strategy_name}] live {timing_mode} entry {entry_sig.upper()} @ {live_candle_ts}")
         self.utsmc_last_entry_signal_ts[symbol] = int(live_candle_ts)
         self._set_utsmc_entry_invalidation(
             symbol,
@@ -2765,6 +2860,8 @@ class SignalEngine(BaseEngine):
         ut_sig, ut_reason, ut_detail = self._calculate_utbot_signal(df, strategy_params)
         smc_sig, smc_reason, smc_detail = self._calculate_smc_internal_ob_signal(df, strategy_params)
         ut_state = ut_sig or ut_detail.get('bias_side')
+        timing_mode = str(strategy_params.get('ut_entry_timing_mode', 'next_candle') or 'next_candle').lower()
+        timing_desc = '다음 진행봉 진입' if timing_mode == 'next_candle' else '신호 유지 시 진입'
 
         detail = {
             'ut_state': ut_state,
@@ -2784,10 +2881,10 @@ class SignalEngine(BaseEngine):
         if ut_sig in {'long', 'short'}:
             reason = (
                 f"UTSMC {ut_sig.upper()} SIGNAL: "
-                f"다음 봉 진행 중 {ut_sig.upper()} 진입 대기, 청산은 {exit_wait_label}"
+                f"신호봉 이후 {timing_desc}, 청산은 {exit_wait_label}"
             )
         else:
-            reason = f"UTSMC 상태 유지: UT {ut_state.upper()} 상태, 신규 진입은 fresh signal 다음 봉만 허용"
+            reason = f"UTSMC 상태 유지: UT {ut_state.upper()} 상태, fresh signal armed 후 {timing_desc}"
         return ut_sig, reason, detail
 
     def _calculate_rsi_signal(self, df, strategy_params):
@@ -3920,6 +4017,14 @@ class SignalEngine(BaseEngine):
                     pos_side,
                     strategy_name='UTSMC'
                 )
+            elif (not self.is_upbit_mode()) and (active_strategy == 'utbot' or active_strategy in UT_HYBRID_STRATEGIES):
+                live_candle_ts = int(ohlcv_p[-1][0])
+                pos_side = await self._maybe_execute_ut_live_entry(
+                    symbol,
+                    live_candle_ts,
+                    current_price,
+                    pos_side
+                )
                 
             # 3. Check Exit TF (Exit Logic)
             # Cross/Position 紐⑤뱶?먯꽌留?Secondary TF 泥?궛 濡쒖쭅 ?ъ슜
@@ -4236,6 +4341,12 @@ class SignalEngine(BaseEngine):
     async def _handle_utbot_primary_strategy(self, symbol, k, pos, strategy_name, raw_strategy_sig, raw_state_sig, sig):
         target_sig = raw_state_sig
         entry_sig = sig
+        current_ts = int(k.get('t') or 0)
+        tf = self.get_runtime_common_settings().get('entry_timeframe', self.get_runtime_common_settings().get('timeframe', '15m'))
+        candle_ms = self._timeframe_to_ms(tf)
+        timing_mode = self._get_ut_entry_timing_mode()
+        timing_label = self._get_ut_entry_timing_label(timing_mode)
+        pending = self._get_ut_pending_entry(symbol)
         if self.is_upbit_mode():
             if pos and target_sig == 'short':
                 self.last_entry_reason[symbol] = (
@@ -4254,6 +4365,17 @@ class SignalEngine(BaseEngine):
             else:
                 self.last_entry_reason[symbol] = f"{strategy_name} BUY 대기"
             return
+
+        if pending and timing_mode == 'next_candle' and current_ts >= int(pending.get('execute_ts') or 0):
+            self._clear_ut_pending_entry(symbol)
+            pending = None
+
+        if pending and target_sig not in {'long', 'short'}:
+            self._clear_ut_pending_entry(symbol)
+            pending = None
+        elif pending and target_sig in {'long', 'short'} and target_sig != pending.get('side'):
+            self._clear_ut_pending_entry(symbol)
+            pending = None
 
         need_flip = pos and target_sig and (
             (pos['side'] == 'long' and target_sig == 'short') or
@@ -4286,14 +4408,23 @@ class SignalEngine(BaseEngine):
                     note=f"{flip_label} exit complete"
                 )
                 if entry_sig == target_sig:
-                    self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} -> {entry_sig.upper()} 재진입"
-                    await self.entry(symbol, entry_sig, float(k['c']))
+                    execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
+                    self._set_ut_pending_entry(
+                        symbol,
+                        entry_sig,
+                        current_ts,
+                        execute_ts,
+                        strategy_name=strategy_name
+                    )
+                    self.last_entry_reason[symbol] = (
+                        f"{strategy_name} {flip_label} -> {entry_sig.upper()} {timing_label} 대기"
+                    )
                     self._update_stateful_diag(
                         symbol,
-                        stage='flip_reentered',
+                        stage='flip_reentry_armed',
                         entry_sig=entry_sig,
-                        pos_side=entry_sig.upper(),
-                        note='re-entry submitted'
+                        pos_side='NONE',
+                        note=f"re-entry armed | execute_ts={execute_ts} | mode={timing_mode}"
                     )
                 else:
                     self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} 청산 완료, 재진입은 필터 또는 방향 설정으로 차단"
@@ -4315,12 +4446,38 @@ class SignalEngine(BaseEngine):
                 await self._notify_stateful_diag(symbol, force=True)
                 logger.warning(f"[{strategy_name}] Flip re-entry skipped: position still open ({check_pos['side']})")
         elif not pos and entry_sig:
-            self.last_entry_reason[symbol] = f"{strategy_name} 현재 상태 -> {entry_sig.upper()} 진입"
-            logger.info(f"[{strategy_name}] Stateful entry {entry_sig.upper()}")
-            await self.entry(symbol, entry_sig, float(k['c']))
+            execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
+            self._set_ut_pending_entry(
+                symbol,
+                entry_sig,
+                current_ts,
+                execute_ts,
+                strategy_name=strategy_name
+            )
+            self.last_entry_reason[symbol] = (
+                f"{strategy_name} {entry_sig.upper()} 신호 확정, {timing_label} 대기"
+            )
+            self._update_stateful_diag(
+                symbol,
+                stage='entry_armed',
+                strategy=strategy_name,
+                raw_state=(target_sig or 'none'),
+                raw_signal=(raw_strategy_sig or 'none'),
+                entry_sig=entry_sig,
+                pos_side='NONE',
+                note=f"pending {timing_mode} entry | execute_ts={execute_ts}"
+            )
         elif not pos and target_sig:
-            self.last_entry_reason[symbol] = f"{strategy_name} 현재 상태는 {target_sig.upper()}지만 진입은 방향 설정 또는 필터로 차단"
+            if pending and timing_mode == 'persistent' and pending.get('side') == target_sig:
+                self.last_entry_reason[symbol] = (
+                    f"{strategy_name} 예약된 {target_sig.upper()} {timing_label} 대기"
+                )
+            else:
+                self.last_entry_reason[symbol] = (
+                    f"{strategy_name} 현재 상태는 {target_sig.upper()}지만 fresh signal 대기"
+                )
         elif pos:
+            self._clear_ut_pending_entry(symbol)
             self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {strategy_name} 반대신호 대기"
 
     async def _handle_utsmc_primary_strategy(self, symbol, k, pos, strategy_name, raw_strategy_sig, raw_state_sig, raw_smc_detail, sig):
@@ -4329,6 +4486,8 @@ class SignalEngine(BaseEngine):
         current_ts = int(k.get('t') or 0)
         tf = self.get_runtime_common_settings().get('entry_timeframe', self.get_runtime_common_settings().get('timeframe', '15m'))
         candle_ms = self._timeframe_to_ms(tf)
+        timing_mode = self._get_ut_entry_timing_mode()
+        timing_label = self._get_ut_entry_timing_label(timing_mode)
         pending = self._get_utsmc_pending_entry(symbol)
         ut_detail = raw_smc_detail.get('ut_detail') or {}
         ut_signal_high = ut_detail.get('signal_high')
@@ -4339,7 +4498,7 @@ class SignalEngine(BaseEngine):
         bullish_ob_entry = bool(raw_smc_detail.get('bullish_internal_ob_entry'))
         bearish_ob_entry = bool(raw_smc_detail.get('bearish_internal_ob_entry'))
 
-        if pending and current_ts > int(pending.get('execute_ts') or 0):
+        if pending and timing_mode == 'next_candle' and current_ts >= int(pending.get('execute_ts') or 0):
             self._clear_utsmc_pending_entry(symbol)
             pending = None
 
@@ -4359,6 +4518,15 @@ class SignalEngine(BaseEngine):
 
         self._clear_utsmc_entry_invalidation(symbol)
 
+        if pending and target_sig not in {'long', 'short'}:
+            self._clear_utsmc_pending_entry(symbol)
+            self.last_entry_reason[symbol] = f"{strategy_name} UT 상태 해제, fresh UT 신호 재대기"
+            return
+
+        if pending and target_sig in {'long', 'short'} and target_sig != pending.get('side'):
+            self._clear_utsmc_pending_entry(symbol)
+            pending = None
+
         if pending and ut_signal and ut_signal != pending.get('side'):
             execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
             self._set_utsmc_pending_entry(
@@ -4371,7 +4539,7 @@ class SignalEngine(BaseEngine):
             )
             self.last_entry_reason[symbol] = (
                 f"{strategy_name} 기존 {pending.get('side', '').upper()} 예약 취소, "
-                f"새 UT {ut_signal.upper()} 신호로 다음 봉 진행 중 진입 대기"
+                f"새 UT {ut_signal.upper()} 신호로 {timing_label} 대기"
             )
             self._update_stateful_diag(
                 symbol,
@@ -4381,13 +4549,9 @@ class SignalEngine(BaseEngine):
                 raw_signal=(ut_signal or 'none'),
                 entry_sig=(ut_signal or 'none'),
                 pos_side='NONE',
-                note=f"pending replaced | execute_ts={execute_ts} | ob={smc_reason or '-'}"
+                note=f"pending replaced | execute_ts={execute_ts} | mode={timing_mode} | ob={smc_reason or '-'}"
             )
             return
-
-        if pending and current_ts >= int(pending.get('execute_ts') or 0):
-            self._clear_utsmc_pending_entry(symbol)
-            self.last_entry_reason[symbol] = f"{strategy_name} 다음 봉 진행 중 진입 기회 종료, fresh UT 신호 재대기"
 
         if ut_signal in {'long', 'short'}:
             execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
@@ -4400,8 +4564,7 @@ class SignalEngine(BaseEngine):
                 signal_low=ut_signal_low
             )
             self.last_entry_reason[symbol] = (
-                f"{strategy_name} UT {ut_signal.upper()} 확정, "
-                f"다음 봉 진행 중 {ut_signal.upper()} 진입 대기"
+                f"{strategy_name} UT {ut_signal.upper()} 확정, {timing_label} 대기"
             )
             self._update_stateful_diag(
                 symbol,
@@ -4411,27 +4574,47 @@ class SignalEngine(BaseEngine):
                 raw_signal=(ut_signal or 'none'),
                 entry_sig=(ut_signal or 'none'),
                 pos_side='NONE',
-                note=f"pending next candle | execute_ts={execute_ts} | ob={smc_reason or '-'}"
+                note=f"pending {timing_mode} entry | execute_ts={execute_ts} | ob={smc_reason or '-'}"
             )
             return
 
         if pending:
-            self.last_entry_reason[symbol] = (
-                f"{strategy_name} 예약된 {str(pending.get('side', '')).upper()} 진입 대기 "
-                f"(다음 봉 ts={int(pending.get('execute_ts') or 0)})"
-            )
+            if timing_mode == 'persistent' and target_sig == pending.get('side'):
+                self.last_entry_reason[symbol] = (
+                    f"{strategy_name} 예약된 {str(pending.get('side', '')).upper()} {timing_label} 대기 "
+                    f"(armed ts={int(pending.get('execute_ts') or 0)}, UT 상태 유지 중)"
+                )
+            else:
+                self.last_entry_reason[symbol] = (
+                    f"{strategy_name} 예약된 {str(pending.get('side', '')).upper()} {timing_label} 대기"
+                )
             return
 
         if target_sig in {'long', 'short'}:
             self.last_entry_reason[symbol] = (
-                f"{strategy_name} 현재 UT 상태는 {target_sig.upper()}지만 "
-                f"fresh signal 다음 봉에서만 진입"
+                f"{strategy_name} 현재 UT 상태는 {target_sig.upper()}지만 fresh UT 신호 재대기"
             )
 
     async def _handle_ut_hybrid_primary_strategy(self, symbol, k, pos, strategy_name, active_strategy, raw_strategy_sig, raw_state_sig, raw_hybrid_detail, sig):
         timing_label = raw_hybrid_detail.get('timing_label', UT_HYBRID_TIMING_LABELS.get(active_strategy, 'signal'))
         regime_sig = raw_state_sig
         entry_sig = sig
+        fresh_entry_sig = self._remember_ut_strategy_signal_state(symbol, active_strategy, entry_sig)
+        current_ts = int(k.get('t') or 0)
+        tf = self.get_runtime_common_settings().get('entry_timeframe', self.get_runtime_common_settings().get('timeframe', '15m'))
+        candle_ms = self._timeframe_to_ms(tf)
+        timing_mode = self._get_ut_entry_timing_mode()
+        entry_mode_label = self._get_ut_entry_timing_label(timing_mode)
+        pending = self._get_ut_pending_entry(symbol)
+
+        if pending and timing_mode == 'next_candle' and current_ts >= int(pending.get('execute_ts') or 0):
+            self._clear_ut_pending_entry(symbol)
+            pending = None
+
+        if pending and (entry_sig not in {'long', 'short'} or entry_sig != pending.get('side')):
+            self._clear_ut_pending_entry(symbol)
+            pending = None
+
         need_flip = pos and regime_sig and (
             (pos['side'] == 'long' and regime_sig == 'short') or
             (pos['side'] == 'short' and regime_sig == 'long')
@@ -4462,17 +4645,24 @@ class SignalEngine(BaseEngine):
                     note='UT flip exit complete'
                 )
                 if entry_sig == regime_sig:
-                    self.last_entry_reason[symbol] = (
-                        f"{strategy_name} UT 반전 + {timing_label} 타이밍 -> {entry_sig.upper()} 재진입"
+                    execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
+                    self._set_ut_pending_entry(
+                        symbol,
+                        entry_sig,
+                        current_ts,
+                        execute_ts,
+                        strategy_name=strategy_name,
+                        hybrid_strategy=active_strategy
                     )
-                    await self.entry(symbol, entry_sig, float(k['c']))
-                    self._consume_ut_hybrid_timing_latch(symbol, active_strategy, entry_sig)
+                    self.last_entry_reason[symbol] = (
+                        f"{strategy_name} UT 반전 + {timing_label} 타이밍 -> {entry_sig.upper()} {entry_mode_label} 대기"
+                    )
                     self._update_stateful_diag(
                         symbol,
-                        stage='flip_reentered',
+                        stage='flip_reentry_armed',
                         entry_sig=entry_sig,
-                        pos_side=entry_sig.upper(),
-                        note='re-entry submitted'
+                        pos_side='NONE',
+                        note=f"re-entry armed | execute_ts={execute_ts} | mode={timing_mode}"
                     )
                 else:
                     self.last_entry_reason[symbol] = (
@@ -4495,16 +4685,39 @@ class SignalEngine(BaseEngine):
                 )
                 await self._notify_stateful_diag(symbol, force=True)
                 logger.warning(f"[{strategy_name}] Hybrid re-entry skipped: position still open ({check_pos['side']})")
-        elif not pos and entry_sig:
-            self.last_entry_reason[symbol] = f"{strategy_name} 조건 충족 -> {entry_sig.upper()} 진입"
-            logger.info(f"[{strategy_name}] New entry {entry_sig.upper()}")
-            await self.entry(symbol, entry_sig, float(k['c']))
-            self._consume_ut_hybrid_timing_latch(symbol, active_strategy, entry_sig)
+        elif not pos and fresh_entry_sig:
+            execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
+            self._set_ut_pending_entry(
+                symbol,
+                fresh_entry_sig,
+                current_ts,
+                execute_ts,
+                strategy_name=strategy_name,
+                hybrid_strategy=active_strategy
+            )
+            self.last_entry_reason[symbol] = (
+                f"{strategy_name} 조건 충족 -> {fresh_entry_sig.upper()} {entry_mode_label} 대기"
+            )
+            self._update_stateful_diag(
+                symbol,
+                stage='entry_armed',
+                strategy=strategy_name,
+                raw_state=(regime_sig or 'none'),
+                raw_signal=(raw_strategy_sig or 'none'),
+                entry_sig=fresh_entry_sig,
+                pos_side='NONE',
+                note=f"pending {timing_mode} entry | execute_ts={execute_ts} | timing={timing_label}"
+            )
+        elif not pos and pending and timing_mode == 'persistent' and entry_sig == pending.get('side'):
+            self.last_entry_reason[symbol] = (
+                f"{strategy_name} 예약된 {entry_sig.upper()} {entry_mode_label} 대기"
+            )
         elif not pos and regime_sig:
             self.last_entry_reason[symbol] = (
                 f"{strategy_name} UT {regime_sig.upper()} 상태, {timing_label} 타이밍 대기"
             )
         elif pos:
+            self._clear_ut_pending_entry(symbol)
             self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {strategy_name} UT 반전 대기"
 
     async def _handle_rsibb_primary_strategy(self, symbol, k, pos, strategy_name, raw_strategy_sig, sig):
@@ -7836,6 +8049,8 @@ class MainController:
         strategy_params = sig.get('strategy_params', {})
         active_strategy = strategy_params.get('active_strategy', 'utbot').upper()
         entry_mode = active_strategy
+        ut_entry_timing_mode = str(strategy_params.get('ut_entry_timing_mode', 'next_candle') or 'next_candle').lower()
+        ut_entry_timing_label = "다음봉 진입" if ut_entry_timing_mode == 'next_candle' else "신호유지 진입"
         utbot_params = strategy_params.get('UTBot', {})
         utbot_key = float(utbot_params.get('key_value', 1.0) or 1.0)
         utbot_atr = int(utbot_params.get('atr_period', 10) or 10)
@@ -7882,6 +8097,7 @@ class MainController:
 19. UT Bot (`K={utbot_key:.2f}` / `ATR={utbot_atr}` / `HA={utbot_ha}`)
 20. RSI+BB 보조설정 (`RSI={rsibb_rsi}` / `BB={rsibb_bb}` / `x{rsibb_mult:.2f}`)
 21. UT 전략 안내 (`UTBOT / UTRSI / UTBB / UTRSIBB / UTSMC`)
+26. UT 진입 방식 (`{ut_entry_timing_label}`)
 13. TP/SL 자동청산 (`{tp_sl_status}`)
 36. ROE 자동청산 (`{tp_status}`)
 37. 손절 자동청산 (`{sl_status}`)
@@ -7930,7 +8146,8 @@ class MainController:
             '16': "📝 **전략 선택** (1=UTBOT, 2=UTRSIBB, 3=UTRSI, 4=UTBB, 5=UTSMC)",
             '19': "📝 **UT Bot 설정** 입력 (형식: key,atr,on/off 예: 1,10,off)",
             '20': "RSI/BB 보조설정 입력\n형식: RSI길이,BB길이,BB배수\n예: 6,200,2",
-            '21': "ℹ️ **UT 전략 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙, UTSMC는 UT fresh 다음봉 진행중 진입 + internal OB/UT 신호봉 무효화 청산을 사용합니다.",
+            '21': "ℹ️ **UT 전략 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙, UTSMC는 26번 UT 진입 방식 + internal OB/UT 신호봉 무효화 청산을 사용합니다.",
+            '26': "📝 **UT 진입 방식** 입력\n`next` 또는 `1` = 시그널 마감봉 바로 다음봉에만 진입\n`persistent` 또는 `2` = 신호가 유지되는 동안 늦게라도 진입",
             '22': "📝 **거래소/네트워크 선택** (1=바이낸스 테스트넷, 2=바이낸스 메인넷, 3=업비트 KRW 현물)",
             '23': "📝 **거래량 급등 채굴 기능** (1=ON, 0=OFF)",
             '24': "📝 **채굴 진입 타임프레임** 입력 (예: 5m)\n1m, 5m, 15m, 30m, 1h",
@@ -7948,7 +8165,7 @@ class MainController:
         if self.is_upbit_mode():
             blocked_choices = {
                 '1', '2', '3', '4', '5', '6', '8', '10', '11', '12', '13', '14', '15',
-                '16', '19', '20', '21', '23', '24', '25', '35', '36', '37', '38', '41', '00'
+                '16', '19', '20', '21', '23', '24', '25', '26', '35', '36', '37', '38', '41', '00'
             }
             if text in blocked_choices:
                 await update.message.reply_text("ℹ️ 업비트 모드에서는 업비트 전용 메뉴(22, 43~48)만 사용합니다.")
@@ -8040,6 +8257,7 @@ class MainController:
         elif text == '21':
             await update.message.reply_text(
                 "ℹ️ UT Hybrid 전략 안내\n"
+                "- 26번 UT 진입 방식: `다음봉 진입`은 시그널 마감 직후 다음 진행봉에서만 진입, `신호유지 진입`은 조건이 유지되면 늦게라도 진입\n"
                 "- UTRSI: UT 방향 + RSI 타이밍 조합\n"
                 "- UTRSIBB: UT 방향 + RSI/BB 동시 타이밍 조합\n"
                 "- UTBB LONG: UT 롱신호와 BB 롱신호가 순서 무관 3봉 내 일치하면 진입, 중간에 UT 숏 또는 BB 숏이 나오면 저장 무효\n"
@@ -8049,9 +8267,9 @@ class MainController:
                 "- UTBB 특수 SHORT(하단돌파형): 진입봉이 BB 중간선 하향 + BB 하단선 하향 돌파면 BB 하단선 상향 돌파 또는 UT 롱상태로 청산\n"
                 "- UTBB 특수 SHORT(반등실패형): 중간선 아래 양봉 1~2개 뒤 저점 이탈 음봉이면 진입, BB 중간선 상향 돌파 또는 UT 롱상태로 청산\n"
                 "- UTBB SHORT 청산: 일반은 UT 롱상태 또는 BB 하단선 하향 돌파\n"
-                "- UTSMC: UT fresh signal 확정봉의 바로 다음 봉 진행 중에 진입, 청산은 exit TF internal OB 또는 UT 신호봉 무효화 마감 기준\n"
-                "- UTSMC LONG: UT 롱신호 확정 후 다음 봉 진행 중 LONG 진입, internal bearish OB 진입 마감 또는 UT 신호봉 저가 이탈 마감 청산\n"
-                "- UTSMC SHORT: UT 숏신호 확정 후 다음 봉 진행 중 SHORT 진입, internal bullish OB 진입 마감 또는 UT 신호봉 고가 돌파 마감 청산\n"
+                "- UTSMC: UT fresh signal 확정 후 선택한 진입 방식대로 진입, 청산은 exit TF internal OB 또는 UT 신호봉 무효화 마감 기준\n"
+                "- UTSMC LONG: UT 롱신호 확정 후 LONG 진입, internal bearish OB 진입 마감 또는 UT 신호봉 저가 이탈 마감 청산\n"
+                "- UTSMC SHORT: UT 숏신호 확정 후 SHORT 진입, internal bullish OB 진입 마감 또는 UT 신호봉 고가 돌파 마감 청산\n"
                 "- 모든 판단은 확정봉 기준"
             )
             await self.show_setup_menu(update)
@@ -8129,7 +8347,7 @@ class MainController:
         val = update.message.text
         
         try:
-            removed_strategy_filter_choices = {'10', '17', '18', '26', '27', '30', '31', '32', '33', '34'}
+            removed_strategy_filter_choices = {'10', '17', '18', '27', '30', '31', '32', '33', '34'}
             if choice in removed_strategy_filter_choices:
                 await update.message.reply_text("ℹ️ 해당 전략/필터 항목은 현재 코어 UT 설정에서 제거되었습니다.")
                 await self.show_setup_menu(update)
@@ -8460,6 +8678,25 @@ class MainController:
                 await update.message.reply_text(
                     f"✅ UT Bot 설정 변경: key={key_value:.2f}, ATR={atr_period}, HA={'ON' if use_ha else 'OFF'}"
                 )
+
+            elif choice == '26':
+                mode_raw = str(val or '').strip().lower()
+                if mode_raw in {'1', 'next', 'next_candle', 'next-candle'}:
+                    timing_mode = 'next_candle'
+                    timing_label = '다음봉 진입'
+                elif mode_raw in {'2', 'persistent', 'hold', 'maintain'}:
+                    timing_mode = 'persistent'
+                    timing_label = '신호유지 진입'
+                else:
+                    await update.message.reply_text("❌ `next`(1) 또는 `persistent`(2)만 입력하세요.")
+                    return SELECT
+
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'ut_entry_timing_mode'], timing_mode)
+                self._reset_signal_engine_runtime_state(
+                    reset_entry_cache=True,
+                    reset_stateful_strategy=True
+                )
+                await update.message.reply_text(f"✅ UT 진입 방식 변경: {timing_label}")
             
             elif choice == '18':
                 # 吏꾩엯紐⑤뱶 蹂寃?(1=cross, 2=position)
