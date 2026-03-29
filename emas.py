@@ -1601,6 +1601,7 @@ class SignalEngine(BaseEngine):
         self.utsmc_pending_entries = {}
         self.utsmc_last_entry_signal_ts = {}
         self.utsmc_entry_invalidation = {}
+        self.utsmc_fixed_exit_obs = {}
         
         self.last_heartbeat = 0
         self.consecutive_errors = 0
@@ -1670,6 +1671,7 @@ class SignalEngine(BaseEngine):
         self.utsmc_pending_entries = {}
         self.utsmc_last_entry_signal_ts = {}
         self.utsmc_entry_invalidation = {}
+        self.utsmc_fixed_exit_obs = {}
 
     def reset_signal_runtime_state(self, *, reset_entry_cache=False, reset_exit_cache=False, reset_stateful_strategy=False):
         if reset_entry_cache:
@@ -2756,12 +2758,16 @@ class SignalEngine(BaseEngine):
             'curr_close': curr_close,
             'bullish_internal_ob_entry': bullish_internal_ob_entry,
             'bearish_internal_ob_entry': bearish_internal_ob_entry,
+            'active_bullish_obs': list(lux_state.get('active_bullish_obs') or []),
+            'active_bearish_obs': list(lux_state.get('active_bearish_obs') or []),
             'bullish_ob_top': latest_bullish_ob.get('top') if latest_bullish_ob else None,
             'bullish_ob_bottom': latest_bullish_ob.get('bottom') if latest_bullish_ob else None,
             'bearish_ob_top': latest_bearish_ob.get('top') if latest_bearish_ob else None,
             'bearish_ob_bottom': latest_bearish_ob.get('bottom') if latest_bearish_ob else None,
             'bullish_ob_origin_ts': latest_bullish_ob.get('origin_ts') if latest_bullish_ob else None,
             'bearish_ob_origin_ts': latest_bearish_ob.get('origin_ts') if latest_bearish_ob else None,
+            'bullish_ob_created_ts': latest_bullish_ob.get('created_ts') if latest_bullish_ob else None,
+            'bearish_ob_created_ts': latest_bearish_ob.get('created_ts') if latest_bearish_ob else None,
             'active_bullish_ob_count': len(lux_state.get('active_bullish_obs') or []),
             'active_bearish_ob_count': len(lux_state.get('active_bearish_obs') or []),
             'order_block_filter': order_block_filter,
@@ -2825,6 +2831,31 @@ class SignalEngine(BaseEngine):
     def _clear_utsmc_entry_invalidation(self, symbol):
         self.utsmc_entry_invalidation.pop(symbol, None)
 
+    def _set_utsmc_fixed_exit_ob(self, symbol, position_side, ob_side, ob_data, tf=None):
+        if position_side not in {'long', 'short'} or ob_side not in {'bullish', 'bearish'}:
+            return
+        if not isinstance(ob_data, dict):
+            return
+        top = ob_data.get('top')
+        bottom = ob_data.get('bottom')
+        if top is None or bottom is None:
+            return
+        self.utsmc_fixed_exit_obs[symbol] = {
+            'position_side': str(position_side).lower(),
+            'ob_side': str(ob_side).lower(),
+            'top': float(top),
+            'bottom': float(bottom),
+            'origin_ts': int(ob_data.get('origin_ts') or 0),
+            'created_ts': int(ob_data.get('created_ts') or 0),
+            'tf': tf
+        }
+
+    def _get_utsmc_fixed_exit_ob(self, symbol):
+        return self.utsmc_fixed_exit_obs.get(symbol)
+
+    def _clear_utsmc_fixed_exit_ob(self, symbol):
+        self.utsmc_fixed_exit_obs.pop(symbol, None)
+
     async def _maybe_execute_utsmc_live_entry(self, symbol, live_candle_ts, live_price, pos_side, strategy_name='UTSMC'):
         pending = self._get_utsmc_pending_entry(symbol)
         if pos_side != 'NONE':
@@ -2864,6 +2895,7 @@ class SignalEngine(BaseEngine):
         )
         logger.info(f"[{strategy_name}] live {timing_mode} entry {entry_sig.upper()} @ {live_candle_ts}")
         self.utsmc_last_entry_signal_ts[symbol] = int(live_candle_ts)
+        self._clear_utsmc_fixed_exit_ob(symbol)
         self._set_utsmc_entry_invalidation(
             symbol,
             entry_sig,
@@ -4437,6 +4469,21 @@ class SignalEngine(BaseEngine):
             )
 
         if include_exit:
+            if (
+                diag.get('utsmc_fixed_ob_side')
+                or diag.get('utsmc_fixed_ob_bottom') is not None
+                or diag.get('utsmc_fixed_ob_top') is not None
+            ):
+                lines.append(
+                    f"UTSMC 고정 청산 OB: side `{diag.get('utsmc_fixed_ob_side', '-')}` | "
+                    f"range `{self._fmt_signal_trade_value(diag.get('utsmc_fixed_ob_bottom'))}` ~ "
+                    f"`{self._fmt_signal_trade_value(diag.get('utsmc_fixed_ob_top'))}`"
+                )
+            if diag.get('utsmc_fixed_ob_created_ts_human') or diag.get('utsmc_fixed_ob_origin_ts_human'):
+                lines.append(
+                    f"UTSMC 고정 OB 시각: created `{diag.get('utsmc_fixed_ob_created_ts_human', '-')}` | "
+                    f"origin `{diag.get('utsmc_fixed_ob_origin_ts_human', '-')}`"
+                )
             if diag.get('exit_reason_text'):
                 lines.append(f"청산판정: `{diag.get('exit_reason_text')}`")
             if diag.get('exit_trigger_kind'):
@@ -5631,8 +5678,73 @@ class SignalEngine(BaseEngine):
                 invalidation_side = str(invalidation.get('side') or '').lower()
                 signal_high = invalidation.get('signal_high')
                 signal_low = invalidation.get('signal_low')
-                bearish_ob_entry = bool(smc_detail.get('bearish_internal_ob_entry'))
-                bullish_ob_entry = bool(smc_detail.get('bullish_internal_ob_entry'))
+                position_side = str(current_side or '').lower()
+                entry_anchor_ts = int(self.utsmc_last_entry_signal_ts.get(symbol, 0) or 0)
+                required_ob_side = 'bearish' if position_side == 'long' else 'bullish'
+                fixed_exit_ob = self._get_utsmc_fixed_exit_ob(symbol)
+                if fixed_exit_ob:
+                    fixed_position_side = str(fixed_exit_ob.get('position_side') or '').lower()
+                    fixed_ob_side = str(fixed_exit_ob.get('ob_side') or '').lower()
+                    if fixed_position_side != position_side or fixed_ob_side != required_ob_side:
+                        self._clear_utsmc_fixed_exit_ob(symbol)
+                        fixed_exit_ob = None
+
+                if not fixed_exit_ob and position_side in {'long', 'short'}:
+                    candidate_obs = (
+                        list(smc_detail.get('active_bearish_obs') or [])
+                        if position_side == 'long'
+                        else list(smc_detail.get('active_bullish_obs') or [])
+                    )
+                    eligible_obs = []
+                    for order_block in candidate_obs:
+                        created_ts = int(order_block.get('created_ts') or 0)
+                        if entry_anchor_ts and created_ts < entry_anchor_ts:
+                            continue
+                        eligible_obs.append(order_block)
+                    if eligible_obs:
+                        fixed_candidate = min(
+                            eligible_obs,
+                            key=lambda ob: (
+                                int(ob.get('created_ts') or 0),
+                                int(ob.get('origin_ts') or 0)
+                            )
+                        )
+                        self._set_utsmc_fixed_exit_ob(
+                            symbol,
+                            position_side,
+                            required_ob_side,
+                            fixed_candidate,
+                            tf=tf
+                        )
+                        fixed_exit_ob = self._get_utsmc_fixed_exit_ob(symbol)
+
+                fixed_ob_side = str((fixed_exit_ob or {}).get('ob_side') or '').lower()
+                fixed_ob_top = (fixed_exit_ob or {}).get('top')
+                fixed_ob_bottom = (fixed_exit_ob or {}).get('bottom')
+                fixed_ob_origin_ts = int((fixed_exit_ob or {}).get('origin_ts') or 0)
+                fixed_ob_created_ts = int((fixed_exit_ob or {}).get('created_ts') or 0)
+                fixed_ob_origin_human = (
+                    datetime.fromtimestamp(fixed_ob_origin_ts / 1000).strftime('%m-%d %H:%M')
+                    if fixed_ob_origin_ts else None
+                )
+                fixed_ob_created_human = (
+                    datetime.fromtimestamp(fixed_ob_created_ts / 1000).strftime('%m-%d %H:%M')
+                    if fixed_ob_created_ts else None
+                )
+                fixed_bearish_ob_entry = (
+                    position_side == 'long'
+                    and fixed_ob_side == 'bearish'
+                    and fixed_ob_bottom is not None
+                    and fixed_ob_top is not None
+                    and float(fixed_ob_bottom) <= current_closed_price <= float(fixed_ob_top)
+                )
+                fixed_bullish_ob_entry = (
+                    position_side == 'short'
+                    and fixed_ob_side == 'bullish'
+                    and fixed_ob_bottom is not None
+                    and fixed_ob_top is not None
+                    and float(fixed_ob_bottom) <= current_closed_price <= float(fixed_ob_top)
+                )
                 ut_invalidation_long = (
                     current_side.lower() == 'long'
                     and invalidation_side in {'', 'long'}
@@ -5648,11 +5760,11 @@ class SignalEngine(BaseEngine):
                 exit_trigger_tags = []
                 exit_reason_parts = []
                 if current_side.lower() == 'long':
-                    if bearish_ob_entry:
-                        exit_trigger_tags.append('internal_bearish_ob_entry')
+                    if fixed_bearish_ob_entry:
+                        exit_trigger_tags.append('fixed_internal_bearish_ob_entry')
                         exit_reason_parts.append(
-                            f"SMC INTERNAL BEARISH OB ENTRY {float(smc_detail.get('bearish_ob_bottom') or 0.0):.4f} ~ "
-                            f"{float(smc_detail.get('bearish_ob_top') or 0.0):.4f}"
+                            f"FIXED INTERNAL BEARISH OB ENTRY {float(fixed_ob_bottom or 0.0):.4f} ~ "
+                            f"{float(fixed_ob_top or 0.0):.4f}"
                         )
                     if ut_invalidation_long:
                         exit_trigger_tags.append('ut_long_invalidation')
@@ -5662,11 +5774,11 @@ class SignalEngine(BaseEngine):
                     raw_exit_long = bool(exit_reason_parts)
                     raw_exit_short = False
                 else:
-                    if bullish_ob_entry:
-                        exit_trigger_tags.append('internal_bullish_ob_entry')
+                    if fixed_bullish_ob_entry:
+                        exit_trigger_tags.append('fixed_internal_bullish_ob_entry')
                         exit_reason_parts.append(
-                            f"SMC INTERNAL BULLISH OB ENTRY {float(smc_detail.get('bullish_ob_bottom') or 0.0):.4f} ~ "
-                            f"{float(smc_detail.get('bullish_ob_top') or 0.0):.4f}"
+                            f"FIXED INTERNAL BULLISH OB ENTRY {float(fixed_ob_bottom or 0.0):.4f} ~ "
+                            f"{float(fixed_ob_top or 0.0):.4f}"
                         )
                     if ut_invalidation_short:
                         exit_trigger_tags.append('ut_short_invalidation')
@@ -5677,21 +5789,52 @@ class SignalEngine(BaseEngine):
                     raw_exit_long = False
                 if exit_reason_parts:
                     exit_reason = " | ".join(exit_reason_parts)
+                elif current_side.lower() == 'long':
+                    if fixed_ob_side == 'bearish' and fixed_ob_bottom is not None and fixed_ob_top is not None:
+                        exit_reason = (
+                            f"FIXED INTERNAL BEARISH OB WAIT {float(fixed_ob_bottom):.4f} ~ "
+                            f"{float(fixed_ob_top):.4f}"
+                        )
+                    else:
+                        exit_reason = (
+                            f"FIXED INTERNAL BEARISH OB 대기: "
+                            f"active_bear_ob={'Y' if smc_detail.get('active_bearish_ob_count', 0) else 'N'}"
+                        )
+                else:
+                    if fixed_ob_side == 'bullish' and fixed_ob_bottom is not None and fixed_ob_top is not None:
+                        exit_reason = (
+                            f"FIXED INTERNAL BULLISH OB WAIT {float(fixed_ob_bottom):.4f} ~ "
+                            f"{float(fixed_ob_top):.4f}"
+                        )
+                    else:
+                        exit_reason = (
+                            f"FIXED INTERNAL BULLISH OB 대기: "
+                            f"active_bull_ob={'Y' if smc_detail.get('active_bullish_ob_count', 0) else 'N'}"
+                        )
                 bypass_exit_filters = True
                 self._update_stateful_diag(
                     symbol,
-                    smc_bullish_ob_entry=bullish_ob_entry,
-                    smc_bearish_ob_entry=bearish_ob_entry,
-                    smc_ob_tags=", ".join(smc_detail.get('ob_tags') or []) if smc_detail.get('ob_tags') else None,
-                    smc_bullish_ob_top=smc_detail.get('bullish_ob_top'),
-                    smc_bullish_ob_bottom=smc_detail.get('bullish_ob_bottom'),
-                    smc_bearish_ob_top=smc_detail.get('bearish_ob_top'),
-                    smc_bearish_ob_bottom=smc_detail.get('bearish_ob_bottom'),
+                    smc_bullish_ob_entry=fixed_bullish_ob_entry,
+                    smc_bearish_ob_entry=fixed_bearish_ob_entry,
+                    smc_ob_tags=(
+                        ", ".join(exit_trigger_tags)
+                        if exit_trigger_tags else
+                        (f"fixed_{fixed_ob_side}_ob_locked" if fixed_ob_side else None)
+                    ),
+                    smc_bullish_ob_top=(float(fixed_ob_top) if fixed_ob_side == 'bullish' and fixed_ob_top is not None else None),
+                    smc_bullish_ob_bottom=(float(fixed_ob_bottom) if fixed_ob_side == 'bullish' and fixed_ob_bottom is not None else None),
+                    smc_bearish_ob_top=(float(fixed_ob_top) if fixed_ob_side == 'bearish' and fixed_ob_top is not None else None),
+                    smc_bearish_ob_bottom=(float(fixed_ob_bottom) if fixed_ob_side == 'bearish' and fixed_ob_bottom is not None else None),
                     smc_signal=smc_sig,
                     smc_reason=exit_reason,
                     smc_tf=tf,
                     utsmc_signal_high=signal_high,
                     utsmc_signal_low=signal_low,
+                    utsmc_fixed_ob_side=(fixed_ob_side or None),
+                    utsmc_fixed_ob_top=fixed_ob_top,
+                    utsmc_fixed_ob_bottom=fixed_ob_bottom,
+                    utsmc_fixed_ob_created_ts_human=fixed_ob_created_human,
+                    utsmc_fixed_ob_origin_ts_human=fixed_ob_origin_human,
                     exit_reason_text=exit_reason,
                     exit_trigger_kind=", ".join(exit_trigger_tags) if exit_trigger_tags else None,
                     exit_tf=tf,
@@ -6558,6 +6701,7 @@ class SignalEngine(BaseEngine):
         if active_strategy == 'utsmc' or str(reason or '').startswith('UTSMC'):
             self._clear_utsmc_pending_entry(symbol)
             self._clear_utsmc_entry_invalidation(symbol)
+            self._clear_utsmc_fixed_exit_ob(symbol)
             self.utsmc_last_entry_signal_ts.pop(symbol, None)
         
         self.db.log_trade_close(symbol, pnl, pnl_pct, exit_price, reason)
