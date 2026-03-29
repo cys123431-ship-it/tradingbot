@@ -2884,7 +2884,7 @@ class SignalEngine(BaseEngine):
                 f"신호봉 이후 {timing_desc}, 청산은 {exit_wait_label}"
             )
         else:
-            reason = f"UTSMC 상태 유지: UT {ut_state.upper()} 상태, fresh signal armed 후 {timing_desc}"
+            reason = f"UTSMC 상태 유지: UT {ut_state.upper()} 상태, 현재 유지 신호 기준 {timing_desc}"
         return ut_sig, reason, detail
 
     def _calculate_rsi_signal(self, df, strategy_params):
@@ -4609,6 +4609,28 @@ class SignalEngine(BaseEngine):
                 pos_side='NONE',
                 note=f"pending {timing_mode} entry | execute_ts={execute_ts}"
             )
+        elif not pos and timing_mode == 'persistent' and target_sig in {'long', 'short'}:
+            execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
+            self._set_ut_pending_entry(
+                symbol,
+                target_sig,
+                current_ts,
+                execute_ts,
+                strategy_name=strategy_name
+            )
+            self.last_entry_reason[symbol] = (
+                f"{strategy_name} 현재 유지 중인 {target_sig.upper()} 상태 확인, {timing_label} 즉시 대기"
+            )
+            self._update_stateful_diag(
+                symbol,
+                stage='entry_armed',
+                strategy=strategy_name,
+                raw_state=(target_sig or 'none'),
+                raw_signal=(raw_strategy_sig or 'none'),
+                entry_sig=target_sig,
+                pos_side='NONE',
+                note=f"persistent state entry | execute_ts={execute_ts} | source=current_state"
+            )
         elif not pos and target_sig:
             if pending and timing_mode == 'persistent' and pending.get('side') == target_sig:
                 self.last_entry_reason[symbol] = (
@@ -4717,6 +4739,34 @@ class SignalEngine(BaseEngine):
                 entry_sig=(ut_signal or 'none'),
                 pos_side='NONE',
                 note=f"pending {timing_mode} entry | execute_ts={execute_ts} | ob={smc_reason or '-'}"
+            )
+            return
+
+        if timing_mode == 'persistent' and target_sig in {'long', 'short'}:
+            execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
+            self._set_utsmc_pending_entry(
+                symbol,
+                target_sig,
+                ut_detail.get('signal_ts') or current_ts,
+                execute_ts,
+                signal_high=ut_detail.get('signal_high'),
+                signal_low=ut_detail.get('signal_low')
+            )
+            self.last_entry_reason[symbol] = (
+                f"{strategy_name} 현재 유지 중인 UT {target_sig.upper()} 상태 확인, {timing_label} 즉시 대기"
+            )
+            self._update_stateful_diag(
+                symbol,
+                stage='entry_armed',
+                strategy=strategy_name,
+                raw_state=(target_sig or 'none'),
+                raw_signal=(ut_signal or 'none'),
+                entry_sig=target_sig,
+                pos_side='NONE',
+                note=(
+                    f"persistent state entry | execute_ts={execute_ts} | "
+                    f"signal_high={ut_signal_high} | signal_low={ut_signal_low} | ob={smc_reason or '-'}"
+                )
             )
             return
 
@@ -4849,6 +4899,29 @@ class SignalEngine(BaseEngine):
                 entry_sig=fresh_entry_sig,
                 pos_side='NONE',
                 note=f"pending {timing_mode} entry | execute_ts={execute_ts} | timing={timing_label}"
+            )
+        elif not pos and timing_mode == 'persistent' and entry_sig in {'long', 'short'}:
+            execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
+            self._set_ut_pending_entry(
+                symbol,
+                entry_sig,
+                current_ts,
+                execute_ts,
+                strategy_name=strategy_name,
+                hybrid_strategy=active_strategy
+            )
+            self.last_entry_reason[symbol] = (
+                f"{strategy_name} 현재 유지 중인 {entry_sig.upper()} 조건 확인 -> {entry_mode_label} 즉시 대기"
+            )
+            self._update_stateful_diag(
+                symbol,
+                stage='entry_armed',
+                strategy=strategy_name,
+                raw_state=(regime_sig or 'none'),
+                raw_signal=(raw_strategy_sig or 'none'),
+                entry_sig=entry_sig,
+                pos_side='NONE',
+                note=f"persistent state entry | execute_ts={execute_ts} | timing={timing_label}"
             )
         elif not pos and pending and timing_mode == 'persistent' and entry_sig == pending.get('side'):
             self.last_entry_reason[symbol] = (
@@ -8357,7 +8430,7 @@ class MainController:
             '19': "📝 **UT Bot 설정** 입력 (형식: key,atr,on/off 예: 1,10,off)",
             '20': "RSI/BB 보조설정 입력\n형식: RSI길이,BB길이,BB배수\n예: 6,200,2",
             '21': "ℹ️ **UT 전략 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙, UTSMC는 26번 UT 진입 방식 + internal OB/UT 신호봉 무효화 청산을 사용합니다.",
-            '26': "📝 **UT 진입 방식** 입력\n`next` 또는 `1` = 시그널 마감봉 바로 다음봉에만 진입\n`persistent` 또는 `2` = 신호가 유지되는 동안 늦게라도 진입",
+            '26': "📝 **UT 진입 방식** 입력\n`next` 또는 `1` = 시그널 마감봉 바로 다음봉에만 진입\n`persistent` 또는 `2` = fresh signal이 아니어도 현재 유지 중인 시그널이면 즉시 진입 대기/진입",
             '22': "📝 **거래소/네트워크 선택** (1=바이낸스 테스트넷, 2=바이낸스 메인넷, 3=업비트 KRW 현물)",
             '23': "📝 **거래량 급등 채굴 기능** (1=ON, 0=OFF)",
             '24': "📝 **채굴 진입 타임프레임** 입력 (예: 5m)\n1m, 5m, 15m, 30m, 1h",
@@ -8467,7 +8540,7 @@ class MainController:
         elif text == '21':
             await update.message.reply_text(
                 "ℹ️ UT Hybrid 전략 안내\n"
-                "- 26번 UT 진입 방식: `다음봉 진입`은 시그널 마감 직후 다음 진행봉에서만 진입, `신호유지 진입`은 조건이 유지되면 늦게라도 진입\n"
+                "- 26번 UT 진입 방식: `다음봉 진입`은 시그널 마감 직후 다음 진행봉에서만 진입, `신호유지 진입`은 fresh signal이 아니어도 현재 유지 중인 시그널이면 즉시 진입 대기/진입\n"
                 "- UTRSI: UT 방향 + RSI 타이밍 조합\n"
                 "- UTRSIBB: UT 방향 + RSI/BB 동시 타이밍 조합\n"
                 "- UTBB LONG: UT 롱신호와 BB 롱신호가 순서 무관 3봉 내 일치하면 진입, 중간에 UT 숏 또는 BB 숏이 나오면 저장 무효\n"
@@ -8477,7 +8550,7 @@ class MainController:
                 "- UTBB 특수 SHORT(하단돌파형): 진입봉이 BB 중간선 하향 + BB 하단선 하향 돌파면 BB 하단선 상향 돌파 또는 UT 롱상태로 청산\n"
                 "- UTBB 특수 SHORT(반등실패형): 중간선 아래 양봉 1~2개 뒤 저점 이탈 음봉이면 진입, BB 중간선 상향 돌파 또는 UT 롱상태로 청산\n"
                 "- UTBB SHORT 청산: 일반은 UT 롱상태 또는 BB 하단선 하향 돌파\n"
-                "- UTSMC: UT fresh signal 확정 후 선택한 진입 방식대로 진입, 청산은 exit TF internal OB 또는 UT 신호봉 무효화 마감 기준\n"
+                "- UTSMC: 선택한 진입 방식대로 진입, `신호유지 진입`이면 현재 유지 중인 UT 상태에서도 바로 진입 가능, 청산은 exit TF internal OB 또는 UT 신호봉 무효화 마감 기준\n"
                 "- UTSMC LONG: UT 롱신호 확정 후 LONG 진입, internal bearish OB 진입 마감 또는 UT 신호봉 저가 이탈 마감 청산\n"
                 "- UTSMC SHORT: UT 숏신호 확정 후 SHORT 진입, internal bullish OB 진입 마감 또는 UT 신호봉 고가 돌파 마감 청산\n"
                 "- 모든 판단은 확정봉 기준"
