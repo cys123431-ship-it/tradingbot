@@ -4710,8 +4710,6 @@ class SignalEngine(BaseEngine):
             self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {hold_note}"
             return
 
-        self._clear_utsmc_entry_invalidation(symbol)
-
         if pending and target_sig not in {'long', 'short'}:
             self._clear_utsmc_pending_entry(symbol)
             self.last_entry_reason[symbol] = f"{strategy_name} UT 상태 해제, fresh UT 신호 재대기"
@@ -6513,6 +6511,12 @@ class SignalEngine(BaseEngine):
         # 罹먯떆 ?꾩쟾 臾댄슚??
         self.position_cache = None
         self.position_cache_time = 0
+
+        active_strategy = str(self.get_runtime_strategy_params().get('active_strategy', '') or '').lower()
+        if active_strategy == 'utsmc' or str(reason or '').startswith('UTSMC'):
+            self._clear_utsmc_pending_entry(symbol)
+            self._clear_utsmc_entry_invalidation(symbol)
+            self.utsmc_last_entry_signal_ts.pop(symbol, None)
         
         self.db.log_trade_close(symbol, pnl, pnl_pct, exit_price, reason)
         await self.ctrl.notify(
