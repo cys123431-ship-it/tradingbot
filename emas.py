@@ -2340,15 +2340,277 @@ class SignalEngine(BaseEngine):
         )
         return None, reason, detail
 
+    def _calculate_rma_series(self, values, length):
+        series = pd.Series(np.nan, index=range(len(values)), dtype=float)
+        if values is None or len(values) < length or length <= 0:
+            return series
+        base = pd.Series(values, dtype=float)
+        series.iloc[length - 1] = float(base.iloc[:length].mean())
+        for idx in range(length, len(base)):
+            prev_val = float(series.iloc[idx - 1])
+            series.iloc[idx] = ((prev_val * (length - 1)) + float(base.iloc[idx])) / length
+        return series
+
+    def _update_luxalgo_structure_pivot_state(self, bar_index, size, state, highs, lows, times):
+        if size <= 0 or bar_index < size:
+            return
+
+        pivot_index = bar_index - size
+        future_highs = highs[pivot_index + 1:bar_index + 1]
+        future_lows = lows[pivot_index + 1:bar_index + 1]
+        if len(future_highs) != size or len(future_lows) != size:
+            return
+
+        leg_val = int(state.get('leg', 0) or 0)
+        prev_leg = leg_val
+        if highs[pivot_index] > max(future_highs):
+            leg_val = 0
+        elif lows[pivot_index] < min(future_lows):
+            leg_val = 1
+        state['leg'] = leg_val
+
+        leg_change = leg_val - prev_leg
+        if leg_change == 1:
+            pivot = state['low']
+            pivot['last_level'] = pivot.get('current_level')
+            pivot['current_level'] = float(lows[pivot_index])
+            pivot['crossed'] = False
+            pivot['bar_time'] = int(times[pivot_index])
+            pivot['bar_index'] = int(pivot_index)
+        elif leg_change == -1:
+            pivot = state['high']
+            pivot['last_level'] = pivot.get('current_level')
+            pivot['current_level'] = float(highs[pivot_index])
+            pivot['crossed'] = False
+            pivot['bar_time'] = int(times[pivot_index])
+            pivot['bar_index'] = int(pivot_index)
+
+    def _store_luxalgo_order_block(self, order_blocks, pivot, current_bar_index, parsed_highs, parsed_lows, times, bias):
+        start_idx = pivot.get('bar_index')
+        if start_idx is None:
+            return
+        start_idx = int(start_idx)
+        if start_idx < 0 or start_idx >= current_bar_index:
+            return
+
+        if bias == -1:
+            source_slice = parsed_highs[start_idx:current_bar_index]
+            if not source_slice:
+                return
+            rel_idx = source_slice.index(max(source_slice))
+        else:
+            source_slice = parsed_lows[start_idx:current_bar_index]
+            if not source_slice:
+                return
+            rel_idx = source_slice.index(min(source_slice))
+
+        parsed_index = start_idx + rel_idx
+        order_blocks.insert(0, {
+            'top': float(parsed_highs[parsed_index]),
+            'bottom': float(parsed_lows[parsed_index]),
+            'origin_ts': int(times[parsed_index]),
+            'created_ts': int(times[current_bar_index]),
+            'bias': int(bias)
+        })
+        if len(order_blocks) > 100:
+            del order_blocks[100:]
+
+    def _delete_luxalgo_order_blocks(self, order_blocks, high_price, low_price, close_price, mitigation_mode):
+        mitigation_key = str(mitigation_mode or 'highlow').lower()
+        bearish_source = float(close_price) if mitigation_key == 'close' else float(high_price)
+        bullish_source = float(close_price) if mitigation_key == 'close' else float(low_price)
+
+        active_blocks = []
+        for order_block in order_blocks:
+            bias = int(order_block.get('bias', 0) or 0)
+            top = float(order_block.get('top', 0.0) or 0.0)
+            bottom = float(order_block.get('bottom', 0.0) or 0.0)
+            crossed = (
+                (bias == -1 and bearish_source > top) or
+                (bias == 1 and bullish_source < bottom)
+            )
+            if not crossed:
+                active_blocks.append(order_block)
+        return active_blocks
+
+    def _calculate_luxalgo_internal_ob_state(self, closed, internal_length, swing_length, use_confluence_filter=False, order_block_filter='atr', mitigation_mode='highlow'):
+        detail = {
+            'trend_bias': 0,
+            'trend_label': 'neutral',
+            'active_bullish_obs': [],
+            'active_bearish_obs': [],
+            'matched_bullish_ob': None,
+            'matched_bearish_ob': None
+        }
+        if closed is None or len(closed) < max(swing_length + 5, internal_length + 5, 40):
+            return detail
+
+        opens = closed['open'].astype(float).tolist()
+        highs = closed['high'].astype(float).tolist()
+        lows = closed['low'].astype(float).tolist()
+        closes = closed['close'].astype(float).tolist()
+        times = closed['timestamp'].astype(int).tolist()
+        n = len(closed)
+
+        prev_close = pd.Series(closes, dtype=float).shift(1)
+        true_range = pd.concat([
+            (closed['high'].astype(float) - closed['low'].astype(float)).abs(),
+            (closed['high'].astype(float) - prev_close).abs(),
+            (closed['low'].astype(float) - prev_close).abs()
+        ], axis=1).max(axis=1).fillna(0.0)
+        atr_measure = self._calculate_rma_series(true_range.tolist(), 200)
+        range_measure = true_range.cumsum() / np.arange(1, n + 1)
+
+        filter_key = str(order_block_filter or 'atr').lower()
+        volatility_measure = range_measure if filter_key == 'range' else atr_measure
+
+        parsed_highs = []
+        parsed_lows = []
+        for idx in range(n):
+            high_val = float(highs[idx])
+            low_val = float(lows[idx])
+            vol_val = volatility_measure.iloc[idx] if hasattr(volatility_measure, 'iloc') else volatility_measure[idx]
+            high_volatility_bar = bool(np.isfinite(vol_val) and (high_val - low_val) >= (2.0 * float(vol_val)))
+            parsed_highs.append(low_val if high_volatility_bar else high_val)
+            parsed_lows.append(high_val if high_volatility_bar else low_val)
+
+        def _new_state():
+            return {
+                'leg': 0,
+                'trend_bias': 0,
+                'high': {
+                    'current_level': None,
+                    'last_level': None,
+                    'crossed': False,
+                    'bar_time': None,
+                    'bar_index': None
+                },
+                'low': {
+                    'current_level': None,
+                    'last_level': None,
+                    'crossed': False,
+                    'bar_time': None,
+                    'bar_index': None
+                }
+            }
+
+        swing_state = _new_state()
+        internal_state = _new_state()
+        internal_order_blocks = []
+
+        for bar_index in range(n):
+            self._update_luxalgo_structure_pivot_state(bar_index, swing_length, swing_state, highs, lows, times)
+            self._update_luxalgo_structure_pivot_state(bar_index, internal_length, internal_state, highs, lows, times)
+
+            upper_wick = float(highs[bar_index]) - max(float(closes[bar_index]), float(opens[bar_index]))
+            lower_wick = min(float(closes[bar_index]), float(opens[bar_index])) - float(lows[bar_index])
+            bullish_bar = True
+            bearish_bar = True
+            if use_confluence_filter:
+                bullish_bar = upper_wick > lower_wick
+                bearish_bar = upper_wick < lower_wick
+
+            if bar_index >= 1:
+                internal_high = internal_state['high']
+                high_level = internal_high.get('current_level')
+                swing_high_level = swing_state['high'].get('current_level')
+                extra_bullish = bullish_bar and (
+                    swing_high_level is None or high_level is None or not np.isclose(float(high_level), float(swing_high_level))
+                )
+                if (
+                    high_level is not None
+                    and not internal_high.get('crossed')
+                    and float(closes[bar_index - 1]) <= float(high_level)
+                    and float(closes[bar_index]) > float(high_level)
+                    and extra_bullish
+                ):
+                    internal_high['crossed'] = True
+                    internal_state['trend_bias'] = 1
+                    self._store_luxalgo_order_block(
+                        internal_order_blocks,
+                        internal_high,
+                        bar_index,
+                        parsed_highs,
+                        parsed_lows,
+                        times,
+                        bias=1
+                    )
+
+                internal_low = internal_state['low']
+                low_level = internal_low.get('current_level')
+                swing_low_level = swing_state['low'].get('current_level')
+                extra_bearish = bearish_bar and (
+                    swing_low_level is None or low_level is None or not np.isclose(float(low_level), float(swing_low_level))
+                )
+                if (
+                    low_level is not None
+                    and not internal_low.get('crossed')
+                    and float(closes[bar_index - 1]) >= float(low_level)
+                    and float(closes[bar_index]) < float(low_level)
+                    and extra_bearish
+                ):
+                    internal_low['crossed'] = True
+                    internal_state['trend_bias'] = -1
+                    self._store_luxalgo_order_block(
+                        internal_order_blocks,
+                        internal_low,
+                        bar_index,
+                        parsed_highs,
+                        parsed_lows,
+                        times,
+                        bias=-1
+                    )
+
+            internal_order_blocks = self._delete_luxalgo_order_blocks(
+                internal_order_blocks,
+                highs[bar_index],
+                lows[bar_index],
+                closes[bar_index],
+                mitigation_mode
+            )
+
+        curr_close = float(closes[-1])
+        active_bullish_obs = [ob for ob in internal_order_blocks if int(ob.get('bias', 0) or 0) == 1]
+        active_bearish_obs = [ob for ob in internal_order_blocks if int(ob.get('bias', 0) or 0) == -1]
+        matched_bullish = next(
+            (
+                ob for ob in active_bullish_obs
+                if float(ob.get('bottom', curr_close + 1.0)) <= curr_close <= float(ob.get('top', curr_close - 1.0))
+            ),
+            None
+        )
+        matched_bearish = next(
+            (
+                ob for ob in active_bearish_obs
+                if float(ob.get('bottom', curr_close + 1.0)) <= curr_close <= float(ob.get('top', curr_close - 1.0))
+            ),
+            None
+        )
+
+        detail.update({
+            'trend_bias': int(internal_state.get('trend_bias', 0) or 0),
+            'trend_label': 'bullish' if internal_state.get('trend_bias') == 1 else 'bearish' if internal_state.get('trend_bias') == -1 else 'neutral',
+            'active_bullish_obs': active_bullish_obs,
+            'active_bearish_obs': active_bearish_obs,
+            'matched_bullish_ob': matched_bullish,
+            'matched_bearish_ob': matched_bearish
+        })
+        return detail
+
     def _calculate_smc_internal_ob_signal(self, df, strategy_params):
         cfg = strategy_params.get('UTSMC', {})
         internal_length = max(2, int(cfg.get('internal_length', 5) or 5))
+        swing_length = max(internal_length + 1, int(cfg.get('swing_length', 50) or 50))
+        use_confluence_filter = bool(cfg.get('use_confluence_filter', False))
+        order_block_filter = str(cfg.get('order_block_filter', 'atr') or 'atr')
+        mitigation_mode = str(cfg.get('order_block_mitigation', 'highlow') or 'highlow')
 
         closed = df.iloc[:-1].copy().reset_index(drop=True)
-        min_bars = max(internal_length + 10, 40)
+        min_bars = max(swing_length + 5, internal_length + 10, 40)
         if len(closed) < min_bars:
             return None, "SMC internal OB 데이터 부족", {
                 'internal_length': internal_length,
+                'swing_length': swing_length,
                 'bullish_internal_ob_entry': False,
                 'bearish_internal_ob_entry': False,
                 'bullish_ob_top': None,
@@ -2358,99 +2620,28 @@ class SignalEngine(BaseEngine):
                 'signal_ts': int(closed.iloc[-1]['timestamp']) if len(closed) else 0
             }
 
-        highs = closed['high'].astype(float).tolist()
-        lows = closed['low'].astype(float).tolist()
-        closes = closed['close'].astype(float).tolist()
         times = closed['timestamp'].astype(int).tolist()
-        n = len(closed)
-
-        pivot_high = None
-        pivot_low = None
-        trend_bias = 0
-        latest_bullish_ob = None
-        latest_bearish_ob = None
-
-        for bar_index in range(n):
-            confirm_idx = bar_index - internal_length
-            if confirm_idx >= 0:
-                future_highs = highs[confirm_idx + 1:bar_index + 1]
-                future_lows = lows[confirm_idx + 1:bar_index + 1]
-                center_high = highs[confirm_idx]
-                center_low = lows[confirm_idx]
-
-                if len(future_highs) == internal_length and center_high > max(future_highs):
-                    pivot_high = {
-                        'level': center_high,
-                        'ts': times[confirm_idx],
-                        'bar_index': confirm_idx,
-                        'crossed': False
-                    }
-                if len(future_lows) == internal_length and center_low < min(future_lows):
-                    pivot_low = {
-                        'level': center_low,
-                        'ts': times[confirm_idx],
-                        'bar_index': confirm_idx,
-                        'crossed': False
-                    }
-
-            high_price = highs[bar_index]
-            low_price = lows[bar_index]
-            close_price = closes[bar_index]
-
-            if latest_bearish_ob and high_price > float(latest_bearish_ob.get('top', 0.0)):
-                latest_bearish_ob = None
-            if latest_bullish_ob and low_price < float(latest_bullish_ob.get('bottom', 0.0)):
-                latest_bullish_ob = None
-
-            if pivot_high and not pivot_high.get('crossed') and close_price > float(pivot_high.get('level', 0.0)):
-                trend_bias = 1
-                pivot_high['crossed'] = True
-                start_idx = max(0, int(pivot_high.get('bar_index', bar_index)))
-                end_idx = bar_index
-                if start_idx <= end_idx:
-                    ob_slice = lows[start_idx:end_idx + 1]
-                    if ob_slice:
-                        rel_idx = ob_slice.index(min(ob_slice))
-                        ob_idx = start_idx + rel_idx
-                        latest_bullish_ob = {
-                            'top': highs[ob_idx],
-                            'bottom': lows[ob_idx],
-                            'origin_ts': times[ob_idx],
-                            'created_ts': times[bar_index],
-                            'label': 'internal_bullish_ob'
-                        }
-
-            if pivot_low and not pivot_low.get('crossed') and close_price < float(pivot_low.get('level', 0.0)):
-                trend_bias = -1
-                pivot_low['crossed'] = True
-                start_idx = max(0, int(pivot_low.get('bar_index', bar_index)))
-                end_idx = bar_index
-                if start_idx <= end_idx:
-                    ob_slice = highs[start_idx:end_idx + 1]
-                    if ob_slice:
-                        rel_idx = ob_slice.index(max(ob_slice))
-                        ob_idx = start_idx + rel_idx
-                        latest_bearish_ob = {
-                            'top': highs[ob_idx],
-                            'bottom': lows[ob_idx],
-                            'origin_ts': times[ob_idx],
-                            'created_ts': times[bar_index],
-                            'label': 'internal_bearish_ob'
-                        }
-
-        curr_close = closes[-1]
-        bullish_internal_ob_entry = bool(
-            latest_bullish_ob
-            and float(latest_bullish_ob.get('bottom', curr_close + 1.0)) <= curr_close <= float(latest_bullish_ob.get('top', curr_close - 1.0))
+        closes = closed['close'].astype(float).tolist()
+        curr_close = float(closes[-1])
+        lux_state = self._calculate_luxalgo_internal_ob_state(
+            closed,
+            internal_length,
+            swing_length,
+            use_confluence_filter=use_confluence_filter,
+            order_block_filter=order_block_filter,
+            mitigation_mode=mitigation_mode
         )
-        bearish_internal_ob_entry = bool(
-            latest_bearish_ob
-            and float(latest_bearish_ob.get('bottom', curr_close + 1.0)) <= curr_close <= float(latest_bearish_ob.get('top', curr_close - 1.0))
-        )
+        matched_bullish_ob = lux_state.get('matched_bullish_ob')
+        matched_bearish_ob = lux_state.get('matched_bearish_ob')
+        latest_bullish_ob = matched_bullish_ob or next(iter(lux_state.get('active_bullish_obs') or []), None)
+        latest_bearish_ob = matched_bearish_ob or next(iter(lux_state.get('active_bearish_obs') or []), None)
+        bullish_internal_ob_entry = matched_bullish_ob is not None
+        bearish_internal_ob_entry = matched_bearish_ob is not None
 
         detail = {
             'internal_length': internal_length,
-            'trend_label': 'bullish' if trend_bias == 1 else 'bearish' if trend_bias == -1 else 'neutral',
+            'swing_length': swing_length,
+            'trend_label': lux_state.get('trend_label', 'neutral'),
             'signal_ts': int(times[-1]),
             'curr_close': curr_close,
             'bullish_internal_ob_entry': bullish_internal_ob_entry,
@@ -2461,6 +2652,10 @@ class SignalEngine(BaseEngine):
             'bearish_ob_bottom': latest_bearish_ob.get('bottom') if latest_bearish_ob else None,
             'bullish_ob_origin_ts': latest_bullish_ob.get('origin_ts') if latest_bullish_ob else None,
             'bearish_ob_origin_ts': latest_bearish_ob.get('origin_ts') if latest_bearish_ob else None,
+            'active_bullish_ob_count': len(lux_state.get('active_bullish_obs') or []),
+            'active_bearish_ob_count': len(lux_state.get('active_bearish_obs') or []),
+            'order_block_filter': order_block_filter,
+            'order_block_mitigation': mitigation_mode,
             'ob_tags': [tag for tag, active in (
                 ('internal_bullish_ob_entry', bullish_internal_ob_entry),
                 ('internal_bearish_ob_entry', bearish_internal_ob_entry),
