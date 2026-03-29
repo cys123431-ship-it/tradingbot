@@ -4422,6 +4422,19 @@ class SignalEngine(BaseEngine):
             if diag.get('utsmc_entry_ob_tags'):
                 line += f" | tags `{diag.get('utsmc_entry_ob_tags')}`"
             lines.append(line)
+        if (
+            diag.get('utsmc_entry_bullish_ob_bottom') is not None
+            or diag.get('utsmc_entry_bullish_ob_top') is not None
+            or diag.get('utsmc_entry_bearish_ob_bottom') is not None
+            or diag.get('utsmc_entry_bearish_ob_top') is not None
+        ):
+            lines.append(
+                f"UTSMC entry OB range: "
+                f"bull `{self._fmt_signal_trade_value(diag.get('utsmc_entry_bullish_ob_bottom'))}` ~ "
+                f"`{self._fmt_signal_trade_value(diag.get('utsmc_entry_bullish_ob_top'))}` | "
+                f"bear `{self._fmt_signal_trade_value(diag.get('utsmc_entry_bearish_ob_bottom'))}` ~ "
+                f"`{self._fmt_signal_trade_value(diag.get('utsmc_entry_bearish_ob_top'))}`"
+            )
 
         if include_exit:
             if diag.get('exit_reason_text'):
@@ -4458,6 +4471,19 @@ class SignalEngine(BaseEngine):
                 lines.append(line)
             if diag.get('smc_reason'):
                 lines.append(f"UTSMC exit 판정: `{diag.get('smc_reason')}`")
+            if (
+                diag.get('smc_bullish_ob_bottom') is not None
+                or diag.get('smc_bullish_ob_top') is not None
+                or diag.get('smc_bearish_ob_bottom') is not None
+                or diag.get('smc_bearish_ob_top') is not None
+            ):
+                lines.append(
+                    f"UTSMC exit OB range: "
+                    f"bull `{self._fmt_signal_trade_value(diag.get('smc_bullish_ob_bottom'))}` ~ "
+                    f"`{self._fmt_signal_trade_value(diag.get('smc_bullish_ob_top'))}` | "
+                    f"bear `{self._fmt_signal_trade_value(diag.get('smc_bearish_ob_bottom'))}` ~ "
+                    f"`{self._fmt_signal_trade_value(diag.get('smc_bearish_ob_top'))}`"
+                )
 
         note = diag.get('note')
         if note:
@@ -5397,6 +5423,18 @@ class SignalEngine(BaseEngine):
                         if active_strategy == 'utsmc' and raw_hybrid_detail.get('ob_tags')
                         else None
                     ),
+                    utsmc_entry_bullish_ob_top=(
+                        raw_hybrid_detail.get('bullish_ob_top') if active_strategy == 'utsmc' else None
+                    ),
+                    utsmc_entry_bullish_ob_bottom=(
+                        raw_hybrid_detail.get('bullish_ob_bottom') if active_strategy == 'utsmc' else None
+                    ),
+                    utsmc_entry_bearish_ob_top=(
+                        raw_hybrid_detail.get('bearish_ob_top') if active_strategy == 'utsmc' else None
+                    ),
+                    utsmc_entry_bearish_ob_bottom=(
+                        raw_hybrid_detail.get('bearish_ob_bottom') if active_strategy == 'utsmc' else None
+                    ),
                     utsmc_entry_smc_signal=(
                         raw_hybrid_detail.get('smc_signal') if active_strategy == 'utsmc' else None
                     ),
@@ -5645,6 +5683,10 @@ class SignalEngine(BaseEngine):
                     smc_bullish_ob_entry=bullish_ob_entry,
                     smc_bearish_ob_entry=bearish_ob_entry,
                     smc_ob_tags=", ".join(smc_detail.get('ob_tags') or []) if smc_detail.get('ob_tags') else None,
+                    smc_bullish_ob_top=smc_detail.get('bullish_ob_top'),
+                    smc_bullish_ob_bottom=smc_detail.get('bullish_ob_bottom'),
+                    smc_bearish_ob_top=smc_detail.get('bearish_ob_top'),
+                    smc_bearish_ob_bottom=smc_detail.get('bearish_ob_bottom'),
                     smc_signal=smc_sig,
                     smc_reason=exit_reason,
                     smc_tf=tf,
@@ -10077,6 +10119,19 @@ class MainController:
                             if stateful_diag.get('utsmc_entry_ob_tags'):
                                 smc_entry_line += f" | tags `{stateful_diag.get('utsmc_entry_ob_tags')}`"
                             msg += smc_entry_line + "\n"
+                        if (
+                            stateful_diag.get('utsmc_entry_bullish_ob_bottom') is not None
+                            or stateful_diag.get('utsmc_entry_bullish_ob_top') is not None
+                            or stateful_diag.get('utsmc_entry_bearish_ob_bottom') is not None
+                            or stateful_diag.get('utsmc_entry_bearish_ob_top') is not None
+                        ):
+                            msg += (
+                                f"UTSMC entry OB range: "
+                                f"bull `{float(stateful_diag.get('utsmc_entry_bullish_ob_bottom') or 0.0):.2f}` ~ "
+                                f"`{float(stateful_diag.get('utsmc_entry_bullish_ob_top') or 0.0):.2f}` | "
+                                f"bear `{float(stateful_diag.get('utsmc_entry_bearish_ob_bottom') or 0.0):.2f}` ~ "
+                                f"`{float(stateful_diag.get('utsmc_entry_bearish_ob_top') or 0.0):.2f}`\n"
+                            )
                         if stateful_diag.get('utsmc_entry_smc_reason'):
                             msg += f"UTSMC entry 판정: `{stateful_diag.get('utsmc_entry_smc_reason')}`\n"
                         if stateful_diag.get('utsmc_signal_high') is not None or stateful_diag.get('utsmc_signal_low') is not None:
@@ -10096,6 +10151,19 @@ class MainController:
                             if stateful_diag.get('smc_ob_tags'):
                                 smc_line += f" | tags `{stateful_diag.get('smc_ob_tags')}`"
                             msg += smc_line + "\n"
+                        if (
+                            stateful_diag.get('smc_bullish_ob_bottom') is not None
+                            or stateful_diag.get('smc_bullish_ob_top') is not None
+                            or stateful_diag.get('smc_bearish_ob_bottom') is not None
+                            or stateful_diag.get('smc_bearish_ob_top') is not None
+                        ):
+                            msg += (
+                                f"UTSMC exit OB range: "
+                                f"bull `{float(stateful_diag.get('smc_bullish_ob_bottom') or 0.0):.2f}` ~ "
+                                f"`{float(stateful_diag.get('smc_bullish_ob_top') or 0.0):.2f}` | "
+                                f"bear `{float(stateful_diag.get('smc_bearish_ob_bottom') or 0.0):.2f}` ~ "
+                                f"`{float(stateful_diag.get('smc_bearish_ob_top') or 0.0):.2f}`\n"
+                            )
                         if stateful_diag.get('smc_reason'):
                             msg += f"UTSMC exit 판정: `{stateful_diag.get('smc_reason')}`\n"
                         diag_note = stateful_diag.get('note')
