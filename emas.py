@@ -4338,6 +4338,148 @@ class SignalEngine(BaseEngine):
             lines.append(f"note={note}")
         await self.ctrl.notify("\n".join(lines))
 
+    def _fmt_signal_trade_value(self, value, digits=2, signed=False):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return '-'
+        prefix = '+' if signed and number >= 0 else ''
+        quote_currency = self.get_quote_currency()
+        if str(quote_currency).upper() == 'KRW':
+            return f"{prefix}{number:,.0f}"
+        return f"{prefix}{number:.{digits}f}"
+
+    def _append_signal_diag_lines(self, lines, diag, *, include_exit=False):
+        if not isinstance(diag, dict) or not diag:
+            return
+
+        if diag.get('strategy'):
+            lines.append(
+                f"진단: stage `{diag.get('stage', '-')}` | raw `{diag.get('raw_state', '-')}` | "
+                f"entry `{diag.get('entry_sig', '-')}` | pos `{diag.get('pos_side', '-')}`"
+            )
+        if diag.get('ut_key') is not None:
+            lines.append(
+                f"UT 설정: K `{diag.get('ut_key')}` | ATR `{diag.get('ut_atr')}` | HA `{diag.get('ut_ha', '-')}`"
+            )
+        if diag.get('src') is not None and diag.get('stop') is not None:
+            lines.append(
+                f"UT 값: src `{self._fmt_signal_trade_value(diag.get('src'))}` | "
+                f"stop `{self._fmt_signal_trade_value(diag.get('stop'))}`"
+            )
+        if diag.get('signal_ts_human') or diag.get('feed_last_ts_human'):
+            lines.append(
+                f"UT 기준봉: tf `{diag.get('tf_used', '?')}` | signal `{diag.get('signal_ts_human', '?')}` | "
+                f"feed_last `{diag.get('feed_last_ts_human', '?')}`"
+            )
+        if (
+            diag.get('signal_open') is not None or diag.get('signal_high') is not None
+            or diag.get('signal_low') is not None or diag.get('signal_close') is not None
+        ):
+            lines.append(
+                f"UT 기준값: O `{self._fmt_signal_trade_value(diag.get('signal_open'))}` | "
+                f"H `{self._fmt_signal_trade_value(diag.get('signal_high'))}` | "
+                f"L `{self._fmt_signal_trade_value(diag.get('signal_low'))}` | "
+                f"C `{self._fmt_signal_trade_value(diag.get('signal_close'))}`"
+            )
+        elif diag.get('closed_ohlc_text'):
+            lines.append(f"UT 확정봉: `{diag.get('closed_ohlc_text')}`")
+
+        if diag.get('utsmc_entry_smc_reason'):
+            lines.append(f"UTSMC 진입판정: `{diag.get('utsmc_entry_smc_reason')}`")
+        if diag.get('utsmc_signal_high') is not None or diag.get('utsmc_signal_low') is not None:
+            lines.append(
+                f"UTSMC invalidation: high `{self._fmt_signal_trade_value(diag.get('utsmc_signal_high'))}` | "
+                f"low `{self._fmt_signal_trade_value(diag.get('utsmc_signal_low'))}`"
+            )
+        if (
+            diag.get('utsmc_entry_bullish_ob_entry') is not None
+            or diag.get('utsmc_entry_bearish_ob_entry') is not None
+            or diag.get('utsmc_entry_ob_tags')
+        ):
+            smc_entry_bull = 'Y' if diag.get('utsmc_entry_bullish_ob_entry') else 'N'
+            smc_entry_bear = 'Y' if diag.get('utsmc_entry_bearish_ob_entry') else 'N'
+            smc_entry_tf = diag.get('utsmc_entry_tf')
+            line = f"UTSMC entry OB{f'[{smc_entry_tf}]' if smc_entry_tf else ''}: bull `{smc_entry_bull}` | bear `{smc_entry_bear}`"
+            if diag.get('utsmc_entry_ob_tags'):
+                line += f" | tags `{diag.get('utsmc_entry_ob_tags')}`"
+            lines.append(line)
+
+        if include_exit:
+            if diag.get('exit_reason_text'):
+                lines.append(f"청산판정: `{diag.get('exit_reason_text')}`")
+            if diag.get('exit_trigger_kind'):
+                lines.append(f"청산트리거: `{diag.get('exit_trigger_kind')}`")
+            if diag.get('exit_closed_ts_human') or diag.get('exit_tf'):
+                lines.append(
+                    f"청산봉: tf `{diag.get('exit_tf', '?')}` | close_ts `{diag.get('exit_closed_ts_human', '?')}`"
+                )
+            if diag.get('exit_closed_ohlc_text'):
+                lines.append(f"청산 확정봉: `{diag.get('exit_closed_ohlc_text')}`")
+            elif (
+                diag.get('exit_closed_open') is not None or diag.get('exit_closed_high') is not None
+                or diag.get('exit_closed_low') is not None or diag.get('exit_closed_close') is not None
+            ):
+                lines.append(
+                    f"청산봉 값: O `{self._fmt_signal_trade_value(diag.get('exit_closed_open'))}` | "
+                    f"H `{self._fmt_signal_trade_value(diag.get('exit_closed_high'))}` | "
+                    f"L `{self._fmt_signal_trade_value(diag.get('exit_closed_low'))}` | "
+                    f"C `{self._fmt_signal_trade_value(diag.get('exit_closed_close'))}`"
+                )
+            if (
+                diag.get('smc_bullish_ob_entry') is not None
+                or diag.get('smc_bearish_ob_entry') is not None
+                or diag.get('smc_ob_tags')
+            ):
+                smc_bull = 'Y' if diag.get('smc_bullish_ob_entry') else 'N'
+                smc_bear = 'Y' if diag.get('smc_bearish_ob_entry') else 'N'
+                smc_tf = diag.get('smc_tf')
+                line = f"UTSMC exit OB{f'[{smc_tf}]' if smc_tf else ''}: bull `{smc_bull}` | bear `{smc_bear}`"
+                if diag.get('smc_ob_tags'):
+                    line += f" | tags `{diag.get('smc_ob_tags')}`"
+                lines.append(line)
+            if diag.get('smc_reason'):
+                lines.append(f"UTSMC exit 판정: `{diag.get('smc_reason')}`")
+
+        note = diag.get('note')
+        if note:
+            lines.append(f"진단메모: `{note}`")
+
+    def _build_signal_entry_notice(self, symbol, side, qty, requested_price, actual_entry_price):
+        display_symbol = self.ctrl.format_symbol_for_display(symbol)
+        diag = dict(self.last_stateful_diag.get(symbol, {}) or {})
+        strategy_name = str(self.get_runtime_strategy_params().get('active_strategy', 'utbot') or 'utbot').upper()
+        cfg = self.get_runtime_common_settings()
+
+        lines = [
+            f"✅ [Signal Entry] {display_symbol} `{str(side).upper()}`",
+            f"전략: `{strategy_name}` | 수량 `{qty}`",
+            f"주문가: `{self._fmt_signal_trade_value(requested_price)}` | 체결가: `{self._fmt_signal_trade_value(actual_entry_price)}`",
+            f"TF: 진입 `{cfg.get('entry_timeframe', cfg.get('timeframe', '15m'))}` / 청산 `{self._get_exit_timeframe(symbol)}`",
+            f"네트워크: `{self.ctrl.get_network_status_label()}` | 거래소 `{self.ctrl.get_exchange_display_name()}`",
+        ]
+        entry_reason = self.last_entry_reason.get(symbol)
+        if entry_reason:
+            lines.append(f"진입근거: `{entry_reason}`")
+        self._append_signal_diag_lines(lines, diag, include_exit=False)
+        return "\n".join(lines)
+
+    def _build_signal_exit_notice(self, symbol, pos, reason, pnl, pnl_pct, exit_price):
+        display_symbol = self.ctrl.format_symbol_for_display(symbol)
+        diag = dict(self.last_stateful_diag.get(symbol, {}) or {})
+        strategy_name = str(self.get_runtime_strategy_params().get('active_strategy', 'utbot') or 'utbot').upper()
+        side = str(pos.get('side', 'unknown')).upper()
+        entry_price = pos.get('entryPrice')
+
+        lines = [
+            f"📊 [Signal Exit] {display_symbol} `{side}`",
+            f"전략: `{strategy_name}` | 호출사유 `{reason}`",
+            f"PnL: `{self._fmt_signal_trade_value(pnl, signed=True)}` (`{float(pnl_pct):+.2f}%`)",
+            f"진입가: `{self._fmt_signal_trade_value(entry_price)}` | 청산가: `{self._fmt_signal_trade_value(exit_price)}`",
+        ]
+        self._append_signal_diag_lines(lines, diag, include_exit=True)
+        return "\n".join(lines)
+
     async def _handle_utbot_primary_strategy(self, symbol, k, pos, strategy_name, raw_strategy_sig, raw_state_sig, sig):
         target_sig = raw_state_sig
         entry_sig = sig
@@ -5122,6 +5264,10 @@ class SignalEngine(BaseEngine):
                     tf_used=tf,
                     signal_ts=signal_ts,
                     signal_ts_human=datetime.fromtimestamp(signal_ts / 1000).strftime('%m-%d %H:%M') if signal_ts else None,
+                    signal_open=raw_ut_detail.get('signal_open'),
+                    signal_high=raw_ut_detail.get('signal_high'),
+                    signal_low=raw_ut_detail.get('signal_low'),
+                    signal_close=raw_ut_detail.get('signal_close'),
                     timing_label=raw_hybrid_detail.get('timing_label'),
                     timing_signal=(raw_hybrid_detail.get('timing_signal') or 'none') if raw_hybrid_detail.get('timing_label') else None,
                     effective_timing_signal=(raw_hybrid_detail.get('effective_timing_signal') or 'none') if raw_hybrid_detail.get('timing_label') else None,
@@ -5316,51 +5462,99 @@ class SignalEngine(BaseEngine):
             if active_strategy == 'utsmc':
                 strategy_name = "UTSMC(Exit)"
                 smc_sig, exit_reason, smc_detail = self._calculate_smc_internal_ob_signal(df, strategy_params)
-                current_closed_ts = int(df.iloc[-2]['timestamp'])
-                current_closed_price = float(df.iloc[-2]['close'])
+                current_closed_row = df.iloc[-2]
+                current_closed_ts = int(current_closed_row['timestamp'])
+                current_closed_price = float(current_closed_row['close'])
+                current_closed_open = float(current_closed_row['open'])
+                current_closed_high = float(current_closed_row['high'])
+                current_closed_low = float(current_closed_row['low'])
+                exit_candle_ms = self._timeframe_to_ms(tf)
+                current_closed_end_ts = (
+                    current_closed_ts + exit_candle_ms
+                    if exit_candle_ms > 0 else current_closed_ts
+                )
+                current_closed_end_human = datetime.fromtimestamp(
+                    current_closed_end_ts / 1000
+                ).strftime('%m-%d %H:%M') if current_closed_end_ts else None
+                current_closed_ohlc_text = (
+                    f"{datetime.fromtimestamp(current_closed_ts / 1000).strftime('%m-%d %H:%M')} "
+                    f"O{current_closed_open:.2f} H{current_closed_high:.2f} "
+                    f"L{current_closed_low:.2f} C{current_closed_price:.2f}"
+                )
                 invalidation = self._get_utsmc_entry_invalidation(symbol) or {}
+                invalidation_side = str(invalidation.get('side') or '').lower()
                 signal_high = invalidation.get('signal_high')
                 signal_low = invalidation.get('signal_low')
+                bearish_ob_entry = bool(smc_detail.get('bearish_internal_ob_entry'))
+                bullish_ob_entry = bool(smc_detail.get('bullish_internal_ob_entry'))
                 ut_invalidation_long = (
                     current_side.lower() == 'long'
+                    and invalidation_side in {'', 'long'}
                     and signal_low is not None
                     and current_closed_price <= float(signal_low)
                 )
                 ut_invalidation_short = (
                     current_side.lower() == 'short'
+                    and invalidation_side in {'', 'short'}
                     and signal_high is not None
                     and current_closed_price >= float(signal_high)
                 )
-                raw_exit_long = current_side.lower() == 'long' and (
-                    bool(smc_detail.get('bearish_internal_ob_entry')) or ut_invalidation_long
-                )
-                raw_exit_short = current_side.lower() == 'short' and (
-                    bool(smc_detail.get('bullish_internal_ob_entry')) or ut_invalidation_short
-                )
-                if ut_invalidation_long:
-                    exit_reason = (
-                        f"UTSMC LONG INVALIDATION: close {current_closed_price:.4f} <= "
-                        f"UT signal low {float(signal_low):.4f}"
-                    )
-                elif ut_invalidation_short:
-                    exit_reason = (
-                        f"UTSMC SHORT INVALIDATION: close {current_closed_price:.4f} >= "
-                        f"UT signal high {float(signal_high):.4f}"
-                    )
+                exit_trigger_tags = []
+                exit_reason_parts = []
+                if current_side.lower() == 'long':
+                    if bearish_ob_entry:
+                        exit_trigger_tags.append('internal_bearish_ob_entry')
+                        exit_reason_parts.append(
+                            f"SMC INTERNAL BEARISH OB ENTRY {float(smc_detail.get('bearish_ob_bottom') or 0.0):.4f} ~ "
+                            f"{float(smc_detail.get('bearish_ob_top') or 0.0):.4f}"
+                        )
+                    if ut_invalidation_long:
+                        exit_trigger_tags.append('ut_long_invalidation')
+                        exit_reason_parts.append(
+                            f"UT LONG INVALIDATION close {current_closed_price:.4f} <= signal low {float(signal_low):.4f}"
+                        )
+                    raw_exit_long = bool(exit_reason_parts)
+                    raw_exit_short = False
+                else:
+                    if bullish_ob_entry:
+                        exit_trigger_tags.append('internal_bullish_ob_entry')
+                        exit_reason_parts.append(
+                            f"SMC INTERNAL BULLISH OB ENTRY {float(smc_detail.get('bullish_ob_bottom') or 0.0):.4f} ~ "
+                            f"{float(smc_detail.get('bullish_ob_top') or 0.0):.4f}"
+                        )
+                    if ut_invalidation_short:
+                        exit_trigger_tags.append('ut_short_invalidation')
+                        exit_reason_parts.append(
+                            f"UT SHORT INVALIDATION close {current_closed_price:.4f} >= signal high {float(signal_high):.4f}"
+                        )
+                    raw_exit_short = bool(exit_reason_parts)
+                    raw_exit_long = False
+                if exit_reason_parts:
+                    exit_reason = " | ".join(exit_reason_parts)
                 bypass_exit_filters = True
                 self._update_stateful_diag(
                     symbol,
-                    smc_bullish_ob_entry=smc_detail.get('bullish_internal_ob_entry'),
-                    smc_bearish_ob_entry=smc_detail.get('bearish_internal_ob_entry'),
+                    smc_bullish_ob_entry=bullish_ob_entry,
+                    smc_bearish_ob_entry=bearish_ob_entry,
                     smc_ob_tags=", ".join(smc_detail.get('ob_tags') or []) if smc_detail.get('ob_tags') else None,
                     smc_signal=smc_sig,
                     smc_reason=exit_reason,
                     smc_tf=tf,
                     utsmc_signal_high=signal_high,
-                    utsmc_signal_low=signal_low
+                    utsmc_signal_low=signal_low,
+                    exit_reason_text=exit_reason,
+                    exit_trigger_kind=", ".join(exit_trigger_tags) if exit_trigger_tags else None,
+                    exit_tf=tf,
+                    exit_closed_ts=current_closed_end_ts,
+                    exit_closed_ts_human=current_closed_end_human,
+                    exit_closed_open=current_closed_open,
+                    exit_closed_high=current_closed_high,
+                    exit_closed_low=current_closed_low,
+                    exit_closed_close=current_closed_price,
+                    exit_closed_ohlc_text=current_closed_ohlc_text
                 )
                 last_utsmc_entry_ts = int(self.utsmc_last_entry_signal_ts.get(symbol, 0) or 0)
-                if last_utsmc_entry_ts and current_closed_ts < last_utsmc_entry_ts:
+                if last_utsmc_entry_ts and current_closed_end_ts <= last_utsmc_entry_ts:
                     raw_exit_long = False
                     raw_exit_short = False
                 if raw_exit_long or raw_exit_short:
@@ -5430,11 +5624,23 @@ class SignalEngine(BaseEngine):
 
             if bypass_exit_filters:
                 if current_side.lower() == 'long' and raw_exit_long:
-                    logger.info(f"[Exit {tf}] LONG Exit Triggered by UTSMC internal bearish OB entry")
-                    await self.exit_position(symbol, f"{strategy_name}_InternalBearishOBEntry")
+                    if bearish_ob_entry and ut_invalidation_long:
+                        exit_call_reason = f"{strategy_name}_MultiTriggerLongExit"
+                    elif ut_invalidation_long:
+                        exit_call_reason = f"{strategy_name}_UTLongInvalidation"
+                    else:
+                        exit_call_reason = f"{strategy_name}_InternalBearishOBEntry"
+                    logger.info(f"[Exit {tf}] LONG Exit Triggered: {exit_reason}")
+                    await self.exit_position(symbol, exit_call_reason)
                 elif current_side.lower() == 'short' and raw_exit_short:
-                    logger.info(f"[Exit {tf}] SHORT Exit Triggered by UTSMC internal bullish OB entry")
-                    await self.exit_position(symbol, f"{strategy_name}_InternalBullishOBEntry")
+                    if bullish_ob_entry and ut_invalidation_short:
+                        exit_call_reason = f"{strategy_name}_MultiTriggerShortExit"
+                    elif ut_invalidation_short:
+                        exit_call_reason = f"{strategy_name}_UTShortInvalidation"
+                    else:
+                        exit_call_reason = f"{strategy_name}_InternalBullishOBEntry"
+                    logger.info(f"[Exit {tf}] SHORT Exit Triggered: {exit_reason}")
+                    await self.exit_position(symbol, exit_call_reason)
                 return True
             
             # ===== 3. Exit Filter logic check =====
@@ -5843,7 +6049,6 @@ class SignalEngine(BaseEngine):
             self.position_cache_time = 0
             
             self.db.log_trade_entry(symbol, side, price, float(qty))
-            await self.ctrl.notify(f"✅ [Signal] {side.upper()} {qty} @ {price:.2f}")
             logger.info(f"??Entry order success: {order.get('id', 'N/A')}")
             
             # ?꾨왂 ?뚮씪誘명꽣 濡쒕뱶
@@ -5855,6 +6060,9 @@ class SignalEngine(BaseEngine):
             self.position_cache = None
             verify_pos = await self.get_server_position(symbol, use_cache=False)
             actual_entry_price = float(verify_pos['entryPrice']) if verify_pos else price
+            await self.ctrl.notify(
+                self._build_signal_entry_notice(symbol, side, qty, price, actual_entry_price)
+            )
             
             # ===== ?꾨왂蹂?TP/SL ?ㅼ젙 =====
             if active_strategy == 'microvbo':
@@ -6197,7 +6405,9 @@ class SignalEngine(BaseEngine):
         self.position_cache_time = 0
         
         self.db.log_trade_close(symbol, pnl, pnl_pct, exit_price, reason)
-        await self.ctrl.notify(f"📊 [{reason}] PnL: {pnl:+.2f} ({pnl_pct:+.2f}%)")
+        await self.ctrl.notify(
+            self._build_signal_exit_notice(symbol, pos, reason, pnl, pnl_pct, exit_price)
+        )
         logger.info(f"??Exit order success: {order.get('id', 'N/A')}")
 
     async def _exit_upbit_spot(self, symbol, reason):
