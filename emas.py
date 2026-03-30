@@ -127,6 +127,12 @@ class TradingConfig:
                 'testnet': {'api_key': '', 'secret_key': ''},
                 'upbit': {'api_key': '', 'secret_key': ''}
             },
+            'telegram': {
+                'reporting': {
+                    'hourly_report_enabled': True,
+                    'stateful_diag_enabled': False
+                }
+            },
             'system_settings': {
                 'active_engine': CORE_ENGINE,
                 'trade_direction': 'both', 
@@ -537,7 +543,14 @@ class TradingConfig:
                 "testnet": {"api_key": "", "secret_key": ""},
                 "upbit": {"api_key": "", "secret_key": ""}
             },
-            "telegram": {"token": "", "chat_id": ""},
+            "telegram": {
+                "token": "",
+                "chat_id": "",
+                "reporting": {
+                    "hourly_report_enabled": True,
+                    "stateful_diag_enabled": False
+                }
+            },
             "system_settings": {
                 "active_engine": CORE_ENGINE,
                 "trade_direction": "both",
@@ -4339,6 +4352,9 @@ class SignalEngine(BaseEngine):
         self.last_stateful_diag[symbol] = current
 
     async def _notify_stateful_diag(self, symbol, force=False):
+        reporting_cfg = self.cfg.get('telegram', {}).get('reporting', {})
+        if not reporting_cfg.get('stateful_diag_enabled', False):
+            return
         info = self.last_stateful_diag.get(symbol)
         if not info:
             return
