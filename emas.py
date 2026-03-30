@@ -193,7 +193,13 @@ class TradingConfig:
                     'UTSMC': {
                         'internal_length': 5,
                         'swing_length': 50,
-                        'use_confluence_filter': False
+                        'use_confluence_filter': False,
+                        'candidate_filter': {
+                            'mode': 'off',
+                            'apply_to_persistent': True,
+                            'c1_release_window': 3,
+                            'c2_breakout_window': 2
+                        }
                     },
                     'RSIBB': {
                         'rsi_length': 6,
@@ -336,7 +342,13 @@ class TradingConfig:
             'UTSMC': {
                 'internal_length': 5,
                 'swing_length': 50,
-                'use_confluence_filter': False
+                'use_confluence_filter': False,
+                'candidate_filter': {
+                    'mode': 'off',
+                    'apply_to_persistent': True,
+                    'c1_release_window': 3,
+                    'c2_breakout_window': 2
+                }
             },
             'ut_entry_timing_mode': 'next_candle',
             'RSIBB': {
@@ -1638,6 +1650,7 @@ class SignalEngine(BaseEngine):
         # [New] Filter Status Persistence (Dashboard)
         self.last_entry_filter_status = {} # symbol -> {r2_val, ...}
         self.last_exit_filter_status = {}  # symbol -> {r2_val, ...}
+        self.last_utsmc_candidate_filter_status = {}  # symbol -> candidate filter diagnostics
         self.last_entry_reason = {}        # symbol -> latest entry decision reason
 
     def start(self):
@@ -1673,6 +1686,7 @@ class SignalEngine(BaseEngine):
         self.last_stateful_diag_notice = {}
         self.last_entry_filter_status = {}
         self.last_exit_filter_status = {}
+        self.last_utsmc_candidate_filter_status = {}
         self.last_entry_reason = {}
         self.pending_reentry = {}
         self.ut_hybrid_timing_latches = {}
@@ -1741,6 +1755,19 @@ class SignalEngine(BaseEngine):
             context['raw_ut_detail'] = utsmc_detail.get('ut_detail') or {}
             context['raw_hybrid_detail'] = utsmc_detail or {}
             context['precomputed'][active_strategy] = utsmc_result
+            self.last_utsmc_candidate_filter_status[symbol] = {
+                'mode': utsmc_detail.get('candidate_filter_mode', 'off'),
+                'mode_label': utsmc_detail.get('candidate_filter_mode_label', 'OFF'),
+                'apply_to_persistent': bool(utsmc_detail.get('candidate_filter_apply_to_persistent', True)),
+                'candidate1_long_pass': bool(utsmc_detail.get('candidate1_long_pass', False)),
+                'candidate1_short_pass': bool(utsmc_detail.get('candidate1_short_pass', False)),
+                'candidate2_long_pass': bool(utsmc_detail.get('candidate2_long_pass', False)),
+                'candidate2_short_pass': bool(utsmc_detail.get('candidate2_short_pass', False)),
+                'candidate_final_long_pass': bool(utsmc_detail.get('candidate_final_long_pass', True)),
+                'candidate_final_short_pass': bool(utsmc_detail.get('candidate_final_short_pass', True)),
+                'candidate_reason_long': utsmc_detail.get('candidate_reason_long'),
+                'candidate_reason_short': utsmc_detail.get('candidate_reason_short')
+            }
         elif active_strategy == 'utbb':
             utbb_result = self._calculate_utbb_signal(symbol, df, strategy_params)
             _, _, hybrid_detail = utbb_result
@@ -2919,9 +2946,349 @@ class SignalEngine(BaseEngine):
         await self.entry(symbol, entry_sig, float(live_price))
         return entry_sig.upper()
 
+    def _normalize_utsmc_candidate_filter_mode(self, mode):
+        mode_raw = str(mode or 'off').strip().lower()
+        aliases = {
+            '0': 'off',
+            'off': 'off',
+            'none': 'off',
+            '1': 'candidate1',
+            'c1': 'candidate1',
+            'candidate1': 'candidate1',
+            '2': 'candidate2',
+            'c2': 'candidate2',
+            'candidate2': 'candidate2',
+            '3': 'candidate12',
+            '12': 'candidate12',
+            'c12': 'candidate12',
+            'candidate12': 'candidate12',
+            'both': 'candidate12'
+        }
+        return aliases.get(mode_raw, 'off')
+
+    def _format_utsmc_candidate_filter_mode(self, mode):
+        normalized = self._normalize_utsmc_candidate_filter_mode(mode)
+        return {
+            'off': 'OFF',
+            'candidate1': 'C1',
+            'candidate2': 'C2',
+            'candidate12': 'C1+C2'
+        }.get(normalized, 'OFF')
+
+    def _calculate_utsmc_candidate1_filter(self, df, strategy_params):
+        cfg = (strategy_params.get('UTSMC', {}) or {}).get('candidate_filter', {}) or {}
+        release_window = max(1, int(cfg.get('c1_release_window', 3) or 3))
+        bb_length = 20
+        bb_mult = 2.0
+        kc_length = 20
+        kc_mult = 1.5
+        mom_length = 20
+
+        result = {
+            'long_pass': False,
+            'short_pass': False,
+            'squeeze_on': False,
+            'squeeze_off': False,
+            'hist': np.nan,
+            'prev_hist': np.nan,
+            'release_age': None,
+            'reason_long': 'candidate1 data wait',
+            'reason_short': 'candidate1 data wait'
+        }
+
+        closed = df.iloc[:-1].copy().reset_index(drop=True)
+        min_bars = max(bb_length, kc_length, mom_length) + release_window + 2
+        if len(closed) < min_bars:
+            return result
+
+        close = closed['close']
+        high = closed['high']
+        low = closed['low']
+
+        bb_basis = close.rolling(bb_length).mean()
+        bb_dev = close.rolling(bb_length).std(ddof=0) * bb_mult
+        bb_upper = bb_basis + bb_dev
+        bb_lower = bb_basis - bb_dev
+
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+
+        kc_basis = close.rolling(kc_length).mean()
+        kc_range = tr.rolling(kc_length).mean()
+        kc_upper = kc_basis + kc_range * kc_mult
+        kc_lower = kc_basis - kc_range * kc_mult
+
+        squeeze_on = (bb_lower > kc_lower) & (bb_upper < kc_upper)
+        squeeze_off = (bb_lower < kc_lower) & (bb_upper > kc_upper)
+        release_signal = squeeze_off & squeeze_on.shift(1).fillna(False)
+
+        highest = high.rolling(mom_length).max()
+        lowest = low.rolling(mom_length).min()
+        mean_basis = ((highest + lowest) / 2.0 + close.rolling(mom_length).mean()) / 2.0
+        mom_source = close - mean_basis
+
+        def _linreg_last(values):
+            if np.isnan(values).any():
+                return np.nan
+            x = np.arange(len(values))
+            slope, intercept = np.polyfit(x, values, 1)
+            return intercept + slope * x[-1]
+
+        mom_hist = mom_source.rolling(mom_length).apply(_linreg_last, raw=True)
+        curr_hist = float(mom_hist.iloc[-1]) if len(mom_hist) >= 1 else np.nan
+        prev_hist = float(mom_hist.iloc[-2]) if len(mom_hist) >= 2 else np.nan
+
+        release_age = None
+        for age in range(release_window):
+            idx = len(release_signal) - 1 - age
+            if idx < 0:
+                break
+            if bool(release_signal.iloc[idx]):
+                release_age = age
+                break
+
+        result.update({
+            'squeeze_on': bool(squeeze_on.iloc[-1]) if len(squeeze_on) else False,
+            'squeeze_off': bool(squeeze_off.iloc[-1]) if len(squeeze_off) else False,
+            'hist': curr_hist,
+            'prev_hist': prev_hist,
+            'release_age': release_age
+        })
+
+        if release_age is None:
+            result['reason_long'] = f"candidate1 no squeeze release within {release_window} bars"
+            result['reason_short'] = f"candidate1 no squeeze release within {release_window} bars"
+            return result
+
+        if np.isnan(curr_hist) or np.isnan(prev_hist):
+            result['reason_long'] = 'candidate1 momentum history insufficient'
+            result['reason_short'] = 'candidate1 momentum history insufficient'
+            return result
+
+        long_pass = curr_hist > 0 and curr_hist > prev_hist
+        short_pass = curr_hist < 0 and curr_hist < prev_hist
+        result['long_pass'] = bool(long_pass)
+        result['short_pass'] = bool(short_pass)
+        result['reason_long'] = (
+            f"candidate1 release_age={release_age}, hist={curr_hist:.4f}, prev={prev_hist:.4f}"
+            if long_pass else
+            f"candidate1 long rejected: release_age={release_age}, hist={curr_hist:.4f}, prev={prev_hist:.4f}"
+        )
+        result['reason_short'] = (
+            f"candidate1 release_age={release_age}, hist={curr_hist:.4f}, prev={prev_hist:.4f}"
+            if short_pass else
+            f"candidate1 short rejected: release_age={release_age}, hist={curr_hist:.4f}, prev={prev_hist:.4f}"
+        )
+        return result
+
+    def _calculate_utsmc_candidate2_filter(self, df, strategy_params):
+        cfg = (strategy_params.get('UTSMC', {}) or {}).get('candidate_filter', {}) or {}
+        breakout_window = max(1, int(cfg.get('c2_breakout_window', 2) or 2))
+        box_length = 20
+        atr_length = 14
+        max_box_width_atr = 1.8
+        impulse_atr_mult = 0.8
+
+        result = {
+            'long_pass': False,
+            'short_pass': False,
+            'box_high': np.nan,
+            'box_low': np.nan,
+            'box_width': np.nan,
+            'box_width_atr': np.nan,
+            'long_breakout_age': None,
+            'short_breakout_age': None,
+            'long_impulse_body_atr': np.nan,
+            'short_impulse_body_atr': np.nan,
+            'reason_long': 'candidate2 data wait',
+            'reason_short': 'candidate2 data wait'
+        }
+
+        closed = df.iloc[:-1].copy().reset_index(drop=True)
+        min_bars = box_length + atr_length + breakout_window + 3
+        if len(closed) < min_bars:
+            return result
+
+        open_ = closed['open']
+        high = closed['high']
+        low = closed['low']
+        close = closed['close']
+
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(atr_length).mean()
+
+        box_high = high.shift(1).rolling(box_length).max()
+        box_low = low.shift(1).rolling(box_length).min()
+        box_width = box_high - box_low
+        box_width_atr = box_width / atr.replace(0, np.nan)
+        valid_box = box_width <= (atr * max_box_width_atr)
+
+        candle_range = (high - low).replace(0, np.nan)
+        body = (close - open_).abs()
+        body_atr = body / atr.replace(0, np.nan)
+        close_top30 = close >= (low + candle_range * 0.7)
+        close_bottom30 = close <= (low + candle_range * 0.3)
+
+        long_break = (
+            valid_box
+            & (close.shift(1) <= box_high)
+            & (close > box_high)
+            & (body >= atr * impulse_atr_mult)
+            & close_top30
+        )
+        short_break = (
+            valid_box
+            & (close.shift(1) >= box_low)
+            & (close < box_low)
+            & (body >= atr * impulse_atr_mult)
+            & close_bottom30
+        )
+
+        latest_box_high = float(box_high.iloc[-1]) if len(box_high) else np.nan
+        latest_box_low = float(box_low.iloc[-1]) if len(box_low) else np.nan
+        latest_box_width = float(box_width.iloc[-1]) if len(box_width) else np.nan
+        latest_box_width_atr = float(box_width_atr.iloc[-1]) if len(box_width_atr) else np.nan
+
+        result.update({
+            'box_high': latest_box_high,
+            'box_low': latest_box_low,
+            'box_width': latest_box_width,
+            'box_width_atr': latest_box_width_atr
+        })
+
+        long_breakout_age = None
+        long_level = np.nan
+        long_impulse = np.nan
+        for age in range(breakout_window):
+            idx = len(long_break) - 1 - age
+            if idx < 0:
+                break
+            if bool(long_break.iloc[idx]):
+                long_breakout_age = age
+                long_level = float(box_high.iloc[idx])
+                long_impulse = float(body_atr.iloc[idx]) if not np.isnan(body_atr.iloc[idx]) else np.nan
+                break
+
+        short_breakout_age = None
+        short_level = np.nan
+        short_impulse = np.nan
+        for age in range(breakout_window):
+            idx = len(short_break) - 1 - age
+            if idx < 0:
+                break
+            if bool(short_break.iloc[idx]):
+                short_breakout_age = age
+                short_level = float(box_low.iloc[idx])
+                short_impulse = float(body_atr.iloc[idx]) if not np.isnan(body_atr.iloc[idx]) else np.nan
+                break
+
+        result['long_breakout_age'] = long_breakout_age
+        result['short_breakout_age'] = short_breakout_age
+        result['long_impulse_body_atr'] = long_impulse
+        result['short_impulse_body_atr'] = short_impulse
+
+        if np.isnan(latest_box_width_atr):
+            result['reason_long'] = 'candidate2 box/atr unavailable'
+            result['reason_short'] = 'candidate2 box/atr unavailable'
+            return result
+
+        if long_breakout_age is not None and not np.isnan(long_level) and close.iloc[-1] > long_level:
+            result['long_pass'] = True
+            result['reason_long'] = (
+                f"candidate2 breakout_age={long_breakout_age}, box_high={long_level:.4f}, body_atr={long_impulse:.2f}"
+            )
+        else:
+            result['reason_long'] = (
+                f"candidate2 long rejected: box_width_atr={latest_box_width_atr:.2f}, breakout_age={long_breakout_age}"
+            )
+
+        if short_breakout_age is not None and not np.isnan(short_level) and close.iloc[-1] < short_level:
+            result['short_pass'] = True
+            result['reason_short'] = (
+                f"candidate2 breakout_age={short_breakout_age}, box_low={short_level:.4f}, body_atr={short_impulse:.2f}"
+            )
+        else:
+            result['reason_short'] = (
+                f"candidate2 short rejected: box_width_atr={latest_box_width_atr:.2f}, breakout_age={short_breakout_age}"
+            )
+
+        return result
+
+    def _calculate_utsmc_candidate_filter_state(self, df, strategy_params):
+        utsmc_cfg = strategy_params.get('UTSMC', {}) or {}
+        filter_cfg = utsmc_cfg.get('candidate_filter', {}) or {}
+        mode = self._normalize_utsmc_candidate_filter_mode(filter_cfg.get('mode', 'off'))
+        apply_to_persistent = bool(filter_cfg.get('apply_to_persistent', True))
+
+        c1 = self._calculate_utsmc_candidate1_filter(df, strategy_params)
+        c2 = self._calculate_utsmc_candidate2_filter(df, strategy_params)
+
+        detail = {
+            'candidate_filter_mode': mode,
+            'candidate_filter_mode_label': self._format_utsmc_candidate_filter_mode(mode),
+            'candidate_filter_apply_to_persistent': apply_to_persistent,
+            'candidate1_long_pass': bool(c1.get('long_pass', False)),
+            'candidate1_short_pass': bool(c1.get('short_pass', False)),
+            'candidate1_squeeze_on': bool(c1.get('squeeze_on', False)),
+            'candidate1_squeeze_off': bool(c1.get('squeeze_off', False)),
+            'candidate1_hist': c1.get('hist'),
+            'candidate1_prev_hist': c1.get('prev_hist'),
+            'candidate1_release_age': c1.get('release_age'),
+            'candidate1_reason_long': c1.get('reason_long'),
+            'candidate1_reason_short': c1.get('reason_short'),
+            'candidate2_long_pass': bool(c2.get('long_pass', False)),
+            'candidate2_short_pass': bool(c2.get('short_pass', False)),
+            'candidate2_box_high': c2.get('box_high'),
+            'candidate2_box_low': c2.get('box_low'),
+            'candidate2_box_width': c2.get('box_width'),
+            'candidate2_box_width_atr': c2.get('box_width_atr'),
+            'candidate2_long_breakout_age': c2.get('long_breakout_age'),
+            'candidate2_short_breakout_age': c2.get('short_breakout_age'),
+            'candidate2_long_impulse_body_atr': c2.get('long_impulse_body_atr'),
+            'candidate2_short_impulse_body_atr': c2.get('short_impulse_body_atr'),
+            'candidate2_reason_long': c2.get('reason_long'),
+            'candidate2_reason_short': c2.get('reason_short'),
+            'candidate_final_long_pass': True,
+            'candidate_final_short_pass': True,
+            'candidate_reason_long': 'candidate filter off',
+            'candidate_reason_short': 'candidate filter off'
+        }
+
+        if mode == 'candidate1':
+            detail['candidate_final_long_pass'] = detail['candidate1_long_pass']
+            detail['candidate_final_short_pass'] = detail['candidate1_short_pass']
+            detail['candidate_reason_long'] = detail['candidate1_reason_long']
+            detail['candidate_reason_short'] = detail['candidate1_reason_short']
+        elif mode == 'candidate2':
+            detail['candidate_final_long_pass'] = detail['candidate2_long_pass']
+            detail['candidate_final_short_pass'] = detail['candidate2_short_pass']
+            detail['candidate_reason_long'] = detail['candidate2_reason_long']
+            detail['candidate_reason_short'] = detail['candidate2_reason_short']
+        elif mode == 'candidate12':
+            detail['candidate_final_long_pass'] = detail['candidate1_long_pass'] and detail['candidate2_long_pass']
+            detail['candidate_final_short_pass'] = detail['candidate1_short_pass'] and detail['candidate2_short_pass']
+            detail['candidate_reason_long'] = (
+                f"C1={detail['candidate1_reason_long']} | C2={detail['candidate2_reason_long']}"
+            )
+            detail['candidate_reason_short'] = (
+                f"C1={detail['candidate1_reason_short']} | C2={detail['candidate2_reason_short']}"
+            )
+
+        return detail
+
     def _calculate_utsmc_signal(self, df, strategy_params):
         ut_sig, ut_reason, ut_detail = self._calculate_utbot_signal(df, strategy_params)
         smc_sig, smc_reason, smc_detail = self._calculate_smc_internal_ob_signal(df, strategy_params)
+        candidate_detail = self._calculate_utsmc_candidate_filter_state(df, strategy_params)
         ut_state = ut_sig or ut_detail.get('bias_side')
         timing_mode = str(strategy_params.get('ut_entry_timing_mode', 'next_candle') or 'next_candle').lower()
         timing_desc = '다음 진행봉 진입' if timing_mode == 'next_candle' else '신호 유지 시 진입'
@@ -2934,7 +3301,8 @@ class SignalEngine(BaseEngine):
             'ut_detail': ut_detail,
             'smc_signal': smc_sig,
             'smc_reason': smc_reason,
-            **(smc_detail or {})
+            **(smc_detail or {}),
+            **candidate_detail
         }
 
         if ut_state not in {'long', 'short'}:
@@ -2949,6 +3317,21 @@ class SignalEngine(BaseEngine):
         else:
             reason = f"UTSMC 상태 유지: UT {ut_state.upper()} 상태, 마지막 UT 시그널 확정봉 기준 {timing_desc}"
         return ut_sig, reason, detail
+
+    def _utsmc_candidate_filter_allows(self, raw_smc_detail, side, *, is_persistent=False):
+        mode = self._normalize_utsmc_candidate_filter_mode(raw_smc_detail.get('candidate_filter_mode', 'off'))
+        if side not in {'long', 'short'} or mode == 'off':
+            return True, 'candidate filter off'
+
+        apply_to_persistent = bool(raw_smc_detail.get('candidate_filter_apply_to_persistent', True))
+        if is_persistent and not apply_to_persistent:
+            return True, 'candidate filter persistent bypass'
+
+        pass_key = 'candidate_final_long_pass' if side == 'long' else 'candidate_final_short_pass'
+        reason_key = 'candidate_reason_long' if side == 'long' else 'candidate_reason_short'
+        allowed = bool(raw_smc_detail.get(pass_key, False))
+        reason = raw_smc_detail.get(reason_key) or 'candidate filter no detail'
+        return allowed, reason
 
     def _calculate_rsi_signal(self, df, strategy_params):
         cfg = strategy_params.get('RSIBB', {})
@@ -4210,11 +4593,22 @@ class SignalEngine(BaseEngine):
                     
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     
+                    strategy_context = self._collect_primary_strategy_context(symbol, df, scan_params, active_strategy)
                     sig, _, _, _, _, _ = await self._calculate_strategy_signal(
-                        symbol, df, scan_params, active_strategy, allow_utbot_stateful=False
+                        symbol, df, scan_params, active_strategy, allow_utbot_stateful=False,
+                        precomputed=strategy_context.get('precomputed')
                     )
                     
                     if sig:
+                        if active_strategy == 'utsmc':
+                            utsmc_detail = strategy_context.get('raw_hybrid_detail', {}) or {}
+                            allowed, candidate_reason = self._utsmc_candidate_filter_allows(utsmc_detail, sig, is_persistent=False)
+                            if not allowed:
+                                logger.info(
+                                    f"?? Scanner Skip {symbol}: UTSMC candidate filter blocked "
+                                    f"({utsmc_detail.get('candidate_filter_mode_label', 'OFF')} | {candidate_reason})"
+                                )
+                                continue
                         # ?ъ????뺤씤 (?쒕쾭)
                         pos = await self.get_server_position(symbol, use_cache=False)
                         
@@ -4311,6 +4705,9 @@ class SignalEngine(BaseEngine):
             symbol_status['entry_filters'] = {}
             symbol_status['exit_filters'] = {}
             symbol_status['filter_config'] = {}
+            candidate_status = self.last_utsmc_candidate_filter_status.get(symbol, {})
+            symbol_status['utsmc_candidate_filter_mode'] = candidate_status.get('mode_label', 'OFF')
+            symbol_status['utsmc_candidate_filter'] = candidate_status
             tp_master_enabled = False if self.is_upbit_mode() else bool(comm_cfg.get('tp_sl_enabled', True))
             tp_enabled = tp_master_enabled and bool(comm_cfg.get('take_profit_enabled', True))
             sl_enabled = tp_master_enabled and bool(comm_cfg.get('stop_loss_enabled', True))
@@ -4369,6 +4766,9 @@ class SignalEngine(BaseEngine):
             str(info.get('ut_key', '')),
             str(info.get('ut_atr', '')),
             str(info.get('ut_ha', '')),
+            str(info.get('utsmc_candidate_filter_mode', '')),
+            str(info.get('utsmc_candidate_final_long_pass', '')),
+            str(info.get('utsmc_candidate_final_short_pass', '')),
             str(info.get('note', '')),
         ])
         now = time.time()
@@ -4394,6 +4794,12 @@ class SignalEngine(BaseEngine):
         if info.get('signal_ts_human') or info.get('feed_last_ts_human'):
             lines.append(
                 f"tf={info.get('tf_used', '?')} signal_ts={info.get('signal_ts_human', '?')} feed_last={info.get('feed_last_ts_human', '?')}"
+            )
+        if info.get('utsmc_candidate_filter_mode'):
+            lines.append(
+                f"candidate={info.get('utsmc_candidate_filter_mode')} "
+                f"long={'PASS' if info.get('utsmc_candidate_final_long_pass') else 'FAIL'} "
+                f"short={'PASS' if info.get('utsmc_candidate_final_short_pass') else 'FAIL'}"
             )
         if info.get('closed_ohlc_text'):
             lines.append(f"closed={info.get('closed_ohlc_text')}")
@@ -4483,6 +4889,22 @@ class SignalEngine(BaseEngine):
                 f"bear `{self._fmt_signal_trade_value(diag.get('utsmc_entry_bearish_ob_bottom'))}` ~ "
                 f"`{self._fmt_signal_trade_value(diag.get('utsmc_entry_bearish_ob_top'))}`"
             )
+        if diag.get('utsmc_candidate_filter_mode'):
+            c1_long = 'PASS' if diag.get('utsmc_candidate1_long_pass') else 'FAIL'
+            c2_long = 'PASS' if diag.get('utsmc_candidate2_long_pass') else 'FAIL'
+            final_long = 'PASS' if diag.get('utsmc_candidate_final_long_pass') else 'FAIL'
+            c1_short = 'PASS' if diag.get('utsmc_candidate1_short_pass') else 'FAIL'
+            c2_short = 'PASS' if diag.get('utsmc_candidate2_short_pass') else 'FAIL'
+            final_short = 'PASS' if diag.get('utsmc_candidate_final_short_pass') else 'FAIL'
+            lines.append(
+                f"UTSMC 후보필터: mode `{diag.get('utsmc_candidate_filter_mode')}` | "
+                f"LONG `C1 {c1_long} / C2 {c2_long} / FINAL {final_long}` | "
+                f"SHORT `C1 {c1_short} / C2 {c2_short} / FINAL {final_short}`"
+            )
+            if diag.get('utsmc_candidate_reason_long'):
+                lines.append(f"UTSMC 후보필터 LONG: `{diag.get('utsmc_candidate_reason_long')}`")
+            if diag.get('utsmc_candidate_reason_short'):
+                lines.append(f"UTSMC 후보필터 SHORT: `{diag.get('utsmc_candidate_reason_short')}`")
 
         if include_exit:
             if (
@@ -4809,6 +5231,27 @@ class SignalEngine(BaseEngine):
             pending = None
 
         if pending and ut_signal and ut_signal != pending.get('side'):
+            allowed, candidate_reason = self._utsmc_candidate_filter_allows(raw_smc_detail, ut_signal, is_persistent=False)
+            if not allowed:
+                self._clear_utsmc_pending_entry(symbol)
+                self.last_entry_reason[symbol] = (
+                    f"{strategy_name} UT {ut_signal.upper()} 후보 필터 차단 "
+                    f"({raw_smc_detail.get('candidate_filter_mode_label', 'OFF')} | {candidate_reason})"
+                )
+                self._update_stateful_diag(
+                    symbol,
+                    stage='entry_blocked',
+                    strategy=strategy_name,
+                    raw_state=(target_sig or 'none'),
+                    raw_signal=(ut_signal or 'none'),
+                    entry_sig=(ut_signal or 'none'),
+                    pos_side='NONE',
+                    note=(
+                        f"candidate filter blocked | mode={raw_smc_detail.get('candidate_filter_mode_label', 'OFF')} | "
+                        f"reason={candidate_reason}"
+                    )
+                )
+                return
             execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
             self._set_utsmc_pending_entry(
                 symbol,
@@ -4835,6 +5278,26 @@ class SignalEngine(BaseEngine):
             return
 
         if ut_signal in {'long', 'short'}:
+            allowed, candidate_reason = self._utsmc_candidate_filter_allows(raw_smc_detail, ut_signal, is_persistent=False)
+            if not allowed:
+                self.last_entry_reason[symbol] = (
+                    f"{strategy_name} UT {ut_signal.upper()} 후보 필터 차단 "
+                    f"({raw_smc_detail.get('candidate_filter_mode_label', 'OFF')} | {candidate_reason})"
+                )
+                self._update_stateful_diag(
+                    symbol,
+                    stage='entry_blocked',
+                    strategy=strategy_name,
+                    raw_state=(target_sig or 'none'),
+                    raw_signal=(ut_signal or 'none'),
+                    entry_sig=(ut_signal or 'none'),
+                    pos_side='NONE',
+                    note=(
+                        f"candidate filter blocked | mode={raw_smc_detail.get('candidate_filter_mode_label', 'OFF')} | "
+                        f"reason={candidate_reason}"
+                    )
+                )
+                return
             execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
             self._set_utsmc_pending_entry(
                 symbol,
@@ -4861,6 +5324,26 @@ class SignalEngine(BaseEngine):
 
         if timing_mode == 'persistent' and target_sig in {'long', 'short'}:
             if ut_signal_side == target_sig and ut_signal_ts > 0:
+                allowed, candidate_reason = self._utsmc_candidate_filter_allows(raw_smc_detail, target_sig, is_persistent=True)
+                if not allowed:
+                    self.last_entry_reason[symbol] = (
+                        f"{strategy_name} 현재 UT {target_sig.upper()} 상태지만 후보 필터 차단 "
+                        f"({raw_smc_detail.get('candidate_filter_mode_label', 'OFF')} | {candidate_reason})"
+                    )
+                    self._update_stateful_diag(
+                        symbol,
+                        stage='entry_blocked',
+                        strategy=strategy_name,
+                        raw_state=(target_sig or 'none'),
+                        raw_signal=(ut_signal or 'none'),
+                        entry_sig=target_sig,
+                        pos_side='NONE',
+                        note=(
+                            f"candidate filter blocked | mode={raw_smc_detail.get('candidate_filter_mode_label', 'OFF')} | "
+                            f"reason={candidate_reason} | persistent=Y"
+                        )
+                    )
+                    return
                 execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
                 self._set_utsmc_pending_entry(
                     symbol,
@@ -5505,6 +5988,33 @@ class SignalEngine(BaseEngine):
                         raw_hybrid_detail.get('smc_reason') if active_strategy == 'utsmc' else None
                     ),
                     utsmc_entry_tf=tf if active_strategy == 'utsmc' else None,
+                    utsmc_candidate_filter_mode=(
+                        raw_hybrid_detail.get('candidate_filter_mode_label') if active_strategy == 'utsmc' else None
+                    ),
+                    utsmc_candidate1_long_pass=(
+                        raw_hybrid_detail.get('candidate1_long_pass') if active_strategy == 'utsmc' else None
+                    ),
+                    utsmc_candidate1_short_pass=(
+                        raw_hybrid_detail.get('candidate1_short_pass') if active_strategy == 'utsmc' else None
+                    ),
+                    utsmc_candidate2_long_pass=(
+                        raw_hybrid_detail.get('candidate2_long_pass') if active_strategy == 'utsmc' else None
+                    ),
+                    utsmc_candidate2_short_pass=(
+                        raw_hybrid_detail.get('candidate2_short_pass') if active_strategy == 'utsmc' else None
+                    ),
+                    utsmc_candidate_final_long_pass=(
+                        raw_hybrid_detail.get('candidate_final_long_pass') if active_strategy == 'utsmc' else None
+                    ),
+                    utsmc_candidate_final_short_pass=(
+                        raw_hybrid_detail.get('candidate_final_short_pass') if active_strategy == 'utsmc' else None
+                    ),
+                    utsmc_candidate_reason_long=(
+                        raw_hybrid_detail.get('candidate_reason_long') if active_strategy == 'utsmc' else None
+                    ),
+                    utsmc_candidate_reason_short=(
+                        raw_hybrid_detail.get('candidate_reason_short') if active_strategy == 'utsmc' else None
+                    ),
                     feed_last_ts=feed_last_ts,
                     feed_last_ts_human=datetime.fromtimestamp(feed_last_ts / 1000).strftime('%m-%d %H:%M') if feed_last_ts else None,
                     feed_last_close=float(df.iloc[-1]['close']) if len(df) >= 1 else None,
@@ -8581,6 +9091,8 @@ class MainController:
         utbot_key = float(utbot_params.get('key_value', 1.0) or 1.0)
         utbot_atr = int(utbot_params.get('atr_period', 10) or 10)
         utbot_ha = "ON" if utbot_params.get('use_heikin_ashi', False) else "OFF"
+        utsmc_filter_cfg = strategy_params.get('UTSMC', {}).get('candidate_filter', {})
+        utsmc_filter_mode = self._format_utsmc_candidate_filter_mode(utsmc_filter_cfg.get('mode', 'off'))
         rsibb_params = strategy_params.get('RSIBB', {})
         rsibb_rsi = int(rsibb_params.get('rsi_length', 6) or 6)
         rsibb_bb = int(rsibb_params.get('bb_length', 200) or 200)
@@ -8624,6 +9136,7 @@ class MainController:
 20. RSI+BB 보조설정 (`RSI={rsibb_rsi}` / `BB={rsibb_bb}` / `x{rsibb_mult:.2f}`)
 21. UT 전략 안내 (`UTBOT / UTRSI / UTBB / UTRSIBB / UTSMC`)
 26. UT 진입 방식 (`{ut_entry_timing_label}`)
+49. UTSMC 후보 필터 (`{utsmc_filter_mode}`)
 13. TP/SL 자동청산 (`{tp_sl_status}`)
 36. ROE 자동청산 (`{tp_status}`)
 37. 손절 자동청산 (`{sl_status}`)
@@ -8674,6 +9187,7 @@ class MainController:
             '20': "RSI/BB 보조설정 입력\n형식: RSI길이,BB길이,BB배수\n예: 6,200,2",
             '21': "ℹ️ **UT 전략 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙, UTSMC는 26번 UT 진입 방식 + internal OB/UT 신호봉 무효화 청산을 사용합니다.",
             '26': "📝 **UT 진입 방식** 입력\n`next` 또는 `1` = 시그널 마감봉 바로 다음봉에만 진입\n`persistent` 또는 `2` = fresh signal이 아니어도 현재 유지 중인 시그널이면 즉시 진입 대기/진입 (기준봉은 마지막 시그널 확정봉)",
+            '49': "📝 **UTSMC 후보 필터** 입력\n`0/off` = OFF\n`1/c1` = 후보1 (Squeeze)\n`2/c2` = 후보2 (Breakout)\n`3/c12` = 후보1+2",
             '22': "📝 **거래소/네트워크 선택** (1=바이낸스 테스트넷, 2=바이낸스 메인넷, 3=업비트 KRW 현물)",
             '23': "📝 **거래량 급등 채굴 기능** (1=ON, 0=OFF)",
             '24': "📝 **채굴 진입 타임프레임** 입력 (예: 5m)\n1m, 5m, 15m, 30m, 1h",
@@ -8691,7 +9205,7 @@ class MainController:
         if self.is_upbit_mode():
             blocked_choices = {
                 '1', '2', '3', '4', '5', '6', '8', '10', '11', '12', '13', '14', '15',
-                '16', '19', '20', '21', '23', '24', '25', '26', '35', '36', '37', '38', '41', '00'
+                '16', '19', '20', '21', '23', '24', '25', '26', '35', '36', '37', '38', '41', '49', '00'
             }
             if text in blocked_choices:
                 await update.message.reply_text("ℹ️ 업비트 모드에서는 업비트 전용 메뉴(22, 43~48)만 사용합니다.")
@@ -9223,6 +9737,24 @@ class MainController:
                     reset_stateful_strategy=True
                 )
                 await update.message.reply_text(f"✅ UT 진입 방식 변경: {timing_label}")
+
+            elif choice == '49':
+                filter_mode = self._normalize_utsmc_candidate_filter_mode(val)
+                if filter_mode == 'off' and str(val or '').strip().lower() not in {'0', 'off', 'none'}:
+                    await update.message.reply_text("❌ `0/off`, `1/c1`, `2/c2`, `3/c12` 중 하나를 입력하세요.")
+                    return SELECT
+
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTSMC', 'candidate_filter', 'mode'],
+                    filter_mode
+                )
+                self._reset_signal_engine_runtime_state(
+                    reset_entry_cache=True,
+                    reset_stateful_strategy=True
+                )
+                await update.message.reply_text(
+                    f"✅ UTSMC 후보 필터 변경: {self._format_utsmc_candidate_filter_mode(filter_mode)}"
+                )
             
             elif choice == '18':
                 # 吏꾩엯紐⑤뱶 蹂寃?(1=cross, 2=position)
@@ -9417,7 +9949,7 @@ class MainController:
                 await update.message.reply_text(f"✅ 업비트 일일 손실 제한 변경: ₩{limit_krw:,.0f}")
             
             # 10~41 success message handled
-            if choice not in ['2', '3', '10', '11', '12', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '26', '27', '28', '30', '31', '33', '34', '35', '41', '44', '45', '46', '47', '48']:
+            if choice not in ['2', '3', '10', '11', '12', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '26', '27', '28', '30', '31', '33', '34', '35', '41', '44', '45', '46', '47', '48', '49']:
                 await update.message.reply_text(f"✅ 설정 완료: {val}")
             await self._restore_main_keyboard(update)
             await self.show_setup_menu(update)
@@ -10294,6 +10826,18 @@ class MainController:
                             )
                         if stateful_diag.get('utsmc_entry_smc_reason'):
                             msg += f"UTSMC entry 판정: `{stateful_diag.get('utsmc_entry_smc_reason')}`\n"
+                        if stateful_diag.get('utsmc_candidate_filter_mode'):
+                            c1_long = 'PASS' if stateful_diag.get('utsmc_candidate1_long_pass') else 'FAIL'
+                            c2_long = 'PASS' if stateful_diag.get('utsmc_candidate2_long_pass') else 'FAIL'
+                            final_long = 'PASS' if stateful_diag.get('utsmc_candidate_final_long_pass') else 'FAIL'
+                            c1_short = 'PASS' if stateful_diag.get('utsmc_candidate1_short_pass') else 'FAIL'
+                            c2_short = 'PASS' if stateful_diag.get('utsmc_candidate2_short_pass') else 'FAIL'
+                            final_short = 'PASS' if stateful_diag.get('utsmc_candidate_final_short_pass') else 'FAIL'
+                            msg += (
+                                f"UTSMC 후보필터: mode `{stateful_diag.get('utsmc_candidate_filter_mode')}` | "
+                                f"LONG `C1 {c1_long} / C2 {c2_long} / FINAL {final_long}` | "
+                                f"SHORT `C1 {c1_short} / C2 {c2_short} / FINAL {final_short}`\n"
+                            )
                         if stateful_diag.get('utsmc_signal_high') is not None or stateful_diag.get('utsmc_signal_low') is not None:
                             msg += (
                                 f"UTSMC invalidation: high `{float(stateful_diag.get('utsmc_signal_high') or 0.0):.2f}` | "
@@ -10356,6 +10900,16 @@ class MainController:
                         msg += f"🧪 필터(청산): R2 {x_r2} | CHOP {x_c} | CC {x_cc}({cc_val:.2f})\n"
 
                     active_strat = d.get('active_strategy', '')
+                    cand_mode = d.get('utsmc_candidate_filter_mode', 'OFF')
+                    cand_status = d.get('utsmc_candidate_filter', {}) or {}
+                    if active_strat == 'UTSMC' and cand_mode != 'OFF':
+                        c1_final = 'PASS' if cand_status.get('candidate1_long_pass') or cand_status.get('candidate1_short_pass') else 'FAIL'
+                        c2_final = 'PASS' if cand_status.get('candidate2_long_pass') or cand_status.get('candidate2_short_pass') else 'FAIL'
+                        final_long = cand_status.get('candidate_final_long_pass')
+                        final_short = cand_status.get('candidate_final_short_pass')
+                        final_text = 'PASS' if final_long or final_short else 'FAIL'
+                        msg += f"🧪 UTSMC 후보필터: {cand_mode} | C1 {c1_final} | C2 {c2_final} | FINAL {final_text}\n"
+
                     if active_strat == 'MICROVBO':
                         vbo = d.get('vbo_breakout_level', {})
                         if vbo:
