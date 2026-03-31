@@ -8760,7 +8760,6 @@ class MainController:
         
         await asyncio.gather(
             self._main_polling_loop(),  # [?대쭅 ?꾩슜] 硫붿씤 ?대쭅 猷⑦봽
-            self._dashboard_loop(),
             self._hourly_report_loop(),
             self._heartbeat_loop()
         )
@@ -8869,22 +8868,6 @@ class MainController:
                 await update.message.reply_text("▶ 매매 재개 (엔진 재시작)")
             else:
                 await update.message.reply_text("▶ 매매 재개")
-            return ConversationHandler.END
-        elif text == "/status":
-            all_data = self.status_data if isinstance(self.status_data, dict) else {}
-            status_text, history_text, snapshot_key = self._build_dashboard_messages(
-                all_data,
-                "●",
-                " [PAUSED]" if self.is_paused else ""
-            )
-            self._record_status_snapshot(snapshot_key, history_text)
-            try:
-                await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
-            except BadRequest as md_err:
-                if "can't parse entities" in str(md_err).lower():
-                    await update.message.reply_text(status_text)
-                else:
-                    raise
             return ConversationHandler.END
         
         return None
@@ -10175,6 +10158,7 @@ class MainController:
     async def _setup_telegram(self):
         markup = self._build_main_keyboard()
         text_filter = filters.TEXT & ~filters.COMMAND
+        setup_text_filter = text_filter & ~filters.Regex(r"^/")
 
         async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             # Re-bind chat_id to the current chat to avoid stale configuration lockout.
@@ -10205,6 +10189,22 @@ class MainController:
                 await u.message.reply_text("\n".join(logs))
             else:
                 await u.message.reply_text("📝 최근 로그가 없습니다.")
+
+        async def status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            all_data = self.status_data if isinstance(self.status_data, dict) else {}
+            status_text, history_text, snapshot_key = self._build_dashboard_messages(
+                all_data,
+                "●",
+                " [PAUSED]" if self.is_paused else ""
+            )
+            self._record_status_snapshot(snapshot_key, history_text)
+            try:
+                await u.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
+            except BadRequest as md_err:
+                if "can't parse entities" in str(md_err).lower():
+                    await u.message.reply_text(status_text)
+                else:
+                    raise
 
         async def history_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             limit = 3
@@ -10279,33 +10279,63 @@ class MainController:
 """
             await u.message.reply_text(msg.strip(), parse_mode=ParseMode.MARKDOWN)
 
-        emergency_handler = MessageHandler(filters.Regex("STOP|PAUSE|RESUME|/status"), self.global_handler)
+        emergency_handler = MessageHandler(filters.Regex(r"STOP|PAUSE|RESUME"), self.global_handler)
         self.tg_app.add_handler(emergency_handler, group=-1)
 
         self.tg_app.add_handler(CommandHandler("start", start_cmd))
         self.tg_app.add_handler(CommandHandler("strat", strat_cmd))
+        self.tg_app.add_handler(CommandHandler("status", status_cmd))
         self.tg_app.add_handler(CommandHandler("history", history_cmd))
         self.tg_app.add_handler(CommandHandler("log", log_cmd))
         self.tg_app.add_handler(CommandHandler("close", close_cmd))
         self.tg_app.add_handler(CommandHandler("stats", stats_cmd))
         self.tg_app.add_handler(CommandHandler("help", help_cmd))
 
+        setup_text_handler = MessageHandler(filters.Regex(r"^/setup$"), self.setup_entry)
+
         conv = ConversationHandler(
-            entry_points=[CommandHandler('setup', self.setup_entry)],
+            entry_points=[
+                CommandHandler('setup', self.setup_entry),
+                setup_text_handler
+            ],
             states={
-                SELECT: [MessageHandler(text_filter, self.setup_select)],
-                INPUT: [MessageHandler(text_filter, self.setup_input)],
-                SYMBOL_INPUT: [MessageHandler(text_filter, self.setup_symbol_input)],
-                DIRECTION_SELECT: [MessageHandler(text_filter, self.setup_direction_select)],
-                ENGINE_SELECT: [MessageHandler(text_filter, self.setup_engine_select)]
+                SELECT: [MessageHandler(setup_text_filter, self.setup_select)],
+                INPUT: [MessageHandler(setup_text_filter, self.setup_input)],
+                SYMBOL_INPUT: [MessageHandler(setup_text_filter, self.setup_symbol_input)],
+                DIRECTION_SELECT: [MessageHandler(setup_text_filter, self.setup_direction_select)],
+                ENGINE_SELECT: [MessageHandler(setup_text_filter, self.setup_engine_select)]
             },
             fallbacks=[
                 CommandHandler('setup', self.setup_entry),
+                setup_text_handler,
                 emergency_handler
             ]
         )
 
         self.tg_app.add_handler(conv)
+
+        async def menu_button_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            text = (u.message.text or "").strip()
+            if text == "/status":
+                return await status_cmd(u, c)
+            if text == "/history":
+                return await history_cmd(u, c)
+            if text == "/log":
+                return await log_cmd(u, c)
+            if text == "/help":
+                return await help_cmd(u, c)
+            if text == "/stats":
+                return await stats_cmd(u, c)
+            if text == "/close":
+                return await close_cmd(u, c)
+            return None
+
+        self.tg_app.add_handler(
+            MessageHandler(
+                filters.Regex(r"^/(status|history|log|help|stats|close)$"),
+                menu_button_handler
+            )
+        )
 
         async def manual_symbol_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             text = u.message.text.strip().upper()
