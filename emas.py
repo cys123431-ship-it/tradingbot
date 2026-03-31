@@ -3006,7 +3006,6 @@ class SignalEngine(BaseEngine):
         cfg = (strategy_params.get('UTSMC', {}) or {}).get('candidate_filter', {}) or {}
         release_window = max(1, int(cfg.get('c1_release_window', 3) or 3))
         bb_length = 20
-        bb_mult = 2.0
         kc_length = 20
         kc_mult = 1.5
         mom_length = 20
@@ -3033,7 +3032,8 @@ class SignalEngine(BaseEngine):
         low = closed['low']
 
         bb_basis = close.rolling(bb_length).mean()
-        bb_dev = close.rolling(bb_length).std(ddof=0) * bb_mult
+        # Match the linked LazyBear script exactly: BB dev also uses the KC multiplier.
+        bb_dev = close.rolling(bb_length).std(ddof=0) * kc_mult
         bb_upper = bb_basis + bb_dev
         bb_lower = bb_basis - bb_dev
 
