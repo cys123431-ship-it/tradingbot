@@ -194,6 +194,7 @@ class TradingConfig:
                         'internal_length': 5,
                         'swing_length': 50,
                         'use_confluence_filter': False,
+                        'exit_candidate2_enabled': False,
                         'candidate_filter': {
                             'mode': 'off',
                             'apply_to_persistent': True,
@@ -343,6 +344,7 @@ class TradingConfig:
                 'internal_length': 5,
                 'swing_length': 50,
                 'use_confluence_filter': False,
+                'exit_candidate2_enabled': False,
                 'candidate_filter': {
                     'mode': 'off',
                     'apply_to_persistent': True,
@@ -392,6 +394,24 @@ class TradingConfig:
                 if sub_key not in current_val:
                     current_val[sub_key] = sub_val
                     changed = True
+        utsmc_cfg = strategy_params.setdefault('UTSMC', {})
+        if 'exit_candidate2_enabled' not in utsmc_cfg:
+            utsmc_cfg['exit_candidate2_enabled'] = False
+            changed = True
+        elif not isinstance(utsmc_cfg.get('exit_candidate2_enabled'), bool):
+            utsmc_cfg['exit_candidate2_enabled'] = bool(utsmc_cfg.get('exit_candidate2_enabled'))
+            changed = True
+        utsmc_candidate_filter_cfg = utsmc_cfg.setdefault('candidate_filter', {})
+        utsmc_candidate_filter_defaults = {
+            'mode': 'off',
+            'apply_to_persistent': True,
+            'c1_release_window': 3,
+            'c2_breakout_window': 2
+        }
+        for key, value in utsmc_candidate_filter_defaults.items():
+            if key not in utsmc_candidate_filter_cfg:
+                utsmc_candidate_filter_cfg[key] = value
+                changed = True
         active_strategy = str(strategy_params.get('active_strategy', 'utbot')).lower()
         if active_strategy not in CORE_STRATEGIES:
             strategy_params['active_strategy'] = 'utbot'
@@ -607,7 +627,14 @@ class TradingConfig:
                     "UTSMC": {
                         "internal_length": 5,
                         "swing_length": 50,
-                        "use_confluence_filter": False
+                        "use_confluence_filter": False,
+                        "exit_candidate2_enabled": False,
+                        "candidate_filter": {
+                            "mode": "off",
+                            "apply_to_persistent": True,
+                            "c1_release_window": 3,
+                            "c2_breakout_window": 2
+                        }
                     },
                     "RSIBB": {
                         "rsi_length": 6,
@@ -6194,6 +6221,10 @@ class SignalEngine(BaseEngine):
             if active_strategy == 'utsmc':
                 strategy_name = "UTSMC(Exit)"
                 smc_sig, exit_reason, smc_detail = self._calculate_smc_internal_ob_signal(df, strategy_params)
+                candidate_eval_df = df.iloc[:-1].copy() if len(df.index) > 2 else df.copy()
+                candidate_detail = self._calculate_utsmc_candidate_filter_state(candidate_eval_df, strategy_params)
+                utsmc_cfg = strategy_params.get('UTSMC', {}) or {}
+                exit_candidate2_enabled = bool(utsmc_cfg.get('exit_candidate2_enabled', False))
                 current_closed_row = df.iloc[-2]
                 current_closed_ts = int(current_closed_row['timestamp'])
                 current_closed_price = float(current_closed_row['close'])
@@ -6298,6 +6329,12 @@ class SignalEngine(BaseEngine):
                 )
                 exit_trigger_tags = []
                 exit_reason_parts = []
+                candidate2_long_exit = bool(
+                    exit_candidate2_enabled and candidate_detail.get('candidate2_long_pass', False)
+                )
+                candidate2_short_exit = bool(
+                    exit_candidate2_enabled and candidate_detail.get('candidate2_short_pass', False)
+                )
                 if current_side.lower() == 'long':
                     if fixed_bearish_ob_entry:
                         exit_trigger_tags.append('fixed_internal_bearish_ob_entry')
@@ -6309,6 +6346,11 @@ class SignalEngine(BaseEngine):
                         exit_trigger_tags.append('ut_long_invalidation')
                         exit_reason_parts.append(
                             f"UT LONG INVALIDATION close {current_closed_price:.4f} <= signal low {float(signal_low):.4f}"
+                        )
+                    if candidate2_short_exit:
+                        exit_trigger_tags.append('candidate2_short_exit')
+                        exit_reason_parts.append(
+                            f"OPPOSITE C2 SHORT {candidate_detail.get('candidate2_reason_short')}"
                         )
                     raw_exit_long = bool(exit_reason_parts)
                     raw_exit_short = False
@@ -6323,6 +6365,11 @@ class SignalEngine(BaseEngine):
                         exit_trigger_tags.append('ut_short_invalidation')
                         exit_reason_parts.append(
                             f"UT SHORT INVALIDATION close {current_closed_price:.4f} >= signal high {float(signal_high):.4f}"
+                        )
+                    if candidate2_long_exit:
+                        exit_trigger_tags.append('candidate2_long_exit')
+                        exit_reason_parts.append(
+                            f"OPPOSITE C2 LONG {candidate_detail.get('candidate2_reason_long')}"
                         )
                     raw_exit_short = bool(exit_reason_parts)
                     raw_exit_long = False
@@ -6374,6 +6421,11 @@ class SignalEngine(BaseEngine):
                     utsmc_fixed_ob_bottom=fixed_ob_bottom,
                     utsmc_fixed_ob_created_ts_human=fixed_ob_created_human,
                     utsmc_fixed_ob_origin_ts_human=fixed_ob_origin_human,
+                    utsmc_exit_candidate2_enabled=exit_candidate2_enabled,
+                    utsmc_exit_candidate2_long_pass=candidate_detail.get('candidate2_long_pass'),
+                    utsmc_exit_candidate2_short_pass=candidate_detail.get('candidate2_short_pass'),
+                    utsmc_exit_candidate2_reason_long=candidate_detail.get('candidate2_reason_long'),
+                    utsmc_exit_candidate2_reason_short=candidate_detail.get('candidate2_reason_short'),
                     exit_reason_text=exit_reason,
                     exit_trigger_kind=", ".join(exit_trigger_tags) if exit_trigger_tags else None,
                     exit_tf=tf,
@@ -6456,19 +6508,23 @@ class SignalEngine(BaseEngine):
 
             if bypass_exit_filters:
                 if current_side.lower() == 'long' and raw_exit_long:
-                    if bearish_ob_entry and ut_invalidation_long:
+                    if fixed_bearish_ob_entry and ut_invalidation_long:
                         exit_call_reason = f"{strategy_name}_MultiTriggerLongExit"
                     elif ut_invalidation_long:
                         exit_call_reason = f"{strategy_name}_UTLongInvalidation"
+                    elif candidate2_short_exit:
+                        exit_call_reason = f"{strategy_name}_Candidate2ShortExit"
                     else:
                         exit_call_reason = f"{strategy_name}_InternalBearishOBEntry"
                     logger.info(f"[Exit {tf}] LONG Exit Triggered: {exit_reason}")
                     await self.exit_position(symbol, exit_call_reason)
                 elif current_side.lower() == 'short' and raw_exit_short:
-                    if bullish_ob_entry and ut_invalidation_short:
+                    if fixed_bullish_ob_entry and ut_invalidation_short:
                         exit_call_reason = f"{strategy_name}_MultiTriggerShortExit"
                     elif ut_invalidation_short:
                         exit_call_reason = f"{strategy_name}_UTShortInvalidation"
+                    elif candidate2_long_exit:
+                        exit_call_reason = f"{strategy_name}_Candidate2LongExit"
                     else:
                         exit_call_reason = f"{strategy_name}_InternalBullishOBEntry"
                     logger.info(f"[Exit {tf}] SHORT Exit Triggered: {exit_reason}")
@@ -9150,8 +9206,10 @@ class MainController:
         utbot_key = float(utbot_params.get('key_value', 1.0) or 1.0)
         utbot_atr = int(utbot_params.get('atr_period', 10) or 10)
         utbot_ha = "ON" if utbot_params.get('use_heikin_ashi', False) else "OFF"
-        utsmc_filter_cfg = strategy_params.get('UTSMC', {}).get('candidate_filter', {})
+        utsmc_cfg = strategy_params.get('UTSMC', {}) or {}
+        utsmc_filter_cfg = utsmc_cfg.get('candidate_filter', {})
         utsmc_filter_mode = self._format_utsmc_candidate_filter_mode(utsmc_filter_cfg.get('mode', 'off'))
+        utsmc_c2_exit_status = "ON" if bool(utsmc_cfg.get('exit_candidate2_enabled', False)) else "OFF"
         rsibb_params = strategy_params.get('RSIBB', {})
         rsibb_rsi = int(rsibb_params.get('rsi_length', 6) or 6)
         rsibb_bb = int(rsibb_params.get('bb_length', 200) or 200)
@@ -9196,6 +9254,7 @@ class MainController:
 21. UT 전략 안내 (`UTBOT / UTRSI / UTBB / UTRSIBB / UTSMC`)
 26. UT 진입 방식 (`{ut_entry_timing_label}`)
 49. UTSMC 후보 필터 (`{utsmc_filter_mode}`)
+50. UTSMC C2 청산 (`{utsmc_c2_exit_status}`)
 13. TP/SL 자동청산 (`{tp_sl_status}`)
 36. ROE 자동청산 (`{tp_status}`)
 37. 손절 자동청산 (`{sl_status}`)
@@ -9255,9 +9314,10 @@ class MainController:
             '16': "📝 **전략 선택** (1=UTBOT, 2=UTRSIBB, 3=UTRSI, 4=UTBB, 5=UTSMC)",
             '19': "📝 **UT Bot 설정** 입력 (형식: key,atr,on/off 예: 1,10,off)",
             '20': "RSI/BB 보조설정 입력\n형식: RSI길이,BB길이,BB배수\n예: 6,200,2",
-            '21': "ℹ️ **UT 전략 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙, UTSMC는 26번 UT 진입 방식 + internal OB/UT 신호봉 무효화 청산을 사용합니다.",
+            '21': "ℹ️ **UT 전략 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙, UTSMC는 26번 UT 진입 방식 + internal OB/UT 신호봉 무효화 청산을 사용합니다.\n- 49번: UTSMC 진입용 후보 필터(C1/C2)\n- 50번: 필요 시 exit TF 기준 반대 방향 C2를 보조 청산으로 OR 추가",
             '26': "📝 **UT 진입 방식** 입력\n`next` 또는 `1` = 시그널 마감봉 바로 다음봉에만 진입\n`persistent` 또는 `2` = fresh signal이 아니어도 현재 유지 중인 시그널이면 즉시 진입 대기/진입 (기준봉은 마지막 시그널 확정봉)",
             '49': "📝 **UTSMC 후보 필터** 입력\n`0/off` = OFF\n`1/c1` = 후보1 (Squeeze)\n`2/c2` = 후보2 (Breakout)\n`3/c12` = 후보1+2",
+            '50': "📝 **UTSMC C2 청산** 입력\n`on/off` 또는 `1/0` (`true/false`, `yes/no` 지원)",
             '22': "📝 **거래소/네트워크 선택** (1=바이낸스 테스트넷, 2=바이낸스 메인넷, 3=업비트 KRW 현물)",
             '23': "📝 **거래량 급등 채굴 기능** (1=ON, 0=OFF)",
             '24': "📝 **채굴 진입 타임프레임** 입력 (예: 5m)\n1m, 5m, 15m, 30m, 1h",
@@ -9275,7 +9335,7 @@ class MainController:
         if self.is_upbit_mode():
             blocked_choices = {
                 '1', '2', '3', '4', '5', '6', '8', '10', '11', '12', '13', '14', '15',
-                '16', '19', '20', '21', '23', '24', '25', '26', '35', '36', '37', '38', '41', '49', '00'
+                '16', '19', '20', '21', '23', '24', '25', '26', '35', '36', '37', '38', '41', '49', '50', '00'
             }
             if text in blocked_choices:
                 await update.message.reply_text("ℹ️ 업비트 모드에서는 업비트 전용 메뉴(22, 43~48)만 사용합니다.")
@@ -9825,6 +9885,25 @@ class MainController:
                 await update.message.reply_text(
                     f"✅ UTSMC 후보 필터 변경: {self._format_utsmc_candidate_filter_mode(filter_mode)}"
                 )
+
+            elif choice == '50':
+                toggle_raw = str(val or '').strip().lower()
+                if toggle_raw in {'1', 'on', 'true', 'yes'}:
+                    exit_candidate2_enabled = True
+                elif toggle_raw in {'0', 'off', 'false', 'no'}:
+                    exit_candidate2_enabled = False
+                else:
+                    await update.message.reply_text("❌ `on/off`, `1/0`, `true/false`, `yes/no` 중 하나를 입력하세요.")
+                    return SELECT
+
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTSMC', 'exit_candidate2_enabled'],
+                    exit_candidate2_enabled
+                )
+                self._reset_signal_engine_runtime_state(reset_exit_cache=True)
+                await update.message.reply_text(
+                    f"✅ UTSMC C2 청산: {'ON' if exit_candidate2_enabled else 'OFF'}"
+                )
             
             elif choice == '18':
                 # 吏꾩엯紐⑤뱶 蹂寃?(1=cross, 2=position)
@@ -10019,7 +10098,7 @@ class MainController:
                 await update.message.reply_text(f"✅ 업비트 일일 손실 제한 변경: ₩{limit_krw:,.0f}")
             
             # 10~41 success message handled
-            if choice not in ['2', '3', '10', '11', '12', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '26', '27', '28', '30', '31', '33', '34', '35', '41', '44', '45', '46', '47', '48', '49']:
+            if choice not in ['2', '3', '10', '11', '12', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '26', '27', '28', '30', '31', '33', '34', '35', '41', '44', '45', '46', '47', '48', '49', '50']:
                 await update.message.reply_text(f"✅ 설정 완료: {val}")
             await self._restore_main_keyboard(update)
             await self.show_setup_menu(update)
