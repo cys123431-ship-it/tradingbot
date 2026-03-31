@@ -8872,6 +8872,18 @@ class MainController:
         
         return None
 
+    async def _reply_markdown_safe(self, message, text, reply_markup=None):
+        if message is None:
+            return
+        try:
+            await message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+        except BadRequest as md_err:
+            if "can't parse entities" in str(md_err).lower():
+                plain_text = str(text).replace("**", "").replace("`", "")
+                await message.reply_text(plain_text, reply_markup=reply_markup)
+            else:
+                raise
+
     async def _sync_signal_protection_orders(self):
         """현재 보유 포지션의 보호주문(TP/SL)을 최신 설정으로 동기화한다."""
         try:
@@ -9032,7 +9044,7 @@ class MainController:
 9. 매매 시작/중지 (`{status}`)
 0. 나가기
 """
-            await update.message.reply_text(msg.strip(), parse_mode=ParseMode.MARKDOWN)
+            await self._reply_markdown_safe(update.message, msg.strip())
             return
         
         # ?덉쟾???ㅼ젙 ?묎렐
@@ -9134,9 +9146,10 @@ class MainController:
 9. 매매 시작/중지 (`{status}`)
 0. 나가기
 """
-        await update.message.reply_text(msg.strip(), parse_mode=ParseMode.MARKDOWN)
+        await self._reply_markdown_safe(update.message, msg.strip())
 
     async def setup_entry(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info("Telegram setup menu requested")
         await self.show_setup_menu(update)
         return SELECT
 
@@ -10198,13 +10211,7 @@ class MainController:
                 " [PAUSED]" if self.is_paused else ""
             )
             self._record_status_snapshot(snapshot_key, history_text)
-            try:
-                await u.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
-            except BadRequest as md_err:
-                if "can't parse entities" in str(md_err).lower():
-                    await u.message.reply_text(status_text)
-                else:
-                    raise
+            await self._reply_markdown_safe(u.message, status_text)
 
         async def history_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             limit = 3
@@ -10298,6 +10305,7 @@ class MainController:
                 CommandHandler('setup', self.setup_entry),
                 setup_text_handler
             ],
+            allow_reentry=True,
             states={
                 SELECT: [MessageHandler(setup_text_filter, self.setup_select)],
                 INPUT: [MessageHandler(setup_text_filter, self.setup_input)],
