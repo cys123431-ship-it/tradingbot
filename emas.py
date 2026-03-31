@@ -8884,6 +8884,21 @@ class MainController:
             else:
                 raise
 
+    def _extract_telegram_command(self, text):
+        normalized = str(text or "").strip()
+        if not normalized.startswith('/'):
+            return None
+        first_token = normalized.split(None, 1)[0]
+        return first_token.split('@', 1)[0].lower()
+
+    def _build_manual_status_payload(self):
+        all_data = self.status_data if isinstance(self.status_data, dict) else {}
+        return self._build_dashboard_messages(
+            all_data,
+            "●",
+            " [PAUSED]" if self.is_paused else ""
+        )
+
     async def _sync_signal_protection_orders(self):
         """현재 보유 포지션의 보호주문(TP/SL)을 최신 설정으로 동기화한다."""
         try:
@@ -8990,6 +9005,13 @@ class MainController:
         dt = self.cfg.get('dual_thrust_engine', {})
         dm = self.cfg.get('dual_mode_engine', {})
         eng = sys_cfg.get('active_engine', CORE_ENGINE)
+        request_text = ""
+        if update and update.message and update.message.text:
+            request_text = update.message.text.strip()
+        logger.info(
+            f"Telegram setup menu rendering: chat_id={update.effective_chat.id if update and update.effective_chat else 'unknown'} "
+            f"text={request_text!r} engine={eng} exchange={self.get_exchange_mode()}"
+        )
         direction = self.get_effective_trade_direction()
         watchlist = sig.get('watchlist', ['BTC/USDT'])
         if not isinstance(watchlist, list) or not watchlist:
@@ -9149,9 +9171,19 @@ class MainController:
         await self._reply_markdown_safe(update.message, msg.strip())
 
     async def setup_entry(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        logger.info("Telegram setup menu requested")
-        await self.show_setup_menu(update)
-        return SELECT
+        request_text = ""
+        if update and update.message and update.message.text:
+            request_text = update.message.text.strip()
+        chat_id = update.effective_chat.id if update and update.effective_chat else 'unknown'
+        logger.info(f"Telegram setup menu requested: chat_id={chat_id} text={request_text!r}")
+        try:
+            await self.show_setup_menu(update)
+            return SELECT
+        except Exception as e:
+            logger.exception(f"Telegram setup menu render failed: chat_id={chat_id} text={request_text!r}")
+            if update and update.message:
+                await update.message.reply_text(f"❌ 설정 메뉴 표시 실패: {e}")
+            return ConversationHandler.END
 
     async def setup_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
@@ -10171,6 +10203,8 @@ class MainController:
     async def _setup_telegram(self):
         markup = self._build_main_keyboard()
         text_filter = filters.TEXT & ~filters.COMMAND
+        setup_trigger_pattern = r"^/setup(?:@[A-Za-z0-9_]+)?$"
+        menu_trigger_pattern = r"^/(status|history|log|help|stats|close)(?:@[A-Za-z0-9_]+)?$"
         setup_text_filter = text_filter & ~filters.Regex(r"^/")
 
         async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -10204,12 +10238,7 @@ class MainController:
                 await u.message.reply_text("📝 최근 로그가 없습니다.")
 
         async def status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-            all_data = self.status_data if isinstance(self.status_data, dict) else {}
-            status_text, history_text, snapshot_key = self._build_dashboard_messages(
-                all_data,
-                "●",
-                " [PAUSED]" if self.is_paused else ""
-            )
+            status_text, history_text, snapshot_key = self._build_manual_status_payload()
             self._record_status_snapshot(snapshot_key, history_text)
             await self._reply_markdown_safe(u.message, status_text)
 
@@ -10274,7 +10303,7 @@ class MainController:
 
 /start - 메인 메뉴 표시
 /setup - 설정 메뉴
-/status - 대시보드 갱신
+/status - 현재 상태 조회
 /history - 지난 상태 조회
 /stats - 통계
 /log - 최근 로그
@@ -10298,11 +10327,12 @@ class MainController:
         self.tg_app.add_handler(CommandHandler("stats", stats_cmd))
         self.tg_app.add_handler(CommandHandler("help", help_cmd))
 
-        setup_text_handler = MessageHandler(filters.Regex(r"^/setup$"), self.setup_entry)
+        setup_command_handler = CommandHandler('setup', self.setup_entry)
+        setup_text_handler = MessageHandler(filters.Regex(setup_trigger_pattern), self.setup_entry)
 
         conv = ConversationHandler(
             entry_points=[
-                CommandHandler('setup', self.setup_entry),
+                setup_command_handler,
                 setup_text_handler
             ],
             allow_reentry=True,
@@ -10314,7 +10344,7 @@ class MainController:
                 ENGINE_SELECT: [MessageHandler(setup_text_filter, self.setup_engine_select)]
             },
             fallbacks=[
-                CommandHandler('setup', self.setup_entry),
+                setup_command_handler,
                 setup_text_handler,
                 emergency_handler
             ]
@@ -10323,24 +10353,24 @@ class MainController:
         self.tg_app.add_handler(conv)
 
         async def menu_button_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-            text = (u.message.text or "").strip()
-            if text == "/status":
+            command = self._extract_telegram_command(u.message.text if u and u.message else "")
+            if command == "/status":
                 return await status_cmd(u, c)
-            if text == "/history":
+            if command == "/history":
                 return await history_cmd(u, c)
-            if text == "/log":
+            if command == "/log":
                 return await log_cmd(u, c)
-            if text == "/help":
+            if command == "/help":
                 return await help_cmd(u, c)
-            if text == "/stats":
+            if command == "/stats":
                 return await stats_cmd(u, c)
-            if text == "/close":
+            if command == "/close":
                 return await close_cmd(u, c)
             return None
 
         self.tg_app.add_handler(
             MessageHandler(
-                filters.Regex(r"^/(status|history|log|help|stats|close)$"),
+                filters.Regex(menu_trigger_pattern),
                 menu_button_handler
             )
         )
@@ -10524,37 +10554,15 @@ class MainController:
 
     # ---------------- ??쒕낫??----------------
     async def _dashboard_loop(self):
-        cid = self.cfg.get_chat_id()
-        if not cid:
-            logger.error("??Invalid chat_id - Dashboard disabled")
-            return
-        
-        await asyncio.sleep(3)
-        
-        while True:
-            try:
-                if self.cfg.get('system_settings', {}).get('show_dashboard', True):
-                    await self._refresh_dashboard()
-                
-                interval = self.cfg.get('system_settings', {}).get('monitoring_interval_seconds', 10)
-                await asyncio.sleep(interval)
-                
-            except Exception as e:
-                logger.error(f"Dashboard loop error: {e}")
-                await asyncio.sleep(10)
+        logger.info("Legacy Telegram dashboard loop disabled; manual /status only.")
+        return
 
 
     async def _refresh_dashboard(self, force=False):
-        if not force and not self.cfg.get('system_settings', {}).get('show_dashboard', True):
-            return False
-
-        self.blink_state = not self.blink_state
-        blink = "●" if self.blink_state else "○"
-        pause_indicator = " [PAUSED]" if self.is_paused else ""
-        all_data = self.status_data if isinstance(self.status_data, dict) else {}
-        live_text, history_text, snapshot_key = self._build_dashboard_messages(all_data, blink, pause_indicator)
-        self._record_status_snapshot(snapshot_key, history_text)
-        return await self._upsert_dashboard_message(live_text)
+        logger.info(
+            f"Legacy Telegram dashboard refresh ignored (force={force}); manual /status only."
+        )
+        return False
 
     def _record_status_snapshot(self, snapshot_key, snapshot_text):
         if not snapshot_key or snapshot_key == self.last_status_snapshot_key:
