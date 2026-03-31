@@ -8899,6 +8899,35 @@ class MainController:
             " [PAUSED]" if self.is_paused else ""
         )
 
+    def _normalize_utsmc_candidate_filter_mode(self, mode):
+        mode_raw = str(mode or 'off').strip().lower()
+        aliases = {
+            '0': 'off',
+            'off': 'off',
+            'none': 'off',
+            '1': 'candidate1',
+            'c1': 'candidate1',
+            'candidate1': 'candidate1',
+            '2': 'candidate2',
+            'c2': 'candidate2',
+            'candidate2': 'candidate2',
+            '3': 'candidate12',
+            '12': 'candidate12',
+            'c12': 'candidate12',
+            'candidate12': 'candidate12',
+            'both': 'candidate12'
+        }
+        return aliases.get(mode_raw, 'off')
+
+    def _format_utsmc_candidate_filter_mode(self, mode):
+        normalized = self._normalize_utsmc_candidate_filter_mode(mode)
+        return {
+            'off': 'OFF',
+            'candidate1': 'C1',
+            'candidate2': 'C2',
+            'candidate12': 'C1+C2'
+        }.get(normalized, 'OFF')
+
     async def _sync_signal_protection_orders(self):
         """현재 보유 포지션의 보호주문(TP/SL)을 최신 설정으로 동기화한다."""
         try:
