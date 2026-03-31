@@ -4745,6 +4745,17 @@ class SignalEngine(BaseEngine):
 
     def _update_stateful_diag(self, symbol, **kwargs):
         current = dict(self.last_stateful_diag.get(symbol, {}))
+        if 'smc_reason' in kwargs:
+            next_reason = kwargs.get('smc_reason')
+            prev_reason = current.get('smc_reason')
+            if next_reason:
+                if next_reason != prev_reason:
+                    reason_now = datetime.now()
+                    current['smc_reason_ts'] = int(reason_now.timestamp())
+                    current['smc_reason_ts_human'] = reason_now.strftime('%m-%d %H:%M:%S')
+            else:
+                current.pop('smc_reason_ts', None)
+                current.pop('smc_reason_ts_human', None)
         current.update(kwargs)
         self.last_stateful_diag[symbol] = current
 
@@ -4956,6 +4967,8 @@ class SignalEngine(BaseEngine):
                 lines.append(line)
             if diag.get('smc_reason'):
                 lines.append(f"UTSMC exit 판정: `{diag.get('smc_reason')}`")
+            if diag.get('smc_reason_ts_human'):
+                lines.append(f"UTSMC exit 판정시각: `{diag.get('smc_reason_ts_human')}`")
             if (
                 diag.get('smc_bullish_ob_bottom') is not None
                 or diag.get('smc_bullish_ob_top') is not None
@@ -10945,6 +10958,8 @@ class MainController:
                             )
                         if stateful_diag.get('smc_reason'):
                             msg += f"UTSMC exit 판정: `{stateful_diag.get('smc_reason')}`\n"
+                        if stateful_diag.get('smc_reason_ts_human'):
+                            msg += f"UTSMC exit 판정시각: `{stateful_diag.get('smc_reason_ts_human')}`\n"
                         diag_note = stateful_diag.get('note')
                         if diag_note:
                             msg += f"진단메모: `{diag_note}`\n"
