@@ -91,6 +91,136 @@ BINANCE_TESTNET = 'binance_testnet'
 BINANCE_MAINNET = 'binance_mainnet'
 UPBIT_MODE = 'upbit'
 SUPPORTED_EXCHANGE_MODES = {BINANCE_TESTNET, BINANCE_MAINNET, UPBIT_MODE}
+UTBOT_FILTER_PACK_LABELS = {
+    1: 'CHOP',
+    2: 'ADX+DMI',
+    3: 'VWAP',
+    4: 'HTF Supertrend',
+    5: 'BOS/CHoCH'
+}
+UTBOT_FILTER_PACK_ID_SET = set(UTBOT_FILTER_PACK_LABELS.keys())
+
+
+def build_default_utbot_filter_pack():
+    return {
+        'entry': {
+            'selected': [],
+            'logic': 'and'
+        },
+        'exit': {
+            'selected': [],
+            'logic': 'and',
+            'mode_by_filter': {}
+        }
+    }
+
+
+def get_utbot_filter_pack_label(filter_id):
+    try:
+        return UTBOT_FILTER_PACK_LABELS[int(filter_id)]
+    except (TypeError, ValueError, KeyError):
+        return f"Filter {filter_id}"
+
+
+def normalize_utbot_filter_pack_selected(selected):
+    if selected is None:
+        return []
+
+    if isinstance(selected, str):
+        raw_items = [item.strip() for item in selected.split(',')]
+    elif isinstance(selected, (list, tuple, set)):
+        raw_items = list(selected)
+    else:
+        raw_items = [selected]
+
+    normalized = []
+    seen = set()
+    for raw_item in raw_items:
+        item_text = str(raw_item or '').strip().lower()
+        if not item_text or item_text in {'0', 'off', 'none', '[]'}:
+            continue
+        try:
+            filter_id = int(item_text)
+        except (TypeError, ValueError):
+            continue
+        if filter_id in UTBOT_FILTER_PACK_ID_SET and filter_id not in seen:
+            normalized.append(filter_id)
+            seen.add(filter_id)
+    return sorted(normalized)
+
+
+def normalize_utbot_filter_pack_logic(logic):
+    return 'or' if str(logic or 'and').strip().lower() == 'or' else 'and'
+
+
+def normalize_utbot_filter_pack_exit_mode(mode):
+    aliases = {
+        'c': 'confirm',
+        'confirm': 'confirm',
+        's': 'signal',
+        'signal': 'signal'
+    }
+    return aliases.get(str(mode or 'confirm').strip().lower(), 'confirm')
+
+
+def normalize_utbot_filter_pack_config(filter_pack):
+    raw_pack = filter_pack if isinstance(filter_pack, dict) else {}
+    entry_cfg = raw_pack.get('entry') if isinstance(raw_pack.get('entry'), dict) else {}
+    exit_cfg = raw_pack.get('exit') if isinstance(raw_pack.get('exit'), dict) else {}
+
+    entry_selected = normalize_utbot_filter_pack_selected(entry_cfg.get('selected', []))
+    exit_selected = normalize_utbot_filter_pack_selected(exit_cfg.get('selected', []))
+
+    raw_mode_by_filter = exit_cfg.get('mode_by_filter')
+    normalized_mode_by_filter = {}
+    if isinstance(raw_mode_by_filter, dict):
+        for filter_id in exit_selected:
+            raw_mode = raw_mode_by_filter.get(str(filter_id), raw_mode_by_filter.get(filter_id, 'confirm'))
+            normalized_mode_by_filter[str(filter_id)] = normalize_utbot_filter_pack_exit_mode(raw_mode)
+    else:
+        for filter_id in exit_selected:
+            normalized_mode_by_filter[str(filter_id)] = 'confirm'
+
+    for filter_id in exit_selected:
+        normalized_mode_by_filter.setdefault(str(filter_id), 'confirm')
+
+    return {
+        'entry': {
+            'selected': entry_selected,
+            'logic': normalize_utbot_filter_pack_logic(entry_cfg.get('logic', 'and'))
+        },
+        'exit': {
+            'selected': exit_selected,
+            'logic': normalize_utbot_filter_pack_logic(exit_cfg.get('logic', 'and')),
+            'mode_by_filter': normalized_mode_by_filter
+        }
+    }
+
+
+def format_utbot_filter_pack_selected(selected):
+    normalized = normalize_utbot_filter_pack_selected(selected)
+    if not normalized:
+        return 'OFF'
+    return "[" + ",".join(str(filter_id) for filter_id in normalized) + "]"
+
+
+def format_utbot_filter_pack_logic(logic):
+    return normalize_utbot_filter_pack_logic(logic).upper()
+
+
+def format_utbot_filter_pack_mode_map(mode_by_filter, selected=None):
+    normalized_selected = normalize_utbot_filter_pack_selected(selected or [])
+    if not normalized_selected:
+        return 'OFF'
+    if isinstance(mode_by_filter, dict):
+        raw_map = mode_by_filter
+    else:
+        raw_map = {}
+    items = []
+    for filter_id in normalized_selected:
+        mode = normalize_utbot_filter_pack_exit_mode(raw_map.get(str(filter_id), raw_map.get(filter_id, 'confirm')))
+        items.append(f"{filter_id}={'C' if mode == 'confirm' else 'S'}")
+    return ", ".join(items) if items else 'OFF'
 
 # ??뷀삎 ?곹깭
 SELECT, INPUT, SYMBOL_INPUT, DIRECTION_SELECT, ENGINE_SELECT = range(5)
@@ -188,7 +318,8 @@ class TradingConfig:
                     'UTBot': {
                         'key_value': 1.0,
                         'atr_period': 10,
-                        'use_heikin_ashi': False
+                        'use_heikin_ashi': False,
+                        'filter_pack': build_default_utbot_filter_pack()
                     },
                     'UTSMC': {
                         'internal_length': 5,
@@ -338,7 +469,8 @@ class TradingConfig:
             'UTBot': {
                 'key_value': 1.0,
                 'atr_period': 10,
-                'use_heikin_ashi': False
+                'use_heikin_ashi': False,
+                'filter_pack': build_default_utbot_filter_pack()
             },
             'UTSMC': {
                 'internal_length': 5,
@@ -394,6 +526,11 @@ class TradingConfig:
                 if sub_key not in current_val:
                     current_val[sub_key] = sub_val
                     changed = True
+        utbot_cfg = strategy_params.setdefault('UTBot', {})
+        normalized_utbot_filter_pack = normalize_utbot_filter_pack_config(utbot_cfg.get('filter_pack', {}))
+        if utbot_cfg.get('filter_pack') != normalized_utbot_filter_pack:
+            utbot_cfg['filter_pack'] = normalized_utbot_filter_pack
+            changed = True
         utsmc_cfg = strategy_params.setdefault('UTSMC', {})
         if 'exit_candidate2_enabled' not in utsmc_cfg:
             utsmc_cfg['exit_candidate2_enabled'] = False
@@ -622,7 +759,8 @@ class TradingConfig:
                     "UTBot": {
                         "key_value": 1.0,
                         "atr_period": 10,
-                        "use_heikin_ashi": False
+                        "use_heikin_ashi": False,
+                        "filter_pack": build_default_utbot_filter_pack()
                     },
                     "UTSMC": {
                         "internal_length": 5,
@@ -1677,6 +1815,7 @@ class SignalEngine(BaseEngine):
         # [New] Filter Status Persistence (Dashboard)
         self.last_entry_filter_status = {} # symbol -> {r2_val, ...}
         self.last_exit_filter_status = {}  # symbol -> {r2_val, ...}
+        self.last_utbot_filter_pack_status = {}  # symbol -> UTBot filter pack diagnostics
         self.last_utsmc_candidate_filter_status = {}  # symbol -> candidate filter diagnostics
         self.last_entry_reason = {}        # symbol -> latest entry decision reason
 
@@ -1713,6 +1852,7 @@ class SignalEngine(BaseEngine):
         self.last_stateful_diag_notice = {}
         self.last_entry_filter_status = {}
         self.last_exit_filter_status = {}
+        self.last_utbot_filter_pack_status = {}
         self.last_utsmc_candidate_filter_status = {}
         self.last_entry_reason = {}
         self.pending_reentry = {}
@@ -1831,6 +1971,489 @@ class SignalEngine(BaseEngine):
         if symbol and symbol == self.scanner_active_symbol:
             return cfg.get('scanner_exit_timeframe', '1h')
         return cfg.get('exit_timeframe', '4h')
+
+    def _get_utbot_filter_pack(self, strategy_params=None):
+        params = strategy_params if isinstance(strategy_params, dict) else self.get_runtime_strategy_params()
+        utbot_cfg = params.get('UTBot', {}) if isinstance(params, dict) else {}
+        return normalize_utbot_filter_pack_config(utbot_cfg.get('filter_pack', {}))
+
+    def _get_utbot_filter_pack_htf(self, tf):
+        tf_text = str(tf or '').strip()
+        if not tf_text:
+            return '1d'
+        if tf_text.endswith('M'):
+            return '1d'
+        mapping = {
+            '1m': '15m',
+            '2m': '15m',
+            '3m': '15m',
+            '4m': '15m',
+            '5m': '30m',
+            '15m': '1h',
+            '30m': '4h',
+            '1h': '1d',
+            '2h': '1d',
+            '4h': '1d',
+            '6h': '1d',
+            '8h': '1d',
+            '12h': '1d',
+            '1d': '1d'
+        }
+        return mapping.get(tf_text.lower(), '1d')
+
+    def _combine_utbot_filter_flags(self, values, logic, default_value):
+        flags = [bool(value) for value in values]
+        if not flags:
+            return default_value
+        return all(flags) if normalize_utbot_filter_pack_logic(logic) == 'and' else any(flags)
+
+    def _store_utbot_filter_pack_status(self, symbol, phase, evaluation, strategy_params=None):
+        current = dict(self.last_utbot_filter_pack_status.get(symbol, {}) or {})
+        current['config'] = self._get_utbot_filter_pack(strategy_params)
+        current[phase] = evaluation or {}
+        self.last_utbot_filter_pack_status[symbol] = current
+        if isinstance(self.ctrl.status_data, dict):
+            symbol_status = self.ctrl.status_data.get(symbol)
+            if isinstance(symbol_status, dict):
+                symbol_status['utbot_filter_pack'] = current
+
+    def _build_utbot_filter_pack_side_text(self, evaluation, side):
+        if side not in {'long', 'short'}:
+            return 'UTBot filter pack off'
+        if not isinstance(evaluation, dict) or not evaluation.get('selected'):
+            return 'UTBot filter pack off'
+
+        pass_key = 'long_pass' if side == 'long' else 'short_pass'
+        reason_key = 'reason_long' if side == 'long' else 'reason_short'
+        parts = []
+        for filter_id in evaluation.get('selected', []):
+            detail = (evaluation.get('filters') or {}).get(str(filter_id), {})
+            status_text = 'PASS' if detail.get(pass_key, False) else 'FAIL'
+            parts.append(
+                f"{filter_id}:{detail.get('label', get_utbot_filter_pack_label(filter_id))} "
+                f"{status_text} ({detail.get(reason_key, '-')})"
+            )
+        logic_text = format_utbot_filter_pack_logic(evaluation.get('logic', 'and'))
+        return f"{logic_text} | " + " | ".join(parts) if parts else 'UTBot filter pack off'
+
+    def _utbot_filter_pack_allows_entry(self, evaluation, side):
+        if side not in {'long', 'short'}:
+            return True, 'UTBot filter pack off'
+        if not isinstance(evaluation, dict) or not evaluation.get('selected'):
+            return True, 'UTBot filter pack off'
+        pass_key = 'long_pass' if side == 'long' else 'short_pass'
+        allowed = bool(evaluation.get(pass_key, False))
+        return allowed, self._build_utbot_filter_pack_side_text(evaluation, side)
+
+    def _calculate_utbot_filter_pack_chop(self, closed, length=14):
+        if closed is None or len(closed) < (length + 1):
+            return None, "CHOP 데이터 부족"
+
+        high = closed['high'].astype(float)
+        low = closed['low'].astype(float)
+        close = closed['close'].astype(float)
+        prev_close = close.shift(1)
+        true_range = pd.concat([
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+        tr_sum = true_range.rolling(length).sum()
+        highest_high = high.rolling(length).max()
+        lowest_low = low.rolling(length).min()
+        price_span = (highest_high - lowest_low).replace(0, np.nan)
+        chop = 100.0 * np.log10(tr_sum / price_span) / np.log10(float(length))
+        curr_chop = chop.iloc[-1]
+        if pd.isna(curr_chop) or np.isinf(curr_chop):
+            return None, "CHOP 계산 대기"
+        return float(curr_chop), f"CHOP {float(curr_chop):.2f}"
+
+    def _calculate_utbot_filter_pack_adx_dmi(self, closed, length=14):
+        if closed is None or len(closed) < max((length * 2), (length + 5)):
+            return None, None, None, "ADX 데이터 부족"
+
+        high = closed['high'].astype(float).reset_index(drop=True)
+        low = closed['low'].astype(float).reset_index(drop=True)
+        close = closed['close'].astype(float).reset_index(drop=True)
+        prev_high = high.shift(1)
+        prev_low = low.shift(1)
+        prev_close = close.shift(1)
+
+        up_move = high - prev_high
+        down_move = prev_low - low
+        plus_dm = pd.Series(
+            np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
+            index=high.index,
+            dtype=float
+        )
+        minus_dm = pd.Series(
+            np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
+            index=high.index,
+            dtype=float
+        )
+        true_range = pd.concat([
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1).fillna(0.0)
+
+        atr = self._calculate_rma_series(true_range, length)
+        plus_dm_rma = self._calculate_rma_series(plus_dm, length)
+        minus_dm_rma = self._calculate_rma_series(minus_dm, length)
+
+        atr_safe = atr.replace(0, np.nan)
+        plus_di = 100.0 * (plus_dm_rma / atr_safe)
+        minus_di = 100.0 * (minus_dm_rma / atr_safe)
+        dx_den = (plus_di + minus_di).replace(0, np.nan)
+        dx = 100.0 * ((plus_di - minus_di).abs() / dx_den)
+        adx = self._calculate_rma_series(dx.fillna(0.0), length)
+
+        curr_adx = adx.iloc[-1]
+        curr_plus = plus_di.iloc[-1]
+        curr_minus = minus_di.iloc[-1]
+        if pd.isna(curr_adx) or pd.isna(curr_plus) or pd.isna(curr_minus):
+            return None, None, None, "ADX 계산 대기"
+
+        return (
+            float(curr_adx),
+            float(curr_plus),
+            float(curr_minus),
+            f"ADX {float(curr_adx):.2f} | +DI {float(curr_plus):.2f} | -DI {float(curr_minus):.2f}"
+        )
+
+    def _calculate_utbot_filter_pack_vwap(self, closed):
+        if closed is None or len(closed) < 2:
+            return None, None, None, "VWAP 데이터 부족"
+
+        high = closed['high'].astype(float)
+        low = closed['low'].astype(float)
+        close = closed['close'].astype(float)
+        volume = closed['volume'].astype(float)
+        session_key = (closed['timestamp'].astype('int64') // 86400000).astype('int64')
+        typical_price = (high + low + close) / 3.0
+        pv = typical_price * volume
+        cum_pv = pv.groupby(session_key).cumsum()
+        cum_vol = volume.groupby(session_key).cumsum().replace(0, np.nan)
+        session_vwap = cum_pv / cum_vol
+        curr_vwap = session_vwap.iloc[-1]
+        prev_vwap = session_vwap.iloc[-2]
+        curr_close = close.iloc[-1]
+        if pd.isna(curr_vwap) or pd.isna(prev_vwap) or pd.isna(curr_close):
+            return None, None, None, "VWAP 계산 대기"
+        slope = float(curr_vwap - prev_vwap)
+        return (
+            float(curr_vwap),
+            slope,
+            float(curr_close),
+            f"close {float(curr_close):.2f} | VWAP {float(curr_vwap):.2f} | slope {slope:+.4f}"
+        )
+
+    def _calculate_utbot_filter_pack_supertrend_direction(self, closed, length=10, multiplier=3.0):
+        if closed is None or len(closed) < max((length + 5), 20):
+            return None, None, "HTF Supertrend 데이터 부족"
+
+        high = closed['high'].astype(float).reset_index(drop=True)
+        low = closed['low'].astype(float).reset_index(drop=True)
+        close = closed['close'].astype(float).reset_index(drop=True)
+        prev_close = close.shift(1)
+        true_range = pd.concat([
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1).fillna(0.0)
+        atr = self._calculate_rma_series(true_range, length)
+        if atr.isna().all():
+            return None, None, "HTF Supertrend ATR 대기"
+
+        hl2 = (high + low) / 2.0
+        upper_band = hl2 + (multiplier * atr)
+        lower_band = hl2 - (multiplier * atr)
+        final_upper = pd.Series(np.nan, index=closed.index, dtype=float)
+        final_lower = pd.Series(np.nan, index=closed.index, dtype=float)
+        supertrend = pd.Series(np.nan, index=closed.index, dtype=float)
+        direction = pd.Series(np.nan, index=closed.index, dtype=float)
+
+        valid_indices = [idx for idx, value in enumerate(atr.tolist()) if not pd.isna(value)]
+        if not valid_indices:
+            return None, None, "HTF Supertrend ATR 대기"
+        start_idx = valid_indices[0]
+        final_upper.iloc[start_idx] = float(upper_band.iloc[start_idx])
+        final_lower.iloc[start_idx] = float(lower_band.iloc[start_idx])
+        direction.iloc[start_idx] = 1.0 if float(close.iloc[start_idx]) >= float(hl2.iloc[start_idx]) else -1.0
+        supertrend.iloc[start_idx] = (
+            float(final_lower.iloc[start_idx])
+            if direction.iloc[start_idx] == 1.0
+            else float(final_upper.iloc[start_idx])
+        )
+
+        for idx in range(start_idx + 1, len(closed)):
+            if pd.isna(atr.iloc[idx]):
+                continue
+
+            prev_final_upper = float(final_upper.iloc[idx - 1])
+            prev_final_lower = float(final_lower.iloc[idx - 1])
+            prev_supertrend = float(supertrend.iloc[idx - 1])
+            prev_close_val = float(close.iloc[idx - 1])
+            curr_close_val = float(close.iloc[idx])
+
+            curr_upper = float(upper_band.iloc[idx])
+            curr_lower = float(lower_band.iloc[idx])
+            final_upper.iloc[idx] = (
+                curr_upper if (curr_upper < prev_final_upper or prev_close_val > prev_final_upper) else prev_final_upper
+            )
+            final_lower.iloc[idx] = (
+                curr_lower if (curr_lower > prev_final_lower or prev_close_val < prev_final_lower) else prev_final_lower
+            )
+
+            if prev_supertrend == prev_final_upper:
+                if curr_close_val <= float(final_upper.iloc[idx]):
+                    supertrend.iloc[idx] = float(final_upper.iloc[idx])
+                    direction.iloc[idx] = -1.0
+                else:
+                    supertrend.iloc[idx] = float(final_lower.iloc[idx])
+                    direction.iloc[idx] = 1.0
+            else:
+                if curr_close_val >= float(final_lower.iloc[idx]):
+                    supertrend.iloc[idx] = float(final_lower.iloc[idx])
+                    direction.iloc[idx] = 1.0
+                else:
+                    supertrend.iloc[idx] = float(final_upper.iloc[idx])
+                    direction.iloc[idx] = -1.0
+
+        curr_direction = direction.dropna()
+        curr_supertrend = supertrend.dropna()
+        if curr_direction.empty or curr_supertrend.empty:
+            return None, None, "HTF Supertrend 계산 대기"
+
+        final_direction = 'long' if float(curr_direction.iloc[-1]) > 0 else 'short'
+        final_band = float(curr_supertrend.iloc[-1])
+        return final_direction, final_band, f"HTF Supertrend {final_direction.upper()} @ {final_band:.2f}"
+
+    async def _evaluate_utbot_filter_pack(self, symbol, df, strategy_params, tf, phase):
+        filter_pack = self._get_utbot_filter_pack(strategy_params)
+        phase_cfg = filter_pack.get(phase, {})
+        selected = normalize_utbot_filter_pack_selected(phase_cfg.get('selected', []))
+        logic = normalize_utbot_filter_pack_logic(phase_cfg.get('logic', 'and'))
+        mode_by_filter = dict(filter_pack.get('exit', {}).get('mode_by_filter', {})) if phase == 'exit' else {}
+        evaluation = {
+            'phase': phase,
+            'selected': selected,
+            'logic': logic,
+            'mode_by_filter': mode_by_filter,
+            'filters': {}
+        }
+
+        if not selected:
+            if phase == 'entry':
+                evaluation['long_pass'] = True
+                evaluation['short_pass'] = True
+            else:
+                evaluation['confirm_selected'] = []
+                evaluation['signal_selected'] = []
+                evaluation['confirm_long_pass'] = True
+                evaluation['confirm_short_pass'] = True
+                evaluation['signal_long_trigger'] = False
+                evaluation['signal_short_trigger'] = False
+            return evaluation
+
+        closed = df.iloc[:-1].copy().reset_index(drop=True)
+        if len(closed) < 2:
+            for filter_id in selected:
+                evaluation['filters'][str(filter_id)] = {
+                    'label': get_utbot_filter_pack_label(filter_id),
+                    'long_pass': False,
+                    'short_pass': False,
+                    'reason_long': '확정봉 부족',
+                    'reason_short': '확정봉 부족'
+                }
+            if phase == 'entry':
+                evaluation['long_pass'] = False
+                evaluation['short_pass'] = False
+            else:
+                evaluation['confirm_selected'] = [fid for fid in selected if mode_by_filter.get(str(fid), 'confirm') == 'confirm']
+                evaluation['signal_selected'] = [fid for fid in selected if mode_by_filter.get(str(fid), 'confirm') == 'signal']
+                evaluation['confirm_long_pass'] = False
+                evaluation['confirm_short_pass'] = False
+                evaluation['signal_long_trigger'] = False
+                evaluation['signal_short_trigger'] = False
+            return evaluation
+
+        htf_tf = None
+        htf_direction = None
+        htf_band = None
+        htf_reason = None
+        if 4 in selected:
+            htf_tf = self._get_utbot_filter_pack_htf(tf)
+            try:
+                htf_ohlcv = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, htf_tf, limit=300)
+                htf_df = pd.DataFrame(htf_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    htf_df[col] = pd.to_numeric(htf_df[col], errors='coerce')
+                htf_closed = htf_df.iloc[:-1].copy().reset_index(drop=True)
+                htf_direction, htf_band, htf_reason = self._calculate_utbot_filter_pack_supertrend_direction(
+                    htf_closed,
+                    length=10,
+                    multiplier=3.0
+                )
+            except Exception as exc:
+                htf_reason = f"HTF Supertrend fetch error: {exc}"
+
+        smc_sig = None
+        smc_reason = None
+        smc_detail = {}
+        if 5 in selected:
+            smc_sig, smc_reason, smc_detail = self._calculate_smc_structure_signal(df, strategy_params)
+
+        curr_chop = None
+        adx_val = plus_di = minus_di = None
+        curr_vwap = vwap_slope = curr_close = None
+        chop_reason = adx_reason = vwap_reason = None
+        if 1 in selected:
+            curr_chop, chop_reason = self._calculate_utbot_filter_pack_chop(closed, length=14)
+        if 2 in selected:
+            adx_val, plus_di, minus_di, adx_reason = self._calculate_utbot_filter_pack_adx_dmi(closed, length=14)
+        if 3 in selected:
+            curr_vwap, vwap_slope, curr_close, vwap_reason = self._calculate_utbot_filter_pack_vwap(closed)
+
+        for filter_id in selected:
+            detail = {
+                'label': get_utbot_filter_pack_label(filter_id),
+                'long_pass': False,
+                'short_pass': False,
+                'reason_long': '-',
+                'reason_short': '-'
+            }
+
+            if filter_id == 1:
+                if curr_chop is None:
+                    detail['reason_long'] = chop_reason or 'CHOP 계산 대기'
+                    detail['reason_short'] = detail['reason_long']
+                elif phase == 'entry':
+                    detail['long_pass'] = curr_chop <= 50.0
+                    detail['short_pass'] = curr_chop <= 50.0
+                    detail['reason_long'] = f"{chop_reason} <= 50.00"
+                    detail['reason_short'] = detail['reason_long']
+                else:
+                    detail['long_pass'] = curr_chop >= 61.8
+                    detail['short_pass'] = curr_chop >= 61.8
+                    detail['reason_long'] = f"{chop_reason} >= 61.80"
+                    detail['reason_short'] = detail['reason_long']
+
+            elif filter_id == 2:
+                if adx_val is None or plus_di is None or minus_di is None:
+                    detail['reason_long'] = adx_reason or 'ADX 계산 대기'
+                    detail['reason_short'] = detail['reason_long']
+                elif phase == 'entry':
+                    detail['long_pass'] = adx_val >= 20.0 and plus_di > minus_di
+                    detail['short_pass'] = adx_val >= 20.0 and minus_di > plus_di
+                    detail['reason_long'] = f"{adx_reason} | +DI > -DI"
+                    detail['reason_short'] = f"{adx_reason} | -DI > +DI"
+                else:
+                    detail['long_pass'] = adx_val >= 20.0 and minus_di > plus_di
+                    detail['short_pass'] = adx_val >= 20.0 and plus_di > minus_di
+                    detail['reason_long'] = f"{adx_reason} | -DI > +DI"
+                    detail['reason_short'] = f"{adx_reason} | +DI > -DI"
+
+            elif filter_id == 3:
+                if curr_vwap is None or vwap_slope is None or curr_close is None:
+                    detail['reason_long'] = vwap_reason or 'VWAP 계산 대기'
+                    detail['reason_short'] = detail['reason_long']
+                elif phase == 'entry':
+                    detail['long_pass'] = curr_close > curr_vwap and vwap_slope > 0
+                    detail['short_pass'] = curr_close < curr_vwap and vwap_slope < 0
+                    detail['reason_long'] = f"{vwap_reason} | close > VWAP & slope > 0"
+                    detail['reason_short'] = f"{vwap_reason} | close < VWAP & slope < 0"
+                else:
+                    detail['long_pass'] = curr_close < curr_vwap and vwap_slope < 0
+                    detail['short_pass'] = curr_close > curr_vwap and vwap_slope > 0
+                    detail['reason_long'] = f"{vwap_reason} | close < VWAP & slope < 0"
+                    detail['reason_short'] = f"{vwap_reason} | close > VWAP & slope > 0"
+
+            elif filter_id == 4:
+                reason_text = htf_reason or 'HTF Supertrend 계산 대기'
+                if htf_direction is None:
+                    detail['reason_long'] = reason_text
+                    detail['reason_short'] = reason_text
+                elif phase == 'entry':
+                    detail['long_pass'] = htf_direction == 'long'
+                    detail['short_pass'] = htf_direction == 'short'
+                    detail['reason_long'] = f"{htf_tf} | {reason_text} | LONG 일치"
+                    detail['reason_short'] = f"{htf_tf} | {reason_text} | SHORT 일치"
+                else:
+                    detail['long_pass'] = htf_direction == 'short'
+                    detail['short_pass'] = htf_direction == 'long'
+                    detail['reason_long'] = f"{htf_tf} | {reason_text} | SHORT 반전"
+                    detail['reason_short'] = f"{htf_tf} | {reason_text} | LONG 반전"
+                if htf_band is not None:
+                    detail['htf_band'] = float(htf_band)
+                detail['htf_tf'] = htf_tf
+
+            elif filter_id == 5:
+                bullish_structure = bool(smc_detail.get('bullish_structure', False))
+                bearish_structure = bool(smc_detail.get('bearish_structure', False))
+                bullish_types = list(smc_detail.get('bullish_structure_types', []) or [])
+                bearish_types = list(smc_detail.get('bearish_structure_types', []) or [])
+                bullish_reason = (
+                    f"BULLISH {', '.join(bullish_types)}"
+                    if bullish_types else
+                    "BULLISH BOS/CHoCH 대기"
+                )
+                bearish_reason = (
+                    f"BEARISH {', '.join(bearish_types)}"
+                    if bearish_types else
+                    "BEARISH BOS/CHoCH 대기"
+                )
+                if phase == 'entry':
+                    detail['long_pass'] = bullish_structure
+                    detail['short_pass'] = bearish_structure
+                    detail['reason_long'] = bullish_reason
+                    detail['reason_short'] = bearish_reason
+                else:
+                    detail['long_pass'] = bearish_structure
+                    detail['short_pass'] = bullish_structure
+                    detail['reason_long'] = bearish_reason
+                    detail['reason_short'] = bullish_reason
+
+            evaluation['filters'][str(filter_id)] = detail
+
+        if phase == 'entry':
+            evaluation['long_pass'] = self._combine_utbot_filter_flags(
+                [evaluation['filters'][str(filter_id)].get('long_pass', False) for filter_id in selected],
+                logic,
+                True
+            )
+            evaluation['short_pass'] = self._combine_utbot_filter_flags(
+                [evaluation['filters'][str(filter_id)].get('short_pass', False) for filter_id in selected],
+                logic,
+                True
+            )
+        else:
+            confirm_selected = [filter_id for filter_id in selected if mode_by_filter.get(str(filter_id), 'confirm') == 'confirm']
+            signal_selected = [filter_id for filter_id in selected if mode_by_filter.get(str(filter_id), 'confirm') == 'signal']
+            evaluation['confirm_selected'] = confirm_selected
+            evaluation['signal_selected'] = signal_selected
+            evaluation['confirm_long_pass'] = self._combine_utbot_filter_flags(
+                [evaluation['filters'][str(filter_id)].get('long_pass', False) for filter_id in confirm_selected],
+                logic,
+                True
+            )
+            evaluation['confirm_short_pass'] = self._combine_utbot_filter_flags(
+                [evaluation['filters'][str(filter_id)].get('short_pass', False) for filter_id in confirm_selected],
+                logic,
+                True
+            )
+            evaluation['signal_long_trigger'] = self._combine_utbot_filter_flags(
+                [evaluation['filters'][str(filter_id)].get('long_pass', False) for filter_id in signal_selected],
+                logic,
+                False
+            )
+            evaluation['signal_short_trigger'] = self._combine_utbot_filter_flags(
+                [evaluation['filters'][str(filter_id)].get('short_pass', False) for filter_id in signal_selected],
+                logic,
+                False
+            )
+
+        return evaluation
 
     async def prime_symbol_to_next_closed_candle(self, symbol):
         """When a symbol is newly selected, skip retroactive entry/exit on the latest closed candle."""
@@ -4627,7 +5250,22 @@ class SignalEngine(BaseEngine):
                     )
                     
                     if sig:
-                        if active_strategy == 'utsmc':
+                        if active_strategy == 'utbot':
+                            utbot_entry_filter_eval = await self._evaluate_utbot_filter_pack(
+                                symbol,
+                                df,
+                                scan_params,
+                                scan_tf,
+                                'entry'
+                            )
+                            allowed, filter_reason = self._utbot_filter_pack_allows_entry(utbot_entry_filter_eval, sig)
+                            if not allowed:
+                                logger.info(
+                                    f"🚫 Scanner Skip {symbol}: UTBot filter pack blocked "
+                                    f"({filter_reason})"
+                                )
+                                continue
+                        elif active_strategy == 'utsmc':
                             utsmc_detail = strategy_context.get('raw_hybrid_detail', {}) or {}
                             allowed, candidate_reason = self._utsmc_candidate_filter_allows(utsmc_detail, sig, is_persistent=False)
                             if not allowed:
@@ -4732,6 +5370,9 @@ class SignalEngine(BaseEngine):
             symbol_status['entry_filters'] = {}
             symbol_status['exit_filters'] = {}
             symbol_status['filter_config'] = {}
+            utbot_filter_pack_status = dict(self.last_utbot_filter_pack_status.get(symbol, {}) or {})
+            utbot_filter_pack_status.setdefault('config', self._get_utbot_filter_pack(strategy_params))
+            symbol_status['utbot_filter_pack'] = utbot_filter_pack_status
             candidate_status = self.last_utsmc_candidate_filter_status.get(symbol, {})
             symbol_status['utsmc_candidate_filter_mode'] = candidate_status.get('mode_label', 'OFF')
             symbol_status['utsmc_candidate_filter'] = candidate_status
@@ -5049,7 +5690,7 @@ class SignalEngine(BaseEngine):
         self._append_signal_diag_lines(lines, diag, include_exit=True)
         return "\n".join(lines)
 
-    async def _handle_utbot_primary_strategy(self, symbol, k, pos, strategy_name, raw_strategy_sig, raw_state_sig, raw_ut_detail, sig):
+    async def _handle_utbot_primary_strategy(self, symbol, k, pos, strategy_name, raw_strategy_sig, raw_state_sig, raw_ut_detail, sig, filter_pack_entry=None):
         target_sig = raw_state_sig
         entry_sig = sig
         current_ts = int(k.get('t') or 0)
@@ -5060,6 +5701,27 @@ class SignalEngine(BaseEngine):
         pending = self._get_ut_pending_entry(symbol)
         signal_basis_ts = int(raw_ut_detail.get('signal_ts') or 0)
         signal_basis_side = str(raw_ut_detail.get('signal_side') or '').lower()
+
+        def _entry_filter_gate(side, *, persistent=False):
+            allowed, filter_reason = self._utbot_filter_pack_allows_entry(filter_pack_entry, side)
+            if allowed:
+                return True, filter_reason
+            suffix = " | persistent=Y" if persistent else ""
+            self.last_entry_reason[symbol] = (
+                f"{strategy_name} {side.upper()} 진입 필터 차단 ({filter_reason})"
+            )
+            self._update_stateful_diag(
+                symbol,
+                stage='entry_blocked',
+                strategy=strategy_name,
+                raw_state=(target_sig or 'none'),
+                raw_signal=(raw_strategy_sig or 'none'),
+                entry_sig=(side or 'none'),
+                pos_side='NONE',
+                note=f"utbot filter pack blocked | reason={filter_reason}{suffix}"
+            )
+            return False, filter_reason
+
         if self.is_upbit_mode():
             if pos and target_sig == 'short':
                 self.last_entry_reason[symbol] = (
@@ -5121,6 +5783,19 @@ class SignalEngine(BaseEngine):
                     note=f"{flip_label} exit complete"
                 )
                 if entry_sig == target_sig:
+                    allowed, filter_reason = _entry_filter_gate(entry_sig)
+                    if not allowed:
+                        self.last_entry_reason[symbol] = (
+                            f"{strategy_name} {flip_label} 후 {entry_sig.upper()} 재진입 필터 차단 ({filter_reason})"
+                        )
+                        self._update_stateful_diag(
+                            symbol,
+                            stage='entry_blocked',
+                            pos_side='NONE',
+                            note=f"flip re-entry blocked | reason={filter_reason}"
+                        )
+                        await self._notify_stateful_diag(symbol)
+                        return
                     execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
                     self._set_ut_pending_entry(
                         symbol,
@@ -5159,6 +5834,9 @@ class SignalEngine(BaseEngine):
                 await self._notify_stateful_diag(symbol, force=True)
                 logger.warning(f"[{strategy_name}] Flip re-entry skipped: position still open ({check_pos['side']})")
         elif not pos and entry_sig:
+            allowed, filter_reason = _entry_filter_gate(entry_sig)
+            if not allowed:
+                return
             execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
             self._set_ut_pending_entry(
                 symbol,
@@ -5182,6 +5860,12 @@ class SignalEngine(BaseEngine):
             )
         elif not pos and timing_mode == 'persistent' and target_sig in {'long', 'short'}:
             if signal_basis_side == target_sig and signal_basis_ts > 0:
+                allowed, filter_reason = _entry_filter_gate(target_sig, persistent=True)
+                if not allowed:
+                    self.last_entry_reason[symbol] = (
+                        f"{strategy_name} 현재 {target_sig.upper()} 상태지만 진입 필터 차단 ({filter_reason})"
+                    )
+                    return
                 execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
                 self._set_ut_pending_entry(
                     symbol,
@@ -5935,6 +6619,16 @@ class SignalEngine(BaseEngine):
                 precomputed=strategy_context['precomputed']
             )
             strategy_sig = sig
+            utbot_entry_filter_eval = None
+            if active_strategy == 'utbot':
+                utbot_entry_filter_eval = await self._evaluate_utbot_filter_pack(
+                    symbol,
+                    df,
+                    strategy_params,
+                    tf,
+                    'entry'
+                )
+                self._store_utbot_filter_pack_status(symbol, 'entry', utbot_entry_filter_eval, strategy_params)
             
             # 留ㅻℓ 諛⑺뼢 ?꾪꽣
             d_mode = self.ctrl.get_effective_trade_direction()
@@ -6100,7 +6794,8 @@ class SignalEngine(BaseEngine):
                     raw_strategy_sig,
                     raw_state_sig,
                     raw_ut_detail,
-                    sig
+                    sig,
+                    utbot_entry_filter_eval
                 )
 
             elif active_strategy == 'utsmc':
@@ -6453,8 +7148,80 @@ class SignalEngine(BaseEngine):
             elif active_strategy == 'utbot':
                 strategy_name = "UTBOT(Exit)"
                 exit_sig, exit_reason, _ = self._calculate_utbot_signal(df, strategy_params)
-                raw_exit_long = current_side.lower() == 'long' and exit_sig == 'short'
-                raw_exit_short = current_side.lower() == 'short' and exit_sig == 'long'
+                base_exit_long = current_side.lower() == 'long' and exit_sig == 'short'
+                base_exit_short = current_side.lower() == 'short' and exit_sig == 'long'
+                utbot_exit_eval = await self._evaluate_utbot_filter_pack(
+                    symbol,
+                    df,
+                    strategy_params,
+                    tf,
+                    'exit'
+                )
+                self._store_utbot_filter_pack_status(symbol, 'exit', utbot_exit_eval, strategy_params)
+
+                confirm_selected = utbot_exit_eval.get('confirm_selected', [])
+                signal_selected = utbot_exit_eval.get('signal_selected', [])
+                confirm_long_pass = bool(utbot_exit_eval.get('confirm_long_pass', True))
+                confirm_short_pass = bool(utbot_exit_eval.get('confirm_short_pass', True))
+                signal_long_trigger = bool(utbot_exit_eval.get('signal_long_trigger', False))
+                signal_short_trigger = bool(utbot_exit_eval.get('signal_short_trigger', False))
+
+                def _collect_utbot_exit_filter_text(filter_ids, side):
+                    reason_key = 'reason_long' if side == 'long' else 'reason_short'
+                    pass_key = 'long_pass' if side == 'long' else 'short_pass'
+                    parts = []
+                    for filter_id in filter_ids:
+                        filter_detail = (utbot_exit_eval.get('filters') or {}).get(str(filter_id), {})
+                        if filter_detail.get(pass_key, False):
+                            parts.append(
+                                f"{filter_id}:{filter_detail.get('label', get_utbot_filter_pack_label(filter_id))} "
+                                f"({filter_detail.get(reason_key, '-')})"
+                            )
+                    return " | ".join(parts)
+
+                raw_exit_long = (base_exit_long and confirm_long_pass) or signal_long_trigger
+                raw_exit_short = (base_exit_short and confirm_short_pass) or signal_short_trigger
+
+                if current_side.lower() == 'long':
+                    exit_reason_parts = []
+                    if base_exit_long:
+                        if confirm_selected:
+                            if confirm_long_pass:
+                                confirm_text = _collect_utbot_exit_filter_text(confirm_selected, 'long')
+                                exit_reason_parts.append(
+                                    f"{exit_reason} | confirm {format_utbot_filter_pack_logic(utbot_exit_eval.get('logic', 'and'))} "
+                                    f"{confirm_text or 'PASS'}"
+                                )
+                        else:
+                            exit_reason_parts.append(exit_reason)
+                    if signal_long_trigger:
+                        signal_text = _collect_utbot_exit_filter_text(signal_selected, 'long')
+                        exit_reason_parts.append(
+                            f"UTBOT FILTER SIGNAL EXIT | {format_utbot_filter_pack_logic(utbot_exit_eval.get('logic', 'and'))} "
+                            f"{signal_text or 'PASS'}"
+                        )
+                    if exit_reason_parts:
+                        exit_reason = " | ".join(exit_reason_parts)
+                elif current_side.lower() == 'short':
+                    exit_reason_parts = []
+                    if base_exit_short:
+                        if confirm_selected:
+                            if confirm_short_pass:
+                                confirm_text = _collect_utbot_exit_filter_text(confirm_selected, 'short')
+                                exit_reason_parts.append(
+                                    f"{exit_reason} | confirm {format_utbot_filter_pack_logic(utbot_exit_eval.get('logic', 'and'))} "
+                                    f"{confirm_text or 'PASS'}"
+                                )
+                        else:
+                            exit_reason_parts.append(exit_reason)
+                    if signal_short_trigger:
+                        signal_text = _collect_utbot_exit_filter_text(signal_selected, 'short')
+                        exit_reason_parts.append(
+                            f"UTBOT FILTER SIGNAL EXIT | {format_utbot_filter_pack_logic(utbot_exit_eval.get('logic', 'and'))} "
+                            f"{signal_text or 'PASS'}"
+                        )
+                    if exit_reason_parts:
+                        exit_reason = " | ".join(exit_reason_parts)
                 if raw_exit_long or raw_exit_short:
                     logger.info(f"[Exit Debug] {symbol} {strategy_name}: {exit_reason}")
             else:
@@ -8968,6 +9735,25 @@ class MainController:
             " [PAUSED]" if self.is_paused else ""
         )
 
+    def _get_utbot_filter_pack(self, strategy_params=None):
+        params = strategy_params
+        if not isinstance(params, dict):
+            params = self.cfg.get('signal_engine', {}).get('strategy_params', {})
+        utbot_cfg = params.get('UTBot', {}) if isinstance(params, dict) else {}
+        return normalize_utbot_filter_pack_config(utbot_cfg.get('filter_pack', {}))
+
+    def _format_utbot_filter_pack_selected(self, selected):
+        return format_utbot_filter_pack_selected(selected)
+
+    def _format_utbot_filter_pack_logic(self, logic):
+        return format_utbot_filter_pack_logic(logic)
+
+    def _format_utbot_filter_pack_mode_map(self, mode_by_filter, selected=None):
+        return format_utbot_filter_pack_mode_map(mode_by_filter, selected)
+
+    def _get_utbot_filter_label(self, filter_id):
+        return get_utbot_filter_pack_label(filter_id)
+
     def _normalize_utsmc_candidate_filter_mode(self, mode):
         mode_raw = str(mode or 'off').strip().lower()
         aliases = {
@@ -9203,6 +9989,23 @@ class MainController:
         ut_entry_timing_mode = str(strategy_params.get('ut_entry_timing_mode', 'next_candle') or 'next_candle').lower()
         ut_entry_timing_label = "다음봉 진입" if ut_entry_timing_mode == 'next_candle' else "신호유지 진입"
         utbot_params = strategy_params.get('UTBot', {})
+        utbot_filter_pack = self._get_utbot_filter_pack(strategy_params)
+        utbot_entry_filters_text = self._format_utbot_filter_pack_selected(
+            utbot_filter_pack.get('entry', {}).get('selected', [])
+        )
+        utbot_entry_logic_text = self._format_utbot_filter_pack_logic(
+            utbot_filter_pack.get('entry', {}).get('logic', 'and')
+        )
+        utbot_exit_filters_text = self._format_utbot_filter_pack_selected(
+            utbot_filter_pack.get('exit', {}).get('selected', [])
+        )
+        utbot_exit_logic_text = self._format_utbot_filter_pack_logic(
+            utbot_filter_pack.get('exit', {}).get('logic', 'and')
+        )
+        utbot_exit_mode_text = self._format_utbot_filter_pack_mode_map(
+            utbot_filter_pack.get('exit', {}).get('mode_by_filter', {}),
+            utbot_filter_pack.get('exit', {}).get('selected', [])
+        )
         utbot_key = float(utbot_params.get('key_value', 1.0) or 1.0)
         utbot_atr = int(utbot_params.get('atr_period', 10) or 10)
         utbot_ha = "ON" if utbot_params.get('use_heikin_ashi', False) else "OFF"
@@ -9252,6 +10055,12 @@ class MainController:
 19. UT Bot (`K={utbot_key:.2f}` / `ATR={utbot_atr}` / `HA={utbot_ha}`)
 20. RSI+BB 보조설정 (`RSI={rsibb_rsi}` / `BB={rsibb_bb}` / `x{rsibb_mult:.2f}`)
 21. UT 전략 안내 (`UTBOT / UTRSI / UTBB / UTRSIBB / UTSMC`)
+51. UTBot 진입 필터 (`{utbot_entry_filters_text}`)
+52. UTBot 진입 결합모드 (`{utbot_entry_logic_text}`)
+53. UTBot 청산 필터 (`{utbot_exit_filters_text}`)
+54. UTBot 청산 결합모드 (`{utbot_exit_logic_text}`)
+55. UTBot 청산 필터 타입 (`{utbot_exit_mode_text}`)
+56. UTBot 필터 안내
 26. UT 진입 방식 (`{ut_entry_timing_label}`)
 49. UTSMC 후보 필터 (`{utsmc_filter_mode}`)
 50. UTSMC C2 청산 (`{utsmc_c2_exit_status}`)
@@ -9315,6 +10124,12 @@ class MainController:
             '19': "📝 **UT Bot 설정** 입력 (형식: key,atr,on/off 예: 1,10,off)",
             '20': "RSI/BB 보조설정 입력\n형식: RSI길이,BB길이,BB배수\n예: 6,200,2",
             '21': "ℹ️ **UT 전략 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙, UTSMC는 26번 UT 진입 방식 + internal OB/UT 신호봉 무효화 청산을 사용합니다.\n- 49번: UTSMC 진입용 후보 필터(C1/C2)\n- 50번: 필요 시 exit TF 기준 반대 방향 C2를 보조 청산으로 OR 추가",
+            '51': "📝 **UTBot 진입 필터** 입력\n`0/off` = OFF\n또는 `1,4,5` 형식으로 번호 조합 입력\n1=CHOP, 2=ADX+DMI, 3=VWAP, 4=HTF Supertrend, 5=BOS/CHoCH",
+            '52': "📝 **UTBot 진입 결합모드** 입력\n`and` 또는 `or`",
+            '53': "📝 **UTBot 청산 필터** 입력\n`0/off` = OFF\n또는 `2,3` 형식으로 번호 조합 입력\n1=CHOP, 2=ADX+DMI, 3=VWAP, 4=HTF Supertrend, 5=BOS/CHoCH",
+            '54': "📝 **UTBot 청산 결합모드** 입력\n`and` 또는 `or`",
+            '55': "📝 **UTBot 청산 필터 타입** 입력\n형식: `2:c,3:s,5:c`\n`c=confirm`, `s=signal`",
+            '56': "ℹ️ **UTBot 필터 안내**: 1=CHOP, 2=ADX+DMI, 3=VWAP, 4=HTF Supertrend, 5=BOS/CHoCH\n- 진입: 선택한 필터를 52번 AND/OR로 결합\n- 청산: 55번에서 각 필터를 `confirm`(기본 UT 반대신호 확인용) 또는 `signal`(단독 청산 트리거)로 지정\n- 예시: 진입 `1,4,5` / 청산 `2,3` / 타입 `2:c,3:s`",
             '26': "📝 **UT 진입 방식** 입력\n`next` 또는 `1` = 시그널 마감봉 바로 다음봉에만 진입\n`persistent` 또는 `2` = fresh signal이 아니어도 현재 유지 중인 시그널이면 즉시 진입 대기/진입 (기준봉은 마지막 시그널 확정봉)",
             '49': "📝 **UTSMC 후보 필터** 입력\n`0/off` = OFF\n`1/c1` = 후보1 (Squeeze)\n`2/c2` = 후보2 (Breakout)\n`3/c12` = 후보1+2",
             '50': "📝 **UTSMC C2 청산** 입력\n`on/off` 또는 `1/0` (`true/false`, `yes/no` 지원)",
@@ -9335,7 +10150,7 @@ class MainController:
         if self.is_upbit_mode():
             blocked_choices = {
                 '1', '2', '3', '4', '5', '6', '8', '10', '11', '12', '13', '14', '15',
-                '16', '19', '20', '21', '23', '24', '25', '26', '35', '36', '37', '38', '41', '49', '50', '00'
+                '16', '19', '20', '21', '23', '24', '25', '26', '35', '36', '37', '38', '41', '49', '50', '51', '52', '53', '54', '55', '56', '00'
             }
             if text in blocked_choices:
                 await update.message.reply_text("ℹ️ 업비트 모드에서는 업비트 전용 메뉴(22, 43~48)만 사용합니다.")
@@ -9371,6 +10186,10 @@ class MainController:
 """
             await update.message.reply_text(msg.strip(), parse_mode=ParseMode.MARKDOWN)
             return ENGINE_SELECT
+        elif text == '56':
+            await update.message.reply_text(prompts['56'], parse_mode=ParseMode.MARKDOWN)
+            await self.show_setup_menu(update)
+            return SELECT
 
         elif text == '9':
             self.is_paused = not self.is_paused
@@ -9800,6 +10619,151 @@ class MainController:
                 await update.message.reply_text(
                     f"✅ RSI+BB 설정 변경: RSI={rsi_length}, BB={bb_length}, x{bb_mult:.2f}"
                 )
+
+            elif choice in {'51', '53'}:
+                raw_val = str(val or '').strip().lower()
+                if raw_val in {'0', 'off', 'none'}:
+                    selected_filters = []
+                else:
+                    tokens = [token.strip() for token in str(val or '').split(',') if token.strip()]
+                    if not tokens:
+                        await update.message.reply_text("❌ `0/off` 또는 `1,4,5` 형식으로 입력하세요.")
+                        return SELECT
+                    selected_filters = []
+                    seen_filters = set()
+                    for token in tokens:
+                        if not re.fullmatch(r'\d+', token):
+                            await update.message.reply_text("❌ 필터 번호는 `1,2,3,4,5` 중에서 입력하세요.")
+                            return SELECT
+                        filter_id = int(token)
+                        if filter_id not in UTBOT_FILTER_PACK_ID_SET:
+                            await update.message.reply_text("❌ 사용 가능한 필터 번호는 1,2,3,4,5 입니다.")
+                            return SELECT
+                        if filter_id in seen_filters:
+                            await update.message.reply_text("❌ 같은 필터 번호를 중복해서 입력할 수 없습니다.")
+                            return SELECT
+                        seen_filters.add(filter_id)
+                        selected_filters.append(filter_id)
+                    selected_filters = sorted(selected_filters)
+
+                filter_pack = self._get_utbot_filter_pack()
+                if choice == '51':
+                    filter_pack['entry']['selected'] = selected_filters
+                    await self.cfg.update_value(
+                        ['signal_engine', 'strategy_params', 'UTBot', 'filter_pack'],
+                        filter_pack
+                    )
+                    self._reset_signal_engine_runtime_state(
+                        reset_entry_cache=True,
+                        reset_exit_cache=True,
+                        reset_stateful_strategy=True
+                    )
+                    await update.message.reply_text(
+                        f"✅ UTBot 진입 필터: {self._format_utbot_filter_pack_selected(selected_filters)}"
+                    )
+                else:
+                    filter_pack['exit']['selected'] = selected_filters
+                    filter_pack['exit']['mode_by_filter'] = {
+                        str(filter_id): normalize_utbot_filter_pack_exit_mode(
+                            filter_pack.get('exit', {}).get('mode_by_filter', {}).get(str(filter_id), 'confirm')
+                        )
+                        for filter_id in selected_filters
+                    }
+                    await self.cfg.update_value(
+                        ['signal_engine', 'strategy_params', 'UTBot', 'filter_pack'],
+                        filter_pack
+                    )
+                    self._reset_signal_engine_runtime_state(
+                        reset_entry_cache=True,
+                        reset_exit_cache=True,
+                        reset_stateful_strategy=True
+                    )
+                    await update.message.reply_text(
+                        f"✅ UTBot 청산 필터: {self._format_utbot_filter_pack_selected(selected_filters)}"
+                    )
+
+            elif choice in {'52', '54'}:
+                logic_raw = str(val or '').strip().lower()
+                if logic_raw not in {'and', 'or'}:
+                    await update.message.reply_text("❌ `and` 또는 `or`만 입력하세요.")
+                    return SELECT
+                filter_pack = self._get_utbot_filter_pack()
+                if choice == '52':
+                    filter_pack['entry']['logic'] = logic_raw
+                    label = '진입'
+                else:
+                    filter_pack['exit']['logic'] = logic_raw
+                    label = '청산'
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBot', 'filter_pack'],
+                    filter_pack
+                )
+                self._reset_signal_engine_runtime_state(
+                    reset_entry_cache=True,
+                    reset_exit_cache=True,
+                    reset_stateful_strategy=True
+                )
+                await update.message.reply_text(
+                    f"✅ UTBot {label} 결합모드: {self._format_utbot_filter_pack_logic(logic_raw)}"
+                )
+
+            elif choice == '55':
+                filter_pack = self._get_utbot_filter_pack()
+                exit_selected = normalize_utbot_filter_pack_selected(
+                    filter_pack.get('exit', {}).get('selected', [])
+                )
+                if not exit_selected:
+                    await update.message.reply_text("❌ 먼저 53번에서 UTBot 청산 필터를 선택하세요.")
+                    return SELECT
+
+                raw_val = str(val or '').strip().lower()
+                if raw_val in {'0', 'off', 'none'}:
+                    mode_by_filter = {str(filter_id): 'confirm' for filter_id in exit_selected}
+                else:
+                    tokens = [token.strip() for token in str(val or '').split(',') if token.strip()]
+                    if not tokens:
+                        await update.message.reply_text("❌ 형식: `2:c,3:s,5:c`")
+                        return SELECT
+                    mode_by_filter = {str(filter_id): 'confirm' for filter_id in exit_selected}
+                    seen_mode_filters = set()
+                    for token in tokens:
+                        if ':' not in token:
+                            await update.message.reply_text("❌ 형식: `2:c,3:s,5:c`")
+                            return SELECT
+                        filter_token, mode_token = token.split(':', 1)
+                        filter_token = filter_token.strip()
+                        mode_token = mode_token.strip().lower()
+                        if not re.fullmatch(r'\d+', filter_token):
+                            await update.message.reply_text("❌ 필터 번호는 숫자로 입력하세요.")
+                            return SELECT
+                        filter_id = int(filter_token)
+                        if filter_id not in exit_selected:
+                            await update.message.reply_text(
+                                "❌ 55번에서는 53번에서 선택한 청산 필터만 지정할 수 있습니다."
+                            )
+                            return SELECT
+                        if filter_id in seen_mode_filters:
+                            await update.message.reply_text("❌ 같은 필터 타입을 중복 지정할 수 없습니다.")
+                            return SELECT
+                        if mode_token not in {'c', 'confirm', 's', 'signal'}:
+                            await update.message.reply_text("❌ 필터 타입은 `c(confirm)` 또는 `s(signal)`만 가능합니다.")
+                            return SELECT
+                        seen_mode_filters.add(filter_id)
+                        mode_by_filter[str(filter_id)] = normalize_utbot_filter_pack_exit_mode(mode_token)
+
+                filter_pack['exit']['mode_by_filter'] = mode_by_filter
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBot', 'filter_pack'],
+                    filter_pack
+                )
+                self._reset_signal_engine_runtime_state(
+                    reset_entry_cache=True,
+                    reset_exit_cache=True,
+                    reset_stateful_strategy=True
+                )
+                await update.message.reply_text(
+                    f"✅ UTBot 청산 필터 타입: {self._format_utbot_filter_pack_mode_map(mode_by_filter, exit_selected)}"
+                )
             
             elif choice == '17':
                 # HMA 湲곌컙 蹂寃?(?뺤떇: "9,21")
@@ -10098,7 +11062,7 @@ class MainController:
                 await update.message.reply_text(f"✅ 업비트 일일 손실 제한 변경: ₩{limit_krw:,.0f}")
             
             # 10~41 success message handled
-            if choice not in ['2', '3', '10', '11', '12', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '26', '27', '28', '30', '31', '33', '34', '35', '41', '44', '45', '46', '47', '48', '49', '50']:
+            if choice not in ['2', '3', '10', '11', '12', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '26', '27', '28', '30', '31', '33', '34', '35', '41', '44', '45', '46', '47', '48', '49', '50', '51', '52', '53', '54', '55']:
                 await update.message.reply_text(f"✅ 설정 완료: {val}")
             await self._restore_main_keyboard(update)
             await self.show_setup_menu(update)
@@ -11043,6 +12007,52 @@ class MainController:
                         if diag_note:
                             msg += f"진단메모: `{diag_note}`\n"
 
+                    active_strat = d.get('active_strategy', '')
+                    utbot_filter_pack = d.get('utbot_filter_pack', {}) or {}
+                    utbot_filter_cfg = utbot_filter_pack.get('config', {}) if isinstance(utbot_filter_pack, dict) else {}
+                    if active_strat == 'UTBOT' and utbot_filter_cfg:
+                        utbot_entry_cfg = utbot_filter_cfg.get('entry', {})
+                        utbot_exit_cfg = utbot_filter_cfg.get('exit', {})
+                        utbot_entry_eval = utbot_filter_pack.get('entry', {}) if isinstance(utbot_filter_pack.get('entry', {}), dict) else {}
+                        utbot_exit_eval = utbot_filter_pack.get('exit', {}) if isinstance(utbot_filter_pack.get('exit', {}), dict) else {}
+                        entry_selected = normalize_utbot_filter_pack_selected(utbot_entry_cfg.get('selected', []))
+                        exit_selected = normalize_utbot_filter_pack_selected(utbot_exit_cfg.get('selected', []))
+                        msg += (
+                            f"🧪 UTBot 필터(진입): `{format_utbot_filter_pack_selected(entry_selected)}` "
+                            f"`{format_utbot_filter_pack_logic(utbot_entry_cfg.get('logic', 'and'))}`\n"
+                        )
+                        msg += (
+                            f"🧪 UTBot 필터(청산): `{format_utbot_filter_pack_selected(exit_selected)}` "
+                            f"`{format_utbot_filter_pack_logic(utbot_exit_cfg.get('logic', 'and'))}` | "
+                            f"`{format_utbot_filter_pack_mode_map(utbot_exit_cfg.get('mode_by_filter', {}), exit_selected)}`\n"
+                        )
+
+                        for filter_id in entry_selected:
+                            filter_detail = (utbot_entry_eval.get('filters') or {}).get(str(filter_id), {})
+                            label = filter_detail.get('label', get_utbot_filter_pack_label(filter_id))
+                            long_status = 'PASS' if filter_detail.get('long_pass') else 'FAIL'
+                            short_status = 'PASS' if filter_detail.get('short_pass') else 'FAIL'
+                            msg += (
+                                f"UTBot 진입 {filter_id} `{label}`: "
+                                f"LONG `{long_status}` ({filter_detail.get('reason_long', '-')}) | "
+                                f"SHORT `{short_status}` ({filter_detail.get('reason_short', '-')})\n"
+                            )
+
+                        exit_mode_map = utbot_exit_cfg.get('mode_by_filter', {})
+                        for filter_id in exit_selected:
+                            filter_detail = (utbot_exit_eval.get('filters') or {}).get(str(filter_id), {})
+                            label = filter_detail.get('label', get_utbot_filter_pack_label(filter_id))
+                            mode_label = normalize_utbot_filter_pack_exit_mode(
+                                exit_mode_map.get(str(filter_id), exit_mode_map.get(filter_id, 'confirm'))
+                            )
+                            long_status = 'PASS' if filter_detail.get('long_pass') else 'FAIL'
+                            short_status = 'PASS' if filter_detail.get('short_pass') else 'FAIL'
+                            msg += (
+                                f"UTBot 청산 {filter_id} `{label}`[{mode_label.upper()}]: "
+                                f"LONG `{long_status}` ({filter_detail.get('reason_long', '-')}) | "
+                                f"SHORT `{short_status}` ({filter_detail.get('reason_short', '-')})\n"
+                            )
+
                     f_cfg = d.get('filter_config', {})
                     if f_cfg:
                         entry_st = d.get('entry_filters', {})
@@ -11068,7 +12078,6 @@ class MainController:
                         msg += f"🧪 필터(진입): R2 {e_r2} | CHOP {e_c}\n"
                         msg += f"🧪 필터(청산): R2 {x_r2} | CHOP {x_c} | CC {x_cc}({cc_val:.2f})\n"
 
-                    active_strat = d.get('active_strategy', '')
                     cand_mode = d.get('utsmc_candidate_filter_mode', 'OFF')
                     cand_status = d.get('utsmc_candidate_filter', {}) or {}
                     if active_strat == 'UTSMC' and cand_mode != 'OFF':
