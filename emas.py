@@ -2672,6 +2672,22 @@ class SignalEngine(BaseEngine):
         self.ut_strategy_signal_state[state_key] = parsed_sig
         return parsed_sig if parsed_sig != previous_sig else None
 
+    def _clear_ut_strategy_signal_state(self, symbol, strategy_key=None):
+        symbol_text = str(symbol or '').strip()
+        if not symbol_text:
+            return
+        if strategy_key:
+            self.ut_strategy_signal_state.pop(
+                self._get_ut_strategy_signal_state_key(symbol_text, strategy_key),
+                None
+            )
+            return
+
+        suffix = f"::{symbol_text}"
+        for state_key in list(self.ut_strategy_signal_state.keys()):
+            if str(state_key).endswith(suffix):
+                self.ut_strategy_signal_state.pop(state_key, None)
+
     def _set_ut_pending_entry(self, symbol, side, signal_ts, execute_ts, strategy_name=None, hybrid_strategy=None):
         if side not in {'long', 'short'}:
             return
@@ -5130,7 +5146,8 @@ class SignalEngine(BaseEngine):
                     (active_strategy in MA_STRATEGIES and entry_mode in ['cross', 'position'])
                     or active_strategy == 'cameron'
                     or active_strategy == 'utsmc'
-                    or (self.is_upbit_mode() and active_strategy == 'utbot')
+                    or active_strategy == 'utbot'
+                    or active_strategy in UT_HYBRID_STRATEGIES
                 )
             )
             if uses_secondary_exit:
@@ -5757,82 +5774,29 @@ class SignalEngine(BaseEngine):
             (pos['side'] == 'short' and target_sig == 'long')
         )
 
-        if need_flip:
-            flip_label = "반전 신호" if raw_strategy_sig == target_sig else "상태 동기화"
-            self._update_stateful_diag(
-                symbol,
-                stage='flip_detected',
-                strategy=strategy_name,
-                raw_state=(target_sig or 'none'),
-                raw_signal=(raw_strategy_sig or 'none'),
-                entry_sig=(entry_sig or 'none'),
-                pos_side=str(pos['side']).upper(),
-                note=flip_label
-            )
-            await self._notify_stateful_diag(symbol)
-            logger.info(f"[{strategy_name}] {flip_label}: {pos['side']} -> {target_sig}")
-            await self.exit_position(symbol, f"{strategy_name}_Flip")
-            await asyncio.sleep(1)
-            self.position_cache = None
-            check_pos = await self.get_server_position(symbol, use_cache=False)
-            if not check_pos:
+        if pos:
+            self._clear_ut_pending_entry(symbol)
+            exit_tf = self._get_exit_timeframe(symbol)
+            if need_flip:
+                flip_label = "반전 신호" if raw_strategy_sig == target_sig else "상태 동기화"
+                self.last_entry_reason[symbol] = (
+                    f"{strategy_name} {flip_label} 감지, 청산은 exit TF `{exit_tf}` 확인 후 실행"
+                )
                 self._update_stateful_diag(
                     symbol,
-                    stage='flip_exit_done',
-                    pos_side='NONE',
-                    note=f"{flip_label} exit complete"
+                    stage='exit_wait',
+                    strategy=strategy_name,
+                    raw_state=(target_sig or 'none'),
+                    raw_signal=(raw_strategy_sig or 'none'),
+                    entry_sig=(entry_sig or 'none'),
+                    pos_side=str(pos['side']).upper(),
+                    note=f"{flip_label} detected on entry TF | exit_tf={exit_tf}"
                 )
-                if entry_sig == target_sig:
-                    allowed, filter_reason = _entry_filter_gate(entry_sig)
-                    if not allowed:
-                        self.last_entry_reason[symbol] = (
-                            f"{strategy_name} {flip_label} 후 {entry_sig.upper()} 재진입 필터 차단 ({filter_reason})"
-                        )
-                        self._update_stateful_diag(
-                            symbol,
-                            stage='entry_blocked',
-                            pos_side='NONE',
-                            note=f"flip re-entry blocked | reason={filter_reason}"
-                        )
-                        await self._notify_stateful_diag(symbol)
-                        return
-                    execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
-                    self._set_ut_pending_entry(
-                        symbol,
-                        entry_sig,
-                        current_ts,
-                        execute_ts,
-                        strategy_name=strategy_name
-                    )
-                    self.last_entry_reason[symbol] = (
-                        f"{strategy_name} {flip_label} -> {entry_sig.upper()} {timing_label} 대기"
-                    )
-                    self._update_stateful_diag(
-                        symbol,
-                        stage='flip_reentry_armed',
-                        entry_sig=entry_sig,
-                        pos_side='NONE',
-                        note=f"re-entry armed | execute_ts={execute_ts} | mode={timing_mode}"
-                    )
-                else:
-                    self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} 청산 완료, 재진입은 필터 또는 방향 설정으로 차단"
-                    self._update_stateful_diag(
-                        symbol,
-                        stage='flip_exit_only',
-                        note='re-entry blocked by filter or direction'
-                    )
-                    await self._notify_stateful_diag(symbol)
             else:
-                self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} 청산 미확인, 상태 재동기화 재시도 대기"
-                self.last_stateful_retry_ts[symbol] = 0.0
-                self._update_stateful_diag(
-                    symbol,
-                    stage='flip_still_open',
-                    pos_side=str(check_pos['side']).upper(),
-                    note='position still open after exit attempt'
+                self.last_entry_reason[symbol] = (
+                    f"포지션 보유 중 ({pos['side'].upper()}), {strategy_name} 청산은 exit TF `{exit_tf}` 기준"
                 )
-                await self._notify_stateful_diag(symbol, force=True)
-                logger.warning(f"[{strategy_name}] Flip re-entry skipped: position still open ({check_pos['side']})")
+            return
         elif not pos and entry_sig:
             allowed, filter_reason = _entry_filter_gate(entry_sig)
             if not allowed:
@@ -5903,9 +5867,6 @@ class SignalEngine(BaseEngine):
                 self.last_entry_reason[symbol] = (
                     f"{strategy_name} 현재 상태는 {target_sig.upper()}지만 fresh signal 대기"
                 )
-        elif pos:
-            self._clear_ut_pending_entry(symbol)
-            self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {strategy_name} 반대신호 대기"
 
     async def _handle_utsmc_primary_strategy(self, symbol, k, pos, strategy_name, raw_strategy_sig, raw_state_sig, raw_smc_detail, sig):
         target_sig = raw_state_sig
@@ -6142,71 +6103,28 @@ class SignalEngine(BaseEngine):
             (pos['side'] == 'short' and regime_sig == 'long')
         )
 
-        if need_flip:
-            self._update_stateful_diag(
-                symbol,
-                stage='flip_detected',
-                strategy=strategy_name,
-                raw_state=(regime_sig or 'none'),
-                raw_signal=(raw_strategy_sig or 'none'),
-                entry_sig=(entry_sig or 'none'),
-                pos_side=str(pos['side']).upper(),
-                note='UT regime flip'
-            )
-            await self._notify_stateful_diag(symbol)
-            logger.info(f"[{strategy_name}] UT regime flip: {pos['side']} -> {regime_sig}")
-            await self.exit_position(symbol, f"{strategy_name}_UTFlip")
-            await asyncio.sleep(1)
-            self.position_cache = None
-            check_pos = await self.get_server_position(symbol, use_cache=False)
-            if not check_pos:
+        if pos:
+            self._clear_ut_pending_entry(symbol)
+            exit_tf = self._get_exit_timeframe(symbol)
+            if need_flip:
+                self.last_entry_reason[symbol] = (
+                    f"{strategy_name} UT {regime_sig.upper()} 상태 감지, 청산은 exit TF `{exit_tf}` 확인 후 실행"
+                )
                 self._update_stateful_diag(
                     symbol,
-                    stage='flip_exit_done',
-                    pos_side='NONE',
-                    note='UT flip exit complete'
+                    stage='exit_wait',
+                    strategy=strategy_name,
+                    raw_state=(regime_sig or 'none'),
+                    raw_signal=(raw_strategy_sig or 'none'),
+                    entry_sig=(entry_sig or 'none'),
+                    pos_side=str(pos['side']).upper(),
+                    note=f"UT regime flip detected on entry TF | exit_tf={exit_tf}"
                 )
-                if entry_sig == regime_sig:
-                    execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
-                    self._set_ut_pending_entry(
-                        symbol,
-                        entry_sig,
-                        current_ts,
-                        execute_ts,
-                        strategy_name=strategy_name,
-                        hybrid_strategy=active_strategy
-                    )
-                    self.last_entry_reason[symbol] = (
-                        f"{strategy_name} UT 반전 + {timing_label} 타이밍 -> {entry_sig.upper()} {entry_mode_label} 대기"
-                    )
-                    self._update_stateful_diag(
-                        symbol,
-                        stage='flip_reentry_armed',
-                        entry_sig=entry_sig,
-                        pos_side='NONE',
-                        note=f"re-entry armed | execute_ts={execute_ts} | mode={timing_mode}"
-                    )
-                else:
-                    self.last_entry_reason[symbol] = (
-                        f"{strategy_name} UT 반전 청산 완료, {regime_sig.upper()} {timing_label} 타이밍 대기"
-                    )
-                    self._update_stateful_diag(
-                        symbol,
-                        stage='flip_exit_only',
-                        note=f'waiting for {timing_label} timing'
-                    )
-                    await self._notify_stateful_diag(symbol)
             else:
-                self.last_entry_reason[symbol] = f"{strategy_name} UT 반전 청산 미확인, 상태 재동기화 재시도 대기"
-                self.last_stateful_retry_ts[symbol] = 0.0
-                self._update_stateful_diag(
-                    symbol,
-                    stage='flip_still_open',
-                    pos_side=str(check_pos['side']).upper(),
-                    note='position still open after exit attempt'
+                self.last_entry_reason[symbol] = (
+                    f"포지션 보유 중 ({pos['side'].upper()}), {strategy_name} 청산은 exit TF `{exit_tf}` 기준"
                 )
-                await self._notify_stateful_diag(symbol, force=True)
-                logger.warning(f"[{strategy_name}] Hybrid re-entry skipped: position still open ({check_pos['side']})")
+            return
         elif not pos and fresh_entry_sig:
             execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
             self._set_ut_pending_entry(
@@ -6261,9 +6179,6 @@ class SignalEngine(BaseEngine):
             self.last_entry_reason[symbol] = (
                 f"{strategy_name} UT {regime_sig.upper()} 상태, {timing_label} 타이밍 대기"
             )
-        elif pos:
-            self._clear_ut_pending_entry(symbol)
-            self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {strategy_name} UT 반전 대기"
 
     async def _handle_rsibb_primary_strategy(self, symbol, k, pos, strategy_name, raw_strategy_sig, sig):
         if pos and raw_strategy_sig and (
@@ -6323,6 +6238,64 @@ class SignalEngine(BaseEngine):
             return f"{strategy_name} 청산 조건 대기 (UT 롱 또는 BB 하단 돌파)"
         return f"{strategy_name} 청산 조건 대기"
 
+    def _evaluate_utbb_exit_context(self, symbol, raw_hybrid_detail, current_side):
+        current_side = str(current_side or '').lower()
+        ut_signal = raw_hybrid_detail.get('ut_signal')
+        ut_state = raw_hybrid_detail.get('ut_state')
+        bb_reentry_down = bool(raw_hybrid_detail.get('bb_reentry_down'))
+        bb_mid_two_bearish_exit = bool(raw_hybrid_detail.get('bb_mid_two_bearish_exit'))
+        bb_reentry_up = bool(raw_hybrid_detail.get('bb_reentry_up'))
+        bb_mid_reentry_up = bool(raw_hybrid_detail.get('bb_mid_reentry_up'))
+        bb_lower_breakout = bool(raw_hybrid_detail.get('bb_lower_breakout'))
+        special_long_active = self._is_utbb_special_long_active(symbol)
+        special_short_active = self._is_utbb_special_short_active(symbol)
+        special_short_mode = self._get_utbb_special_short_mode(symbol)
+
+        result = {
+            'raw_exit_long': False,
+            'raw_exit_short': False,
+            'exit_note': None,
+            'hold_note': self._build_utbb_hold_note(
+                'UTBB',
+                current_side,
+                special_long_active=special_long_active,
+                special_short_active=special_short_active,
+                special_short_mode=special_short_mode
+            ),
+            'special_long_active': special_long_active,
+            'special_short_active': special_short_active,
+            'special_short_mode': special_short_mode
+        }
+
+        if current_side == 'long' and (
+            ut_state == 'short'
+            or bb_reentry_down
+            or ((not special_long_active) and bb_mid_two_bearish_exit)
+        ):
+            result['raw_exit_long'] = True
+            result['exit_note'] = self._build_utbb_long_exit_note(
+                ut_signal=ut_signal,
+                ut_state=ut_state,
+                bb_reentry_down=bb_reentry_down
+            )
+            return result
+
+        if current_side == 'short' and (
+            ut_state == 'long'
+            or ((not special_short_active) and bb_lower_breakout)
+            or (special_short_mode == 'lower_reentry' and bb_reentry_up)
+            or (special_short_mode == 'mid_rebound_fail' and bb_mid_reentry_up)
+        ):
+            result['raw_exit_short'] = True
+            result['exit_note'] = self._build_utbb_short_exit_note(
+                ut_signal=ut_signal,
+                ut_state=ut_state,
+                special_short_mode=special_short_mode
+            )
+            return result
+
+        return result
+
     async def _handle_utbb_primary_strategy(self, symbol, k, pos, strategy_name, raw_strategy_sig, raw_state_sig, raw_hybrid_detail, sig):
         ut_signal = raw_hybrid_detail.get('ut_signal')
         ut_state = raw_hybrid_detail.get('ut_state')
@@ -6345,161 +6318,36 @@ class SignalEngine(BaseEngine):
         special_short_active = self._is_utbb_special_short_active(symbol)
         special_short_mode = self._get_utbb_special_short_mode(symbol)
 
-        if pos and pos['side'] == 'long' and (
-            ut_state == 'short'
-            or bb_reentry_down
-            or ((not special_long_active) and bb_mid_two_bearish_exit)
-        ):
-            exit_note = self._build_utbb_long_exit_note(
-                ut_signal=ut_signal,
-                ut_state=ut_state,
-                bb_reentry_down=bb_reentry_down
-            )
-            self._update_stateful_diag(
-                symbol,
-                stage='flip_detected',
-                strategy=strategy_name,
-                raw_state=(raw_state_sig or 'none'),
-                raw_signal=(raw_strategy_sig or 'none'),
-                entry_sig=(entry_sig or 'none'),
-                pos_side=str(pos['side']).upper(),
-                note=f'long exit by {exit_note} (special={special_long_active})'
-            )
-            await self._notify_stateful_diag(symbol)
-            logger.info(f"[{strategy_name}] LONG exit trigger: {exit_note}")
-            await self.exit_position(symbol, f"{strategy_name}_LongExit")
-            await asyncio.sleep(1)
-            self.position_cache = None
-            check_pos = await self.get_server_position(symbol, use_cache=False)
-            if not check_pos:
-                self._clear_utbb_special_long_state(symbol)
+        if pos:
+            exit_tf = self._get_exit_timeframe(symbol)
+            exit_ctx = self._evaluate_utbb_exit_context(symbol, raw_hybrid_detail, pos['side'])
+            if exit_ctx.get('raw_exit_long') or exit_ctx.get('raw_exit_short'):
+                exit_note = exit_ctx.get('exit_note') or 'exit condition'
+                self.last_entry_reason[symbol] = (
+                    f"{strategy_name} {pos['side'].upper()} 청산 조건 감지 ({exit_note}), "
+                    f"청산은 exit TF `{exit_tf}` 확인 후 실행"
+                )
                 self._update_stateful_diag(
                     symbol,
-                    stage='flip_exit_done',
-                    pos_side='NONE',
-                    note=f'long exit complete ({exit_note})'
+                    stage='exit_wait',
+                    strategy=strategy_name,
+                    raw_state=(raw_state_sig or 'none'),
+                    raw_signal=(raw_strategy_sig or 'none'),
+                    entry_sig=(entry_sig or 'none'),
+                    pos_side=str(pos['side']).upper(),
+                    note=f"primary exit condition detected | exit_tf={exit_tf} | {exit_note}"
                 )
-                if ut_state == 'short' and entry_sig == 'short':
-                    short_note = self._build_utbb_short_entry_note(
-                        ut_signal=ut_signal,
-                        short_mid_ready=short_mid_ready,
-                        short_rebound_fail_ready=short_rebound_fail_ready,
-                        short_rebound_fail_bull_count=short_rebound_fail_bull_count,
-                        special_short_candidate=special_short_candidate
-                    )
-                    if special_short_candidate:
-                        self.last_entry_reason[symbol] = (
-                            f"{strategy_name} 롱 청산 후 특수 SHORT 재진입"
-                            if ut_signal == 'short'
-                            else f"{strategy_name} 롱 청산 후 UT 숏상태로 특수 SHORT 재진입"
-                        )
-                    else:
-                        self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 후 {short_note} 재진입"
-                    self._apply_utbb_short_entry_state(
-                        symbol,
-                        raw_hybrid_detail,
-                        special_short_candidate=special_short_candidate,
-                        short_rebound_fail_ready=short_rebound_fail_ready
-                    )
-                    self._clear_utbb_long_setup(symbol)
-                    await self.entry(symbol, 'short', float(k['c']))
-                    if short_setup_ready:
-                        self._consume_utbb_short_setup(symbol)
-                    self._update_stateful_diag(
-                        symbol,
-                        stage='flip_reentered',
-                        entry_sig='short',
-                        pos_side='SHORT',
-                        note='re-entered short after long exit'
-                    )
-                else:
-                    self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 완료, 다음 진입 신호 대기"
-                    await self._notify_stateful_diag(symbol)
             else:
-                self.last_entry_reason[symbol] = f"{strategy_name} 롱 청산 미확인, 상태 재동기화 재시도 대기"
-                self.last_stateful_retry_ts[symbol] = 0.0
-                self._update_stateful_diag(
-                    symbol,
-                    stage='flip_still_open',
-                    pos_side=str(check_pos['side']).upper(),
-                    note='position still open after long exit attempt'
+                hold_note = self._build_utbb_hold_note(
+                    strategy_name,
+                    pos['side'],
+                    special_long_active=special_long_active,
+                    special_short_active=special_short_active,
+                    special_short_mode=special_short_mode
                 )
-                await self._notify_stateful_diag(symbol, force=True)
-            return
-
-        if pos and pos['side'] == 'short' and (
-            ut_state == 'long'
-            or ((not special_short_active) and bb_lower_breakout)
-            or (special_short_mode == 'lower_reentry' and bb_reentry_up)
-            or (special_short_mode == 'mid_rebound_fail' and bb_mid_reentry_up)
-        ):
-            short_exit_note = self._build_utbb_short_exit_note(
-                ut_signal=ut_signal,
-                ut_state=ut_state,
-                special_short_mode=special_short_mode
-            )
-            self._update_stateful_diag(
-                symbol,
-                stage='flip_detected',
-                strategy=strategy_name,
-                raw_state=(raw_state_sig or 'none'),
-                raw_signal=(raw_strategy_sig or 'none'),
-                entry_sig=(entry_sig or 'none'),
-                pos_side=str(pos['side']).upper(),
-                note=short_exit_note
-            )
-            await self._notify_stateful_diag(symbol)
-            logger.info(f"[{strategy_name}] SHORT exit trigger: {short_exit_note.replace('short exit by ', '')}")
-            await self.exit_position(symbol, f"{strategy_name}_ShortExit")
-            await asyncio.sleep(1)
-            self.position_cache = None
-            check_pos = await self.get_server_position(symbol, use_cache=False)
-            if not check_pos:
-                self._clear_utbb_special_short_state(symbol)
-                self._update_stateful_diag(
-                    symbol,
-                    stage='flip_exit_done',
-                    pos_side='NONE',
-                    note='short exit complete'
+                self.last_entry_reason[symbol] = (
+                    f"포지션 보유 중 ({pos['side'].upper()}), {hold_note} | exit TF `{exit_tf}`"
                 )
-                if entry_sig == 'long':
-                    self.last_entry_reason[symbol] = self._build_utbb_long_entry_reason(
-                        strategy_name,
-                        ut_signal=ut_signal,
-                        long_pair_source=long_pair_source,
-                        ut_long_fresh=ut_long_fresh,
-                        bb_long_fresh=bb_long_fresh,
-                        bb_upper_breakout=bb_upper_breakout,
-                        reentry=True
-                    )
-                    self._apply_utbb_long_entry_state(symbol, raw_hybrid_detail, bb_upper_breakout)
-                    self._clear_utbb_long_setup(symbol)
-                    self._clear_utbb_short_setup(symbol)
-                    await self.entry(symbol, 'long', float(k['c']))
-                    self._update_stateful_diag(
-                        symbol,
-                        stage='flip_reentered',
-                        entry_sig='long',
-                        pos_side='LONG',
-                        note='re-entered long after short exit'
-                    )
-                else:
-                    self.last_entry_reason[symbol] = (
-                        f"{strategy_name} 숏 청산 완료, {'LONG 신호' if ut_state == 'long' else '다음 신호'} 대기"
-                    )
-                    self._clear_utbb_special_long_state(symbol)
-                    self._clear_utbb_special_short_state(symbol)
-                    await self._notify_stateful_diag(symbol)
-            else:
-                self.last_entry_reason[symbol] = f"{strategy_name} 숏 청산 미확인, 상태 재동기화 재시도 대기"
-                self.last_stateful_retry_ts[symbol] = 0.0
-                self._update_stateful_diag(
-                    symbol,
-                    stage='flip_still_open',
-                    pos_side=str(check_pos['side']).upper(),
-                    note='position still open after short exit attempt'
-                )
-                await self._notify_stateful_diag(symbol, force=True)
             return
 
         if not pos and entry_sig == 'long':
@@ -6552,16 +6400,6 @@ class SignalEngine(BaseEngine):
             self._clear_utbb_special_long_state(symbol)
             self._clear_utbb_special_short_state(symbol)
             return
-
-        if pos:
-            hold_note = self._build_utbb_hold_note(
-                strategy_name,
-                pos['side'],
-                special_long_active=special_long_active,
-                special_short_active=special_short_active,
-                special_short_mode=special_short_mode
-            )
-            self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), {hold_note}"
 
     async def process_primary_candle(self, symbol, k, force=False):
         candle_time = k['t']
@@ -6892,6 +6730,38 @@ class SignalEngine(BaseEngine):
             logger.error(f"Signal process_candle error: {e}")
             import traceback
             traceback.print_exc()
+
+    async def _post_ut_secondary_exit(self, symbol, active_strategy, previous_side):
+        strategy_key = str(active_strategy or '').lower()
+        previous_side = str(previous_side or '').lower()
+        if self.is_upbit_mode():
+            return
+        if strategy_key not in ({'utbot'} | UT_HYBRID_STRATEGIES):
+            return
+
+        await asyncio.sleep(1)
+        self.position_cache = None
+        check_pos = await self.get_server_position(symbol, use_cache=False)
+        if check_pos:
+            logger.warning(
+                f"[{STRATEGY_DISPLAY_NAMES.get(strategy_key, strategy_key.upper())}] "
+                f"Secondary exit not yet confirmed for {symbol}: {check_pos['side']}"
+            )
+            self.last_stateful_retry_ts[symbol] = 0.0
+            return
+
+        self._clear_ut_pending_entry(symbol)
+        if strategy_key in UT_HYBRID_STRATEGIES:
+            self._clear_ut_strategy_signal_state(symbol, strategy_key)
+        if strategy_key == 'utbb':
+            if previous_side == 'long':
+                self._clear_utbb_special_long_state(symbol)
+            elif previous_side == 'short':
+                self._clear_utbb_special_short_state(symbol)
+                self._clear_utbb_special_long_state(symbol)
+
+        self.last_state_sync_candle_ts[symbol] = 0
+        self.last_stateful_retry_ts[symbol] = 0.0
 
     async def process_exit_candle(self, symbol, tf, current_side):
         """[New] Process secondary timeframe candle for EXIT signals
@@ -7224,6 +7094,37 @@ class SignalEngine(BaseEngine):
                         exit_reason = " | ".join(exit_reason_parts)
                 if raw_exit_long or raw_exit_short:
                     logger.info(f"[Exit Debug] {symbol} {strategy_name}: {exit_reason}")
+            elif active_strategy == 'utbb':
+                strategy_name = "UTBB(Exit)"
+                _, exit_reason, utbb_detail = self._calculate_utbb_signal(None, df, strategy_params)
+                exit_ctx = self._evaluate_utbb_exit_context(symbol, utbb_detail, current_side)
+                raw_exit_long = bool(exit_ctx.get('raw_exit_long'))
+                raw_exit_short = bool(exit_ctx.get('raw_exit_short'))
+                if raw_exit_long or raw_exit_short:
+                    exit_note = exit_ctx.get('exit_note') or exit_reason
+                    exit_reason = f"UTBB EXIT: {exit_note}"
+                    logger.info(f"[Exit Debug] {symbol} {strategy_name}: {exit_reason}")
+                else:
+                    exit_reason = exit_ctx.get('hold_note') or exit_reason
+            elif active_strategy in {'utrsi', 'utrsibb'}:
+                strategy_name = f"{STRATEGY_DISPLAY_NAMES.get(active_strategy, active_strategy.upper())}(Exit)"
+                hybrid_calc = {
+                    'utrsibb': self._calculate_utrsibb_signal,
+                    'utrsi': self._calculate_utrsi_signal
+                }.get(active_strategy)
+                _, hybrid_reason, hybrid_detail = hybrid_calc(None, df, strategy_params)
+                regime_sig = str(hybrid_detail.get('ut_state') or '').lower()
+                timing_label = hybrid_detail.get('timing_label') or 'Signal'
+                timing_sig = hybrid_detail.get('effective_timing_signal') or hybrid_detail.get('timing_signal')
+                raw_exit_long = current_side.lower() == 'long' and regime_sig == 'short'
+                raw_exit_short = current_side.lower() == 'short' and regime_sig == 'long'
+                if raw_exit_long or raw_exit_short:
+                    exit_reason = f"{strategy_name} EXIT: UT {regime_sig.upper()} state on exit TF"
+                    if timing_sig in {'long', 'short'}:
+                        exit_reason += f" | {timing_label} {str(timing_sig).upper()}"
+                    logger.info(f"[Exit Debug] {symbol} {strategy_name}: {exit_reason}")
+                else:
+                    exit_reason = hybrid_reason
             else:
                 # Simple SMA/HMA Logic for Exit
                 if active_strategy == 'hma':
@@ -7374,6 +7275,8 @@ class SignalEngine(BaseEngine):
                     if can_exit:
                         logger.info(f"?뵒 [Exit {tf}] LONG Exit Triggered (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
                         await self.exit_position(symbol, f"{strategy_name}_Exit_L")
+                        if (not self.is_upbit_mode()) and (active_strategy == 'utbot' or active_strategy in UT_HYBRID_STRATEGIES):
+                            await self._post_ut_secondary_exit(symbol, active_strategy, current_side)
                     else:
                         why = ", ".join(block_reasons) if block_reasons else "Filter blocked"
                         logger.info(f"?썳截?[Exit {tf}] LONG Exit Blocked: {why} (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
@@ -7385,6 +7288,8 @@ class SignalEngine(BaseEngine):
                     if can_exit:
                         logger.info(f"?뵒 [Exit {tf}] SHORT Exit Triggered (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
                         await self.exit_position(symbol, f"{strategy_name}_Exit_S")
+                        if (not self.is_upbit_mode()) and (active_strategy == 'utbot' or active_strategy in UT_HYBRID_STRATEGIES):
+                            await self._post_ut_secondary_exit(symbol, active_strategy, current_side)
                     else:
                         why = ", ".join(block_reasons) if block_reasons else "Filter blocked"
                         logger.info(f"?썳截?[Exit {tf}] SHORT Exit Blocked: {why} (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
