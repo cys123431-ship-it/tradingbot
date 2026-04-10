@@ -2688,28 +2688,67 @@ class SignalEngine(BaseEngine):
             if str(state_key).endswith(suffix):
                 self.ut_strategy_signal_state.pop(state_key, None)
 
-    def _set_ut_pending_entry(self, symbol, side, signal_ts, execute_ts, strategy_name=None, hybrid_strategy=None):
+    def _set_ut_pending_entry(
+        self,
+        symbol,
+        side,
+        signal_ts,
+        execute_ts,
+        strategy_name=None,
+        hybrid_strategy=None,
+        source=None,
+        expires_ts=None,
+        signal_side=None,
+        block_reason=None,
+        retry_count=0,
+        pending_state=None
+    ):
         if side not in {'long', 'short'}:
             return
         self.ut_pending_entries[symbol] = {
             'side': side,
             'signal_ts': int(signal_ts or 0),
             'execute_ts': int(execute_ts or 0),
+            'expires_ts': int(expires_ts or 0),
             'strategy_name': str(strategy_name or 'UT'),
-            'hybrid_strategy': str(hybrid_strategy or '').lower() or None
+            'hybrid_strategy': str(hybrid_strategy or '').lower() or None,
+            'source': str(source or 'signal').strip().lower() or 'signal',
+            'signal_side': str(signal_side or side).strip().lower() or side,
+            'block_reason': str(block_reason or '').strip() or None,
+            'retry_count': max(0, int(retry_count or 0)),
+            'pending_state': str(pending_state or 'armed').strip().lower() or 'armed'
         }
 
     def _get_ut_pending_entry(self, symbol):
         return self.ut_pending_entries.get(symbol)
+
+    def _touch_ut_pending_entry(self, symbol, **updates):
+        pending = dict(self.ut_pending_entries.get(symbol) or {})
+        if not pending:
+            return None
+        pending.update(updates)
+        self.ut_pending_entries[symbol] = pending
+        return pending
+
+    def _get_ut_pending_source(self, pending):
+        return str((pending or {}).get('source') or 'signal').strip().lower() or 'signal'
+
+    def _is_ut_flip_pending(self, pending):
+        return self._get_ut_pending_source(pending) == 'flip'
 
     def _clear_ut_pending_entry(self, symbol):
         self.ut_pending_entries.pop(symbol, None)
 
     async def _maybe_execute_ut_live_entry(self, symbol, live_candle_ts, live_price, pos_side):
         pending = self._get_ut_pending_entry(symbol)
+        pending_source = self._get_ut_pending_source(pending) if pending else None
+        is_flip_pending = self._is_ut_flip_pending(pending) if pending else False
         if pos_side != 'NONE':
             if pending:
-                self._clear_ut_pending_entry(symbol)
+                if is_flip_pending:
+                    self._touch_ut_pending_entry(symbol, pending_state='waiting_flat')
+                else:
+                    self._clear_ut_pending_entry(symbol)
             return pos_side
         if not pending:
             return pos_side
@@ -2719,9 +2758,53 @@ class SignalEngine(BaseEngine):
             return pos_side
 
         timing_mode = self._get_ut_entry_timing_mode()
-        if timing_mode == 'next_candle' and live_candle_ts > execute_ts:
-            self._clear_ut_pending_entry(symbol)
-            return pos_side
+        expires_ts = int(pending.get('expires_ts') or 0)
+        if timing_mode == 'next_candle':
+            if is_flip_pending:
+                if expires_ts > 0 and live_candle_ts > expires_ts:
+                    entry_sig = str(pending.get('side') or '').lower()
+                    strategy_name = str(pending.get('strategy_name') or 'UT')
+                    retry_count = int(pending.get('retry_count') or 0)
+                    self._clear_ut_pending_entry(symbol)
+                    self.last_entry_reason[symbol] = (
+                        f"{strategy_name} flip {entry_sig.upper()} 대기 만료"
+                        if entry_sig in {'long', 'short'}
+                        else f"{strategy_name} flip 대기 만료"
+                    )
+                    self._update_stateful_diag(
+                        symbol,
+                        stage='flip_expired',
+                        strategy=strategy_name,
+                        entry_sig=(entry_sig or 'none'),
+                        pos_side='NONE',
+                        ut_pending_source=pending_source,
+                        ut_pending_side=(entry_sig.upper() if entry_sig in {'long', 'short'} else None),
+                        ut_pending_state='expired',
+                        ut_pending_execute_ts=execute_ts,
+                        ut_pending_execute_ts_human=datetime.fromtimestamp(execute_ts / 1000).strftime('%m-%d %H:%M') if execute_ts else None,
+                        ut_pending_expires_ts=expires_ts,
+                        ut_pending_expires_ts_human=datetime.fromtimestamp(expires_ts / 1000).strftime('%m-%d %H:%M') if expires_ts else None,
+                        ut_flip_target_side=(entry_sig.upper() if entry_sig in {'long', 'short'} else None),
+                        ut_flip_signal_ts=int(pending.get('signal_ts') or 0) or None,
+                        ut_flip_signal_ts_human=(
+                            datetime.fromtimestamp(int(pending.get('signal_ts') or 0) / 1000).strftime('%m-%d %H:%M')
+                            if int(pending.get('signal_ts') or 0) else None
+                        ),
+                        ut_flip_execute_ts=execute_ts,
+                        ut_flip_execute_ts_human=datetime.fromtimestamp(execute_ts / 1000).strftime('%m-%d %H:%M') if execute_ts else None,
+                        ut_flip_expires_ts=expires_ts,
+                        ut_flip_expires_ts_human=datetime.fromtimestamp(expires_ts / 1000).strftime('%m-%d %H:%M') if expires_ts else None,
+                        ut_flip_retry_count=retry_count,
+                        ut_flip_block_reason=pending.get('block_reason'),
+                        note=(
+                            f"flip pending expired | live_ts={live_candle_ts} | "
+                            f"execute_ts={execute_ts} | expires_ts={expires_ts}"
+                        )
+                    )
+                    return pos_side
+            elif live_candle_ts > execute_ts:
+                self._clear_ut_pending_entry(symbol)
+                return pos_side
 
         entry_sig = str(pending.get('side') or '').lower()
         if entry_sig not in {'long', 'short'}:
@@ -2731,14 +2814,47 @@ class SignalEngine(BaseEngine):
         strategy_name = str(pending.get('strategy_name') or 'UT')
         timing_label = self._get_ut_entry_timing_label(timing_mode)
         self._clear_ut_pending_entry(symbol)
-        self.last_entry_reason[symbol] = f"{strategy_name} {timing_label} 기준 {entry_sig.upper()} 진입"
+        self.last_entry_reason[symbol] = (
+            f"{strategy_name} flip 유지 확인 -> {entry_sig.upper()} 진입"
+            if is_flip_pending else
+            f"{strategy_name} {timing_label} 기준 {entry_sig.upper()} 진입"
+        )
         self._update_stateful_diag(
             symbol,
-            stage='entry_submitted',
+            stage='flip_reentered' if is_flip_pending else 'entry_submitted',
             strategy=strategy_name,
             entry_sig=entry_sig,
             pos_side=entry_sig.upper(),
-            note=f"live {timing_mode} entry | live_ts={live_candle_ts} | armed_ts={execute_ts}"
+            ut_pending_source=pending_source,
+            ut_pending_side=entry_sig.upper(),
+            ut_pending_state='executed',
+            ut_pending_execute_ts=execute_ts,
+            ut_pending_execute_ts_human=datetime.fromtimestamp(execute_ts / 1000).strftime('%m-%d %H:%M') if execute_ts else None,
+            ut_pending_expires_ts=expires_ts,
+            ut_pending_expires_ts_human=datetime.fromtimestamp(expires_ts / 1000).strftime('%m-%d %H:%M') if expires_ts else None,
+            ut_flip_target_side=(entry_sig.upper() if is_flip_pending else None),
+            ut_flip_signal_ts=int(pending.get('signal_ts') or 0) or None,
+            ut_flip_signal_ts_human=(
+                datetime.fromtimestamp(int(pending.get('signal_ts') or 0) / 1000).strftime('%m-%d %H:%M')
+                if int(pending.get('signal_ts') or 0) else None
+            ),
+            ut_flip_execute_ts=execute_ts if is_flip_pending else None,
+            ut_flip_execute_ts_human=(
+                datetime.fromtimestamp(execute_ts / 1000).strftime('%m-%d %H:%M')
+                if is_flip_pending and execute_ts else None
+            ),
+            ut_flip_expires_ts=expires_ts if is_flip_pending else None,
+            ut_flip_expires_ts_human=(
+                datetime.fromtimestamp(expires_ts / 1000).strftime('%m-%d %H:%M')
+                if is_flip_pending and expires_ts else None
+            ),
+            ut_flip_retry_count=int(pending.get('retry_count') or 0) if is_flip_pending else None,
+            ut_flip_block_reason=pending.get('block_reason') if is_flip_pending else None,
+            note=(
+                f"live flip entry | live_ts={live_candle_ts} | armed_ts={execute_ts} | expires_ts={expires_ts}"
+                if is_flip_pending else
+                f"live {timing_mode} entry | live_ts={live_candle_ts} | armed_ts={execute_ts}"
+            )
         )
         logger.info(f"[{strategy_name}] live {timing_mode} entry {entry_sig.upper()} @ {live_candle_ts}")
         await self.entry(symbol, entry_sig, float(live_price))
@@ -5465,6 +5581,10 @@ class SignalEngine(BaseEngine):
             str(info.get('utsmc_candidate_filter_mode', '')),
             str(info.get('utsmc_candidate_final_long_pass', '')),
             str(info.get('utsmc_candidate_final_short_pass', '')),
+            str(info.get('ut_pending_source', '')),
+            str(info.get('ut_pending_state', '')),
+            str(info.get('ut_flip_target_side', '')),
+            str(info.get('ut_flip_retry_count', '')),
             str(info.get('note', '')),
         ])
         now = time.time()
@@ -5491,6 +5611,25 @@ class SignalEngine(BaseEngine):
             lines.append(
                 f"tf={info.get('tf_used', '?')} signal_ts={info.get('signal_ts_human', '?')} feed_last={info.get('feed_last_ts_human', '?')}"
             )
+        if info.get('ut_pending_source'):
+            pending_line = (
+                f"pending={info.get('ut_pending_source')}:{info.get('ut_pending_side', '-')}"
+                f" state={info.get('ut_pending_state', '-')}"
+                f" execute={info.get('ut_pending_execute_ts_human', '-')}"
+            )
+            if info.get('ut_pending_expires_ts_human'):
+                pending_line += f" expires={info.get('ut_pending_expires_ts_human')}"
+            lines.append(pending_line)
+        if info.get('ut_flip_target_side'):
+            flip_line = (
+                f"flip_target={info.get('ut_flip_target_side')} "
+                f"signal={info.get('ut_flip_signal_ts_human', '-')}"
+            )
+            if info.get('ut_flip_retry_count') is not None:
+                flip_line += f" retry={info.get('ut_flip_retry_count')}"
+            if info.get('ut_flip_block_reason'):
+                flip_line += f" block={info.get('ut_flip_block_reason')}"
+            lines.append(flip_line)
         if info.get('utsmc_candidate_filter_mode'):
             lines.append(
                 f"candidate={info.get('utsmc_candidate_filter_mode')} "
@@ -5552,6 +5691,30 @@ class SignalEngine(BaseEngine):
             )
         elif diag.get('closed_ohlc_text'):
             lines.append(f"UT 확정봉: `{diag.get('closed_ohlc_text')}`")
+        if diag.get('ut_pending_source'):
+            pending_line = (
+                f"UT pending: source `{diag.get('ut_pending_source')}` | "
+                f"side `{diag.get('ut_pending_side', '-')}` | "
+                f"state `{diag.get('ut_pending_state', '-')}` | "
+                f"execute `{diag.get('ut_pending_execute_ts_human', '-')}`"
+            )
+            if diag.get('ut_pending_expires_ts_human'):
+                pending_line += f" | expires `{diag.get('ut_pending_expires_ts_human')}`"
+            lines.append(pending_line)
+        if diag.get('ut_flip_target_side'):
+            flip_line = (
+                f"UTBOT flip: target `{diag.get('ut_flip_target_side')}` | "
+                f"signal `{diag.get('ut_flip_signal_ts_human', '-')}`"
+            )
+            if diag.get('ut_flip_execute_ts_human'):
+                flip_line += f" | execute `{diag.get('ut_flip_execute_ts_human')}`"
+            if diag.get('ut_flip_expires_ts_human'):
+                flip_line += f" | expires `{diag.get('ut_flip_expires_ts_human')}`"
+            if diag.get('ut_flip_retry_count') is not None:
+                flip_line += f" | retry `{diag.get('ut_flip_retry_count')}`"
+            lines.append(flip_line)
+        if diag.get('ut_flip_block_reason'):
+            lines.append(f"UTBOT flip 차단사유: `{diag.get('ut_flip_block_reason')}`")
 
         if diag.get('utsmc_entry_smc_reason'):
             lines.append(f"UTSMC 진입판정: `{diag.get('utsmc_entry_smc_reason')}`")
@@ -5719,6 +5882,13 @@ class SignalEngine(BaseEngine):
         signal_basis_ts = int(raw_ut_detail.get('signal_ts') or 0)
         signal_basis_side = str(raw_ut_detail.get('signal_side') or '').lower()
 
+        def _fmt_pending_ts(ts):
+            ts = int(ts or 0)
+            return datetime.fromtimestamp(ts / 1000).strftime('%m-%d %H:%M') if ts else None
+
+        pending_source = self._get_ut_pending_source(pending) if pending else None
+        is_flip_pending = self._is_ut_flip_pending(pending) if pending else False
+
         def _entry_filter_gate(side, *, persistent=False):
             allowed, filter_reason = self._utbot_filter_pack_allows_entry(filter_pack_entry, side)
             if allowed:
@@ -5758,43 +5928,266 @@ class SignalEngine(BaseEngine):
                 self.last_entry_reason[symbol] = f"{strategy_name} BUY 대기"
             return
 
-        if pending and timing_mode == 'next_candle' and current_ts >= int(pending.get('execute_ts') or 0):
-            self._clear_ut_pending_entry(symbol)
-            pending = None
+        if pending and timing_mode == 'next_candle':
+            pending_execute_ts = int(pending.get('execute_ts') or 0)
+            pending_expires_ts = int(pending.get('expires_ts') or 0)
+            if is_flip_pending:
+                if (not pos) and pending_expires_ts > 0 and current_ts > pending_expires_ts:
+                    self._clear_ut_pending_entry(symbol)
+                    pending = None
+                    pending_source = None
+                    is_flip_pending = False
+            elif current_ts > pending_execute_ts:
+                self._clear_ut_pending_entry(symbol)
+                pending = None
+                pending_source = None
+                is_flip_pending = False
 
         if pending and target_sig not in {'long', 'short'}:
             self._clear_ut_pending_entry(symbol)
             pending = None
+            pending_source = None
+            is_flip_pending = False
         elif pending and target_sig in {'long', 'short'} and target_sig != pending.get('side'):
             self._clear_ut_pending_entry(symbol)
             pending = None
+            pending_source = None
+            is_flip_pending = False
 
         need_flip = pos and target_sig and (
             (pos['side'] == 'long' and target_sig == 'short') or
             (pos['side'] == 'short' and target_sig == 'long')
         )
 
-        if pos:
+        exit_tf = self._get_exit_timeframe(symbol)
+        flip_on_entry_tf = str(exit_tf or '').lower() == str(tf or '').lower()
+
+        if pos and need_flip and not flip_on_entry_tf:
             self._clear_ut_pending_entry(symbol)
-            exit_tf = self._get_exit_timeframe(symbol)
-            if need_flip:
-                flip_label = "반전 신호" if raw_strategy_sig == target_sig else "상태 동기화"
-                self.last_entry_reason[symbol] = (
-                    f"{strategy_name} {flip_label} 감지, 청산은 exit TF `{exit_tf}` 확인 후 실행"
+            flip_label = "반전 신호" if raw_strategy_sig == target_sig else "상태 동기화"
+            self.last_entry_reason[symbol] = (
+                f"{strategy_name} {flip_label} 감지, 청산은 exit TF `{exit_tf}` 확인 후 실행"
+            )
+            self._update_stateful_diag(
+                symbol,
+                stage='exit_wait',
+                strategy=strategy_name,
+                raw_state=(target_sig or 'none'),
+                raw_signal=(raw_strategy_sig or 'none'),
+                entry_sig=(entry_sig or 'none'),
+                pos_side=str(pos['side']).upper(),
+                note=f"{flip_label} detected on entry TF | exit_tf={exit_tf}"
+            )
+            return
+        if need_flip:
+            flip_label = "반전 신호" if raw_strategy_sig == target_sig else "상태 동기화"
+            reentry_allowed = False
+            reentry_filter_reason = None
+            can_reenter = entry_sig == target_sig
+            execute_ts = current_ts + candle_ms if candle_ms > 0 else current_ts
+            expires_ts = execute_ts + (candle_ms * 2 if candle_ms > 0 else 0)
+            retry_count = int(pending.get('retry_count') or 0) if is_flip_pending and pending.get('side') == target_sig else 0
+
+            if can_reenter:
+                reentry_allowed, reentry_filter_reason = self._utbot_filter_pack_allows_entry(filter_pack_entry, entry_sig)
+                if reentry_allowed:
+                    self._set_ut_pending_entry(
+                        symbol,
+                        entry_sig,
+                        signal_basis_ts or current_ts,
+                        execute_ts,
+                        strategy_name=strategy_name,
+                        source='flip',
+                        expires_ts=expires_ts,
+                        signal_side=signal_basis_side or entry_sig,
+                        retry_count=retry_count,
+                        pending_state='exit_pending'
+                    )
+                    pending = self._get_ut_pending_entry(symbol)
+                    pending_source = self._get_ut_pending_source(pending)
+                    is_flip_pending = self._is_ut_flip_pending(pending)
+                elif pending and is_flip_pending and pending.get('side') == entry_sig:
+                    self._clear_ut_pending_entry(symbol)
+                    pending = None
+                    pending_source = None
+                    is_flip_pending = False
+            elif pending and is_flip_pending and pending.get('side') == target_sig:
+                self._clear_ut_pending_entry(symbol)
+                pending = None
+                pending_source = None
+                is_flip_pending = False
+
+            self._update_stateful_diag(
+                symbol,
+                stage='flip_detected',
+                strategy=strategy_name,
+                raw_state=(target_sig or 'none'),
+                raw_signal=(raw_strategy_sig or 'none'),
+                entry_sig=(entry_sig or 'none'),
+                pos_side=str(pos['side']).upper(),
+                ut_pending_source=pending_source,
+                ut_pending_side=(target_sig.upper() if can_reenter and reentry_allowed else None),
+                ut_pending_state=('exit_pending' if can_reenter and reentry_allowed else None),
+                ut_pending_execute_ts=execute_ts if can_reenter and reentry_allowed else None,
+                ut_pending_execute_ts_human=_fmt_pending_ts(execute_ts) if can_reenter and reentry_allowed else None,
+                ut_pending_expires_ts=expires_ts if can_reenter and reentry_allowed else None,
+                ut_pending_expires_ts_human=_fmt_pending_ts(expires_ts) if can_reenter and reentry_allowed else None,
+                ut_flip_target_side=target_sig.upper(),
+                ut_flip_signal_ts=(signal_basis_ts or current_ts),
+                ut_flip_signal_ts_human=_fmt_pending_ts(signal_basis_ts or current_ts),
+                ut_flip_execute_ts=execute_ts if can_reenter and reentry_allowed else None,
+                ut_flip_execute_ts_human=_fmt_pending_ts(execute_ts) if can_reenter and reentry_allowed else None,
+                ut_flip_expires_ts=expires_ts if can_reenter and reentry_allowed else None,
+                ut_flip_expires_ts_human=_fmt_pending_ts(expires_ts) if can_reenter and reentry_allowed else None,
+                ut_flip_retry_count=retry_count,
+                ut_flip_block_reason=(
+                    reentry_filter_reason if can_reenter and not reentry_allowed else
+                    ('direction_or_timing' if not can_reenter else None)
+                ),
+                note=(
+                    f"{flip_label} | flip pending armed"
+                    if can_reenter and reentry_allowed else
+                    (
+                        f"{flip_label} | re-entry blocked ({reentry_filter_reason})"
+                        if can_reenter else
+                        f"{flip_label} | waiting state/timing alignment"
+                    )
                 )
+            )
+            await self._notify_stateful_diag(symbol)
+            logger.info(f"[{strategy_name}] {flip_label}: {pos['side']} -> {target_sig}")
+            await self.exit_position(symbol, f"{strategy_name}_Flip")
+            await asyncio.sleep(1)
+            self.position_cache = None
+            check_pos = await self.get_server_position(symbol, use_cache=False)
+            if not check_pos:
                 self._update_stateful_diag(
                     symbol,
-                    stage='exit_wait',
-                    strategy=strategy_name,
-                    raw_state=(target_sig or 'none'),
-                    raw_signal=(raw_strategy_sig or 'none'),
-                    entry_sig=(entry_sig or 'none'),
-                    pos_side=str(pos['side']).upper(),
-                    note=f"{flip_label} detected on entry TF | exit_tf={exit_tf}"
+                    stage='flip_exit_done',
+                    pos_side='NONE',
+                    ut_pending_source=pending_source,
+                    ut_pending_side=(target_sig.upper() if can_reenter and reentry_allowed else None),
+                    ut_pending_state=('armed' if can_reenter and reentry_allowed else None),
+                    ut_pending_execute_ts=execute_ts if can_reenter and reentry_allowed else None,
+                    ut_pending_execute_ts_human=_fmt_pending_ts(execute_ts) if can_reenter and reentry_allowed else None,
+                    ut_pending_expires_ts=expires_ts if can_reenter and reentry_allowed else None,
+                    ut_pending_expires_ts_human=_fmt_pending_ts(expires_ts) if can_reenter and reentry_allowed else None,
+                    ut_flip_target_side=target_sig.upper(),
+                    ut_flip_signal_ts=(signal_basis_ts or current_ts),
+                    ut_flip_signal_ts_human=_fmt_pending_ts(signal_basis_ts or current_ts),
+                    ut_flip_execute_ts=execute_ts if can_reenter and reentry_allowed else None,
+                    ut_flip_execute_ts_human=_fmt_pending_ts(execute_ts) if can_reenter and reentry_allowed else None,
+                    ut_flip_expires_ts=expires_ts if can_reenter and reentry_allowed else None,
+                    ut_flip_expires_ts_human=_fmt_pending_ts(expires_ts) if can_reenter and reentry_allowed else None,
+                    ut_flip_retry_count=retry_count,
+                    ut_flip_block_reason=(
+                        reentry_filter_reason if can_reenter and not reentry_allowed else
+                        ('direction_or_timing' if not can_reenter else None)
+                    ),
+                    note=f"{flip_label} exit complete"
                 )
+                if can_reenter and reentry_allowed:
+                    self._touch_ut_pending_entry(symbol, pending_state='armed', retry_count=retry_count, block_reason=None)
+                    self.last_entry_reason[symbol] = (
+                        f"{strategy_name} {flip_label} -> {entry_sig.upper()} {timing_label} 대기"
+                    )
+                    self._update_stateful_diag(
+                        symbol,
+                        stage='flip_reentry_armed',
+                        entry_sig=entry_sig,
+                        pos_side='NONE',
+                        ut_pending_source='flip',
+                        ut_pending_side=entry_sig.upper(),
+                        ut_pending_state='armed',
+                        ut_pending_execute_ts=execute_ts,
+                        ut_pending_execute_ts_human=_fmt_pending_ts(execute_ts),
+                        ut_pending_expires_ts=expires_ts,
+                        ut_pending_expires_ts_human=_fmt_pending_ts(expires_ts),
+                        ut_flip_target_side=entry_sig.upper(),
+                        ut_flip_signal_ts=(signal_basis_ts or current_ts),
+                        ut_flip_signal_ts_human=_fmt_pending_ts(signal_basis_ts or current_ts),
+                        ut_flip_execute_ts=execute_ts,
+                        ut_flip_execute_ts_human=_fmt_pending_ts(execute_ts),
+                        ut_flip_expires_ts=expires_ts,
+                        ut_flip_expires_ts_human=_fmt_pending_ts(expires_ts),
+                        ut_flip_retry_count=retry_count,
+                        ut_flip_block_reason=None,
+                        note=f"re-entry armed | execute_ts={execute_ts} | expires_ts={expires_ts} | mode={timing_mode}"
+                    )
+                else:
+                    self._clear_ut_pending_entry(symbol)
+                    self.last_entry_reason[symbol] = (
+                        f"{strategy_name} {flip_label} 청산 완료, 재진입은 "
+                        f"{'필터 차단' if can_reenter else '방향/타이밍 미정렬'}"
+                    )
+                    self._update_stateful_diag(
+                        symbol,
+                        stage='entry_blocked' if can_reenter else 'flip_exit_only',
+                        pos_side='NONE',
+                        ut_pending_source=None,
+                        ut_pending_side=None,
+                        ut_pending_state=None,
+                        ut_pending_execute_ts=None,
+                        ut_pending_execute_ts_human=None,
+                        ut_pending_expires_ts=None,
+                        ut_pending_expires_ts_human=None,
+                        ut_flip_target_side=target_sig.upper(),
+                        ut_flip_signal_ts=(signal_basis_ts or current_ts),
+                        ut_flip_signal_ts_human=_fmt_pending_ts(signal_basis_ts or current_ts),
+                        ut_flip_execute_ts=None,
+                        ut_flip_execute_ts_human=None,
+                        ut_flip_expires_ts=None,
+                        ut_flip_expires_ts_human=None,
+                        ut_flip_retry_count=retry_count,
+                        ut_flip_block_reason=(
+                            reentry_filter_reason if can_reenter and not reentry_allowed else 'direction_or_timing'
+                        ),
+                        note=(
+                            f"flip re-entry blocked | reason={reentry_filter_reason}"
+                            if can_reenter else
+                            're-entry blocked by direction or timing'
+                        )
+                    )
+                    await self._notify_stateful_diag(symbol)
             else:
-                self.last_entry_reason[symbol] = (
-                    f"포지션 보유 중 ({pos['side'].upper()}), {strategy_name} 청산은 exit TF `{exit_tf}` 기준"
+                if can_reenter and reentry_allowed:
+                    retry_count += 1
+                    self._touch_ut_pending_entry(
+                        symbol,
+                        retry_count=retry_count,
+                        pending_state='waiting_flat',
+                        block_reason=None
+                    )
+                self.last_entry_reason[symbol] = f"{strategy_name} {flip_label} 청산 미확인, 상태 재동기화 재시도 대기"
+                self.last_stateful_retry_ts[symbol] = 0.0
+                self._update_stateful_diag(
+                    symbol,
+                    stage='flip_still_open',
+                    pos_side=str(check_pos['side']).upper(),
+                    ut_pending_source=('flip' if can_reenter and reentry_allowed else None),
+                    ut_pending_side=(target_sig.upper() if can_reenter and reentry_allowed else None),
+                    ut_pending_state=('waiting_flat' if can_reenter and reentry_allowed else None),
+                    ut_pending_execute_ts=execute_ts if can_reenter and reentry_allowed else None,
+                    ut_pending_execute_ts_human=_fmt_pending_ts(execute_ts) if can_reenter and reentry_allowed else None,
+                    ut_pending_expires_ts=expires_ts if can_reenter and reentry_allowed else None,
+                    ut_pending_expires_ts_human=_fmt_pending_ts(expires_ts) if can_reenter and reentry_allowed else None,
+                    ut_flip_target_side=target_sig.upper(),
+                    ut_flip_signal_ts=(signal_basis_ts or current_ts),
+                    ut_flip_signal_ts_human=_fmt_pending_ts(signal_basis_ts or current_ts),
+                    ut_flip_execute_ts=execute_ts if can_reenter and reentry_allowed else None,
+                    ut_flip_execute_ts_human=_fmt_pending_ts(execute_ts) if can_reenter and reentry_allowed else None,
+                    ut_flip_expires_ts=expires_ts if can_reenter and reentry_allowed else None,
+                    ut_flip_expires_ts_human=_fmt_pending_ts(expires_ts) if can_reenter and reentry_allowed else None,
+                    ut_flip_retry_count=retry_count,
+                    ut_flip_block_reason=(
+                        reentry_filter_reason if can_reenter and not reentry_allowed else
+                        ('direction_or_timing' if not can_reenter else None)
+                    ),
+                    note=(
+                        f"position still open after exit attempt | retry_count={retry_count}"
+                        if can_reenter and reentry_allowed else
+                        'position still open after exit attempt'
+                    )
                 )
             return
         elif not pos and entry_sig:
@@ -5867,6 +6260,17 @@ class SignalEngine(BaseEngine):
                 self.last_entry_reason[symbol] = (
                     f"{strategy_name} 현재 상태는 {target_sig.upper()}지만 fresh signal 대기"
                 )
+        elif pos:
+            if pending and self._is_ut_flip_pending(pending) and pending.get('side') in {'long', 'short'} and pending.get('side') != str(pos['side']).lower():
+                self.last_entry_reason[symbol] = (
+                    f"{strategy_name} flip {str(pending.get('side')).upper()} 대기 "
+                    f"(현재 {pos['side'].upper()} 청산 확인 중)"
+                )
+            else:
+                self._clear_ut_pending_entry(symbol)
+                self.last_entry_reason[symbol] = (
+                    f"포지션 보유 중 ({pos['side'].upper()}), {strategy_name} 청산은 exit TF `{exit_tf}` 기준"
+                )
 
     async def _handle_utsmc_primary_strategy(self, symbol, k, pos, strategy_name, raw_strategy_sig, raw_state_sig, raw_smc_detail, sig):
         target_sig = raw_state_sig
@@ -5888,7 +6292,7 @@ class SignalEngine(BaseEngine):
         bullish_ob_entry = bool(raw_smc_detail.get('bullish_internal_ob_entry'))
         bearish_ob_entry = bool(raw_smc_detail.get('bearish_internal_ob_entry'))
 
-        if pending and timing_mode == 'next_candle' and current_ts >= int(pending.get('execute_ts') or 0):
+        if pending and timing_mode == 'next_candle' and current_ts > int(pending.get('execute_ts') or 0):
             self._clear_utsmc_pending_entry(symbol)
             pending = None
 
@@ -6090,7 +6494,7 @@ class SignalEngine(BaseEngine):
         entry_mode_label = self._get_ut_entry_timing_label(timing_mode)
         pending = self._get_ut_pending_entry(symbol)
 
-        if pending and timing_mode == 'next_candle' and current_ts >= int(pending.get('execute_ts') or 0):
+        if pending and timing_mode == 'next_candle' and current_ts > int(pending.get('execute_ts') or 0):
             self._clear_ut_pending_entry(symbol)
             pending = None
 
@@ -6488,6 +6892,10 @@ class SignalEngine(BaseEngine):
                 feed_last_ts = int(df.iloc[-1]['timestamp']) if len(df) >= 1 else None
                 closed_row = df.iloc[-2] if len(df) >= 2 else None
                 live_row = df.iloc[-1] if len(df) >= 1 else None
+                ut_pending = self._get_ut_pending_entry(symbol)
+                ut_pending_source = self._get_ut_pending_source(ut_pending) if ut_pending else None
+                ut_pending_execute_ts = int(ut_pending.get('execute_ts') or 0) if ut_pending else 0
+                ut_pending_expires_ts = int(ut_pending.get('expires_ts') or 0) if ut_pending else 0
 
                 def _fmt_ohlc(row):
                     if row is None:
@@ -6586,6 +6994,50 @@ class SignalEngine(BaseEngine):
                     ),
                     utsmc_candidate_reason_short=(
                         raw_hybrid_detail.get('candidate_reason_short') if active_strategy == 'utsmc' else None
+                    ),
+                    ut_pending_source=ut_pending_source,
+                    ut_pending_side=(str(ut_pending.get('side') or '').upper() if ut_pending else None),
+                    ut_pending_state=(ut_pending.get('pending_state') if ut_pending else None),
+                    ut_pending_execute_ts=(ut_pending_execute_ts or None),
+                    ut_pending_execute_ts_human=(
+                        datetime.fromtimestamp(ut_pending_execute_ts / 1000).strftime('%m-%d %H:%M')
+                        if ut_pending_execute_ts else None
+                    ),
+                    ut_pending_expires_ts=(ut_pending_expires_ts or None),
+                    ut_pending_expires_ts_human=(
+                        datetime.fromtimestamp(ut_pending_expires_ts / 1000).strftime('%m-%d %H:%M')
+                        if ut_pending_expires_ts else None
+                    ),
+                    ut_flip_target_side=(
+                        str(ut_pending.get('side') or '').upper()
+                        if ut_pending and ut_pending_source == 'flip' else None
+                    ),
+                    ut_flip_signal_ts=(
+                        int(ut_pending.get('signal_ts') or 0) if ut_pending and ut_pending_source == 'flip' else None
+                    ),
+                    ut_flip_signal_ts_human=(
+                        datetime.fromtimestamp(int(ut_pending.get('signal_ts') or 0) / 1000).strftime('%m-%d %H:%M')
+                        if ut_pending and ut_pending_source == 'flip' and int(ut_pending.get('signal_ts') or 0) else None
+                    ),
+                    ut_flip_execute_ts=(
+                        ut_pending_execute_ts if ut_pending and ut_pending_source == 'flip' and ut_pending_execute_ts else None
+                    ),
+                    ut_flip_execute_ts_human=(
+                        datetime.fromtimestamp(ut_pending_execute_ts / 1000).strftime('%m-%d %H:%M')
+                        if ut_pending and ut_pending_source == 'flip' and ut_pending_execute_ts else None
+                    ),
+                    ut_flip_expires_ts=(
+                        ut_pending_expires_ts if ut_pending and ut_pending_source == 'flip' and ut_pending_expires_ts else None
+                    ),
+                    ut_flip_expires_ts_human=(
+                        datetime.fromtimestamp(ut_pending_expires_ts / 1000).strftime('%m-%d %H:%M')
+                        if ut_pending and ut_pending_source == 'flip' and ut_pending_expires_ts else None
+                    ),
+                    ut_flip_retry_count=(
+                        int(ut_pending.get('retry_count') or 0) if ut_pending and ut_pending_source == 'flip' else None
+                    ),
+                    ut_flip_block_reason=(
+                        ut_pending.get('block_reason') if ut_pending and ut_pending_source == 'flip' else None
                     ),
                     feed_last_ts=feed_last_ts,
                     feed_last_ts_human=datetime.fromtimestamp(feed_last_ts / 1000).strftime('%m-%d %H:%M') if feed_last_ts else None,
@@ -11835,6 +12287,30 @@ class MainController:
                             msg += f"UT 확정봉: `{stateful_diag.get('closed_ohlc_text')}`\n"
                         if stateful_diag.get('live_ohlc_text'):
                             msg += f"UT 진행봉: `{stateful_diag.get('live_ohlc_text')}`\n"
+                        if stateful_diag.get('ut_pending_source'):
+                            pending_line = (
+                                f"UT pending: source `{stateful_diag.get('ut_pending_source')}` | "
+                                f"side `{stateful_diag.get('ut_pending_side', '-')}` | "
+                                f"state `{stateful_diag.get('ut_pending_state', '-')}` | "
+                                f"execute `{stateful_diag.get('ut_pending_execute_ts_human', '-')}`"
+                            )
+                            if stateful_diag.get('ut_pending_expires_ts_human'):
+                                pending_line += f" | expires `{stateful_diag.get('ut_pending_expires_ts_human')}`"
+                            msg += pending_line + "\n"
+                        if stateful_diag.get('ut_flip_target_side'):
+                            flip_line = (
+                                f"UTBOT flip: target `{stateful_diag.get('ut_flip_target_side')}` | "
+                                f"signal `{stateful_diag.get('ut_flip_signal_ts_human', '-')}`"
+                            )
+                            if stateful_diag.get('ut_flip_execute_ts_human'):
+                                flip_line += f" | execute `{stateful_diag.get('ut_flip_execute_ts_human')}`"
+                            if stateful_diag.get('ut_flip_expires_ts_human'):
+                                flip_line += f" | expires `{stateful_diag.get('ut_flip_expires_ts_human')}`"
+                            if stateful_diag.get('ut_flip_retry_count') is not None:
+                                flip_line += f" | retry `{stateful_diag.get('ut_flip_retry_count')}`"
+                            msg += flip_line + "\n"
+                        if stateful_diag.get('ut_flip_block_reason'):
+                            msg += f"UTBOT flip 차단사유: `{stateful_diag.get('ut_flip_block_reason')}`\n"
                         if (
                             stateful_diag.get('utsmc_entry_bullish_ob_entry') is not None
                             or stateful_diag.get('utsmc_entry_bearish_ob_entry') is not None
