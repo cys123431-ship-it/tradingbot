@@ -319,6 +319,7 @@ class TradingConfig:
                         'key_value': 1.0,
                         'atr_period': 10,
                         'use_heikin_ashi': False,
+                        'rsi_momentum_filter_enabled': False,
                         'filter_pack': build_default_utbot_filter_pack()
                     },
                     'UTSMC': {
@@ -337,6 +338,12 @@ class TradingConfig:
                         'rsi_length': 6,
                         'bb_length': 200,
                         'bb_mult': 2.0
+                    },
+                    'RSIMomentumTrend': {
+                        'rsi_length': 14,
+                        'positive_above': 65,
+                        'negative_below': 32,
+                        'ema_period': 5
                     },
                     'Cameron': {
                         'rsi_period': 14,
@@ -470,6 +477,7 @@ class TradingConfig:
                 'key_value': 1.0,
                 'atr_period': 10,
                 'use_heikin_ashi': False,
+                'rsi_momentum_filter_enabled': False,
                 'filter_pack': build_default_utbot_filter_pack()
             },
             'UTSMC': {
@@ -489,6 +497,12 @@ class TradingConfig:
                 'rsi_length': 6,
                 'bb_length': 200,
                 'bb_mult': 2.0
+            },
+            'RSIMomentumTrend': {
+                'rsi_length': 14,
+                'positive_above': 65,
+                'negative_below': 32,
+                'ema_period': 5
             },
             'Cameron': {
                 'rsi_period': 14,
@@ -680,7 +694,8 @@ class TradingConfig:
             'UTBot': {
                 'key_value': 1.0,
                 'atr_period': 10,
-                'use_heikin_ashi': False
+                'use_heikin_ashi': False,
+                'rsi_momentum_filter_enabled': False
             },
             'kalman_filter': {
                 'entry_enabled': False,
@@ -760,6 +775,7 @@ class TradingConfig:
                         "key_value": 1.0,
                         "atr_period": 10,
                         "use_heikin_ashi": False,
+                        "rsi_momentum_filter_enabled": False,
                         "filter_pack": build_default_utbot_filter_pack()
                     },
                     "UTSMC": {
@@ -778,6 +794,12 @@ class TradingConfig:
                         "rsi_length": 6,
                         "bb_length": 200,
                         "bb_mult": 2.0
+                    },
+                    "RSIMomentumTrend": {
+                        "rsi_length": 14,
+                        "positive_above": 65,
+                        "negative_below": 32,
+                        "ema_period": 5
                     },
                     "Cameron": {
                         "rsi_period": 14,
@@ -829,7 +851,8 @@ class TradingConfig:
                     "UTBot": {
                         "key_value": 1.0,
                         "atr_period": 10,
-                        "use_heikin_ashi": False
+                        "use_heikin_ashi": False,
+                        "rsi_momentum_filter_enabled": False
                     },
                     "kalman_filter": {
                         "entry_enabled": False,
@@ -1816,6 +1839,7 @@ class SignalEngine(BaseEngine):
         self.last_entry_filter_status = {} # symbol -> {r2_val, ...}
         self.last_exit_filter_status = {}  # symbol -> {r2_val, ...}
         self.last_utbot_filter_pack_status = {}  # symbol -> UTBot filter pack diagnostics
+        self.last_utbot_rsi_momentum_filter_status = {}  # symbol -> UTBot RSI Momentum filter diagnostics
         self.last_utsmc_candidate_filter_status = {}  # symbol -> candidate filter diagnostics
         self.last_entry_reason = {}        # symbol -> latest entry decision reason
 
@@ -1853,6 +1877,7 @@ class SignalEngine(BaseEngine):
         self.last_entry_filter_status = {}
         self.last_exit_filter_status = {}
         self.last_utbot_filter_pack_status = {}
+        self.last_utbot_rsi_momentum_filter_status = {}
         self.last_utsmc_candidate_filter_status = {}
         self.last_entry_reason = {}
         self.pending_reentry = {}
@@ -1977,6 +2002,18 @@ class SignalEngine(BaseEngine):
         utbot_cfg = params.get('UTBot', {}) if isinstance(params, dict) else {}
         return normalize_utbot_filter_pack_config(utbot_cfg.get('filter_pack', {}))
 
+    def _get_utbot_rsi_momentum_filter_config(self, strategy_params=None):
+        params = strategy_params if isinstance(strategy_params, dict) else self.get_runtime_strategy_params()
+        utbot_cfg = params.get('UTBot', {}) if isinstance(params, dict) else {}
+        rsi_cfg = params.get('RSIMomentumTrend', {}) if isinstance(params, dict) else {}
+        return {
+            'enabled': bool(utbot_cfg.get('rsi_momentum_filter_enabled', False)),
+            'rsi_length': max(1, int(rsi_cfg.get('rsi_length', 14) or 14)),
+            'positive_above': float(rsi_cfg.get('positive_above', 65) or 65),
+            'negative_below': float(rsi_cfg.get('negative_below', 32) or 32),
+            'ema_period': max(1, int(rsi_cfg.get('ema_period', 5) or 5))
+        }
+
     def _get_utbot_filter_pack_htf(self, tf):
         tf_text = str(tf or '').strip()
         if not tf_text:
@@ -2017,6 +2054,16 @@ class SignalEngine(BaseEngine):
             if isinstance(symbol_status, dict):
                 symbol_status['utbot_filter_pack'] = current
 
+    def _store_utbot_rsi_momentum_filter_status(self, symbol, phase, evaluation, strategy_params=None):
+        current = dict(self.last_utbot_rsi_momentum_filter_status.get(symbol, {}) or {})
+        current['config'] = self._get_utbot_rsi_momentum_filter_config(strategy_params)
+        current[phase] = evaluation or {}
+        self.last_utbot_rsi_momentum_filter_status[symbol] = current
+        if isinstance(self.ctrl.status_data, dict):
+            symbol_status = self.ctrl.status_data.get(symbol)
+            if isinstance(symbol_status, dict):
+                symbol_status['utbot_rsi_momentum_filter'] = current
+
     def _build_utbot_filter_pack_side_text(self, evaluation, side):
         if side not in {'long', 'short'}:
             return 'UTBot filter pack off'
@@ -2044,6 +2091,76 @@ class SignalEngine(BaseEngine):
         pass_key = 'long_pass' if side == 'long' else 'short_pass'
         allowed = bool(evaluation.get(pass_key, False))
         return allowed, self._build_utbot_filter_pack_side_text(evaluation, side)
+
+    def _build_utbot_rsi_momentum_filter_side_text(self, evaluation, side):
+        if side not in {'long', 'short'}:
+            return 'RSI Momentum Trend filter off'
+        if not isinstance(evaluation, dict) or not evaluation.get('enabled', False):
+            return 'RSI Momentum Trend filter off'
+        pass_key = 'long_pass' if side == 'long' else 'short_pass'
+        reason_key = 'reason_long' if side == 'long' else 'reason_short'
+        status_text = 'PASS' if evaluation.get(pass_key, False) else 'FAIL'
+        return f"RSI Momentum Trend {status_text} ({evaluation.get(reason_key, '-')})"
+
+    def _utbot_rsi_momentum_filter_allows(self, evaluation, side):
+        if side not in {'long', 'short'}:
+            return True, 'RSI Momentum Trend filter off'
+        if not isinstance(evaluation, dict) or not evaluation.get('enabled', False):
+            return True, 'RSI Momentum Trend filter off'
+        pass_key = 'long_pass' if side == 'long' else 'short_pass'
+        allowed = bool(evaluation.get(pass_key, False))
+        return allowed, self._build_utbot_rsi_momentum_filter_side_text(evaluation, side)
+
+    def _evaluate_utbot_rsi_momentum_filter(self, df, strategy_params, phase='entry'):
+        config = self._get_utbot_rsi_momentum_filter_config(strategy_params)
+        evaluation = {
+            'phase': phase,
+            'enabled': bool(config.get('enabled', False)),
+            'long_pass': True,
+            'short_pass': True,
+            'reason_long': 'RSI Momentum Trend filter off',
+            'reason_short': 'RSI Momentum Trend filter off',
+            'detail': {}
+        }
+        if not evaluation['enabled']:
+            return evaluation
+
+        signal_side, reason, detail = self._calculate_rsi_momentum_trend_signal(df, strategy_params)
+        state_side = str(detail.get('state_side') or '').lower()
+        base_reason = reason or 'RSI Momentum Trend 상태 대기'
+
+        evaluation['detail'] = detail or {}
+        evaluation['signal_side'] = signal_side
+        evaluation['state_side'] = state_side or None
+
+        if phase == 'exit':
+            evaluation['long_pass'] = state_side == 'short'
+            evaluation['short_pass'] = state_side == 'long'
+            evaluation['reason_long'] = (
+                f"{base_reason} | SHORT 반전 확인"
+                if evaluation['long_pass'] else
+                f"{base_reason} | SHORT 반전 미확인"
+            )
+            evaluation['reason_short'] = (
+                f"{base_reason} | LONG 반전 확인"
+                if evaluation['short_pass'] else
+                f"{base_reason} | LONG 반전 미확인"
+            )
+        else:
+            evaluation['long_pass'] = state_side == 'long'
+            evaluation['short_pass'] = state_side == 'short'
+            evaluation['reason_long'] = (
+                f"{base_reason} | LONG 상태 일치"
+                if evaluation['long_pass'] else
+                f"{base_reason} | LONG 상태 대기"
+            )
+            evaluation['reason_short'] = (
+                f"{base_reason} | SHORT 상태 일치"
+                if evaluation['short_pass'] else
+                f"{base_reason} | SHORT 상태 대기"
+            )
+
+        return evaluation
 
     def _calculate_utbot_filter_pack_chop(self, closed, length=14):
         if closed is None or len(closed) < (length + 1):
@@ -4214,6 +4331,120 @@ class SignalEngine(BaseEngine):
         reason = f"RSI 대기: RSI={curr_rsi:.2f}, len={rsi_length}"
         return None, reason, detail
 
+    def _calculate_rsi_momentum_trend_signal(self, df, strategy_params):
+        cfg = strategy_params.get('RSIMomentumTrend', {}) or {}
+        rsi_length = max(1, int(cfg.get('rsi_length', 14) or 14))
+        positive_above = float(cfg.get('positive_above', 65) or 65)
+        negative_below = float(cfg.get('negative_below', 32) or 32)
+        ema_period = max(1, int(cfg.get('ema_period', 5) or 5))
+
+        closed = df.iloc[:-1].copy().reset_index(drop=True)
+        min_bars = max(rsi_length + ema_period + 5, 30)
+        if len(closed) < min_bars:
+            return None, "RSI Momentum Trend 데이터 부족", {}
+
+        close_series = closed['close'].astype(float)
+        rsi_series = ta.rsi(close_series, length=rsi_length)
+        ema_series = ta.ema(close_series, length=ema_period)
+        ema_change = ema_series.diff()
+
+        valid = pd.DataFrame({
+            'timestamp': closed['timestamp'],
+            'close': close_series,
+            'rsi': rsi_series,
+            'ema': ema_series,
+            'ema_change': ema_change
+        }).dropna().reset_index(drop=True)
+        if len(valid) < 2:
+            return None, "RSI Momentum Trend 지표 확정 대기", {}
+
+        state_side = None
+        state_ts = None
+        signal_side = None
+        signal_ts = None
+
+        for idx, row in valid.iterrows():
+            curr_rsi = float(row['rsi'])
+            curr_ema_change = float(row['ema_change'])
+            prev_rsi = float(valid.iloc[idx - 1]['rsi']) if idx > 0 else np.nan
+
+            p_mom = (
+                idx > 0
+                and prev_rsi < positive_above
+                and curr_rsi > positive_above
+                and curr_rsi > negative_below
+                and curr_ema_change > 0
+            )
+            n_mom = curr_rsi < negative_below and curr_ema_change < 0
+
+            current_bar_signal = None
+            if p_mom:
+                state_side = 'long'
+                state_ts = int(row['timestamp'])
+                current_bar_signal = 'long'
+            elif n_mom:
+                state_side = 'short'
+                state_ts = int(row['timestamp'])
+                current_bar_signal = 'short'
+
+            if idx == (len(valid) - 1):
+                signal_side = current_bar_signal
+                signal_ts = int(row['timestamp']) if current_bar_signal else None
+
+        curr_row = valid.iloc[-1]
+        curr_rsi = float(curr_row['rsi'])
+        curr_ema = float(curr_row['ema'])
+        curr_ema_change = float(curr_row['ema_change'])
+
+        detail = {
+            'rsi_length': rsi_length,
+            'positive_above': positive_above,
+            'negative_below': negative_below,
+            'ema_period': ema_period,
+            'curr_rsi': curr_rsi,
+            'curr_close': float(curr_row['close']),
+            'curr_ema': curr_ema,
+            'curr_ema_change': curr_ema_change,
+            'state_side': state_side,
+            'state_ts': state_ts,
+            'signal_side': signal_side,
+            'signal_ts': signal_ts
+        }
+
+        if signal_side == 'long':
+            reason = (
+                f"RSI Momentum LONG: RSI {positive_above:.1f} 상향 + "
+                f"EMA({ema_period}) 상승 (RSI={curr_rsi:.2f})"
+            )
+            return 'long', reason, detail
+
+        if signal_side == 'short':
+            reason = (
+                f"RSI Momentum SHORT: RSI {negative_below:.1f} 아래 + "
+                f"EMA({ema_period}) 하락 (RSI={curr_rsi:.2f})"
+            )
+            return 'short', reason, detail
+
+        if state_side == 'long':
+            reason = (
+                f"RSI Momentum 상태 유지 (LONG): RSI={curr_rsi:.2f}, "
+                f"EMA({ema_period}) 변화={curr_ema_change:.4f}"
+            )
+            return None, reason, detail
+
+        if state_side == 'short':
+            reason = (
+                f"RSI Momentum 상태 유지 (SHORT): RSI={curr_rsi:.2f}, "
+                f"EMA({ema_period}) 변화={curr_ema_change:.4f}"
+            )
+            return None, reason, detail
+
+        reason = (
+            f"RSI Momentum 대기: RSI={curr_rsi:.2f}, "
+            f"EMA({ema_period}) 변화={curr_ema_change:.4f}"
+        )
+        return None, reason, detail
+
     def _calculate_bb_signal(self, df, strategy_params):
         cfg = strategy_params.get('RSIBB', {})
         bb_length = max(2, int(cfg.get('bb_length', 200) or 200))
@@ -5451,6 +5682,21 @@ class SignalEngine(BaseEngine):
                                     f"({filter_reason})"
                                 )
                                 continue
+                            utbot_rsi_momentum_entry_eval = self._evaluate_utbot_rsi_momentum_filter(
+                                df,
+                                scan_params,
+                                'entry'
+                            )
+                            allowed, filter_reason = self._utbot_rsi_momentum_filter_allows(
+                                utbot_rsi_momentum_entry_eval,
+                                sig
+                            )
+                            if not allowed:
+                                logger.info(
+                                    f"🚫 Scanner Skip {symbol}: RSI Momentum Trend filter blocked "
+                                    f"({filter_reason})"
+                                )
+                                continue
                         elif active_strategy == 'utsmc':
                             utsmc_detail = strategy_context.get('raw_hybrid_detail', {}) or {}
                             allowed, candidate_reason = self._utsmc_candidate_filter_allows(utsmc_detail, sig, is_persistent=False)
@@ -5576,6 +5822,9 @@ class SignalEngine(BaseEngine):
             utbot_filter_pack_status = dict(self.last_utbot_filter_pack_status.get(symbol, {}) or {})
             utbot_filter_pack_status.setdefault('config', self._get_utbot_filter_pack(strategy_params))
             symbol_status['utbot_filter_pack'] = utbot_filter_pack_status
+            utbot_rsi_momentum_status = dict(self.last_utbot_rsi_momentum_filter_status.get(symbol, {}) or {})
+            utbot_rsi_momentum_status.setdefault('config', self._get_utbot_rsi_momentum_filter_config(strategy_params))
+            symbol_status['utbot_rsi_momentum_filter'] = utbot_rsi_momentum_status
             candidate_status = self.last_utsmc_candidate_filter_status.get(symbol, {})
             symbol_status['utsmc_candidate_filter_mode'] = candidate_status.get('mode_label', 'OFF')
             symbol_status['utsmc_candidate_filter'] = candidate_status
@@ -5961,7 +6210,20 @@ class SignalEngine(BaseEngine):
         self._append_signal_diag_lines(lines, diag, include_exit=True)
         return "\n".join(lines)
 
-    async def _handle_utbot_primary_strategy(self, symbol, k, pos, strategy_name, raw_strategy_sig, raw_state_sig, raw_ut_detail, sig, filter_pack_entry=None):
+    async def _handle_utbot_primary_strategy(
+        self,
+        symbol,
+        k,
+        pos,
+        strategy_name,
+        raw_strategy_sig,
+        raw_state_sig,
+        raw_ut_detail,
+        sig,
+        filter_pack_entry=None,
+        rsi_momentum_entry_eval=None,
+        rsi_momentum_exit_eval=None
+    ):
         target_sig = raw_state_sig
         entry_sig = sig
         current_ts = int(k.get('t') or 0)
@@ -5982,6 +6244,24 @@ class SignalEngine(BaseEngine):
 
         def _entry_filter_gate(side, *, persistent=False):
             allowed, filter_reason = self._utbot_filter_pack_allows_entry(filter_pack_entry, side)
+            if not allowed:
+                suffix = " | persistent=Y" if persistent else ""
+                self.last_entry_reason[symbol] = (
+                    f"{strategy_name} {side.upper()} 진입 필터 차단 ({filter_reason})"
+                )
+                self._update_stateful_diag(
+                    symbol,
+                    stage='entry_blocked',
+                    strategy=strategy_name,
+                    raw_state=(target_sig or 'none'),
+                    raw_signal=(raw_strategy_sig or 'none'),
+                    entry_sig=(side or 'none'),
+                    pos_side='NONE',
+                    note=f"utbot filter pack blocked | reason={filter_reason}{suffix}"
+                )
+                return False, filter_reason
+
+            allowed, filter_reason = self._utbot_rsi_momentum_filter_allows(rsi_momentum_entry_eval, side)
             if allowed:
                 return True, filter_reason
             suffix = " | persistent=Y" if persistent else ""
@@ -5996,7 +6276,7 @@ class SignalEngine(BaseEngine):
                 raw_signal=(raw_strategy_sig or 'none'),
                 entry_sig=(side or 'none'),
                 pos_side='NONE',
-                note=f"utbot filter pack blocked | reason={filter_reason}{suffix}"
+                note=f"rsi momentum filter blocked | reason={filter_reason}{suffix}"
             )
             return False, filter_reason
 
@@ -6006,6 +6286,9 @@ class SignalEngine(BaseEngine):
                     f"{strategy_name} SELL 상태 감지, 청산은 exit TF `{self._get_exit_timeframe(symbol)}` 확인 후 실행"
                 )
             elif not pos and entry_sig == 'long':
+                allowed, _ = _entry_filter_gate('long')
+                if not allowed:
+                    return
                 self.last_entry_reason[symbol] = f"{strategy_name} BUY 상태 -> 현물 매수"
                 logger.info(f"[{strategy_name}] Upbit spot entry LONG")
                 await self.entry(symbol, 'long', float(k['c']))
@@ -6045,15 +6328,22 @@ class SignalEngine(BaseEngine):
             pending_source = None
             is_flip_pending = False
 
-        need_flip = pos and target_sig and (
+        raw_flip_detected = pos and target_sig and (
             (pos['side'] == 'long' and target_sig == 'short') or
             (pos['side'] == 'short' and target_sig == 'long')
         )
 
         exit_tf = self._get_exit_timeframe(symbol)
         flip_on_entry_tf = self._timeframes_equivalent(exit_tf, tf)
+        flip_filter_confirmed = True
+        flip_filter_reason = 'RSI Momentum Trend filter off'
+        if raw_flip_detected and flip_on_entry_tf:
+            flip_filter_confirmed, flip_filter_reason = self._utbot_rsi_momentum_filter_allows(
+                rsi_momentum_exit_eval,
+                str(pos['side']).lower()
+            )
 
-        if pos and need_flip and not flip_on_entry_tf:
+        if pos and raw_flip_detected and not flip_on_entry_tf:
             self._clear_ut_pending_entry(symbol)
             flip_label = "반전 신호" if raw_strategy_sig == target_sig else "상태 동기화"
             self.last_entry_reason[symbol] = (
@@ -6070,7 +6360,25 @@ class SignalEngine(BaseEngine):
                 note=f"{flip_label} detected on entry TF | exit_tf={exit_tf}"
             )
             return
-        if need_flip:
+        if pos and raw_flip_detected and flip_on_entry_tf and not flip_filter_confirmed:
+            self._clear_ut_pending_entry(symbol)
+            flip_label = "반전 신호" if raw_strategy_sig == target_sig else "상태 동기화"
+            self.last_entry_reason[symbol] = (
+                f"{strategy_name} {flip_label} 감지, RSI Momentum Trend 반전 미확인으로 "
+                f"{pos['side'].upper()} 유지 ({flip_filter_reason})"
+            )
+            self._update_stateful_diag(
+                symbol,
+                stage='exit_wait',
+                strategy=strategy_name,
+                raw_state=(target_sig or 'none'),
+                raw_signal=(raw_strategy_sig or 'none'),
+                entry_sig=(entry_sig or 'none'),
+                pos_side=str(pos['side']).upper(),
+                note=f"{flip_label} blocked by rsi momentum filter | reason={flip_filter_reason}"
+            )
+            return
+        if pos and raw_flip_detected and flip_on_entry_tf and flip_filter_confirmed:
             flip_label = "반전 신호" if raw_strategy_sig == target_sig else "상태 동기화"
             reentry_allowed = False
             reentry_filter_reason = None
@@ -6080,7 +6388,7 @@ class SignalEngine(BaseEngine):
             retry_count = int(pending.get('retry_count') or 0) if is_flip_pending and pending.get('side') == target_sig else 0
 
             if can_reenter:
-                reentry_allowed, reentry_filter_reason = self._utbot_filter_pack_allows_entry(filter_pack_entry, entry_sig)
+                reentry_allowed, reentry_filter_reason = _entry_filter_gate(entry_sig)
                 if reentry_allowed:
                     self._set_ut_pending_entry(
                         symbol,
@@ -6953,6 +7261,8 @@ class SignalEngine(BaseEngine):
             )
             strategy_sig = sig
             utbot_entry_filter_eval = None
+            utbot_rsi_momentum_entry_eval = None
+            utbot_rsi_momentum_exit_eval = None
             if active_strategy == 'utbot':
                 utbot_entry_filter_eval = await self._evaluate_utbot_filter_pack(
                     symbol,
@@ -6962,6 +7272,28 @@ class SignalEngine(BaseEngine):
                     'entry'
                 )
                 self._store_utbot_filter_pack_status(symbol, 'entry', utbot_entry_filter_eval, strategy_params)
+                utbot_rsi_momentum_entry_eval = self._evaluate_utbot_rsi_momentum_filter(
+                    df,
+                    strategy_params,
+                    'entry'
+                )
+                utbot_rsi_momentum_exit_eval = self._evaluate_utbot_rsi_momentum_filter(
+                    df,
+                    strategy_params,
+                    'exit'
+                )
+                self._store_utbot_rsi_momentum_filter_status(
+                    symbol,
+                    'entry',
+                    utbot_rsi_momentum_entry_eval,
+                    strategy_params
+                )
+                self._store_utbot_rsi_momentum_filter_status(
+                    symbol,
+                    'exit',
+                    utbot_rsi_momentum_exit_eval,
+                    strategy_params
+                )
             
             # 留ㅻℓ 諛⑺뼢 ?꾪꽣
             d_mode = self.ctrl.get_effective_trade_direction()
@@ -7186,7 +7518,9 @@ class SignalEngine(BaseEngine):
                     raw_state_sig,
                     raw_ut_detail,
                     sig,
-                    utbot_entry_filter_eval
+                    utbot_entry_filter_eval,
+                    utbot_rsi_momentum_entry_eval,
+                    utbot_rsi_momentum_exit_eval
                 )
 
             elif active_strategy == 'utsmc':
@@ -7630,6 +7964,17 @@ class SignalEngine(BaseEngine):
                     'exit'
                 )
                 self._store_utbot_filter_pack_status(symbol, 'exit', utbot_exit_eval, strategy_params)
+                utbot_rsi_exit_eval = self._evaluate_utbot_rsi_momentum_filter(
+                    df,
+                    strategy_params,
+                    'exit'
+                )
+                self._store_utbot_rsi_momentum_filter_status(
+                    symbol,
+                    'exit',
+                    utbot_rsi_exit_eval,
+                    strategy_params
+                )
 
                 confirm_selected = utbot_exit_eval.get('confirm_selected', [])
                 signal_selected = utbot_exit_eval.get('signal_selected', [])
@@ -7637,6 +7982,9 @@ class SignalEngine(BaseEngine):
                 confirm_short_pass = bool(utbot_exit_eval.get('confirm_short_pass', True))
                 signal_long_trigger = bool(utbot_exit_eval.get('signal_long_trigger', False))
                 signal_short_trigger = bool(utbot_exit_eval.get('signal_short_trigger', False))
+                rsi_exit_long_pass = bool(utbot_rsi_exit_eval.get('long_pass', True))
+                rsi_exit_short_pass = bool(utbot_rsi_exit_eval.get('short_pass', True))
+                rsi_filter_enabled = bool(utbot_rsi_exit_eval.get('enabled', False))
 
                 def _collect_utbot_exit_filter_text(filter_ids, side):
                     reason_key = 'reason_long' if side == 'long' else 'reason_short'
@@ -7651,8 +7999,12 @@ class SignalEngine(BaseEngine):
                             )
                     return " | ".join(parts)
 
-                raw_exit_long = (base_exit_long and confirm_long_pass) or signal_long_trigger
-                raw_exit_short = (base_exit_short and confirm_short_pass) or signal_short_trigger
+                if rsi_filter_enabled:
+                    raw_exit_long = base_exit_long and confirm_long_pass and rsi_exit_long_pass
+                    raw_exit_short = base_exit_short and confirm_short_pass and rsi_exit_short_pass
+                else:
+                    raw_exit_long = (base_exit_long and confirm_long_pass) or signal_long_trigger
+                    raw_exit_short = (base_exit_short and confirm_short_pass) or signal_short_trigger
 
                 if current_side.lower() == 'long':
                     exit_reason_parts = []
@@ -7666,11 +8018,15 @@ class SignalEngine(BaseEngine):
                                 )
                         else:
                             exit_reason_parts.append(exit_reason)
-                    if signal_long_trigger:
+                    if signal_long_trigger and not rsi_filter_enabled:
                         signal_text = _collect_utbot_exit_filter_text(signal_selected, 'long')
                         exit_reason_parts.append(
                             f"UTBOT FILTER SIGNAL EXIT | {format_utbot_filter_pack_logic(utbot_exit_eval.get('logic', 'and'))} "
                             f"{signal_text or 'PASS'}"
+                        )
+                    if (base_exit_long or signal_long_trigger) and utbot_rsi_exit_eval.get('enabled', False) and rsi_exit_long_pass:
+                        exit_reason_parts.append(
+                            f"RSI Momentum Trend confirm ({utbot_rsi_exit_eval.get('reason_long', 'PASS')})"
                         )
                     if exit_reason_parts:
                         exit_reason = " | ".join(exit_reason_parts)
@@ -7686,11 +8042,15 @@ class SignalEngine(BaseEngine):
                                 )
                         else:
                             exit_reason_parts.append(exit_reason)
-                    if signal_short_trigger:
+                    if signal_short_trigger and not rsi_filter_enabled:
                         signal_text = _collect_utbot_exit_filter_text(signal_selected, 'short')
                         exit_reason_parts.append(
                             f"UTBOT FILTER SIGNAL EXIT | {format_utbot_filter_pack_logic(utbot_exit_eval.get('logic', 'and'))} "
                             f"{signal_text or 'PASS'}"
+                        )
+                    if (base_exit_short or signal_short_trigger) and utbot_rsi_exit_eval.get('enabled', False) and rsi_exit_short_pass:
+                        exit_reason_parts.append(
+                            f"RSI Momentum Trend confirm ({utbot_rsi_exit_eval.get('reason_short', 'PASS')})"
                         )
                     if exit_reason_parts:
                         exit_reason = " | ".join(exit_reason_parts)
@@ -10516,6 +10876,7 @@ class MainController:
         utbot_key = float(utbot_params.get('key_value', 1.0) or 1.0)
         utbot_atr = int(utbot_params.get('atr_period', 10) or 10)
         utbot_ha = "ON" if utbot_params.get('use_heikin_ashi', False) else "OFF"
+        utbot_rsi_momentum_enabled = "ON" if bool(utbot_params.get('rsi_momentum_filter_enabled', False)) else "OFF"
         utsmc_cfg = strategy_params.get('UTSMC', {}) or {}
         utsmc_filter_cfg = utsmc_cfg.get('candidate_filter', {})
         utsmc_filter_mode = self._format_utsmc_candidate_filter_mode(utsmc_filter_cfg.get('mode', 'off'))
@@ -10524,6 +10885,11 @@ class MainController:
         rsibb_rsi = int(rsibb_params.get('rsi_length', 6) or 6)
         rsibb_bb = int(rsibb_params.get('bb_length', 200) or 200)
         rsibb_mult = float(rsibb_params.get('bb_mult', 2.0) or 2.0)
+        rsi_momentum_params = strategy_params.get('RSIMomentumTrend', {}) or {}
+        rsi_momentum_rsi = int(rsi_momentum_params.get('rsi_length', 14) or 14)
+        rsi_momentum_pos = float(rsi_momentum_params.get('positive_above', 65) or 65)
+        rsi_momentum_neg = float(rsi_momentum_params.get('negative_below', 32) or 32)
+        rsi_momentum_ema = int(rsi_momentum_params.get('ema_period', 5) or 5)
         watchlist_preview = ", ".join(watchlist[:4]) if isinstance(watchlist, list) and watchlist else symbol
         if isinstance(watchlist, list) and len(watchlist) > 4:
             watchlist_preview += " ..."
@@ -10561,6 +10927,8 @@ class MainController:
 16. 전략 (`{active_strategy}`)
 19. UT Bot (`K={utbot_key:.2f}` / `ATR={utbot_atr}` / `HA={utbot_ha}`)
 20. RSI+BB 보조설정 (`RSI={rsibb_rsi}` / `BB={rsibb_bb}` / `x{rsibb_mult:.2f}`)
+57. RSI Momentum Trend (`RSI={rsi_momentum_rsi}` / `P>{rsi_momentum_pos:.0f}` / `N<{rsi_momentum_neg:.0f}` / `EMA={rsi_momentum_ema}`)
+58. UTBot + RSI Momentum (`{utbot_rsi_momentum_enabled}`)
 21. UT 전략 안내 (`UTBOT / UTRSI / UTBB / UTRSIBB / UTSMC`)
 51. UTBot 진입 필터 (`{utbot_entry_filters_text}`)
 52. UTBot 진입 결합모드 (`{utbot_entry_logic_text}`)
@@ -10630,13 +10998,15 @@ class MainController:
             '16': "📝 **전략 선택** (1=UTBOT, 2=UTRSIBB, 3=UTRSI, 4=UTBB, 5=UTSMC)",
             '19': "📝 **UT Bot 설정** 입력 (형식: key,atr,on/off 예: 1,10,off)",
             '20': "RSI/BB 보조설정 입력\n형식: RSI길이,BB길이,BB배수\n예: 6,200,2",
-            '21': "ℹ️ **UT 전략 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙, UTSMC는 26번 UT 진입 방식 + internal OB/UT 신호봉 무효화 청산을 사용합니다.\n- 49번: UTSMC 진입용 후보 필터(C1/C2)\n- 50번: 필요 시 exit TF 기준 반대 방향 C2를 보조 청산으로 OR 추가",
+            '21': "ℹ️ **UT 전략 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙, UTSMC는 26번 UT 진입 방식 + internal OB/UT 신호봉 무효화 청산을 사용합니다.\n- 57번: RSI Momentum Trend 파라미터 설정\n- 58번: UTBot에 RSI Momentum Trend 보조필터 ON/OFF\n- 49번: UTSMC 진입용 후보 필터(C1/C2)\n- 50번: 필요 시 exit TF 기준 반대 방향 C2를 보조 청산으로 OR 추가",
             '51': "📝 **UTBot 진입 필터** 입력\n`0/off` = OFF\n또는 `1,4,5` 형식으로 번호 조합 입력\n1=CHOP, 2=ADX+DMI, 3=VWAP, 4=HTF Supertrend, 5=BOS/CHoCH",
             '52': "📝 **UTBot 진입 결합모드** 입력\n`and` 또는 `or`",
             '53': "📝 **UTBot 청산 필터** 입력\n`0/off` = OFF\n또는 `2,3` 형식으로 번호 조합 입력\n1=CHOP, 2=ADX+DMI, 3=VWAP, 4=HTF Supertrend, 5=BOS/CHoCH",
             '54': "📝 **UTBot 청산 결합모드** 입력\n`and` 또는 `or`",
             '55': "📝 **UTBot 청산 필터 타입** 입력\n형식: `2:c,3:s,5:c`\n`c=confirm`, `s=signal`",
-            '56': "ℹ️ **UTBot 필터 안내**: 1=CHOP, 2=ADX+DMI, 3=VWAP, 4=HTF Supertrend, 5=BOS/CHoCH\n- 진입: 선택한 필터를 52번 AND/OR로 결합\n- 청산: 55번에서 각 필터를 `confirm`(기본 UT 반대신호 확인용) 또는 `signal`(단독 청산 트리거)로 지정\n- 예시: 진입 `1,4,5` / 청산 `2,3` / 타입 `2:c,3:s`",
+            '56': "ℹ️ **UTBot 필터 안내**: 1=CHOP, 2=ADX+DMI, 3=VWAP, 4=HTF Supertrend, 5=BOS/CHoCH\n- 진입: 선택한 필터를 52번 AND/OR로 결합\n- 청산: 55번에서 각 필터를 `confirm`(기본 UT 반대신호 확인용) 또는 `signal`(단독 청산 트리거)로 지정\n- 58번 RSI Momentum Trend는 일반 필터팩과 별도로, UTBot 진입/청산을 직접 확인하는 전용 보조필터\n- 예시: 진입 `1,4,5` / 청산 `2,3` / 타입 `2:c,3:s`",
+            '57': "📝 **RSI Momentum Trend 설정** 입력\n형식: RSI길이,PositiveAbove,NegativeBelow,EMA길이\n예: 14,65,32,5",
+            '58': "📝 **UTBot + RSI Momentum Trend 보조필터** 입력\n`on/off` 또는 `1/0` (`true/false`, `yes/no` 지원)\n- on: UTBot 진입은 둘 다 같은 방향일 때만, 청산/반전은 둘 다 반대 방향일 때만 실행\n- off: 순수 UTBot만 사용",
             '26': "📝 **UT 진입 방식** 입력\n`next` 또는 `1` = 시그널 마감봉 바로 다음봉에만 진입\n`persistent` 또는 `2` = fresh signal이 아니어도 현재 유지 중인 시그널이면 즉시 진입 대기/진입 (기준봉은 마지막 시그널 확정봉)",
             '49': "📝 **UTSMC 후보 필터** 입력\n`0/off` = OFF\n`1/c1` = 후보1 (Squeeze)\n`2/c2` = 후보2 (Breakout)\n`3/c12` = 후보1+2",
             '50': "📝 **UTSMC C2 청산** 입력\n`on/off` 또는 `1/0` (`true/false`, `yes/no` 지원)",
@@ -10657,7 +11027,7 @@ class MainController:
         if self.is_upbit_mode():
             blocked_choices = {
                 '1', '2', '3', '4', '5', '6', '8', '10', '11', '12', '13', '14', '15',
-                '16', '19', '20', '21', '23', '24', '25', '26', '35', '36', '37', '38', '41', '49', '50', '51', '52', '53', '54', '55', '56', '00'
+                '16', '19', '20', '21', '23', '24', '25', '26', '35', '36', '37', '38', '41', '49', '50', '51', '52', '53', '54', '55', '56', '57', '58', '00'
             }
             if text in blocked_choices:
                 await update.message.reply_text("ℹ️ 업비트 모드에서는 업비트 전용 메뉴(22, 43~48)만 사용합니다.")
@@ -10756,6 +11126,8 @@ class MainController:
                 "- 26번 UT 진입 방식: `다음봉 진입`은 시그널 마감 직후 다음 진행봉에서만 진입, `신호유지 진입`은 fresh signal이 아니어도 현재 유지 중인 시그널이면 즉시 진입 대기/진입하고 기준봉은 마지막 시그널 확정봉\n"
                 "- UTRSI: UT 방향 + RSI 타이밍 조합\n"
                 "- UTRSIBB: UT 방향 + RSI/BB 동시 타이밍 조합\n"
+                "- 57번 RSI Momentum Trend: Positive/Negative 상태 계산 파라미터 설정\n"
+                "- 58번 UTBot + RSI Momentum: UTBot 진입은 RSI Momentum Trend와 같은 방향일 때만, 청산/반전은 둘 다 반대 방향일 때만 실행\n"
                 "- UTBB LONG: UT 롱신호와 BB 롱신호가 순서 무관 3봉 내 일치하면 진입, 중간에 UT 숏 또는 BB 숏이 나오면 저장 무효\n"
                 "- UTBB LONG 청산: 일반롱은 UT 숏상태 또는 BB 상단 하향 돌파 또는 중간선 위 음봉 2개, 특수롱은 BB 상단 하향 돌파 또는 UT 숏상태\n"
                 "- UTBB 특수 LONG: UT 롱상태에서 BB 상단 상향 돌파가 나오면 진입\n"
@@ -11125,6 +11497,59 @@ class MainController:
                 )
                 await update.message.reply_text(
                     f"✅ RSI+BB 설정 변경: RSI={rsi_length}, BB={bb_length}, x{bb_mult:.2f}"
+                )
+
+            elif choice == '57':
+                parts = val.replace(' ', '').split(',')
+                if len(parts) != 4:
+                    await update.message.reply_text("❌ 형식: rsi_length,positive_above,negative_below,ema_period (예: 14,65,32,5)")
+                    return SELECT
+
+                rsi_length = int(parts[0])
+                positive_above = float(parts[1])
+                negative_below = float(parts[2])
+                ema_period = int(parts[3])
+                if rsi_length < 1 or ema_period < 1:
+                    await update.message.reply_text("❌ RSI 기간과 EMA 기간은 1 이상이어야 합니다.")
+                    return SELECT
+                if not (0 <= negative_below < positive_above <= 100):
+                    await update.message.reply_text("❌ 기준값은 `0 <= NegativeBelow < PositiveAbove <= 100` 이어야 합니다.")
+                    return SELECT
+
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'RSIMomentumTrend', 'rsi_length'], rsi_length)
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'RSIMomentumTrend', 'positive_above'], positive_above)
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'RSIMomentumTrend', 'negative_below'], negative_below)
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'RSIMomentumTrend', 'ema_period'], ema_period)
+                self._reset_signal_engine_runtime_state(
+                    reset_entry_cache=True,
+                    reset_exit_cache=True,
+                    reset_stateful_strategy=True
+                )
+                await update.message.reply_text(
+                    f"✅ RSI Momentum Trend 설정 변경: RSI={rsi_length}, P>{positive_above:.1f}, N<{negative_below:.1f}, EMA={ema_period}"
+                )
+
+            elif choice == '58':
+                toggle_raw = str(val or '').strip().lower()
+                if toggle_raw in {'1', 'on', 'true', 'yes'}:
+                    enabled = True
+                elif toggle_raw in {'0', 'off', 'false', 'no'}:
+                    enabled = False
+                else:
+                    await update.message.reply_text("❌ `on/off`, `1/0`, `true/false`, `yes/no` 중 하나를 입력하세요.")
+                    return SELECT
+
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBot', 'rsi_momentum_filter_enabled'],
+                    enabled
+                )
+                self._reset_signal_engine_runtime_state(
+                    reset_entry_cache=True,
+                    reset_exit_cache=True,
+                    reset_stateful_strategy=True
+                )
+                await update.message.reply_text(
+                    f"✅ UTBot + RSI Momentum Trend: {'ON' if enabled else 'OFF'}"
                 )
 
             elif choice in {'51', '53'}:
@@ -12549,6 +12974,8 @@ class MainController:
                     active_strat = d.get('active_strategy', '')
                     utbot_filter_pack = d.get('utbot_filter_pack', {}) or {}
                     utbot_filter_cfg = utbot_filter_pack.get('config', {}) if isinstance(utbot_filter_pack, dict) else {}
+                    utbot_rsi_momentum_filter = d.get('utbot_rsi_momentum_filter', {}) or {}
+                    utbot_rsi_cfg = utbot_rsi_momentum_filter.get('config', {}) if isinstance(utbot_rsi_momentum_filter, dict) else {}
                     if active_strat == 'UTBOT' and utbot_filter_cfg:
                         utbot_entry_cfg = utbot_filter_cfg.get('entry', {})
                         utbot_exit_cfg = utbot_filter_cfg.get('exit', {})
@@ -12590,6 +13017,31 @@ class MainController:
                                 f"UTBot 청산 {filter_id} `{label}`[{mode_label.upper()}]: "
                                 f"LONG `{long_status}` ({filter_detail.get('reason_long', '-')}) | "
                                 f"SHORT `{short_status}` ({filter_detail.get('reason_short', '-')})\n"
+                            )
+
+                    if active_strat == 'UTBOT' and utbot_rsi_cfg.get('enabled'):
+                        rsi_entry_eval = utbot_rsi_momentum_filter.get('entry', {}) if isinstance(utbot_rsi_momentum_filter.get('entry', {}), dict) else {}
+                        rsi_exit_eval = utbot_rsi_momentum_filter.get('exit', {}) if isinstance(utbot_rsi_momentum_filter.get('exit', {}), dict) else {}
+                        msg += (
+                            f"🧪 RSI Momentum Trend: `ON` | "
+                            f"`RSI {utbot_rsi_cfg.get('rsi_length', 14)}` / "
+                            f"`P>{float(utbot_rsi_cfg.get('positive_above', 65) or 65):.1f}` / "
+                            f"`N<{float(utbot_rsi_cfg.get('negative_below', 32) or 32):.1f}` / "
+                            f"`EMA {utbot_rsi_cfg.get('ema_period', 5)}`\n"
+                        )
+                        if rsi_entry_eval:
+                            long_status = 'PASS' if rsi_entry_eval.get('long_pass') else 'FAIL'
+                            short_status = 'PASS' if rsi_entry_eval.get('short_pass') else 'FAIL'
+                            msg += (
+                                f"RMT 진입: LONG `{long_status}` ({rsi_entry_eval.get('reason_long', '-')}) | "
+                                f"SHORT `{short_status}` ({rsi_entry_eval.get('reason_short', '-')})\n"
+                            )
+                        if rsi_exit_eval:
+                            long_status = 'PASS' if rsi_exit_eval.get('long_pass') else 'FAIL'
+                            short_status = 'PASS' if rsi_exit_eval.get('short_pass') else 'FAIL'
+                            msg += (
+                                f"RMT 청산확인: LONG `{long_status}` ({rsi_exit_eval.get('reason_long', '-')}) | "
+                                f"SHORT `{short_status}` ({rsi_exit_eval.get('reason_short', '-')})\n"
                             )
 
                     f_cfg = d.get('filter_config', {})
