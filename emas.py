@@ -7288,12 +7288,6 @@ class SignalEngine(BaseEngine):
                     utbot_rsi_momentum_entry_eval,
                     strategy_params
                 )
-                self._store_utbot_rsi_momentum_filter_status(
-                    symbol,
-                    'exit',
-                    utbot_rsi_momentum_exit_eval,
-                    strategy_params
-                )
             
             # 留ㅻℓ 諛⑺뼢 ?꾪꽣
             d_mode = self.ctrl.get_effective_trade_direction()
@@ -7953,9 +7947,10 @@ class SignalEngine(BaseEngine):
                     logger.info(f"[Exit Debug] {symbol} {strategy_name}: {exit_reason}")
             elif active_strategy == 'utbot':
                 strategy_name = "UTBOT(Exit)"
-                exit_sig, exit_reason, _ = self._calculate_utbot_signal(df, strategy_params)
-                base_exit_long = current_side.lower() == 'long' and exit_sig == 'short'
-                base_exit_short = current_side.lower() == 'short' and exit_sig == 'long'
+                exit_sig, exit_reason, utbot_exit_detail = self._calculate_utbot_signal(df, strategy_params)
+                exit_state = str(exit_sig or utbot_exit_detail.get('bias_side') or '').lower()
+                base_exit_long = current_side.lower() == 'long' and exit_state == 'short'
+                base_exit_short = current_side.lower() == 'short' and exit_state == 'long'
                 utbot_exit_eval = await self._evaluate_utbot_filter_pack(
                     symbol,
                     df,
@@ -8008,6 +8003,7 @@ class SignalEngine(BaseEngine):
 
                 if current_side.lower() == 'long':
                     exit_reason_parts = []
+                    long_trigger_present = base_exit_long if rsi_filter_enabled else (base_exit_long or signal_long_trigger)
                     if base_exit_long:
                         if confirm_selected:
                             if confirm_long_pass:
@@ -8024,7 +8020,7 @@ class SignalEngine(BaseEngine):
                             f"UTBOT FILTER SIGNAL EXIT | {format_utbot_filter_pack_logic(utbot_exit_eval.get('logic', 'and'))} "
                             f"{signal_text or 'PASS'}"
                         )
-                    if (base_exit_long or signal_long_trigger) and utbot_rsi_exit_eval.get('enabled', False) and rsi_exit_long_pass:
+                    if long_trigger_present and utbot_rsi_exit_eval.get('enabled', False) and rsi_exit_long_pass:
                         exit_reason_parts.append(
                             f"RSI Momentum Trend confirm ({utbot_rsi_exit_eval.get('reason_long', 'PASS')})"
                         )
@@ -8032,6 +8028,7 @@ class SignalEngine(BaseEngine):
                         exit_reason = " | ".join(exit_reason_parts)
                 elif current_side.lower() == 'short':
                     exit_reason_parts = []
+                    short_trigger_present = base_exit_short if rsi_filter_enabled else (base_exit_short or signal_short_trigger)
                     if base_exit_short:
                         if confirm_selected:
                             if confirm_short_pass:
@@ -8048,7 +8045,7 @@ class SignalEngine(BaseEngine):
                             f"UTBOT FILTER SIGNAL EXIT | {format_utbot_filter_pack_logic(utbot_exit_eval.get('logic', 'and'))} "
                             f"{signal_text or 'PASS'}"
                         )
-                    if (base_exit_short or signal_short_trigger) and utbot_rsi_exit_eval.get('enabled', False) and rsi_exit_short_pass:
+                    if short_trigger_present and utbot_rsi_exit_eval.get('enabled', False) and rsi_exit_short_pass:
                         exit_reason_parts.append(
                             f"RSI Momentum Trend confirm ({utbot_rsi_exit_eval.get('reason_short', 'PASS')})"
                         )
