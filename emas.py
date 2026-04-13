@@ -19,6 +19,8 @@ import re
 import atexit
 import signal
 import faulthandler
+import urllib.parse
+import urllib.request
 import ccxt
 import pandas as pd
 import pandas_ta as ta
@@ -99,6 +101,11 @@ UTBOT_FILTER_PACK_LABELS = {
     5: 'BOS/CHoCH'
 }
 UTBOT_FILTER_PACK_ID_SET = set(UTBOT_FILTER_PACK_LABELS.keys())
+ALT_TREND_ALLOWED_TIMEFRAMES = ['5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '1d']
+ALT_TREND_TIMEFRAME_ORDER = {
+    timeframe: idx for idx, timeframe in enumerate(ALT_TREND_ALLOWED_TIMEFRAMES)
+}
+BINANCE_FAPI_PUBLIC_BASE_URL = 'https://fapi.binance.com'
 
 
 def build_default_utbot_filter_pack():
@@ -222,6 +229,36 @@ def format_utbot_filter_pack_mode_map(mode_by_filter, selected=None):
         items.append(f"{filter_id}={'C' if mode == 'confirm' else 'S'}")
     return ", ".join(items) if items else 'OFF'
 
+
+def normalize_alt_trend_timeframes(timeframes):
+    if isinstance(timeframes, str):
+        raw_tokens = [token.strip().lower() for token in timeframes.split(',') if token.strip()]
+    elif isinstance(timeframes, (list, tuple, set)):
+        raw_tokens = [str(token or '').strip().lower() for token in timeframes if str(token or '').strip()]
+    else:
+        try:
+            raw_tokens = [str(token or '').strip().lower() for token in list(timeframes) if str(token or '').strip()]
+        except Exception:
+            raw_tokens = []
+
+    selected = []
+    seen = set()
+    for token in raw_tokens:
+        if token not in ALT_TREND_TIMEFRAME_ORDER:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        selected.append(token)
+
+    selected.sort(key=lambda timeframe: ALT_TREND_TIMEFRAME_ORDER.get(timeframe, 999))
+    return selected
+
+
+def format_alt_trend_timeframes(timeframes):
+    normalized = normalize_alt_trend_timeframes(timeframes)
+    return ", ".join(normalized) if normalized else 'OFF'
+
 # ??뷀삎 ?곹깭
 SELECT, INPUT, SYMBOL_INPUT, DIRECTION_SELECT, ENGINE_SELECT = range(5)
 
@@ -260,7 +297,13 @@ class TradingConfig:
             'telegram': {
                 'reporting': {
                     'hourly_report_enabled': True,
-                    'stateful_diag_enabled': False
+                    'stateful_diag_enabled': False,
+                    'alt_trend_alert_enabled': False,
+                    'alt_trend_alert_timeframes': ['1d'],
+                    'alt_trend_alert_scope': 'binance_futures_all',
+                    'alt_trend_alert_stage_mode': 'setup_and_confirm',
+                    'alt_trend_alert_profile': 'conservative',
+                    'alt_trend_alert_oi_cvd_mode': 'required'
                 }
             },
             'system_settings': {
@@ -718,6 +761,30 @@ class TradingConfig:
         if changed:
             self.save_config_sync()
 
+        reporting_cfg = self.config.setdefault('telegram', {}).setdefault('reporting', {})
+        normalized_timeframes = normalize_alt_trend_timeframes(
+            reporting_cfg.get('alt_trend_alert_timeframes', ['1d'])
+        ) or ['1d']
+        if reporting_cfg.get('alt_trend_alert_timeframes') != normalized_timeframes:
+            reporting_cfg['alt_trend_alert_timeframes'] = normalized_timeframes
+            changed = True
+
+        if str(reporting_cfg.get('alt_trend_alert_scope', 'binance_futures_all')).strip().lower() != 'binance_futures_all':
+            reporting_cfg['alt_trend_alert_scope'] = 'binance_futures_all'
+            changed = True
+        if str(reporting_cfg.get('alt_trend_alert_stage_mode', 'setup_and_confirm')).strip().lower() != 'setup_and_confirm':
+            reporting_cfg['alt_trend_alert_stage_mode'] = 'setup_and_confirm'
+            changed = True
+        if str(reporting_cfg.get('alt_trend_alert_profile', 'conservative')).strip().lower() != 'conservative':
+            reporting_cfg['alt_trend_alert_profile'] = 'conservative'
+            changed = True
+        if str(reporting_cfg.get('alt_trend_alert_oi_cvd_mode', 'required')).strip().lower() != 'required':
+            reporting_cfg['alt_trend_alert_oi_cvd_mode'] = 'required'
+            changed = True
+
+        if changed:
+            self.save_config_sync()
+
     def create_default_config(self):
         self.config = {
             "api": {
@@ -732,7 +799,13 @@ class TradingConfig:
                 "chat_id": "",
                 "reporting": {
                     "hourly_report_enabled": True,
-                    "stateful_diag_enabled": False
+                    "stateful_diag_enabled": False,
+                    "alt_trend_alert_enabled": False,
+                    "alt_trend_alert_timeframes": ["1d"],
+                    "alt_trend_alert_scope": "binance_futures_all",
+                    "alt_trend_alert_stage_mode": "setup_and_confirm",
+                    "alt_trend_alert_profile": "conservative",
+                    "alt_trend_alert_oi_cvd_mode": "required"
                 }
             },
             "system_settings": {
@@ -4236,6 +4309,106 @@ class SignalEngine(BaseEngine):
             )
 
         return detail
+
+    def _calculate_alt_trend_price_signal(self, symbol, df, strategy_params):
+        closed = df.iloc[:-1].copy().reset_index(drop=True)
+        min_bars = 80
+        if len(closed) < min_bars:
+            return None
+
+        close_series = closed['close'].astype(float)
+        volume_series = closed['volume'].astype(float)
+        ema21 = ta.ema(close_series, length=21)
+        sma50 = ta.sma(close_series, length=50)
+        rsi14 = ta.rsi(close_series, length=14)
+        volume_sma20 = ta.sma(volume_series, length=20)
+
+        indicator_df = closed.copy()
+        indicator_df['ema21'] = ema21
+        indicator_df['sma50'] = sma50
+        indicator_df['rsi14'] = rsi14
+        indicator_df['volume_sma20'] = volume_sma20
+        indicator_df = indicator_df.dropna().reset_index(drop=True)
+        if len(indicator_df) < 2:
+            return None
+
+        curr = indicator_df.iloc[-1]
+        prev = indicator_df.iloc[-2]
+        curr_close = float(curr['close'])
+        curr_rsi = float(curr['rsi14'])
+        curr_ema21 = float(curr['ema21'])
+        prev_ema21 = float(prev['ema21'])
+        curr_sma50 = float(curr['sma50'])
+        curr_volume = float(curr['volume'])
+        curr_volume_sma20 = float(curr['volume_sma20']) if float(curr['volume_sma20']) != 0 else np.nan
+        volume_ratio = curr_volume / curr_volume_sma20 if not np.isnan(curr_volume_sma20) else np.nan
+
+        if np.isnan(volume_ratio):
+            return None
+
+        candidate1 = self._calculate_utsmc_candidate1_filter(df, strategy_params)
+        candidate2 = self._calculate_utsmc_candidate2_filter(df, strategy_params)
+        candidate1_long_pass = bool(candidate1.get('long_pass', False))
+        candidate2_long_pass = bool(candidate2.get('long_pass', False))
+
+        box_high_raw = candidate2.get('box_high')
+        box_width_atr_raw = candidate2.get('box_width_atr')
+        box_high = float(box_high_raw) if box_high_raw is not None and not np.isnan(box_high_raw) else np.nan
+        box_width_atr = float(box_width_atr_raw) if box_width_atr_raw is not None and not np.isnan(box_width_atr_raw) else np.nan
+
+        compact_box_ready = (not np.isnan(box_width_atr)) and box_width_atr <= 1.8
+        near_box_high = (not np.isnan(box_high)) and curr_close <= (box_high * 1.03)
+        ema21_rising = curr_ema21 > prev_ema21
+        close_above_ema21 = curr_close > curr_ema21
+        close_above_sma50 = curr_close > curr_sma50
+
+        setup_ready = (
+            (candidate1_long_pass or (compact_box_ready and near_box_high))
+            and curr_rsi >= 55.0
+            and close_above_ema21
+            and ema21_rising
+            and volume_ratio >= 1.5
+        )
+
+        confirm_ready = (
+            candidate2_long_pass
+            and curr_rsi >= 58.0
+            and volume_ratio >= 2.0
+            and close_above_ema21
+            and close_above_sma50
+            and curr_close <= (curr_ema21 * 1.25)
+        )
+
+        if not setup_ready and not confirm_ready:
+            return None
+
+        score = (
+            (volume_ratio * 40.0)
+            + (max(0.0, curr_rsi - 50.0) * 2.0)
+            + (15.0 if candidate2_long_pass else 0.0)
+            + (10.0 if candidate1_long_pass else 0.0)
+            + (10.0 if close_above_sma50 else 0.0)
+        )
+
+        return {
+            'symbol': symbol,
+            'stage': 'confirm' if confirm_ready else 'setup',
+            'score': float(score),
+            'candle_ts': int(curr['timestamp']),
+            'curr_close': curr_close,
+            'curr_rsi': curr_rsi,
+            'curr_ema21': curr_ema21,
+            'curr_sma50': curr_sma50,
+            'volume_ratio': float(volume_ratio),
+            'candidate1_long_pass': candidate1_long_pass,
+            'candidate2_long_pass': candidate2_long_pass,
+            'candidate2_box_high': box_high,
+            'candidate2_box_width_atr': box_width_atr,
+            'setup_ready': bool(setup_ready),
+            'confirm_ready': bool(confirm_ready),
+            'close_above_sma50': bool(close_above_sma50),
+            'reason': candidate2.get('reason_long') if confirm_ready else candidate1.get('reason_long')
+        }
 
     def _calculate_utsmc_signal(self, df, strategy_params):
         ut_sig, ut_reason, ut_detail = self._calculate_utbot_signal(df, strategy_params)
@@ -10104,6 +10277,9 @@ class MainController:
         self.last_status_snapshot_key = None
         self.blink_state = False
         self.last_hourly_report = 0
+        self.last_alt_trend_scan_candle_ts_by_tf = {}
+        self.last_alt_trend_alert_sent = {}
+        self.last_alt_trend_scan_summary = {}
 
     def get_exchange_mode(self):
         api_cfg = self.cfg.get('api', {})
@@ -10423,6 +10599,379 @@ class MainController:
             lines.extend(["", "이전 실행 상태를 유지해 자동으로 재개되었습니다."])
         return "\n".join(lines)
 
+    def _get_alt_trend_alert_settings(self):
+        reporting = self.cfg.get('telegram', {}).get('reporting', {}) or {}
+        timeframes = normalize_alt_trend_timeframes(
+            reporting.get('alt_trend_alert_timeframes', ['1d'])
+        ) or ['1d']
+        return {
+            'enabled': bool(reporting.get('alt_trend_alert_enabled', False)),
+            'timeframes': timeframes,
+            'scope': 'binance_futures_all',
+            'stage_mode': 'setup_and_confirm',
+            'profile': 'conservative',
+            'oi_cvd_mode': 'required'
+        }
+
+    def _format_alt_trend_alert_item(self, item):
+        symbol_label = self.format_symbol_for_display(item.get('symbol', ''))
+        cvd_label = "▲" if float(item.get('cvd_delta', 0.0) or 0.0) > 0 else "▼"
+        return (
+            f"- `{symbol_label}` score `{float(item.get('score', 0.0) or 0.0):.1f}` | "
+            f"RSI `{float(item.get('curr_rsi', 0.0) or 0.0):.1f}` | "
+            f"Vol `x{float(item.get('volume_ratio', 0.0) or 0.0):.2f}` | "
+            f"OI `{float(item.get('oi_delta_pct', 0.0) or 0.0):+.2f}%` | "
+            f"CVD `{cvd_label}`"
+        )
+
+    def _build_alt_trend_alert_chunks(self, results_by_tf, scanned_timeframes=None):
+        if not results_by_tf:
+            return []
+
+        scanned_tf_text = format_alt_trend_timeframes(scanned_timeframes or results_by_tf.keys())
+        header_lines = [
+            "🚀 **알트 급등 알림**",
+            f"시각: `{datetime.now().strftime('%m-%d %H:%M:%S')}`",
+            f"스캔 TF: `{scanned_tf_text}`"
+        ]
+        header = "\n".join(header_lines)
+        sections = []
+
+        for timeframe in sorted(results_by_tf.keys(), key=lambda tf: ALT_TREND_TIMEFRAME_ORDER.get(tf, 999)):
+            tf_result = results_by_tf.get(timeframe, {}) or {}
+            confirms = tf_result.get('confirm', []) or []
+            setups = tf_result.get('setup', []) or []
+            if not confirms and not setups:
+                continue
+
+            section_lines = [f"**{timeframe}**"]
+            if confirms:
+                section_lines.append("🟢 확정")
+                section_lines.extend(self._format_alt_trend_alert_item(item) for item in confirms)
+            if setups:
+                section_lines.append("🟡 준비")
+                section_lines.extend(self._format_alt_trend_alert_item(item) for item in setups)
+            sections.append("\n".join(section_lines))
+
+        if not sections:
+            return []
+
+        chunks = []
+        current = header
+        for section in sections:
+            candidate = f"{current}\n\n{section}".strip()
+            if len(candidate) > 3800 and current != header:
+                chunks.append(current.strip())
+                current = f"{header}\n\n{section}".strip()
+            else:
+                current = candidate
+        if current:
+            chunks.append(current.strip())
+
+        if len(chunks) <= 1:
+            return chunks
+
+        numbered_chunks = []
+        total = len(chunks)
+        for idx, chunk in enumerate(chunks, start=1):
+            numbered_chunks.append(chunk.replace("🚀 **알트 급등 알림**", f"🚀 **알트 급등 알림** ({idx}/{total})", 1))
+        return numbered_chunks
+
+    def _build_binance_futures_rest_symbol(self, symbol):
+        text = str(symbol or '').strip().upper()
+        if not text:
+            return ''
+        if '/' in text:
+            base, quote = text.split('/', 1)
+            quote = quote.split(':', 1)[0]
+            return f"{base}{quote}"
+        return text.replace(':', '')
+
+    def _fetch_binance_public_json_sync(self, path, params):
+        query = urllib.parse.urlencode(params)
+        url = f"{BINANCE_FAPI_PUBLIC_BASE_URL}{path}?{query}"
+        request = urllib.request.Request(
+            url,
+            headers={
+                'User-Agent': 'Mozilla/5.0',
+                'Accept': 'application/json'
+            }
+        )
+        with urllib.request.urlopen(request, timeout=12) as response:
+            payload = response.read().decode('utf-8')
+        return json.loads(payload)
+
+    async def _fetch_binance_public_json(self, path, params):
+        return await asyncio.to_thread(self._fetch_binance_public_json_sync, path, params)
+
+    async def _fetch_alt_trend_oi_cvd_metrics(self, symbol, timeframe):
+        rest_symbol = self._build_binance_futures_rest_symbol(symbol)
+        if not rest_symbol:
+            return None
+
+        try:
+            if timeframe in {'5m', '15m', '30m'}:
+                oi_rows = await self._fetch_binance_public_json(
+                    '/futures/data/openInterestHist',
+                    {'symbol': rest_symbol, 'period': timeframe, 'limit': 2}
+                )
+                cvd_rows = await self._fetch_binance_public_json(
+                    '/futures/data/takerlongshortRatio',
+                    {'symbol': rest_symbol, 'period': timeframe, 'limit': 2}
+                )
+                if not isinstance(oi_rows, list) or len(oi_rows) < 2:
+                    return None
+                if not isinstance(cvd_rows, list) or len(cvd_rows) < 1:
+                    return None
+
+                oi_rows = sorted(oi_rows, key=lambda row: int(row.get('timestamp', 0) or 0))
+                cvd_rows = sorted(cvd_rows, key=lambda row: int(row.get('timestamp', 0) or 0))
+                start_row = oi_rows[-2]
+                end_row = oi_rows[-1]
+                cvd_window = cvd_rows[-1:]
+            else:
+                bars_by_timeframe = {
+                    '1h': 1,
+                    '2h': 2,
+                    '4h': 4,
+                    '6h': 6,
+                    '8h': 8,
+                    '1d': 24
+                }
+                bars = bars_by_timeframe.get(timeframe)
+                if not bars:
+                    return None
+
+                oi_rows = await self._fetch_binance_public_json(
+                    '/futures/data/openInterestHist',
+                    {'symbol': rest_symbol, 'period': '1h', 'limit': bars + 1}
+                )
+                cvd_rows = await self._fetch_binance_public_json(
+                    '/futures/data/takerlongshortRatio',
+                    {'symbol': rest_symbol, 'period': '1h', 'limit': bars}
+                )
+                if not isinstance(oi_rows, list) or len(oi_rows) < (bars + 1):
+                    return None
+                if not isinstance(cvd_rows, list) or len(cvd_rows) < bars:
+                    return None
+
+                oi_rows = sorted(oi_rows, key=lambda row: int(row.get('timestamp', 0) or 0))
+                cvd_rows = sorted(cvd_rows, key=lambda row: int(row.get('timestamp', 0) or 0))
+                oi_window = oi_rows[-(bars + 1):]
+                cvd_window = cvd_rows[-bars:]
+                start_row = oi_window[0]
+                end_row = oi_window[-1]
+
+            start_oi = float(
+                start_row.get('sumOpenInterestValue')
+                or start_row.get('sumOpenInterest')
+                or 0.0
+            )
+            end_oi = float(
+                end_row.get('sumOpenInterestValue')
+                or end_row.get('sumOpenInterest')
+                or 0.0
+            )
+            oi_delta_pct = ((end_oi - start_oi) / start_oi * 100.0) if start_oi > 0 else 0.0
+            cvd_delta = 0.0
+            latest_ts = int(end_row.get('timestamp', 0) or 0)
+            for row in cvd_window:
+                buy_vol = float(row.get('buyVol') or 0.0)
+                sell_vol = float(row.get('sellVol') or 0.0)
+                cvd_delta += (buy_vol - sell_vol)
+                latest_ts = max(latest_ts, int(row.get('timestamp', 0) or 0))
+
+            return {
+                'oi_delta_pct': float(oi_delta_pct),
+                'cvd_delta': float(cvd_delta),
+                'oi_cvd_pass': bool(oi_delta_pct > 0 and cvd_delta > 0),
+                'oi_cvd_ts': latest_ts
+            }
+        except Exception as e:
+            logger.warning(f"Alt trend OI/CVD fetch failed for {symbol} {timeframe}: {e}")
+            return None
+
+    async def _get_last_closed_candle_ts_for_alert(self, timeframe):
+        try:
+            ohlcv = await asyncio.to_thread(
+                self.market_data_exchange.fetch_ohlcv,
+                'BTC/USDT:USDT',
+                timeframe,
+                limit=3
+            )
+            if not ohlcv or len(ohlcv) < 2:
+                return 0
+            return int(ohlcv[-2][0] or 0)
+        except Exception as e:
+            logger.warning(f"Alt trend candle sync failed for {timeframe}: {e}")
+            return 0
+
+    async def _scan_alt_trend_timeframe(self, timeframe, expected_candle_ts, ranked_symbols):
+        signal_engine = self.engines.get('signal')
+        if not signal_engine:
+            return {'confirm': [], 'setup': []}
+
+        strategy_params = self.get_active_strategy_params()
+        price_semaphore = asyncio.Semaphore(8)
+        oi_cvd_semaphore = asyncio.Semaphore(4)
+
+        async def _evaluate_price(symbol_row):
+            symbol = symbol_row.get('symbol')
+            quote_volume = float(symbol_row.get('quote_volume', 0.0) or 0.0)
+            try:
+                async with price_semaphore:
+                    ohlcv = await asyncio.to_thread(
+                        self.market_data_exchange.fetch_ohlcv,
+                        symbol,
+                        timeframe,
+                        limit=300
+                    )
+                if not ohlcv or len(ohlcv) < 60:
+                    return None
+
+                last_closed_ts = int(ohlcv[-2][0] or 0) if len(ohlcv) >= 2 else 0
+                if expected_candle_ts and last_closed_ts != expected_candle_ts:
+                    return None
+
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                result = signal_engine._calculate_alt_trend_price_signal(symbol, df, strategy_params)
+                if not result:
+                    return None
+                if expected_candle_ts and int(result.get('candle_ts', 0) or 0) != expected_candle_ts:
+                    return None
+                result['quote_volume'] = quote_volume
+                result['timeframe'] = timeframe
+                return result
+            except Exception as e:
+                logger.warning(f"Alt trend price scan failed for {symbol} {timeframe}: {e}")
+                return None
+
+        price_tasks = [_evaluate_price(symbol_row) for symbol_row in ranked_symbols]
+        price_candidates = [item for item in await asyncio.gather(*price_tasks) if item]
+        price_candidates.sort(
+            key=lambda item: (1 if item.get('stage') == 'confirm' else 0, float(item.get('score', 0.0) or 0.0)),
+            reverse=True
+        )
+        shortlist = price_candidates[:12]
+        if not shortlist:
+            return {'confirm': [], 'setup': []}
+
+        async def _attach_oi_cvd(item):
+            try:
+                async with oi_cvd_semaphore:
+                    metrics = await self._fetch_alt_trend_oi_cvd_metrics(item.get('symbol'), timeframe)
+                if not metrics or not metrics.get('oi_cvd_pass', False):
+                    return None
+                enriched = dict(item)
+                enriched.update(metrics)
+                return enriched
+            except Exception as e:
+                logger.warning(f"Alt trend OI/CVD attach failed for {item.get('symbol')} {timeframe}: {e}")
+                return None
+
+        final_candidates = [item for item in await asyncio.gather(*[_attach_oi_cvd(item) for item in shortlist]) if item]
+        final_candidates.sort(
+            key=lambda item: (1 if item.get('stage') == 'confirm' else 0, float(item.get('score', 0.0) or 0.0)),
+            reverse=True
+        )
+
+        confirms = []
+        setups = []
+        for item in final_candidates:
+            key = (timeframe, item.get('symbol'), item.get('stage'))
+            candle_ts = int(item.get('candle_ts', 0) or 0)
+            if self.last_alt_trend_alert_sent.get(key) == candle_ts:
+                continue
+            if item.get('stage') == 'confirm':
+                confirms.append(item)
+            else:
+                setups.append(item)
+
+        confirms = confirms[:5]
+        remaining_slots = max(0, 5 - len(confirms))
+        setups = setups[:remaining_slots]
+
+        return {
+            'confirm': confirms,
+            'setup': setups
+        }
+
+    async def _alt_trend_alert_loop(self):
+        await asyncio.sleep(20)
+        while True:
+            try:
+                settings = self._get_alt_trend_alert_settings()
+                if self.is_upbit_mode() or not settings.get('enabled', False):
+                    await asyncio.sleep(60)
+                    continue
+
+                due_timeframes = {}
+                for timeframe in settings.get('timeframes', []):
+                    closed_ts = await self._get_last_closed_candle_ts_for_alert(timeframe)
+                    if closed_ts <= 0:
+                        continue
+                    if int(self.last_alt_trend_scan_candle_ts_by_tf.get(timeframe, 0) or 0) >= closed_ts:
+                        continue
+                    due_timeframes[timeframe] = closed_ts
+
+                if not due_timeframes:
+                    await asyncio.sleep(60)
+                    continue
+
+                try:
+                    tickers = await asyncio.to_thread(self.market_data_exchange.fetch_tickers)
+                except Exception as e:
+                    logger.warning(f"Alt trend ticker scan failed: {e}")
+                    await asyncio.sleep(60)
+                    continue
+
+                ranked_symbols = []
+                for symbol, data in (tickers or {}).items():
+                    if '/USDT:USDT' not in symbol:
+                        continue
+                    quote_volume = float(data.get('quoteVolume', 0.0) or 0.0)
+                    if quote_volume < 15_000_000:
+                        continue
+                    ranked_symbols.append({
+                        'symbol': symbol,
+                        'quote_volume': quote_volume
+                    })
+                ranked_symbols.sort(key=lambda item: item.get('quote_volume', 0.0), reverse=True)
+                ranked_symbols = ranked_symbols[:60]
+
+                results_by_tf = {}
+                summary = {}
+                for timeframe in sorted(due_timeframes.keys(), key=lambda tf: ALT_TREND_TIMEFRAME_ORDER.get(tf, 999)):
+                    closed_ts = due_timeframes[timeframe]
+                    tf_result = await self._scan_alt_trend_timeframe(timeframe, closed_ts, ranked_symbols)
+                    confirm_count = len(tf_result.get('confirm', []) or [])
+                    setup_count = len(tf_result.get('setup', []) or [])
+                    summary[timeframe] = {
+                        'candle_ts': closed_ts,
+                        'confirm_count': confirm_count,
+                        'setup_count': setup_count,
+                        'scanned_symbols': len(ranked_symbols),
+                        'scanned_at': int(time.time())
+                    }
+                    self.last_alt_trend_scan_candle_ts_by_tf[timeframe] = closed_ts
+                    if confirm_count or setup_count:
+                        results_by_tf[timeframe] = tf_result
+
+                self.last_alt_trend_scan_summary = summary
+
+                if results_by_tf:
+                    for chunk in self._build_alt_trend_alert_chunks(results_by_tf, due_timeframes.keys()):
+                        await self.notify(chunk)
+                    for timeframe, tf_result in results_by_tf.items():
+                        for stage in ('confirm', 'setup'):
+                            for item in tf_result.get(stage, []) or []:
+                                self.last_alt_trend_alert_sent[(timeframe, item.get('symbol'), stage)] = int(item.get('candle_ts', 0) or 0)
+
+                await asyncio.sleep(60)
+            except Exception as e:
+                logger.error(f"Alt trend alert loop error: {e}")
+                await asyncio.sleep(60)
+
     async def run(self):
         logger.info("Bot starting... (Pure Polling Mode)")
         
@@ -10461,6 +11010,7 @@ class MainController:
         await asyncio.gather(
             self._main_polling_loop(),  # [?대쭅 ?꾩슜] 硫붿씤 ?대쭅 猷⑦봽
             self._hourly_report_loop(),
+            self._alt_trend_alert_loop(),
             self._heartbeat_loop()
         )
 
@@ -10899,6 +11449,9 @@ class MainController:
 
         # Hourly Report Status
         hourly_report_status = "ON" if self.cfg.get('telegram', {}).get('reporting', {}).get('hourly_report_enabled', True) else "OFF"
+        alt_trend_settings = self._get_alt_trend_alert_settings()
+        alt_trend_alert_status = "ON 🔔" if alt_trend_settings.get('enabled', False) else "OFF"
+        alt_trend_tf_text = format_alt_trend_timeframes(alt_trend_settings.get('timeframes', []))
 
         # Network status
         network_status = self.get_network_status_label()
@@ -10942,6 +11495,9 @@ class MainController:
 23. 거래량 급등 채굴 (`{scanner_status}` / `{scanner_tf}`)
 24. 채굴 진입 TF
 25. 채굴 청산 TF (`{scanner_exit_tf}`)
+59. 알트 상승추세 알림 (`{alt_trend_alert_status}`)
+60. 알트 상승추세 알림 TF (`{alt_trend_tf_text}`)
+61. 알트 상승추세 알림 안내
 
 **기타**
 22. 거래소/네트워크 전환 (`{network_status}`)
@@ -11004,6 +11560,9 @@ class MainController:
             '56': "ℹ️ **UTBot 필터 안내**: 1=CHOP, 2=ADX+DMI, 3=VWAP, 4=HTF Supertrend, 5=BOS/CHoCH\n- 진입: 선택한 필터를 52번 AND/OR로 결합\n- 청산: 55번에서 각 필터를 `confirm`(기본 UT 반대신호 확인용) 또는 `signal`(단독 청산 트리거)로 지정\n- 58번 RSI Momentum Trend는 일반 필터팩과 별도로, UTBot 진입/청산을 직접 확인하는 전용 보조필터\n- 예시: 진입 `1,4,5` / 청산 `2,3` / 타입 `2:c,3:s`",
             '57': "📝 **RSI Momentum Trend 설정** 입력\n형식: RSI길이,PositiveAbove,NegativeBelow,EMA길이\n예: 14,65,32,5",
             '58': "📝 **UTBot + RSI Momentum Trend 보조필터** 입력\n`on/off` 또는 `1/0` (`true/false`, `yes/no` 지원)\n- on: UTBot 진입은 둘 다 같은 방향일 때만, 청산/반전은 둘 다 반대 방향일 때만 실행\n- off: 순수 UTBot만 사용",
+            '59': "📝 **알트 상승추세 알림** 입력\n`on/off` 또는 `1/0` (`true/false`, `yes/no` 지원)",
+            '60': "📝 **알트 상승추세 알림 TF** 입력\n쉼표로 여러 개 선택 가능\n예: `5m,15m,30m,1h,2h,4h,6h,8h,1d`\n허용 TF: 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 1d",
+            '61': "ℹ️ **알트 상승추세 알림 안내**\n- 선택한 시간프레임만 스캔합니다.\n- 여러 TF를 선택하면 텔레그램 한 메시지 안에 TF별 섹션으로 묶어 보냅니다.\n- 준비(setup)와 확정(confirm)을 함께 보여줍니다.\n- Binance OI/CVD가 둘 다 양수일 때만 최종 알림에 포함됩니다.",
             '26': "📝 **UT 진입 방식** 입력\n`next` 또는 `1` = 시그널 마감봉 바로 다음봉에만 진입\n`persistent` 또는 `2` = fresh signal이 아니어도 현재 유지 중인 시그널이면 즉시 진입 대기/진입 (기준봉은 마지막 시그널 확정봉)",
             '49': "📝 **UTSMC 후보 필터** 입력\n`0/off` = OFF\n`1/c1` = 후보1 (Squeeze)\n`2/c2` = 후보2 (Breakout)\n`3/c12` = 후보1+2",
             '50': "📝 **UTSMC C2 청산** 입력\n`on/off` 또는 `1/0` (`true/false`, `yes/no` 지원)",
@@ -11024,7 +11583,7 @@ class MainController:
         if self.is_upbit_mode():
             blocked_choices = {
                 '1', '2', '3', '4', '5', '6', '8', '10', '11', '12', '13', '14', '15',
-                '16', '19', '20', '21', '23', '24', '25', '26', '35', '36', '37', '38', '41', '49', '50', '51', '52', '53', '54', '55', '56', '57', '58', '00'
+                '16', '19', '20', '21', '23', '24', '25', '26', '35', '36', '37', '38', '41', '49', '50', '51', '52', '53', '54', '55', '56', '57', '58', '59', '60', '61', '00'
             }
             if text in blocked_choices:
                 await update.message.reply_text("ℹ️ 업비트 모드에서는 업비트 전용 메뉴(22, 43~48)만 사용합니다.")
@@ -11062,6 +11621,10 @@ class MainController:
             return ENGINE_SELECT
         elif text == '56':
             await update.message.reply_text(prompts['56'], parse_mode=ParseMode.MARKDOWN)
+            await self.show_setup_menu(update)
+            return SELECT
+        elif text == '61':
+            await update.message.reply_text(prompts['61'], parse_mode=ParseMode.MARKDOWN)
             await self.show_setup_menu(update)
             return SELECT
 
@@ -11547,6 +12110,46 @@ class MainController:
                 )
                 await update.message.reply_text(
                     f"✅ UTBot + RSI Momentum Trend: {'ON' if enabled else 'OFF'}"
+                )
+
+            elif choice == '59':
+                toggle_raw = str(val or '').strip().lower()
+                if toggle_raw in {'1', 'on', 'true', 'yes'}:
+                    enabled = True
+                elif toggle_raw in {'0', 'off', 'false', 'no'}:
+                    enabled = False
+                else:
+                    await update.message.reply_text("❌ `on/off`, `1/0`, `true/false`, `yes/no` 중 하나를 입력하세요.")
+                    return SELECT
+
+                await self.cfg.update_value(
+                    ['telegram', 'reporting', 'alt_trend_alert_enabled'],
+                    enabled
+                )
+                self.last_alt_trend_scan_candle_ts_by_tf = {}
+                self.last_alt_trend_alert_sent = {}
+                self.last_alt_trend_scan_summary = {}
+                await update.message.reply_text(
+                    f"✅ 알트 상승추세 알림: {'ON' if enabled else 'OFF'}"
+                )
+
+            elif choice == '60':
+                selected_timeframes = normalize_alt_trend_timeframes(val)
+                if not selected_timeframes:
+                    await update.message.reply_text(
+                        "❌ 최소 1개 이상 입력하세요.\n허용 TF: 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 1d"
+                    )
+                    return SELECT
+
+                await self.cfg.update_value(
+                    ['telegram', 'reporting', 'alt_trend_alert_timeframes'],
+                    selected_timeframes
+                )
+                self.last_alt_trend_scan_candle_ts_by_tf = {}
+                self.last_alt_trend_alert_sent = {}
+                self.last_alt_trend_scan_summary = {}
+                await update.message.reply_text(
+                    f"✅ 알트 상승추세 알림 TF: {format_alt_trend_timeframes(selected_timeframes)}"
                 )
 
             elif choice in {'51', '53'}:
