@@ -1127,6 +1127,22 @@ class BaseEngine:
     def get_quote_currency(self):
         return 'KRW' if self.is_upbit_mode() else 'USDT'
 
+    def get_effective_trade_direction(self):
+        return self.ctrl.get_effective_trade_direction()
+
+    def is_trade_direction_allowed(self, side):
+        side = str(side or '').strip().lower()
+        if side not in {'long', 'short'}:
+            return True
+        direction = self.get_effective_trade_direction()
+        return not (
+            (direction == 'long' and side == 'short') or
+            (direction == 'short' and side == 'long')
+        )
+
+    def format_trade_direction_block_reason(self, side):
+        return f"방향 필터 차단 ({str(side or '').upper()} vs {self.get_effective_trade_direction().upper()})"
+
     def _to_float_safe(self, value):
         try:
             if value in (None, ''):
@@ -3056,6 +3072,34 @@ class SignalEngine(BaseEngine):
 
         strategy_name = str(pending.get('strategy_name') or 'UT')
         timing_label = self._get_ut_entry_timing_label(timing_mode)
+        if not self.is_trade_direction_allowed(entry_sig):
+            block_reason = self.format_trade_direction_block_reason(entry_sig)
+            self._clear_ut_pending_entry(symbol)
+            self.last_entry_reason[symbol] = f"{strategy_name} {block_reason}"
+            self._update_stateful_diag(
+                symbol,
+                stage='entry_blocked',
+                strategy=strategy_name,
+                entry_sig=entry_sig,
+                pos_side='NONE',
+                ut_pending_source=pending_source,
+                ut_pending_side=entry_sig.upper(),
+                ut_pending_state='blocked',
+                ut_pending_execute_ts=execute_ts or None,
+                ut_pending_execute_ts_human=(
+                    datetime.fromtimestamp(execute_ts / 1000).strftime('%m-%d %H:%M')
+                    if execute_ts else None
+                ),
+                ut_pending_expires_ts=expires_ts or None,
+                ut_pending_expires_ts_human=(
+                    datetime.fromtimestamp(expires_ts / 1000).strftime('%m-%d %H:%M')
+                    if expires_ts else None
+                ),
+                ut_flip_target_side=(entry_sig.upper() if is_flip_pending else None),
+                note=f"live {timing_mode} entry blocked by direction filter"
+            )
+            return pos_side
+
         self._clear_ut_pending_entry(symbol)
         self.last_entry_reason[symbol] = (
             f"{strategy_name} flip 유지 확인 -> {entry_sig.upper()} 진입"
@@ -3945,6 +3989,20 @@ class SignalEngine(BaseEngine):
             return pos_side
 
         timing_label = self._get_ut_entry_timing_label(timing_mode)
+        if not self.is_trade_direction_allowed(entry_sig):
+            block_reason = self.format_trade_direction_block_reason(entry_sig)
+            self._clear_utsmc_pending_entry(symbol)
+            self.last_entry_reason[symbol] = f"{strategy_name} {block_reason}"
+            self._update_stateful_diag(
+                symbol,
+                stage='entry_blocked',
+                strategy=strategy_name,
+                entry_sig=entry_sig,
+                pos_side='NONE',
+                note=f"live {timing_mode} entry blocked by direction filter"
+            )
+            return pos_side
+
         self._clear_utsmc_pending_entry(symbol)
         self.last_entry_reason[symbol] = f"{strategy_name} {timing_label} 기준 {entry_sig.upper()} 진입"
         self._update_stateful_diag(
@@ -6788,6 +6846,23 @@ class SignalEngine(BaseEngine):
                 note=f"pending {timing_mode} entry | execute_ts={execute_ts}"
             )
         elif not pos and timing_mode == 'persistent' and target_sig in {'long', 'short'}:
+            if not self.is_trade_direction_allowed(target_sig):
+                self._clear_ut_pending_entry(symbol)
+                self.last_entry_reason[symbol] = (
+                    f"{strategy_name} 현재 {target_sig.upper()} 상태지만 "
+                    f"{self.format_trade_direction_block_reason(target_sig)}"
+                )
+                self._update_stateful_diag(
+                    symbol,
+                    stage='entry_blocked',
+                    strategy=strategy_name,
+                    raw_state=(target_sig or 'none'),
+                    raw_signal=(raw_strategy_sig or 'none'),
+                    entry_sig=target_sig,
+                    pos_side='NONE',
+                    note="persistent entry blocked by direction filter"
+                )
+                return
             if signal_basis_side == target_sig and signal_basis_ts > 0:
                 allowed, filter_reason = _entry_filter_gate(target_sig, persistent=True)
                 if not allowed:
@@ -6892,6 +6967,23 @@ class SignalEngine(BaseEngine):
             pending = None
 
         if pending and ut_signal and ut_signal != pending.get('side'):
+            if not self.is_trade_direction_allowed(ut_signal):
+                self._clear_utsmc_pending_entry(symbol)
+                self.last_entry_reason[symbol] = (
+                    f"{strategy_name} UT {ut_signal.upper()} "
+                    f"{self.format_trade_direction_block_reason(ut_signal)}"
+                )
+                self._update_stateful_diag(
+                    symbol,
+                    stage='entry_blocked',
+                    strategy=strategy_name,
+                    raw_state=(target_sig or 'none'),
+                    raw_signal=(ut_signal or 'none'),
+                    entry_sig=(ut_signal or 'none'),
+                    pos_side='NONE',
+                    note="candidate replacement blocked by direction filter"
+                )
+                return
             allowed, candidate_reason = self._utsmc_candidate_filter_allows(raw_smc_detail, ut_signal, is_persistent=False)
             if not allowed:
                 self._clear_utsmc_pending_entry(symbol)
@@ -6939,6 +7031,23 @@ class SignalEngine(BaseEngine):
             return
 
         if ut_signal in {'long', 'short'}:
+            if not self.is_trade_direction_allowed(ut_signal):
+                self._clear_utsmc_pending_entry(symbol)
+                self.last_entry_reason[symbol] = (
+                    f"{strategy_name} UT {ut_signal.upper()} "
+                    f"{self.format_trade_direction_block_reason(ut_signal)}"
+                )
+                self._update_stateful_diag(
+                    symbol,
+                    stage='entry_blocked',
+                    strategy=strategy_name,
+                    raw_state=(target_sig or 'none'),
+                    raw_signal=(ut_signal or 'none'),
+                    entry_sig=(ut_signal or 'none'),
+                    pos_side='NONE',
+                    note="fresh entry blocked by direction filter"
+                )
+                return
             allowed, candidate_reason = self._utsmc_candidate_filter_allows(raw_smc_detail, ut_signal, is_persistent=False)
             if not allowed:
                 self.last_entry_reason[symbol] = (
@@ -6984,6 +7093,23 @@ class SignalEngine(BaseEngine):
             return
 
         if timing_mode == 'persistent' and target_sig in {'long', 'short'}:
+            if not self.is_trade_direction_allowed(target_sig):
+                self._clear_utsmc_pending_entry(symbol)
+                self.last_entry_reason[symbol] = (
+                    f"{strategy_name} 현재 UT {target_sig.upper()} 상태지만 "
+                    f"{self.format_trade_direction_block_reason(target_sig)}"
+                )
+                self._update_stateful_diag(
+                    symbol,
+                    stage='entry_blocked',
+                    strategy=strategy_name,
+                    raw_state=(target_sig or 'none'),
+                    raw_signal=(ut_signal or 'none'),
+                    entry_sig=target_sig,
+                    pos_side='NONE',
+                    note="persistent entry blocked by direction filter"
+                )
+                return
             if ut_signal_side == target_sig and ut_signal_ts > 0:
                 allowed, candidate_reason = self._utsmc_candidate_filter_allows(raw_smc_detail, target_sig, is_persistent=True)
                 if not allowed:
@@ -7463,10 +7589,10 @@ class SignalEngine(BaseEngine):
                 )
             
             # 留ㅻℓ 諛⑺뼢 ?꾪꽣
-            d_mode = self.ctrl.get_effective_trade_direction()
-            if sig and ((d_mode == 'long' and sig == 'short') or (d_mode == 'short' and sig == 'long')):
+            d_mode = self.get_effective_trade_direction()
+            if sig and not self.is_trade_direction_allowed(sig):
                 logger.info(f"??Signal {sig} blocked by direction filter: {d_mode}")
-                self.last_entry_reason[symbol] = f"방향 필터 차단 ({sig.upper()} vs {d_mode.upper()})"
+                self.last_entry_reason[symbol] = self.format_trade_direction_block_reason(sig)
                 sig = None
 
             # ?ъ????뺤씤
@@ -8586,6 +8712,17 @@ class SignalEngine(BaseEngine):
 
     async def entry(self, symbol, side, price):
         try:
+            if not self.is_trade_direction_allowed(side):
+                block_reason = self.format_trade_direction_block_reason(side)
+                display_symbol = self.ctrl.format_symbol_for_display(symbol)
+                logger.info(
+                    f"[Signal] Entry blocked by direction filter: "
+                    f"{display_symbol} {str(side or '').upper()} vs {self.get_effective_trade_direction().upper()}"
+                )
+                self.last_entry_reason[symbol] = block_reason
+                await self.ctrl.notify(f"⚠️ {display_symbol} {block_reason}")
+                return
+
             if self.is_upbit_mode():
                 await self._entry_upbit_spot(symbol, side, price)
                 return
@@ -12775,8 +12912,16 @@ class MainController:
                 break
         
         if direction:
+            previous_direction = self.get_effective_trade_direction()
             await self.cfg.update_value(['system_settings', 'trade_direction'], direction)
-            await update.message.reply_text(f"✅ 매매 방향 변경: {direction}")
+            if direction != previous_direction:
+                self._reset_signal_engine_runtime_state(
+                    reset_entry_cache=True,
+                    reset_exit_cache=True,
+                    reset_stateful_strategy=True
+                )
+            direction_label = {'both': '양방향', 'long': '롱만', 'short': '숏만'}.get(direction, direction)
+            await update.message.reply_text(f"✅ 매매 방향 변경: {direction_label}")
         else:
             await update.message.reply_text("❌ 유효하지 않은 선택입니다.")
         
