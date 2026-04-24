@@ -4210,6 +4210,13 @@ class SignalEngine(BaseEngine):
                 return "🔴"
             return "🟡"
 
+        def _state_label(state):
+            if state is True:
+                return "만족"
+            if state is False:
+                return "불만족"
+            return "대기"
+
         def _fmt(value, digits=2):
             try:
                 if value is None or not np.isfinite(float(value)):
@@ -4230,7 +4237,12 @@ class SignalEngine(BaseEngine):
                 return "n/a"
 
         def _line(idx, label, state, detail):
-            return f"{_icon(state)} {idx}. {label}: {detail}"
+            return f"{_icon(state)} {_state_label(state)} {idx}. {label}: {detail}"
+
+        def _requirement_detail(label, value, condition, threshold, state, digits=2, unit=''):
+            return (
+                f"{label} {_fmt(value, digits)}{unit} / 조건 {condition} {_fmt(threshold, digits)}{unit}"
+            )
 
         if self.is_upbit_mode():
             return "🚦 UT Breakout 조건 스테이터스\n\n업비트 현물 모드에서는 UTBOT_FILTERED_BREAKOUT_V1을 사용하지 않습니다."
@@ -4380,12 +4392,26 @@ class SignalEngine(BaseEngine):
             if htf_ready:
                 if side == 'long':
                     htf_trend = htf_close > htf_ema_slow and htf_ema_fast > htf_ema_slow
-                    htf_trend_detail = f"close {_fmt(htf_close, 4)} > EMA200 {_fmt(htf_ema_slow, 4)}, EMA50 {_fmt(htf_ema_fast, 4)}"
+                    htf_trend_detail = (
+                        f"조건 close > EMA200, EMA50 > EMA200 | "
+                        f"close {_fmt(htf_close, 4)}, EMA50 {_fmt(htf_ema_fast, 4)}, EMA200 {_fmt(htf_ema_slow, 4)}"
+                    )
                 else:
                     htf_trend = htf_close < htf_ema_slow and htf_ema_fast < htf_ema_slow
-                    htf_trend_detail = f"close {_fmt(htf_close, 4)} < EMA200 {_fmt(htf_ema_slow, 4)}, EMA50 {_fmt(htf_ema_fast, 4)}"
+                    htf_trend_detail = (
+                        f"조건 close < EMA200, EMA50 < EMA200 | "
+                        f"close {_fmt(htf_close, 4)}, EMA50 {_fmt(htf_ema_fast, 4)}, EMA200 {_fmt(htf_ema_slow, 4)}"
+                    )
                 htf_gap_state = htf_gap_pct >= float(cfg.get('htf_ema_gap_min_percent', 0.15) or 0.15)
-                htf_gap_detail = f"{_fmt(htf_gap_pct, 3)}% >= {float(cfg.get('htf_ema_gap_min_percent', 0.15) or 0.15):.3f}%"
+                htf_gap_detail = _requirement_detail(
+                    "EMA gap",
+                    htf_gap_pct,
+                    ">=",
+                    float(cfg.get('htf_ema_gap_min_percent', 0.15) or 0.15),
+                    htf_gap_state,
+                    3,
+                    "%"
+                )
             else:
                 htf_trend = None
                 htf_trend_detail = htf_error or "1H 계산 대기"
@@ -4397,12 +4423,12 @@ class SignalEngine(BaseEngine):
                     rsi_state = rsi_value > rsi_threshold
                     if cfg.get('exclude_rsi_extreme', False):
                         rsi_state = rsi_state and rsi_value <= float(cfg.get('rsi_long_extreme', 80.0) or 80.0)
-                    rsi_detail = f"RSI {_fmt(rsi_value, 2)} > {rsi_threshold:.1f}"
+                    rsi_detail = _requirement_detail("RSI", rsi_value, ">", rsi_threshold, rsi_state, 2)
                 else:
                     rsi_state = rsi_value < rsi_threshold
                     if cfg.get('exclude_rsi_extreme', False):
                         rsi_state = rsi_state and rsi_value >= float(cfg.get('rsi_short_extreme', 20.0) or 20.0)
-                    rsi_detail = f"RSI {_fmt(rsi_value, 2)} < {rsi_threshold:.1f}"
+                    rsi_detail = _requirement_detail("RSI", rsi_value, "<", rsi_threshold, rsi_state, 2)
             else:
                 rsi_state = None
                 rsi_detail = f"데이터 부족 {len(closed)}/{min_bars}"
@@ -4411,17 +4437,32 @@ class SignalEngine(BaseEngine):
             adx_detail = adx_reason or f"데이터 부족 {len(closed)}/{min_bars}"
             if data_ready and self._is_valid_number(adx_value):
                 adx_state = float(adx_value) >= float(cfg.get('adx_threshold', 22.0) or 22.0)
-                adx_detail = f"ADX {_fmt(adx_value, 2)} >= {float(cfg.get('adx_threshold', 22.0) or 22.0):.1f}"
+                adx_detail = _requirement_detail(
+                    "ADX",
+                    adx_value,
+                    ">=",
+                    float(cfg.get('adx_threshold', 22.0) or 22.0),
+                    adx_state,
+                    2
+                )
 
             if don_ready:
                 if side == 'long':
                     don_state = entry_price > don_high_prev
-                    don_detail = f"close {_fmt(entry_price, 4)} > prev high {_fmt(don_high_prev, 4)}"
+                    don_detail = _requirement_detail("close", entry_price, "> prev high", don_high_prev, don_state, 4)
                 else:
                     don_state = entry_price < don_low_prev
-                    don_detail = f"close {_fmt(entry_price, 4)} < prev low {_fmt(don_low_prev, 4)}"
+                    don_detail = _requirement_detail("close", entry_price, "< prev low", don_low_prev, don_state, 4)
                 don_width_state = don_width_pct >= float(cfg.get('donchian_width_min_percent', 0.50) or 0.50)
-                don_width_detail = f"{_fmt(don_width_pct, 3)}% >= {float(cfg.get('donchian_width_min_percent', 0.50) or 0.50):.2f}%"
+                don_width_detail = _requirement_detail(
+                    "width",
+                    don_width_pct,
+                    ">=",
+                    float(cfg.get('donchian_width_min_percent', 0.50) or 0.50),
+                    don_width_state,
+                    3,
+                    "%"
+                )
             else:
                 don_state = None
                 don_detail = f"Donchian 데이터 부족 {len(closed)}/{int(cfg['donchian_length']) + 1}"
@@ -4429,15 +4470,25 @@ class SignalEngine(BaseEngine):
                 don_width_detail = "Donchian 계산 대기"
 
             if data_ready and self._is_valid_number(atr_pct):
-                atr_state = float(cfg.get('atr_min_percent', 0.12) or 0.12) <= atr_pct <= float(cfg.get('atr_max_percent', 1.20) or 1.20)
-                atr_detail = f"{_fmt(atr_pct, 3)}% in {float(cfg.get('atr_min_percent', 0.12) or 0.12):.2f}~{float(cfg.get('atr_max_percent', 1.20) or 1.20):.2f}%"
+                atr_min = float(cfg.get('atr_min_percent', 0.12) or 0.12)
+                atr_max = float(cfg.get('atr_max_percent', 1.20) or 1.20)
+                atr_state = atr_min <= atr_pct <= atr_max
+                atr_detail = f"ATR% {_fmt(atr_pct, 3)}% / 조건 {atr_min:.2f}%~{atr_max:.2f}%"
             else:
                 atr_state = None
                 atr_detail = "ATR 계산 대기"
 
             if data_ready and self._is_valid_number(ema_near_pct):
                 ema_state = ema_near_pct >= float(cfg.get('ema_near_percent', 0.20) or 0.20)
-                ema_detail = f"{_fmt(ema_near_pct, 3)}% >= {float(cfg.get('ema_near_percent', 0.20) or 0.20):.2f}%"
+                ema_detail = _requirement_detail(
+                    "EMA200 거리",
+                    ema_near_pct,
+                    ">=",
+                    float(cfg.get('ema_near_percent', 0.20) or 0.20),
+                    ema_state,
+                    3,
+                    "%"
+                )
             else:
                 ema_state = None
                 ema_detail = "EMA200 거리 계산 대기"
