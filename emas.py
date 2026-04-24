@@ -13883,6 +13883,91 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
 `/utbreakout toggle_extreme` - RSI 과열 제외 토글
 """.strip()
 
+        def _build_utbreakout_keyboard():
+            return InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("전략 ON", callback_data="utb:on"),
+                    InlineKeyboardButton("UTBOT 복귀", callback_data="utb:off")
+                ],
+                [
+                    InlineKeyboardButton("Set1 공격", callback_data="utb:set1"),
+                    InlineKeyboardButton("Set2 기본", callback_data="utb:set2"),
+                    InlineKeyboardButton("Set3 보수", callback_data="utb:set3")
+                ],
+                [
+                    InlineKeyboardButton("1회손실 $1", callback_data="utb:risk:1"),
+                    InlineKeyboardButton("1회손실 $5", callback_data="utb:risk:5"),
+                    InlineKeyboardButton("1회손실 $10", callback_data="utb:risk:10"),
+                    InlineKeyboardButton("1회손실 $25", callback_data="utb:risk:25")
+                ],
+                [
+                    InlineKeyboardButton("Risk 0.5%", callback_data="utb:riskpct:0.5"),
+                    InlineKeyboardButton("Risk 1%", callback_data="utb:riskpct:1"),
+                    InlineKeyboardButton("Risk 2%", callback_data="utb:riskpct:2")
+                ],
+                [
+                    InlineKeyboardButton("일손실 $3", callback_data="utb:dailyloss:3"),
+                    InlineKeyboardButton("일손실 $15", callback_data="utb:dailyloss:15"),
+                    InlineKeyboardButton("일손실 $30", callback_data="utb:dailyloss:30"),
+                    InlineKeyboardButton("일손실 $50", callback_data="utb:dailyloss:50")
+                ],
+                [
+                    InlineKeyboardButton("반대청산", callback_data="utb:toggle_opposite"),
+                    InlineKeyboardButton("EMA청산", callback_data="utb:toggle_ema"),
+                    InlineKeyboardButton("RSI과열", callback_data="utb:toggle_extreme")
+                ],
+                [
+                    InlineKeyboardButton("새로고침", callback_data="utb:status")
+                ]
+            ])
+
+        async def _edit_utbreakout_menu(query, notice=None):
+            text = _format_utbreakout_menu_text()
+            if notice:
+                text = f"{notice}\n\n{text}"
+            try:
+                await query.edit_message_text(
+                    text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=_build_utbreakout_keyboard()
+                )
+            except BadRequest as md_err:
+                message = str(md_err).lower()
+                if "message is not modified" in message:
+                    return
+                if "can't parse entities" in message:
+                    plain_text = str(text).replace("**", "").replace("`", "")
+                    await query.edit_message_text(
+                        plain_text,
+                        reply_markup=_build_utbreakout_keyboard()
+                    )
+                else:
+                    raise
+
+        def _current_utbreakout_cfg():
+            raw = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
+            return dict(raw) if isinstance(raw, dict) else {}
+
+        def _merge_utbreakout_profile_with_preserved_settings(profile):
+            profile_cfg = build_utbot_filtered_breakout_profile(profile)
+            current_cfg = _current_utbreakout_cfg()
+            preserve_keys = {
+                'risk_per_trade_percent',
+                'max_risk_per_trade_usdt',
+                'daily_max_loss_usdt',
+                'max_daily_trades',
+                'daily_profit_target_enabled',
+                'daily_profit_target_usdt',
+                'opposite_signal_exit_enabled',
+                'ema_rsi_exit_enabled',
+                'adx_donchian_exit_enabled',
+                'exclude_rsi_extreme'
+            }
+            for key in preserve_keys:
+                if key in current_cfg:
+                    profile_cfg[key] = current_cfg[key]
+            return profile_cfg
+
         async def utbreakout_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             args = list(getattr(c, 'args', []) or [])
             if not args and u and u.message and u.message.text:
@@ -13903,10 +13988,6 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
                     raise ValueError(f"{label} 값은 {maximum} 이하로 입력하세요.")
                 return value
 
-            def _current_utbreakout_cfg():
-                raw = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
-                return dict(raw) if isinstance(raw, dict) else {}
-
             if action in {'on', 'enable', 'activate', 'start'}:
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_FILTERED_BREAKOUT_STRATEGY)
                 self._reset_signal_engine_runtime_state(
@@ -13924,23 +14005,7 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
                 )
                 await u.message.reply_text("✅ 기본 UTBOT 전략으로 복귀")
             elif action in {'set1', 'set2', 'set3', '1', '2', '3', 'aggressive', 'conservative'}:
-                profile_cfg = build_utbot_filtered_breakout_profile(action)
-                current_cfg = _current_utbreakout_cfg()
-                preserve_keys = {
-                    'risk_per_trade_percent',
-                    'max_risk_per_trade_usdt',
-                    'daily_max_loss_usdt',
-                    'max_daily_trades',
-                    'daily_profit_target_enabled',
-                    'daily_profit_target_usdt',
-                    'opposite_signal_exit_enabled',
-                    'ema_rsi_exit_enabled',
-                    'adx_donchian_exit_enabled',
-                    'exclude_rsi_extreme'
-                }
-                for key in preserve_keys:
-                    if key in current_cfg:
-                        profile_cfg[key] = current_cfg[key]
+                profile_cfg = _merge_utbreakout_profile_with_preserved_settings(action)
                 await self.cfg.update_value(
                     ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1'],
                     profile_cfg
@@ -14013,7 +14078,102 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
                 await u.message.reply_text("❌ 알 수 없는 UT Breakout 명령입니다. `/utbreakout`로 메뉴를 확인하세요.", parse_mode=ParseMode.MARKDOWN)
                 return
 
-            await self._reply_markdown_safe(u.message, _format_utbreakout_menu_text())
+            await self._reply_markdown_safe(
+                u.message,
+                _format_utbreakout_menu_text(),
+                reply_markup=_build_utbreakout_keyboard()
+            )
+
+        async def utbreakout_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            query = u.callback_query
+            if not query:
+                return
+            await query.answer()
+            data = str(query.data or '')
+            if not data.startswith('utb:'):
+                return
+            parts = data.split(':')
+            action = parts[1] if len(parts) > 1 else 'status'
+            value = parts[2] if len(parts) > 2 else None
+
+            if action == 'on':
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_FILTERED_BREAKOUT_STRATEGY)
+                self._reset_signal_engine_runtime_state(
+                    reset_entry_cache=True,
+                    reset_exit_cache=True,
+                    reset_stateful_strategy=True
+                )
+                await _edit_utbreakout_menu(query, "✅ UTBOT_FILTERED_BREAKOUT_V1 활성화 완료")
+                return
+
+            if action == 'off':
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], 'utbot')
+                self._reset_signal_engine_runtime_state(
+                    reset_entry_cache=True,
+                    reset_exit_cache=True,
+                    reset_stateful_strategy=True
+                )
+                await _edit_utbreakout_menu(query, "✅ 기본 UTBOT 전략으로 복귀")
+                return
+
+            if action in {'set1', 'set2', 'set3'}:
+                profile_cfg = _merge_utbreakout_profile_with_preserved_settings(action)
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1'],
+                    profile_cfg
+                )
+                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
+                await _edit_utbreakout_menu(query, f"✅ 프로필 적용: {profile_cfg.get('profile')}")
+                return
+
+            if action in {'risk', 'riskpct', 'dailyloss'}:
+                try:
+                    numeric_value = float(str(value or '').replace('$', '').replace(',', '').strip())
+                except (TypeError, ValueError):
+                    await _edit_utbreakout_menu(query, "❌ 버튼 값 처리 실패")
+                    return
+                if numeric_value <= 0:
+                    await _edit_utbreakout_menu(query, "❌ 손실 설정값은 0보다 커야 합니다.")
+                    return
+                if action == 'risk':
+                    await self.cfg.update_value(
+                        ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'max_risk_per_trade_usdt'],
+                        numeric_value
+                    )
+                    notice = f"✅ 1회 최대 손실 설정: ${numeric_value:.2f}"
+                elif action == 'riskpct':
+                    await self.cfg.update_value(
+                        ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'risk_per_trade_percent'],
+                        numeric_value
+                    )
+                    notice = f"✅ 잔고 대비 손실 기준 설정: {numeric_value:.2f}%"
+                else:
+                    await self.cfg.update_value(
+                        ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'daily_max_loss_usdt'],
+                        numeric_value
+                    )
+                    notice = f"✅ 하루 최대 손실 설정: ${numeric_value:.2f}"
+                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
+                await _edit_utbreakout_menu(query, notice)
+                return
+
+            if action in {'toggle_opposite', 'toggle_ema', 'toggle_extreme'}:
+                key_map = {
+                    'toggle_opposite': ('opposite_signal_exit_enabled', '반대 UT 신호 청산'),
+                    'toggle_ema': ('ema_rsi_exit_enabled', 'EMA50/RSI 청산'),
+                    'toggle_extreme': ('exclude_rsi_extreme', 'RSI 과열 제외 옵션')
+                }
+                key, label = key_map[action]
+                current = bool(_current_utbreakout_cfg().get(key, False))
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', key],
+                    not current
+                )
+                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
+                await _edit_utbreakout_menu(query, f"✅ {label}: {'ON' if not current else 'OFF'}")
+                return
+
+            await _edit_utbreakout_menu(query)
 
         async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             msg = """
@@ -14045,6 +14205,7 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
         self.tg_app.add_handler(CommandHandler("close", close_cmd))
         self.tg_app.add_handler(CommandHandler("stats", stats_cmd))
         self.tg_app.add_handler(CommandHandler("utbreakout", utbreakout_cmd))
+        self.tg_app.add_handler(CallbackQueryHandler(utbreakout_callback, pattern=r"^utb:"))
         self.tg_app.add_handler(CommandHandler("help", help_cmd))
 
         setup_command_handler = CommandHandler('setup', self.setup_entry)
