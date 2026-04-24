@@ -275,7 +275,6 @@ def build_default_utbot_filtered_breakout_config():
         'daily_max_loss_usdt': 3.0,
         'max_daily_trades': 5,
         'max_consecutive_losses': 3,
-        'reentry_cooldown_candles': 3,
         'daily_profit_target_enabled': False,
         'daily_profit_target_usdt': 5.0,
         'opposite_signal_exit_enabled': False,
@@ -3718,8 +3717,7 @@ class SignalEngine(BaseEngine):
             'atr_length': 14,
             'donchian_length': 20,
             'max_daily_trades': 5,
-            'max_consecutive_losses': 3,
-            'reentry_cooldown_candles': 3
+            'max_consecutive_losses': 3
         }.items():
             _int(key, default, 1)
 
@@ -3803,24 +3801,6 @@ class SignalEngine(BaseEngine):
         failures.append({'ts': int(candle_ts or 0), 'reason': str(reason or '')})
         symbol_failures[side] = failures[-10:]
 
-    def _utbot_filtered_breakout_recent_failure(self, symbol, side, candle_ts, candle_ms, cooldown_candles):
-        side = str(side or '').lower()
-        failures = self.utbot_filtered_breakout_failures.get(symbol, {}).get(side, [])
-        if not failures:
-            return None
-        window_ms = max(1, int(candle_ms or 0)) * max(1, int(cooldown_candles or 3))
-        current_ts = int(candle_ts or 0)
-        recent = []
-        for item in failures:
-            ts = int((item or {}).get('ts') or 0)
-            if current_ts <= 0 or ts <= 0:
-                continue
-            if 0 < current_ts - ts <= window_ms:
-                recent.append(item)
-        if recent:
-            return recent[-1]
-        return None
-
     def _store_utbot_filtered_breakout_status(self, symbol, status):
         status = dict(status or {})
         self.last_utbot_filtered_breakout_status[symbol] = status
@@ -3880,6 +3860,9 @@ class SignalEngine(BaseEngine):
                 'side': side,
                 'code': code,
                 'reason': status.get('reason'),
+                'candidate_type': status.get('candidate_type'),
+                'fresh_signal': status.get('fresh_signal'),
+                'ut_bias_side': status.get('ut_bias_side'),
                 'entry_timeframe': status.get('entry_timeframe'),
                 'htf_timeframe': status.get('htf_timeframe'),
                 'decision_candle_ts': status.get('decision_candle_ts'),
@@ -3989,9 +3972,15 @@ class SignalEngine(BaseEngine):
             self._get_utbot_filtered_breakout_ut_params(cfg)
         )
         ut_detail = ut_detail or {}
+        ut_bias_side = str(ut_detail.get('bias_side') or '').lower()
+        candidate_side = ut_sig if ut_sig in {'long', 'short'} else ut_bias_side if ut_bias_side in {'long', 'short'} else None
+        candidate_type = 'fresh_signal' if ut_sig in {'long', 'short'} else 'bias_state' if candidate_side else None
         status.update({
-            'candidate_signal': ut_sig,
-            'candidate_side': ut_sig,
+            'fresh_signal': ut_sig,
+            'candidate_signal': candidate_side,
+            'candidate_side': candidate_side,
+            'candidate_type': candidate_type,
+            'ut_bias_side': ut_bias_side,
             'ut_reason': ut_reason,
             'ut_curr_src': ut_detail.get('curr_src'),
             'ut_curr_stop': ut_detail.get('curr_stop'),
@@ -3999,10 +3988,10 @@ class SignalEngine(BaseEngine):
             'ut_signal_ts': ut_detail.get('signal_ts')
         })
 
-        if ut_sig not in {'long', 'short'}:
+        if candidate_side not in {'long', 'short'}:
             return _finish(None, "UTBOT_FILTERED_BREAKOUT_V1 후보 신호 대기", None)
 
-        side = ut_sig
+        side = candidate_side
         daily_count, daily_pnl = self.db.get_daily_stats()
         daily_entries = self.db.get_daily_entry_count()
         status['daily_pnl'] = daily_pnl
@@ -4039,23 +4028,6 @@ class SignalEngine(BaseEngine):
             return _finish(
                 None,
                 f"REJECTED_CONSECUTIVE_LOSSES: last {max_losses} closed trades are losses",
-                'REJECTED_CONSECUTIVE_LOSSES',
-                record_failure=False,
-                side=side
-            )
-
-        candle_ms = self._timeframe_to_ms(cfg.get('entry_timeframe', '15m')) or self._timeframe_to_ms('15m')
-        recent_failure = self._utbot_filtered_breakout_recent_failure(
-            symbol,
-            side,
-            decision_ts,
-            candle_ms,
-            int(cfg.get('reentry_cooldown_candles', 3) or 3)
-        )
-        if recent_failure:
-            return _finish(
-                None,
-                f"REJECTED_CONSECUTIVE_LOSSES: recent {side.upper()} candidate failed ({recent_failure.get('reason')})",
                 'REJECTED_CONSECUTIVE_LOSSES',
                 record_failure=False,
                 side=side
@@ -4224,7 +4196,288 @@ class SignalEngine(BaseEngine):
             f"SL={stop_loss:.4f}, TP={take_profit:.4f}, qty={planned_qty:.8f}, RR={rr_multiple:.2f}"
         )
         status['entry_plan'] = dict(plan)
-        return _finish(side, f"ACCEPTED_ENTRY: {side.upper()} filtered breakout confirmed", None)
+        return _finish(side, f"ACCEPTED_ENTRY: {side.upper()} filtered breakout confirmed ({candidate_type})", None)
+
+    async def build_utbreakout_condition_status_text(self, symbol):
+        cfg = self._get_utbot_filtered_breakout_config(self.get_runtime_strategy_params())
+        entry_tf = cfg.get('entry_timeframe', '15m')
+        htf_tf = cfg.get('htf_timeframe', '1h')
+
+        def _icon(state):
+            if state is True:
+                return "🟢"
+            if state is False:
+                return "🔴"
+            return "🟡"
+
+        def _fmt(value, digits=2):
+            try:
+                if value is None or not np.isfinite(float(value)):
+                    return "n/a"
+                return f"{float(value):.{digits}f}"
+            except (TypeError, ValueError):
+                return "n/a"
+
+        def _fmt_ts(ms):
+            try:
+                ts = int(ms or 0)
+                if ts <= 0:
+                    return "n/a"
+                return datetime.fromtimestamp(ts / 1000, timezone.utc).astimezone(
+                    timezone(timedelta(hours=9))
+                ).strftime('%m-%d %H:%M KST')
+            except Exception:
+                return "n/a"
+
+        def _line(idx, label, state, detail):
+            return f"{_icon(state)} {idx}. {label}: {detail}"
+
+        if self.is_upbit_mode():
+            return "🚦 UT Breakout 조건 스테이터스\n\n업비트 현물 모드에서는 UTBOT_FILTERED_BREAKOUT_V1을 사용하지 않습니다."
+
+        try:
+            ohlcv = await asyncio.to_thread(
+                self.market_data_exchange.fetch_ohlcv,
+                symbol,
+                entry_tf,
+                limit=300
+            )
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        except Exception as e:
+            return f"🚦 UT Breakout 조건 스테이터스\n\n{symbol} {entry_tf} 데이터 조회 실패: {e}"
+
+        if df is None or len(df) < 5:
+            return f"🚦 UT Breakout 조건 스테이터스\n\n{symbol} {entry_tf} 데이터 부족"
+
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        closed = df.iloc[:-1].copy().dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+        decision_ts = int(closed.iloc[-1].get('timestamp') or 0) if len(closed) else 0
+        entry_price = float(closed.iloc[-1]['close']) if len(closed) else np.nan
+
+        ut_sig, ut_reason, ut_detail = self._calculate_utbot_signal(
+            df,
+            self._get_utbot_filtered_breakout_ut_params(cfg)
+        )
+        ut_detail = ut_detail or {}
+        ut_bias_side = str(ut_detail.get('bias_side') or '').lower()
+        candidate_side = ut_sig if ut_sig in {'long', 'short'} else ut_bias_side if ut_bias_side in {'long', 'short'} else None
+        candidate_type = 'fresh_signal' if ut_sig in {'long', 'short'} else 'bias_state' if candidate_side else 'waiting'
+
+        ema_fast_len = int(cfg['ema_fast'])
+        ema_slow_len = int(cfg['ema_slow'])
+        htf_gap_pct = np.nan
+        htf_close = np.nan
+        htf_ema_fast = np.nan
+        htf_ema_slow = np.nan
+        htf_ready = False
+        htf_error = None
+        try:
+            htf_ohlcv = await asyncio.to_thread(
+                self.market_data_exchange.fetch_ohlcv,
+                symbol,
+                htf_tf,
+                limit=300
+            )
+            htf_df = pd.DataFrame(htf_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                htf_df[col] = pd.to_numeric(htf_df[col], errors='coerce')
+            htf_closed = htf_df.iloc[:-1].dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+            if len(htf_closed) >= ema_slow_len + 2:
+                htf_close_series = htf_closed['close'].astype(float)
+                htf_ema_fast = float(htf_close_series.ewm(span=ema_fast_len, adjust=False).mean().iloc[-1])
+                htf_ema_slow = float(htf_close_series.ewm(span=ema_slow_len, adjust=False).mean().iloc[-1])
+                htf_close = float(htf_close_series.iloc[-1])
+                htf_gap_pct = abs(htf_ema_fast - htf_ema_slow) / max(abs(htf_close), 1e-9) * 100.0
+                htf_ready = True
+            else:
+                htf_error = f"데이터 부족 {len(htf_closed)}/{ema_slow_len + 2}"
+        except Exception as e:
+            htf_error = str(e)
+
+        min_bars = max(
+            ema_slow_len + 5,
+            int(cfg['donchian_length']) + 2,
+            int(cfg['adx_length']) * 2 + 5,
+            int(cfg['atr_length']) + 5,
+            int(cfg['rsi_length']) + 5
+        )
+        data_ready = len(closed) >= min_bars
+        rsi_value = adx_value = atr_value = atr_pct = ema200 = ema_near_pct = np.nan
+        don_high_prev = don_low_prev = don_width_pct = np.nan
+        don_ready = False
+        adx_reason = None
+        if data_ready:
+            close_series = closed['close'].astype(float)
+            ema200 = float(close_series.ewm(span=ema_slow_len, adjust=False).mean().iloc[-1])
+            rsi_series = self._calculate_wilder_rsi_series(close_series, int(cfg['rsi_length']))
+            rsi_value = float(rsi_series.iloc[-1]) if self._is_valid_number(rsi_series.iloc[-1]) else np.nan
+            adx_value, _, _, adx_reason = self._calculate_utbot_filter_pack_adx_dmi(closed, int(cfg['adx_length']))
+            atr_series = self._calculate_wilder_atr_series(closed, int(cfg['atr_length']))
+            atr_value = float(atr_series.iloc[-1]) if self._is_valid_number(atr_series.iloc[-1]) else np.nan
+            atr_pct = atr_value / max(abs(entry_price), 1e-9) * 100.0 if self._is_valid_number(atr_value) else np.nan
+            ema_near_pct = abs(entry_price - ema200) / max(abs(entry_price), 1e-9) * 100.0
+            donchian_len = int(cfg['donchian_length'])
+            don_window = closed.iloc[-donchian_len - 1:-1]
+            if len(don_window) >= donchian_len:
+                don_high_prev = float(don_window['high'].astype(float).max())
+                don_low_prev = float(don_window['low'].astype(float).min())
+                don_width_pct = (don_high_prev - don_low_prev) / max(abs(entry_price), 1e-9) * 100.0
+                don_ready = True
+
+        daily_count, daily_pnl = self.db.get_daily_stats()
+        daily_entries = self.db.get_daily_entry_count()
+        max_losses = int(cfg.get('max_consecutive_losses', 3) or 3)
+        recent_pnls = self.db.get_recent_closed_trade_pnls(max_losses, today_only=True)
+        daily_ok = True
+        daily_detail = f"PnL {_fmt(daily_pnl, 2)} / trades {daily_entries}/{int(cfg['max_daily_trades'])}"
+        if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
+            daily_ok = False
+            daily_detail = f"일손실 한도 도달 PnL {_fmt(daily_pnl, 2)}"
+        elif int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
+            daily_ok = False
+            daily_detail = f"일일 거래수 한도 {daily_entries}/{int(cfg['max_daily_trades'])}"
+        elif bool(cfg.get('daily_profit_target_enabled', False)) and float(daily_pnl or 0) >= float(cfg.get('daily_profit_target_usdt', 0) or 0):
+            daily_ok = False
+            daily_detail = f"일 목표수익 도달 {_fmt(daily_pnl, 2)}"
+        elif len(recent_pnls) >= max_losses and all(float(pnl) < 0 for pnl in recent_pnls[:max_losses]):
+            daily_ok = False
+            daily_detail = f"연속 손절 {max_losses}회"
+
+        balance_detail = "잔고 조회 대기"
+        risk_ok = None
+        risk_distance = np.nan
+        risk_usdt = np.nan
+        if data_ready and self._is_valid_number(atr_value):
+            ut_stop = ut_detail.get('curr_stop')
+            stop_anchor_distance = abs(entry_price - float(ut_stop)) if self._is_valid_number(ut_stop) else 0.0
+            risk_distance = max(float(cfg.get('stop_atr_multiplier', 1.5) or 1.5) * float(atr_value), stop_anchor_distance)
+            rr_multiple = float(cfg.get('take_profit_r_multiple', 2.0) or 2.0)
+            try:
+                total_balance, free_balance, _ = await self.get_balance_info()
+                balance_for_risk = total_balance if total_balance > 0 else free_balance
+                risk_usdt = min(
+                    balance_for_risk * float(cfg.get('risk_per_trade_percent', 1.0) or 1.0) / 100.0,
+                    float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
+                )
+                planned_qty = risk_usdt / max(risk_distance, 1e-9)
+                risk_ok = risk_distance > 0 and rr_multiple >= float(cfg.get('min_risk_reward', 2.0) or 2.0) and risk_usdt > 0 and planned_qty > 0
+                balance_detail = f"risk {_fmt(risk_usdt, 2)} USDT / RR {_fmt(rr_multiple, 1)} / qty {_fmt(planned_qty, 6)}"
+            except Exception as e:
+                balance_detail = f"잔고 조회 실패 {e}"
+
+        rsi_threshold = float(cfg.get('rsi_threshold', 50.0) or 50.0)
+
+        def _side_conditions(side):
+            side_upper = side.upper()
+            if candidate_side == side:
+                ut_state = True
+                ut_detail_text = f"{side_upper} {candidate_type}"
+            else:
+                ut_state = False if candidate_side in {'long', 'short'} else None
+                ut_detail_text = f"현재 {str(candidate_side or 'none').upper()} / bias {str(ut_bias_side or 'none').upper()}"
+
+            if htf_ready:
+                if side == 'long':
+                    htf_trend = htf_close > htf_ema_slow and htf_ema_fast > htf_ema_slow
+                    htf_trend_detail = f"close {_fmt(htf_close, 4)} > EMA200 {_fmt(htf_ema_slow, 4)}, EMA50 {_fmt(htf_ema_fast, 4)}"
+                else:
+                    htf_trend = htf_close < htf_ema_slow and htf_ema_fast < htf_ema_slow
+                    htf_trend_detail = f"close {_fmt(htf_close, 4)} < EMA200 {_fmt(htf_ema_slow, 4)}, EMA50 {_fmt(htf_ema_fast, 4)}"
+                htf_gap_state = htf_gap_pct >= float(cfg.get('htf_ema_gap_min_percent', 0.15) or 0.15)
+                htf_gap_detail = f"{_fmt(htf_gap_pct, 3)}% >= {float(cfg.get('htf_ema_gap_min_percent', 0.15) or 0.15):.3f}%"
+            else:
+                htf_trend = None
+                htf_trend_detail = htf_error or "1H 계산 대기"
+                htf_gap_state = None
+                htf_gap_detail = htf_error or "1H 계산 대기"
+
+            if data_ready and self._is_valid_number(rsi_value):
+                if side == 'long':
+                    rsi_state = rsi_value > rsi_threshold
+                    if cfg.get('exclude_rsi_extreme', False):
+                        rsi_state = rsi_state and rsi_value <= float(cfg.get('rsi_long_extreme', 80.0) or 80.0)
+                    rsi_detail = f"RSI {_fmt(rsi_value, 2)} > {rsi_threshold:.1f}"
+                else:
+                    rsi_state = rsi_value < rsi_threshold
+                    if cfg.get('exclude_rsi_extreme', False):
+                        rsi_state = rsi_state and rsi_value >= float(cfg.get('rsi_short_extreme', 20.0) or 20.0)
+                    rsi_detail = f"RSI {_fmt(rsi_value, 2)} < {rsi_threshold:.1f}"
+            else:
+                rsi_state = None
+                rsi_detail = f"데이터 부족 {len(closed)}/{min_bars}"
+
+            adx_state = None
+            adx_detail = adx_reason or f"데이터 부족 {len(closed)}/{min_bars}"
+            if data_ready and self._is_valid_number(adx_value):
+                adx_state = float(adx_value) >= float(cfg.get('adx_threshold', 22.0) or 22.0)
+                adx_detail = f"ADX {_fmt(adx_value, 2)} >= {float(cfg.get('adx_threshold', 22.0) or 22.0):.1f}"
+
+            if don_ready:
+                if side == 'long':
+                    don_state = entry_price > don_high_prev
+                    don_detail = f"close {_fmt(entry_price, 4)} > prev high {_fmt(don_high_prev, 4)}"
+                else:
+                    don_state = entry_price < don_low_prev
+                    don_detail = f"close {_fmt(entry_price, 4)} < prev low {_fmt(don_low_prev, 4)}"
+                don_width_state = don_width_pct >= float(cfg.get('donchian_width_min_percent', 0.50) or 0.50)
+                don_width_detail = f"{_fmt(don_width_pct, 3)}% >= {float(cfg.get('donchian_width_min_percent', 0.50) or 0.50):.2f}%"
+            else:
+                don_state = None
+                don_detail = f"Donchian 데이터 부족 {len(closed)}/{int(cfg['donchian_length']) + 1}"
+                don_width_state = None
+                don_width_detail = "Donchian 계산 대기"
+
+            if data_ready and self._is_valid_number(atr_pct):
+                atr_state = float(cfg.get('atr_min_percent', 0.12) or 0.12) <= atr_pct <= float(cfg.get('atr_max_percent', 1.20) or 1.20)
+                atr_detail = f"{_fmt(atr_pct, 3)}% in {float(cfg.get('atr_min_percent', 0.12) or 0.12):.2f}~{float(cfg.get('atr_max_percent', 1.20) or 1.20):.2f}%"
+            else:
+                atr_state = None
+                atr_detail = "ATR 계산 대기"
+
+            if data_ready and self._is_valid_number(ema_near_pct):
+                ema_state = ema_near_pct >= float(cfg.get('ema_near_percent', 0.20) or 0.20)
+                ema_detail = f"{_fmt(ema_near_pct, 3)}% >= {float(cfg.get('ema_near_percent', 0.20) or 0.20):.2f}%"
+            else:
+                ema_state = None
+                ema_detail = "EMA200 거리 계산 대기"
+
+            items = [
+                ("UTBot 방향", ut_state, ut_detail_text),
+                ("1H EMA 추세", htf_trend, htf_trend_detail),
+                ("1H EMA Gap", htf_gap_state, htf_gap_detail),
+                ("RSI 모멘텀", rsi_state, rsi_detail),
+                ("ADX 추세강도", adx_state, adx_detail),
+                ("Donchian 돌파", don_state, don_detail),
+                ("ATR% 변동성", atr_state, atr_detail),
+                ("15M EMA200 거리", ema_state, ema_detail),
+                ("Donchian Width", don_width_state, don_width_detail),
+                ("일일 리스크", daily_ok, daily_detail),
+                ("RR/수량 계획", risk_ok, balance_detail)
+            ]
+            ok = all(item[1] is True for item in items)
+            lines = [f"{side_upper}: {'진입 가능' if ok else '대기'}"]
+            lines.extend(_line(idx, label, state, detail) for idx, (label, state, detail) in enumerate(items, 1))
+            return ok, lines
+
+        long_ok, long_lines = _side_conditions('long')
+        short_ok, short_lines = _side_conditions('short')
+        ut_label = f"{str(candidate_side or 'none').upper()} ({candidate_type})"
+        text_lines = [
+            "🚦 UT Breakout 조건 스테이터스",
+            f"심볼: {symbol}",
+            f"TF: 진입 {entry_tf} / HTF {htf_tf}",
+            f"마지막 마감봉: {_fmt_ts(decision_ts)} / close {_fmt(entry_price, 4)}",
+            f"현재 UTBot 방향: {ut_label}",
+            f"최종: LONG {'가능' if long_ok else '대기'} / SHORT {'가능' if short_ok else '대기'}",
+            "",
+            *long_lines,
+            "",
+            *short_lines,
+            "",
+            f"UT 사유: {ut_reason}"
+        ]
+        return "\n".join(text_lines)
 
     def _calculate_smc_structure_scope(self, closed, size, scope_name):
         result = {
@@ -14130,6 +14383,8 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
 `/utbreakout risk 5` - 1회 최대 손실 5 USDT로 설정
 `/utbreakout riskpct 1` - 잔고 대비 손실 기준 1%로 설정
 `/utbreakout dailyloss 30` - 하루 최대 손실 30 USDT로 설정
+`/utbreakout status` - 롱/숏 조건 신호등
+`/utbreakout menu` - 이 메뉴 다시 보기
 `/utbreakout log` - 진단 로그 파일 다운로드
 `/utbreakout toggle_opposite` - 반대 UT 신호 청산 토글
 `/utbreakout toggle_ema` - EMA50/RSI 청산 토글
@@ -14170,6 +14425,7 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
                     InlineKeyboardButton("RSI과열", callback_data="utb:toggle_extreme")
                 ],
                 [
+                    InlineKeyboardButton("조건 스테이터스", callback_data="utb:condition_status"),
                     InlineKeyboardButton("진단 로그 다운로드", callback_data="utb:download")
                 ],
                 [
@@ -14217,6 +14473,32 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
             except Exception as e:
                 logger.error(f"UT breakout diagnostic log download failed: {e}")
                 await message.reply_text(f"진단 로그 다운로드 실패: {e}")
+
+        def _get_utbreakout_status_symbol():
+            watchlist = self.get_active_watchlist()
+            return watchlist[0] if watchlist else 'BTC/USDT'
+
+        async def _get_utbreakout_condition_status_text():
+            engine = self.engines.get('signal')
+            if not engine:
+                return "🚦 UT Breakout 조건 스테이터스\n\nSignal 엔진을 찾을 수 없습니다."
+            symbol = _get_utbreakout_status_symbol()
+            return await engine.build_utbreakout_condition_status_text(symbol)
+
+        async def _send_utbreakout_condition_status(message):
+            if message is None:
+                return
+            text = await _get_utbreakout_condition_status_text()
+            await message.reply_text(text, reply_markup=_build_utbreakout_keyboard())
+
+        async def _edit_utbreakout_condition_status(query):
+            text = await _get_utbreakout_condition_status_text()
+            try:
+                await query.edit_message_text(text, reply_markup=_build_utbreakout_keyboard())
+            except BadRequest as md_err:
+                if "message is not modified" in str(md_err).lower():
+                    return
+                raise
 
         def _current_utbreakout_cfg():
             raw = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
@@ -14349,7 +14631,10 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
             elif action in {'log', 'logs', 'download'}:
                 await _send_utbreakout_log_document(u.message)
                 return
-            elif action in {'status', 'menu', ''}:
+            elif action in {'status', 'conditions', 'condition_status'}:
+                await _send_utbreakout_condition_status(u.message)
+                return
+            elif action in {'menu', ''}:
                 pass
             else:
                 await u.message.reply_text("❌ 알 수 없는 UT Breakout 명령입니다. `/utbreakout`로 메뉴를 확인하세요.", parse_mode=ParseMode.MARKDOWN)
@@ -14452,6 +14737,10 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
 
             if action == 'download':
                 await _send_utbreakout_log_document(query.message)
+                return
+
+            if action == 'condition_status':
+                await _edit_utbreakout_condition_status(query)
                 return
 
             await _edit_utbreakout_menu(query)
