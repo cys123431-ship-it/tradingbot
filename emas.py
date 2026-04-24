@@ -224,7 +224,7 @@ ALT_TREND_TIMEFRAME_ORDER = {
     timeframe: idx for idx, timeframe in enumerate(ALT_TREND_ALLOWED_TIMEFRAMES)
 }
 BINANCE_FAPI_PUBLIC_BASE_URL = 'https://fapi.binance.com'
-UTBREAKOUT_ACTIVE_SET_MAX = 10
+UTBREAKOUT_ACTIVE_SET_MAX = 50
 UTBREAKOUT_DEFAULT_SET_ID = 2
 UTBREAKOUT_AUTO_TIMEFRAMES = ['15m', '30m', '1h', '2h', '4h']
 
@@ -3953,6 +3953,45 @@ class SignalEngine(BaseEngine):
         aroon_down = 100.0 * (length - periods_since_low) / max(float(length), 1.0)
         return float(aroon_up), float(aroon_down), f"AroonUp {aroon_up:.2f} | AroonDown {aroon_down:.2f}"
 
+    def _calculate_utbreakout_psar_direction(self, closed, step=0.02, max_step=0.20):
+        if closed is None or len(closed) < 12:
+            return None, None, "PSAR 데이터 부족"
+        high = closed['high'].astype(float).reset_index(drop=True)
+        low = closed['low'].astype(float).reset_index(drop=True)
+        close = closed['close'].astype(float).reset_index(drop=True)
+        bull = bool(close.iloc[1] >= close.iloc[0])
+        psar = float(low.iloc[0] if bull else high.iloc[0])
+        extreme = float(high.iloc[0] if bull else low.iloc[0])
+        accel = float(step)
+        for idx in range(1, len(closed)):
+            psar = psar + accel * (extreme - psar)
+            if bull:
+                if idx >= 2:
+                    psar = min(psar, float(low.iloc[idx - 1]), float(low.iloc[idx - 2]))
+                if float(low.iloc[idx]) < psar:
+                    bull = False
+                    psar = extreme
+                    extreme = float(low.iloc[idx])
+                    accel = float(step)
+                else:
+                    if float(high.iloc[idx]) > extreme:
+                        extreme = float(high.iloc[idx])
+                        accel = min(float(max_step), accel + float(step))
+            else:
+                if idx >= 2:
+                    psar = max(psar, float(high.iloc[idx - 1]), float(high.iloc[idx - 2]))
+                if float(high.iloc[idx]) > psar:
+                    bull = True
+                    psar = extreme
+                    extreme = float(high.iloc[idx])
+                    accel = float(step)
+                else:
+                    if float(low.iloc[idx]) < extreme:
+                        extreme = float(low.iloc[idx])
+                        accel = min(float(max_step), accel + float(step))
+        direction = 'long' if bull else 'short'
+        return direction, float(psar), f"PSAR {direction.upper()} @ {psar:.4f}"
+
     def _calculate_utbreakout_timeframe_metrics(self, closed, cfg):
         metrics = {'ready': False, 'reason': '데이터 부족'}
         if closed is None or len(closed) < 30:
@@ -3969,6 +4008,7 @@ class SignalEngine(BaseEngine):
         high = local['high'].astype(float)
         low = local['low'].astype(float)
         volume = local['volume'].astype(float) if 'volume' in local else pd.Series(0.0, index=local.index)
+        curr_open = float(local['open'].astype(float).iloc[-1])
         curr_close = float(close.iloc[-1])
         prev_close = float(close.iloc[-2]) if len(close) >= 2 else curr_close
         ema_fast_len = int(cfg.get('ema_fast', 50) or 50)
@@ -3992,6 +4032,35 @@ class SignalEngine(BaseEngine):
 
         rsi_series = self._calculate_wilder_rsi_series(close, int(cfg.get('rsi_length', 14) or 14))
         rsi_value = float(rsi_series.iloc[-1]) if self._is_valid_number(rsi_series.iloc[-1]) else np.nan
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        macd_line = ema12 - ema26
+        macd_signal = macd_line.ewm(span=9, adjust=False).mean()
+        macd_hist = macd_line - macd_signal
+        macd_hist_value = float(macd_hist.iloc[-1]) if self._is_valid_number(macd_hist.iloc[-1]) else np.nan
+        macd_hist_prev = float(macd_hist.iloc[-2]) if len(macd_hist) >= 2 and self._is_valid_number(macd_hist.iloc[-2]) else np.nan
+        roc_len = 10
+        roc_pct = (
+            (curr_close / max(abs(float(close.iloc[-roc_len - 1])), 1e-9) - 1.0) * 100.0
+            if len(close) > roc_len and self._is_valid_number(close.iloc[-roc_len - 1])
+            else np.nan
+        )
+        typical_price = (high + low + close) / 3.0
+        cci_len = 20
+        tp_sma = typical_price.rolling(cci_len).mean()
+        tp_mad = typical_price.rolling(cci_len).apply(
+            lambda values: float(np.mean(np.abs(values - np.mean(values)))),
+            raw=True
+        )
+        cci_series = (typical_price - tp_sma) / (0.015 * tp_mad.replace(0.0, np.nan))
+        cci_value = float(cci_series.iloc[-1]) if self._is_valid_number(cci_series.iloc[-1]) else np.nan
+        stoch_len = 14
+        lowest_low = low.rolling(stoch_len).min()
+        highest_high = high.rolling(stoch_len).max()
+        stoch_k = 100.0 * ((close - lowest_low) / (highest_high - lowest_low).replace(0.0, np.nan))
+        stoch_d = stoch_k.rolling(3).mean()
+        stoch_k_value = float(stoch_k.iloc[-1]) if self._is_valid_number(stoch_k.iloc[-1]) else np.nan
+        stoch_d_value = float(stoch_d.iloc[-1]) if self._is_valid_number(stoch_d.iloc[-1]) else np.nan
         adx_value, plus_di, minus_di, adx_reason = self._calculate_utbot_filter_pack_adx_dmi(
             local,
             int(cfg.get('adx_length', 14) or 14)
@@ -3999,6 +4068,8 @@ class SignalEngine(BaseEngine):
         atr_series = self._calculate_wilder_atr_series(local, int(cfg.get('atr_length', 14) or 14))
         atr_value = float(atr_series.iloc[-1]) if self._is_valid_number(atr_series.iloc[-1]) else np.nan
         atr_pct = atr_value / max(abs(curr_close), 1e-9) * 100.0 if self._is_valid_number(atr_value) else np.nan
+        atr20_series = self._calculate_wilder_atr_series(local, 20)
+        atr20_value = float(atr20_series.iloc[-1]) if self._is_valid_number(atr20_series.iloc[-1]) else np.nan
         chop_value, chop_reason = self._calculate_utbot_filter_pack_chop(local, 14)
         vortex_plus, vortex_minus, vortex_reason = self._calculate_utbreakout_vortex(local, 14)
         aroon_up, aroon_down, aroon_reason = self._calculate_utbreakout_aroon(local, 25)
@@ -4020,18 +4091,98 @@ class SignalEngine(BaseEngine):
         vol_ma = volume.rolling(20).mean().iloc[-1] if len(volume) >= 20 else np.nan
         volume_ratio = float(volume.iloc[-1] / vol_ma) if self._is_valid_number(vol_ma) and float(vol_ma) > 0 else np.nan
         bb_width_pct = np.nan
+        bb_width_prev_pct = np.nan
+        bb_width_min_pct = np.nan
+        bb_upper_value = np.nan
+        bb_lower_value = np.nan
+        bb_mid_value = np.nan
         if len(close) >= 20:
             bb_mid = close.rolling(20).mean()
             bb_std = close.rolling(20).std()
             bb_upper = bb_mid + (2.0 * bb_std)
             bb_lower = bb_mid - (2.0 * bb_std)
             if self._is_valid_number(bb_upper.iloc[-1]) and self._is_valid_number(bb_lower.iloc[-1]):
+                bb_upper_value = float(bb_upper.iloc[-1])
+                bb_lower_value = float(bb_lower.iloc[-1])
+                bb_mid_value = float(bb_mid.iloc[-1])
                 bb_width_pct = (float(bb_upper.iloc[-1]) - float(bb_lower.iloc[-1])) / max(abs(curr_close), 1e-9) * 100.0
+                if len(bb_upper) >= 2 and self._is_valid_number(bb_upper.iloc[-2]) and self._is_valid_number(bb_lower.iloc[-2]):
+                    bb_width_prev_pct = (float(bb_upper.iloc[-2]) - float(bb_lower.iloc[-2])) / max(abs(prev_close), 1e-9) * 100.0
+                bb_width_series = ((bb_upper - bb_lower) / close.abs().replace(0.0, np.nan)) * 100.0
+                bb_width_min = bb_width_series.rolling(min(120, len(bb_width_series)), min_periods=20).min().iloc[-1]
+                bb_width_min_pct = float(bb_width_min) if self._is_valid_number(bb_width_min) else np.nan
+
+        keltner_mid = close.ewm(span=20, adjust=False).mean()
+        keltner_upper = keltner_mid + (2.0 * atr20_series)
+        keltner_lower = keltner_mid - (2.0 * atr20_series)
+        keltner_mid_value = float(keltner_mid.iloc[-1]) if self._is_valid_number(keltner_mid.iloc[-1]) else np.nan
+        keltner_upper_value = float(keltner_upper.iloc[-1]) if self._is_valid_number(keltner_upper.iloc[-1]) else np.nan
+        keltner_lower_value = float(keltner_lower.iloc[-1]) if self._is_valid_number(keltner_lower.iloc[-1]) else np.nan
+        keltner_width_pct = (
+            (keltner_upper_value - keltner_lower_value) / max(abs(curr_close), 1e-9) * 100.0
+            if self._is_valid_number(keltner_upper_value) and self._is_valid_number(keltner_lower_value)
+            else np.nan
+        )
+        keltner_width_prev_pct = (
+            (float(keltner_upper.iloc[-2]) - float(keltner_lower.iloc[-2])) / max(abs(prev_close), 1e-9) * 100.0
+            if len(keltner_upper) >= 2 and self._is_valid_number(keltner_upper.iloc[-2]) and self._is_valid_number(keltner_lower.iloc[-2])
+            else np.nan
+        )
+
+        candle_range_pct = (float(high.iloc[-1]) - float(low.iloc[-1])) / max(abs(curr_close), 1e-9) * 100.0
+        avg_range20_pct = ((high - low) / close.abs().replace(0.0, np.nan) * 100.0).rolling(20).mean().iloc[-1]
+        avg_range50_pct = ((high - low) / close.abs().replace(0.0, np.nan) * 100.0).rolling(50).mean().iloc[-1]
+        avg_range20_pct = float(avg_range20_pct) if self._is_valid_number(avg_range20_pct) else np.nan
+        avg_range50_pct = float(avg_range50_pct) if self._is_valid_number(avg_range50_pct) else np.nan
+        range_expansion_ratio = candle_range_pct / max(avg_range20_pct, 1e-9) if self._is_valid_number(avg_range20_pct) else np.nan
+        range_compression_ratio = avg_range20_pct / max(avg_range50_pct, 1e-9) if self._is_valid_number(avg_range50_pct) else np.nan
+
+        close_delta = close.diff().fillna(0.0)
+        signed_volume = pd.Series(
+            np.where(close_delta > 0, volume, np.where(close_delta < 0, -volume, 0.0)),
+            index=close.index,
+            dtype=float
+        )
+        obv = signed_volume.cumsum()
+        obv_slope = float(obv.iloc[-1] - obv.iloc[-6]) if len(obv) >= 6 else np.nan
+        avg_volume20 = volume.rolling(20).mean().iloc[-1] if len(volume) >= 20 else np.nan
+        obv_slope_ratio = obv_slope / max(abs(float(avg_volume20)), 1e-9) if self._is_valid_number(avg_volume20) else np.nan
+
+        money_flow = typical_price * volume
+        tp_delta = typical_price.diff().fillna(0.0)
+        positive_flow = money_flow.where(tp_delta > 0, 0.0).rolling(14).sum()
+        negative_flow = money_flow.where(tp_delta < 0, 0.0).abs().rolling(14).sum().replace(0.0, np.nan)
+        mfi = 100.0 - (100.0 / (1.0 + (positive_flow / negative_flow)))
+        mfi_value = float(mfi.iloc[-1]) if self._is_valid_number(mfi.iloc[-1]) else np.nan
+
+        psar_direction, psar_value, psar_reason = self._calculate_utbreakout_psar_direction(local)
+        tenkan = (high.rolling(9).max() + low.rolling(9).min()) / 2.0
+        kijun = (high.rolling(26).max() + low.rolling(26).min()) / 2.0
+        span_a = (tenkan + kijun) / 2.0
+        span_b = (high.rolling(52).max() + low.rolling(52).min()) / 2.0
+        ichimoku_a = float(span_a.iloc[-1]) if self._is_valid_number(span_a.iloc[-1]) else np.nan
+        ichimoku_b = float(span_b.iloc[-1]) if self._is_valid_number(span_b.iloc[-1]) else np.nan
+        ichimoku_top = max(ichimoku_a, ichimoku_b) if self._is_valid_number(ichimoku_a) and self._is_valid_number(ichimoku_b) else np.nan
+        ichimoku_bottom = min(ichimoku_a, ichimoku_b) if self._is_valid_number(ichimoku_a) and self._is_valid_number(ichimoku_b) else np.nan
+        ichimoku_bias = (
+            'long' if self._is_valid_number(ichimoku_top) and curr_close > ichimoku_top
+            else 'short' if self._is_valid_number(ichimoku_bottom) and curr_close < ichimoku_bottom
+            else 'neutral'
+        )
+        session_hour_kst = None
+        try:
+            session_hour_kst = datetime.fromtimestamp(
+                int(local.iloc[-1].get('timestamp') or 0) / 1000,
+                timezone.utc
+            ).astimezone(timezone(timedelta(hours=9))).hour
+        except Exception:
+            session_hour_kst = None
 
         metrics.update({
             'ready': True,
             'reason': 'OK',
             'timestamp': int(local.iloc[-1].get('timestamp') or 0),
+            'open': curr_open,
             'close': curr_close,
             'prev_close': prev_close,
             'ema_fast': ema_fast,
@@ -4040,6 +4191,12 @@ class SignalEngine(BaseEngine):
             'ema_gap_pct': ema_gap_pct,
             'ema_bias': ema_bias,
             'rsi': rsi_value,
+            'macd_hist': macd_hist_value,
+            'macd_hist_prev': macd_hist_prev,
+            'roc_pct': roc_pct,
+            'cci': cci_value,
+            'stoch_k': stoch_k_value,
+            'stoch_d': stoch_d_value,
             'adx': adx_value,
             'plus_di': plus_di,
             'minus_di': minus_di,
@@ -4061,8 +4218,35 @@ class SignalEngine(BaseEngine):
             'donchian_low_prev': don_low_prev,
             'donchian_width_pct': don_width_pct,
             'donchian_ready': don_ready,
+            'bb_upper': bb_upper_value,
+            'bb_lower': bb_lower_value,
+            'bb_mid': bb_mid_value,
             'bb_width_pct': bb_width_pct,
+            'bb_width_prev_pct': bb_width_prev_pct,
+            'bb_width_min_pct': bb_width_min_pct,
+            'keltner_upper': keltner_upper_value,
+            'keltner_lower': keltner_lower_value,
+            'keltner_mid': keltner_mid_value,
+            'keltner_width_pct': keltner_width_pct,
+            'keltner_width_prev_pct': keltner_width_prev_pct,
+            'candle_range_pct': candle_range_pct,
+            'avg_range20_pct': avg_range20_pct,
+            'avg_range50_pct': avg_range50_pct,
+            'range_expansion_ratio': range_expansion_ratio,
+            'range_compression_ratio': range_compression_ratio,
             'volume_ratio': volume_ratio,
+            'obv_slope': obv_slope,
+            'obv_slope_ratio': obv_slope_ratio,
+            'mfi': mfi_value,
+            'psar_direction': psar_direction,
+            'psar': psar_value,
+            'psar_reason': psar_reason,
+            'ichimoku_a': ichimoku_a,
+            'ichimoku_b': ichimoku_b,
+            'ichimoku_top': ichimoku_top,
+            'ichimoku_bottom': ichimoku_bottom,
+            'ichimoku_bias': ichimoku_bias,
+            'session_hour_kst': session_hour_kst,
         })
         return metrics
 
@@ -4088,20 +4272,149 @@ class SignalEngine(BaseEngine):
         don_width_vals = _valid_values('donchian_width_pct')
         volume_vals = _valid_values('volume_ratio')
         bb_width_vals = _valid_values('bb_width_pct')
+        bb_width_prev_vals = _valid_values('bb_width_prev_pct')
+        bb_width_min_vals = _valid_values('bb_width_min_pct')
+        keltner_width_vals = _valid_values('keltner_width_pct')
+        keltner_width_prev_vals = _valid_values('keltner_width_prev_pct')
+        range_expansion_vals = _valid_values('range_expansion_ratio')
+        range_compression_vals = _valid_values('range_compression_ratio')
+        roc_vals = _valid_values('roc_pct')
+        cci_vals = _valid_values('cci')
+        stoch_k_vals = _valid_values('stoch_k')
+        stoch_d_vals = _valid_values('stoch_d')
+        obv_vals = _valid_values('obv_slope_ratio')
+        mfi_vals = _valid_values('mfi')
+
+        def _scale(value, low, high):
+            try:
+                if not np.isfinite(float(value)) or high <= low:
+                    return 0.0
+                return min(100.0, max(0.0, (float(value) - float(low)) / (float(high) - float(low)) * 100.0))
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _atr_normal_score(value):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return 0.0
+            if not np.isfinite(value):
+                return 0.0
+            if value < 0.12:
+                return _scale(value, 0.04, 0.12) * 0.55
+            if value <= 0.45:
+                return 58.0 + _scale(value, 0.12, 0.45) * 34.0 / 100.0
+            if value <= 1.20:
+                return 92.0 - _scale(value, 0.45, 1.20) * 24.0 / 100.0
+            return max(0.0, 68.0 - _scale(value, 1.20, 2.20) * 68.0 / 100.0)
 
         adx_score = _avg([min(100.0, max(0.0, (v - 10.0) / 25.0 * 100.0)) for v in adx_vals], 35.0)
         gap_score = _avg([min(100.0, max(0.0, v / 0.80 * 100.0)) for v in gap_vals], 35.0)
         chop_trend_score = _avg([min(100.0, max(0.0, (62.0 - v) / 24.0 * 100.0)) for v in chop_vals], 45.0)
         chop_score = _avg([min(100.0, max(0.0, (v - 38.0) / 24.0 * 100.0)) for v in chop_vals], 45.0)
-        volatility_score = _avg([
-            100.0 if 0.12 <= v <= 1.20 else max(0.0, 100.0 - abs(v - 0.66) * 90.0)
-            for v in atr_vals
-        ], 55.0)
-        momentum_score = _avg([min(100.0, abs(v - 50.0) * 4.0) for v in rsi_vals], 40.0)
+        volatility_score = _avg([_atr_normal_score(v) for v in atr_vals], 55.0)
+        low_vol_score = _avg([max(0.0, 100.0 - _scale(v, 0.08, 0.35)) for v in atr_vals], 35.0)
+        high_vol_score = _avg([_scale(v, 0.75, 1.60) for v in atr_vals], 30.0)
+        rsi_momentum_score = _avg([min(100.0, abs(v - 50.0) * 4.0) for v in rsi_vals], 40.0)
+        roc_score = _avg([min(100.0, abs(v) / 1.20 * 100.0) for v in roc_vals], 35.0)
+        cci_score = _avg([min(100.0, abs(v) / 160.0 * 100.0) for v in cci_vals], 35.0)
+        stoch_scores = []
+        for item in ready_metrics:
+            stoch_k = item.get('stoch_k')
+            stoch_d = item.get('stoch_d')
+            if self._is_valid_number(stoch_k) and self._is_valid_number(stoch_d):
+                stoch_scores.append(min(100.0, abs(float(stoch_k) - float(stoch_d)) / 30.0 * 100.0))
+        stoch_score = _avg(stoch_scores, 35.0)
+        macd_scores = []
+        for item in ready_metrics:
+            macd_hist = item.get('macd_hist')
+            close_value = item.get('close')
+            if self._is_valid_number(macd_hist) and self._is_valid_number(close_value):
+                macd_pct = abs(float(macd_hist)) / max(abs(float(close_value)), 1e-9) * 100.0
+                macd_scores.append(min(100.0, macd_pct / 0.08 * 100.0))
+        macd_score = _avg(macd_scores, 35.0)
+        momentum_score = (rsi_momentum_score * 0.32) + (macd_score * 0.24) + (roc_score * 0.20) + (cci_score * 0.14) + (stoch_score * 0.10)
         breakout_score = _avg([min(100.0, max(0.0, v / 1.0 * 100.0)) for v in don_width_vals], 40.0)
         if bb_width_vals:
             breakout_score = (breakout_score + _avg([min(100.0, max(0.0, v / 1.5 * 100.0)) for v in bb_width_vals])) / 2.0
         flow_score = _avg([min(100.0, max(0.0, (v - 0.7) / 1.3 * 100.0)) for v in volume_vals], 40.0)
+        volume_spike_score = _avg([_scale(v, 1.20, 2.40) for v in volume_vals], 30.0)
+        relative_volume_score = _avg([_scale(v, 0.80, 1.80) for v in volume_vals], 40.0)
+        obv_score = _avg([min(100.0, abs(v) / 3.0 * 100.0) for v in obv_vals], 35.0)
+        mfi_score = _avg([min(100.0, abs(v - 50.0) * 4.0) for v in mfi_vals], 35.0)
+        vwap_scores = []
+        pullback_scores = []
+        psar_votes = {'long': 0, 'short': 0}
+        ichimoku_votes = {'long': 0, 'short': 0}
+        session_scores = []
+        for item in ready_metrics:
+            close_value = item.get('close')
+            vwap_slope = item.get('vwap_slope')
+            if self._is_valid_number(vwap_slope) and self._is_valid_number(close_value):
+                slope_pct = abs(float(vwap_slope)) / max(abs(float(close_value)), 1e-9) * 100.0
+                vwap_scores.append(min(100.0, slope_pct / 0.03 * 100.0))
+            distances = []
+            for key, max_dist in [('vwap', 0.55), ('ema_fast', 0.80), ('bb_mid', 0.65)]:
+                ref = item.get(key)
+                if self._is_valid_number(ref) and self._is_valid_number(close_value):
+                    dist_pct = abs(float(close_value) - float(ref)) / max(abs(float(close_value)), 1e-9) * 100.0
+                    distances.append(max(0.0, 100.0 - min(100.0, dist_pct / max_dist * 100.0)))
+            if distances:
+                pullback_scores.append(max(distances))
+            psar_direction = str(item.get('psar_direction') or '').lower()
+            if psar_direction in psar_votes:
+                psar_votes[psar_direction] += 1
+            ichimoku_bias = str(item.get('ichimoku_bias') or '').lower()
+            if ichimoku_bias in ichimoku_votes:
+                ichimoku_votes[ichimoku_bias] += 1
+            hour = item.get('session_hour_kst')
+            atr_pct = item.get('atr_pct')
+            volume_ratio = item.get('volume_ratio')
+            if hour is not None:
+                active_session = int(hour) in {0, 1, 2, 8, 9, 10, 16, 17, 18, 19, 20, 21, 22, 23}
+                atr_ok = self._is_valid_number(atr_pct) and float(atr_pct) >= 0.12
+                vol_ok = self._is_valid_number(volume_ratio) and float(volume_ratio) >= 0.9
+                session_scores.append(85.0 if active_session and (atr_ok or vol_ok) else 35.0 if active_session else 15.0)
+        vwap_score = _avg(vwap_scores, 35.0)
+        pullback_score = _avg(pullback_scores, 35.0)
+        psar_total = psar_votes['long'] + psar_votes['short']
+        psar_score = abs(psar_votes['long'] - psar_votes['short']) / max(psar_total, 1) * 100.0 if psar_total else 35.0
+        ichimoku_total = ichimoku_votes['long'] + ichimoku_votes['short']
+        ichimoku_score = abs(ichimoku_votes['long'] - ichimoku_votes['short']) / max(ichimoku_total, 1) * 100.0 if ichimoku_total else 35.0
+        session_score = _avg(session_scores, 35.0)
+
+        bb_expansion_scores = []
+        squeeze_release_scores = []
+        squeeze_avoid_scores = []
+        for item in ready_metrics:
+            width = item.get('bb_width_pct')
+            prev = item.get('bb_width_prev_pct')
+            min_width = item.get('bb_width_min_pct')
+            if self._is_valid_number(width) and self._is_valid_number(prev):
+                bb_expansion_scores.append(
+                    50.0 + min(50.0, max(-50.0, ((float(width) - float(prev)) / max(abs(float(prev)), 1e-9)) * 160.0))
+                )
+            if self._is_valid_number(width) and self._is_valid_number(min_width):
+                ratio = float(width) / max(float(min_width), 1e-9)
+                squeeze_release_scores.append(_scale(ratio, 1.05, 1.90))
+                squeeze_avoid_scores.append(_scale(ratio, 1.05, 1.80))
+        bb_expansion_score = _avg(bb_expansion_scores, 40.0)
+        if squeeze_release_scores:
+            squeeze_release = _avg(squeeze_release_scores, 40.0)
+            bb_expansion_score = (bb_expansion_score + squeeze_release) / 2.0
+
+        keltner_expansion_scores = []
+        for item in ready_metrics:
+            width = item.get('keltner_width_pct')
+            prev = item.get('keltner_width_prev_pct')
+            if self._is_valid_number(width) and self._is_valid_number(prev):
+                keltner_expansion_scores.append(
+                    50.0 + min(50.0, max(-50.0, ((float(width) - float(prev)) / max(abs(float(prev)), 1e-9)) * 160.0))
+                )
+        keltner_expansion_score = _avg(keltner_expansion_scores, 40.0)
+        range_expansion_score = _avg([_scale(v, 0.95, 2.20) for v in range_expansion_vals], 40.0)
+        squeeze_avoid_score = _avg(squeeze_avoid_scores, 45.0)
+        compression_avoid_score = _avg([_scale(v, 0.65, 1.10) for v in range_compression_vals], 45.0)
 
         long_votes = 0
         short_votes = 0
@@ -4127,15 +4440,43 @@ class SignalEngine(BaseEngine):
         alignment_score = abs(long_votes - short_votes) / max(total_votes, 1) * 100.0
         dominant_side = 'long' if long_votes > short_votes else 'short' if short_votes > long_votes else 'neutral'
         trend_score = (adx_score * 0.45) + (gap_score * 0.25) + (chop_trend_score * 0.30)
+        mtf_momentum_score = (momentum_score * 0.60) + (alignment_score * 0.40)
+        mtf_volatility_score = (volatility_score * 0.70) + (min(100.0, len(ready_metrics) / max(len(tf_metrics), 1) * 100.0) * 0.30)
+        clarity_score = max(trend_score, breakout_score, momentum_score, alignment_score)
+        fallback_score = max(0.0, 100.0 - clarity_score)
 
         return {
             'trend_score': round(trend_score, 2),
             'chop_score': round(chop_score, 2),
             'volatility_score': round(volatility_score, 2),
+            'low_vol_score': round(low_vol_score, 2),
+            'high_vol_score': round(high_vol_score, 2),
             'breakout_score': round(breakout_score, 2),
             'momentum_score': round(momentum_score, 2),
+            'rsi_momentum_score': round(rsi_momentum_score, 2),
+            'macd_score': round(macd_score, 2),
+            'roc_score': round(roc_score, 2),
+            'cci_score': round(cci_score, 2),
+            'stoch_score': round(stoch_score, 2),
+            'bb_expansion_score': round(bb_expansion_score, 2),
+            'keltner_expansion_score': round(keltner_expansion_score, 2),
+            'range_expansion_score': round(range_expansion_score, 2),
+            'pullback_score': round(pullback_score, 2),
             'flow_score': round(flow_score, 2),
+            'volume_spike_score': round(volume_spike_score, 2),
+            'relative_volume_score': round(relative_volume_score, 2),
+            'obv_score': round(obv_score, 2),
+            'mfi_score': round(mfi_score, 2),
+            'vwap_score': round(vwap_score, 2),
+            'squeeze_avoid_score': round(squeeze_avoid_score, 2),
+            'compression_avoid_score': round(compression_avoid_score, 2),
             'alignment_score': round(alignment_score, 2),
+            'mtf_momentum_score': round(mtf_momentum_score, 2),
+            'mtf_volatility_score': round(mtf_volatility_score, 2),
+            'psar_score': round(psar_score, 2),
+            'ichimoku_score': round(ichimoku_score, 2),
+            'session_score': round(session_score, 2),
+            'fallback_score': round(fallback_score, 2),
             'dominant_side': dominant_side,
             'ready_timeframes': len(ready_metrics),
         }
@@ -4179,45 +4520,110 @@ class SignalEngine(BaseEngine):
         trend = float(scores.get('trend_score', 0.0) or 0.0)
         chop = float(scores.get('chop_score', 0.0) or 0.0)
         volatility = float(scores.get('volatility_score', 0.0) or 0.0)
+        low_vol = float(scores.get('low_vol_score', 0.0) or 0.0)
+        high_vol = float(scores.get('high_vol_score', 0.0) or 0.0)
         breakout = float(scores.get('breakout_score', 0.0) or 0.0)
         momentum = float(scores.get('momentum_score', 0.0) or 0.0)
+        rsi_momentum = float(scores.get('rsi_momentum_score', momentum) or 0.0)
+        macd = float(scores.get('macd_score', momentum) or 0.0)
+        roc = float(scores.get('roc_score', momentum) or 0.0)
+        cci = float(scores.get('cci_score', momentum) or 0.0)
+        stoch = float(scores.get('stoch_score', momentum) or 0.0)
+        bb_expansion = float(scores.get('bb_expansion_score', breakout) or 0.0)
+        keltner_expansion = float(scores.get('keltner_expansion_score', breakout) or 0.0)
+        range_expansion = float(scores.get('range_expansion_score', breakout) or 0.0)
+        pullback = float(scores.get('pullback_score', 0.0) or 0.0)
         flow = float(scores.get('flow_score', 0.0) or 0.0)
+        volume_spike = float(scores.get('volume_spike_score', flow) or 0.0)
+        relative_volume = float(scores.get('relative_volume_score', flow) or 0.0)
+        obv = float(scores.get('obv_score', flow) or 0.0)
+        mfi = float(scores.get('mfi_score', flow) or 0.0)
+        vwap = float(scores.get('vwap_score', flow) or 0.0)
+        squeeze_avoid = float(scores.get('squeeze_avoid_score', 0.0) or 0.0)
+        compression_avoid = float(scores.get('compression_avoid_score', 0.0) or 0.0)
         alignment = float(scores.get('alignment_score', 0.0) or 0.0)
+        mtf_momentum = float(scores.get('mtf_momentum_score', 0.0) or 0.0)
+        mtf_volatility = float(scores.get('mtf_volatility_score', volatility) or 0.0)
+        psar = float(scores.get('psar_score', trend) or 0.0)
+        ichimoku = float(scores.get('ichimoku_score', trend) or 0.0)
+        session = float(scores.get('session_score', 0.0) or 0.0)
+        fallback = float(scores.get('fallback_score', 0.0) or 0.0)
         ready = int(scores.get('ready_timeframes', 0) or 0)
 
         if ready <= 0:
-            fallback_id = normalize_utbreakout_set_id(cfg.get('active_set_id'), UTBREAKOUT_DEFAULT_SET_ID)
-            return fallback_id, "AUTO 분석 데이터 부족: 수동 set 유지"
+            return 50, "AUTO 분석 데이터 부족: Set50 emergency simple mode"
 
         clarity = max(trend, breakout, momentum, alignment)
         uncertainty = 100.0 - clarity
         trendability = 100.0 - chop
+        volatility_balance = 100.0 - abs(volatility - 72.0)
         candidate_scores = {
-            1: 42.0 + (uncertainty * 0.22) + (chop * 0.10) - (trend * 0.06) - (breakout * 0.04),
-            2: 40.0 + (volatility * 0.18) + (uncertainty * 0.16) + (chop * 0.04) - (clarity * 0.10),
-            3: 36.0 + (alignment * 0.35) + (trend * 0.15) + (trendability * 0.05),
-            4: 36.0 + (momentum * 0.32) + (trend * 0.10) + (flow * 0.05),
-            5: 32.0 + (trend * 0.28) + (alignment * 0.22) + (trendability * 0.12),
-            6: 40.0 + (trend * 0.35) + (volatility * 0.05),
-            7: 30.0 + (trend * 0.32) + (alignment * 0.22) + (momentum * 0.16) + (trendability * 0.08),
-            8: 34.0 + (trendability * 0.34) + (trend * 0.18) + (volatility * 0.04),
-            9: 34.0 + (momentum * 0.25) + (flow * 0.18) + (trend * 0.10) + (alignment * 0.05),
-            10: 34.0 + (breakout * 0.34) + (momentum * 0.15) + (trend * 0.08) + (trendability * 0.08),
+            1: 34.0 + (uncertainty * 0.20) + (chop * 0.08) - (trend * 0.04) - (breakout * 0.03),
+            2: 33.0 + (volatility_balance * 0.18) + (uncertainty * 0.10) + (low_vol * 0.04) + (high_vol * 0.03),
+            3: 31.0 + (alignment * 0.31) + (trend * 0.16) + (trendability * 0.05),
+            4: 31.0 + (momentum * 0.26) + (trend * 0.10) + (vwap * 0.05),
+            5: 28.0 + (trend * 0.24) + (alignment * 0.22) + (trendability * 0.10),
+            6: 33.0 + (trend * 0.26) + (volatility * 0.07) + (uncertainty * 0.04),
+            7: 26.0 + (trend * 0.20) + (alignment * 0.18) + (momentum * 0.10) + (trendability * 0.05),
+            8: 30.0 + (trendability * 0.30) + (trend * 0.14) + (compression_avoid * 0.04),
+            9: 30.0 + (momentum * 0.18) + (flow * 0.15) + (trend * 0.10) + (alignment * 0.06),
+            10: 30.0 + (breakout * 0.28) + (momentum * 0.13) + (trend * 0.08) + (range_expansion * 0.05),
+            11: 30.0 + (rsi_momentum * 0.33) + (alignment * 0.10) + (volatility * 0.05),
+            12: 30.0 + (macd * 0.34) + (momentum * 0.10) + (trend * 0.05),
+            13: 31.0 + (roc * 0.34) + (range_expansion * 0.08) + (relative_volume * 0.05),
+            14: 29.0 + (cci * 0.34) + (momentum * 0.09) + (trendability * 0.05),
+            15: 31.0 + (stoch * 0.32) + (uncertainty * 0.08) + (relative_volume * 0.05),
+            16: 31.0 + (volatility_balance * 0.28) + (flow * 0.08) + (uncertainty * 0.04),
+            17: 28.0 + (low_vol * 0.34) + (squeeze_avoid * 0.10) + (relative_volume * 0.06),
+            18: 27.0 + (high_vol * 0.34) + (volatility * 0.08) + (trend * 0.06),
+            19: 29.0 + (bb_expansion * 0.34) + (range_expansion * 0.10) + (momentum * 0.05),
+            20: 29.0 + (keltner_expansion * 0.34) + (volatility * 0.08) + (trend * 0.06),
+            21: 28.0 + (breakout * 0.26) + (range_expansion * 0.14) + (relative_volume * 0.06),
+            22: 27.0 + (breakout * 0.30) + (trend * 0.12) + (alignment * 0.05),
+            23: 28.0 + (bb_expansion * 0.28) + (breakout * 0.14) + (volume_spike * 0.05),
+            24: 28.0 + (keltner_expansion * 0.28) + (breakout * 0.12) + (trend * 0.07),
+            25: 29.0 + (range_expansion * 0.34) + (volume_spike * 0.12) + (momentum * 0.04),
+            26: 29.0 + (pullback * 0.30) + (vwap * 0.16) + (trendability * 0.05),
+            27: 29.0 + (pullback * 0.30) + (trend * 0.14) + (volatility * 0.05),
+            28: 28.0 + (pullback * 0.28) + (bb_expansion * 0.10) + (momentum * 0.08),
+            29: 29.0 + (pullback * 0.26) + (rsi_momentum * 0.16) + (uncertainty * 0.05),
+            30: 28.0 + (trend * 0.24) + (volatility * 0.16) + (psar * 0.06),
+            31: 28.0 + (volume_spike * 0.36) + (range_expansion * 0.08) + (momentum * 0.05),
+            32: 30.0 + (relative_volume * 0.34) + (flow * 0.12) + (volatility * 0.04),
+            33: 29.0 + (obv * 0.34) + (flow * 0.10) + (alignment * 0.06),
+            34: 29.0 + (mfi * 0.34) + (flow * 0.10) + (momentum * 0.05),
+            35: 29.0 + (vwap * 0.34) + (pullback * 0.08) + (trend * 0.05),
+            36: 29.0 + (trendability * 0.26) + (compression_avoid * 0.12) + (squeeze_avoid * 0.05),
+            37: 28.0 + (breakout * 0.20) + (compression_avoid * 0.18) + (uncertainty * 0.04),
+            38: 29.0 + (trend * 0.20) + (alignment * 0.16) + (trendability * 0.12),
+            39: 28.0 + (squeeze_avoid * 0.32) + (bb_expansion * 0.10) + (uncertainty * 0.04),
+            40: 28.0 + (compression_avoid * 0.34) + (trendability * 0.08) + (volatility * 0.05),
+            41: 29.0 + (alignment * 0.24) + (mtf_momentum * 0.16) + (momentum * 0.05),
+            42: 29.0 + (alignment * 0.27) + (trend * 0.18) + (mtf_momentum * 0.06),
+            43: 28.0 + (alignment * 0.30) + (trend * 0.18) + (ichimoku * 0.05),
+            44: 29.0 + (mtf_momentum * 0.34) + (alignment * 0.08) + (momentum * 0.05),
+            45: 29.0 + (mtf_volatility * 0.34) + (volatility_balance * 0.08) + (ready * 1.2),
+            46: 29.0 + (psar * 0.34) + (trend * 0.08) + (volatility * 0.05),
+            47: 28.0 + (ichimoku * 0.34) + (alignment * 0.12) + (trend * 0.06),
+            48: 29.0 + (session * 0.34) + (relative_volume * 0.08) + (volatility * 0.05),
+            49: 31.0 + (fallback * 0.32) + (chop * 0.08) + (uncertainty * 0.08),
+            50: 20.0 + (max(0.0, 3.0 - ready) * 8.0) + (fallback * 0.22) + (uncertainty * 0.06),
         }
         selected_id, selected_score = max(candidate_scores.items(), key=lambda item: item[1])
         top3 = sorted(candidate_scores.items(), key=lambda item: item[1], reverse=True)[:3]
         top3_text = ", ".join(f"Set{set_id}:{score:.1f}" for set_id, score in top3)
-        if selected_score < 52.0:
-            selected_id = 2 if volatility < 45.0 else 1
+        if selected_score < 50.0:
+            selected_id = 2 if volatility < 45.0 else 49 if fallback >= 55.0 else 1
             reason = (
-                f"점수 우위 약함 -> {'Set2 ATR guard' if selected_id == 2 else 'Set1 UT only'} fallback "
-                f"(trend {trend:.1f}, chop {chop:.1f}, vol {volatility:.1f}, top {top3_text})"
+                f"점수 우위 약함 -> Set{selected_id} fallback "
+                f"(trend {trend:.1f}, chop {chop:.1f}, vol {volatility:.1f}, momentum {momentum:.1f}, top {top3_text})"
             )
         else:
             reason = (
                 f"trend {trend:.1f}, chop {chop:.1f}, vol {volatility:.1f}, "
-                f"breakout {breakout:.1f}, momentum {momentum:.1f}, flow {flow:.1f}, "
-                f"align {alignment:.1f} -> Set{selected_id} score {selected_score:.1f} "
+                f"breakout {breakout:.1f}, momentum {momentum:.1f}, flow {flow:.1f}, align {alignment:.1f}, "
+                f"bbExp {bb_expansion:.1f}, keltner {keltner_expansion:.1f}, pullback {pullback:.1f} "
+                f"-> Set{selected_id} score {selected_score:.1f} "
                 f"(top {top3_text})"
             )
         return selected_id, reason
@@ -4255,6 +4661,27 @@ class SignalEngine(BaseEngine):
                 'detail': detail,
                 'code': code,
             })
+
+        def _mtf_bias(tf):
+            metrics = values.get('mtf_metrics') or {}
+            item = metrics.get(tf) if isinstance(metrics, dict) else None
+            if not isinstance(item, dict) or not item.get('ready'):
+                return None
+            ema_bias = str(item.get('ema_bias') or 'neutral').lower()
+            rsi = item.get('rsi')
+            if ema_bias in {'long', 'short'}:
+                return ema_bias
+            if self._is_valid_number(rsi):
+                return 'long' if float(rsi) > 52.0 else 'short' if float(rsi) < 48.0 else 'neutral'
+            return 'neutral'
+
+        def _mtf_pair_state(tf_a, tf_b):
+            bias_a = _mtf_bias(tf_a)
+            bias_b = _mtf_bias(tf_b)
+            if bias_a is None or bias_b is None:
+                return None, f"{tf_a}/{tf_b} 계산 대기"
+            ok = bias_a == side and bias_b == side
+            return ok, f"{tf_a}={str(bias_a).upper()} / {tf_b}={str(bias_b).upper()}"
 
         for filter_name in filters:
             if filter_name == 'atr_guard':
@@ -4346,6 +4773,316 @@ class SignalEngine(BaseEngine):
                         else float(aroon_down) > float(aroon_up) and float(aroon_down) >= 50.0
                     )
                     _add('Aroon 방향', ok, f"Up {_fmt(aroon_up, 2)} / Down {_fmt(aroon_down, 2)}", 'REJECTED_RSI_MOMENTUM')
+            elif filter_name == 'rsi_momentum':
+                rsi_value = values.get('rsi')
+                threshold = float(cfg.get('rsi_threshold', 50.0) or 50.0)
+                if not self._is_valid_number(rsi_value):
+                    _add('RSI50 모멘텀', None, 'RSI 계산 대기', 'REJECTED_RSI_MOMENTUM')
+                else:
+                    ok = float(rsi_value) > threshold if side == 'long' else float(rsi_value) < threshold
+                    _add('RSI50 모멘텀', ok, f"RSI {_fmt(rsi_value, 2)} / 기준 {threshold:.1f}", 'REJECTED_RSI_MOMENTUM')
+            elif filter_name == 'macd_histogram':
+                macd_hist = values.get('macd_hist')
+                macd_prev = values.get('macd_hist_prev')
+                if not self._is_valid_number(macd_hist):
+                    _add('MACD Histogram', None, 'MACD 계산 대기', 'REJECTED_RSI_MOMENTUM')
+                else:
+                    ok = float(macd_hist) > 0 if side == 'long' else float(macd_hist) < 0
+                    if self._is_valid_number(macd_prev):
+                        ok = ok and (float(macd_hist) >= float(macd_prev) if side == 'long' else float(macd_hist) <= float(macd_prev))
+                    _add('MACD Histogram', ok, f"hist {_fmt(macd_hist, 6)} / prev {_fmt(macd_prev, 6)}", 'REJECTED_RSI_MOMENTUM')
+            elif filter_name == 'roc_momentum':
+                roc_pct = values.get('roc_pct')
+                if not self._is_valid_number(roc_pct):
+                    _add('ROC 모멘텀', None, 'ROC 계산 대기', 'REJECTED_RSI_MOMENTUM')
+                else:
+                    ok = float(roc_pct) > 0 if side == 'long' else float(roc_pct) < 0
+                    _add('ROC 모멘텀', ok, f"ROC10 {_fmt(roc_pct, 3)}%", 'REJECTED_RSI_MOMENTUM')
+            elif filter_name == 'cci_direction':
+                cci_value = values.get('cci')
+                if not self._is_valid_number(cci_value):
+                    _add('CCI 방향', None, 'CCI 계산 대기', 'REJECTED_RSI_MOMENTUM')
+                else:
+                    ok = float(cci_value) > 0 if side == 'long' else float(cci_value) < 0
+                    _add('CCI 방향', ok, f"CCI {_fmt(cci_value, 2)}", 'REJECTED_RSI_MOMENTUM')
+            elif filter_name == 'stoch_direction':
+                stoch_k = values.get('stoch_k')
+                stoch_d = values.get('stoch_d')
+                if not (self._is_valid_number(stoch_k) and self._is_valid_number(stoch_d)):
+                    _add('Stochastic 방향', None, 'Stochastic 계산 대기', 'REJECTED_RSI_MOMENTUM')
+                else:
+                    ok = float(stoch_k) > float(stoch_d) if side == 'long' else float(stoch_k) < float(stoch_d)
+                    _add('Stochastic 방향', ok, f"K {_fmt(stoch_k, 2)} / D {_fmt(stoch_d, 2)}", 'REJECTED_RSI_MOMENTUM')
+            elif filter_name == 'atr_low_vol_caution':
+                atr_pct = values.get('atr_pct')
+                threshold = max(float(cfg.get('atr_min_percent', 0.12) or 0.12) * 1.5, 0.18)
+                if not self._is_valid_number(atr_pct):
+                    _add('ATR 저변동 회피', None, 'ATR 계산 대기', 'REJECTED_ATR_TOO_LOW')
+                else:
+                    ok = float(atr_pct) >= threshold
+                    _add('ATR 저변동 회피', ok, f"ATR% {_fmt(atr_pct, 3)} / 조건 >= {threshold:.3f}", 'REJECTED_ATR_TOO_LOW')
+            elif filter_name == 'atr_high_vol_reduce':
+                atr_pct = values.get('atr_pct')
+                threshold = min(float(cfg.get('atr_max_percent', 1.20) or 1.20), 1.00)
+                if not self._is_valid_number(atr_pct):
+                    _add('ATR 고변동 회피', None, 'ATR 계산 대기', 'REJECTED_ATR_TOO_HIGH')
+                else:
+                    ok = float(atr_pct) <= threshold
+                    _add('ATR 고변동 회피', ok, f"ATR% {_fmt(atr_pct, 3)} / 조건 <= {threshold:.3f}", 'REJECTED_ATR_TOO_HIGH')
+            elif filter_name == 'bb_width_expansion':
+                width = values.get('bb_width_pct')
+                prev_width = values.get('bb_width_prev_pct')
+                min_width = values.get('bb_width_min_pct')
+                if not (self._is_valid_number(width) and self._is_valid_number(prev_width)):
+                    _add('BB Width 확장', None, 'BB Width 계산 대기', 'REJECTED_DONCHIAN_WIDTH_TOO_NARROW')
+                else:
+                    ok = float(width) > float(prev_width)
+                    if self._is_valid_number(min_width):
+                        ok = ok and float(width) >= float(min_width) * 1.05
+                    _add('BB Width 확장', ok, f"width {_fmt(width, 3)}% / prev {_fmt(prev_width, 3)}%", 'REJECTED_DONCHIAN_WIDTH_TOO_NARROW')
+            elif filter_name == 'keltner_expansion':
+                width = values.get('keltner_width_pct')
+                prev_width = values.get('keltner_width_prev_pct')
+                if not (self._is_valid_number(width) and self._is_valid_number(prev_width)):
+                    _add('Keltner 확장', None, 'Keltner 계산 대기', 'REJECTED_ATR_TOO_LOW')
+                else:
+                    ok = float(width) > float(prev_width)
+                    _add('Keltner 확장', ok, f"width {_fmt(width, 3)}% / prev {_fmt(prev_width, 3)}%", 'REJECTED_ATR_TOO_LOW')
+            elif filter_name == 'donchian_breakout':
+                close_value = values.get('entry_price')
+                high_prev = values.get('donchian_high_prev')
+                low_prev = values.get('donchian_low_prev')
+                if not (self._is_valid_number(close_value) and self._is_valid_number(high_prev) and self._is_valid_number(low_prev)):
+                    _add('Donchian 돌파', None, 'Donchian 계산 대기', 'REJECTED_DONCHIAN_NO_BREAKOUT')
+                elif side == 'long':
+                    ok = float(close_value) > float(high_prev)
+                    _add('Donchian 돌파', ok, f"close {_fmt(close_value, 4)} > prev high {_fmt(high_prev, 4)}", 'REJECTED_DONCHIAN_NO_BREAKOUT')
+                else:
+                    ok = float(close_value) < float(low_prev)
+                    _add('Donchian 돌파', ok, f"close {_fmt(close_value, 4)} < prev low {_fmt(low_prev, 4)}", 'REJECTED_DONCHIAN_NO_BREAKOUT')
+            elif filter_name == 'bb_band_breakout':
+                close_value = values.get('entry_price')
+                upper = values.get('bb_upper')
+                lower = values.get('bb_lower')
+                if not (self._is_valid_number(close_value) and self._is_valid_number(upper) and self._is_valid_number(lower)):
+                    _add('BB 밴드 돌파', None, 'Bollinger Band 계산 대기', 'REJECTED_DONCHIAN_NO_BREAKOUT')
+                elif side == 'long':
+                    ok = float(close_value) > float(upper)
+                    _add('BB 밴드 돌파', ok, f"close {_fmt(close_value, 4)} > upper {_fmt(upper, 4)}", 'REJECTED_DONCHIAN_NO_BREAKOUT')
+                else:
+                    ok = float(close_value) < float(lower)
+                    _add('BB 밴드 돌파', ok, f"close {_fmt(close_value, 4)} < lower {_fmt(lower, 4)}", 'REJECTED_DONCHIAN_NO_BREAKOUT')
+            elif filter_name == 'keltner_breakout':
+                close_value = values.get('entry_price')
+                upper = values.get('keltner_upper')
+                lower = values.get('keltner_lower')
+                if not (self._is_valid_number(close_value) and self._is_valid_number(upper) and self._is_valid_number(lower)):
+                    _add('Keltner 돌파', None, 'Keltner 계산 대기', 'REJECTED_DONCHIAN_NO_BREAKOUT')
+                elif side == 'long':
+                    ok = float(close_value) > float(upper)
+                    _add('Keltner 돌파', ok, f"close {_fmt(close_value, 4)} > upper {_fmt(upper, 4)}", 'REJECTED_DONCHIAN_NO_BREAKOUT')
+                else:
+                    ok = float(close_value) < float(lower)
+                    _add('Keltner 돌파', ok, f"close {_fmt(close_value, 4)} < lower {_fmt(lower, 4)}", 'REJECTED_DONCHIAN_NO_BREAKOUT')
+            elif filter_name == 'range_expansion':
+                ratio = values.get('range_expansion_ratio')
+                open_value = values.get('open')
+                close_value = values.get('entry_price')
+                if not (self._is_valid_number(ratio) and self._is_valid_number(open_value) and self._is_valid_number(close_value)):
+                    _add('Range 확장봉', None, 'Range 계산 대기', 'REJECTED_DONCHIAN_NO_BREAKOUT')
+                else:
+                    candle_ok = float(close_value) > float(open_value) if side == 'long' else float(close_value) < float(open_value)
+                    ok = float(ratio) >= 1.25 and candle_ok
+                    _add('Range 확장봉', ok, f"range/avg {_fmt(ratio, 2)} / 방향봉 {'OK' if candle_ok else 'NO'}", 'REJECTED_DONCHIAN_NO_BREAKOUT')
+            elif filter_name == 'vwap_pullback':
+                close_value = values.get('entry_price')
+                vwap = values.get('vwap')
+                if not (self._is_valid_number(close_value) and self._is_valid_number(vwap)):
+                    _add('VWAP 눌림 지속', None, values.get('vwap_reason') or 'VWAP 계산 대기', 'REJECTED_RSI_MOMENTUM')
+                else:
+                    dist_pct = abs(float(close_value) - float(vwap)) / max(abs(float(close_value)), 1e-9) * 100.0
+                    side_ok = float(close_value) >= float(vwap) if side == 'long' else float(close_value) <= float(vwap)
+                    ok = side_ok and dist_pct <= 0.60
+                    _add('VWAP 눌림 지속', ok, f"dist {_fmt(dist_pct, 3)}% / close {_fmt(close_value, 4)} / VWAP {_fmt(vwap, 4)}", 'REJECTED_RSI_MOMENTUM')
+            elif filter_name == 'ema_pullback':
+                close_value = values.get('entry_price')
+                ema_fast = values.get('ema50')
+                if not (self._is_valid_number(close_value) and self._is_valid_number(ema_fast)):
+                    _add('EMA 눌림 지속', None, 'EMA 계산 대기', 'REJECTED_EMA_CHOP_ZONE')
+                else:
+                    dist_pct = abs(float(close_value) - float(ema_fast)) / max(abs(float(close_value)), 1e-9) * 100.0
+                    side_ok = float(close_value) >= float(ema_fast) if side == 'long' else float(close_value) <= float(ema_fast)
+                    ok = side_ok and dist_pct <= 0.80
+                    _add('EMA 눌림 지속', ok, f"dist {_fmt(dist_pct, 3)}% / EMA50 {_fmt(ema_fast, 4)}", 'REJECTED_EMA_CHOP_ZONE')
+            elif filter_name == 'bb_midline_reclaim':
+                close_value = values.get('entry_price')
+                bb_mid = values.get('bb_mid')
+                if not (self._is_valid_number(close_value) and self._is_valid_number(bb_mid)):
+                    _add('BB 중심선 회복', None, 'BB 중심선 계산 대기', 'REJECTED_RSI_MOMENTUM')
+                else:
+                    ok = float(close_value) > float(bb_mid) if side == 'long' else float(close_value) < float(bb_mid)
+                    _add('BB 중심선 회복', ok, f"close {_fmt(close_value, 4)} / mid {_fmt(bb_mid, 4)}", 'REJECTED_RSI_MOMENTUM')
+            elif filter_name == 'rsi_pullback':
+                rsi_value = values.get('rsi')
+                if not self._is_valid_number(rsi_value):
+                    _add('RSI 눌림 재개', None, 'RSI 계산 대기', 'REJECTED_RSI_MOMENTUM')
+                elif side == 'long':
+                    ok = 50.0 <= float(rsi_value) <= 70.0
+                    _add('RSI 눌림 재개', ok, f"RSI {_fmt(rsi_value, 2)} / 조건 50~70", 'REJECTED_RSI_MOMENTUM')
+                else:
+                    ok = 30.0 <= float(rsi_value) <= 50.0
+                    _add('RSI 눌림 재개', ok, f"RSI {_fmt(rsi_value, 2)} / 조건 30~50", 'REJECTED_RSI_MOMENTUM')
+            elif filter_name == 'atr_trail_continuation':
+                close_value = values.get('entry_price')
+                ema_fast = values.get('ema50')
+                atr_pct = values.get('atr_pct')
+                if not (self._is_valid_number(close_value) and self._is_valid_number(ema_fast) and self._is_valid_number(atr_pct)):
+                    _add('ATR 지속 추세', None, 'ATR/EMA 계산 대기', 'REJECTED_ATR_TOO_LOW')
+                else:
+                    atr_ok = float(cfg.get('atr_min_percent', 0.12) or 0.12) <= float(atr_pct) <= float(cfg.get('atr_max_percent', 1.20) or 1.20)
+                    side_ok = float(close_value) > float(ema_fast) if side == 'long' else float(close_value) < float(ema_fast)
+                    ok = atr_ok and side_ok
+                    _add('ATR 지속 추세', ok, f"ATR% {_fmt(atr_pct, 3)} / EMA50 {_fmt(ema_fast, 4)}", 'REJECTED_ATR_TOO_LOW')
+            elif filter_name == 'volume_spike':
+                volume_ratio = values.get('volume_ratio')
+                open_value = values.get('open')
+                close_value = values.get('entry_price')
+                if not (self._is_valid_number(volume_ratio) and self._is_valid_number(open_value) and self._is_valid_number(close_value)):
+                    _add('거래량 급증', None, '거래량 계산 대기', 'REJECTED_RSI_MOMENTUM')
+                else:
+                    candle_ok = float(close_value) > float(open_value) if side == 'long' else float(close_value) < float(open_value)
+                    ok = float(volume_ratio) >= 1.80 and candle_ok
+                    _add('거래량 급증', ok, f"relVol {_fmt(volume_ratio, 2)} / 방향봉 {'OK' if candle_ok else 'NO'}", 'REJECTED_RSI_MOMENTUM')
+            elif filter_name == 'relative_volume':
+                volume_ratio = values.get('volume_ratio')
+                if not self._is_valid_number(volume_ratio):
+                    _add('상대 거래량', None, '상대 거래량 계산 대기', 'REJECTED_RSI_MOMENTUM')
+                else:
+                    ok = float(volume_ratio) >= 1.20
+                    _add('상대 거래량', ok, f"relVol {_fmt(volume_ratio, 2)} / 조건 >= 1.20", 'REJECTED_RSI_MOMENTUM')
+            elif filter_name == 'obv_slope':
+                obv_slope_ratio = values.get('obv_slope_ratio')
+                if not self._is_valid_number(obv_slope_ratio):
+                    _add('OBV 기울기', None, 'OBV 계산 대기', 'REJECTED_RSI_MOMENTUM')
+                else:
+                    ok = float(obv_slope_ratio) > 0 if side == 'long' else float(obv_slope_ratio) < 0
+                    _add('OBV 기울기', ok, f"OBV slope/vol {_fmt(obv_slope_ratio, 3)}", 'REJECTED_RSI_MOMENTUM')
+            elif filter_name == 'mfi_flow':
+                mfi_value = values.get('mfi')
+                if not self._is_valid_number(mfi_value):
+                    _add('MFI 자금흐름', None, 'MFI 계산 대기', 'REJECTED_RSI_MOMENTUM')
+                else:
+                    ok = float(mfi_value) > 50.0 if side == 'long' else float(mfi_value) < 50.0
+                    _add('MFI 자금흐름', ok, f"MFI {_fmt(mfi_value, 2)} / 기준 50", 'REJECTED_RSI_MOMENTUM')
+            elif filter_name == 'vwap_slope':
+                vwap_slope = values.get('vwap_slope')
+                if not self._is_valid_number(vwap_slope):
+                    _add('VWAP 기울기', None, values.get('vwap_reason') or 'VWAP 계산 대기', 'REJECTED_RSI_MOMENTUM')
+                else:
+                    ok = float(vwap_slope) > 0 if side == 'long' else float(vwap_slope) < 0
+                    _add('VWAP 기울기', ok, f"slope {_fmt(vwap_slope, 6)}", 'REJECTED_RSI_MOMENTUM')
+            elif filter_name == 'chop_avoid':
+                chop_value = values.get('chop')
+                threshold = 61.8
+                if not self._is_valid_number(chop_value):
+                    _add('CHOP 횡보회피', None, values.get('chop_reason') or 'CHOP 계산 대기', 'REJECTED_DONCHIAN_WIDTH_TOO_NARROW')
+                else:
+                    ok = float(chop_value) <= threshold
+                    _add('CHOP 횡보회피', ok, f"CHOP {_fmt(chop_value, 2)} / 조건 <= {threshold:.1f}", 'REJECTED_DONCHIAN_WIDTH_TOO_NARROW')
+            elif filter_name == 'donchian_width':
+                width = values.get('donchian_width_pct')
+                threshold = float(cfg.get('donchian_width_min_percent', 0.50) or 0.50)
+                if not self._is_valid_number(width):
+                    _add('Donchian Width', None, 'Donchian Width 계산 대기', 'REJECTED_DONCHIAN_WIDTH_TOO_NARROW')
+                else:
+                    ok = float(width) >= threshold
+                    _add('Donchian Width', ok, f"width {_fmt(width, 3)}% / 조건 >= {threshold:.2f}%", 'REJECTED_DONCHIAN_WIDTH_TOO_NARROW')
+            elif filter_name == 'htf_ema_gap':
+                gap = values.get('htf_gap_pct')
+                threshold = float(cfg.get('htf_ema_gap_min_percent', 0.15) or 0.15)
+                if not self._is_valid_number(gap):
+                    _add('HTF EMA Gap', None, values.get('htf_error') or 'HTF EMA gap 계산 대기', 'REJECTED_HTF_TREND')
+                else:
+                    ok = float(gap) >= threshold
+                    _add('HTF EMA Gap', ok, f"gap {_fmt(gap, 3)}% / 조건 >= {threshold:.3f}%", 'REJECTED_HTF_TREND')
+            elif filter_name == 'bb_squeeze_avoid':
+                width = values.get('bb_width_pct')
+                min_width = values.get('bb_width_min_pct')
+                if not (self._is_valid_number(width) and self._is_valid_number(min_width)):
+                    _add('BB Squeeze 회피', None, 'BB squeeze 계산 대기', 'REJECTED_DONCHIAN_WIDTH_TOO_NARROW')
+                else:
+                    ok = float(width) >= float(min_width) * 1.08
+                    _add('BB Squeeze 회피', ok, f"width {_fmt(width, 3)}% / min {_fmt(min_width, 3)}%", 'REJECTED_DONCHIAN_WIDTH_TOO_NARROW')
+            elif filter_name == 'range_compression_avoid':
+                ratio = values.get('range_compression_ratio')
+                if not self._is_valid_number(ratio):
+                    _add('Range 압축회피', None, 'Range compression 계산 대기', 'REJECTED_DONCHIAN_WIDTH_TOO_NARROW')
+                else:
+                    ok = float(ratio) >= 0.70
+                    _add('Range 압축회피', ok, f"range20/range50 {_fmt(ratio, 2)} / 조건 >= 0.70", 'REJECTED_DONCHIAN_WIDTH_TOO_NARROW')
+            elif filter_name == 'mtf_15_30':
+                ok, detail = _mtf_pair_state('15m', '30m')
+                _add('MTF 15m/30m 정렬', ok, detail, 'REJECTED_HTF_TREND')
+            elif filter_name == 'mtf_30_1h':
+                ok, detail = _mtf_pair_state('30m', '1h')
+                _add('MTF 30m/1h 정렬', ok, detail, 'REJECTED_HTF_TREND')
+            elif filter_name == 'mtf_1h_4h':
+                ok, detail = _mtf_pair_state('1h', '4h')
+                _add('MTF 1h/4h 정렬', ok, detail, 'REJECTED_HTF_TREND')
+            elif filter_name == 'mtf_momentum_score':
+                scores = values.get('auto_scores') if isinstance(values.get('auto_scores'), dict) else {}
+                momentum_score = scores.get('momentum_score')
+                dominant_side = str(scores.get('dominant_side') or 'neutral').lower()
+                if not self._is_valid_number(momentum_score):
+                    _add('MTF 모멘텀 점수', None, 'MTF 모멘텀 계산 대기', 'REJECTED_RSI_MOMENTUM')
+                else:
+                    ok = float(momentum_score) >= 55.0 and dominant_side in {side, 'neutral'}
+                    _add('MTF 모멘텀 점수', ok, f"momentum {float(momentum_score):.1f} / dominant {dominant_side.upper()}", 'REJECTED_RSI_MOMENTUM')
+            elif filter_name == 'mtf_volatility_score':
+                scores = values.get('auto_scores') if isinstance(values.get('auto_scores'), dict) else {}
+                volatility_score = scores.get('volatility_score')
+                if not self._is_valid_number(volatility_score):
+                    _add('MTF 변동성 점수', None, 'MTF 변동성 계산 대기', 'REJECTED_ATR_TOO_LOW')
+                else:
+                    ok = float(volatility_score) >= 55.0
+                    _add('MTF 변동성 점수', ok, f"volatility {float(volatility_score):.1f} / 조건 >= 55", 'REJECTED_ATR_TOO_LOW')
+            elif filter_name == 'psar_direction':
+                psar_direction = str(values.get('psar_direction') or '').lower()
+                psar = values.get('psar')
+                if psar_direction not in {'long', 'short'}:
+                    _add('Parabolic SAR 방향', None, values.get('psar_reason') or 'PSAR 계산 대기', 'REJECTED_RSI_MOMENTUM')
+                else:
+                    ok = psar_direction == side
+                    _add('Parabolic SAR 방향', ok, f"{psar_direction.upper()} @ {_fmt(psar, 4)}", 'REJECTED_RSI_MOMENTUM')
+            elif filter_name == 'ichimoku_cloud':
+                bias = str(values.get('ichimoku_bias') or 'neutral').lower()
+                top = values.get('ichimoku_top')
+                bottom = values.get('ichimoku_bottom')
+                if bias not in {'long', 'short', 'neutral'} or not (self._is_valid_number(top) and self._is_valid_number(bottom)):
+                    _add('Ichimoku Cloud', None, 'Ichimoku 계산 대기', 'REJECTED_HTF_TREND')
+                else:
+                    ok = bias == side
+                    _add('Ichimoku Cloud', ok, f"bias {bias.upper()} / cloud {_fmt(bottom, 4)}~{_fmt(top, 4)}", 'REJECTED_HTF_TREND')
+            elif filter_name == 'session_volatility':
+                hour = values.get('session_hour_kst')
+                atr_pct = values.get('atr_pct')
+                volume_ratio = values.get('volume_ratio')
+                if hour is None or not self._is_valid_number(atr_pct):
+                    _add('세션 변동성', None, '세션/ATR 계산 대기', 'REJECTED_ATR_TOO_LOW')
+                else:
+                    active_session = int(hour) in {0, 1, 2, 8, 9, 10, 16, 17, 18, 19, 20, 21, 22, 23}
+                    volume_ok = self._is_valid_number(volume_ratio) and float(volume_ratio) >= 0.9
+                    ok = active_session and (float(atr_pct) >= float(cfg.get('atr_min_percent', 0.12) or 0.12) or volume_ok)
+                    _add('세션 변동성', ok, f"KST {int(hour):02d}h / ATR% {_fmt(atr_pct, 3)} / relVol {_fmt(volume_ratio, 2)}", 'REJECTED_ATR_TOO_LOW')
+            elif filter_name == 'regime_fallback':
+                scores = values.get('auto_scores') if isinstance(values.get('auto_scores'), dict) else {}
+                core = [
+                    float(scores.get(key, 0.0) or 0.0)
+                    for key in ('trend_score', 'breakout_score', 'momentum_score', 'flow_score', 'alignment_score')
+                ]
+                max_core = max(core) if core else 0.0
+                ok = max_core < 65.0
+                _add('Regime fallback', ok, f"max core score {max_core:.1f} / 조건 < 65", 'REJECTED_RISK_REWARD_LOW')
             else:
                 _add(filter_name, None, 'planned 필터: 아직 실거래 연결 안 됨', 'REJECTED_RISK_REWARD_LOW')
         return items
@@ -4745,6 +5482,7 @@ class SignalEngine(BaseEngine):
             don_low_prev = float(don_window['low'].astype(float).min())
             don_width_pct = (don_high_prev - don_low_prev) / max(abs(entry_price), 1e-9) * 100.0
         ema_near_pct = abs(entry_price - float(ema200)) / max(abs(entry_price), 1e-9) * 100.0 if self._is_valid_number(ema200) else np.nan
+        entry_metrics = self._calculate_utbreakout_timeframe_metrics(closed, cfg)
 
         status.update({
             'rsi': rsi_value,
@@ -4780,7 +5518,14 @@ class SignalEngine(BaseEngine):
 
         filter_values = {
             'entry_price': entry_price,
+            'open': entry_metrics.get('open'),
             'rsi': rsi_value,
+            'macd_hist': entry_metrics.get('macd_hist'),
+            'macd_hist_prev': entry_metrics.get('macd_hist_prev'),
+            'roc_pct': entry_metrics.get('roc_pct'),
+            'cci': entry_metrics.get('cci'),
+            'stoch_k': entry_metrics.get('stoch_k'),
+            'stoch_d': entry_metrics.get('stoch_d'),
             'adx': adx_value,
             'plus_di': plus_di,
             'minus_di': minus_di,
@@ -4793,6 +5538,34 @@ class SignalEngine(BaseEngine):
             'donchian_high_prev': don_high_prev,
             'donchian_low_prev': don_low_prev,
             'donchian_width_pct': don_width_pct,
+            'bb_upper': entry_metrics.get('bb_upper'),
+            'bb_lower': entry_metrics.get('bb_lower'),
+            'bb_mid': entry_metrics.get('bb_mid'),
+            'bb_width_pct': entry_metrics.get('bb_width_pct'),
+            'bb_width_prev_pct': entry_metrics.get('bb_width_prev_pct'),
+            'bb_width_min_pct': entry_metrics.get('bb_width_min_pct'),
+            'keltner_upper': entry_metrics.get('keltner_upper'),
+            'keltner_lower': entry_metrics.get('keltner_lower'),
+            'keltner_mid': entry_metrics.get('keltner_mid'),
+            'keltner_width_pct': entry_metrics.get('keltner_width_pct'),
+            'keltner_width_prev_pct': entry_metrics.get('keltner_width_prev_pct'),
+            'range_expansion_ratio': entry_metrics.get('range_expansion_ratio'),
+            'range_compression_ratio': entry_metrics.get('range_compression_ratio'),
+            'vwap': entry_metrics.get('vwap'),
+            'vwap_slope': entry_metrics.get('vwap_slope'),
+            'vwap_reason': entry_metrics.get('vwap_reason'),
+            'volume_ratio': entry_metrics.get('volume_ratio'),
+            'obv_slope_ratio': entry_metrics.get('obv_slope_ratio'),
+            'mfi': entry_metrics.get('mfi'),
+            'psar_direction': entry_metrics.get('psar_direction'),
+            'psar': entry_metrics.get('psar'),
+            'psar_reason': entry_metrics.get('psar_reason'),
+            'ichimoku_bias': entry_metrics.get('ichimoku_bias'),
+            'ichimoku_top': entry_metrics.get('ichimoku_top'),
+            'ichimoku_bottom': entry_metrics.get('ichimoku_bottom'),
+            'session_hour_kst': entry_metrics.get('session_hour_kst'),
+            'auto_scores': (auto_analysis or {}).get('scores') if isinstance(auto_analysis, dict) else {},
+            'mtf_metrics': (auto_analysis or {}).get('timeframes') if isinstance(auto_analysis, dict) else {},
             'chop': chop_value,
             'chop_reason': chop_reason,
             'vortex_plus': vortex_plus,
@@ -5052,7 +5825,14 @@ class SignalEngine(BaseEngine):
 
             filter_values = {
                 'entry_price': entry_price,
+                'open': metrics.get('open'),
                 'rsi': metrics.get('rsi'),
+                'macd_hist': metrics.get('macd_hist'),
+                'macd_hist_prev': metrics.get('macd_hist_prev'),
+                'roc_pct': metrics.get('roc_pct'),
+                'cci': metrics.get('cci'),
+                'stoch_k': metrics.get('stoch_k'),
+                'stoch_d': metrics.get('stoch_d'),
                 'adx': metrics.get('adx'),
                 'plus_di': metrics.get('plus_di'),
                 'minus_di': metrics.get('minus_di'),
@@ -5064,6 +5844,34 @@ class SignalEngine(BaseEngine):
                 'donchian_high_prev': metrics.get('donchian_high_prev'),
                 'donchian_low_prev': metrics.get('donchian_low_prev'),
                 'donchian_width_pct': metrics.get('donchian_width_pct'),
+                'bb_upper': metrics.get('bb_upper'),
+                'bb_lower': metrics.get('bb_lower'),
+                'bb_mid': metrics.get('bb_mid'),
+                'bb_width_pct': metrics.get('bb_width_pct'),
+                'bb_width_prev_pct': metrics.get('bb_width_prev_pct'),
+                'bb_width_min_pct': metrics.get('bb_width_min_pct'),
+                'keltner_upper': metrics.get('keltner_upper'),
+                'keltner_lower': metrics.get('keltner_lower'),
+                'keltner_mid': metrics.get('keltner_mid'),
+                'keltner_width_pct': metrics.get('keltner_width_pct'),
+                'keltner_width_prev_pct': metrics.get('keltner_width_prev_pct'),
+                'range_expansion_ratio': metrics.get('range_expansion_ratio'),
+                'range_compression_ratio': metrics.get('range_compression_ratio'),
+                'vwap': metrics.get('vwap'),
+                'vwap_slope': metrics.get('vwap_slope'),
+                'vwap_reason': metrics.get('vwap_reason'),
+                'volume_ratio': metrics.get('volume_ratio'),
+                'obv_slope_ratio': metrics.get('obv_slope_ratio'),
+                'mfi': metrics.get('mfi'),
+                'psar_direction': metrics.get('psar_direction'),
+                'psar': metrics.get('psar'),
+                'psar_reason': metrics.get('psar_reason'),
+                'ichimoku_bias': metrics.get('ichimoku_bias'),
+                'ichimoku_top': metrics.get('ichimoku_top'),
+                'ichimoku_bottom': metrics.get('ichimoku_bottom'),
+                'session_hour_kst': metrics.get('session_hour_kst'),
+                'auto_scores': (auto_analysis or {}).get('scores') if isinstance(auto_analysis, dict) else {},
+                'mtf_metrics': (auto_analysis or {}).get('timeframes') if isinstance(auto_analysis, dict) else {},
                 'chop': metrics.get('chop'),
                 'chop_reason': metrics.get('chop_reason'),
                 'vortex_plus': metrics.get('vortex_plus'),
@@ -15011,7 +15819,7 @@ class MainController:
             auto_set = diag.get('auto_selected_set_id')
             auto_name = diag.get('auto_selected_set_name')
             auto_reason = diag.get('auto_selection_reason') or '아직 AUTO 분석 기록 없음'
-            active_set_lines = "\n".join(format_utbreakout_set_brief(i) for i in range(1, UTBREAKOUT_ACTIVE_SET_MAX + 1))
+            active_set_lines = "\n".join(format_utbreakout_set_brief(i) for i in range(1, 11))
             return f"""
 🧭 **UTBOT_FILTERED_BREAKOUT_V1**
 
@@ -15027,11 +15835,11 @@ UT: `K={float(cfg.get('utbot_key_value', 2.5) or 2.5):.2f}` / `ATR={int(cfg.get(
 AUTO 최근 선택 이유:
 `{auto_reason}`
 
-실거래 연결 Set 1~10:
+실거래 연결 Set 1~50 (아래는 빠른 버튼용 Set 1~10 요약):
 ```
 {active_set_lines}
 ```
-Set 11~50은 `/utbreakout sets`에서 설명만 확인 가능하며 아직 주문에는 연결하지 않습니다.
+Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설명은 `/utbreakout sets 1~5`, 수동 선택은 `/utbreakout set 27`처럼 입력하세요.
 
 최근 진단({first_symbol}): `{last_reason}`
 진단 요약:
@@ -15043,7 +15851,7 @@ Set 11~50은 `/utbreakout sets`에서 설명만 확인 가능하며 아직 주�
 `/utbreakout on` - 전략 활성화
 `/utbreakout off` - UTBOT으로 복귀
 `/utbreakout auto on` / `auto off` - AUTO set 선택 ON/OFF
-`/utbreakout set 7` 또는 `set7` - Set 1~10 수동 적용
+`/utbreakout set 27` 또는 `set27` - Set 1~50 수동 적용
 `/utbreakout sets` - 50개 set 설명 보기
 `/utbreakout why` - 최근 AUTO 선택 이유 보기
 `/utbreakout risk 5` - 1회 최대 손실 5 USDT로 설정
@@ -15202,7 +16010,7 @@ Set 11~50은 `/utbreakout sets`에서 설명만 확인 가능하며 아직 주�
             end_id = min(50, start_id + 9)
             lines = [
                 f"📚 UT Breakout 50-Set 카탈로그 ({page}/5)",
-                "Set 1~10만 현재 주문에 연결되어 있고, Set 11~50은 planned 설명 상태입니다.",
+                "Set 1~50 모두 AUTO 후보/수동 선택/실거래 판단에 연결되어 있습니다.",
                 "",
             ]
             for set_id in range(start_id, end_id + 1):
@@ -15338,7 +16146,7 @@ Set 11~50은 `/utbreakout sets`에서 설명만 확인 가능하며 아직 주�
                 set_text = str(set_arg or '').strip().lower()
                 set_id = 1 if set_text == 'aggressive' else 7 if set_text == 'conservative' else normalize_utbreakout_set_id(set_arg, UTBREAKOUT_DEFAULT_SET_ID)
                 if set_id > UTBREAKOUT_ACTIVE_SET_MAX:
-                    await u.message.reply_text("❌ 현재 실거래 연결은 Set 1~10만 가능합니다. Set 11~50은 설명/계획 상태입니다.")
+                    await u.message.reply_text("❌ 현재 선택 가능한 범위는 Set 1~50입니다.")
                     return
                 profile_cfg = _merge_utbreakout_profile_with_preserved_settings(f"set{set_id}")
                 await self.cfg.update_value(
@@ -15483,7 +16291,7 @@ Set 11~50은 `/utbreakout sets`에서 설명만 확인 가능하며 아직 주�
                 set_arg = value if action == 'set' else action
                 set_id = normalize_utbreakout_set_id(set_arg, UTBREAKOUT_DEFAULT_SET_ID)
                 if set_id > UTBREAKOUT_ACTIVE_SET_MAX:
-                    await _edit_utbreakout_menu(query, "❌ 현재 실거래 연결은 Set 1~10만 가능합니다.")
+                    await _edit_utbreakout_menu(query, "❌ 현재 선택 가능한 범위는 Set 1~50입니다.")
                     return
                 profile_cfg = _merge_utbreakout_profile_with_preserved_settings(f"set{set_id}")
                 await self.cfg.update_value(
