@@ -4189,30 +4189,36 @@ class SignalEngine(BaseEngine):
             fallback_id = normalize_utbreakout_set_id(cfg.get('active_set_id'), UTBREAKOUT_DEFAULT_SET_ID)
             return fallback_id, "AUTO 분석 데이터 부족: 수동 set 유지"
 
+        clarity = max(trend, breakout, momentum, alignment)
+        uncertainty = 100.0 - clarity
+        trendability = 100.0 - chop
         candidate_scores = {
-            1: 42.0 + (chop * 0.12) + ((100.0 - trend) * 0.06),
-            2: 48.0 + (volatility * 0.36) + (flow * 0.08),
-            3: 38.0 + (alignment * 0.42) + (trend * 0.22),
-            4: 40.0 + (momentum * 0.30) + (trend * 0.18),
-            5: 36.0 + (trend * 0.35) + (alignment * 0.22),
-            6: 42.0 + (trend * 0.42),
-            7: 34.0 + (trend * 0.38) + (momentum * 0.18) + (alignment * 0.16),
-            8: 30.0 + ((100.0 - chop) * 0.34) + (trend * 0.22),
-            9: 38.0 + (momentum * 0.28) + (trend * 0.20) + (flow * 0.08),
-            10: 36.0 + (breakout * 0.34) + (momentum * 0.18) + (trend * 0.08),
+            1: 42.0 + (uncertainty * 0.22) + (chop * 0.10) - (trend * 0.06) - (breakout * 0.04),
+            2: 40.0 + (volatility * 0.18) + (uncertainty * 0.16) + (chop * 0.04) - (clarity * 0.10),
+            3: 36.0 + (alignment * 0.35) + (trend * 0.15) + (trendability * 0.05),
+            4: 36.0 + (momentum * 0.32) + (trend * 0.10) + (flow * 0.05),
+            5: 32.0 + (trend * 0.28) + (alignment * 0.22) + (trendability * 0.12),
+            6: 40.0 + (trend * 0.35) + (volatility * 0.05),
+            7: 30.0 + (trend * 0.32) + (alignment * 0.22) + (momentum * 0.16) + (trendability * 0.08),
+            8: 34.0 + (trendability * 0.34) + (trend * 0.18) + (volatility * 0.04),
+            9: 34.0 + (momentum * 0.25) + (flow * 0.18) + (trend * 0.10) + (alignment * 0.05),
+            10: 34.0 + (breakout * 0.34) + (momentum * 0.15) + (trend * 0.08) + (trendability * 0.08),
         }
         selected_id, selected_score = max(candidate_scores.items(), key=lambda item: item[1])
-        if selected_score < 58.0:
-            selected_id = 2
+        top3 = sorted(candidate_scores.items(), key=lambda item: item[1], reverse=True)[:3]
+        top3_text = ", ".join(f"Set{set_id}:{score:.1f}" for set_id, score in top3)
+        if selected_score < 52.0:
+            selected_id = 2 if volatility < 45.0 else 1
             reason = (
-                f"점수 우위가 약해 Set2로 fallback "
-                f"(trend {trend:.1f}, chop {chop:.1f}, vol {volatility:.1f})"
+                f"점수 우위 약함 -> {'Set2 ATR guard' if selected_id == 2 else 'Set1 UT only'} fallback "
+                f"(trend {trend:.1f}, chop {chop:.1f}, vol {volatility:.1f}, top {top3_text})"
             )
         else:
             reason = (
                 f"trend {trend:.1f}, chop {chop:.1f}, vol {volatility:.1f}, "
                 f"breakout {breakout:.1f}, momentum {momentum:.1f}, flow {flow:.1f}, "
-                f"align {alignment:.1f} -> Set{selected_id} score {selected_score:.1f}"
+                f"align {alignment:.1f} -> Set{selected_id} score {selected_score:.1f} "
+                f"(top {top3_text})"
             )
         return selected_id, reason
 
@@ -15014,7 +15020,7 @@ class MainController:
 프로필: `{cfg.get('profile', 'set2')}` | 진입 `{cfg.get('entry_timeframe', '15m')}` / 청산 `{cfg.get('exit_timeframe', cfg.get('entry_timeframe', '15m'))}` / HTF `{cfg.get('htf_timeframe', '1h')}`
 UT: `K={float(cfg.get('utbot_key_value', 2.5) or 2.5):.2f}` / `ATR={int(cfg.get('utbot_atr_period', 14) or 14)}`
 선택 Set 조건: `{', '.join(set_info.get('entry_filters') or ['UT only'])}`
-리스크: `SL {float(cfg.get('stop_atr_multiplier', 1.5) or 1.5):.1f}ATR` | `TP {float(cfg.get('take_profit_r_multiple', 2.0) or 2.0):.1f}R` | `max ${float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0):.2f}`
+리스크: `SL {float(cfg.get('stop_atr_multiplier', 1.5) or 1.5):.1f}ATR` | `TP {float(cfg.get('take_profit_r_multiple', 2.0) or 2.0):.1f}R` | `1회 최대손실 ${float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0):.2f}`
 손실한도: `1회 min(잔고 x {float(cfg.get('risk_per_trade_percent', 1.0) or 1.0):.2f}%, ${float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0):.2f})` | `일손실 ${float(cfg.get('daily_max_loss_usdt', 3.0) or 3.0):.2f}`
 옵션: 반대신호청산 `{'ON' if cfg.get('opposite_signal_exit_enabled') else 'OFF'}` | EMA/RSI청산 `{'ON' if cfg.get('ema_rsi_exit_enabled') else 'OFF'}` | RSI과열제외 `{'ON' if cfg.get('exclude_rsi_extreme') else 'OFF'}`
 
@@ -15080,10 +15086,15 @@ Set 11~50은 `/utbreakout sets`에서 설명만 확인 가능하며 아직 주�
                     InlineKeyboardButton("50 Set 설명", callback_data="utb:sets")
                 ],
                 [
+                    InlineKeyboardButton("1회손실 $0.5", callback_data="utb:risk:0.5"),
                     InlineKeyboardButton("1회손실 $1", callback_data="utb:risk:1"),
-                    InlineKeyboardButton("1회손실 $5", callback_data="utb:risk:5"),
+                    InlineKeyboardButton("1회손실 $2", callback_data="utb:risk:2"),
+                    InlineKeyboardButton("1회손실 $5", callback_data="utb:risk:5")
+                ],
+                [
                     InlineKeyboardButton("1회손실 $10", callback_data="utb:risk:10"),
-                    InlineKeyboardButton("1회손실 $25", callback_data="utb:risk:25")
+                    InlineKeyboardButton("1회손실 $25", callback_data="utb:risk:25"),
+                    InlineKeyboardButton("1회손실 $50", callback_data="utb:risk:50")
                 ],
                 [
                     InlineKeyboardButton("Risk 0.5%", callback_data="utb:riskpct:0.5"),
@@ -15092,9 +15103,13 @@ Set 11~50은 `/utbreakout sets`에서 설명만 확인 가능하며 아직 주�
                 ],
                 [
                     InlineKeyboardButton("일손실 $3", callback_data="utb:dailyloss:3"),
-                    InlineKeyboardButton("일손실 $15", callback_data="utb:dailyloss:15"),
-                    InlineKeyboardButton("일손실 $30", callback_data="utb:dailyloss:30"),
-                    InlineKeyboardButton("일손실 $50", callback_data="utb:dailyloss:50")
+                    InlineKeyboardButton("일손실 $10", callback_data="utb:dailyloss:10"),
+                    InlineKeyboardButton("일손실 $20", callback_data="utb:dailyloss:20"),
+                    InlineKeyboardButton("일손실 $30", callback_data="utb:dailyloss:30")
+                ],
+                [
+                    InlineKeyboardButton("일손실 $50", callback_data="utb:dailyloss:50"),
+                    InlineKeyboardButton("일손실 $100", callback_data="utb:dailyloss:100")
                 ],
                 [
                     InlineKeyboardButton("반대청산", callback_data="utb:toggle_opposite"),
