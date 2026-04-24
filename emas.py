@@ -5650,6 +5650,8 @@ class SignalEngine(BaseEngine):
 
     async def build_utbreakout_condition_status_text(self, symbol):
         cfg = self._get_utbot_filtered_breakout_config(self.get_runtime_strategy_params())
+        common_cfg = self.get_runtime_common_settings()
+        lev = int(max(1.0, float(common_cfg.get('leverage', 5) or 5)))
         entry_tf = cfg.get('entry_timeframe', '15m')
         htf_tf = cfg.get('htf_timeframe', '1h')
 
@@ -5789,15 +5791,21 @@ class SignalEngine(BaseEngine):
             daily_detail = f"연속 손절 {max_losses}회"
 
         balance_detail = "잔고 조회 대기"
+        entry_plan_detail = "진입 계획: ATR/잔고 계산 대기"
         risk_ok = None
         risk_distance = np.nan
+        risk_distance_pct = np.nan
         risk_usdt = np.nan
+        planned_qty = np.nan
+        planned_notional = np.nan
+        planned_margin = np.nan
         atr_value = metrics.get('atr')
         atr_pct = metrics.get('atr_pct')
         if self._is_valid_number(atr_value):
             ut_stop = ut_detail.get('curr_stop')
             stop_anchor_distance = abs(entry_price - float(ut_stop)) if self._is_valid_number(ut_stop) else 0.0
             risk_distance = max(float(cfg.get('stop_atr_multiplier', 1.5) or 1.5) * float(atr_value), stop_anchor_distance)
+            risk_distance_pct = risk_distance / max(abs(entry_price), 1e-9) * 100.0
             rr_multiple = float(cfg.get('take_profit_r_multiple', 2.0) or 2.0)
             try:
                 total_balance, free_balance, _ = await self.get_balance_info()
@@ -5807,12 +5815,24 @@ class SignalEngine(BaseEngine):
                     float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
                 )
                 planned_qty = risk_usdt / max(risk_distance, 1e-9)
+                planned_notional = planned_qty * entry_price
+                planned_margin = planned_notional / max(float(lev), 1e-9)
                 risk_ok = risk_distance > 0 and rr_multiple >= float(cfg.get('min_risk_reward', 2.0) or 2.0) and risk_usdt > 0 and planned_qty > 0
-                balance_detail = f"risk {_fmt(risk_usdt, 2)} USDT / RR {_fmt(rr_multiple, 1)} / qty {_fmt(planned_qty, 6)}"
+                balance_detail = (
+                    f"손실한도 {_fmt(risk_usdt, 2)} USDT / 손절거리 {_fmt(risk_distance, 4)} "
+                    f"({_fmt(risk_distance_pct, 3)}%) / qty {_fmt(planned_qty, 6)}"
+                )
+                entry_plan_detail = (
+                    f"진입 계획: 증거금 {_fmt(planned_margin, 2)} USDT / "
+                    f"포지션 {_fmt(planned_notional, 2)} USDT / 레버리지 {lev}x / "
+                    f"손절시 손실 {_fmt(risk_usdt, 2)} USDT"
+                )
             except Exception as e:
                 balance_detail = f"잔고 조회 실패 {e}"
+                entry_plan_detail = f"진입 계획: 잔고 조회 실패 {e}"
         else:
             balance_detail = "ATR 기반 손절폭 계산 대기"
+            entry_plan_detail = "진입 계획: ATR 기반 손절폭 계산 대기"
 
         def _side_conditions(side):
             side_upper = side.upper()
@@ -5926,6 +5946,7 @@ class SignalEngine(BaseEngine):
             f"선택모드: {mode_label}",
             f"선택 Set: Set{selected_set.get('id')} {selected_set.get('name')} ({set_status})",
             f"선택 이유: {auto_reason or '수동 선택'}",
+            entry_plan_detail,
             f"AUTO 점수: {score_line}",
             "주의: AUTO/MTF 지표는 set 선택용이고, 실제 진입은 아래 선택 Set 조건만 봅니다.",
             f"최종: LONG {'가능' if long_ok else '대기'} / SHORT {'가능' if short_ok else '대기'}",
@@ -8930,7 +8951,18 @@ class SignalEngine(BaseEngine):
         if note:
             lines.append(f"진단메모: `{note}`")
 
-    def _build_signal_entry_notice(self, symbol, side, qty, requested_price, actual_entry_price):
+    def _build_signal_entry_notice(
+        self,
+        symbol,
+        side,
+        qty,
+        requested_price,
+        actual_entry_price,
+        entry_plan=None,
+        leverage=None,
+        target_notional=None,
+        margin_to_use=None
+    ):
         display_symbol = self.ctrl.format_symbol_for_display(symbol)
         diag = dict(self.last_stateful_diag.get(symbol, {}) or {})
         strategy_name = str(self.get_runtime_strategy_params().get('active_strategy', 'utbot') or 'utbot').upper()
@@ -8946,6 +8978,22 @@ class SignalEngine(BaseEngine):
         entry_reason = self.last_entry_reason.get(symbol)
         if entry_reason:
             lines.append(f"진입근거: `{entry_reason}`")
+        if strategy_name == UTBOT_FILTERED_BREAKOUT_STRATEGY.upper() and isinstance(entry_plan, dict):
+            try:
+                lev = float(leverage or cfg.get('leverage', 1) or 1)
+                notional = float(target_notional) if target_notional is not None else float(qty) * float(actual_entry_price)
+                margin = float(margin_to_use) if margin_to_use is not None else notional / max(lev, 1e-9)
+                risk_usdt = float(entry_plan.get('risk_usdt', 0.0) or 0.0)
+                risk_distance = float(entry_plan.get('risk_distance', 0.0) or 0.0)
+                risk_pct = risk_distance / max(abs(float(actual_entry_price)), 1e-9) * 100.0
+                lines.append(
+                    f"진입금액: `증거금 {margin:.2f} USDT / 포지션 {notional:.2f} USDT / {lev:.0f}x`"
+                )
+                lines.append(
+                    f"손절계획: `거리 {risk_distance:.4f} ({risk_pct:.3f}%) / 손실 {risk_usdt:.2f} USDT`"
+                )
+            except Exception as e:
+                logger.debug(f"UT breakout entry notice sizing detail failed: {e}")
         self._append_signal_diag_lines(lines, diag, include_exit=False)
         return "\n".join(lines)
 
@@ -11381,8 +11429,6 @@ class SignalEngine(BaseEngine):
 
             lev_default = 5 if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY else 10
             lev = int(max(1.0, float(cfg.get('leverage', lev_default) or lev_default)))
-            if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
-                lev = min(10, lev)
             req_risk_pct = float(cfg.get('risk_per_trade_pct', 10.0) or 10.0)
             max_risk_pct = float(cfg.get('max_risk_per_trade_pct', 100.0) or 100.0)
             max_risk_pct = min(100.0, max(1.0, max_risk_pct))
@@ -11599,7 +11645,17 @@ class SignalEngine(BaseEngine):
             verify_pos = await self.get_server_position(symbol, use_cache=False)
             actual_entry_price = float(verify_pos['entryPrice']) if verify_pos else price
             await self.ctrl.notify(
-                self._build_signal_entry_notice(symbol, side, qty, price, actual_entry_price)
+                self._build_signal_entry_notice(
+                    symbol,
+                    side,
+                    qty,
+                    price,
+                    actual_entry_price,
+                    entry_plan=filtered_breakout_plan if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY else None,
+                    leverage=lev,
+                    target_notional=target_notional,
+                    margin_to_use=margin_to_use
+                )
             )
             
             # ===== ?꾨왂蹂?TP/SL ?ㅼ젙 =====
