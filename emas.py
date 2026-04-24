@@ -13861,7 +13861,13 @@ class MainController:
 UT: `K={float(cfg.get('utbot_key_value', 2.5) or 2.5):.2f}` / `ATR={int(cfg.get('utbot_atr_period', 14) or 14)}`
 필터: `ADX>={float(cfg.get('adx_threshold', 22) or 22):.1f}` | `ATR% {float(cfg.get('atr_min_percent', 0.12) or 0.12):.2f}~{float(cfg.get('atr_max_percent', 1.20) or 1.20):.2f}` | `Donchian {int(cfg.get('donchian_length', 20) or 20)}`
 리스크: `SL {float(cfg.get('stop_atr_multiplier', 1.5) or 1.5):.1f}ATR` | `TP {float(cfg.get('take_profit_r_multiple', 2.0) or 2.0):.1f}R` | `max ${float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0):.2f}`
+손실한도: `1회 min(잔고 x {float(cfg.get('risk_per_trade_percent', 1.0) or 1.0):.2f}%, ${float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0):.2f})` | `일손실 ${float(cfg.get('daily_max_loss_usdt', 3.0) or 3.0):.2f}`
 옵션: 반대신호청산 `{'ON' if cfg.get('opposite_signal_exit_enabled') else 'OFF'}` | EMA/RSI청산 `{'ON' if cfg.get('ema_rsi_exit_enabled') else 'OFF'}` | RSI과열제외 `{'ON' if cfg.get('exclude_rsi_extreme') else 'OFF'}`
+
+세트 설명:
+Set1 공격형: `UT 2,10` / `ADX>=20` / `Donchian20` / `SL 1.5ATR` / `TP 2R`
+Set2 기본형: `UT 2.5,14` / `ADX>=22` / `Donchian20` / `SL 1.5ATR` / `TP 2R`
+Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
 
 최근 진단({first_symbol}): `{last_reason}`
 
@@ -13869,6 +13875,9 @@ UT: `K={float(cfg.get('utbot_key_value', 2.5) or 2.5):.2f}` / `ATR={int(cfg.get(
 `/utbreakout on` - 전략 활성화
 `/utbreakout off` - UTBOT으로 복귀
 `/utbreakout set1` / `set2` / `set3` - 파라미터 세트 적용
+`/utbreakout risk 5` - 1회 최대 손실 5 USDT로 설정
+`/utbreakout riskpct 1` - 잔고 대비 손실 기준 1%로 설정
+`/utbreakout dailyloss 30` - 하루 최대 손실 30 USDT로 설정
 `/utbreakout toggle_opposite` - 반대 UT 신호 청산 토글
 `/utbreakout toggle_ema` - EMA50/RSI 청산 토글
 `/utbreakout toggle_extreme` - RSI 과열 제외 토글
@@ -13880,6 +13889,23 @@ UT: `K={float(cfg.get('utbot_key_value', 2.5) or 2.5):.2f}` / `ATR={int(cfg.get(
                 parts = u.message.text.strip().split()
                 args = parts[1:]
             action = str(args[0]).strip().lower() if args else ''
+
+            def _parse_positive_arg(label, minimum=0.0, maximum=None):
+                if len(args) < 2:
+                    raise ValueError(f"{label} 값을 입력하세요.")
+                try:
+                    value = float(str(args[1]).replace('$', '').replace(',', '').strip())
+                except (TypeError, ValueError):
+                    raise ValueError(f"{label} 값은 숫자로 입력하세요.")
+                if value <= minimum:
+                    raise ValueError(f"{label} 값은 {minimum}보다 커야 합니다.")
+                if maximum is not None and value > maximum:
+                    raise ValueError(f"{label} 값은 {maximum} 이하로 입력하세요.")
+                return value
+
+            def _current_utbreakout_cfg():
+                raw = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
+                return dict(raw) if isinstance(raw, dict) else {}
 
             if action in {'on', 'enable', 'activate', 'start'}:
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_FILTERED_BREAKOUT_STRATEGY)
@@ -13899,31 +13925,83 @@ UT: `K={float(cfg.get('utbot_key_value', 2.5) or 2.5):.2f}` / `ATR={int(cfg.get(
                 await u.message.reply_text("✅ 기본 UTBOT 전략으로 복귀")
             elif action in {'set1', 'set2', 'set3', '1', '2', '3', 'aggressive', 'conservative'}:
                 profile_cfg = build_utbot_filtered_breakout_profile(action)
+                current_cfg = _current_utbreakout_cfg()
+                preserve_keys = {
+                    'risk_per_trade_percent',
+                    'max_risk_per_trade_usdt',
+                    'daily_max_loss_usdt',
+                    'max_daily_trades',
+                    'daily_profit_target_enabled',
+                    'daily_profit_target_usdt',
+                    'opposite_signal_exit_enabled',
+                    'ema_rsi_exit_enabled',
+                    'adx_donchian_exit_enabled',
+                    'exclude_rsi_extreme'
+                }
+                for key in preserve_keys:
+                    if key in current_cfg:
+                        profile_cfg[key] = current_cfg[key]
                 await self.cfg.update_value(
                     ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1'],
                     profile_cfg
                 )
                 self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
                 await u.message.reply_text(f"✅ UTBOT_FILTERED_BREAKOUT_V1 프로필 적용: {profile_cfg.get('profile')}")
+            elif action in {'risk', 'maxrisk', 'loss', 'max_loss'}:
+                try:
+                    value = _parse_positive_arg('1회 최대 손실 USDT', minimum=0.0, maximum=100000.0)
+                except ValueError as e:
+                    await u.message.reply_text(f"❌ {e}\n예: `/utbreakout risk 5`", parse_mode=ParseMode.MARKDOWN)
+                    return
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'max_risk_per_trade_usdt'],
+                    value
+                )
+                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
+                await u.message.reply_text(f"✅ 1회 최대 손실 설정: ${value:.2f}")
+            elif action in {'riskpct', 'risk_pct', 'riskpercent', 'risk_percent'}:
+                try:
+                    value = _parse_positive_arg('잔고 대비 손실 기준(%)', minimum=0.0, maximum=100.0)
+                except ValueError as e:
+                    await u.message.reply_text(f"❌ {e}\n예: `/utbreakout riskpct 1`", parse_mode=ParseMode.MARKDOWN)
+                    return
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'risk_per_trade_percent'],
+                    value
+                )
+                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
+                await u.message.reply_text(f"✅ 잔고 대비 손실 기준 설정: {value:.2f}%")
+            elif action in {'dailyloss', 'daily_loss', 'dayloss', 'day_loss'}:
+                try:
+                    value = _parse_positive_arg('하루 최대 손실 USDT', minimum=0.0, maximum=1000000.0)
+                except ValueError as e:
+                    await u.message.reply_text(f"❌ {e}\n예: `/utbreakout dailyloss 30`", parse_mode=ParseMode.MARKDOWN)
+                    return
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'daily_max_loss_usdt'],
+                    value
+                )
+                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
+                await u.message.reply_text(f"✅ 하루 최대 손실 설정: ${value:.2f}")
             elif action in {'toggle_opposite', 'opposite'}:
-                raw = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
-                current = bool(raw.get('opposite_signal_exit_enabled', False)) if isinstance(raw, dict) else False
+                raw = _current_utbreakout_cfg()
+                current = bool(raw.get('opposite_signal_exit_enabled', False))
                 await self.cfg.update_value(
                     ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'opposite_signal_exit_enabled'],
                     not current
                 )
                 await u.message.reply_text(f"✅ 반대 UT 신호 청산: {'ON' if not current else 'OFF'}")
             elif action in {'toggle_ema', 'ema'}:
-                raw = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
-                current = bool(raw.get('ema_rsi_exit_enabled', False)) if isinstance(raw, dict) else False
+                raw = _current_utbreakout_cfg()
+                current = bool(raw.get('ema_rsi_exit_enabled', False))
                 await self.cfg.update_value(
                     ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'ema_rsi_exit_enabled'],
                     not current
                 )
                 await u.message.reply_text(f"✅ EMA50/RSI 청산: {'ON' if not current else 'OFF'}")
             elif action in {'toggle_extreme', 'extreme'}:
-                raw = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
-                current = bool(raw.get('exclude_rsi_extreme', False)) if isinstance(raw, dict) else False
+                raw = _current_utbreakout_cfg()
+                current = bool(raw.get('exclude_rsi_extreme', False))
                 await self.cfg.update_value(
                     ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'exclude_rsi_extreme'],
                     not current
