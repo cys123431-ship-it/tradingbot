@@ -224,6 +224,153 @@ ALT_TREND_TIMEFRAME_ORDER = {
     timeframe: idx for idx, timeframe in enumerate(ALT_TREND_ALLOWED_TIMEFRAMES)
 }
 BINANCE_FAPI_PUBLIC_BASE_URL = 'https://fapi.binance.com'
+UTBREAKOUT_ACTIVE_SET_MAX = 10
+UTBREAKOUT_DEFAULT_SET_ID = 2
+UTBREAKOUT_AUTO_TIMEFRAMES = ['15m', '30m', '1h', '2h', '4h']
+
+
+def _build_utbreakout_set(
+    set_id,
+    family,
+    name,
+    description,
+    regime,
+    pros,
+    cons,
+    frequency_impact,
+    indicators,
+    entry_filters=None,
+    params=None,
+):
+    status = 'active' if int(set_id) <= UTBREAKOUT_ACTIVE_SET_MAX else 'planned'
+    return {
+        'id': int(set_id),
+        'key': f"set{int(set_id)}",
+        'family': family,
+        'name': name,
+        'status': status,
+        'description': description,
+        'regime': regime,
+        'pros': pros,
+        'cons': cons,
+        'frequency_impact': frequency_impact,
+        'indicators': list(indicators or []),
+        'entry_filters': list(entry_filters or []),
+        'params': dict(params or {}),
+    }
+
+
+def build_utbreakout_set_registry():
+    base_params = {
+        'utbot_key_value': 2.5,
+        'utbot_atr_period': 14,
+        'stop_atr_multiplier': 1.5,
+        'take_profit_r_multiple': 2.0,
+        'min_risk_reward': 2.0,
+    }
+    rows = [
+        (1, 'UT Core', 'UT only', 'UTBot 방향 유지 상태만 진입 후보로 쓰는 가장 단순한 세트입니다.', '애매한 장세에서 진입 자체가 사라지는 것을 피하고 싶을 때', '진입 빈도가 가장 높고 구조가 단순함', '횡보장 false signal 방어는 약함', '매우 많음', ['UTBot'], [], {'utbot_key_value': 2.0, 'utbot_atr_period': 10}),
+        (2, 'UT Core', 'UT + ATR guard', 'UTBot에 최소/최대 변동성 가드만 붙입니다.', '변동성이 너무 죽었거나 과열된 구간만 피하고 싶을 때', '진입을 크게 줄이지 않으면서 위험 구간만 제거', '추세 방향 품질 검증은 약함', '많음', ['UTBot', 'ATR%'], ['atr_guard'], {'utbot_key_value': 2.0, 'utbot_atr_period': 10}),
+        (3, 'UT Core', 'UT + HTF trend', '1시간 EMA50/EMA200 방향이 UT 방향과 맞을 때만 허용합니다.', '상위 추세가 비교적 뚜렷한 장', '역방향 진입을 줄임', '상위 추세 전환 초반에는 늦을 수 있음', '중간', ['UTBot', '1H EMA50/200'], ['htf_trend'], {'utbot_key_value': 2.5, 'utbot_atr_period': 14}),
+        (4, 'UT Core', 'UT + EMA slope', '15분 EMA50 기울기와 가격 위치만 확인합니다.', '짧은 추세가 막 살아나는 구간', 'HTF보다 빠르게 반응', '짧은 노이즈에 흔들릴 수 있음', '중간~많음', ['UTBot', 'EMA slope'], ['ema_slope'], {'utbot_key_value': 2.5, 'utbot_atr_period': 14}),
+        (5, 'UT Core', 'UT + HTF Supertrend', '상위봉 Supertrend 방향과 UTBot 방향을 맞춥니다.', '추세 추종 성격이 강한 장', '추세장 필터로 직관적', '횡보 전환 때 늦게 반응할 수 있음', '중간', ['UTBot', 'HTF Supertrend'], ['htf_supertrend'], {'utbot_key_value': 2.5, 'utbot_atr_period': 14}),
+        (6, 'Trend Strength', 'UT + ADX loose', 'ADX 20 이상이면 추세 가능성이 있다고 보고 허용합니다.', '추세 강도만 약하게 보고 싶을 때', 'Set7보다 진입이 많음', '방향성은 UTBot에 많이 의존', '중간~많음', ['UTBot', 'ADX'], ['adx_loose'], {'utbot_key_value': 2.0, 'utbot_atr_period': 10, 'adx_threshold': 20.0}),
+        (7, 'Trend Strength', 'UT + ADX + DMI', 'ADX와 +DI/-DI 방향까지 함께 확인합니다.', '추세 강도와 방향이 함께 잡히는 구간', '횡보장 손실을 줄이는 데 유리', 'Set6보다 진입이 줄어듦', '중간', ['UTBot', 'ADX', 'DMI'], ['adx_dmi'], {'utbot_key_value': 2.5, 'utbot_atr_period': 14, 'adx_threshold': 22.0}),
+        (8, 'Trend Strength', 'UT + CHOP trend', 'CHOP 값이 낮아 추세성 장세일 때만 허용합니다.', '횡보가 줄고 방향성이 생기는 구간', '횡보 회피에 직접적', '강한 압축 후 초기 돌파는 놓칠 수 있음', '적음~중간', ['UTBot', 'CHOP'], ['chop_trend'], {'utbot_key_value': 2.5, 'utbot_atr_period': 14}),
+        (9, 'Trend Strength', 'UT + Vortex', 'Vortex 방향성이 UTBot 방향과 맞을 때 허용합니다.', '방향 전환과 추세 지속을 같이 보고 싶을 때', 'DMI와 다른 방식의 방향 확인', '급변동 구간에서 흔들릴 수 있음', '중간', ['UTBot', 'Vortex'], ['vortex'], {'utbot_key_value': 2.5, 'utbot_atr_period': 14}),
+        (10, 'Trend Strength', 'UT + Aroon', 'Aroon Up/Down으로 최근 고저점 갱신 방향을 확인합니다.', '신고가/신저가 갱신 흐름이 있는 장', '돌파성 추세 포착에 유리', '박스권에서는 잦은 전환 가능', '중간', ['UTBot', 'Aroon'], ['aroon'], {'utbot_key_value': 2.5, 'utbot_atr_period': 14}),
+        (11, 'Momentum', 'UT + RSI50', 'RSI 50선을 방향성 확인용으로 쓰는 세트입니다.', '모멘텀이 선명한 장', '간단하고 해석 쉬움', 'RSI 50 근처에서 진입 감소', '중간', ['UTBot', 'RSI'], ['rsi_momentum'], {}),
+        (12, 'Momentum', 'UT + MACD histogram', 'MACD 히스토그램 방향으로 모멘텀을 확인합니다.', '추세 전환 후 가속 구간', '가속도 확인에 유리', '횡보 중 잦은 반전 가능', '중간', ['UTBot', 'MACD'], ['macd_histogram'], {}),
+        (13, 'Momentum', 'UT + ROC', 'Rate of Change로 단기 가격 추진력을 확인합니다.', '방향성이 빠르게 붙는 구간', '빠른 반응', '급등락 후 늦은 진입 가능', '중간~많음', ['UTBot', 'ROC'], ['roc_momentum'], {}),
+        (14, 'Momentum', 'UT + CCI', 'CCI가 0선 기준으로 방향성을 보일 때 허용합니다.', '평균 대비 가격 위치가 방향성을 띨 때', '추세/과열을 같이 관찰 가능', '노이즈 구간에서는 흔들릴 수 있음', '중간', ['UTBot', 'CCI'], ['cci_direction'], {}),
+        (15, 'Momentum', 'UT + Stochastic direction', '스토캐스틱 K/D 방향으로 단기 힘을 확인합니다.', '짧은 파동 추종', '민감한 진입 가능', '잦은 신호로 과매매 위험', '많음', ['UTBot', 'Stochastic'], ['stoch_direction'], {}),
+        (16, 'Volatility Regime', 'UT + ATR normal', 'ATR% 정상 구간만 허용합니다.', '일반 변동성 장', '위험한 저/고변동성 회피', '기회 일부 감소', '중간~많음', ['UTBot', 'ATR%'], ['atr_guard'], {}),
+        (17, 'Volatility Regime', 'UT + ATR low-vol caution', '저변동성에서는 더 보수적으로 진입합니다.', '거래량과 변동성이 낮은 장', '무의미한 진입 감소', '초기 변동성 확장 전 놓칠 수 있음', '적음', ['UTBot', 'ATR%'], ['atr_low_vol_caution'], {}),
+        (18, 'Volatility Regime', 'UT + ATR high-vol reduce', '고변동성에서는 진입 축소 또는 회피를 목표로 합니다.', '뉴스성 급변동 장', '큰 손실 꼬리 방어', '강한 추세 수익 일부 포기', '적음', ['UTBot', 'ATR%'], ['atr_high_vol_reduce'], {}),
+        (19, 'Volatility Regime', 'UT + BB Width expansion', '볼린저 밴드 폭 확장으로 변동성 시작을 봅니다.', '압축 후 확장 구간', '돌파 초반 감지', '가짜 확장 가능', '중간', ['UTBot', 'Bollinger BandWidth'], ['bb_width_expansion'], {}),
+        (20, 'Volatility Regime', 'UT + Keltner expansion', 'ATR 기반 Keltner 채널 확장으로 추세성을 봅니다.', 'ATR 변동성 확장 구간', '변동성 기반이라 실전적', '급등락 후 늦을 수 있음', '중간', ['UTBot', 'Keltner Channel'], ['keltner_expansion'], {}),
+        (21, 'Breakout', 'UT + Donchian 10', '직전 10봉 Donchian 돌파를 확인합니다.', '짧은 돌파장', 'Set22보다 빠름', '가짜 돌파 증가', '중간', ['UTBot', 'Donchian'], ['donchian_breakout'], {'donchian_length': 10}),
+        (22, 'Breakout', 'UT + Donchian 20', '직전 20봉 Donchian 돌파를 확인합니다.', '표준 돌파장', '고전적 돌파 규칙과 잘 맞음', '진입이 늦거나 적을 수 있음', '적음~중간', ['UTBot', 'Donchian'], ['donchian_breakout'], {'donchian_length': 20}),
+        (23, 'Breakout', 'UT + BB band breakout', '볼린저 상/하단 종가 돌파를 봅니다.', '변동성 돌파장', '돌파 해석이 쉬움', '상단 추격 리스크', '중간', ['UTBot', 'Bollinger Bands'], ['bb_band_breakout'], {}),
+        (24, 'Breakout', 'UT + Keltner breakout', 'Keltner 채널 밖 종가 돌파를 봅니다.', 'ATR 기반 추세 돌파', '노이즈가 BB보다 적을 수 있음', '강한 변동성 후 늦음', '중간', ['UTBot', 'Keltner Channel'], ['keltner_breakout'], {}),
+        (25, 'Breakout', 'UT + range expansion candle', '현재 봉 범위가 평균보다 커진 확장봉을 확인합니다.', '강한 캔들 돌파', '급가속 구간 포착', '꼬리 큰 봉에 취약', '중간', ['UTBot', 'Range Expansion'], ['range_expansion'], {}),
+        (26, 'Pullback/Continuation', 'UT + VWAP pullback', 'VWAP 근처 눌림 후 UT 방향 지속을 봅니다.', '추세 중 눌림목', '추격보다 가격이 유리할 수 있음', '강한 추세에서는 못 탈 수 있음', '중간', ['UTBot', 'VWAP'], ['vwap_pullback'], {}),
+        (27, 'Pullback/Continuation', 'UT + EMA pullback', 'EMA 근처 눌림 후 재개를 봅니다.', 'EMA를 따라가는 추세', '실전 해석이 쉬움', '횡보 EMA에서는 무의미', '중간', ['UTBot', 'EMA'], ['ema_pullback'], {}),
+        (28, 'Pullback/Continuation', 'UT + BB midline reclaim', '볼린저 중심선 회복/이탈로 눌림 회복을 봅니다.', '중심선 리클레임 장', '추세 복귀 확인', '중심선 근처 노이즈', '중간', ['UTBot', 'Bollinger Midline'], ['bb_midline_reclaim'], {}),
+        (29, 'Pullback/Continuation', 'UT + RSI pullback', 'RSI 눌림 후 방향 재개를 봅니다.', '모멘텀 유지 중 눌림', '과열 추격을 줄임', '추세 초반 진입 감소', '중간', ['UTBot', 'RSI'], ['rsi_pullback'], {}),
+        (30, 'Pullback/Continuation', 'UT + ATR trailing continuation', 'ATR trailing 방향 유지로 추세 지속을 봅니다.', '추세가 길게 이어지는 장', '추세 유지 확인', '전환 초반 늦음', '적음~중간', ['UTBot', 'ATR Trail'], ['atr_trail_continuation'], {}),
+        (31, 'Volume/Flow', 'UT + volume spike', '거래량 급증을 동반한 UT 방향만 봅니다.', '관심이 몰리는 돌파/추세', '약한 신호 제거', '저거래량 추세 놓침', '중간', ['UTBot', 'Volume'], ['volume_spike'], {}),
+        (32, 'Volume/Flow', 'UT + relative volume', '상대 거래량이 평균보다 높은지 봅니다.', '평균보다 활발한 장', '실전적 유동성 필터', '거래량 없는 추세 제외', '중간', ['UTBot', 'Relative Volume'], ['relative_volume'], {}),
+        (33, 'Volume/Flow', 'UT + OBV slope', 'OBV 기울기로 누적 매수/매도 흐름을 봅니다.', '수급 방향이 쌓이는 장', '가격보다 선행 가능성', '선물 거래량 해석 한계', '중간', ['UTBot', 'OBV'], ['obv_slope'], {}),
+        (34, 'Volume/Flow', 'UT + MFI flow', 'Money Flow Index 방향을 확인합니다.', '가격과 거래량 흐름이 함께 움직일 때', '거래량 가중 모멘텀', '급변동 시 과열 신호', '중간', ['UTBot', 'MFI'], ['mfi_flow'], {}),
+        (35, 'Volume/Flow', 'UT + VWAP slope', 'VWAP 기울기가 UT 방향과 맞는지 봅니다.', '당일 평균가격 흐름이 기울어진 장', '데이 트레이딩에 직관적', '세션 기준 변화에 민감', '중간', ['UTBot', 'VWAP'], ['vwap_slope'], {}),
+        (36, 'Chop Avoidance', 'UT + CHOP avoid', 'CHOP 높은 구간을 회피합니다.', '횡보 회피 목적', 'false signal 감소', '진입 감소', '적음~중간', ['UTBot', 'CHOP'], ['chop_avoid'], {}),
+        (37, 'Chop Avoidance', 'UT + Donchian width avoid', 'Donchian 폭이 너무 좁은 압축장을 피합니다.', '박스권 회피', '좁은 횡보 손실 감소', '압축 후 첫 돌파 놓침', '적음~중간', ['UTBot', 'Donchian Width'], ['donchian_width'], {}),
+        (38, 'Chop Avoidance', 'UT + EMA gap avoid', 'EMA50/200 간격이 너무 좁으면 피합니다.', '추세 불명확 회피', '방향 없는 장 방어', '전환 초반 늦음', '적음', ['UTBot', 'EMA Gap'], ['htf_ema_gap'], {}),
+        (39, 'Chop Avoidance', 'UT + BB squeeze avoid', '볼린저 squeeze 구간을 피합니다.', '압축 횡보 회피', '무의미한 신호 감소', 'squeeze breakout 초반 놓침', '적음', ['UTBot', 'BB Squeeze'], ['bb_squeeze_avoid'], {}),
+        (40, 'Chop Avoidance', 'UT + range compression avoid', '최근 range 압축이 심하면 피합니다.', '좁은 박스권', '수수료 소모 감소', '초기 확장 누락 가능', '적음', ['UTBot', 'Range Compression'], ['range_compression_avoid'], {}),
+        (41, 'MTF Alignment', 'UT + 15m/30m align', '15분과 30분 방향 일치를 봅니다.', '단기 MTF 정렬', '빠른 MTF 확인', '신호 감소', '중간', ['UTBot', '15m', '30m'], ['mtf_15_30'], {}),
+        (42, 'MTF Alignment', 'UT + 30m/1h align', '30분과 1시간 방향 일치를 봅니다.', '중기 MTF 정렬', '노이즈 감소', '진입 늦음', '적음~중간', ['UTBot', '30m', '1h'], ['mtf_30_1h'], {}),
+        (43, 'MTF Alignment', 'UT + 1h/4h align', '1시간과 4시간 방향 일치를 봅니다.', '큰 추세 정렬', '역추세 감소', '진입 매우 감소', '적음', ['UTBot', '1h', '4h'], ['mtf_1h_4h'], {}),
+        (44, 'MTF Alignment', 'UT + MTF momentum score', '여러 봉 모멘텀 점수로 set을 고릅니다.', '모멘텀 점수 우위 장', '분산된 정보 활용', '구현 검증 필요', '중간', ['UTBot', 'MTF Momentum'], ['mtf_momentum_score'], {}),
+        (45, 'MTF Alignment', 'UT + MTF volatility score', '여러 봉 변동성 점수로 set을 고릅니다.', '변동성 regime 전환', '장세 구분에 유리', '구현 검증 필요', '중간', ['UTBot', 'MTF Volatility'], ['mtf_volatility_score'], {}),
+        (46, 'Special Regime', 'UT + Parabolic SAR', 'PSAR 방향과 UT 방향을 맞춥니다.', '추세 추종 특화', '명확한 trailing 구조', '횡보 whipsaw', '중간', ['UTBot', 'Parabolic SAR'], ['psar_direction'], {}),
+        (47, 'Special Regime', 'UT + Ichimoku cloud', '일목 구름 위치로 큰 방향을 봅니다.', '중장기 방향성 장', '구조적 추세 판단', '계산/해석 복잡', '적음', ['UTBot', 'Ichimoku'], ['ichimoku_cloud'], {}),
+        (48, 'Special Regime', 'UT + session/time volatility', '시간대별 변동성 특성을 반영합니다.', '세션별 움직임 차이가 큰 장', '실거래 시간대 최적화 가능', '시장 구조 변화에 민감', '중간', ['UTBot', 'Session'], ['session_volatility'], {}),
+        (49, 'Special Regime', 'UT + market regime fallback', '분석 점수가 애매하면 안전한 단순 set으로 후퇴합니다.', '분류가 애매한 장', '과도한 필터링 방지', '방어력은 낮음', '많음', ['UTBot', 'Regime Score'], ['regime_fallback'], {}),
+        (50, 'Special Regime', 'UT emergency simple mode', '장애/데이터 부족 시 UT와 리스크만 남기는 비상 단순 모드입니다.', '데이터 분석이 불안정할 때', '진입 로직이 멈추지 않음', '품질 필터 거의 없음', '매우 많음', ['UTBot', 'Risk Control'], [], {}),
+    ]
+    registry = {}
+    for row in rows:
+        set_id, family, name, description, regime, pros, cons, frequency, indicators, filters, params = row
+        merged_params = dict(base_params)
+        merged_params.update(params or {})
+        registry[int(set_id)] = _build_utbreakout_set(
+            set_id,
+            family,
+            name,
+            description,
+            regime,
+            pros,
+            cons,
+            frequency,
+            indicators,
+            filters,
+            merged_params,
+        )
+    return registry
+
+
+UTBREAKOUT_SET_REGISTRY = build_utbreakout_set_registry()
+
+
+def normalize_utbreakout_set_id(value, default=UTBREAKOUT_DEFAULT_SET_ID):
+    try:
+        text = str(value or '').strip().lower()
+        if text.startswith('set'):
+            text = text[3:]
+        set_id = int(float(text))
+    except (TypeError, ValueError):
+        set_id = int(default)
+    if set_id not in UTBREAKOUT_SET_REGISTRY:
+        set_id = int(default)
+    return set_id
+
+
+def get_utbreakout_set_definition(set_id):
+    return UTBREAKOUT_SET_REGISTRY.get(
+        normalize_utbreakout_set_id(set_id),
+        UTBREAKOUT_SET_REGISTRY[UTBREAKOUT_DEFAULT_SET_ID],
+    )
+
+
+def format_utbreakout_set_brief(set_id):
+    info = get_utbreakout_set_definition(set_id)
+    status = '실거래' if info.get('status') == 'active' else '예정'
+    return (
+        f"Set{info['id']} {info['name']} [{status}] - {info['description']} "
+        f"진입빈도: {info['frequency_impact']}"
+    )
 
 
 def build_default_utbot_filter_pack():
@@ -243,6 +390,10 @@ def build_default_utbot_filter_pack():
 def build_default_utbot_filtered_breakout_config():
     return {
         'profile': 'set2',
+        'active_set_id': UTBREAKOUT_DEFAULT_SET_ID,
+        'auto_select_enabled': False,
+        'selection_mode': 'manual',
+        'auto_timeframes': list(UTBREAKOUT_AUTO_TIMEFRAMES),
         'entry_timeframe': '15m',
         'exit_timeframe': '15m',
         'htf_timeframe': '1h',
@@ -285,31 +436,18 @@ def build_default_utbot_filtered_breakout_config():
 
 def build_utbot_filtered_breakout_profile(profile):
     profile_key = str(profile or 'set2').strip().lower()
+    set_id = normalize_utbreakout_set_id(profile_key, UTBREAKOUT_DEFAULT_SET_ID)
     cfg = build_default_utbot_filtered_breakout_config()
-    if profile_key in {'1', 'set1', 'aggressive'}:
-        cfg.update({
-            'profile': 'set1',
-            'utbot_key_value': 2.0,
-            'utbot_atr_period': 10,
-            'adx_threshold': 20.0,
-            'donchian_length': 20,
-            'stop_atr_multiplier': 1.5,
-            'take_profit_r_multiple': 2.0,
-            'min_risk_reward': 2.0
-        })
-    elif profile_key in {'3', 'set3', 'conservative'}:
-        cfg.update({
-            'profile': 'set3',
-            'utbot_key_value': 3.0,
-            'utbot_atr_period': 21,
-            'adx_threshold': 25.0,
-            'donchian_length': 30,
-            'stop_atr_multiplier': 1.8,
-            'take_profit_r_multiple': 2.0,
-            'min_risk_reward': 2.0
-        })
-    else:
-        cfg['profile'] = 'set2'
+    if profile_key in {'aggressive'}:
+        set_id = 1
+    elif profile_key in {'conservative'}:
+        set_id = 7
+    set_info = get_utbreakout_set_definition(set_id)
+    cfg.update(set_info.get('params', {}))
+    cfg['profile'] = f"set{set_id}"
+    cfg['active_set_id'] = set_id
+    cfg['selection_mode'] = 'manual'
+    cfg['auto_select_enabled'] = False
     return cfg
 
 
@@ -3664,6 +3802,7 @@ class SignalEngine(BaseEngine):
         params = strategy_params if isinstance(strategy_params, dict) else self.get_runtime_strategy_params()
         raw = params.get('UTBotFilteredBreakoutV1', {}) if isinstance(params, dict) else {}
         cfg = build_default_utbot_filtered_breakout_config()
+        raw_has_active_set_id = isinstance(raw, dict) and 'active_set_id' in raw
         if isinstance(raw, dict):
             for key in list(cfg.keys()):
                 if key in raw:
@@ -3721,6 +3860,27 @@ class SignalEngine(BaseEngine):
         }.items():
             _int(key, default, 1)
 
+        cfg['active_set_id'] = normalize_utbreakout_set_id(
+            cfg.get('active_set_id') if raw_has_active_set_id else cfg.get('profile'),
+            UTBREAKOUT_DEFAULT_SET_ID
+        )
+        cfg['profile'] = f"set{cfg['active_set_id']}"
+        selection_mode = str(cfg.get('selection_mode') or '').strip().lower()
+        auto_enabled = bool(cfg.get('auto_select_enabled', False))
+        if selection_mode not in {'manual', 'auto'}:
+            selection_mode = 'auto' if auto_enabled else 'manual'
+        cfg['selection_mode'] = selection_mode
+        cfg['auto_select_enabled'] = selection_mode == 'auto' or auto_enabled
+        if cfg['auto_select_enabled']:
+            cfg['selection_mode'] = 'auto'
+        raw_timeframes = cfg.get('auto_timeframes', UTBREAKOUT_AUTO_TIMEFRAMES)
+        if isinstance(raw_timeframes, str):
+            auto_timeframes = [item.strip().lower() for item in raw_timeframes.split(',') if item.strip()]
+        elif isinstance(raw_timeframes, (list, tuple, set)):
+            auto_timeframes = [str(item).strip().lower() for item in raw_timeframes if str(item).strip()]
+        else:
+            auto_timeframes = list(UTBREAKOUT_AUTO_TIMEFRAMES)
+        cfg['auto_timeframes'] = auto_timeframes or list(UTBREAKOUT_AUTO_TIMEFRAMES)
         cfg['entry_timeframe'] = str(cfg.get('entry_timeframe') or '15m').strip().lower() or '15m'
         cfg['exit_timeframe'] = str(cfg.get('exit_timeframe') or cfg['entry_timeframe']).strip().lower() or cfg['entry_timeframe']
         cfg['htf_timeframe'] = str(cfg.get('htf_timeframe') or '1h').strip().lower() or '1h'
@@ -3745,6 +3905,444 @@ class SignalEngine(BaseEngine):
                 'use_heikin_ashi': bool(cfg.get('use_heikin_ashi', False))
             }
         }
+
+    def _get_utbreakout_set_info(self, cfg, set_id=None):
+        resolved_id = normalize_utbreakout_set_id(
+            set_id if set_id is not None else cfg.get('active_set_id'),
+            UTBREAKOUT_DEFAULT_SET_ID
+        )
+        return get_utbreakout_set_definition(resolved_id)
+
+    def _calculate_utbreakout_vortex(self, closed, length=14):
+        if closed is None or len(closed) < length + 2:
+            return None, None, "Vortex 데이터 부족"
+        high = closed['high'].astype(float).reset_index(drop=True)
+        low = closed['low'].astype(float).reset_index(drop=True)
+        close = closed['close'].astype(float).reset_index(drop=True)
+        prev_high = high.shift(1)
+        prev_low = low.shift(1)
+        prev_close = close.shift(1)
+        true_range = pd.concat([
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+        vm_plus = (high - prev_low).abs()
+        vm_minus = (low - prev_high).abs()
+        tr_sum = true_range.rolling(length).sum().replace(0.0, np.nan)
+        vi_plus = vm_plus.rolling(length).sum() / tr_sum
+        vi_minus = vm_minus.rolling(length).sum() / tr_sum
+        curr_plus = vi_plus.iloc[-1]
+        curr_minus = vi_minus.iloc[-1]
+        if pd.isna(curr_plus) or pd.isna(curr_minus):
+            return None, None, "Vortex 계산 대기"
+        return float(curr_plus), float(curr_minus), f"VI+ {float(curr_plus):.3f} | VI- {float(curr_minus):.3f}"
+
+    def _calculate_utbreakout_aroon(self, closed, length=25):
+        if closed is None or len(closed) < length + 1:
+            return None, None, "Aroon 데이터 부족"
+        high_window = closed['high'].astype(float).iloc[-length:]
+        low_window = closed['low'].astype(float).iloc[-length:]
+        if high_window.empty or low_window.empty:
+            return None, None, "Aroon 계산 대기"
+        high_pos = int(np.argmax(high_window.to_numpy(dtype=float)))
+        low_pos = int(np.argmin(low_window.to_numpy(dtype=float)))
+        periods_since_high = (length - 1) - high_pos
+        periods_since_low = (length - 1) - low_pos
+        aroon_up = 100.0 * (length - periods_since_high) / max(float(length), 1.0)
+        aroon_down = 100.0 * (length - periods_since_low) / max(float(length), 1.0)
+        return float(aroon_up), float(aroon_down), f"AroonUp {aroon_up:.2f} | AroonDown {aroon_down:.2f}"
+
+    def _calculate_utbreakout_timeframe_metrics(self, closed, cfg):
+        metrics = {'ready': False, 'reason': '데이터 부족'}
+        if closed is None or len(closed) < 30:
+            return metrics
+        local = closed.copy().reset_index(drop=True)
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            local[col] = pd.to_numeric(local[col], errors='coerce')
+        local = local.dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+        if len(local) < 30:
+            metrics['reason'] = f"유효 데이터 부족 {len(local)}/30"
+            return metrics
+
+        close = local['close'].astype(float)
+        high = local['high'].astype(float)
+        low = local['low'].astype(float)
+        volume = local['volume'].astype(float) if 'volume' in local else pd.Series(0.0, index=local.index)
+        curr_close = float(close.iloc[-1])
+        prev_close = float(close.iloc[-2]) if len(close) >= 2 else curr_close
+        ema_fast_len = int(cfg.get('ema_fast', 50) or 50)
+        ema_slow_len = int(cfg.get('ema_slow', 200) or 200)
+        ema_fast_series = close.ewm(span=ema_fast_len, adjust=False).mean() if len(close) >= ema_fast_len else pd.Series(np.nan, index=close.index)
+        ema_slow_series = close.ewm(span=ema_slow_len, adjust=False).mean() if len(close) >= ema_slow_len else pd.Series(np.nan, index=close.index)
+        ema_fast = float(ema_fast_series.iloc[-1]) if self._is_valid_number(ema_fast_series.iloc[-1]) else np.nan
+        ema_fast_prev = float(ema_fast_series.iloc[-2]) if len(ema_fast_series) >= 2 and self._is_valid_number(ema_fast_series.iloc[-2]) else np.nan
+        ema_slow = float(ema_slow_series.iloc[-1]) if self._is_valid_number(ema_slow_series.iloc[-1]) else np.nan
+        ema_gap_pct = (
+            abs(ema_fast - ema_slow) / max(abs(curr_close), 1e-9) * 100.0
+            if self._is_valid_number(ema_fast) and self._is_valid_number(ema_slow)
+            else np.nan
+        )
+        ema_bias = 'neutral'
+        if self._is_valid_number(ema_fast) and self._is_valid_number(ema_slow):
+            if curr_close > ema_slow and ema_fast > ema_slow:
+                ema_bias = 'long'
+            elif curr_close < ema_slow and ema_fast < ema_slow:
+                ema_bias = 'short'
+
+        rsi_series = self._calculate_wilder_rsi_series(close, int(cfg.get('rsi_length', 14) or 14))
+        rsi_value = float(rsi_series.iloc[-1]) if self._is_valid_number(rsi_series.iloc[-1]) else np.nan
+        adx_value, plus_di, minus_di, adx_reason = self._calculate_utbot_filter_pack_adx_dmi(
+            local,
+            int(cfg.get('adx_length', 14) or 14)
+        )
+        atr_series = self._calculate_wilder_atr_series(local, int(cfg.get('atr_length', 14) or 14))
+        atr_value = float(atr_series.iloc[-1]) if self._is_valid_number(atr_series.iloc[-1]) else np.nan
+        atr_pct = atr_value / max(abs(curr_close), 1e-9) * 100.0 if self._is_valid_number(atr_value) else np.nan
+        chop_value, chop_reason = self._calculate_utbot_filter_pack_chop(local, 14)
+        vortex_plus, vortex_minus, vortex_reason = self._calculate_utbreakout_vortex(local, 14)
+        aroon_up, aroon_down, aroon_reason = self._calculate_utbreakout_aroon(local, 25)
+        vwap_value, vwap_slope, _, vwap_reason = self._calculate_utbot_filter_pack_vwap(local)
+
+        don_len = int(cfg.get('donchian_length', 20) or 20)
+        don_high_prev = np.nan
+        don_low_prev = np.nan
+        don_width_pct = np.nan
+        don_ready = False
+        if len(local) >= don_len + 1:
+            don_window = local.iloc[-don_len - 1:-1]
+            if len(don_window) >= don_len:
+                don_high_prev = float(don_window['high'].astype(float).max())
+                don_low_prev = float(don_window['low'].astype(float).min())
+                don_width_pct = (don_high_prev - don_low_prev) / max(abs(curr_close), 1e-9) * 100.0
+                don_ready = True
+
+        vol_ma = volume.rolling(20).mean().iloc[-1] if len(volume) >= 20 else np.nan
+        volume_ratio = float(volume.iloc[-1] / vol_ma) if self._is_valid_number(vol_ma) and float(vol_ma) > 0 else np.nan
+        bb_width_pct = np.nan
+        if len(close) >= 20:
+            bb_mid = close.rolling(20).mean()
+            bb_std = close.rolling(20).std()
+            bb_upper = bb_mid + (2.0 * bb_std)
+            bb_lower = bb_mid - (2.0 * bb_std)
+            if self._is_valid_number(bb_upper.iloc[-1]) and self._is_valid_number(bb_lower.iloc[-1]):
+                bb_width_pct = (float(bb_upper.iloc[-1]) - float(bb_lower.iloc[-1])) / max(abs(curr_close), 1e-9) * 100.0
+
+        metrics.update({
+            'ready': True,
+            'reason': 'OK',
+            'timestamp': int(local.iloc[-1].get('timestamp') or 0),
+            'close': curr_close,
+            'prev_close': prev_close,
+            'ema_fast': ema_fast,
+            'ema_fast_prev': ema_fast_prev,
+            'ema_slow': ema_slow,
+            'ema_gap_pct': ema_gap_pct,
+            'ema_bias': ema_bias,
+            'rsi': rsi_value,
+            'adx': adx_value,
+            'plus_di': plus_di,
+            'minus_di': minus_di,
+            'adx_reason': adx_reason,
+            'atr': atr_value,
+            'atr_pct': atr_pct,
+            'chop': chop_value,
+            'chop_reason': chop_reason,
+            'vortex_plus': vortex_plus,
+            'vortex_minus': vortex_minus,
+            'vortex_reason': vortex_reason,
+            'aroon_up': aroon_up,
+            'aroon_down': aroon_down,
+            'aroon_reason': aroon_reason,
+            'vwap': vwap_value,
+            'vwap_slope': vwap_slope,
+            'vwap_reason': vwap_reason,
+            'donchian_high_prev': don_high_prev,
+            'donchian_low_prev': don_low_prev,
+            'donchian_width_pct': don_width_pct,
+            'donchian_ready': don_ready,
+            'bb_width_pct': bb_width_pct,
+            'volume_ratio': volume_ratio,
+        })
+        return metrics
+
+    def _utbreakout_score_from_metrics(self, tf_metrics):
+        ready_metrics = [m for m in tf_metrics.values() if isinstance(m, dict) and m.get('ready')]
+
+        def _valid_values(key):
+            vals = []
+            for item in ready_metrics:
+                value = item.get(key)
+                if self._is_valid_number(value):
+                    vals.append(float(value))
+            return vals
+
+        def _avg(values, default=0.0):
+            return float(sum(values) / len(values)) if values else float(default)
+
+        adx_vals = _valid_values('adx')
+        gap_vals = _valid_values('ema_gap_pct')
+        chop_vals = _valid_values('chop')
+        atr_vals = _valid_values('atr_pct')
+        rsi_vals = _valid_values('rsi')
+        don_width_vals = _valid_values('donchian_width_pct')
+        volume_vals = _valid_values('volume_ratio')
+        bb_width_vals = _valid_values('bb_width_pct')
+
+        adx_score = _avg([min(100.0, max(0.0, (v - 10.0) / 25.0 * 100.0)) for v in adx_vals], 35.0)
+        gap_score = _avg([min(100.0, max(0.0, v / 0.80 * 100.0)) for v in gap_vals], 35.0)
+        chop_trend_score = _avg([min(100.0, max(0.0, (62.0 - v) / 24.0 * 100.0)) for v in chop_vals], 45.0)
+        chop_score = _avg([min(100.0, max(0.0, (v - 38.0) / 24.0 * 100.0)) for v in chop_vals], 45.0)
+        volatility_score = _avg([
+            100.0 if 0.12 <= v <= 1.20 else max(0.0, 100.0 - abs(v - 0.66) * 90.0)
+            for v in atr_vals
+        ], 55.0)
+        momentum_score = _avg([min(100.0, abs(v - 50.0) * 4.0) for v in rsi_vals], 40.0)
+        breakout_score = _avg([min(100.0, max(0.0, v / 1.0 * 100.0)) for v in don_width_vals], 40.0)
+        if bb_width_vals:
+            breakout_score = (breakout_score + _avg([min(100.0, max(0.0, v / 1.5 * 100.0)) for v in bb_width_vals])) / 2.0
+        flow_score = _avg([min(100.0, max(0.0, (v - 0.7) / 1.3 * 100.0)) for v in volume_vals], 40.0)
+
+        long_votes = 0
+        short_votes = 0
+        for item in ready_metrics:
+            if item.get('ema_bias') == 'long':
+                long_votes += 1
+            elif item.get('ema_bias') == 'short':
+                short_votes += 1
+            rsi = item.get('rsi')
+            if self._is_valid_number(rsi):
+                if float(rsi) > 52:
+                    long_votes += 1
+                elif float(rsi) < 48:
+                    short_votes += 1
+            plus_di = item.get('plus_di')
+            minus_di = item.get('minus_di')
+            if self._is_valid_number(plus_di) and self._is_valid_number(minus_di):
+                if float(plus_di) > float(minus_di):
+                    long_votes += 1
+                elif float(minus_di) > float(plus_di):
+                    short_votes += 1
+        total_votes = long_votes + short_votes
+        alignment_score = abs(long_votes - short_votes) / max(total_votes, 1) * 100.0
+        dominant_side = 'long' if long_votes > short_votes else 'short' if short_votes > long_votes else 'neutral'
+        trend_score = (adx_score * 0.45) + (gap_score * 0.25) + (chop_trend_score * 0.30)
+
+        return {
+            'trend_score': round(trend_score, 2),
+            'chop_score': round(chop_score, 2),
+            'volatility_score': round(volatility_score, 2),
+            'breakout_score': round(breakout_score, 2),
+            'momentum_score': round(momentum_score, 2),
+            'flow_score': round(flow_score, 2),
+            'alignment_score': round(alignment_score, 2),
+            'dominant_side': dominant_side,
+            'ready_timeframes': len(ready_metrics),
+        }
+
+    async def _build_utbreakout_auto_analysis(self, symbol, base_df, cfg):
+        timeframes = list(cfg.get('auto_timeframes') or UTBREAKOUT_AUTO_TIMEFRAMES)
+        entry_tf = str(cfg.get('entry_timeframe', '15m') or '15m').lower()
+        timeframe_metrics = {}
+        errors = {}
+        for tf in timeframes:
+            tf = str(tf or '').strip().lower()
+            if not tf:
+                continue
+            try:
+                if tf == entry_tf and base_df is not None and len(base_df) > 0:
+                    tf_df = base_df.copy()
+                else:
+                    ohlcv = await asyncio.to_thread(
+                        self.market_data_exchange.fetch_ohlcv,
+                        symbol,
+                        tf,
+                        limit=300
+                    )
+                    tf_df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    tf_df[col] = pd.to_numeric(tf_df[col], errors='coerce')
+                tf_closed = tf_df.iloc[:-1].dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+                timeframe_metrics[tf] = self._calculate_utbreakout_timeframe_metrics(tf_closed, cfg)
+            except Exception as exc:
+                errors[tf] = str(exc)
+                timeframe_metrics[tf] = {'ready': False, 'reason': str(exc)}
+        scores = self._utbreakout_score_from_metrics(timeframe_metrics)
+        return {
+            'timeframes': timeframe_metrics,
+            'scores': scores,
+            'errors': errors,
+        }
+
+    def _select_utbreakout_auto_set(self, analysis, cfg):
+        scores = dict((analysis or {}).get('scores') or {})
+        trend = float(scores.get('trend_score', 0.0) or 0.0)
+        chop = float(scores.get('chop_score', 0.0) or 0.0)
+        volatility = float(scores.get('volatility_score', 0.0) or 0.0)
+        breakout = float(scores.get('breakout_score', 0.0) or 0.0)
+        momentum = float(scores.get('momentum_score', 0.0) or 0.0)
+        flow = float(scores.get('flow_score', 0.0) or 0.0)
+        alignment = float(scores.get('alignment_score', 0.0) or 0.0)
+        ready = int(scores.get('ready_timeframes', 0) or 0)
+
+        if ready <= 0:
+            fallback_id = normalize_utbreakout_set_id(cfg.get('active_set_id'), UTBREAKOUT_DEFAULT_SET_ID)
+            return fallback_id, "AUTO 분석 데이터 부족: 수동 set 유지"
+
+        candidate_scores = {
+            1: 42.0 + (chop * 0.12) + ((100.0 - trend) * 0.06),
+            2: 48.0 + (volatility * 0.36) + (flow * 0.08),
+            3: 38.0 + (alignment * 0.42) + (trend * 0.22),
+            4: 40.0 + (momentum * 0.30) + (trend * 0.18),
+            5: 36.0 + (trend * 0.35) + (alignment * 0.22),
+            6: 42.0 + (trend * 0.42),
+            7: 34.0 + (trend * 0.38) + (momentum * 0.18) + (alignment * 0.16),
+            8: 30.0 + ((100.0 - chop) * 0.34) + (trend * 0.22),
+            9: 38.0 + (momentum * 0.28) + (trend * 0.20) + (flow * 0.08),
+            10: 36.0 + (breakout * 0.34) + (momentum * 0.18) + (trend * 0.08),
+        }
+        selected_id, selected_score = max(candidate_scores.items(), key=lambda item: item[1])
+        if selected_score < 58.0:
+            selected_id = 2
+            reason = (
+                f"점수 우위가 약해 Set2로 fallback "
+                f"(trend {trend:.1f}, chop {chop:.1f}, vol {volatility:.1f})"
+            )
+        else:
+            reason = (
+                f"trend {trend:.1f}, chop {chop:.1f}, vol {volatility:.1f}, "
+                f"breakout {breakout:.1f}, momentum {momentum:.1f}, flow {flow:.1f}, "
+                f"align {alignment:.1f} -> Set{selected_id} score {selected_score:.1f}"
+            )
+        return selected_id, reason
+
+    async def _resolve_utbreakout_selected_set(self, symbol, df, cfg):
+        analysis = None
+        auto_reason = None
+        selected_id = normalize_utbreakout_set_id(cfg.get('active_set_id'), UTBREAKOUT_DEFAULT_SET_ID)
+        if bool(cfg.get('auto_select_enabled', False)) or str(cfg.get('selection_mode', '')).lower() == 'auto':
+            try:
+                analysis = await self._build_utbreakout_auto_analysis(symbol, df, cfg)
+                selected_id, auto_reason = self._select_utbreakout_auto_set(analysis, cfg)
+            except Exception as exc:
+                auto_reason = f"AUTO 분석 실패: {exc}. 수동 Set{selected_id} 유지"
+        selected_info = self._get_utbreakout_set_info(cfg, selected_id)
+        return selected_info, analysis, auto_reason
+
+    def _evaluate_utbreakout_set_filter_items(self, side, set_info, cfg, values):
+        side = str(side or '').lower()
+        filters = list((set_info or {}).get('entry_filters') or [])
+        items = []
+
+        def _fmt(value, digits=2):
+            try:
+                if value is None or not np.isfinite(float(value)):
+                    return "n/a"
+                return f"{float(value):.{digits}f}"
+            except (TypeError, ValueError):
+                return "n/a"
+
+        def _add(name, state, detail, code):
+            items.append({
+                'name': name,
+                'state': state,
+                'detail': detail,
+                'code': code,
+            })
+
+        for filter_name in filters:
+            if filter_name == 'atr_guard':
+                atr_pct = values.get('atr_pct')
+                atr_min = float(cfg.get('atr_min_percent', 0.12) or 0.12)
+                atr_max = float(cfg.get('atr_max_percent', 1.20) or 1.20)
+                if not self._is_valid_number(atr_pct):
+                    _add('ATR% 변동성', None, 'ATR 계산 대기', 'REJECTED_ATR_TOO_LOW')
+                elif float(atr_pct) < atr_min:
+                    _add('ATR% 변동성', False, f"ATR% {_fmt(atr_pct, 3)} < {atr_min:.2f}", 'REJECTED_ATR_TOO_LOW')
+                elif float(atr_pct) > atr_max:
+                    _add('ATR% 변동성', False, f"ATR% {_fmt(atr_pct, 3)} > {atr_max:.2f}", 'REJECTED_ATR_TOO_HIGH')
+                else:
+                    _add('ATR% 변동성', True, f"ATR% {_fmt(atr_pct, 3)} in {atr_min:.2f}~{atr_max:.2f}", 'ACCEPTED_ENTRY')
+            elif filter_name == 'htf_trend':
+                if not values.get('htf_ready'):
+                    _add('HTF EMA 추세', None, values.get('htf_error') or 'HTF 계산 대기', 'REJECTED_HTF_TREND')
+                else:
+                    htf_close = values.get('htf_close')
+                    htf_fast = values.get('htf_ema_fast')
+                    htf_slow = values.get('htf_ema_slow')
+                    if side == 'long':
+                        ok = htf_close > htf_slow and htf_fast > htf_slow
+                        cond = 'close>EMA200, EMA50>EMA200'
+                    else:
+                        ok = htf_close < htf_slow and htf_fast < htf_slow
+                        cond = 'close<EMA200, EMA50<EMA200'
+                    _add(
+                        'HTF EMA 추세',
+                        ok,
+                        f"{cond} | close {_fmt(htf_close, 4)}, EMA50 {_fmt(htf_fast, 4)}, EMA200 {_fmt(htf_slow, 4)}",
+                        'REJECTED_HTF_TREND'
+                    )
+            elif filter_name == 'ema_slope':
+                ema_fast = values.get('ema50')
+                ema_fast_prev = values.get('ema50_prev')
+                close_value = values.get('entry_price')
+                if not (self._is_valid_number(ema_fast) and self._is_valid_number(ema_fast_prev) and self._is_valid_number(close_value)):
+                    _add('15M EMA 기울기', None, 'EMA 계산 대기', 'REJECTED_EMA_CHOP_ZONE')
+                elif side == 'long':
+                    ok = float(close_value) > float(ema_fast) and float(ema_fast) > float(ema_fast_prev)
+                    _add('15M EMA 기울기', ok, f"close {_fmt(close_value, 4)} > EMA50 {_fmt(ema_fast, 4)}, EMA50 상승", 'REJECTED_EMA_CHOP_ZONE')
+                else:
+                    ok = float(close_value) < float(ema_fast) and float(ema_fast) < float(ema_fast_prev)
+                    _add('15M EMA 기울기', ok, f"close {_fmt(close_value, 4)} < EMA50 {_fmt(ema_fast, 4)}, EMA50 하락", 'REJECTED_EMA_CHOP_ZONE')
+            elif filter_name == 'htf_supertrend':
+                direction = values.get('htf_supertrend_direction')
+                reason = values.get('htf_supertrend_reason') or 'HTF Supertrend 계산 대기'
+                state = (direction == side) if direction in {'long', 'short'} else None
+                _add('HTF Supertrend', state, reason, 'REJECTED_HTF_TREND')
+            elif filter_name == 'adx_loose':
+                adx_value = values.get('adx')
+                threshold = float(cfg.get('adx_threshold', 20.0) or 20.0)
+                state = float(adx_value) >= threshold if self._is_valid_number(adx_value) else None
+                _add('ADX 추세강도', state, f"ADX {_fmt(adx_value, 2)} / 조건 >= {threshold:.2f}", 'REJECTED_ADX_LOW')
+            elif filter_name == 'adx_dmi':
+                adx_value = values.get('adx')
+                plus_di = values.get('plus_di')
+                minus_di = values.get('minus_di')
+                threshold = float(cfg.get('adx_threshold', 22.0) or 22.0)
+                if not (self._is_valid_number(adx_value) and self._is_valid_number(plus_di) and self._is_valid_number(minus_di)):
+                    _add('ADX+DMI', None, values.get('adx_reason') or 'ADX/DMI 계산 대기', 'REJECTED_ADX_LOW')
+                else:
+                    dmi_ok = float(plus_di) > float(minus_di) if side == 'long' else float(minus_di) > float(plus_di)
+                    ok = float(adx_value) >= threshold and dmi_ok
+                    _add('ADX+DMI', ok, f"ADX {_fmt(adx_value, 2)} >= {threshold:.2f}, +DI {_fmt(plus_di, 2)}, -DI {_fmt(minus_di, 2)}", 'REJECTED_ADX_LOW')
+            elif filter_name == 'chop_trend':
+                chop_value = values.get('chop')
+                threshold = 55.0
+                state = float(chop_value) <= threshold if self._is_valid_number(chop_value) else None
+                _add('CHOP 추세성', state, f"CHOP {_fmt(chop_value, 2)} / 조건 <= {threshold:.2f}", 'REJECTED_DONCHIAN_WIDTH_TOO_NARROW')
+            elif filter_name == 'vortex':
+                vi_plus = values.get('vortex_plus')
+                vi_minus = values.get('vortex_minus')
+                if not (self._is_valid_number(vi_plus) and self._is_valid_number(vi_minus)):
+                    _add('Vortex 방향', None, values.get('vortex_reason') or 'Vortex 계산 대기', 'REJECTED_RSI_MOMENTUM')
+                else:
+                    ok = float(vi_plus) > float(vi_minus) if side == 'long' else float(vi_minus) > float(vi_plus)
+                    _add('Vortex 방향', ok, f"VI+ {_fmt(vi_plus, 3)} / VI- {_fmt(vi_minus, 3)}", 'REJECTED_RSI_MOMENTUM')
+            elif filter_name == 'aroon':
+                aroon_up = values.get('aroon_up')
+                aroon_down = values.get('aroon_down')
+                if not (self._is_valid_number(aroon_up) and self._is_valid_number(aroon_down)):
+                    _add('Aroon 방향', None, values.get('aroon_reason') or 'Aroon 계산 대기', 'REJECTED_RSI_MOMENTUM')
+                else:
+                    ok = (
+                        float(aroon_up) > float(aroon_down) and float(aroon_up) >= 50.0
+                        if side == 'long'
+                        else float(aroon_down) > float(aroon_up) and float(aroon_down) >= 50.0
+                    )
+                    _add('Aroon 방향', ok, f"Up {_fmt(aroon_up, 2)} / Down {_fmt(aroon_down, 2)}", 'REJECTED_RSI_MOMENTUM')
+            else:
+                _add(filter_name, None, 'planned 필터: 아직 실거래 연결 안 됨', 'REJECTED_RISK_REWARD_LOW')
+        return items
 
     def _calculate_wilder_atr_series(self, closed, length):
         if closed is None or len(closed) < length:
@@ -3863,6 +4461,12 @@ class SignalEngine(BaseEngine):
                 'candidate_type': status.get('candidate_type'),
                 'fresh_signal': status.get('fresh_signal'),
                 'ut_bias_side': status.get('ut_bias_side'),
+                'selection_mode': status.get('selection_mode'),
+                'auto_selected_set_id': status.get('auto_selected_set_id'),
+                'auto_selected_set_name': status.get('auto_selected_set_name'),
+                'auto_selection_reason': status.get('auto_selection_reason'),
+                'auto_scores': status.get('auto_scores'),
+                'set_filters': status.get('set_filters'),
                 'entry_timeframe': status.get('entry_timeframe'),
                 'htf_timeframe': status.get('htf_timeframe'),
                 'decision_candle_ts': status.get('decision_candle_ts'),
@@ -3944,19 +4548,52 @@ class SignalEngine(BaseEngine):
             return _finish(None, "UTBOT_FILTERED_BREAKOUT_V1 데이터 부족", None)
 
         closed = df.iloc[:-1].copy().reset_index(drop=True)
-        min_bars = max(
-            int(cfg['ema_slow']) + 5,
-            int(cfg['donchian_length']) + 2,
-            int(cfg['adx_length']) * 2 + 5,
-            int(cfg['atr_length']) + 5,
-            int(cfg['rsi_length']) + 5
-        )
-        if len(closed) < min_bars:
-            return _finish(None, f"UTBOT_FILTERED_BREAKOUT_V1 데이터 부족 ({len(closed)}/{min_bars})", None)
-
         for col in ['open', 'high', 'low', 'close', 'volume']:
             closed[col] = pd.to_numeric(closed[col], errors='coerce')
         closed = closed.dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+
+        selected_set, auto_analysis, auto_reason = await self._resolve_utbreakout_selected_set(symbol, df, cfg)
+        set_params = selected_set.get('params', {}) if isinstance(selected_set, dict) else {}
+        effective_cfg = dict(cfg)
+        effective_cfg.update(set_params)
+        effective_cfg['active_set_id'] = int(selected_set.get('id', cfg.get('active_set_id', UTBREAKOUT_DEFAULT_SET_ID)))
+        effective_cfg['profile'] = f"set{effective_cfg['active_set_id']}"
+        cfg = effective_cfg
+        selected_filters = set(selected_set.get('entry_filters') or [])
+        status.update({
+            'selection_mode': 'auto' if cfg.get('auto_select_enabled') else 'manual',
+            'auto_select_enabled': bool(cfg.get('auto_select_enabled', False)),
+            'auto_selected_set_id': selected_set.get('id'),
+            'auto_selected_set_name': selected_set.get('name'),
+            'auto_selected_set_status': selected_set.get('status'),
+            'auto_selection_reason': auto_reason,
+            'auto_scores': (auto_analysis or {}).get('scores') if isinstance(auto_analysis, dict) else None,
+            'set_filters': list(selected_set.get('entry_filters') or []),
+            'utbot_key_value': cfg.get('utbot_key_value'),
+            'utbot_atr_period': cfg.get('utbot_atr_period'),
+        })
+
+        if selected_set.get('status') != 'active':
+            return _finish(
+                None,
+                f"REJECTED_RISK_REWARD_LOW: Set{selected_set.get('id')} is planned only and not connected to orders",
+                'REJECTED_RISK_REWARD_LOW'
+            )
+
+        min_candidates = [
+            int(cfg.get('utbot_atr_period', 14) or 14) + 5,
+            int(cfg.get('atr_length', 14) or 14) + 5,
+            30,
+        ]
+        if 'ema_slope' in selected_filters:
+            min_candidates.append(int(cfg.get('ema_fast', 50) or 50) + 5)
+        if 'rsi_momentum' in selected_filters:
+            min_candidates.append(int(cfg.get('rsi_length', 14) or 14) + 5)
+        if 'adx_loose' in selected_filters or 'adx_dmi' in selected_filters:
+            min_candidates.append(int(cfg.get('adx_length', 14) or 14) * 2 + 5)
+        if 'donchian_breakout' in selected_filters or 'donchian_width' in selected_filters:
+            min_candidates.append(int(cfg.get('donchian_length', 20) or 20) + 2)
+        min_bars = max(min_candidates)
         if len(closed) < min_bars:
             return _finish(None, f"UTBOT_FILTERED_BREAKOUT_V1 유효 데이터 부족 ({len(closed)}/{min_bars})", None)
 
@@ -4033,6 +4670,14 @@ class SignalEngine(BaseEngine):
                 side=side
             )
 
+        ema_fast_len = int(cfg['ema_fast'])
+        ema_slow_len = int(cfg['ema_slow'])
+        htf_closed = None
+        htf_ready = False
+        htf_error = None
+        htf_curr_close = htf_ema_fast = htf_ema_slow = htf_gap_pct = np.nan
+        htf_supertrend_direction = None
+        htf_supertrend_reason = None
         try:
             htf_ohlcv = await asyncio.to_thread(
                 self.market_data_exchange.fetch_ohlcv,
@@ -4044,114 +4689,136 @@ class SignalEngine(BaseEngine):
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 htf_df[col] = pd.to_numeric(htf_df[col], errors='coerce')
             htf_closed = htf_df.iloc[:-1].dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+            if len(htf_closed) >= ema_slow_len + 2:
+                htf_close = htf_closed['close'].astype(float)
+                htf_ema_fast = float(htf_close.ewm(span=ema_fast_len, adjust=False).mean().iloc[-1])
+                htf_ema_slow = float(htf_close.ewm(span=ema_slow_len, adjust=False).mean().iloc[-1])
+                htf_curr_close = float(htf_close.iloc[-1])
+                htf_gap_pct = abs(htf_ema_fast - htf_ema_slow) / max(abs(htf_curr_close), 1e-9) * 100.0
+                htf_ready = True
+            else:
+                htf_error = f"HTF 데이터 부족 ({len(htf_closed)}/{ema_slow_len + 2})"
+            if htf_closed is not None:
+                htf_supertrend_direction, htf_supertrend_band, htf_supertrend_reason = self._calculate_utbot_filter_pack_supertrend_direction(
+                    htf_closed,
+                    length=10,
+                    multiplier=3.0
+                )
+                status['htf_supertrend_band'] = htf_supertrend_band
         except Exception as e:
-            return _finish(None, f"REJECTED_HTF_TREND: htf fetch failed ({e})", 'REJECTED_HTF_TREND', record_failure=True, side=side)
-
-        ema_fast_len = int(cfg['ema_fast'])
-        ema_slow_len = int(cfg['ema_slow'])
-        if len(htf_closed) < ema_slow_len + 2:
-            return _finish(
-                None,
-                f"REJECTED_HTF_TREND: htf data shortage ({len(htf_closed)}/{ema_slow_len + 2})",
-                'REJECTED_HTF_TREND',
-                record_failure=True,
-                side=side
-            )
-
-        htf_close = htf_closed['close'].astype(float)
-        htf_ema_fast = htf_close.ewm(span=ema_fast_len, adjust=False).mean().iloc[-1]
-        htf_ema_slow = htf_close.ewm(span=ema_slow_len, adjust=False).mean().iloc[-1]
-        htf_curr_close = float(htf_close.iloc[-1])
-        htf_gap_pct = abs(float(htf_ema_fast) - float(htf_ema_slow)) / max(abs(htf_curr_close), 1e-9) * 100.0
+            htf_error = f"HTF fetch failed ({e})"
         status['htf_summary'] = (
             f"{cfg.get('htf_timeframe')} close={htf_curr_close:.4f}, "
             f"EMA{ema_fast_len}={float(htf_ema_fast):.4f}, EMA{ema_slow_len}={float(htf_ema_slow):.4f}, "
             f"gap={htf_gap_pct:.3f}%"
+            if htf_ready else (htf_error or "HTF 계산 대기")
         )
-        if htf_gap_pct < float(cfg.get('htf_ema_gap_min_percent', 0.15) or 0.15):
-            return _finish(None, f"REJECTED_HTF_TREND: htf EMA gap {htf_gap_pct:.3f}% too narrow", 'REJECTED_HTF_TREND', record_failure=True, side=side)
-        if side == 'long':
-            htf_ok = htf_curr_close > float(htf_ema_slow) and float(htf_ema_fast) > float(htf_ema_slow)
-        else:
-            htf_ok = htf_curr_close < float(htf_ema_slow) and float(htf_ema_fast) < float(htf_ema_slow)
-        if not htf_ok:
-            return _finish(None, f"REJECTED_HTF_TREND: {side.upper()} htf direction mismatch", 'REJECTED_HTF_TREND', record_failure=True, side=side)
 
         close_series = closed['close'].astype(float)
-        ema200 = close_series.ewm(span=ema_slow_len, adjust=False).mean().iloc[-1]
-        ema50 = close_series.ewm(span=ema_fast_len, adjust=False).mean().iloc[-1]
+        ema200 = close_series.ewm(span=ema_slow_len, adjust=False).mean().iloc[-1] if len(close_series) >= ema_slow_len else np.nan
+        ema50_series = close_series.ewm(span=ema_fast_len, adjust=False).mean()
+        ema50 = ema50_series.iloc[-1]
+        ema50_prev = ema50_series.iloc[-2] if len(ema50_series) >= 2 else np.nan
         rsi_series = self._calculate_wilder_rsi_series(close_series, int(cfg['rsi_length']))
         rsi_value = float(rsi_series.iloc[-1]) if self._is_valid_number(rsi_series.iloc[-1]) else np.nan
         adx_value, plus_di, minus_di, adx_reason = self._calculate_utbot_filter_pack_adx_dmi(closed, int(cfg['adx_length']))
         atr_series = self._calculate_wilder_atr_series(closed, int(cfg['atr_length']))
         atr_value = float(atr_series.iloc[-1]) if self._is_valid_number(atr_series.iloc[-1]) else np.nan
         atr_pct = atr_value / max(abs(entry_price), 1e-9) * 100.0 if self._is_valid_number(atr_value) else np.nan
+        chop_value, chop_reason = self._calculate_utbot_filter_pack_chop(closed, 14)
+        vortex_plus, vortex_minus, vortex_reason = self._calculate_utbreakout_vortex(closed, 14)
+        aroon_up, aroon_down, aroon_reason = self._calculate_utbreakout_aroon(closed, 25)
         donchian_len = int(cfg['donchian_length'])
         don_window = closed.iloc[-donchian_len - 1:-1]
         if len(don_window) < donchian_len:
-            return _finish(None, "REJECTED_DONCHIAN_NO_BREAKOUT: Donchian data shortage", 'REJECTED_DONCHIAN_NO_BREAKOUT', record_failure=True, side=side)
-        don_high_prev = float(don_window['high'].astype(float).max())
-        don_low_prev = float(don_window['low'].astype(float).min())
-        don_width_pct = (don_high_prev - don_low_prev) / max(abs(entry_price), 1e-9) * 100.0
-        ema_near_pct = abs(entry_price - float(ema200)) / max(abs(entry_price), 1e-9) * 100.0
+            don_high_prev = np.nan
+            don_low_prev = np.nan
+            don_width_pct = np.nan
+        else:
+            don_high_prev = float(don_window['high'].astype(float).max())
+            don_low_prev = float(don_window['low'].astype(float).min())
+            don_width_pct = (don_high_prev - don_low_prev) / max(abs(entry_price), 1e-9) * 100.0
+        ema_near_pct = abs(entry_price - float(ema200)) / max(abs(entry_price), 1e-9) * 100.0 if self._is_valid_number(ema200) else np.nan
 
         status.update({
             'rsi': rsi_value,
             'adx': adx_value,
             'plus_di': plus_di,
             'minus_di': minus_di,
+            'chop': chop_value,
+            'vortex_plus': vortex_plus,
+            'vortex_minus': vortex_minus,
+            'aroon_up': aroon_up,
+            'aroon_down': aroon_down,
             'atr': atr_value,
             'atr_pct': atr_pct,
             'ema50': float(ema50),
+            'ema50_prev': float(ema50_prev) if self._is_valid_number(ema50_prev) else None,
             'ema200': float(ema200),
             'ema_near_pct': ema_near_pct,
             'donchian_high_prev': don_high_prev,
             'donchian_low_prev': don_low_prev,
             'donchian_width_pct': don_width_pct,
+            'htf_ready': htf_ready,
+            'htf_close': htf_curr_close,
+            'htf_ema_fast': htf_ema_fast,
+            'htf_ema_slow': htf_ema_slow,
+            'htf_gap_pct': htf_gap_pct,
+            'htf_supertrend_direction': htf_supertrend_direction,
+            'htf_supertrend_reason': htf_supertrend_reason,
             'metric_summary': (
                 f"RSI={rsi_value:.2f}, ADX={float(adx_value or 0):.2f}, ATR%={atr_pct:.3f}, "
                 f"EMA200 dist={ema_near_pct:.3f}%, Donchian width={don_width_pct:.3f}%"
             )
         })
 
-        if not self._is_valid_number(rsi_value):
-            return _finish(None, "REJECTED_RSI_MOMENTUM: RSI calculation pending", 'REJECTED_RSI_MOMENTUM', record_failure=True, side=side)
-        rsi_threshold = float(cfg.get('rsi_threshold', 50.0) or 50.0)
-        if side == 'long':
-            rsi_ok = rsi_value > rsi_threshold
-            if cfg.get('exclude_rsi_extreme', False):
-                rsi_ok = rsi_ok and rsi_value <= float(cfg.get('rsi_long_extreme', 80.0) or 80.0)
-        else:
-            rsi_ok = rsi_value < rsi_threshold
-            if cfg.get('exclude_rsi_extreme', False):
-                rsi_ok = rsi_ok and rsi_value >= float(cfg.get('rsi_short_extreme', 20.0) or 20.0)
-        if not rsi_ok:
-            return _finish(None, f"REJECTED_RSI_MOMENTUM: RSI {rsi_value:.2f} not aligned for {side.upper()}", 'REJECTED_RSI_MOMENTUM', record_failure=True, side=side)
+        filter_values = {
+            'entry_price': entry_price,
+            'rsi': rsi_value,
+            'adx': adx_value,
+            'plus_di': plus_di,
+            'minus_di': minus_di,
+            'adx_reason': adx_reason,
+            'atr_pct': atr_pct,
+            'ema50': ema50,
+            'ema50_prev': ema50_prev,
+            'ema200': ema200,
+            'ema_near_pct': ema_near_pct,
+            'donchian_high_prev': don_high_prev,
+            'donchian_low_prev': don_low_prev,
+            'donchian_width_pct': don_width_pct,
+            'chop': chop_value,
+            'chop_reason': chop_reason,
+            'vortex_plus': vortex_plus,
+            'vortex_minus': vortex_minus,
+            'vortex_reason': vortex_reason,
+            'aroon_up': aroon_up,
+            'aroon_down': aroon_down,
+            'aroon_reason': aroon_reason,
+            'htf_ready': htf_ready,
+            'htf_error': htf_error,
+            'htf_close': htf_curr_close,
+            'htf_ema_fast': htf_ema_fast,
+            'htf_ema_slow': htf_ema_slow,
+            'htf_gap_pct': htf_gap_pct,
+            'htf_supertrend_direction': htf_supertrend_direction,
+            'htf_supertrend_reason': htf_supertrend_reason,
+        }
+        filter_items = self._evaluate_utbreakout_set_filter_items(side, selected_set, cfg, filter_values)
+        status['set_filter_items'] = filter_items
+        for item in filter_items:
+            if item.get('state') is not True:
+                code = item.get('code') or 'REJECTED_RISK_REWARD_LOW'
+                return _finish(
+                    None,
+                    f"{code}: Set{selected_set.get('id')} {item.get('name')} - {item.get('detail')}",
+                    code,
+                    record_failure=True,
+                    side=side
+                )
 
-        if adx_value is None or not self._is_valid_number(adx_value):
-            return _finish(None, f"REJECTED_ADX_LOW: {adx_reason}", 'REJECTED_ADX_LOW', record_failure=True, side=side)
-        if float(adx_value) < float(cfg.get('adx_threshold', 22.0) or 22.0):
-            return _finish(None, f"REJECTED_ADX_LOW: ADX {float(adx_value):.2f} < {float(cfg['adx_threshold']):.2f}", 'REJECTED_ADX_LOW', record_failure=True, side=side)
-
-        long_breakout = entry_price > don_high_prev
-        short_breakout = entry_price < don_low_prev
-        if side == 'long' and not long_breakout:
-            return _finish(None, f"REJECTED_DONCHIAN_NO_BREAKOUT: close {entry_price:.4f} <= prev high {don_high_prev:.4f}", 'REJECTED_DONCHIAN_NO_BREAKOUT', record_failure=True, side=side)
-        if side == 'short' and not short_breakout:
-            return _finish(None, f"REJECTED_DONCHIAN_NO_BREAKOUT: close {entry_price:.4f} >= prev low {don_low_prev:.4f}", 'REJECTED_DONCHIAN_NO_BREAKOUT', record_failure=True, side=side)
-
-        if not self._is_valid_number(atr_pct):
-            return _finish(None, "REJECTED_ATR_TOO_LOW: ATR calculation pending", 'REJECTED_ATR_TOO_LOW', record_failure=True, side=side)
-        if atr_pct < float(cfg.get('atr_min_percent', 0.12) or 0.12):
-            return _finish(None, f"REJECTED_ATR_TOO_LOW: ATR% {atr_pct:.3f} < {float(cfg['atr_min_percent']):.3f}", 'REJECTED_ATR_TOO_LOW', record_failure=True, side=side)
-        if atr_pct > float(cfg.get('atr_max_percent', 1.20) or 1.20):
-            return _finish(None, f"REJECTED_ATR_TOO_HIGH: ATR% {atr_pct:.3f} > {float(cfg['atr_max_percent']):.3f}", 'REJECTED_ATR_TOO_HIGH', record_failure=True, side=side)
-
-        if ema_near_pct < float(cfg.get('ema_near_percent', 0.20) or 0.20):
-            return _finish(None, f"REJECTED_EMA_CHOP_ZONE: EMA200 distance {ema_near_pct:.3f}% too close", 'REJECTED_EMA_CHOP_ZONE', record_failure=True, side=side)
-
-        if don_width_pct < float(cfg.get('donchian_width_min_percent', 0.50) or 0.50):
-            return _finish(None, f"REJECTED_DONCHIAN_WIDTH_TOO_NARROW: width {don_width_pct:.3f}% too narrow", 'REJECTED_DONCHIAN_WIDTH_TOO_NARROW', record_failure=True, side=side)
+        if not self._is_valid_number(atr_value) or float(atr_value) <= 0:
+            return _finish(None, "REJECTED_ATR_TOO_LOW: ATR risk distance calculation pending", 'REJECTED_ATR_TOO_LOW', record_failure=True, side=side)
 
         ut_stop = ut_detail.get('curr_stop')
         stop_anchor_distance = abs(entry_price - float(ut_stop)) if self._is_valid_number(ut_stop) else 0.0
@@ -4196,7 +4863,11 @@ class SignalEngine(BaseEngine):
             f"SL={stop_loss:.4f}, TP={take_profit:.4f}, qty={planned_qty:.8f}, RR={rr_multiple:.2f}"
         )
         status['entry_plan'] = dict(plan)
-        return _finish(side, f"ACCEPTED_ENTRY: {side.upper()} filtered breakout confirmed ({candidate_type})", None)
+        return _finish(
+            side,
+            f"ACCEPTED_ENTRY: {side.upper()} Set{selected_set.get('id')} {selected_set.get('name')} confirmed ({candidate_type})",
+            None
+        )
 
     async def build_utbreakout_condition_status_text(self, symbol):
         cfg = self._get_utbot_filtered_breakout_config(self.get_runtime_strategy_params())
@@ -4239,11 +4910,6 @@ class SignalEngine(BaseEngine):
         def _line(idx, label, state, detail):
             return f"{_icon(state)} {_state_label(state)} {idx}. {label}: {detail}"
 
-        def _requirement_detail(label, value, condition, threshold, state, digits=2, unit=''):
-            return (
-                f"{label} {_fmt(value, digits)}{unit} / 조건 {condition} {_fmt(threshold, digits)}{unit}"
-            )
-
         if self.is_upbit_mode():
             return "🚦 UT Breakout 조건 스테이터스\n\n업비트 현물 모드에서는 UTBOT_FILTERED_BREAKOUT_V1을 사용하지 않습니다."
 
@@ -4264,6 +4930,18 @@ class SignalEngine(BaseEngine):
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         closed = df.iloc[:-1].copy().dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+        if len(closed) < 5:
+            return f"🚦 UT Breakout 조건 스테이터스\n\n{symbol} {entry_tf} 유효 데이터 부족"
+
+        selected_set, auto_analysis, auto_reason = await self._resolve_utbreakout_selected_set(symbol, df, cfg)
+        effective_cfg = dict(cfg)
+        effective_cfg.update(selected_set.get('params', {}) if isinstance(selected_set, dict) else {})
+        effective_cfg['active_set_id'] = selected_set.get('id', cfg.get('active_set_id', UTBREAKOUT_DEFAULT_SET_ID))
+        effective_cfg['profile'] = f"set{effective_cfg['active_set_id']}"
+        cfg = effective_cfg
+        entry_tf = cfg.get('entry_timeframe', '15m')
+        htf_tf = cfg.get('htf_timeframe', '1h')
+
         decision_ts = int(closed.iloc[-1].get('timestamp') or 0) if len(closed) else 0
         entry_price = float(closed.iloc[-1]['close']) if len(closed) else np.nan
 
@@ -4276,14 +4954,14 @@ class SignalEngine(BaseEngine):
         candidate_side = ut_sig if ut_sig in {'long', 'short'} else ut_bias_side if ut_bias_side in {'long', 'short'} else None
         candidate_type = 'fresh_signal' if ut_sig in {'long', 'short'} else 'bias_state' if candidate_side else 'waiting'
 
-        ema_fast_len = int(cfg['ema_fast'])
-        ema_slow_len = int(cfg['ema_slow'])
-        htf_gap_pct = np.nan
-        htf_close = np.nan
-        htf_ema_fast = np.nan
-        htf_ema_slow = np.nan
+        metrics = self._calculate_utbreakout_timeframe_metrics(closed, cfg)
+        ema_fast_len = int(cfg.get('ema_fast', 50) or 50)
+        ema_slow_len = int(cfg.get('ema_slow', 200) or 200)
         htf_ready = False
         htf_error = None
+        htf_close = htf_ema_fast = htf_ema_slow = htf_gap_pct = np.nan
+        htf_supertrend_direction = None
+        htf_supertrend_reason = None
         try:
             htf_ohlcv = await asyncio.to_thread(
                 self.market_data_exchange.fetch_ohlcv,
@@ -4304,38 +4982,13 @@ class SignalEngine(BaseEngine):
                 htf_ready = True
             else:
                 htf_error = f"데이터 부족 {len(htf_closed)}/{ema_slow_len + 2}"
+            htf_supertrend_direction, _, htf_supertrend_reason = self._calculate_utbot_filter_pack_supertrend_direction(
+                htf_closed,
+                length=10,
+                multiplier=3.0
+            )
         except Exception as e:
             htf_error = str(e)
-
-        min_bars = max(
-            ema_slow_len + 5,
-            int(cfg['donchian_length']) + 2,
-            int(cfg['adx_length']) * 2 + 5,
-            int(cfg['atr_length']) + 5,
-            int(cfg['rsi_length']) + 5
-        )
-        data_ready = len(closed) >= min_bars
-        rsi_value = adx_value = atr_value = atr_pct = ema200 = ema_near_pct = np.nan
-        don_high_prev = don_low_prev = don_width_pct = np.nan
-        don_ready = False
-        adx_reason = None
-        if data_ready:
-            close_series = closed['close'].astype(float)
-            ema200 = float(close_series.ewm(span=ema_slow_len, adjust=False).mean().iloc[-1])
-            rsi_series = self._calculate_wilder_rsi_series(close_series, int(cfg['rsi_length']))
-            rsi_value = float(rsi_series.iloc[-1]) if self._is_valid_number(rsi_series.iloc[-1]) else np.nan
-            adx_value, _, _, adx_reason = self._calculate_utbot_filter_pack_adx_dmi(closed, int(cfg['adx_length']))
-            atr_series = self._calculate_wilder_atr_series(closed, int(cfg['atr_length']))
-            atr_value = float(atr_series.iloc[-1]) if self._is_valid_number(atr_series.iloc[-1]) else np.nan
-            atr_pct = atr_value / max(abs(entry_price), 1e-9) * 100.0 if self._is_valid_number(atr_value) else np.nan
-            ema_near_pct = abs(entry_price - ema200) / max(abs(entry_price), 1e-9) * 100.0
-            donchian_len = int(cfg['donchian_length'])
-            don_window = closed.iloc[-donchian_len - 1:-1]
-            if len(don_window) >= donchian_len:
-                don_high_prev = float(don_window['high'].astype(float).max())
-                don_low_prev = float(don_window['low'].astype(float).min())
-                don_width_pct = (don_high_prev - don_low_prev) / max(abs(entry_price), 1e-9) * 100.0
-                don_ready = True
 
         daily_count, daily_pnl = self.db.get_daily_stats()
         daily_entries = self.db.get_daily_entry_count()
@@ -4360,7 +5013,9 @@ class SignalEngine(BaseEngine):
         risk_ok = None
         risk_distance = np.nan
         risk_usdt = np.nan
-        if data_ready and self._is_valid_number(atr_value):
+        atr_value = metrics.get('atr')
+        atr_pct = metrics.get('atr_pct')
+        if self._is_valid_number(atr_value):
             ut_stop = ut_detail.get('curr_stop')
             stop_anchor_distance = abs(entry_price - float(ut_stop)) if self._is_valid_number(ut_stop) else 0.0
             risk_distance = max(float(cfg.get('stop_atr_multiplier', 1.5) or 1.5) * float(atr_value), stop_anchor_distance)
@@ -4377,8 +5032,8 @@ class SignalEngine(BaseEngine):
                 balance_detail = f"risk {_fmt(risk_usdt, 2)} USDT / RR {_fmt(rr_multiple, 1)} / qty {_fmt(planned_qty, 6)}"
             except Exception as e:
                 balance_detail = f"잔고 조회 실패 {e}"
-
-        rsi_threshold = float(cfg.get('rsi_threshold', 50.0) or 50.0)
+        else:
+            balance_detail = "ATR 기반 손절폭 계산 대기"
 
         def _side_conditions(side):
             side_upper = side.upper()
@@ -4389,123 +5044,46 @@ class SignalEngine(BaseEngine):
                 ut_state = False if candidate_side in {'long', 'short'} else None
                 ut_detail_text = f"현재 {str(candidate_side or 'none').upper()} / bias {str(ut_bias_side or 'none').upper()}"
 
-            if htf_ready:
-                if side == 'long':
-                    htf_trend = htf_close > htf_ema_slow and htf_ema_fast > htf_ema_slow
-                    htf_trend_detail = (
-                        f"조건 close > EMA200, EMA50 > EMA200 | "
-                        f"close {_fmt(htf_close, 4)}, EMA50 {_fmt(htf_ema_fast, 4)}, EMA200 {_fmt(htf_ema_slow, 4)}"
-                    )
-                else:
-                    htf_trend = htf_close < htf_ema_slow and htf_ema_fast < htf_ema_slow
-                    htf_trend_detail = (
-                        f"조건 close < EMA200, EMA50 < EMA200 | "
-                        f"close {_fmt(htf_close, 4)}, EMA50 {_fmt(htf_ema_fast, 4)}, EMA200 {_fmt(htf_ema_slow, 4)}"
-                    )
-                htf_gap_state = htf_gap_pct >= float(cfg.get('htf_ema_gap_min_percent', 0.15) or 0.15)
-                htf_gap_detail = _requirement_detail(
-                    "EMA gap",
-                    htf_gap_pct,
-                    ">=",
-                    float(cfg.get('htf_ema_gap_min_percent', 0.15) or 0.15),
-                    htf_gap_state,
-                    3,
-                    "%"
-                )
-            else:
-                htf_trend = None
-                htf_trend_detail = htf_error or "1H 계산 대기"
-                htf_gap_state = None
-                htf_gap_detail = htf_error or "1H 계산 대기"
-
-            if data_ready and self._is_valid_number(rsi_value):
-                if side == 'long':
-                    rsi_state = rsi_value > rsi_threshold
-                    if cfg.get('exclude_rsi_extreme', False):
-                        rsi_state = rsi_state and rsi_value <= float(cfg.get('rsi_long_extreme', 80.0) or 80.0)
-                    rsi_detail = _requirement_detail("RSI", rsi_value, ">", rsi_threshold, rsi_state, 2)
-                else:
-                    rsi_state = rsi_value < rsi_threshold
-                    if cfg.get('exclude_rsi_extreme', False):
-                        rsi_state = rsi_state and rsi_value >= float(cfg.get('rsi_short_extreme', 20.0) or 20.0)
-                    rsi_detail = _requirement_detail("RSI", rsi_value, "<", rsi_threshold, rsi_state, 2)
-            else:
-                rsi_state = None
-                rsi_detail = f"데이터 부족 {len(closed)}/{min_bars}"
-
-            adx_state = None
-            adx_detail = adx_reason or f"데이터 부족 {len(closed)}/{min_bars}"
-            if data_ready and self._is_valid_number(adx_value):
-                adx_state = float(adx_value) >= float(cfg.get('adx_threshold', 22.0) or 22.0)
-                adx_detail = _requirement_detail(
-                    "ADX",
-                    adx_value,
-                    ">=",
-                    float(cfg.get('adx_threshold', 22.0) or 22.0),
-                    adx_state,
-                    2
-                )
-
-            if don_ready:
-                if side == 'long':
-                    don_state = entry_price > don_high_prev
-                    don_detail = _requirement_detail("close", entry_price, "> prev high", don_high_prev, don_state, 4)
-                else:
-                    don_state = entry_price < don_low_prev
-                    don_detail = _requirement_detail("close", entry_price, "< prev low", don_low_prev, don_state, 4)
-                don_width_state = don_width_pct >= float(cfg.get('donchian_width_min_percent', 0.50) or 0.50)
-                don_width_detail = _requirement_detail(
-                    "width",
-                    don_width_pct,
-                    ">=",
-                    float(cfg.get('donchian_width_min_percent', 0.50) or 0.50),
-                    don_width_state,
-                    3,
-                    "%"
-                )
-            else:
-                don_state = None
-                don_detail = f"Donchian 데이터 부족 {len(closed)}/{int(cfg['donchian_length']) + 1}"
-                don_width_state = None
-                don_width_detail = "Donchian 계산 대기"
-
-            if data_ready and self._is_valid_number(atr_pct):
-                atr_min = float(cfg.get('atr_min_percent', 0.12) or 0.12)
-                atr_max = float(cfg.get('atr_max_percent', 1.20) or 1.20)
-                atr_state = atr_min <= atr_pct <= atr_max
-                atr_detail = f"ATR% {_fmt(atr_pct, 3)}% / 조건 {atr_min:.2f}%~{atr_max:.2f}%"
-            else:
-                atr_state = None
-                atr_detail = "ATR 계산 대기"
-
-            if data_ready and self._is_valid_number(ema_near_pct):
-                ema_state = ema_near_pct >= float(cfg.get('ema_near_percent', 0.20) or 0.20)
-                ema_detail = _requirement_detail(
-                    "EMA200 거리",
-                    ema_near_pct,
-                    ">=",
-                    float(cfg.get('ema_near_percent', 0.20) or 0.20),
-                    ema_state,
-                    3,
-                    "%"
-                )
-            else:
-                ema_state = None
-                ema_detail = "EMA200 거리 계산 대기"
-
+            filter_values = {
+                'entry_price': entry_price,
+                'rsi': metrics.get('rsi'),
+                'adx': metrics.get('adx'),
+                'plus_di': metrics.get('plus_di'),
+                'minus_di': metrics.get('minus_di'),
+                'adx_reason': metrics.get('adx_reason'),
+                'atr_pct': metrics.get('atr_pct'),
+                'ema50': metrics.get('ema_fast'),
+                'ema50_prev': metrics.get('ema_fast_prev'),
+                'ema200': metrics.get('ema_slow'),
+                'donchian_high_prev': metrics.get('donchian_high_prev'),
+                'donchian_low_prev': metrics.get('donchian_low_prev'),
+                'donchian_width_pct': metrics.get('donchian_width_pct'),
+                'chop': metrics.get('chop'),
+                'chop_reason': metrics.get('chop_reason'),
+                'vortex_plus': metrics.get('vortex_plus'),
+                'vortex_minus': metrics.get('vortex_minus'),
+                'vortex_reason': metrics.get('vortex_reason'),
+                'aroon_up': metrics.get('aroon_up'),
+                'aroon_down': metrics.get('aroon_down'),
+                'aroon_reason': metrics.get('aroon_reason'),
+                'htf_ready': htf_ready,
+                'htf_error': htf_error,
+                'htf_close': htf_close,
+                'htf_ema_fast': htf_ema_fast,
+                'htf_ema_slow': htf_ema_slow,
+                'htf_gap_pct': htf_gap_pct,
+                'htf_supertrend_direction': htf_supertrend_direction,
+                'htf_supertrend_reason': htf_supertrend_reason,
+            }
+            selected_items = self._evaluate_utbreakout_set_filter_items(side, selected_set, cfg, filter_values)
             items = [
                 ("UTBot 방향", ut_state, ut_detail_text),
-                ("1H EMA 추세", htf_trend, htf_trend_detail),
-                ("1H EMA Gap", htf_gap_state, htf_gap_detail),
-                ("RSI 모멘텀", rsi_state, rsi_detail),
-                ("ADX 추세강도", adx_state, adx_detail),
-                ("Donchian 돌파", don_state, don_detail),
-                ("ATR% 변동성", atr_state, atr_detail),
-                ("15M EMA200 거리", ema_state, ema_detail),
-                ("Donchian Width", don_width_state, don_width_detail),
-                ("일일 리스크", daily_ok, daily_detail),
-                ("RR/수량 계획", risk_ok, balance_detail)
             ]
+            items.extend((item.get('name'), item.get('state'), item.get('detail')) for item in selected_items)
+            items.extend([
+                ("일일 리스크", daily_ok, daily_detail),
+                ("ATR 손절/RR/수량", risk_ok, balance_detail),
+            ])
             ok = all(item[1] is True for item in items)
             lines = [f"{side_upper}: {'진입 가능' if ok else '대기'}"]
             lines.extend(_line(idx, label, state, detail) for idx, (label, state, detail) in enumerate(items, 1))
@@ -4514,12 +5092,28 @@ class SignalEngine(BaseEngine):
         long_ok, long_lines = _side_conditions('long')
         short_ok, short_lines = _side_conditions('short')
         ut_label = f"{str(candidate_side or 'none').upper()} ({candidate_type})"
+        scores = (auto_analysis or {}).get('scores') if isinstance(auto_analysis, dict) else {}
+        if scores:
+            score_line = (
+                f"trend {scores.get('trend_score', 0):.1f} / chop {scores.get('chop_score', 0):.1f} / "
+                f"vol {scores.get('volatility_score', 0):.1f} / breakout {scores.get('breakout_score', 0):.1f} / "
+                f"momentum {scores.get('momentum_score', 0):.1f} / flow {scores.get('flow_score', 0):.1f}"
+            )
+        else:
+            score_line = "AUTO OFF 또는 분석 대기"
+        mode_label = 'AUTO' if cfg.get('auto_select_enabled') else 'MANUAL'
+        set_status = '실거래 연결' if selected_set.get('status') == 'active' else 'planned only'
         text_lines = [
             "🚦 UT Breakout 조건 스테이터스",
             f"심볼: {symbol}",
             f"TF: 진입 {entry_tf} / HTF {htf_tf}",
             f"마지막 마감봉: {_fmt_ts(decision_ts)} / close {_fmt(entry_price, 4)}",
             f"현재 UTBot 방향: {ut_label}",
+            f"선택모드: {mode_label}",
+            f"선택 Set: Set{selected_set.get('id')} {selected_set.get('name')} ({set_status})",
+            f"선택 이유: {auto_reason or '수동 선택'}",
+            f"AUTO 점수: {score_line}",
+            "주의: AUTO/MTF 지표는 set 선택용이고, 실제 진입은 아래 선택 Set 조건만 봅니다.",
             f"최종: LONG {'가능' if long_ok else '대기'} / SHORT {'가능' if short_ok else '대기'}",
             "",
             *long_lines,
@@ -14405,21 +14999,33 @@ class MainController:
             active_label = "ON" if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY else f"OFF ({active_strategy.upper()})"
             last_reason = diag.get('reject_code') or diag.get('accepted_code') or diag.get('reason') or '대기'
             diag_summary = format_utbreakout_diagnostic_summary()
+            set_id = normalize_utbreakout_set_id(cfg.get('active_set_id') or cfg.get('profile'), UTBREAKOUT_DEFAULT_SET_ID)
+            set_info = get_utbreakout_set_definition(set_id)
+            mode_label = 'AUTO' if bool(cfg.get('auto_select_enabled', False)) or str(cfg.get('selection_mode', '')).lower() == 'auto' else 'MANUAL'
+            auto_set = diag.get('auto_selected_set_id')
+            auto_name = diag.get('auto_selected_set_name')
+            auto_reason = diag.get('auto_selection_reason') or '아직 AUTO 분석 기록 없음'
+            active_set_lines = "\n".join(format_utbreakout_set_brief(i) for i in range(1, UTBREAKOUT_ACTIVE_SET_MAX + 1))
             return f"""
 🧭 **UTBOT_FILTERED_BREAKOUT_V1**
 
 상태: `{active_label}`
+선택모드: `{mode_label}` | 수동 Set: `Set{set_id} {set_info.get('name')}` | AUTO 최근: `{('Set' + str(auto_set) + ' ' + str(auto_name)) if auto_set else '대기'}`
 프로필: `{cfg.get('profile', 'set2')}` | 진입 `{cfg.get('entry_timeframe', '15m')}` / 청산 `{cfg.get('exit_timeframe', cfg.get('entry_timeframe', '15m'))}` / HTF `{cfg.get('htf_timeframe', '1h')}`
 UT: `K={float(cfg.get('utbot_key_value', 2.5) or 2.5):.2f}` / `ATR={int(cfg.get('utbot_atr_period', 14) or 14)}`
-필터: `ADX>={float(cfg.get('adx_threshold', 22) or 22):.1f}` | `ATR% {float(cfg.get('atr_min_percent', 0.12) or 0.12):.2f}~{float(cfg.get('atr_max_percent', 1.20) or 1.20):.2f}` | `Donchian {int(cfg.get('donchian_length', 20) or 20)}`
+선택 Set 조건: `{', '.join(set_info.get('entry_filters') or ['UT only'])}`
 리스크: `SL {float(cfg.get('stop_atr_multiplier', 1.5) or 1.5):.1f}ATR` | `TP {float(cfg.get('take_profit_r_multiple', 2.0) or 2.0):.1f}R` | `max ${float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0):.2f}`
 손실한도: `1회 min(잔고 x {float(cfg.get('risk_per_trade_percent', 1.0) or 1.0):.2f}%, ${float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0):.2f})` | `일손실 ${float(cfg.get('daily_max_loss_usdt', 3.0) or 3.0):.2f}`
 옵션: 반대신호청산 `{'ON' if cfg.get('opposite_signal_exit_enabled') else 'OFF'}` | EMA/RSI청산 `{'ON' if cfg.get('ema_rsi_exit_enabled') else 'OFF'}` | RSI과열제외 `{'ON' if cfg.get('exclude_rsi_extreme') else 'OFF'}`
 
-세트 설명:
-Set1 공격형: `UT 2,10` / `ADX>=20` / `Donchian20` / `SL 1.5ATR` / `TP 2R`
-Set2 기본형: `UT 2.5,14` / `ADX>=22` / `Donchian20` / `SL 1.5ATR` / `TP 2R`
-Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
+AUTO 최근 선택 이유:
+`{auto_reason}`
+
+실거래 연결 Set 1~10:
+```
+{active_set_lines}
+```
+Set 11~50은 `/utbreakout sets`에서 설명만 확인 가능하며 아직 주문에는 연결하지 않습니다.
 
 최근 진단({first_symbol}): `{last_reason}`
 진단 요약:
@@ -14430,7 +15036,10 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
 명령:
 `/utbreakout on` - 전략 활성화
 `/utbreakout off` - UTBOT으로 복귀
-`/utbreakout set1` / `set2` / `set3` - 파라미터 세트 적용
+`/utbreakout auto on` / `auto off` - AUTO set 선택 ON/OFF
+`/utbreakout set 7` 또는 `set7` - Set 1~10 수동 적용
+`/utbreakout sets` - 50개 set 설명 보기
+`/utbreakout why` - 최근 AUTO 선택 이유 보기
 `/utbreakout risk 5` - 1회 최대 손실 5 USDT로 설정
 `/utbreakout riskpct 1` - 잔고 대비 손실 기준 1%로 설정
 `/utbreakout dailyloss 30` - 하루 최대 손실 30 USDT로 설정
@@ -14449,9 +15058,26 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
                     InlineKeyboardButton("UTBOT 복귀", callback_data="utb:off")
                 ],
                 [
-                    InlineKeyboardButton("Set1 공격", callback_data="utb:set1"),
-                    InlineKeyboardButton("Set2 기본", callback_data="utb:set2"),
-                    InlineKeyboardButton("Set3 보수", callback_data="utb:set3")
+                    InlineKeyboardButton("AUTO ON", callback_data="utb:auto:on"),
+                    InlineKeyboardButton("AUTO OFF", callback_data="utb:auto:off"),
+                    InlineKeyboardButton("AUTO 이유", callback_data="utb:why")
+                ],
+                [
+                    InlineKeyboardButton("Set1", callback_data="utb:set:1"),
+                    InlineKeyboardButton("Set2", callback_data="utb:set:2"),
+                    InlineKeyboardButton("Set3", callback_data="utb:set:3"),
+                    InlineKeyboardButton("Set4", callback_data="utb:set:4"),
+                    InlineKeyboardButton("Set5", callback_data="utb:set:5")
+                ],
+                [
+                    InlineKeyboardButton("Set6", callback_data="utb:set:6"),
+                    InlineKeyboardButton("Set7", callback_data="utb:set:7"),
+                    InlineKeyboardButton("Set8", callback_data="utb:set:8"),
+                    InlineKeyboardButton("Set9", callback_data="utb:set:9"),
+                    InlineKeyboardButton("Set10", callback_data="utb:set:10")
+                ],
+                [
+                    InlineKeyboardButton("50 Set 설명", callback_data="utb:sets")
                 ],
                 [
                     InlineKeyboardButton("1회손실 $1", callback_data="utb:risk:1"),
@@ -14551,6 +15177,67 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
                     return
                 raise
 
+        def _format_utbreakout_sets_text(page=1):
+            try:
+                page = int(page or 1)
+            except (TypeError, ValueError):
+                page = 1
+            page = min(5, max(1, page))
+            start_id = ((page - 1) * 10) + 1
+            end_id = min(50, start_id + 9)
+            lines = [
+                f"📚 UT Breakout 50-Set 카탈로그 ({page}/5)",
+                "Set 1~10만 현재 주문에 연결되어 있고, Set 11~50은 planned 설명 상태입니다.",
+                "",
+            ]
+            for set_id in range(start_id, end_id + 1):
+                info = get_utbreakout_set_definition(set_id)
+                status = "실거래" if info.get('status') == 'active' else "예정"
+                filters = ", ".join(info.get('entry_filters') or ['UT only'])
+                lines.extend([
+                    f"Set{set_id} {info.get('name')} [{status}]",
+                    f"장세: {info.get('regime')}",
+                    f"조건: {filters} | 빈도: {info.get('frequency_impact')}",
+                    f"설명: {info.get('description')}",
+                    "",
+                ])
+            lines.append("다른 페이지: /utbreakout sets 1~5")
+            return "\n".join(lines).strip()
+
+        def _format_utbreakout_why_text():
+            symbol = _get_utbreakout_status_symbol()
+            engine = self.engines.get('signal')
+            diag = {}
+            if engine:
+                diag = engine.last_utbot_filtered_breakout_status.get(symbol, {}) or {}
+            cfg = _current_utbreakout_cfg()
+            set_id = diag.get('auto_selected_set_id') or cfg.get('active_set_id') or cfg.get('profile') or UTBREAKOUT_DEFAULT_SET_ID
+            info = get_utbreakout_set_definition(set_id)
+            scores = diag.get('auto_scores') or {}
+            if scores:
+                score_lines = [
+                    f"trend: {scores.get('trend_score', 0)}",
+                    f"chop: {scores.get('chop_score', 0)}",
+                    f"volatility: {scores.get('volatility_score', 0)}",
+                    f"breakout: {scores.get('breakout_score', 0)}",
+                    f"momentum: {scores.get('momentum_score', 0)}",
+                    f"flow: {scores.get('flow_score', 0)}",
+                    f"alignment: {scores.get('alignment_score', 0)}",
+                    f"dominant_side: {scores.get('dominant_side', 'n/a')}",
+                ]
+            else:
+                score_lines = ["AUTO 점수 기록 없음. /utbreakout status 또는 다음 판단봉 이후 확인하세요."]
+            return "\n".join([
+                "🧠 UT Breakout AUTO 선택 이유",
+                f"심볼: {symbol}",
+                f"선택: Set{info.get('id')} {info.get('name')} ({'실거래' if info.get('status') == 'active' else 'planned'})",
+                f"이유: {diag.get('auto_selection_reason') or '수동 선택 또는 아직 분석 기록 없음'}",
+                f"실제 진입 조건: {', '.join(info.get('entry_filters') or ['UT only'])}",
+                "",
+                "점수:",
+                *score_lines,
+            ])
+
         def _current_utbreakout_cfg():
             raw = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
             return dict(raw) if isinstance(raw, dict) else {}
@@ -14559,6 +15246,10 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
             profile_cfg = build_utbot_filtered_breakout_profile(profile)
             current_cfg = _current_utbreakout_cfg()
             preserve_keys = {
+                'entry_timeframe',
+                'exit_timeframe',
+                'htf_timeframe',
+                'auto_timeframes',
                 'risk_per_trade_percent',
                 'max_risk_per_trade_usdt',
                 'daily_max_loss_usdt',
@@ -14611,14 +15302,37 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
                     reset_stateful_strategy=True
                 )
                 await u.message.reply_text("✅ 기본 UTBOT 전략으로 복귀")
-            elif action in {'set1', 'set2', 'set3', '1', '2', '3', 'aggressive', 'conservative'}:
-                profile_cfg = _merge_utbreakout_profile_with_preserved_settings(action)
+            elif action in {'auto', 'autoset', 'auto_select'}:
+                mode = str(args[1]).strip().lower() if len(args) > 1 else ''
+                if mode not in {'on', 'off', 'enable', 'disable'}:
+                    await u.message.reply_text("❌ 예: `/utbreakout auto on` 또는 `/utbreakout auto off`", parse_mode=ParseMode.MARKDOWN)
+                    return
+                enabled = mode in {'on', 'enable'}
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'auto_select_enabled'],
+                    enabled
+                )
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'],
+                    'auto' if enabled else 'manual'
+                )
+                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
+                await u.message.reply_text(f"✅ AUTO Set 선택: {'ON' if enabled else 'OFF'}")
+            elif action == 'set' or re.fullmatch(r'set\d+', action or '') or action in {'1', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'aggressive', 'conservative'}:
+                set_arg = args[1] if action == 'set' and len(args) > 1 else action
+                set_text = str(set_arg or '').strip().lower()
+                set_id = 1 if set_text == 'aggressive' else 7 if set_text == 'conservative' else normalize_utbreakout_set_id(set_arg, UTBREAKOUT_DEFAULT_SET_ID)
+                if set_id > UTBREAKOUT_ACTIVE_SET_MAX:
+                    await u.message.reply_text("❌ 현재 실거래 연결은 Set 1~10만 가능합니다. Set 11~50은 설명/계획 상태입니다.")
+                    return
+                profile_cfg = _merge_utbreakout_profile_with_preserved_settings(f"set{set_id}")
                 await self.cfg.update_value(
                     ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1'],
                     profile_cfg
                 )
                 self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
-                await u.message.reply_text(f"✅ UTBOT_FILTERED_BREAKOUT_V1 프로필 적용: {profile_cfg.get('profile')}")
+                info = get_utbreakout_set_definition(set_id)
+                await u.message.reply_text(f"✅ Set{set_id} 적용: {info.get('name')} (AUTO OFF, 수동 선택)")
             elif action in {'risk', 'maxrisk', 'loss', 'max_loss'}:
                 try:
                     value = _parse_positive_arg('1회 최대 손실 USDT', minimum=0.0, maximum=100000.0)
@@ -14682,6 +15396,13 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
             elif action in {'log', 'logs', 'download'}:
                 await _send_utbreakout_log_document(u.message)
                 return
+            elif action in {'sets', 'catalog', 'list'}:
+                page = args[1] if len(args) > 1 else 1
+                await u.message.reply_text(_format_utbreakout_sets_text(page), reply_markup=_build_utbreakout_keyboard())
+                return
+            elif action in {'why', 'reason', 'auto_reason'}:
+                await u.message.reply_text(_format_utbreakout_why_text(), reply_markup=_build_utbreakout_keyboard())
+                return
             elif action in {'status', 'conditions', 'condition_status'}:
                 await _send_utbreakout_condition_status(u.message)
                 return
@@ -14729,14 +15450,58 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
                 await _edit_utbreakout_menu(query, "✅ 기본 UTBOT 전략으로 복귀")
                 return
 
-            if action in {'set1', 'set2', 'set3'}:
-                profile_cfg = _merge_utbreakout_profile_with_preserved_settings(action)
+            if action == 'auto':
+                enabled = str(value or '').lower() in {'on', 'enable', '1', 'true'}
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'auto_select_enabled'],
+                    enabled
+                )
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'],
+                    'auto' if enabled else 'manual'
+                )
+                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
+                await _edit_utbreakout_menu(query, f"✅ AUTO Set 선택: {'ON' if enabled else 'OFF'}")
+                return
+
+            if action == 'set' or re.fullmatch(r'set\d+', action or ''):
+                set_arg = value if action == 'set' else action
+                set_id = normalize_utbreakout_set_id(set_arg, UTBREAKOUT_DEFAULT_SET_ID)
+                if set_id > UTBREAKOUT_ACTIVE_SET_MAX:
+                    await _edit_utbreakout_menu(query, "❌ 현재 실거래 연결은 Set 1~10만 가능합니다.")
+                    return
+                profile_cfg = _merge_utbreakout_profile_with_preserved_settings(f"set{set_id}")
                 await self.cfg.update_value(
                     ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1'],
                     profile_cfg
                 )
                 self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
-                await _edit_utbreakout_menu(query, f"✅ 프로필 적용: {profile_cfg.get('profile')}")
+                info = get_utbreakout_set_definition(set_id)
+                await _edit_utbreakout_menu(query, f"✅ Set{set_id} 적용: {info.get('name')} (AUTO OFF)")
+                return
+
+            if action == 'sets':
+                try:
+                    await query.edit_message_text(
+                        _format_utbreakout_sets_text(value or 1),
+                        reply_markup=_build_utbreakout_keyboard()
+                    )
+                except BadRequest as md_err:
+                    if "message is not modified" in str(md_err).lower():
+                        return
+                    raise
+                return
+
+            if action == 'why':
+                try:
+                    await query.edit_message_text(
+                        _format_utbreakout_why_text(),
+                        reply_markup=_build_utbreakout_keyboard()
+                    )
+                except BadRequest as md_err:
+                    if "message is not modified" in str(md_err).lower():
+                        return
+                    raise
                 return
 
             if action in {'risk', 'riskpct', 'dailyloss'}:
