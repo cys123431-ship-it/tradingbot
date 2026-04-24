@@ -5792,6 +5792,7 @@ class SignalEngine(BaseEngine):
 
         balance_detail = "잔고 조회 대기"
         entry_plan_detail = "진입 계획: ATR/잔고 계산 대기"
+        take_profit_detail = "익절 계획: ATR/잔고 계산 대기"
         risk_ok = None
         risk_distance = np.nan
         risk_distance_pct = np.nan
@@ -5799,6 +5800,9 @@ class SignalEngine(BaseEngine):
         planned_qty = np.nan
         planned_notional = np.nan
         planned_margin = np.nan
+        take_profit_distance = np.nan
+        take_profit_pct = np.nan
+        expected_profit_usdt = np.nan
         atr_value = metrics.get('atr')
         atr_pct = metrics.get('atr_pct')
         if self._is_valid_number(atr_value):
@@ -5807,6 +5811,8 @@ class SignalEngine(BaseEngine):
             risk_distance = max(float(cfg.get('stop_atr_multiplier', 1.5) or 1.5) * float(atr_value), stop_anchor_distance)
             risk_distance_pct = risk_distance / max(abs(entry_price), 1e-9) * 100.0
             rr_multiple = float(cfg.get('take_profit_r_multiple', 2.0) or 2.0)
+            take_profit_distance = rr_multiple * risk_distance
+            take_profit_pct = take_profit_distance / max(abs(entry_price), 1e-9) * 100.0
             try:
                 total_balance, free_balance, _ = await self.get_balance_info()
                 balance_for_risk = total_balance if total_balance > 0 else free_balance
@@ -5817,6 +5823,7 @@ class SignalEngine(BaseEngine):
                 planned_qty = risk_usdt / max(risk_distance, 1e-9)
                 planned_notional = planned_qty * entry_price
                 planned_margin = planned_notional / max(float(lev), 1e-9)
+                expected_profit_usdt = risk_usdt * rr_multiple
                 risk_ok = risk_distance > 0 and rr_multiple >= float(cfg.get('min_risk_reward', 2.0) or 2.0) and risk_usdt > 0 and planned_qty > 0
                 balance_detail = (
                     f"손실한도 {_fmt(risk_usdt, 2)} USDT / 손절거리 {_fmt(risk_distance, 4)} "
@@ -5827,12 +5834,18 @@ class SignalEngine(BaseEngine):
                     f"포지션 {_fmt(planned_notional, 2)} USDT / 레버리지 {lev}x / "
                     f"손절시 손실 {_fmt(risk_usdt, 2)} USDT"
                 )
+                take_profit_detail = (
+                    f"익절 계획: {_fmt(rr_multiple, 1)}R / 익절거리 {_fmt(take_profit_distance, 4)} "
+                    f"({_fmt(take_profit_pct, 3)}%) / 예상수익 {_fmt(expected_profit_usdt, 2)} USDT"
+                )
             except Exception as e:
                 balance_detail = f"잔고 조회 실패 {e}"
                 entry_plan_detail = f"진입 계획: 잔고 조회 실패 {e}"
+                take_profit_detail = f"익절 계획: 잔고 조회 실패 {e}"
         else:
             balance_detail = "ATR 기반 손절폭 계산 대기"
             entry_plan_detail = "진입 계획: ATR 기반 손절폭 계산 대기"
+            take_profit_detail = "익절 계획: ATR 기반 손절폭 계산 대기"
 
         def _side_conditions(side):
             side_upper = side.upper()
@@ -5947,6 +5960,7 @@ class SignalEngine(BaseEngine):
             f"선택 Set: Set{selected_set.get('id')} {selected_set.get('name')} ({set_status})",
             f"선택 이유: {auto_reason or '수동 선택'}",
             entry_plan_detail,
+            take_profit_detail,
             f"AUTO 점수: {score_line}",
             "주의: AUTO/MTF 지표는 set 선택용이고, 실제 진입은 아래 선택 Set 조건만 봅니다.",
             f"최종: LONG {'가능' if long_ok else '대기'} / SHORT {'가능' if short_ok else '대기'}",
@@ -8985,12 +8999,20 @@ class SignalEngine(BaseEngine):
                 margin = float(margin_to_use) if margin_to_use is not None else notional / max(lev, 1e-9)
                 risk_usdt = float(entry_plan.get('risk_usdt', 0.0) or 0.0)
                 risk_distance = float(entry_plan.get('risk_distance', 0.0) or 0.0)
+                rr_multiple = float(entry_plan.get('rr_multiple', 2.0) or 2.0)
+                take_profit_distance = risk_distance * rr_multiple
+                expected_profit = risk_usdt * rr_multiple
                 risk_pct = risk_distance / max(abs(float(actual_entry_price)), 1e-9) * 100.0
+                take_profit_pct = take_profit_distance / max(abs(float(actual_entry_price)), 1e-9) * 100.0
                 lines.append(
                     f"진입금액: `증거금 {margin:.2f} USDT / 포지션 {notional:.2f} USDT / {lev:.0f}x`"
                 )
                 lines.append(
                     f"손절계획: `거리 {risk_distance:.4f} ({risk_pct:.3f}%) / 손실 {risk_usdt:.2f} USDT`"
+                )
+                lines.append(
+                    f"익절계획: `{rr_multiple:.1f}R / 거리 {take_profit_distance:.4f} "
+                    f"({take_profit_pct:.3f}%) / 예상수익 {expected_profit:.2f} USDT`"
                 )
             except Exception as e:
                 logger.debug(f"UT breakout entry notice sizing detail failed: {e}")
