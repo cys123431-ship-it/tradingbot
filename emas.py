@@ -67,10 +67,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 faulthandler.enable()
 CORE_ENGINE = 'signal'
+UTBOT_FILTERED_BREAKOUT_STRATEGY = 'utbot_filtered_breakout_v1'
 UT_ONLY_STRATEGIES = {'utbot', 'utrsibb', 'utrsi', 'utbb', 'utsmc'}
 MA_STRATEGIES = set()
 PATTERN_STRATEGIES = set(UT_ONLY_STRATEGIES)
-CORE_STRATEGIES = set(UT_ONLY_STRATEGIES)
+CORE_STRATEGIES = set(UT_ONLY_STRATEGIES) | {UTBOT_FILTERED_BREAKOUT_STRATEGY}
 UT_HYBRID_STRATEGIES = {'utrsibb', 'utrsi', 'utbb'}
 STATEFUL_UT_STRATEGIES = {'utbot', 'utsmc'} | UT_HYBRID_STRATEGIES
 STRATEGY_DISPLAY_NAMES = {
@@ -82,7 +83,8 @@ STRATEGY_DISPLAY_NAMES = {
     'rsibb': 'RSIBB',
     'utrsibb': 'UTRSIBB',
     'utrsi': 'UTRSI',
-    'utbb': 'UTBB'
+    'utbb': 'UTBB',
+    UTBOT_FILTERED_BREAKOUT_STRATEGY: 'UTBOT_FILTERED_BREAKOUT_V1'
 }
 UT_HYBRID_TIMING_LABELS = {
     'utrsibb': 'RSI+BB',
@@ -120,6 +122,79 @@ def build_default_utbot_filter_pack():
             'mode_by_filter': {}
         }
     }
+
+
+def build_default_utbot_filtered_breakout_config():
+    return {
+        'profile': 'set2',
+        'entry_timeframe': '15m',
+        'htf_timeframe': '1h',
+        'utbot_key_value': 2.5,
+        'utbot_atr_period': 14,
+        'legacy_utbot_key_value': 2.0,
+        'legacy_utbot_atr_period': 10,
+        'use_heikin_ashi': False,
+        'ema_fast': 50,
+        'ema_slow': 200,
+        'rsi_length': 14,
+        'rsi_threshold': 50.0,
+        'rsi_long_extreme': 80.0,
+        'rsi_short_extreme': 20.0,
+        'exclude_rsi_extreme': False,
+        'adx_length': 14,
+        'adx_threshold': 22.0,
+        'atr_length': 14,
+        'atr_min_percent': 0.12,
+        'atr_max_percent': 1.20,
+        'donchian_length': 20,
+        'ema_near_percent': 0.20,
+        'htf_ema_gap_min_percent': 0.15,
+        'donchian_width_min_percent': 0.50,
+        'stop_atr_multiplier': 1.5,
+        'take_profit_r_multiple': 2.0,
+        'min_risk_reward': 2.0,
+        'risk_per_trade_percent': 1.0,
+        'max_risk_per_trade_usdt': 1.0,
+        'daily_max_loss_usdt': 3.0,
+        'max_daily_trades': 5,
+        'max_consecutive_losses': 3,
+        'reentry_cooldown_candles': 3,
+        'daily_profit_target_enabled': False,
+        'daily_profit_target_usdt': 5.0,
+        'opposite_signal_exit_enabled': False,
+        'ema_rsi_exit_enabled': False,
+        'adx_donchian_exit_enabled': False
+    }
+
+
+def build_utbot_filtered_breakout_profile(profile):
+    profile_key = str(profile or 'set2').strip().lower()
+    cfg = build_default_utbot_filtered_breakout_config()
+    if profile_key in {'1', 'set1', 'aggressive'}:
+        cfg.update({
+            'profile': 'set1',
+            'utbot_key_value': 2.0,
+            'utbot_atr_period': 10,
+            'adx_threshold': 20.0,
+            'donchian_length': 20,
+            'stop_atr_multiplier': 1.5,
+            'take_profit_r_multiple': 2.0,
+            'min_risk_reward': 2.0
+        })
+    elif profile_key in {'3', 'set3', 'conservative'}:
+        cfg.update({
+            'profile': 'set3',
+            'utbot_key_value': 3.0,
+            'utbot_atr_period': 21,
+            'adx_threshold': 25.0,
+            'donchian_length': 30,
+            'stop_atr_multiplier': 1.8,
+            'take_profit_r_multiple': 2.0,
+            'min_risk_reward': 2.0
+        })
+    else:
+        cfg['profile'] = 'set2'
+    return cfg
 
 
 def get_utbot_filter_pack_label(filter_id):
@@ -365,6 +440,7 @@ class TradingConfig:
                         'rsi_momentum_filter_enabled': False,
                         'filter_pack': build_default_utbot_filter_pack()
                     },
+                    'UTBotFilteredBreakoutV1': build_default_utbot_filtered_breakout_config(),
                     'UTSMC': {
                         'internal_length': 5,
                         'swing_length': 50,
@@ -523,6 +599,7 @@ class TradingConfig:
                 'rsi_momentum_filter_enabled': False,
                 'filter_pack': build_default_utbot_filter_pack()
             },
+            'UTBotFilteredBreakoutV1': build_default_utbot_filtered_breakout_config(),
             'UTSMC': {
                 'internal_length': 5,
                 'swing_length': 50,
@@ -851,6 +928,7 @@ class TradingConfig:
                         "rsi_momentum_filter_enabled": False,
                         "filter_pack": build_default_utbot_filter_pack()
                     },
+                    "UTBotFilteredBreakoutV1": build_default_utbot_filtered_breakout_config(),
                     "UTSMC": {
                         "internal_length": 5,
                         "swing_length": 50,
@@ -1049,6 +1127,31 @@ class DBManager:
             cur.execute("SELECT COUNT(*), SUM(pnl_usdt) FROM trades WHERE exit_time >= ?", (week_ago,))
             res = cur.fetchone()
             return (res[0] if res and res[0] else 0), (res[1] if res and res[1] else 0.0)
+
+    def get_daily_entry_count(self):
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM trades WHERE entry_time LIKE ?", (f"{today}%",))
+            res = cur.fetchone()
+            return res[0] if res and res[0] else 0
+
+    def get_recent_closed_trade_pnls(self, limit=10, today_only=False):
+        limit = max(1, int(limit or 1))
+        with self.lock:
+            cur = self.conn.cursor()
+            if today_only:
+                today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+                cur.execute(
+                    "SELECT pnl_usdt FROM trades WHERE exit_time LIKE ? ORDER BY exit_time DESC, id DESC LIMIT ?",
+                    (f"{today}%", limit)
+                )
+            else:
+                cur.execute(
+                    "SELECT pnl_usdt FROM trades WHERE exit_time IS NOT NULL ORDER BY exit_time DESC, id DESC LIMIT ?",
+                    (limit,)
+                )
+            return [float(row[0] or 0.0) for row in cur.fetchall()]
 
     def log_status_snapshot(self, snapshot_key, snapshot_text, keep_rows=200):
         with self.lock:
@@ -1930,6 +2033,9 @@ class SignalEngine(BaseEngine):
         self.last_utbot_filter_pack_status = {}  # symbol -> UTBot filter pack diagnostics
         self.last_utbot_rsi_momentum_filter_status = {}  # symbol -> UTBot RSI Momentum filter diagnostics
         self.last_utsmc_candidate_filter_status = {}  # symbol -> candidate filter diagnostics
+        self.last_utbot_filtered_breakout_status = {}  # symbol -> filtered breakout diagnostics
+        self.utbot_filtered_breakout_entry_plans = {}  # symbol -> accepted risk plan
+        self.utbot_filtered_breakout_failures = {}  # symbol -> side -> recent failed candidate timestamps
         self.last_entry_reason = {}        # symbol -> latest entry decision reason
 
     def start(self):
@@ -1968,6 +2074,9 @@ class SignalEngine(BaseEngine):
         self.last_utbot_filter_pack_status = {}
         self.last_utbot_rsi_momentum_filter_status = {}
         self.last_utsmc_candidate_filter_status = {}
+        self.last_utbot_filtered_breakout_status = {}
+        self.utbot_filtered_breakout_entry_plans = {}
+        self.utbot_filtered_breakout_failures = {}
         self.last_entry_reason = {}
         self.pending_reentry = {}
         self.ut_hybrid_timing_latches = {}
@@ -3429,6 +3538,502 @@ class SignalEngine(BaseEngine):
             f"(key={key_value:.2f}, ATR={atr_period}, HA={'ON' if use_heikin_ashi else 'OFF'})"
         )
         return None, reason, detail
+
+    def _get_utbot_filtered_breakout_config(self, strategy_params=None):
+        params = strategy_params if isinstance(strategy_params, dict) else self.get_runtime_strategy_params()
+        raw = params.get('UTBotFilteredBreakoutV1', {}) if isinstance(params, dict) else {}
+        cfg = build_default_utbot_filtered_breakout_config()
+        if isinstance(raw, dict):
+            for key in list(cfg.keys()):
+                if key in raw:
+                    cfg[key] = raw[key]
+
+        def _float(key, default, min_value=None):
+            try:
+                value = float(cfg.get(key, default))
+            except (TypeError, ValueError):
+                value = float(default)
+            if min_value is not None:
+                value = max(float(min_value), value)
+            cfg[key] = value
+
+        def _int(key, default, min_value=1):
+            try:
+                value = int(cfg.get(key, default))
+            except (TypeError, ValueError):
+                value = int(default)
+            cfg[key] = max(int(min_value), value)
+
+        for key, default in {
+            'utbot_key_value': 2.5,
+            'legacy_utbot_key_value': 2.0,
+            'rsi_threshold': 50.0,
+            'rsi_long_extreme': 80.0,
+            'rsi_short_extreme': 20.0,
+            'adx_threshold': 22.0,
+            'atr_min_percent': 0.12,
+            'atr_max_percent': 1.20,
+            'ema_near_percent': 0.20,
+            'htf_ema_gap_min_percent': 0.15,
+            'donchian_width_min_percent': 0.50,
+            'stop_atr_multiplier': 1.5,
+            'take_profit_r_multiple': 2.0,
+            'min_risk_reward': 2.0,
+            'risk_per_trade_percent': 1.0,
+            'max_risk_per_trade_usdt': 1.0,
+            'daily_max_loss_usdt': 3.0,
+            'daily_profit_target_usdt': 5.0
+        }.items():
+            _float(key, default, 0.0)
+
+        for key, default in {
+            'utbot_atr_period': 14,
+            'legacy_utbot_atr_period': 10,
+            'ema_fast': 50,
+            'ema_slow': 200,
+            'rsi_length': 14,
+            'adx_length': 14,
+            'atr_length': 14,
+            'donchian_length': 20,
+            'max_daily_trades': 5,
+            'max_consecutive_losses': 3,
+            'reentry_cooldown_candles': 3
+        }.items():
+            _int(key, default, 1)
+
+        cfg['entry_timeframe'] = str(cfg.get('entry_timeframe') or '15m').strip().lower() or '15m'
+        cfg['htf_timeframe'] = str(cfg.get('htf_timeframe') or '1h').strip().lower() or '1h'
+        for key in (
+            'use_heikin_ashi',
+            'exclude_rsi_extreme',
+            'daily_profit_target_enabled',
+            'opposite_signal_exit_enabled',
+            'ema_rsi_exit_enabled',
+            'adx_donchian_exit_enabled'
+        ):
+            cfg[key] = bool(cfg.get(key, False))
+        if cfg['atr_max_percent'] < cfg['atr_min_percent']:
+            cfg['atr_max_percent'] = cfg['atr_min_percent']
+        return cfg
+
+    def _get_utbot_filtered_breakout_ut_params(self, cfg):
+        return {
+            'UTBot': {
+                'key_value': float(cfg.get('utbot_key_value', 2.5) or 2.5),
+                'atr_period': int(cfg.get('utbot_atr_period', 14) or 14),
+                'use_heikin_ashi': bool(cfg.get('use_heikin_ashi', False))
+            }
+        }
+
+    def _calculate_wilder_atr_series(self, closed, length):
+        if closed is None or len(closed) < length:
+            return pd.Series(np.nan, index=range(0 if closed is None else len(closed)), dtype=float)
+        high = closed['high'].astype(float).reset_index(drop=True)
+        low = closed['low'].astype(float).reset_index(drop=True)
+        close = closed['close'].astype(float).reset_index(drop=True)
+        prev_close = close.shift(1)
+        true_range = pd.concat([
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1).fillna(0.0)
+        return self._calculate_rma_series(true_range, int(length or 14))
+
+    def _calculate_wilder_rsi_series(self, close, length):
+        close = pd.Series(close, dtype=float).reset_index(drop=True)
+        if len(close) < length + 1:
+            return pd.Series(np.nan, index=close.index, dtype=float)
+        delta = close.diff().fillna(0.0)
+        gain = delta.clip(lower=0.0)
+        loss = (-delta).clip(lower=0.0)
+        avg_gain = self._calculate_rma_series(gain, int(length or 14))
+        avg_loss = self._calculate_rma_series(loss, int(length or 14))
+        rs = avg_gain / avg_loss.replace(0.0, np.nan)
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        rsi = rsi.where(avg_loss != 0.0, 100.0)
+        rsi = rsi.where(~((avg_gain == 0.0) & (avg_loss == 0.0)), 50.0)
+        return rsi
+
+    def _is_valid_number(self, value):
+        try:
+            return np.isfinite(float(value))
+        except (TypeError, ValueError):
+            return False
+
+    def _clear_utbot_filtered_breakout_entry_plan(self, symbol):
+        self.utbot_filtered_breakout_entry_plans.pop(symbol, None)
+
+    def _get_utbot_filtered_breakout_entry_plan(self, symbol, side=None):
+        plan = self.utbot_filtered_breakout_entry_plans.get(symbol)
+        if not isinstance(plan, dict):
+            return None
+        if side and str(plan.get('side', '')).lower() != str(side).lower():
+            return None
+        return plan
+
+    def _record_utbot_filtered_breakout_failure(self, symbol, side, candle_ts, reason):
+        side = str(side or '').lower()
+        if side not in {'long', 'short'}:
+            return
+        symbol_failures = self.utbot_filtered_breakout_failures.setdefault(symbol, {})
+        failures = list(symbol_failures.get(side, []))
+        failures.append({'ts': int(candle_ts or 0), 'reason': str(reason or '')})
+        symbol_failures[side] = failures[-10:]
+
+    def _utbot_filtered_breakout_recent_failure(self, symbol, side, candle_ts, candle_ms, cooldown_candles):
+        side = str(side or '').lower()
+        failures = self.utbot_filtered_breakout_failures.get(symbol, {}).get(side, [])
+        if not failures:
+            return None
+        window_ms = max(1, int(candle_ms or 0)) * max(1, int(cooldown_candles or 3))
+        current_ts = int(candle_ts or 0)
+        recent = []
+        for item in failures:
+            ts = int((item or {}).get('ts') or 0)
+            if current_ts <= 0 or ts <= 0:
+                continue
+            if 0 < current_ts - ts <= window_ms:
+                recent.append(item)
+        if recent:
+            return recent[-1]
+        return None
+
+    def _store_utbot_filtered_breakout_status(self, symbol, status):
+        status = dict(status or {})
+        self.last_utbot_filtered_breakout_status[symbol] = status
+        signal_ts = int(status.get('ut_signal_ts') or 0)
+        feed_ts = int(status.get('feed_last_ts') or 0)
+        self._update_stateful_diag(
+            symbol,
+            stage=status.get('stage', 'evaluate'),
+            strategy='UTBOT_FILTERED_BREAKOUT_V1',
+            raw_state=(status.get('candidate_side') or 'none'),
+            raw_signal=(status.get('candidate_signal') or 'none'),
+            entry_sig=(status.get('accepted_side') or 'none'),
+            pos_side=status.get('pos_side', 'UNKNOWN'),
+            ut_key=status.get('utbot_key_value'),
+            ut_atr=status.get('utbot_atr_period'),
+            ut_ha='ON' if status.get('use_heikin_ashi') else 'OFF',
+            src=status.get('ut_curr_src'),
+            stop=status.get('ut_curr_stop'),
+            tf_used=status.get('entry_timeframe', '15m'),
+            signal_ts=signal_ts or None,
+            signal_ts_human=datetime.fromtimestamp(signal_ts / 1000).strftime('%m-%d %H:%M') if signal_ts else None,
+            feed_last_ts=feed_ts or None,
+            feed_last_ts_human=datetime.fromtimestamp(feed_ts / 1000).strftime('%m-%d %H:%M') if feed_ts else None,
+            utbreakout_reject_code=status.get('reject_code'),
+            utbreakout_reason=status.get('reason'),
+            utbreakout_htf=status.get('htf_summary'),
+            utbreakout_metrics=status.get('metric_summary'),
+            utbreakout_risk=status.get('risk_summary'),
+            note=status.get('reject_code') or status.get('accepted_code') or status.get('reason')
+        )
+
+    async def _calculate_utbot_filtered_breakout_signal(self, symbol, df, strategy_params):
+        cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+        self._clear_utbot_filtered_breakout_entry_plan(symbol)
+        status = {
+            'strategy': 'UTBOT_FILTERED_BREAKOUT_V1',
+            'stage': 'evaluate',
+            'entry_timeframe': cfg.get('entry_timeframe', '15m'),
+            'htf_timeframe': cfg.get('htf_timeframe', '1h'),
+            'utbot_key_value': cfg.get('utbot_key_value'),
+            'utbot_atr_period': cfg.get('utbot_atr_period'),
+            'use_heikin_ashi': cfg.get('use_heikin_ashi', False)
+        }
+
+        def _finish(sig, reason, code=None, *, record_failure=False, side=None):
+            status['reason'] = reason
+            if code:
+                status['reject_code'] = code
+                status['stage'] = 'entry_rejected'
+            else:
+                status['stage'] = 'entry_ready' if sig else 'waiting'
+            if sig:
+                status['accepted_code'] = 'ACCEPTED_ENTRY'
+                status['accepted_side'] = sig
+            self._store_utbot_filtered_breakout_status(symbol, status)
+            self.last_entry_reason[symbol] = reason
+            if record_failure and side:
+                self._record_utbot_filtered_breakout_failure(
+                    symbol,
+                    side,
+                    status.get('decision_candle_ts'),
+                    code or reason
+                )
+            return sig, reason, status
+
+        if self.is_upbit_mode():
+            return _finish(None, "REJECTED_HTF_TREND: Upbit spot mode is not supported", 'REJECTED_HTF_TREND')
+
+        if df is None or len(df) < 5:
+            return _finish(None, "UTBOT_FILTERED_BREAKOUT_V1 데이터 부족", None)
+
+        closed = df.iloc[:-1].copy().reset_index(drop=True)
+        min_bars = max(
+            int(cfg['ema_slow']) + 5,
+            int(cfg['donchian_length']) + 2,
+            int(cfg['adx_length']) * 2 + 5,
+            int(cfg['atr_length']) + 5,
+            int(cfg['rsi_length']) + 5
+        )
+        if len(closed) < min_bars:
+            return _finish(None, f"UTBOT_FILTERED_BREAKOUT_V1 데이터 부족 ({len(closed)}/{min_bars})", None)
+
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            closed[col] = pd.to_numeric(closed[col], errors='coerce')
+        closed = closed.dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+        if len(closed) < min_bars:
+            return _finish(None, f"UTBOT_FILTERED_BREAKOUT_V1 유효 데이터 부족 ({len(closed)}/{min_bars})", None)
+
+        decision_row = closed.iloc[-1]
+        decision_ts = int(decision_row.get('timestamp') or 0)
+        entry_price = float(decision_row['close'])
+        status['decision_candle_ts'] = decision_ts
+        status['feed_last_ts'] = int(df.iloc[-1]['timestamp']) if len(df) else decision_ts
+        status['entry_price'] = entry_price
+
+        ut_sig, ut_reason, ut_detail = self._calculate_utbot_signal(
+            df,
+            self._get_utbot_filtered_breakout_ut_params(cfg)
+        )
+        ut_detail = ut_detail or {}
+        status.update({
+            'candidate_signal': ut_sig,
+            'candidate_side': ut_sig,
+            'ut_reason': ut_reason,
+            'ut_curr_src': ut_detail.get('curr_src'),
+            'ut_curr_stop': ut_detail.get('curr_stop'),
+            'ut_curr_atr': ut_detail.get('curr_atr'),
+            'ut_signal_ts': ut_detail.get('signal_ts')
+        })
+
+        if ut_sig not in {'long', 'short'}:
+            return _finish(None, "UTBOT_FILTERED_BREAKOUT_V1 후보 신호 대기", None)
+
+        side = ut_sig
+        daily_count, daily_pnl = self.db.get_daily_stats()
+        daily_entries = self.db.get_daily_entry_count()
+        status['daily_pnl'] = daily_pnl
+        status['daily_entries'] = daily_entries
+        if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
+            return _finish(
+                None,
+                f"REJECTED_DAILY_LOSS_LIMIT: daily pnl {daily_pnl:.2f} <= -{float(cfg['daily_max_loss_usdt']):.2f}",
+                'REJECTED_DAILY_LOSS_LIMIT',
+                record_failure=False,
+                side=side
+            )
+        if int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
+            return _finish(
+                None,
+                f"REJECTED_DAILY_LOSS_LIMIT: daily trade count {daily_entries} >= {int(cfg['max_daily_trades'])}",
+                'REJECTED_DAILY_LOSS_LIMIT',
+                record_failure=False,
+                side=side
+            )
+        if bool(cfg.get('daily_profit_target_enabled', False)) and float(daily_pnl or 0) >= float(cfg.get('daily_profit_target_usdt', 0) or 0):
+            return _finish(
+                None,
+                f"REJECTED_DAILY_LOSS_LIMIT: daily target reached {daily_pnl:.2f}",
+                'REJECTED_DAILY_LOSS_LIMIT',
+                record_failure=False,
+                side=side
+            )
+
+        max_losses = int(cfg.get('max_consecutive_losses', 3) or 3)
+        recent_pnls = self.db.get_recent_closed_trade_pnls(max_losses, today_only=True)
+        status['recent_closed_pnls'] = recent_pnls
+        if len(recent_pnls) >= max_losses and all(float(pnl) < 0 for pnl in recent_pnls[:max_losses]):
+            return _finish(
+                None,
+                f"REJECTED_CONSECUTIVE_LOSSES: last {max_losses} closed trades are losses",
+                'REJECTED_CONSECUTIVE_LOSSES',
+                record_failure=False,
+                side=side
+            )
+
+        candle_ms = self._timeframe_to_ms(cfg.get('entry_timeframe', '15m')) or self._timeframe_to_ms('15m')
+        recent_failure = self._utbot_filtered_breakout_recent_failure(
+            symbol,
+            side,
+            decision_ts,
+            candle_ms,
+            int(cfg.get('reentry_cooldown_candles', 3) or 3)
+        )
+        if recent_failure:
+            return _finish(
+                None,
+                f"REJECTED_CONSECUTIVE_LOSSES: recent {side.upper()} candidate failed ({recent_failure.get('reason')})",
+                'REJECTED_CONSECUTIVE_LOSSES',
+                record_failure=False,
+                side=side
+            )
+
+        try:
+            htf_ohlcv = await asyncio.to_thread(
+                self.market_data_exchange.fetch_ohlcv,
+                symbol,
+                cfg.get('htf_timeframe', '1h'),
+                limit=300
+            )
+            htf_df = pd.DataFrame(htf_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                htf_df[col] = pd.to_numeric(htf_df[col], errors='coerce')
+            htf_closed = htf_df.iloc[:-1].dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+        except Exception as e:
+            return _finish(None, f"REJECTED_HTF_TREND: htf fetch failed ({e})", 'REJECTED_HTF_TREND', record_failure=True, side=side)
+
+        ema_fast_len = int(cfg['ema_fast'])
+        ema_slow_len = int(cfg['ema_slow'])
+        if len(htf_closed) < ema_slow_len + 2:
+            return _finish(
+                None,
+                f"REJECTED_HTF_TREND: htf data shortage ({len(htf_closed)}/{ema_slow_len + 2})",
+                'REJECTED_HTF_TREND',
+                record_failure=True,
+                side=side
+            )
+
+        htf_close = htf_closed['close'].astype(float)
+        htf_ema_fast = htf_close.ewm(span=ema_fast_len, adjust=False).mean().iloc[-1]
+        htf_ema_slow = htf_close.ewm(span=ema_slow_len, adjust=False).mean().iloc[-1]
+        htf_curr_close = float(htf_close.iloc[-1])
+        htf_gap_pct = abs(float(htf_ema_fast) - float(htf_ema_slow)) / max(abs(htf_curr_close), 1e-9) * 100.0
+        status['htf_summary'] = (
+            f"{cfg.get('htf_timeframe')} close={htf_curr_close:.4f}, "
+            f"EMA{ema_fast_len}={float(htf_ema_fast):.4f}, EMA{ema_slow_len}={float(htf_ema_slow):.4f}, "
+            f"gap={htf_gap_pct:.3f}%"
+        )
+        if htf_gap_pct < float(cfg.get('htf_ema_gap_min_percent', 0.15) or 0.15):
+            return _finish(None, f"REJECTED_HTF_TREND: htf EMA gap {htf_gap_pct:.3f}% too narrow", 'REJECTED_HTF_TREND', record_failure=True, side=side)
+        if side == 'long':
+            htf_ok = htf_curr_close > float(htf_ema_slow) and float(htf_ema_fast) > float(htf_ema_slow)
+        else:
+            htf_ok = htf_curr_close < float(htf_ema_slow) and float(htf_ema_fast) < float(htf_ema_slow)
+        if not htf_ok:
+            return _finish(None, f"REJECTED_HTF_TREND: {side.upper()} htf direction mismatch", 'REJECTED_HTF_TREND', record_failure=True, side=side)
+
+        close_series = closed['close'].astype(float)
+        ema200 = close_series.ewm(span=ema_slow_len, adjust=False).mean().iloc[-1]
+        ema50 = close_series.ewm(span=ema_fast_len, adjust=False).mean().iloc[-1]
+        rsi_series = self._calculate_wilder_rsi_series(close_series, int(cfg['rsi_length']))
+        rsi_value = float(rsi_series.iloc[-1]) if self._is_valid_number(rsi_series.iloc[-1]) else np.nan
+        adx_value, plus_di, minus_di, adx_reason = self._calculate_utbot_filter_pack_adx_dmi(closed, int(cfg['adx_length']))
+        atr_series = self._calculate_wilder_atr_series(closed, int(cfg['atr_length']))
+        atr_value = float(atr_series.iloc[-1]) if self._is_valid_number(atr_series.iloc[-1]) else np.nan
+        atr_pct = atr_value / max(abs(entry_price), 1e-9) * 100.0 if self._is_valid_number(atr_value) else np.nan
+        donchian_len = int(cfg['donchian_length'])
+        don_window = closed.iloc[-donchian_len - 1:-1]
+        if len(don_window) < donchian_len:
+            return _finish(None, "REJECTED_DONCHIAN_NO_BREAKOUT: Donchian data shortage", 'REJECTED_DONCHIAN_NO_BREAKOUT', record_failure=True, side=side)
+        don_high_prev = float(don_window['high'].astype(float).max())
+        don_low_prev = float(don_window['low'].astype(float).min())
+        don_width_pct = (don_high_prev - don_low_prev) / max(abs(entry_price), 1e-9) * 100.0
+        ema_near_pct = abs(entry_price - float(ema200)) / max(abs(entry_price), 1e-9) * 100.0
+
+        status.update({
+            'rsi': rsi_value,
+            'adx': adx_value,
+            'plus_di': plus_di,
+            'minus_di': minus_di,
+            'atr': atr_value,
+            'atr_pct': atr_pct,
+            'ema50': float(ema50),
+            'ema200': float(ema200),
+            'ema_near_pct': ema_near_pct,
+            'donchian_high_prev': don_high_prev,
+            'donchian_low_prev': don_low_prev,
+            'donchian_width_pct': don_width_pct,
+            'metric_summary': (
+                f"RSI={rsi_value:.2f}, ADX={float(adx_value or 0):.2f}, ATR%={atr_pct:.3f}, "
+                f"EMA200 dist={ema_near_pct:.3f}%, Donchian width={don_width_pct:.3f}%"
+            )
+        })
+
+        if not self._is_valid_number(rsi_value):
+            return _finish(None, "REJECTED_RSI_MOMENTUM: RSI calculation pending", 'REJECTED_RSI_MOMENTUM', record_failure=True, side=side)
+        rsi_threshold = float(cfg.get('rsi_threshold', 50.0) or 50.0)
+        if side == 'long':
+            rsi_ok = rsi_value > rsi_threshold
+            if cfg.get('exclude_rsi_extreme', False):
+                rsi_ok = rsi_ok and rsi_value <= float(cfg.get('rsi_long_extreme', 80.0) or 80.0)
+        else:
+            rsi_ok = rsi_value < rsi_threshold
+            if cfg.get('exclude_rsi_extreme', False):
+                rsi_ok = rsi_ok and rsi_value >= float(cfg.get('rsi_short_extreme', 20.0) or 20.0)
+        if not rsi_ok:
+            return _finish(None, f"REJECTED_RSI_MOMENTUM: RSI {rsi_value:.2f} not aligned for {side.upper()}", 'REJECTED_RSI_MOMENTUM', record_failure=True, side=side)
+
+        if adx_value is None or not self._is_valid_number(adx_value):
+            return _finish(None, f"REJECTED_ADX_LOW: {adx_reason}", 'REJECTED_ADX_LOW', record_failure=True, side=side)
+        if float(adx_value) < float(cfg.get('adx_threshold', 22.0) or 22.0):
+            return _finish(None, f"REJECTED_ADX_LOW: ADX {float(adx_value):.2f} < {float(cfg['adx_threshold']):.2f}", 'REJECTED_ADX_LOW', record_failure=True, side=side)
+
+        long_breakout = entry_price > don_high_prev
+        short_breakout = entry_price < don_low_prev
+        if side == 'long' and not long_breakout:
+            return _finish(None, f"REJECTED_DONCHIAN_NO_BREAKOUT: close {entry_price:.4f} <= prev high {don_high_prev:.4f}", 'REJECTED_DONCHIAN_NO_BREAKOUT', record_failure=True, side=side)
+        if side == 'short' and not short_breakout:
+            return _finish(None, f"REJECTED_DONCHIAN_NO_BREAKOUT: close {entry_price:.4f} >= prev low {don_low_prev:.4f}", 'REJECTED_DONCHIAN_NO_BREAKOUT', record_failure=True, side=side)
+
+        if not self._is_valid_number(atr_pct):
+            return _finish(None, "REJECTED_ATR_TOO_LOW: ATR calculation pending", 'REJECTED_ATR_TOO_LOW', record_failure=True, side=side)
+        if atr_pct < float(cfg.get('atr_min_percent', 0.12) or 0.12):
+            return _finish(None, f"REJECTED_ATR_TOO_LOW: ATR% {atr_pct:.3f} < {float(cfg['atr_min_percent']):.3f}", 'REJECTED_ATR_TOO_LOW', record_failure=True, side=side)
+        if atr_pct > float(cfg.get('atr_max_percent', 1.20) or 1.20):
+            return _finish(None, f"REJECTED_ATR_TOO_HIGH: ATR% {atr_pct:.3f} > {float(cfg['atr_max_percent']):.3f}", 'REJECTED_ATR_TOO_HIGH', record_failure=True, side=side)
+
+        if ema_near_pct < float(cfg.get('ema_near_percent', 0.20) or 0.20):
+            return _finish(None, f"REJECTED_EMA_CHOP_ZONE: EMA200 distance {ema_near_pct:.3f}% too close", 'REJECTED_EMA_CHOP_ZONE', record_failure=True, side=side)
+
+        if don_width_pct < float(cfg.get('donchian_width_min_percent', 0.50) or 0.50):
+            return _finish(None, f"REJECTED_DONCHIAN_WIDTH_TOO_NARROW: width {don_width_pct:.3f}% too narrow", 'REJECTED_DONCHIAN_WIDTH_TOO_NARROW', record_failure=True, side=side)
+
+        ut_stop = ut_detail.get('curr_stop')
+        stop_anchor_distance = abs(entry_price - float(ut_stop)) if self._is_valid_number(ut_stop) else 0.0
+        risk_distance = max(float(cfg.get('stop_atr_multiplier', 1.5) or 1.5) * float(atr_value), stop_anchor_distance)
+        rr_multiple = float(cfg.get('take_profit_r_multiple', 2.0) or 2.0)
+        if risk_distance <= 0 or rr_multiple < float(cfg.get('min_risk_reward', 2.0) or 2.0):
+            return _finish(None, "REJECTED_RISK_REWARD_LOW: invalid risk distance or RR", 'REJECTED_RISK_REWARD_LOW', record_failure=True, side=side)
+
+        if side == 'long':
+            stop_loss = entry_price - risk_distance
+            take_profit = entry_price + (rr_multiple * risk_distance)
+        else:
+            stop_loss = entry_price + risk_distance
+            take_profit = entry_price - (rr_multiple * risk_distance)
+
+        total_balance, free_balance, _ = await self.get_balance_info()
+        balance_for_risk = total_balance if total_balance > 0 else free_balance
+        risk_usdt = min(
+            balance_for_risk * float(cfg.get('risk_per_trade_percent', 1.0) or 1.0) / 100.0,
+            float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
+        )
+        if risk_usdt <= 0:
+            return _finish(None, "REJECTED_RISK_REWARD_LOW: risk budget unavailable", 'REJECTED_RISK_REWARD_LOW', record_failure=True, side=side)
+        planned_qty = risk_usdt / max(risk_distance, 1e-9)
+        plan = {
+            'strategy': UTBOT_FILTERED_BREAKOUT_STRATEGY,
+            'side': side,
+            'entry_price': entry_price,
+            'risk_distance': risk_distance,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'risk_usdt': risk_usdt,
+            'qty': planned_qty,
+            'rr_multiple': rr_multiple,
+            'atr': atr_value,
+            'atr_pct': atr_pct,
+            'decision_candle_ts': decision_ts
+        }
+        self.utbot_filtered_breakout_entry_plans[symbol] = plan
+        status['risk_summary'] = (
+            f"risk={risk_usdt:.4f} USDT, distance={risk_distance:.4f}, "
+            f"SL={stop_loss:.4f}, TP={take_profit:.4f}, qty={planned_qty:.8f}, RR={rr_multiple:.2f}"
+        )
+        status['entry_plan'] = dict(plan)
+        return _finish(side, f"ACCEPTED_ENTRY: {side.upper()} filtered breakout confirmed", None)
 
     def _calculate_smc_structure_scope(self, closed, size, scope_name):
         result = {
@@ -5778,6 +6383,7 @@ class SignalEngine(BaseEngine):
                     or active_strategy == 'cameron'
                     or active_strategy == 'utsmc'
                     or active_strategy == 'utbot'
+                    or active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY
                     or active_strategy in UT_HYBRID_STRATEGIES
                 )
             )
@@ -5884,6 +6490,8 @@ class SignalEngine(BaseEngine):
                     active_strategy = scan_params.get('active_strategy', 'utbot').lower()
                     if active_strategy not in CORE_STRATEGIES:
                         active_strategy = 'utbot'
+                    if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                        scan_tf = self._get_utbot_filtered_breakout_config(scan_params).get('entry_timeframe', '15m')
                     
                     # Use scanner_timeframe if set, but ensure we are thinking about consistency
                     ohlcv = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, scan_tf, limit=300)
@@ -6003,7 +6611,7 @@ class SignalEngine(BaseEngine):
             comm_cfg = self.get_runtime_common_settings()
             active_strategy = strategy_params.get('active_strategy', 'utbot').upper()
             entry_mode = strategy_params.get('entry_mode', 'cross').upper()
-            if active_strategy in {'UTBOT', 'UTSMC', 'RSIBB', 'UTRSIBB', 'UTRSI', 'UTBB'}:
+            if active_strategy in {'UTBOT', 'UTSMC', 'RSIBB', 'UTRSIBB', 'UTRSI', 'UTBB', 'UTBOT_FILTERED_BREAKOUT_V1'}:
                 entry_mode = active_strategy
             
             # MicroVBO State
@@ -6059,6 +6667,7 @@ class SignalEngine(BaseEngine):
             candidate_status = self.last_utsmc_candidate_filter_status.get(symbol, {})
             symbol_status['utsmc_candidate_filter_mode'] = candidate_status.get('mode_label', 'OFF')
             symbol_status['utsmc_candidate_filter'] = candidate_status
+            symbol_status['utbot_filtered_breakout'] = self.last_utbot_filtered_breakout_status.get(symbol, {})
             tp_master_enabled = False if self.is_upbit_mode() else bool(comm_cfg.get('tp_sl_enabled', True))
             tp_enabled = tp_master_enabled and bool(comm_cfg.get('take_profit_enabled', True))
             sl_enabled = tp_master_enabled and bool(comm_cfg.get('stop_loss_enabled', True))
@@ -6335,6 +6944,18 @@ class SignalEngine(BaseEngine):
                 lines.append(f"UTSMC 후보필터 LONG: `{diag.get('utsmc_candidate_reason_long')}`")
             if diag.get('utsmc_candidate_reason_short'):
                 lines.append(f"UTSMC 후보필터 SHORT: `{diag.get('utsmc_candidate_reason_short')}`")
+
+        if diag.get('utbreakout_reason') or diag.get('utbreakout_reject_code'):
+            lines.append(
+                f"Filtered Breakout: `{diag.get('utbreakout_reject_code') or 'ACCEPTED_ENTRY'}` | "
+                f"`{diag.get('utbreakout_reason', '-')}`"
+            )
+        if diag.get('utbreakout_htf'):
+            lines.append(f"HTF 필터: `{diag.get('utbreakout_htf')}`")
+        if diag.get('utbreakout_metrics'):
+            lines.append(f"지표 필터: `{diag.get('utbreakout_metrics')}`")
+        if diag.get('utbreakout_risk'):
+            lines.append(f"리스크 계획: `{diag.get('utbreakout_risk')}`")
 
         if include_exit:
             if (
@@ -7521,9 +8142,13 @@ class SignalEngine(BaseEngine):
         self.last_candle_success[symbol] = False
         
         logger.info(f"?빉截?[Signal] Processing candle: {symbol} close={k['c']}")
+        strategy_params = self.get_runtime_strategy_params()
+        active_strategy = strategy_params.get('active_strategy', 'utbot').lower()
         
         if await self.check_daily_loss_limit():
             logger.info("??Daily loss limit reached, skipping trade")
+            if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                self.last_entry_reason[symbol] = "REJECTED_DAILY_LOSS_LIMIT"
             self.last_candle_time[symbol] = processing_candle_time
             self.last_candle_success[symbol] = True
             return
@@ -7533,7 +8158,11 @@ class SignalEngine(BaseEngine):
             
             # [MODIFIED] Prioritize entry_timeframe for fetching entry OHLCV
             common_cfg = self.get_runtime_common_settings()
-            tf = common_cfg.get('entry_timeframe', common_cfg.get('timeframe', '15m'))
+            if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                filtered_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+                tf = filtered_cfg.get('entry_timeframe', '15m')
+            else:
+                tf = common_cfg.get('entry_timeframe', common_cfg.get('timeframe', '15m'))
             ohlcv = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, tf, limit=300)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
@@ -7542,8 +8171,6 @@ class SignalEngine(BaseEngine):
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             
             # ===== ?꾨왂 ?ㅼ젙 濡쒕뱶 =====
-            strategy_params = self.get_runtime_strategy_params()
-            active_strategy = strategy_params.get('active_strategy', 'utbot').lower()
             strategy_context = self._collect_primary_strategy_context(symbol, df, strategy_params, active_strategy)
             raw_strategy_sig = strategy_context['raw_strategy_sig']
             raw_state_sig = strategy_context['raw_state_sig']
@@ -7593,6 +8220,8 @@ class SignalEngine(BaseEngine):
             if sig and not self.is_trade_direction_allowed(sig):
                 logger.info(f"??Signal {sig} blocked by direction filter: {d_mode}")
                 self.last_entry_reason[symbol] = self.format_trade_direction_block_reason(sig)
+                if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                    self._clear_utbot_filtered_breakout_entry_plan(symbol)
                 sig = None
 
             # ?ъ????뺤씤
@@ -7862,6 +8491,19 @@ class SignalEngine(BaseEngine):
                     raw_strategy_sig,
                     sig
                 )
+
+            elif active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                if pos:
+                    self.last_entry_reason[symbol] = (
+                        f"포지션 보유 중 ({pos['side'].upper()}), UTBOT_FILTERED_BREAKOUT_V1 신규 진입 대기"
+                    )
+                    self._clear_utbot_filtered_breakout_entry_plan(symbol)
+                elif sig:
+                    self.last_entry_reason[symbol] = f"ACCEPTED_ENTRY: {sig.upper()} filtered breakout -> 진입"
+                    logger.info(f"[UTBOT_FILTERED_BREAKOUT_V1] New {sig.upper()} entry")
+                    await self.entry(symbol, sig, float(k['c']))
+                else:
+                    self._clear_utbot_filtered_breakout_entry_plan(symbol)
 
             elif (active_strategy in MA_STRATEGIES and entry_mode in ['cross', 'position']) or active_strategy == 'cameron':
                 # Cross/Position 紐⑤뱶: Primary TF?먯꽌??"吏꾩엯(Entry)"留?泥섎━
@@ -8352,6 +8994,58 @@ class SignalEngine(BaseEngine):
                         exit_reason = " | ".join(exit_reason_parts)
                 if raw_exit_long or raw_exit_short:
                     logger.info(f"[Exit Debug] {symbol} {strategy_name}: {exit_reason}")
+            elif active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                strategy_name = "UTBOT_FILTERED_BREAKOUT_V1(Exit)"
+                fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+                exit_reason_parts = []
+                closed = df.iloc[:-1].copy().reset_index(drop=True)
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    closed[col] = pd.to_numeric(closed[col], errors='coerce')
+                closed = closed.dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+
+                if bool(fb_cfg.get('opposite_signal_exit_enabled', False)):
+                    exit_sig, ut_exit_reason, _ = self._calculate_utbot_signal(
+                        df,
+                        self._get_utbot_filtered_breakout_ut_params(fb_cfg)
+                    )
+                    if current_side.lower() == 'long' and exit_sig == 'short':
+                        raw_exit_long = True
+                        exit_reason_parts.append(f"UT opposite SELL ({ut_exit_reason})")
+                    elif current_side.lower() == 'short' and exit_sig == 'long':
+                        raw_exit_short = True
+                        exit_reason_parts.append(f"UT opposite BUY ({ut_exit_reason})")
+
+                if bool(fb_cfg.get('ema_rsi_exit_enabled', False)) and len(closed) >= int(fb_cfg['ema_fast']) + int(fb_cfg['rsi_length']) + 2:
+                    close_series = closed['close'].astype(float)
+                    curr_close = float(close_series.iloc[-1])
+                    ema50 = float(close_series.ewm(span=int(fb_cfg['ema_fast']), adjust=False).mean().iloc[-1])
+                    rsi_series = self._calculate_wilder_rsi_series(close_series, int(fb_cfg['rsi_length']))
+                    rsi_value = float(rsi_series.iloc[-1]) if self._is_valid_number(rsi_series.iloc[-1]) else np.nan
+                    if current_side.lower() == 'long' and curr_close < ema50 and self._is_valid_number(rsi_value) and rsi_value < 50.0:
+                        raw_exit_long = True
+                        exit_reason_parts.append(f"EMA50/RSI exit close={curr_close:.4f} < EMA50={ema50:.4f}, RSI={rsi_value:.2f}")
+                    elif current_side.lower() == 'short' and curr_close > ema50 and self._is_valid_number(rsi_value) and rsi_value > 50.0:
+                        raw_exit_short = True
+                        exit_reason_parts.append(f"EMA50/RSI exit close={curr_close:.4f} > EMA50={ema50:.4f}, RSI={rsi_value:.2f}")
+
+                if bool(fb_cfg.get('adx_donchian_exit_enabled', False)) and len(closed) >= int(fb_cfg['donchian_length']) + int(fb_cfg['adx_length']) * 2 + 5:
+                    curr_close = float(closed['close'].astype(float).iloc[-1])
+                    adx_value, _, _, _ = self._calculate_utbot_filter_pack_adx_dmi(closed, int(fb_cfg['adx_length']))
+                    don_window = closed.iloc[-int(fb_cfg['donchian_length']) - 1:-1]
+                    don_high_prev = float(don_window['high'].astype(float).max())
+                    don_low_prev = float(don_window['low'].astype(float).min())
+                    back_inside = don_low_prev <= curr_close <= don_high_prev
+                    adx_low = adx_value is not None and self._is_valid_number(adx_value) and float(adx_value) < float(fb_cfg['adx_threshold'])
+                    if current_side.lower() == 'long' and back_inside and adx_low:
+                        raw_exit_long = True
+                        exit_reason_parts.append(f"ADX/Donchian re-entry exit ADX={float(adx_value):.2f}")
+                    elif current_side.lower() == 'short' and back_inside and adx_low:
+                        raw_exit_short = True
+                        exit_reason_parts.append(f"ADX/Donchian re-entry exit ADX={float(adx_value):.2f}")
+
+                exit_reason = " | ".join(exit_reason_parts) if exit_reason_parts else "SL/TP managed; optional exit filters OFF"
+                if raw_exit_long or raw_exit_short:
+                    logger.info(f"[Exit Debug] {symbol} {strategy_name}: {exit_reason}")
             elif active_strategy == 'utbb':
                 strategy_name = "UTBB(Exit)"
                 _, exit_reason, utbb_detail = self._calculate_utbb_signal(None, df, strategy_params)
@@ -8636,6 +9330,11 @@ class SignalEngine(BaseEngine):
             sig, entry_reason, _ = precomputed.get('rsibb') or self._calculate_rsibb_signal(df, strategy_params)
             is_bullish = sig == 'long'
             is_bearish = sig == 'short'
+        elif active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+            entry_mode = UTBOT_FILTERED_BREAKOUT_STRATEGY
+            sig, entry_reason, _ = await self._calculate_utbot_filtered_breakout_signal(symbol, df, strategy_params)
+            is_bullish = sig == 'long'
+            is_bearish = sig == 'short'
 
         self.last_entry_reason[symbol] = entry_reason
         return sig, is_bullish, is_bearish, strategy_name, entry_mode, kalman_entry_enabled
@@ -8748,7 +9447,16 @@ class SignalEngine(BaseEngine):
             logger.info(f"?뱿 [Signal] Attempting {side.upper()} entry @ {price}")
             
             cfg = self.get_runtime_common_settings()
-            lev = int(max(1.0, float(cfg.get('leverage', 10) or 10)))
+            strategy_params = self.get_runtime_strategy_params()
+            active_strategy = strategy_params.get('active_strategy', '').lower()
+            filtered_breakout_plan = (
+                self._get_utbot_filtered_breakout_entry_plan(symbol, side)
+                if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY else None
+            )
+            lev_default = 5 if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY else 10
+            lev = int(max(1.0, float(cfg.get('leverage', lev_default) or lev_default)))
+            if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                lev = min(10, lev)
             req_risk_pct = float(cfg.get('risk_per_trade_pct', 10.0) or 10.0)
             max_risk_pct = float(cfg.get('max_risk_per_trade_pct', 100.0) or 100.0)
             max_risk_pct = min(100.0, max(1.0, max_risk_pct))
@@ -8775,13 +9483,21 @@ class SignalEngine(BaseEngine):
                 parsed = [x for x in (_safe_float(v) for v in values) if x is not None]
                 return min(parsed) if parsed else 0.0
             
-            # Position sizing (user-friendly):
-            # 1) Use configured % of current free USDT as margin.
-            # 2) Apply leverage to that margin to get position notional.
-            # 3) Keep a small safety buffer to avoid -2019 by fees/slippage.
-            margin_to_use = free * risk_pct
             safety_buffer = 0.98
-            target_notional = margin_to_use * lev * safety_buffer
+            if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                if not filtered_breakout_plan:
+                    await self.ctrl.notify("⚠️ UTBOT_FILTERED_BREAKOUT_V1 진입 계획이 없어 주문을 중단합니다.")
+                    return
+                planned_qty = float(filtered_breakout_plan.get('qty', 0.0) or 0.0)
+                target_notional = planned_qty * float(price)
+                margin_to_use = target_notional / max(float(lev), 1e-9)
+            else:
+                # Position sizing (user-friendly):
+                # 1) Use configured % of current free USDT as margin.
+                # 2) Apply leverage to that margin to get position notional.
+                # 3) Keep a small safety buffer to avoid -2019 by fees/slippage.
+                margin_to_use = free * risk_pct
+                target_notional = margin_to_use * lev * safety_buffer
 
             # Exchange min notional check (prevents Binance -4164).
             min_notional = 0.0
@@ -8815,6 +9531,18 @@ class SignalEngine(BaseEngine):
 
             max_notional = free * lev * safety_buffer
             if min_notional > 0 and target_notional < min_notional:
+                if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                    logger.warning(
+                        f"[UTBOT_FILTERED_BREAKOUT_V1] Entry blocked by min notional: "
+                        f"target={target_notional:.2f}, min={min_notional:.2f}, risk_plan={filtered_breakout_plan}"
+                    )
+                    await self.ctrl.notify(
+                        f"⚠️ UTBOT_FILTERED_BREAKOUT_V1 최소 주문금액 미달: "
+                        f"계획 {target_notional:.2f} < 필요 {min_notional:.2f} USDT. "
+                        "리스크 기반 수량을 임의 증액하지 않고 진입을 차단합니다."
+                    )
+                    self._clear_utbot_filtered_breakout_entry_plan(symbol)
+                    return
                 # If balance/leverage can support exchange minimum, auto-bump notional.
                 if max_notional >= min_notional:
                     target_notional = min_notional * 1.001  # small buffer for precision truncation
@@ -8836,6 +9564,17 @@ class SignalEngine(BaseEngine):
                     )
                     return
 
+            if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY and target_notional > max_notional:
+                logger.warning(
+                    f"[UTBOT_FILTERED_BREAKOUT_V1] Entry blocked by margin cap: "
+                    f"target={target_notional:.2f}, max={max_notional:.2f}, free={free:.2f}, lev={lev}"
+                )
+                await self.ctrl.notify(
+                    f"⚠️ UTBOT_FILTERED_BREAKOUT_V1 증거금 부족: 계획 {target_notional:.2f} > 가능 {max_notional:.2f} USDT"
+                )
+                self._clear_utbot_filtered_breakout_entry_plan(symbol)
+                return
+
             qty = self.safe_amount(symbol, target_notional / price)
             try:
                 qty_notional = float(qty) * float(price)
@@ -8846,10 +9585,17 @@ class SignalEngine(BaseEngine):
                     f"Entry quantity below min notional after precision: qty={qty}, "
                     f"notional={qty_notional:.4f}, min={min_notional:.4f}"
                 )
-                await self.ctrl.notify(
-                    f"⚠️ 주문 수량 정밀도 때문에 최소 금액 미달({qty_notional:.2f} < {min_notional:.2f}). "
-                    "레버리지/진입비율을 높여주세요."
-                )
+                if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                    await self.ctrl.notify(
+                        f"⚠️ UTBOT_FILTERED_BREAKOUT_V1 수량 정밀도 후 최소 금액 미달"
+                        f"({qty_notional:.2f} < {min_notional:.2f}). 리스크 기반 진입 차단."
+                    )
+                    self._clear_utbot_filtered_breakout_entry_plan(symbol)
+                else:
+                    await self.ctrl.notify(
+                        f"⚠️ 주문 수량 정밀도 때문에 최소 금액 미달({qty_notional:.2f} < {min_notional:.2f}). "
+                        "레버리지/진입비율을 높여주세요."
+                    )
                 return
             
             if float(qty) <= 0:
@@ -8857,12 +9603,20 @@ class SignalEngine(BaseEngine):
                 await self.ctrl.notify(f"⚠️ 주문 수량 계산 오류: {qty} (잔고: {free:.2f})")
                 return
             
-            if bounded_risk_pct != req_risk_pct:
+            if active_strategy != UTBOT_FILTERED_BREAKOUT_STRATEGY and bounded_risk_pct != req_risk_pct:
                 await self.ctrl.notify(f"⚠️ 리스크 상한 적용: {req_risk_pct:.1f}% -> {bounded_risk_pct:.1f}%")
-            logger.info(
-                f"Entry params: qty={qty}, lev={lev}x, risk={bounded_risk_pct:.1f}% "
-                f"(free={free:.2f}, margin_to_use={margin_to_use:.2f}, target_notional={target_notional:.2f}, safety={safety_buffer:.2f})"
-            )
+            if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                logger.info(
+                    f"[UTBOT_FILTERED_BREAKOUT_V1] Entry params: qty={qty}, lev={lev}x, "
+                    f"risk_usdt={float(filtered_breakout_plan.get('risk_usdt', 0) or 0):.4f}, "
+                    f"risk_distance={float(filtered_breakout_plan.get('risk_distance', 0) or 0):.4f}, "
+                    f"target_notional={target_notional:.2f}, margin_to_use={margin_to_use:.2f}"
+                )
+            else:
+                logger.info(
+                    f"Entry params: qty={qty}, lev={lev}x, risk={bounded_risk_pct:.1f}% "
+                    f"(free={free:.2f}, margin_to_use={margin_to_use:.2f}, target_notional={target_notional:.2f}, safety={safety_buffer:.2f})"
+                )
             
             # [Enforce] Market Settings (Isolated + Leverage)
             await self.ensure_market_settings(symbol, leverage=lev)
@@ -8879,10 +9633,6 @@ class SignalEngine(BaseEngine):
             
             self.db.log_trade_entry(symbol, side, price, float(qty))
             logger.info(f"??Entry order success: {order.get('id', 'N/A')}")
-            
-            # ?꾨왂 ?뚮씪誘명꽣 濡쒕뱶
-            strategy_params = self.get_runtime_strategy_params()
-            active_strategy = strategy_params.get('active_strategy', '').lower()
             
             # 吏꾩엯 ???ъ????뺤씤?섏뿬 ?뺥솗??吏꾩엯媛 ?뚯븙
             await asyncio.sleep(1)
@@ -8976,6 +9726,31 @@ class SignalEngine(BaseEngine):
                                 tp_distance=tp_distance,
                                 sl_distance=sl_distance
                             )
+
+            elif active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                plan = filtered_breakout_plan or self._get_utbot_filtered_breakout_entry_plan(symbol, side)
+                if not plan:
+                    logger.warning("[UTBOT_FILTERED_BREAKOUT_V1] Missing risk plan after entry; TP/SL placement skipped.")
+                    await self.ctrl.notify("⚠️ UTBOT_FILTERED_BREAKOUT_V1 리스크 계획 누락: 보호 주문 설정을 건너뜀")
+                else:
+                    risk_distance = float(plan.get('risk_distance', 0.0) or 0.0)
+                    rr_multiple = float(plan.get('rr_multiple', 2.0) or 2.0)
+                    if risk_distance > 0 and rr_multiple > 0:
+                        await self._place_tp_sl_orders(
+                            symbol,
+                            side,
+                            actual_entry_price,
+                            qty,
+                            tp_distance=risk_distance * rr_multiple,
+                            sl_distance=risk_distance
+                        )
+                        logger.info(
+                            f"[UTBOT_FILTERED_BREAKOUT_V1] RR protection set: "
+                            f"entry={actual_entry_price:.4f}, risk={risk_distance:.4f}, rr={rr_multiple:.2f}"
+                        )
+                    else:
+                        await self.ctrl.notify("⚠️ UTBOT_FILTERED_BREAKOUT_V1 보호 주문 거리 계산 오류")
+                self._clear_utbot_filtered_breakout_entry_plan(symbol)
             
             else:
                 # SMA/HMA: ?쇱꽱??湲곕컲 TP/SL 二쇰Ц
@@ -9008,6 +9783,8 @@ class SignalEngine(BaseEngine):
             logger.error(f"Signal entry error: {e}")
             import traceback
             traceback.print_exc()
+            if locals().get('active_strategy') == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                self._clear_utbot_filtered_breakout_entry_plan(symbol)
             await self.ctrl.notify(f"❌ 진입 실패: {e}")
 
     async def _entry_upbit_spot(self, symbol, side, price):
@@ -12953,7 +13730,8 @@ class MainController:
     def _build_main_keyboard(self):
         kb = [
             [KeyboardButton("🚨 STOP"), KeyboardButton("⏸ PAUSE"), KeyboardButton("▶ RESUME")],
-            [KeyboardButton("/setup"), KeyboardButton("/status"), KeyboardButton("/history")],
+            [KeyboardButton("/setup"), KeyboardButton("/utbreakout"), KeyboardButton("/status")],
+            [KeyboardButton("/history"), KeyboardButton("/stats")],
             [KeyboardButton("/log"), KeyboardButton("/help")]
         ]
         return ReplyKeyboardMarkup(kb, resize_keyboard=True)
@@ -12966,7 +13744,7 @@ class MainController:
         markup = self._build_main_keyboard()
         text_filter = filters.TEXT & ~filters.COMMAND
         setup_trigger_pattern = r"^/setup(?:@[A-Za-z0-9_]+)?$"
-        menu_trigger_pattern = r"^/(status|history|log|help|stats|close)(?:@[A-Za-z0-9_]+)?$"
+        menu_trigger_pattern = r"^/(status|history|log|help|stats|close|utbreakout)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
         setup_text_filter = text_filter & ~filters.Regex(r"^/")
 
         async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -13059,6 +13837,106 @@ class MainController:
 """
             await u.message.reply_text(msg.strip(), parse_mode=ParseMode.MARKDOWN)
 
+        def _format_utbreakout_menu_text():
+            sig_cfg = self.cfg.get('signal_engine', {})
+            strategy_params = sig_cfg.get('strategy_params', {})
+            active_strategy = str(strategy_params.get('active_strategy', 'utbot') or 'utbot').lower()
+            cfg = build_default_utbot_filtered_breakout_config()
+            raw_cfg = strategy_params.get('UTBotFilteredBreakoutV1', {})
+            if isinstance(raw_cfg, dict):
+                cfg.update(raw_cfg)
+            watchlist = self.get_active_watchlist()
+            first_symbol = watchlist[0] if watchlist else 'BTC/USDT'
+            engine = self.engines.get('signal')
+            diag = {}
+            if engine:
+                diag = engine.last_utbot_filtered_breakout_status.get(first_symbol, {}) or {}
+            active_label = "ON" if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY else f"OFF ({active_strategy.upper()})"
+            last_reason = diag.get('reject_code') or diag.get('accepted_code') or diag.get('reason') or '대기'
+            return f"""
+🧭 **UTBOT_FILTERED_BREAKOUT_V1**
+
+상태: `{active_label}`
+프로필: `{cfg.get('profile', 'set2')}` | TF `{cfg.get('entry_timeframe', '15m')}` / HTF `{cfg.get('htf_timeframe', '1h')}`
+UT: `K={float(cfg.get('utbot_key_value', 2.5) or 2.5):.2f}` / `ATR={int(cfg.get('utbot_atr_period', 14) or 14)}`
+필터: `ADX>={float(cfg.get('adx_threshold', 22) or 22):.1f}` | `ATR% {float(cfg.get('atr_min_percent', 0.12) or 0.12):.2f}~{float(cfg.get('atr_max_percent', 1.20) or 1.20):.2f}` | `Donchian {int(cfg.get('donchian_length', 20) or 20)}`
+리스크: `SL {float(cfg.get('stop_atr_multiplier', 1.5) or 1.5):.1f}ATR` | `TP {float(cfg.get('take_profit_r_multiple', 2.0) or 2.0):.1f}R` | `max ${float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0):.2f}`
+옵션: 반대신호청산 `{'ON' if cfg.get('opposite_signal_exit_enabled') else 'OFF'}` | EMA/RSI청산 `{'ON' if cfg.get('ema_rsi_exit_enabled') else 'OFF'}` | RSI과열제외 `{'ON' if cfg.get('exclude_rsi_extreme') else 'OFF'}`
+
+최근 진단({first_symbol}): `{last_reason}`
+
+명령:
+`/utbreakout on` - 전략 활성화
+`/utbreakout off` - UTBOT으로 복귀
+`/utbreakout set1` / `set2` / `set3` - 파라미터 세트 적용
+`/utbreakout toggle_opposite` - 반대 UT 신호 청산 토글
+`/utbreakout toggle_ema` - EMA50/RSI 청산 토글
+`/utbreakout toggle_extreme` - RSI 과열 제외 토글
+""".strip()
+
+        async def utbreakout_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            args = list(getattr(c, 'args', []) or [])
+            if not args and u and u.message and u.message.text:
+                parts = u.message.text.strip().split()
+                args = parts[1:]
+            action = str(args[0]).strip().lower() if args else ''
+
+            if action in {'on', 'enable', 'activate', 'start'}:
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_FILTERED_BREAKOUT_STRATEGY)
+                self._reset_signal_engine_runtime_state(
+                    reset_entry_cache=True,
+                    reset_exit_cache=True,
+                    reset_stateful_strategy=True
+                )
+                await u.message.reply_text("✅ UTBOT_FILTERED_BREAKOUT_V1 활성화 완료")
+            elif action in {'off', 'disable', 'utbot'}:
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], 'utbot')
+                self._reset_signal_engine_runtime_state(
+                    reset_entry_cache=True,
+                    reset_exit_cache=True,
+                    reset_stateful_strategy=True
+                )
+                await u.message.reply_text("✅ 기본 UTBOT 전략으로 복귀")
+            elif action in {'set1', 'set2', 'set3', '1', '2', '3', 'aggressive', 'conservative'}:
+                profile_cfg = build_utbot_filtered_breakout_profile(action)
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1'],
+                    profile_cfg
+                )
+                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
+                await u.message.reply_text(f"✅ UTBOT_FILTERED_BREAKOUT_V1 프로필 적용: {profile_cfg.get('profile')}")
+            elif action in {'toggle_opposite', 'opposite'}:
+                raw = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
+                current = bool(raw.get('opposite_signal_exit_enabled', False)) if isinstance(raw, dict) else False
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'opposite_signal_exit_enabled'],
+                    not current
+                )
+                await u.message.reply_text(f"✅ 반대 UT 신호 청산: {'ON' if not current else 'OFF'}")
+            elif action in {'toggle_ema', 'ema'}:
+                raw = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
+                current = bool(raw.get('ema_rsi_exit_enabled', False)) if isinstance(raw, dict) else False
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'ema_rsi_exit_enabled'],
+                    not current
+                )
+                await u.message.reply_text(f"✅ EMA50/RSI 청산: {'ON' if not current else 'OFF'}")
+            elif action in {'toggle_extreme', 'extreme'}:
+                raw = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
+                current = bool(raw.get('exclude_rsi_extreme', False)) if isinstance(raw, dict) else False
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'exclude_rsi_extreme'],
+                    not current
+                )
+                await u.message.reply_text(f"✅ RSI 과열 제외 옵션: {'ON' if not current else 'OFF'}")
+            elif action in {'status', 'menu', ''}:
+                pass
+            else:
+                await u.message.reply_text("❌ 알 수 없는 UT Breakout 명령입니다. `/utbreakout`로 메뉴를 확인하세요.", parse_mode=ParseMode.MARKDOWN)
+                return
+
+            await self._reply_markdown_safe(u.message, _format_utbreakout_menu_text())
+
         async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             msg = """
 📚 **명령어**
@@ -13068,6 +13946,7 @@ class MainController:
 /status - 현재 상태 조회
 /history - 지난 상태 조회
 /stats - 통계
+/utbreakout - UTBOT_FILTERED_BREAKOUT_V1 전용 메뉴
 /log - 최근 로그
 /close - 긴급 청산
 
@@ -13087,6 +13966,7 @@ class MainController:
         self.tg_app.add_handler(CommandHandler("log", log_cmd))
         self.tg_app.add_handler(CommandHandler("close", close_cmd))
         self.tg_app.add_handler(CommandHandler("stats", stats_cmd))
+        self.tg_app.add_handler(CommandHandler("utbreakout", utbreakout_cmd))
         self.tg_app.add_handler(CommandHandler("help", help_cmd))
 
         setup_command_handler = CommandHandler('setup', self.setup_entry)
@@ -13128,6 +14008,8 @@ class MainController:
                 return await stats_cmd(u, c)
             if command == "/close":
                 return await close_cmd(u, c)
+            if command == "/utbreakout":
+                return await utbreakout_cmd(u, c)
             return None
 
         self.tg_app.add_handler(
