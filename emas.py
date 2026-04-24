@@ -128,6 +128,7 @@ def build_default_utbot_filtered_breakout_config():
     return {
         'profile': 'set2',
         'entry_timeframe': '15m',
+        'exit_timeframe': '15m',
         'htf_timeframe': '1h',
         'utbot_key_value': 2.5,
         'utbot_atr_period': 14,
@@ -2191,6 +2192,11 @@ class SignalEngine(BaseEngine):
            醫낅ぉ???ㅼ틦?덉뿉 ?섑빐 ?≫엺 寃쎌슦 ?꾩슜 ??꾪봽?덉엫 諛섑솚
         """
         cfg = self.get_runtime_common_settings()
+        strategy_params = self.get_runtime_strategy_params()
+        active_strategy = str(strategy_params.get('active_strategy', 'utbot') or 'utbot').lower()
+        if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+            fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+            return fb_cfg.get('exit_timeframe', fb_cfg.get('entry_timeframe', '15m'))
         if symbol and symbol == self.scanner_active_symbol:
             return cfg.get('scanner_exit_timeframe', '1h')
         return cfg.get('exit_timeframe', '4h')
@@ -3602,6 +3608,7 @@ class SignalEngine(BaseEngine):
             _int(key, default, 1)
 
         cfg['entry_timeframe'] = str(cfg.get('entry_timeframe') or '15m').strip().lower() or '15m'
+        cfg['exit_timeframe'] = str(cfg.get('exit_timeframe') or cfg['entry_timeframe']).strip().lower() or cfg['entry_timeframe']
         cfg['htf_timeframe'] = str(cfg.get('htf_timeframe') or '1h').strip().lower() or '1h'
         for key in (
             'use_heikin_ashi',
@@ -13857,7 +13864,7 @@ class MainController:
 🧭 **UTBOT_FILTERED_BREAKOUT_V1**
 
 상태: `{active_label}`
-프로필: `{cfg.get('profile', 'set2')}` | TF `{cfg.get('entry_timeframe', '15m')}` / HTF `{cfg.get('htf_timeframe', '1h')}`
+프로필: `{cfg.get('profile', 'set2')}` | 진입 `{cfg.get('entry_timeframe', '15m')}` / 청산 `{cfg.get('exit_timeframe', cfg.get('entry_timeframe', '15m'))}` / HTF `{cfg.get('htf_timeframe', '1h')}`
 UT: `K={float(cfg.get('utbot_key_value', 2.5) or 2.5):.2f}` / `ATR={int(cfg.get('utbot_atr_period', 14) or 14)}`
 필터: `ADX>={float(cfg.get('adx_threshold', 22) or 22):.1f}` | `ATR% {float(cfg.get('atr_min_percent', 0.12) or 0.12):.2f}~{float(cfg.get('atr_max_percent', 1.20) or 1.20):.2f}` | `Donchian {int(cfg.get('donchian_length', 20) or 20)}`
 리스크: `SL {float(cfg.get('stop_atr_multiplier', 1.5) or 1.5):.1f}ATR` | `TP {float(cfg.get('take_profit_r_multiple', 2.0) or 2.0):.1f}R` | `max ${float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0):.2f}`
