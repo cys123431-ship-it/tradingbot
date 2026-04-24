@@ -7,6 +7,7 @@
 # 4. 誘멸뎄??湲곕뒫 異붽?: Grid Trading, Daily Loss Limit, Hourly Report, MMR Alert
 
 import logging
+from logging.handlers import RotatingFileHandler
 import threading
 import sqlite3
 import os
@@ -27,7 +28,7 @@ import pandas_ta as ta
 import numpy as np
 from pykalman import KalmanFilter as PyKalmanFilter
 from datetime import datetime, timezone, timedelta
-from collections import deque
+from collections import Counter, deque
 try:
     from dual_mode_fractal_strategy import DualModeFractalStrategy
     DUAL_MODE_AVAILABLE = True
@@ -66,6 +67,121 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 faulthandler.enable()
+UTBREAKOUT_DIAGNOSTIC_LOG_FILE = os.path.abspath('utbreakout_diagnostics.log')
+UTBREAKOUT_DIAGNOSTIC_MAX_BYTES = 5 * 1024 * 1024
+UTBREAKOUT_DIAGNOSTIC_BACKUP_COUNT = 2
+
+
+def _build_utbreakout_diagnostic_logger():
+    diag_logger = logging.getLogger('utbreakout_diagnostics')
+    diag_logger.setLevel(logging.INFO)
+    diag_logger.propagate = False
+    if not any(isinstance(h, RotatingFileHandler) for h in diag_logger.handlers):
+        handler = RotatingFileHandler(
+            UTBREAKOUT_DIAGNOSTIC_LOG_FILE,
+            maxBytes=UTBREAKOUT_DIAGNOSTIC_MAX_BYTES,
+            backupCount=UTBREAKOUT_DIAGNOSTIC_BACKUP_COUNT,
+            encoding='utf-8'
+        )
+        handler.setFormatter(logging.Formatter('%(message)s'))
+        diag_logger.addHandler(handler)
+    return diag_logger
+
+
+utbreakout_diag_logger = _build_utbreakout_diagnostic_logger()
+
+
+def _safe_float_or_none(value):
+    try:
+        if value is None or value == '':
+            return None
+        parsed = float(value)
+        return parsed if np.isfinite(parsed) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def get_utbreakout_diagnostic_log_paths():
+    paths = []
+    for idx in range(UTBREAKOUT_DIAGNOSTIC_BACKUP_COUNT, 0, -1):
+        rotated = f"{UTBREAKOUT_DIAGNOSTIC_LOG_FILE}.{idx}"
+        if os.path.exists(rotated):
+            paths.append(rotated)
+    if os.path.exists(UTBREAKOUT_DIAGNOSTIC_LOG_FILE):
+        paths.append(UTBREAKOUT_DIAGNOSTIC_LOG_FILE)
+    return paths
+
+
+def read_utbreakout_diagnostic_events(days=7):
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(days or 7)))
+    events = []
+    for path in get_utbreakout_diagnostic_log_paths():
+        try:
+            with open(path, 'r', encoding='utf-8') as fp:
+                for line in fp:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    raw_ts = event.get('ts')
+                    try:
+                        event_ts = datetime.fromisoformat(str(raw_ts).replace('Z', '+00:00'))
+                    except (TypeError, ValueError):
+                        continue
+                    if event_ts.tzinfo is None:
+                        event_ts = event_ts.replace(tzinfo=timezone.utc)
+                    event_ts = event_ts.astimezone(timezone.utc)
+                    if event_ts >= cutoff:
+                        event['_dt'] = event_ts
+                        events.append(event)
+        except OSError:
+            continue
+    events.sort(key=lambda item: item.get('_dt') or datetime.min.replace(tzinfo=timezone.utc))
+    return events
+
+
+def format_utbreakout_diagnostic_summary():
+    events = read_utbreakout_diagnostic_events(days=7)
+    if not events:
+        return "최근 7일 진단 로그 없음"
+
+    now = datetime.now(timezone.utc)
+    lines = []
+    for label, hours in (('24h', 24), ('7d', 24 * 7)):
+        cutoff = now - timedelta(hours=hours)
+        window_events = [e for e in events if e.get('_dt') and e['_dt'] >= cutoff]
+        candidate_keys = {
+            (
+                e.get('symbol'),
+                e.get('side'),
+                e.get('decision_candle_ts') or e.get('ut_signal_ts') or e.get('ts')
+            )
+            for e in window_events
+        }
+        accepted = sum(1 for e in window_events if e.get('code') == 'ACCEPTED_ENTRY')
+        blocked = sum(1 for e in window_events if e.get('event') == 'entry_blocked')
+        rejected = [e for e in window_events if str(e.get('code') or '').startswith('REJECTED_')]
+        code_counts = Counter(e.get('code') or 'UNKNOWN' for e in rejected)
+        top_codes = ', '.join(f"{code}:{count}" for code, count in code_counts.most_common(3)) or 'none'
+        lines.append(
+            f"{label}: candidates {len(candidate_keys)}, accepted {accepted}, "
+            f"blocked {blocked}, top rejects {top_codes}"
+        )
+
+    last = events[-1]
+    last_dt = last.get('_dt')
+    if last_dt:
+        kst = last_dt.astimezone(timezone(timedelta(hours=9))).strftime('%m-%d %H:%M')
+    else:
+        kst = 'unknown'
+    lines.append(
+        f"last: {kst} {last.get('symbol', '?')} {str(last.get('side') or '?').upper()} "
+        f"{last.get('code') or last.get('event') or 'UNKNOWN'}"
+    )
+    return "\n".join(lines)
 CORE_ENGINE = 'signal'
 UTBOT_FILTERED_BREAKOUT_STRATEGY = 'utbot_filtered_breakout_v1'
 UT_ONLY_STRATEGIES = {'utbot', 'utrsibb', 'utrsi', 'utbb', 'utsmc'}
@@ -3736,6 +3852,73 @@ class SignalEngine(BaseEngine):
             note=status.get('reject_code') or status.get('accepted_code') or status.get('reason')
         )
 
+    def _record_utbreakout_diagnostic_event(self, symbol, status, event=None, extra=None):
+        try:
+            status = dict(status or {})
+            side = status.get('accepted_side') or status.get('candidate_side') or status.get('candidate_signal')
+            side = str(side or '').lower()
+            if side not in {'long', 'short'}:
+                return
+            code = (
+                status.get('accepted_code')
+                or status.get('reject_code')
+                or (extra or {}).get('code')
+                or 'CANDIDATE'
+            )
+            if event is None:
+                if code == 'ACCEPTED_ENTRY':
+                    event = 'accepted'
+                elif str(code).startswith('REJECTED_'):
+                    event = 'rejected'
+                else:
+                    event = 'candidate'
+
+            payload = {
+                'ts': datetime.now(timezone.utc).isoformat(),
+                'event': event,
+                'symbol': symbol,
+                'side': side,
+                'code': code,
+                'reason': status.get('reason'),
+                'entry_timeframe': status.get('entry_timeframe'),
+                'htf_timeframe': status.get('htf_timeframe'),
+                'decision_candle_ts': status.get('decision_candle_ts'),
+                'ut_signal_ts': status.get('ut_signal_ts'),
+                'utbot_key_value': _safe_float_or_none(status.get('utbot_key_value')),
+                'utbot_atr_period': status.get('utbot_atr_period'),
+                'entry_price': _safe_float_or_none(status.get('entry_price')),
+                'rsi': _safe_float_or_none(status.get('rsi')),
+                'adx': _safe_float_or_none(status.get('adx')),
+                'atr_pct': _safe_float_or_none(status.get('atr_pct')),
+                'ema_near_pct': _safe_float_or_none(status.get('ema_near_pct')),
+                'donchian_width_pct': _safe_float_or_none(status.get('donchian_width_pct')),
+                'donchian_high_prev': _safe_float_or_none(status.get('donchian_high_prev')),
+                'donchian_low_prev': _safe_float_or_none(status.get('donchian_low_prev')),
+                'htf_summary': status.get('htf_summary'),
+                'metric_summary': status.get('metric_summary'),
+                'risk_summary': status.get('risk_summary')
+            }
+            plan = status.get('entry_plan')
+            if isinstance(plan, dict):
+                if not payload.get('decision_candle_ts'):
+                    payload['decision_candle_ts'] = plan.get('decision_candle_ts')
+                payload.update({
+                    'risk_usdt': _safe_float_or_none(plan.get('risk_usdt')),
+                    'risk_distance': _safe_float_or_none(plan.get('risk_distance')),
+                    'stop_loss': _safe_float_or_none(plan.get('stop_loss')),
+                    'take_profit': _safe_float_or_none(plan.get('take_profit')),
+                    'planned_qty': _safe_float_or_none(plan.get('qty')),
+                    'rr_multiple': _safe_float_or_none(plan.get('rr_multiple'))
+                })
+            if isinstance(extra, dict):
+                for key, value in extra.items():
+                    if key not in payload:
+                        payload[key] = value
+            clean_payload = {k: v for k, v in payload.items() if v is not None}
+            utbreakout_diag_logger.info(json.dumps(clean_payload, ensure_ascii=False, separators=(',', ':')))
+        except Exception as e:
+            logger.debug(f"UT breakout diagnostic log write failed: {e}")
+
     async def _calculate_utbot_filtered_breakout_signal(self, symbol, df, strategy_params):
         cfg = self._get_utbot_filtered_breakout_config(strategy_params)
         self._clear_utbot_filtered_breakout_entry_plan(symbol)
@@ -3761,6 +3944,7 @@ class SignalEngine(BaseEngine):
                 status['accepted_side'] = sig
             self._store_utbot_filtered_breakout_status(symbol, status)
             self.last_entry_reason[symbol] = reason
+            self._record_utbreakout_diagnostic_event(symbol, status)
             if record_failure and side:
                 self._record_utbot_filtered_breakout_failure(
                     symbol,
@@ -9460,6 +9644,29 @@ class SignalEngine(BaseEngine):
                 self._get_utbot_filtered_breakout_entry_plan(symbol, side)
                 if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY else None
             )
+
+            def _record_filtered_breakout_entry_block(code, reason, extra=None):
+                if active_strategy != UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                    return
+                fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+                status = {
+                    'candidate_side': side,
+                    'entry_timeframe': fb_cfg.get('entry_timeframe', '15m'),
+                    'htf_timeframe': fb_cfg.get('htf_timeframe', '1h'),
+                    'reason': reason,
+                    'entry_price': price,
+                    'entry_plan': dict(filtered_breakout_plan or {})
+                }
+                payload_extra = {'code': code}
+                if isinstance(extra, dict):
+                    payload_extra.update(extra)
+                self._record_utbreakout_diagnostic_event(
+                    symbol,
+                    status,
+                    event='entry_blocked',
+                    extra=payload_extra
+                )
+
             lev_default = 5 if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY else 10
             lev = int(max(1.0, float(cfg.get('leverage', lev_default) or lev_default)))
             if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
@@ -9493,6 +9700,10 @@ class SignalEngine(BaseEngine):
             safety_buffer = 0.98
             if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
                 if not filtered_breakout_plan:
+                    _record_filtered_breakout_entry_block(
+                        'ENTRY_BLOCKED_MISSING_PLAN',
+                        'UTBOT_FILTERED_BREAKOUT_V1 entry blocked: missing risk plan'
+                    )
                     await self.ctrl.notify("⚠️ UTBOT_FILTERED_BREAKOUT_V1 진입 계획이 없어 주문을 중단합니다.")
                     return
                 planned_qty = float(filtered_breakout_plan.get('qty', 0.0) or 0.0)
@@ -9543,6 +9754,16 @@ class SignalEngine(BaseEngine):
                         f"[UTBOT_FILTERED_BREAKOUT_V1] Entry blocked by min notional: "
                         f"target={target_notional:.2f}, min={min_notional:.2f}, risk_plan={filtered_breakout_plan}"
                     )
+                    _record_filtered_breakout_entry_block(
+                        'ENTRY_BLOCKED_MIN_NOTIONAL',
+                        'UTBOT_FILTERED_BREAKOUT_V1 entry blocked by min notional',
+                        {
+                            'target_notional': target_notional,
+                            'min_notional': min_notional,
+                            'free_balance': free,
+                            'leverage': lev
+                        }
+                    )
                     await self.ctrl.notify(
                         f"⚠️ UTBOT_FILTERED_BREAKOUT_V1 최소 주문금액 미달: "
                         f"계획 {target_notional:.2f} < 필요 {min_notional:.2f} USDT. "
@@ -9576,6 +9797,16 @@ class SignalEngine(BaseEngine):
                     f"[UTBOT_FILTERED_BREAKOUT_V1] Entry blocked by margin cap: "
                     f"target={target_notional:.2f}, max={max_notional:.2f}, free={free:.2f}, lev={lev}"
                 )
+                _record_filtered_breakout_entry_block(
+                    'ENTRY_BLOCKED_MARGIN_CAP',
+                    'UTBOT_FILTERED_BREAKOUT_V1 entry blocked by margin cap',
+                    {
+                        'target_notional': target_notional,
+                        'max_notional': max_notional,
+                        'free_balance': free,
+                        'leverage': lev
+                    }
+                )
                 await self.ctrl.notify(
                     f"⚠️ UTBOT_FILTERED_BREAKOUT_V1 증거금 부족: 계획 {target_notional:.2f} > 가능 {max_notional:.2f} USDT"
                 )
@@ -9593,6 +9824,15 @@ class SignalEngine(BaseEngine):
                     f"notional={qty_notional:.4f}, min={min_notional:.4f}"
                 )
                 if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                    _record_filtered_breakout_entry_block(
+                        'ENTRY_BLOCKED_PRECISION_MIN_NOTIONAL',
+                        'UTBOT_FILTERED_BREAKOUT_V1 entry blocked after precision min notional check',
+                        {
+                            'qty_notional': qty_notional,
+                            'min_notional': min_notional,
+                            'qty': qty
+                        }
+                    )
                     await self.ctrl.notify(
                         f"⚠️ UTBOT_FILTERED_BREAKOUT_V1 수량 정밀도 후 최소 금액 미달"
                         f"({qty_notional:.2f} < {min_notional:.2f}). 리스크 기반 진입 차단."
@@ -13860,6 +14100,7 @@ class MainController:
                 diag = engine.last_utbot_filtered_breakout_status.get(first_symbol, {}) or {}
             active_label = "ON" if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY else f"OFF ({active_strategy.upper()})"
             last_reason = diag.get('reject_code') or diag.get('accepted_code') or diag.get('reason') or '대기'
+            diag_summary = format_utbreakout_diagnostic_summary()
             return f"""
 🧭 **UTBOT_FILTERED_BREAKOUT_V1**
 
@@ -13877,6 +14118,10 @@ Set2 기본형: `UT 2.5,14` / `ADX>=22` / `Donchian20` / `SL 1.5ATR` / `TP 2R`
 Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
 
 최근 진단({first_symbol}): `{last_reason}`
+진단 요약:
+```
+{diag_summary}
+```
 
 명령:
 `/utbreakout on` - 전략 활성화
@@ -13885,6 +14130,7 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
 `/utbreakout risk 5` - 1회 최대 손실 5 USDT로 설정
 `/utbreakout riskpct 1` - 잔고 대비 손실 기준 1%로 설정
 `/utbreakout dailyloss 30` - 하루 최대 손실 30 USDT로 설정
+`/utbreakout log` - 진단 로그 파일 다운로드
 `/utbreakout toggle_opposite` - 반대 UT 신호 청산 토글
 `/utbreakout toggle_ema` - EMA50/RSI 청산 토글
 `/utbreakout toggle_extreme` - RSI 과열 제외 토글
@@ -13924,6 +14170,9 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
                     InlineKeyboardButton("RSI과열", callback_data="utb:toggle_extreme")
                 ],
                 [
+                    InlineKeyboardButton("진단 로그 다운로드", callback_data="utb:download")
+                ],
+                [
                     InlineKeyboardButton("새로고침", callback_data="utb:status")
                 ]
             ])
@@ -13950,6 +14199,24 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
                     )
                 else:
                     raise
+
+        async def _send_utbreakout_log_document(message):
+            if message is None:
+                return
+            path = UTBREAKOUT_DIAGNOSTIC_LOG_FILE
+            try:
+                if not os.path.exists(path) or os.path.getsize(path) <= 0:
+                    await message.reply_text("다운로드할 UT Breakout 진단 로그가 아직 없습니다.")
+                    return
+                with open(path, 'rb') as fp:
+                    await message.reply_document(
+                        document=fp,
+                        filename=os.path.basename(path),
+                        caption="UT Breakout 진단 로그입니다. 후보/거절/승인/진입차단 이벤트만 기록합니다."
+                    )
+            except Exception as e:
+                logger.error(f"UT breakout diagnostic log download failed: {e}")
+                await message.reply_text(f"진단 로그 다운로드 실패: {e}")
 
         def _current_utbreakout_cfg():
             raw = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
@@ -14079,6 +14346,9 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
                     not current
                 )
                 await u.message.reply_text(f"✅ RSI 과열 제외 옵션: {'ON' if not current else 'OFF'}")
+            elif action in {'log', 'logs', 'download'}:
+                await _send_utbreakout_log_document(u.message)
+                return
             elif action in {'status', 'menu', ''}:
                 pass
             else:
@@ -14178,6 +14448,10 @@ Set3 보수형: `UT 3,21` / `ADX>=25` / `Donchian30` / `SL 1.8ATR` / `TP 2R`
                 )
                 self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
                 await _edit_utbreakout_menu(query, f"✅ {label}: {'ON' if not current else 'OFF'}")
+                return
+
+            if action == 'download':
+                await _send_utbreakout_log_document(query.message)
                 return
 
             await _edit_utbreakout_menu(query)
