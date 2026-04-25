@@ -429,6 +429,9 @@ def build_default_utbot_filtered_breakout_config():
         'daily_profit_target_enabled': False,
         'daily_profit_target_usdt': 5.0,
         'opposite_signal_exit_enabled': False,
+        'opposite_set_exit_enabled': False,
+        'opposite_set_exit_min_hold_candles': 3,
+        'opposite_set_exit_min_pnl_usdt': 0.0,
         'ema_rsi_exit_enabled': False,
         'adx_donchian_exit_enabled': False
     }
@@ -1406,6 +1409,26 @@ class DBManager:
                     (limit,)
                 )
             return [float(row[0] or 0.0) for row in cur.fetchall()]
+
+    def get_latest_open_trade(self, symbol):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """SELECT symbol, side, entry_price, quantity, entry_time
+                FROM trades WHERE symbol=? AND exit_time IS NULL
+                ORDER BY id DESC LIMIT 1""",
+                (symbol,)
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                'symbol': row[0],
+                'side': row[1],
+                'entry_price': float(row[2] or 0.0),
+                'quantity': float(row[3] or 0.0),
+                'entry_time': row[4],
+            }
 
     def log_status_snapshot(self, snapshot_key, snapshot_text, keep_rows=200):
         with self.lock:
@@ -3842,9 +3865,11 @@ class SignalEngine(BaseEngine):
             'risk_per_trade_percent': 1.0,
             'max_risk_per_trade_usdt': 1.0,
             'daily_max_loss_usdt': 3.0,
-            'daily_profit_target_usdt': 5.0
+            'daily_profit_target_usdt': 5.0,
+            'opposite_set_exit_min_pnl_usdt': 0.0
         }.items():
-            _float(key, default, 0.0)
+            min_value = None if key == 'opposite_set_exit_min_pnl_usdt' else 0.0
+            _float(key, default, min_value)
 
         for key, default in {
             'utbot_atr_period': 14,
@@ -3856,9 +3881,11 @@ class SignalEngine(BaseEngine):
             'atr_length': 14,
             'donchian_length': 20,
             'max_daily_trades': 5,
-            'max_consecutive_losses': 3
+            'max_consecutive_losses': 3,
+            'opposite_set_exit_min_hold_candles': 3
         }.items():
-            _int(key, default, 1)
+            min_value = 0 if key == 'opposite_set_exit_min_hold_candles' else 1
+            _int(key, default, min_value)
 
         cfg['active_set_id'] = normalize_utbreakout_set_id(
             cfg.get('active_set_id') if raw_has_active_set_id else cfg.get('profile'),
@@ -3889,10 +3916,14 @@ class SignalEngine(BaseEngine):
             'exclude_rsi_extreme',
             'daily_profit_target_enabled',
             'opposite_signal_exit_enabled',
+            'opposite_set_exit_enabled',
             'ema_rsi_exit_enabled',
             'adx_donchian_exit_enabled'
         ):
             cfg[key] = bool(cfg.get(key, False))
+        # A-option (opposite UT signal only) is intentionally rejected for UT Breakout.
+        # Only the stricter opposite-set exit can be enabled from Telegram.
+        cfg['opposite_signal_exit_enabled'] = False
         if cfg['atr_max_percent'] < cfg['atr_min_percent']:
             cfg['atr_max_percent'] = cfg['atr_min_percent']
         return cfg
@@ -5847,6 +5878,14 @@ class SignalEngine(BaseEngine):
             entry_plan_detail = "진입 계획: ATR 기반 손절폭 계산 대기"
             take_profit_detail = "익절 계획: ATR 기반 손절폭 계산 대기"
 
+        opposite_set_exit_detail = (
+            f"반대Set청산: {'ON' if cfg.get('opposite_set_exit_enabled') else 'OFF'} | "
+            f"조건: 반대 UT 신규신호 + 선택 Set 조건 통과 + 최소 "
+            f"{int(float(cfg.get('opposite_set_exit_min_hold_candles', 3) or 0))}봉 보유 + "
+            f"PnL≥${float(cfg.get('opposite_set_exit_min_pnl_usdt', 0.0) or 0.0):.2f} | "
+            "동작: 현재 포지션 청산만, 반대 신규진입 없음"
+        )
+
         def _side_conditions(side):
             side_upper = side.upper()
             if candidate_side == side:
@@ -5961,6 +6000,7 @@ class SignalEngine(BaseEngine):
             f"선택 이유: {auto_reason or '수동 선택'}",
             entry_plan_detail,
             take_profit_detail,
+            opposite_set_exit_detail,
             f"AUTO 점수: {score_line}",
             "주의: AUTO/MTF 지표는 set 선택용이고, 실제 진입은 아래 선택 Set 조건만 봅니다.",
             f"최종: LONG {'가능' if long_ok else '대기'} / SHORT {'가능' if short_ok else '대기'}",
@@ -5972,6 +6012,179 @@ class SignalEngine(BaseEngine):
             f"UT 사유: {ut_reason}"
         ]
         return "\n".join(text_lines)
+
+    async def _evaluate_utbreakout_opposite_set_exit(self, symbol, df, fb_cfg, current_side, pos):
+        if not bool(fb_cfg.get('opposite_set_exit_enabled', False)):
+            return False, None
+
+        current_side = str(current_side or '').lower()
+        if current_side not in {'long', 'short'}:
+            return False, "Opposite set exit skipped: unknown current side"
+        opposite_side = 'short' if current_side == 'long' else 'long'
+
+        exit_sig, ut_exit_reason, _ = self._calculate_utbot_signal(
+            df,
+            self._get_utbot_filtered_breakout_ut_params(fb_cfg)
+        )
+        if exit_sig != opposite_side:
+            return False, f"Opposite set exit wait: no fresh UT {opposite_side.upper()} signal"
+
+        min_hold_candles = int(fb_cfg.get('opposite_set_exit_min_hold_candles', 3) or 0)
+        hold_candles = None
+        if min_hold_candles > 0:
+            open_trade = self.db.get_latest_open_trade(symbol)
+            entry_time_text = (open_trade or {}).get('entry_time')
+            if not entry_time_text:
+                return False, "Opposite set exit blocked: entry time unknown"
+            try:
+                entry_dt = datetime.fromisoformat(str(entry_time_text).replace('Z', '+00:00'))
+                if entry_dt.tzinfo is None:
+                    entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+                elapsed_ms = (datetime.now(timezone.utc) - entry_dt.astimezone(timezone.utc)).total_seconds() * 1000.0
+                candle_ms = self._timeframe_to_ms(fb_cfg.get('entry_timeframe', '15m'))
+                hold_candles = elapsed_ms / max(float(candle_ms), 1.0)
+            except Exception as exc:
+                return False, f"Opposite set exit blocked: entry time parse failed {exc}"
+            if hold_candles < min_hold_candles:
+                return False, f"Opposite set exit wait: hold {hold_candles:.1f}/{min_hold_candles} candles"
+
+        min_pnl_usdt = float(fb_cfg.get('opposite_set_exit_min_pnl_usdt', 0.0) or 0.0)
+        try:
+            current_pnl = float((pos or {}).get('unrealizedPnl', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            current_pnl = 0.0
+        if current_pnl < min_pnl_usdt:
+            return False, f"Opposite set exit wait: PnL {current_pnl:.2f} < min {min_pnl_usdt:.2f} USDT"
+
+        closed = df.iloc[:-1].copy().reset_index(drop=True)
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            closed[col] = pd.to_numeric(closed[col], errors='coerce')
+        closed = closed.dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+        if len(closed) < 30:
+            return False, f"Opposite set exit wait: data shortage {len(closed)}/30"
+
+        selected_set, auto_analysis, auto_reason = await self._resolve_utbreakout_selected_set(symbol, df, fb_cfg)
+        selected_filters = list(selected_set.get('entry_filters') or [])
+        if not selected_filters:
+            return False, f"Opposite set exit blocked: Set{selected_set.get('id')} has no confirmation filters"
+
+        metrics = self._calculate_utbreakout_timeframe_metrics(closed, fb_cfg)
+        ema_fast_len = int(fb_cfg.get('ema_fast', 50) or 50)
+        ema_slow_len = int(fb_cfg.get('ema_slow', 200) or 200)
+        htf_tf = str(fb_cfg.get('htf_timeframe', '1h') or '1h')
+        htf_ready = False
+        htf_error = None
+        htf_close = htf_ema_fast = htf_ema_slow = htf_gap_pct = np.nan
+        htf_supertrend_direction = None
+        htf_supertrend_reason = None
+        try:
+            htf_ohlcv = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, htf_tf, limit=300)
+            htf_df = pd.DataFrame(htf_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                htf_df[col] = pd.to_numeric(htf_df[col], errors='coerce')
+            htf_closed = htf_df.iloc[:-1].dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+            if len(htf_closed) >= ema_slow_len + 2:
+                htf_close_series = htf_closed['close'].astype(float)
+                htf_ema_fast = float(htf_close_series.ewm(span=ema_fast_len, adjust=False).mean().iloc[-1])
+                htf_ema_slow = float(htf_close_series.ewm(span=ema_slow_len, adjust=False).mean().iloc[-1])
+                htf_close = float(htf_close_series.iloc[-1])
+                htf_gap_pct = abs(htf_ema_fast - htf_ema_slow) / max(abs(htf_close), 1e-9) * 100.0
+                htf_ready = True
+            else:
+                htf_error = f"HTF data shortage {len(htf_closed)}/{ema_slow_len + 2}"
+            htf_supertrend_direction, _, htf_supertrend_reason = self._calculate_utbot_filter_pack_supertrend_direction(
+                htf_closed,
+                length=10,
+                multiplier=3.0
+            )
+        except Exception as exc:
+            htf_error = str(exc)
+
+        entry_price = float(metrics.get('close') or closed['close'].astype(float).iloc[-1])
+        filter_values = {
+            'entry_price': entry_price,
+            'open': metrics.get('open'),
+            'rsi': metrics.get('rsi'),
+            'macd_hist': metrics.get('macd_hist'),
+            'macd_hist_prev': metrics.get('macd_hist_prev'),
+            'roc_pct': metrics.get('roc_pct'),
+            'cci': metrics.get('cci'),
+            'stoch_k': metrics.get('stoch_k'),
+            'stoch_d': metrics.get('stoch_d'),
+            'adx': metrics.get('adx'),
+            'plus_di': metrics.get('plus_di'),
+            'minus_di': metrics.get('minus_di'),
+            'adx_reason': metrics.get('adx_reason'),
+            'atr_pct': metrics.get('atr_pct'),
+            'ema50': metrics.get('ema_fast'),
+            'ema50_prev': metrics.get('ema_fast_prev'),
+            'ema200': metrics.get('ema_slow'),
+            'donchian_high_prev': metrics.get('donchian_high_prev'),
+            'donchian_low_prev': metrics.get('donchian_low_prev'),
+            'donchian_width_pct': metrics.get('donchian_width_pct'),
+            'bb_upper': metrics.get('bb_upper'),
+            'bb_lower': metrics.get('bb_lower'),
+            'bb_mid': metrics.get('bb_mid'),
+            'bb_width_pct': metrics.get('bb_width_pct'),
+            'bb_width_prev_pct': metrics.get('bb_width_prev_pct'),
+            'bb_width_min_pct': metrics.get('bb_width_min_pct'),
+            'keltner_upper': metrics.get('keltner_upper'),
+            'keltner_lower': metrics.get('keltner_lower'),
+            'keltner_mid': metrics.get('keltner_mid'),
+            'keltner_width_pct': metrics.get('keltner_width_pct'),
+            'keltner_width_prev_pct': metrics.get('keltner_width_prev_pct'),
+            'range_expansion_ratio': metrics.get('range_expansion_ratio'),
+            'range_compression_ratio': metrics.get('range_compression_ratio'),
+            'vwap': metrics.get('vwap'),
+            'vwap_slope': metrics.get('vwap_slope'),
+            'vwap_reason': metrics.get('vwap_reason'),
+            'volume_ratio': metrics.get('volume_ratio'),
+            'obv_slope_ratio': metrics.get('obv_slope_ratio'),
+            'mfi': metrics.get('mfi'),
+            'psar_direction': metrics.get('psar_direction'),
+            'psar': metrics.get('psar'),
+            'psar_reason': metrics.get('psar_reason'),
+            'ichimoku_bias': metrics.get('ichimoku_bias'),
+            'ichimoku_top': metrics.get('ichimoku_top'),
+            'ichimoku_bottom': metrics.get('ichimoku_bottom'),
+            'session_hour_kst': metrics.get('session_hour_kst'),
+            'auto_scores': (auto_analysis or {}).get('scores') if isinstance(auto_analysis, dict) else {},
+            'mtf_metrics': (auto_analysis or {}).get('timeframes') if isinstance(auto_analysis, dict) else {},
+            'chop': metrics.get('chop'),
+            'chop_reason': metrics.get('chop_reason'),
+            'vortex_plus': metrics.get('vortex_plus'),
+            'vortex_minus': metrics.get('vortex_minus'),
+            'vortex_reason': metrics.get('vortex_reason'),
+            'aroon_up': metrics.get('aroon_up'),
+            'aroon_down': metrics.get('aroon_down'),
+            'aroon_reason': metrics.get('aroon_reason'),
+            'htf_ready': htf_ready,
+            'htf_error': htf_error,
+            'htf_close': htf_close,
+            'htf_ema_fast': htf_ema_fast,
+            'htf_ema_slow': htf_ema_slow,
+            'htf_gap_pct': htf_gap_pct,
+            'htf_supertrend_direction': htf_supertrend_direction,
+            'htf_supertrend_reason': htf_supertrend_reason,
+        }
+        filter_items = self._evaluate_utbreakout_set_filter_items(opposite_side, selected_set, fb_cfg, filter_values)
+        failed_items = [item for item in filter_items if item.get('state') is not True]
+        if failed_items:
+            first = failed_items[0]
+            return False, (
+                f"Opposite set exit wait: Set{selected_set.get('id')} {first.get('name')} "
+                f"{first.get('detail')}"
+            )
+
+        hold_text = f"{hold_candles:.1f}/{min_hold_candles}" if hold_candles is not None else f"0/{min_hold_candles}"
+        reason = (
+            f"OppositeSetExit {current_side.upper()} -> flat: fresh UT {opposite_side.upper()} "
+            f"({ut_exit_reason}) + Set{selected_set.get('id')} {selected_set.get('name')} PASS "
+            f"| hold {hold_text} candles | PnL {current_pnl:.2f} >= {min_pnl_usdt:.2f} USDT"
+        )
+        if auto_reason:
+            reason += f" | AUTO {auto_reason}"
+        return True, reason
 
     def _calculate_smc_structure_scope(self, closed, size, scope_name):
         result = {
@@ -10988,6 +11201,20 @@ class SignalEngine(BaseEngine):
                         raw_exit_short = True
                         exit_reason_parts.append(f"UT opposite BUY ({ut_exit_reason})")
 
+                opposite_set_exit, opposite_set_reason = await self._evaluate_utbreakout_opposite_set_exit(
+                    symbol,
+                    df,
+                    fb_cfg,
+                    current_side,
+                    pos
+                )
+                if opposite_set_exit:
+                    if current_side.lower() == 'long':
+                        raw_exit_long = True
+                    elif current_side.lower() == 'short':
+                        raw_exit_short = True
+                    exit_reason_parts.append(opposite_set_reason)
+
                 if bool(fb_cfg.get('ema_rsi_exit_enabled', False)) and len(closed) >= int(fb_cfg['ema_fast']) + int(fb_cfg['rsi_length']) + 2:
                     close_series = closed['close'].astype(float)
                     curr_close = float(close_series.iloc[-1])
@@ -15908,7 +16135,8 @@ UT: `K={float(cfg.get('utbot_key_value', 2.5) or 2.5):.2f}` / `ATR={int(cfg.get(
 선택 Set 조건: `{', '.join(set_info.get('entry_filters') or ['UT only'])}`
 리스크: `SL {float(cfg.get('stop_atr_multiplier', 1.5) or 1.5):.1f}ATR` | `TP {float(cfg.get('take_profit_r_multiple', 2.0) or 2.0):.1f}R` | `1회 최대손실 ${float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0):.2f}`
 손실한도: `1회 min(잔고 x {float(cfg.get('risk_per_trade_percent', 1.0) or 1.0):.2f}%, ${float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0):.2f})` | `일손실 ${float(cfg.get('daily_max_loss_usdt', 3.0) or 3.0):.2f}`
-옵션: 반대신호청산 `{'ON' if cfg.get('opposite_signal_exit_enabled') else 'OFF'}` | EMA/RSI청산 `{'ON' if cfg.get('ema_rsi_exit_enabled') else 'OFF'}` | RSI과열제외 `{'ON' if cfg.get('exclude_rsi_extreme') else 'OFF'}`
+옵션: 반대Set청산 `{'ON' if cfg.get('opposite_set_exit_enabled') else 'OFF'}` (`{int(float(cfg.get('opposite_set_exit_min_hold_candles', 3) or 0))}봉`, PnL≥`${float(cfg.get('opposite_set_exit_min_pnl_usdt', 0.0) or 0.0):.2f}`) | 청산 후 반대진입 `없음`
+보조청산: EMA/RSI `{'ON' if cfg.get('ema_rsi_exit_enabled') else 'OFF'}` | RSI과열제외 `{'ON' if cfg.get('exclude_rsi_extreme') else 'OFF'}`
 
 AUTO 최근 선택 이유:
 `{auto_reason}`
@@ -15938,7 +16166,9 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 `/utbreakout status` - 롱/숏 조건 신호등
 `/utbreakout menu` - 이 메뉴 다시 보기
 `/utbreakout log` - 진단 로그 파일 다운로드
-`/utbreakout toggle_opposite` - 반대 UT 신호 청산 토글
+`/utbreakout toggle_opposite_set` - 반대 UT + 반대 Set 조건 청산 토글
+`/utbreakout opphold 3` - 반대Set청산 최소 보유 3캔들
+`/utbreakout opppnl 0` - 반대Set청산 최소 미실현손익 0 USDT
 `/utbreakout toggle_ema` - EMA50/RSI 청산 토글
 `/utbreakout toggle_extreme` - RSI 과열 제외 토글
 """.strip()
@@ -15998,7 +16228,13 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                     InlineKeyboardButton("일손실 $100", callback_data="utb:dailyloss:100")
                 ],
                 [
-                    InlineKeyboardButton("반대청산", callback_data="utb:toggle_opposite"),
+                    InlineKeyboardButton("반대Set청산", callback_data="utb:toggle_opposite_set"),
+                    InlineKeyboardButton("보유0봉", callback_data="utb:opphold:0"),
+                    InlineKeyboardButton("보유3봉", callback_data="utb:opphold:3")
+                ],
+                [
+                    InlineKeyboardButton("Set청산 PnL $0", callback_data="utb:opppnl:0"),
+                    InlineKeyboardButton("Set청산 PnL -$25", callback_data="utb:opppnl:-25"),
                     InlineKeyboardButton("EMA청산", callback_data="utb:toggle_ema"),
                     InlineKeyboardButton("RSI과열", callback_data="utb:toggle_extreme")
                 ],
@@ -16158,6 +16394,9 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 'daily_profit_target_enabled',
                 'daily_profit_target_usdt',
                 'opposite_signal_exit_enabled',
+                'opposite_set_exit_enabled',
+                'opposite_set_exit_min_hold_candles',
+                'opposite_set_exit_min_pnl_usdt',
                 'ema_rsi_exit_enabled',
                 'adx_donchian_exit_enabled',
                 'exclude_rsi_extreme'
@@ -16183,6 +16422,19 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                     raise ValueError(f"{label} 값은 숫자로 입력하세요.")
                 if value <= minimum:
                     raise ValueError(f"{label} 값은 {minimum}보다 커야 합니다.")
+                if maximum is not None and value > maximum:
+                    raise ValueError(f"{label} 값은 {maximum} 이하로 입력하세요.")
+                return value
+
+            def _parse_float_arg(label, minimum=None, maximum=None):
+                if len(args) < 2:
+                    raise ValueError(f"{label} 값을 입력하세요.")
+                try:
+                    value = float(str(args[1]).replace('$', '').replace(',', '').strip())
+                except (TypeError, ValueError):
+                    raise ValueError(f"{label} 값은 숫자로 입력하세요.")
+                if minimum is not None and value < minimum:
+                    raise ValueError(f"{label} 값은 {minimum} 이상이어야 합니다.")
                 if maximum is not None and value > maximum:
                     raise ValueError(f"{label} 값은 {maximum} 이하로 입력하세요.")
                 return value
@@ -16270,14 +16522,57 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 )
                 self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
                 await u.message.reply_text(f"✅ 하루 최대 손실 설정: ${value:.2f}")
-            elif action in {'toggle_opposite', 'opposite'}:
+            elif action in {'toggle_opposite_set', 'opposite_set', 'setexit', 'set_exit'}:
                 raw = _current_utbreakout_cfg()
-                current = bool(raw.get('opposite_signal_exit_enabled', False))
+                current = bool(raw.get('opposite_set_exit_enabled', False))
                 await self.cfg.update_value(
-                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'opposite_signal_exit_enabled'],
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'opposite_set_exit_enabled'],
                     not current
                 )
-                await u.message.reply_text(f"✅ 반대 UT 신호 청산: {'ON' if not current else 'OFF'}")
+                if not current:
+                    await self.cfg.update_value(
+                        ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'opposite_signal_exit_enabled'],
+                        False
+                    )
+                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
+                await u.message.reply_text(
+                    f"✅ 반대Set청산: {'ON' if not current else 'OFF'}\n"
+                    "조건: 반대 UT 신규신호 + 반대 방향 선택 Set 조건 통과 + 최소 보유/PNL 조건. 청산만 하고 반대진입은 하지 않습니다."
+                )
+            elif action in {'opphold', 'opposite_hold', 'sethold', 'set_hold'}:
+                try:
+                    raw_value = _parse_float_arg('반대Set청산 최소 보유 캔들', minimum=0.0, maximum=1000.0)
+                    if raw_value != int(raw_value):
+                        raise ValueError("반대Set청산 최소 보유 캔들은 정수로 입력하세요.")
+                    value = int(raw_value)
+                except ValueError as e:
+                    await u.message.reply_text(f"❌ {e}\n예: `/utbreakout opphold 3`", parse_mode=ParseMode.MARKDOWN)
+                    return
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'opposite_set_exit_min_hold_candles'],
+                    value
+                )
+                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
+                await u.message.reply_text(f"✅ 반대Set청산 최소 보유: {value}캔들")
+            elif action in {'opppnl', 'opposite_pnl', 'setpnl', 'set_pnl'}:
+                try:
+                    value = _parse_float_arg('반대Set청산 최소 미실현손익 USDT', minimum=-1000000.0, maximum=1000000.0)
+                except ValueError as e:
+                    await u.message.reply_text(f"❌ {e}\n예: `/utbreakout opppnl 0` 또는 `/utbreakout opppnl -25`", parse_mode=ParseMode.MARKDOWN)
+                    return
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'opposite_set_exit_min_pnl_usdt'],
+                    value
+                )
+                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
+                await u.message.reply_text(f"✅ 반대Set청산 최소 PnL: ${value:.2f}")
+            elif action in {'toggle_opposite', 'opposite'}:
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'opposite_signal_exit_enabled'],
+                    False
+                )
+                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
+                await u.message.reply_text("✅ 단순 반대UT청산(A)은 기각 옵션이라 OFF로 유지합니다. 반대Set청산(B)은 `/utbreakout toggle_opposite_set`으로 켜세요.", parse_mode=ParseMode.MARKDOWN)
             elif action in {'toggle_ema', 'ema'}:
                 raw = _current_utbreakout_cfg()
                 current = bool(raw.get('ema_rsi_exit_enabled', False))
@@ -16436,9 +16731,44 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 await _edit_utbreakout_menu(query, notice)
                 return
 
-            if action in {'toggle_opposite', 'toggle_ema', 'toggle_extreme'}:
+            if action in {'opphold', 'opppnl'}:
+                try:
+                    numeric_value = float(str(value or '').replace('$', '').replace(',', '').strip())
+                except (TypeError, ValueError):
+                    await _edit_utbreakout_menu(query, "❌ 버튼 값 처리 실패")
+                    return
+                if action == 'opphold':
+                    if numeric_value < 0 or numeric_value != int(numeric_value):
+                        await _edit_utbreakout_menu(query, "❌ 최소 보유 캔들은 0 이상의 정수여야 합니다.")
+                        return
+                    hold_value = int(numeric_value)
+                    await self.cfg.update_value(
+                        ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'opposite_set_exit_min_hold_candles'],
+                        hold_value
+                    )
+                    notice = f"✅ 반대Set청산 최소 보유: {hold_value}캔들"
+                else:
+                    await self.cfg.update_value(
+                        ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'opposite_set_exit_min_pnl_usdt'],
+                        numeric_value
+                    )
+                    notice = f"✅ 반대Set청산 최소 PnL: ${numeric_value:.2f}"
+                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
+                await _edit_utbreakout_menu(query, notice)
+                return
+
+            if action == 'toggle_opposite':
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'opposite_signal_exit_enabled'],
+                    False
+                )
+                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
+                await _edit_utbreakout_menu(query, "✅ 단순 반대UT청산(A)은 기각 옵션이라 OFF로 유지합니다.")
+                return
+
+            if action in {'toggle_opposite_set', 'toggle_ema', 'toggle_extreme'}:
                 key_map = {
-                    'toggle_opposite': ('opposite_signal_exit_enabled', '반대 UT 신호 청산'),
+                    'toggle_opposite_set': ('opposite_set_exit_enabled', '반대Set청산'),
                     'toggle_ema': ('ema_rsi_exit_enabled', 'EMA50/RSI 청산'),
                     'toggle_extreme': ('exclude_rsi_extreme', 'RSI 과열 제외 옵션')
                 }
@@ -16448,6 +16778,11 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                     ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', key],
                     not current
                 )
+                if action == 'toggle_opposite_set' and not current:
+                    await self.cfg.update_value(
+                        ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'opposite_signal_exit_enabled'],
+                        False
+                    )
                 self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
                 await _edit_utbreakout_menu(query, f"✅ {label}: {'ON' if not current else 'OFF'}")
                 return
