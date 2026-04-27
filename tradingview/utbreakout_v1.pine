@@ -1,0 +1,97 @@
+//@version=6
+strategy("UTBOT_FILTERED_BREAKOUT_V1 Research Parity", overlay=true, process_orders_on_close=true, calc_on_every_tick=false, commission_type=strategy.commission.percent, commission_value=0.04, slippage=1)
+
+utKey = input.float(2.5, "UT Bot key", minval=0.1, step=0.1)
+utAtrLen = input.int(14, "UT Bot ATR", minval=1)
+useBiasState = input.bool(true, "Use UT bias state, not only fresh signal")
+useHa = input.bool(false, "Heikin Ashi source")
+useAtrGuard = input.bool(true, "Filter: ATR% guard")
+useHtfTrend = input.bool(false, "Filter: HTF EMA50/200 trend")
+useRsi50 = input.bool(false, "Filter: RSI 50 momentum")
+useAdx = input.bool(false, "Filter: ADX trend strength")
+useDonchian = input.bool(false, "Filter: Donchian breakout")
+useEmaDistance = input.bool(false, "Filter: 15m EMA200 noise distance")
+entryTfNote = input.string("15m", "Bot entry TF note")
+htf = input.timeframe("60", "HTF trend timeframe")
+
+atrMinPct = input.float(0.12, "ATR% min", step=0.01)
+atrMaxPct = input.float(1.20, "ATR% max", step=0.01)
+adxThreshold = input.float(22.0, "ADX threshold", step=0.5)
+donLen = input.int(20, "Donchian length", minval=2)
+emaNearPct = input.float(0.20, "EMA200 min distance %", step=0.01)
+stopAtrMult = input.float(1.5, "SL ATR multiple", minval=0.1, step=0.1)
+rrMultiple = input.float(2.0, "TP R multiple", minval=1.0, step=0.1)
+
+src = useHa ? request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, close, lookahead=barmerge.lookahead_off) : close
+atr = ta.atr(utAtrLen)
+nLoss = atr * utKey
+var float trail = na
+prevTrail = nz(trail[1], src - nLoss)
+trail := src > prevTrail and src[1] > prevTrail ? math.max(prevTrail, src - nLoss) : src < prevTrail and src[1] < prevTrail ? math.min(prevTrail, src + nLoss) : src > prevTrail ? src - nLoss : src + nLoss
+
+freshBuy = src > trail and src[1] <= nz(trail[1])
+freshSell = src < trail and src[1] >= nz(trail[1])
+utBias = src > trail ? 1 : src < trail ? -1 : 0
+candidateLong = useBiasState ? utBias == 1 : freshBuy
+candidateShort = useBiasState ? utBias == -1 : freshSell
+
+ema200 = ta.ema(close, 200)
+rsi = ta.rsi(close, 14)
+[plusDi, minusDi, adx] = ta.dmi(14, 14)
+atrPct = ta.atr(14) / close * 100.0
+donHighPrev = ta.highest(high[1], donLen)
+donLowPrev = ta.lowest(low[1], donLen)
+emaDistPct = math.abs(close - ema200) / close * 100.0
+
+htfClose = request.security(syminfo.tickerid, htf, close, lookahead=barmerge.lookahead_off)
+htfEma50 = request.security(syminfo.tickerid, htf, ta.ema(close, 50), lookahead=barmerge.lookahead_off)
+htfEma200 = request.security(syminfo.tickerid, htf, ta.ema(close, 200), lookahead=barmerge.lookahead_off)
+
+atrOk = not useAtrGuard or (atrPct >= atrMinPct and atrPct <= atrMaxPct)
+htfLongOk = not useHtfTrend or (htfClose > htfEma200 and htfEma50 > htfEma200)
+htfShortOk = not useHtfTrend or (htfClose < htfEma200 and htfEma50 < htfEma200)
+rsiLongOk = not useRsi50 or rsi > 50
+rsiShortOk = not useRsi50 or rsi < 50
+adxOk = not useAdx or adx >= adxThreshold
+donLongOk = not useDonchian or close > donHighPrev
+donShortOk = not useDonchian or close < donLowPrev
+emaDistOk = not useEmaDistance or emaDistPct >= emaNearPct
+
+longOk = barstate.isconfirmed and candidateLong and atrOk and htfLongOk and rsiLongOk and adxOk and donLongOk and emaDistOk
+shortOk = barstate.isconfirmed and candidateShort and atrOk and htfShortOk and rsiShortOk and adxOk and donShortOk and emaDistOk
+
+longRisk = math.max(stopAtrMult * ta.atr(14), math.abs(close - trail))
+shortRisk = longRisk
+
+if longOk and strategy.position_size <= 0
+    strategy.entry("L", strategy.long)
+    strategy.exit("XL", "L", stop=close - longRisk, limit=close + rrMultiple * longRisk)
+
+if shortOk and strategy.position_size >= 0
+    strategy.entry("S", strategy.short)
+    strategy.exit("XS", "S", stop=close + shortRisk, limit=close - rrMultiple * shortRisk)
+
+plot(trail, "UT trailing stop", color=utBias == 1 ? color.green : color.red, linewidth=2)
+plot(donHighPrev, "Prev Donchian high", color=color.new(color.green, 70))
+plot(donLowPrev, "Prev Donchian low", color=color.new(color.red, 70))
+plotshape(freshBuy, title="Fresh UT Buy", style=shape.triangleup, color=color.green, location=location.belowbar, size=size.tiny)
+plotshape(freshSell, title="Fresh UT Sell", style=shape.triangledown, color=color.red, location=location.abovebar, size=size.tiny)
+
+var table status = table.new(position.top_right, 2, 8)
+if barstate.islast
+    table.cell(status, 0, 0, "Entry TF note")
+    table.cell(status, 1, 0, entryTfNote)
+    table.cell(status, 0, 1, "UT bias")
+    table.cell(status, 1, 1, utBias == 1 ? "LONG" : utBias == -1 ? "SHORT" : "NONE")
+    table.cell(status, 0, 2, "ATR%")
+    table.cell(status, 1, 2, str.tostring(atrPct, "#.###"))
+    table.cell(status, 0, 3, "ADX")
+    table.cell(status, 1, 3, str.tostring(adx, "#.##"))
+    table.cell(status, 0, 4, "RSI")
+    table.cell(status, 1, 4, str.tostring(rsi, "#.##"))
+    table.cell(status, 0, 5, "Don high prev")
+    table.cell(status, 1, 5, str.tostring(donHighPrev, "#.####"))
+    table.cell(status, 0, 6, "Don low prev")
+    table.cell(status, 1, 6, str.tostring(donLowPrev, "#.####"))
+    table.cell(status, 0, 7, "No repaint")
+    table.cell(status, 1, 7, "confirmed bars")

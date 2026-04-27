@@ -8,6 +8,7 @@
 
 import logging
 from logging.handlers import RotatingFileHandler
+import io
 import threading
 import sqlite3
 import os
@@ -43,6 +44,9 @@ from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, 
     MessageHandler, filters, ConversationHandler, CallbackQueryHandler
 )
+from utbreakout.indicators import previous_donchian
+from utbreakout.research import format_research_summary
+from utbreakout.risk import calculate_risk_plan
 
 # ---------------------------------------------------------
 # 0. 濡쒓퉭 諛??좏떥由ы떚
@@ -182,6 +186,21 @@ def format_utbreakout_diagnostic_summary():
         f"{last.get('code') or last.get('event') or 'UNKNOWN'}"
     )
     return "\n".join(lines)
+
+
+def format_utbreakout_research_summary(protection_status=None, days=7):
+    events = read_utbreakout_diagnostic_events(days=days)
+    if not events:
+        return (
+            "UT Breakout Research Summary\n"
+            f"Window: last {int(days or 7)} days\n"
+            "No diagnostic events yet. 다음 15분 판단봉 이후 다시 확인하세요."
+        )
+    return format_research_summary(
+        events,
+        protection_status=protection_status or {},
+        days=days
+    )
 CORE_ENGINE = 'signal'
 UTBOT_FILTERED_BREAKOUT_STRATEGY = 'utbot_filtered_breakout_v1'
 UT_ONLY_STRATEGIES = {'utbot', 'utrsibb', 'utrsi', 'utbb', 'utsmc'}
@@ -2314,6 +2333,7 @@ class SignalEngine(BaseEngine):
         self.last_utbot_filtered_breakout_status = {}  # symbol -> filtered breakout diagnostics
         self.utbot_filtered_breakout_entry_plans = {}  # symbol -> accepted risk plan
         self.utbot_filtered_breakout_failures = {}  # symbol -> side -> recent failed candidate timestamps
+        self.utbreakout_futures_context_cache = {}  # symbol -> cached funding/OI context for research logs
         self.last_protection_order_status = {}  # symbol -> exchange-side TP/SL audit status
         self.last_protection_alert_ts = {}  # symbol:kind -> last Telegram alert timestamp
         self.last_entry_reason = {}        # symbol -> latest entry decision reason
@@ -2357,6 +2377,7 @@ class SignalEngine(BaseEngine):
         self.last_utbot_filtered_breakout_status = {}
         self.utbot_filtered_breakout_entry_plans = {}
         self.utbot_filtered_breakout_failures = {}
+        self.utbreakout_futures_context_cache = {}
         self.last_protection_order_status = {}
         self.last_protection_alert_ts = {}
         self.last_entry_reason = {}
@@ -4117,13 +4138,16 @@ class SignalEngine(BaseEngine):
         don_low_prev = np.nan
         don_width_pct = np.nan
         don_ready = False
-        if len(local) >= don_len + 1:
-            don_window = local.iloc[-don_len - 1:-1]
-            if len(don_window) >= don_len:
-                don_high_prev = float(don_window['high'].astype(float).max())
-                don_low_prev = float(don_window['low'].astype(float).min())
-                don_width_pct = (don_high_prev - don_low_prev) / max(abs(curr_close), 1e-9) * 100.0
-                don_ready = True
+        donchian_prev = previous_donchian(
+            high.astype(float).tolist(),
+            low.astype(float).tolist(),
+            don_len
+        )
+        if donchian_prev.get('ready'):
+            don_high_prev = float(donchian_prev['high'])
+            don_low_prev = float(donchian_prev['low'])
+            don_width_pct = (don_high_prev - don_low_prev) / max(abs(curr_close), 1e-9) * 100.0
+            don_ready = True
 
         vol_ma = volume.rolling(20).mean().iloc[-1] if len(volume) >= 20 else np.nan
         volume_ratio = float(volume.iloc[-1] / vol_ma) if self._is_valid_number(vol_ma) and float(vol_ma) > 0 else np.nan
@@ -4553,7 +4577,8 @@ class SignalEngine(BaseEngine):
         }
 
     def _select_utbreakout_auto_set(self, analysis, cfg):
-        scores = dict((analysis or {}).get('scores') or {})
+        raw_scores = (analysis or {}).get('scores') if isinstance(analysis, dict) else None
+        scores = dict(raw_scores or {})
         trend = float(scores.get('trend_score', 0.0) or 0.0)
         chop = float(scores.get('chop_score', 0.0) or 0.0)
         volatility = float(scores.get('volatility_score', 0.0) or 0.0)
@@ -4649,8 +4674,24 @@ class SignalEngine(BaseEngine):
         selected_id, selected_score = max(candidate_scores.items(), key=lambda item: item[1])
         top3 = sorted(candidate_scores.items(), key=lambda item: item[1], reverse=True)[:3]
         top3_text = ", ".join(f"Set{set_id}:{score:.1f}" for set_id, score in top3)
+        second_score = top3[1][1] if len(top3) > 1 else 0.0
+        score_margin = selected_score - second_score
+        if isinstance(raw_scores, dict):
+            raw_scores['auto_candidate_scores'] = {
+                f"Set{set_id}": round(float(score), 2)
+                for set_id, score in sorted(candidate_scores.items())
+            }
+            raw_scores['auto_top3'] = [
+                {'set_id': int(set_id), 'score': round(float(score), 2)}
+                for set_id, score in top3
+            ]
+            raw_scores['auto_selected_score'] = round(float(selected_score), 2)
+            raw_scores['auto_score_margin'] = round(float(score_margin), 2)
+            raw_scores['auto_confidence'] = 'weak' if selected_score < 50.0 or score_margin < 3.0 else 'normal'
         if selected_score < 50.0:
             selected_id = 2 if volatility < 45.0 else 49 if fallback >= 55.0 else 1
+            if isinstance(raw_scores, dict):
+                raw_scores['auto_fallback_set_id'] = int(selected_id)
             reason = (
                 f"점수 우위 약함 -> Set{selected_id} fallback "
                 f"(trend {trend:.1f}, chop {chop:.1f}, vol {volatility:.1f}, momentum {momentum:.1f}, top {top3_text})"
@@ -4663,6 +4704,8 @@ class SignalEngine(BaseEngine):
                 f"-> Set{selected_id} score {selected_score:.1f} "
                 f"(top {top3_text})"
             )
+        if isinstance(raw_scores, dict):
+            raw_scores['auto_final_set_id'] = int(selected_id)
         return selected_id, reason
 
     async def _resolve_utbreakout_selected_set(self, symbol, df, cfg):
@@ -5230,6 +5273,8 @@ class SignalEngine(BaseEngine):
                     event = 'rejected'
                 else:
                     event = 'candidate'
+            auto_scores = status.get('auto_scores') if isinstance(status.get('auto_scores'), dict) else {}
+            protection_status = self.last_protection_order_status.get(symbol)
 
             payload = {
                 'ts': datetime.now(timezone.utc).isoformat(),
@@ -5244,8 +5289,12 @@ class SignalEngine(BaseEngine):
                 'selection_mode': status.get('selection_mode'),
                 'auto_selected_set_id': status.get('auto_selected_set_id'),
                 'auto_selected_set_name': status.get('auto_selected_set_name'),
+                'auto_selected_set_family': status.get('auto_selected_set_family'),
                 'auto_selection_reason': status.get('auto_selection_reason'),
                 'auto_scores': status.get('auto_scores'),
+                'auto_top3': auto_scores.get('auto_top3'),
+                'auto_score_margin': _safe_float_or_none(auto_scores.get('auto_score_margin')),
+                'auto_confidence': auto_scores.get('auto_confidence'),
                 'set_filters': status.get('set_filters'),
                 'entry_timeframe': status.get('entry_timeframe'),
                 'htf_timeframe': status.get('htf_timeframe'),
@@ -5263,7 +5312,12 @@ class SignalEngine(BaseEngine):
                 'donchian_low_prev': _safe_float_or_none(status.get('donchian_low_prev')),
                 'htf_summary': status.get('htf_summary'),
                 'metric_summary': status.get('metric_summary'),
-                'risk_summary': status.get('risk_summary')
+                'risk_summary': status.get('risk_summary'),
+                'funding_rate': _safe_float_or_none(status.get('funding_rate')),
+                'next_funding_time': status.get('next_funding_time'),
+                'open_interest': _safe_float_or_none(status.get('open_interest')),
+                'mark_price': _safe_float_or_none(status.get('mark_price')),
+                'protection_status': protection_status
             }
             plan = status.get('entry_plan')
             if isinstance(plan, dict):
@@ -5272,9 +5326,15 @@ class SignalEngine(BaseEngine):
                 payload.update({
                     'risk_usdt': _safe_float_or_none(plan.get('risk_usdt')),
                     'risk_distance': _safe_float_or_none(plan.get('risk_distance')),
+                    'risk_distance_pct': _safe_float_or_none(plan.get('risk_distance_pct')),
                     'stop_loss': _safe_float_or_none(plan.get('stop_loss')),
                     'take_profit': _safe_float_or_none(plan.get('take_profit')),
+                    'take_profit_pct': _safe_float_or_none(plan.get('take_profit_pct')),
                     'planned_qty': _safe_float_or_none(plan.get('qty')),
+                    'planned_notional': _safe_float_or_none(plan.get('planned_notional')),
+                    'planned_margin': _safe_float_or_none(plan.get('planned_margin')),
+                    'expected_profit_usdt': _safe_float_or_none(plan.get('expected_profit_usdt')),
+                    'leverage': _safe_float_or_none(plan.get('leverage')),
                     'rr_multiple': _safe_float_or_none(plan.get('rr_multiple'))
                 })
             if isinstance(extra, dict):
@@ -5345,6 +5405,7 @@ class SignalEngine(BaseEngine):
             'auto_select_enabled': bool(cfg.get('auto_select_enabled', False)),
             'auto_selected_set_id': selected_set.get('id'),
             'auto_selected_set_name': selected_set.get('name'),
+            'auto_selected_set_family': selected_set.get('family'),
             'auto_selected_set_status': selected_set.get('status'),
             'auto_selection_reason': auto_reason,
             'auto_scores': (auto_analysis or {}).get('scores') if isinstance(auto_analysis, dict) else None,
@@ -5509,14 +5570,18 @@ class SignalEngine(BaseEngine):
         vortex_plus, vortex_minus, vortex_reason = self._calculate_utbreakout_vortex(closed, 14)
         aroon_up, aroon_down, aroon_reason = self._calculate_utbreakout_aroon(closed, 25)
         donchian_len = int(cfg['donchian_length'])
-        don_window = closed.iloc[-donchian_len - 1:-1]
-        if len(don_window) < donchian_len:
+        donchian_prev = previous_donchian(
+            closed['high'].astype(float).tolist(),
+            closed['low'].astype(float).tolist(),
+            donchian_len
+        )
+        if not donchian_prev.get('ready'):
             don_high_prev = np.nan
             don_low_prev = np.nan
             don_width_pct = np.nan
         else:
-            don_high_prev = float(don_window['high'].astype(float).max())
-            don_low_prev = float(don_window['low'].astype(float).min())
+            don_high_prev = float(donchian_prev['high'])
+            don_low_prev = float(donchian_prev['low'])
             don_width_pct = (don_high_prev - don_low_prev) / max(abs(entry_price), 1e-9) * 100.0
         ema_near_pct = abs(entry_price - float(ema200)) / max(abs(entry_price), 1e-9) * 100.0 if self._is_valid_number(ema200) else np.nan
         entry_metrics = self._calculate_utbreakout_timeframe_metrics(closed, cfg)
@@ -5552,6 +5617,12 @@ class SignalEngine(BaseEngine):
                 f"EMA200 dist={ema_near_pct:.3f}%, Donchian width={don_width_pct:.3f}%"
             )
         })
+        try:
+            futures_context = await self._fetch_utbreakout_futures_context(symbol)
+            if futures_context:
+                status.update(futures_context)
+        except Exception as e:
+            status['futures_context_error'] = str(e)
 
         filter_values = {
             'entry_price': entry_price,
@@ -5636,47 +5707,38 @@ class SignalEngine(BaseEngine):
         if not self._is_valid_number(atr_value) or float(atr_value) <= 0:
             return _finish(None, "REJECTED_ATR_TOO_LOW: ATR risk distance calculation pending", 'REJECTED_ATR_TOO_LOW', record_failure=True, side=side)
 
-        ut_stop = ut_detail.get('curr_stop')
-        stop_anchor_distance = abs(entry_price - float(ut_stop)) if self._is_valid_number(ut_stop) else 0.0
-        risk_distance = max(float(cfg.get('stop_atr_multiplier', 1.5) or 1.5) * float(atr_value), stop_anchor_distance)
-        rr_multiple = float(cfg.get('take_profit_r_multiple', 2.0) or 2.0)
-        if risk_distance <= 0 or rr_multiple < float(cfg.get('min_risk_reward', 2.0) or 2.0):
-            return _finish(None, "REJECTED_RISK_REWARD_LOW: invalid risk distance or RR", 'REJECTED_RISK_REWARD_LOW', record_failure=True, side=side)
-
-        if side == 'long':
-            stop_loss = entry_price - risk_distance
-            take_profit = entry_price + (rr_multiple * risk_distance)
-        else:
-            stop_loss = entry_price + risk_distance
-            take_profit = entry_price - (rr_multiple * risk_distance)
-
         total_balance, free_balance, _ = await self.get_balance_info()
         balance_for_risk = total_balance if total_balance > 0 else free_balance
-        risk_usdt = min(
-            balance_for_risk * float(cfg.get('risk_per_trade_percent', 1.0) or 1.0) / 100.0,
-            float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
-        )
-        if risk_usdt <= 0:
-            return _finish(None, "REJECTED_RISK_REWARD_LOW: risk budget unavailable", 'REJECTED_RISK_REWARD_LOW', record_failure=True, side=side)
-        planned_qty = risk_usdt / max(risk_distance, 1e-9)
-        plan = {
+        common_cfg = self.get_runtime_common_settings()
+        leverage = int(max(1.0, float(common_cfg.get('leverage', 5) or 5)))
+        try:
+            plan = calculate_risk_plan(
+                side=side,
+                entry_price=entry_price,
+                atr_value=atr_value,
+                stop_atr_multiplier=cfg.get('stop_atr_multiplier', 1.5),
+                ut_stop=ut_detail.get('curr_stop'),
+                take_profit_r_multiple=cfg.get('take_profit_r_multiple', 2.0),
+                min_risk_reward=cfg.get('min_risk_reward', 2.0),
+                balance_usdt=balance_for_risk,
+                risk_per_trade_percent=cfg.get('risk_per_trade_percent', 1.0),
+                max_risk_per_trade_usdt=cfg.get('max_risk_per_trade_usdt', 1.0),
+                leverage=leverage,
+            )
+        except ValueError as e:
+            return _finish(None, f"REJECTED_RISK_REWARD_LOW: {e}", 'REJECTED_RISK_REWARD_LOW', record_failure=True, side=side)
+        plan.update({
             'strategy': UTBOT_FILTERED_BREAKOUT_STRATEGY,
-            'side': side,
-            'entry_price': entry_price,
-            'risk_distance': risk_distance,
-            'stop_loss': stop_loss,
-            'take_profit': take_profit,
-            'risk_usdt': risk_usdt,
-            'qty': planned_qty,
-            'rr_multiple': rr_multiple,
             'atr': atr_value,
             'atr_pct': atr_pct,
             'decision_candle_ts': decision_ts
-        }
+        })
         self.utbot_filtered_breakout_entry_plans[symbol] = plan
         status['risk_summary'] = (
-            f"risk={risk_usdt:.4f} USDT, distance={risk_distance:.4f}, "
-            f"SL={stop_loss:.4f}, TP={take_profit:.4f}, qty={planned_qty:.8f}, RR={rr_multiple:.2f}"
+            f"risk={plan['risk_usdt']:.4f} USDT, distance={plan['risk_distance']:.4f}, "
+            f"SL={plan['stop_loss']:.4f}, TP={plan['take_profit']:.4f}, "
+            f"qty={plan['qty']:.8f}, margin={plan['planned_margin']:.2f}, "
+            f"notional={plan['planned_notional']:.2f}, RR={plan['rr_multiple']:.2f}"
         )
         status['entry_plan'] = dict(plan)
         return _finish(
@@ -5843,25 +5905,34 @@ class SignalEngine(BaseEngine):
         atr_value = metrics.get('atr')
         atr_pct = metrics.get('atr_pct')
         if self._is_valid_number(atr_value):
-            ut_stop = ut_detail.get('curr_stop')
-            stop_anchor_distance = abs(entry_price - float(ut_stop)) if self._is_valid_number(ut_stop) else 0.0
-            risk_distance = max(float(cfg.get('stop_atr_multiplier', 1.5) or 1.5) * float(atr_value), stop_anchor_distance)
-            risk_distance_pct = risk_distance / max(abs(entry_price), 1e-9) * 100.0
-            rr_multiple = float(cfg.get('take_profit_r_multiple', 2.0) or 2.0)
-            take_profit_distance = rr_multiple * risk_distance
-            take_profit_pct = take_profit_distance / max(abs(entry_price), 1e-9) * 100.0
             try:
                 total_balance, free_balance, _ = await self.get_balance_info()
                 balance_for_risk = total_balance if total_balance > 0 else free_balance
-                risk_usdt = min(
-                    balance_for_risk * float(cfg.get('risk_per_trade_percent', 1.0) or 1.0) / 100.0,
-                    float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
+                side_for_plan = candidate_side if candidate_side in {'long', 'short'} else 'long'
+                plan = calculate_risk_plan(
+                    side=side_for_plan,
+                    entry_price=entry_price,
+                    atr_value=atr_value,
+                    stop_atr_multiplier=cfg.get('stop_atr_multiplier', 1.5),
+                    ut_stop=ut_detail.get('curr_stop'),
+                    take_profit_r_multiple=cfg.get('take_profit_r_multiple', 2.0),
+                    min_risk_reward=cfg.get('min_risk_reward', 2.0),
+                    balance_usdt=balance_for_risk,
+                    risk_per_trade_percent=cfg.get('risk_per_trade_percent', 1.0),
+                    max_risk_per_trade_usdt=cfg.get('max_risk_per_trade_usdt', 1.0),
+                    leverage=lev,
                 )
-                planned_qty = risk_usdt / max(risk_distance, 1e-9)
-                planned_notional = planned_qty * entry_price
-                planned_margin = planned_notional / max(float(lev), 1e-9)
-                expected_profit_usdt = risk_usdt * rr_multiple
-                risk_ok = risk_distance > 0 and rr_multiple >= float(cfg.get('min_risk_reward', 2.0) or 2.0) and risk_usdt > 0 and planned_qty > 0
+                risk_distance = plan['risk_distance']
+                risk_distance_pct = plan['risk_distance_pct']
+                rr_multiple = plan['rr_multiple']
+                take_profit_distance = plan['take_profit_distance']
+                take_profit_pct = plan['take_profit_pct']
+                risk_usdt = plan['risk_usdt']
+                planned_qty = plan['qty']
+                planned_notional = plan['planned_notional']
+                planned_margin = plan['planned_margin']
+                expected_profit_usdt = plan['expected_profit_usdt']
+                risk_ok = True
                 balance_detail = (
                     f"손실한도 {_fmt(risk_usdt, 2)} USDT / 손절거리 {_fmt(risk_distance, 4)} "
                     f"({_fmt(risk_distance_pct, 3)}%) / qty {_fmt(planned_qty, 6)}"
@@ -12047,6 +12118,40 @@ class SignalEngine(BaseEngine):
                         )
                     else:
                         await self.ctrl.notify("⚠️ UTBOT_FILTERED_BREAKOUT_V1 보호 주문 거리 계산 오류")
+                if plan:
+                    try:
+                        requested = float(price)
+                        actual = float(actual_entry_price)
+                        signed_slippage_pct = (actual - requested) / max(abs(requested), 1e-9) * 100.0
+                        adverse_slippage_pct = (
+                            signed_slippage_pct if side == 'long' else -signed_slippage_pct
+                        )
+                    except (TypeError, ValueError):
+                        signed_slippage_pct = None
+                        adverse_slippage_pct = None
+                    self._record_utbreakout_diagnostic_event(
+                        symbol,
+                        {
+                            'candidate_side': side,
+                            'entry_timeframe': self._get_utbot_filtered_breakout_config(strategy_params).get('entry_timeframe', '15m'),
+                            'htf_timeframe': self._get_utbot_filtered_breakout_config(strategy_params).get('htf_timeframe', '1h'),
+                            'reason': 'UTBOT_FILTERED_BREAKOUT_V1 entry filled',
+                            'entry_price': actual_entry_price,
+                            'entry_plan': dict(plan)
+                        },
+                        event='entry_filled',
+                        extra={
+                            'code': 'ENTRY_FILLED',
+                            'order_id': order.get('id') if isinstance(order, dict) else None,
+                            'requested_price': price,
+                            'actual_entry_price': actual_entry_price,
+                            'entry_slippage_pct': adverse_slippage_pct,
+                            'entry_signed_slippage_pct': signed_slippage_pct,
+                            'target_notional': target_notional,
+                            'planned_margin': margin_to_use,
+                            'leverage': lev
+                        }
+                    )
                 self._clear_utbot_filtered_breakout_entry_plan(symbol)
             
             else:
@@ -14258,6 +14363,59 @@ class MainController:
 
     async def _fetch_binance_public_json(self, path, params):
         return await asyncio.to_thread(self._fetch_binance_public_json_sync, path, params)
+
+    async def _fetch_utbreakout_futures_context(self, symbol):
+        """Fetch lightweight futures context for research logs only.
+
+        This data is intentionally not used as an entry filter. It helps later
+        backtest/forward-test review decide whether funding/open-interest
+        features are worth promoting into optional strategy inputs.
+        """
+        if self.is_upbit_mode():
+            return {}
+        now = time.time()
+        cached = self.utbreakout_futures_context_cache.get(symbol)
+        if isinstance(cached, dict) and (now - float(cached.get('cached_at', 0) or 0)) < 300:
+            return dict(cached.get('data') or {})
+
+        rest_symbol = self._build_binance_futures_rest_symbol(symbol)
+        if not rest_symbol:
+            return {}
+
+        context = {}
+        try:
+            premium = await self._fetch_binance_public_json(
+                '/fapi/v1/premiumIndex',
+                {'symbol': rest_symbol}
+            )
+            if isinstance(premium, dict):
+                context.update({
+                    'funding_rate': _safe_float_or_none(premium.get('lastFundingRate')),
+                    'next_funding_time': int(premium.get('nextFundingTime') or 0) or None,
+                    'mark_price': _safe_float_or_none(premium.get('markPrice')),
+                    'index_price': _safe_float_or_none(premium.get('indexPrice')),
+                })
+        except Exception as e:
+            context['futures_context_error'] = f"premiumIndex: {e}"
+
+        try:
+            oi = await self._fetch_binance_public_json(
+                '/fapi/v1/openInterest',
+                {'symbol': rest_symbol}
+            )
+            if isinstance(oi, dict):
+                context['open_interest'] = _safe_float_or_none(oi.get('openInterest'))
+                context['open_interest_ts'] = int(oi.get('time') or 0) or None
+        except Exception as e:
+            if 'futures_context_error' not in context:
+                context['futures_context_error'] = f"openInterest: {e}"
+
+        clean_context = {k: v for k, v in context.items() if v is not None}
+        self.utbreakout_futures_context_cache[symbol] = {
+            'cached_at': now,
+            'data': clean_context
+        }
+        return clean_context
 
     async def _fetch_alt_trend_oi_cvd_metrics(self, symbol, timeframe):
         rest_symbol = self._build_binance_futures_rest_symbol(symbol)
@@ -16519,6 +16677,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 `/utbreakout riskpct 1` - 잔고 대비 손실 기준 1%로 설정
 `/utbreakout dailyloss 30` - 하루 최대 손실 30 USDT로 설정
 `/utbreakout status` - 롱/숏 조건 신호등
+`/utbreakout research` - 최근 7일 리서치 요약
 `/utbreakout menu` - 이 메뉴 다시 보기
 `/utbreakout log` - 진단 로그 파일 다운로드
 `/utbreakout toggle_opposite_set` - 반대 UT + 반대 Set 조건 청산 토글
@@ -16600,7 +16759,11 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 ],
                 [
                     InlineKeyboardButton("조건 스테이터스", callback_data="utb:condition_status"),
-                    InlineKeyboardButton("진단 로그 다운로드", callback_data="utb:download")
+                    InlineKeyboardButton("리서치 요약", callback_data="utb:research")
+                ],
+                [
+                    InlineKeyboardButton("진단 로그 다운로드", callback_data="utb:download"),
+                    InlineKeyboardButton("리서치 다운로드", callback_data="utb:research_download")
                 ],
                 [
                     InlineKeyboardButton("새로고침", callback_data="utb:status")
@@ -16647,6 +16810,38 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
             except Exception as e:
                 logger.error(f"UT breakout diagnostic log download failed: {e}")
                 await message.reply_text(f"진단 로그 다운로드 실패: {e}")
+
+        def _format_utbreakout_research_text():
+            engine = self.engines.get('signal')
+            protection_status = engine.last_protection_order_status if engine else {}
+            text = format_utbreakout_research_summary(
+                protection_status=protection_status,
+                days=7
+            )
+            return "\n".join([
+                "📈 UT Breakout 리서치 요약",
+                "실거래 조건을 바꾸는 화면이 아니라, 최근 판단 로그로 쏠림/거절/리스크를 보는 화면입니다.",
+                "",
+                text,
+                "",
+                "다운로드: /utbreakout research download",
+            ])
+
+        async def _send_utbreakout_research_document(message):
+            if message is None:
+                return
+            try:
+                report = _format_utbreakout_research_text()
+                bio = io.BytesIO(report.encode('utf-8'))
+                bio.name = 'utbreakout_research_report.txt'
+                await message.reply_document(
+                    document=bio,
+                    filename='utbreakout_research_report.txt',
+                    caption='UT Breakout 최근 7일 리서치 요약입니다.'
+                )
+            except Exception as e:
+                logger.error(f"UT breakout research report download failed: {e}")
+                await message.reply_text(f"리서치 리포트 다운로드 실패: {e}")
 
         def _get_utbreakout_status_symbol():
             watchlist = self.get_active_watchlist()
@@ -16983,6 +17178,12 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
             elif action in {'why', 'reason', 'auto_reason'}:
                 await u.message.reply_text(_format_utbreakout_why_text(), reply_markup=_build_utbreakout_keyboard())
                 return
+            elif action in {'research', 'report'}:
+                if len(args) > 1 and str(args[1]).strip().lower() in {'download', 'file', 'log'}:
+                    await _send_utbreakout_research_document(u.message)
+                else:
+                    await u.message.reply_text(_format_utbreakout_research_text(), reply_markup=_build_utbreakout_keyboard())
+                return
             elif action in {'status', 'conditions', 'condition_status'}:
                 await _send_utbreakout_condition_status(u.message)
                 return
@@ -17185,6 +17386,22 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 
             if action == 'download':
                 await _send_utbreakout_log_document(query.message)
+                return
+
+            if action == 'research_download':
+                await _send_utbreakout_research_document(query.message)
+                return
+
+            if action == 'research':
+                try:
+                    await query.edit_message_text(
+                        _format_utbreakout_research_text(),
+                        reply_markup=_build_utbreakout_keyboard()
+                    )
+                except BadRequest as md_err:
+                    if "message is not modified" in str(md_err).lower():
+                        return
+                    raise
                 return
 
             if action == 'condition_status':
