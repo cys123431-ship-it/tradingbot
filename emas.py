@@ -648,7 +648,8 @@ class TradingConfig:
             },
             'telegram': {
                 'reporting': {
-                    'hourly_report_enabled': True,
+                    'periodic_reports_enabled': False,
+                    'hourly_report_enabled': False,
                     'stateful_diag_enabled': False,
                     'alt_trend_alert_enabled': False,
                     'alt_trend_alert_timeframes': ['1d'],
@@ -1116,6 +1117,9 @@ class TradingConfig:
             self.save_config_sync()
 
         reporting_cfg = self.config.setdefault('telegram', {}).setdefault('reporting', {})
+        if 'periodic_reports_enabled' not in reporting_cfg:
+            reporting_cfg['periodic_reports_enabled'] = False
+            changed = True
         normalized_timeframes = normalize_alt_trend_timeframes(
             reporting_cfg.get('alt_trend_alert_timeframes', ['1d'])
         ) or ['1d']
@@ -1152,7 +1156,8 @@ class TradingConfig:
                 "token": "",
                 "chat_id": "",
                 "reporting": {
-                    "hourly_report_enabled": True,
+                    "periodic_reports_enabled": False,
+                    "hourly_report_enabled": False,
                     "stateful_diag_enabled": False,
                     "alt_trend_alert_enabled": False,
                     "alt_trend_alert_timeframes": ["1d"],
@@ -8976,6 +8981,8 @@ class SignalEngine(BaseEngine):
 
     async def _notify_stateful_diag(self, symbol, force=False):
         reporting_cfg = self.cfg.get('telegram', {}).get('reporting', {})
+        if not reporting_cfg.get('periodic_reports_enabled', False):
+            return
         if not reporting_cfg.get('stateful_diag_enabled', False):
             return
         info = self.last_stateful_diag.get(symbol)
@@ -14264,8 +14271,9 @@ class MainController:
         timeframes = normalize_alt_trend_timeframes(
             reporting.get('alt_trend_alert_timeframes', ['1d'])
         ) or ['1d']
+        periodic_enabled = bool(reporting.get('periodic_reports_enabled', False))
         return {
-            'enabled': bool(reporting.get('alt_trend_alert_enabled', False)),
+            'enabled': periodic_enabled and bool(reporting.get('alt_trend_alert_enabled', False)),
             'timeframes': timeframes,
             'scope': 'binance_futures_all',
             'stage_mode': 'setup_and_confirm',
@@ -15026,7 +15034,11 @@ class MainController:
             up_utbot = up_strategy.get('UTBot', {})
             up_symbol = self.format_symbol_for_display(up_watchlist[0])
             network_status = self.get_network_status_label()
-            hourly_report_status = "ON" if self.cfg.get('telegram', {}).get('reporting', {}).get('hourly_report_enabled', True) else "OFF"
+            reporting_cfg = self.cfg.get('telegram', {}).get('reporting', {})
+            hourly_report_status = "ON" if (
+                reporting_cfg.get('periodic_reports_enabled', False)
+                and reporting_cfg.get('hourly_report_enabled', False)
+            ) else "OFF"
 
             msg = f"""
 🔧 **설정 메뉴** (번호 입력)
@@ -15134,7 +15146,11 @@ class MainController:
         scanner_exit_tf = sig_common.get('scanner_exit_timeframe', '1h')
 
         # Hourly Report Status
-        hourly_report_status = "ON" if self.cfg.get('telegram', {}).get('reporting', {}).get('hourly_report_enabled', True) else "OFF"
+        reporting_cfg = self.cfg.get('telegram', {}).get('reporting', {})
+        hourly_report_status = "ON" if (
+            reporting_cfg.get('periodic_reports_enabled', False)
+            and reporting_cfg.get('hourly_report_enabled', False)
+        ) else "OFF"
         alt_trend_settings = self._get_alt_trend_alert_settings()
         alt_trend_alert_status = "ON 🔔" if alt_trend_settings.get('enabled', False) else "OFF"
         alt_trend_tf_text = format_alt_trend_timeframes(alt_trend_settings.get('timeframes', []))
@@ -15355,9 +15371,17 @@ class MainController:
             return SELECT
         elif text == '42':
             # Hourly Report Toggle
-            curr = self.cfg.get('telegram', {}).get('reporting', {}).get('hourly_report_enabled', True)
+            reporting = self.cfg.get('telegram', {}).get('reporting', {})
+            curr = bool(
+                reporting.get('periodic_reports_enabled', False)
+                and reporting.get('hourly_report_enabled', False)
+            )
             new_val = not curr
             await self.cfg.update_value(['telegram', 'reporting', 'hourly_report_enabled'], new_val)
+            await self.cfg.update_value(
+                ['telegram', 'reporting', 'periodic_reports_enabled'],
+                bool(new_val or reporting.get('alt_trend_alert_enabled', False))
+            )
             status = "ON" if new_val else "OFF"
             await update.message.reply_text(f"⚙️ 시간별 리포트: {status}")
             await self.show_setup_menu(update)
@@ -15811,6 +15835,11 @@ class MainController:
                 await self.cfg.update_value(
                     ['telegram', 'reporting', 'alt_trend_alert_enabled'],
                     enabled
+                )
+                reporting = self.cfg.get('telegram', {}).get('reporting', {})
+                await self.cfg.update_value(
+                    ['telegram', 'reporting', 'periodic_reports_enabled'],
+                    bool(enabled or reporting.get('hourly_report_enabled', False))
                 )
                 self.last_alt_trend_scan_candle_ts_by_tf = {}
                 self.last_alt_trend_alert_sent = {}
@@ -17555,7 +17584,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
         while True:
             try:
                 reporting = self.cfg.get('telegram', {}).get('reporting', {})
-                if reporting.get('hourly_report_enabled', False):
+                if reporting.get('periodic_reports_enabled', False) and reporting.get('hourly_report_enabled', False):
                     now = datetime.now()
                     if now.minute == 0 and time.time() - self.last_hourly_report > 3500:
                         self.last_hourly_report = time.time()
