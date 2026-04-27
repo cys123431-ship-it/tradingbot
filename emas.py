@@ -2314,6 +2314,8 @@ class SignalEngine(BaseEngine):
         self.last_utbot_filtered_breakout_status = {}  # symbol -> filtered breakout diagnostics
         self.utbot_filtered_breakout_entry_plans = {}  # symbol -> accepted risk plan
         self.utbot_filtered_breakout_failures = {}  # symbol -> side -> recent failed candidate timestamps
+        self.last_protection_order_status = {}  # symbol -> exchange-side TP/SL audit status
+        self.last_protection_alert_ts = {}  # symbol:kind -> last Telegram alert timestamp
         self.last_entry_reason = {}        # symbol -> latest entry decision reason
 
     def start(self):
@@ -2355,6 +2357,8 @@ class SignalEngine(BaseEngine):
         self.last_utbot_filtered_breakout_status = {}
         self.utbot_filtered_breakout_entry_plans = {}
         self.utbot_filtered_breakout_failures = {}
+        self.last_protection_order_status = {}
+        self.last_protection_alert_ts = {}
         self.last_entry_reason = {}
         self.pending_reentry = {}
         self.ut_hybrid_timing_latches = {}
@@ -8339,6 +8343,10 @@ class SignalEngine(BaseEngine):
                     else:
                         # ?ъ????놁쓬 (泥?궛?? -> ?ㅼ틦??蹂??珥덇린??& ?ㅼ떆 ?ㅼ틪 紐⑤뱶 吏꾩엯
                         logger.info(f"?삼툘 Scanner trade completed for {self.scanner_active_symbol}. Resuming scan.")
+                        await self._cancel_protection_orders(
+                            self.scanner_active_symbol,
+                            reason='scanner position completed'
+                        )
                         self.scanner_active_symbol = None
                         # 諛붾줈 ?ㅼ틪 濡쒖쭅?쇰줈 ?섏뼱媛?
                 
@@ -8763,7 +8771,7 @@ class SignalEngine(BaseEngine):
         try:
             total, free, mmr = await self.get_balance_info()
             count, daily_pnl = self.db.get_daily_stats()
-            pos = await self.get_server_position(symbol)
+            pos = await self.get_server_position(symbol, use_cache=False)
             
             # ?꾨왂 ?곹깭 媛?몄삤湲?
             strategy_params = self.get_runtime_strategy_params()
@@ -8830,9 +8838,26 @@ class SignalEngine(BaseEngine):
             tp_master_enabled = False if self.is_upbit_mode() else bool(comm_cfg.get('tp_sl_enabled', True))
             tp_enabled = tp_master_enabled and bool(comm_cfg.get('take_profit_enabled', True))
             sl_enabled = tp_master_enabled and bool(comm_cfg.get('stop_loss_enabled', True))
+            expected_tp, expected_sl = self._protection_expected_from_config(symbol, pos)
+            protection_audit = await self._audit_protection_orders(
+                symbol,
+                pos=pos,
+                expected_tp=expected_tp,
+                expected_sl=expected_sl,
+                alert=True
+            )
             symbol_status['protection_config'] = {
                 'tp_enabled': tp_enabled,
-                'sl_enabled': sl_enabled
+                'sl_enabled': sl_enabled,
+                'tp_expected': expected_tp,
+                'sl_expected': expected_sl,
+                'tp_present': protection_audit.get('tp_present', False),
+                'sl_present': protection_audit.get('sl_present', False),
+                'tp_count': protection_audit.get('tp_count', 0),
+                'sl_count': protection_audit.get('sl_count', 0),
+                'missing_tp': protection_audit.get('missing_tp', False),
+                'missing_sl': protection_audit.get('missing_sl', False),
+                'audit_status': protection_audit.get('status', 'UNKNOWN')
             }
             
             # [New] Status Display Enhancement
@@ -12145,6 +12170,249 @@ class SignalEngine(BaseEngine):
             logger.error(f"Upbit spot entry error: {e}")
             await self.ctrl.notify(f"❌ 업비트 매수 실패: {e}")
 
+    def _protection_order_info(self, order):
+        return order.get('info', {}) if isinstance(order, dict) and isinstance(order.get('info', {}), dict) else {}
+
+    def _protection_bool(self, value):
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {'true', '1', 'yes', 'y'}
+
+    def _is_reduce_only_order(self, order):
+        if not isinstance(order, dict):
+            return False
+        info = self._protection_order_info(order)
+        return any(
+            self._protection_bool(value)
+            for value in (
+                order.get('reduceOnly'),
+                order.get('reduce_only'),
+                info.get('reduceOnly'),
+                info.get('reduce_only'),
+                info.get('closePosition')
+            )
+        )
+
+    def _protection_order_type(self, order):
+        if not isinstance(order, dict):
+            return ''
+        info = self._protection_order_info(order)
+        return str(
+            order.get('type')
+            or info.get('type')
+            or info.get('origType')
+            or info.get('orderType')
+            or ''
+        ).strip().lower()
+
+    def _protection_order_side(self, order):
+        if not isinstance(order, dict):
+            return ''
+        info = self._protection_order_info(order)
+        return str(order.get('side') or info.get('side') or '').strip().lower()
+
+    def _classify_protection_order(self, order):
+        order_type = self._protection_order_type(order)
+        is_reduce_only = self._is_reduce_only_order(order)
+        if 'take_profit' in order_type or 'take-profit' in order_type:
+            return 'tp'
+        if 'stop' in order_type:
+            return 'sl'
+        if is_reduce_only and ('limit' in order_type or order_type == ''):
+            return 'tp'
+        return None
+
+    def _is_protection_order(self, order):
+        return self._classify_protection_order(order) in {'tp', 'sl'}
+
+    async def _fetch_open_orders_safe(self, symbol):
+        try:
+            return await asyncio.to_thread(self.exchange.fetch_open_orders, symbol)
+        except Exception as e:
+            logger.warning(f"Protection audit: fetch_open_orders failed for {symbol}: {e}")
+            return None
+
+    async def _cancel_protection_orders(self, symbol, reason='protection cleanup', orders=None):
+        if self.is_upbit_mode():
+            return 0
+        open_orders = orders if orders is not None else await self._fetch_open_orders_safe(symbol)
+        if open_orders is None:
+            return 0
+        cancelled = 0
+        for order in open_orders or []:
+            if not self._is_protection_order(order):
+                continue
+            order_id = order.get('id') or self._protection_order_info(order).get('orderId')
+            if not order_id:
+                continue
+            try:
+                await asyncio.to_thread(self.exchange.cancel_order, order_id, symbol)
+                cancelled += 1
+            except Exception as e:
+                logger.warning(f"Protection cleanup cancel failed for {symbol} / {order_id}: {e}")
+        if cancelled:
+            logger.info(f"Protection cleanup: cancelled {cancelled} orders for {symbol} ({reason})")
+        return cancelled
+
+    async def _notify_protection_issue(self, symbol, kind, message, cooldown_sec=300):
+        key = f"{symbol}:{kind}"
+        now_ts = time.time()
+        last_ts = float(self.last_protection_alert_ts.get(key, 0.0) or 0.0)
+        if now_ts - last_ts < cooldown_sec:
+            return
+        self.last_protection_alert_ts[key] = now_ts
+        try:
+            await self.ctrl.notify(message)
+        except Exception as e:
+            logger.warning(f"Protection alert failed for {symbol}: {e}")
+
+    def _protection_expected_from_config(self, symbol, pos):
+        if self.is_upbit_mode() or not pos:
+            return False, False
+        strategy_params = self.get_runtime_strategy_params()
+        active_strategy = str(strategy_params.get('active_strategy', '') or '').lower()
+        if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+            return True, True
+        cfg = self.get_runtime_common_settings()
+        master = bool(cfg.get('tp_sl_enabled', True))
+        return (
+            master and bool(cfg.get('take_profit_enabled', True)),
+            master and bool(cfg.get('stop_loss_enabled', True))
+        )
+
+    async def _audit_protection_orders(self, symbol, pos=None, expected_tp=None, expected_sl=None, alert=True):
+        status = {
+            'tp_expected': bool(expected_tp),
+            'sl_expected': bool(expected_sl),
+            'tp_present': False,
+            'sl_present': False,
+            'tp_count': 0,
+            'sl_count': 0,
+            'missing_tp': False,
+            'missing_sl': False,
+            'orphan_cancelled': 0,
+            'mismatch_cancelled': 0,
+            'status': 'SKIPPED'
+        }
+        if self.is_upbit_mode():
+            self.last_protection_order_status[symbol] = status
+            return status
+
+        if expected_tp is None or expected_sl is None:
+            expected_tp, expected_sl = self._protection_expected_from_config(symbol, pos)
+            status['tp_expected'] = bool(expected_tp)
+            status['sl_expected'] = bool(expected_sl)
+
+        open_orders = await self._fetch_open_orders_safe(symbol)
+        if open_orders is None:
+            status['status'] = 'ORDER_FETCH_FAILED'
+            self.last_protection_order_status[symbol] = status
+            return status
+        protection_orders = [order for order in (open_orders or []) if self._is_protection_order(order)]
+
+        if not pos:
+            status['status'] = 'NO_POSITION'
+            if protection_orders:
+                status['orphan_cancelled'] = await self._cancel_protection_orders(
+                    symbol,
+                    reason='no position remains',
+                    orders=protection_orders
+                )
+                status['status'] = 'ORPHAN_CANCELLED'
+                if alert and status['orphan_cancelled']:
+                    await self._notify_protection_issue(
+                        symbol,
+                        'orphan_cancelled',
+                        f"ℹ️ {self.ctrl.format_symbol_for_display(symbol)} 포지션 없음: 잔존 보호주문 {status['orphan_cancelled']}건 자동 취소"
+                    )
+            self.last_protection_order_status[symbol] = status
+            return status
+
+        pos_side = str(pos.get('side', '')).lower()
+        close_side = 'sell' if pos_side == 'long' else 'buy'
+        valid_tp = []
+        valid_sl = []
+        mismatched = []
+        for order in protection_orders:
+            kind = self._classify_protection_order(order)
+            order_side = self._protection_order_side(order)
+            if order_side and order_side != close_side:
+                mismatched.append(order)
+                continue
+            if kind == 'tp':
+                valid_tp.append(order)
+            elif kind == 'sl':
+                valid_sl.append(order)
+
+        if mismatched:
+            status['mismatch_cancelled'] = await self._cancel_protection_orders(
+                symbol,
+                reason='wrong close side',
+                orders=mismatched
+            )
+
+        status['tp_count'] = len(valid_tp)
+        status['sl_count'] = len(valid_sl)
+        status['tp_present'] = len(valid_tp) > 0
+        status['sl_present'] = len(valid_sl) > 0
+        status['missing_tp'] = bool(expected_tp) and not status['tp_present']
+        status['missing_sl'] = bool(expected_sl) and not status['sl_present']
+        if status['missing_sl']:
+            status['status'] = 'MISSING_SL'
+            if alert:
+                await self._notify_protection_issue(
+                    symbol,
+                    'missing_sl',
+                    f"🚨 {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락: SL 없음. 포지션은 유지 중이니 거래소 주문을 확인하세요."
+                )
+        elif status['missing_tp']:
+            status['status'] = 'MISSING_TP'
+            if alert:
+                await self._notify_protection_issue(
+                    symbol,
+                    'missing_tp',
+                    f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락: TP 없음"
+                )
+        elif status['mismatch_cancelled']:
+            status['status'] = 'MISMATCH_CANCELLED'
+        else:
+            status['status'] = 'OK'
+        self.last_protection_order_status[symbol] = status
+        return status
+
+    async def _create_protection_order_with_retries(
+        self,
+        symbol,
+        order_type,
+        side,
+        qty,
+        price,
+        params,
+        label,
+        max_attempts=3
+    ):
+        last_error = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                order = await asyncio.to_thread(
+                    self.exchange.create_order,
+                    symbol,
+                    order_type,
+                    side,
+                    qty,
+                    price,
+                    params
+                )
+                if attempt > 1:
+                    logger.info(f"{label} protection order succeeded on retry {attempt}: {symbol}")
+                return order
+            except Exception as e:
+                last_error = e
+                logger.error(f"{label} order attempt {attempt}/{max_attempts} failed for {symbol}: {e}")
+                if attempt < max_attempts:
+                    await asyncio.sleep(0.7)
+        raise last_error
+
     async def _place_tp_sl_orders(self, symbol, side, entry_price, qty, tp_distance=None, sl_distance=None):
         """嫄곕옒?뚯뿉 TP/SL 二쇰Ц 諛곗튂 (?ㅽ뵂?ㅻ뜑??蹂댁엫)"""
         try:
@@ -12156,6 +12424,26 @@ class SignalEngine(BaseEngine):
             sl_order = None
             tp_price = None
             sl_price = None
+            side = str(side or '').lower()
+            entry_price = float(entry_price or 0.0)
+            if side not in {'long', 'short'} or entry_price <= 0:
+                logger.error(f"Protection placement skipped: invalid side/entry ({symbol}, {side}, {entry_price})")
+                return
+
+            pos = await self.get_server_position(symbol, use_cache=False)
+            if pos and str(pos.get('side', '')).lower() == side:
+                pos_contracts = abs(float(pos.get('contracts', 0) or 0))
+                if pos_contracts > 0:
+                    qty = self.safe_amount(symbol, pos_contracts)
+                pos_entry = float(pos.get('entryPrice') or 0.0)
+                if pos_entry > 0:
+                    entry_price = pos_entry
+            qty = self.safe_amount(symbol, abs(float(qty or 0)))
+            if float(qty) <= 0:
+                logger.error(f"Protection placement skipped: invalid qty for {symbol}: {qty}")
+                return
+
+            await self._cancel_protection_orders(symbol, reason='before new protection placement')
 
             if side == 'long':
                 tp_side = 'sell'
@@ -12172,27 +12460,97 @@ class SignalEngine(BaseEngine):
                 if sl_distance is not None and sl_distance > 0:
                     sl_price = self.safe_price(symbol, entry_price + sl_distance)
 
+            def _valid_price(direction, price_value):
+                try:
+                    price_float = float(price_value)
+                except (TypeError, ValueError):
+                    return False
+                if direction == 'tp':
+                    return price_float > entry_price if side == 'long' else price_float < entry_price
+                return price_float < entry_price if side == 'long' else price_float > entry_price
+
+            # Stop Loss is placed first. A position without SL is the riskiest failure mode.
+            if sl_price is not None:
+                if not _valid_price('sl', sl_price):
+                    await self._notify_protection_issue(
+                        symbol,
+                        'invalid_sl_price',
+                        f"🚨 {self.ctrl.format_symbol_for_display(symbol)} SL 가격 오류: entry {entry_price:.6f}, SL {sl_price}"
+                    )
+                    await self._cancel_protection_orders(symbol, reason='invalid SL price')
+                    self.last_protection_order_status[symbol] = {
+                        'tp_expected': tp_price is not None,
+                        'sl_expected': True,
+                        'tp_present': False,
+                        'sl_present': False,
+                        'missing_tp': tp_price is not None,
+                        'missing_sl': True,
+                        'status': 'INVALID_SL_PRICE'
+                    }
+                    return
+                else:
+                    try:
+                        sl_order = await self._create_protection_order_with_retries(
+                            symbol,
+                            'stop_market',
+                            sl_side,
+                            qty,
+                            None,
+                            {'stopPrice': sl_price, 'reduceOnly': True},
+                            'SL',
+                            max_attempts=3
+                        )
+                        logger.info(f"SL order placed: {sl_side.upper()} @ {sl_price} (stop)")
+                    except Exception as sl_e:
+                        logger.error(f"SL order failed after retries: {sl_e}")
+                        await self._cancel_protection_orders(symbol, reason='SL placement failed')
+                        await self._notify_protection_issue(
+                            symbol,
+                            'sl_place_failed',
+                            f"🚨 {self.ctrl.format_symbol_for_display(symbol)} SL 주문 생성 실패(3회 재시도). 포지션은 유지 중이니 거래소에서 수동 확인하세요: {sl_e}",
+                            cooldown_sec=30
+                        )
+                        self.last_protection_order_status[symbol] = {
+                            'tp_expected': tp_price is not None,
+                            'sl_expected': True,
+                            'tp_present': False,
+                            'sl_present': False,
+                            'missing_tp': tp_price is not None,
+                            'missing_sl': True,
+                            'status': 'SL_PLACE_FAILED'
+                        }
+                        return
+
             # Take Profit 二쇰Ц (吏?뺢? + reduceOnly)
             if tp_price is not None:
-                try:
-                    tp_order = await asyncio.to_thread(
-                        self.exchange.create_order, symbol, 'limit', tp_side, qty, tp_price,
-                        {'reduceOnly': True}
+                if not _valid_price('tp', tp_price):
+                    await self._notify_protection_issue(
+                        symbol,
+                        'invalid_tp_price',
+                        f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} TP 가격 오류: entry {entry_price:.6f}, TP {tp_price}"
                     )
-                    logger.info(f"??TP order placed: {tp_side.upper()} @ {tp_price}")
-                except Exception as tp_e:
-                    logger.error(f"TP order failed: {tp_e}")
-
-            # Stop Loss 二쇰Ц (?ㅽ깙 留덉폆 + reduceOnly)
-            if sl_price is not None:
-                try:
-                    sl_order = await asyncio.to_thread(
-                        self.exchange.create_order, symbol, 'stop_market', sl_side, qty, None,
-                        {'stopPrice': sl_price, 'reduceOnly': True}
-                    )
-                    logger.info(f"??SL order placed: {sl_side.upper()} @ {sl_price} (stop)")
-                except Exception as sl_e:
-                    logger.error(f"SL order failed: {sl_e}")
+                    tp_price = None
+                else:
+                    try:
+                        tp_order = await self._create_protection_order_with_retries(
+                            symbol,
+                            'limit',
+                            tp_side,
+                            qty,
+                            tp_price,
+                            {'reduceOnly': True},
+                            'TP',
+                            max_attempts=2
+                        )
+                        logger.info(f"TP order placed: {tp_side.upper()} @ {tp_price}")
+                    except Exception as tp_e:
+                        logger.error(f"TP order failed: {tp_e}")
+                        await self._notify_protection_issue(
+                            symbol,
+                            'tp_place_failed',
+                            f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} TP 주문 생성 실패. SL은 유지됩니다: {tp_e}",
+                            cooldown_sec=60
+                        )
             
             notice_parts = []
             if tp_order and tp_price is not None:
@@ -12201,6 +12559,14 @@ class SignalEngine(BaseEngine):
                 notice_parts.append(f"🛑 SL: `{float(sl_price):.2f}`")
             if notice_parts:
                 await self.ctrl.notify(" | ".join(notice_parts))
+
+            await self._audit_protection_orders(
+                symbol,
+                pos=await self.get_server_position(symbol, use_cache=False),
+                expected_tp=tp_price is not None,
+                expected_sl=sl_price is not None,
+                alert=True
+            )
             
         except Exception as e:
             logger.error(f"TP/SL order placement error: {e}")
@@ -12223,11 +12589,13 @@ class SignalEngine(BaseEngine):
         pos = await self.get_server_position(symbol, use_cache=False)
         if not pos:
             logger.info("No position to exit")
+            await self._cancel_protection_orders(symbol, reason='exit requested but no position')
             return
         
         contracts = abs(float(pos['contracts']))
         if contracts <= 0:
             logger.info("No contracts to exit")
+            await self._cancel_protection_orders(symbol, reason='exit requested but zero contracts')
             return
         
         qty = self.safe_amount(symbol, contracts)
@@ -12281,6 +12649,7 @@ class SignalEngine(BaseEngine):
         # 罹먯떆 ?꾩쟾 臾댄슚??
         self.position_cache = None
         self.position_cache_time = 0
+        await self._cancel_protection_orders(symbol, reason='after exit order success')
 
         active_strategy = str(self.get_runtime_strategy_params().get('active_strategy', '') or '').lower()
         if active_strategy == 'utsmc' or str(reason or '').startswith('UTSMC'):
@@ -14434,44 +14803,17 @@ class MainController:
                 except Exception:
                     qty = str(round(contracts, 6))
 
-                if tp_enabled and tp_pct > 0:
-                    tp_price_raw = entry_price * (1 + tp_pct) if side == 'long' else entry_price * (1 - tp_pct)
-                    try:
-                        tp_price = self.exchange.price_to_precision(symbol, tp_price_raw)
-                    except Exception:
-                        tp_price = str(round(tp_price_raw, 6))
-                    try:
-                        await asyncio.to_thread(
-                            self.exchange.create_order,
-                            symbol,
-                            'limit',
-                            close_side,
-                            qty,
-                            tp_price,
-                            {'reduceOnly': True}
-                        )
-                    except Exception as tp_e:
-                        logger.warning(f"Protection sync TP failed for {symbol}: {tp_e}")
-
-                if sl_enabled and sl_pct > 0:
-                    sl_price_raw = entry_price * (1 - sl_pct) if side == 'long' else entry_price * (1 + sl_pct)
-                    try:
-                        sl_price = self.exchange.price_to_precision(symbol, sl_price_raw)
-                    except Exception:
-                        sl_price = str(round(sl_price_raw, 6))
-                    try:
-                        await asyncio.to_thread(
-                            self.exchange.create_order,
-                            symbol,
-                            'stop_market',
-                            close_side,
-                            qty,
-                            None,
-                            {'stopPrice': sl_price, 'reduceOnly': True}
-                        )
-                    except Exception as sl_e:
-                        logger.warning(f"Protection sync SL failed for {symbol}: {sl_e}")
-
+                tp_distance = (entry_price * tp_pct) if (tp_enabled and tp_pct > 0) else None
+                sl_distance = (entry_price * sl_pct) if (sl_enabled and sl_pct > 0) else None
+                if tp_distance is not None or sl_distance is not None:
+                    await self._place_tp_sl_orders(
+                        symbol,
+                        side,
+                        entry_price,
+                        qty,
+                        tp_distance=tp_distance,
+                        sl_distance=sl_distance
+                    )
                 refreshed += 1
 
             logger.info(
@@ -17342,8 +17684,13 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                     x_tf = d.get('exit_tf', '?')
                     entry_reason = d.get('entry_reason', '대기')
                     protection_cfg = d.get('protection_config', {})
-                    tp_text = "ON" if protection_cfg.get('tp_enabled', False) else "OFF"
-                    sl_text = "ON" if protection_cfg.get('sl_enabled', False) else "OFF"
+                    tp_expected = bool(protection_cfg.get('tp_expected', protection_cfg.get('tp_enabled', False)))
+                    sl_expected = bool(protection_cfg.get('sl_expected', protection_cfg.get('sl_enabled', False)))
+                    tp_present = bool(protection_cfg.get('tp_present', False))
+                    sl_present = bool(protection_cfg.get('sl_present', False))
+                    tp_text = "OK" if tp_expected and tp_present else "누락" if tp_expected else "OFF"
+                    sl_text = "OK" if sl_expected and sl_present else "누락" if sl_expected else "OFF"
+                    audit_status = protection_cfg.get('audit_status', '-')
                     network = d.get('network', '?')
                     exchange_id = d.get('exchange_id', '?')
                     market_data_exchange_id = d.get('market_data_exchange_id', '?')
@@ -17351,7 +17698,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                     msg += f"⏱ TF: 진입 `{e_tf}` / 청산 `{x_tf}`\n"
                     msg += f"🌐 거래소: `{exchange_id}` | 네트워크 `{network}`\n"
                     msg += f"📡 신호데이터: `{market_data_exchange_id}` | `{market_data_source}`\n"
-                    msg += f"🛡 보호주문: TP `{tp_text}` | SL `{sl_text}`\n"
+                    msg += f"🛡 보호주문: TP `{tp_text}`({protection_cfg.get('tp_count', 0)}) | SL `{sl_text}`({protection_cfg.get('sl_count', 0)}) | audit `{audit_status}`\n"
                     msg += f"📝 진입판정: `{entry_reason}`\n"
                     stateful_diag = d.get('stateful_diag', {})
                     if stateful_diag:
