@@ -61,7 +61,7 @@ jobs:
               git checkout -f -B main origin/main
             fi
             git reset --hard origin/main
-            git clean -fd
+            git clean -fd -e venv/ -e runtime/
 
             echo "=== Restore config ==="
             if [ -f "$CONFIG_BACKUP" ]; then
@@ -72,8 +72,20 @@ jobs:
             fi
 
             echo "=== Prepare Python environment ==="
-            if [ ! -d venv ]; then
-              python3 -m venv venv
+            PY_BOOTSTRAP=""
+            for CANDIDATE in python3.12 python3 python; do
+              if command -v "$CANDIDATE" >/dev/null 2>&1; then
+                PY_BOOTSTRAP="$CANDIDATE"
+                break
+              fi
+            done
+            if [ -z "$PY_BOOTSTRAP" ]; then
+              echo "No system Python found to create venv"
+              exit 127
+            fi
+            if [ ! -x venv/bin/python ]; then
+              rm -rf venv
+              "$PY_BOOTSTRAP" -m venv venv
             fi
 
             ./venv/bin/python -m pip install --upgrade pip
