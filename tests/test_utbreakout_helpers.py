@@ -1,9 +1,14 @@
 from datetime import datetime, timezone
 
+import pytest
+
 from utbreakout.indicators import previous_donchian
 from utbreakout.research import summarize_diagnostic_events
 from utbreakout.risk import calculate_risk_plan
-from emas import SignalEngine
+
+
+def _signal_engine_cls():
+    return pytest.importorskip("emas", reason="emas runtime dependencies are optional in CI").SignalEngine
 
 
 def test_previous_donchian_excludes_current_candle():
@@ -81,7 +86,8 @@ def test_research_summary_detects_set_concentration_and_protection_gaps():
 
 
 def test_protection_order_classifies_binance_stop_market_from_orig_type():
-    engine = SignalEngine.__new__(SignalEngine)
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
     order = {
         "type": "market",
         "side": "sell",
@@ -94,12 +100,13 @@ def test_protection_order_classifies_binance_stop_market_from_orig_type():
         },
     }
 
-    assert SignalEngine._classify_protection_order(engine, order) == "sl"
-    assert SignalEngine._protection_order_matches_symbol(engine, order, "BTC/USDT") is True
+    assert signal_engine._classify_protection_order(engine, order) == "sl"
+    assert signal_engine._protection_order_matches_symbol(engine, order, "BTC/USDT") is True
 
 
 def test_protection_order_keeps_take_profit_separate_from_stop_loss():
-    engine = SignalEngine.__new__(SignalEngine)
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
     take_profit_market = {
         "type": "market",
         "side": "sell",
@@ -112,5 +119,5 @@ def test_protection_order_keeps_take_profit_separate_from_stop_loss():
     }
     take_profit_limit = {"type": "limit", "side": "sell", "reduceOnly": True}
 
-    assert SignalEngine._classify_protection_order(engine, take_profit_market) == "tp"
-    assert SignalEngine._classify_protection_order(engine, take_profit_limit) == "tp"
+    assert signal_engine._classify_protection_order(engine, take_profit_market) == "tp"
+    assert signal_engine._classify_protection_order(engine, take_profit_limit) == "tp"
