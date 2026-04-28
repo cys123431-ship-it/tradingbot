@@ -12325,13 +12325,22 @@ class SignalEngine(BaseEngine):
         if not isinstance(order, dict):
             return ''
         info = self._protection_order_info(order)
-        return str(
-            order.get('type')
-            or info.get('type')
-            or info.get('origType')
-            or info.get('orderType')
-            or ''
-        ).strip().lower()
+        type_values = []
+        for value in (
+            order.get('type'),
+            order.get('orderType'),
+            order.get('stopOrderType'),
+            order.get('triggerType'),
+            info.get('type'),
+            info.get('origType'),
+            info.get('orderType'),
+            info.get('stopOrderType'),
+            info.get('triggerType'),
+            info.get('strategyType')
+        ):
+            if value not in (None, ''):
+                type_values.append(str(value))
+        return " ".join(type_values).strip().lower().replace('-', '_')
 
     def _protection_order_side(self, order):
         if not isinstance(order, dict):
@@ -12339,12 +12348,58 @@ class SignalEngine(BaseEngine):
         info = self._protection_order_info(order)
         return str(order.get('side') or info.get('side') or '').strip().lower()
 
+    def _protection_trigger_price(self, order):
+        if not isinstance(order, dict):
+            return None
+        info = self._protection_order_info(order)
+        for value in (
+            order.get('stopPrice'),
+            order.get('triggerPrice'),
+            order.get('stop_price'),
+            order.get('trigger_price'),
+            info.get('stopPrice'),
+            info.get('triggerPrice'),
+            info.get('stop_price'),
+            info.get('trigger_price'),
+            info.get('activatePrice')
+        ):
+            try:
+                number = float(value)
+                if number > 0:
+                    return number
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _normalize_protection_symbol(self, value):
+        return (
+            str(value or '')
+            .upper()
+            .replace(':USDT', '')
+            .replace('/', '')
+            .replace('-', '')
+            .replace('_', '')
+            .strip()
+        )
+
+    def _protection_order_symbol(self, order):
+        if not isinstance(order, dict):
+            return ''
+        info = self._protection_order_info(order)
+        return str(order.get('symbol') or info.get('symbol') or info.get('pair') or '').strip()
+
+    def _protection_order_matches_symbol(self, order, symbol):
+        order_symbol = self._normalize_protection_symbol(self._protection_order_symbol(order))
+        target_symbol = self._normalize_protection_symbol(symbol)
+        return not order_symbol or order_symbol == target_symbol
+
     def _classify_protection_order(self, order):
         order_type = self._protection_order_type(order)
         is_reduce_only = self._is_reduce_only_order(order)
-        if 'take_profit' in order_type or 'take-profit' in order_type:
+        has_trigger_price = self._protection_trigger_price(order) is not None
+        if 'take_profit' in order_type or 'takeprofit' in order_type:
             return 'tp'
-        if 'stop' in order_type:
+        if 'stop' in order_type or (is_reduce_only and has_trigger_price):
             return 'sl'
         if is_reduce_only and ('limit' in order_type or order_type == ''):
             return 'tp'
@@ -12353,11 +12408,13 @@ class SignalEngine(BaseEngine):
     def _is_protection_order(self, order):
         return self._classify_protection_order(order) in {'tp', 'sl'}
 
-    async def _fetch_open_orders_safe(self, symbol):
+    async def _fetch_open_orders_safe(self, symbol=None):
         try:
-            return await asyncio.to_thread(self.exchange.fetch_open_orders, symbol)
+            if symbol:
+                return await asyncio.to_thread(self.exchange.fetch_open_orders, symbol)
+            return await asyncio.to_thread(self.exchange.fetch_open_orders)
         except Exception as e:
-            logger.warning(f"Protection audit: fetch_open_orders failed for {symbol}: {e}")
+            logger.warning(f"Protection audit: fetch_open_orders failed for {symbol or 'ALL'}: {e}")
             return None
 
     async def _cancel_protection_orders(self, symbol, reason='protection cleanup', orders=None):
@@ -12393,6 +12450,20 @@ class SignalEngine(BaseEngine):
             await self.ctrl.notify(message)
         except Exception as e:
             logger.warning(f"Protection alert failed for {symbol}: {e}")
+
+    def _protection_position_signature(self, pos):
+        if not isinstance(pos, dict):
+            return 'none'
+        side = str(pos.get('side', '') or 'unknown').lower()
+        try:
+            contracts = round(abs(float(pos.get('contracts', 0) or 0)), 12)
+        except (TypeError, ValueError):
+            contracts = 0.0
+        try:
+            entry_price = round(float(pos.get('entryPrice', 0) or 0), 8)
+        except (TypeError, ValueError):
+            entry_price = 0.0
+        return f"{side}:{contracts}:{entry_price}"
 
     def _protection_expected_from_config(self, symbol, pos):
         if self.is_upbit_mode() or not pos:
@@ -12436,7 +12507,32 @@ class SignalEngine(BaseEngine):
             status['status'] = 'ORDER_FETCH_FAILED'
             self.last_protection_order_status[symbol] = status
             return status
-        protection_orders = [order for order in (open_orders or []) if self._is_protection_order(order)]
+        candidate_orders = list(open_orders or [])
+        protection_orders = [
+            order for order in candidate_orders
+            if self._protection_order_matches_symbol(order, symbol) and self._is_protection_order(order)
+        ]
+
+        if bool(expected_tp or expected_sl):
+            has_tp = any(self._classify_protection_order(order) == 'tp' for order in protection_orders)
+            has_sl = any(self._classify_protection_order(order) == 'sl' for order in protection_orders)
+            if (expected_tp and not has_tp) or (expected_sl and not has_sl):
+                all_open_orders = await self._fetch_open_orders_safe(None)
+                if all_open_orders is not None:
+                    seen = {
+                        str(order.get('id') or self._protection_order_info(order).get('orderId') or id(order))
+                        for order in candidate_orders
+                    }
+                    for order in all_open_orders or []:
+                        order_key = str(order.get('id') or self._protection_order_info(order).get('orderId') or id(order))
+                        if order_key in seen or not self._protection_order_matches_symbol(order, symbol):
+                            continue
+                        candidate_orders.append(order)
+                        seen.add(order_key)
+                    protection_orders = [
+                        order for order in candidate_orders
+                        if self._protection_order_matches_symbol(order, symbol) and self._is_protection_order(order)
+                    ]
 
         if not pos:
             status['status'] = 'NO_POSITION'
@@ -12481,25 +12577,29 @@ class SignalEngine(BaseEngine):
 
         status['tp_count'] = len(valid_tp)
         status['sl_count'] = len(valid_sl)
+        status['order_types'] = [self._protection_order_type(order) for order in protection_orders]
         status['tp_present'] = len(valid_tp) > 0
         status['sl_present'] = len(valid_sl) > 0
         status['missing_tp'] = bool(expected_tp) and not status['tp_present']
         status['missing_sl'] = bool(expected_sl) and not status['sl_present']
+        position_signature = self._protection_position_signature(pos)
         if status['missing_sl']:
             status['status'] = 'MISSING_SL'
             if alert:
                 await self._notify_protection_issue(
                     symbol,
-                    'missing_sl',
-                    f"🚨 {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락: SL 없음. 포지션은 유지 중이니 거래소 주문을 확인하세요."
+                    f"missing_sl:{position_signature}",
+                    f"🚨 {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락: SL 없음. 포지션은 유지 중이니 거래소 주문을 확인하세요.",
+                    cooldown_sec=30 * 24 * 60 * 60
                 )
         elif status['missing_tp']:
             status['status'] = 'MISSING_TP'
             if alert:
                 await self._notify_protection_issue(
                     symbol,
-                    'missing_tp',
-                    f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락: TP 없음"
+                    f"missing_tp:{position_signature}",
+                    f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락: TP 없음",
+                    cooldown_sec=30 * 24 * 60 * 60
                 )
         elif status['mismatch_cancelled']:
             status['status'] = 'MISMATCH_CANCELLED'

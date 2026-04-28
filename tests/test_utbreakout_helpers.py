@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from utbreakout.indicators import previous_donchian
 from utbreakout.research import summarize_diagnostic_events
 from utbreakout.risk import calculate_risk_plan
+from emas import SignalEngine
 
 
 def test_previous_donchian_excludes_current_candle():
@@ -77,3 +78,39 @@ def test_research_summary_detects_set_concentration_and_protection_gaps():
     assert summary["top_set_share_pct"] > 50.0
     assert summary["top_rejects"][0] == ("REJECTED_ADX_LOW", 6)
     assert summary["protection_missing_sl"] == ["BTC/USDT"]
+
+
+def test_protection_order_classifies_binance_stop_market_from_orig_type():
+    engine = SignalEngine.__new__(SignalEngine)
+    order = {
+        "type": "market",
+        "side": "sell",
+        "info": {
+            "type": "STOP_MARKET",
+            "origType": "STOP_MARKET",
+            "stopPrice": "78000",
+            "reduceOnly": "true",
+            "symbol": "BTCUSDT",
+        },
+    }
+
+    assert SignalEngine._classify_protection_order(engine, order) == "sl"
+    assert SignalEngine._protection_order_matches_symbol(engine, order, "BTC/USDT") is True
+
+
+def test_protection_order_keeps_take_profit_separate_from_stop_loss():
+    engine = SignalEngine.__new__(SignalEngine)
+    take_profit_market = {
+        "type": "market",
+        "side": "sell",
+        "info": {
+            "type": "TAKE_PROFIT_MARKET",
+            "origType": "TAKE_PROFIT_MARKET",
+            "stopPrice": "82000",
+            "reduceOnly": "true",
+        },
+    }
+    take_profit_limit = {"type": "limit", "side": "sell", "reduceOnly": True}
+
+    assert SignalEngine._classify_protection_order(engine, take_profit_market) == "tp"
+    assert SignalEngine._classify_protection_order(engine, take_profit_limit) == "tp"
