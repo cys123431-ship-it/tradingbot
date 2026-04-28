@@ -648,7 +648,10 @@ class TradingConfig:
             },
             'telegram': {
                 'reporting': {
+                    'event_alerts_only': True,
                     'periodic_reports_enabled': False,
+                    'startup_notice_enabled': False,
+                    'startup_keyboard_enabled': False,
                     'hourly_report_enabled': False,
                     'stateful_diag_enabled': False,
                     'alt_trend_alert_enabled': False,
@@ -1117,9 +1120,19 @@ class TradingConfig:
             self.save_config_sync()
 
         reporting_cfg = self.config.setdefault('telegram', {}).setdefault('reporting', {})
-        if 'periodic_reports_enabled' not in reporting_cfg:
-            reporting_cfg['periodic_reports_enabled'] = False
-            changed = True
+        reporting_defaults = {
+            'event_alerts_only': True,
+            'periodic_reports_enabled': False,
+            'startup_notice_enabled': False,
+            'startup_keyboard_enabled': False,
+            'hourly_report_enabled': False,
+            'stateful_diag_enabled': False,
+            'alt_trend_alert_enabled': False
+        }
+        for key, default_value in reporting_defaults.items():
+            if key not in reporting_cfg:
+                reporting_cfg[key] = default_value
+                changed = True
         normalized_timeframes = normalize_alt_trend_timeframes(
             reporting_cfg.get('alt_trend_alert_timeframes', ['1d'])
         ) or ['1d']
@@ -1156,7 +1169,10 @@ class TradingConfig:
                 "token": "",
                 "chat_id": "",
                 "reporting": {
+                    "event_alerts_only": True,
                     "periodic_reports_enabled": False,
+                    "startup_notice_enabled": False,
+                    "startup_keyboard_enabled": False,
                     "hourly_report_enabled": False,
                     "stateful_diag_enabled": False,
                     "alt_trend_alert_enabled": False,
@@ -13948,6 +13964,90 @@ class MainController:
         self.last_alt_trend_alert_sent = {}
         self.last_alt_trend_scan_summary = {}
 
+    def _telegram_reporting_cfg(self):
+        return self.cfg.get('telegram', {}).get('reporting', {}) or {}
+
+    def _telegram_event_alerts_only(self):
+        return bool(self._telegram_reporting_cfg().get('event_alerts_only', True))
+
+    def _startup_notice_enabled(self):
+        reporting = self._telegram_reporting_cfg()
+        return (not self._telegram_event_alerts_only()) and bool(reporting.get('startup_notice_enabled', False))
+
+    def _startup_keyboard_enabled(self):
+        reporting = self._telegram_reporting_cfg()
+        return (not self._telegram_event_alerts_only()) and bool(reporting.get('startup_keyboard_enabled', False))
+
+    def _should_suppress_telegram_notice(self, text):
+        if not self._telegram_event_alerts_only():
+            return False
+
+        body = str(text or '').strip()
+        if not body:
+            return True
+
+        quiet_prefixes = (
+            "🧪 UT 진단",
+            "⏱ **시간별 리포트**",
+            "⏱ 시간별 리포트",
+            "▶ **봇 시작됨",
+            "⏸ **봇 시작됨",
+            "📱 메인 메뉴",
+            "🚦 UT Breakout 조건 스테이터스",
+            "UT Breakout Research Summary",
+        )
+        if body.startswith(quiet_prefixes):
+            return True
+        if "대시보드" in body and body.startswith(("🟢", "🔴", "🟡", "⚪", "**[")):
+            return True
+
+        event_markers = (
+            "[Signal Entry]",
+            "[Signal Exit]",
+            "TEMA 진입",
+            "TEMA 청산",
+            "[Shannon]",
+            "[DualThrust]",
+            "[DualMode]",
+            "✅ [Signal Entry]",
+            "📊 [Signal Exit]",
+            "✅ **TEMA 진입",
+            "🔄 **TEMA 청산",
+            "✅ [Shannon]",
+            "🔄 [Shannon]",
+            "✅ [DualThrust]",
+            "🔄 [DualThrust]",
+            "📊 [DualThrust]",
+            "📊 [DualMode]",
+            "✅ 강제 청산 성공",
+            "TP:",
+            "SL:",
+            "🎯 TP",
+            "🛑 SL",
+            "TP 주문",
+            "SL 주문",
+            "보호",
+            "청산",
+            "익절",
+            "손절",
+            "진입 실패",
+            "진입 계획이 없어",
+            "주문 수량 계산 오류",
+            "잔고 부족",
+            "증거금 부족",
+            "최소 주문금액 미달",
+            "수량 정밀도",
+            "일일 손실",
+            "MMR",
+            "강제",
+            "긴급",
+            "실패",
+            "오류",
+            "🚨",
+            "❌",
+        )
+        return not any(marker in body for marker in event_markers)
+
     def get_exchange_mode(self):
         api_cfg = self.cfg.get('api', {})
         mode = str(api_cfg.get('exchange_mode', '')).lower()
@@ -14716,9 +14816,12 @@ class MainController:
         self._write_heartbeat()
         
         # Startup notice + keyboard
-        await self.notify(self._build_startup_notice())
+        if self._startup_notice_enabled():
+            await self.notify(self._build_startup_notice())
+        else:
+            logger.info("Telegram startup notice suppressed by event-only alert mode.")
         cid = self.cfg.get_chat_id()
-        if cid:
+        if cid and self._startup_keyboard_enabled():
             try:
                 await self.tg_app.bot.send_message(
                     chat_id=cid,
@@ -14727,6 +14830,8 @@ class MainController:
                 )
             except Exception as e:
                 logger.warning(f"Failed to send main menu keyboard: {e}")
+        else:
+            logger.info("Telegram startup keyboard suppressed by event-only alert mode.")
         
         await asyncio.gather(
             self._main_polling_loop(),  # [?대쭅 ?꾩슜] 硫붿씤 ?대쭅 猷⑦봽
@@ -18363,6 +18468,10 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
     async def notify(self, text):
         """?뚮┝ ?꾩넚"""
         try:
+            if self._should_suppress_telegram_notice(text):
+                first_line = str(text or '').strip().splitlines()[0][:120] if str(text or '').strip() else ''
+                logger.info(f"Telegram notice suppressed by event-only alert mode: {first_line}")
+                return
             cid = self.cfg.get_chat_id()
             if not cid or not self.tg_app:
                 return
