@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import asyncio
 
 import pytest
 
@@ -121,3 +122,107 @@ def test_protection_order_keeps_take_profit_separate_from_stop_loss():
 
     assert signal_engine._classify_protection_order(engine, take_profit_market) == "tp"
     assert signal_engine._classify_protection_order(engine, take_profit_limit) == "tp"
+
+
+class _DummyCtrl:
+    def format_symbol_for_display(self, symbol):
+        return symbol
+
+    async def notify(self, message):
+        self.last_message = message
+
+
+class _FakeExchange:
+    def __init__(self, orders, symbol_scope_returns=True):
+        self.orders = list(orders)
+        self.cancelled = []
+        self.symbol_scope_returns = symbol_scope_returns
+
+    def fetch_open_orders(self, symbol=None):
+        if symbol and not self.symbol_scope_returns:
+            return []
+        return list(self.orders)
+
+    def cancel_order(self, order_id, symbol):
+        self.cancelled.append((str(order_id), symbol))
+        self.orders = [
+            order for order in self.orders
+            if str(order.get("id") or order.get("info", {}).get("orderId")) != str(order_id)
+        ]
+        return {"id": order_id}
+
+
+def _protection_engine(orders, symbol_scope_returns=True):
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    engine.exchange = _FakeExchange(orders, symbol_scope_returns=symbol_scope_returns)
+    engine.ctrl = _DummyCtrl()
+    engine.last_protection_alert_ts = {}
+    engine.last_protection_order_status = {}
+    engine.is_upbit_mode = lambda: False
+    return engine
+
+
+def test_protection_audit_cancels_orphan_orders_even_when_symbol_fetch_misses_them():
+    engine = _protection_engine(
+        [
+            {
+                "id": "sl-old",
+                "side": "buy",
+                "type": "market",
+                "info": {
+                    "origType": "STOP_MARKET",
+                    "stopPrice": "105",
+                    "reduceOnly": "true",
+                    "symbol": "BTCUSDT",
+                },
+            }
+        ],
+        symbol_scope_returns=False,
+    )
+
+    status = asyncio.run(
+        engine._audit_protection_orders("BTC/USDT", pos=None, expected_tp=False, expected_sl=False, alert=False)
+    )
+
+    assert status["status"] == "ORPHAN_CANCELLED"
+    assert status["orphan_cancelled"] == 1
+    assert engine.exchange.orders == []
+
+
+def test_protection_audit_deduplicates_short_stop_loss_orders():
+    orders = [
+        {
+            "id": "sl-old",
+            "side": "buy",
+            "type": "market",
+            "timestamp": 1000,
+            "info": {"origType": "STOP_MARKET", "stopPrice": "105", "reduceOnly": "true", "symbol": "BTCUSDT"},
+        },
+        {
+            "id": "sl-new",
+            "side": "buy",
+            "type": "market",
+            "timestamp": 2000,
+            "info": {"origType": "STOP_MARKET", "stopPrice": "106", "reduceOnly": "true", "symbol": "BTCUSDT"},
+        },
+        {
+            "id": "tp",
+            "side": "buy",
+            "type": "limit",
+            "price": "90",
+            "reduceOnly": True,
+            "info": {"symbol": "BTCUSDT"},
+        },
+    ]
+    engine = _protection_engine(orders)
+    pos = {"side": "short", "contracts": 1, "entryPrice": 100}
+
+    status = asyncio.run(
+        engine._audit_protection_orders("BTC/USDT", pos=pos, expected_tp=True, expected_sl=True, alert=False)
+    )
+
+    assert status["status"] == "DUPLICATE_CANCELLED"
+    assert status["duplicate_cancelled"] == 1
+    remaining_ids = {order["id"] for order in engine.exchange.orders}
+    assert remaining_ids == {"sl-new", "tp"}

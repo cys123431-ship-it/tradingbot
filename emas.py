@@ -18,6 +18,7 @@ import time
 import sys
 import traceback
 import re
+import hashlib
 import atexit
 import signal
 import faulthandler
@@ -47,6 +48,7 @@ from telegram.ext import (
 from utbreakout.indicators import previous_donchian
 from utbreakout.research import format_research_summary
 from utbreakout.risk import calculate_risk_plan
+from utbreakout.timeframe import HTF_MAP as UTBREAKOUT_HTF_MAP, select_adaptive_timeframe
 
 # ---------------------------------------------------------
 # 0. 濡쒓퉭 諛??좏떥由ы떚
@@ -203,10 +205,15 @@ def format_utbreakout_research_summary(protection_status=None, days=7):
     )
 CORE_ENGINE = 'signal'
 UTBOT_FILTERED_BREAKOUT_STRATEGY = 'utbot_filtered_breakout_v1'
+UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY = 'utbot_adaptive_timeframe_v1'
+UTBREAKOUT_STRATEGIES = {
+    UTBOT_FILTERED_BREAKOUT_STRATEGY,
+    UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY,
+}
 UT_ONLY_STRATEGIES = {'utbot', 'utrsibb', 'utrsi', 'utbb', 'utsmc'}
 MA_STRATEGIES = set()
 PATTERN_STRATEGIES = set(UT_ONLY_STRATEGIES)
-CORE_STRATEGIES = set(UT_ONLY_STRATEGIES) | {UTBOT_FILTERED_BREAKOUT_STRATEGY}
+CORE_STRATEGIES = set(UT_ONLY_STRATEGIES) | UTBREAKOUT_STRATEGIES
 UT_HYBRID_STRATEGIES = {'utrsibb', 'utrsi', 'utbb'}
 STATEFUL_UT_STRATEGIES = {'utbot', 'utsmc'} | UT_HYBRID_STRATEGIES
 STRATEGY_DISPLAY_NAMES = {
@@ -219,7 +226,8 @@ STRATEGY_DISPLAY_NAMES = {
     'utrsibb': 'UTRSIBB',
     'utrsi': 'UTRSI',
     'utbb': 'UTBB',
-    UTBOT_FILTERED_BREAKOUT_STRATEGY: 'UTBOT_FILTERED_BREAKOUT_V1'
+    UTBOT_FILTERED_BREAKOUT_STRATEGY: 'UTBOT_FILTERED_BREAKOUT_V1',
+    UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY: 'UTBOT_ADAPTIVE_TIMEFRAME_V1'
 }
 UT_HYBRID_TIMING_LABELS = {
     'utrsibb': 'RSI+BB',
@@ -413,6 +421,11 @@ def build_default_utbot_filtered_breakout_config():
         'auto_select_enabled': False,
         'selection_mode': 'manual',
         'auto_timeframes': list(UTBREAKOUT_AUTO_TIMEFRAMES),
+        'adaptive_timeframe_enabled': False,
+        'adaptive_timeframes': list(UTBREAKOUT_AUTO_TIMEFRAMES),
+        'adaptive_timeframe_min_score': 45.0,
+        'adaptive_timeframe_switch_margin': 8.0,
+        'adaptive_timeframe_min_hold_candles': 3,
         'entry_timeframe': '15m',
         'exit_timeframe': '15m',
         'htf_timeframe': '1h',
@@ -2355,6 +2368,8 @@ class SignalEngine(BaseEngine):
         self.utbot_filtered_breakout_entry_plans = {}  # symbol -> accepted risk plan
         self.utbot_filtered_breakout_failures = {}  # symbol -> side -> recent failed candidate timestamps
         self.utbreakout_futures_context_cache = {}  # symbol -> cached funding/OI context for research logs
+        self.utbreakout_adaptive_tf_state = {}  # symbol -> selected TF stability state
+        self.utbreakout_adaptive_last_decision_ts = {}  # symbol -> tf -> last closed candle evaluated
         self.last_protection_order_status = {}  # symbol -> exchange-side TP/SL audit status
         self.last_protection_alert_ts = {}  # symbol:kind -> last Telegram alert timestamp
         self.last_entry_reason = {}        # symbol -> latest entry decision reason
@@ -2399,6 +2414,8 @@ class SignalEngine(BaseEngine):
         self.utbot_filtered_breakout_entry_plans = {}
         self.utbot_filtered_breakout_failures = {}
         self.utbreakout_futures_context_cache = {}
+        self.utbreakout_adaptive_tf_state = {}
+        self.utbreakout_adaptive_last_decision_ts = {}
         self.last_protection_order_status = {}
         self.last_protection_alert_ts = {}
         self.last_entry_reason = {}
@@ -2517,8 +2534,12 @@ class SignalEngine(BaseEngine):
         cfg = self.get_runtime_common_settings()
         strategy_params = self.get_runtime_strategy_params()
         active_strategy = str(strategy_params.get('active_strategy', 'utbot') or 'utbot').lower()
-        if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+        if active_strategy in UTBREAKOUT_STRATEGIES:
             fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+            if bool(fb_cfg.get('adaptive_timeframe_enabled', False)) and symbol:
+                selected_tf = (self.utbreakout_adaptive_tf_state.get(symbol, {}) or {}).get('selected_tf')
+                if selected_tf:
+                    return selected_tf
             return fb_cfg.get('exit_timeframe', fb_cfg.get('entry_timeframe', '15m'))
         if symbol and symbol == self.scanner_active_symbol:
             return cfg.get('scanner_exit_timeframe', '1h')
@@ -3913,7 +3934,9 @@ class SignalEngine(BaseEngine):
             'max_risk_per_trade_usdt': 1.0,
             'daily_max_loss_usdt': 3.0,
             'daily_profit_target_usdt': 5.0,
-            'opposite_set_exit_min_pnl_usdt': 0.0
+            'opposite_set_exit_min_pnl_usdt': 0.0,
+            'adaptive_timeframe_min_score': 45.0,
+            'adaptive_timeframe_switch_margin': 8.0
         }.items():
             min_value = None if key == 'opposite_set_exit_min_pnl_usdt' else 0.0
             _float(key, default, min_value)
@@ -3929,7 +3952,8 @@ class SignalEngine(BaseEngine):
             'donchian_length': 20,
             'max_daily_trades': 5,
             'max_consecutive_losses': 3,
-            'opposite_set_exit_min_hold_candles': 3
+            'opposite_set_exit_min_hold_candles': 3,
+            'adaptive_timeframe_min_hold_candles': 3
         }.items():
             min_value = 0 if key == 'opposite_set_exit_min_hold_candles' else 1
             _int(key, default, min_value)
@@ -3955,9 +3979,23 @@ class SignalEngine(BaseEngine):
         else:
             auto_timeframes = list(UTBREAKOUT_AUTO_TIMEFRAMES)
         cfg['auto_timeframes'] = auto_timeframes or list(UTBREAKOUT_AUTO_TIMEFRAMES)
+        raw_adaptive_timeframes = cfg.get('adaptive_timeframes', cfg['auto_timeframes'])
+        if isinstance(raw_adaptive_timeframes, str):
+            adaptive_timeframes = [item.strip().lower() for item in raw_adaptive_timeframes.split(',') if item.strip()]
+        elif isinstance(raw_adaptive_timeframes, (list, tuple, set)):
+            adaptive_timeframes = [str(item).strip().lower() for item in raw_adaptive_timeframes if str(item).strip()]
+        else:
+            adaptive_timeframes = list(cfg['auto_timeframes'])
+        cfg['adaptive_timeframes'] = [
+            tf for tf in (adaptive_timeframes or list(UTBREAKOUT_AUTO_TIMEFRAMES))
+            if tf in UTBREAKOUT_AUTO_TIMEFRAMES
+        ] or list(UTBREAKOUT_AUTO_TIMEFRAMES)
         cfg['entry_timeframe'] = str(cfg.get('entry_timeframe') or '15m').strip().lower() or '15m'
         cfg['exit_timeframe'] = str(cfg.get('exit_timeframe') or cfg['entry_timeframe']).strip().lower() or cfg['entry_timeframe']
         cfg['htf_timeframe'] = str(cfg.get('htf_timeframe') or '1h').strip().lower() or '1h'
+        active_strategy = str(params.get('active_strategy', '') or '').lower() if isinstance(params, dict) else ''
+        if active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY:
+            cfg['adaptive_timeframe_enabled'] = True
         for key in (
             'use_heikin_ashi',
             'exclude_rsi_extreme',
@@ -3966,7 +4004,8 @@ class SignalEngine(BaseEngine):
             'opposite_set_exit_enabled',
             'opposite_set_exit_min_pnl_enabled',
             'ema_rsi_exit_enabled',
-            'adx_donchian_exit_enabled'
+            'adx_donchian_exit_enabled',
+            'adaptive_timeframe_enabled'
         ):
             cfg[key] = bool(cfg.get(key, False))
         # A-option (opposite UT signal only) is intentionally rejected for UT Breakout.
@@ -4565,6 +4604,10 @@ class SignalEngine(BaseEngine):
 
     async def _build_utbreakout_auto_analysis(self, symbol, base_df, cfg):
         timeframes = list(cfg.get('auto_timeframes') or UTBREAKOUT_AUTO_TIMEFRAMES)
+        if bool(cfg.get('adaptive_timeframe_enabled', False)):
+            for tf in list(cfg.get('adaptive_timeframes') or UTBREAKOUT_AUTO_TIMEFRAMES):
+                if tf not in timeframes:
+                    timeframes.append(tf)
         entry_tf = str(cfg.get('entry_timeframe', '15m') or '15m').lower()
         timeframe_metrics = {}
         errors = {}
@@ -4596,6 +4639,67 @@ class SignalEngine(BaseEngine):
             'scores': scores,
             'errors': errors,
         }
+
+    async def _resolve_utbreakout_adaptive_timeframe(self, symbol, base_df, cfg, pos=None):
+        if not bool(cfg.get('adaptive_timeframe_enabled', False)):
+            return cfg, base_df, None
+        analysis = await self._build_utbreakout_auto_analysis(symbol, base_df, cfg)
+        state = dict(self.utbreakout_adaptive_tf_state.get(symbol, {}) or {})
+        position_side = str((pos or {}).get('side') or 'none').lower() if isinstance(pos, dict) else 'none'
+        decision = select_adaptive_timeframe(
+            analysis.get('timeframes', {}),
+            cfg,
+            state=state,
+            position_side=position_side,
+        )
+        selected_tf = decision.get('selected_tf')
+        previous_tf = decision.get('previous_tf')
+        if selected_tf:
+            next_state = dict(state)
+            next_state['selected_tf'] = selected_tf
+            next_state['selected_score'] = decision.get('selected_score')
+            next_state['last_reason'] = decision.get('reason')
+            next_state['last_decision'] = decision.get('decision')
+            next_state['last_decision_ts'] = decision.get('selected_timestamp')
+            if selected_tf != previous_tf:
+                next_state['last_switch_ts'] = decision.get('selected_timestamp') or int(time.time() * 1000)
+            elif 'last_switch_ts' not in next_state:
+                next_state['last_switch_ts'] = decision.get('selected_timestamp') or int(time.time() * 1000)
+            self.utbreakout_adaptive_tf_state[symbol] = next_state
+
+        effective_cfg = dict(cfg)
+        effective_cfg['_auto_analysis_override'] = analysis
+        effective_cfg['_adaptive_timeframe_decision'] = decision
+        if not selected_tf:
+            return effective_cfg, base_df, decision
+
+        effective_cfg['entry_timeframe'] = selected_tf
+        effective_cfg['exit_timeframe'] = selected_tf
+        effective_cfg['htf_timeframe'] = decision.get('htf_timeframe') or UTBREAKOUT_HTF_MAP.get(selected_tf, '1h')
+        selected_df = base_df
+        base_tf = str(cfg.get('entry_timeframe', '15m') or '15m').lower()
+        if selected_tf != base_tf:
+            ohlcv = await asyncio.to_thread(
+                self.market_data_exchange.fetch_ohlcv,
+                symbol,
+                selected_tf,
+                limit=300
+            )
+            selected_df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                selected_df[col] = pd.to_numeric(selected_df[col], errors='coerce')
+        return effective_cfg, selected_df, decision
+
+    def _format_adaptive_timeframe_summary(self, decision):
+        if not isinstance(decision, dict):
+            return "Adaptive TF 분석 기록 없음"
+        top3 = decision.get('top3') or []
+        top_text = ", ".join(
+            f"{item.get('tf')}:{float(item.get('score', 0) or 0):.1f}"
+            for item in top3[:3]
+        ) or "n/a"
+        selected = decision.get('selected_tf') or "NO_TRADE"
+        return f"{selected} ({decision.get('decision', 'WAIT')}) | {decision.get('reason', '')} | top {top_text}"
 
     def _select_utbreakout_auto_set(self, analysis, cfg):
         raw_scores = (analysis or {}).get('scores') if isinstance(analysis, dict) else None
@@ -4735,7 +4839,9 @@ class SignalEngine(BaseEngine):
         selected_id = normalize_utbreakout_set_id(cfg.get('active_set_id'), UTBREAKOUT_DEFAULT_SET_ID)
         if bool(cfg.get('auto_select_enabled', False)) or str(cfg.get('selection_mode', '')).lower() == 'auto':
             try:
-                analysis = await self._build_utbreakout_auto_analysis(symbol, df, cfg)
+                analysis = cfg.get('_auto_analysis_override') if isinstance(cfg.get('_auto_analysis_override'), dict) else None
+                if analysis is None:
+                    analysis = await self._build_utbreakout_auto_analysis(symbol, df, cfg)
                 selected_id, auto_reason = self._select_utbreakout_auto_set(analysis, cfg)
             except Exception as exc:
                 auto_reason = f"AUTO 분석 실패: {exc}. 수동 Set{selected_id} 유지"
@@ -5271,7 +5377,8 @@ class SignalEngine(BaseEngine):
             utbreakout_htf=status.get('htf_summary'),
             utbreakout_metrics=status.get('metric_summary'),
             utbreakout_risk=status.get('risk_summary'),
-            note=status.get('reject_code') or status.get('accepted_code') or status.get('reason')
+            utbreakout_adaptive_tf=status.get('adaptive_timeframe_summary'),
+            note=status.get('reject_code') or status.get('accepted_code') or status.get('adaptive_timeframe_summary') or status.get('reason')
         )
 
     def _record_utbreakout_diagnostic_event(self, symbol, status, event=None, extra=None):
@@ -5319,6 +5426,11 @@ class SignalEngine(BaseEngine):
                 'set_filters': status.get('set_filters'),
                 'entry_timeframe': status.get('entry_timeframe'),
                 'htf_timeframe': status.get('htf_timeframe'),
+                'adaptive_timeframe_enabled': status.get('adaptive_timeframe_enabled'),
+                'adaptive_selected_tf': status.get('adaptive_selected_tf'),
+                'adaptive_previous_tf': status.get('adaptive_previous_tf'),
+                'adaptive_timeframe_summary': status.get('adaptive_timeframe_summary'),
+                'adaptive_top3': status.get('adaptive_top3'),
                 'decision_candle_ts': status.get('decision_candle_ts'),
                 'ut_signal_ts': status.get('ut_signal_ts'),
                 'utbot_key_value': _safe_float_or_none(status.get('utbot_key_value')),
@@ -5370,11 +5482,14 @@ class SignalEngine(BaseEngine):
     async def _calculate_utbot_filtered_breakout_signal(self, symbol, df, strategy_params):
         cfg = self._get_utbot_filtered_breakout_config(strategy_params)
         self._clear_utbot_filtered_breakout_entry_plan(symbol)
+        active_strategy = str((strategy_params or {}).get('active_strategy', UTBOT_FILTERED_BREAKOUT_STRATEGY) or UTBOT_FILTERED_BREAKOUT_STRATEGY).lower()
+        strategy_label = STRATEGY_DISPLAY_NAMES.get(active_strategy, 'UTBOT_FILTERED_BREAKOUT_V1')
         status = {
-            'strategy': 'UTBOT_FILTERED_BREAKOUT_V1',
+            'strategy': strategy_label,
             'stage': 'evaluate',
             'entry_timeframe': cfg.get('entry_timeframe', '15m'),
             'htf_timeframe': cfg.get('htf_timeframe', '1h'),
+            'adaptive_timeframe_enabled': bool(cfg.get('adaptive_timeframe_enabled', False)),
             'utbot_key_value': cfg.get('utbot_key_value'),
             'utbot_atr_period': cfg.get('utbot_atr_period'),
             'use_heikin_ashi': cfg.get('use_heikin_ashi', False)
@@ -5407,6 +5522,33 @@ class SignalEngine(BaseEngine):
 
         if df is None or len(df) < 5:
             return _finish(None, "UTBOT_FILTERED_BREAKOUT_V1 데이터 부족", None)
+
+        if bool(cfg.get('adaptive_timeframe_enabled', False)):
+            try:
+                cfg, df, adaptive_decision = await self._resolve_utbreakout_adaptive_timeframe(symbol, df, cfg)
+                status.update({
+                    'entry_timeframe': cfg.get('entry_timeframe', '15m'),
+                    'exit_timeframe': cfg.get('exit_timeframe', cfg.get('entry_timeframe', '15m')),
+                    'htf_timeframe': cfg.get('htf_timeframe', '1h'),
+                    'adaptive_timeframe_enabled': True,
+                    'adaptive_timeframe_decision': adaptive_decision,
+                    'adaptive_timeframe_summary': self._format_adaptive_timeframe_summary(adaptive_decision),
+                    'adaptive_selected_tf': (adaptive_decision or {}).get('selected_tf') if isinstance(adaptive_decision, dict) else None,
+                    'adaptive_previous_tf': (adaptive_decision or {}).get('previous_tf') if isinstance(adaptive_decision, dict) else None,
+                    'adaptive_top3': (adaptive_decision or {}).get('top3') if isinstance(adaptive_decision, dict) else None,
+                })
+                if not (adaptive_decision or {}).get('selected_tf'):
+                    return _finish(
+                        None,
+                        f"REJECTED_TIMEFRAME_NO_TRADE: {self._format_adaptive_timeframe_summary(adaptive_decision)}",
+                        'REJECTED_TIMEFRAME_NO_TRADE'
+                    )
+            except Exception as exc:
+                return _finish(
+                    None,
+                    f"REJECTED_TIMEFRAME_NO_TRADE: Adaptive TF 분석 실패 ({exc})",
+                    'REJECTED_TIMEFRAME_NO_TRADE'
+                )
 
         closed = df.iloc[:-1].copy().reset_index(drop=True)
         for col in ['open', 'high', 'low', 'close', 'volume']:
@@ -5465,6 +5607,17 @@ class SignalEngine(BaseEngine):
         status['decision_candle_ts'] = decision_ts
         status['feed_last_ts'] = int(df.iloc[-1]['timestamp']) if len(df) else decision_ts
         status['entry_price'] = entry_price
+        if bool(cfg.get('adaptive_timeframe_enabled', False)):
+            tf_key = str(cfg.get('entry_timeframe', '15m') or '15m')
+            symbol_decisions = self.utbreakout_adaptive_last_decision_ts.setdefault(symbol, {})
+            last_adaptive_ts = int(symbol_decisions.get(tf_key, 0) or 0)
+            if decision_ts <= last_adaptive_ts:
+                return _finish(
+                    None,
+                    f"ADAPTIVE_TF 대기: {tf_key} 마감봉 {decision_ts} 이미 평가 완료",
+                    None
+                )
+            symbol_decisions[tf_key] = decision_ts
 
         ut_sig, ut_reason, ut_detail = self._calculate_utbot_signal(
             df,
@@ -5749,7 +5902,11 @@ class SignalEngine(BaseEngine):
         except ValueError as e:
             return _finish(None, f"REJECTED_RISK_REWARD_LOW: {e}", 'REJECTED_RISK_REWARD_LOW', record_failure=True, side=side)
         plan.update({
-            'strategy': UTBOT_FILTERED_BREAKOUT_STRATEGY,
+            'strategy': active_strategy if active_strategy in UTBREAKOUT_STRATEGIES else UTBOT_FILTERED_BREAKOUT_STRATEGY,
+            'entry_timeframe': cfg.get('entry_timeframe', '15m'),
+            'exit_timeframe': cfg.get('exit_timeframe', cfg.get('entry_timeframe', '15m')),
+            'htf_timeframe': cfg.get('htf_timeframe', '1h'),
+            'adaptive_timeframe_enabled': bool(cfg.get('adaptive_timeframe_enabled', False)),
             'atr': atr_value,
             'atr_pct': atr_pct,
             'decision_candle_ts': decision_ts
@@ -5833,6 +5990,20 @@ class SignalEngine(BaseEngine):
         closed = df.iloc[:-1].copy().dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
         if len(closed) < 5:
             return f"🚦 UT Breakout 조건 스테이터스\n\n{symbol} {entry_tf} 유효 데이터 부족"
+
+        adaptive_decision = None
+        if bool(cfg.get('adaptive_timeframe_enabled', False)):
+            try:
+                cfg, df, adaptive_decision = await self._resolve_utbreakout_adaptive_timeframe(symbol, df, cfg)
+                entry_tf = cfg.get('entry_timeframe', entry_tf)
+                htf_tf = cfg.get('htf_timeframe', htf_tf)
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                closed = df.iloc[:-1].copy().dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+                if len(closed) < 5:
+                    return f"🚦 UT Breakout 조건 스테이터스\n\n{symbol} {entry_tf} 유효 데이터 부족"
+            except Exception as e:
+                adaptive_decision = {'selected_tf': None, 'decision': 'ERROR', 'reason': str(e), 'top3': []}
 
         selected_set, auto_analysis, auto_reason = await self._resolve_utbreakout_selected_set(symbol, df, cfg)
         effective_cfg = dict(cfg)
@@ -6091,6 +6262,7 @@ class SignalEngine(BaseEngine):
             "🚦 UT Breakout 조건 스테이터스",
             f"심볼: {symbol}",
             f"TF: 진입 {entry_tf} / HTF {htf_tf}",
+            f"Adaptive TF: {'ON' if cfg.get('adaptive_timeframe_enabled') else 'OFF'} / {self._format_adaptive_timeframe_summary(adaptive_decision) if adaptive_decision else '고정 시간봉'}",
             f"마지막 마감봉: {_fmt_ts(decision_ts)} / close {_fmt(entry_price, 4)}",
             f"현재 UTBot 방향: {ut_label}",
             f"선택모드: {mode_label}",
@@ -8545,6 +8717,8 @@ class SignalEngine(BaseEngine):
             'last_stateful_retry_ts',
             'last_processed_exit_candle_ts',
             'last_candle_time',
+            'utbreakout_adaptive_tf_state',
+            'utbreakout_adaptive_last_decision_ts',
             'fisher_states',
             'vbo_states',
             'cameron_states'
@@ -8642,7 +8816,7 @@ class SignalEngine(BaseEngine):
                     or active_strategy == 'cameron'
                     or active_strategy == 'utsmc'
                     or active_strategy == 'utbot'
-                    or active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY
+                    or active_strategy in UTBREAKOUT_STRATEGIES
                     or active_strategy in UT_HYBRID_STRATEGIES
                 )
             )
@@ -8749,7 +8923,7 @@ class SignalEngine(BaseEngine):
                     active_strategy = scan_params.get('active_strategy', 'utbot').lower()
                     if active_strategy not in CORE_STRATEGIES:
                         active_strategy = 'utbot'
-                    if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                    if active_strategy in UTBREAKOUT_STRATEGIES:
                         scan_tf = self._get_utbot_filtered_breakout_config(scan_params).get('entry_timeframe', '15m')
                     
                     # Use scanner_timeframe if set, but ensure we are thinking about consistency
@@ -8949,14 +9123,22 @@ class SignalEngine(BaseEngine):
                 'sl_count': protection_audit.get('sl_count', 0),
                 'missing_tp': protection_audit.get('missing_tp', False),
                 'missing_sl': protection_audit.get('missing_sl', False),
+                'orphan_cancelled': protection_audit.get('orphan_cancelled', 0),
+                'duplicate_cancelled': protection_audit.get('duplicate_cancelled', 0),
+                'invalid_price_cancelled': protection_audit.get('invalid_price_cancelled', 0),
                 'audit_status': protection_audit.get('status', 'UNKNOWN')
             }
             
             # [New] Status Display Enhancement
             symbol_status['leverage'] = comm_cfg.get('leverage', 1 if self.is_upbit_mode() else 20)
             symbol_status['margin_mode'] = 'SPOT' if self.is_upbit_mode() else 'ISOLATED'
-            symbol_status['entry_tf'] = comm_cfg.get('entry_timeframe', comm_cfg.get('timeframe', '8h'))
-            symbol_status['exit_tf'] = comm_cfg.get('exit_timeframe', '4h')
+            utbreakout_status = self.last_utbot_filtered_breakout_status.get(symbol, {}) or {}
+            if active_strategy in UTBREAKOUT_STRATEGIES and utbreakout_status.get('entry_timeframe'):
+                symbol_status['entry_tf'] = utbreakout_status.get('entry_timeframe')
+                symbol_status['exit_tf'] = utbreakout_status.get('exit_timeframe') or self._get_exit_timeframe(symbol)
+            else:
+                symbol_status['entry_tf'] = comm_cfg.get('entry_timeframe', comm_cfg.get('timeframe', '8h'))
+                symbol_status['exit_tf'] = comm_cfg.get('exit_timeframe', '4h')
 
             self.ctrl.status_data[symbol] = symbol_status
             
@@ -9326,13 +9508,13 @@ class SignalEngine(BaseEngine):
             f"✅ [Signal Entry] {display_symbol} `{str(side).upper()}`",
             f"전략: `{strategy_name}` | 수량 `{qty}`",
             f"주문가: `{self._fmt_signal_trade_value(requested_price)}` | 체결가: `{self._fmt_signal_trade_value(actual_entry_price)}`",
-            f"TF: 진입 `{cfg.get('entry_timeframe', cfg.get('timeframe', '15m'))}` / 청산 `{self._get_exit_timeframe(symbol)}`",
+            f"TF: 진입 `{(entry_plan or {}).get('entry_timeframe') or cfg.get('entry_timeframe', cfg.get('timeframe', '15m'))}` / 청산 `{(entry_plan or {}).get('exit_timeframe') or self._get_exit_timeframe(symbol)}`",
             f"네트워크: `{self.ctrl.get_network_status_label()}` | 거래소 `{self.ctrl.get_exchange_display_name()}`",
         ]
         entry_reason = self.last_entry_reason.get(symbol)
         if entry_reason:
             lines.append(f"진입근거: `{entry_reason}`")
-        if strategy_name == UTBOT_FILTERED_BREAKOUT_STRATEGY.upper() and isinstance(entry_plan, dict):
+        if strategy_name in {name.upper() for name in STRATEGY_DISPLAY_NAMES.values() if name.startswith('UTBOT_')} and isinstance(entry_plan, dict):
             try:
                 lev = float(leverage or cfg.get('leverage', 1) or 1)
                 notional = float(target_notional) if target_notional is not None else float(qty) * float(actual_entry_price)
@@ -10460,7 +10642,7 @@ class SignalEngine(BaseEngine):
         
         if await self.check_daily_loss_limit():
             logger.info("??Daily loss limit reached, skipping trade")
-            if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+            if active_strategy in UTBREAKOUT_STRATEGIES:
                 self.last_entry_reason[symbol] = "REJECTED_DAILY_LOSS_LIMIT"
             self.last_candle_time[symbol] = processing_candle_time
             self.last_candle_success[symbol] = True
@@ -10471,7 +10653,7 @@ class SignalEngine(BaseEngine):
             
             # [MODIFIED] Prioritize entry_timeframe for fetching entry OHLCV
             common_cfg = self.get_runtime_common_settings()
-            if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+            if active_strategy in UTBREAKOUT_STRATEGIES:
                 filtered_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
                 tf = filtered_cfg.get('entry_timeframe', '15m')
             else:
@@ -10533,7 +10715,7 @@ class SignalEngine(BaseEngine):
             if sig and not self.is_trade_direction_allowed(sig):
                 logger.info(f"??Signal {sig} blocked by direction filter: {d_mode}")
                 self.last_entry_reason[symbol] = self.format_trade_direction_block_reason(sig)
-                if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                if active_strategy in UTBREAKOUT_STRATEGIES:
                     self._clear_utbot_filtered_breakout_entry_plan(symbol)
                 sig = None
 
@@ -10805,7 +10987,7 @@ class SignalEngine(BaseEngine):
                     sig
                 )
 
-            elif active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+            elif active_strategy in UTBREAKOUT_STRATEGIES:
                 if pos:
                     self.last_entry_reason[symbol] = (
                         f"포지션 보유 중 ({pos['side'].upper()}), UTBOT_FILTERED_BREAKOUT_V1 신규 진입 대기"
@@ -10814,7 +10996,9 @@ class SignalEngine(BaseEngine):
                 elif sig:
                     self.last_entry_reason[symbol] = f"ACCEPTED_ENTRY: {sig.upper()} filtered breakout -> 진입"
                     logger.info(f"[UTBOT_FILTERED_BREAKOUT_V1] New {sig.upper()} entry")
-                    await self.entry(symbol, sig, float(k['c']))
+                    plan = self._get_utbot_filtered_breakout_entry_plan(symbol, sig) or {}
+                    entry_ref_price = float(plan.get('entry_price') or k['c'])
+                    await self.entry(symbol, sig, entry_ref_price)
                 else:
                     self._clear_utbot_filtered_breakout_entry_plan(symbol)
 
@@ -11307,7 +11491,7 @@ class SignalEngine(BaseEngine):
                         exit_reason = " | ".join(exit_reason_parts)
                 if raw_exit_long or raw_exit_short:
                     logger.info(f"[Exit Debug] {symbol} {strategy_name}: {exit_reason}")
-            elif active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+            elif active_strategy in UTBREAKOUT_STRATEGIES:
                 strategy_name = "UTBOT_FILTERED_BREAKOUT_V1(Exit)"
                 fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
                 exit_reason_parts = []
@@ -11657,8 +11841,8 @@ class SignalEngine(BaseEngine):
             sig, entry_reason, _ = precomputed.get('rsibb') or self._calculate_rsibb_signal(df, strategy_params)
             is_bullish = sig == 'long'
             is_bearish = sig == 'short'
-        elif active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
-            entry_mode = UTBOT_FILTERED_BREAKOUT_STRATEGY
+        elif active_strategy in UTBREAKOUT_STRATEGIES:
+            entry_mode = active_strategy
             sig, entry_reason, _ = await self._calculate_utbot_filtered_breakout_signal(symbol, df, strategy_params)
             is_bullish = sig == 'long'
             is_bearish = sig == 'short'
@@ -11778,11 +11962,11 @@ class SignalEngine(BaseEngine):
             active_strategy = strategy_params.get('active_strategy', '').lower()
             filtered_breakout_plan = (
                 self._get_utbot_filtered_breakout_entry_plan(symbol, side)
-                if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY else None
+                if active_strategy in UTBREAKOUT_STRATEGIES else None
             )
 
             def _record_filtered_breakout_entry_block(code, reason, extra=None):
-                if active_strategy != UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                if active_strategy not in UTBREAKOUT_STRATEGIES:
                     return
                 fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
                 status = {
@@ -11803,7 +11987,7 @@ class SignalEngine(BaseEngine):
                     extra=payload_extra
                 )
 
-            lev_default = 5 if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY else 10
+            lev_default = 5 if active_strategy in UTBREAKOUT_STRATEGIES else 10
             lev = int(max(1.0, float(cfg.get('leverage', lev_default) or lev_default)))
             req_risk_pct = float(cfg.get('risk_per_trade_pct', 10.0) or 10.0)
             max_risk_pct = float(cfg.get('max_risk_per_trade_pct', 100.0) or 100.0)
@@ -11832,7 +12016,7 @@ class SignalEngine(BaseEngine):
                 return min(parsed) if parsed else 0.0
             
             safety_buffer = 0.98
-            if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+            if active_strategy in UTBREAKOUT_STRATEGIES:
                 if not filtered_breakout_plan:
                     _record_filtered_breakout_entry_block(
                         'ENTRY_BLOCKED_MISSING_PLAN',
@@ -11883,7 +12067,7 @@ class SignalEngine(BaseEngine):
 
             max_notional = free * lev * safety_buffer
             if min_notional > 0 and target_notional < min_notional:
-                if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                if active_strategy in UTBREAKOUT_STRATEGIES:
                     logger.warning(
                         f"[UTBOT_FILTERED_BREAKOUT_V1] Entry blocked by min notional: "
                         f"target={target_notional:.2f}, min={min_notional:.2f}, risk_plan={filtered_breakout_plan}"
@@ -11926,7 +12110,7 @@ class SignalEngine(BaseEngine):
                     )
                     return
 
-            if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY and target_notional > max_notional:
+            if active_strategy in UTBREAKOUT_STRATEGIES and target_notional > max_notional:
                 logger.warning(
                     f"[UTBOT_FILTERED_BREAKOUT_V1] Entry blocked by margin cap: "
                     f"target={target_notional:.2f}, max={max_notional:.2f}, free={free:.2f}, lev={lev}"
@@ -11957,7 +12141,7 @@ class SignalEngine(BaseEngine):
                     f"Entry quantity below min notional after precision: qty={qty}, "
                     f"notional={qty_notional:.4f}, min={min_notional:.4f}"
                 )
-                if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+                if active_strategy in UTBREAKOUT_STRATEGIES:
                     _record_filtered_breakout_entry_block(
                         'ENTRY_BLOCKED_PRECISION_MIN_NOTIONAL',
                         'UTBOT_FILTERED_BREAKOUT_V1 entry blocked after precision min notional check',
@@ -11984,9 +12168,9 @@ class SignalEngine(BaseEngine):
                 await self.ctrl.notify(f"⚠️ 주문 수량 계산 오류: {qty} (잔고: {free:.2f})")
                 return
             
-            if active_strategy != UTBOT_FILTERED_BREAKOUT_STRATEGY and bounded_risk_pct != req_risk_pct:
+            if active_strategy not in UTBREAKOUT_STRATEGIES and bounded_risk_pct != req_risk_pct:
                 await self.ctrl.notify(f"⚠️ 리스크 상한 적용: {req_risk_pct:.1f}% -> {bounded_risk_pct:.1f}%")
-            if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+            if active_strategy in UTBREAKOUT_STRATEGIES:
                 logger.info(
                     f"[UTBOT_FILTERED_BREAKOUT_V1] Entry params: qty={qty}, lev={lev}x, "
                     f"risk_usdt={float(filtered_breakout_plan.get('risk_usdt', 0) or 0):.4f}, "
@@ -12027,7 +12211,7 @@ class SignalEngine(BaseEngine):
                     qty,
                     price,
                     actual_entry_price,
-                    entry_plan=filtered_breakout_plan if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY else None,
+                    entry_plan=filtered_breakout_plan if active_strategy in UTBREAKOUT_STRATEGIES else None,
                     leverage=lev,
                     target_notional=target_notional,
                     margin_to_use=margin_to_use
@@ -12118,7 +12302,7 @@ class SignalEngine(BaseEngine):
                                 sl_distance=sl_distance
                             )
 
-            elif active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+            elif active_strategy in UTBREAKOUT_STRATEGIES:
                 plan = filtered_breakout_plan or self._get_utbot_filtered_breakout_entry_plan(symbol, side)
                 if not plan:
                     logger.warning("[UTBOT_FILTERED_BREAKOUT_V1] Missing risk plan after entry; TP/SL placement skipped.")
@@ -12156,9 +12340,10 @@ class SignalEngine(BaseEngine):
                         symbol,
                         {
                             'candidate_side': side,
-                            'entry_timeframe': self._get_utbot_filtered_breakout_config(strategy_params).get('entry_timeframe', '15m'),
-                            'htf_timeframe': self._get_utbot_filtered_breakout_config(strategy_params).get('htf_timeframe', '1h'),
-                            'reason': 'UTBOT_FILTERED_BREAKOUT_V1 entry filled',
+                            'entry_timeframe': plan.get('entry_timeframe') or self._get_utbot_filtered_breakout_config(strategy_params).get('entry_timeframe', '15m'),
+                            'htf_timeframe': plan.get('htf_timeframe') or self._get_utbot_filtered_breakout_config(strategy_params).get('htf_timeframe', '1h'),
+                            'adaptive_timeframe_enabled': plan.get('adaptive_timeframe_enabled'),
+                            'reason': f"{STRATEGY_DISPLAY_NAMES.get(active_strategy, 'UTBOT_FILTERED_BREAKOUT_V1')} entry filled",
                             'entry_price': actual_entry_price,
                             'entry_plan': dict(plan)
                         },
@@ -12408,6 +12593,116 @@ class SignalEngine(BaseEngine):
     def _is_protection_order(self, order):
         return self._classify_protection_order(order) in {'tp', 'sl'}
 
+    def _protection_order_id(self, order):
+        if not isinstance(order, dict):
+            return None
+        info = self._protection_order_info(order)
+        for value in (
+            order.get('id'),
+            order.get('orderId'),
+            order.get('clientOrderId'),
+            order.get('client_order_id'),
+            info.get('orderId'),
+            info.get('clientOrderId'),
+            info.get('origClientOrderId'),
+        ):
+            if value not in (None, ''):
+                return str(value)
+        return None
+
+    def _protection_client_order_id(self, order):
+        if not isinstance(order, dict):
+            return ''
+        info = self._protection_order_info(order)
+        return str(
+            order.get('clientOrderId')
+            or order.get('client_order_id')
+            or info.get('clientOrderId')
+            or info.get('origClientOrderId')
+            or ''
+        ).strip()
+
+    def _protection_order_timestamp(self, order):
+        if not isinstance(order, dict):
+            return 0
+        info = self._protection_order_info(order)
+        for value in (
+            order.get('timestamp'),
+            order.get('lastTradeTimestamp'),
+            info.get('updateTime'),
+            info.get('time'),
+            info.get('workingTime'),
+        ):
+            try:
+                parsed = int(float(value))
+                if parsed > 0:
+                    return parsed
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    def _build_protection_client_order_id(self, symbol, side, kind, pos=None):
+        raw = "|".join([
+            self._normalize_protection_symbol(symbol),
+            str(side or '').lower(),
+            str(kind or '').lower(),
+            self._protection_position_signature(pos),
+            str(int(time.time() * 1000)),
+        ])
+        digest = hashlib.sha1(raw.encode('utf-8')).hexdigest()[:10]
+        symbol_part = self._normalize_protection_symbol(symbol)[-8:] or 'SYMBOL'
+        return f"utb{str(kind or '')[:2]}{symbol_part}{digest}"[:36]
+
+    async def _collect_protection_orders(self, symbol):
+        merged = []
+        seen = set()
+        for scope in (symbol, None):
+            open_orders = await self._fetch_open_orders_safe(scope)
+            if open_orders is None:
+                continue
+            for order in open_orders or []:
+                if not self._protection_order_matches_symbol(order, symbol):
+                    continue
+                if not self._is_protection_order(order):
+                    continue
+                key = self._protection_order_id(order) or str(id(order))
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(order)
+        return merged
+
+    async def _cancel_single_protection_order(self, symbol, order, reason='protection cleanup'):
+        order_id = self._protection_order_id(order)
+        if not order_id:
+            return False
+        order_symbol = str(order.get('symbol') or '').strip() if isinstance(order, dict) else ''
+        candidates = [symbol]
+        if order_symbol and '/' in order_symbol and order_symbol not in candidates:
+            candidates.append(order_symbol)
+        last_error = None
+        for cancel_symbol in candidates:
+            try:
+                await asyncio.to_thread(self.exchange.cancel_order, order_id, cancel_symbol)
+                logger.info(f"Protection cleanup: cancelled {order_id} for {cancel_symbol} ({reason})")
+                return True
+            except Exception as e:
+                last_error = e
+        logger.warning(f"Protection cleanup cancel failed for {symbol} / {order_id}: {last_error}")
+        return False
+
+    def _newest_protection_order(self, orders):
+        if not orders:
+            return None
+        return max(
+            orders,
+            key=lambda order: (
+                self._protection_order_timestamp(order),
+                self._protection_client_order_id(order),
+                self._protection_order_id(order) or ''
+            )
+        )
+
     async def _fetch_open_orders_safe(self, symbol=None):
         try:
             if symbol:
@@ -12420,21 +12715,15 @@ class SignalEngine(BaseEngine):
     async def _cancel_protection_orders(self, symbol, reason='protection cleanup', orders=None):
         if self.is_upbit_mode():
             return 0
-        open_orders = orders if orders is not None else await self._fetch_open_orders_safe(symbol)
+        open_orders = orders if orders is not None else await self._collect_protection_orders(symbol)
         if open_orders is None:
             return 0
         cancelled = 0
         for order in open_orders or []:
             if not self._is_protection_order(order):
                 continue
-            order_id = order.get('id') or self._protection_order_info(order).get('orderId')
-            if not order_id:
-                continue
-            try:
-                await asyncio.to_thread(self.exchange.cancel_order, order_id, symbol)
+            if await self._cancel_single_protection_order(symbol, order, reason=reason):
                 cancelled += 1
-            except Exception as e:
-                logger.warning(f"Protection cleanup cancel failed for {symbol} / {order_id}: {e}")
         if cancelled:
             logger.info(f"Protection cleanup: cancelled {cancelled} orders for {symbol} ({reason})")
         return cancelled
@@ -12470,7 +12759,7 @@ class SignalEngine(BaseEngine):
             return False, False
         strategy_params = self.get_runtime_strategy_params()
         active_strategy = str(strategy_params.get('active_strategy', '') or '').lower()
-        if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+        if active_strategy in UTBREAKOUT_STRATEGIES:
             return True, True
         cfg = self.get_runtime_common_settings()
         master = bool(cfg.get('tp_sl_enabled', True))
@@ -12491,6 +12780,8 @@ class SignalEngine(BaseEngine):
             'missing_sl': False,
             'orphan_cancelled': 0,
             'mismatch_cancelled': 0,
+            'duplicate_cancelled': 0,
+            'invalid_price_cancelled': 0,
             'status': 'SKIPPED'
         }
         if self.is_upbit_mode():
@@ -12502,37 +12793,7 @@ class SignalEngine(BaseEngine):
             status['tp_expected'] = bool(expected_tp)
             status['sl_expected'] = bool(expected_sl)
 
-        open_orders = await self._fetch_open_orders_safe(symbol)
-        if open_orders is None:
-            status['status'] = 'ORDER_FETCH_FAILED'
-            self.last_protection_order_status[symbol] = status
-            return status
-        candidate_orders = list(open_orders or [])
-        protection_orders = [
-            order for order in candidate_orders
-            if self._protection_order_matches_symbol(order, symbol) and self._is_protection_order(order)
-        ]
-
-        if bool(expected_tp or expected_sl):
-            has_tp = any(self._classify_protection_order(order) == 'tp' for order in protection_orders)
-            has_sl = any(self._classify_protection_order(order) == 'sl' for order in protection_orders)
-            if (expected_tp and not has_tp) or (expected_sl and not has_sl):
-                all_open_orders = await self._fetch_open_orders_safe(None)
-                if all_open_orders is not None:
-                    seen = {
-                        str(order.get('id') or self._protection_order_info(order).get('orderId') or id(order))
-                        for order in candidate_orders
-                    }
-                    for order in all_open_orders or []:
-                        order_key = str(order.get('id') or self._protection_order_info(order).get('orderId') or id(order))
-                        if order_key in seen or not self._protection_order_matches_symbol(order, symbol):
-                            continue
-                        candidate_orders.append(order)
-                        seen.add(order_key)
-                    protection_orders = [
-                        order for order in candidate_orders
-                        if self._protection_order_matches_symbol(order, symbol) and self._is_protection_order(order)
-                    ]
+        protection_orders = await self._collect_protection_orders(symbol)
 
         if not pos:
             status['status'] = 'NO_POSITION'
@@ -12554,15 +12815,41 @@ class SignalEngine(BaseEngine):
 
         pos_side = str(pos.get('side', '')).lower()
         close_side = 'sell' if pos_side == 'long' else 'buy'
+        try:
+            pos_entry_price = float(pos.get('entryPrice') or 0.0)
+        except (TypeError, ValueError):
+            pos_entry_price = 0.0
         valid_tp = []
         valid_sl = []
         mismatched = []
+        invalid_price_orders = []
         for order in protection_orders:
             kind = self._classify_protection_order(order)
             order_side = self._protection_order_side(order)
             if order_side and order_side != close_side:
                 mismatched.append(order)
                 continue
+            trigger_price = self._protection_trigger_price(order)
+            order_price = _safe_float_or_none(order.get('price')) or trigger_price
+            if pos_entry_price > 0 and order_price:
+                if kind == 'sl':
+                    invalid_sl = (
+                        pos_side == 'long' and float(order_price) >= pos_entry_price
+                    ) or (
+                        pos_side == 'short' and float(order_price) <= pos_entry_price
+                    )
+                    if invalid_sl:
+                        invalid_price_orders.append(order)
+                        continue
+                elif kind == 'tp':
+                    invalid_tp = (
+                        pos_side == 'long' and float(order_price) <= pos_entry_price
+                    ) or (
+                        pos_side == 'short' and float(order_price) >= pos_entry_price
+                    )
+                    if invalid_tp:
+                        invalid_price_orders.append(order)
+                        continue
             if kind == 'tp':
                 valid_tp.append(order)
             elif kind == 'sl':
@@ -12574,6 +12861,32 @@ class SignalEngine(BaseEngine):
                 reason='wrong close side',
                 orders=mismatched
             )
+
+        if invalid_price_orders:
+            status['invalid_price_cancelled'] = await self._cancel_protection_orders(
+                symbol,
+                reason='invalid protection price for current position',
+                orders=invalid_price_orders
+            )
+
+        for kind, valid_orders in (('tp', valid_tp), ('sl', valid_sl)):
+            if len(valid_orders) <= 1:
+                continue
+            keep = self._newest_protection_order(valid_orders)
+            duplicates = [
+                order for order in valid_orders
+                if (self._protection_order_id(order) or id(order)) != (self._protection_order_id(keep) or id(keep))
+            ]
+            if duplicates:
+                status['duplicate_cancelled'] += await self._cancel_protection_orders(
+                    symbol,
+                    reason=f'duplicate {kind.upper()} protection',
+                    orders=duplicates
+                )
+                if kind == 'tp':
+                    valid_tp = [keep]
+                else:
+                    valid_sl = [keep]
 
         status['tp_count'] = len(valid_tp)
         status['sl_count'] = len(valid_sl)
@@ -12603,6 +12916,10 @@ class SignalEngine(BaseEngine):
                 )
         elif status['mismatch_cancelled']:
             status['status'] = 'MISMATCH_CANCELLED'
+        elif status['invalid_price_cancelled']:
+            status['status'] = 'INVALID_PRICE_CANCELLED'
+        elif status['duplicate_cancelled']:
+            status['status'] = 'DUPLICATE_CANCELLED'
         else:
             status['status'] = 'OK'
         self.last_protection_order_status[symbol] = status
@@ -12672,6 +12989,14 @@ class SignalEngine(BaseEngine):
                 return
 
             await self._cancel_protection_orders(symbol, reason='before new protection placement')
+            await asyncio.sleep(0.25)
+            remaining_before_place = await self._collect_protection_orders(symbol)
+            if remaining_before_place:
+                await self._cancel_protection_orders(
+                    symbol,
+                    reason='stale protection still open before placement',
+                    orders=remaining_before_place
+                )
 
             if side == 'long':
                 tp_side = 'sell'
@@ -12724,7 +13049,11 @@ class SignalEngine(BaseEngine):
                             sl_side,
                             qty,
                             None,
-                            {'stopPrice': sl_price, 'reduceOnly': True},
+                            {
+                                'stopPrice': sl_price,
+                                'reduceOnly': True,
+                                'newClientOrderId': self._build_protection_client_order_id(symbol, side, 'sl', pos)
+                            },
                             'SL',
                             max_attempts=3
                         )
@@ -12766,7 +13095,10 @@ class SignalEngine(BaseEngine):
                             tp_side,
                             qty,
                             tp_price,
-                            {'reduceOnly': True},
+                            {
+                                'reduceOnly': True,
+                                'newClientOrderId': self._build_protection_client_order_id(symbol, side, 'tp', pos)
+                            },
                             'TP',
                             max_attempts=2
                         )
@@ -16871,7 +17203,9 @@ class MainController:
             diag = {}
             if engine:
                 diag = engine.last_utbot_filtered_breakout_status.get(first_symbol, {}) or {}
-            active_label = "ON" if active_strategy == UTBOT_FILTERED_BREAKOUT_STRATEGY else f"OFF ({active_strategy.upper()})"
+            active_label = "ON" if active_strategy in UTBREAKOUT_STRATEGIES else f"OFF ({active_strategy.upper()})"
+            if active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY:
+                active_label = "ON (ADAPTIVE TF)"
             last_reason = diag.get('reject_code') or diag.get('accepted_code') or diag.get('reason') or '대기'
             diag_summary = format_utbreakout_diagnostic_summary()
             set_id = normalize_utbreakout_set_id(cfg.get('active_set_id') or cfg.get('profile'), UTBREAKOUT_DEFAULT_SET_ID)
@@ -16880,18 +17214,25 @@ class MainController:
             auto_set = diag.get('auto_selected_set_id')
             auto_name = diag.get('auto_selected_set_name')
             auto_reason = diag.get('auto_selection_reason') or '아직 AUTO 분석 기록 없음'
+            adaptive_summary = diag.get('adaptive_timeframe_summary') or '아직 Adaptive TF 분석 기록 없음'
             active_set_lines = "\n".join(format_utbreakout_set_brief(i) for i in range(1, 11))
             opposite_pnl_text = (
                 f"PnL≥${float(cfg.get('opposite_set_exit_min_pnl_usdt', 0.0) or 0.0):.2f}"
                 if cfg.get('opposite_set_exit_min_pnl_enabled') else
                 "PnL조건 OFF"
             )
+            menu_title = (
+                'UTBOT_ADAPTIVE_TIMEFRAME_V1'
+                if active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY
+                else 'UTBOT_FILTERED_BREAKOUT_V1'
+            )
             return f"""
-🧭 **UTBOT_FILTERED_BREAKOUT_V1**
+🧭 **{menu_title}**
 
 상태: `{active_label}`
 선택모드: `{mode_label}` | 수동 Set: `Set{set_id} {set_info.get('name')}` | AUTO 최근: `{('Set' + str(auto_set) + ' ' + str(auto_name)) if auto_set else '대기'}`
 프로필: `{cfg.get('profile', 'set2')}` | 진입 `{cfg.get('entry_timeframe', '15m')}` / 청산 `{cfg.get('exit_timeframe', cfg.get('entry_timeframe', '15m'))}` / HTF `{cfg.get('htf_timeframe', '1h')}`
+Adaptive TF: `{'ON' if cfg.get('adaptive_timeframe_enabled') or active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY else 'OFF'}` | 최근: `{adaptive_summary}`
 UT: `K={float(cfg.get('utbot_key_value', 2.5) or 2.5):.2f}` / `ATR={int(cfg.get('utbot_atr_period', 14) or 14)}`
 선택 Set 조건: `{', '.join(set_info.get('entry_filters') or ['UT only'])}`
 리스크: `SL {float(cfg.get('stop_atr_multiplier', 1.5) or 1.5):.1f}ATR` | `TP {float(cfg.get('take_profit_r_multiple', 2.0) or 2.0):.1f}R` | `1회 최대손실 ${float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0):.2f}`
@@ -16918,6 +17259,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 `/utbreakout on` - 전략 활성화
 `/utbreakout off` - UTBOT으로 복귀
 `/utbreakout auto on` / `auto off` - AUTO set 선택 ON/OFF
+`/utbreakout adaptive on` / `adaptive off` - Adaptive 시간봉 전략 ON/OFF
 `/utbreakout set 27` 또는 `set27` - Set 1~50 수동 적용
 `/utbreakout sets` - 50개 set 설명 보기
 `/utbreakout why` - 최근 AUTO 선택 이유 보기
@@ -16947,6 +17289,10 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                     InlineKeyboardButton("AUTO ON", callback_data="utb:auto:on"),
                     InlineKeyboardButton("AUTO OFF", callback_data="utb:auto:off"),
                     InlineKeyboardButton("AUTO 이유", callback_data="utb:why")
+                ],
+                [
+                    InlineKeyboardButton("Adaptive TF ON", callback_data="utb:adaptive:on"),
+                    InlineKeyboardButton("Adaptive TF OFF", callback_data="utb:adaptive:off")
                 ],
                 [
                     InlineKeyboardButton("Set1", callback_data="utb:set:1"),
@@ -17190,6 +17536,11 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 'exit_timeframe',
                 'htf_timeframe',
                 'auto_timeframes',
+                'adaptive_timeframe_enabled',
+                'adaptive_timeframes',
+                'adaptive_timeframe_min_score',
+                'adaptive_timeframe_switch_margin',
+                'adaptive_timeframe_min_hold_candles',
                 'risk_per_trade_percent',
                 'max_risk_per_trade_usdt',
                 'daily_max_loss_usdt',
@@ -17245,6 +17596,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 
             if action in {'on', 'enable', 'activate', 'start'}:
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_FILTERED_BREAKOUT_STRATEGY)
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], False)
                 self._reset_signal_engine_runtime_state(
                     reset_entry_cache=True,
                     reset_exit_cache=True,
@@ -17275,6 +17627,29 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 )
                 self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
                 await u.message.reply_text(f"✅ AUTO Set 선택: {'ON' if enabled else 'OFF'}")
+            elif action in {'adaptive', 'tfauto', 'timeframe', 'timeframe_auto'}:
+                mode = str(args[1]).strip().lower() if len(args) > 1 else ''
+                if mode not in {'on', 'off', 'enable', 'disable'}:
+                    await u.message.reply_text("❌ 예: `/utbreakout adaptive on` 또는 `/utbreakout adaptive off`", parse_mode=ParseMode.MARKDOWN)
+                    return
+                enabled = mode in {'on', 'enable'}
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'],
+                    enabled
+                )
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'active_strategy'],
+                    UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY if enabled else UTBOT_FILTERED_BREAKOUT_STRATEGY
+                )
+                self._reset_signal_engine_runtime_state(
+                    reset_entry_cache=True,
+                    reset_exit_cache=True,
+                    reset_stateful_strategy=True
+                )
+                await u.message.reply_text(
+                    f"✅ Adaptive 시간봉 전략: {'ON' if enabled else 'OFF'} "
+                    f"({'UTBOT_ADAPTIVE_TIMEFRAME_V1' if enabled else 'UTBOT_FILTERED_BREAKOUT_V1'})"
+                )
             elif action == 'set' or re.fullmatch(r'set\d+', action or '') or action in {'1', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'aggressive', 'conservative'}:
                 set_arg = args[1] if action == 'set' and len(args) > 1 else action
                 set_text = str(set_arg or '').strip().lower()
@@ -17461,6 +17836,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 
             if action == 'on':
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_FILTERED_BREAKOUT_STRATEGY)
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], False)
                 self._reset_signal_engine_runtime_state(
                     reset_entry_cache=True,
                     reset_exit_cache=True,
@@ -17491,6 +17867,27 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 )
                 self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
                 await _edit_utbreakout_menu(query, f"✅ AUTO Set 선택: {'ON' if enabled else 'OFF'}")
+                return
+
+            if action == 'adaptive':
+                enabled = str(value or '').lower() in {'on', 'enable', '1', 'true'}
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'],
+                    enabled
+                )
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'active_strategy'],
+                    UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY if enabled else UTBOT_FILTERED_BREAKOUT_STRATEGY
+                )
+                self._reset_signal_engine_runtime_state(
+                    reset_entry_cache=True,
+                    reset_exit_cache=True,
+                    reset_stateful_strategy=True
+                )
+                await _edit_utbreakout_menu(
+                    query,
+                    f"✅ Adaptive 시간봉 전략: {'ON' if enabled else 'OFF'}"
+                )
                 return
 
             if action == 'set' or re.fullmatch(r'set\d+', action or ''):
