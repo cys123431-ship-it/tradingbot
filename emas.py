@@ -46,6 +46,13 @@ from telegram.ext import (
     MessageHandler, filters, ConversationHandler, CallbackQueryHandler
 )
 from utbreakout.indicators import previous_donchian
+from utbreakout.coinselector import (
+    build_base_candidate as build_coin_selector_base_candidate,
+    build_selection_report as build_coin_selector_report,
+    default_coin_selector_config,
+    finalize_candidate as finalize_coin_selector_candidate,
+    sector_tags_for_symbol as coin_selector_sector_tags_for_symbol,
+)
 from utbreakout.research import format_research_summary
 from utbreakout.risk import calculate_risk_plan
 from utbreakout.timeframe import HTF_MAP as UTBREAKOUT_HTF_MAP, select_adaptive_timeframe
@@ -721,6 +728,7 @@ class TradingConfig:
                     'cc_threshold': 0.70,
                     'cc_length': 14
                 },
+                'coin_selector': default_coin_selector_config(),
                 'strategy_params': {
                     'active_strategy': 'utbot',
                     'entry_mode': 'cross',
@@ -1048,6 +1056,54 @@ class TradingConfig:
             common_cfg['scanner_min_rise_pct'] = max(0.1, scanner_max_rise * 0.25)
             changed = True
 
+        coin_selector_cfg = signal_cfg.setdefault('coin_selector', {})
+        if not isinstance(coin_selector_cfg, dict):
+            coin_selector_cfg = default_coin_selector_config()
+            signal_cfg['coin_selector'] = coin_selector_cfg
+            changed = True
+        coin_selector_defaults = default_coin_selector_config()
+        for key, value in coin_selector_defaults.items():
+            if key not in coin_selector_cfg:
+                coin_selector_cfg[key] = value
+                changed = True
+        for list_key in ('excluded_sectors', 'blacklist'):
+            if not isinstance(coin_selector_cfg.get(list_key), list):
+                coin_selector_cfg[list_key] = list(coin_selector_defaults[list_key])
+                changed = True
+        if not isinstance(coin_selector_cfg.get('sector_overrides'), dict):
+            coin_selector_cfg['sector_overrides'] = {}
+            changed = True
+        numeric_coin_selector_defaults = {
+            'min_quote_volume_usdt': 100_000_000.0,
+            'ideal_quote_volume_usdt': 1_000_000_000.0,
+            'min_trade_count': 20_000,
+            'ideal_trade_count': 500_000,
+            'max_spread_pct': 0.08,
+            'max_abs_price_change_pct': 18.0,
+            'analysis_limit': 20,
+            'top_n': 10,
+            'min_final_score': 55.0,
+            'refresh_interval_seconds': 300,
+        }
+        for key, default in numeric_coin_selector_defaults.items():
+            try:
+                value = float(coin_selector_cfg.get(key, default))
+            except (TypeError, ValueError):
+                value = float(default)
+            if value <= 0:
+                value = float(default)
+            if key in {'analysis_limit', 'top_n', 'min_trade_count', 'ideal_trade_count'}:
+                value = int(value)
+            if coin_selector_cfg.get(key) != value:
+                coin_selector_cfg[key] = value
+                changed = True
+        if float(coin_selector_cfg.get('ideal_quote_volume_usdt', 0) or 0) < float(coin_selector_cfg.get('min_quote_volume_usdt', 0) or 0):
+            coin_selector_cfg['ideal_quote_volume_usdt'] = max(
+                float(coin_selector_cfg.get('min_quote_volume_usdt', 100_000_000.0) or 100_000_000.0) * 5.0,
+                1_000_000_000.0
+            )
+            changed = True
+
         upbit_cfg = self.config.setdefault('upbit', {})
         upbit_watchlist = upbit_cfg.get('watchlist')
         if not isinstance(upbit_watchlist, list) or not upbit_watchlist:
@@ -1226,6 +1282,7 @@ class TradingConfig:
                     "chop_entry_enabled": True,
                     "chop_exit_enabled": True
                 },
+                "coin_selector": default_coin_selector_config(),
                 "strategy_params": {
                     "active_strategy": "utbot",
                     "entry_mode": "cross",
@@ -2372,6 +2429,9 @@ class SignalEngine(BaseEngine):
         self.utbreakout_adaptive_last_decision_ts = {}  # symbol -> tf -> last closed candle evaluated
         self.last_protection_order_status = {}  # symbol -> exchange-side TP/SL audit status
         self.last_protection_alert_ts = {}  # symbol:kind -> last Telegram alert timestamp
+        self.coin_selector_last_result = {}  # runtime CoinSelector V2 report
+        self.coin_selector_symbol_scores = {}  # normalized symbol -> latest selector score
+        self.coin_selector_last_run_ts = 0.0
         self.last_entry_reason = {}        # symbol -> latest entry decision reason
 
     def start(self):
@@ -2418,6 +2478,9 @@ class SignalEngine(BaseEngine):
         self.utbreakout_adaptive_last_decision_ts = {}
         self.last_protection_order_status = {}
         self.last_protection_alert_ts = {}
+        self.coin_selector_last_result = {}
+        self.coin_selector_symbol_scores = {}
+        self.coin_selector_last_run_ts = 0.0
         self.last_entry_reason = {}
         self.pending_reentry = {}
         self.ut_hybrid_timing_latches = {}
@@ -6272,6 +6335,7 @@ class SignalEngine(BaseEngine):
             take_profit_detail,
             opposite_set_exit_detail,
             f"AUTO 점수: {score_line}",
+            self.get_coin_selector_symbol_summary(symbol),
             "주의: AUTO/MTF 지표는 set 선택용이고, 실제 진입은 아래 선택 Set 조건만 봅니다.",
             f"최종: LONG {'가능' if long_ok else '대기'} / SHORT {'가능' if short_ok else '대기'}",
             "",
@@ -8851,6 +8915,357 @@ class SignalEngine(BaseEngine):
             import traceback
             traceback.print_exc()
 
+    def _get_coin_selector_config(self):
+        raw = self.get_runtime_trade_config().get('coin_selector', {})
+        cfg = default_coin_selector_config()
+        if isinstance(raw, dict):
+            cfg.update(raw)
+        def _bool_value(value, default=False):
+            if isinstance(value, bool):
+                return value
+            text = str(value).strip().lower()
+            if text in {'1', 'true', 'yes', 'on', 'enable', 'enabled'}:
+                return True
+            if text in {'0', 'false', 'no', 'off', 'disable', 'disabled'}:
+                return False
+            return default
+        for key in ('enabled', 'auto_apply_watchlist'):
+            cfg[key] = _bool_value(cfg.get(key), bool(default_coin_selector_config().get(key, False)))
+        for key in ('excluded_sectors', 'blacklist'):
+            value = cfg.get(key, [])
+            if isinstance(value, str):
+                cfg[key] = [item.strip() for item in value.split(',') if item.strip()]
+            elif isinstance(value, (list, tuple, set)):
+                cfg[key] = [str(item).strip() for item in value if str(item).strip()]
+            else:
+                cfg[key] = []
+        if not isinstance(cfg.get('sector_overrides'), dict):
+            cfg['sector_overrides'] = {}
+        for key, default in {
+            'min_quote_volume_usdt': 100_000_000.0,
+            'ideal_quote_volume_usdt': 1_000_000_000.0,
+            'max_spread_pct': 0.08,
+            'max_abs_price_change_pct': 18.0,
+            'min_final_score': 55.0,
+            'refresh_interval_seconds': 300.0,
+        }.items():
+            try:
+                cfg[key] = max(0.0, float(cfg.get(key, default)))
+            except (TypeError, ValueError):
+                cfg[key] = float(default)
+        for key, default in {
+            'min_trade_count': 20_000,
+            'ideal_trade_count': 500_000,
+            'analysis_limit': 20,
+            'top_n': 10,
+        }.items():
+            try:
+                cfg[key] = max(1, int(float(cfg.get(key, default))))
+            except (TypeError, ValueError):
+                cfg[key] = int(default)
+        return cfg
+
+    async def _fetch_utbreakout_futures_context(self, symbol):
+        if self.is_upbit_mode():
+            return {}
+        now = time.time()
+        cached = self.utbreakout_futures_context_cache.get(symbol)
+        if isinstance(cached, dict) and (now - float(cached.get('cached_at', 0) or 0)) < 300:
+            return dict(cached.get('data') or {})
+        rest_symbol = ''
+        try:
+            rest_symbol = self.ctrl._build_binance_futures_rest_symbol(symbol)
+        except Exception:
+            rest_symbol = ''
+        if not rest_symbol:
+            return {}
+
+        context = {}
+        try:
+            premium = await self.ctrl._fetch_binance_public_json('/fapi/v1/premiumIndex', {'symbol': rest_symbol})
+            if isinstance(premium, dict):
+                context.update({
+                    'funding_rate': _safe_float_or_none(premium.get('lastFundingRate')),
+                    'next_funding_time': int(premium.get('nextFundingTime') or 0) or None,
+                    'mark_price': _safe_float_or_none(premium.get('markPrice')),
+                    'index_price': _safe_float_or_none(premium.get('indexPrice')),
+                })
+        except Exception as exc:
+            context['futures_context_error'] = f"premiumIndex: {exc}"
+
+        try:
+            oi = await self.ctrl._fetch_binance_public_json('/fapi/v1/openInterest', {'symbol': rest_symbol})
+            if isinstance(oi, dict):
+                context['open_interest'] = _safe_float_or_none(oi.get('openInterest'))
+                context['open_interest_ts'] = int(oi.get('time') or 0) or None
+        except Exception as exc:
+            if 'futures_context_error' not in context:
+                context['futures_context_error'] = f"openInterest: {exc}"
+
+        if context.get('open_interest') is not None and context.get('mark_price') is not None:
+            try:
+                context['open_interest_usdt'] = float(context['open_interest']) * float(context['mark_price'])
+            except (TypeError, ValueError):
+                pass
+        clean_context = {key: value for key, value in context.items() if value is not None}
+        self.utbreakout_futures_context_cache[symbol] = {'cached_at': now, 'data': clean_context}
+        return clean_context
+
+    async def _load_coin_selector_markets(self):
+        try:
+            markets = await asyncio.to_thread(self.market_data_exchange.load_markets)
+            return markets if isinstance(markets, dict) else {}
+        except Exception as exc:
+            logger.warning(f"CoinSelector markets load failed: {exc}")
+            return {}
+
+    def _coin_selector_market_for_symbol(self, symbol, markets):
+        if not isinstance(markets, dict):
+            return None
+        normalized = str(symbol or '').replace(':USDT', '')
+        base = normalized.split('/', 1)[0] if '/' in normalized else normalized.replace('USDT', '')
+        keys = [
+            symbol,
+            normalized,
+            f"{normalized}:USDT",
+            f"{base}/USDT:USDT",
+            f"{base}/USDT",
+        ]
+        for key in keys:
+            if key in markets:
+                return markets[key]
+        return None
+
+    async def _score_coin_selector_candidate(self, base_candidate, cfg, strategy_params):
+        symbol = base_candidate.get('exchange_symbol') or base_candidate.get('symbol')
+        try:
+            ut_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+            entry_tf = str(ut_cfg.get('entry_timeframe', '15m') or '15m')
+            ohlcv = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, entry_tf, limit=300)
+            if not ohlcv:
+                raise ValueError("empty OHLCV")
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            analysis = await self._build_utbreakout_auto_analysis(symbol, df, ut_cfg)
+            selected_set_id, auto_reason = self._select_utbreakout_auto_set(analysis, ut_cfg)
+            selected_set_info = self._get_utbreakout_set_info(ut_cfg, selected_set_id)
+            decision = select_adaptive_timeframe(
+                analysis.get('timeframes', {}),
+                ut_cfg,
+                state=self.utbreakout_adaptive_tf_state.get(symbol, {}),
+                position_side='none',
+            )
+            futures_context = await self._fetch_utbreakout_futures_context(symbol)
+            result = finalize_coin_selector_candidate(
+                base_candidate,
+                auto_analysis=analysis,
+                selected_set_id=selected_set_id,
+                selected_set_info=selected_set_info,
+                adaptive_decision=decision,
+                futures_context=futures_context,
+                cfg=cfg,
+            )
+            result['auto_selection_reason'] = auto_reason
+            return result
+        except Exception as exc:
+            result = dict(base_candidate)
+            result['accepted'] = False
+            result.setdefault('reject_reasons', []).append('REJECTED_ANALYSIS_ERROR')
+            result['analysis_error'] = str(exc)
+            result['score'] = 0.0
+            result['selection_state'] = 'REJECTED'
+            return result
+
+    async def evaluate_coin_selector(self, *, force=False):
+        cfg = self._get_coin_selector_config()
+        now = time.time()
+        cached = self.coin_selector_last_result if isinstance(self.coin_selector_last_result, dict) else {}
+        refresh_interval = float(cfg.get('refresh_interval_seconds', 300.0) or 300.0)
+        if (not force) and cached and (now - float(cached.get('generated_at_ts', 0) or 0)) < refresh_interval:
+            return cached
+
+        if self.is_upbit_mode():
+            report = {
+                'generated_at_ts': now,
+                'selected': [],
+                'reject_counts': {'REJECTED_UPBIT_MODE': 1},
+                'total_scored': 0,
+                'total_rejected': 0,
+                'criteria': cfg,
+                'note': 'CoinSelector V2는 Binance Futures 전용입니다.',
+            }
+            self.coin_selector_last_result = report
+            self.coin_selector_symbol_scores = {}
+            return report
+
+        tickers = await asyncio.to_thread(self.market_data_exchange.fetch_tickers)
+        markets = await self._load_coin_selector_markets()
+        accepted_base = []
+        rejected = []
+        for symbol, ticker in (tickers or {}).items():
+            market = self._coin_selector_market_for_symbol(symbol, markets)
+            tags = coin_selector_sector_tags_for_symbol(symbol, cfg.get('sector_overrides'))
+            candidate = build_coin_selector_base_candidate(symbol, ticker, market, cfg, tags)
+            if candidate.get('accepted'):
+                accepted_base.append(candidate)
+            else:
+                rejected.append(candidate)
+
+        accepted_base.sort(
+            key=lambda item: float(item.get('quote_volume', 0.0) or 0.0),
+            reverse=True
+        )
+        strategy_params = self.get_runtime_strategy_params()
+        analysis_limit = int(cfg.get('analysis_limit', 20) or 20)
+        scored = []
+        analysis_errors = []
+        for candidate in accepted_base[:analysis_limit]:
+            scored_candidate = await self._score_coin_selector_candidate(candidate, cfg, strategy_params)
+            if scored_candidate.get('accepted'):
+                scored.append(scored_candidate)
+            else:
+                analysis_errors.append(scored_candidate)
+
+        top_n = int(cfg.get('top_n', 10) or 10)
+        report = build_coin_selector_report(scored, rejected + analysis_errors, top_n=top_n)
+        report.update({
+            'generated_at_ts': now,
+            'generated_at': datetime.now(timezone.utc).isoformat(),
+            'criteria': cfg,
+            'analysis_limit': analysis_limit,
+            'total_base_candidates': len(accepted_base),
+            'total_unanalyzed': max(0, len(accepted_base) - analysis_limit),
+        })
+        selected = report.get('selected', [])
+        self.coin_selector_symbol_scores = {}
+        for item in selected:
+            for key in (item.get('normalized_symbol'), item.get('exchange_symbol')):
+                if key:
+                    self.coin_selector_symbol_scores[key] = item
+        self.coin_selector_last_result = report
+        self.coin_selector_last_run_ts = now
+        warning = report.get('concentration_warning')
+        if warning:
+            logger.warning(
+                f"CoinSelector concentration warning: {warning.get('key')}={warning.get('value')} "
+                f"{warning.get('share_pct')}%"
+            )
+        return report
+
+    def get_coin_selector_symbol_summary(self, symbol):
+        if not isinstance(self.coin_selector_symbol_scores, dict):
+            return "CoinSelector: 아직 스캔 기록 없음"
+        item = (
+            self.coin_selector_symbol_scores.get(symbol)
+            or self.coin_selector_symbol_scores.get(str(symbol or '').replace(':USDT', ''))
+        )
+        if not isinstance(item, dict):
+            return "CoinSelector: 현재 Top 후보 아님"
+        return (
+            f"CoinSelector: {float(item.get('score', 0.0) or 0.0):.1f}점 / "
+            f"Set{item.get('auto_set_id') or '?'} / TF {item.get('adaptive_tf') or 'n/a'} / "
+            f"{item.get('selection_state', 'WATCH')}"
+        )
+
+    async def _scan_and_trade_coin_selector(self):
+        cfg = self._get_coin_selector_config()
+        report = await self.evaluate_coin_selector(force=False)
+        candidates = [
+            item for item in report.get('selected', [])
+            if item.get('selection_state') == 'SELECTED'
+        ]
+        if not candidates:
+            logger.info("CoinSelector scanner: no selected candidates.")
+            return
+
+        log_lines = ["🧭 [CoinSelector] Top candidates:"]
+        for idx, item in enumerate(candidates[:int(cfg.get('top_n', 10) or 10)], 1):
+            log_lines.append(
+                f"  {idx}. {item.get('normalized_symbol')}: score={float(item.get('score', 0) or 0):.1f}, "
+                f"vol={float(item.get('quote_volume', 0) or 0)/1_000_000:.1f}M, "
+                f"Set{item.get('auto_set_id') or '?'}, TF={item.get('adaptive_tf')}"
+            )
+        logger.info("\n".join(log_lines))
+
+        for target_coin in candidates:
+            symbol = target_coin.get('exchange_symbol') or target_coin.get('normalized_symbol')
+            logger.info(
+                f"CoinSelector evaluating {symbol}: score={float(target_coin.get('score', 0) or 0):.1f}, "
+                f"Set{target_coin.get('auto_set_id')}, TF={target_coin.get('adaptive_tf')}"
+            )
+            if self.ctrl.is_paused:
+                return
+            try:
+                trade_cfg = self.get_runtime_trade_config()
+                common_cfg = self.get_runtime_common_settings()
+                scan_tf = common_cfg.get('scanner_timeframe', '15m')
+                strategy_params = trade_cfg.get('strategy_params', {})
+                scan_params = strategy_params.copy()
+                active_strategy = scan_params.get('active_strategy', 'utbot').lower()
+                if active_strategy not in CORE_STRATEGIES:
+                    active_strategy = 'utbot'
+                if active_strategy in UTBREAKOUT_STRATEGIES:
+                    scan_tf = self._get_utbot_filtered_breakout_config(scan_params).get('entry_timeframe', '15m')
+                    if target_coin.get('adaptive_tf') and target_coin.get('adaptive_tf') != 'NO_TRADE':
+                        scan_tf = target_coin.get('adaptive_tf')
+
+                ohlcv = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, scan_tf, limit=300)
+                if not ohlcv:
+                    continue
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                strategy_context = self._collect_primary_strategy_context(symbol, df, scan_params, active_strategy)
+                sig, _, _, _, _, _ = await self._calculate_strategy_signal(
+                    symbol,
+                    df,
+                    scan_params,
+                    active_strategy,
+                    allow_utbot_stateful=False,
+                    precomputed=strategy_context.get('precomputed')
+                )
+
+                if not sig:
+                    continue
+                if active_strategy == 'utbot':
+                    utbot_entry_filter_eval = await self._evaluate_utbot_filter_pack(
+                        symbol,
+                        df,
+                        scan_params,
+                        scan_tf,
+                        'entry'
+                    )
+                    allowed, filter_reason = self._utbot_filter_pack_allows_entry(utbot_entry_filter_eval, sig)
+                    if not allowed:
+                        logger.info(f"CoinSelector skip {symbol}: UTBot filter pack blocked ({filter_reason})")
+                        continue
+                    utbot_rsi_momentum_entry_eval = self._evaluate_utbot_rsi_momentum_filter(df, scan_params, 'entry')
+                    allowed, filter_reason = self._utbot_rsi_momentum_filter_allows(utbot_rsi_momentum_entry_eval, sig)
+                    if not allowed:
+                        logger.info(f"CoinSelector skip {symbol}: RSI Momentum filter blocked ({filter_reason})")
+                        continue
+                elif active_strategy == 'utsmc':
+                    utsmc_detail = strategy_context.get('raw_hybrid_detail', {}) or {}
+                    allowed, candidate_reason = self._utsmc_candidate_filter_allows(utsmc_detail, sig, is_persistent=False)
+                    if not allowed:
+                        logger.info(f"CoinSelector skip {symbol}: UTSMC candidate filter blocked ({candidate_reason})")
+                        continue
+
+                pos = await self.get_server_position(symbol, use_cache=False)
+                if not pos:
+                    logger.info(f"CoinSelector locking in: {symbol} [{sig.upper()}]")
+                    current_price = float(ohlcv[-1][4])
+                    await self.entry(symbol, sig, current_price)
+                    self.scanner_active_symbol = symbol
+                    current_ts = int(ohlcv[-1][0])
+                    self.last_processed_candle_ts[symbol] = current_ts
+                    self.last_candle_time[symbol] = current_ts
+                    self.last_candle_success[symbol] = True
+                    break
+                logger.info(f"CoinSelector checked {symbol}: position exists ({pos.get('side')})")
+            except Exception as exc:
+                logger.error(f"CoinSelector strategy check failed for {symbol}: {exc}")
+                continue
+
     async def scan_and_trade_high_volume(self):
         """[New] High Volume Scanner Logic (Refined)
         Rule: 200M+ Vol -> Top 5 Risers -> Select Max Vol from Top 5 -> Cross Strategy
@@ -8859,6 +9274,11 @@ class SignalEngine(BaseEngine):
         try:
             if self.is_upbit_mode():
                 logger.info("Scanner skipped: Upbit mode uses dedicated KRW UTBOT watchlist only.")
+                return
+
+            coin_selector_cfg = self._get_coin_selector_config()
+            if bool(coin_selector_cfg.get('enabled', True)):
+                await self._scan_and_trade_coin_selector()
                 return
 
             logger.info("?뱻 Scanning high volume markets (>200M USDT)...")
@@ -17082,8 +17502,8 @@ class MainController:
     def _build_main_keyboard(self):
         kb = [
             [KeyboardButton("🚨 STOP"), KeyboardButton("⏸ PAUSE"), KeyboardButton("▶ RESUME")],
-            [KeyboardButton("/setup"), KeyboardButton("/utbreakout"), KeyboardButton("/status")],
-            [KeyboardButton("/history"), KeyboardButton("/stats")],
+            [KeyboardButton("/setup"), KeyboardButton("/utbreakout"), KeyboardButton("/coinscan")],
+            [KeyboardButton("/status"), KeyboardButton("/history"), KeyboardButton("/stats")],
             [KeyboardButton("/log"), KeyboardButton("/help")]
         ]
         return ReplyKeyboardMarkup(kb, resize_keyboard=True)
@@ -17096,7 +17516,7 @@ class MainController:
         markup = self._build_main_keyboard()
         text_filter = filters.TEXT & ~filters.COMMAND
         setup_trigger_pattern = r"^/setup(?:@[A-Za-z0-9_]+)?$"
-        menu_trigger_pattern = r"^/(status|history|log|help|stats|close|utbreakout)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
+        menu_trigger_pattern = r"^/(status|history|log|help|stats|close|utbreakout|coinscan)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
         setup_text_filter = text_filter & ~filters.Regex(r"^/")
 
         async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -18055,6 +18475,348 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 
             await _edit_utbreakout_menu(query)
 
+        def _format_volume_usdt(value):
+            try:
+                amount = float(value or 0.0)
+            except (TypeError, ValueError):
+                amount = 0.0
+            if amount >= 1_000_000_000:
+                return f"{amount / 1_000_000_000:.2f}B"
+            if amount >= 1_000_000:
+                return f"{amount / 1_000_000:.1f}M"
+            return f"{amount:.0f}"
+
+        def _coinscan_cfg():
+            raw = self.cfg.get('signal_engine', {}).get('coin_selector', {})
+            cfg = default_coin_selector_config()
+            if isinstance(raw, dict):
+                cfg.update(raw)
+            return cfg
+
+        def _build_coinscan_keyboard():
+            return InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("자동선택 ON", callback_data="cs:on"),
+                    InlineKeyboardButton("자동선택 OFF", callback_data="cs:off")
+                ],
+                [
+                    InlineKeyboardButton("Top 10 후보", callback_data="cs:top"),
+                    InlineKeyboardButton("watchlist 적용", callback_data="cs:apply")
+                ],
+                [
+                    InlineKeyboardButton("제외 사유", callback_data="cs:rejects"),
+                    InlineKeyboardButton("현재 기준", callback_data="cs:criteria")
+                ],
+                [
+                    InlineKeyboardButton("섹터 제외", callback_data="cs:sectors"),
+                    InlineKeyboardButton("리포트 다운로드", callback_data="cs:download")
+                ],
+                [
+                    InlineKeyboardButton("새로고침", callback_data="cs:status")
+                ]
+            ])
+
+        async def _run_coinscan(force=False):
+            engine = self.engines.get('signal')
+            if not engine:
+                return {
+                    'selected': [],
+                    'reject_counts': {'NO_SIGNAL_ENGINE': 1},
+                    'criteria': _coinscan_cfg(),
+                    'note': 'Signal 엔진을 찾을 수 없습니다.',
+                }
+            return await engine.evaluate_coin_selector(force=force)
+
+        def _format_coinscan_top_text(report):
+            cfg = report.get('criteria') or _coinscan_cfg()
+            selected = list(report.get('selected') or [])
+            lines = [
+                "🧭 CoinSelector V2 Top 후보",
+                "코인 선택은 감시 대상 선정이고, 최종 진입은 기존 전략이 다시 판단합니다.",
+                f"상태: {'ON' if cfg.get('enabled', True) else 'OFF'} | minVol {_format_volume_usdt(cfg.get('min_quote_volume_usdt'))} | top {int(cfg.get('top_n', 10) or 10)}",
+                f"분석: base {report.get('total_base_candidates', 0)}개 / scored {report.get('total_scored', 0)}개 / rejected {report.get('total_rejected', 0)}개",
+                "",
+            ]
+            if not selected:
+                lines.append("아직 후보가 없습니다. `/coinscan top`으로 새로 스캔하거나 기준을 확인하세요.")
+            for idx, item in enumerate(selected, 1):
+                components = item.get('component_scores') or {}
+                warnings = ", ".join(item.get('soft_warnings') or [])
+                lines.extend([
+                    f"{idx}. {item.get('normalized_symbol') or item.get('symbol')}",
+                    (
+                        f"점수 {float(item.get('score', 0) or 0):.1f} / 상태 {item.get('selection_state')} / "
+                        f"거래대금 {_format_volume_usdt(item.get('quote_volume'))} / 변동 {float(item.get('percentage', 0) or 0):.2f}%"
+                    ),
+                    (
+                        f"Set{item.get('auto_set_id') or '?'} {item.get('auto_set_name') or ''} / "
+                        f"Adaptive TF {item.get('adaptive_tf')} / margin {float(item.get('auto_score_margin', 0) or 0):.1f}"
+                    ),
+                    (
+                        "구성점수 "
+                        f"liq {components.get('liquidity_cost', 0):.1f}, "
+                        f"ut {components.get('utbreakout_regime', 0):.1f}, "
+                        f"set {components.get('auto_set', 0):.1f}, "
+                        f"tf {components.get('adaptive_tf', 0):.1f}, "
+                        f"fut {components.get('futures_health', 0):.1f}"
+                    ),
+                ])
+                if warnings:
+                    lines.append(f"주의: {warnings}")
+                lines.append("")
+            warning = report.get('concentration_warning')
+            if warning:
+                lines.append(
+                    f"쏠림 경고: {warning.get('key')}={warning.get('value')} "
+                    f"{warning.get('share_pct')}% ({warning.get('count')}/{warning.get('total')})"
+                )
+            lines.append("명령: `/coinscan apply`로 현재 Top 후보를 watchlist에 반영")
+            return "\n".join(lines).strip()
+
+        def _format_coinscan_reject_text(report):
+            counts = report.get('reject_counts') or {}
+            lines = [
+                "🚫 CoinSelector 제외 사유",
+                f"총 제외: {report.get('total_rejected', 0)}개",
+                "",
+            ]
+            if not counts:
+                lines.append("제외 사유 기록이 없습니다.")
+            else:
+                for reason, count in sorted(counts.items(), key=lambda item: item[1], reverse=True):
+                    lines.append(f"- {reason}: {count}")
+            return "\n".join(lines).strip()
+
+        def _format_coinscan_criteria_text():
+            cfg = _coinscan_cfg()
+            excluded = ", ".join(cfg.get('excluded_sectors') or []) or "없음"
+            blacklist = ", ".join(cfg.get('blacklist') or []) or "없음"
+            return "\n".join([
+                "⚙️ CoinSelector V2 현재 기준",
+                f"자동선택: {'ON' if cfg.get('enabled', True) else 'OFF'}",
+                f"거래대금: 24h quoteVolume >= {_format_volume_usdt(cfg.get('min_quote_volume_usdt'))} USDT",
+                f"스프레드: <= {float(cfg.get('max_spread_pct', 0.08) or 0.08):.3f}%",
+                f"24h 변동 과열 제외: abs(change) <= {float(cfg.get('max_abs_price_change_pct', 18.0) or 18.0):.1f}%",
+                f"최소 체결수: {int(float(cfg.get('min_trade_count', 20000) or 20000)):,}",
+                f"분석 후보 수: {int(float(cfg.get('analysis_limit', 20) or 20))} / 표시 Top {int(float(cfg.get('top_n', 10) or 10))}",
+                f"최소 최종 점수: {float(cfg.get('min_final_score', 55.0) or 55.0):.1f}",
+                f"새로고침 간격: {int(float(cfg.get('refresh_interval_seconds', 300) or 300))}초",
+                f"제외 섹터: {excluded}",
+                f"블랙리스트: {blacklist}",
+                "",
+                "점수 구성: 유동성/비용 25 + UTBreakout 장세 30 + AUTO Set 20 + Adaptive TF 10 + 선물시장 10 + 섹터 5",
+                "주의: CoinSelector는 감시 후보만 고르고, 실제 진입은 전략 로직이 다시 확인합니다.",
+            ])
+
+        async def _send_coinscan_report_document(message, report=None):
+            if message is None:
+                return
+            try:
+                report = report or await _run_coinscan(force=False)
+                text = "\n\n".join([
+                    _format_coinscan_top_text(report),
+                    _format_coinscan_reject_text(report),
+                    _format_coinscan_criteria_text(),
+                ])
+                bio = io.BytesIO(text.encode('utf-8'))
+                bio.name = 'coinselector_v2_report.txt'
+                await message.reply_document(
+                    document=bio,
+                    filename='coinselector_v2_report.txt',
+                    caption='CoinSelector V2 리포트입니다.'
+                )
+            except Exception as e:
+                logger.error(f"CoinSelector report download failed: {e}")
+                await message.reply_text(f"CoinSelector 리포트 다운로드 실패: {e}")
+
+        async def _apply_coinscan_watchlist(message, report=None):
+            report = report or await _run_coinscan(force=False)
+            selected = [
+                item for item in report.get('selected', [])
+                if item.get('selection_state') == 'SELECTED'
+            ]
+            symbols = []
+            for item in selected:
+                symbol = item.get('normalized_symbol') or str(item.get('exchange_symbol') or '').replace(':USDT', '')
+                if symbol and symbol not in symbols:
+                    symbols.append(symbol)
+            if not symbols:
+                await message.reply_text("❌ 적용할 CoinSelector 후보가 없습니다. `/coinscan top`으로 먼저 확인하세요.", parse_mode=ParseMode.MARKDOWN)
+                return
+            await self.cfg.update_value(['signal_engine', 'watchlist'], symbols)
+            engine = self.engines.get('signal')
+            if engine:
+                engine.active_symbols = set(symbols)
+            await message.reply_text(f"✅ CoinSelector 후보를 watchlist에 적용했습니다: {', '.join(symbols)}")
+
+        def _format_coinscan_menu_text():
+            cfg = _coinscan_cfg()
+            engine = self.engines.get('signal')
+            report = engine.coin_selector_last_result if engine else {}
+            selected = list((report or {}).get('selected') or [])
+            preview = ", ".join(
+                f"{item.get('normalized_symbol')}({float(item.get('score', 0) or 0):.0f})"
+                for item in selected[:5]
+            ) or "아직 스캔 기록 없음"
+            return "\n".join([
+                "🧭 CoinSelector V2",
+                "",
+                f"상태: {'ON' if cfg.get('enabled', True) else 'OFF'}",
+                f"기준: minVol {_format_volume_usdt(cfg.get('min_quote_volume_usdt'))}, spread <= {float(cfg.get('max_spread_pct', 0.08) or 0.08):.3f}%, Top {int(float(cfg.get('top_n', 10) or 10))}",
+                f"최근 후보: {preview}",
+                "",
+                "역할: Binance USDT perpetual 중 감시할 코인을 고릅니다. 주문/진입은 기존 전략이 담당합니다.",
+                "",
+                "명령:",
+                "`/coinscan top` - Top 후보 새로 조회",
+                "`/coinscan apply` - Top 후보를 watchlist에 적용",
+                "`/coinscan minvol 100` - 최소 24h 거래대금 100M 설정",
+                "`/coinscan blacklist DOGE` / `unblacklist DOGE`",
+                "`/coinscan criteria` - 현재 기준",
+                "`/coinscan rejects` - 제외 사유",
+                "`/coinscan download` - 리포트 다운로드",
+            ])
+
+        async def _edit_coinscan_menu(query, notice=None):
+            text = _format_coinscan_menu_text()
+            if notice:
+                text = f"{notice}\n\n{text}"
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=_build_coinscan_keyboard())
+            except BadRequest as md_err:
+                if "message is not modified" in str(md_err).lower():
+                    return
+                plain = str(text).replace("`", "").replace("**", "")
+                await query.edit_message_text(plain, reply_markup=_build_coinscan_keyboard())
+
+        async def coinscan_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            args = list(getattr(c, 'args', []) or [])
+            if not args and u and u.message and u.message.text:
+                parts = u.message.text.strip().split()
+                args = parts[1:]
+            action = str(args[0]).strip().lower() if args else ''
+
+            if action in {'on', 'enable', 'start'}:
+                await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], True)
+                await u.message.reply_text("✅ CoinSelector V2 자동선택: ON")
+                return
+            if action in {'off', 'disable', 'stop'}:
+                await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], False)
+                await u.message.reply_text("✅ CoinSelector V2 자동선택: OFF. 기존 거래량 스캐너로 되돌아갑니다.")
+                return
+            if action in {'top', 'scan', 'refresh'}:
+                report = await _run_coinscan(force=True)
+                await u.message.reply_text(_format_coinscan_top_text(report), reply_markup=_build_coinscan_keyboard())
+                return
+            if action in {'apply', 'watchlist'}:
+                report = await _run_coinscan(force=False)
+                await _apply_coinscan_watchlist(u.message, report)
+                return
+            if action in {'criteria', 'rule', 'rules'}:
+                await u.message.reply_text(_format_coinscan_criteria_text(), reply_markup=_build_coinscan_keyboard())
+                return
+            if action in {'rejects', 'exclude', 'excluded'}:
+                report = await _run_coinscan(force=False)
+                await u.message.reply_text(_format_coinscan_reject_text(report), reply_markup=_build_coinscan_keyboard())
+                return
+            if action in {'sectors', 'sector'}:
+                cfg = _coinscan_cfg()
+                await u.message.reply_text(
+                    "제외 섹터: " + (", ".join(cfg.get('excluded_sectors') or []) or "없음"),
+                    reply_markup=_build_coinscan_keyboard()
+                )
+                return
+            if action in {'download', 'report', 'log'}:
+                await _send_coinscan_report_document(u.message)
+                return
+            if action in {'minvol', 'volume', 'min_volume'}:
+                if len(args) < 2:
+                    await u.message.reply_text("❌ 예: `/coinscan minvol 100` (100M USDT)", parse_mode=ParseMode.MARKDOWN)
+                    return
+                try:
+                    value_m = float(str(args[1]).replace('m', '').replace('M', '').replace(',', '').strip())
+                except (TypeError, ValueError):
+                    await u.message.reply_text("❌ 거래대금은 숫자로 입력하세요. 예: `/coinscan minvol 100`", parse_mode=ParseMode.MARKDOWN)
+                    return
+                value = max(1.0, value_m) * 1_000_000.0
+                await self.cfg.update_value(['signal_engine', 'coin_selector', 'min_quote_volume_usdt'], value)
+                await u.message.reply_text(f"✅ CoinSelector 최소 거래대금: {_format_volume_usdt(value)} USDT")
+                return
+            if action in {'blacklist', 'ban'}:
+                if len(args) < 2:
+                    await u.message.reply_text("❌ 예: `/coinscan blacklist DOGE`", parse_mode=ParseMode.MARKDOWN)
+                    return
+                try:
+                    symbol = self.normalize_symbol_for_exchange(args[1], BINANCE_MAINNET)
+                except Exception:
+                    symbol = str(args[1]).upper()
+                cfg = _coinscan_cfg()
+                blacklist = list(cfg.get('blacklist') or [])
+                if symbol not in blacklist:
+                    blacklist.append(symbol)
+                await self.cfg.update_value(['signal_engine', 'coin_selector', 'blacklist'], blacklist)
+                await u.message.reply_text(f"✅ 블랙리스트 추가: {symbol}")
+                return
+            if action in {'unblacklist', 'allow', 'unban'}:
+                if len(args) < 2:
+                    await u.message.reply_text("❌ 예: `/coinscan unblacklist DOGE`", parse_mode=ParseMode.MARKDOWN)
+                    return
+                try:
+                    symbol = self.normalize_symbol_for_exchange(args[1], BINANCE_MAINNET)
+                except Exception:
+                    symbol = str(args[1]).upper()
+                cfg = _coinscan_cfg()
+                blacklist = [item for item in list(cfg.get('blacklist') or []) if item != symbol and item.split('/')[0] != symbol]
+                await self.cfg.update_value(['signal_engine', 'coin_selector', 'blacklist'], blacklist)
+                await u.message.reply_text(f"✅ 블랙리스트 해제: {symbol}")
+                return
+
+            await self._reply_markdown_safe(u.message, _format_coinscan_menu_text(), reply_markup=_build_coinscan_keyboard())
+
+        async def coinscan_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            query = u.callback_query
+            if not query:
+                return
+            await query.answer()
+            data = str(query.data or '')
+            if not data.startswith('cs:'):
+                return
+            action = data.split(':', 1)[1]
+            if action == 'on':
+                await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], True)
+                await _edit_coinscan_menu(query, "✅ CoinSelector V2 자동선택: ON")
+                return
+            if action == 'off':
+                await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], False)
+                await _edit_coinscan_menu(query, "✅ CoinSelector V2 자동선택: OFF")
+                return
+            if action == 'top':
+                report = await _run_coinscan(force=True)
+                await query.edit_message_text(_format_coinscan_top_text(report), reply_markup=_build_coinscan_keyboard())
+                return
+            if action == 'apply':
+                report = await _run_coinscan(force=False)
+                await _apply_coinscan_watchlist(query.message, report)
+                return
+            if action == 'criteria':
+                await query.edit_message_text(_format_coinscan_criteria_text(), reply_markup=_build_coinscan_keyboard())
+                return
+            if action == 'rejects':
+                report = await _run_coinscan(force=False)
+                await query.edit_message_text(_format_coinscan_reject_text(report), reply_markup=_build_coinscan_keyboard())
+                return
+            if action == 'sectors':
+                cfg = _coinscan_cfg()
+                await query.edit_message_text(
+                    "제외 섹터: " + (", ".join(cfg.get('excluded_sectors') or []) or "없음"),
+                    reply_markup=_build_coinscan_keyboard()
+                )
+                return
+            if action == 'download':
+                await _send_coinscan_report_document(query.message)
+                return
+            await _edit_coinscan_menu(query)
+
         async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             msg = """
 📚 **명령어**
@@ -18065,6 +18827,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 /history - 지난 상태 조회
 /stats - 통계
 /utbreakout - UTBOT_FILTERED_BREAKOUT_V1 전용 메뉴
+/coinscan - CoinSelector V2 자동 코인 선택 메뉴
 /log - 최근 로그
 /close - 긴급 청산
 
@@ -18086,6 +18849,8 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
         self.tg_app.add_handler(CommandHandler("stats", stats_cmd))
         self.tg_app.add_handler(CommandHandler("utbreakout", utbreakout_cmd))
         self.tg_app.add_handler(CallbackQueryHandler(utbreakout_callback, pattern=r"^utb:"))
+        self.tg_app.add_handler(CommandHandler("coinscan", coinscan_cmd))
+        self.tg_app.add_handler(CallbackQueryHandler(coinscan_callback, pattern=r"^cs:"))
         self.tg_app.add_handler(CommandHandler("help", help_cmd))
 
         setup_command_handler = CommandHandler('setup', self.setup_entry)
@@ -18129,6 +18894,8 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 return await close_cmd(u, c)
             if command == "/utbreakout":
                 return await utbreakout_cmd(u, c)
+            if command == "/coinscan":
+                return await coinscan_cmd(u, c)
             return None
 
         self.tg_app.add_handler(
