@@ -124,6 +124,16 @@ def test_protection_order_keeps_take_profit_separate_from_stop_loss():
     assert signal_engine._classify_protection_order(engine, take_profit_limit) == "tp"
 
 
+def test_protection_order_classifies_bot_client_ids_even_without_reduce_only():
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    take_profit = {"id": "tp", "type": "limit", "side": "buy", "clientOrderId": "utbtpBTCUSDTabc"}
+    stop_loss = {"id": "sl", "type": "market", "side": "buy", "clientOrderId": "utbslBTCUSDTabc"}
+
+    assert signal_engine._classify_protection_order(engine, take_profit) == "tp"
+    assert signal_engine._classify_protection_order(engine, stop_loss) == "sl"
+
+
 class _DummyCtrl:
     def format_symbol_for_display(self, symbol):
         return symbol
@@ -136,12 +146,18 @@ class _FakeExchange:
     def __init__(self, orders, symbol_scope_returns=True):
         self.orders = list(orders)
         self.cancelled = []
+        self.cancel_all_requests = []
         self.symbol_scope_returns = symbol_scope_returns
 
     def fetch_open_orders(self, symbol=None):
         if symbol and not self.symbol_scope_returns:
             return []
         return list(self.orders)
+
+    def cancel_all_orders(self, symbol):
+        self.cancel_all_requests.append(symbol)
+        self.orders = []
+        return []
 
     def cancel_order(self, order_id, symbol):
         self.cancelled.append((str(order_id), symbol))
@@ -187,6 +203,82 @@ def test_protection_audit_cancels_orphan_orders_even_when_symbol_fetch_misses_th
 
     assert status["status"] == "ORPHAN_CANCELLED"
     assert status["orphan_cancelled"] == 1
+    assert engine.exchange.orders == []
+
+
+def test_reconcile_closed_position_cancels_leftover_tp_and_sl_orders():
+    engine = _protection_engine(
+        [
+            {
+                "id": "tp-left",
+                "side": "sell",
+                "type": "limit",
+                "clientOrderId": "utbtpBTCUSDTleft",
+                "info": {"symbol": "BTCUSDT"},
+            },
+            {
+                "id": "sl-left",
+                "side": "sell",
+                "type": "market",
+                "clientOrderId": "utbslBTCUSDTleft",
+                "info": {"origType": "STOP_MARKET", "stopPrice": "95", "symbol": "BTCUSDT"},
+            },
+        ],
+        symbol_scope_returns=False,
+    )
+
+    async def _no_position(symbol, use_cache=False):
+        return None
+
+    engine.get_server_position = _no_position
+
+    status = asyncio.run(
+        engine._reconcile_closed_position_protection(
+            "BTC/USDT",
+            reason="tp/sl filled",
+            alert=False,
+            attempts=1,
+        )
+    )
+
+    assert status["status"] == "ORPHAN_CANCELLED"
+    assert status["orphan_cancelled"] == 2
+    assert engine.exchange.orders == []
+
+
+def test_cancel_protection_order_tries_raw_binance_symbol_variant():
+    class _RawOnlyExchange(_FakeExchange):
+        def cancel_order(self, order_id, symbol):
+            if symbol != "BTCUSDT":
+                raise ValueError(f"wrong symbol {symbol}")
+            return super().cancel_order(order_id, symbol)
+
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    engine.exchange = _RawOnlyExchange(
+        [
+            {
+                "id": "sl-raw",
+                "side": "buy",
+                "type": "market",
+                "info": {
+                    "origType": "STOP_MARKET",
+                    "stopPrice": "105",
+                    "reduceOnly": "true",
+                    "symbol": "BTCUSDT",
+                },
+            }
+        ]
+    )
+    engine.ctrl = _DummyCtrl()
+    engine.last_protection_alert_ts = {}
+    engine.last_protection_order_status = {}
+    engine.is_upbit_mode = lambda: False
+
+    cancelled = asyncio.run(engine._cancel_protection_orders("BTC/USDT", reason="raw symbol fallback"))
+
+    assert cancelled == 1
+    assert engine.exchange.cancelled == [("sl-raw", "BTCUSDT")]
     assert engine.exchange.orders == []
 
 

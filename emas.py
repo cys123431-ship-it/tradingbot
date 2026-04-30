@@ -8753,6 +8753,12 @@ class SignalEngine(BaseEngine):
                             self.scanner_active_symbol,
                             reason='scanner position completed'
                         )
+                        await self._reconcile_closed_position_protection(
+                            self.scanner_active_symbol,
+                            reason='scanner position completed',
+                            alert=True,
+                            attempts=2
+                        )
                         self.scanner_active_symbol = None
                         # 諛붾줈 ?ㅼ틪 濡쒖쭅?쇰줈 ?섏뼱媛?
                 
@@ -13324,6 +13330,11 @@ class SignalEngine(BaseEngine):
         return not order_symbol or order_symbol == target_symbol
 
     def _classify_protection_order(self, order):
+        client_id = self._protection_client_order_id(order).lower()
+        if client_id.startswith('utbtp'):
+            return 'tp'
+        if client_id.startswith('utbsl'):
+            return 'sl'
         order_type = self._protection_order_type(order)
         is_reduce_only = self._is_reduce_only_order(order)
         has_trigger_price = self._protection_trigger_price(order) is not None
@@ -13422,9 +13433,7 @@ class SignalEngine(BaseEngine):
         if not order_id:
             return False
         order_symbol = str(order.get('symbol') or '').strip() if isinstance(order, dict) else ''
-        candidates = [symbol]
-        if order_symbol and '/' in order_symbol and order_symbol not in candidates:
-            candidates.append(order_symbol)
+        candidates = self._protection_cancel_symbol_candidates(symbol, order_symbol)
         last_error = None
         for cancel_symbol in candidates:
             try:
@@ -13455,7 +13464,45 @@ class SignalEngine(BaseEngine):
             return await asyncio.to_thread(self.exchange.fetch_open_orders)
         except Exception as e:
             logger.warning(f"Protection audit: fetch_open_orders failed for {symbol or 'ALL'}: {e}")
-            return None
+        return None
+
+    def _protection_cancel_symbol_candidates(self, symbol, order_symbol=None):
+        candidates = []
+
+        def _add(value):
+            text = str(value or '').strip()
+            if text and text not in candidates:
+                candidates.append(text)
+
+        _add(symbol)
+        _add(order_symbol)
+        for value in (symbol, order_symbol):
+            normalized = self._normalize_protection_symbol(value)
+            if not normalized:
+                continue
+            _add(normalized)
+            if normalized.endswith('USDT') and len(normalized) > 4:
+                base = normalized[:-4]
+                _add(f"{base}/USDT")
+                _add(f"{base}/USDT:USDT")
+        return candidates
+
+    async def _cancel_all_orders_variants(self, symbol, reason='order cleanup'):
+        if self.is_upbit_mode():
+            return 0
+        successes = 0
+        last_error = None
+        for cancel_symbol in self._protection_cancel_symbol_candidates(symbol):
+            try:
+                await asyncio.to_thread(self.exchange.cancel_all_orders, cancel_symbol)
+                successes += 1
+                logger.info(f"All orders cancel requested for {cancel_symbol} ({reason})")
+            except Exception as exc:
+                last_error = exc
+                logger.debug(f"cancel_all_orders failed for {cancel_symbol} ({reason}): {exc}")
+        if successes <= 0 and last_error:
+            logger.warning(f"cancel_all_orders failed for all symbol variants {symbol}: {last_error}")
+        return successes
 
     async def _cancel_protection_orders(self, symbol, reason='protection cleanup', orders=None):
         if self.is_upbit_mode():
@@ -13472,6 +13519,36 @@ class SignalEngine(BaseEngine):
         if cancelled:
             logger.info(f"Protection cleanup: cancelled {cancelled} orders for {symbol} ({reason})")
         return cancelled
+
+    async def _reconcile_closed_position_protection(self, symbol, reason='position closed', alert=True, attempts=3):
+        if self.is_upbit_mode():
+            return None
+        final_status = None
+        total_attempts = max(1, int(attempts or 1))
+        for attempt in range(total_attempts):
+            self.position_cache = None
+            self.position_cache_time = 0
+            pos = await self.get_server_position(symbol, use_cache=False)
+            final_status = await self._audit_protection_orders(
+                symbol,
+                pos=pos,
+                expected_tp=False if not pos else None,
+                expected_sl=False if not pos else None,
+                alert=alert
+            )
+            if pos:
+                return final_status
+            remaining = await self._collect_protection_orders(symbol)
+            if not remaining:
+                return final_status
+            await self._cancel_protection_orders(
+                symbol,
+                reason=f"{reason} retry {attempt + 1}",
+                orders=remaining
+            )
+            if attempt < total_attempts - 1:
+                await asyncio.sleep(0.5)
+        return final_status
 
     async def _notify_protection_issue(self, symbol, kind, message, cooldown_sec=300):
         key = f"{symbol}:{kind}"
@@ -13884,8 +13961,8 @@ class SignalEngine(BaseEngine):
         
         # 癒쇱? TP/SL 二쇰Ц 痍⑥냼 (?덈뒗 寃쎌슦)
         try:
-            await asyncio.to_thread(self.exchange.cancel_all_orders, symbol)
-            logger.info(f"??All orders cancelled for {symbol}")
+            await self._cancel_all_orders_variants(symbol, reason=f'before exit: {reason}')
+            await self._cancel_protection_orders(symbol, reason=f'before exit: {reason}')
         except Exception as cancel_e:
             logger.warning(f"Order cancellation failed (may have none): {cancel_e}")
         
@@ -13933,7 +14010,8 @@ class SignalEngine(BaseEngine):
             
             # 媛뺤젣 泥?궛: 紐⑤뱺 二쇰Ц 痍⑥냼 ??reduceOnly濡??ъ떆??
             try:
-                await asyncio.to_thread(self.exchange.cancel_all_orders, symbol)
+                await self._cancel_all_orders_variants(symbol, reason='before force close retry')
+                await self._cancel_protection_orders(symbol, reason='before force close retry')
                 await asyncio.sleep(0.5)
                 
                 # reduceOnly ?듭뀡?쇰줈 媛뺤젣 泥?궛
@@ -13954,7 +14032,14 @@ class SignalEngine(BaseEngine):
         # 罹먯떆 ?꾩쟾 臾댄슚??
         self.position_cache = None
         self.position_cache_time = 0
+        await self._cancel_all_orders_variants(symbol, reason='after exit order success')
         await self._cancel_protection_orders(symbol, reason='after exit order success')
+        await self._reconcile_closed_position_protection(
+            symbol,
+            reason='after exit order success',
+            alert=True,
+            attempts=3
+        )
 
         active_strategy = str(self.get_runtime_strategy_params().get('active_strategy', '') or '').lower()
         if active_strategy == 'utsmc' or str(reason or '').startswith('UTSMC'):
@@ -20271,6 +20356,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 return
 
             # 1. ?ㅽ뵂??紐⑤뱺 ?ъ???議고쉶
+            signal_engine = engine if hasattr(engine, '_cancel_protection_orders') else self.engines.get(CORE_ENGINE)
             positions = await asyncio.to_thread(self.exchange.fetch_positions)
             open_positions = []
             for p in positions:
@@ -20279,11 +20365,27 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
             
             if not open_positions:
                 # ?ъ??섏씠 ?녿떎硫? ?뱀떆 紐⑤Ⅴ???꾩옱 ?ㅼ젙???щ낵??誘몄껜寃?二쇰Ц留?痍⑥냼 ?쒕룄
-                sym = self._get_current_symbol()
-                try:
-                    await asyncio.to_thread(self.exchange.cancel_all_orders, sym)
-                    logger.info(f"??All orders cancelled for {sym}")
-                except: pass
+                symbols_to_clean = {self._get_current_symbol(), *self.get_active_watchlist()}
+                if signal_engine:
+                    symbols_to_clean.update(getattr(signal_engine, 'active_symbols', set()) or set())
+                    symbols_to_clean.update(getattr(signal_engine, 'last_protection_order_status', {}).keys())
+                    if getattr(signal_engine, 'scanner_active_symbol', None):
+                        symbols_to_clean.add(signal_engine.scanner_active_symbol)
+                for sym in sorted(symbol for symbol in symbols_to_clean if symbol):
+                    try:
+                        if signal_engine:
+                            await signal_engine._cancel_all_orders_variants(sym, reason='emergency stop without position')
+                            await signal_engine._reconcile_closed_position_protection(
+                                sym,
+                                reason='emergency stop without position',
+                                alert=True,
+                                attempts=2
+                            )
+                        else:
+                            await asyncio.to_thread(self.exchange.cancel_all_orders, sym)
+                            logger.info(f"??All orders cancelled for {sym}")
+                    except Exception as cleanup_error:
+                        logger.warning(f"Emergency orphan cleanup failed for {sym}: {cleanup_error}")
                 await self.notify("ℹ️ 청산할 오픈 포지션이 없습니다. (미체결 주문만 취소)")
                 return
 
@@ -20295,7 +20397,11 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 
                 # 二쇰Ц 痍⑥냼
                 try:
-                    await asyncio.to_thread(self.exchange.cancel_all_orders, sym)
+                    if signal_engine:
+                        await signal_engine._cancel_all_orders_variants(sym, reason='before emergency close')
+                        await signal_engine._cancel_protection_orders(sym, reason='before emergency close')
+                    else:
+                        await asyncio.to_thread(self.exchange.cancel_all_orders, sym)
                 except Exception as e:
                     logger.error(f"Cancel orders error for {sym}: {e}")
                 
@@ -20314,6 +20420,15 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                         self.exchange.create_order, sym, 'market', side, qty, None, {'reduceOnly': True}
                     )
                     logger.info(f"??Emergency Close: {sym} {side} {qty}")
+                    if signal_engine:
+                        await asyncio.sleep(0.5)
+                        await signal_engine._cancel_all_orders_variants(sym, reason='after emergency close')
+                        await signal_engine._reconcile_closed_position_protection(
+                            sym,
+                            reason='after emergency close',
+                            alert=True,
+                            attempts=3
+                        )
                     await self.notify(f"✅ **{sym}** 청산 완료\nPnL: ${pnl:+.2f}")
                     
                 except Exception as e:
