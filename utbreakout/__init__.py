@@ -12,6 +12,13 @@ from .coinselector import (
 from .research import format_research_summary, summarize_diagnostic_events
 from .risk import calculate_risk_plan
 from .timeframe import HTF_MAP, select_adaptive_timeframe
+from .micro_auto import (
+    MICRO_AUTO_STRATEGY_KEY,
+    assess_micro_market_feasibility,
+    build_micro_entry_plan,
+    default_micro_auto_config,
+    normalize_micro_auto_config,
+)
 
 __all__ = [
     "build_base_candidate",
@@ -21,8 +28,13 @@ __all__ = [
     "finalize_candidate",
     "format_research_summary",
     "HTF_MAP",
+    "MICRO_AUTO_STRATEGY_KEY",
+    "assess_micro_market_feasibility",
+    "build_micro_entry_plan",
     "previous_donchian",
+    "default_micro_auto_config",
     "rank_candidates",
+    "normalize_micro_auto_config",
     "sector_tags_for_symbol",
     "select_adaptive_timeframe",
     "summarize_diagnostic_events",

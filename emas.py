@@ -56,6 +56,13 @@ from utbreakout.coinselector import (
 from utbreakout.research import format_research_summary
 from utbreakout.risk import calculate_risk_plan
 from utbreakout.timeframe import HTF_MAP as UTBREAKOUT_HTF_MAP, select_adaptive_timeframe
+from utbreakout.micro_auto import (
+    MICRO_AUTO_STRATEGY_KEY,
+    assess_micro_market_feasibility,
+    build_micro_entry_plan,
+    default_micro_auto_config,
+    normalize_micro_auto_config,
+)
 
 # ---------------------------------------------------------
 # 0. 濡쒓퉭 諛??좏떥由ы떚
@@ -729,6 +736,7 @@ class TradingConfig:
                     'cc_length': 14
                 },
                 'coin_selector': default_coin_selector_config(),
+                'micro_auto': default_micro_auto_config(),
                 'strategy_params': {
                     'active_strategy': 'utbot',
                     'entry_mode': 'cross',
@@ -1103,6 +1111,17 @@ class TradingConfig:
                 1_000_000_000.0
             )
             changed = True
+
+        micro_auto_cfg = signal_cfg.setdefault('micro_auto', {})
+        if not isinstance(micro_auto_cfg, dict):
+            micro_auto_cfg = default_micro_auto_config()
+            signal_cfg['micro_auto'] = micro_auto_cfg
+            changed = True
+        normalized_micro = normalize_micro_auto_config(micro_auto_cfg)
+        for key, value in normalized_micro.items():
+            if micro_auto_cfg.get(key) != value:
+                micro_auto_cfg[key] = value
+                changed = True
 
         upbit_cfg = self.config.setdefault('upbit', {})
         upbit_watchlist = upbit_cfg.get('watchlist')
@@ -2432,6 +2451,9 @@ class SignalEngine(BaseEngine):
         self.coin_selector_last_result = {}  # runtime CoinSelector V2 report
         self.coin_selector_symbol_scores = {}  # normalized symbol -> latest selector score
         self.coin_selector_last_run_ts = 0.0
+        self.micro_auto_last_plan = {}  # symbol -> latest accepted Micro Auto plan
+        self.micro_auto_last_rejects = {}  # symbol -> latest Micro Auto reject payload
+        self.micro_auto_last_scan = {}  # latest Micro Auto feasibility scan report
         self.last_entry_reason = {}        # symbol -> latest entry decision reason
 
     def start(self):
@@ -2481,6 +2503,9 @@ class SignalEngine(BaseEngine):
         self.coin_selector_last_result = {}
         self.coin_selector_symbol_scores = {}
         self.coin_selector_last_run_ts = 0.0
+        self.micro_auto_last_plan = {}
+        self.micro_auto_last_rejects = {}
+        self.micro_auto_last_scan = {}
         self.last_entry_reason = {}
         self.pending_reentry = {}
         self.ut_hybrid_timing_latches = {}
@@ -5707,6 +5732,13 @@ class SignalEngine(BaseEngine):
             return _finish(None, "UTBOT_FILTERED_BREAKOUT_V1 후보 신호 대기", None)
 
         side = candidate_side
+        if self._micro_auto_enabled():
+            micro_cfg = self._get_micro_auto_config()
+            cfg['daily_max_loss_usdt'] = micro_cfg.get('daily_loss_limit_usdt', cfg.get('daily_max_loss_usdt'))
+            cfg['max_daily_trades'] = micro_cfg.get('max_daily_trades', cfg.get('max_daily_trades'))
+            cfg['max_consecutive_losses'] = micro_cfg.get('max_consecutive_losses', cfg.get('max_consecutive_losses'))
+            cfg['risk_per_trade_percent'] = micro_cfg.get('risk_per_trade_pct', cfg.get('risk_per_trade_percent'))
+            cfg['max_risk_per_trade_usdt'] = micro_cfg.get('max_risk_usdt', cfg.get('max_risk_per_trade_usdt'))
         daily_count, daily_pnl = self.db.get_daily_stats()
         daily_entries = self.db.get_daily_entry_count()
         status['daily_pnl'] = daily_pnl
@@ -5974,6 +6006,34 @@ class SignalEngine(BaseEngine):
             'atr_pct': atr_pct,
             'decision_candle_ts': decision_ts
         })
+        plan, micro_reject = await self._apply_micro_auto_to_utbreakout_plan(
+            symbol=symbol,
+            side=side,
+            base_plan=plan,
+            selected_set=selected_set,
+            auto_analysis=auto_analysis,
+            cfg=cfg,
+            entry_price=entry_price,
+            atr_value=atr_value,
+            ut_stop=ut_detail.get('curr_stop'),
+            total_balance=total_balance,
+            free_balance=free_balance,
+        )
+        if micro_reject:
+            code = micro_reject.get('reject_code') or 'REJECTED_MICRO_AUTO'
+            reason = micro_reject.get('reason') or 'Micro Auto V1 rejected candidate'
+            status['micro_auto'] = micro_reject
+            status['micro_auto_summary'] = f"{code}: {reason}"
+            return _finish(None, f"{code}: {reason}", code, record_failure=True, side=side)
+
+        if plan.get('micro_auto'):
+            status['micro_auto'] = dict(plan)
+            status['micro_auto_summary'] = (
+                f"Micro Auto V1 {'DRY-RUN' if plan.get('dry_run') else 'LIVE'}: "
+                f"{plan.get('planned_notional', 0):.2f} notional / "
+                f"{plan.get('planned_margin', 0):.2f} margin / "
+                f"{plan.get('leverage', 0)}x / fee burden {plan.get('fee_burden_pct', 0):.1f}%"
+            )
         self.utbot_filtered_breakout_entry_plans[symbol] = plan
         status['risk_summary'] = (
             f"risk={plan['risk_usdt']:.4f} USDT, distance={plan['risk_distance']:.4f}, "
@@ -6321,6 +6381,23 @@ class SignalEngine(BaseEngine):
             score_line = "AUTO OFF 또는 분석 대기"
         mode_label = 'AUTO' if cfg.get('auto_select_enabled') else 'MANUAL'
         set_status = '실거래 연결' if selected_set.get('status') == 'active' else 'planned only'
+        micro_cfg = self._get_micro_auto_config()
+        micro_plan = self.micro_auto_last_plan.get(symbol) if isinstance(self.micro_auto_last_plan, dict) else None
+        micro_reject = self.micro_auto_last_rejects.get(symbol) if isinstance(self.micro_auto_last_rejects, dict) else None
+        if micro_cfg.get('enabled'):
+            if isinstance(micro_plan, dict) and micro_plan.get('micro_auto'):
+                micro_line = (
+                    f"Micro Auto: ON / {'DRY-RUN' if micro_plan.get('dry_run') else 'LIVE'} / "
+                    f"{float(micro_plan.get('planned_margin', 0) or 0):.2f} margin / "
+                    f"{float(micro_plan.get('planned_notional', 0) or 0):.2f} notional / "
+                    f"{int(float(micro_plan.get('leverage', 0) or 0))}x"
+                )
+            elif isinstance(micro_reject, dict):
+                micro_line = f"Micro Auto: ON / 최근 거절 {micro_reject.get('reject_code')}: {micro_reject.get('reason')}"
+            else:
+                micro_line = "Micro Auto: ON / 아직 계획 없음"
+        else:
+            micro_line = "Micro Auto: OFF"
         text_lines = [
             "🚦 UT Breakout 조건 스테이터스",
             f"심볼: {symbol}",
@@ -6333,6 +6410,7 @@ class SignalEngine(BaseEngine):
             f"선택 이유: {auto_reason or '수동 선택'}",
             entry_plan_detail,
             take_profit_detail,
+            micro_line,
             opposite_set_exit_detail,
             f"AUTO 점수: {score_line}",
             self.get_coin_selector_symbol_summary(symbol),
@@ -8965,6 +9043,186 @@ class SignalEngine(BaseEngine):
                 cfg[key] = int(default)
         return cfg
 
+    def _get_micro_auto_config(self):
+        raw = self.get_runtime_trade_config().get('micro_auto', {})
+        return normalize_micro_auto_config(raw if isinstance(raw, dict) else {})
+
+    def _micro_auto_enabled(self):
+        cfg = self._get_micro_auto_config()
+        return bool(cfg.get('enabled', False)) and not self.is_upbit_mode()
+
+    def _extract_market_min_notional(self, market):
+        def _safe_positive(value):
+            try:
+                parsed = float(value)
+                return parsed if parsed > 0 and np.isfinite(parsed) else None
+            except (TypeError, ValueError):
+                return None
+
+        if not isinstance(market, dict):
+            return 0.0
+        limits = market.get('limits', {}) if isinstance(market.get('limits', {}), dict) else {}
+        info = market.get('info', {}) if isinstance(market.get('info', {}), dict) else {}
+        candidates = []
+        cost_limits = limits.get('cost', {}) if isinstance(limits.get('cost', {}), dict) else {}
+        candidates.extend([cost_limits.get('min'), info.get('notional'), info.get('minNotional')])
+        filters = info.get('filters', [])
+        if isinstance(filters, list):
+            for item in filters:
+                if not isinstance(item, dict):
+                    continue
+                if item.get('filterType') in {'MIN_NOTIONAL', 'NOTIONAL'}:
+                    candidates.extend([item.get('notional'), item.get('minNotional')])
+        values = [value for value in (_safe_positive(item) for item in candidates) if value is not None]
+        return min(values) if values else 0.0
+
+    async def _get_symbol_min_notional(self, symbol):
+        try:
+            markets = await asyncio.to_thread(self.market_data_exchange.load_markets)
+            market = self._coin_selector_market_for_symbol(symbol, markets)
+            min_notional = self._extract_market_min_notional(market)
+            if min_notional > 0:
+                return min_notional
+        except Exception as exc:
+            logger.debug(f"Micro Auto market data minNotional lookup failed for {symbol}: {exc}")
+        try:
+            markets = await asyncio.to_thread(self.exchange.load_markets)
+            market = self._coin_selector_market_for_symbol(symbol, markets)
+            return self._extract_market_min_notional(market)
+        except Exception as exc:
+            logger.debug(f"Micro Auto private exchange minNotional lookup failed for {symbol}: {exc}")
+            return 0.0
+
+    async def evaluate_micro_auto_candidates(self, *, force=False):
+        cfg = self._get_micro_auto_config()
+        now = time.time()
+        cached = self.micro_auto_last_scan if isinstance(self.micro_auto_last_scan, dict) else {}
+        if (not force) and cached and (now - float(cached.get('generated_at_ts', 0) or 0)) < 60:
+            return cached
+
+        total, free, _ = await self.get_balance_info()
+        if self.is_upbit_mode():
+            report = {
+                'generated_at_ts': now,
+                'criteria': cfg,
+                'selected': [],
+                'rejected': [],
+                'note': 'Micro Auto V1은 Binance Futures 전용입니다.',
+            }
+            self.micro_auto_last_scan = report
+            return report
+
+        coin_report = await self.evaluate_coin_selector(force=force)
+        selected = list((coin_report or {}).get('selected') or [])
+        markets = await self._load_coin_selector_markets()
+        feasible = []
+        rejected = []
+        for item in selected:
+            symbol = item.get('normalized_symbol') or item.get('exchange_symbol') or item.get('symbol')
+            exchange_symbol = item.get('exchange_symbol') or symbol
+            market = self._coin_selector_market_for_symbol(exchange_symbol, markets)
+            min_notional = self._extract_market_min_notional(market)
+            if min_notional <= 0:
+                min_notional = await self._get_symbol_min_notional(symbol)
+            decision = assess_micro_market_feasibility(
+                symbol=symbol,
+                total_equity_usdt=total,
+                free_usdt=free,
+                min_notional_usdt=min_notional,
+                cfg=cfg,
+                assumed_stop_distance_pct=1.5,
+            )
+            row = dict(item)
+            row.update({
+                'micro_auto': decision,
+                'micro_min_notional': min_notional,
+                'micro_accepted': bool(decision.get('accepted')),
+                'micro_reject_code': decision.get('reject_code'),
+            })
+            if decision.get('accepted'):
+                feasible.append(row)
+            else:
+                rejected.append(row)
+
+        report = {
+            'generated_at_ts': now,
+            'generated_at': datetime.now(timezone.utc).isoformat(),
+            'criteria': cfg,
+            'coin_selector': coin_report,
+            'total_equity_usdt': total,
+            'free_usdt': free,
+            'equity_for_micro': min(max(0.0, total if total > 0 else free), float(cfg.get('equity_cap_usdt', 10.0) or 10.0)),
+            'selected': feasible,
+            'rejected': rejected,
+            'total_checked': len(selected),
+        }
+        self.micro_auto_last_scan = report
+        return report
+
+    async def _apply_micro_auto_to_utbreakout_plan(
+        self,
+        *,
+        symbol,
+        side,
+        base_plan,
+        selected_set,
+        auto_analysis,
+        cfg,
+        entry_price,
+        atr_value,
+        ut_stop,
+        total_balance,
+        free_balance,
+    ):
+        if not self._micro_auto_enabled():
+            return base_plan, None
+
+        micro_cfg = self._get_micro_auto_config()
+        min_notional = await self._get_symbol_min_notional(symbol)
+        auto_scores = (auto_analysis or {}).get('scores') if isinstance(auto_analysis, dict) else {}
+        micro_plan = build_micro_entry_plan(
+            side=side,
+            entry_price=entry_price,
+            atr_value=atr_value,
+            ut_stop=ut_stop,
+            base_plan=base_plan,
+            cfg=micro_cfg,
+            selected_set=selected_set,
+            auto_scores=auto_scores,
+            selected_timeframe=cfg.get('entry_timeframe', '15m'),
+            total_equity_usdt=total_balance,
+            free_usdt=free_balance,
+            min_notional_usdt=min_notional,
+            max_symbol_leverage=micro_cfg.get('max_leverage', 10),
+        )
+        if not micro_plan.get('accepted'):
+            payload = dict(micro_plan)
+            payload.update({
+                'symbol': symbol,
+                'side': side,
+                'min_notional_usdt': min_notional,
+                'cfg': micro_cfg,
+            })
+            self.micro_auto_last_rejects[symbol] = payload
+            self.micro_auto_last_plan.pop(symbol, None)
+            return None, payload
+
+        merged = dict(base_plan or {})
+        merged.update(micro_plan)
+        merged.update({
+            'strategy': base_plan.get('strategy'),
+            'entry_timeframe': base_plan.get('entry_timeframe') or cfg.get('entry_timeframe', '15m'),
+            'exit_timeframe': base_plan.get('exit_timeframe') or cfg.get('exit_timeframe', cfg.get('entry_timeframe', '15m')),
+            'htf_timeframe': base_plan.get('htf_timeframe') or cfg.get('htf_timeframe', '1h'),
+            'adaptive_timeframe_enabled': bool(cfg.get('adaptive_timeframe_enabled', False)),
+            'atr': atr_value,
+            'atr_pct': base_plan.get('atr_pct'),
+            'decision_candle_ts': base_plan.get('decision_candle_ts'),
+        })
+        self.micro_auto_last_plan[symbol] = dict(merged)
+        self.micro_auto_last_rejects.pop(symbol, None)
+        return merged, None
+
     async def _fetch_utbreakout_futures_context(self, symbol):
         if self.is_upbit_mode():
             return {}
@@ -9170,21 +9428,32 @@ class SignalEngine(BaseEngine):
 
     async def _scan_and_trade_coin_selector(self):
         cfg = self._get_coin_selector_config()
-        report = await self.evaluate_coin_selector(force=False)
-        candidates = [
-            item for item in report.get('selected', [])
-            if item.get('selection_state') == 'SELECTED'
-        ]
+        if self._micro_auto_enabled():
+            report = await self.evaluate_micro_auto_candidates(force=False)
+            candidates = list(report.get('selected', []))
+        else:
+            report = await self.evaluate_coin_selector(force=False)
+            candidates = [
+                item for item in report.get('selected', [])
+                if item.get('selection_state') == 'SELECTED'
+            ]
         if not candidates:
             logger.info("CoinSelector scanner: no selected candidates.")
             return
 
         log_lines = ["🧭 [CoinSelector] Top candidates:"]
         for idx, item in enumerate(candidates[:int(cfg.get('top_n', 10) or 10)], 1):
+            micro_note = ""
+            if item.get('micro_accepted'):
+                decision = item.get('micro_auto') or {}
+                micro_note = (
+                    f", micro minNotional={float(item.get('micro_min_notional', 0) or 0):.2f}, "
+                    f"{int(decision.get('leverage', 0) or 0)}x"
+                )
             log_lines.append(
                 f"  {idx}. {item.get('normalized_symbol')}: score={float(item.get('score', 0) or 0):.1f}, "
                 f"vol={float(item.get('quote_volume', 0) or 0)/1_000_000:.1f}M, "
-                f"Set{item.get('auto_set_id') or '?'}, TF={item.get('adaptive_tf')}"
+                f"Set{item.get('auto_set_id') or '?'}, TF={item.get('adaptive_tf')}{micro_note}"
             )
         logger.info("\n".join(log_lines))
 
@@ -9255,6 +9524,11 @@ class SignalEngine(BaseEngine):
                     logger.info(f"CoinSelector locking in: {symbol} [{sig.upper()}]")
                     current_price = float(ohlcv[-1][4])
                     await self.entry(symbol, sig, current_price)
+                    if self._micro_auto_enabled():
+                        post_pos = await self.get_server_position(symbol, use_cache=False)
+                        if not post_pos:
+                            logger.info(f"Micro Auto scanner did not open {symbol}; continuing candidates.")
+                            continue
                     self.scanner_active_symbol = symbol
                     current_ts = int(ohlcv[-1][0])
                     self.last_processed_candle_ts[symbol] = current_ts
@@ -9949,6 +10223,12 @@ class SignalEngine(BaseEngine):
                 lines.append(
                     f"진입금액: `증거금 {margin:.2f} USDT / 포지션 {notional:.2f} USDT / {lev:.0f}x`"
                 )
+                if entry_plan.get('micro_auto'):
+                    lines.append(
+                        f"Micro Auto: `equity cap {float(entry_plan.get('equity_for_micro', 0) or 0):.2f} / "
+                        f"minNotional {float(entry_plan.get('min_notional_usdt', 0) or 0):.2f} / "
+                        f"수수료부담 {float(entry_plan.get('fee_burden_pct', 0) or 0):.1f}%`"
+                    )
                 lines.append(
                     f"손절계획: `거리 {risk_distance:.4f} ({risk_pct:.3f}%) / 손실 {risk_usdt:.2f} USDT`"
                 )
@@ -12409,6 +12689,11 @@ class SignalEngine(BaseEngine):
 
             lev_default = 5 if active_strategy in UTBREAKOUT_STRATEGIES else 10
             lev = int(max(1.0, float(cfg.get('leverage', lev_default) or lev_default)))
+            if active_strategy in UTBREAKOUT_STRATEGIES and filtered_breakout_plan and filtered_breakout_plan.get('micro_auto'):
+                try:
+                    lev = int(max(1.0, float(filtered_breakout_plan.get('leverage', lev) or lev)))
+                except (TypeError, ValueError):
+                    pass
             req_risk_pct = float(cfg.get('risk_per_trade_pct', 10.0) or 10.0)
             max_risk_pct = float(cfg.get('max_risk_per_trade_pct', 100.0) or 100.0)
             max_risk_pct = min(100.0, max(1.0, max_risk_pct))
@@ -12478,6 +12763,14 @@ class SignalEngine(BaseEngine):
                 ])
             except Exception as e:
                 logger.debug(f"Entry min notional lookup failed for {symbol}: {e}")
+
+            if (
+                active_strategy in UTBREAKOUT_STRATEGIES
+                and filtered_breakout_plan
+                and filtered_breakout_plan.get('micro_auto')
+                and float(filtered_breakout_plan.get('min_notional_usdt', 0.0) or 0.0) > 0
+            ):
+                min_notional = float(filtered_breakout_plan.get('min_notional_usdt', 0.0) or 0.0)
 
             # Binance futures fallback (some responses omit min notional filter fields).
             if min_notional <= 0 and getattr(self.exchange, 'id', '') == 'binance':
@@ -12602,6 +12895,38 @@ class SignalEngine(BaseEngine):
                     f"Entry params: qty={qty}, lev={lev}x, risk={bounded_risk_pct:.1f}% "
                     f"(free={free:.2f}, margin_to_use={margin_to_use:.2f}, target_notional={target_notional:.2f}, safety={safety_buffer:.2f})"
                 )
+
+            if (
+                active_strategy in UTBREAKOUT_STRATEGIES
+                and filtered_breakout_plan
+                and filtered_breakout_plan.get('micro_auto')
+                and (filtered_breakout_plan.get('dry_run', True) or not filtered_breakout_plan.get('live_enabled', False))
+            ):
+                logger.info(
+                    f"[Micro Auto V1] Dry-run/live-lock entry skipped: {symbol} {side} "
+                    f"qty={qty}, notional={target_notional:.2f}, margin={margin_to_use:.2f}, lev={lev}x"
+                )
+                self.micro_auto_last_plan[symbol] = dict(filtered_breakout_plan)
+                self.micro_auto_last_plan[symbol].update({
+                    'dry_run_blocked_at': datetime.now(timezone.utc).isoformat(),
+                    'dry_run_target_notional': target_notional,
+                    'dry_run_margin': margin_to_use,
+                    'dry_run_qty': float(qty),
+                })
+                _record_filtered_breakout_entry_block(
+                    'MICRO_AUTO_DRY_RUN_READY',
+                    'Micro Auto V1 dry-run/live-lock: order not sent',
+                    {
+                        'target_notional': target_notional,
+                        'planned_margin': margin_to_use,
+                        'leverage': lev,
+                        'micro_auto': True,
+                        'dry_run': filtered_breakout_plan.get('dry_run', True),
+                        'live_enabled': filtered_breakout_plan.get('live_enabled', False),
+                    }
+                )
+                self._clear_utbot_filtered_breakout_entry_plan(symbol)
+                return
             
             # [Enforce] Market Settings (Isolated + Leverage)
             await self.ensure_market_settings(symbol, leverage=lev)
@@ -12813,7 +13138,7 @@ class SignalEngine(BaseEngine):
             logger.error(f"Signal entry error: {e}")
             import traceback
             traceback.print_exc()
-            if locals().get('active_strategy') == UTBOT_FILTERED_BREAKOUT_STRATEGY:
+            if locals().get('active_strategy') in UTBREAKOUT_STRATEGIES:
                 self._clear_utbot_filtered_breakout_entry_plan(symbol)
             await self.ctrl.notify(f"❌ 진입 실패: {e}")
 
@@ -17503,6 +17828,7 @@ class MainController:
         kb = [
             [KeyboardButton("🚨 STOP"), KeyboardButton("⏸ PAUSE"), KeyboardButton("▶ RESUME")],
             [KeyboardButton("/setup"), KeyboardButton("/utbreakout"), KeyboardButton("/coinscan")],
+            [KeyboardButton("/microauto")],
             [KeyboardButton("/status"), KeyboardButton("/history"), KeyboardButton("/stats")],
             [KeyboardButton("/log"), KeyboardButton("/help")]
         ]
@@ -17516,7 +17842,7 @@ class MainController:
         markup = self._build_main_keyboard()
         text_filter = filters.TEXT & ~filters.COMMAND
         setup_trigger_pattern = r"^/setup(?:@[A-Za-z0-9_]+)?$"
-        menu_trigger_pattern = r"^/(status|history|log|help|stats|close|utbreakout|coinscan)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
+        menu_trigger_pattern = r"^/(status|history|log|help|stats|close|utbreakout|coinscan|microauto)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
         setup_text_filter = text_filter & ~filters.Regex(r"^/")
 
         async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -18817,6 +19143,255 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 return
             await _edit_coinscan_menu(query)
 
+        def _micro_cfg():
+            raw = self.cfg.get('signal_engine', {}).get('micro_auto', {})
+            return normalize_micro_auto_config(raw if isinstance(raw, dict) else {})
+
+        def _build_micro_keyboard():
+            return InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("ON", callback_data="ma:on"),
+                    InlineKeyboardButton("OFF", callback_data="ma:off")
+                ],
+                [
+                    InlineKeyboardButton("DRY-RUN ON", callback_data="ma:dry_on"),
+                    InlineKeyboardButton("LIVE LOCK 해제", callback_data="ma:live_on")
+                ],
+                [
+                    InlineKeyboardButton("현재 후보", callback_data="ma:scan"),
+                    InlineKeyboardButton("자동계획", callback_data="ma:status")
+                ],
+                [
+                    InlineKeyboardButton("리스크", callback_data="ma:risk"),
+                    InlineKeyboardButton("리포트 다운로드", callback_data="ma:download")
+                ],
+                [
+                    InlineKeyboardButton("새로고침", callback_data="ma:menu")
+                ]
+            ])
+
+        async def _enable_microauto(dry_run=True):
+            await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'micro_auto', 'dry_run'], bool(dry_run))
+            await self.cfg.update_value(['signal_engine', 'micro_auto', 'live_enabled'], not bool(dry_run))
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'], 'auto')
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'auto_select_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], True)
+            self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
+
+        async def _run_micro_scan(force=False):
+            engine = self.engines.get('signal')
+            if not engine:
+                return {
+                    'criteria': _micro_cfg(),
+                    'selected': [],
+                    'rejected': [],
+                    'note': 'Signal 엔진을 찾을 수 없습니다.',
+                }
+            return await engine.evaluate_micro_auto_candidates(force=force)
+
+        def _format_micro_risk_text():
+            cfg = _micro_cfg()
+            return "\n".join([
+                "🧪 Micro Auto V1 리스크 기준",
+                f"계좌 한도: min(total equity, {float(cfg.get('equity_cap_usdt', 10.0) or 10.0):.2f} USDT)",
+                f"최소 거래 equity: {float(cfg.get('min_equity_to_trade_usdt', 6.0) or 6.0):.2f} USDT",
+                f"레버리지 자동범위: {int(cfg.get('min_leverage', 3) or 3)}x~{int(cfg.get('max_leverage', 10) or 10)}x",
+                f"증거금 상한: micro equity의 {float(cfg.get('max_margin_usage_pct', 45.0) or 45.0):.1f}%",
+                f"1회 손실: {float(cfg.get('risk_per_trade_pct', 1.5) or 1.5):.2f}% 또는 최대 {float(cfg.get('max_risk_usdt', 0.15) or 0.15):.2f} USDT",
+                f"일일 손실/거래 제한: -{float(cfg.get('daily_loss_limit_usdt', 0.45) or 0.45):.2f} USDT / {int(cfg.get('max_daily_trades', 3) or 3)}회 / 연속손절 {int(cfg.get('max_consecutive_losses', 2) or 2)}회",
+                f"익절: 최소 {float(cfg.get('min_take_profit_r', 2.2) or 2.2):.1f}R, 수수료 부담 크면 {float(cfg.get('high_fee_take_profit_r', 2.5) or 2.5):.1f}R",
+                "원칙: 최소주문 때문에 수량을 키웠을 때 손절 손실이 예산을 넘으면 진입하지 않습니다.",
+            ])
+
+        def _format_micro_status_text(report=None):
+            cfg = _micro_cfg()
+            engine = self.engines.get('signal')
+            report = report or (engine.micro_auto_last_scan if engine else {}) or {}
+            last_plan = {}
+            last_reject = {}
+            if engine:
+                if engine.micro_auto_last_plan:
+                    last_plan = next(reversed(engine.micro_auto_last_plan.values()))
+                if engine.micro_auto_last_rejects:
+                    last_reject = next(reversed(engine.micro_auto_last_rejects.values()))
+            selected = list(report.get('selected') or [])
+            rejected = list(report.get('rejected') or [])
+            lines = [
+                "🧪 MICRO_AUTO_V1",
+                "",
+                f"상태: {'ON' if cfg.get('enabled') else 'OFF'} | DRY-RUN {'ON' if cfg.get('dry_run') else 'OFF'} | LIVE {'ON' if cfg.get('live_enabled') else 'LOCKED'}",
+                f"전략: `{UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY}` + CoinSelector V2 + 50-set AUTO + Adaptive TF",
+                f"계좌: total {float(report.get('total_equity_usdt', 0) or 0):.2f} / free {float(report.get('free_usdt', 0) or 0):.2f} / micro {float(report.get('equity_for_micro', 0) or 0):.2f} USDT",
+                "",
+            ]
+            if last_plan:
+                lines.extend([
+                    "최근 자동계획:",
+                    (
+                        f"{last_plan.get('side', '').upper()} {last_plan.get('selected_timeframe') or last_plan.get('entry_timeframe')} / "
+                        f"Set{last_plan.get('selected_set_id') or '?'} {last_plan.get('selected_set_name') or ''}"
+                    ),
+                    (
+                        f"레버리지 {int(float(last_plan.get('leverage', 0) or 0))}x / "
+                        f"증거금 {float(last_plan.get('planned_margin', 0) or 0):.2f} / "
+                        f"포지션 {float(last_plan.get('planned_notional', 0) or 0):.2f} USDT / "
+                        f"수량 {float(last_plan.get('qty', 0) or 0):.8f}"
+                    ),
+                    (
+                        f"SL {float(last_plan.get('stop_loss', 0) or 0):.6f} / "
+                        f"TP {float(last_plan.get('take_profit', 0) or 0):.6f} / "
+                        f"손실 {float(last_plan.get('risk_usdt', 0) or 0):.4f} / "
+                        f"RR {float(last_plan.get('rr_multiple', 0) or 0):.1f}R"
+                    ),
+                    (
+                        f"minNotional {float(last_plan.get('min_notional_usdt', 0) or 0):.2f} / "
+                        f"수수료부담 {float(last_plan.get('fee_burden_pct', 0) or 0):.1f}%"
+                    ),
+                    "",
+                ])
+            elif last_reject:
+                lines.extend([
+                    "최근 거절:",
+                    f"{last_reject.get('symbol', '')} {last_reject.get('reject_code', '')}: {last_reject.get('reason', '')}",
+                    "",
+                ])
+            else:
+                lines.append("최근 자동계획: 아직 없음. `/microauto scan`으로 후보를 확인하세요.\n")
+
+            lines.append("현재 후보:")
+            if not selected:
+                lines.append("가능 후보 없음 또는 아직 스캔 전입니다.")
+            for idx, item in enumerate(selected[:8], 1):
+                decision = item.get('micro_auto') or {}
+                lines.append(
+                    f"{idx}. {item.get('normalized_symbol') or item.get('symbol')} "
+                    f"score {float(item.get('score', 0) or 0):.1f} / "
+                    f"minNotional {float(item.get('micro_min_notional', 0) or 0):.2f} / "
+                    f"{int(decision.get('leverage', 0) or 0)}x / margin {float(decision.get('required_margin', 0) or 0):.2f}"
+                )
+            if rejected:
+                lines.append("")
+                lines.append(f"제외 후보: {len(rejected)}개 (예: {rejected[0].get('normalized_symbol') or rejected[0].get('symbol')} {rejected[0].get('micro_reject_code')})")
+            lines.extend([
+                "",
+                "명령: `/microauto on`, `/microauto off`, `/microauto scan`, `/microauto dryrun on`, `/microauto live on`, `/microauto risk`",
+            ])
+            return "\n".join(lines).strip()
+
+        async def _send_micro_report_document(message, report=None):
+            if message is None:
+                return
+            try:
+                report = report or await _run_micro_scan(force=False)
+                text = "\n\n".join([
+                    _format_micro_status_text(report),
+                    _format_micro_risk_text(),
+                ])
+                bio = io.BytesIO(text.encode('utf-8'))
+                bio.name = 'micro_auto_v1_report.txt'
+                await message.reply_document(
+                    document=bio,
+                    filename='micro_auto_v1_report.txt',
+                    caption='Micro Auto V1 리포트입니다.'
+                )
+            except Exception as e:
+                logger.error(f"Micro Auto report download failed: {e}")
+                await message.reply_text(f"Micro Auto 리포트 다운로드 실패: {e}")
+
+        async def _edit_micro_menu(query, notice=None, report=None):
+            text = _format_micro_status_text(report)
+            if notice:
+                text = f"{notice}\n\n{text}"
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=_build_micro_keyboard())
+            except BadRequest as md_err:
+                if "message is not modified" in str(md_err).lower():
+                    return
+                plain = str(text).replace("`", "").replace("**", "")
+                await query.edit_message_text(plain, reply_markup=_build_micro_keyboard())
+
+        async def microauto_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            args = list(getattr(c, 'args', []) or [])
+            if not args and u and u.message and u.message.text:
+                args = u.message.text.strip().split()[1:]
+            action = str(args[0]).strip().lower() if args else ''
+            value = str(args[1]).strip().lower() if len(args) >= 2 else ''
+
+            if action in {'on', 'enable', 'start'}:
+                await _enable_microauto(dry_run=True)
+                await u.message.reply_text("✅ Micro Auto V1: ON / DRY-RUN ON. 실주문은 `/microauto live on` 전까지 차단됩니다.", parse_mode=ParseMode.MARKDOWN)
+                return
+            if action in {'off', 'disable', 'stop'}:
+                await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
+                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
+                await u.message.reply_text("✅ Micro Auto V1: OFF")
+                return
+            if action in {'dryrun', 'dry-run'}:
+                on = value not in {'off', 'false', '0', 'disable'}
+                await self.cfg.update_value(['signal_engine', 'micro_auto', 'dry_run'], on)
+                if on:
+                    await self.cfg.update_value(['signal_engine', 'micro_auto', 'live_enabled'], False)
+                await u.message.reply_text(f"✅ Micro Auto DRY-RUN: {'ON' if on else 'OFF'}")
+                return
+            if action == 'live' and value == 'on':
+                await _enable_microauto(dry_run=False)
+                await u.message.reply_text("✅ Micro Auto LIVE: ON. 소액 모드 조건을 통과한 주문만 실행됩니다.")
+                return
+            if action in {'scan', 'candidates', 'top'}:
+                report = await _run_micro_scan(force=True)
+                await u.message.reply_text(_format_micro_status_text(report), parse_mode=ParseMode.MARKDOWN, reply_markup=_build_micro_keyboard())
+                return
+            if action in {'risk', 'rules'}:
+                await u.message.reply_text(_format_micro_risk_text(), reply_markup=_build_micro_keyboard())
+                return
+            if action in {'download', 'report', 'log'}:
+                await _send_micro_report_document(u.message)
+                return
+            await self._reply_markdown_safe(u.message, _format_micro_status_text(), reply_markup=_build_micro_keyboard())
+
+        async def microauto_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            query = u.callback_query
+            if not query:
+                return
+            await query.answer()
+            data = str(query.data or '')
+            if not data.startswith('ma:'):
+                return
+            action = data.split(':', 1)[1]
+            if action == 'on':
+                await _enable_microauto(dry_run=True)
+                await _edit_micro_menu(query, "✅ Micro Auto V1: ON / DRY-RUN ON")
+                return
+            if action == 'off':
+                await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
+                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
+                await _edit_micro_menu(query, "✅ Micro Auto V1: OFF")
+                return
+            if action == 'dry_on':
+                await self.cfg.update_value(['signal_engine', 'micro_auto', 'dry_run'], True)
+                await self.cfg.update_value(['signal_engine', 'micro_auto', 'live_enabled'], False)
+                await _edit_micro_menu(query, "✅ DRY-RUN ON")
+                return
+            if action == 'live_on':
+                await _enable_microauto(dry_run=False)
+                await _edit_micro_menu(query, "✅ LIVE ON")
+                return
+            if action == 'scan':
+                report = await _run_micro_scan(force=True)
+                await _edit_micro_menu(query, report=report)
+                return
+            if action == 'risk':
+                await query.edit_message_text(_format_micro_risk_text(), reply_markup=_build_micro_keyboard())
+                return
+            if action == 'download':
+                await _send_micro_report_document(query.message)
+                return
+            await _edit_micro_menu(query)
+
         async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             msg = """
 📚 **명령어**
@@ -18828,6 +19403,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 /stats - 통계
 /utbreakout - UTBOT_FILTERED_BREAKOUT_V1 전용 메뉴
 /coinscan - CoinSelector V2 자동 코인 선택 메뉴
+/microauto - 10 USDT 이하 소액 전용 자동매매 메뉴
 /log - 최근 로그
 /close - 긴급 청산
 
@@ -18851,6 +19427,8 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
         self.tg_app.add_handler(CallbackQueryHandler(utbreakout_callback, pattern=r"^utb:"))
         self.tg_app.add_handler(CommandHandler("coinscan", coinscan_cmd))
         self.tg_app.add_handler(CallbackQueryHandler(coinscan_callback, pattern=r"^cs:"))
+        self.tg_app.add_handler(CommandHandler("microauto", microauto_cmd))
+        self.tg_app.add_handler(CallbackQueryHandler(microauto_callback, pattern=r"^ma:"))
         self.tg_app.add_handler(CommandHandler("help", help_cmd))
 
         setup_command_handler = CommandHandler('setup', self.setup_entry)
@@ -18896,6 +19474,8 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 return await utbreakout_cmd(u, c)
             if command == "/coinscan":
                 return await coinscan_cmd(u, c)
+            if command == "/microauto":
+                return await microauto_cmd(u, c)
             return None
 
         self.tg_app.add_handler(
