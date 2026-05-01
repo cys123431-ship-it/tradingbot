@@ -27,10 +27,13 @@ jobs:
 
       - name: Deploy to Azure server
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         with:
           host: ${{ secrets.AZURE_HOST }}
           username: ${{ secrets.AZURE_USERNAME }}
           key: ${{ secrets.AZURE_SSH_PRIVATE_KEY }}
+          envs: TELEGRAM_BOT_TOKEN
           script: |
             set -euo pipefail
 
@@ -90,6 +93,22 @@ jobs:
 
             ./venv/bin/python -m pip install --upgrade pip
             ./venv/bin/python -m pip install -r requirements.txt
+            if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+              echo "=== Apply Telegram token from GitHub Secret ==="
+              ./venv/bin/python - <<'PY'
+import json
+import os
+
+path = "config.json"
+with open(path, "r", encoding="utf-8") as fh:
+    cfg = json.load(fh)
+cfg.setdefault("telegram", {})["token"] = os.environ["TELEGRAM_BOT_TOKEN"]
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(cfg, fh, ensure_ascii=False, indent=4)
+PY
+            else
+              echo "TELEGRAM_BOT_TOKEN secret is empty; preserving restored config token"
+            fi
             ./venv/bin/python -m py_compile emas.py scripts/utbreakout_backtest.py scripts/utbreakout_research_report.py
             chmod +x "$BOT_CTL"
 
