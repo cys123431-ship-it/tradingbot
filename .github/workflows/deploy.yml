@@ -95,17 +95,7 @@ jobs:
             ./venv/bin/python -m pip install -r requirements.txt
             if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
               echo "=== Apply Telegram token from GitHub Secret ==="
-              ./venv/bin/python - <<'PY'
-import json
-import os
-
-path = "config.json"
-with open(path, "r", encoding="utf-8") as fh:
-    cfg = json.load(fh)
-cfg.setdefault("telegram", {})["token"] = os.environ["TELEGRAM_BOT_TOKEN"]
-with open(path, "w", encoding="utf-8") as fh:
-    json.dump(cfg, fh, ensure_ascii=False, indent=4)
-PY
+              ./venv/bin/python -c 'import json, os, pathlib; p=pathlib.Path("config.json"); cfg=json.loads(p.read_text(encoding="utf-8")); cfg.setdefault("telegram", {})["token"]=os.environ["TELEGRAM_BOT_TOKEN"]; p.write_text(json.dumps(cfg, ensure_ascii=False, indent=4) + "\n", encoding="utf-8")'
             else
               echo "TELEGRAM_BOT_TOKEN secret is empty; preserving restored config token"
             fi
