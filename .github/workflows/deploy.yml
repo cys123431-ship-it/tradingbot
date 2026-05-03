@@ -20,7 +20,7 @@ jobs:
       - name: Static smoke tests
         run: |
           set -euo pipefail
-          python -m py_compile emas.py scripts/utbreakout_backtest.py scripts/utbreakout_research_report.py
+          python -m py_compile emas.py scripts/utbreakout_backtest.py scripts/utbreakout_research_report.py scripts/validate_telegram_token.py
           python -m pip install --upgrade pip
           python -m pip install pytest
           python -m pytest -q
@@ -99,7 +99,9 @@ jobs:
             else
               echo "TELEGRAM_BOT_TOKEN secret is empty; preserving restored config token"
             fi
-            ./venv/bin/python -m py_compile emas.py scripts/utbreakout_backtest.py scripts/utbreakout_research_report.py
+            ./venv/bin/python -m py_compile emas.py scripts/utbreakout_backtest.py scripts/utbreakout_research_report.py scripts/validate_telegram_token.py
+            echo "=== Verify Telegram token ==="
+            TELEGRAM_EXPECTED_USERNAME=YosebiBot ./venv/bin/python scripts/validate_telegram_token.py
             chmod +x "$BOT_CTL"
 
             echo "=== Stop previous bot ==="
