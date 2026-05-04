@@ -96,11 +96,23 @@ start_bot() {
   fi
 
   mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")" "$STATE_DIR"
+  if [[ -f "$APP_DIR/runtime/prediction_live.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$APP_DIR/runtime/prediction_live.env"
+    set +a
+  fi
   if [[ "$TRUNCATE_LOG" == "1" ]]; then
     : > "$LOG_FILE"
   fi
 
   nohup env \
+    PREDICTION_API_KEY="${PREDICTION_API_KEY:-}" \
+    PREDICTION_JWT="${PREDICTION_JWT:-}" \
+    PREDICTION_PRIVATE_KEY="${PREDICTION_PRIVATE_KEY:-}" \
+    PREDICTION_PREDICT_ACCOUNT="${PREDICTION_PREDICT_ACCOUNT:-}" \
+    PREDICTION_CHAIN_ID="${PREDICTION_CHAIN_ID:-56}" \
+    PREDICTION_LIVE_TRADING_ENABLED="${PREDICTION_LIVE_TRADING_ENABLED:-0}" \
     BOT_LAUNCH_REASON="$launch_reason" \
     BOT_LAST_HEARTBEAT_AGE="$last_heartbeat_age" \
     BOT_LAST_PID="$last_pid" \

@@ -7,7 +7,10 @@ from prediction import (
     PaperLedger,
     PredictAuthRequired,
     PredictClient,
+    PredictionLiveCredentials,
+    PredictionLiveOrderError,
     analyze_orderbook,
+    build_live_market_order_payload,
     build_prediction_micro_plan,
     default_prediction_micro_config,
     evaluate_paper_position_exit,
@@ -17,6 +20,8 @@ from prediction import (
     format_prediction_research_report,
     normalize_market,
     score_prediction_candidate,
+    submit_live_market_order,
+    yes_token_id_from_market,
 )
 
 
@@ -38,6 +43,13 @@ def test_predict_mainnet_without_api_key_rejects_before_network():
     with pytest.raises(PredictAuthRequired) as exc:
         client.get_markets(first=1)
     assert "PREDICTION_MAINNET_AUTH_REQUIRED" in str(exc.value)
+
+
+def test_predict_mainnet_create_order_requires_jwt():
+    client = PredictClient.mainnet(api_key="key", jwt_token="")
+    with pytest.raises(PredictAuthRequired) as exc:
+        client.create_order({"data": {}})
+    assert "PREDICTION_MAINNET_JWT_REQUIRED" in str(exc.value)
 
 
 def test_orderbook_analyzer_calculates_spread_depth_and_impact():
@@ -136,6 +148,22 @@ def test_prediction_micro_guard_caps_total_at_ten_usdt_and_one_open_position():
     assert open_limit["reject_code"] == "REJECTED_PREDICTION_OPEN_POSITION_LIMIT"
 
 
+def test_prediction_live_config_unlocks_paper_only_flag():
+    cfg = default_prediction_micro_config()
+    cfg["live_enabled"] = True
+    plan = build_prediction_micro_plan(
+        market=normalize_market({"id": 1, "title": "Bitcoin Up or Down", "categorySlug": "crypto"}),
+        side="YES",
+        market_price=0.50,
+        edge=0.08,
+        cfg=cfg,
+    )
+
+    assert plan["accepted"] is True
+    assert plan["paper_only"] is False
+    assert plan["live_enabled"] is True
+
+
 def test_prediction_paper_ledger_tracks_close_settlement_brier_and_pnl():
     ledger = PaperLedger()
     plan = {
@@ -207,6 +235,144 @@ def test_prediction_lifecycle_closes_on_edge_loss_and_settles_resolution():
     assert settle["action"] == "settle"
     assert settle["outcome_won"] is True
     assert extract_market_resolution({"winningOutcome": "No"})["winning_side"] == "NO"
+
+
+class _FakeAmounts:
+    price_per_share = 500000000000000000
+    maker_amount = 1000000000000000000
+    taker_amount = 2000000000000000000
+
+
+class _FakeSignedOrder:
+    def __init__(self):
+        self.salt = "1"
+        self.maker = "0xmaker"
+        self.signer = "0xsigner"
+        self.taker = "0x0000000000000000000000000000000000000000"
+        self.token_id = "123"
+        self.maker_amount = "1000000000000000000"
+        self.taker_amount = "2000000000000000000"
+        self.expiration = "1"
+        self.nonce = "0"
+        self.fee_rate_bps = "100"
+        self.side = 0
+        self.signature_type = 0
+        self.signature = "0xsig"
+
+
+class _FakeBuilder:
+    @classmethod
+    def make(cls, *args, **kwargs):
+        return cls()
+
+    def get_market_order_amounts(self, *args, **kwargs):
+        return _FakeAmounts()
+
+    def build_order(self, *args, **kwargs):
+        return {"order": True}
+
+    def build_typed_data(self, *args, **kwargs):
+        return {"typed": True}
+
+    def sign_typed_data_order(self, *args, **kwargs):
+        return _FakeSignedOrder()
+
+    def build_typed_data_hash(self, *args, **kwargs):
+        return "0xhash"
+
+
+class _FakeSdk:
+    class ChainId:
+        BNB_MAINNET = 56
+        BNB_TESTNET = 97
+
+    class Side:
+        BUY = 0
+
+    class OrderBuilderOptions:
+        def __init__(self, predict_account=None):
+            self.predict_account = predict_account
+
+    class MarketHelperValueInput:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class BuildOrderInput:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class Book:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    OrderBuilder = _FakeBuilder
+
+
+class _FakeLiveClient:
+    def __init__(self):
+        self.payload = None
+
+    def create_order(self, payload):
+        self.payload = payload
+        return {"success": True, "data": {"orderId": "ord-1", "orderHash": "0xhash"}}
+
+
+def test_prediction_live_order_requires_env_unlock_and_builds_payload():
+    market = normalize_market({
+        "id": 1,
+        "title": "Bitcoin Up or Down",
+        "categorySlug": "crypto",
+        "feeRateBps": 100,
+        "outcomes": [{"name": "Yes", "onChainId": "123"}],
+    })
+    orderbook = {"data": {"marketId": 1, "asks": [[0.50, 10]], "bids": [[0.49, 10]]}}
+    locked = PredictionLiveCredentials(api_key="k", jwt_token="j", private_key="p", env_live_enabled=False)
+    unlocked = PredictionLiveCredentials(api_key="k", jwt_token="j", private_key="p", env_live_enabled=True)
+
+    assert yes_token_id_from_market(market) == "123"
+    with pytest.raises(PredictionLiveOrderError):
+        build_live_market_order_payload(
+            market=market,
+            orderbook_payload=orderbook,
+            stake_usdt=1.0,
+            credentials=locked,
+            sdk_module=_FakeSdk,
+        )
+
+    payload = build_live_market_order_payload(
+        market=market,
+        orderbook_payload=orderbook,
+        stake_usdt=1.0,
+        credentials=unlocked,
+        sdk_module=_FakeSdk,
+    )
+
+    assert payload["data"]["strategy"] == "MARKET"
+    assert payload["data"]["order"]["hash"] == "0xhash"
+    assert payload["data"]["order"]["tokenId"] == "123"
+
+
+def test_prediction_live_order_submit_uses_client_create_order():
+    market = normalize_market({
+        "id": 1,
+        "title": "Bitcoin Up or Down",
+        "categorySlug": "crypto",
+        "outcomes": [{"name": "Yes", "onChainId": "123"}],
+    })
+    client = _FakeLiveClient()
+    result = submit_live_market_order(
+        client=client,
+        market=market,
+        orderbook_payload={"data": {"marketId": 1, "asks": [[0.50, 10]], "bids": [[0.49, 10]]}},
+        plan={"stake_usdt": 1.0},
+        cfg={"live_slippage_bps": 25},
+        credentials=PredictionLiveCredentials(api_key="k", jwt_token="j", private_key="p", env_live_enabled=True),
+        sdk_module=_FakeSdk,
+    )
+
+    assert result["accepted"] is True
+    assert result["order_id"] == "ord-1"
+    assert client.payload["data"]["slippageBps"] == "25"
 
 
 def test_prediction_strategy_catalog_and_candidate_score_are_paper_only():

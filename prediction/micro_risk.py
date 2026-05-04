@@ -6,6 +6,7 @@ from __future__ import annotations
 DEFAULT_PREDICTION_MICRO_CONFIG = {
     "enabled": False,
     "paper_only": True,
+    "live_enabled": False,
     "equity_cap_usdt": 10.0,
     "min_stake_usdt": 1.0,
     "max_stake_usdt": 1.0,
@@ -19,6 +20,10 @@ DEFAULT_PREDICTION_MICRO_CONFIG = {
     "scan_limit": 30,
     "scan_interval_seconds": 300,
     "auto_paper_entry": True,
+    "live_order_strategy": "MARKET",
+    "live_side": "YES",
+    "live_slippage_bps": 50,
+    "live_min_score": 60.0,
     "paper_exit_edge_floor": 0.0,
     "paper_stop_loss_probability": 0.20,
     "paper_take_profit_probability": 0.25,
@@ -53,7 +58,8 @@ def normalize_prediction_micro_config(raw=None):
     if isinstance(raw, dict):
         cfg.update(raw)
     cfg["enabled"] = str(cfg.get("enabled")).lower() in {"1", "true", "yes", "on", "enabled"}
-    cfg["paper_only"] = True
+    cfg["live_enabled"] = str(cfg.get("live_enabled")).lower() in {"1", "true", "yes", "on", "enabled", "unlocked"}
+    cfg["paper_only"] = not cfg["live_enabled"]
     for key in (
         "equity_cap_usdt",
         "min_stake_usdt",
@@ -61,6 +67,7 @@ def normalize_prediction_micro_config(raw=None):
         "daily_loss_limit_usdt",
         "min_edge_probability",
         "max_fee_burden_pct",
+        "live_min_score",
         "paper_exit_edge_floor",
         "paper_stop_loss_probability",
         "paper_take_profit_probability",
@@ -71,8 +78,11 @@ def normalize_prediction_micro_config(raw=None):
         cfg[key] = max(0, _finite_int(cfg.get(key), DEFAULT_PREDICTION_MICRO_CONFIG[key]))
     for key in ("scan_limit", "scan_interval_seconds"):
         cfg[key] = max(1, _finite_int(cfg.get(key), DEFAULT_PREDICTION_MICRO_CONFIG[key]))
+    cfg["live_slippage_bps"] = max(0, min(500, _finite_int(cfg.get("live_slippage_bps"), DEFAULT_PREDICTION_MICRO_CONFIG["live_slippage_bps"])))
     cfg["use_mainnet"] = str(cfg.get("use_mainnet")).lower() in {"1", "true", "yes", "on", "enabled"}
     cfg["auto_paper_entry"] = str(cfg.get("auto_paper_entry")).lower() in {"1", "true", "yes", "on", "enabled"}
+    cfg["live_order_strategy"] = "MARKET"
+    cfg["live_side"] = "YES"
     if cfg["equity_cap_usdt"] <= 0 or cfg["equity_cap_usdt"] > 10.0:
         cfg["equity_cap_usdt"] = 10.0
     if cfg["max_stake_usdt"] < cfg["min_stake_usdt"]:
@@ -124,6 +134,7 @@ def build_prediction_micro_plan(
             "accepted": False,
             "reject_code": reject,
             "paper_only": True,
+            "live_enabled": cfg["live_enabled"],
             "equity_cap_usdt": cfg["equity_cap_usdt"],
             "stake_usdt": stake,
         }
@@ -143,5 +154,6 @@ def build_prediction_micro_plan(
         "max_profit_usdt": shares - stake,
         "edge_probability": edge,
         "equity_cap_usdt": cfg["equity_cap_usdt"],
-        "paper_only": True,
+        "paper_only": cfg["paper_only"],
+        "live_enabled": cfg["live_enabled"],
     }

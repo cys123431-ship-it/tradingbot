@@ -29,11 +29,17 @@ jobs:
         uses: appleboy/ssh-action@v1.0.3
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          PREDICTION_API_KEY: ${{ secrets.PREDICTION_API_KEY }}
+          PREDICTION_JWT: ${{ secrets.PREDICTION_JWT }}
+          PREDICTION_PRIVATE_KEY: ${{ secrets.PREDICTION_PRIVATE_KEY }}
+          PREDICTION_PREDICT_ACCOUNT: ${{ secrets.PREDICTION_PREDICT_ACCOUNT }}
+          PREDICTION_CHAIN_ID: ${{ secrets.PREDICTION_CHAIN_ID }}
+          PREDICTION_LIVE_TRADING_ENABLED: ${{ secrets.PREDICTION_LIVE_TRADING_ENABLED }}
         with:
           host: ${{ secrets.AZURE_HOST }}
           username: ${{ secrets.AZURE_USERNAME }}
           key: ${{ secrets.AZURE_SSH_PRIVATE_KEY }}
-          envs: TELEGRAM_BOT_TOKEN
+          envs: TELEGRAM_BOT_TOKEN,PREDICTION_API_KEY,PREDICTION_JWT,PREDICTION_PRIVATE_KEY,PREDICTION_PREDICT_ACCOUNT,PREDICTION_CHAIN_ID,PREDICTION_LIVE_TRADING_ENABLED
           script: |
             set -euo pipefail
 
@@ -93,6 +99,23 @@ jobs:
 
             ./venv/bin/python -m pip install --upgrade pip
             ./venv/bin/python -m pip install -r requirements.txt
+            echo "=== Apply Prediction live env if provided ==="
+            mkdir -p runtime
+            if [ -n "${PREDICTION_API_KEY:-}" ] || [ -n "${PREDICTION_JWT:-}" ] || [ -n "${PREDICTION_PRIVATE_KEY:-}" ]; then
+              umask 077
+              {
+                printf 'PREDICTION_API_KEY=%q\n' "${PREDICTION_API_KEY:-}"
+                printf 'PREDICTION_JWT=%q\n' "${PREDICTION_JWT:-}"
+                printf 'PREDICTION_PRIVATE_KEY=%q\n' "${PREDICTION_PRIVATE_KEY:-}"
+                printf 'PREDICTION_PREDICT_ACCOUNT=%q\n' "${PREDICTION_PREDICT_ACCOUNT:-}"
+                printf 'PREDICTION_CHAIN_ID=%q\n' "${PREDICTION_CHAIN_ID:-56}"
+                printf 'PREDICTION_LIVE_TRADING_ENABLED=%q\n' "${PREDICTION_LIVE_TRADING_ENABLED:-0}"
+              } > runtime/prediction_live.env
+              chmod 600 runtime/prediction_live.env
+              echo "prediction live env updated"
+            else
+              echo "Prediction live secrets not provided; preserving existing runtime env if any"
+            fi
             if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
               echo "=== Apply Telegram token from GitHub Secret ==="
               ./venv/bin/python -c 'import json, os, pathlib; p=pathlib.Path("config.json"); cfg=json.loads(p.read_text(encoding="utf-8")); cfg.setdefault("telegram", {})["token"]=os.environ["TELEGRAM_BOT_TOKEN"]; p.write_text(json.dumps(cfg, ensure_ascii=False, indent=4) + "\n", encoding="utf-8")'

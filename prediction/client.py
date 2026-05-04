@@ -21,9 +21,10 @@ class PredictAuthRequired(RuntimeError):
 
 
 class PredictClient:
-    def __init__(self, base_url=PREDICT_TESTNET_BASE_URL, api_key=None, timeout=15):
+    def __init__(self, base_url=PREDICT_TESTNET_BASE_URL, api_key=None, jwt_token=None, timeout=15):
         self.base_url = str(base_url or PREDICT_TESTNET_BASE_URL).rstrip("/")
         self.api_key = str(api_key or "").strip()
+        self.jwt_token = str(jwt_token or "").strip()
         self.timeout = timeout
 
     @classmethod
@@ -31,8 +32,8 @@ class PredictClient:
         return cls(PREDICT_TESTNET_BASE_URL, timeout=timeout)
 
     @classmethod
-    def mainnet(cls, api_key=None, timeout=15):
-        return cls(PREDICT_MAINNET_BASE_URL, api_key=api_key, timeout=timeout)
+    def mainnet(cls, api_key=None, jwt_token=None, timeout=15):
+        return cls(PREDICT_MAINNET_BASE_URL, api_key=api_key, jwt_token=jwt_token, timeout=timeout)
 
     @property
     def is_mainnet(self):
@@ -47,6 +48,8 @@ class PredictClient:
         }
         if self.api_key:
             headers["x-api-key"] = self.api_key
+        if self.jwt_token:
+            headers["Authorization"] = f"Bearer {self.jwt_token}"
         return headers
 
     @staticmethod
@@ -70,6 +73,27 @@ class PredictClient:
                 payload = {"message": body}
             raise RuntimeError(f"PREDICT_HTTP_{exc.code}: {payload.get('message') or payload}") from exc
 
+    def post(self, path, payload):
+        url = f"{self.base_url}{path}"
+        headers = self._headers()
+        headers["Content-Type"] = "application/json; charset=utf-8"
+        req = request.Request(
+            url,
+            headers=headers,
+            data=json.dumps(payload or {}).encode("utf-8"),
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=self.timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            try:
+                error_payload = json.loads(body)
+            except Exception:
+                error_payload = {"message": body}
+            raise RuntimeError(f"PREDICT_HTTP_{exc.code}: {error_payload.get('message') or error_payload}") from exc
+
     def get_markets(self, first=20, status=None, category_slug=None):
         return self.get(
             "/v1/markets",
@@ -82,3 +106,8 @@ class PredictClient:
 
     def get_orderbook(self, market_id):
         return self.get(f"/v1/markets/{market_id}/orderbook")
+
+    def create_order(self, order_payload):
+        if self.is_mainnet and not self.jwt_token:
+            raise PredictAuthRequired("PREDICTION_MAINNET_JWT_REQUIRED")
+        return self.post("/v1/orders", order_payload)

@@ -5,3 +5,4 @@ numpy
 pykalman
 python-telegram-bot
 hurst
+predict-sdk==0.0.16

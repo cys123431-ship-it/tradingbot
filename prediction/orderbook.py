@@ -75,3 +75,13 @@ def analyze_orderbook(payload, spend_usdt=1.0):
         "accepted": best_ask is not None,
         "reject_code": None if best_ask is not None else "REJECTED_PREDICTION_ORDERBOOK_EMPTY",
     }
+
+
+def normalize_orderbook_levels(payload):
+    data = (payload or {}).get("data", payload or {})
+    return {
+        "market_id": data.get("marketId") or data.get("market_id") or data.get("id") or (payload or {}).get("marketId"),
+        "update_timestamp_ms": int(_finite_float(data.get("updateTimestampMs") or data.get("updatedAtMs") or 0)),
+        "bids": sorted(_levels(data.get("bids")), key=lambda item: item[0], reverse=True),
+        "asks": sorted(_levels(data.get("asks")), key=lambda item: item[0]),
+    }

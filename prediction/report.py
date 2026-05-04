@@ -24,9 +24,14 @@ def format_prediction_report(scan_result, cfg=None, ledger_summary=None):
     rejects = list((scan_result or {}).get("rejects") or [])
     lines = [
         "Prediction Micro Auto",
-        "State: {} | Paper Only: ON | Cap {:.2f} USDT".format(
+        "State: {} | Paper Only: {} | Cap {:.2f} USDT".format(
             "ON" if cfg.get("enabled") else "OFF",
+            "OFF" if cfg.get("live_enabled") else "ON",
             float(cfg.get("equity_cap_usdt", 10.0) or 10.0),
+        ),
+        "Live: {} | Order: BUY YES MARKET | stake <= {:.2f} USDT".format(
+            "UNLOCKED" if cfg.get("live_enabled") else "LOCKED",
+            float(cfg.get("max_stake_usdt", 1.0) or 1.0),
         ),
         f"Markets: Crypto + Macro | candidates {len(candidates)} / rejects {len(rejects)}",
         "Live orders disabled. Predict.fun mainnet orders/JWT/private keys are not used.",
