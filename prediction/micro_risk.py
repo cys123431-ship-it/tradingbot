@@ -19,6 +19,10 @@ DEFAULT_PREDICTION_MICRO_CONFIG = {
     "scan_limit": 30,
     "scan_interval_seconds": 300,
     "auto_paper_entry": True,
+    "paper_exit_edge_floor": 0.0,
+    "paper_stop_loss_probability": 0.20,
+    "paper_take_profit_probability": 0.25,
+    "paper_max_hold_hours": 72,
 }
 
 
@@ -50,7 +54,18 @@ def normalize_prediction_micro_config(raw=None):
         cfg.update(raw)
     cfg["enabled"] = str(cfg.get("enabled")).lower() in {"1", "true", "yes", "on", "enabled"}
     cfg["paper_only"] = True
-    for key in ("equity_cap_usdt", "min_stake_usdt", "max_stake_usdt", "daily_loss_limit_usdt", "min_edge_probability", "max_fee_burden_pct"):
+    for key in (
+        "equity_cap_usdt",
+        "min_stake_usdt",
+        "max_stake_usdt",
+        "daily_loss_limit_usdt",
+        "min_edge_probability",
+        "max_fee_burden_pct",
+        "paper_exit_edge_floor",
+        "paper_stop_loss_probability",
+        "paper_take_profit_probability",
+        "paper_max_hold_hours",
+    ):
         cfg[key] = max(0.0, _finite_float(cfg.get(key), DEFAULT_PREDICTION_MICRO_CONFIG[key]))
     for key in ("max_daily_trades", "max_open_positions"):
         cfg[key] = max(0, _finite_int(cfg.get(key), DEFAULT_PREDICTION_MICRO_CONFIG[key]))

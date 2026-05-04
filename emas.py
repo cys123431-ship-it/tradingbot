@@ -71,11 +71,14 @@ from prediction import (
     analyze_orderbook,
     build_prediction_micro_plan,
     default_prediction_micro_config,
+    evaluate_paper_position_exit,
     estimate_crypto_up_probability,
     evaluate_prediction_edge,
     format_prediction_report,
+    format_prediction_research_report,
     normalize_market,
     normalize_prediction_micro_config,
+    prediction_reject_counts,
     score_prediction_candidate,
 )
 
@@ -105,6 +108,10 @@ faulthandler.enable()
 UTBREAKOUT_DIAGNOSTIC_LOG_FILE = os.path.abspath('utbreakout_diagnostics.log')
 UTBREAKOUT_DIAGNOSTIC_MAX_BYTES = 5 * 1024 * 1024
 UTBREAKOUT_DIAGNOSTIC_BACKUP_COUNT = 2
+PREDICTION_PAPER_LEDGER_FILE = os.path.abspath('prediction_paper_ledger.json')
+PREDICTION_DIAGNOSTIC_LOG_FILE = os.path.abspath('prediction_micro_diagnostics.log')
+PREDICTION_DIAGNOSTIC_MAX_BYTES = 3 * 1024 * 1024
+PREDICTION_DIAGNOSTIC_BACKUP_COUNT = 2
 
 
 def _build_utbreakout_diagnostic_logger():
@@ -124,6 +131,68 @@ def _build_utbreakout_diagnostic_logger():
 
 
 utbreakout_diag_logger = _build_utbreakout_diagnostic_logger()
+
+
+def _build_prediction_diagnostic_logger():
+    diag_logger = logging.getLogger('prediction_micro_diagnostics')
+    diag_logger.setLevel(logging.INFO)
+    diag_logger.propagate = False
+    if not any(isinstance(h, RotatingFileHandler) for h in diag_logger.handlers):
+        handler = RotatingFileHandler(
+            PREDICTION_DIAGNOSTIC_LOG_FILE,
+            maxBytes=PREDICTION_DIAGNOSTIC_MAX_BYTES,
+            backupCount=PREDICTION_DIAGNOSTIC_BACKUP_COUNT,
+            encoding='utf-8'
+        )
+        handler.setFormatter(logging.Formatter('%(message)s'))
+        diag_logger.addHandler(handler)
+    return diag_logger
+
+
+prediction_diag_logger = _build_prediction_diagnostic_logger()
+
+
+def log_prediction_diagnostic_event(event):
+    try:
+        payload = dict(event or {})
+        payload.setdefault('ts', datetime.now(timezone.utc).isoformat())
+        prediction_diag_logger.info(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    except Exception as e:
+        logger.debug(f"Prediction diagnostic event write failed: {e}")
+
+
+def read_prediction_diagnostic_events(days=7):
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(days or 7)))
+    paths = []
+    for idx in range(PREDICTION_DIAGNOSTIC_BACKUP_COUNT, 0, -1):
+        rotated = f"{PREDICTION_DIAGNOSTIC_LOG_FILE}.{idx}"
+        if os.path.exists(rotated):
+            paths.append(rotated)
+    if os.path.exists(PREDICTION_DIAGNOSTIC_LOG_FILE):
+        paths.append(PREDICTION_DIAGNOSTIC_LOG_FILE)
+
+    events = []
+    for path in paths:
+        try:
+            with open(path, 'r', encoding='utf-8') as fp:
+                for line in fp:
+                    try:
+                        event = json.loads(line.strip())
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    raw_ts = event.get('ts')
+                    try:
+                        event_ts = datetime.fromisoformat(str(raw_ts).replace('Z', '+00:00'))
+                    except (TypeError, ValueError):
+                        continue
+                    if event_ts.tzinfo is None:
+                        event_ts = event_ts.replace(tzinfo=timezone.utc)
+                    event_ts = event_ts.astimezone(timezone.utc)
+                    if event_ts >= cutoff:
+                        events.append(event)
+        except OSError:
+            continue
+    return events
 
 
 def _safe_float_or_none(value):
@@ -19512,9 +19581,15 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
         def _prediction_ledger():
             ledger = getattr(self, 'prediction_paper_ledger', None)
             if ledger is None:
-                ledger = PaperLedger()
+                ledger = PaperLedger.load(PREDICTION_PAPER_LEDGER_FILE)
                 self.prediction_paper_ledger = ledger
             return ledger
+
+        def _save_prediction_ledger():
+            try:
+                _prediction_ledger().save(PREDICTION_PAPER_LEDGER_FILE)
+            except Exception as e:
+                logger.warning(f"Prediction paper ledger save failed: {e}")
 
         def _build_prediction_keyboard():
             return InlineKeyboardMarkup([
@@ -19529,11 +19604,11 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 ],
                 [
                     InlineKeyboardButton("페이퍼 포지션", callback_data="pr:positions"),
-                    InlineKeyboardButton("리포트 다운로드", callback_data="pr:download"),
+                    InlineKeyboardButton("7일 리포트", callback_data="pr:research"),
                 ],
                 [
                     InlineKeyboardButton("Futures 연구 Set", callback_data="pr:futures"),
-                    InlineKeyboardButton("새로고침", callback_data="pr:menu"),
+                    InlineKeyboardButton("리포트 다운로드", callback_data="pr:download"),
                 ],
             ])
 
@@ -19558,7 +19633,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
             return sum(float(p.get('stake_usdt') or 0.0) for p in ledger.open_positions())
 
         def _prediction_daily_trade_count(ledger):
-            return len(list(getattr(ledger, 'positions', []) or []))
+            return ledger.opened_count_since(hours=24)
 
         def _prediction_market_price(orderbook):
             for key in ('buy_yes_avg_price', 'best_yes_ask', 'yes_mid', 'best_yes_bid'):
@@ -19583,6 +19658,108 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
             if market_type == 'macro':
                 return 0.55
             return 0.50
+
+        def _prediction_event_summary(days=7):
+            events = read_prediction_diagnostic_events(days=days)
+            reject_counts = Counter()
+            strategy_counts = Counter()
+            for event in events:
+                if event.get('event') == 'scan':
+                    for reason, count in (event.get('reject_counts') or {}).items():
+                        reject_counts[str(reason)] += int(count or 0)
+                    for strategy_id, count in (event.get('strategy_counts') or {}).items():
+                        strategy_counts[str(strategy_id)] += int(count or 0)
+                elif event.get('event') in {'paper_entry', 'paper_close', 'paper_settle'}:
+                    for strategy_id in event.get('strategy_ids') or []:
+                        strategy_counts[str(strategy_id)] += 1
+            return {
+                'events': events,
+                'reject_counts': dict(reject_counts),
+                'strategy_counts': dict(strategy_counts),
+            }
+
+        def _log_prediction_scan_result(result):
+            reject_counts = prediction_reject_counts(result)
+            strategy_counts = Counter()
+            for item in list((result or {}).get('candidates') or []):
+                for strategy_id in item.get('strategy_ids') or []:
+                    strategy_counts[str(strategy_id)] += 1
+            log_prediction_diagnostic_event({
+                'event': 'scan',
+                'source': (result or {}).get('source'),
+                'candidate_count': len((result or {}).get('candidates') or []),
+                'reject_count': len((result or {}).get('rejects') or []),
+                'reject_counts': reject_counts,
+                'strategy_counts': dict(strategy_counts),
+                'top_market_id': ((result or {}).get('candidates') or [{}])[0].get('market_id') if (result or {}).get('candidates') else None,
+                'futures_research_sets': list(range(51, 61)),
+            })
+
+        async def _reconcile_prediction_paper_positions(client, raw_market_by_id, cfg, ledger):
+            events = []
+            for position in list(ledger.open_positions()):
+                market_id = str(position.get('market_id') or '')
+                raw_market = raw_market_by_id.get(market_id, {})
+                orderbook = {}
+                try:
+                    orderbook_payload = await asyncio.to_thread(client.get_orderbook, position.get('market_id'))
+                    orderbook = analyze_orderbook(orderbook_payload, spend_usdt=float(position.get('stake_usdt') or 1.0))
+                except Exception as e:
+                    orderbook = {'accepted': False, 'reject_code': f"PREDICTION_ORDERBOOK_ERROR: {e}"}
+                market_price = _safe_float_or_none(orderbook.get('yes_mid'))
+                if market_price is None:
+                    market_price = _safe_float_or_none(orderbook.get('best_yes_bid')) or float(position.get('entry_price') or 0.5)
+                edge_result = evaluate_prediction_edge(
+                    fair_probability=position.get('fair_probability', 0.5),
+                    market_price=market_price,
+                    fee_rate_bps=200,
+                    spread_decimal=orderbook.get('yes_spread') or 0.0,
+                    safety_margin=cfg.get('min_edge_probability', 0.03),
+                )
+                decision = evaluate_paper_position_exit(
+                    position,
+                    raw_market=raw_market,
+                    orderbook=orderbook,
+                    edge_result=edge_result,
+                    cfg=cfg,
+                )
+                if decision.get('action') == 'settle':
+                    updated = ledger.settle_position(
+                        position.get('id'),
+                        outcome_won=bool(decision.get('outcome_won')),
+                        closing_price=decision.get('closing_price'),
+                    )
+                    event = {
+                        'event': 'paper_settle',
+                        'position_id': updated.get('id'),
+                        'market_id': updated.get('market_id'),
+                        'market_title': updated.get('market_title'),
+                        'reason': decision.get('reason'),
+                        'pnl_usdt': updated.get('pnl_usdt'),
+                        'strategy_ids': position.get('strategy_ids') or [],
+                    }
+                    events.append(event)
+                    log_prediction_diagnostic_event(event)
+                elif decision.get('action') == 'close':
+                    updated = ledger.close_position(
+                        position.get('id'),
+                        exit_price=float(decision.get('exit_price') or position.get('entry_price') or 0.0),
+                    )
+                    event = {
+                        'event': 'paper_close',
+                        'position_id': updated.get('id'),
+                        'market_id': updated.get('market_id'),
+                        'market_title': updated.get('market_title'),
+                        'reason': decision.get('reason'),
+                        'exit_price': updated.get('exit_price'),
+                        'pnl_usdt': updated.get('pnl_usdt'),
+                        'strategy_ids': position.get('strategy_ids') or [],
+                    }
+                    events.append(event)
+                    log_prediction_diagnostic_event(event)
+            if events:
+                _save_prediction_ledger()
+            return events
 
         async def _run_prediction_scan(force=False, auto=False):
             cfg = _prediction_cfg()
@@ -19612,6 +19789,8 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 logger.warning(f"Prediction scan failed: {e}")
                 return result
 
+            raw_market_by_id = {str(raw.get('id') or raw.get('marketId') or raw.get('market_id')): raw for raw in raw_markets}
+            result['paper_exits'] = await _reconcile_prediction_paper_positions(client, raw_market_by_id, cfg, ledger)
             open_ids = {str(p.get('market_id')) for p in ledger.open_positions()}
             summary = ledger.summary()
             for raw in raw_markets:
@@ -19680,7 +19859,22 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                     top.get('micro_plan') or {},
                     fair_probability=top.get('fair_probability'),
                 )
+                position['strategy_ids'] = top.get('strategy_ids') or []
+                position['score'] = top.get('score')
                 result['paper_entry'] = position
+                _save_prediction_ledger()
+                log_prediction_diagnostic_event({
+                    'event': 'paper_entry',
+                    'position_id': position.get('id'),
+                    'market_id': position.get('market_id'),
+                    'market_title': position.get('market_title'),
+                    'market_type': position.get('market_type'),
+                    'stake_usdt': position.get('stake_usdt'),
+                    'entry_price': position.get('entry_price'),
+                    'fair_probability': position.get('fair_probability'),
+                    'strategy_ids': position.get('strategy_ids') or [],
+                    'score': position.get('score'),
+                })
                 logger.info(
                     "Prediction Micro Auto paper entry: %s stake=%.2f price=%.4f",
                     position.get('market_title'),
@@ -19688,6 +19882,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                     float(position.get('entry_price') or 0.0),
                 )
             self.prediction_micro_last_scan = result
+            _log_prediction_scan_result(result)
             return result
 
         def _format_prediction_menu_text(report=None):
@@ -19702,9 +19897,17 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                     f"{entry.get('market_title')} / stake {float(entry.get('stake_usdt', 0) or 0):.2f} USDT / "
                     f"price {float(entry.get('entry_price', 0) or 0):.4f}"
                 )
+            exits = report.get('paper_exits') if isinstance(report, dict) else []
+            if exits:
+                text += "\n\nPaper lifecycle:"
+                for event in exits[:3]:
+                    text += (
+                        f"\n{event.get('event')} {event.get('market_title')} "
+                        f"{event.get('reason')} PnL {float(event.get('pnl_usdt', 0) or 0):.2f}"
+                    )
             if isinstance(report, dict) and report.get('note'):
                 text += f"\n\nNote: {report.get('note')}"
-            text += "\n\nCommands: /prediction on, /prediction off, /prediction scan, /prediction positions, /prediction strategies"
+            text += "\n\nCommands: /prediction on, /prediction off, /prediction scan, /prediction positions, /prediction strategies, /prediction research"
             return text
 
         def _format_prediction_positions_text():
@@ -19717,8 +19920,22 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 lines.append(
                     f"OPEN {pos.get('id')} | {pos.get('market_title')} | "
                     f"stake {float(pos.get('stake_usdt', 0) or 0):.2f} | "
-                    f"entry {float(pos.get('entry_price', 0) or 0):.4f}"
+                    f"entry {float(pos.get('entry_price', 0) or 0):.4f} | "
+                    f"fair {float(pos.get('fair_probability', 0) or 0):.3f}"
                 )
+            recent_closed = [
+                p for p in list(getattr(ledger, 'positions', []) or [])
+                if p.get('status') in {'CLOSED', 'SETTLED'}
+            ][-5:]
+            if recent_closed:
+                lines.append("")
+                lines.append("Recent closed/settled:")
+                for pos in recent_closed:
+                    lines.append(
+                        f"{pos.get('status')} {pos.get('id')} | {pos.get('market_title')} | "
+                        f"PnL {float(pos.get('pnl_usdt', 0) or 0):.2f} | "
+                        f"CLV {pos.get('closing_line_value') if pos.get('closing_line_value') is not None else 'n/a'}"
+                    )
             summary = ledger.summary()
             lines.append(
                 f"Summary: total {summary.get('total_positions', 0)} / open {summary.get('open_positions', 0)} / "
@@ -19758,6 +19975,16 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 lines.append(f"Set{set_id} {info.get('name')} - {info.get('description')}")
             return "\n".join(lines)
 
+        def _format_prediction_research_text(days=7):
+            ledger = _prediction_ledger()
+            event_summary = _prediction_event_summary(days=days)
+            return format_prediction_research_report(
+                ledger.summary(days=days),
+                reject_counts=event_summary.get('reject_counts'),
+                strategy_counts=event_summary.get('strategy_counts'),
+                days=days,
+            )
+
         async def _send_prediction_report_document(message, report=None):
             if message is None:
                 return
@@ -19766,6 +19993,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 text = "\n\n".join([
                     _format_prediction_menu_text(report),
                     _format_prediction_positions_text(),
+                    _format_prediction_research_text(),
                     _format_prediction_strategies_text(1),
                     _format_prediction_futures_sets_text(),
                 ])
@@ -19805,6 +20033,9 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 await self.cfg.update_value(['prediction_micro_auto', 'enabled'], False)
                 await u.message.reply_text("Prediction Micro Auto: OFF")
                 return
+            if action in {'status', 'menu', ''}:
+                await u.message.reply_text(_format_prediction_menu_text(), reply_markup=_build_prediction_keyboard())
+                return
             if action in {'scan', 'markets', 'top'}:
                 report = await _run_prediction_scan(force=True)
                 await u.message.reply_text(_format_prediction_menu_text(report), reply_markup=_build_prediction_keyboard())
@@ -19818,6 +20049,9 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 return
             if action in {'futures', 'sets'}:
                 await u.message.reply_text(_format_prediction_futures_sets_text(), reply_markup=_build_prediction_keyboard())
+                return
+            if action in {'research', 'summary', '7d'}:
+                await u.message.reply_text(_format_prediction_research_text(), reply_markup=_build_prediction_keyboard())
                 return
             if action in {'download', 'report', 'log'}:
                 await _send_prediction_report_document(u.message)
@@ -19858,6 +20092,9 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 return
             if action == 'futures':
                 await query.edit_message_text(_format_prediction_futures_sets_text(), reply_markup=_build_prediction_keyboard())
+                return
+            if action == 'research':
+                await query.edit_message_text(_format_prediction_research_text(), reply_markup=_build_prediction_keyboard())
                 return
             if action == 'download':
                 await _send_prediction_report_document(query.message)

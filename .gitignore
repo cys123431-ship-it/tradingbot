@@ -6,3 +6,5 @@ venv/
 *.db
 runtime/
 config.json
+prediction_paper_ledger.json
+prediction_paper_ledger.json.tmp

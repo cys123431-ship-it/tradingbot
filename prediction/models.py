@@ -110,3 +110,32 @@ def normalize_market(raw):
         "reject_reasons": reject_reasons,
         "raw": raw,
     }
+
+
+def extract_market_resolution(raw):
+    """Best-effort extraction of a resolved YES/NO outcome.
+
+    Predict.fun responses have evolved over time, so this accepts several
+    common field names. Returns None when the market is not clearly resolved.
+    """
+    raw = raw or {}
+    for key in ("resolvedOutcome", "resolved_outcome", "winningOutcome", "winning_outcome", "resolution"):
+        value = raw.get(key)
+        if value is None:
+            continue
+        if isinstance(value, dict):
+            value = value.get("name") or value.get("outcome") or value.get("value") or value.get("result")
+        outcome = _text(value).lower()
+        if outcome in {"yes", "true", "1", "up"}:
+            return {"resolved": True, "winning_side": "YES"}
+        if outcome in {"no", "false", "0", "down"}:
+            return {"resolved": True, "winning_side": "NO"}
+
+    for outcome in raw.get("outcomes") or []:
+        if not isinstance(outcome, dict):
+            continue
+        status = _status_text(outcome.get("status"))
+        name = _text(outcome.get("name")).upper()
+        if status in {"won", "winner", "winning", "resolved_true", "true"} and name in {"YES", "NO"}:
+            return {"resolved": True, "winning_side": name}
+    return None

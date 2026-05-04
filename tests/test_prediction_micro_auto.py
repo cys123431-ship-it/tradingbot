@@ -10,8 +10,11 @@ from prediction import (
     analyze_orderbook,
     build_prediction_micro_plan,
     default_prediction_micro_config,
+    evaluate_paper_position_exit,
     estimate_crypto_up_probability,
     evaluate_prediction_edge,
+    extract_market_resolution,
+    format_prediction_research_report,
     normalize_market,
     score_prediction_candidate,
 )
@@ -154,6 +157,58 @@ def test_prediction_paper_ledger_tracks_close_settlement_brier_and_pnl():
     assert summary["realized_pnl_usdt"] == 1.0
 
 
+def test_prediction_paper_ledger_persists_to_json(tmp_path):
+    path = tmp_path / "ledger.json"
+    ledger = PaperLedger()
+    plan = {
+        "market_id": 7,
+        "market_title": "Fed rate unchanged",
+        "market_type": "macro",
+        "side": "YES",
+        "stake_usdt": 1.0,
+        "entry_price": 0.25,
+        "shares": 4.0,
+    }
+    ledger.open_position(plan, fair_probability=0.55, opened_at="2026-05-04T00:00:00Z")
+    ledger.save(path)
+
+    loaded = PaperLedger.load(path)
+
+    assert loaded.open_positions()[0]["market_id"] == 7
+    assert loaded.summary()["open_positions"] == 1
+    assert loaded.opened_count_since(hours=24, now="2026-05-04T12:00:00Z") == 1
+    assert loaded.opened_count_since(hours=1, now="2026-05-04T12:00:00Z") == 0
+
+
+def test_prediction_lifecycle_closes_on_edge_loss_and_settles_resolution():
+    position = {
+        "id": "paper-1",
+        "status": "OPEN",
+        "opened_at": "2026-05-04T00:00:00Z",
+        "side": "YES",
+        "entry_price": 0.55,
+        "stake_usdt": 1.0,
+        "shares": 1.8181818,
+    }
+    close = evaluate_paper_position_exit(
+        position,
+        orderbook={"best_yes_bid": 0.54, "yes_mid": 0.55},
+        edge_result={"edge": -0.01},
+        now="2026-05-04T01:00:00Z",
+    )
+    settle = evaluate_paper_position_exit(
+        position,
+        raw_market={"resolution": "YES"},
+        orderbook={"best_yes_bid": 0.90},
+    )
+
+    assert close["action"] == "close"
+    assert close["reason"] == "PAPER_CLOSE_EDGE_GONE"
+    assert settle["action"] == "settle"
+    assert settle["outcome_won"] is True
+    assert extract_market_resolution({"winningOutcome": "No"})["winning_side"] == "NO"
+
+
 def test_prediction_strategy_catalog_and_candidate_score_are_paper_only():
     assert len(PREDICTION_STRATEGY_CATALOG) == 100
     assert all(item["paper_only"] for item in PREDICTION_STRATEGY_CATALOG)
@@ -172,6 +227,25 @@ def test_prediction_strategy_catalog_and_candidate_score_are_paper_only():
 
     assert scored["accepted"] is True
     assert scored["score"] >= 60
+
+
+def test_prediction_research_report_includes_core_metrics():
+    text = format_prediction_research_report(
+        {
+            "realized_pnl_usdt": 0.25,
+            "closed_positions": 2,
+            "open_positions": 1,
+            "avg_brier_score": 0.18,
+            "avg_closing_line_value": 0.04,
+            "by_category": {"crypto": {"count": 2, "pnl_usdt": 0.25}},
+        },
+        reject_counts={"REJECTED_PREDICTION_EDGE_LOW": 3},
+        strategy_counts={51: 2},
+    )
+
+    assert "Avg Brier" in text
+    assert "REJECTED_PREDICTION_EDGE_LOW" in text
+    assert "Strategy 51" in text
 
 
 def test_futures_prediction_research_sets_are_not_live_selectable():
