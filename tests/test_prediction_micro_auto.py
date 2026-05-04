@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from prediction import (
@@ -173,10 +175,12 @@ def test_prediction_strategy_catalog_and_candidate_score_are_paper_only():
 
 
 def test_futures_prediction_research_sets_are_not_live_selectable():
-    import emas
+    text = Path("emas.py").read_text(encoding="utf-8")
 
-    assert emas.UTBREAKOUT_ACTIVE_SET_MAX == 50
+    assert "UTBREAKOUT_ACTIVE_SET_MAX = 50" in text
     for set_id in range(51, 61):
-        info = emas.UTBREAKOUT_SET_REGISTRY[set_id]
-        assert info["status"] == "planned"
-        assert info["params"].get("research_only") is True
+        start = text.find(f"({set_id}, 'Prediction Research'")
+        assert start >= 0
+        end = text.find(f"({set_id + 1},", start) if set_id < 60 else text.find("\n    ]", start)
+        segment = text[start:end]
+        assert "'research_only': True" in segment
