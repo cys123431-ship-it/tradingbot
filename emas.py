@@ -63,6 +63,21 @@ from utbreakout.micro_auto import (
     default_micro_auto_config,
     normalize_micro_auto_config,
 )
+from prediction import (
+    PREDICTION_STRATEGY_CATALOG,
+    PaperLedger,
+    PredictAuthRequired,
+    PredictClient,
+    analyze_orderbook,
+    build_prediction_micro_plan,
+    default_prediction_micro_config,
+    estimate_crypto_up_probability,
+    evaluate_prediction_edge,
+    format_prediction_report,
+    normalize_market,
+    normalize_prediction_micro_config,
+    score_prediction_candidate,
+)
 
 # ---------------------------------------------------------
 # 0. 濡쒓퉭 諛??좏떥由ы떚
@@ -360,6 +375,16 @@ def build_utbreakout_set_registry():
         (48, 'Special Regime', 'UT + session/time volatility', '시간대별 변동성 특성을 반영합니다.', '세션별 움직임 차이가 큰 장', '실거래 시간대 최적화 가능', '시장 구조 변화에 민감', '중간', ['UTBot', 'Session'], ['session_volatility'], {}),
         (49, 'Special Regime', 'UT + market regime fallback', '분석 점수가 애매하면 안전한 단순 set으로 후퇴합니다.', '분류가 애매한 장', '과도한 필터링 방지', '방어력은 낮음', '많음', ['UTBot', 'Regime Score'], ['regime_fallback'], {}),
         (50, 'Special Regime', 'UT emergency simple mode', '장애/데이터 부족 시 UT와 리스크만 남기는 비상 단순 모드입니다.', '데이터 분석이 불안정할 때', '진입 로직이 멈추지 않음', '품질 필터 거의 없음', '매우 많음', ['UTBot', 'Risk Control'], [], {}),
+        (51, 'Prediction Research', 'UT + Orderflow Imbalance', 'Prediction/orderbook 수급 불균형을 Futures 연구 feature로 기록합니다.', '호가 쏠림이 강한 장', '체결 전 압력 감지 가능', '얕은 호가에 과민', '연구전용', ['UTBot', 'Orderbook Imbalance'], ['research_orderflow_imbalance'], {'research_only': True}),
+        (52, 'Prediction Research', 'UT + OI/Funding Crowding', 'OI/Funding crowding이 UT 방향과 충돌하는지 연구합니다.', '군중 포지션이 한쪽으로 몰린 장', 'crowded trade 회피 후보', '거래소별 데이터 차이', '연구전용', ['UTBot', 'Open Interest', 'Funding'], ['research_oi_funding_crowding'], {'research_only': True}),
+        (53, 'Prediction Research', 'UT + Liquidation Cascade', '청산 밀집 구간 돌파/반전을 연구용 feature로 봅니다.', '급격한 청산 연쇄 가능 구간', '가속 구간 감지 후보', '청산 지도 데이터 의존', '연구전용', ['UTBot', 'Liquidation Map'], ['research_liquidation_cascade'], {'research_only': True}),
+        (54, 'Prediction Research', 'UT + Prediction Odds Divergence', 'Prediction odds와 Futures 가격 방향 괴리를 연구합니다.', '이벤트 확률과 가격이 엇갈리는 장', '크로스마켓 정보 활용', '예측시장 유동성 부족 가능', '연구전용', ['UTBot', 'Prediction Odds'], ['research_prediction_odds_divergence'], {'research_only': True}),
+        (55, 'Prediction Research', 'UT + Macro Event Guard', '중요 macro event 전후 UT 신호 품질 변화를 연구합니다.', '경제지표/금리/정책 이벤트 주변', '이벤트 리스크 기록', '일정 데이터 품질 의존', '연구전용', ['UTBot', 'Macro Calendar'], ['research_macro_event_guard'], {'research_only': True}),
+        (56, 'Prediction Research', 'UT + Volatility Forecast', 'Prediction/옵션성 변동성 예상을 Futures risk scaling 연구에 씁니다.', '변동성 regime 전환 전후', '손익비 조정 후보', '예측치 불안정', '연구전용', ['UTBot', 'Volatility Forecast'], ['research_volatility_forecast'], {'research_only': True}),
+        (57, 'Prediction Research', 'UT + Spread Depth Guard', 'Prediction/Futures spread-depth 비용을 연구용 guard로 기록합니다.', '호가 얕은 변동장', '실제 비용 반영 후보', '데이터 지연에 취약', '연구전용', ['UTBot', 'Spread', 'Depth'], ['research_spread_depth_guard'], {'research_only': True}),
+        (58, 'Prediction Research', 'UT + Basis Divergence', '현물-선물 basis와 Prediction odds divergence를 함께 연구합니다.', 'basis 왜곡 장', '파생시장 과열 감지 후보', 'basis 해석 복잡', '연구전용', ['UTBot', 'Basis', 'Prediction Odds'], ['research_basis_divergence'], {'research_only': True}),
+        (59, 'Prediction Research', 'UT + Probability Trailing Exit', '확률 변화 기반 trailing exit를 Futures 청산 연구 후보로 기록합니다.', '진입 후 확률 우위가 줄어드는 장', '청산 개선 후보', '실시간 odds 의존', '연구전용', ['UTBot', 'Probability Trail'], ['research_probability_trailing_exit'], {'research_only': True}),
+        (60, 'Prediction Research', 'UT + Cross-Market Confirmation', 'Futures, Prediction, Macro 신호의 방향 일치를 연구합니다.', '크로스마켓 정렬 장', '품질 좋은 신호 선별 후보', '신호 수 감소 가능', '연구전용', ['UTBot', 'Prediction', 'Macro'], ['research_cross_market_confirmation'], {'research_only': True}),
     ]
     registry = {}
     for row in rows:
@@ -407,7 +432,7 @@ def get_utbreakout_set_definition(set_id):
 
 def format_utbreakout_set_brief(set_id):
     info = get_utbreakout_set_definition(set_id)
-    status = '실거래' if info.get('status') == 'active' else '예정'
+    status = '실거래' if info.get('status') == 'active' else '연구전용'
     return (
         f"Set{info['id']} {info['name']} [{status}] - {info['description']} "
         f"진입빈도: {info['frequency_impact']}"
@@ -17913,7 +17938,7 @@ class MainController:
         kb = [
             [KeyboardButton("🚨 STOP"), KeyboardButton("⏸ PAUSE"), KeyboardButton("▶ RESUME")],
             [KeyboardButton("/setup"), KeyboardButton("/utbreakout"), KeyboardButton("/coinscan")],
-            [KeyboardButton("/microauto")],
+            [KeyboardButton("/microauto"), KeyboardButton("/prediction")],
             [KeyboardButton("/status"), KeyboardButton("/history"), KeyboardButton("/stats")],
             [KeyboardButton("/log"), KeyboardButton("/help")]
         ]
@@ -17927,7 +17952,7 @@ class MainController:
         markup = self._build_main_keyboard()
         text_filter = filters.TEXT & ~filters.COMMAND
         setup_trigger_pattern = r"^/setup(?:@[A-Za-z0-9_]+)?$"
-        menu_trigger_pattern = r"^/(status|history|log|help|stats|close|utbreakout|coinscan|microauto)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
+        menu_trigger_pattern = r"^/(status|history|log|help|stats|close|utbreakout|coinscan|microauto|prediction)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
         setup_text_filter = text_filter & ~filters.Regex(r"^/")
 
         async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -18299,17 +18324,18 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 page = int(page or 1)
             except (TypeError, ValueError):
                 page = 1
-            page = min(5, max(1, page))
+            page = min(6, max(1, page))
             start_id = ((page - 1) * 10) + 1
-            end_id = min(50, start_id + 9)
+            end_id = min(60, start_id + 9)
             lines = [
-                f"📚 UT Breakout 50-Set 카탈로그 ({page}/5)",
-                "Set 1~50 모두 AUTO 후보/수동 선택/실거래 판단에 연결되어 있습니다.",
+                f"📚 UT Breakout 60-Set 카탈로그 ({page}/6)",
+                "Set 1~50은 AUTO 후보/수동 선택/실거래 판단에 연결되어 있습니다.",
+                "Set 51~60은 Prediction 기반 Futures research_only 세트라 상태/로그에만 표시되고 실주문에는 연결하지 않습니다.",
                 "",
             ]
             for set_id in range(start_id, end_id + 1):
                 info = get_utbreakout_set_definition(set_id)
-                status = "실거래" if info.get('status') == 'active' else "예정"
+                status = "실거래" if info.get('status') == 'active' else "연구전용"
                 filters = ", ".join(info.get('entry_filters') or ['UT only'])
                 lines.extend([
                     f"Set{set_id} {info.get('name')} [{status}]",
@@ -18318,7 +18344,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                     f"설명: {info.get('description')}",
                     "",
                 ])
-            lines.append("다른 페이지: /utbreakout sets 1~5")
+            lines.append("다른 페이지: /utbreakout sets 1~6")
             return "\n".join(lines).strip()
 
         def _format_utbreakout_why_text():
@@ -19477,6 +19503,376 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 return
             await _edit_micro_menu(query)
 
+        def _prediction_cfg():
+            raw = self.cfg.get('prediction_micro_auto', {})
+            if not isinstance(raw, dict):
+                raw = {}
+            return normalize_prediction_micro_config(raw)
+
+        def _prediction_ledger():
+            ledger = getattr(self, 'prediction_paper_ledger', None)
+            if ledger is None:
+                ledger = PaperLedger()
+                self.prediction_paper_ledger = ledger
+            return ledger
+
+        def _build_prediction_keyboard():
+            return InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("ON", callback_data="pr:on"),
+                    InlineKeyboardButton("OFF", callback_data="pr:off"),
+                    InlineKeyboardButton("Paper Only", callback_data="pr:paper"),
+                ],
+                [
+                    InlineKeyboardButton("시장 스캔", callback_data="pr:scan"),
+                    InlineKeyboardButton("전략 점수", callback_data="pr:strategies"),
+                ],
+                [
+                    InlineKeyboardButton("페이퍼 포지션", callback_data="pr:positions"),
+                    InlineKeyboardButton("리포트 다운로드", callback_data="pr:download"),
+                ],
+                [
+                    InlineKeyboardButton("Futures 연구 Set", callback_data="pr:futures"),
+                    InlineKeyboardButton("새로고침", callback_data="pr:menu"),
+                ],
+            ])
+
+        def _prediction_extract_markets(payload):
+            if isinstance(payload, list):
+                return payload
+            if not isinstance(payload, dict):
+                return []
+            data = payload.get('data')
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                for key in ('markets', 'items', 'results', 'data'):
+                    if isinstance(data.get(key), list):
+                        return data.get(key)
+            for key in ('markets', 'items', 'results'):
+                if isinstance(payload.get(key), list):
+                    return payload.get(key)
+            return []
+
+        def _prediction_open_allocated_usdt(ledger):
+            return sum(float(p.get('stake_usdt') or 0.0) for p in ledger.open_positions())
+
+        def _prediction_daily_trade_count(ledger):
+            return len(list(getattr(ledger, 'positions', []) or []))
+
+        def _prediction_market_price(orderbook):
+            for key in ('buy_yes_avg_price', 'best_yes_ask', 'yes_mid', 'best_yes_bid'):
+                value = _safe_float_or_none((orderbook or {}).get(key))
+                if value is not None and 0.0 < value < 1.0:
+                    return value
+            return 0.5
+
+        def _prediction_fair_probability(market, orderbook):
+            title = str((market or {}).get('title') or '').lower()
+            market_type = str((market or {}).get('market_type') or '')
+            if market_type == 'crypto' and ('up or down' in title or 'up/down' in title):
+                return estimate_crypto_up_probability(
+                    open_price=100.0,
+                    current_price=100.4,
+                    minutes_remaining=15,
+                    realized_vol_pct=0.8,
+                    drift_pct=0.05,
+                )
+            if market_type == 'crypto':
+                return 0.56
+            if market_type == 'macro':
+                return 0.55
+            return 0.50
+
+        async def _run_prediction_scan(force=False, auto=False):
+            cfg = _prediction_cfg()
+            ledger = _prediction_ledger()
+            result = {
+                'candidates': [],
+                'rejects': [],
+                'note': '',
+                'paper_entry': None,
+                'source': 'mainnet' if cfg.get('use_mainnet') else 'testnet',
+            }
+            try:
+                if cfg.get('use_mainnet'):
+                    api_key = str((self.cfg.get('prediction_micro_auto', {}) or {}).get('api_key') or '').strip()
+                    client = PredictClient.mainnet(api_key=api_key, timeout=12)
+                else:
+                    client = PredictClient.testnet(timeout=12)
+                payload = await asyncio.to_thread(client.get_markets, first=int(cfg.get('scan_limit', 30) or 30))
+                raw_markets = _prediction_extract_markets(payload)
+            except PredictAuthRequired as e:
+                result['note'] = str(e)
+                self.prediction_micro_last_scan = result
+                return result
+            except Exception as e:
+                result['note'] = f"PREDICTION_SCAN_ERROR: {e}"
+                self.prediction_micro_last_scan = result
+                logger.warning(f"Prediction scan failed: {e}")
+                return result
+
+            open_ids = {str(p.get('market_id')) for p in ledger.open_positions()}
+            summary = ledger.summary()
+            for raw in raw_markets:
+                market = normalize_market(raw)
+                if not market.get('accepted'):
+                    result['rejects'].append({
+                        'market_id': market.get('id'),
+                        'title': market.get('title'),
+                        'reject_reasons': market.get('reject_reasons'),
+                    })
+                    continue
+
+                orderbook = {}
+                try:
+                    orderbook_payload = await asyncio.to_thread(client.get_orderbook, market.get('id'))
+                    orderbook = analyze_orderbook(orderbook_payload, spend_usdt=float(cfg.get('min_stake_usdt', 1.0) or 1.0))
+                except Exception as e:
+                    orderbook = {'accepted': False, 'reject_code': f"PREDICTION_ORDERBOOK_ERROR: {e}"}
+
+                market_price = _prediction_market_price(orderbook)
+                fair_probability = _prediction_fair_probability(market, orderbook)
+                edge_result = evaluate_prediction_edge(
+                    fair_probability=fair_probability,
+                    market_price=market_price,
+                    fee_rate_bps=market.get('fee_rate_bps'),
+                    spread_decimal=orderbook.get('yes_spread') or 0.0,
+                    safety_margin=cfg.get('min_edge_probability', 0.03),
+                )
+                plan = build_prediction_micro_plan(
+                    market=market,
+                    side='YES',
+                    market_price=market_price,
+                    edge=edge_result.get('edge'),
+                    total_allocated_usdt=_prediction_open_allocated_usdt(ledger),
+                    daily_realized_pnl_usdt=summary.get('realized_pnl_usdt', 0.0),
+                    daily_trade_count=_prediction_daily_trade_count(ledger),
+                    open_position_count=len(ledger.open_positions()),
+                    requested_stake_usdt=cfg.get('max_stake_usdt', 1.0),
+                    cfg=cfg,
+                )
+                score = score_prediction_candidate(market, orderbook, edge_result, plan)
+                item = {
+                    'market_id': market.get('id'),
+                    'title': market.get('title'),
+                    'market_type': market.get('market_type'),
+                    'score': score.get('score'),
+                    'accepted': bool(score.get('accepted')),
+                    'strategy_ids': score.get('selected_strategy_ids') or [],
+                    'component_scores': score.get('component_scores') or {},
+                    'fair_probability': edge_result.get('fair_probability'),
+                    'market_price': edge_result.get('market_price'),
+                    'edge': edge_result.get('edge'),
+                    'stake_usdt': plan.get('stake_usdt'),
+                    'reject_code': plan.get('reject_code') or edge_result.get('reject_code') or orderbook.get('reject_code'),
+                    'micro_plan': plan,
+                }
+                if item['accepted'] and str(item['market_id']) not in open_ids:
+                    result['candidates'].append(item)
+                else:
+                    result['rejects'].append(item)
+
+            result['candidates'].sort(key=lambda item: float(item.get('score') or 0.0), reverse=True)
+            if cfg.get('enabled') and cfg.get('auto_paper_entry') and result['candidates'] and not ledger.open_positions():
+                top = result['candidates'][0]
+                position = ledger.open_position(
+                    top.get('micro_plan') or {},
+                    fair_probability=top.get('fair_probability'),
+                )
+                result['paper_entry'] = position
+                logger.info(
+                    "Prediction Micro Auto paper entry: %s stake=%.2f price=%.4f",
+                    position.get('market_title'),
+                    float(position.get('stake_usdt') or 0.0),
+                    float(position.get('entry_price') or 0.0),
+                )
+            self.prediction_micro_last_scan = result
+            return result
+
+        def _format_prediction_menu_text(report=None):
+            cfg = _prediction_cfg()
+            ledger = _prediction_ledger()
+            report = report or getattr(self, 'prediction_micro_last_scan', None) or {}
+            text = format_prediction_report(report, cfg=cfg, ledger_summary=ledger.summary())
+            entry = report.get('paper_entry') if isinstance(report, dict) else None
+            if entry:
+                text += (
+                    "\n\nPaper entry opened:\n"
+                    f"{entry.get('market_title')} / stake {float(entry.get('stake_usdt', 0) or 0):.2f} USDT / "
+                    f"price {float(entry.get('entry_price', 0) or 0):.4f}"
+                )
+            if isinstance(report, dict) and report.get('note'):
+                text += f"\n\nNote: {report.get('note')}"
+            text += "\n\nCommands: /prediction on, /prediction off, /prediction scan, /prediction positions, /prediction strategies"
+            return text
+
+        def _format_prediction_positions_text():
+            ledger = _prediction_ledger()
+            lines = ["Prediction Paper Positions"]
+            open_positions = ledger.open_positions()
+            if not open_positions:
+                lines.append("Open: none")
+            for pos in open_positions:
+                lines.append(
+                    f"OPEN {pos.get('id')} | {pos.get('market_title')} | "
+                    f"stake {float(pos.get('stake_usdt', 0) or 0):.2f} | "
+                    f"entry {float(pos.get('entry_price', 0) or 0):.4f}"
+                )
+            summary = ledger.summary()
+            lines.append(
+                f"Summary: total {summary.get('total_positions', 0)} / open {summary.get('open_positions', 0)} / "
+                f"closed {summary.get('closed_positions', 0)} / PnL {float(summary.get('realized_pnl_usdt', 0) or 0):.2f} USDT"
+            )
+            return "\n".join(lines)
+
+        def _format_prediction_strategies_text(page=1):
+            try:
+                page = int(page or 1)
+            except (TypeError, ValueError):
+                page = 1
+            page = min(10, max(1, page))
+            start = (page - 1) * 10
+            rows = PREDICTION_STRATEGY_CATALOG[start:start + 10]
+            lines = [
+                f"Prediction Strategy Catalog ({page}/10)",
+                "All 100 items are paper-only scoring/research rules. No live Predict.fun order path is connected.",
+                "",
+            ]
+            for item in rows:
+                lines.append(
+                    f"{item.get('id')}. {item.get('name')} [{item.get('family')}] "
+                    f"{item.get('status')}"
+                )
+            lines.append("Other pages: /prediction strategies 1~10")
+            return "\n".join(lines)
+
+        def _format_prediction_futures_sets_text():
+            lines = [
+                "Futures Prediction Research Sets",
+                "Set51~60 are registered in UT Breakout as research_only/planned. They are not selectable for live entry.",
+                "",
+            ]
+            for set_id in range(51, 61):
+                info = get_utbreakout_set_definition(set_id)
+                lines.append(f"Set{set_id} {info.get('name')} - {info.get('description')}")
+            return "\n".join(lines)
+
+        async def _send_prediction_report_document(message, report=None):
+            if message is None:
+                return
+            try:
+                report = report or getattr(self, 'prediction_micro_last_scan', None) or await _run_prediction_scan(force=False)
+                text = "\n\n".join([
+                    _format_prediction_menu_text(report),
+                    _format_prediction_positions_text(),
+                    _format_prediction_strategies_text(1),
+                    _format_prediction_futures_sets_text(),
+                ])
+                bio = io.BytesIO(text.encode('utf-8'))
+                bio.name = 'prediction_micro_auto_report.txt'
+                await message.reply_document(
+                    document=bio,
+                    filename='prediction_micro_auto_report.txt',
+                    caption='Prediction Micro Auto paper report'
+                )
+            except Exception as e:
+                logger.error(f"Prediction report download failed: {e}")
+                await message.reply_text(f"Prediction report download failed: {e}")
+
+        async def _edit_prediction_menu(query, notice=None, report=None):
+            text = _format_prediction_menu_text(report)
+            if notice:
+                text = f"{notice}\n\n{text}"
+            try:
+                await query.edit_message_text(text, reply_markup=_build_prediction_keyboard())
+            except BadRequest as md_err:
+                if "message is not modified" in str(md_err).lower():
+                    return
+                await query.edit_message_text(str(text).replace("`", ""), reply_markup=_build_prediction_keyboard())
+
+        async def prediction_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            args = list(getattr(c, 'args', []) or [])
+            if not args and u and u.message and u.message.text:
+                args = u.message.text.strip().split()[1:]
+            action = str(args[0]).strip().lower() if args else ''
+            if action in {'on', 'enable', 'start'}:
+                await self.cfg.update_value(['prediction_micro_auto', 'enabled'], True)
+                await self.cfg.update_value(['prediction_micro_auto', 'paper_only'], True)
+                await u.message.reply_text("Prediction Micro Auto: ON / PAPER ONLY. Live Predict.fun orders are blocked.")
+                return
+            if action in {'off', 'disable', 'stop'}:
+                await self.cfg.update_value(['prediction_micro_auto', 'enabled'], False)
+                await u.message.reply_text("Prediction Micro Auto: OFF")
+                return
+            if action in {'scan', 'markets', 'top'}:
+                report = await _run_prediction_scan(force=True)
+                await u.message.reply_text(_format_prediction_menu_text(report), reply_markup=_build_prediction_keyboard())
+                return
+            if action in {'positions', 'paper', 'ledger'}:
+                await u.message.reply_text(_format_prediction_positions_text(), reply_markup=_build_prediction_keyboard())
+                return
+            if action in {'strategies', 'strategy', 'score'}:
+                page = args[1] if len(args) > 1 else 1
+                await u.message.reply_text(_format_prediction_strategies_text(page), reply_markup=_build_prediction_keyboard())
+                return
+            if action in {'futures', 'sets'}:
+                await u.message.reply_text(_format_prediction_futures_sets_text(), reply_markup=_build_prediction_keyboard())
+                return
+            if action in {'download', 'report', 'log'}:
+                await _send_prediction_report_document(u.message)
+                return
+            await u.message.reply_text(_format_prediction_menu_text(), reply_markup=_build_prediction_keyboard())
+
+        async def prediction_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            query = u.callback_query
+            if not query:
+                return
+            await query.answer()
+            data = str(query.data or '')
+            if not data.startswith('pr:'):
+                return
+            action = data.split(':', 1)[1]
+            if action == 'on':
+                await self.cfg.update_value(['prediction_micro_auto', 'enabled'], True)
+                await self.cfg.update_value(['prediction_micro_auto', 'paper_only'], True)
+                await _edit_prediction_menu(query, "Prediction Micro Auto: ON / PAPER ONLY")
+                return
+            if action == 'off':
+                await self.cfg.update_value(['prediction_micro_auto', 'enabled'], False)
+                await _edit_prediction_menu(query, "Prediction Micro Auto: OFF")
+                return
+            if action == 'paper':
+                await self.cfg.update_value(['prediction_micro_auto', 'paper_only'], True)
+                await _edit_prediction_menu(query, "Paper Only is locked ON")
+                return
+            if action == 'scan':
+                report = await _run_prediction_scan(force=True)
+                await _edit_prediction_menu(query, report=report)
+                return
+            if action == 'positions':
+                await query.edit_message_text(_format_prediction_positions_text(), reply_markup=_build_prediction_keyboard())
+                return
+            if action == 'strategies':
+                await query.edit_message_text(_format_prediction_strategies_text(1), reply_markup=_build_prediction_keyboard())
+                return
+            if action == 'futures':
+                await query.edit_message_text(_format_prediction_futures_sets_text(), reply_markup=_build_prediction_keyboard())
+                return
+            if action == 'download':
+                await _send_prediction_report_document(query.message)
+                return
+            await _edit_prediction_menu(query)
+
+        async def prediction_auto_scan_job(context):
+            try:
+                cfg = _prediction_cfg()
+                if not cfg.get('enabled'):
+                    return
+                await _run_prediction_scan(force=True, auto=True)
+            except Exception as e:
+                logger.warning(f"Prediction auto scan job failed: {e}")
+
         async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             msg = """
 📚 **명령어**
@@ -19489,6 +19885,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 /utbreakout - UTBOT_FILTERED_BREAKOUT_V1 전용 메뉴
 /coinscan - CoinSelector V2 자동 코인 선택 메뉴
 /microauto - 10 USDT 이하 소액 전용 자동매매 메뉴
+/prediction - Prediction Micro Auto paper-only 메뉴
 /log - 최근 로그
 /close - 긴급 청산
 
@@ -19514,6 +19911,8 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
         self.tg_app.add_handler(CallbackQueryHandler(coinscan_callback, pattern=r"^cs:"))
         self.tg_app.add_handler(CommandHandler("microauto", microauto_cmd))
         self.tg_app.add_handler(CallbackQueryHandler(microauto_callback, pattern=r"^ma:"))
+        self.tg_app.add_handler(CommandHandler("prediction", prediction_cmd))
+        self.tg_app.add_handler(CallbackQueryHandler(prediction_callback, pattern=r"^pr:"))
         self.tg_app.add_handler(CommandHandler("help", help_cmd))
 
         setup_command_handler = CommandHandler('setup', self.setup_entry)
@@ -19561,6 +19960,8 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 return await coinscan_cmd(u, c)
             if command == "/microauto":
                 return await microauto_cmd(u, c)
+            if command == "/prediction":
+                return await prediction_cmd(u, c)
             return None
 
         self.tg_app.add_handler(
@@ -19569,6 +19970,21 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 menu_button_handler
             )
         )
+
+        try:
+            job_queue = getattr(self.tg_app, 'job_queue', None)
+            if job_queue:
+                for job in job_queue.get_jobs_by_name('prediction_micro_auto_scan'):
+                    job.schedule_removal()
+                interval = int(_prediction_cfg().get('scan_interval_seconds', 300) or 300)
+                job_queue.run_repeating(
+                    prediction_auto_scan_job,
+                    interval=max(60, interval),
+                    first=60,
+                    name='prediction_micro_auto_scan'
+                )
+        except Exception as e:
+            logger.warning(f"Prediction auto scan scheduler setup failed: {e}")
 
         async def manual_symbol_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             text = u.message.text.strip().upper()
