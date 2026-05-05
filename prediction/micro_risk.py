@@ -5,6 +5,7 @@ from __future__ import annotations
 
 DEFAULT_PREDICTION_MICRO_CONFIG = {
     "enabled": False,
+    "provider": "binance_wallet_predict_fun",
     "paper_only": True,
     "live_enabled": False,
     "equity_cap_usdt": 10.0,
@@ -83,6 +84,10 @@ def normalize_prediction_micro_config(raw=None):
     cfg["auto_paper_entry"] = str(cfg.get("auto_paper_entry")).lower() in {"1", "true", "yes", "on", "enabled"}
     cfg["live_order_strategy"] = "MARKET"
     cfg["live_side"] = "YES"
+    provider = str(cfg.get("provider") or "binance_wallet_predict_fun").strip().lower()
+    if provider not in {"binance_wallet_predict_fun", "predict_fun"}:
+        provider = "binance_wallet_predict_fun"
+    cfg["provider"] = provider
     if cfg["equity_cap_usdt"] <= 0 or cfg["equity_cap_usdt"] > 10.0:
         cfg["equity_cap_usdt"] = 10.0
     if cfg["max_stake_usdt"] < cfg["min_stake_usdt"]:

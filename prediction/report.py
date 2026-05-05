@@ -22,8 +22,12 @@ def format_prediction_report(scan_result, cfg=None, ledger_summary=None):
     ledger_summary = ledger_summary or {}
     candidates = list((scan_result or {}).get("candidates") or [])
     rejects = list((scan_result or {}).get("rejects") or [])
+    provider = "Binance Wallet Prediction (Predict.fun API)"
+    if str(cfg.get("provider") or "").strip().lower() == "predict_fun":
+        provider = "Predict.fun direct"
     lines = [
         "Prediction Micro Auto",
+        f"Provider: {provider}",
         "State: {} | Paper Only: {} | Cap {:.2f} USDT".format(
             "ON" if cfg.get("enabled") else "OFF",
             "OFF" if cfg.get("live_enabled") else "ON",
@@ -34,7 +38,7 @@ def format_prediction_report(scan_result, cfg=None, ledger_summary=None):
             float(cfg.get("max_stake_usdt", 1.0) or 1.0),
         ),
         f"Markets: Crypto + Macro | candidates {len(candidates)} / rejects {len(rejects)}",
-        "Live orders disabled. Predict.fun mainnet orders/JWT/private keys are not used.",
+        "Binance app Prediction is treated as a Predict.fun protocol integration, not a separate Binance order API.",
         "",
     ]
     if candidates:

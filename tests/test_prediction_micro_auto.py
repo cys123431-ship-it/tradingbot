@@ -12,6 +12,7 @@ from prediction import (
     analyze_orderbook,
     build_live_market_order_payload,
     build_prediction_micro_plan,
+    check_live_preflight,
     default_prediction_micro_config,
     evaluate_paper_position_exit,
     estimate_crypto_up_probability,
@@ -21,6 +22,7 @@ from prediction import (
     normalize_market,
     score_prediction_candidate,
     submit_live_market_order,
+    provider_label,
     yes_token_id_from_market,
 )
 
@@ -268,6 +270,9 @@ class _FakeBuilder:
     def get_market_order_amounts(self, *args, **kwargs):
         return _FakeAmounts()
 
+    def balance_of(self, *args, **kwargs):
+        return 2 * 10**18
+
     def build_order(self, *args, **kwargs):
         return {"order": True}
 
@@ -327,7 +332,13 @@ def test_prediction_live_order_requires_env_unlock_and_builds_payload():
     })
     orderbook = {"data": {"marketId": 1, "asks": [[0.50, 10]], "bids": [[0.49, 10]]}}
     locked = PredictionLiveCredentials(api_key="k", jwt_token="j", private_key="p", env_live_enabled=False)
-    unlocked = PredictionLiveCredentials(api_key="k", jwt_token="j", private_key="p", env_live_enabled=True)
+    unlocked = PredictionLiveCredentials(
+        api_key="k",
+        jwt_token="j",
+        private_key="p",
+        env_live_enabled=True,
+        approvals_confirmed=True,
+    )
 
     assert yes_token_id_from_market(market) == "123"
     with pytest.raises(PredictionLiveOrderError):
@@ -366,13 +377,67 @@ def test_prediction_live_order_submit_uses_client_create_order():
         orderbook_payload={"data": {"marketId": 1, "asks": [[0.50, 10]], "bids": [[0.49, 10]]}},
         plan={"stake_usdt": 1.0},
         cfg={"live_slippage_bps": 25},
-        credentials=PredictionLiveCredentials(api_key="k", jwt_token="j", private_key="p", env_live_enabled=True),
+        credentials=PredictionLiveCredentials(
+            api_key="k",
+            jwt_token="j",
+            private_key="p",
+            env_live_enabled=True,
+            approvals_confirmed=True,
+        ),
         sdk_module=_FakeSdk,
     )
 
     assert result["accepted"] is True
     assert result["order_id"] == "ord-1"
     assert client.payload["data"]["slippageBps"] == "25"
+
+
+def test_prediction_live_preflight_rejects_unconfirmed_approvals_and_low_balance():
+    market = normalize_market({
+        "id": 1,
+        "title": "Bitcoin Up or Down",
+        "categorySlug": "crypto",
+        "outcomes": [{"name": "Yes", "onChainId": "123"}],
+    })
+    orderbook = {"data": {"marketId": 1, "asks": [[0.50, 10]], "bids": [[0.49, 10]]}}
+
+    blocked = check_live_preflight(
+        market=market,
+        orderbook_payload=orderbook,
+        plan={"stake_usdt": 1.0},
+        cfg=default_prediction_micro_config(),
+        credentials=PredictionLiveCredentials(api_key="k", jwt_token="j", private_key="p", env_live_enabled=True),
+        sdk_module=_FakeSdk,
+    )
+
+    assert blocked["accepted"] is False
+    assert "PREDICTION_APPROVALS_NOT_CONFIRMED" in blocked["reject_reasons"]
+
+    class _LowBalanceBuilder(_FakeBuilder):
+        def balance_of(self, *args, **kwargs):
+            return int(0.5 * 10**18)
+
+    class _LowBalanceSdk(_FakeSdk):
+        OrderBuilder = _LowBalanceBuilder
+
+    low_balance = check_live_preflight(
+        market=market,
+        orderbook_payload=orderbook,
+        plan={"stake_usdt": 1.0},
+        cfg=default_prediction_micro_config(),
+        credentials=PredictionLiveCredentials(
+            api_key="k",
+            jwt_token="j",
+            private_key="p",
+            env_live_enabled=True,
+            approvals_confirmed=True,
+        ),
+        sdk_module=_LowBalanceSdk,
+    )
+
+    assert low_balance["accepted"] is False
+    assert "PREDICTION_BALANCE_LOW" in low_balance["reject_reasons"]
+    assert provider_label() == "Binance Wallet Prediction (Predict.fun API)"
 
 
 def test_prediction_strategy_catalog_and_candidate_score_are_paper_only():

@@ -107,6 +107,9 @@ class PredictClient:
     def get_orderbook(self, market_id):
         return self.get(f"/v1/markets/{market_id}/orderbook")
 
+    def get_order(self, order_hash_or_id):
+        return self.get(f"/v1/orders/{order_hash_or_id}")
+
     def create_order(self, order_payload):
         if self.is_mainnet and not self.jwt_token:
             raise PredictAuthRequired("PREDICTION_MAINNET_JWT_REQUIRED")

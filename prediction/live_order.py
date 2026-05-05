@@ -28,6 +28,7 @@ class PredictionLiveCredentials:
     predict_account: str = ""
     chain_id: int = 56
     env_live_enabled: bool = False
+    approvals_confirmed: bool = False
 
     @classmethod
     def from_env(cls, env=None):
@@ -40,6 +41,8 @@ class PredictionLiveCredentials:
             chain_id=int(float(env.get("PREDICTION_CHAIN_ID") or 56)),
             env_live_enabled=str(env.get("PREDICTION_LIVE_TRADING_ENABLED") or "").strip().lower()
             in {"1", "true", "yes", "on", "enabled", "unlocked"},
+            approvals_confirmed=str(env.get("PREDICTION_APPROVALS_CONFIRMED") or "").strip().lower()
+            in {"1", "true", "yes", "on", "confirmed", "approved"},
         )
 
     def missing_reasons(self):
@@ -52,7 +55,16 @@ class PredictionLiveCredentials:
             reasons.append("PREDICTION_JWT_MISSING")
         if not self.private_key:
             reasons.append("PREDICTION_PRIVATE_KEY_MISSING")
+        if not self.approvals_confirmed:
+            reasons.append("PREDICTION_APPROVALS_NOT_CONFIRMED")
         return reasons
+
+
+def provider_label(provider="binance_wallet_predict_fun"):
+    provider = str(provider or "binance_wallet_predict_fun").strip().lower()
+    if provider == "predict_fun":
+        return "Predict.fun direct"
+    return "Binance Wallet Prediction (Predict.fun API)"
 
 
 def yes_token_id_from_market(market):
@@ -81,6 +93,90 @@ def _sdk_chain_id(sdk, chain_id):
     if int(chain_id) == 97:
         return chain.BNB_TESTNET
     return chain.BNB_MAINNET
+
+
+def build_order_builder(*, credentials=None, sdk_module=None):
+    credentials = credentials or PredictionLiveCredentials.from_env()
+    try:
+        sdk = sdk_module or __import__("predict_sdk")
+    except Exception as exc:
+        raise PredictionLiveOrderError("PREDICTION_SDK_NOT_INSTALLED") from exc
+    builder_options = sdk.OrderBuilderOptions(
+        predict_account=credentials.predict_account or None,
+    )
+    builder = sdk.OrderBuilder.make(
+        _sdk_chain_id(sdk, credentials.chain_id),
+        credentials.private_key,
+        builder_options,
+    )
+    return sdk, builder
+
+
+def _balance_usdt_from_builder(builder):
+    balance_wei = builder.balance_of("USDT")
+    return float(balance_wei or 0) / float(WEI)
+
+
+def check_live_preflight(
+    *,
+    market,
+    orderbook_payload,
+    plan,
+    cfg,
+    credentials=None,
+    sdk_module=None,
+    open_positions=None,
+):
+    """Strict live-order readiness check before signing or submitting orders."""
+    credentials = credentials or PredictionLiveCredentials.from_env()
+    cfg = cfg or {}
+    plan = plan or {}
+    reasons = list(credentials.missing_reasons())
+    stake_usdt = float(plan.get("stake_usdt") or 0.0)
+    equity_cap = float(cfg.get("equity_cap_usdt") or 10.0)
+    max_stake = float(cfg.get("max_stake_usdt") or 1.0)
+    market_id = str((market or {}).get("id") or plan.get("market_id") or "")
+    levels = normalize_orderbook_levels(orderbook_payload)
+    balance_usdt = None
+
+    if not market_id:
+        reasons.append("PREDICTION_MARKET_ID_MISSING")
+    for pos in list(open_positions or []):
+        if str(pos.get("market_id") or "") == market_id and str(pos.get("status") or "").upper() == "OPEN":
+            reasons.append("PREDICTION_DUPLICATE_MARKET_POSITION")
+            break
+    if stake_usdt <= 0:
+        reasons.append("PREDICTION_STAKE_INVALID")
+    if stake_usdt > max_stake + 1e-12:
+        reasons.append("PREDICTION_STAKE_EXCEEDS_MAX")
+    if stake_usdt > equity_cap + 1e-12 or equity_cap > 10.0 + 1e-12:
+        reasons.append("PREDICTION_10USDT_CAP_VIOLATION")
+    if not yes_token_id_from_market(market):
+        reasons.append("PREDICTION_YES_TOKEN_ID_MISSING")
+    if not levels["asks"]:
+        reasons.append("PREDICTION_ORDERBOOK_ASKS_EMPTY")
+
+    if not reasons:
+        try:
+            _, builder = build_order_builder(credentials=credentials, sdk_module=sdk_module)
+            balance_usdt = _balance_usdt_from_builder(builder)
+            if balance_usdt + 1e-12 < stake_usdt:
+                reasons.append("PREDICTION_BALANCE_LOW")
+        except PredictionLiveOrderError as exc:
+            reasons.append(str(exc))
+        except Exception as exc:
+            reasons.append(f"PREDICTION_BALANCE_CHECK_FAILED: {exc}")
+
+    return {
+        "accepted": not reasons,
+        "reject_reasons": reasons,
+        "provider": provider_label(cfg.get("provider")),
+        "market_id": market_id,
+        "stake_usdt": stake_usdt,
+        "equity_cap_usdt": equity_cap,
+        "max_stake_usdt": max_stake,
+        "balance_usdt": balance_usdt,
+    }
 
 
 def _signed_order_dict(signed_order, order_hash=None):
@@ -130,25 +226,13 @@ def build_live_market_order_payload(
     if not token_id:
         raise PredictionLiveOrderError("PREDICTION_YES_TOKEN_ID_MISSING")
 
-    try:
-        sdk = sdk_module or __import__("predict_sdk")
-    except Exception as exc:
-        raise PredictionLiveOrderError("PREDICTION_SDK_NOT_INSTALLED") from exc
-
     levels = normalize_orderbook_levels(orderbook_payload)
     if not levels["asks"]:
         raise PredictionLiveOrderError("PREDICTION_ORDERBOOK_ASKS_EMPTY")
 
     raw = (market or {}).get("raw") or {}
     stake_wei = int(round(float(stake_usdt) * WEI))
-    builder_options = sdk.OrderBuilderOptions(
-        predict_account=credentials.predict_account or None,
-    )
-    builder = sdk.OrderBuilder.make(
-        _sdk_chain_id(sdk, credentials.chain_id),
-        credentials.private_key,
-        builder_options,
-    )
+    sdk, builder = build_order_builder(credentials=credentials, sdk_module=sdk_module)
     book = sdk.Book(
         market_id=int(float(levels["market_id"] or (market or {}).get("id") or 0)),
         update_timestamp_ms=int(levels["update_timestamp_ms"] or 0),
@@ -197,7 +281,28 @@ def build_live_market_order_payload(
     }
 
 
-def submit_live_market_order(*, client, market, orderbook_payload, plan, cfg, credentials=None, sdk_module=None):
+def submit_live_market_order(
+    *,
+    client,
+    market,
+    orderbook_payload,
+    plan,
+    cfg,
+    credentials=None,
+    sdk_module=None,
+    open_positions=None,
+):
+    preflight = check_live_preflight(
+        market=market,
+        orderbook_payload=orderbook_payload,
+        plan=plan,
+        cfg=cfg,
+        credentials=credentials,
+        sdk_module=sdk_module,
+        open_positions=open_positions,
+    )
+    if not preflight["accepted"]:
+        raise PredictionLiveOrderError(",".join(preflight["reject_reasons"]))
     payload = build_live_market_order_payload(
         market=market,
         orderbook_payload=orderbook_payload,
@@ -209,6 +314,7 @@ def submit_live_market_order(*, client, market, orderbook_payload, plan, cfg, cr
     response = client.create_order(payload)
     return {
         "accepted": True,
+        "preflight": preflight,
         "payload": payload,
         "response": response,
         "order_id": ((response or {}).get("data") or {}).get("orderId"),

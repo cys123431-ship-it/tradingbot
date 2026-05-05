@@ -72,6 +72,7 @@ from prediction import (
     PredictionLiveOrderError,
     analyze_orderbook,
     build_prediction_micro_plan,
+    check_live_preflight,
     default_prediction_micro_config,
     evaluate_paper_position_exit,
     estimate_crypto_up_probability,
@@ -81,6 +82,7 @@ from prediction import (
     normalize_market,
     normalize_prediction_micro_config,
     prediction_reject_counts,
+    provider_label,
     score_prediction_candidate,
     submit_live_market_order,
 )
@@ -19604,6 +19606,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 [
                     InlineKeyboardButton("LIVE UNLOCK", callback_data="pr:live_on"),
                     InlineKeyboardButton("LIVE LOCK", callback_data="pr:live_off"),
+                    InlineKeyboardButton("LIVE STATUS", callback_data="pr:live_status"),
                 ],
                 [
                     InlineKeyboardButton("시장 스캔", callback_data="pr:scan"),
@@ -19674,7 +19677,116 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
             missing = creds.missing_reasons()
             if missing:
                 return "LIVE blocked: " + ", ".join(missing)
-            return "LIVE ready: env unlock + API key + JWT + private key detected"
+            return "LIVE ready: env unlock + API key + JWT + private key + approvals confirmed"
+
+        def _prediction_value(payload, *keys):
+            if not isinstance(payload, dict):
+                return None
+            scopes = [payload]
+            if isinstance(payload.get('data'), dict):
+                scopes.append(payload.get('data'))
+            for scope in scopes:
+                for key in keys:
+                    if key in scope and scope.get(key) is not None:
+                        return scope.get(key)
+            return None
+
+        async def _sync_prediction_live_orders():
+            cfg = _prediction_cfg()
+            ledger = _prediction_ledger()
+            creds = _prediction_live_credentials()
+            missing = [reason for reason in creds.missing_reasons() if reason not in {'PREDICTION_APPROVALS_NOT_CONFIRMED'}]
+            if missing:
+                return {'synced': [], 'errors': [{'error': ','.join(missing)}]}
+            client = PredictClient.mainnet(api_key=creds.api_key, jwt_token=creds.jwt_token, timeout=10)
+            synced = []
+            errors = []
+            changed = False
+            for pos in list(ledger.open_positions()):
+                if pos.get('execution_mode') != 'live':
+                    continue
+                order_ref = pos.get('order_hash') or pos.get('order_id')
+                if not order_ref:
+                    errors.append({'position_id': pos.get('id'), 'error': 'PREDICTION_LIVE_ORDER_REF_MISSING'})
+                    continue
+                try:
+                    payload = await asyncio.to_thread(client.get_order, order_ref)
+                    status = _prediction_value(payload, 'status', 'state', 'orderStatus') or 'UNKNOWN'
+                    filled = _prediction_value(payload, 'filledAmount', 'filled_amount', 'filled', 'matchedAmount')
+                    remaining = _prediction_value(payload, 'remainingAmount', 'remaining_amount', 'remaining')
+                    pos['live_order_status'] = str(status)
+                    pos['live_order_last_sync'] = datetime.now(timezone.utc).isoformat()
+                    if filled is not None:
+                        pos['live_filled_amount'] = str(filled)
+                    if remaining is not None:
+                        pos['live_remaining_amount'] = str(remaining)
+                    synced.append({
+                        'position_id': pos.get('id'),
+                        'market_id': pos.get('market_id'),
+                        'order_ref': order_ref,
+                        'status': str(status),
+                        'filled': filled,
+                        'remaining': remaining,
+                    })
+                    changed = True
+                    log_prediction_diagnostic_event({
+                        'event': 'live_order_sync',
+                        'position_id': pos.get('id'),
+                        'market_id': pos.get('market_id'),
+                        'order_ref': order_ref,
+                        'status': str(status),
+                    })
+                except Exception as e:
+                    errors.append({'position_id': pos.get('id'), 'order_ref': order_ref, 'error': str(e)})
+                    log_prediction_diagnostic_event({
+                        'event': 'live_order_sync_error',
+                        'position_id': pos.get('id'),
+                        'market_id': pos.get('market_id'),
+                        'order_ref': order_ref,
+                        'error': str(e),
+                    })
+            if changed:
+                _save_prediction_ledger()
+            return {'synced': synced, 'errors': errors, 'provider': provider_label(cfg.get('provider'))}
+
+        async def _format_prediction_live_status_text(sync=True):
+            cfg = _prediction_cfg()
+            ledger = _prediction_ledger()
+            creds = _prediction_live_credentials()
+            sync_result = await _sync_prediction_live_orders() if sync else {'synced': [], 'errors': []}
+            missing = creds.missing_reasons()
+            lines = [
+                "Prediction LIVE Status",
+                f"Provider: {provider_label(cfg.get('provider'))}",
+                "Binance 앱 Prediction은 공식 문서상 Predict.fun 제3자 프로토콜 통합으로 취급합니다.",
+                f"Bot: {'ON' if cfg.get('enabled') else 'OFF'} | LIVE {'UNLOCKED' if cfg.get('live_enabled') else 'LOCKED'} | Mainnet {'ON' if cfg.get('use_mainnet') else 'OFF'}",
+                f"10USDT cap: {float(cfg.get('equity_cap_usdt', 10.0) or 10.0):.2f} / stake max {float(cfg.get('max_stake_usdt', 1.0) or 1.0):.2f}",
+                f"Env/approval: {'READY' if not missing else 'BLOCKED'}",
+            ]
+            if missing:
+                lines.append("Missing: " + ", ".join(missing))
+            lines.extend([
+                "",
+                "Funding/withdraw check:",
+                "Binance 앱은 Assets > Prediction > Transfer에서 USDT를 옮기는 구조입니다.",
+                "Predict.fun 직접 사용은 스마트월렛 입금/출금 구조라, live 전 1~2 USDT 입금-주문-회수 테스트가 필요합니다.",
+            ])
+            live_positions = [p for p in ledger.open_positions() if p.get('execution_mode') == 'live']
+            lines.append("")
+            lines.append("Live positions:")
+            if not live_positions:
+                lines.append("none")
+            for pos in live_positions:
+                lines.append(
+                    f"{pos.get('id')} | {pos.get('market_title')} | stake {float(pos.get('stake_usdt', 0) or 0):.2f} | "
+                    f"order {pos.get('order_id') or pos.get('order_hash') or 'n/a'} | status {pos.get('live_order_status') or 'UNKNOWN'}"
+                )
+            if sync_result.get('errors'):
+                lines.append("")
+                lines.append("Sync errors:")
+                for item in sync_result.get('errors')[:5]:
+                    lines.append(f"{item.get('position_id', 'n/a')}: {item.get('error')}")
+            return "\n".join(lines)
 
         def _prediction_event_summary(days=7):
             events = read_prediction_diagnostic_events(days=days)
@@ -19790,6 +19902,9 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 'paper_entry': None,
                 'live_order': None,
                 'live_error': None,
+                'live_preflight': None,
+                'live_sync': None,
+                'provider': provider_label(cfg.get('provider')),
                 'source': 'mainnet' if cfg.get('use_mainnet') else 'testnet',
             }
             try:
@@ -19813,6 +19928,8 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 
             raw_market_by_id = {str(raw.get('id') or raw.get('marketId') or raw.get('market_id')): raw for raw in raw_markets}
             result['paper_exits'] = await _reconcile_prediction_paper_positions(client, raw_market_by_id, cfg, ledger)
+            if any(p.get('execution_mode') == 'live' for p in ledger.open_positions()):
+                result['live_sync'] = await _sync_prediction_live_orders()
             open_ids = {str(p.get('market_id')) for p in ledger.open_positions()}
             summary = ledger.summary()
             for raw in raw_markets:
@@ -19885,6 +20002,27 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 else:
                     try:
                         creds = _prediction_live_credentials()
+                        live_preflight = await asyncio.to_thread(
+                            check_live_preflight,
+                            market=top.get('_market') or {},
+                            orderbook_payload=top.get('_orderbook_payload') or {},
+                            plan=top.get('micro_plan') or {},
+                            cfg=cfg,
+                            credentials=creds,
+                            open_positions=ledger.open_positions(),
+                        )
+                        result['live_preflight'] = live_preflight
+                        if not live_preflight.get('accepted'):
+                            result['live_error'] = ",".join(live_preflight.get('reject_reasons') or ['PREDICTION_LIVE_PREFLIGHT_REJECTED'])
+                            log_prediction_diagnostic_event({
+                                'event': 'live_order_preflight_reject',
+                                'market_id': top.get('market_id'),
+                                'market_title': top.get('title'),
+                                'reject_reasons': live_preflight.get('reject_reasons') or [],
+                                'stake_usdt': live_preflight.get('stake_usdt'),
+                                'balance_usdt': live_preflight.get('balance_usdt'),
+                            })
+                            raise PredictionLiveOrderError(result['live_error'])
                         live_result = await asyncio.to_thread(
                             submit_live_market_order,
                             client=PredictClient.mainnet(api_key=creds.api_key, jwt_token=creds.jwt_token, timeout=15),
@@ -19893,6 +20031,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                             plan=top.get('micro_plan') or {},
                             cfg=cfg,
                             credentials=creds,
+                            open_positions=ledger.open_positions(),
                         )
                         result['live_order'] = {
                             'market_id': top.get('market_id'),
@@ -19901,6 +20040,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                             'score': top.get('score'),
                             'order_id': live_result.get('order_id'),
                             'order_hash': live_result.get('order_hash'),
+                            'balance_usdt': (live_result.get('preflight') or {}).get('balance_usdt'),
                         }
                         position = ledger.open_position(
                             top.get('micro_plan') or {},
@@ -19912,6 +20052,8 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                         position['score'] = top.get('score')
                         position['order_id'] = live_result.get('order_id')
                         position['order_hash'] = live_result.get('order_hash')
+                        position['live_order_status'] = 'SUBMITTED'
+                        position['provider'] = provider_label(cfg.get('provider'))
                         _save_prediction_ledger()
                         log_prediction_diagnostic_event({
                             'event': 'live_order',
@@ -19995,12 +20137,19 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                     f"{live_order.get('market_title')} / stake {float(live_order.get('stake_usdt', 0) or 0):.2f} USDT / "
                     f"order {live_order.get('order_id') or live_order.get('order_hash')}"
                 )
+            live_preflight = report.get('live_preflight') if isinstance(report, dict) else None
+            if live_preflight:
+                state = 'PASS' if live_preflight.get('accepted') else 'BLOCKED'
+                text += (
+                    f"\n\nLIVE preflight: {state} / stake {float(live_preflight.get('stake_usdt', 0) or 0):.2f} / "
+                    f"balance {live_preflight.get('balance_usdt') if live_preflight.get('balance_usdt') is not None else 'n/a'}"
+                )
             if isinstance(report, dict) and report.get('live_error'):
                 text += f"\n\nLIVE error: {report.get('live_error')}"
             if isinstance(report, dict) and report.get('note'):
                 text += f"\n\nNote: {report.get('note')}"
             text += f"\n\n{_prediction_live_ready_text()}"
-            text += "\n\nCommands: /prediction on, /prediction off, /prediction scan, /prediction positions, /prediction strategies, /prediction research"
+            text += "\n\nCommands: /prediction on, /prediction off, /prediction scan, /prediction positions, /prediction live status, /prediction strategies, /prediction research"
             return text
 
         def _format_prediction_positions_text():
@@ -20047,7 +20196,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
             rows = PREDICTION_STRATEGY_CATALOG[start:start + 10]
             lines = [
                 f"Prediction Strategy Catalog ({page}/10)",
-                "All 100 items are paper-only scoring/research rules. No live Predict.fun order path is connected.",
+                "All 100 items are scoring/research rules. Live orders are gated separately by preflight, cap, balance, and approval checks.",
                 "",
             ]
             for item in rows:
@@ -20130,12 +20279,15 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 await self.cfg.update_value(['prediction_micro_auto', 'enabled'], True)
                 await self.cfg.update_value(['prediction_micro_auto', 'live_enabled'], True)
                 await self.cfg.update_value(['prediction_micro_auto', 'use_mainnet'], True)
-                await u.message.reply_text("Prediction LIVE: UNLOCKED. 단, 환경변수 키와 PREDICTION_LIVE_TRADING_ENABLED=1 없으면 주문은 차단됩니다.")
+                await u.message.reply_text("Prediction LIVE: UNLOCKED. 단, 환경변수 키, 승인 확인, PREDICTION_LIVE_TRADING_ENABLED=1 없으면 주문은 차단됩니다.")
                 return
             if action == 'live' and len(args) > 1 and str(args[1]).lower() in {'lock', 'off'}:
                 await self.cfg.update_value(['prediction_micro_auto', 'live_enabled'], False)
                 await self.cfg.update_value(['prediction_micro_auto', 'use_mainnet'], False)
                 await u.message.reply_text("Prediction LIVE: LOCKED. Paper mode로 돌아갑니다.")
+                return
+            if action == 'live' and len(args) > 1 and str(args[1]).lower() == 'status':
+                await u.message.reply_text(await _format_prediction_live_status_text(), reply_markup=_build_prediction_keyboard())
                 return
             if action in {'status', 'menu', ''}:
                 await u.message.reply_text(_format_prediction_menu_text(), reply_markup=_build_prediction_keyboard())
@@ -20189,12 +20341,15 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 await self.cfg.update_value(['prediction_micro_auto', 'enabled'], True)
                 await self.cfg.update_value(['prediction_micro_auto', 'live_enabled'], True)
                 await self.cfg.update_value(['prediction_micro_auto', 'use_mainnet'], True)
-                await _edit_prediction_menu(query, "Prediction LIVE: UNLOCKED. 환경변수 키가 없으면 주문은 차단됩니다.")
+                await _edit_prediction_menu(query, "Prediction LIVE: UNLOCKED. 환경변수 키/승인 확인이 없으면 주문은 차단됩니다.")
                 return
             if action == 'live_off':
                 await self.cfg.update_value(['prediction_micro_auto', 'live_enabled'], False)
                 await self.cfg.update_value(['prediction_micro_auto', 'use_mainnet'], False)
                 await _edit_prediction_menu(query, "Prediction LIVE: LOCKED")
+                return
+            if action == 'live_status':
+                await query.edit_message_text(await _format_prediction_live_status_text(), reply_markup=_build_prediction_keyboard())
                 return
             if action == 'scan':
                 report = await _run_prediction_scan(force=True)
@@ -20238,7 +20393,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 /utbreakout - UTBOT_FILTERED_BREAKOUT_V1 전용 메뉴
 /coinscan - CoinSelector V2 자동 코인 선택 메뉴
 /microauto - 10 USDT 이하 소액 전용 자동매매 메뉴
-/prediction - Prediction Micro Auto paper-only 메뉴
+/prediction - Prediction Micro Auto / Binance Wallet Prediction(Predict.fun) 메뉴
 /log - 최근 로그
 /close - 긴급 청산
 
