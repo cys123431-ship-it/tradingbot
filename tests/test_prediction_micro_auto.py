@@ -479,13 +479,27 @@ def test_prediction_research_report_includes_core_metrics():
     assert "Strategy 51" in text
 
 
-def test_futures_prediction_research_sets_are_not_live_selectable():
+def test_futures_prediction_sets_are_live_selectable_with_required_filters():
     text = Path("emas.py").read_text(encoding="utf-8")
 
-    assert "UTBREAKOUT_ACTIVE_SET_MAX = 50" in text
+    assert "UTBREAKOUT_ACTIVE_SET_MAX = 60" in text
     for set_id in range(51, 61):
-        start = text.find(f"({set_id}, 'Prediction Research'")
+        start = text.find(f"({set_id}, 'Prediction Futures'")
         assert start >= 0
         end = text.find(f"({set_id + 1},", start) if set_id < 60 else text.find("\n    ]", start)
         segment = text[start:end]
-        assert "'research_only': True" in segment
+        assert "'research_only': True" not in segment
+        assert "prediction_" in segment
+    for filter_name in (
+        "prediction_orderflow_imbalance",
+        "prediction_oi_funding_crowding",
+        "prediction_liquidation_cascade",
+        "prediction_odds_divergence",
+        "prediction_macro_event_guard",
+        "prediction_volatility_forecast",
+        "prediction_spread_depth_guard",
+        "prediction_basis_divergence",
+        "prediction_probability_trail",
+        "prediction_cross_market_confirmation",
+    ):
+        assert f"filter_name == '{filter_name}'" in text

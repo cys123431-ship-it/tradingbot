@@ -354,7 +354,7 @@ ALT_TREND_TIMEFRAME_ORDER = {
     timeframe: idx for idx, timeframe in enumerate(ALT_TREND_ALLOWED_TIMEFRAMES)
 }
 BINANCE_FAPI_PUBLIC_BASE_URL = 'https://fapi.binance.com'
-UTBREAKOUT_ACTIVE_SET_MAX = 50
+UTBREAKOUT_ACTIVE_SET_MAX = 60
 UTBREAKOUT_DEFAULT_SET_ID = 2
 UTBREAKOUT_AUTO_TIMEFRAMES = ['15m', '30m', '1h', '2h', '4h']
 
@@ -449,16 +449,16 @@ def build_utbreakout_set_registry():
         (48, 'Special Regime', 'UT + session/time volatility', '시간대별 변동성 특성을 반영합니다.', '세션별 움직임 차이가 큰 장', '실거래 시간대 최적화 가능', '시장 구조 변화에 민감', '중간', ['UTBot', 'Session'], ['session_volatility'], {}),
         (49, 'Special Regime', 'UT + market regime fallback', '분석 점수가 애매하면 안전한 단순 set으로 후퇴합니다.', '분류가 애매한 장', '과도한 필터링 방지', '방어력은 낮음', '많음', ['UTBot', 'Regime Score'], ['regime_fallback'], {}),
         (50, 'Special Regime', 'UT emergency simple mode', '장애/데이터 부족 시 UT와 리스크만 남기는 비상 단순 모드입니다.', '데이터 분석이 불안정할 때', '진입 로직이 멈추지 않음', '품질 필터 거의 없음', '매우 많음', ['UTBot', 'Risk Control'], [], {}),
-        (51, 'Prediction Research', 'UT + Orderflow Imbalance', 'Prediction/orderbook 수급 불균형을 Futures 연구 feature로 기록합니다.', '호가 쏠림이 강한 장', '체결 전 압력 감지 가능', '얕은 호가에 과민', '연구전용', ['UTBot', 'Orderbook Imbalance'], ['research_orderflow_imbalance'], {'research_only': True}),
-        (52, 'Prediction Research', 'UT + OI/Funding Crowding', 'OI/Funding crowding이 UT 방향과 충돌하는지 연구합니다.', '군중 포지션이 한쪽으로 몰린 장', 'crowded trade 회피 후보', '거래소별 데이터 차이', '연구전용', ['UTBot', 'Open Interest', 'Funding'], ['research_oi_funding_crowding'], {'research_only': True}),
-        (53, 'Prediction Research', 'UT + Liquidation Cascade', '청산 밀집 구간 돌파/반전을 연구용 feature로 봅니다.', '급격한 청산 연쇄 가능 구간', '가속 구간 감지 후보', '청산 지도 데이터 의존', '연구전용', ['UTBot', 'Liquidation Map'], ['research_liquidation_cascade'], {'research_only': True}),
-        (54, 'Prediction Research', 'UT + Prediction Odds Divergence', 'Prediction odds와 Futures 가격 방향 괴리를 연구합니다.', '이벤트 확률과 가격이 엇갈리는 장', '크로스마켓 정보 활용', '예측시장 유동성 부족 가능', '연구전용', ['UTBot', 'Prediction Odds'], ['research_prediction_odds_divergence'], {'research_only': True}),
-        (55, 'Prediction Research', 'UT + Macro Event Guard', '중요 macro event 전후 UT 신호 품질 변화를 연구합니다.', '경제지표/금리/정책 이벤트 주변', '이벤트 리스크 기록', '일정 데이터 품질 의존', '연구전용', ['UTBot', 'Macro Calendar'], ['research_macro_event_guard'], {'research_only': True}),
-        (56, 'Prediction Research', 'UT + Volatility Forecast', 'Prediction/옵션성 변동성 예상을 Futures risk scaling 연구에 씁니다.', '변동성 regime 전환 전후', '손익비 조정 후보', '예측치 불안정', '연구전용', ['UTBot', 'Volatility Forecast'], ['research_volatility_forecast'], {'research_only': True}),
-        (57, 'Prediction Research', 'UT + Spread Depth Guard', 'Prediction/Futures spread-depth 비용을 연구용 guard로 기록합니다.', '호가 얕은 변동장', '실제 비용 반영 후보', '데이터 지연에 취약', '연구전용', ['UTBot', 'Spread', 'Depth'], ['research_spread_depth_guard'], {'research_only': True}),
-        (58, 'Prediction Research', 'UT + Basis Divergence', '현물-선물 basis와 Prediction odds divergence를 함께 연구합니다.', 'basis 왜곡 장', '파생시장 과열 감지 후보', 'basis 해석 복잡', '연구전용', ['UTBot', 'Basis', 'Prediction Odds'], ['research_basis_divergence'], {'research_only': True}),
-        (59, 'Prediction Research', 'UT + Probability Trailing Exit', '확률 변화 기반 trailing exit를 Futures 청산 연구 후보로 기록합니다.', '진입 후 확률 우위가 줄어드는 장', '청산 개선 후보', '실시간 odds 의존', '연구전용', ['UTBot', 'Probability Trail'], ['research_probability_trailing_exit'], {'research_only': True}),
-        (60, 'Prediction Research', 'UT + Cross-Market Confirmation', 'Futures, Prediction, Macro 신호의 방향 일치를 연구합니다.', '크로스마켓 정렬 장', '품질 좋은 신호 선별 후보', '신호 수 감소 가능', '연구전용', ['UTBot', 'Prediction', 'Macro'], ['research_cross_market_confirmation'], {'research_only': True}),
+        (51, 'Prediction Futures', 'UT + Orderflow Imbalance', 'Futures 호가 불균형과 taker buy/sell 흐름이 UT 방향과 맞을 때만 진입합니다.', '호가와 체결 흐름이 한쪽으로 기울어진 장', '체결 전 수급 압력을 반영', '얕은 호가/순간 노이즈에 취약', '적음~중간', ['UTBot', 'Futures Depth', 'Taker Buy/Sell'], ['prediction_orderflow_imbalance'], {}),
+        (52, 'Prediction Futures', 'UT + OI/Funding Crowding', 'OI 변화와 funding/long-short crowding이 진입 방향에 과열되지 않았는지 확인합니다.', '군중 포지션이 한쪽으로 과도하게 몰린 장', 'crowded trade 회피', '보수적이라 일부 강한 추세를 놓칠 수 있음', '적음~중간', ['UTBot', 'Open Interest', 'Funding'], ['prediction_oi_funding_crowding'], {}),
+        (53, 'Prediction Futures', 'UT + Liquidation Cascade Proxy', 'OI 급감과 taker 흐름, 확장봉으로 청산 연쇄 이후 방향 지속을 확인합니다.', '급격한 청산 연쇄 가능 구간', '가속 구간 포착 후보', '실제 청산맵이 아닌 public data proxy', '적음', ['UTBot', 'OI Delta', 'Taker Flow', 'Range Expansion'], ['prediction_liquidation_cascade'], {}),
+        (54, 'Prediction Futures', 'UT + Prediction Odds Divergence', 'Prediction odds가 Futures 방향과 과도하게 충돌하지 않을 때만 허용합니다.', '예측시장 확률과 선물 방향을 같이 볼 때', '크로스마켓 정보 활용', 'Prediction 스캔 데이터가 없으면 진입 차단', '적음', ['UTBot', 'Prediction Odds'], ['prediction_odds_divergence'], {}),
+        (55, 'Prediction Futures', 'UT + Event/Funding Guard', '중요 funding window와 과도한 funding rate 주변 진입을 회피합니다.', '이벤트/펀딩 직전 변동성 리스크', '불필요한 이벤트성 꼬리 위험 감소', '뉴스 캘린더 직접 연동은 아님', '적음~중간', ['UTBot', 'Funding Time', 'Funding Rate'], ['prediction_macro_event_guard'], {}),
+        (56, 'Prediction Futures', 'UT + Volatility Forecast', 'ATR/BB/Keltner 기반 변동성 예측 점수가 정상일 때만 진입합니다.', '변동성 regime 전환 전후', '손익비 악화 구간 회피', '강한 고변동 추세 일부 제외', '적음~중간', ['UTBot', 'ATR', 'BB Width', 'Keltner'], ['prediction_volatility_forecast'], {}),
+        (57, 'Prediction Futures', 'UT + Spread Depth Guard', 'Futures 스프레드와 호가 깊이가 실거래 비용을 감당할 수준인지 확인합니다.', '호가 얕은 변동장', '실제 체결 비용 방어', '저유동 알트 진입 감소', '적음~중간', ['UTBot', 'Spread', 'Depth'], ['prediction_spread_depth_guard'], {}),
+        (58, 'Prediction Futures', 'UT + Basis Divergence', 'Mark/Index basis가 진입 방향으로 과열되지 않았는지 확인합니다.', 'basis 왜곡 장', '파생시장 과열 감지', 'basis 해석이 심볼별로 다를 수 있음', '적음~중간', ['UTBot', 'Basis', 'Mark/Index'], ['prediction_basis_divergence'], {}),
+        (59, 'Prediction Futures', 'UT + Probability Trail Guard', 'Prediction 확률이 진입 방향을 일정 수준 이상 지지할 때만 허용합니다.', 'Prediction 확률 우위가 뚜렷한 장', '진입 후 확률 약화 감시 후보', 'Prediction 데이터 없으면 진입 차단', '적음', ['UTBot', 'Prediction Probability'], ['prediction_probability_trail'], {}),
+        (60, 'Prediction Futures', 'UT + Cross-Market Confirmation', 'Futures 수급, basis/funding, Prediction odds 중 2개 이상이 UT 방향과 맞을 때 진입합니다.', '크로스마켓 정렬 장', '품질 좋은 신호 선별', '신호 수 감소', '적음', ['UTBot', 'Futures Flow', 'Basis', 'Prediction'], ['prediction_cross_market_confirmation'], {}),
     ]
     registry = {}
     for row in rows:
@@ -4821,9 +4821,20 @@ class SignalEngine(BaseEngine):
                 errors[tf] = str(exc)
                 timeframe_metrics[tf] = {'ready': False, 'reason': str(exc)}
         scores = self._utbreakout_score_from_metrics(timeframe_metrics)
+        futures_context = {}
+        try:
+            futures_context = await self._fetch_utbreakout_futures_context(symbol)
+            if isinstance(futures_context, dict):
+                futures_context = dict(futures_context)
+                futures_context['volatility_forecast_score'] = scores.get('volatility_score')
+            futures_scores = self._score_prediction_futures_context(futures_context)
+            scores.update(futures_scores)
+        except Exception as exc:
+            errors['futures_context'] = str(exc)
         return {
             'timeframes': timeframe_metrics,
             'scores': scores,
+            'futures_context': futures_context,
             'errors': errors,
         }
 
@@ -4922,6 +4933,15 @@ class SignalEngine(BaseEngine):
         ichimoku = float(scores.get('ichimoku_score', trend) or 0.0)
         session = float(scores.get('session_score', 0.0) or 0.0)
         fallback = float(scores.get('fallback_score', 0.0) or 0.0)
+        prediction_orderflow = float(scores.get('prediction_orderflow_score', 0.0) or 0.0)
+        prediction_depth = float(scores.get('prediction_depth_score', 0.0) or 0.0)
+        prediction_oi_funding = float(scores.get('prediction_oi_funding_score', 0.0) or 0.0)
+        prediction_liquidation = float(scores.get('prediction_liquidation_score', 0.0) or 0.0)
+        prediction_odds = float(scores.get('prediction_odds_score', 0.0) or 0.0)
+        prediction_event_guard = float(scores.get('prediction_event_guard_score', 0.0) or 0.0)
+        prediction_volatility = float(scores.get('prediction_volatility_score', 0.0) or 0.0)
+        prediction_basis = float(scores.get('prediction_basis_score', 0.0) or 0.0)
+        prediction_cross_market = float(scores.get('prediction_cross_market_score', 0.0) or 0.0)
         ready = int(scores.get('ready_timeframes', 0) or 0)
 
         if ready <= 0:
@@ -4982,6 +5002,16 @@ class SignalEngine(BaseEngine):
             48: 29.0 + (session * 0.34) + (relative_volume * 0.08) + (volatility * 0.05),
             49: 31.0 + (fallback * 0.32) + (chop * 0.08) + (uncertainty * 0.08),
             50: 20.0 + (max(0.0, 3.0 - ready) * 8.0) + (fallback * 0.22) + (uncertainty * 0.06),
+            51: 24.0 + (prediction_orderflow * 0.38) + (prediction_depth * 0.12) + (flow * 0.05),
+            52: 25.0 + (prediction_oi_funding * 0.40) + (trend * 0.08) + (volatility * 0.04),
+            53: 22.0 + (prediction_liquidation * 0.42) + (range_expansion * 0.12) + (high_vol * 0.04),
+            54: 21.0 + (prediction_odds * 0.44) + (alignment * 0.08) + (momentum * 0.04),
+            55: 25.0 + (prediction_event_guard * 0.40) + (volatility_balance * 0.08) + (session * 0.04),
+            56: 24.0 + (prediction_volatility * 0.36) + (bb_expansion * 0.08) + (keltner_expansion * 0.08),
+            57: 24.0 + (prediction_depth * 0.42) + (relative_volume * 0.06) + (volatility * 0.04),
+            58: 24.0 + (prediction_basis * 0.40) + (prediction_oi_funding * 0.08) + (trend * 0.04),
+            59: 20.0 + (prediction_odds * 0.42) + (prediction_cross_market * 0.12) + (momentum * 0.04),
+            60: 20.0 + (prediction_cross_market * 0.44) + (alignment * 0.08) + (trend * 0.04),
         }
         selected_id, selected_score = max(candidate_scores.items(), key=lambda item: item[1])
         top3 = sorted(candidate_scores.items(), key=lambda item: item[1], reverse=True)[:3]
@@ -5477,6 +5507,119 @@ class SignalEngine(BaseEngine):
                 max_core = max(core) if core else 0.0
                 ok = max_core < 65.0
                 _add('Regime fallback', ok, f"max core score {max_core:.1f} / 조건 < 65", 'REJECTED_RISK_REWARD_LOW')
+            elif filter_name == 'prediction_orderflow_imbalance':
+                imbalance = values.get('orderbook_imbalance_pct')
+                taker_ratio = values.get('taker_buy_sell_ratio')
+                spread = values.get('futures_spread_pct')
+                if not (self._is_valid_number(imbalance) and self._is_valid_number(taker_ratio)):
+                    _add('Futures 수급 불균형', None, 'orderbook/taker flow 데이터 대기', 'REJECTED_PREDICTION_FLOW')
+                else:
+                    flow_ok = (
+                        float(imbalance) >= 5.0 and float(taker_ratio) >= 1.05
+                        if side == 'long'
+                        else float(imbalance) <= -5.0 and float(taker_ratio) <= 0.95
+                    )
+                    spread_ok = (not self._is_valid_number(spread)) or float(spread) <= 0.05
+                    _add('Futures 수급 불균형', flow_ok and spread_ok, f"imbalance {_fmt(imbalance, 2)}%, takerRatio {_fmt(taker_ratio, 3)}, spread {_fmt(spread, 4)}%", 'REJECTED_PREDICTION_FLOW')
+            elif filter_name == 'prediction_oi_funding_crowding':
+                funding = values.get('funding_rate')
+                long_short = values.get('long_short_ratio')
+                oi_delta = values.get('open_interest_delta_pct')
+                if not (self._is_valid_number(funding) or self._is_valid_number(long_short) or self._is_valid_number(oi_delta)):
+                    _add('OI/Funding 과열회피', None, 'funding/OI 데이터 대기', 'REJECTED_PREDICTION_CROWDING')
+                else:
+                    funding_value = float(funding) if self._is_valid_number(funding) else 0.0
+                    ratio_value = float(long_short) if self._is_valid_number(long_short) else 1.0
+                    crowd_ok = (
+                        funding_value <= 0.0008 and ratio_value <= 1.85
+                        if side == 'long'
+                        else funding_value >= -0.0008 and ratio_value >= 0.55
+                    )
+                    _add('OI/Funding 과열회피', crowd_ok, f"funding {_fmt(funding, 6)}, L/S {_fmt(long_short, 3)}, OIΔ {_fmt(oi_delta, 2)}%", 'REJECTED_PREDICTION_CROWDING')
+            elif filter_name == 'prediction_liquidation_cascade':
+                oi_delta = values.get('open_interest_delta_pct')
+                taker_ratio = values.get('taker_buy_sell_ratio')
+                range_ratio = values.get('range_expansion_ratio')
+                if not (self._is_valid_number(oi_delta) and self._is_valid_number(taker_ratio) and self._is_valid_number(range_ratio)):
+                    _add('청산 연쇄 Proxy', None, 'OIΔ/taker/range 데이터 대기', 'REJECTED_PREDICTION_LIQUIDATION')
+                else:
+                    flow_ok = float(taker_ratio) >= 1.08 if side == 'long' else float(taker_ratio) <= 0.92
+                    ok = float(oi_delta) <= -0.35 and flow_ok and float(range_ratio) >= 1.10
+                    _add('청산 연쇄 Proxy', ok, f"OIΔ {_fmt(oi_delta, 2)}%, takerRatio {_fmt(taker_ratio, 3)}, range {_fmt(range_ratio, 2)}", 'REJECTED_PREDICTION_LIQUIDATION')
+            elif filter_name == 'prediction_odds_divergence':
+                probability = values.get('prediction_up_probability')
+                edge = values.get('prediction_edge')
+                title = values.get('prediction_title') or 'prediction scan'
+                if not self._is_valid_number(probability):
+                    _add('Prediction odds 괴리', None, 'Prediction odds 데이터 대기', 'REJECTED_PREDICTION_ODDS')
+                else:
+                    ok = float(probability) >= 0.52 if side == 'long' else float(probability) <= 0.48
+                    _add('Prediction odds 괴리', ok, f"upProb {_fmt(probability, 3)}, edge {_fmt(edge, 3)} / {title}", 'REJECTED_PREDICTION_ODDS')
+            elif filter_name == 'prediction_macro_event_guard':
+                funding = values.get('funding_rate')
+                next_funding_time = values.get('next_funding_time')
+                minutes_to_funding = None
+                if next_funding_time:
+                    minutes_to_funding = (int(next_funding_time) / 1000.0 - time.time()) / 60.0
+                if self._is_valid_number(funding) and minutes_to_funding is not None:
+                    ok = not (0.0 <= minutes_to_funding <= 20.0 and abs(float(funding)) >= 0.0007)
+                    _add('Event/Funding Guard', ok, f"funding {_fmt(funding, 6)}, next {minutes_to_funding:.1f}m", 'REJECTED_PREDICTION_EVENT_GUARD')
+                else:
+                    _add('Event/Funding Guard', None, 'funding window 데이터 대기', 'REJECTED_PREDICTION_EVENT_GUARD')
+            elif filter_name == 'prediction_volatility_forecast':
+                scores = values.get('auto_scores') if isinstance(values.get('auto_scores'), dict) else {}
+                vol_score = scores.get('prediction_volatility_score') or scores.get('volatility_score')
+                high_vol = scores.get('high_vol_score')
+                if not self._is_valid_number(vol_score):
+                    _add('변동성 예측', None, 'volatility forecast 계산 대기', 'REJECTED_ATR_TOO_HIGH')
+                else:
+                    ok = float(vol_score) >= 48.0 and (not self._is_valid_number(high_vol) or float(high_vol) <= 85.0)
+                    _add('변동성 예측', ok, f"volScore {_fmt(vol_score, 1)}, highVol {_fmt(high_vol, 1)}", 'REJECTED_ATR_TOO_HIGH')
+            elif filter_name == 'prediction_spread_depth_guard':
+                spread = values.get('futures_spread_pct')
+                bid_depth = values.get('bid_depth_usdt')
+                ask_depth = values.get('ask_depth_usdt')
+                min_depth = float(cfg.get('prediction_min_depth_usdt', 50000.0) or 50000.0)
+                if not (self._is_valid_number(spread) and self._is_valid_number(bid_depth) and self._is_valid_number(ask_depth)):
+                    _add('Spread/Depth 비용', None, 'depth 데이터 대기', 'REJECTED_PREDICTION_LIQUIDITY')
+                else:
+                    min_side_depth = min(float(bid_depth), float(ask_depth))
+                    ok = float(spread) <= 0.05 and min_side_depth >= min_depth
+                    _add('Spread/Depth 비용', ok, f"spread {_fmt(spread, 4)}%, depth {_fmt(min_side_depth, 0)} >= {min_depth:.0f}", 'REJECTED_PREDICTION_LIQUIDITY')
+            elif filter_name == 'prediction_basis_divergence':
+                basis = values.get('basis_pct')
+                if not self._is_valid_number(basis):
+                    _add('Basis 과열회피', None, 'basis 데이터 대기', 'REJECTED_PREDICTION_BASIS')
+                else:
+                    ok = float(basis) <= 0.10 if side == 'long' else float(basis) >= -0.10
+                    _add('Basis 과열회피', ok, f"mark-index basis {_fmt(basis, 4)}%", 'REJECTED_PREDICTION_BASIS')
+            elif filter_name == 'prediction_probability_trail':
+                probability = values.get('prediction_up_probability')
+                if not self._is_valid_number(probability):
+                    _add('Probability Trail Guard', None, 'Prediction probability 데이터 대기', 'REJECTED_PREDICTION_ODDS')
+                else:
+                    ok = float(probability) >= 0.55 if side == 'long' else float(probability) <= 0.45
+                    _add('Probability Trail Guard', ok, f"upProb {_fmt(probability, 3)} / long>=0.55 short<=0.45", 'REJECTED_PREDICTION_ODDS')
+            elif filter_name == 'prediction_cross_market_confirmation':
+                probability = values.get('prediction_up_probability')
+                imbalance = values.get('orderbook_imbalance_pct')
+                taker_ratio = values.get('taker_buy_sell_ratio')
+                basis = values.get('basis_pct')
+                funding = values.get('funding_rate')
+                votes = []
+                if self._is_valid_number(probability):
+                    votes.append(float(probability) >= 0.52 if side == 'long' else float(probability) <= 0.48)
+                if self._is_valid_number(imbalance) and self._is_valid_number(taker_ratio):
+                    votes.append(float(imbalance) >= 3.0 and float(taker_ratio) >= 1.03 if side == 'long' else float(imbalance) <= -3.0 and float(taker_ratio) <= 0.97)
+                if self._is_valid_number(basis):
+                    votes.append(float(basis) <= 0.10 if side == 'long' else float(basis) >= -0.10)
+                if self._is_valid_number(funding):
+                    votes.append(float(funding) <= 0.0008 if side == 'long' else float(funding) >= -0.0008)
+                if len(votes) < 2:
+                    _add('Cross-Market 확인', None, '크로스마켓 데이터 2개 미만', 'REJECTED_PREDICTION_CROSS_MARKET')
+                else:
+                    passed = sum(1 for vote in votes if vote)
+                    _add('Cross-Market 확인', passed >= 2, f"{passed}/{len(votes)} votes pass", 'REJECTED_PREDICTION_CROSS_MARKET')
             else:
                 _add(filter_name, None, 'planned 필터: 아직 실거래 연결 안 됨', 'REJECTED_RISK_REWARD_LOW')
         return items
@@ -5636,7 +5779,19 @@ class SignalEngine(BaseEngine):
                 'funding_rate': _safe_float_or_none(status.get('funding_rate')),
                 'next_funding_time': status.get('next_funding_time'),
                 'open_interest': _safe_float_or_none(status.get('open_interest')),
+                'open_interest_delta_pct': _safe_float_or_none(status.get('open_interest_delta_pct')),
                 'mark_price': _safe_float_or_none(status.get('mark_price')),
+                'basis_pct': _safe_float_or_none(status.get('basis_pct')),
+                'taker_buy_sell_ratio': _safe_float_or_none(status.get('taker_buy_sell_ratio')),
+                'long_short_ratio': _safe_float_or_none(status.get('long_short_ratio')),
+                'orderbook_imbalance_pct': _safe_float_or_none(status.get('orderbook_imbalance_pct')),
+                'futures_spread_pct': _safe_float_or_none(status.get('futures_spread_pct')),
+                'bid_depth_usdt': _safe_float_or_none(status.get('bid_depth_usdt')),
+                'ask_depth_usdt': _safe_float_or_none(status.get('ask_depth_usdt')),
+                'prediction_up_probability': _safe_float_or_none(status.get('prediction_up_probability')),
+                'prediction_edge': _safe_float_or_none(status.get('prediction_edge')),
+                'prediction_score': _safe_float_or_none(status.get('prediction_score')),
+                'prediction_title': status.get('prediction_title'),
                 'protection_status': protection_status
             }
             plan = status.get('entry_plan')
@@ -5986,7 +6141,13 @@ class SignalEngine(BaseEngine):
             )
         })
         try:
-            futures_context = await self._fetch_utbreakout_futures_context(symbol)
+            futures_context = (
+                (auto_analysis or {}).get('futures_context')
+                if isinstance(auto_analysis, dict) and isinstance((auto_analysis or {}).get('futures_context'), dict)
+                else None
+            )
+            if futures_context is None:
+                futures_context = await self._fetch_utbreakout_futures_context(symbol)
             if futures_context:
                 status.update(futures_context)
         except Exception as e:
@@ -6058,6 +6219,20 @@ class SignalEngine(BaseEngine):
             'htf_gap_pct': htf_gap_pct,
             'htf_supertrend_direction': htf_supertrend_direction,
             'htf_supertrend_reason': htf_supertrend_reason,
+            'funding_rate': status.get('funding_rate'),
+            'next_funding_time': status.get('next_funding_time'),
+            'open_interest_delta_pct': status.get('open_interest_delta_pct'),
+            'taker_buy_sell_ratio': status.get('taker_buy_sell_ratio'),
+            'long_short_ratio': status.get('long_short_ratio'),
+            'orderbook_imbalance_pct': status.get('orderbook_imbalance_pct'),
+            'futures_spread_pct': status.get('futures_spread_pct'),
+            'bid_depth_usdt': status.get('bid_depth_usdt'),
+            'ask_depth_usdt': status.get('ask_depth_usdt'),
+            'basis_pct': status.get('basis_pct'),
+            'prediction_up_probability': status.get('prediction_up_probability'),
+            'prediction_edge': status.get('prediction_edge'),
+            'prediction_score': status.get('prediction_score'),
+            'prediction_title': status.get('prediction_title'),
         }
         filter_items = self._evaluate_utbreakout_set_filter_items(side, selected_set, cfg, filter_values)
         status['set_filter_items'] = filter_items
@@ -9328,6 +9503,117 @@ class SignalEngine(BaseEngine):
         self.micro_auto_last_rejects.pop(symbol, None)
         return merged, None
 
+    def _prediction_context_for_futures_symbol(self, symbol):
+        scan = getattr(self.ctrl, 'prediction_micro_last_scan', None)
+        if not isinstance(scan, dict):
+            return {}
+        base = str(symbol or '').upper().replace(':USDT', '').split('/', 1)[0].replace('USDT', '')
+        base_aliases = {
+            'BTC': ['BTC', 'BITCOIN'],
+            'ETH': ['ETH', 'ETHEREUM'],
+            'SOL': ['SOL', 'SOLANA'],
+            'XRP': ['XRP', 'RIPPLE'],
+            'BNB': ['BNB', 'BINANCE COIN'],
+            'DOGE': ['DOGE', 'DOGECOIN'],
+        }.get(base, [base])
+        rows = list(scan.get('candidates') or []) + list(scan.get('rejects') or [])
+        for row in rows:
+            title = str(row.get('title') or row.get('market_title') or '').upper()
+            if not title:
+                continue
+            if not any(alias in title for alias in base_aliases):
+                continue
+            if 'UP' not in title and 'DOWN' not in title:
+                continue
+            probability = _safe_float_or_none(row.get('fair_probability'))
+            market_price = _safe_float_or_none(row.get('market_price'))
+            edge = _safe_float_or_none(row.get('edge'))
+            if probability is None and market_price is None:
+                continue
+            return {
+                'prediction_title': row.get('title') or row.get('market_title'),
+                'prediction_up_probability': probability,
+                'prediction_market_price': market_price,
+                'prediction_edge': edge,
+                'prediction_score': _safe_float_or_none(row.get('score')),
+            }
+        return {}
+
+    def _score_prediction_futures_context(self, context):
+        context = dict(context or {})
+
+        def _score(value, low, high):
+            if value is None or high <= low:
+                return 0.0
+            try:
+                return max(0.0, min(100.0, (float(value) - float(low)) / (float(high) - float(low)) * 100.0))
+            except (TypeError, ValueError):
+                return 0.0
+
+        imbalance = _safe_float_or_none(context.get('orderbook_imbalance_pct'))
+        taker_ratio = _safe_float_or_none(context.get('taker_buy_sell_ratio'))
+        spread = _safe_float_or_none(context.get('futures_spread_pct'))
+        depth = min(
+            _safe_float_or_none(context.get('bid_depth_usdt')) or 0.0,
+            _safe_float_or_none(context.get('ask_depth_usdt')) or 0.0,
+        )
+        funding = _safe_float_or_none(context.get('funding_rate'))
+        long_short = _safe_float_or_none(context.get('long_short_ratio'))
+        oi_delta = _safe_float_or_none(context.get('open_interest_delta_pct'))
+        basis = _safe_float_or_none(context.get('basis_pct'))
+        prediction_prob = _safe_float_or_none(context.get('prediction_up_probability'))
+        prediction_edge = _safe_float_or_none(context.get('prediction_edge'))
+        vol_score = _safe_float_or_none(context.get('volatility_forecast_score'))
+
+        orderflow_score = 0.0
+        if imbalance is not None and taker_ratio is not None:
+            orderflow_score = min(100.0, abs(imbalance) * 5.0 + abs(taker_ratio - 1.0) * 130.0)
+            if spread is not None and spread > 0.05:
+                orderflow_score *= 0.45
+        depth_score = _score(depth, 10000.0, 150000.0)
+        funding_crowding_score = 55.0
+        if funding is not None:
+            funding_crowding_score = max(0.0, 100.0 - min(100.0, abs(funding) / 0.0012 * 100.0))
+        if long_short is not None:
+            funding_crowding_score = min(funding_crowding_score, max(0.0, 100.0 - min(100.0, abs(long_short - 1.0) / 1.2 * 100.0)))
+        liquidation_proxy_score = 0.0
+        if oi_delta is not None and taker_ratio is not None:
+            liquidation_proxy_score = min(100.0, max(0.0, -oi_delta) * 22.0 + abs(taker_ratio - 1.0) * 120.0)
+        prediction_score = 0.0
+        if prediction_prob is not None:
+            prediction_score = min(100.0, abs(prediction_prob - 0.5) * 240.0)
+            if prediction_edge is not None:
+                prediction_score = max(prediction_score, min(100.0, abs(prediction_edge) * 600.0))
+        event_guard_score = 70.0
+        next_funding_time = context.get('next_funding_time')
+        if next_funding_time:
+            minutes_to_funding = (int(next_funding_time) / 1000.0 - time.time()) / 60.0
+            if 0.0 <= minutes_to_funding <= 20.0 and funding is not None and abs(funding) >= 0.0007:
+                event_guard_score = 20.0
+        if vol_score is None:
+            vol_score = 50.0
+        basis_score = 55.0
+        if basis is not None:
+            basis_score = max(0.0, 100.0 - min(100.0, abs(basis) / 0.18 * 100.0))
+        cross_market_score = (
+            orderflow_score * 0.28
+            + funding_crowding_score * 0.18
+            + prediction_score * 0.28
+            + basis_score * 0.16
+            + depth_score * 0.10
+        )
+        return {
+            'prediction_orderflow_score': round(orderflow_score, 2),
+            'prediction_depth_score': round(depth_score, 2),
+            'prediction_oi_funding_score': round(funding_crowding_score, 2),
+            'prediction_liquidation_score': round(liquidation_proxy_score, 2),
+            'prediction_odds_score': round(prediction_score, 2),
+            'prediction_event_guard_score': round(event_guard_score, 2),
+            'prediction_volatility_score': round(float(vol_score), 2),
+            'prediction_basis_score': round(basis_score, 2),
+            'prediction_cross_market_score': round(cross_market_score, 2),
+        }
+
     async def _fetch_utbreakout_futures_context(self, symbol):
         if self.is_upbit_mode():
             return {}
@@ -9370,6 +9656,82 @@ class SignalEngine(BaseEngine):
                 context['open_interest_usdt'] = float(context['open_interest']) * float(context['mark_price'])
             except (TypeError, ValueError):
                 pass
+        try:
+            depth = await self.ctrl._fetch_binance_public_json('/fapi/v1/depth', {'symbol': rest_symbol, 'limit': 20})
+            bids = depth.get('bids') if isinstance(depth, dict) else []
+            asks = depth.get('asks') if isinstance(depth, dict) else []
+            bid_levels = [
+                (float(row[0]), float(row[1]))
+                for row in bids or []
+                if isinstance(row, (list, tuple)) and len(row) >= 2
+            ]
+            ask_levels = [
+                (float(row[0]), float(row[1]))
+                for row in asks or []
+                if isinstance(row, (list, tuple)) and len(row) >= 2
+            ]
+            if bid_levels and ask_levels:
+                best_bid = bid_levels[0][0]
+                best_ask = ask_levels[0][0]
+                mid = (best_bid + best_ask) / 2.0
+                bid_depth = sum(price * qty for price, qty in bid_levels)
+                ask_depth = sum(price * qty for price, qty in ask_levels)
+                context.update({
+                    'futures_best_bid': best_bid,
+                    'futures_best_ask': best_ask,
+                    'futures_spread_pct': (best_ask - best_bid) / max(abs(mid), 1e-9) * 100.0,
+                    'bid_depth_usdt': bid_depth,
+                    'ask_depth_usdt': ask_depth,
+                    'orderbook_imbalance_pct': (bid_depth - ask_depth) / max(bid_depth + ask_depth, 1e-9) * 100.0,
+                })
+        except Exception as exc:
+            context.setdefault('futures_context_error', f"depth: {exc}")
+
+        try:
+            oi_hist = await self.ctrl._fetch_binance_public_json('/futures/data/openInterestHist', {'symbol': rest_symbol, 'period': '15m', 'limit': 2})
+            if isinstance(oi_hist, list) and len(oi_hist) >= 2:
+                rows = sorted(oi_hist, key=lambda row: int(row.get('timestamp', 0) or 0))
+                start = _safe_float_or_none(rows[-2].get('sumOpenInterestValue') or rows[-2].get('sumOpenInterest'))
+                end = _safe_float_or_none(rows[-1].get('sumOpenInterestValue') or rows[-1].get('sumOpenInterest'))
+                if start and end is not None:
+                    context['open_interest_delta_pct'] = (float(end) - float(start)) / max(abs(float(start)), 1e-9) * 100.0
+        except Exception as exc:
+            context.setdefault('futures_context_error', f"openInterestHist: {exc}")
+
+        try:
+            taker_rows = await self.ctrl._fetch_binance_public_json('/futures/data/takerlongshortRatio', {'symbol': rest_symbol, 'period': '15m', 'limit': 1})
+            if isinstance(taker_rows, list) and taker_rows:
+                latest = taker_rows[-1]
+                context.update({
+                    'taker_buy_sell_ratio': _safe_float_or_none(latest.get('buySellRatio')),
+                    'taker_buy_vol': _safe_float_or_none(latest.get('buyVol')),
+                    'taker_sell_vol': _safe_float_or_none(latest.get('sellVol')),
+                })
+        except Exception as exc:
+            context.setdefault('futures_context_error', f"takerlongshortRatio: {exc}")
+
+        try:
+            ratio_rows = await self.ctrl._fetch_binance_public_json('/futures/data/globalLongShortAccountRatio', {'symbol': rest_symbol, 'period': '15m', 'limit': 1})
+            if isinstance(ratio_rows, list) and ratio_rows:
+                latest = ratio_rows[-1]
+                context.update({
+                    'long_short_ratio': _safe_float_or_none(latest.get('longShortRatio')),
+                    'long_account': _safe_float_or_none(latest.get('longAccount')),
+                    'short_account': _safe_float_or_none(latest.get('shortAccount')),
+                })
+        except Exception as exc:
+            context.setdefault('futures_context_error', f"globalLongShortAccountRatio: {exc}")
+
+        if context.get('mark_price') is not None and context.get('index_price') is not None:
+            try:
+                context['basis_pct'] = (
+                    (float(context['mark_price']) - float(context['index_price']))
+                    / max(abs(float(context['index_price'])), 1e-9)
+                    * 100.0
+                )
+            except (TypeError, ValueError):
+                pass
+        context.update(self._prediction_context_for_futures_symbol(symbol))
         clean_context = {key: value for key, value in context.items() if value is not None}
         self.utbreakout_futures_context_cache[symbol] = {'cached_at': now, 'data': clean_context}
         return clean_context
@@ -18173,11 +18535,11 @@ UT: `K={float(cfg.get('utbot_key_value', 2.5) or 2.5):.2f}` / `ATR={int(cfg.get(
 AUTO 최근 선택 이유:
 `{auto_reason}`
 
-실거래 연결 Set 1~50 (아래는 빠른 버튼용 Set 1~10 요약):
+실거래 연결 Set 1~60 (아래는 빠른 버튼용 Set 1~10 요약):
 ```
 {active_set_lines}
 ```
-Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설명은 `/utbreakout sets 1~5`, 수동 선택은 `/utbreakout set 27`처럼 입력하세요.
+Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설명은 `/utbreakout sets 1~6`, 수동 선택은 `/utbreakout set 57`처럼 입력하세요.
 
 최근 진단({first_symbol}): `{last_reason}`
 진단 요약:
@@ -18190,8 +18552,8 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 `/utbreakout off` - UTBOT으로 복귀
 `/utbreakout auto on` / `auto off` - AUTO set 선택 ON/OFF
 `/utbreakout adaptive on` / `adaptive off` - Adaptive 시간봉 전략 ON/OFF
-`/utbreakout set 27` 또는 `set27` - Set 1~50 수동 적용
-`/utbreakout sets` - 50개 set 설명 보기
+`/utbreakout set 57` 또는 `set57` - Set 1~60 수동 적용
+`/utbreakout sets` - 60개 set 설명 보기
 `/utbreakout why` - 최근 AUTO 선택 이유 보기
 `/utbreakout risk 5` - 1회 최대 손실 5 USDT로 설정
 `/utbreakout riskpct 1` - 잔고 대비 손실 기준 1%로 설정
@@ -18403,8 +18765,8 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
             end_id = min(60, start_id + 9)
             lines = [
                 f"📚 UT Breakout 60-Set 카탈로그 ({page}/6)",
-                "Set 1~50은 AUTO 후보/수동 선택/실거래 판단에 연결되어 있습니다.",
-                "Set 51~60은 Prediction 기반 Futures research_only 세트라 상태/로그에만 표시되고 실주문에는 연결하지 않습니다.",
+                "Set 1~60은 AUTO 후보/수동 선택/실거래 판단에 연결되어 있습니다.",
+                "Set 51~60은 Futures public data + Prediction scan 데이터가 없으면 진입을 차단합니다.",
                 "",
             ]
             for set_id in range(start_id, end_id + 1):
@@ -18586,7 +18948,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 set_text = str(set_arg or '').strip().lower()
                 set_id = 1 if set_text == 'aggressive' else 7 if set_text == 'conservative' else normalize_utbreakout_set_id(set_arg, UTBREAKOUT_DEFAULT_SET_ID)
                 if set_id > UTBREAKOUT_ACTIVE_SET_MAX:
-                    await u.message.reply_text("❌ 현재 선택 가능한 범위는 Set 1~50입니다.")
+                    await u.message.reply_text("❌ 현재 선택 가능한 범위는 Set 1~60입니다.")
                     return
                 profile_cfg = _merge_utbreakout_profile_with_preserved_settings(f"set{set_id}")
                 await self.cfg.update_value(
@@ -18825,7 +19187,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 set_arg = value if action == 'set' else action
                 set_id = normalize_utbreakout_set_id(set_arg, UTBREAKOUT_DEFAULT_SET_ID)
                 if set_id > UTBREAKOUT_ACTIVE_SET_MAX:
-                    await _edit_utbreakout_menu(query, "❌ 현재 선택 가능한 범위는 Set 1~50입니다.")
+                    await _edit_utbreakout_menu(query, "❌ 현재 선택 가능한 범위는 Set 1~60입니다.")
                     return
                 profile_cfg = _merge_utbreakout_profile_with_preserved_settings(f"set{set_id}")
                 await self.cfg.update_value(
@@ -20210,7 +20572,7 @@ Set 11~50도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
         def _format_prediction_futures_sets_text():
             lines = [
                 "Futures Prediction Research Sets",
-                "Set51~60 are registered in UT Breakout as research_only/planned. They are not selectable for live entry.",
+                "Set51~60 are now active UT Breakout futures sets. They require Binance Futures public data and, for odds-based sets, recent Prediction scan data.",
                 "",
             ]
             for set_id in range(51, 61):
