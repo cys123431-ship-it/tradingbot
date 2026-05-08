@@ -18467,7 +18467,7 @@ class MainController:
         kb = [
             [KeyboardButton("🚨 STOP"), KeyboardButton("⏸ PAUSE"), KeyboardButton("▶ RESUME")],
             [KeyboardButton("/setup"), KeyboardButton("/utbreakout"), KeyboardButton("/coinscan")],
-            [KeyboardButton("/microauto"), KeyboardButton("/prediction")],
+            [KeyboardButton("/customcoins"), KeyboardButton("/microauto"), KeyboardButton("/prediction")],
             [KeyboardButton("/status"), KeyboardButton("/history"), KeyboardButton("/stats")],
             [KeyboardButton("/log"), KeyboardButton("/help")]
         ]
