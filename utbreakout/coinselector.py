@@ -21,6 +21,9 @@ DEFAULT_EXCLUDED_SECTORS = {
 DEFAULT_COIN_SELECTOR_CONFIG = {
     "enabled": True,
     "auto_apply_watchlist": False,
+    "custom_universe_enabled": False,
+    "custom_symbols": [],
+    "custom_relax_discovery": True,
     "min_quote_volume_usdt": 100_000_000.0,
     "ideal_quote_volume_usdt": 1_000_000_000.0,
     "min_trade_count": 20_000,
@@ -112,6 +115,44 @@ def normalize_symbol(symbol):
 def symbol_base(symbol):
     normalized = normalize_symbol(symbol)
     return normalized.split("/", 1)[0] if "/" in normalized else normalized
+
+
+def normalize_custom_symbol(symbol, default_quote="USDT"):
+    text = str(symbol or "").strip().upper()
+    if not text:
+        return ""
+    quote = str(default_quote or "USDT").strip().upper() or "USDT"
+    normalized = normalize_symbol(text)
+    if not normalized:
+        return ""
+    if "/" not in normalized:
+        normalized = f"{normalized}/{quote}"
+    base, raw_quote = normalized.split("/", 1)
+    raw_quote = raw_quote.split(":", 1)[0]
+    return f"{base}/{raw_quote}"
+
+
+def normalize_custom_symbols(symbols, default_quote="USDT"):
+    if symbols is None:
+        raw_items = []
+    elif isinstance(symbols, str):
+        text = symbols
+        for sep in (",", ";", "\n", "\t"):
+            text = text.replace(sep, " ")
+        raw_items = text.split()
+    elif isinstance(symbols, (list, tuple, set)):
+        raw_items = list(symbols)
+    else:
+        raw_items = [symbols]
+
+    result = []
+    seen = set()
+    for item in raw_items:
+        normalized = normalize_custom_symbol(item, default_quote)
+        if normalized and normalized not in seen:
+            result.append(normalized)
+            seen.add(normalized)
+    return result
 
 
 def _info_value(container, key, default=None):

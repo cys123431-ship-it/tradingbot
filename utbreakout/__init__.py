@@ -6,6 +6,8 @@ from .coinselector import (
     build_selection_report,
     default_coin_selector_config,
     finalize_candidate,
+    normalize_custom_symbol,
+    normalize_custom_symbols,
     rank_candidates,
     sector_tags_for_symbol,
 )
@@ -28,6 +30,8 @@ __all__ = [
     "finalize_candidate",
     "format_research_summary",
     "HTF_MAP",
+    "normalize_custom_symbol",
+    "normalize_custom_symbols",
     "MICRO_AUTO_STRATEGY_KEY",
     "assess_micro_market_feasibility",
     "build_micro_entry_plan",

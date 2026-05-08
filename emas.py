@@ -51,6 +51,7 @@ from utbreakout.coinselector import (
     build_selection_report as build_coin_selector_report,
     default_coin_selector_config,
     finalize_candidate as finalize_coin_selector_candidate,
+    normalize_custom_symbols as normalize_coin_selector_custom_symbols,
     sector_tags_for_symbol as coin_selector_sector_tags_for_symbol,
 )
 from utbreakout.research import format_research_summary
@@ -1173,9 +1174,28 @@ class TradingConfig:
             if key not in coin_selector_cfg:
                 coin_selector_cfg[key] = value
                 changed = True
-        for list_key in ('excluded_sectors', 'blacklist'):
+        for list_key in ('excluded_sectors', 'blacklist', 'custom_symbols'):
             if not isinstance(coin_selector_cfg.get(list_key), list):
                 coin_selector_cfg[list_key] = list(coin_selector_defaults[list_key])
+                changed = True
+        normalized_custom_symbols = normalize_coin_selector_custom_symbols(coin_selector_cfg.get('custom_symbols'))
+        if coin_selector_cfg.get('custom_symbols') != normalized_custom_symbols:
+            coin_selector_cfg['custom_symbols'] = normalized_custom_symbols
+            changed = True
+        for bool_key in ('enabled', 'auto_apply_watchlist', 'custom_universe_enabled', 'custom_relax_discovery'):
+            value = coin_selector_cfg.get(bool_key, coin_selector_defaults.get(bool_key, False))
+            if isinstance(value, bool):
+                normalized_bool = value
+            else:
+                text = str(value).strip().lower()
+                if text in {'1', 'true', 'yes', 'on', 'enable', 'enabled'}:
+                    normalized_bool = True
+                elif text in {'0', 'false', 'no', 'off', 'disable', 'disabled'}:
+                    normalized_bool = False
+                else:
+                    normalized_bool = bool(coin_selector_defaults.get(bool_key, False))
+            if coin_selector_cfg.get(bool_key) != normalized_bool:
+                coin_selector_cfg[bool_key] = normalized_bool
                 changed = True
         if not isinstance(coin_selector_cfg.get('sector_overrides'), dict):
             coin_selector_cfg['sector_overrides'] = {}
@@ -9287,7 +9307,7 @@ class SignalEngine(BaseEngine):
             if text in {'0', 'false', 'no', 'off', 'disable', 'disabled'}:
                 return False
             return default
-        for key in ('enabled', 'auto_apply_watchlist'):
+        for key in ('enabled', 'auto_apply_watchlist', 'custom_universe_enabled', 'custom_relax_discovery'):
             cfg[key] = _bool_value(cfg.get(key), bool(default_coin_selector_config().get(key, False)))
         for key in ('excluded_sectors', 'blacklist'):
             value = cfg.get(key, [])
@@ -9297,6 +9317,7 @@ class SignalEngine(BaseEngine):
                 cfg[key] = [str(item).strip() for item in value if str(item).strip()]
             else:
                 cfg[key] = []
+        cfg['custom_symbols'] = normalize_coin_selector_custom_symbols(cfg.get('custom_symbols'))
         if not isinstance(cfg.get('sector_overrides'), dict):
             cfg['sector_overrides'] = {}
         for key, default in {
@@ -9393,7 +9414,10 @@ class SignalEngine(BaseEngine):
             return report
 
         coin_report = await self.evaluate_coin_selector(force=force)
-        selected = list((coin_report or {}).get('selected') or [])
+        selected = [
+            item for item in list((coin_report or {}).get('selected') or [])
+            if item.get('selection_state') == 'SELECTED'
+        ]
         markets = await self._load_coin_selector_markets()
         feasible = []
         rejected = []
@@ -9761,6 +9785,16 @@ class SignalEngine(BaseEngine):
                 return markets[key]
         return None
 
+    def _coin_selector_exchange_symbol_for_custom(self, symbol, markets):
+        normalized = normalize_coin_selector_custom_symbols([symbol])
+        normalized = normalized[0] if normalized else str(symbol or '').strip().upper()
+        market = self._coin_selector_market_for_symbol(normalized, markets)
+        if isinstance(market, dict) and market.get('symbol'):
+            return market.get('symbol')
+        if normalized.endswith('/USDT'):
+            return f"{normalized}:USDT"
+        return normalized
+
     async def _score_coin_selector_candidate(self, base_candidate, cfg, strategy_params):
         symbol = base_candidate.get('exchange_symbol') or base_candidate.get('symbol')
         try:
@@ -9802,13 +9836,19 @@ class SignalEngine(BaseEngine):
             result['selection_state'] = 'REJECTED'
             return result
 
-    async def evaluate_coin_selector(self, *, force=False):
+    async def evaluate_coin_selector(self, *, force=False, custom_universe_override=False):
         cfg = self._get_coin_selector_config()
+        custom_symbols = normalize_coin_selector_custom_symbols(cfg.get('custom_symbols'))
+        custom_enabled = bool(cfg.get('custom_universe_enabled', False)) or bool(custom_universe_override)
         now = time.time()
         cached = self.coin_selector_last_result if isinstance(self.coin_selector_last_result, dict) else {}
         refresh_interval = float(cfg.get('refresh_interval_seconds', 300.0) or 300.0)
         if (not force) and cached and (now - float(cached.get('generated_at_ts', 0) or 0)) < refresh_interval:
-            return cached
+            cached_cfg = cached.get('criteria') if isinstance(cached.get('criteria'), dict) else {}
+            cached_custom = bool(cached_cfg.get('custom_universe_enabled', False))
+            cached_symbols = normalize_coin_selector_custom_symbols(cached_cfg.get('custom_symbols'))
+            if cached_custom == custom_enabled and (not custom_enabled or cached_symbols == custom_symbols):
+                return cached
 
         if self.is_upbit_mode():
             report = {
@@ -9824,25 +9864,76 @@ class SignalEngine(BaseEngine):
             self.coin_selector_symbol_scores = {}
             return report
 
-        tickers = await asyncio.to_thread(self.market_data_exchange.fetch_tickers)
         markets = await self._load_coin_selector_markets()
+        if custom_enabled and not custom_symbols:
+            report = {
+                'generated_at_ts': now,
+                'generated_at': datetime.now(timezone.utc).isoformat(),
+                'selected': [],
+                'reject_counts': {'REJECTED_CUSTOM_SYMBOLS_EMPTY': 1},
+                'total_scored': 0,
+                'total_rejected': 0,
+                'criteria': dict(cfg, custom_universe_enabled=True, custom_symbols=[]),
+                'analysis_limit': 0,
+                'total_base_candidates': 0,
+                'total_unanalyzed': 0,
+                'note': '커스텀 코인 목록이 비어 있습니다.',
+            }
+            self.coin_selector_last_result = report
+            self.coin_selector_symbol_scores = {}
+            return report
+
+        ticker_items = []
+        if custom_enabled:
+            for requested_symbol in custom_symbols:
+                exchange_symbol = self._coin_selector_exchange_symbol_for_custom(requested_symbol, markets)
+                try:
+                    ticker = await asyncio.to_thread(self.market_data_exchange.fetch_ticker, exchange_symbol)
+                    ticker_items.append((exchange_symbol, ticker))
+                except Exception as exc:
+                    ticker_items.append((
+                        exchange_symbol,
+                        {
+                            'coin_selector_fetch_error': str(exc),
+                            'quoteVolume': 0.0,
+                            'percentage': 0.0,
+                            'count': 0,
+                        }
+                    ))
+        else:
+            tickers = await asyncio.to_thread(self.market_data_exchange.fetch_tickers)
+            ticker_items = list((tickers or {}).items())
+
         accepted_base = []
         rejected = []
-        for symbol, ticker in (tickers or {}).items():
+        for symbol, ticker in ticker_items:
             market = self._coin_selector_market_for_symbol(symbol, markets)
             tags = coin_selector_sector_tags_for_symbol(symbol, cfg.get('sector_overrides'))
-            candidate = build_coin_selector_base_candidate(symbol, ticker, market, cfg, tags)
+            candidate_cfg = cfg
+            if custom_enabled and bool(cfg.get('custom_relax_discovery', True)):
+                candidate_cfg = dict(cfg)
+                candidate_cfg['min_quote_volume_usdt'] = 0.0
+                candidate_cfg['min_trade_count'] = 0
+            candidate = build_coin_selector_base_candidate(symbol, ticker, market, candidate_cfg, tags)
+            if custom_enabled:
+                candidate['custom_universe'] = True
+                candidate['custom_discovery_relaxed'] = bool(cfg.get('custom_relax_discovery', True))
+            if isinstance(ticker, dict) and ticker.get('coin_selector_fetch_error'):
+                candidate['accepted'] = False
+                candidate.setdefault('reject_reasons', []).append('REJECTED_TICKER_UNAVAILABLE')
+                candidate['analysis_error'] = ticker.get('coin_selector_fetch_error')
             if candidate.get('accepted'):
                 accepted_base.append(candidate)
             else:
                 rejected.append(candidate)
 
-        accepted_base.sort(
-            key=lambda item: float(item.get('quote_volume', 0.0) or 0.0),
-            reverse=True
-        )
+        if not custom_enabled:
+            accepted_base.sort(
+                key=lambda item: float(item.get('quote_volume', 0.0) or 0.0),
+                reverse=True
+            )
         strategy_params = self.get_runtime_strategy_params()
-        analysis_limit = int(cfg.get('analysis_limit', 20) or 20)
+        analysis_limit = len(accepted_base) if custom_enabled else int(cfg.get('analysis_limit', 20) or 20)
         scored = []
         analysis_errors = []
         for candidate in accepted_base[:analysis_limit]:
@@ -9857,10 +9948,12 @@ class SignalEngine(BaseEngine):
         report.update({
             'generated_at_ts': now,
             'generated_at': datetime.now(timezone.utc).isoformat(),
-            'criteria': cfg,
+            'criteria': dict(cfg, custom_universe_enabled=custom_enabled, custom_symbols=custom_symbols),
             'analysis_limit': analysis_limit,
             'total_base_candidates': len(accepted_base),
             'total_unanalyzed': max(0, len(accepted_base) - analysis_limit),
+            'custom_universe_enabled': custom_enabled,
+            'custom_symbols': custom_symbols if custom_enabled else [],
         })
         selected = report.get('selected', [])
         self.coin_selector_symbol_scores = {}
@@ -18388,7 +18481,7 @@ class MainController:
         markup = self._build_main_keyboard()
         text_filter = filters.TEXT & ~filters.COMMAND
         setup_trigger_pattern = r"^/setup(?:@[A-Za-z0-9_]+)?$"
-        menu_trigger_pattern = r"^/(status|history|log|help|stats|close|utbreakout|coinscan|microauto|prediction)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
+        menu_trigger_pattern = r"^/(status|history|log|help|stats|close|utbreakout|coinscan|customcoins|microauto|prediction)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
         setup_text_filter = text_filter & ~filters.Regex(r"^/")
 
         async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -19690,6 +19783,220 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 return
             await _edit_coinscan_menu(query)
 
+        def _customcoins_cfg():
+            cfg = _coinscan_cfg()
+            cfg['custom_symbols'] = normalize_coin_selector_custom_symbols(cfg.get('custom_symbols'))
+            return cfg
+
+        def _build_customcoins_keyboard():
+            return InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("ON", callback_data="cc:on"),
+                    InlineKeyboardButton("OFF", callback_data="cc:off")
+                ],
+                [
+                    InlineKeyboardButton("SCAN", callback_data="cc:scan"),
+                    InlineKeyboardButton("CLEAR", callback_data="cc:clear")
+                ],
+                [
+                    InlineKeyboardButton("새로고침", callback_data="cc:status")
+                ]
+            ])
+
+        def _format_customcoins_status(report=None):
+            cfg = _customcoins_cfg()
+            symbols = normalize_coin_selector_custom_symbols(cfg.get('custom_symbols'))
+            selected = list((report or {}).get('selected') or [])
+            reject_counts = (report or {}).get('reject_counts') or {}
+            lines = [
+                "🎯 CustomCoins AUTO",
+                "",
+                f"상태: {'ON' if cfg.get('custom_universe_enabled') else 'OFF'}",
+                f"코인: {', '.join(symbols) if symbols else '없음'}",
+                "모드: 지정 코인만 후보 풀로 사용 + 60-set AUTO + Adaptive TF",
+                "완화: 거래대금/체결수 발견 기준만 완화, 진입/리스크 기준 유지",
+            ]
+            if report:
+                lines.extend([
+                    "",
+                    f"스캔: base {report.get('total_base_candidates', 0)}개 / scored {report.get('total_scored', 0)}개 / rejected {report.get('total_rejected', 0)}개",
+                ])
+                if selected:
+                    lines.append("후보:")
+                    for idx, item in enumerate(selected[:8], 1):
+                        lines.append(
+                            f"{idx}. {item.get('normalized_symbol') or item.get('symbol')} "
+                            f"score {float(item.get('score', 0) or 0):.1f} / "
+                            f"state `{item.get('selection_state')}` / "
+                            f"Set{item.get('auto_set_id') or '?'} / TF {item.get('adaptive_tf')}"
+                        )
+                else:
+                    lines.append("후보: 없음")
+                if reject_counts:
+                    lines.append(f"제외 사유: {', '.join(f'{k}:{v}' for k, v in reject_counts.items())}")
+            lines.extend([
+                "",
+                "명령: `/customcoins on BTC ETH SOL`, `/customcoins off`, `/customcoins scan`, `/customcoins clear`",
+            ])
+            return "\n".join(lines).strip()
+
+        def _clear_coin_selector_runtime_cache():
+            engine = self.engines.get('signal')
+            if not engine:
+                return
+            engine.coin_selector_last_result = {}
+            engine.coin_selector_symbol_scores = {}
+            engine.coin_selector_last_run_ts = 0.0
+            engine.micro_auto_last_scan = {}
+
+        async def _enable_customcoins(symbols):
+            normalized = normalize_coin_selector_custom_symbols(symbols)
+            if not normalized:
+                return False, "❌ 코인을 입력하세요. 예: `BTC ETH SOL`"
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_symbols'], normalized)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_relax_discovery'], True)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'], 'auto')
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'auto_select_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], True)
+            _clear_coin_selector_runtime_cache()
+            self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
+            return True, f"✅ CustomCoins AUTO ON: {', '.join(normalized)}"
+
+        async def _disable_customcoins():
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
+            _clear_coin_selector_runtime_cache()
+            return "✅ CustomCoins AUTO OFF. 코인 목록은 보존했습니다."
+
+        async def _clear_customcoins():
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_symbols'], [])
+            _clear_coin_selector_runtime_cache()
+            return "✅ CustomCoins 목록을 비우고 OFF로 전환했습니다."
+
+        async def _run_customcoins_scan(force=True):
+            engine = self.engines.get('signal')
+            if not engine:
+                return {
+                    'selected': [],
+                    'reject_counts': {'NO_SIGNAL_ENGINE': 1},
+                    'criteria': _customcoins_cfg(),
+                    'note': 'Signal 엔진을 찾을 수 없습니다.',
+                }
+            return await engine.evaluate_coin_selector(force=force, custom_universe_override=True)
+
+        async def _prompt_customcoins_input(message_or_query, context):
+            if context and context.user_data is not None:
+                context.user_data['customcoins_waiting_for_symbols'] = True
+            text = "코인을 입력하세요. 예: `BTC ETH SOL`"
+            if hasattr(message_or_query, 'edit_message_text'):
+                await message_or_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+            else:
+                await message_or_query.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+        async def _handle_customcoins_symbol_text(message, context, text):
+            symbols = normalize_coin_selector_custom_symbols(text)
+            if not symbols:
+                if context and context.user_data is not None:
+                    context.user_data['customcoins_waiting_for_symbols'] = True
+                await message.reply_text("❌ 코인을 인식하지 못했습니다. 예: `BTC ETH SOL`", parse_mode=ParseMode.MARKDOWN)
+                return
+            _, notice = await _enable_customcoins(symbols)
+            await message.reply_text(
+                f"{notice}\n\n{_format_customcoins_status()}",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=_build_customcoins_keyboard()
+            )
+
+        async def customcoins_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            args = list(getattr(c, 'args', []) or [])
+            if not args and u and u.message and u.message.text:
+                parts = u.message.text.strip().split()
+                args = parts[1:]
+            action = str(args[0]).strip().lower() if args else ''
+
+            if action in {'on', 'enable', 'start'}:
+                if len(args) > 1:
+                    _, notice = await _enable_customcoins(args[1:])
+                    await u.message.reply_text(
+                        f"{notice}\n\n{_format_customcoins_status()}",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=_build_customcoins_keyboard()
+                    )
+                    return
+                await _prompt_customcoins_input(u.message, c)
+                return
+            if action in {'off', 'disable', 'stop'}:
+                notice = await _disable_customcoins()
+                await u.message.reply_text(
+                    f"{notice}\n\n{_format_customcoins_status()}",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=_build_customcoins_keyboard()
+                )
+                return
+            if action in {'clear', 'reset'}:
+                notice = await _clear_customcoins()
+                await u.message.reply_text(
+                    f"{notice}\n\n{_format_customcoins_status()}",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=_build_customcoins_keyboard()
+                )
+                return
+            if action in {'scan', 'top', 'refresh'}:
+                report = await _run_customcoins_scan(force=True)
+                await u.message.reply_text(
+                    _format_customcoins_status(report),
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=_build_customcoins_keyboard()
+                )
+                return
+            await self._reply_markdown_safe(u.message, _format_customcoins_status(), reply_markup=_build_customcoins_keyboard())
+
+        async def customcoins_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            query = u.callback_query
+            if not query:
+                return
+            await query.answer()
+            data = str(query.data or '')
+            if not data.startswith('cc:'):
+                return
+            action = data.split(':', 1)[1]
+            if action == 'on':
+                await _prompt_customcoins_input(query, c)
+                return
+            if action == 'off':
+                notice = await _disable_customcoins()
+                await query.edit_message_text(
+                    f"{notice}\n\n{_format_customcoins_status()}",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=_build_customcoins_keyboard()
+                )
+                return
+            if action == 'clear':
+                notice = await _clear_customcoins()
+                await query.edit_message_text(
+                    f"{notice}\n\n{_format_customcoins_status()}",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=_build_customcoins_keyboard()
+                )
+                return
+            if action == 'scan':
+                report = await _run_customcoins_scan(force=True)
+                await query.edit_message_text(
+                    _format_customcoins_status(report),
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=_build_customcoins_keyboard()
+                )
+                return
+            await query.edit_message_text(
+                _format_customcoins_status(),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=_build_customcoins_keyboard()
+            )
+
         def _micro_cfg():
             raw = self.cfg.get('signal_engine', {}).get('micro_auto', {})
             return normalize_micro_auto_config(raw if isinstance(raw, dict) else {})
@@ -20754,6 +21061,7 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 /stats - 통계
 /utbreakout - UTBOT_FILTERED_BREAKOUT_V1 전용 메뉴
 /coinscan - CoinSelector V2 자동 코인 선택 메뉴
+/customcoins - 커스텀 코인 기반 AUTO Set/Adaptive TF 메뉴
 /microauto - 10 USDT 이하 소액 전용 자동매매 메뉴
 /prediction - Prediction Micro Auto / Binance Wallet Prediction(Predict.fun) 메뉴
 /log - 최근 로그
@@ -20779,6 +21087,8 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
         self.tg_app.add_handler(CallbackQueryHandler(utbreakout_callback, pattern=r"^utb:"))
         self.tg_app.add_handler(CommandHandler("coinscan", coinscan_cmd))
         self.tg_app.add_handler(CallbackQueryHandler(coinscan_callback, pattern=r"^cs:"))
+        self.tg_app.add_handler(CommandHandler("customcoins", customcoins_cmd))
+        self.tg_app.add_handler(CallbackQueryHandler(customcoins_callback, pattern=r"^cc:"))
         self.tg_app.add_handler(CommandHandler("microauto", microauto_cmd))
         self.tg_app.add_handler(CallbackQueryHandler(microauto_callback, pattern=r"^ma:"))
         self.tg_app.add_handler(CommandHandler("prediction", prediction_cmd))
@@ -20828,6 +21138,8 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 return await utbreakout_cmd(u, c)
             if command == "/coinscan":
                 return await coinscan_cmd(u, c)
+            if command == "/customcoins":
+                return await customcoins_cmd(u, c)
             if command == "/microauto":
                 return await microauto_cmd(u, c)
             if command == "/prediction":
@@ -20857,7 +21169,11 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
             logger.warning(f"Prediction auto scan scheduler setup failed: {e}")
 
         async def manual_symbol_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-            text = u.message.text.strip().upper()
+            raw_text = u.message.text.strip()
+            if c and c.user_data is not None and c.user_data.pop('customcoins_waiting_for_symbols', False):
+                await _handle_customcoins_symbol_text(u.message, c, raw_text)
+                return
+            text = raw_text.upper()
             if re.match(r'^[A-Z0-9]{2,15}([/-][A-Z0-9]{2,15})?(:[A-Z0-9]+)?$', text):
                 if text.startswith('/'):
                     return

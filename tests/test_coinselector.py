@@ -3,6 +3,7 @@ from utbreakout.coinselector import (
     build_selection_report,
     default_coin_selector_config,
     finalize_candidate,
+    normalize_custom_symbols,
     rank_candidates,
 )
 
@@ -69,6 +70,40 @@ def test_coinselector_rejects_default_excluded_sector():
 
     assert candidate["accepted"] is False
     assert "REJECTED_EXCLUDED_SECTOR" in candidate["reject_reasons"]
+
+
+def test_custom_symbols_normalize_and_dedupe_to_usdt_pairs():
+    symbols = normalize_custom_symbols("BTC BTCUSDT BTC/USDT BTC/USDT:USDT eth, SOL")
+
+    assert symbols == ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+
+
+def test_custom_discovery_relax_only_volume_and_trade_count():
+    strict_cfg = default_coin_selector_config()
+    relaxed_cfg = dict(strict_cfg)
+    relaxed_cfg["min_quote_volume_usdt"] = 0.0
+    relaxed_cfg["min_trade_count"] = 0
+
+    strict = build_base_candidate("ABC/USDT:USDT", _ticker(quoteVolume=1_000, count=5), _market(), strict_cfg)
+    relaxed = build_base_candidate("ABC/USDT:USDT", _ticker(quoteVolume=1_000, count=5), _market(), relaxed_cfg)
+    non_usdt = build_base_candidate("ABC/USDC:USDC", _ticker(quoteVolume=1_000, count=5), _market(quote="USDC", settle="USDC"), relaxed_cfg)
+    blacklisted = build_base_candidate(
+        "ABC/USDT:USDT",
+        _ticker(quoteVolume=1_000, count=5),
+        _market(),
+        {**relaxed_cfg, "blacklist": ["ABC/USDT"]},
+    )
+    wide_spread = build_base_candidate("ABC/USDT:USDT", _ticker(quoteVolume=1_000, count=5, ask=101.0), _market(), relaxed_cfg)
+
+    assert strict["accepted"] is False
+    assert "REJECTED_VOLUME_LOW" in strict["reject_reasons"]
+    assert relaxed["accepted"] is True
+    assert non_usdt["accepted"] is False
+    assert "REJECTED_NOT_USDT_PERPETUAL_TRADING" in non_usdt["reject_reasons"]
+    assert blacklisted["accepted"] is False
+    assert "REJECTED_BLACKLIST" in blacklisted["reject_reasons"]
+    assert wide_spread["accepted"] is False
+    assert "REJECTED_SPREAD_WIDE" in wide_spread["reject_reasons"]
 
 
 def test_coinselector_scores_utbreakout_set_and_adaptive_tf():
