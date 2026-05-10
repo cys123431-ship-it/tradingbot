@@ -19198,6 +19198,9 @@ class MainController:
             active_symbols = set(engine.active_symbols or set()) if engine else set()
             cached_positions = getattr(engine, 'all_positions_cache', None) if engine else None
             direction = self.get_effective_trade_direction()
+            scanner_on = bool(common_cfg.get('scanner_enabled', False))
+            selector_on = bool(coin_cfg.get('enabled', False))
+            custom_on = bool(coin_cfg.get('custom_universe_enabled', False))
             warnings = []
 
             if self.cfg.get('system_settings', {}).get('active_engine', CORE_ENGINE) != CORE_ENGINE:
@@ -19210,11 +19213,15 @@ class MainController:
                 warnings.append(f"현재 전략은 {active_strategy.upper()}입니다. UTBot ON을 눌러 전환하세요.")
             if strategy_key == 'utbreak' and active_strategy not in UTBREAKOUT_STRATEGIES:
                 warnings.append(f"현재 전략은 {active_strategy.upper()}입니다. UTBreak ON을 눌러 전환하세요.")
-            if strategy_key in {'utbot', 'utbreak'} and bool(common_cfg.get('scanner_enabled', False)):
+            if strategy_key == 'utbreak' and scanner_on and selector_on and not custom_on:
+                warnings.append("코인 자동 선택 ON: Binance Futures 전체 후보 중 lock-in 모드입니다.")
+            elif strategy_key == 'utbreak' and scanner_on and selector_on and custom_on:
+                warnings.append("AUTO 후보 스캔 ON: 입력한 후보군 안에서 lock-in 모드입니다.")
+            elif strategy_key in {'utbot', 'utbreak'} and scanner_on:
                 warnings.append("scanner ON: watchlist 직접 진입이 아니라 후보 lock-in 방식입니다.")
-            if strategy_key in {'utbot', 'utbreak'} and bool(coin_cfg.get('enabled', False)):
+            if strategy_key in {'utbot', 'utbreak'} and selector_on and not scanner_on:
                 warnings.append("CoinSelector ON: 전략 메뉴의 단일코인/직접감시와 충돌할 수 있습니다.")
-            if strategy_key in {'utbot', 'utbreak'} and bool(coin_cfg.get('custom_universe_enabled', False)):
+            if strategy_key in {'utbot', 'utbreak'} and custom_on and not scanner_on:
                 warnings.append("Custom universe ON: 지정 코인 후보 스캔 모드입니다.")
             if strategy_key == 'utbreak' and micro_cfg.get('enabled') and (micro_cfg.get('dry_run') or not micro_cfg.get('live_enabled')):
                 warnings.append("Micro Auto dry-run/live-lock: 조건이 맞아도 주문을 보내지 않습니다.")
@@ -19241,14 +19248,26 @@ class MainController:
             watchlist = self.get_active_watchlist()
             coin_cfg = sig_cfg.get('coin_selector', {}) or {}
             micro_cfg = normalize_micro_auto_config(sig_cfg.get('micro_auto', {}) if isinstance(sig_cfg.get('micro_auto', {}), dict) else {})
+            scanner_on = bool(common_cfg.get('scanner_enabled', False))
+            selector_on = bool(coin_cfg.get('enabled', False))
+            custom_on = bool(coin_cfg.get('custom_universe_enabled', False))
+            if scanner_on and selector_on and not custom_on:
+                coin_mode = '코인 자동 선택'
+            elif scanner_on and selector_on and custom_on:
+                coin_mode = 'AUTO 후보'
+            elif scanner_on:
+                coin_mode = 'scanner'
+            else:
+                coin_mode = '직접감시'
             return "\n".join([
                 f"전략: `{active_strategy.upper()}`",
                 f"매매: `{'PAUSE' if self.is_paused else 'RUNNING'}` | 방향 `{self.get_effective_trade_direction().upper()}`",
                 f"코인: `{', '.join(watchlist) if watchlist else '없음'}`",
+                f"코인선택: `{coin_mode}`",
                 f"레버리지: `{int(float(common_cfg.get('leverage', 10) or 10))}x`",
                 f"TF: 진입 `{common_cfg.get('entry_timeframe', common_cfg.get('timeframe', '15m'))}` / 청산 `{common_cfg.get('exit_timeframe', '4h')}`",
                 f"TP/SL: TP `{'ON' if common_cfg.get('take_profit_enabled', True) else 'OFF'} {float(common_cfg.get('target_roe_pct', 20) or 20):.1f}%` / SL `{'ON' if common_cfg.get('stop_loss_enabled', True) else 'OFF'} {float(common_cfg.get('stop_loss_pct', 10) or 10):.1f}%`",
-                f"Scanner/CoinSelector: `{'ON' if common_cfg.get('scanner_enabled', False) else 'OFF'}` / `{'ON' if coin_cfg.get('enabled', False) else 'OFF'}`",
+                f"Scanner/CoinSelector: `{'ON' if scanner_on else 'OFF'}` / `{'ON' if selector_on else 'OFF'}`",
                 f"Micro Auto: `{'ON' if micro_cfg.get('enabled') else 'OFF'}`",
                 _format_warning_block(strategy_key),
             ])
@@ -19652,6 +19671,7 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 
 명령:
 `/utbreak on`, `/utbreak coin EWY`, `/utbreak autoscan on BTC ETH`, `/utbreak autoscan off`
+`/utbreak coinauto on`, `/utbreak coinauto off` - 코인 자동 선택 ON/OFF
 `/utbreak lev 10`, `/utbreak tf 15m`, `/utbreak exit_tf 1h`, `/utbreak target 20`, `/utbreak stop 10`
 `/utbreak auto on` / `auto off` - AUTO set 선택 ON/OFF
 `/utbreak adaptive on` / `adaptive off` - Adaptive 시간봉 전략 ON/OFF
@@ -19678,6 +19698,10 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                     InlineKeyboardButton("AUTO후보 ON", callback_data="utb:auto_scan"),
                     InlineKeyboardButton("AUTO후보 OFF", callback_data="utb:auto_scan_off"),
                     InlineKeyboardButton("AUTO 이유", callback_data="utb:why")
+                ],
+                [
+                    InlineKeyboardButton("코인 자동 선택 ON", callback_data="utb:coin_auto:on"),
+                    InlineKeyboardButton("코인 자동 선택 OFF", callback_data="utb:coin_auto:off")
                 ],
                 [
                     InlineKeyboardButton("Lev 5x", callback_data="utb:lev:5"),
@@ -20121,6 +20145,15 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 else:
                     await u.message.reply_text("❌ 예: `/utbreak autoscan on BTC ETH SOL` 또는 `/utbreak autoscan off`", parse_mode=ParseMode.MARKDOWN)
                     return
+            elif action in {'coinauto', 'coin_auto', 'coinselect', 'coin_select', 'autocoin', 'auto_coin'}:
+                mode = str(args[1]).strip().lower() if len(args) > 1 else ''
+                if mode in {'on', 'enable', 'start', '1'}:
+                    await u.message.reply_text(await _enable_coin_auto_selection(), parse_mode=ParseMode.MARKDOWN)
+                elif mode in {'off', 'disable', 'stop', '0'}:
+                    await u.message.reply_text(await _disable_coin_auto_selection(), parse_mode=ParseMode.MARKDOWN)
+                else:
+                    await u.message.reply_text("❌ 예: `/utbreak coinauto on` 또는 `/utbreak coinauto off`", parse_mode=ParseMode.MARKDOWN)
+                    return
             elif action in {'lev', 'leverage'}:
                 try:
                     value = args[1]
@@ -20432,6 +20465,16 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 
             if action == 'auto_scan_off':
                 await _edit_utbreakout_menu(query, await _disable_customcoins())
+                return
+
+            if action == 'coin_auto':
+                mode = str(value or '').lower()
+                if mode in {'on', 'enable', '1', 'true'}:
+                    await _edit_utbreakout_menu(query, await _enable_coin_auto_selection())
+                elif mode in {'off', 'disable', '0', 'false'}:
+                    await _edit_utbreakout_menu(query, await _disable_coin_auto_selection())
+                else:
+                    await _edit_utbreakout_menu(query, "❌ 코인 자동 선택 버튼 값 처리 실패")
                 return
 
             if action == 'lev':
@@ -21103,7 +21146,7 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                         )
             lines.extend([
                 "",
-                "명령: `/utbreak coin EWY`, `/utbreak coin off`, `/utbreak autoscan on BTC ETH SOL`, `/utbreak autoscan off`",
+                "명령: `/utbreak coin EWY`, `/utbreak coin off`, `/utbreak autoscan on BTC ETH SOL`, `/utbreak coinauto on`, `/utbreak coinauto off`",
             ])
             return "\n".join(lines).strip()
 
@@ -21133,6 +21176,45 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
             _clear_coin_selector_runtime_cache()
             self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
             return True, f"✅ CustomCoins AUTO ON: {', '.join(normalized)}"
+
+        async def _enable_coin_auto_selection():
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol'], '')
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'], 'auto')
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'auto_select_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], True)
+            _clear_coin_selector_runtime_cache()
+            engine = self._reset_signal_engine_runtime_state(
+                reset_entry_cache=True,
+                reset_exit_cache=True,
+                reset_stateful_strategy=True
+            )
+            if engine:
+                engine.scanner_active_symbol = None
+                engine.active_symbols.clear()
+            return "✅ 코인 자동 선택 ON. Binance Futures 전체 후보에서 CoinSelector가 고르고 UTBreak AUTO/Adaptive로 진입합니다."
+
+        async def _disable_coin_auto_selection():
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], False)
+            _clear_coin_selector_runtime_cache()
+            engine = self._reset_signal_engine_runtime_state(
+                reset_entry_cache=True,
+                reset_exit_cache=True,
+                reset_stateful_strategy=True
+            )
+            if engine:
+                engine.scanner_active_symbol = None
+                engine.active_symbols.clear()
+                for item in self.get_active_watchlist():
+                    engine.active_symbols.add(item)
+            return "✅ 코인 자동 선택 OFF. scanner/CoinSelector를 끄고 watchlist 직접감시로 돌아갑니다."
 
         async def _disable_customcoins():
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
