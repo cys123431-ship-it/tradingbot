@@ -6720,6 +6720,566 @@ class SignalEngine(BaseEngine):
         ]
         return "\n".join(text_lines)
 
+    async def build_utbreakout_entry_analysis_text(self, symbol):
+        """Read-only UT Breakout preflight report for Telegram diagnostics."""
+        strategy_params = self.get_runtime_strategy_params()
+        common_cfg = self.get_runtime_common_settings()
+        active_strategy = str(strategy_params.get('active_strategy', 'utbot') or 'utbot').lower()
+        cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+        entry_tf = str(cfg.get('entry_timeframe', '15m') or '15m').lower()
+        htf_tf = str(cfg.get('htf_timeframe', '1h') or '1h').lower()
+        display_symbol = self.ctrl.format_symbol_for_display(symbol)
+
+        def _fmt(value, digits=2):
+            try:
+                if value is None or not np.isfinite(float(value)):
+                    return "n/a"
+                return f"{float(value):.{digits}f}"
+            except (TypeError, ValueError):
+                return "n/a"
+
+        def _fmt_ts(ms):
+            try:
+                ts = int(ms or 0)
+                if ts <= 0:
+                    return "n/a"
+                return datetime.fromtimestamp(ts / 1000, timezone.utc).astimezone(
+                    timezone(timedelta(hours=9))
+                ).strftime('%m-%d %H:%M KST')
+            except Exception:
+                return "n/a"
+
+        def _symbol_key(value):
+            return str(value or '').upper().replace(':USDT', '').replace('/', '').strip()
+
+        def _ok_text(state):
+            if state is True:
+                return "OK"
+            if state is False:
+                return "BLOCK"
+            return "WAIT"
+
+        blockers = []
+        waits = []
+        notes = []
+        symbol_key = _symbol_key(symbol)
+
+        if self.is_upbit_mode():
+            return "UT Breakout 진입 분석\n\n업비트 현물 모드에서는 UTBOT_FILTERED_BREAKOUT_V1을 사용하지 않습니다."
+
+        if self.cfg.get('system_settings', {}).get('active_engine', CORE_ENGINE) != CORE_ENGINE:
+            blockers.append("Signal 엔진이 활성 엔진이 아님")
+        if not self.running:
+            waits.append("SignalEngine running=False")
+        if self.ctrl.is_paused:
+            blockers.append("봇 일시정지 상태")
+        if active_strategy not in UTBREAKOUT_STRATEGIES:
+            blockers.append(f"현재 전략이 UT Breakout이 아님: {active_strategy.upper()}")
+
+        scanner_enabled = bool(common_cfg.get('scanner_enabled', True))
+        watchlist = list(self.get_runtime_watchlist() or [])
+        active_symbols = set(self.active_symbols or set())
+        active_keys = {_symbol_key(item) for item in active_symbols}
+        watch_keys = {_symbol_key(item) for item in watchlist}
+        scanner_active = self.scanner_active_symbol
+        scanner_active_key = _symbol_key(scanner_active)
+        coin_cfg = self._get_coin_selector_config()
+        custom_symbols = normalize_coin_selector_custom_symbols(coin_cfg.get('custom_symbols'))
+        custom_keys = {_symbol_key(item) for item in custom_symbols}
+
+        all_positions = []
+        position_fetch_error = None
+        symbol_position = None
+        other_positions = []
+        try:
+            all_positions = await asyncio.to_thread(self.exchange.fetch_positions)
+            if not isinstance(all_positions, list):
+                all_positions = []
+            for pos in all_positions:
+                try:
+                    contracts = abs(float(pos.get('contracts', 0) or 0))
+                except (TypeError, ValueError):
+                    contracts = 0.0
+                if contracts <= 0:
+                    continue
+                pos_symbol = pos.get('symbol') or ''
+                if _symbol_key(pos_symbol) == symbol_key:
+                    symbol_position = pos
+                else:
+                    other_positions.append(pos)
+        except Exception as exc:
+            position_fetch_error = str(exc)
+            blockers.append(f"포지션 조회 실패: 실제 entry()도 안전상 중단 가능 ({exc})")
+
+        position_keys = {_symbol_key(pos.get('symbol')) for pos in [symbol_position] if isinstance(pos, dict)}
+        target_keys = active_keys | watch_keys | position_keys
+        if scanner_enabled:
+            if scanner_active_key and scanner_active_key == symbol_key:
+                notes.append("scanner ON: 현재 scanner_active_symbol이 이 심볼")
+            elif symbol_position:
+                notes.append("scanner ON: 기존 포지션 안전관리 대상으로 포함")
+            else:
+                blockers.append("scanner ON: EWY가 scanner_active_symbol으로 lock-in되지 않으면 직접 진입 루프가 돌지 않음")
+        else:
+            if symbol_key not in target_keys:
+                blockers.append("scanner OFF지만 watchlist/active_symbols/포지션 대상에 심볼이 없음")
+
+        if symbol_key in custom_keys and not coin_cfg.get('custom_universe_enabled'):
+            notes.append("custom_symbols에는 있으나 custom universe는 OFF")
+
+        if symbol_position:
+            blockers.append(f"동일 심볼 포지션 보유 중: {symbol_position.get('side')}")
+        if other_positions:
+            held = ", ".join(str(pos.get('symbol') or '?') for pos in other_positions[:3])
+            blockers.append(f"단일 포지션 제한: 다른 포지션 보유 중 ({held})")
+
+        try:
+            ohlcv = await asyncio.to_thread(
+                self.market_data_exchange.fetch_ohlcv,
+                symbol,
+                entry_tf,
+                limit=300
+            )
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        except Exception as exc:
+            return (
+                "UT Breakout 진입 분석\n\n"
+                f"심볼: {display_symbol}\n"
+                f"TF: {entry_tf}\n"
+                f"OHLCV 조회 실패: {exc}\n"
+                "이 경우 조건 계산과 실제 진입 모두 진행되지 않습니다."
+            )
+
+        if df is None or len(df) < 5:
+            return f"UT Breakout 진입 분석\n\n심볼: {display_symbol}\nTF: {entry_tf}\n데이터 부족: {0 if df is None else len(df)}/5"
+
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        closed = df.iloc[:-1].copy().dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+        if len(closed) < 5:
+            return f"UT Breakout 진입 분석\n\n심볼: {display_symbol}\nTF: {entry_tf}\n유효 마감봉 데이터 부족"
+
+        if cfg.get('adaptive_timeframe_enabled'):
+            adaptive_state = self.utbreakout_adaptive_tf_state.get(symbol, {}) or {}
+            selected_tf = adaptive_state.get('selected_tf')
+            if selected_tf and selected_tf != entry_tf:
+                notes.append(f"Adaptive TF ON: 최근 선택 TF {selected_tf}. 이 분석은 config 진입 TF {entry_tf} 기준")
+            else:
+                notes.append("Adaptive TF ON: 실제 루프는 판단 시점에 TF를 다시 고를 수 있음")
+
+        selected_set, auto_analysis, auto_reason = await self._resolve_utbreakout_selected_set(symbol, df, cfg)
+        effective_cfg = dict(cfg)
+        effective_cfg.update(selected_set.get('params', {}) if isinstance(selected_set, dict) else {})
+        effective_cfg['active_set_id'] = selected_set.get('id', cfg.get('active_set_id', UTBREAKOUT_DEFAULT_SET_ID))
+        effective_cfg['profile'] = f"set{effective_cfg['active_set_id']}"
+        cfg = effective_cfg
+        entry_tf = str(cfg.get('entry_timeframe', entry_tf) or entry_tf).lower()
+        htf_tf = str(cfg.get('htf_timeframe', htf_tf) or htf_tf).lower()
+
+        decision_ts = int(closed.iloc[-1].get('timestamp') or 0)
+        entry_price = float(closed.iloc[-1]['close'])
+        last_processed_ts = int(self.last_processed_candle_ts.get(symbol, 0) or 0)
+        if last_processed_ts >= decision_ts:
+            waits.append("현재 마감봉은 이미 처리/프라임됨. 다음 마감봉까지 신규 진입 재시도 없음")
+
+        ut_sig, ut_reason, ut_detail = self._calculate_utbot_signal(
+            df,
+            self._get_utbot_filtered_breakout_ut_params(cfg)
+        )
+        ut_detail = ut_detail or {}
+        ut_bias_side = str(ut_detail.get('bias_side') or '').lower()
+        candidate_side = ut_sig if ut_sig in {'long', 'short'} else ut_bias_side if ut_bias_side in {'long', 'short'} else None
+        candidate_type = 'fresh_signal' if ut_sig in {'long', 'short'} else 'bias_state' if candidate_side else 'waiting'
+
+        metrics = self._calculate_utbreakout_timeframe_metrics(closed, cfg)
+        ema_fast_len = int(cfg.get('ema_fast', 50) or 50)
+        ema_slow_len = int(cfg.get('ema_slow', 200) or 200)
+        htf_ready = False
+        htf_error = None
+        htf_close = htf_ema_fast = htf_ema_slow = htf_gap_pct = np.nan
+        htf_supertrend_direction = None
+        htf_supertrend_reason = None
+        try:
+            htf_ohlcv = await asyncio.to_thread(
+                self.market_data_exchange.fetch_ohlcv,
+                symbol,
+                htf_tf,
+                limit=300
+            )
+            htf_df = pd.DataFrame(htf_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                htf_df[col] = pd.to_numeric(htf_df[col], errors='coerce')
+            htf_closed = htf_df.iloc[:-1].dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+            if len(htf_closed) >= ema_slow_len + 2:
+                htf_close_series = htf_closed['close'].astype(float)
+                htf_ema_fast = float(htf_close_series.ewm(span=ema_fast_len, adjust=False).mean().iloc[-1])
+                htf_ema_slow = float(htf_close_series.ewm(span=ema_slow_len, adjust=False).mean().iloc[-1])
+                htf_close = float(htf_close_series.iloc[-1])
+                htf_gap_pct = abs(htf_ema_fast - htf_ema_slow) / max(abs(htf_close), 1e-9) * 100.0
+                htf_ready = True
+            else:
+                htf_error = f"HTF 데이터 부족 {len(htf_closed)}/{ema_slow_len + 2}"
+            htf_supertrend_direction, _, htf_supertrend_reason = self._calculate_utbot_filter_pack_supertrend_direction(
+                htf_closed,
+                length=10,
+                multiplier=3.0
+            )
+        except Exception as exc:
+            htf_error = str(exc)
+
+        daily_entries = self.db.get_daily_entry_count()
+        _, daily_pnl = self.db.get_daily_stats()
+        max_losses = int(cfg.get('max_consecutive_losses', 3) or 3)
+        recent_pnls = self.db.get_recent_closed_trade_pnls(max_losses, today_only=True)
+        daily_ok = True
+        daily_detail = f"PnL {_fmt(daily_pnl, 2)} / trades {daily_entries}/{int(cfg.get('max_daily_trades', 0) or 0)}"
+        if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
+            daily_ok = False
+            daily_detail = f"일손실 한도 도달 PnL {_fmt(daily_pnl, 2)}"
+        elif int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
+            daily_ok = False
+            daily_detail = f"일일 거래수 한도 {daily_entries}/{int(cfg['max_daily_trades'])}"
+        elif bool(cfg.get('daily_profit_target_enabled', False)) and float(daily_pnl or 0) >= float(cfg.get('daily_profit_target_usdt', 0) or 0):
+            daily_ok = False
+            daily_detail = f"일 목표수익 도달 {_fmt(daily_pnl, 2)}"
+        elif len(recent_pnls) >= max_losses and all(float(pnl) < 0 for pnl in recent_pnls[:max_losses]):
+            daily_ok = False
+            daily_detail = f"연속 손절 {max_losses}회"
+        if not daily_ok:
+            blockers.append(daily_detail)
+
+        filter_values = {
+            'entry_price': entry_price,
+            'open': metrics.get('open'),
+            'rsi': metrics.get('rsi'),
+            'macd_hist': metrics.get('macd_hist'),
+            'macd_hist_prev': metrics.get('macd_hist_prev'),
+            'roc_pct': metrics.get('roc_pct'),
+            'cci': metrics.get('cci'),
+            'stoch_k': metrics.get('stoch_k'),
+            'stoch_d': metrics.get('stoch_d'),
+            'adx': metrics.get('adx'),
+            'plus_di': metrics.get('plus_di'),
+            'minus_di': metrics.get('minus_di'),
+            'adx_reason': metrics.get('adx_reason'),
+            'atr_pct': metrics.get('atr_pct'),
+            'ema50': metrics.get('ema_fast'),
+            'ema50_prev': metrics.get('ema_fast_prev'),
+            'ema200': metrics.get('ema_slow'),
+            'donchian_high_prev': metrics.get('donchian_high_prev'),
+            'donchian_low_prev': metrics.get('donchian_low_prev'),
+            'donchian_width_pct': metrics.get('donchian_width_pct'),
+            'bb_upper': metrics.get('bb_upper'),
+            'bb_lower': metrics.get('bb_lower'),
+            'bb_mid': metrics.get('bb_mid'),
+            'bb_width_pct': metrics.get('bb_width_pct'),
+            'bb_width_prev_pct': metrics.get('bb_width_prev_pct'),
+            'bb_width_min_pct': metrics.get('bb_width_min_pct'),
+            'keltner_upper': metrics.get('keltner_upper'),
+            'keltner_lower': metrics.get('keltner_lower'),
+            'keltner_mid': metrics.get('keltner_mid'),
+            'keltner_width_pct': metrics.get('keltner_width_pct'),
+            'keltner_width_prev_pct': metrics.get('keltner_width_prev_pct'),
+            'range_expansion_ratio': metrics.get('range_expansion_ratio'),
+            'range_compression_ratio': metrics.get('range_compression_ratio'),
+            'vwap': metrics.get('vwap'),
+            'vwap_slope': metrics.get('vwap_slope'),
+            'vwap_reason': metrics.get('vwap_reason'),
+            'volume_ratio': metrics.get('volume_ratio'),
+            'obv_slope_ratio': metrics.get('obv_slope_ratio'),
+            'mfi': metrics.get('mfi'),
+            'psar_direction': metrics.get('psar_direction'),
+            'psar': metrics.get('psar'),
+            'psar_reason': metrics.get('psar_reason'),
+            'ichimoku_bias': metrics.get('ichimoku_bias'),
+            'ichimoku_top': metrics.get('ichimoku_top'),
+            'ichimoku_bottom': metrics.get('ichimoku_bottom'),
+            'session_hour_kst': metrics.get('session_hour_kst'),
+            'auto_scores': (auto_analysis or {}).get('scores') if isinstance(auto_analysis, dict) else {},
+            'mtf_metrics': (auto_analysis or {}).get('timeframes') if isinstance(auto_analysis, dict) else {},
+            'chop': metrics.get('chop'),
+            'chop_reason': metrics.get('chop_reason'),
+            'vortex_plus': metrics.get('vortex_plus'),
+            'vortex_minus': metrics.get('vortex_minus'),
+            'vortex_reason': metrics.get('vortex_reason'),
+            'aroon_up': metrics.get('aroon_up'),
+            'aroon_down': metrics.get('aroon_down'),
+            'aroon_reason': metrics.get('aroon_reason'),
+            'htf_ready': htf_ready,
+            'htf_error': htf_error,
+            'htf_close': htf_close,
+            'htf_ema_fast': htf_ema_fast,
+            'htf_ema_slow': htf_ema_slow,
+            'htf_gap_pct': htf_gap_pct,
+            'htf_supertrend_direction': htf_supertrend_direction,
+            'htf_supertrend_reason': htf_supertrend_reason,
+        }
+        long_filter_items = self._evaluate_utbreakout_set_filter_items('long', selected_set, cfg, filter_values)
+        failed_filters = [item for item in long_filter_items if item.get('state') is not True]
+        if selected_set.get('status') != 'active':
+            blockers.append(f"Set{selected_set.get('id')}은 실거래 연결 상태가 아님")
+        if candidate_side != 'long':
+            blockers.append(f"UTBot LONG 후보 아님: 현재 {str(candidate_side or 'none').upper()} ({candidate_type})")
+        if failed_filters:
+            top_failed = "; ".join(
+                f"{item.get('name')}={item.get('detail')}"
+                for item in failed_filters[:4]
+            )
+            blockers.append(f"선택 Set LONG 필터 미통과: {top_failed}")
+
+        if not self.is_trade_direction_allowed('long'):
+            blockers.append(self.format_trade_direction_block_reason('long'))
+
+        balance_error = None
+        total_balance = free_balance = mmr = 0.0
+        try:
+            total_balance, free_balance, mmr = await self.get_balance_info()
+            if float(free_balance or 0) <= 0:
+                blockers.append(f"잔고 부족: free {_fmt(free_balance, 2)} USDT")
+        except Exception as exc:
+            balance_error = str(exc)
+            blockers.append(f"잔고 조회 실패: {exc}")
+
+        lev = int(max(1.0, float(common_cfg.get('leverage', 5) or 5)))
+        risk_plan = None
+        risk_error = None
+        atr_value = metrics.get('atr')
+        try:
+            if not self._is_valid_number(atr_value) or float(atr_value) <= 0:
+                raise ValueError("ATR 값 없음")
+            balance_for_risk = total_balance if total_balance > 0 else free_balance
+            risk_plan = calculate_risk_plan(
+                side='long',
+                entry_price=entry_price,
+                atr_value=atr_value,
+                stop_atr_multiplier=cfg.get('stop_atr_multiplier', 1.5),
+                ut_stop=ut_detail.get('curr_stop'),
+                take_profit_r_multiple=cfg.get('take_profit_r_multiple', 2.0),
+                min_risk_reward=cfg.get('min_risk_reward', 2.0),
+                balance_usdt=balance_for_risk,
+                risk_per_trade_percent=cfg.get('risk_per_trade_percent', 1.0),
+                max_risk_per_trade_usdt=cfg.get('max_risk_per_trade_usdt', 1.0),
+                leverage=lev,
+            )
+        except Exception as exc:
+            risk_error = str(exc)
+            blockers.append(f"리스크 계획 생성 실패: {exc}")
+
+        min_notional = 0.0
+        min_notional_source = "unknown"
+        markets = {}
+        market = {}
+        try:
+            markets = await asyncio.to_thread(self.exchange.load_markets)
+            market = markets.get(symbol) or markets.get(f"{symbol}:USDT") or {}
+            limits = market.get('limits', {}) if isinstance(market, dict) else {}
+            info = market.get('info', {}) if isinstance(market, dict) else {}
+            filters = info.get('filters', []) if isinstance(info, dict) else []
+            candidates = []
+            if isinstance(limits.get('cost', {}), dict):
+                candidates.append(limits.get('cost', {}).get('min'))
+            candidates.extend([info.get('notional'), info.get('minNotional')])
+            if isinstance(filters, list):
+                for item in filters:
+                    if isinstance(item, dict) and item.get('filterType') in ('MIN_NOTIONAL', 'NOTIONAL'):
+                        candidates.extend([item.get('notional'), item.get('minNotional')])
+            parsed = []
+            for item in candidates:
+                try:
+                    value = float(item)
+                    if value > 0:
+                        parsed.append(value)
+                except (TypeError, ValueError):
+                    continue
+            if parsed:
+                min_notional = min(parsed)
+                min_notional_source = "exchange"
+        except Exception as exc:
+            notes.append(f"min notional 조회 실패: {exc}")
+        if min_notional <= 0 and getattr(self.exchange, 'id', '') == 'binance':
+            default_type = str(getattr(self.exchange, 'options', {}).get('defaultType', '')).lower()
+            if default_type in ('future', 'futures'):
+                min_notional = 100.0
+                min_notional_source = "binance fallback"
+
+        effective_plan = risk_plan
+        micro_cfg = self._get_micro_auto_config()
+        micro_line = "Micro Auto: OFF"
+        if micro_cfg.get('enabled') and risk_plan:
+            micro_plan = build_micro_entry_plan(
+                side='long',
+                entry_price=entry_price,
+                atr_value=atr_value,
+                ut_stop=ut_detail.get('curr_stop'),
+                base_plan=dict(risk_plan, stop_atr_multiplier=cfg.get('stop_atr_multiplier', 1.5)),
+                cfg=micro_cfg,
+                selected_set=selected_set,
+                auto_scores=(auto_analysis or {}).get('scores') if isinstance(auto_analysis, dict) else {},
+                selected_timeframe=entry_tf,
+                total_equity_usdt=total_balance,
+                free_usdt=free_balance,
+                min_notional_usdt=min_notional,
+            )
+            if micro_plan.get('accepted'):
+                effective_plan = micro_plan
+                lev = int(max(1, float(micro_plan.get('leverage', lev) or lev)))
+                micro_line = (
+                    f"Micro Auto: ON / {'DRY-RUN' if micro_plan.get('dry_run') else 'LIVE'} / "
+                    f"notional {_fmt(micro_plan.get('planned_notional'), 2)} / "
+                    f"margin {_fmt(micro_plan.get('planned_margin'), 2)} / {lev}x"
+                )
+                if micro_plan.get('dry_run', True) or not micro_plan.get('live_enabled', False):
+                    blockers.append("Micro Auto dry-run/live-lock: 실제 주문 전송 안 함")
+            else:
+                micro_line = f"Micro Auto: ON / 거절 {micro_plan.get('reject_code')}: {micro_plan.get('reason')}"
+                blockers.append(micro_line)
+
+        qty = None
+        qty_notional = 0.0
+        target_notional = 0.0
+        max_notional = float(free_balance or 0.0) * float(lev) * 0.98
+        if effective_plan:
+            try:
+                target_notional = float(effective_plan.get('qty', 0) or 0) * entry_price
+                if min_notional > 0 and target_notional < min_notional:
+                    blockers.append(
+                        f"최소 주문금액 미달: 계획 {_fmt(target_notional, 2)} < 필요 {_fmt(min_notional, 2)} USDT"
+                    )
+                if target_notional > max_notional:
+                    blockers.append(
+                        f"증거금 부족: 계획 {_fmt(target_notional, 2)} > 가능 {_fmt(max_notional, 2)} USDT"
+                    )
+                qty = self.safe_amount(symbol, target_notional / max(entry_price, 1e-9))
+                qty_notional = float(qty) * entry_price
+                if min_notional > 0 and qty_notional < min_notional:
+                    blockers.append(
+                        f"수량 정밀도 후 최소금액 미달: {_fmt(qty_notional, 2)} < {_fmt(min_notional, 2)} USDT"
+                    )
+                if float(qty) <= 0:
+                    blockers.append(f"주문 수량 계산 오류: {qty}")
+            except Exception as exc:
+                blockers.append(f"주문 수량/정밀도 분석 실패: {exc}")
+
+        last_status = self.last_utbot_filtered_breakout_status.get(symbol, {}) or {}
+        last_status_code = last_status.get('reject_code') or last_status.get('accepted_code') or last_status.get('reason') or '없음'
+        last_status_ts = int(last_status.get('decision_candle_ts') or 0)
+        if last_status_ts and last_status_ts != decision_ts:
+            notes.append(f"최근 엔진 판단은 현재 마감봉과 다름: {_fmt_ts(last_status_ts)} / 현재 {_fmt_ts(decision_ts)}")
+
+        recent_events = []
+        try:
+            events = read_utbreakout_diagnostic_events(days=2)
+            recent_events = [
+                event for event in events
+                if _symbol_key(event.get('symbol')) == symbol_key
+            ][-5:]
+        except Exception as exc:
+            notes.append(f"진단 로그 읽기 실패: {exc}")
+
+        if self.ctrl._telegram_event_alerts_only():
+            notes.append("Telegram event-only 모드: 진입 차단/최소금액/증거금 알림 일부가 숨겨질 수 있음")
+
+        core_ok = (
+            candidate_side == 'long'
+            and selected_set.get('status') == 'active'
+            and not failed_filters
+            and daily_ok
+            and risk_plan is not None
+        )
+        blocker_lines = list(dict.fromkeys(str(item) for item in blockers if str(item).strip()))
+        wait_lines = list(dict.fromkeys(str(item) for item in waits if str(item).strip()))
+        note_lines = list(dict.fromkeys(str(item) for item in notes if str(item).strip()))
+        if blocker_lines:
+            verdict = "차단/대기 원인 있음"
+        elif wait_lines:
+            verdict = "조건은 대체로 충족, 다음 봉 또는 다음 루프 대기"
+        elif core_ok:
+            verdict = "현재 15분 기준으로는 주문 시도 가능 상태"
+        else:
+            verdict = "조건 미충족"
+
+        filter_lines = [
+            f"- {item.get('name')}: {_ok_text(item.get('state'))} / {item.get('detail')}"
+            for item in long_filter_items[:12]
+        ] or ["- 선택 Set 필터 없음"]
+        event_lines = []
+        for event in recent_events:
+            dt = event.get('_dt')
+            dt_text = dt.astimezone(timezone(timedelta(hours=9))).strftime('%m-%d %H:%M') if dt else 'unknown'
+            code = event.get('code') or event.get('event') or 'UNKNOWN'
+            reason = str(event.get('reason') or '').replace('\n', ' ')
+            if len(reason) > 110:
+                reason = reason[:107] + "..."
+            event_lines.append(f"- {dt_text} {code}: {reason}")
+        if not event_lines:
+            event_lines = ["- 최근 2일 EWY/해당 심볼 진단 로그 없음"]
+
+        summary_blockers = blocker_lines or ["없음"]
+        summary_waits = wait_lines or ["없음"]
+        summary_notes = note_lines[:6] or ["없음"]
+        plan_summary = (
+            f"risk {_fmt(effective_plan.get('risk_usdt'), 4)} / "
+            f"qty {qty if qty is not None else _fmt(effective_plan.get('qty'), 6)} / "
+            f"notional {_fmt(target_notional, 2)} / margin {_fmt(effective_plan.get('planned_margin'), 2)} / "
+            f"SL {_fmt(effective_plan.get('stop_loss'), 4)} / TP {_fmt(effective_plan.get('take_profit'), 4)}"
+            if effective_plan else
+            f"없음 ({risk_error or balance_error or '계산 대기'})"
+        )
+        active_summary = (
+            f"scanner {'ON' if scanner_enabled else 'OFF'} / "
+            f"scanner_active {scanner_active or 'none'} / "
+            f"watchlist {', '.join(watchlist[:4]) if watchlist else 'none'} / "
+            f"active_symbols {', '.join(sorted(active_symbols)[:4]) if active_symbols else 'none'}"
+        )
+
+        lines = [
+            "UT Breakout 진입 분석",
+            f"심볼: {display_symbol}",
+            f"결론: {verdict}",
+            "",
+            "1) 실행 경로",
+            f"- 전략: {active_strategy.upper()}",
+            f"- {active_summary}",
+            f"- customcoins: {'ON' if coin_cfg.get('custom_universe_enabled') else 'OFF'} / {', '.join(custom_symbols) if custom_symbols else 'none'}",
+            f"- 일시정지: {'YES' if self.ctrl.is_paused else 'NO'} / running: {'YES' if self.running else 'NO'}",
+            "",
+            "2) 15분봉 조건",
+            f"- TF: entry {entry_tf} / HTF {htf_tf}",
+            f"- 마감봉: {_fmt_ts(decision_ts)} / close {_fmt(entry_price, 4)}",
+            f"- UT 후보: {str(candidate_side or 'none').upper()} ({candidate_type}) / fresh {str(ut_sig or 'none').upper()} / bias {str(ut_bias_side or 'none').upper()}",
+            f"- 선택 Set: Set{selected_set.get('id')} {selected_set.get('name')} ({selected_set.get('status')})",
+            f"- AUTO 이유: {auto_reason or '수동 선택'}",
+            f"- LONG 핵심: UT {_ok_text(candidate_side == 'long')} / Set필터 {_ok_text(not failed_filters)} / 일일리스크 {_ok_text(daily_ok)} / 리스크계획 {_ok_text(risk_plan is not None)}",
+            f"- 일일리스크 상세: {daily_detail}",
+            "",
+            "3) LONG 필터 상세",
+            *filter_lines,
+            "",
+            "4) 주문 전 체크",
+            f"- 방향필터 LONG: {_ok_text(self.is_trade_direction_allowed('long'))}",
+            f"- 잔고: total {_fmt(total_balance, 2)} / free {_fmt(free_balance, 2)} / MMR {_fmt(mmr, 2)}",
+            f"- minNotional: {_fmt(min_notional, 2)} USDT ({min_notional_source})",
+            f"- 계획: {plan_summary}",
+            f"- 가능 notional: {_fmt(max_notional, 2)} USDT @ {lev}x",
+            f"- {micro_line}",
+            "",
+            "5) 차단 원인",
+            *[f"- {item}" for item in summary_blockers[:10]],
+            "",
+            "6) 대기/주의",
+            *[f"- {item}" for item in summary_waits[:6]],
+            *[f"- {item}" for item in summary_notes],
+            "",
+            "7) 최근 엔진/로그",
+            f"- last_status: {last_status_code}",
+            f"- last_status_candle: {_fmt_ts(last_status_ts)}",
+            *event_lines,
+            "",
+            "복붙용 요약",
+            f"symbol={symbol} verdict={verdict} tf={entry_tf} candle={_fmt_ts(decision_ts)} candidate={candidate_side}/{candidate_type} set=Set{selected_set.get('id')} blockers={' | '.join(summary_blockers[:5])}",
+        ]
+        return "\n".join(lines)
+
     async def _evaluate_utbreakout_opposite_set_exit(self, symbol, df, fb_cfg, current_side, pos):
         if not bool(fb_cfg.get('opposite_set_exit_enabled', False)):
             return False, None
@@ -18695,6 +19255,7 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 `/utbreakout riskpct 1` - 잔고 대비 손실 기준 1%로 설정
 `/utbreakout dailyloss 30` - 하루 최대 손실 30 USDT로 설정
 `/utbreakout status` - 롱/숏 조건 신호등
+`/utbreakout analyze [EWY]` - 왜 진입하지 않는지 종합 분석
 `/utbreakout research` - 최근 7일 리서치 요약
 `/utbreakout menu` - 이 메뉴 다시 보기
 `/utbreakout log` - 진단 로그 파일 다운로드
@@ -18781,6 +19342,7 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 ],
                 [
                     InlineKeyboardButton("조건 스테이터스", callback_data="utb:condition_status"),
+                    InlineKeyboardButton("진입 분석", callback_data="utb:entry_analyze"),
                     InlineKeyboardButton("리서치 요약", callback_data="utb:research")
                 ],
                 [
@@ -18869,6 +19431,29 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
             watchlist = self.get_active_watchlist()
             return watchlist[0] if watchlist else 'BTC/USDT'
 
+        def _get_utbreakout_analysis_symbol(raw_symbol=None):
+            raw = str(raw_symbol or '').strip()
+            if raw:
+                try:
+                    return self.normalize_symbol_for_exchange(raw)
+                except Exception:
+                    return raw.upper()
+
+            sig_cfg = self.cfg.get('signal_engine', {}) or {}
+            coin_cfg = sig_cfg.get('coin_selector', {}) or {}
+            custom_symbols = normalize_coin_selector_custom_symbols(coin_cfg.get('custom_symbols'))
+            if len(custom_symbols) == 1:
+                return custom_symbols[0]
+
+            engine = self.engines.get('signal')
+            if engine and engine.scanner_active_symbol:
+                return engine.scanner_active_symbol
+            if engine and len(engine.active_symbols or set()) == 1:
+                return next(iter(engine.active_symbols))
+
+            watchlist = self.get_active_watchlist()
+            return watchlist[0] if watchlist else 'BTC/USDT'
+
         async def _get_utbreakout_condition_status_text():
             engine = self.engines.get('signal')
             if not engine:
@@ -18890,6 +19475,60 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 if "message is not modified" in str(md_err).lower():
                     return
                 raise
+
+        async def _get_utbreakout_entry_analysis_text(raw_symbol=None):
+            engine = self.engines.get('signal')
+            if not engine:
+                return "UT Breakout 진입 분석\n\nSignal 엔진을 찾을 수 없습니다."
+            symbol = _get_utbreakout_analysis_symbol(raw_symbol)
+            return await engine.build_utbreakout_entry_analysis_text(symbol)
+
+        async def _send_utbreakout_entry_analysis(message, raw_symbol=None):
+            if message is None:
+                return
+            text = await _get_utbreakout_entry_analysis_text(raw_symbol)
+            if len(text) <= 3900:
+                await message.reply_text(text, reply_markup=_build_utbreakout_keyboard())
+                return
+            preview = "\n".join(text.splitlines()[:45])
+            await message.reply_text(
+                f"{preview}\n\n상세 분석은 파일로 보냈습니다.",
+                reply_markup=_build_utbreakout_keyboard()
+            )
+            bio = io.BytesIO(text.encode('utf-8'))
+            bio.name = 'utbreakout_entry_analysis.txt'
+            await message.reply_document(
+                document=bio,
+                filename='utbreakout_entry_analysis.txt',
+                caption='UT Breakout 진입 분석 전체 로그입니다. 그대로 공유하면 원인 추적에 사용할 수 있습니다.'
+            )
+
+        async def _edit_utbreakout_entry_analysis(query, raw_symbol=None):
+            text = await _get_utbreakout_entry_analysis_text(raw_symbol)
+            if len(text) <= 3900:
+                try:
+                    await query.edit_message_text(text, reply_markup=_build_utbreakout_keyboard())
+                except BadRequest as md_err:
+                    if "message is not modified" in str(md_err).lower():
+                        return
+                    raise
+                return
+            preview = "\n".join(text.splitlines()[:45])
+            try:
+                await query.edit_message_text(
+                    f"{preview}\n\n상세 분석은 파일로 보냈습니다.",
+                    reply_markup=_build_utbreakout_keyboard()
+                )
+            except BadRequest as md_err:
+                if "message is not modified" not in str(md_err).lower():
+                    raise
+            bio = io.BytesIO(text.encode('utf-8'))
+            bio.name = 'utbreakout_entry_analysis.txt'
+            await query.message.reply_document(
+                document=bio,
+                filename='utbreakout_entry_analysis.txt',
+                caption='UT Breakout 진입 분석 전체 로그입니다. 그대로 공유하면 원인 추적에 사용할 수 있습니다.'
+            )
 
         def _format_utbreakout_sets_text(page=1):
             try:
@@ -19234,6 +19873,10 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
             elif action in {'status', 'conditions', 'condition_status'}:
                 await _send_utbreakout_condition_status(u.message)
                 return
+            elif action in {'analyze', 'analysis', 'entry_analyze', 'why_entry', 'debug'}:
+                symbol_arg = args[1] if len(args) > 1 else None
+                await _send_utbreakout_entry_analysis(u.message, symbol_arg)
+                return
             elif action in {'menu', ''}:
                 pass
             else:
@@ -19470,6 +20113,10 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 
             if action == 'condition_status':
                 await _edit_utbreakout_condition_status(query)
+                return
+
+            if action == 'entry_analyze':
+                await _edit_utbreakout_entry_analysis(query)
                 return
 
             await _edit_utbreakout_menu(query)
