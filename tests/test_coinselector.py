@@ -72,6 +72,19 @@ def test_coinselector_rejects_default_excluded_sector():
     assert "REJECTED_EXCLUDED_SECTOR" in candidate["reject_reasons"]
 
 
+def test_coinselector_accepts_tradifi_usdt_perpetual():
+    cfg = default_coin_selector_config()
+    candidate = build_base_candidate(
+        "EWY/USDT:USDT",
+        _ticker(quoteVolume=500_000_000),
+        _market(info={"contractType": "TRADIFI_PERPETUAL", "status": "TRADING"}),
+        cfg,
+    )
+
+    assert candidate["accepted"] is True
+    assert "REJECTED_NOT_USDT_PERPETUAL_TRADING" not in candidate["reject_reasons"]
+
+
 def test_custom_symbols_normalize_and_dedupe_to_usdt_pairs():
     symbols = normalize_custom_symbols("BTC BTCUSDT BTC/USDT BTC/USDT:USDT eth, SOL")
 

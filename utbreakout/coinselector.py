@@ -196,7 +196,7 @@ def market_is_usdt_perpetual(symbol, market):
     return (
         quote == "USDT"
         and settle == "USDT"
-        and contract_type == "PERPETUAL"
+        and contract_type in {"PERPETUAL", "TRADIFI_PERPETUAL"}
         and status == "TRADING"
         and active is not False
         and swap_like

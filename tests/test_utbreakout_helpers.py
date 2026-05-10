@@ -12,6 +12,10 @@ def _signal_engine_cls():
     return pytest.importorskip("emas", reason="emas runtime dependencies are optional in CI").SignalEngine
 
 
+def _emas_module():
+    return pytest.importorskip("emas", reason="emas runtime dependencies are optional in CI")
+
+
 def test_previous_donchian_excludes_current_candle():
     highs = [10, 11, 12, 13, 14, 999]
     lows = [9, 8, 7, 6, 5, -999]
@@ -84,6 +88,106 @@ def test_research_summary_detects_set_concentration_and_protection_gaps():
     assert summary["top_set_share_pct"] > 50.0
     assert summary["top_rejects"][0] == ("REJECTED_ADX_LOW", 6)
     assert summary["protection_missing_sl"] == ["BTC/USDT"]
+
+
+def _market(**overrides):
+    base = {
+        "symbol": "BTC/USDT:USDT",
+        "quote": "USDT",
+        "settle": "USDT",
+        "swap": True,
+        "active": True,
+        "type": "swap",
+        "info": {"contractType": "PERPETUAL", "status": "TRADING"},
+    }
+    base.update(overrides)
+    return base
+
+
+def test_coin_selector_market_lookup_prefers_futures_over_spot():
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    spot = _market(
+        symbol="BTC/USDT",
+        settle=None,
+        swap=False,
+        type="spot",
+        info={"status": "TRADING"},
+    )
+    futures = _market(symbol="BTC/USDT:USDT")
+    markets = {
+        "BTC/USDT": spot,
+        "BTC/USDT:USDT": futures,
+    }
+
+    assert engine._coin_selector_market_for_symbol("BTC/USDT", markets) is futures
+
+
+def test_custom_coin_symbol_resolution_uses_futures_canonical_symbol():
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    markets = {
+        "BTC/USDT": _market(
+            symbol="BTC/USDT",
+            settle=None,
+            swap=False,
+            type="spot",
+            info={"status": "TRADING"},
+        ),
+        "BTC/USDT:USDT": _market(symbol="BTC/USDT:USDT"),
+    }
+
+    for raw in ["BTC", "BTCUSDT", "BTC/USDT", "BTC/USDT:USDT"]:
+        assert engine._coin_selector_exchange_symbol_for_custom(raw, markets) == "BTC/USDT:USDT"
+
+    assert engine._coin_selector_market_for_symbol("BTC/USDC", markets) is None
+
+
+class _MemoryConfig:
+    def __init__(self):
+        self.values = {}
+
+    async def update_value(self, path, value):
+        node = self.values
+        for key in path[:-1]:
+            node = node.setdefault(key, {})
+        node[path[-1]] = value
+
+
+class _ResettableSignalEngine:
+    def __init__(self):
+        self.scanner_active_symbol = "ETH/USDT"
+        self.reset_kwargs = None
+
+    def reset_signal_runtime_state(self, **kwargs):
+        self.reset_kwargs = kwargs
+
+
+def test_return_signal_engine_to_utbot_turns_off_utbreakout_customcoins_and_scanner():
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+    controller.cfg = _MemoryConfig()
+    signal_engine = _ResettableSignalEngine()
+    controller.engines = {"signal": signal_engine}
+
+    asyncio.run(controller._return_signal_engine_to_utbot())
+
+    signal_cfg = controller.cfg.values["signal_engine"]
+    strategy = signal_cfg["strategy_params"]
+    breakout = strategy["UTBotFilteredBreakoutV1"]
+    assert strategy["active_strategy"] == "utbot"
+    assert breakout["adaptive_timeframe_enabled"] is False
+    assert breakout["auto_select_enabled"] is False
+    assert breakout["selection_mode"] == "manual"
+    assert signal_cfg["coin_selector"]["enabled"] is False
+    assert signal_cfg["coin_selector"]["custom_universe_enabled"] is False
+    assert signal_cfg["common_settings"]["scanner_enabled"] is False
+    assert signal_engine.scanner_active_symbol is None
+    assert signal_engine.reset_kwargs == {
+        "reset_entry_cache": True,
+        "reset_exit_cache": True,
+        "reset_stateful_strategy": True,
+    }
 
 
 def test_protection_order_classifies_binance_stop_market_from_orig_type():
