@@ -683,6 +683,9 @@ def test_utbreakout_defaults_enable_partial_trailing_and_short_guard():
     assert cfg["short_conservative_enabled"] is True
     assert cfg["short_risk_multiplier"] == 0.5
     assert cfg["short_adx_threshold"] == 22.0
+    assert cfg["market_quality_enabled"] is True
+    assert cfg["market_quality_data_required"] is False
+    assert cfg["market_quality_min_risk_multiplier"] == 0.25
 
 
 def test_utbreakout_short_guard_requires_htf_and_dmi_alignment():
@@ -748,6 +751,73 @@ def test_utbreakout_short_guard_status_item_matches_real_gate():
     assert state is False
     assert "ADX" in detail
     assert "숏 리스크 x0.50" in detail
+
+
+def test_utbreakout_market_quality_reduces_risk_without_blocking_on_mild_funding():
+    emas = _emas_module()
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    cfg = emas.build_default_utbot_filtered_breakout_config()
+
+    result = engine._evaluate_utbreakout_market_quality(
+        "long",
+        cfg,
+        {
+            "atr_pct": 0.5,
+            "funding_rate": 0.0007,
+            "open_interest_delta_pct": 0.3,
+            "taker_buy_sell_ratio": 1.04,
+            "futures_spread_pct": 0.02,
+        },
+    )
+
+    assert result["state"] == "reduced"
+    assert 0 < result["risk_multiplier"] < 1
+    assert result["hard_block"] is False
+    assert "funding" in result["summary"]
+
+
+def test_utbreakout_market_quality_blocks_extreme_adverse_funding():
+    emas = _emas_module()
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    cfg = emas.build_default_utbot_filtered_breakout_config()
+
+    result = engine._evaluate_utbreakout_market_quality(
+        "long",
+        cfg,
+        {
+            "atr_pct": 0.5,
+            "funding_rate": 0.002,
+            "futures_spread_pct": 0.02,
+        },
+    )
+
+    assert result["state"] is False
+    assert result["risk_multiplier"] == 0
+    assert result["hard_block"] is True
+    assert result["summary"].startswith("BLOCK")
+
+
+def test_utbreakout_market_quality_status_item_shows_reduced_state():
+    emas = _emas_module()
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    cfg = emas.build_default_utbot_filtered_breakout_config()
+
+    label, state, detail = engine._build_utbreakout_market_quality_status_item(
+        "short",
+        cfg,
+        {
+            "atr_pct": 0.6,
+            "taker_buy_sell_ratio": 1.10,
+            "futures_spread_pct": 0.02,
+        },
+    )
+
+    assert label == "시장 품질 게이트"
+    assert state == "reduced"
+    assert "REDUCE" in detail
 
 
 def test_place_tp_sl_orders_uses_partial_tp_quantity_and_full_sl_quantity():

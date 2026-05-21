@@ -408,6 +408,17 @@ def build_utbreakout_set_registry():
         'short_conservative_enabled': True,
         'short_risk_multiplier': 0.5,
         'short_adx_threshold': 22.0,
+        'market_quality_enabled': True,
+        'market_quality_data_required': False,
+        'market_quality_min_risk_multiplier': 0.25,
+        'market_quality_high_atr_pct': 1.5,
+        'market_quality_extreme_atr_pct': 2.5,
+        'market_quality_adverse_funding_soft': 0.0006,
+        'market_quality_adverse_funding_hard': 0.0015,
+        'market_quality_regime_enabled': True,
+        'market_quality_regime_symbols': ['BTC/USDT', 'ETH/USDT'],
+        'market_quality_regime_timeframe': '4h',
+        'market_quality_regime_strong_move_pct': 1.5,
         'min_risk_reward': 2.0,
     }
     rows = [
@@ -587,6 +598,17 @@ def build_default_utbot_filtered_breakout_config():
         'short_conservative_enabled': True,
         'short_risk_multiplier': 0.5,
         'short_adx_threshold': 22.0,
+        'market_quality_enabled': True,
+        'market_quality_data_required': False,
+        'market_quality_min_risk_multiplier': 0.25,
+        'market_quality_high_atr_pct': 1.5,
+        'market_quality_extreme_atr_pct': 2.5,
+        'market_quality_adverse_funding_soft': 0.0006,
+        'market_quality_adverse_funding_hard': 0.0015,
+        'market_quality_regime_enabled': True,
+        'market_quality_regime_symbols': ['BTC/USDT', 'ETH/USDT'],
+        'market_quality_regime_timeframe': '4h',
+        'market_quality_regime_strong_move_pct': 1.5,
         'min_risk_reward': 2.0,
         'risk_per_trade_percent': 1.0,
         'max_risk_per_trade_usdt': 1.0,
@@ -2585,6 +2607,7 @@ class SignalEngine(BaseEngine):
         self.utbreakout_trailing_states = {}  # symbol -> partial TP / ATR trailing state
         self.utbot_filtered_breakout_failures = {}  # symbol -> side -> recent failed candidate timestamps
         self.utbreakout_futures_context_cache = {}  # symbol -> cached funding/OI context for research logs
+        self.utbreakout_market_regime_cache = {}  # cache key -> BTC/ETH broad market regime
         self.utbreakout_adaptive_tf_state = {}  # symbol -> selected TF stability state
         self.utbreakout_adaptive_last_decision_ts = {}  # symbol -> tf -> last closed candle evaluated
         self.last_protection_order_status = {}  # symbol -> exchange-side TP/SL audit status
@@ -2641,6 +2664,7 @@ class SignalEngine(BaseEngine):
         self.utbreakout_trailing_states = {}
         self.utbot_filtered_breakout_failures = {}
         self.utbreakout_futures_context_cache = {}
+        self.utbreakout_market_regime_cache = {}
         self.utbreakout_adaptive_tf_state = {}
         self.utbreakout_adaptive_last_decision_ts = {}
         self.last_protection_order_status = {}
@@ -5796,6 +5820,199 @@ class SignalEngine(BaseEngine):
         detail = f"ON / {reason} / 숏 리스크 x{risk_multiplier:.2f}"
         return ("보수적 숏 가드", ok, detail)
 
+    def _evaluate_utbreakout_market_quality(self, side, cfg, values):
+        side = str(side or '').lower()
+        if side not in {'long', 'short'}:
+            return {
+                'enabled': False,
+                'state': False,
+                'risk_multiplier': 0.0,
+                'hard_block': True,
+                'summary': 'invalid side',
+                'reasons': ['invalid side'],
+                'positives': [],
+            }
+        if not bool(cfg.get('market_quality_enabled', True)):
+            return {
+                'enabled': False,
+                'state': True,
+                'risk_multiplier': 1.0,
+                'hard_block': False,
+                'summary': 'OFF',
+                'reasons': ['OFF'],
+                'positives': [],
+            }
+
+        values = dict(values or {})
+        risk_multiplier = 1.0
+        hard_block = False
+        reasons = []
+        positives = []
+        data_seen = 0
+
+        def _f(key):
+            value = values.get(key)
+            if self._is_valid_number(value):
+                return float(value)
+            return None
+
+        def _reduce(factor, reason):
+            nonlocal risk_multiplier
+            risk_multiplier *= max(0.0, min(1.0, float(factor or 0.0)))
+            reasons.append(reason)
+
+        def _block(reason):
+            nonlocal hard_block, risk_multiplier
+            hard_block = True
+            risk_multiplier = 0.0
+            reasons.append(reason)
+
+        atr_pct = _f('atr_pct')
+        if atr_pct is not None:
+            data_seen += 1
+            high_atr = float(cfg.get('market_quality_high_atr_pct', 1.5) or 1.5)
+            extreme_atr = float(cfg.get('market_quality_extreme_atr_pct', 2.5) or 2.5)
+            if atr_pct >= extreme_atr:
+                _block(f"ATR% {atr_pct:.3f} >= extreme {extreme_atr:.2f}")
+            elif atr_pct >= high_atr:
+                _reduce(0.50, f"ATR% {atr_pct:.3f} high")
+            else:
+                positives.append(f"ATR% {atr_pct:.3f}")
+
+        funding = _f('funding_rate')
+        if funding is not None:
+            data_seen += 1
+            adverse_funding = funding if side == 'long' else -funding
+            soft = float(cfg.get('market_quality_adverse_funding_soft', 0.0006) or 0.0006)
+            hard = float(cfg.get('market_quality_adverse_funding_hard', 0.0015) or 0.0015)
+            if adverse_funding >= hard:
+                _block(f"funding adverse {funding:.6f}")
+            elif adverse_funding >= soft * 1.5:
+                _reduce(0.50, f"funding adverse {funding:.6f}")
+            elif adverse_funding >= soft:
+                _reduce(0.75, f"funding mildly adverse {funding:.6f}")
+            else:
+                positives.append(f"funding {funding:.6f}")
+
+        long_short = _f('long_short_ratio')
+        if long_short is not None:
+            data_seen += 1
+            if side == 'long' and long_short >= 1.85:
+                _reduce(0.75, f"L/S crowded {long_short:.2f}")
+            elif side == 'short' and long_short <= 0.55:
+                _reduce(0.75, f"L/S short crowded {long_short:.2f}")
+            else:
+                positives.append(f"L/S {long_short:.2f}")
+
+        oi_delta = _f('open_interest_delta_pct')
+        if oi_delta is not None:
+            data_seen += 1
+            if oi_delta <= -0.40:
+                _reduce(0.75, f"OI not confirming {oi_delta:.2f}%")
+            elif oi_delta >= 0.20:
+                positives.append(f"OI confirms {oi_delta:.2f}%")
+            else:
+                positives.append(f"OI flat {oi_delta:.2f}%")
+
+        taker_ratio = _f('taker_buy_sell_ratio')
+        if taker_ratio is not None:
+            data_seen += 1
+            if side == 'long':
+                if taker_ratio < 0.95:
+                    _reduce(0.75, f"taker flow against {taker_ratio:.3f}")
+                elif taker_ratio >= 1.03:
+                    positives.append(f"taker flow {taker_ratio:.3f}")
+            else:
+                if taker_ratio > 1.05:
+                    _reduce(0.75, f"taker flow against {taker_ratio:.3f}")
+                elif taker_ratio <= 0.97:
+                    positives.append(f"taker flow {taker_ratio:.3f}")
+
+        basis_pct = _f('basis_pct')
+        if basis_pct is not None:
+            data_seen += 1
+            adverse_basis = basis_pct if side == 'long' else -basis_pct
+            if adverse_basis >= 0.35:
+                _reduce(0.50, f"basis adverse {basis_pct:.3f}%")
+            elif adverse_basis >= 0.15:
+                _reduce(0.75, f"basis mildly adverse {basis_pct:.3f}%")
+            else:
+                positives.append(f"basis {basis_pct:.3f}%")
+
+        spread_pct = _f('futures_spread_pct')
+        if spread_pct is not None:
+            data_seen += 1
+            if spread_pct >= 0.10:
+                _block(f"spread too wide {spread_pct:.4f}%")
+            elif spread_pct >= 0.05:
+                _reduce(0.50, f"spread wide {spread_pct:.4f}%")
+            else:
+                positives.append(f"spread {spread_pct:.4f}%")
+
+        regime = values.get('market_regime_context')
+        if bool(cfg.get('market_quality_regime_enabled', True)) and isinstance(regime, dict):
+            items = regime.get('items') if isinstance(regime.get('items'), dict) else {}
+            strong_move = float(cfg.get('market_quality_regime_strong_move_pct', 1.5) or 1.5)
+            for raw_symbol, item in items.items():
+                if not isinstance(item, dict):
+                    continue
+                data_seen += 1
+                symbol_label = str(raw_symbol or '')
+                direction = str(item.get('direction') or 'neutral').lower()
+                ret_pct = item.get('return_lookback_pct')
+                ret_value = float(ret_pct) if self._is_valid_number(ret_pct) else 0.0
+                opposite = direction == ('short' if side == 'long' else 'long')
+                aligned = direction == side
+                strong_opposite = (
+                    side == 'long' and ret_value <= -strong_move
+                    or side == 'short' and ret_value >= strong_move
+                )
+                is_btc = symbol_label.upper().startswith('BTC')
+                if opposite and is_btc and strong_opposite:
+                    _block(f"BTC strong opposite regime {direction.upper()} {ret_value:.2f}%")
+                elif opposite and is_btc:
+                    _reduce(0.50, f"BTC opposite regime {direction.upper()}")
+                elif opposite:
+                    _reduce(0.75, f"{symbol_label} opposite regime {direction.upper()}")
+                elif aligned:
+                    positives.append(f"{symbol_label} {direction.upper()}")
+
+        min_multiplier = float(cfg.get('market_quality_min_risk_multiplier', 0.25) or 0.25)
+        if data_seen <= 0 and bool(cfg.get('market_quality_data_required', False)):
+            _block('market quality data missing')
+        elif data_seen <= 0:
+            positives.append('market data neutral')
+        if not hard_block and risk_multiplier < min_multiplier:
+            _block(f"risk multiplier {risk_multiplier:.2f} < min {min_multiplier:.2f}")
+
+        risk_multiplier = max(0.0, min(1.0, float(risk_multiplier)))
+        if hard_block:
+            state = False
+            headline = "BLOCK"
+        elif risk_multiplier < 0.999:
+            state = 'reduced'
+            headline = "REDUCE"
+        else:
+            state = True
+            headline = "PASS"
+        detail_parts = reasons if reasons else positives
+        if not detail_parts:
+            detail_parts = ['neutral']
+        summary = f"{headline} x{risk_multiplier:.2f}: " + "; ".join(detail_parts[:5])
+        return {
+            'enabled': True,
+            'state': state,
+            'risk_multiplier': round(risk_multiplier, 4),
+            'hard_block': bool(hard_block),
+            'summary': summary,
+            'reasons': list(reasons),
+            'positives': list(positives),
+        }
+
+    def _build_utbreakout_market_quality_status_item(self, side, cfg, values):
+        quality = self._evaluate_utbreakout_market_quality(side, cfg, values)
+        return ("시장 품질 게이트", quality.get('state'), quality.get('summary'))
+
     def _record_utbot_filtered_breakout_failure(self, symbol, side, candle_ts, reason):
         side = str(side or '').lower()
         if side not in {'long', 'short'}:
@@ -5918,6 +6135,9 @@ class SignalEngine(BaseEngine):
                 'prediction_edge': _safe_float_or_none(status.get('prediction_edge')),
                 'prediction_score': _safe_float_or_none(status.get('prediction_score')),
                 'prediction_title': status.get('prediction_title'),
+                'market_quality_summary': status.get('market_quality_summary'),
+                'market_quality_risk_multiplier': _safe_float_or_none(status.get('market_quality_risk_multiplier')),
+                'market_regime_summary': status.get('market_regime_summary'),
                 'protection_status': protection_status
             }
             plan = status.get('entry_plan')
@@ -6266,6 +6486,7 @@ class SignalEngine(BaseEngine):
                 f"EMA200 dist={ema_near_pct:.3f}%, Donchian width={don_width_pct:.3f}%"
             )
         })
+        futures_context = {}
         try:
             futures_context = (
                 (auto_analysis or {}).get('futures_context')
@@ -6278,6 +6499,14 @@ class SignalEngine(BaseEngine):
                 status.update(futures_context)
         except Exception as e:
             status['futures_context_error'] = str(e)
+        market_regime_context = {}
+        try:
+            market_regime_context = await self._fetch_utbreakout_market_regime_context(cfg)
+            if isinstance(market_regime_context, dict) and market_regime_context:
+                status['market_regime_context'] = market_regime_context
+                status['market_regime_summary'] = market_regime_context.get('summary')
+        except Exception as e:
+            status['market_regime_error'] = str(e)
 
         filter_values = {
             'entry_price': entry_price,
@@ -6359,6 +6588,7 @@ class SignalEngine(BaseEngine):
             'prediction_edge': status.get('prediction_edge'),
             'prediction_score': status.get('prediction_score'),
             'prediction_title': status.get('prediction_title'),
+            'market_regime_context': market_regime_context,
         }
         filter_items = self._evaluate_utbreakout_set_filter_items(side, selected_set, cfg, filter_values)
         status['set_filter_items'] = filter_items
@@ -6386,6 +6616,20 @@ class SignalEngine(BaseEngine):
                     side=side
                 )
 
+        market_quality = self._evaluate_utbreakout_market_quality(side, cfg, filter_values)
+        market_quality_multiplier = min(1.0, max(0.0, float(market_quality.get('risk_multiplier', 1.0) or 0.0)))
+        status['market_quality'] = market_quality
+        status['market_quality_summary'] = market_quality.get('summary')
+        status['market_quality_risk_multiplier'] = market_quality_multiplier
+        if market_quality.get('hard_block') or market_quality.get('state') is False:
+            return _finish(
+                None,
+                f"REJECTED_MARKET_QUALITY: {market_quality.get('summary')}",
+                'REJECTED_MARKET_QUALITY',
+                record_failure=True,
+                side=side
+            )
+
         if not self._is_valid_number(atr_value) or float(atr_value) <= 0:
             return _finish(None, "REJECTED_ATR_TOO_LOW: ATR risk distance calculation pending", 'REJECTED_ATR_TOO_LOW', record_failure=True, side=side)
 
@@ -6400,6 +6644,9 @@ class SignalEngine(BaseEngine):
             risk_per_trade_percent *= short_risk_multiplier
             max_risk_per_trade_usdt *= short_risk_multiplier
             status['short_risk_multiplier'] = short_risk_multiplier
+        if market_quality_multiplier < 0.999:
+            risk_per_trade_percent *= market_quality_multiplier
+            max_risk_per_trade_usdt *= market_quality_multiplier
         try:
             plan = calculate_risk_plan(
                 side=side,
@@ -6433,6 +6680,9 @@ class SignalEngine(BaseEngine):
             'atr_trailing_activation_r': float(cfg.get('atr_trailing_activation_r', 1.5) or 1.5),
             'short_conservative_enabled': bool(cfg.get('short_conservative_enabled', True)),
             'short_risk_multiplier': float(cfg.get('short_risk_multiplier', 0.5) or 0.5),
+            'market_quality_enabled': bool(cfg.get('market_quality_enabled', True)),
+            'market_quality_risk_multiplier': market_quality_multiplier,
+            'market_quality_summary': market_quality.get('summary'),
         })
         plan, micro_reject = await self._apply_micro_auto_to_utbreakout_plan(
             symbol=symbol,
@@ -6446,6 +6696,7 @@ class SignalEngine(BaseEngine):
             ut_stop=ut_detail.get('curr_stop'),
             total_balance=total_balance,
             free_balance=free_balance,
+            market_quality_risk_multiplier=market_quality_multiplier,
         )
         if micro_reject:
             code = micro_reject.get('reject_code') or 'REJECTED_MICRO_AUTO'
@@ -6495,6 +6746,8 @@ class SignalEngine(BaseEngine):
                 return "만족"
             if state is False:
                 return "불만족"
+            if state == 'reduced':
+                return "축소"
             return "대기"
 
         def _fmt(value, digits=2):
@@ -6613,6 +6866,42 @@ class SignalEngine(BaseEngine):
         except Exception as e:
             htf_error = str(e)
 
+        futures_context = {}
+        try:
+            futures_context = (
+                (auto_analysis or {}).get('futures_context')
+                if isinstance(auto_analysis, dict) and isinstance((auto_analysis or {}).get('futures_context'), dict)
+                else None
+            )
+            if futures_context is None:
+                futures_context = await self._fetch_utbreakout_futures_context(symbol)
+            futures_context = dict(futures_context or {})
+        except Exception as e:
+            futures_context = {'futures_context_error': str(e)}
+        market_regime_context = {}
+        try:
+            market_regime_context = await self._fetch_utbreakout_market_regime_context(cfg)
+            market_regime_context = dict(market_regime_context or {})
+        except Exception as e:
+            market_regime_context = {'error': str(e)}
+
+        def _market_quality_filter_values():
+            values = {
+                'atr_pct': metrics.get('atr_pct'),
+                'funding_rate': futures_context.get('funding_rate'),
+                'next_funding_time': futures_context.get('next_funding_time'),
+                'open_interest_delta_pct': futures_context.get('open_interest_delta_pct'),
+                'taker_buy_sell_ratio': futures_context.get('taker_buy_sell_ratio'),
+                'long_short_ratio': futures_context.get('long_short_ratio'),
+                'orderbook_imbalance_pct': futures_context.get('orderbook_imbalance_pct'),
+                'futures_spread_pct': futures_context.get('futures_spread_pct'),
+                'bid_depth_usdt': futures_context.get('bid_depth_usdt'),
+                'ask_depth_usdt': futures_context.get('ask_depth_usdt'),
+                'basis_pct': futures_context.get('basis_pct'),
+                'market_regime_context': market_regime_context,
+            }
+            return values
+
         daily_count, daily_pnl = self.db.get_daily_stats()
         daily_entries = self.db.get_daily_entry_count()
         max_losses = int(cfg.get('max_consecutive_losses', 3) or 3)
@@ -6660,6 +6949,21 @@ class SignalEngine(BaseEngine):
                     risk_per_trade_percent *= short_risk_multiplier
                     max_risk_per_trade_usdt *= short_risk_multiplier
                     risk_note = f" / 숏 리스크 x{short_risk_multiplier:.2f}"
+                market_quality_for_plan = self._evaluate_utbreakout_market_quality(
+                    side_for_plan,
+                    cfg,
+                    _market_quality_filter_values()
+                )
+                market_quality_multiplier = min(
+                    1.0,
+                    max(0.0, float(market_quality_for_plan.get('risk_multiplier', 1.0) or 0.0))
+                )
+                if market_quality_for_plan.get('state') is False:
+                    risk_note += " / 시장품질 BLOCK"
+                elif market_quality_multiplier < 0.999:
+                    risk_per_trade_percent *= market_quality_multiplier
+                    max_risk_per_trade_usdt *= market_quality_multiplier
+                    risk_note += f" / 시장품질 x{market_quality_multiplier:.2f}"
                 plan = calculate_risk_plan(
                     side=side_for_plan,
                     entry_price=entry_price,
@@ -6788,6 +7092,17 @@ class SignalEngine(BaseEngine):
                 'htf_gap_pct': htf_gap_pct,
                 'htf_supertrend_direction': htf_supertrend_direction,
                 'htf_supertrend_reason': htf_supertrend_reason,
+                'funding_rate': futures_context.get('funding_rate'),
+                'next_funding_time': futures_context.get('next_funding_time'),
+                'open_interest_delta_pct': futures_context.get('open_interest_delta_pct'),
+                'taker_buy_sell_ratio': futures_context.get('taker_buy_sell_ratio'),
+                'long_short_ratio': futures_context.get('long_short_ratio'),
+                'orderbook_imbalance_pct': futures_context.get('orderbook_imbalance_pct'),
+                'futures_spread_pct': futures_context.get('futures_spread_pct'),
+                'bid_depth_usdt': futures_context.get('bid_depth_usdt'),
+                'ask_depth_usdt': futures_context.get('ask_depth_usdt'),
+                'basis_pct': futures_context.get('basis_pct'),
+                'market_regime_context': market_regime_context,
             }
             selected_items = self._evaluate_utbreakout_set_filter_items(side, selected_set, cfg, filter_values)
             items = [
@@ -6796,11 +7111,12 @@ class SignalEngine(BaseEngine):
             items.extend((item.get('name'), item.get('state'), item.get('detail')) for item in selected_items)
             if side == 'short':
                 items.append(self._build_utbreakout_short_guard_status_item(cfg, filter_values))
+            items.append(self._build_utbreakout_market_quality_status_item(side, cfg, filter_values))
             items.extend([
                 ("일일 리스크", daily_ok, daily_detail),
                 ("ATR 손절/RR/수량", risk_ok, balance_detail),
             ])
-            ok = all(item[1] is True for item in items)
+            ok = all(item[1] is True or item[1] == 'reduced' for item in items)
             lines = [f"{side_upper}: {'진입 가능' if ok else '대기'}"]
             lines.extend(_line(idx, label, state, detail) for idx, (label, state, detail) in enumerate(items, 1))
             return ok, lines
@@ -6850,9 +7166,10 @@ class SignalEngine(BaseEngine):
             take_profit_detail,
             micro_line,
             opposite_set_exit_detail,
+            f"시장 레짐: {market_regime_context.get('summary') or '데이터 대기'}",
             f"AUTO 점수: {score_line}",
             self.get_coin_selector_symbol_summary(symbol),
-            "주의: 실제 진입은 아래 선택 Set 조건, 리스크, 숏 가드까지 모두 봅니다.",
+            "주의: 실제 진입은 아래 선택 Set 조건, 리스크, 숏 가드, 시장 품질 게이트까지 모두 봅니다.",
             f"최종: LONG {'가능' if long_ok else '대기'} / SHORT {'가능' if short_ok else '대기'}",
             "",
             *long_lines,
@@ -10194,11 +10511,20 @@ class SignalEngine(BaseEngine):
         ut_stop,
         total_balance,
         free_balance,
+        market_quality_risk_multiplier=1.0,
     ):
         if not self._micro_auto_enabled():
             return base_plan, None
 
         micro_cfg = self._get_micro_auto_config()
+        try:
+            quality_multiplier = min(1.0, max(0.0, float(market_quality_risk_multiplier or 1.0)))
+        except (TypeError, ValueError):
+            quality_multiplier = 1.0
+        if quality_multiplier < 0.999:
+            micro_cfg = dict(micro_cfg)
+            micro_cfg['risk_per_trade_pct'] = float(micro_cfg.get('risk_per_trade_pct', 0.0) or 0.0) * quality_multiplier
+            micro_cfg['max_risk_usdt'] = float(micro_cfg.get('max_risk_usdt', 0.0) or 0.0) * quality_multiplier
         min_notional = await self._get_symbol_min_notional(symbol)
         auto_scores = (auto_analysis or {}).get('scores') if isinstance(auto_analysis, dict) else {}
         micro_plan = build_micro_entry_plan(
@@ -10476,6 +10802,110 @@ class SignalEngine(BaseEngine):
         clean_context = {key: value for key, value in context.items() if value is not None}
         self.utbreakout_futures_context_cache[symbol] = {'cached_at': now, 'data': clean_context}
         return clean_context
+
+    async def _fetch_utbreakout_market_regime_context(self, cfg):
+        if self.is_upbit_mode() or not bool(cfg.get('market_quality_regime_enabled', True)):
+            return {}
+        raw_symbols = cfg.get('market_quality_regime_symbols') or ['BTC/USDT', 'ETH/USDT']
+        if isinstance(raw_symbols, str):
+            symbols = [part.strip() for part in raw_symbols.split(',') if part.strip()]
+        else:
+            symbols = [str(part or '').strip() for part in raw_symbols if str(part or '').strip()]
+        normalized_symbols = []
+        for symbol in symbols:
+            clean = symbol.upper().replace(':USDT', '')
+            if '/' not in clean and clean.endswith('USDT'):
+                clean = f"{clean[:-4]}/USDT"
+            elif '/' not in clean:
+                clean = f"{clean}/USDT"
+            if clean not in normalized_symbols:
+                normalized_symbols.append(clean)
+        normalized_symbols = normalized_symbols[:4] or ['BTC/USDT', 'ETH/USDT']
+
+        timeframe = str(cfg.get('market_quality_regime_timeframe', '4h') or '4h')
+        cache_key = f"{timeframe}:{','.join(normalized_symbols)}"
+        now = time.time()
+        cached = self.utbreakout_market_regime_cache.get(cache_key)
+        if isinstance(cached, dict) and (now - float(cached.get('cached_at', 0) or 0)) < 300:
+            return dict(cached.get('data') or {})
+
+        ema_fast_len = int(cfg.get('ema_fast', 50) or 50)
+        ema_slow_len = int(cfg.get('ema_slow', 200) or 200)
+        limit = max(ema_slow_len + 10, 80)
+        items = {}
+        for symbol in normalized_symbols:
+            ohlcv = None
+            candidates = [symbol]
+            futures_symbol = f"{symbol}:USDT"
+            if futures_symbol not in candidates:
+                candidates.append(futures_symbol)
+            last_error = None
+            for candidate in candidates:
+                try:
+                    ohlcv = await asyncio.to_thread(
+                        self.market_data_exchange.fetch_ohlcv,
+                        candidate,
+                        timeframe,
+                        limit=limit
+                    )
+                    if ohlcv:
+                        break
+                except Exception as exc:
+                    last_error = exc
+                    ohlcv = None
+            if not ohlcv:
+                items[symbol] = {'direction': 'unknown', 'error': str(last_error or 'no ohlcv'), 'timeframe': timeframe}
+                continue
+
+            try:
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                closed = df.iloc[:-1].dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+                if len(closed) < ema_slow_len + 2:
+                    items[symbol] = {
+                        'direction': 'unknown',
+                        'error': f"data {len(closed)}/{ema_slow_len + 2}",
+                        'timeframe': timeframe,
+                    }
+                    continue
+                close_series = closed['close'].astype(float)
+                close = float(close_series.iloc[-1])
+                ema_fast = float(close_series.ewm(span=ema_fast_len, adjust=False).mean().iloc[-1])
+                ema_slow = float(close_series.ewm(span=ema_slow_len, adjust=False).mean().iloc[-1])
+                prev_idx = -4 if len(close_series) >= 4 else 0
+                prev_close = float(close_series.iloc[prev_idx])
+                return_lookback_pct = (close - prev_close) / max(abs(prev_close), 1e-9) * 100.0
+                if close > ema_slow and ema_fast > ema_slow:
+                    direction = 'long'
+                elif close < ema_slow and ema_fast < ema_slow:
+                    direction = 'short'
+                else:
+                    direction = 'neutral'
+                items[symbol] = {
+                    'direction': direction,
+                    'close': close,
+                    'ema_fast': ema_fast,
+                    'ema_slow': ema_slow,
+                    'return_lookback_pct': return_lookback_pct,
+                    'timeframe': timeframe,
+                }
+            except Exception as exc:
+                items[symbol] = {'direction': 'unknown', 'error': str(exc), 'timeframe': timeframe}
+
+        summary_parts = []
+        for symbol, item in items.items():
+            direction = str(item.get('direction') or 'unknown').upper()
+            ret_pct = item.get('return_lookback_pct')
+            ret_text = f" {float(ret_pct):+.2f}%" if self._is_valid_number(ret_pct) else ""
+            summary_parts.append(f"{symbol} {direction}{ret_text}")
+        data = {
+            'items': items,
+            'summary': ', '.join(summary_parts) if summary_parts else 'market regime data unavailable',
+            'timeframe': timeframe,
+        }
+        self.utbreakout_market_regime_cache[cache_key] = {'cached_at': now, 'data': data}
+        return data
 
     async def _load_coin_selector_markets(self):
         try:
