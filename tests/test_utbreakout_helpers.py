@@ -723,6 +723,33 @@ def test_utbreakout_short_guard_requires_htf_and_dmi_alignment():
     assert "-DI > +DI" in reason
 
 
+def test_utbreakout_short_guard_status_item_matches_real_gate():
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    cfg = {
+        "short_conservative_enabled": True,
+        "short_risk_multiplier": 0.5,
+        "short_adx_threshold": 22.0,
+    }
+
+    label, state, detail = engine._build_utbreakout_short_guard_status_item(
+        cfg,
+        {
+            "htf_close": 105,
+            "htf_ema_fast": 110,
+            "htf_ema_slow": 100,
+            "adx": 18,
+            "plus_di": 30,
+            "minus_di": 20,
+        },
+    )
+
+    assert label == "보수적 숏 가드"
+    assert state is False
+    assert "ADX" in detail
+    assert "숏 리스크 x0.50" in detail
+
+
 def test_place_tp_sl_orders_uses_partial_tp_quantity_and_full_sl_quantity():
     pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "2", "entryPrice": "100"}
     engine = _protection_engine([], positions=[pos])

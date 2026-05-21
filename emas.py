@@ -5785,6 +5785,17 @@ class SignalEngine(BaseEngine):
             return False, "; ".join(failed)
         return True, "short guard passed"
 
+    def _build_utbreakout_short_guard_status_item(self, cfg, values):
+        if not bool(cfg.get('short_conservative_enabled', True)):
+            return ("보수적 숏 가드", True, "OFF")
+        ok, reason = self._utbreakout_short_guard_passes(cfg, values)
+        try:
+            risk_multiplier = float(cfg.get('short_risk_multiplier', 0.5) or 0.5)
+        except (TypeError, ValueError):
+            risk_multiplier = 0.5
+        detail = f"ON / {reason} / 숏 리스크 x{risk_multiplier:.2f}"
+        return ("보수적 숏 가드", ok, detail)
+
     def _record_utbot_filtered_breakout_failure(self, symbol, side, candle_ts, reason):
         side = str(side or '').lower()
         if side not in {'long', 'short'}:
@@ -6641,6 +6652,14 @@ class SignalEngine(BaseEngine):
                 total_balance, free_balance, _ = await self.get_balance_info()
                 balance_for_risk = total_balance if total_balance > 0 else free_balance
                 side_for_plan = candidate_side if candidate_side in {'long', 'short'} else 'long'
+                risk_per_trade_percent = float(cfg.get('risk_per_trade_percent', 1.0) or 1.0)
+                max_risk_per_trade_usdt = float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
+                risk_note = ""
+                if side_for_plan == 'short' and bool(cfg.get('short_conservative_enabled', True)):
+                    short_risk_multiplier = min(1.0, max(0.0, float(cfg.get('short_risk_multiplier', 0.5) or 0.5)))
+                    risk_per_trade_percent *= short_risk_multiplier
+                    max_risk_per_trade_usdt *= short_risk_multiplier
+                    risk_note = f" / 숏 리스크 x{short_risk_multiplier:.2f}"
                 plan = calculate_risk_plan(
                     side=side_for_plan,
                     entry_price=entry_price,
@@ -6650,8 +6669,8 @@ class SignalEngine(BaseEngine):
                     take_profit_r_multiple=cfg.get('take_profit_r_multiple', 2.0),
                     min_risk_reward=cfg.get('min_risk_reward', 2.0),
                     balance_usdt=balance_for_risk,
-                    risk_per_trade_percent=cfg.get('risk_per_trade_percent', 1.0),
-                    max_risk_per_trade_usdt=cfg.get('max_risk_per_trade_usdt', 1.0),
+                    risk_per_trade_percent=risk_per_trade_percent,
+                    max_risk_per_trade_usdt=max_risk_per_trade_usdt,
                     leverage=lev,
                 )
                 risk_distance = plan['risk_distance']
@@ -6667,7 +6686,7 @@ class SignalEngine(BaseEngine):
                 risk_ok = True
                 balance_detail = (
                     f"손실한도 {_fmt(risk_usdt, 2)} USDT / 손절거리 {_fmt(risk_distance, 4)} "
-                    f"({_fmt(risk_distance_pct, 3)}%) / qty {_fmt(planned_qty, 6)}"
+                    f"({_fmt(risk_distance_pct, 3)}%) / qty {_fmt(planned_qty, 6)}{risk_note}"
                 )
                 entry_plan_detail = (
                     f"진입 계획: 증거금 {_fmt(planned_margin, 2)} USDT / "
@@ -6775,6 +6794,8 @@ class SignalEngine(BaseEngine):
                 ("UTBot 방향", ut_state, ut_detail_text),
             ]
             items.extend((item.get('name'), item.get('state'), item.get('detail')) for item in selected_items)
+            if side == 'short':
+                items.append(self._build_utbreakout_short_guard_status_item(cfg, filter_values))
             items.extend([
                 ("일일 리스크", daily_ok, daily_detail),
                 ("ATR 손절/RR/수량", risk_ok, balance_detail),
@@ -6831,7 +6852,7 @@ class SignalEngine(BaseEngine):
             opposite_set_exit_detail,
             f"AUTO 점수: {score_line}",
             self.get_coin_selector_symbol_summary(symbol),
-            "주의: AUTO/MTF 지표는 set 선택용이고, 실제 진입은 아래 선택 Set 조건만 봅니다.",
+            "주의: 실제 진입은 아래 선택 Set 조건, 리스크, 숏 가드까지 모두 봅니다.",
             f"최종: LONG {'가능' if long_ok else '대기'} / SHORT {'가능' if short_ok else '대기'}",
             "",
             *long_lines,
