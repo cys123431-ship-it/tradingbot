@@ -247,8 +247,9 @@ class _DummyCtrl:
 
 
 class _FakeExchange:
-    def __init__(self, orders, symbol_scope_returns=True):
+    def __init__(self, orders, symbol_scope_returns=True, positions=None):
         self.orders = list(orders)
+        self.positions = list(positions or [])
         self.cancelled = []
         self.cancel_all_requests = []
         self.symbol_scope_returns = symbol_scope_returns
@@ -257,6 +258,9 @@ class _FakeExchange:
         if symbol and not self.symbol_scope_returns:
             return []
         return list(self.orders)
+
+    def fetch_positions(self, symbols=None):
+        return list(self.positions)
 
     def cancel_all_orders(self, symbol):
         self.cancel_all_requests.append(symbol)
@@ -272,13 +276,18 @@ class _FakeExchange:
         return {"id": order_id}
 
 
-def _protection_engine(orders, symbol_scope_returns=True):
+def _protection_engine(orders, symbol_scope_returns=True, positions=None):
     signal_engine = _signal_engine_cls()
     engine = signal_engine.__new__(signal_engine)
-    engine.exchange = _FakeExchange(orders, symbol_scope_returns=symbol_scope_returns)
+    engine.exchange = _FakeExchange(orders, symbol_scope_returns=symbol_scope_returns, positions=positions)
     engine.ctrl = _DummyCtrl()
     engine.last_protection_alert_ts = {}
     engine.last_protection_order_status = {}
+    engine.last_orphan_protection_sweep_ts = 0.0
+    engine.orphan_protection_candidates = {}
+    engine.ORPHAN_PROTECTION_SWEEP_INTERVAL = 10.0
+    engine.position_cache = {}
+    engine.POSITION_CACHE_TTL = 0.0
     engine.is_upbit_mode = lambda: False
     return engine
 
@@ -348,6 +357,103 @@ def test_reconcile_closed_position_cancels_leftover_tp_and_sl_orders():
     assert status["status"] == "ORPHAN_CANCELLED"
     assert status["orphan_cancelled"] == 2
     assert engine.exchange.orders == []
+
+
+def test_global_orphan_sweep_cancels_leftover_stop_loss_without_tracked_symbol():
+    engine = _protection_engine(
+        [
+            {
+                "id": "sl-orphan",
+                "side": "sell",
+                "type": "market",
+                "info": {
+                    "origType": "STOP_MARKET",
+                    "stopPrice": "95",
+                    "reduceOnly": "true",
+                    "symbol": "BTCUSDT",
+                },
+            }
+        ],
+        positions=[],
+    )
+
+    status = asyncio.run(
+        engine._cleanup_orphan_protection_orders(
+            reason="test orphan sweep",
+            alert=False,
+            min_interval=0,
+            confirm_delay_sec=0,
+        )
+    )
+
+    assert status["status"] == "ORPHAN_CANCELLED"
+    assert status["cancelled"] == 1
+    assert status["symbols"]["BTC/USDT"]["cancelled"] == 1
+    assert engine.exchange.orders == []
+
+
+def test_global_orphan_sweep_keeps_orders_when_position_is_active():
+    engine = _protection_engine(
+        [
+            {
+                "id": "sl-active",
+                "side": "sell",
+                "type": "market",
+                "info": {
+                    "origType": "STOP_MARKET",
+                    "stopPrice": "95",
+                    "reduceOnly": "true",
+                    "symbol": "BTCUSDT",
+                },
+            }
+        ],
+        positions=[{"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "0.1", "entryPrice": "100"}],
+    )
+
+    status = asyncio.run(
+        engine._cleanup_orphan_protection_orders(
+            reason="test active position sweep",
+            alert=False,
+            min_interval=0,
+            confirm_delay_sec=0,
+        )
+    )
+
+    assert status["status"] == "OK"
+    assert status["cancelled"] == 0
+    assert [order["id"] for order in engine.exchange.orders] == ["sl-active"]
+
+
+def test_global_orphan_sweep_requires_confirmation_before_cancelling():
+    engine = _protection_engine(
+        [
+            {
+                "id": "sl-pending",
+                "side": "sell",
+                "type": "market",
+                "info": {
+                    "origType": "STOP_MARKET",
+                    "stopPrice": "95",
+                    "reduceOnly": "true",
+                    "symbol": "BTCUSDT",
+                },
+            }
+        ],
+        positions=[],
+    )
+
+    status = asyncio.run(
+        engine._cleanup_orphan_protection_orders(
+            reason="test pending sweep",
+            alert=False,
+            min_interval=0,
+            confirm_delay_sec=60,
+        )
+    )
+
+    assert status["status"] == "PENDING_CONFIRMATION"
+    assert status["pending"] == 1
+    assert [order["id"] for order in engine.exchange.orders] == ["sl-pending"]
 
 
 def test_cancel_protection_order_tries_raw_binance_symbol_variant():

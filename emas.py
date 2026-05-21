@@ -2568,6 +2568,9 @@ class SignalEngine(BaseEngine):
         self.utbreakout_adaptive_last_decision_ts = {}  # symbol -> tf -> last closed candle evaluated
         self.last_protection_order_status = {}  # symbol -> exchange-side TP/SL audit status
         self.last_protection_alert_ts = {}  # symbol:kind -> last Telegram alert timestamp
+        self.last_orphan_protection_sweep_ts = 0.0
+        self.orphan_protection_candidates = {}  # normalized symbol -> first-seen orphan order signature
+        self.ORPHAN_PROTECTION_SWEEP_INTERVAL = 10.0
         self.coin_selector_last_result = {}  # runtime CoinSelector V2 report
         self.coin_selector_symbol_scores = {}  # normalized symbol -> latest selector score
         self.coin_selector_last_run_ts = 0.0
@@ -2620,6 +2623,8 @@ class SignalEngine(BaseEngine):
         self.utbreakout_adaptive_last_decision_ts = {}
         self.last_protection_order_status = {}
         self.last_protection_alert_ts = {}
+        self.last_orphan_protection_sweep_ts = 0.0
+        self.orphan_protection_candidates = {}
         self.coin_selector_last_result = {}
         self.coin_selector_symbol_scores = {}
         self.coin_selector_last_run_ts = 0.0
@@ -9583,6 +9588,19 @@ class SignalEngine(BaseEngine):
                     f"Signal poll_tick: fetch_positions failed, continuing without server positions ({e})"
                 )
 
+            try:
+                orphan_cleanup = await self._cleanup_orphan_protection_orders(
+                    reason='poll tick orphan protection sweep',
+                    alert=True
+                )
+                if orphan_cleanup.get('cancelled', 0):
+                    logger.warning(
+                        f"Protection orphan sweep cancelled {orphan_cleanup.get('cancelled')} "
+                        f"orders across {len(orphan_cleanup.get('symbols', {}))} symbols"
+                    )
+            except Exception as cleanup_error:
+                logger.warning(f"Protection orphan sweep failed: {cleanup_error}")
+
             # Check Scanner Setting
             scanner_enabled = common_cfg.get('scanner_enabled', True)
             
@@ -14596,6 +14614,202 @@ class SignalEngine(BaseEngine):
         except Exception as e:
             logger.warning(f"Protection audit: fetch_open_orders failed for {symbol or 'ALL'}: {e}")
         return None
+
+    def _protection_position_symbol(self, pos):
+        if not isinstance(pos, dict):
+            return ''
+        info = self._protection_order_info(pos)
+        return str(pos.get('symbol') or info.get('symbol') or info.get('pair') or '').strip()
+
+    def _protection_unified_symbol_from_key(self, symbol_key, fallback=None):
+        raw = str(fallback or '').strip()
+        if '/' in raw:
+            return raw.replace(':USDT', '')
+        normalized = self._normalize_protection_symbol(symbol_key or raw)
+        if normalized.endswith('USDT') and len(normalized) > 4:
+            return f"{normalized[:-4]}/USDT"
+        return raw or normalized
+
+    async def _fetch_active_protection_symbol_keys(self):
+        try:
+            positions = await asyncio.to_thread(self.exchange.fetch_positions)
+        except Exception as e:
+            logger.warning(f"Protection orphan sweep: fetch_positions failed: {e}")
+            return None
+
+        active_keys = set()
+        for pos in positions or []:
+            try:
+                contracts = abs(float(pos.get('contracts', 0) or 0))
+            except (TypeError, ValueError):
+                contracts = 0.0
+            if contracts <= 0:
+                continue
+            symbol_key = self._normalize_protection_symbol(self._protection_position_symbol(pos))
+            if symbol_key:
+                active_keys.add(symbol_key)
+        return active_keys
+
+    def _group_protection_orders_by_symbol(self, orders):
+        grouped = {}
+        unknown_symbol_orders = []
+        for order in orders or []:
+            if not self._is_protection_order(order):
+                continue
+            raw_symbol = self._protection_order_symbol(order)
+            symbol_key = self._normalize_protection_symbol(raw_symbol)
+            if not symbol_key:
+                unknown_symbol_orders.append(order)
+                continue
+            group = grouped.setdefault(
+                symbol_key,
+                {
+                    'symbol': self._protection_unified_symbol_from_key(symbol_key, raw_symbol),
+                    'raw_symbol': raw_symbol,
+                    'orders': []
+                }
+            )
+            group['orders'].append(order)
+        return grouped, unknown_symbol_orders
+
+    def _protection_orders_signature(self, orders):
+        return tuple(sorted(
+            self._protection_order_id(order) or self._protection_client_order_id(order) or str(id(order))
+            for order in orders or []
+        ))
+
+    async def _cleanup_orphan_protection_orders(
+        self,
+        reason='orphan protection sweep',
+        alert=True,
+        min_interval=None,
+        confirm_delay_sec=10.0
+    ):
+        status = {
+            'status': 'SKIPPED',
+            'cancelled': 0,
+            'pending': 0,
+            'symbols': {}
+        }
+        if self.is_upbit_mode():
+            status['status'] = 'UPBIT_SKIPPED'
+            return status
+
+        now_ts = time.time()
+        interval = (
+            float(min_interval)
+            if min_interval is not None
+            else float(getattr(self, 'ORPHAN_PROTECTION_SWEEP_INTERVAL', 10.0) or 10.0)
+        )
+        last_sweep = float(getattr(self, 'last_orphan_protection_sweep_ts', 0.0) or 0.0)
+        if interval > 0 and now_ts - last_sweep < interval:
+            status['status'] = 'THROTTLED'
+            return status
+        self.last_orphan_protection_sweep_ts = now_ts
+
+        active_keys = await self._fetch_active_protection_symbol_keys()
+        if active_keys is None:
+            status['status'] = 'POSITION_FETCH_FAILED'
+            return status
+
+        open_orders = await self._fetch_open_orders_safe(None)
+        if open_orders is None:
+            status['status'] = 'OPEN_ORDERS_FETCH_FAILED'
+            return status
+
+        grouped, unknown_symbol_orders = self._group_protection_orders_by_symbol(open_orders)
+        candidates = getattr(self, 'orphan_protection_candidates', None)
+        if not isinstance(candidates, dict):
+            candidates = {}
+            self.orphan_protection_candidates = candidates
+
+        for symbol_key in list(candidates.keys()):
+            if symbol_key in active_keys or symbol_key not in grouped:
+                candidates.pop(symbol_key, None)
+
+        for symbol_key, group in grouped.items():
+            orders = group.get('orders') or []
+            symbol = group.get('symbol') or symbol_key
+            if symbol_key in active_keys:
+                candidates.pop(symbol_key, None)
+                continue
+
+            signature = self._protection_orders_signature(orders)
+            candidate = candidates.get(symbol_key)
+            if not candidate or tuple(candidate.get('signature') or ()) != signature:
+                candidate = {
+                    'first_seen_ts': now_ts,
+                    'signature': signature,
+                    'symbol': symbol
+                }
+                candidates[symbol_key] = candidate
+                if float(confirm_delay_sec or 0.0) <= 0:
+                    first_seen = now_ts
+                else:
+                    status['pending'] += len(orders)
+                    status['symbols'][symbol] = {
+                        'pending': len(orders),
+                        'cancelled': 0,
+                        'status': 'PENDING_CONFIRMATION'
+                    }
+                    continue
+            else:
+                first_seen = float(candidate.get('first_seen_ts', now_ts) or now_ts)
+
+            if now_ts - first_seen < max(0.0, float(confirm_delay_sec or 0.0)):
+                status['pending'] += len(orders)
+                status['symbols'][symbol] = {
+                    'pending': len(orders),
+                    'cancelled': 0,
+                    'status': 'PENDING_CONFIRMATION'
+                }
+                continue
+
+            pos = await self.get_server_position(symbol, use_cache=False)
+            if pos:
+                candidates.pop(symbol_key, None)
+                continue
+
+            cancelled = await self._cancel_protection_orders(
+                symbol,
+                reason=reason,
+                orders=orders
+            )
+            candidates.pop(symbol_key, None)
+            status['cancelled'] += cancelled
+            status['symbols'][symbol] = {
+                'pending': 0,
+                'cancelled': cancelled,
+                'status': 'ORPHAN_CANCELLED' if cancelled else 'CANCEL_FAILED'
+            }
+            self.last_protection_order_status[symbol] = {
+                'tp_expected': False,
+                'sl_expected': False,
+                'tp_present': False,
+                'sl_present': False,
+                'tp_count': 0,
+                'sl_count': 0,
+                'missing_tp': False,
+                'missing_sl': False,
+                'orphan_cancelled': cancelled,
+                'status': 'ORPHAN_CANCELLED_GLOBAL' if cancelled else 'ORPHAN_CANCEL_FAILED'
+            }
+            if alert and cancelled:
+                await self._notify_protection_issue(
+                    symbol,
+                    f'global_orphan_cancelled:{symbol_key}',
+                    f"ℹ️ {self.ctrl.format_symbol_for_display(symbol)} 포지션 없음: 잔존 보호주문 {cancelled}건 자동 취소"
+                )
+
+        if status['cancelled']:
+            status['status'] = 'ORPHAN_CANCELLED'
+        elif status['pending']:
+            status['status'] = 'PENDING_CONFIRMATION'
+        else:
+            status['status'] = 'OK'
+        if unknown_symbol_orders:
+            status['unknown_symbol_orders'] = len(unknown_symbol_orders)
+        return status
 
     def _protection_cancel_symbol_candidates(self, symbol, order_symbol=None):
         candidates = []
