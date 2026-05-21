@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 import asyncio
 
+import pandas as pd
 import pytest
 
 from utbreakout.indicators import previous_donchian
@@ -354,7 +355,14 @@ class _FakeExchange:
         self.positions = list(positions or [])
         self.cancelled = []
         self.cancel_all_requests = []
+        self.created = []
         self.symbol_scope_returns = symbol_scope_returns
+
+    def amount_to_precision(self, symbol, amount):
+        return str(round(float(amount), 6))
+
+    def price_to_precision(self, symbol, price):
+        return str(round(float(price), 2))
 
     def fetch_open_orders(self, symbol=None):
         if symbol and not self.symbol_scope_returns:
@@ -376,6 +384,35 @@ class _FakeExchange:
             if str(order.get("id") or order.get("info", {}).get("orderId")) != str(order_id)
         ]
         return {"id": order_id}
+
+    def create_order(self, symbol, order_type, side, amount, price=None, params=None):
+        params = dict(params or {})
+        order_id = f"created-{len(self.created) + 1}"
+        info = {
+            "symbol": symbol.replace("/", "").replace(":USDT", ""),
+            "reduceOnly": str(bool(params.get("reduceOnly", False))).lower(),
+        }
+        if str(order_type).lower() == "stop_market":
+            info.update({
+                "type": "STOP_MARKET",
+                "origType": "STOP_MARKET",
+                "stopPrice": params.get("stopPrice"),
+            })
+        order = {
+            "id": order_id,
+            "symbol": symbol,
+            "type": order_type,
+            "side": side,
+            "amount": amount,
+            "price": price,
+            "reduceOnly": bool(params.get("reduceOnly", False)),
+            "clientOrderId": params.get("newClientOrderId"),
+            "info": info,
+            "params": params,
+        }
+        self.created.append(order)
+        self.orders.append(order)
+        return order
 
 
 def _protection_engine(orders, symbol_scope_returns=True, positions=None):
@@ -630,3 +667,155 @@ def test_protection_audit_deduplicates_short_stop_loss_orders():
     assert status["duplicate_cancelled"] == 1
     remaining_ids = {order["id"] for order in engine.exchange.orders}
     assert remaining_ids == {"sl-new", "tp"}
+
+
+def test_utbreakout_defaults_enable_partial_trailing_and_short_guard():
+    emas = _emas_module()
+
+    cfg = emas.build_default_utbot_filtered_breakout_config()
+
+    assert cfg["partial_take_profit_enabled"] is True
+    assert cfg["partial_take_profit_r_multiple"] == 1.5
+    assert cfg["partial_take_profit_ratio"] == 0.5
+    assert cfg["atr_trailing_enabled"] is True
+    assert cfg["atr_trailing_multiplier"] == 2.0
+    assert cfg["atr_trailing_activation_r"] == 1.5
+    assert cfg["short_conservative_enabled"] is True
+    assert cfg["short_risk_multiplier"] == 0.5
+    assert cfg["short_adx_threshold"] == 22.0
+
+
+def test_utbreakout_short_guard_requires_htf_and_dmi_alignment():
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    cfg = {
+        "short_conservative_enabled": True,
+        "short_adx_threshold": 22.0,
+    }
+
+    ok, reason = engine._utbreakout_short_guard_passes(
+        cfg,
+        {
+            "htf_close": 95,
+            "htf_ema_fast": 90,
+            "htf_ema_slow": 100,
+            "adx": 25,
+            "plus_di": 12,
+            "minus_di": 28,
+        },
+    )
+    assert ok is True
+    assert reason == "short guard passed"
+
+    ok, reason = engine._utbreakout_short_guard_passes(
+        cfg,
+        {
+            "htf_close": 105,
+            "htf_ema_fast": 110,
+            "htf_ema_slow": 100,
+            "adx": 18,
+            "plus_di": 30,
+            "minus_di": 20,
+        },
+    )
+    assert ok is False
+    assert "ADX" in reason
+    assert "-DI > +DI" in reason
+
+
+def test_place_tp_sl_orders_uses_partial_tp_quantity_and_full_sl_quantity():
+    pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "2", "entryPrice": "100"}
+    engine = _protection_engine([], positions=[pos])
+
+    async def _get_position(symbol, use_cache=False):
+        return pos
+
+    engine.get_server_position = _get_position
+
+    asyncio.run(
+        engine._place_tp_sl_orders(
+            "BTC/USDT",
+            "long",
+            100,
+            "2",
+            tp_distance=15,
+            sl_distance=10,
+            tp_qty_ratio=0.5,
+        )
+    )
+
+    stop_order = next(order for order in engine.exchange.created if order["type"] == "stop_market")
+    tp_order = next(order for order in engine.exchange.created if order["type"] == "limit")
+    assert float(stop_order["amount"]) == 2.0
+    assert float(stop_order["params"]["stopPrice"]) == 90.0
+    assert float(tp_order["amount"]) == 1.0
+    assert float(tp_order["price"]) == 115.0
+
+
+def test_utbreakout_trailing_replaces_sl_and_keeps_partial_tp_order():
+    pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "1", "entryPrice": "100"}
+    engine = _protection_engine(
+        [
+            {
+                "id": "tp-existing",
+                "side": "sell",
+                "type": "limit",
+                "price": "115",
+                "reduceOnly": True,
+                "info": {"symbol": "BTCUSDT"},
+            },
+            {
+                "id": "sl-old",
+                "side": "sell",
+                "type": "market",
+                "clientOrderId": "utbslBTCUSDTold",
+                "info": {"origType": "STOP_MARKET", "stopPrice": "90", "reduceOnly": "true", "symbol": "BTCUSDT"},
+            },
+        ],
+        positions=[pos],
+    )
+    engine.utbreakout_trailing_states = {
+        "BTC/USDT": {
+            "side": "long",
+            "entry_price": 100.0,
+            "initial_qty": 2.0,
+            "remaining_ratio": 0.5,
+            "risk_distance": 10.0,
+            "activation_r": 1.5,
+            "trailing_atr_multiplier": 1.0,
+            "breakeven_enabled": True,
+            "last_stop_price": 90.0,
+            "active": False,
+        }
+    }
+    rows = []
+    for idx in range(25):
+        close = 100 + idx * 1.5
+        rows.append({
+            "open": close - 0.5,
+            "high": close + 1.0,
+            "low": close - 1.0,
+            "close": close,
+        })
+    df = pd.DataFrame(rows)
+
+    state = asyncio.run(
+        engine._manage_utbreakout_partial_trailing(
+            "BTC/USDT",
+            pos,
+            df,
+            {
+                "atr_length": 14,
+                "atr_trailing_enabled": True,
+                "atr_trailing_multiplier": 1.0,
+                "atr_trailing_breakeven_enabled": True,
+            },
+        )
+    )
+
+    assert state["active"] is True
+    assert ("sl-old", "BTC/USDT") in engine.exchange.cancelled
+    remaining_ids = {order["id"] for order in engine.exchange.orders}
+    assert "tp-existing" in remaining_ids
+    assert "sl-old" not in remaining_ids
+    assert any(order["type"] == "stop_market" for order in engine.exchange.created)

@@ -398,6 +398,16 @@ def build_utbreakout_set_registry():
         'utbot_atr_period': 14,
         'stop_atr_multiplier': 1.5,
         'take_profit_r_multiple': 2.0,
+        'partial_take_profit_enabled': True,
+        'partial_take_profit_r_multiple': 1.5,
+        'partial_take_profit_ratio': 0.5,
+        'atr_trailing_enabled': True,
+        'atr_trailing_multiplier': 2.0,
+        'atr_trailing_activation_r': 1.5,
+        'atr_trailing_breakeven_enabled': True,
+        'short_conservative_enabled': True,
+        'short_risk_multiplier': 0.5,
+        'short_adx_threshold': 22.0,
         'min_risk_reward': 2.0,
     }
     rows = [
@@ -567,6 +577,16 @@ def build_default_utbot_filtered_breakout_config():
         'donchian_width_min_percent': 0.50,
         'stop_atr_multiplier': 1.5,
         'take_profit_r_multiple': 2.0,
+        'partial_take_profit_enabled': True,
+        'partial_take_profit_r_multiple': 1.5,
+        'partial_take_profit_ratio': 0.5,
+        'atr_trailing_enabled': True,
+        'atr_trailing_multiplier': 2.0,
+        'atr_trailing_activation_r': 1.5,
+        'atr_trailing_breakeven_enabled': True,
+        'short_conservative_enabled': True,
+        'short_risk_multiplier': 0.5,
+        'short_adx_threshold': 22.0,
         'min_risk_reward': 2.0,
         'risk_per_trade_percent': 1.0,
         'max_risk_per_trade_usdt': 1.0,
@@ -2562,6 +2582,7 @@ class SignalEngine(BaseEngine):
         self.last_utsmc_candidate_filter_status = {}  # symbol -> candidate filter diagnostics
         self.last_utbot_filtered_breakout_status = {}  # symbol -> filtered breakout diagnostics
         self.utbot_filtered_breakout_entry_plans = {}  # symbol -> accepted risk plan
+        self.utbreakout_trailing_states = {}  # symbol -> partial TP / ATR trailing state
         self.utbot_filtered_breakout_failures = {}  # symbol -> side -> recent failed candidate timestamps
         self.utbreakout_futures_context_cache = {}  # symbol -> cached funding/OI context for research logs
         self.utbreakout_adaptive_tf_state = {}  # symbol -> selected TF stability state
@@ -2617,6 +2638,7 @@ class SignalEngine(BaseEngine):
         self.last_utsmc_candidate_filter_status = {}
         self.last_utbot_filtered_breakout_status = {}
         self.utbot_filtered_breakout_entry_plans = {}
+        self.utbreakout_trailing_states = {}
         self.utbot_filtered_breakout_failures = {}
         self.utbreakout_futures_context_cache = {}
         self.utbreakout_adaptive_tf_state = {}
@@ -5696,6 +5718,73 @@ class SignalEngine(BaseEngine):
             return None
         return plan
 
+    def _clear_utbreakout_trailing_state(self, symbol):
+        states = getattr(self, 'utbreakout_trailing_states', None)
+        if isinstance(states, dict):
+            states.pop(symbol, None)
+
+    def _register_utbreakout_trailing_state(self, symbol, side, entry_price, qty, plan, cfg):
+        if not bool(cfg.get('atr_trailing_enabled', True)):
+            self._clear_utbreakout_trailing_state(symbol)
+            return None
+        try:
+            risk_distance = float(plan.get('risk_distance', 0.0) or 0.0)
+            initial_qty = abs(float(qty or 0.0))
+            entry = float(entry_price or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if risk_distance <= 0 or initial_qty <= 0 or entry <= 0:
+            return None
+        ratio = min(0.9, max(0.0, float(cfg.get('partial_take_profit_ratio', 0.5) or 0.5)))
+        activation_r = max(
+            0.0,
+            float(
+                cfg.get(
+                    'atr_trailing_activation_r',
+                    cfg.get('partial_take_profit_r_multiple', 1.5)
+                ) or 1.5
+            )
+        )
+        state = {
+            'side': str(side or '').lower(),
+            'entry_price': entry,
+            'initial_qty': initial_qty,
+            'remaining_ratio': max(0.0, 1.0 - ratio),
+            'risk_distance': risk_distance,
+            'activation_r': activation_r,
+            'trailing_atr_multiplier': max(0.1, float(cfg.get('atr_trailing_multiplier', 2.0) or 2.0)),
+            'breakeven_enabled': bool(cfg.get('atr_trailing_breakeven_enabled', True)),
+            'last_stop_price': float(plan.get('stop_loss', 0.0) or 0.0),
+            'active': False,
+            'created_at': datetime.now(timezone.utc).isoformat(),
+        }
+        self.utbreakout_trailing_states[symbol] = state
+        return state
+
+    def _utbreakout_short_guard_passes(self, cfg, values):
+        if not bool(cfg.get('short_conservative_enabled', True)):
+            return True, "short guard off"
+        try:
+            htf_close = float(values.get('htf_close'))
+            htf_fast = float(values.get('htf_ema_fast'))
+            htf_slow = float(values.get('htf_ema_slow'))
+            adx = float(values.get('adx'))
+            plus_di = float(values.get('plus_di'))
+            minus_di = float(values.get('minus_di'))
+            threshold = float(cfg.get('short_adx_threshold', cfg.get('adx_threshold', 22.0)) or 22.0)
+        except (TypeError, ValueError):
+            return False, "short guard data pending"
+        checks = [
+            (htf_fast < htf_slow, f"HTF EMA{int(cfg.get('ema_fast', 50) or 50)} < EMA{int(cfg.get('ema_slow', 200) or 200)}"),
+            (htf_close < htf_slow, "HTF close < EMA slow"),
+            (adx >= threshold, f"ADX >= {threshold:.1f}"),
+            (minus_di > plus_di, "-DI > +DI"),
+        ]
+        failed = [label for ok, label in checks if not ok]
+        if failed:
+            return False, "; ".join(failed)
+        return True, "short guard passed"
+
     def _record_utbot_filtered_breakout_failure(self, symbol, side, candle_ts, reason):
         side = str(side or '').lower()
         if side not in {'long', 'short'}:
@@ -6273,6 +6362,19 @@ class SignalEngine(BaseEngine):
                     side=side
                 )
 
+        if side == 'short':
+            short_ok, short_reason = self._utbreakout_short_guard_passes(cfg, filter_values)
+            status['short_guard_enabled'] = bool(cfg.get('short_conservative_enabled', True))
+            status['short_guard_summary'] = short_reason
+            if not short_ok:
+                return _finish(
+                    None,
+                    f"REJECTED_SHORT_GUARD: {short_reason}",
+                    'REJECTED_SHORT_GUARD',
+                    record_failure=True,
+                    side=side
+                )
+
         if not self._is_valid_number(atr_value) or float(atr_value) <= 0:
             return _finish(None, "REJECTED_ATR_TOO_LOW: ATR risk distance calculation pending", 'REJECTED_ATR_TOO_LOW', record_failure=True, side=side)
 
@@ -6280,6 +6382,13 @@ class SignalEngine(BaseEngine):
         balance_for_risk = total_balance if total_balance > 0 else free_balance
         common_cfg = self.get_runtime_common_settings()
         leverage = int(max(1.0, float(common_cfg.get('leverage', 5) or 5)))
+        risk_per_trade_percent = float(cfg.get('risk_per_trade_percent', 1.0) or 1.0)
+        max_risk_per_trade_usdt = float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
+        if side == 'short' and bool(cfg.get('short_conservative_enabled', True)):
+            short_risk_multiplier = min(1.0, max(0.0, float(cfg.get('short_risk_multiplier', 0.5) or 0.5)))
+            risk_per_trade_percent *= short_risk_multiplier
+            max_risk_per_trade_usdt *= short_risk_multiplier
+            status['short_risk_multiplier'] = short_risk_multiplier
         try:
             plan = calculate_risk_plan(
                 side=side,
@@ -6290,8 +6399,8 @@ class SignalEngine(BaseEngine):
                 take_profit_r_multiple=cfg.get('take_profit_r_multiple', 2.0),
                 min_risk_reward=cfg.get('min_risk_reward', 2.0),
                 balance_usdt=balance_for_risk,
-                risk_per_trade_percent=cfg.get('risk_per_trade_percent', 1.0),
-                max_risk_per_trade_usdt=cfg.get('max_risk_per_trade_usdt', 1.0),
+                risk_per_trade_percent=risk_per_trade_percent,
+                max_risk_per_trade_usdt=max_risk_per_trade_usdt,
                 leverage=leverage,
             )
         except ValueError as e:
@@ -6304,7 +6413,15 @@ class SignalEngine(BaseEngine):
             'adaptive_timeframe_enabled': bool(cfg.get('adaptive_timeframe_enabled', False)),
             'atr': atr_value,
             'atr_pct': atr_pct,
-            'decision_candle_ts': decision_ts
+            'decision_candle_ts': decision_ts,
+            'partial_take_profit_enabled': bool(cfg.get('partial_take_profit_enabled', True)),
+            'partial_take_profit_r_multiple': float(cfg.get('partial_take_profit_r_multiple', 1.5) or 1.5),
+            'partial_take_profit_ratio': float(cfg.get('partial_take_profit_ratio', 0.5) or 0.5),
+            'atr_trailing_enabled': bool(cfg.get('atr_trailing_enabled', True)),
+            'atr_trailing_multiplier': float(cfg.get('atr_trailing_multiplier', 2.0) or 2.0),
+            'atr_trailing_activation_r': float(cfg.get('atr_trailing_activation_r', 1.5) or 1.5),
+            'short_conservative_enabled': bool(cfg.get('short_conservative_enabled', True)),
+            'short_risk_multiplier': float(cfg.get('short_risk_multiplier', 0.5) or 0.5),
         })
         plan, micro_reject = await self._apply_micro_auto_to_utbreakout_plan(
             symbol=symbol,
@@ -12844,17 +12961,21 @@ class SignalEngine(BaseEngine):
 
             elif active_strategy in UTBREAKOUT_STRATEGIES:
                 if pos:
+                    filtered_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+                    await self._manage_utbreakout_partial_trailing(symbol, pos, df, filtered_cfg)
                     self.last_entry_reason[symbol] = (
                         f"포지션 보유 중 ({pos['side'].upper()}), UTBOT_FILTERED_BREAKOUT_V1 신규 진입 대기"
                     )
                     self._clear_utbot_filtered_breakout_entry_plan(symbol)
                 elif sig:
+                    self._clear_utbreakout_trailing_state(symbol)
                     self.last_entry_reason[symbol] = f"ACCEPTED_ENTRY: {sig.upper()} filtered breakout -> 진입"
                     logger.info(f"[UTBOT_FILTERED_BREAKOUT_V1] New {sig.upper()} entry")
                     plan = self._get_utbot_filtered_breakout_entry_plan(symbol, sig) or {}
                     entry_ref_price = float(plan.get('entry_price') or k['c'])
                     await self.entry(symbol, sig, entry_ref_price)
                 else:
+                    self._clear_utbreakout_trailing_state(symbol)
                     self._clear_utbot_filtered_breakout_entry_plan(symbol)
 
             elif (active_strategy in MA_STRATEGIES and entry_mode in ['cross', 'position']) or active_strategy == 'cameron':
@@ -14211,17 +14332,37 @@ class SignalEngine(BaseEngine):
                     risk_distance = float(plan.get('risk_distance', 0.0) or 0.0)
                     rr_multiple = float(plan.get('rr_multiple', 2.0) or 2.0)
                     if risk_distance > 0 and rr_multiple > 0:
+                        fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+                        partial_enabled = bool(fb_cfg.get('partial_take_profit_enabled', True))
+                        partial_ratio = (
+                            min(0.9, max(0.0, float(fb_cfg.get('partial_take_profit_ratio', 0.5) or 0.5)))
+                            if partial_enabled else 1.0
+                        )
+                        partial_r = (
+                            float(fb_cfg.get('partial_take_profit_r_multiple', 1.5) or 1.5)
+                            if partial_enabled else rr_multiple
+                        )
                         await self._place_tp_sl_orders(
                             symbol,
                             side,
                             actual_entry_price,
                             qty,
-                            tp_distance=risk_distance * rr_multiple,
-                            sl_distance=risk_distance
+                            tp_distance=risk_distance * partial_r,
+                            sl_distance=risk_distance,
+                            tp_qty_ratio=partial_ratio
+                        )
+                        self._register_utbreakout_trailing_state(
+                            symbol,
+                            side,
+                            actual_entry_price,
+                            qty,
+                            plan,
+                            fb_cfg
                         )
                         logger.info(
                             f"[UTBOT_FILTERED_BREAKOUT_V1] RR protection set: "
-                            f"entry={actual_entry_price:.4f}, risk={risk_distance:.4f}, rr={rr_multiple:.2f}"
+                            f"entry={actual_entry_price:.4f}, risk={risk_distance:.4f}, "
+                            f"partial={partial_ratio:.2f}@{partial_r:.2f}R, trail={fb_cfg.get('atr_trailing_multiplier', 2.0)}ATR"
                         )
                     else:
                         await self.ctrl.notify("⚠️ UTBOT_FILTERED_BREAKOUT_V1 보호 주문 거리 계산 오류")
@@ -15121,12 +15262,154 @@ class SignalEngine(BaseEngine):
             except Exception as e:
                 last_error = e
                 logger.error(f"{label} order attempt {attempt}/{max_attempts} failed for {symbol}: {e}")
-                if attempt < max_attempts:
-                    await asyncio.sleep(0.7)
+            if attempt < max_attempts:
+                await asyncio.sleep(0.7)
         raise last_error
 
-    async def _place_tp_sl_orders(self, symbol, side, entry_price, qty, tp_distance=None, sl_distance=None):
-        """嫄곕옒?뚯뿉 TP/SL 二쇰Ц 諛곗튂 (?ㅽ뵂?ㅻ뜑??蹂댁엫)"""
+    async def _cancel_protection_orders_by_kind(self, symbol, kinds, reason='protection cleanup'):
+        wanted = {str(kind).lower() for kind in (kinds or [])}
+        orders = await self._collect_protection_orders(symbol)
+        selected = [
+            order for order in (orders or [])
+            if self._classify_protection_order(order) in wanted
+        ]
+        if not selected:
+            return 0
+        return await self._cancel_protection_orders(symbol, reason=reason, orders=selected)
+
+    async def _replace_stop_loss_order(self, symbol, pos, stop_price, reason='stop replacement'):
+        if not pos:
+            return None
+        side = str(pos.get('side', '') or '').lower()
+        if side not in {'long', 'short'}:
+            return None
+        qty = self.safe_amount(symbol, abs(float(pos.get('contracts', 0) or 0)))
+        if float(qty) <= 0:
+            return None
+        sl_side = 'sell' if side == 'long' else 'buy'
+        safe_stop = self.safe_price(symbol, float(stop_price))
+        await self._cancel_protection_orders_by_kind(symbol, {'sl'}, reason=reason)
+        return await self._create_protection_order_with_retries(
+            symbol,
+            'stop_market',
+            sl_side,
+            qty,
+            None,
+            {
+                'stopPrice': safe_stop,
+                'reduceOnly': True,
+                'newClientOrderId': self._build_protection_client_order_id(symbol, side, 'sl', pos)
+            },
+            'SL',
+            max_attempts=3
+        )
+
+    async def _manage_utbreakout_partial_trailing(self, symbol, pos, df, cfg):
+        state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
+        if not isinstance(state, dict):
+            return None
+        if not pos:
+            self._clear_utbreakout_trailing_state(symbol)
+            return None
+        if not bool(cfg.get('atr_trailing_enabled', state.get('atr_trailing_enabled', True))):
+            return None
+        side = str(pos.get('side', '') or '').lower()
+        if side != str(state.get('side', '')).lower():
+            self._clear_utbreakout_trailing_state(symbol)
+            return None
+        try:
+            current_qty = abs(float(pos.get('contracts', 0) or 0))
+            entry_price = float(pos.get('entryPrice') or state.get('entry_price') or 0.0)
+            initial_qty = float(state.get('initial_qty') or 0.0)
+            risk_distance = float(state.get('risk_distance') or 0.0)
+            activation_r = float(state.get('activation_r') or 1.5)
+            trailing_mult = float(cfg.get('atr_trailing_multiplier', state.get('trailing_atr_multiplier', 2.0)) or 2.0)
+        except (TypeError, ValueError):
+            return None
+        if current_qty <= 0 or entry_price <= 0 or initial_qty <= 0 or risk_distance <= 0:
+            self._clear_utbreakout_trailing_state(symbol)
+            return None
+
+        closed = df.iloc[:-1].copy().reset_index(drop=True) if df is not None and len(df) >= 3 else None
+        if closed is None or len(closed) < int(cfg.get('atr_length', 14) or 14) + 2:
+            return None
+        for col in ['open', 'high', 'low', 'close']:
+            closed[col] = pd.to_numeric(closed[col], errors='coerce')
+        closed = closed.dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+        if closed.empty:
+            return None
+        current_close = float(closed.iloc[-1]['close'])
+        atr_series = self._calculate_wilder_atr_series(closed, int(cfg.get('atr_length', 14) or 14))
+        atr_value = float(atr_series.iloc[-1]) if self._is_valid_number(atr_series.iloc[-1]) else 0.0
+        if atr_value <= 0:
+            return None
+
+        favorable_move = (
+            current_close - entry_price
+            if side == 'long'
+            else entry_price - current_close
+        )
+        remaining_ratio = float(state.get('remaining_ratio', 0.5) or 0.5)
+        partial_qty_seen = current_qty <= initial_qty * min(0.98, max(0.05, remaining_ratio + 0.05))
+        active = bool(state.get('active')) or favorable_move >= activation_r * risk_distance or partial_qty_seen
+        if not active:
+            return None
+
+        raw_trail = (
+            current_close - (atr_value * trailing_mult)
+            if side == 'long'
+            else current_close + (atr_value * trailing_mult)
+        )
+        if bool(cfg.get('atr_trailing_breakeven_enabled', state.get('breakeven_enabled', True))):
+            raw_trail = max(entry_price, raw_trail) if side == 'long' else min(entry_price, raw_trail)
+
+        last_stop = float(state.get('last_stop_price') or 0.0)
+        new_stop = max(last_stop, raw_trail) if side == 'long' else (min(last_stop, raw_trail) if last_stop > 0 else raw_trail)
+        if side == 'long' and new_stop >= current_close:
+            return None
+        if side == 'short' and new_stop <= current_close:
+            return None
+
+        min_improve = max(abs(current_close) * 0.0002, atr_value * 0.05)
+        improved = (
+            new_stop > last_stop + min_improve
+            if side == 'long'
+            else last_stop <= 0 or new_stop < last_stop - min_improve
+        )
+        if not improved and state.get('active'):
+            return None
+
+        await self._replace_stop_loss_order(
+            symbol,
+            pos,
+            new_stop,
+            reason='UTBreak ATR trailing stop update'
+        )
+        state.update({
+            'active': True,
+            'last_stop_price': float(new_stop),
+            'last_atr': float(atr_value),
+            'last_close': float(current_close),
+            'last_update_ts': datetime.now(timezone.utc).isoformat(),
+        })
+        self.utbreakout_trailing_states[symbol] = state
+        await self.ctrl.notify(
+            f"🧭 UTBreak ATR 트레일링 갱신: {self.ctrl.format_symbol_for_display(symbol)} "
+            f"{side.upper()} SL `{float(new_stop):.4f}`"
+        )
+        return state
+
+    async def _place_tp_sl_orders(
+        self,
+        symbol,
+        side,
+        entry_price,
+        qty,
+        tp_distance=None,
+        sl_distance=None,
+        tp_qty_ratio=1.0
+    ):
+        """Place reduce-only TP/SL protection orders for the current futures position."""
         try:
             if self.is_upbit_mode():
                 logger.info("TP/SL order placement skipped in Upbit spot mode.")
@@ -15136,6 +15419,7 @@ class SignalEngine(BaseEngine):
             sl_order = None
             tp_price = None
             sl_price = None
+            pos = None
             side = str(side or '').lower()
             entry_price = float(entry_price or 0.0)
             if side not in {'long', 'short'} or entry_price <= 0:
@@ -15150,11 +15434,13 @@ class SignalEngine(BaseEngine):
                 pos_entry = float(pos.get('entryPrice') or 0.0)
                 if pos_entry > 0:
                     entry_price = pos_entry
-            qty = self.safe_amount(symbol, abs(float(qty or 0)))
-            if float(qty) <= 0:
-                logger.error(f"Protection placement skipped: invalid qty for {symbol}: {qty}")
+            raw_qty = abs(float(qty or 0))
+            sl_qty = self.safe_amount(symbol, raw_qty)
+            tp_ratio = min(1.0, max(0.0, float(tp_qty_ratio if tp_qty_ratio is not None else 1.0)))
+            tp_qty = self.safe_amount(symbol, raw_qty * tp_ratio) if tp_ratio > 0 else "0"
+            if float(sl_qty) <= 0:
+                logger.error(f"Protection placement skipped: invalid qty for {symbol}: {sl_qty}")
                 return
-
             await self._cancel_protection_orders(symbol, reason='before new protection placement')
             await asyncio.sleep(0.25)
             remaining_before_place = await self._collect_protection_orders(symbol)
@@ -15214,7 +15500,7 @@ class SignalEngine(BaseEngine):
                             symbol,
                             'stop_market',
                             sl_side,
-                            qty,
+                            sl_qty,
                             None,
                             {
                                 'stopPrice': sl_price,
@@ -15245,9 +15531,13 @@ class SignalEngine(BaseEngine):
                         }
                         return
 
-            # Take Profit 二쇰Ц (吏?뺢? + reduceOnly)
+            # Take Profit is allowed to be partial; SL always covers the full current size.
             if tp_price is not None:
-                if not _valid_price('tp', tp_price):
+                if float(tp_qty) <= 0:
+                    logger.warning(f"TP placement skipped: partial TP qty rounds to zero for {symbol}: ratio={tp_ratio}")
+                    tp_price = None
+                    tp_order = None
+                elif not _valid_price('tp', tp_price):
                     await self._notify_protection_issue(
                         symbol,
                         'invalid_tp_price',
@@ -15260,7 +15550,7 @@ class SignalEngine(BaseEngine):
                             symbol,
                             'limit',
                             tp_side,
-                            qty,
+                            tp_qty,
                             tp_price,
                             {
                                 'reduceOnly': True,
@@ -15281,9 +15571,9 @@ class SignalEngine(BaseEngine):
             
             notice_parts = []
             if tp_order and tp_price is not None:
-                notice_parts.append(f"🎯 TP: `{float(tp_price):.2f}`")
+                notice_parts.append(f"🎯 TP: `{float(tp_price):.2f}` x `{float(tp_qty):.6f}`")
             if sl_order and sl_price is not None:
-                notice_parts.append(f"🛑 SL: `{float(sl_price):.2f}`")
+                notice_parts.append(f"🛑 SL: `{float(sl_price):.2f}` x `{float(sl_qty):.6f}`")
             if notice_parts:
                 await self.ctrl.notify(" | ".join(notice_parts))
 
@@ -15394,6 +15684,7 @@ class SignalEngine(BaseEngine):
             self.utsmc_last_entry_signal_ts.pop(symbol, None)
         
         self.db.log_trade_close(symbol, pnl, pnl_pct, exit_price, reason)
+        self._clear_utbreakout_trailing_state(symbol)
         await self.ctrl.notify(
             self._build_signal_exit_notice(symbol, pos, reason, pnl, pnl_pct, exit_price)
         )
@@ -17741,6 +18032,8 @@ class MainController:
                 logger.info("Protection sync skipped: Upbit spot mode does not use futures TP/SL orders.")
                 return
 
+            strategy_params = self.get_active_strategy_params()
+            active_strategy = str(strategy_params.get('active_strategy', '') or '').lower()
             common_cfg = self.get_active_common_settings()
             tp_master_enabled = bool(common_cfg.get('tp_sl_enabled', True))
             tp_enabled = tp_master_enabled and bool(common_cfg.get('take_profit_enabled', True))
@@ -17763,6 +18056,20 @@ class MainController:
                 symbol = raw_symbol.replace(':USDT', '')
                 side = str(p.get('side', '')).lower()
                 if side not in ('long', 'short'):
+                    continue
+
+                if active_strategy in UTBREAKOUT_STRATEGIES:
+                    await self._audit_protection_orders(
+                        symbol,
+                        pos=p,
+                        expected_tp=True,
+                        expected_sl=True,
+                        alert=True
+                    )
+                    refreshed += 1
+                    logger.info(
+                        f"Protection sync audited UTBreak position without overwriting partial TP/trailing SL: {symbol}"
+                    )
                     continue
 
                 try:
@@ -19885,6 +20192,7 @@ UTBot:
             raw_cfg = strategy_params.get('UTBotFilteredBreakoutV1', {})
             if isinstance(raw_cfg, dict):
                 cfg.update(raw_cfg)
+            coin_cfg = sig_cfg.get('coin_selector', {}) if isinstance(sig_cfg.get('coin_selector', {}), dict) else {}
             watchlist = self.get_active_watchlist()
             first_symbol = watchlist[0] if watchlist else 'BTC/USDT'
             engine = self.engines.get('signal')
@@ -19903,12 +20211,6 @@ UTBot:
             auto_name = diag.get('auto_selected_set_name')
             auto_reason = diag.get('auto_selection_reason') or '아직 AUTO 분석 기록 없음'
             adaptive_summary = diag.get('adaptive_timeframe_summary') or '아직 Adaptive TF 분석 기록 없음'
-            active_set_lines = "\n".join(format_utbreakout_set_brief(i) for i in range(1, 11))
-            opposite_pnl_text = (
-                f"PnL≥${float(cfg.get('opposite_set_exit_min_pnl_usdt', 0.0) or 0.0):.2f}"
-                if cfg.get('opposite_set_exit_min_pnl_enabled') else
-                "PnL조건 OFF"
-            )
             menu_title = (
                 'UTBreak 전략 메뉴 (Adaptive TF)'
                 if active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY
@@ -19916,30 +20218,53 @@ UTBot:
             )
             daily_trade_limit = int(float(cfg.get('max_daily_trades', 5) if cfg.get('max_daily_trades', 5) is not None else 5))
             daily_trade_limit_text = "OFF" if daily_trade_limit <= 0 else f"{daily_trade_limit}회"
+            adaptive_on = bool(cfg.get('adaptive_timeframe_enabled')) or active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY
+            auto_set_on = bool(cfg.get('auto_select_enabled', False)) or str(cfg.get('selection_mode', '')).lower() == 'auto'
+            auto_bundle_on = adaptive_on and auto_set_on
+            fixed_symbol = coin_cfg.get('fixed_symbol') or ''
+            custom_symbols = coin_cfg.get('custom_symbols') or []
+            if coin_cfg.get('fixed_symbol_mode_enabled') and fixed_symbol:
+                coin_mode = f"단일 `{fixed_symbol}`"
+            elif coin_cfg.get('custom_universe_enabled') and custom_symbols:
+                coin_mode = f"후보 `{', '.join(custom_symbols[:6])}`"
+            else:
+                coin_mode = f"Watchlist `{', '.join(watchlist[:6]) if watchlist else '없음'}`"
+            partial_enabled = bool(cfg.get('partial_take_profit_enabled', True))
+            partial_text = (
+                f"{float(cfg.get('partial_take_profit_ratio', 0.5) or 0.5) * 100:.0f}% @ "
+                f"{float(cfg.get('partial_take_profit_r_multiple', 1.5) or 1.5):.1f}R"
+                if partial_enabled else
+                "OFF"
+            )
+            trailing_text = (
+                f"{float(cfg.get('atr_trailing_multiplier', 2.0) or 2.0):.1f}ATR / "
+                f"{float(cfg.get('atr_trailing_activation_r', 1.5) or 1.5):.1f}R부터"
+                if cfg.get('atr_trailing_enabled', True) else
+                "OFF"
+            )
+            short_text = (
+                f"ON / 리스크 x{float(cfg.get('short_risk_multiplier', 0.5) or 0.5):.2f}, "
+                f"ADX≥{float(cfg.get('short_adx_threshold', 22.0) or 22.0):.1f}"
+                if cfg.get('short_conservative_enabled', True) else
+                "OFF"
+            )
             return f"""
 🧭 **{menu_title}**
 
 {_format_common_strategy_summary('utbreak')}
 
 상태: `{active_label}`
-선택모드: `{mode_label}` | 수동 Set: `Set{set_id} {set_info.get('name')}` | AUTO 최근: `{('Set' + str(auto_set) + ' ' + str(auto_name)) if auto_set else '대기'}`
-프로필: `{cfg.get('profile', 'set2')}` | 진입 `{cfg.get('entry_timeframe', '15m')}` / 청산 `{cfg.get('exit_timeframe', cfg.get('entry_timeframe', '15m'))}` / HTF `{cfg.get('htf_timeframe', '1h')}`
-Adaptive TF: `{'ON' if cfg.get('adaptive_timeframe_enabled') or active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY else 'OFF'}` | 최근: `{adaptive_summary}`
-UT: `K={float(cfg.get('utbot_key_value', 2.5) or 2.5):.2f}` / `ATR={int(cfg.get('utbot_atr_period', 14) or 14)}`
-선택 Set 조건: `{', '.join(set_info.get('entry_filters') or ['UT only'])}`
-리스크: `SL {float(cfg.get('stop_atr_multiplier', 1.5) or 1.5):.1f}ATR` | `TP {float(cfg.get('take_profit_r_multiple', 2.0) or 2.0):.1f}R` | `1회 최대손실 ${float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0):.2f}`
-손실한도: `1회 min(잔고 x {float(cfg.get('risk_per_trade_percent', 1.0) or 1.0):.2f}%, ${float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0):.2f})` | `일손실 ${float(cfg.get('daily_max_loss_usdt', 3.0) or 3.0):.2f}` | `일거래 {daily_trade_limit_text}`
-옵션: 반대Set청산 `{'ON' if cfg.get('opposite_set_exit_enabled') else 'OFF'}` (`{int(float(cfg.get('opposite_set_exit_min_hold_candles', 3) or 0))}봉`, `{opposite_pnl_text}`) | 청산 후 반대진입 `없음`
-보조청산: EMA/RSI `{'ON' if cfg.get('ema_rsi_exit_enabled') else 'OFF'}` | RSI과열제외 `{'ON' if cfg.get('exclude_rsi_extreme') else 'OFF'}`
+코인: {coin_mode}
+AUTO 묶음: `{'ON' if auto_bundle_on else 'OFF'}` (Set 자동 + Adaptive TF, 코인 선택 제외)
+Set: `{mode_label}` / 수동 `Set{set_id} {set_info.get('name')}` / 최근 AUTO `{('Set' + str(auto_set) + ' ' + str(auto_name)) if auto_set else '대기'}`
+시간봉: 진입 `{cfg.get('entry_timeframe', '15m')}` / 청산 `{cfg.get('exit_timeframe', cfg.get('entry_timeframe', '15m'))}` / HTF `{cfg.get('htf_timeframe', '1h')}`
+Adaptive 최근: `{adaptive_summary}`
+리스크: `SL {float(cfg.get('stop_atr_multiplier', 1.5) or 1.5):.1f}ATR` | 부분익절 `{partial_text}` | ATR 트레일 `{trailing_text}`
+숏 가드: `{short_text}`
+한도: `1회 ${float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0):.2f}` / `일손실 ${float(cfg.get('daily_max_loss_usdt', 3.0) or 3.0):.2f}` / `일거래 {daily_trade_limit_text}`
 
 AUTO 최근 선택 이유:
 `{auto_reason}`
-
-실거래 연결 Set 1~60 (아래는 빠른 버튼용 Set 1~10 요약):
-```
-{active_set_lines}
-```
-Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설명은 `/utbreak sets 1~6`, 수동 선택은 `/utbreak set 57`처럼 입력하세요.
 
 최근 진단({first_symbol}): `{last_reason}`
 진단 요약:
@@ -19949,15 +20274,9 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 
 명령:
 `/utbreak on`, `/utbreak coin EWY`, `/utbreak autoscan on BTC ETH`, `/utbreak autoscan off`
-`/utbreak coinauto on`, `/utbreak coinauto off` - 코인 자동 선택 ON/OFF
-`/utbreak lev 10`, `/utbreak tf 15m`, `/utbreak exit_tf 1h`, `/utbreak target 20`, `/utbreak stop 10`
-`/utbreak auto on` / `auto off` - AUTO set 선택 ON/OFF
-`/utbreak adaptive on` / `adaptive off` - Adaptive 시간봉 전략 ON/OFF
-`/utbreak set 57` 또는 `set57` - Set 1~60 수동 적용
+`/utbreak auto on` / `auto off` - AUTO 묶음 ON/OFF
+`/utbreak set 57`, `/utbreak risk 5`, `/utbreak dailytrades 3`
 `/utbreak sets`, `/utbreak why`, `/utbreak status`, `/utbreak analyze [EWY]`, `/utbreak research`, `/utbreak log`
-`/utbreak risk 5`, `/utbreak riskpct 1`, `/utbreak dailyloss 30`, `/utbreak dailytrades 3`
-`/utbreak micro on`, `/utbreak micro live`, `/utbreak micro off`
-`/utbreak toggle_opposite_set`, `/utbreak opphold 3`, `/utbreak opppnl off`, `/utbreak toggle_ema`, `/utbreak toggle_extreme`
 """.strip()
 
         def _build_utbreakout_keyboard():
@@ -19968,18 +20287,19 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                     InlineKeyboardButton("재개", callback_data="utb:resume")
                 ],
                 [
-                    InlineKeyboardButton("단일코인 설정", callback_data="utb:fixed"),
-                    InlineKeyboardButton("단일코인 해제", callback_data="utb:fixed_off"),
-                    InlineKeyboardButton("UTBot 복귀", callback_data="utb:off")
-                ],
-                [
-                    InlineKeyboardButton("AUTO후보 ON", callback_data="utb:auto_scan"),
-                    InlineKeyboardButton("AUTO후보 OFF", callback_data="utb:auto_scan_off"),
+                    InlineKeyboardButton("AUTO 묶음 ON", callback_data="utb:auto_bundle:on"),
+                    InlineKeyboardButton("AUTO 묶음 OFF", callback_data="utb:auto_bundle:off"),
                     InlineKeyboardButton("AUTO 이유", callback_data="utb:why")
                 ],
                 [
-                    InlineKeyboardButton("코인 자동 선택 ON", callback_data="utb:coin_auto:on"),
-                    InlineKeyboardButton("코인 자동 선택 OFF", callback_data="utb:coin_auto:off")
+                    InlineKeyboardButton("추천 Set7", callback_data="utb:set:7"),
+                    InlineKeyboardButton("Set 목록", callback_data="utb:sets"),
+                    InlineKeyboardButton("진입 분석", callback_data="utb:entry_analyze")
+                ],
+                [
+                    InlineKeyboardButton("단일코인 설정", callback_data="utb:fixed"),
+                    InlineKeyboardButton("단일코인 해제", callback_data="utb:fixed_off"),
+                    InlineKeyboardButton("UTBot 복귀", callback_data="utb:off")
                 ],
                 [
                     InlineKeyboardButton("Lev 5x", callback_data="utb:lev:5"),
@@ -19992,94 +20312,16 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                     InlineKeyboardButton("청산 1h", callback_data="utb:exit_tf:1h")
                 ],
                 [
-                    InlineKeyboardButton("TP ON", callback_data="utb:target:on"),
-                    InlineKeyboardButton("TP OFF", callback_data="utb:target:off"),
-                    InlineKeyboardButton("SL ON", callback_data="utb:stop:on"),
-                    InlineKeyboardButton("SL OFF", callback_data="utb:stop:off")
-                ],
-                [
-                    InlineKeyboardButton("AUTO ON", callback_data="utb:auto:on"),
-                    InlineKeyboardButton("AUTO OFF", callback_data="utb:auto:off"),
-                    InlineKeyboardButton("Adaptive ON", callback_data="utb:adaptive:on")
-                ],
-                [
-                    InlineKeyboardButton("Adaptive OFF", callback_data="utb:adaptive:off"),
-                    InlineKeyboardButton("Micro DRY", callback_data="utb:micro:dry"),
-                    InlineKeyboardButton("Micro OFF", callback_data="utb:micro:off")
-                ],
-                [
-                    InlineKeyboardButton("Set1", callback_data="utb:set:1"),
-                    InlineKeyboardButton("Set2", callback_data="utb:set:2"),
-                    InlineKeyboardButton("Set3", callback_data="utb:set:3"),
-                    InlineKeyboardButton("Set4", callback_data="utb:set:4"),
-                    InlineKeyboardButton("Set5", callback_data="utb:set:5")
-                ],
-                [
-                    InlineKeyboardButton("Set6", callback_data="utb:set:6"),
-                    InlineKeyboardButton("Set7", callback_data="utb:set:7"),
-                    InlineKeyboardButton("Set8", callback_data="utb:set:8"),
-                    InlineKeyboardButton("Set9", callback_data="utb:set:9"),
-                    InlineKeyboardButton("Set10", callback_data="utb:set:10")
-                ],
-                [
-                    InlineKeyboardButton("50 Set 설명", callback_data="utb:sets")
-                ],
-                [
-                    InlineKeyboardButton("1회손실 $0.5", callback_data="utb:risk:0.5"),
                     InlineKeyboardButton("1회손실 $1", callback_data="utb:risk:1"),
-                    InlineKeyboardButton("1회손실 $2", callback_data="utb:risk:2"),
-                    InlineKeyboardButton("1회손실 $5", callback_data="utb:risk:5")
-                ],
-                [
-                    InlineKeyboardButton("1회손실 $10", callback_data="utb:risk:10"),
-                    InlineKeyboardButton("1회손실 $25", callback_data="utb:risk:25"),
-                    InlineKeyboardButton("1회손실 $50", callback_data="utb:risk:50")
-                ],
-                [
-                    InlineKeyboardButton("Risk 0.5%", callback_data="utb:riskpct:0.5"),
-                    InlineKeyboardButton("Risk 1%", callback_data="utb:riskpct:1"),
-                    InlineKeyboardButton("Risk 2%", callback_data="utb:riskpct:2")
-                ],
-                [
-                    InlineKeyboardButton("일손실 $3", callback_data="utb:dailyloss:3"),
-                    InlineKeyboardButton("일손실 $10", callback_data="utb:dailyloss:10"),
-                    InlineKeyboardButton("일손실 $20", callback_data="utb:dailyloss:20"),
-                    InlineKeyboardButton("일손실 $30", callback_data="utb:dailyloss:30")
-                ],
-                [
-                    InlineKeyboardButton("일손실 $50", callback_data="utb:dailyloss:50"),
-                    InlineKeyboardButton("일손실 $100", callback_data="utb:dailyloss:100")
-                ],
-                [
-                    InlineKeyboardButton("일거래 1회", callback_data="utb:dailytrades:1"),
                     InlineKeyboardButton("일거래 3회", callback_data="utb:dailytrades:3"),
-                    InlineKeyboardButton("일거래 5회", callback_data="utb:dailytrades:5"),
-                    InlineKeyboardButton("일거래 10회", callback_data="utb:dailytrades:10")
-                ],
-                [
-                    InlineKeyboardButton("반대Set청산", callback_data="utb:toggle_opposite_set"),
-                    InlineKeyboardButton("보유0봉", callback_data="utb:opphold:0"),
-                    InlineKeyboardButton("보유3봉", callback_data="utb:opphold:3")
-                ],
-                [
-                    InlineKeyboardButton("PnL조건 OFF", callback_data="utb:opppnl:off"),
-                    InlineKeyboardButton("PnL≥$0", callback_data="utb:opppnl:0"),
-                    InlineKeyboardButton("PnL≥-$25", callback_data="utb:opppnl:-25")
-                ],
-                [
-                    InlineKeyboardButton("EMA청산", callback_data="utb:toggle_ema"),
-                    InlineKeyboardButton("RSI과열", callback_data="utb:toggle_extreme")
+                    InlineKeyboardButton("일손실 $10", callback_data="utb:dailyloss:10")
                 ],
                 [
                     InlineKeyboardButton("조건 스테이터스", callback_data="utb:condition_status"),
-                    InlineKeyboardButton("진입 분석", callback_data="utb:entry_analyze"),
                     InlineKeyboardButton("리서치 요약", callback_data="utb:research")
                 ],
                 [
-                    InlineKeyboardButton("진단 로그 다운로드", callback_data="utb:download"),
-                    InlineKeyboardButton("리서치 다운로드", callback_data="utb:research_download")
-                ],
-                [
+                    InlineKeyboardButton("진단 로그", callback_data="utb:download"),
                     InlineKeyboardButton("새로고침", callback_data="utb:status")
                 ]
             ])
@@ -20488,22 +20730,17 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                 else:
                     await u.message.reply_text("❌ 예: `/utbreak micro on`, `/utbreak micro live`, `/utbreak micro off`", parse_mode=ParseMode.MARKDOWN)
                     return
-            elif action in {'auto', 'autoset', 'auto_select'}:
+            elif action in {'auto', 'autoset', 'auto_select', 'bundle', 'autobundle', 'auto_bundle'}:
                 mode = str(args[1]).strip().lower() if len(args) > 1 else ''
                 if mode not in {'on', 'off', 'enable', 'disable'}:
                     await u.message.reply_text("❌ 예: `/utbreak auto on` 또는 `/utbreak auto off`", parse_mode=ParseMode.MARKDOWN)
                     return
-                enabled = mode in {'on', 'enable'}
-                await self.cfg.update_value(
-                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'auto_select_enabled'],
-                    enabled
+                notice = (
+                    await _enable_utbreak_auto_bundle()
+                    if mode in {'on', 'enable'} else
+                    await _disable_utbreak_auto_bundle()
                 )
-                await self.cfg.update_value(
-                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'],
-                    'auto' if enabled else 'manual'
-                )
-                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
-                await u.message.reply_text(f"✅ AUTO Set 선택: {'ON' if enabled else 'OFF'}")
+                await u.message.reply_text(notice, parse_mode=ParseMode.MARKDOWN)
             elif action in {'adaptive', 'tfauto', 'timeframe', 'timeframe_auto'}:
                 mode = str(args[1]).strip().lower() if len(args) > 1 else ''
                 if mode not in {'on', 'off', 'enable', 'disable'}:
@@ -20827,18 +21064,14 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                     await _edit_utbreakout_menu(query, "❌ Micro Auto 버튼 값 처리 실패")
                 return
 
-            if action == 'auto':
+            if action in {'auto', 'auto_bundle'}:
                 enabled = str(value or '').lower() in {'on', 'enable', '1', 'true'}
-                await self.cfg.update_value(
-                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'auto_select_enabled'],
-                    enabled
+                notice = (
+                    await _enable_utbreak_auto_bundle()
+                    if enabled else
+                    await _disable_utbreak_auto_bundle()
                 )
-                await self.cfg.update_value(
-                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'],
-                    'auto' if enabled else 'manual'
-                )
-                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
-                await _edit_utbreakout_menu(query, f"✅ AUTO Set 선택: {'ON' if enabled else 'OFF'}")
+                await _edit_utbreakout_menu(query, notice)
                 return
 
             if action == 'adaptive':
@@ -21463,7 +21696,7 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                         )
             lines.extend([
                 "",
-                "명령: `/utbreak coin EWY`, `/utbreak coin off`, `/utbreak autoscan on BTC ETH SOL`, `/utbreak coinauto on`, `/utbreak coinauto off`",
+                "명령: `/utbreak coin EWY`, `/utbreak coin off`, `/utbreak autoscan on BTC ETH SOL`, `/utbreak auto on`, `/utbreak auto off`",
             ])
             return "\n".join(lines).strip()
 
@@ -21475,6 +21708,46 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
             engine.coin_selector_symbol_scores = {}
             engine.coin_selector_last_run_ts = 0.0
             engine.micro_auto_last_scan = {}
+
+        async def _enable_utbreak_auto_bundle():
+            await _ensure_signal_engine_active()
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'], 'auto')
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'auto_select_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
+            engine = self._reset_signal_engine_runtime_state(
+                reset_entry_cache=True,
+                reset_exit_cache=True,
+                reset_stateful_strategy=True
+            )
+            if engine:
+                engine.scanner_active_symbol = None
+                engine.active_symbols.clear()
+                for item in self.get_active_watchlist():
+                    engine.active_symbols.add(item)
+            return "✅ AUTO 묶음 ON: Set 자동 선택 + Adaptive TF를 켰습니다. 코인 선택 설정은 변경하지 않았습니다."
+
+        async def _disable_utbreak_auto_bundle():
+            await _ensure_signal_engine_active()
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_FILTERED_BREAKOUT_STRATEGY)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'], 'manual')
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'auto_select_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
+            engine = self._reset_signal_engine_runtime_state(
+                reset_entry_cache=True,
+                reset_exit_cache=True,
+                reset_stateful_strategy=True
+            )
+            if engine:
+                engine.scanner_active_symbol = None
+                engine.active_symbols.clear()
+                for item in self.get_active_watchlist():
+                    engine.active_symbols.add(item)
+            return "✅ AUTO 묶음 OFF: 수동 Set + 고정 시간봉으로 돌렸습니다. 코인 선택 설정은 변경하지 않았습니다."
 
         async def _enable_customcoins(symbols):
             normalized = normalize_coin_selector_custom_symbols(symbols)
