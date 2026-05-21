@@ -72,6 +72,11 @@ def summarize_diagnostic_events(events, protection_status=None):
     rejected = [event for event in events if str(event.get("code") or "").startswith("REJECTED_")]
     accepted = [event for event in events if event.get("code") == "ACCEPTED_ENTRY"]
     blocked = [event for event in events if event.get("event") == "entry_blocked"]
+    shadow = [
+        event for event in events
+        if event.get("event") == "shadow_outcome" or str(event.get("code") or "").startswith("SHADOW_")
+    ]
+    shadow_counts = Counter(str(event.get("shadow_outcome") or event.get("outcome") or "unknown").lower() for event in shadow)
     set_counts = Counter(
         f"Set{int(event.get('auto_selected_set_id'))}"
         for event in events
@@ -125,6 +130,12 @@ def summarize_diagnostic_events(events, protection_status=None):
         "avg_take_profit_pct": _avg(event.get("take_profit_pct") for event in events),
         "avg_slippage_pct": _avg(event.get("entry_slippage_pct") for event in events),
         "funding_events": sum(1 for event in events if event.get("funding_rate") is not None),
+        "shadow_count": len(shadow),
+        "shadow_outcomes": shadow_counts.most_common(),
+        "shadow_tp_rate_pct": (shadow_counts.get("tp", 0) / max(len(shadow), 1) * 100.0),
+        "shadow_avg_pnl_r": _avg(event.get("pnl_r") for event in shadow),
+        "shadow_avg_mfe_r": _avg(event.get("mfe_r") for event in shadow),
+        "shadow_avg_mae_r": _avg(event.get("mae_r") for event in shadow),
         "protection_missing_sl": protection_missing_sl,
         "protection_missing_tp": protection_missing_tp,
         "protection_orphan_cancelled": protection_orphan,
@@ -162,6 +173,7 @@ def format_research_summary(events, protection_status=None, days=7):
         f"Avg risk: {_fmt(summary['avg_risk_usdt'], 2)} USDT / stop distance {_fmt(summary['avg_risk_distance_pct'], 3)}% / TP distance {_fmt(summary['avg_take_profit_pct'], 3)}%",
         f"Avg planned: margin {_fmt(summary['avg_planned_margin'], 2)} USDT / notional {_fmt(summary['avg_planned_notional'], 2)} USDT",
         f"Avg slippage: {_fmt(summary['avg_slippage_pct'], 4)}% / funding samples: {summary['funding_events']}",
+        f"Shadow outcomes: {_format_pairs(summary['shadow_outcomes'])} / TP rate {_fmt(summary['shadow_tp_rate_pct'], 1)}% / avg {_fmt(summary['shadow_avg_pnl_r'], 2)}R / MFE {_fmt(summary['shadow_avg_mfe_r'], 2)}R / MAE {_fmt(summary['shadow_avg_mae_r'], 2)}R",
         f"Protection missing SL: {', '.join(summary['protection_missing_sl']) or 'none'}",
         f"Protection missing TP: {', '.join(summary['protection_missing_tp']) or 'none'}",
         f"Orphan protection cleaned: {', '.join(summary['protection_orphan_cancelled']) or 'none'}",

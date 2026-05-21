@@ -58,6 +58,11 @@ from utbreakout.coinselector import (
 from utbreakout.research import format_research_summary
 from utbreakout.risk import calculate_risk_plan
 from utbreakout.timeframe import HTF_MAP as UTBREAKOUT_HTF_MAP, select_adaptive_timeframe
+from utbreakout.adaptive import (
+    build_strategy_adaptation,
+    evaluate_shadow_triple_barrier,
+    summarize_shadow_outcomes,
+)
 from utbreakout.micro_auto import (
     MICRO_AUTO_STRATEGY_KEY,
     assess_micro_market_feasibility,
@@ -419,6 +424,31 @@ def build_utbreakout_set_registry():
         'market_quality_regime_symbols': ['BTC/USDT', 'ETH/USDT'],
         'market_quality_regime_timeframe': '4h',
         'market_quality_regime_strong_move_pct': 1.5,
+        'shadow_triple_barrier_enabled': True,
+        'shadow_triple_barrier_max_bars': 24,
+        'adaptive_exit_enabled': True,
+        'adaptive_exit_min_samples': 8,
+        'adaptive_exit_lookback_days': 14,
+        'adaptive_exit_partial_r_min': 1.0,
+        'adaptive_exit_partial_r_max': 1.8,
+        'adaptive_exit_ratio_min': 0.35,
+        'adaptive_exit_ratio_max': 0.65,
+        'adaptive_exit_trailing_multiplier_min': 1.4,
+        'adaptive_exit_trailing_multiplier_max': 2.6,
+        'adaptive_exit_activation_r_min': 1.0,
+        'adaptive_exit_activation_r_max': 1.8,
+        'volatility_targeting_enabled': True,
+        'volatility_target_atr_pct': 1.0,
+        'volatility_target_min_multiplier': 0.25,
+        'meta_labeling_enabled': True,
+        'meta_labeling_min_samples': 12,
+        'meta_labeling_min_multiplier': 0.5,
+        'strategy_adaptive_min_risk_multiplier': 0.25,
+        'short_asymmetry_enabled': True,
+        'short_partial_take_profit_r_delta': 0.20,
+        'short_partial_take_profit_ratio_add': 0.10,
+        'short_atr_trailing_multiplier_delta': 0.25,
+        'short_atr_trailing_activation_r_delta': 0.20,
         'min_risk_reward': 2.0,
     }
     rows = [
@@ -609,6 +639,31 @@ def build_default_utbot_filtered_breakout_config():
         'market_quality_regime_symbols': ['BTC/USDT', 'ETH/USDT'],
         'market_quality_regime_timeframe': '4h',
         'market_quality_regime_strong_move_pct': 1.5,
+        'shadow_triple_barrier_enabled': True,
+        'shadow_triple_barrier_max_bars': 24,
+        'adaptive_exit_enabled': True,
+        'adaptive_exit_min_samples': 8,
+        'adaptive_exit_lookback_days': 14,
+        'adaptive_exit_partial_r_min': 1.0,
+        'adaptive_exit_partial_r_max': 1.8,
+        'adaptive_exit_ratio_min': 0.35,
+        'adaptive_exit_ratio_max': 0.65,
+        'adaptive_exit_trailing_multiplier_min': 1.4,
+        'adaptive_exit_trailing_multiplier_max': 2.6,
+        'adaptive_exit_activation_r_min': 1.0,
+        'adaptive_exit_activation_r_max': 1.8,
+        'volatility_targeting_enabled': True,
+        'volatility_target_atr_pct': 1.0,
+        'volatility_target_min_multiplier': 0.25,
+        'meta_labeling_enabled': True,
+        'meta_labeling_min_samples': 12,
+        'meta_labeling_min_multiplier': 0.5,
+        'strategy_adaptive_min_risk_multiplier': 0.25,
+        'short_asymmetry_enabled': True,
+        'short_partial_take_profit_r_delta': 0.20,
+        'short_partial_take_profit_ratio_add': 0.10,
+        'short_atr_trailing_multiplier_delta': 0.25,
+        'short_atr_trailing_activation_r_delta': 0.20,
         'min_risk_reward': 2.0,
         'risk_per_trade_percent': 1.0,
         'max_risk_per_trade_usdt': 1.0,
@@ -2608,6 +2663,9 @@ class SignalEngine(BaseEngine):
         self.utbot_filtered_breakout_failures = {}  # symbol -> side -> recent failed candidate timestamps
         self.utbreakout_futures_context_cache = {}  # symbol -> cached funding/OI context for research logs
         self.utbreakout_market_regime_cache = {}  # cache key -> BTC/ETH broad market regime
+        self.utbreakout_shadow_pending = {}  # key -> pending triple-barrier observation
+        self.utbreakout_shadow_resolved_keys = set()  # keys already logged in this runtime
+        self.utbreakout_shadow_stats_cache = {}  # cache key -> recent shadow stats
         self.utbreakout_adaptive_tf_state = {}  # symbol -> selected TF stability state
         self.utbreakout_adaptive_last_decision_ts = {}  # symbol -> tf -> last closed candle evaluated
         self.last_protection_order_status = {}  # symbol -> exchange-side TP/SL audit status
@@ -2665,6 +2723,9 @@ class SignalEngine(BaseEngine):
         self.utbot_filtered_breakout_failures = {}
         self.utbreakout_futures_context_cache = {}
         self.utbreakout_market_regime_cache = {}
+        self.utbreakout_shadow_pending = {}
+        self.utbreakout_shadow_resolved_keys = set()
+        self.utbreakout_shadow_stats_cache = {}
         self.utbreakout_adaptive_tf_state = {}
         self.utbreakout_adaptive_last_decision_ts = {}
         self.last_protection_order_status = {}
@@ -4195,7 +4256,33 @@ class SignalEngine(BaseEngine):
             'daily_profit_target_usdt': 5.0,
             'opposite_set_exit_min_pnl_usdt': 0.0,
             'adaptive_timeframe_min_score': 45.0,
-            'adaptive_timeframe_switch_margin': 8.0
+            'adaptive_timeframe_switch_margin': 8.0,
+            'partial_take_profit_r_multiple': 1.5,
+            'partial_take_profit_ratio': 0.5,
+            'atr_trailing_multiplier': 2.0,
+            'atr_trailing_activation_r': 1.5,
+            'market_quality_min_risk_multiplier': 0.25,
+            'market_quality_high_atr_pct': 1.5,
+            'market_quality_extreme_atr_pct': 2.5,
+            'market_quality_adverse_funding_soft': 0.0006,
+            'market_quality_adverse_funding_hard': 0.0015,
+            'market_quality_regime_strong_move_pct': 1.5,
+            'adaptive_exit_partial_r_min': 1.0,
+            'adaptive_exit_partial_r_max': 1.8,
+            'adaptive_exit_ratio_min': 0.35,
+            'adaptive_exit_ratio_max': 0.65,
+            'adaptive_exit_trailing_multiplier_min': 1.4,
+            'adaptive_exit_trailing_multiplier_max': 2.6,
+            'adaptive_exit_activation_r_min': 1.0,
+            'adaptive_exit_activation_r_max': 1.8,
+            'volatility_target_atr_pct': 1.0,
+            'volatility_target_min_multiplier': 0.25,
+            'meta_labeling_min_multiplier': 0.5,
+            'strategy_adaptive_min_risk_multiplier': 0.25,
+            'short_partial_take_profit_r_delta': 0.20,
+            'short_partial_take_profit_ratio_add': 0.10,
+            'short_atr_trailing_multiplier_delta': 0.25,
+            'short_atr_trailing_activation_r_delta': 0.20
         }.items():
             min_value = None if key == 'opposite_set_exit_min_pnl_usdt' else 0.0
             _float(key, default, min_value)
@@ -4212,7 +4299,11 @@ class SignalEngine(BaseEngine):
             'max_daily_trades': 5,
             'max_consecutive_losses': 3,
             'opposite_set_exit_min_hold_candles': 3,
-            'adaptive_timeframe_min_hold_candles': 3
+            'adaptive_timeframe_min_hold_candles': 3,
+            'shadow_triple_barrier_max_bars': 24,
+            'adaptive_exit_min_samples': 8,
+            'adaptive_exit_lookback_days': 14,
+            'meta_labeling_min_samples': 12
         }.items():
             min_value = 0 if key == 'opposite_set_exit_min_hold_candles' else 1
             _int(key, default, min_value)
@@ -4264,7 +4355,19 @@ class SignalEngine(BaseEngine):
             'opposite_set_exit_min_pnl_enabled',
             'ema_rsi_exit_enabled',
             'adx_donchian_exit_enabled',
-            'adaptive_timeframe_enabled'
+            'adaptive_timeframe_enabled',
+            'partial_take_profit_enabled',
+            'atr_trailing_enabled',
+            'atr_trailing_breakeven_enabled',
+            'short_conservative_enabled',
+            'market_quality_enabled',
+            'market_quality_data_required',
+            'market_quality_regime_enabled',
+            'shadow_triple_barrier_enabled',
+            'adaptive_exit_enabled',
+            'volatility_targeting_enabled',
+            'meta_labeling_enabled',
+            'short_asymmetry_enabled'
         ):
             cfg[key] = bool(cfg.get(key, False))
         # A-option (opposite UT signal only) is intentionally rejected for UT Breakout.
@@ -6013,6 +6116,164 @@ class SignalEngine(BaseEngine):
         quality = self._evaluate_utbreakout_market_quality(side, cfg, values)
         return ("시장 품질 게이트", quality.get('state'), quality.get('summary'))
 
+    def _utbreakout_shadow_key(self, symbol, side, decision_ts, set_id):
+        return f"{str(symbol or '').upper()}:{str(side or '').lower()}:{int(decision_ts or 0)}:{set_id or 'set'}"
+
+    def _register_utbreakout_shadow_candidate(self, symbol, side, status, plan, cfg, selected_set):
+        if not bool(cfg.get('shadow_triple_barrier_enabled', True)):
+            return None
+        if not isinstance(plan, dict):
+            return None
+        decision_ts = int(plan.get('decision_candle_ts') or status.get('decision_candle_ts') or 0)
+        if decision_ts <= 0:
+            return None
+        set_id = selected_set.get('id') if isinstance(selected_set, dict) else status.get('auto_selected_set_id')
+        key = self._utbreakout_shadow_key(symbol, side, decision_ts, set_id)
+        if key in getattr(self, 'utbreakout_shadow_resolved_keys', set()):
+            return None
+        pending = getattr(self, 'utbreakout_shadow_pending', {})
+        if not isinstance(pending, dict):
+            pending = {}
+            self.utbreakout_shadow_pending = pending
+        if key in pending:
+            return pending[key]
+        item = {
+            'key': key,
+            'symbol': symbol,
+            'side': str(side or '').lower(),
+            'decision_ts': decision_ts,
+            'entry_price': plan.get('entry_price') or status.get('entry_price'),
+            'stop_loss': plan.get('stop_loss'),
+            'take_profit': plan.get('take_profit'),
+            'risk_distance': plan.get('risk_distance'),
+            'take_profit_r_multiple': plan.get('rr_multiple') or cfg.get('take_profit_r_multiple', 2.0),
+            'max_bars': int(cfg.get('shadow_triple_barrier_max_bars', 24) or 24),
+            'auto_selected_set_id': set_id,
+            'auto_selected_set_name': selected_set.get('name') if isinstance(selected_set, dict) else status.get('auto_selected_set_name'),
+            'entry_timeframe': plan.get('entry_timeframe') or cfg.get('entry_timeframe', '15m'),
+            'htf_timeframe': plan.get('htf_timeframe') or cfg.get('htf_timeframe', '1h'),
+            'created_at': datetime.now(timezone.utc).isoformat(),
+        }
+        pending[key] = item
+        return item
+
+    def _update_utbreakout_shadow_triple_barrier(self, symbol, closed, cfg):
+        if not bool(cfg.get('shadow_triple_barrier_enabled', True)):
+            return []
+        pending = getattr(self, 'utbreakout_shadow_pending', {})
+        if not isinstance(pending, dict) or not pending:
+            return []
+        if closed is None or len(closed) < 2:
+            return []
+        resolved = []
+        for key, item in list(pending.items()):
+            if item.get('symbol') != symbol:
+                continue
+            result = evaluate_shadow_triple_barrier(
+                side=item.get('side'),
+                entry_price=item.get('entry_price'),
+                stop_loss=item.get('stop_loss'),
+                take_profit=item.get('take_profit'),
+                risk_distance=item.get('risk_distance'),
+                take_profit_r_multiple=item.get('take_profit_r_multiple', 2.0),
+                decision_ts=item.get('decision_ts'),
+                bars=closed,
+                max_bars=item.get('max_bars', cfg.get('shadow_triple_barrier_max_bars', 24)),
+            )
+            if not isinstance(result, dict):
+                continue
+            status = {
+                'candidate_side': item.get('side'),
+                'entry_timeframe': item.get('entry_timeframe'),
+                'htf_timeframe': item.get('htf_timeframe'),
+                'auto_selected_set_id': item.get('auto_selected_set_id'),
+                'auto_selected_set_name': item.get('auto_selected_set_name'),
+                'decision_candle_ts': item.get('decision_ts'),
+                'entry_price': item.get('entry_price'),
+                'reason': f"shadow triple-barrier {result.get('outcome')}",
+                'entry_plan': {
+                    'entry_price': item.get('entry_price'),
+                    'stop_loss': item.get('stop_loss'),
+                    'take_profit': item.get('take_profit'),
+                    'risk_distance': item.get('risk_distance'),
+                    'rr_multiple': item.get('take_profit_r_multiple'),
+                    'decision_candle_ts': item.get('decision_ts'),
+                }
+            }
+            extra = {
+                'code': result.get('code'),
+                'shadow_key': key,
+                'shadow_outcome': result.get('outcome'),
+                'exit_price': result.get('exit_price'),
+                'pnl_r': result.get('pnl_r'),
+                'mfe_r': result.get('mfe_r'),
+                'mae_r': result.get('mae_r'),
+                'bars_elapsed': result.get('bars_elapsed'),
+                'observation_window_bars': result.get('observation_window_bars'),
+                'shadow_exit_ts': result.get('exit_ts'),
+            }
+            self._record_utbreakout_diagnostic_event(symbol, status, event='shadow_outcome', extra=extra)
+            if isinstance(getattr(self, 'utbreakout_shadow_stats_cache', None), dict):
+                self.utbreakout_shadow_stats_cache.clear()
+            pending.pop(key, None)
+            resolved_keys = getattr(self, 'utbreakout_shadow_resolved_keys', set())
+            if not isinstance(resolved_keys, set):
+                resolved_keys = set(resolved_keys or [])
+                self.utbreakout_shadow_resolved_keys = resolved_keys
+            resolved_keys.add(key)
+            resolved.append(extra)
+        return resolved
+
+    def _get_utbreakout_shadow_stats(self, symbol, side, cfg, selected_set=None):
+        days = int(cfg.get('adaptive_exit_lookback_days', 14) or 14)
+        set_id = selected_set.get('id') if isinstance(selected_set, dict) else None
+        cache_key = f"{symbol}:{side}:{set_id}:{days}"
+        now = time.time()
+        cache = getattr(self, 'utbreakout_shadow_stats_cache', {})
+        if isinstance(cache, dict):
+            cached = cache.get(cache_key)
+            if isinstance(cached, dict) and (now - float(cached.get('cached_at', 0) or 0)) < 60:
+                return dict(cached.get('stats') or {})
+        else:
+            cache = {}
+            self.utbreakout_shadow_stats_cache = cache
+        events = read_utbreakout_diagnostic_events(days=days)
+        min_samples = min(
+            int(cfg.get('adaptive_exit_min_samples', 8) or 8),
+            int(cfg.get('meta_labeling_min_samples', 12) or 12),
+        )
+        scopes = [
+            ('symbol_side_set', {'symbol': symbol, 'side': side, 'set_id': set_id}),
+            ('symbol_side', {'symbol': symbol, 'side': side, 'set_id': None}),
+            ('side', {'symbol': None, 'side': side, 'set_id': None}),
+            ('all', {'symbol': None, 'side': None, 'set_id': None}),
+        ]
+        selected_stats = None
+        selected_scope = 'none'
+        for scope, kwargs in scopes:
+            stats = summarize_shadow_outcomes(events, **kwargs)
+            if selected_stats is None or int(stats.get('sample_count') or 0) > int(selected_stats.get('sample_count') or 0):
+                selected_stats = stats
+                selected_scope = scope
+            if int(stats.get('sample_count') or 0) >= min_samples:
+                selected_stats = stats
+                selected_scope = scope
+                break
+        selected_stats = dict(selected_stats or summarize_shadow_outcomes(events))
+        selected_stats['scope'] = selected_scope
+        cache[cache_key] = {'cached_at': now, 'stats': selected_stats}
+        return dict(selected_stats)
+
+    def _build_utbreakout_strategy_adaptation(self, symbol, side, cfg, selected_set, filter_values):
+        stats = self._get_utbreakout_shadow_stats(symbol, side, cfg, selected_set)
+        adaptation = build_strategy_adaptation(
+            cfg,
+            stats,
+            side=side,
+            atr_pct=(filter_values or {}).get('atr_pct')
+        )
+        return adaptation
+
     def _record_utbot_filtered_breakout_failure(self, symbol, side, candle_ts, reason):
         side = str(side or '').lower()
         if side not in {'long', 'short'}:
@@ -6138,6 +6399,14 @@ class SignalEngine(BaseEngine):
                 'market_quality_summary': status.get('market_quality_summary'),
                 'market_quality_risk_multiplier': _safe_float_or_none(status.get('market_quality_risk_multiplier')),
                 'market_regime_summary': status.get('market_regime_summary'),
+                'strategy_adaptation_summary': status.get('strategy_adaptation_summary'),
+                'strategy_adaptive_risk_multiplier': _safe_float_or_none(status.get('strategy_adaptive_risk_multiplier')),
+                'volatility_risk_multiplier': _safe_float_or_none(status.get('volatility_risk_multiplier')),
+                'meta_label_risk_multiplier': _safe_float_or_none(status.get('meta_label_risk_multiplier')),
+                'adaptive_exit_summary': status.get('adaptive_exit_summary'),
+                'shadow_sample_count': status.get('shadow_sample_count'),
+                'shadow_win_rate': _safe_float_or_none(status.get('shadow_win_rate')),
+                'shadow_avg_pnl_r': _safe_float_or_none(status.get('shadow_avg_pnl_r')),
                 'protection_status': protection_status
             }
             plan = status.get('entry_plan')
@@ -6156,7 +6425,18 @@ class SignalEngine(BaseEngine):
                     'planned_margin': _safe_float_or_none(plan.get('planned_margin')),
                     'expected_profit_usdt': _safe_float_or_none(plan.get('expected_profit_usdt')),
                     'leverage': _safe_float_or_none(plan.get('leverage')),
-                    'rr_multiple': _safe_float_or_none(plan.get('rr_multiple'))
+                    'rr_multiple': _safe_float_or_none(plan.get('rr_multiple')),
+                    'partial_take_profit_r_multiple': _safe_float_or_none(plan.get('partial_take_profit_r_multiple')),
+                    'partial_take_profit_ratio': _safe_float_or_none(plan.get('partial_take_profit_ratio')),
+                    'atr_trailing_multiplier': _safe_float_or_none(plan.get('atr_trailing_multiplier')),
+                    'atr_trailing_activation_r': _safe_float_or_none(plan.get('atr_trailing_activation_r')),
+                    'strategy_adaptive_risk_multiplier': _safe_float_or_none(plan.get('strategy_adaptive_risk_multiplier')),
+                    'volatility_risk_multiplier': _safe_float_or_none(plan.get('volatility_risk_multiplier')),
+                    'meta_label_risk_multiplier': _safe_float_or_none(plan.get('meta_label_risk_multiplier')),
+                    'adaptive_exit_summary': plan.get('adaptive_exit_summary'),
+                    'shadow_sample_count': plan.get('shadow_sample_count'),
+                    'shadow_win_rate': _safe_float_or_none(plan.get('shadow_win_rate')),
+                    'shadow_avg_pnl_r': _safe_float_or_none(plan.get('shadow_avg_pnl_r'))
                 })
             if isinstance(extra, dict):
                 for key, value in extra.items():
@@ -6250,6 +6530,7 @@ class SignalEngine(BaseEngine):
         effective_cfg['active_set_id'] = int(selected_set.get('id', cfg.get('active_set_id', UTBREAKOUT_DEFAULT_SET_ID)))
         effective_cfg['profile'] = f"set{effective_cfg['active_set_id']}"
         cfg = effective_cfg
+        self._update_utbreakout_shadow_triple_barrier(symbol, closed, cfg)
         selected_filters = set(selected_set.get('entry_filters') or [])
         status.update({
             'selection_mode': 'auto' if cfg.get('auto_select_enabled') else 'manual',
@@ -6630,6 +6911,30 @@ class SignalEngine(BaseEngine):
                 side=side
             )
 
+        strategy_adaptation = self._build_utbreakout_strategy_adaptation(symbol, side, cfg, selected_set, filter_values)
+        strategy_risk_multiplier = min(1.0, max(0.0, float(strategy_adaptation.get('risk_multiplier', 1.0) or 0.0)))
+        exit_overlay = strategy_adaptation.get('exit_overlay') if isinstance(strategy_adaptation.get('exit_overlay'), dict) else {}
+        if exit_overlay:
+            cfg = dict(cfg)
+            for key in (
+                'partial_take_profit_r_multiple',
+                'partial_take_profit_ratio',
+                'atr_trailing_multiplier',
+                'atr_trailing_activation_r',
+            ):
+                if key in exit_overlay:
+                    cfg[key] = exit_overlay[key]
+        status['strategy_adaptation'] = strategy_adaptation
+        status['strategy_adaptation_summary'] = strategy_adaptation.get('summary')
+        status['strategy_adaptive_risk_multiplier'] = strategy_risk_multiplier
+        status['volatility_risk_multiplier'] = strategy_adaptation.get('volatility_risk_multiplier')
+        status['meta_label_risk_multiplier'] = strategy_adaptation.get('meta_label_risk_multiplier')
+        shadow_stats = strategy_adaptation.get('shadow_stats') if isinstance(strategy_adaptation.get('shadow_stats'), dict) else {}
+        status['shadow_sample_count'] = shadow_stats.get('sample_count')
+        status['shadow_win_rate'] = shadow_stats.get('tp_rate')
+        status['shadow_avg_pnl_r'] = shadow_stats.get('avg_pnl_r')
+        status['adaptive_exit_summary'] = exit_overlay.get('summary')
+
         if not self._is_valid_number(atr_value) or float(atr_value) <= 0:
             return _finish(None, "REJECTED_ATR_TOO_LOW: ATR risk distance calculation pending", 'REJECTED_ATR_TOO_LOW', record_failure=True, side=side)
 
@@ -6647,6 +6952,9 @@ class SignalEngine(BaseEngine):
         if market_quality_multiplier < 0.999:
             risk_per_trade_percent *= market_quality_multiplier
             max_risk_per_trade_usdt *= market_quality_multiplier
+        if strategy_risk_multiplier < 0.999:
+            risk_per_trade_percent *= strategy_risk_multiplier
+            max_risk_per_trade_usdt *= strategy_risk_multiplier
         try:
             plan = calculate_risk_plan(
                 side=side,
@@ -6683,7 +6991,16 @@ class SignalEngine(BaseEngine):
             'market_quality_enabled': bool(cfg.get('market_quality_enabled', True)),
             'market_quality_risk_multiplier': market_quality_multiplier,
             'market_quality_summary': market_quality.get('summary'),
+            'strategy_adaptive_risk_multiplier': strategy_risk_multiplier,
+            'strategy_adaptation_summary': strategy_adaptation.get('summary'),
+            'volatility_risk_multiplier': strategy_adaptation.get('volatility_risk_multiplier'),
+            'meta_label_risk_multiplier': strategy_adaptation.get('meta_label_risk_multiplier'),
+            'adaptive_exit_summary': exit_overlay.get('summary'),
+            'shadow_sample_count': shadow_stats.get('sample_count'),
+            'shadow_win_rate': shadow_stats.get('tp_rate'),
+            'shadow_avg_pnl_r': shadow_stats.get('avg_pnl_r'),
         })
+        self._register_utbreakout_shadow_candidate(symbol, side, status, plan, cfg, selected_set)
         plan, micro_reject = await self._apply_micro_auto_to_utbreakout_plan(
             symbol=symbol,
             side=side,
@@ -6696,7 +7013,7 @@ class SignalEngine(BaseEngine):
             ut_stop=ut_detail.get('curr_stop'),
             total_balance=total_balance,
             free_balance=free_balance,
-            market_quality_risk_multiplier=market_quality_multiplier,
+            market_quality_risk_multiplier=market_quality_multiplier * strategy_risk_multiplier,
         )
         if micro_reject:
             code = micro_reject.get('reject_code') or 'REJECTED_MICRO_AUTO'
@@ -6964,6 +7281,21 @@ class SignalEngine(BaseEngine):
                     risk_per_trade_percent *= market_quality_multiplier
                     max_risk_per_trade_usdt *= market_quality_multiplier
                     risk_note += f" / 시장품질 x{market_quality_multiplier:.2f}"
+                adaptation_for_plan = self._build_utbreakout_strategy_adaptation(
+                    symbol,
+                    side_for_plan,
+                    cfg,
+                    selected_set,
+                    _market_quality_filter_values()
+                )
+                adaptation_multiplier = min(
+                    1.0,
+                    max(0.0, float(adaptation_for_plan.get('risk_multiplier', 1.0) or 0.0))
+                )
+                if adaptation_multiplier < 0.999:
+                    risk_per_trade_percent *= adaptation_multiplier
+                    max_risk_per_trade_usdt *= adaptation_multiplier
+                    risk_note += f" / 적응 x{adaptation_multiplier:.2f}"
                 plan = calculate_risk_plan(
                     side=side_for_plan,
                     entry_price=entry_price,
@@ -7112,6 +7444,8 @@ class SignalEngine(BaseEngine):
             if side == 'short':
                 items.append(self._build_utbreakout_short_guard_status_item(cfg, filter_values))
             items.append(self._build_utbreakout_market_quality_status_item(side, cfg, filter_values))
+            adaptation = self._build_utbreakout_strategy_adaptation(symbol, side, cfg, selected_set, filter_values)
+            items.append(("전략 적응", True, adaptation.get('summary')))
             items.extend([
                 ("일일 리스크", daily_ok, daily_detail),
                 ("ATR 손절/RR/수량", risk_ok, balance_detail),
@@ -13926,6 +14260,7 @@ class SignalEngine(BaseEngine):
                 for col in ['open', 'high', 'low', 'close', 'volume']:
                     closed[col] = pd.to_numeric(closed[col], errors='coerce')
                 closed = closed.dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+                self._update_utbreakout_shadow_triple_barrier(symbol, closed, fb_cfg)
 
                 if bool(fb_cfg.get('opposite_signal_exit_enabled', False)):
                     exit_sig, ut_exit_reason, _ = self._calculate_utbot_signal(
@@ -14784,13 +15119,25 @@ class SignalEngine(BaseEngine):
                     rr_multiple = float(plan.get('rr_multiple', 2.0) or 2.0)
                     if risk_distance > 0 and rr_multiple > 0:
                         fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
-                        partial_enabled = bool(fb_cfg.get('partial_take_profit_enabled', True))
+                        effective_fb_cfg = dict(fb_cfg)
+                        for key in (
+                            'partial_take_profit_enabled',
+                            'partial_take_profit_r_multiple',
+                            'partial_take_profit_ratio',
+                            'atr_trailing_enabled',
+                            'atr_trailing_multiplier',
+                            'atr_trailing_activation_r',
+                            'atr_trailing_breakeven_enabled',
+                        ):
+                            if key in plan:
+                                effective_fb_cfg[key] = plan[key]
+                        partial_enabled = bool(effective_fb_cfg.get('partial_take_profit_enabled', True))
                         partial_ratio = (
-                            min(0.9, max(0.0, float(fb_cfg.get('partial_take_profit_ratio', 0.5) or 0.5)))
+                            min(0.9, max(0.0, float(effective_fb_cfg.get('partial_take_profit_ratio', 0.5) or 0.5)))
                             if partial_enabled else 1.0
                         )
                         partial_r = (
-                            float(fb_cfg.get('partial_take_profit_r_multiple', 1.5) or 1.5)
+                            float(effective_fb_cfg.get('partial_take_profit_r_multiple', 1.5) or 1.5)
                             if partial_enabled else rr_multiple
                         )
                         await self._place_tp_sl_orders(
@@ -14808,12 +15155,12 @@ class SignalEngine(BaseEngine):
                             actual_entry_price,
                             qty,
                             plan,
-                            fb_cfg
+                            effective_fb_cfg
                         )
                         logger.info(
                             f"[UTBOT_FILTERED_BREAKOUT_V1] RR protection set: "
                             f"entry={actual_entry_price:.4f}, risk={risk_distance:.4f}, "
-                            f"partial={partial_ratio:.2f}@{partial_r:.2f}R, trail={fb_cfg.get('atr_trailing_multiplier', 2.0)}ATR"
+                            f"partial={partial_ratio:.2f}@{partial_r:.2f}R, trail={effective_fb_cfg.get('atr_trailing_multiplier', 2.0)}ATR"
                         )
                     else:
                         await self.ctrl.notify("⚠️ UTBOT_FILTERED_BREAKOUT_V1 보호 주문 거리 계산 오류")
@@ -20662,6 +21009,7 @@ UTBot:
             auto_name = diag.get('auto_selected_set_name')
             auto_reason = diag.get('auto_selection_reason') or '아직 AUTO 분석 기록 없음'
             adaptive_summary = diag.get('adaptive_timeframe_summary') or '아직 Adaptive TF 분석 기록 없음'
+            strategy_adaptation_summary = diag.get('strategy_adaptation_summary') or '아직 전략 적응 기록 없음'
             menu_title = (
                 'UTBreak 전략 메뉴 (Adaptive TF)'
                 if active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY
@@ -20699,6 +21047,13 @@ UTBot:
                 if cfg.get('short_conservative_enabled', True) else
                 "OFF"
             )
+            adaptive_stack_text = (
+                f"Shadow {'ON' if cfg.get('shadow_triple_barrier_enabled', True) else 'OFF'} / "
+                f"Exit {'ON' if cfg.get('adaptive_exit_enabled', True) else 'OFF'} / "
+                f"VolTarget {'ON' if cfg.get('volatility_targeting_enabled', True) else 'OFF'} / "
+                f"MetaSizing {'ON' if cfg.get('meta_labeling_enabled', True) else 'OFF'} / "
+                f"ShortAsym {'ON' if cfg.get('short_asymmetry_enabled', True) else 'OFF'}"
+            )
             return f"""
 🧭 **{menu_title}**
 
@@ -20712,10 +21067,14 @@ Set: `{mode_label}` / 수동 `Set{set_id} {set_info.get('name')}` / 최근 AUTO 
 Adaptive 최근: `{adaptive_summary}`
 리스크: `SL {float(cfg.get('stop_atr_multiplier', 1.5) or 1.5):.1f}ATR` | 부분익절 `{partial_text}` | ATR 트레일 `{trailing_text}`
 숏 가드: `{short_text}`
+고도화: `{adaptive_stack_text}`
 한도: `1회 ${float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0):.2f}` / `일손실 ${float(cfg.get('daily_max_loss_usdt', 3.0) or 3.0):.2f}` / `일거래 {daily_trade_limit_text}`
 
 AUTO 최근 선택 이유:
 `{auto_reason}`
+
+최근 전략 적응:
+`{strategy_adaptation_summary}`
 
 최근 진단({first_symbol}): `{last_reason}`
 진단 요약:

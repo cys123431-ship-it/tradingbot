@@ -686,6 +686,12 @@ def test_utbreakout_defaults_enable_partial_trailing_and_short_guard():
     assert cfg["market_quality_enabled"] is True
     assert cfg["market_quality_data_required"] is False
     assert cfg["market_quality_min_risk_multiplier"] == 0.25
+    assert cfg["shadow_triple_barrier_enabled"] is True
+    assert cfg["adaptive_exit_enabled"] is True
+    assert cfg["volatility_targeting_enabled"] is True
+    assert cfg["volatility_target_atr_pct"] == 1.0
+    assert cfg["meta_labeling_enabled"] is True
+    assert cfg["short_asymmetry_enabled"] is True
 
 
 def test_utbreakout_short_guard_requires_htf_and_dmi_alignment():
@@ -818,6 +824,54 @@ def test_utbreakout_market_quality_status_item_shows_reduced_state():
     assert label == "시장 품질 게이트"
     assert state == "reduced"
     assert "REDUCE" in detail
+
+
+def test_utbreakout_shadow_candidate_resolves_to_diagnostic_event():
+    emas = _emas_module()
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    engine.utbreakout_shadow_pending = {}
+    engine.utbreakout_shadow_resolved_keys = set()
+    captured = []
+
+    def _capture(symbol, status, event=None, extra=None):
+        captured.append((symbol, status, event, extra))
+
+    engine._record_utbreakout_diagnostic_event = _capture
+    cfg = emas.build_default_utbot_filtered_breakout_config()
+    plan = {
+        "entry_price": 100,
+        "stop_loss": 95,
+        "take_profit": 110,
+        "risk_distance": 5,
+        "rr_multiple": 2.0,
+        "decision_candle_ts": 1000,
+        "entry_timeframe": "15m",
+        "htf_timeframe": "1h",
+    }
+
+    pending = engine._register_utbreakout_shadow_candidate(
+        "BTC/USDT",
+        "long",
+        {"decision_candle_ts": 1000},
+        plan,
+        cfg,
+        {"id": 2, "name": "UT + ATR guard"},
+    )
+    assert pending is not None
+
+    closed = pd.DataFrame(
+        [
+            {"timestamp": 1000, "open": 100, "high": 101, "low": 99, "close": 100},
+            {"timestamp": 2000, "open": 100, "high": 111, "low": 100, "close": 110},
+        ]
+    )
+    resolved = engine._update_utbreakout_shadow_triple_barrier("BTC/USDT", closed, cfg)
+
+    assert resolved[0]["shadow_outcome"] == "tp"
+    assert captured[0][2] == "shadow_outcome"
+    assert captured[0][3]["code"] == "SHADOW_TP"
+    assert engine.utbreakout_shadow_pending == {}
 
 
 def test_place_tp_sl_orders_uses_partial_tp_quantity_and_full_sl_quantity():

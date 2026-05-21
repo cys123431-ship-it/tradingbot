@@ -21,6 +21,11 @@ from .micro_auto import (
     default_micro_auto_config,
     normalize_micro_auto_config,
 )
+from .adaptive import (
+    build_strategy_adaptation,
+    evaluate_shadow_triple_barrier,
+    summarize_shadow_outcomes,
+)
 
 __all__ = [
     "build_base_candidate",
@@ -42,4 +47,7 @@ __all__ = [
     "sector_tags_for_symbol",
     "select_adaptive_timeframe",
     "summarize_diagnostic_events",
+    "build_strategy_adaptation",
+    "evaluate_shadow_triple_barrier",
+    "summarize_shadow_outcomes",
 ]
