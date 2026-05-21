@@ -154,6 +154,108 @@ class _MemoryConfig:
         node[path[-1]] = value
 
 
+class _TelegramConfig:
+    def __init__(self, chat_id):
+        self.chat_id = chat_id
+
+    def get_chat_id(self):
+        return self.chat_id
+
+
+class _FakeTelegramChat:
+    def __init__(self, chat_id):
+        self.id = chat_id
+
+
+class _FakeTelegramMessage:
+    def __init__(self, text):
+        self.text = text
+        self.replies = []
+
+    async def reply_text(self, *args, **kwargs):
+        self.replies.append((args, kwargs))
+
+
+class _FakeTelegramUpdate:
+    def __init__(self, chat_id, text):
+        self.effective_chat = _FakeTelegramChat(chat_id)
+        self.message = _FakeTelegramMessage(text)
+        self.effective_message = self.message
+        self.callback_query = None
+
+
+def _telegram_controller(chat_id=12345):
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+    controller.cfg = _TelegramConfig(chat_id)
+    controller.is_paused = False
+    controller.active_engine = None
+    return controller
+
+
+def test_telegram_update_requires_configured_chat_id():
+    controller = _telegram_controller(chat_id=12345)
+
+    assert controller._is_authorized_telegram_update(_FakeTelegramUpdate(12345, "/status")) is True
+    assert controller._is_authorized_telegram_update(_FakeTelegramUpdate(99999, "/status")) is False
+
+
+def test_telegram_global_handler_rejects_unauthorized_stop_without_emergency_call():
+    controller = _telegram_controller(chat_id=12345)
+    called = False
+
+    async def emergency_stop():
+        nonlocal called
+        called = True
+
+    controller.emergency_stop = emergency_stop
+    update = _FakeTelegramUpdate(99999, "STOP")
+
+    result = asyncio.run(controller.global_handler(update, None))
+
+    emas = _emas_module()
+    assert result == emas.ConversationHandler.END
+    assert called is False
+    assert len(update.message.replies) == 1
+
+
+def test_telegram_global_handler_requires_exact_emergency_text():
+    controller = _telegram_controller(chat_id=12345)
+    called = False
+
+    async def emergency_stop():
+        nonlocal called
+        called = True
+
+    controller.emergency_stop = emergency_stop
+    update = _FakeTelegramUpdate(12345, "PLEASE STOP")
+
+    result = asyncio.run(controller.global_handler(update, None))
+
+    assert result is None
+    assert called is False
+    assert update.message.replies == []
+
+
+def test_telegram_global_handler_accepts_authorized_exact_stop():
+    controller = _telegram_controller(chat_id=12345)
+    called = False
+
+    async def emergency_stop():
+        nonlocal called
+        called = True
+
+    controller.emergency_stop = emergency_stop
+    update = _FakeTelegramUpdate(12345, "STOP")
+
+    result = asyncio.run(controller.global_handler(update, None))
+
+    emas = _emas_module()
+    assert result == emas.ConversationHandler.END
+    assert called is True
+    assert len(update.message.replies) == 1
+
+
 class _ResettableSignalEngine:
     def __init__(self):
         self.scanner_active_symbol = "ETH/USDT"

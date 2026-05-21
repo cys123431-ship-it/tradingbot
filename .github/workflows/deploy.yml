@@ -22,7 +22,8 @@ jobs:
           set -euo pipefail
           python -m py_compile emas.py scripts/utbreakout_backtest.py scripts/utbreakout_research_report.py scripts/validate_telegram_token.py
           python -m pip install --upgrade pip
-          python -m pip install pytest
+          python -m pip install -r requirements.txt pytest
+          python -c "import emas; print('runtime import ok')"
           python -m pytest -q
 
       - name: Deploy to Azure server

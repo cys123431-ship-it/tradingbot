@@ -17574,17 +17574,21 @@ class MainController:
 
     # ---------------- UI: emergency controls ----------------
     async def global_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._require_authorized_telegram_update(update):
+            return ConversationHandler.END
+
         text = update.message.text if update.message else ""
-        
-        if "STOP" in text:
+        action = self._extract_emergency_action(text)
+
+        if action == "STOP":
             await self.emergency_stop()
             await update.message.reply_text("🚨 긴급 정지 완료 - 모든 포지션 청산")
             return ConversationHandler.END
-        elif "PAUSE" in text:
+        elif action == "PAUSE":
             self.is_paused = True
             await update.message.reply_text("⏸ 일시정지 (매매 중단, 모니터링 유지)")
             return ConversationHandler.END
-        elif "RESUME" in text:
+        elif action == "RESUME":
             self.is_paused = False
             # Restart engine if it is not running
             if self.active_engine and not self.active_engine.running:
@@ -17614,6 +17618,65 @@ class MainController:
             return None
         first_token = normalized.split(None, 1)[0]
         return first_token.split('@', 1)[0].lower()
+
+    def _telegram_chat_id_from_update(self, update):
+        chat = getattr(update, "effective_chat", None)
+        if chat is not None and getattr(chat, "id", None) is not None:
+            try:
+                return int(chat.id)
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    def _is_authorized_telegram_update(self, update):
+        try:
+            configured_chat_id = int(self.cfg.get_chat_id())
+        except Exception:
+            configured_chat_id = 0
+        incoming_chat_id = self._telegram_chat_id_from_update(update)
+        return bool(configured_chat_id and incoming_chat_id == configured_chat_id)
+
+    async def _reject_unauthorized_telegram_update(self, update):
+        incoming_chat_id = self._telegram_chat_id_from_update(update)
+        logger.warning(f"Unauthorized Telegram update rejected: chat_id={incoming_chat_id}")
+        query = getattr(update, "callback_query", None)
+        if query is not None:
+            try:
+                await query.answer("권한이 없습니다.", show_alert=True)
+                return
+            except Exception:
+                logger.exception("Unauthorized Telegram callback reject failed")
+        message = getattr(update, "effective_message", None) or getattr(update, "message", None)
+        if message is not None:
+            try:
+                await message.reply_text("⛔ 권한이 없습니다.")
+            except Exception:
+                logger.exception("Unauthorized Telegram reply failed")
+
+    async def _require_authorized_telegram_update(self, update):
+        if self._is_authorized_telegram_update(update):
+            return True
+        await self._reject_unauthorized_telegram_update(update)
+        return False
+
+    def _telegram_owner_only(self, handler):
+        async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if not await self._require_authorized_telegram_update(update):
+                return ConversationHandler.END
+            return await handler(update, context)
+        return wrapped
+
+    def _extract_emergency_action(self, text):
+        normalized = str(text or "").strip()
+        if not normalized:
+            return None
+        command = self._extract_telegram_command(normalized)
+        if command in {"/stop", "/pause", "/resume"}:
+            return command[1:].upper()
+        upper = normalized.upper()
+        if upper in {"STOP", "PAUSE", "RESUME"}:
+            return upper
+        return None
 
     def _build_manual_status_payload(self):
         all_data = self.status_data if isinstance(self.status_data, dict) else {}
@@ -17964,6 +18027,9 @@ class MainController:
         await self._reply_markdown_safe(update.message, msg.strip())
 
     async def setup_entry(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._require_authorized_telegram_update(update):
+            return ConversationHandler.END
+
         request_text = ""
         if update and update.message and update.message.text:
             request_text = update.message.text.strip()
@@ -19297,18 +19363,14 @@ class MainController:
 
     async def _setup_telegram(self):
         markup = self._build_main_keyboard()
+        owner_only = self._telegram_owner_only
         text_filter = filters.TEXT & ~filters.COMMAND
         setup_trigger_pattern = r"^/setup(?:@[A-Za-z0-9_]+)?$"
         menu_trigger_pattern = r"^/(status|history|log|help|stats|close|utbot|utbreak|utbreakout|setup|coinscan|customcoins|microauto|prediction)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
         setup_text_filter = text_filter & ~filters.Regex(r"^/")
+        emergency_pattern = r"(?i)^(?:/(?:stop|pause|resume)(?:@[A-Za-z0-9_]+)?|STOP|PAUSE|RESUME)$"
 
         async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-            # Re-bind chat_id to the current chat to avoid stale configuration lockout.
-            incoming_chat_id = u.effective_chat.id if u.effective_chat else 0
-            configured_chat_id = self.cfg.get_chat_id()
-            if incoming_chat_id and configured_chat_id != incoming_chat_id:
-                await self.cfg.update_value(['telegram', 'chat_id'], incoming_chat_id)
-                logger.info(f"Telegram chat_id updated: {incoming_chat_id}")
             await u.message.reply_text("🤖 봇 준비 완료", reply_markup=markup)
 
         async def strat_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -22809,30 +22871,30 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
 """
             await u.message.reply_text(msg.strip(), parse_mode=ParseMode.MARKDOWN)
 
-        emergency_handler = MessageHandler(filters.Regex(r"STOP|PAUSE|RESUME"), self.global_handler)
+        emergency_handler = MessageHandler(filters.Regex(emergency_pattern), owner_only(self.global_handler))
         self.tg_app.add_handler(emergency_handler, group=-1)
 
-        self.tg_app.add_handler(CommandHandler("start", start_cmd))
-        self.tg_app.add_handler(CommandHandler("strat", strat_cmd))
-        self.tg_app.add_handler(CommandHandler("status", status_cmd))
-        self.tg_app.add_handler(CommandHandler("history", history_cmd))
-        self.tg_app.add_handler(CommandHandler("log", log_cmd))
-        self.tg_app.add_handler(CommandHandler("close", close_cmd))
-        self.tg_app.add_handler(CommandHandler("stats", stats_cmd))
-        self.tg_app.add_handler(CommandHandler("utbot", utbot_cmd))
-        self.tg_app.add_handler(CallbackQueryHandler(utbot_callback, pattern=r"^utbot:"))
-        self.tg_app.add_handler(CommandHandler("utbreak", utbreakout_cmd))
-        self.tg_app.add_handler(CommandHandler("utbreakout", utbreakout_cmd))
-        self.tg_app.add_handler(CallbackQueryHandler(utbreakout_callback, pattern=r"^utb:"))
-        self.tg_app.add_handler(CallbackQueryHandler(coinscan_callback, pattern=r"^cs:"))
-        self.tg_app.add_handler(CallbackQueryHandler(customcoins_callback, pattern=r"^cc:"))
-        self.tg_app.add_handler(CallbackQueryHandler(microauto_callback, pattern=r"^ma:"))
-        self.tg_app.add_handler(CommandHandler("prediction", prediction_cmd))
-        self.tg_app.add_handler(CallbackQueryHandler(prediction_callback, pattern=r"^pr:"))
-        self.tg_app.add_handler(CommandHandler("help", help_cmd))
+        self.tg_app.add_handler(CommandHandler("start", owner_only(start_cmd)))
+        self.tg_app.add_handler(CommandHandler("strat", owner_only(strat_cmd)))
+        self.tg_app.add_handler(CommandHandler("status", owner_only(status_cmd)))
+        self.tg_app.add_handler(CommandHandler("history", owner_only(history_cmd)))
+        self.tg_app.add_handler(CommandHandler("log", owner_only(log_cmd)))
+        self.tg_app.add_handler(CommandHandler("close", owner_only(close_cmd)))
+        self.tg_app.add_handler(CommandHandler("stats", owner_only(stats_cmd)))
+        self.tg_app.add_handler(CommandHandler("utbot", owner_only(utbot_cmd)))
+        self.tg_app.add_handler(CallbackQueryHandler(owner_only(utbot_callback), pattern=r"^utbot:"))
+        self.tg_app.add_handler(CommandHandler("utbreak", owner_only(utbreakout_cmd)))
+        self.tg_app.add_handler(CommandHandler("utbreakout", owner_only(utbreakout_cmd)))
+        self.tg_app.add_handler(CallbackQueryHandler(owner_only(utbreakout_callback), pattern=r"^utb:"))
+        self.tg_app.add_handler(CallbackQueryHandler(owner_only(coinscan_callback), pattern=r"^cs:"))
+        self.tg_app.add_handler(CallbackQueryHandler(owner_only(customcoins_callback), pattern=r"^cc:"))
+        self.tg_app.add_handler(CallbackQueryHandler(owner_only(microauto_callback), pattern=r"^ma:"))
+        self.tg_app.add_handler(CommandHandler("prediction", owner_only(prediction_cmd)))
+        self.tg_app.add_handler(CallbackQueryHandler(owner_only(prediction_callback), pattern=r"^pr:"))
+        self.tg_app.add_handler(CommandHandler("help", owner_only(help_cmd)))
 
-        setup_command_handler = CommandHandler('setup', self.setup_entry)
-        setup_text_handler = MessageHandler(filters.Regex(setup_trigger_pattern), self.setup_entry)
+        setup_command_handler = CommandHandler('setup', owner_only(self.setup_entry))
+        setup_text_handler = MessageHandler(filters.Regex(setup_trigger_pattern), owner_only(self.setup_entry))
 
         conv = ConversationHandler(
             entry_points=[
@@ -22841,11 +22903,11 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
             ],
             allow_reentry=True,
             states={
-                SELECT: [MessageHandler(setup_text_filter, self.setup_select)],
-                INPUT: [MessageHandler(setup_text_filter, self.setup_input)],
-                SYMBOL_INPUT: [MessageHandler(setup_text_filter, self.setup_symbol_input)],
-                DIRECTION_SELECT: [MessageHandler(setup_text_filter, self.setup_direction_select)],
-                ENGINE_SELECT: [MessageHandler(setup_text_filter, self.setup_engine_select)]
+                SELECT: [MessageHandler(setup_text_filter, owner_only(self.setup_select))],
+                INPUT: [MessageHandler(setup_text_filter, owner_only(self.setup_input))],
+                SYMBOL_INPUT: [MessageHandler(setup_text_filter, owner_only(self.setup_symbol_input))],
+                DIRECTION_SELECT: [MessageHandler(setup_text_filter, owner_only(self.setup_direction_select))],
+                ENGINE_SELECT: [MessageHandler(setup_text_filter, owner_only(self.setup_engine_select))]
             },
             fallbacks=[
                 setup_command_handler,
@@ -22888,7 +22950,7 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
         self.tg_app.add_handler(
             MessageHandler(
                 filters.Regex(menu_trigger_pattern),
-                menu_button_handler
+                owner_only(menu_button_handler)
             )
         )
 
@@ -22965,7 +23027,7 @@ Set 11~60도 AUTO 후보/수동 선택에 연결되어 있습니다. 전체 설�
                     return
                 await self.handle_manual_symbol_input(u, text)
 
-        self.tg_app.add_handler(MessageHandler(text_filter, manual_symbol_handler))
+        self.tg_app.add_handler(MessageHandler(text_filter, owner_only(manual_symbol_handler)))
 
     async def setup_r2_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text
