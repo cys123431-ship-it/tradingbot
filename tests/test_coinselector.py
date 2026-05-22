@@ -5,6 +5,7 @@ from utbreakout.coinselector import (
     finalize_candidate,
     normalize_custom_symbols,
     rank_candidates,
+    score_selection_quality,
 )
 
 
@@ -136,6 +137,7 @@ def test_coinselector_scores_utbreakout_set_and_adaptive_tf():
     assert result["auto_set_id"] == 22
     assert result["adaptive_tf"] == "30m"
     assert result["component_scores"]["utbreakout_regime"] > 15
+    assert "selection_quality" in result["component_scores"]
 
 
 def test_coinselector_penalizes_no_trade_adaptive_tf():
@@ -184,3 +186,89 @@ def test_coinselector_report_detects_set_concentration():
     assert len(ranked) == 4
     assert report["concentration_warning"]["value"] == 7
     assert report["concentration_warning"]["share_pct"] == 100.0
+
+
+def test_coinselector_selection_quality_rewards_persistent_implementable_momentum():
+    cfg = default_coin_selector_config()
+    candidate = build_base_candidate("BTC/USDT:USDT", _ticker(quoteVolume=900_000_000), _market(), cfg)
+    strong = finalize_candidate(
+        candidate,
+        auto_analysis=_auto_scores(dominant_side="long"),
+        selected_set_id=22,
+        selected_set_info={"name": "UT + Donchian 20", "family": "Breakout"},
+        adaptive_decision={"selected_tf": "30m", "selected_score": 76.0, "decision": "SELECTED"},
+        selection_metrics={
+            "rolling_sharpe": 1.1,
+            "momentum_consistency": 0.68,
+            "directional_efficiency": 0.55,
+            "realized_vol_pct": 0.70,
+            "return_lookback_pct": 6.0,
+            "max_drawdown_pct": 3.5,
+            "max_rebound_pct": 4.0,
+            "cross_sectional_dispersion_pct": 3.0,
+        },
+        cfg=cfg,
+    )
+    weak = finalize_candidate(
+        candidate,
+        auto_analysis=_auto_scores(dominant_side="long"),
+        selected_set_id=22,
+        selected_set_info={"name": "UT + Donchian 20", "family": "Breakout"},
+        adaptive_decision={"selected_tf": "30m", "selected_score": 76.0, "decision": "SELECTED"},
+        selection_metrics={
+            "rolling_sharpe": -0.4,
+            "momentum_consistency": 0.42,
+            "directional_efficiency": 0.08,
+            "realized_vol_pct": 3.0,
+            "return_lookback_pct": -14.0,
+            "max_drawdown_pct": 24.0,
+            "max_rebound_pct": 18.0,
+            "cross_sectional_dispersion_pct": 14.0,
+        },
+        cfg=cfg,
+    )
+
+    assert strong["component_scores"]["selection_quality"] > weak["component_scores"]["selection_quality"]
+    assert strong["score"] > weak["score"]
+    assert "SELECTION_DRAWDOWN_RISK" in weak["soft_warnings"]
+    assert "SELECTION_HIGH_DISPERSION" in weak["soft_warnings"]
+
+
+def test_coinselector_selection_quality_penalizes_short_rebound_risk():
+    cfg = default_coin_selector_config()
+    candidate = build_base_candidate("ETH/USDT:USDT", _ticker(quoteVolume=900_000_000), _market(), cfg)
+
+    calm_short = score_selection_quality(
+        {
+            **candidate,
+            "selection_metrics": {
+                "rolling_sharpe": 0.9,
+                "momentum_consistency": 0.64,
+                "directional_efficiency": 0.48,
+                "realized_vol_pct": 0.7,
+                "return_lookback_pct": -5.0,
+                "max_drawdown_pct": 6.0,
+                "max_rebound_pct": 4.0,
+            },
+        },
+        {"dominant_side": "short"},
+        cfg,
+    )
+    rebound_short = score_selection_quality(
+        {
+            **candidate,
+            "selection_metrics": {
+                "rolling_sharpe": 0.9,
+                "momentum_consistency": 0.64,
+                "directional_efficiency": 0.48,
+                "realized_vol_pct": 0.7,
+                "return_lookback_pct": -5.0,
+                "max_drawdown_pct": 6.0,
+                "max_rebound_pct": 18.0,
+            },
+        },
+        {"dominant_side": "short"},
+        cfg,
+    )
+
+    assert calm_short > rebound_short

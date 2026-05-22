@@ -1329,7 +1329,7 @@ class TradingConfig:
         if coin_selector_cfg.get('custom_symbols') != normalized_custom_symbols:
             coin_selector_cfg['custom_symbols'] = normalized_custom_symbols
             changed = True
-        for bool_key in ('enabled', 'auto_apply_watchlist', 'custom_universe_enabled', 'custom_relax_discovery'):
+        for bool_key in ('enabled', 'auto_apply_watchlist', 'custom_universe_enabled', 'custom_relax_discovery', 'selection_quality_enabled'):
             value = coin_selector_cfg.get(bool_key, coin_selector_defaults.get(bool_key, False))
             if isinstance(value, bool):
                 normalized_bool = value
@@ -1358,6 +1358,11 @@ class TradingConfig:
             'top_n': 10,
             'min_final_score': 55.0,
             'refresh_interval_seconds': 300,
+            'selection_return_lookback_bars': 96,
+            'selection_target_realized_vol_pct': 0.65,
+            'selection_max_drawdown_pct': 18.0,
+            'selection_max_rebound_pct': 18.0,
+            'selection_max_dispersion_pct': 9.0,
         }
         for key, default in numeric_coin_selector_defaults.items():
             try:
@@ -6709,6 +6714,9 @@ class SignalEngine(BaseEngine):
                 'market_quality_summary': status.get('market_quality_summary'),
                 'market_quality_risk_multiplier': _safe_float_or_none(status.get('market_quality_risk_multiplier')),
                 'market_regime_summary': status.get('market_regime_summary'),
+                'selector_quality_summary': status.get('selector_quality_summary'),
+                'selector_quality_score': _safe_float_or_none(status.get('selector_quality_score')),
+                'selector_quality_risk_multiplier': _safe_float_or_none(status.get('selector_quality_risk_multiplier')),
                 'strategy_adaptation_summary': status.get('strategy_adaptation_summary'),
                 'strategy_adaptive_risk_multiplier': _safe_float_or_none(status.get('strategy_adaptive_risk_multiplier')),
                 'volatility_risk_multiplier': _safe_float_or_none(status.get('volatility_risk_multiplier')),
@@ -6748,6 +6756,9 @@ class SignalEngine(BaseEngine):
                     'atr_trailing_multiplier': _safe_float_or_none(plan.get('atr_trailing_multiplier')),
                     'atr_trailing_activation_r': _safe_float_or_none(plan.get('atr_trailing_activation_r')),
                     'strategy_adaptive_risk_multiplier': _safe_float_or_none(plan.get('strategy_adaptive_risk_multiplier')),
+                    'selector_quality_risk_multiplier': _safe_float_or_none(plan.get('selector_quality_risk_multiplier')),
+                    'selector_quality_score': _safe_float_or_none(plan.get('selector_quality_score')),
+                    'selector_quality_summary': plan.get('selector_quality_summary'),
                     'volatility_risk_multiplier': _safe_float_or_none(plan.get('volatility_risk_multiplier')),
                     'meta_label_risk_multiplier': _safe_float_or_none(plan.get('meta_label_risk_multiplier')),
                     'trend_health_risk_multiplier': _safe_float_or_none(plan.get('trend_health_risk_multiplier')),
@@ -7235,6 +7246,13 @@ class SignalEngine(BaseEngine):
                 side=side
             )
 
+        selector_quality = self._build_utbreakout_selector_quality(symbol)
+        selector_quality_multiplier = min(1.0, max(0.0, float(selector_quality.get('risk_multiplier', 1.0) or 1.0)))
+        status['selector_quality'] = selector_quality
+        status['selector_quality_score'] = selector_quality.get('score')
+        status['selector_quality_summary'] = selector_quality.get('summary')
+        status['selector_quality_risk_multiplier'] = selector_quality_multiplier
+
         strategy_adaptation = self._build_utbreakout_strategy_adaptation(symbol, side, cfg, selected_set, filter_values)
         strategy_risk_multiplier = min(1.0, max(0.0, float(strategy_adaptation.get('risk_multiplier', 1.0) or 0.0)))
         exit_overlay = strategy_adaptation.get('exit_overlay') if isinstance(strategy_adaptation.get('exit_overlay'), dict) else {}
@@ -7296,6 +7314,9 @@ class SignalEngine(BaseEngine):
         if strategy_risk_multiplier < 0.999:
             risk_per_trade_percent *= strategy_risk_multiplier
             max_risk_per_trade_usdt *= strategy_risk_multiplier
+        if selector_quality_multiplier < 0.999:
+            risk_per_trade_percent *= selector_quality_multiplier
+            max_risk_per_trade_usdt *= selector_quality_multiplier
         try:
             plan = calculate_risk_plan(
                 side=side,
@@ -7334,6 +7355,9 @@ class SignalEngine(BaseEngine):
             'market_quality_enabled': bool(cfg.get('market_quality_enabled', True)),
             'market_quality_risk_multiplier': market_quality_multiplier,
             'market_quality_summary': market_quality.get('summary'),
+            'selector_quality_risk_multiplier': selector_quality_multiplier,
+            'selector_quality_score': selector_quality.get('score'),
+            'selector_quality_summary': selector_quality.get('summary'),
             'strategy_adaptive_risk_multiplier': strategy_risk_multiplier,
             'strategy_adaptation_summary': strategy_adaptation.get('summary'),
             'volatility_risk_multiplier': strategy_adaptation.get('volatility_risk_multiplier'),
@@ -7362,7 +7386,7 @@ class SignalEngine(BaseEngine):
             ut_stop=ut_detail.get('curr_stop'),
             total_balance=total_balance,
             free_balance=free_balance,
-            market_quality_risk_multiplier=market_quality_multiplier * strategy_risk_multiplier,
+            market_quality_risk_multiplier=market_quality_multiplier * strategy_risk_multiplier * selector_quality_multiplier,
         )
         if micro_reject:
             code = micro_reject.get('reject_code') or 'REJECTED_MICRO_AUTO'
@@ -7814,6 +7838,10 @@ class SignalEngine(BaseEngine):
             if side == 'short':
                 items.append(self._build_utbreakout_short_guard_status_item(cfg, filter_values))
             items.append(self._build_utbreakout_market_quality_status_item(side, cfg, filter_values))
+            selector_quality = self._build_utbreakout_selector_quality(symbol)
+            selector_multiplier = float(selector_quality.get('risk_multiplier', 1.0) or 1.0)
+            selector_state = True if selector_multiplier >= 0.999 else 'reduced'
+            items.append(("코인 선택 품질", selector_state, selector_quality.get('summary')))
             adaptation = self._build_utbreakout_strategy_adaptation(symbol, side, cfg, selected_set, filter_values)
             adaptation_health = adaptation.get('trend_health') if isinstance(adaptation.get('trend_health'), dict) else {}
             items.append(("전략 적응", adaptation_health.get('state', True), adaptation.get('summary')))
@@ -11046,7 +11074,7 @@ class SignalEngine(BaseEngine):
             if text in {'0', 'false', 'no', 'off', 'disable', 'disabled'}:
                 return False
             return default
-        for key in ('enabled', 'auto_apply_watchlist', 'custom_universe_enabled', 'custom_relax_discovery'):
+        for key in ('enabled', 'auto_apply_watchlist', 'custom_universe_enabled', 'custom_relax_discovery', 'selection_quality_enabled'):
             cfg[key] = _bool_value(cfg.get(key), bool(default_coin_selector_config().get(key, False)))
         for key in ('excluded_sectors', 'blacklist'):
             value = cfg.get(key, [])
@@ -11066,6 +11094,10 @@ class SignalEngine(BaseEngine):
             'max_abs_price_change_pct': 18.0,
             'min_final_score': 55.0,
             'refresh_interval_seconds': 300.0,
+            'selection_target_realized_vol_pct': 0.65,
+            'selection_max_drawdown_pct': 18.0,
+            'selection_max_rebound_pct': 18.0,
+            'selection_max_dispersion_pct': 9.0,
         }.items():
             try:
                 cfg[key] = max(0.0, float(cfg.get(key, default)))
@@ -11076,6 +11108,7 @@ class SignalEngine(BaseEngine):
             'ideal_trade_count': 500_000,
             'analysis_limit': 20,
             'top_n': 10,
+            'selection_return_lookback_bars': 96,
         }.items():
             try:
                 cfg[key] = max(1, int(float(cfg.get(key, default))))
@@ -11661,7 +11694,109 @@ class SignalEngine(BaseEngine):
             return f"{normalized}:USDT"
         return normalized
 
-    async def _score_coin_selector_candidate(self, base_candidate, cfg, strategy_params):
+    def _calculate_coin_selector_selection_metrics(self, df, cfg, selector_context=None):
+        try:
+            if df is None or len(df) < 20:
+                return {}
+            closed = df.iloc[:-1].copy().reset_index(drop=True)
+            if len(closed) < 20:
+                closed = df.copy().reset_index(drop=True)
+            close = pd.to_numeric(closed['close'], errors='coerce').dropna().astype(float)
+            if len(close) < 20:
+                return {}
+            lookback = max(12, int(cfg.get('selection_return_lookback_bars', 96) or 96))
+            lookback = min(lookback, len(close) - 1)
+            window = close.tail(lookback + 1)
+            returns = window.pct_change().dropna()
+            if returns.empty:
+                return {}
+            start = float(window.iloc[0])
+            end = float(window.iloc[-1])
+            return_lookback_pct = (end / max(start, 1e-9) - 1.0) * 100.0
+            realized_vol_pct = float(returns.std(ddof=0) * 100.0)
+            mean_return = float(returns.mean())
+            rolling_sharpe = 0.0
+            if realized_vol_pct > 0:
+                rolling_sharpe = float(mean_return / max(float(returns.std(ddof=0)), 1e-12) * np.sqrt(len(returns)))
+            direction = 1 if return_lookback_pct >= 0 else -1
+            momentum_consistency = float(((returns * direction) > 0).mean())
+            path = float(window.diff().abs().dropna().sum())
+            directional_efficiency = abs(end - start) / max(path, 1e-9)
+            running_peak = window.cummax()
+            drawdowns = (running_peak - window) / running_peak.replace(0, np.nan) * 100.0
+            running_trough = window.cummin()
+            rebounds = (window - running_trough) / running_trough.replace(0, np.nan) * 100.0
+            bar_returns_pct = returns * 100.0
+            metrics = {
+                'return_lookback_pct': round(float(return_lookback_pct), 4),
+                'realized_vol_pct': round(float(realized_vol_pct), 4),
+                'rolling_sharpe': round(float(rolling_sharpe), 4),
+                'momentum_consistency': round(float(momentum_consistency), 4),
+                'directional_efficiency': round(float(directional_efficiency), 4),
+                'max_drawdown_pct': round(float(drawdowns.max(skipna=True) or 0.0), 4),
+                'max_rebound_pct': round(float(rebounds.max(skipna=True) or 0.0), 4),
+                'tail_bar_move_pct': round(float(bar_returns_pct.abs().max() or 0.0), 4),
+            }
+            context = selector_context if isinstance(selector_context, dict) else {}
+            dispersion = context.get('cross_sectional_dispersion_pct')
+            if self._is_valid_number(dispersion):
+                metrics['cross_sectional_dispersion_pct'] = round(float(dispersion), 4)
+            return metrics
+        except Exception as exc:
+            logger.debug(f"CoinSelector selection quality metrics failed: {exc}")
+            return {}
+
+    def _build_utbreakout_selector_quality(self, symbol):
+        item = None
+        scores = getattr(self, 'coin_selector_symbol_scores', {})
+        if isinstance(scores, dict):
+            candidates = [
+                symbol,
+                str(symbol or '').replace(':USDT', ''),
+                str(symbol or '').upper(),
+            ]
+            for key in candidates:
+                if key in scores and isinstance(scores.get(key), dict):
+                    item = scores.get(key)
+                    break
+        if not isinstance(item, dict):
+            return {
+                'score': None,
+                'risk_multiplier': 1.0,
+                'summary': 'selector quality neutral: no recent CoinSelector score',
+            }
+        cfg = self._get_coin_selector_config()
+        try:
+            score = float(item.get('score', 0.0) or 0.0)
+            min_score = float(cfg.get('min_final_score', 55.0) or 55.0)
+        except (TypeError, ValueError):
+            score = 0.0
+            min_score = 55.0
+        if score >= 78.0:
+            multiplier = 1.0
+            label = 'strong'
+        elif score >= 68.0:
+            multiplier = 0.90
+            label = 'good'
+        elif score >= min_score:
+            multiplier = 0.75
+            label = 'marginal'
+        else:
+            multiplier = 0.50
+            label = 'weak'
+        return {
+            'score': round(score, 2),
+            'risk_multiplier': multiplier,
+            'summary': (
+                f"selector quality {label} {score:.1f}/100 x{multiplier:.2f} "
+                f"(Sharpe {item.get('rolling_sharpe', 'n/a')}, "
+                f"vol {item.get('realized_vol_pct', 'n/a')}%, "
+                f"ret {item.get('return_lookback_pct', 'n/a')}%)"
+            ),
+            'candidate': item,
+        }
+
+    async def _score_coin_selector_candidate(self, base_candidate, cfg, strategy_params, selector_context=None):
         symbol = base_candidate.get('exchange_symbol') or base_candidate.get('symbol')
         try:
             ut_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
@@ -11672,6 +11807,7 @@ class SignalEngine(BaseEngine):
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
+            selection_metrics = self._calculate_coin_selector_selection_metrics(df, cfg, selector_context=selector_context)
             analysis = await self._build_utbreakout_auto_analysis(symbol, df, ut_cfg)
             selected_set_id, auto_reason = self._select_utbreakout_auto_set(analysis, ut_cfg)
             selected_set_info = self._get_utbreakout_set_info(ut_cfg, selected_set_id)
@@ -11689,6 +11825,7 @@ class SignalEngine(BaseEngine):
                 selected_set_info=selected_set_info,
                 adaptive_decision=decision,
                 futures_context=futures_context,
+                selection_metrics=selection_metrics,
                 cfg=cfg,
             )
             result['auto_selection_reason'] = auto_reason
@@ -11798,12 +11935,25 @@ class SignalEngine(BaseEngine):
                 key=lambda item: float(item.get('quote_volume', 0.0) or 0.0),
                 reverse=True
             )
+        dispersion_values = [
+            float(item.get('percentage', 0.0) or 0.0)
+            for item in accepted_base
+            if self._is_valid_number(item.get('percentage', 0.0))
+        ]
+        selector_context = {
+            'cross_sectional_dispersion_pct': float(np.std(dispersion_values)) if len(dispersion_values) >= 2 else 0.0,
+        }
         strategy_params = self.get_runtime_strategy_params()
         analysis_limit = len(accepted_base) if custom_enabled else int(cfg.get('analysis_limit', 20) or 20)
         scored = []
         analysis_errors = []
         for candidate in accepted_base[:analysis_limit]:
-            scored_candidate = await self._score_coin_selector_candidate(candidate, cfg, strategy_params)
+            scored_candidate = await self._score_coin_selector_candidate(
+                candidate,
+                cfg,
+                strategy_params,
+                selector_context=selector_context,
+            )
             if scored_candidate.get('accepted'):
                 scored.append(scored_candidate)
             else:
@@ -21433,6 +21583,7 @@ UTBot:
             if isinstance(raw_cfg, dict):
                 cfg.update(raw_cfg)
             coin_cfg = sig_cfg.get('coin_selector', {}) if isinstance(sig_cfg.get('coin_selector', {}), dict) else {}
+            common_cfg = sig_cfg.get('common_settings', {}) if isinstance(sig_cfg.get('common_settings', {}), dict) else {}
             watchlist = self.get_active_watchlist()
             first_symbol = watchlist[0] if watchlist else 'BTC/USDT'
             engine = self.engines.get('signal')
@@ -21461,13 +21612,17 @@ UTBot:
             daily_trade_limit_text = "OFF" if daily_trade_limit <= 0 else f"{daily_trade_limit}회"
             adaptive_on = bool(cfg.get('adaptive_timeframe_enabled')) or active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY
             auto_set_on = bool(cfg.get('auto_select_enabled', False)) or str(cfg.get('selection_mode', '')).lower() == 'auto'
-            auto_bundle_on = adaptive_on and auto_set_on
+            scanner_on = bool(common_cfg.get('scanner_enabled', False))
+            coin_auto_on = bool(coin_cfg.get('enabled', False)) and scanner_on and not bool(coin_cfg.get('fixed_symbol_mode_enabled', False))
+            auto_bundle_on = adaptive_on and auto_set_on and coin_auto_on
             fixed_symbol = coin_cfg.get('fixed_symbol') or ''
             custom_symbols = coin_cfg.get('custom_symbols') or []
             if coin_cfg.get('fixed_symbol_mode_enabled') and fixed_symbol:
                 coin_mode = f"단일 `{fixed_symbol}`"
             elif coin_cfg.get('custom_universe_enabled') and custom_symbols:
                 coin_mode = f"후보 `{', '.join(custom_symbols[:6])}`"
+            elif coin_auto_on:
+                coin_mode = f"AUTO Binance Futures Top {int(float(coin_cfg.get('top_n', 10) or 10))}"
             else:
                 coin_mode = f"Watchlist `{', '.join(watchlist[:6]) if watchlist else '없음'}`"
             partial_enabled = bool(cfg.get('partial_take_profit_enabled', True))
@@ -21505,7 +21660,7 @@ UTBot:
 
 상태: `{active_label}`
 코인: {coin_mode}
-AUTO 묶음: `{'ON' if auto_bundle_on else 'OFF'}` (Set 자동 + Adaptive TF, 코인 선택 제외)
+AUTO 묶음: `{'ON' if auto_bundle_on else 'OFF'}` (코인 자동선택 + Set 자동 + Adaptive TF)
 Set: `{mode_label}` / 수동 `Set{set_id} {set_info.get('name')}` / 최근 AUTO `{('Set' + str(auto_set) + ' ' + str(auto_name)) if auto_set else '대기'}`
 시간봉: 진입 `{cfg.get('entry_timeframe', '15m')}` / 청산 `{cfg.get('exit_timeframe', cfg.get('entry_timeframe', '15m'))}` / HTF `{cfg.get('htf_timeframe', '1h')}`
 Adaptive 최근: `{adaptive_summary}`
@@ -21528,7 +21683,7 @@ AUTO 최근 선택 이유:
 
 명령:
 `/utbreak on`, `/utbreak coin EWY`, `/utbreak autoscan on BTC ETH`, `/utbreak autoscan off`
-`/utbreak auto on` / `auto off` - AUTO 묶음 ON/OFF
+`/utbreak auto on` / `auto off` - 코인선택 포함 AUTO 묶음 ON/OFF
 `/utbreak set 57`, `/utbreak risk 5`, `/utbreak dailytrades 3`
 `/utbreak sets`, `/utbreak why`, `/utbreak status`, `/utbreak analyze [EWY]`, `/utbreak research`, `/utbreak log`
 """.strip()
@@ -21541,8 +21696,8 @@ AUTO 최근 선택 이유:
                     InlineKeyboardButton("재개", callback_data="utb:resume")
                 ],
                 [
-                    InlineKeyboardButton("AUTO 묶음 ON", callback_data="utb:auto_bundle:on"),
-                    InlineKeyboardButton("AUTO 묶음 OFF", callback_data="utb:auto_bundle:off"),
+                    InlineKeyboardButton("FULL AUTO ON", callback_data="utb:auto_bundle:on"),
+                    InlineKeyboardButton("FULL AUTO OFF", callback_data="utb:auto_bundle:off"),
                     InlineKeyboardButton("AUTO 이유", callback_data="utb:why")
                 ],
                 [
@@ -22619,7 +22774,14 @@ AUTO 최근 선택 이유:
                         f"ut {components.get('utbreakout_regime', 0):.1f}, "
                         f"set {components.get('auto_set', 0):.1f}, "
                         f"tf {components.get('adaptive_tf', 0):.1f}, "
-                        f"fut {components.get('futures_health', 0):.1f}"
+                        f"fut {components.get('futures_health', 0):.1f}, "
+                        f"qual {components.get('selection_quality', 0):.1f}"
+                    ),
+                    (
+                        f"품질 Sharpe {item.get('rolling_sharpe', 'n/a')} / "
+                        f"ret {item.get('return_lookback_pct', 'n/a')}% / "
+                        f"vol {item.get('realized_vol_pct', 'n/a')}% / "
+                        f"cons {item.get('momentum_consistency', 'n/a')}"
                     ),
                 ])
                 if warnings:
@@ -22665,7 +22827,8 @@ AUTO 최근 선택 이유:
                 f"제외 섹터: {excluded}",
                 f"블랙리스트: {blacklist}",
                 "",
-                "점수 구성: 유동성/비용 25 + UTBreakout 장세 30 + AUTO Set 20 + Adaptive TF 10 + 선물시장 10 + 섹터 5",
+                "점수 구성: 유동성/비용 23 + UTBreakout 장세 27 + AUTO Set 17 + Adaptive TF 8 + 선물시장 8 + 선택품질 12 + 섹터 5",
+                "선택품질: rolling Sharpe, 모멘텀 일관성, 방향 효율, 적정 변동성, drawdown/rebound, 시장 분산을 점수화합니다.",
                 "주의: CoinSelector는 감시 후보만 고르고, 실제 진입은 전략 로직이 다시 확인합니다.",
             ])
 
@@ -22969,7 +23132,12 @@ AUTO 최근 선택 이유:
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'], 'auto')
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'auto_select_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], True)
-            await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol'], '')
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'selection_quality_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
             engine = self._reset_signal_engine_runtime_state(
                 reset_entry_cache=True,
@@ -22979,9 +23147,7 @@ AUTO 최근 선택 이유:
             if engine:
                 engine.scanner_active_symbol = None
                 engine.active_symbols.clear()
-                for item in self.get_active_watchlist():
-                    engine.active_symbols.add(item)
-            return "✅ AUTO 묶음 ON: Set 자동 선택 + Adaptive TF를 켰습니다. 코인 선택 설정은 변경하지 않았습니다."
+            return "✅ FULL AUTO ON: CoinSelector V2 + scanner + Set AUTO + Adaptive TF를 한 번에 켰습니다."
 
         async def _disable_utbreak_auto_bundle():
             await _ensure_signal_engine_active()
@@ -22989,6 +23155,10 @@ AUTO 최근 선택 이유:
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'], 'manual')
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'auto_select_enabled'], False)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol'], '')
             await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], False)
             await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
             engine = self._reset_signal_engine_runtime_state(
@@ -23001,7 +23171,7 @@ AUTO 최근 선택 이유:
                 engine.active_symbols.clear()
                 for item in self.get_active_watchlist():
                     engine.active_symbols.add(item)
-            return "✅ AUTO 묶음 OFF: 수동 Set + 고정 시간봉으로 돌렸습니다. 코인 선택 설정은 변경하지 않았습니다."
+            return "✅ FULL AUTO OFF: 코인 자동선택/scanner/Set AUTO/Adaptive TF를 끄고 watchlist 직접감시로 돌렸습니다."
 
         async def _enable_customcoins(symbols):
             normalized = normalize_coin_selector_custom_symbols(symbols)

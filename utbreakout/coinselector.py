@@ -34,6 +34,12 @@ DEFAULT_COIN_SELECTOR_CONFIG = {
     "top_n": 10,
     "min_final_score": 55.0,
     "refresh_interval_seconds": 300,
+    "selection_quality_enabled": True,
+    "selection_return_lookback_bars": 96,
+    "selection_target_realized_vol_pct": 0.65,
+    "selection_max_drawdown_pct": 18.0,
+    "selection_max_rebound_pct": 18.0,
+    "selection_max_dispersion_pct": 9.0,
     "excluded_sectors": sorted(DEFAULT_EXCLUDED_SECTORS),
     "blacklist": [],
     "sector_overrides": {},
@@ -298,7 +304,7 @@ def score_liquidity(candidate, cfg=None):
     else:
         spread_score = clamp(100.0 - (finite_float(spread) / max(finite_float(cfg.get("max_spread_pct"), 0.08), 0.001) * 100.0))
     raw = (volume_score * 0.58) + (count_score * 0.22) + (spread_score * 0.20)
-    return round(raw * 0.25, 2)
+    return round(raw * 0.23, 2)
 
 
 def score_ut_regime(auto_scores):
@@ -323,7 +329,7 @@ def score_ut_regime(auto_scores):
         + mtf_momentum * 0.04
         + mtf_volatility * 0.04
     )
-    return round(raw * 0.30, 2)
+    return round(raw * 0.27, 2)
 
 
 def score_set_suitability(auto_scores, selected_set_id=None, selected_set_info=None):
@@ -346,7 +352,7 @@ def score_set_suitability(auto_scores, selected_set_id=None, selected_set_info=N
         raw -= 10.0
     if selected_set_id <= 0:
         raw = min(raw, 35.0)
-    return round(clamp(raw) * 0.20, 2)
+    return round(clamp(raw) * 0.17, 2)
 
 
 def score_adaptive_timeframe(decision):
@@ -360,7 +366,7 @@ def score_adaptive_timeframe(decision):
         selected_score += 4.0
     elif state == "POSITION_LOCKED":
         selected_score += 2.0
-    return round(clamp(selected_score) * 0.10, 2)
+    return round(clamp(selected_score) * 0.08, 2)
 
 
 def score_futures_context(context):
@@ -376,7 +382,86 @@ def score_futures_context(context):
     oi = context.get("open_interest_usdt", context.get("open_interest", context.get("openInterest")))
     oi = finite_float(oi, 0.0)
     oi_score = 70.0 if oi <= 0 else clamp(_scaled_log_score(oi, 50_000_000.0, 1_000_000_000.0))
-    return round((funding_score * 0.65 + oi_score * 0.35) * 0.10, 2)
+    return round((funding_score * 0.65 + oi_score * 0.35) * 0.08, 2)
+
+
+def score_selection_quality(candidate, auto_scores=None, cfg=None):
+    """Score implementable momentum quality without adding hard filters.
+
+    This is intentionally a soft component. It rewards liquid, persistent
+    trends with tolerable realized volatility and penalizes crash/rebound
+    profiles that are especially harmful to crypto momentum shorts.
+    """
+    cfg = {**default_coin_selector_config(), **(cfg or {})}
+    if not bool(cfg.get("selection_quality_enabled", True)):
+        return 6.6
+    auto_scores = auto_scores or {}
+    metrics = candidate.get("selection_metrics")
+    if not isinstance(metrics, dict):
+        metrics = candidate
+
+    sharpe = finite_float(metrics.get("rolling_sharpe"), None)
+    consistency = finite_float(metrics.get("momentum_consistency"), None)
+    efficiency = finite_float(metrics.get("directional_efficiency"), None)
+    realized_vol = finite_float(metrics.get("realized_vol_pct"), None)
+    lookback_return = finite_float(metrics.get("return_lookback_pct"), finite_float(candidate.get("percentage"), 0.0))
+    max_drawdown = finite_float(metrics.get("max_drawdown_pct"), None)
+    max_rebound = finite_float(metrics.get("max_rebound_pct"), None)
+    dispersion = finite_float(metrics.get("cross_sectional_dispersion_pct"), None)
+    dominant_side = str(auto_scores.get("dominant_side") or "").lower()
+
+    if sharpe is None and consistency is None and efficiency is None and realized_vol is None:
+        return 6.6
+
+    sharpe_score = 55.0 if sharpe is None else clamp((sharpe + 0.20) / 1.40 * 100.0)
+    consistency_score = 55.0 if consistency is None else clamp((consistency - 0.45) / 0.25 * 100.0)
+    efficiency_score = 55.0 if efficiency is None else clamp((efficiency - 0.12) / 0.45 * 100.0)
+
+    target_vol = max(0.05, finite_float(cfg.get("selection_target_realized_vol_pct"), 0.65))
+    if realized_vol is None or realized_vol <= 0:
+        vol_score = 55.0
+    else:
+        vol_score = clamp(100.0 - abs(realized_vol - target_vol) / max(target_vol, 1e-9) * 100.0)
+        if realized_vol > target_vol * 2.8:
+            vol_score *= 0.55
+
+    max_dd_limit = max(1.0, finite_float(cfg.get("selection_max_drawdown_pct"), 18.0))
+    max_rebound_limit = max(1.0, finite_float(cfg.get("selection_max_rebound_pct"), 18.0))
+    drawdown_score = 65.0 if max_drawdown is None else clamp(100.0 - max_drawdown / max_dd_limit * 100.0)
+    rebound_score = 65.0 if max_rebound is None else clamp(100.0 - max_rebound / max_rebound_limit * 100.0)
+    tail_score = rebound_score if dominant_side == "short" else drawdown_score
+
+    abs_return = abs(finite_float(lookback_return, 0.0))
+    max_abs_change = max(3.0, finite_float(cfg.get("max_abs_price_change_pct"), 18.0))
+    if abs_return < 0.8:
+        extension_score = clamp(abs_return / 0.8 * 70.0)
+    elif abs_return <= 10.0:
+        extension_score = 100.0
+    else:
+        extension_score = clamp(100.0 - (abs_return - 10.0) / max(max_abs_change - 10.0, 1e-9) * 65.0)
+
+    raw = (
+        sharpe_score * 0.25
+        + consistency_score * 0.20
+        + efficiency_score * 0.15
+        + vol_score * 0.15
+        + tail_score * 0.15
+        + extension_score * 0.10
+    )
+
+    if dominant_side == "short":
+        if lookback_return is not None and lookback_return > 0:
+            raw -= 12.0
+        if max_rebound is not None and max_rebound >= max_rebound_limit * 0.75:
+            raw -= 10.0
+    elif dominant_side == "long" and lookback_return is not None and lookback_return < 0:
+        raw -= 8.0
+
+    max_dispersion = max(1.0, finite_float(cfg.get("selection_max_dispersion_pct"), 9.0))
+    if dispersion is not None and dispersion > max_dispersion:
+        raw *= clamp(1.0 - (dispersion - max_dispersion) / max_dispersion * 0.35, 0.60, 1.0)
+
+    return round(clamp(raw) * 0.12, 2)
 
 
 def score_sector(candidate):
@@ -396,20 +481,25 @@ def finalize_candidate(
     selected_set_info=None,
     adaptive_decision=None,
     futures_context=None,
+    selection_metrics=None,
     cfg=None,
 ):
     cfg = {**default_coin_selector_config(), **(cfg or {})}
     auto_scores = (auto_analysis or {}).get("scores", {}) if isinstance(auto_analysis, dict) else {}
+    enriched_candidate = dict(candidate)
+    if isinstance(selection_metrics, dict):
+        enriched_candidate["selection_metrics"] = dict(selection_metrics)
     components = {
-        "liquidity_cost": score_liquidity(candidate, cfg),
+        "liquidity_cost": score_liquidity(enriched_candidate, cfg),
         "utbreakout_regime": score_ut_regime(auto_scores),
         "auto_set": score_set_suitability(auto_scores, selected_set_id, selected_set_info),
         "adaptive_tf": score_adaptive_timeframe(adaptive_decision),
         "futures_health": score_futures_context(futures_context),
-        "sector_risk": score_sector(candidate),
+        "selection_quality": score_selection_quality(enriched_candidate, auto_scores, cfg),
+        "sector_risk": score_sector(enriched_candidate),
     }
     total = round(sum(components.values()), 2)
-    result = dict(candidate)
+    result = dict(enriched_candidate)
     set_info = selected_set_info or {}
     adaptive_decision = adaptive_decision or {}
     result.update({
@@ -427,16 +517,44 @@ def finalize_candidate(
         "funding_rate": (futures_context or {}).get("funding_rate", (futures_context or {}).get("lastFundingRate")),
         "open_interest_usdt": (futures_context or {}).get("open_interest_usdt", (futures_context or {}).get("open_interest")),
     })
+    metrics = result.get("selection_metrics") if isinstance(result.get("selection_metrics"), dict) else {}
+    result.update({
+        "rolling_sharpe": metrics.get("rolling_sharpe"),
+        "return_lookback_pct": metrics.get("return_lookback_pct"),
+        "realized_vol_pct": metrics.get("realized_vol_pct"),
+        "momentum_consistency": metrics.get("momentum_consistency"),
+        "directional_efficiency": metrics.get("directional_efficiency"),
+        "max_drawdown_pct": metrics.get("max_drawdown_pct"),
+        "max_rebound_pct": metrics.get("max_rebound_pct"),
+        "cross_sectional_dispersion_pct": metrics.get("cross_sectional_dispersion_pct"),
+    })
     if result["adaptive_tf"] == "NO_TRADE":
         result.setdefault("soft_warnings", []).append("ADAPTIVE_NO_TRADE")
     if result["auto_set_id"] in {49, 50}:
         result.setdefault("soft_warnings", []).append("AUTO_FALLBACK_OR_EMERGENCY")
+    if metrics:
+        if finite_float(metrics.get("cross_sectional_dispersion_pct"), 0.0) > finite_float(cfg.get("selection_max_dispersion_pct"), 9.0):
+            result.setdefault("soft_warnings", []).append("SELECTION_HIGH_DISPERSION")
+        if finite_float(metrics.get("max_drawdown_pct"), 0.0) > finite_float(cfg.get("selection_max_drawdown_pct"), 18.0):
+            result.setdefault("soft_warnings", []).append("SELECTION_DRAWDOWN_RISK")
+        if (
+            str(auto_scores.get("dominant_side") or "").lower() == "short"
+            and finite_float(metrics.get("max_rebound_pct"), 0.0) > finite_float(cfg.get("selection_max_rebound_pct"), 18.0) * 0.75
+        ):
+            result.setdefault("soft_warnings", []).append("SELECTION_SHORT_REBOUND_RISK")
     return result
 
 
 def rank_candidates(candidates, top_n=10):
     accepted = [item for item in candidates if item.get("accepted")]
-    accepted.sort(key=lambda item: (finite_float(item.get("score"), 0.0), finite_float(item.get("quote_volume"), 0.0)), reverse=True)
+    accepted.sort(
+        key=lambda item: (
+            finite_float(item.get("score"), 0.0),
+            finite_float(item.get("rolling_sharpe"), 0.0),
+            finite_float(item.get("quote_volume"), 0.0),
+        ),
+        reverse=True,
+    )
     return accepted[:max(1, int(top_n or 10))]
 
 
