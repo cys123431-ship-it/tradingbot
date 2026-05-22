@@ -22,8 +22,12 @@ from .micro_auto import (
     normalize_micro_auto_config,
 )
 from .adaptive import (
+    build_dynamic_chandelier_stop,
     build_strategy_adaptation,
+    build_trend_health_score,
+    evaluate_shadow_runner_exit,
     evaluate_shadow_triple_barrier,
+    summarize_runner_outcomes,
     summarize_shadow_outcomes,
 )
 
@@ -48,6 +52,10 @@ __all__ = [
     "select_adaptive_timeframe",
     "summarize_diagnostic_events",
     "build_strategy_adaptation",
+    "build_dynamic_chandelier_stop",
+    "build_trend_health_score",
+    "evaluate_shadow_runner_exit",
     "evaluate_shadow_triple_barrier",
+    "summarize_runner_outcomes",
     "summarize_shadow_outcomes",
 ]

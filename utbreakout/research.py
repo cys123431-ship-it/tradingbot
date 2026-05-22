@@ -74,9 +74,19 @@ def summarize_diagnostic_events(events, protection_status=None):
     blocked = [event for event in events if event.get("event") == "entry_blocked"]
     shadow = [
         event for event in events
-        if event.get("event") == "shadow_outcome" or str(event.get("code") or "").startswith("SHADOW_")
+        if event.get("event") == "shadow_outcome"
+        or (
+            str(event.get("code") or "").startswith("SHADOW_")
+            and not str(event.get("code") or "").startswith("SHADOW_RUNNER_")
+        )
+    ]
+    runner = [
+        event for event in events
+        if event.get("event") in {"runner_shadow_outcome", "runner_outcome"}
+        or str(event.get("code") or "").startswith("SHADOW_RUNNER_")
     ]
     shadow_counts = Counter(str(event.get("shadow_outcome") or event.get("outcome") or "unknown").lower() for event in shadow)
+    runner_counts = Counter(str(event.get("runner_outcome") or event.get("outcome") or "unknown").lower() for event in runner)
     set_counts = Counter(
         f"Set{int(event.get('auto_selected_set_id'))}"
         for event in events
@@ -136,6 +146,12 @@ def summarize_diagnostic_events(events, protection_status=None):
         "shadow_avg_pnl_r": _avg(event.get("pnl_r") for event in shadow),
         "shadow_avg_mfe_r": _avg(event.get("mfe_r") for event in shadow),
         "shadow_avg_mae_r": _avg(event.get("mae_r") for event in shadow),
+        "runner_count": len(runner),
+        "runner_outcomes": runner_counts.most_common(),
+        "runner_avg_pnl_r": _avg(event.get("pnl_r") for event in runner),
+        "runner_avg_mfe_r": _avg(event.get("mfe_r") for event in runner),
+        "runner_avg_mae_r": _avg(event.get("mae_r") for event in runner),
+        "runner_avg_mfe_capture_ratio": _avg(event.get("mfe_capture_ratio") for event in runner),
         "protection_missing_sl": protection_missing_sl,
         "protection_missing_tp": protection_missing_tp,
         "protection_orphan_cancelled": protection_orphan,
@@ -174,6 +190,7 @@ def format_research_summary(events, protection_status=None, days=7):
         f"Avg planned: margin {_fmt(summary['avg_planned_margin'], 2)} USDT / notional {_fmt(summary['avg_planned_notional'], 2)} USDT",
         f"Avg slippage: {_fmt(summary['avg_slippage_pct'], 4)}% / funding samples: {summary['funding_events']}",
         f"Shadow outcomes: {_format_pairs(summary['shadow_outcomes'])} / TP rate {_fmt(summary['shadow_tp_rate_pct'], 1)}% / avg {_fmt(summary['shadow_avg_pnl_r'], 2)}R / MFE {_fmt(summary['shadow_avg_mfe_r'], 2)}R / MAE {_fmt(summary['shadow_avg_mae_r'], 2)}R",
+        f"Runner outcomes: {_format_pairs(summary['runner_outcomes'])} / avg {_fmt(summary['runner_avg_pnl_r'], 2)}R / MFE {_fmt(summary['runner_avg_mfe_r'], 2)}R / capture {_fmt(summary['runner_avg_mfe_capture_ratio'], 2)}",
         f"Protection missing SL: {', '.join(summary['protection_missing_sl']) or 'none'}",
         f"Protection missing TP: {', '.join(summary['protection_missing_tp']) or 'none'}",
         f"Orphan protection cleaned: {', '.join(summary['protection_orphan_cancelled']) or 'none'}",

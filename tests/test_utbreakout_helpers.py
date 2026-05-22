@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import asyncio
+import re
 
 import pandas as pd
 import pytest
@@ -255,6 +256,26 @@ def test_telegram_global_handler_accepts_authorized_exact_stop():
     assert result == emas.ConversationHandler.END
     assert called is True
     assert len(update.message.replies) == 1
+
+
+def test_telegram_global_handler_accepts_main_keyboard_stop_button():
+    controller = _telegram_controller(chat_id=12345)
+    called = False
+
+    async def emergency_stop():
+        nonlocal called
+        called = True
+
+    controller.emergency_stop = emergency_stop
+    update = _FakeTelegramUpdate(12345, "🚨 STOP")
+
+    result = asyncio.run(controller.global_handler(update, None))
+
+    emas = _emas_module()
+    assert result == emas.ConversationHandler.END
+    assert called is True
+    assert len(update.message.replies) == 1
+    assert re.match(emas.TELEGRAM_EMERGENCY_PATTERN, "🚨 STOP")
 
 
 class _ResettableSignalEngine:
@@ -692,6 +713,11 @@ def test_utbreakout_defaults_enable_partial_trailing_and_short_guard():
     assert cfg["volatility_target_atr_pct"] == 1.0
     assert cfg["meta_labeling_enabled"] is True
     assert cfg["short_asymmetry_enabled"] is True
+    assert cfg["shadow_runner_exit_enabled"] is True
+    assert cfg["runner_exit_enabled"] is True
+    assert cfg["runner_chandelier_enabled"] is True
+    assert cfg["runner_chandelier_multiplier"] == 2.4
+    assert cfg["trend_health_enabled"] is True
 
 
 def test_utbreakout_short_guard_requires_htf_and_dmi_alignment():
@@ -839,6 +865,7 @@ def test_utbreakout_shadow_candidate_resolves_to_diagnostic_event():
 
     engine._record_utbreakout_diagnostic_event = _capture
     cfg = emas.build_default_utbot_filtered_breakout_config()
+    cfg["shadow_runner_exit_enabled"] = False
     plan = {
         "entry_price": 100,
         "stop_loss": 95,
@@ -871,6 +898,74 @@ def test_utbreakout_shadow_candidate_resolves_to_diagnostic_event():
     assert resolved[0]["shadow_outcome"] == "tp"
     assert captured[0][2] == "shadow_outcome"
     assert captured[0][3]["code"] == "SHADOW_TP"
+    assert engine.utbreakout_shadow_pending == {}
+
+
+def test_utbreakout_shadow_candidate_logs_runner_diagnostic_event():
+    emas = _emas_module()
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    engine.utbreakout_shadow_pending = {}
+    engine.utbreakout_shadow_resolved_keys = set()
+    engine.utbreakout_runner_stats_cache = {}
+    captured = []
+
+    def _capture(symbol, status, event=None, extra=None):
+        captured.append((symbol, status, event, extra))
+
+    engine._record_utbreakout_diagnostic_event = _capture
+    cfg = emas.build_default_utbot_filtered_breakout_config()
+    cfg.update({
+        "shadow_runner_exit_enabled": True,
+        "shadow_runner_max_bars": 8,
+        "shadow_triple_barrier_max_bars": 8,
+        "atr_length": 2,
+        "partial_take_profit_r_multiple": 1.0,
+        "partial_take_profit_ratio": 0.35,
+        "atr_trailing_activation_r": 1.0,
+        "runner_chandelier_lookback": 3,
+        "runner_structure_lookback": 2,
+        "runner_dynamic_multiplier_enabled": False,
+    })
+    plan = {
+        "entry_price": 100,
+        "stop_loss": 95,
+        "take_profit": 110,
+        "risk_distance": 5,
+        "rr_multiple": 2.0,
+        "decision_candle_ts": 1000,
+        "entry_timeframe": "15m",
+        "htf_timeframe": "1h",
+    }
+
+    pending = engine._register_utbreakout_shadow_candidate(
+        "BTC/USDT",
+        "long",
+        {"decision_candle_ts": 1000},
+        plan,
+        cfg,
+        {"id": 2, "name": "UT + ATR guard"},
+    )
+    assert pending is not None
+
+    rows = [{"timestamp": 1000, "open": 100, "high": 101, "low": 99, "close": 100}]
+    for idx in range(1, 9):
+        close = 100 + idx * 1.2
+        rows.append({
+            "timestamp": 1000 + idx * 1000,
+            "open": close - 0.4,
+            "high": close + 1.5,
+            "low": close - 1.0,
+            "close": close,
+        })
+    closed = pd.DataFrame(rows)
+
+    resolved = engine._update_utbreakout_shadow_triple_barrier("BTC/USDT", closed, cfg)
+
+    event_names = [item[2] for item in captured]
+    assert "shadow_outcome" in event_names
+    assert "runner_shadow_outcome" in event_names
+    assert any(str(extra["code"]).startswith("SHADOW_RUNNER_") for extra in resolved)
     assert engine.utbreakout_shadow_pending == {}
 
 
