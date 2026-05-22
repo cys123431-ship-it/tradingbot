@@ -61,6 +61,7 @@ from utbreakout.timeframe import HTF_MAP as UTBREAKOUT_HTF_MAP, select_adaptive_
 from utbreakout.adaptive import (
     build_dynamic_chandelier_stop,
     build_strategy_adaptation,
+    build_strategy_quality_score,
     build_trend_health_score,
     evaluate_shadow_runner_exit,
     evaluate_shadow_triple_barrier,
@@ -455,6 +456,14 @@ def build_utbreakout_set_registry():
         'trend_health_reduce_below': 55.0,
         'trend_health_full_score': 75.0,
         'trend_health_min_multiplier': 0.35,
+        'strategy_quality_enabled': True,
+        'strategy_quality_hard_block_below': 28.0,
+        'strategy_quality_reduce_below': 58.0,
+        'strategy_quality_full_score': 78.0,
+        'strategy_quality_min_multiplier': 0.35,
+        'strategy_quality_regression_lookback': 24,
+        'strategy_quality_hurst_lookback': 64,
+        'strategy_quality_rebound_lookback': 12,
         'adaptive_exit_enabled': True,
         'adaptive_exit_min_samples': 8,
         'adaptive_exit_lookback_days': 14,
@@ -4333,6 +4342,10 @@ class SignalEngine(BaseEngine):
             'trend_health_reduce_below': 55.0,
             'trend_health_full_score': 75.0,
             'trend_health_min_multiplier': 0.35,
+            'strategy_quality_hard_block_below': 28.0,
+            'strategy_quality_reduce_below': 58.0,
+            'strategy_quality_full_score': 78.0,
+            'strategy_quality_min_multiplier': 0.35,
             'adaptive_exit_partial_r_min': 1.0,
             'adaptive_exit_partial_r_max': 1.8,
             'adaptive_exit_ratio_min': 0.35,
@@ -4372,6 +4385,9 @@ class SignalEngine(BaseEngine):
             'runner_structure_lookback': 5,
             'trend_health_directional_lookback': 12,
             'trend_health_volatility_long_length': 50,
+            'strategy_quality_regression_lookback': 24,
+            'strategy_quality_hurst_lookback': 64,
+            'strategy_quality_rebound_lookback': 12,
             'adaptive_exit_min_samples': 8,
             'adaptive_exit_lookback_days': 14,
             'meta_labeling_min_samples': 12
@@ -4440,6 +4456,7 @@ class SignalEngine(BaseEngine):
             'runner_chandelier_enabled',
             'runner_dynamic_multiplier_enabled',
             'trend_health_enabled',
+            'strategy_quality_enabled',
             'adaptive_exit_enabled',
             'volatility_targeting_enabled',
             'meta_labeling_enabled',
@@ -6032,6 +6049,11 @@ class SignalEngine(BaseEngine):
                 'summary': plan.get('trend_health_summary'),
                 'risk_multiplier': plan.get('trend_health_risk_multiplier'),
             },
+            'strategy_quality': {
+                'score': plan.get('strategy_quality_score'),
+                'summary': plan.get('strategy_quality_summary'),
+                'risk_multiplier': plan.get('strategy_quality_risk_multiplier'),
+            },
             'entry_timeframe': plan.get('entry_timeframe'),
             'htf_timeframe': plan.get('htf_timeframe'),
             'auto_selected_set_id': plan.get('auto_selected_set_id'),
@@ -6326,6 +6348,85 @@ class SignalEngine(BaseEngine):
     def _build_utbreakout_trend_health(self, side, cfg, values):
         return build_trend_health_score(cfg, values, side)
 
+    def _calculate_utbreakout_hurst_exponent(self, close_series, lookback=64):
+        try:
+            clean = pd.to_numeric(close_series, errors='coerce').dropna().astype(float)
+            if len(clean) < 20:
+                return None
+            lookback = max(20, int(lookback or 64))
+            window = clean.tail(min(lookback, len(clean))).clip(lower=1e-12)
+            values = np.log(window.to_numpy(dtype=float))
+            lags = []
+            tau_values = []
+            for lag in (2, 4, 8, 16):
+                if len(values) <= lag + 2:
+                    continue
+                diffs = values[lag:] - values[:-lag]
+                tau = float(np.std(diffs))
+                if np.isfinite(tau) and tau > 0:
+                    lags.append(float(lag))
+                    tau_values.append(tau)
+            if len(lags) < 2:
+                return None
+            slope = float(np.polyfit(np.log(lags), np.log(tau_values), 1)[0])
+            if not np.isfinite(slope):
+                return None
+            return max(0.0, min(1.0, slope))
+        except Exception:
+            return None
+
+    def _enrich_utbreakout_strategy_quality_values(self, values, closed, cfg):
+        values = dict(values or {})
+        try:
+            if closed is None or len(closed) < 5:
+                return values
+            local = closed.copy().reset_index(drop=True)
+            for col in ['open', 'high', 'low', 'close']:
+                local[col] = pd.to_numeric(local[col], errors='coerce')
+            local = local.dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+            if len(local) < 5:
+                return values
+            close = local['close'].astype(float)
+            last_close = float(close.iloc[-1])
+            for lookback in (6, 12, 24):
+                if len(close) > lookback:
+                    start = float(close.iloc[-lookback - 1])
+                    values[f'momentum_{lookback}_pct'] = (last_close / max(abs(start), 1e-9) - 1.0) * 100.0
+            regression_lookback = max(6, int(cfg.get('strategy_quality_regression_lookback', 24) or 24))
+            regression_window = close.tail(min(regression_lookback, len(close)))
+            if len(regression_window) >= 6:
+                x = np.arange(len(regression_window), dtype=float)
+                y = regression_window.to_numpy(dtype=float)
+                slope = float(np.polyfit(x, y, 1)[0])
+                values['trend_slope_pct'] = slope * len(regression_window) / max(abs(float(y[-1])), 1e-9) * 100.0
+            hurst = self._calculate_utbreakout_hurst_exponent(
+                close,
+                cfg.get('strategy_quality_hurst_lookback', 64)
+            )
+            if hurst is not None:
+                values['hurst_exponent'] = hurst
+            rebound_lookback = max(3, int(cfg.get('strategy_quality_rebound_lookback', 12) or 12))
+            recent = local.tail(min(rebound_lookback, len(local)))
+            min_low = float(recent['low'].min())
+            max_high = float(recent['high'].max())
+            values['recent_rebound_pct'] = (last_close / max(abs(min_low), 1e-9) - 1.0) * 100.0
+            values['recent_drawdown_pct'] = (max_high - last_close) / max(abs(max_high), 1e-9) * 100.0
+            row = local.iloc[-1]
+            open_value = float(row['open'])
+            high_value = float(row['high'])
+            low_value = float(row['low'])
+            candle_range = max(high_value - low_value, 1e-12)
+            values['close_location'] = (last_close - low_value) / candle_range
+            values['upper_wick_ratio'] = max(0.0, high_value - max(open_value, last_close)) / candle_range
+            values['lower_wick_ratio'] = max(0.0, min(open_value, last_close) - low_value) / candle_range
+            values['body_ratio'] = abs(last_close - open_value) / candle_range
+        except Exception as exc:
+            logger.debug(f"UTBreak strategy quality enrichment failed: {exc}")
+        return values
+
+    def _build_utbreakout_strategy_quality(self, side, cfg, values):
+        return build_strategy_quality_score(cfg, values, side)
+
     def _utbreakout_shadow_key(self, symbol, side, decision_ts, set_id):
         return f"{str(symbol or '').upper()}:{str(side or '').lower()}:{int(decision_ts or 0)}:{set_id or 'set'}"
 
@@ -6579,13 +6680,15 @@ class SignalEngine(BaseEngine):
         stats = self._get_utbreakout_shadow_stats(symbol, side, cfg, selected_set)
         runner_stats = self._get_utbreakout_runner_stats(symbol, side, cfg, selected_set)
         trend_health = self._build_utbreakout_trend_health(side, cfg, filter_values)
+        strategy_quality = self._build_utbreakout_strategy_quality(side, cfg, filter_values)
         adaptation = build_strategy_adaptation(
             cfg,
             stats,
             side=side,
             atr_pct=(filter_values or {}).get('atr_pct'),
             runner_stats=runner_stats,
-            trend_health=trend_health
+            trend_health=trend_health,
+            strategy_quality=strategy_quality,
         )
         return adaptation
 
@@ -6725,6 +6828,10 @@ class SignalEngine(BaseEngine):
                 'trend_health_score': _safe_float_or_none(status.get('trend_health_score')),
                 'trend_health_state': status.get('trend_health_state'),
                 'trend_health_summary': status.get('trend_health_summary'),
+                'strategy_quality_risk_multiplier': _safe_float_or_none(status.get('strategy_quality_risk_multiplier')),
+                'strategy_quality_score': _safe_float_or_none(status.get('strategy_quality_score')),
+                'strategy_quality_state': status.get('strategy_quality_state'),
+                'strategy_quality_summary': status.get('strategy_quality_summary'),
                 'adaptive_exit_summary': status.get('adaptive_exit_summary'),
                 'shadow_sample_count': status.get('shadow_sample_count'),
                 'shadow_win_rate': _safe_float_or_none(status.get('shadow_win_rate')),
@@ -6764,6 +6871,9 @@ class SignalEngine(BaseEngine):
                     'trend_health_risk_multiplier': _safe_float_or_none(plan.get('trend_health_risk_multiplier')),
                     'trend_health_score': _safe_float_or_none(plan.get('trend_health_score')),
                     'trend_health_summary': plan.get('trend_health_summary'),
+                    'strategy_quality_risk_multiplier': _safe_float_or_none(plan.get('strategy_quality_risk_multiplier')),
+                    'strategy_quality_score': _safe_float_or_none(plan.get('strategy_quality_score')),
+                    'strategy_quality_summary': plan.get('strategy_quality_summary'),
                     'adaptive_exit_summary': plan.get('adaptive_exit_summary'),
                     'shadow_sample_count': plan.get('shadow_sample_count'),
                     'shadow_win_rate': _safe_float_or_none(plan.get('shadow_win_rate')),
@@ -7206,6 +7316,7 @@ class SignalEngine(BaseEngine):
             'market_regime_context': market_regime_context,
         }
         filter_values = self._enrich_utbreakout_trend_health_values(filter_values, closed, cfg, atr_series)
+        filter_values = self._enrich_utbreakout_strategy_quality_values(filter_values, closed, cfg)
         filter_items = self._evaluate_utbreakout_set_filter_items(side, selected_set, cfg, filter_values)
         status['set_filter_items'] = filter_items
         for item in filter_items:
@@ -7276,6 +7387,11 @@ class SignalEngine(BaseEngine):
         status['trend_health_score'] = trend_health.get('score')
         status['trend_health_state'] = trend_health.get('state')
         status['trend_health_summary'] = trend_health.get('summary')
+        strategy_quality = strategy_adaptation.get('strategy_quality') if isinstance(strategy_adaptation.get('strategy_quality'), dict) else {}
+        status['strategy_quality_score'] = strategy_quality.get('score')
+        status['strategy_quality_state'] = strategy_quality.get('state')
+        status['strategy_quality_summary'] = strategy_quality.get('summary')
+        status['strategy_quality_risk_multiplier'] = strategy_adaptation.get('strategy_quality_risk_multiplier')
         shadow_stats = strategy_adaptation.get('shadow_stats') if isinstance(strategy_adaptation.get('shadow_stats'), dict) else {}
         runner_stats = strategy_adaptation.get('runner_stats') if isinstance(strategy_adaptation.get('runner_stats'), dict) else {}
         status['shadow_sample_count'] = shadow_stats.get('sample_count')
@@ -7290,6 +7406,14 @@ class SignalEngine(BaseEngine):
                 None,
                 f"REJECTED_TREND_HEALTH: {trend_health.get('summary')}",
                 'REJECTED_TREND_HEALTH',
+                record_failure=True,
+                side=side
+            )
+        if strategy_quality.get('state') is False:
+            return _finish(
+                None,
+                f"REJECTED_STRATEGY_QUALITY: {strategy_quality.get('summary')}",
+                'REJECTED_STRATEGY_QUALITY',
                 record_failure=True,
                 side=side
             )
@@ -7365,6 +7489,9 @@ class SignalEngine(BaseEngine):
             'trend_health_risk_multiplier': strategy_adaptation.get('trend_health_risk_multiplier'),
             'trend_health_score': trend_health.get('score'),
             'trend_health_summary': trend_health.get('summary'),
+            'strategy_quality_risk_multiplier': strategy_adaptation.get('strategy_quality_risk_multiplier'),
+            'strategy_quality_score': strategy_quality.get('score'),
+            'strategy_quality_summary': strategy_quality.get('summary'),
             'adaptive_exit_summary': exit_overlay.get('summary'),
             'shadow_sample_count': shadow_stats.get('sample_count'),
             'shadow_win_rate': shadow_stats.get('tp_rate'),
@@ -7607,7 +7734,8 @@ class SignalEngine(BaseEngine):
                 'basis_pct': futures_context.get('basis_pct'),
                 'market_regime_context': market_regime_context,
             }
-            return self._enrich_utbreakout_trend_health_values(values, closed, cfg, status_atr_series)
+            values = self._enrich_utbreakout_trend_health_values(values, closed, cfg, status_atr_series)
+            return self._enrich_utbreakout_strategy_quality_values(values, closed, cfg)
 
         daily_count, daily_pnl = self.db.get_daily_stats()
         daily_entries = self.db.get_daily_entry_count()
@@ -7830,6 +7958,7 @@ class SignalEngine(BaseEngine):
                 'market_regime_context': market_regime_context,
             }
             filter_values = self._enrich_utbreakout_trend_health_values(filter_values, closed, cfg, status_atr_series)
+            filter_values = self._enrich_utbreakout_strategy_quality_values(filter_values, closed, cfg)
             selected_items = self._evaluate_utbreakout_set_filter_items(side, selected_set, cfg, filter_values)
             items = [
                 ("UTBot 방향", ut_state, ut_detail_text),
@@ -7844,6 +7973,8 @@ class SignalEngine(BaseEngine):
             items.append(("코인 선택 품질", selector_state, selector_quality.get('summary')))
             adaptation = self._build_utbreakout_strategy_adaptation(symbol, side, cfg, selected_set, filter_values)
             adaptation_health = adaptation.get('trend_health') if isinstance(adaptation.get('trend_health'), dict) else {}
+            adaptation_quality = adaptation.get('strategy_quality') if isinstance(adaptation.get('strategy_quality'), dict) else {}
+            items.append(("전략 품질 V2", adaptation_quality.get('state', True), adaptation_quality.get('summary')))
             items.append(("전략 적응", adaptation_health.get('state', True), adaptation.get('summary')))
             items.extend([
                 ("일일 리스크", daily_ok, daily_detail),
@@ -21648,6 +21779,7 @@ UTBot:
                 f"Shadow {'ON' if cfg.get('shadow_triple_barrier_enabled', True) else 'OFF'} / "
                 f"Runner {'ON' if cfg.get('runner_exit_enabled', True) else 'OFF'} / "
                 f"TrendHealth {'ON' if cfg.get('trend_health_enabled', True) else 'OFF'} / "
+                f"QualityV2 {'ON' if cfg.get('strategy_quality_enabled', True) else 'OFF'} / "
                 f"Exit {'ON' if cfg.get('adaptive_exit_enabled', True) else 'OFF'} / "
                 f"VolTarget {'ON' if cfg.get('volatility_targeting_enabled', True) else 'OFF'} / "
                 f"MetaSizing {'ON' if cfg.get('meta_labeling_enabled', True) else 'OFF'} / "

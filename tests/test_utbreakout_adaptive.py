@@ -2,6 +2,7 @@ from utbreakout.adaptive import (
     build_adaptive_exit_overlay,
     build_dynamic_chandelier_stop,
     build_strategy_adaptation,
+    build_strategy_quality_score,
     build_trend_health_score,
     evaluate_shadow_runner_exit,
     evaluate_shadow_triple_barrier,
@@ -264,3 +265,103 @@ def test_strategy_adaptation_uses_trend_health_and_runner_capture():
     assert result["trend_health_risk_multiplier"] == 0.5
     assert result["risk_multiplier"] == 0.5
     assert result["exit_overlay"]["atr_trailing_multiplier"] < 2.0
+
+
+def test_strategy_quality_rewards_persistent_squeeze_breakout():
+    strong = build_strategy_quality_score(
+        {
+            "strategy_quality_enabled": True,
+            "strategy_quality_hard_block_below": 28,
+            "strategy_quality_reduce_below": 58,
+            "strategy_quality_full_score": 78,
+            "strategy_quality_min_multiplier": 0.35,
+        },
+        {
+            "momentum_6_pct": 1.4,
+            "momentum_12_pct": 2.2,
+            "momentum_24_pct": 4.0,
+            "trend_slope_pct": 0.85,
+            "directional_efficiency": 0.46,
+            "hurst_exponent": 0.61,
+            "bb_width_pct": 1.25,
+            "bb_width_prev_pct": 0.95,
+            "bb_width_min_pct": 0.78,
+            "keltner_width_pct": 1.10,
+            "keltner_width_prev_pct": 0.98,
+            "range_expansion_ratio": 1.35,
+            "volume_ratio": 1.55,
+            "vwap_slope": 0.04,
+            "entry_price": 100,
+            "close_location": 0.84,
+            "upper_wick_ratio": 0.08,
+        },
+        "long",
+    )
+    weak = build_strategy_quality_score(
+        {
+            "strategy_quality_enabled": True,
+            "strategy_quality_hard_block_below": 28,
+            "strategy_quality_reduce_below": 58,
+            "strategy_quality_full_score": 78,
+            "strategy_quality_min_multiplier": 0.35,
+        },
+        {
+            "momentum_6_pct": -0.4,
+            "momentum_12_pct": 0.1,
+            "momentum_24_pct": -0.6,
+            "trend_slope_pct": -0.22,
+            "directional_efficiency": 0.08,
+            "hurst_exponent": 0.44,
+            "bb_width_pct": 0.82,
+            "bb_width_prev_pct": 0.84,
+            "bb_width_min_pct": 0.80,
+            "keltner_width_pct": 0.78,
+            "keltner_width_prev_pct": 0.80,
+            "range_expansion_ratio": 2.85,
+            "volume_ratio": 0.72,
+            "vwap_slope": -0.02,
+            "entry_price": 100,
+            "close_location": 0.48,
+            "upper_wick_ratio": 0.52,
+        },
+        "long",
+    )
+
+    assert strong["score"] > weak["score"]
+    assert strong["risk_multiplier"] == 1.0
+    assert weak["risk_multiplier"] < 1.0
+    assert "exhaustion/chasing risk" in weak["reasons"]
+
+
+def test_strategy_adaptation_uses_strategy_quality_for_sizing_and_runner():
+    result = build_strategy_adaptation(
+        {
+            "volatility_targeting_enabled": True,
+            "volatility_target_atr_pct": 1.0,
+            "meta_labeling_enabled": False,
+            "strategy_adaptive_min_risk_multiplier": 0.25,
+            "adaptive_exit_min_samples": 2,
+            "partial_take_profit_r_multiple": 1.5,
+            "partial_take_profit_ratio": 0.5,
+            "atr_trailing_multiplier": 2.0,
+            "atr_trailing_activation_r": 1.5,
+        },
+        {"sample_count": 0},
+        side="long",
+        atr_pct=1.0,
+        strategy_quality={
+            "score": 82,
+            "state": True,
+            "risk_multiplier": 1.0,
+            "summary": "strategy quality PASS",
+            "components": {
+                "squeeze_expansion": 82,
+                "persistence": 74,
+                "exhaustion_guard": 88,
+            },
+        },
+    )
+
+    assert result["strategy_quality_risk_multiplier"] == 1.0
+    assert result["exit_overlay"]["atr_trailing_multiplier"] > 2.0
+    assert result["exit_overlay"]["partial_take_profit_ratio"] < 0.5

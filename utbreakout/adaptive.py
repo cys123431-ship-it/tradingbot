@@ -713,7 +713,185 @@ def build_meta_risk_multiplier(cfg, stats):
     return round(multiplier, 4), reason
 
 
-def build_adaptive_exit_overlay(cfg, stats, side, runner_stats=None, trend_health=None):
+def build_strategy_quality_score(cfg, values, side):
+    """Score whether the current breakout looks like tradable trend continuation.
+
+    The score is deliberately soft by default. It should reduce sizing and make
+    exits more defensive before it blocks entries, so UTBreak does not become a
+    stack of brittle filters.
+    """
+    cfg = dict(cfg or {})
+    values = dict(values or {})
+    side = str(side or "").lower()
+    if not bool(cfg.get("strategy_quality_enabled", True)):
+        return {
+            "enabled": False,
+            "score": 100.0,
+            "state": True,
+            "risk_multiplier": 1.0,
+            "summary": "strategy quality OFF",
+            "components": {},
+            "reasons": ["OFF"],
+        }
+    if side not in {"long", "short"}:
+        return {
+            "enabled": True,
+            "score": 0.0,
+            "state": False,
+            "risk_multiplier": 0.0,
+            "summary": "strategy quality BLOCK invalid side",
+            "components": {},
+            "reasons": ["invalid side"],
+        }
+
+    direction = 1.0 if side == "long" else -1.0
+
+    def _score(value, low, high):
+        value = finite_float(value)
+        if value is None or high <= low:
+            return 50.0
+        return clamp((value - low) / (high - low) * 100.0, 0.0, 100.0)
+
+    momentum_values = [
+        finite_float(values.get("momentum_6_pct")),
+        finite_float(values.get("momentum_12_pct")),
+        finite_float(values.get("momentum_24_pct")),
+    ]
+    clean_momentum = [value for value in momentum_values if value is not None]
+    if clean_momentum:
+        aligned = [value * direction for value in clean_momentum]
+        aligned_share = sum(1 for value in aligned if value > 0) / len(aligned)
+        magnitude = sum(abs(value) for value in clean_momentum) / len(clean_momentum)
+        magnitude_score = _score(magnitude, 0.20, 2.20)
+        momentum_score = aligned_share * 72.0 + magnitude_score * 0.28
+        if aligned and aligned[-1] < 0:
+            momentum_score -= 12.0
+    else:
+        momentum_score = 50.0
+
+    slope = finite_float(values.get("trend_slope_pct"))
+    slope_score = _score(slope * direction if slope is not None else None, 0.02, 1.10)
+
+    efficiency = finite_float(values.get("directional_efficiency"))
+    efficiency_score = _score(efficiency, 0.12, 0.48)
+    hurst = finite_float(values.get("hurst_exponent"))
+    hurst_score = _score(hurst, 0.48, 0.62)
+    persistence_score = (efficiency_score * 0.60) + (hurst_score * 0.40)
+
+    bb_width = finite_float(values.get("bb_width_pct"))
+    bb_prev = finite_float(values.get("bb_width_prev_pct"))
+    bb_min = finite_float(values.get("bb_width_min_pct"))
+    k_width = finite_float(values.get("keltner_width_pct"))
+    k_prev = finite_float(values.get("keltner_width_prev_pct"))
+    range_expansion = finite_float(values.get("range_expansion_ratio"))
+    squeeze_parts = []
+    if bb_width is not None and bb_prev is not None:
+        squeeze_parts.append(_score((bb_width / max(bb_prev, 1e-9)) - 1.0, 0.00, 0.25))
+    if bb_width is not None and bb_min is not None:
+        squeeze_parts.append(_score((bb_width / max(bb_min, 1e-9)) - 1.0, 0.02, 0.45))
+    if k_width is not None and k_prev is not None:
+        squeeze_parts.append(_score((k_width / max(k_prev, 1e-9)) - 1.0, 0.00, 0.18))
+    if range_expansion is not None:
+        squeeze_parts.append(_score(range_expansion, 0.90, 1.75))
+    squeeze_score = sum(squeeze_parts) / len(squeeze_parts) if squeeze_parts else 50.0
+
+    volume = finite_float(values.get("volume_ratio"))
+    volume_score = _score(volume, 0.80, 1.80)
+    vwap_slope = finite_float(values.get("vwap_slope"))
+    close = finite_float(values.get("entry_price"))
+    if vwap_slope is not None and close is not None and close > 0:
+        vwap_slope_pct = vwap_slope / close * 100.0 * direction
+        vwap_score = _score(vwap_slope_pct, 0.0005, 0.035)
+    else:
+        vwap_score = 50.0
+    flow_score = (volume_score * 0.62) + (vwap_score * 0.38)
+
+    close_location = finite_float(values.get("close_location"))
+    upper_wick = finite_float(values.get("upper_wick_ratio"))
+    lower_wick = finite_float(values.get("lower_wick_ratio"))
+    range_ratio = finite_float(values.get("range_expansion_ratio"))
+    if side == "long":
+        close_quality = 50.0 if close_location is None else _score(close_location, 0.45, 0.85)
+        wick_penalty = 0.0 if upper_wick is None else clamp(upper_wick / 0.45 * 38.0, 0.0, 45.0)
+    else:
+        close_quality = 50.0 if close_location is None else _score(1.0 - close_location, 0.45, 0.85)
+        wick_penalty = 0.0 if lower_wick is None else clamp(lower_wick / 0.45 * 38.0, 0.0, 45.0)
+    exhaustion_score = close_quality - wick_penalty
+    if range_ratio is not None and range_ratio > 2.20:
+        exhaustion_score -= clamp((range_ratio - 2.20) / 1.20 * 25.0, 0.0, 25.0)
+    if side == "short":
+        recent_rebound = finite_float(values.get("recent_rebound_pct"))
+        if recent_rebound is not None:
+            exhaustion_score -= clamp((recent_rebound - 2.0) / 5.0 * 18.0, 0.0, 18.0)
+    exhaustion_score = clamp(exhaustion_score, 0.0, 100.0)
+
+    score = (
+        clamp(momentum_score, 0.0, 100.0) * 0.22
+        + slope_score * 0.16
+        + persistence_score * 0.18
+        + squeeze_score * 0.16
+        + flow_score * 0.12
+        + exhaustion_score * 0.16
+    )
+    hard_block_below = finite_float(cfg.get("strategy_quality_hard_block_below"), 28.0)
+    reduce_below = finite_float(cfg.get("strategy_quality_reduce_below"), 58.0)
+    full_score = max(reduce_below, finite_float(cfg.get("strategy_quality_full_score"), 78.0))
+    min_multiplier = clamp(cfg.get("strategy_quality_min_multiplier", 0.35), 0.05, 1.0)
+    if score < hard_block_below:
+        state = False
+        multiplier = 0.0
+    elif score < reduce_below:
+        state = "reduced"
+        multiplier = min_multiplier
+    elif score < full_score:
+        state = "reduced"
+        scale = (score - reduce_below) / max(full_score - reduce_below, 1e-9)
+        multiplier = min_multiplier + (1.0 - min_multiplier) * clamp(scale, 0.0, 1.0)
+    else:
+        state = True
+        multiplier = 1.0
+
+    components = {
+        "multi_speed_momentum": round(clamp(momentum_score, 0.0, 100.0), 2),
+        "trend_slope": round(slope_score, 2),
+        "persistence": round(persistence_score, 2),
+        "squeeze_expansion": round(squeeze_score, 2),
+        "volume_flow": round(flow_score, 2),
+        "exhaustion_guard": round(exhaustion_score, 2),
+    }
+    reasons = []
+    if components["multi_speed_momentum"] < 45.0:
+        reasons.append("momentum disagreement")
+    if components["persistence"] < 45.0:
+        reasons.append("low persistence")
+    if components["squeeze_expansion"] >= 70.0:
+        reasons.append("squeeze expansion")
+    if components["exhaustion_guard"] < 45.0:
+        reasons.append("exhaustion/chasing risk")
+    if side == "short" and finite_float(values.get("recent_rebound_pct")) is not None:
+        rebound = finite_float(values.get("recent_rebound_pct"), 0.0)
+        if rebound >= 4.0:
+            reasons.append(f"short rebound {rebound:.2f}%")
+    if not reasons:
+        reasons.append("balanced")
+    state_label = "BLOCK" if state is False else "REDUCE" if state == "reduced" else "PASS"
+    return {
+        "enabled": True,
+        "score": round(score, 2),
+        "state": state,
+        "risk_multiplier": round(multiplier, 4),
+        "components": components,
+        "reasons": reasons,
+        "summary": (
+            f"strategy quality {state_label} {score:.1f}/100 x{multiplier:.2f} "
+            f"(mom {components['multi_speed_momentum']:.0f}, slope {components['trend_slope']:.0f}, "
+            f"persist {components['persistence']:.0f}, sqz {components['squeeze_expansion']:.0f}, "
+            f"flow {components['volume_flow']:.0f}, exhaust {components['exhaustion_guard']:.0f})"
+        ),
+    }
+
+
+def build_adaptive_exit_overlay(cfg, stats, side, runner_stats=None, trend_health=None, strategy_quality=None):
     cfg = dict(cfg or {})
     side = str(side or "").lower()
     partial_r = finite_float(cfg.get("partial_take_profit_r_multiple"), 1.5)
@@ -784,6 +962,33 @@ def build_adaptive_exit_overlay(cfg, stats, side, runner_stats=None, trend_healt
             activation_r -= 0.10
             reasons.append(f"weak trend health {health_score:.0f}")
 
+    strategy_quality = dict(strategy_quality or {})
+    quality_score = finite_float(strategy_quality.get("score"))
+    quality_components = strategy_quality.get("components") if isinstance(strategy_quality.get("components"), dict) else {}
+    if quality_score is not None:
+        if quality_score >= 78.0:
+            trailing_mult += 0.15
+            partial_ratio -= 0.03
+            reasons.append(f"strong strategy quality {quality_score:.0f}")
+        elif quality_score < 58.0:
+            partial_r -= 0.10
+            partial_ratio += 0.04
+            trailing_mult -= 0.10
+            activation_r -= 0.10
+            reasons.append(f"weak strategy quality {quality_score:.0f}")
+    squeeze_score = finite_float(quality_components.get("squeeze_expansion"))
+    persistence_score = finite_float(quality_components.get("persistence"))
+    exhaustion_score = finite_float(quality_components.get("exhaustion_guard"))
+    if squeeze_score is not None and persistence_score is not None and squeeze_score >= 75.0 and persistence_score >= 68.0:
+        trailing_mult += 0.10
+        reasons.append("persistent squeeze expansion")
+    if exhaustion_score is not None and exhaustion_score < 45.0:
+        partial_r -= 0.15
+        partial_ratio += 0.05
+        trailing_mult -= 0.15
+        activation_r -= 0.10
+        reasons.append(f"exhaustion guard {exhaustion_score:.0f}")
+
     partial_r = clamp(partial_r, cfg.get("adaptive_exit_partial_r_min", 1.0), cfg.get("adaptive_exit_partial_r_max", 1.8))
     partial_ratio = clamp(partial_ratio, cfg.get("adaptive_exit_ratio_min", 0.35), cfg.get("adaptive_exit_ratio_max", 0.65))
     trailing_mult = clamp(trailing_mult, cfg.get("adaptive_exit_trailing_multiplier_min", 1.4), cfg.get("adaptive_exit_trailing_multiplier_max", 2.6))
@@ -801,15 +1006,29 @@ def build_adaptive_exit_overlay(cfg, stats, side, runner_stats=None, trend_healt
     }
 
 
-def build_strategy_adaptation(cfg, stats, *, side, atr_pct, runner_stats=None, trend_health=None):
+def build_strategy_adaptation(cfg, stats, *, side, atr_pct, runner_stats=None, trend_health=None, strategy_quality=None):
     vol_multiplier, vol_summary = build_volatility_risk_multiplier(cfg, atr_pct)
     meta_multiplier, meta_summary = build_meta_risk_multiplier(cfg, stats)
     trend_health = dict(trend_health or {})
     trend_multiplier = finite_float(trend_health.get("risk_multiplier"), 1.0)
     trend_summary = trend_health.get("summary") or "trend health neutral"
+    strategy_quality = dict(strategy_quality or {})
+    quality_multiplier = finite_float(strategy_quality.get("risk_multiplier"), 1.0)
+    quality_summary = strategy_quality.get("summary") or "strategy quality neutral"
     min_multiplier = clamp((cfg or {}).get("strategy_adaptive_min_risk_multiplier", 0.25), 0.05, 1.0)
-    risk_multiplier = clamp(float(vol_multiplier) * float(meta_multiplier) * float(trend_multiplier), min_multiplier, 1.0)
-    exit_overlay = build_adaptive_exit_overlay(cfg, stats, side, runner_stats=runner_stats, trend_health=trend_health)
+    risk_multiplier = clamp(
+        float(vol_multiplier) * float(meta_multiplier) * float(trend_multiplier) * float(quality_multiplier),
+        min_multiplier,
+        1.0
+    )
+    exit_overlay = build_adaptive_exit_overlay(
+        cfg,
+        stats,
+        side,
+        runner_stats=runner_stats,
+        trend_health=trend_health,
+        strategy_quality=strategy_quality,
+    )
     stats = dict(stats or {})
     runner_stats = dict(runner_stats or {})
     sample_count = int(stats.get("sample_count") or 0)
@@ -819,7 +1038,7 @@ def build_strategy_adaptation(cfg, stats, *, side, atr_pct, runner_stats=None, t
     capture = finite_float(runner_stats.get("avg_mfe_capture_ratio"))
     capture_text = "n/a" if capture is None else f"{capture:.0%}"
     summary = (
-        f"risk x{risk_multiplier:.2f}; {vol_summary}; {meta_summary}; {trend_summary}; "
+        f"risk x{risk_multiplier:.2f}; {vol_summary}; {meta_summary}; {trend_summary}; {quality_summary}; "
         f"shadow n={sample_count}, WR={finite_float(stats.get('tp_rate'), 0.0):.0%}, avg={avg_text}; "
         f"runner n={runner_count}, capture={capture_text}; "
         f"{exit_overlay['summary']}"
@@ -829,10 +1048,13 @@ def build_strategy_adaptation(cfg, stats, *, side, atr_pct, runner_stats=None, t
         "volatility_risk_multiplier": vol_multiplier,
         "meta_label_risk_multiplier": meta_multiplier,
         "trend_health_risk_multiplier": round(trend_multiplier, 4),
+        "strategy_quality_risk_multiplier": round(quality_multiplier, 4),
         "volatility_summary": vol_summary,
         "meta_label_summary": meta_summary,
         "trend_health": trend_health,
         "trend_health_summary": trend_summary,
+        "strategy_quality": strategy_quality,
+        "strategy_quality_summary": quality_summary,
         "shadow_stats": stats,
         "runner_stats": runner_stats,
         "exit_overlay": exit_overlay,
