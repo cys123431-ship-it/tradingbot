@@ -119,6 +119,43 @@ def test_adaptive_exit_overlay_makes_short_exits_more_defensive():
     assert overlay["atr_trailing_activation_r"] == 1.3
 
 
+def test_adaptive_exit_overlay_weak_quality_takes_profit_faster():
+    weak = build_adaptive_exit_overlay(
+        {
+            "partial_take_profit_r_multiple": 1.5,
+            "partial_take_profit_ratio": 0.5,
+            "atr_trailing_multiplier": 2.0,
+            "atr_trailing_activation_r": 1.5,
+            "adaptive_exit_min_samples": 1,
+        },
+        {"sample_count": 3, "tp_rate": 0.25, "avg_pnl_r": -0.2},
+        "long",
+        strategy_quality={"risk_multiplier": 0.5, "score": 42},
+    )
+
+    assert weak["partial_take_profit_r_multiple"] < 1.5
+    assert weak["partial_take_profit_ratio"] > 0.5
+    assert weak["atr_trailing_multiplier"] < 2.0
+
+
+def test_adaptive_exit_overlay_strong_quality_keeps_runner_wider():
+    strong = build_adaptive_exit_overlay(
+        {
+            "partial_take_profit_r_multiple": 1.5,
+            "partial_take_profit_ratio": 0.5,
+            "atr_trailing_multiplier": 2.0,
+            "atr_trailing_activation_r": 1.5,
+            "adaptive_exit_min_samples": 1,
+        },
+        {"sample_count": 4, "tp_rate": 0.75, "avg_pnl_r": 0.8},
+        "long",
+        strategy_quality={"risk_multiplier": 1.0, "score": 85},
+    )
+
+    assert strong["partial_take_profit_ratio"] <= 0.5
+    assert strong["atr_trailing_multiplier"] >= 2.0
+
+
 def test_trend_health_compresses_quality_into_single_multiplier():
     strong = build_trend_health_score(
         {

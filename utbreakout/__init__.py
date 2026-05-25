@@ -21,6 +21,12 @@ from .micro_auto import (
     default_micro_auto_config,
     normalize_micro_auto_config,
 )
+from .quant_config import default_quant_config
+from .regime import classify_market_regime, default_regime_config
+from .meta import build_meta_features, decide_meta_trade, estimate_meta_probability, evaluate_meta_label, label_from_barrier_outcome
+from .sizing import build_position_risk_multiplier, default_sizing_config
+from .portfolio import evaluate_portfolio_risk, default_portfolio_config
+from .performance import calculate_performance_metrics, group_performance, walk_forward_splits
 from .adaptive import (
     build_dynamic_chandelier_stop,
     build_strategy_adaptation,
@@ -47,6 +53,7 @@ __all__ = [
     "build_micro_entry_plan",
     "previous_donchian",
     "default_micro_auto_config",
+    "default_quant_config",
     "rank_candidates",
     "normalize_micro_auto_config",
     "sector_tags_for_symbol",
@@ -60,4 +67,18 @@ __all__ = [
     "evaluate_shadow_triple_barrier",
     "summarize_runner_outcomes",
     "summarize_shadow_outcomes",
+    "classify_market_regime",
+    "default_regime_config",
+    "build_meta_features",
+    "decide_meta_trade",
+    "estimate_meta_probability",
+    "evaluate_meta_label",
+    "label_from_barrier_outcome",
+    "build_position_risk_multiplier",
+    "default_sizing_config",
+    "evaluate_portfolio_risk",
+    "default_portfolio_config",
+    "calculate_performance_metrics",
+    "group_performance",
+    "walk_forward_splits",
 ]
