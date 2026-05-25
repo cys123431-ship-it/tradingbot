@@ -1065,3 +1065,121 @@ def test_utbreakout_trailing_replaces_sl_and_keeps_partial_tp_order():
     assert "tp-existing" in remaining_ids
     assert "sl-old" not in remaining_ids
     assert any(order["type"] == "stop_market" for order in engine.exchange.created)
+    assert engine.last_protection_order_status["BTC/USDT"]["tp_expected"] is True
+    assert engine.last_protection_order_status["BTC/USDT"]["sl_count"] == 1
+
+
+def test_utbreakout_trailing_does_not_create_duplicate_sl_when_cancel_does_not_clear():
+    class _StickyStopExchange(_FakeExchange):
+        def cancel_order(self, order_id, symbol):
+            self.cancelled.append((str(order_id), symbol))
+            return {"id": order_id}
+
+    pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "1", "entryPrice": "100"}
+    engine = _protection_engine(
+        [
+            {
+                "id": "tp-existing",
+                "side": "sell",
+                "type": "limit",
+                "price": "115",
+                "reduceOnly": True,
+                "info": {"symbol": "BTCUSDT"},
+            },
+            {
+                "id": "sl-old",
+                "side": "sell",
+                "type": "market",
+                "clientOrderId": "utbslBTCUSDTold",
+                "info": {"origType": "STOP_MARKET", "stopPrice": "90", "reduceOnly": "true", "symbol": "BTCUSDT"},
+            },
+        ],
+        positions=[pos],
+    )
+    engine.exchange = _StickyStopExchange(engine.exchange.orders, positions=[pos])
+    engine.PROTECTION_REPLACE_CONFIRM_ATTEMPTS = 1
+    engine.PROTECTION_REPLACE_CONFIRM_DELAY = 0
+    engine.utbreakout_trailing_states = {
+        "BTC/USDT": {
+            "side": "long",
+            "entry_price": 100.0,
+            "initial_qty": 2.0,
+            "remaining_ratio": 0.5,
+            "risk_distance": 10.0,
+            "activation_r": 1.5,
+            "trailing_atr_multiplier": 1.0,
+            "breakeven_enabled": True,
+            "last_stop_price": 90.0,
+            "active": False,
+        }
+    }
+    rows = []
+    for idx in range(25):
+        close = 100 + idx * 1.5
+        rows.append({
+            "open": close - 0.5,
+            "high": close + 1.0,
+            "low": close - 1.0,
+            "close": close,
+        })
+    df = pd.DataFrame(rows)
+
+    state = asyncio.run(
+        engine._manage_utbreakout_partial_trailing(
+            "BTC/USDT",
+            pos,
+            df,
+            {
+                "atr_length": 14,
+                "atr_trailing_enabled": True,
+                "atr_trailing_multiplier": 1.0,
+                "atr_trailing_breakeven_enabled": True,
+            },
+        )
+    )
+
+    assert state is None
+    assert ("sl-old", "BTC/USDT") in engine.exchange.cancelled
+    assert engine.exchange.created == []
+    assert engine.utbreakout_trailing_states["BTC/USDT"]["last_stop_price"] == 90.0
+    remaining_sl = [
+        order for order in engine.exchange.orders
+        if engine._classify_protection_order(order) == "sl"
+    ]
+    assert [order["id"] for order in remaining_sl] == ["sl-old"]
+
+
+def test_replace_stop_loss_aborts_when_open_order_fetch_fails():
+    class _FetchFailExchange(_FakeExchange):
+        def fetch_open_orders(self, symbol=None):
+            raise RuntimeError("open orders unavailable")
+
+    pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "1", "entryPrice": "100"}
+    engine = _protection_engine(
+        [
+            {
+                "id": "sl-old",
+                "side": "sell",
+                "type": "market",
+                "clientOrderId": "utbslBTCUSDTold",
+                "info": {"origType": "STOP_MARKET", "stopPrice": "90", "reduceOnly": "true", "symbol": "BTCUSDT"},
+            }
+        ],
+        positions=[pos],
+    )
+    engine.exchange = _FetchFailExchange(engine.exchange.orders, positions=[pos])
+    engine.PROTECTION_REPLACE_CONFIRM_ATTEMPTS = 1
+    engine.PROTECTION_REPLACE_CONFIRM_DELAY = 0
+
+    order = asyncio.run(
+        engine._replace_stop_loss_order(
+            "BTC/USDT",
+            pos,
+            stop_price=95,
+            reason="test fetch failure",
+        )
+    )
+
+    assert order is None
+    assert engine.exchange.created == []
+    assert engine.last_protection_order_status["BTC/USDT"]["status"] == "SL_REPLACE_FETCH_FAILED"

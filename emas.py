@@ -16150,12 +16150,18 @@ class SignalEngine(BaseEngine):
         return f"utb{str(kind or '')[:2]}{symbol_part}{digest}"[:36]
 
     async def _collect_protection_orders(self, symbol):
+        _, orders = await self._collect_protection_orders_checked(symbol)
+        return orders
+
+    async def _collect_protection_orders_checked(self, symbol):
         merged = []
         seen = set()
+        fetch_ok = False
         for scope in (symbol, None):
             open_orders = await self._fetch_open_orders_safe(scope)
             if open_orders is None:
                 continue
+            fetch_ok = True
             for order in open_orders or []:
                 if not self._protection_order_matches_symbol(order, symbol):
                     continue
@@ -16166,7 +16172,7 @@ class SignalEngine(BaseEngine):
                     continue
                 seen.add(key)
                 merged.append(order)
-        return merged
+        return fetch_ok, merged
 
     async def _cancel_single_protection_order(self, symbol, order, reason='protection cleanup'):
         order_id = self._protection_order_id(order)
@@ -16577,6 +16583,12 @@ class SignalEngine(BaseEngine):
             pos_entry_price = float(pos.get('entryPrice') or 0.0)
         except (TypeError, ValueError):
             pos_entry_price = 0.0
+        runner_state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
+        runner_sl_active = (
+            isinstance(runner_state, dict)
+            and bool(runner_state.get('active'))
+            and str(runner_state.get('side', '')).lower() == pos_side
+        )
         valid_tp = []
         valid_sl = []
         mismatched = []
@@ -16591,10 +16603,9 @@ class SignalEngine(BaseEngine):
             order_price = _safe_float_or_none(order.get('price')) or trigger_price
             if pos_entry_price > 0 and order_price:
                 if kind == 'sl':
-                    invalid_sl = (
-                        pos_side == 'long' and float(order_price) >= pos_entry_price
-                    ) or (
-                        pos_side == 'short' and float(order_price) <= pos_entry_price
+                    invalid_sl = False if runner_sl_active else (
+                        (pos_side == 'long' and float(order_price) >= pos_entry_price)
+                        or (pos_side == 'short' and float(order_price) <= pos_entry_price)
                     )
                     if invalid_sl:
                         invalid_price_orders.append(order)
@@ -16739,6 +16750,81 @@ class SignalEngine(BaseEngine):
         sl_side = 'sell' if side == 'long' else 'buy'
         safe_stop = self.safe_price(symbol, float(stop_price))
         await self._cancel_protection_orders_by_kind(symbol, {'sl'}, reason=reason)
+        confirm_attempts = max(1, int(getattr(self, 'PROTECTION_REPLACE_CONFIRM_ATTEMPTS', 3) or 3))
+        confirm_delay = max(0.0, float(getattr(self, 'PROTECTION_REPLACE_CONFIRM_DELAY', 0.25) or 0.0))
+        remaining_sl = []
+        latest_protection_orders = []
+        for attempt in range(confirm_attempts):
+            if confirm_delay > 0:
+                await asyncio.sleep(confirm_delay)
+            fetch_ok, protection_orders = await self._collect_protection_orders_checked(symbol)
+            if not fetch_ok:
+                status = {
+                    'tp_expected': False,
+                    'sl_expected': True,
+                    'tp_present': False,
+                    'sl_present': False,
+                    'tp_count': 0,
+                    'sl_count': 0,
+                    'missing_tp': False,
+                    'missing_sl': True,
+                    'duplicate_cancelled': 0,
+                    'status': 'SL_REPLACE_FETCH_FAILED'
+                }
+                self.last_protection_order_status[symbol] = status
+                logger.warning(
+                    f"SL replacement aborted for {symbol}: open-order fetch failed during "
+                    f"confirmation ({reason})"
+                )
+                await self._notify_protection_issue(
+                    symbol,
+                    f"sl_replace_fetch_failed:{self._protection_position_signature(pos)}",
+                    f"🚨 {self.ctrl.format_symbol_for_display(symbol)} SL 교체 중단: "
+                    "기존 SL 취소 여부를 조회하지 못해 새 SL을 만들지 않았습니다.",
+                    cooldown_sec=60
+                )
+                return None
+            latest_protection_orders = list(protection_orders or [])
+            remaining_sl = [
+                order for order in latest_protection_orders
+                if self._classify_protection_order(order) == 'sl'
+            ]
+            if not remaining_sl:
+                break
+            if attempt < confirm_attempts - 1:
+                await self._cancel_protection_orders(
+                    symbol,
+                    reason=f"{reason} confirm retry {attempt + 1}",
+                    orders=remaining_sl
+                )
+
+        if remaining_sl:
+            status = {
+                'tp_expected': False,
+                'sl_expected': True,
+                'tp_present': False,
+                'sl_present': True,
+                'tp_count': 0,
+                'sl_count': len(remaining_sl),
+                'missing_tp': False,
+                'missing_sl': False,
+                'duplicate_cancelled': 0,
+                'status': 'SL_REPLACE_CANCEL_FAILED'
+            }
+            self.last_protection_order_status[symbol] = status
+            logger.warning(
+                f"SL replacement aborted for {symbol}: existing SL still open after "
+                f"{confirm_attempts} confirmation attempt(s) ({reason})"
+            )
+            await self._notify_protection_issue(
+                symbol,
+                f"sl_replace_cancel_failed:{self._protection_position_signature(pos)}",
+                f"🚨 {self.ctrl.format_symbol_for_display(symbol)} SL 교체 중단: "
+                f"기존 SL {len(remaining_sl)}건 취소 확인 실패. 중복 SL 방지를 위해 새 SL을 만들지 않았습니다.",
+                cooldown_sec=60
+            )
+            return None
+
         return await self._create_protection_order_with_retries(
             symbol,
             'stop_market',
@@ -16892,12 +16978,14 @@ class SignalEngine(BaseEngine):
         if not improved and state.get('active'):
             return None
 
-        await self._replace_stop_loss_order(
+        replacement_order = await self._replace_stop_loss_order(
             symbol,
             pos,
             new_stop,
             reason='UTBreak ATR trailing stop update'
         )
+        if not replacement_order:
+            return None
         state.update({
             'active': True,
             'last_stop_price': float(new_stop),
@@ -16913,6 +17001,18 @@ class SignalEngine(BaseEngine):
             'last_update_ts': datetime.now(timezone.utc).isoformat(),
         })
         self.utbreakout_trailing_states[symbol] = state
+        protection_orders = await self._collect_protection_orders(symbol)
+        expected_tp = any(
+            self._classify_protection_order(order) == 'tp'
+            for order in (protection_orders or [])
+        )
+        await self._audit_protection_orders(
+            symbol,
+            pos=pos,
+            expected_tp=expected_tp,
+            expected_sl=True,
+            alert=True
+        )
         await self.ctrl.notify(
             f"🧭 UTBreak Runner SL 갱신: {self.ctrl.format_symbol_for_display(symbol)} "
             f"{side.upper()} SL `{float(new_stop):.4f}` ({runner_mode}, MFE {mfe_r:.2f}R)"
