@@ -440,6 +440,24 @@ def build_utbreakout_set_registry():
         'bias_continuation_15m_max_extension_atr': 1.00,
         'bias_continuation_min_adaptive_tf_score': 48.0,
         'bias_continuation_15m_min_adaptive_tf_score': 62.0,
+        'quality_score_v2_enabled': True,
+        'quality_score_v2_block_below': 60.0,
+        'quality_score_v2_reduce_below': 70.0,
+        'quality_score_v2_full_score': 82.0,
+        'quality_score_v2_min_risk_multiplier': 0.50,
+        'quality_score_v2_15m_block_below': 62.0,
+        'quality_score_v2_15m_reduce_below': 72.0,
+        'dynamic_take_profit_enabled': True,
+        'dynamic_tp2_strong_score': 72.0,
+        'dynamic_tp2_elite_score': 82.0,
+        'dynamic_tp2_base_r_multiple': 2.0,
+        'dynamic_tp2_strong_r_multiple': 2.5,
+        'dynamic_tp2_elite_r_multiple': 3.0,
+        'tp1_breakeven_enabled': True,
+        'tp1_breakeven_trigger_r': 1.5,
+        'tp1_breakeven_offset_r': 0.03,
+        'tp1_breakeven_wait_for_partial': True,
+        'tp1_breakeven_qty_tolerance': 0.08,
         'market_quality_enabled': True,
         'regime_filter_enabled': False,
         'meta_sizing_enabled': False,
@@ -706,6 +724,24 @@ def build_default_utbot_filtered_breakout_config():
         'bias_continuation_15m_max_extension_atr': 1.00,
         'bias_continuation_min_adaptive_tf_score': 48.0,
         'bias_continuation_15m_min_adaptive_tf_score': 62.0,
+        'quality_score_v2_enabled': True,
+        'quality_score_v2_block_below': 60.0,
+        'quality_score_v2_reduce_below': 70.0,
+        'quality_score_v2_full_score': 82.0,
+        'quality_score_v2_min_risk_multiplier': 0.50,
+        'quality_score_v2_15m_block_below': 62.0,
+        'quality_score_v2_15m_reduce_below': 72.0,
+        'dynamic_take_profit_enabled': True,
+        'dynamic_tp2_strong_score': 72.0,
+        'dynamic_tp2_elite_score': 82.0,
+        'dynamic_tp2_base_r_multiple': 2.0,
+        'dynamic_tp2_strong_r_multiple': 2.5,
+        'dynamic_tp2_elite_r_multiple': 3.0,
+        'tp1_breakeven_enabled': True,
+        'tp1_breakeven_trigger_r': 1.5,
+        'tp1_breakeven_offset_r': 0.03,
+        'tp1_breakeven_wait_for_partial': True,
+        'tp1_breakeven_qty_tolerance': 0.08,
         'market_quality_enabled': True,
         'regime_filter_enabled': False,
         'meta_sizing_enabled': False,
@@ -4420,6 +4456,20 @@ class SignalEngine(BaseEngine):
             'bias_continuation_15m_max_extension_atr': 1.00,
             'bias_continuation_min_adaptive_tf_score': 48.0,
             'bias_continuation_15m_min_adaptive_tf_score': 62.0,
+            'quality_score_v2_block_below': 60.0,
+            'quality_score_v2_reduce_below': 70.0,
+            'quality_score_v2_full_score': 82.0,
+            'quality_score_v2_min_risk_multiplier': 0.50,
+            'quality_score_v2_15m_block_below': 62.0,
+            'quality_score_v2_15m_reduce_below': 72.0,
+            'dynamic_tp2_strong_score': 72.0,
+            'dynamic_tp2_elite_score': 82.0,
+            'dynamic_tp2_base_r_multiple': 2.0,
+            'dynamic_tp2_strong_r_multiple': 2.5,
+            'dynamic_tp2_elite_r_multiple': 3.0,
+            'tp1_breakeven_trigger_r': 1.5,
+            'tp1_breakeven_offset_r': 0.03,
+            'tp1_breakeven_qty_tolerance': 0.08,
         }.items():
             min_value = None if key == 'opposite_set_exit_min_pnl_usdt' else 0.0
             _float(key, default, min_value)
@@ -4530,6 +4580,10 @@ class SignalEngine(BaseEngine):
             'adaptive_exit_v2_enabled',
             'walk_forward_report_enabled',
             'bias_continuation_enabled',
+            'quality_score_v2_enabled',
+            'dynamic_take_profit_enabled',
+            'tp1_breakeven_enabled',
+            'tp1_breakeven_wait_for_partial',
         ):
             cfg[key] = bool(cfg.get(key, False))
         if bool(cfg.get('fixed_take_profit_enabled', True)):
@@ -6082,7 +6136,10 @@ class SignalEngine(BaseEngine):
         return extra
 
     def _register_utbreakout_trailing_state(self, symbol, side, entry_price, qty, plan, cfg):
-        if not bool(cfg.get('atr_trailing_enabled', True)):
+        if (
+            not bool(cfg.get('atr_trailing_enabled', False))
+            and not bool(cfg.get('tp1_breakeven_enabled', True))
+        ):
             self._clear_utbreakout_trailing_state(symbol)
             return None
         try:
@@ -6112,6 +6169,24 @@ class SignalEngine(BaseEngine):
             'activation_r': activation_r,
             'trailing_atr_multiplier': max(0.1, float(cfg.get('atr_trailing_multiplier', 2.0) or 2.0)),
             'breakeven_enabled': bool(cfg.get('atr_trailing_breakeven_enabled', True)),
+            'atr_trailing_enabled': bool(cfg.get('atr_trailing_enabled', False)),
+            'tp1_breakeven_enabled': bool(cfg.get('tp1_breakeven_enabled', True)),
+            'tp1_breakeven_trigger_r': max(
+                0.1,
+                float(
+                    cfg.get(
+                        'tp1_breakeven_trigger_r',
+                        cfg.get('partial_take_profit_r_multiple', 1.5)
+                    ) or 1.5
+                )
+            ),
+            'tp1_breakeven_offset_r': max(0.0, float(cfg.get('tp1_breakeven_offset_r', 0.03) or 0.03)),
+            'tp1_breakeven_wait_for_partial': bool(cfg.get('tp1_breakeven_wait_for_partial', True)),
+            'tp1_breakeven_qty_tolerance': min(
+                0.5,
+                max(0.0, float(cfg.get('tp1_breakeven_qty_tolerance', 0.08) or 0.08))
+            ),
+            'breakeven_armed': False,
             'last_stop_price': float(plan.get('stop_loss', 0.0) or 0.0),
             'initial_stop_price': float(plan.get('stop_loss', 0.0) or 0.0),
             'runner_exit_enabled': bool(cfg.get('runner_exit_enabled', True)),
@@ -6657,6 +6732,188 @@ class SignalEngine(BaseEngine):
         continuation = self._evaluate_utbreakout_bias_continuation(side, cfg, status, values, selected_set)
         return ("Bias continuation", continuation.get('state'), continuation.get('summary'))
 
+    def _build_utbreakout_quality_score_v2(
+        self,
+        side,
+        cfg,
+        status,
+        values,
+        *,
+        trend_health=None,
+        strategy_quality=None,
+        market_quality=None,
+        selector_quality=None,
+    ):
+        side = str(side or '').lower()
+        cfg = dict(cfg or {})
+        status = dict(status or {})
+        values = dict(values or {})
+        if not bool(cfg.get('quality_score_v2_enabled', True)):
+            return {
+                'enabled': False,
+                'score': 100.0,
+                'state': True,
+                'risk_multiplier': 1.0,
+                'summary': 'quality score v2 OFF',
+                'components': {},
+                'reasons': ['OFF'],
+            }
+
+        def _score(value, default=50.0):
+            if self._is_valid_number(value):
+                return max(0.0, min(100.0, float(value)))
+            return float(default)
+
+        def _risk(value, default=1.0):
+            if self._is_valid_number(value):
+                return max(0.0, min(1.0, float(value)))
+            return float(default)
+
+        trend_health = dict(trend_health or {})
+        strategy_quality = dict(strategy_quality or {})
+        market_quality = dict(market_quality or {})
+        selector_quality = dict(selector_quality or {})
+
+        trend_score = _score(trend_health.get('score'))
+        strategy_score = _score(strategy_quality.get('score'))
+        market_multiplier = _risk(market_quality.get('risk_multiplier'))
+        if market_quality.get('hard_block') or market_quality.get('state') is False:
+            market_score = 0.0
+        else:
+            market_score = max(35.0, market_multiplier * 100.0)
+        selector_score = _score(selector_quality.get('score'), 70.0)
+        adaptive = status.get('adaptive_timeframe_decision')
+        if not isinstance(adaptive, dict):
+            adaptive = cfg.get('_adaptive_timeframe_decision') if isinstance(cfg.get('_adaptive_timeframe_decision'), dict) else {}
+        adaptive_score = _score(adaptive.get('selected_score'), 65.0)
+        candidate_type = str(status.get('candidate_type') or '').lower()
+        if candidate_type == 'fresh_signal':
+            signal_score = 92.0
+        elif candidate_type == 'bias_continuation':
+            signal_score = 74.0
+        else:
+            signal_score = 58.0
+
+        components = {
+            'trend_health': round(trend_score, 2),
+            'strategy_quality': round(strategy_score, 2),
+            'market_quality': round(market_score, 2),
+            'selector_quality': round(selector_score, 2),
+            'adaptive_timeframe': round(adaptive_score, 2),
+            'signal_freshness': round(signal_score, 2),
+        }
+        score = (
+            trend_score * 0.24
+            + strategy_score * 0.28
+            + market_score * 0.16
+            + selector_score * 0.12
+            + adaptive_score * 0.10
+            + signal_score * 0.10
+        )
+
+        entry_tf = str(cfg.get('entry_timeframe', status.get('entry_timeframe', '15m')) or '15m').lower()
+        tf_ms = self._timeframe_to_ms(entry_tf) or (15 * 60 * 1000)
+        is_fast_tf = tf_ms <= 15 * 60 * 1000
+        block_below = (
+            float(cfg.get('quality_score_v2_15m_block_below', 62.0) or 62.0)
+            if is_fast_tf else
+            float(cfg.get('quality_score_v2_block_below', 60.0) or 60.0)
+        )
+        reduce_below = (
+            float(cfg.get('quality_score_v2_15m_reduce_below', 72.0) or 72.0)
+            if is_fast_tf else
+            float(cfg.get('quality_score_v2_reduce_below', 70.0) or 70.0)
+        )
+        full_score = max(reduce_below, float(cfg.get('quality_score_v2_full_score', 82.0) or 82.0))
+        min_multiplier = max(0.05, min(1.0, float(cfg.get('quality_score_v2_min_risk_multiplier', 0.50) or 0.50)))
+
+        reasons = []
+        if trend_score < reduce_below:
+            reasons.append(f"trend {trend_score:.0f}")
+        if strategy_score < reduce_below:
+            reasons.append(f"strategy {strategy_score:.0f}")
+        if market_score < reduce_below:
+            reasons.append(f"market {market_score:.0f}")
+        if adaptive_score < block_below:
+            reasons.append(f"adaptive {adaptive_score:.0f}")
+        if candidate_type not in {'fresh_signal', 'bias_continuation'}:
+            reasons.append('signal state weak')
+        if not reasons:
+            reasons.append('confluence aligned')
+
+        if score < block_below:
+            state = False
+            risk_multiplier = 0.0
+        elif score < reduce_below:
+            state = 'reduced'
+            risk_multiplier = min_multiplier
+        elif score < full_score:
+            state = 'reduced'
+            scale = (score - reduce_below) / max(full_score - reduce_below, 1e-9)
+            risk_multiplier = min_multiplier + (1.0 - min_multiplier) * max(0.0, min(1.0, scale))
+        else:
+            state = True
+            risk_multiplier = 1.0
+
+        state_label = 'BLOCK' if state is False else 'REDUCE' if state == 'reduced' else 'PASS'
+        return {
+            'enabled': True,
+            'score': round(score, 2),
+            'state': state,
+            'risk_multiplier': round(risk_multiplier, 4),
+            'components': components,
+            'reasons': reasons,
+            'block_below': block_below,
+            'reduce_below': reduce_below,
+            'summary': (
+                f"quality score v2 {state_label} {score:.1f}/100 x{risk_multiplier:.2f} "
+                f"(trend {trend_score:.0f}, strat {strategy_score:.0f}, market {market_score:.0f}, "
+                f"selector {selector_score:.0f}, tf {adaptive_score:.0f}, sig {signal_score:.0f}; "
+                f"{'; '.join(reasons[:4])})"
+            ),
+        }
+
+    def _build_utbreakout_dynamic_tp2(self, side, cfg, quality_score_v2, trend_health=None, strategy_quality=None):
+        cfg = dict(cfg or {})
+        if not bool(cfg.get('dynamic_take_profit_enabled', True)):
+            base_r = float(cfg.get('second_take_profit_r_multiple', cfg.get('take_profit_r_multiple', 2.0)) or 2.0)
+            return {
+                'enabled': False,
+                'second_take_profit_r_multiple': base_r,
+                'summary': f'dynamic TP2 OFF: {base_r:.2f}R',
+                'tier': 'off',
+            }
+        quality_score_v2 = dict(quality_score_v2 or {})
+        trend_health = dict(trend_health or {})
+        strategy_quality = dict(strategy_quality or {})
+        score = float(quality_score_v2.get('score', 0.0) or 0.0)
+        trend_score = float(trend_health.get('score', 0.0) or 0.0)
+        strategy_score = float(strategy_quality.get('score', 0.0) or 0.0)
+        base_r = float(cfg.get('dynamic_tp2_base_r_multiple', 2.0) or 2.0)
+        strong_r = float(cfg.get('dynamic_tp2_strong_r_multiple', 2.5) or 2.5)
+        elite_r = float(cfg.get('dynamic_tp2_elite_r_multiple', 3.0) or 3.0)
+        strong_score = float(cfg.get('dynamic_tp2_strong_score', 72.0) or 72.0)
+        elite_score = float(cfg.get('dynamic_tp2_elite_score', 82.0) or 82.0)
+        if score >= elite_score and trend_score >= 75.0 and strategy_score >= 75.0:
+            tier = 'elite'
+            second_r = elite_r
+        elif score >= strong_score and trend_score >= 65.0 and strategy_score >= 65.0:
+            tier = 'strong'
+            second_r = strong_r
+        else:
+            tier = 'base'
+            second_r = base_r
+        second_r = max(base_r, min(elite_r, second_r))
+        return {
+            'enabled': True,
+            'tier': tier,
+            'second_take_profit_r_multiple': round(second_r, 4),
+            'summary': (
+                f"dynamic TP2 {tier}: {second_r:.2f}R "
+                f"(Q {score:.1f}, trend {trend_score:.1f}, strat {strategy_score:.1f})"
+            ),
+        }
+
     def _calculate_utbreakout_directional_efficiency(self, closed, lookback=12):
         try:
             if closed is None or len(closed) < 3:
@@ -7201,6 +7458,12 @@ class SignalEngine(BaseEngine):
                 'strategy_quality_score': _safe_float_or_none(status.get('strategy_quality_score')),
                 'strategy_quality_state': status.get('strategy_quality_state'),
                 'strategy_quality_summary': status.get('strategy_quality_summary'),
+                'quality_score_v2_score': _safe_float_or_none(status.get('quality_score_v2_score')),
+                'quality_score_v2_state': status.get('quality_score_v2_state'),
+                'quality_score_v2_summary': status.get('quality_score_v2_summary'),
+                'quality_score_v2_risk_multiplier': _safe_float_or_none(status.get('quality_score_v2_risk_multiplier')),
+                'dynamic_take_profit_summary': status.get('dynamic_take_profit_summary'),
+                'dynamic_tp2_r_multiple': _safe_float_or_none(status.get('dynamic_tp2_r_multiple')),
                 'adaptive_exit_summary': status.get('adaptive_exit_summary'),
                 'shadow_sample_count': status.get('shadow_sample_count'),
                 'shadow_win_rate': _safe_float_or_none(status.get('shadow_win_rate')),
@@ -7253,6 +7516,13 @@ class SignalEngine(BaseEngine):
                     'strategy_quality_risk_multiplier': _safe_float_or_none(plan.get('strategy_quality_risk_multiplier')),
                     'strategy_quality_score': _safe_float_or_none(plan.get('strategy_quality_score')),
                     'strategy_quality_summary': plan.get('strategy_quality_summary'),
+                    'quality_score_v2_score': _safe_float_or_none(plan.get('quality_score_v2_score')),
+                    'quality_score_v2_state': plan.get('quality_score_v2_state'),
+                    'quality_score_v2_summary': plan.get('quality_score_v2_summary'),
+                    'quality_score_v2_risk_multiplier': _safe_float_or_none(plan.get('quality_score_v2_risk_multiplier')),
+                    'dynamic_take_profit_summary': plan.get('dynamic_take_profit_summary'),
+                    'dynamic_tp2_r_multiple': _safe_float_or_none(plan.get('dynamic_tp2_r_multiple')),
+                    'tp1_breakeven_enabled': plan.get('tp1_breakeven_enabled'),
                     'adaptive_exit_summary': plan.get('adaptive_exit_summary'),
                     'shadow_sample_count': plan.get('shadow_sample_count'),
                     'shadow_win_rate': _safe_float_or_none(plan.get('shadow_win_rate')),
@@ -7802,6 +8072,48 @@ class SignalEngine(BaseEngine):
         status['strategy_quality_state'] = strategy_quality.get('state')
         status['strategy_quality_summary'] = strategy_quality.get('summary')
         status['strategy_quality_risk_multiplier'] = strategy_adaptation.get('strategy_quality_risk_multiplier')
+        quality_score_v2 = self._build_utbreakout_quality_score_v2(
+            side,
+            cfg,
+            status,
+            filter_values,
+            trend_health=trend_health,
+            strategy_quality=strategy_quality,
+            market_quality=market_quality,
+            selector_quality=selector_quality,
+        )
+        quality_score_v2_multiplier = min(1.0, max(0.0, float(quality_score_v2.get('risk_multiplier', 1.0) or 0.0)))
+        status['quality_score_v2'] = quality_score_v2
+        status['quality_score_v2_score'] = quality_score_v2.get('score')
+        status['quality_score_v2_state'] = quality_score_v2.get('state')
+        status['quality_score_v2_summary'] = quality_score_v2.get('summary')
+        status['quality_score_v2_risk_multiplier'] = quality_score_v2_multiplier
+        dynamic_tp2 = self._build_utbreakout_dynamic_tp2(
+            side,
+            cfg,
+            quality_score_v2,
+            trend_health=trend_health,
+            strategy_quality=strategy_quality,
+        )
+        if dynamic_tp2.get('enabled') and bool(cfg.get('fixed_take_profit_enabled', True)):
+            cfg = dict(cfg)
+            cfg['second_take_profit_r_multiple'] = dynamic_tp2.get('second_take_profit_r_multiple', cfg.get('second_take_profit_r_multiple', 2.0))
+            cfg['take_profit_r_multiple'] = max(
+                float(cfg.get('take_profit_r_multiple', 2.0) or 2.0),
+                float(cfg.get('second_take_profit_r_multiple', 2.0) or 2.0),
+            )
+        status['dynamic_take_profit'] = dynamic_tp2
+        status['dynamic_take_profit_summary'] = dynamic_tp2.get('summary')
+        status['dynamic_tp2_r_multiple'] = dynamic_tp2.get('second_take_profit_r_multiple')
+        if fixed_take_profit:
+            status['adaptive_exit_summary'] = (
+                f"fixed TP ladder {float(cfg.get('partial_take_profit_ratio', 0.5) or 0.5):.0%}@"
+                f"{float(cfg.get('partial_take_profit_r_multiple', 1.5) or 1.5):.1f}R + "
+                f"{float(cfg.get('second_take_profit_ratio', 0.5) or 0.5):.0%}@"
+                f"{float(cfg.get('second_take_profit_r_multiple', 2.0) or 2.0):.1f}R; "
+                f"runner OFF; {dynamic_tp2.get('summary')}; "
+                f"TP1 BE {'ON' if cfg.get('tp1_breakeven_enabled', True) else 'OFF'}"
+            )
         shadow_stats = strategy_adaptation.get('shadow_stats') if isinstance(strategy_adaptation.get('shadow_stats'), dict) else {}
         runner_stats = strategy_adaptation.get('runner_stats') if isinstance(strategy_adaptation.get('runner_stats'), dict) else {}
         status['shadow_sample_count'] = shadow_stats.get('sample_count')
@@ -7831,6 +8143,14 @@ class SignalEngine(BaseEngine):
                 record_failure=True,
                 side=side
             )
+        if quality_score_v2.get('state') is False:
+            return _finish(
+                None,
+                f"REJECTED_QUALITY_SCORE_V2: {quality_score_v2.get('summary')}",
+                'REJECTED_QUALITY_SCORE_V2',
+                record_failure=True,
+                side=side
+            )
 
         if not self._is_valid_number(atr_value) or float(atr_value) <= 0:
             return _finish(None, "REJECTED_ATR_TOO_LOW: ATR risk distance calculation pending", 'REJECTED_ATR_TOO_LOW', record_failure=True, side=side)
@@ -7855,6 +8175,9 @@ class SignalEngine(BaseEngine):
         if strategy_risk_multiplier < 0.999:
             risk_per_trade_percent *= strategy_risk_multiplier
             max_risk_per_trade_usdt *= strategy_risk_multiplier
+        if quality_score_v2_multiplier < 0.999:
+            risk_per_trade_percent *= quality_score_v2_multiplier
+            max_risk_per_trade_usdt *= quality_score_v2_multiplier
         if selector_quality_multiplier < 0.999:
             risk_per_trade_percent *= selector_quality_multiplier
             max_risk_per_trade_usdt *= selector_quality_multiplier
@@ -7918,6 +8241,18 @@ class SignalEngine(BaseEngine):
             'strategy_quality_risk_multiplier': strategy_adaptation.get('strategy_quality_risk_multiplier'),
             'strategy_quality_score': strategy_quality.get('score'),
             'strategy_quality_summary': strategy_quality.get('summary'),
+            'quality_score_v2_score': quality_score_v2.get('score'),
+            'quality_score_v2_state': quality_score_v2.get('state'),
+            'quality_score_v2_summary': quality_score_v2.get('summary'),
+            'quality_score_v2_risk_multiplier': quality_score_v2_multiplier,
+            'dynamic_take_profit_enabled': bool(cfg.get('dynamic_take_profit_enabled', True)),
+            'dynamic_take_profit_summary': dynamic_tp2.get('summary'),
+            'dynamic_tp2_r_multiple': dynamic_tp2.get('second_take_profit_r_multiple'),
+            'tp1_breakeven_enabled': bool(cfg.get('tp1_breakeven_enabled', True)),
+            'tp1_breakeven_trigger_r': float(cfg.get('tp1_breakeven_trigger_r', cfg.get('partial_take_profit_r_multiple', 1.5)) or 1.5),
+            'tp1_breakeven_offset_r': float(cfg.get('tp1_breakeven_offset_r', 0.03) or 0.03),
+            'tp1_breakeven_wait_for_partial': bool(cfg.get('tp1_breakeven_wait_for_partial', True)),
+            'tp1_breakeven_qty_tolerance': float(cfg.get('tp1_breakeven_qty_tolerance', 0.08) or 0.08),
             'adaptive_exit_summary': status.get('adaptive_exit_summary'),
             'shadow_sample_count': shadow_stats.get('sample_count'),
             'shadow_win_rate': shadow_stats.get('tp_rate'),
@@ -7943,6 +8278,7 @@ class SignalEngine(BaseEngine):
                 bias_continuation_multiplier
                 * market_quality_multiplier
                 * strategy_risk_multiplier
+                * quality_score_v2_multiplier
                 * selector_quality_multiplier
             ),
         )
@@ -8415,7 +8751,8 @@ class SignalEngine(BaseEngine):
             items.extend((item.get('name'), item.get('state'), item.get('detail')) for item in selected_items)
             if side == 'short':
                 items.append(self._build_utbreakout_short_guard_status_item(cfg, filter_values))
-            items.append(self._build_utbreakout_market_quality_status_item(side, cfg, filter_values))
+            market_quality = self._evaluate_utbreakout_market_quality(side, cfg, filter_values)
+            items.append(("시장 품질 게이트", market_quality.get('state'), market_quality.get('summary')))
             selector_quality = self._build_utbreakout_selector_quality(symbol)
             selector_multiplier = float(selector_quality.get('risk_multiplier', 1.0) or 1.0)
             selector_state = True if selector_multiplier >= 0.999 else 'reduced'
@@ -8425,6 +8762,22 @@ class SignalEngine(BaseEngine):
             adaptation_quality = adaptation.get('strategy_quality') if isinstance(adaptation.get('strategy_quality'), dict) else {}
             items.append(("전략 품질 V2", adaptation_quality.get('state', True), adaptation_quality.get('summary')))
             items.append(("전략 적응", adaptation_health.get('state', True), adaptation.get('summary')))
+            q_status = {
+                'candidate_type': candidate_type if candidate_side == side else 'waiting',
+                'adaptive_timeframe_decision': adaptive_decision,
+                'entry_timeframe': entry_tf,
+            }
+            quality_score_v2 = self._build_utbreakout_quality_score_v2(
+                side,
+                cfg,
+                q_status,
+                filter_values,
+                trend_health=adaptation_health,
+                strategy_quality=adaptation_quality,
+                market_quality=market_quality,
+                selector_quality=selector_quality,
+            )
+            items.append(("통합 품질 점수", quality_score_v2.get('state'), quality_score_v2.get('summary')))
             items.extend([
                 ("일일 리스크", daily_ok, daily_detail),
                 ("ATR 손절/RR/수량", risk_ok, balance_detail),
@@ -8815,6 +9168,37 @@ class SignalEngine(BaseEngine):
             bias_continuation_summary = bias_continuation.get('summary') or "n/a"
             if not bias_continuation_ok:
                 blockers.append(f"Bias continuation 미통과: {bias_continuation_summary}")
+        market_quality_analysis = self._evaluate_utbreakout_market_quality('long', cfg, filter_values)
+        selector_quality_analysis = self._build_utbreakout_selector_quality(symbol)
+        adaptation_analysis = self._build_utbreakout_strategy_adaptation(
+            symbol,
+            'long',
+            cfg,
+            selected_set,
+            filter_values,
+        )
+        trend_health_analysis = adaptation_analysis.get('trend_health') if isinstance(adaptation_analysis.get('trend_health'), dict) else {}
+        strategy_quality_analysis = adaptation_analysis.get('strategy_quality') if isinstance(adaptation_analysis.get('strategy_quality'), dict) else {}
+        quality_score_v2_analysis = self._build_utbreakout_quality_score_v2(
+            'long',
+            cfg,
+            {
+                'candidate_type': candidate_type if candidate_side == 'long' else 'waiting',
+                'entry_timeframe': entry_tf,
+                'adaptive_timeframe_decision': {
+                    'selected_score': adaptive_state.get('selected_score'),
+                    'selected_tf': adaptive_state.get('selected_tf'),
+                    'decision': adaptive_state.get('last_decision'),
+                },
+            },
+            filter_values,
+            trend_health=trend_health_analysis,
+            strategy_quality=strategy_quality_analysis,
+            market_quality=market_quality_analysis,
+            selector_quality=selector_quality_analysis,
+        )
+        if quality_score_v2_analysis.get('state') is False:
+            blockers.append(f"통합 품질 점수 미통과: {quality_score_v2_analysis.get('summary')}")
         failed_filters = [item for item in long_filter_items if item.get('state') is not True]
         if selected_set.get('status') != 'active':
             blockers.append(f"Set{selected_set.get('id')}은 실거래 연결 상태가 아님")
@@ -8983,6 +9367,7 @@ class SignalEngine(BaseEngine):
             candidate_side == 'long'
             and selected_set.get('status') == 'active'
             and bias_continuation_ok
+            and quality_score_v2_analysis.get('state') is not False
             and not failed_filters
             and daily_ok
             and risk_plan is not None
@@ -9050,8 +9435,9 @@ class SignalEngine(BaseEngine):
             f"- UT 후보: {str(candidate_side or 'none').upper()} ({candidate_type}) / fresh {str(ut_sig or 'none').upper()} / bias {str(ut_bias_side or 'none').upper()}",
             f"- 선택 Set: Set{selected_set.get('id')} {selected_set.get('name')} ({selected_set.get('status')})",
             f"- AUTO 이유: {auto_reason or '수동 선택'}",
-            f"- LONG 핵심: UT {_ok_text(candidate_side == 'long')} / BiasCont {_ok_text(bias_continuation_ok)} / Set필터 {_ok_text(not failed_filters)} / 일일리스크 {_ok_text(daily_ok)} / 리스크계획 {_ok_text(risk_plan is not None)}",
+            f"- LONG 핵심: UT {_ok_text(candidate_side == 'long')} / BiasCont {_ok_text(bias_continuation_ok)} / QScore {_ok_text(quality_score_v2_analysis.get('state'))} / Set필터 {_ok_text(not failed_filters)} / 일일리스크 {_ok_text(daily_ok)} / 리스크계획 {_ok_text(risk_plan is not None)}",
             f"- Bias continuation: {bias_continuation_summary}",
+            f"- 통합 품질 점수: {quality_score_v2_analysis.get('summary')}",
             f"- 일일리스크 상세: {daily_detail}",
             "",
             "3) LONG 필터 상세",
@@ -16283,6 +16669,12 @@ class SignalEngine(BaseEngine):
                             'atr_trailing_multiplier',
                             'atr_trailing_activation_r',
                             'atr_trailing_breakeven_enabled',
+                            'dynamic_take_profit_enabled',
+                            'tp1_breakeven_enabled',
+                            'tp1_breakeven_trigger_r',
+                            'tp1_breakeven_offset_r',
+                            'tp1_breakeven_wait_for_partial',
+                            'tp1_breakeven_qty_tolerance',
                         ):
                             if key in plan:
                                 effective_fb_cfg[key] = plan[key]
@@ -16334,7 +16726,10 @@ class SignalEngine(BaseEngine):
                             sl_distance=risk_distance,
                             tp_targets=tp_targets
                         )
-                        if bool(effective_fb_cfg.get('atr_trailing_enabled', False)):
+                        if (
+                            bool(effective_fb_cfg.get('atr_trailing_enabled', False))
+                            or bool(effective_fb_cfg.get('tp1_breakeven_enabled', True))
+                        ):
                             self._register_utbreakout_trailing_state(
                                 symbol,
                                 side,
@@ -16350,7 +16745,8 @@ class SignalEngine(BaseEngine):
                             f"entry={actual_entry_price:.4f}, risk={risk_distance:.4f}, "
                             f"tp1={partial_ratio:.2f}@{partial_r:.2f}R, "
                             f"tp2={second_ratio:.2f}@{second_r:.2f}R, "
-                            f"runner={'ON' if effective_fb_cfg.get('atr_trailing_enabled', False) else 'OFF'}"
+                            f"runner={'ON' if effective_fb_cfg.get('atr_trailing_enabled', False) else 'OFF'}, "
+                            f"tp1_be={'ON' if effective_fb_cfg.get('tp1_breakeven_enabled', True) else 'OFF'}"
                         )
                     else:
                         await self.ctrl.notify("⚠️ UTBOT_FILTERED_BREAKOUT_V1 보호 주문 거리 계산 오류")
@@ -17122,7 +17518,7 @@ class SignalEngine(BaseEngine):
         except (TypeError, ValueError):
             pos_entry_price = 0.0
         runner_state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
-        runner_sl_active = (
+        managed_sl_active = (
             isinstance(runner_state, dict)
             and bool(runner_state.get('active'))
             and str(runner_state.get('side', '')).lower() == pos_side
@@ -17141,7 +17537,7 @@ class SignalEngine(BaseEngine):
             order_price = _safe_float_or_none(order.get('price')) or trigger_price
             if pos_entry_price > 0 and order_price:
                 if kind == 'sl':
-                    invalid_sl = False if runner_sl_active else (
+                    invalid_sl = False if managed_sl_active else (
                         (pos_side == 'long' and float(order_price) >= pos_entry_price)
                         or (pos_side == 'short' and float(order_price) <= pos_entry_price)
                     )
@@ -17393,7 +17789,9 @@ class SignalEngine(BaseEngine):
         if not pos:
             self._clear_utbreakout_trailing_state(symbol, finalize=True, reason='position closed before runner update')
             return None
-        if not bool(cfg.get('atr_trailing_enabled', state.get('atr_trailing_enabled', True))):
+        atr_trailing_enabled = bool(cfg.get('atr_trailing_enabled', state.get('atr_trailing_enabled', False)))
+        tp1_breakeven_enabled = bool(cfg.get('tp1_breakeven_enabled', state.get('tp1_breakeven_enabled', False)))
+        if not atr_trailing_enabled and not tp1_breakeven_enabled:
             return None
         side = str(pos.get('side', '') or '').lower()
         if side != str(state.get('side', '')).lower():
@@ -17446,7 +17844,78 @@ class SignalEngine(BaseEngine):
             else entry_price - current_close
         )
         remaining_ratio = float(state.get('remaining_ratio', 0.5) or 0.5)
-        partial_qty_seen = current_qty <= initial_qty * min(0.98, max(0.05, remaining_ratio + 0.05))
+        qty_tolerance = min(
+            0.5,
+            max(0.0, float(cfg.get('tp1_breakeven_qty_tolerance', state.get('tp1_breakeven_qty_tolerance', 0.08)) or 0.08))
+        )
+        partial_qty_seen = current_qty <= initial_qty * min(0.98, max(0.05, remaining_ratio + qty_tolerance))
+        tp1_trigger_r = max(
+            0.1,
+            float(cfg.get('tp1_breakeven_trigger_r', state.get('tp1_breakeven_trigger_r', activation_r)) or activation_r)
+        )
+        price_reached_tp1 = favorable_move >= tp1_trigger_r * risk_distance
+        wait_for_partial = bool(cfg.get('tp1_breakeven_wait_for_partial', state.get('tp1_breakeven_wait_for_partial', True)))
+        if (
+            tp1_breakeven_enabled
+            and not bool(state.get('breakeven_armed'))
+            and (partial_qty_seen if wait_for_partial else (partial_qty_seen or price_reached_tp1))
+        ):
+            offset_r = max(0.0, float(cfg.get('tp1_breakeven_offset_r', state.get('tp1_breakeven_offset_r', 0.03)) or 0.03))
+            breakeven_stop = (
+                entry_price + risk_distance * offset_r
+                if side == 'long' else
+                entry_price - risk_distance * offset_r
+            )
+            last_stop = float(state.get('last_stop_price') or 0.0)
+            improved = (
+                breakeven_stop > last_stop
+                if side == 'long' else
+                last_stop <= 0 or breakeven_stop < last_stop
+            )
+            valid_stop = breakeven_stop < current_close if side == 'long' else breakeven_stop > current_close
+            if improved and valid_stop:
+                replacement_order = await self._replace_stop_loss_order(
+                    symbol,
+                    pos,
+                    breakeven_stop,
+                    reason='UTBreak TP1 breakeven protection'
+                )
+                if replacement_order:
+                    state.update({
+                        'active': True,
+                        'breakeven_armed': True,
+                        'last_stop_price': float(breakeven_stop),
+                        'last_atr': float(atr_value),
+                        'last_close': float(current_close),
+                        'highest_price': float(highest_price),
+                        'lowest_price': float(lowest_price),
+                        'mfe_r': float(mfe_r),
+                        'mae_r': float(mae_r),
+                        'runner_mode': 'tp1_breakeven',
+                        'runner_multiplier': None,
+                        'runner_updates': int(state.get('runner_updates') or 0) + 1,
+                        'last_update_ts': datetime.now(timezone.utc).isoformat(),
+                    })
+                    self.utbreakout_trailing_states[symbol] = state
+                    protection_orders = await self._collect_protection_orders(symbol)
+                    expected_tp = any(
+                        self._classify_protection_order(order) == 'tp'
+                        for order in (protection_orders or [])
+                    )
+                    await self._audit_protection_orders(
+                        symbol,
+                        pos=pos,
+                        expected_tp=expected_tp,
+                        expected_sl=True,
+                        alert=True
+                    )
+                    await self.ctrl.notify(
+                        f"🛡️ UTBreak TP1 보호: {self.ctrl.format_symbol_for_display(symbol)} "
+                        f"{side.upper()} SL `{float(breakeven_stop):.4f}` (BE+{offset_r:.2f}R)"
+                    )
+                    return state
+        if not atr_trailing_enabled:
+            return None
         active = bool(state.get('active')) or favorable_move >= activation_r * risk_distance or partial_qty_seen
         if not active:
             return None
@@ -22219,6 +22688,10 @@ class MainController:
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'shadow_runner_exit_enabled'], False)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'runner_exit_enabled'], False)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'runner_chandelier_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'quality_score_v2_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'dynamic_take_profit_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'tp1_breakeven_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'tp1_breakeven_wait_for_partial'], True)
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol'], '')
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
@@ -22626,6 +23099,16 @@ UTBot:
                 if cfg.get('fixed_take_profit_enabled', True) else
                 f"부분익절 {partial_text}"
             )
+            if cfg.get('dynamic_take_profit_enabled', True):
+                take_profit_text += (
+                    f" / Dynamic TP2 ON "
+                    f"({float(cfg.get('dynamic_tp2_base_r_multiple', 2.0) or 2.0):.1f}~"
+                    f"{float(cfg.get('dynamic_tp2_elite_r_multiple', 3.0) or 3.0):.1f}R)"
+                )
+            if cfg.get('tp1_breakeven_enabled', True):
+                take_profit_text += (
+                    f" / TP1 BE+{float(cfg.get('tp1_breakeven_offset_r', 0.03) or 0.03):.2f}R"
+                )
             trailing_text = (
                 f"{float(cfg.get('atr_trailing_multiplier', 2.0) or 2.0):.1f}ATR + Chandelier / "
                 f"{float(cfg.get('atr_trailing_activation_r', 1.5) or 1.5):.1f}R부터"
@@ -22643,6 +23126,7 @@ UTBot:
                 f"Runner {'ON' if cfg.get('runner_exit_enabled', True) else 'OFF'} / "
                 f"TrendHealth {'ON' if cfg.get('trend_health_enabled', True) else 'OFF'} / "
                 f"QualityV2 {'ON' if cfg.get('strategy_quality_enabled', True) else 'OFF'} / "
+                f"QScore {'ON' if cfg.get('quality_score_v2_enabled', True) else 'OFF'} / "
                 f"Exit {'ON' if cfg.get('adaptive_exit_enabled', True) else 'OFF'} / "
                 f"VolTarget {'ON' if cfg.get('volatility_targeting_enabled', True) else 'OFF'} / "
                 f"MetaSizing {'ON' if cfg.get('meta_labeling_enabled', True) else 'OFF'} / "

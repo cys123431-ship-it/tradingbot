@@ -808,6 +808,16 @@ def test_utbreakout_defaults_enable_fixed_tp_ladder_and_disable_runner():
     assert cfg["bias_continuation_15m_max_signal_age_candles"] == 3
     assert cfg["bias_continuation_15m_min_adx"] == 25.0
     assert cfg["bias_continuation_15m_max_extension_atr"] == 1.0
+    assert cfg["quality_score_v2_enabled"] is True
+    assert cfg["quality_score_v2_block_below"] == 60.0
+    assert cfg["quality_score_v2_reduce_below"] == 70.0
+    assert cfg["quality_score_v2_min_risk_multiplier"] == 0.5
+    assert cfg["dynamic_take_profit_enabled"] is True
+    assert cfg["dynamic_tp2_base_r_multiple"] == 2.0
+    assert cfg["dynamic_tp2_strong_r_multiple"] == 2.5
+    assert cfg["dynamic_tp2_elite_r_multiple"] == 3.0
+    assert cfg["tp1_breakeven_enabled"] is True
+    assert cfg["tp1_breakeven_wait_for_partial"] is True
     assert cfg["market_quality_enabled"] is True
     assert cfg["market_quality_data_required"] is False
     assert cfg["market_quality_min_risk_multiplier"] == 0.25
@@ -994,6 +1004,77 @@ def test_utbreakout_bias_continuation_rejects_overextended_state():
 
     assert result["state"] is False
     assert "extension" in result["summary"]
+
+
+def test_utbreakout_quality_score_v2_blocks_weak_confluence_and_reduces_mixed():
+    emas = _emas_module()
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    cfg = emas.build_default_utbot_filtered_breakout_config()
+    cfg["entry_timeframe"] = "15m"
+
+    blocked = engine._build_utbreakout_quality_score_v2(
+        "long",
+        cfg,
+        {"candidate_type": "fresh_signal", "entry_timeframe": "15m"},
+        {},
+        trend_health={"score": 35, "risk_multiplier": 0.35},
+        strategy_quality={"score": 42, "risk_multiplier": 0.35},
+        market_quality={"state": True, "risk_multiplier": 1.0},
+        selector_quality={"score": 70},
+    )
+    assert blocked["state"] is False
+    assert blocked["risk_multiplier"] == 0
+
+    reduced = engine._build_utbreakout_quality_score_v2(
+        "long",
+        cfg,
+        {"candidate_type": "fresh_signal", "entry_timeframe": "15m", "adaptive_timeframe_decision": {"selected_score": 70}},
+        {},
+        trend_health={"score": 64, "risk_multiplier": 0.7},
+        strategy_quality={"score": 66, "risk_multiplier": 0.7},
+        market_quality={"state": True, "risk_multiplier": 1.0},
+        selector_quality={"score": 76},
+    )
+    assert reduced["state"] == "reduced"
+    assert 0 < reduced["risk_multiplier"] < 1
+
+
+def test_utbreakout_dynamic_tp2_expands_only_on_strong_confluence():
+    emas = _emas_module()
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    cfg = emas.build_default_utbot_filtered_breakout_config()
+
+    base = engine._build_utbreakout_dynamic_tp2(
+        "long",
+        cfg,
+        {"score": 69},
+        trend_health={"score": 80},
+        strategy_quality={"score": 80},
+    )
+    assert base["second_take_profit_r_multiple"] == 2.0
+    assert base["tier"] == "base"
+
+    strong = engine._build_utbreakout_dynamic_tp2(
+        "long",
+        cfg,
+        {"score": 76},
+        trend_health={"score": 72},
+        strategy_quality={"score": 71},
+    )
+    assert strong["second_take_profit_r_multiple"] == 2.5
+    assert strong["tier"] == "strong"
+
+    elite = engine._build_utbreakout_dynamic_tp2(
+        "long",
+        cfg,
+        {"score": 86},
+        trend_health={"score": 80},
+        strategy_quality={"score": 79},
+    )
+    assert elite["second_take_profit_r_multiple"] == 3.0
+    assert elite["tier"] == "elite"
 
 
 def test_utbreakout_market_quality_reduces_risk_without_blocking_on_mild_funding():
@@ -1314,6 +1395,84 @@ def test_utbreakout_trailing_replaces_sl_and_keeps_partial_tp_order():
     assert "sl-old" not in remaining_ids
     assert any(order["type"] == "stop_market" for order in engine.exchange.created)
     assert engine.last_protection_order_status["BTC/USDT"]["tp_expected"] is True
+    assert engine.last_protection_order_status["BTC/USDT"]["sl_count"] == 1
+
+
+def test_utbreakout_tp1_breakeven_replaces_sl_even_when_runner_is_off():
+    pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "1", "entryPrice": "100"}
+    engine = _protection_engine(
+        [
+            {
+                "id": "tp2-existing",
+                "side": "sell",
+                "type": "limit",
+                "price": "125",
+                "reduceOnly": True,
+                "info": {"symbol": "BTCUSDT"},
+            },
+            {
+                "id": "sl-old",
+                "side": "sell",
+                "type": "market",
+                "clientOrderId": "utbslBTCUSDTold",
+                "info": {"origType": "STOP_MARKET", "stopPrice": "90", "reduceOnly": "true", "symbol": "BTCUSDT"},
+            },
+        ],
+        positions=[pos],
+    )
+    engine.utbreakout_trailing_states = {
+        "BTC/USDT": {
+            "side": "long",
+            "entry_price": 100.0,
+            "initial_qty": 2.0,
+            "remaining_ratio": 0.5,
+            "risk_distance": 10.0,
+            "activation_r": 1.5,
+            "atr_trailing_enabled": False,
+            "tp1_breakeven_enabled": True,
+            "tp1_breakeven_trigger_r": 1.5,
+            "tp1_breakeven_offset_r": 0.03,
+            "tp1_breakeven_wait_for_partial": True,
+            "tp1_breakeven_qty_tolerance": 0.08,
+            "last_stop_price": 90.0,
+            "active": False,
+            "breakeven_armed": False,
+        }
+    }
+    rows = []
+    for idx in range(25):
+        close = 100 + idx * 0.9
+        rows.append({
+            "open": close - 0.4,
+            "high": close + 0.8,
+            "low": close - 0.8,
+            "close": close,
+        })
+    df = pd.DataFrame(rows)
+
+    state = asyncio.run(
+        engine._manage_utbreakout_partial_trailing(
+            "BTC/USDT",
+            pos,
+            df,
+            {
+                "atr_length": 14,
+                "atr_trailing_enabled": False,
+                "tp1_breakeven_enabled": True,
+                "tp1_breakeven_offset_r": 0.03,
+                "tp1_breakeven_wait_for_partial": True,
+            },
+        )
+    )
+
+    assert state["active"] is True
+    assert state["breakeven_armed"] is True
+    assert state["runner_mode"] == "tp1_breakeven"
+    assert ("sl-old", "BTC/USDT") in engine.exchange.cancelled
+    stop_order = next(order for order in engine.exchange.created if order["type"] == "stop_market")
+    assert float(stop_order["params"]["stopPrice"]) == 100.3
+    remaining_ids = {order["id"] for order in engine.exchange.orders}
+    assert "tp2-existing" in remaining_ids
     assert engine.last_protection_order_status["BTC/USDT"]["sl_count"] == 1
 
 
