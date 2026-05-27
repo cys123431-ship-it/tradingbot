@@ -1420,7 +1420,7 @@ class TradingConfig:
         if coin_selector_cfg.get('custom_symbols') != normalized_custom_symbols:
             coin_selector_cfg['custom_symbols'] = normalized_custom_symbols
             changed = True
-        for bool_key in ('enabled', 'auto_apply_watchlist', 'custom_universe_enabled', 'custom_relax_discovery', 'selection_quality_enabled'):
+        for bool_key in ('enabled', 'auto_apply_watchlist', 'custom_universe_enabled', 'custom_relax_discovery', 'candidate_cooldown_enabled', 'selection_quality_enabled'):
             value = coin_selector_cfg.get(bool_key, coin_selector_defaults.get(bool_key, False))
             if isinstance(value, bool):
                 normalized_bool = value
@@ -1449,6 +1449,8 @@ class TradingConfig:
             'top_n': 10,
             'min_final_score': 55.0,
             'refresh_interval_seconds': 300,
+            'candidate_cooldown_misses': 3,
+            'candidate_cooldown_seconds': 1800,
             'selection_return_lookback_bars': 96,
             'selection_target_realized_vol_pct': 0.65,
             'selection_max_drawdown_pct': 18.0,
@@ -1462,7 +1464,7 @@ class TradingConfig:
                 value = float(default)
             if value <= 0:
                 value = float(default)
-            if key in {'analysis_limit', 'top_n', 'min_trade_count', 'ideal_trade_count'}:
+            if key in {'analysis_limit', 'top_n', 'min_trade_count', 'ideal_trade_count', 'candidate_cooldown_misses'}:
                 value = int(value)
             if coin_selector_cfg.get(key) != value:
                 coin_selector_cfg[key] = value
@@ -2967,6 +2969,7 @@ class SignalEngine(BaseEngine):
         self.coin_selector_last_result = {}  # runtime CoinSelector V2 report
         self.coin_selector_symbol_scores = {}  # normalized symbol -> latest selector score
         self.coin_selector_last_run_ts = 0.0
+        self.coin_selector_candidate_cooldowns = {}  # normalized symbol -> no-entry miss / cooldown state
         self.micro_auto_last_plan = {}  # symbol -> latest accepted Micro Auto plan
         self.micro_auto_last_rejects = {}  # symbol -> latest Micro Auto reject payload
         self.micro_auto_last_scan = {}  # latest Micro Auto feasibility scan report
@@ -3027,6 +3030,7 @@ class SignalEngine(BaseEngine):
         self.coin_selector_last_result = {}
         self.coin_selector_symbol_scores = {}
         self.coin_selector_last_run_ts = 0.0
+        self.coin_selector_candidate_cooldowns = {}
         self.micro_auto_last_plan = {}
         self.micro_auto_last_rejects = {}
         self.micro_auto_last_scan = {}
@@ -3062,6 +3066,136 @@ class SignalEngine(BaseEngine):
     def _ensure_runtime_state_containers(self, attr_names):
         for attr_name in attr_names:
             self._ensure_runtime_state_container(attr_name)
+
+    def _coin_selector_candidate_key(self, symbol):
+        return (
+            str(symbol or '')
+            .strip()
+            .upper()
+            .replace(':USDT', '')
+            .replace('/', '')
+            .replace('-', '')
+            .replace('_', '')
+        )
+
+    def _coin_selector_cooldown_config(self, cfg=None):
+        cfg = cfg if isinstance(cfg, dict) else default_coin_selector_config()
+
+        def _bool_value(value, default=True):
+            if isinstance(value, bool):
+                return value
+            text = str(value).strip().lower()
+            if text in {'1', 'true', 'yes', 'on', 'enable', 'enabled'}:
+                return True
+            if text in {'0', 'false', 'no', 'off', 'disable', 'disabled'}:
+                return False
+            return default
+
+        def _positive_int(value, default):
+            try:
+                parsed = int(float(value))
+            except (TypeError, ValueError):
+                parsed = int(default)
+            return max(1, parsed)
+
+        def _positive_float(value, default):
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                parsed = float(default)
+            return max(1.0, parsed)
+
+        defaults = default_coin_selector_config()
+        enabled = _bool_value(
+            cfg.get('candidate_cooldown_enabled', defaults.get('candidate_cooldown_enabled', True)),
+            bool(defaults.get('candidate_cooldown_enabled', True))
+        )
+        miss_limit = _positive_int(
+            cfg.get('candidate_cooldown_misses', defaults.get('candidate_cooldown_misses', 3)),
+            defaults.get('candidate_cooldown_misses', 3)
+        )
+        cooldown_seconds = _positive_float(
+            cfg.get('candidate_cooldown_seconds', defaults.get('candidate_cooldown_seconds', 1800)),
+            defaults.get('candidate_cooldown_seconds', 1800)
+        )
+        return enabled, miss_limit, cooldown_seconds
+
+    def _coin_selector_cooldown_remaining(self, symbol, cfg=None, now=None):
+        enabled, _, _ = self._coin_selector_cooldown_config(cfg)
+        if not enabled:
+            return 0.0, None
+        key = self._coin_selector_candidate_key(symbol)
+        if not key:
+            return 0.0, None
+        states = self._ensure_runtime_state_container('coin_selector_candidate_cooldowns')
+        state = states.get(key)
+        if not isinstance(state, dict):
+            return 0.0, None
+        now = time.time() if now is None else float(now)
+        cooldown_until = float(state.get('cooldown_until', 0.0) or 0.0)
+        if cooldown_until > now:
+            return cooldown_until - now, state
+        if cooldown_until:
+            states.pop(key, None)
+        return 0.0, None
+
+    def _record_coin_selector_candidate_outcome(
+        self,
+        symbol,
+        *,
+        accepted=False,
+        reason='',
+        cfg=None,
+        now=None,
+        decision_key=None
+    ):
+        key = self._coin_selector_candidate_key(symbol)
+        if not key:
+            return None
+        states = self._ensure_runtime_state_container('coin_selector_candidate_cooldowns')
+        if accepted:
+            states.pop(key, None)
+            return None
+
+        enabled, miss_limit, cooldown_seconds = self._coin_selector_cooldown_config(cfg)
+        if not enabled:
+            states.pop(key, None)
+            return None
+
+        now = time.time() if now is None else float(now)
+        previous = states.get(key)
+        state = dict(previous) if isinstance(previous, dict) else {}
+        cooldown_until = float(state.get('cooldown_until', 0.0) or 0.0)
+        if cooldown_until > now:
+            return state
+        if cooldown_until:
+            state = {}
+
+        normalized_decision_key = str(decision_key or '').strip()
+        if normalized_decision_key and state.get('last_decision_key') == normalized_decision_key:
+            return state
+
+        miss_count = int(state.get('miss_count', 0) or 0) + 1
+        state.update({
+            'symbol': symbol,
+            'miss_count': miss_count,
+            'last_reason': str(reason or 'no entry').strip()[:240],
+            'last_ts': now,
+        })
+        if normalized_decision_key:
+            state['last_decision_key'] = normalized_decision_key
+
+        if miss_count >= miss_limit:
+            state['cooldown_until'] = now + cooldown_seconds
+            state['cooldown_seconds'] = cooldown_seconds
+            logger.info(
+                f"CoinSelector candidate cooldown: {symbol} skipped for "
+                f"{cooldown_seconds / 60.0:.1f}m after {miss_count} no-entry checks "
+                f"({state['last_reason']})"
+            )
+
+        states[key] = state
+        return state
 
     def _get_ut_entry_timing_mode(self):
         strategy_params = self.get_runtime_strategy_params()
@@ -12235,7 +12369,7 @@ class SignalEngine(BaseEngine):
             if text in {'0', 'false', 'no', 'off', 'disable', 'disabled'}:
                 return False
             return default
-        for key in ('enabled', 'auto_apply_watchlist', 'custom_universe_enabled', 'custom_relax_discovery', 'selection_quality_enabled'):
+        for key in ('enabled', 'auto_apply_watchlist', 'custom_universe_enabled', 'custom_relax_discovery', 'candidate_cooldown_enabled', 'selection_quality_enabled'):
             cfg[key] = _bool_value(cfg.get(key), bool(default_coin_selector_config().get(key, False)))
         for key in ('excluded_sectors', 'blacklist'):
             value = cfg.get(key, [])
@@ -12255,6 +12389,7 @@ class SignalEngine(BaseEngine):
             'max_abs_price_change_pct': 18.0,
             'min_final_score': 55.0,
             'refresh_interval_seconds': 300.0,
+            'candidate_cooldown_seconds': 1800.0,
             'selection_target_realized_vol_pct': 0.65,
             'selection_max_drawdown_pct': 18.0,
             'selection_max_rebound_pct': 18.0,
@@ -12269,6 +12404,7 @@ class SignalEngine(BaseEngine):
             'ideal_trade_count': 500_000,
             'analysis_limit': 20,
             'top_n': 10,
+            'candidate_cooldown_misses': 3,
             'selection_return_lookback_bars': 96,
         }.items():
             try:
@@ -13167,6 +13303,7 @@ class SignalEngine(BaseEngine):
 
     async def _scan_and_trade_coin_selector(self):
         cfg = self._get_coin_selector_config()
+        scan_started_at = time.time()
         if self._micro_auto_enabled():
             report = await self.evaluate_micro_auto_candidates(force=False)
             candidates = list(report.get('selected', []))
@@ -13198,6 +13335,20 @@ class SignalEngine(BaseEngine):
 
         for target_coin in candidates:
             symbol = target_coin.get('exchange_symbol') or target_coin.get('normalized_symbol')
+            cooldown_remaining, cooldown_state = self._coin_selector_cooldown_remaining(
+                symbol,
+                cfg,
+                now=scan_started_at
+            )
+            if cooldown_remaining > 0:
+                cooldown_reason = ''
+                if isinstance(cooldown_state, dict):
+                    cooldown_reason = cooldown_state.get('last_reason') or ''
+                logger.info(
+                    f"CoinSelector skip {symbol}: candidate cooldown "
+                    f"{cooldown_remaining / 60.0:.1f}m remaining ({cooldown_reason})"
+                )
+                continue
             logger.info(
                 f"CoinSelector evaluating {symbol}: score={float(target_coin.get('score', 0) or 0):.1f}, "
                 f"Set{target_coin.get('auto_set_id')}, TF={target_coin.get('adaptive_tf')}"
@@ -13220,8 +13371,15 @@ class SignalEngine(BaseEngine):
 
                 ohlcv = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, scan_tf, limit=300)
                 if not ohlcv:
+                    self._record_coin_selector_candidate_outcome(
+                        symbol,
+                        reason=f"{active_strategy}: no OHLCV on {scan_tf}",
+                        cfg=cfg,
+                        decision_key=f"no_ohlcv:{scan_tf}:{int(scan_started_at // 60)}"
+                    )
                     continue
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                decision_key = f"{active_strategy}:{scan_tf}:{int(ohlcv[-1][0])}"
                 strategy_context = self._collect_primary_strategy_context(symbol, df, scan_params, active_strategy)
                 sig, _, _, _, _, _ = await self._calculate_strategy_signal(
                     symbol,
@@ -13233,6 +13391,15 @@ class SignalEngine(BaseEngine):
                 )
 
                 if not sig:
+                    last_reason = ''
+                    if isinstance(getattr(self, 'last_entry_reason', None), dict):
+                        last_reason = self.last_entry_reason.get(symbol) or ''
+                    self._record_coin_selector_candidate_outcome(
+                        symbol,
+                        reason=last_reason or f"{active_strategy}: no entry signal on {scan_tf}",
+                        cfg=cfg,
+                        decision_key=decision_key
+                    )
                     continue
                 if active_strategy == 'utbot':
                     utbot_entry_filter_eval = await self._evaluate_utbot_filter_pack(
@@ -13245,17 +13412,35 @@ class SignalEngine(BaseEngine):
                     allowed, filter_reason = self._utbot_filter_pack_allows_entry(utbot_entry_filter_eval, sig)
                     if not allowed:
                         logger.info(f"CoinSelector skip {symbol}: UTBot filter pack blocked ({filter_reason})")
+                        self._record_coin_selector_candidate_outcome(
+                            symbol,
+                            reason=f"utbot filter blocked: {filter_reason}",
+                            cfg=cfg,
+                            decision_key=decision_key
+                        )
                         continue
                     utbot_rsi_momentum_entry_eval = self._evaluate_utbot_rsi_momentum_filter(df, scan_params, 'entry')
                     allowed, filter_reason = self._utbot_rsi_momentum_filter_allows(utbot_rsi_momentum_entry_eval, sig)
                     if not allowed:
                         logger.info(f"CoinSelector skip {symbol}: RSI Momentum filter blocked ({filter_reason})")
+                        self._record_coin_selector_candidate_outcome(
+                            symbol,
+                            reason=f"rsi momentum filter blocked: {filter_reason}",
+                            cfg=cfg,
+                            decision_key=decision_key
+                        )
                         continue
                 elif active_strategy == 'utsmc':
                     utsmc_detail = strategy_context.get('raw_hybrid_detail', {}) or {}
                     allowed, candidate_reason = self._utsmc_candidate_filter_allows(utsmc_detail, sig, is_persistent=False)
                     if not allowed:
                         logger.info(f"CoinSelector skip {symbol}: UTSMC candidate filter blocked ({candidate_reason})")
+                        self._record_coin_selector_candidate_outcome(
+                            symbol,
+                            reason=f"utsmc candidate filter blocked: {candidate_reason}",
+                            cfg=cfg,
+                            decision_key=decision_key
+                        )
                         continue
 
                 pos = await self.get_server_position(symbol, use_cache=False)
@@ -13263,19 +13448,35 @@ class SignalEngine(BaseEngine):
                     logger.info(f"CoinSelector locking in: {symbol} [{sig.upper()}]")
                     current_price = float(ohlcv[-1][4])
                     await self.entry(symbol, sig, current_price)
-                    if self._micro_auto_enabled():
-                        post_pos = await self.get_server_position(symbol, use_cache=False)
-                        if not post_pos:
-                            logger.info(f"Micro Auto scanner did not open {symbol}; continuing candidates.")
-                            continue
+                    post_pos = await self.get_server_position(symbol, use_cache=False)
+                    if not post_pos:
+                        entry_reason = ''
+                        if isinstance(getattr(self, 'last_entry_reason', None), dict):
+                            entry_reason = self.last_entry_reason.get(symbol) or ''
+                        self._record_coin_selector_candidate_outcome(
+                            symbol,
+                            reason=entry_reason or "entry call did not open position",
+                            cfg=cfg,
+                            decision_key=decision_key
+                        )
+                        logger.info(f"CoinSelector scanner did not open {symbol}; continuing candidates.")
+                        continue
+                    self._record_coin_selector_candidate_outcome(symbol, accepted=True, cfg=cfg)
                     self.scanner_active_symbol = symbol
                     current_ts = int(ohlcv[-1][0])
                     self.last_processed_candle_ts[symbol] = current_ts
                     self.last_candle_time[symbol] = current_ts
                     self.last_candle_success[symbol] = True
                     break
+                self._record_coin_selector_candidate_outcome(symbol, accepted=True, cfg=cfg)
                 logger.info(f"CoinSelector checked {symbol}: position exists ({pos.get('side')})")
             except Exception as exc:
+                self._record_coin_selector_candidate_outcome(
+                    symbol,
+                    reason=f"strategy check error: {type(exc).__name__}",
+                    cfg=cfg,
+                    decision_key=f"strategy_error:{int(time.time() // 60)}"
+                )
                 logger.error(f"CoinSelector strategy check failed for {symbol}: {exc}")
                 continue
 
@@ -13289,6 +13490,7 @@ class SignalEngine(BaseEngine):
                 logger.info("Scanner skipped: Upbit mode uses dedicated KRW UTBOT watchlist only.")
                 return
 
+            scan_started_at = time.time()
             coin_selector_cfg = self._get_coin_selector_config()
             if bool(coin_selector_cfg.get('enabled', True)):
                 await self._scan_and_trade_coin_selector()
@@ -13330,6 +13532,20 @@ class SignalEngine(BaseEngine):
             
             for target_coin in top_5_risers:
                 symbol = target_coin['symbol']
+                cooldown_remaining, cooldown_state = self._coin_selector_cooldown_remaining(
+                    symbol,
+                    coin_selector_cfg,
+                    now=scan_started_at
+                )
+                if cooldown_remaining > 0:
+                    cooldown_reason = ''
+                    if isinstance(cooldown_state, dict):
+                        cooldown_reason = cooldown_state.get('last_reason') or ''
+                    logger.info(
+                        f"Scanner Skip {symbol}: candidate cooldown "
+                        f"{cooldown_remaining / 60.0:.1f}m remaining ({cooldown_reason})"
+                    )
+                    continue
                 logger.info(f"?렞 Scanner Evaluating: {symbol} (Vol: {target_coin['vol']/1_000_000:.1f}M, Rise: {target_coin['pct']:.2f}%)")
 
                 # 4. ?꾨왂 ?ㅽ뻾
@@ -13346,9 +13562,21 @@ class SignalEngine(BaseEngine):
                     rise_pct = float(target_coin.get('pct', 0) or 0)
                     if rise_pct < min_rise_pct:
                         logger.info(f"?? Scanner Skip {symbol}: rise too weak ({rise_pct:.2f}% < {min_rise_pct:.2f}%)")
+                        self._record_coin_selector_candidate_outcome(
+                            symbol,
+                            reason=f"rise too weak: {rise_pct:.2f}% < {min_rise_pct:.2f}%",
+                            cfg=coin_selector_cfg,
+                            decision_key=f"rise_min:{int(scan_started_at // 300)}"
+                        )
                         continue
                     if rise_pct > max_rise_pct:
                         logger.info(f"?? Scanner Skip {symbol}: rise too extended ({rise_pct:.2f}% > {max_rise_pct:.2f}%)")
+                        self._record_coin_selector_candidate_outcome(
+                            symbol,
+                            reason=f"rise too extended: {rise_pct:.2f}% > {max_rise_pct:.2f}%",
+                            cfg=coin_selector_cfg,
+                            decision_key=f"rise_max:{int(scan_started_at // 300)}"
+                        )
                         continue
                     
                     # [MODIFIED] Always use entry_timeframe if scanner is evaluating for a position-like entry
@@ -13361,9 +13589,17 @@ class SignalEngine(BaseEngine):
                     
                     # Use scanner_timeframe if set, but ensure we are thinking about consistency
                     ohlcv = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, scan_tf, limit=300)
-                    if not ohlcv: continue
+                    if not ohlcv:
+                        self._record_coin_selector_candidate_outcome(
+                            symbol,
+                            reason=f"{active_strategy}: no OHLCV on {scan_tf}",
+                            cfg=coin_selector_cfg,
+                            decision_key=f"no_ohlcv:{scan_tf}:{int(scan_started_at // 60)}"
+                        )
+                        continue
                     
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    decision_key = f"{active_strategy}:{scan_tf}:{int(ohlcv[-1][0])}"
                     
                     strategy_context = self._collect_primary_strategy_context(symbol, df, scan_params, active_strategy)
                     sig, _, _, _, _, _ = await self._calculate_strategy_signal(
@@ -13371,6 +13607,18 @@ class SignalEngine(BaseEngine):
                         precomputed=strategy_context.get('precomputed')
                     )
                     
+                    if not sig:
+                        last_reason = ''
+                        if isinstance(getattr(self, 'last_entry_reason', None), dict):
+                            last_reason = self.last_entry_reason.get(symbol) or ''
+                        self._record_coin_selector_candidate_outcome(
+                            symbol,
+                            reason=last_reason or f"{active_strategy}: no entry signal on {scan_tf}",
+                            cfg=coin_selector_cfg,
+                            decision_key=decision_key
+                        )
+                        continue
+
                     if sig:
                         if active_strategy == 'utbot':
                             utbot_entry_filter_eval = await self._evaluate_utbot_filter_pack(
@@ -13385,6 +13633,12 @@ class SignalEngine(BaseEngine):
                                 logger.info(
                                     f"🚫 Scanner Skip {symbol}: UTBot filter pack blocked "
                                     f"({filter_reason})"
+                                )
+                                self._record_coin_selector_candidate_outcome(
+                                    symbol,
+                                    reason=f"utbot filter blocked: {filter_reason}",
+                                    cfg=coin_selector_cfg,
+                                    decision_key=decision_key
                                 )
                                 continue
                             utbot_rsi_momentum_entry_eval = self._evaluate_utbot_rsi_momentum_filter(
@@ -13401,6 +13655,12 @@ class SignalEngine(BaseEngine):
                                     f"🚫 Scanner Skip {symbol}: RSI Momentum Trend filter blocked "
                                     f"({filter_reason})"
                                 )
+                                self._record_coin_selector_candidate_outcome(
+                                    symbol,
+                                    reason=f"rsi momentum filter blocked: {filter_reason}",
+                                    cfg=coin_selector_cfg,
+                                    decision_key=decision_key
+                                )
                                 continue
                         elif active_strategy == 'utsmc':
                             utsmc_detail = strategy_context.get('raw_hybrid_detail', {}) or {}
@@ -13410,6 +13670,12 @@ class SignalEngine(BaseEngine):
                                     f"?? Scanner Skip {symbol}: UTSMC candidate filter blocked "
                                     f"({utsmc_detail.get('candidate_filter_mode_label', 'OFF')} | {candidate_reason})"
                                 )
+                                self._record_coin_selector_candidate_outcome(
+                                    symbol,
+                                    reason=f"utsmc candidate filter blocked: {candidate_reason}",
+                                    cfg=coin_selector_cfg,
+                                    decision_key=decision_key
+                                )
                                 continue
                         # ?ъ????뺤씤 (?쒕쾭)
                         pos = await self.get_server_position(symbol, use_cache=False)
@@ -13418,7 +13684,20 @@ class SignalEngine(BaseEngine):
                             logger.info(f"?? Scanner Locking In: {symbol} [{sig.upper()}] detected!")
                             current_price = float(ohlcv[-1][4])
                             await self.entry(symbol, sig, current_price)
-                            
+                            post_pos = await self.get_server_position(symbol, use_cache=False)
+                            if not post_pos:
+                                entry_reason = ''
+                                if isinstance(getattr(self, 'last_entry_reason', None), dict):
+                                    entry_reason = self.last_entry_reason.get(symbol) or ''
+                                self._record_coin_selector_candidate_outcome(
+                                    symbol,
+                                    reason=entry_reason or "entry call did not open position",
+                                    cfg=coin_selector_cfg,
+                                    decision_key=decision_key
+                                )
+                                logger.info(f"Scanner did not open {symbol}; continuing candidates.")
+                                continue
+                            self._record_coin_selector_candidate_outcome(symbol, accepted=True, cfg=coin_selector_cfg)
                             self.scanner_active_symbol = symbol
                             current_ts = int(ohlcv[-1][0])
                             self.last_processed_candle_ts[symbol] = current_ts
@@ -13426,9 +13705,16 @@ class SignalEngine(BaseEngine):
                             self.last_candle_success[symbol] = True
                             break # Found a winner, exit loop
                         else:
+                            self._record_coin_selector_candidate_outcome(symbol, accepted=True, cfg=coin_selector_cfg)
                             logger.info(f"?? Scanner Checked {symbol}: Position exists ({pos['side']})")
 
                 except Exception as e:
+                    self._record_coin_selector_candidate_outcome(
+                        symbol,
+                        reason=f"strategy check error: {type(e).__name__}",
+                        cfg=coin_selector_cfg,
+                        decision_key=f"strategy_error:{int(time.time() // 60)}"
+                    )
                     logger.error(f"Scanner strategy check failed for {symbol}: {e}")
                     continue
                 

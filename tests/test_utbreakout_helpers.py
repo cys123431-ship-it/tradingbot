@@ -145,6 +145,75 @@ def test_custom_coin_symbol_resolution_uses_futures_canonical_symbol():
     assert engine._coin_selector_market_for_symbol("BTC/USDC", markets) is None
 
 
+def test_coin_selector_candidate_cooldown_counts_unique_decision_keys():
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    engine.coin_selector_candidate_cooldowns = {}
+    cfg = {
+        "candidate_cooldown_enabled": True,
+        "candidate_cooldown_misses": 2,
+        "candidate_cooldown_seconds": 60,
+    }
+
+    first = engine._record_coin_selector_candidate_outcome(
+        "BTC/USDT:USDT",
+        reason="no signal",
+        cfg=cfg,
+        now=100,
+        decision_key="utbot:15m:1",
+    )
+    duplicate = engine._record_coin_selector_candidate_outcome(
+        "BTC/USDT:USDT",
+        reason="no signal",
+        cfg=cfg,
+        now=110,
+        decision_key="utbot:15m:1",
+    )
+    remaining, _ = engine._coin_selector_cooldown_remaining("BTCUSDT", cfg, now=111)
+
+    assert first["miss_count"] == 1
+    assert duplicate["miss_count"] == 1
+    assert remaining == 0
+
+    cooled = engine._record_coin_selector_candidate_outcome(
+        "BTC/USDT:USDT",
+        reason="filter blocked",
+        cfg=cfg,
+        now=120,
+        decision_key="utbot:15m:2",
+    )
+    remaining, state = engine._coin_selector_cooldown_remaining("BTC/USDT", cfg, now=130)
+
+    assert cooled["cooldown_until"] == 180
+    assert remaining == pytest.approx(50)
+    assert state["last_reason"] == "filter blocked"
+
+
+def test_coin_selector_candidate_cooldown_success_clears_state():
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    engine.coin_selector_candidate_cooldowns = {}
+    cfg = {
+        "candidate_cooldown_enabled": True,
+        "candidate_cooldown_misses": 1,
+        "candidate_cooldown_seconds": 60,
+    }
+
+    engine._record_coin_selector_candidate_outcome(
+        "ETH/USDT:USDT",
+        reason="entry call did not open position",
+        cfg=cfg,
+        now=100,
+        decision_key="utbot:15m:1",
+    )
+    assert engine._coin_selector_cooldown_remaining("ETH/USDT", cfg, now=101)[0] > 0
+
+    engine._record_coin_selector_candidate_outcome("ETH/USDT:USDT", accepted=True, cfg=cfg, now=102)
+
+    assert engine._coin_selector_cooldown_remaining("ETH/USDT", cfg, now=103) == (0.0, None)
+    assert engine.coin_selector_candidate_cooldowns == {}
+
+
 class _MemoryConfig:
     def __init__(self):
         self.values = {}
