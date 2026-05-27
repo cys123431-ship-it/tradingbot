@@ -413,10 +413,14 @@ def build_utbreakout_set_registry():
         'utbot_atr_period': 14,
         'stop_atr_multiplier': 1.5,
         'take_profit_r_multiple': 2.0,
+        'fixed_take_profit_enabled': True,
         'partial_take_profit_enabled': True,
         'partial_take_profit_r_multiple': 1.5,
         'partial_take_profit_ratio': 0.5,
-        'atr_trailing_enabled': True,
+        'second_take_profit_enabled': True,
+        'second_take_profit_r_multiple': 2.0,
+        'second_take_profit_ratio': 0.5,
+        'atr_trailing_enabled': False,
         'atr_trailing_multiplier': 2.0,
         'atr_trailing_activation_r': 1.5,
         'atr_trailing_breakeven_enabled': True,
@@ -442,10 +446,10 @@ def build_utbreakout_set_registry():
         'market_quality_regime_strong_move_pct': 1.5,
         'shadow_triple_barrier_enabled': True,
         'shadow_triple_barrier_max_bars': 24,
-        'shadow_runner_exit_enabled': True,
+        'shadow_runner_exit_enabled': False,
         'shadow_runner_max_bars': 48,
-        'runner_exit_enabled': True,
-        'runner_chandelier_enabled': True,
+        'runner_exit_enabled': False,
+        'runner_chandelier_enabled': False,
         'runner_chandelier_lookback': 22,
         'runner_structure_lookback': 5,
         'runner_structure_buffer_atr': 0.20,
@@ -662,10 +666,14 @@ def build_default_utbot_filtered_breakout_config():
         'donchian_width_min_percent': 0.50,
         'stop_atr_multiplier': 1.5,
         'take_profit_r_multiple': 2.0,
+        'fixed_take_profit_enabled': True,
         'partial_take_profit_enabled': True,
         'partial_take_profit_r_multiple': 1.5,
         'partial_take_profit_ratio': 0.5,
-        'atr_trailing_enabled': True,
+        'second_take_profit_enabled': True,
+        'second_take_profit_r_multiple': 2.0,
+        'second_take_profit_ratio': 0.5,
+        'atr_trailing_enabled': False,
         'atr_trailing_multiplier': 2.0,
         'atr_trailing_activation_r': 1.5,
         'atr_trailing_breakeven_enabled': True,
@@ -691,10 +699,10 @@ def build_default_utbot_filtered_breakout_config():
         'market_quality_regime_strong_move_pct': 1.5,
         'shadow_triple_barrier_enabled': True,
         'shadow_triple_barrier_max_bars': 24,
-        'shadow_runner_exit_enabled': True,
+        'shadow_runner_exit_enabled': False,
         'shadow_runner_max_bars': 48,
-        'runner_exit_enabled': True,
-        'runner_chandelier_enabled': True,
+        'runner_exit_enabled': False,
+        'runner_chandelier_enabled': False,
         'runner_chandelier_lookback': 22,
         'runner_structure_lookback': 5,
         'runner_structure_buffer_atr': 0.20,
@@ -4336,6 +4344,8 @@ class SignalEngine(BaseEngine):
             'adaptive_timeframe_switch_margin': 8.0,
             'partial_take_profit_r_multiple': 1.5,
             'partial_take_profit_ratio': 0.5,
+            'second_take_profit_r_multiple': 2.0,
+            'second_take_profit_ratio': 0.5,
             'atr_trailing_multiplier': 2.0,
             'atr_trailing_activation_r': 1.5,
             'market_quality_min_risk_multiplier': 0.25,
@@ -4455,7 +4465,9 @@ class SignalEngine(BaseEngine):
             'ema_rsi_exit_enabled',
             'adx_donchian_exit_enabled',
             'adaptive_timeframe_enabled',
+            'fixed_take_profit_enabled',
             'partial_take_profit_enabled',
+            'second_take_profit_enabled',
             'atr_trailing_enabled',
             'atr_trailing_breakeven_enabled',
             'short_conservative_enabled',
@@ -4481,6 +4493,17 @@ class SignalEngine(BaseEngine):
             'walk_forward_report_enabled',
         ):
             cfg[key] = bool(cfg.get(key, False))
+        if bool(cfg.get('fixed_take_profit_enabled', True)):
+            cfg['partial_take_profit_enabled'] = True
+            cfg['partial_take_profit_r_multiple'] = 1.5
+            cfg['partial_take_profit_ratio'] = 0.5
+            cfg['second_take_profit_enabled'] = True
+            cfg['second_take_profit_r_multiple'] = 2.0
+            cfg['second_take_profit_ratio'] = 0.5
+            cfg['atr_trailing_enabled'] = False
+            cfg['shadow_runner_exit_enabled'] = False
+            cfg['runner_exit_enabled'] = False
+            cfg['runner_chandelier_enabled'] = False
         # A-option (opposite UT signal only) is intentionally rejected for UT Breakout.
         # Only the stricter opposite-set exit can be enabled from Telegram.
         cfg['opposite_signal_exit_enabled'] = False
@@ -6876,8 +6899,13 @@ class SignalEngine(BaseEngine):
                     'expected_profit_usdt': _safe_float_or_none(plan.get('expected_profit_usdt')),
                     'leverage': _safe_float_or_none(plan.get('leverage')),
                     'rr_multiple': _safe_float_or_none(plan.get('rr_multiple')),
+                    'fixed_take_profit_enabled': plan.get('fixed_take_profit_enabled'),
+                    'partial_take_profit_enabled': plan.get('partial_take_profit_enabled'),
                     'partial_take_profit_r_multiple': _safe_float_or_none(plan.get('partial_take_profit_r_multiple')),
                     'partial_take_profit_ratio': _safe_float_or_none(plan.get('partial_take_profit_ratio')),
+                    'second_take_profit_enabled': plan.get('second_take_profit_enabled'),
+                    'second_take_profit_r_multiple': _safe_float_or_none(plan.get('second_take_profit_r_multiple')),
+                    'second_take_profit_ratio': _safe_float_or_none(plan.get('second_take_profit_ratio')),
                     'atr_trailing_multiplier': _safe_float_or_none(plan.get('atr_trailing_multiplier')),
                     'atr_trailing_activation_r': _safe_float_or_none(plan.get('atr_trailing_activation_r')),
                     'strategy_adaptive_risk_multiplier': _safe_float_or_none(plan.get('strategy_adaptive_risk_multiplier')),
@@ -7385,7 +7413,8 @@ class SignalEngine(BaseEngine):
         strategy_adaptation = self._build_utbreakout_strategy_adaptation(symbol, side, cfg, selected_set, filter_values)
         strategy_risk_multiplier = min(1.0, max(0.0, float(strategy_adaptation.get('risk_multiplier', 1.0) or 0.0)))
         exit_overlay = strategy_adaptation.get('exit_overlay') if isinstance(strategy_adaptation.get('exit_overlay'), dict) else {}
-        if exit_overlay:
+        fixed_take_profit = bool(cfg.get('fixed_take_profit_enabled', True))
+        if exit_overlay and not fixed_take_profit:
             cfg = dict(cfg)
             for key in (
                 'partial_take_profit_r_multiple',
@@ -7418,7 +7447,11 @@ class SignalEngine(BaseEngine):
         status['runner_sample_count'] = runner_stats.get('sample_count')
         status['runner_avg_mfe_capture_ratio'] = runner_stats.get('avg_mfe_capture_ratio')
         status['runner_avg_pnl_r'] = runner_stats.get('avg_pnl_r')
-        status['adaptive_exit_summary'] = exit_overlay.get('summary')
+        status['adaptive_exit_summary'] = (
+            "fixed TP ladder 50%@1.5R + 50%@2.0R; runner OFF"
+            if fixed_take_profit else
+            exit_overlay.get('summary')
+        )
         if trend_health.get('state') is False:
             return _finish(
                 None,
@@ -7486,9 +7519,13 @@ class SignalEngine(BaseEngine):
             'atr': atr_value,
             'atr_pct': atr_pct,
             'decision_candle_ts': decision_ts,
+            'fixed_take_profit_enabled': bool(cfg.get('fixed_take_profit_enabled', True)),
             'partial_take_profit_enabled': bool(cfg.get('partial_take_profit_enabled', True)),
             'partial_take_profit_r_multiple': float(cfg.get('partial_take_profit_r_multiple', 1.5) or 1.5),
             'partial_take_profit_ratio': float(cfg.get('partial_take_profit_ratio', 0.5) or 0.5),
+            'second_take_profit_enabled': bool(cfg.get('second_take_profit_enabled', True)),
+            'second_take_profit_r_multiple': float(cfg.get('second_take_profit_r_multiple', cfg.get('take_profit_r_multiple', 2.0)) or 2.0),
+            'second_take_profit_ratio': float(cfg.get('second_take_profit_ratio', 0.5) or 0.5),
             'atr_trailing_enabled': bool(cfg.get('atr_trailing_enabled', True)),
             'atr_trailing_multiplier': float(cfg.get('atr_trailing_multiplier', 2.0) or 2.0),
             'atr_trailing_activation_r': float(cfg.get('atr_trailing_activation_r', 1.5) or 1.5),
@@ -7510,7 +7547,7 @@ class SignalEngine(BaseEngine):
             'strategy_quality_risk_multiplier': strategy_adaptation.get('strategy_quality_risk_multiplier'),
             'strategy_quality_score': strategy_quality.get('score'),
             'strategy_quality_summary': strategy_quality.get('summary'),
-            'adaptive_exit_summary': exit_overlay.get('summary'),
+            'adaptive_exit_summary': status.get('adaptive_exit_summary'),
             'shadow_sample_count': shadow_stats.get('sample_count'),
             'shadow_win_rate': shadow_stats.get('tp_rate'),
             'shadow_avg_pnl_r': shadow_stats.get('avg_pnl_r'),
@@ -10900,6 +10937,26 @@ class SignalEngine(BaseEngine):
 
         return None, reason, {}
 
+    def _get_primary_poll_timeframe(self, symbol=None, trade_cfg=None):
+        cfg = trade_cfg if isinstance(trade_cfg, dict) else self.get_runtime_trade_config()
+        common_cfg = cfg.get('common_settings', {}) if isinstance(cfg.get('common_settings', {}), dict) else {}
+        strategy_params = cfg.get('strategy_params', {}) if isinstance(cfg.get('strategy_params', {}), dict) else {}
+        active_strategy = str(strategy_params.get('active_strategy', 'utbot') or 'utbot').lower()
+        if active_strategy in UTBREAKOUT_STRATEGIES:
+            fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+            if bool(fb_cfg.get('adaptive_timeframe_enabled', False)):
+                raw_timeframes = fb_cfg.get('adaptive_timeframes') or fb_cfg.get('auto_timeframes') or [fb_cfg.get('entry_timeframe', '15m')]
+                candidates = []
+                for tf in raw_timeframes:
+                    tf_text = str(tf or '').strip().lower()
+                    tf_ms = self._timeframe_to_ms(tf_text)
+                    if tf_text and tf_ms > 0:
+                        candidates.append((tf_ms, tf_text))
+                if candidates:
+                    return min(candidates, key=lambda item: item[0])[1]
+            return str(fb_cfg.get('entry_timeframe', '15m') or '15m').strip().lower() or '15m'
+        return common_cfg.get('entry_timeframe', common_cfg.get('timeframe', '15m'))
+
     async def poll_tick(self):
         """
         [?쒖닔 ?대쭅] 硫붿씤 ?대쭅 ?⑥닔 (Multi-Symbol)
@@ -10913,7 +10970,7 @@ class SignalEngine(BaseEngine):
             self.last_activity = time.time()
             cfg = self.get_runtime_trade_config()
             common_cfg = self.get_runtime_common_settings()
-            entry_tf = common_cfg.get('entry_timeframe', common_cfg.get('timeframe', '8h'))
+            entry_tf = self._get_primary_poll_timeframe(trade_cfg=cfg)
             
             active_position_symbols = set()
             # Common: Fetch current positions (best effort).
@@ -11083,6 +11140,7 @@ class SignalEngine(BaseEngine):
         ))
             
         try:
+            primary_tf = self._get_primary_poll_timeframe(symbol, cfg)
             # 1. OHLCV (Primary) - Basic monitoring
             ohlcv_p = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, primary_tf, limit=5)
             if not ohlcv_p or len(ohlcv_p) < 3:
@@ -15791,9 +15849,13 @@ class SignalEngine(BaseEngine):
                         fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
                         effective_fb_cfg = dict(fb_cfg)
                         for key in (
+                            'fixed_take_profit_enabled',
                             'partial_take_profit_enabled',
                             'partial_take_profit_r_multiple',
                             'partial_take_profit_ratio',
+                            'second_take_profit_enabled',
+                            'second_take_profit_r_multiple',
+                            'second_take_profit_ratio',
                             'atr_trailing_enabled',
                             'atr_trailing_multiplier',
                             'atr_trailing_activation_r',
@@ -15810,27 +15872,62 @@ class SignalEngine(BaseEngine):
                             float(effective_fb_cfg.get('partial_take_profit_r_multiple', 1.5) or 1.5)
                             if partial_enabled else rr_multiple
                         )
+                        second_enabled = bool(effective_fb_cfg.get('second_take_profit_enabled', True))
+                        second_r = float(effective_fb_cfg.get('second_take_profit_r_multiple', rr_multiple) or rr_multiple)
+                        second_ratio = (
+                            min(
+                                max(0.0, 1.0 - partial_ratio),
+                                max(0.0, float(effective_fb_cfg.get('second_take_profit_ratio', 0.5) or 0.5))
+                            )
+                            if second_enabled else 0.0
+                        )
+                        tp_targets = []
+                        if partial_enabled and partial_ratio > 0:
+                            tp_targets.append({
+                                'label': 'TP1',
+                                'kind': 'tp1',
+                                'distance': risk_distance * partial_r,
+                                'qty_ratio': partial_ratio,
+                            })
+                        if second_enabled and second_ratio > 0 and second_r > 0:
+                            tp_targets.append({
+                                'label': 'TP2',
+                                'kind': 'tp2',
+                                'distance': risk_distance * second_r,
+                                'qty_ratio': second_ratio,
+                            })
+                        if not tp_targets:
+                            tp_targets.append({
+                                'label': 'TP',
+                                'kind': 'tp',
+                                'distance': risk_distance * rr_multiple,
+                                'qty_ratio': 1.0,
+                            })
                         await self._place_tp_sl_orders(
                             symbol,
                             side,
                             actual_entry_price,
                             qty,
-                            tp_distance=risk_distance * partial_r,
                             sl_distance=risk_distance,
-                            tp_qty_ratio=partial_ratio
+                            tp_targets=tp_targets
                         )
-                        self._register_utbreakout_trailing_state(
-                            symbol,
-                            side,
-                            actual_entry_price,
-                            qty,
-                            plan,
-                            effective_fb_cfg
-                        )
+                        if bool(effective_fb_cfg.get('atr_trailing_enabled', False)):
+                            self._register_utbreakout_trailing_state(
+                                symbol,
+                                side,
+                                actual_entry_price,
+                                qty,
+                                plan,
+                                effective_fb_cfg
+                            )
+                        else:
+                            self._clear_utbreakout_trailing_state(symbol)
                         logger.info(
                             f"[UTBOT_FILTERED_BREAKOUT_V1] RR protection set: "
                             f"entry={actual_entry_price:.4f}, risk={risk_distance:.4f}, "
-                            f"partial={partial_ratio:.2f}@{partial_r:.2f}R, trail={effective_fb_cfg.get('atr_trailing_multiplier', 2.0)}ATR"
+                            f"tp1={partial_ratio:.2f}@{partial_r:.2f}R, "
+                            f"tp2={second_ratio:.2f}@{second_r:.2f}R, "
+                            f"runner={'ON' if effective_fb_cfg.get('atr_trailing_enabled', False) else 'OFF'}"
                         )
                     else:
                         await self.ctrl.notify("⚠️ UTBOT_FILTERED_BREAKOUT_V1 보호 주문 거리 계산 오류")
@@ -16656,8 +16753,16 @@ class SignalEngine(BaseEngine):
                 orders=invalid_price_orders
             )
 
+        try:
+            strategy_params = self.get_runtime_strategy_params()
+            active_strategy = str(strategy_params.get('active_strategy', '') or '').lower()
+        except Exception:
+            active_strategy = ''
+        allow_split_tp = active_strategy in UTBREAKOUT_STRATEGIES
         for kind, valid_orders in (('tp', valid_tp), ('sl', valid_sl)):
             if len(valid_orders) <= 1:
+                continue
+            if kind == 'tp' and allow_split_tp:
                 continue
             keep = self._newest_protection_order(valid_orders)
             duplicates = [
@@ -17045,7 +17150,8 @@ class SignalEngine(BaseEngine):
         qty,
         tp_distance=None,
         sl_distance=None,
-        tp_qty_ratio=1.0
+        tp_qty_ratio=1.0,
+        tp_targets=None
     ):
         """Place reduce-only TP/SL protection orders for the current futures position."""
         try:
@@ -17053,7 +17159,6 @@ class SignalEngine(BaseEngine):
                 logger.info("TP/SL order placement skipped in Upbit spot mode.")
                 return
 
-            tp_order = None
             sl_order = None
             tp_price = None
             sl_price = None
@@ -17074,8 +17179,6 @@ class SignalEngine(BaseEngine):
                     entry_price = pos_entry
             raw_qty = abs(float(qty or 0))
             sl_qty = self.safe_amount(symbol, raw_qty)
-            tp_ratio = min(1.0, max(0.0, float(tp_qty_ratio if tp_qty_ratio is not None else 1.0)))
-            tp_qty = self.safe_amount(symbol, raw_qty * tp_ratio) if tp_ratio > 0 else "0"
             if float(sl_qty) <= 0:
                 logger.error(f"Protection placement skipped: invalid qty for {symbol}: {sl_qty}")
                 return
@@ -17092,17 +17195,46 @@ class SignalEngine(BaseEngine):
             if side == 'long':
                 tp_side = 'sell'
                 sl_side = 'sell'
-                if tp_distance is not None and tp_distance > 0:
-                    tp_price = self.safe_price(symbol, entry_price + tp_distance)
                 if sl_distance is not None and sl_distance > 0:
                     sl_price = self.safe_price(symbol, entry_price - sl_distance)
             else:
                 tp_side = 'buy'
                 sl_side = 'buy'
-                if tp_distance is not None and tp_distance > 0:
-                    tp_price = self.safe_price(symbol, entry_price - tp_distance)
                 if sl_distance is not None and sl_distance > 0:
                     sl_price = self.safe_price(symbol, entry_price + sl_distance)
+
+            normalized_tp_targets = []
+            raw_targets = tp_targets
+            if raw_targets is None and tp_distance is not None:
+                raw_targets = [{
+                    'label': 'TP',
+                    'kind': 'tp',
+                    'distance': tp_distance,
+                    'qty_ratio': tp_qty_ratio,
+                }]
+            for index, target in enumerate(list(raw_targets or []), 1):
+                if not isinstance(target, dict):
+                    continue
+                try:
+                    distance = float(target.get('distance', 0.0) or 0.0)
+                    ratio = min(1.0, max(0.0, float(target.get('qty_ratio', 0.0) or 0.0)))
+                except (TypeError, ValueError):
+                    continue
+                if distance <= 0 or ratio <= 0:
+                    continue
+                target_price = self.safe_price(
+                    symbol,
+                    entry_price + distance if side == 'long' else entry_price - distance
+                )
+                normalized_tp_targets.append({
+                    'label': str(target.get('label') or f'TP{index}'),
+                    'kind': str(target.get('kind') or f'tp{index}'),
+                    'distance': distance,
+                    'qty_ratio': ratio,
+                    'qty': self.safe_amount(symbol, raw_qty * ratio),
+                    'price': target_price,
+                })
+            tp_price = normalized_tp_targets[0]['price'] if normalized_tp_targets else None
 
             def _valid_price(direction, price_value):
                 try:
@@ -17169,47 +17301,62 @@ class SignalEngine(BaseEngine):
                         }
                         return
 
-            # Take Profit is allowed to be partial; SL always covers the full current size.
-            if tp_price is not None:
-                if float(tp_qty) <= 0:
-                    logger.warning(f"TP placement skipped: partial TP qty rounds to zero for {symbol}: ratio={tp_ratio}")
-                    tp_price = None
-                    tp_order = None
-                elif not _valid_price('tp', tp_price):
+            # Take Profit is allowed to be split; SL always covers the full current size.
+            valid_tp_targets = []
+            for target in normalized_tp_targets:
+                target_label = target.get('label') or 'TP'
+                target_price = target.get('price')
+                target_qty = target.get('qty')
+                if float(target_qty) <= 0:
+                    logger.warning(
+                        f"{target_label} placement skipped: TP qty rounds to zero for "
+                        f"{symbol}: ratio={target.get('qty_ratio')}"
+                    )
+                    continue
+                if not _valid_price('tp', target_price):
                     await self._notify_protection_issue(
                         symbol,
                         'invalid_tp_price',
-                        f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} TP 가격 오류: entry {entry_price:.6f}, TP {tp_price}"
+                        f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} {target_label} 가격 오류: "
+                        f"entry {entry_price:.6f}, TP {target_price}"
                     )
-                    tp_price = None
-                else:
-                    try:
-                        tp_order = await self._create_protection_order_with_retries(
-                            symbol,
-                            'limit',
-                            tp_side,
-                            tp_qty,
-                            tp_price,
-                            {
-                                'reduceOnly': True,
-                                'newClientOrderId': self._build_protection_client_order_id(symbol, side, 'tp', pos)
-                            },
-                            'TP',
-                            max_attempts=2
-                        )
-                        logger.info(f"TP order placed: {tp_side.upper()} @ {tp_price}")
-                    except Exception as tp_e:
-                        logger.error(f"TP order failed: {tp_e}")
-                        await self._notify_protection_issue(
-                            symbol,
-                            'tp_place_failed',
-                            f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} TP 주문 생성 실패. SL은 유지됩니다: {tp_e}",
-                            cooldown_sec=60
-                        )
+                    continue
+                try:
+                    await self._create_protection_order_with_retries(
+                        symbol,
+                        'limit',
+                        tp_side,
+                        target_qty,
+                        target_price,
+                        {
+                            'reduceOnly': True,
+                            'newClientOrderId': self._build_protection_client_order_id(
+                                symbol,
+                                side,
+                                target.get('kind') or 'tp',
+                                pos
+                            )
+                        },
+                        target_label,
+                        max_attempts=2
+                    )
+                    valid_tp_targets.append(target)
+                    logger.info(f"{target_label} order placed: {tp_side.upper()} @ {target_price}")
+                except Exception as tp_e:
+                    logger.error(f"{target_label} order failed: {tp_e}")
+                    await self._notify_protection_issue(
+                        symbol,
+                        f"{str(target_label).lower()}_place_failed",
+                        f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} {target_label} 주문 생성 실패. SL은 유지됩니다: {tp_e}",
+                        cooldown_sec=60
+                    )
             
             notice_parts = []
-            if tp_order and tp_price is not None:
-                notice_parts.append(f"🎯 TP: `{float(tp_price):.2f}` x `{float(tp_qty):.6f}`")
+            for target in valid_tp_targets:
+                notice_parts.append(
+                    f"🎯 {target.get('label')}: `{float(target.get('price')):.2f}` "
+                    f"x `{float(target.get('qty')):.6f}`"
+                )
             if sl_order and sl_price is not None:
                 notice_parts.append(f"🛑 SL: `{float(sl_price):.2f}` x `{float(sl_qty):.6f}`")
             if notice_parts:
@@ -17218,7 +17365,7 @@ class SignalEngine(BaseEngine):
             await self._audit_protection_orders(
                 symbol,
                 pos=await self.get_server_position(symbol, use_cache=False),
-                expected_tp=tp_price is not None,
+                expected_tp=bool(valid_tp_targets),
                 expected_sl=sl_price is not None,
                 alert=True
             )
@@ -18763,6 +18910,134 @@ class MainController:
                 return f"KRW-{base.upper()}"
         return raw
 
+    def _futures_symbol_for_order(self, raw_symbol):
+        text = str(raw_symbol or '').strip().upper()
+        if not text:
+            return ''
+        text = text.replace(':USDT', '')
+        if '/' in text:
+            return text
+        for quote in ('USDT', 'USDC', 'BUSD'):
+            if text.endswith(quote) and len(text) > len(quote):
+                return f"{text[:-len(quote)]}/{quote}"
+        return self.normalize_symbol_for_exchange(text)
+
+    def _position_numeric_value(self, position, keys):
+        if not isinstance(position, dict):
+            return None
+        info = position.get('info', {}) if isinstance(position.get('info'), dict) else {}
+        for source in (position, info):
+            for key in keys:
+                if key not in source:
+                    continue
+                value = source.get(key)
+                if value in (None, ''):
+                    continue
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def _position_signed_contracts(self, position):
+        if not isinstance(position, dict):
+            return 0.0
+        signed_value = self._position_numeric_value(
+            position,
+            ('positionAmt', 'position_amt', 'pa')
+        )
+        if signed_value is not None:
+            return signed_value
+
+        amount = self._position_numeric_value(
+            position,
+            ('contracts', 'contract', 'amount', 'size', 'qty', 'position')
+        )
+        if amount is None:
+            return 0.0
+        if amount < 0:
+            return amount
+
+        side = str(position.get('side', '') or '').lower()
+        info = position.get('info', {}) if isinstance(position.get('info'), dict) else {}
+        position_side = str(info.get('positionSide', '') or info.get('side', '') or '').lower()
+        if side == 'short' or position_side == 'short':
+            return -abs(amount)
+        return abs(amount)
+
+    def _position_side_for_close(self, position, signed_contracts=None):
+        if signed_contracts is None:
+            signed_contracts = self._position_signed_contracts(position)
+        side = str((position or {}).get('side', '') or '').lower()
+        if side in {'long', 'short'}:
+            return side
+        info = (position or {}).get('info', {}) if isinstance((position or {}).get('info'), dict) else {}
+        raw_position_side = str(info.get('positionSide', '') or info.get('side', '') or '').lower()
+        if raw_position_side in {'long', 'short'}:
+            return raw_position_side
+        if signed_contracts > 0:
+            return 'long'
+        if signed_contracts < 0:
+            return 'short'
+        return ''
+
+    def _normalize_futures_position_for_emergency(self, position):
+        if not isinstance(position, dict):
+            return None
+        info = position.get('info', {}) if isinstance(position.get('info'), dict) else {}
+        raw_symbol = (
+            position.get('symbol')
+            or info.get('symbol')
+            or info.get('pair')
+            or ''
+        )
+        symbol = self._futures_symbol_for_order(raw_symbol)
+        signed_contracts = self._position_signed_contracts(position)
+        contracts = abs(float(signed_contracts or 0.0))
+        if not symbol or contracts <= 0:
+            return None
+        side = self._position_side_for_close(position, signed_contracts)
+        if side not in {'long', 'short'}:
+            return None
+        return {
+            'symbol': symbol,
+            'side': side,
+            'contracts': contracts,
+            'raw_position': position,
+            'pnl': self._to_float_safe(position.get('unrealizedPnl') or info.get('unRealizedProfit')),
+            'mark_price': self._to_float_safe(position.get('markPrice') or info.get('markPrice')),
+        }
+
+    def _safe_emergency_amount(self, symbol, contracts):
+        try:
+            return self.exchange.amount_to_precision(symbol, contracts)
+        except Exception as exc:
+            logger.warning(f"Emergency amount precision fallback for {symbol}: {exc}")
+            return str(round(float(contracts or 0.0), 8))
+
+    def _format_emergency_stop_reply(self, result):
+        if not isinstance(result, dict):
+            return "🚨 긴급 정지 완료"
+        status = result.get('status')
+        if status == 'error':
+            return f"❌ 긴급 정지 중 오류: {result.get('error', 'unknown error')}"
+        closed = int(result.get('closed', 0) or 0)
+        failed = int(result.get('failed', 0) or 0)
+        total = int(result.get('position_count', closed + failed) or 0)
+        if failed:
+            failed_symbols = ", ".join(str(item.get('symbol')) for item in result.get('failed_positions', [])[:5])
+            return (
+                f"⚠️ 긴급 정지 일부 실패\n"
+                f"청산 성공 {closed}/{max(total, closed + failed)}개, 실패 {failed}개"
+                + (f"\n실패: {failed_symbols}" if failed_symbols else "")
+            )
+        if closed:
+            return f"✅ 긴급 정지 완료\n청산 성공 {closed}개"
+        if status == 'no_position':
+            cancelled = int(result.get('cancelled_orders', 0) or 0)
+            return f"ℹ️ 긴급 정지 완료\n청산할 오픈 포지션 없음. 미체결 주문 정리 {cancelled}건"
+        return "🧯 긴급 정지 처리 완료"
+
     def _build_exchange(self, creds, exchange_mode=None):
         mode = exchange_mode or self.get_exchange_mode()
         if mode == UPBIT_MODE:
@@ -19510,8 +19785,8 @@ class MainController:
         action = self._extract_emergency_action(text)
 
         if action == "STOP":
-            await self.emergency_stop()
-            await update.message.reply_text("🚨 긴급 정지 완료 - 모든 포지션 청산")
+            result = await self.emergency_stop()
+            await update.message.reply_text(self._format_emergency_stop_reply(result))
             return ConversationHandler.END
         elif action == "PAUSE":
             self.is_paused = True
@@ -21371,8 +21646,8 @@ class MainController:
                 )
 
         async def close_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-            await self.emergency_stop()
-            await u.message.reply_text("🚨 긴급 정지 완료")
+            result = await self.emergency_stop()
+            await u.message.reply_text(self._format_emergency_stop_reply(result))
 
         async def stats_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             daily_count, daily_pnl = self.db.get_daily_stats()
@@ -21506,12 +21781,28 @@ class MainController:
 
         async def _activate_utbreak_strategy():
             await _ensure_signal_engine_active()
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_FILTERED_BREAKOUT_STRATEGY)
-            await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'], 'auto')
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'auto_select_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'fixed_take_profit_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'partial_take_profit_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'partial_take_profit_r_multiple'], 1.5)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'partial_take_profit_ratio'], 0.5)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'second_take_profit_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'second_take_profit_r_multiple'], 2.0)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'second_take_profit_ratio'], 0.5)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'atr_trailing_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'shadow_runner_exit_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'runner_exit_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'runner_chandelier_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol'], '')
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
-            await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'selection_quality_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], False)
             engine = self._reset_signal_engine_runtime_state(
                 reset_entry_cache=True,
                 reset_exit_cache=True,
@@ -21520,9 +21811,7 @@ class MainController:
             if engine:
                 engine.scanner_active_symbol = None
                 engine.active_symbols.clear()
-                for item in self.get_active_watchlist():
-                    engine.active_symbols.add(item)
-            return "✅ UTBreak 전략 ON. 기본은 scanner OFF + watchlist 직접 감시입니다."
+            return "✅ UTBreak 전략 ON. CoinSelector + scanner + Set AUTO + Adaptive TF 자동 운용으로 켰습니다."
 
         async def _set_strategy_coin(symbol_text):
             symbol = self.normalize_symbol_for_exchange(symbol_text)
@@ -21565,6 +21854,10 @@ class MainController:
                 raise ValueError(f"유효하지 않은 타임프레임입니다. 사용 가능: {', '.join(valid_tf)}")
             await self.cfg.update_value(['signal_engine', 'common_settings', 'timeframe'], tf)
             await self.cfg.update_value(['signal_engine', 'common_settings', 'entry_timeframe'], tf)
+            strategy_params = self.cfg.get('signal_engine', {}).get('strategy_params', {})
+            active_strategy = str(strategy_params.get('active_strategy', 'utbot') or 'utbot').lower()
+            if active_strategy in UTBREAKOUT_STRATEGIES:
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'entry_timeframe'], tf)
             self._reset_signal_engine_runtime_state(reset_entry_cache=True, reset_stateful_strategy=True)
             return tf
 
@@ -21574,6 +21867,10 @@ class MainController:
             if tf not in valid_tf:
                 raise ValueError(f"유효하지 않은 타임프레임입니다. 사용 가능: {', '.join(valid_tf)}")
             await self.cfg.update_value(['signal_engine', 'common_settings', 'exit_timeframe'], tf)
+            strategy_params = self.cfg.get('signal_engine', {}).get('strategy_params', {})
+            active_strategy = str(strategy_params.get('active_strategy', 'utbot') or 'utbot').lower()
+            if active_strategy in UTBREAKOUT_STRATEGIES:
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'exit_timeframe'], tf)
             self._reset_signal_engine_runtime_state(reset_exit_cache=True)
             return tf
 
@@ -21831,6 +22128,19 @@ UTBot:
             raw_cfg = strategy_params.get('UTBotFilteredBreakoutV1', {})
             if isinstance(raw_cfg, dict):
                 cfg.update(raw_cfg)
+            if bool(cfg.get('fixed_take_profit_enabled', True)):
+                cfg.update({
+                    'partial_take_profit_enabled': True,
+                    'partial_take_profit_r_multiple': 1.5,
+                    'partial_take_profit_ratio': 0.5,
+                    'second_take_profit_enabled': True,
+                    'second_take_profit_r_multiple': 2.0,
+                    'second_take_profit_ratio': 0.5,
+                    'atr_trailing_enabled': False,
+                    'shadow_runner_exit_enabled': False,
+                    'runner_exit_enabled': False,
+                    'runner_chandelier_enabled': False,
+                })
             coin_cfg = sig_cfg.get('coin_selector', {}) if isinstance(sig_cfg.get('coin_selector', {}), dict) else {}
             common_cfg = sig_cfg.get('common_settings', {}) if isinstance(sig_cfg.get('common_settings', {}), dict) else {}
             watchlist = self.get_active_watchlist()
@@ -21881,6 +22191,18 @@ UTBot:
                 if partial_enabled else
                 "OFF"
             )
+            second_enabled = bool(cfg.get('second_take_profit_enabled', True))
+            second_text = (
+                f"{float(cfg.get('second_take_profit_ratio', 0.5) or 0.5) * 100:.0f}% @ "
+                f"{float(cfg.get('second_take_profit_r_multiple', cfg.get('take_profit_r_multiple', 2.0)) or 2.0):.1f}R"
+                if second_enabled else
+                "OFF"
+            )
+            take_profit_text = (
+                f"TP1 {partial_text} / TP2 {second_text}"
+                if cfg.get('fixed_take_profit_enabled', True) else
+                f"부분익절 {partial_text}"
+            )
             trailing_text = (
                 f"{float(cfg.get('atr_trailing_multiplier', 2.0) or 2.0):.1f}ATR + Chandelier / "
                 f"{float(cfg.get('atr_trailing_activation_r', 1.5) or 1.5):.1f}R부터"
@@ -21914,7 +22236,7 @@ AUTO 묶음: `{'ON' if auto_bundle_on else 'OFF'}` (코인 자동선택 + Set �
 Set: `{mode_label}` / 수동 `Set{set_id} {set_info.get('name')}` / 최근 AUTO `{('Set' + str(auto_set) + ' ' + str(auto_name)) if auto_set else '대기'}`
 시간봉: 진입 `{cfg.get('entry_timeframe', '15m')}` / 청산 `{cfg.get('exit_timeframe', cfg.get('entry_timeframe', '15m'))}` / HTF `{cfg.get('htf_timeframe', '1h')}`
 Adaptive 최근: `{adaptive_summary}`
-리스크: `SL {float(cfg.get('stop_atr_multiplier', 1.5) or 1.5):.1f}ATR` | 부분익절 `{partial_text}` | ATR 트레일 `{trailing_text}`
+리스크: `SL {float(cfg.get('stop_atr_multiplier', 1.5) or 1.5):.1f}ATR` | 익절 `{take_profit_text}` | ATR 트레일 `{trailing_text}`
 숏 가드: `{short_text}`
 고도화: `{adaptive_stack_text}`
 한도: `1회 ${float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0):.2f}` / `일손실 ${float(cfg.get('daily_max_loss_usdt', 3.0) or 3.0):.2f}` / `일거래 {daily_trade_limit_text}`
@@ -22294,8 +22616,7 @@ AUTO 최근 선택 이유:
                 return value
 
             if action in {'on', 'enable', 'activate', 'start'}:
-                await _activate_utbreak_strategy()
-                await u.message.reply_text("✅ UTBreak 전략 ON. scanner OFF + watchlist 직접 감시로 정리했습니다.")
+                await u.message.reply_text(await _activate_utbreak_strategy())
             elif action in {'off', 'disable', 'utbot'}:
                 await _activate_utbot_strategy()
                 await u.message.reply_text("✅ 기본 UTBOT 전략으로 복귀")
@@ -25704,6 +26025,15 @@ AUTO 최근 선택 이유:
             self.active_engine.stop()
 
         self.is_paused = True
+        result = {
+            'status': 'started',
+            'position_count': 0,
+            'closed': 0,
+            'failed': 0,
+            'cancelled_orders': 0,
+            'closed_positions': [],
+            'failed_positions': [],
+        }
 
         try:
             if self.is_upbit_mode():
@@ -25731,13 +26061,18 @@ AUTO 최근 선택 이유:
                             except Exception as cancel_error:
                                 logger.warning(f"Cancel order error for {sym} / {order_id}: {cancel_error}")
 
+                    result.update({
+                        'status': 'no_position',
+                        'cancelled_orders': cancelled_orders,
+                    })
                     if cancelled_orders:
                         await self.notify(f"ℹ️ 업비트 보유 코인은 없어서 미체결 주문 `{cancelled_orders}`건만 취소했습니다.")
                     else:
                         await self.notify("ℹ️ 청산할 업비트 보유 코인이 없습니다.")
-                    return
+                    return result
 
                 symbols_text = ", ".join(self.format_symbol_for_display(sym) for sym in sorted(open_symbols))
+                result['position_count'] = len(open_symbols)
                 await self.notify(
                     f"🚨 **긴급 정지 실행**\n업비트 보유 코인 `{len(open_symbols)}`개를 즉시 매도합니다.\n대상: `{symbols_text}`"
                 )
@@ -25745,20 +26080,27 @@ AUTO 최근 선택 이유:
                 for sym in sorted(open_symbols):
                     try:
                         await upbit_engine.exit_position(sym, "EmergencyStop")
+                        result['closed'] += 1
+                        result['closed_positions'].append({'symbol': sym})
                     except Exception as e:
+                        result['failed'] += 1
+                        result['failed_positions'].append({'symbol': sym, 'error': str(e)})
                         logger.error(f"Failed to close Upbit position {sym}: {e}")
                         await self.notify(f"❌ {self.format_symbol_for_display(sym)} 청산 실패: {e}")
 
+                result['status'] = 'failed' if result['failed'] and not result['closed'] else ('partial_failed' if result['failed'] else 'closed')
                 await self.notify("🧯 긴급 정지 처리 완료")
-                return
+                return result
 
             # 1. ?ㅽ뵂??紐⑤뱺 ?ъ???議고쉶
             signal_engine = engine if hasattr(engine, '_cancel_protection_orders') else self.engines.get(CORE_ENGINE)
             positions = await asyncio.to_thread(self.exchange.fetch_positions)
             open_positions = []
             for p in positions:
-                if float(p.get('contracts', 0)) != 0:
-                    open_positions.append(p)
+                normalized_pos = self._normalize_futures_position_for_emergency(p)
+                if normalized_pos:
+                    open_positions.append(normalized_pos)
+            result['position_count'] = len(open_positions)
             
             if not open_positions:
                 # ?ъ??섏씠 ?녿떎硫? ?뱀떆 紐⑤Ⅴ???꾩옱 ?ㅼ젙???щ낵??誘몄껜寃?二쇰Ц留?痍⑥냼 ?쒕룄
@@ -25783,14 +26125,15 @@ AUTO 최근 선택 이유:
                             logger.info(f"??All orders cancelled for {sym}")
                     except Exception as cleanup_error:
                         logger.warning(f"Emergency orphan cleanup failed for {sym}: {cleanup_error}")
+                result['status'] = 'no_position'
                 await self.notify("ℹ️ 청산할 오픈 포지션이 없습니다. (미체결 주문만 취소)")
-                return
+                return result
 
             await self.notify(f"🚨 **긴급 정지 실행**\n발견된 포지션 {len(open_positions)}개를 즉시 청산합니다.")
 
             # 2. 紐⑤뱺 ?ㅽ뵂 ?ъ????쒖감 泥?궛
             for pos in open_positions:
-                sym = pos['symbol'].replace(':USDT', '') # ?щ낵 ?щ㎎??
+                sym = pos['symbol']
                 
                 # 二쇰Ц 痍⑥냼
                 try:
@@ -25805,17 +26148,34 @@ AUTO 최근 선택 이유:
                 # 泥?궛 二쇰Ц
                 try:
                     side = 'sell' if pos['side'] == 'long' else 'buy'
-                    qty = abs(float(pos['contracts']))
-                    pnl = float(pos.get('unrealizedPnl', 0))
+                    qty = self._safe_emergency_amount(sym, pos['contracts'])
+                    if float(qty) <= 0:
+                        raise ValueError(f"invalid emergency close qty: {qty}")
+                    pnl = float(pos.get('pnl', 0.0) or 0.0)
                     
-                    # ?섎웾 ?뺣????곸슜 ?깆쓣 ?꾪빐 engine.exit_position???곕㈃ 醫뗪쿋吏留?
-                    # 湲닿툒 ?뺤??대?濡??⑥닚?섍쾶 market order濡??좊┝ (?먮뒗 reduceOnly)
-                    # ?섏?留??섎웾 ?뺣???臾몄젣 ?앷만 ???덉쑝誘濡?exchange.create_order ?ъ슜 ??二쇱쓽
-                    # ?ш린?쒕뒗 媛꾨떒???ㅽ뻾?섎릺, ?ㅻ쪟 ??濡쒓렇 ?④?
-                    
-                    order = await asyncio.to_thread(
-                        self.exchange.create_order, sym, 'market', side, qty, None, {'reduceOnly': True}
-                    )
+                    order = None
+                    last_error = None
+                    for attempt in range(1, 4):
+                        try:
+                            order = await asyncio.to_thread(
+                                self.exchange.create_order,
+                                sym,
+                                'market',
+                                side,
+                                qty,
+                                None,
+                                {'reduceOnly': True}
+                            )
+                            break
+                        except Exception as close_error:
+                            last_error = close_error
+                            logger.error(f"Emergency close attempt {attempt}/3 failed for {sym}: {close_error}")
+                            if attempt < 3:
+                                await asyncio.sleep(1.0)
+                                await self.notify(f"⚠️ {sym} 청산 재시도 중... ({attempt + 1}/3)")
+                    if not order:
+                        raise last_error or RuntimeError("emergency close order failed")
+
                     logger.info(f"??Emergency Close: {sym} {side} {qty}")
                     if signal_engine:
                         await asyncio.sleep(0.5)
@@ -25824,7 +26184,7 @@ AUTO 최근 선택 이유:
                                 sym,
                                 finalize=True,
                                 reason='EmergencyStop',
-                                exit_price=order.get('average') or pos.get('markPrice')
+                                exit_price=order.get('average') or pos.get('mark_price')
                             )
                         await signal_engine._cancel_all_orders_variants(sym, reason='after emergency close')
                         await signal_engine._reconcile_closed_position_protection(
@@ -25833,17 +26193,28 @@ AUTO 최근 선택 이유:
                             alert=True,
                             attempts=3
                         )
+                    result['closed'] += 1
+                    result['closed_positions'].append({'symbol': sym, 'qty': qty, 'pnl': pnl})
                     await self.notify(f"✅ **{sym}** 청산 완료\nPnL: ${pnl:+.2f}")
                     
                 except Exception as e:
+                    result['failed'] += 1
+                    result['failed_positions'].append({'symbol': sym, 'error': str(e)})
                     logger.error(f"Failed to close {sym}: {e}")
                     await self.notify(f"❌ {sym} 청산 실패: {e}")
             
+            result['status'] = 'failed' if result['failed'] and not result['closed'] else ('partial_failed' if result['failed'] else 'closed')
             await self.notify("🧯 긴급 정지 처리 완료")
+            return result
                     
         except Exception as e:
             logger.error(f"Emergency stop error: {e}")
             await self.notify(f"❌ 긴급 정지 중 오류: {e}")
+            result.update({
+                'status': 'error',
+                'error': str(e),
+            })
+            return result
 
     async def notify(self, text):
         """?뚮┝ ?꾩넚"""

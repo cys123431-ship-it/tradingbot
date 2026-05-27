@@ -278,6 +278,100 @@ def test_telegram_global_handler_accepts_main_keyboard_stop_button():
     assert re.match(emas.TELEGRAM_EMERGENCY_PATTERN, "🚨 STOP")
 
 
+def test_telegram_global_handler_reports_no_position_stop_result():
+    controller = _telegram_controller(chat_id=12345)
+
+    async def emergency_stop():
+        return {"status": "no_position", "closed": 0, "failed": 0, "cancelled_orders": 0}
+
+    controller.emergency_stop = emergency_stop
+    update = _FakeTelegramUpdate(12345, "/stop")
+
+    result = asyncio.run(controller.global_handler(update, None))
+
+    emas = _emas_module()
+    assert result == emas.ConversationHandler.END
+    assert "청산할 오픈 포지션 없음" in update.message.replies[0][0][0]
+
+
+class _EmergencyExchange:
+    def __init__(self, positions):
+        self.positions = list(positions)
+        self.created = []
+        self.cancel_all_requests = []
+
+    def fetch_positions(self):
+        return list(self.positions)
+
+    def amount_to_precision(self, symbol, amount):
+        return str(round(float(amount), 8)).rstrip("0").rstrip(".")
+
+    def cancel_all_orders(self, symbol):
+        self.cancel_all_requests.append(symbol)
+        return []
+
+    def create_order(self, symbol, order_type, side, amount, price=None, params=None):
+        order = {
+            "id": f"created-{len(self.created) + 1}",
+            "symbol": symbol,
+            "type": order_type,
+            "side": side,
+            "amount": amount,
+            "price": price,
+            "params": dict(params or {}),
+        }
+        self.created.append(order)
+        return order
+
+
+def _emergency_controller(positions):
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+    exchange = _EmergencyExchange(positions)
+    notices = []
+    controller.exchange = exchange
+    controller.engines = {}
+    controller.active_engine = None
+    controller.is_paused = False
+    controller.is_upbit_mode = lambda: False
+    controller.get_active_watchlist = lambda: ["BTC/USDT"]
+    controller._get_current_symbol = lambda: "BTC/USDT"
+
+    async def notify(message):
+        notices.append(message)
+
+    controller.notify = notify
+    return controller, exchange, notices
+
+
+def test_emergency_stop_closes_binance_position_amt_when_contracts_missing():
+    controller, exchange, notices = _emergency_controller([
+        {
+            "symbol": "BTC/USDT:USDT",
+            "contracts": None,
+            "side": None,
+            "unrealizedPnl": "1.25",
+            "info": {
+                "symbol": "BTCUSDT",
+                "positionAmt": "-0.25",
+                "positionSide": "BOTH",
+            },
+        }
+    ])
+
+    result = asyncio.run(controller.emergency_stop())
+
+    assert result["status"] == "closed"
+    assert result["closed"] == 1
+    assert result["failed"] == 0
+    assert controller.is_paused is True
+    assert exchange.created[0]["symbol"] == "BTC/USDT"
+    assert exchange.created[0]["side"] == "buy"
+    assert exchange.created[0]["amount"] == "0.25"
+    assert exchange.created[0]["params"]["reduceOnly"] is True
+    assert any("청산 완료" in notice for notice in notices)
+
+
 class _ResettableSignalEngine:
     def __init__(self):
         self.scanner_active_symbol = "ETH/USDT"
@@ -690,15 +784,19 @@ def test_protection_audit_deduplicates_short_stop_loss_orders():
     assert remaining_ids == {"sl-new", "tp"}
 
 
-def test_utbreakout_defaults_enable_partial_trailing_and_short_guard():
+def test_utbreakout_defaults_enable_fixed_tp_ladder_and_disable_runner():
     emas = _emas_module()
 
     cfg = emas.build_default_utbot_filtered_breakout_config()
 
+    assert cfg["fixed_take_profit_enabled"] is True
     assert cfg["partial_take_profit_enabled"] is True
     assert cfg["partial_take_profit_r_multiple"] == 1.5
     assert cfg["partial_take_profit_ratio"] == 0.5
-    assert cfg["atr_trailing_enabled"] is True
+    assert cfg["second_take_profit_enabled"] is True
+    assert cfg["second_take_profit_r_multiple"] == 2.0
+    assert cfg["second_take_profit_ratio"] == 0.5
+    assert cfg["atr_trailing_enabled"] is False
     assert cfg["atr_trailing_multiplier"] == 2.0
     assert cfg["atr_trailing_activation_r"] == 1.5
     assert cfg["short_conservative_enabled"] is True
@@ -713,9 +811,9 @@ def test_utbreakout_defaults_enable_partial_trailing_and_short_guard():
     assert cfg["volatility_target_atr_pct"] == 1.0
     assert cfg["meta_labeling_enabled"] is True
     assert cfg["short_asymmetry_enabled"] is True
-    assert cfg["shadow_runner_exit_enabled"] is True
-    assert cfg["runner_exit_enabled"] is True
-    assert cfg["runner_chandelier_enabled"] is True
+    assert cfg["shadow_runner_exit_enabled"] is False
+    assert cfg["runner_exit_enabled"] is False
+    assert cfg["runner_chandelier_enabled"] is False
     assert cfg["runner_chandelier_multiplier"] == 2.4
     assert cfg["trend_health_enabled"] is True
 
@@ -996,6 +1094,43 @@ def test_place_tp_sl_orders_uses_partial_tp_quantity_and_full_sl_quantity():
     assert float(stop_order["params"]["stopPrice"]) == 90.0
     assert float(tp_order["amount"]) == 1.0
     assert float(tp_order["price"]) == 115.0
+
+
+def test_place_tp_sl_orders_can_place_utbreakout_split_tp_ladder():
+    emas = _emas_module()
+    pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "2", "entryPrice": "100"}
+    engine = _protection_engine([], positions=[pos])
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": emas.UTBOT_FILTERED_BREAKOUT_STRATEGY
+    }
+
+    async def _get_position(symbol, use_cache=False):
+        return pos
+
+    engine.get_server_position = _get_position
+
+    asyncio.run(
+        engine._place_tp_sl_orders(
+            "BTC/USDT",
+            "long",
+            100,
+            "2",
+            sl_distance=10,
+            tp_targets=[
+                {"label": "TP1", "kind": "tp1", "distance": 15, "qty_ratio": 0.5},
+                {"label": "TP2", "kind": "tp2", "distance": 20, "qty_ratio": 0.5},
+            ],
+        )
+    )
+
+    tp_orders = [order for order in engine.exchange.created if order["type"] == "limit"]
+    stop_order = next(order for order in engine.exchange.created if order["type"] == "stop_market")
+    assert [float(order["amount"]) for order in tp_orders] == [1.0, 1.0]
+    assert [float(order["price"]) for order in tp_orders] == [115.0, 120.0]
+    assert float(stop_order["amount"]) == 2.0
+    assert float(stop_order["params"]["stopPrice"]) == 90.0
+    assert engine.last_protection_order_status["BTC/USDT"]["tp_count"] == 2
+    assert engine.last_protection_order_status["BTC/USDT"]["sl_count"] == 1
 
 
 def test_utbreakout_trailing_replaces_sl_and_keeps_partial_tp_order():
