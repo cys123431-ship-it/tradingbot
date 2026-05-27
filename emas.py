@@ -19004,8 +19004,8 @@ class MainController:
             'side': side,
             'contracts': contracts,
             'raw_position': position,
-            'pnl': self._to_float_safe(position.get('unrealizedPnl') or info.get('unRealizedProfit')),
-            'mark_price': self._to_float_safe(position.get('markPrice') or info.get('markPrice')),
+            'pnl': _safe_float_or_none(position.get('unrealizedPnl') or info.get('unRealizedProfit')) or 0.0,
+            'mark_price': _safe_float_or_none(position.get('markPrice') or info.get('markPrice')) or 0.0,
         }
 
     def _safe_emergency_amount(self, symbol, contracts):
