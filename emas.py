@@ -427,6 +427,19 @@ def build_utbreakout_set_registry():
         'short_conservative_enabled': True,
         'short_risk_multiplier': 0.5,
         'short_adx_threshold': 22.0,
+        'bias_continuation_enabled': True,
+        'bias_continuation_risk_multiplier': 0.65,
+        'bias_continuation_15m_risk_multiplier': 0.50,
+        'bias_continuation_max_signal_age_candles': 6,
+        'bias_continuation_15m_max_signal_age_candles': 3,
+        'bias_continuation_min_adx': 22.0,
+        'bias_continuation_15m_min_adx': 25.0,
+        'bias_continuation_min_volume_ratio': 0.85,
+        'bias_continuation_15m_min_volume_ratio': 1.00,
+        'bias_continuation_max_extension_atr': 1.35,
+        'bias_continuation_15m_max_extension_atr': 1.00,
+        'bias_continuation_min_adaptive_tf_score': 48.0,
+        'bias_continuation_15m_min_adaptive_tf_score': 62.0,
         'market_quality_enabled': True,
         'regime_filter_enabled': False,
         'meta_sizing_enabled': False,
@@ -680,6 +693,19 @@ def build_default_utbot_filtered_breakout_config():
         'short_conservative_enabled': True,
         'short_risk_multiplier': 0.5,
         'short_adx_threshold': 22.0,
+        'bias_continuation_enabled': True,
+        'bias_continuation_risk_multiplier': 0.65,
+        'bias_continuation_15m_risk_multiplier': 0.50,
+        'bias_continuation_max_signal_age_candles': 6,
+        'bias_continuation_15m_max_signal_age_candles': 3,
+        'bias_continuation_min_adx': 22.0,
+        'bias_continuation_15m_min_adx': 25.0,
+        'bias_continuation_min_volume_ratio': 0.85,
+        'bias_continuation_15m_min_volume_ratio': 1.00,
+        'bias_continuation_max_extension_atr': 1.35,
+        'bias_continuation_15m_max_extension_atr': 1.00,
+        'bias_continuation_min_adaptive_tf_score': 48.0,
+        'bias_continuation_15m_min_adaptive_tf_score': 62.0,
         'market_quality_enabled': True,
         'regime_filter_enabled': False,
         'meta_sizing_enabled': False,
@@ -4383,7 +4409,17 @@ class SignalEngine(BaseEngine):
             'short_partial_take_profit_r_delta': 0.20,
             'short_partial_take_profit_ratio_add': 0.10,
             'short_atr_trailing_multiplier_delta': 0.25,
-            'short_atr_trailing_activation_r_delta': 0.20
+            'short_atr_trailing_activation_r_delta': 0.20,
+            'bias_continuation_risk_multiplier': 0.65,
+            'bias_continuation_15m_risk_multiplier': 0.50,
+            'bias_continuation_min_adx': 22.0,
+            'bias_continuation_15m_min_adx': 25.0,
+            'bias_continuation_min_volume_ratio': 0.85,
+            'bias_continuation_15m_min_volume_ratio': 1.00,
+            'bias_continuation_max_extension_atr': 1.35,
+            'bias_continuation_15m_max_extension_atr': 1.00,
+            'bias_continuation_min_adaptive_tf_score': 48.0,
+            'bias_continuation_15m_min_adaptive_tf_score': 62.0,
         }.items():
             min_value = None if key == 'opposite_set_exit_min_pnl_usdt' else 0.0
             _float(key, default, min_value)
@@ -4412,7 +4448,9 @@ class SignalEngine(BaseEngine):
             'strategy_quality_rebound_lookback': 12,
             'adaptive_exit_min_samples': 8,
             'adaptive_exit_lookback_days': 14,
-            'meta_labeling_min_samples': 12
+            'meta_labeling_min_samples': 12,
+            'bias_continuation_max_signal_age_candles': 6,
+            'bias_continuation_15m_max_signal_age_candles': 3,
         }.items():
             min_value = 0 if key == 'opposite_set_exit_min_hold_candles' else 1
             _int(key, default, min_value)
@@ -4491,6 +4529,7 @@ class SignalEngine(BaseEngine):
             'drawdown_brake_enabled',
             'adaptive_exit_v2_enabled',
             'walk_forward_report_enabled',
+            'bias_continuation_enabled',
         ):
             cfg[key] = bool(cfg.get(key, False))
         if bool(cfg.get('fixed_take_profit_enabled', True)):
@@ -6334,6 +6373,290 @@ class SignalEngine(BaseEngine):
         quality = self._evaluate_utbreakout_market_quality(side, cfg, values)
         return ("시장 품질 게이트", quality.get('state'), quality.get('summary'))
 
+    def _evaluate_utbreakout_bias_continuation(self, side, cfg, status, values, selected_set=None):
+        side = str(side or '').lower()
+        cfg = dict(cfg or {})
+        status = dict(status or {})
+        values = dict(values or {})
+
+        def _f(key):
+            value = values.get(key)
+            if self._is_valid_number(value):
+                return float(value)
+            return None
+
+        def _sf(key):
+            value = status.get(key)
+            if self._is_valid_number(value):
+                return float(value)
+            return None
+
+        def _cfg_float(key, default):
+            try:
+                return float(cfg.get(key, default) or default)
+            except (TypeError, ValueError):
+                return float(default)
+
+        def _cfg_int(key, default):
+            try:
+                return int(cfg.get(key, default) or default)
+            except (TypeError, ValueError):
+                return int(default)
+
+        candidate_type = str(status.get('candidate_type') or '').lower()
+        if side not in {'long', 'short'}:
+            return {
+                'enabled': True,
+                'state': False,
+                'risk_multiplier': 0.0,
+                'summary': 'BLOCK: invalid side',
+                'reasons': ['invalid side'],
+                'positives': [],
+            }
+        if candidate_type not in {'bias_state', 'bias_continuation'}:
+            return {
+                'enabled': bool(cfg.get('bias_continuation_enabled', True)),
+                'state': True,
+                'risk_multiplier': 1.0,
+                'summary': 'fresh signal',
+                'reasons': [],
+                'positives': ['fresh signal'],
+            }
+        if not bool(cfg.get('bias_continuation_enabled', True)):
+            return {
+                'enabled': False,
+                'state': True,
+                'risk_multiplier': 1.0,
+                'summary': 'OFF',
+                'reasons': ['OFF'],
+                'positives': [],
+            }
+
+        entry_tf = str(cfg.get('entry_timeframe', status.get('entry_timeframe', '15m')) or '15m').lower()
+        tf_ms = self._timeframe_to_ms(entry_tf) or (15 * 60 * 1000)
+        is_fast_tf = tf_ms <= 15 * 60 * 1000
+        risk_multiplier = _cfg_float('bias_continuation_risk_multiplier', 0.65)
+        if is_fast_tf:
+            risk_multiplier = min(
+                risk_multiplier,
+                _cfg_float('bias_continuation_15m_risk_multiplier', 0.50),
+            )
+        risk_multiplier = max(0.0, min(1.0, risk_multiplier))
+
+        reasons = []
+        positives = []
+        selected_score = None
+        signal_age_candles = None
+        extension_atr = None
+
+        selected_id = None
+        if isinstance(selected_set, dict):
+            selected_id = selected_set.get('id')
+        if selected_id is None:
+            selected_id = status.get('auto_selected_set_id') or cfg.get('active_set_id')
+        try:
+            selected_id = int(selected_id)
+        except (TypeError, ValueError):
+            selected_id = None
+        if selected_id in {49, 50}:
+            reasons.append(f"Set{selected_id} fallback not allowed for bias continuation")
+
+        decision_ts = _sf('decision_candle_ts')
+        signal_ts = _sf('ut_signal_ts')
+        max_age = (
+            _cfg_int('bias_continuation_15m_max_signal_age_candles', 3)
+            if is_fast_tf else
+            _cfg_int('bias_continuation_max_signal_age_candles', 6)
+        )
+        if decision_ts is None or signal_ts is None or signal_ts <= 0 or decision_ts <= 0 or signal_ts > decision_ts:
+            reasons.append('UT signal age missing')
+        else:
+            signal_age_candles = (decision_ts - signal_ts) / max(float(tf_ms), 1.0)
+            if signal_age_candles > max_age:
+                reasons.append(f"UT signal stale {signal_age_candles:.1f}>{max_age} candles")
+            else:
+                positives.append(f"UT age {signal_age_candles:.1f}/{max_age} candles")
+
+        if bool(cfg.get('adaptive_timeframe_enabled', False)):
+            adaptive = status.get('adaptive_timeframe_decision')
+            if not isinstance(adaptive, dict):
+                adaptive = cfg.get('_adaptive_timeframe_decision') if isinstance(cfg.get('_adaptive_timeframe_decision'), dict) else {}
+            if self._is_valid_number(adaptive.get('selected_score')):
+                selected_score = float(adaptive.get('selected_score'))
+            min_score = (
+                _cfg_float('bias_continuation_15m_min_adaptive_tf_score', 62.0)
+                if is_fast_tf else
+                _cfg_float('bias_continuation_min_adaptive_tf_score', 48.0)
+            )
+            if selected_score is None:
+                reasons.append('adaptive TF score missing')
+            elif selected_score < min_score:
+                reasons.append(f"adaptive TF score {selected_score:.1f}<{min_score:.1f}")
+            else:
+                positives.append(f"adaptive TF score {selected_score:.1f}>={min_score:.1f}")
+
+        adx = _f('adx')
+        plus_di = _f('plus_di')
+        minus_di = _f('minus_di')
+        min_adx = (
+            _cfg_float('bias_continuation_15m_min_adx', 25.0)
+            if is_fast_tf else
+            _cfg_float('bias_continuation_min_adx', 22.0)
+        )
+        if adx is None or plus_di is None or minus_di is None:
+            reasons.append('ADX/DMI missing')
+        else:
+            dmi_ok = plus_di > minus_di if side == 'long' else minus_di > plus_di
+            if adx < min_adx:
+                reasons.append(f"ADX {adx:.1f}<{min_adx:.1f}")
+            if not dmi_ok:
+                reasons.append(f"DMI against +DI {plus_di:.1f} / -DI {minus_di:.1f}")
+            if adx >= min_adx and dmi_ok:
+                positives.append(f"ADX/DMI aligned {adx:.1f}")
+
+        close_value = _f('entry_price')
+        open_value = _f('open')
+        ema50 = _f('ema50')
+        ema50_prev = _f('ema50_prev')
+        ema_ok = False
+        if close_value is not None and ema50 is not None and ema50_prev is not None:
+            if side == 'long':
+                ema_ok = close_value >= ema50 and ema50 >= ema50_prev
+            else:
+                ema_ok = close_value <= ema50 and ema50 <= ema50_prev
+
+        htf_ok = False
+        htf_supertrend_direction = str(values.get('htf_supertrend_direction') or '').lower()
+        if htf_supertrend_direction == side:
+            htf_ok = True
+        if bool(values.get('htf_ready')):
+            htf_close = _f('htf_close')
+            htf_fast = _f('htf_ema_fast')
+            htf_slow = _f('htf_ema_slow')
+            if htf_close is not None and htf_fast is not None and htf_slow is not None:
+                if side == 'long' and htf_close > htf_slow and htf_fast > htf_slow:
+                    htf_ok = True
+                elif side == 'short' and htf_close < htf_slow and htf_fast < htf_slow:
+                    htf_ok = True
+        if not (ema_ok or htf_ok):
+            reasons.append('trend alignment missing')
+        else:
+            positives.append('trend aligned')
+
+        atr_pct = _f('atr_pct')
+        max_extension = (
+            _cfg_float('bias_continuation_15m_max_extension_atr', 1.00)
+            if is_fast_tf else
+            _cfg_float('bias_continuation_max_extension_atr', 1.35)
+        )
+        extension_refs = []
+        if close_value is None or atr_pct is None or atr_pct <= 0:
+            reasons.append('ATR extension data missing')
+        else:
+            for label, key in (('EMA50', 'ema50'), ('VWAP', 'vwap'), ('BB mid', 'bb_mid')):
+                ref = _f(key)
+                if ref is None or ref <= 0:
+                    continue
+                dist_pct = abs(close_value - ref) / max(abs(close_value), 1e-9) * 100.0
+                extension_refs.append((dist_pct / max(atr_pct, 1e-9), label, ref))
+            if not extension_refs:
+                reasons.append('extension reference missing')
+            else:
+                extension_atr, extension_label, _ = min(extension_refs, key=lambda item: item[0])
+                if extension_atr > max_extension:
+                    reasons.append(f"extension {extension_atr:.2f}ATR>{max_extension:.2f}ATR from {extension_label}")
+                else:
+                    positives.append(f"extension {extension_atr:.2f}ATR")
+
+        volume_ratio = _f('volume_ratio')
+        min_volume = (
+            _cfg_float('bias_continuation_15m_min_volume_ratio', 1.00)
+            if is_fast_tf else
+            _cfg_float('bias_continuation_min_volume_ratio', 0.85)
+        )
+        if volume_ratio is None:
+            if is_fast_tf:
+                reasons.append('volume ratio missing')
+            else:
+                positives.append('volume neutral')
+        elif volume_ratio < min_volume:
+            reasons.append(f"volume ratio {volume_ratio:.2f}<{min_volume:.2f}")
+        else:
+            positives.append(f"volume ratio {volume_ratio:.2f}>={min_volume:.2f}")
+
+        pullback_ok = False
+        rebreak_ok = False
+        flow_ok = False
+        if close_value is not None and atr_pct is not None and atr_pct > 0:
+            for _, key in (('EMA50', 'ema50'), ('VWAP', 'vwap'), ('BB mid', 'bb_mid')):
+                ref = _f(key)
+                if ref is None or ref <= 0:
+                    continue
+                dist_pct = abs(close_value - ref) / max(abs(close_value), 1e-9) * 100.0
+                dist_atr = dist_pct / max(atr_pct, 1e-9)
+                if side == 'long':
+                    pullback_ok = pullback_ok or (close_value >= ref and dist_atr <= max_extension)
+                else:
+                    pullback_ok = pullback_ok or (close_value <= ref and dist_atr <= max_extension)
+            if side == 'long':
+                for key in ('donchian_high_prev', 'keltner_upper', 'bb_upper'):
+                    level = _f(key)
+                    rebreak_ok = rebreak_ok or (level is not None and close_value > level)
+            else:
+                for key in ('donchian_low_prev', 'keltner_lower', 'bb_lower'):
+                    level = _f(key)
+                    rebreak_ok = rebreak_ok or (level is not None and close_value < level)
+            range_expansion = _f('range_expansion_ratio')
+            candle_ok = True
+            if open_value is not None:
+                candle_ok = close_value >= open_value if side == 'long' else close_value <= open_value
+            flow_ok = (
+                volume_ratio is not None
+                and volume_ratio >= min_volume
+                and range_expansion is not None
+                and range_expansion >= 1.05
+                and candle_ok
+            )
+        if not (pullback_ok or rebreak_ok or flow_ok):
+            reasons.append('no pullback/rebreak/flow continuation setup')
+        else:
+            setup_parts = []
+            if pullback_ok:
+                setup_parts.append('pullback')
+            if rebreak_ok:
+                setup_parts.append('rebreak')
+            if flow_ok:
+                setup_parts.append('flow')
+            positives.append('setup ' + '/'.join(setup_parts))
+
+        if reasons:
+            return {
+                'enabled': True,
+                'state': False,
+                'risk_multiplier': 0.0,
+                'summary': 'BLOCK: ' + '; '.join(reasons[:5]),
+                'reasons': reasons,
+                'positives': positives,
+                'signal_age_candles': signal_age_candles,
+                'extension_atr': extension_atr,
+                'selected_tf_score': selected_score,
+            }
+        return {
+            'enabled': True,
+            'state': True,
+            'risk_multiplier': round(risk_multiplier, 4),
+            'summary': f"PASS x{risk_multiplier:.2f}: " + '; '.join(positives[:5]),
+            'reasons': [],
+            'positives': positives,
+            'signal_age_candles': signal_age_candles,
+            'extension_atr': extension_atr,
+            'selected_tf_score': selected_score,
+        }
+
+    def _build_utbreakout_bias_continuation_status_item(self, side, cfg, status, values, selected_set=None):
+        continuation = self._evaluate_utbreakout_bias_continuation(side, cfg, status, values, selected_set)
+        return ("Bias continuation", continuation.get('state'), continuation.get('summary'))
+
     def _calculate_utbreakout_directional_efficiency(self, closed, lookback=12):
         try:
             if closed is None or len(closed) < 3:
@@ -6855,6 +7178,11 @@ class SignalEngine(BaseEngine):
                 'prediction_edge': _safe_float_or_none(status.get('prediction_edge')),
                 'prediction_score': _safe_float_or_none(status.get('prediction_score')),
                 'prediction_title': status.get('prediction_title'),
+                'bias_continuation_summary': status.get('bias_continuation_summary'),
+                'bias_continuation_risk_multiplier': _safe_float_or_none(status.get('bias_continuation_risk_multiplier')),
+                'bias_continuation_signal_age_candles': _safe_float_or_none(status.get('bias_continuation_signal_age_candles')),
+                'bias_continuation_extension_atr': _safe_float_or_none(status.get('bias_continuation_extension_atr')),
+                'bias_continuation_selected_tf_score': _safe_float_or_none(status.get('bias_continuation_selected_tf_score')),
                 'market_quality_summary': status.get('market_quality_summary'),
                 'market_quality_risk_multiplier': _safe_float_or_none(status.get('market_quality_risk_multiplier')),
                 'market_regime_summary': status.get('market_regime_summary'),
@@ -6908,6 +7236,11 @@ class SignalEngine(BaseEngine):
                     'second_take_profit_ratio': _safe_float_or_none(plan.get('second_take_profit_ratio')),
                     'atr_trailing_multiplier': _safe_float_or_none(plan.get('atr_trailing_multiplier')),
                     'atr_trailing_activation_r': _safe_float_or_none(plan.get('atr_trailing_activation_r')),
+                    'bias_continuation_summary': plan.get('bias_continuation_summary'),
+                    'bias_continuation_risk_multiplier': _safe_float_or_none(plan.get('bias_continuation_risk_multiplier')),
+                    'bias_continuation_signal_age_candles': _safe_float_or_none(plan.get('bias_continuation_signal_age_candles')),
+                    'bias_continuation_extension_atr': _safe_float_or_none(plan.get('bias_continuation_extension_atr')),
+                    'bias_continuation_selected_tf_score': _safe_float_or_none(plan.get('bias_continuation_selected_tf_score')),
                     'strategy_adaptive_risk_multiplier': _safe_float_or_none(plan.get('strategy_adaptive_risk_multiplier')),
                     'selector_quality_risk_multiplier': _safe_float_or_none(plan.get('selector_quality_risk_multiplier')),
                     'selector_quality_score': _safe_float_or_none(plan.get('selector_quality_score')),
@@ -7363,6 +7696,36 @@ class SignalEngine(BaseEngine):
         }
         filter_values = self._enrich_utbreakout_trend_health_values(filter_values, closed, cfg, atr_series)
         filter_values = self._enrich_utbreakout_strategy_quality_values(filter_values, closed, cfg)
+        bias_continuation_multiplier = 1.0
+        if candidate_type == 'bias_state':
+            bias_continuation = self._evaluate_utbreakout_bias_continuation(
+                side,
+                cfg,
+                status,
+                filter_values,
+                selected_set,
+            )
+            bias_continuation_multiplier = min(
+                1.0,
+                max(0.0, float(bias_continuation.get('risk_multiplier', 1.0) or 0.0))
+            )
+            status['bias_continuation'] = bias_continuation
+            status['bias_continuation_summary'] = bias_continuation.get('summary')
+            status['bias_continuation_risk_multiplier'] = bias_continuation_multiplier
+            status['bias_continuation_signal_age_candles'] = bias_continuation.get('signal_age_candles')
+            status['bias_continuation_extension_atr'] = bias_continuation.get('extension_atr')
+            status['bias_continuation_selected_tf_score'] = bias_continuation.get('selected_tf_score')
+            if bias_continuation.get('state') is not True:
+                return _finish(
+                    None,
+                    f"REJECTED_BIAS_CONTINUATION: {bias_continuation.get('summary')}",
+                    'REJECTED_BIAS_CONTINUATION',
+                    record_failure=True,
+                    side=side
+                )
+            if bias_continuation.get('enabled', True):
+                candidate_type = 'bias_continuation'
+                status['candidate_type'] = candidate_type
         filter_items = self._evaluate_utbreakout_set_filter_items(side, selected_set, cfg, filter_values)
         status['set_filter_items'] = filter_items
         for item in filter_items:
@@ -7483,6 +7846,9 @@ class SignalEngine(BaseEngine):
             risk_per_trade_percent *= short_risk_multiplier
             max_risk_per_trade_usdt *= short_risk_multiplier
             status['short_risk_multiplier'] = short_risk_multiplier
+        if bias_continuation_multiplier < 0.999:
+            risk_per_trade_percent *= bias_continuation_multiplier
+            max_risk_per_trade_usdt *= bias_continuation_multiplier
         if market_quality_multiplier < 0.999:
             risk_per_trade_percent *= market_quality_multiplier
             max_risk_per_trade_usdt *= market_quality_multiplier
@@ -7531,6 +7897,11 @@ class SignalEngine(BaseEngine):
             'atr_trailing_activation_r': float(cfg.get('atr_trailing_activation_r', 1.5) or 1.5),
             'short_conservative_enabled': bool(cfg.get('short_conservative_enabled', True)),
             'short_risk_multiplier': float(cfg.get('short_risk_multiplier', 0.5) or 0.5),
+            'bias_continuation_summary': status.get('bias_continuation_summary'),
+            'bias_continuation_risk_multiplier': bias_continuation_multiplier,
+            'bias_continuation_signal_age_candles': status.get('bias_continuation_signal_age_candles'),
+            'bias_continuation_extension_atr': status.get('bias_continuation_extension_atr'),
+            'bias_continuation_selected_tf_score': status.get('bias_continuation_selected_tf_score'),
             'market_quality_enabled': bool(cfg.get('market_quality_enabled', True)),
             'market_quality_risk_multiplier': market_quality_multiplier,
             'market_quality_summary': market_quality.get('summary'),
@@ -7568,7 +7939,12 @@ class SignalEngine(BaseEngine):
             ut_stop=ut_detail.get('curr_stop'),
             total_balance=total_balance,
             free_balance=free_balance,
-            market_quality_risk_multiplier=market_quality_multiplier * strategy_risk_multiplier * selector_quality_multiplier,
+            market_quality_risk_multiplier=(
+                bias_continuation_multiplier
+                * market_quality_multiplier
+                * strategy_risk_multiplier
+                * selector_quality_multiplier
+            ),
         )
         if micro_reject:
             code = micro_reject.get('reject_code') or 'REJECTED_MICRO_AUTO'
@@ -8018,6 +8394,24 @@ class SignalEngine(BaseEngine):
             items = [
                 ("UTBot 방향", ut_state, ut_detail_text),
             ]
+            if candidate_side == side and candidate_type == 'bias_state':
+                bias_status = {
+                    'candidate_type': candidate_type,
+                    'decision_candle_ts': decision_ts,
+                    'ut_signal_ts': ut_detail.get('signal_ts'),
+                    'adaptive_timeframe_decision': adaptive_decision,
+                    'auto_selected_set_id': selected_set.get('id') if isinstance(selected_set, dict) else None,
+                    'entry_timeframe': entry_tf,
+                }
+                items.append(
+                    self._build_utbreakout_bias_continuation_status_item(
+                        side,
+                        cfg,
+                        bias_status,
+                        filter_values,
+                        selected_set,
+                    )
+                )
             items.extend((item.get('name'), item.get('state'), item.get('detail')) for item in selected_items)
             if side == 'short':
                 items.append(self._build_utbreakout_short_guard_status_item(cfg, filter_values))
@@ -8238,6 +8632,7 @@ class SignalEngine(BaseEngine):
         if len(closed) < 5:
             return f"UT Breakout 진입 분석\n\n심볼: {display_symbol}\nTF: {entry_tf}\n유효 마감봉 데이터 부족"
 
+        adaptive_state = {}
         if cfg.get('adaptive_timeframe_enabled'):
             adaptive_state = self.utbreakout_adaptive_tf_state.get(symbol, {}) or {}
             selected_tf = adaptive_state.get('selected_tf')
@@ -8394,6 +8789,32 @@ class SignalEngine(BaseEngine):
             'htf_supertrend_reason': htf_supertrend_reason,
         }
         long_filter_items = self._evaluate_utbreakout_set_filter_items('long', selected_set, cfg, filter_values)
+        bias_continuation_ok = True
+        bias_continuation_summary = "fresh/waiting"
+        if candidate_side == 'long' and candidate_type == 'bias_state':
+            bias_status = {
+                'candidate_type': candidate_type,
+                'decision_candle_ts': decision_ts,
+                'ut_signal_ts': ut_detail.get('signal_ts'),
+                'auto_selected_set_id': selected_set.get('id') if isinstance(selected_set, dict) else None,
+                'entry_timeframe': entry_tf,
+                'adaptive_timeframe_decision': {
+                    'selected_score': adaptive_state.get('selected_score'),
+                    'selected_tf': adaptive_state.get('selected_tf'),
+                    'decision': adaptive_state.get('last_decision'),
+                },
+            }
+            bias_continuation = self._evaluate_utbreakout_bias_continuation(
+                'long',
+                cfg,
+                bias_status,
+                filter_values,
+                selected_set,
+            )
+            bias_continuation_ok = bias_continuation.get('state') is True
+            bias_continuation_summary = bias_continuation.get('summary') or "n/a"
+            if not bias_continuation_ok:
+                blockers.append(f"Bias continuation 미통과: {bias_continuation_summary}")
         failed_filters = [item for item in long_filter_items if item.get('state') is not True]
         if selected_set.get('status') != 'active':
             blockers.append(f"Set{selected_set.get('id')}은 실거래 연결 상태가 아님")
@@ -8561,6 +8982,7 @@ class SignalEngine(BaseEngine):
         core_ok = (
             candidate_side == 'long'
             and selected_set.get('status') == 'active'
+            and bias_continuation_ok
             and not failed_filters
             and daily_ok
             and risk_plan is not None
@@ -8628,7 +9050,8 @@ class SignalEngine(BaseEngine):
             f"- UT 후보: {str(candidate_side or 'none').upper()} ({candidate_type}) / fresh {str(ut_sig or 'none').upper()} / bias {str(ut_bias_side or 'none').upper()}",
             f"- 선택 Set: Set{selected_set.get('id')} {selected_set.get('name')} ({selected_set.get('status')})",
             f"- AUTO 이유: {auto_reason or '수동 선택'}",
-            f"- LONG 핵심: UT {_ok_text(candidate_side == 'long')} / Set필터 {_ok_text(not failed_filters)} / 일일리스크 {_ok_text(daily_ok)} / 리스크계획 {_ok_text(risk_plan is not None)}",
+            f"- LONG 핵심: UT {_ok_text(candidate_side == 'long')} / BiasCont {_ok_text(bias_continuation_ok)} / Set필터 {_ok_text(not failed_filters)} / 일일리스크 {_ok_text(daily_ok)} / 리스크계획 {_ok_text(risk_plan is not None)}",
+            f"- Bias continuation: {bias_continuation_summary}",
             f"- 일일리스크 상세: {daily_detail}",
             "",
             "3) LONG 필터 상세",

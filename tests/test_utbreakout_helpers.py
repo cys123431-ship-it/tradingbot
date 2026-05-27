@@ -802,6 +802,12 @@ def test_utbreakout_defaults_enable_fixed_tp_ladder_and_disable_runner():
     assert cfg["short_conservative_enabled"] is True
     assert cfg["short_risk_multiplier"] == 0.5
     assert cfg["short_adx_threshold"] == 22.0
+    assert cfg["bias_continuation_enabled"] is True
+    assert cfg["bias_continuation_risk_multiplier"] == 0.65
+    assert cfg["bias_continuation_15m_risk_multiplier"] == 0.5
+    assert cfg["bias_continuation_15m_max_signal_age_candles"] == 3
+    assert cfg["bias_continuation_15m_min_adx"] == 25.0
+    assert cfg["bias_continuation_15m_max_extension_atr"] == 1.0
     assert cfg["market_quality_enabled"] is True
     assert cfg["market_quality_data_required"] is False
     assert cfg["market_quality_min_risk_multiplier"] == 0.25
@@ -881,6 +887,113 @@ def test_utbreakout_short_guard_status_item_matches_real_gate():
     assert state is False
     assert "ADX" in detail
     assert "숏 리스크 x0.50" in detail
+
+
+def _bias_continuation_engine_and_cfg():
+    emas = _emas_module()
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    cfg = emas.build_default_utbot_filtered_breakout_config()
+    cfg["entry_timeframe"] = "15m"
+    cfg["adaptive_timeframe_enabled"] = True
+    return engine, cfg
+
+
+def _passing_bias_continuation_values():
+    return {
+        "entry_price": 100.0,
+        "open": 99.6,
+        "ema50": 99.7,
+        "ema50_prev": 99.4,
+        "ema200": 98.0,
+        "vwap": 99.8,
+        "bb_mid": 99.6,
+        "adx": 28.0,
+        "plus_di": 31.0,
+        "minus_di": 16.0,
+        "atr_pct": 0.8,
+        "volume_ratio": 1.2,
+        "range_expansion_ratio": 1.1,
+        "donchian_high_prev": 103.0,
+        "keltner_upper": 101.0,
+        "bb_upper": 102.0,
+        "htf_ready": True,
+        "htf_close": 100.0,
+        "htf_ema_fast": 99.0,
+        "htf_ema_slow": 98.0,
+    }
+
+
+def test_utbreakout_bias_continuation_passes_recent_aligned_15m_state():
+    engine, cfg = _bias_continuation_engine_and_cfg()
+
+    result = engine._evaluate_utbreakout_bias_continuation(
+        "long",
+        cfg,
+        {
+            "candidate_type": "bias_state",
+            "decision_candle_ts": 3 * 900_000,
+            "ut_signal_ts": 1 * 900_000,
+            "adaptive_timeframe_decision": {"selected_score": 70.0},
+        },
+        _passing_bias_continuation_values(),
+        {"id": 7},
+    )
+
+    assert result["state"] is True
+    assert result["risk_multiplier"] == 0.5
+    assert result["signal_age_candles"] == 2.0
+    assert result["extension_atr"] < 1.0
+
+
+def test_utbreakout_bias_continuation_rejects_stale_15m_state():
+    engine, cfg = _bias_continuation_engine_and_cfg()
+
+    result = engine._evaluate_utbreakout_bias_continuation(
+        "long",
+        cfg,
+        {
+            "candidate_type": "bias_state",
+            "decision_candle_ts": 6 * 900_000,
+            "ut_signal_ts": 1 * 900_000,
+            "adaptive_timeframe_decision": {"selected_score": 70.0},
+        },
+        _passing_bias_continuation_values(),
+        {"id": 7},
+    )
+
+    assert result["state"] is False
+    assert "stale" in result["summary"]
+
+
+def test_utbreakout_bias_continuation_rejects_overextended_state():
+    engine, cfg = _bias_continuation_engine_and_cfg()
+    values = _passing_bias_continuation_values()
+    values.update({
+        "entry_price": 105.0,
+        "open": 104.8,
+        "ema50": 100.0,
+        "ema50_prev": 99.7,
+        "vwap": 99.8,
+        "bb_mid": 100.5,
+        "atr_pct": 0.5,
+    })
+
+    result = engine._evaluate_utbreakout_bias_continuation(
+        "long",
+        cfg,
+        {
+            "candidate_type": "bias_state",
+            "decision_candle_ts": 3 * 900_000,
+            "ut_signal_ts": 1 * 900_000,
+            "adaptive_timeframe_decision": {"selected_score": 70.0},
+        },
+        values,
+        {"id": 7},
+    )
+
+    assert result["state"] is False
+    assert "extension" in result["summary"]
 
 
 def test_utbreakout_market_quality_reduces_risk_without_blocking_on_mild_funding():
