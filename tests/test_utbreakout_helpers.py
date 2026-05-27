@@ -310,6 +310,39 @@ class _EmergencyExchange:
         self.cancel_all_requests.append(symbol)
         return []
 
+    def _signed_position_amount(self, position):
+        info = position.get("info", {}) if isinstance(position.get("info"), dict) else {}
+        value = info.get("positionAmt")
+        if value not in (None, ""):
+            return float(value)
+        contracts = float(position.get("contracts", 0) or 0)
+        if str(position.get("side", "")).lower() == "short":
+            return -abs(contracts)
+        return abs(contracts)
+
+    def _symbol_key(self, value):
+        return str(value or "").upper().replace(":USDT", "").replace("/", "")
+
+    def _apply_market_close(self, symbol, side, amount):
+        close_amount = abs(float(amount or 0))
+        if close_amount <= 0:
+            return
+        target_key = self._symbol_key(symbol)
+        for position in self.positions:
+            info = position.setdefault("info", {})
+            pos_symbol = position.get("symbol") or info.get("symbol")
+            if self._symbol_key(pos_symbol) != target_key:
+                continue
+            signed = self._signed_position_amount(position)
+            if side == "buy":
+                signed = min(0.0, signed + close_amount)
+            elif side == "sell":
+                signed = max(0.0, signed - close_amount)
+            info["positionAmt"] = str(signed)
+            position["contracts"] = abs(signed)
+            position["side"] = "long" if signed > 0 else ("short" if signed < 0 else None)
+            return
+
     def create_order(self, symbol, order_type, side, amount, price=None, params=None):
         order = {
             "id": f"created-{len(self.created) + 1}",
@@ -321,6 +354,8 @@ class _EmergencyExchange:
             "params": dict(params or {}),
         }
         self.created.append(order)
+        if str(order_type).lower() == "market" and params and params.get("reduceOnly"):
+            self._apply_market_close(symbol, side, amount)
         return order
 
 
@@ -370,6 +405,61 @@ def test_emergency_stop_closes_binance_position_amt_when_contracts_missing():
     assert exchange.created[0]["amount"] == "0.25"
     assert exchange.created[0]["params"]["reduceOnly"] is True
     assert any("청산 완료" in notice for notice in notices)
+
+
+def test_emergency_stop_retries_until_position_is_flat():
+    class _PartialEmergencyExchange(_EmergencyExchange):
+        def _apply_market_close(self, symbol, side, amount):
+            fill_amount = float(amount) / 2 if len(self.created) == 1 else amount
+            super()._apply_market_close(symbol, side, fill_amount)
+
+    controller, exchange, notices = _emergency_controller([
+        {
+            "symbol": "BTC/USDT:USDT",
+            "contracts": "0.4",
+            "side": "long",
+            "unrealizedPnl": "0",
+            "info": {"symbol": "BTCUSDT", "positionAmt": "0.4", "positionSide": "BOTH"},
+        }
+    ])
+    exchange = _PartialEmergencyExchange(exchange.positions)
+    controller.exchange = exchange
+
+    result = asyncio.run(controller.emergency_stop())
+
+    assert result["status"] == "closed"
+    assert result["closed"] == 1
+    assert len(exchange.created) == 2
+    assert float(exchange.created[0]["amount"]) == 0.4
+    assert float(exchange.created[1]["amount"]) == 0.2
+    assert any("잔여 포지션" in notice for notice in notices)
+
+
+def test_emergency_stop_fails_when_accepted_order_does_not_flatten_position():
+    class _StickyEmergencyExchange(_EmergencyExchange):
+        def _apply_market_close(self, symbol, side, amount):
+            return
+
+    controller, exchange, notices = _emergency_controller([
+        {
+            "symbol": "BTC/USDT:USDT",
+            "contracts": "0.3",
+            "side": "long",
+            "unrealizedPnl": "0",
+            "info": {"symbol": "BTCUSDT", "positionAmt": "0.3", "positionSide": "BOTH"},
+        }
+    ])
+    exchange = _StickyEmergencyExchange(exchange.positions)
+    controller.exchange = exchange
+
+    result = asyncio.run(controller.emergency_stop())
+
+    assert result["status"] == "failed"
+    assert result["closed"] == 0
+    assert result["failed"] == 1
+    assert len(exchange.created) == 5
+    assert "still open" in result["failed_positions"][0]["error"]
+    assert any("청산 실패" in notice for notice in notices)
 
 
 class _ResettableSignalEngine:
@@ -544,6 +634,26 @@ def _protection_engine(orders, symbol_scope_returns=True, positions=None):
     engine.POSITION_CACHE_TTL = 0.0
     engine.is_upbit_mode = lambda: False
     return engine
+
+
+def test_get_server_position_matches_futures_symbol_and_position_amt():
+    position = {
+        "symbol": "BTC/USDT:USDT",
+        "contracts": None,
+        "side": None,
+        "entryPrice": "100",
+        "info": {"symbol": "BTCUSDT", "positionAmt": "-0.25", "positionSide": "BOTH"},
+    }
+    engine = _protection_engine([], positions=[position])
+
+    pos_plain = asyncio.run(engine.get_server_position("BTC/USDT", use_cache=False))
+    pos_swap = asyncio.run(engine.get_server_position("BTC/USDT:USDT", use_cache=False))
+
+    assert pos_plain["symbol"] == "BTC/USDT"
+    assert pos_plain["side"] == "short"
+    assert pos_plain["contracts"] == 0.25
+    assert pos_swap["side"] == "short"
+    assert pos_swap["contracts"] == 0.25
 
 
 def test_protection_audit_cancels_orphan_orders_even_when_symbol_fetch_misses_them():
@@ -1325,6 +1435,37 @@ def test_place_tp_sl_orders_can_place_utbreakout_split_tp_ladder():
     assert float(stop_order["params"]["stopPrice"]) == 90.0
     assert engine.last_protection_order_status["BTC/USDT"]["tp_count"] == 2
     assert engine.last_protection_order_status["BTC/USDT"]["sl_count"] == 1
+
+
+def test_place_tp_sl_orders_uses_position_amt_for_short_futures_symbol():
+    pos = {
+        "symbol": "BTC/USDT:USDT",
+        "contracts": None,
+        "side": None,
+        "entryPrice": "100",
+        "info": {"symbol": "BTCUSDT", "positionAmt": "-2", "positionSide": "BOTH"},
+    }
+    engine = _protection_engine([], positions=[pos])
+
+    asyncio.run(
+        engine._place_tp_sl_orders(
+            "BTC/USDT:USDT",
+            "short",
+            101,
+            "1",
+            tp_distance=10,
+            sl_distance=5,
+        )
+    )
+
+    stop_order = next(order for order in engine.exchange.created if order["type"] == "stop_market")
+    tp_order = next(order for order in engine.exchange.created if order["type"] == "limit")
+    assert stop_order["side"] == "buy"
+    assert float(stop_order["amount"]) == 2.0
+    assert float(stop_order["params"]["stopPrice"]) == 105.0
+    assert tp_order["side"] == "buy"
+    assert float(tp_order["amount"]) == 2.0
+    assert float(tp_order["price"]) == 90.0
 
 
 def test_utbreakout_trailing_replaces_sl_and_keeps_partial_tp_order():

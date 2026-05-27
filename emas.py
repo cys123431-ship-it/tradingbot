@@ -2092,6 +2092,154 @@ class BaseEngine:
             logger.error(f"Price precision error: {e}")
             return str(round(price, 2))
 
+    def _futures_symbol_for_order(self, raw_symbol):
+        text = str(raw_symbol or '').strip().upper()
+        if not text:
+            return ''
+        for suffix in (':USDT', ':USDC', ':BUSD'):
+            text = text.replace(suffix, '')
+        if '/' in text:
+            return text
+        for quote in ('USDT', 'USDC', 'BUSD'):
+            if text.endswith(quote) and len(text) > len(quote):
+                return f"{text[:-len(quote)]}/{quote}"
+        return text
+
+    def _futures_symbol_key(self, value):
+        text = str(value or '').strip().upper()
+        for suffix in (':USDT', ':USDC', ':BUSD'):
+            text = text.replace(suffix, '')
+        return (
+            text
+            .replace('/', '')
+            .replace('-', '')
+            .replace('_', '')
+            .replace(':', '')
+        )
+
+    def _position_numeric_value(self, position, keys):
+        if not isinstance(position, dict):
+            return None
+        info = position.get('info', {}) if isinstance(position.get('info'), dict) else {}
+        for source in (position, info):
+            for key in keys:
+                if key not in source:
+                    continue
+                value = source.get(key)
+                if value in (None, ''):
+                    continue
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def _position_signed_contracts(self, position):
+        if not isinstance(position, dict):
+            return 0.0
+        signed_value = self._position_numeric_value(
+            position,
+            ('positionAmt', 'position_amt', 'pa')
+        )
+        if signed_value is not None:
+            return signed_value
+
+        amount = self._position_numeric_value(
+            position,
+            ('contracts', 'contract', 'amount', 'size', 'qty', 'position')
+        )
+        if amount is None:
+            return 0.0
+        if amount < 0:
+            return amount
+
+        side = str(position.get('side', '') or '').lower()
+        info = position.get('info', {}) if isinstance(position.get('info'), dict) else {}
+        position_side = str(info.get('positionSide', '') or info.get('side', '') or '').lower()
+        if side == 'short' or position_side == 'short':
+            return -abs(amount)
+        return abs(amount)
+
+    def _position_side_for_close(self, position, signed_contracts=None):
+        if signed_contracts is None:
+            signed_contracts = self._position_signed_contracts(position)
+        side = str((position or {}).get('side', '') or '').lower()
+        if side in {'long', 'short'}:
+            return side
+        info = (position or {}).get('info', {}) if isinstance((position or {}).get('info'), dict) else {}
+        raw_position_side = str(info.get('positionSide', '') or info.get('side', '') or '').lower()
+        if raw_position_side in {'long', 'short'}:
+            return raw_position_side
+        if signed_contracts > 0:
+            return 'long'
+        if signed_contracts < 0:
+            return 'short'
+        return ''
+
+    def _position_symbol_for_match(self, position):
+        if not isinstance(position, dict):
+            return ''
+        info = position.get('info', {}) if isinstance(position.get('info'), dict) else {}
+        return str(position.get('symbol') or info.get('symbol') or info.get('pair') or '').strip()
+
+    def _position_matches_symbol(self, position, symbol):
+        position_key = self._futures_symbol_key(self._position_symbol_for_match(position))
+        target_key = self._futures_symbol_key(symbol)
+        target_order_key = self._futures_symbol_key(self._futures_symbol_for_order(symbol))
+        return bool(position_key and position_key in {target_key, target_order_key})
+
+    def _normalize_server_position(self, position, symbol=None):
+        if not isinstance(position, dict):
+            return None
+        if symbol and not self._position_matches_symbol(position, symbol):
+            return None
+        signed_contracts = self._position_signed_contracts(position)
+        contracts = abs(float(signed_contracts or 0.0))
+        if contracts <= 0:
+            return None
+        side = self._position_side_for_close(position, signed_contracts)
+        if side not in {'long', 'short'}:
+            return None
+
+        info = position.get('info', {}) if isinstance(position.get('info'), dict) else {}
+        normalized = dict(position)
+        normalized['symbol'] = (
+            self._futures_symbol_for_order(self._position_symbol_for_match(position))
+            or self._futures_symbol_for_order(symbol)
+            or position.get('symbol')
+        )
+        normalized['side'] = side
+        normalized['contracts'] = contracts
+        for field, keys in {
+            'entryPrice': ('entryPrice', 'entry_price', 'entry_price', 'entryPrice'),
+            'markPrice': ('markPrice', 'mark_price', 'markPrice'),
+            'unrealizedPnl': ('unrealizedPnl', 'unRealizedProfit', 'unrealizedProfit'),
+            'percentage': ('percentage', 'unrealizedPnlPercent'),
+        }.items():
+            if normalized.get(field) not in (None, ''):
+                continue
+            value = self._position_numeric_value(position, keys)
+            if value is not None:
+                normalized[field] = value
+        normalized['raw_position'] = position
+        normalized['positionSide'] = str(info.get('positionSide') or position.get('positionSide') or '').upper()
+        return normalized
+
+    def _close_order_params_for_position(self, position):
+        params = {'reduceOnly': True}
+        raw_position = position.get('raw_position') if isinstance(position, dict) else None
+        raw_position = raw_position if isinstance(raw_position, dict) else position
+        info = raw_position.get('info', {}) if isinstance(raw_position, dict) and isinstance(raw_position.get('info'), dict) else {}
+        position_side = str(
+            (position or {}).get('positionSide')
+            or info.get('positionSide')
+            or (raw_position or {}).get('positionSide')
+            or ''
+        ).upper()
+        if position_side in {'LONG', 'SHORT'}:
+            params['positionSide'] = position_side
+        return params
+
     async def ensure_market_settings(self, symbol, leverage=None):
         """留덉폆 ?ㅼ젙 媛뺤젣 ?곸슜 (寃⑸━ 紐⑤뱶 + ?덈쾭由ъ?)"""
         if self.is_upbit_mode():
@@ -2184,27 +2332,22 @@ class BaseEngine:
                 self.position_cache[symbol] = (found_pos, now)
                 return found_pos
 
-            # fetch_positions??紐⑤뱺 ?ъ??섏쓣 媛?몄삱 ?섎룄 ?덇퀬, params濡??뱀젙???섎룄 ?덉쓬
-            # exchange.fetch_positions([symbol]) ?ъ슜 沅뚯옣
-            positions = await asyncio.to_thread(self.exchange.fetch_positions, [symbol])
-            
-            # ?щ낵 ?뺢퇋??(BTC/USDT -> BTCUSDT)
-            base_symbol = symbol.replace('/', '')
-            
+            try:
+                positions = await asyncio.to_thread(self.exchange.fetch_positions, [symbol])
+            except Exception as scoped_error:
+                logger.debug(f"Scoped position fetch failed for {symbol}: {scoped_error}")
+                positions = await asyncio.to_thread(self.exchange.fetch_positions)
+
             found_pos = None
             for p in positions:
-                pos_symbol = p.get('symbol', '')
-                # ?ㅼ뼇???뺤떇 留ㅼ묶
-                pos_base = pos_symbol.replace('/', '').replace(':USDT', '')
-                
-                if pos_base == base_symbol or pos_symbol == symbol or pos_symbol == f"{symbol}:USDT":
-                    # ?섎웾 0 ?댁긽??寃껊쭔 ?좏슚 ?ъ??섏쑝濡?媛꾩＜? 
-                    # fetch_positions??蹂댄넻 ?대젮?덈뒗 寃껊쭔 二쇨굅?? 0??寃껊룄 以????덉쓬.
-                    # ?ш린??contracts != 0 泥댄겕
-                    if abs(float(p.get('contracts', 0))) > 0:
-                        found_pos = p
-                        logger.debug(f"Position found: {p['symbol']} contracts={p['contracts']}")
-                        break
+                normalized_pos = self._normalize_server_position(p, symbol)
+                if normalized_pos:
+                    found_pos = normalized_pos
+                    logger.debug(
+                        f"Position found: {normalized_pos['symbol']} "
+                        f"side={normalized_pos['side']} contracts={normalized_pos['contracts']}"
+                    )
+                    break
             
             # Update Cache (Key by Symbol)
             self.position_cache[symbol] = (found_pos, now)
@@ -2248,8 +2391,9 @@ class BaseEngine:
             positions = await asyncio.to_thread(self.exchange.fetch_positions)
             active_symbols = set()
             for p in positions:
-                if abs(float(p.get('contracts', 0) or 0)) > 0:
-                    sym = str(p.get('symbol', '')).replace(':USDT', '')
+                normalized_pos = self._normalize_server_position(p)
+                if normalized_pos:
+                    sym = str(normalized_pos.get('symbol', '')).replace(':USDT', '')
                     if sym:
                         active_symbols.add(sym)
             self.all_positions_cache = set(active_symbols)
@@ -2642,13 +2786,14 @@ class TemaEngine(BaseEngine):
             try:
                 all_positions = await asyncio.to_thread(self.exchange.fetch_positions)
                 for p in all_positions:
-                    if float(p.get('contracts', 0)) > 0:
-                        active_sym = p.get('symbol', '').replace(':USDT', '').replace('/', '')
+                    normalized_pos = self._normalize_server_position(p)
+                    if normalized_pos:
+                        active_sym = str(normalized_pos.get('symbol', '')).replace(':USDT', '').replace('/', '')
                         target_sym = symbol.replace(':USDT', '').replace('/', '')
                         
                         if active_sym != target_sym:
-                            logger.warning(f"?슟 [Single Limit] Entry blocked: Already holding {p['symbol']}")
-                            await self.ctrl.notify(f"⚠️ **진입 차단**: 단일 포지션 제한 (보유 중: {p['symbol']})")
+                            logger.warning(f"?슟 [Single Limit] Entry blocked: Already holding {normalized_pos['symbol']}")
+                            await self.ctrl.notify(f"⚠️ **진입 차단**: 단일 포지션 제한 (보유 중: {normalized_pos['symbol']})")
                             return
             except Exception as e:
                 logger.error(f"Single position check failed: {e}")
@@ -17170,13 +17315,12 @@ class SignalEngine(BaseEngine):
 
         active_keys = set()
         for pos in positions or []:
-            try:
-                contracts = abs(float(pos.get('contracts', 0) or 0))
-            except (TypeError, ValueError):
-                contracts = 0.0
-            if contracts <= 0:
+            normalized_pos = self._normalize_server_position(pos)
+            if not normalized_pos:
                 continue
-            symbol_key = self._normalize_protection_symbol(self._protection_position_symbol(pos))
+            symbol_key = self._normalize_protection_symbol(
+                self._protection_position_symbol(normalized_pos)
+            )
             if symbol_key:
                 active_keys.add(symbol_key)
         return active_keys
@@ -17443,7 +17587,7 @@ class SignalEngine(BaseEngine):
             return 'none'
         side = str(pos.get('side', '') or 'unknown').lower()
         try:
-            contracts = round(abs(float(pos.get('contracts', 0) or 0)), 12)
+            contracts = round(abs(float(self._position_signed_contracts(pos) or pos.get('contracts', 0) or 0)), 12)
         except (TypeError, ValueError):
             contracts = 0.0
         try:
@@ -17686,7 +17830,7 @@ class SignalEngine(BaseEngine):
         side = str(pos.get('side', '') or '').lower()
         if side not in {'long', 'short'}:
             return None
-        qty = self.safe_amount(symbol, abs(float(pos.get('contracts', 0) or 0)))
+        qty = self.safe_amount(symbol, abs(float(self._position_signed_contracts(pos) or pos.get('contracts', 0) or 0)))
         if float(qty) <= 0:
             return None
         sl_side = 'sell' if side == 'long' else 'buy'
@@ -18286,60 +18430,90 @@ class SignalEngine(BaseEngine):
             await self._cancel_protection_orders(symbol, reason='exit requested but no position')
             return
         
-        contracts = abs(float(pos['contracts']))
+        contracts = abs(float(pos.get('contracts', 0) or 0))
         if contracts <= 0:
             logger.info("No contracts to exit")
             await self._cancel_protection_orders(symbol, reason='exit requested but zero contracts')
             return
-        
-        qty = self.safe_amount(symbol, contracts)
-        side = 'sell' if pos['side'] == 'long' else 'buy'
-        
-        logger.info(f"Exit params: {side} {qty} (position: {pos['side']} {contracts})")
-        
-        # ?ъ떆??濡쒖쭅 (理쒕? 3??
-        max_retries = 3
+
+        initial_pos = dict(pos)
+        pnl = float(initial_pos.get('unrealizedPnl', 0) or 0)
+        pnl_pct = float(initial_pos.get('percentage', 0) or 0)
+        max_retries = 4
         order = None
         last_error = None
-        
-        for attempt in range(max_retries):
+        remaining_pos = pos
+
+        for attempt in range(1, max_retries + 1):
             try:
+                remaining_contracts = abs(float(remaining_pos.get('contracts', 0) or 0))
+                if remaining_contracts <= 0:
+                    remaining_pos = None
+                    break
+                qty = self.safe_amount(symbol, remaining_contracts)
+                if float(qty) <= 0:
+                    raise ValueError(f"invalid close qty: {qty}")
+                side = 'sell' if remaining_pos['side'] == 'long' else 'buy'
+                params = self._close_order_params_for_position(remaining_pos)
+                logger.info(
+                    f"Exit params attempt {attempt}/{max_retries}: "
+                    f"{side} {qty} (position: {remaining_pos['side']} {remaining_contracts})"
+                )
                 order = await asyncio.to_thread(
                     self.exchange.create_order, symbol, 'market', side, qty, None,
-                    {'reduceOnly': True}
+                    params
                 )
-                break  # ?깃났 ??猷⑦봽 ?덉텧
             except Exception as e:
                 last_error = e
-                logger.error(f"Exit attempt {attempt + 1}/{max_retries} failed: {e}")
-                if attempt < max_retries - 1:
+                logger.error(f"Exit attempt {attempt}/{max_retries} failed: {e}")
+                if attempt < max_retries:
                     await asyncio.sleep(1)  # 1珥??湲????ъ떆??
-                    await self.ctrl.notify(f"⚠️ 청산 재시도 중... ({attempt + 2}/{max_retries})")
-        
-        if not order:
-            logger.error(f"??Exit failed after {max_retries} attempts, trying force close...")
-            await self.ctrl.notify("🚨 청산 실패! 강제 청산을 시도합니다...")
-            
-            # 媛뺤젣 泥?궛: 紐⑤뱺 二쇰Ц 痍⑥냼 ??reduceOnly濡??ъ떆??
-            try:
-                await self._cancel_all_orders_variants(symbol, reason='before force close retry')
-                await self._cancel_protection_orders(symbol, reason='before force close retry')
-                await asyncio.sleep(0.5)
-                
-                # reduceOnly ?듭뀡?쇰줈 媛뺤젣 泥?궛
-                order = await asyncio.to_thread(
-                    self.exchange.create_order, symbol, 'market', side, qty, None,
-                    {'reduceOnly': True}
+                    await self.ctrl.notify(f"⚠️ 청산 재시도 중... ({attempt + 1}/{max_retries})")
+                continue
+
+            await asyncio.sleep(0.8)
+            self.position_cache = None
+            self.position_cache_time = 0
+            remaining_pos = await self.get_server_position(symbol, use_cache=False)
+            if not remaining_pos:
+                break
+
+            remaining_qty = abs(float(remaining_pos.get('contracts', 0) or 0))
+            logger.warning(
+                f"Exit order accepted but position still open: {symbol} "
+                f"{remaining_pos.get('side')} {remaining_qty}"
+            )
+            if attempt < max_retries:
+                await self._cancel_all_orders_variants(symbol, reason=f'exit remaining retry {attempt}')
+                await self._cancel_protection_orders(symbol, reason=f'exit remaining retry {attempt}')
+                await self.ctrl.notify(
+                    f"⚠️ 청산 주문 후 잔여 포지션 확인: {self.ctrl.format_symbol_for_display(symbol)} "
+                    f"{remaining_pos.get('side', '').upper()} `{remaining_qty}`. 재시도합니다."
                 )
-                await self.ctrl.notify("✅ 강제 청산 성공")
-            except Exception as force_e:
-                logger.error(f"Force close also failed: {force_e}")
-                await self.ctrl.notify(f"🚨 강제 청산도 실패했습니다. 즉시 수동 청산이 필요합니다: {force_e}")
-                return
-        
-        pnl = float(pos.get('unrealizedPnl', 0))
-        pnl_pct = float(pos.get('percentage', 0))
-        exit_price = float(order.get('average', 0)) if order.get('average') else float(pos.get('markPrice', 0))
+
+        if remaining_pos:
+            remaining_qty = abs(float(remaining_pos.get('contracts', 0) or 0))
+            logger.error(
+                f"Exit failed to flatten {symbol} after {max_retries} attempts: "
+                f"{remaining_pos.get('side')} {remaining_qty}"
+            )
+            await self._audit_protection_orders(symbol, pos=remaining_pos, alert=True)
+            await self.ctrl.notify(
+                f"🚨 청산 미완료: {self.ctrl.format_symbol_for_display(symbol)} "
+                f"{remaining_pos.get('side', '').upper()} `{remaining_qty}` 잔여. 거래소에서 즉시 수동 확인하세요."
+            )
+            return
+
+        if not order:
+            logger.error(f"Exit failed after {max_retries} attempts: {last_error}")
+            await self.ctrl.notify(f"🚨 청산 실패! 즉시 수동 청산이 필요합니다: {last_error}")
+            return
+
+        exit_price = (
+            float(order.get('average', 0))
+            if isinstance(order, dict) and order.get('average')
+            else float(initial_pos.get('markPrice', 0) or 0)
+        )
         
         # 罹먯떆 ?꾩쟾 臾댄슚??
         self.position_cache = None
@@ -18348,7 +18522,7 @@ class SignalEngine(BaseEngine):
         await self._cancel_protection_orders(symbol, reason='after exit order success')
         await self._reconcile_closed_position_protection(
             symbol,
-            reason='after exit order success',
+            reason='after exit flat confirmed',
             alert=True,
             attempts=3
         )
@@ -19814,6 +19988,18 @@ class MainController:
                 return f"{text[:-len(quote)]}/{quote}"
         return self.normalize_symbol_for_exchange(text)
 
+    def _futures_symbol_key(self, value):
+        text = str(value or '').strip().upper()
+        for suffix in (':USDT', ':USDC', ':BUSD'):
+            text = text.replace(suffix, '')
+        return (
+            text
+            .replace('/', '')
+            .replace('-', '')
+            .replace('_', '')
+            .replace(':', '')
+        )
+
     def _position_numeric_value(self, position, keys):
         if not isinstance(position, dict):
             return None
@@ -19898,7 +20084,40 @@ class MainController:
             'raw_position': position,
             'pnl': _safe_float_or_none(position.get('unrealizedPnl') or info.get('unRealizedProfit')) or 0.0,
             'mark_price': _safe_float_or_none(position.get('markPrice') or info.get('markPrice')) or 0.0,
+            'positionSide': str(info.get('positionSide') or position.get('positionSide') or '').upper(),
         }
+
+    def _emergency_position_matches_symbol(self, position, symbol):
+        normalized_pos = self._normalize_futures_position_for_emergency(position)
+        if not normalized_pos:
+            return False
+        return self._futures_symbol_key(normalized_pos.get('symbol')) == self._futures_symbol_key(symbol)
+
+    async def _fetch_emergency_position_by_symbol(self, symbol):
+        positions = await asyncio.to_thread(self.exchange.fetch_positions)
+        target_key = self._futures_symbol_key(symbol)
+        for p in positions or []:
+            normalized_pos = self._normalize_futures_position_for_emergency(p)
+            if not normalized_pos:
+                continue
+            if self._futures_symbol_key(normalized_pos.get('symbol')) == target_key:
+                return normalized_pos
+        return None
+
+    def _close_order_params_for_position(self, position):
+        params = {'reduceOnly': True}
+        raw_position = position.get('raw_position') if isinstance(position, dict) else None
+        raw_position = raw_position if isinstance(raw_position, dict) else position
+        info = raw_position.get('info', {}) if isinstance(raw_position, dict) and isinstance(raw_position.get('info'), dict) else {}
+        position_side = str(
+            (position or {}).get('positionSide')
+            or info.get('positionSide')
+            or (raw_position or {}).get('positionSide')
+            or ''
+        ).upper()
+        if position_side in {'LONG', 'SHORT'}:
+            params['positionSide'] = position_side
+        return params
 
     def _safe_emergency_amount(self, symbol, contracts):
         try:
@@ -22538,6 +22757,10 @@ class MainController:
                 )
 
         async def close_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            result = await self.emergency_stop()
+            await u.message.reply_text(self._format_emergency_stop_reply(result))
+
+        async def stop_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             result = await self.emergency_stop()
             await u.message.reply_text(self._format_emergency_stop_reply(result))
 
@@ -26039,6 +26262,7 @@ AUTO 최근 선택 이유:
 /prediction - Prediction Micro Auto / Binance Wallet Prediction(Predict.fun) 메뉴
 /log - 최근 로그
 /close - 긴급 청산
+/stop - 긴급 정지 및 포지션 청산
 
 🚨 STOP - 긴급 정지
 ⏸ PAUSE - 일시정지
@@ -26046,6 +26270,7 @@ AUTO 최근 선택 이유:
 """
             await u.message.reply_text(msg.strip(), parse_mode=ParseMode.MARKDOWN)
 
+        self.tg_app.add_handler(CommandHandler("stop", owner_only(stop_cmd)), group=-1)
         emergency_handler = MessageHandler(filters.Regex(emergency_pattern), owner_only(self.global_handler))
         self.tg_app.add_handler(emergency_handler, group=-1)
 
@@ -27054,15 +27279,19 @@ AUTO 최근 선택 이유:
                 
                 # 泥?궛 二쇰Ц
                 try:
-                    side = 'sell' if pos['side'] == 'long' else 'buy'
-                    qty = self._safe_emergency_amount(sym, pos['contracts'])
-                    if float(qty) <= 0:
-                        raise ValueError(f"invalid emergency close qty: {qty}")
                     pnl = float(pos.get('pnl', 0.0) or 0.0)
-                    
                     order = None
                     last_error = None
-                    for attempt in range(1, 4):
+                    current_pos = await self._fetch_emergency_position_by_symbol(sym) or pos
+                    max_close_attempts = 5
+                    for attempt in range(1, max_close_attempts + 1):
+                        if not current_pos:
+                            break
+                        side = 'sell' if current_pos['side'] == 'long' else 'buy'
+                        qty = self._safe_emergency_amount(sym, current_pos['contracts'])
+                        if float(qty) <= 0:
+                            raise ValueError(f"invalid emergency close qty: {qty}")
+                        params = self._close_order_params_for_position(current_pos)
                         try:
                             order = await asyncio.to_thread(
                                 self.exchange.create_order,
@@ -27071,17 +27300,55 @@ AUTO 최근 선택 이유:
                                 side,
                                 qty,
                                 None,
-                                {'reduceOnly': True}
+                                params
                             )
-                            break
                         except Exception as close_error:
                             last_error = close_error
-                            logger.error(f"Emergency close attempt {attempt}/3 failed for {sym}: {close_error}")
-                            if attempt < 3:
-                                await asyncio.sleep(1.0)
-                                await self.notify(f"⚠️ {sym} 청산 재시도 중... ({attempt + 1}/3)")
-                    if not order:
-                        raise last_error or RuntimeError("emergency close order failed")
+                            logger.error(
+                                f"Emergency close attempt {attempt}/{max_close_attempts} failed for {sym}: {close_error}"
+                            )
+                            await asyncio.sleep(1.0)
+                            current_pos = await self._fetch_emergency_position_by_symbol(sym)
+                            if not current_pos:
+                                break
+                            if attempt < max_close_attempts:
+                                await self.notify(f"⚠️ {sym} 청산 재시도 중... ({attempt + 1}/{max_close_attempts})")
+                            continue
+
+                        await asyncio.sleep(0.9)
+                        current_pos = await self._fetch_emergency_position_by_symbol(sym)
+                        if not current_pos:
+                            break
+
+                        remaining_qty = abs(float(current_pos.get('contracts', 0) or 0))
+                        logger.warning(
+                            f"Emergency close order accepted but position still open: "
+                            f"{sym} {current_pos.get('side')} {remaining_qty}"
+                        )
+                        if signal_engine:
+                            await signal_engine._cancel_all_orders_variants(sym, reason=f'emergency close remaining retry {attempt}')
+                            await signal_engine._cancel_protection_orders(sym, reason=f'emergency close remaining retry {attempt}')
+                        else:
+                            try:
+                                await asyncio.to_thread(self.exchange.cancel_all_orders, sym)
+                            except Exception as retry_cancel_error:
+                                logger.warning(f"Emergency retry cancel failed for {sym}: {retry_cancel_error}")
+                        if attempt < max_close_attempts:
+                            await self.notify(
+                                f"⚠️ {sym} 청산 주문 후 잔여 포지션 확인: "
+                                f"{current_pos.get('side', '').upper()} `{remaining_qty}`. 재시도합니다."
+                            )
+
+                    if current_pos:
+                        remaining_qty = abs(float(current_pos.get('contracts', 0) or 0))
+                        raise RuntimeError(
+                            f"position still open after emergency close attempts: "
+                            f"{current_pos.get('side')} {remaining_qty}"
+                        )
+                    if not order and last_error:
+                        logger.warning(
+                            f"Emergency close order errored for {sym}, but position is now flat: {last_error}"
+                        )
 
                     logger.info(f"??Emergency Close: {sym} {side} {qty}")
                     if signal_engine:
@@ -27091,7 +27358,11 @@ AUTO 최근 선택 이유:
                                 sym,
                                 finalize=True,
                                 reason='EmergencyStop',
-                                exit_price=order.get('average') or pos.get('mark_price')
+                                exit_price=(
+                                    order.get('average')
+                                    if isinstance(order, dict) and order.get('average')
+                                    else pos.get('mark_price')
+                                )
                             )
                         await signal_engine._cancel_all_orders_variants(sym, reason='after emergency close')
                         await signal_engine._reconcile_closed_position_protection(
