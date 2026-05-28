@@ -20926,6 +20926,8 @@ class MainController:
         self.last_alt_trend_scan_candle_ts_by_tf = {}
         self.last_alt_trend_alert_sent = {}
         self.last_alt_trend_scan_summary = {}
+        self.utbreakout_futures_context_cache = {}
+        self.utbreakout_orderflow_snapshots = {}
 
     def _telegram_reporting_cfg(self):
         return self.cfg.get('telegram', {}).get('reporting', {}) or {}
@@ -21650,54 +21652,299 @@ class MainController:
         return await asyncio.to_thread(self._fetch_binance_public_json_sync, path, params)
 
     async def _fetch_utbreakout_futures_context(self, symbol):
-        """Fetch lightweight futures context for research logs only.
+        """Fetch lightweight futures context for controller-side reports.
 
-        This data is intentionally not used as an entry filter. It helps later
-        backtest/forward-test review decide whether funding/open-interest
-        features are worth promoting into optional strategy inputs.
+        The SignalEngine implementation is the source of truth for entry
+        evaluation. This controller helper delegates there when available so
+        status/report paths keep the same field contract, then falls back to a
+        small None-safe public-data fetch for isolated helper use.
         """
         if self.is_upbit_mode():
             return {}
+        signal_engine = getattr(self, 'engines', {}).get('signal') if isinstance(getattr(self, 'engines', None), dict) else None
+        if signal_engine is not None and hasattr(signal_engine, '_fetch_utbreakout_futures_context'):
+            try:
+                context = await signal_engine._fetch_utbreakout_futures_context(symbol)
+                return dict(context or {})
+            except Exception as exc:
+                delegate_error = f"signalEngineContext: {exc}"
+        else:
+            delegate_error = None
+
+        if not hasattr(self, 'utbreakout_futures_context_cache') or not isinstance(self.utbreakout_futures_context_cache, dict):
+            self.utbreakout_futures_context_cache = {}
+        if not hasattr(self, 'utbreakout_orderflow_snapshots') or not isinstance(self.utbreakout_orderflow_snapshots, dict):
+            self.utbreakout_orderflow_snapshots = {}
+
+        def _open_interest_stats(oi_hist):
+            if not isinstance(oi_hist, list) or len(oi_hist) < 2:
+                return {
+                    'open_interest_delta_pct': None,
+                    'open_interest_delta_z': None,
+                    'open_interest_acceleration': None,
+                    'open_interest_hist_samples': len(oi_hist) if isinstance(oi_hist, list) else 0,
+                }
+            rows = sorted(
+                [row for row in oi_hist if isinstance(row, dict)],
+                key=lambda row: int(row.get('timestamp', 0) or 0),
+            )
+            values = []
+            for row in rows:
+                value = _safe_float_or_none(row.get('sumOpenInterestValue') or row.get('sumOpenInterest'))
+                if value is not None and value > 0:
+                    values.append(float(value))
+            if len(values) < 2:
+                return {
+                    'open_interest_delta_pct': None,
+                    'open_interest_delta_z': None,
+                    'open_interest_acceleration': None,
+                    'open_interest_hist_samples': len(values),
+                }
+            changes = []
+            for prev, curr in zip(values, values[1:]):
+                if prev == 0.0:
+                    continue
+                pct = (curr - prev) / max(abs(prev), 1e-9) * 100.0
+                if np.isfinite(pct):
+                    changes.append(float(pct))
+            if not changes:
+                return {
+                    'open_interest_delta_pct': None,
+                    'open_interest_delta_z': None,
+                    'open_interest_acceleration': None,
+                    'open_interest_hist_samples': len(values),
+                }
+            latest = changes[-1]
+            z_score = None
+            if len(changes) >= 3:
+                mean = sum(changes) / len(changes)
+                variance = sum((item - mean) ** 2 for item in changes) / len(changes)
+                std = variance ** 0.5
+                if std > 0 and np.isfinite(std):
+                    z_score = (latest - mean) / std
+            acceleration = changes[-1] - changes[-2] if len(changes) >= 2 else None
+            return {
+                'open_interest_delta_pct': latest,
+                'open_interest_delta_z': z_score,
+                'open_interest_acceleration': acceleration,
+                'open_interest_hist_samples': len(values),
+            }
+
+        def _build_orderflow_snapshot(depth, timestamp=None):
+            bids = depth.get('bids') if isinstance(depth, dict) else []
+            asks = depth.get('asks') if isinstance(depth, dict) else []
+
+            def _levels(rows, *, reverse=False):
+                levels = []
+                for row in rows or []:
+                    if not isinstance(row, (list, tuple)) or len(row) < 2:
+                        continue
+                    price = _safe_float_or_none(row[0])
+                    qty = _safe_float_or_none(row[1])
+                    if price is None or qty is None or price <= 0 or qty < 0:
+                        continue
+                    levels.append((float(price), float(qty)))
+                return sorted(levels, key=lambda item: item[0], reverse=reverse)
+
+            bid_levels = _levels(bids, reverse=True)
+            ask_levels = _levels(asks, reverse=False)
+            if not bid_levels or not ask_levels:
+                return {}
+            best_bid = bid_levels[0][0]
+            best_ask = ask_levels[0][0]
+            mid = (best_bid + best_ask) / 2.0
+            bid_depth = sum(price * qty for price, qty in bid_levels)
+            ask_depth = sum(price * qty for price, qty in ask_levels)
+            if bid_depth < 0 or ask_depth < 0 or mid <= 0:
+                return {}
+            return {
+                'timestamp': float(timestamp if timestamp is not None else time.time()),
+                'bid_depth_usdt': float(bid_depth),
+                'ask_depth_usdt': float(ask_depth),
+                'orderbook_imbalance_pct': (bid_depth - ask_depth) / max(bid_depth + ask_depth, 1e-9) * 100.0,
+                'futures_spread_pct': (best_ask - best_bid) / max(abs(mid), 1e-9) * 100.0,
+                'best_bid': float(best_bid),
+                'best_ask': float(best_ask),
+            }
+
+        def _update_orderflow_snapshots(snapshot=None, *, window=5, max_samples=20):
+            symbol_key = str(symbol or '')
+            rows = list(self.utbreakout_orderflow_snapshots.get(symbol_key) or [])
+            if isinstance(snapshot, dict) and snapshot:
+                clean = {}
+                for key in (
+                    'timestamp',
+                    'bid_depth_usdt',
+                    'ask_depth_usdt',
+                    'orderbook_imbalance_pct',
+                    'futures_spread_pct',
+                    'best_bid',
+                    'best_ask',
+                ):
+                    value = _safe_float_or_none(snapshot.get(key))
+                    if value is not None:
+                        clean[key] = value
+                if clean.get('timestamp') is not None:
+                    rows.append(clean)
+            rows = rows[-max(1, int(max_samples or 20)):]
+            self.utbreakout_orderflow_snapshots[symbol_key] = rows
+            try:
+                window = max(1, int(window or 5))
+            except (TypeError, ValueError):
+                window = 5
+            recent = [
+                row for row in rows[-window:]
+                if _safe_float_or_none((row or {}).get('orderbook_imbalance_pct')) is not None
+            ]
+            latest = rows[-1] if rows else {}
+            orderflow_context = {}
+            if latest:
+                orderflow_context.update({
+                    'futures_best_bid': latest.get('best_bid'),
+                    'futures_best_ask': latest.get('best_ask'),
+                    'best_bid': latest.get('best_bid'),
+                    'best_ask': latest.get('best_ask'),
+                    'futures_spread_pct': latest.get('futures_spread_pct'),
+                    'bid_depth_usdt': latest.get('bid_depth_usdt'),
+                    'ask_depth_usdt': latest.get('ask_depth_usdt'),
+                    'orderbook_imbalance_pct': latest.get('orderbook_imbalance_pct'),
+                    'orderflow_snapshot_ts': latest.get('timestamp'),
+                })
+            if recent:
+                imbalances = [float(row.get('orderbook_imbalance_pct')) for row in recent]
+                rolling = sum(imbalances) / len(imbalances)
+                delta = imbalances[-1] - imbalances[0] if len(imbalances) >= 2 else 0.0
+                orderflow_context.update({
+                    'rolling_orderbook_imbalance_pct': rolling,
+                    'rolling_orderbook_imbalance_delta': delta,
+                    'rolling_ofi_score': rolling + (delta * 0.5),
+                    'rolling_ofi_samples': len(imbalances),
+                })
+            else:
+                orderflow_context['rolling_ofi_samples'] = 0
+            return {key: value for key, value in orderflow_context.items() if value is not None}
+
         now = time.time()
         cached = self.utbreakout_futures_context_cache.get(symbol)
-        if isinstance(cached, dict) and (now - float(cached.get('cached_at', 0) or 0)) < 300:
-            return dict(cached.get('data') or {})
+        cached_at = float(cached.get('cached_at', 0) or 0) if isinstance(cached, dict) else 0.0
+        cache_fresh = isinstance(cached, dict) and (now - cached_at) < 300
+        context = dict((cached or {}).get('data') or {}) if cache_fresh else {}
+        if delegate_error:
+            context.setdefault('futures_context_error', delegate_error)
 
         rest_symbol = self._build_binance_futures_rest_symbol(symbol)
         if not rest_symbol:
             return {}
 
-        context = {}
-        try:
-            premium = await self._fetch_binance_public_json(
-                '/fapi/v1/premiumIndex',
-                {'symbol': rest_symbol}
-            )
-            if isinstance(premium, dict):
-                context.update({
-                    'funding_rate': _safe_float_or_none(premium.get('lastFundingRate')),
-                    'next_funding_time': int(premium.get('nextFundingTime') or 0) or None,
-                    'mark_price': _safe_float_or_none(premium.get('markPrice')),
-                    'index_price': _safe_float_or_none(premium.get('indexPrice')),
-                })
-        except Exception as e:
-            context['futures_context_error'] = f"premiumIndex: {e}"
+        if not cache_fresh:
+            context = {'futures_context_error': delegate_error} if delegate_error else {}
+            try:
+                premium = await self._fetch_binance_public_json(
+                    '/fapi/v1/premiumIndex',
+                    {'symbol': rest_symbol}
+                )
+                if isinstance(premium, dict):
+                    context.update({
+                        'funding_rate': _safe_float_or_none(premium.get('lastFundingRate')),
+                        'next_funding_time': int(premium.get('nextFundingTime') or 0) or None,
+                        'mark_price': _safe_float_or_none(premium.get('markPrice')),
+                        'index_price': _safe_float_or_none(premium.get('indexPrice')),
+                    })
+            except Exception as e:
+                context['futures_context_error'] = f"premiumIndex: {e}"
 
+            try:
+                oi = await self._fetch_binance_public_json(
+                    '/fapi/v1/openInterest',
+                    {'symbol': rest_symbol}
+                )
+                if isinstance(oi, dict):
+                    context['open_interest'] = _safe_float_or_none(oi.get('openInterest'))
+                    context['open_interest_ts'] = int(oi.get('time') or 0) or None
+            except Exception as e:
+                if 'futures_context_error' not in context:
+                    context['futures_context_error'] = f"openInterest: {e}"
+
+            if context.get('open_interest') is not None and context.get('mark_price') is not None:
+                try:
+                    context['open_interest_usdt'] = float(context['open_interest']) * float(context['mark_price'])
+                except (TypeError, ValueError):
+                    pass
+
+            try:
+                oi_hist = await self._fetch_binance_public_json(
+                    '/futures/data/openInterestHist',
+                    {'symbol': rest_symbol, 'period': '15m', 'limit': 20}
+                )
+                context.update({
+                    key: value for key, value in _open_interest_stats(oi_hist).items()
+                    if value is not None
+                })
+            except Exception as e:
+                context.setdefault('futures_context_error', f"openInterestHist: {e}")
+
+            try:
+                ratio_rows = await self._fetch_binance_public_json(
+                    '/futures/data/globalLongShortAccountRatio',
+                    {'symbol': rest_symbol, 'period': '15m', 'limit': 1}
+                )
+                if isinstance(ratio_rows, list) and ratio_rows:
+                    latest = ratio_rows[-1]
+                    context.update({
+                        'long_short_ratio': _safe_float_or_none(latest.get('longShortRatio')),
+                        'long_account': _safe_float_or_none(latest.get('longAccount')),
+                        'short_account': _safe_float_or_none(latest.get('shortAccount')),
+                    })
+            except Exception as e:
+                context.setdefault('futures_context_error', f"globalLongShortAccountRatio: {e}")
+
+            if context.get('mark_price') is not None and context.get('index_price') is not None:
+                try:
+                    context['basis_pct'] = (
+                        (float(context['mark_price']) - float(context['index_price']))
+                        / max(abs(float(context['index_price'])), 1e-9)
+                        * 100.0
+                    )
+                except (TypeError, ValueError):
+                    pass
+
+        orderflow_cache_ttl = 30.0
+        rows = self.utbreakout_orderflow_snapshots.get(str(symbol or '')) or []
+        latest_snapshot = rows[-1] if isinstance(rows, list) and rows else None
+        latest_snapshot_ts = float((latest_snapshot or {}).get('timestamp', 0) or 0)
+        orderflow_due = not latest_snapshot_ts or (now - latest_snapshot_ts) >= orderflow_cache_ttl
         try:
-            oi = await self._fetch_binance_public_json(
-                '/fapi/v1/openInterest',
-                {'symbol': rest_symbol}
-            )
-            if isinstance(oi, dict):
-                context['open_interest'] = _safe_float_or_none(oi.get('openInterest'))
-                context['open_interest_ts'] = int(oi.get('time') or 0) or None
+            if orderflow_due:
+                depth = await self._fetch_binance_public_json(
+                    '/fapi/v1/depth',
+                    {'symbol': rest_symbol, 'limit': 20}
+                )
+                context.update(_update_orderflow_snapshots(_build_orderflow_snapshot(depth, timestamp=now), window=5))
+            else:
+                context.update(_update_orderflow_snapshots(None, window=5))
         except Exception as e:
-            if 'futures_context_error' not in context:
-                context['futures_context_error'] = f"openInterest: {e}"
+            context.setdefault('futures_context_error', f"depth: {e}")
+            context.update(_update_orderflow_snapshots(None, window=5))
+
+        if orderflow_due or not cache_fresh:
+            try:
+                taker_rows = await self._fetch_binance_public_json(
+                    '/futures/data/takerlongshortRatio',
+                    {'symbol': rest_symbol, 'period': '15m', 'limit': 1}
+                )
+                if isinstance(taker_rows, list) and taker_rows:
+                    latest = taker_rows[-1]
+                    context.update({
+                        'taker_buy_sell_ratio': _safe_float_or_none(latest.get('buySellRatio')),
+                        'taker_buy_vol': _safe_float_or_none(latest.get('buyVol')),
+                        'taker_sell_vol': _safe_float_or_none(latest.get('sellVol')),
+                    })
+            except Exception as e:
+                context.setdefault('futures_context_error', f"takerlongshortRatio: {e}")
 
         clean_context = {k: v for k, v in context.items() if v is not None}
         self.utbreakout_futures_context_cache[symbol] = {
-            'cached_at': now,
+            'cached_at': cached_at if cache_fresh else now,
             'data': clean_context
         }
         return clean_context

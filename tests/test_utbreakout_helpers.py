@@ -126,6 +126,89 @@ def test_open_interest_stats_are_safe_for_short_and_flat_history():
     assert varied["open_interest_acceleration"] is not None
 
 
+def test_controller_futures_context_delegates_to_signal_engine():
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+    controller.is_upbit_mode = lambda: False
+
+    class FakeSignal:
+        async def _fetch_utbreakout_futures_context(self, symbol):
+            assert symbol == "BTC/USDT"
+            return {
+                "rolling_orderbook_imbalance_pct": 4.5,
+                "rolling_orderbook_imbalance_delta": 1.2,
+                "rolling_ofi_score": 5.1,
+                "open_interest_delta_z": 0.8,
+                "open_interest_acceleration": 0.3,
+            }
+
+    controller.engines = {"signal": FakeSignal()}
+
+    result = asyncio.run(controller._fetch_utbreakout_futures_context("BTC/USDT"))
+
+    assert result["rolling_orderbook_imbalance_pct"] == 4.5
+    assert result["open_interest_delta_z"] == 0.8
+
+
+def test_controller_futures_context_fallback_returns_new_fields_without_network():
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+    controller.engines = {}
+    controller.utbreakout_futures_context_cache = {}
+    controller.utbreakout_orderflow_snapshots = {}
+    controller.is_upbit_mode = lambda: False
+    controller._build_binance_futures_rest_symbol = lambda symbol: "BTCUSDT"
+    seen_requests = []
+
+    async def fake_fetch(path, params):
+        seen_requests.append((path, dict(params)))
+        if path == "/fapi/v1/premiumIndex":
+            return {
+                "lastFundingRate": "0.0001",
+                "nextFundingTime": "1800000000000",
+                "markPrice": "101",
+                "indexPrice": "100",
+            }
+        if path == "/fapi/v1/openInterest":
+            return {"openInterest": "2500", "time": "1700000000000"}
+        if path == "/futures/data/openInterestHist":
+            return [
+                {"timestamp": 1, "sumOpenInterestValue": "100"},
+                {"timestamp": 2, "sumOpenInterestValue": "101"},
+                {"timestamp": 3, "sumOpenInterestValue": "103"},
+                {"timestamp": 4, "sumOpenInterestValue": "106"},
+                {"timestamp": 5, "sumOpenInterestValue": "110"},
+            ]
+        if path == "/futures/data/globalLongShortAccountRatio":
+            return [{"longShortRatio": "1.1", "longAccount": "0.52", "shortAccount": "0.48"}]
+        if path == "/fapi/v1/depth":
+            return {
+                "bids": [["100", "10"], ["99", "5"]],
+                "asks": [["101", "4"], ["102", "3"]],
+            }
+        if path == "/futures/data/takerlongshortRatio":
+            return [{"buySellRatio": "1.04", "buyVol": "120", "sellVol": "100"}]
+        raise AssertionError(path)
+
+    controller._fetch_binance_public_json = fake_fetch
+
+    result = asyncio.run(controller._fetch_utbreakout_futures_context("BTC/USDT"))
+
+    assert result["open_interest_delta_pct"] is not None
+    assert result["open_interest_delta_z"] is not None
+    assert result["open_interest_acceleration"] is not None
+    assert result["open_interest_hist_samples"] == 5
+    assert result["rolling_ofi_samples"] == 1
+    assert result["rolling_orderbook_imbalance_pct"] > 0
+    assert result["rolling_ofi_score"] > 0
+    assert result["taker_buy_sell_ratio"] == pytest.approx(1.04)
+    assert any(path == "/fapi/v1/depth" for path, _ in seen_requests)
+    assert any(
+        path == "/futures/data/openInterestHist" and params["limit"] == 20
+        for path, params in seen_requests
+    )
+
+
 def test_risk_plan_uses_loss_budget_not_fixed_margin():
     plan = calculate_risk_plan(
         side="long",
