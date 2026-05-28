@@ -1,67 +1,48 @@
-# 📈 Advanced Crypto Trading Bot
+# Advanced Crypto Trading Bot
 
-![Python](https://img.shields.io/badge/Python-3.9+-blue.svg) ![Binance](https://img.shields.io/badge/Exchange-Binance-yellow.svg) ![License](https://img.shields.io/badge/License-MIT-green.svg)
+Python 기반 crypto futures trading bot입니다. 이 문서는 현재 실제 코드 기준으로 정리되어 있으며, 핵심 live 경로는 `emas.py`, `utbreakout/`, `prediction/`, `tests/`에 있습니다.
 
-Advanced algorithmic trading bot built with Python, designed for the Binance Futures market. It features a robust **Signal Engine** capable of multi-strategy execution, real-time risk management, and a Telegram-based dashboard.
+> 주의: mainnet 실거래 전에는 반드시 testnet/paper forward test로 주문, TP/SL, 텔레그램 제어, 네트워크 설정을 확인해야 합니다. API key, secret, token은 저장소에 커밋하지 마세요.
 
-> **Note**: This is a portfolio/educational project demonstrating advanced quantitative trading concepts.
+## 현재 Live Core
 
-## ✨ Key Features
+현재 `MA_STRATEGIES = set()` 상태라 README에 오래 남아 있던 Triple SMA/HMA 계열은 live core가 아닙니다. 실제 선택 가능한 core 전략은 다음 계열입니다.
 
-### 🧠 Intelligent Signal Engine
-- **Multi-Strategy Support**:
-  - **Triple SMA/HMA**: Classic trend following with adjustable periods.
-  - **MicroVBO (Volatility Breakout)**: Captures short-term bursts using ATR thresholds.
-  - **Fractal Fisher**: Combines Hurst Exponent for trend validation with Fisher Transform for entry timing.
-- **Advanced Filtering**:
-  - **Kalman Filter**: Smoothes price data to reduce noise and false signals.
-  - **Hurst Exponent**: Measures market memory/trend persistency (Mean Reverting vs Trending).
-  - **R-Squared ($R^2$)**: Quantifies the strength of the trend.
-  - **Choppiness Index**: Avoids trading in sideways/choppy markets.
+- `UTBOT`: 기본 UTBot 방향 전략
+- `UTSMC`: UTBot + SMC/internal structure 조합
+- `UTRSI`: UTBot + RSI timing 조합
+- `UTRSIBB`: UTBot + RSI/Bollinger timing 조합
+- `UTBB`: UTBot + Bollinger Band 조합
+- `UTBOT_FILTERED_BREAKOUT_V1`: UT Breakout set registry 기반 필터 전략
+- `UTBOT_ADAPTIVE_TIMEFRAME_V1`: UT Breakout adaptive timeframe 변형
+- `RSIBB`: 순수 RSI Bollinger mean-reversion. 선택은 가능하지만 기본값은 `rsibb_enabled=false`, `rsibb_paper_only=true`, `rsibb_regime_guard_enabled=true`입니다.
 
-### 🛡️ Robust Risk Management
-- **Automatic Position Sizing**: Calculates quantity based on risk percentage and account balance.
-- **Circuit Breakers**:
-  - **Daily Loss Limit**: Automatically stops trading if daily limits are breached.
-  - **MMR Alert**: Monitors Maintenance Margin Ratio to prevent liquidation.
-- **Isolated Margin**: Ensures risk is contained per position.
+## UT Breakout Sets
 
-### 📱 Real-time Operations
-- **AsyncIO Core**: Non-blocking polling architecture for high responsiveness.
-- **Telegram Dashboard**: real-time status updates, PnL tracking, and manual override controls via chat commands.
-- **SQLite Logging**: Comprehensive trade history and performance tracking.
+UT Breakout은 `build_utbreakout_set_registry()`에서 Set1~Set63으로 구성됩니다. Set1~60은 기존 UT/volatility/prediction 계열이며, Set61~63이 추가되었습니다.
 
-## 🛠️ Installation & Setup
+- Set61 `UT + Rolling OFI Confirmation`: rolling orderbook imbalance, taker buy/sell ratio, spread/depth guard를 UTBot 방향과 같이 확인합니다.
+- Set62 `UT + OI Funding Squeeze`: OI 변화 z-score, OI acceleration, funding, long/short ratio, basis, liquidity guard를 조합합니다.
+- Set63 `UT + Squeeze Release Breakout`: BB width percentile, Keltner squeeze state, range expansion, Donchian breakout, ATR guard를 같이 확인합니다.
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/cys123431-ship-it/tradingbot.git
-   cd tradingbot
-   ```
+새 set은 lightweight deterministic feature score를 보조 gate로 사용합니다. Deep Learning 모델은 포함하지 않습니다.
 
-2. **Install Dependencies**
-   ```bash
-   pip install ccxt pandas pandas_ta numpy pykalman python-telegram-bot
-   # Optional for Fractal strategies
-   pip install hurst
-   ```
+## Legacy / Inactive Notes
 
-3. **Configuration**
-   - Rename `config.json` and fill in your details (API Keys, Telegram Token).
-   > ⚠️ **Security Warning**: Never commit your real API keys to GitHub!
+과거 README에 있던 Triple SMA, HMA, MicroVBO, Fractal Fisher 설명은 현재 live core 설명으로 보지 마세요. 일부 보조 코드나 legacy 흔적이 남아 있을 수 있지만 현재 전략 선택 집합과 실행 경로는 UTBot/UT hybrid/UT Breakout 중심입니다.
 
-4. **Run**
-   ```bash
-   python emas.py
-   ```
+## Risk And Operations
 
-## 📊 Strategy Examples
+- 기본 exchange mode는 testnet 쪽으로 유지됩니다.
+- live 주문을 켜는 기본 설정은 추가하지 않습니다.
+- UT Breakout은 fixed TP ladder, ATR 기반 risk plan, market quality, selector quality, diagnostic log를 함께 사용합니다.
+- Telegram status/diagnostic에는 포지션, 선택 set, 후보, orderflow/OI/squeeze/feature score 정보가 표시됩니다.
 
-### Kalman Filter + SMA Cross
-Combines the lag-reduction of Kalman Filters with the reliability of Moving Average Crossovers to enter trends earlier with higher confidence.
+## Setup
 
-### Fractal Fisher
-Uses the **Hurst Exponent** to determine if the market is trending ($H > 0.5$) and applies the **Fisher Transform** to pinpoint precise entry/exit points within that trend.
+```bash
+pip install -r requirements.txt
+python3 emas.py
+```
 
----
-*Created by [cys123431](https://github.com/cys123431-ship-it)*
+실운영 환경에서는 Azure/GitHub Actions 배포 설정을 먼저 확인하고, 로컬에서 live bot을 실행하지 않는 운영 원칙을 유지하세요.

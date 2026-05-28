@@ -2,10 +2,16 @@ from datetime import datetime, timezone
 import asyncio
 import re
 
+import math
+
 import pandas as pd
 import pytest
 
-from utbreakout.indicators import previous_donchian
+from utbreakout.indicators import (
+    bollinger_width_percentile,
+    keltner_squeeze_state,
+    previous_donchian,
+)
 from utbreakout.research import summarize_diagnostic_events
 from utbreakout.risk import calculate_risk_plan
 
@@ -27,6 +33,97 @@ def test_previous_donchian_excludes_current_candle():
     assert result["ready"] is True
     assert result["high"] == 14
     assert result["low"] == 5
+
+
+def test_bollinger_width_percentile_handles_short_and_ready_data():
+    short = bollinger_width_percentile([100.0] * 30, length=20, lookback=80)
+    assert short["ready"] is False
+    assert short["reason"] == "insufficient_data"
+
+    closes = [100.0 + (idx * 0.08) + math.sin(idx / 5.0) for idx in range(140)]
+    ready = bollinger_width_percentile(closes, length=20, lookback=80)
+
+    assert ready["ready"] is True
+    assert 0.0 <= ready["percentile"] <= 100.0
+    assert ready["width_pct"] > 0
+
+
+def test_keltner_squeeze_state_returns_bool_for_valid_series():
+    closes = [100.0 + math.sin(idx / 8.0) * 0.25 for idx in range(60)]
+    highs = [close + 0.35 for close in closes]
+    lows = [close - 0.35 for close in closes]
+
+    result = keltner_squeeze_state(highs, lows, closes)
+
+    assert result["ready"] is True
+    assert isinstance(result["squeeze_on"], bool)
+    assert result["bb_width_pct"] >= 0
+    assert result["kc_width_pct"] > 0
+
+
+def test_rolling_orderflow_snapshot_ignores_non_finite_values():
+    engine_cls = _signal_engine_cls()
+    engine = engine_cls.__new__(engine_cls)
+    engine.utbreakout_orderflow_snapshots = {}
+
+    bad = {
+        "timestamp": 1,
+        "orderbook_imbalance_pct": float("nan"),
+        "bid_depth_usdt": 10000,
+        "ask_depth_usdt": 10000,
+        "futures_spread_pct": 0.01,
+        "best_bid": 99,
+        "best_ask": 101,
+    }
+    engine._update_utbreakout_orderflow_snapshots("BTC/USDT", bad, window=5)
+    for idx, imbalance in enumerate([2.0, 4.0, 7.0], start=2):
+        engine._update_utbreakout_orderflow_snapshots(
+            "BTC/USDT",
+            {
+                "timestamp": idx,
+                "orderbook_imbalance_pct": imbalance,
+                "bid_depth_usdt": 10000 + idx,
+                "ask_depth_usdt": 9000,
+                "futures_spread_pct": 0.01,
+                "best_bid": 99,
+                "best_ask": 101,
+            },
+            window=5,
+        )
+
+    context = engine._update_utbreakout_orderflow_snapshots("BTC/USDT", None, window=5)
+
+    assert context["rolling_ofi_samples"] == 3
+    assert context["rolling_orderbook_imbalance_pct"] == pytest.approx((2.0 + 4.0 + 7.0) / 3.0)
+    assert context["rolling_orderbook_imbalance_delta"] == pytest.approx(5.0)
+    assert context["rolling_ofi_score"] > 0
+
+
+def test_open_interest_stats_are_safe_for_short_and_flat_history():
+    engine_cls = _signal_engine_cls()
+    engine = engine_cls.__new__(engine_cls)
+
+    short = engine._calculate_utbreakout_open_interest_stats([{"sumOpenInterestValue": "100"}])
+    flat = engine._calculate_utbreakout_open_interest_stats([
+        {"timestamp": 1, "sumOpenInterestValue": "100"},
+        {"timestamp": 2, "sumOpenInterestValue": "100"},
+        {"timestamp": 3, "sumOpenInterestValue": "100"},
+        {"timestamp": 4, "sumOpenInterestValue": "100"},
+    ])
+    varied = engine._calculate_utbreakout_open_interest_stats([
+        {"timestamp": 1, "sumOpenInterestValue": "100"},
+        {"timestamp": 2, "sumOpenInterestValue": "101"},
+        {"timestamp": 3, "sumOpenInterestValue": "103"},
+        {"timestamp": 4, "sumOpenInterestValue": "106"},
+        {"timestamp": 5, "sumOpenInterestValue": "110"},
+    ])
+
+    assert short["open_interest_delta_pct"] is None
+    assert flat["open_interest_delta_pct"] == pytest.approx(0.0)
+    assert flat["open_interest_delta_z"] is None
+    assert varied["open_interest_delta_pct"] is not None
+    assert varied["open_interest_delta_z"] is not None
+    assert varied["open_interest_acceleration"] is not None
 
 
 def test_risk_plan_uses_loss_budget_not_fixed_margin():
@@ -776,6 +873,69 @@ def test_return_signal_engine_to_utbot_turns_off_utbreakout_customcoins_and_scan
         "reset_exit_cache": True,
         "reset_stateful_strategy": True,
     }
+
+
+def test_rsibb_is_selectable_without_becoming_default(tmp_path):
+    emas = _emas_module()
+
+    cfg = emas.TradingConfig(str(tmp_path / "config.json"))
+    assert cfg.config["signal_engine"]["strategy_params"]["active_strategy"] == "utbot"
+    rsibb_cfg = cfg.config["signal_engine"]["strategy_params"]["RSIBB"]
+    assert rsibb_cfg["rsibb_enabled"] is False
+    assert rsibb_cfg["rsibb_paper_only"] is True
+    assert "rsibb" in emas.CORE_STRATEGIES
+
+    controller = emas.MainController.__new__(emas.MainController)
+    controller.cfg = {
+        "signal_engine": {
+            "strategy_params": {
+                "active_strategy": "rsibb",
+                "RSIBB": dict(rsibb_cfg),
+            }
+        }
+    }
+    controller.is_upbit_mode = lambda: False
+
+    assert controller.get_active_strategy_params()["active_strategy"] == "rsibb"
+
+
+def test_rsibb_guard_blocks_default_and_paper_only_mainnet():
+    emas = _emas_module()
+    engine_cls = _signal_engine_cls()
+    engine = engine_cls.__new__(engine_cls)
+
+    class _Ctrl:
+        def __init__(self, mode):
+            self.mode = mode
+
+        def get_exchange_mode(self):
+            return self.mode
+
+    engine.ctrl = _Ctrl(emas.BINANCE_TESTNET)
+    allowed, reason = engine._rsibb_runtime_guard({"RSIBB": {}})
+    assert allowed is False
+    assert "rsibb_enabled=False" in reason
+
+    engine.ctrl = _Ctrl(emas.BINANCE_MAINNET)
+    allowed, reason = engine._rsibb_runtime_guard({
+        "RSIBB": {
+            "rsibb_enabled": True,
+            "rsibb_paper_only": True,
+            "rsibb_regime_guard_enabled": True,
+        }
+    })
+    assert allowed is False
+    assert "paper_only=True" in reason
+
+    engine.ctrl = _Ctrl(emas.BINANCE_TESTNET)
+    allowed, _ = engine._rsibb_runtime_guard({
+        "RSIBB": {
+            "rsibb_enabled": True,
+            "rsibb_paper_only": True,
+            "rsibb_regime_guard_enabled": True,
+        }
+    })
+    assert allowed is True
 
 
 def test_protection_order_classifies_binance_stop_market_from_orig_type():

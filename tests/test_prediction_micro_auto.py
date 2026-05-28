@@ -482,7 +482,7 @@ def test_prediction_research_report_includes_core_metrics():
 def test_futures_prediction_sets_are_live_selectable_with_required_filters():
     text = Path("emas.py").read_text(encoding="utf-8")
 
-    assert "UTBREAKOUT_ACTIVE_SET_MAX = 60" in text
+    assert "UTBREAKOUT_ACTIVE_SET_MAX = 63" in text
     for set_id in range(51, 61):
         start = text.find(f"({set_id}, 'Prediction Futures'")
         assert start >= 0
@@ -490,6 +490,17 @@ def test_futures_prediction_sets_are_live_selectable_with_required_filters():
         segment = text[start:end]
         assert "'research_only': True" not in segment
         assert "prediction_" in segment
+    for set_id, family, filter_name in (
+        (61, "Microstructure Futures", "rolling_orderflow_imbalance"),
+        (62, "Prediction Futures", "oi_funding_squeeze"),
+        (63, "Volatility Regime", "squeeze_release_breakout"),
+    ):
+        start = text.find(f"({set_id}, '{family}'")
+        assert start >= 0
+        end = text.find(f"({set_id + 1},", start) if set_id < 63 else text.find("\n    ]", start)
+        segment = text[start:end]
+        assert "'research_only': True" not in segment
+        assert filter_name in segment
     for filter_name in (
         "prediction_orderflow_imbalance",
         "prediction_oi_funding_crowding",
@@ -501,5 +512,13 @@ def test_futures_prediction_sets_are_live_selectable_with_required_filters():
         "prediction_basis_divergence",
         "prediction_probability_trail",
         "prediction_cross_market_confirmation",
+        "rolling_orderflow_imbalance",
+        "oi_funding_squeeze",
+        "squeeze_release_breakout",
     ):
         assert f"filter_name == '{filter_name}'" in text
+        start = text.find(f"filter_name == '{filter_name}'")
+        end = text.find("elif filter_name", start + 1)
+        if end < 0:
+            end = text.find("else:", start)
+        assert "planned 필터" not in text[start:end]

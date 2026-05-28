@@ -45,7 +45,11 @@ from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, 
     MessageHandler, filters, ConversationHandler, CallbackQueryHandler
 )
-from utbreakout.indicators import previous_donchian
+from utbreakout.indicators import (
+    bollinger_width_percentile,
+    keltner_squeeze_state,
+    previous_donchian,
+)
 from utbreakout.coinselector import (
     build_base_candidate as build_coin_selector_base_candidate,
     build_selection_report as build_coin_selector_report,
@@ -345,7 +349,7 @@ UTBREAKOUT_STRATEGIES = {
     UTBOT_FILTERED_BREAKOUT_STRATEGY,
     UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY,
 }
-UT_ONLY_STRATEGIES = {'utbot', 'utrsibb', 'utrsi', 'utbb', 'utsmc'}
+UT_ONLY_STRATEGIES = {'utbot', 'rsibb', 'utrsibb', 'utrsi', 'utbb', 'utsmc'}
 MA_STRATEGIES = set()
 PATTERN_STRATEGIES = set(UT_ONLY_STRATEGIES)
 CORE_STRATEGIES = set(UT_ONLY_STRATEGIES) | UTBREAKOUT_STRATEGIES
@@ -386,7 +390,7 @@ ALT_TREND_TIMEFRAME_ORDER = {
     timeframe: idx for idx, timeframe in enumerate(ALT_TREND_ALLOWED_TIMEFRAMES)
 }
 BINANCE_FAPI_PUBLIC_BASE_URL = 'https://fapi.binance.com'
-UTBREAKOUT_ACTIVE_SET_MAX = 60
+UTBREAKOUT_ACTIVE_SET_MAX = 63
 UTBREAKOUT_DEFAULT_SET_ID = 2
 UTBREAKOUT_AUTO_TIMEFRAMES = ['15m', '30m', '1h', '2h', '4h']
 
@@ -462,6 +466,28 @@ def build_utbreakout_set_registry():
         'quality_score_v2_min_risk_multiplier': 0.50,
         'quality_score_v2_15m_block_below': 62.0,
         'quality_score_v2_15m_reduce_below': 72.0,
+        'feature_score_enabled': True,
+        'feature_score_block_below': 55.0,
+        'feature_score_reduce_below': 65.0,
+        'feature_score_min_risk_multiplier': 0.60,
+        'rolling_ofi_window': 5,
+        'rolling_ofi_min_abs': 3.0,
+        'rolling_ofi_taker_long_min': 1.03,
+        'rolling_ofi_taker_short_max': 0.97,
+        'rolling_ofi_spread_max_pct': 0.05,
+        'prediction_min_depth_usdt': 50000.0,
+        'oi_z_min': 0.75,
+        'oi_acceleration_min': 0.0,
+        'funding_long_max': 0.0008,
+        'funding_short_min': -0.0008,
+        'long_short_long_max': 1.85,
+        'long_short_short_min': 0.55,
+        'basis_long_max_pct': 0.20,
+        'basis_short_min_pct': -0.20,
+        'squeeze_lookback': 80,
+        'squeeze_percentile_max': 25.0,
+        'squeeze_release_range_min': 1.05,
+        'squeeze_require_keltner': False,
         'dynamic_take_profit_enabled': True,
         'dynamic_tp2_strong_score': 72.0,
         'dynamic_tp2_elite_score': 82.0,
@@ -606,6 +632,9 @@ def build_utbreakout_set_registry():
         (58, 'Prediction Futures', 'UT + Basis Divergence', 'Mark/Index basis가 진입 방향으로 과열되지 않았는지 확인합니다.', 'basis 왜곡 장', '파생시장 과열 감지', 'basis 해석이 심볼별로 다를 수 있음', '적음~중간', ['UTBot', 'Basis', 'Mark/Index'], ['prediction_basis_divergence'], {}),
         (59, 'Prediction Futures', 'UT + Probability Trail Guard', 'Prediction 확률이 진입 방향을 일정 수준 이상 지지할 때만 허용합니다.', 'Prediction 확률 우위가 뚜렷한 장', '진입 후 확률 약화 감시 후보', 'Prediction 데이터 없으면 진입 차단', '적음', ['UTBot', 'Prediction Probability'], ['prediction_probability_trail'], {}),
         (60, 'Prediction Futures', 'UT + Cross-Market Confirmation', 'Futures 수급, basis/funding, Prediction odds 중 2개 이상이 UT 방향과 맞을 때 진입합니다.', '크로스마켓 정렬 장', '품질 좋은 신호 선별', '신호 수 감소', '적음', ['UTBot', 'Futures Flow', 'Basis', 'Prediction'], ['prediction_cross_market_confirmation'], {}),
+        (61, 'Microstructure Futures', 'UT + Rolling OFI Confirmation', 'UTBot 방향 신호에 최근 orderbook imbalance, taker flow, spread/depth 비용을 같이 확인하는 futures microstructure set입니다.', '짧은 호가 수급이 UT 방향으로 누적되는 구간', '순간 호가가 아니라 rolling pressure를 확인', '호가 snapshot 품질과 호출 주기에 민감', '적음~중간', ['UTBot', 'Rolling OFI', 'Orderbook Imbalance', 'Taker Buy/Sell Ratio', 'Spread/Depth'], ['rolling_orderflow_imbalance', 'prediction_spread_depth_guard'], {'rolling_ofi_window': 5, 'rolling_ofi_min_abs': 3.0, 'rolling_ofi_taker_long_min': 1.03, 'rolling_ofi_taker_short_max': 0.97, 'rolling_ofi_spread_max_pct': 0.05, 'prediction_min_depth_usdt': 50000.0}),
+        (62, 'Prediction Futures', 'UT + OI Funding Squeeze', 'UTBot 방향 신호에 OI 변화 z-score, funding 과열, long/short crowding, basis를 조합하는 set입니다.', 'OI가 가속되지만 funding/crowding이 아직 과열되지 않은 구간', '추세 가속과 군중 과열을 같이 점검', 'OI 히스토리 데이터 부족 시 보수적으로 대기', '적음', ['UTBot', 'Open Interest Z', 'Funding Rate', 'Long/Short Ratio', 'Basis'], ['oi_funding_squeeze', 'prediction_macro_event_guard', 'prediction_basis_divergence', 'prediction_spread_depth_guard'], {'oi_z_min': 0.75, 'oi_acceleration_min': 0.0, 'funding_long_max': 0.0008, 'funding_short_min': -0.0008, 'long_short_long_max': 1.85, 'long_short_short_min': 0.55}),
+        (63, 'Volatility Regime', 'UT + Squeeze Release Breakout', 'BB/Keltner 압축 이후 range breakout이 발생하고 UTBot 방향과 일치할 때만 진입하는 set입니다.', '압축 뒤 변동성 확장이 시작되는 구간', '압축 후 돌파만 선택해 추격 노이즈를 줄임', '초기 압축 판정 데이터가 부족하면 대기', '적음~중간', ['UTBot', 'BB Width Percentile', 'Keltner Channel', 'Range Expansion', 'ATR'], ['squeeze_release_breakout', 'atr_guard'], {'squeeze_lookback': 80, 'squeeze_percentile_max': 25.0, 'squeeze_release_range_min': 1.05, 'squeeze_require_keltner': False}),
     ]
     registry = {}
     for row in rows:
@@ -1119,7 +1148,10 @@ class TradingConfig:
                     'RSIBB': {
                         'rsi_length': 6,
                         'bb_length': 200,
-                        'bb_mult': 2.0
+                        'bb_mult': 2.0,
+                        'rsibb_enabled': False,
+                        'rsibb_paper_only': True,
+                        'rsibb_regime_guard_enabled': True
                     },
                     'RSIMomentumTrend': {
                         'rsi_length': 14,
@@ -1279,7 +1311,10 @@ class TradingConfig:
             'RSIBB': {
                 'rsi_length': 6,
                 'bb_length': 200,
-                'bb_mult': 2.0
+                'bb_mult': 2.0,
+                'rsibb_enabled': False,
+                'rsibb_paper_only': True,
+                'rsibb_regime_guard_enabled': True
             },
             'RSIMomentumTrend': {
                 'rsi_length': 14,
@@ -1710,7 +1745,10 @@ class TradingConfig:
                     "RSIBB": {
                         "rsi_length": 6,
                         "bb_length": 200,
-                        "bb_mult": 2.0
+                        "bb_mult": 2.0,
+                        "rsibb_enabled": False,
+                        "rsibb_paper_only": True,
+                        "rsibb_regime_guard_enabled": True
                     },
                     "RSIMomentumTrend": {
                         "rsi_length": 14,
@@ -2969,6 +3007,7 @@ class SignalEngine(BaseEngine):
         self.utbreakout_trailing_states = {}  # symbol -> partial TP / ATR trailing state
         self.utbot_filtered_breakout_failures = {}  # symbol -> side -> recent failed candidate timestamps
         self.utbreakout_futures_context_cache = {}  # symbol -> cached funding/OI context for research logs
+        self.utbreakout_orderflow_snapshots = {}  # symbol -> rolling depth/orderflow snapshots
         self.utbreakout_market_regime_cache = {}  # cache key -> BTC/ETH broad market regime
         self.utbreakout_shadow_pending = {}  # key -> pending triple-barrier observation
         self.utbreakout_shadow_resolved_keys = set()  # keys already logged in this runtime
@@ -3031,6 +3070,7 @@ class SignalEngine(BaseEngine):
         self.utbreakout_trailing_states = {}
         self.utbot_filtered_breakout_failures = {}
         self.utbreakout_futures_context_cache = {}
+        self.utbreakout_orderflow_snapshots = {}
         self.utbreakout_market_regime_cache = {}
         self.utbreakout_shadow_pending = {}
         self.utbreakout_shadow_resolved_keys = set()
@@ -5141,6 +5181,50 @@ class SignalEngine(BaseEngine):
         range_expansion_ratio = candle_range_pct / max(avg_range20_pct, 1e-9) if self._is_valid_number(avg_range20_pct) else np.nan
         range_compression_ratio = avg_range20_pct / max(avg_range50_pct, 1e-9) if self._is_valid_number(avg_range50_pct) else np.nan
 
+        bb_width_percentile = np.nan
+        keltner_squeeze_on = None
+        keltner_squeeze_reason = None
+        squeeze_release_state = 'pending'
+        try:
+            squeeze_lookback = max(2, int(cfg.get('squeeze_lookback', 80) or 80))
+            bb_rank = bollinger_width_percentile(
+                close.astype(float).tolist(),
+                length=20,
+                mult=2.0,
+                lookback=squeeze_lookback,
+            )
+            if bb_rank.get('ready') and self._is_valid_number(bb_rank.get('percentile')):
+                bb_width_percentile = float(bb_rank.get('percentile'))
+            keltner_state = keltner_squeeze_state(
+                high.astype(float).tolist(),
+                low.astype(float).tolist(),
+                close.astype(float).tolist(),
+                bb_length=20,
+                bb_mult=2.0,
+                kc_length=20,
+                kc_mult=1.5,
+            )
+            keltner_squeeze_reason = keltner_state.get('reason')
+            if keltner_state.get('ready'):
+                keltner_squeeze_on = bool(keltner_state.get('squeeze_on'))
+            squeeze_threshold = float(cfg.get('squeeze_percentile_max', 25.0) or 25.0)
+            release_threshold = float(cfg.get('squeeze_release_range_min', 1.05) or 1.05)
+            squeeze_condition = (
+                bool(keltner_squeeze_on)
+                or (self._is_valid_number(bb_width_percentile) and float(bb_width_percentile) <= squeeze_threshold)
+            )
+            release_condition = self._is_valid_number(range_expansion_ratio) and float(range_expansion_ratio) >= release_threshold
+            if squeeze_condition and release_condition:
+                squeeze_release_state = 'released'
+            elif squeeze_condition:
+                squeeze_release_state = 'compressed'
+            elif keltner_squeeze_on is None and not self._is_valid_number(bb_width_percentile):
+                squeeze_release_state = 'pending'
+            else:
+                squeeze_release_state = 'inactive'
+        except Exception as exc:
+            keltner_squeeze_reason = str(exc)
+
         close_delta = close.diff().fillna(0.0)
         signed_volume = pd.Series(
             np.where(close_delta > 0, volume, np.where(close_delta < 0, -volume, 0.0)),
@@ -5228,16 +5312,20 @@ class SignalEngine(BaseEngine):
             'bb_width_pct': bb_width_pct,
             'bb_width_prev_pct': bb_width_prev_pct,
             'bb_width_min_pct': bb_width_min_pct,
+            'bb_width_percentile': bb_width_percentile,
             'keltner_upper': keltner_upper_value,
             'keltner_lower': keltner_lower_value,
             'keltner_mid': keltner_mid_value,
             'keltner_width_pct': keltner_width_pct,
             'keltner_width_prev_pct': keltner_width_prev_pct,
+            'keltner_squeeze_on': keltner_squeeze_on,
+            'keltner_squeeze_reason': keltner_squeeze_reason,
             'candle_range_pct': candle_range_pct,
             'avg_range20_pct': avg_range20_pct,
             'avg_range50_pct': avg_range50_pct,
             'range_expansion_ratio': range_expansion_ratio,
             'range_compression_ratio': range_compression_ratio,
+            'squeeze_release_state': squeeze_release_state,
             'volume_ratio': volume_ratio,
             'obv_slope': obv_slope,
             'obv_slope_ratio': obv_slope_ratio,
@@ -5278,6 +5366,7 @@ class SignalEngine(BaseEngine):
         bb_width_vals = _valid_values('bb_width_pct')
         bb_width_prev_vals = _valid_values('bb_width_prev_pct')
         bb_width_min_vals = _valid_values('bb_width_min_pct')
+        bb_width_percentile_vals = _valid_values('bb_width_percentile')
         keltner_width_vals = _valid_values('keltner_width_pct')
         keltner_width_prev_vals = _valid_values('keltner_width_prev_pct')
         range_expansion_vals = _valid_values('range_expansion_ratio')
@@ -5389,6 +5478,7 @@ class SignalEngine(BaseEngine):
 
         bb_expansion_scores = []
         squeeze_release_scores = []
+        squeeze_release_auto_scores = []
         squeeze_avoid_scores = []
         for item in ready_metrics:
             width = item.get('bb_width_pct')
@@ -5402,10 +5492,21 @@ class SignalEngine(BaseEngine):
                 ratio = float(width) / max(float(min_width), 1e-9)
                 squeeze_release_scores.append(_scale(ratio, 1.05, 1.90))
                 squeeze_avoid_scores.append(_scale(ratio, 1.05, 1.80))
+            percentile = item.get('bb_width_percentile')
+            range_ratio = item.get('range_expansion_ratio')
+            keltner_squeeze = item.get('keltner_squeeze_on')
+            compression_score = None
+            if self._is_valid_number(percentile):
+                compression_score = max(0.0, min(100.0, (35.0 - float(percentile)) / 35.0 * 100.0))
+            elif keltner_squeeze is True:
+                compression_score = 80.0
+            if compression_score is not None and self._is_valid_number(range_ratio):
+                squeeze_release_auto_scores.append((compression_score * 0.55) + (_scale(float(range_ratio), 1.05, 1.90) * 0.45))
         bb_expansion_score = _avg(bb_expansion_scores, 40.0)
         if squeeze_release_scores:
             squeeze_release = _avg(squeeze_release_scores, 40.0)
             bb_expansion_score = (bb_expansion_score + squeeze_release) / 2.0
+        squeeze_release_score = _avg(squeeze_release_auto_scores, _avg([100.0 - min(100.0, v) for v in bb_width_percentile_vals], 40.0))
 
         keltner_expansion_scores = []
         for item in ready_metrics:
@@ -5465,6 +5566,7 @@ class SignalEngine(BaseEngine):
             'bb_expansion_score': round(bb_expansion_score, 2),
             'keltner_expansion_score': round(keltner_expansion_score, 2),
             'range_expansion_score': round(range_expansion_score, 2),
+            'squeeze_release_score': round(squeeze_release_score, 2),
             'pullback_score': round(pullback_score, 2),
             'flow_score': round(flow_score, 2),
             'volume_spike_score': round(volume_spike_score, 2),
@@ -5613,6 +5715,7 @@ class SignalEngine(BaseEngine):
         bb_expansion = float(scores.get('bb_expansion_score', breakout) or 0.0)
         keltner_expansion = float(scores.get('keltner_expansion_score', breakout) or 0.0)
         range_expansion = float(scores.get('range_expansion_score', breakout) or 0.0)
+        squeeze_release = float(scores.get('squeeze_release_score', bb_expansion) or 0.0)
         pullback = float(scores.get('pullback_score', 0.0) or 0.0)
         flow = float(scores.get('flow_score', 0.0) or 0.0)
         volume_spike = float(scores.get('volume_spike_score', flow) or 0.0)
@@ -5638,6 +5741,8 @@ class SignalEngine(BaseEngine):
         prediction_volatility = float(scores.get('prediction_volatility_score', 0.0) or 0.0)
         prediction_basis = float(scores.get('prediction_basis_score', 0.0) or 0.0)
         prediction_cross_market = float(scores.get('prediction_cross_market_score', 0.0) or 0.0)
+        rolling_orderflow = float(scores.get('rolling_orderflow_score', prediction_orderflow) or 0.0)
+        oi_funding_squeeze = float(scores.get('oi_funding_squeeze_score', prediction_oi_funding) or 0.0)
         ready = int(scores.get('ready_timeframes', 0) or 0)
 
         if ready <= 0:
@@ -5708,6 +5813,9 @@ class SignalEngine(BaseEngine):
             58: 24.0 + (prediction_basis * 0.40) + (prediction_oi_funding * 0.08) + (trend * 0.04),
             59: 20.0 + (prediction_odds * 0.42) + (prediction_cross_market * 0.12) + (momentum * 0.04),
             60: 20.0 + (prediction_cross_market * 0.44) + (alignment * 0.08) + (trend * 0.04),
+            61: 23.0 + (rolling_orderflow * 0.40) + (prediction_depth * 0.12) + (flow * 0.05),
+            62: 23.0 + (oi_funding_squeeze * 0.42) + (prediction_basis * 0.08) + (trend * 0.05),
+            63: 24.0 + (squeeze_release * 0.38) + (range_expansion * 0.12) + (volatility * 0.05),
         }
         selected_id, selected_score = max(candidate_scores.items(), key=lambda item: item[1])
         top3 = sorted(candidate_scores.items(), key=lambda item: item[1], reverse=True)[:3]
@@ -6203,6 +6311,114 @@ class SignalEngine(BaseEngine):
                 max_core = max(core) if core else 0.0
                 ok = max_core < 65.0
                 _add('Regime fallback', ok, f"max core score {max_core:.1f} / 조건 < 65", 'REJECTED_RISK_REWARD_LOW')
+            elif filter_name == 'rolling_orderflow_imbalance':
+                imbalance = values.get('rolling_orderbook_imbalance_pct')
+                delta = values.get('rolling_orderbook_imbalance_delta')
+                ofi_score = values.get('rolling_ofi_score')
+                samples = int(float(values.get('rolling_ofi_samples', 0) or 0))
+                taker_ratio = values.get('taker_buy_sell_ratio')
+                spread = values.get('futures_spread_pct')
+                min_abs = float(cfg.get('rolling_ofi_min_abs', 3.0) or 3.0)
+                long_min = float(cfg.get('rolling_ofi_taker_long_min', 1.03) or 1.03)
+                short_max = float(cfg.get('rolling_ofi_taker_short_max', 0.97) or 0.97)
+                spread_max = float(cfg.get('rolling_ofi_spread_max_pct', 0.05) or 0.05)
+                detail = (
+                    f"imb {_fmt(imbalance, 2)}%, Δ {_fmt(delta, 2)}, OFI {_fmt(ofi_score, 2)}, "
+                    f"taker {_fmt(taker_ratio, 3)}, spread {_fmt(spread, 4)}%, samples {samples}"
+                )
+                if samples < 3 or not (
+                    self._is_valid_number(imbalance)
+                    and self._is_valid_number(taker_ratio)
+                    and self._is_valid_number(spread)
+                ):
+                    _add('Rolling OFI 확인', None, f"{detail} / rolling OFI 데이터 대기", 'REJECTED_ROLLING_OFI')
+                else:
+                    if side == 'long':
+                        ok = float(imbalance) >= min_abs and float(taker_ratio) >= long_min and float(spread) <= spread_max
+                        cond = f"long imb>={min_abs:.1f}, taker>={long_min:.2f}, spread<={spread_max:.3f}%"
+                    else:
+                        ok = float(imbalance) <= -min_abs and float(taker_ratio) <= short_max and float(spread) <= spread_max
+                        cond = f"short imb<=-{min_abs:.1f}, taker<={short_max:.2f}, spread<={spread_max:.3f}%"
+                    _add('Rolling OFI 확인', ok, f"{detail} / {cond}", 'REJECTED_ROLLING_OFI')
+            elif filter_name == 'oi_funding_squeeze':
+                oi_z = values.get('open_interest_delta_z')
+                acceleration = values.get('open_interest_acceleration')
+                funding = values.get('funding_rate')
+                long_short = values.get('long_short_ratio')
+                basis = values.get('basis_pct')
+                oi_z_min = float(cfg.get('oi_z_min', 0.75) or 0.75)
+                acc_min = float(cfg.get('oi_acceleration_min', 0.0) or 0.0)
+                funding_long_max = float(cfg.get('funding_long_max', 0.0008) or 0.0008)
+                funding_short_min = float(cfg.get('funding_short_min', -0.0008) or -0.0008)
+                long_short_long_max = float(cfg.get('long_short_long_max', 1.85) or 1.85)
+                long_short_short_min = float(cfg.get('long_short_short_min', 0.55) or 0.55)
+                basis_long_max = float(cfg.get('basis_long_max_pct', 0.20) or 0.20)
+                basis_short_min = float(cfg.get('basis_short_min_pct', -0.20) or -0.20)
+                detail = (
+                    f"OI z {_fmt(oi_z, 2)}, accel {_fmt(acceleration, 3)}, funding {_fmt(funding, 6)}, "
+                    f"L/S {_fmt(long_short, 3)}, basis {_fmt(basis, 4)}%"
+                )
+                if not (
+                    self._is_valid_number(oi_z)
+                    and self._is_valid_number(acceleration)
+                    and self._is_valid_number(funding)
+                    and self._is_valid_number(long_short)
+                ):
+                    _add('OI/Funding Squeeze', None, f"{detail} / OI history/funding 데이터 대기", 'REJECTED_OI_FUNDING_SQUEEZE')
+                else:
+                    basis_ok = True
+                    if self._is_valid_number(basis):
+                        basis_ok = float(basis) <= basis_long_max if side == 'long' else float(basis) >= basis_short_min
+                    if side == 'long':
+                        ok = (
+                            float(oi_z) >= oi_z_min
+                            and float(acceleration) >= acc_min
+                            and float(funding) <= funding_long_max
+                            and float(long_short) <= long_short_long_max
+                            and basis_ok
+                        )
+                        cond = f"long z>={oi_z_min:.2f}, accel>={acc_min:.2f}, funding<={funding_long_max:.4g}, L/S<={long_short_long_max:.2f}"
+                    else:
+                        ok = (
+                            float(oi_z) >= oi_z_min
+                            and float(acceleration) >= acc_min
+                            and float(funding) >= funding_short_min
+                            and float(long_short) >= long_short_short_min
+                            and basis_ok
+                        )
+                        cond = f"short z>={oi_z_min:.2f}, accel>={acc_min:.2f}, funding>={funding_short_min:.4g}, L/S>={long_short_short_min:.2f}"
+                    _add('OI/Funding Squeeze', ok, f"{detail} / {cond}", 'REJECTED_OI_FUNDING_SQUEEZE')
+            elif filter_name == 'squeeze_release_breakout':
+                bb_pct = values.get('bb_width_percentile')
+                keltner_squeeze = values.get('keltner_squeeze_on')
+                range_ratio = values.get('range_expansion_ratio')
+                close_value = values.get('entry_price')
+                high_prev = values.get('donchian_high_prev')
+                low_prev = values.get('donchian_low_prev')
+                pct_max = float(cfg.get('squeeze_percentile_max', 25.0) or 25.0)
+                range_min = float(cfg.get('squeeze_release_range_min', 1.05) or 1.05)
+                require_keltner = bool(cfg.get('squeeze_require_keltner', False))
+                level = high_prev if side == 'long' else low_prev
+                detail = (
+                    f"BB pct {_fmt(bb_pct, 2)}, Keltner {'ON' if keltner_squeeze is True else 'OFF' if keltner_squeeze is False else 'n/a'}, "
+                    f"range {_fmt(range_ratio, 2)}, level {_fmt(level, 4)}"
+                )
+                if not (
+                    self._is_valid_number(range_ratio)
+                    and self._is_valid_number(close_value)
+                    and self._is_valid_number(high_prev)
+                    and self._is_valid_number(low_prev)
+                    and (self._is_valid_number(bb_pct) or keltner_squeeze is not None)
+                ):
+                    _add('Squeeze Release 돌파', None, f"{detail} / squeeze 데이터 대기", 'REJECTED_SQUEEZE_RELEASE')
+                else:
+                    squeeze_ok = keltner_squeeze is True if require_keltner else (
+                        keltner_squeeze is True or (self._is_valid_number(bb_pct) and float(bb_pct) <= pct_max)
+                    )
+                    range_ok = float(range_ratio) >= range_min
+                    breakout_ok = float(close_value) > float(high_prev) if side == 'long' else float(close_value) < float(low_prev)
+                    ok = squeeze_ok and range_ok and breakout_ok
+                    _add('Squeeze Release 돌파', ok, f"{detail} / squeeze {squeeze_ok} range>={range_min:.2f} breakout {breakout_ok}", 'REJECTED_SQUEEZE_RELEASE')
             elif filter_name == 'prediction_orderflow_imbalance':
                 imbalance = values.get('orderbook_imbalance_pct')
                 taker_ratio = values.get('taker_buy_sell_ratio')
@@ -6318,6 +6534,25 @@ class SignalEngine(BaseEngine):
                     _add('Cross-Market 확인', passed >= 2, f"{passed}/{len(votes)} votes pass", 'REJECTED_PREDICTION_CROSS_MARKET')
             else:
                 _add(filter_name, None, 'planned 필터: 아직 실거래 연결 안 됨', 'REJECTED_RISK_REWARD_LOW')
+        selected_id = int((set_info or {}).get('id') or 0)
+        if selected_id in {61, 62, 63} and bool(cfg.get('feature_score_enabled', True)):
+            feature = values.get('feature_score')
+            if not isinstance(feature, dict):
+                feature = self._calculate_utbreakout_feature_score(side, cfg, values)
+            score = feature.get('score') if isinstance(feature, dict) else None
+            block_below = float(cfg.get('feature_score_block_below', 55.0) or 55.0)
+            reduce_below = float(cfg.get('feature_score_reduce_below', 65.0) or 65.0)
+            if not self._is_valid_number(score):
+                _add('Feature Score', None, 'feature score 계산 대기', 'REJECTED_FEATURE_SCORE')
+            else:
+                score_value = float(score)
+                mode = 'risk-reduce' if score_value < reduce_below else 'normal'
+                _add(
+                    'Feature Score',
+                    score_value >= block_below,
+                    f"score {score_value:.1f} / block<{block_below:.1f}, reduce<{reduce_below:.1f} / {feature.get('reason', mode)}",
+                    'REJECTED_FEATURE_SCORE',
+                )
         return items
 
     def _calculate_wilder_atr_series(self, closed, length):
@@ -7710,6 +7945,9 @@ class SignalEngine(BaseEngine):
                 'donchian_width_pct': _safe_float_or_none(status.get('donchian_width_pct')),
                 'donchian_high_prev': _safe_float_or_none(status.get('donchian_high_prev')),
                 'donchian_low_prev': _safe_float_or_none(status.get('donchian_low_prev')),
+                'bb_width_percentile': _safe_float_or_none(status.get('bb_width_percentile')),
+                'keltner_squeeze_on': status.get('keltner_squeeze_on'),
+                'squeeze_release_state': status.get('squeeze_release_state'),
                 'htf_summary': status.get('htf_summary'),
                 'metric_summary': status.get('metric_summary'),
                 'risk_summary': status.get('risk_summary'),
@@ -7717,11 +7955,18 @@ class SignalEngine(BaseEngine):
                 'next_funding_time': status.get('next_funding_time'),
                 'open_interest': _safe_float_or_none(status.get('open_interest')),
                 'open_interest_delta_pct': _safe_float_or_none(status.get('open_interest_delta_pct')),
+                'open_interest_delta_z': _safe_float_or_none(status.get('open_interest_delta_z')),
+                'open_interest_acceleration': _safe_float_or_none(status.get('open_interest_acceleration')),
+                'open_interest_hist_samples': status.get('open_interest_hist_samples'),
                 'mark_price': _safe_float_or_none(status.get('mark_price')),
                 'basis_pct': _safe_float_or_none(status.get('basis_pct')),
                 'taker_buy_sell_ratio': _safe_float_or_none(status.get('taker_buy_sell_ratio')),
                 'long_short_ratio': _safe_float_or_none(status.get('long_short_ratio')),
                 'orderbook_imbalance_pct': _safe_float_or_none(status.get('orderbook_imbalance_pct')),
+                'rolling_orderbook_imbalance_pct': _safe_float_or_none(status.get('rolling_orderbook_imbalance_pct')),
+                'rolling_orderbook_imbalance_delta': _safe_float_or_none(status.get('rolling_orderbook_imbalance_delta')),
+                'rolling_ofi_score': _safe_float_or_none(status.get('rolling_ofi_score')),
+                'rolling_ofi_samples': status.get('rolling_ofi_samples'),
                 'futures_spread_pct': _safe_float_or_none(status.get('futures_spread_pct')),
                 'bid_depth_usdt': _safe_float_or_none(status.get('bid_depth_usdt')),
                 'ask_depth_usdt': _safe_float_or_none(status.get('ask_depth_usdt')),
@@ -7740,6 +7985,10 @@ class SignalEngine(BaseEngine):
                 'selector_quality_summary': status.get('selector_quality_summary'),
                 'selector_quality_score': _safe_float_or_none(status.get('selector_quality_score')),
                 'selector_quality_risk_multiplier': _safe_float_or_none(status.get('selector_quality_risk_multiplier')),
+                'feature_score_value': _safe_float_or_none(status.get('feature_score_value')),
+                'feature_score_components': status.get('feature_score_components'),
+                'feature_score_reason': status.get('feature_score_reason'),
+                'feature_score_risk_multiplier': _safe_float_or_none(status.get('feature_score_risk_multiplier')),
                 'strategy_adaptation_summary': status.get('strategy_adaptation_summary'),
                 'strategy_adaptive_risk_multiplier': _safe_float_or_none(status.get('strategy_adaptive_risk_multiplier')),
                 'volatility_risk_multiplier': _safe_float_or_none(status.get('volatility_risk_multiplier')),
@@ -7802,6 +8051,10 @@ class SignalEngine(BaseEngine):
                     'selector_quality_risk_multiplier': _safe_float_or_none(plan.get('selector_quality_risk_multiplier')),
                     'selector_quality_score': _safe_float_or_none(plan.get('selector_quality_score')),
                     'selector_quality_summary': plan.get('selector_quality_summary'),
+                    'feature_score_value': _safe_float_or_none(plan.get('feature_score_value')),
+                    'feature_score_components': plan.get('feature_score_components'),
+                    'feature_score_reason': plan.get('feature_score_reason'),
+                    'feature_score_risk_multiplier': _safe_float_or_none(plan.get('feature_score_risk_multiplier')),
                     'volatility_risk_multiplier': _safe_float_or_none(plan.get('volatility_risk_multiplier')),
                     'meta_label_risk_multiplier': _safe_float_or_none(plan.get('meta_label_risk_multiplier')),
                     'trend_health_risk_multiplier': _safe_float_or_none(plan.get('trend_health_risk_multiplier')),
@@ -8142,6 +8395,9 @@ class SignalEngine(BaseEngine):
             'donchian_high_prev': don_high_prev,
             'donchian_low_prev': don_low_prev,
             'donchian_width_pct': don_width_pct,
+            'bb_width_percentile': entry_metrics.get('bb_width_percentile'),
+            'keltner_squeeze_on': entry_metrics.get('keltner_squeeze_on'),
+            'squeeze_release_state': entry_metrics.get('squeeze_release_state'),
             'htf_ready': htf_ready,
             'htf_close': htf_curr_close,
             'htf_ema_fast': htf_ema_fast,
@@ -8204,13 +8460,16 @@ class SignalEngine(BaseEngine):
             'bb_width_pct': entry_metrics.get('bb_width_pct'),
             'bb_width_prev_pct': entry_metrics.get('bb_width_prev_pct'),
             'bb_width_min_pct': entry_metrics.get('bb_width_min_pct'),
+            'bb_width_percentile': entry_metrics.get('bb_width_percentile'),
             'keltner_upper': entry_metrics.get('keltner_upper'),
             'keltner_lower': entry_metrics.get('keltner_lower'),
             'keltner_mid': entry_metrics.get('keltner_mid'),
             'keltner_width_pct': entry_metrics.get('keltner_width_pct'),
             'keltner_width_prev_pct': entry_metrics.get('keltner_width_prev_pct'),
+            'keltner_squeeze_on': entry_metrics.get('keltner_squeeze_on'),
             'range_expansion_ratio': entry_metrics.get('range_expansion_ratio'),
             'range_compression_ratio': entry_metrics.get('range_compression_ratio'),
+            'squeeze_release_state': entry_metrics.get('squeeze_release_state'),
             'vwap': entry_metrics.get('vwap'),
             'vwap_slope': entry_metrics.get('vwap_slope'),
             'vwap_reason': entry_metrics.get('vwap_reason'),
@@ -8245,9 +8504,16 @@ class SignalEngine(BaseEngine):
             'funding_rate': status.get('funding_rate'),
             'next_funding_time': status.get('next_funding_time'),
             'open_interest_delta_pct': status.get('open_interest_delta_pct'),
+            'open_interest_delta_z': status.get('open_interest_delta_z'),
+            'open_interest_acceleration': status.get('open_interest_acceleration'),
+            'open_interest_hist_samples': status.get('open_interest_hist_samples'),
             'taker_buy_sell_ratio': status.get('taker_buy_sell_ratio'),
             'long_short_ratio': status.get('long_short_ratio'),
             'orderbook_imbalance_pct': status.get('orderbook_imbalance_pct'),
+            'rolling_orderbook_imbalance_pct': status.get('rolling_orderbook_imbalance_pct'),
+            'rolling_orderbook_imbalance_delta': status.get('rolling_orderbook_imbalance_delta'),
+            'rolling_ofi_score': status.get('rolling_ofi_score'),
+            'rolling_ofi_samples': status.get('rolling_ofi_samples'),
             'futures_spread_pct': status.get('futures_spread_pct'),
             'bid_depth_usdt': status.get('bid_depth_usdt'),
             'ask_depth_usdt': status.get('ask_depth_usdt'),
@@ -8260,6 +8526,12 @@ class SignalEngine(BaseEngine):
         }
         filter_values = self._enrich_utbreakout_trend_health_values(filter_values, closed, cfg, atr_series)
         filter_values = self._enrich_utbreakout_strategy_quality_values(filter_values, closed, cfg)
+        feature_score = self._calculate_utbreakout_feature_score(side, cfg, filter_values)
+        filter_values['feature_score'] = feature_score
+        status['feature_score'] = feature_score
+        status['feature_score_value'] = feature_score.get('score')
+        status['feature_score_components'] = feature_score.get('components')
+        status['feature_score_reason'] = feature_score.get('reason')
         bias_continuation_multiplier = 1.0
         if candidate_type == 'bias_state':
             bias_continuation = self._evaluate_utbreakout_bias_continuation(
@@ -8336,6 +8608,16 @@ class SignalEngine(BaseEngine):
         status['selector_quality_score'] = selector_quality.get('score')
         status['selector_quality_summary'] = selector_quality.get('summary')
         status['selector_quality_risk_multiplier'] = selector_quality_multiplier
+
+        feature_score_multiplier = 1.0
+        selected_set_id = int(selected_set.get('id') or 0) if isinstance(selected_set, dict) else 0
+        if selected_set_id in {61, 62, 63} and bool(cfg.get('feature_score_enabled', True)):
+            score_value = _safe_float_or_none((feature_score or {}).get('score'))
+            reduce_below = float(cfg.get('feature_score_reduce_below', 65.0) or 65.0)
+            min_multiplier = min(1.0, max(0.0, float(cfg.get('feature_score_min_risk_multiplier', 0.60) or 0.60)))
+            if score_value is not None and score_value < reduce_below:
+                feature_score_multiplier = max(min_multiplier, min(1.0, score_value / max(reduce_below, 1e-9)))
+            status['feature_score_risk_multiplier'] = feature_score_multiplier
 
         strategy_adaptation = self._build_utbreakout_strategy_adaptation(symbol, side, cfg, selected_set, filter_values)
         strategy_risk_multiplier = min(1.0, max(0.0, float(strategy_adaptation.get('risk_multiplier', 1.0) or 0.0)))
@@ -8475,6 +8757,9 @@ class SignalEngine(BaseEngine):
         if selector_quality_multiplier < 0.999:
             risk_per_trade_percent *= selector_quality_multiplier
             max_risk_per_trade_usdt *= selector_quality_multiplier
+        if feature_score_multiplier < 0.999:
+            risk_per_trade_percent *= feature_score_multiplier
+            max_risk_per_trade_usdt *= feature_score_multiplier
         try:
             plan = calculate_risk_plan(
                 side=side,
@@ -8525,6 +8810,10 @@ class SignalEngine(BaseEngine):
             'selector_quality_risk_multiplier': selector_quality_multiplier,
             'selector_quality_score': selector_quality.get('score'),
             'selector_quality_summary': selector_quality.get('summary'),
+            'feature_score_value': feature_score.get('score'),
+            'feature_score_components': feature_score.get('components'),
+            'feature_score_reason': feature_score.get('reason'),
+            'feature_score_risk_multiplier': feature_score_multiplier,
             'strategy_adaptive_risk_multiplier': strategy_risk_multiplier,
             'strategy_adaptation_summary': strategy_adaptation.get('summary'),
             'volatility_risk_multiplier': strategy_adaptation.get('volatility_risk_multiplier'),
@@ -8574,6 +8863,7 @@ class SignalEngine(BaseEngine):
                 * strategy_risk_multiplier
                 * quality_score_v2_multiplier
                 * selector_quality_multiplier
+                * feature_score_multiplier
             ),
         )
         if micro_reject:
@@ -8930,7 +9220,10 @@ class SignalEngine(BaseEngine):
                 'donchian_low_prev': metrics.get('donchian_low_prev'),
                 'keltner_upper': metrics.get('keltner_upper'),
                 'keltner_lower': metrics.get('keltner_lower'),
+                'bb_width_percentile': metrics.get('bb_width_percentile'),
+                'keltner_squeeze_on': metrics.get('keltner_squeeze_on'),
                 'range_expansion_ratio': metrics.get('range_expansion_ratio'),
+                'squeeze_release_state': metrics.get('squeeze_release_state'),
                 'htf_ready': htf_ready,
                 'htf_close': htf_close,
                 'htf_ema_fast': htf_ema_fast,
@@ -8939,9 +9232,16 @@ class SignalEngine(BaseEngine):
                 'funding_rate': futures_context.get('funding_rate'),
                 'next_funding_time': futures_context.get('next_funding_time'),
                 'open_interest_delta_pct': futures_context.get('open_interest_delta_pct'),
+                'open_interest_delta_z': futures_context.get('open_interest_delta_z'),
+                'open_interest_acceleration': futures_context.get('open_interest_acceleration'),
+                'open_interest_hist_samples': futures_context.get('open_interest_hist_samples'),
                 'taker_buy_sell_ratio': futures_context.get('taker_buy_sell_ratio'),
                 'long_short_ratio': futures_context.get('long_short_ratio'),
                 'orderbook_imbalance_pct': futures_context.get('orderbook_imbalance_pct'),
+                'rolling_orderbook_imbalance_pct': futures_context.get('rolling_orderbook_imbalance_pct'),
+                'rolling_orderbook_imbalance_delta': futures_context.get('rolling_orderbook_imbalance_delta'),
+                'rolling_ofi_score': futures_context.get('rolling_ofi_score'),
+                'rolling_ofi_samples': futures_context.get('rolling_ofi_samples'),
                 'futures_spread_pct': futures_context.get('futures_spread_pct'),
                 'bid_depth_usdt': futures_context.get('bid_depth_usdt'),
                 'ask_depth_usdt': futures_context.get('ask_depth_usdt'),
@@ -9121,13 +9421,16 @@ class SignalEngine(BaseEngine):
                 'bb_width_pct': metrics.get('bb_width_pct'),
                 'bb_width_prev_pct': metrics.get('bb_width_prev_pct'),
                 'bb_width_min_pct': metrics.get('bb_width_min_pct'),
+                'bb_width_percentile': metrics.get('bb_width_percentile'),
                 'keltner_upper': metrics.get('keltner_upper'),
                 'keltner_lower': metrics.get('keltner_lower'),
                 'keltner_mid': metrics.get('keltner_mid'),
                 'keltner_width_pct': metrics.get('keltner_width_pct'),
                 'keltner_width_prev_pct': metrics.get('keltner_width_prev_pct'),
+                'keltner_squeeze_on': metrics.get('keltner_squeeze_on'),
                 'range_expansion_ratio': metrics.get('range_expansion_ratio'),
                 'range_compression_ratio': metrics.get('range_compression_ratio'),
+                'squeeze_release_state': metrics.get('squeeze_release_state'),
                 'vwap': metrics.get('vwap'),
                 'vwap_slope': metrics.get('vwap_slope'),
                 'vwap_reason': metrics.get('vwap_reason'),
@@ -9162,9 +9465,16 @@ class SignalEngine(BaseEngine):
                 'funding_rate': futures_context.get('funding_rate'),
                 'next_funding_time': futures_context.get('next_funding_time'),
                 'open_interest_delta_pct': futures_context.get('open_interest_delta_pct'),
+                'open_interest_delta_z': futures_context.get('open_interest_delta_z'),
+                'open_interest_acceleration': futures_context.get('open_interest_acceleration'),
+                'open_interest_hist_samples': futures_context.get('open_interest_hist_samples'),
                 'taker_buy_sell_ratio': futures_context.get('taker_buy_sell_ratio'),
                 'long_short_ratio': futures_context.get('long_short_ratio'),
                 'orderbook_imbalance_pct': futures_context.get('orderbook_imbalance_pct'),
+                'rolling_orderbook_imbalance_pct': futures_context.get('rolling_orderbook_imbalance_pct'),
+                'rolling_orderbook_imbalance_delta': futures_context.get('rolling_orderbook_imbalance_delta'),
+                'rolling_ofi_score': futures_context.get('rolling_ofi_score'),
+                'rolling_ofi_samples': futures_context.get('rolling_ofi_samples'),
                 'futures_spread_pct': futures_context.get('futures_spread_pct'),
                 'bid_depth_usdt': futures_context.get('bid_depth_usdt'),
                 'ask_depth_usdt': futures_context.get('ask_depth_usdt'),
@@ -9173,6 +9483,8 @@ class SignalEngine(BaseEngine):
             }
             filter_values = self._enrich_utbreakout_trend_health_values(filter_values, closed, cfg, status_atr_series)
             filter_values = self._enrich_utbreakout_strategy_quality_values(filter_values, closed, cfg)
+            feature_score = self._calculate_utbreakout_feature_score(side, cfg, filter_values)
+            filter_values['feature_score'] = feature_score
             selected_items = self._evaluate_utbreakout_set_filter_items(side, selected_set, cfg, filter_values)
             items = [
                 ("UTBot 방향", ut_state, ut_detail_text),
@@ -9204,6 +9516,7 @@ class SignalEngine(BaseEngine):
             selector_multiplier = float(selector_quality.get('risk_multiplier', 1.0) or 1.0)
             selector_state = True if selector_multiplier >= 0.999 else 'reduced'
             items.append(("코인 선택 품질", selector_state, selector_quality.get('summary')))
+            items.append(("Feature Score", True, f"{feature_score.get('score', 0):.1f} / {feature_score.get('reason')}"))
             adaptation = self._build_utbreakout_strategy_adaptation(symbol, side, cfg, selected_set, filter_values)
             adaptation_health = adaptation.get('trend_health') if isinstance(adaptation.get('trend_health'), dict) else {}
             adaptation_quality = adaptation.get('strategy_quality') if isinstance(adaptation.get('strategy_quality'), dict) else {}
@@ -9266,6 +9579,30 @@ class SignalEngine(BaseEngine):
                 micro_line = "Micro Auto: ON / 아직 계획 없음"
         else:
             micro_line = "Micro Auto: OFF"
+        status_side = candidate_side if candidate_side in {'long', 'short'} else 'long'
+        status_filter_values = _market_quality_filter_values()
+        status_feature_score = self._calculate_utbreakout_feature_score(status_side, cfg, status_filter_values)
+        orderflow_line = (
+            f"Orderflow: imb {_fmt(futures_context.get('rolling_orderbook_imbalance_pct'), 2)}% / "
+            f"Δ {_fmt(futures_context.get('rolling_orderbook_imbalance_delta'), 2)} / "
+            f"OFI {_fmt(futures_context.get('rolling_ofi_score'), 2)} / "
+            f"samples {int(float(futures_context.get('rolling_ofi_samples') or 0))}"
+        )
+        oi_line = (
+            f"OI/Funding: OI z {_fmt(futures_context.get('open_interest_delta_z'), 2)} / "
+            f"accel {_fmt(futures_context.get('open_interest_acceleration'), 3)} / "
+            f"funding {_fmt(futures_context.get('funding_rate'), 6)} / "
+            f"L/S {_fmt(futures_context.get('long_short_ratio'), 3)}"
+        )
+        squeeze_line = (
+            f"Squeeze: BB pct {_fmt(metrics.get('bb_width_percentile'), 2)} / "
+            f"Keltner {'ON' if metrics.get('keltner_squeeze_on') is True else 'OFF' if metrics.get('keltner_squeeze_on') is False else 'n/a'} / "
+            f"range {_fmt(metrics.get('range_expansion_ratio'), 2)} / state {metrics.get('squeeze_release_state') or 'n/a'}"
+        )
+        feature_line = (
+            f"Feature Score: {_fmt(status_feature_score.get('score'), 1)} / "
+            f"{status_feature_score.get('reason') or 'n/a'}"
+        )
         text_lines = [
             "🚦 UT Breakout 조건 스테이터스",
             *position_scan_context,
@@ -9282,6 +9619,10 @@ class SignalEngine(BaseEngine):
             opposite_set_exit_detail,
             f"시장 레짐: {market_regime_context.get('summary') or '데이터 대기'}",
             f"AUTO 점수: {score_line}",
+            orderflow_line,
+            oi_line,
+            squeeze_line,
+            feature_line,
             self.get_coin_selector_symbol_summary(symbol),
             "주의: 실제 진입은 아래 선택 Set 조건, 리스크, 숏 가드, 시장 품질 게이트까지 모두 봅니다.",
             f"최종: LONG {'가능' if long_ok else '대기'} / SHORT {'가능' if short_ok else '대기'}",
@@ -9502,6 +9843,25 @@ class SignalEngine(BaseEngine):
         except Exception as exc:
             htf_error = str(exc)
 
+        futures_context = {}
+        try:
+            futures_context = (
+                (auto_analysis or {}).get('futures_context')
+                if isinstance(auto_analysis, dict) and isinstance((auto_analysis or {}).get('futures_context'), dict)
+                else None
+            )
+            if futures_context is None:
+                futures_context = await self._fetch_utbreakout_futures_context(symbol)
+            futures_context = dict(futures_context or {})
+        except Exception as exc:
+            futures_context = {'futures_context_error': str(exc)}
+        market_regime_context = {}
+        try:
+            market_regime_context = await self._fetch_utbreakout_market_regime_context(cfg)
+            market_regime_context = dict(market_regime_context or {})
+        except Exception as exc:
+            market_regime_context = {'error': str(exc)}
+
         daily_entries = self.db.get_daily_entry_count()
         _, daily_pnl = self.db.get_daily_stats()
         max_losses = int(cfg.get('max_consecutive_losses', 3) or 3)
@@ -9550,13 +9910,16 @@ class SignalEngine(BaseEngine):
             'bb_width_pct': metrics.get('bb_width_pct'),
             'bb_width_prev_pct': metrics.get('bb_width_prev_pct'),
             'bb_width_min_pct': metrics.get('bb_width_min_pct'),
+            'bb_width_percentile': metrics.get('bb_width_percentile'),
             'keltner_upper': metrics.get('keltner_upper'),
             'keltner_lower': metrics.get('keltner_lower'),
             'keltner_mid': metrics.get('keltner_mid'),
             'keltner_width_pct': metrics.get('keltner_width_pct'),
             'keltner_width_prev_pct': metrics.get('keltner_width_prev_pct'),
+            'keltner_squeeze_on': metrics.get('keltner_squeeze_on'),
             'range_expansion_ratio': metrics.get('range_expansion_ratio'),
             'range_compression_ratio': metrics.get('range_compression_ratio'),
+            'squeeze_release_state': metrics.get('squeeze_release_state'),
             'vwap': metrics.get('vwap'),
             'vwap_slope': metrics.get('vwap_slope'),
             'vwap_reason': metrics.get('vwap_reason'),
@@ -9588,7 +9951,33 @@ class SignalEngine(BaseEngine):
             'htf_gap_pct': htf_gap_pct,
             'htf_supertrend_direction': htf_supertrend_direction,
             'htf_supertrend_reason': htf_supertrend_reason,
+            'funding_rate': futures_context.get('funding_rate'),
+            'next_funding_time': futures_context.get('next_funding_time'),
+            'open_interest_delta_pct': futures_context.get('open_interest_delta_pct'),
+            'open_interest_delta_z': futures_context.get('open_interest_delta_z'),
+            'open_interest_acceleration': futures_context.get('open_interest_acceleration'),
+            'open_interest_hist_samples': futures_context.get('open_interest_hist_samples'),
+            'taker_buy_sell_ratio': futures_context.get('taker_buy_sell_ratio'),
+            'long_short_ratio': futures_context.get('long_short_ratio'),
+            'orderbook_imbalance_pct': futures_context.get('orderbook_imbalance_pct'),
+            'rolling_orderbook_imbalance_pct': futures_context.get('rolling_orderbook_imbalance_pct'),
+            'rolling_orderbook_imbalance_delta': futures_context.get('rolling_orderbook_imbalance_delta'),
+            'rolling_ofi_score': futures_context.get('rolling_ofi_score'),
+            'rolling_ofi_samples': futures_context.get('rolling_ofi_samples'),
+            'futures_spread_pct': futures_context.get('futures_spread_pct'),
+            'bid_depth_usdt': futures_context.get('bid_depth_usdt'),
+            'ask_depth_usdt': futures_context.get('ask_depth_usdt'),
+            'basis_pct': futures_context.get('basis_pct'),
+            'prediction_up_probability': futures_context.get('prediction_up_probability'),
+            'prediction_edge': futures_context.get('prediction_edge'),
+            'prediction_score': futures_context.get('prediction_score'),
+            'prediction_title': futures_context.get('prediction_title'),
+            'market_regime_context': market_regime_context,
         }
+        filter_values = self._enrich_utbreakout_trend_health_values(filter_values, closed, cfg, None)
+        filter_values = self._enrich_utbreakout_strategy_quality_values(filter_values, closed, cfg)
+        feature_score_analysis = self._calculate_utbreakout_feature_score('long', cfg, filter_values)
+        filter_values['feature_score'] = feature_score_analysis
         long_filter_items = self._evaluate_utbreakout_set_filter_items('long', selected_set, cfg, filter_values)
         bias_continuation_ok = True
         bias_continuation_summary = "fresh/waiting"
@@ -9886,6 +10275,10 @@ class SignalEngine(BaseEngine):
             f"- LONG 핵심: UT {_ok_text(candidate_side == 'long')} / BiasCont {_ok_text(bias_continuation_ok)} / QScore {_ok_text(quality_score_v2_analysis.get('state'))} / Set필터 {_ok_text(not failed_filters)} / 일일리스크 {_ok_text(daily_ok)} / 리스크계획 {_ok_text(risk_plan is not None)}",
             f"- Bias continuation: {bias_continuation_summary}",
             f"- 통합 품질 점수: {quality_score_v2_analysis.get('summary')}",
+            f"- Feature Score: {_fmt(feature_score_analysis.get('score'), 1)} / {feature_score_analysis.get('reason')}",
+            f"- Orderflow: imb {_fmt(futures_context.get('rolling_orderbook_imbalance_pct'), 2)}% / Δ {_fmt(futures_context.get('rolling_orderbook_imbalance_delta'), 2)} / OFI {_fmt(futures_context.get('rolling_ofi_score'), 2)} / samples {int(float(futures_context.get('rolling_ofi_samples') or 0))}",
+            f"- OI/Funding: OI z {_fmt(futures_context.get('open_interest_delta_z'), 2)} / accel {_fmt(futures_context.get('open_interest_acceleration'), 3)} / funding {_fmt(futures_context.get('funding_rate'), 6)} / L/S {_fmt(futures_context.get('long_short_ratio'), 3)}",
+            f"- Squeeze: BB pct {_fmt(metrics.get('bb_width_percentile'), 2)} / Keltner {'ON' if metrics.get('keltner_squeeze_on') is True else 'OFF' if metrics.get('keltner_squeeze_on') is False else 'n/a'} / range {_fmt(metrics.get('range_expansion_ratio'), 2)} / state {metrics.get('squeeze_release_state') or 'n/a'}",
             f"- 일일리스크 상세: {daily_detail}",
             "",
             "3) LONG 필터 상세",
@@ -10004,6 +10397,25 @@ class SignalEngine(BaseEngine):
         except Exception as exc:
             htf_error = str(exc)
 
+        futures_context = {}
+        try:
+            futures_context = (
+                (auto_analysis or {}).get('futures_context')
+                if isinstance(auto_analysis, dict) and isinstance((auto_analysis or {}).get('futures_context'), dict)
+                else None
+            )
+            if futures_context is None:
+                futures_context = await self._fetch_utbreakout_futures_context(symbol)
+            futures_context = dict(futures_context or {})
+        except Exception:
+            futures_context = {}
+        market_regime_context = {}
+        try:
+            market_regime_context = await self._fetch_utbreakout_market_regime_context(fb_cfg)
+            market_regime_context = dict(market_regime_context or {})
+        except Exception:
+            market_regime_context = {}
+
         entry_price = float(metrics.get('close') or closed['close'].astype(float).iloc[-1])
         filter_values = {
             'entry_price': entry_price,
@@ -10032,13 +10444,16 @@ class SignalEngine(BaseEngine):
             'bb_width_pct': metrics.get('bb_width_pct'),
             'bb_width_prev_pct': metrics.get('bb_width_prev_pct'),
             'bb_width_min_pct': metrics.get('bb_width_min_pct'),
+            'bb_width_percentile': metrics.get('bb_width_percentile'),
             'keltner_upper': metrics.get('keltner_upper'),
             'keltner_lower': metrics.get('keltner_lower'),
             'keltner_mid': metrics.get('keltner_mid'),
             'keltner_width_pct': metrics.get('keltner_width_pct'),
             'keltner_width_prev_pct': metrics.get('keltner_width_prev_pct'),
+            'keltner_squeeze_on': metrics.get('keltner_squeeze_on'),
             'range_expansion_ratio': metrics.get('range_expansion_ratio'),
             'range_compression_ratio': metrics.get('range_compression_ratio'),
+            'squeeze_release_state': metrics.get('squeeze_release_state'),
             'vwap': metrics.get('vwap'),
             'vwap_slope': metrics.get('vwap_slope'),
             'vwap_reason': metrics.get('vwap_reason'),
@@ -10070,7 +10485,28 @@ class SignalEngine(BaseEngine):
             'htf_gap_pct': htf_gap_pct,
             'htf_supertrend_direction': htf_supertrend_direction,
             'htf_supertrend_reason': htf_supertrend_reason,
+            'funding_rate': futures_context.get('funding_rate'),
+            'next_funding_time': futures_context.get('next_funding_time'),
+            'open_interest_delta_pct': futures_context.get('open_interest_delta_pct'),
+            'open_interest_delta_z': futures_context.get('open_interest_delta_z'),
+            'open_interest_acceleration': futures_context.get('open_interest_acceleration'),
+            'open_interest_hist_samples': futures_context.get('open_interest_hist_samples'),
+            'taker_buy_sell_ratio': futures_context.get('taker_buy_sell_ratio'),
+            'long_short_ratio': futures_context.get('long_short_ratio'),
+            'orderbook_imbalance_pct': futures_context.get('orderbook_imbalance_pct'),
+            'rolling_orderbook_imbalance_pct': futures_context.get('rolling_orderbook_imbalance_pct'),
+            'rolling_orderbook_imbalance_delta': futures_context.get('rolling_orderbook_imbalance_delta'),
+            'rolling_ofi_score': futures_context.get('rolling_ofi_score'),
+            'rolling_ofi_samples': futures_context.get('rolling_ofi_samples'),
+            'futures_spread_pct': futures_context.get('futures_spread_pct'),
+            'bid_depth_usdt': futures_context.get('bid_depth_usdt'),
+            'ask_depth_usdt': futures_context.get('ask_depth_usdt'),
+            'basis_pct': futures_context.get('basis_pct'),
+            'market_regime_context': market_regime_context,
         }
+        filter_values = self._enrich_utbreakout_trend_health_values(filter_values, closed, fb_cfg, None)
+        filter_values = self._enrich_utbreakout_strategy_quality_values(filter_values, closed, fb_cfg)
+        filter_values['feature_score'] = self._calculate_utbreakout_feature_score(opposite_side, fb_cfg, filter_values)
         filter_items = self._evaluate_utbreakout_set_filter_items(opposite_side, selected_set, fb_cfg, filter_values)
         failed_items = [item for item in filter_items if item.get('state') is not True]
         if failed_items:
@@ -11775,6 +12211,22 @@ class SignalEngine(BaseEngine):
         reason = f"RSIBB 대기: {rsi_reason} / {bb_reason}"
         return None, reason, detail
 
+    def _rsibb_runtime_guard(self, strategy_params):
+        cfg = (strategy_params or {}).get('RSIBB', {}) or {}
+        if not bool(cfg.get('rsibb_enabled', False)):
+            return False, "RSIBB 안전장치: rsibb_enabled=False (기본 비활성)"
+        paper_only = bool(cfg.get('rsibb_paper_only', True))
+        mode = None
+        try:
+            mode = self.ctrl.get_exchange_mode() if getattr(self, 'ctrl', None) else None
+        except Exception:
+            mode = None
+        if paper_only and mode == BINANCE_MAINNET:
+            return False, "RSIBB 안전장치: paper_only=True 상태에서는 메인넷 진입 차단"
+        if bool(cfg.get('rsibb_regime_guard_enabled', True)):
+            return True, "RSIBB regime guard ON"
+        return True, "RSIBB guard pass"
+
     def _calculate_ut_hybrid_signal(self, symbol, df, strategy_params, hybrid_strategy):
         hybrid_strategy = str(hybrid_strategy or '').lower()
         timing_label = UT_HYBRID_TIMING_LABELS.get(hybrid_strategy, 'Signal')
@@ -12873,10 +13325,32 @@ class SignalEngine(BaseEngine):
             + basis_score * 0.16
             + depth_score * 0.10
         )
+        rolling_imbalance = _safe_float_or_none(context.get('rolling_orderbook_imbalance_pct'))
+        rolling_delta = _safe_float_or_none(context.get('rolling_orderbook_imbalance_delta'))
+        rolling_samples = int(context.get('rolling_ofi_samples') or 0)
+        rolling_orderflow_score = 0.0
+        if rolling_imbalance is not None and taker_ratio is not None and rolling_samples >= 3:
+            rolling_orderflow_score = min(
+                100.0,
+                abs(rolling_imbalance) * 7.0
+                + abs(taker_ratio - 1.0) * 130.0
+                + (abs(rolling_delta or 0.0) * 3.0)
+            )
+            if spread is not None and spread > 0.05:
+                rolling_orderflow_score *= 0.45
+        oi_z = _safe_float_or_none(context.get('open_interest_delta_z'))
+        oi_acc = _safe_float_or_none(context.get('open_interest_acceleration'))
+        oi_funding_squeeze_score = funding_crowding_score
+        if oi_z is not None:
+            oi_base = min(100.0, max(0.0, oi_z / 2.0 * 100.0))
+            acc_bonus = min(20.0, max(0.0, (oi_acc or 0.0) * 80.0))
+            oi_funding_squeeze_score = min(100.0, (oi_base * 0.65) + (funding_crowding_score * 0.30) + acc_bonus)
         return {
             'prediction_orderflow_score': round(orderflow_score, 2),
+            'rolling_orderflow_score': round(rolling_orderflow_score, 2),
             'prediction_depth_score': round(depth_score, 2),
             'prediction_oi_funding_score': round(funding_crowding_score, 2),
+            'oi_funding_squeeze_score': round(oi_funding_squeeze_score, 2),
             'prediction_liquidation_score': round(liquidation_proxy_score, 2),
             'prediction_odds_score': round(prediction_score, 2),
             'prediction_event_guard_score': round(event_guard_score, 2),
@@ -12885,13 +13359,279 @@ class SignalEngine(BaseEngine):
             'prediction_cross_market_score': round(cross_market_score, 2),
         }
 
+    def _build_utbreakout_orderflow_snapshot(self, depth, timestamp=None):
+        bids = depth.get('bids') if isinstance(depth, dict) else []
+        asks = depth.get('asks') if isinstance(depth, dict) else []
+
+        def _levels(rows, *, reverse=False):
+            levels = []
+            for row in rows or []:
+                if not isinstance(row, (list, tuple)) or len(row) < 2:
+                    continue
+                price = _safe_float_or_none(row[0])
+                qty = _safe_float_or_none(row[1])
+                if price is None or qty is None or price <= 0 or qty < 0:
+                    continue
+                levels.append((float(price), float(qty)))
+            return sorted(levels, key=lambda item: item[0], reverse=reverse)
+
+        bid_levels = _levels(bids, reverse=True)
+        ask_levels = _levels(asks, reverse=False)
+        if not bid_levels or not ask_levels:
+            return {}
+
+        best_bid = bid_levels[0][0]
+        best_ask = ask_levels[0][0]
+        mid = (best_bid + best_ask) / 2.0
+        bid_depth = sum(price * qty for price, qty in bid_levels)
+        ask_depth = sum(price * qty for price, qty in ask_levels)
+        if bid_depth < 0 or ask_depth < 0 or mid <= 0:
+            return {}
+        return {
+            'timestamp': float(timestamp if timestamp is not None else time.time()),
+            'bid_depth_usdt': float(bid_depth),
+            'ask_depth_usdt': float(ask_depth),
+            'orderbook_imbalance_pct': (bid_depth - ask_depth) / max(bid_depth + ask_depth, 1e-9) * 100.0,
+            'futures_spread_pct': (best_ask - best_bid) / max(abs(mid), 1e-9) * 100.0,
+            'best_bid': float(best_bid),
+            'best_ask': float(best_ask),
+        }
+
+    def _update_utbreakout_orderflow_snapshots(self, symbol, snapshot=None, *, window=5, max_samples=20):
+        snapshots = self._ensure_runtime_state_container('utbreakout_orderflow_snapshots')
+        symbol_key = str(symbol or '')
+        rows = list(snapshots.get(symbol_key) or [])
+        if isinstance(snapshot, dict) and snapshot:
+            clean = {}
+            for key in (
+                'timestamp',
+                'bid_depth_usdt',
+                'ask_depth_usdt',
+                'orderbook_imbalance_pct',
+                'futures_spread_pct',
+                'best_bid',
+                'best_ask',
+            ):
+                value = _safe_float_or_none(snapshot.get(key))
+                if value is not None:
+                    clean[key] = value
+            if clean.get('timestamp') is not None:
+                rows.append(clean)
+        rows = rows[-max(1, int(max_samples or 20)):]
+        snapshots[symbol_key] = rows
+
+        try:
+            window = max(1, int(window or 5))
+        except (TypeError, ValueError):
+            window = 5
+        recent = [
+            row for row in rows[-window:]
+            if _safe_float_or_none((row or {}).get('orderbook_imbalance_pct')) is not None
+        ]
+        latest = rows[-1] if rows else {}
+        context = {}
+        if latest:
+            context.update({
+                'futures_best_bid': latest.get('best_bid'),
+                'futures_best_ask': latest.get('best_ask'),
+                'best_bid': latest.get('best_bid'),
+                'best_ask': latest.get('best_ask'),
+                'futures_spread_pct': latest.get('futures_spread_pct'),
+                'bid_depth_usdt': latest.get('bid_depth_usdt'),
+                'ask_depth_usdt': latest.get('ask_depth_usdt'),
+                'orderbook_imbalance_pct': latest.get('orderbook_imbalance_pct'),
+                'orderflow_snapshot_ts': latest.get('timestamp'),
+            })
+        if recent:
+            imbalances = [float(row.get('orderbook_imbalance_pct')) for row in recent]
+            rolling = sum(imbalances) / len(imbalances)
+            delta = imbalances[-1] - imbalances[0] if len(imbalances) >= 2 else 0.0
+            context.update({
+                'rolling_orderbook_imbalance_pct': rolling,
+                'rolling_orderbook_imbalance_delta': delta,
+                'rolling_ofi_score': rolling + (delta * 0.5),
+                'rolling_ofi_samples': len(imbalances),
+            })
+        else:
+            context.update({
+                'rolling_orderbook_imbalance_pct': None,
+                'rolling_orderbook_imbalance_delta': None,
+                'rolling_ofi_score': None,
+                'rolling_ofi_samples': 0,
+            })
+        return {key: value for key, value in context.items() if value is not None}
+
+    def _calculate_utbreakout_open_interest_stats(self, oi_hist):
+        if not isinstance(oi_hist, list) or len(oi_hist) < 2:
+            return {
+                'open_interest_delta_pct': None,
+                'open_interest_delta_z': None,
+                'open_interest_acceleration': None,
+                'open_interest_hist_samples': len(oi_hist) if isinstance(oi_hist, list) else 0,
+            }
+        rows = sorted(
+            [row for row in oi_hist if isinstance(row, dict)],
+            key=lambda row: int(row.get('timestamp', 0) or 0),
+        )
+        values = []
+        for row in rows:
+            value = _safe_float_or_none(row.get('sumOpenInterestValue') or row.get('sumOpenInterest'))
+            if value is not None and value > 0:
+                values.append(float(value))
+        if len(values) < 2:
+            return {
+                'open_interest_delta_pct': None,
+                'open_interest_delta_z': None,
+                'open_interest_acceleration': None,
+                'open_interest_hist_samples': len(values),
+            }
+
+        changes = []
+        for prev, curr in zip(values, values[1:]):
+            if prev == 0.0:
+                continue
+            pct = (curr - prev) / max(abs(prev), 1e-9) * 100.0
+            if np.isfinite(pct):
+                changes.append(float(pct))
+        if not changes:
+            return {
+                'open_interest_delta_pct': None,
+                'open_interest_delta_z': None,
+                'open_interest_acceleration': None,
+                'open_interest_hist_samples': len(values),
+            }
+
+        latest = changes[-1]
+        z_score = None
+        if len(changes) >= 3:
+            mean = sum(changes) / len(changes)
+            variance = sum((item - mean) ** 2 for item in changes) / len(changes)
+            std = variance ** 0.5
+            if std > 0 and np.isfinite(std):
+                z_score = (latest - mean) / std
+        acceleration = changes[-1] - changes[-2] if len(changes) >= 2 else None
+        return {
+            'open_interest_delta_pct': latest,
+            'open_interest_delta_z': z_score,
+            'open_interest_acceleration': acceleration,
+            'open_interest_hist_samples': len(values),
+        }
+
+    def _calculate_utbreakout_feature_score(self, side, cfg, values):
+        side = str(side or '').lower()
+        values = dict(values or {})
+
+        def _f(key):
+            return _safe_float_or_none(values.get(key))
+
+        def _score_between(value, low, high):
+            if value is None or high <= low:
+                return 50.0
+            return max(0.0, min(100.0, (float(value) - float(low)) / (float(high) - float(low)) * 100.0))
+
+        trend_parts = []
+        adx = _f('adx')
+        if adx is not None:
+            trend_parts.append(_score_between(adx, 15.0, 32.0))
+        htf_close = _f('htf_close')
+        htf_fast = _f('htf_ema_fast')
+        htf_slow = _f('htf_ema_slow')
+        if htf_close is not None and htf_fast is not None and htf_slow is not None:
+            aligned = (htf_close > htf_slow and htf_fast > htf_slow) if side == 'long' else (htf_close < htf_slow and htf_fast < htf_slow)
+            trend_parts.append(85.0 if aligned else 25.0)
+        macd_hist = _f('macd_hist')
+        if macd_hist is not None:
+            trend_parts.append(70.0 if (macd_hist > 0 if side == 'long' else macd_hist < 0) else 35.0)
+        trend = sum(trend_parts) / len(trend_parts) if trend_parts else 50.0
+
+        atr_pct = _f('atr_pct')
+        range_ratio = _f('range_expansion_ratio')
+        bb_percentile = _f('bb_width_percentile')
+        volatility_parts = []
+        if atr_pct is not None:
+            volatility_parts.append(85.0 if 0.12 <= atr_pct <= 1.20 else 40.0 if atr_pct < 0.12 else 55.0)
+        if range_ratio is not None:
+            volatility_parts.append(_score_between(range_ratio, 0.85, 1.70))
+        if bb_percentile is not None:
+            volatility_parts.append(max(0.0, min(100.0, 100.0 - abs(bb_percentile - 35.0))))
+        volatility = sum(volatility_parts) / len(volatility_parts) if volatility_parts else 50.0
+
+        rolling_ofi = _f('rolling_orderbook_imbalance_pct')
+        taker_ratio = _f('taker_buy_sell_ratio')
+        orderflow_parts = []
+        if rolling_ofi is not None:
+            signed = rolling_ofi if side == 'long' else -rolling_ofi
+            orderflow_parts.append(_score_between(signed, -3.0, 8.0))
+        if taker_ratio is not None:
+            signed_ratio = (taker_ratio - 1.0) if side == 'long' else (1.0 - taker_ratio)
+            orderflow_parts.append(_score_between(signed_ratio, -0.04, 0.09))
+        orderflow = sum(orderflow_parts) / len(orderflow_parts) if orderflow_parts else 50.0
+
+        oi_z = _f('open_interest_delta_z')
+        oi_acc = _f('open_interest_acceleration')
+        funding = _f('funding_rate')
+        long_short = _f('long_short_ratio')
+        basis = _f('basis_pct')
+        oi_parts = []
+        if oi_z is not None:
+            oi_parts.append(_score_between(oi_z, -0.25, 1.75))
+        if oi_acc is not None:
+            oi_parts.append(_score_between(oi_acc, -0.20, 0.45))
+        if funding is not None:
+            adverse = funding if side == 'long' else -funding
+            oi_parts.append(max(0.0, 100.0 - _score_between(adverse, 0.0002, 0.0012)))
+        if long_short is not None:
+            adverse_ratio = long_short if side == 'long' else (1.0 / max(long_short, 1e-9))
+            oi_parts.append(max(0.0, 100.0 - _score_between(adverse_ratio, 1.20, 2.20)))
+        if basis is not None:
+            adverse_basis = basis if side == 'long' else -basis
+            oi_parts.append(max(0.0, 100.0 - _score_between(adverse_basis, 0.05, 0.35)))
+        oi_funding = sum(oi_parts) / len(oi_parts) if oi_parts else 50.0
+
+        spread = _f('futures_spread_pct')
+        bid_depth = _f('bid_depth_usdt') or 0.0
+        ask_depth = _f('ask_depth_usdt') or 0.0
+        min_depth = min(bid_depth, ask_depth)
+        liquidity_parts = []
+        if spread is not None:
+            liquidity_parts.append(max(0.0, 100.0 - _score_between(spread, 0.02, 0.12)))
+        if min_depth > 0:
+            liquidity_parts.append(_score_between(min_depth, 10000.0, 150000.0))
+        liquidity_cost = sum(liquidity_parts) / len(liquidity_parts) if liquidity_parts else 50.0
+
+        components = {
+            'trend': round(trend, 2),
+            'volatility': round(volatility, 2),
+            'orderflow': round(orderflow, 2),
+            'oi_funding': round(oi_funding, 2),
+            'liquidity_cost': round(liquidity_cost, 2),
+        }
+        score = (
+            trend * 0.24
+            + volatility * 0.18
+            + orderflow * 0.22
+            + oi_funding * 0.20
+            + liquidity_cost * 0.16
+        )
+        score = max(0.0, min(100.0, float(score)))
+        return {
+            'score': round(score, 2),
+            'components': components,
+            'reason': (
+                f"trend {components['trend']:.1f}, vol {components['volatility']:.1f}, "
+                f"OFI {components['orderflow']:.1f}, OI {components['oi_funding']:.1f}, "
+                f"liq {components['liquidity_cost']:.1f}"
+            ),
+        }
+
     async def _fetch_utbreakout_futures_context(self, symbol):
         if self.is_upbit_mode():
             return {}
         now = time.time()
         cached = self.utbreakout_futures_context_cache.get(symbol)
-        if isinstance(cached, dict) and (now - float(cached.get('cached_at', 0) or 0)) < 300:
-            return dict(cached.get('data') or {})
+        cached_at = float(cached.get('cached_at', 0) or 0) if isinstance(cached, dict) else 0.0
+        cache_fresh = isinstance(cached, dict) and (now - cached_at) < 300
+        context = dict((cached or {}).get('data') or {}) if cache_fresh else {}
         rest_symbol = ''
         try:
             rest_symbol = self.ctrl._build_binance_futures_rest_symbol(symbol)
@@ -12900,111 +13640,121 @@ class SignalEngine(BaseEngine):
         if not rest_symbol:
             return {}
 
-        context = {}
-        try:
-            premium = await self.ctrl._fetch_binance_public_json('/fapi/v1/premiumIndex', {'symbol': rest_symbol})
-            if isinstance(premium, dict):
-                context.update({
-                    'funding_rate': _safe_float_or_none(premium.get('lastFundingRate')),
-                    'next_funding_time': int(premium.get('nextFundingTime') or 0) or None,
-                    'mark_price': _safe_float_or_none(premium.get('markPrice')),
-                    'index_price': _safe_float_or_none(premium.get('indexPrice')),
-                })
-        except Exception as exc:
-            context['futures_context_error'] = f"premiumIndex: {exc}"
-
-        try:
-            oi = await self.ctrl._fetch_binance_public_json('/fapi/v1/openInterest', {'symbol': rest_symbol})
-            if isinstance(oi, dict):
-                context['open_interest'] = _safe_float_or_none(oi.get('openInterest'))
-                context['open_interest_ts'] = int(oi.get('time') or 0) or None
-        except Exception as exc:
-            if 'futures_context_error' not in context:
-                context['futures_context_error'] = f"openInterest: {exc}"
-
-        if context.get('open_interest') is not None and context.get('mark_price') is not None:
+        if not cache_fresh:
+            context = {}
             try:
-                context['open_interest_usdt'] = float(context['open_interest']) * float(context['mark_price'])
-            except (TypeError, ValueError):
-                pass
-        try:
-            depth = await self.ctrl._fetch_binance_public_json('/fapi/v1/depth', {'symbol': rest_symbol, 'limit': 20})
-            bids = depth.get('bids') if isinstance(depth, dict) else []
-            asks = depth.get('asks') if isinstance(depth, dict) else []
-            bid_levels = [
-                (float(row[0]), float(row[1]))
-                for row in bids or []
-                if isinstance(row, (list, tuple)) and len(row) >= 2
-            ]
-            ask_levels = [
-                (float(row[0]), float(row[1]))
-                for row in asks or []
-                if isinstance(row, (list, tuple)) and len(row) >= 2
-            ]
-            if bid_levels and ask_levels:
-                best_bid = bid_levels[0][0]
-                best_ask = ask_levels[0][0]
-                mid = (best_bid + best_ask) / 2.0
-                bid_depth = sum(price * qty for price, qty in bid_levels)
-                ask_depth = sum(price * qty for price, qty in ask_levels)
+                premium = await self.ctrl._fetch_binance_public_json('/fapi/v1/premiumIndex', {'symbol': rest_symbol})
+                if isinstance(premium, dict):
+                    context.update({
+                        'funding_rate': _safe_float_or_none(premium.get('lastFundingRate')),
+                        'next_funding_time': int(premium.get('nextFundingTime') or 0) or None,
+                        'mark_price': _safe_float_or_none(premium.get('markPrice')),
+                        'index_price': _safe_float_or_none(premium.get('indexPrice')),
+                    })
+            except Exception as exc:
+                context['futures_context_error'] = f"premiumIndex: {exc}"
+
+            try:
+                oi = await self.ctrl._fetch_binance_public_json('/fapi/v1/openInterest', {'symbol': rest_symbol})
+                if isinstance(oi, dict):
+                    context['open_interest'] = _safe_float_or_none(oi.get('openInterest'))
+                    context['open_interest_ts'] = int(oi.get('time') or 0) or None
+            except Exception as exc:
+                if 'futures_context_error' not in context:
+                    context['futures_context_error'] = f"openInterest: {exc}"
+
+            if context.get('open_interest') is not None and context.get('mark_price') is not None:
+                try:
+                    context['open_interest_usdt'] = float(context['open_interest']) * float(context['mark_price'])
+                except (TypeError, ValueError):
+                    pass
+
+            try:
+                oi_hist = await self.ctrl._fetch_binance_public_json('/futures/data/openInterestHist', {'symbol': rest_symbol, 'period': '15m', 'limit': 20})
                 context.update({
-                    'futures_best_bid': best_bid,
-                    'futures_best_ask': best_ask,
-                    'futures_spread_pct': (best_ask - best_bid) / max(abs(mid), 1e-9) * 100.0,
-                    'bid_depth_usdt': bid_depth,
-                    'ask_depth_usdt': ask_depth,
-                    'orderbook_imbalance_pct': (bid_depth - ask_depth) / max(bid_depth + ask_depth, 1e-9) * 100.0,
+                    key: value for key, value in self._calculate_utbreakout_open_interest_stats(oi_hist).items()
+                    if value is not None
                 })
+            except Exception as exc:
+                context.setdefault('futures_context_error', f"openInterestHist: {exc}")
+
+            try:
+                ratio_rows = await self.ctrl._fetch_binance_public_json('/futures/data/globalLongShortAccountRatio', {'symbol': rest_symbol, 'period': '15m', 'limit': 1})
+                if isinstance(ratio_rows, list) and ratio_rows:
+                    latest = ratio_rows[-1]
+                    context.update({
+                        'long_short_ratio': _safe_float_or_none(latest.get('longShortRatio')),
+                        'long_account': _safe_float_or_none(latest.get('longAccount')),
+                        'short_account': _safe_float_or_none(latest.get('shortAccount')),
+                    })
+            except Exception as exc:
+                context.setdefault('futures_context_error', f"globalLongShortAccountRatio: {exc}")
+
+            if context.get('mark_price') is not None and context.get('index_price') is not None:
+                try:
+                    context['basis_pct'] = (
+                        (float(context['mark_price']) - float(context['index_price']))
+                        / max(abs(float(context['index_price'])), 1e-9)
+                        * 100.0
+                    )
+                except (TypeError, ValueError):
+                    pass
+            context.update(self._prediction_context_for_futures_symbol(symbol))
+
+        orderflow_cache_ttl = 30.0
+        snapshots = getattr(self, 'utbreakout_orderflow_snapshots', {})
+        latest_snapshot = None
+        if isinstance(snapshots, dict):
+            rows = snapshots.get(symbol)
+            latest_snapshot = rows[-1] if isinstance(rows, list) and rows else None
+        latest_snapshot_ts = float((latest_snapshot or {}).get('timestamp', 0) or 0)
+        orderflow_due = not latest_snapshot_ts or (now - latest_snapshot_ts) >= orderflow_cache_ttl
+        try:
+            if orderflow_due:
+                depth = await self.ctrl._fetch_binance_public_json('/fapi/v1/depth', {'symbol': rest_symbol, 'limit': 20})
+                snapshot = self._build_utbreakout_orderflow_snapshot(depth, timestamp=now)
+                context.update(
+                    self._update_utbreakout_orderflow_snapshots(
+                        symbol,
+                        snapshot,
+                        window=int(context.get('rolling_ofi_window') or 5),
+                    )
+                )
+            else:
+                context.update(
+                    self._update_utbreakout_orderflow_snapshots(
+                        symbol,
+                        None,
+                        window=int(context.get('rolling_ofi_window') or 5),
+                    )
+                )
         except Exception as exc:
             context.setdefault('futures_context_error', f"depth: {exc}")
-
-        try:
-            oi_hist = await self.ctrl._fetch_binance_public_json('/futures/data/openInterestHist', {'symbol': rest_symbol, 'period': '15m', 'limit': 2})
-            if isinstance(oi_hist, list) and len(oi_hist) >= 2:
-                rows = sorted(oi_hist, key=lambda row: int(row.get('timestamp', 0) or 0))
-                start = _safe_float_or_none(rows[-2].get('sumOpenInterestValue') or rows[-2].get('sumOpenInterest'))
-                end = _safe_float_or_none(rows[-1].get('sumOpenInterestValue') or rows[-1].get('sumOpenInterest'))
-                if start and end is not None:
-                    context['open_interest_delta_pct'] = (float(end) - float(start)) / max(abs(float(start)), 1e-9) * 100.0
-        except Exception as exc:
-            context.setdefault('futures_context_error', f"openInterestHist: {exc}")
-
-        try:
-            taker_rows = await self.ctrl._fetch_binance_public_json('/futures/data/takerlongshortRatio', {'symbol': rest_symbol, 'period': '15m', 'limit': 1})
-            if isinstance(taker_rows, list) and taker_rows:
-                latest = taker_rows[-1]
-                context.update({
-                    'taker_buy_sell_ratio': _safe_float_or_none(latest.get('buySellRatio')),
-                    'taker_buy_vol': _safe_float_or_none(latest.get('buyVol')),
-                    'taker_sell_vol': _safe_float_or_none(latest.get('sellVol')),
-                })
-        except Exception as exc:
-            context.setdefault('futures_context_error', f"takerlongshortRatio: {exc}")
-
-        try:
-            ratio_rows = await self.ctrl._fetch_binance_public_json('/futures/data/globalLongShortAccountRatio', {'symbol': rest_symbol, 'period': '15m', 'limit': 1})
-            if isinstance(ratio_rows, list) and ratio_rows:
-                latest = ratio_rows[-1]
-                context.update({
-                    'long_short_ratio': _safe_float_or_none(latest.get('longShortRatio')),
-                    'long_account': _safe_float_or_none(latest.get('longAccount')),
-                    'short_account': _safe_float_or_none(latest.get('shortAccount')),
-                })
-        except Exception as exc:
-            context.setdefault('futures_context_error', f"globalLongShortAccountRatio: {exc}")
-
-        if context.get('mark_price') is not None and context.get('index_price') is not None:
-            try:
-                context['basis_pct'] = (
-                    (float(context['mark_price']) - float(context['index_price']))
-                    / max(abs(float(context['index_price'])), 1e-9)
-                    * 100.0
+            context.update(
+                self._update_utbreakout_orderflow_snapshots(
+                    symbol,
+                    None,
+                    window=int(context.get('rolling_ofi_window') or 5),
                 )
-            except (TypeError, ValueError):
-                pass
-        context.update(self._prediction_context_for_futures_symbol(symbol))
+            )
+
+        if orderflow_due or not cache_fresh:
+            try:
+                taker_rows = await self.ctrl._fetch_binance_public_json('/futures/data/takerlongshortRatio', {'symbol': rest_symbol, 'period': '15m', 'limit': 1})
+                if isinstance(taker_rows, list) and taker_rows:
+                    latest = taker_rows[-1]
+                    context.update({
+                        'taker_buy_sell_ratio': _safe_float_or_none(latest.get('buySellRatio')),
+                        'taker_buy_vol': _safe_float_or_none(latest.get('buyVol')),
+                        'taker_sell_vol': _safe_float_or_none(latest.get('sellVol')),
+                    })
+            except Exception as exc:
+                context.setdefault('futures_context_error', f"takerlongshortRatio: {exc}")
         clean_context = {key: value for key, value in context.items() if value is not None}
-        self.utbreakout_futures_context_cache[symbol] = {'cached_at': now, 'data': clean_context}
+        self.utbreakout_futures_context_cache[symbol] = {
+            'cached_at': cached_at if cache_fresh else now,
+            'data': clean_context,
+        }
         return clean_context
 
     async def _fetch_utbreakout_market_regime_context(self, cfg):
@@ -15293,6 +16043,10 @@ class SignalEngine(BaseEngine):
             )
 
     async def _handle_rsibb_primary_strategy(self, symbol, k, pos, strategy_name, raw_strategy_sig, sig):
+        guard_ok, guard_reason = self._rsibb_runtime_guard(self.get_runtime_strategy_params())
+        if not guard_ok:
+            self.last_entry_reason[symbol] = guard_reason
+            return
         if pos and raw_strategy_sig and (
             (pos['side'] == 'long' and raw_strategy_sig == 'short') or
             (pos['side'] == 'short' and raw_strategy_sig == 'long')
@@ -16737,7 +17491,12 @@ class SignalEngine(BaseEngine):
             is_bearish = ut_state == 'short'
         elif active_strategy == 'rsibb':
             entry_mode = 'rsibb'
-            sig, entry_reason, _ = precomputed.get('rsibb') or self._calculate_rsibb_signal(df, strategy_params)
+            guard_ok, guard_reason = self._rsibb_runtime_guard(strategy_params)
+            if guard_ok:
+                sig, entry_reason, _ = precomputed.get('rsibb') or self._calculate_rsibb_signal(df, strategy_params)
+            else:
+                sig = None
+                entry_reason = guard_reason
             is_bullish = sig == 'long'
             is_bearish = sig == 'short'
         elif active_strategy in UTBREAKOUT_STRATEGIES:
@@ -22051,7 +22810,7 @@ class MainController:
 20. RSI+BB 보조설정 (`RSI={rsibb_rsi}` / `BB={rsibb_bb}` / `x{rsibb_mult:.2f}`)
 57. RSI Momentum Trend (`RSI={rsi_momentum_rsi}` / `P>{rsi_momentum_pos:.0f}` / `N<{rsi_momentum_neg:.0f}` / `EMA={rsi_momentum_ema}`)
 58. UTBot + RSI Momentum (`{utbot_rsi_momentum_enabled}`)
-21. UT 전략 안내 (`UTBOT / UTRSI / UTBB / UTRSIBB / UTSMC`)
+21. UT 전략 안내 (`UTBOT / UTRSI / UTBB / UTRSIBB / UTSMC / RSIBB`)
 51. UTBot 진입 필터 (`{utbot_entry_filters_text}`)
 52. UTBot 진입 결합모드 (`{utbot_entry_logic_text}`)
 53. UTBot 청산 필터 (`{utbot_exit_filters_text}`)
@@ -22130,10 +22889,10 @@ class MainController:
             '12': "📝 **Grid 설정** 입력 (예: on,200 또는 off)",
             '14': "📝 **N Days** 입력 (예: 4)",
             '15': "📝 **K1/K2** 입력 (예: 0.5,0.5)",
-            '16': "📝 **전략 선택** (1=UTBOT, 2=UTRSIBB, 3=UTRSI, 4=UTBB, 5=UTSMC)",
+            '16': "📝 **전략 선택** (1=UTBOT, 2=UTRSIBB, 3=UTRSI, 4=UTBB, 5=UTSMC, 6=RSIBB)\nRSIBB는 순수 RSI Bollinger mean-reversion이며 기본 안전장치로 비활성/paper-only입니다.",
             '19': "📝 **UT Bot 설정** 입력 (형식: key,atr,on/off 예: 1,10,off)",
             '20': "RSI/BB 보조설정 입력\n형식: RSI길이,BB길이,BB배수\n예: 6,200,2",
-            '21': "ℹ️ **UT 전략 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙, UTSMC는 26번 UT 진입 방식 + internal OB/UT 신호봉 무효화 청산을 사용합니다.\n- 57번: RSI Momentum Trend 파라미터 설정\n- 58번: UTBot에 RSI Momentum Trend 보조필터 ON/OFF\n- 49번: UTSMC 진입용 후보 필터(C1/C2)\n- 50번: 필요 시 exit TF 기준 반대 방향 C2를 보조 청산으로 OR 추가",
+            '21': "ℹ️ **UT 전략 안내**: UTRSI/UTRSIBB는 조합형, UTBB는 비대칭 롱/숏 규칙, UTSMC는 26번 UT 진입 방식 + internal OB/UT 신호봉 무효화 청산을 사용합니다.\n- RSIBB: 순수 RSI Bollinger mean-reversion입니다. 기본값은 rsibb_enabled=False / paper_only=True라 안전장치 해제 전 진입하지 않습니다.\n- 57번: RSI Momentum Trend 파라미터 설정\n- 58번: UTBot에 RSI Momentum Trend 보조필터 ON/OFF\n- 49번: UTSMC 진입용 후보 필터(C1/C2)\n- 50번: 필요 시 exit TF 기준 반대 방향 C2를 보조 청산으로 OR 추가",
             '51': "📝 **UTBot 진입 필터** 입력\n`0/off` = OFF\n또는 `1,4,5` 형식으로 번호 조합 입력\n1=CHOP, 2=ADX+DMI, 3=VWAP, 4=HTF Supertrend, 5=BOS/CHoCH",
             '52': "📝 **UTBot 진입 결합모드** 입력\n`and` 또는 `or`",
             '53': "📝 **UTBot 청산 필터** 입력\n`0/off` = OFF\n또는 `2,3` 형식으로 번호 조합 입력\n1=CHOP, 2=ADX+DMI, 3=VWAP, 4=HTF Supertrend, 5=BOS/CHoCH",
@@ -22283,6 +23042,7 @@ class MainController:
                 "- 26번 UT 진입 방식: `다음봉 진입`은 시그널 마감 직후 다음 진행봉에서만 진입, `신호유지 진입`은 fresh signal이 아니어도 현재 유지 중인 시그널이면 즉시 진입 대기/진입하고 기준봉은 마지막 시그널 확정봉\n"
                 "- UTRSI: UT 방향 + RSI 타이밍 조합\n"
                 "- UTRSIBB: UT 방향 + RSI/BB 동시 타이밍 조합\n"
+                "- RSIBB: UT 없는 순수 RSI Bollinger mean-reversion입니다. 기본 안전장치(rsibb_enabled=False, paper_only=True) 해제 전에는 진입하지 않습니다.\n"
                 "- 57번 RSI Momentum Trend: Positive/Negative 상태 계산 파라미터 설정\n"
                 "- 58번 UTBot + RSI Momentum: UTBot 진입은 RSI Momentum Trend와 같은 방향일 때만, 청산/반전은 둘 다 반대 방향일 때만 실행\n"
                 "- UTBB LONG: UT 롱신호와 BB 롱신호가 순서 무관 3봉 내 일치하면 진입, 중간에 UT 숏 또는 BB 숏이 나오면 저장 무효\n"
@@ -22607,7 +23367,8 @@ class MainController:
                     '2': 'utrsibb',
                     '3': 'utrsi',
                     '4': 'utbb',
-                    '5': 'utsmc'
+                    '5': 'utsmc',
+                    '6': 'rsibb'
                 }
                 val_lower = val.lower().strip()
                 
@@ -22624,11 +23385,12 @@ class MainController:
                             reset_exit_cache=True,
                             reset_stateful_strategy=True
                         )
-                    await update.message.reply_text(f"✅ 전략 변경: {val_lower.upper()}")
+                    suffix = "\n⚠️ RSIBB는 기본 rsibb_enabled=False / paper_only=True 안전장치가 적용됩니다." if val_lower == 'rsibb' else ""
+                    await update.message.reply_text(f"✅ 전략 변경: {val_lower.upper()}{suffix}")
                 else:
                     await update.message.reply_text(
-                        "❌ 1~5 또는 utbot/utrsibb/utrsi/utbb/utsmc를 입력하세요.\n"
-                        "1=UTBOT, 2=UTRSIBB, 3=UTRSI, 4=UTBB, 5=UTSMC"
+                        "❌ 1~6 또는 utbot/utrsibb/utrsi/utbb/utsmc/rsibb를 입력하세요.\n"
+                        "1=UTBOT, 2=UTRSIBB, 3=UTRSI, 4=UTBB, 5=UTSMC, 6=RSIBB"
                     )
                     return SELECT
             
