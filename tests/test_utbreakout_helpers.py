@@ -271,6 +271,33 @@ def test_main_keyboard_removes_utbot_button():
     assert "/utbot" not in labels
 
 
+def test_setup_keyboard_keeps_exchange_button_choices():
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+
+    setup_keyboard = controller._build_setup_keyboard()
+    network_keyboard = controller._build_setup_network_keyboard()
+    setup_labels = [button.text for row in setup_keyboard.keyboard for button in row]
+    network_labels = [button.text for row in network_keyboard.keyboard for button in row]
+
+    assert "거래소/네트워크 전환" in setup_labels
+    assert "나가기" in setup_labels
+    assert "1. 바이낸스 테스트넷" in network_labels
+    assert "2. 바이낸스 메인넷" in network_labels
+    assert "3. 업비트 KRW 현물" in network_labels
+
+
+def test_setup_button_labels_normalize_to_existing_number_flow():
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+
+    assert controller._normalize_setup_choice_text("거래소/네트워크 전환") == "22"
+    assert controller._normalize_setup_choice_text("나가기") == "0"
+    assert controller._normalize_setup_network_choice("1. 바이낸스 테스트넷") == "1"
+    assert controller._normalize_setup_network_choice("2. 바이낸스 메인넷") == "2"
+    assert controller._normalize_setup_network_choice("3. 업비트 KRW 현물") == "3"
+
+
 def test_utbreakout_position_scan_context_shows_position_and_next_candidate():
     signal_engine = _signal_engine_cls()
     engine = signal_engine.__new__(signal_engine)

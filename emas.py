@@ -21610,6 +21610,47 @@ class MainController:
         except Exception as e:
             logger.error(f"Protection order sync error: {e}")
 
+    def _build_setup_keyboard(self):
+        return ReplyKeyboardMarkup(
+            [
+                [KeyboardButton("거래소/네트워크 전환")],
+                [KeyboardButton("나가기")],
+            ],
+            one_time_keyboard=True,
+            resize_keyboard=True
+        )
+
+    def _build_setup_network_keyboard(self):
+        return ReplyKeyboardMarkup(
+            [
+                [KeyboardButton("1. 바이낸스 테스트넷")],
+                [KeyboardButton("2. 바이낸스 메인넷")],
+                [KeyboardButton("3. 업비트 KRW 현물")],
+                [KeyboardButton("나가기")],
+            ],
+            one_time_keyboard=True,
+            resize_keyboard=True
+        )
+
+    def _normalize_setup_choice_text(self, text):
+        normalized = str(text or '').strip().lower()
+        if normalized in {'0', '나가기', '종료', '취소', 'cancel', 'exit', 'quit'}:
+            return '0'
+        if normalized in {'22', '거래소/네트워크 전환', '거래소 네트워크 전환', '거래소 전환', '네트워크 전환'}:
+            return '22'
+        return normalized
+
+    def _normalize_setup_network_choice(self, text):
+        normalized = str(text or '').strip().lower()
+        compact = normalized.replace(' ', '')
+        if compact.startswith('1') or '테스트넷' in compact or 'testnet' in compact:
+            return '1'
+        if compact.startswith('2') or '메인넷' in compact or 'mainnet' in compact:
+            return '2'
+        if compact.startswith('3') or '업비트' in compact or 'upbit' in compact:
+            return '3'
+        return normalized
+
     async def show_setup_menu(self, update: Update):
         sys_cfg = self.cfg.get('system_settings', {})
         sig = self.cfg.get('signal_engine', {})
@@ -21634,7 +21675,11 @@ class MainController:
 22. 거래소/네트워크 전환 (`{network_status}`)
 0. 나가기
 """
-        await self._reply_markdown_safe(update.message, msg.strip())
+        await self._reply_markdown_safe(
+            update.message,
+            msg.strip(),
+            reply_markup=self._build_setup_keyboard()
+        )
         return
         direction = self.get_effective_trade_direction()
         watchlist = sig.get('watchlist', ['BTC/USDT'])
@@ -21861,10 +21906,12 @@ class MainController:
             return ConversationHandler.END
 
     async def setup_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text.strip()
+        raw_text = update.message.text.strip()
+        text = self._normalize_setup_choice_text(raw_text)
         
         if text == '0':
             await update.message.reply_text("✅ 설정 종료")
+            await self._restore_main_keyboard(update)
             return ConversationHandler.END
 
         if text != '22':
@@ -21922,6 +21969,13 @@ class MainController:
             '47': "📝 **업비트 청산 타임프레임** 입력 (예: 1h)\n1m,3m,5m,15m,30m | 1h,4h | 1d",
             '48': "📝 **업비트 일일 손실 제한(KRW)** 입력 (예: 50000)",
         }
+        if text == '22':
+            await update.message.reply_text(
+                prompts['22'],
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=self._build_setup_network_keyboard()
+            )
+            return INPUT
         if self.is_upbit_mode():
             blocked_choices = {
                 '1', '2', '3', '4', '5', '6', '8', '10', '11', '12', '13', '14', '15',
@@ -22775,11 +22829,20 @@ class MainController:
                     '2': BINANCE_MAINNET,
                     '3': UPBIT_MODE
                 }
-                if val not in mode_map:
-                    await update.message.reply_text("❌ 1, 2, 3 중 하나를 입력하세요.\n1=바이낸스 테스트넷, 2=바이낸스 메인넷, 3=업비트 KRW 현물")
-                    return SELECT
+                network_choice = self._normalize_setup_network_choice(val)
+                if network_choice in {'0', '나가기', '종료', '취소', 'cancel', 'exit', 'quit'}:
+                    await update.message.reply_text("✅ 설정 종료")
+                    await self._restore_main_keyboard(update)
+                    return ConversationHandler.END
+                if network_choice not in mode_map:
+                    await update.message.reply_text(
+                        "❌ 버튼에서 선택하거나 1, 2, 3 중 하나를 입력하세요.\n"
+                        "1=바이낸스 테스트넷, 2=바이낸스 메인넷, 3=업비트 KRW 현물",
+                        reply_markup=self._build_setup_network_keyboard()
+                    )
+                    return INPUT
 
-                target_mode = mode_map[val]
+                target_mode = mode_map[network_choice]
                 current_mode = self.get_exchange_mode()
 
                 if target_mode == current_mode:
