@@ -214,6 +214,130 @@ def test_coin_selector_candidate_cooldown_success_clears_state():
     assert engine.coin_selector_candidate_cooldowns == {}
 
 
+def test_utbreakout_status_symbol_prefers_live_position_over_watchlist():
+    emas = _emas_module()
+
+    class _PositionEngine:
+        scanner_active_symbol = "LAB/USDT"
+
+        async def get_active_position_symbols(self, use_cache=True):
+            return {"XRP/USDT"}
+
+    controller = emas.MainController.__new__(emas.MainController)
+    controller.engines = {emas.CORE_ENGINE: _PositionEngine()}
+    controller.status_data = {}
+    controller.is_upbit_mode = lambda: False
+    controller.get_active_watchlist = lambda: ["LAB/USDT"]
+    controller._get_current_symbol = lambda: "LAB/USDT"
+
+    symbol = asyncio.run(controller._resolve_utbreakout_status_symbol())
+
+    assert symbol == "XRP/USDT"
+
+
+def test_utbreakout_status_symbol_uses_scanner_when_no_position():
+    emas = _emas_module()
+
+    class _ScannerEngine:
+        scanner_active_symbol = "SOL/USDT"
+
+        async def get_active_position_symbols(self, use_cache=True):
+            return set()
+
+    controller = emas.MainController.__new__(emas.MainController)
+    controller.engines = {emas.CORE_ENGINE: _ScannerEngine()}
+    controller.status_data = {"LAB/USDT": {"symbol": "LAB/USDT", "pos_side": "NONE"}}
+    controller.is_upbit_mode = lambda: False
+    controller.get_active_watchlist = lambda: ["LAB/USDT"]
+    controller._get_current_symbol = lambda: "LAB/USDT"
+
+    symbol = asyncio.run(controller._resolve_utbreakout_status_symbol())
+
+    assert symbol == "SOL/USDT"
+
+
+def test_main_keyboard_removes_utbot_button():
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+
+    keyboard = controller._build_main_keyboard()
+    labels = [
+        button.text
+        for row in keyboard.keyboard
+        for button in row
+    ]
+
+    assert "/utbreak" in labels
+    assert "/utbot" not in labels
+
+
+def test_utbreakout_position_scan_context_shows_position_and_next_candidate():
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    engine.ctrl = type("Ctrl", (), {"status_data": {}})()
+    engine.coin_selector_candidate_cooldowns = {}
+    engine.scanner_active_symbol = None
+    engine.last_utbot_filtered_breakout_status = {
+        "XRP/USDT:USDT": {
+            "auto_selected_set_id": 7,
+            "auto_selected_set_name": "Conservative",
+            "auto_selection_reason": "trend and liquidity aligned",
+            "reason": "ACCEPTED_ENTRY: LONG Set7 confirmed",
+        }
+    }
+    engine.coin_selector_last_result = {
+        "selected": [
+            {
+                "normalized_symbol": "XRP/USDT",
+                "exchange_symbol": "XRP/USDT:USDT",
+                "selection_state": "SELECTED",
+                "score": 80,
+            },
+            {
+                "normalized_symbol": "ETH/USDT",
+                "exchange_symbol": "ETH/USDT:USDT",
+                "selection_state": "SELECTED",
+                "score": 74.5,
+                "auto_set_id": 12,
+                "auto_set_name": "Momentum",
+                "adaptive_tf": "15m",
+                "auto_selection_reason": "breakout quality improved",
+            },
+        ]
+    }
+    engine._get_coin_selector_config = lambda: {
+        "enabled": True,
+        "candidate_cooldown_enabled": True,
+        "candidate_cooldown_misses": 3,
+        "candidate_cooldown_seconds": 1800,
+    }
+    engine._micro_auto_enabled = lambda: False
+
+    async def _active_symbols(use_cache=True):
+        return {"XRP/USDT"}
+
+    async def _server_position(symbol, use_cache=True):
+        return {
+            "symbol": symbol,
+            "side": "long",
+            "contracts": 25,
+            "entryPrice": 0.55,
+            "unrealizedPnl": 12.5,
+        }
+
+    engine.get_active_position_symbols = _active_symbols
+    engine.get_server_position = _server_position
+
+    lines = asyncio.run(engine._build_utbreakout_position_scan_context_lines("XRP/USDT"))
+    text = "\n".join(lines)
+
+    assert "현재 포지션: XRP/USDT" in text
+    assert "trend and liquidity aligned" in text
+    assert "ACCEPTED_ENTRY: LONG Set7 confirmed" in text
+    assert "다음 스캔 후보: ETH/USDT:USDT" in text
+    assert "breakout quality improved" in text
+
+
 class _MemoryConfig:
     def __init__(self):
         self.values = {}

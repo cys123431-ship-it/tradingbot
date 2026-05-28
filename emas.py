@@ -8590,6 +8590,159 @@ class SignalEngine(BaseEngine):
             None
         )
 
+    def _utbreakout_status_symbol_key(self, symbol):
+        return str(symbol or '').upper().replace(':USDT', '').replace('/', '').replace('-', '').strip()
+
+    def _utbreakout_diag_for_symbol(self, symbol):
+        statuses = getattr(self, 'last_utbot_filtered_breakout_status', {})
+        if not isinstance(statuses, dict):
+            return {}
+        direct = statuses.get(symbol)
+        if isinstance(direct, dict):
+            return direct
+        target_key = self._utbreakout_status_symbol_key(symbol)
+        for status_symbol, status in statuses.items():
+            if self._utbreakout_status_symbol_key(status_symbol) == target_key and isinstance(status, dict):
+                return status
+        return {}
+
+    def _utbreakout_status_row_for_symbol(self, symbol):
+        status_data = getattr(self.ctrl, 'status_data', {}) if getattr(self, 'ctrl', None) else {}
+        if not isinstance(status_data, dict):
+            return {}
+        direct = status_data.get(symbol)
+        if isinstance(direct, dict):
+            return direct
+        target_key = self._utbreakout_status_symbol_key(symbol)
+        for status_symbol, row in status_data.items():
+            if self._utbreakout_status_symbol_key(status_symbol) == target_key and isinstance(row, dict):
+                return row
+        return {}
+
+    def _format_utbreakout_diag_reason(self, diag, *, entry=False):
+        if not isinstance(diag, dict) or not diag:
+            return "아직 기록 없음"
+        if entry:
+            return (
+                diag.get('reason')
+                or diag.get('accepted_code')
+                or diag.get('reject_code')
+                or "진입 기록 대기"
+            )
+        selected_set = diag.get('auto_selected_set_id')
+        selected_name = diag.get('auto_selected_set_name') or ''
+        reason = diag.get('auto_selection_reason') or diag.get('selector_quality_summary') or diag.get('strategy_adaptation_summary')
+        if selected_set and reason:
+            return f"Set{selected_set} {selected_name}: {reason}"
+        if selected_set:
+            return f"Set{selected_set} {selected_name}"
+        return reason or "수동 선택 또는 AUTO 기록 대기"
+
+    def _format_coin_selector_candidate_reason(self, item):
+        if not isinstance(item, dict):
+            return "후보 정보 없음"
+        components = item.get('component_scores') if isinstance(item.get('component_scores'), dict) else {}
+        reason_parts = [
+            f"점수 {float(item.get('score', 0) or 0):.1f}",
+            f"상태 {item.get('selection_state') or 'WATCH'}",
+            f"Set{item.get('auto_set_id') or '?'} {item.get('auto_set_name') or ''}".strip(),
+            f"TF {item.get('adaptive_tf') or 'n/a'}",
+        ]
+        auto_reason = item.get('auto_selection_reason') or item.get('adaptive_reason')
+        if auto_reason:
+            reason_parts.append(str(auto_reason))
+        elif components:
+            reason_parts.append(
+                "구성 "
+                f"liq {components.get('liquidity_cost', 0):.1f}, "
+                f"ut {components.get('utbreakout_regime', 0):.1f}, "
+                f"set {components.get('auto_set', 0):.1f}, "
+                f"tf {components.get('adaptive_tf', 0):.1f}, "
+                f"qual {components.get('selection_quality', 0):.1f}"
+            )
+        warnings = ", ".join(str(w) for w in (item.get('soft_warnings') or [])[:3])
+        if warnings:
+            reason_parts.append(f"주의 {warnings}")
+        return " / ".join(part for part in reason_parts if part)
+
+    async def _build_utbreakout_position_scan_context_lines(self, evaluated_symbol):
+        lines = []
+        position_symbols = []
+        try:
+            position_symbols = sorted(
+                await self.get_active_position_symbols(use_cache=False),
+                key=self._utbreakout_status_symbol_key
+            )
+        except Exception as exc:
+            lines.append(f"현재 포지션: 조회 실패 ({exc})")
+
+        if position_symbols:
+            for pos_symbol in position_symbols[:3]:
+                pos = await self.get_server_position(pos_symbol, use_cache=False)
+                diag = self._utbreakout_diag_for_symbol(pos_symbol)
+                status_row = self._utbreakout_status_row_for_symbol(pos_symbol)
+                side = str((pos or {}).get('side') or status_row.get('pos_side') or 'UNKNOWN').upper()
+                contracts = float((pos or {}).get('contracts') or status_row.get('coin_amt') or 0.0)
+                entry_price = float((pos or {}).get('entryPrice') or status_row.get('entry_price') or 0.0)
+                pnl = float((pos or {}).get('unrealizedPnl') or status_row.get('pnl_usdt') or 0.0)
+                lines.extend([
+                    f"현재 포지션: {pos_symbol} `{side}` qty `{contracts:.6g}` entry `{entry_price:.6g}` PnL `{pnl:+.2f}`",
+                    f"포지션 코인 선택 이유: {self._format_utbreakout_diag_reason(diag)}",
+                    f"포지션 진입 이유: {self._format_utbreakout_diag_reason(diag, entry=True)}",
+                ])
+            if len(position_symbols) > 3:
+                lines.append(f"현재 포지션 추가: {len(position_symbols) - 3}개")
+        else:
+            lines.append("현재 포지션: 없음")
+
+        scanner_symbol = getattr(self, 'scanner_active_symbol', None)
+        if scanner_symbol:
+            lines.append(f"현재 scanner lock: {scanner_symbol}")
+
+        next_candidate = None
+        report = self.coin_selector_last_result if isinstance(getattr(self, 'coin_selector_last_result', None), dict) else {}
+        selected = list(report.get('selected') or [])
+        coin_cfg = self._get_coin_selector_config()
+        if not selected and bool(coin_cfg.get('enabled', False)):
+            try:
+                if self._micro_auto_enabled():
+                    report = await self.evaluate_micro_auto_candidates(force=False)
+                else:
+                    report = await self.evaluate_coin_selector(force=False)
+                selected = list(report.get('selected') or [])
+            except Exception as exc:
+                lines.append(f"다음 스캔 후보: 조회 실패 ({exc})")
+                selected = []
+
+        excluded_keys = {self._utbreakout_status_symbol_key(item) for item in position_symbols}
+        now = time.time()
+        for item in selected:
+            symbol = item.get('exchange_symbol') or item.get('normalized_symbol') or item.get('symbol')
+            if not symbol:
+                continue
+            if self._utbreakout_status_symbol_key(symbol) in excluded_keys:
+                continue
+            if item.get('selection_state') not in (None, 'SELECTED') and not item.get('micro_accepted'):
+                continue
+            cooldown_remaining, _ = self._coin_selector_cooldown_remaining(symbol, coin_cfg, now=now)
+            if cooldown_remaining > 0:
+                continue
+            next_candidate = item
+            break
+
+        if next_candidate:
+            next_symbol = next_candidate.get('exchange_symbol') or next_candidate.get('normalized_symbol') or next_candidate.get('symbol')
+            lines.append(f"다음 스캔 후보: {next_symbol}")
+            lines.append(f"다음 후보 선택 이유: {self._format_coin_selector_candidate_reason(next_candidate)}")
+        elif bool(coin_cfg.get('enabled', False)):
+            lines.append("다음 스캔 후보: 없음 또는 후보 쿨다운/대기")
+        else:
+            lines.append("다음 스캔 후보: CoinSelector OFF")
+
+        if evaluated_symbol:
+            lines.append(f"조건 평가 심볼: {evaluated_symbol}")
+        return lines
+
     async def build_utbreakout_condition_status_text(self, symbol):
         cfg = self._get_utbot_filtered_breakout_config(self.get_runtime_strategy_params())
         common_cfg = self.get_runtime_common_settings()
@@ -9080,6 +9233,7 @@ class SignalEngine(BaseEngine):
             score_line = "AUTO OFF 또는 분석 대기"
         mode_label = 'AUTO' if cfg.get('auto_select_enabled') else 'MANUAL'
         set_status = '실거래 연결' if selected_set.get('status') == 'active' else 'planned only'
+        position_scan_context = await self._build_utbreakout_position_scan_context_lines(symbol)
         micro_cfg = self._get_micro_auto_config()
         micro_plan = self.micro_auto_last_plan.get(symbol) if isinstance(self.micro_auto_last_plan, dict) else None
         micro_reject = self.micro_auto_last_rejects.get(symbol) if isinstance(self.micro_auto_last_rejects, dict) else None
@@ -9099,7 +9253,7 @@ class SignalEngine(BaseEngine):
             micro_line = "Micro Auto: OFF"
         text_lines = [
             "🚦 UT Breakout 조건 스테이터스",
-            f"심볼: {symbol}",
+            *position_scan_context,
             f"TF: 진입 {entry_tf} / HTF {htf_tf}",
             f"Adaptive TF: {'ON' if cfg.get('adaptive_timeframe_enabled') else 'OFF'} / {self._format_adaptive_timeframe_summary(adaptive_decision) if adaptive_decision else '고정 시간봉'}",
             f"마지막 마감봉: {_fmt_ts(decision_ts)} / close {_fmt(entry_price, 4)}",
@@ -21119,6 +21273,39 @@ class MainController:
         watchlist = self.get_active_watchlist()
         return watchlist[0] if watchlist else ('BTC/KRW' if self.is_upbit_mode() else 'BTC/USDT')
 
+    def _telegram_status_symbol_key(self, symbol):
+        return str(symbol or '').upper().replace(':USDT', '').replace('/', '').replace('-', '').strip()
+
+    async def _resolve_utbreakout_status_symbol(self):
+        """Pick the symbol operators expect to inspect: live position first, scanner lock second."""
+        engine = self.engines.get(CORE_ENGINE)
+        position_symbols = set()
+        if engine and hasattr(engine, 'get_active_position_symbols'):
+            try:
+                position_symbols = await engine.get_active_position_symbols(use_cache=False)
+            except Exception as exc:
+                logger.warning(f"UTBreak status position symbol lookup failed: {exc}")
+        if position_symbols:
+            return sorted(position_symbols, key=self._telegram_status_symbol_key)[0]
+
+        if isinstance(self.status_data, dict):
+            status_symbols = []
+            for key, row in self.status_data.items():
+                if not isinstance(row, dict):
+                    continue
+                pos_side = str(row.get('pos_side') or '').upper()
+                symbol = row.get('symbol') or key
+                if symbol and pos_side not in {'', 'NONE', 'NO_POSITION'}:
+                    status_symbols.append(symbol)
+            if status_symbols:
+                return sorted(status_symbols, key=self._telegram_status_symbol_key)[0]
+
+        scanner_symbol = getattr(engine, 'scanner_active_symbol', None) if engine else None
+        if scanner_symbol:
+            return scanner_symbol
+
+        return self._get_current_symbol()
+
     async def reinit_exchange(self, target_mode):
         """거래소 연결 재초기화."""
         try:
@@ -21438,6 +21625,17 @@ class MainController:
             f"Telegram setup menu rendering: chat_id={update.effective_chat.id if update and update.effective_chat else 'unknown'} "
             f"text={request_text!r} engine={eng} exchange={self.get_exchange_mode()}"
         )
+        network_status = self.get_network_status_label()
+        msg = f"""
+🔧 **설정 메뉴** (번호 입력)
+
+/setup은 이제 거래소/네트워크 전환만 남겼습니다.
+
+22. 거래소/네트워크 전환 (`{network_status}`)
+0. 나가기
+"""
+        await self._reply_markdown_safe(update.message, msg.strip())
+        return
         direction = self.get_effective_trade_direction()
         watchlist = sig.get('watchlist', ['BTC/USDT'])
         if not isinstance(watchlist, list) or not watchlist:
@@ -21668,6 +21866,11 @@ class MainController:
         if text == '0':
             await update.message.reply_text("✅ 설정 종료")
             return ConversationHandler.END
+
+        if text != '22':
+            await update.message.reply_text("ℹ️ 현재 /setup은 거래소/네트워크 전환(22)만 지원합니다.")
+            await self.show_setup_menu(update)
+            return SELECT
         
         context.user_data['setup_choice'] = text
         
@@ -22968,7 +23171,7 @@ class MainController:
     def _build_main_keyboard(self):
         kb = [
             [KeyboardButton("🚨 STOP"), KeyboardButton("⏸ PAUSE"), KeyboardButton("▶ RESUME")],
-            [KeyboardButton("/utbot"), KeyboardButton("/utbreak")],
+            [KeyboardButton("/utbreak")],
             [KeyboardButton("/prediction")],
             [KeyboardButton("/status"), KeyboardButton("/history"), KeyboardButton("/stats")],
             [KeyboardButton("/log"), KeyboardButton("/help")]
@@ -22984,7 +23187,7 @@ class MainController:
         owner_only = self._telegram_owner_only
         text_filter = filters.TEXT & ~filters.COMMAND
         setup_trigger_pattern = r"^/setup(?:@[A-Za-z0-9_]+)?$"
-        menu_trigger_pattern = r"^/(status|history|log|help|stats|close|utbot|utbreak|utbreakout|setup|coinscan|customcoins|microauto|prediction)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
+        menu_trigger_pattern = r"^/(status|history|log|help|stats|close|utbreak|utbreakout|setup|coinscan|customcoins|microauto|prediction)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
         setup_text_filter = text_filter & ~filters.Regex(r"^/")
         emergency_pattern = TELEGRAM_EMERGENCY_PATTERN
 
@@ -23182,6 +23385,7 @@ class MainController:
 
         async def _activate_utbreak_strategy():
             await _ensure_signal_engine_active()
+            self.is_paused = False
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'], 'auto')
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'auto_select_enabled'], True)
@@ -23216,7 +23420,32 @@ class MainController:
             if engine:
                 engine.scanner_active_symbol = None
                 engine.active_symbols.clear()
-            return "✅ UTBreak 전략 ON. CoinSelector + scanner + Set AUTO + Adaptive TF 자동 운용으로 켰습니다."
+                if not engine.running:
+                    engine.start()
+            return "✅ UTBreak ON. CoinSelector + scanner + Set AUTO + Adaptive TF 자동 운용을 한 번에 켰습니다."
+
+        async def _stop_utbreak_trading():
+            await _ensure_signal_engine_active()
+            self.is_paused = True
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_FILTERED_BREAKOUT_STRATEGY)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'], 'manual')
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'auto_select_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol'], '')
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
+            engine = self._reset_signal_engine_runtime_state(
+                reset_entry_cache=True,
+                reset_exit_cache=True,
+                reset_stateful_strategy=True
+            )
+            if engine:
+                engine.scanner_active_symbol = None
+                engine.active_symbols.clear()
+            return "⛔ UTBreak OFF. 자동 코인선택/scanner/Set AUTO/Adaptive TF/Micro Auto를 끄고 매매를 PAUSE 상태로 전환했습니다. 기존 포지션 강제청산은 /stop 입니다."
 
         async def _set_strategy_coin(symbol_text):
             symbol = self.normalize_symbol_for_exchange(symbol_text)
@@ -23680,46 +23909,8 @@ AUTO 최근 선택 이유:
             return InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("UTBreak ON", callback_data="utb:on"),
-                    InlineKeyboardButton("일시정지", callback_data="utb:pause"),
-                    InlineKeyboardButton("재개", callback_data="utb:resume")
-                ],
-                [
-                    InlineKeyboardButton("FULL AUTO ON", callback_data="utb:auto_bundle:on"),
-                    InlineKeyboardButton("FULL AUTO OFF", callback_data="utb:auto_bundle:off"),
-                    InlineKeyboardButton("AUTO 이유", callback_data="utb:why")
-                ],
-                [
-                    InlineKeyboardButton("추천 Set7", callback_data="utb:set:7"),
-                    InlineKeyboardButton("Set 목록", callback_data="utb:sets"),
-                    InlineKeyboardButton("진입 분석", callback_data="utb:entry_analyze")
-                ],
-                [
-                    InlineKeyboardButton("단일코인 설정", callback_data="utb:fixed"),
-                    InlineKeyboardButton("단일코인 해제", callback_data="utb:fixed_off"),
-                    InlineKeyboardButton("UTBot 복귀", callback_data="utb:off")
-                ],
-                [
-                    InlineKeyboardButton("Lev 5x", callback_data="utb:lev:5"),
-                    InlineKeyboardButton("Lev 10x", callback_data="utb:lev:10"),
-                    InlineKeyboardButton("Lev 15x", callback_data="utb:lev:15")
-                ],
-                [
-                    InlineKeyboardButton("진입 15m", callback_data="utb:tf:15m"),
-                    InlineKeyboardButton("진입 1h", callback_data="utb:tf:1h"),
-                    InlineKeyboardButton("청산 1h", callback_data="utb:exit_tf:1h")
-                ],
-                [
-                    InlineKeyboardButton("1회손실 $1", callback_data="utb:risk:1"),
-                    InlineKeyboardButton("일거래 3회", callback_data="utb:dailytrades:3"),
-                    InlineKeyboardButton("일손실 $10", callback_data="utb:dailyloss:10")
-                ],
-                [
-                    InlineKeyboardButton("조건 스테이터스", callback_data="utb:condition_status"),
-                    InlineKeyboardButton("리서치 요약", callback_data="utb:research")
-                ],
-                [
-                    InlineKeyboardButton("진단 로그", callback_data="utb:download"),
-                    InlineKeyboardButton("새로고침", callback_data="utb:status")
+                    InlineKeyboardButton("UTBreak OFF", callback_data="utb:off"),
+                    InlineKeyboardButton("조건 스테이터스", callback_data="utb:condition_status")
                 ]
             ])
 
@@ -23800,6 +23991,9 @@ AUTO 최근 선택 이유:
             watchlist = self.get_active_watchlist()
             return watchlist[0] if watchlist else 'BTC/USDT'
 
+        async def _get_utbreakout_status_symbol_async():
+            return await self._resolve_utbreakout_status_symbol()
+
         def _get_utbreakout_analysis_symbol(raw_symbol=None):
             raw = str(raw_symbol or '').strip()
             if raw:
@@ -23827,7 +24021,7 @@ AUTO 최근 선택 이유:
             engine = self.engines.get('signal')
             if not engine:
                 return "🚦 UT Breakout 조건 스테이터스\n\nSignal 엔진을 찾을 수 없습니다."
-            symbol = _get_utbreakout_status_symbol()
+            symbol = await _get_utbreakout_status_symbol_async()
             return await engine.build_utbreakout_condition_status_text(symbol)
 
         async def _send_utbreakout_condition_status(message):
@@ -24033,9 +24227,8 @@ AUTO 최근 선택 이유:
 
             if action in {'on', 'enable', 'activate', 'start'}:
                 await u.message.reply_text(await _activate_utbreak_strategy())
-            elif action in {'off', 'disable', 'utbot'}:
-                await _activate_utbot_strategy()
-                await u.message.reply_text("✅ 기본 UTBOT 전략으로 복귀")
+            elif action in {'off', 'disable', 'stop_trade', 'stoptrading'}:
+                await u.message.reply_text(await _stop_utbreak_trading())
             elif action in {'pause', 'paused', 'stop_trade', 'stoptrading'}:
                 await u.message.reply_text(await _set_strategy_pause(True))
             elif action in {'resume', 'run', 'restart'}:
@@ -24368,7 +24561,7 @@ AUTO 최근 선택 이유:
                 return
 
             if action == 'off':
-                await _edit_utbreakout_menu(query, await _activate_utbot_strategy())
+                await _edit_utbreakout_menu(query, await _stop_utbreak_trading())
                 return
 
             if action == 'pause':
@@ -25115,6 +25308,7 @@ AUTO 최근 선택 이유:
 
         async def _enable_utbreak_auto_bundle():
             await _ensure_signal_engine_active()
+            self.is_paused = False
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'], 'auto')
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'auto_select_enabled'], True)
@@ -26542,7 +26736,6 @@ AUTO 최근 선택 이유:
 /status - 현재 상태 조회
 /history - 지난 상태 조회
 /stats - 통계
-/utbot - UTBot 전략 메뉴
 /utbreak - UTBreak 전략 메뉴
 /utbreakout - /utbreak alias
 /prediction - Prediction Micro Auto / Binance Wallet Prediction(Predict.fun) 메뉴
@@ -26567,8 +26760,6 @@ AUTO 최근 선택 이유:
         self.tg_app.add_handler(CommandHandler("log", owner_only(log_cmd)))
         self.tg_app.add_handler(CommandHandler("close", owner_only(close_cmd)))
         self.tg_app.add_handler(CommandHandler("stats", owner_only(stats_cmd)))
-        self.tg_app.add_handler(CommandHandler("utbot", owner_only(utbot_cmd)))
-        self.tg_app.add_handler(CallbackQueryHandler(owner_only(utbot_callback), pattern=r"^utbot:"))
         self.tg_app.add_handler(CommandHandler("utbreak", owner_only(utbreakout_cmd)))
         self.tg_app.add_handler(CommandHandler("utbreakout", owner_only(utbreakout_cmd)))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(utbreakout_callback), pattern=r"^utb:"))
@@ -26618,8 +26809,6 @@ AUTO 최근 선택 이유:
                 return await stats_cmd(u, c)
             if command == "/close":
                 return await close_cmd(u, c)
-            if command == "/utbot":
-                return await utbot_cmd(u, c)
             if command in {"/utbreak", "/utbreakout"}:
                 return await utbreakout_cmd(u, c)
             if command in {"/coinscan", "/customcoins", "/microauto"}:
