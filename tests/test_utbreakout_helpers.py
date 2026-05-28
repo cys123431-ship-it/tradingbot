@@ -393,9 +393,13 @@ class _FakeTelegramMessage:
     def __init__(self, text):
         self.text = text
         self.replies = []
+        self.documents = []
 
     async def reply_text(self, *args, **kwargs):
         self.replies.append((args, kwargs))
+
+    async def reply_document(self, *args, **kwargs):
+        self.documents.append((args, kwargs))
 
 
 class _FakeTelegramUpdate:
@@ -439,6 +443,26 @@ def test_telegram_global_handler_rejects_unauthorized_stop_without_emergency_cal
     assert result == emas.ConversationHandler.END
     assert called is False
     assert len(update.message.replies) == 1
+
+
+def test_telegram_long_text_reply_sends_preview_and_document():
+    controller = _telegram_controller(chat_id=12345)
+    message = _FakeTelegramMessage("/utbreak status")
+    long_text = "\n".join(f"line {idx} " + ("x" * 90) for idx in range(80))
+
+    asyncio.run(controller._reply_long_text_with_document(
+        message,
+        long_text,
+        filename="utbreakout_condition_status.txt",
+        caption="condition status",
+        preview_suffix="상세 조건 스테이터스는 파일로 보냈습니다.",
+    ))
+
+    assert len(message.replies) == 1
+    assert "상세 조건 스테이터스는 파일로 보냈습니다." in message.replies[0][0][0]
+    assert len(message.documents) == 1
+    assert message.documents[0][1]["filename"] == "utbreakout_condition_status.txt"
+    assert message.documents[0][1]["document"].getvalue().decode("utf-8") == long_text
 
 
 def test_telegram_global_handler_requires_exact_emergency_text():

@@ -21400,6 +21400,114 @@ class MainController:
             else:
                 raise
 
+    @staticmethod
+    def _is_telegram_message_not_modified_error(error):
+        return "message is not modified" in str(error).lower()
+
+    @staticmethod
+    def _is_telegram_message_too_long_error(error):
+        message = str(error).lower()
+        return "message is too long" in message or "message_too_long" in message
+
+    @staticmethod
+    def _build_telegram_long_text_preview(text, max_chars=3600, max_lines=45, suffix="상세 내용은 파일로 보냈습니다."):
+        raw = str(text or "").strip()
+        if not raw:
+            return suffix
+
+        lines = raw.splitlines()
+        preview_lines = []
+        used_chars = 0
+        for line in lines:
+            add_chars = len(line) + (1 if preview_lines else 0)
+            if preview_lines and (len(preview_lines) >= max_lines or used_chars + add_chars > max_chars):
+                break
+            if not preview_lines and add_chars > max_chars:
+                preview_lines.append(line[:max_chars])
+                break
+            if len(preview_lines) >= max_lines or used_chars + add_chars > max_chars:
+                break
+            preview_lines.append(line)
+            used_chars += add_chars
+
+        preview = "\n".join(preview_lines).strip() or raw[:max_chars].strip()
+        return f"{preview}\n\n{suffix}".strip()
+
+    async def _send_telegram_text_document(self, message, text, filename, caption):
+        if message is None:
+            return
+        bio = io.BytesIO(str(text or "").encode("utf-8"))
+        bio.name = filename
+        await message.reply_document(
+            document=bio,
+            filename=filename,
+            caption=caption,
+        )
+
+    async def _reply_long_text_with_document(
+        self,
+        message,
+        text,
+        *,
+        reply_markup=None,
+        filename="telegram_message.txt",
+        caption="전체 내용입니다.",
+        preview_suffix="상세 내용은 파일로 보냈습니다.",
+        text_limit=3900,
+    ):
+        if message is None:
+            return
+        raw = str(text or "")
+        if len(raw) <= text_limit:
+            try:
+                await message.reply_text(raw, reply_markup=reply_markup)
+                return
+            except BadRequest as md_err:
+                if not self._is_telegram_message_too_long_error(md_err):
+                    raise
+
+        preview = self._build_telegram_long_text_preview(raw, suffix=preview_suffix)
+        await message.reply_text(preview, reply_markup=reply_markup)
+        await self._send_telegram_text_document(message, raw, filename, caption)
+
+    async def _edit_long_text_with_document(
+        self,
+        query,
+        text,
+        *,
+        reply_markup=None,
+        filename="telegram_message.txt",
+        caption="전체 내용입니다.",
+        preview_suffix="상세 내용은 파일로 보냈습니다.",
+        text_limit=3900,
+    ):
+        if query is None:
+            return
+        raw = str(text or "")
+        if len(raw) <= text_limit:
+            try:
+                await query.edit_message_text(raw, reply_markup=reply_markup)
+                return
+            except BadRequest as md_err:
+                if self._is_telegram_message_not_modified_error(md_err):
+                    return
+                if not self._is_telegram_message_too_long_error(md_err):
+                    raise
+
+        preview = self._build_telegram_long_text_preview(raw, suffix=preview_suffix)
+        try:
+            await query.edit_message_text(preview, reply_markup=reply_markup)
+        except BadRequest as md_err:
+            if not self._is_telegram_message_not_modified_error(md_err):
+                raise
+
+        await self._send_telegram_text_document(
+            getattr(query, "message", None),
+            raw,
+            filename,
+            caption,
+        )
+
     def _extract_telegram_command(self, text):
         normalized = str(text or "").strip()
         if not normalized.startswith('/'):
@@ -24091,16 +24199,25 @@ AUTO 최근 선택 이유:
             if message is None:
                 return
             text = await _get_utbreakout_condition_status_text()
-            await message.reply_text(text, reply_markup=_build_utbreakout_keyboard())
+            await self._reply_long_text_with_document(
+                message,
+                text,
+                reply_markup=_build_utbreakout_keyboard(),
+                filename='utbreakout_condition_status.txt',
+                caption='UT Breakout 조건 스테이터스 전체 내용입니다. 현재 포지션/선택 이유/다음 스캔 후보 확인용입니다.',
+                preview_suffix='상세 조건 스테이터스는 파일로 보냈습니다.',
+            )
 
         async def _edit_utbreakout_condition_status(query):
             text = await _get_utbreakout_condition_status_text()
-            try:
-                await query.edit_message_text(text, reply_markup=_build_utbreakout_keyboard())
-            except BadRequest as md_err:
-                if "message is not modified" in str(md_err).lower():
-                    return
-                raise
+            await self._edit_long_text_with_document(
+                query,
+                text,
+                reply_markup=_build_utbreakout_keyboard(),
+                filename='utbreakout_condition_status.txt',
+                caption='UT Breakout 조건 스테이터스 전체 내용입니다. 현재 포지션/선택 이유/다음 스캔 후보 확인용입니다.',
+                preview_suffix='상세 조건 스테이터스는 파일로 보냈습니다.',
+            )
 
         async def _get_utbreakout_entry_analysis_text(raw_symbol=None):
             engine = self.engines.get('signal')
