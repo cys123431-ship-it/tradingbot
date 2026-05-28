@@ -103,6 +103,21 @@ TELEGRAM_EMERGENCY_PATTERN = (
     r"(?i)^\s*(?:[^\w/]+\s*)?"
     r"(?:/(?:stop|pause|resume)(?:@[A-Za-z0-9_]+)?|STOP|PAUSE|RESUME)\s*$"
 )
+TELEGRAM_MENU_COMMAND_PATTERN = (
+    r"^/(status|history|log|help|stats|close|utbreak|utbreakout|utbot|setup|"
+    r"coinscan|customcoins|microauto|prediction)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
+)
+TELEGRAM_UTBREAK_INTEGRATED_COMMANDS = frozenset({
+    "/utbot",
+    "/coinscan",
+    "/customcoins",
+    "/microauto",
+})
+UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS = frozenset({
+    "on",
+    "off",
+    "condition_status",
+})
 
 # ---------------------------------------------------------
 # 0. 濡쒓퉭 諛??좏떥由ы떚
@@ -21394,11 +21409,81 @@ class MainController:
         try:
             await message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
         except BadRequest as md_err:
-            if "can't parse entities" in str(md_err).lower():
+            if self._is_telegram_message_too_long_error(md_err):
+                await self._reply_long_text_with_document(
+                    message,
+                    str(text),
+                    reply_markup=reply_markup,
+                    filename="telegram_message.txt",
+                    caption="텔레그램 메시지 전체 내용입니다.",
+                )
+            elif "can't parse entities" in str(md_err).lower():
                 plain_text = str(text).replace("**", "").replace("`", "")
-                await message.reply_text(plain_text, reply_markup=reply_markup)
+                try:
+                    await message.reply_text(plain_text, reply_markup=reply_markup)
+                except BadRequest as plain_err:
+                    if not self._is_telegram_message_too_long_error(plain_err):
+                        raise
+                    await self._reply_long_text_with_document(
+                        message,
+                        plain_text,
+                        reply_markup=reply_markup,
+                        filename="telegram_message.txt",
+                        caption="텔레그램 메시지 전체 내용입니다.",
+                    )
             else:
                 raise
+
+    async def _edit_markdown_safe(
+        self,
+        query,
+        text,
+        *,
+        reply_markup=None,
+        filename="telegram_message.txt",
+        caption="텔레그램 메시지 전체 내용입니다.",
+        preview_suffix="상세 내용은 파일로 보냈습니다.",
+    ):
+        if query is None:
+            return
+        try:
+            await query.edit_message_text(
+                text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup,
+            )
+        except BadRequest as md_err:
+            if self._is_telegram_message_not_modified_error(md_err):
+                return
+            plain_text = str(text).replace("**", "").replace("`", "")
+            if self._is_telegram_message_too_long_error(md_err):
+                await self._edit_long_text_with_document(
+                    query,
+                    plain_text,
+                    reply_markup=reply_markup,
+                    filename=filename,
+                    caption=caption,
+                    preview_suffix=preview_suffix,
+                )
+                return
+            if "can't parse entities" in str(md_err).lower():
+                try:
+                    await query.edit_message_text(plain_text, reply_markup=reply_markup)
+                except BadRequest as plain_err:
+                    if self._is_telegram_message_not_modified_error(plain_err):
+                        return
+                    if not self._is_telegram_message_too_long_error(plain_err):
+                        raise
+                    await self._edit_long_text_with_document(
+                        query,
+                        plain_text,
+                        reply_markup=reply_markup,
+                        filename=filename,
+                        caption=caption,
+                        preview_suffix=preview_suffix,
+                    )
+                return
+            raise
 
     @staticmethod
     def _is_telegram_message_not_modified_error(error):
@@ -23343,7 +23428,7 @@ class MainController:
         kb = [
             [KeyboardButton("🚨 STOP"), KeyboardButton("⏸ PAUSE"), KeyboardButton("▶ RESUME")],
             [KeyboardButton("/utbreak")],
-            [KeyboardButton("/prediction")],
+            [KeyboardButton("/setup"), KeyboardButton("/prediction")],
             [KeyboardButton("/status"), KeyboardButton("/history"), KeyboardButton("/stats")],
             [KeyboardButton("/log"), KeyboardButton("/help")]
         ]
@@ -23358,7 +23443,7 @@ class MainController:
         owner_only = self._telegram_owner_only
         text_filter = filters.TEXT & ~filters.COMMAND
         setup_trigger_pattern = r"^/setup(?:@[A-Za-z0-9_]+)?$"
-        menu_trigger_pattern = r"^/(status|history|log|help|stats|close|utbreak|utbreakout|setup|coinscan|customcoins|microauto|prediction)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
+        menu_trigger_pattern = TELEGRAM_MENU_COMMAND_PATTERN
         setup_text_filter = text_filter & ~filters.Regex(r"^/")
         emergency_pattern = TELEGRAM_EMERGENCY_PATTERN
 
@@ -23925,6 +24010,16 @@ UTBot:
             except Exception as exc:
                 await _edit_utbot_menu(query, f"❌ {exc}")
 
+        async def legacy_utbot_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            query = u.callback_query
+            if not query:
+                return
+            await query.answer()
+            data = str(query.data or '')
+            if not data.startswith('utbot:'):
+                return
+            await _edit_integrated_utbreak_notice(query, "UTBot")
+
         def _format_utbreakout_menu_text():
             sig_cfg = self.cfg.get('signal_engine', {})
             strategy_params = sig_cfg.get('strategy_params', {})
@@ -24089,24 +24184,20 @@ AUTO 최근 선택 이유:
             text = _format_utbreakout_menu_text()
             if notice:
                 text = f"{notice}\n\n{text}"
-            try:
-                await query.edit_message_text(
-                    text,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=_build_utbreakout_keyboard()
-                )
-            except BadRequest as md_err:
-                message = str(md_err).lower()
-                if "message is not modified" in message:
-                    return
-                if "can't parse entities" in message:
-                    plain_text = str(text).replace("**", "").replace("`", "")
-                    await query.edit_message_text(
-                        plain_text,
-                        reply_markup=_build_utbreakout_keyboard()
-                    )
-                else:
-                    raise
+            await self._edit_markdown_safe(
+                query,
+                text,
+                reply_markup=_build_utbreakout_keyboard(),
+                filename='utbreakout_menu.txt',
+                caption='UT Breakout 메뉴 전체 내용입니다.',
+                preview_suffix='상세 UTBreak 메뉴는 파일로 보냈습니다.',
+            )
+
+        async def _edit_integrated_utbreak_notice(query, source_label):
+            await _edit_utbreakout_menu(
+                query,
+                f"ℹ️ {source_label} 버튼은 이제 `/utbreak`의 UTBreak ON/OFF/조건 스테이터스로 통합되었습니다."
+            )
 
         async def _send_utbreakout_log_document(message):
             if message is None:
@@ -24735,6 +24826,12 @@ AUTO 최근 선택 이유:
             parts = data.split(':')
             action = parts[1] if len(parts) > 1 else 'status'
             value = parts[2] if len(parts) > 2 else None
+            if action not in UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS:
+                await _edit_utbreakout_menu(
+                    query,
+                    "ℹ️ 이전 버전 UTBreak 버튼입니다. 현재 버튼은 UTBreak ON/OFF/조건 스테이터스 3개만 사용합니다."
+                )
+                return
 
             if action == 'on':
                 await _edit_utbreakout_menu(query, await _activate_utbreak_strategy())
@@ -25365,6 +25462,8 @@ AUTO 최근 선택 이유:
             data = str(query.data or '')
             if not data.startswith('cs:'):
                 return
+            await _edit_integrated_utbreak_notice(query, "CoinSelector")
+            return
             action = data.split(':', 1)[1]
             if action == 'on':
                 await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], True)
@@ -25810,6 +25909,8 @@ AUTO 최근 선택 이유:
             data = str(query.data or '')
             if not data.startswith('cc:'):
                 return
+            await _edit_integrated_utbreak_notice(query, "CustomCoins AUTO")
+            return
             action = data.split(':', 1)[1]
             if action == 'on':
                 await _prompt_customcoins_input(query, c)
@@ -26073,6 +26174,8 @@ AUTO 최근 선택 이유:
             data = str(query.data or '')
             if not data.startswith('ma:'):
                 return
+            await _edit_integrated_utbreak_notice(query, "Micro Auto")
+            return
             action = data.split(':', 1)[1]
             if action == 'on':
                 await _enable_microauto(dry_run=True)
@@ -26918,6 +27021,7 @@ AUTO 최근 선택 이유:
 /stats - 통계
 /utbreak - UTBreak 전략 메뉴
 /utbreakout - /utbreak alias
+/setup - 거래소/네트워크 전환
 /prediction - Prediction Micro Auto / Binance Wallet Prediction(Predict.fun) 메뉴
 /log - 최근 로그
 /close - 긴급 청산
@@ -26942,6 +27046,7 @@ AUTO 최근 선택 이유:
         self.tg_app.add_handler(CommandHandler("stats", owner_only(stats_cmd)))
         self.tg_app.add_handler(CommandHandler("utbreak", owner_only(utbreakout_cmd)))
         self.tg_app.add_handler(CommandHandler("utbreakout", owner_only(utbreakout_cmd)))
+        self.tg_app.add_handler(CallbackQueryHandler(owner_only(legacy_utbot_callback), pattern=r"^utbot:"))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(utbreakout_callback), pattern=r"^utb:"))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(coinscan_callback), pattern=r"^cs:"))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(customcoins_callback), pattern=r"^cc:"))
@@ -26991,7 +27096,7 @@ AUTO 최근 선택 이유:
                 return await close_cmd(u, c)
             if command in {"/utbreak", "/utbreakout"}:
                 return await utbreakout_cmd(u, c)
-            if command in {"/coinscan", "/customcoins", "/microauto"}:
+            if command in TELEGRAM_UTBREAK_INTEGRATED_COMMANDS:
                 await self._reply_markdown_safe(
                     u.message,
                     "ℹ️ 해당 기능은 이제 `/utbreak` 메뉴 안으로 통합되었습니다.\n\n" + _format_utbreakout_menu_text(),

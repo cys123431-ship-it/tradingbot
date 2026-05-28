@@ -268,7 +268,22 @@ def test_main_keyboard_removes_utbot_button():
     ]
 
     assert "/utbreak" in labels
+    assert "/setup" in labels
     assert "/utbot" not in labels
+
+
+def test_legacy_utbot_command_routes_to_integrated_menu_handler():
+    emas = _emas_module()
+
+    assert re.match(emas.TELEGRAM_MENU_COMMAND_PATTERN, "/utbot")
+    assert re.match(emas.TELEGRAM_MENU_COMMAND_PATTERN, "/utbot on")
+    assert "/utbot" in emas.TELEGRAM_UTBREAK_INTEGRATED_COMMANDS
+
+
+def test_utbreakout_visible_callback_actions_stay_three_button_only():
+    emas = _emas_module()
+
+    assert emas.UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS == {"on", "off", "condition_status"}
 
 
 def test_setup_keyboard_keeps_exchange_button_choices():
@@ -402,6 +417,14 @@ class _FakeTelegramMessage:
         self.documents.append((args, kwargs))
 
 
+class _FakeTelegramMessageRejectsLongText(_FakeTelegramMessage):
+    async def reply_text(self, *args, **kwargs):
+        text = str(args[0]) if args else ""
+        if len(text) > 4096:
+            raise _emas_module().BadRequest("Message is too long")
+        await super().reply_text(*args, **kwargs)
+
+
 class _FakeTelegramUpdate:
     def __init__(self, chat_id, text):
         self.effective_chat = _FakeTelegramChat(chat_id)
@@ -463,6 +486,19 @@ def test_telegram_long_text_reply_sends_preview_and_document():
     assert len(message.documents) == 1
     assert message.documents[0][1]["filename"] == "utbreakout_condition_status.txt"
     assert message.documents[0][1]["document"].getvalue().decode("utf-8") == long_text
+
+
+def test_telegram_markdown_safe_long_reply_falls_back_to_document():
+    controller = _telegram_controller(chat_id=12345)
+    message = _FakeTelegramMessageRejectsLongText("/status")
+    long_text = "x" * 5000
+
+    asyncio.run(controller._reply_markdown_safe(message, long_text))
+
+    assert len(message.replies) == 1
+    assert "상세 내용은 파일로 보냈습니다." in message.replies[0][0][0]
+    assert len(message.documents) == 1
+    assert message.documents[0][1]["filename"] == "telegram_message.txt"
 
 
 def test_telegram_global_handler_requires_exact_emergency_text():
