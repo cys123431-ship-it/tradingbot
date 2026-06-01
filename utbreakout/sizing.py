@@ -17,7 +17,7 @@ def _clamp(value, low, high):
 
 def default_sizing_config():
     return {
-        "base_risk_percent": 1.0,
+        "base_risk_percent": 0.5,
         "volatility_target_atr_pct": 1.0,
         "volatility_target_min_multiplier": 0.25,
         "meta_min_multiplier": 0.25,

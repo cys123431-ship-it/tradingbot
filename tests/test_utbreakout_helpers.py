@@ -13,7 +13,7 @@ from utbreakout.indicators import (
     previous_donchian,
 )
 from utbreakout.research import summarize_diagnostic_events
-from utbreakout.risk import calculate_risk_plan
+from utbreakout.risk import calculate_risk_plan, normalize_risk_percent
 
 
 def _signal_engine_cls():
@@ -230,6 +230,31 @@ def test_risk_plan_uses_loss_budget_not_fixed_margin():
     assert plan["planned_notional"] == 1000.0
     assert plan["planned_margin"] == 100.0
     assert plan["take_profit"] == 108.0
+
+
+def test_risk_percent_normalization_clamps_legacy_live_defaults():
+    assert normalize_risk_percent({"risk_per_trade_pct": 10.0, "max_risk_per_trade_pct": 100.0}) == 1.0
+    assert normalize_risk_percent({"risk_per_trade_percent": 0.01}) == 0.05
+    assert normalize_risk_percent({"risk_per_trade_percent": 0.5}) == 0.5
+
+
+def test_trading_config_clamps_signal_futures_risk_defaults(tmp_path):
+    emas = _emas_module()
+    config_path = tmp_path / "config.json"
+    cfg = emas.TradingConfig(str(config_path))
+    common = cfg.config["signal_engine"]["common_settings"]
+    assert common["risk_per_trade_pct"] == 0.5
+    assert common["min_risk_per_trade_pct"] == 0.05
+    assert common["max_risk_per_trade_pct"] == 1.0
+
+    config_path.write_text(
+        '{"api":{"exchange_mode":"binance_testnet"},"signal_engine":{"common_settings":{"risk_per_trade_pct":10,"max_risk_per_trade_pct":100}}}',
+        encoding="utf-8",
+    )
+    legacy_cfg = emas.TradingConfig(str(config_path))
+    legacy_common = legacy_cfg.config["signal_engine"]["common_settings"]
+    assert legacy_common["risk_per_trade_pct"] == 1.0
+    assert legacy_common["max_risk_per_trade_pct"] == 1.0
 
 
 def test_research_summary_detects_set_concentration_and_protection_gaps():
@@ -1166,6 +1191,39 @@ class _FakeExchange:
         ]
         return {"id": order_id}
 
+    def _symbol_key(self, value):
+        return str(value or "").upper().replace(":USDT", "").replace("/", "")
+
+    def _signed_position_amount(self, position):
+        info = position.get("info", {}) if isinstance(position.get("info"), dict) else {}
+        value = info.get("positionAmt")
+        if value not in (None, ""):
+            return float(value)
+        contracts = float(position.get("contracts", 0) or 0)
+        if str(position.get("side", "")).lower() == "short":
+            return -abs(contracts)
+        return abs(contracts)
+
+    def _apply_market_close(self, symbol, side, amount):
+        close_amount = abs(float(amount or 0))
+        if close_amount <= 0:
+            return
+        target_key = self._symbol_key(symbol)
+        for position in self.positions:
+            info = position.setdefault("info", {})
+            pos_symbol = position.get("symbol") or info.get("symbol")
+            if self._symbol_key(pos_symbol) != target_key:
+                continue
+            signed = self._signed_position_amount(position)
+            if side == "buy":
+                signed = min(0.0, signed + close_amount)
+            elif side == "sell":
+                signed = max(0.0, signed - close_amount)
+            info["positionAmt"] = str(signed)
+            position["contracts"] = abs(signed)
+            position["side"] = "long" if signed > 0 else ("short" if signed < 0 else None)
+            return
+
     def create_order(self, symbol, order_type, side, amount, price=None, params=None):
         params = dict(params or {})
         order_id = f"created-{len(self.created) + 1}"
@@ -1193,6 +1251,8 @@ class _FakeExchange:
         }
         self.created.append(order)
         self.orders.append(order)
+        if str(order_type).lower() == "market" and params.get("reduceOnly"):
+            self._apply_market_close(symbol, side, amount)
         return order
 
 
@@ -2122,6 +2182,64 @@ def test_place_tp_sl_orders_uses_position_amt_for_short_futures_symbol():
     assert tp_order["side"] == "buy"
     assert float(tp_order["amount"]) == 2.0
     assert float(tp_order["price"]) == 90.0
+
+
+def test_place_tp_sl_orders_emergency_closes_when_stop_loss_creation_fails():
+    emas = _emas_module()
+
+    class StopFailingExchange(_FakeExchange):
+        def __init__(self, orders, symbol_scope_returns=True, positions=None):
+            super().__init__(orders, symbol_scope_returns=symbol_scope_returns, positions=positions)
+            self.stop_attempts = 0
+
+        def create_order(self, symbol, order_type, side, amount, price=None, params=None):
+            if str(order_type).lower() == "stop_market":
+                self.stop_attempts += 1
+                raise RuntimeError("stop rejected")
+            return super().create_order(symbol, order_type, side, amount, price, params)
+
+    pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "2", "entryPrice": "100"}
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    engine.exchange = StopFailingExchange([], positions=[pos])
+    engine.ctrl = _DummyCtrl()
+    engine.last_protection_alert_ts = {}
+    engine.last_protection_order_status = {}
+    engine.last_orphan_protection_sweep_ts = 0.0
+    engine.orphan_protection_candidates = {}
+    engine.ORPHAN_PROTECTION_SWEEP_INTERVAL = 10.0
+    engine.position_cache = {}
+    engine.POSITION_CACHE_TTL = 0.0
+    engine.is_upbit_mode = lambda: False
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": emas.UTBOT_FILTERED_BREAKOUT_STRATEGY,
+        "UTBotFilteredBreakoutV1": {
+            "sl_place_max_retries": 2,
+            "sl_retry_delay_sec": 0.0,
+            "emergency_close_on_sl_fail": True,
+        },
+    }
+
+    asyncio.run(
+        engine._place_tp_sl_orders(
+            "BTC/USDT",
+            "long",
+            100,
+            "2",
+            tp_distance=15,
+            sl_distance=10,
+            tp_qty_ratio=0.5,
+        )
+    )
+
+    market_orders = [order for order in engine.exchange.created if order["type"] == "market"]
+    assert engine.exchange.stop_attempts == 2
+    assert len(market_orders) == 1
+    assert market_orders[0]["side"] == "sell"
+    assert market_orders[0]["params"]["reduceOnly"] is True
+    assert float(market_orders[0]["amount"]) == 2.0
+    assert float(engine.exchange.positions[0]["contracts"]) == 0.0
+    assert engine.last_protection_order_status["BTC/USDT"]["emergency_close_status"] == "EMERGENCY_CLOSED"
 
 
 def test_utbreakout_trailing_replaces_sl_and_keeps_partial_tp_order():

@@ -3,6 +3,7 @@ from utbreakout.micro_auto import (
     build_micro_entry_plan,
     choose_micro_leverage,
     default_micro_auto_config,
+    normalize_micro_auto_config,
 )
 
 
@@ -22,6 +23,11 @@ def test_micro_auto_rejects_btc_like_min_notional_for_ten_usdt_account():
     assert result["reject_code"] == "REJECTED_MICRO_MIN_NOTIONAL_MARGIN"
     assert result["last_attempt"]["leverage"] == 10
     assert result["last_attempt"]["required_margin"] > result["last_attempt"]["margin_cap"]
+
+
+def test_micro_auto_default_and_legacy_risk_are_bounded():
+    assert default_micro_auto_config()["risk_per_trade_pct"] == 0.5
+    assert normalize_micro_auto_config({"risk_per_trade_pct": 1.5})["risk_per_trade_pct"] == 1.0
 
 
 def test_micro_auto_accepts_five_usdt_min_notional_with_lowest_safe_leverage():
@@ -62,6 +68,7 @@ def test_micro_auto_rejects_when_min_notional_bump_exceeds_risk_budget():
 
 def test_micro_auto_builds_plan_from_atr_risk_and_min_notional():
     cfg = default_micro_auto_config()
+    cfg["risk_per_trade_pct"] = 1.0
 
     plan = build_micro_entry_plan(
         side="short",
@@ -88,6 +95,7 @@ def test_micro_auto_builds_plan_from_atr_risk_and_min_notional():
 
 def test_micro_auto_fee_burden_blocks_too_tight_risk():
     cfg = default_micro_auto_config()
+    cfg["risk_per_trade_pct"] = 1.0
     cfg["max_fee_burden_pct"] = 5.0
 
     plan = build_micro_entry_plan(

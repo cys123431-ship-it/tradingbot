@@ -8,6 +8,7 @@ PYTHON_BIN="${PYTHON_BIN:-$APP_DIR/venv/bin/python}"
 BOT_ENTRY="${BOT_ENTRY:-$APP_DIR/emas.py}"
 STATE_DIR="${STATE_DIR:-$APP_DIR/runtime}"
 HEARTBEAT_FILE="${HEARTBEAT_FILE:-$STATE_DIR/bot_heartbeat.json}"
+HEARTBEAT_MAX_AGE_SEC="${HEARTBEAT_MAX_AGE_SEC:-180}"
 ACTION="${1:-}"
 TRUNCATE_LOG="${TRUNCATE_LOG:-0}"
 
@@ -68,6 +69,32 @@ except Exception:
 PY
 }
 
+heartbeat_health_status() {
+  if [[ ! -f "$HEARTBEAT_FILE" ]]; then
+    echo "missing"
+    return 1
+  fi
+
+  local age
+  age="$(heartbeat_age_seconds)"
+  if [[ -z "$age" ]]; then
+    echo "unreadable"
+    return 1
+  fi
+
+  if [[ "$age" -gt "$HEARTBEAT_MAX_AGE_SEC" ]]; then
+    echo "stale:$age"
+    return 1
+  fi
+
+  echo "ok:$age"
+  return 0
+}
+
+bot_process_running() {
+  pgrep -f "$BOT_ENTRY" >/dev/null 2>&1
+}
+
 start_bot() {
   local launch_reason="${BOT_LAUNCH_REASON:-manual_start}"
   local last_heartbeat_age="${BOT_LAST_HEARTBEAT_AGE:-}"
@@ -85,7 +112,7 @@ start_bot() {
     rm -f "$PID_FILE"
   fi
 
-  if pgrep -f "$BOT_ENTRY" >/dev/null 2>&1; then
+  if bot_process_running; then
     echo "bot already running via process scan"
     return 0
   fi
@@ -146,7 +173,7 @@ stop_bot() {
     rm -f "$PID_FILE"
   fi
 
-  if pgrep -f "$BOT_ENTRY" >/dev/null 2>&1; then
+  if bot_process_running; then
     pkill -f "$BOT_ENTRY" || true
     sleep 2
   fi
@@ -155,18 +182,52 @@ stop_bot() {
 }
 
 status_bot() {
-  if pgrep -f "$BOT_ENTRY" >/dev/null 2>&1; then
+  if bot_process_running; then
     pgrep -af "$BOT_ENTRY"
-    return 0
+    local hb_status
+    if hb_status="$(heartbeat_health_status)"; then
+      echo "heartbeat healthy: age=${hb_status#ok:}s max=${HEARTBEAT_MAX_AGE_SEC}s"
+      return 0
+    fi
+    case "$hb_status" in
+      stale:*)
+        echo "bot unhealthy: heartbeat stale age=${hb_status#stale:}s max=${HEARTBEAT_MAX_AGE_SEC}s"
+        ;;
+      missing)
+        echo "bot unhealthy: heartbeat missing: $HEARTBEAT_FILE"
+        ;;
+      *)
+        echo "bot unhealthy: heartbeat unreadable: $HEARTBEAT_FILE"
+        ;;
+    esac
+    return 1
   fi
 
-  echo "bot not running"
+  if [[ -f "$HEARTBEAT_FILE" ]]; then
+    local hb_age
+    hb_age="$(heartbeat_age_seconds)"
+    echo "bot not running (last heartbeat age=${hb_age:-unknown}s)"
+  else
+    echo "bot not running"
+  fi
   return 1
 }
 
 ensure_bot() {
-  if pgrep -f "$BOT_ENTRY" >/dev/null 2>&1; then
-    echo "bot healthy"
+  if bot_process_running; then
+    local hb_status
+    if hb_status="$(heartbeat_health_status)"; then
+      echo "bot healthy: heartbeat age=${hb_status#ok:}s"
+      return 0
+    fi
+    echo "bot unhealthy: heartbeat $hb_status; restarting"
+    BOT_LAST_HEARTBEAT_AGE="$(heartbeat_age_seconds)" \
+    BOT_LAST_PID="$(cat "$PID_FILE" 2>/dev/null || true)" \
+    BOT_LAST_LOG_LINE="$(last_log_excerpt)" \
+    BOT_PREV_PAUSED="$(heartbeat_paused_state)" \
+    stop_bot
+    BOT_LAUNCH_REASON="ensure_restart_stale_heartbeat" \
+    start_bot
     return 0
   fi
 

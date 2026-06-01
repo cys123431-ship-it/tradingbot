@@ -23,7 +23,7 @@ DEFAULT_MICRO_AUTO_CONFIG = {
     "max_margin_usage_pct": 45.0,
     "min_free_buffer_usdt": 1.5,
     "min_free_buffer_pct": 20.0,
-    "risk_per_trade_pct": 1.5,
+    "risk_per_trade_pct": 0.5,
     "max_risk_usdt": 0.15,
     "daily_loss_limit_usdt": 0.45,
     "max_daily_trades": 3,
@@ -122,6 +122,7 @@ def normalize_micro_auto_config(raw=None):
         cfg["max_margin_usage_pct"] = DEFAULT_MICRO_AUTO_CONFIG["max_margin_usage_pct"]
     if cfg["risk_per_trade_pct"] <= 0:
         cfg["risk_per_trade_pct"] = DEFAULT_MICRO_AUTO_CONFIG["risk_per_trade_pct"]
+    cfg["risk_per_trade_pct"] = min(1.0, cfg["risk_per_trade_pct"])
     if cfg["max_risk_usdt"] <= 0:
         cfg["max_risk_usdt"] = DEFAULT_MICRO_AUTO_CONFIG["max_risk_usdt"]
     if cfg["min_take_profit_r"] < 2.0:

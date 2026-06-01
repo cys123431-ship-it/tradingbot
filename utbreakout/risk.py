@@ -6,6 +6,10 @@ exchange, Telegram, or pandas state.
 
 from math import isfinite
 
+DEFAULT_RISK_PER_TRADE_PERCENT = 0.5
+DEFAULT_MIN_RISK_PER_TRADE_PERCENT = 0.05
+DEFAULT_MAX_RISK_PER_TRADE_PERCENT = 1.0
+
 
 def _finite_float(value, default=None):
     try:
@@ -13,6 +17,36 @@ def _finite_float(value, default=None):
     except (TypeError, ValueError):
         return default
     return parsed if isfinite(parsed) else default
+
+
+def normalize_risk_percent(
+    config_or_value=None,
+    *,
+    default=DEFAULT_RISK_PER_TRADE_PERCENT,
+    min_default=DEFAULT_MIN_RISK_PER_TRADE_PERCENT,
+    max_default=DEFAULT_MAX_RISK_PER_TRADE_PERCENT,
+):
+    """Return a bounded percent risk value for live futures sizing."""
+    cfg = config_or_value if isinstance(config_or_value, dict) else {}
+    if isinstance(config_or_value, dict):
+        raw = cfg.get("risk_per_trade_percent", cfg.get("risk_per_trade_pct", default))
+    else:
+        raw = config_or_value if config_or_value not in (None, "") else default
+
+    min_raw = cfg.get(
+        "min_risk_per_trade_percent",
+        cfg.get("min_risk_per_trade_pct", min_default),
+    )
+    max_raw = cfg.get(
+        "max_risk_per_trade_percent",
+        cfg.get("max_risk_per_trade_pct", max_default),
+    )
+    min_pct = max(0.0, _finite_float(min_raw, min_default))
+    max_pct = max(min_pct, min(_finite_float(max_raw, max_default), float(max_default)))
+    parsed = _finite_float(raw, default)
+    if parsed is None or parsed <= 0:
+        parsed = _finite_float(default, DEFAULT_RISK_PER_TRADE_PERCENT)
+    return max(min_pct, min(max_pct, parsed))
 
 
 def calculate_risk_plan(
@@ -25,7 +59,7 @@ def calculate_risk_plan(
     take_profit_r_multiple=2.0,
     min_risk_reward=2.0,
     balance_usdt=0.0,
-    risk_per_trade_percent=1.0,
+    risk_per_trade_percent=DEFAULT_RISK_PER_TRADE_PERCENT,
     max_risk_per_trade_usdt=1.0,
     leverage=1.0,
 ):

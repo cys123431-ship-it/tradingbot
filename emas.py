@@ -61,7 +61,13 @@ from utbreakout.coinselector import (
     sector_tags_for_symbol as coin_selector_sector_tags_for_symbol,
 )
 from utbreakout.research import format_research_summary
-from utbreakout.risk import calculate_risk_plan
+from utbreakout.risk import (
+    DEFAULT_MAX_RISK_PER_TRADE_PERCENT,
+    DEFAULT_MIN_RISK_PER_TRADE_PERCENT,
+    DEFAULT_RISK_PER_TRADE_PERCENT,
+    calculate_risk_plan,
+    normalize_risk_percent,
+)
 from utbreakout.timeframe import HTF_MAP as UTBREAKOUT_HTF_MAP, select_adaptive_timeframe
 from utbreakout.adaptive import (
     build_dynamic_chandelier_stop,
@@ -912,7 +918,12 @@ def build_default_utbot_filtered_breakout_config():
         'short_atr_trailing_multiplier_delta': 0.25,
         'short_atr_trailing_activation_r_delta': 0.20,
         'min_risk_reward': 2.0,
-        'risk_per_trade_percent': 1.0,
+        'risk_per_trade_percent': DEFAULT_RISK_PER_TRADE_PERCENT,
+        'min_risk_per_trade_percent': DEFAULT_MIN_RISK_PER_TRADE_PERCENT,
+        'max_risk_per_trade_percent': DEFAULT_MAX_RISK_PER_TRADE_PERCENT,
+        'sl_place_max_retries': 3,
+        'sl_retry_delay_sec': 0.7,
+        'emergency_close_on_sl_fail': True,
         'max_risk_per_trade_usdt': 1.0,
         'daily_max_loss_usdt': 3.0,
         'max_daily_trades': 5,
@@ -1156,8 +1167,9 @@ class TradingConfig:
                     'timeframe': '15m',
                     'entry_timeframe': '8h',
                     'exit_timeframe': '4h',
-                    'risk_per_trade_pct': 10.0,
-                    'max_risk_per_trade_pct': 100.0,
+                    'risk_per_trade_pct': DEFAULT_RISK_PER_TRADE_PERCENT,
+                    'min_risk_per_trade_pct': DEFAULT_MIN_RISK_PER_TRADE_PERCENT,
+                    'max_risk_per_trade_pct': DEFAULT_MAX_RISK_PER_TRADE_PERCENT,
                     'target_roe_pct': 20.0,
                     'stop_loss_pct': 10.0,
                     'daily_loss_limit': 5000.0,
@@ -1455,27 +1467,27 @@ class TradingConfig:
             changed = True
 
         common_cfg = signal_cfg.setdefault('common_settings', {})
-        max_risk_pct = float(common_cfg.get('max_risk_per_trade_pct', 100.0) or 100.0)
-        if max_risk_pct < 1.0:
-            max_risk_pct = 1.0
-            common_cfg['max_risk_per_trade_pct'] = max_risk_pct
-            changed = True
-        if max_risk_pct > 100.0:
-            max_risk_pct = 100.0
-            common_cfg['max_risk_per_trade_pct'] = max_risk_pct
-            changed = True
-        # Keep global cap at 100% so Telegram setup can always allow up to 100.
-        if max_risk_pct < 100.0:
-            max_risk_pct = 100.0
-            common_cfg['max_risk_per_trade_pct'] = max_risk_pct
-            changed = True
+        risk_bounds = {
+            'min_risk_per_trade_pct': DEFAULT_MIN_RISK_PER_TRADE_PERCENT,
+            'max_risk_per_trade_pct': DEFAULT_MAX_RISK_PER_TRADE_PERCENT,
+        }
+        for key, default in risk_bounds.items():
+            try:
+                value = float(common_cfg.get(key, default))
+            except (TypeError, ValueError):
+                value = float(default)
+            if key == 'min_risk_per_trade_pct':
+                value = max(0.0, value)
+            else:
+                min_value = float(common_cfg.get('min_risk_per_trade_pct', DEFAULT_MIN_RISK_PER_TRADE_PERCENT) or 0.0)
+                value = max(min_value, min(DEFAULT_MAX_RISK_PER_TRADE_PERCENT, value))
+            if common_cfg.get(key) != value:
+                common_cfg[key] = value
+                changed = True
 
-        risk_pct = float(common_cfg.get('risk_per_trade_pct', 10.0) or 10.0)
-        if risk_pct > max_risk_pct:
-            common_cfg['risk_per_trade_pct'] = max_risk_pct
-            changed = True
-        elif risk_pct < 1.0:
-            common_cfg['risk_per_trade_pct'] = 1.0
+        normalized_risk_pct = normalize_risk_percent(common_cfg)
+        if common_cfg.get('risk_per_trade_pct') != normalized_risk_pct:
+            common_cfg['risk_per_trade_pct'] = normalized_risk_pct
             changed = True
 
         tp_sl_master = bool(common_cfg.get('tp_sl_enabled', True))
@@ -1760,8 +1772,9 @@ class TradingConfig:
                     "leverage": 10, "timeframe": "15m",
                     "entry_timeframe": "15m",
                     "exit_timeframe": "15m",
-                    "risk_per_trade_pct": 10.0,
-                    "max_risk_per_trade_pct": 100.0,
+                    "risk_per_trade_pct": DEFAULT_RISK_PER_TRADE_PERCENT,
+                    "min_risk_per_trade_pct": DEFAULT_MIN_RISK_PER_TRADE_PERCENT,
+                    "max_risk_per_trade_pct": DEFAULT_MAX_RISK_PER_TRADE_PERCENT,
                     "target_roe_pct": 20.0, "stop_loss_pct": 10.0,
                     "daily_loss_limit": 5000.0,
                     "daily_loss_limit_pct": 5.0,
@@ -4794,7 +4807,10 @@ class SignalEngine(BaseEngine):
             'stop_atr_multiplier': 1.5,
             'take_profit_r_multiple': 2.0,
             'min_risk_reward': 2.0,
-            'risk_per_trade_percent': 1.0,
+            'risk_per_trade_percent': DEFAULT_RISK_PER_TRADE_PERCENT,
+            'min_risk_per_trade_percent': DEFAULT_MIN_RISK_PER_TRADE_PERCENT,
+            'max_risk_per_trade_percent': DEFAULT_MAX_RISK_PER_TRADE_PERCENT,
+            'sl_retry_delay_sec': 0.7,
             'max_risk_per_trade_usdt': 1.0,
             'daily_max_loss_usdt': 3.0,
             'daily_profit_target_usdt': 5.0,
@@ -4892,6 +4908,7 @@ class SignalEngine(BaseEngine):
             'donchian_length': 20,
             'max_daily_trades': 5,
             'max_consecutive_losses': 3,
+            'sl_place_max_retries': 3,
             'opposite_set_exit_min_hold_candles': 3,
             'adaptive_timeframe_min_hold_candles': 3,
             'shadow_triple_barrier_max_bars': 24,
@@ -4994,8 +5011,14 @@ class SignalEngine(BaseEngine):
             'dynamic_take_profit_enabled',
             'tp1_breakeven_enabled',
             'tp1_breakeven_wait_for_partial',
+            'emergency_close_on_sl_fail',
         ):
             cfg[key] = bool(cfg.get(key, False))
+        cfg['risk_per_trade_percent'] = normalize_risk_percent({
+            'risk_per_trade_percent': cfg.get('risk_per_trade_percent'),
+            'min_risk_per_trade_percent': cfg.get('min_risk_per_trade_percent'),
+            'max_risk_per_trade_percent': cfg.get('max_risk_per_trade_percent'),
+        })
         if bool(cfg.get('fixed_take_profit_enabled', True)):
             cfg['partial_take_profit_enabled'] = True
             cfg['partial_take_profit_r_multiple'] = 1.5
@@ -17856,10 +17879,8 @@ class SignalEngine(BaseEngine):
                     lev = int(max(1.0, float(filtered_breakout_plan.get('leverage', lev) or lev)))
                 except (TypeError, ValueError):
                     pass
-            req_risk_pct = float(cfg.get('risk_per_trade_pct', 10.0) or 10.0)
-            max_risk_pct = float(cfg.get('max_risk_per_trade_pct', 100.0) or 100.0)
-            max_risk_pct = min(100.0, max(1.0, max_risk_pct))
-            bounded_risk_pct = min(max(req_risk_pct, 1.0), max_risk_pct)
+            req_risk_pct = float(cfg.get('risk_per_trade_pct', DEFAULT_RISK_PER_TRADE_PERCENT) or DEFAULT_RISK_PER_TRADE_PERCENT)
+            bounded_risk_pct = normalize_risk_percent(cfg)
             risk_pct = bounded_risk_pct / 100.0
             
             _, free, _ = await self.get_balance_info()
@@ -18044,7 +18065,7 @@ class SignalEngine(BaseEngine):
                 return
             
             if active_strategy not in UTBREAKOUT_STRATEGIES and bounded_risk_pct != req_risk_pct:
-                await self.ctrl.notify(f"⚠️ 리스크 상한 적용: {req_risk_pct:.1f}% -> {bounded_risk_pct:.1f}%")
+                await self.ctrl.notify(f"⚠️ 리스크 상한 적용: {req_risk_pct:.2f}% -> {bounded_risk_pct:.2f}%")
             if active_strategy in UTBREAKOUT_STRATEGIES:
                 logger.info(
                     f"[UTBOT_FILTERED_BREAKOUT_V1] Entry params: qty={qty}, lev={lev}x, "
@@ -18054,7 +18075,7 @@ class SignalEngine(BaseEngine):
                 )
             else:
                 logger.info(
-                    f"Entry params: qty={qty}, lev={lev}x, risk={bounded_risk_pct:.1f}% "
+                    f"Entry params: qty={qty}, lev={lev}x, risk={bounded_risk_pct:.2f}% "
                     f"(free={free:.2f}, margin_to_use={margin_to_use:.2f}, target_notional={target_notional:.2f}, safety={safety_buffer:.2f})"
                 )
 
@@ -19207,10 +19228,13 @@ class SignalEngine(BaseEngine):
         price,
         params,
         label,
-        max_attempts=3
+        max_attempts=3,
+        retry_delay_sec=0.7
     ):
         last_error = None
-        for attempt in range(1, max_attempts + 1):
+        total_attempts = max(1, int(max_attempts or 1))
+        retry_delay = max(0.0, float(retry_delay_sec or 0.0))
+        for attempt in range(1, total_attempts + 1):
             try:
                 order = await asyncio.to_thread(
                     self.exchange.create_order,
@@ -19226,10 +19250,111 @@ class SignalEngine(BaseEngine):
                 return order
             except Exception as e:
                 last_error = e
-                logger.error(f"{label} order attempt {attempt}/{max_attempts} failed for {symbol}: {e}")
-            if attempt < max_attempts:
-                await asyncio.sleep(0.7)
+                logger.error(f"{label} order attempt {attempt}/{total_attempts} failed for {symbol}: {e}")
+            if attempt < total_attempts and retry_delay > 0:
+                await asyncio.sleep(retry_delay)
         raise last_error
+
+    async def _emergency_close_position_without_stop_loss(
+        self,
+        symbol,
+        *,
+        reason='SL placement failed',
+        max_attempts=5
+    ):
+        status = {
+            'status': 'SKIPPED',
+            'symbol': symbol,
+            'attempts': 0,
+            'closed': False,
+            'error': None,
+        }
+        if self.is_upbit_mode():
+            status['status'] = 'UPBIT_SKIPPED'
+            return status
+
+        try:
+            await self._cancel_all_orders_variants(symbol, reason=f'before emergency close: {reason}')
+            await self._cancel_protection_orders(symbol, reason=f'before emergency close: {reason}')
+        except Exception as cancel_e:
+            logger.warning(f"Emergency close pre-cancel failed for {symbol}: {cancel_e}")
+
+        last_error = None
+        total_attempts = max(1, int(max_attempts or 1))
+        for attempt in range(1, total_attempts + 1):
+            self.position_cache = None
+            self.position_cache_time = 0
+            pos = await self.get_server_position(symbol, use_cache=False)
+            if not pos:
+                status.update({'status': 'ALREADY_FLAT', 'closed': True, 'attempts': attempt - 1})
+                await self._reconcile_closed_position_protection(symbol, reason=reason, alert=True, attempts=2)
+                return status
+
+            side = str(pos.get('side', '') or '').lower()
+            if side not in {'long', 'short'}:
+                last_error = ValueError(f"invalid position side for emergency close: {side}")
+                break
+            contracts = abs(float(self._position_signed_contracts(pos) or pos.get('contracts', 0) or 0))
+            qty = self.safe_amount(symbol, contracts)
+            if float(qty) <= 0:
+                last_error = ValueError(f"invalid emergency close qty: {qty}")
+                break
+            close_side = 'sell' if side == 'long' else 'buy'
+            params = self._close_order_params_for_position(pos)
+
+            try:
+                status['attempts'] = attempt
+                await asyncio.to_thread(
+                    self.exchange.create_order,
+                    symbol,
+                    'market',
+                    close_side,
+                    qty,
+                    None,
+                    params
+                )
+            except Exception as close_error:
+                last_error = close_error
+                logger.error(
+                    f"Emergency close after SL failure attempt {attempt}/{total_attempts} "
+                    f"failed for {symbol}: {close_error}"
+                )
+                if attempt < total_attempts:
+                    await asyncio.sleep(1.0)
+                continue
+
+            await asyncio.sleep(0.8)
+            self.position_cache = None
+            self.position_cache_time = 0
+            remaining = await self.get_server_position(symbol, use_cache=False)
+            if not remaining:
+                await self._cancel_all_orders_variants(symbol, reason=f'after emergency close: {reason}')
+                await self._reconcile_closed_position_protection(symbol, reason=reason, alert=True, attempts=3)
+                status.update({'status': 'EMERGENCY_CLOSED', 'closed': True})
+                await self.ctrl.notify(
+                    f"🚨 {self.ctrl.format_symbol_for_display(symbol)} SL 생성 실패로 포지션을 즉시 시장가 청산했습니다."
+                )
+                return status
+
+            logger.warning(
+                f"Emergency close order accepted but position still open after SL failure: "
+                f"{symbol} {remaining.get('side')} {remaining.get('contracts')}"
+            )
+            if attempt < total_attempts:
+                await self._cancel_all_orders_variants(symbol, reason=f'emergency close retry {attempt}')
+                await self._cancel_protection_orders(symbol, reason=f'emergency close retry {attempt}')
+
+        status.update({
+            'status': 'EMERGENCY_CLOSE_FAILED',
+            'closed': False,
+            'error': str(last_error) if last_error else 'position still open',
+        })
+        await self._audit_protection_orders(symbol, pos=await self.get_server_position(symbol, use_cache=False), alert=True)
+        await self.ctrl.notify(
+            f"🚨 {self.ctrl.format_symbol_for_display(symbol)} SL 생성 실패 후 긴급 청산도 실패했습니다. "
+            f"거래소에서 즉시 수동 청산하세요: {status['error']}"
+        )
+        return status
 
     async def _cancel_protection_orders_by_kind(self, symbol, kinds, reason='protection cleanup'):
         wanted = {str(kind).lower() for kind in (kinds or [])}
@@ -19619,6 +19744,13 @@ class SignalEngine(BaseEngine):
             pos = None
             side = str(side or '').lower()
             entry_price = float(entry_price or 0.0)
+            try:
+                protection_cfg = self._get_utbot_filtered_breakout_config(self.get_runtime_strategy_params())
+            except Exception:
+                protection_cfg = build_default_utbot_filtered_breakout_config()
+            sl_max_attempts = max(1, int(protection_cfg.get('sl_place_max_retries', 3) or 3))
+            sl_retry_delay = max(0.0, float(protection_cfg.get('sl_retry_delay_sec', 0.7) or 0.0))
+            emergency_close_on_sl_fail = bool(protection_cfg.get('emergency_close_on_sl_fail', True))
             if side not in {'long', 'short'} or entry_price <= 0:
                 logger.error(f"Protection placement skipped: invalid side/entry ({symbol}, {side}, {entry_price})")
                 return
@@ -19732,7 +19864,8 @@ class SignalEngine(BaseEngine):
                                 'newClientOrderId': self._build_protection_client_order_id(symbol, side, 'sl', pos)
                             },
                             'SL',
-                            max_attempts=3
+                            max_attempts=sl_max_attempts,
+                            retry_delay_sec=sl_retry_delay
                         )
                         logger.info(f"SL order placed: {sl_side.upper()} @ {sl_price} (stop)")
                     except Exception as sl_e:
@@ -19741,7 +19874,8 @@ class SignalEngine(BaseEngine):
                         await self._notify_protection_issue(
                             symbol,
                             'sl_place_failed',
-                            f"🚨 {self.ctrl.format_symbol_for_display(symbol)} SL 주문 생성 실패(3회 재시도). 포지션은 유지 중이니 거래소에서 수동 확인하세요: {sl_e}",
+                            f"🚨 {self.ctrl.format_symbol_for_display(symbol)} SL 주문 생성 실패({sl_max_attempts}회 재시도). "
+                            f"{'즉시 시장가 청산을 시도합니다.' if emergency_close_on_sl_fail else '거래소에서 수동 확인하세요.'}: {sl_e}",
                             cooldown_sec=30
                         )
                         self.last_protection_order_status[symbol] = {
@@ -19753,6 +19887,13 @@ class SignalEngine(BaseEngine):
                             'missing_sl': True,
                             'status': 'SL_PLACE_FAILED'
                         }
+                        if emergency_close_on_sl_fail:
+                            close_status = await self._emergency_close_position_without_stop_loss(
+                                symbol,
+                                reason='SL placement failed after entry',
+                                max_attempts=5
+                            )
+                            self.last_protection_order_status[symbol]['emergency_close_status'] = close_status.get('status')
                         return
 
             # Take Profit is allowed to be split; SL always covers the full current size.
@@ -23314,7 +23455,7 @@ class MainController:
 4. 진입 타임프레임 (`{sig_common.get('timeframe', '15m')}`)
 41. 청산 타임프레임 (`{sig_common.get('exit_timeframe', '4h')}`)
 5. 일일 손실 제한 (`${sig_common.get('daily_loss_limit', 5000)}`)
-6. 진입 비율 (`{sig_common.get('risk_per_trade_pct', 50)}%`)
+6. 진입 비율 (`{sig_common.get('risk_per_trade_pct', DEFAULT_RISK_PER_TRADE_PERCENT)}%`)
 7. 매매 방향 (`{direction_str}`)
 8. 심볼 변경 (`{symbol}`)
 38. 감시 심볼 추가 (`{watchlist_preview}`)
@@ -23760,10 +23901,13 @@ class MainController:
                 await self.cfg.update_value(['dual_mode_engine', 'daily_loss_limit'], float(val))
             elif choice == '6':
                 v = float(val)
-                max_risk = float(self.cfg.get('signal_engine', {}).get('common_settings', {}).get('max_risk_per_trade_pct', 100.0) or 100.0)
-                max_risk = min(100.0, max(1.0, max_risk))
-                if v < 1 or v > max_risk:
-                    await update.message.reply_text(f"❌ 1~{max_risk:.0f} 사이 값을 입력하세요.")
+                common_settings = self.cfg.get('signal_engine', {}).get('common_settings', {})
+                min_risk = float(common_settings.get('min_risk_per_trade_pct', DEFAULT_MIN_RISK_PER_TRADE_PERCENT) or 0.0)
+                max_risk = float(common_settings.get('max_risk_per_trade_pct', DEFAULT_MAX_RISK_PER_TRADE_PERCENT) or DEFAULT_MAX_RISK_PER_TRADE_PERCENT)
+                min_risk = max(0.0, min_risk)
+                max_risk = max(min_risk, min(DEFAULT_MAX_RISK_PER_TRADE_PERCENT, max_risk))
+                if v < min_risk or v > max_risk:
+                    await update.message.reply_text(f"❌ {min_risk:.2f}~{max_risk:.2f}% 사이 값을 입력하세요.")
                     return SELECT
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'risk_per_trade_pct'], v)
                 await self.cfg.update_value(['dual_thrust_engine', 'risk_per_trade_pct'], v)
@@ -26078,9 +26222,13 @@ AUTO 최근 선택 이유:
                 await u.message.reply_text(f"✅ 1회 최대 손실 설정: ${value:.2f}")
             elif action in {'riskpct', 'risk_pct', 'riskpercent', 'risk_percent'}:
                 try:
-                    value = _parse_positive_arg('잔고 대비 손실 기준(%)', minimum=0.0, maximum=100.0)
+                    value = _parse_positive_arg(
+                        '잔고 대비 손실 기준(%)',
+                        minimum=DEFAULT_MIN_RISK_PER_TRADE_PERCENT,
+                        maximum=DEFAULT_MAX_RISK_PER_TRADE_PERCENT
+                    )
                 except ValueError as e:
-                    await u.message.reply_text(f"❌ {e}\n예: `/utbreak riskpct 1`", parse_mode=ParseMode.MARKDOWN)
+                    await u.message.reply_text(f"❌ {e}\n예: `/utbreak riskpct 0.5`", parse_mode=ParseMode.MARKDOWN)
                     return
                 await self.cfg.update_value(
                     ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'risk_per_trade_percent'],
@@ -26452,6 +26600,19 @@ AUTO 최근 선택 이유:
                     return
                 if numeric_value <= 0:
                     await _edit_utbreakout_menu(query, "❌ 손실 설정값은 0보다 커야 합니다.")
+                    return
+                if (
+                    action == 'riskpct'
+                    and (
+                        numeric_value < DEFAULT_MIN_RISK_PER_TRADE_PERCENT
+                        or numeric_value > DEFAULT_MAX_RISK_PER_TRADE_PERCENT
+                    )
+                ):
+                    await _edit_utbreakout_menu(
+                        query,
+                        f"❌ 잔고 대비 손실 기준은 "
+                        f"{DEFAULT_MIN_RISK_PER_TRADE_PERCENT:.2f}~{DEFAULT_MAX_RISK_PER_TRADE_PERCENT:.2f}% 사이여야 합니다."
+                    )
                     return
                 if action == 'risk':
                     await self.cfg.update_value(
