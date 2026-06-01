@@ -246,15 +246,105 @@ def test_trading_config_clamps_signal_futures_risk_defaults(tmp_path):
     assert common["risk_per_trade_pct"] == 0.5
     assert common["min_risk_per_trade_pct"] == 0.05
     assert common["max_risk_per_trade_pct"] == 1.0
+    upbit_common = cfg.config["upbit"]["common_settings"]
+    assert upbit_common["risk_per_trade_pct"] == 0.5
+    assert upbit_common["min_risk_per_trade_pct"] == 0.05
+    assert upbit_common["max_risk_per_trade_pct"] == 1.0
+    dual_thrust = cfg.config["dual_thrust_engine"]
+    dual_mode = cfg.config["dual_mode_engine"]
+    assert dual_thrust["risk_per_trade_pct"] == 0.5
+    assert dual_thrust["max_risk_per_trade_pct"] == 1.0
+    assert dual_mode["risk_per_trade_pct"] == 0.5
+    assert dual_mode["max_risk_per_trade_pct"] == 1.0
 
     config_path.write_text(
-        '{"api":{"exchange_mode":"binance_testnet"},"signal_engine":{"common_settings":{"risk_per_trade_pct":10,"max_risk_per_trade_pct":100}}}',
+        (
+            '{"api":{"exchange_mode":"binance_testnet"},'
+            '"signal_engine":{"common_settings":{"risk_per_trade_pct":10,"max_risk_per_trade_pct":100}},'
+            '"upbit":{"common_settings":{"risk_per_trade_pct":10,"max_risk_per_trade_pct":100}},'
+            '"dual_thrust_engine":{"risk_per_trade_pct":50,"max_risk_per_trade_pct":100},'
+            '"dual_mode_engine":{"risk_per_trade_pct":10,"max_risk_per_trade_pct":100}}'
+        ),
         encoding="utf-8",
     )
     legacy_cfg = emas.TradingConfig(str(config_path))
     legacy_common = legacy_cfg.config["signal_engine"]["common_settings"]
     assert legacy_common["risk_per_trade_pct"] == 1.0
     assert legacy_common["max_risk_per_trade_pct"] == 1.0
+    assert legacy_cfg.config["upbit"]["common_settings"]["risk_per_trade_pct"] == 1.0
+    assert legacy_cfg.config["upbit"]["common_settings"]["max_risk_per_trade_pct"] == 1.0
+    assert legacy_cfg.config["dual_thrust_engine"]["risk_per_trade_pct"] == 1.0
+    assert legacy_cfg.config["dual_thrust_engine"]["max_risk_per_trade_pct"] == 1.0
+    assert legacy_cfg.config["dual_mode_engine"]["risk_per_trade_pct"] == 1.0
+    assert legacy_cfg.config["dual_mode_engine"]["max_risk_per_trade_pct"] == 1.0
+
+
+def test_utbreakout_runtime_blocks_unsafe_live_and_emergency_sets():
+    emas = _emas_module()
+    engine_cls = _signal_engine_cls()
+
+    class LiveController:
+        def get_exchange_mode(self):
+            return emas.BINANCE_MAINNET
+
+    class TestnetController:
+        def get_exchange_mode(self):
+            return emas.BINANCE_TESTNET
+
+    engine = engine_cls.__new__(engine_cls)
+    engine.ctrl = LiveController()
+    cfg = emas.build_default_utbot_filtered_breakout_config()
+    cfg["active_set_id"] = 1
+
+    selected, _, reason = asyncio.run(engine._resolve_utbreakout_selected_set("BTC/USDT", pd.DataFrame(), cfg))
+
+    assert selected["id"] == 22
+    assert "Set1" in reason
+
+    cfg["allow_ut_only_live_override"] = True
+    selected, _, _ = asyncio.run(engine._resolve_utbreakout_selected_set("BTC/USDT", pd.DataFrame(), cfg))
+    assert selected["id"] == 1
+
+    engine.ctrl = TestnetController()
+    cfg = emas.build_default_utbot_filtered_breakout_config()
+    cfg["active_set_id"] = 50
+    selected, _, reason = asyncio.run(engine._resolve_utbreakout_selected_set("BTC/USDT", pd.DataFrame(), cfg))
+
+    assert selected["id"] == 22
+    assert "Set50" in reason
+
+    cfg["emergency_mode"] = True
+    selected, _, _ = asyncio.run(engine._resolve_utbreakout_selected_set("BTC/USDT", pd.DataFrame(), cfg))
+    assert selected["id"] == 50
+
+
+def test_utbreakout_set63_requires_volume_on_squeeze_release():
+    emas = _emas_module()
+    engine_cls = _signal_engine_cls()
+    engine = engine_cls.__new__(engine_cls)
+    cfg = emas.build_default_utbot_filtered_breakout_config()
+    set_info = emas.get_utbreakout_set_definition(63)
+    cfg.update(set_info["params"])
+    values = {
+        "bb_width_percentile": 20.0,
+        "keltner_squeeze_on": False,
+        "range_expansion_ratio": 1.10,
+        "volume_ratio": 1.0,
+        "entry_price": 105.0,
+        "donchian_high_prev": 100.0,
+        "donchian_low_prev": 90.0,
+    }
+
+    low_volume = engine._evaluate_utbreakout_set_filter_items("long", set_info, cfg, values)
+    item = next(item for item in low_volume if item["code"] == "REJECTED_SQUEEZE_RELEASE")
+
+    assert item["state"] is False
+    assert "vol>=1.20" in item["detail"]
+
+    values["volume_ratio"] = 1.25
+    high_volume = engine._evaluate_utbreakout_set_filter_items("long", set_info, cfg, values)
+    item = next(item for item in high_volume if item["code"] == "REJECTED_SQUEEZE_RELEASE")
+    assert item["state"] is True
 
 
 def test_research_summary_detects_set_concentration_and_protection_gaps():

@@ -437,6 +437,7 @@ ALT_TREND_TIMEFRAME_ORDER = {
 BINANCE_FAPI_PUBLIC_BASE_URL = 'https://fapi.binance.com'
 UTBREAKOUT_ACTIVE_SET_MAX = 63
 UTBREAKOUT_DEFAULT_SET_ID = 2
+UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID = 22
 UTBREAKOUT_AUTO_TIMEFRAMES = ['15m', '30m', '1h', '2h', '4h']
 
 
@@ -544,6 +545,7 @@ def build_utbreakout_set_registry():
         'squeeze_lookback': 80,
         'squeeze_percentile_max': 25.0,
         'squeeze_release_range_min': 1.05,
+        'squeeze_volume_ratio_min': 1.20,
         'squeeze_require_keltner': False,
         'dynamic_take_profit_enabled': True,
         'dynamic_tp2_strong_score': 72.0,
@@ -691,7 +693,7 @@ def build_utbreakout_set_registry():
         (60, 'Prediction Futures', 'UT + Cross-Market Confirmation', 'Futures 수급, basis/funding, Prediction odds 중 2개 이상이 UT 방향과 맞을 때 진입합니다.', '크로스마켓 정렬 장', '품질 좋은 신호 선별', '신호 수 감소', '적음', ['UTBot', 'Futures Flow', 'Basis', 'Prediction'], ['prediction_cross_market_confirmation'], {}),
         (61, 'Microstructure Futures', 'UT + Rolling OFI Confirmation', 'UTBot 방향 신호에 최근 orderbook imbalance, taker flow, spread/depth 비용을 같이 확인하는 futures microstructure set입니다.', '짧은 호가 수급이 UT 방향으로 누적되는 구간', '순간 호가가 아니라 rolling pressure를 확인', '호가 snapshot 품질과 호출 주기에 민감', '적음~중간', ['UTBot', 'Rolling OFI', 'Orderbook Imbalance', 'Taker Buy/Sell Ratio', 'Spread/Depth'], ['rolling_orderflow_imbalance', 'prediction_spread_depth_guard'], {'rolling_ofi_window': 5, 'rolling_ofi_min_abs': 3.0, 'rolling_ofi_taker_long_min': 1.03, 'rolling_ofi_taker_short_max': 0.97, 'rolling_ofi_spread_max_pct': 0.05, 'prediction_min_depth_usdt': 50000.0}),
         (62, 'Prediction Futures', 'UT + OI Funding Squeeze', 'UTBot 방향 신호에 OI 변화 z-score, funding 과열, long/short crowding, basis를 조합하는 set입니다.', 'OI가 가속되지만 funding/crowding이 아직 과열되지 않은 구간', '추세 가속과 군중 과열을 같이 점검', 'OI 히스토리 데이터 부족 시 보수적으로 대기', '적음', ['UTBot', 'Open Interest Z', 'Funding Rate', 'Long/Short Ratio', 'Basis'], ['oi_funding_squeeze', 'prediction_macro_event_guard', 'prediction_basis_divergence', 'prediction_spread_depth_guard'], {'oi_z_min': 0.75, 'oi_acceleration_min': 0.0, 'funding_long_max': 0.0008, 'funding_short_min': -0.0008, 'long_short_long_max': 1.85, 'long_short_short_min': 0.55}),
-        (63, 'Volatility Regime', 'UT + Squeeze Release Breakout', 'BB/Keltner 압축 이후 range breakout이 발생하고 UTBot 방향과 일치할 때만 진입하는 set입니다.', '압축 뒤 변동성 확장이 시작되는 구간', '압축 후 돌파만 선택해 추격 노이즈를 줄임', '초기 압축 판정 데이터가 부족하면 대기', '적음~중간', ['UTBot', 'BB Width Percentile', 'Keltner Channel', 'Range Expansion', 'ATR'], ['squeeze_release_breakout', 'atr_guard'], {'squeeze_lookback': 80, 'squeeze_percentile_max': 25.0, 'squeeze_release_range_min': 1.05, 'squeeze_require_keltner': False}),
+        (63, 'Volatility Regime', 'UT + Squeeze Release Breakout', 'BB/Keltner 압축 이후 range breakout이 발생하고 UTBot 방향과 일치할 때만 진입하는 set입니다.', '압축 뒤 변동성 확장이 시작되는 구간', '압축 후 돌파만 선택해 추격 노이즈를 줄임', '초기 압축 판정 데이터가 부족하면 대기', '적음~중간', ['UTBot', 'BB Width Percentile', 'Keltner Channel', 'Range Expansion', 'Relative Volume', 'ATR'], ['squeeze_release_breakout', 'atr_guard'], {'squeeze_lookback': 80, 'squeeze_percentile_max': 25.0, 'squeeze_release_range_min': 1.05, 'squeeze_volume_ratio_min': 1.20, 'squeeze_require_keltner': False}),
     ]
     registry = {}
     for row in rows:
@@ -737,6 +739,53 @@ def get_utbreakout_set_definition(set_id):
     )
 
 
+def _parse_bool_like(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    text = str(value).strip().lower()
+    if text in {'1', 'true', 'yes', 'y', 'on', 'enable', 'enabled'}:
+        return True
+    if text in {'0', 'false', 'no', 'n', 'off', 'disable', 'disabled'}:
+        return False
+    return bool(default)
+
+
+def is_utbreakout_live_mode_value(value):
+    text = str(value or '').strip().lower()
+    return text in {BINANCE_MAINNET, 'mainnet', 'live', 'real', 'production', 'prod'}
+
+
+def validate_utbreakout_runtime_set_id(cfg, set_id, is_live=False):
+    cfg = cfg if isinstance(cfg, dict) else {}
+    selected_id = normalize_utbreakout_set_id(set_id, UTBREAKOUT_DEFAULT_SET_ID)
+    if not _parse_bool_like(cfg.get('live_safety_guard_enabled', True), True):
+        return selected_id, None
+
+    safe_id = normalize_utbreakout_set_id(
+        cfg.get('safe_live_default_set_id', UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID),
+        UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID
+    )
+    if safe_id in {1, 50}:
+        safe_id = UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID
+
+    inferred_live = (
+        bool(is_live)
+        or _parse_bool_like(cfg.get('live_trading'), False)
+        or is_utbreakout_live_mode_value(cfg.get('mode'))
+        or is_utbreakout_live_mode_value(cfg.get('exchange_mode'))
+    )
+    if selected_id == 1 and inferred_live and not _parse_bool_like(cfg.get('allow_ut_only_live_override', False), False):
+        return safe_id, f"Set1 UT-only live blocked -> Set{safe_id} safety fallback"
+    if selected_id == 50 and not (
+        _parse_bool_like(cfg.get('emergency_mode', False), False)
+        or _parse_bool_like(cfg.get('allow_emergency_simple_set', False), False)
+    ):
+        return safe_id, f"Set50 emergency simple mode blocked outside emergency -> Set{safe_id} safety fallback"
+    return selected_id, None
+
+
 def format_utbreakout_set_brief(set_id):
     info = get_utbreakout_set_definition(set_id)
     status = '실거래' if info.get('status') == 'active' else '연구전용'
@@ -764,6 +813,11 @@ def build_default_utbot_filtered_breakout_config():
     return {
         'profile': 'set2',
         'active_set_id': UTBREAKOUT_DEFAULT_SET_ID,
+        'safe_live_default_set_id': UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID,
+        'live_safety_guard_enabled': True,
+        'allow_ut_only_live_override': False,
+        'emergency_mode': False,
+        'allow_emergency_simple_set': False,
         'auto_select_enabled': False,
         'selection_mode': 'manual',
         'auto_timeframes': list(UTBREAKOUT_AUTO_TIMEFRAMES),
@@ -1263,8 +1317,9 @@ class TradingConfig:
                     'timeframe': '1h',
                     'entry_timeframe': '1h',
                     'exit_timeframe': '1h',
-                    'risk_per_trade_pct': 10.0,
-                    'max_risk_per_trade_pct': 100.0,
+                    'risk_per_trade_pct': DEFAULT_RISK_PER_TRADE_PERCENT,
+                    'min_risk_per_trade_pct': DEFAULT_MIN_RISK_PER_TRADE_PERCENT,
+                    'max_risk_per_trade_pct': DEFAULT_MAX_RISK_PER_TRADE_PERCENT,
                     'daily_loss_limit': 50000.0,
                     'daily_loss_limit_pct': 5.0,
                     'min_order_krw': 5000.0,
@@ -1306,13 +1361,17 @@ class TradingConfig:
                 'n_days': 4,
                 'k1': 0.5,
                 'k2': 0.5,
-                'risk_per_trade_pct': 50.0
+                'risk_per_trade_pct': DEFAULT_RISK_PER_TRADE_PERCENT,
+                'min_risk_per_trade_pct': DEFAULT_MIN_RISK_PER_TRADE_PERCENT,
+                'max_risk_per_trade_pct': DEFAULT_MAX_RISK_PER_TRADE_PERCENT
             },
             'dual_mode_engine': {
                 'target_symbol': 'BTC/USDT',
                 'leverage': 5,
                 'mode': 'standard',  # 'scalping' or 'standard'
-                'risk_per_trade_pct': 10.0,
+                'risk_per_trade_pct': DEFAULT_RISK_PER_TRADE_PERCENT,
+                'min_risk_per_trade_pct': DEFAULT_MIN_RISK_PER_TRADE_PERCENT,
+                'max_risk_per_trade_pct': DEFAULT_MAX_RISK_PER_TRADE_PERCENT,
                 'scalping_tf': '5m',
                 'standard_tf': '4h'
             },
@@ -1466,29 +1525,35 @@ class TradingConfig:
             strategy_params['entry_mode'] = 'cross'
             changed = True
 
-        common_cfg = signal_cfg.setdefault('common_settings', {})
-        risk_bounds = {
-            'min_risk_per_trade_pct': DEFAULT_MIN_RISK_PER_TRADE_PERCENT,
-            'max_risk_per_trade_pct': DEFAULT_MAX_RISK_PER_TRADE_PERCENT,
-        }
-        for key, default in risk_bounds.items():
+        def _normalize_percent_risk_cfg(risk_cfg):
+            nonlocal changed
+            if not isinstance(risk_cfg, dict):
+                return
+            min_raw = risk_cfg.get('min_risk_per_trade_pct', DEFAULT_MIN_RISK_PER_TRADE_PERCENT)
             try:
-                value = float(common_cfg.get(key, default))
+                min_value = max(0.0, float(min_raw))
             except (TypeError, ValueError):
-                value = float(default)
-            if key == 'min_risk_per_trade_pct':
-                value = max(0.0, value)
-            else:
-                min_value = float(common_cfg.get('min_risk_per_trade_pct', DEFAULT_MIN_RISK_PER_TRADE_PERCENT) or 0.0)
-                value = max(min_value, min(DEFAULT_MAX_RISK_PER_TRADE_PERCENT, value))
-            if common_cfg.get(key) != value:
-                common_cfg[key] = value
+                min_value = DEFAULT_MIN_RISK_PER_TRADE_PERCENT
+            max_raw = risk_cfg.get('max_risk_per_trade_pct', DEFAULT_MAX_RISK_PER_TRADE_PERCENT)
+            try:
+                max_value = float(max_raw)
+            except (TypeError, ValueError):
+                max_value = DEFAULT_MAX_RISK_PER_TRADE_PERCENT
+            max_value = max(min_value, min(DEFAULT_MAX_RISK_PER_TRADE_PERCENT, max_value))
+            for key, value in (
+                ('min_risk_per_trade_pct', min_value),
+                ('max_risk_per_trade_pct', max_value),
+            ):
+                if risk_cfg.get(key) != value:
+                    risk_cfg[key] = value
+                    changed = True
+            normalized = normalize_risk_percent(risk_cfg)
+            if risk_cfg.get('risk_per_trade_pct') != normalized:
+                risk_cfg['risk_per_trade_pct'] = normalized
                 changed = True
 
-        normalized_risk_pct = normalize_risk_percent(common_cfg)
-        if common_cfg.get('risk_per_trade_pct') != normalized_risk_pct:
-            common_cfg['risk_per_trade_pct'] = normalized_risk_pct
-            changed = True
+        common_cfg = signal_cfg.setdefault('common_settings', {})
+        _normalize_percent_risk_cfg(common_cfg)
 
         tp_sl_master = bool(common_cfg.get('tp_sl_enabled', True))
         tp_enabled = bool(common_cfg.get('take_profit_enabled', True))
@@ -1624,8 +1689,9 @@ class TradingConfig:
             'timeframe': '1h',
             'entry_timeframe': '1h',
             'exit_timeframe': '1h',
-            'risk_per_trade_pct': 10.0,
-            'max_risk_per_trade_pct': 100.0,
+            'risk_per_trade_pct': DEFAULT_RISK_PER_TRADE_PERCENT,
+            'min_risk_per_trade_pct': DEFAULT_MIN_RISK_PER_TRADE_PERCENT,
+            'max_risk_per_trade_pct': DEFAULT_MAX_RISK_PER_TRADE_PERCENT,
             'daily_loss_limit': 50000.0,
             'daily_loss_limit_pct': 5.0,
             'min_order_krw': 5000.0,
@@ -1648,12 +1714,9 @@ class TradingConfig:
             if key not in upbit_common:
                 upbit_common[key] = value
                 changed = True
-        if float(upbit_common.get('risk_per_trade_pct', 10.0) or 10.0) < 1.0:
-            upbit_common['risk_per_trade_pct'] = 1.0
-            changed = True
-        if float(upbit_common.get('max_risk_per_trade_pct', 100.0) or 100.0) < 1.0:
-            upbit_common['max_risk_per_trade_pct'] = 100.0
-            changed = True
+        _normalize_percent_risk_cfg(upbit_common)
+        for legacy_section in ('dual_thrust_engine', 'dual_mode_engine'):
+            _normalize_percent_risk_cfg(self.config.setdefault(legacy_section, {}))
         if float(upbit_common.get('min_order_krw', 5000.0) or 0.0) < 5000.0:
             upbit_common['min_order_krw'] = 5000.0
             changed = True
@@ -1856,8 +1919,9 @@ class TradingConfig:
                     "timeframe": "1h",
                     "entry_timeframe": "1h",
                     "exit_timeframe": "1h",
-                    "risk_per_trade_pct": 10.0,
-                    "max_risk_per_trade_pct": 100.0,
+                    "risk_per_trade_pct": DEFAULT_RISK_PER_TRADE_PERCENT,
+                    "min_risk_per_trade_pct": DEFAULT_MIN_RISK_PER_TRADE_PERCENT,
+                    "max_risk_per_trade_pct": DEFAULT_MAX_RISK_PER_TRADE_PERCENT,
                     "daily_loss_limit": 50000.0,
                     "daily_loss_limit_pct": 5.0,
                     "min_order_krw": 5000.0,
@@ -1898,6 +1962,27 @@ class TradingConfig:
                 "asset_allocation": {"target_ratio": 0.5, "allowed_deviation_pct": 2.0},
                 "grid_trading": {"enabled": True, "grid_levels": 5, "grid_step_pct": 0.5, "order_size_usdt": 20},
                 "risk_monitor": {"max_mmr_alert_pct": 25.0}
+            },
+            "dual_thrust_engine": {
+                "target_symbol": "BTC/USDT",
+                "leverage": 5,
+                "daily_loss_limit": 5000,
+                "n_days": 4,
+                "k1": 0.5,
+                "k2": 0.5,
+                "risk_per_trade_pct": DEFAULT_RISK_PER_TRADE_PERCENT,
+                "min_risk_per_trade_pct": DEFAULT_MIN_RISK_PER_TRADE_PERCENT,
+                "max_risk_per_trade_pct": DEFAULT_MAX_RISK_PER_TRADE_PERCENT
+            },
+            "dual_mode_engine": {
+                "target_symbol": "BTC/USDT",
+                "leverage": 5,
+                "mode": "standard",
+                "risk_per_trade_pct": DEFAULT_RISK_PER_TRADE_PERCENT,
+                "min_risk_per_trade_pct": DEFAULT_MIN_RISK_PER_TRADE_PERCENT,
+                "max_risk_per_trade_pct": DEFAULT_MAX_RISK_PER_TRADE_PERCENT,
+                "scalping_tf": "5m",
+                "standard_tf": "4h"
             },
             "logging": {"db_path": "bot_database.db"}
         }
@@ -2935,7 +3020,7 @@ class TemaEngine(BaseEngine):
             if total <= 0: return
 
             # 2. ?ъ옄 鍮꾩쨷 (Risk %) - 怨듯넻 ?ㅼ젙 ?ъ슜
-            risk_pct = common_cfg.get('risk_per_trade_pct', 50.0)
+            risk_pct = normalize_risk_percent(common_cfg)
             leverage = common_cfg.get('leverage', 5)
             
             # USDT ?ъ엯 湲덉븸 怨꾩궛
@@ -4829,6 +4914,7 @@ class SignalEngine(BaseEngine):
             'market_quality_adverse_funding_soft': 0.0006,
             'market_quality_adverse_funding_hard': 0.0015,
             'market_quality_regime_strong_move_pct': 1.5,
+            'squeeze_volume_ratio_min': 1.20,
             'runner_structure_buffer_atr': 0.20,
             'runner_chandelier_multiplier': 2.4,
             'runner_chandelier_multiplier_min': 1.4,
@@ -4925,6 +5011,7 @@ class SignalEngine(BaseEngine):
             'meta_labeling_min_samples': 12,
             'bias_continuation_max_signal_age_candles': 6,
             'bias_continuation_15m_max_signal_age_candles': 3,
+            'safe_live_default_set_id': UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID,
         }.items():
             min_value = 0 if key == 'opposite_set_exit_min_hold_candles' else 1
             _int(key, default, min_value)
@@ -5012,6 +5099,10 @@ class SignalEngine(BaseEngine):
             'tp1_breakeven_enabled',
             'tp1_breakeven_wait_for_partial',
             'emergency_close_on_sl_fail',
+            'live_safety_guard_enabled',
+            'allow_ut_only_live_override',
+            'emergency_mode',
+            'allow_emergency_simple_set',
         ):
             cfg[key] = bool(cfg.get(key, False))
         cfg['risk_per_trade_percent'] = normalize_risk_percent({
@@ -5845,7 +5936,17 @@ class SignalEngine(BaseEngine):
         ready = int(scores.get('ready_timeframes', 0) or 0)
 
         if ready <= 0:
-            return 50, "AUTO 분석 데이터 부족: Set50 emergency simple mode"
+            emergency_allowed = (
+                _parse_bool_like(cfg.get('emergency_mode', False), False)
+                or _parse_bool_like(cfg.get('allow_emergency_simple_set', False), False)
+            )
+            fallback_id = 50 if emergency_allowed else normalize_utbreakout_set_id(
+                cfg.get('safe_live_default_set_id', UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID),
+                UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID
+            )
+            if fallback_id in {1, 50} and not emergency_allowed:
+                fallback_id = UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID
+            return fallback_id, f"AUTO 분석 데이터 부족: Set{fallback_id} safety fallback"
 
         clarity = max(trend, breakout, momentum, alignment)
         uncertainty = 100.0 - clarity
@@ -5934,7 +6035,12 @@ class SignalEngine(BaseEngine):
             raw_scores['auto_score_margin'] = round(float(score_margin), 2)
             raw_scores['auto_confidence'] = 'weak' if selected_score < 50.0 or score_margin < 3.0 else 'normal'
         if selected_score < 50.0:
-            selected_id = 2 if volatility < 45.0 else 49 if fallback >= 55.0 else 1
+            selected_id = 2 if volatility < 45.0 else 49 if fallback >= 55.0 else normalize_utbreakout_set_id(
+                cfg.get('safe_live_default_set_id', UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID),
+                UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID
+            )
+            if selected_id in {1, 50}:
+                selected_id = UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID
             if isinstance(raw_scores, dict):
                 raw_scores['auto_fallback_set_id'] = int(selected_id)
             reason = (
@@ -5953,6 +6059,20 @@ class SignalEngine(BaseEngine):
             raw_scores['auto_final_set_id'] = int(selected_id)
         return selected_id, reason
 
+    def _is_utbreakout_live_runtime(self, cfg):
+        if isinstance(cfg, dict):
+            if _parse_bool_like(cfg.get('live_trading'), False):
+                return True
+            if is_utbreakout_live_mode_value(cfg.get('mode')) or is_utbreakout_live_mode_value(cfg.get('exchange_mode')):
+                return True
+        ctrl = getattr(self, 'ctrl', None)
+        if ctrl is not None and hasattr(ctrl, 'get_exchange_mode'):
+            try:
+                return is_utbreakout_live_mode_value(ctrl.get_exchange_mode())
+            except Exception:
+                return False
+        return False
+
     async def _resolve_utbreakout_selected_set(self, symbol, df, cfg):
         analysis = None
         auto_reason = None
@@ -5965,6 +6085,19 @@ class SignalEngine(BaseEngine):
                 selected_id, auto_reason = self._select_utbreakout_auto_set(analysis, cfg)
             except Exception as exc:
                 auto_reason = f"AUTO 분석 실패: {exc}. 수동 Set{selected_id} 유지"
+        validated_id, safety_reason = validate_utbreakout_runtime_set_id(
+            cfg,
+            selected_id,
+            is_live=self._is_utbreakout_live_runtime(cfg)
+        )
+        if validated_id != selected_id:
+            selected_id = validated_id
+            auto_reason = f"{auto_reason} | {safety_reason}" if auto_reason else safety_reason
+            if isinstance(analysis, dict):
+                scores = analysis.setdefault('scores', {})
+                if isinstance(scores, dict):
+                    scores['auto_safety_fallback_set_id'] = int(validated_id)
+                    scores['auto_safety_reason'] = safety_reason
         selected_info = self._get_utbreakout_set_info(cfg, selected_id)
         return selected_info, analysis, auto_reason
 
@@ -6491,19 +6624,22 @@ class SignalEngine(BaseEngine):
                 bb_pct = values.get('bb_width_percentile')
                 keltner_squeeze = values.get('keltner_squeeze_on')
                 range_ratio = values.get('range_expansion_ratio')
+                volume_ratio = values.get('volume_ratio')
                 close_value = values.get('entry_price')
                 high_prev = values.get('donchian_high_prev')
                 low_prev = values.get('donchian_low_prev')
                 pct_max = float(cfg.get('squeeze_percentile_max', 25.0) or 25.0)
                 range_min = float(cfg.get('squeeze_release_range_min', 1.05) or 1.05)
+                volume_min = float(cfg.get('squeeze_volume_ratio_min', 1.20) or 1.20)
                 require_keltner = bool(cfg.get('squeeze_require_keltner', False))
                 level = high_prev if side == 'long' else low_prev
                 detail = (
                     f"BB pct {_fmt(bb_pct, 2)}, Keltner {'ON' if keltner_squeeze is True else 'OFF' if keltner_squeeze is False else 'n/a'}, "
-                    f"range {_fmt(range_ratio, 2)}, level {_fmt(level, 4)}"
+                    f"range {_fmt(range_ratio, 2)}, vol {_fmt(volume_ratio, 2)}, level {_fmt(level, 4)}"
                 )
                 if not (
                     self._is_valid_number(range_ratio)
+                    and self._is_valid_number(volume_ratio)
                     and self._is_valid_number(close_value)
                     and self._is_valid_number(high_prev)
                     and self._is_valid_number(low_prev)
@@ -6515,9 +6651,10 @@ class SignalEngine(BaseEngine):
                         keltner_squeeze is True or (self._is_valid_number(bb_pct) and float(bb_pct) <= pct_max)
                     )
                     range_ok = float(range_ratio) >= range_min
+                    volume_ok = float(volume_ratio) >= volume_min
                     breakout_ok = float(close_value) > float(high_prev) if side == 'long' else float(close_value) < float(low_prev)
-                    ok = squeeze_ok and range_ok and breakout_ok
-                    _add('Squeeze Release 돌파', ok, f"{detail} / squeeze {squeeze_ok} range>={range_min:.2f} breakout {breakout_ok}", 'REJECTED_SQUEEZE_RELEASE')
+                    ok = squeeze_ok and range_ok and volume_ok and breakout_ok
+                    _add('Squeeze Release 돌파', ok, f"{detail} / squeeze {squeeze_ok} range>={range_min:.2f} vol>={volume_min:.2f} breakout {breakout_ok}", 'REJECTED_SQUEEZE_RELEASE')
             elif filter_name == 'prediction_orderflow_imbalance':
                 imbalance = values.get('orderbook_imbalance_pct')
                 taker_ratio = values.get('taker_buy_sell_ratio')
@@ -18430,10 +18567,8 @@ class SignalEngine(BaseEngine):
                     await self.ctrl.notify(f"⚠️ **진입 차단**: 업비트 단일 보유 제한 (보유 중: {display_active})")
                     return
 
-            req_risk_pct = float(cfg.get('risk_per_trade_pct', 10.0) or 10.0)
-            max_risk_pct = float(cfg.get('max_risk_per_trade_pct', 100.0) or 100.0)
-            max_risk_pct = min(100.0, max(1.0, max_risk_pct))
-            bounded_risk_pct = min(max(req_risk_pct, 1.0), max_risk_pct)
+            req_risk_pct = float(cfg.get('risk_per_trade_pct', DEFAULT_RISK_PER_TRADE_PERCENT) or DEFAULT_RISK_PER_TRADE_PERCENT)
+            bounded_risk_pct = normalize_risk_percent(cfg)
             risk_pct = bounded_risk_pct / 100.0
 
             _, free_krw, _ = await self.get_balance_info()
@@ -18458,7 +18593,7 @@ class SignalEngine(BaseEngine):
                 return
 
             if bounded_risk_pct != req_risk_pct:
-                await self.ctrl.notify(f"⚠️ 업비트 리스크 상한 적용: {req_risk_pct:.1f}% -> {bounded_risk_pct:.1f}%")
+                await self.ctrl.notify(f"⚠️ 업비트 리스크 상한 적용: {req_risk_pct:.2f}% -> {bounded_risk_pct:.2f}%")
 
             await self.ensure_market_settings(symbol, leverage=1)
             order = await asyncio.to_thread(
@@ -20836,7 +20971,7 @@ class DualThrustEngine(BaseEngine):
         try:
             cfg = self.cfg.get('dual_thrust_engine', {})
             lev = cfg.get('leverage', 5)
-            risk_pct = cfg.get('risk_per_trade_pct', 50.0) / 100.0
+            risk_pct = normalize_risk_percent(cfg) / 100.0
             
             # ?덈쾭由ъ? ?ㅼ젙 & 寃⑸━ 紐⑤뱶 媛뺤젣
             await self.ensure_market_settings(symbol, leverage=lev)
@@ -21058,7 +21193,7 @@ class DualModeFractalEngine(BaseEngine):
     async def _entry(self, symbol, side, price, free_usdt):
         # 怨듯넻 ?ㅼ젙?먯꽌 由ъ뒪??諛?TP/SL 媛?몄삤湲?
         common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
-        risk = common_cfg.get('risk_per_trade_pct', 50.0) / 100.0
+        risk = normalize_risk_percent(common_cfg) / 100.0
         
         # ?덈쾭由ъ?????쇰え???ㅼ젙???곕Ⅴ嫄곕굹 怨듯넻 ?ㅼ젙???곕쫫 (?ъ슜???붿껌: ?먯궛/肄붿씤/TP/SL)
         # 臾몃㎘???덈쾭由ъ???怨듯넻???곕Ⅴ??寃껋씠 ?덉쟾?섎굹, 紐낆떆???붿껌? ?놁뿀?? 
@@ -23337,7 +23472,7 @@ class MainController:
 **Upbit**
 43. 업비트 코인 (`{up_symbol}`)
 44. 업비트 UT Bot (`K={float(up_utbot.get('key_value', 1.0) or 1.0):.2f}` / `ATR={int(up_utbot.get('atr_period', 10) or 10)}` / `HA={'ON' if up_utbot.get('use_heikin_ashi', False) else 'OFF'}`)
-45. 업비트 진입 비율 (`{up_common.get('risk_per_trade_pct', 10)}%`)
+45. 업비트 진입 비율 (`{up_common.get('risk_per_trade_pct', DEFAULT_RISK_PER_TRADE_PERCENT)}%`)
 46. 업비트 진입 TF (`{up_common.get('entry_timeframe', up_common.get('timeframe', '1h'))}`)
 47. 업비트 청산 TF (`{up_common.get('exit_timeframe', '1h')}`)
 48. 업비트 일일 손실 제한 (`₩{float(up_common.get('daily_loss_limit', 50000) or 50000):,.0f}`)
@@ -23536,7 +23671,7 @@ class MainController:
             '4': "📝 **진입 타임프레임** 입력 (예: 15m)\n1m,2m,3m,5m,15m,30m | 1h,2h,4h | 1d",
             '41': "📝 **청산 타임프레임** 입력 (예: 1h)\n1m,2m,3m,5m,15m,30m | 1h,2h,4h | 1d",
             '5': "📝 **일일 손실 제한($)** 입력 (예: 1000)",
-            '6': "📝 **진입 비율(%)** 입력 (1~100, 예: 50)",
+            '6': f"📝 **진입 비율(%)** 입력 ({DEFAULT_MIN_RISK_PER_TRADE_PERCENT:.2f}~{DEFAULT_MAX_RISK_PER_TRADE_PERCENT:.2f}, 예: {DEFAULT_RISK_PER_TRADE_PERCENT:.2f})",
             '7': "↕️ **매매 방향** 선택 (양방향/롱만/숏만)",
             '8': "💱 **심볼** 입력 또는 선택\n1: BTC  2: ETH  3: SOL\n또는 직접 입력 (예: DOGE, XRP, PEPE)",
             '38': "➕ **감시 심볼 추가**\n1: BTC  2: ETH  3: SOL\n또는 직접 입력 (예: DOGE, XRP, PEPE)",
@@ -23572,7 +23707,7 @@ class MainController:
             '37': "📝 **손절 자동청산** ON/OFF 토글",
             '43': "📝 **업비트 코인** 입력\n예: BTC, XRP, KRW-BTC, BTC/KRW",
             '44': "📝 **업비트 UT Bot 설정** 입력 (형식: key,atr,on/off 예: 1,10,off)",
-            '45': "📝 **업비트 진입 비율(%)** 입력 (1~100, 예: 25)",
+            '45': f"📝 **업비트 진입 비율(%)** 입력 ({DEFAULT_MIN_RISK_PER_TRADE_PERCENT:.2f}~{DEFAULT_MAX_RISK_PER_TRADE_PERCENT:.2f}, 예: {DEFAULT_RISK_PER_TRADE_PERCENT:.2f})",
             '46': "📝 **업비트 진입 타임프레임** 입력 (예: 1h)\n1m,3m,5m,15m,30m | 1h,4h | 1d",
             '47': "📝 **업비트 청산 타임프레임** 입력 (예: 1h)\n1m,3m,5m,15m,30m | 1h,4h | 1d",
             '48': "📝 **업비트 일일 손실 제한(KRW)** 입력 (예: 50000)",
@@ -23914,10 +24049,13 @@ class MainController:
                 await self.cfg.update_value(['dual_mode_engine', 'risk_per_trade_pct'], v)
             elif choice == '45':
                 v = float(val)
-                max_risk = float(self.cfg.get('upbit', {}).get('common_settings', {}).get('max_risk_per_trade_pct', 100.0) or 100.0)
-                max_risk = min(100.0, max(1.0, max_risk))
-                if v < 1 or v > max_risk:
-                    await update.message.reply_text(f"❌ 업비트 진입 비율은 1~{max_risk:.0f} 사이여야 합니다.")
+                upbit_common = self.cfg.get('upbit', {}).get('common_settings', {})
+                min_risk = float(upbit_common.get('min_risk_per_trade_pct', DEFAULT_MIN_RISK_PER_TRADE_PERCENT) or 0.0)
+                max_risk = float(upbit_common.get('max_risk_per_trade_pct', DEFAULT_MAX_RISK_PER_TRADE_PERCENT) or DEFAULT_MAX_RISK_PER_TRADE_PERCENT)
+                min_risk = max(0.0, min_risk)
+                max_risk = max(min_risk, min(DEFAULT_MAX_RISK_PER_TRADE_PERCENT, max_risk))
+                if v < min_risk or v > max_risk:
+                    await update.message.reply_text(f"❌ 업비트 진입 비율은 {min_risk:.2f}~{max_risk:.2f}% 사이여야 합니다.")
                     return SELECT
                 await self.cfg.update_value(['upbit', 'common_settings', 'risk_per_trade_pct'], v)
                 await update.message.reply_text(f"✅ 업비트 진입 비율 변경: {v}%")
@@ -27599,7 +27737,7 @@ AUTO 최근 선택 이유:
                 f"최소 거래 equity: {float(cfg.get('min_equity_to_trade_usdt', 6.0) or 6.0):.2f} USDT",
                 f"레버리지 자동범위: {int(cfg.get('min_leverage', 3) or 3)}x~{int(cfg.get('max_leverage', 10) or 10)}x",
                 f"증거금 상한: micro equity의 {float(cfg.get('max_margin_usage_pct', 45.0) or 45.0):.1f}%",
-                f"1회 손실: {float(cfg.get('risk_per_trade_pct', 1.5) or 1.5):.2f}% 또는 최대 {float(cfg.get('max_risk_usdt', 0.15) or 0.15):.2f} USDT",
+                f"1회 손실: {float(cfg.get('risk_per_trade_pct', DEFAULT_RISK_PER_TRADE_PERCENT) or DEFAULT_RISK_PER_TRADE_PERCENT):.2f}% 또는 최대 {float(cfg.get('max_risk_usdt', 0.15) or 0.15):.2f} USDT",
                 f"일일 손실/거래 제한: -{float(cfg.get('daily_loss_limit_usdt', 0.45) or 0.45):.2f} USDT / {int(cfg.get('max_daily_trades', 3) or 3)}회 / 연속손절 {int(cfg.get('max_consecutive_losses', 2) or 2)}회",
                 f"익절: 최소 {float(cfg.get('min_take_profit_r', 2.2) or 2.2):.1f}R, 수수료 부담 크면 {float(cfg.get('high_fee_take_profit_r', 2.5) or 2.5):.1f}R",
                 "원칙: 최소주문 때문에 수량을 키웠을 때 손절 손실이 예산을 넘으면 진입하지 않습니다.",

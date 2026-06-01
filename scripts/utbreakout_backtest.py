@@ -325,6 +325,36 @@ def simulate_utbot_rr(
             "planned_notional": plan["planned_notional"],
         }
 
+    if position and rows:
+        idx = len(rows) - 1
+        row = rows[idx]
+        side = position["side"]
+        exit_price = _apply_slippage(row["close"], side, slippage_bps, is_entry=False)
+        qty = position["qty"]
+        gross = (exit_price - position["entry_price"]) * qty
+        if side == "short":
+            gross *= -1.0
+        fees = (position["entry_price"] * qty + exit_price * qty) * fee_bps / 10000.0
+        closing_pnl = gross - fees
+        total_trade_pnl = closing_pnl + position.get("realized_pnl", 0.0) + position.get("funding_pnl", 0.0)
+        balance += closing_pnl + position.get("funding_pnl", 0.0)
+        fee_paid = position.get("fee_paid", 0.0) + fees
+        risk_usdt = max(position.get("risk_usdt", 0.0), 1e-9)
+        trade = dict(position)
+        trade.update({
+            "exit_idx": idx,
+            "exit_price": exit_price,
+            "exit_reason": "END_OF_DATA",
+            "pnl": total_trade_pnl,
+            "r_multiple": total_trade_pnl / risk_usdt,
+            "fee_paid": fee_paid,
+            "balance": balance,
+        })
+        trades.append(trade)
+        equity_peak = max(equity_peak, balance)
+        max_drawdown = max(max_drawdown, equity_peak - balance)
+        position = None
+
     gross_profit = sum(t["pnl"] for t in trades if t["pnl"] > 0)
     gross_loss = abs(sum(t["pnl"] for t in trades if t["pnl"] < 0))
     net_pnl = sum(t["pnl"] for t in trades)
