@@ -3,6 +3,7 @@ from utbreakout.coinselector import (
     build_selection_report,
     default_coin_selector_config,
     finalize_candidate,
+    market_is_tradifi_perpetual,
     normalize_custom_symbols,
     rank_candidates,
     score_selection_quality,
@@ -83,6 +84,8 @@ def test_coinselector_accepts_tradifi_usdt_perpetual():
     )
 
     assert candidate["accepted"] is True
+    assert candidate["tradifi_perpetual"] is True
+    assert market_is_tradifi_perpetual("EWY/USDT:USDT", _market(info={"contractType": "TRADIFI_PERPETUAL", "status": "TRADING"})) is True
     assert "REJECTED_NOT_USDT_PERPETUAL_TRADING" not in candidate["reject_reasons"]
 
 

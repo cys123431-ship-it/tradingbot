@@ -325,6 +325,58 @@ def test_custom_coin_symbol_resolution_uses_futures_canonical_symbol():
     assert engine._coin_selector_market_for_symbol("BTC/USDC", markets) is None
 
 
+def test_controller_resolves_tradifi_watch_symbol_on_binance_mainnet():
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+    controller.cfg = {"api": {"exchange_mode": emas.BINANCE_MAINNET, "use_testnet": False}}
+    markets = {
+        "AAPL/USDT:USDT": _market(
+            symbol="AAPL/USDT:USDT",
+            info={"contractType": "TRADIFI_PERPETUAL", "status": "TRADING"},
+        ),
+    }
+
+    assert controller._resolve_futures_watch_symbol_from_markets("AAPL", markets) == "AAPL/USDT:USDT"
+
+
+def test_controller_blocks_tradifi_watch_symbol_on_testnet():
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+    controller.cfg = {"api": {"exchange_mode": emas.BINANCE_TESTNET, "use_testnet": True}}
+    markets = {
+        "AAPL/USDT:USDT": _market(
+            symbol="AAPL/USDT:USDT",
+            info={"contractType": "TRADIFI_PERPETUAL", "status": "TRADING"},
+        ),
+    }
+
+    with pytest.raises(ValueError, match="메인넷"):
+        controller._resolve_futures_watch_symbol_from_markets("AAPL", markets)
+
+
+def test_coin_selector_tradifi_universe_only_auto_on_binance_mainnet():
+    emas = _emas_module()
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    engine.is_upbit_mode = lambda: False
+    cfg = {"include_tradifi_universe": True}
+
+    class MainnetCtrl:
+        def get_exchange_mode(self):
+            return emas.BINANCE_MAINNET
+
+    class TestnetCtrl:
+        def get_exchange_mode(self):
+            return emas.BINANCE_TESTNET
+
+    engine.ctrl = MainnetCtrl()
+    assert engine._coin_selector_should_include_tradifi_universe(cfg, custom_enabled=False) is True
+    assert engine._coin_selector_should_include_tradifi_universe(cfg, custom_enabled=True) is False
+
+    engine.ctrl = TestnetCtrl()
+    assert engine._coin_selector_should_include_tradifi_universe(cfg, custom_enabled=False) is False
+
+
 def test_coin_selector_candidate_cooldown_counts_unique_decision_keys():
     signal_engine = _signal_engine_cls()
     engine = signal_engine.__new__(signal_engine)
@@ -460,10 +512,10 @@ def test_legacy_utbot_command_routes_to_integrated_menu_handler():
     assert "/utbot" in emas.TELEGRAM_UTBREAK_INTEGRATED_COMMANDS
 
 
-def test_utbreakout_visible_callback_actions_stay_three_button_only():
+def test_utbreakout_visible_callback_actions_include_watchlist_button():
     emas = _emas_module()
 
-    assert emas.UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS == {"on", "off", "condition_status"}
+    assert emas.UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS == {"on", "off", "condition_status", "watchlist"}
 
 
 def test_setup_keyboard_keeps_exchange_button_choices():
@@ -1434,7 +1486,11 @@ def test_utbreakout_defaults_enable_fixed_tp_ladder_and_disable_runner():
     assert cfg["atr_trailing_activation_r"] == 1.5
     assert cfg["short_conservative_enabled"] is True
     assert cfg["short_risk_multiplier"] == 0.5
-    assert cfg["short_adx_threshold"] == 22.0
+    assert cfg["short_adx_threshold"] == 25.0
+    assert cfg["short_dmi_min_gap"] == 4.0
+    assert cfg["short_require_htf_supertrend"] is True
+    assert cfg["short_require_entry_ema_downtrend"] is True
+    assert cfg["short_require_momentum_downtrend"] is True
     assert cfg["bias_continuation_enabled"] is True
     assert cfg["bias_continuation_risk_multiplier"] == 0.65
     assert cfg["bias_continuation_15m_risk_multiplier"] == 0.5
@@ -1445,6 +1501,8 @@ def test_utbreakout_defaults_enable_fixed_tp_ladder_and_disable_runner():
     assert cfg["quality_score_v2_block_below"] == 60.0
     assert cfg["quality_score_v2_reduce_below"] == 70.0
     assert cfg["quality_score_v2_min_risk_multiplier"] == 0.5
+    assert cfg["quality_score_v2_long_15m_block_below"] == 58.0
+    assert cfg["quality_score_v2_short_15m_block_below"] == 70.0
     assert cfg["dynamic_take_profit_enabled"] is True
     assert cfg["dynamic_tp2_base_r_multiple"] == 2.0
     assert cfg["dynamic_tp2_strong_r_multiple"] == 2.5
@@ -1472,7 +1530,11 @@ def test_utbreakout_short_guard_requires_htf_and_dmi_alignment():
     engine = signal_engine.__new__(signal_engine)
     cfg = {
         "short_conservative_enabled": True,
-        "short_adx_threshold": 22.0,
+        "short_adx_threshold": 25.0,
+        "short_dmi_min_gap": 4.0,
+        "short_require_htf_supertrend": True,
+        "short_require_entry_ema_downtrend": True,
+        "short_require_momentum_downtrend": True,
     }
 
     ok, reason = engine._utbreakout_short_guard_passes(
@@ -1484,6 +1546,12 @@ def test_utbreakout_short_guard_requires_htf_and_dmi_alignment():
             "adx": 25,
             "plus_di": 12,
             "minus_di": 28,
+            "htf_supertrend_direction": "short",
+            "entry_price": 88,
+            "ema50": 90,
+            "ema50_prev": 91,
+            "momentum_6_pct": -1.2,
+            "momentum_12_pct": -2.4,
         },
     )
     assert ok is True
@@ -1498,6 +1566,12 @@ def test_utbreakout_short_guard_requires_htf_and_dmi_alignment():
             "adx": 18,
             "plus_di": 30,
             "minus_di": 20,
+            "htf_supertrend_direction": "long",
+            "entry_price": 108,
+            "ema50": 105,
+            "ema50_prev": 104,
+            "momentum_6_pct": 1.2,
+            "momentum_12_pct": 2.4,
         },
     )
     assert ok is False
@@ -1511,7 +1585,8 @@ def test_utbreakout_short_guard_status_item_matches_real_gate():
     cfg = {
         "short_conservative_enabled": True,
         "short_risk_multiplier": 0.5,
-        "short_adx_threshold": 22.0,
+        "short_adx_threshold": 25.0,
+        "short_dmi_min_gap": 4.0,
     }
 
     label, state, detail = engine._build_utbreakout_short_guard_status_item(
@@ -1649,10 +1724,10 @@ def test_utbreakout_quality_score_v2_blocks_weak_confluence_and_reduces_mixed():
     blocked = engine._build_utbreakout_quality_score_v2(
         "long",
         cfg,
-        {"candidate_type": "fresh_signal", "entry_timeframe": "15m"},
+        {"candidate_type": "fresh_signal", "entry_timeframe": "15m", "adaptive_timeframe_decision": {"selected_score": 50}},
         {},
-        trend_health={"score": 35, "risk_multiplier": 0.35},
-        strategy_quality={"score": 42, "risk_multiplier": 0.35},
+        trend_health={"score": 20, "risk_multiplier": 0.35},
+        strategy_quality={"score": 30, "risk_multiplier": 0.35},
         market_quality={"state": True, "risk_multiplier": 1.0},
         selector_quality={"score": 70},
     )
@@ -1671,6 +1746,33 @@ def test_utbreakout_quality_score_v2_blocks_weak_confluence_and_reduces_mixed():
     )
     assert reduced["state"] == "reduced"
     assert 0 < reduced["risk_multiplier"] < 1
+
+
+def test_utbreakout_quality_score_v2_uses_stricter_short_thresholds():
+    emas = _emas_module()
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    cfg = emas.build_default_utbot_filtered_breakout_config()
+    cfg["entry_timeframe"] = "15m"
+    status = {
+        "candidate_type": "fresh_signal",
+        "entry_timeframe": "15m",
+        "adaptive_timeframe_decision": {"selected_score": 65},
+    }
+
+    common_kwargs = {
+        "trend_health": {"score": 60, "risk_multiplier": 0.7},
+        "strategy_quality": {"score": 60, "risk_multiplier": 0.7},
+        "market_quality": {"state": "reduced", "risk_multiplier": 0.5},
+        "selector_quality": {"score": 70},
+    }
+
+    long_result = engine._build_utbreakout_quality_score_v2("long", cfg, status, {}, **common_kwargs)
+    short_result = engine._build_utbreakout_quality_score_v2("short", cfg, status, {}, **common_kwargs)
+
+    assert long_result["state"] == "reduced"
+    assert short_result["state"] is False
+    assert short_result["block_below"] > long_result["block_below"]
 
 
 def test_utbreakout_dynamic_tp2_expands_only_on_strong_confluence():

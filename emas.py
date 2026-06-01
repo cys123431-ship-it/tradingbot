@@ -55,6 +55,7 @@ from utbreakout.coinselector import (
     build_selection_report as build_coin_selector_report,
     default_coin_selector_config,
     finalize_candidate as finalize_coin_selector_candidate,
+    market_is_tradifi_perpetual as coin_selector_market_is_tradifi_perpetual,
     market_is_usdt_perpetual as coin_selector_market_is_usdt_perpetual,
     normalize_custom_symbols as normalize_coin_selector_custom_symbols,
     sector_tags_for_symbol as coin_selector_sector_tags_for_symbol,
@@ -121,6 +122,7 @@ UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS = frozenset({
     "on",
     "off",
     "condition_status",
+    "watchlist",
 })
 
 # ---------------------------------------------------------
@@ -445,7 +447,11 @@ def build_utbreakout_set_registry():
         'atr_trailing_breakeven_enabled': True,
         'short_conservative_enabled': True,
         'short_risk_multiplier': 0.5,
-        'short_adx_threshold': 22.0,
+        'short_adx_threshold': 25.0,
+        'short_dmi_min_gap': 4.0,
+        'short_require_htf_supertrend': True,
+        'short_require_entry_ema_downtrend': True,
+        'short_require_momentum_downtrend': True,
         'bias_continuation_enabled': True,
         'bias_continuation_risk_multiplier': 0.65,
         'bias_continuation_15m_risk_multiplier': 0.50,
@@ -466,6 +472,14 @@ def build_utbreakout_set_registry():
         'quality_score_v2_min_risk_multiplier': 0.50,
         'quality_score_v2_15m_block_below': 62.0,
         'quality_score_v2_15m_reduce_below': 72.0,
+        'quality_score_v2_long_block_below': 56.0,
+        'quality_score_v2_long_reduce_below': 66.0,
+        'quality_score_v2_long_15m_block_below': 58.0,
+        'quality_score_v2_long_15m_reduce_below': 68.0,
+        'quality_score_v2_short_block_below': 68.0,
+        'quality_score_v2_short_reduce_below': 78.0,
+        'quality_score_v2_short_15m_block_below': 70.0,
+        'quality_score_v2_short_15m_reduce_below': 80.0,
         'feature_score_enabled': True,
         'feature_score_block_below': 55.0,
         'feature_score_reduce_below': 65.0,
@@ -754,7 +768,11 @@ def build_default_utbot_filtered_breakout_config():
         'atr_trailing_breakeven_enabled': True,
         'short_conservative_enabled': True,
         'short_risk_multiplier': 0.5,
-        'short_adx_threshold': 22.0,
+        'short_adx_threshold': 25.0,
+        'short_dmi_min_gap': 4.0,
+        'short_require_htf_supertrend': True,
+        'short_require_entry_ema_downtrend': True,
+        'short_require_momentum_downtrend': True,
         'bias_continuation_enabled': True,
         'bias_continuation_risk_multiplier': 0.65,
         'bias_continuation_15m_risk_multiplier': 0.50,
@@ -775,6 +793,14 @@ def build_default_utbot_filtered_breakout_config():
         'quality_score_v2_min_risk_multiplier': 0.50,
         'quality_score_v2_15m_block_below': 62.0,
         'quality_score_v2_15m_reduce_below': 72.0,
+        'quality_score_v2_long_block_below': 56.0,
+        'quality_score_v2_long_reduce_below': 66.0,
+        'quality_score_v2_long_15m_block_below': 58.0,
+        'quality_score_v2_long_15m_reduce_below': 68.0,
+        'quality_score_v2_short_block_below': 68.0,
+        'quality_score_v2_short_reduce_below': 78.0,
+        'quality_score_v2_short_15m_block_below': 70.0,
+        'quality_score_v2_short_15m_reduce_below': 80.0,
         'dynamic_take_profit_enabled': True,
         'dynamic_tp2_strong_score': 72.0,
         'dynamic_tp2_elite_score': 82.0,
@@ -1470,7 +1496,7 @@ class TradingConfig:
         if coin_selector_cfg.get('custom_symbols') != normalized_custom_symbols:
             coin_selector_cfg['custom_symbols'] = normalized_custom_symbols
             changed = True
-        for bool_key in ('enabled', 'auto_apply_watchlist', 'custom_universe_enabled', 'custom_relax_discovery', 'candidate_cooldown_enabled', 'selection_quality_enabled'):
+        for bool_key in ('enabled', 'auto_apply_watchlist', 'custom_universe_enabled', 'custom_relax_discovery', 'candidate_cooldown_enabled', 'selection_quality_enabled', 'include_tradifi_universe'):
             value = coin_selector_cfg.get(bool_key, coin_selector_defaults.get(bool_key, False))
             if isinstance(value, bool):
                 normalized_bool = value
@@ -4780,6 +4806,8 @@ class SignalEngine(BaseEngine):
             'short_partial_take_profit_ratio_add': 0.10,
             'short_atr_trailing_multiplier_delta': 0.25,
             'short_atr_trailing_activation_r_delta': 0.20,
+            'short_adx_threshold': 25.0,
+            'short_dmi_min_gap': 4.0,
             'bias_continuation_risk_multiplier': 0.65,
             'bias_continuation_15m_risk_multiplier': 0.50,
             'bias_continuation_min_adx': 22.0,
@@ -4796,6 +4824,14 @@ class SignalEngine(BaseEngine):
             'quality_score_v2_min_risk_multiplier': 0.50,
             'quality_score_v2_15m_block_below': 62.0,
             'quality_score_v2_15m_reduce_below': 72.0,
+            'quality_score_v2_long_block_below': 56.0,
+            'quality_score_v2_long_reduce_below': 66.0,
+            'quality_score_v2_long_15m_block_below': 58.0,
+            'quality_score_v2_long_15m_reduce_below': 68.0,
+            'quality_score_v2_short_block_below': 68.0,
+            'quality_score_v2_short_reduce_below': 78.0,
+            'quality_score_v2_short_15m_block_below': 70.0,
+            'quality_score_v2_short_15m_reduce_below': 80.0,
             'dynamic_tp2_strong_score': 72.0,
             'dynamic_tp2_elite_score': 82.0,
             'dynamic_tp2_base_r_multiple': 2.0,
@@ -4907,6 +4943,9 @@ class SignalEngine(BaseEngine):
             'volatility_targeting_enabled',
             'meta_labeling_enabled',
             'short_asymmetry_enabled',
+            'short_require_htf_supertrend',
+            'short_require_entry_ema_downtrend',
+            'short_require_momentum_downtrend',
             'regime_filter_enabled',
             'meta_sizing_enabled',
             'portfolio_risk_enabled',
@@ -6759,15 +6798,39 @@ class SignalEngine(BaseEngine):
             adx = float(values.get('adx'))
             plus_di = float(values.get('plus_di'))
             minus_di = float(values.get('minus_di'))
-            threshold = float(cfg.get('short_adx_threshold', cfg.get('adx_threshold', 22.0)) or 22.0)
+            threshold = float(cfg.get('short_adx_threshold', cfg.get('adx_threshold', 25.0)) or 25.0)
+            dmi_gap_min = float(cfg.get('short_dmi_min_gap', 4.0) or 4.0)
         except (TypeError, ValueError):
             return False, "short guard data pending"
+        htf_supertrend = str(values.get('htf_supertrend_direction') or '').lower()
+        entry_price = values.get('entry_price')
+        ema50 = values.get('ema50')
+        ema50_prev = values.get('ema50_prev')
+        momentum_6 = values.get('momentum_6_pct')
+        momentum_12 = values.get('momentum_12_pct')
         checks = [
             (htf_fast < htf_slow, f"HTF EMA{int(cfg.get('ema_fast', 50) or 50)} < EMA{int(cfg.get('ema_slow', 200) or 200)}"),
             (htf_close < htf_slow, "HTF close < EMA slow"),
             (adx >= threshold, f"ADX >= {threshold:.1f}"),
             (minus_di > plus_di, "-DI > +DI"),
+            ((minus_di - plus_di) >= dmi_gap_min, f"-DI gap >= {dmi_gap_min:.1f}"),
         ]
+        if bool(cfg.get('short_require_htf_supertrend', True)):
+            checks.append((htf_supertrend == 'short', "HTF Supertrend SHORT"))
+        if bool(cfg.get('short_require_entry_ema_downtrend', True)):
+            ema_downtrend = False
+            if (
+                self._is_valid_number(entry_price)
+                and self._is_valid_number(ema50)
+                and self._is_valid_number(ema50_prev)
+            ):
+                ema_downtrend = float(entry_price) < float(ema50) and float(ema50) < float(ema50_prev)
+            checks.append((ema_downtrend, "entry close < EMA50 and EMA50 falling"))
+        if bool(cfg.get('short_require_momentum_downtrend', True)):
+            momentum_downtrend = False
+            if self._is_valid_number(momentum_6) and self._is_valid_number(momentum_12):
+                momentum_downtrend = float(momentum_6) < 0 and float(momentum_12) < 0
+            checks.append((momentum_downtrend, "6/12 momentum negative"))
         failed = [label for ok, label in checks if not ok]
         if failed:
             return False, "; ".join(failed)
@@ -7343,16 +7406,14 @@ class SignalEngine(BaseEngine):
         entry_tf = str(cfg.get('entry_timeframe', status.get('entry_timeframe', '15m')) or '15m').lower()
         tf_ms = self._timeframe_to_ms(entry_tf) or (15 * 60 * 1000)
         is_fast_tf = tf_ms <= 15 * 60 * 1000
-        block_below = (
-            float(cfg.get('quality_score_v2_15m_block_below', 62.0) or 62.0)
-            if is_fast_tf else
-            float(cfg.get('quality_score_v2_block_below', 60.0) or 60.0)
-        )
-        reduce_below = (
-            float(cfg.get('quality_score_v2_15m_reduce_below', 72.0) or 72.0)
-            if is_fast_tf else
-            float(cfg.get('quality_score_v2_reduce_below', 70.0) or 70.0)
-        )
+        base_block_key = 'quality_score_v2_15m_block_below' if is_fast_tf else 'quality_score_v2_block_below'
+        base_reduce_key = 'quality_score_v2_15m_reduce_below' if is_fast_tf else 'quality_score_v2_reduce_below'
+        side_block_key = f"quality_score_v2_{side}_{'15m_' if is_fast_tf else ''}block_below"
+        side_reduce_key = f"quality_score_v2_{side}_{'15m_' if is_fast_tf else ''}reduce_below"
+        base_block_default = 62.0 if is_fast_tf else 60.0
+        base_reduce_default = 72.0 if is_fast_tf else 70.0
+        block_below = float(cfg.get(side_block_key, cfg.get(base_block_key, base_block_default)) or base_block_default)
+        reduce_below = float(cfg.get(side_reduce_key, cfg.get(base_reduce_key, base_reduce_default)) or base_reduce_default)
         full_score = max(reduce_below, float(cfg.get('quality_score_v2_full_score', 82.0) or 82.0))
         min_multiplier = max(0.05, min(1.0, float(cfg.get('quality_score_v2_min_risk_multiplier', 0.50) or 0.50)))
 
@@ -12990,7 +13051,7 @@ class SignalEngine(BaseEngine):
             if text in {'0', 'false', 'no', 'off', 'disable', 'disabled'}:
                 return False
             return default
-        for key in ('enabled', 'auto_apply_watchlist', 'custom_universe_enabled', 'custom_relax_discovery', 'candidate_cooldown_enabled', 'selection_quality_enabled'):
+        for key in ('enabled', 'auto_apply_watchlist', 'custom_universe_enabled', 'custom_relax_discovery', 'candidate_cooldown_enabled', 'selection_quality_enabled', 'include_tradifi_universe'):
             cfg[key] = _bool_value(cfg.get(key), bool(default_coin_selector_config().get(key, False)))
         for key in ('excluded_sectors', 'blacklist'):
             value = cfg.get(key, [])
@@ -13027,6 +13088,7 @@ class SignalEngine(BaseEngine):
             'top_n': 10,
             'candidate_cooldown_misses': 3,
             'selection_return_lookback_bars': 96,
+            'tradifi_universe_max_candidates': 20,
         }.items():
             try:
                 cfg[key] = max(1, int(float(cfg.get(key, default))))
@@ -13900,6 +13962,19 @@ class SignalEngine(BaseEngine):
                 return market
         return None
 
+    def _coin_selector_should_include_tradifi_universe(self, cfg, custom_enabled):
+        if custom_enabled or self.is_upbit_mode():
+            return False
+        if not bool(cfg.get('include_tradifi_universe', True)):
+            return False
+        ctrl = getattr(self, 'ctrl', None)
+        if ctrl is None or not hasattr(ctrl, 'get_exchange_mode'):
+            return False
+        return ctrl.get_exchange_mode() == BINANCE_MAINNET
+
+    def _coin_selector_is_tradifi_market(self, symbol, market):
+        return coin_selector_market_is_tradifi_perpetual(symbol, market)
+
     def _coin_selector_exchange_symbol_for_custom(self, symbol, markets):
         normalized = normalize_coin_selector_custom_symbols([symbol])
         normalized = normalized[0] if normalized else str(symbol or '').strip().upper()
@@ -14125,6 +14200,7 @@ class SignalEngine(BaseEngine):
 
         accepted_base = []
         rejected = []
+        include_tradifi_universe = self._coin_selector_should_include_tradifi_universe(cfg, custom_enabled)
         for symbol, ticker in ticker_items:
             market = self._coin_selector_market_for_symbol(symbol, markets)
             tags = coin_selector_sector_tags_for_symbol(symbol, cfg.get('sector_overrides'))
@@ -14134,6 +14210,8 @@ class SignalEngine(BaseEngine):
                 candidate_cfg['min_quote_volume_usdt'] = 0.0
                 candidate_cfg['min_trade_count'] = 0
             candidate = build_coin_selector_base_candidate(symbol, ticker, market, candidate_cfg, tags)
+            if self._coin_selector_is_tradifi_market(symbol, market):
+                candidate['tradifi_perpetual'] = True
             if custom_enabled:
                 candidate['custom_universe'] = True
                 candidate['custom_discovery_relaxed'] = bool(cfg.get('custom_relax_discovery', True))
@@ -14161,9 +14239,32 @@ class SignalEngine(BaseEngine):
         }
         strategy_params = self.get_runtime_strategy_params()
         analysis_limit = len(accepted_base) if custom_enabled else int(cfg.get('analysis_limit', 20) or 20)
+        analysis_candidates = list(accepted_base[:analysis_limit])
+        tradifi_candidates_considered = 0
+        if include_tradifi_universe:
+            tradifi_limit = max(1, int(cfg.get('tradifi_universe_max_candidates', 20) or 20))
+            seen_symbols = {
+                str(item.get('normalized_symbol') or item.get('exchange_symbol') or item.get('symbol') or '').upper()
+                for item in analysis_candidates
+            }
+            tradifi_candidates = [
+                item for item in accepted_base
+                if item.get('tradifi_perpetual')
+            ]
+            tradifi_candidates.sort(
+                key=lambda item: float(item.get('quote_volume', 0.0) or 0.0),
+                reverse=True
+            )
+            for item in tradifi_candidates[:tradifi_limit]:
+                key = str(item.get('normalized_symbol') or item.get('exchange_symbol') or item.get('symbol') or '').upper()
+                if key in seen_symbols:
+                    continue
+                analysis_candidates.append(item)
+                seen_symbols.add(key)
+            tradifi_candidates_considered = len(tradifi_candidates[:tradifi_limit])
         scored = []
         analysis_errors = []
-        for candidate in accepted_base[:analysis_limit]:
+        for candidate in analysis_candidates:
             scored_candidate = await self._score_coin_selector_candidate(
                 candidate,
                 cfg,
@@ -14182,11 +14283,13 @@ class SignalEngine(BaseEngine):
             'generated_at_ts': now,
             'generated_at': datetime.now(timezone.utc).isoformat(),
             'criteria': dict(cfg, custom_universe_enabled=custom_enabled, custom_symbols=custom_symbols),
-            'analysis_limit': analysis_limit,
+            'analysis_limit': len(analysis_candidates),
             'total_base_candidates': len(accepted_base),
-            'total_unanalyzed': max(0, len(accepted_base) - analysis_limit),
+            'total_unanalyzed': max(0, len(accepted_base) - len(analysis_candidates)),
             'custom_universe_enabled': custom_enabled,
             'custom_symbols': custom_symbols if custom_enabled else [],
+            'tradifi_universe_included': include_tradifi_universe,
+            'tradifi_candidates_considered': tradifi_candidates_considered,
             'reject_samples': reject_samples,
         })
         selected = report.get('selected', [])
@@ -21183,6 +21286,70 @@ class MainController:
             return text
         return f"{text}/USDT"
 
+    def _futures_market_for_symbol(self, symbol, markets):
+        if not isinstance(markets, dict):
+            return None
+        normalized_items = normalize_coin_selector_custom_symbols([symbol])
+        normalized = normalized_items[0] if normalized_items else str(symbol or '').replace(':USDT', '').strip().upper()
+        base = normalized.split('/', 1)[0] if '/' in normalized else normalized.replace('USDT', '')
+        quote = normalized.split('/', 1)[1] if '/' in normalized else 'USDT'
+        keys = []
+
+        def _add_key(key):
+            key = str(key or '').strip()
+            if key and key not in keys:
+                keys.append(key)
+
+        if quote == 'USDT':
+            _add_key(f"{base}/USDT:USDT")
+            _add_key(f"{normalized}:USDT")
+        _add_key(symbol)
+        _add_key(normalized)
+        if quote == 'USDT':
+            _add_key(f"{base}/USDT")
+
+        for key in keys:
+            market = markets.get(key)
+            if not isinstance(market, dict):
+                continue
+            market_symbol = market.get('symbol') or key
+            if coin_selector_market_is_usdt_perpetual(market_symbol, market):
+                return market
+        return None
+
+    def _resolve_futures_watch_symbol_from_markets(self, raw_symbol, markets, *, exchange_mode=None):
+        mode = exchange_mode or self.get_exchange_mode()
+        normalized_items = normalize_coin_selector_custom_symbols([raw_symbol])
+        if not normalized_items:
+            raise ValueError("빈 심볼은 사용할 수 없습니다.")
+        normalized = normalized_items[0]
+        market = self._futures_market_for_symbol(normalized, markets)
+        if not isinstance(market, dict):
+            raise ValueError(f"유효하지 않은 Binance Futures USDT perpetual 심볼입니다: {normalized}")
+        market_symbol = market.get('symbol') or normalized
+        is_tradifi = coin_selector_market_is_tradifi_perpetual(market_symbol, market)
+        if is_tradifi and mode != BINANCE_MAINNET:
+            raise ValueError(f"TradFi perpetual은 Binance Futures 메인넷에서만 직접 감시합니다: {normalized}")
+        return market_symbol if is_tradifi else normalized
+
+    def _get_tradifi_symbols_from_markets(self, markets):
+        if not isinstance(markets, dict):
+            return []
+        result = []
+        seen = set()
+        for key, market in markets.items():
+            if not isinstance(market, dict):
+                continue
+            symbol = market.get('symbol') or key
+            if not coin_selector_market_is_tradifi_perpetual(symbol, market):
+                continue
+            normalized = normalize_coin_selector_custom_symbols([symbol])
+            normalized = normalized[0] if normalized else str(symbol or '').replace(':USDT', '')
+            if normalized not in seen:
+                result.append(symbol)
+                seen.add(normalized)
+        return sorted(result)
+
     def format_symbol_for_display(self, symbol, exchange_mode=None):
         mode = exchange_mode or self.get_exchange_mode()
         raw = str(symbol or '')
@@ -24619,6 +24786,8 @@ class MainController:
             custom_on = bool(coin_cfg.get('custom_universe_enabled', False))
             if scanner_on and selector_on and not custom_on:
                 coin_mode = '코인 자동 선택'
+                if self.get_exchange_mode() == BINANCE_MAINNET and bool(coin_cfg.get('include_tradifi_universe', True)):
+                    coin_mode += ' + TradFi'
             elif scanner_on and selector_on and custom_on:
                 coin_mode = 'AUTO 후보'
             elif scanner_on:
@@ -25091,6 +25260,8 @@ UTBot:
                 coin_mode = f"후보 `{', '.join(custom_symbols[:6])}`"
             elif coin_auto_on:
                 coin_mode = f"AUTO Binance Futures Top {int(float(coin_cfg.get('top_n', 10) or 10))}"
+                if self.get_exchange_mode() == BINANCE_MAINNET and bool(coin_cfg.get('include_tradifi_universe', True)):
+                    coin_mode += f" + TradFi {int(float(coin_cfg.get('tradifi_universe_max_candidates', 20) or 20))}"
             else:
                 coin_mode = f"Watchlist `{', '.join(watchlist[:6]) if watchlist else '없음'}`"
             partial_enabled = bool(cfg.get('partial_take_profit_enabled', True))
@@ -25130,7 +25301,8 @@ UTBot:
             )
             short_text = (
                 f"ON / 리스크 x{float(cfg.get('short_risk_multiplier', 0.5) or 0.5):.2f}, "
-                f"ADX≥{float(cfg.get('short_adx_threshold', 22.0) or 22.0):.1f}"
+                f"ADX≥{float(cfg.get('short_adx_threshold', 25.0) or 25.0):.1f}, "
+                "HTF ST/EMA/모멘텀 확인"
                 if cfg.get('short_conservative_enabled', True) else
                 "OFF"
             )
@@ -25174,7 +25346,7 @@ AUTO 최근 선택 이유:
 ```
 
 명령:
-`/utbreak on`, `/utbreak coin EWY`, `/utbreak autoscan on BTC ETH`, `/utbreak autoscan off`
+`/utbreak on`, `/utbreak watch BTC ETH AAPL`, `/utbreak coin EWY`, `/utbreak autoscan on BTC ETH`
 `/utbreak auto on` / `auto off` - 코인선택 포함 AUTO 묶음 ON/OFF
 `/utbreak set 57`, `/utbreak risk 5`, `/utbreak dailytrades 3`
 `/utbreak sets`, `/utbreak why`, `/utbreak status`, `/utbreak analyze [EWY]`, `/utbreak research`, `/utbreak log`
@@ -25186,6 +25358,9 @@ AUTO 최근 선택 이유:
                     InlineKeyboardButton("UTBreak ON", callback_data="utb:on"),
                     InlineKeyboardButton("UTBreak OFF", callback_data="utb:off"),
                     InlineKeyboardButton("조건 스테이터스", callback_data="utb:condition_status")
+                ],
+                [
+                    InlineKeyboardButton("코인 감시 목록", callback_data="utb:watchlist")
                 ]
             ])
 
@@ -25472,6 +25647,67 @@ AUTO 최근 선택 이유:
                     profile_cfg[key] = current_cfg[key]
             return profile_cfg
 
+        async def _resolve_utbreak_direct_watchlist(symbols, *, max_symbols=5):
+            normalized = normalize_coin_selector_custom_symbols(symbols)
+            if not normalized:
+                raise ValueError("감시할 코인을 1개 이상 입력하세요. 예: `/utbreak watch BTC ETH AAPL`")
+            if len(normalized) > max_symbols:
+                raise ValueError(f"감시 목록은 최대 {max_symbols}개까지만 가능합니다.")
+            markets = await asyncio.to_thread(self.market_data_exchange.load_markets)
+            resolved = []
+            seen = set()
+            for raw_symbol in normalized:
+                symbol = self._resolve_futures_watch_symbol_from_markets(raw_symbol, markets)
+                key = self._futures_symbol_key(symbol)
+                if key and key not in seen:
+                    resolved.append(symbol)
+                    seen.add(key)
+            if not resolved:
+                raise ValueError("감시할 코인을 인식하지 못했습니다.")
+            return resolved
+
+        async def _enable_utbreak_direct_watchlist(symbols):
+            watch_symbols = await _resolve_utbreak_direct_watchlist(symbols)
+            await _ensure_signal_engine_active()
+            await self.cfg.update_value(['signal_engine', 'watchlist'], watch_symbols)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol'], '')
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_symbols'], watch_symbols)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
+
+            strategy_params = self.cfg.get('signal_engine', {}).get('strategy_params', {}) or {}
+            active_strategy = str(strategy_params.get('active_strategy', '') or '').lower()
+            if active_strategy not in UTBREAKOUT_STRATEGIES:
+                await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_FILTERED_BREAKOUT_STRATEGY)
+
+            engine = self._reset_signal_engine_runtime_state(
+                reset_entry_cache=True,
+                reset_exit_cache=True,
+                reset_stateful_strategy=True
+            )
+            if engine:
+                engine.scanner_active_symbol = None
+                engine.active_symbols.clear()
+                for symbol in watch_symbols:
+                    engine.active_symbols.add(symbol)
+                    await engine.prime_symbol_to_next_closed_candle(symbol)
+            return (
+                f"✅ UTBreak 직접 감시 목록: `{', '.join(watch_symbols)}`\n"
+                "scanner/CoinSelector를 끄고 지정한 1~5개 심볼만 감시합니다."
+            )
+
+        async def _prompt_utbreak_watchlist_input(message_or_query, context):
+            if context and context.user_data is not None:
+                context.user_data['utbreak_watchlist_waiting_for_symbols'] = True
+            text = "UTBreak에서 직접 감시할 코인 1~5개를 입력하세요. 예: `BTC ETH AAPL EWY`"
+            if hasattr(message_or_query, 'edit_message_text'):
+                await message_or_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+            else:
+                await message_or_query.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
         async def utbreakout_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             args = list(getattr(c, 'args', []) or [])
             if not args and u and u.message and u.message.text:
@@ -25524,6 +25760,20 @@ AUTO 최근 선택 이유:
                         c.user_data['utbreak_coin_waiting_for_symbol'] = True
                     await u.message.reply_text("UTBreak에서 직접 감시할 코인 1개를 입력하세요. 예: `EWY`", parse_mode=ParseMode.MARKDOWN)
                     return
+            elif action in {'watch', 'watchlist', 'coins'}:
+                if len(args) <= 1:
+                    await _prompt_utbreak_watchlist_input(u.message, c)
+                    return
+                try:
+                    notice = await _enable_utbreak_direct_watchlist(args[1:])
+                except ValueError as e:
+                    await u.message.reply_text(f"❌ {e}", parse_mode=ParseMode.MARKDOWN)
+                    return
+                await u.message.reply_text(
+                    f"{notice}\n\n{_format_utbreakout_menu_text()}",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=_build_utbreakout_keyboard()
+                )
             elif action in {'autoscan', 'auto_scan', 'candidates', 'candidate', 'scanmode'}:
                 mode = str(args[1]).strip().lower() if len(args) > 1 else ''
                 if mode in {'off', 'disable', 'stop', '0'}:
@@ -25838,7 +26088,7 @@ AUTO 최근 선택 이유:
             if action not in UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS:
                 await _edit_utbreakout_menu(
                     query,
-                    "ℹ️ 이전 버전 UTBreak 버튼입니다. 현재 버튼은 UTBreak ON/OFF/조건 스테이터스 3개만 사용합니다."
+                    "ℹ️ 이전 버전 UTBreak 버튼입니다. 현재 버튼은 UTBreak ON/OFF/조건 스테이터스/코인 감시 목록만 사용합니다."
                 )
                 return
 
@@ -25856,6 +26106,10 @@ AUTO 최근 선택 이유:
 
             if action == 'resume':
                 await _edit_utbreakout_menu(query, await _set_strategy_pause(False))
+                return
+
+            if action == 'watchlist':
+                await _prompt_utbreak_watchlist_input(query, c)
                 return
 
             if action == 'fixed':
@@ -26713,11 +26967,10 @@ AUTO 최근 선택 이유:
             normalized = normalize_coin_selector_custom_symbols(symbols)
             if len(normalized) != 1:
                 return False, "❌ 단일코인 고정은 코인 1개만 입력하세요. 예: `/utbreak coin EWY`"
-            symbol = normalized[0]
             try:
-                await asyncio.to_thread(self.exchange.fetch_ticker, symbol)
-            except Exception:
-                return False, f"❌ 유효하지 않은 심볼입니다: `{symbol}`"
+                symbol = (await _resolve_utbreak_direct_watchlist(normalized, max_symbols=1))[0]
+            except Exception as exc:
+                return False, f"❌ {exc}"
 
             current = _customcoins_cfg()
             if not current.get('fixed_symbol_mode_enabled'):
@@ -28169,6 +28422,19 @@ AUTO 최근 선택 이유:
                 if not ok:
                     c.user_data['utbreak_coin_waiting_for_symbol'] = True
                     await u.message.reply_text(f"{notice}\n다시 입력하세요. 예: `EWY`", parse_mode=ParseMode.MARKDOWN)
+                    return
+                await self._reply_markdown_safe(
+                    u.message,
+                    f"{notice}\n\n{_format_utbreakout_menu_text()}",
+                    reply_markup=_build_utbreakout_keyboard()
+                )
+                return
+            if c and c.user_data is not None and c.user_data.pop('utbreak_watchlist_waiting_for_symbols', False):
+                try:
+                    notice = await _enable_utbreak_direct_watchlist(raw_text.split())
+                except ValueError as e:
+                    c.user_data['utbreak_watchlist_waiting_for_symbols'] = True
+                    await u.message.reply_text(f"❌ {e}\n다시 입력하세요. 예: `BTC ETH AAPL EWY`", parse_mode=ParseMode.MARKDOWN)
                     return
                 await self._reply_markdown_safe(
                     u.message,

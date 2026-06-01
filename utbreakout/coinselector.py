@@ -38,6 +38,8 @@ DEFAULT_COIN_SELECTOR_CONFIG = {
     "candidate_cooldown_misses": 3,
     "candidate_cooldown_seconds": 1800,
     "selection_quality_enabled": True,
+    "include_tradifi_universe": True,
+    "tradifi_universe_max_candidates": 20,
     "selection_return_lookback_bars": 96,
     "selection_target_realized_vol_pct": 0.65,
     "selection_max_drawdown_pct": 18.0,
@@ -212,6 +214,15 @@ def market_is_usdt_perpetual(symbol, market):
     )
 
 
+def market_is_tradifi_perpetual(symbol, market):
+    if not market_is_usdt_perpetual(symbol, market):
+        return False
+    if not isinstance(market, dict):
+        return False
+    contract_type = str(_info_value(market, "contractType", "")).upper()
+    return contract_type == "TRADIFI_PERPETUAL"
+
+
 def extract_ticker_metrics(symbol, ticker):
     ticker = ticker or {}
     quote_volume = finite_float(
@@ -273,6 +284,7 @@ def build_base_candidate(symbol, ticker, market=None, cfg=None, sector_tags=None
 
     metrics.update({
         "exchange_symbol": symbol,
+        "tradifi_perpetual": market_is_tradifi_perpetual(symbol, market),
         "sector_tags": sector_tags,
         "accepted": not reject_reasons,
         "reject_reasons": reject_reasons,
