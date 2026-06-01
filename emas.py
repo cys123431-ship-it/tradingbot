@@ -124,6 +124,43 @@ UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS = frozenset({
     "condition_status",
     "watchlist",
 })
+UTBREAKOUT_CALLBACK_ACTIONS = UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS | frozenset({
+    "pause",
+    "resume",
+    "fixed",
+    "fixed_off",
+    "auto_scan",
+    "auto_scan_off",
+    "coin_auto",
+    "lev",
+    "tf",
+    "exit_tf",
+    "target",
+    "stop",
+    "micro",
+    "auto",
+    "auto_bundle",
+    "adaptive",
+    "set",
+    "sets",
+    "why",
+    "dailytrades",
+    "risk",
+    "riskpct",
+    "dailyloss",
+    "opphold",
+    "opppnl",
+    "toggle_opposite",
+    "toggle_opposite_set",
+    "toggle_ema",
+    "toggle_extreme",
+    "download",
+    "research_download",
+    "research",
+    "entry_analyze",
+    "status",
+    "menu",
+})
 
 # ---------------------------------------------------------
 # 0. 濡쒓퉭 諛??좏떥由ы떚
@@ -6900,7 +6937,10 @@ class SignalEngine(BaseEngine):
             high_atr = float(cfg.get('market_quality_high_atr_pct', 1.5) or 1.5)
             extreme_atr = float(cfg.get('market_quality_extreme_atr_pct', 2.5) or 2.5)
             if atr_pct >= extreme_atr:
-                _block(f"ATR% {atr_pct:.3f} >= extreme {extreme_atr:.2f}")
+                if side == 'long':
+                    _reduce(0.50, f"ATR% {atr_pct:.3f} extreme")
+                else:
+                    _block(f"ATR% {atr_pct:.3f} >= extreme {extreme_atr:.2f}")
             elif atr_pct >= high_atr:
                 _reduce(0.50, f"ATR% {atr_pct:.3f} high")
             else:
@@ -6913,7 +6953,10 @@ class SignalEngine(BaseEngine):
             soft = float(cfg.get('market_quality_adverse_funding_soft', 0.0006) or 0.0006)
             hard = float(cfg.get('market_quality_adverse_funding_hard', 0.0015) or 0.0015)
             if adverse_funding >= hard:
-                _block(f"funding adverse {funding:.6f}")
+                if side == 'long':
+                    _reduce(0.50, f"funding adverse {funding:.6f}")
+                else:
+                    _block(f"funding adverse {funding:.6f}")
             elif adverse_funding >= soft * 1.5:
                 _reduce(0.50, f"funding adverse {funding:.6f}")
             elif adverse_funding >= soft:
@@ -6996,7 +7039,10 @@ class SignalEngine(BaseEngine):
                 )
                 is_btc = symbol_label.upper().startswith('BTC')
                 if opposite and is_btc and strong_opposite:
-                    _block(f"BTC strong opposite regime {direction.upper()} {ret_value:.2f}%")
+                    if side == 'long':
+                        _reduce(0.50, f"BTC strong opposite regime {direction.upper()} {ret_value:.2f}%")
+                    else:
+                        _block(f"BTC strong opposite regime {direction.upper()} {ret_value:.2f}%")
                 elif opposite and is_btc:
                     _reduce(0.50, f"BTC opposite regime {direction.upper()}")
                 elif opposite:
@@ -7010,7 +7056,11 @@ class SignalEngine(BaseEngine):
         elif data_seen <= 0:
             positives.append('market data neutral')
         if not hard_block and risk_multiplier < min_multiplier:
-            _block(f"risk multiplier {risk_multiplier:.2f} < min {min_multiplier:.2f}")
+            if side == 'long':
+                reasons.append(f"risk floor {min_multiplier:.2f} after reductions")
+                risk_multiplier = min_multiplier
+            else:
+                _block(f"risk multiplier {risk_multiplier:.2f} < min {min_multiplier:.2f}")
 
         risk_multiplier = max(0.0, min(1.0, float(risk_multiplier)))
         if hard_block:
@@ -9547,7 +9597,23 @@ class SignalEngine(BaseEngine):
             feature_score = self._calculate_utbreakout_feature_score(side, cfg, filter_values)
             filter_values['feature_score'] = feature_score
             selected_items = self._evaluate_utbreakout_set_filter_items(side, selected_set, cfg, filter_values)
-            items = [
+            failed_set_items = [item for item in selected_items if item.get('state') is not True]
+            if failed_set_items:
+                set_state = False
+                set_detail = "; ".join(
+                    f"{item.get('name')}: {item.get('detail')}"
+                    for item in failed_set_items[:3]
+                )
+            elif selected_items:
+                set_state = True
+                set_detail = f"{len(selected_items)}개 통과: " + ", ".join(
+                    str(item.get('name') or '필터') for item in selected_items[:3]
+                )
+            else:
+                set_state = True
+                set_detail = "선택 Set 추가 필터 없음"
+
+            core_items = [
                 ("UTBot 방향", ut_state, ut_detail_text),
             ]
             if candidate_side == side and candidate_type == 'bias_state':
@@ -9559,7 +9625,7 @@ class SignalEngine(BaseEngine):
                     'auto_selected_set_id': selected_set.get('id') if isinstance(selected_set, dict) else None,
                     'entry_timeframe': entry_tf,
                 }
-                items.append(
+                core_items.append(
                     self._build_utbreakout_bias_continuation_status_item(
                         side,
                         cfg,
@@ -9568,21 +9634,39 @@ class SignalEngine(BaseEngine):
                         selected_set,
                     )
                 )
-            items.extend((item.get('name'), item.get('state'), item.get('detail')) for item in selected_items)
+            core_items.append(("선택 Set 필터", set_state, set_detail))
             if side == 'short':
-                items.append(self._build_utbreakout_short_guard_status_item(cfg, filter_values))
+                core_items.append(self._build_utbreakout_short_guard_status_item(cfg, filter_values))
             market_quality = self._evaluate_utbreakout_market_quality(side, cfg, filter_values)
-            items.append(("시장 품질 게이트", market_quality.get('state'), market_quality.get('summary')))
+            core_items.append(("시장 품질", market_quality.get('state'), market_quality.get('summary')))
             selector_quality = self._build_utbreakout_selector_quality(symbol)
             selector_multiplier = float(selector_quality.get('risk_multiplier', 1.0) or 1.0)
             selector_state = True if selector_multiplier >= 0.999 else 'reduced'
-            items.append(("코인 선택 품질", selector_state, selector_quality.get('summary')))
-            items.append(("Feature Score", True, f"{feature_score.get('score', 0):.1f} / {feature_score.get('reason')}"))
             adaptation = self._build_utbreakout_strategy_adaptation(symbol, side, cfg, selected_set, filter_values)
             adaptation_health = adaptation.get('trend_health') if isinstance(adaptation.get('trend_health'), dict) else {}
             adaptation_quality = adaptation.get('strategy_quality') if isinstance(adaptation.get('strategy_quality'), dict) else {}
-            items.append(("전략 품질 V2", adaptation_quality.get('state', True), adaptation_quality.get('summary')))
-            items.append(("전략 적응", adaptation_health.get('state', True), adaptation.get('summary')))
+            try:
+                adaptation_multiplier = min(1.0, max(0.0, float(adaptation.get('risk_multiplier', 1.0) or 1.0)))
+            except (TypeError, ValueError):
+                adaptation_multiplier = 1.0
+            if adaptation_health.get('state') is False or adaptation_quality.get('state') is False:
+                adaptation_state = False
+            elif (
+                adaptation_health.get('state') == 'reduced'
+                or adaptation_quality.get('state') == 'reduced'
+                or adaptation_multiplier < 0.999
+            ):
+                adaptation_state = 'reduced'
+            else:
+                adaptation_state = True
+            core_items.append((
+                "추세/전략 품질",
+                adaptation_state,
+                (
+                    f"trend {adaptation_health.get('summary') or 'neutral'}; "
+                    f"strategy {adaptation_quality.get('summary') or 'neutral'}"
+                ),
+            ))
             q_status = {
                 'candidate_type': candidate_type if candidate_side == side else 'waiting',
                 'adaptive_timeframe_decision': adaptive_decision,
@@ -9598,14 +9682,31 @@ class SignalEngine(BaseEngine):
                 market_quality=market_quality,
                 selector_quality=selector_quality,
             )
-            items.append(("통합 품질 점수", quality_score_v2.get('state'), quality_score_v2.get('summary')))
-            items.extend([
+            core_items.append(("통합 품질 점수", quality_score_v2.get('state'), quality_score_v2.get('summary')))
+            core_items.extend([
                 ("일일 리스크", daily_ok, daily_detail),
                 ("ATR 손절/RR/수량", risk_ok, balance_detail),
             ])
-            ok = all(item[1] is True or item[1] == 'reduced' for item in items)
-            lines = [f"{side_upper}: {'진입 가능' if ok else '대기'}"]
-            lines.extend(_line(idx, label, state, detail) for idx, (label, state, detail) in enumerate(items, 1))
+            advisory_items = [
+                ("코인 선택 품질", selector_state, selector_quality.get('summary')),
+                ("Feature Score", True, f"{feature_score.get('score', 0):.1f} / {feature_score.get('reason')}"),
+                (
+                    "전략 적응 요약",
+                    'reduced' if adaptation_multiplier < 0.999 else True,
+                    adaptation.get('summary'),
+                ),
+            ]
+            ok = all(item[1] is True or item[1] == 'reduced' for item in core_items)
+            lines = [
+                f"{side_upper}: {'진입 가능' if ok else '대기'}",
+                "필수 게이트",
+            ]
+            lines.extend(_line(idx, label, state, detail) for idx, (label, state, detail) in enumerate(core_items, 1))
+            lines.append("참고/감액")
+            lines.extend(
+                f"{_icon(state)} {_state_label(state)} - {label}: {detail}"
+                for label, state, detail in advisory_items
+            )
             return ok, lines
 
         long_ok, long_lines = _side_conditions('long')
@@ -9685,7 +9786,7 @@ class SignalEngine(BaseEngine):
             squeeze_line,
             feature_line,
             self.get_coin_selector_symbol_summary(symbol),
-            "주의: 실제 진입은 아래 선택 Set 조건, 리스크, 숏 가드, 시장 품질 게이트까지 모두 봅니다.",
+            "주의: 빨간 필수 게이트만 진입 차단입니다. 노란 항목은 진입 차단이 아니라 수량/리스크 축소입니다.",
             f"최종: LONG {'가능' if long_ok else '대기'} / SHORT {'가능' if short_ok else '대기'}",
             "",
             *long_lines,
@@ -25377,6 +25478,48 @@ AUTO 최근 선택 이유:
                 preview_suffix='상세 UTBreak 메뉴는 파일로 보냈습니다.',
             )
 
+        async def _reply_utbreakout_interaction(message_or_query, text, *, parse_mode=ParseMode.MARKDOWN):
+            target = getattr(message_or_query, 'message', None)
+            if target is not None and hasattr(target, 'reply_text'):
+                await target.reply_text(
+                    text,
+                    parse_mode=parse_mode,
+                    reply_markup=_build_utbreakout_keyboard()
+                )
+                return
+            if hasattr(message_or_query, 'reply_text'):
+                await message_or_query.reply_text(
+                    text,
+                    parse_mode=parse_mode,
+                    reply_markup=_build_utbreakout_keyboard()
+                )
+                return
+            if hasattr(message_or_query, 'edit_message_text'):
+                try:
+                    await message_or_query.edit_message_text(
+                        text,
+                        parse_mode=parse_mode,
+                        reply_markup=_build_utbreakout_keyboard()
+                    )
+                except BadRequest as md_err:
+                    if not self._is_telegram_message_not_modified_error(md_err):
+                        raise
+
+        async def _show_utbreakout_callback_progress(query, text="⏳ 처리 중입니다. 잠시만 기다려 주세요."):
+            try:
+                await query.edit_message_text(
+                    text,
+                    reply_markup=_build_utbreakout_keyboard()
+                )
+            except BadRequest as md_err:
+                if self._is_telegram_message_not_modified_error(md_err):
+                    return
+                message = getattr(query, 'message', None)
+                if message is not None:
+                    await message.reply_text(text, reply_markup=_build_utbreakout_keyboard())
+            except Exception as exc:
+                logger.debug(f"UTBreak callback progress message failed: {exc}")
+
         async def _edit_integrated_utbreak_notice(query, source_label):
             await _edit_utbreakout_menu(
                 query,
@@ -25483,6 +25626,13 @@ AUTO 최근 선택 이유:
                 preview_suffix='상세 조건 스테이터스는 파일로 보냈습니다.',
             )
 
+        async def _send_utbreakout_condition_status_from_callback(query):
+            await _show_utbreakout_callback_progress(
+                query,
+                "⏳ UTBreak 조건 스테이터스 조회 중입니다. 완료되면 새 메시지/파일로 보냅니다."
+            )
+            await _send_utbreakout_condition_status(getattr(query, 'message', None))
+
         async def _edit_utbreakout_condition_status(query):
             text = await _get_utbreakout_condition_status_text()
             await self._edit_long_text_with_document(
@@ -25547,6 +25697,13 @@ AUTO 최근 선택 이유:
                 filename='utbreakout_entry_analysis.txt',
                 caption='UT Breakout 진입 분석 전체 로그입니다. 그대로 공유하면 원인 추적에 사용할 수 있습니다.'
             )
+
+        async def _send_utbreakout_entry_analysis_from_callback(query):
+            await _show_utbreakout_callback_progress(
+                query,
+                "⏳ UTBreak 진입 분석 조회 중입니다. 완료되면 새 메시지/파일로 보냅니다."
+            )
+            await _send_utbreakout_entry_analysis(getattr(query, 'message', None))
 
         def _format_utbreakout_sets_text(page=1):
             try:
@@ -25703,10 +25860,23 @@ AUTO 최근 선택 이유:
             if context and context.user_data is not None:
                 context.user_data['utbreak_watchlist_waiting_for_symbols'] = True
             text = "UTBreak에서 직접 감시할 코인 1~5개를 입력하세요. 예: `BTC ETH AAPL EWY`"
-            if hasattr(message_or_query, 'edit_message_text'):
-                await message_or_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
-            else:
-                await message_or_query.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+            await _reply_utbreakout_interaction(message_or_query, text)
+
+        async def _prompt_utbreak_single_coin_input(message_or_query, context):
+            if context and context.user_data is not None:
+                context.user_data['utbreak_coin_waiting_for_symbol'] = True
+            await _reply_utbreakout_interaction(
+                message_or_query,
+                "UTBreak에서 직접 감시할 코인 1개를 입력하세요. 예: `EWY`"
+            )
+
+        async def _prompt_utbreak_autoscan_input(message_or_query, context):
+            if context and context.user_data is not None:
+                context.user_data['utbreak_autoscan_waiting_for_symbols'] = True
+            await _reply_utbreakout_interaction(
+                message_or_query,
+                "AUTO 후보 스캔에 사용할 코인을 입력하세요. 예: `BTC ETH SOL`"
+            )
 
         async def utbreakout_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             args = list(getattr(c, 'args', []) or [])
@@ -25756,9 +25926,7 @@ AUTO 최근 선택 이유:
                     ok, notice = await _enable_single_fixed_coin(args[1:])
                     await u.message.reply_text(notice, parse_mode=ParseMode.MARKDOWN)
                 else:
-                    if c and c.user_data is not None:
-                        c.user_data['utbreak_coin_waiting_for_symbol'] = True
-                    await u.message.reply_text("UTBreak에서 직접 감시할 코인 1개를 입력하세요. 예: `EWY`", parse_mode=ParseMode.MARKDOWN)
+                    await _prompt_utbreak_single_coin_input(u.message, c)
                     return
             elif action in {'watch', 'watchlist', 'coins'}:
                 if len(args) <= 1:
@@ -25781,9 +25949,7 @@ AUTO 최근 선택 이유:
                 elif mode in {'on', 'enable', 'start', '1'}:
                     symbols = args[2:]
                     if not symbols:
-                        if c and c.user_data is not None:
-                            c.user_data['utbreak_autoscan_waiting_for_symbols'] = True
-                        await u.message.reply_text("AUTO 후보 스캔에 사용할 코인을 입력하세요. 예: `BTC ETH SOL`", parse_mode=ParseMode.MARKDOWN)
+                        await _prompt_utbreak_autoscan_input(u.message, c)
                         return
                     _, notice = await _enable_customcoins(symbols)
                     await u.message.reply_text(notice, parse_mode=ParseMode.MARKDOWN)
@@ -26078,17 +26244,17 @@ AUTO 최근 선택 이유:
             query = u.callback_query
             if not query:
                 return
-            await query.answer()
+            await query.answer("처리 중입니다.")
             data = str(query.data or '')
             if not data.startswith('utb:'):
                 return
             parts = data.split(':')
             action = parts[1] if len(parts) > 1 else 'status'
             value = parts[2] if len(parts) > 2 else None
-            if action not in UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS:
+            if action not in UTBREAKOUT_CALLBACK_ACTIONS and not re.fullmatch(r'set\d+', action or ''):
                 await _edit_utbreakout_menu(
                     query,
-                    "ℹ️ 이전 버전 UTBreak 버튼입니다. 현재 버튼은 UTBreak ON/OFF/조건 스테이터스/코인 감시 목록만 사용합니다."
+                    "ℹ️ 알 수 없는 이전 버전 UTBreak 버튼입니다. `/utbreak`로 최신 메뉴를 다시 열어주세요."
                 )
                 return
 
@@ -26113,9 +26279,7 @@ AUTO 최근 선택 이유:
                 return
 
             if action == 'fixed':
-                if c and c.user_data is not None:
-                    c.user_data['utbreak_coin_waiting_for_symbol'] = True
-                await query.edit_message_text("UTBreak에서 직접 감시할 코인 1개를 입력하세요. 예: `EWY`", parse_mode=ParseMode.MARKDOWN)
+                await _prompt_utbreak_single_coin_input(query, c)
                 return
 
             if action == 'fixed_off':
@@ -26123,9 +26287,7 @@ AUTO 최근 선택 이유:
                 return
 
             if action == 'auto_scan':
-                if c and c.user_data is not None:
-                    c.user_data['utbreak_autoscan_waiting_for_symbols'] = True
-                await query.edit_message_text("AUTO 후보 스캔에 사용할 코인을 입력하세요. 예: `BTC ETH SOL`", parse_mode=ParseMode.MARKDOWN)
+                await _prompt_utbreak_autoscan_input(query, c)
                 return
 
             if action == 'auto_scan_off':
@@ -26402,11 +26564,11 @@ AUTO 최근 선택 이유:
                 return
 
             if action == 'condition_status':
-                await _edit_utbreakout_condition_status(query)
+                await _send_utbreakout_condition_status_from_callback(query)
                 return
 
             if action == 'entry_analyze':
-                await _edit_utbreakout_entry_analysis(query)
+                await _send_utbreakout_entry_analysis_from_callback(query)
                 return
 
             await _edit_utbreakout_menu(query)

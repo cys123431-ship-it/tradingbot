@@ -516,6 +516,7 @@ def test_utbreakout_visible_callback_actions_include_watchlist_button():
     emas = _emas_module()
 
     assert emas.UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS == {"on", "off", "condition_status", "watchlist"}
+    assert {"fixed", "auto_scan", "sets", "why", "entry_analyze"}.issubset(emas.UTBREAKOUT_CALLBACK_ACTIONS)
 
 
 def test_setup_keyboard_keeps_exchange_button_choices():
@@ -1836,7 +1837,7 @@ def test_utbreakout_market_quality_reduces_risk_without_blocking_on_mild_funding
     assert "funding" in result["summary"]
 
 
-def test_utbreakout_market_quality_blocks_extreme_adverse_funding():
+def test_utbreakout_market_quality_reduces_extreme_long_risk_without_blocking():
     emas = _emas_module()
     signal_engine = _signal_engine_cls()
     engine = signal_engine.__new__(signal_engine)
@@ -1846,8 +1847,38 @@ def test_utbreakout_market_quality_blocks_extreme_adverse_funding():
         "long",
         cfg,
         {
-            "atr_pct": 0.5,
+            "atr_pct": 11.0,
             "funding_rate": 0.002,
+            "futures_spread_pct": 0.02,
+            "market_regime_context": {
+                "items": {
+                    "BTC/USDT": {
+                        "direction": "short",
+                        "return_lookback_pct": -2.0,
+                    },
+                },
+            },
+        },
+    )
+
+    assert result["state"] == "reduced"
+    assert result["risk_multiplier"] > 0
+    assert result["hard_block"] is False
+    assert result["summary"].startswith("REDUCE")
+
+
+def test_utbreakout_market_quality_blocks_extreme_short_adverse_funding():
+    emas = _emas_module()
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    cfg = emas.build_default_utbot_filtered_breakout_config()
+
+    result = engine._evaluate_utbreakout_market_quality(
+        "short",
+        cfg,
+        {
+            "atr_pct": 0.5,
+            "funding_rate": -0.002,
             "futures_spread_pct": 0.02,
         },
     )
