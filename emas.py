@@ -565,6 +565,12 @@ def build_utbreakout_set_registry():
         'drawdown_brake_enabled': False,
         'adaptive_exit_v2_enabled': False,
         'walk_forward_report_enabled': False,
+        'advanced_alpha_engine_enabled': False,
+        'advanced_alpha_paper_testnet_default_enabled': True,
+        'adaptive_ladder_tp_enabled': False,
+        'macro_guard_enabled': False,
+        'engine_kill_switch_enabled': True,
+        'live_parity_signal_enabled': False,
         'market_quality_data_required': False,
         'market_quality_min_risk_multiplier': 0.25,
         'market_quality_high_atr_pct': 1.5,
@@ -5093,6 +5099,12 @@ class SignalEngine(BaseEngine):
             'drawdown_brake_enabled',
             'adaptive_exit_v2_enabled',
             'walk_forward_report_enabled',
+            'advanced_alpha_engine_enabled',
+            'advanced_alpha_paper_testnet_default_enabled',
+            'adaptive_ladder_tp_enabled',
+            'macro_guard_enabled',
+            'engine_kill_switch_enabled',
+            'live_parity_signal_enabled',
             'bias_continuation_enabled',
             'quality_score_v2_enabled',
             'dynamic_take_profit_enabled',
@@ -5105,6 +5117,12 @@ class SignalEngine(BaseEngine):
             'allow_emergency_simple_set',
         ):
             cfg[key] = bool(cfg.get(key, False))
+        if isinstance(raw, dict) and 'advanced_alpha_engine_enabled' not in raw:
+            cfg['advanced_alpha_engine_enabled'] = (
+                False
+                if self._is_utbreakout_live_runtime(cfg)
+                else bool(cfg.get('advanced_alpha_paper_testnet_default_enabled', True))
+            )
         cfg['risk_per_trade_percent'] = normalize_risk_percent({
             'risk_per_trade_percent': cfg.get('risk_per_trade_percent'),
             'min_risk_per_trade_percent': cfg.get('min_risk_per_trade_percent'),

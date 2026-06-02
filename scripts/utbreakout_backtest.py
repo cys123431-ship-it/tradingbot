@@ -28,6 +28,8 @@ from utbreakout.exit_policy import (
     evaluate_time_stop,
     rank_exit_policies,
 )
+from utbreakout.engine_router import ALPHA_ENGINE_NAMES, evaluate_final_trade_decision
+from utbreakout.market_context import build_market_context
 from utbreakout.meta import meta_label_gate
 from utbreakout.regime import classify_regime, regime_action
 from utbreakout.sizing import calculate_adaptive_risk_pct
@@ -177,6 +179,62 @@ def _backtest_context(rows, idx, atr, bias, side=None, *, timeframe="15m", symbo
     return context
 
 
+def _advanced_market_context(rows, idx, atr, bias, side=None, *, timeframe="15m", symbol=None):
+    base = _backtest_context(rows, idx, atr, bias, side, timeframe=timeframe, symbol=symbol)
+    row = rows[idx]
+    values = {
+        **base,
+        "open": row.get("open"),
+        "high": row.get("high"),
+        "low": row.get("low"),
+        "close": row.get("close"),
+        "volume": row.get("volume"),
+        "atr": atr[idx],
+        "utbot_direction": base.get("utbot_direction") or str(side or "").upper(),
+        "side": side,
+        "funding_rate": row.get("funding_rate"),
+        "funding_delta": row.get("funding_delta"),
+        "oi_change_pct": row.get("oi_change_pct"),
+        "long_short_ratio": row.get("long_short_ratio"),
+        "taker_buy_sell_ratio": row.get("taker_buy_sell_ratio"),
+        "liquidation_spike_score": row.get("liquidation_spike_score"),
+        "spread_bps": row.get("spread_bps", base.get("spread_bps")),
+        "orderbook_imbalance": row.get("orderbook_imbalance"),
+        "macro_risk_flag": bool(row.get("macro_risk_flag", False)),
+        "news_spike_flag": bool(row.get("news_spike_flag", False)),
+    }
+    return build_market_context(rows, idx, symbol=symbol or "UNKNOWN", timeframe=timeframe, values=values)
+
+
+def _advanced_config(args_or_config=None):
+    source = vars(args_or_config) if hasattr(args_or_config, "__dict__") else dict(args_or_config or {})
+    enabled_engines = source.get("enabled_engines")
+    return {
+        "advanced_alpha_engine_enabled": bool(source.get("advanced_alpha", source.get("advanced_alpha_enabled", False))),
+        "adaptive_ladder_tp_enabled": bool(source.get("adaptive_ladder_tp", source.get("adaptive_ladder_tp_enabled", False))),
+        "macro_guard_enabled": bool(source.get("macro_guard", source.get("macro_guard_enabled", False))),
+        "engine_kill_switch_enabled": bool(source.get("engine_kill_switch_enabled", True)),
+        "engine": source.get("engine") or "ALL",
+        "enabled_engines": enabled_engines,
+        "risk_per_trade_pct": source.get("risk_pct", source.get("risk_per_trade_percent", 0.5)),
+        "max_risk_per_trade_pct": min(1.0, float(source.get("max_risk_per_trade_pct", 1.0) or 1.0)),
+        "min_risk_per_trade_pct": 0.0,
+        "max_total_open_risk_pct": 2.0,
+        "max_same_direction_positions": 2,
+        "soft_reduce_consecutive_losses": 2,
+        "hard_stop_consecutive_losses": 3,
+        "daily_loss_limit_r": 2.0,
+        "weekly_loss_limit_r": 5.0,
+        "macro_guard_mode": "BLOCK" if bool(source.get("macro_guard", False)) else "OFF",
+        "meta_label_gate_enabled": bool(source.get("meta_label_gate", False)),
+        "min_alpha_confidence": float(source.get("min_alpha_confidence", 0.55) or 0.55),
+        "allow_advanced_reversal_in_chop": bool(source.get("allow_advanced_reversal_in_chop", False)),
+        "derivatives_data_required": bool(source.get("derivatives_data_required", False)),
+        "require_engine_stats": bool(source.get("require_engine_stats", False)),
+        "default_engine_expected_r": float(source.get("default_engine_expected_r", 0.30) or 0.30),
+    }
+
+
 def _apply_slippage(price, side, bps, is_entry):
     direction = 1.0
     if side == "short":
@@ -259,6 +317,12 @@ def simulate_utbot_rr(
     signal_invalid_exit_enabled=True,
     time_stop_enabled=True,
     volatility_adaptive_tp_enabled=True,
+    advanced_alpha_enabled=False,
+    adaptive_ladder_tp_enabled=False,
+    macro_guard_enabled=False,
+    engine=None,
+    enabled_engines=None,
+    min_alpha_confidence=0.55,
 ):
     atr, trail, signal, bias = utbot_rows(rows, key_value=key_value, atr_period=atr_period)
     balance = float(initial_balance)
@@ -271,8 +335,14 @@ def simulate_utbot_rr(
         "signal_invalid_exit_count": 0,
         "meta_gate_reject_count": 0,
         "derivatives_veto_count": 0,
+        "macro_block_count": 0,
+        "engine_kill_count": 0,
         "regime_block_count": 0,
         "size_reduction_count": 0,
+        "ladder_tp1_count": 0,
+        "ladder_tp2_count": 0,
+        "ladder_tp3_count": 0,
+        "stop_loss_count": 0,
         "end_of_data_count": 0,
     }
 
@@ -323,6 +393,69 @@ def simulate_utbot_rr(
             if stop_hit:
                 exit_reason = "SL"
                 exit_price = position["stop_loss"]
+                counts["stop_loss_count"] += 1
+            elif position.get("ladder_targets"):
+                ladder_targets = position.get("ladder_targets") or []
+                for target in ladder_targets[:-1]:
+                    if target.get("filled"):
+                        continue
+                    hit = row["high"] >= target["price"] if side == "long" else row["low"] <= target["price"]
+                    if not hit:
+                        continue
+                    target_qty = min(position["qty"], position["initial_qty"] * target["qty_ratio"])
+                    if target_qty <= 0:
+                        target["filled"] = True
+                        continue
+                    partial_price = _apply_slippage(target["price"], side, slippage_bps, is_entry=False)
+                    gross = (partial_price - position["entry_price"]) * target_qty
+                    if side == "short":
+                        gross *= -1.0
+                    fees = (position["entry_price"] * target_qty + partial_price * target_qty) * fee_bps / 10000.0
+                    pnl = gross - fees
+                    balance += pnl
+                    equity_peak = max(equity_peak, balance)
+                    max_drawdown = max(max_drawdown, equity_peak - balance)
+                    position["qty"] -= target_qty
+                    position["realized_pnl"] += pnl
+                    position["fee_paid"] += fees
+                    target["filled"] = True
+                    label = str(target.get("label") or "").upper()
+                    if label == "TP1":
+                        position["partial_filled"] = True
+                        position["tp1_filled"] = True
+                        counts["ladder_tp1_count"] += 1
+                        if position.get("move_sl_to_be_after_tp1", True):
+                            buffer_r = max(
+                                0.0,
+                                _float(position.get("breakeven_buffer_r"), (fee_bps * 2.0 + slippage_bps * 2.0) / 10000.0),
+                            )
+                            if side == "long":
+                                position["stop_loss"] = max(position["stop_loss"], position["entry_price"] + position["risk_distance"] * buffer_r)
+                            else:
+                                position["stop_loss"] = min(position["stop_loss"], position["entry_price"] - position["risk_distance"] * buffer_r)
+                    elif label == "TP2":
+                        counts["ladder_tp2_count"] += 1
+                        if position.get("move_sl_to_tp1_after_tp2", False):
+                            tp1_target = next((item for item in ladder_targets if item.get("label") == "TP1"), None)
+                            if tp1_target:
+                                if side == "long":
+                                    position["stop_loss"] = max(position["stop_loss"], tp1_target["price"])
+                                else:
+                                    position["stop_loss"] = min(position["stop_loss"], tp1_target["price"])
+                final_target = ladder_targets[-1] if ladder_targets else None
+                if final_target:
+                    final_hit = row["high"] >= final_target["price"] if side == "long" else row["low"] <= final_target["price"]
+                    if final_hit and position["qty"] > 0:
+                        label = str(final_target.get("label") or "TP").upper()
+                        if label == "TP2":
+                            counts["ladder_tp2_count"] += 1
+                            exit_reason = "TP2_FINAL"
+                        elif label == "TP3":
+                            counts["ladder_tp3_count"] += 1
+                            exit_reason = "TP3_FINAL"
+                        else:
+                            exit_reason = "TP"
+                        exit_price = final_target["price"]
             elif partial_hit:
                 partial_qty = min(
                     position["qty"],
@@ -342,6 +475,7 @@ def simulate_utbot_rr(
                 position["fee_paid"] += fees
                 position["partial_filled"] = True
                 position["tp1_filled"] = True
+                counts["ladder_tp1_count"] += 1
                 if breakeven_after_partial:
                     buffer_r = max(
                         0.0,
@@ -355,9 +489,11 @@ def simulate_utbot_rr(
                 if target_hit and position["qty"] > 0:
                     exit_reason = "TP2"
                     exit_price = position["take_profit"]
+                    counts["ladder_tp2_count"] += 1
             elif target_hit:
                 exit_reason = "TP"
                 exit_price = position["take_profit"]
+                counts["ladder_tp2_count"] += 1
             if not exit_reason and position.get("time_stop_enabled", False):
                 time_stop = evaluate_time_stop(
                     position,
@@ -414,51 +550,100 @@ def simulate_utbot_rr(
                 position = None
             continue
 
-        if signal[idx] not in {"long", "short"} or atr[idx] is None:
+        if atr[idx] is None:
             continue
-        side = signal[idx]
-        context = _backtest_context(rows, idx, atr, bias, side, timeframe=timeframe, symbol=symbol)
-        policy = build_exit_policy(
-            exit_policy_name,
-            context,
-            {
-                "tp1_r": partial_take_profit_r_multiple,
-                "tp1_size_pct": partial_take_profit_ratio * 100.0,
-                "tp2_r": rr_multiple,
-            },
-        )
-        action = {"risk_multiplier": 1.0}
-        if regime_router_enabled:
-            regime = classify_regime(context)
-            context["regime"] = regime
-            action = regime_action(
-                regime,
-                {"side": side, "has_breakout": True, "volume_ratio": context.get("volume_ratio", 1.0)},
-            )
-            if (side == "long" and not action.allow_long) or (side == "short" and not action.allow_short):
-                counts["regime_block_count"] += 1
-                continue
-        gate = meta_label_gate(
-            {"side": side},
-            context,
-            model=None,
-            config={"meta_label_gate_enabled": meta_label_gate_enabled, "meta_gate_min_prob": 0.55},
-        )
-        if not gate.allow:
-            counts["meta_gate_reject_count"] += 1
-            continue
-        effective_risk_pct = calculate_adaptive_risk_pct(
-            {"side": side},
-            {**context, "account": {}, "portfolio": {}},
-            action,
-            {"size_multiplier": 1.0},
-            gate,
-            {
-                "risk_per_trade_pct": risk_per_trade_percent,
-                "min_risk_per_trade_pct": 0.0,
+        decision = None
+        ladder = None
+        if advanced_alpha_enabled:
+            provisional_side = signal[idx] or bias[idx]
+            context = _advanced_market_context(rows, idx, atr, bias, provisional_side, timeframe=timeframe, symbol=symbol)
+            advanced_cfg = _advanced_config({
+                "advanced_alpha": True,
+                "adaptive_ladder_tp": adaptive_ladder_tp_enabled,
+                "macro_guard": macro_guard_enabled,
+                "engine": engine or "ALL",
+                "enabled_engines": enabled_engines,
+                "risk_pct": risk_per_trade_percent,
                 "max_risk_per_trade_pct": min(1.0, max(0.0, risk_per_trade_percent * 2.0)),
-            },
-        )
+                "meta_label_gate": meta_label_gate_enabled,
+                "min_alpha_confidence": min_alpha_confidence,
+            })
+            decision = evaluate_final_trade_decision(
+                row,
+                context,
+                advanced_cfg,
+                models=None,
+                stats={},
+            )
+            if not decision.valid:
+                joined = ",".join(decision.reasons)
+                if "MACRO" in joined:
+                    counts["macro_block_count"] += 1
+                if "DERIVATIVES" in joined:
+                    counts["derivatives_veto_count"] += 1
+                if "META" in joined:
+                    counts["meta_gate_reject_count"] += 1
+                if "REGIME_BLOCK" in joined:
+                    counts["regime_block_count"] += 1
+                continue
+            side = decision.side.lower()
+            ladder = decision.ladder_tp
+            effective_risk_pct = decision.risk_pct
+            policy = build_exit_policy(
+                exit_policy_name,
+                context,
+                {
+                    "tp1_r": partial_take_profit_r_multiple,
+                    "tp1_size_pct": partial_take_profit_ratio * 100.0,
+                    "tp2_r": rr_multiple,
+                },
+            )
+        else:
+            if signal[idx] not in {"long", "short"}:
+                continue
+            side = signal[idx]
+            context = _backtest_context(rows, idx, atr, bias, side, timeframe=timeframe, symbol=symbol)
+            policy = build_exit_policy(
+                exit_policy_name,
+                context,
+                {
+                    "tp1_r": partial_take_profit_r_multiple,
+                    "tp1_size_pct": partial_take_profit_ratio * 100.0,
+                    "tp2_r": rr_multiple,
+                },
+            )
+            action = {"risk_multiplier": 1.0}
+            if regime_router_enabled:
+                regime = classify_regime(context)
+                context["regime"] = regime
+                action = regime_action(
+                    regime,
+                    {"side": side, "has_breakout": True, "volume_ratio": context.get("volume_ratio", 1.0)},
+                )
+                if (side == "long" and not action.allow_long) or (side == "short" and not action.allow_short):
+                    counts["regime_block_count"] += 1
+                    continue
+            gate = meta_label_gate(
+                {"side": side},
+                context,
+                model=None,
+                config={"meta_label_gate_enabled": meta_label_gate_enabled, "meta_gate_min_prob": 0.55},
+            )
+            if not gate.allow:
+                counts["meta_gate_reject_count"] += 1
+                continue
+            effective_risk_pct = calculate_adaptive_risk_pct(
+                {"side": side},
+                {**context, "account": {}, "portfolio": {}},
+                action,
+                {"size_multiplier": 1.0},
+                gate,
+                {
+                    "risk_per_trade_pct": risk_per_trade_percent,
+                    "min_risk_per_trade_pct": 0.0,
+                    "max_risk_per_trade_pct": min(1.0, max(0.0, risk_per_trade_percent * 2.0)),
+                },
+            )
         if effective_risk_pct <= 0:
             counts["size_reduction_count"] += 1
             continue
@@ -481,6 +666,29 @@ def simulate_utbot_rr(
             )
         except ValueError:
             continue
+        ladder_targets = None
+        if ladder:
+            ladder_targets = []
+            for target in ladder.targets():
+                r_multiple = _float(target.get("r"), 0.0)
+                if r_multiple <= 0:
+                    continue
+                price = entry + (plan["risk_distance"] * r_multiple) if side == "long" else entry - (plan["risk_distance"] * r_multiple)
+                ladder_targets.append({
+                    "label": target.get("label"),
+                    "r": r_multiple,
+                    "qty_ratio": max(0.0, min(1.0, _float(target.get("pct"), 0.0) / 100.0)),
+                    "price": price,
+                    "filled": False,
+                })
+            total_ratio = sum(item["qty_ratio"] for item in ladder_targets)
+            if ladder_targets and abs(total_ratio - 1.0) > 1e-9:
+                for item in ladder_targets:
+                    item["qty_ratio"] = item["qty_ratio"] / max(total_ratio, 1e-9)
+            if not ladder_targets:
+                ladder_targets = None
+        tp1_r = ladder_targets[0]["r"] if ladder_targets else policy.tp1_r
+        final_tp_r = ladder_targets[-1]["r"] if ladder_targets else policy.tp2_r
         position = {
             "entry_idx": idx,
             "side": side,
@@ -488,13 +696,22 @@ def simulate_utbot_rr(
             "qty": plan["qty"],
             "initial_qty": plan["qty"],
             "stop_loss": plan["stop_loss"],
-            "take_profit": plan["take_profit"],
-            "partial_take_profit": (
-                entry + (plan["risk_distance"] * policy.tp1_r)
+            "take_profit": (
+                entry + (plan["risk_distance"] * final_tp_r)
                 if side == "long" else
-                entry - (plan["risk_distance"] * policy.tp1_r)
-            ) if policy.tp1_r > 0 and policy.tp1_size_pct > 0 else None,
-            "partial_take_profit_ratio": max(0.0, min(1.0, policy.tp1_size_pct / 100.0)),
+                entry - (plan["risk_distance"] * final_tp_r)
+            ),
+            "partial_take_profit": (
+                entry + (plan["risk_distance"] * tp1_r)
+                if side == "long" else
+                entry - (plan["risk_distance"] * tp1_r)
+            ) if (ladder_targets or (policy.tp1_r > 0 and policy.tp1_size_pct > 0)) else None,
+            "partial_take_profit_ratio": (
+                ladder_targets[0]["qty_ratio"] if ladder_targets else max(0.0, min(1.0, policy.tp1_size_pct / 100.0))
+            ),
+            "ladder_targets": ladder_targets,
+            "move_sl_to_be_after_tp1": bool(getattr(ladder, "move_sl_to_be_after_tp1", True)),
+            "move_sl_to_tp1_after_tp2": bool(getattr(ladder, "move_sl_to_tp1_after_tp2", False)),
             "partial_filled": False,
             "tp1_filled": False,
             "entry_bar_index": idx,
@@ -503,10 +720,13 @@ def simulate_utbot_rr(
             "time_stop_enabled": bool(policy.time_stop_enabled and time_stop_enabled),
             "signal_invalid_exit_enabled": bool(policy.signal_invalid_exit_enabled and signal_invalid_exit_enabled),
             "volatility_adaptive_tp_enabled": bool(policy.volatility_adaptive_tp_enabled and volatility_adaptive_tp_enabled),
+            "alpha_engine": decision.engine if decision else None,
+            "alpha_confidence": decision.confidence if decision else None,
+            "alpha_expected_r": decision.expected_r if decision else None,
             "breakeven_buffer_r": (fee_bps * 2.0 + slippage_bps * 2.0) / 10000.0,
             "risk_pct": effective_risk_pct,
-            "regime": context.get("regime"),
-            "meta_probability": gate.probability,
+            "regime": decision.regime if decision else context.get("regime"),
+            "meta_probability": None if decision else gate.probability,
             "realized_pnl": 0.0,
             "funding_pnl": 0.0,
             "funding_abs": 0.0,
@@ -563,6 +783,11 @@ def simulate_utbot_rr(
     total_notional = sum(t.get("planned_notional", 0.0) for t in trades)
     long_trades = [t for t in trades if t.get("side") == "long"]
     short_trades = [t for t in trades if t.get("side") == "short"]
+    engine_performance = {}
+    for engine_name in ALPHA_ENGINE_NAMES:
+        engine_trades = [t for t in trades if t.get("alpha_engine") == engine_name]
+        if engine_trades:
+            engine_performance[engine_name] = _performance_summary(engine_trades)
     end_of_data_trades = sum(1 for t in trades if t.get("exit_reason") == "END_OF_DATA")
     time_stop_trades = sum(1 for t in trades if str(t.get("exit_reason") or "").startswith("TIME_STOP"))
     signal_invalid_trades = sum(1 for t in trades if str(t.get("exit_reason") or "").startswith("SIGNAL_INVALID"))
@@ -588,6 +813,9 @@ def simulate_utbot_rr(
         "trades_per_month": len(trades) / months if months and months > 0 else None,
         "long_performance": _performance_summary(long_trades),
         "short_performance": _performance_summary(short_trades),
+        "long_trades": len(long_trades),
+        "short_trades": len(short_trades),
+        "engine_performance": engine_performance,
         "max_drawdown_usdt": max_drawdown,
         "max_drawdown_pct": max_drawdown / max(initial_balance, 1e-9) * 100.0,
         "ending_balance": balance,
@@ -595,8 +823,14 @@ def simulate_utbot_rr(
         "signal_invalid_exit_count": signal_invalid_trades or counts["signal_invalid_exit_count"],
         "meta_gate_reject_count": counts["meta_gate_reject_count"],
         "derivatives_veto_count": counts["derivatives_veto_count"],
+        "macro_block_count": counts["macro_block_count"],
+        "engine_kill_count": counts["engine_kill_count"],
         "regime_block_count": counts["regime_block_count"],
         "size_reduction_count": counts["size_reduction_count"],
+        "ladder_tp1_count": counts["ladder_tp1_count"],
+        "ladder_tp2_count": counts["ladder_tp2_count"],
+        "ladder_tp3_count": counts["ladder_tp3_count"],
+        "stop_loss_count": counts["stop_loss_count"],
         "END_OF_DATA_trades": end_of_data_trades,
         "trades_detail": trades,
     }
@@ -622,6 +856,12 @@ def _simulate_variant(rows, params, args):
         trailing_atr_multiplier=args.trailing_atr_mult,
         meta_label_gate_enabled=getattr(args, "meta_label_gate", False),
         regime_router_enabled=getattr(args, "regime_router", False),
+        advanced_alpha_enabled=getattr(args, "advanced_alpha", False),
+        adaptive_ladder_tp_enabled=getattr(args, "adaptive_ladder_tp", False),
+        macro_guard_enabled=getattr(args, "macro_guard", False),
+        engine=getattr(args, "engine", None),
+        enabled_engines=getattr(args, "enabled_engines", None),
+        min_alpha_confidence=getattr(args, "min_alpha_confidence", 0.55),
         **params,
     )
 
@@ -717,6 +957,45 @@ def _candidate_args(args, candidate):
         candidate_args.regime_router = True
         candidate_args.risk_pct = min(candidate_args.risk_pct, 0.5)
         candidate_args.max_risk_usdt = min(candidate_args.max_risk_usdt, 5.0)
+    elif candidate == "BI_DIRECTIONAL_ALPHA":
+        candidate_args.advanced_alpha = True
+        candidate_args.adaptive_ladder_tp = True
+        candidate_args.engine = "ALL"
+        candidate_args.enabled_engines = [
+            "TREND_CONTINUATION_LONG",
+            "TREND_CONTINUATION_SHORT",
+            "SQUEEZE_BREAKOUT_LONG",
+            "SQUEEZE_BREAKOUT_SHORT",
+        ]
+        candidate_args.risk_pct = min(candidate_args.risk_pct, 0.5)
+        candidate_args.max_risk_usdt = min(candidate_args.max_risk_usdt, 10.0)
+    elif candidate == "TREND_AND_REVERSAL_COMBO":
+        candidate_args.advanced_alpha = True
+        candidate_args.adaptive_ladder_tp = True
+        candidate_args.engine = "ALL"
+        candidate_args.enabled_engines = [
+            "TREND_CONTINUATION_LONG",
+            "TREND_CONTINUATION_SHORT",
+            "EXHAUSTION_REVERSAL_LONG",
+            "EXHAUSTION_REVERSAL_SHORT",
+        ]
+        candidate_args.risk_pct = min(candidate_args.risk_pct, 0.25)
+    elif candidate == "LIQUIDITY_SWEEP_ENGINE":
+        candidate_args.advanced_alpha = True
+        candidate_args.adaptive_ladder_tp = True
+        candidate_args.engine = "ALL"
+        candidate_args.enabled_engines = [
+            "LIQUIDITY_SWEEP_REVERSAL_LONG",
+            "LIQUIDITY_SWEEP_REVERSAL_SHORT",
+        ]
+        candidate_args.risk_pct = min(candidate_args.risk_pct, 0.25)
+    elif candidate == "AGGRESSIVE_BUT_CAPPED_ALPHA":
+        candidate_args.advanced_alpha = True
+        candidate_args.adaptive_ladder_tp = True
+        candidate_args.engine = "ALL"
+        candidate_args.enabled_engines = list(ALPHA_ENGINE_NAMES)
+        candidate_args.min_alpha_confidence = 0.72
+        candidate_args.risk_pct = min(candidate_args.risk_pct, 1.0)
     return candidate_args
 
 
@@ -728,6 +1007,13 @@ def compare_strategy_candidates(rows, variants, args):
         "REGIME_ROUTED_BREAKOUT",
         "DEFENSIVE_BTC_ETH_ONLY",
     ]
+    if getattr(args, "include_advanced_alpha", False):
+        candidates.extend([
+            "BI_DIRECTIONAL_ALPHA",
+            "TREND_AND_REVERSAL_COMBO",
+            "LIQUIDITY_SWEEP_ENGINE",
+            "AGGRESSIVE_BUT_CAPPED_ALPHA",
+        ])
     params = next(iter(variants.values()))
     results = {}
     ranked = []
@@ -740,8 +1026,16 @@ def compare_strategy_candidates(rows, variants, args):
         expectancy = report.get("expectancy_r") or 0.0
         pf = report.get("profit_factor") or 0.0
         dd = report.get("max_drawdown_pct") or 0.0
-        if trades >= args.wf_min_trades and expectancy > 0 and pf >= 1.05:
-            score = 0.35 * expectancy + 0.25 * min(pf, 3.0) - 0.20 * dd / 20.0
+        fee = report.get("fee_burden_pct") or 0.0
+        losses = report.get("max_consecutive_losses") or 0
+        if trades >= args.wf_min_trades and expectancy > 0 and pf >= 1.05 and dd <= 20:
+            score = (
+                0.25 * expectancy
+                + 0.20 * min(pf, 3.0)
+                - 0.20 * dd / 20.0
+                - 0.10 * fee
+                - 0.10 * losses / 10.0
+            )
             ranked.append((round(score, 8), candidate))
     ranked.sort(reverse=True)
     return {"results": results, "ranked": [{"score": score, "name": name} for score, name in ranked]}
@@ -761,10 +1055,28 @@ def _decision_for_report(report):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", required=True, help="OHLCV CSV path")
-    parser.add_argument("--strategy", default="baseline", choices=["baseline", "live-parity", "BASE_HYBRID_DEFENSIVE", "META_FILTERED_BREAKOUT", "LOW_CROWDING_BREAKOUT", "REGIME_ROUTED_BREAKOUT", "DEFENSIVE_BTC_ETH_ONLY"])
+    parser.add_argument("--strategy", default="baseline", choices=[
+        "baseline",
+        "live-parity",
+        "BASE_HYBRID_DEFENSIVE",
+        "META_FILTERED_BREAKOUT",
+        "LOW_CROWDING_BREAKOUT",
+        "REGIME_ROUTED_BREAKOUT",
+        "DEFENSIVE_BTC_ETH_ONLY",
+        "BI_DIRECTIONAL_ALPHA",
+        "TREND_AND_REVERSAL_COMBO",
+        "LIQUIDITY_SWEEP_ENGINE",
+        "AGGRESSIVE_BUT_CAPPED_ALPHA",
+    ])
     parser.add_argument("--exit-policy", default=DEFAULT_EXIT_POLICY)
     parser.add_argument("--compare-exits", action="store_true")
     parser.add_argument("--compare-candidates", action="store_true")
+    parser.add_argument("--include-advanced-alpha", action="store_true")
+    parser.add_argument("--advanced-alpha", action="store_true")
+    parser.add_argument("--engine", choices=["ALL", *ALPHA_ENGINE_NAMES], default="ALL")
+    parser.add_argument("--adaptive-ladder-tp", action="store_true")
+    parser.add_argument("--macro-guard", action="store_true")
+    parser.add_argument("--min-alpha-confidence", type=float, default=0.55)
     parser.add_argument("--meta-label-gate", action="store_true")
     parser.add_argument("--regime-router", action="store_true")
     parser.add_argument("--symbol", default="UNKNOWN")
@@ -788,6 +1100,34 @@ def main():
     parser.add_argument("--wf-min-trades", type=int, default=5)
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args()
+    if args.strategy in {"BI_DIRECTIONAL_ALPHA", "TREND_AND_REVERSAL_COMBO", "LIQUIDITY_SWEEP_ENGINE", "AGGRESSIVE_BUT_CAPPED_ALPHA"}:
+        args.advanced_alpha = True
+        args.adaptive_ladder_tp = True if args.strategy != "baseline" else args.adaptive_ladder_tp
+        args.include_advanced_alpha = True
+        if args.strategy == "BI_DIRECTIONAL_ALPHA":
+            args.enabled_engines = [
+                "TREND_CONTINUATION_LONG",
+                "TREND_CONTINUATION_SHORT",
+                "SQUEEZE_BREAKOUT_LONG",
+                "SQUEEZE_BREAKOUT_SHORT",
+            ]
+        elif args.strategy == "TREND_AND_REVERSAL_COMBO":
+            args.enabled_engines = [
+                "TREND_CONTINUATION_LONG",
+                "TREND_CONTINUATION_SHORT",
+                "EXHAUSTION_REVERSAL_LONG",
+                "EXHAUSTION_REVERSAL_SHORT",
+            ]
+        elif args.strategy == "LIQUIDITY_SWEEP_ENGINE":
+            args.enabled_engines = [
+                "LIQUIDITY_SWEEP_REVERSAL_LONG",
+                "LIQUIDITY_SWEEP_REVERSAL_SHORT",
+            ]
+        else:
+            args.enabled_engines = list(ALPHA_ENGINE_NAMES)
+            args.min_alpha_confidence = max(args.min_alpha_confidence, 0.72)
+    else:
+        args.enabled_engines = None
     if args.train_months:
         args.wf_train_candles = max(args.wf_train_candles, int(args.train_months) * 30)
     if args.test_months:
@@ -815,6 +1155,11 @@ def main():
     if args.as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
+        if args.advanced_alpha or args.include_advanced_alpha:
+            print("# Advanced UT Breakout Research Report")
+            print(f"Candidate: {args.strategy}")
+            print(f"Engine: {args.engine}")
+            print(f"Mode: {'advanced-alpha' if args.advanced_alpha else 'comparison'}")
         print(f"CSV: {Path(args.csv)} / candles: {len(rows)}")
         for name, result in report.items():
             if name == "walk_forward":
@@ -851,7 +1196,8 @@ def main():
                         f"avgR={(candidate_result.get('expectancy_r') or 0.0):.2f}R "
                         f"PF={pf_text} MDD={candidate_result['max_drawdown_pct']:.2f}% "
                         f"metaReject={candidate_result.get('meta_gate_reject_count', 0)} "
-                        f"regimeBlock={candidate_result.get('regime_block_count', 0)}"
+                        f"regimeBlock={candidate_result.get('regime_block_count', 0)} "
+                        f"macroBlock={candidate_result.get('macro_block_count', 0)}"
                     )
                 selected = result["ranked"][0]["name"] if result["ranked"] else "NEED_MORE_DATA"
                 print(f"Selected Candidate: {selected}")
@@ -872,6 +1218,15 @@ def main():
                 f"fee={result['fee_burden_pct'] if result['fee_burden_pct'] is not None else 0:.3f}% "
                 f"policy={result.get('exit_policy')} decision={result.get('decision')}"
             )
+            if args.advanced_alpha or args.adaptive_ladder_tp:
+                print(
+                    f"  engines={','.join(sorted(result.get('engine_performance', {}).keys())) or 'none'} "
+                    f"long={result.get('long_trades', 0)} short={result.get('short_trades', 0)} "
+                    f"macro={result.get('macro_block_count', 0)} derivVeto={result.get('derivatives_veto_count', 0)} "
+                    f"metaReject={result.get('meta_gate_reject_count', 0)} "
+                    f"TP1={result.get('ladder_tp1_count', 0)} TP2={result.get('ladder_tp2_count', 0)} "
+                    f"TP3={result.get('ladder_tp3_count', 0)} SL={result.get('stop_loss_count', 0)}"
+                )
 
 
 if __name__ == "__main__":
