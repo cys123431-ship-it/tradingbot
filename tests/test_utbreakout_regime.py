@@ -1,4 +1,4 @@
-from utbreakout.regime import classify_market_regime
+from utbreakout.regime import classify_market_regime, classify_regime, regime_action
 
 
 def test_regime_scores_trending_market_high_for_aligned_long():
@@ -51,3 +51,29 @@ def test_regime_high_volatility_chaos_reduces_risk():
 
     assert result["regime"] == "high_vol_chaos"
     assert result["risk_multiplier"] <= 0.35
+
+
+def test_regime_router_blocks_chop_and_crowding():
+    assert classify_regime({"adx": 10, "atr_percentile": 50, "squeeze_percentile": 50}) == "CHOP"
+    assert regime_action("CHOP", {"side": "long"}).allow_long is False
+    assert classify_regime({"derivatives_crowding_score": 3}) == "CROWDING_OVERHEATED"
+    assert regime_action("CROWDING_OVERHEATED", {"side": "long"}).risk_multiplier == 0.0
+
+
+def test_regime_router_allows_directional_trends_only():
+    up = classify_regime({"adx": 30, "htf_trend": "UP", "plus_di": 25, "minus_di": 10})
+    down = classify_regime({"adx": 30, "htf_trend": "DOWN", "plus_di": 10, "minus_di": 25})
+
+    assert up == "TREND_UP"
+    assert regime_action(up, {"side": "long"}).allow_long is True
+    assert regime_action(up, {"side": "short"}).allow_short is False
+    assert down == "TREND_DOWN"
+    assert regime_action(down, {"side": "short"}).allow_short is True
+
+
+def test_regime_router_reduces_risk_in_high_vol_expansion():
+    regime = classify_regime({"atr_percentile": 90})
+    action = regime_action(regime, {"side": "long"})
+
+    assert regime == "HIGH_VOL_EXPANSION"
+    assert action.risk_multiplier == 0.5

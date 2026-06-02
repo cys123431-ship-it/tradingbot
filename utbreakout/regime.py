@@ -4,7 +4,16 @@ These helpers are deliberately pure. They do not place orders and do not mutate
 runtime bot state.
 """
 
+from dataclasses import dataclass
 from math import isfinite
+
+
+@dataclass(frozen=True)
+class RegimeAction:
+    allow_long: bool
+    allow_short: bool
+    risk_multiplier: float = 1.0
+    preferred_exit: str | None = "HYBRID_DEFENSIVE"
 
 
 def _finite_float(value, default=0.0):
@@ -17,6 +26,12 @@ def _finite_float(value, default=0.0):
 
 def _clamp(value, low, high):
     return max(float(low), min(float(high), float(value)))
+
+
+def _field(obj, key, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
 
 
 def _score_above(value, low, high):
@@ -44,6 +59,60 @@ def default_regime_config():
         "low_vol_compression_risk_multiplier": 0.55,
         "mixed_risk_multiplier": 0.75,
     }
+
+
+def classify_regime(context=None, config=None):
+    """Classify a final-entry regime using the brief's explicit labels."""
+    config = config or {}
+    spread_bps = _finite_float(_field(context, "spread_bps"), 0.0)
+    if spread_bps > _finite_float(config.get("max_spread_bps"), 10.0):
+        return "BAD_LIQUIDITY"
+
+    abnormal = _finite_float(_field(context, "abnormal_candle_zscore"), 0.0)
+    if abnormal >= _finite_float(config.get("abnormal_candle_zscore"), 4.0):
+        return "NEWS_SPIKE_OR_ABNORMAL"
+
+    crowding = _finite_float(_field(context, "derivatives_crowding_score"), 0.0)
+    if crowding >= _finite_float(config.get("crowding_overheated_score"), 3.0):
+        return "CROWDING_OVERHEATED"
+
+    adx = _finite_float(_field(context, "adx"), 0.0)
+    plus_di = _finite_float(_field(context, "plus_di"), 0.0)
+    minus_di = _finite_float(_field(context, "minus_di"), 0.0)
+    htf_trend = str(_field(context, "htf_trend", "") or "").upper()
+    if adx >= _finite_float(config.get("trend_adx_min"), 25.0) and htf_trend == "UP" and plus_di > minus_di:
+        return "TREND_UP"
+    if adx >= _finite_float(config.get("trend_adx_min"), 25.0) and htf_trend == "DOWN" and minus_di > plus_di:
+        return "TREND_DOWN"
+
+    squeeze = _finite_float(_field(context, "squeeze_percentile"), None)
+    atr_pctile = _finite_float(_field(context, "atr_percentile"), None)
+    if squeeze is not None and atr_pctile is not None and squeeze <= 20 and atr_pctile <= 30:
+        return "LOW_VOL_COMPRESSION"
+    if atr_pctile is not None and atr_pctile >= 85:
+        return "HIGH_VOL_EXPANSION"
+    return "CHOP"
+
+
+def regime_action(regime, signal=None, config=None):
+    config = config or {}
+    regime = str(regime or "").upper()
+    has_breakout = bool(_field(signal, "has_breakout", True))
+    volume_ratio = _finite_float(_field(signal, "volume_ratio"), 1.0)
+    volume_min = _finite_float(config.get("regime_breakout_volume_ratio_min"), 1.20)
+
+    if regime == "TREND_UP":
+        return RegimeAction(True, False, 1.0, "HYBRID_DEFENSIVE")
+    if regime == "TREND_DOWN":
+        return RegimeAction(False, True, _finite_float(config.get("short_risk_multiplier"), 0.5), "HYBRID_DEFENSIVE")
+    if regime == "LOW_VOL_COMPRESSION":
+        allowed = has_breakout and volume_ratio >= volume_min
+        return RegimeAction(allowed, allowed, 0.7, "VOL_ADAPTIVE_TP")
+    if regime == "HIGH_VOL_EXPANSION":
+        return RegimeAction(True, True, 0.5, "FIXED_TP_TIME_STOP")
+    if regime in {"CROWDING_OVERHEATED", "CHOP", "NEWS_SPIKE_OR_ABNORMAL", "BAD_LIQUIDITY"}:
+        return RegimeAction(False, False, 0.0, None)
+    return RegimeAction(False, False, 0.0, None)
 
 
 def classify_market_regime(values, cfg=None, side=None):

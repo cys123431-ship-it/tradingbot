@@ -2332,6 +2332,46 @@ def test_place_tp_sl_orders_emergency_closes_when_stop_loss_creation_fails():
     assert engine.last_protection_order_status["BTC/USDT"]["emergency_close_status"] == "EMERGENCY_CLOSED"
 
 
+def test_emergency_close_failure_sets_critical_paused_state():
+    class MarketFailingExchange(_FakeExchange):
+        def create_order(self, symbol, order_type, side, amount, price=None, params=None):
+            if str(order_type).lower() == "market":
+                raise RuntimeError("market rejected")
+            return super().create_order(symbol, order_type, side, amount, price, params)
+
+    pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "2", "entryPrice": "100"}
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    engine.exchange = MarketFailingExchange([], positions=[pos])
+    engine.ctrl = _DummyCtrl()
+    engine.ctrl.is_paused = False
+    engine.last_protection_alert_ts = {}
+    engine.last_protection_order_status = {}
+    engine.last_orphan_protection_sweep_ts = 0.0
+    engine.orphan_protection_candidates = {}
+    engine.ORPHAN_PROTECTION_SWEEP_INTERVAL = 10.0
+    engine.position_cache = {}
+    engine.POSITION_CACHE_TTL = 0.0
+    engine.is_upbit_mode = lambda: False
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": _emas_module().UTBOT_FILTERED_BREAKOUT_STRATEGY,
+        "UTBotFilteredBreakoutV1": {},
+    }
+
+    status = asyncio.run(
+        engine._emergency_close_position_without_stop_loss(
+            "BTC/USDT",
+            reason="test emergency failure",
+            max_attempts=1,
+        )
+    )
+
+    assert status["status"] == "CRITICAL_PAUSED"
+    assert status["emergency_close_status"] == "EMERGENCY_CLOSE_FAILED"
+    assert engine.ctrl.is_paused is True
+    assert "Emergency close failed" in engine.critical_pause_reason
+
+
 def test_utbreakout_trailing_replaces_sl_and_keeps_partial_tp_order():
     pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "1", "entryPrice": "100"}
     engine = _protection_engine(

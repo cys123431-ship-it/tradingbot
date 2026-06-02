@@ -19480,14 +19480,22 @@ class SignalEngine(BaseEngine):
                 await self._cancel_protection_orders(symbol, reason=f'emergency close retry {attempt}')
 
         status.update({
-            'status': 'EMERGENCY_CLOSE_FAILED',
+            'status': 'CRITICAL_PAUSED',
+            'emergency_close_status': 'EMERGENCY_CLOSE_FAILED',
             'closed': False,
             'error': str(last_error) if last_error else 'position still open',
         })
+        try:
+            self.critical_pause_reason = f"Emergency close failed after SL placement failure: {status['error']}"
+            self.critical_pause_status = dict(status)
+            if getattr(self, 'ctrl', None) is not None and hasattr(self.ctrl, 'is_paused'):
+                self.ctrl.is_paused = True
+        except Exception as pause_error:
+            logger.error(f"Critical pause state update failed for {symbol}: {pause_error}")
         await self._audit_protection_orders(symbol, pos=await self.get_server_position(symbol, use_cache=False), alert=True)
         await self.ctrl.notify(
             f"🚨 {self.ctrl.format_symbol_for_display(symbol)} SL 생성 실패 후 긴급 청산도 실패했습니다. "
-            f"거래소에서 즉시 수동 청산하세요: {status['error']}"
+            f"CRITICAL_PAUSED 상태로 전환했습니다. 거래소에서 즉시 수동 청산하세요: {status['error']}"
         )
         return status
 

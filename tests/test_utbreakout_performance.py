@@ -1,6 +1,14 @@
 from math import isinf
 
-from utbreakout.performance import calculate_performance_metrics, group_performance, walk_forward_splits
+from utbreakout.performance import (
+    apply_multiple_testing_penalty,
+    calculate_performance_metrics,
+    deflated_sharpe_proxy,
+    group_performance,
+    passes_oos_rules,
+    pbo_proxy,
+    walk_forward_splits,
+)
 
 
 def test_performance_metrics_include_risk_and_capture_stats():
@@ -36,3 +44,22 @@ def test_performance_groups_by_side_and_builds_walk_forward_splits():
     assert len(splits) == 4
     assert splits[0]["train"]["trade_count"] == 4
     assert splits[0]["test"]["trade_count"] == 2
+
+
+def test_multiple_testing_penalty_increases_with_trials():
+    low_trials = apply_multiple_testing_penalty({"expectancy_r": 1.0, "profit_factor": 2.0}, 5)
+    many_trials = apply_multiple_testing_penalty({"expectancy_r": 1.0, "profit_factor": 2.0}, 100)
+
+    assert low_trials["multiple_testing_penalty"] == 0.0
+    assert many_trials["multiple_testing_penalty"] > low_trials["multiple_testing_penalty"]
+    assert many_trials["adjusted_expectancy_r"] < 1.0
+
+
+def test_deflated_sharpe_proxy_rejects_low_sharpe_many_trials():
+    assert deflated_sharpe_proxy(0.4, n_obs=80, n_trials=100) is False
+    assert deflated_sharpe_proxy(1.2, n_obs=300, n_trials=5) is True
+
+
+def test_oos_failure_and_pbo_proxy_reject_strategy():
+    assert passes_oos_rules({"trades": 3, "average_R": 1.0, "profit_factor": 2.0}) is False
+    assert pbo_proxy([True, False, False, True]) == 0.5

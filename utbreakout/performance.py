@@ -1,7 +1,7 @@
 """Backtest/research performance metrics for UT Breakout."""
 
 from collections import defaultdict
-from math import isfinite, sqrt
+from math import isfinite, log, sqrt
 
 
 def _finite_float(value, default=0.0):
@@ -101,3 +101,71 @@ def walk_forward_splits(trades=None, train_size=50, test_size=20):
         })
         start += test_size
     return splits
+
+
+def passes_train_rules(report, config=None):
+    config = dict(config or {})
+    report = dict(report or {})
+    if int(_finite_float(report.get("total_trades", report.get("trades")), 0)) < int(config.get("min_train_trades", 30) or 30):
+        return False
+    if _finite_float(report.get("profit_factor"), 0.0) < _finite_float(config.get("min_train_profit_factor"), 1.15):
+        return False
+    if _finite_float(report.get("expectancy_r", report.get("average_R")), 0.0) <= 0:
+        return False
+    if _finite_float(report.get("max_drawdown_pct"), 0.0) > _finite_float(config.get("max_train_drawdown_pct"), 15.0):
+        return False
+    return True
+
+
+def passes_oos_rules(report, config=None):
+    config = dict(config or {})
+    report = dict(report or {})
+    if int(_finite_float(report.get("total_trades", report.get("trades")), 0)) < int(config.get("min_oos_trades", 10) or 10):
+        return False
+    if _finite_float(report.get("expectancy_r", report.get("average_R")), 0.0) <= 0:
+        return False
+    if _finite_float(report.get("profit_factor"), 0.0) < _finite_float(config.get("min_oos_profit_factor"), 1.05):
+        return False
+    if _finite_float(report.get("max_drawdown_pct"), 0.0) > _finite_float(config.get("max_oos_drawdown_pct"), 20.0):
+        return False
+    return True
+
+
+def apply_multiple_testing_penalty(report, number_of_trials, config=None):
+    report = dict(report or {})
+    trials = max(1, int(number_of_trials or 1))
+    if trials <= int((config or {}).get("multiple_testing_free_trials", 10) or 10):
+        report.setdefault("adjusted_expectancy_r", _finite_float(report.get("expectancy_r", report.get("average_R")), 0.0))
+        report.setdefault("adjusted_profit_factor", _finite_float(report.get("profit_factor"), 0.0))
+        report["multiple_testing_penalty"] = 0.0
+        return report
+    penalty = min(_finite_float((config or {}).get("multiple_testing_max_penalty"), 0.30), 0.02 * log(trials))
+    expectancy = _finite_float(report.get("expectancy_r", report.get("average_R")), 0.0)
+    pf = _finite_float(report.get("profit_factor"), 0.0)
+    report["multiple_testing_penalty"] = round(penalty, 8)
+    report["adjusted_expectancy_r"] = expectancy * (1.0 - penalty)
+    report["adjusted_profit_factor"] = 1.0 + (pf - 1.0) * (1.0 - penalty)
+    return report
+
+
+def deflated_sharpe_proxy(sharpe, skew=0.0, kurtosis=3.0, n_obs=0, n_trials=1):
+    """Proxy threshold for deflated Sharpe style selection.
+
+    More trials and shorter/noisier samples raise the required Sharpe.
+    """
+    required = 0.5 + 0.05 * log(max(int(n_trials or 1), 1))
+    if int(n_obs or 0) < 100:
+        required += 0.25
+    if _finite_float(kurtosis, 3.0) > 3:
+        required += 0.10
+    if abs(_finite_float(skew, 0.0)) > 1.0:
+        required += 0.05
+    return _finite_float(sharpe, 0.0) > required
+
+
+def pbo_proxy(oos_passes=None):
+    values = list(oos_passes or [])
+    if not values:
+        return 1.0
+    failures = sum(1 for value in values if not bool(value))
+    return failures / len(values)

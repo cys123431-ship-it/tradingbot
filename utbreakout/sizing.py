@@ -15,6 +15,17 @@ def _clamp(value, low, high):
     return max(float(low), min(float(high), float(value)))
 
 
+def _field(obj, key, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _nested(obj, outer, inner, default=None):
+    parent = _field(obj, outer, None)
+    return _field(parent, inner, default)
+
+
 def default_sizing_config():
     return {
         "base_risk_percent": 0.5,
@@ -124,3 +135,59 @@ def build_position_risk_multiplier(inputs=None, cfg=None):
         },
         "reasons": reasons,
     }
+
+
+def calculate_adaptive_risk_pct(signal=None, context=None, regime_action=None, derivatives=None, gate=None, config=None):
+    """Return the final percent risk after all defensive brakes.
+
+    Percent units are used throughout: 0.5 means 0.5% account risk.
+    """
+    config = dict(config or {})
+    risk = _finite_float(
+        config.get("risk_per_trade_pct", config.get("risk_per_trade_percent", config.get("base_risk_pct", 0.5))),
+        0.5,
+    )
+    risk *= _finite_float(_field(regime_action, "risk_multiplier"), 1.0)
+    risk *= _finite_float(_field(derivatives, "size_multiplier"), 1.0)
+    risk *= _finite_float(_field(gate, "size_multiplier"), 1.0)
+
+    atr_percentile = _finite_float(_field(context, "atr_percentile"), None)
+    if atr_percentile is not None:
+        if atr_percentile >= _finite_float(config.get("high_vol_risk_reduce_percentile"), 85.0):
+            risk *= _finite_float(config.get("high_vol_risk_multiplier"), 0.5)
+        if atr_percentile <= _finite_float(config.get("low_vol_risk_reduce_percentile"), 10.0):
+            risk *= _finite_float(config.get("low_vol_risk_multiplier"), 0.5)
+
+    losses = int(_finite_float(_nested(context, "account", "consecutive_losses", _field(context, "consecutive_losses", 0)), 0) or 0)
+    if losses >= int(config.get("hard_stop_consecutive_losses", 3) or 3):
+        return 0.0
+    if losses >= int(config.get("soft_reduce_consecutive_losses", 2) or 2):
+        risk *= _finite_float(config.get("loss_streak_risk_multiplier"), 0.5)
+
+    daily_loss_r = _finite_float(_nested(context, "account", "daily_loss_r", _field(context, "daily_loss_r", 0.0)), 0.0)
+    weekly_loss_r = _finite_float(_nested(context, "account", "weekly_loss_r", _field(context, "weekly_loss_r", 0.0)), 0.0)
+    if daily_loss_r <= -_finite_float(config.get("daily_loss_limit_r"), 2.0):
+        return 0.0
+    if weekly_loss_r <= -_finite_float(config.get("weekly_loss_limit_r"), 5.0):
+        return 0.0
+
+    total_open_risk = _finite_float(
+        _nested(context, "portfolio", "total_open_risk_pct", _field(context, "total_open_risk_pct", 0.0)),
+        0.0,
+    )
+    same_direction = int(
+        _finite_float(
+            _nested(context, "portfolio", "same_direction_positions", _field(context, "same_direction_positions", 0)),
+            0,
+        ) or 0
+    )
+    if total_open_risk >= _finite_float(config.get("max_total_open_risk_pct"), 2.0):
+        return 0.0
+    if same_direction >= int(config.get("max_same_direction_positions", 2) or 2):
+        return 0.0
+
+    if risk <= 0:
+        return 0.0
+    min_risk = _finite_float(config.get("min_risk_per_trade_pct", config.get("min_risk_per_trade_percent")), 0.05)
+    max_risk = _finite_float(config.get("max_risk_per_trade_pct", config.get("max_risk_per_trade_percent")), 1.0)
+    return round(_clamp(risk, min_risk, max_risk), 8)
