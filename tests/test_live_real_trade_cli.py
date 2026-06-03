@@ -1,0 +1,82 @@
+import pytest
+
+from scripts import live_real_trade
+
+
+def test_cli_requires_once_before_running(monkeypatch):
+    async def should_not_run(args):
+        raise AssertionError("run_once must not be called without --once")
+
+    monkeypatch.setattr(live_real_trade, "run_once", should_not_run)
+
+    with pytest.raises(SystemExit):
+        live_real_trade.main([
+            "--symbol",
+            "BTC/USDT:USDT",
+            "--confirm",
+            live_real_trade.LIVE_REAL_CONFIRM_TEXT,
+        ])
+
+
+def test_cli_requires_exact_confirmation_before_running(monkeypatch):
+    async def should_not_run(args):
+        raise AssertionError("run_once must not be called with a bad confirmation")
+
+    monkeypatch.setattr(live_real_trade, "run_once", should_not_run)
+
+    with pytest.raises(SystemExit):
+        live_real_trade.main([
+            "--symbol",
+            "BTC/USDT:USDT",
+            "--once",
+            "--confirm",
+            "WRONG",
+        ])
+
+
+def test_cli_builds_real_small_cap_config_with_updated_caps():
+    args = live_real_trade.parse_args([
+        "--symbol",
+        "BTC/USDT:USDT",
+        "--once",
+        "--confirm",
+        live_real_trade.LIVE_REAL_CONFIRM_TEXT,
+        "--max-notional",
+        "999",
+        "--max-loss",
+        "999",
+        "--leverage",
+        "99",
+    ])
+
+    cfg = live_real_trade.build_live_real_config(args, {"testnet": True})
+
+    assert cfg["live_activation_stage"] == "LIVE_REAL_SMALL_CAP"
+    assert cfg["testnet"] is False
+    assert cfg["live_trading"] is True
+    assert cfg["real_order_enabled"] is True
+    assert cfg["max_leverage"] == 5
+    assert cfg["leverage"] == 5
+    assert cfg["max_real_position_notional_usdt"] == 15.0
+    assert cfg["max_real_loss_per_trade_usdt"] == 3.0
+    assert cfg["max_daily_real_loss_usdt"] == 6.0
+    assert cfg["max_weekly_real_loss_usdt"] == 30.0
+
+
+def test_cli_main_runs_once_when_safety_tokens_are_present(monkeypatch, capsys):
+    async def fake_run_once(args):
+        return {"status": "NO_TRADE", "symbol": args.symbol}
+
+    monkeypatch.setattr(live_real_trade, "run_once", fake_run_once)
+
+    result = live_real_trade.main([
+        "--symbol",
+        "BTC/USDT:USDT",
+        "--once",
+        "--confirm",
+        live_real_trade.LIVE_REAL_CONFIRM_TEXT,
+    ])
+
+    out = capsys.readouterr().out
+    assert result["status"] == "NO_TRADE"
+    assert '"status": "NO_TRADE"' in out

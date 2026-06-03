@@ -1,4 +1,4 @@
-﻿# emas_improved.py
+# emas_improved.py
 # [?쒖닔 ?대쭅 踰꾩쟾]
 # Version: 2025-12-25-Recovery (Emergency Access)
 # 1. WebSocket ?쒓굅 ???덉젙?곸씤 ?대쭅 諛⑹떇?쇰줈 ?꾪솚
@@ -42,7 +42,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboard
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TimedOut, RetryAfter
 from telegram.ext import (
-    ApplicationBuilder, ContextTypes, CommandHandler, 
+    ApplicationBuilder, ContextTypes, CommandHandler,
     MessageHandler, filters, ConversationHandler, CallbackQueryHandler
 )
 from utbreakout.indicators import (
@@ -86,6 +86,15 @@ from utbreakout.micro_auto import (
     default_micro_auto_config,
     normalize_micro_auto_config,
 )
+from utbreakout.engine_router import (
+    evaluate_final_trade_decision,
+    TradeDecision,
+    LadderTP,
+    should_disable_engine,
+)
+from utbreakout.market_context import build_market_context
+from utbreakout.exit_policy import evaluate_time_stop, evaluate_signal_invalid_exit
+from utbreakout.macro_guard import is_macro_risk_window
 from prediction import (
     PREDICTION_STRATEGY_CATALOG,
     PaperLedger,
@@ -184,7 +193,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO,
     handlers=[
-        logging.StreamHandler(), 
+        logging.StreamHandler(),
         BufferHandler(),
         logging.FileHandler('trading_bot.log', encoding='utf-8')  # 濡쒓렇 ?뚯씪 ???
     ]
@@ -1207,7 +1216,7 @@ class TradingConfig:
             },
             'system_settings': {
                 'active_engine': CORE_ENGINE,
-                'trade_direction': 'both', 
+                'trade_direction': 'both',
                 'show_dashboard': True,
                 'monitoring_interval_seconds': 3
             },
@@ -1394,7 +1403,7 @@ class TradingConfig:
             if section not in self.config:
                 self.config[section] = {}
                 changed = True
-            
+
             for key, val in fields.items():
                 if key not in self.config[section]:
                     self.config[section][key] = val
@@ -1405,7 +1414,7 @@ class TradingConfig:
                         if sub_k not in self.config[section][key]:
                             self.config[section][key][sub_k] = sub_v
                             changed = True
-        
+
         # Enforce signal-only runtime policy while keeping legacy configs archived.
         api_cfg = self.config.setdefault('api', {})
         exchange_mode = str(api_cfg.get('exchange_mode', '')).lower()
@@ -2015,7 +2024,7 @@ class TradingConfig:
 
     def get(self, key, default=None):
         return self.config.get(key, default)
-    
+
     def get_chat_id(self):
         """chat_id瑜??뺤닔濡??덉쟾?섍쾶 諛섑솚"""
         cid = self.config.get('telegram', {}).get('chat_id', '')
@@ -2035,14 +2044,14 @@ class DBManager:
     def _init_tables(self):
         with self.lock:
             self.conn.execute("""CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY, symbol TEXT, side TEXT, 
-                entry_price REAL, exit_price REAL, quantity REAL, 
-                pnl_usdt REAL, pnl_pct REAL, 
+                id INTEGER PRIMARY KEY, symbol TEXT, side TEXT,
+                entry_price REAL, exit_price REAL, quantity REAL,
+                pnl_usdt REAL, pnl_pct REAL,
                 entry_time TEXT, exit_time TEXT, exit_reason TEXT
             )""")
             self.conn.execute("""CREATE TABLE IF NOT EXISTS shannon_log (
-                id INTEGER PRIMARY KEY, timestamp TEXT, 
-                total_equity REAL, action TEXT, 
+                id INTEGER PRIMARY KEY, timestamp TEXT,
+                total_equity REAL, action TEXT,
                 coin_price REAL, coin_amt REAL, usdt_amt REAL
             )""")
             self.conn.execute("""CREATE TABLE IF NOT EXISTS grid_orders (
@@ -2069,7 +2078,7 @@ class DBManager:
     def log_trade_entry(self, symbol, side, price, quantity=0):
         with self.lock:
             self.conn.execute(
-                "INSERT INTO trades (symbol, side, entry_price, quantity, entry_time) VALUES (?,?,?,?,?)", 
+                "INSERT INTO trades (symbol, side, entry_price, quantity, entry_time) VALUES (?,?,?,?,?)",
                 (symbol, side, price, quantity, datetime.now(timezone.utc).isoformat())
             )
             self.conn.commit()
@@ -2077,7 +2086,7 @@ class DBManager:
     def log_trade_close(self, symbol, pnl, pnl_pct, exit_price, reason):
         with self.lock:
             self.conn.execute(
-                """UPDATE trades SET exit_time=?, exit_price=?, pnl_usdt=?, pnl_pct=?, exit_reason=? 
+                """UPDATE trades SET exit_time=?, exit_price=?, pnl_usdt=?, pnl_pct=?, exit_reason=?
                 WHERE symbol=? AND exit_time IS NULL ORDER BY id DESC LIMIT 1""",
                 (datetime.now(timezone.utc).isoformat(), exit_price, pnl, pnl_pct, reason, symbol)
             )
@@ -2474,14 +2483,14 @@ class BaseEngine:
         except Exception as e:
             # ?대? ?ㅼ젙?섏뼱 ?덇굅??吏?먰븯吏 ?딅뒗 寃쎌슦 臾댁떆 (濡쒓렇 ?앸왂 媛??
             pass
-        
+
         # 2. Margin Mode: ISOLATED (媛뺤젣)
         try:
             await asyncio.to_thread(self.exchange.set_margin_mode, 'ISOLATED', symbol)
         except Exception as e:
             # ?대? 寃⑸━ 紐⑤뱶?????덉쓬
             pass
-        
+
             # 3. Leverage Setting
         try:
             # ?몄옄濡??꾨떖???덈쾭由ъ?媛 ?놁쑝硫??ㅼ젙?먯꽌 議고쉶
@@ -2495,7 +2504,7 @@ class BaseEngine:
                     leverage = self.cfg.get('dual_mode_engine', {}).get('leverage', 5)
                 else:
                     leverage = self.get_runtime_common_settings().get('leverage', 20)
-            
+
             await asyncio.to_thread(self.exchange.set_leverage, leverage, symbol)
             logger.info(f"??{symbol} Settings: ISOLATED / {leverage}x")
         except Exception as e:
@@ -2504,7 +2513,7 @@ class BaseEngine:
     async def get_server_position(self, symbol, use_cache=True):
         """?ъ???議고쉶 (?щ낵蹂?罹먯떆 ?곸슜)"""
         now = time.time()
-        
+
         # [Fix] Lazy Init for Dictionary Cache (Backward Compatibility)
         if not isinstance(self.position_cache, dict):
             self.position_cache = {}
@@ -2516,7 +2525,7 @@ class BaseEngine:
                 cached_pos, cached_ts = cache_entry
                 if (now - cached_ts) < self.POSITION_CACHE_TTL:
                     return cached_pos
-        
+
         try:
             if self.is_upbit_mode():
                 bal = await asyncio.to_thread(self.exchange.fetch_balance)
@@ -2570,7 +2579,7 @@ class BaseEngine:
                         f"side={normalized_pos['side']} contracts={normalized_pos['contracts']}"
                     )
                     break
-            
+
             # Update Cache (Key by Symbol)
             self.position_cache[symbol] = (found_pos, now)
             return found_pos
@@ -2777,7 +2786,7 @@ class BaseEngine:
             total_equity = max(equities) if equities else 0.0
         if total_equity <= 0:
             total_equity, _, _ = await self.get_balance_info()
-        
+
         if eng == 'shannon':
             sh_cfg = self.cfg.get('shannon_engine', {})
             limit_abs = float(sh_cfg.get('daily_loss_limit', 5000) or 5000)
@@ -2815,12 +2824,12 @@ class BaseEngine:
     async def check_mmr_alert(self, mmr):
         """MMR 寃쎄퀬 泥댄겕 (荑⑤떎???곸슜)"""
         max_mmr = self.cfg.get('shannon_engine', {}).get('risk_monitor', {}).get('max_mmr_alert_pct', 25.0)
-        
+
         # 荑⑤떎?? 5遺??숈븞 以묐났 ?뚮┝ 諛⑹?
         now = time.time()
         if not hasattr(self, '_last_mmr_alert_time'):
             self._last_mmr_alert_time = 0
-        
+
         if mmr >= max_mmr:
             if now - self._last_mmr_alert_time > 300:  # 5遺?
                 self._last_mmr_alert_time = now
@@ -2834,12 +2843,12 @@ class TemaEngine(BaseEngine):
         super().__init__(controller)
         self.last_candle_time = 0
         self.consecutive_errors = 0
-        
+
         # 湲곕낯 湲곗닠??吏??罹먯떆
         self.ema1 = None
         self.ema2 = None
         self.ema3 = None
-    
+
     def start(self):
         super().start()
         # ?ъ떆?????곹깭 珥덇린?뷀븯??利됱떆 遺꾩꽍 媛?ν븯寃???
@@ -2848,40 +2857,40 @@ class TemaEngine(BaseEngine):
         self.ema2 = None
         self.ema3 = None
         logger.info(f"?? [TEMA] Engine started")
-        
+
     async def poll_tick(self):
         if not self.running: return
-        
+
         try:
             # 1. ?ㅼ젙 濡쒕뱶 (怨듯넻 ?ㅼ젙 ?ъ슜)
             cfg = self.cfg.get('tema_engine', {})
             common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
-            
+
             symbol = cfg.get('target_symbol', 'BTC/USDT')
             tf = cfg.get('timeframe', '5m')
-            
+
             # 2. 罹붾뱾 ?곗씠??議고쉶
             ohlcv = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, tf, limit=100)
             if not ohlcv or len(ohlcv) < 50:
                 return
-                
+
             last_closed = ohlcv[-2]
             current_ts = int(last_closed[0])
             current_close = float(last_closed[4])
-            
+
             # 3. ?덈줈??罹붾뱾 留덇컧 ??遺꾩꽍
             if current_ts > self.last_candle_time:
                 logger.info(f"?빉截?[TEMA {tf}] {symbol} New Candle: close={current_close}")
                 self.last_candle_time = current_ts
-                
+
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                
+
                 # 吏??怨꾩궛
                 df = self._calculate_indicators(df, cfg)
-                
+
                 # ?좏샇 ?뺤씤
                 signal, reason = self._check_entry_conditions(df, cfg)
-                
+
                 # ?ъ???議고쉶
                 pos = await self.get_server_position(symbol, use_cache=False)
                 if pos and abs(float(pos.get('contracts', 0) or 0)) > 0:
@@ -2894,13 +2903,13 @@ class TemaEngine(BaseEngine):
                         pos_side = 'none'
                 else:
                     pos_side = 'none'
-                
+
                 # 吏꾩엯 媛먯?
                 if signal and pos_side == 'none':
                     logger.info(f"?? TEMA Signal Detected: {signal.upper()} ({reason})")
                     current_price = float(ohlcv[-1][4])
                     await self.entry(symbol, signal, current_price, common_cfg)
-                    
+
                 # 泥?궛 媛먯? (?ъ??섏씠 ?덉쓣 ?뚮쭔)
                 elif pos_side != 'none':
                      exit_signal, exit_reason = self._check_exit_conditions(df, pos_side, cfg)
@@ -2918,17 +2927,17 @@ class TemaEngine(BaseEngine):
             rsi_period = cfg.get('rsi_period', 14)
             tema_period = cfg.get('tema_period', 9)
             bb_window = cfg.get('bollinger_window', 20)
-            
+
             # RSI
             df['rsi'] = ta.rsi(df['close'], length=rsi_period)
-            
+
             # TEMA Calculation
             # TEMA = (3 * EMA1) - (3 * EMA2) + EMA3
             ema1 = ta.ema(df['close'], length=tema_period)
             ema2 = ta.ema(ema1, length=tema_period)
             ema3 = ta.ema(ema2, length=tema_period)
             df['tema'] = (3 * ema1) - (3 * ema2) + ema3
-            
+
             # Bollinger Bands
             bb = ta.bbands(df['close'], length=bb_window, std=2.0)
             # pandas_ta bbands returns multiple columns. We need standard names.
@@ -2938,7 +2947,7 @@ class TemaEngine(BaseEngine):
             df['bb_lower'] = bb[cols[0]]
             df['bb_mid'] = bb[cols[1]]
             df['bb_upper'] = bb[cols[2]]
-            
+
             return df
         except Exception as e:
             logger.error(f"Indicator calculation error: {e}")
@@ -2948,28 +2957,28 @@ class TemaEngine(BaseEngine):
         # ?꾨왂: SampleStrategy.py 濡쒖쭅 援ы쁽
         # Long: RSI > 30 & TEMA < BB_Mid & TEMA Rising
         # Short: RSI > 70 & TEMA > BB_Mid & TEMA Falling
-        
+
         try:
             last = df.iloc[-2] # 吏곸쟾 ?뺤젙 遊?
             prev = df.iloc[-3] # 洹???遊?(異붿꽭 ?뺤씤??
-            
+
             # TEMA Rising/Falling check
             tema_rising = last['tema'] > prev['tema']
             tema_falling = last['tema'] < prev['tema']
-            
+
             # Conditions
             # 1. Long
-            if (last['rsi'] > 30 and 
-                last['tema'] <= last['bb_mid'] and 
+            if (last['rsi'] > 30 and
+                last['tema'] <= last['bb_mid'] and
                 tema_rising):
                 return 'long', f"RSI({last['rsi']:.1f})>30 & TEMA<Mid & Rising"
-                
+
             # 2. Short
-            if (last['rsi'] > 70 and 
-                last['tema'] >= last['bb_mid'] and 
+            if (last['rsi'] > 70 and
+                last['tema'] >= last['bb_mid'] and
                 tema_falling):
                 return 'short', f"RSI({last['rsi']:.1f})>70 & TEMA>Mid & Falling"
-                
+
             return None, None
         except Exception:
             return None, None
@@ -2978,26 +2987,26 @@ class TemaEngine(BaseEngine):
         # ?꾨왂: SampleStrategy.py 濡쒖쭅 援ы쁽
         # Exit Long: RSI > 70 & TEMA > BB_Mid & TEMA Falling (怨쇰ℓ??+ 爰얠엫)
         # Exit Short: RSI < 30 & TEMA < BB_Mid & TEMA Rising (怨쇰ℓ??+ 諛섎벑)
-        
+
         try:
             last = df.iloc[-2]
             prev = df.iloc[-3]
-            
+
             tema_rising = last['tema'] > prev['tema']
             tema_falling = last['tema'] < prev['tema']
-            
+
             if pos_side == 'long':
-                if (last['rsi'] > 70 and 
-                    last['tema'] > last['bb_mid'] and 
+                if (last['rsi'] > 70 and
+                    last['tema'] > last['bb_mid'] and
                     tema_falling):
                     return True, f"Long Exit: RSI({last['rsi']:.1f})>70 & TEMA>Mid & Falling"
-            
+
             elif pos_side == 'short':
-                if (last['rsi'] < 30 and 
-                    last['tema'] < last['bb_mid'] and 
+                if (last['rsi'] < 30 and
+                    last['tema'] < last['bb_mid'] and
                     tema_rising):
                     return True, f"Short Exit: RSI({last['rsi']:.1f})<30 & TEMA<Mid & Rising"
-                    
+
             return False, None
         except Exception:
             return False, None
@@ -3012,7 +3021,7 @@ class TemaEngine(BaseEngine):
                     if normalized_pos:
                         active_sym = str(normalized_pos.get('symbol', '')).replace(':USDT', '').replace('/', '')
                         target_sym = symbol.replace(':USDT', '').replace('/', '')
-                        
+
                         if active_sym != target_sym:
                             logger.warning(f"?슟 [Single Limit] Entry blocked: Already holding {normalized_pos['symbol']}")
                             await self.ctrl.notify(f"⚠️ **진입 차단**: 단일 포지션 제한 (보유 중: {normalized_pos['symbol']})")
@@ -3028,30 +3037,30 @@ class TemaEngine(BaseEngine):
             # 2. ?ъ옄 鍮꾩쨷 (Risk %) - 怨듯넻 ?ㅼ젙 ?ъ슜
             risk_pct = normalize_risk_percent(common_cfg)
             leverage = common_cfg.get('leverage', 5)
-            
+
             # USDT ?ъ엯 湲덉븸 怨꾩궛
             invest_amount = (total * (risk_pct / 100.0)) * leverage
-            
+
             # ?섎웾 怨꾩궛
             quantity = invest_amount / price
             amount_str = self.safe_amount(symbol, quantity)
             price_str = self.safe_price(symbol, price) # Limit 二쇰Ц??(?꾩옱媛)
-            
+
             logger.info(f"?뮥 TEMA Entry: {side.upper()} {symbol} Qty={amount_str} Price={price_str} (Lev {leverage}x)")
-            
+
             # 3. 二쇰Ц ?꾩넚
             # [Enforce] Market Settings
             await self.ensure_market_settings(symbol, leverage=leverage)
-            
+
             params = {'leverage': leverage}
-            
+
             if side == 'long':
                 order = await asyncio.to_thread(self.exchange.create_market_buy_order, symbol, float(amount_str), params)
             else:
                 order = await asyncio.to_thread(self.exchange.create_market_sell_order, symbol, float(amount_str), params)
-            
+
             await self.ctrl.notify(f"✅ **TEMA 진입**: {symbol} {side.upper()}\n가격: {price}\n수량: {amount_str}")
-            
+
             # 4. TP/SL ?ㅼ젙 (怨듯넻 ?ㅼ젙 ?ъ슜)
             tp_master_enabled = bool(common_cfg.get('tp_sl_enabled', False))
             tp_enabled = tp_master_enabled and bool(common_cfg.get('take_profit_enabled', True))
@@ -3059,17 +3068,17 @@ class TemaEngine(BaseEngine):
             if tp_enabled or sl_enabled:
                 roe_target = common_cfg.get('target_roe_pct', 20.0) / 100.0
                 stop_loss = common_cfg.get('stop_loss_pct', 10.0) / 100.0
-                
+
                 # 二쇰Ц 泥닿껐媛 湲곗? TP/SL 怨꾩궛
                 entry_price = float(order['average']) if order.get('average') else price
-                
+
                 if side == 'long':
                     tp_price = entry_price * (1 + roe_target/leverage)
                     sl_price = entry_price * (1 - stop_loss/leverage)
                 else:
                     tp_price = entry_price * (1 - roe_target/leverage)
                     sl_price = entry_price * (1 + stop_loss/leverage)
-                    
+
                 # 諛붿씠?몄뒪 湲곗? TP/SL 二쇰Ц (STOP_MARKET / TAKE_PROFIT_MARKET)
                 try:
                     if tp_enabled:
@@ -3081,7 +3090,7 @@ class TemaEngine(BaseEngine):
                             await asyncio.to_thread(self.exchange.create_order, symbol, 'TAKE_PROFIT_MARKET', 'sell', amount_str, None, params_tp)
                         else:
                             await asyncio.to_thread(self.exchange.create_order, symbol, 'TAKE_PROFIT_MARKET', 'buy', amount_str, None, params_tp)
-                    
+
                     if sl_enabled:
                         params_sl = {
                             'stopPrice': self.safe_price(symbol, sl_price),
@@ -3091,7 +3100,7 @@ class TemaEngine(BaseEngine):
                             await asyncio.to_thread(self.exchange.create_order, symbol, 'STOP_MARKET', 'sell', amount_str, None, params_sl)
                         else:
                             await asyncio.to_thread(self.exchange.create_order, symbol, 'STOP_MARKET', 'buy', amount_str, None, params_sl)
-                    
+
                     logger.info(f"??Protective orders placed: TP={'ON' if tp_enabled else 'OFF'}, SL={'ON' if sl_enabled else 'OFF'}")
                 except Exception as e:
                     logger.error(f"Failed to place TP/SL order: {e}")
@@ -3109,7 +3118,7 @@ class TemaEngine(BaseEngine):
             amount = abs(float(pos.get('contracts', 0) or 0))
             pos_side = str(pos.get('side', '')).lower()
             side = 'sell' if pos_side == 'long' else 'buy'
-            
+
             if amount > 0:
                 await asyncio.to_thread(self.exchange.create_market_order, symbol, side, amount)
                 await self.ctrl.notify(f"🔄 **TEMA 청산**: {symbol} ({reason})")
@@ -3122,10 +3131,10 @@ class SignalEngine(BaseEngine):
         super().__init__(controller)
         # Multi-symbol support
         self.active_symbols = set()  # Manually added + Scanned symbols
-        
+
         # Symbol-specific states (Dict[symbol, value])
         self.last_candle_time = {}
-        self.last_candle_success = {} 
+        self.last_candle_success = {}
         self.last_processed_candle_ts = {}
         self.last_state_sync_candle_ts = {}
         self.last_stateful_retry_ts = {}
@@ -3143,26 +3152,26 @@ class SignalEngine(BaseEngine):
         self.utsmc_last_entry_signal_ts = {}
         self.utsmc_entry_invalidation = {}
         self.utsmc_fixed_exit_obs = {}
-        
+
         self.last_heartbeat = 0
         self.consecutive_errors = 0
         self.last_activity = time.time()
         self.last_volume_scan = 0
-        
+
         # Scanner State
         self.scanner_active_symbol = None # ?꾩옱 ?ㅼ틦?덇? ?↔퀬 ?덈뒗 肄붿씤 (Serial Hunter Mode)
-        
+
         # Kalman ?곹깭 罹먯떆 (??쒕낫???쒖떆??
         self.kalman_states = {} # {symbol: {'velocity': float, 'direction': str}}
-        
+
         # Strategy states (Dict[symbol, value] or just cache keying)
         # MicroVBO ?곹깭 罹먯떆
         self.vbo_states = {} # {symbol: {entry_price, entry_atr, breakout_level}}
-        
+
         # FractalFisher ?곹깭 罹먯떆
         self.fisher_states = {} # {symbol: {hurst, value, prev_value, entry_price, entry_atr, trailing_stop}}
         self.cameron_states = {} # {symbol: {side, stop_price, entry_ref_price, signal_ts, ...}}
-        
+
         # [New] Filter Status Persistence (Dashboard)
         self.last_entry_filter_status = {} # symbol -> {r2_val, ...}
         self.last_exit_filter_status = {}  # symbol -> {r2_val, ...}
@@ -4121,7 +4130,7 @@ class SignalEngine(BaseEngine):
         obs_cov = kalman_cfg.get('observation_covariance', 0.1)
         trans_cov = kalman_cfg.get('transition_covariance', 0.05)
         prices = df['close'].values
-        
+
         kf = PyKalmanFilter(
             transition_matrices=np.array([[1, 1], [0, 1]]),
             observation_matrices=np.array([[1, 0]]),
@@ -6972,9 +6981,9 @@ class SignalEngine(BaseEngine):
             'breakeven_armed': False,
             'last_stop_price': float(plan.get('stop_loss', 0.0) or 0.0),
             'initial_stop_price': float(plan.get('stop_loss', 0.0) or 0.0),
-            'runner_exit_enabled': bool(cfg.get('runner_exit_enabled', True)),
-            'runner_chandelier_enabled': bool(cfg.get('runner_chandelier_enabled', True)),
-            'runner_mode': 'dynamic_chandelier' if cfg.get('runner_chandelier_enabled', True) else 'atr_close',
+            'runner_exit_enabled': bool(cfg.get('runner_exit_enabled', False)),
+            'runner_chandelier_enabled': bool(cfg.get('runner_chandelier_enabled', False)),
+            'runner_mode': 'dynamic_chandelier' if cfg.get('runner_chandelier_enabled', False) else 'atr_close',
             'runner_chandelier_lookback': int(cfg.get('runner_chandelier_lookback', 22) or 22),
             'runner_structure_lookback': int(cfg.get('runner_structure_lookback', 5) or 5),
             'highest_price': entry,
@@ -7900,7 +7909,7 @@ class SignalEngine(BaseEngine):
             'max_bars': int(cfg.get('shadow_triple_barrier_max_bars', 24) or 24),
             'shadow_triple_logged': False,
             'shadow_runner_logged': False,
-            'shadow_runner_exit_enabled': bool(cfg.get('shadow_runner_exit_enabled', True)),
+            'shadow_runner_exit_enabled': bool(cfg.get('shadow_runner_exit_enabled', False)),
             'shadow_runner_max_bars': int(cfg.get('shadow_runner_max_bars', 48) or 48),
             'runner_cfg': {
                 key: cfg.get(key)
@@ -7992,7 +8001,7 @@ class SignalEngine(BaseEngine):
                     item['shadow_triple_logged'] = True
                     resolved.append(extra)
 
-            if bool(item.get('shadow_runner_exit_enabled', cfg.get('shadow_runner_exit_enabled', True))) and not item.get('shadow_runner_logged'):
+            if bool(item.get('shadow_runner_exit_enabled', cfg.get('shadow_runner_exit_enabled', False))) and not item.get('shadow_runner_logged'):
                 runner_cfg = dict(item.get('runner_cfg') or {})
                 runner_cfg.update({
                     'shadow_runner_max_bars': item.get('shadow_runner_max_bars', cfg.get('shadow_runner_max_bars', 48)),
@@ -8028,7 +8037,7 @@ class SignalEngine(BaseEngine):
                     item['shadow_runner_logged'] = True
                     resolved.append(runner_extra)
 
-            runner_required = bool(item.get('shadow_runner_exit_enabled', cfg.get('shadow_runner_exit_enabled', True)))
+            runner_required = bool(item.get('shadow_runner_exit_enabled', cfg.get('shadow_runner_exit_enabled', False)))
             if item.get('shadow_triple_logged') and (not runner_required or item.get('shadow_runner_logged')):
                 pending.pop(key, None)
                 resolved_keys = getattr(self, 'utbreakout_shadow_resolved_keys', set())
@@ -13014,13 +13023,13 @@ class SignalEngine(BaseEngine):
         """
         if not self.running:
             return
-        
+
         try:
             self.last_activity = time.time()
             cfg = self.get_runtime_trade_config()
             common_cfg = self.get_runtime_common_settings()
             entry_tf = self._get_primary_poll_timeframe(trade_cfg=cfg)
-            
+
             active_position_symbols = set()
             # Common: Fetch current positions (best effort).
             # If this call fails (e.g. permission/auth issue), do not stop status updates.
@@ -13046,9 +13055,9 @@ class SignalEngine(BaseEngine):
 
             # Check Scanner Setting
             scanner_enabled = common_cfg.get('scanner_enabled', True)
-            
+
             target_symbols = set()
-            
+
             if scanner_enabled:
                 # === [Mode 1: Serial Scanner] ===
                 # 0. Add Existing Positions to Targets (Safety Net)
@@ -13077,16 +13086,16 @@ class SignalEngine(BaseEngine):
                         )
                         self.scanner_active_symbol = None
                         # 諛붾줈 ?ㅼ틪 濡쒖쭅?쇰줈 ?섏뼱媛?
-                
+
                 # 2. ?↔퀬 ?덈뒗寃??녿떎硫? -> ?ㅼ틪 ?ㅽ뻾
                 if not self.scanner_active_symbol:
                     # ?ㅼ틪 寃곌낵? 蹂꾧컻濡?湲곗〈 ?ъ??섏? ?대? target_symbols??異붽???
-                    
+
                     # 荑⑦???濡쒖쭅: ?ъ???泥?궛 吏곹썑?쇰㈃ 諛붾줈 ?ㅼ틪?댁빞 ??
                     if time.time() - self.last_volume_scan > 60: # 1遺?荑⑦???
                         await self.scan_and_trade_high_volume()
                         self.last_volume_scan = time.time()
-                    
+
                     # ?ㅼ틪 寃곌낵 吏꾩엯?덉쑝硫?target_symbols??異붽???
                     if self.scanner_active_symbol:
                         target_symbols.add(self.scanner_active_symbol)
@@ -13094,10 +13103,10 @@ class SignalEngine(BaseEngine):
                 # === [Mode 2: Manual / Watchlist] ===
                 # Config Watchlist
                 config_symbols = set(self.get_runtime_watchlist())
-                
+
                 # Merge: Config + Chat Manual + Positions
                 target_symbols = self.active_symbols | config_symbols | active_position_symbols
- 
+
             if self.ctrl.is_paused:
                 total, free, mmr = await self.get_balance_info()
                 count, daily_pnl = self.db.get_daily_stats()
@@ -13131,7 +13140,7 @@ class SignalEngine(BaseEngine):
                     # [Fix] Provide status feedback during scanning (Target empty)
                     total, free, mmr = await self.get_balance_info()
                     count, daily_pnl = self.db.get_daily_stats()
-                    
+
                     self.ctrl.status_data['SCANNER'] = {
                         'engine': 'SIGNAL',
                         'symbol': 'Scanning... ?뱻',
@@ -13163,7 +13172,7 @@ class SignalEngine(BaseEngine):
             for symbol in target_symbols:
                 if self.ctrl.is_paused: break
                 tasks.append(self.poll_symbol(symbol, entry_tf, cfg))
-                
+
             if tasks:
                 await asyncio.gather(*tasks)
 
@@ -13187,19 +13196,19 @@ class SignalEngine(BaseEngine):
             'vbo_states',
             'cameron_states'
         ))
-            
+
         try:
             primary_tf = self._get_primary_poll_timeframe(symbol, cfg)
             # 1. OHLCV (Primary) - Basic monitoring
             ohlcv_p = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, primary_tf, limit=5)
             if not ohlcv_p or len(ohlcv_p) < 3:
                 return
-            
+
             current_price = float(ohlcv_p[-1][4])
-        
+
             # [Fix] Update Status and get local pos_side to avoid race condition
             pos_side = await self.check_status(symbol, current_price)
-            
+
             # 2. Check Primary TF (Entry Logic)
             last_closed_p = ohlcv_p[-2]
             ts_p = last_closed_p[0]
@@ -13207,7 +13216,7 @@ class SignalEngine(BaseEngine):
                 't': ts_p, 'o': str(last_closed_p[1]), 'h': str(last_closed_p[2]),
                 'l': str(last_closed_p[3]), 'c': str(last_closed_p[4]), 'v': str(last_closed_p[5])
             }
-            
+
             # ?щ낵蹂??곹깭 珥덇린??
             if symbol not in self.last_processed_candle_ts:
                 self.last_processed_candle_ts[symbol] = 0
@@ -13221,7 +13230,7 @@ class SignalEngine(BaseEngine):
             active_strategy = strategy_params.get('active_strategy', 'utbot').lower()
             uses_stateful_primary_sync = active_strategy in STATEFUL_UT_STRATEGIES
             processed_primary_this_tick = False
-            
+
             if ts_p > self.last_processed_candle_ts[symbol]:
                 logger.info(f"?빉截?[Primary {primary_tf}] {symbol} New Candle: {ts_p} close={last_closed_p[4]}")
                 await self.process_primary_candle(symbol, k_p)
@@ -13271,7 +13280,7 @@ class SignalEngine(BaseEngine):
                     current_price,
                     pos_side
                 )
-                
+
             # 3. Check Exit TF (Exit Logic)
             # Cross/Position 紐⑤뱶?먯꽌留?Secondary TF 泥?궛 濡쒖쭅 ?ъ슜
             uses_secondary_exit = (
@@ -13287,24 +13296,24 @@ class SignalEngine(BaseEngine):
             )
             if uses_secondary_exit:
                 exit_tf = self._get_exit_timeframe(symbol)
-                
+
                 ohlcv_e = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, exit_tf, limit=5)
                 if ohlcv_e and len(ohlcv_e) >= 3:
                     last_closed_e = ohlcv_e[-2]
                     ts_e = last_closed_e[0]
-                    
+
                     if symbol not in self.last_processed_exit_candle_ts:
                         self.last_processed_exit_candle_ts[symbol] = 0
 
                     # [Initial Sync] 留뚯빟 遊??ъ떆???깆쑝濡??꾩쭅 怨꾩궛 湲곕줉???녾퀬 ?ъ??섏씠 ?덈떎硫?利됱떆 1??怨꾩궛
                     is_first_sync = (self.last_processed_exit_candle_ts[symbol] == 0)
-                    
+
                     if ts_e > self.last_processed_exit_candle_ts[symbol] or is_first_sync:
                         if is_first_sync:
                             logger.info(f"?봽 [Initial Sync] {symbol} Position detected on restart, processing filters...")
                         else:
                             logger.info(f"?빉截?[Exit {exit_tf}] {symbol} New Candle: {ts_e} close={last_closed_e[4]}")
-                            
+
                         exit_ok = await self.process_exit_candle(symbol, exit_tf, pos_side)
                         if exit_ok:
                             self.last_processed_exit_candle_ts[symbol] = ts_e
@@ -14799,7 +14808,7 @@ class SignalEngine(BaseEngine):
 
             logger.info("?뱻 Scanning high volume markets (>200M USDT)...")
             tickers = await asyncio.to_thread(self.market_data_exchange.fetch_tickers)
-            
+
             # 1. 1李??꾪꽣: 嫄곕옒湲덉븸 200M ?댁긽
             candidates = []
             for symbol, data in tickers.items():
@@ -14809,7 +14818,7 @@ class SignalEngine(BaseEngine):
                     percentage = float(data.get('percentage', 0) or 0)
                     if quote_vol >= 200_000_000:
                         candidates.append({'symbol': symbol, 'vol': quote_vol, 'pct': percentage})
-            
+
             if not candidates:
                 logger.info("scanner: No coins > 200M vol found.")
                 return
@@ -14817,7 +14826,7 @@ class SignalEngine(BaseEngine):
             # 2. 2李??꾪꽣: ?곸듅瑜??곸쐞 5媛?
             candidates.sort(key=lambda x: x['pct'], reverse=True)
             top_5_risers = candidates[:5]
-            
+
             # Debug Log: Top 5 Risers
             log_msg = "?뱤 [Scanner Debug] Top 5 Risers:\n"
             for idx, c in enumerate(top_5_risers):
@@ -14830,7 +14839,7 @@ class SignalEngine(BaseEngine):
 
             # 3. 3李??꾪꽣: 洹?以?嫄곕옒?湲??쒖쑝濡??뺣젹?섏뿬 ?쒖감?곸쑝濡?泥댄겕
             top_5_risers.sort(key=lambda x: x['vol'], reverse=True)
-            
+
             for target_coin in top_5_risers:
                 symbol = target_coin['symbol']
                 cooldown_remaining, cooldown_state = self._coin_selector_cooldown_remaining(
@@ -14851,7 +14860,7 @@ class SignalEngine(BaseEngine):
 
                 # 4. ?꾨왂 ?ㅽ뻾
                 if self.ctrl.is_paused: return
-                
+
                 try:
                     cfg = self.get_runtime_trade_config()
                     common_cfg = self.get_runtime_common_settings()
@@ -14879,7 +14888,7 @@ class SignalEngine(BaseEngine):
                             decision_key=f"rise_max:{int(scan_started_at // 300)}"
                         )
                         continue
-                    
+
                     # [MODIFIED] Always use entry_timeframe if scanner is evaluating for a position-like entry
                     scan_params = strategy_params.copy()
                     active_strategy = scan_params.get('active_strategy', 'utbot').lower()
@@ -14887,7 +14896,7 @@ class SignalEngine(BaseEngine):
                         active_strategy = 'utbot'
                     if active_strategy in UTBREAKOUT_STRATEGIES:
                         scan_tf = self._get_utbot_filtered_breakout_config(scan_params).get('entry_timeframe', '15m')
-                    
+
                     # Use scanner_timeframe if set, but ensure we are thinking about consistency
                     ohlcv = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, scan_tf, limit=300)
                     if not ohlcv:
@@ -14898,16 +14907,16 @@ class SignalEngine(BaseEngine):
                             decision_key=f"no_ohlcv:{scan_tf}:{int(scan_started_at // 60)}"
                         )
                         continue
-                    
+
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     decision_key = f"{active_strategy}:{scan_tf}:{int(ohlcv[-1][0])}"
-                    
+
                     strategy_context = self._collect_primary_strategy_context(symbol, df, scan_params, active_strategy)
                     sig, _, _, _, _, _ = await self._calculate_strategy_signal(
                         symbol, df, scan_params, active_strategy, allow_utbot_stateful=False,
                         precomputed=strategy_context.get('precomputed')
                     )
-                    
+
                     if not sig:
                         last_reason = ''
                         if isinstance(getattr(self, 'last_entry_reason', None), dict):
@@ -14980,7 +14989,7 @@ class SignalEngine(BaseEngine):
                                 continue
                         # ?ъ????뺤씤 (?쒕쾭)
                         pos = await self.get_server_position(symbol, use_cache=False)
-                        
+
                         if not pos:
                             logger.info(f"?? Scanner Locking In: {symbol} [{sig.upper()}] detected!")
                             current_price = float(ohlcv[-1][4])
@@ -15018,7 +15027,7 @@ class SignalEngine(BaseEngine):
                     )
                     logger.error(f"Scanner strategy check failed for {symbol}: {e}")
                     continue
-                
+
         except Exception as e:
             logger.error(f"Volume scanner error: {e}")
 
@@ -15058,7 +15067,7 @@ class SignalEngine(BaseEngine):
             total, free, mmr = await self.get_balance_info()
             count, daily_pnl = self.db.get_daily_stats()
             pos = await self.get_server_position(symbol, use_cache=False)
-            
+
             # ?꾨왂 ?곹깭 媛?몄삤湲?
             strategy_params = self.get_runtime_strategy_params()
             comm_cfg = self.get_runtime_common_settings()
@@ -15066,12 +15075,12 @@ class SignalEngine(BaseEngine):
             entry_mode = strategy_params.get('entry_mode', 'cross').upper()
             if active_strategy in {'UTBOT', 'UTSMC', 'RSIBB', 'UTRSIBB', 'UTRSI', 'UTBB', 'UTBOT_FILTERED_BREAKOUT_V1'}:
                 entry_mode = active_strategy
-            
+
             # MicroVBO State
             vbo_state = self.vbo_states.get(symbol, {})
             # FractalFisher State
             fisher_state = self.fisher_states.get(symbol, {})
-            
+
             # [Fix] Multi-symbol Status Data
             pos_side = pos['side'].upper() if pos else 'NONE'
             symbol_status = {
@@ -15107,7 +15116,7 @@ class SignalEngine(BaseEngine):
                 'fisher_trailing_stop': fisher_state.get('trailing_stop'),
                 'fisher_entry_atr': fisher_state.get('entry_atr')
             }
-            
+
             symbol_status['entry_filters'] = {}
             symbol_status['exit_filters'] = {}
             symbol_status['filter_config'] = {}
@@ -15148,7 +15157,7 @@ class SignalEngine(BaseEngine):
                 'invalid_price_cancelled': protection_audit.get('invalid_price_cancelled', 0),
                 'audit_status': protection_audit.get('status', 'UNKNOWN')
             }
-            
+
             # [New] Status Display Enhancement
             symbol_status['leverage'] = comm_cfg.get('leverage', 1 if self.is_upbit_mode() else 20)
             symbol_status['margin_mode'] = 'SPOT' if self.is_upbit_mode() else 'ISOLATED'
@@ -15161,12 +15170,12 @@ class SignalEngine(BaseEngine):
                 symbol_status['exit_tf'] = comm_cfg.get('exit_timeframe', '4h')
 
             self.ctrl.status_data[symbol] = symbol_status
-            
+
             # MMR 寃쎄퀬 泥댄겕
             await self.check_mmr_alert(mmr)
-            
+
             return pos_side
-                
+
         except Exception as e:
             logger.error(f"Signal check_status error: {e}")
 
@@ -16651,7 +16660,7 @@ class SignalEngine(BaseEngine):
 
     async def process_primary_candle(self, symbol, k, force=False):
         candle_time = k['t']
-        
+
         # ?щ낵蹂??곹깭 珥덇린??
         if symbol not in self.last_candle_time:
             self.last_candle_time[symbol] = 0
@@ -16661,15 +16670,15 @@ class SignalEngine(BaseEngine):
         if (not force) and candle_time <= self.last_candle_time[symbol] and self.last_candle_success[symbol]:
             logger.debug(f"??Skipping duplicate candle: {candle_time} <= {self.last_candle_time[symbol]}")
             return
-        
+
         processing_candle_time = candle_time
         self.last_signal_check = time.time()
         self.last_candle_success[symbol] = False
-        
+
         logger.info(f"?빉截?[Signal] Processing candle: {symbol} close={k['c']}")
         strategy_params = self.get_runtime_strategy_params()
         active_strategy = strategy_params.get('active_strategy', 'utbot').lower()
-        
+
         if await self.check_daily_loss_limit():
             logger.info("??Daily loss limit reached, skipping trade")
             if active_strategy in UTBREAKOUT_STRATEGIES:
@@ -16677,10 +16686,10 @@ class SignalEngine(BaseEngine):
             self.last_candle_time[symbol] = processing_candle_time
             self.last_candle_success[symbol] = True
             return
-        
+
         try:
             await self.check_status(symbol, float(k['c']))
-            
+
             # [MODIFIED] Prioritize entry_timeframe for fetching entry OHLCV
             common_cfg = self.get_runtime_common_settings()
             if active_strategy in UTBREAKOUT_STRATEGIES:
@@ -16690,18 +16699,18 @@ class SignalEngine(BaseEngine):
                 tf = common_cfg.get('entry_timeframe', common_cfg.get('timeframe', '15m'))
             ohlcv = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, tf, limit=300)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            
+
             # [CRITICAL] Ensure numeric types (Robust Loop)
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
-            
+
             # ===== ?꾨왂 ?ㅼ젙 濡쒕뱶 =====
             strategy_context = self._collect_primary_strategy_context(symbol, df, strategy_params, active_strategy)
             raw_strategy_sig = strategy_context['raw_strategy_sig']
             raw_state_sig = strategy_context['raw_state_sig']
             raw_ut_detail = strategy_context['raw_ut_detail']
             raw_hybrid_detail = strategy_context['raw_hybrid_detail']
-            
+
             # ?꾨왂蹂??좏샇 怨꾩궛
             sig, is_bullish, is_bearish, strategy_name, entry_mode, kalman_enabled = await self._calculate_strategy_signal(
                 symbol,
@@ -16739,7 +16748,7 @@ class SignalEngine(BaseEngine):
                     utbot_rsi_momentum_entry_eval,
                     strategy_params
                 )
-            
+
             # 留ㅻℓ 諛⑺뼢 ?꾪꽣
             d_mode = self.get_effective_trade_direction()
             if sig and not self.is_trade_direction_allowed(sig):
@@ -16753,7 +16762,7 @@ class SignalEngine(BaseEngine):
             self.position_cache = None
             self.position_cache_time = 0
             pos = await self.get_server_position(symbol, use_cache=False)
-            
+
             current_side = pos['side'] if pos else 'NONE'
             logger.info(f"?뱧 Current position: {current_side}, Signal: {sig or 'NONE'}, Mode: {entry_mode}")
             if active_strategy in STATEFUL_UT_STRATEGIES:
@@ -16926,19 +16935,19 @@ class SignalEngine(BaseEngine):
                     live_ohlc_text=_fmt_ohlc(live_row),
                     note=f"force={'Y' if force else 'N'} dir={d_mode}"
                 )
-            
+
             # 6.5 Pending Re-entry Check (吏??吏꾩엯)
             # ?댁쟾 罹붾뱾?먯꽌 泥?궛 ???덉빟??吏꾩엯???덈뒗吏 ?뺤씤
             if self.pending_reentry.get(symbol):
                 reentry_data = self.pending_reentry[symbol]
                 target_ts = reentry_data.get('target_time', 0)
                 side = reentry_data.get('side')
-                
+
                 # ?寃?罹붾뱾 ?쒓컙?닿굅??洹??댄썑硫?吏꾩엯
                 if candle_time >= target_ts:
                     logger.info(f"??Executing PENDING re-entry for {side.upper()} at {candle_time} (scheduled for {target_ts})")
                     self.pending_reentry.pop(symbol, None) # Reset first to avoid loop
-                    
+
                     if not pos: # ?ъ??섏씠 鍮꾩뼱?덉뼱??吏꾩엯
                         await self.entry(symbol, side, float(k['c']))
                     else:
@@ -16946,11 +16955,11 @@ class SignalEngine(BaseEngine):
                 else:
                     logger.info(f"??Waiting for pending re-entry: target={target_ts}, current={candle_time}")
                     # ?꾩쭅 ?쒓컙 ???먯쑝硫??대쾲 ??醫낅즺 (?좉퇋 ?좏샇 臾댁떆)
-                    return 
+                    return
 
             # ===== Kalman 諛⑺뼢 媛?몄삤湲?(李멸퀬?? =====
             kalman_direction = self.kalman_states.get(symbol, {}).get('direction')  # 'long' or 'short' or None
-            
+
             # ?ㅼ쓬 罹붾뱾 ?쒓컙 怨꾩궛??
             next_candle_ts = candle_time + self._timeframe_to_ms(tf)
 
@@ -17021,6 +17030,7 @@ class SignalEngine(BaseEngine):
                 if pos:
                     filtered_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
                     await self._manage_utbreakout_partial_trailing(symbol, pos, df, filtered_cfg)
+                    await self._manage_live_ladder_exit_policy(symbol, pos, df, filtered_cfg)
                     self.last_entry_reason[symbol] = (
                         f"포지션 보유 중 ({pos['side'].upper()}), UTBOT_FILTERED_BREAKOUT_V1 신규 진입 대기"
                     )
@@ -17039,13 +17049,13 @@ class SignalEngine(BaseEngine):
             elif (active_strategy in MA_STRATEGIES and entry_mode in ['cross', 'position']) or active_strategy == 'cameron':
                 # Cross/Position 紐⑤뱶: Primary TF?먯꽌??"吏꾩엯(Entry)"留?泥섎━
                 # 泥?궛(Exit)? Secondary TF candle (process_exit_candle)?먯꽌 泥섎━??
-                
+
                 if pos:
                     # ?대? ?ъ??섏씠 ?덉쑝硫?Entry 泥댄겕 ????(Wait for Exit TF signal)
                     # ?? Pending Re-entry???꾩뿉??泥섎━??
                     self.last_entry_reason[symbol] = f"포지션 보유 중 ({pos['side'].upper()}), 진입 대기"
                     logger.debug(f"ProcessPrimary: Position exists ({pos['side']}), waiting for Exit TF signal.")
-                    
+
                 elif not pos and sig:
                     # ?ъ????놁쓬 + 吏꾩엯 ?좏샇 -> 吏꾩엯
                     if active_strategy == 'cameron':
@@ -17055,7 +17065,7 @@ class SignalEngine(BaseEngine):
                     self.last_entry_reason[symbol] = f"{strategy_label} 조건 충족 -> {sig.upper()} 진입"
                     logger.info(f"?? {strategy_label} (Primary): New entry {sig.upper()}")
                     await self.entry(symbol, sig, float(k['c']))
-            
+
             elif entry_mode in ['hurst_fisher', 'microvbo']:
                 # FractalFisher / MicroVBO 紐⑤뱶: 湲곗〈 濡쒖쭅 ?좎? (?⑥씪 TF)
                 if not pos and sig:
@@ -17071,14 +17081,14 @@ class SignalEngine(BaseEngine):
                         check_pos = await self.get_server_position(symbol, use_cache=False)
                         if not check_pos:
                             await self.entry(symbol, sig, float(k['c']))
-            
+
             else:
                 logger.debug(f"No action: pos={current_side}, sig={sig}, entry_mode={entry_mode}")
-            
+
             self.last_candle_time[symbol] = processing_candle_time
             self.last_candle_success[symbol] = True
             logger.debug(f"??Candle processing completed successfully")
-                
+
         except Exception as e:
             logger.error(f"Signal process_candle error: {e}")
             import traceback
@@ -17176,7 +17186,7 @@ class SignalEngine(BaseEngine):
             # [CRITICAL] Ensure numeric types (Robust Loop)
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
-            
+
             # ===== 1. Calculate Raw Exit Signal =====
             strategy_params = self.get_runtime_strategy_params()
             active_strategy = strategy_params.get('active_strategy', 'utbot').lower()
@@ -17666,7 +17676,7 @@ class SignalEngine(BaseEngine):
                         logger.info(f"??[Exit Debug] {symbol} Bullish Alignment: {c_f:.2f} > {c_s:.2f}")
                     else:
                         logger.debug(f"?뵇 [Exit Debug] {symbol} Still Bearish: {c_f:.2f} < {c_s:.2f}")
-            
+
             # ?좏샇媛 ?녿뜑?쇰룄 ?꾪꽣 媛믪? 怨꾩궛?댁꽌 ??쒕낫?쒖뿉 ?낅뜲?댄듃 (??Pending 諛⑹?)
             await self._update_exit_filter_values(symbol, df, current_side)
             if not raw_exit_long and not raw_exit_short:
@@ -17696,20 +17706,20 @@ class SignalEngine(BaseEngine):
                     logger.info(f"[Exit {tf}] SHORT Exit Triggered: {exit_reason}")
                     await self.exit_position(symbol, exit_call_reason)
                 return True
-            
+
             # ===== 3. Exit Filter logic check =====
             can_exit = True
             block_reasons = []
-            
+
             # Re-fetch the calculated values for checking
             st = self.last_exit_filter_status.get(symbol, {})
             kalman_vel = st.get('kalman_vel', 0.0)
             curr_r2 = st.get('r2_val', 0.0)
             curr_chop = st.get('chop_val', 50.0)
-            
+
             kalman_cfg = strategy_params.get('kalman_filter', {})
             kalman_exit_enabled = kalman_cfg.get('exit_enabled', False)
-            
+
             common_cfg = self.get_runtime_common_settings()
             r2_exit_enabled = common_cfg.get('r2_exit_enabled', True)
             r2_thresh = common_cfg.get('r2_threshold', 0.25)
@@ -17728,7 +17738,7 @@ class SignalEngine(BaseEngine):
                     if kalman_vel <= 0:
                         can_exit = False
                         block_reasons.append(f"Kalman(Vel={kalman_vel:.4f})<=0")
-            
+
             # 2. R2 Check (Trend Strength)
             if r2_exit_enabled:
                 if curr_r2 < r2_thresh:
@@ -17740,7 +17750,7 @@ class SignalEngine(BaseEngine):
             if chop_exit_enabled and not can_exit_by_chop:
                 can_exit = False
                 block_reasons.append(f"Chop({curr_chop:.1f})>{chop_thresh}")
-            
+
             # 4. CC Check (Correlation)
             cc_exit_enabled = common_cfg.get('cc_exit_enabled', False)
             cc_thresh = common_cfg.get('cc_threshold', 0.70)
@@ -17756,15 +17766,15 @@ class SignalEngine(BaseEngine):
                 if not can_exit_by_cc:
                     can_exit = False
                     block_reasons.append(f"CC({curr_cc:.2f}) fail")
-            
+
             # [New] Update Pass/Fail Status based on logic above
             st['kalman_pass'] = (not kalman_exit_enabled) or \
                               (current_side.lower() == 'long' and kalman_vel < 0) or \
                               (current_side.lower() == 'short' and kalman_vel > 0)
             st['r2_pass'] = (not r2_exit_enabled) or (curr_r2 >= r2_thresh)
             st['chop_pass'] = (not chop_exit_enabled) or (curr_chop <= chop_thresh)
-            
-            
+
+
             # ===== 5. Execute Exit =====
             # Enabled exit filters are all mandatory. If one fails, exit is blocked.
 
@@ -17780,7 +17790,7 @@ class SignalEngine(BaseEngine):
                         logger.info(f"?썳截?[Exit {tf}] LONG Exit Blocked: {why} (Chop:{curr_chop:.1f}, CC:{curr_cc:.2f})")
                 else:
                     logger.debug(f"??[Exit {tf}] LONG Exit Ignored: raw exit signal not confirmed")
-            
+
             elif current_side.lower() == 'short':
                 if raw_exit_short:
                     if can_exit:
@@ -17794,7 +17804,7 @@ class SignalEngine(BaseEngine):
                 else:
                     logger.debug(f"??[Exit {tf}] SHORT Exit Ignored: raw exit signal not confirmed")
             return True
-                
+
         except Exception as e:
             logger.error(f"Process exit candle error: {e}")
             import traceback
@@ -17811,7 +17821,7 @@ class SignalEngine(BaseEngine):
         is_bullish = False
         is_bearish = False
         entry_reason = "신호 대기"
-        
+
         precomputed = precomputed or {}
 
         # Init state dicts if needed
@@ -17895,12 +17905,12 @@ class SignalEngine(BaseEngine):
         try:
             strategy_params = self.get_runtime_strategy_params()
             common_cfg = self.get_runtime_common_settings()
-            
+
             # A. Kalman Filter
             kalman_cfg = strategy_params.get('kalman_filter', {})
             kalman_exit_enabled = kalman_cfg.get('exit_enabled', False)
             kalman_vel = self._calculate_kalman_values(df, kalman_cfg)
-            
+
             # B. R2 Filter
             r2_exit_enabled = common_cfg.get('r2_exit_enabled', True)
             r2_thresh = common_cfg.get('r2_threshold', 0.25)
@@ -17909,7 +17919,7 @@ class SignalEngine(BaseEngine):
                 df['idx_seq'] = np.arange(len(df))
                 curr_r2 = (df['close'].rolling(14).corr(df['idx_seq']).iloc[-2]) ** 2
                 if np.isnan(curr_r2): curr_r2 = 0.0
-            
+
             # C. Chop Filter
             chop_exit_enabled = common_cfg.get('chop_exit_enabled', True)
             chop_thresh = common_cfg.get('chop_threshold', 50.0)
@@ -17917,14 +17927,14 @@ class SignalEngine(BaseEngine):
             if len(df) >= 14 and chop_exit_enabled:
                 try:
                     chop = df.ta.chop(length=14)
-                    if chop is not None: 
+                    if chop is not None:
                         curr_chop = chop.iloc[-2]
                         if np.isnan(curr_chop): curr_chop = 50.0
                     else:
                         logger.warning("?좑툘 Chop calculation returned None")
                 except Exception as e:
                     logger.error(f"??Chop calculation error (Exit): {e}")
-            
+
             # D. CC Filter (Correlation Coefficient)
             cc_exit_enabled = common_cfg.get('cc_exit_enabled', False)
             cc_thresh = common_cfg.get('cc_threshold', 0.70)
@@ -17935,7 +17945,7 @@ class SignalEngine(BaseEngine):
                     df['idx_seq'] = np.arange(len(df))
                 curr_cc = df['close'].rolling(cc_len).corr(df['idx_seq']).iloc[-2]
                 if np.isnan(curr_cc): curr_cc = 0.0
-            
+
             # Debug: CC Pass calculation
             cc_pass_result = (not cc_exit_enabled) or \
                            (current_side.lower() == 'long' and curr_cc < -cc_thresh) or \
@@ -17962,6 +17972,102 @@ class SignalEngine(BaseEngine):
 
     async def entry(self, symbol, side, price):
         try:
+            cfg = self.get_runtime_common_settings()
+            cfg = apply_runtime_safety_defaults(cfg)
+            try:
+                cfg = enforce_activation_stage(cfg)
+            except Exception as stage_err:
+                logger.error(f"Error enforcing activation stage: {stage_err}")
+                self.last_entry_reason[symbol] = f"Activation stage blocked: {stage_err}"
+                await self.ctrl.notify(f"⚠️ **진입 차단**: activation stage 오류 ({stage_err})")
+                return
+
+            try:
+                assert_trading_allowed(symbol, cfg)
+            except Exception as pause_err:
+                logger.error(f"Trading blocked by pause state: {pause_err}")
+                self.last_entry_reason[symbol] = f"Trading Blocked: {pause_err}"
+                await self.ctrl.notify(f"⚠️ **진입 차단**: {symbol} 거래 정지 상태 ({pause_err})")
+                return
+
+            if _normalize_live_real_stage(cfg.get("live_activation_stage")) == "LIVE_REAL_SMALL_CAP":
+                try:
+                    await self.preflight_live_real_check(symbol, cfg)
+                except Exception as safety_err:
+                    logger.error(f"Live real preflight blocked entry: {safety_err}")
+                    self.last_entry_reason[symbol] = f"Live real preflight blocked: {safety_err}"
+                    await self.ctrl.notify(f"⚠️ **실거래 진입 차단**: {symbol} ({safety_err})")
+                    return
+
+            if cfg.get("live_parity_signal_enabled", False):
+                logger.info(f"[Live Parity] Attempting {side.upper()} final trade decision for {symbol} @ {price}")
+
+                rows = await self._fetch_live_ohlcv_rows_for_context(symbol, cfg)
+                if not rows or len(rows) < int(cfg.get("live_context_min_bars", 80)):
+                    logger.warning("[Live Parity] insufficient OHLCV rows for context: %s", symbol)
+                    self.last_entry_reason[symbol] = "NO_TRADE: insufficient live OHLCV context"
+                    return
+
+                idx = len(rows) - 1
+
+                indicator_values = await self._build_live_indicator_values(
+                    symbol=symbol,
+                    side=side,
+                    rows=rows,
+                    idx=idx,
+                    cfg=cfg,
+                )
+
+                context = build_market_context(
+                    rows=rows,
+                    idx=idx,
+                    symbol=symbol,
+                    timeframe=cfg.get("timeframe", "15m"),
+                    values=indicator_values,
+                    config=cfg,
+                )
+
+                context = self._validate_live_context_or_block(symbol, context, cfg)
+                if context is None:
+                    self.last_entry_reason[symbol] = "NO_TRADE: invalid live context"
+                    return
+
+                models = getattr(self, "models", None) or {}
+                stats = ENGINE_PERFORMANCE_STATS
+
+                decision = evaluate_final_trade_decision(
+                    context=context,
+                    config=cfg,
+                    models=models,
+                    stats=stats
+                )
+
+                if not decision.valid:
+                    logger.info(f"[Live Parity] Decision invalid: {decision.reasons}")
+                    self.last_entry_reason[symbol] = f"Decision Invalid: {decision.reasons}"
+                    await self.ctrl.notify(f"⚠️ **진입 판정 거부**: {symbol} Parity 거절 ({decision.reasons})")
+                    return
+
+                if str(decision.side).upper() != str(side).upper():
+                    logger.warning(f"[Live Parity] Side conflict: side={side}, decision={decision.side}")
+                    return
+
+                try:
+                    account_equity = await self._fetch_futures_account_equity(cfg)
+                    plan = build_live_order_plan_from_decision(
+                        symbol,
+                        decision,
+                        context,
+                        cfg,
+                        account_equity=account_equity,
+                    )
+                except Exception as err:
+                    logger.error(f"[Live Parity] Order plan error: {err}")
+                    await self.ctrl.notify(f"⚠️ **주문 계획 생성 오류**: {err}")
+                    return
+
+                result = await self.execute_live_order_plan(plan, cfg)
+                return result
             if not self.is_trade_direction_allowed(side):
                 block_reason = self.format_trade_direction_block_reason(side)
                 display_symbol = self.ctrl.format_symbol_for_display(symbol)
@@ -17986,7 +18092,7 @@ class SignalEngine(BaseEngine):
                     if float(p.get('contracts', 0)) > 0:
                         active_sym = p.get('symbol', '').replace(':USDT', '').replace('/', '')
                         target_sym = symbol.replace(':USDT', '').replace('/', '')
-                        
+
                         if active_sym != target_sym:
                             logger.warning(f"?슟 [Single Limit] Entry blocked: Already holding {p['symbol']}")
                             await self.ctrl.notify(f"⚠️ **진입 차단**: 단일 포지션 제한 (보유 중: {p['symbol']})")
@@ -17996,7 +18102,7 @@ class SignalEngine(BaseEngine):
                 return # ?덉쟾???꾪빐 ?뺤씤 ?ㅽ뙣 ??吏꾩엯 以묐떒
 
             logger.info(f"?뱿 [Signal] Attempting {side.upper()} entry @ {price}")
-            
+
             cfg = self.get_runtime_common_settings()
             strategy_params = self.get_runtime_strategy_params()
             active_strategy = strategy_params.get('active_strategy', '').lower()
@@ -18037,9 +18143,9 @@ class SignalEngine(BaseEngine):
             req_risk_pct = float(cfg.get('risk_per_trade_pct', DEFAULT_RISK_PER_TRADE_PERCENT) or DEFAULT_RISK_PER_TRADE_PERCENT)
             bounded_risk_pct = normalize_risk_percent(cfg)
             risk_pct = bounded_risk_pct / 100.0
-            
+
             _, free, _ = await self.get_balance_info()
-            
+
             if free <= 0:
                 logger.warning(f"Insufficient balance: {free}")
                 await self.ctrl.notify(f"⚠️ 잔고 부족: ${free:.2f}")
@@ -18057,7 +18163,7 @@ class SignalEngine(BaseEngine):
             def _pick_min_positive(values):
                 parsed = [x for x in (_safe_float(v) for v in values) if x is not None]
                 return min(parsed) if parsed else 0.0
-            
+
             safety_buffer = 0.98
             if active_strategy in UTBREAKOUT_STRATEGIES:
                 if not filtered_breakout_plan:
@@ -18213,12 +18319,12 @@ class SignalEngine(BaseEngine):
                         "레버리지/진입비율을 높여주세요."
                     )
                 return
-            
+
             if float(qty) <= 0:
                 logger.warning(f"Invalid quantity: {qty} (free={free}, risk={risk_pct}, lev={lev}, price={price}, target_notional={target_notional})")
                 await self.ctrl.notify(f"⚠️ 주문 수량 계산 오류: {qty} (잔고: {free:.2f})")
                 return
-            
+
             if active_strategy not in UTBREAKOUT_STRATEGIES and bounded_risk_pct != req_risk_pct:
                 await self.ctrl.notify(f"⚠️ 리스크 상한 적용: {req_risk_pct:.2f}% -> {bounded_risk_pct:.2f}%")
             if active_strategy in UTBREAKOUT_STRATEGIES:
@@ -18265,23 +18371,23 @@ class SignalEngine(BaseEngine):
                 )
                 self._clear_utbot_filtered_breakout_entry_plan(symbol)
                 return
-            
+
             # [Enforce] Market Settings (Isolated + Leverage)
             await self.ensure_market_settings(symbol, leverage=lev)
-            
+
             # await asyncio.to_thread(self.exchange.set_leverage, lev, symbol) # Redundant, handled above
             order = await asyncio.to_thread(
-                self.exchange.create_order, symbol, 'market', 
+                self.exchange.create_order, symbol, 'market',
                 'buy' if side == 'long' else 'sell', qty
             )
-            
+
             # 罹먯떆 ?꾩쟾 臾댄슚??
             self.position_cache = None
             self.position_cache_time = 0
-            
+
             self.db.log_trade_entry(symbol, side, price, float(qty))
             logger.info(f"??Entry order success: {order.get('id', 'N/A')}")
-            
+
             # 吏꾩엯 ???ъ????뺤씤?섏뿬 ?뺥솗??吏꾩엯媛 ?뚯븙
             await asyncio.sleep(1)
             self.position_cache = None
@@ -18300,7 +18406,7 @@ class SignalEngine(BaseEngine):
                     margin_to_use=margin_to_use
                 )
             )
-            
+
             # ===== ?꾨왂蹂?TP/SL ?ㅼ젙 =====
             if active_strategy == 'microvbo':
                 # MicroVBO: ATR 湲곕컲 TP/SL 二쇰Ц
@@ -18310,12 +18416,12 @@ class SignalEngine(BaseEngine):
                     vbo_cfg = strategy_params.get('MicroVBO', {})
                     tp_mult = vbo_cfg.get('tp_atr_multiplier', 1.0)
                     sl_mult = vbo_cfg.get('sl_atr_multiplier', 0.5)
-                    
+
                     await self._place_tp_sl_orders(symbol, side, actual_entry_price, qty,
-                                                   self.vbo_entry_atr * tp_mult, 
+                                                   self.vbo_entry_atr * tp_mult,
                                                    self.vbo_entry_atr * sl_mult)
                     logger.info(f"?뮶 [MicroVBO] Entry state saved: price={actual_entry_price:.2f}, ATR={self.vbo_entry_atr:.2f}")
-            
+
             elif active_strategy == 'fractalfisher':
                 # FractalFisher: Trailing Stop (?뚰봽?몄썾??湲곕컲 ?좎? - ?숈쟻?대?濡?
                 if self.fisher_entry_atr:
@@ -18525,7 +18631,7 @@ class SignalEngine(BaseEngine):
                         }
                     )
                 self._clear_utbot_filtered_breakout_entry_plan(symbol)
-            
+
             else:
                 # SMA/HMA: ?쇱꽱??湲곕컲 TP/SL 二쇰Ц
                 tp_master_enabled = bool(cfg.get('tp_sl_enabled', True))
@@ -18547,12 +18653,12 @@ class SignalEngine(BaseEngine):
                             tp_distance=tp_distance,
                             sl_distance=sl_distance
                         )
-            
+
             if verify_pos:
                 logger.info(f"??Position verified: {verify_pos['side']} {verify_pos['contracts']}")
             else:
                 logger.warning("?좑툘 Position not found after entry (may take time to update)")
-            
+
         except Exception as e:
             logger.error(f"Signal entry error: {e}")
             import traceback
@@ -19504,6 +19610,16 @@ class SignalEngine(BaseEngine):
             'error': str(last_error) if last_error else 'position still open',
         })
         try:
+            write_critical_pause_state(
+                symbol=symbol,
+                reason="SL_FAILED_AND_EMERGENCY_CLOSE_FAILED",
+                exception=last_error if last_error else RuntimeError("position still open"),
+                cfg=self.get_runtime_common_settings() if hasattr(self, "get_runtime_common_settings") else None,
+            )
+        except Exception as persist_error:
+            logger.error(f"Failed to persist CRITICAL_PAUSED state for {symbol}: {persist_error}")
+
+        try:
             self.critical_pause_reason = f"Emergency close failed after SL placement failure: {status['error']}"
             self.critical_pause_status = dict(status)
             if getattr(self, 'ctrl', None) is not None and hasattr(self.ctrl, 'is_paused'):
@@ -19773,7 +19889,7 @@ class SignalEngine(BaseEngine):
             'atr_trailing_multiplier': trailing_mult,
             'atr_trailing_breakeven_enabled': bool(cfg.get('atr_trailing_breakeven_enabled', state.get('breakeven_enabled', True))),
         })
-        if bool(cfg.get('runner_exit_enabled', state.get('runner_exit_enabled', True))) and bool(cfg.get('runner_chandelier_enabled', state.get('runner_chandelier_enabled', True))):
+        if bool(cfg.get('runner_exit_enabled', state.get('runner_exit_enabled', False))) and bool(cfg.get('runner_chandelier_enabled', state.get('runner_chandelier_enabled', False))):
             lookback = max(
                 int(cfg.get('runner_chandelier_lookback', state.get('runner_chandelier_lookback', 22)) or 22),
                 int(cfg.get('runner_structure_lookback', state.get('runner_structure_lookback', 5)) or 5),
@@ -20106,7 +20222,7 @@ class SignalEngine(BaseEngine):
                         f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} {target_label} 주문 생성 실패. SL은 유지됩니다: {tp_e}",
                         cooldown_sec=60
                     )
-            
+
             notice_parts = []
             for target in valid_tp_targets:
                 notice_parts.append(
@@ -20125,7 +20241,7 @@ class SignalEngine(BaseEngine):
                 expected_sl=sl_price is not None,
                 alert=True
             )
-            
+
         except Exception as e:
             logger.error(f"TP/SL order placement error: {e}")
 
@@ -20134,14 +20250,14 @@ class SignalEngine(BaseEngine):
         if self.is_upbit_mode():
             await self._exit_upbit_spot(symbol, reason)
             return
-        
+
         # 癒쇱? TP/SL 二쇰Ц 痍⑥냼 (?덈뒗 寃쎌슦)
         try:
             await self._cancel_all_orders_variants(symbol, reason=f'before exit: {reason}')
             await self._cancel_protection_orders(symbol, reason=f'before exit: {reason}')
         except Exception as cancel_e:
             logger.warning(f"Order cancellation failed (may have none): {cancel_e}")
-        
+
         # 罹먯떆 臾댄슚?????ъ????뺤씤
         self.position_cache = None
         pos = await self.get_server_position(symbol, use_cache=False)
@@ -20149,7 +20265,7 @@ class SignalEngine(BaseEngine):
             logger.info("No position to exit")
             await self._cancel_protection_orders(symbol, reason='exit requested but no position')
             return
-        
+
         contracts = abs(float(pos.get('contracts', 0) or 0))
         if contracts <= 0:
             logger.info("No contracts to exit")
@@ -20234,7 +20350,7 @@ class SignalEngine(BaseEngine):
             if isinstance(order, dict) and order.get('average')
             else float(initial_pos.get('markPrice', 0) or 0)
         )
-        
+
         # 罹먯떆 ?꾩쟾 臾댄슚??
         self.position_cache = None
         self.position_cache_time = 0
@@ -20253,7 +20369,7 @@ class SignalEngine(BaseEngine):
             self._clear_utsmc_entry_invalidation(symbol)
             self._clear_utsmc_fixed_exit_ob(symbol)
             self.utsmc_last_entry_signal_ts.pop(symbol, None)
-        
+
         self.db.log_trade_close(symbol, pnl, pnl_pct, exit_price, reason)
         self._clear_utbreakout_trailing_state(symbol, finalize=True, reason=reason, exit_price=exit_price)
         await self.ctrl.notify(
@@ -20332,7 +20448,7 @@ class ShannonEngine(BaseEngine):
         self.last_indicator_update = 0
         self.ratio = controller.cfg.get('shannon_engine', {}).get('asset_allocation', {}).get('target_ratio', 0.5)
         self.grid_orders = []
-        
+
         # 吏??罹먯떆
         self.ema_200 = None
         self.atr_value = None
@@ -20357,22 +20473,22 @@ class ShannonEngine(BaseEngine):
         """
         if not self.running:
             return
-        
+
         try:
             symbol = self._get_target_symbol()
-            
+
             # ?꾩옱 媛寃?議고쉶 (ticker ?ъ슜)
             ticker = await asyncio.to_thread(self.exchange.fetch_ticker, symbol)
             price = float(ticker['last'])
-            
+
             # 由щ갭?곗떛 濡쒖쭅 ?ㅽ뻾 (1珥?媛꾧꺽 ?쒗븳)
             if time.time() - self.last_logic_time > 1.0:
                 await self.logic(symbol, price)
                 self.last_logic_time = time.time()
-                
+
         except Exception as e:
             logger.error(f"Shannon poll_tick error: {e}")
-    
+
     def _get_target_symbol(self):
         """config?먯꽌 target_symbol 媛?몄삤湲?"""
         return self.cfg.get('shannon_engine', {}).get('target_symbol', 'BTC/USDT')
@@ -20380,23 +20496,23 @@ class ShannonEngine(BaseEngine):
     async def update_indicators(self, symbol):
         """200 EMA? ATR ?낅뜲?댄듃"""
         now = time.time()
-        
+
         # 泥??ㅽ뻾?닿굅??罹먯떆 留뚮즺 ???낅뜲?댄듃
         # trend_direction??None?대㈃ 媛뺤젣 ?낅뜲?댄듃 (泥?吏꾩엯 ?꾪빐)
         if self.trend_direction is not None and now - self.last_indicator_update < self.INDICATOR_UPDATE_INTERVAL:
             return  # 罹먯떆 ?ъ슜
-        
+
         try:
             cfg = self.cfg.get('shannon_engine', {})
             # Shannon??timeframe ?ㅼ젙???놁쑝硫?signal_engine ?ㅼ젙 ?ъ슜
             tf = cfg.get('timeframe') or self.cfg.get('signal_engine', {}).get('common_settings', {}).get('timeframe', '15m')
-            
+
             # OHLCV ?곗씠??媛?몄삤湲?(200 EMA 怨꾩궛???꾪빐 理쒖냼 250媛?
             ohlcv = await asyncio.to_thread(
                 self.exchange.fetch_ohlcv, symbol, tf, limit=250
             )
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            
+
             # 200 EMA 怨꾩궛
             trend_cfg = cfg.get('trend_filter', {})
             if trend_cfg.get('enabled', True):
@@ -20405,7 +20521,7 @@ class ShannonEngine(BaseEngine):
                 self.ema_200 = df['ema'].iloc[-1]
                 # trend_direction? logic()?먯꽌 ?ㅼ떆媛?媛寃⑹쑝濡?寃곗젙
                 logger.info(f"?뱤 {tf} 200 EMA ?낅뜲?댄듃: {self.ema_200:.2f}")
-            
+
             # ATR 怨꾩궛
             atr_cfg = cfg.get('atr_settings', {})
             if atr_cfg.get('enabled', True):
@@ -20413,46 +20529,46 @@ class ShannonEngine(BaseEngine):
                 df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=atr_period)
                 self.atr_value = df['atr'].iloc[-1]
                 logger.info(f"?뱤 ATR({atr_period}): {self.atr_value:.2f}")
-            
+
             self.last_indicator_update = now
-            
+
         except Exception as e:
             logger.error(f"Indicator update error: {e}")
 
     def get_drawdown_multiplier(self, total_equity, daily_pnl):
         """?쒕줈?곕떎??湲곕컲 由ъ뒪???뱀닔 怨꾩궛"""
         cfg = self.cfg.get('shannon_engine', {}).get('drawdown_protection', {})
-        
+
         if not cfg.get('enabled', True):
             return 1.0
-        
+
         threshold_pct = cfg.get('threshold_pct', 3.0)
         reduction_factor = cfg.get('reduction_factor', 0.5)
-        
+
         # ?쇱씪 ?먯떎瑜?怨꾩궛
         if total_equity > 0:
             daily_loss_pct = abs(min(0, daily_pnl)) / total_equity * 100
         else:
             daily_loss_pct = 0
-        
+
         if daily_loss_pct >= threshold_pct:
             logger.warning(f"?좑툘 Drawdown protection: {daily_loss_pct:.2f}% loss ??{reduction_factor*100:.0f}% size")
             return reduction_factor
-        
+
         return 1.0
 
     async def logic(self, symbol, price):
         try:
             # 吏???낅뜲?댄듃
             await self.update_indicators(symbol)
-            
+
             total, free, mmr = await self.get_balance_info()
             count, daily_pnl = self.db.get_daily_stats()
             pos = await self.get_server_position(symbol)
-            
+
             # ?쒕줈?곕떎???뱀닔 怨꾩궛
             dd_multiplier = self.get_drawdown_multiplier(total, daily_pnl)
-            
+
             coin_amt = float(pos['contracts']) if pos else 0.0
             coin_val = abs(coin_amt * price)
             diff = coin_val - (total * self.ratio)
@@ -20481,14 +20597,14 @@ class ShannonEngine(BaseEngine):
 
             if self.ctrl.is_paused:
                 return
-            
+
             # ?쇱씪 ?먯떎 ?쒕룄 泥댄겕
             if await self.check_daily_loss_limit():
                 return
-            
+
             cfg = self.cfg.get('shannon_engine', {})
             trend_cfg = cfg.get('trend_filter', {})
-            
+
             # ============ ?ㅼ떆媛?媛寃?湲곗? 異붿꽭 諛⑺뼢 寃곗젙 ============
             if trend_cfg.get('enabled', True) and self.ema_200 is not None:
                 if price > self.ema_200:
@@ -20496,7 +20612,7 @@ class ShannonEngine(BaseEngine):
                 else:
                     self.trend_direction = 'short'
                 logger.info(f"?뱤 ?꾩옱媛 {price:.2f} vs 200 EMA {self.ema_200:.2f} ??{self.trend_direction.upper()}")
-            
+
             # ============ 珥덇린 吏꾩엯 濡쒖쭅 (200 EMA 湲곕컲) ============
             # ?ъ??섏씠 ?놁쓣 ??200 EMA 諛⑺뼢?쇰줈 珥덇린 吏꾩엯
             if not pos and trend_cfg.get('enabled', True) and self.trend_direction:
@@ -20506,15 +20622,15 @@ class ShannonEngine(BaseEngine):
                    (d_mode == 'short' and self.trend_direction == 'long'):
                     logger.info(f"??[Shannon] Entry blocked by direction filter: {d_mode}")
                     return  # ?꾪꽣???섑빐 吏꾩엯 李⑤떒
-                
+
                 target_value = total * self.ratio * dd_multiplier  # 紐⑺몴 50%
                 entry_qty = self.safe_amount(symbol, target_value / price)
-                
+
                 if float(entry_qty) > 0:
                     # ?덈쾭由ъ? ?ㅼ젙 ?곸슜
                     lev = cfg.get('leverage', 5)
                     await asyncio.to_thread(self.exchange.set_leverage, lev, symbol)
-                    
+
                     if self.trend_direction == 'long':
                         # 200 EMA ????濡?吏꾩엯
                         order = await asyncio.to_thread(
@@ -20526,7 +20642,7 @@ class ShannonEngine(BaseEngine):
                         self.db.log_shannon(total, "ENTRY_LONG", price, float(entry_qty), total)
                         logger.info(f"Shannon initial LONG entry: {order}")
                         return
-                    
+
                     elif self.trend_direction == 'short':
                         # 200 EMA ?꾨옒 ????吏꾩엯
                         order = await asyncio.to_thread(
@@ -20538,7 +20654,7 @@ class ShannonEngine(BaseEngine):
                         self.db.log_shannon(total, "ENTRY_SHORT", price, float(entry_qty), total)
                         logger.info(f"Shannon initial SHORT entry: {order}")
                         return
-            
+
             # ============ 異붿꽭 諛섏쟾 媛먯?: ?ъ???泥?궛 ???ъ쭊??============
             reversed_position = False
             if pos and trend_cfg.get('enabled', True) and self.trend_direction:
@@ -20554,19 +20670,19 @@ class ShannonEngine(BaseEngine):
                     await self._close_and_reverse(symbol, pos, price, 'long', total, dd_multiplier)
                     reversed_position = True
                     pos = await self.get_server_position(symbol, use_cache=False)
-            
+
             # ============ Grid Trading (ATR 湲곕컲 媛꾧꺽) ============
             grid_cfg = cfg.get('grid_trading', {})
             if grid_cfg.get('enabled', False):
                 await self.manage_grid_orders(symbol, price, grid_cfg, dd_multiplier)
-            
+
             # ============ Rebalance (鍮꾩쑉 ?좎?) ============
             threshold = cfg.get('asset_allocation', {}).get('allowed_deviation_pct', 2.0)
             if abs(diff_pct) > threshold and pos:
                 current_side = pos['side']
                 contracts = abs(float(pos['contracts']))
                 target_contracts = (total * self.ratio) / price  # 紐⑺몴 怨꾩빟 ??
-                
+
                 if current_side == 'long':
                     # 濡??ъ???由щ갭?곗떛
                     if contracts > target_contracts:
@@ -20621,9 +20737,9 @@ class ShannonEngine(BaseEngine):
                                 logger.info(f"Rebalance SELL (add short): {order}")
                         else:
                             logger.info(f"??[Short] ?뺣? 李⑤떒: 異붿꽭媛 {self.trend_direction}")
-                
+
                 self.db.log_shannon(total, "REBAL", price, coin_amt, total)
-                    
+
         except Exception as e:
             logger.error(f"Shannon logic error: {e}")
 
@@ -20645,26 +20761,26 @@ class ShannonEngine(BaseEngine):
                 self.position_cache = None
                 self.position_cache_time = 0
                 return
-            
+
             # 湲곗〈 ?ъ???泥?궛
             close_qty = self.safe_amount(symbol, abs(float(pos['contracts'])))
             close_side = 'sell' if pos['side'] == 'long' else 'buy'
-            
+
             await asyncio.to_thread(
                 self.exchange.create_order, symbol, 'market', close_side, close_qty
             )
-            
+
             pnl = float(pos.get('unrealizedPnl', 0))
             await self.ctrl.notify(f"🔄 [Shannon] {pos['side'].upper()} 청산 (추세 반전) PnL: {pnl:+.2f}")
-            
+
             # 泥?궛 ?꾨즺 ?湲?
             await asyncio.sleep(2.0)  # 2珥??湲?
-            
+
             # 諛섎? 諛⑺뼢 ???ъ???吏꾩엯
             target_value = total * self.ratio * dd_multiplier
             entry_qty = self.safe_amount(symbol, target_value / price)
             entry_side = 'buy' if new_direction == 'long' else 'sell'
-            
+
             if float(entry_qty) > 0:
                 await asyncio.to_thread(
                     self.exchange.create_order, symbol, 'market', entry_side, entry_qty
@@ -20673,7 +20789,7 @@ class ShannonEngine(BaseEngine):
                 self.position_cache_time = 0
                 await self.ctrl.notify(f"✅ [Shannon] {new_direction.upper()} 진입 {entry_qty} @ {price:.2f}")
                 self.db.log_shannon(total, f"REVERSE_{new_direction.upper()}", price, float(entry_qty), total)
-                
+
         except Exception as e:
             logger.error(f"Shannon close and reverse error: {e}")
 
@@ -20682,17 +20798,17 @@ class ShannonEngine(BaseEngine):
         try:
             levels = grid_cfg.get('grid_levels', 5)
             base_order_size = grid_cfg.get('order_size_usdt', 20)
-            
+
             # ?쒕줈?곕떎??蹂댄샇 ?곸슜
             order_size = base_order_size * dd_multiplier
-            
+
             # ?덈쾭由ъ? ?ㅼ젙 ?뺤씤 (Grid 二쇰Ц?먮룄 ?숈씪?섍쾶 ?곸슜)
             lev = self.cfg.get('shannon_engine', {}).get('leverage', 5)
             try:
                 await asyncio.to_thread(self.exchange.set_leverage, lev, symbol)
             except Exception:
                 pass  # ?대? ?ㅼ젙??寃쎌슦 臾댁떆
-            
+
             # ATR 湲곕컲 洹몃━??媛꾧꺽 怨꾩궛
             atr_cfg = self.cfg.get('shannon_engine', {}).get('atr_settings', {})
             if atr_cfg.get('enabled', True) and self.atr_value:
@@ -20703,25 +20819,25 @@ class ShannonEngine(BaseEngine):
             else:
                 # ATR ?놁쑝硫?湲곕낯媛??ъ슜
                 step_pct = 0.005  # 0.5%
-            
+
             # 200 EMA 諛⑺뼢 ?꾪꽣 ?곸슜
             trend_cfg = self.cfg.get('shannon_engine', {}).get('trend_filter', {})
             allow_buy = True
             allow_sell = True
-            
+
             if trend_cfg.get('enabled', True) and self.trend_direction:
                 if self.trend_direction == 'short':
                     allow_buy = False  # ?섎씫 異붿꽭: 留ㅼ닔 二쇰Ц 湲덉?
                 elif self.trend_direction == 'long':
                     allow_sell = False  # ?곸듅 異붿꽭: 留ㅻ룄 二쇰Ц 湲덉?
-            
+
             # 湲곗〈 洹몃━??二쇰Ц ?곹깭 ?뺤씤
             try:
                 open_orders = await asyncio.to_thread(self.exchange.fetch_open_orders, symbol)
             except Exception as e:
                 logger.error(f"Fetch open orders error: {e}")
                 return
-            
+
             # #5 Fix: ?꾩옱 媛寃⑹뿉???덈Т 硫?댁쭊 二쇰Ц 痍⑥냼 (媛寃⑹쓽 5% ?댁긽)
             max_distance_pct = 0.05
             for order in open_orders:
@@ -20733,12 +20849,12 @@ class ShannonEngine(BaseEngine):
                         logger.info(f"Grid order cancelled (too far): {order['side']} @ {order_price:.2f} ({distance*100:.1f}% away)")
                 except Exception as e:
                     logger.error(f"Cancel distant order error: {e}")
-            
+
             # ?꾩옱 ?ъ????뺤씤 (#10 Fix)
             pos = await self.get_server_position(symbol, use_cache=True)
             has_long_position = pos and pos['side'] == 'long' and float(pos['contracts']) > 0
             has_short_position = pos and pos['side'] == 'short' and abs(float(pos['contracts'])) > 0
-            
+
             # 洹몃━??二쇰Ц 諛⑺뼢 寃곗젙 (?ъ???湲곕컲)
             # - 濡??ъ??? 留ㅻ룄 二쇰Ц ?덉슜 (?듭젅/泥?궛??, 留ㅼ닔 二쇰Ц???덉슜 (異붽? 吏꾩엯)
             # - ???ъ??? 留ㅼ닔 二쇰Ц ?덉슜 (?듭젅/泥?궛??, 留ㅻ룄 二쇰Ц???덉슜 (異붽? 吏꾩엯)
@@ -20755,28 +20871,28 @@ class ShannonEngine(BaseEngine):
                     allow_buy = False  # ??異붿꽭: 留ㅼ닔 湲덉?
                 elif self.trend_direction == 'long':
                     allow_sell = False  # 濡?異붿꽭: 留ㅻ룄 湲덉?
-            
+
             # 洹몃━??二쇰Ц??遺議깊븯硫??덈줈 ?앹꽦
             if len(open_orders) < levels * 2:
                 for i in range(1, levels + 1):
                     # 留ㅼ닔 二쇰Ц (?꾩옱媛 ?꾨옒)
                     buy_price = price * (1 - step_pct * i)
                     buy_qty = self.safe_amount(symbol, order_size / buy_price)
-                    
+
                     # 留ㅻ룄 二쇰Ц (?꾩옱媛 ??
                     sell_price = price * (1 + step_pct * i)
                     sell_qty = self.safe_amount(symbol, order_size / sell_price)
-                    
+
                     # 以묐났 泥댄겕
                     buy_exists = any(
-                        abs(float(o['price']) - buy_price) / buy_price < 0.002 
+                        abs(float(o['price']) - buy_price) / buy_price < 0.002
                         for o in open_orders if o['side'] == 'buy'
                     )
                     sell_exists = any(
-                        abs(float(o['price']) - sell_price) / sell_price < 0.002 
+                        abs(float(o['price']) - sell_price) / sell_price < 0.002
                         for o in open_orders if o['side'] == 'sell'
                     )
-                    
+
                     # 留ㅼ닔 二쇰Ц (異붿꽭 ?꾪꽣 ?곸슜)
                     if allow_buy and not buy_exists and float(buy_qty) > 0:
                         try:
@@ -20787,7 +20903,7 @@ class ShannonEngine(BaseEngine):
                             logger.info(f"Grid BUY: {buy_qty} @ {buy_price:.2f} (ATR step: {step_pct*100:.2f}%)")
                         except Exception as e:
                             logger.error(f"Grid buy order error: {e}")
-                    
+
                     # 留ㅻ룄 二쇰Ц (異붿꽭 ?꾪꽣 + ?ъ???泥댄겕 ?곸슜)
                     if allow_sell and not sell_exists and float(sell_qty) > 0:
                         try:
@@ -20798,9 +20914,9 @@ class ShannonEngine(BaseEngine):
                             logger.info(f"Grid SELL: {sell_qty} @ {sell_price:.2f} (ATR step: {step_pct*100:.2f}%)")
                         except Exception as e:
                             logger.error(f"Grid sell order error: {e}")
-            
+
             self.grid_orders = open_orders
-            
+
         except Exception as e:
             logger.error(f"Grid trading error: {e}")
 
@@ -20812,14 +20928,14 @@ class DualThrustEngine(BaseEngine):
         self.last_heartbeat = 0
         self.last_trigger_update = 0
         self.consecutive_errors = 0
-        
+
         # ?몃━嫄?罹먯떆
         self.today_open = None
         self.range_value = None
         self.long_trigger = None
         self.short_trigger = None
         self.trigger_date = None  # ?몃━嫄?怨꾩궛 ?좎쭨 (?ㅻ쾭?섏엲 由ъ뀑??
-        
+
         self.TRIGGER_UPDATE_INTERVAL = 60  # 60珥덈쭏??泥댄겕 (??蹂寃??뺤씤)
 
     def start(self):
@@ -20839,17 +20955,17 @@ class DualThrustEngine(BaseEngine):
         """[?쒖닔 ?대쭅] Dual Thrust 硫붿씤 ?대쭅"""
         if not self.running:
             return
-        
+
         try:
             symbol = self._get_target_symbol()
-            
+
             # ?꾩옱 媛寃?議고쉶
             ticker = await asyncio.to_thread(self.exchange.fetch_ticker, symbol)
             price = float(ticker['last'])
-            
+
             # ?몃━嫄??낅뜲?댄듃 (?섎（ 蹂寃???媛깆떊)
             await self._update_triggers(symbol)
-            
+
             # ?섑듃鍮꾪듃 (30珥덈쭏??
             now = time.time()
             if now - self.last_heartbeat > 30:
@@ -20858,11 +20974,11 @@ class DualThrustEngine(BaseEngine):
                 logger.info(f"?뮄 [DualThrust] Heartbeat: running={self.running}, paused={self.ctrl.is_paused}, pos={pos_side}, price={price:.2f}")
                 if self.long_trigger and self.short_trigger:
                     logger.info(f"?뱤 [DualThrust] Triggers: Long={self.long_trigger:.2f}, Short={self.short_trigger:.2f}, Range={self.range_value:.2f}")
-            
+
             # ?곹깭 ?낅뜲?댄듃 + 留ㅻℓ 濡쒖쭅
             await self._logic(symbol, price)
             self.consecutive_errors = 0
-            
+
         except Exception as e:
             self.consecutive_errors += 1
             logger.error(f"DualThrust poll_tick error ({self.consecutive_errors}x): {e}")
@@ -20875,53 +20991,53 @@ class DualThrustEngine(BaseEngine):
         """N???쇰큺?쇰줈 Range 怨꾩궛 諛??몃━嫄??낅뜲?댄듃"""
         now = datetime.now(timezone.utc)
         today_str = now.strftime('%Y-%m-%d')
-        
+
         # ?대? ?ㅻ뒛 怨꾩궛?덉쑝硫??ㅽ궢
         if self.trigger_date == today_str and self.long_trigger and self.short_trigger:
             return
-        
+
         try:
             cfg = self.cfg.get('dual_thrust_engine', {})
             n_days = cfg.get('n_days', 4)
             k1 = cfg.get('k1', 0.5)
             k2 = cfg.get('k2', 0.5)
-            
+
             # ?쇰큺 ?곗씠??媛?몄삤湲?(N+1媛? 怨쇨굅 N??+ ?ㅻ뒛)
             ohlcv = await asyncio.to_thread(
                 self.exchange.fetch_ohlcv, symbol, '1d', limit=n_days + 1
             )
-            
+
             if len(ohlcv) < n_days + 1:
                 logger.warning(f"[DualThrust] Insufficient daily data: {len(ohlcv)} < {n_days + 1}")
                 return
-            
+
             # 怨쇨굅 N???곗씠??(?ㅻ뒛 ?쒖쇅)
             past_n = ohlcv[:-1][-n_days:]
-            
+
             # HH, HC, LC, LL 怨꾩궛
             highs = [candle[2] for candle in past_n]
             lows = [candle[3] for candle in past_n]
             closes = [candle[4] for candle in past_n]
-            
+
             hh = max(highs)  # Highest High
             hc = max(closes)  # Highest Close
             lc = min(closes)  # Lowest Close
             ll = min(lows)  # Lowest Low
-            
+
             # Range = max(HH - LC, HC - LL)
             self.range_value = max(hh - lc, hc - ll)
-            
+
             # ?뱀씪 ?쒓? (?ㅻ뒛 罹붾뱾)
             self.today_open = ohlcv[-1][1]
-            
+
             # ?몃━嫄?怨꾩궛
             self.long_trigger = self.today_open + (self.range_value * k1)
             self.short_trigger = self.today_open - (self.range_value * k2)
             self.trigger_date = today_str
-            
+
             logger.info(f"?뱢 [DualThrust] Triggers Updated: Open={self.today_open:.2f}, Range={self.range_value:.2f}")
             logger.info(f"   Long Trigger: {self.long_trigger:.2f}, Short Trigger: {self.short_trigger:.2f}")
-            
+
         except Exception as e:
             logger.error(f"DualThrust trigger update error: {e}")
 
@@ -20931,7 +21047,7 @@ class DualThrustEngine(BaseEngine):
             total, free, mmr = await self.get_balance_info()
             count, daily_pnl = self.db.get_daily_stats()
             pos = await self.get_server_position(symbol)
-            
+
             # ?곹깭 ?곗씠???낅뜲?댄듃 (Symbol Keyed)
             self.ctrl.status_data[symbol] = {
                 'engine': 'DualThrust', 'symbol': symbol, 'price': price,
@@ -20948,27 +21064,27 @@ class DualThrustEngine(BaseEngine):
                 'range': self.range_value,
                 'today_open': self.today_open
             }
-            
+
             # MMR 寃쎄퀬
             await self.check_mmr_alert(mmr)
-            
+
             if self.ctrl.is_paused:
                 return
-            
+
             # ?쇱씪 ?먯떎 ?쒕룄
             if await self.check_daily_loss_limit():
                 return
-            
+
             # ?몃━嫄곌? ?놁쑝硫??湲?
             if not self.long_trigger or not self.short_trigger:
                 logger.debug("[DualThrust] Waiting for trigger calculation...")
                 return
-            
+
             # 留ㅻℓ 諛⑺뼢 ?꾪꽣
             d_mode = self.cfg.get('system_settings', {}).get('trade_direction', 'both')
-            
+
             current_side = pos['side'] if pos else None
-            
+
             # 濡??몃━嫄??뚰뙆
             if price > self.long_trigger:
                 if d_mode != 'short':  # ???꾩슜 ?꾨땲硫?
@@ -20978,7 +21094,7 @@ class DualThrustEngine(BaseEngine):
                     elif not pos:
                         # ?ъ????놁쑝硫?濡?吏꾩엯
                         await self._entry(symbol, 'long', price, total)
-            
+
             # ???몃━嫄??댄깉
             elif price < self.short_trigger:
                 if d_mode != 'long':  # 濡??꾩슜 ?꾨땲硫?
@@ -20988,7 +21104,7 @@ class DualThrustEngine(BaseEngine):
                     elif not pos:
                         # ?ъ????놁쑝硫???吏꾩엯
                         await self._entry(symbol, 'short', price, total)
-                        
+
         except Exception as e:
             logger.error(f"DualThrust logic error: {e}")
 
@@ -20998,31 +21114,31 @@ class DualThrustEngine(BaseEngine):
             cfg = self.cfg.get('dual_thrust_engine', {})
             lev = cfg.get('leverage', 5)
             risk_pct = normalize_risk_percent(cfg) / 100.0
-            
+
             # ?덈쾭由ъ? ?ㅼ젙 & 寃⑸━ 紐⑤뱶 媛뺤젣
             await self.ensure_market_settings(symbol, leverage=lev)
             # await asyncio.to_thread(self.exchange.set_leverage, lev, symbol)
-            
+
             # ?섎웾 怨꾩궛
             _, free, _ = await self.get_balance_info()
             qty = self.safe_amount(symbol, (free * risk_pct * lev) / price)
-            
+
             if float(qty) <= 0:
                 logger.warning(f"[DualThrust] Invalid qty: {qty}")
                 return
-            
+
             order = await asyncio.to_thread(
                 self.exchange.create_order, symbol, 'market',
                 'buy' if side == 'long' else 'sell', qty
             )
-            
+
             self.position_cache = None
             self.position_cache_time = 0
-            
+
             self.db.log_trade_entry(symbol, side, price, float(qty))
             await self.ctrl.notify(f"✅ [DualThrust] {side.upper()} {qty} @ {price:.2f}")
             logger.info(f"??[DualThrust] Entry: {side} {qty} @ {price}")
-            
+
         except Exception as e:
             logger.error(f"DualThrust entry error: {e}")
             await self.ctrl.notify(f"❌ [DualThrust] 진입 실패: {e}")
@@ -21036,27 +21152,27 @@ class DualThrustEngine(BaseEngine):
                 # 泥?궛留??섍퀬 ?ъ쭊???덊븿
                 await self.exit_position(symbol, "DirectionFilter")
                 return
-            
+
             # 湲곗〈 ?ъ???泥?궛
             close_qty = self.safe_amount(symbol, abs(float(pos['contracts'])))
             close_side = 'sell' if pos['side'] == 'long' else 'buy'
-            
+
             pnl = float(pos.get('unrealizedPnl', 0))
-            
+
             await asyncio.to_thread(
                 self.exchange.create_order, symbol, 'market', close_side, close_qty
             )
-            
+
             self.db.log_trade_close(symbol, pnl, float(pos.get('percentage', 0)), price, "Switch")
             await self.ctrl.notify(f"🔄 [DualThrust] {pos['side'].upper()} 청산 -> {new_side.upper()} 전환 | PnL: {pnl:+.2f}")
-            
+
             self.position_cache = None
             self.position_cache_time = 0
-            
+
             # ?좎떆 ?湲???諛섎? 諛⑺뼢 吏꾩엯
             await asyncio.sleep(1.0)
             await self._entry(symbol, new_side, price, total_equity)
-            
+
         except Exception as e:
             logger.error(f"DualThrust switch error: {e}")
 
@@ -21066,28 +21182,28 @@ class DualThrustEngine(BaseEngine):
             pos = await self.get_server_position(symbol, use_cache=False)
             if not pos:
                 return
-            
+
             contracts = abs(float(pos['contracts']))
             if contracts <= 0:
                 return
-            
+
             qty = self.safe_amount(symbol, contracts)
             side = 'sell' if pos['side'] == 'long' else 'buy'
-            
+
             order = await asyncio.to_thread(
                 self.exchange.create_order, symbol, 'market', side, qty
             )
-            
+
             pnl = float(pos.get('unrealizedPnl', 0))
             pnl_pct = float(pos.get('percentage', 0))
             exit_price = float(order.get('average', 0)) or float(pos.get('markPrice', 0))
-            
+
             self.position_cache = None
             self.position_cache_time = 0
-            
+
             self.db.log_trade_close(symbol, pnl, pnl_pct, exit_price, reason)
             await self.ctrl.notify(f"📊 [DualThrust] [{reason}] PnL: {pnl:+.2f} ({pnl_pct:+.2f}%)")
-            
+
         except Exception as e:
             logger.error(f"DualThrust exit error: {e}")
 
@@ -21102,7 +21218,7 @@ class DualModeFractalEngine(BaseEngine):
         self.strategy = None
         self.current_mode = None
         self.last_candle_ts = 0
-    
+
     def _get_target_symbol(self):
         # 怨듯넻 ?ㅼ젙??Watchlist 泥?踰덉㎏ 肄붿씤???寃잛쑝濡??ъ슜
         watchlist = self.cfg.get('signal_engine', {}).get('watchlist', [])
@@ -21130,62 +21246,62 @@ class DualModeFractalEngine(BaseEngine):
             return
         if not self.strategy:
             return
-        
+
         try:
             symbol = self._get_target_symbol()
             cfg = self.cfg.get('dual_mode_engine', {})
-            
+
             # 紐⑤뱶 蹂寃?媛먯? 諛??ъ큹湲고솕
             if cfg.get('mode') != self.current_mode:
                 if not self._init_strategy():
                     return
-            
+
             # ??꾪봽?덉엫 寃곗젙
             if self.current_mode == 'scalping':
                 tf = cfg.get('scalping_tf', '5m')
             else:
                 tf = cfg.get('standard_tf', '4h')
-                
+
             # OHLCV 媛?몄삤湲?(Limit reduced to 300 for optimization)
             ohlcv = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, tf, limit=300)
             if not ohlcv: return
-            
+
             # 留덉?留??뺤젙 罹붾뱾 湲곗? (?꾩옱 吏꾪뻾 以묒씤 罹붾뱾? ?쒖쇅?섍굅???ы븿 ?щ? 寃곗젙)
             # ?꾨왂 濡쒖쭅??'close' ?곗씠?곕? ?곕?濡??뺤젙??罹붾뱾???덉쟾??
-            last_closed = ohlcv[-2] 
+            last_closed = ohlcv[-2]
             ts = last_closed[0]
             price = float(ohlcv[-1][4]) # ?꾩옱媛???ㅼ떆媛?
-            
+
             # ??罹붾뱾 媛깆떊 ?쒖뿉留??쒓렇??怨꾩궛 (?대쭅 遺??媛먯냼)
             if ts > self.last_candle_ts:
                 self.last_candle_ts = ts
-                
+
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                
+
                 # ?꾨왂 ?ㅽ뻾
                 res = self.strategy.generate_signals(df)
                 last_row = res.iloc[-2] # ?뺤젙 罹붾뱾 湲곗? ?쒓렇??
-                
+
                 sig = int(last_row['signal'])
                 chop = float(last_row['chop_idx'])
                 kalman = float(last_row['kalman_val'])
                 exit_price = float(last_row['exit_price'])
-                
+
                 logger.info(f"?쏉툘 [DualMode] {tf} Candle Close: Chop={chop:.1f}, Kalman={kalman:.1f}, Signal={sig}")
-                
+
                 # 留ㅻℓ 濡쒖쭅
                 await self._execute_signal(symbol, sig, price)
-                
+
             # ?곹깭 ?낅뜲?댄듃 (??쒕낫?쒖슜)
             await self._update_status(symbol, price, tf)
-                
+
         except Exception as e:
             logger.error(f"DualMode poll error: {e}")
 
     async def _execute_signal(self, symbol, sig, price):
         pos = await self.get_server_position(symbol, use_cache=False)
         total, free, _ = await self.get_balance_info()
-        
+
         # 1. Long Entry (Signal=1)
         if sig == 1:
             if not pos:
@@ -21195,7 +21311,7 @@ class DualModeFractalEngine(BaseEngine):
                 await self.exit_position(symbol, "Signal_Flip_Long")
                 await asyncio.sleep(1)
                 await self._entry(symbol, 'long', price, free)
-        
+
         # 2. Short Entry (Signal=-1)
         elif sig == -1:
             if not pos:
@@ -21220,22 +21336,22 @@ class DualModeFractalEngine(BaseEngine):
         # 怨듯넻 ?ㅼ젙?먯꽌 由ъ뒪??諛?TP/SL 媛?몄삤湲?
         common_cfg = self.cfg.get('signal_engine', {}).get('common_settings', {})
         risk = normalize_risk_percent(common_cfg) / 100.0
-        
+
         # ?덈쾭由ъ?????쇰え???ㅼ젙???곕Ⅴ嫄곕굹 怨듯넻 ?ㅼ젙???곕쫫 (?ъ슜???붿껌: ?먯궛/肄붿씤/TP/SL)
-        # 臾몃㎘???덈쾭由ъ???怨듯넻???곕Ⅴ??寃껋씠 ?덉쟾?섎굹, 紐낆떆???붿껌? ?놁뿀?? 
+        # 臾몃㎘???덈쾭由ъ???怨듯넻???곕Ⅴ??寃껋씠 ?덉쟾?섎굹, 紐낆떆???붿껌? ?놁뿀??
         # ?섏?留??ㅻⅨ ?ㅼ젙?ㅼ씠 怨듯넻???곕Ⅴ誘濡??덈쾭由ъ???怨듯넻???쎈뒗 寃껋씠 ?쇨??곸엫.
         lev = common_cfg.get('leverage', 5)
-        
+
         # ?덈쾭由ъ? ?ㅼ젙 & 寃⑸━ 紐⑤뱶 媛뺤젣
         await self.ensure_market_settings(symbol, leverage=lev)
         # await asyncio.to_thread(self.exchange.set_leverage, lev, symbol)
-        
+
         cost = free_usdt * risk
         qty = self.safe_amount(symbol, (cost * lev) / price)
-        
+
         if float(qty) > 0:
             actual_side = 'buy' if side == 'long' else 'sell'
-            
+
             # 1. 吏꾩엯 二쇰Ц
             order = await asyncio.to_thread(
                 self.exchange.create_order, symbol, 'market', actual_side, qty
@@ -21243,22 +21359,22 @@ class DualModeFractalEngine(BaseEngine):
             entry_price = float(order.get('average', price))
             self.position_cache = None
             self.db.log_trade_entry(symbol, side, entry_price, float(qty))
-            
+
             # 2. TP/SL ?ㅼ젙 (怨듯넻 ?ㅼ젙 媛??ъ슜)
             tp_master_enabled = bool(common_cfg.get('tp_sl_enabled', True))
             tp_enabled = tp_master_enabled and bool(common_cfg.get('take_profit_enabled', True))
             sl_enabled = tp_master_enabled and bool(common_cfg.get('stop_loss_enabled', True))
             tp_pct = common_cfg.get('target_roe_pct', 0.0) if tp_enabled else 0.0
             sl_pct = common_cfg.get('stop_loss_pct', 0.0) if sl_enabled else 0.0
-            
+
             msg = f"✅ [DualMode] {side.upper()} 진입: {qty} @ {entry_price}"
-            
+
             # TP/SL 二쇰Ц 諛곗튂 (鍮꾨룞湲??ㅻ쪟 諛⑹?瑜??꾪빐 try-except)
             if tp_pct > 0 or sl_pct > 0:
                 try:
                     # 湲곗〈 ?ㅽ뵂 ?ㅻ뜑 痍⑥냼
                     await asyncio.to_thread(self.exchange.cancel_all_orders, symbol)
-                    
+
                     if side == 'long':
                         if tp_pct > 0:
                             tp_price = entry_price * (1 + tp_pct / 100 / lev)
@@ -21332,7 +21448,7 @@ class DualModeFractalEngine(BaseEngine):
         total, free, mmr = await self.get_balance_info()
         count, daily_pnl = self.db.get_daily_stats()
         pos = await self.get_server_position(symbol)
-        
+
         self.ctrl.status_data[symbol] = {
             'engine': 'DualMode', 'symbol': symbol, 'price': price,
             'total_equity': total, 'free_usdt': free, 'mmr': mmr,
@@ -21402,7 +21518,7 @@ class MainController:
                 f"Selected {network_name} API credentials are empty. "
                 "Private endpoints (balance/positions/orders) will fail."
             )
-        
+
         market_data_mode = self._get_market_data_exchange_mode(self.exchange_mode)
         self.exchange = self._build_exchange(creds, self.exchange_mode)
         self._configure_exchange_network(self.exchange, self.exchange_mode)
@@ -21410,7 +21526,7 @@ class MainController:
         self._configure_exchange_network(self.market_data_exchange, market_data_mode)
         self.market_data_source_label = self._get_market_data_source_label(self.exchange_mode)
         logger.info(f"Market data source configured: {self.market_data_source_label}")
-        
+
         self.engines = {
             CORE_ENGINE: SignalEngine(self)
         }
@@ -22789,26 +22905,26 @@ class MainController:
 
     async def run(self):
         logger.info("Bot starting... (Pure Polling Mode)")
-        
+
         if self.cfg.get('logging', {}).get('debug_mode', False):
             logger.setLevel(logging.DEBUG)
             logger.info("Debug mode enabled")
-        
+
         token = self.cfg.get('telegram', {}).get('token', '')
         if not token:
             logger.error("??Telegram token is missing!")
             return
-        
+
         self.tg_app = ApplicationBuilder().token(token).build()
         await self._setup_telegram()
-        
+
         await self._switch_engine(self.cfg.get('system_settings', {}).get('active_engine', CORE_ENGINE))
-        
+
         await self.tg_app.initialize()
         await self.tg_app.start()
         await self.tg_app.updater.start_polling()
         self._write_heartbeat()
-        
+
         # Startup notice + keyboard
         if self._startup_notice_enabled():
             await self.notify(self._build_startup_notice())
@@ -22826,7 +22942,7 @@ class MainController:
                 logger.warning(f"Failed to send main menu keyboard: {e}")
         else:
             logger.info("Telegram startup keyboard suppressed by event-only alert mode.")
-        
+
         await asyncio.gather(
             self._main_polling_loop(),  # [?대쭅 ?꾩슜] 硫붿씤 ?대쭅 猷⑦봽
             self._hourly_report_loop(),
@@ -22844,18 +22960,18 @@ class MainController:
         if CORE_ENGINE not in self.engines:
             logger.error(f"Required engine not available: {CORE_ENGINE}")
             return
-        
+
         if self.active_engine:
             self.active_engine.stop()
-        
+
         # ?붿쭊 ?꾪솚 ???곹깭 ?곗씠??珥덇린??
         self.status_data = {}
-        
+
         self.active_engine = self.engines[CORE_ENGINE]
         self.active_engine.start()
-        
+
         sym = self._get_current_symbol()
-        
+
         await self.active_engine.ensure_market_settings(sym)
         logger.info(f"Active engine: {CORE_ENGINE.upper()}")
 
@@ -22911,15 +23027,15 @@ class MainController:
             if self.active_engine:
                 self.active_engine.stop()
                 logger.info("??Engine stopped for exchange reinit")
-            
+
             # 2. ?ㅼ젙 ?낅뜲?댄듃
             await self.cfg.update_value(['api', 'exchange_mode'], exchange_mode)
             await self.cfg.update_value(['api', 'use_testnet'], exchange_mode == BINANCE_TESTNET)
-            
+
             # 3. ??API ?먭꺽利앸챸 濡쒕뱶
             self.exchange_mode = exchange_mode
             creds = self._get_exchange_credentials(exchange_mode)
-            
+
             # 4. 嫄곕옒???ъ큹湲고솕
             market_data_mode = self._get_market_data_exchange_mode(exchange_mode)
             self.exchange = self._build_exchange(creds, exchange_mode)
@@ -22927,10 +23043,10 @@ class MainController:
             self.market_data_exchange = self._build_public_market_data_exchange(market_data_mode)
             self._configure_exchange_network(self.market_data_exchange, market_data_mode)
             self.market_data_source_label = self._get_market_data_source_label(exchange_mode)
-            
+
             # 5. 留덉폆 ?뺣낫 濡쒕뱶
             await asyncio.to_thread(self.exchange.load_markets)
-            
+
             # 6. ?붿쭊?ㅼ뿉 ??exchange ?꾨떖
             for engine in self.engines.values():
                 engine.exchange = self.exchange
@@ -22939,14 +23055,14 @@ class MainController:
                 engine.position_cache_time = 0
                 engine.all_positions_cache = None
                 engine.all_positions_cache_time = 0
-            
+
             # 7. ?쒖꽦 ?붿쭊 ?ъ떆??
             eng_name = self.cfg.get('system_settings', {}).get('active_engine', CORE_ENGINE)
             await self._switch_engine(eng_name)
-            
+
             logger.info(f"Exchange reinitialized: {network_name}")
             return True, network_name
-            
+
         except Exception as e:
             logger.error(f"Exchange reinit error: {e}")
             return False, str(e)
@@ -22976,7 +23092,7 @@ class MainController:
             else:
                 await update.message.reply_text("▶ 매매 재개")
             return ConversationHandler.END
-        
+
         return None
 
     async def _reply_markdown_safe(self, message, text, reply_markup=None):
@@ -23454,7 +23570,7 @@ class MainController:
         watchlist = sig.get('watchlist', ['BTC/USDT'])
         if not isinstance(watchlist, list) or not watchlist:
             watchlist = ['BTC/USDT']
-        
+
         if eng == 'shannon':
             lev = sha.get('leverage', 5)
             symbol = sha.get('target_symbol', 'BTC/USDT')
@@ -23467,7 +23583,7 @@ class MainController:
         else:
             lev = sig.get('common_settings', {}).get('leverage', 20)
             symbol = watchlist[0] if watchlist else 'BTC/USDT'
-            
+
         status = "🔴 OFF" if self.is_paused else "🟢 ON"
         direction_str = {'both': '양방향', 'long': '롱만', 'short': '숏만'}.get(direction, 'both')
 
@@ -23510,36 +23626,36 @@ class MainController:
 """
             await self._reply_markdown_safe(update.message, msg.strip())
             return
-        
+
         # ?덉쟾???ㅼ젙 ?묎렐
         sig_common = sig.get('common_settings', {})
-        
+
         # SMA ?ㅼ젙 媛?몄삤湲?
         sma_params = sig.get('strategy_params', {}).get('Triple_SMA', {})
         fast_sma = sma_params.get('fast_sma', 2)
         slow_sma = sma_params.get('slow_sma', 10)
-        
+
         # Shannon ?ㅼ젙
         shannon_ratio = int(sha.get('asset_allocation', {}).get('target_ratio', 0.5) * 100)
         grid_enabled = "ON" if sha.get('grid_trading', {}).get('enabled', False) else "OFF"
         grid_size = sha.get('grid_trading', {}).get('order_size_usdt', 200)
-        
+
         # Dual Thrust ?ㅼ젙
         dt_n = dt.get('n_days', 4)
         dt_k1 = dt.get('k1', 0.5)
         dt_k2 = dt.get('k2', 0.5)
-        
+
         # Dual Mode ?ㅼ젙
         dm_mode = dm.get('mode', 'standard').upper()
         dm_tf = dm.get('scalping_tf', '5m') if dm_mode == 'SCALPING' else dm.get('standard_tf', '4h')
-        
+
         # TP/SL ?곹깭
         tp_enabled = bool(sig_common.get('take_profit_enabled', sig_common.get('tp_sl_enabled', True)))
         sl_enabled = bool(sig_common.get('stop_loss_enabled', sig_common.get('tp_sl_enabled', True)))
         tp_sl_status = "ON" if (tp_enabled or sl_enabled) else "OFF"
         tp_status = "ON" if tp_enabled else "OFF"
         sl_status = "ON" if sl_enabled else "OFF"
-        
+
         # Signal ?꾨왂 ?ㅼ젙 (異붽?)
         strategy_params = sig.get('strategy_params', {})
         active_strategy = strategy_params.get('active_strategy', 'utbot').upper()
@@ -23584,7 +23700,7 @@ class MainController:
         watchlist_preview = ", ".join(watchlist[:4]) if isinstance(watchlist, list) and watchlist else symbol
         if isinstance(watchlist, list) and len(watchlist) > 4:
             watchlist_preview += " ..."
-        
+
         # Scanner ?곹깭
         scanner_enabled = sig_common.get('scanner_enabled', True)
         scanner_status = "ON 📡" if scanner_enabled else "OFF"
@@ -23603,7 +23719,7 @@ class MainController:
 
         # Network status
         network_status = self.get_network_status_label()
-        
+
         msg = f"""
 🔧 **설정 메뉴** (번호 입력)
 
@@ -23677,7 +23793,7 @@ class MainController:
     async def setup_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw_text = update.message.text.strip()
         text = self._normalize_setup_choice_text(raw_text)
-        
+
         if text == '0':
             await update.message.reply_text("✅ 설정 종료")
             await self._restore_main_keyboard(update)
@@ -23687,9 +23803,9 @@ class MainController:
             await update.message.reply_text("ℹ️ 현재 /setup은 거래소/네트워크 전환(22)만 지원합니다.")
             await self.show_setup_menu(update)
             return SELECT
-        
+
         context.user_data['setup_choice'] = text
-        
+
         prompts = {
             '1': "📝 **레버리지** 값을 입력하세요 (1~20, 예: 5)",
             '2': "📝 **목표 ROE 설정**: 값(%) 또는 ON/OFF 입력 (예: 20, on, off)",
@@ -23852,7 +23968,7 @@ class MainController:
         elif text in ('28', '29'):
             await update.message.reply_text("ℹ️ Hurst 필터는 코드에서 제거되었습니다.")
             return SELECT
-            
+
         elif text == '21':
             await update.message.reply_text(
                 "ℹ️ UT Hybrid 전략 안내\n"
@@ -23897,7 +24013,7 @@ class MainController:
         """Telegram manual symbol input handler."""
         try:
             symbol = self.normalize_symbol_for_exchange(symbol)
-            
+
             # ?щ낵 ?좏슚??寃??(Exchange check)
             # SignalEngine???쒖꽦?붾릺???덉뼱????
             eng_type = self.cfg.get('system_settings', {}).get('active_engine', CORE_ENGINE)
@@ -23947,7 +24063,7 @@ class MainController:
     async def setup_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         choice = context.user_data.get('setup_choice')
         val = update.message.text
-        
+
         try:
             removed_strategy_filter_choices = {'10', '17', '18', '27', '30', '31', '32', '33', '34'}
             if choice in removed_strategy_filter_choices:
@@ -23965,7 +24081,7 @@ class MainController:
                 await self.cfg.update_value(['shannon_engine', 'leverage'], v)
                 await self.cfg.update_value(['dual_thrust_engine', 'leverage'], v)
                 await self.cfg.update_value(['dual_mode_engine', 'leverage'], v)
-                # TEMA??common_settings瑜?李몄“?섎?濡?蹂꾨룄 ?낅뜲?댄듃 遺덊븘?뷀븯吏留? 
+                # TEMA??common_settings瑜?李몄“?섎?濡?蹂꾨룄 ?낅뜲?댄듃 遺덊븘?뷀븯吏留?
                 # ?쒖꽦 ?붿쭊??TEMA??寃쎌슦 market settings 利됱떆 ?곸슜 ?꾩슂
                 if self.active_engine:
                     sym = self._get_current_symbol()
@@ -24030,7 +24146,7 @@ class MainController:
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'timeframe'], val)
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'entry_timeframe'], val) # Sync Entry TF
                 await self.cfg.update_value(['shannon_engine', 'timeframe'], val)
-                
+
                 # DualMode 타임프레임도 모드에 따라 동기화
                 dm_mode = self.cfg.get('dual_mode_engine', {}).get('mode', 'standard')
                 if dm_mode == 'scalping':
@@ -24085,7 +24201,7 @@ class MainController:
                     return SELECT
                 await self.cfg.update_value(['upbit', 'common_settings', 'risk_per_trade_pct'], v)
                 await update.message.reply_text(f"✅ 업비트 진입 비율 변경: {v}%")
-            
+
             elif choice == '24':
                 # Scanner Entry Timeframe
                 valid_tf = ['1m', '2m', '3m', '5m', '15m', '30m', '1h', '4h']
@@ -24118,7 +24234,7 @@ class MainController:
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'Triple_SMA', 'fast_sma'], fast)
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'Triple_SMA', 'slow_sma'], slow)
                 await update.message.reply_text(f"✅ SMA 기간 변경: {fast}/{slow}")
-            
+
             # ======== Shannon ?꾩슜 ========
             elif choice == '11':
                 # ?먯궛 鍮꾩쑉 蹂寃?(?뺤떇: "50" = 50%)
@@ -24133,7 +24249,7 @@ class MainController:
                 if shannon_engine:
                     shannon_engine.ratio = ratio
                 await update.message.reply_text(f"✅ Shannon 자산 비율 변경: {int(v)}%")
-            
+
             elif choice == '12':
                 # Grid ?ㅼ젙 (?뺤떇: "on,200" ?먮뒗 "off")
                 val_lower = val.lower().strip()
@@ -24150,7 +24266,7 @@ class MainController:
                     else:
                         await update.message.reply_text("❌ 형식: on,금액 또는 off (예: on,200)")
                         return SELECT
-            
+
             # ======== Dual Thrust ?꾩슜 ========
             elif choice == '14':
                 # N Days 蹂寃?
@@ -24164,7 +24280,7 @@ class MainController:
                 if dt_engine:
                     dt_engine.trigger_date = None
                 await update.message.reply_text(f"✅ Dual Thrust N Days 변경: {v}")
-            
+
             elif choice == '15':
                 # K1/K2 蹂寃?(?뺤떇: "0.5,0.5" ?먮뒗 "0.4,0.6")
                 parts = val.replace(' ', '').split(',')
@@ -24194,11 +24310,11 @@ class MainController:
                     '6': 'rsibb'
                 }
                 val_lower = val.lower().strip()
-                
+
                 # 踰덊샇 ?낅젰 ??蹂??
                 if val_lower in strategy_map:
                     val_lower = strategy_map[val_lower]
-                
+
                 if val_lower in UT_ONLY_STRATEGIES:
                     await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], val_lower)
                     signal_engine = self.engines.get('signal')
@@ -24216,7 +24332,7 @@ class MainController:
                         "1=UTBOT, 2=UTRSIBB, 3=UTRSI, 4=UTBB, 5=UTSMC, 6=RSIBB"
                     )
                     return SELECT
-            
+
             elif choice == '20':
                 parts = val.replace(' ', '').split(',')
                 if len(parts) != 3:
@@ -24483,7 +24599,7 @@ class MainController:
                 await update.message.reply_text(
                     f"✅ UTBot 청산 필터 타입: {self._format_utbot_filter_pack_mode_map(mode_by_filter, exit_selected)}"
                 )
-            
+
             elif choice == '17':
                 # HMA 湲곌컙 蹂寃?(?뺤떇: "9,21")
                 parts = val.replace(' ', '').split(',')
@@ -24587,7 +24703,7 @@ class MainController:
                 await update.message.reply_text(
                     f"✅ UTSMC C2 청산: {'ON' if exit_candidate2_enabled else 'OFF'}"
                 )
-            
+
             elif choice == '18':
                 # 吏꾩엯紐⑤뱶 蹂寃?(1=cross, 2=position)
                 if val == '1':
@@ -24597,10 +24713,10 @@ class MainController:
                 else:
                     await update.message.reply_text("❌ 1(Cross) 또는 2(Position)를 입력하세요.")
                     return SELECT
-                
+
                 await self.cfg.update_value(['signal_engine', 'strategy_params', 'entry_mode'], val_lower)
                 await update.message.reply_text(f"✅ 진입모드 변경: {val_lower.upper()}")
-            
+
             elif choice == '22':
                 mode_map = {
                     '1': BINANCE_TESTNET,
@@ -24638,7 +24754,7 @@ class MainController:
                         await update.message.reply_text(f"✅ 거래소 전환 완료: {result}")
                     else:
                         await update.message.reply_text(f"❌ 거래소 전환 실패: {result}")
-            
+
             elif choice == '23':
                 # Scanner Toggle
                 if val in ['1', 'on', 'ON']:
@@ -24648,7 +24764,7 @@ class MainController:
                 else:
                     await update.message.reply_text("❌ 1(ON) 또는 0(OFF)를 입력하세요.")
                     return SELECT
-                
+
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], new_val)
                 status = "ON 📡" if new_val else "OFF"
                 await update.message.reply_text(f"✅ 거래량 급등 채굴: {status}")
@@ -24670,7 +24786,7 @@ class MainController:
                     return SELECT
                 await self.cfg.update_value(['signal_engine', 'common_settings', 'chop_threshold'], v)
                 await update.message.reply_text(f"✅ CHOP 기준값 변경: {v}")
-            
+
             elif choice == '34':
                 # CC Threshold & Length
                 parts = val.replace(' ', '').split(',')
@@ -24705,15 +24821,15 @@ class MainController:
                 else:
                     await update.message.reply_text("❌ 1(스탠다드) 또는 2(스캘핑)를 입력하세요.")
                     return SELECT
-                
+
                 await self.cfg.update_value(['dual_mode_engine', 'mode'], new_mode)
                 await update.message.reply_text(f"✅ 듀얼모드 변경: {mode_label}")
-                
+
                 # 利됱떆 ?ъ큹湲고솕 ?몃━嫄?(poll_tick?먯꽌 媛먯??섏?留?紐낆떆??由ъ뀑)
                 dm_engine = self.engines.get('dualmode')
                 if dm_engine:
                     dm_engine._init_strategy()
-            
+
             elif choice == '41':
                 # 청산 타임프레임 변경
                 valid_tf = ['1m', '2m', '3m', '4m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
@@ -24788,14 +24904,14 @@ class MainController:
                     return SELECT
                 await self.cfg.update_value(['upbit', 'common_settings', 'daily_loss_limit'], limit_krw)
                 await update.message.reply_text(f"✅ 업비트 일일 손실 제한 변경: ₩{limit_krw:,.0f}")
-            
+
             # 10~41 success message handled
             if choice not in ['2', '3', '10', '11', '12', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '26', '27', '28', '30', '31', '33', '34', '35', '41', '44', '45', '46', '47', '48', '49', '50', '51', '52', '53', '54', '55']:
                 await update.message.reply_text(f"✅ 설정 완료: {val}")
             await self._restore_main_keyboard(update)
             await self.show_setup_menu(update)
             return SELECT
-            
+
         except ValueError:
             await update.message.reply_text("❌ 올바른 숫자를 입력하세요.")
             return SELECT
@@ -24814,14 +24930,14 @@ class MainController:
         upbit_watchlist = self.cfg.get('upbit', {}).get('watchlist', ['BTC/KRW'])
         if not isinstance(upbit_watchlist, list):
             upbit_watchlist = ['BTC/KRW']
-        
+
         # 1/2/3 踰덊샇濡??щ낵 留ㅽ븨 (?⑥텞??
         symbol_map = (
             {'1': 'BTC/KRW', '2': 'ETH/KRW', '3': 'SOL/KRW'}
             if setup_choice == '43' or self.is_upbit_mode()
             else {'1': 'BTC/USDT', '2': 'ETH/USDT', '3': 'SOL/USDT'}
         )
-        
+
         # ?⑥텞???먮뒗 吏곸젒 ?낅젰 ?ъ슜
         if choice in symbol_map:
             symbol = symbol_map[choice]
@@ -24839,7 +24955,7 @@ class MainController:
         except Exception:
             await update.message.reply_text(f"❌ 유효하지 않은 심볼 또는 거래쌍입니다: {symbol}")
             return SELECT
-        
+
         try:
             eng = self.cfg.get('system_settings', {}).get('active_engine', CORE_ENGINE)
             display_symbol = self.format_symbol_for_display(symbol)
@@ -24868,12 +24984,12 @@ class MainController:
                     await self.cfg.update_value(['signal_engine', 'watchlist'], [symbol])
                     new_watchlist = [symbol]
                     await update.message.reply_text("ℹ️ Signal 엔진 감시 목록이 해당 심볼로 초기화되었습니다.")
-            
+
             # 留덉폆 ?ㅼ젙 ?곸슜
             # 留덉폆 ?ㅼ젙 ?곸슜
             if self.active_engine:
                 await self.active_engine.ensure_market_settings(symbol)
-            
+
             # Shannon ?붿쭊 罹먯떆 珥덇린??(?щ낵 蹂寃????꾩닔!)
             shannon_engine = self.engines.get('shannon')
             if shannon_engine:
@@ -24884,7 +25000,7 @@ class MainController:
                 shannon_engine.position_cache = None
                 shannon_engine.grid_orders = []
                 logger.info(f"?봽 Shannon engine cache cleared for new symbol: {symbol}")
-            
+
             # Signal ?붿쭊 罹먯떆??珥덇린??
             signal_engine = self.engines.get('signal')
             if signal_engine:
@@ -24910,7 +25026,7 @@ class MainController:
                     signal_engine.active_symbols.clear() # 湲곗〈 ?섎룞 紐⑸줉??珥덇린??(紐낇솗?깆쓣 ?꾪빐)
                     signal_engine.active_symbols.add(symbol)
                     await signal_engine.prime_symbol_to_next_closed_candle(symbol)
-            
+
             # Dual Thrust ?붿쭊 罹먯떆??珥덇린??
             dt_engine = self.engines.get('dualthrust')
             if dt_engine:
@@ -24926,7 +25042,7 @@ class MainController:
                 tema_engine.ema2 = None
                 tema_engine.ema3 = None
                 logger.info(f"?봽 TEMA engine cache cleared for new symbol: {symbol}")
-            
+
             if setup_choice == '38':
                 watchlist_text = ", ".join(new_watchlist)
                 await update.message.reply_text(f"✅ 감시 목록: {watchlist_text}")
@@ -24938,7 +25054,7 @@ class MainController:
             await self._restore_main_keyboard(update)
             await self.show_setup_menu(update)
             return SELECT
-            
+
         except Exception as e:
             logger.error(f"Symbol change error: {e}")
             await update.message.reply_text(f"❌ 심볼 변경 실패: {e}")
@@ -24954,7 +25070,7 @@ class MainController:
             await self._restore_main_keyboard(update)
             await self.show_setup_menu(update)
             return SELECT
-        
+
         direction_map = {
             '양방향': 'both',
             'Long+Short': 'both',
@@ -24963,13 +25079,13 @@ class MainController:
             '숏만': 'short',
             'Short Only': 'short'
         }
-        
+
         direction = None
         for key, val in direction_map.items():
             if key in text:
                 direction = val
                 break
-        
+
         if direction:
             previous_direction = self.get_effective_trade_direction()
             await self.cfg.update_value(['system_settings', 'trade_direction'], direction)
@@ -24983,7 +25099,7 @@ class MainController:
             await update.message.reply_text(f"✅ 매매 방향 변경: {direction_label}")
         else:
             await update.message.reply_text("❌ 유효하지 않은 선택입니다.")
-        
+
         await self._restore_main_keyboard(update)
         await self.show_setup_menu(update)
         return SELECT
@@ -24991,9 +25107,9 @@ class MainController:
     async def setup_engine_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """?붿쭊 援먯껜 泥섎━"""
         text = update.message.text.strip()
-        
+
         mode_map = {'1': CORE_ENGINE}
-        
+
         if text in mode_map:
             mode = mode_map[text]
             if mode == 'dualmode' and not DUAL_MODE_AVAILABLE:
@@ -25004,7 +25120,7 @@ class MainController:
                 await update.message.reply_text(f"✅ 엔진 변경 완료: {mode.upper()}")
         else:
             await update.message.reply_text("ℹ️ 코어 모드에서는 `1 (Signal)`만 사용 가능합니다.", parse_mode=ParseMode.MARKDOWN)
-        
+
         await self._restore_main_keyboard(update)
         await self.show_setup_menu(update)
         return SELECT
@@ -25717,7 +25833,7 @@ UTBot:
             )
             adaptive_stack_text = (
                 f"Shadow {'ON' if cfg.get('shadow_triple_barrier_enabled', True) else 'OFF'} / "
-                f"Runner {'ON' if cfg.get('runner_exit_enabled', True) else 'OFF'} / "
+                f"Runner {'ON' if cfg.get('runner_exit_enabled', False) else 'OFF'} / "
                 f"TrendHealth {'ON' if cfg.get('trend_health_enabled', True) else 'OFF'} / "
                 f"QualityV2 {'ON' if cfg.get('strategy_quality_enabled', True) else 'OFF'} / "
                 f"QScore {'ON' if cfg.get('quality_score_v2_enabled', True) else 'OFF'} / "
@@ -28961,7 +29077,7 @@ AUTO 최근 선택 이유:
             curr = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('r2_exit_enabled', True)
             await self.cfg.update_value(['signal_engine', 'common_settings', 'r2_exit_enabled'], not curr)
             await update.message.reply_text(f"✅ R2 Exit: {'ON' if not curr else 'OFF'}")
-        
+
         await self._restore_main_keyboard(update)
         await self.show_setup_menu(update)
         return SELECT
@@ -28976,7 +29092,7 @@ AUTO 최근 선택 이유:
             curr = self.cfg.get('signal_engine', {}).get('common_settings', {}).get('chop_exit_enabled', True)
             await self.cfg.update_value(['signal_engine', 'common_settings', 'chop_exit_enabled'], not curr)
             await update.message.reply_text(f"✅ CHOP Exit: {'ON' if not curr else 'OFF'}")
-        
+
         await self._restore_main_keyboard(update)
         await self.show_setup_menu(update)
         return SELECT
@@ -28991,7 +29107,7 @@ AUTO 최근 선택 이유:
             curr = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('kalman_filter', {}).get('exit_enabled', False)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'kalman_filter', 'exit_enabled'], not curr)
             await update.message.reply_text(f"✅ Kalman Exit: {'ON' if not curr else 'OFF'}")
-            
+
         await self._restore_main_keyboard(update)
         await self.show_setup_menu(update)
         return SELECT
@@ -29000,7 +29116,7 @@ AUTO 최근 선택 이유:
     async def _hourly_report_loop(self):
         """시간별 리포트."""
         await asyncio.sleep(60)  # ?쒖옉 ?湲?
-        
+
         while True:
             try:
                 reporting = self.cfg.get('telegram', {}).get('reporting', {})
@@ -29008,7 +29124,7 @@ AUTO 최근 선택 이유:
                     now = datetime.now()
                     if now.minute == 0 and time.time() - self.last_hourly_report > 3500:
                         self.last_hourly_report = time.time()
-                        
+
                         daily_count, daily_pnl = self.db.get_daily_stats()
                         d = {}
                         if isinstance(self.status_data, dict) and self.status_data:
@@ -29026,7 +29142,7 @@ AUTO 최근 선택 이유:
                                 return f"{prefix}₩{amount:,.0f}"
                             prefix = '+' if signed and amount >= 0 else ''
                             return f"{prefix}${amount:.2f}"
-                        
+
                         msg = f"""
 ⏱ **시간별 리포트** [{now.strftime('%H:%M')}]
 
@@ -29035,7 +29151,7 @@ AUTO 최근 선택 이유:
 🛡 MMR: {d.get('mmr', 0):.2f}%
 """
                         await self.notify(msg.strip())
-                
+
                 await asyncio.sleep(30)
             except Exception as e:
                 logger.error(f"Hourly report error: {e}")
@@ -29062,23 +29178,23 @@ AUTO 최근 선택 이유:
         """
         logger.info("?봽 [Polling] Main polling loop started (Pure Polling Mode)")
         await asyncio.sleep(3)  # ?쒖옉 ?湲?
-        
+
         while True:
             try:
                 eng = self.cfg.get('system_settings', {}).get('active_engine', CORE_ENGINE)
-                
+
                 if eng == 'signal' and self.active_engine and self.active_engine.running:
                     # Signal ?붿쭊 ?대쭅
                     signal_engine = self.engines.get('signal')
                     if signal_engine and hasattr(signal_engine, 'poll_tick'):
                         await signal_engine.poll_tick()
-                        
+
                 elif eng == 'shannon' and self.active_engine and self.active_engine.running:
                     # Shannon ?붿쭊 ?대쭅
                     shannon_engine = self.engines.get('shannon')
                     if shannon_engine and hasattr(shannon_engine, 'poll_tick'):
                         await shannon_engine.poll_tick()
-                
+
                 elif eng == 'dualthrust' and self.active_engine and self.active_engine.running:
                     # Dual Thrust ?붿쭊 ?대쭅
                     dt_engine = self.engines.get('dualthrust')
@@ -29096,13 +29212,13 @@ AUTO 최근 선택 이유:
                     tema_engine = self.engines.get('tema')
                     if tema_engine and hasattr(tema_engine, 'poll_tick'):
                         await tema_engine.poll_tick()
-                
+
                 # [MODIFIED] Prioritize entry_timeframe for polling interval
                 sys_cfg = self.get_active_common_settings()
                 tf = sys_cfg.get('entry_timeframe', sys_cfg.get('timeframe', '15m'))
                 poll_interval = self._get_poll_interval(tf)
                 await asyncio.sleep(poll_interval)
-                
+
             except Exception as e:
                 logger.error(f"Main polling loop error: {e}")
                 await asyncio.sleep(30)
@@ -29755,7 +29871,7 @@ AUTO 최근 선택 이유:
                 if normalized_pos:
                     open_positions.append(normalized_pos)
             result['position_count'] = len(open_positions)
-            
+
             if not open_positions:
                 # ?ъ??섏씠 ?녿떎硫? ?뱀떆 紐⑤Ⅴ???꾩옱 ?ㅼ젙???щ낵??誘몄껜寃?二쇰Ц留?痍⑥냼 ?쒕룄
                 symbols_to_clean = {self._get_current_symbol(), *self.get_active_watchlist()}
@@ -29788,7 +29904,7 @@ AUTO 최근 선택 이유:
             # 2. 紐⑤뱺 ?ㅽ뵂 ?ъ????쒖감 泥?궛
             for pos in open_positions:
                 sym = pos['symbol']
-                
+
                 # 二쇰Ц 痍⑥냼
                 try:
                     if signal_engine:
@@ -29798,7 +29914,7 @@ AUTO 최근 선택 이유:
                         await asyncio.to_thread(self.exchange.cancel_all_orders, sym)
                 except Exception as e:
                     logger.error(f"Cancel orders error for {sym}: {e}")
-                
+
                 # 泥?궛 二쇰Ц
                 try:
                     pnl = float(pos.get('pnl', 0.0) or 0.0)
@@ -29896,17 +30012,17 @@ AUTO 최근 선택 이유:
                     result['closed'] += 1
                     result['closed_positions'].append({'symbol': sym, 'qty': qty, 'pnl': pnl})
                     await self.notify(f"✅ **{sym}** 청산 완료\nPnL: ${pnl:+.2f}")
-                    
+
                 except Exception as e:
                     result['failed'] += 1
                     result['failed_positions'].append({'symbol': sym, 'error': str(e)})
                     logger.error(f"Failed to close {sym}: {e}")
                     await self.notify(f"❌ {sym} 청산 실패: {e}")
-            
+
             result['status'] = 'failed' if result['failed'] and not result['closed'] else ('partial_failed' if result['failed'] else 'closed')
             await self.notify("🧯 긴급 정지 처리 완료")
             return result
-                    
+
         except Exception as e:
             logger.error(f"Emergency stop error: {e}")
             await self.notify(f"❌ 긴급 정지 중 오류: {e}")
@@ -29941,6 +30057,1683 @@ AUTO 최근 선택 이유:
                     raise
         except Exception as e:
             logger.error(f"Notify error: {e}")
+
+# ==============================================================================
+# Live Features Integration & Hardening Layers for UT Breakout
+# ==============================================================================
+
+from dataclasses import dataclass, field as dc_field
+import math
+
+@dataclass
+class TakeProfitOrderPlan:
+    tp_name: str
+    side: str
+    price: float
+    qty: float
+    reduce_only: bool
+    close_position: bool
+    r_multiple: float
+    pct: float
+
+@dataclass
+class LiveOrderPlan:
+    symbol: str
+    side: str
+    entry_type: str
+    entry_price: float | None
+    qty: float
+    risk_pct: float
+    initial_sl_price: float
+    tp_orders: list
+    ladder: object | None
+    reduce_only: bool
+    engine: str
+    regime: str
+    confidence: float
+    expected_r: float
+    reasons: list[str]
+
+def apply_runtime_safety_defaults(cfg):
+    if not isinstance(cfg, dict):
+        return cfg
+    mode = str(cfg.get("mode", "")).lower()
+    is_live = mode in {"live", "real", "production"} or bool(cfg.get("live_trading", False))
+    is_paper_or_testnet = mode in {"paper", "testnet", "dry_run"} or bool(cfg.get("testnet", False))
+
+    if is_live:
+        cfg["advanced_alpha_engine_enabled"] = bool(cfg.get("advanced_alpha_live_opt_in", False))
+        cfg["live_parity_signal_enabled"] = bool(cfg.get("live_parity_signal_live_opt_in", False))
+        cfg["adaptive_ladder_tp_enabled"] = bool(cfg.get("adaptive_ladder_tp_live_opt_in", False))
+
+        if cfg.get("advanced_alpha_engine_enabled"):
+            cfg["max_risk_per_trade_pct"] = min(
+                float(cfg.get("max_risk_per_trade_pct", 0.25)),
+                float(cfg.get("live_advanced_alpha_initial_max_risk_pct", 0.25)),
+            )
+    elif is_paper_or_testnet:
+        cfg["advanced_alpha_engine_enabled"] = bool(cfg.get("paper_testnet_advanced_alpha_default_enabled", True))
+        cfg["live_parity_signal_enabled"] = bool(cfg.get("paper_testnet_live_parity_default_enabled", True))
+        cfg["adaptive_ladder_tp_enabled"] = bool(cfg.get("paper_testnet_ladder_tp_default_enabled", True))
+
+    cfg["runner_exit_enabled"] = False
+    cfg["shadow_runner_exit_enabled"] = False
+    cfg["runner_chandelier_enabled"] = False
+    return cfg
+
+LIVE_REAL_CONFIRM_TEXT = "I_CONFIRM_REAL_BINANCE_FUTURES_TRADING"
+LIVE_REAL_ALLOWED_SYMBOLS_DEFAULT = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+LIVE_REAL_BLOCKED_SYMBOL_FRAGMENTS = (
+    "UP/",
+    "DOWN/",
+    "BULL/",
+    "BEAR/",
+    "1000",
+    "AAPL",
+    "AMZN",
+    "GOOGL",
+    "GOOG",
+    "META",
+    "MSFT",
+    "NFLX",
+    "NVDA",
+    "TSLA",
+)
+
+
+def _normalize_live_real_stage(stage):
+    return str(stage or "").strip().upper()
+
+
+def _normalize_live_real_symbol(symbol):
+    text = str(symbol or "").strip().upper()
+    if not text:
+        return ""
+    for suffix in (":USDT", ":USDC", ":BUSD"):
+        text = text.replace(suffix, "")
+    text = text.replace("-", "/").replace("_", "/")
+    if "/" not in text:
+        for quote in ("USDT", "USDC", "BUSD"):
+            if text.endswith(quote) and len(text) > len(quote):
+                text = f"{text[:-len(quote)]}/{quote}"
+                break
+    return text
+
+
+def enforce_activation_stage(cfg):
+    if not isinstance(cfg, dict):
+        return cfg
+
+    mode = str(cfg.get("mode", "")).lower()
+    is_live = mode in {"live", "real", "production"} or bool(cfg.get("live_trading", False))
+    is_paper_or_testnet = mode in {"paper", "testnet", "dry_run"} or bool(cfg.get("testnet", False))
+
+    default_stage = "DISABLED" if is_live else "TESTNET_ONLY" if is_paper_or_testnet else "DISABLED"
+    stage = _normalize_live_real_stage(cfg.get("live_activation_stage", default_stage))
+    cfg["live_activation_stage"] = stage
+    cfg["runner_exit_enabled"] = False
+    cfg["shadow_runner_exit_enabled"] = False
+    cfg["runner_chandelier_enabled"] = False
+
+    if stage == "DISABLED":
+        cfg["advanced_alpha_engine_enabled"] = False
+        cfg["live_parity_signal_enabled"] = False
+        cfg["adaptive_ladder_tp_enabled"] = False
+        cfg["real_order_enabled"] = False
+        cfg["live_trading"] = False
+    elif stage == "PAPER_ONLY":
+        cfg["advanced_alpha_engine_enabled"] = True
+        cfg["live_parity_signal_enabled"] = True
+        cfg["adaptive_ladder_tp_enabled"] = True
+        cfg["real_order_enabled"] = False
+        cfg["live_trading"] = False
+    elif stage == "TESTNET_ONLY":
+        cfg["advanced_alpha_engine_enabled"] = True
+        cfg["live_parity_signal_enabled"] = True
+        cfg["adaptive_ladder_tp_enabled"] = True
+        cfg["real_order_enabled"] = True
+        cfg["testnet"] = True
+        cfg["live_trading"] = False
+        cfg["max_leverage"] = min(float(cfg.get("max_leverage", cfg.get("leverage", 2)) or 2), 2.0)
+        cfg["leverage"] = min(float(cfg.get("leverage", cfg.get("max_leverage", 2)) or 2), cfg["max_leverage"])
+    elif stage == "SMALL_LIVE_025":
+        if is_live and not bool(cfg.get("advanced_alpha_live_opt_in", False)):
+            raise ValueError("SMALL_LIVE_025 requires advanced_alpha_live_opt_in=True for live trading")
+        cfg["advanced_alpha_engine_enabled"] = True
+        cfg["live_parity_signal_enabled"] = True
+        cfg["adaptive_ladder_tp_enabled"] = True
+        cfg["max_risk_per_trade_pct"] = min(float(cfg.get("max_risk_per_trade_pct", 0.25)), 0.25)
+    elif stage == "LIVE_050":
+        if is_live and not bool(cfg.get("advanced_alpha_live_opt_in", False)):
+            raise ValueError("LIVE_050 requires advanced_alpha_live_opt_in=True for live trading")
+        cfg["advanced_alpha_engine_enabled"] = True
+        cfg["live_parity_signal_enabled"] = True
+        cfg["adaptive_ladder_tp_enabled"] = True
+        cfg["max_risk_per_trade_pct"] = min(float(cfg.get("max_risk_per_trade_pct", 0.5)), 0.5)
+    elif stage == "LIVE_REAL_SMALL_CAP":
+        if cfg.get("real_live_confirm") != LIVE_REAL_CONFIRM_TEXT:
+            raise ValueError("LIVE_REAL_SMALL_CAP requires exact real_live_confirm text")
+        cfg["advanced_alpha_engine_enabled"] = True
+        cfg["live_parity_signal_enabled"] = True
+        cfg["adaptive_ladder_tp_enabled"] = True
+        cfg["real_order_enabled"] = True
+        cfg["testnet"] = False
+        cfg["live_trading"] = True
+        cfg["account_reference_equity_usdt"] = float(cfg.get("account_reference_equity_usdt", 62.0) or 62.0)
+        cfg["max_leverage"] = min(int(cfg.get("max_leverage", 5) or 5), 5)
+        cfg["leverage"] = min(float(cfg.get("leverage", cfg["max_leverage"]) or cfg["max_leverage"]), cfg["max_leverage"])
+        cfg["max_real_position_notional_usdt"] = min(float(cfg.get("max_real_position_notional_usdt", 15.0) or 15.0), 15.0)
+        cfg["max_real_loss_per_trade_usdt"] = min(float(cfg.get("max_real_loss_per_trade_usdt", 3.0) or 3.0), 3.0)
+        cfg["max_risk_per_trade_pct"] = min(float(cfg.get("max_risk_per_trade_pct", 0.50) or 0.50), 0.50)
+        cfg["max_open_positions"] = min(int(cfg.get("max_open_positions", 1) or 1), 1)
+        cfg["max_same_direction_positions"] = min(int(cfg.get("max_same_direction_positions", 1) or 1), 1)
+        cfg["max_daily_real_loss_usdt"] = min(float(cfg.get("max_daily_real_loss_usdt", 6.0) or 6.0), 6.0)
+        cfg["max_weekly_real_loss_usdt"] = min(float(cfg.get("max_weekly_real_loss_usdt", 30.0) or 30.0), 30.0)
+        cfg.setdefault("live_real_allowlist", list(LIVE_REAL_ALLOWED_SYMBOLS_DEFAULT))
+        cfg.setdefault("live_real_blocklist", [])
+        cfg.setdefault("min_notional_usdt", 5.0)
+    elif stage == "LIVE_REAL_FULL_LOCKED":
+        raise ValueError("LIVE_REAL_FULL_LOCKED is intentionally locked; use LIVE_REAL_SMALL_CAP only")
+    else:
+        raise ValueError(f"Unknown live_activation_stage: {stage}")
+    return cfg
+
+PAUSE_STATE_FILE = "runtime/critical_pause_state.json"
+LIVE_REAL_RISK_STATE_FILE = "runtime/live_real_risk_state.json"
+
+def write_critical_pause_state(symbol, reason, exception, cfg=None):
+    state = {
+        "status": "CRITICAL_PAUSED",
+        "symbol": symbol,
+        "reason": reason,
+        "exception": repr(exception),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "manual_resume_required": True,
+    }
+    os.makedirs("runtime", exist_ok=True)
+    with open(PAUSE_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=4)
+    return state
+
+def load_critical_pause_state():
+    if not os.path.exists(PAUSE_STATE_FILE):
+        return None
+    try:
+        with open(PAUSE_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def assert_trading_allowed(symbol, cfg=None):
+    state = load_critical_pause_state()
+    if state and state.get("status") == "CRITICAL_PAUSED":
+        if state.get("symbol") in {symbol, "*"}:
+            raise RuntimeError(f"TRADING_CRITICAL_PAUSED for {symbol}: {state.get('reason')}")
+    if cfg and bool(cfg.get("global_trading_paused", False)):
+        raise RuntimeError("TRADING_GLOBAL_PAUSED")
+    return True
+
+def manual_resume_trading(symbol, confirm_text):
+    required = "I_CONFIRM_MANUAL_RISK_CHECK_DONE"
+
+    if confirm_text != required:
+        raise ValueError("Manual Confirmation Required: exact verification token missing.")
+
+    state = load_critical_pause_state()
+
+    if not state:
+        return {"status": "NO_PAUSE_STATE"}
+
+    if symbol not in {state.get("symbol"), "*"}:
+        raise ValueError("symbol does not match pause state")
+
+    from pathlib import Path
+    import shutil
+    from datetime import datetime, timezone
+
+    archive_dir = Path("runtime/pause_archive")
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_symbol = symbol.replace("/", "_").replace(":", "_")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    archive_file = archive_dir / f"critical_pause_{safe_symbol}_{ts}.json"
+
+    try:
+        shutil.move(str(PAUSE_STATE_FILE), str(archive_file))
+    except Exception:
+        logger.exception("Failed to archive pause state before manual resume")
+        raise
+
+    try:
+        if globals().get("notify_telegram_warning"):
+            notify_telegram_warning(f"Manual trading resume completed for {symbol}")
+    except Exception:
+        pass
+
+    return {
+        "status": "RESUMED",
+        "symbol": symbol,
+        "archived": str(archive_file),
+    }
+
+class InvalidOrderPlan(Exception):
+    pass
+
+
+class TradingSafetyError(Exception):
+    pass
+
+
+class TradingPausedError(TradingSafetyError):
+    pass
+
+
+def configure_binance_futures_environment(exchange, cfg):
+    if exchange is None:
+        raise TradingSafetyError("exchange is required")
+    cfg = cfg if isinstance(cfg, dict) else {}
+    stage = _normalize_live_real_stage(cfg.get("live_activation_stage"))
+    if stage == "LIVE_REAL_SMALL_CAP" and bool(cfg.get("testnet", False)):
+        raise TradingSafetyError("LIVE_REAL_SMALL_CAP must not use Binance testnet/sandbox")
+
+    options = dict(getattr(exchange, "options", {}) or {})
+    options["defaultType"] = "future"
+    options["adjustForTimeDifference"] = True
+    exchange.options = options
+
+    sandbox = stage == "TESTNET_ONLY" or bool(cfg.get("testnet", False))
+    if hasattr(exchange, "set_sandbox_mode"):
+        exchange.set_sandbox_mode(bool(sandbox))
+    return {
+        "defaultType": exchange.options.get("defaultType"),
+        "adjustForTimeDifference": exchange.options.get("adjustForTimeDifference"),
+        "sandbox": bool(sandbox),
+    }
+
+
+def assert_symbol_allowed_for_live_real(symbol, cfg):
+    cfg = cfg if isinstance(cfg, dict) else {}
+    stage = _normalize_live_real_stage(cfg.get("live_activation_stage"))
+    if stage != "LIVE_REAL_SMALL_CAP":
+        return True
+
+    normalized = _normalize_live_real_symbol(symbol)
+    allowlist = cfg.get("live_real_allowlist", LIVE_REAL_ALLOWED_SYMBOLS_DEFAULT)
+    blocklist = cfg.get("live_real_blocklist", [])
+    allowed = {_normalize_live_real_symbol(item) for item in (allowlist or []) if _normalize_live_real_symbol(item)}
+    blocked = {_normalize_live_real_symbol(item) for item in (blocklist or []) if _normalize_live_real_symbol(item)}
+
+    if normalized in blocked:
+        raise TradingSafetyError(f"{symbol} is blocked for LIVE_REAL_SMALL_CAP")
+    if allowed and normalized not in allowed:
+        raise TradingSafetyError(f"{symbol} is not in LIVE_REAL_SMALL_CAP allowlist")
+
+    compact = normalized.replace("/", "")
+    if any(fragment in normalized or fragment.replace("/", "") in compact for fragment in LIVE_REAL_BLOCKED_SYMBOL_FRAGMENTS):
+        raise TradingSafetyError(f"{symbol} looks like a leveraged token or tokenized stock and is blocked")
+    return True
+
+
+def _live_real_period_keys(now=None):
+    now = now or datetime.now(timezone.utc)
+    iso = now.isocalendar()
+    return now.strftime("%Y-%m-%d"), f"{iso.year}-W{iso.week:02d}"
+
+
+def load_live_real_risk_state():
+    today, week = _live_real_period_keys()
+    default_state = {
+        "date": today,
+        "week": week,
+        "daily_realized_pnl_usdt": 0.0,
+        "weekly_realized_pnl_usdt": 0.0,
+    }
+    if not os.path.exists(LIVE_REAL_RISK_STATE_FILE):
+        return default_state
+    try:
+        with open(LIVE_REAL_RISK_STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception:
+        return default_state
+    if not isinstance(state, dict):
+        return default_state
+    state.setdefault("date", today)
+    state.setdefault("week", week)
+    if state.get("date") != today:
+        state["date"] = today
+        state["daily_realized_pnl_usdt"] = 0.0
+        state["daily_loss_usdt"] = 0.0
+    if state.get("week") != week:
+        state["week"] = week
+        state["weekly_realized_pnl_usdt"] = 0.0
+        state["weekly_loss_usdt"] = 0.0
+    state.setdefault("daily_realized_pnl_usdt", 0.0)
+    state.setdefault("weekly_realized_pnl_usdt", 0.0)
+    return state
+
+
+def save_live_real_risk_state(state):
+    os.makedirs(os.path.dirname(LIVE_REAL_RISK_STATE_FILE) or ".", exist_ok=True)
+    with open(LIVE_REAL_RISK_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state if isinstance(state, dict) else {}, f, indent=4)
+    return state
+
+
+def _realized_loss_from_state(state, pnl_key, loss_key):
+    loss = 0.0
+    try:
+        pnl = float((state or {}).get(pnl_key, 0.0) or 0.0)
+        if pnl < 0:
+            loss = max(loss, abs(pnl))
+    except Exception:
+        pass
+    try:
+        explicit_loss = float((state or {}).get(loss_key, 0.0) or 0.0)
+        if explicit_loss > 0:
+            loss = max(loss, explicit_loss)
+    except Exception:
+        pass
+    return loss
+
+
+def assert_live_real_loss_limits_not_exceeded(cfg):
+    cfg = cfg if isinstance(cfg, dict) else {}
+    if _normalize_live_real_stage(cfg.get("live_activation_stage")) != "LIVE_REAL_SMALL_CAP":
+        return True
+    state = load_live_real_risk_state()
+    daily_loss = _realized_loss_from_state(state, "daily_realized_pnl_usdt", "daily_loss_usdt")
+    weekly_loss = _realized_loss_from_state(state, "weekly_realized_pnl_usdt", "weekly_loss_usdt")
+    max_daily = float(cfg.get("max_daily_real_loss_usdt", 6.0) or 6.0)
+    max_weekly = float(cfg.get("max_weekly_real_loss_usdt", 30.0) or 30.0)
+    if daily_loss >= max_daily:
+        raise TradingPausedError(f"daily real loss limit reached: {daily_loss:.4f} >= {max_daily:.4f}")
+    if weekly_loss >= max_weekly:
+        raise TradingPausedError(f"weekly real loss limit reached: {weekly_loss:.4f} >= {max_weekly:.4f}")
+    return True
+
+
+def validate_min_notional_against_live_cap(min_notional, cfg):
+    cfg = cfg if isinstance(cfg, dict) else {}
+    if _normalize_live_real_stage(cfg.get("live_activation_stage")) != "LIVE_REAL_SMALL_CAP":
+        return True
+    cap = float(cfg.get("max_real_position_notional_usdt", 15.0) or 15.0)
+    if float(min_notional) > cap:
+        raise InvalidOrderPlan(f"minNotional {float(min_notional):.4f} exceeds live real notional cap {cap:.4f}")
+    return True
+
+
+def _live_real_entry_reference(plan, cfg):
+    entry_ref = getattr(plan, "entry_price", None) or (cfg or {}).get("last_price") or (cfg or {}).get("last_context_close") or 0.0
+    try:
+        return float(entry_ref)
+    except Exception:
+        return 0.0
+
+
+def _scale_live_order_plan_qty(plan, new_qty):
+    old_qty = float(getattr(plan, "qty", 0.0) or 0.0)
+    new_qty = float(new_qty)
+    if new_qty <= 0:
+        raise InvalidOrderPlan("qty <= 0 after LIVE_REAL_SMALL_CAP scaling")
+    ratio = new_qty / old_qty if old_qty > 0 else 0.0
+    plan.qty = new_qty
+    for tp in getattr(plan, "tp_orders", []) or []:
+        tp.qty = float(tp.qty) * ratio
+    return plan
+
+
+def enforce_live_real_order_caps(plan, context, cfg):
+    cfg = cfg if isinstance(cfg, dict) else {}
+    if _normalize_live_real_stage(cfg.get("live_activation_stage")) != "LIVE_REAL_SMALL_CAP":
+        return plan
+    entry_ref = float(getattr(plan, "entry_price", None) or getattr(context, "close", 0.0) or cfg.get("last_price") or 0.0)
+    if entry_ref <= 0:
+        raise InvalidOrderPlan("missing entry reference price for LIVE_REAL_SMALL_CAP cap check")
+    qty = float(plan.qty)
+    notional = qty * entry_ref
+    notional_cap = float(cfg.get("max_real_position_notional_usdt", 15.0) or 15.0)
+    if notional > notional_cap:
+        qty = notional_cap / entry_ref
+
+    stop_ref = float(plan.initial_sl_price)
+    risk_per_unit = abs(entry_ref - stop_ref)
+    loss_cap = float(cfg.get("max_real_loss_per_trade_usdt", 3.0) or 3.0)
+    if risk_per_unit <= 0:
+        raise InvalidOrderPlan("invalid SL distance for LIVE_REAL_SMALL_CAP cap check")
+    if qty * risk_per_unit > loss_cap:
+        qty = loss_cap / risk_per_unit
+    return _scale_live_order_plan_qty(plan, qty)
+
+
+def validate_live_real_order_caps_after_rounding(plan, cfg):
+    cfg = cfg if isinstance(cfg, dict) else {}
+    if _normalize_live_real_stage(cfg.get("live_activation_stage")) != "LIVE_REAL_SMALL_CAP":
+        return True
+    entry_ref = _live_real_entry_reference(plan, cfg)
+    if entry_ref <= 0:
+        raise InvalidOrderPlan("missing entry reference price for LIVE_REAL_SMALL_CAP rounded cap check")
+    qty = float(plan.qty)
+    notional_cap = float(cfg.get("max_real_position_notional_usdt", 15.0) or 15.0)
+    loss_cap = float(cfg.get("max_real_loss_per_trade_usdt", 3.0) or 3.0)
+    notional = qty * entry_ref
+    loss = qty * abs(entry_ref - float(plan.initial_sl_price))
+    if notional > notional_cap * 1.001:
+        raise InvalidOrderPlan(f"LIVE_REAL_SMALL_CAP notional cap exceeded after rounding: {notional:.4f} > {notional_cap:.4f}")
+    if loss > loss_cap * 1.001:
+        raise InvalidOrderPlan(f"LIVE_REAL_SMALL_CAP loss cap exceeded after rounding: {loss:.4f} > {loss_cap:.4f}")
+    return True
+
+def calculate_initial_stop_price(side, entry_price, atr, config, engine="NONE"):
+    stop_distance = float(config.get("initial_stop_atr_distance", 2.0) or 2.0) * float(atr)
+    if side == "LONG":
+        return float(entry_price) - stop_distance
+    else:
+        return float(entry_price) + stop_distance
+
+def calculate_position_qty_by_risk(equity, risk_pct, entry_price, stop_price, symbol, config):
+    risk_usdt = float(equity) * (float(risk_pct) / 100.0)
+    price_distance = abs(float(entry_price) - float(stop_price))
+    if price_distance <= 0:
+        return 0.0
+    qty = risk_usdt / price_distance
+    return qty
+
+def calculate_tp_price(side, entry_price, stop_price, r_multiple):
+    price_distance = abs(float(entry_price) - float(stop_price))
+    if side == "LONG":
+        return float(entry_price) + (price_distance * float(r_multiple))
+    else:
+        return float(entry_price) - (price_distance * float(r_multiple))
+
+def build_ladder_tp_orders(side, entry_price, qty, ladder, config):
+    if ladder is None:
+        ladder = LadderTP(1.0, 50.0, 1.6, 50.0)
+
+    exit_side = "sell" if side == "LONG" else "buy"
+    targets = []
+    targets.append(("TP1", ladder.tp1_r, ladder.tp1_pct))
+    targets.append(("TP2", ladder.tp2_r, ladder.tp2_pct))
+    if getattr(ladder, "tp3_r", None) is not None and getattr(ladder, "tp3_pct", None) is not None:
+        targets.append(("TP3", ladder.tp3_r, ladder.tp3_pct))
+
+    total_pct = sum(pct for _, _, pct in targets)
+    if abs(total_pct - 100.0) > 0.001:
+        raise InvalidOrderPlan("ladder TP percentages must sum to 100")
+
+    orders = []
+    for name, r_mult, pct in targets:
+        tp_price = calculate_tp_price(side, entry_price, config["initial_stop_price"], r_mult)
+        tp_qty = qty * (pct / 100.0)
+
+        orders.append(TakeProfitOrderPlan(
+            tp_name=name,
+            side=exit_side,
+            price=tp_price,
+            qty=tp_qty,
+            reduce_only=True,
+            close_position=False,
+            r_multiple=r_mult,
+            pct=pct,
+        ))
+    return orders
+
+def build_live_order_plan_from_decision(symbol, decision, context, cfg, *, account_equity):
+    if account_equity is None or float(account_equity) <= 0:
+        raise InvalidOrderPlan("live order plan requires real account equity")
+    equity = float(account_equity)
+
+    risk_pct = min(
+        float(decision.risk_pct),
+        float(cfg.get("max_risk_per_trade_pct", 1.0)),
+    )
+    if risk_pct <= 0:
+        raise InvalidOrderPlan("risk_pct <= 0")
+
+    sl_price = calculate_initial_stop_price(
+        side=decision.side,
+        entry_price=context.close,
+        atr=context.atr,
+        config=cfg,
+        engine=decision.engine,
+    )
+
+    qty = calculate_position_qty_by_risk(
+        equity=equity,
+        risk_pct=risk_pct,
+        entry_price=context.close,
+        stop_price=sl_price,
+        symbol=symbol,
+        config=cfg,
+    )
+
+    if qty <= 0:
+        raise InvalidOrderPlan("qty <= 0")
+
+    tp_config = dict(cfg)
+    tp_config["symbol"] = symbol
+    tp_config["initial_stop_price"] = sl_price
+
+    tp_orders = build_ladder_tp_orders(
+        side=decision.side,
+        entry_price=context.close,
+        qty=qty,
+        ladder=decision.ladder_tp,
+        config=tp_config,
+    )
+
+    return LiveOrderPlan(
+        symbol=symbol,
+        side=decision.side,
+        entry_type=cfg.get("entry_order_type", "MARKET"),
+        entry_price=None if cfg.get("entry_order_type", "MARKET") == "MARKET" else context.close,
+        qty=qty,
+        risk_pct=risk_pct,
+        initial_sl_price=sl_price,
+        tp_orders=tp_orders,
+        ladder=decision.ladder_tp,
+        reduce_only=False,
+        engine=decision.engine,
+        regime=decision.regime,
+        confidence=decision.confidence,
+        expected_r=decision.expected_r,
+        reasons=decision.reasons,
+    )
+
+def validate_live_order_plan(plan, cfg):
+    if plan.qty <= 0:
+        raise InvalidOrderPlan("qty <= 0")
+    if plan.initial_sl_price <= 0:
+        raise InvalidOrderPlan("invalid SL price")
+    if not plan.tp_orders:
+        raise InvalidOrderPlan("no TP orders")
+    if plan.risk_pct <= 0:
+        raise InvalidOrderPlan("risk_pct <= 0")
+    if plan.risk_pct > float(cfg.get("max_risk_per_trade_pct", 1.0)):
+        raise InvalidOrderPlan("risk exceeds max")
+
+    tp_qty_sum = sum(tp.qty for tp in plan.tp_orders)
+    if tp_qty_sum > plan.qty * 1.0001:
+        raise InvalidOrderPlan("TP qty exceeds position qty")
+
+    for tp in plan.tp_orders:
+        if not tp.reduce_only:
+            raise InvalidOrderPlan("TP must be reduceOnly")
+        if tp.close_position:
+            raise InvalidOrderPlan("partial TP must not use closePosition")
+    return True
+
+# ==============================================================================
+# Hardening Support & Calculation Helpers
+# ==============================================================================
+
+async def _fetch_live_ohlcv_rows_for_context(self, symbol, cfg):
+    tf = cfg.get("timeframe", "15m")
+    limit = max(120, int(cfg.get("live_context_ohlcv_limit", 200) or 200))
+    raw = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, tf, limit=limit)
+    rows = []
+    for i, item in enumerate(raw or []):
+        if len(item) < 6:
+            continue
+        rows.append({
+            "index": i,
+            "timestamp": item[0],
+            "open": float(item[1]),
+            "high": float(item[2]),
+            "low": float(item[3]),
+            "close": float(item[4]),
+            "volume": float(item[5]),
+        })
+    return rows
+
+async def _build_live_indicator_values(self, symbol, side, rows, idx, cfg):
+    values = {
+        "symbol": symbol,
+        "timeframe": cfg.get("timeframe", "15m"),
+        "utbot_direction": str(side).upper(),
+    }
+    row = rows[idx]
+    values.update({
+        "open": row["open"],
+        "high": row["high"],
+        "low": row["low"],
+        "close": row["close"],
+        "volume": row["volume"],
+    })
+
+    try:
+        adx_values = self._calculate_live_adx_dmi(rows, cfg)
+        values.update(adx_values)
+    except Exception as e:
+        logger.warning("[Live Context] ADX/DMI calculation failed for %s: %s", symbol, e)
+        values["indicator_data_missing"] = True
+
+    try:
+        htf_values = await self._calculate_live_htf_trend(symbol, cfg)
+        values.update(htf_values)
+    except Exception as e:
+        logger.warning("[Live Context] HTF trend calculation failed for %s: %s", symbol, e)
+        values["htf_data_missing"] = True
+
+    values.setdefault("squeeze_percentile", None)
+
+    try:
+        deriv_values = await self._fetch_live_derivatives_values(symbol, cfg)
+        values.update(deriv_values)
+    except Exception as e:
+        logger.warning("[Live Context] derivatives fetch failed for %s: %s", symbol, e)
+        values["derivatives_data_missing"] = True
+
+    try:
+        liquidity_values = await self._fetch_live_liquidity_values(symbol, cfg)
+        values.update(liquidity_values)
+    except Exception as e:
+        logger.warning("[Live Context] liquidity fetch failed for %s: %s", symbol, e)
+        values["liquidity_data_missing"] = True
+
+    return values
+
+def _calculate_live_adx_dmi(self, rows, cfg):
+    length = int(cfg.get("adx_length", 14) or 14)
+    if len(rows) < length + 2:
+        return {"indicator_data_missing": True}
+
+    highs = [float(r["high"]) for r in rows]
+    lows = [float(r["low"]) for r in rows]
+    closes = [float(r["close"]) for r in rows]
+
+    tr_list = []
+    plus_dm_list = []
+    minus_dm_list = []
+
+    for i in range(1, len(rows)):
+        high_diff = highs[i] - highs[i - 1]
+        low_diff = lows[i - 1] - lows[i]
+
+        plus_dm = high_diff if high_diff > low_diff and high_diff > 0 else 0.0
+        minus_dm = low_diff if low_diff > high_diff and low_diff > 0 else 0.0
+
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+
+        tr_list.append(tr)
+        plus_dm_list.append(plus_dm)
+        minus_dm_list.append(minus_dm)
+
+    if len(tr_list) < length:
+        return {"indicator_data_missing": True}
+
+    atr = sum(tr_list[-length:]) / length
+    plus_dm_sum = sum(plus_dm_list[-length:])
+    minus_dm_sum = sum(minus_dm_list[-length:])
+
+    if atr <= 0:
+        return {"indicator_data_missing": True}
+
+    plus_di = 100.0 * plus_dm_sum / max(sum(tr_list[-length:]), 1e-12)
+    minus_di = 100.0 * minus_dm_sum / max(sum(tr_list[-length:]), 1e-12)
+    dx = 100.0 * abs(plus_di - minus_di) / max(plus_di + minus_di, 1e-12)
+    adx = dx
+
+    atr_values = []
+    for j in range(length, len(rows)):
+        window_tr = tr_list[max(0, j - length):j]
+        if window_tr:
+            atr_values.append(sum(window_tr) / len(window_tr))
+
+    current_atr = atr
+    if atr_values:
+        below = sum(1 for v in atr_values if v <= current_atr)
+        atr_percentile = (below / len(atr_values)) * 100.0
+    else:
+        atr_percentile = None
+
+    return {
+        "atr": current_atr,
+        "adx": adx,
+        "plus_di": plus_di,
+        "minus_di": minus_di,
+        "atr_percentile": atr_percentile,
+    }
+
+async def _calculate_live_htf_trend(self, symbol, cfg):
+    htf = cfg.get("htf_timeframe", cfg.get("higher_timeframe", "1h"))
+    limit = max(220, int(cfg.get("htf_ohlcv_limit", 250) or 250))
+    raw = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, htf, limit=limit)
+    closes = [float(x[4]) for x in raw or [] if len(x) >= 5]
+    if len(closes) < 200:
+        return {
+            "htf_trend": "FLAT",
+            "supertrend_direction": "FLAT",
+            "htf_data_missing": True,
+        }
+
+    ema50 = self._ema_last(closes, 50)
+    ema200 = self._ema_last(closes, 200)
+
+    if ema50 > ema200 and closes[-1] > ema50:
+        trend = "UP"
+    elif ema50 < ema200 and closes[-1] < ema50:
+        trend = "DOWN"
+    else:
+        trend = "FLAT"
+
+    return {
+        "htf_trend": trend,
+        "supertrend_direction": trend,
+        "htf_ema50": ema50,
+        "htf_ema200": ema200,
+    }
+
+def _ema_last(self, values, length):
+    if not values:
+        return 0.0
+    alpha = 2.0 / (length + 1.0)
+    ema = float(values[0])
+    for value in values[1:]:
+        ema = alpha * float(value) + (1.0 - alpha) * ema
+    return ema
+
+async def _fetch_live_derivatives_values(self, symbol, cfg):
+    values = {}
+    try:
+        funding_info = await asyncio.to_thread(self.exchange.fetch_funding_rate, symbol)
+        if funding_info and "fundingRate" in funding_info:
+            values["funding_rate"] = float(funding_info["fundingRate"])
+    except Exception as e:
+        logger.debug("Failed to fetch funding rate: %s", e)
+
+    values.setdefault("funding_rate", None)
+    values.setdefault("oi_change_pct", None)
+    values.setdefault("long_short_ratio", None)
+    return values
+
+async def _fetch_live_liquidity_values(self, symbol, cfg):
+    try:
+        ob = await asyncio.to_thread(self.exchange.fetch_order_book, symbol, 5)
+        if ob and ob.get("bids") and ob.get("asks"):
+            bid = float(ob["bids"][0][0])
+            ask = float(ob["asks"][0][0])
+            spread = ask - bid
+            mid = (ask + bid) / 2.0
+            if mid > 0:
+                spread_bps = (spread / mid) * 10000.0
+                return {"spread_bps": spread_bps}
+    except Exception as e:
+        logger.debug("Failed to fetch liquidity values: %s", e)
+    return {"spread_bps": None}
+
+def _validate_live_context_or_block(self, symbol, context, cfg):
+    reasons = []
+    quality = getattr(context, "quality", None)
+    if quality is not None:
+        reasons.extend(list(getattr(quality, "reasons", ()) or ()))
+
+    if bool(cfg.get("require_live_dmi_for_advanced_alpha", True)):
+        if float(getattr(context, "plus_di", 0.0) or 0.0) <= 0 and float(getattr(context, "minus_di", 0.0) or 0.0) <= 0:
+            reasons.append("MISSING_DMI")
+
+    if bool(cfg.get("require_live_htf_for_advanced_alpha", True)):
+        if str(getattr(context, "htf_trend", "FLAT")).upper() == "FLAT":
+            reasons.append("MISSING_HTF_TREND")
+
+    if bool(cfg.get("require_derivatives_data_for_advanced_alpha", True)):
+        if getattr(context, "funding_rate", None) is None or getattr(context, "oi_change_pct", None) is None or getattr(context, "long_short_ratio", None) is None:
+            reasons.append("MISSING_DERIVATIVES_DATA")
+
+    if getattr(context, "spread_bps", None) is None:
+        reasons.append("MISSING_SPREAD")
+
+    if float(getattr(context, "spread_bps", 999.0) or 999.0) > float(cfg.get("max_spread_bps", 10.0) or 10.0):
+        reasons.append("BAD_LIQUIDITY")
+
+    if reasons:
+        logger.warning("[Live Parity] context blocked for %s: %s", symbol, reasons)
+        return None
+    return context
+
+
+def _infer_live_utbot_direction_from_rows(rows, cfg):
+    hint = str(
+        (cfg or {}).get("live_real_side_hint")
+        or (cfg or {}).get("live_signal_side")
+        or (cfg or {}).get("utbot_direction")
+        or ""
+    ).upper()
+    if hint in {"LONG", "SHORT"}:
+        return hint
+
+    cfg = cfg or {}
+    key_value = float(cfg.get("utbot_key_value", cfg.get("key_value", 2.5)) or 2.5)
+    atr_period = max(1, int(cfg.get("utbot_atr_period", cfg.get("atr_period", 14)) or 14))
+    if not rows or len(rows) < max(atr_period + 3, 20):
+        return ""
+    try:
+        closed = pd.DataFrame(rows).iloc[:-1].copy().reset_index(drop=True)
+        if len(closed) < max(atr_period + 3, 20):
+            closed = pd.DataFrame(rows).copy().reset_index(drop=True)
+        prev_close = closed["close"].shift(1)
+        true_range = pd.concat([
+            (closed["high"] - closed["low"]).abs(),
+            (closed["high"] - prev_close).abs(),
+            (closed["low"] - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        atr_series = pd.Series(np.nan, index=closed.index, dtype=float)
+        if len(true_range) >= atr_period:
+            atr_series.iloc[atr_period - 1] = true_range.iloc[:atr_period].mean()
+            for idx in range(atr_period, len(true_range)):
+                atr_series.iloc[idx] = ((atr_series.iloc[idx - 1] * (atr_period - 1)) + true_range.iloc[idx]) / atr_period
+        valid = pd.DataFrame({
+            "src": closed["close"].astype(float),
+            "atr": atr_series.astype(float),
+        }).dropna().reset_index(drop=True)
+        if len(valid) < 3:
+            return ""
+        valid["nloss"] = valid["atr"] * key_value
+        trail = []
+        for idx, row in valid.iterrows():
+            src_val = float(row["src"])
+            nloss_val = float(row["nloss"])
+            if idx == 0:
+                trail.append(src_val - nloss_val)
+                continue
+            prev_stop = float(trail[-1])
+            prev_src = float(valid.iloc[idx - 1]["src"])
+            if src_val > prev_stop and prev_src > prev_stop:
+                trail.append(max(prev_stop, src_val - nloss_val))
+            elif src_val < prev_stop and prev_src < prev_stop:
+                trail.append(min(prev_stop, src_val + nloss_val))
+            elif src_val > prev_stop:
+                trail.append(src_val - nloss_val)
+            else:
+                trail.append(src_val + nloss_val)
+        curr_src = float(valid.iloc[-1]["src"])
+        curr_stop = float(trail[-1])
+        if curr_src > curr_stop:
+            return "LONG"
+        if curr_src < curr_stop:
+            return "SHORT"
+    except Exception as exc:
+        logger.warning("[Live Real] UT direction inference failed: %s", exc)
+    return ""
+
+
+async def build_live_context_for_symbol(self, symbol, cfg):
+    cfg = cfg if isinstance(cfg, dict) else {}
+    rows = await self._fetch_live_ohlcv_rows_for_context(symbol, cfg)
+    if not rows or len(rows) < int(cfg.get("live_context_min_bars", 80) or 80):
+        raise TradingSafetyError(f"insufficient live OHLCV context for {symbol}")
+
+    idx = len(rows) - 1
+    side = _infer_live_utbot_direction_from_rows(rows, cfg)
+    indicator_values = await self._build_live_indicator_values(
+        symbol=symbol,
+        side=side,
+        rows=rows,
+        idx=idx,
+        cfg=cfg,
+    )
+    context = build_market_context(
+        rows=rows,
+        idx=idx,
+        symbol=symbol,
+        timeframe=cfg.get("timeframe", "15m"),
+        values=indicator_values,
+        config=cfg,
+    )
+    context = self._validate_live_context_or_block(symbol, context, cfg)
+    if context is None:
+        raise TradingSafetyError(f"invalid live context for {symbol}")
+    try:
+        object.__setattr__(context, "current_candle", rows[idx])
+    except Exception:
+        pass
+    cfg["last_price"] = float(getattr(context, "close", 0.0) or 0.0)
+    cfg["last_context_close"] = cfg["last_price"]
+    cfg["last_context_atr"] = float(getattr(context, "atr", 0.0) or 0.0)
+    return context
+
+
+def get_runtime_models(self=None, cfg=None):
+    return getattr(self, "models", None) or {}
+
+
+def get_runtime_stats(self=None, symbol=None, cfg=None):
+    return ENGINE_PERFORMANCE_STATS
+
+
+def _live_real_position_contracts(self, position):
+    try:
+        return abs(float(self._position_signed_contracts(position) or 0.0))
+    except Exception:
+        pass
+    if not isinstance(position, dict):
+        return 0.0
+    info = position.get("info", {}) if isinstance(position.get("info"), dict) else {}
+    for source in (position, info):
+        for key in ("contracts", "contract", "amount", "positionAmt", "position_amt", "size"):
+            try:
+                value = float(source.get(key, 0.0) or 0.0)
+                if value:
+                    return abs(value)
+            except Exception:
+                continue
+    return 0.0
+
+
+async def preflight_live_real_check(self, symbol, cfg):
+    cfg = enforce_activation_stage(cfg if isinstance(cfg, dict) else {})
+    if _normalize_live_real_stage(cfg.get("live_activation_stage")) != "LIVE_REAL_SMALL_CAP":
+        raise TradingSafetyError("preflight_live_real_check requires LIVE_REAL_SMALL_CAP")
+    if getattr(self, "is_upbit_mode", lambda: False)():
+        raise TradingSafetyError("LIVE_REAL_SMALL_CAP is Binance Futures only")
+    if bool(cfg.get("testnet", False)):
+        raise TradingSafetyError("LIVE_REAL_SMALL_CAP must not use testnet")
+    if not bool(cfg.get("real_order_enabled", False)) or not bool(cfg.get("live_trading", False)):
+        raise TradingSafetyError("LIVE_REAL_SMALL_CAP real order flags are not enabled")
+
+    assert_symbol_allowed_for_live_real(symbol, cfg)
+    assert_live_real_loss_limits_not_exceeded(cfg)
+    state = load_critical_pause_state()
+    if state and state.get("status") == "CRITICAL_PAUSED":
+        raise TradingPausedError(f"TRADING_CRITICAL_PAUSED: {state.get('reason')}")
+
+    configure_binance_futures_environment(self.exchange, cfg)
+    if hasattr(self.exchange, "load_markets"):
+        await asyncio.to_thread(self.exchange.load_markets)
+
+    active_positions = []
+    if hasattr(self.exchange, "fetch_positions"):
+        try:
+            positions = await asyncio.to_thread(self.exchange.fetch_positions)
+        except Exception as exc:
+            raise TradingSafetyError(f"could not verify open futures positions: {exc}") from exc
+        for pos in positions or []:
+            if _live_real_position_contracts(self, pos) > 0:
+                active_positions.append(pos)
+    elif hasattr(self, "get_server_position"):
+        pos = await self.get_server_position(symbol, use_cache=False)
+        if pos and _live_real_position_contracts(self, pos) > 0:
+            active_positions.append(pos)
+    else:
+        raise TradingSafetyError("could not verify open futures positions")
+    if active_positions:
+        raise TradingSafetyError("LIVE_REAL_SMALL_CAP blocks new entries while any futures position is open")
+
+    open_orders = []
+    if not hasattr(self.exchange, "fetch_open_orders"):
+        raise TradingSafetyError("could not verify open futures orders")
+    for args in ((symbol,), tuple()):
+        try:
+            fetched = await asyncio.to_thread(self.exchange.fetch_open_orders, *args)
+        except Exception as exc:
+            raise TradingSafetyError(f"could not verify open futures orders: {exc}") from exc
+        open_orders.extend(fetched or [])
+    if open_orders:
+        raise TradingSafetyError("LIVE_REAL_SMALL_CAP blocks new entries while open orders exist")
+
+    account_equity = await self._fetch_futures_account_equity(cfg)
+    if float(account_equity) <= 0:
+        raise TradingSafetyError("real futures account equity must be positive")
+    return {
+        "status": "OK",
+        "symbol": symbol,
+        "account_equity": float(account_equity),
+        "open_positions": 0,
+        "open_orders": 0,
+    }
+
+
+async def run_live_real_once(self, symbol, cfg):
+    cfg = enforce_activation_stage(cfg if isinstance(cfg, dict) else {})
+    if _normalize_live_real_stage(cfg.get("live_activation_stage")) != "LIVE_REAL_SMALL_CAP":
+        raise TradingSafetyError("run_live_real_once requires LIVE_REAL_SMALL_CAP")
+    preflight = await self.preflight_live_real_check(symbol, cfg)
+    context = await self.build_live_context_for_symbol(symbol, cfg)
+    decision = evaluate_final_trade_decision(
+        candle=getattr(context, "current_candle", None),
+        context=context,
+        config=cfg,
+        models=self.get_runtime_models(cfg),
+        stats=self.get_runtime_stats(symbol, cfg),
+    )
+    if not decision.valid:
+        return {
+            "status": "NO_TRADE",
+            "symbol": symbol,
+            "reason": list(decision.reasons or []),
+        }
+
+    account_equity = float(preflight.get("account_equity") or await self._fetch_futures_account_equity(cfg))
+    plan = build_live_order_plan_from_decision(
+        symbol,
+        decision,
+        context,
+        cfg,
+        account_equity=account_equity,
+    )
+    plan = enforce_live_real_order_caps(plan, context, cfg)
+    cfg["last_price"] = float(getattr(context, "close", 0.0) or cfg.get("last_price") or 0.0)
+    return await self.execute_live_order_plan(plan, cfg)
+
+async def _fetch_futures_account_equity(self, cfg):
+    if self.is_upbit_mode():
+        raise InvalidOrderPlan("advanced live futures equity is not available in Upbit mode")
+
+    balance = await asyncio.to_thread(self.exchange.fetch_balance)
+    candidates = []
+
+    try:
+        usdt_total = balance.get("USDT", {}).get("total")
+        if usdt_total is not None:
+            candidates.append(float(usdt_total))
+    except Exception:
+        pass
+
+    try:
+        usdt_free = balance.get("USDT", {}).get("free")
+        if usdt_free is not None:
+            candidates.append(float(usdt_free))
+    except Exception:
+        pass
+
+    try:
+        info = balance.get("info", {})
+        total_wallet_balance = info.get("totalWalletBalance")
+        if total_wallet_balance is not None:
+            candidates.append(float(total_wallet_balance))
+    except Exception:
+        pass
+
+    candidates = [x for x in candidates if x > 0]
+    if not candidates:
+        raise InvalidOrderPlan("could not fetch real futures account equity")
+    return min(candidates)
+
+def _get_min_notional_for_symbol(self, symbol, cfg):
+    market = None
+    try:
+        market = self.exchange.market(symbol)
+    except Exception:
+        pass
+
+    if market:
+        limits = market.get("limits", {}) or {}
+        cost = limits.get("cost", {}) or {}
+        min_cost = cost.get("min")
+        if min_cost:
+            return float(min_cost)
+    return float(cfg.get("min_notional_usdt", 5.0) or 5.0)
+
+def _normalize_live_order_plan_for_exchange(self, plan, cfg):
+    plan.qty = float(self.safe_amount(plan.symbol, plan.qty))
+    plan.initial_sl_price = float(self.safe_price(plan.symbol, plan.initial_sl_price))
+
+    normalized_tps = []
+    for tp in plan.tp_orders:
+        tp.qty = float(self.safe_amount(plan.symbol, tp.qty))
+        tp.price = float(self.safe_price(plan.symbol, tp.price))
+        if tp.qty > 0:
+            normalized_tps.append(tp)
+
+    plan.tp_orders = normalized_tps
+    return plan
+
+def _validate_live_order_plan_for_exchange(self, plan, cfg):
+    validate_live_order_plan(plan, cfg)
+    min_notional = self._get_min_notional_for_symbol(plan.symbol, cfg)
+    validate_min_notional_against_live_cap(min_notional, cfg)
+    entry_ref = plan.entry_price or cfg.get("last_price") or 0.0
+    if not entry_ref:
+        raise InvalidOrderPlan("missing entry reference price for minNotional check")
+
+    if float(plan.qty) * float(entry_ref) < min_notional:
+        raise InvalidOrderPlan("order notional below minNotional")
+    validate_live_real_order_caps_after_rounding(plan, cfg)
+    return True
+
+# ==============================================================================
+# Hardened Execution Orchestrator
+# ==============================================================================
+
+async def execute_live_order_plan(self, plan, cfg):
+    cfg = enforce_activation_stage(cfg if isinstance(cfg, dict) else {})
+    if _normalize_live_real_stage(cfg.get("live_activation_stage")) == "LIVE_REAL_SMALL_CAP":
+        if bool(cfg.get("testnet", False)):
+            raise TradingSafetyError("LIVE_REAL_SMALL_CAP must not use testnet")
+        if not bool(cfg.get("real_order_enabled", False)) or not bool(cfg.get("live_trading", False)):
+            raise TradingSafetyError("LIVE_REAL_SMALL_CAP real order flags are not enabled")
+        assert_symbol_allowed_for_live_real(plan.symbol, cfg)
+        assert_live_real_loss_limits_not_exceeded(cfg)
+        configure_binance_futures_environment(self.exchange, cfg)
+    assert_trading_allowed(plan.symbol, cfg)
+    plan = self._normalize_live_order_plan_for_exchange(plan, cfg)
+    cfg["last_price"] = plan.entry_price or cfg.get("last_price") or 0.0
+    cfg["last_context_atr"] = abs(float(cfg["last_price"]) - plan.initial_sl_price) / 2.0
+    self._validate_live_order_plan_for_exchange(plan, cfg)
+
+    if _normalize_live_real_stage(cfg.get("live_activation_stage")) == "LIVE_REAL_SMALL_CAP":
+        lev = int(max(1.0, min(float(cfg.get("leverage", 5) or 5), float(cfg.get("max_leverage", 5) or 5), 5.0)))
+    else:
+        lev = int(max(1.0, float(cfg.get("leverage", 5))))
+    await self.ensure_market_settings(plan.symbol, leverage=lev)
+    entry_side = "buy" if str(plan.side).upper() == "LONG" else "sell"
+
+    try:
+        entry_order = await asyncio.to_thread(
+            self.exchange.create_order,
+            plan.symbol,
+            "market",
+            entry_side,
+            plan.qty,
+            None,
+            {}
+        )
+    except Exception as order_err:
+        logger.error("[LiveOrderPlan] entry order failed: %s", order_err)
+        await self.ctrl.notify(f"❌ 시장가 진입 실패: {order_err}")
+        return {"status": "ENTRY_FAILED", "error": str(order_err)}
+
+    await asyncio.sleep(float(cfg.get("entry_fill_wait_sec", 1.0) or 1.0))
+    self.position_cache = None
+    self.position_cache_time = 0
+
+    pos = await self.get_server_position(plan.symbol, use_cache=False)
+    if not pos:
+        await self.ctrl.notify(f"⚠️ 진입 주문 후 포지션 확인 실패: {plan.symbol}")
+        return {"status": "ENTRY_UNVERIFIED", "entry_order": entry_order}
+
+    actual_entry = float(pos.get("entryPrice") or plan.entry_price or 0.0)
+    actual_qty = abs(float(self._position_signed_contracts(pos) or pos.get("contracts", 0) or plan.qty))
+
+    if actual_entry <= 0 or actual_qty <= 0:
+        await self.ctrl.notify(f"⚠️ 포지션 체결값 오류: {plan.symbol}")
+        return {"status": "ENTRY_BAD_FILL", "entry_order": entry_order}
+
+    plan = self._rebuild_plan_after_fill(plan, actual_entry, actual_qty, cfg)
+
+    try:
+        sl_order = await self._place_initial_sl_from_plan(plan, pos, cfg)
+    except Exception as sl_error:
+        # SL 체결 오류 시 영구 락 발동
+        return await self._handle_sl_failure_with_persistent_pause(
+            symbol=plan.symbol,
+            position=pos,
+            plan=plan,
+            error=sl_error,
+            cfg=cfg,
+        )
+
+    tp_orders = []
+    for tp in plan.tp_orders:
+        try:
+            order = await self._place_reduce_only_tp_from_plan(plan, tp, cfg)
+            tp_orders.append(order)
+        except Exception as tp_error:
+            logger.error("[LiveOrderPlan] TP placement failed: %s %s", tp.tp_name, tp_error)
+            await self.ctrl.notify(f"⚠️ {plan.symbol} {tp.tp_name} 생성 실패. SL은 유지됩니다: {tp_error}")
+
+    self._register_live_ladder_position_state(plan, pos, sl_order, tp_orders, cfg)
+
+    await self.ctrl.notify(
+        f"✅ LiveOrderPlan 진입 완료: {plan.symbol} {plan.side} qty={plan.qty} "
+        f"SL={plan.initial_sl_price} TP={len(tp_orders)} engine={plan.engine}"
+    )
+
+    return {
+        "status": "LIVE_ORDER_PLAN_EXECUTED",
+        "entry_order": entry_order,
+        "sl_order": sl_order,
+        "tp_orders": tp_orders,
+        "plan": plan,
+    }
+
+def _rebuild_plan_after_fill(self, plan, actual_entry, actual_qty, cfg):
+    sl_price = calculate_initial_stop_price(
+        side=plan.side,
+        entry_price=actual_entry,
+        atr=cfg.get("last_context_atr", abs(actual_entry - plan.initial_sl_price) / 2.0),
+        config=cfg,
+        engine=plan.engine,
+    )
+    tp_config = dict(cfg)
+    tp_config["symbol"] = plan.symbol
+    tp_config["initial_stop_price"] = sl_price
+
+    tp_orders = build_ladder_tp_orders(
+        side=plan.side,
+        entry_price=actual_entry,
+        qty=actual_qty,
+        ladder=plan.ladder,
+        config=tp_config,
+    )
+    plan.entry_price = actual_entry
+    plan.qty = actual_qty
+    plan.initial_sl_price = sl_price
+    plan.tp_orders = tp_orders
+    return self._normalize_live_order_plan_for_exchange(plan, cfg)
+
+async def _place_initial_sl_from_plan(self, plan, pos, cfg):
+    exit_side = "sell" if str(plan.side).upper() == "LONG" else "buy"
+    qty = self.safe_amount(plan.symbol, abs(float(self._position_signed_contracts(pos) or pos.get("contracts", 0) or plan.qty)))
+    stop_price = self.safe_price(plan.symbol, plan.initial_sl_price)
+    if float(qty) <= 0:
+        raise InvalidOrderPlan("SL qty <= 0")
+
+    return await self._create_protection_order_with_retries(
+        plan.symbol,
+        "stop_market",
+        exit_side,
+        qty,
+        None,
+        {
+            "stopPrice": stop_price,
+            "reduceOnly": True,
+            "newClientOrderId": self._build_protection_client_order_id(plan.symbol, plan.side.lower(), "sl", pos),
+        },
+        "SL",
+        max_attempts=int(cfg.get("sl_place_max_retries", 3) or 3),
+        retry_delay_sec=float(cfg.get("sl_retry_delay_sec", 0.7) or 0.7),
+    )
+
+async def _place_reduce_only_tp_from_plan(self, plan, tp, cfg):
+    qty = self.safe_amount(plan.symbol, tp.qty)
+    price = self.safe_price(plan.symbol, tp.price)
+
+    if float(qty) <= 0:
+        raise InvalidOrderPlan(f"{tp.tp_name} qty <= 0 after rounding")
+
+    if not tp.reduce_only:
+        raise InvalidOrderPlan(f"{tp.tp_name} must be reduceOnly")
+
+    if tp.close_position:
+        raise InvalidOrderPlan(f"{tp.tp_name} partial TP must not use closePosition")
+
+    tp_order_type = str(cfg.get("tp_order_type", "LIMIT")).upper()
+
+    client_id = self._build_protection_client_order_id(
+        plan.symbol,
+        str(plan.side).lower(),
+        tp.tp_name.lower(),
+        {"side": str(plan.side).lower(), "entryPrice": plan.entry_price, "contracts": plan.qty},
+    )
+
+    if tp_order_type in {"LIMIT", "TAKE_PROFIT_LIMIT"}:
+        return await self._create_protection_order_with_retries(
+            plan.symbol,
+            "limit",
+            tp.side,
+            qty,
+            price,
+            {
+                "reduceOnly": True,
+                "newClientOrderId": client_id,
+            },
+            tp.tp_name,
+            max_attempts=int(cfg.get("tp_place_max_retries", 2) or 2),
+        )
+
+    if tp_order_type in {"TAKE_PROFIT_MARKET", "TP_MARKET"}:
+        return await self._create_protection_order_with_retries(
+            plan.symbol,
+            "take_profit_market",
+            tp.side,
+            qty,
+            None,
+            {
+                "stopPrice": price,
+                "reduceOnly": True,
+                "closePosition": False,
+                "newClientOrderId": client_id,
+            },
+            tp.tp_name,
+            max_attempts=int(cfg.get("tp_place_max_retries", 2) or 2),
+        )
+
+    raise InvalidOrderPlan(f"Unsupported tp_order_type: {tp_order_type}")
+
+async def _handle_sl_failure_with_persistent_pause(self, symbol, position, plan, error, cfg):
+    logger.error("[LiveOrderPlan] SL placement failed completely: %s", error)
+    await self.ctrl.notify(f"❌ SL 주문 생성 최종 실패! 즉시 비상 청산을 가동합니다: {error}")
+    close_status = await self._emergency_close_position_without_stop_loss(
+        symbol=symbol,
+        reason=f"SL placement failure: {error}",
+        max_attempts=5,
+    )
+    if not close_status.get("closed"):
+        write_critical_pause_state(symbol, "SL_AND_EMERGENCY_CLOSE_FAILED", error, cfg)
+        if getattr(self, "ctrl", None) is not None:
+            self.ctrl.is_paused = True
+    return {"status": "SL_PLACEMENT_FAILED", "close_status": close_status, "error": str(error)}
+
+# ==============================================================================
+# Live exit policies monitoring & Stop replacements
+# ==============================================================================
+
+async def _manage_live_ladder_exit_policy(self, symbol, pos, df, cfg):
+    state = getattr(self, "utbreakout_trailing_states", {}).get(symbol)
+    if not isinstance(state, dict):
+        return None
+    if not bool(state.get("advanced_live_ladder_state", False)):
+        return None
+    if not pos:
+        self._clear_utbreakout_trailing_state(symbol, finalize=True, reason="position closed")
+        return None
+    if df is None or len(df) < 5:
+        return None
+
+    try:
+        current_bar = {
+            "index": int(state.get("bars_seen", 0)) + 1,
+            "open": float(df.iloc[-1]["open"]),
+            "high": float(df.iloc[-1]["high"]),
+            "low": float(df.iloc[-1]["low"]),
+            "close": float(df.iloc[-1]["close"]),
+            "volume": float(df.iloc[-1].get("volume", 0.0)),
+        }
+        state["bars_seen"] = current_bar["index"]
+    except Exception:
+        return None
+
+    position_proxy = {
+        "side": str(pos.get("side") or state.get("side")).upper(),
+        "timeframe": cfg.get("timeframe", "15m"),
+        "entry_bar_index": int(state.get("entry_bar_index", 0)),
+        "tp1_filled": bool(state.get("tp1_filled", False)),
+        "partial_filled": bool(state.get("tp1_filled", False)),
+    }
+
+    await self._refresh_ladder_fill_state(symbol, pos, state, cfg)
+
+    time_stop = evaluate_time_stop(position_proxy, current_bar, cfg)
+    if time_stop.should_exit:
+        await self._close_position_reduce_only_market(symbol, pos, reason=time_stop.reason, cfg=cfg)
+        self._clear_utbreakout_trailing_state(symbol, finalize=True, reason=time_stop.reason)
+        return {"status": "EXITED", "reason": time_stop.reason}
+
+    rows = []
+    try:
+        for i, row in enumerate(df.to_dict("records")):
+            rows.append({
+                "index": i,
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+                "volume": float(row.get("volume", 0.0)),
+            })
+        indicator_values = await self._build_live_indicator_values(symbol, pos.get("side", ""), rows, len(rows) - 1, cfg)
+        context = build_market_context(
+            rows=rows,
+            idx=len(rows) - 1,
+            symbol=symbol,
+            timeframe=cfg.get("timeframe", "15m"),
+            values=indicator_values,
+            config=cfg,
+        )
+    except Exception as context_error:
+        logger.warning("Signal invalid context build failed for %s: %s", symbol, context_error)
+        return None
+
+    invalid_exit = evaluate_signal_invalid_exit(position_proxy, context, cfg)
+    if invalid_exit.should_exit:
+        await self._close_position_reduce_only_market(symbol, pos, reason=invalid_exit.reason, cfg=cfg)
+        self._clear_utbreakout_trailing_state(symbol, finalize=True, reason=invalid_exit.reason)
+        return {"status": "EXITED", "reason": invalid_exit.reason}
+    return None
+
+async def _close_position_reduce_only_market(self, symbol, pos, reason, cfg):
+    side = str(pos.get("side", "")).lower()
+    if side not in {"long", "short"}:
+        raise ValueError(f"invalid position side: {side}")
+    qty = self.safe_amount(symbol, abs(float(self._position_signed_contracts(pos) or pos.get("contracts", 0) or 0)))
+    if float(qty) <= 0:
+        raise ValueError("close qty <= 0")
+
+    close_side = "sell" if side == "long" else "buy"
+    params = self._close_order_params_for_position(pos)
+    params["reduceOnly"] = True
+
+    order = await asyncio.to_thread(
+        self.exchange.create_order,
+        symbol,
+        "market",
+        close_side,
+        qty,
+        None,
+        params,
+    )
+    await self.ctrl.notify(f"⚠️ {symbol} {reason} 사유로 reduceOnly 시장가 청산 실행")
+    return order
+
+def _register_live_ladder_position_state(self, plan, pos, sl_order, tp_orders, cfg):
+    side = str(plan.side).lower()
+    state = {
+        "advanced_live_ladder_state": True,
+        "side": side,
+        "entry_price": float(plan.entry_price),
+        "initial_qty": float(plan.qty),
+        "risk_distance": abs(float(plan.entry_price) - float(plan.initial_sl_price)),
+        "initial_stop_price": float(plan.initial_sl_price),
+        "last_stop_price": float(plan.initial_sl_price),
+        "tp_orders": [
+            {
+                "tp_name": tp.tp_name,
+                "price": float(tp.price),
+                "qty": float(tp.qty),
+                "pct": float(tp.pct),
+                "filled": False,
+            }
+            for tp in plan.tp_orders
+        ],
+        "tp1_filled": False,
+        "tp2_filled": False,
+        "tp3_filled": False,
+        "sl_moved_to_be": False,
+        "sl_moved_to_tp1_area": False,
+        "entry_bar_index": 0,
+        "bars_seen": 0,
+        "engine": plan.engine,
+        "regime": plan.regime,
+        "confidence": plan.confidence,
+        "expected_r": plan.expected_r,
+        "runner_exit_enabled": False,
+        "runner_chandelier_enabled": False,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    self.utbreakout_trailing_states[plan.symbol] = state
+    return state
+
+async def _refresh_ladder_fill_state(self, symbol, pos, state, cfg):
+    current_qty = abs(float(self._position_signed_contracts(pos) or pos.get("contracts", 0) or 0))
+    initial_qty = float(state.get("initial_qty") or 0.0)
+    if initial_qty <= 0:
+        return state
+
+    remaining_ratio = current_qty / initial_qty
+    if not state.get("tp1_filled") and remaining_ratio <= 0.75:
+        state["tp1_filled"] = True
+    if not state.get("tp2_filled") and remaining_ratio <= 0.35:
+        state["tp2_filled"] = True
+    if not state.get("tp3_filled") and remaining_ratio <= 0.05:
+        state["tp3_filled"] = True
+
+    if state.get("tp1_filled") and not state.get("sl_moved_to_be"):
+        await self._replace_stop_loss_order(
+            symbol,
+            pos,
+            self._calculate_be_plus_fees_stop(pos, state, cfg),
+            reason="TP1 filled -> BE stop"
+        )
+        state["sl_moved_to_be"] = True
+
+    if state.get("tp2_filled") and not state.get("sl_moved_to_tp1_area"):
+        await self._replace_stop_loss_order(
+            symbol,
+            pos,
+            self._calculate_tp1_area_stop(pos, state, cfg),
+            reason="TP2 filled -> profit protection stop"
+        )
+        state["sl_moved_to_tp1_area"] = True
+
+    self.utbreakout_trailing_states[symbol] = state
+    return state
+
+def _calculate_be_plus_fees_stop(self, pos, state, cfg):
+    entry = float(state["entry_price"])
+    risk = float(state["risk_distance"])
+    side = str(state["side"]).lower()
+    offset_r = float(cfg.get("be_plus_fee_offset_r", 0.03) or 0.03)
+    if side == "long":
+        return entry + risk * offset_r
+    return entry - risk * offset_r
+
+def _calculate_tp1_area_stop(self, pos, state, cfg):
+    entry = float(state["entry_price"])
+    risk = float(state["risk_distance"])
+    side = str(state["side"]).lower()
+    tp1_r = 1.0
+
+    tp_orders = state.get("tp_orders", [])
+    for tp in tp_orders:
+        if tp.get("tp_name") == "TP1":
+            return float(tp.get("price"))
+    if side == "long":
+        return entry + risk * tp1_r
+    return entry - risk * tp1_r
+
+ENGINE_PERFORMANCE_STATS = {}
+
+def record_live_trade_result(trade, cfg=None):
+    engine = trade.get("engine")
+    if not engine or engine == "NONE":
+        return
+    if engine not in ENGINE_PERFORMANCE_STATS:
+        ENGINE_PERFORMANCE_STATS[engine] = {
+            "trade_count": 0,
+            "expectancy_r": 0.0,
+            "profit_factor": 0.0,
+            "max_drawdown_pct": 0.0,
+            "max_consecutive_losses": 0,
+            "consecutive_losses": 0,
+            "fee_burden": 0.0,
+            "funding_burden": 0.0,
+            "oos_expectancy": None,
+        }
+    stats = ENGINE_PERFORMANCE_STATS[engine]
+    stats["trade_count"] += 1
+    pnl_r = float(trade.get("r_multiple", 0.0))
+    stats["expectancy_r"] += (pnl_r - stats["expectancy_r"]) / stats["trade_count"]
+
+    if pnl_r < 0:
+        stats["consecutive_losses"] += 1
+        stats["max_consecutive_losses"] = max(stats["max_consecutive_losses"], stats["consecutive_losses"])
+    else:
+        stats["consecutive_losses"] = 0
+
+    if should_disable_engine(stats, cfg):
+        if cfg:
+            disabled = cfg.get("disabled_engines", [])
+            if engine not in disabled:
+                disabled.append(engine)
+                cfg["disabled_engines"] = disabled
+                logger.warning(f"Engine {engine} disabled due to poor live performance.")
+
+
+def _bind_live_advanced_alpha_helpers_to_main_controller():
+    """
+    Bind module-level live advanced-alpha helper functions to MainController.
+
+    This is a defensive compatibility guard.
+
+    Preferred long-term solution:
+        Move these functions physically into the MainController class.
+
+    Required runtime behavior:
+        entry() and live monitor call these helpers as self.<method>().
+        Therefore, MainController must actually expose these names.
+    """
+    cls = globals().get("MainController")
+    if cls is None:
+        return
+
+    helper_names = [
+        "_fetch_live_ohlcv_rows_for_context",
+        "_build_live_indicator_values",
+        "build_live_context_for_symbol",
+        "_calculate_live_adx_dmi",
+        "_calculate_live_htf_trend",
+        "_ema_last",
+        "_fetch_live_derivatives_values",
+        "_fetch_live_liquidity_values",
+        "_validate_live_context_or_block",
+        "_fetch_futures_account_equity",
+        "preflight_live_real_check",
+        "_normalize_live_order_plan_for_exchange",
+        "_get_min_notional_for_symbol",
+        "_validate_live_order_plan_for_exchange",
+        "execute_live_order_plan",
+        "run_live_real_once",
+        "get_runtime_models",
+        "get_runtime_stats",
+        "_rebuild_plan_after_fill",
+        "_place_initial_sl_from_plan",
+        "_place_reduce_only_tp_from_plan",
+        "_handle_sl_failure_with_persistent_pause",
+        "_register_live_ladder_position_state",
+        "_manage_live_ladder_exit_policy",
+        "_refresh_ladder_fill_state",
+        "_calculate_be_plus_fees_stop",
+        "_calculate_tp1_area_stop",
+        "_close_position_reduce_only_market",
+    ]
+
+    missing = []
+
+    # Bind to MainController
+    for name in helper_names:
+        fn = globals().get(name)
+        if fn is None:
+            missing.append(name)
+            continue
+
+        setattr(cls, name, fn)
+
+    # Bind to SignalEngine so that self.<helper>() functions correctly inside its methods
+    sig_cls = globals().get("SignalEngine")
+    if sig_cls is not None:
+        for name in helper_names:
+            fn = globals().get(name)
+            if fn is not None:
+                setattr(sig_cls, name, fn)
+
+    # Bind SignalEngine.entry to MainController.entry so bot.entry works in testing/runtime
+    if sig_cls is not None and hasattr(sig_cls, "entry"):
+        setattr(cls, "entry", sig_cls.entry)
+
+    if missing:
+        message = (
+            "Missing live advanced-alpha helper functions. "
+            "These names are required by MainController live entry/monitor path: "
+            f"{missing}"
+        )
+        try:
+            logger.error(message)
+        except Exception:
+            pass
+
+    # Hard post-condition check.
+    still_missing = [name for name in helper_names if not hasattr(cls, name)]
+    if still_missing:
+        raise RuntimeError(
+            "Failed to bind live advanced-alpha helpers to MainController: "
+            f"{still_missing}"
+        )
+
+
+_bind_live_advanced_alpha_helpers_to_main_controller()
 
 
 if __name__ == "__main__":

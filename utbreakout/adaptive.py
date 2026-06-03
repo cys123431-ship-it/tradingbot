@@ -936,7 +936,7 @@ def build_adaptive_exit_overlay(cfg, stats, side, runner_stats=None, trend_healt
 
     runner_stats = dict(runner_stats or {})
     runner_samples = int(runner_stats.get("sample_count") or 0)
-    if bool(cfg.get("runner_exit_enabled", True)) and runner_samples >= min_samples:
+    if bool(cfg.get("runner_exit_enabled", False)) and runner_samples >= min_samples:
         capture = finite_float(runner_stats.get("avg_mfe_capture_ratio"))
         runner_mfe = finite_float(runner_stats.get("avg_mfe_r"), 0.0)
         runner_pnl = finite_float(runner_stats.get("avg_pnl_r"), 0.0)

@@ -187,10 +187,15 @@ def build_market_context(rows=None, idx=None, *, symbol="UNKNOWN", timeframe="15
         direction = "LONG"
     elif direction.lower() == "short":
         direction = "SHORT"
-    htf_trend = str(values.get("htf_trend") or ("UP" if direction == "LONG" else "DOWN" if direction == "SHORT" else "FLAT")).upper()
-    supertrend = str(values.get("supertrend_direction") or htf_trend).upper()
-    plus_di = _finite_float(values.get("plus_di"), 30.0 if direction == "LONG" else 12.0)
-    minus_di = _finite_float(values.get("minus_di"), 30.0 if direction == "SHORT" else 12.0)
+    htf_missing = values.get("htf_trend") is None
+    dmi_missing = values.get("plus_di") is None or values.get("minus_di") is None
+    adx_missing = values.get("adx") is None
+
+    htf_trend = str(values.get("htf_trend") or "FLAT").upper()
+    supertrend = str(values.get("supertrend_direction") or htf_trend or "FLAT").upper()
+
+    plus_di = _finite_float(values.get("plus_di"), 0.0)
+    minus_di = _finite_float(values.get("minus_di"), 0.0)
     spread_bps = _optional_float(values.get("spread_bps", _bar_value(row, "spread_bps", None)))
 
     derivatives_available = all(
@@ -204,6 +209,12 @@ def build_market_context(rows=None, idx=None, *, symbol="UNKNOWN", timeframe="15
         reasons.append("BAD_LIQUIDITY")
     if not derivatives_available:
         reasons.append("MISSING_DERIVATIVES_DATA")
+    if htf_missing:
+        reasons.append("MISSING_HTF_TREND")
+    if dmi_missing:
+        reasons.append("MISSING_DMI")
+    if adx_missing:
+        reasons.append("MISSING_ADX")
     quality = MarketContextQuality(derivatives_available, is_bad_liquidity, tuple(reasons))
 
     return MarketContext(
@@ -220,7 +231,7 @@ def build_market_context(rows=None, idx=None, *, symbol="UNKNOWN", timeframe="15
         donchian_mid=donchian_mid,
         donchian_high_previous=_finite_float(values.get("donchian_high_previous"), prev_high),
         donchian_low_previous=_finite_float(values.get("donchian_low_previous"), prev_low),
-        adx=_finite_float(values.get("adx"), 28.0 if direction in {"LONG", "SHORT"} else 10.0),
+        adx=_finite_float(values.get("adx"), 0.0),
         plus_di=plus_di,
         minus_di=minus_di,
         htf_trend=htf_trend,
