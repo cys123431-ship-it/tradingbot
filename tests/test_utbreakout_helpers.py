@@ -1407,6 +1407,189 @@ def _protection_engine(orders, symbol_scope_returns=True, positions=None):
     return engine
 
 
+def test_aggressive_growth_exposure_counts_only_tracked_positions():
+    btc = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "1.0", "entryPrice": "100", "markPrice": "110"}
+    eth = {"symbol": "ETH/USDT:USDT", "side": "long", "contracts": "2.0", "entryPrice": "50", "markPrice": "55"}
+    engine = _protection_engine([], positions=[btc, eth])
+    btc_key = engine._aggressive_growth_symbol_key("BTC/USDT")
+    engine.aggressive_growth_positions = {
+        btc_key: {"symbol": "BTC/USDT", "side": "long", "qty": 1.0, "entry_price": 100.0}
+    }
+
+    exposure = engine._calculate_aggressive_growth_exposure([btc, eth], symbol="BTC/USDT")
+
+    assert exposure["open_positions"] == 1
+    assert exposure["total_notional"] == pytest.approx(110.0)
+    assert exposure["symbol_notional"] == pytest.approx(110.0)
+    assert "ETHUSDT" not in exposure["positions"]
+
+
+def test_aggressive_growth_pyramiding_adds_after_breakeven_and_rebuilds_protection():
+    class GrowthExchange(_FakeExchange):
+        def create_order(self, symbol, order_type, side, amount, price=None, params=None):
+            order = super().create_order(symbol, order_type, side, amount, price, params)
+            params = dict(params or {})
+            if str(order_type).lower() == "market" and side == "buy" and not params.get("reduceOnly"):
+                fill_price = 112.0
+                for position in self.positions:
+                    if self._symbol_key(position.get("symbol")) != self._symbol_key(symbol):
+                        continue
+                    old_qty = abs(float(position.get("contracts", 0) or 0))
+                    old_entry = float(position.get("entryPrice", 0) or 0)
+                    add_qty = abs(float(amount or 0))
+                    new_qty = old_qty + add_qty
+                    new_entry = ((old_entry * old_qty) + (fill_price * add_qty)) / max(new_qty, 1e-12)
+                    position["contracts"] = new_qty
+                    position["entryPrice"] = str(new_entry)
+                    position["markPrice"] = str(fill_price)
+                    position["side"] = "long"
+                    position.setdefault("info", {})["positionAmt"] = str(new_qty)
+                    return order
+            return order
+
+    pos = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": "1.0",
+        "entryPrice": "100",
+        "markPrice": "112",
+        "info": {"symbol": "BTCUSDT", "positionAmt": "1.0"},
+    }
+    orders = [
+        {
+            "id": "tp1-old",
+            "symbol": "BTC/USDT",
+            "side": "sell",
+            "type": "limit",
+            "price": "110",
+            "amount": "0.35",
+            "clientOrderId": "utbtp1BTCUSDTold",
+            "reduceOnly": True,
+            "info": {"symbol": "BTCUSDT", "reduceOnly": "true"},
+        },
+        {
+            "id": "tp2-old",
+            "symbol": "BTC/USDT",
+            "side": "sell",
+            "type": "limit",
+            "price": "120",
+            "amount": "0.30",
+            "clientOrderId": "utbtp2BTCUSDTold",
+            "reduceOnly": True,
+            "info": {"symbol": "BTCUSDT", "reduceOnly": "true"},
+        },
+        {
+            "id": "sl-old",
+            "symbol": "BTC/USDT",
+            "side": "sell",
+            "type": "stop_market",
+            "clientOrderId": "utbslBTCUSDTold",
+            "reduceOnly": True,
+            "info": {"symbol": "BTCUSDT", "origType": "STOP_MARKET", "stopPrice": "95", "reduceOnly": "true"},
+        },
+    ]
+    engine = _protection_engine(orders, positions=[pos])
+    engine.exchange = GrowthExchange(orders, positions=[pos])
+    engine.get_runtime_strategy_params = lambda: {"active_strategy": "utbot_filtered_breakout_v1"}
+    engine.get_runtime_common_settings = lambda: {"leverage": 5}
+    engine.aggressive_growth_high_watermark = 1000.0
+    engine.utbreakout_trailing_states = {
+        "BTC/USDT": {
+            "side": "long",
+            "entry_price": 100.0,
+            "initial_qty": 1.0,
+            "risk_distance": 10.0,
+            "last_stop_price": 95.0,
+            "aggressive_growth_overlay": True,
+            "aggressive_growth_score": 85.0,
+            "pyramid_add_count": 0,
+            "planned_tp_orders": [
+                {"tp_index": 1, "tp_label": "TP1", "side": "sell", "price": 110.0, "qty": 0.35},
+                {"tp_index": 2, "tp_label": "TP2", "side": "sell", "price": 120.0, "qty": 0.30},
+            ],
+        }
+    }
+    key = engine._aggressive_growth_symbol_key("BTC/USDT")
+    engine.aggressive_growth_positions = {
+        key: {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "qty": 1.0,
+            "base_qty": 1.0,
+            "entry_price": 100.0,
+            "risk_distance": 10.0,
+            "last_stop_price": 95.0,
+            "aggressive_growth_score": 85.0,
+            "pyramid_add_count": 0,
+        }
+    }
+
+    async def balance_info():
+        return 1000.0, 1000.0, 0.0
+
+    async def futures_context(symbol):
+        return {
+            "funding_rate": 0.0001,
+            "open_interest_delta_pct": 0.5,
+            "long_short_ratio": 1.2,
+            "taker_buy_sell_ratio": 1.08,
+        }
+
+    async def ensure_market_settings(symbol, leverage=1):
+        return None
+
+    class Stats:
+        def get_daily_stats(self):
+            return 0, 0.0
+
+        def get_weekly_stats(self):
+            return 0, 0.0
+
+    engine.get_balance_info = balance_info
+    engine._fetch_utbreakout_futures_context = futures_context
+    engine.ensure_market_settings = ensure_market_settings
+    engine.db = Stats()
+    engine.PROTECTION_REPLACE_CONFIRM_ATTEMPTS = 1
+    engine.PROTECTION_REPLACE_CONFIRM_DELAY = 0.0
+
+    closes = [90 + (idx * 0.18) for idx in range(75)]
+    df = pd.DataFrame({
+        "open": closes,
+        "high": [value + 0.5 for value in closes],
+        "low": [value - 0.5 for value in closes],
+        "close": closes,
+        "volume": [100.0 for _ in closes],
+    })
+    cfg = {
+        "aggressive_growth_enabled": True,
+        "aggressive_growth_pyramiding_enabled": True,
+        "aggressive_growth_pyramid_trigger_r": 1.0,
+        "aggressive_growth_pyramid_max_adds": 2,
+        "aggressive_growth_pyramid_add_risk_fraction": 0.5,
+        "aggressive_growth_max_symbol_exposure_pct": 1.0,
+        "aggressive_growth_move_sl_to_breakeven_before_add": True,
+        "aggressive_growth_trailing_atr_multiplier": 2.5,
+        "bias_continuation_min_volume_ratio": 0.75,
+        "funding_long_max": 0.0008,
+    }
+
+    status = asyncio.run(engine._maybe_apply_aggressive_growth_pyramiding("BTC/USDT", pos, df, cfg))
+
+    assert status["status"] == "ADDED"
+    market_buys = [order for order in engine.exchange.created if order["type"] == "market" and order["side"] == "buy"]
+    assert market_buys
+    final_pos = engine.exchange.positions[0]
+    assert float(final_pos["contracts"]) == pytest.approx(1.5)
+    assert engine.aggressive_growth_positions[key]["pyramid_add_count"] == 1
+    stop_orders = [
+        order for order in engine.exchange.created
+        if str(order["type"]).lower() == "stop_market" and order["side"] == "sell"
+    ]
+    assert stop_orders
+    assert float(stop_orders[-1]["params"]["stopPrice"]) == pytest.approx(100.0)
+    assert any("Aggressive Growth 추가진입" in message for message in engine.ctrl.messages)
+
+
 def test_protection_audit_fetch_failure_does_not_alert_missing_sl():
     class FailingOpenOrdersExchange(_FakeExchange):
         def fetch_open_orders(self, symbol=None):
@@ -1770,7 +1953,12 @@ def test_utbreakout_defaults_enable_fixed_tp_ladder_and_disable_runner():
     assert cfg["trend_health_enabled"] is True
     assert cfg["aggressive_growth_enabled"] is False
     assert cfg["aggressive_growth_balance_sleeve_pct"] == 0.20
+    assert cfg["aggressive_growth_sleeve_mode"] == "notional"
+    assert cfg["aggressive_growth_max_leverage_for_margin_sleeve"] == 3.0
     assert cfg["aggressive_growth_max_trade_risk_pct"] == 0.015
+    assert cfg["aggressive_growth_vol_target_enabled"] is True
+    assert cfg["aggressive_growth_kelly_enabled"] is False
+    assert cfg["aggressive_growth_cppi_enabled"] is False
 
 
 def test_utbreakout_short_guard_requires_htf_and_dmi_alignment():

@@ -1,10 +1,17 @@
 import pytest
 
 from utbreakout.sizing import (
+    apply_aggressive_volatility_targeting,
     build_aggressive_growth_overlay_plan,
     build_aggressive_growth_pyramid_plan,
     build_position_risk_multiplier,
     calculate_adaptive_risk_pct,
+    calculate_aggressive_sleeve_notional_cap,
+    calculate_cppi_sleeve_pct,
+    calculate_fractional_kelly_multiplier,
+    choose_aggressive_exit_split,
+    evaluate_derivatives_growth_score,
+    is_aggressive_symbol_trend_bullish,
 )
 
 
@@ -105,6 +112,7 @@ def test_aggressive_growth_enabled_caps_qty_by_risk_and_sleeve():
             "stop_loss_price": 90.0,
             "account_equity": 1000.0,
             "growth_score": 70.0,
+            "atr_pct": 0.012,
             "daily_pnl_usdt": 0.0,
             "weekly_pnl_usdt": 0.0,
             "open_positions": 0,
@@ -121,6 +129,140 @@ def test_aggressive_growth_enabled_caps_qty_by_risk_and_sleeve():
     assert plan["partial_take_profit_ratio"] == pytest.approx(0.35)
     assert plan["second_take_profit_ratio"] == pytest.approx(0.30)
     assert plan["runner_pct"] == pytest.approx(0.35)
+
+
+def test_aggressive_growth_sleeve_mode_notional_and_margin():
+    base_plan = {"side": "long", "entry_price": 100.0, "stop_loss": 99.0, "risk_distance": 1.0, "leverage": 5}
+    context = {
+        "side": "long",
+        "entry_price": 100.0,
+        "stop_loss_price": 99.0,
+        "account_equity": 1000.0,
+        "growth_score": 70.0,
+        "atr_pct": 0.012,
+        "open_positions": 0,
+        "leverage": 5,
+    }
+    cfg = {"aggressive_growth_enabled": True, "aggressive_growth_max_symbol_exposure_pct": 1.0}
+
+    notional = build_aggressive_growth_overlay_plan(base_plan, cfg, context)
+    margin = build_aggressive_growth_overlay_plan(
+        base_plan,
+        {**cfg, "aggressive_growth_sleeve_mode": "margin", "aggressive_growth_max_leverage_for_margin_sleeve": 3.0},
+        context,
+    )
+
+    assert notional["accepted"] is True
+    assert margin["accepted"] is True
+    assert notional["plan"]["aggressive_growth_sleeve_cap_usdt"] == pytest.approx(200.0)
+    assert margin["plan"]["aggressive_growth_sleeve_cap_usdt"] == pytest.approx(600.0)
+    assert notional["plan"]["qty"] == pytest.approx(2.0)
+    assert margin["plan"]["qty"] == pytest.approx(6.0)
+
+
+def test_aggressive_symbol_trend_strict_parser():
+    assert is_aggressive_symbol_trend_bullish({"state": True}) is True
+    assert is_aggressive_symbol_trend_bullish({"state": "strong"}) is True
+    assert is_aggressive_symbol_trend_bullish({"state": "uptrend"}) is True
+    assert is_aggressive_symbol_trend_bullish({"state": None}) is False
+    assert is_aggressive_symbol_trend_bullish({"state": False}) is False
+    assert is_aggressive_symbol_trend_bullish({}) is False
+
+
+def test_aggressive_derivatives_growth_score_rewards_confirmation_and_penalizes_crowding():
+    positive, positive_reasons = evaluate_derivatives_growth_score({
+        "funding_rate": 0.0001,
+        "funding_percentile_7d": 45,
+        "open_interest_change_1h": 0.8,
+        "price_change_1h": 1.2,
+        "long_short_ratio": 1.2,
+        "taker_buy_sell_ratio": 1.08,
+        "liquidation_imbalance": 0.3,
+    })
+    negative, negative_reasons = evaluate_derivatives_growth_score({
+        "funding_rate": 0.0012,
+        "funding_percentile_30d": 95,
+        "open_interest_change_1h": 1.1,
+        "price_change_1h": -0.2,
+        "long_short_ratio": 2.8,
+        "taker_buy_sell_ratio": 0.9,
+    })
+
+    assert positive > 0
+    assert "price_up_oi_up" in positive_reasons
+    assert negative < 0
+    assert "funding_overheated" in negative_reasons
+    assert "long_crowded" in negative_reasons
+
+
+def test_aggressive_dynamic_exit_split_sums_to_one():
+    assert choose_aggressive_exit_split(90) == {
+        "tp1_pct": 0.2,
+        "tp2_pct": 0.2,
+        "runner_pct": 0.6,
+        "mode": "super_strong_trend",
+    }
+    assert choose_aggressive_exit_split(80)["runner_pct"] == pytest.approx(0.5)
+    assert choose_aggressive_exit_split(65)["runner_pct"] == pytest.approx(0.35)
+    weak = choose_aggressive_exit_split(40)
+    assert weak["tp1_pct"] + weak["tp2_pct"] + weak["runner_pct"] == pytest.approx(1.0)
+
+
+def test_aggressive_volatility_targeting_reduces_or_blocks_risk():
+    cfg = {"aggressive_growth_vol_target_enabled": True}
+
+    risk, reason = apply_aggressive_volatility_targeting(0.01, None, cfg)
+    assert risk == pytest.approx(0.008)
+    assert reason == "atr_missing"
+    risk, reason = apply_aggressive_volatility_targeting(0.01, 0.003, cfg)
+    assert risk == pytest.approx(0.008)
+    assert reason == "atr_too_low_reduce"
+    risk, reason = apply_aggressive_volatility_targeting(0.01, 0.030, cfg)
+    assert risk == pytest.approx(0.005)
+    assert reason == "atr_high_reduce"
+    risk, reason = apply_aggressive_volatility_targeting(0.01, 0.040, cfg)
+    assert risk == pytest.approx(0.0)
+    assert reason == "atr_extreme_block"
+
+
+def test_aggressive_fractional_kelly_multiplier_defaults_and_bounds():
+    assert calculate_fractional_kelly_multiplier([], {}) == (1.0, "kelly_disabled")
+    assert calculate_fractional_kelly_multiplier([], {"aggressive_growth_kelly_enabled": True}) == (0.75, "not_enough_trades")
+
+    negative_trades = [{"r_multiple": -1.0}] * 25 + [{"r_multiple": 0.5}] * 5
+    negative, reason = calculate_fractional_kelly_multiplier(negative_trades, {"aggressive_growth_kelly_enabled": True})
+    assert negative == pytest.approx(0.25)
+    assert reason == "negative_kelly"
+
+    positive_trades = [{"r_multiple": 1.5}] * 35 + [{"r_multiple": -1.0}] * 15
+    positive, reason = calculate_fractional_kelly_multiplier(
+        positive_trades,
+        {"aggressive_growth_kelly_enabled": True, "aggressive_growth_kelly_min_risk_multiplier": 0.0},
+    )
+    assert 0 < positive <= 1.25
+    assert reason == "kelly_applied"
+
+
+def test_aggressive_cppi_sleeve_and_margin_cap():
+    cfg = {
+        "aggressive_growth_cppi_enabled": True,
+        "aggressive_growth_cppi_floor_pct": 0.90,
+        "aggressive_growth_cppi_multiplier": 2.0,
+        "aggressive_growth_cppi_min_sleeve_pct": 0.05,
+        "aggressive_growth_cppi_max_sleeve_pct": 0.20,
+    }
+
+    assert calculate_cppi_sleeve_pct(1000, 1200, cfg) == pytest.approx(0.05)
+    assert calculate_cppi_sleeve_pct(1300, 1300, cfg) == pytest.approx(0.20)
+
+    cap, sleeve = calculate_aggressive_sleeve_notional_cap(
+        1300,
+        leverage=5,
+        cfg={**cfg, "aggressive_growth_sleeve_mode": "margin", "aggressive_growth_max_leverage_for_margin_sleeve": 3.0},
+        high_watermark=1300,
+    )
+    assert sleeve == pytest.approx(0.20)
+    assert cap == pytest.approx(1300 * 0.20 * 3.0)
 
 
 def test_aggressive_growth_daily_loss_limit_blocks_overlay():
@@ -180,3 +322,34 @@ def test_aggressive_growth_pyramiding_requires_profit_and_breakeven_sl():
     assert allowed["requires_sl_move"] is True
     assert allowed["add_qty"] <= 0.5
     assert allowed["worst_loss_usdt"] <= 15.0
+
+
+def test_aggressive_growth_pyramiding_blocks_bad_growth_context_and_loss_limits():
+    cfg = {"aggressive_growth_enabled": True}
+    base_position = {"side": "long", "entry_price": 100.0, "risk_distance": 10.0, "initial_qty": 1.0}
+
+    bad_context = build_aggressive_growth_pyramid_plan(
+        base_position,
+        cfg,
+        {
+            "current_price": 112.0,
+            "stop_loss_price": 100.0,
+            "account_equity": 1000.0,
+            "growth_context_valid": False,
+        },
+    )
+    daily_block = build_aggressive_growth_pyramid_plan(
+        base_position,
+        cfg,
+        {
+            "current_price": 112.0,
+            "stop_loss_price": 100.0,
+            "account_equity": 1000.0,
+            "daily_pnl_usdt": -40.0,
+        },
+    )
+
+    assert bad_context["accepted"] is False
+    assert "growth context" in bad_context["reason"]
+    assert daily_block["accepted"] is False
+    assert "daily loss limit" in daily_block["reason"]

@@ -68,7 +68,14 @@ from utbreakout.risk import (
     calculate_risk_plan,
     normalize_risk_percent,
 )
-from utbreakout.sizing import build_aggressive_growth_overlay_plan
+from utbreakout.sizing import (
+    build_aggressive_growth_overlay_plan,
+    build_aggressive_growth_pyramid_plan,
+    calculate_aggressive_sleeve_notional_cap,
+    choose_aggressive_exit_split,
+    evaluate_derivatives_growth_score,
+    is_aggressive_symbol_trend_bullish,
+)
 from utbreakout.timeframe import HTF_MAP as UTBREAKOUT_HTF_MAP, select_adaptive_timeframe
 from utbreakout.adaptive import (
     build_dynamic_chandelier_stop,
@@ -1003,6 +1010,8 @@ def build_default_utbot_filtered_breakout_config():
         'protection_audit_after_place_delay_sec': 0.5,
         'aggressive_growth_enabled': False,
         'aggressive_growth_balance_sleeve_pct': 0.20,
+        'aggressive_growth_sleeve_mode': 'notional',
+        'aggressive_growth_max_leverage_for_margin_sleeve': 3.0,
         'aggressive_growth_max_trade_risk_pct': 0.015,
         'aggressive_growth_max_trade_risk_pct_strong': 0.025,
         'aggressive_growth_daily_loss_limit_pct': 0.04,
@@ -1018,6 +1027,21 @@ def build_default_utbot_filtered_breakout_config():
         'aggressive_growth_runner_pct': 0.35,
         'aggressive_growth_tp1_pct': 0.35,
         'aggressive_growth_tp2_pct': 0.30,
+        'aggressive_growth_vol_target_enabled': True,
+        'aggressive_growth_atr_pct_low': 0.004,
+        'aggressive_growth_atr_pct_normal': 0.012,
+        'aggressive_growth_atr_pct_high': 0.025,
+        'aggressive_growth_atr_pct_extreme': 0.040,
+        'aggressive_growth_kelly_enabled': False,
+        'aggressive_growth_kelly_lookback_trades': 50,
+        'aggressive_growth_kelly_fraction': 0.25,
+        'aggressive_growth_kelly_max_risk_multiplier': 1.25,
+        'aggressive_growth_kelly_min_risk_multiplier': 0.25,
+        'aggressive_growth_cppi_enabled': False,
+        'aggressive_growth_cppi_floor_pct': 0.90,
+        'aggressive_growth_cppi_multiplier': 2.0,
+        'aggressive_growth_cppi_min_sleeve_pct': 0.05,
+        'aggressive_growth_cppi_max_sleeve_pct': 0.20,
         'max_risk_per_trade_usdt': 1.0,
         'daily_max_loss_usdt': 3.0,
         'max_daily_trades': 5,
@@ -3206,6 +3230,8 @@ class SignalEngine(BaseEngine):
         self.last_utbot_filtered_breakout_status = {}  # symbol -> filtered breakout diagnostics
         self.utbot_filtered_breakout_entry_plans = {}  # symbol -> accepted risk plan
         self.utbreakout_trailing_states = {}  # symbol -> partial TP / ATR trailing state
+        self.aggressive_growth_positions = {}  # symbol -> aggressive-only sleeve tracking
+        self.aggressive_growth_high_watermark = 0.0
         self.utbot_filtered_breakout_failures = {}  # symbol -> side -> recent failed candidate timestamps
         self.utbreakout_futures_context_cache = {}  # symbol -> cached funding/OI context for research logs
         self.utbreakout_orderflow_snapshots = {}  # symbol -> rolling depth/orderflow snapshots
@@ -3270,6 +3296,8 @@ class SignalEngine(BaseEngine):
         self.last_utbot_filtered_breakout_status = {}
         self.utbot_filtered_breakout_entry_plans = {}
         self.utbreakout_trailing_states = {}
+        self.aggressive_growth_positions = {}
+        self.aggressive_growth_high_watermark = 0.0
         self.utbot_filtered_breakout_failures = {}
         self.utbreakout_futures_context_cache = {}
         self.utbreakout_orderflow_snapshots = {}
@@ -5023,6 +5051,7 @@ class SignalEngine(BaseEngine):
             'tp1_breakeven_qty_tolerance': 0.08,
             'protection_audit_after_place_delay_sec': 0.5,
             'aggressive_growth_balance_sleeve_pct': 0.20,
+            'aggressive_growth_max_leverage_for_margin_sleeve': 3.0,
             'aggressive_growth_max_trade_risk_pct': 0.015,
             'aggressive_growth_max_trade_risk_pct_strong': 0.025,
             'aggressive_growth_daily_loss_limit_pct': 0.04,
@@ -5034,6 +5063,17 @@ class SignalEngine(BaseEngine):
             'aggressive_growth_runner_pct': 0.35,
             'aggressive_growth_tp1_pct': 0.35,
             'aggressive_growth_tp2_pct': 0.30,
+            'aggressive_growth_atr_pct_low': 0.004,
+            'aggressive_growth_atr_pct_normal': 0.012,
+            'aggressive_growth_atr_pct_high': 0.025,
+            'aggressive_growth_atr_pct_extreme': 0.040,
+            'aggressive_growth_kelly_fraction': 0.25,
+            'aggressive_growth_kelly_max_risk_multiplier': 1.25,
+            'aggressive_growth_kelly_min_risk_multiplier': 0.25,
+            'aggressive_growth_cppi_floor_pct': 0.90,
+            'aggressive_growth_cppi_multiplier': 2.0,
+            'aggressive_growth_cppi_min_sleeve_pct': 0.05,
+            'aggressive_growth_cppi_max_sleeve_pct': 0.20,
         }.items():
             min_value = None if key == 'opposite_set_exit_min_pnl_usdt' else 0.0
             _float(key, default, min_value)
@@ -5069,6 +5109,7 @@ class SignalEngine(BaseEngine):
             'tp2_fallback_confirm_loops': 2,
             'aggressive_growth_max_open_positions': 2,
             'aggressive_growth_pyramid_max_adds': 2,
+            'aggressive_growth_kelly_lookback_trades': 50,
             'safe_live_default_set_id': UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID,
         }.items():
             min_value = 0 if key == 'opposite_set_exit_min_hold_candles' else 1
@@ -5168,6 +5209,9 @@ class SignalEngine(BaseEngine):
             'aggressive_growth_enabled',
             'aggressive_growth_pyramiding_enabled',
             'aggressive_growth_move_sl_to_breakeven_before_add',
+            'aggressive_growth_vol_target_enabled',
+            'aggressive_growth_kelly_enabled',
+            'aggressive_growth_cppi_enabled',
             'live_safety_guard_enabled',
             'allow_ut_only_live_override',
             'emergency_mode',
@@ -5180,6 +5224,8 @@ class SignalEngine(BaseEngine):
                 if self._is_utbreakout_live_runtime(cfg)
                 else bool(cfg.get('advanced_alpha_paper_testnet_default_enabled', True))
             )
+        sleeve_mode = str(cfg.get('aggressive_growth_sleeve_mode') or 'notional').strip().lower()
+        cfg['aggressive_growth_sleeve_mode'] = sleeve_mode if sleeve_mode in {'notional', 'margin'} else 'notional'
         cfg['risk_per_trade_percent'] = normalize_risk_percent({
             'risk_per_trade_percent': cfg.get('risk_per_trade_percent'),
             'min_risk_per_trade_percent': cfg.get('min_risk_per_trade_percent'),
@@ -6918,6 +6964,151 @@ class SignalEngine(BaseEngine):
             if finalize:
                 self._finalize_utbreakout_runner_state(symbol, reason=reason, exit_price=exit_price)
             states.pop(symbol, None)
+
+    def _aggressive_growth_symbol_key(self, symbol):
+        return self._normalize_protection_symbol(symbol)
+
+    def _update_aggressive_growth_high_watermark(self, equity):
+        value = _safe_float_or_none(equity)
+        if value is None or value <= 0:
+            return float(getattr(self, 'aggressive_growth_high_watermark', 0.0) or 0.0)
+        current = float(getattr(self, 'aggressive_growth_high_watermark', 0.0) or 0.0)
+        current = max(current, float(value))
+        self.aggressive_growth_high_watermark = current
+        return current
+
+    def _clear_aggressive_growth_position(self, symbol):
+        positions = getattr(self, 'aggressive_growth_positions', None)
+        if not isinstance(positions, dict):
+            self.aggressive_growth_positions = {}
+            return
+        key = self._aggressive_growth_symbol_key(symbol)
+        positions.pop(key, None)
+        positions.pop(symbol, None)
+
+    def _record_aggressive_growth_position(self, symbol, pos=None, plan=None, qty=None, current_price=None):
+        positions = getattr(self, 'aggressive_growth_positions', None)
+        if not isinstance(positions, dict):
+            positions = {}
+            self.aggressive_growth_positions = positions
+        plan = dict(plan or {})
+        pos = dict(pos or {})
+        key = self._aggressive_growth_symbol_key(symbol or self._protection_position_symbol(pos))
+        if not key:
+            return None
+        position_qty = _safe_float_or_none(qty)
+        if position_qty is None or position_qty <= 0:
+            position_qty = abs(float(self._position_signed_contracts(pos) or pos.get('contracts', 0) or 0))
+        side = str(pos.get('side') or plan.get('side') or 'long').lower()
+        if side != 'long' or position_qty <= 0:
+            self._clear_aggressive_growth_position(symbol)
+            return None
+        entry_price = _safe_float_or_none(pos.get('entryPrice')) or _safe_float_or_none(plan.get('entry_price')) or 0.0
+        mark_price = (
+            _safe_float_or_none(current_price)
+            or _safe_float_or_none(pos.get('markPrice'))
+            or _safe_float_or_none(pos.get('lastPrice'))
+            or entry_price
+        )
+        notional = position_qty * max(mark_price, entry_price, 0.0)
+        previous = positions.get(key, {}) if isinstance(positions.get(key), dict) else {}
+        add_count = int(plan.get('pyramid_add_count', previous.get('pyramid_add_count', previous.get('pyramid_adds', 0))) or 0)
+        meta = dict(previous)
+        meta.update({
+            'symbol': symbol,
+            'symbol_key': key,
+            'side': side,
+            'qty': float(position_qty),
+            'base_qty': float(previous.get('base_qty') or plan.get('base_qty') or position_qty),
+            'entry_price': float(entry_price or 0.0),
+            'last_price': float(mark_price or 0.0),
+            'notional': float(notional or 0.0),
+            'risk_distance': _safe_float_or_none(plan.get('risk_distance')) or previous.get('risk_distance'),
+            'last_stop_price': _safe_float_or_none(plan.get('stop_loss')) or previous.get('last_stop_price'),
+            'aggressive_growth_score': plan.get('aggressive_growth_score', previous.get('aggressive_growth_score')),
+            'pyramid_add_count': add_count,
+            'pyramid_adds': add_count,
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+        })
+        positions[key] = meta
+        return meta
+
+    def _calculate_aggressive_growth_exposure(self, positions=None, symbol=None, price_by_symbol=None):
+        tracked = getattr(self, 'aggressive_growth_positions', None)
+        if not isinstance(tracked, dict):
+            tracked = {}
+            self.aggressive_growth_positions = tracked
+        price_map = {}
+        for raw_key, raw_price in (price_by_symbol or {}).items():
+            price = _safe_float_or_none(raw_price)
+            if price is not None and price > 0:
+                price_map[self._aggressive_growth_symbol_key(raw_key)] = price
+
+        position_by_key = {}
+        if positions is not None:
+            for position in positions or []:
+                if not isinstance(position, dict):
+                    continue
+                key = self._aggressive_growth_symbol_key(self._protection_position_symbol(position))
+                if key:
+                    position_by_key[key] = position
+
+        total = 0.0
+        symbol_total = 0.0
+        active = {}
+        target_key = self._aggressive_growth_symbol_key(symbol) if symbol else None
+        for key, meta in list(tracked.items()):
+            if not isinstance(meta, dict):
+                tracked.pop(key, None)
+                continue
+            position = position_by_key.get(key)
+            if positions is not None and not position:
+                tracked.pop(key, None)
+                continue
+            side = str((position or meta).get('side') or meta.get('side') or '').lower()
+            try:
+                qty = abs(float(
+                    self._position_signed_contracts(position)
+                    if position else meta.get('qty', 0.0)
+                ))
+            except (TypeError, ValueError):
+                qty = 0.0
+            if side != 'long' or qty <= 0:
+                tracked.pop(key, None)
+                continue
+            entry = (
+                _safe_float_or_none((position or {}).get('entryPrice'))
+                or _safe_float_or_none(meta.get('entry_price'))
+                or 0.0
+            )
+            mark = (
+                price_map.get(key)
+                or _safe_float_or_none((position or {}).get('markPrice'))
+                or _safe_float_or_none((position or {}).get('lastPrice'))
+                or _safe_float_or_none(meta.get('last_price'))
+                or entry
+            )
+            exposure = qty * max(float(mark or 0.0), float(entry or 0.0), 0.0)
+            if exposure <= 0:
+                tracked.pop(key, None)
+                continue
+            meta.update({
+                'qty': float(qty),
+                'entry_price': float(entry or 0.0),
+                'last_price': float(mark or 0.0),
+                'notional': float(exposure),
+                'updated_at': datetime.now(timezone.utc).isoformat(),
+            })
+            active[key] = dict(meta)
+            total += exposure
+            if target_key and key == target_key:
+                symbol_total += exposure
+        return {
+            'total_notional': float(total),
+            'symbol_notional': float(symbol_total),
+            'open_positions': len(active),
+            'positions': active,
+        }
 
     def _finalize_utbreakout_runner_state(self, symbol, *, reason='position closed', exit_price=None):
         states = getattr(self, 'utbreakout_trailing_states', None)
@@ -9298,33 +9489,17 @@ class SignalEngine(BaseEngine):
                 _, weekly_pnl = self.db.get_weekly_stats()
             except Exception:
                 weekly_pnl = 0.0
-            open_positions = 0
-            total_aggressive_exposure = 0.0
-            symbol_exposure = 0.0
+            exposure = {
+                'open_positions': int(cfg.get('aggressive_growth_max_open_positions', 2) or 2),
+                'total_notional': 0.0,
+                'symbol_notional': 0.0,
+            }
             try:
                 positions = await asyncio.to_thread(self.exchange.fetch_positions)
-                for position in positions or []:
-                    try:
-                        contracts = abs(float(self._position_signed_contracts(position) or position.get('contracts', 0) or 0))
-                    except (TypeError, ValueError):
-                        contracts = 0.0
-                    if contracts <= 0:
-                        continue
-                    open_positions += 1
-                    try:
-                        pos_entry = float(position.get('entryPrice') or position.get('markPrice') or entry_price or 0.0)
-                    except (TypeError, ValueError):
-                        pos_entry = 0.0
-                    exposure = contracts * max(pos_entry, 0.0)
-                    total_aggressive_exposure += exposure
-                    pos_symbol = self._normalize_protection_symbol(
-                        self._protection_position_symbol(position)
-                    )
-                    if pos_symbol == self._normalize_protection_symbol(symbol):
-                        symbol_exposure += exposure
+                exposure = self._calculate_aggressive_growth_exposure(positions, symbol=symbol)
             except Exception as exc:
                 logger.warning(f"Aggressive growth overlay position scan failed for {symbol}: {exc}")
-                open_positions = int(cfg.get('aggressive_growth_max_open_positions', 2) or 2)
+            high_watermark = self._update_aggressive_growth_high_watermark(balance_for_risk)
 
             min_depth = float(cfg.get('prediction_min_depth_usdt', 50000.0) or 50000.0)
             bid_depth = _safe_float_or_none(filter_values.get('bid_depth_usdt'))
@@ -9344,6 +9519,7 @@ class SignalEngine(BaseEngine):
             volume_value = _safe_float_or_none(filter_values.get('volume_ratio'))
             funding_value = _safe_float_or_none(filter_values.get('funding_rate'))
             extreme_atr = float(cfg.get('market_quality_extreme_atr_pct', 2.5) or 2.5)
+            symbol_trend_bullish = is_aggressive_symbol_trend_bullish(trend_health)
             growth_overlay = build_aggressive_growth_overlay_plan(
                 plan,
                 cfg,
@@ -9353,21 +9529,33 @@ class SignalEngine(BaseEngine):
                     'stop_loss_price': plan.get('stop_loss'),
                     'risk_distance': plan.get('risk_distance'),
                     'account_equity': balance_for_risk,
+                    'aggressive_growth_high_watermark': high_watermark,
                     'daily_pnl_usdt': daily_pnl,
                     'weekly_pnl_usdt': weekly_pnl,
-                    'open_positions': open_positions,
-                    'symbol_exposure_notional': symbol_exposure,
-                    'total_aggressive_exposure_notional': total_aggressive_exposure,
+                    'open_positions': exposure.get('open_positions', 0),
+                    'symbol_exposure_notional': exposure.get('symbol_notional', 0.0),
+                    'total_aggressive_exposure_notional': exposure.get('total_notional', 0.0),
                     'leverage': leverage,
                     'liquidity_ok': liquidity_ok,
                     'spread_ok': spread_ok,
                     'htf_trend_bullish': long_htf_bullish,
-                    'symbol_trend_bullish': trend_health.get('state') is not False,
+                    'symbol_trend_bullish': symbol_trend_bullish,
                     'volume_ok': volume_value is not None and volume_value >= float(cfg.get('bias_continuation_min_volume_ratio', 0.75) or 0.75),
                     'adx_ok': adx_value is not None and adx_value >= float(cfg.get('bias_continuation_min_adx', 18.0) or 18.0),
                     'quality_ok': float(quality_score_v2.get('score', 0.0) or 0.0) >= float(cfg.get('quality_score_v2_long_reduce_below', 60.0) or 60.0),
                     'funding_not_overheated': funding_value is None or funding_value <= float(cfg.get('funding_long_max', 0.0008) or 0.0008),
                     'volatility_safe': atr_pct is None or float(atr_pct) <= extreme_atr,
+                    'atr_pct': atr_pct,
+                    'funding_rate': filter_values.get('funding_rate'),
+                    'funding_percentile_7d': filter_values.get('funding_percentile_7d'),
+                    'funding_percentile_30d': filter_values.get('funding_percentile_30d'),
+                    'open_interest_change_1h': filter_values.get('open_interest_change_1h', filter_values.get('open_interest_delta_pct')),
+                    'open_interest_change_4h': filter_values.get('open_interest_change_4h'),
+                    'price_change_1h': filter_values.get('price_change_1h', filter_values.get('momentum_6_pct')),
+                    'price_change_4h': filter_values.get('price_change_4h', filter_values.get('momentum_12_pct')),
+                    'long_short_ratio': filter_values.get('long_short_ratio'),
+                    'taker_buy_sell_ratio': filter_values.get('taker_buy_sell_ratio'),
+                    'liquidation_imbalance': filter_values.get('liquidation_imbalance'),
                 }
             )
             status['aggressive_growth_overlay'] = growth_overlay
@@ -9395,6 +9583,13 @@ class SignalEngine(BaseEngine):
                 logger.info(
                     f"Aggressive growth overlay not applied for {symbol}: {growth_overlay.get('reason')}"
                 )
+                try:
+                    await self.ctrl.notify(
+                        f"⚠️ Aggressive Growth 차단: {self.ctrl.format_symbol_for_display(symbol)} "
+                        f"{growth_overlay.get('reason')}. 일반 UTBreakout 수량으로 진행합니다."
+                    )
+                except Exception:
+                    logger.debug("Aggressive growth blocked notice skipped", exc_info=True)
         plan.update({
             'strategy': active_strategy if active_strategy in UTBREAKOUT_STRATEGIES else UTBOT_FILTERED_BREAKOUT_STRATEGY,
             'entry_timeframe': cfg.get('entry_timeframe', '15m'),
@@ -17356,6 +17551,10 @@ class SignalEngine(BaseEngine):
                 if pos:
                     filtered_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
                     await self._manage_utbreakout_partial_trailing(symbol, pos, df, filtered_cfg)
+                    pyramid_status = await self._maybe_apply_aggressive_growth_pyramiding(symbol, pos, df, filtered_cfg)
+                    if isinstance(pyramid_status, dict) and pyramid_status.get('status') == 'ADDED':
+                        self.position_cache = None
+                        pos = await self.get_server_position(symbol, use_cache=False) or pos
                     await self._manage_live_ladder_exit_policy(symbol, pos, df, filtered_cfg)
                     self.last_entry_reason[symbol] = (
                         f"포지션 보유 중 ({pos['side'].upper()}), UTBOT_FILTERED_BREAKOUT_V1 신규 진입 대기"
@@ -17363,6 +17562,7 @@ class SignalEngine(BaseEngine):
                     self._clear_utbot_filtered_breakout_entry_plan(symbol)
                 elif sig:
                     self._clear_utbreakout_trailing_state(symbol, finalize=True, reason='position closed before new UTBreak signal')
+                    self._clear_aggressive_growth_position(symbol)
                     self.last_entry_reason[symbol] = f"ACCEPTED_ENTRY: {sig.upper()} filtered breakout -> 진입"
                     logger.info(f"[UTBOT_FILTERED_BREAKOUT_V1] New {sig.upper()} entry")
                     plan = self._get_utbot_filtered_breakout_entry_plan(symbol, sig) or {}
@@ -17370,6 +17570,7 @@ class SignalEngine(BaseEngine):
                     await self.entry(symbol, sig, entry_ref_price)
                 else:
                     self._clear_utbreakout_trailing_state(symbol, finalize=True, reason='position closed while UTBreak waiting')
+                    self._clear_aggressive_growth_position(symbol)
                     self._clear_utbot_filtered_breakout_entry_plan(symbol)
 
             elif (active_strategy in MA_STRATEGIES and entry_mode in ['cross', 'position']) or active_strategy == 'cameron':
@@ -18926,8 +19127,59 @@ class SignalEngine(BaseEngine):
                             f"runner={'ON' if effective_fb_cfg.get('atr_trailing_enabled', False) else 'OFF'}, "
                             f"tp1_be={'ON' if effective_fb_cfg.get('tp1_breakeven_enabled', True) else 'OFF'}"
                         )
+                        if bool(plan.get('aggressive_growth_overlay')):
+                            fresh_pos = await self.get_server_position(symbol, use_cache=False)
+                            runner_state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
+                            audit_status = await self._audit_protection_orders(
+                                symbol,
+                                pos=fresh_pos,
+                                expected_tp=True,
+                                expected_sl=True,
+                                planned_tp_orders=self._planned_tp_orders_from_state(symbol, runner_state),
+                                alert=True
+                            )
+                            if fresh_pos and audit_status.get('sl_present'):
+                                self._record_aggressive_growth_position(
+                                    symbol,
+                                    fresh_pos,
+                                    plan,
+                                    qty=abs(float(fresh_pos.get('contracts', qty) or qty)),
+                                    current_price=actual_entry_price
+                                )
+                                split_mode = plan.get('aggressive_growth_exit_split_mode', 'growth')
+                                await self.ctrl.notify(
+                                    f"🚀 Aggressive Growth 진입: {self.ctrl.format_symbol_for_display(symbol)} "
+                                    f"score `{float(plan.get('aggressive_growth_score', 0) or 0):.1f}` / "
+                                    f"risk `{float(plan.get('aggressive_growth_risk_pct', 0) or 0) * 100:.2f}%` / "
+                                    f"split `{float(plan.get('partial_take_profit_ratio', 0) or 0):.0%}/"
+                                    f"{float(plan.get('second_take_profit_ratio', 0) or 0):.0%}/"
+                                    f"{float(plan.get('runner_pct', 0) or 0):.0%}` ({split_mode})"
+                                )
+                                reduced_reasons = []
+                                vol_reason = str(plan.get('aggressive_growth_vol_target_reason') or '')
+                                if vol_reason not in {'', 'atr_normal', 'vol_target_disabled'}:
+                                    reduced_reasons.append(vol_reason)
+                                try:
+                                    kelly_mult = float(plan.get('aggressive_growth_kelly_multiplier', 1.0) or 1.0)
+                                except (TypeError, ValueError):
+                                    kelly_mult = 1.0
+                                if kelly_mult < 0.999:
+                                    reduced_reasons.append(str(plan.get('aggressive_growth_kelly_reason') or 'kelly_reduced'))
+                                if reduced_reasons:
+                                    await self.ctrl.notify(
+                                        f"ℹ️ Aggressive Growth 축소 적용: "
+                                        f"{self.ctrl.format_symbol_for_display(symbol)} {', '.join(reduced_reasons)}"
+                                    )
+                            else:
+                                self._clear_aggressive_growth_position(symbol)
+                                logger.warning(
+                                    f"Aggressive growth tracking skipped for {symbol}: "
+                                    f"protection audit={audit_status}"
+                                )
                     else:
                         await self.ctrl.notify("⚠️ UTBOT_FILTERED_BREAKOUT_V1 보호 주문 거리 계산 오류")
+                if plan and not plan.get('aggressive_growth_overlay'):
+                    self._clear_aggressive_growth_position(symbol)
                 if plan:
                     try:
                         requested = float(price)
@@ -20699,6 +20951,441 @@ class SignalEngine(BaseEngine):
         )
         return state
 
+    async def _current_stop_loss_price(self, symbol, state=None):
+        state_stop = _safe_float_or_none((state or {}).get('last_stop_price'))
+        if state_stop is not None and state_stop > 0:
+            return float(state_stop)
+        orders = await self._collect_protection_orders(symbol)
+        sl_orders = [
+            order for order in (orders or [])
+            if self._classify_protection_order(order) == 'sl'
+        ]
+        newest = self._newest_protection_order(sl_orders)
+        if not newest:
+            return None
+        stop = self._protection_trigger_price(newest)
+        if stop is None:
+            info = self._protection_order_info(newest)
+            stop = newest.get('stopPrice') or info.get('stopPrice')
+        parsed = _safe_float_or_none(stop)
+        return float(parsed) if parsed is not None and parsed > 0 else None
+
+    def _build_aggressive_growth_tp_targets(self, side, entry_price, risk_distance, growth_score):
+        split = choose_aggressive_exit_split(growth_score)
+        targets = []
+        if split['tp1_pct'] > 0:
+            targets.append({
+                'label': 'TP1',
+                'kind': 'tp1',
+                'distance': risk_distance * 1.0,
+                'qty_ratio': split['tp1_pct'],
+            })
+        if split['tp2_pct'] > 0:
+            targets.append({
+                'label': 'TP2',
+                'kind': 'tp2',
+                'distance': risk_distance * 2.0,
+                'qty_ratio': split['tp2_pct'],
+            })
+        if not targets:
+            targets.append({
+                'label': 'TP',
+                'kind': 'tp',
+                'distance': risk_distance * 2.0,
+                'qty_ratio': 1.0,
+            })
+        return targets, split
+
+    async def _maybe_apply_aggressive_growth_pyramiding(self, symbol, pos, df, cfg):
+        if self.is_upbit_mode() or not bool(cfg.get('aggressive_growth_enabled', False)):
+            return None
+        if not bool(cfg.get('aggressive_growth_pyramiding_enabled', True)):
+            return None
+        try:
+            active_strategy = str(self.get_runtime_strategy_params().get('active_strategy', '') or '').lower()
+        except Exception:
+            active_strategy = ''
+        if active_strategy not in UTBREAKOUT_STRATEGIES:
+            return None
+        if not pos or str(pos.get('side', '') or '').lower() != 'long':
+            self._clear_aggressive_growth_position(symbol)
+            return None
+
+        key = self._aggressive_growth_symbol_key(symbol)
+        tracked = getattr(self, 'aggressive_growth_positions', {})
+        meta = tracked.get(key) if isinstance(tracked, dict) else None
+        state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
+        if not isinstance(meta, dict) and isinstance(state, dict) and bool(state.get('aggressive_growth_overlay')):
+            meta = self._record_aggressive_growth_position(symbol, pos, state)
+        if not isinstance(meta, dict):
+            return None
+
+        closed = df.iloc[:-1].copy().reset_index(drop=True) if df is not None and len(df) >= 3 else None
+        if closed is None or closed.empty:
+            return None
+        for col in ['open', 'high', 'low', 'close']:
+            if col not in closed.columns:
+                return None
+            closed[col] = pd.to_numeric(closed[col], errors='coerce')
+        if 'volume' in closed.columns:
+            closed['volume'] = pd.to_numeric(closed['volume'], errors='coerce')
+        closed = closed.dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+        if closed.empty:
+            return None
+
+        current_price = (
+            _safe_float_or_none(pos.get('markPrice'))
+            or _safe_float_or_none(closed.iloc[-1]['close'])
+            or _safe_float_or_none(meta.get('last_price'))
+            or 0.0
+        )
+        entry_price = (
+            _safe_float_or_none(meta.get('entry_price'))
+            or _safe_float_or_none((state or {}).get('entry_price'))
+            or _safe_float_or_none(pos.get('entryPrice'))
+            or 0.0
+        )
+        risk_distance = (
+            _safe_float_or_none(meta.get('risk_distance'))
+            or _safe_float_or_none((state or {}).get('risk_distance'))
+            or 0.0
+        )
+        base_qty = (
+            _safe_float_or_none(meta.get('base_qty'))
+            or _safe_float_or_none((state or {}).get('initial_qty'))
+            or abs(float(self._position_signed_contracts(pos) or pos.get('contracts', 0) or 0))
+        )
+        add_count = int(meta.get('pyramid_add_count', meta.get('pyramid_adds', (state or {}).get('pyramid_add_count', 0))) or 0)
+        if current_price <= 0 or entry_price <= 0 or risk_distance <= 0 or base_qty <= 0:
+            return None
+
+        stop_price = await self._current_stop_loss_price(symbol, state)
+        if stop_price is None or stop_price <= 0:
+            return {
+                'status': 'BLOCKED',
+                'reason': 'current SL unavailable',
+            }
+        sl_can_move = current_price > entry_price
+
+        try:
+            total_equity, _, _ = await self.get_balance_info()
+        except Exception:
+            total_equity = 0.0
+        equity = _safe_float_or_none(total_equity) or 0.0
+        high_watermark = self._update_aggressive_growth_high_watermark(equity)
+        daily_pnl = 0.0
+        weekly_pnl = 0.0
+        try:
+            _, daily_pnl = self.db.get_daily_stats()
+        except Exception:
+            daily_pnl = 0.0
+        try:
+            _, weekly_pnl = self.db.get_weekly_stats()
+        except Exception:
+            weekly_pnl = 0.0
+
+        try:
+            all_positions = await asyncio.to_thread(self.exchange.fetch_positions)
+        except Exception:
+            all_positions = [pos]
+        exposure = self._calculate_aggressive_growth_exposure(all_positions, symbol=symbol)
+        try:
+            common_cfg = self.get_runtime_common_settings()
+        except Exception:
+            common_cfg = {}
+        leverage = (
+            _safe_float_or_none((common_cfg or {}).get('leverage'))
+            or _safe_float_or_none(cfg.get('leverage'))
+            or 5.0
+        )
+        sleeve_cap, sleeve_pct = calculate_aggressive_sleeve_notional_cap(
+            equity,
+            leverage=leverage,
+            cfg=cfg,
+            high_watermark=high_watermark,
+        )
+        available_sleeve_notional = max(0.0, sleeve_cap - float(exposure.get('total_notional', 0.0) or 0.0))
+        available_sleeve_qty = available_sleeve_notional / max(current_price, 1e-12)
+
+        futures_context = {}
+        try:
+            futures_context = await self._fetch_utbreakout_futures_context(symbol)
+        except Exception as exc:
+            futures_context = {'futures_context_error': str(exc)}
+        futures_context = dict(futures_context or {})
+        price_change_1h = None
+        price_change_4h = None
+        close_series = closed['close'].astype(float)
+        if len(close_series) >= 5:
+            prev = float(close_series.iloc[-5])
+            if prev > 0:
+                price_change_1h = (current_price - prev) / prev * 100.0
+        if len(close_series) >= 17:
+            prev = float(close_series.iloc[-17])
+            if prev > 0:
+                price_change_4h = (current_price - prev) / prev * 100.0
+
+        volume_ok = False
+        if 'volume' in closed.columns and len(closed) >= 10:
+            recent_volume = _safe_float_or_none(closed.iloc[-1].get('volume'))
+            avg_volume = _safe_float_or_none(closed['volume'].tail(20).mean())
+            if recent_volume is not None and avg_volume is not None and avg_volume > 0:
+                volume_ratio = recent_volume / avg_volume
+                volume_ok = volume_ratio >= float(cfg.get('bias_continuation_min_volume_ratio', 0.75) or 0.75)
+        else:
+            volume_ratio = None
+
+        trend_bullish = False
+        if len(close_series) >= 60:
+            ema_fast = close_series.ewm(span=20, adjust=False).mean().iloc[-1]
+            ema_slow = close_series.ewm(span=50, adjust=False).mean().iloc[-1]
+            trend_bullish = bool(current_price > ema_fast > ema_slow)
+        elif len(close_series) >= 20:
+            trend_bullish = bool(current_price > close_series.tail(20).mean())
+        quality_score = _safe_float_or_none(meta.get('aggressive_growth_score')) or _safe_float_or_none((state or {}).get('aggressive_growth_score'))
+        quality_ok = quality_score is None or quality_score >= 60.0
+        funding_value = _safe_float_or_none(futures_context.get('funding_rate'))
+        funding_not_overheated = (
+            funding_value is None
+            or funding_value <= float(cfg.get('funding_long_max', 0.0008) or 0.0008)
+        )
+        growth_context = {
+            'side': 'long',
+            'entry_price': entry_price,
+            'current_price': current_price,
+            'risk_distance': risk_distance,
+            'initial_qty': base_qty,
+            'pyramid_add_count': add_count,
+            'stop_loss_price': stop_price,
+            'account_equity': equity,
+            'daily_pnl_usdt': daily_pnl,
+            'weekly_pnl_usdt': weekly_pnl,
+            'sl_can_move_to_breakeven': sl_can_move,
+            'available_sleeve_qty': available_sleeve_qty,
+            'symbol_trend_bullish': trend_bullish,
+            'htf_trend_bullish': trend_bullish,
+            'volume_ok': volume_ok,
+            'quality_ok': quality_ok,
+            'funding_not_overheated': funding_not_overheated,
+            'volatility_safe': True,
+            'growth_score': quality_score,
+            'funding_rate': futures_context.get('funding_rate'),
+            'funding_percentile_7d': futures_context.get('funding_percentile_7d'),
+            'funding_percentile_30d': futures_context.get('funding_percentile_30d'),
+            'open_interest_change_1h': futures_context.get('open_interest_delta_pct'),
+            'open_interest_change_4h': futures_context.get('open_interest_change_4h'),
+            'price_change_1h': price_change_1h,
+            'price_change_4h': price_change_4h,
+            'long_short_ratio': futures_context.get('long_short_ratio'),
+            'taker_buy_sell_ratio': futures_context.get('taker_buy_sell_ratio'),
+            'liquidation_imbalance': futures_context.get('liquidation_imbalance'),
+        }
+        derivatives_score, derivatives_reasons = evaluate_derivatives_growth_score(growth_context)
+        growth_context['growth_context_valid'] = (
+            trend_bullish
+            and volume_ok
+            and funding_not_overheated
+            and not any(
+                reason in {'funding_overheated', 'long_crowded', 'oi_up_price_stall', 'oi_4h_up_price_stall'}
+                for reason in derivatives_reasons
+            )
+        )
+        pyramid_plan = build_aggressive_growth_pyramid_plan(
+            {
+                'side': 'long',
+                'entry_price': entry_price,
+                'risk_distance': risk_distance,
+                'initial_qty': base_qty,
+                'pyramid_add_count': add_count,
+            },
+            cfg,
+            growth_context,
+        )
+        if not pyramid_plan.get('accepted'):
+            try:
+                trigger_r = float(cfg.get('aggressive_growth_pyramid_trigger_r', 1.0) or 1.0)
+                pnl_r = (current_price - entry_price) / max(risk_distance, 1e-12)
+                now_ts = time.time()
+                last_notice = float(meta.get('last_pyramid_block_notice_ts', 0.0) or 0.0)
+                if pnl_r >= trigger_r and now_ts - last_notice >= 300:
+                    meta['last_pyramid_block_notice_ts'] = now_ts
+                    await self.ctrl.notify(
+                        f"⚠️ Aggressive Growth 추가진입 차단: {self.ctrl.format_symbol_for_display(symbol)} "
+                        f"{pyramid_plan.get('reason')}"
+                    )
+            except Exception:
+                logger.debug("Aggressive growth pyramid block notice skipped", exc_info=True)
+            return {'status': 'BLOCKED', **pyramid_plan}
+
+        breakeven_stop = float(pyramid_plan.get('breakeven_stop_price') or entry_price)
+        if bool(pyramid_plan.get('requires_sl_move')):
+            replacement = await self._replace_stop_loss_order(
+                symbol,
+                pos,
+                breakeven_stop,
+                reason='Aggressive Growth pyramid breakeven'
+            )
+            if not replacement:
+                await self.ctrl.notify(
+                    f"⚠️ Aggressive Growth 추가진입 차단: {self.ctrl.format_symbol_for_display(symbol)} "
+                    "BE SL 교체 확인 실패"
+                )
+                return {'status': 'BLOCKED', 'reason': 'breakeven SL replacement failed'}
+            if isinstance(state, dict):
+                state.update({
+                    'active': True,
+                    'breakeven_armed': True,
+                    'last_stop_price': breakeven_stop,
+                    'last_update_ts': datetime.now(timezone.utc).isoformat(),
+                })
+                self.utbreakout_trailing_states[symbol] = state
+            pre_add_audit = await self._audit_protection_orders(
+                symbol,
+                pos=pos,
+                expected_tp=True,
+                expected_sl=True,
+                planned_tp_orders=self._planned_tp_orders_from_state(symbol, state),
+                alert=True
+            )
+            if not pre_add_audit.get('sl_present'):
+                await self.ctrl.notify(
+                    f"⚠️ Aggressive Growth 추가진입 차단: {self.ctrl.format_symbol_for_display(symbol)} "
+                    "BE SL 거래소 확인 실패"
+                )
+                return {'status': 'BLOCKED', 'reason': 'breakeven SL audit failed', 'audit': pre_add_audit}
+        else:
+            pre_add_audit = await self._audit_protection_orders(
+                symbol,
+                pos=pos,
+                expected_tp=True,
+                expected_sl=True,
+                planned_tp_orders=self._planned_tp_orders_from_state(symbol, state),
+                alert=True
+            )
+            if not pre_add_audit.get('sl_present'):
+                await self.ctrl.notify(
+                    f"⚠️ Aggressive Growth 추가진입 차단: {self.ctrl.format_symbol_for_display(symbol)} "
+                    "기존 BE SL 거래소 확인 실패"
+                )
+                return {'status': 'BLOCKED', 'reason': 'existing breakeven SL audit failed', 'audit': pre_add_audit}
+
+        add_qty = self.safe_amount(symbol, float(pyramid_plan.get('add_qty') or 0.0))
+        if float(add_qty) <= 0:
+            return {'status': 'BLOCKED', 'reason': 'pyramid quantity rounded to zero'}
+        await self.ensure_market_settings(symbol, leverage=int(max(1, float(leverage or 1))))
+        order = await asyncio.to_thread(self.exchange.create_order, symbol, 'market', 'buy', add_qty)
+        self.position_cache = None
+        self.position_cache_time = 0
+        await asyncio.sleep(1)
+        new_pos = await self.get_server_position(symbol, use_cache=False)
+        if not new_pos or str(new_pos.get('side', '') or '').lower() != 'long':
+            await self.ctrl.notify(
+                f"⚠️ Aggressive Growth 추가진입 후 포지션 확인 실패: {self.ctrl.format_symbol_for_display(symbol)}"
+            )
+            return {'status': 'ORDER_SENT_POSITION_MISSING', 'order': order}
+
+        total_qty = abs(float(self._position_signed_contracts(new_pos) or new_pos.get('contracts', 0) or 0))
+        avg_entry = _safe_float_or_none(new_pos.get('entryPrice')) or entry_price
+        if total_qty <= 0 or avg_entry <= breakeven_stop:
+            await self.ctrl.notify(
+                f"⚠️ Aggressive Growth 추가진입 후 평균가/SL 검증 실패: {self.ctrl.format_symbol_for_display(symbol)}"
+            )
+            return {'status': 'BLOCKED', 'reason': 'average entry not above breakeven stop'}
+        new_risk_distance = avg_entry - breakeven_stop
+        growth_score = (
+            pyramid_plan.get('growth_score')
+            if pyramid_plan.get('growth_score') is not None
+            else quality_score
+        )
+        tp_targets, split = self._build_aggressive_growth_tp_targets(
+            'long',
+            avg_entry,
+            new_risk_distance,
+            growth_score or 0.0,
+        )
+        await self._place_tp_sl_orders(
+            symbol,
+            'long',
+            avg_entry,
+            total_qty,
+            sl_distance=new_risk_distance,
+            tp_targets=tp_targets,
+            preserve_runner_qty=True
+        )
+        effective_cfg = dict(cfg or {})
+        effective_cfg.update({
+            'partial_take_profit_enabled': True,
+            'partial_take_profit_r_multiple': 1.0,
+            'partial_take_profit_ratio': split['tp1_pct'],
+            'second_take_profit_enabled': split['tp2_pct'] > 0,
+            'second_take_profit_r_multiple': 2.0,
+            'second_take_profit_ratio': split['tp2_pct'],
+            'runner_pct': split['runner_pct'],
+            'atr_trailing_enabled': True,
+            'atr_trailing_multiplier': float(cfg.get('aggressive_growth_trailing_atr_multiplier', 2.5) or 2.5),
+            'runner_exit_enabled': True,
+            'runner_chandelier_enabled': True,
+            'tp1_breakeven_enabled': True,
+        })
+        state_plan = dict(meta)
+        state_plan.update({
+            'side': 'long',
+            'entry_price': avg_entry,
+            'risk_distance': new_risk_distance,
+            'stop_loss': breakeven_stop,
+            'aggressive_growth_overlay': True,
+            'aggressive_growth_score': growth_score,
+            'runner_pct': split['runner_pct'],
+            'pyramid_add_count': int(pyramid_plan.get('pyramid_add_count') or add_count + 1),
+            'base_qty': base_qty,
+        })
+        self._register_utbreakout_trailing_state(
+            symbol,
+            'long',
+            avg_entry,
+            total_qty,
+            state_plan,
+            effective_cfg,
+        )
+        runner_state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
+        audit_status = await self._audit_protection_orders(
+            symbol,
+            pos=new_pos,
+            expected_tp=True,
+            expected_sl=True,
+            planned_tp_orders=self._planned_tp_orders_from_state(symbol, runner_state),
+            alert=True
+        )
+        if audit_status.get('missing_tp2') or audit_status.get('tp2_qty_mismatch') or audit_status.get('sl_qty_mismatch'):
+            await self._audit_and_repair_live_ladder_protection(
+                symbol,
+                new_pos,
+                runner_state,
+                effective_cfg,
+                reason='Aggressive Growth pyramid residual audit'
+            )
+        self._record_aggressive_growth_position(
+            symbol,
+            new_pos,
+            state_plan,
+            qty=total_qty,
+            current_price=avg_entry,
+        )
+        await self.ctrl.notify(
+            f"🚀 Aggressive Growth 추가진입: {self.ctrl.format_symbol_for_display(symbol)} "
+            f"+`{float(add_qty):.6f}` / add `{int(pyramid_plan.get('pyramid_add_count') or add_count + 1)}` / "
+            f"SL `{breakeven_stop:.4f}` / split `{split['tp1_pct']:.0%}/{split['tp2_pct']:.0%}/{split['runner_pct']:.0%}`"
+        )
+        return {
+            'status': 'ADDED',
+            'order': order,
+            'plan': pyramid_plan,
+            'audit': audit_status,
+            'sleeve_pct': sleeve_pct,
+            'derivatives_score': derivatives_score,
+            'derivatives_reasons': derivatives_reasons,
+        }
+
     async def _place_tp_sl_orders(
         self,
         symbol,
@@ -21152,6 +21839,7 @@ class SignalEngine(BaseEngine):
 
         self.db.log_trade_close(symbol, pnl, pnl_pct, exit_price, reason)
         self._clear_utbreakout_trailing_state(symbol, finalize=True, reason=reason, exit_price=exit_price)
+        self._clear_aggressive_growth_position(symbol)
         await self.ctrl.notify(
             self._build_signal_exit_notice(symbol, pos, reason, pnl, pnl_pct, exit_price)
         )
