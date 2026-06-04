@@ -494,6 +494,9 @@ def build_utbreakout_set_registry():
         'second_take_profit_enabled': True,
         'second_take_profit_r_multiple': 2.0,
         'second_take_profit_ratio': 0.5,
+        'enable_tp2_fallback_close': False,
+        'tp2_fallback_confirm_loops': 2,
+        'tp2_fallback_use_market': True,
         'atr_trailing_enabled': False,
         'atr_trailing_multiplier': 2.0,
         'atr_trailing_activation_r': 1.5,
@@ -874,6 +877,9 @@ def build_default_utbot_filtered_breakout_config():
         'second_take_profit_enabled': True,
         'second_take_profit_r_multiple': 2.0,
         'second_take_profit_ratio': 0.5,
+        'enable_tp2_fallback_close': False,
+        'tp2_fallback_confirm_loops': 2,
+        'tp2_fallback_use_market': True,
         'atr_trailing_enabled': False,
         'atr_trailing_multiplier': 2.0,
         'atr_trailing_activation_r': 1.5,
@@ -5026,6 +5032,7 @@ class SignalEngine(BaseEngine):
             'meta_labeling_min_samples': 12,
             'bias_continuation_max_signal_age_candles': 6,
             'bias_continuation_15m_max_signal_age_candles': 3,
+            'tp2_fallback_confirm_loops': 2,
             'safe_live_default_set_id': UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID,
         }.items():
             min_value = 0 if key == 'opposite_set_exit_min_hold_candles' else 1
@@ -5119,6 +5126,8 @@ class SignalEngine(BaseEngine):
             'dynamic_take_profit_enabled',
             'tp1_breakeven_enabled',
             'tp1_breakeven_wait_for_partial',
+            'enable_tp2_fallback_close',
+            'tp2_fallback_use_market',
             'emergency_close_on_sl_fail',
             'live_safety_guard_enabled',
             'allow_ut_only_live_override',
@@ -6943,6 +6952,45 @@ class SignalEngine(BaseEngine):
         if risk_distance <= 0 or initial_qty <= 0 or entry <= 0:
             return None
         ratio = min(0.9, max(0.0, float(cfg.get('partial_take_profit_ratio', 0.5) or 0.5)))
+        second_enabled = bool(cfg.get('second_take_profit_enabled', True))
+        partial_enabled = bool(cfg.get('partial_take_profit_enabled', True))
+        partial_ratio = ratio if partial_enabled else 0.0
+        second_ratio = min(
+            max(0.0, 1.0 - partial_ratio),
+            max(0.0, float(cfg.get('second_take_profit_ratio', 0.5) or 0.5))
+        ) if second_enabled else 0.0
+        raw_tp_quantities = []
+        planned_tp_orders = []
+        partial_r = max(0.1, float(cfg.get('partial_take_profit_r_multiple', 1.5) or 1.5))
+        second_r = max(0.1, float(cfg.get('second_take_profit_r_multiple', cfg.get('take_profit_r_multiple', 2.0)) or 2.0))
+        if partial_enabled and partial_ratio > 0:
+            raw_tp_quantities.append(initial_qty * partial_ratio)
+            planned_tp_orders.append({
+                'tp_index': 1,
+                'tp_label': 'TP1',
+                'tp_name': 'TP1',
+                'side': 'sell' if str(side or '').lower() == 'long' else 'buy',
+                'price': entry + risk_distance * partial_r if str(side or '').lower() == 'long' else entry - risk_distance * partial_r,
+                'qty': None,
+                'pct': partial_ratio * 100.0,
+                'filled': False,
+            })
+        if second_enabled and second_ratio > 0:
+            raw_tp_quantities.append(initial_qty * second_ratio)
+            planned_tp_orders.append({
+                'tp_index': len(planned_tp_orders) + 1,
+                'tp_label': 'TP2',
+                'tp_name': 'TP2',
+                'side': 'sell' if str(side or '').lower() == 'long' else 'buy',
+                'price': entry + risk_distance * second_r if str(side or '').lower() == 'long' else entry - risk_distance * second_r,
+                'qty': None,
+                'pct': second_ratio * 100.0,
+                'filled': False,
+            })
+        residual_qtys = _calculate_residual_tp_quantities(symbol, initial_qty, raw_tp_quantities, self.safe_amount)
+        for index, qty_value in enumerate(residual_qtys):
+            if index < len(planned_tp_orders):
+                planned_tp_orders[index]['qty'] = qty_value
         activation_r = max(
             0.0,
             float(
@@ -6957,6 +7005,9 @@ class SignalEngine(BaseEngine):
             'entry_price': entry,
             'initial_qty': initial_qty,
             'remaining_ratio': max(0.0, 1.0 - ratio),
+            'planned_tp_orders': planned_tp_orders,
+            'tp_orders': list(planned_tp_orders),
+            'expected_tp_count': len(planned_tp_orders),
             'risk_distance': risk_distance,
             'activation_r': activation_r,
             'trailing_atr_multiplier': max(0.1, float(cfg.get('atr_trailing_multiplier', 2.0) or 2.0)),
@@ -7007,6 +7058,9 @@ class SignalEngine(BaseEngine):
             'auto_selected_set_name': plan.get('auto_selected_set_name'),
             'decision_candle_ts': plan.get('decision_candle_ts'),
             'active': False,
+            'tp1_filled': False,
+            'tp2_filled': False,
+            'tp2_fallback_reached_loops': 0,
             'created_at': datetime.now(timezone.utc).isoformat(),
         }
         self.utbreakout_trailing_states[symbol] = state
@@ -18824,6 +18878,30 @@ class SignalEngine(BaseEngine):
                 continue
         return None
 
+    def _protection_order_amount(self, order):
+        if not isinstance(order, dict):
+            return None
+        info = self._protection_order_info(order)
+        for value in (
+            order.get('amount'),
+            order.get('remaining'),
+            order.get('origQty'),
+            order.get('orig_qty'),
+            order.get('quantity'),
+            order.get('qty'),
+            info.get('origQty'),
+            info.get('executedQty'),
+            info.get('quantity'),
+            info.get('qty'),
+        ):
+            try:
+                number = float(value)
+                if number > 0:
+                    return number
+            except (TypeError, ValueError):
+                continue
+        return None
+
     def _normalize_protection_symbol(self, value):
         return (
             str(value or '')
@@ -18895,6 +18973,74 @@ class SignalEngine(BaseEngine):
             or ''
         ).strip()
 
+    def _planned_tp_orders_from_state(self, symbol, state=None):
+        if state is None:
+            state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
+        if not isinstance(state, dict):
+            return []
+        planned = []
+        raw_orders = state.get('planned_tp_orders') or state.get('tp_orders') or []
+        for index, item in enumerate(raw_orders or [], 1):
+            if not isinstance(item, dict):
+                continue
+            label = _normalize_tp_plan_label(
+                item.get('tp_label') or item.get('tp_name') or item.get('label'),
+                f"TP{index}",
+            )
+            if not label:
+                continue
+            price = _safe_float_or_none(item.get('price') or item.get('target_price'))
+            qty = _safe_float_or_none(item.get('qty') or item.get('quantity'))
+            planned.append({
+                'tp_index': int(item.get('tp_index') or index),
+                'tp_label': label,
+                'tp_name': item.get('tp_name') or label,
+                'side': str(item.get('side') or '').lower(),
+                'price': float(price) if price is not None else None,
+                'qty': float(qty) if qty is not None else None,
+                'order_id': item.get('order_id'),
+                'client_order_id': item.get('client_order_id'),
+                'filled': bool(item.get('filled', False)),
+            })
+        return planned
+
+    def _price_matches_plan(self, expected, actual, tolerance_pct=0.01):
+        expected = _safe_float_or_none(expected)
+        actual = _safe_float_or_none(actual)
+        if expected is None or actual is None:
+            return False
+        tolerance = max(1e-8, abs(float(expected)) * (float(tolerance_pct) / 100.0))
+        return abs(float(actual) - float(expected)) <= tolerance
+
+    def _qty_matches_plan(self, expected, actual, tolerance_pct=0.1):
+        expected = _safe_float_or_none(expected)
+        actual = _safe_float_or_none(actual)
+        if expected is None or actual is None:
+            return False
+        tolerance = max(1e-9, abs(float(expected)) * (float(tolerance_pct) / 100.0))
+        return abs(float(actual) - float(expected)) <= tolerance
+
+    def _protection_tp_label(self, order, planned_tp_orders=None):
+        text = " ".join([
+            self._protection_client_order_id(order),
+            self._protection_order_id(order) or '',
+        ]).lower()
+        for label in ('tp1', 'tp2', 'tp3'):
+            if label in text:
+                return label.upper()
+
+        order_side = self._protection_order_side(order)
+        order_price = _safe_float_or_none(order.get('price')) or self._protection_trigger_price(order)
+        for plan in planned_tp_orders or []:
+            if not isinstance(plan, dict):
+                continue
+            plan_side = str(plan.get('side') or '').lower()
+            if plan_side and order_side and plan_side != order_side:
+                continue
+            if self._price_matches_plan(plan.get('price'), order_price):
+                return _normalize_tp_plan_label(plan.get('tp_label') or plan.get('tp_name'))
+        return None
+
     def _protection_order_timestamp(self, order):
         if not isinstance(order, dict):
             return 0
@@ -18915,16 +19061,17 @@ class SignalEngine(BaseEngine):
         return 0
 
     def _build_protection_client_order_id(self, symbol, side, kind, pos=None):
+        kind_part = re.sub(r'[^a-zA-Z0-9]', '', str(kind or '').lower())[:4] or 'xx'
         raw = "|".join([
             self._normalize_protection_symbol(symbol),
             str(side or '').lower(),
-            str(kind or '').lower(),
+            kind_part,
             self._protection_position_signature(pos),
             str(int(time.time() * 1000)),
         ])
         digest = hashlib.sha1(raw.encode('utf-8')).hexdigest()[:10]
         symbol_part = self._normalize_protection_symbol(symbol)[-8:] or 'SYMBOL'
-        return f"utb{str(kind or '')[:2]}{symbol_part}{digest}"[:36]
+        return f"utb{kind_part}{symbol_part}{digest}"[:36]
 
     async def _collect_protection_orders(self, symbol):
         _, orders = await self._collect_protection_orders_checked(symbol)
@@ -19308,16 +19455,35 @@ class SignalEngine(BaseEngine):
             master and bool(cfg.get('stop_loss_enabled', True))
         )
 
-    async def _audit_protection_orders(self, symbol, pos=None, expected_tp=None, expected_sl=None, alert=True):
+    async def _audit_protection_orders(
+        self,
+        symbol,
+        pos=None,
+        expected_tp=None,
+        expected_sl=None,
+        alert=True,
+        planned_tp_orders=None,
+    ):
         status = {
             'tp_expected': bool(expected_tp),
             'sl_expected': bool(expected_sl),
             'tp_present': False,
             'sl_present': False,
+            'tp1_present': False,
+            'tp2_present': False,
             'tp_count': 0,
             'sl_count': 0,
+            'expected_tp_count': 0,
+            'actual_tp_count': 0,
+            'tp_labels_present': [],
             'missing_tp': False,
+            'missing_tp1': False,
+            'missing_tp2': False,
             'missing_sl': False,
+            'tp_qty_mismatch': False,
+            'tp2_qty_mismatch': False,
+            'tp_price_mismatch': False,
+            'sl_qty_mismatch': False,
             'orphan_cancelled': 0,
             'mismatch_cancelled': 0,
             'duplicate_cancelled': 0,
@@ -19365,6 +19531,35 @@ class SignalEngine(BaseEngine):
             and bool(runner_state.get('active'))
             and str(runner_state.get('side', '')).lower() == pos_side
         )
+        if planned_tp_orders is None:
+            planned_tp_orders = self._planned_tp_orders_from_state(symbol, runner_state)
+        planned_tp_orders = list(planned_tp_orders or [])
+        planned_by_label = {
+            _normalize_tp_plan_label(plan.get('tp_label') or plan.get('tp_name')): dict(plan)
+            for plan in planned_tp_orders
+            if isinstance(plan, dict) and _normalize_tp_plan_label(plan.get('tp_label') or plan.get('tp_name'))
+        }
+        expected_tp_labels = []
+        if planned_by_label:
+            for label, plan in planned_by_label.items():
+                if isinstance(runner_state, dict) and bool(runner_state.get(f"{label.lower()}_filled", False)):
+                    continue
+                if bool(plan.get('filled', False)):
+                    continue
+                expected_tp_labels.append(label)
+            status['expected_tp_count'] = len(expected_tp_labels)
+            status['planned_tp_orders'] = [
+                {
+                    'tp_label': label,
+                    'price': planned_by_label[label].get('price'),
+                    'qty': planned_by_label[label].get('qty'),
+                    'side': planned_by_label[label].get('side'),
+                }
+                for label in expected_tp_labels
+            ]
+            if expected_tp_labels:
+                expected_tp = True
+                status['tp_expected'] = True
         valid_tp = []
         valid_sl = []
         mismatched = []
@@ -19373,6 +19568,9 @@ class SignalEngine(BaseEngine):
             kind = self._classify_protection_order(order)
             order_side = self._protection_order_side(order)
             if order_side and order_side != close_side:
+                mismatched.append(order)
+                continue
+            if kind in {'tp', 'sl'} and not self._is_reduce_only_order(order):
                 mismatched.append(order)
                 continue
             trigger_price = self._protection_trigger_price(order)
@@ -19444,18 +19642,88 @@ class SignalEngine(BaseEngine):
         status['tp_count'] = len(valid_tp)
         status['sl_count'] = len(valid_sl)
         status['order_types'] = [self._protection_order_type(order) for order in protection_orders]
+        tp_orders_by_label = {}
+        for order in valid_tp:
+            label = self._protection_tp_label(order, planned_tp_orders)
+            if label:
+                tp_orders_by_label.setdefault(label, []).append(order)
+        status['tp_labels_present'] = sorted(tp_orders_by_label.keys())
+        status['tp1_present'] = bool(tp_orders_by_label.get('TP1'))
+        status['tp2_present'] = bool(tp_orders_by_label.get('TP2'))
+        status['actual_tp_count'] = len(valid_tp)
         status['tp_present'] = len(valid_tp) > 0
         status['sl_present'] = len(valid_sl) > 0
-        status['missing_tp'] = bool(expected_tp) and not status['tp_present']
+        if expected_tp_labels:
+            status['missing_tp1'] = 'TP1' in expected_tp_labels and not status['tp1_present']
+            status['missing_tp2'] = 'TP2' in expected_tp_labels and not status['tp2_present']
+            status['missing_tp'] = status['missing_tp1'] or status['missing_tp2']
+        else:
+            status['missing_tp'] = bool(expected_tp) and not status['tp_present']
         status['missing_sl'] = bool(expected_sl) and not status['sl_present']
+        current_qty = abs(float(self._position_signed_contracts(pos) or pos.get('contracts', 0) or 0))
+        tp_qty_mismatches = []
+        tp_price_mismatches = []
+        for label in expected_tp_labels:
+            order = self._newest_protection_order(tp_orders_by_label.get(label) or [])
+            if not order:
+                continue
+            plan = planned_by_label.get(label, {})
+            expected_qty = plan.get('qty')
+            if label == 'TP2' and isinstance(runner_state, dict) and bool(runner_state.get('tp1_filled', False)):
+                expected_qty = current_qty
+            actual_qty = self._protection_order_amount(order)
+            if expected_qty is not None and actual_qty is not None and not self._qty_matches_plan(expected_qty, actual_qty):
+                tp_qty_mismatches.append(label)
+            actual_price = _safe_float_or_none(order.get('price')) or self._protection_trigger_price(order)
+            if plan.get('price') is not None and actual_price is not None and not self._price_matches_plan(plan.get('price'), actual_price):
+                tp_price_mismatches.append(label)
+        status['tp_qty_mismatch_labels'] = sorted(tp_qty_mismatches)
+        status['tp_price_mismatch_labels'] = sorted(tp_price_mismatches)
+        status['tp_qty_mismatch'] = bool(tp_qty_mismatches)
+        status['tp2_qty_mismatch'] = 'TP2' in tp_qty_mismatches
+        status['tp_price_mismatch'] = bool(tp_price_mismatches)
+        sl_qty_mismatch = False
+        for order in valid_sl:
+            actual_sl_qty = self._protection_order_amount(order)
+            if actual_sl_qty is not None and current_qty > 0 and not self._qty_matches_plan(current_qty, actual_sl_qty):
+                sl_qty_mismatch = True
+                break
+        status['sl_qty_mismatch'] = sl_qty_mismatch
         position_signature = self._protection_position_signature(pos)
-        if status['missing_sl']:
+        if status['missing_sl'] and status['missing_tp2']:
+            status['status'] = 'MISSING_SL_AND_TP2'
+            if alert:
+                await self._notify_protection_issue(
+                    symbol,
+                    f"missing_sl_tp2:{position_signature}",
+                    f"🚨 {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락: SL과 TP2 없음. 거래소 주문을 즉시 확인하세요.",
+                    cooldown_sec=30 * 24 * 60 * 60
+                )
+        elif status['missing_sl']:
             status['status'] = 'MISSING_SL'
             if alert:
                 await self._notify_protection_issue(
                     symbol,
                     f"missing_sl:{position_signature}",
                     f"🚨 {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락: SL 없음. 포지션은 유지 중이니 거래소 주문을 확인하세요.",
+                        cooldown_sec=30 * 24 * 60 * 60
+                )
+        elif status['missing_tp2']:
+            status['status'] = 'MISSING_TP2'
+            if alert:
+                await self._notify_protection_issue(
+                    symbol,
+                    f"missing_tp2:{position_signature}",
+                    f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락: TP2 없음",
+                    cooldown_sec=30 * 24 * 60 * 60
+                )
+        elif status['missing_tp1']:
+            status['status'] = 'MISSING_TP1'
+            if alert:
+                await self._notify_protection_issue(
+                    symbol,
+                    f"missing_tp1:{position_signature}",
+                    f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락: TP1 없음",
                     cooldown_sec=30 * 24 * 60 * 60
                 )
         elif status['missing_tp']:
@@ -19473,6 +19741,14 @@ class SignalEngine(BaseEngine):
             status['status'] = 'INVALID_PRICE_CANCELLED'
         elif status['duplicate_cancelled']:
             status['status'] = 'DUPLICATE_CANCELLED'
+        elif status['tp2_qty_mismatch']:
+            status['status'] = 'TP2_QTY_MISMATCH'
+        elif status['tp_qty_mismatch']:
+            status['status'] = 'TP_QTY_MISMATCH'
+        elif status['tp_price_mismatch']:
+            status['status'] = 'TP_PRICE_MISMATCH'
+        elif status['sl_qty_mismatch']:
+            status['status'] = 'SL_QTY_MISMATCH'
         else:
             status['status'] = 'OK'
         self.last_protection_order_status[symbol] = status
@@ -19774,6 +20050,19 @@ class SignalEngine(BaseEngine):
             self._clear_utbreakout_trailing_state(symbol)
             return None
 
+        if state.get('planned_tp_orders') or state.get('tp_orders'):
+            audit_status = await self._audit_and_repair_live_ladder_protection(
+                symbol,
+                pos,
+                state,
+                cfg,
+                reason='UTBreak monitor residual audit'
+            )
+            fallback_status = await self._maybe_tp2_fallback_close(symbol, pos, state, cfg, audit_status=audit_status)
+            if fallback_status.get('status') == 'TP2_FALLBACK_CLOSED':
+                self._clear_utbreakout_trailing_state(symbol, finalize=True, reason='TP2 fallback close')
+                return {'status': 'EXITED', 'reason': 'TP2_FALLBACK_CLOSE', 'fallback': fallback_status}
+
         closed = df.iloc[:-1].copy().reset_index(drop=True) if df is not None and len(df) >= 3 else None
         if closed is None or len(closed) < int(cfg.get('atr_length', 14) or 14) + 2:
             return None
@@ -19861,18 +20150,22 @@ class SignalEngine(BaseEngine):
                         'last_update_ts': datetime.now(timezone.utc).isoformat(),
                     })
                     self.utbreakout_trailing_states[symbol] = state
-                    protection_orders = await self._collect_protection_orders(symbol)
-                    expected_tp = any(
-                        self._classify_protection_order(order) == 'tp'
-                        for order in (protection_orders or [])
-                    )
-                    await self._audit_protection_orders(
+                    audit_status = await self._audit_protection_orders(
                         symbol,
                         pos=pos,
-                        expected_tp=expected_tp,
+                        expected_tp=True,
                         expected_sl=True,
+                        planned_tp_orders=self._planned_tp_orders_from_state(symbol, state),
                         alert=True
                     )
+                    if audit_status.get('missing_tp2') or audit_status.get('tp2_qty_mismatch') or audit_status.get('sl_qty_mismatch'):
+                        await self._audit_and_repair_live_ladder_protection(
+                            symbol,
+                            pos,
+                            state,
+                            cfg,
+                            reason='UTBreak TP1 breakeven residual audit'
+                        )
                     await self.ctrl.notify(
                         f"🛡️ UTBreak TP1 보호: {self.ctrl.format_symbol_for_display(symbol)} "
                         f"{side.upper()} SL `{float(breakeven_stop):.4f}` (BE+{offset_r:.2f}R)"
@@ -19980,18 +20273,22 @@ class SignalEngine(BaseEngine):
             'last_update_ts': datetime.now(timezone.utc).isoformat(),
         })
         self.utbreakout_trailing_states[symbol] = state
-        protection_orders = await self._collect_protection_orders(symbol)
-        expected_tp = any(
-            self._classify_protection_order(order) == 'tp'
-            for order in (protection_orders or [])
-        )
-        await self._audit_protection_orders(
+        audit_status = await self._audit_protection_orders(
             symbol,
             pos=pos,
-            expected_tp=expected_tp,
+            expected_tp=True,
             expected_sl=True,
+            planned_tp_orders=self._planned_tp_orders_from_state(symbol, state),
             alert=True
         )
+        if audit_status.get('missing_tp2') or audit_status.get('tp2_qty_mismatch') or audit_status.get('sl_qty_mismatch'):
+            await self._audit_and_repair_live_ladder_protection(
+                symbol,
+                pos,
+                state,
+                cfg,
+                reason='UTBreak ATR trailing residual audit'
+            )
         await self.ctrl.notify(
             f"🧭 UTBreak Runner SL 갱신: {self.ctrl.format_symbol_for_display(symbol)} "
             f"{side.upper()} SL `{float(new_stop):.4f}` ({runner_mode}, MFE {mfe_r:.2f}R)"
@@ -20090,13 +20387,42 @@ class SignalEngine(BaseEngine):
                     entry_price + distance if side == 'long' else entry_price - distance
                 )
                 normalized_tp_targets.append({
-                    'label': str(target.get('label') or f'TP{index}'),
+                    'label': _normalize_tp_plan_label(target.get('label'), f'TP{index}'),
                     'kind': str(target.get('kind') or f'tp{index}'),
+                    'tp_index': index,
+                    'tp_label': _normalize_tp_plan_label(target.get('label'), f'TP{index}'),
                     'distance': distance,
                     'qty_ratio': ratio,
-                    'qty': self.safe_amount(symbol, raw_qty * ratio),
+                    'raw_qty': raw_qty * ratio,
                     'price': target_price,
                 })
+            residual_tp_qtys = _calculate_residual_tp_quantities(
+                symbol,
+                raw_qty,
+                [target.get('raw_qty') for target in normalized_tp_targets],
+                self.safe_amount,
+            )
+            for index, target in enumerate(normalized_tp_targets):
+                target['qty'] = (
+                    residual_tp_qtys[index]
+                    if index < len(residual_tp_qtys)
+                    else 0.0
+                )
+            if normalized_tp_targets:
+                logger.info(
+                    "[Protection] planned TP ladder for %s: entry=%.12f qty=%.12f targets=%s",
+                    symbol,
+                    entry_price,
+                    raw_qty,
+                    [
+                        {
+                            'label': target.get('label'),
+                            'price': target.get('price'),
+                            'qty': target.get('qty'),
+                        }
+                        for target in normalized_tp_targets
+                    ],
+                )
             tp_price = normalized_tp_targets[0]['price'] if normalized_tp_targets else None
 
             def _valid_price(direction, price_value):
@@ -20194,26 +20520,39 @@ class SignalEngine(BaseEngine):
                     )
                     continue
                 try:
+                    target_order_type = str(
+                        protection_cfg.get(f"{str(target_label).lower()}_order_type")
+                        or protection_cfg.get("tp_order_type", "LIMIT")
+                    ).upper()
+                    order_type = 'take_profit_market' if target_order_type in {'TAKE_PROFIT_MARKET', 'TP_MARKET'} else 'limit'
+                    order_price = None if order_type == 'take_profit_market' else target_price
+                    order_params = {
+                        'reduceOnly': True,
+                        'newClientOrderId': self._build_protection_client_order_id(
+                            symbol,
+                            side,
+                            target.get('kind') or 'tp',
+                            pos
+                        )
+                    }
+                    if order_type == 'take_profit_market':
+                        order_params['stopPrice'] = target_price
+                        order_params['closePosition'] = False
                     await self._create_protection_order_with_retries(
                         symbol,
-                        'limit',
+                        order_type,
                         tp_side,
                         target_qty,
-                        target_price,
-                        {
-                            'reduceOnly': True,
-                            'newClientOrderId': self._build_protection_client_order_id(
-                                symbol,
-                                side,
-                                target.get('kind') or 'tp',
-                                pos
-                            )
-                        },
+                        order_price,
+                        order_params,
                         target_label,
                         max_attempts=2
                     )
                     valid_tp_targets.append(target)
-                    logger.info(f"{target_label} order placed: {tp_side.upper()} @ {target_price}")
+                    logger.info(
+                        f"{target_label} order placed: {tp_side.upper()} @ {target_price} "
+                        f"qty={target_qty} reduceOnly=True"
+                    )
                 except Exception as tp_e:
                     logger.error(f"{target_label} order failed: {tp_e}")
                     await self._notify_protection_issue(
@@ -20239,6 +20578,7 @@ class SignalEngine(BaseEngine):
                 pos=await self.get_server_position(symbol, use_cache=False),
                 expected_tp=bool(valid_tp_targets),
                 expected_sl=sl_price is not None,
+                planned_tp_orders=normalized_tp_targets,
                 alert=True
             )
 
@@ -30075,6 +30415,10 @@ class TakeProfitOrderPlan:
     close_position: bool
     r_multiple: float
     pct: float
+    tp_index: int | None = None
+    tp_label: str | None = None
+    order_id: str | None = None
+    client_order_id: str | None = None
 
 @dataclass
 class LiveOrderPlan:
@@ -30328,6 +30672,56 @@ class TradingPausedError(TradingSafetyError):
     pass
 
 
+def _safe_float_value(value, default=0.0):
+    try:
+        number = float(value)
+        if math.isfinite(number):
+            return number
+    except (TypeError, ValueError):
+        pass
+    return float(default)
+
+
+def _normalize_tp_plan_label(value, fallback=None):
+    text = str(value or fallback or '').strip().upper()
+    compact = re.sub(r'[^A-Z0-9]', '', text)
+    if compact in {'TP1', 'TAKEPROFIT1'}:
+        return 'TP1'
+    if compact in {'TP2', 'TAKEPROFIT2'}:
+        return 'TP2'
+    if compact in {'TP3', 'TAKEPROFIT3'}:
+        return 'TP3'
+    return text or str(fallback or '').strip().upper()
+
+
+def _calculate_residual_tp_quantities(symbol, total_qty, raw_quantities, safe_amount_fn):
+    total = _safe_float_value(safe_amount_fn(symbol, abs(_safe_float_value(total_qty))), 0.0)
+    raw_list = [max(0.0, _safe_float_value(qty)) for qty in (raw_quantities or [])]
+    if total <= 0 or not raw_list:
+        return []
+    if len(raw_list) == 1:
+        single_qty = min(raw_list[0], total)
+        return [max(0.0, _safe_float_value(safe_amount_fn(symbol, single_qty), 0.0))]
+
+    quantities = []
+    remaining = total
+    for index, raw_qty in enumerate(raw_list):
+        is_final = index == len(raw_list) - 1
+        desired = remaining if is_final else min(raw_qty, remaining)
+        qty = _safe_float_value(safe_amount_fn(symbol, max(0.0, desired)), 0.0)
+        if qty > remaining:
+            qty = _safe_float_value(safe_amount_fn(symbol, remaining), 0.0)
+        quantities.append(max(0.0, qty))
+        remaining = max(0.0, remaining - quantities[-1])
+
+    total_after = sum(quantities)
+    tolerance = max(1e-12, total * 1e-8)
+    if total_after > total + tolerance and quantities:
+        preceding = sum(quantities[:-1])
+        quantities[-1] = max(0.0, _safe_float_value(safe_amount_fn(symbol, max(0.0, total - preceding)), 0.0))
+    return quantities
+
+
 def configure_binance_futures_environment(exchange, cfg):
     if exchange is None:
         raise TradingSafetyError("exchange is required")
@@ -30561,7 +30955,7 @@ def build_ladder_tp_orders(side, entry_price, qty, ladder, config):
         raise InvalidOrderPlan("ladder TP percentages must sum to 100")
 
     orders = []
-    for name, r_mult, pct in targets:
+    for index, (name, r_mult, pct) in enumerate(targets, 1):
         tp_price = calculate_tp_price(side, entry_price, config["initial_stop_price"], r_mult)
         tp_qty = qty * (pct / 100.0)
 
@@ -30574,6 +30968,8 @@ def build_ladder_tp_orders(side, entry_price, qty, ladder, config):
             close_position=False,
             r_multiple=r_mult,
             pct=pct,
+            tp_index=index,
+            tp_label=name,
         ))
     return orders
 
@@ -31172,13 +31568,38 @@ def _normalize_live_order_plan_for_exchange(self, plan, cfg):
     plan.initial_sl_price = float(self.safe_price(plan.symbol, plan.initial_sl_price))
 
     normalized_tps = []
-    for tp in plan.tp_orders:
-        tp.qty = float(self.safe_amount(plan.symbol, tp.qty))
+    raw_tp_quantities = [float(getattr(tp, "qty", 0.0) or 0.0) for tp in (plan.tp_orders or [])]
+    residual_quantities = _calculate_residual_tp_quantities(
+        plan.symbol,
+        plan.qty,
+        raw_tp_quantities,
+        self.safe_amount,
+    )
+    for index, tp in enumerate(plan.tp_orders or [], 1):
+        tp.qty = float(residual_quantities[index - 1]) if index <= len(residual_quantities) else 0.0
         tp.price = float(self.safe_price(plan.symbol, tp.price))
+        if getattr(tp, "tp_index", None) is None:
+            tp.tp_index = index
+        if not getattr(tp, "tp_label", None):
+            tp.tp_label = _normalize_tp_plan_label(getattr(tp, "tp_name", ""), f"TP{index}")
         if tp.qty > 0:
             normalized_tps.append(tp)
 
     plan.tp_orders = normalized_tps
+    if plan.tp_orders:
+        logger.info(
+            "[LiveOrderPlan] normalized TP ladder for %s: entry_qty=%.12f %s",
+            plan.symbol,
+            float(plan.qty),
+            [
+                {
+                    "label": tp.tp_label or tp.tp_name,
+                    "price": float(tp.price),
+                    "qty": float(tp.qty),
+                }
+                for tp in plan.tp_orders
+            ],
+        )
     return plan
 
 def _validate_live_order_plan_for_exchange(self, plan, cfg):
@@ -31252,6 +31673,13 @@ async def execute_live_order_plan(self, plan, cfg):
         await self.ctrl.notify(f"⚠️ 포지션 체결값 오류: {plan.symbol}")
         return {"status": "ENTRY_BAD_FILL", "entry_order": entry_order}
 
+    logger.info(
+        "[LiveOrderPlan] entry fill verified: %s side=%s entry=%.12f qty=%.12f",
+        plan.symbol,
+        plan.side,
+        actual_entry,
+        actual_qty,
+    )
     plan = self._rebuild_plan_after_fill(plan, actual_entry, actual_qty, cfg)
 
     try:
@@ -31275,11 +31703,20 @@ async def execute_live_order_plan(self, plan, cfg):
             logger.error("[LiveOrderPlan] TP placement failed: %s %s", tp.tp_name, tp_error)
             await self.ctrl.notify(f"⚠️ {plan.symbol} {tp.tp_name} 생성 실패. SL은 유지됩니다: {tp_error}")
 
-    self._register_live_ladder_position_state(plan, pos, sl_order, tp_orders, cfg)
+    state = self._register_live_ladder_position_state(plan, pos, sl_order, tp_orders, cfg)
+    audit_status = None
+    if hasattr(self, "_audit_protection_orders"):
+        audit_status = await self._audit_and_repair_live_ladder_protection(
+            plan.symbol,
+            pos,
+            state,
+            cfg,
+            reason="initial ladder placement audit",
+        )
 
     await self.ctrl.notify(
         f"✅ LiveOrderPlan 진입 완료: {plan.symbol} {plan.side} qty={plan.qty} "
-        f"SL={plan.initial_sl_price} TP={len(tp_orders)} engine={plan.engine}"
+        f"SL={plan.initial_sl_price} TP={len(tp_orders)}/{len(plan.tp_orders)} engine={plan.engine}"
     )
 
     return {
@@ -31288,6 +31725,7 @@ async def execute_live_order_plan(self, plan, cfg):
         "sl_order": sl_order,
         "tp_orders": tp_orders,
         "plan": plan,
+        "protection_audit": audit_status,
     }
 
 def _rebuild_plan_after_fill(self, plan, actual_entry, actual_qty, cfg):
@@ -31322,6 +31760,13 @@ async def _place_initial_sl_from_plan(self, plan, pos, cfg):
     if float(qty) <= 0:
         raise InvalidOrderPlan("SL qty <= 0")
 
+    logger.info(
+        "[LiveOrderPlan] placing SL: %s side=%s qty=%s stop=%s reduceOnly=True",
+        plan.symbol,
+        exit_side,
+        qty,
+        stop_price,
+    )
     return await self._create_protection_order_with_retries(
         plan.symbol,
         "stop_market",
@@ -31351,7 +31796,11 @@ async def _place_reduce_only_tp_from_plan(self, plan, tp, cfg):
     if tp.close_position:
         raise InvalidOrderPlan(f"{tp.tp_name} partial TP must not use closePosition")
 
-    tp_order_type = str(cfg.get("tp_order_type", "LIMIT")).upper()
+    tp_label = _normalize_tp_plan_label(getattr(tp, "tp_label", None) or getattr(tp, "tp_name", ""))
+    tp_order_type = str(
+        cfg.get(f"{tp_label.lower()}_order_type")
+        or cfg.get("tp_order_type", "LIMIT")
+    ).upper()
 
     client_id = self._build_protection_client_order_id(
         plan.symbol,
@@ -31361,6 +31810,14 @@ async def _place_reduce_only_tp_from_plan(self, plan, tp, cfg):
     )
 
     if tp_order_type in {"LIMIT", "TAKE_PROFIT_LIMIT"}:
+        logger.info(
+            "[LiveOrderPlan] placing %s LIMIT: %s side=%s qty=%s price=%s reduceOnly=True",
+            tp.tp_name,
+            plan.symbol,
+            tp.side,
+            qty,
+            price,
+        )
         return await self._create_protection_order_with_retries(
             plan.symbol,
             "limit",
@@ -31376,6 +31833,14 @@ async def _place_reduce_only_tp_from_plan(self, plan, tp, cfg):
         )
 
     if tp_order_type in {"TAKE_PROFIT_MARKET", "TP_MARKET"}:
+        logger.info(
+            "[LiveOrderPlan] placing %s TAKE_PROFIT_MARKET: %s side=%s qty=%s stop=%s reduceOnly=True",
+            tp.tp_name,
+            plan.symbol,
+            tp.side,
+            qty,
+            price,
+        )
         return await self._create_protection_order_with_retries(
             plan.symbol,
             "take_profit_market",
@@ -31407,6 +31872,280 @@ async def _handle_sl_failure_with_persistent_pause(self, symbol, position, plan,
         if getattr(self, "ctrl", None) is not None:
             self.ctrl.is_paused = True
     return {"status": "SL_PLACEMENT_FAILED", "close_status": close_status, "error": str(error)}
+
+
+def _live_tp_plan_by_label(self, symbol, state):
+    if hasattr(self, "_planned_tp_orders_from_state"):
+        planned = self._planned_tp_orders_from_state(symbol, state)
+    else:
+        planned = list((state or {}).get("planned_tp_orders") or (state or {}).get("tp_orders") or [])
+    return {
+        _normalize_tp_plan_label(item.get("tp_label") or item.get("tp_name") or item.get("label")): dict(item)
+        for item in planned or []
+        if isinstance(item, dict)
+    }
+
+
+def _order_id_from_any(self, order):
+    if not isinstance(order, dict):
+        return None
+    if hasattr(self, "_protection_order_id"):
+        return self._protection_order_id(order)
+    info = order.get("info", {}) if isinstance(order.get("info"), dict) else {}
+    return str(order.get("id") or order.get("orderId") or info.get("orderId") or "") or None
+
+
+async def _cancel_labeled_tp_orders(self, symbol, label, planned_tp_orders=None, reason="TP repair"):
+    if not hasattr(self, "_collect_protection_orders") or not hasattr(self, "_cancel_protection_orders"):
+        return 0
+    selected = []
+    for order in await self._collect_protection_orders(symbol) or []:
+        if self._classify_protection_order(order) != "tp":
+            continue
+        order_label = self._protection_tp_label(order, planned_tp_orders)
+        if order_label == label:
+            selected.append(order)
+    if not selected:
+        return 0
+    return await self._cancel_protection_orders(symbol, reason=reason, orders=selected)
+
+
+async def _repair_missing_tp2_order(self, symbol, pos, state, cfg, audit_status=None, reason="TP2 audit"):
+    status = {"status": "SKIPPED", "symbol": symbol, "label": "TP2"}
+    state = state if isinstance(state, dict) else getattr(self, "utbreakout_trailing_states", {}).get(symbol)
+    if not isinstance(state, dict) or not pos:
+        status["status"] = "NO_STATE_OR_POSITION"
+        return status
+    if bool(state.get("tp2_filled", False)):
+        status["status"] = "TP2_ALREADY_FILLED"
+        return status
+
+    current_qty = abs(float(self._position_signed_contracts(pos) or pos.get("contracts", 0) or 0))
+    if current_qty <= 0:
+        status["status"] = "NO_REMAINING_POSITION"
+        return status
+
+    planned_by_label = _live_tp_plan_by_label(self, symbol, state)
+    tp2_plan = planned_by_label.get("TP2")
+    if not tp2_plan:
+        logger.error("[TP2 Repair] no TP2 plan found for %s", symbol)
+        status["status"] = "NO_TP2_PLAN"
+        return status
+
+    close_side = "sell" if str(pos.get("side") or state.get("side")).lower() == "long" else "buy"
+    target_price = _safe_float_value(tp2_plan.get("price"), 0.0)
+    if target_price <= 0:
+        logger.error("[TP2 Repair] invalid TP2 price for %s: %s", symbol, tp2_plan.get("price"))
+        status["status"] = "INVALID_TP2_PRICE"
+        return status
+
+    audit_status = audit_status or {}
+    planned_qty = _safe_float_value(tp2_plan.get("qty"), 0.0)
+    use_current_residual = bool(state.get("tp1_filled", False)) or current_qty < float(state.get("initial_qty", current_qty) or current_qty) * 0.98
+    repair_qty_source = "current_position" if use_current_residual else "planned_residual"
+    raw_qty = current_qty if use_current_residual or planned_qty <= 0 else min(planned_qty, current_qty)
+    repair_qty = _safe_float_value(self.safe_amount(symbol, raw_qty), 0.0)
+    if repair_qty <= 0:
+        logger.error("[TP2 Repair] TP2 qty <= 0 after precision for %s: raw=%s", symbol, raw_qty)
+        status.update({"status": "INVALID_TP2_QTY", "raw_qty": raw_qty})
+        return status
+
+    try:
+        min_notional = float(self._get_min_notional_for_symbol(symbol, cfg)) if hasattr(self, "_get_min_notional_for_symbol") else float((cfg or {}).get("min_notional_usdt", 5.0) or 5.0)
+    except Exception:
+        min_notional = float((cfg or {}).get("min_notional_usdt", 5.0) or 5.0)
+    notional = repair_qty * target_price
+    if min_notional > 0 and notional < min_notional:
+        logger.critical(
+            "[TP2 Repair] min notional failed for %s: qty=%.12f price=%.12f notional=%.8f min=%.8f",
+            symbol,
+            repair_qty,
+            target_price,
+            notional,
+            min_notional,
+        )
+        await self.ctrl.notify(f"🚨 {symbol} TP2 재생성 실패: 최소 주문금액 미달 notional={notional:.6f} < {min_notional:.6f}")
+        status.update({"status": "TP2_REPAIR_MIN_NOTIONAL_FAILED", "qty": repair_qty, "price": target_price, "notional": notional})
+        return status
+
+    tp2 = TakeProfitOrderPlan(
+        "TP2",
+        close_side,
+        target_price,
+        repair_qty,
+        True,
+        False,
+        float(tp2_plan.get("r_multiple", 0.0) or 0.0),
+        float(tp2_plan.get("pct", 0.0) or 0.0),
+        2,
+        "TP2",
+    )
+    repair_plan = LiveOrderPlan(
+        symbol=symbol,
+        side="LONG" if str(pos.get("side") or state.get("side")).lower() == "long" else "SHORT",
+        entry_type="MARKET",
+        entry_price=float(state.get("entry_price") or pos.get("entryPrice") or 0.0),
+        qty=current_qty,
+        risk_pct=0.0,
+        initial_sl_price=float(state.get("last_stop_price") or state.get("initial_stop_price") or 0.0),
+        tp_orders=[tp2],
+        ladder=None,
+        reduce_only=False,
+        engine=str(state.get("engine") or ""),
+        regime=str(state.get("regime") or ""),
+        confidence=float(state.get("confidence") or 0.0),
+        expected_r=float(state.get("expected_r") or 0.0),
+        reasons=[reason],
+    )
+
+    try:
+        await _cancel_labeled_tp_orders(self, symbol, "TP2", planned_by_label.values(), reason=f"{reason}: recreate TP2")
+        order = await self._place_reduce_only_tp_from_plan(repair_plan, tp2, cfg or {})
+    except Exception as exc:
+        logger.error("[TP2 Repair] TP2 recreate failed for %s: %s", symbol, exc)
+        await self.ctrl.notify(f"🚨 {symbol} TP2 재생성 실패: {exc}")
+        status.update({"status": "TP2_REPAIR_FAILED", "error": str(exc)})
+        return status
+
+    order_id = _order_id_from_any(self, order)
+    client_id = self._protection_client_order_id(order) if hasattr(self, "_protection_client_order_id") else None
+    for item in state.get("planned_tp_orders") or state.get("tp_orders") or []:
+        if isinstance(item, dict) and _normalize_tp_plan_label(item.get("tp_label") or item.get("tp_name")) == "TP2":
+            item["qty"] = float(repair_qty)
+            item["price"] = float(target_price)
+            item["side"] = close_side
+            item["order_id"] = order_id
+            item["client_order_id"] = client_id
+            item["filled"] = False
+    state["tp2_order_id"] = order_id
+    state["last_tp2_repair_ts"] = datetime.now(timezone.utc).isoformat()
+    getattr(self, "utbreakout_trailing_states", {})[symbol] = state
+    logger.info(
+        "[TP2 Repair] recreated TP2 for %s: side=%s qty=%.12f price=%.12f source=%s order_id=%s",
+        symbol,
+        close_side,
+        repair_qty,
+        target_price,
+        repair_qty_source,
+        order_id,
+    )
+    await self.ctrl.notify(f"✅ {symbol} TP2 재생성 완료: {close_side} {repair_qty:.8f} @ {target_price:.8f}")
+    status.update({"status": "TP2_REPAIRED", "order": order, "qty": repair_qty, "price": target_price, "qty_source": repair_qty_source})
+    return status
+
+
+async def _audit_and_repair_live_ladder_protection(self, symbol, pos, state, cfg, reason="ladder audit"):
+    planned = _live_tp_plan_by_label(self, symbol, state)
+    audit = await self._audit_protection_orders(
+        symbol,
+        pos=pos,
+        expected_tp=True,
+        expected_sl=True,
+        planned_tp_orders=list(planned.values()),
+        alert=True,
+    )
+    if audit.get("sl_qty_mismatch"):
+        stop_price = float((state or {}).get("last_stop_price") or (state or {}).get("initial_stop_price") or 0.0)
+        if stop_price > 0:
+            logger.warning("[Protection Audit] SL qty mismatch for %s; replacing SL at %.12f", symbol, stop_price)
+            await self._replace_stop_loss_order(symbol, pos, stop_price, reason=f"{reason}: SL qty repair")
+    if audit.get("missing_tp2") or audit.get("tp2_qty_mismatch"):
+        logger.warning("[Protection Audit] TP2 repair required for %s: %s", symbol, audit.get("status"))
+        repair = await _repair_missing_tp2_order(self, symbol, pos, state, cfg, audit_status=audit, reason=reason)
+        audit["tp2_repair"] = repair
+    return audit
+
+
+async def _fetch_tp2_price_snapshot(self, symbol):
+    snapshot = {"last": None, "bid": None, "ask": None}
+    try:
+        ticker = await asyncio.to_thread(self.exchange.fetch_ticker, symbol)
+        if isinstance(ticker, dict):
+            snapshot["last"] = _safe_float_or_none(ticker.get("last") or ticker.get("mark") or ticker.get("close"))
+            snapshot["bid"] = _safe_float_or_none(ticker.get("bid"))
+            snapshot["ask"] = _safe_float_or_none(ticker.get("ask"))
+    except Exception as exc:
+        logger.warning("[TP2 Fallback] fetch_ticker failed for %s: %s", symbol, exc)
+    if snapshot["bid"] is None or snapshot["ask"] is None:
+        try:
+            book = await asyncio.to_thread(self.exchange.fetch_order_book, symbol, 5)
+            if isinstance(book, dict):
+                bids = book.get("bids") or []
+                asks = book.get("asks") or []
+                if bids:
+                    snapshot["bid"] = _safe_float_or_none(bids[0][0])
+                if asks:
+                    snapshot["ask"] = _safe_float_or_none(asks[0][0])
+        except Exception as exc:
+            logger.debug("[TP2 Fallback] fetch_order_book skipped for %s: %s", symbol, exc)
+    return snapshot
+
+
+def _tp2_target_reached(side, target_price, snapshot):
+    target = _safe_float_value(target_price, 0.0)
+    if target <= 0 or not isinstance(snapshot, dict):
+        return False
+    values = [_safe_float_or_none(snapshot.get(key)) for key in ("last", "bid", "ask")]
+    values = [float(value) for value in values if value is not None and float(value) > 0]
+    if not values:
+        return False
+    side = str(side or "").lower()
+    if side == "long":
+        return max(values) >= target
+    if side == "short":
+        return min(values) <= target
+    return False
+
+
+async def _maybe_tp2_fallback_close(self, symbol, pos, state, cfg, audit_status=None):
+    if not bool((cfg or {}).get("enable_tp2_fallback_close", False)):
+        return {"status": "DISABLED"}
+    if not isinstance(state, dict) or not pos or bool(state.get("tp2_filled", False)):
+        return {"status": "SKIPPED"}
+    planned = _live_tp_plan_by_label(self, symbol, state)
+    tp2_plan = planned.get("TP2")
+    if not tp2_plan:
+        return {"status": "NO_TP2_PLAN"}
+    side = str(pos.get("side") or state.get("side") or "").lower()
+    snapshot = await _fetch_tp2_price_snapshot(self, symbol)
+    if not _tp2_target_reached(side, tp2_plan.get("price"), snapshot):
+        state["tp2_fallback_reached_loops"] = 0
+        getattr(self, "utbreakout_trailing_states", {})[symbol] = state
+        return {"status": "NOT_REACHED", "snapshot": snapshot}
+
+    loops = int(state.get("tp2_fallback_reached_loops", 0) or 0) + 1
+    state["tp2_fallback_reached_loops"] = loops
+    getattr(self, "utbreakout_trailing_states", {})[symbol] = state
+    confirm_loops = max(1, int((cfg or {}).get("tp2_fallback_confirm_loops", 2) or 2))
+    logger.warning(
+        "[TP2 Fallback] target reached for %s loop %s/%s, price=%s snapshot=%s audit=%s",
+        symbol,
+        loops,
+        confirm_loops,
+        tp2_plan.get("price"),
+        snapshot,
+        (audit_status or {}).get("status"),
+    )
+    if loops < confirm_loops:
+        return {"status": "CONFIRMING", "loops": loops, "snapshot": snapshot}
+    if not bool((cfg or {}).get("tp2_fallback_use_market", True)):
+        return {"status": "REACHED_MARKET_DISABLED", "loops": loops, "snapshot": snapshot}
+
+    self.position_cache = None
+    self.position_cache_time = 0
+    fresh_pos = await self.get_server_position(symbol, use_cache=False)
+    if not fresh_pos:
+        state["tp2_fallback_reached_loops"] = 0
+        getattr(self, "utbreakout_trailing_states", {})[symbol] = state
+        return {"status": "ALREADY_FLAT"}
+    order = await self._close_position_reduce_only_market(symbol, fresh_pos, reason="TP2 fallback close", cfg=cfg or {})
+    state["tp2_fallback_reached_loops"] = 0
+    state["tp2_fallback_closed_at"] = datetime.now(timezone.utc).isoformat()
+    getattr(self, "utbreakout_trailing_states", {})[symbol] = state
+    logger.warning("[TP2 Fallback] reduceOnly market close executed for %s: %s", symbol, order)
+    await self.ctrl.notify(f"⚠️ {symbol} TP2 도달 후 미체결 fallback 시장가 청산 실행")
+    return {"status": "TP2_FALLBACK_CLOSED", "order": order, "snapshot": snapshot}
+
 
 # ==============================================================================
 # Live exit policies monitoring & Stop replacements
@@ -31445,7 +32184,20 @@ async def _manage_live_ladder_exit_policy(self, symbol, pos, df, cfg):
         "partial_filled": bool(state.get("tp1_filled", False)),
     }
 
-    await self._refresh_ladder_fill_state(symbol, pos, state, cfg)
+    state = await self._refresh_ladder_fill_state(symbol, pos, state, cfg)
+    audit_status = None
+    if hasattr(self, "_audit_protection_orders"):
+        audit_status = await self._audit_and_repair_live_ladder_protection(
+            symbol,
+            pos,
+            state,
+            cfg,
+            reason="live ladder monitor",
+        )
+    fallback_status = await self._maybe_tp2_fallback_close(symbol, pos, state, cfg, audit_status=audit_status)
+    if fallback_status.get("status") == "TP2_FALLBACK_CLOSED":
+        self._clear_utbreakout_trailing_state(symbol, finalize=True, reason="TP2 fallback close")
+        return {"status": "EXITED", "reason": "TP2_FALLBACK_CLOSE", "fallback": fallback_status}
 
     time_stop = evaluate_time_stop(position_proxy, current_bar, cfg)
     if time_stop.should_exit:
@@ -31510,6 +32262,41 @@ async def _close_position_reduce_only_market(self, symbol, pos, reason, cfg):
 
 def _register_live_ladder_position_state(self, plan, pos, sl_order, tp_orders, cfg):
     side = str(plan.side).lower()
+    created_by_label = {}
+    for index, order in enumerate(tp_orders or [], 1):
+        label = None
+        if index <= len(plan.tp_orders or []):
+            label = _normalize_tp_plan_label(
+                getattr(plan.tp_orders[index - 1], "tp_label", None)
+                or getattr(plan.tp_orders[index - 1], "tp_name", None),
+                f"TP{index}",
+            )
+        if not label and hasattr(self, "_protection_tp_label"):
+            label = self._protection_tp_label(order, [])
+        if label:
+            created_by_label[label] = order
+    planned_tp_orders = []
+    for index, tp in enumerate(plan.tp_orders or [], 1):
+        label = _normalize_tp_plan_label(getattr(tp, "tp_label", None) or getattr(tp, "tp_name", None), f"TP{index}")
+        created = created_by_label.get(label)
+        order_id = self._protection_order_id(created) if created and hasattr(self, "_protection_order_id") else None
+        client_order_id = self._protection_client_order_id(created) if created and hasattr(self, "_protection_client_order_id") else None
+        tp.order_id = order_id
+        tp.client_order_id = client_order_id
+        planned_tp_orders.append({
+            "tp_index": getattr(tp, "tp_index", None) or index,
+            "tp_label": label,
+            "tp_name": tp.tp_name,
+            "side": tp.side,
+            "price": float(tp.price),
+            "qty": float(tp.qty),
+            "pct": float(tp.pct),
+            "reduce_only": bool(tp.reduce_only),
+            "close_position": bool(tp.close_position),
+            "order_id": order_id,
+            "client_order_id": client_order_id,
+            "filled": False,
+        })
     state = {
         "advanced_live_ladder_state": True,
         "side": side,
@@ -31518,16 +32305,12 @@ def _register_live_ladder_position_state(self, plan, pos, sl_order, tp_orders, c
         "risk_distance": abs(float(plan.entry_price) - float(plan.initial_sl_price)),
         "initial_stop_price": float(plan.initial_sl_price),
         "last_stop_price": float(plan.initial_sl_price),
-        "tp_orders": [
-            {
-                "tp_name": tp.tp_name,
-                "price": float(tp.price),
-                "qty": float(tp.qty),
-                "pct": float(tp.pct),
-                "filled": False,
-            }
-            for tp in plan.tp_orders
-        ],
+        "tp_orders": list(planned_tp_orders),
+        "planned_tp_orders": list(planned_tp_orders),
+        "expected_tp_count": len(planned_tp_orders),
+        "actual_tp_count": len(tp_orders or []),
+        "tp1_order_id": (created_by_label.get("TP1") or {}).get("id"),
+        "tp2_order_id": (created_by_label.get("TP2") or {}).get("id"),
         "tp1_filled": False,
         "tp2_filled": False,
         "tp3_filled": False,
@@ -31541,6 +32324,7 @@ def _register_live_ladder_position_state(self, plan, pos, sl_order, tp_orders, c
         "expected_r": plan.expected_r,
         "runner_exit_enabled": False,
         "runner_chandelier_enabled": False,
+        "tp2_fallback_reached_loops": 0,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     self.utbreakout_trailing_states[plan.symbol] = state
@@ -31577,6 +32361,15 @@ async def _refresh_ladder_fill_state(self, symbol, pos, state, cfg):
             reason="TP2 filled -> profit protection stop"
         )
         state["sl_moved_to_tp1_area"] = True
+
+    if hasattr(self, "_audit_protection_orders"):
+        await self._audit_and_repair_live_ladder_protection(
+            symbol,
+            pos,
+            state,
+            cfg,
+            reason="ladder fill-state residual audit",
+        )
 
     self.utbreakout_trailing_states[symbol] = state
     return state
@@ -31682,6 +32475,11 @@ def _bind_live_advanced_alpha_helpers_to_main_controller():
         "_place_initial_sl_from_plan",
         "_place_reduce_only_tp_from_plan",
         "_handle_sl_failure_with_persistent_pause",
+        "_cancel_labeled_tp_orders",
+        "_repair_missing_tp2_order",
+        "_audit_and_repair_live_ladder_protection",
+        "_fetch_tp2_price_snapshot",
+        "_maybe_tp2_fallback_close",
         "_register_live_ladder_position_state",
         "_manage_live_ladder_exit_policy",
         "_refresh_ladder_fill_state",

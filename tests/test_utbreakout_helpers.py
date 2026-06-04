@@ -2240,7 +2240,144 @@ def test_place_tp_sl_orders_can_place_utbreakout_split_tp_ladder():
     assert float(stop_order["amount"]) == 2.0
     assert float(stop_order["params"]["stopPrice"]) == 90.0
     assert engine.last_protection_order_status["BTC/USDT"]["tp_count"] == 2
+    assert engine.last_protection_order_status["BTC/USDT"]["tp1_present"] is True
+    assert engine.last_protection_order_status["BTC/USDT"]["tp2_present"] is True
     assert engine.last_protection_order_status["BTC/USDT"]["sl_count"] == 1
+
+
+def test_place_tp_sl_orders_makes_final_tp_residual_after_precision():
+    class FloorPrecisionExchange(_FakeExchange):
+        def amount_to_precision(self, symbol, amount):
+            return str(math.floor(float(amount) * 1000) / 1000)
+
+    pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "1", "entryPrice": "100"}
+    engine = _protection_engine([], positions=[pos])
+    engine.exchange = FloorPrecisionExchange([], positions=[pos])
+    engine.get_runtime_strategy_params = lambda: {"active_strategy": _emas_module().UTBOT_FILTERED_BREAKOUT_STRATEGY}
+
+    asyncio.run(
+        engine._place_tp_sl_orders(
+            "BTC/USDT",
+            "long",
+            100,
+            "1",
+            sl_distance=10,
+            tp_targets=[
+                {"label": "TP1", "kind": "tp1", "distance": 15, "qty_ratio": 0.3333},
+                {"label": "TP2", "kind": "tp2", "distance": 20, "qty_ratio": 0.6667},
+            ],
+        )
+    )
+
+    tp_orders = [order for order in engine.exchange.created if order["type"] == "limit"]
+    assert [float(order["amount"]) for order in tp_orders] == [0.333, 0.667]
+    assert sum(float(order["amount"]) for order in tp_orders) == pytest.approx(1.0)
+
+
+def test_protection_audit_marks_tp1_only_as_missing_tp2():
+    pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "2", "entryPrice": "100"}
+    engine = _protection_engine(
+        [
+            {
+                "id": "tp1-existing",
+                "side": "sell",
+                "type": "limit",
+                "price": "115",
+                "amount": "1",
+                "reduceOnly": True,
+                "info": {"symbol": "BTCUSDT", "reduceOnly": "true"},
+            },
+            {
+                "id": "sl-existing",
+                "side": "sell",
+                "type": "stop_market",
+                "amount": "2",
+                "reduceOnly": True,
+                "info": {"symbol": "BTCUSDT", "origType": "STOP_MARKET", "stopPrice": "90", "reduceOnly": "true"},
+            },
+        ],
+        positions=[pos],
+    )
+    state = {
+        "side": "long",
+        "entry_price": 100.0,
+        "initial_qty": 2.0,
+        "planned_tp_orders": [
+            {"tp_label": "TP1", "tp_name": "TP1", "side": "sell", "price": 115.0, "qty": 1.0},
+            {"tp_label": "TP2", "tp_name": "TP2", "side": "sell", "price": 120.0, "qty": 1.0},
+        ],
+    }
+    engine.utbreakout_trailing_states = {"BTC/USDT": state}
+
+    status = asyncio.run(
+        engine._audit_protection_orders(
+            "BTC/USDT",
+            pos=pos,
+            expected_tp=True,
+            expected_sl=True,
+            planned_tp_orders=state["planned_tp_orders"],
+            alert=False,
+        )
+    )
+
+    assert status["status"] == "MISSING_TP2"
+    assert status["tp1_present"] is True
+    assert status["tp2_present"] is False
+    assert status["missing_tp2"] is True
+
+
+def test_missing_tp2_repair_recreates_planned_residual_order():
+    pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "2", "entryPrice": "100"}
+    engine = _protection_engine(
+        [
+            {
+                "id": "tp1-existing",
+                "side": "sell",
+                "type": "limit",
+                "price": "115",
+                "amount": "1",
+                "reduceOnly": True,
+                "info": {"symbol": "BTCUSDT", "reduceOnly": "true"},
+            },
+            {
+                "id": "sl-existing",
+                "side": "sell",
+                "type": "stop_market",
+                "amount": "2",
+                "reduceOnly": True,
+                "info": {"symbol": "BTCUSDT", "origType": "STOP_MARKET", "stopPrice": "90", "reduceOnly": "true"},
+            },
+        ],
+        positions=[pos],
+    )
+    state = {
+        "side": "long",
+        "entry_price": 100.0,
+        "initial_qty": 2.0,
+        "last_stop_price": 90.0,
+        "planned_tp_orders": [
+            {"tp_label": "TP1", "tp_name": "TP1", "side": "sell", "price": 115.0, "qty": 1.0},
+            {"tp_label": "TP2", "tp_name": "TP2", "side": "sell", "price": 120.0, "qty": 1.0},
+        ],
+    }
+    engine.utbreakout_trailing_states = {"BTC/USDT": state}
+
+    result = asyncio.run(
+        engine._audit_and_repair_live_ladder_protection(
+            "BTC/USDT",
+            pos,
+            state,
+            {"min_notional_usdt": 0.0},
+            reason="test missing TP2",
+        )
+    )
+
+    assert result["status"] == "MISSING_TP2"
+    assert result["tp2_repair"]["status"] == "TP2_REPAIRED"
+    created_tp2 = [order for order in engine.exchange.created if order["type"] == "limit" and order["side"] == "sell"][-1]
+    assert float(created_tp2["amount"]) == 1.0
+    assert float(created_tp2["price"]) == 120.0
+    assert "tp2" in created_tp2["clientOrderId"].lower()
 
 
 def test_place_tp_sl_orders_uses_position_amt_for_short_futures_symbol():
@@ -2272,6 +2409,34 @@ def test_place_tp_sl_orders_uses_position_amt_for_short_futures_symbol():
     assert tp_order["side"] == "buy"
     assert float(tp_order["amount"]) == 2.0
     assert float(tp_order["price"]) == 90.0
+
+
+def test_utbreakout_split_tp_short_side_prices_and_labels_audit_ok():
+    pos = {"symbol": "BTC/USDT:USDT", "side": "short", "contracts": "2", "entryPrice": "100"}
+    engine = _protection_engine([], positions=[pos])
+    engine.get_runtime_strategy_params = lambda: {"active_strategy": _emas_module().UTBOT_FILTERED_BREAKOUT_STRATEGY}
+
+    asyncio.run(
+        engine._place_tp_sl_orders(
+            "BTC/USDT",
+            "short",
+            100,
+            "2",
+            sl_distance=10,
+            tp_targets=[
+                {"label": "TP1", "kind": "tp1", "distance": 15, "qty_ratio": 0.5},
+                {"label": "TP2", "kind": "tp2", "distance": 20, "qty_ratio": 0.5},
+            ],
+        )
+    )
+
+    tp_orders = [order for order in engine.exchange.created if order["type"] == "limit"]
+    assert [order["side"] for order in tp_orders] == ["buy", "buy"]
+    assert [float(order["price"]) for order in tp_orders] == [85.0, 80.0]
+    status = engine.last_protection_order_status["BTC/USDT"]
+    assert status["status"] == "OK"
+    assert status["tp1_present"] is True
+    assert status["tp2_present"] is True
 
 
 def test_place_tp_sl_orders_emergency_closes_when_stop_loss_creation_fails():
@@ -2599,6 +2764,119 @@ def test_utbreakout_trailing_does_not_create_duplicate_sl_when_cancel_does_not_c
         if engine._classify_protection_order(order) == "sl"
     ]
     assert [order["id"] for order in remaining_sl] == ["sl-old"]
+
+
+def test_ladder_fill_state_repairs_sl_and_tp2_to_current_residual_qty():
+    pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "1", "entryPrice": "100"}
+    engine = _protection_engine(
+        [
+            {
+                "id": "tp2-old",
+                "side": "sell",
+                "type": "limit",
+                "price": "120",
+                "amount": "0.5",
+                "reduceOnly": True,
+                "info": {"symbol": "BTCUSDT", "reduceOnly": "true"},
+            },
+            {
+                "id": "sl-old",
+                "side": "sell",
+                "type": "stop_market",
+                "amount": "2",
+                "reduceOnly": True,
+                "info": {"symbol": "BTCUSDT", "origType": "STOP_MARKET", "stopPrice": "90", "reduceOnly": "true"},
+            },
+        ],
+        positions=[pos],
+    )
+    state = {
+        "advanced_live_ladder_state": True,
+        "side": "long",
+        "entry_price": 100.0,
+        "initial_qty": 2.0,
+        "risk_distance": 10.0,
+        "initial_stop_price": 90.0,
+        "last_stop_price": 90.0,
+        "planned_tp_orders": [
+            {"tp_label": "TP1", "tp_name": "TP1", "side": "sell", "price": 115.0, "qty": 1.0, "filled": False},
+            {"tp_label": "TP2", "tp_name": "TP2", "side": "sell", "price": 120.0, "qty": 1.0, "filled": False},
+        ],
+        "tp1_filled": False,
+        "tp2_filled": False,
+        "sl_moved_to_be": False,
+        "sl_moved_to_tp1_area": False,
+    }
+    engine.utbreakout_trailing_states = {"BTC/USDT": state}
+
+    updated = asyncio.run(engine._refresh_ladder_fill_state("BTC/USDT", pos, state, {"min_notional_usdt": 0.0}))
+
+    assert updated["tp1_filled"] is True
+    assert ("sl-old", "BTC/USDT") in engine.exchange.cancelled
+    assert ("tp2-old", "BTC/USDT") in engine.exchange.cancelled
+    new_sl = [order for order in engine.exchange.created if order["type"] == "stop_market"][-1]
+    new_tp2 = [order for order in engine.exchange.created if order["type"] == "limit" and "tp2" in order["clientOrderId"].lower()][-1]
+    assert float(new_sl["amount"]) == 1.0
+    assert float(new_tp2["amount"]) == 1.0
+    assert float(new_tp2["price"]) == 120.0
+
+
+def test_tp2_fallback_close_requires_enabled_option():
+    class TickerExchange(_FakeExchange):
+        def fetch_ticker(self, symbol):
+            return {"last": 111.0, "bid": 110.5, "ask": 111.5}
+
+    pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "1", "entryPrice": "100"}
+    engine = _protection_engine([], positions=[pos])
+    engine.exchange = TickerExchange([], positions=[pos])
+    state = {
+        "side": "long",
+        "entry_price": 100.0,
+        "initial_qty": 1.0,
+        "planned_tp_orders": [
+            {"tp_label": "TP2", "tp_name": "TP2", "side": "sell", "price": 110.0, "qty": 1.0},
+        ],
+        "tp2_filled": False,
+        "tp2_fallback_reached_loops": 0,
+    }
+    engine.utbreakout_trailing_states = {"BTC/USDT": state}
+
+    result = asyncio.run(engine._maybe_tp2_fallback_close("BTC/USDT", pos, state, {}, audit_status={"status": "MISSING_TP2"}))
+
+    assert result["status"] == "DISABLED"
+    assert engine.exchange.created == []
+
+
+def test_tp2_fallback_close_executes_after_confirmed_reached_loops():
+    class TickerExchange(_FakeExchange):
+        def fetch_ticker(self, symbol):
+            return {"last": 111.0, "bid": 110.5, "ask": 111.5}
+
+    pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "1", "entryPrice": "100"}
+    engine = _protection_engine([], positions=[pos])
+    engine.exchange = TickerExchange([], positions=[pos])
+    state = {
+        "side": "long",
+        "entry_price": 100.0,
+        "initial_qty": 1.0,
+        "planned_tp_orders": [
+            {"tp_label": "TP2", "tp_name": "TP2", "side": "sell", "price": 110.0, "qty": 1.0},
+        ],
+        "tp2_filled": False,
+        "tp2_fallback_reached_loops": 0,
+    }
+    engine.utbreakout_trailing_states = {"BTC/USDT": state}
+    cfg = {"enable_tp2_fallback_close": True, "tp2_fallback_confirm_loops": 2, "tp2_fallback_use_market": True}
+
+    first = asyncio.run(engine._maybe_tp2_fallback_close("BTC/USDT", pos, state, cfg, audit_status={"status": "MISSING_TP2"}))
+    second = asyncio.run(engine._maybe_tp2_fallback_close("BTC/USDT", pos, state, cfg, audit_status={"status": "MISSING_TP2"}))
+
+    assert first["status"] == "CONFIRMING"
+    assert second["status"] == "TP2_FALLBACK_CLOSED"
+    market_order = [order for order in engine.exchange.created if order["type"] == "market"][-1]
+    assert market_order["side"] == "sell"
+    assert market_order["params"]["reduceOnly"] is True
+    assert float(engine.exchange.positions[0]["contracts"]) == 0.0
 
 
 def test_replace_stop_loss_aborts_when_open_order_fetch_fails():
