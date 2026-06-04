@@ -68,6 +68,7 @@ from utbreakout.risk import (
     calculate_risk_plan,
     normalize_risk_percent,
 )
+from utbreakout.sizing import build_aggressive_growth_overlay_plan
 from utbreakout.timeframe import HTF_MAP as UTBREAKOUT_HTF_MAP, select_adaptive_timeframe
 from utbreakout.adaptive import (
     build_dynamic_chandelier_stop,
@@ -513,14 +514,14 @@ def build_utbreakout_set_registry():
         'bias_continuation_15m_risk_multiplier': 0.50,
         'bias_continuation_max_signal_age_candles': 6,
         'bias_continuation_15m_max_signal_age_candles': 3,
-        'bias_continuation_min_adx': 22.0,
-        'bias_continuation_15m_min_adx': 25.0,
-        'bias_continuation_min_volume_ratio': 0.85,
-        'bias_continuation_15m_min_volume_ratio': 1.00,
-        'bias_continuation_max_extension_atr': 1.35,
-        'bias_continuation_15m_max_extension_atr': 1.00,
-        'bias_continuation_min_adaptive_tf_score': 48.0,
-        'bias_continuation_15m_min_adaptive_tf_score': 62.0,
+        'bias_continuation_min_adx': 18.0,
+        'bias_continuation_15m_min_adx': 20.0,
+        'bias_continuation_min_volume_ratio': 0.75,
+        'bias_continuation_15m_min_volume_ratio': 0.80,
+        'bias_continuation_max_extension_atr': 1.60,
+        'bias_continuation_15m_max_extension_atr': 1.50,
+        'bias_continuation_min_adaptive_tf_score': 42.0,
+        'bias_continuation_15m_min_adaptive_tf_score': 50.0,
         'quality_score_v2_enabled': True,
         'quality_score_v2_block_below': 60.0,
         'quality_score_v2_reduce_below': 70.0,
@@ -528,10 +529,10 @@ def build_utbreakout_set_registry():
         'quality_score_v2_min_risk_multiplier': 0.50,
         'quality_score_v2_15m_block_below': 62.0,
         'quality_score_v2_15m_reduce_below': 72.0,
-        'quality_score_v2_long_block_below': 56.0,
-        'quality_score_v2_long_reduce_below': 66.0,
-        'quality_score_v2_long_15m_block_below': 58.0,
-        'quality_score_v2_long_15m_reduce_below': 68.0,
+        'quality_score_v2_long_block_below': 50.0,
+        'quality_score_v2_long_reduce_below': 60.0,
+        'quality_score_v2_long_15m_block_below': 50.0,
+        'quality_score_v2_long_15m_reduce_below': 60.0,
         'quality_score_v2_short_block_below': 68.0,
         'quality_score_v2_short_reduce_below': 78.0,
         'quality_score_v2_short_15m_block_below': 70.0,
@@ -896,14 +897,14 @@ def build_default_utbot_filtered_breakout_config():
         'bias_continuation_15m_risk_multiplier': 0.50,
         'bias_continuation_max_signal_age_candles': 6,
         'bias_continuation_15m_max_signal_age_candles': 3,
-        'bias_continuation_min_adx': 22.0,
-        'bias_continuation_15m_min_adx': 25.0,
-        'bias_continuation_min_volume_ratio': 0.85,
-        'bias_continuation_15m_min_volume_ratio': 1.00,
-        'bias_continuation_max_extension_atr': 1.35,
-        'bias_continuation_15m_max_extension_atr': 1.00,
-        'bias_continuation_min_adaptive_tf_score': 48.0,
-        'bias_continuation_15m_min_adaptive_tf_score': 62.0,
+        'bias_continuation_min_adx': 18.0,
+        'bias_continuation_15m_min_adx': 20.0,
+        'bias_continuation_min_volume_ratio': 0.75,
+        'bias_continuation_15m_min_volume_ratio': 0.80,
+        'bias_continuation_max_extension_atr': 1.60,
+        'bias_continuation_15m_max_extension_atr': 1.50,
+        'bias_continuation_min_adaptive_tf_score': 42.0,
+        'bias_continuation_15m_min_adaptive_tf_score': 50.0,
         'quality_score_v2_enabled': True,
         'quality_score_v2_block_below': 60.0,
         'quality_score_v2_reduce_below': 70.0,
@@ -911,10 +912,10 @@ def build_default_utbot_filtered_breakout_config():
         'quality_score_v2_min_risk_multiplier': 0.50,
         'quality_score_v2_15m_block_below': 62.0,
         'quality_score_v2_15m_reduce_below': 72.0,
-        'quality_score_v2_long_block_below': 56.0,
-        'quality_score_v2_long_reduce_below': 66.0,
-        'quality_score_v2_long_15m_block_below': 58.0,
-        'quality_score_v2_long_15m_reduce_below': 68.0,
+        'quality_score_v2_long_block_below': 50.0,
+        'quality_score_v2_long_reduce_below': 60.0,
+        'quality_score_v2_long_15m_block_below': 50.0,
+        'quality_score_v2_long_15m_reduce_below': 60.0,
         'quality_score_v2_short_block_below': 68.0,
         'quality_score_v2_short_reduce_below': 78.0,
         'quality_score_v2_short_15m_block_below': 70.0,
@@ -999,6 +1000,24 @@ def build_default_utbot_filtered_breakout_config():
         'sl_place_max_retries': 3,
         'sl_retry_delay_sec': 0.7,
         'emergency_close_on_sl_fail': True,
+        'protection_audit_after_place_delay_sec': 0.5,
+        'aggressive_growth_enabled': False,
+        'aggressive_growth_balance_sleeve_pct': 0.20,
+        'aggressive_growth_max_trade_risk_pct': 0.015,
+        'aggressive_growth_max_trade_risk_pct_strong': 0.025,
+        'aggressive_growth_daily_loss_limit_pct': 0.04,
+        'aggressive_growth_weekly_loss_limit_pct': 0.10,
+        'aggressive_growth_max_open_positions': 2,
+        'aggressive_growth_max_symbol_exposure_pct': 0.10,
+        'aggressive_growth_pyramiding_enabled': True,
+        'aggressive_growth_pyramid_trigger_r': 1.0,
+        'aggressive_growth_pyramid_max_adds': 2,
+        'aggressive_growth_pyramid_add_risk_fraction': 0.50,
+        'aggressive_growth_move_sl_to_breakeven_before_add': True,
+        'aggressive_growth_trailing_atr_multiplier': 2.5,
+        'aggressive_growth_runner_pct': 0.35,
+        'aggressive_growth_tp1_pct': 0.35,
+        'aggressive_growth_tp2_pct': 0.30,
         'max_risk_per_trade_usdt': 1.0,
         'daily_max_loss_usdt': 3.0,
         'max_daily_trades': 5,
@@ -3199,6 +3218,7 @@ class SignalEngine(BaseEngine):
         self.utbreakout_adaptive_last_decision_ts = {}  # symbol -> tf -> last closed candle evaluated
         self.last_protection_order_status = {}  # symbol -> exchange-side TP/SL audit status
         self.last_protection_alert_ts = {}  # symbol:kind -> last Telegram alert timestamp
+        self.protection_missing_candidates = {}  # symbol -> missing TP/SL debounce candidates
         self.last_orphan_protection_sweep_ts = 0.0
         self.orphan_protection_candidates = {}  # normalized symbol -> first-seen orphan order signature
         self.ORPHAN_PROTECTION_SWEEP_INTERVAL = 10.0
@@ -3262,6 +3282,7 @@ class SignalEngine(BaseEngine):
         self.utbreakout_adaptive_last_decision_ts = {}
         self.last_protection_order_status = {}
         self.last_protection_alert_ts = {}
+        self.protection_missing_candidates = {}
         self.last_orphan_protection_sweep_ts = 0.0
         self.orphan_protection_candidates = {}
         self.coin_selector_last_result = {}
@@ -4970,24 +4991,24 @@ class SignalEngine(BaseEngine):
             'short_dmi_min_gap': 4.0,
             'bias_continuation_risk_multiplier': 0.65,
             'bias_continuation_15m_risk_multiplier': 0.50,
-            'bias_continuation_min_adx': 22.0,
-            'bias_continuation_15m_min_adx': 25.0,
-            'bias_continuation_min_volume_ratio': 0.85,
-            'bias_continuation_15m_min_volume_ratio': 1.00,
-            'bias_continuation_max_extension_atr': 1.35,
-            'bias_continuation_15m_max_extension_atr': 1.00,
-            'bias_continuation_min_adaptive_tf_score': 48.0,
-            'bias_continuation_15m_min_adaptive_tf_score': 62.0,
+            'bias_continuation_min_adx': 18.0,
+            'bias_continuation_15m_min_adx': 20.0,
+            'bias_continuation_min_volume_ratio': 0.75,
+            'bias_continuation_15m_min_volume_ratio': 0.80,
+            'bias_continuation_max_extension_atr': 1.60,
+            'bias_continuation_15m_max_extension_atr': 1.50,
+            'bias_continuation_min_adaptive_tf_score': 42.0,
+            'bias_continuation_15m_min_adaptive_tf_score': 50.0,
             'quality_score_v2_block_below': 60.0,
             'quality_score_v2_reduce_below': 70.0,
             'quality_score_v2_full_score': 82.0,
             'quality_score_v2_min_risk_multiplier': 0.50,
             'quality_score_v2_15m_block_below': 62.0,
             'quality_score_v2_15m_reduce_below': 72.0,
-            'quality_score_v2_long_block_below': 56.0,
-            'quality_score_v2_long_reduce_below': 66.0,
-            'quality_score_v2_long_15m_block_below': 58.0,
-            'quality_score_v2_long_15m_reduce_below': 68.0,
+            'quality_score_v2_long_block_below': 50.0,
+            'quality_score_v2_long_reduce_below': 60.0,
+            'quality_score_v2_long_15m_block_below': 50.0,
+            'quality_score_v2_long_15m_reduce_below': 60.0,
             'quality_score_v2_short_block_below': 68.0,
             'quality_score_v2_short_reduce_below': 78.0,
             'quality_score_v2_short_15m_block_below': 70.0,
@@ -5000,6 +5021,19 @@ class SignalEngine(BaseEngine):
             'tp1_breakeven_trigger_r': 1.5,
             'tp1_breakeven_offset_r': 0.03,
             'tp1_breakeven_qty_tolerance': 0.08,
+            'protection_audit_after_place_delay_sec': 0.5,
+            'aggressive_growth_balance_sleeve_pct': 0.20,
+            'aggressive_growth_max_trade_risk_pct': 0.015,
+            'aggressive_growth_max_trade_risk_pct_strong': 0.025,
+            'aggressive_growth_daily_loss_limit_pct': 0.04,
+            'aggressive_growth_weekly_loss_limit_pct': 0.10,
+            'aggressive_growth_max_symbol_exposure_pct': 0.10,
+            'aggressive_growth_pyramid_trigger_r': 1.0,
+            'aggressive_growth_pyramid_add_risk_fraction': 0.50,
+            'aggressive_growth_trailing_atr_multiplier': 2.5,
+            'aggressive_growth_runner_pct': 0.35,
+            'aggressive_growth_tp1_pct': 0.35,
+            'aggressive_growth_tp2_pct': 0.30,
         }.items():
             min_value = None if key == 'opposite_set_exit_min_pnl_usdt' else 0.0
             _float(key, default, min_value)
@@ -5033,6 +5067,8 @@ class SignalEngine(BaseEngine):
             'bias_continuation_max_signal_age_candles': 6,
             'bias_continuation_15m_max_signal_age_candles': 3,
             'tp2_fallback_confirm_loops': 2,
+            'aggressive_growth_max_open_positions': 2,
+            'aggressive_growth_pyramid_max_adds': 2,
             'safe_live_default_set_id': UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID,
         }.items():
             min_value = 0 if key == 'opposite_set_exit_min_hold_candles' else 1
@@ -5129,6 +5165,9 @@ class SignalEngine(BaseEngine):
             'enable_tp2_fallback_close',
             'tp2_fallback_use_market',
             'emergency_close_on_sl_fail',
+            'aggressive_growth_enabled',
+            'aggressive_growth_pyramiding_enabled',
+            'aggressive_growth_move_sl_to_breakeven_before_add',
             'live_safety_guard_enabled',
             'allow_ut_only_live_override',
             'emergency_mode',
@@ -6952,11 +6991,23 @@ class SignalEngine(BaseEngine):
         if risk_distance <= 0 or initial_qty <= 0 or entry <= 0:
             return None
         ratio = min(0.9, max(0.0, float(cfg.get('partial_take_profit_ratio', 0.5) or 0.5)))
+        runner_ratio = min(
+            1.0,
+            max(
+                0.0,
+                float(cfg.get('runner_pct', plan.get('runner_pct', 0.0)) or 0.0)
+            )
+        )
+        preserve_runner_qty = bool(plan.get('aggressive_growth_overlay')) and runner_ratio > 0
         second_enabled = bool(cfg.get('second_take_profit_enabled', True))
         partial_enabled = bool(cfg.get('partial_take_profit_enabled', True))
         partial_ratio = ratio if partial_enabled else 0.0
+        if preserve_runner_qty:
+            second_room = max(0.0, 1.0 - partial_ratio - runner_ratio)
+        else:
+            second_room = max(0.0, 1.0 - partial_ratio)
         second_ratio = min(
-            max(0.0, 1.0 - partial_ratio),
+            second_room,
             max(0.0, float(cfg.get('second_take_profit_ratio', 0.5) or 0.5))
         ) if second_enabled else 0.0
         raw_tp_quantities = []
@@ -6987,7 +7038,16 @@ class SignalEngine(BaseEngine):
                 'pct': second_ratio * 100.0,
                 'filled': False,
             })
-        residual_qtys = _calculate_residual_tp_quantities(symbol, initial_qty, raw_tp_quantities, self.safe_amount)
+        if preserve_runner_qty:
+            residual_qtys = []
+            remaining_tp_qty = initial_qty
+            for raw_qty in raw_tp_quantities:
+                desired_qty = min(max(0.0, float(raw_qty or 0.0)), remaining_tp_qty)
+                qty_value = max(0.0, _safe_float_value(self.safe_amount(symbol, desired_qty), 0.0))
+                residual_qtys.append(qty_value)
+                remaining_tp_qty = max(0.0, remaining_tp_qty - qty_value)
+        else:
+            residual_qtys = _calculate_residual_tp_quantities(symbol, initial_qty, raw_tp_quantities, self.safe_amount)
         for index, qty_value in enumerate(residual_qtys):
             if index < len(planned_tp_orders):
                 planned_tp_orders[index]['qty'] = qty_value
@@ -7004,7 +7064,10 @@ class SignalEngine(BaseEngine):
             'side': str(side or '').lower(),
             'entry_price': entry,
             'initial_qty': initial_qty,
-            'remaining_ratio': max(0.0, 1.0 - ratio),
+            'remaining_ratio': runner_ratio if preserve_runner_qty else max(0.0, 1.0 - ratio),
+            'runner_pct': runner_ratio,
+            'aggressive_growth_overlay': bool(plan.get('aggressive_growth_overlay', False)),
+            'pyramid_add_count': int(plan.get('pyramid_add_count', 0) or 0),
             'planned_tp_orders': planned_tp_orders,
             'tp_orders': list(planned_tp_orders),
             'expected_tp_count': len(planned_tp_orders),
@@ -7442,9 +7505,9 @@ class SignalEngine(BaseEngine):
             if self._is_valid_number(adaptive.get('selected_score')):
                 selected_score = float(adaptive.get('selected_score'))
             min_score = (
-                _cfg_float('bias_continuation_15m_min_adaptive_tf_score', 62.0)
+                _cfg_float('bias_continuation_15m_min_adaptive_tf_score', 50.0)
                 if is_fast_tf else
-                _cfg_float('bias_continuation_min_adaptive_tf_score', 48.0)
+                _cfg_float('bias_continuation_min_adaptive_tf_score', 42.0)
             )
             if selected_score is None:
                 reasons.append('adaptive TF score missing')
@@ -7457,9 +7520,9 @@ class SignalEngine(BaseEngine):
         plus_di = _f('plus_di')
         minus_di = _f('minus_di')
         min_adx = (
-            _cfg_float('bias_continuation_15m_min_adx', 25.0)
+            _cfg_float('bias_continuation_15m_min_adx', 20.0)
             if is_fast_tf else
-            _cfg_float('bias_continuation_min_adx', 22.0)
+            _cfg_float('bias_continuation_min_adx', 18.0)
         )
         if adx is None or plus_di is None or minus_di is None:
             reasons.append('ADX/DMI missing')
@@ -7503,9 +7566,9 @@ class SignalEngine(BaseEngine):
 
         atr_pct = _f('atr_pct')
         max_extension = (
-            _cfg_float('bias_continuation_15m_max_extension_atr', 1.00)
+            _cfg_float('bias_continuation_15m_max_extension_atr', 1.50)
             if is_fast_tf else
-            _cfg_float('bias_continuation_max_extension_atr', 1.35)
+            _cfg_float('bias_continuation_max_extension_atr', 1.60)
         )
         extension_refs = []
         if close_value is None or atr_pct is None or atr_pct <= 0:
@@ -7528,9 +7591,9 @@ class SignalEngine(BaseEngine):
 
         volume_ratio = _f('volume_ratio')
         min_volume = (
-            _cfg_float('bias_continuation_15m_min_volume_ratio', 1.00)
+            _cfg_float('bias_continuation_15m_min_volume_ratio', 0.80)
             if is_fast_tf else
-            _cfg_float('bias_continuation_min_volume_ratio', 0.85)
+            _cfg_float('bias_continuation_min_volume_ratio', 0.75)
         )
         if volume_ratio is None:
             if is_fast_tf:
@@ -7586,6 +7649,99 @@ class SignalEngine(BaseEngine):
             if flow_ok:
                 setup_parts.append('flow')
             positives.append('setup ' + '/'.join(setup_parts))
+
+        if side == 'long':
+            def _is_long_soft_reason(reason):
+                text = str(reason or '').lower()
+                return any(fragment in text for fragment in (
+                    'adaptive tf',
+                    'adx',
+                    'dmi',
+                    'trend alignment',
+                    'extension',
+                    'volume',
+                    'pullback',
+                    'rebreak',
+                    'flow continuation',
+                ))
+
+            def _is_long_soft_positive(positive):
+                text = str(positive or '').lower()
+                return any(fragment in text for fragment in (
+                    'adaptive tf',
+                    'adx',
+                    'trend aligned',
+                    'extension',
+                    'volume',
+                    'setup ',
+                ))
+
+            hard_reasons = [reason for reason in reasons if not _is_long_soft_reason(reason)]
+            soft_failures = [reason for reason in reasons if _is_long_soft_reason(reason)]
+            soft_pass_count = sum(1 for positive in positives if _is_long_soft_positive(positive))
+            soft_total = soft_pass_count + len(soft_failures)
+            if hard_reasons:
+                return {
+                    'enabled': True,
+                    'state': False,
+                    'risk_multiplier': 0.0,
+                    'summary': 'BLOCK: ' + '; '.join(hard_reasons[:5]),
+                    'reasons': hard_reasons + soft_failures,
+                    'hard_reasons': hard_reasons,
+                    'soft_failures': soft_failures,
+                    'soft_pass_count': soft_pass_count,
+                    'soft_total': soft_total,
+                    'positives': positives,
+                    'signal_age_candles': signal_age_candles,
+                    'extension_atr': extension_atr,
+                    'selected_tf_score': selected_score,
+                }
+            if soft_total <= 0 or soft_pass_count <= 0:
+                return {
+                    'enabled': True,
+                    'state': False,
+                    'risk_multiplier': 0.0,
+                    'summary': 'BLOCK: no soft continuation checks passed',
+                    'reasons': soft_failures or ['no soft continuation checks passed'],
+                    'hard_reasons': [],
+                    'soft_failures': soft_failures,
+                    'soft_pass_count': soft_pass_count,
+                    'soft_total': soft_total,
+                    'positives': positives,
+                    'signal_age_candles': signal_age_candles,
+                    'extension_atr': extension_atr,
+                    'selected_tf_score': selected_score,
+                }
+            if soft_pass_count >= 3:
+                soft_multiplier = 1.0
+            elif soft_pass_count == 2:
+                soft_multiplier = 0.65
+            else:
+                soft_multiplier = 0.35
+            adjusted_multiplier = max(0.0, min(1.0, risk_multiplier * soft_multiplier))
+            state = True if soft_multiplier >= 0.999 else 'reduced'
+            state_label = 'PASS' if state is True else 'REDUCE'
+            summary_bits = list(positives[:5])
+            if soft_failures:
+                summary_bits.append('soft misses: ' + '; '.join(soft_failures[:3]))
+            return {
+                'enabled': True,
+                'state': state,
+                'risk_multiplier': round(adjusted_multiplier, 4),
+                'summary': (
+                    f"{state_label} x{adjusted_multiplier:.2f}: "
+                    f"soft {soft_pass_count}/{soft_total}; " + '; '.join(summary_bits[:6])
+                ),
+                'reasons': soft_failures,
+                'hard_reasons': [],
+                'soft_failures': soft_failures,
+                'soft_pass_count': soft_pass_count,
+                'soft_total': soft_total,
+                'positives': positives,
+                'signal_age_candles': signal_age_candles,
+                'extension_atr': extension_atr,
+                'selected_tf_score': selected_score,
+            }
 
         if reasons:
             return {
@@ -7703,6 +7859,9 @@ class SignalEngine(BaseEngine):
         side_reduce_key = f"quality_score_v2_{side}_{'15m_' if is_fast_tf else ''}reduce_below"
         base_block_default = 62.0 if is_fast_tf else 60.0
         base_reduce_default = 72.0 if is_fast_tf else 70.0
+        if side == 'long':
+            base_block_default = 50.0
+            base_reduce_default = 60.0
         block_below = float(cfg.get(side_block_key, cfg.get(base_block_key, base_block_default)) or base_block_default)
         reduce_below = float(cfg.get(side_reduce_key, cfg.get(base_reduce_key, base_reduce_default)) or base_reduce_default)
         full_score = max(reduce_below, float(cfg.get('quality_score_v2_full_score', 82.0) or 82.0))
@@ -8903,7 +9062,7 @@ class SignalEngine(BaseEngine):
             status['bias_continuation_signal_age_candles'] = bias_continuation.get('signal_age_candles')
             status['bias_continuation_extension_atr'] = bias_continuation.get('extension_atr')
             status['bias_continuation_selected_tf_score'] = bias_continuation.get('selected_tf_score')
-            if bias_continuation.get('state') is not True:
+            if bias_continuation.get('state') is False:
                 return _finish(
                     None,
                     f"REJECTED_BIAS_CONTINUATION: {bias_continuation.get('summary')}",
@@ -9128,6 +9287,114 @@ class SignalEngine(BaseEngine):
             )
         except ValueError as e:
             return _finish(None, f"REJECTED_RISK_REWARD_LOW: {e}", 'REJECTED_RISK_REWARD_LOW', record_failure=True, side=side)
+        growth_overlay = {
+            'enabled': bool(cfg.get('aggressive_growth_enabled', False)),
+            'accepted': False,
+            'reason': 'disabled',
+        }
+        if bool(cfg.get('aggressive_growth_enabled', False)) and side == 'long':
+            weekly_pnl = 0.0
+            try:
+                _, weekly_pnl = self.db.get_weekly_stats()
+            except Exception:
+                weekly_pnl = 0.0
+            open_positions = 0
+            total_aggressive_exposure = 0.0
+            symbol_exposure = 0.0
+            try:
+                positions = await asyncio.to_thread(self.exchange.fetch_positions)
+                for position in positions or []:
+                    try:
+                        contracts = abs(float(self._position_signed_contracts(position) or position.get('contracts', 0) or 0))
+                    except (TypeError, ValueError):
+                        contracts = 0.0
+                    if contracts <= 0:
+                        continue
+                    open_positions += 1
+                    try:
+                        pos_entry = float(position.get('entryPrice') or position.get('markPrice') or entry_price or 0.0)
+                    except (TypeError, ValueError):
+                        pos_entry = 0.0
+                    exposure = contracts * max(pos_entry, 0.0)
+                    total_aggressive_exposure += exposure
+                    pos_symbol = self._normalize_protection_symbol(
+                        self._protection_position_symbol(position)
+                    )
+                    if pos_symbol == self._normalize_protection_symbol(symbol):
+                        symbol_exposure += exposure
+            except Exception as exc:
+                logger.warning(f"Aggressive growth overlay position scan failed for {symbol}: {exc}")
+                open_positions = int(cfg.get('aggressive_growth_max_open_positions', 2) or 2)
+
+            min_depth = float(cfg.get('prediction_min_depth_usdt', 50000.0) or 50000.0)
+            bid_depth = _safe_float_or_none(filter_values.get('bid_depth_usdt'))
+            ask_depth = _safe_float_or_none(filter_values.get('ask_depth_usdt'))
+            liquidity_ok = True
+            if bid_depth is not None and ask_depth is not None:
+                liquidity_ok = bid_depth >= min_depth and ask_depth >= min_depth
+            spread = _safe_float_or_none(filter_values.get('futures_spread_pct'))
+            spread_ok = True if spread is None else spread <= float(cfg.get('rolling_ofi_spread_max_pct', 0.05) or 0.05)
+            long_htf_bullish = (
+                bool(filter_values.get('htf_ready'))
+                and _safe_float_or_none(filter_values.get('htf_close')) is not None
+                and _safe_float_or_none(filter_values.get('htf_ema_slow')) is not None
+                and float(filter_values.get('htf_close')) > float(filter_values.get('htf_ema_slow'))
+            ) or str(filter_values.get('htf_supertrend_direction') or '').lower() == 'long'
+            adx_value = _safe_float_or_none(filter_values.get('adx'))
+            volume_value = _safe_float_or_none(filter_values.get('volume_ratio'))
+            funding_value = _safe_float_or_none(filter_values.get('funding_rate'))
+            extreme_atr = float(cfg.get('market_quality_extreme_atr_pct', 2.5) or 2.5)
+            growth_overlay = build_aggressive_growth_overlay_plan(
+                plan,
+                cfg,
+                {
+                    'side': side,
+                    'entry_price': entry_price,
+                    'stop_loss_price': plan.get('stop_loss'),
+                    'risk_distance': plan.get('risk_distance'),
+                    'account_equity': balance_for_risk,
+                    'daily_pnl_usdt': daily_pnl,
+                    'weekly_pnl_usdt': weekly_pnl,
+                    'open_positions': open_positions,
+                    'symbol_exposure_notional': symbol_exposure,
+                    'total_aggressive_exposure_notional': total_aggressive_exposure,
+                    'leverage': leverage,
+                    'liquidity_ok': liquidity_ok,
+                    'spread_ok': spread_ok,
+                    'htf_trend_bullish': long_htf_bullish,
+                    'symbol_trend_bullish': trend_health.get('state') is not False,
+                    'volume_ok': volume_value is not None and volume_value >= float(cfg.get('bias_continuation_min_volume_ratio', 0.75) or 0.75),
+                    'adx_ok': adx_value is not None and adx_value >= float(cfg.get('bias_continuation_min_adx', 18.0) or 18.0),
+                    'quality_ok': float(quality_score_v2.get('score', 0.0) or 0.0) >= float(cfg.get('quality_score_v2_long_reduce_below', 60.0) or 60.0),
+                    'funding_not_overheated': funding_value is None or funding_value <= float(cfg.get('funding_long_max', 0.0008) or 0.0008),
+                    'volatility_safe': atr_pct is None or float(atr_pct) <= extreme_atr,
+                }
+            )
+            status['aggressive_growth_overlay'] = growth_overlay
+            status['aggressive_growth_summary'] = growth_overlay.get('reason')
+            if growth_overlay.get('accepted') and isinstance(growth_overlay.get('plan'), dict):
+                plan = growth_overlay['plan']
+                cfg = dict(cfg)
+                for key in (
+                    'partial_take_profit_enabled',
+                    'partial_take_profit_r_multiple',
+                    'partial_take_profit_ratio',
+                    'second_take_profit_enabled',
+                    'second_take_profit_r_multiple',
+                    'second_take_profit_ratio',
+                    'runner_pct',
+                    'atr_trailing_enabled',
+                    'atr_trailing_multiplier',
+                    'runner_exit_enabled',
+                    'runner_chandelier_enabled',
+                    'tp1_breakeven_enabled',
+                ):
+                    if key in plan:
+                        cfg[key] = plan[key]
+            elif growth_overlay.get('enabled'):
+                logger.info(
+                    f"Aggressive growth overlay not applied for {symbol}: {growth_overlay.get('reason')}"
+                )
         plan.update({
             'strategy': active_strategy if active_strategy in UTBREAKOUT_STRATEGIES else UTBOT_FILTERED_BREAKOUT_STRATEGY,
             'entry_timeframe': cfg.get('entry_timeframe', '15m'),
@@ -9183,6 +9450,11 @@ class SignalEngine(BaseEngine):
             'dynamic_take_profit_enabled': bool(cfg.get('dynamic_take_profit_enabled', True)),
             'dynamic_take_profit_summary': dynamic_tp2.get('summary'),
             'dynamic_tp2_r_multiple': dynamic_tp2.get('second_take_profit_r_multiple'),
+            'aggressive_growth_enabled': bool(cfg.get('aggressive_growth_enabled', False)),
+            'aggressive_growth_overlay': bool(plan.get('aggressive_growth_overlay', False)),
+            'aggressive_growth_score': plan.get('aggressive_growth_score'),
+            'aggressive_growth_risk_pct': plan.get('aggressive_growth_risk_pct'),
+            'runner_pct': plan.get('runner_pct', cfg.get('runner_pct')),
             'tp1_breakeven_enabled': bool(cfg.get('tp1_breakeven_enabled', True)),
             'tp1_breakeven_trigger_r': float(cfg.get('tp1_breakeven_trigger_r', cfg.get('partial_take_profit_r_multiple', 1.5)) or 1.5),
             'tp1_breakeven_offset_r': float(cfg.get('tp1_breakeven_offset_r', 0.03) or 0.03),
@@ -10404,7 +10676,7 @@ class SignalEngine(BaseEngine):
                 filter_values,
                 selected_set,
             )
-            bias_continuation_ok = bias_continuation.get('state') is True
+            bias_continuation_ok = bias_continuation.get('state') is not False
             bias_continuation_summary = bias_continuation.get('summary') or "n/a"
             if not bias_continuation_ok:
                 blockers.append(f"Bias continuation 미통과: {bias_continuation_summary}")
@@ -18574,6 +18846,9 @@ class SignalEngine(BaseEngine):
                             'tp1_breakeven_offset_r',
                             'tp1_breakeven_wait_for_partial',
                             'tp1_breakeven_qty_tolerance',
+                            'runner_pct',
+                            'runner_exit_enabled',
+                            'runner_chandelier_enabled',
                         ):
                             if key in plan:
                                 effective_fb_cfg[key] = plan[key]
@@ -18623,7 +18898,11 @@ class SignalEngine(BaseEngine):
                             actual_entry_price,
                             qty,
                             sl_distance=risk_distance,
-                            tp_targets=tp_targets
+                            tp_targets=tp_targets,
+                            preserve_runner_qty=bool(
+                                plan.get('aggressive_growth_overlay')
+                                and float(plan.get('runner_pct', 0.0) or 0.0) > 0
+                            )
                         )
                         if (
                             bool(effective_fb_cfg.get('atr_trailing_enabled', False))
@@ -18926,9 +19205,10 @@ class SignalEngine(BaseEngine):
 
     def _classify_protection_order(self, order):
         client_id = self._protection_client_order_id(order).lower()
-        if client_id.startswith('utbtp'):
+        compact_client_id = re.sub(r'[^a-z0-9]', '', client_id)
+        if compact_client_id.startswith(('utbtp', 'tp1', 'tp2', 'tp3', 'takeprofit')):
             return 'tp'
-        if client_id.startswith('utbsl'):
+        if compact_client_id.startswith(('utbsl', 'sl', 'stoploss')):
             return 'sl'
         order_type = self._protection_order_type(order)
         is_reduce_only = self._is_reduce_only_order(order)
@@ -19441,14 +19721,88 @@ class SignalEngine(BaseEngine):
             entry_price = 0.0
         return f"{side}:{contracts}:{entry_price}"
 
+    def _clear_protection_missing_candidates(self, symbol, position_signature=None, issue_keys=None):
+        candidates = getattr(self, 'protection_missing_candidates', None)
+        if not isinstance(candidates, dict):
+            self.protection_missing_candidates = {}
+            return
+        symbol_candidates = candidates.get(symbol)
+        if not isinstance(symbol_candidates, dict):
+            return
+        wanted = None
+        if issue_keys is not None:
+            wanted = {str(item) for item in issue_keys}
+        for issue_key in list(symbol_candidates.keys()):
+            candidate = symbol_candidates.get(issue_key) or {}
+            if wanted is not None and issue_key in wanted:
+                continue
+            if position_signature is not None and candidate.get('position_signature') != position_signature:
+                continue
+            symbol_candidates.pop(issue_key, None)
+        if not symbol_candidates:
+            candidates.pop(symbol, None)
+
+    def _confirm_protection_missing_issue(
+        self,
+        symbol,
+        issue_key,
+        position_signature,
+        required_count=2,
+        min_age_sec=2.0
+    ):
+        candidates = getattr(self, 'protection_missing_candidates', None)
+        if not isinstance(candidates, dict):
+            candidates = {}
+            self.protection_missing_candidates = candidates
+        issue_key = str(issue_key or '').strip()
+        position_signature = str(position_signature or 'none')
+        if not issue_key:
+            return False
+        now_ts = time.time()
+        symbol_candidates = candidates.setdefault(symbol, {})
+        for existing_key in list(symbol_candidates.keys()):
+            existing = symbol_candidates.get(existing_key) or {}
+            if existing.get('position_signature') != position_signature:
+                symbol_candidates.pop(existing_key, None)
+        candidate = symbol_candidates.get(issue_key)
+        if not candidate or candidate.get('position_signature') != position_signature:
+            symbol_candidates[issue_key] = {
+                'position_signature': position_signature,
+                'first_seen_ts': now_ts,
+                'last_seen_ts': now_ts,
+                'count': 1,
+            }
+            logger.info(
+                f"Protection audit candidate: {symbol} {issue_key} first seen, waiting for confirmation"
+            )
+            return False
+        candidate['count'] = int(candidate.get('count', 1) or 1) + 1
+        candidate['last_seen_ts'] = now_ts
+        first_seen = float(candidate.get('first_seen_ts', now_ts) or now_ts)
+        confirmed = (
+            int(candidate.get('count', 0) or 0) >= max(1, int(required_count or 1))
+            and now_ts - first_seen >= max(0.0, float(min_age_sec or 0.0))
+        )
+        if not confirmed:
+            logger.info(
+                f"Protection audit candidate: {symbol} {issue_key} seen "
+                f"{int(candidate.get('count', 0) or 0)}/{max(1, int(required_count or 1))}, waiting"
+            )
+        return confirmed
+
     def _protection_expected_from_config(self, symbol, pos):
         if self.is_upbit_mode() or not pos:
             return False, False
-        strategy_params = self.get_runtime_strategy_params()
-        active_strategy = str(strategy_params.get('active_strategy', '') or '').lower()
-        if active_strategy in UTBREAKOUT_STRATEGIES:
-            return True, True
-        cfg = self.get_runtime_common_settings()
+        try:
+            qty = abs(float(self._position_signed_contracts(pos) or pos.get('contracts', 0) or 0))
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty <= 0:
+            return False, False
+        try:
+            cfg = self.get_runtime_common_settings()
+        except Exception:
+            cfg = {}
         master = bool(cfg.get('tp_sl_enabled', True))
         return (
             master and bool(cfg.get('take_profit_enabled', True)),
@@ -19488,6 +19842,8 @@ class SignalEngine(BaseEngine):
             'mismatch_cancelled': 0,
             'duplicate_cancelled': 0,
             'invalid_price_cancelled': 0,
+            'fetch_ok': True,
+            'missing_confirmed': False,
             'status': 'SKIPPED'
         }
         if self.is_upbit_mode():
@@ -19499,9 +19855,24 @@ class SignalEngine(BaseEngine):
             status['tp_expected'] = bool(expected_tp)
             status['sl_expected'] = bool(expected_sl)
 
-        protection_orders = await self._collect_protection_orders(symbol)
+        fetch_ok, protection_orders = await self._collect_protection_orders_checked(symbol)
+        status['fetch_ok'] = bool(fetch_ok)
+        if not fetch_ok:
+            status['status'] = 'OPEN_ORDERS_FETCH_FAILED'
+            status['missing_sl'] = False
+            status['missing_tp'] = False
+            status['missing_tp1'] = False
+            status['missing_tp2'] = False
+            self._clear_protection_missing_candidates(symbol)
+            self.last_protection_order_status[symbol] = status
+            logger.warning(
+                f"Protection audit open-order fetch failed for {symbol}; "
+                "not treating missing protection orders as confirmed."
+            )
+            return status
 
         if not pos:
+            self._clear_protection_missing_candidates(symbol)
             status['status'] = 'NO_POSITION'
             if protection_orders:
                 status['orphan_cancelled'] = await self._cancel_protection_orders(
@@ -19690,51 +20061,57 @@ class SignalEngine(BaseEngine):
                 break
         status['sl_qty_mismatch'] = sl_qty_mismatch
         position_signature = self._protection_position_signature(pos)
+        missing_required_count = max(
+            1,
+            int(getattr(self, 'PROTECTION_MISSING_REQUIRED_COUNT', 2) or 2)
+        )
+        missing_min_age = max(
+            0.0,
+            float(getattr(self, 'PROTECTION_MISSING_MIN_AGE_SEC', 2.0) or 0.0)
+        )
+        issue_key = None
+        issue_message = None
+        issue_severity = None
         if status['missing_sl'] and status['missing_tp2']:
             status['status'] = 'MISSING_SL_AND_TP2'
-            if alert:
-                await self._notify_protection_issue(
-                    symbol,
-                    f"missing_sl_tp2:{position_signature}",
-                    f"🚨 {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락: SL과 TP2 없음. 거래소 주문을 즉시 확인하세요.",
-                    cooldown_sec=30 * 24 * 60 * 60
-                )
+            issue_key = 'missing_sl_tp2'
+            issue_severity = 'critical'
+            issue_message = (
+                f"🚨 {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락 확인: "
+                "SL과 TP2 없음. 같은 포지션에서 2회 연속 확인됨. 거래소 주문을 즉시 확인하세요."
+            )
         elif status['missing_sl']:
             status['status'] = 'MISSING_SL'
-            if alert:
-                await self._notify_protection_issue(
-                    symbol,
-                    f"missing_sl:{position_signature}",
-                    f"🚨 {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락: SL 없음. 포지션은 유지 중이니 거래소 주문을 확인하세요.",
-                        cooldown_sec=30 * 24 * 60 * 60
-                )
+            issue_key = 'missing_sl'
+            issue_severity = 'critical'
+            issue_message = (
+                f"🚨 {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락 확인: "
+                "SL 없음. 같은 포지션에서 2회 연속 확인됨. 거래소 주문을 즉시 확인하세요."
+            )
         elif status['missing_tp2']:
             status['status'] = 'MISSING_TP2'
-            if alert:
-                await self._notify_protection_issue(
-                    symbol,
-                    f"missing_tp2:{position_signature}",
-                    f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락: TP2 없음",
-                    cooldown_sec=30 * 24 * 60 * 60
-                )
+            issue_key = 'missing_tp2'
+            issue_severity = 'warning'
+            issue_message = (
+                f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락 확인: "
+                "TP2 없음. 같은 포지션에서 2회 연속 확인됨."
+            )
         elif status['missing_tp1']:
             status['status'] = 'MISSING_TP1'
-            if alert:
-                await self._notify_protection_issue(
-                    symbol,
-                    f"missing_tp1:{position_signature}",
-                    f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락: TP1 없음",
-                    cooldown_sec=30 * 24 * 60 * 60
-                )
+            issue_key = 'missing_tp1'
+            issue_severity = 'warning'
+            issue_message = (
+                f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락 확인: "
+                "TP1 없음. 같은 포지션에서 2회 연속 확인됨."
+            )
         elif status['missing_tp']:
             status['status'] = 'MISSING_TP'
-            if alert:
-                await self._notify_protection_issue(
-                    symbol,
-                    f"missing_tp:{position_signature}",
-                    f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락: TP 없음",
-                    cooldown_sec=30 * 24 * 60 * 60
-                )
+            issue_key = 'missing_tp'
+            issue_severity = 'warning'
+            issue_message = (
+                f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락 확인: "
+                "TP 없음. 같은 포지션에서 2회 연속 확인됨."
+            )
         elif status['mismatch_cancelled']:
             status['status'] = 'MISMATCH_CANCELLED'
         elif status['invalid_price_cancelled']:
@@ -19751,6 +20128,33 @@ class SignalEngine(BaseEngine):
             status['status'] = 'SL_QTY_MISMATCH'
         else:
             status['status'] = 'OK'
+        if issue_key:
+            self._clear_protection_missing_candidates(
+                symbol,
+                position_signature=position_signature,
+                issue_keys={issue_key}
+            )
+            confirmed = self._confirm_protection_missing_issue(
+                symbol,
+                issue_key,
+                position_signature,
+                required_count=missing_required_count,
+                min_age_sec=missing_min_age
+            )
+            status['missing_issue_key'] = issue_key
+            status['missing_issue_severity'] = issue_severity
+            status['missing_confirmed'] = bool(confirmed)
+            if alert and confirmed:
+                await self._notify_protection_issue(
+                    symbol,
+                    f"{issue_key}:{position_signature}",
+                    issue_message,
+                    cooldown_sec=30 * 24 * 60 * 60
+                )
+        else:
+            if getattr(self, 'protection_missing_candidates', {}).get(symbol):
+                logger.info(f"Protection audit recovered: {symbol} SL/TP present")
+            self._clear_protection_missing_candidates(symbol)
         self.last_protection_order_status[symbol] = status
         return status
 
@@ -20304,7 +20708,8 @@ class SignalEngine(BaseEngine):
         tp_distance=None,
         sl_distance=None,
         tp_qty_ratio=1.0,
-        tp_targets=None
+        tp_targets=None,
+        preserve_runner_qty=False
     ):
         """Place reduce-only TP/SL protection orders for the current futures position."""
         try:
@@ -20396,12 +20801,21 @@ class SignalEngine(BaseEngine):
                     'raw_qty': raw_qty * ratio,
                     'price': target_price,
                 })
-            residual_tp_qtys = _calculate_residual_tp_quantities(
-                symbol,
-                raw_qty,
-                [target.get('raw_qty') for target in normalized_tp_targets],
-                self.safe_amount,
-            )
+            if preserve_runner_qty:
+                residual_tp_qtys = []
+                remaining_tp_qty = raw_qty
+                for target in normalized_tp_targets:
+                    desired_qty = min(max(0.0, float(target.get('raw_qty') or 0.0)), remaining_tp_qty)
+                    qty_value = max(0.0, _safe_float_value(self.safe_amount(symbol, desired_qty), 0.0))
+                    residual_tp_qtys.append(qty_value)
+                    remaining_tp_qty = max(0.0, remaining_tp_qty - qty_value)
+            else:
+                residual_tp_qtys = _calculate_residual_tp_quantities(
+                    symbol,
+                    raw_qty,
+                    [target.get('raw_qty') for target in normalized_tp_targets],
+                    self.safe_amount,
+                )
             for index, target in enumerate(normalized_tp_targets):
                 target['qty'] = (
                     residual_tp_qtys[index]
@@ -20573,14 +20987,40 @@ class SignalEngine(BaseEngine):
             if notice_parts:
                 await self.ctrl.notify(" | ".join(notice_parts))
 
-            await self._audit_protection_orders(
+            audit_delay = max(
+                0.5,
+                min(
+                    1.5,
+                    float(protection_cfg.get('protection_audit_after_place_delay_sec', 0.5) or 0.5)
+                )
+            )
+            await asyncio.sleep(audit_delay)
+            first_audit = await self._audit_protection_orders(
                 symbol,
                 pos=await self.get_server_position(symbol, use_cache=False),
                 expected_tp=bool(valid_tp_targets),
                 expected_sl=sl_price is not None,
                 planned_tp_orders=normalized_tp_targets,
-                alert=True
+                alert=False
             )
+            if (
+                first_audit.get('fetch_ok', True)
+                and (
+                    first_audit.get('missing_sl')
+                    or first_audit.get('missing_tp')
+                    or first_audit.get('missing_tp1')
+                    or first_audit.get('missing_tp2')
+                )
+            ):
+                await asyncio.sleep(audit_delay)
+                await self._audit_protection_orders(
+                    symbol,
+                    pos=await self.get_server_position(symbol, use_cache=False),
+                    expected_tp=bool(valid_tp_targets),
+                    expected_sl=sl_price is not None,
+                    planned_tp_orders=normalized_tp_targets,
+                    alert=True
+                )
 
         except Exception as e:
             logger.error(f"TP/SL order placement error: {e}")

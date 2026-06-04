@@ -1237,11 +1237,55 @@ def test_protection_order_classifies_bot_client_ids_even_without_reduce_only():
     assert signal_engine._classify_protection_order(engine, stop_loss) == "sl"
 
 
+def test_protection_order_classifies_binance_stop_market_close_position_as_sl():
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    order = {
+        "id": "sl-stop-market",
+        "side": "sell",
+        "type": "STOP_MARKET",
+        "closePosition": True,
+        "stopPrice": "90",
+        "info": {"symbol": "BTCUSDT", "origType": "STOP_MARKET", "closePosition": "true"},
+    }
+
+    assert signal_engine._classify_protection_order(engine, order) == "sl"
+
+
+def test_protection_order_classifies_reduce_only_trigger_price_as_sl():
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    order = {
+        "id": "sl-trigger",
+        "side": "sell",
+        "type": "market",
+        "reduceOnly": True,
+        "triggerPrice": "90",
+        "info": {"symbol": "BTCUSDT", "reduceOnly": "true"},
+    }
+
+    assert signal_engine._classify_protection_order(engine, order) == "sl"
+
+
+def test_protection_tp_labels_from_client_ids():
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    tp1 = {"id": "tp1", "type": "limit", "side": "sell", "reduceOnly": True, "clientOrderId": "utbtp1BTC"}
+    tp2 = {"id": "tp2", "type": "limit", "side": "sell", "reduceOnly": True, "clientOrderId": "tp2BTC"}
+
+    assert signal_engine._classify_protection_order(engine, tp1) == "tp"
+    assert signal_engine._protection_tp_label(engine, tp1) == "TP1"
+    assert signal_engine._classify_protection_order(engine, tp2) == "tp"
+    assert signal_engine._protection_tp_label(engine, tp2) == "TP2"
+
+
 class _DummyCtrl:
     def format_symbol_for_display(self, symbol):
         return symbol
 
     async def notify(self, message):
+        self.messages = getattr(self, "messages", [])
+        self.messages.append(message)
         self.last_message = message
 
 
@@ -1353,6 +1397,7 @@ def _protection_engine(orders, symbol_scope_returns=True, positions=None):
     engine.ctrl = _DummyCtrl()
     engine.last_protection_alert_ts = {}
     engine.last_protection_order_status = {}
+    engine.protection_missing_candidates = {}
     engine.last_orphan_protection_sweep_ts = 0.0
     engine.orphan_protection_candidates = {}
     engine.ORPHAN_PROTECTION_SWEEP_INTERVAL = 10.0
@@ -1360,6 +1405,46 @@ def _protection_engine(orders, symbol_scope_returns=True, positions=None):
     engine.POSITION_CACHE_TTL = 0.0
     engine.is_upbit_mode = lambda: False
     return engine
+
+
+def test_protection_audit_fetch_failure_does_not_alert_missing_sl():
+    class FailingOpenOrdersExchange(_FakeExchange):
+        def fetch_open_orders(self, symbol=None):
+            raise RuntimeError("temporary exchange outage")
+
+    pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "1", "entryPrice": "100"}
+    engine = _protection_engine([], positions=[pos])
+    engine.exchange = FailingOpenOrdersExchange([], positions=[pos])
+
+    status = asyncio.run(
+        engine._audit_protection_orders("BTC/USDT", pos=pos, expected_tp=False, expected_sl=True, alert=True)
+    )
+
+    assert status["status"] == "OPEN_ORDERS_FETCH_FAILED"
+    assert status["fetch_ok"] is False
+    assert status["missing_sl"] is False
+    assert not getattr(engine.ctrl, "messages", [])
+
+
+def test_protection_audit_missing_sl_requires_two_confirmed_reads():
+    pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "1", "entryPrice": "100"}
+    engine = _protection_engine([], positions=[pos])
+    engine.PROTECTION_MISSING_MIN_AGE_SEC = 0.0
+
+    first = asyncio.run(
+        engine._audit_protection_orders("BTC/USDT", pos=pos, expected_tp=False, expected_sl=True, alert=True)
+    )
+    assert first["status"] == "MISSING_SL"
+    assert first["missing_confirmed"] is False
+    assert not getattr(engine.ctrl, "messages", [])
+
+    second = asyncio.run(
+        engine._audit_protection_orders("BTC/USDT", pos=pos, expected_tp=False, expected_sl=True, alert=True)
+    )
+    assert second["status"] == "MISSING_SL"
+    assert second["missing_confirmed"] is True
+    assert "SL 없음" in engine.ctrl.messages[-1]
+    assert "2회 연속" in engine.ctrl.messages[-1]
 
 
 def test_get_server_position_matches_futures_symbol_and_position_amt():
@@ -1646,13 +1731,22 @@ def test_utbreakout_defaults_enable_fixed_tp_ladder_and_disable_runner():
     assert cfg["bias_continuation_risk_multiplier"] == 0.65
     assert cfg["bias_continuation_15m_risk_multiplier"] == 0.5
     assert cfg["bias_continuation_15m_max_signal_age_candles"] == 3
-    assert cfg["bias_continuation_15m_min_adx"] == 25.0
-    assert cfg["bias_continuation_15m_max_extension_atr"] == 1.0
+    assert cfg["bias_continuation_min_adx"] == 18.0
+    assert cfg["bias_continuation_15m_min_adx"] == 20.0
+    assert cfg["bias_continuation_min_volume_ratio"] == 0.75
+    assert cfg["bias_continuation_15m_min_volume_ratio"] == 0.80
+    assert cfg["bias_continuation_max_extension_atr"] == 1.60
+    assert cfg["bias_continuation_15m_max_extension_atr"] == 1.50
+    assert cfg["bias_continuation_min_adaptive_tf_score"] == 42.0
+    assert cfg["bias_continuation_15m_min_adaptive_tf_score"] == 50.0
     assert cfg["quality_score_v2_enabled"] is True
     assert cfg["quality_score_v2_block_below"] == 60.0
     assert cfg["quality_score_v2_reduce_below"] == 70.0
     assert cfg["quality_score_v2_min_risk_multiplier"] == 0.5
-    assert cfg["quality_score_v2_long_15m_block_below"] == 58.0
+    assert cfg["quality_score_v2_long_block_below"] == 50.0
+    assert cfg["quality_score_v2_long_reduce_below"] == 60.0
+    assert cfg["quality_score_v2_long_15m_block_below"] == 50.0
+    assert cfg["quality_score_v2_long_15m_reduce_below"] == 60.0
     assert cfg["quality_score_v2_short_15m_block_below"] == 70.0
     assert cfg["dynamic_take_profit_enabled"] is True
     assert cfg["dynamic_tp2_base_r_multiple"] == 2.0
@@ -1674,6 +1768,9 @@ def test_utbreakout_defaults_enable_fixed_tp_ladder_and_disable_runner():
     assert cfg["runner_chandelier_enabled"] is False
     assert cfg["runner_chandelier_multiplier"] == 2.4
     assert cfg["trend_health_enabled"] is True
+    assert cfg["aggressive_growth_enabled"] is False
+    assert cfg["aggressive_growth_balance_sleeve_pct"] == 0.20
+    assert cfg["aggressive_growth_max_trade_risk_pct"] == 0.015
 
 
 def test_utbreakout_short_guard_requires_htf_and_dmi_alignment():
@@ -1835,7 +1932,7 @@ def test_utbreakout_bias_continuation_rejects_stale_15m_state():
     assert "stale" in result["summary"]
 
 
-def test_utbreakout_bias_continuation_rejects_overextended_state():
+def test_utbreakout_bias_continuation_treats_overextension_as_long_soft_filter():
     engine, cfg = _bias_continuation_engine_and_cfg()
     values = _passing_bias_continuation_values()
     values.update({
@@ -1861,8 +1958,43 @@ def test_utbreakout_bias_continuation_rejects_overextended_state():
         {"id": 7},
     )
 
-    assert result["state"] is False
-    assert "extension" in result["summary"]
+    assert result["state"] is True
+    assert "extension" in "; ".join(result["reasons"])
+    assert result["soft_pass_count"] >= 3
+
+
+def test_utbreakout_bias_continuation_long_soft_failures_reduce_risk_without_blocking():
+    engine, cfg = _bias_continuation_engine_and_cfg()
+    values = _passing_bias_continuation_values()
+    values.update({
+        "entry_price": 105.0,
+        "open": 104.8,
+        "ema50": 100.0,
+        "ema50_prev": 99.7,
+        "vwap": 99.8,
+        "bb_mid": 100.5,
+        "adx": 15.0,
+        "volume_ratio": 0.60,
+        "atr_pct": 0.5,
+    })
+
+    result = engine._evaluate_utbreakout_bias_continuation(
+        "long",
+        cfg,
+        {
+            "candidate_type": "bias_state",
+            "decision_candle_ts": 3 * 900_000,
+            "ut_signal_ts": 1 * 900_000,
+            "adaptive_timeframe_decision": {"selected_score": 45.0},
+        },
+        values,
+        {"id": 7},
+    )
+
+    assert result["state"] == "reduced"
+    assert result["soft_pass_count"] == 2
+    assert result["risk_multiplier"] == pytest.approx(0.325)
+    assert "soft misses" in result["summary"]
 
 
 def test_utbreakout_quality_score_v2_blocks_weak_confluence_and_reduces_mixed():
@@ -1877,8 +2009,8 @@ def test_utbreakout_quality_score_v2_blocks_weak_confluence_and_reduces_mixed():
         cfg,
         {"candidate_type": "fresh_signal", "entry_timeframe": "15m", "adaptive_timeframe_decision": {"selected_score": 50}},
         {},
-        trend_health={"score": 20, "risk_multiplier": 0.35},
-        strategy_quality={"score": 30, "risk_multiplier": 0.35},
+        trend_health={"score": 0, "risk_multiplier": 0.35},
+        strategy_quality={"score": 0, "risk_multiplier": 0.35},
         market_quality={"state": True, "risk_multiplier": 1.0},
         selector_quality={"score": 70},
     )
