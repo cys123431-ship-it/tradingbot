@@ -439,6 +439,31 @@ BINANCE_TESTNET = 'binance_testnet'
 BINANCE_MAINNET = 'binance_mainnet'
 UPBIT_MODE = 'upbit'
 SUPPORTED_EXCHANGE_MODES = {BINANCE_TESTNET, BINANCE_MAINNET, UPBIT_MODE}
+EXCHANGE_MODE_DEFAULT_WATCHLISTS = {
+    BINANCE_TESTNET: ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+    BINANCE_MAINNET: ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+    UPBIT_MODE: ["BTC/KRW", "ETH/KRW", "SOL/KRW"],
+}
+EXCHANGE_MODE_SYMBOL_POLICY = {
+    BINANCE_TESTNET: {
+        "quote": "USDT",
+        "market_type": "usdt_perpetual",
+        "allow_tradifi": False,
+        "allow_upbit_krw": False,
+    },
+    BINANCE_MAINNET: {
+        "quote": "USDT",
+        "market_type": "usdt_perpetual",
+        "allow_tradifi": True,
+        "allow_upbit_krw": False,
+    },
+    UPBIT_MODE: {
+        "quote": "KRW",
+        "market_type": "spot",
+        "allow_tradifi": False,
+        "allow_upbit_krw": True,
+    },
+}
 UTBOT_FILTER_PACK_LABELS = {
     1: 'CHOP',
     2: 'ADX+DMI',
@@ -1747,6 +1772,25 @@ class TradingConfig:
             upbit_cfg['watchlist'] = ['BTC/KRW']
             changed = True
 
+        exchange_watchlists = self.config.get('exchange_watchlists')
+        if not isinstance(exchange_watchlists, dict):
+            exchange_watchlists = {}
+            self.config['exchange_watchlists'] = exchange_watchlists
+            changed = True
+        legacy_signal_watchlist = signal_cfg.get('watchlist')
+        legacy_upbit_watchlist = upbit_cfg.get('watchlist')
+        for mode, default_watchlist in EXCHANGE_MODE_DEFAULT_WATCHLISTS.items():
+            current_watchlist = exchange_watchlists.get(mode)
+            if isinstance(current_watchlist, list) and current_watchlist:
+                continue
+            if mode == BINANCE_MAINNET and isinstance(legacy_signal_watchlist, list) and legacy_signal_watchlist:
+                exchange_watchlists[mode] = list(legacy_signal_watchlist)
+            elif mode == UPBIT_MODE and isinstance(legacy_upbit_watchlist, list) and legacy_upbit_watchlist:
+                exchange_watchlists[mode] = list(legacy_upbit_watchlist)
+            else:
+                exchange_watchlists[mode] = list(default_watchlist)
+            changed = True
+
         upbit_common = upbit_cfg.setdefault('common_settings', {})
         upbit_common_defaults = {
             'leverage': 1,
@@ -1892,6 +1936,11 @@ class TradingConfig:
                 "trade_direction": "both",
                 "show_dashboard": True,
                 "monitoring_interval_seconds": 3
+            },
+            "exchange_watchlists": {
+                BINANCE_TESTNET: list(EXCHANGE_MODE_DEFAULT_WATCHLISTS[BINANCE_TESTNET]),
+                BINANCE_MAINNET: list(EXCHANGE_MODE_DEFAULT_WATCHLISTS[BINANCE_MAINNET]),
+                UPBIT_MODE: list(EXCHANGE_MODE_DEFAULT_WATCHLISTS[UPBIT_MODE]),
             },
             "signal_engine": {
                 "watchlist": ["BTC/USDT"],
@@ -14987,9 +15036,41 @@ class SignalEngine(BaseEngine):
             return report
 
         ticker_items = []
+        custom_resolution_rejected = []
         if custom_enabled:
+            validation_markets = markets
+            try:
+                loaded_validation_markets = await asyncio.to_thread(self.exchange.load_markets)
+                if isinstance(loaded_validation_markets, dict):
+                    validation_markets = loaded_validation_markets
+            except Exception as exc:
+                logger.warning(f"CoinSelector custom validation markets load failed: {exc}")
+            ctrl = getattr(self, 'ctrl', None)
+            mode = ctrl.get_exchange_mode() if ctrl and hasattr(ctrl, 'get_exchange_mode') else None
             for requested_symbol in custom_symbols:
-                exchange_symbol = self._coin_selector_exchange_symbol_for_custom(requested_symbol, markets)
+                try:
+                    if ctrl and hasattr(ctrl, '_resolve_futures_watch_symbol_from_markets'):
+                        exchange_symbol = ctrl._resolve_futures_watch_symbol_from_markets(
+                            requested_symbol,
+                            validation_markets,
+                            exchange_mode=mode,
+                        )
+                    else:
+                        exchange_symbol = self._coin_selector_exchange_symbol_for_custom(requested_symbol, validation_markets)
+                except Exception as exc:
+                    normalized = normalize_coin_selector_custom_symbols([requested_symbol])
+                    normalized = normalized[0] if normalized else str(requested_symbol or '').strip().upper()
+                    custom_resolution_rejected.append({
+                        'symbol': normalized,
+                        'exchange_symbol': normalized,
+                        'normalized_symbol': normalized,
+                        'accepted': False,
+                        'reject_reasons': ['REJECTED_EXCHANGE_MODE_SYMBOL'],
+                        'analysis_error': str(exc),
+                        'selection_state': 'REJECTED',
+                        'custom_universe': True,
+                    })
+                    continue
                 try:
                     ticker = await asyncio.to_thread(self.market_data_exchange.fetch_ticker, exchange_symbol)
                     ticker_items.append((exchange_symbol, ticker))
@@ -15008,7 +15089,7 @@ class SignalEngine(BaseEngine):
             ticker_items = list((tickers or {}).items())
 
         accepted_base = []
-        rejected = []
+        rejected = list(custom_resolution_rejected)
         include_tradifi_universe = self._coin_selector_should_include_tradifi_universe(cfg, custom_enabled)
         for symbol, ticker in ticker_items:
             market = self._coin_selector_market_for_symbol(symbol, markets)
@@ -18499,6 +18580,7 @@ class SignalEngine(BaseEngine):
 
     async def entry(self, symbol, side, price):
         try:
+            raw_symbol = symbol
             cfg = self.get_runtime_common_settings()
             cfg = apply_runtime_safety_defaults(cfg)
             try:
@@ -18507,6 +18589,17 @@ class SignalEngine(BaseEngine):
                 logger.error(f"Error enforcing activation stage: {stage_err}")
                 self.last_entry_reason[symbol] = f"Activation stage blocked: {stage_err}"
                 await self.ctrl.notify(f"⚠️ **진입 차단**: activation stage 오류 ({stage_err})")
+                return
+
+            try:
+                symbol = await self.ctrl._assert_symbol_tradeable_in_current_exchange_mode(symbol)
+            except Exception as symbol_err:
+                logger.error(f"Exchange-mode symbol preflight blocked entry: {raw_symbol} ({symbol_err})")
+                self.last_entry_reason[raw_symbol] = f"Exchange-mode symbol blocked: {symbol_err}"
+                await self.ctrl.notify(
+                    f"⛔ 주문 차단: 현재 거래소 모드에서 사용할 수 없는 심볼입니다. "
+                    f"{raw_symbol} / {symbol_err}"
+                )
                 return
 
             try:
@@ -23200,11 +23293,46 @@ class MainController:
             strategy['active_strategy'] = 'utbot'
         return strategy
 
+    def _config_root(self):
+        if isinstance(getattr(self.cfg, 'config', None), dict):
+            return self.cfg.config
+        if isinstance(getattr(self.cfg, 'values', None), dict):
+            return self.cfg.values
+        if isinstance(self.cfg, dict):
+            return self.cfg
+        return None
+
+    async def _update_config_value(self, path, value):
+        if hasattr(self.cfg, 'update_value'):
+            await self.cfg.update_value(path, value)
+            return
+        root = self._config_root()
+        if not isinstance(root, dict):
+            raise RuntimeError("Config object does not support updates")
+        node = root
+        for key in path[:-1]:
+            node = node.setdefault(key, {})
+        node[path[-1]] = value
+
+    def get_default_watchlist_for_exchange_mode(self, exchange_mode=None):
+        mode = exchange_mode or self.get_exchange_mode()
+        return list(EXCHANGE_MODE_DEFAULT_WATCHLISTS.get(mode, ["BTC/USDT"]))
+
     def get_active_watchlist(self):
-        watchlist = self.get_active_trade_config().get('watchlist', [])
-        if not isinstance(watchlist, list) or not watchlist:
-            return ['BTC/KRW'] if self.is_upbit_mode() else ['BTC/USDT']
-        return list(watchlist)
+        mode = self.get_exchange_mode()
+        watchlists = self.cfg.get('exchange_watchlists', {}) or {}
+        mode_watchlist = watchlists.get(mode) if isinstance(watchlists, dict) else None
+        if isinstance(mode_watchlist, list) and mode_watchlist:
+            return list(mode_watchlist)
+
+        if mode == UPBIT_MODE:
+            legacy = self.cfg.get('upbit', {}).get('watchlist', [])
+        else:
+            legacy = self.cfg.get('signal_engine', {}).get('watchlist', [])
+        if isinstance(legacy, list) and legacy:
+            return list(legacy)
+
+        return self.get_default_watchlist_for_exchange_mode(mode)
 
     def _reset_signal_engine_runtime_state(self, *, reset_entry_cache=False, reset_exit_cache=False, reset_stateful_strategy=False):
         signal_engine = self.engines.get('signal')
@@ -23304,6 +23432,42 @@ class MainController:
                 return market
         return None
 
+    def _upbit_market_for_symbol(self, symbol, markets):
+        if not isinstance(markets, dict):
+            return None
+        normalized = self.normalize_symbol_for_exchange(symbol, exchange_mode=UPBIT_MODE)
+        base = normalized.split('/', 1)[0]
+        keys = []
+
+        def _add_key(key):
+            key = str(key or '').strip()
+            if key and key not in keys:
+                keys.append(key)
+
+        _add_key(normalized)
+        _add_key(f"KRW-{base}")
+        _add_key(f"{base}/KRW")
+
+        for key in keys:
+            market = markets.get(key)
+            if not isinstance(market, dict):
+                continue
+            info = market.get('info', {}) if isinstance(market.get('info', {}), dict) else {}
+            market_symbol = str(market.get('symbol') or key).upper()
+            market_id = str(market.get('id') or info.get('market') or '').upper()
+            quote = str(market.get('quote') or info.get('quote') or '').upper()
+            market_type = str(market.get('type') or '').lower()
+            active = market.get('active', True)
+            spot_like = bool(market.get('spot', market_type in {'', 'spot'})) and not bool(market.get('swap', False))
+            krw_pair = (
+                quote == 'KRW'
+                or market_symbol.endswith('/KRW')
+                or market_id.startswith('KRW-')
+            )
+            if krw_pair and spot_like and active is not False:
+                return market
+        return None
+
     def _resolve_futures_watch_symbol_from_markets(self, raw_symbol, markets, *, exchange_mode=None):
         mode = exchange_mode or self.get_exchange_mode()
         normalized_items = normalize_coin_selector_custom_symbols([raw_symbol])
@@ -23336,6 +23500,294 @@ class MainController:
                 result.append(symbol)
                 seen.add(normalized)
         return sorted(result)
+
+    async def _load_trade_markets_for_exchange_mode(self, exchange_mode=None):
+        exchange = getattr(self, 'exchange', None) or getattr(self, 'market_data_exchange', None)
+        if exchange is None or not hasattr(exchange, 'load_markets'):
+            raise RuntimeError("현재 거래소 market 정보를 불러올 수 없습니다.")
+        markets = await asyncio.to_thread(exchange.load_markets)
+        return markets if isinstance(markets, dict) else {}
+
+    def _resolve_watch_symbol_for_exchange_mode(self, raw_symbol, markets, *, exchange_mode=None):
+        mode = exchange_mode or self.get_exchange_mode()
+        if mode == UPBIT_MODE:
+            symbol = self.normalize_symbol_for_exchange(raw_symbol, exchange_mode=UPBIT_MODE)
+            if not symbol.endswith('/KRW'):
+                raise ValueError("Upbit 모드는 KRW 현물만 허용합니다.")
+            if self._upbit_market_for_symbol(symbol, markets) is None:
+                raise ValueError(f"유효하지 않은 Upbit KRW 현물 심볼입니다: {symbol}")
+            return symbol
+        return self._resolve_futures_watch_symbol_from_markets(
+            raw_symbol,
+            markets,
+            exchange_mode=mode,
+        )
+
+    def _dedupe_watch_symbols(self, symbols):
+        deduped = []
+        seen = set()
+        for symbol in symbols or []:
+            key = self._telegram_status_symbol_key(symbol)
+            if key and key not in seen:
+                deduped.append(symbol)
+                seen.add(key)
+        return deduped
+
+    def _filter_futures_symbols_for_exchange_mode(self, symbols, markets, *, exchange_mode=None):
+        mode = exchange_mode or self.get_exchange_mode()
+        valid = []
+        removed = []
+        seen = set()
+        for raw_symbol in normalize_coin_selector_custom_symbols(symbols):
+            try:
+                resolved = self._resolve_futures_watch_symbol_from_markets(
+                    raw_symbol,
+                    markets,
+                    exchange_mode=mode,
+                )
+                key = self._futures_symbol_key(resolved)
+                if key and key not in seen:
+                    valid.append(resolved)
+                    seen.add(key)
+            except Exception as exc:
+                removed.append({'symbol': raw_symbol, 'reason': str(exc)})
+        return valid, removed
+
+    def _sync_signal_active_symbols(self, symbols):
+        synced = False
+        seen_engines = set()
+        for key in (CORE_ENGINE, 'signal'):
+            engine = self.engines.get(key) if isinstance(getattr(self, 'engines', None), dict) else None
+            if not engine or id(engine) in seen_engines:
+                continue
+            seen_engines.add(id(engine))
+            if hasattr(engine, 'active_symbols'):
+                engine.active_symbols = set(symbols or [])
+                synced = True
+            if hasattr(engine, 'scanner_active_symbol'):
+                engine.scanner_active_symbol = None
+        return synced
+
+    async def _sanitize_coin_selector_universe_for_exchange_mode(self, exchange_mode=None, markets=None, *, persist=True):
+        mode = exchange_mode or self.get_exchange_mode()
+        signal_cfg = self.cfg.get('signal_engine', {}) or {}
+        coin_cfg = signal_cfg.get('coin_selector', {}) if isinstance(signal_cfg.get('coin_selector', {}), dict) else {}
+        custom_symbols = normalize_coin_selector_custom_symbols(coin_cfg.get('custom_symbols'))
+        removed = []
+
+        if mode == UPBIT_MODE:
+            if persist:
+                await self._update_config_value(['signal_engine', 'coin_selector', 'enabled'], False)
+                await self._update_config_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
+                await self._update_config_value(['signal_engine', 'coin_selector', 'custom_symbols'], [])
+                await self._update_config_value(['signal_engine', 'coin_selector', 'include_tradifi_universe'], False)
+            return {
+                'mode': mode,
+                'valid': [],
+                'removed': [{'symbol': symbol, 'reason': 'Upbit mode does not use Binance Futures CoinSelector'} for symbol in custom_symbols],
+            }
+
+        if markets is None:
+            markets = await self._load_trade_markets_for_exchange_mode(mode)
+
+        valid = []
+        seen = set()
+        for item in custom_symbols:
+            try:
+                resolved = self._resolve_futures_watch_symbol_from_markets(
+                    item,
+                    markets,
+                    exchange_mode=mode,
+                )
+                key = self._futures_symbol_key(resolved)
+                if key and key not in seen:
+                    valid.append(resolved)
+                    seen.add(key)
+            except Exception as exc:
+                removed.append({'symbol': item, 'reason': str(exc)})
+
+        if persist:
+            await self._update_config_value(['signal_engine', 'coin_selector', 'custom_symbols'], valid)
+            if mode != BINANCE_MAINNET:
+                await self._update_config_value(['signal_engine', 'coin_selector', 'include_tradifi_universe'], False)
+            elif 'include_tradifi_universe' not in coin_cfg:
+                await self._update_config_value(['signal_engine', 'coin_selector', 'include_tradifi_universe'], True)
+
+        return {'mode': mode, 'valid': valid, 'removed': removed}
+
+    async def _sanitize_watchlist_for_exchange_mode(
+        self,
+        exchange_mode=None,
+        *,
+        markets=None,
+        persist=True,
+        reason="exchange mode changed",
+    ):
+        mode = exchange_mode or self.get_exchange_mode()
+        watchlists = self.cfg.get('exchange_watchlists', {}) or {}
+        mode_watchlist = watchlists.get(mode) if isinstance(watchlists, dict) else None
+
+        if isinstance(mode_watchlist, list) and mode_watchlist:
+            raw_watchlist = list(mode_watchlist)
+        elif mode == UPBIT_MODE:
+            raw_watchlist = self.cfg.get('upbit', {}).get('watchlist', [])
+        else:
+            raw_watchlist = self.cfg.get('signal_engine', {}).get('watchlist', [])
+
+        if not isinstance(raw_watchlist, list):
+            raw_watchlist = []
+
+        legacy_shadow_watchlist = []
+        raw_keys = {self._telegram_status_symbol_key(item) for item in raw_watchlist}
+        if isinstance(mode_watchlist, list) and mode_watchlist:
+            if mode == UPBIT_MODE:
+                legacy_shadow_watchlist = self.cfg.get('signal_engine', {}).get('watchlist', [])
+            else:
+                legacy_shadow_watchlist = self.cfg.get('signal_engine', {}).get('watchlist', [])
+            if not isinstance(legacy_shadow_watchlist, list):
+                legacy_shadow_watchlist = []
+
+        if markets is None:
+            markets = await self._load_trade_markets_for_exchange_mode(mode)
+
+        valid = []
+        removed = []
+        for raw_symbol in raw_watchlist:
+            try:
+                valid.append(
+                    self._resolve_watch_symbol_for_exchange_mode(
+                        raw_symbol,
+                        markets,
+                        exchange_mode=mode,
+                    )
+                )
+            except Exception as exc:
+                removed.append({'symbol': raw_symbol, 'reason': str(exc)})
+
+        for legacy_symbol in legacy_shadow_watchlist:
+            if self._telegram_status_symbol_key(legacy_symbol) in raw_keys:
+                continue
+            try:
+                self._resolve_watch_symbol_for_exchange_mode(
+                    legacy_symbol,
+                    markets,
+                    exchange_mode=mode,
+                )
+            except Exception as exc:
+                removed.append({'symbol': legacy_symbol, 'reason': str(exc)})
+
+        deduped = self._dedupe_watch_symbols(valid)
+        if not deduped:
+            fallback_removed = []
+            for fallback in self.get_default_watchlist_for_exchange_mode(mode):
+                try:
+                    deduped.append(
+                        self._resolve_watch_symbol_for_exchange_mode(
+                            fallback,
+                            markets,
+                            exchange_mode=mode,
+                        )
+                    )
+                except Exception as exc:
+                    fallback_removed.append({'symbol': fallback, 'reason': str(exc)})
+            deduped = self._dedupe_watch_symbols(deduped)
+            if fallback_removed:
+                removed.extend(fallback_removed)
+
+        if not deduped:
+            raise RuntimeError(f"No valid watchlist symbols for exchange mode: {mode}")
+
+        coin_selector_result = None
+        if persist:
+            await self._update_config_value(['exchange_watchlists', mode], deduped)
+            if mode == UPBIT_MODE:
+                await self._update_config_value(['upbit', 'watchlist'], deduped)
+            else:
+                await self._update_config_value(['signal_engine', 'watchlist'], deduped)
+            coin_selector_result = await self._sanitize_coin_selector_universe_for_exchange_mode(
+                mode,
+                markets=markets,
+                persist=True,
+            )
+
+        self._sync_signal_active_symbols(deduped)
+
+        if removed:
+            logger.warning(
+                "Watchlist sanitized for %s (%s). kept=%s removed=%s",
+                mode,
+                reason,
+                deduped,
+                removed,
+            )
+        else:
+            logger.info("Watchlist validated for %s (%s): %s", mode, reason, deduped)
+
+        return {
+            'mode': mode,
+            'watchlist': deduped,
+            'removed': removed,
+            'reason': reason,
+            'coin_selector': coin_selector_result,
+        }
+
+    async def _assert_symbol_tradeable_in_current_exchange_mode(self, symbol):
+        mode = self.get_exchange_mode()
+        markets = await self._load_trade_markets_for_exchange_mode(mode)
+        resolved = self._resolve_watch_symbol_for_exchange_mode(symbol, markets, exchange_mode=mode)
+
+        if mode == UPBIT_MODE:
+            return resolved
+
+        market = self._futures_market_for_symbol(resolved, markets)
+        if not isinstance(market, dict):
+            raise ValueError(f"현재 Binance Futures market에서 찾을 수 없는 심볼입니다: {symbol}")
+        is_tradifi = coin_selector_market_is_tradifi_perpetual(market.get('symbol') or resolved, market)
+        if is_tradifi and mode == BINANCE_TESTNET:
+            raise ValueError(f"Binance Testnet에서는 TradeFi/tokenized stock 심볼을 주문할 수 없습니다: {symbol}")
+        if is_tradifi and mode != BINANCE_MAINNET:
+            raise ValueError(f"TradeFi/tokenized stock은 Binance Futures Mainnet에서만 주문할 수 있습니다: {symbol}")
+        return resolved
+
+    def _format_watchlist_sanitize_result(self, sanitize_result):
+        if not isinstance(sanitize_result, dict):
+            return ""
+        mode = sanitize_result.get('mode') or self.get_exchange_mode()
+        watchlist = sanitize_result.get('watchlist') or []
+        removed = sanitize_result.get('removed') or []
+
+        lines = ["감시목록이 현재 거래소 기준으로 정리되었습니다."]
+        if removed:
+            removed_symbols = [str(item.get('symbol')) for item in removed if isinstance(item, dict)]
+            if removed_symbols:
+                lines.append(f"제거: {', '.join(removed_symbols[:12])}")
+            reasons = []
+            for item in removed:
+                reason = str((item or {}).get('reason') or '').strip()
+                if reason and reason not in reasons:
+                    reasons.append(reason)
+            if reasons:
+                lines.append(f"제거 사유: {'; '.join(reasons[:3])}")
+
+        lines.append(f"현재 감시목록: {', '.join(watchlist)}")
+        if mode == BINANCE_TESTNET:
+            lines.append("TradeFi/tokenized stock 심볼은 테스트넷에서 차단됩니다.")
+        elif mode == BINANCE_MAINNET:
+            lines.append("TradeFi 심볼은 메인넷에서만 허용되며 실제 TRADING market에 있을 때만 사용할 수 있습니다.")
+        elif mode == UPBIT_MODE:
+            lines.append("Upbit 모드는 KRW 현물 마켓만 감시합니다.")
+        return "\n".join(lines)
+
+    def _format_exchange_reinit_result(self, reinit_result):
+        if not isinstance(reinit_result, dict):
+            return f"✅ 거래소 전환 완료: {reinit_result}"
+        mode = reinit_result.get('mode') or self.get_exchange_mode()
+        network_name = reinit_result.get('network_name') or self.get_network_status_label(mode)
+        lines = [f"✅ 거래소 전환 완료: {network_name}", ""]
+        summary = self._format_watchlist_sanitize_result(reinit_result.get('sanitize'))
+        if summary:
+            lines.append(summary)
+        return "\n".join(lines).strip()
 
     def format_symbol_for_display(self, symbol, exchange_mode=None):
         mode = exchange_mode or self.get_exchange_mode()
@@ -24513,7 +24965,15 @@ class MainController:
             self.market_data_source_label = self._get_market_data_source_label(exchange_mode)
 
             # 5. 留덉폆 ?뺣낫 濡쒕뱶
-            await asyncio.to_thread(self.exchange.load_markets)
+            markets = await asyncio.to_thread(self.exchange.load_markets)
+            markets = markets if isinstance(markets, dict) else {}
+
+            sanitize_result = await self._sanitize_watchlist_for_exchange_mode(
+                exchange_mode,
+                markets=markets,
+                persist=True,
+                reason="exchange reinit",
+            )
 
             # 6. ?붿쭊?ㅼ뿉 ??exchange ?꾨떖
             for engine in self.engines.values():
@@ -24523,13 +24983,21 @@ class MainController:
                 engine.position_cache_time = 0
                 engine.all_positions_cache = None
                 engine.all_positions_cache_time = 0
+                if hasattr(engine, 'active_symbols'):
+                    engine.active_symbols = set(sanitize_result.get('watchlist') or [])
+                if hasattr(engine, 'scanner_active_symbol'):
+                    engine.scanner_active_symbol = None
 
             # 7. ?쒖꽦 ?붿쭊 ?ъ떆??
             eng_name = self.cfg.get('system_settings', {}).get('active_engine', CORE_ENGINE)
             await self._switch_engine(eng_name)
 
             logger.info(f"Exchange reinitialized: {network_name}")
-            return True, network_name
+            return True, {
+                'mode': exchange_mode,
+                'network_name': network_name,
+                'sanitize': sanitize_result,
+            }
 
         except Exception as e:
             logger.error(f"Exchange reinit error: {e}")
@@ -25480,7 +25948,9 @@ class MainController:
     async def handle_manual_symbol_input(self, update: Update, symbol: str):
         """Telegram manual symbol input handler."""
         try:
-            symbol = self.normalize_symbol_for_exchange(symbol)
+            mode = self.get_exchange_mode()
+            markets = await self._load_trade_markets_for_exchange_mode(mode)
+            symbol = self._resolve_watch_symbol_for_exchange_mode(symbol, markets, exchange_mode=mode)
 
             # ?щ낵 ?좏슚??寃??(Exchange check)
             # SignalEngine???쒖꽦?붾릺???덉뼱????
@@ -25503,7 +25973,8 @@ class MainController:
 
             display_symbol = self.format_symbol_for_display(symbol)
             if self.is_upbit_mode():
-                await self.cfg.update_value(['upbit', 'watchlist'], [symbol])
+                await self._update_config_value(['upbit', 'watchlist'], [symbol])
+                await self._update_config_value(['exchange_watchlists', UPBIT_MODE], [symbol])
                 signal_engine.active_symbols.clear()
                 signal_engine.active_symbols.add(symbol)
                 self._reset_signal_engine_runtime_state(
@@ -25517,6 +25988,11 @@ class MainController:
             else:
                 # Active Symbols??異붽?
                 if symbol not in signal_engine.active_symbols:
+                    watchlist = self.get_active_watchlist()
+                    if symbol not in watchlist:
+                        watchlist = watchlist + [symbol]
+                        await self._update_config_value(['signal_engine', 'watchlist'], watchlist)
+                        await self._update_config_value(['exchange_watchlists', mode], watchlist)
                     signal_engine.active_symbols.add(symbol)
                     await signal_engine.prime_symbol_to_next_closed_candle(symbol)
                     await update.message.reply_text(f"✅ **{display_symbol}** 감시 시작 (수동 추가)", parse_mode=ParseMode.MARKDOWN)
@@ -26219,7 +26695,7 @@ class MainController:
                     success, result = await self.reinit_exchange(target_mode)
 
                     if success:
-                        await update.message.reply_text(f"✅ 거래소 전환 완료: {result}")
+                        await update.message.reply_text(self._format_exchange_reinit_result(result))
                     else:
                         await update.message.reply_text(f"❌ 거래소 전환 실패: {result}")
 
@@ -26392,30 +26868,36 @@ class MainController:
         """?щ낵 蹂寃?泥섎━ - 1/2/3 ?⑥텞???먮뒗 吏곸젒 ?낅젰"""
         choice = update.message.text.strip().upper()
         setup_choice = context.user_data.get('setup_choice')
-        new_watchlist = self.cfg.get('signal_engine', {}).get('watchlist', ['BTC/USDT'])
+        target_mode = UPBIT_MODE if setup_choice == '43' else self.get_exchange_mode()
+        new_watchlist = self.get_active_watchlist() if target_mode != UPBIT_MODE else []
         if not isinstance(new_watchlist, list):
-            new_watchlist = ['BTC/USDT']
+            new_watchlist = self.get_default_watchlist_for_exchange_mode(target_mode)
         upbit_watchlist = self.cfg.get('upbit', {}).get('watchlist', ['BTC/KRW'])
         if not isinstance(upbit_watchlist, list):
-            upbit_watchlist = ['BTC/KRW']
+            upbit_watchlist = self.get_default_watchlist_for_exchange_mode(UPBIT_MODE)
 
         # 1/2/3 踰덊샇濡??щ낵 留ㅽ븨 (?⑥텞??
         symbol_map = (
             {'1': 'BTC/KRW', '2': 'ETH/KRW', '3': 'SOL/KRW'}
-            if setup_choice == '43' or self.is_upbit_mode()
+            if target_mode == UPBIT_MODE
             else {'1': 'BTC/USDT', '2': 'ETH/USDT', '3': 'SOL/USDT'}
         )
 
         # ?⑥텞???먮뒗 吏곸젒 ?낅젰 ?ъ슜
-        if choice in symbol_map:
-            symbol = symbol_map[choice]
-        else:
-            try:
-                normalize_mode = UPBIT_MODE if setup_choice == '43' else self.get_exchange_mode()
-                symbol = self.normalize_symbol_for_exchange(choice, exchange_mode=normalize_mode)
-            except ValueError as ve:
-                await update.message.reply_text(f"❌ {ve}")
-                return SELECT
+        raw_symbol = symbol_map.get(choice, choice)
+        try:
+            markets = await self._load_trade_markets_for_exchange_mode(target_mode)
+            symbol = self._resolve_watch_symbol_for_exchange_mode(
+                raw_symbol,
+                markets,
+                exchange_mode=target_mode,
+            )
+        except ValueError as ve:
+            await update.message.reply_text(f"❌ {ve}")
+            return SELECT
+        except Exception as exc:
+            await update.message.reply_text(f"❌ market 검증 실패: {exc}")
+            return SELECT
 
         # ?좏슚??寃??(媛꾨떒??Ticker 議고쉶)
         try:
@@ -26426,7 +26908,7 @@ class MainController:
 
         try:
             eng = self.cfg.get('system_settings', {}).get('active_engine', CORE_ENGINE)
-            display_symbol = self.format_symbol_for_display(symbol)
+            display_symbol = self.format_symbol_for_display(symbol, target_mode)
             if eng == 'shannon':
                 await self.cfg.update_value(['shannon_engine', 'target_symbol'], symbol)
             elif eng == 'dualthrust':
@@ -26436,20 +26918,23 @@ class MainController:
             elif eng == 'tema':
                 await self.cfg.update_value(['tema_engine', 'target_symbol'], symbol)
             elif setup_choice == '43':
-                await self.cfg.update_value(['upbit', 'watchlist'], [symbol])
+                await self._update_config_value(['upbit', 'watchlist'], [symbol])
+                await self._update_config_value(['exchange_watchlists', UPBIT_MODE], [symbol])
                 upbit_watchlist = [symbol]
                 await update.message.reply_text(f"✅ 업비트 코인 변경: {display_symbol}")
             else:
                 if setup_choice == '38':
                     if symbol not in new_watchlist:
                         new_watchlist = new_watchlist + [symbol]
-                        await self.cfg.update_value(['signal_engine', 'watchlist'], new_watchlist)
+                        await self._update_config_value(['signal_engine', 'watchlist'], new_watchlist)
+                        await self._update_config_value(['exchange_watchlists', target_mode], new_watchlist)
                         await update.message.reply_text(f"✅ 감시 심볼 추가: {display_symbol}")
                     else:
                         await update.message.reply_text(f"ℹ️ 이미 감시 목록에 있습니다: {display_symbol}")
                 else:
                     # Signal ?붿쭊: 硫붾돱?먯꽌 蹂寃???Watchlist瑜??대떦 ?щ낵濡?**?泥?* (湲곗〈 ?숈옉 ?좎?)
-                    await self.cfg.update_value(['signal_engine', 'watchlist'], [symbol])
+                    await self._update_config_value(['signal_engine', 'watchlist'], [symbol])
+                    await self._update_config_value(['exchange_watchlists', target_mode], [symbol])
                     new_watchlist = [symbol]
                     await update.message.reply_text("ℹ️ Signal 엔진 감시 목록이 해당 심볼로 초기화되었습니다.")
 
@@ -26875,12 +27360,21 @@ class MainController:
             return "⛔ UTBreak OFF. 자동 코인선택/scanner/Set AUTO/Adaptive TF/Micro Auto를 끄고 매매를 PAUSE 상태로 전환했습니다. 기존 포지션 강제청산은 /stop 입니다."
 
         async def _set_strategy_coin(symbol_text):
-            symbol = self.normalize_symbol_for_exchange(symbol_text)
+            mode = self.get_exchange_mode()
+            if mode == UPBIT_MODE:
+                raise ValueError("Upbit 모드에서는 Binance Futures 전략 코인을 설정할 수 없습니다.")
+            markets = await asyncio.to_thread(self.exchange.load_markets)
+            symbol = self._resolve_futures_watch_symbol_from_markets(
+                symbol_text,
+                markets,
+                exchange_mode=mode,
+            )
             try:
                 await asyncio.to_thread(self.exchange.fetch_ticker, symbol)
             except Exception:
                 raise ValueError(f"유효하지 않은 심볼입니다: {symbol}")
             await self.cfg.update_value(['signal_engine', 'watchlist'], [symbol])
+            await self._update_config_value(['exchange_watchlists', mode], [symbol])
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], False)
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
@@ -27697,16 +28191,23 @@ AUTO 최근 선택 이유:
             return profile_cfg
 
         async def _resolve_utbreak_direct_watchlist(symbols, *, max_symbols=5):
+            mode = self.get_exchange_mode()
+            if mode == UPBIT_MODE:
+                raise ValueError("Upbit 모드에서는 UTBreakout Futures watchlist를 사용할 수 없습니다. 업비트 코인 변경 메뉴를 사용하세요.")
             normalized = normalize_coin_selector_custom_symbols(symbols)
             if not normalized:
                 raise ValueError("감시할 코인을 1개 이상 입력하세요. 예: `/utbreak watch BTC ETH AAPL`")
             if len(normalized) > max_symbols:
                 raise ValueError(f"감시 목록은 최대 {max_symbols}개까지만 가능합니다.")
-            markets = await asyncio.to_thread(self.market_data_exchange.load_markets)
+            markets = await asyncio.to_thread(self.exchange.load_markets)
             resolved = []
             seen = set()
             for raw_symbol in normalized:
-                symbol = self._resolve_futures_watch_symbol_from_markets(raw_symbol, markets)
+                symbol = self._resolve_futures_watch_symbol_from_markets(
+                    raw_symbol,
+                    markets,
+                    exchange_mode=mode,
+                )
                 key = self._futures_symbol_key(symbol)
                 if key and key not in seen:
                     resolved.append(symbol)
@@ -27719,6 +28220,7 @@ AUTO 최근 선택 이유:
             watch_symbols = await _resolve_utbreak_direct_watchlist(symbols)
             await _ensure_signal_engine_active()
             await self.cfg.update_value(['signal_engine', 'watchlist'], watch_symbols)
+            await self._update_config_value(['exchange_watchlists', self.get_exchange_mode()], watch_symbols)
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol'], '')
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_symbols'], watch_symbols)
@@ -28645,24 +29147,44 @@ AUTO 최근 선택 이유:
                 await message.reply_text(f"CoinSelector 리포트 다운로드 실패: {e}")
 
         async def _apply_coinscan_watchlist(message, report=None):
+            mode = self.get_exchange_mode()
+            if mode == UPBIT_MODE:
+                await message.reply_text("❌ CoinSelector apply는 Binance Futures 모드에서만 사용할 수 있습니다.")
+                return
             report = report or await _run_coinscan(force=False)
             selected = [
                 item for item in report.get('selected', [])
                 if item.get('selection_state') == 'SELECTED'
             ]
-            symbols = []
+            raw_symbols = []
             for item in selected:
                 symbol = item.get('normalized_symbol') or str(item.get('exchange_symbol') or '').replace(':USDT', '')
-                if symbol and symbol not in symbols:
-                    symbols.append(symbol)
-            if not symbols:
+                if symbol and symbol not in raw_symbols:
+                    raw_symbols.append(symbol)
+            if not raw_symbols:
                 await message.reply_text("❌ 적용할 CoinSelector 후보가 없습니다. `/coinscan top`으로 먼저 확인하세요.", parse_mode=ParseMode.MARKDOWN)
                 return
+            markets = await asyncio.to_thread(self.exchange.load_markets)
+            symbols, removed = self._filter_futures_symbols_for_exchange_mode(
+                raw_symbols,
+                markets,
+                exchange_mode=mode,
+            )
+            if not symbols:
+                await message.reply_text("❌ 현재 거래소 모드에 적용 가능한 CoinSelector 후보가 없습니다.")
+                return
             await self.cfg.update_value(['signal_engine', 'watchlist'], symbols)
+            await self._update_config_value(['exchange_watchlists', mode], symbols)
             engine = self.engines.get('signal')
             if engine:
                 engine.active_symbols = set(symbols)
-            await message.reply_text(f"✅ CoinSelector 후보를 watchlist에 적용했습니다: {', '.join(symbols)}")
+                engine.scanner_active_symbol = None
+            suffix = ""
+            if removed:
+                suffix = "\n제외: " + ", ".join(
+                    f"{item.get('symbol')}({item.get('reason')})" for item in removed[:5]
+                )
+            await message.reply_text(f"✅ CoinSelector 후보를 watchlist에 적용했습니다: {', '.join(symbols)}{suffix}")
 
         def _format_coinscan_menu_text():
             cfg = _coinscan_cfg()
@@ -28971,8 +29493,29 @@ AUTO 최근 선택 이유:
             normalized = normalize_coin_selector_custom_symbols(symbols)
             if not normalized:
                 return False, "❌ 코인을 입력하세요. 예: `BTC ETH SOL`"
+            if self.get_exchange_mode() == UPBIT_MODE:
+                return False, "❌ CustomCoins는 Binance Futures 모드에서만 사용할 수 있습니다."
+            markets = await asyncio.to_thread(self.exchange.load_markets)
+            resolved_symbols = []
+            removed_symbols = []
+            seen = set()
+            for raw_symbol in normalized:
+                try:
+                    resolved = self._resolve_futures_watch_symbol_from_markets(
+                        raw_symbol,
+                        markets,
+                        exchange_mode=self.get_exchange_mode(),
+                    )
+                    key = self._futures_symbol_key(resolved)
+                    if key and key not in seen:
+                        resolved_symbols.append(resolved)
+                        seen.add(key)
+                except Exception as exc:
+                    removed_symbols.append(f"{raw_symbol}({exc})")
+            if not resolved_symbols:
+                return False, "❌ 현재 거래소 모드에서 사용할 수 있는 CustomCoins 심볼이 없습니다."
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
-            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_symbols'], normalized)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_symbols'], resolved_symbols)
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_relax_discovery'], True)
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], True)
@@ -28983,7 +29526,10 @@ AUTO 최근 선택 이유:
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], True)
             _clear_coin_selector_runtime_cache()
             self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
-            return True, f"✅ CustomCoins AUTO ON: {', '.join(normalized)}"
+            notice = f"✅ CustomCoins AUTO ON: {', '.join(resolved_symbols)}"
+            if removed_symbols:
+                notice += "\n제외: " + ", ".join(removed_symbols[:5])
+            return True, notice
 
         async def _enable_coin_auto_selection():
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
@@ -29050,6 +29596,7 @@ AUTO 최근 선택 이유:
                     await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_previous_watchlist'], list(current_watchlist))
 
             await self.cfg.update_value(['signal_engine', 'watchlist'], [symbol])
+            await self._update_config_value(['exchange_watchlists', self.get_exchange_mode()], [symbol])
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_symbols'], [symbol])
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol'], symbol)
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], True)
@@ -29083,6 +29630,7 @@ AUTO 최근 선택 이유:
             previous_watchlist = self.cfg.get('signal_engine', {}).get('coin_selector', {}).get('fixed_symbol_previous_watchlist')
             if isinstance(previous_watchlist, list) and previous_watchlist:
                 await self.cfg.update_value(['signal_engine', 'watchlist'], list(previous_watchlist))
+                await self._update_config_value(['exchange_watchlists', self.get_exchange_mode()], list(previous_watchlist))
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol'], '')
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)

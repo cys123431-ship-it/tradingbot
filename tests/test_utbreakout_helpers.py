@@ -401,6 +401,44 @@ def _market(**overrides):
     return base
 
 
+def _upbit_market(symbol):
+    base, quote = symbol.split("/", 1)
+    return {
+        "symbol": symbol,
+        "id": f"{quote}-{base}",
+        "base": base,
+        "quote": quote,
+        "spot": True,
+        "active": True,
+        "type": "spot",
+        "info": {"market": f"{quote}-{base}"},
+    }
+
+
+class _FakeMarketExchange:
+    def __init__(self, markets):
+        self.markets = markets
+
+    def load_markets(self):
+        return self.markets
+
+    def fetch_ticker(self, symbol):
+        return {
+            "symbol": symbol,
+            "quoteVolume": 1_000_000_000,
+            "percentage": 0.5,
+            "count": 100_000,
+            "bid": 100.0,
+            "ask": 100.01,
+        }
+
+
+class _FakeSignalRuntime:
+    def __init__(self):
+        self.active_symbols = set()
+        self.scanner_active_symbol = "QQQ/USDT"
+
+
 def test_coin_selector_market_lookup_prefers_futures_over_spot():
     signal_engine = _signal_engine_cls()
     engine = signal_engine.__new__(signal_engine)
@@ -469,6 +507,212 @@ def test_controller_blocks_tradifi_watch_symbol_on_testnet():
         controller._resolve_futures_watch_symbol_from_markets("AAPL", markets)
 
 
+def test_reinit_to_testnet_sanitizes_tradifi_watchlist():
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+    cfg = _MemoryConfig()
+    cfg.values.update({
+        "api": {"exchange_mode": emas.BINANCE_MAINNET, "use_testnet": False},
+        "signal_engine": {
+            "watchlist": ["QQQ/USDT", "SPY/USDT", "BTC/USDT"],
+            "coin_selector": {
+                "custom_symbols": ["QQQ/USDT", "BTC/USDT"],
+                "include_tradifi_universe": True,
+            },
+        },
+        "upbit": {"watchlist": ["BTC/KRW"]},
+    })
+    controller.cfg = cfg
+    engine = _FakeSignalRuntime()
+    engine.active_symbols = {"QQQ/USDT", "SPY/USDT"}
+    controller.engines = {"signal": engine}
+    markets = {
+        "BTC/USDT:USDT": _market(symbol="BTC/USDT:USDT"),
+        "ETH/USDT:USDT": _market(symbol="ETH/USDT:USDT"),
+        "SOL/USDT:USDT": _market(symbol="SOL/USDT:USDT"),
+        "QQQ/USDT:USDT": _market(
+            symbol="QQQ/USDT:USDT",
+            info={"contractType": "TRADIFI_PERPETUAL", "status": "TRADING"},
+        ),
+        "SPY/USDT:USDT": _market(
+            symbol="SPY/USDT:USDT",
+            info={"contractType": "TRADIFI_PERPETUAL", "status": "TRADING"},
+        ),
+    }
+
+    result = asyncio.run(controller._sanitize_watchlist_for_exchange_mode(
+        emas.BINANCE_TESTNET,
+        markets=markets,
+        persist=True,
+        reason="test",
+    ))
+
+    assert "BTC/USDT" in result["watchlist"]
+    assert all("QQQ" not in s and "SPY" not in s for s in result["watchlist"])
+    assert cfg.values["signal_engine"]["coin_selector"]["include_tradifi_universe"] is False
+    assert cfg.values["signal_engine"]["coin_selector"]["custom_symbols"] == ["BTC/USDT"]
+    assert cfg.values["exchange_watchlists"][emas.BINANCE_TESTNET] == result["watchlist"]
+    assert engine.active_symbols == set(result["watchlist"])
+    assert engine.scanner_active_symbol is None
+
+
+def test_mainnet_allows_tradifi_if_market_exists():
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+    controller.cfg = {"api": {"exchange_mode": emas.BINANCE_MAINNET, "use_testnet": False}}
+    markets = {
+        "QQQ/USDT:USDT": _market(
+            symbol="QQQ/USDT:USDT",
+            info={"contractType": "TRADIFI_PERPETUAL", "status": "TRADING"},
+        ),
+    }
+
+    symbol = controller._resolve_futures_watch_symbol_from_markets(
+        "QQQ",
+        markets,
+        exchange_mode=emas.BINANCE_MAINNET,
+    )
+
+    assert symbol == "QQQ/USDT:USDT"
+
+
+def test_testnet_blocks_tradifi_even_if_market_object_exists():
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+    controller.cfg = {"api": {"exchange_mode": emas.BINANCE_TESTNET, "use_testnet": True}}
+    markets = {
+        "QQQ/USDT:USDT": _market(
+            symbol="QQQ/USDT:USDT",
+            info={"contractType": "TRADIFI_PERPETUAL", "status": "TRADING"},
+        ),
+    }
+
+    with pytest.raises(ValueError):
+        controller._resolve_futures_watch_symbol_from_markets(
+            "QQQ",
+            markets,
+            exchange_mode=emas.BINANCE_TESTNET,
+        )
+
+
+def test_upbit_mode_replaces_usdt_watchlist_with_krw_defaults():
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+    cfg = _MemoryConfig()
+    cfg.values.update({
+        "api": {"exchange_mode": emas.UPBIT_MODE, "use_testnet": False},
+        "signal_engine": {
+            "watchlist": ["BTC/USDT", "ETH/USDT"],
+            "coin_selector": {"custom_symbols": ["BTC/USDT"]},
+        },
+        "upbit": {"watchlist": []},
+    })
+    controller.cfg = cfg
+    controller.engines = {}
+    markets = {
+        "BTC/KRW": _upbit_market("BTC/KRW"),
+        "ETH/KRW": _upbit_market("ETH/KRW"),
+        "SOL/KRW": _upbit_market("SOL/KRW"),
+    }
+
+    result = asyncio.run(controller._sanitize_watchlist_for_exchange_mode(
+        emas.UPBIT_MODE,
+        markets=markets,
+        persist=True,
+    ))
+
+    assert result["watchlist"] == ["BTC/KRW", "ETH/KRW", "SOL/KRW"]
+    assert all(symbol.endswith("/KRW") for symbol in result["watchlist"])
+    assert cfg.values["upbit"]["watchlist"] == result["watchlist"]
+    assert cfg.values["exchange_watchlists"][emas.UPBIT_MODE] == result["watchlist"]
+    assert cfg.values["signal_engine"]["coin_selector"]["enabled"] is False
+
+
+def test_active_symbols_sync_after_exchange_sanitize():
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+    cfg = _MemoryConfig()
+    cfg.values.update({
+        "api": {"exchange_mode": emas.BINANCE_TESTNET, "use_testnet": True},
+        "signal_engine": {
+            "watchlist": ["QQQ/USDT", "BTC/USDT"],
+            "coin_selector": {},
+        },
+    })
+    controller.cfg = cfg
+    engine = _FakeSignalRuntime()
+    engine.active_symbols = {"QQQ/USDT", "SPY/USDT"}
+    controller.engines = {"signal": engine}
+    markets = {
+        "BTC/USDT:USDT": _market(symbol="BTC/USDT:USDT"),
+        "QQQ/USDT:USDT": _market(
+            symbol="QQQ/USDT:USDT",
+            info={"contractType": "TRADIFI_PERPETUAL", "status": "TRADING"},
+        ),
+    }
+
+    result = asyncio.run(controller._sanitize_watchlist_for_exchange_mode(
+        emas.BINANCE_TESTNET,
+        markets=markets,
+        persist=True,
+    ))
+
+    assert engine.active_symbols == set(result["watchlist"])
+    assert "QQQ/USDT" not in engine.active_symbols
+
+
+def test_order_preflight_blocks_testnet_tradifi():
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+    controller.cfg = {"api": {"exchange_mode": emas.BINANCE_TESTNET, "use_testnet": True}}
+    controller.exchange = _FakeMarketExchange({
+        "QQQ/USDT:USDT": _market(
+            symbol="QQQ/USDT:USDT",
+            info={"contractType": "TRADIFI_PERPETUAL", "status": "TRADING"},
+        ),
+    })
+
+    with pytest.raises(ValueError):
+        asyncio.run(controller._assert_symbol_tradeable_in_current_exchange_mode("QQQ/USDT"))
+
+
+def test_coinscan_apply_filters_symbols_by_exchange_mode():
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+    controller.cfg = {"api": {"exchange_mode": emas.BINANCE_TESTNET, "use_testnet": True}}
+    markets = {
+        "BTC/USDT:USDT": _market(symbol="BTC/USDT:USDT"),
+        "QQQ/USDT:USDT": _market(
+            symbol="QQQ/USDT:USDT",
+            info={"contractType": "TRADIFI_PERPETUAL", "status": "TRADING"},
+        ),
+    }
+
+    valid, removed = controller._filter_futures_symbols_for_exchange_mode(
+        ["BTC/USDT", "QQQ/USDT"],
+        markets,
+        exchange_mode=emas.BINANCE_TESTNET,
+    )
+
+    assert valid == ["BTC/USDT"]
+    assert [item["symbol"] for item in removed] == ["QQQ/USDT"]
+
+
+def test_get_active_watchlist_uses_mode_specific_storage():
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+    controller.cfg = {
+        "api": {"exchange_mode": emas.BINANCE_TESTNET, "use_testnet": True},
+        "exchange_watchlists": {
+            emas.BINANCE_MAINNET: ["QQQ/USDT:USDT"],
+            emas.BINANCE_TESTNET: ["BTC/USDT", "ETH/USDT"],
+        },
+        "signal_engine": {"watchlist": ["QQQ/USDT:USDT"]},
+    }
+
+    assert controller.get_active_watchlist() == ["BTC/USDT", "ETH/USDT"]
+
+
 def test_coin_selector_tradifi_universe_only_auto_on_binance_mainnet():
     emas = _emas_module()
     signal_engine = _signal_engine_cls()
@@ -490,6 +734,54 @@ def test_coin_selector_tradifi_universe_only_auto_on_binance_mainnet():
 
     engine.ctrl = TestnetCtrl()
     assert engine._coin_selector_should_include_tradifi_universe(cfg, custom_enabled=False) is False
+
+
+def test_coin_selector_custom_universe_blocks_testnet_tradifi_symbols():
+    emas = _emas_module()
+    signal_engine = _signal_engine_cls()
+    controller = emas.MainController.__new__(emas.MainController)
+    controller.cfg = {"api": {"exchange_mode": emas.BINANCE_TESTNET, "use_testnet": True}}
+    validation_markets = {
+        "BTC/USDT:USDT": _market(symbol="BTC/USDT:USDT"),
+        "QQQ/USDT:USDT": _market(
+            symbol="QQQ/USDT:USDT",
+            info={"contractType": "TRADIFI_PERPETUAL", "status": "TRADING"},
+        ),
+    }
+
+    engine = signal_engine.__new__(signal_engine)
+    engine.ctrl = controller
+    engine.exchange = _FakeMarketExchange(validation_markets)
+    engine.market_data_exchange = _FakeMarketExchange(validation_markets)
+    engine.coin_selector_last_result = {}
+    engine.coin_selector_symbol_scores = {}
+    engine.coin_selector_last_run_ts = 0
+    engine.is_upbit_mode = lambda: False
+    engine.get_runtime_trade_config = lambda: {
+        "coin_selector": {
+            "enabled": True,
+            "custom_universe_enabled": True,
+            "custom_symbols": ["BTC/USDT", "QQQ/USDT"],
+            "custom_relax_discovery": True,
+            "top_n": 5,
+        }
+    }
+    engine.get_runtime_strategy_params = lambda: {}
+
+    async def _score_candidate(base_candidate, cfg, strategy_params, selector_context=None):
+        scored = dict(base_candidate)
+        scored["accepted"] = True
+        scored["score"] = 80.0
+        scored["selection_state"] = "SELECTED"
+        return scored
+
+    engine._score_coin_selector_candidate = _score_candidate
+
+    report = asyncio.run(engine.evaluate_coin_selector(force=True))
+
+    selected_symbols = [item.get("normalized_symbol") for item in report["selected"]]
+    assert selected_symbols == ["BTC/USDT"]
+    assert report["reject_counts"]["REJECTED_EXCHANGE_MODE_SYMBOL"] == 1
 
 
 def test_coin_selector_candidate_cooldown_counts_unique_decision_keys():
@@ -731,12 +1023,16 @@ def test_utbreakout_position_scan_context_shows_position_and_next_candidate():
 class _MemoryConfig:
     def __init__(self):
         self.values = {}
+        self.config = self.values
 
     async def update_value(self, path, value):
         node = self.values
         for key in path[:-1]:
             node = node.setdefault(key, {})
         node[path[-1]] = value
+
+    def get(self, key, default=None):
+        return self.values.get(key, default)
 
 
 class _TelegramConfig:
