@@ -38,7 +38,7 @@ except ImportError:
     DUAL_MODE_AVAILABLE = False
     logging.warning("?좑툘 dual_mode_fractal_strategy.py ?뚯씪???놁뒿?덈떎. ?대떦 ?꾨왂???ъ슜?섎젮硫??뚯씪??蹂듦뎄?섏꽭??")
 
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TimedOut, RetryAfter
 from telegram.ext import (
@@ -23111,6 +23111,9 @@ class MainController:
         self.last_alt_trend_scan_summary = {}
         self.utbreakout_futures_context_cache = {}
         self.utbreakout_orderflow_snapshots = {}
+        self.exchange_switch_lock = asyncio.Lock()
+        self.last_exchange_switch_ts = 0.0
+        self.exchange_switch_cooldown_seconds = 30
 
     def _telegram_reporting_cfg(self):
         return self.cfg.get('telegram', {}).get('reporting', {}) or {}
@@ -24934,74 +24937,150 @@ class MainController:
         return self._get_current_symbol()
 
     async def reinit_exchange(self, target_mode):
-        """거래소 연결 재초기화."""
-        try:
-            if isinstance(target_mode, bool):
-                exchange_mode = BINANCE_TESTNET if target_mode else BINANCE_MAINNET
-            else:
-                exchange_mode = str(target_mode or '').lower()
-            if exchange_mode not in SUPPORTED_EXCHANGE_MODES:
-                return False, f"지원하지 않는 거래모드: {target_mode}"
+        """거래소 연결 재초기화. 중복 전환 방지 + 실패 시 이전 상태 롤백."""
+        if not hasattr(self, 'exchange_switch_lock') or self.exchange_switch_lock is None:
+            self.exchange_switch_lock = asyncio.Lock()
 
-            # 1. ?꾩옱 ?붿쭊 ?뺤?
-            if self.active_engine:
-                self.active_engine.stop()
-                logger.info("??Engine stopped for exchange reinit")
+        if self.exchange_switch_lock.locked():
+            return False, "이미 거래소/네트워크 전환 중입니다. 완료될 때까지 기다려주세요."
 
-            # 2. ?ㅼ젙 ?낅뜲?댄듃
-            await self.cfg.update_value(['api', 'exchange_mode'], exchange_mode)
-            await self.cfg.update_value(['api', 'use_testnet'], exchange_mode == BINANCE_TESTNET)
+        async with self.exchange_switch_lock:
+            try:
+                if isinstance(target_mode, bool):
+                    exchange_mode = BINANCE_TESTNET if target_mode else BINANCE_MAINNET
+                else:
+                    exchange_mode = str(target_mode or '').lower()
 
-            # 3. ??API ?먭꺽利앸챸 濡쒕뱶
-            self.exchange_mode = exchange_mode
-            creds = self._get_exchange_credentials(exchange_mode)
+                if exchange_mode not in SUPPORTED_EXCHANGE_MODES:
+                    return False, f"지원하지 않는 거래모드: {target_mode}"
 
-            # 4. 嫄곕옒???ъ큹湲고솕
-            market_data_mode = self._get_market_data_exchange_mode(exchange_mode)
-            self.exchange = self._build_exchange(creds, exchange_mode)
-            network_name = self._configure_exchange_network(self.exchange, exchange_mode)
-            self.market_data_exchange = self._build_public_market_data_exchange(market_data_mode)
-            self._configure_exchange_network(self.market_data_exchange, market_data_mode)
-            self.market_data_source_label = self._get_market_data_source_label(exchange_mode)
+                cooldown = float(getattr(self, 'exchange_switch_cooldown_seconds', 30) or 30)
+                now = time.time()
+                last_ts = float(getattr(self, 'last_exchange_switch_ts', 0.0) or 0.0)
+                if last_ts and (now - last_ts) < cooldown:
+                    remain = int(max(1, cooldown - (now - last_ts)))
+                    return False, f"거래소 전환은 너무 자주 실행할 수 없습니다. {remain}초 후 다시 시도하세요."
 
-            # 5. 留덉폆 ?뺣낫 濡쒕뱶
-            markets = await asyncio.to_thread(self.exchange.load_markets)
-            markets = markets if isinstance(markets, dict) else {}
+                self.last_exchange_switch_ts = now
 
-            sanitize_result = await self._sanitize_watchlist_for_exchange_mode(
-                exchange_mode,
-                markets=markets,
-                persist=True,
-                reason="exchange reinit",
-            )
+                old_mode = self.get_exchange_mode()
+                old_use_testnet = bool(self.cfg.get('api', {}).get('use_testnet', old_mode == BINANCE_TESTNET))
+                old_exchange_mode_attr = getattr(self, 'exchange_mode', old_mode)
+                old_exchange = getattr(self, 'exchange', None)
+                old_market_data_exchange = getattr(self, 'market_data_exchange', None)
+                old_market_data_source_label = getattr(self, 'market_data_source_label', None)
+                old_active_engine = getattr(self, 'active_engine', None)
+                old_status_data = dict(getattr(self, 'status_data', {}) or {})
 
-            # 6. ?붿쭊?ㅼ뿉 ??exchange ?꾨떖
-            for engine in self.engines.values():
-                engine.exchange = self.exchange
-                engine.market_data_exchange = self.market_data_exchange
-                engine.position_cache = None
-                engine.position_cache_time = 0
-                engine.all_positions_cache = None
-                engine.all_positions_cache_time = 0
-                if hasattr(engine, 'active_symbols'):
-                    engine.active_symbols = set(sanitize_result.get('watchlist') or [])
-                if hasattr(engine, 'scanner_active_symbol'):
-                    engine.scanner_active_symbol = None
+                old_engine_state = {}
+                for key, engine in (getattr(self, 'engines', {}) or {}).items():
+                    state = {
+                        'exchange': getattr(engine, 'exchange', None),
+                        'market_data_exchange': getattr(engine, 'market_data_exchange', None),
+                        'position_cache': getattr(engine, 'position_cache', None),
+                        'position_cache_time': getattr(engine, 'position_cache_time', 0),
+                        'all_positions_cache': getattr(engine, 'all_positions_cache', None),
+                        'all_positions_cache_time': getattr(engine, 'all_positions_cache_time', 0),
+                    }
+                    if hasattr(engine, 'active_symbols'):
+                        state['active_symbols'] = set(getattr(engine, 'active_symbols') or set())
+                    if hasattr(engine, 'scanner_active_symbol'):
+                        state['scanner_active_symbol'] = getattr(engine, 'scanner_active_symbol', None)
+                    old_engine_state[key] = state
 
-            # 7. ?쒖꽦 ?붿쭊 ?ъ떆??
-            eng_name = self.cfg.get('system_settings', {}).get('active_engine', CORE_ENGINE)
-            await self._switch_engine(eng_name)
+                try:
+                    if self.active_engine:
+                        self.active_engine.stop()
+                        logger.info("Engine stopped for exchange reinit")
 
-            logger.info(f"Exchange reinitialized: {network_name}")
-            return True, {
-                'mode': exchange_mode,
-                'network_name': network_name,
-                'sanitize': sanitize_result,
-            }
+                    await self.cfg.update_value(['api', 'exchange_mode'], exchange_mode)
+                    await self.cfg.update_value(['api', 'use_testnet'], exchange_mode == BINANCE_TESTNET)
 
-        except Exception as e:
-            logger.error(f"Exchange reinit error: {e}")
-            return False, str(e)
+                    self.exchange_mode = exchange_mode
+                    creds = self._get_exchange_credentials(exchange_mode)
+
+                    market_data_mode = self._get_market_data_exchange_mode(exchange_mode)
+                    self.exchange = self._build_exchange(creds, exchange_mode)
+                    network_name = self._configure_exchange_network(self.exchange, exchange_mode)
+                    self.market_data_exchange = self._build_public_market_data_exchange(market_data_mode)
+                    self._configure_exchange_network(self.market_data_exchange, market_data_mode)
+                    self.market_data_source_label = self._get_market_data_source_label(exchange_mode)
+
+                    markets = await asyncio.to_thread(self.exchange.load_markets)
+                    markets = markets if isinstance(markets, dict) else {}
+
+                    sanitize_result = await self._sanitize_watchlist_for_exchange_mode(
+                        exchange_mode,
+                        markets=markets,
+                        persist=True,
+                        reason="exchange reinit",
+                    )
+
+                    for engine in self.engines.values():
+                        engine.exchange = self.exchange
+                        engine.market_data_exchange = self.market_data_exchange
+                        engine.position_cache = None
+                        engine.position_cache_time = 0
+                        engine.all_positions_cache = None
+                        engine.all_positions_cache_time = 0
+                        if hasattr(engine, 'active_symbols'):
+                            engine.active_symbols = set(sanitize_result.get('watchlist') or [])
+                        if hasattr(engine, 'scanner_active_symbol'):
+                            engine.scanner_active_symbol = None
+
+                    eng_name = self.cfg.get('system_settings', {}).get('active_engine', CORE_ENGINE)
+                    await self._switch_engine(eng_name)
+
+                    logger.info(f"Exchange reinitialized: {network_name}")
+                    return True, {
+                        'mode': exchange_mode,
+                        'network_name': network_name,
+                        'sanitize': sanitize_result,
+                    }
+
+                except Exception as e:
+                    logger.exception(f"Exchange reinit failed, rolling back to previous mode: {e}")
+
+                    try:
+                        await self.cfg.update_value(['api', 'exchange_mode'], old_mode)
+                        await self.cfg.update_value(['api', 'use_testnet'], old_use_testnet)
+                    except Exception as cfg_rollback_error:
+                        logger.error(f"Exchange reinit config rollback failed: {cfg_rollback_error}")
+
+                    self.exchange_mode = old_exchange_mode_attr
+                    self.exchange = old_exchange
+                    self.market_data_exchange = old_market_data_exchange
+                    self.market_data_source_label = old_market_data_source_label
+                    self.active_engine = old_active_engine
+                    self.status_data = old_status_data
+
+                    for key, state in old_engine_state.items():
+                        engine = self.engines.get(key)
+                        if not engine:
+                            continue
+                        engine.exchange = state.get('exchange')
+                        engine.market_data_exchange = state.get('market_data_exchange')
+                        engine.position_cache = state.get('position_cache')
+                        engine.position_cache_time = state.get('position_cache_time', 0)
+                        engine.all_positions_cache = state.get('all_positions_cache')
+                        engine.all_positions_cache_time = state.get('all_positions_cache_time', 0)
+                        if hasattr(engine, 'active_symbols') and 'active_symbols' in state:
+                            engine.active_symbols = set(state.get('active_symbols') or set())
+                        if hasattr(engine, 'scanner_active_symbol') and 'scanner_active_symbol' in state:
+                            engine.scanner_active_symbol = state.get('scanner_active_symbol')
+
+                    try:
+                        if self.active_engine and not getattr(self.active_engine, 'running', False):
+                            self.active_engine.start()
+                            logger.info("Previous engine restarted after exchange reinit rollback")
+                    except Exception as engine_rollback_error:
+                        logger.error(f"Previous engine restart after rollback failed: {engine_rollback_error}")
+
+                    return False, f"{e} (이전 거래소 설정으로 롤백했습니다)"
+
+            except Exception as outer_error:
+                logger.exception(f"Exchange reinit outer error: {outer_error}")
+                return False, str(outer_error)
 
     # ---------------- UI: emergency controls ----------------
     async def global_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -25726,12 +25805,28 @@ class MainController:
                 await update.message.reply_text(f"❌ 설정 메뉴 표시 실패: {e}")
             return ConversationHandler.END
 
+    async def setup_network_entry(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Conversation 상태가 끊겨도 거래소/네트워크 전환 버튼을 바로 처리한다."""
+        if not await self._require_authorized_telegram_update(update):
+            return ConversationHandler.END
+
+        context.user_data['setup_choice'] = '22'
+        await update.message.reply_text(
+            "📝 **거래소/네트워크 선택**\n"
+            "1=바이낸스 테스트넷\n"
+            "2=바이낸스 메인넷\n"
+            "3=업비트 KRW 현물",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=self._build_setup_network_keyboard()
+        )
+        return INPUT
+
     async def setup_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw_text = update.message.text.strip()
         text = self._normalize_setup_choice_text(raw_text)
 
         if text == '0':
-            await update.message.reply_text("✅ 설정 종료")
+            await update.message.reply_text("✅ 설정 종료", reply_markup=ReplyKeyboardRemove())
             await self._restore_main_keyboard(update)
             return ConversationHandler.END
 
@@ -26669,7 +26764,7 @@ class MainController:
                 }
                 network_choice = self._normalize_setup_network_choice(val)
                 if network_choice in {'0', '나가기', '종료', '취소', 'cancel', 'exit', 'quit'}:
-                    await update.message.reply_text("✅ 설정 종료")
+                    await update.message.reply_text("✅ 설정 종료", reply_markup=ReplyKeyboardRemove())
                     await self._restore_main_keyboard(update)
                     return ConversationHandler.END
                 if network_choice not in mode_map:
@@ -26689,12 +26784,11 @@ class MainController:
                     target_name = self.get_network_status_label(target_mode)
                     await update.message.reply_text(f"🔄 {target_name}으로 전환 중...")
 
-                    if target_mode == UPBIT_MODE:
-                        await self.cfg.update_value(['system_settings', 'trade_direction'], 'long')
-
                     success, result = await self.reinit_exchange(target_mode)
 
                     if success:
+                        if target_mode == UPBIT_MODE:
+                            await self.cfg.update_value(['system_settings', 'trade_direction'], 'long')
                         await update.message.reply_text(self._format_exchange_reinit_result(result))
                     else:
                         await update.message.reply_text(f"❌ 거래소 전환 실패: {result}")
@@ -30938,11 +31032,17 @@ AUTO 최근 선택 이유:
 
         setup_command_handler = CommandHandler('setup', owner_only(self.setup_entry))
         setup_text_handler = MessageHandler(filters.Regex(setup_trigger_pattern), owner_only(self.setup_entry))
+        setup_network_direct_pattern = r"^(거래소/네트워크 전환|거래소 네트워크 전환|거래소 전환|네트워크 전환|22)$"
+        setup_network_direct_handler = MessageHandler(
+            filters.Regex(setup_network_direct_pattern),
+            owner_only(self.setup_network_entry)
+        )
 
         conv = ConversationHandler(
             entry_points=[
                 setup_command_handler,
-                setup_text_handler
+                setup_text_handler,
+                setup_network_direct_handler
             ],
             allow_reentry=True,
             states={
@@ -30955,6 +31055,7 @@ AUTO 최근 선택 이유:
             fallbacks=[
                 setup_command_handler,
                 setup_text_handler,
+                setup_network_direct_handler,
                 emergency_handler
             ]
         )
