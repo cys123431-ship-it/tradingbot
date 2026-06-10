@@ -1,0 +1,119 @@
+name: Deploy KStockBot
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "kstockbot/**"
+      - ".github/workflows/deploy-kstockbot.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Pack kstockbot
+        run: |
+          tar \
+            --exclude='kstockbot/.env' \
+            --exclude='kstockbot/.venv' \
+            --exclude='kstockbot/.pytest_cache' \
+            --exclude='kstockbot/**/__pycache__' \
+            --exclude='kstockbot/logs/*.log' \
+            --exclude='kstockbot/runtime/*.json' \
+            --exclude='kstockbot/runtime/*.pid' \
+            -czf kstockbot.tar.gz kstockbot
+
+      - name: Upload package to Azure VM
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.AZURE_VM_HOST }}
+          username: ${{ secrets.AZURE_VM_USER }}
+          key: ${{ secrets.AZURE_VM_SSH_KEY }}
+          source: "kstockbot.tar.gz"
+          target: "/home/azureuser"
+
+      - name: Deploy on Azure VM
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          KSTOCK_ENV_FILE: ${{ secrets.KSTOCK_ENV_FILE }}
+        with:
+          host: ${{ secrets.AZURE_VM_HOST }}
+          username: ${{ secrets.AZURE_VM_USER }}
+          key: ${{ secrets.AZURE_VM_SSH_KEY }}
+          envs: KSTOCK_ENV_FILE
+          script: |
+            set -e
+
+            cd /home/azureuser
+
+            echo "== Prepare kstockbot directory =="
+            mkdir -p /home/azureuser/kstockbot
+
+            echo "== Extract package =="
+            tar -xzf /home/azureuser/kstockbot.tar.gz -C /home/azureuser
+
+            cd /home/azureuser/kstockbot
+
+            echo "== Write .env from GitHub Secret =="
+            printf "%s" "$KSTOCK_ENV_FILE" > .env
+            chmod 600 .env
+
+            echo "== Create runtime directories =="
+            mkdir -p runtime logs
+
+            echo "== Create Python venv =="
+            python3 -m venv .venv
+
+            echo "== Install dependencies =="
+            .venv/bin/python -m pip install --upgrade pip
+            .venv/bin/python -m pip install -r requirements.txt
+            .venv/bin/python -m pip check || true
+
+            echo "== Compile check =="
+            .venv/bin/python -m py_compile app/*.py
+
+            echo "== Pytest =="
+            PYTHONPATH=/home/azureuser .venv/bin/python -m pytest -q
+
+            echo "== Make scripts executable =="
+            chmod +x scripts/kstock_ctl.sh
+            chmod +x scripts/install_service.sh || true
+            chmod +x scripts/doctor.sh || true
+            chmod +x scripts/webhook_smoke.sh || true
+
+            echo "== Restart KStockBot =="
+            if systemctl list-unit-files | grep -q '^kstockbot.service'; then
+              sudo systemctl restart kstockbot.service
+              sleep 5
+              sudo systemctl status kstockbot.service --no-pager || true
+            else
+              scripts/kstock_ctl.sh restart
+              sleep 5
+              scripts/kstock_ctl.sh status || true
+            fi
+
+            echo "== Load non-secret runtime port =="
+            set -a
+            source .env
+            set +a
+            KSTOCK_PORT="${KSTOCK_PORT:-8090}"
+
+            echo "== Health checks =="
+            curl -fsS "http://127.0.0.1:${KSTOCK_PORT}/health"
+            echo
+            curl -fsS "http://127.0.0.1:${KSTOCK_PORT}/status"
+            echo
+
+            echo "== Local script health =="
+            ./scripts/kstock_ctl.sh health || true
+
+            echo "== Doctor diagnostics =="
+            ./scripts/doctor.sh || true
+
+            echo "== Recent logs =="
+            tail -80 logs/kstockbot.log || true
