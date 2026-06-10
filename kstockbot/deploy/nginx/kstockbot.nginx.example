@@ -1,0 +1,52 @@
+server {
+    listen 80;
+    server_name your-domain.com;
+
+    # For production, redirect HTTP to HTTPS after TLS is configured.
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name your-domain.com;
+
+    # Replace with your real cert paths.
+    ssl_certificate /etc/letsencrypt/live/your-domain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/your-domain.com/privkey.pem;
+
+    client_max_body_size 1m;
+
+    location /health {
+        proxy_pass http://127.0.0.1:8090/health;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 5s;
+        proxy_connect_timeout 3s;
+    }
+
+    location /status {
+        proxy_pass http://127.0.0.1:8090/status;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 5s;
+        proxy_connect_timeout 3s;
+    }
+
+    location /webhook/tradingview {
+        # TradingView requires webhooks to respond within 3 seconds.
+        # Keep proxy timeouts at 3s to match TradingView constraints.
+        # If KSTOCK_WEBHOOK_FAST_ACK=false, backend processing may exceed 3s
+        # and cause Nginx to return a 504 Gateway Timeout to TradingView.
+        # It is highly recommended to keep KSTOCK_WEBHOOK_FAST_ACK=true.
+        proxy_pass http://127.0.0.1:8090/webhook/tradingview;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 3s;
+        proxy_connect_timeout 3s;
+    }
+}

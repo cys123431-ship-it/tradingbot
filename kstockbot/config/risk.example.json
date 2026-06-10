@@ -1,0 +1,19 @@
+{
+  "max_daily_buy_amount": 1000000,
+  "max_order_amount": 500000,
+  "max_position_amount_per_symbol": 500000,
+  "max_positions": 5,
+  "max_orders_per_day": 3,
+  "max_orders_per_symbol_per_day": 1,
+  "cooldown_minutes_per_symbol": 60,
+  "no_buy_after_time": "15:10",
+  "no_buy_before_time": "09:10",
+  "daily_loss_limit": 50000,
+  "monthly_loss_limit": 200000,
+  "allow_market_order": false,
+  "allow_live_trading": false,
+  "manual_approval_required": true,
+  "allow_sell_when_emergency_stop": false,
+  "default_order_amount": 100000,
+  "max_order_attempts_per_day": 10
+}

@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+
+logs/*.log
+runtime/*.json
+runtime/*.pid
+
+!logs/.gitkeep
+!runtime/.gitkeep
+
+config/watchlist.json
+config/risk.json
