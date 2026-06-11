@@ -17,7 +17,9 @@ def apply_telegram_status_patch(telegram_bot):
         from .universe import universe
         from .order_manager import order_manager
         from .webhook_events import last_event_summary
+        from .telegram_mock_commands import apply_mock_commands
 
+        apply_mock_commands(self)
         mem = psutil.virtual_memory()
         last_webhook = last_event_summary()
 
@@ -65,4 +67,11 @@ def apply_telegram_status_patch(telegram_bot):
         await update.message.reply_text(status_text, parse_mode="HTML")
 
     telegram_bot.cmd_status = MethodType(cmd_status, telegram_bot)
+
+    try:
+        from .telegram_mock_commands import apply_mock_commands
+        apply_mock_commands(telegram_bot)
+    except Exception:
+        pass
+
     return telegram_bot
