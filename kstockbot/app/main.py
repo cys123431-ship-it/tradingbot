@@ -10,6 +10,7 @@ from apscheduler.triggers.cron import CronTrigger
 from .settings import Settings
 from .logger import get_logger
 from .telegram_bot import telegram_bot
+from .telegram_status_patch import apply_telegram_status_patch
 from .tradingview_webhook import TradingViewPayload, webhook_processor
 from .risk_manager import risk_manager
 from .order_manager import order_manager
@@ -19,6 +20,7 @@ from .webhook_events import create_event, update_event, last_event_summary
 logger = get_logger("main")
 scheduler = AsyncIOScheduler(timezone=Settings.TIMEZONE)
 webhook_background_semaphore = asyncio.Semaphore(Settings.WEBHOOK_BACKGROUND_MAX_CONCURRENCY)
+apply_telegram_status_patch(telegram_bot)
 
 async def scheduled_token_refresh():
     logger.info("Running scheduled KIS token refresh...")
