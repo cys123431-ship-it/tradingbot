@@ -1,7 +1,9 @@
 from pathlib import Path
+import os
 import runpy
 import sys
 ROOT = Path(__file__).resolve().parents[1]
+os.chdir(ROOT)
 sys.path.insert(0, str(ROOT))
 import global_single_position_guard
 global_single_position_guard.install()
