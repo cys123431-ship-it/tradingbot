@@ -7,8 +7,9 @@ choose one execution timeframe, not as extra AND filters on the live entry.
 from math import isfinite
 
 
-TIMEFRAME_ORDER = ["15m", "30m", "1h", "2h", "4h"]
+TIMEFRAME_ORDER = ["5m", "15m", "30m", "1h", "2h", "4h"]
 TIMEFRAME_MS = {
+    "5m": 5 * 60 * 1000,
     "15m": 15 * 60 * 1000,
     "30m": 30 * 60 * 1000,
     "1h": 60 * 60 * 1000,
@@ -16,6 +17,7 @@ TIMEFRAME_MS = {
     "4h": 4 * 60 * 60 * 1000,
 }
 HTF_MAP = {
+    "5m": "15m",
     "15m": "1h",
     "30m": "2h",
     "1h": "4h",
@@ -72,18 +74,21 @@ def _ema_distance_pct(metrics):
 def _timeframe_profile_bias(tf, trend_quality, volatility_fit, noise_penalty, signal_quality):
     """Nudge scores toward practical execution horizons."""
     tf = str(tf)
-    high_noise = noise_penalty >= 55.0
-    clean_fast = trend_quality >= 58.0 and volatility_fit >= 55.0 and noise_penalty <= 45.0
+    high_noise = noise_penalty >= 60.0
+    clean_fast = trend_quality >= 52.0 and volatility_fit >= 50.0 and noise_penalty <= 50.0
+
+    if tf == "5m":
+        return 12.0 if clean_fast else -4.0 if high_noise else 4.0
     if tf == "15m":
-        return 7.0 if clean_fast else -10.0 if high_noise else -2.0
+        return 10.0 if clean_fast else -6.0 if high_noise else 2.0
     if tf == "30m":
-        return 6.0 if clean_fast or high_noise else 2.0
+        return 5.0 if clean_fast or high_noise else 1.0
     if tf == "1h":
-        return 8.0 if high_noise or trend_quality >= 62.0 else 0.0
+        return 3.0 if high_noise or trend_quality >= 68.0 else -2.0
     if tf == "2h":
-        return 6.0 if trend_quality >= 65.0 and signal_quality >= 45.0 else -3.0
+        return 3.0 if trend_quality >= 72.0 and signal_quality >= 50.0 else -6.0
     if tf == "4h":
-        return 7.0 if trend_quality >= 72.0 and signal_quality >= 55.0 else -12.0
+        return 4.0 if trend_quality >= 78.0 and signal_quality >= 60.0 else -14.0
     return 0.0
 
 
@@ -207,9 +212,9 @@ def select_adaptive_timeframe(timeframe_metrics, cfg=None, state=None, position_
     allowed = cfg.get("adaptive_timeframes") or cfg.get("auto_timeframes") or TIMEFRAME_ORDER
     allowed = [str(tf).strip().lower() for tf in allowed if str(tf).strip()]
     allowed = [tf for tf in allowed if tf in TIMEFRAME_MS] or list(TIMEFRAME_ORDER)
-    min_score = finite_float(cfg.get("adaptive_timeframe_min_score"), 45.0)
-    switch_margin = finite_float(cfg.get("adaptive_timeframe_switch_margin"), 8.0)
-    min_hold_candles = int(max(0.0, finite_float(cfg.get("adaptive_timeframe_min_hold_candles"), 3.0)))
+    min_score = finite_float(cfg.get("adaptive_timeframe_min_score"), 35.0)
+    switch_margin = finite_float(cfg.get("adaptive_timeframe_switch_margin"), 4.0)
+    min_hold_candles = int(max(0.0, finite_float(cfg.get("adaptive_timeframe_min_hold_candles"), 1.0)))
 
     candidates = [
         score_timeframe(tf, (timeframe_metrics or {}).get(tf), cfg)

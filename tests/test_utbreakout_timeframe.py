@@ -63,7 +63,14 @@ def test_adaptive_timeframe_returns_no_trade_in_chop():
 def test_adaptive_timeframe_hysteresis_keeps_previous_tf():
     metrics = {
         "15m": _metrics(timestamp=1_800_000, adx=27.0, chop=44.0),
-        "30m": _metrics(timestamp=1_800_000, adx=29.0, chop=43.0),
+        "30m": _metrics(
+            timestamp=1_800_000,
+            adx=38.0,
+            chop=35.0,
+            volume_ratio=1.8,
+            donchian_width_pct=1.5,
+            range_expansion_ratio=1.6
+        ),
     }
     state = {"selected_tf": "15m", "last_switch_ts": 1_000_000}
 

@@ -13,7 +13,79 @@ import time
 log = logging.getLogger("one_position_guard")
 
 
-OPPORTUNITY_PROFILE_NAME = "utbreak_opportunity_v1"
+OPPORTUNITY_PROFILE_NAME = "utbreak_opportunity_v2"
+
+OPPORTUNITY_OVERRIDES = {
+    # faster execution TF
+    "selection_mode": "auto",
+    "auto_select_enabled": True,
+    "adaptive_timeframe_enabled": True,
+    "auto_timeframes": ["5m", "15m", "30m", "1h"],
+    "adaptive_timeframes": ["5m", "15m", "30m", "1h"],
+    "entry_timeframe": "5m",
+    "exit_timeframe": "15m",
+    "htf_timeframe": "1h",
+
+    # adaptive TF should not stay on 1h/4h too stubbornly
+    "adaptive_timeframe_min_score": 30.0,
+    "adaptive_timeframe_switch_margin": 3.0,
+    "adaptive_timeframe_min_hold_candles": 1,
+
+    # reduce excessive hard blocks
+    "trend_health_hard_block_below": 25.0,
+    "trend_health_reduce_below": 42.0,
+    "trend_health_min_multiplier": 0.35,
+
+    "strategy_quality_hard_block_below": 8.0,
+    "strategy_quality_reduce_below": 42.0,
+    "strategy_quality_min_multiplier": 0.35,
+
+    "quality_score_v2_block_below": 30.0,
+    "quality_score_v2_reduce_below": 50.0,
+
+    "quality_score_v2_long_block_below": 30.0,
+    "quality_score_v2_long_reduce_below": 50.0,
+    "quality_score_v2_long_15m_block_below": 35.0,
+    "quality_score_v2_long_15m_reduce_below": 55.0,
+
+    "quality_score_v2_short_block_below": 35.0,
+    "quality_score_v2_short_reduce_below": 58.0,
+    "quality_score_v2_short_15m_block_below": 40.0,
+    "quality_score_v2_short_15m_reduce_below": 60.0,
+
+    # critical: selected SHORT should not be blocked only by 0.75 volume ratio
+    "bias_continuation_min_volume_ratio": 0.50,
+    "bias_continuation_15m_min_volume_ratio": 0.55,
+    "bias_continuation_min_adaptive_tf_score": 30.0,
+    "bias_continuation_15m_min_adaptive_tf_score": 35.0,
+    "bias_continuation_min_adx": 14.0,
+    "bias_continuation_15m_min_adx": 15.0,
+    "bias_continuation_max_extension_atr": 2.20,
+    "bias_continuation_15m_max_extension_atr": 2.00,
+
+    # shorts remain slightly conservative but no longer inactive
+    "short_adx_threshold": 20.0,
+    "short_dmi_min_gap": 2.0,
+    "short_risk_multiplier": 0.60,
+
+    # let winners run farther
+    "partial_take_profit_r_multiple": 1.20,
+    "partial_take_profit_ratio": 0.35,
+    "second_take_profit_r_multiple": 2.80,
+    "second_take_profit_ratio": 0.35,
+    "dynamic_tp2_base_r_multiple": 2.40,
+    "dynamic_tp2_strong_r_multiple": 3.20,
+    "dynamic_tp2_elite_r_multiple": 4.20,
+    "atr_trailing_activation_r": 1.10,
+    "atr_trailing_multiplier": 2.60,
+    "runner_exit_enabled": True,
+    "runner_chandelier_enabled": True,
+    "runner_chandelier_multiplier": 3.00,
+
+    # bounded trade frequency
+    "max_daily_trades": 10,
+    "max_consecutive_losses": 4,
+}
 
 
 def key(symbol):
@@ -99,8 +171,7 @@ def apply_opportunity_tuning(engine):
     strongest breakout by relaxing selector/filter thresholds and opening the
     runner side of exits, while retaining global one-position protection.
     """
-    if getattr(engine, "_utbreak_opportunity_tuning_applied", False):
-        return False
+
 
     root = _config_root(engine)
     if not isinstance(root, dict):
@@ -150,66 +221,10 @@ def apply_opportunity_tuning(engine):
         selector["excluded_sectors"] = [item for item in excluded if item != "meme"]
         changed = True
 
-    # Adaptive strategy: prefer faster discovery, lower blocks, and let winners run more.
-    ut_updates = {
-        "selection_mode": "auto",
-        "auto_select_enabled": True,
-        "adaptive_timeframe_enabled": True,
-        "auto_timeframes": ["5m", "15m", "30m"],
-        "adaptive_timeframes": ["5m", "15m", "30m"],
-        "entry_timeframe": "5m",
-        "exit_timeframe": "15m",
-        "htf_timeframe": "1h",
-        "adaptive_timeframe_min_score": 35.0,
-        "adaptive_timeframe_switch_margin": 4.0,
-        "adaptive_timeframe_min_hold_candles": 1,
-        "trend_health_hard_block_below": 32.0,
-        "trend_health_reduce_below": 47.0,
-        "trend_health_full_score": 68.0,
-        "trend_health_min_multiplier": 0.45,
-        "strategy_quality_hard_block_below": 22.0,
-        "strategy_quality_reduce_below": 50.0,
-        "strategy_quality_full_score": 70.0,
-        "strategy_quality_min_multiplier": 0.45,
-        "quality_score_v2_block_below": 52.0,
-        "quality_score_v2_reduce_below": 62.0,
-        "quality_score_v2_15m_block_below": 55.0,
-        "quality_score_v2_15m_reduce_below": 65.0,
-        "quality_score_v2_long_block_below": 44.0,
-        "quality_score_v2_long_reduce_below": 54.0,
-        "quality_score_v2_long_15m_block_below": 47.0,
-        "quality_score_v2_long_15m_reduce_below": 57.0,
-        "quality_score_v2_short_block_below": 62.0,
-        "quality_score_v2_short_reduce_below": 72.0,
-        "quality_score_v2_short_15m_block_below": 64.0,
-        "quality_score_v2_short_15m_reduce_below": 74.0,
-        "bias_continuation_min_adx": 15.0,
-        "bias_continuation_15m_min_adx": 17.0,
-        "bias_continuation_min_volume_ratio": 0.65,
-        "bias_continuation_15m_min_volume_ratio": 0.70,
-        "bias_continuation_min_adaptive_tf_score": 35.0,
-        "bias_continuation_15m_min_adaptive_tf_score": 42.0,
-        "partial_take_profit_r_multiple": 1.25,
-        "partial_take_profit_ratio": 0.35,
-        "second_take_profit_r_multiple": 2.40,
-        "second_take_profit_ratio": 0.35,
-        "dynamic_tp2_strong_score": 68.0,
-        "dynamic_tp2_elite_score": 78.0,
-        "dynamic_tp2_base_r_multiple": 2.20,
-        "dynamic_tp2_strong_r_multiple": 3.00,
-        "dynamic_tp2_elite_r_multiple": 4.00,
-        "atr_trailing_activation_r": 1.20,
-        "atr_trailing_multiplier": 2.40,
-        "runner_chandelier_multiplier": 2.80,
-        "short_adx_threshold": 22.0,
-        "short_dmi_min_gap": 3.0,
-        "max_daily_trades": 8,
-        "max_consecutive_losses": 4,
-    }
-    for k, v in ut_updates.items():
+    # Adaptive strategy: use OPPORTUNITY_OVERRIDES for faster discovery,
+    # lower blocks, and let winners run more.
+    for k, v in OPPORTUNITY_OVERRIDES.items():
         changed |= _set_if_different(ut, k, v)
-
-    setattr(engine, "_utbreak_opportunity_tuning_applied", True)
     if changed:
         log.warning("UTBreak opportunity profile applied: %s", OPPORTUNITY_PROFILE_NAME)
     return changed
@@ -221,8 +236,27 @@ def patch_signal_engine(cls):
 
     original_entry = getattr(cls, "entry", None)
     original_start = getattr(cls, "start", None)
+    original_get_cfg = getattr(cls, "_get_utbot_filtered_breakout_config", None)
+
     if original_entry is None or original_start is None:
         return False
+
+    def tuned_get_utbreak_cfg(self, strategy_params=None):
+        try:
+            apply_opportunity_tuning(self)
+        except Exception as exc:
+            log.error("UTBreak opportunity tuning failed before cfg: %s", exc)
+
+        if original_get_cfg is None:
+            cfg = strategy_params or {}
+        else:
+            cfg = original_get_cfg(self, strategy_params)
+
+        if isinstance(cfg, dict):
+            for k, v in OPPORTUNITY_OVERRIDES.items():
+                cfg[k] = v
+
+        return cfg
 
     def tuned_start(self, *args, **kwargs):
         try:
@@ -267,6 +301,9 @@ def patch_signal_engine(cls):
                 await notify(self, f"⚠️ 진입 차단: 포지션 확인 실패 ({exc})")
                 return None
             return await original_entry(self, symbol, side, price, *args, **kwargs)
+
+    if original_get_cfg is not None:
+        cls._get_utbot_filtered_breakout_config = tuned_get_utbreak_cfg
 
     cls.start = tuned_start
     cls.entry = guarded_entry

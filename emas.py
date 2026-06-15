@@ -480,7 +480,7 @@ BINANCE_FAPI_PUBLIC_BASE_URL = 'https://fapi.binance.com'
 UTBREAKOUT_ACTIVE_SET_MAX = 63
 UTBREAKOUT_DEFAULT_SET_ID = 2
 UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID = 22
-UTBREAKOUT_AUTO_TIMEFRAMES = ['15m', '30m', '1h', '2h', '4h']
+UTBREAKOUT_AUTO_TIMEFRAMES = ['5m', '15m', '30m', '1h']
 
 
 def _build_utbreakout_set(
@@ -525,7 +525,7 @@ def build_utbreakout_set_registry():
         'partial_take_profit_r_multiple': 1.5,
         'partial_take_profit_ratio': 0.5,
         'second_take_profit_enabled': True,
-        'second_take_profit_r_multiple': 2.0,
+        'second_take_profit_r_multiple': 2.8,
         'second_take_profit_ratio': 0.5,
         'enable_tp2_fallback_close': False,
         'tp2_fallback_confirm_loops': 2,
@@ -548,8 +548,8 @@ def build_utbreakout_set_registry():
         'bias_continuation_15m_max_signal_age_candles': 3,
         'bias_continuation_min_adx': 18.0,
         'bias_continuation_15m_min_adx': 20.0,
-        'bias_continuation_min_volume_ratio': 0.75,
-        'bias_continuation_15m_min_volume_ratio': 0.80,
+        'bias_continuation_min_volume_ratio': 0.50,
+        'bias_continuation_15m_min_volume_ratio': 0.55,
         'bias_continuation_max_extension_atr': 1.60,
         'bias_continuation_15m_max_extension_atr': 1.50,
         'bias_continuation_min_adaptive_tf_score': 42.0,
@@ -561,11 +561,11 @@ def build_utbreakout_set_registry():
         'quality_score_v2_min_risk_multiplier': 0.50,
         'quality_score_v2_15m_block_below': 62.0,
         'quality_score_v2_15m_reduce_below': 72.0,
-        'quality_score_v2_long_block_below': 50.0,
+        'quality_score_v2_long_block_below': 30.0,
         'quality_score_v2_long_reduce_below': 60.0,
         'quality_score_v2_long_15m_block_below': 50.0,
         'quality_score_v2_long_15m_reduce_below': 60.0,
-        'quality_score_v2_short_block_below': 68.0,
+        'quality_score_v2_short_block_below': 35.0,
         'quality_score_v2_short_reduce_below': 78.0,
         'quality_score_v2_short_15m_block_below': 70.0,
         'quality_score_v2_short_15m_reduce_below': 80.0,
@@ -644,12 +644,12 @@ def build_utbreakout_set_registry():
         'trend_health_enabled': True,
         'trend_health_directional_lookback': 12,
         'trend_health_volatility_long_length': 50,
-        'trend_health_hard_block_below': 40.0,
+        'trend_health_hard_block_below': 25.0,
         'trend_health_reduce_below': 55.0,
         'trend_health_full_score': 75.0,
         'trend_health_min_multiplier': 0.35,
         'strategy_quality_enabled': True,
-        'strategy_quality_hard_block_below': 28.0,
+        'strategy_quality_hard_block_below': 8.0,
         'strategy_quality_reduce_below': 58.0,
         'strategy_quality_full_score': 78.0,
         'strategy_quality_min_multiplier': 0.35,
@@ -5023,7 +5023,7 @@ class SignalEngine(BaseEngine):
             'adaptive_timeframe_switch_margin': 8.0,
             'partial_take_profit_r_multiple': 1.5,
             'partial_take_profit_ratio': 0.5,
-            'second_take_profit_r_multiple': 2.0,
+            'second_take_profit_r_multiple': 2.8,
             'second_take_profit_ratio': 0.5,
             'atr_trailing_multiplier': 2.0,
             'atr_trailing_activation_r': 1.5,
@@ -5040,11 +5040,11 @@ class SignalEngine(BaseEngine):
             'runner_chandelier_multiplier_max': 3.2,
             'runner_mfe_tighten_r': 3.0,
             'runner_mfe_tighten_delta': 0.20,
-            'trend_health_hard_block_below': 40.0,
+            'trend_health_hard_block_below': 25.0,
             'trend_health_reduce_below': 55.0,
             'trend_health_full_score': 75.0,
             'trend_health_min_multiplier': 0.35,
-            'strategy_quality_hard_block_below': 28.0,
+            'strategy_quality_hard_block_below': 8.0,
             'strategy_quality_reduce_below': 58.0,
             'strategy_quality_full_score': 78.0,
             'strategy_quality_min_multiplier': 0.35,
@@ -5070,8 +5070,8 @@ class SignalEngine(BaseEngine):
             'bias_continuation_15m_risk_multiplier': 0.50,
             'bias_continuation_min_adx': 18.0,
             'bias_continuation_15m_min_adx': 20.0,
-            'bias_continuation_min_volume_ratio': 0.75,
-            'bias_continuation_15m_min_volume_ratio': 0.80,
+            'bias_continuation_min_volume_ratio': 0.50,
+            'bias_continuation_15m_min_volume_ratio': 0.55,
             'bias_continuation_max_extension_atr': 1.60,
             'bias_continuation_15m_max_extension_atr': 1.50,
             'bias_continuation_min_adaptive_tf_score': 42.0,
@@ -5082,11 +5082,11 @@ class SignalEngine(BaseEngine):
             'quality_score_v2_min_risk_multiplier': 0.50,
             'quality_score_v2_15m_block_below': 62.0,
             'quality_score_v2_15m_reduce_below': 72.0,
-            'quality_score_v2_long_block_below': 50.0,
+            'quality_score_v2_long_block_below': 30.0,
             'quality_score_v2_long_reduce_below': 60.0,
             'quality_score_v2_long_15m_block_below': 50.0,
             'quality_score_v2_long_15m_reduce_below': 60.0,
-            'quality_score_v2_short_block_below': 68.0,
+            'quality_score_v2_short_block_below': 35.0,
             'quality_score_v2_short_reduce_below': 78.0,
             'quality_score_v2_short_15m_block_below': 70.0,
             'quality_score_v2_short_15m_reduce_below': 80.0,
@@ -5296,6 +5296,47 @@ class SignalEngine(BaseEngine):
         cfg['opposite_signal_exit_enabled'] = False
         if cfg['atr_max_percent'] < cfg['atr_min_percent']:
             cfg['atr_max_percent'] = cfg['atr_min_percent']
+        # --- UTBreak opportunity override: force-apply after all Set params ---
+        if isinstance(cfg, dict):
+            cfg.update({
+                "auto_timeframes": ["5m", "15m", "30m", "1h"],
+                "adaptive_timeframes": ["5m", "15m", "30m", "1h"],
+                "entry_timeframe": "5m",
+                "exit_timeframe": "15m",
+                "htf_timeframe": "1h",
+
+                "adaptive_timeframe_min_score": 30.0,
+                "adaptive_timeframe_switch_margin": 3.0,
+                "adaptive_timeframe_min_hold_candles": 1,
+
+                "bias_continuation_min_volume_ratio": 0.50,
+                "bias_continuation_15m_min_volume_ratio": 0.55,
+                "bias_continuation_min_adaptive_tf_score": 30.0,
+                "bias_continuation_15m_min_adaptive_tf_score": 35.0,
+                "bias_continuation_min_adx": 14.0,
+                "bias_continuation_15m_min_adx": 15.0,
+
+                "trend_health_hard_block_below": 25.0,
+                "trend_health_reduce_below": 42.0,
+                "strategy_quality_hard_block_below": 8.0,
+                "strategy_quality_reduce_below": 42.0,
+
+                "quality_score_v2_block_below": 30.0,
+                "quality_score_v2_reduce_below": 50.0,
+                "quality_score_v2_long_block_below": 30.0,
+                "quality_score_v2_long_reduce_below": 50.0,
+                "quality_score_v2_short_block_below": 35.0,
+                "quality_score_v2_short_reduce_below": 58.0,
+                "quality_score_v2_short_15m_block_below": 40.0,
+                "quality_score_v2_short_15m_reduce_below": 60.0,
+
+                "second_take_profit_r_multiple": 2.80,
+                "dynamic_tp2_base_r_multiple": 2.40,
+                "dynamic_tp2_strong_r_multiple": 3.20,
+                "dynamic_tp2_elite_r_multiple": 4.20,
+                "atr_trailing_activation_r": 1.10,
+                "atr_trailing_multiplier": 2.60,
+            })
         return cfg
 
     def _get_utbot_filtered_breakout_ut_params(self, cfg):
