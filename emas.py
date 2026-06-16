@@ -480,7 +480,7 @@ BINANCE_FAPI_PUBLIC_BASE_URL = 'https://fapi.binance.com'
 UTBREAKOUT_ACTIVE_SET_MAX = 63
 UTBREAKOUT_DEFAULT_SET_ID = 2
 UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID = 22
-UTBREAKOUT_AUTO_TIMEFRAMES = ['5m', '15m', '30m', '1h']
+UTBREAKOUT_AUTO_TIMEFRAMES = ["15m", "30m", "1h"]
 
 
 def _build_utbreakout_set(
@@ -5299,43 +5299,48 @@ class SignalEngine(BaseEngine):
         # --- UTBreak opportunity override: force-apply after all Set params ---
         if isinstance(cfg, dict):
             cfg.update({
-                "auto_timeframes": ["5m", "15m", "30m", "1h"],
-                "adaptive_timeframes": ["5m", "15m", "30m", "1h"],
-                "entry_timeframe": "5m",
+                "auto_timeframes": ["15m", "30m", "1h"],
+                "adaptive_timeframes": ["15m", "30m", "1h"],
+                "entry_timeframe": "15m",
                 "exit_timeframe": "15m",
                 "htf_timeframe": "1h",
 
-                "adaptive_timeframe_min_score": 30.0,
-                "adaptive_timeframe_switch_margin": 3.0,
-                "adaptive_timeframe_min_hold_candles": 1,
+                "adaptive_timeframe_min_score": 38.0,
+                "adaptive_timeframe_switch_margin": 10.0,
+                "adaptive_timeframe_min_hold_candles": 6,
 
                 "bias_continuation_min_volume_ratio": 0.50,
                 "bias_continuation_15m_min_volume_ratio": 0.55,
-                "bias_continuation_min_adaptive_tf_score": 30.0,
-                "bias_continuation_15m_min_adaptive_tf_score": 35.0,
+                "bias_continuation_min_adaptive_tf_score": 35.0,
+                "bias_continuation_15m_min_adaptive_tf_score": 38.0,
                 "bias_continuation_min_adx": 14.0,
                 "bias_continuation_15m_min_adx": 15.0,
 
                 "trend_health_hard_block_below": 25.0,
                 "trend_health_reduce_below": 42.0,
-                "strategy_quality_hard_block_below": 8.0,
+                "strategy_quality_hard_block_below": 12.0,
                 "strategy_quality_reduce_below": 42.0,
 
                 "quality_score_v2_block_below": 30.0,
                 "quality_score_v2_reduce_below": 50.0,
                 "quality_score_v2_long_block_below": 30.0,
                 "quality_score_v2_long_reduce_below": 50.0,
-                "quality_score_v2_short_block_below": 35.0,
-                "quality_score_v2_short_reduce_below": 58.0,
-                "quality_score_v2_short_15m_block_below": 40.0,
-                "quality_score_v2_short_15m_reduce_below": 60.0,
+                "quality_score_v2_short_block_below": 40.0,
+                "quality_score_v2_short_reduce_below": 60.0,
+                "quality_score_v2_short_15m_block_below": 42.0,
+                "quality_score_v2_short_15m_reduce_below": 62.0,
 
-                "second_take_profit_r_multiple": 2.80,
-                "dynamic_tp2_base_r_multiple": 2.40,
-                "dynamic_tp2_strong_r_multiple": 3.20,
-                "dynamic_tp2_elite_r_multiple": 4.20,
-                "atr_trailing_activation_r": 1.10,
-                "atr_trailing_multiplier": 2.60,
+                "short_adx_threshold": 20.0,
+                "short_dmi_min_gap": 2.0,
+                "short_risk_multiplier": 0.60,
+
+                "partial_take_profit_r_multiple": 1.20,
+                "second_take_profit_r_multiple": 2.50,
+                "dynamic_tp2_base_r_multiple": 2.30,
+                "dynamic_tp2_strong_r_multiple": 3.00,
+                "dynamic_tp2_elite_r_multiple": 4.00,
+                "atr_trailing_activation_r": 1.20,
+                "atr_trailing_multiplier": 2.50,
             })
         return cfg
 
@@ -7881,8 +7886,10 @@ class SignalEngine(BaseEngine):
                 reasons.append('volume ratio missing')
             else:
                 positives.append('volume neutral')
+        elif volume_ratio < 0.35:
+            reasons.append(f"volume ratio extremely weak {volume_ratio:.2f}<0.35")
         elif volume_ratio < min_volume:
-            reasons.append(f"volume ratio {volume_ratio:.2f}<{min_volume:.2f}")
+            pass
         else:
             positives.append(f"volume ratio {volume_ratio:.2f}>={min_volume:.2f}")
 
@@ -8617,6 +8624,31 @@ class SignalEngine(BaseEngine):
         selected_stats['scope'] = selected_scope
         cache[cache_key] = {'cached_at': now, 'stats': selected_stats}
         return dict(selected_stats)
+
+    def _build_direction_metrics_dict(self, ohlcv_data) -> dict:
+        if not ohlcv_data or len(ohlcv_data) < 50:
+            return {}
+        import pandas as pd
+        df = pd.DataFrame(ohlcv_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df.dropna(subset=['close']).reset_index(drop=True)
+        if len(df) < 50:
+            return {}
+        close_series = df['close'].astype(float)
+        ema20 = close_series.ewm(span=20, adjust=False).mean()
+        ema50 = close_series.ewm(span=50, adjust=False).mean()
+        
+        ema50_last = float(ema50.iloc[-1])
+        ema50_prev = float(ema50.iloc[-2]) if len(ema50) > 1 else ema50_last
+        ema_slope = (ema50_last - ema50_prev) / max(ema50_prev, 1e-9) * 100.0
+        
+        return {
+            "close": float(close_series.iloc[-1]),
+            "ema20": float(ema20.iloc[-1]),
+            "ema50": float(ema50.iloc[-1]),
+            "ema_slope": ema_slope,
+        }
 
     def _build_utbreakout_strategy_adaptation(self, symbol, side, cfg, selected_set, filter_values):
         stats = self._get_utbreakout_shadow_stats(symbol, side, cfg, selected_set)
@@ -9473,6 +9505,46 @@ class SignalEngine(BaseEngine):
         status['dynamic_take_profit'] = dynamic_tp2
         status['dynamic_take_profit_summary'] = dynamic_tp2.get('summary')
         status['dynamic_tp2_r_multiple'] = dynamic_tp2.get('second_take_profit_r_multiple')
+
+        # 4-layer direction decision overlay
+        dir_decision = None
+        try:
+            from utbreakout.direction_filter import decide_direction
+            
+            # Fetch BTC/USDT 4h & 1d OHLCV data
+            btc_4h_raw = await self.fetch_ohlcv_async('BTC/USDT', '4h', limit=60)
+            btc_1d_raw = await self.fetch_ohlcv_async('BTC/USDT', '1d', limit=60)
+            
+            # Fetch Symbol 1h OHLCV data
+            sym_1h_raw = await self.fetch_ohlcv_async(symbol, '1h', limit=60)
+            
+            btc_4h = self._build_direction_metrics_dict(btc_4h_raw)
+            btc_1d = self._build_direction_metrics_dict(btc_1d_raw)
+            sym_1h = self._build_direction_metrics_dict(sym_1h_raw)
+            
+            dir_decision = decide_direction(
+                side=side,
+                btc_4h=btc_4h,
+                btc_1d=btc_1d,
+                sym_1h=sym_1h,
+                cfg=cfg
+            )
+            status['direction_decision'] = {
+                "allowed": dir_decision.allowed,
+                "size_multiplier": dir_decision.size_multiplier,
+                "reasons": dir_decision.reasons,
+            }
+            if not dir_decision.allowed:
+                return _finish(
+                    None,
+                    f"REJECTED_DIRECTION_FILTER: {', '.join(dir_decision.reasons)}",
+                    'REJECTED_DIRECTION_FILTER',
+                    record_failure=True,
+                    side=side
+                )
+        except Exception as exc:
+            log.error("decide_direction overlay failed: %s", exc)
+
         if fixed_take_profit:
             status['adaptive_exit_summary'] = (
                 f"fixed TP ladder {float(cfg.get('partial_take_profit_ratio', 0.5) or 0.5):.0%}@"
@@ -9495,26 +9567,33 @@ class SignalEngine(BaseEngine):
             if fixed_take_profit else
             exit_overlay.get('summary')
         )
-        if trend_health.get('state') is False:
+
+        # --- Relaxed Hard Block Conditions ---
+        trend_score_val = trend_health.get('score')
+        if trend_score_val is not None and float(trend_score_val) < 20.0:
             return _finish(
                 None,
-                f"REJECTED_TREND_HEALTH: {trend_health.get('summary')}",
+                f"REJECTED_TREND_HEALTH: trend health score {trend_score_val:.2f} < 20.0",
                 'REJECTED_TREND_HEALTH',
                 record_failure=True,
                 side=side
             )
-        if strategy_quality.get('state') is False:
+
+        strategy_score_val = strategy_quality.get('score')
+        if strategy_score_val is not None and float(strategy_score_val) < 12.0:
             return _finish(
                 None,
-                f"REJECTED_STRATEGY_QUALITY: {strategy_quality.get('summary')}",
+                f"REJECTED_STRATEGY_QUALITY: strategy quality score {strategy_score_val:.2f} < 12.0",
                 'REJECTED_STRATEGY_QUALITY',
                 record_failure=True,
                 side=side
             )
-        if quality_score_v2.get('state') is False:
+
+        q2_score_val = quality_score_v2.get('score')
+        if q2_score_val is not None and float(q2_score_val) < 20.0:
             return _finish(
                 None,
-                f"REJECTED_QUALITY_SCORE_V2: {quality_score_v2.get('summary')}",
+                f"REJECTED_QUALITY_SCORE_V2: quality score v2 {q2_score_val:.2f} < 20.0",
                 'REJECTED_QUALITY_SCORE_V2',
                 record_failure=True,
                 side=side
@@ -9552,6 +9631,9 @@ class SignalEngine(BaseEngine):
         if feature_score_multiplier < 0.999:
             risk_per_trade_percent *= feature_score_multiplier
             max_risk_per_trade_usdt *= feature_score_multiplier
+        if dir_decision and dir_decision.size_multiplier < 0.999:
+            risk_per_trade_percent *= dir_decision.size_multiplier
+            max_risk_per_trade_usdt *= dir_decision.size_multiplier
         try:
             plan = calculate_risk_plan(
                 side=side,

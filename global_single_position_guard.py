@@ -13,31 +13,33 @@ import time
 log = logging.getLogger("one_position_guard")
 
 
-OPPORTUNITY_PROFILE_NAME = "utbreak_opportunity_v2"
+OPPORTUNITY_PROFILE_NAME = "utbreak_direction_filter_v1"
 
 OPPORTUNITY_OVERRIDES = {
-    # faster execution TF
+    # stable TF design
     "selection_mode": "auto",
     "auto_select_enabled": True,
     "adaptive_timeframe_enabled": True,
-    "auto_timeframes": ["5m", "15m", "30m", "1h"],
-    "adaptive_timeframes": ["5m", "15m", "30m", "1h"],
-    "entry_timeframe": "5m",
+    "auto_timeframes": ["15m", "30m", "1h"],
+    "adaptive_timeframes": ["15m", "30m", "1h"],
+    "entry_timeframe": "15m",
     "exit_timeframe": "15m",
     "htf_timeframe": "1h",
 
-    # adaptive TF should not stay on 1h/4h too stubbornly
-    "adaptive_timeframe_min_score": 30.0,
-    "adaptive_timeframe_switch_margin": 3.0,
-    "adaptive_timeframe_min_hold_candles": 1,
+    # less frequent timeframe switching
+    "adaptive_timeframe_min_score": 38.0,
+    "adaptive_timeframe_switch_margin": 10.0,
+    "adaptive_timeframe_min_hold_candles": 6,
 
-    # reduce excessive hard blocks
+    # reduce overfitted hard blocks
     "trend_health_hard_block_below": 25.0,
     "trend_health_reduce_below": 42.0,
+    "trend_health_full_score": 68.0,
     "trend_health_min_multiplier": 0.35,
 
-    "strategy_quality_hard_block_below": 8.0,
+    "strategy_quality_hard_block_below": 12.0,
     "strategy_quality_reduce_below": 42.0,
+    "strategy_quality_full_score": 70.0,
     "strategy_quality_min_multiplier": 0.35,
 
     "quality_score_v2_block_below": 30.0,
@@ -48,42 +50,38 @@ OPPORTUNITY_OVERRIDES = {
     "quality_score_v2_long_15m_block_below": 35.0,
     "quality_score_v2_long_15m_reduce_below": 55.0,
 
-    "quality_score_v2_short_block_below": 35.0,
-    "quality_score_v2_short_reduce_below": 58.0,
-    "quality_score_v2_short_15m_block_below": 40.0,
-    "quality_score_v2_short_15m_reduce_below": 60.0,
+    "quality_score_v2_short_block_below": 40.0,
+    "quality_score_v2_short_reduce_below": 60.0,
+    "quality_score_v2_short_15m_block_below": 42.0,
+    "quality_score_v2_short_15m_reduce_below": 62.0,
 
-    # critical: selected SHORT should not be blocked only by 0.75 volume ratio
+    # volume should rarely be the only hard block
     "bias_continuation_min_volume_ratio": 0.50,
     "bias_continuation_15m_min_volume_ratio": 0.55,
-    "bias_continuation_min_adaptive_tf_score": 30.0,
-    "bias_continuation_15m_min_adaptive_tf_score": 35.0,
+    "bias_continuation_min_adaptive_tf_score": 35.0,
+    "bias_continuation_15m_min_adaptive_tf_score": 38.0,
     "bias_continuation_min_adx": 14.0,
     "bias_continuation_15m_min_adx": 15.0,
-    "bias_continuation_max_extension_atr": 2.20,
-    "bias_continuation_15m_max_extension_atr": 2.00,
 
-    # shorts remain slightly conservative but no longer inactive
+    # short filter: stricter than long, but not dead
     "short_adx_threshold": 20.0,
     "short_dmi_min_gap": 2.0,
     "short_risk_multiplier": 0.60,
 
-    # let winners run farther
+    # exits
     "partial_take_profit_r_multiple": 1.20,
     "partial_take_profit_ratio": 0.35,
-    "second_take_profit_r_multiple": 2.80,
+    "second_take_profit_r_multiple": 2.50,
     "second_take_profit_ratio": 0.35,
-    "dynamic_tp2_base_r_multiple": 2.40,
-    "dynamic_tp2_strong_r_multiple": 3.20,
-    "dynamic_tp2_elite_r_multiple": 4.20,
-    "atr_trailing_activation_r": 1.10,
-    "atr_trailing_multiplier": 2.60,
-    "runner_exit_enabled": True,
-    "runner_chandelier_enabled": True,
-    "runner_chandelier_multiplier": 3.00,
+    "dynamic_tp2_base_r_multiple": 2.30,
+    "dynamic_tp2_strong_r_multiple": 3.00,
+    "dynamic_tp2_elite_r_multiple": 4.00,
+    "atr_trailing_activation_r": 1.20,
+    "atr_trailing_multiplier": 2.50,
+    "runner_chandelier_multiplier": 2.80,
 
-    # bounded trade frequency
-    "max_daily_trades": 10,
+    # bounded activity
+    "max_daily_trades": 8,
     "max_consecutive_losses": 4,
 }
 
@@ -245,7 +243,7 @@ def patch_signal_engine(cls):
         try:
             apply_opportunity_tuning(self)
         except Exception as exc:
-            log.error("UTBreak opportunity tuning failed before cfg: %s", exc)
+            log.error("UTBreak direction-filter tuning failed before cfg: %s", exc)
 
         if original_get_cfg is None:
             cfg = strategy_params or {}
@@ -253,8 +251,46 @@ def patch_signal_engine(cls):
             cfg = original_get_cfg(self, strategy_params)
 
         if isinstance(cfg, dict):
-            for k, v in OPPORTUNITY_OVERRIDES.items():
-                cfg[k] = v
+            cfg.update({
+                "auto_timeframes": ["15m", "30m", "1h"],
+                "adaptive_timeframes": ["15m", "30m", "1h"],
+                "entry_timeframe": "15m",
+                "exit_timeframe": "15m",
+                "htf_timeframe": "1h",
+
+                "adaptive_timeframe_min_score": 38.0,
+                "adaptive_timeframe_switch_margin": 10.0,
+                "adaptive_timeframe_min_hold_candles": 6,
+
+                "bias_continuation_min_volume_ratio": 0.50,
+                "bias_continuation_15m_min_volume_ratio": 0.55,
+                "bias_continuation_min_adaptive_tf_score": 35.0,
+                "bias_continuation_15m_min_adaptive_tf_score": 38.0,
+                "bias_continuation_min_adx": 14.0,
+                "bias_continuation_15m_min_adx": 15.0,
+
+                "trend_health_hard_block_below": 25.0,
+                "trend_health_reduce_below": 42.0,
+                "strategy_quality_hard_block_below": 12.0,
+                "strategy_quality_reduce_below": 42.0,
+
+                "quality_score_v2_block_below": 30.0,
+                "quality_score_v2_reduce_below": 50.0,
+                "quality_score_v2_long_block_below": 30.0,
+                "quality_score_v2_long_reduce_below": 50.0,
+                "quality_score_v2_short_block_below": 40.0,
+                "quality_score_v2_short_reduce_below": 60.0,
+                "quality_score_v2_short_15m_block_below": 42.0,
+                "quality_score_v2_short_15m_reduce_below": 62.0,
+
+                "partial_take_profit_r_multiple": 1.20,
+                "second_take_profit_r_multiple": 2.50,
+                "dynamic_tp2_base_r_multiple": 2.30,
+                "dynamic_tp2_strong_r_multiple": 3.00,
+                "dynamic_tp2_elite_r_multiple": 4.00,
+                "atr_trailing_activation_r": 1.20,
+                "atr_trailing_multiplier": 2.50,
+            })
 
         return cfg
 
