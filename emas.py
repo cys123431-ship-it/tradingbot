@@ -9523,21 +9523,37 @@ class SignalEngine(BaseEngine):
             sym_1h = self._build_direction_metrics_dict(sym_1h_raw)
             
             dir_decision = decide_direction(
-                side=side,
+                side_hint=side,
                 btc_4h=btc_4h,
                 btc_1d=btc_1d,
-                sym_1h=sym_1h,
-                cfg=cfg
+                symbol_1h=sym_1h,
+                entry_15m={
+                    "volume_ratio": filter_values.get("volume_ratio"),
+                    "quality_score_v2": quality_score_v2.get("score"),
+                    "strategy_quality": strategy_quality.get("score"),
+                    "trend_health": trend_health.get("score"),
+                },
             )
+
+            direction_allowed = (
+                dir_decision.long_allowed
+                if side == "long"
+                else dir_decision.short_allowed
+            )
+
             status['direction_decision'] = {
-                "allowed": dir_decision.allowed,
+                "allowed": direction_allowed,
+                "long_allowed": dir_decision.long_allowed,
+                "short_allowed": dir_decision.short_allowed,
+                "regime": dir_decision.regime,
                 "size_multiplier": dir_decision.size_multiplier,
-                "reasons": dir_decision.reasons,
+                "reasons": [dir_decision.reason],
             }
-            if not dir_decision.allowed:
+
+            if not direction_allowed:
                 return _finish(
                     None,
-                    f"REJECTED_DIRECTION_FILTER: {', '.join(dir_decision.reasons)}",
+                    f"REJECTED_DIRECTION_FILTER: {dir_decision.reason}",
                     'REJECTED_DIRECTION_FILTER',
                     record_failure=True,
                     side=side
