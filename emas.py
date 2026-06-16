@@ -8645,10 +8645,26 @@ class SignalEngine(BaseEngine):
         return dict(selected_stats)
 
     def _build_direction_metrics_dict(self, ohlcv_data) -> dict:
-        if not ohlcv_data or len(ohlcv_data) < 50:
+        if ohlcv_data is None:
             return {}
+
         import pandas as pd
-        df = pd.DataFrame(ohlcv_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+
+        try:
+            if hasattr(ohlcv_data, "empty") and ohlcv_data.empty:
+                return {}
+            if hasattr(ohlcv_data, "__len__") and len(ohlcv_data) < 50:
+                return {}
+        except Exception:
+            return {}
+
+        if isinstance(ohlcv_data, pd.DataFrame):
+            df = ohlcv_data.copy()
+            if not {'timestamp', 'open', 'high', 'low', 'close', 'volume'}.issubset(df.columns):
+                df = df.iloc[:, :6].copy()
+                df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+        else:
+            df = pd.DataFrame(ohlcv_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         df = df.dropna(subset=['close']).reset_index(drop=True)
@@ -9437,9 +9453,10 @@ class SignalEngine(BaseEngine):
         soft_filter_failures = []
 
         for item in failed_filter_items:
-            code = item.get('code') or 'REJECTED_RISK_REWARD_LOW'
+            raw_code = item.get('code')
             name = item.get('name') or ''
             detail = item.get('detail') or ''
+            code = raw_code or 'SET_FILTER_SOFT_FAIL'
             is_hard = code in hard_filter_codes or name in hard_filter_names
 
             # HTF/EMA/ADX/DMI/volume/RSI/Donchian style filters are useful,
@@ -9455,7 +9472,7 @@ class SignalEngine(BaseEngine):
 
         if hard_filter_failures:
             item = hard_filter_failures[0]
-            code = item.get('code') or 'REJECTED_RISK_REWARD_LOW'
+            code = item.get('code') or 'REJECTED_SET_FILTER_HARD'
             return _finish(
                 None,
                 f"{code}: Set{selected_set.get('id')} {item.get('name')} - {item.get('detail')}",
@@ -9477,7 +9494,7 @@ class SignalEngine(BaseEngine):
             )
         elif soft_filter_failures:
             item = soft_filter_failures[0]
-            code = item.get('code') or 'REJECTED_RISK_REWARD_LOW'
+            code = item.get('code') or 'REJECTED_SET_FILTER_SOFT'
             return _finish(
                 None,
                 f"{code}: Set{selected_set.get('id')} {item.get('name')} - {item.get('detail')}",
@@ -9732,13 +9749,18 @@ class SignalEngine(BaseEngine):
 
         if fixed_take_profit:
             status['adaptive_exit_summary'] = (
-                f"fixed TP ladder {float(cfg.get('partial_take_profit_ratio', 0.5) or 0.5):.0%}@"
-                f"{float(cfg.get('partial_take_profit_r_multiple', 1.5) or 1.5):.1f}R + "
-                f"{float(cfg.get('second_take_profit_ratio', 0.5) or 0.5):.0%}@"
-                f"{float(cfg.get('second_take_profit_r_multiple', 2.0) or 2.0):.1f}R; "
-                f"runner OFF; {dynamic_tp2.get('summary')}; "
+                f"fixed TP ladder "
+                f"{float(cfg.get('partial_take_profit_ratio', 0.35) or 0.35):.0%}@"
+                f"{float(cfg.get('partial_take_profit_r_multiple', 1.20) or 1.20):.1f}R + "
+                f"{float(cfg.get('second_take_profit_ratio', 0.35) or 0.35):.0%}@"
+                f"{float(cfg.get('second_take_profit_r_multiple', 2.50) or 2.50):.1f}R; "
+                f"dynamic={dynamic_tp2.get('summary')}; "
+                f"runner/chandelier policy active if enabled; "
                 f"TP1 BE {'ON' if cfg.get('tp1_breakeven_enabled', True) else 'OFF'}"
             )
+        else:
+            status['adaptive_exit_summary'] = exit_overlay.get('summary')
+
         shadow_stats = strategy_adaptation.get('shadow_stats') if isinstance(strategy_adaptation.get('shadow_stats'), dict) else {}
         runner_stats = strategy_adaptation.get('runner_stats') if isinstance(strategy_adaptation.get('runner_stats'), dict) else {}
         status['shadow_sample_count'] = shadow_stats.get('sample_count')
@@ -9747,11 +9769,6 @@ class SignalEngine(BaseEngine):
         status['runner_sample_count'] = runner_stats.get('sample_count')
         status['runner_avg_mfe_capture_ratio'] = runner_stats.get('avg_mfe_capture_ratio')
         status['runner_avg_pnl_r'] = runner_stats.get('avg_pnl_r')
-        status['adaptive_exit_summary'] = (
-            "fixed TP ladder 50%@1.5R + 50%@2.0R; runner OFF"
-            if fixed_take_profit else
-            exit_overlay.get('summary')
-        )
 
         # --- Relaxed Hard Block Conditions ---
         trend_score_val = trend_health.get('score')
@@ -9819,6 +9836,15 @@ class SignalEngine(BaseEngine):
         if dir_decision and dir_decision.size_multiplier < 0.999:
             risk_per_trade_percent *= dir_decision.size_multiplier
             max_risk_per_trade_usdt *= dir_decision.size_multiplier
+        if 'set_filter_multiplier' in locals() and set_filter_multiplier < 0.999:
+            risk_per_trade_percent *= set_filter_multiplier
+            max_risk_per_trade_usdt *= set_filter_multiplier
+            status['set_filter_risk_multiplier'] = set_filter_multiplier
+
+        if continuation_decision and continuation_decision.risk_multiplier < 0.999:
+            risk_per_trade_percent *= continuation_decision.risk_multiplier
+            max_risk_per_trade_usdt *= continuation_decision.risk_multiplier
+            status['trend_continuation_risk_multiplier'] = continuation_decision.risk_multiplier
         try:
             plan = calculate_risk_plan(
                 side=side,
@@ -9897,7 +9923,7 @@ class SignalEngine(BaseEngine):
                     'spread_ok': spread_ok,
                     'htf_trend_bullish': long_htf_bullish,
                     'symbol_trend_bullish': symbol_trend_bullish,
-                    'volume_ok': volume_value is not None and volume_value >= float(cfg.get('bias_continuation_min_volume_ratio', 0.75) or 0.75),
+                    'volume_ok': volume_value is not None and volume_value >= float(cfg.get('bias_continuation_min_volume_ratio', 0.50) or 0.50),
                     'adx_ok': adx_value is not None and adx_value >= float(cfg.get('bias_continuation_min_adx', 18.0) or 18.0),
                     'quality_ok': float(quality_score_v2.get('score', 0.0) or 0.0) >= float(cfg.get('quality_score_v2_long_reduce_below', 60.0) or 60.0),
                     'funding_not_overheated': funding_value is None or funding_value <= float(cfg.get('funding_long_max', 0.0008) or 0.0008),
@@ -10013,6 +10039,17 @@ class SignalEngine(BaseEngine):
             'tp1_breakeven_wait_for_partial': bool(cfg.get('tp1_breakeven_wait_for_partial', True)),
             'tp1_breakeven_qty_tolerance': float(cfg.get('tp1_breakeven_qty_tolerance', 0.08) or 0.08),
             'adaptive_exit_summary': status.get('adaptive_exit_summary'),
+            'trend_continuation_entry': status.get('trend_continuation_entry'),
+            'trend_continuation_accepted': status.get('trend_continuation_accepted'),
+            'trend_continuation_summary': status.get('trend_continuation_summary'),
+            'trend_continuation_risk_multiplier': status.get('trend_continuation_risk_multiplier'),
+            'set_filter_risk_multiplier': status.get('set_filter_risk_multiplier'),
+            'set_filter_soft_fail_summary': status.get('set_filter_soft_fail_summary'),
+            'set_filter_soft_fail_count': status.get('set_filter_soft_fail_count'),
+            'direction_decision': status.get('direction_decision'),
+            'direction_btc_4h_symbol': status.get('direction_btc_4h_symbol'),
+            'direction_btc_1d_symbol': status.get('direction_btc_1d_symbol'),
+            'direction_symbol_1h_symbol': status.get('direction_symbol_1h_symbol'),
             'shadow_sample_count': shadow_stats.get('sample_count'),
             'shadow_win_rate': shadow_stats.get('tp_rate'),
             'shadow_avg_pnl_r': shadow_stats.get('avg_pnl_r'),
@@ -28227,6 +28264,20 @@ AUTO 최근 선택 이유:
 
 최근 전략 적응:
 `{strategy_adaptation_summary}`
+
+[Trend Continuation]
+진입여부: `{diag.get('trend_continuation_entry')}` | 승인: `{diag.get('trend_continuation_accepted')}`
+배율: `x{float(diag.get('trend_continuation_risk_multiplier', 1.0) or 1.0):.2f}`
+요약: `{diag.get('trend_continuation_summary') or 'n/a'}`
+
+[Set Filter]
+배율: `x{float(diag.get('set_filter_risk_multiplier', 1.0) or 1.0):.2f}` (소프트 실패: `{diag.get('set_filter_soft_fail_count', 0)}`개)
+실패 요약: `{diag.get('set_filter_soft_fail_summary') or 'n/a'}`
+
+[Direction (Directional Bias)]
+판단: `{diag.get('direction_decision') or 'n/a'}`
+BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('direction_btc_1d_symbol') or 'n/a'}`
+심볼 1h: `{diag.get('direction_symbol_1h_symbol') or 'n/a'}`
 
 최근 진단({first_symbol}): `{last_reason}`
 진단 요약:
