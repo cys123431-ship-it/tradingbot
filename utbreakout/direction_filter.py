@@ -1,6 +1,4 @@
-"""Direction filter for UT Breakout.
-
-This module intentionally keeps the long/short gate simple.
+"""Simple direction filter for UT Breakout.
 
 Design:
 - BTC higher timeframe determines broad market regime.
@@ -8,7 +6,7 @@ Design:
 - 15m UTBot remains the main entry trigger in emas.py.
 - Non-critical filters should reduce size, not block trades.
 
-No exchange access, no secrets, no order placement here.
+This module has no exchange access, no secrets, and no order placement.
 """
 
 from __future__ import annotations
@@ -44,11 +42,6 @@ def _slope_value(metrics: Mapping[str, Any], *names: str) -> float:
 
 
 def _close_ema_bias(metrics: Mapping[str, Any]) -> str:
-    """Return bullish/bearish/neutral using common metric keys.
-
-    This accepts several key names because the existing bot has many diagnostic
-    dictionaries with slightly different names.
-    """
     close = _f(metrics.get("close") or metrics.get("last") or metrics.get("price"))
     ema_fast = _f(
         metrics.get("ema_fast")
@@ -87,21 +80,19 @@ def _close_ema_bias(metrics: Mapping[str, Any]) -> str:
 
 
 def _volume_multiplier(metrics: Mapping[str, Any]) -> tuple[float, str]:
-    """Volume is a sizing input, not a hard block except in extreme cases."""
-    vr = _f(metrics.get("volume_ratio"), 1.0)
-    if vr is None:
+    volume_ratio = _f(metrics.get("volume_ratio"), 1.0)
+    if volume_ratio is None:
         return 0.85, "volume unknown"
-    if vr < 0.35:
-        return 0.0, f"volume extremely weak {vr:.2f}<0.35"
-    if vr < 0.55:
-        return 0.50, f"volume weak {vr:.2f}"
-    if vr < 0.75:
-        return 0.75, f"volume moderate {vr:.2f}"
-    return 1.0, f"volume ok {vr:.2f}"
+    if volume_ratio < 0.35:
+        return 0.0, f"volume extremely weak {volume_ratio:.2f}<0.35"
+    if volume_ratio < 0.55:
+        return 0.50, f"volume weak {volume_ratio:.2f}"
+    if volume_ratio < 0.75:
+        return 0.75, f"volume moderate {volume_ratio:.2f}"
+    return 1.0, f"volume ok {volume_ratio:.2f}"
 
 
 def _quality_multiplier(metrics: Mapping[str, Any]) -> tuple[float, str]:
-    """Quality score should reduce size before it blocks a trade."""
     score = _f(
         metrics.get("quality_score")
         or metrics.get("quality_score_v2")
@@ -127,11 +118,6 @@ def decide_direction(
     entry_15m: Mapping[str, Any] | None = None,
     side_hint: str | None = None,
 ) -> DirectionDecision:
-    """Decide whether long/short is allowed.
-
-    Parameters are metric dictionaries from existing code. Missing data should
-    not crash the bot; it should default to neutral and lower size.
-    """
     btc_4h = btc_4h or {}
     btc_1d = btc_1d or {}
     symbol_1h = symbol_1h or {}
@@ -141,7 +127,6 @@ def decide_direction(
     btc_1d_bias = _close_ema_bias(btc_1d)
     symbol_bias = _close_ema_bias(symbol_1h)
 
-    # Broad market regime.
     if btc_4h_bias == "bullish" and btc_1d_bias != "bearish":
         regime = "bullish"
     elif btc_4h_bias == "bearish" and btc_1d_bias != "bullish":
@@ -152,20 +137,18 @@ def decide_direction(
     long_allowed = regime in {"bullish", "neutral"} and symbol_bias in {"bullish", "neutral"}
     short_allowed = regime == "bearish" and symbol_bias in {"bearish", "neutral"}
 
-    # Never let a bullish BTC regime freely short. This is a major simplification
-    # to prevent countertrend overfitting.
+    # Prevent countertrend shorting in bullish BTC regime.
     if regime == "bullish":
         short_allowed = False
 
-    # If side_hint is known, keep the opposite side disabled only at the final stage.
-    hint = str(side_hint or "").lower()
-    if hint == "long":
+    side = str(side_hint or "").lower()
+    if side == "long":
         short_allowed = False
-    elif hint == "short":
+    elif side == "short":
         long_allowed = False
 
-    vm, v_reason = _volume_multiplier(entry_15m)
-    qm, q_reason = _quality_multiplier(entry_15m)
+    vm, volume_reason = _volume_multiplier(entry_15m)
+    qm, quality_reason = _quality_multiplier(entry_15m)
     size_multiplier = round(max(0.0, min(1.0, vm * qm)), 2)
 
     if size_multiplier <= 0:
@@ -174,7 +157,7 @@ def decide_direction(
 
     reason = (
         f"regime={regime}, btc4h={btc_4h_bias}, btc1d={btc_1d_bias}, "
-        f"symbol1h={symbol_bias}, {v_reason}, {q_reason}, "
+        f"symbol1h={symbol_bias}, {volume_reason}, {quality_reason}, "
         f"size_mult={size_multiplier:.2f}"
     )
 
