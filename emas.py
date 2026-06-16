@@ -10077,6 +10077,8 @@ class SignalEngine(BaseEngine):
                 * quality_score_v2_multiplier
                 * selector_quality_multiplier
                 * feature_score_multiplier
+                * (set_filter_multiplier if 'set_filter_multiplier' in locals() else 1.0)
+                * (continuation_decision.risk_multiplier if continuation_decision else 1.0)
             ),
         )
         if micro_reject:
@@ -21569,7 +21571,7 @@ class SignalEngine(BaseEngine):
             avg_volume = _safe_float_or_none(closed['volume'].tail(20).mean())
             if recent_volume is not None and avg_volume is not None and avg_volume > 0:
                 volume_ratio = recent_volume / avg_volume
-                volume_ok = volume_ratio >= float(cfg.get('bias_continuation_min_volume_ratio', 0.75) or 0.75)
+                volume_ok = volume_ratio >= float(cfg.get('bias_continuation_min_volume_ratio', 0.50) or 0.50)
         else:
             volume_ratio = None
 
