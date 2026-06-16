@@ -13,7 +13,7 @@ import time
 log = logging.getLogger("one_position_guard")
 
 
-OPPORTUNITY_PROFILE_NAME = "utbreak_direction_filter_v1"
+OPPORTUNITY_PROFILE_NAME = "utbreak_direction_filter_v2_continuation"
 
 OPPORTUNITY_OVERRIDES = {
     # stable TF design
@@ -83,6 +83,26 @@ OPPORTUNITY_OVERRIDES = {
     # bounded activity
     "max_daily_trades": 8,
     "max_consecutive_losses": 4,
+
+    # Trend continuation entry path
+    "trend_continuation_entry_enabled": True,
+    "trend_continuation_base_risk_multiplier": 0.60,
+    "trend_continuation_min_risk_multiplier": 0.25,
+    "trend_continuation_min_adx": 14.0,
+    "trend_continuation_max_extension_atr": 2.20,
+    "trend_continuation_flow_min_volume_ratio": 0.45,
+    "trend_continuation_min_range_expansion": 1.03,
+    "trend_continuation_quality_hard_floor": 20.0,
+    "trend_continuation_quality_reduce_floor": 45.0,
+    "trend_continuation_trend_hard_floor": 18.0,
+    "trend_continuation_trend_reduce_floor": 42.0,
+    "trend_continuation_strategy_hard_floor": 12.0,
+    "trend_continuation_strategy_reduce_floor": 42.0,
+
+    # Set filter failures should mostly reduce size, not block continuation entries
+    "set_filter_soft_fail_enabled": True,
+    "set_filter_soft_fail_multiplier": 0.70,
+    "set_filter_multi_soft_fail_multiplier": 0.50,
 }
 
 
@@ -290,6 +310,24 @@ def patch_signal_engine(cls):
                 "dynamic_tp2_elite_r_multiple": 4.00,
                 "atr_trailing_activation_r": 1.20,
                 "atr_trailing_multiplier": 2.50,
+
+                "trend_continuation_entry_enabled": True,
+                "trend_continuation_base_risk_multiplier": 0.60,
+                "trend_continuation_min_risk_multiplier": 0.25,
+                "trend_continuation_min_adx": 14.0,
+                "trend_continuation_max_extension_atr": 2.20,
+                "trend_continuation_flow_min_volume_ratio": 0.45,
+                "trend_continuation_min_range_expansion": 1.03,
+                "trend_continuation_quality_hard_floor": 20.0,
+                "trend_continuation_quality_reduce_floor": 45.0,
+                "trend_continuation_trend_hard_floor": 18.0,
+                "trend_continuation_trend_reduce_floor": 42.0,
+                "trend_continuation_strategy_hard_floor": 12.0,
+                "trend_continuation_strategy_reduce_floor": 42.0,
+
+                "set_filter_soft_fail_enabled": True,
+                "set_filter_soft_fail_multiplier": 0.70,
+                "set_filter_multi_soft_fail_multiplier": 0.50,
             })
 
         return cfg

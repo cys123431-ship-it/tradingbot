@@ -7,12 +7,13 @@ choose one execution timeframe, not as extra AND filters on the live entry.
 from math import isfinite
 
 
-TIMEFRAME_ORDER = ["15m", "30m", "1h", "4h"]
+TIMEFRAME_ORDER = ["5m", "15m", "30m", "1h", "2h", "4h"]
 TIMEFRAME_MS = {
     "5m": 5 * 60 * 1000,
     "15m": 15 * 60 * 1000,
     "30m": 30 * 60 * 1000,
     "1h": 60 * 60 * 1000,
+    "2h": 2 * 60 * 60 * 1000,
     "4h": 4 * 60 * 60 * 1000,
 }
 HTF_MAP = {
@@ -20,6 +21,7 @@ HTF_MAP = {
     "15m": "1h",
     "30m": "1h",
     "1h": "4h",
+    "2h": "4h",
     "4h": "1d",
 }
 
@@ -71,24 +73,25 @@ def _ema_distance_pct(metrics):
 
 def _timeframe_profile_bias(tf, trend_quality, volatility_fit, noise_penalty, signal_quality):
     """Nudge scores toward stable UTBot execution horizons.
-
-    UTBot should not constantly jump between very short and long frames.
-    15m is the main execution timeframe.
-    30m is the fallback when 15m is noisy.
-    1h is confirmation, not the default entry trigger.
+    Optimized for Opportunity Tuning: favor fast timeframes, penalize heavy lags.
     """
     tf = str(tf)
     high_noise = noise_penalty >= 60.0
     clean_entry = trend_quality >= 50.0 and volatility_fit >= 45.0 and signal_quality >= 45.0
 
+    if tf == "5m":
+        # Strongly favor 5m if noise is moderate
+        return 15.0 if clean_entry else -2.0 if high_noise else 8.0
     if tf == "15m":
         return 10.0 if clean_entry else -4.0 if high_noise else 4.0
     if tf == "30m":
         return 5.0 if high_noise else 2.0
     if tf == "1h":
-        return 2.0 if trend_quality >= 70.0 else -4.0
-    if tf == "4h":
+        return -5.0 # Penalize slow 1h default entries
+    if tf == "2h":
         return -10.0
+    if tf == "4h":
+        return -15.0 # Strongly penalize 4h default entries
     return 0.0
 
 
@@ -210,13 +213,12 @@ def select_adaptive_timeframe(timeframe_metrics, cfg=None, state=None, position_
     cfg = cfg or {}
     state = state or {}
     allowed = cfg.get("adaptive_timeframes") or cfg.get("auto_timeframes") or TIMEFRAME_ORDER
-    allowed = [str(tf).strip().lower() for tf in allowed if str(tf).strip()]
-    allowed = [tf for tf in allowed if tf in TIMEFRAME_MS and tf != "5m"] or list(TIMEFRAME_ORDER)
+    allowed = [tf for tf in allowed if tf in TIMEFRAME_MS] or list(TIMEFRAME_ORDER)
 
     # UTBot should prefer stable 15m/30m execution instead of frequently switching.
-    min_score = finite_float(cfg.get("adaptive_timeframe_min_score"), 38.0)
-    switch_margin = finite_float(cfg.get("adaptive_timeframe_switch_margin"), 10.0)
-    min_hold_candles = int(max(0.0, finite_float(cfg.get("adaptive_timeframe_min_hold_candles"), 6.0)))
+    min_score = finite_float(cfg.get("adaptive_timeframe_min_score"), 30.0)
+    switch_margin = finite_float(cfg.get("adaptive_timeframe_switch_margin"), 5.0)
+    min_hold_candles = int(max(0.0, finite_float(cfg.get("adaptive_timeframe_min_hold_candles"), 3.0)))
 
     candidates = [
         score_timeframe(tf, (timeframe_metrics or {}).get(tf), cfg)

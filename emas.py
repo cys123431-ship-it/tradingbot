@@ -77,6 +77,7 @@ from utbreakout.sizing import (
     is_aggressive_symbol_trend_bullish,
 )
 from utbreakout.timeframe import HTF_MAP as UTBREAKOUT_HTF_MAP, select_adaptive_timeframe
+from utbreakout.continuation_entry import evaluate_trend_continuation_entry
 from utbreakout.adaptive import (
     build_dynamic_chandelier_stop,
     build_strategy_adaptation,
@@ -5341,6 +5342,24 @@ class SignalEngine(BaseEngine):
                 "dynamic_tp2_elite_r_multiple": 4.00,
                 "atr_trailing_activation_r": 1.20,
                 "atr_trailing_multiplier": 2.50,
+
+                "trend_continuation_entry_enabled": True,
+                "trend_continuation_base_risk_multiplier": 0.60,
+                "trend_continuation_min_risk_multiplier": 0.25,
+                "trend_continuation_min_adx": 14.0,
+                "trend_continuation_max_extension_atr": 2.20,
+                "trend_continuation_flow_min_volume_ratio": 0.45,
+                "trend_continuation_min_range_expansion": 1.03,
+                "trend_continuation_quality_hard_floor": 20.0,
+                "trend_continuation_quality_reduce_floor": 45.0,
+                "trend_continuation_trend_hard_floor": 18.0,
+                "trend_continuation_trend_reduce_floor": 42.0,
+                "trend_continuation_strategy_hard_floor": 12.0,
+                "trend_continuation_strategy_reduce_floor": 42.0,
+
+                "set_filter_soft_fail_enabled": True,
+                "set_filter_soft_fail_multiplier": 0.70,
+                "set_filter_multi_soft_fail_multiplier": 0.50,
             })
         return cfg
 
@@ -9376,28 +9395,96 @@ class SignalEngine(BaseEngine):
             status['bias_continuation_extension_atr'] = bias_continuation.get('extension_atr')
             status['bias_continuation_selected_tf_score'] = bias_continuation.get('selected_tf_score')
             if bias_continuation.get('state') is False:
-                return _finish(
-                    None,
-                    f"REJECTED_BIAS_CONTINUATION: {bias_continuation.get('summary')}",
-                    'REJECTED_BIAS_CONTINUATION',
-                    record_failure=True,
-                    side=side
-                )
+                status['bias_continuation_blocked'] = True
+                status['bias_continuation_block_reason'] = bias_continuation.get('summary')
+                if not bool(cfg.get('trend_continuation_entry_enabled', True)):
+                    return _finish(
+                        None,
+                        f"REJECTED_BIAS_CONTINUATION: {bias_continuation.get('summary')}",
+                        'REJECTED_BIAS_CONTINUATION',
+                        record_failure=True,
+                        side=side
+                    )
+
+                # Do not reject immediately. Trend continuation entry will decide later.
+                # Apply reduced size if continuation is finally accepted.
+                bias_continuation_multiplier = min(bias_continuation_multiplier, 0.50)
+                status['bias_continuation_risk_multiplier'] = bias_continuation_multiplier
             if bias_continuation.get('enabled', True):
                 candidate_type = 'bias_continuation'
                 status['candidate_type'] = candidate_type
         filter_items = self._evaluate_utbreakout_set_filter_items(side, selected_set, cfg, filter_values)
         status['set_filter_items'] = filter_items
-        for item in filter_items:
-            if item.get('state') is not True:
-                code = item.get('code') or 'REJECTED_RISK_REWARD_LOW'
-                return _finish(
-                    None,
-                    f"{code}: Set{selected_set.get('id')} {item.get('name')} - {item.get('detail')}",
-                    code,
-                    record_failure=True,
-                    side=side
-                )
+
+        hard_filter_codes = {
+            'REJECTED_RISK_REWARD_LOW',
+            'REJECTED_ATR_TOO_HIGH',
+            'REJECTED_ATR_TOO_LOW',
+            'REJECTED_SPREAD_TOO_WIDE',
+            'REJECTED_LIQUIDITY_TOO_LOW',
+            'REJECTED_MARKET_QUALITY',
+        }
+
+        hard_filter_names = {
+            'ATR% 변동성',
+            '손익비',
+            '스프레드',
+            '유동성',
+        }
+
+        failed_filter_items = [item for item in filter_items if item.get('state') is not True]
+        hard_filter_failures = []
+        soft_filter_failures = []
+
+        for item in failed_filter_items:
+            code = item.get('code') or 'REJECTED_RISK_REWARD_LOW'
+            name = item.get('name') or ''
+            detail = item.get('detail') or ''
+            is_hard = code in hard_filter_codes or name in hard_filter_names
+
+            # HTF/EMA/ADX/DMI/volume/RSI/Donchian style filters are useful,
+            # but for continuation entries they should reduce size before blocking.
+            if is_hard:
+                hard_filter_failures.append(item)
+            else:
+                soft_filter_failures.append(item)
+
+        status['set_filter_hard_failures'] = hard_filter_failures
+        status['set_filter_soft_failures'] = soft_filter_failures
+        status['set_filter_soft_fail_count'] = len(soft_filter_failures)
+
+        if hard_filter_failures:
+            item = hard_filter_failures[0]
+            code = item.get('code') or 'REJECTED_RISK_REWARD_LOW'
+            return _finish(
+                None,
+                f"{code}: Set{selected_set.get('id')} {item.get('name')} - {item.get('detail')}",
+                code,
+                record_failure=True,
+                side=side
+            )
+
+        set_filter_multiplier = 1.0
+        if soft_filter_failures and bool(cfg.get('set_filter_soft_fail_enabled', True)):
+            if len(soft_filter_failures) >= 2:
+                set_filter_multiplier = float(cfg.get('set_filter_multi_soft_fail_multiplier', 0.50) or 0.50)
+            else:
+                set_filter_multiplier = float(cfg.get('set_filter_soft_fail_multiplier', 0.70) or 0.70)
+            status['set_filter_risk_multiplier'] = set_filter_multiplier
+            status['set_filter_soft_fail_summary'] = '; '.join(
+                f"{item.get('name')}: {item.get('detail')}"
+                for item in soft_filter_failures[:4]
+            )
+        elif soft_filter_failures:
+            item = soft_filter_failures[0]
+            code = item.get('code') or 'REJECTED_RISK_REWARD_LOW'
+            return _finish(
+                None,
+                f"{code}: Set{selected_set.get('id')} {item.get('name')} - {item.get('detail')}",
+                code,
+                record_failure=True,
+                side=side
+            )
 
         if side == 'short':
             short_ok, short_reason = self._utbreakout_short_guard_passes(cfg, filter_values)
@@ -9511,12 +9598,43 @@ class SignalEngine(BaseEngine):
         try:
             from utbreakout.direction_filter import decide_direction
             
-            # Fetch BTC/USDT 4h & 1d OHLCV data
-            btc_4h_raw = await self.fetch_ohlcv_async('BTC/USDT', '4h', limit=60)
-            btc_1d_raw = await self.fetch_ohlcv_async('BTC/USDT', '1d', limit=60)
-            
-            # Fetch Symbol 1h OHLCV data
-            sym_1h_raw = await self.fetch_ohlcv_async(symbol, '1h', limit=60)
+            async def _fetch_direction_ohlcv_with_fallback(candidates, timeframe, limit=60):
+                last_error = None
+                for candidate_symbol in candidates:
+                    try:
+                        raw = await self.fetch_ohlcv_async(candidate_symbol, timeframe, limit=limit)
+                        if raw is None:
+                            continue
+                        if hasattr(raw, "empty") and raw.empty:
+                            continue
+                        if hasattr(raw, "__len__") and len(raw) == 0:
+                            continue
+                        return raw, candidate_symbol
+                    except Exception as exc:
+                        last_error = exc
+                        continue
+                if last_error is not None:
+                    log.warning(
+                        "direction filter OHLCV fallback failed for %s %s: %s",
+                        candidates,
+                        timeframe,
+                        last_error,
+                    )
+                return None, None
+
+            btc_candidates = (
+                ["BTC/USDT:USDT", "BTC/USDT"]
+                if ":USDT" in str(symbol)
+                else ["BTC/USDT", "BTC/USDT:USDT"]
+            )
+
+            btc_4h_raw, btc_4h_symbol = await _fetch_direction_ohlcv_with_fallback(btc_candidates, "4h", limit=60)
+            btc_1d_raw, btc_1d_symbol = await _fetch_direction_ohlcv_with_fallback(btc_candidates, "1d", limit=60)
+            sym_1h_raw, sym_1h_symbol = await _fetch_direction_ohlcv_with_fallback([symbol], "1h", limit=60)
+
+            status["direction_btc_4h_symbol"] = btc_4h_symbol
+            status["direction_btc_1d_symbol"] = btc_1d_symbol
+            status["direction_symbol_1h_symbol"] = sym_1h_symbol
             
             btc_4h = self._build_direction_metrics_dict(btc_4h_raw)
             btc_1d = self._build_direction_metrics_dict(btc_1d_raw)
@@ -9560,6 +9678,57 @@ class SignalEngine(BaseEngine):
                 )
         except Exception as exc:
             log.error("decide_direction overlay failed: %s", exc)
+
+        continuation_decision = None
+        try:
+            continuation_decision = evaluate_trend_continuation_entry(
+                side=side,
+                candidate_type=candidate_type,
+                cfg=cfg,
+                values=filter_values,
+                status=status,
+                direction_decision=dir_decision,
+                quality_score_v2=quality_score_v2,
+                trend_health=trend_health,
+                strategy_quality=strategy_quality,
+            )
+            status['trend_continuation_entry'] = {
+                'enabled': continuation_decision.enabled,
+                'accepted': continuation_decision.accepted,
+                'side': continuation_decision.side,
+                'mode': continuation_decision.mode,
+                'risk_multiplier': continuation_decision.risk_multiplier,
+                'setup': continuation_decision.setup,
+                'reason': continuation_decision.reason,
+                'blockers': continuation_decision.blockers,
+                'positives': continuation_decision.positives,
+            }
+
+            if candidate_type in {'bias_state', 'bias_continuation'}:
+                if continuation_decision.accepted:
+                    candidate_type = 'trend_continuation'
+                    status['candidate_type'] = candidate_type
+                    status['trend_continuation_accepted'] = True
+                    status['trend_continuation_summary'] = continuation_decision.reason
+                else:
+                    return _finish(
+                        None,
+                        f"REJECTED_TREND_CONTINUATION: {continuation_decision.reason}",
+                        'REJECTED_TREND_CONTINUATION',
+                        record_failure=True,
+                        side=side
+                    )
+        except Exception as exc:
+            log.error("trend continuation evaluation failed: %s", exc)
+            status['trend_continuation_error'] = str(exc)
+            if candidate_type in {'bias_state', 'bias_continuation'}:
+                return _finish(
+                    None,
+                    f"REJECTED_TREND_CONTINUATION_ERROR: {exc}",
+                    'REJECTED_TREND_CONTINUATION_ERROR',
+                    record_failure=True,
+                    side=side
+                )
 
         if fixed_take_profit:
             status['adaptive_exit_summary'] = (
