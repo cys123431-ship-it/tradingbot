@@ -25387,6 +25387,9 @@ class MainController:
         return watchlist[0] if watchlist else ('BTC/KRW' if self.is_upbit_mode() else 'BTC/USDT')
 
 
+    def _utbreakout_status_symbol_key(self, symbol):
+        return str(symbol or '').upper().replace(':USDT', '').replace('/', '').replace('-', '').strip()
+
     async def _resolve_utbreakout_status_symbol(self):
         """Pick the symbol operators expect to inspect.
 
