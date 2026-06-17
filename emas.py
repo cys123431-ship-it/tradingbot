@@ -10267,6 +10267,63 @@ class SignalEngine(BaseEngine):
             lines.append(f"조건 평가 심볼: {evaluated_symbol}")
         return lines
 
+    async def _build_direction_decision_for_status(self, symbol, side, filter_values):
+        try:
+            from utbreakout.direction_filter import decide_direction
+
+            btc_candidates = (
+                ["BTC/USDT:USDT", "BTC/USDT"]
+                if ":USDT" in str(symbol)
+                else ["BTC/USDT", "BTC/USDT:USDT"]
+            )
+
+            btc_4h_raw = None
+            btc_1d_raw = None
+            sym_1h_raw = None
+
+            for btc_symbol in btc_candidates:
+                try:
+                    btc_4h_raw = await self.fetch_ohlcv_async(btc_symbol, "4h", limit=60)
+                    if btc_4h_raw is not None and len(btc_4h_raw) > 0:
+                        break
+                except Exception:
+                    pass
+
+            for btc_symbol in btc_candidates:
+                try:
+                    btc_1d_raw = await self.fetch_ohlcv_async(btc_symbol, "1d", limit=60)
+                    if btc_1d_raw is not None and len(btc_1d_raw) > 0:
+                        break
+                except Exception:
+                    pass
+
+            try:
+                sym_1h_raw = await self.fetch_ohlcv_async(symbol, "1h", limit=60)
+            except Exception:
+                sym_1h_raw = None
+
+            btc_4h = self._build_direction_metrics_dict(btc_4h_raw)
+            btc_1d = self._build_direction_metrics_dict(btc_1d_raw)
+            sym_1h = self._build_direction_metrics_dict(sym_1h_raw)
+
+            decision = decide_direction(
+                btc_4h=btc_4h,
+                btc_1d=btc_1d,
+                symbol_1h=sym_1h,
+                entry_15m=filter_values or {},
+                side_hint=side,
+            )
+
+            allowed = decision.long_allowed if side == "long" else decision.short_allowed
+            state = True if allowed else False
+            return state, (
+                f"{'PASS' if allowed else 'BLOCK'}: regime {decision.regime}, "
+                f"{decision.reason}"
+            ), decision
+        except Exception as exc:
+            logger.exception("direction filter status evaluation failed")
+            return 'reduced', f"방향 필터 평가 오류: {exc}", None
+
     async def build_utbreakout_condition_status_text(self, symbol):
         cfg = self._get_utbot_filtered_breakout_config(self.get_runtime_strategy_params())
         cfg = apply_stable_utbreak_final_overrides(cfg)
@@ -10552,6 +10609,10 @@ class SignalEngine(BaseEngine):
                     risk_note += f" / 적응 x{adaptation_multiplier:.2f}"
                 if trend_health_for_plan.get('state') is False:
                     risk_note += " / 추세건강 BLOCK"
+                cfg['take_profit_r_multiple'] = max(
+                    float(cfg.get('take_profit_r_multiple', 2.0) or 2.0),
+                    float(cfg.get('second_take_profit_r_multiple', 2.50) or 2.50),
+                )
                 plan = calculate_risk_plan(
                     side=side_for_plan,
                     entry_price=entry_price,
@@ -10585,9 +10646,15 @@ class SignalEngine(BaseEngine):
                     f"포지션 {_fmt(planned_notional, 2)} USDT / 레버리지 {lev}x / "
                     f"손절시 손실 {_fmt(risk_usdt, 2)} USDT"
                 )
+                tp1_r = float(cfg.get('partial_take_profit_r_multiple', 1.20) or 1.20)
+                tp2_r = float(cfg.get('second_take_profit_r_multiple', 2.50) or 2.50)
+                tp1_ratio = float(cfg.get('partial_take_profit_ratio', 0.35) or 0.35)
+                tp2_ratio = float(cfg.get('second_take_profit_ratio', 0.35) or 0.35)
                 take_profit_detail = (
-                    f"익절 계획: {_fmt(rr_multiple, 1)}R / 익절거리 {_fmt(take_profit_distance, 4)} "
-                    f"({_fmt(take_profit_pct, 3)}%) / 예상수익 {_fmt(expected_profit_usdt, 2)} USDT"
+                    f"익절 계획: TP1 {tp1_r:.2f}R({tp1_ratio:.0%}) / "
+                    f"TP2 {tp2_r:.2f}R({tp2_ratio:.0%}) / "
+                    f"익절거리 {take_profit_distance:.4f} ({take_profit_pct:.3f}%) / "
+                    f"예상수익 {expected_profit_usdt:.2f} USDT"
                 )
             except Exception as e:
                 balance_detail = f"잔고 조회 실패 {e}"
@@ -10606,7 +10673,7 @@ class SignalEngine(BaseEngine):
             "동작: 현재 포지션 청산만, 반대 신규진입 없음"
         )
 
-        def _side_conditions(side):
+        async def _side_conditions(side):
             side_upper = side.upper()
             if candidate_side == side:
                 ut_state = True
@@ -10723,9 +10790,12 @@ class SignalEngine(BaseEngine):
                 set_state = True
                 set_detail = "선택 Set 추가 필터 없음"
 
+            direction_state, direction_detail, direction_decision = await self._build_direction_decision_for_status(symbol, side, filter_values)
+
             core_items = [
                 ("UTBot 방향", ut_state, ut_detail_text),
             ]
+            core_items.insert(1, ("방향 필터", direction_state, direction_detail))
             if candidate_side == side and candidate_type == 'bias_state':
                 bias_status = {
                     'candidate_type': candidate_type,
@@ -10819,8 +10889,8 @@ class SignalEngine(BaseEngine):
             )
             return ok, lines
 
-        long_ok, long_lines = _side_conditions('long')
-        short_ok, short_lines = _side_conditions('short')
+        long_ok, long_lines = await _side_conditions('long')
+        short_ok, short_lines = await _side_conditions('short')
         ut_label = f"{str(candidate_side or 'none').upper()} ({candidate_type})"
         scores = (auto_analysis or {}).get('scores') if isinstance(auto_analysis, dict) else {}
         if scores:
@@ -25271,32 +25341,61 @@ class MainController:
         return str(symbol or '').upper().replace(':USDT', '').replace('/', '').replace('-', '').strip()
 
     async def _resolve_utbreakout_status_symbol(self):
-        """Pick the symbol operators expect to inspect: live position first, scanner lock second."""
+        """Pick the symbol operators expect to inspect.
+
+        Priority:
+        1. Real live position symbol
+        2. Current scanner_active_symbol / next selected candidate
+        3. Non-stale status_data symbol
+        4. current watchlist fallback
+        """
         engine = self.engines.get(CORE_ENGINE)
+
         position_symbols = set()
         if engine and hasattr(engine, 'get_active_position_symbols'):
             try:
                 position_symbols = await engine.get_active_position_symbols(use_cache=False)
             except Exception as exc:
                 logger.warning(f"UTBreak status position symbol lookup failed: {exc}")
+
         if position_symbols:
             return sorted(position_symbols, key=self._telegram_status_symbol_key)[0]
-
-        if isinstance(self.status_data, dict):
-            status_symbols = []
-            for key, row in self.status_data.items():
-                if not isinstance(row, dict):
-                    continue
-                pos_side = str(row.get('pos_side') or '').upper()
-                symbol = row.get('symbol') or key
-                if symbol and pos_side not in {'', 'NONE', 'NO_POSITION'}:
-                    status_symbols.append(symbol)
-            if status_symbols:
-                return sorted(status_symbols, key=self._telegram_status_symbol_key)[0]
 
         scanner_symbol = getattr(engine, 'scanner_active_symbol', None) if engine else None
         if scanner_symbol:
             return scanner_symbol
+
+        if isinstance(self.status_data, dict):
+            status_symbols = []
+            now_ts = time.time()
+            for key, row in self.status_data.items():
+                if not isinstance(row, dict):
+                    continue
+
+                symbol = row.get('symbol') or key
+                if not symbol:
+                    continue
+
+                # Ignore stale rows when there is no active position/scanner lock.
+                updated_at = row.get('updated_at') or row.get('ts') or row.get('timestamp')
+                try:
+                    updated_float = float(updated_at or 0)
+                except (TypeError, ValueError):
+                    updated_float = 0.0
+
+                # If timestamp looks like ms, convert to seconds.
+                if updated_float > 10_000_000_000:
+                    updated_float = updated_float / 1000.0
+
+                if updated_float and now_ts - updated_float > 300:
+                    continue
+
+                pos_side = str(row.get('pos_side') or '').upper()
+                if pos_side not in {'', 'NONE', 'NO_POSITION'}:
+                    status_symbols.append(symbol)
+
+            if status_symbols:
+                return sorted(status_symbols, key=self._telegram_status_symbol_key)[0]
 
         return self._get_current_symbol()
 
