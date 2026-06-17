@@ -527,12 +527,12 @@ def apply_stable_utbreak_final_overrides(cfg):
         "quality_score_v2_block_below": 20.0,
         "quality_score_v2_reduce_below": 50.0,
         "quality_score_v2_15m_block_below": 20.0,
-        "quality_score_v2_15m_reduce_below": 55.0,
+        "quality_score_v2_15m_reduce_below": 50.0,
 
         "quality_score_v2_long_block_below": 20.0,
         "quality_score_v2_long_reduce_below": 50.0,
         "quality_score_v2_long_15m_block_below": 20.0,
-        "quality_score_v2_long_15m_reduce_below": 55.0,
+        "quality_score_v2_long_15m_reduce_below": 50.0,
 
         "quality_score_v2_short_block_below": 25.0,
         "quality_score_v2_short_reduce_below": 60.0,
@@ -25416,7 +25416,19 @@ class MainController:
         if scanner_symbol:
             return scanner_symbol
 
-        next_symbol, _ = await self._resolve_next_utbreakout_scan_candidate(excluded_symbols=position_symbols)
+        next_symbol = None
+        try:
+            if engine and hasattr(engine, "_resolve_next_utbreakout_scan_candidate"):
+                next_symbol, _ = await engine._resolve_next_utbreakout_scan_candidate(
+                    excluded_symbols=position_symbols
+                )
+            elif hasattr(self, "_resolve_next_utbreakout_scan_candidate"):
+                next_symbol, _ = await self._resolve_next_utbreakout_scan_candidate(
+                    excluded_symbols=position_symbols
+                )
+        except Exception as exc:
+            logger.warning(f"UTBreak next candidate status lookup failed: {exc}")
+
         if next_symbol:
             return next_symbol
 

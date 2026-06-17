@@ -39,6 +39,34 @@ def test_weak_volume_reduces_size_not_block():
     assert decision.size_multiplier == 0.5
 
 
+def test_direction_filter_does_not_ignore_zero_quality_score():
+    decision = decide_direction(
+        btc_4h={"close": 105, "ema_fast": 103, "ema_slow": 100, "ema_slope": 0.1},
+        btc_1d={"close": 110, "ema_fast": 105, "ema_slow": 100, "ema_slope": 0.1},
+        symbol_1h={"close": 55, "ema_fast": 53, "ema_slow": 50, "ema_slope": 0.1},
+        entry_15m={
+            "volume_ratio": 0.8,
+            "quality_score": 0,
+            "quality_score_v2": 80,
+        },
+        side_hint="long",
+    )
+    assert decision.long_allowed is False
+    assert decision.size_multiplier == 0.0
+
+
+def test_direction_filter_weak_volume_reduces_size_not_block():
+    decision = decide_direction(
+        btc_4h={"close": 105, "ema_fast": 103, "ema_slow": 100, "ema_slope": 0.1},
+        btc_1d={"close": 110, "ema_fast": 105, "ema_slow": 100, "ema_slope": 0.1},
+        symbol_1h={"close": 55, "ema_fast": 53, "ema_slow": 50, "ema_slope": 0.1},
+        entry_15m={"volume_ratio": 0.50, "quality_score": 60},
+        side_hint="long",
+    )
+    assert decision.long_allowed is True
+    assert decision.size_multiplier == 0.5
+
+
 def test_extreme_volume_blocks():
     decision = decide_direction(
         btc_4h={"close": 105, "ema_fast": 103, "ema_slow": 100, "ema_slope": 0.1},
@@ -74,4 +102,3 @@ def test_quality_score_zero_handling():
     # volume_ratio 0.8 is volume ok (1.0). quality unknown is 0.85. 1.0 * 0.85 = 0.85
     assert decision_none.long_allowed is True
     assert decision_none.size_multiplier == 0.85
-

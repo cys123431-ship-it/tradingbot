@@ -41,6 +41,13 @@ def _slope_value(metrics: Mapping[str, Any], *names: str) -> float:
     return 0.0
 
 
+def _first_present(metrics: Mapping[str, Any], names: list[str]) -> Any:
+    for name in names:
+        if name in metrics and metrics.get(name) is not None:
+            return metrics.get(name)
+    return None
+
+
 def _close_ema_bias(metrics: Mapping[str, Any]) -> str:
     close = _f(metrics.get("close") or metrics.get("last") or metrics.get("price"))
     ema_fast = _f(
@@ -93,13 +100,10 @@ def _volume_multiplier(metrics: Mapping[str, Any]) -> tuple[float, str]:
 
 
 def _quality_multiplier(metrics: Mapping[str, Any]) -> tuple[float, str]:
-    raw_val = None
-    for k in ["quality_score", "quality_score_v2", "strategy_quality", "trend_health"]:
-        val = metrics.get(k)
-        if val is not None:
-            raw_val = val
-            break
-    score = _f(raw_val)
+    score = _f(_first_present(
+        metrics,
+        ["quality_score", "quality_score_v2", "strategy_quality", "trend_health"],
+    ))
     if score is None:
         return 0.85, "quality unknown"
     if score < 20:

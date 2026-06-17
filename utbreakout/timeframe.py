@@ -213,7 +213,7 @@ def select_adaptive_timeframe(timeframe_metrics, cfg=None, state=None, position_
     state = state or {}
     allowed = cfg.get("adaptive_timeframes") or cfg.get("auto_timeframes") or TIMEFRAME_ORDER
     allowed = [str(tf).strip().lower() for tf in allowed if str(tf).strip()]
-    allowed = [tf for tf in allowed if tf in TIMEFRAME_MS and tf != "5m"] or list(TIMEFRAME_ORDER)
+    allowed = [tf for tf in allowed if tf in TIMEFRAME_ORDER] or list(TIMEFRAME_ORDER)
 
     # UTBot should prefer stable 15m/30m execution instead of frequently switching.
     min_score = finite_float(cfg.get("adaptive_timeframe_min_score"), 38.0)

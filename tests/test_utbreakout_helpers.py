@@ -895,6 +895,42 @@ def test_utbreakout_status_symbol_uses_scanner_when_no_position():
     assert symbol == "SOL/USDT"
 
 
+@pytest.mark.asyncio
+async def test_main_controller_status_symbol_key_exists():
+    from emas import MainController
+
+    ctrl = MainController.__new__(MainController)
+    assert ctrl._utbreakout_status_symbol_key("BTC/USDT:USDT") == "BTCUSDT"
+
+
+@pytest.mark.asyncio
+async def test_status_symbol_uses_engine_next_candidate_before_stale_status():
+    from emas import MainController, CORE_ENGINE
+
+    class DummyEngine:
+        scanner_active_symbol = None
+
+        async def get_active_position_symbols(self, use_cache=False):
+            return set()
+
+        async def _resolve_next_utbreakout_scan_candidate(self, excluded_symbols=None):
+            return "BTC/USDT:USDT", {"exchange_symbol": "BTC/USDT:USDT"}
+
+    ctrl = MainController.__new__(MainController)
+    ctrl.engines = {CORE_ENGINE: DummyEngine()}
+    ctrl.status_data = {
+        "ETH/USDT": {
+            "symbol": "ETH/USDT",
+            "pos_side": "NONE",
+            "updated_at": 0,
+        }
+    }
+    ctrl._get_current_symbol = lambda: "ETH/USDT"
+
+    result = await ctrl._resolve_utbreakout_status_symbol()
+    assert result == "BTC/USDT:USDT"
+
+
 def test_main_keyboard_removes_utbot_button():
     emas = _emas_module()
     controller = emas.MainController.__new__(emas.MainController)

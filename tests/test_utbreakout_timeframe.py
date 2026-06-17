@@ -110,3 +110,43 @@ def test_adaptive_timeframe_excludes_unwanted_timeframes():
     # 5m, 2h, 4h are excluded, so it must fall back to 15m (which is valid and has high score compared to 1h)
     assert decision["selected_tf"] == "15m"
 
+
+def test_adaptive_timeframe_excludes_2h_even_if_cfg_contains_it():
+    metrics = {
+        "15m": {
+            "ready": True,
+            "close": 100,
+            "ema_fast": 101,
+            "ema_slow": 99,
+            "adx": 30,
+            "chop": 40,
+            "atr_pct": 0.5,
+            "ema_gap_pct": 0.3,
+            "donchian_width_pct": 1.0,
+            "range_expansion_ratio": 1.2,
+            "volume_ratio": 1.0,
+            "donchian_ready": True,
+            "ema_bias": "long",
+        },
+        "2h": {
+            "ready": True,
+            "close": 100,
+            "ema_fast": 101,
+            "ema_slow": 99,
+            "adx": 90,
+            "chop": 10,
+            "atr_pct": 0.5,
+            "ema_gap_pct": 0.3,
+            "donchian_width_pct": 1.0,
+            "range_expansion_ratio": 1.2,
+            "volume_ratio": 1.0,
+            "donchian_ready": True,
+            "ema_bias": "long",
+        },
+    }
+    result = select_adaptive_timeframe(
+        metrics,
+        cfg={"adaptive_timeframes": ["15m", "2h"], "adaptive_timeframe_min_score": 1},
+    )
+    assert result["selected_tf"] == "15m"
+    assert all(item["tf"] != "2h" for item in result["scores"])
