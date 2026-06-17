@@ -895,16 +895,14 @@ def test_utbreakout_status_symbol_uses_scanner_when_no_position():
     assert symbol == "SOL/USDT"
 
 
-@pytest.mark.asyncio
-async def test_main_controller_status_symbol_key_exists():
+def test_main_controller_status_symbol_key_exists():
     from emas import MainController
 
     ctrl = MainController.__new__(MainController)
     assert ctrl._utbreakout_status_symbol_key("BTC/USDT:USDT") == "BTCUSDT"
 
 
-@pytest.mark.asyncio
-async def test_status_symbol_uses_engine_next_candidate_before_stale_status():
+def test_status_symbol_uses_engine_next_candidate_before_stale_status():
     from emas import MainController, CORE_ENGINE
 
     class DummyEngine:
@@ -927,7 +925,7 @@ async def test_status_symbol_uses_engine_next_candidate_before_stale_status():
     }
     ctrl._get_current_symbol = lambda: "ETH/USDT"
 
-    result = await ctrl._resolve_utbreakout_status_symbol()
+    result = asyncio.run(ctrl._resolve_utbreakout_status_symbol())
     assert result == "BTC/USDT:USDT"
 
 
