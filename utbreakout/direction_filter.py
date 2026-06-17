@@ -93,12 +93,13 @@ def _volume_multiplier(metrics: Mapping[str, Any]) -> tuple[float, str]:
 
 
 def _quality_multiplier(metrics: Mapping[str, Any]) -> tuple[float, str]:
-    score = _f(
-        metrics.get("quality_score")
-        or metrics.get("quality_score_v2")
-        or metrics.get("strategy_quality")
-        or metrics.get("trend_health")
-    )
+    raw_val = None
+    for k in ["quality_score", "quality_score_v2", "strategy_quality", "trend_health"]:
+        val = metrics.get(k)
+        if val is not None:
+            raw_val = val
+            break
+    score = _f(raw_val)
     if score is None:
         return 0.85, "quality unknown"
     if score < 20:

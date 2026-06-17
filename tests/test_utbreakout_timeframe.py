@@ -95,3 +95,18 @@ def test_adaptive_timeframe_position_lock_keeps_entry_tf():
 
     assert decision["selected_tf"] == "15m"
     assert decision["decision"] == "POSITION_LOCKED"
+
+
+def test_adaptive_timeframe_excludes_unwanted_timeframes():
+    # Even if 2h or 4h or 5m are present in metrics, they should be filtered out from candidate selection and not be chosen.
+    metrics = {
+        "5m": _metrics(adx=50.0, chop=20.0), # highly scored but not in candidates
+        "15m": _metrics(adx=30.0, chop=40.0), # acceptable
+        "1h": _metrics(adx=15.0, chop=60.0), # noisy
+        "2h": _metrics(adx=50.0, chop=20.0), # highly scored but not in candidates
+        "4h": _metrics(adx=50.0, chop=20.0), # highly scored but not in candidates
+    }
+    decision = select_adaptive_timeframe(metrics, {"adaptive_timeframe_min_score": 10.0})
+    # 5m, 2h, 4h are excluded, so it must fall back to 15m (which is valid and has high score compared to 1h)
+    assert decision["selected_tf"] == "15m"
+

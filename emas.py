@@ -482,6 +482,80 @@ UTBREAKOUT_ACTIVE_SET_MAX = 63
 UTBREAKOUT_DEFAULT_SET_ID = 2
 UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID = 22
 UTBREAKOUT_AUTO_TIMEFRAMES = ["15m", "30m", "1h"]
+UTBREAKOUT_RUNTIME_PROFILE = "stable_15m_direction_filter_v1"
+
+
+def apply_stable_utbreak_final_overrides(cfg):
+    """Apply final UTBreak config overrides after selected Set params are merged.
+
+    This function must be the single source of truth for live entry evaluation
+    and Telegram condition status. Do not read raw Set params directly for
+    status/entry thresholds after this point.
+    """
+    if not isinstance(cfg, dict):
+        return cfg
+
+    cfg.update({
+        "runtime_profile": UTBREAKOUT_RUNTIME_PROFILE,
+
+        # Stable execution design
+        "auto_timeframes": ["15m", "30m", "1h"],
+        "adaptive_timeframes": ["15m", "30m", "1h"],
+        "entry_timeframe": "15m",
+        "exit_timeframe": "15m",
+        "htf_timeframe": "1h",
+
+        # Prevent frequent TF switching
+        "adaptive_timeframe_min_score": 38.0,
+        "adaptive_timeframe_switch_margin": 10.0,
+        "adaptive_timeframe_min_hold_candles": 6,
+
+        # Bias continuation thresholds
+        "bias_continuation_min_volume_ratio": 0.50,
+        "bias_continuation_15m_min_volume_ratio": 0.55,
+        "bias_continuation_min_adaptive_tf_score": 35.0,
+        "bias_continuation_15m_min_adaptive_tf_score": 38.0,
+        "bias_continuation_min_adx": 14.0,
+        "bias_continuation_15m_min_adx": 15.0,
+
+        # Hard block should be reserved for extreme bad states only
+        "trend_health_hard_block_below": 20.0,
+        "trend_health_reduce_below": 42.0,
+        "strategy_quality_hard_block_below": 12.0,
+        "strategy_quality_reduce_below": 42.0,
+
+        "quality_score_v2_block_below": 20.0,
+        "quality_score_v2_reduce_below": 50.0,
+        "quality_score_v2_15m_block_below": 20.0,
+        "quality_score_v2_15m_reduce_below": 55.0,
+
+        "quality_score_v2_long_block_below": 20.0,
+        "quality_score_v2_long_reduce_below": 50.0,
+        "quality_score_v2_long_15m_block_below": 20.0,
+        "quality_score_v2_long_15m_reduce_below": 55.0,
+
+        "quality_score_v2_short_block_below": 25.0,
+        "quality_score_v2_short_reduce_below": 60.0,
+        "quality_score_v2_short_15m_block_below": 25.0,
+        "quality_score_v2_short_15m_reduce_below": 62.0,
+
+        # Short remains stricter than long, but not dead
+        "short_adx_threshold": 20.0,
+        "short_dmi_min_gap": 2.0,
+        "short_risk_multiplier": 0.60,
+
+        # Exit profile
+        "partial_take_profit_r_multiple": 1.20,
+        "partial_take_profit_ratio": 0.35,
+        "second_take_profit_r_multiple": 2.50,
+        "second_take_profit_ratio": 0.35,
+        "dynamic_tp2_base_r_multiple": 2.30,
+        "dynamic_tp2_strong_r_multiple": 3.00,
+        "dynamic_tp2_elite_r_multiple": 4.00,
+        "atr_trailing_activation_r": 1.20,
+        "atr_trailing_multiplier": 2.50,
+    })
+    return cfg
 
 
 def _build_utbreakout_set(
@@ -5297,78 +5371,7 @@ class SignalEngine(BaseEngine):
         cfg['opposite_signal_exit_enabled'] = False
         if cfg['atr_max_percent'] < cfg['atr_min_percent']:
             cfg['atr_max_percent'] = cfg['atr_min_percent']
-        # Final stable UTBreak override.
-        # This must run after selected Set params are merged, otherwise Set51/SetXX
-        # can reintroduce overfitted conservative thresholds.
-        if isinstance(cfg, dict):
-            cfg.update({
-                'auto_timeframes': ['15m', '30m', '1h'],
-                'adaptive_timeframes': ['15m', '30m', '1h'],
-                'entry_timeframe': '15m',
-                'exit_timeframe': '15m',
-                'htf_timeframe': '1h',
-
-                'adaptive_timeframe_min_score': 38.0,
-                'adaptive_timeframe_switch_margin': 10.0,
-                'adaptive_timeframe_min_hold_candles': 6,
-
-                'bias_continuation_min_volume_ratio': 0.50,
-                'bias_continuation_15m_min_volume_ratio': 0.55,
-                'bias_continuation_min_adaptive_tf_score': 35.0,
-                'bias_continuation_15m_min_adaptive_tf_score': 38.0,
-                'bias_continuation_min_adx': 14.0,
-                'bias_continuation_15m_min_adx': 15.0,
-
-                'trend_health_hard_block_below': 25.0,
-                'trend_health_reduce_below': 42.0,
-                'strategy_quality_hard_block_below': 12.0,
-                'strategy_quality_reduce_below': 42.0,
-
-                'quality_score_v2_block_below': 30.0,
-                'quality_score_v2_reduce_below': 50.0,
-                'quality_score_v2_15m_block_below': 35.0,
-                'quality_score_v2_15m_reduce_below': 55.0,
-                'quality_score_v2_long_block_below': 30.0,
-                'quality_score_v2_long_reduce_below': 50.0,
-                'quality_score_v2_long_15m_block_below': 35.0,
-                'quality_score_v2_long_15m_reduce_below': 55.0,
-                'quality_score_v2_short_block_below': 40.0,
-                'quality_score_v2_short_reduce_below': 60.0,
-                'quality_score_v2_short_15m_block_below': 42.0,
-                'quality_score_v2_short_15m_reduce_below': 62.0,
-
-                'short_adx_threshold': 20.0,
-                'short_dmi_min_gap': 2.0,
-                'short_risk_multiplier': 0.60,
-
-                'partial_take_profit_r_multiple': 1.20,
-                'partial_take_profit_ratio': 0.35,
-                'second_take_profit_r_multiple': 2.50,
-                'second_take_profit_ratio': 0.35,
-                'dynamic_tp2_base_r_multiple': 2.30,
-                'dynamic_tp2_strong_r_multiple': 3.00,
-                'dynamic_tp2_elite_r_multiple': 4.00,
-                'atr_trailing_activation_r': 1.20,
-                'atr_trailing_multiplier': 2.50,
-
-                "trend_continuation_entry_enabled": True,
-                "trend_continuation_base_risk_multiplier": 0.60,
-                "trend_continuation_min_risk_multiplier": 0.25,
-                "trend_continuation_min_adx": 14.0,
-                "trend_continuation_max_extension_atr": 2.20,
-                "trend_continuation_flow_min_volume_ratio": 0.45,
-                "trend_continuation_min_range_expansion": 1.03,
-                "trend_continuation_quality_hard_floor": 20.0,
-                "trend_continuation_quality_reduce_floor": 45.0,
-                "trend_continuation_trend_hard_floor": 18.0,
-                "trend_continuation_trend_reduce_floor": 42.0,
-                "trend_continuation_strategy_hard_floor": 12.0,
-                "trend_continuation_strategy_reduce_floor": 42.0,
-
-                "set_filter_soft_fail_enabled": True,
-                "set_filter_soft_fail_multiplier": 0.70,
-                "set_filter_multi_soft_fail_multiplier": 0.50,
-            })
+        cfg = apply_stable_utbreak_final_overrides(cfg)
         return cfg
 
     def _get_utbot_filtered_breakout_ut_params(self, cfg):
@@ -9666,43 +9669,36 @@ class SignalEngine(BaseEngine):
             sym_1h = self._build_direction_metrics_dict(sym_1h_raw)
             
             dir_decision = decide_direction(
-                side_hint=side,
                 btc_4h=btc_4h,
                 btc_1d=btc_1d,
                 symbol_1h=sym_1h,
-                entry_15m={
-                    "volume_ratio": filter_values.get("volume_ratio"),
-                    "quality_score_v2": quality_score_v2.get("score"),
-                    "strategy_quality": strategy_quality.get("score"),
-                    "trend_health": trend_health.get("score"),
-                },
+                entry_15m=filter_values or {},
+                side_hint=side,
             )
 
-            direction_allowed = (
-                dir_decision.long_allowed
-                if side == "long"
+            allowed_by_direction = (
+                dir_decision.long_allowed if str(side).lower() == "long"
                 else dir_decision.short_allowed
             )
 
-            status['direction_decision'] = {
-                "allowed": direction_allowed,
-                "long_allowed": dir_decision.long_allowed,
-                "short_allowed": dir_decision.short_allowed,
+            status["direction_decision"] = {
+                "allowed": allowed_by_direction,
                 "regime": dir_decision.regime,
                 "size_multiplier": dir_decision.size_multiplier,
-                "reasons": [dir_decision.reason],
+                "reason": dir_decision.reason,
             }
 
-            if not direction_allowed:
+            if not allowed_by_direction:
                 return _finish(
                     None,
                     f"REJECTED_DIRECTION_FILTER: {dir_decision.reason}",
-                    'REJECTED_DIRECTION_FILTER',
+                    "REJECTED_DIRECTION_FILTER",
                     record_failure=True,
-                    side=side
+                    side=side,
                 )
         except Exception as exc:
-            log.error("decide_direction overlay failed: %s", exc)
+            status["direction_decision_error"] = str(exc)
+            log.exception("decide_direction overlay failed")
 
         continuation_decision = None
         try:
@@ -10273,6 +10269,7 @@ class SignalEngine(BaseEngine):
 
     async def build_utbreakout_condition_status_text(self, symbol):
         cfg = self._get_utbot_filtered_breakout_config(self.get_runtime_strategy_params())
+        cfg = apply_stable_utbreak_final_overrides(cfg)
         common_cfg = self.get_runtime_common_settings()
         lev = int(max(1.0, float(common_cfg.get('leverage', 5) or 5)))
         entry_tf = cfg.get('entry_timeframe', '15m')
@@ -10359,6 +10356,7 @@ class SignalEngine(BaseEngine):
         effective_cfg['active_set_id'] = selected_set.get('id', cfg.get('active_set_id', UTBREAKOUT_DEFAULT_SET_ID))
         effective_cfg['profile'] = f"set{effective_cfg['active_set_id']}"
         cfg = effective_cfg
+        cfg = apply_stable_utbreak_final_overrides(cfg)
         entry_tf = cfg.get('entry_timeframe', '15m')
         htf_tf = cfg.get('htf_timeframe', '1h')
 
@@ -10877,9 +10875,18 @@ class SignalEngine(BaseEngine):
             f"Feature Score: {_fmt(status_feature_score.get('score'), 1)} / "
             f"{status_feature_score.get('reason') or 'n/a'}"
         )
+        adaptive_tfs = cfg.get("adaptive_timeframes", ["15m", "30m", "1h"])
+        tp2 = float(cfg.get("second_take_profit_r_multiple", 2.50) or 2.50)
+        vol_base = float(cfg.get("bias_continuation_min_volume_ratio", 0.50) or 0.50)
+        vol_15m = float(cfg.get("bias_continuation_15m_min_volume_ratio", 0.55) or 0.55)
+
         text_lines = [
             "🚦 UT Breakout 조건 스테이터스",
             *position_scan_context,
+            f"Runtime Profile: {cfg.get('runtime_profile', UTBREAKOUT_RUNTIME_PROFILE)}",
+            f"Effective TF: entry {entry_tf} / htf {htf_tf} / adaptive {', '.join(map(str, adaptive_tfs))}",
+            f"Effective TP2: {tp2:.2f}R",
+            f"Effective volume: base {vol_base:.2f} / 15m {vol_15m:.2f}",
             f"TF: 진입 {entry_tf} / HTF {htf_tf}",
             f"Adaptive TF: {'ON' if cfg.get('adaptive_timeframe_enabled') else 'OFF'} / {self._format_adaptive_timeframe_summary(adaptive_decision) if adaptive_decision else '고정 시간봉'}",
             f"마지막 마감봉: {_fmt_ts(decision_ts)} / close {_fmt(entry_price, 4)}",
@@ -10915,6 +10922,7 @@ class SignalEngine(BaseEngine):
         common_cfg = self.get_runtime_common_settings()
         active_strategy = str(strategy_params.get('active_strategy', 'utbot') or 'utbot').lower()
         cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+        cfg = apply_stable_utbreak_final_overrides(cfg)
         entry_tf = str(cfg.get('entry_timeframe', '15m') or '15m').lower()
         htf_tf = str(cfg.get('htf_timeframe', '1h') or '1h').lower()
         display_symbol = self.ctrl.format_symbol_for_display(symbol)
@@ -11063,6 +11071,7 @@ class SignalEngine(BaseEngine):
         effective_cfg['active_set_id'] = selected_set.get('id', cfg.get('active_set_id', UTBREAKOUT_DEFAULT_SET_ID))
         effective_cfg['profile'] = f"set{effective_cfg['active_set_id']}"
         cfg = effective_cfg
+        cfg = apply_stable_utbreak_final_overrides(cfg)
         entry_tf = str(cfg.get('entry_timeframe', entry_tf) or entry_tf).lower()
         htf_tf = str(cfg.get('htf_timeframe', htf_tf) or htf_tf).lower()
 
