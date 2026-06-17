@@ -484,6 +484,36 @@ UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID = 22
 UTBREAKOUT_AUTO_TIMEFRAMES = ["15m", "30m", "1h"]
 UTBREAKOUT_RUNTIME_PROFILE = "stable_15m_direction_filter_v1"
 
+# Live AUTO set hardening:
+# Keep live AUTO narrow to reduce many-set overfitting / multiple-testing risk.
+UTBREAKOUT_LIVE_AUTO_SET_WHITELIST = frozenset({22, 32, 51, 63})
+
+# Selected Set identity filters that must hard-block when they fail in live mode.
+# These are the core filters that define the selected Set itself.
+UTBREAKOUT_CORE_SET_FILTER_HARD_NAMES = frozenset({
+    'Donchian 돌파',
+    'BB 밴드 돌파',
+    'Keltner 돌파',
+    'Range 확장봉',
+    '거래량 급증',
+    '상대 거래량',
+    'Rolling OFI 확인',
+    'OI/Funding Squeeze',
+    'Squeeze Release 돌파',
+    'Futures 수급 불균형',
+    'OI/Funding 과열회피',
+})
+
+UTBREAKOUT_CORE_SET_FILTER_HARD_CODES = frozenset({
+    'REJECTED_DONCHIAN_NO_BREAKOUT',
+    'REJECTED_RELATIVE_VOLUME_CORE',
+    'REJECTED_ROLLING_OFI',
+    'REJECTED_OI_FUNDING_SQUEEZE',
+    'REJECTED_SQUEEZE_RELEASE',
+    'REJECTED_PREDICTION_FLOW',
+    'REJECTED_PREDICTION_CROWDING',
+})
+
 
 def apply_stable_utbreak_final_overrides(cfg):
     """Apply final UTBreak config overrides after selected Set params are merged.
@@ -883,6 +913,104 @@ def is_utbreakout_live_mode_value(value):
     return text in {BINANCE_MAINNET, 'mainnet', 'live', 'real', 'production', 'prod'}
 
 
+def normalize_utbreakout_set_id_list(value, default=None):
+    """Normalize comma/list style Set IDs into active UTBreakout set IDs."""
+    default_values = list(default or [])
+    if value is None:
+        raw_items = default_values
+    elif isinstance(value, str):
+        raw_items = [item.strip() for item in value.split(',') if item.strip()]
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        raw_items = list(value)
+    else:
+        raw_items = default_values
+
+    result = []
+    for item in raw_items:
+        try:
+            set_id = normalize_utbreakout_set_id(item, None)
+        except Exception:
+            continue
+        if set_id in UTBREAKOUT_SET_REGISTRY and set_id <= UTBREAKOUT_ACTIVE_SET_MAX:
+            if set_id not in result:
+                result.append(int(set_id))
+
+    if not result:
+        result = [int(v) for v in default_values if int(v) in UTBREAKOUT_SET_REGISTRY]
+    return result
+
+
+def build_utbreakout_effective_config_diff_text(raw_cfg, effective_cfg):
+    """Format raw/effective UTBreakout config differences for Telegram diagnostics."""
+    raw_cfg = dict(raw_cfg or {})
+    effective_cfg = dict(effective_cfg or {})
+
+    watch_keys = [
+        'runtime_profile',
+        'selection_mode',
+        'auto_select_enabled',
+        'active_set_id',
+        'safe_live_default_set_id',
+        'live_safety_guard_enabled',
+        'live_auto_set_whitelist_enabled',
+        'live_auto_set_whitelist',
+        'auto_min_score_margin_live',
+        'auto_min_adjusted_score_live',
+        'auto_block_on_weak_margin_live',
+        'auto_multiple_testing_penalty_enabled',
+        'selected_set_core_filter_hard_block_enabled',
+        'set32_min_relative_volume',
+        'set32_require_direction_candle',
+        'set32_require_ema50_side',
+        'set32_require_orderflow_confirmation',
+        'set32_orderflow_min_samples',
+        'market_quality_long_hard_block_on_multi_adverse_enabled',
+        'market_quality_long_multi_adverse_min_reasons',
+        'market_quality_long_multi_adverse_max_multiplier',
+        'entry_timeframe',
+        'exit_timeframe',
+        'htf_timeframe',
+        'partial_take_profit_r_multiple',
+        'partial_take_profit_ratio',
+        'second_take_profit_r_multiple',
+        'second_take_profit_ratio',
+        'atr_trailing_activation_r',
+        'atr_trailing_multiplier',
+    ]
+
+    lines = [
+        '🧾 UT Breakout Config Diff',
+        '',
+        '[Effective 핵심값]',
+    ]
+
+    for key in watch_keys:
+        if key in effective_cfg:
+            lines.append(f"- {key}: {effective_cfg.get(key)!r}")
+
+    changed = []
+    for key in sorted(set(raw_cfg.keys()) | set(effective_cfg.keys())):
+        raw_value = raw_cfg.get(key, '<missing>')
+        eff_value = effective_cfg.get(key, '<missing>')
+        if raw_value != eff_value:
+            changed.append((key, raw_value, eff_value))
+
+    lines.extend([
+        '',
+        '[Raw -> Effective 변경값]',
+    ])
+
+    if not changed:
+        lines.append('- 변경 없음')
+    else:
+        for key, raw_value, eff_value in changed[:120]:
+            lines.append(f"- {key}: {raw_value!r} -> {eff_value!r}")
+        if len(changed) > 120:
+            lines.append(f"- ... and {len(changed) - 120} more")
+
+    return '\n'.join(lines)
+
+
 def validate_utbreakout_runtime_set_id(cfg, set_id, is_live=False):
     cfg = cfg if isinstance(cfg, dict) else {}
     selected_id = normalize_utbreakout_set_id(set_id, UTBREAKOUT_DEFAULT_SET_ID)
@@ -902,6 +1030,24 @@ def validate_utbreakout_runtime_set_id(cfg, set_id, is_live=False):
         or is_utbreakout_live_mode_value(cfg.get('mode'))
         or is_utbreakout_live_mode_value(cfg.get('exchange_mode'))
     )
+
+    auto_mode = (
+        _parse_bool_like(cfg.get('auto_select_enabled', False), False)
+        or str(cfg.get('selection_mode') or '').strip().lower() == 'auto'
+    )
+
+    if inferred_live and auto_mode and _parse_bool_like(cfg.get('live_auto_set_whitelist_enabled', True), True):
+        whitelist = normalize_utbreakout_set_id_list(
+            cfg.get('live_auto_set_whitelist'),
+            UTBREAKOUT_LIVE_AUTO_SET_WHITELIST,
+        )
+        if selected_id not in whitelist:
+            return safe_id, (
+                f"Set{selected_id} live AUTO whitelist blocked "
+                f"(allowed {','.join('Set' + str(x) for x in whitelist)}) "
+                f"-> Set{safe_id} safety fallback"
+            )
+
     if selected_id == 1 and inferred_live and not _parse_bool_like(cfg.get('allow_ut_only_live_override', False), False):
         return safe_id, f"Set1 UT-only live blocked -> Set{safe_id} safety fallback"
     if selected_id == 50 and not (
@@ -946,6 +1092,17 @@ def build_default_utbot_filtered_breakout_config():
         'allow_emergency_simple_set': False,
         'auto_select_enabled': False,
         'selection_mode': 'manual',
+
+        # Live AUTO overfit guards
+        'live_auto_set_whitelist_enabled': True,
+        'live_auto_set_whitelist': list(sorted(UTBREAKOUT_LIVE_AUTO_SET_WHITELIST)),
+        'auto_min_score_margin_live': 3.0,
+        'auto_min_adjusted_score_live': 50.0,
+        'auto_block_on_weak_margin_live': True,
+        'auto_multiple_testing_penalty_enabled': True,
+        'multiple_testing_free_trials': 10,
+        'multiple_testing_max_score_penalty': 12.0,
+
         'auto_timeframes': list(UTBREAKOUT_AUTO_TIMEFRAMES),
         'adaptive_timeframe_enabled': False,
         'adaptive_timeframes': list(UTBREAKOUT_AUTO_TIMEFRAMES),
@@ -1047,6 +1204,9 @@ def build_default_utbot_filtered_breakout_config():
         'walk_forward_report_enabled': False,
         'market_quality_data_required': False,
         'market_quality_min_risk_multiplier': 0.25,
+        'market_quality_long_hard_block_on_multi_adverse_enabled': True,
+        'market_quality_long_multi_adverse_min_reasons': 3,
+        'market_quality_long_multi_adverse_max_multiplier': 0.35,
         'market_quality_high_atr_pct': 1.5,
         'market_quality_extreme_atr_pct': 2.5,
         'market_quality_adverse_funding_soft': 0.0006,
@@ -1095,6 +1255,20 @@ def build_default_utbot_filtered_breakout_config():
         'meta_labeling_min_samples': 12,
         'meta_labeling_min_multiplier': 0.5,
         'strategy_adaptive_min_risk_multiplier': 0.25,
+        'selected_set_core_filter_hard_block_enabled': True,
+        'set_filter_soft_fail_enabled': True,
+        'set_filter_soft_fail_multiplier': 0.70,
+        'set_filter_multi_soft_fail_multiplier': 0.50,
+
+        # Set32 live strengthening
+        'set32_min_relative_volume': 1.50,
+        'set32_require_direction_candle': True,
+        'set32_require_ema50_side': True,
+        'set32_require_orderflow_confirmation': True,
+        'set32_orderflow_min_samples': 3,
+        'set32_min_taker_ratio_long': 1.00,
+        'set32_max_taker_ratio_short': 1.00,
+        'set32_max_spread_pct': 0.05,
         'short_asymmetry_enabled': True,
         'short_partial_take_profit_r_delta': 0.20,
         'short_partial_take_profit_ratio_add': 0.10,
@@ -5094,6 +5268,9 @@ class SignalEngine(BaseEngine):
             'daily_max_loss_usdt': 3.0,
             'daily_profit_target_usdt': 5.0,
             'opposite_set_exit_min_pnl_usdt': 0.0,
+            'auto_min_score_margin_live': 3.0,
+            'auto_min_adjusted_score_live': 50.0,
+            'multiple_testing_max_score_penalty': 12.0,
             'adaptive_timeframe_min_score': 38.0,
             'adaptive_timeframe_switch_margin': 10.0,
             'partial_take_profit_r_multiple': 1.20,
@@ -5107,6 +5284,7 @@ class SignalEngine(BaseEngine):
             'market_quality_extreme_atr_pct': 2.5,
             'market_quality_adverse_funding_soft': 0.0006,
             'market_quality_adverse_funding_hard': 0.0015,
+            'market_quality_long_multi_adverse_max_multiplier': 0.35,
             'market_quality_regime_strong_move_pct': 1.5,
             'squeeze_volume_ratio_min': 1.20,
             'runner_structure_buffer_atr': 0.20,
@@ -5135,6 +5313,12 @@ class SignalEngine(BaseEngine):
             'volatility_target_min_multiplier': 0.25,
             'meta_labeling_min_multiplier': 0.5,
             'strategy_adaptive_min_risk_multiplier': 0.25,
+            'set_filter_soft_fail_multiplier': 0.70,
+            'set_filter_multi_soft_fail_multiplier': 0.50,
+            'set32_min_relative_volume': 1.50,
+            'set32_min_taker_ratio_long': 1.00,
+            'set32_max_taker_ratio_short': 1.00,
+            'set32_max_spread_pct': 0.05,
             'short_partial_take_profit_r_delta': 0.20,
             'short_partial_take_profit_ratio_add': 0.10,
             'short_atr_trailing_multiplier_delta': 0.25,
@@ -5215,6 +5399,9 @@ class SignalEngine(BaseEngine):
             'max_consecutive_losses': 3,
             'sl_place_max_retries': 3,
             'opposite_set_exit_min_hold_candles': 3,
+            'multiple_testing_free_trials': 10,
+            'market_quality_long_multi_adverse_min_reasons': 3,
+            'set32_orderflow_min_samples': 3,
             'adaptive_timeframe_min_hold_candles': 6,
             'shadow_triple_barrier_max_bars': 24,
             'shadow_runner_max_bars': 48,
@@ -5260,6 +5447,10 @@ class SignalEngine(BaseEngine):
         else:
             auto_timeframes = list(UTBREAKOUT_AUTO_TIMEFRAMES)
         cfg['auto_timeframes'] = auto_timeframes or list(UTBREAKOUT_AUTO_TIMEFRAMES)
+        cfg['live_auto_set_whitelist'] = normalize_utbreakout_set_id_list(
+            cfg.get('live_auto_set_whitelist'),
+            UTBREAKOUT_LIVE_AUTO_SET_WHITELIST,
+        )
         raw_adaptive_timeframes = cfg.get('adaptive_timeframes', cfg['auto_timeframes'])
         if isinstance(raw_adaptive_timeframes, str):
             adaptive_timeframes = [item.strip().lower() for item in raw_adaptive_timeframes.split(',') if item.strip()]
@@ -5337,6 +5528,15 @@ class SignalEngine(BaseEngine):
             'aggressive_growth_kelly_enabled',
             'aggressive_growth_cppi_enabled',
             'live_safety_guard_enabled',
+            'live_auto_set_whitelist_enabled',
+            'auto_block_on_weak_margin_live',
+            'auto_multiple_testing_penalty_enabled',
+            'market_quality_long_hard_block_on_multi_adverse_enabled',
+            'selected_set_core_filter_hard_block_enabled',
+            'set_filter_soft_fail_enabled',
+            'set32_require_direction_candle',
+            'set32_require_ema50_side',
+            'set32_require_orderflow_confirmation',
             'allow_ut_only_live_override',
             'emergency_mode',
             'allow_emergency_simple_set',
@@ -6263,6 +6463,67 @@ class SignalEngine(BaseEngine):
             62: 23.0 + (oi_funding_squeeze * 0.42) + (prediction_basis * 0.08) + (trend * 0.05),
             63: 24.0 + (squeeze_release * 0.38) + (range_expansion * 0.12) + (volatility * 0.05),
         }
+        raw_candidate_scores = dict(candidate_scores)
+        is_live_runtime = self._is_utbreakout_live_runtime(cfg)
+
+        if isinstance(raw_scores, dict):
+            raw_scores['auto_candidate_scores_raw'] = {
+                f"Set{set_id}": round(float(score), 2)
+                for set_id, score in sorted(raw_candidate_scores.items())
+            }
+
+        if is_live_runtime and bool(cfg.get('live_auto_set_whitelist_enabled', True)):
+            whitelist = set(normalize_utbreakout_set_id_list(
+                cfg.get('live_auto_set_whitelist'),
+                UTBREAKOUT_LIVE_AUTO_SET_WHITELIST,
+            ))
+            candidate_scores = {
+                set_id: score
+                for set_id, score in candidate_scores.items()
+                if set_id in whitelist
+            }
+            if isinstance(raw_scores, dict):
+                raw_scores['auto_live_whitelist'] = sorted(int(x) for x in whitelist)
+
+            if not candidate_scores:
+                fallback_id = normalize_utbreakout_set_id(
+                    cfg.get('safe_live_default_set_id', UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID),
+                    UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID,
+                )
+                if fallback_id in {1, 50}:
+                    fallback_id = UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID
+                if isinstance(raw_scores, dict):
+                    raw_scores['auto_blocked_by_whitelist'] = True
+                    raw_scores['auto_block_reason'] = 'live AUTO whitelist removed all candidates'
+                    raw_scores['auto_final_set_id'] = int(fallback_id)
+                return fallback_id, f"AUTO live whitelist 후보 없음 -> Set{fallback_id} safety fallback"
+
+        multiple_testing_penalty_points = 0.0
+        if is_live_runtime and bool(cfg.get('auto_multiple_testing_penalty_enabled', True)):
+            trial_count = max(1, len(raw_candidate_scores))
+            free_trials = int(cfg.get('multiple_testing_free_trials', 10) or 10)
+            if trial_count > free_trials:
+                try:
+                    multiple_testing_penalty_points = min(
+                        float(cfg.get('multiple_testing_max_score_penalty', 12.0) or 12.0),
+                        2.0 * float(np.log(max(trial_count, 1))),
+                    )
+                except Exception:
+                    multiple_testing_penalty_points = 0.0
+
+            if multiple_testing_penalty_points > 0:
+                candidate_scores = {
+                    set_id: score - multiple_testing_penalty_points
+                    for set_id, score in candidate_scores.items()
+                }
+
+        if isinstance(raw_scores, dict):
+            raw_scores['auto_multiple_testing_penalty_points'] = round(float(multiple_testing_penalty_points), 2)
+            raw_scores['auto_candidate_scores_adjusted'] = {
+                f"Set{set_id}": round(float(score), 2)
+                for set_id, score in sorted(candidate_scores.items())
+            }
+
         selected_id, selected_score = max(candidate_scores.items(), key=lambda item: item[1])
         top3 = sorted(candidate_scores.items(), key=lambda item: item[1], reverse=True)[:3]
         top3_text = ", ".join(f"Set{set_id}:{score:.1f}" for set_id, score in top3)
@@ -6280,6 +6541,22 @@ class SignalEngine(BaseEngine):
             raw_scores['auto_selected_score'] = round(float(selected_score), 2)
             raw_scores['auto_score_margin'] = round(float(score_margin), 2)
             raw_scores['auto_confidence'] = 'weak' if selected_score < 50.0 or score_margin < 3.0 else 'normal'
+            min_live_score = float(cfg.get('auto_min_adjusted_score_live', 50.0) or 50.0)
+            min_live_margin = float(cfg.get('auto_min_score_margin_live', 3.0) or 3.0)
+            weak_live_margin = bool(is_live_runtime and score_margin < min_live_margin)
+            weak_live_score = bool(is_live_runtime and selected_score < min_live_score)
+            raw_scores['auto_live_score_threshold'] = round(float(min_live_score), 2)
+            raw_scores['auto_live_margin_threshold'] = round(float(min_live_margin), 2)
+
+            if (
+                bool(cfg.get('auto_block_on_weak_margin_live', True))
+                and (weak_live_margin or weak_live_score)
+            ):
+                raw_scores['auto_blocked_by_margin'] = True
+                raw_scores['auto_block_reason'] = (
+                    f"live AUTO weak edge: score {selected_score:.1f}/{min_live_score:.1f}, "
+                    f"margin {score_margin:.1f}/{min_live_margin:.1f}, top {top3_text}"
+                )
         if selected_score < 50.0:
             selected_id = 2 if volatility < 45.0 else 49 if fallback >= 55.0 else normalize_utbreakout_set_id(
                 cfg.get('safe_live_default_set_id', UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID),
@@ -6298,8 +6575,8 @@ class SignalEngine(BaseEngine):
                 f"trend {trend:.1f}, chop {chop:.1f}, vol {volatility:.1f}, "
                 f"breakout {breakout:.1f}, momentum {momentum:.1f}, flow {flow:.1f}, align {alignment:.1f}, "
                 f"bbExp {bb_expansion:.1f}, keltner {keltner_expansion:.1f}, pullback {pullback:.1f} "
-                f"-> Set{selected_id} score {selected_score:.1f} "
-                f"(top {top3_text})"
+                f"-> Set{selected_id} adjusted score {selected_score:.1f} "
+                f"(penalty {multiple_testing_penalty_points:.1f}, margin {score_margin:.1f}, top {top3_text})"
             )
         if isinstance(raw_scores, dict):
             raw_scores['auto_final_set_id'] = int(selected_id)
@@ -6661,11 +6938,82 @@ class SignalEngine(BaseEngine):
                     _add('거래량 급증', ok, f"relVol {_fmt(volume_ratio, 2)} / 방향봉 {'OK' if candle_ok else 'NO'}", 'REJECTED_RSI_MOMENTUM')
             elif filter_name == 'relative_volume':
                 volume_ratio = values.get('volume_ratio')
+                open_value = values.get('open')
+                close_value = values.get('entry_price')
+                ema_fast = values.get('ema50')
+                taker_ratio = values.get('taker_buy_sell_ratio')
+                spread = values.get('futures_spread_pct')
+                rolling_samples = int(values.get('rolling_ofi_samples') or 0)
+
+                min_volume = float(cfg.get('set32_min_relative_volume', 1.50) or 1.50)
+                require_candle = bool(cfg.get('set32_require_direction_candle', True))
+                require_ema = bool(cfg.get('set32_require_ema50_side', True))
+                require_flow = bool(cfg.get('set32_require_orderflow_confirmation', True))
+                min_samples = int(cfg.get('set32_orderflow_min_samples', 3) or 3)
+                long_taker_min = float(cfg.get('set32_min_taker_ratio_long', 1.00) or 1.00)
+                short_taker_max = float(cfg.get('set32_max_taker_ratio_short', 1.00) or 1.00)
+                spread_max = float(cfg.get('set32_max_spread_pct', 0.05) or 0.05)
+
                 if not self._is_valid_number(volume_ratio):
-                    _add('상대 거래량', None, '상대 거래량 계산 대기', 'REJECTED_RSI_MOMENTUM')
+                    _add('상대 거래량', None, '상대 거래량 계산 대기', 'REJECTED_RELATIVE_VOLUME_CORE')
                 else:
-                    ok = float(volume_ratio) >= 1.20
-                    _add('상대 거래량', ok, f"relVol {_fmt(volume_ratio, 2)} / 조건 >= 1.20", 'REJECTED_RSI_MOMENTUM')
+                    relvol_ok = float(volume_ratio) >= min_volume
+
+                    candle_ok = True
+                    if require_candle:
+                        candle_ok = (
+                            self._is_valid_number(open_value)
+                            and self._is_valid_number(close_value)
+                            and (
+                                float(close_value) > float(open_value)
+                                if side == 'long'
+                                else float(close_value) < float(open_value)
+                            )
+                        )
+
+                    ema_ok = True
+                    if require_ema:
+                        ema_ok = (
+                            self._is_valid_number(close_value)
+                            and self._is_valid_number(ema_fast)
+                            and (
+                                float(close_value) >= float(ema_fast)
+                                if side == 'long'
+                                else float(close_value) <= float(ema_fast)
+                            )
+                        )
+
+                    flow_ok = True
+                    flow_detail = 'flow OFF'
+                    if require_flow:
+                        spread_ok = (not self._is_valid_number(spread)) or float(spread) <= spread_max
+                        if side == 'long':
+                            taker_ok = self._is_valid_number(taker_ratio) and float(taker_ratio) >= long_taker_min
+                            flow_cond = f"taker>={long_taker_min:.2f}"
+                        else:
+                            taker_ok = self._is_valid_number(taker_ratio) and float(taker_ratio) <= short_taker_max
+                            flow_cond = f"taker<={short_taker_max:.2f}"
+
+                        sample_ok = rolling_samples >= min_samples
+                        flow_ok = bool(sample_ok and taker_ok and spread_ok)
+                        flow_detail = (
+                            f"samples {rolling_samples}/{min_samples}, "
+                            f"{flow_cond}, taker {_fmt(taker_ratio, 3)}, "
+                            f"spread {_fmt(spread, 4)}%<= {spread_max:.3f}%"
+                        )
+
+                    ok = bool(relvol_ok and candle_ok and ema_ok and flow_ok)
+                    _add(
+                        '상대 거래량',
+                        ok,
+                        (
+                            f"relVol {_fmt(volume_ratio, 2)} / 조건 >= {min_volume:.2f}; "
+                            f"방향봉 {'OK' if candle_ok else 'NO'}; "
+                            f"EMA50 {'OK' if ema_ok else 'NO'}; "
+                            f"{flow_detail}"
+                        ),
+                        'REJECTED_RELATIVE_VOLUME_CORE'
+                    )
             elif filter_name == 'obv_slope':
                 obv_slope_ratio = values.get('obv_slope_ratio')
                 if not self._is_valid_number(obv_slope_ratio):
@@ -7669,6 +8017,18 @@ class SignalEngine(BaseEngine):
                     _reduce(0.75, f"{symbol_label} opposite regime {direction.upper()}")
                 elif aligned:
                     positives.append(f"{symbol_label} {direction.upper()}")
+
+        if (
+            side == 'long'
+            and self._is_utbreakout_live_runtime(cfg)
+            and bool(cfg.get('market_quality_long_hard_block_on_multi_adverse_enabled', True))
+            and len(reasons) >= int(cfg.get('market_quality_long_multi_adverse_min_reasons', 3) or 3)
+            and risk_multiplier <= float(cfg.get('market_quality_long_multi_adverse_max_multiplier', 0.35) or 0.35)
+        ):
+            _block(
+                "LONG market multi-adverse: "
+                + "; ".join(str(reason) for reason in reasons[:6])
+            )
 
         min_multiplier = float(cfg.get('market_quality_min_risk_multiplier', 0.25) or 0.25)
         if data_seen <= 0 and bool(cfg.get('market_quality_data_required', False)):
@@ -9056,6 +9416,19 @@ class SignalEngine(BaseEngine):
             'utbot_atr_period': cfg.get('utbot_atr_period'),
         })
 
+        auto_scores = (auto_analysis or {}).get('scores') if isinstance(auto_analysis, dict) else {}
+        if (
+            bool(cfg.get('auto_select_enabled', False))
+            and isinstance(auto_scores, dict)
+            and auto_scores.get('auto_blocked_by_margin')
+        ):
+            return _finish(
+                None,
+                f"REJECTED_AUTO_WEAK_MARGIN: {auto_scores.get('auto_block_reason')}",
+                'REJECTED_AUTO_WEAK_MARGIN',
+                record_failure=True,
+            )
+
         if selected_set.get('status') != 'active':
             return _finish(
                 None,
@@ -9459,6 +9832,10 @@ class SignalEngine(BaseEngine):
             '유동성',
         }
 
+        if bool(cfg.get('selected_set_core_filter_hard_block_enabled', True)):
+            hard_filter_codes = hard_filter_codes | set(UTBREAKOUT_CORE_SET_FILTER_HARD_CODES)
+            hard_filter_names = hard_filter_names | set(UTBREAKOUT_CORE_SET_FILTER_HARD_NAMES)
+
         failed_filter_items = [item for item in filter_items if item.get('state') is not True]
         hard_filter_failures = []
         soft_filter_failures = []
@@ -9470,8 +9847,8 @@ class SignalEngine(BaseEngine):
             code = raw_code or 'SET_FILTER_SOFT_FAIL'
             is_hard = code in hard_filter_codes or name in hard_filter_names
 
-            # HTF/EMA/ADX/DMI/volume/RSI/Donchian style filters are useful,
-            # but for continuation entries they should reduce size before blocking.
+            # Non-core filters may reduce size, but the selected Set's identity/core filters
+            # must hard-block when selected_set_core_filter_hard_block_enabled=True.
             if is_hard:
                 hard_filter_failures.append(item)
             else:
@@ -10912,11 +11289,46 @@ class SignalEngine(BaseEngine):
                 selector_quality=selector_quality,
             )
             core_items.append(("통합 품질 점수", quality_score_v2.get('state'), quality_score_v2.get('summary')))
+            q2_multiplier = min(1.0, max(0.0, float(quality_score_v2.get('risk_multiplier', 1.0) or 1.0)))
+            market_multiplier = min(1.0, max(0.0, float(market_quality.get('risk_multiplier', 1.0) or 1.0)))
+
+            set_filter_multiplier_status = 1.0
+            if failed_set_items and bool(cfg.get('set_filter_soft_fail_enabled', True)):
+                set_filter_multiplier_status = (
+                    float(cfg.get('set_filter_multi_soft_fail_multiplier', 0.50) or 0.50)
+                    if len(failed_set_items) >= 2
+                    else float(cfg.get('set_filter_soft_fail_multiplier', 0.70) or 0.70)
+                )
+            elif failed_set_items:
+                set_filter_multiplier_status = 0.0
+
+            final_risk_multiplier_status = (
+                market_multiplier
+                * selector_multiplier
+                * adaptation_multiplier
+                * q2_multiplier
+                * set_filter_multiplier_status
+            )
+            final_risk_multiplier_status = max(0.0, min(1.0, float(final_risk_multiplier_status)))
+
+            base_max_risk = float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
+            effective_max_risk = base_max_risk * final_risk_multiplier_status
             core_items.extend([
                 ("일일 리스크", daily_ok, daily_detail),
                 ("ATR 손절/RR/수량", risk_ok, balance_detail),
             ])
             advisory_items = [
+                (
+                    "최종 누적 리스크",
+                    'reduced' if final_risk_multiplier_status < 0.999 else True,
+                    (
+                        f"x{final_risk_multiplier_status:.3f} "
+                        f"(base ${base_max_risk:.2f} -> effective ${effective_max_risk:.2f}; "
+                        f"market x{market_multiplier:.2f}, selector x{selector_multiplier:.2f}, "
+                        f"strategy x{adaptation_multiplier:.2f}, qscore x{q2_multiplier:.2f}, "
+                        f"set x{set_filter_multiplier_status:.2f})"
+                    ),
+                ),
                 ("코인 선택 품질", selector_state, selector_quality.get('summary')),
                 ("Feature Score", True, f"{feature_score.get('score', 0):.1f} / {feature_score.get('reason')}"),
                 (
@@ -28472,8 +28884,63 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 `/utbreak on`, `/utbreak watch BTC ETH AAPL`, `/utbreak coin EWY`, `/utbreak autoscan on BTC ETH`
 `/utbreak auto on` / `auto off` - 코인선택 포함 AUTO 묶음 ON/OFF
 `/utbreak set 57`, `/utbreak risk 5`, `/utbreak dailytrades 3`
-`/utbreak sets`, `/utbreak why`, `/utbreak status`, `/utbreak analyze [EWY]`, `/utbreak research`, `/utbreak log`
+`/utbreak sets`, `/utbreak why`, `/utbreak status`, `/utbreak analyze [EWY]`, `/utbreak research`, `/utbreak config`, `/utbreak configdiff`, `/utbreak log`
 """.strip()
+
+        def _format_utbreakout_config_text(diff=False):
+            sig_cfg = self.cfg.get('signal_engine', {}) or {}
+            strategy_params = sig_cfg.get('strategy_params', {}) if isinstance(sig_cfg.get('strategy_params', {}), dict) else {}
+            raw_cfg = strategy_params.get('UTBotFilteredBreakoutV1', {})
+            raw_cfg = dict(raw_cfg or {})
+
+            engine = self.engines.get('signal')
+            if engine and hasattr(engine, '_get_utbot_filtered_breakout_config'):
+                effective_cfg = engine._get_utbot_filtered_breakout_config(strategy_params)
+            else:
+                effective_cfg = build_default_utbot_filtered_breakout_config()
+                effective_cfg.update(raw_cfg)
+                effective_cfg = apply_stable_utbreak_final_overrides(effective_cfg)
+
+            if diff:
+                return build_utbreakout_effective_config_diff_text(raw_cfg, effective_cfg)
+
+            keys = [
+                'runtime_profile',
+                'selection_mode',
+                'auto_select_enabled',
+                'active_set_id',
+                'safe_live_default_set_id',
+                'live_safety_guard_enabled',
+                'live_auto_set_whitelist_enabled',
+                'live_auto_set_whitelist',
+                'auto_min_score_margin_live',
+                'auto_min_adjusted_score_live',
+                'auto_block_on_weak_margin_live',
+                'auto_multiple_testing_penalty_enabled',
+                'selected_set_core_filter_hard_block_enabled',
+                'set32_min_relative_volume',
+                'set32_require_direction_candle',
+                'set32_require_ema50_side',
+                'set32_require_orderflow_confirmation',
+                'set32_orderflow_min_samples',
+                'market_quality_long_hard_block_on_multi_adverse_enabled',
+                'market_quality_long_multi_adverse_min_reasons',
+                'market_quality_long_multi_adverse_max_multiplier',
+                'entry_timeframe',
+                'exit_timeframe',
+                'htf_timeframe',
+                'partial_take_profit_r_multiple',
+                'partial_take_profit_ratio',
+                'second_take_profit_r_multiple',
+                'second_take_profit_ratio',
+            ]
+            lines = [
+                '🧾 UT Breakout Effective Config',
+                '',
+            ]
+            for key in keys:
+                lines.append(f"- {key}: {effective_cfg.get(key)!r}")
+            return '\n'.join(lines)
 
         def _build_utbreakout_keyboard():
             return InlineKeyboardMarkup([
@@ -28776,8 +29243,27 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     f"alignment: {scores.get('alignment_score', 0)}",
                     f"dominant_side: {scores.get('dominant_side', 'n/a')}",
                 ]
+                adjusted_scores = scores.get('auto_candidate_scores_adjusted')
+                if isinstance(adjusted_scores, dict) and adjusted_scores:
+                    adjusted_preview = ", ".join(
+                        f"{key}:{value}"
+                        for key, value in list(adjusted_scores.items())[:8]
+                    )
+                else:
+                    adjusted_preview = 'n/a'
+                safety_lines = [
+                    "AUTO 안전장치:",
+                    f"- confidence: {scores.get('auto_confidence', 'n/a')}",
+                    f"- margin: {scores.get('auto_score_margin', 'n/a')}",
+                    f"- live whitelist: {scores.get('auto_live_whitelist', 'n/a')}",
+                    f"- multiple-testing penalty: {scores.get('auto_multiple_testing_penalty_points', 0)}점",
+                    f"- blocked: {bool(scores.get('auto_blocked_by_margin'))}",
+                    f"- block reason: {scores.get('auto_block_reason') or 'n/a'}",
+                    f"- adjusted scores: {adjusted_preview}",
+                ]
             else:
                 score_lines = ["AUTO 점수 기록 없음. /utbreak status 또는 다음 판단봉 이후 확인하세요."]
+                safety_lines = []
             return "\n".join([
                 "🧠 UT Breakout AUTO 선택 이유",
                 f"심볼: {symbol}",
@@ -28787,6 +29273,8 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 "",
                 "점수:",
                 *score_lines,
+                "",
+                *safety_lines,
             ])
 
         def _current_utbreakout_cfg():
@@ -29239,6 +29727,26 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     not current
                 )
                 await u.message.reply_text(f"✅ RSI 과열 제외 옵션: {'ON' if not current else 'OFF'}")
+            elif action in {'config', 'cfg'}:
+                await self._reply_markdown_safe(
+                    u.message,
+                    _format_utbreakout_config_text(diff=False),
+                    reply_markup=_build_utbreakout_keyboard(),
+                    filename='utbreakout_effective_config.txt',
+                    caption='UT Breakout effective config입니다.',
+                    preview_suffix='상세 effective config는 파일로 보냈습니다.',
+                )
+                return
+            elif action in {'configdiff', 'cfgdiff', 'diff'}:
+                await self._reply_markdown_safe(
+                    u.message,
+                    _format_utbreakout_config_text(diff=True),
+                    reply_markup=_build_utbreakout_keyboard(),
+                    filename='utbreakout_config_diff.txt',
+                    caption='UT Breakout raw/effective config diff입니다.',
+                    preview_suffix='상세 config diff는 파일로 보냈습니다.',
+                )
+                return
             elif action in {'log', 'logs', 'download'}:
                 await _send_utbreakout_log_document(u.message)
                 return
