@@ -10189,6 +10189,77 @@ class SignalEngine(BaseEngine):
             reason_parts.append(f"주의 {warnings}")
         return " / ".join(part for part in reason_parts if part)
 
+    async def _resolve_next_utbreakout_scan_candidate(self, excluded_symbols=None):
+        """Return the next actionable CoinSelector candidate.
+
+        This is shared by:
+        - _resolve_utbreakout_status_symbol()
+        - _build_utbreakout_position_scan_context_lines()
+
+        It prevents the status header from showing one symbol while the condition
+        body evaluates another.
+        """
+        excluded_symbols = excluded_symbols or set()
+        excluded_keys = {
+            self._utbreakout_status_symbol_key(item)
+            for item in excluded_symbols
+            if item
+        }
+
+        next_candidate = None
+        report = self.coin_selector_last_result if isinstance(getattr(self, 'coin_selector_last_result', None), dict) else {}
+        selected = list(report.get('selected') or [])
+        coin_cfg = self._get_coin_selector_config()
+
+        if not selected and bool(coin_cfg.get('enabled', False)):
+            try:
+                if self._micro_auto_enabled():
+                    report = await self.evaluate_micro_auto_candidates(force=False)
+                else:
+                    report = await self.evaluate_coin_selector(force=False)
+                selected = list(report.get('selected') or [])
+            except Exception as exc:
+                logger.warning(f"UTBreak next scan candidate lookup failed: {exc}")
+                selected = []
+
+        now = time.time()
+        for item in selected:
+            if not isinstance(item, dict):
+                continue
+
+            symbol = item.get('exchange_symbol') or item.get('normalized_symbol') or item.get('symbol')
+            if not symbol:
+                continue
+
+            symbol_key = self._utbreakout_status_symbol_key(symbol)
+            if symbol_key in excluded_keys:
+                continue
+
+            if item.get('selection_state') not in (None, 'SELECTED') and not item.get('micro_accepted'):
+                continue
+
+            try:
+                cooldown_remaining, _ = self._coin_selector_cooldown_remaining(symbol, coin_cfg, now=now)
+            except Exception:
+                cooldown_remaining = 0
+
+            if cooldown_remaining > 0:
+                continue
+
+            next_candidate = item
+            break
+
+        if not next_candidate:
+            return None, None
+
+        next_symbol = (
+            next_candidate.get('exchange_symbol')
+            or next_candidate.get('normalized_symbol')
+            or next_candidate.get('symbol')
+        )
+
+        return next_symbol, next_candidate
+
     async def _build_utbreakout_position_scan_context_lines(self, evaluated_symbol):
         lines = []
         position_symbols = []
@@ -10223,39 +10294,12 @@ class SignalEngine(BaseEngine):
         if scanner_symbol:
             lines.append(f"현재 scanner lock: {scanner_symbol}")
 
-        next_candidate = None
-        report = self.coin_selector_last_result if isinstance(getattr(self, 'coin_selector_last_result', None), dict) else {}
-        selected = list(report.get('selected') or [])
+        next_symbol, next_candidate = await self._resolve_next_utbreakout_scan_candidate(
+            excluded_symbols=position_symbols
+        )
+
         coin_cfg = self._get_coin_selector_config()
-        if not selected and bool(coin_cfg.get('enabled', False)):
-            try:
-                if self._micro_auto_enabled():
-                    report = await self.evaluate_micro_auto_candidates(force=False)
-                else:
-                    report = await self.evaluate_coin_selector(force=False)
-                selected = list(report.get('selected') or [])
-            except Exception as exc:
-                lines.append(f"다음 스캔 후보: 조회 실패 ({exc})")
-                selected = []
-
-        excluded_keys = {self._utbreakout_status_symbol_key(item) for item in position_symbols}
-        now = time.time()
-        for item in selected:
-            symbol = item.get('exchange_symbol') or item.get('normalized_symbol') or item.get('symbol')
-            if not symbol:
-                continue
-            if self._utbreakout_status_symbol_key(symbol) in excluded_keys:
-                continue
-            if item.get('selection_state') not in (None, 'SELECTED') and not item.get('micro_accepted'):
-                continue
-            cooldown_remaining, _ = self._coin_selector_cooldown_remaining(symbol, coin_cfg, now=now)
-            if cooldown_remaining > 0:
-                continue
-            next_candidate = item
-            break
-
         if next_candidate:
-            next_symbol = next_candidate.get('exchange_symbol') or next_candidate.get('normalized_symbol') or next_candidate.get('symbol')
             lines.append(f"다음 스캔 후보: {next_symbol}")
             lines.append(f"다음 후보 선택 이유: {self._format_coin_selector_candidate_reason(next_candidate)}")
         elif bool(coin_cfg.get('enabled', False)):
@@ -10265,6 +10309,11 @@ class SignalEngine(BaseEngine):
 
         if evaluated_symbol:
             lines.append(f"조건 평가 심볼: {evaluated_symbol}")
+
+            if next_symbol and self._utbreakout_status_symbol_key(next_symbol) != self._utbreakout_status_symbol_key(evaluated_symbol):
+                lines.append(
+                    f"⚠️ 상태 경고: 다음 후보({next_symbol})와 조건 평가 심볼({evaluated_symbol})이 다릅니다."
+                )
         return lines
 
     async def _build_direction_decision_for_status(self, symbol, side, filter_values):
@@ -23964,7 +24013,7 @@ class MainController:
         deduped = []
         seen = set()
         for symbol in symbols or []:
-            key = self._telegram_status_symbol_key(symbol)
+            key = self._utbreakout_status_symbol_key(symbol)
             if key and key not in seen:
                 deduped.append(symbol)
                 seen.add(key)
@@ -24075,7 +24124,7 @@ class MainController:
             raw_watchlist = []
 
         legacy_shadow_watchlist = []
-        raw_keys = {self._telegram_status_symbol_key(item) for item in raw_watchlist}
+        raw_keys = {self._utbreakout_status_symbol_key(item) for item in raw_watchlist}
         if isinstance(mode_watchlist, list) and mode_watchlist:
             if mode == UPBIT_MODE:
                 legacy_shadow_watchlist = self.cfg.get('signal_engine', {}).get('watchlist', [])
@@ -24102,7 +24151,7 @@ class MainController:
                 removed.append({'symbol': raw_symbol, 'reason': str(exc)})
 
         for legacy_symbol in legacy_shadow_watchlist:
-            if self._telegram_status_symbol_key(legacy_symbol) in raw_keys:
+            if self._utbreakout_status_symbol_key(legacy_symbol) in raw_keys:
                 continue
             try:
                 self._resolve_watch_symbol_for_exchange_mode(
@@ -25337,17 +25386,16 @@ class MainController:
         watchlist = self.get_active_watchlist()
         return watchlist[0] if watchlist else ('BTC/KRW' if self.is_upbit_mode() else 'BTC/USDT')
 
-    def _telegram_status_symbol_key(self, symbol):
-        return str(symbol or '').upper().replace(':USDT', '').replace('/', '').replace('-', '').strip()
 
     async def _resolve_utbreakout_status_symbol(self):
         """Pick the symbol operators expect to inspect.
 
         Priority:
         1. Real live position symbol
-        2. Current scanner_active_symbol / next selected candidate
-        3. Non-stale status_data symbol
-        4. current watchlist fallback
+        2. Current scanner_active_symbol
+        3. Next selected CoinSelector candidate
+        4. Non-stale status_data position symbol
+        5. current watchlist fallback
         """
         engine = self.engines.get(CORE_ENGINE)
 
@@ -25359,11 +25407,15 @@ class MainController:
                 logger.warning(f"UTBreak status position symbol lookup failed: {exc}")
 
         if position_symbols:
-            return sorted(position_symbols, key=self._telegram_status_symbol_key)[0]
+            return sorted(position_symbols, key=self._utbreakout_status_symbol_key)[0]
 
         scanner_symbol = getattr(engine, 'scanner_active_symbol', None) if engine else None
         if scanner_symbol:
             return scanner_symbol
+
+        next_symbol, _ = await self._resolve_next_utbreakout_scan_candidate(excluded_symbols=position_symbols)
+        if next_symbol:
+            return next_symbol
 
         if isinstance(self.status_data, dict):
             status_symbols = []
@@ -25376,14 +25428,12 @@ class MainController:
                 if not symbol:
                     continue
 
-                # Ignore stale rows when there is no active position/scanner lock.
                 updated_at = row.get('updated_at') or row.get('ts') or row.get('timestamp')
                 try:
                     updated_float = float(updated_at or 0)
                 except (TypeError, ValueError):
                     updated_float = 0.0
 
-                # If timestamp looks like ms, convert to seconds.
                 if updated_float > 10_000_000_000:
                     updated_float = updated_float / 1000.0
 
@@ -25395,7 +25445,7 @@ class MainController:
                     status_symbols.append(symbol)
 
             if status_symbols:
-                return sorted(status_symbols, key=self._telegram_status_symbol_key)[0]
+                return sorted(status_symbols, key=self._utbreakout_status_symbol_key)[0]
 
         return self._get_current_symbol()
 
