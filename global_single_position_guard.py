@@ -32,7 +32,7 @@ OPPORTUNITY_OVERRIDES = {
     "adaptive_timeframe_min_hold_candles": 6,
 
     # reduce overfitted hard blocks
-    "trend_health_hard_block_below": 25.0,
+    "trend_health_hard_block_below": 20.0,
     "trend_health_reduce_below": 42.0,
     "trend_health_full_score": 68.0,
     "trend_health_min_multiplier": 0.35,
@@ -42,18 +42,18 @@ OPPORTUNITY_OVERRIDES = {
     "strategy_quality_full_score": 70.0,
     "strategy_quality_min_multiplier": 0.35,
 
-    "quality_score_v2_block_below": 30.0,
+    "quality_score_v2_block_below": 20.0,
     "quality_score_v2_reduce_below": 50.0,
 
-    "quality_score_v2_long_block_below": 30.0,
+    "quality_score_v2_long_block_below": 20.0,
     "quality_score_v2_long_reduce_below": 50.0,
-    "quality_score_v2_long_15m_block_below": 35.0,
-    "quality_score_v2_long_15m_reduce_below": 55.0,
+    "quality_score_v2_long_15m_block_below": 20.0,
+    "quality_score_v2_long_15m_reduce_below": 50.0,
 
-    "quality_score_v2_short_block_below": 40.0,
+    "quality_score_v2_short_block_below": 25.0,
     "quality_score_v2_short_reduce_below": 60.0,
-    "quality_score_v2_short_15m_block_below": 42.0,
-    "quality_score_v2_short_15m_reduce_below": 62.0,
+    "quality_score_v2_short_15m_block_below": 25.0,
+    "quality_score_v2_short_15m_reduce_below": 60.0,
 
     # volume should rarely be the only hard block
     "bias_continuation_min_volume_ratio": 0.50,
@@ -289,19 +289,21 @@ def patch_signal_engine(cls):
                 "bias_continuation_min_adx": 14.0,
                 "bias_continuation_15m_min_adx": 15.0,
 
-                "trend_health_hard_block_below": 25.0,
+                "trend_health_hard_block_below": 20.0,
                 "trend_health_reduce_below": 42.0,
                 "strategy_quality_hard_block_below": 12.0,
                 "strategy_quality_reduce_below": 42.0,
 
-                "quality_score_v2_block_below": 30.0,
+                "quality_score_v2_block_below": 20.0,
                 "quality_score_v2_reduce_below": 50.0,
-                "quality_score_v2_long_block_below": 30.0,
+                "quality_score_v2_long_block_below": 20.0,
                 "quality_score_v2_long_reduce_below": 50.0,
-                "quality_score_v2_short_block_below": 40.0,
+                "quality_score_v2_long_15m_block_below": 20.0,
+                "quality_score_v2_long_15m_reduce_below": 50.0,
+                "quality_score_v2_short_block_below": 25.0,
                 "quality_score_v2_short_reduce_below": 60.0,
-                "quality_score_v2_short_15m_block_below": 42.0,
-                "quality_score_v2_short_15m_reduce_below": 62.0,
+                "quality_score_v2_short_15m_block_below": 25.0,
+                "quality_score_v2_short_15m_reduce_below": 60.0,
 
                 "partial_take_profit_r_multiple": 1.20,
                 "second_take_profit_r_multiple": 2.50,

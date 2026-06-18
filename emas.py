@@ -515,6 +515,176 @@ UTBREAKOUT_CORE_SET_FILTER_HARD_CODES = frozenset({
 })
 
 
+def _safe_set_id(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        text = str(value or "")
+        match = re.search(r"(\d+)", text)
+        return int(match.group(1)) if match else None
+
+
+def _estimate_set_complexity_penalty(set_info):
+    """Penalize over-specific Sets without turning complexity into a hard block."""
+    if not isinstance(set_info, dict):
+        return 0.0
+
+    name = str(
+        set_info.get("name")
+        or set_info.get("label")
+        or set_info.get("description")
+        or ""
+    ).lower()
+    penalty = 0.0
+    for keyword in (
+        "rolling ofi",
+        "orderflow",
+        "imbalance",
+        "aroon",
+        "mtf",
+        "volatility score",
+        "confirmation",
+        "squeeze",
+        "pullback",
+    ):
+        if keyword in name:
+            penalty += 0.7
+
+    condition_count = 0
+    for key in ("filters", "conditions", "confirmations", "requirements"):
+        value = set_info.get(key)
+        if isinstance(value, (list, tuple, set)):
+            condition_count += len(value)
+        elif isinstance(value, dict):
+            condition_count += len(value)
+    if condition_count >= 4:
+        penalty += 1.0
+    elif condition_count >= 2:
+        penalty += 0.5
+    return min(penalty, 3.0)
+
+
+def _rank_utbreakout_sets_stably(candidates, previous_set_id=None, cfg=None):
+    """Rank Set candidates with hysteresis and a bounded complexity tie-break."""
+    cfg = cfg or {}
+    switch_margin = float(cfg.get("set_selection_switch_margin", 3.0) or 3.0)
+    complexity_penalty_enabled = bool(cfg.get("set_complexity_penalty_enabled", True))
+    previous_set_id = _safe_set_id(previous_set_id)
+
+    normalized = []
+    for item in candidates or []:
+        if not isinstance(item, dict):
+            continue
+        raw_score = item.get("score")
+        if raw_score is None:
+            raw_score = item.get("set_score")
+        if raw_score is None:
+            raw_score = item.get("total_score")
+        try:
+            raw_score = float(raw_score)
+        except (TypeError, ValueError):
+            continue
+
+        set_id = _safe_set_id(item.get("set_id") or item.get("id") or item.get("set"))
+        complexity_penalty = (
+            _estimate_set_complexity_penalty(item)
+            if complexity_penalty_enabled
+            else 0.0
+        )
+        adjusted_score = raw_score - complexity_penalty
+        if previous_set_id is not None and set_id == previous_set_id:
+            adjusted_score += switch_margin
+
+        normalized.append({
+            "item": item,
+            "set_id": set_id,
+            "raw_score": raw_score,
+            "adjusted_score": adjusted_score,
+            "complexity_penalty": complexity_penalty,
+        })
+
+    normalized.sort(key=lambda row: row["adjusted_score"], reverse=True)
+    return normalized
+
+
+def _first_present_metric(metrics, names, default=None):
+    metrics = metrics if isinstance(metrics, dict) else {}
+    for name in names:
+        if name in metrics and metrics.get(name) is not None:
+            return metrics.get(name)
+    return default
+
+
+def _classify_set_filter_result(side, passed, detail, metrics=None, cfg=None):
+    """Classify selected-Set confirmation failures as pass, reduce, or block."""
+    metrics = metrics or {}
+    cfg = cfg or {}
+    if passed:
+        return True, 1.0, detail
+
+    try:
+        spread = float(_first_present_metric(
+            metrics,
+            ("futures_spread_pct", "spread_pct", "spread"),
+        ))
+    except (TypeError, ValueError):
+        spread = None
+    spread_limit = float(
+        cfg.get(
+            "rolling_ofi_spread_max_pct",
+            cfg.get("set32_max_spread_pct", 0.05),
+        )
+        or 0.05
+    )
+    if spread is not None and spread > spread_limit:
+        return False, 0.0, (
+            f"{detail}; spread {spread:.4f}%>{spread_limit:.4f}%"
+        )
+
+    try:
+        imbalance = float(_first_present_metric(
+            metrics,
+            (
+                "imbalance",
+                "imb",
+                "orderflow_imbalance",
+                "rolling_orderbook_imbalance_pct",
+                "orderbook_imbalance_pct",
+            ),
+            0.0,
+        ))
+    except (TypeError, ValueError):
+        imbalance = 0.0
+    try:
+        taker = float(_first_present_metric(
+            metrics,
+            ("taker", "taker_ratio", "taker_buy_sell_ratio"),
+            1.0,
+        ))
+    except (TypeError, ValueError):
+        taker = 1.0
+    try:
+        samples = int(float(_first_present_metric(
+            metrics,
+            ("samples", "rolling_ofi_samples"),
+            0,
+        )))
+    except (TypeError, ValueError):
+        samples = 0
+
+    if samples < 3:
+        return "reduced", 0.75, f"{detail}; soft fail due to low samples {samples}<3"
+    if samples < 5:
+        return "reduced", 0.65, f"{detail}; soft fail due to limited samples {samples}<5"
+
+    side_l = str(side or "").lower()
+    if side_l == "long" and imbalance <= -8.0 and taker <= 0.98:
+        return False, 0.0, f"{detail}; hard opposite orderflow for LONG"
+    if side_l == "short" and imbalance >= 8.0 and taker >= 1.02:
+        return False, 0.0, f"{detail}; hard opposite orderflow for SHORT"
+    return "reduced", 0.50, f"{detail}; set confirmation soft fail"
+
+
 def apply_stable_utbreak_final_overrides(cfg):
     """Apply final UTBreak config overrides after selected Set params are merged.
 
@@ -539,6 +709,16 @@ def apply_stable_utbreak_final_overrides(cfg):
         "adaptive_timeframe_min_score": 38.0,
         "adaptive_timeframe_switch_margin": 10.0,
         "adaptive_timeframe_min_hold_candles": 6,
+
+        # Stable Set selection: avoid chasing tiny score differences.
+        "set_selection_hysteresis_enabled": True,
+        "set_selection_switch_margin": 3.0,
+        "set_selection_min_score_gap": 2.0,
+        "set_complexity_penalty_enabled": True,
+
+        # Selected-Set confirmations are sizing overlays by default.
+        "selected_set_core_filter_hard_block_enabled": False,
+        "set_filter_soft_fail_enabled": True,
 
         # Bias continuation thresholds
         "bias_continuation_min_volume_ratio": 0.50,
@@ -567,7 +747,7 @@ def apply_stable_utbreak_final_overrides(cfg):
         "quality_score_v2_short_block_below": 25.0,
         "quality_score_v2_short_reduce_below": 60.0,
         "quality_score_v2_short_15m_block_below": 25.0,
-        "quality_score_v2_short_15m_reduce_below": 62.0,
+        "quality_score_v2_short_15m_reduce_below": 60.0,
 
         # Short remains stricter than long, but not dead
         "short_adx_threshold": 20.0,
@@ -958,6 +1138,10 @@ def build_utbreakout_effective_config_diff_text(raw_cfg, effective_cfg):
         'auto_min_adjusted_score_live',
         'auto_block_on_weak_margin_live',
         'auto_multiple_testing_penalty_enabled',
+        'set_selection_hysteresis_enabled',
+        'set_selection_switch_margin',
+        'set_selection_min_score_gap',
+        'set_complexity_penalty_enabled',
         'selected_set_core_filter_hard_block_enabled',
         'set32_min_relative_volume',
         'set32_require_direction_candle',
@@ -1102,6 +1286,10 @@ def build_default_utbot_filtered_breakout_config():
         'auto_multiple_testing_penalty_enabled': True,
         'multiple_testing_free_trials': 10,
         'multiple_testing_max_score_penalty': 12.0,
+        'set_selection_hysteresis_enabled': True,
+        'set_selection_switch_margin': 3.0,
+        'set_selection_min_score_gap': 2.0,
+        'set_complexity_penalty_enabled': True,
 
         'auto_timeframes': list(UTBREAKOUT_AUTO_TIMEFRAMES),
         'adaptive_timeframe_enabled': False,
@@ -1255,7 +1443,7 @@ def build_default_utbot_filtered_breakout_config():
         'meta_labeling_min_samples': 12,
         'meta_labeling_min_multiplier': 0.5,
         'strategy_adaptive_min_risk_multiplier': 0.25,
-        'selected_set_core_filter_hard_block_enabled': True,
+        'selected_set_core_filter_hard_block_enabled': False,
         'set_filter_soft_fail_enabled': True,
         'set_filter_soft_fail_multiplier': 0.70,
         'set_filter_multi_soft_fail_multiplier': 0.50,
@@ -3540,6 +3728,7 @@ class SignalEngine(BaseEngine):
         self.utbreakout_runner_stats_cache = {}  # cache key -> recent runner stats
         self.utbreakout_adaptive_tf_state = {}  # symbol -> selected TF stability state
         self.utbreakout_adaptive_last_decision_ts = {}  # symbol -> tf -> last closed candle evaluated
+        self.utbreakout_last_selected_set_ids = {}  # symbol -> last validated AUTO Set
         self.last_protection_order_status = {}  # symbol -> exchange-side TP/SL audit status
         self.last_protection_alert_ts = {}  # symbol:kind -> last Telegram alert timestamp
         self.protection_missing_candidates = {}  # symbol -> missing TP/SL debounce candidates
@@ -3606,6 +3795,7 @@ class SignalEngine(BaseEngine):
         self.utbreakout_runner_stats_cache = {}
         self.utbreakout_adaptive_tf_state = {}
         self.utbreakout_adaptive_last_decision_ts = {}
+        self.utbreakout_last_selected_set_ids = {}
         self.last_protection_order_status = {}
         self.last_protection_alert_ts = {}
         self.protection_missing_candidates = {}
@@ -5271,6 +5461,8 @@ class SignalEngine(BaseEngine):
             'auto_min_score_margin_live': 3.0,
             'auto_min_adjusted_score_live': 50.0,
             'multiple_testing_max_score_penalty': 12.0,
+            'set_selection_switch_margin': 3.0,
+            'set_selection_min_score_gap': 2.0,
             'adaptive_timeframe_min_score': 38.0,
             'adaptive_timeframe_switch_margin': 10.0,
             'partial_take_profit_r_multiple': 1.20,
@@ -5531,6 +5723,8 @@ class SignalEngine(BaseEngine):
             'live_auto_set_whitelist_enabled',
             'auto_block_on_weak_margin_live',
             'auto_multiple_testing_penalty_enabled',
+            'set_selection_hysteresis_enabled',
+            'set_complexity_penalty_enabled',
             'market_quality_long_hard_block_on_multi_adverse_enabled',
             'selected_set_core_filter_hard_block_enabled',
             'set_filter_soft_fail_enabled',
@@ -6333,7 +6527,7 @@ class SignalEngine(BaseEngine):
         selected = decision.get('selected_tf') or "NO_TRADE"
         return f"{selected} ({decision.get('decision', 'WAIT')}) | {decision.get('reason', '')} | top {top_text}"
 
-    def _select_utbreakout_auto_set(self, analysis, cfg):
+    def _select_utbreakout_auto_set(self, analysis, cfg, previous_set_id=None):
         raw_scores = (analysis or {}).get('scores') if isinstance(analysis, dict) else None
         scores = dict(raw_scores or {})
         trend = float(scores.get('trend_score', 0.0) or 0.0)
@@ -6524,23 +6718,83 @@ class SignalEngine(BaseEngine):
                 for set_id, score in sorted(candidate_scores.items())
             }
 
-        selected_id, selected_score = max(candidate_scores.items(), key=lambda item: item[1])
-        top3 = sorted(candidate_scores.items(), key=lambda item: item[1], reverse=True)[:3]
+        candidate_rows = []
+        for set_id, score in candidate_scores.items():
+            set_info = get_utbreakout_set_definition(set_id)
+            candidate_rows.append({
+                'set_id': int(set_id),
+                'score': float(score),
+                'name': set_info.get('name'),
+                'description': set_info.get('description'),
+                'filters': list(set_info.get('entry_filters') or []),
+            })
+
+        if bool(cfg.get('set_selection_hysteresis_enabled', True)):
+            ranked_sets = _rank_utbreakout_sets_stably(
+                candidate_rows,
+                previous_set_id=previous_set_id,
+                cfg=cfg,
+            )
+        else:
+            ranked_sets = [
+                {
+                    'item': item,
+                    'set_id': item['set_id'],
+                    'raw_score': item['score'],
+                    'adjusted_score': item['score'],
+                    'complexity_penalty': 0.0,
+                }
+                for item in sorted(candidate_rows, key=lambda row: row['score'], reverse=True)
+            ]
+        if not ranked_sets:
+            fallback_id = normalize_utbreakout_set_id(
+                cfg.get('safe_live_default_set_id', UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID),
+                UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID,
+            )
+            return fallback_id, f"AUTO Set ranking empty -> Set{fallback_id} safety fallback"
+
+        selected_row = ranked_sets[0]
+        selected_id = int(selected_row['set_id'])
+        selected_score = float(selected_row['adjusted_score'])
+        selected_raw_score = float(selected_row['raw_score'])
+        top3_rows = ranked_sets[:3]
+        top3 = [
+            (int(row['set_id']), float(row['adjusted_score']))
+            for row in top3_rows
+        ]
         top3_text = ", ".join(f"Set{set_id}:{score:.1f}" for set_id, score in top3)
         second_score = top3[1][1] if len(top3) > 1 else 0.0
         score_margin = selected_score - second_score
+        stable_detail = (
+            f"raw={selected_raw_score:.1f}, adjusted={selected_score:.1f}, "
+            f"complexity_penalty={float(selected_row['complexity_penalty']):.1f}, "
+            f"prev={_safe_set_id(previous_set_id)}"
+        )
         if isinstance(raw_scores, dict):
             raw_scores['auto_candidate_scores'] = {
                 f"Set{set_id}": round(float(score), 2)
                 for set_id, score in sorted(candidate_scores.items())
             }
             raw_scores['auto_top3'] = [
-                {'set_id': int(set_id), 'score': round(float(score), 2)}
-                for set_id, score in top3
+                {
+                    'set_id': int(row['set_id']),
+                    'score': round(float(row['adjusted_score']), 2),
+                    'raw_score': round(float(row['raw_score']), 2),
+                    'complexity_penalty': round(float(row['complexity_penalty']), 2),
+                }
+                for row in top3_rows
             ]
             raw_scores['auto_selected_score'] = round(float(selected_score), 2)
+            raw_scores['auto_selected_raw_score'] = round(float(selected_raw_score), 2)
             raw_scores['auto_score_margin'] = round(float(score_margin), 2)
-            raw_scores['auto_confidence'] = 'weak' if selected_score < 50.0 or score_margin < 3.0 else 'normal'
+            raw_scores['auto_stable_selection_detail'] = stable_detail
+            raw_scores['auto_previous_set_id'] = _safe_set_id(previous_set_id)
+            min_score_gap = float(cfg.get('set_selection_min_score_gap', 2.0) or 2.0)
+            raw_scores['auto_confidence'] = (
+                'weak'
+                if selected_score < 50.0 or score_margin < min_score_gap
+                else 'normal'
+            )
             min_live_score = float(cfg.get('auto_min_adjusted_score_live', 50.0) or 50.0)
             min_live_margin = float(cfg.get('auto_min_score_margin_live', 3.0) or 3.0)
             weak_live_margin = bool(is_live_runtime and score_margin < min_live_margin)
@@ -6575,7 +6829,7 @@ class SignalEngine(BaseEngine):
                 f"trend {trend:.1f}, chop {chop:.1f}, vol {volatility:.1f}, "
                 f"breakout {breakout:.1f}, momentum {momentum:.1f}, flow {flow:.1f}, align {alignment:.1f}, "
                 f"bbExp {bb_expansion:.1f}, keltner {keltner_expansion:.1f}, pullback {pullback:.1f} "
-                f"-> Set{selected_id} adjusted score {selected_score:.1f} "
+                f"-> Set{selected_id} stable score {selected_score:.1f} "
                 f"(penalty {multiple_testing_penalty_points:.1f}, margin {score_margin:.1f}, top {top3_text})"
             )
         if isinstance(raw_scores, dict):
@@ -6605,7 +6859,15 @@ class SignalEngine(BaseEngine):
                 analysis = cfg.get('_auto_analysis_override') if isinstance(cfg.get('_auto_analysis_override'), dict) else None
                 if analysis is None:
                     analysis = await self._build_utbreakout_auto_analysis(symbol, df, cfg)
-                selected_id, auto_reason = self._select_utbreakout_auto_set(analysis, cfg)
+                previous_set_id = None
+                last_selected = getattr(self, 'utbreakout_last_selected_set_ids', {})
+                if isinstance(last_selected, dict):
+                    previous_set_id = last_selected.get(symbol)
+                selected_id, auto_reason = self._select_utbreakout_auto_set(
+                    analysis,
+                    cfg,
+                    previous_set_id=previous_set_id,
+                )
             except Exception as exc:
                 auto_reason = f"AUTO 분석 실패: {exc}. 수동 Set{selected_id} 유지"
         validated_id, safety_reason = validate_utbreakout_runtime_set_id(
@@ -6621,7 +6883,10 @@ class SignalEngine(BaseEngine):
                 if isinstance(scores, dict):
                     scores['auto_safety_fallback_set_id'] = int(validated_id)
                     scores['auto_safety_reason'] = safety_reason
-        selected_info = self._get_utbreakout_set_info(cfg, selected_id)
+        selected_info = dict(self._get_utbreakout_set_info(cfg, selected_id))
+        scores = analysis.get('scores') if isinstance(analysis, dict) else None
+        if isinstance(scores, dict):
+            selected_info['_stable_selection_detail'] = scores.get('auto_stable_selection_detail')
         return selected_info, analysis, auto_reason
 
     def _evaluate_utbreakout_set_filter_items(self, side, set_info, cfg, values):
@@ -9151,6 +9416,7 @@ class SignalEngine(BaseEngine):
                 'auto_selected_set_name': status.get('auto_selected_set_name'),
                 'auto_selected_set_family': status.get('auto_selected_set_family'),
                 'auto_selection_reason': status.get('auto_selection_reason'),
+                'auto_stable_selection_detail': status.get('auto_stable_selection_detail'),
                 'auto_scores': status.get('auto_scores'),
                 'auto_top3': auto_scores.get('auto_top3'),
                 'auto_score_margin': _safe_float_or_none(auto_scores.get('auto_score_margin')),
@@ -9244,6 +9510,8 @@ class SignalEngine(BaseEngine):
                 'runner_sample_count': status.get('runner_sample_count'),
                 'runner_avg_mfe_capture_ratio': _safe_float_or_none(status.get('runner_avg_mfe_capture_ratio')),
                 'runner_avg_pnl_r': _safe_float_or_none(status.get('runner_avg_pnl_r')),
+                'final_risk_multiplier': _safe_float_or_none(status.get('final_risk_multiplier')),
+                'decision_trace': status.get('decision_trace'),
                 'protection_status': protection_status
             }
             plan = status.get('entry_plan')
@@ -9399,7 +9667,11 @@ class SignalEngine(BaseEngine):
         effective_cfg.update(set_params)
         effective_cfg['active_set_id'] = int(selected_set.get('id', cfg.get('active_set_id', UTBREAKOUT_DEFAULT_SET_ID)))
         effective_cfg['profile'] = f"set{effective_cfg['active_set_id']}"
-        cfg = effective_cfg
+        cfg = apply_stable_utbreak_final_overrides(effective_cfg)
+        if bool(cfg.get('auto_select_enabled', False)):
+            if not isinstance(getattr(self, 'utbreakout_last_selected_set_ids', None), dict):
+                self.utbreakout_last_selected_set_ids = {}
+            self.utbreakout_last_selected_set_ids[symbol] = int(selected_set.get('id'))
         self._update_utbreakout_shadow_triple_barrier(symbol, closed, cfg)
         selected_filters = set(selected_set.get('entry_filters') or [])
         status.update({
@@ -9407,9 +9679,11 @@ class SignalEngine(BaseEngine):
             'auto_select_enabled': bool(cfg.get('auto_select_enabled', False)),
             'auto_selected_set_id': selected_set.get('id'),
             'auto_selected_set_name': selected_set.get('name'),
+            'auto_stable_selection_detail': selected_set.get('_stable_selection_detail'),
             'auto_selected_set_family': selected_set.get('family'),
             'auto_selected_set_status': selected_set.get('status'),
             'auto_selection_reason': auto_reason,
+            'auto_stable_selection_detail': selected_set.get('_stable_selection_detail'),
             'auto_scores': (auto_analysis or {}).get('scores') if isinstance(auto_analysis, dict) else None,
             'set_filters': list(selected_set.get('entry_filters') or []),
             'utbot_key_value': cfg.get('utbot_key_value'),
@@ -9816,15 +10090,6 @@ class SignalEngine(BaseEngine):
         filter_items = self._evaluate_utbreakout_set_filter_items(side, selected_set, cfg, filter_values)
         status['set_filter_items'] = filter_items
 
-        hard_filter_codes = {
-            'REJECTED_RISK_REWARD_LOW',
-            'REJECTED_ATR_TOO_HIGH',
-            'REJECTED_ATR_TOO_LOW',
-            'REJECTED_SPREAD_TOO_WIDE',
-            'REJECTED_LIQUIDITY_TOO_LOW',
-            'REJECTED_MARKET_QUALITY',
-        }
-
         hard_filter_names = {
             'ATR% 변동성',
             '손익비',
@@ -9832,31 +10097,60 @@ class SignalEngine(BaseEngine):
             '유동성',
         }
 
-        if bool(cfg.get('selected_set_core_filter_hard_block_enabled', True)):
-            hard_filter_codes = hard_filter_codes | set(UTBREAKOUT_CORE_SET_FILTER_HARD_CODES)
-            hard_filter_names = hard_filter_names | set(UTBREAKOUT_CORE_SET_FILTER_HARD_NAMES)
-
         failed_filter_items = [item for item in filter_items if item.get('state') is not True]
         hard_filter_failures = []
         soft_filter_failures = []
+        set_filter_item_multipliers = []
+        orderflow_filter_names = {
+            '상대 거래량',
+            'Rolling OFI 확인',
+            'Futures 수급 불균형',
+            'Spread/Depth 비용',
+        }
 
         for item in failed_filter_items:
-            raw_code = item.get('code')
             name = item.get('name') or ''
             detail = item.get('detail') or ''
-            code = raw_code or 'SET_FILTER_SOFT_FAIL'
-            is_hard = code in hard_filter_codes or name in hard_filter_names
-
-            # Non-core filters may reduce size, but the selected Set's identity/core filters
-            # must hard-block when selected_set_core_filter_hard_block_enabled=True.
-            if is_hard:
-                hard_filter_failures.append(item)
+            code = item.get('code') or 'SET_FILTER_SOFT_FAIL'
+            if name in hard_filter_names or code == 'REJECTED_RISK_REWARD_LOW':
+                classified_state = False
+                classified_multiplier = 0.0
+                classified_detail = detail
+            elif name in orderflow_filter_names:
+                classified_state, classified_multiplier, classified_detail = _classify_set_filter_result(
+                    side,
+                    False,
+                    detail,
+                    metrics=filter_values,
+                    cfg=cfg,
+                )
             else:
-                soft_filter_failures.append(item)
+                classified_state = 'reduced'
+                classified_multiplier = (
+                    0.65 if item.get('state') is None else 0.50
+                )
+                classified_detail = f"{detail}; set confirmation soft fail"
+
+            classified = dict(item)
+            classified.update({
+                'state': classified_state,
+                'detail': classified_detail,
+                'risk_multiplier': classified_multiplier,
+            })
+            if classified_state is False:
+                hard_filter_failures.append(classified)
+            else:
+                soft_filter_failures.append(classified)
+                set_filter_item_multipliers.append(float(classified_multiplier))
 
         status['set_filter_hard_failures'] = hard_filter_failures
         status['set_filter_soft_failures'] = soft_filter_failures
         status['set_filter_soft_fail_count'] = len(soft_filter_failures)
+        status['set_filter_state'] = (
+            False if hard_filter_failures else
+            'reduced' if soft_filter_failures else
+            True
+        )
 
         if hard_filter_failures:
             item = hard_filter_failures[0]
@@ -9871,10 +10165,14 @@ class SignalEngine(BaseEngine):
 
         set_filter_multiplier = 1.0
         if soft_filter_failures and bool(cfg.get('set_filter_soft_fail_enabled', True)):
-            if len(soft_filter_failures) >= 2:
-                set_filter_multiplier = float(cfg.get('set_filter_multi_soft_fail_multiplier', 0.50) or 0.50)
-            else:
-                set_filter_multiplier = float(cfg.get('set_filter_soft_fail_multiplier', 0.70) or 0.70)
+            configured_multiplier = (
+                float(cfg.get('set_filter_multi_soft_fail_multiplier', 0.50) or 0.50)
+                if len(soft_filter_failures) >= 2
+                else float(cfg.get('set_filter_soft_fail_multiplier', 0.70) or 0.70)
+            )
+            set_filter_multiplier = min(
+                [configured_multiplier, *set_filter_item_multipliers]
+            )
             status['set_filter_risk_multiplier'] = set_filter_multiplier
             status['set_filter_soft_fail_summary'] = '; '.join(
                 f"{item.get('name')}: {item.get('detail')}"
@@ -9890,6 +10188,8 @@ class SignalEngine(BaseEngine):
                 record_failure=True,
                 side=side
             )
+        else:
+            status['set_filter_risk_multiplier'] = 1.0
 
         if side == 'short':
             short_ok, short_reason = self._utbreakout_short_guard_passes(cfg, filter_values)
@@ -10151,32 +10451,99 @@ class SignalEngine(BaseEngine):
         status['runner_avg_mfe_capture_ratio'] = runner_stats.get('avg_mfe_capture_ratio')
         status['runner_avg_pnl_r'] = runner_stats.get('avg_pnl_r')
 
-        # --- Relaxed Hard Block Conditions ---
+        short_risk_multiplier = 1.0
+        if side == 'short' and bool(cfg.get('short_conservative_enabled', True)):
+            short_risk_multiplier = min(
+                1.0,
+                max(0.0, float(cfg.get('short_risk_multiplier', 0.60) or 0.60)),
+            )
+        direction_multiplier = (
+            min(1.0, max(0.0, float(dir_decision.size_multiplier)))
+            if dir_decision is not None
+            else 1.0
+        )
+        continuation_multiplier = (
+            min(1.0, max(0.0, float(continuation_decision.risk_multiplier)))
+            if continuation_decision is not None
+            else 1.0
+        )
+        final_risk_multiplier = (
+            short_risk_multiplier
+            * bias_continuation_multiplier
+            * market_quality_multiplier
+            * strategy_risk_multiplier
+            * quality_score_v2_multiplier
+            * selector_quality_multiplier
+            * feature_score_multiplier
+            * set_filter_multiplier
+            * direction_multiplier
+            * continuation_multiplier
+        )
+        final_risk_multiplier = max(0.0, min(1.0, float(final_risk_multiplier)))
+        status['final_risk_multiplier'] = final_risk_multiplier
+        status['decision_trace'] = {
+            'runtime_profile': cfg.get('runtime_profile'),
+            'entry_timeframe': cfg.get('entry_timeframe'),
+            'htf_timeframe': cfg.get('htf_timeframe'),
+            'adaptive_timeframes': cfg.get('adaptive_timeframes'),
+            'selected_set': selected_set.get('id') if isinstance(selected_set, dict) else None,
+            'selected_set_detail': (
+                selected_set.get('_stable_selection_detail')
+                if isinstance(selected_set, dict)
+                else None
+            ),
+            'set_filter_state': status.get('set_filter_state'),
+            'set_filter_multiplier': set_filter_multiplier,
+            'trend_health_state': trend_health.get('state'),
+            'strategy_quality_state': strategy_quality.get('state'),
+            'quality_score_v2_state': quality_score_v2.get('state'),
+            'final_risk_multiplier': final_risk_multiplier,
+        }
+
+        # Only configured extreme states remain hard blocks.
         trend_score_val = trend_health.get('score')
-        if trend_score_val is not None and float(trend_score_val) < 20.0:
+        trend_hard = float(cfg.get('trend_health_hard_block_below', 20.0) or 20.0)
+        if trend_health.get('state') is False or (
+            trend_score_val is not None and float(trend_score_val) < trend_hard
+        ):
             return _finish(
                 None,
-                f"REJECTED_TREND_HEALTH: trend health score {trend_score_val:.2f} < 20.0",
+                f"REJECTED_TREND_HEALTH: trend health score {float(trend_score_val or 0.0):.2f} < {trend_hard:.1f}",
                 'REJECTED_TREND_HEALTH',
                 record_failure=True,
                 side=side
             )
 
         strategy_score_val = strategy_quality.get('score')
-        if strategy_score_val is not None and float(strategy_score_val) < 12.0:
+        strategy_hard = float(cfg.get('strategy_quality_hard_block_below', 12.0) or 12.0)
+        if strategy_quality.get('state') is False or (
+            strategy_score_val is not None and float(strategy_score_val) < strategy_hard
+        ):
             return _finish(
                 None,
-                f"REJECTED_STRATEGY_QUALITY: strategy quality score {strategy_score_val:.2f} < 12.0",
+                f"REJECTED_STRATEGY_QUALITY: strategy quality score {float(strategy_score_val or 0.0):.2f} < {strategy_hard:.1f}",
                 'REJECTED_STRATEGY_QUALITY',
                 record_failure=True,
                 side=side
             )
 
         q2_score_val = quality_score_v2.get('score')
-        if q2_score_val is not None and float(q2_score_val) < 20.0:
+        q2_hard = float(
+            quality_score_v2.get(
+                'block_below',
+                cfg.get(
+                    'quality_score_v2_short_block_below' if side == 'short' else 'quality_score_v2_long_block_below',
+                    25.0 if side == 'short' else 20.0,
+                ),
+            )
+            or (25.0 if side == 'short' else 20.0)
+        )
+        if quality_score_v2.get('state') is False or (
+            q2_score_val is not None and float(q2_score_val) < q2_hard
+        ):
             return _finish(
                 None,
-                f"REJECTED_QUALITY_SCORE_V2: quality score v2 {q2_score_val:.2f} < 20.0",
+                f"REJECTED_QUALITY_SCORE_V2: quality score v2 {float(q2_score_val or 0.0):.2f} < {q2_hard:.1f}",
                 'REJECTED_QUALITY_SCORE_V2',
                 record_failure=True,
                 side=side
@@ -10192,7 +10559,6 @@ class SignalEngine(BaseEngine):
         risk_per_trade_percent = float(cfg.get('risk_per_trade_percent', 1.0) or 1.0)
         max_risk_per_trade_usdt = float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
         if side == 'short' and bool(cfg.get('short_conservative_enabled', True)):
-            short_risk_multiplier = min(1.0, max(0.0, float(cfg.get('short_risk_multiplier', 0.5) or 0.5)))
             risk_per_trade_percent *= short_risk_multiplier
             max_risk_per_trade_usdt *= short_risk_multiplier
             status['short_risk_multiplier'] = short_risk_multiplier
@@ -10427,6 +10793,9 @@ class SignalEngine(BaseEngine):
             'set_filter_risk_multiplier': status.get('set_filter_risk_multiplier'),
             'set_filter_soft_fail_summary': status.get('set_filter_soft_fail_summary'),
             'set_filter_soft_fail_count': status.get('set_filter_soft_fail_count'),
+            'set_filter_state': status.get('set_filter_state'),
+            'final_risk_multiplier': status.get('final_risk_multiplier'),
+            'decision_trace': status.get('decision_trace'),
             'direction_decision': status.get('direction_decision'),
             'direction_btc_4h_symbol': status.get('direction_btc_4h_symbol'),
             'direction_btc_1d_symbol': status.get('direction_btc_1d_symbol'),
@@ -11201,11 +11570,50 @@ class SignalEngine(BaseEngine):
             filter_values['feature_score'] = feature_score
             selected_items = self._evaluate_utbreakout_set_filter_items(side, selected_set, cfg, filter_values)
             failed_set_items = [item for item in selected_items if item.get('state') is not True]
-            if failed_set_items:
+            set_hard_failures = []
+            set_soft_failures = []
+            set_item_multipliers = []
+            for item in failed_set_items:
+                name = item.get('name') or ''
+                detail = item.get('detail') or ''
+                code = item.get('code') or ''
+                if name in {'ATR% 변동성', '손익비', '스프레드', '유동성'} or code == 'REJECTED_RISK_REWARD_LOW':
+                    state, multiplier, classified_detail = False, 0.0, detail
+                elif name in {'상대 거래량', 'Rolling OFI 확인', 'Futures 수급 불균형', 'Spread/Depth 비용'}:
+                    state, multiplier, classified_detail = _classify_set_filter_result(
+                        side,
+                        False,
+                        detail,
+                        metrics=filter_values,
+                        cfg=cfg,
+                    )
+                else:
+                    state = 'reduced'
+                    multiplier = 0.65 if item.get('state') is None else 0.50
+                    classified_detail = f"{detail}; set confirmation soft fail"
+                classified = dict(item)
+                classified.update({
+                    'state': state,
+                    'risk_multiplier': multiplier,
+                    'detail': classified_detail,
+                })
+                if state is False:
+                    set_hard_failures.append(classified)
+                else:
+                    set_soft_failures.append(classified)
+                    set_item_multipliers.append(float(multiplier))
+
+            if set_hard_failures:
                 set_state = False
                 set_detail = "; ".join(
                     f"{item.get('name')}: {item.get('detail')}"
-                    for item in failed_set_items[:3]
+                    for item in set_hard_failures[:3]
+                )
+            elif set_soft_failures:
+                set_state = 'reduced'
+                set_detail = "; ".join(
+                    f"{item.get('name')}: {item.get('detail')}"
+                    for item in set_soft_failures[:3]
                 )
             elif selected_items:
                 set_state = True
@@ -11293,13 +11701,18 @@ class SignalEngine(BaseEngine):
             market_multiplier = min(1.0, max(0.0, float(market_quality.get('risk_multiplier', 1.0) or 1.0)))
 
             set_filter_multiplier_status = 1.0
-            if failed_set_items and bool(cfg.get('set_filter_soft_fail_enabled', True)):
-                set_filter_multiplier_status = (
+            if set_hard_failures:
+                set_filter_multiplier_status = 0.0
+            elif set_soft_failures and bool(cfg.get('set_filter_soft_fail_enabled', True)):
+                configured_set_multiplier = (
                     float(cfg.get('set_filter_multi_soft_fail_multiplier', 0.50) or 0.50)
-                    if len(failed_set_items) >= 2
+                    if len(set_soft_failures) >= 2
                     else float(cfg.get('set_filter_soft_fail_multiplier', 0.70) or 0.70)
                 )
-            elif failed_set_items:
+                set_filter_multiplier_status = min(
+                    [configured_set_multiplier, *set_item_multipliers]
+                )
+            elif set_soft_failures:
                 set_filter_multiplier_status = 0.0
 
             final_risk_multiplier_status = (
@@ -11483,6 +11896,8 @@ class SignalEngine(BaseEngine):
         def _ok_text(state):
             if state is True:
                 return "OK"
+            if state == 'reduced':
+                return "REDUCE"
             if state is False:
                 return "BLOCK"
             return "WAIT"
@@ -11850,17 +12265,65 @@ class SignalEngine(BaseEngine):
         )
         if quality_score_v2_analysis.get('state') is False:
             blockers.append(f"통합 품질 점수 미통과: {quality_score_v2_analysis.get('summary')}")
-        failed_filters = [item for item in long_filter_items if item.get('state') is not True]
+        classified_long_filter_items = []
+        hard_failed_filters = []
+        soft_failed_filters = []
+        for item in long_filter_items:
+            if item.get('state') is True:
+                classified_long_filter_items.append(item)
+                continue
+            name = item.get('name') or ''
+            detail = item.get('detail') or ''
+            code = item.get('code') or ''
+            if name in {'ATR% 변동성', '손익비', '스프레드', '유동성'} or code == 'REJECTED_RISK_REWARD_LOW':
+                state, multiplier, classified_detail = False, 0.0, detail
+            elif name in {'상대 거래량', 'Rolling OFI 확인', 'Futures 수급 불균형', 'Spread/Depth 비용'}:
+                state, multiplier, classified_detail = _classify_set_filter_result(
+                    'long',
+                    False,
+                    detail,
+                    metrics=filter_values,
+                    cfg=cfg,
+                )
+            else:
+                state = 'reduced'
+                multiplier = 0.65 if item.get('state') is None else 0.50
+                classified_detail = f"{detail}; set confirmation soft fail"
+            classified = dict(item)
+            classified.update({
+                'state': state,
+                'risk_multiplier': multiplier,
+                'detail': classified_detail,
+            })
+            classified_long_filter_items.append(classified)
+            if state is False:
+                hard_failed_filters.append(classified)
+            else:
+                soft_failed_filters.append(classified)
+        failed_filters = hard_failed_filters
+        set_filter_analysis_state = (
+            False if hard_failed_filters else
+            'reduced' if soft_failed_filters else
+            True
+        )
         if selected_set.get('status') != 'active':
             blockers.append(f"Set{selected_set.get('id')}은 실거래 연결 상태가 아님")
         if candidate_side != 'long':
             blockers.append(f"UTBot LONG 후보 아님: 현재 {str(candidate_side or 'none').upper()} ({candidate_type})")
-        if failed_filters:
+        if hard_failed_filters:
             top_failed = "; ".join(
                 f"{item.get('name')}={item.get('detail')}"
-                for item in failed_filters[:4]
+                for item in hard_failed_filters[:4]
             )
             blockers.append(f"선택 Set LONG 필터 미통과: {top_failed}")
+        if soft_failed_filters:
+            notes.append(
+                "선택 Set 보조 확인 감액: "
+                + "; ".join(
+                    f"{item.get('name')} x{float(item.get('risk_multiplier', 1.0)):.2f}"
+                    for item in soft_failed_filters[:4]
+                )
+            )
 
         if not self.is_trade_direction_allowed('long'):
             blockers.append(self.format_trade_direction_block_reason('long'))
@@ -12019,7 +12482,7 @@ class SignalEngine(BaseEngine):
             and selected_set.get('status') == 'active'
             and bias_continuation_ok
             and quality_score_v2_analysis.get('state') is not False
-            and not failed_filters
+            and not hard_failed_filters
             and daily_ok
             and risk_plan is not None
         )
@@ -12037,7 +12500,7 @@ class SignalEngine(BaseEngine):
 
         filter_lines = [
             f"- {item.get('name')}: {_ok_text(item.get('state'))} / {item.get('detail')}"
-            for item in long_filter_items[:12]
+            for item in classified_long_filter_items[:12]
         ] or ["- 선택 Set 필터 없음"]
         event_lines = []
         for event in recent_events:
@@ -12086,7 +12549,7 @@ class SignalEngine(BaseEngine):
             f"- UT 후보: {str(candidate_side or 'none').upper()} ({candidate_type}) / fresh {str(ut_sig or 'none').upper()} / bias {str(ut_bias_side or 'none').upper()}",
             f"- 선택 Set: Set{selected_set.get('id')} {selected_set.get('name')} ({selected_set.get('status')})",
             f"- AUTO 이유: {auto_reason or '수동 선택'}",
-            f"- LONG 핵심: UT {_ok_text(candidate_side == 'long')} / BiasCont {_ok_text(bias_continuation_ok)} / QScore {_ok_text(quality_score_v2_analysis.get('state'))} / Set필터 {_ok_text(not failed_filters)} / 일일리스크 {_ok_text(daily_ok)} / 리스크계획 {_ok_text(risk_plan is not None)}",
+            f"- LONG 핵심: UT {_ok_text(candidate_side == 'long')} / BiasCont {_ok_text(bias_continuation_ok)} / QScore {_ok_text(quality_score_v2_analysis.get('state'))} / Set필터 {_ok_text(set_filter_analysis_state)} / 일일리스크 {_ok_text(daily_ok)} / 리스크계획 {_ok_text(risk_plan is not None)}",
             f"- Bias continuation: {bias_continuation_summary}",
             f"- 통합 품질 점수: {quality_score_v2_analysis.get('summary')}",
             f"- Feature Score: {_fmt(feature_score_analysis.get('score'), 1)} / {feature_score_analysis.get('reason')}",
@@ -14657,6 +15120,7 @@ class SignalEngine(BaseEngine):
             'last_candle_time',
             'utbreakout_adaptive_tf_state',
             'utbreakout_adaptive_last_decision_ts',
+            'utbreakout_last_selected_set_ids',
             'fisher_states',
             'vbo_states',
             'cameron_states'
