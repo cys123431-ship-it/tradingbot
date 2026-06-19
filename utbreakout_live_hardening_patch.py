@@ -148,4 +148,4 @@ def install(timeout_seconds=60.0):
                 return
             time.sleep(0.02)
 
-    threading.Thread(target="utbreak-live-hardening", daemon=True, target=watch).start()
+    threading.Thread(target=watch, name="utbreak-live-hardening", daemon=True).start()
