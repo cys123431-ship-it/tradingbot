@@ -483,6 +483,7 @@ UTBREAKOUT_DEFAULT_SET_ID = 2
 UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID = 22
 UTBREAKOUT_AUTO_TIMEFRAMES = ["15m", "30m", "1h"]
 UTBREAKOUT_RUNTIME_PROFILE = "stable_15m_direction_filter_v1"
+UTBREAKOUT_EFFECTIVE_PROFILE_VERSION = "profit_opportunity_v4_tp350_runner"
 
 # Live AUTO set hardening:
 # Keep live AUTO narrow to reduce many-set overfitting / multiple-testing risk.
@@ -704,6 +705,133 @@ def _apply_utbreakout_risk_multiplier_floor(value, cfg=None):
     return max(multiplier, floor)
 
 
+def apply_profit_opportunity_effective_overrides(cfg):
+    """Single source of truth for live UTBreakout effective config.
+
+    Apply this after every merge boundary and immediately before status or
+    live plan rendering so persisted config and selected Set params cannot
+    restore the legacy conservative profile.
+    """
+    if not isinstance(cfg, dict):
+        return cfg
+
+    cfg.update({
+        "effective_profile_version": UTBREAKOUT_EFFECTIVE_PROFILE_VERSION,
+
+        # AUTO selection
+        "selection_mode": "auto",
+        "auto_select_enabled": True,
+        "live_auto_set_whitelist_enabled": True,
+        "live_auto_set_whitelist": [5, 12, 22, 32, 51, 63],
+        "auto_min_score_margin_live": 0.5,
+        "auto_min_adjusted_score_live": 40.0,
+        "auto_block_on_weak_margin_live": True,
+        "auto_multiple_testing_penalty_enabled": True,
+        "multiple_testing_free_trials": 25,
+        "multiple_testing_max_score_penalty": 4.0,
+
+        # Selected Set guard
+        "selected_set_core_filter_hard_block_enabled": True,
+        "set_filter_soft_fail_enabled": True,
+        "set_filter_soft_fail_multiplier": 0.90,
+        "set_filter_multi_soft_fail_multiplier": 0.80,
+
+        # Continuation
+        "bias_continuation_min_volume_ratio": 0.40,
+        "bias_continuation_15m_min_volume_ratio": 0.45,
+        "bias_continuation_min_adaptive_tf_score": 30.0,
+        "bias_continuation_15m_min_adaptive_tf_score": 32.0,
+        "bias_continuation_min_adx": 10.0,
+        "bias_continuation_15m_min_adx": 11.0,
+        "bias_continuation_max_signal_age_candles": 10,
+        "bias_continuation_15m_max_signal_age_candles": 10,
+
+        # Quality and risk floors
+        "trend_health_hard_block_below": 12.0,
+        "trend_health_reduce_below": 35.0,
+        "trend_health_full_score": 62.0,
+        "trend_health_min_multiplier": 0.55,
+        "strategy_quality_hard_block_below": 8.0,
+        "strategy_quality_reduce_below": 25.0,
+        "strategy_quality_full_score": 60.0,
+        "strategy_quality_min_multiplier": 0.55,
+        "strategy_adaptive_min_risk_multiplier": 0.50,
+        "quality_score_v2_block_below": 12.0,
+        "quality_score_v2_reduce_below": 40.0,
+        "quality_score_v2_15m_block_below": 12.0,
+        "quality_score_v2_15m_reduce_below": 40.0,
+        "quality_score_v2_min_risk_multiplier": 0.60,
+        "quality_score_v2_long_block_below": 12.0,
+        "quality_score_v2_long_reduce_below": 40.0,
+        "quality_score_v2_long_15m_block_below": 12.0,
+        "quality_score_v2_long_15m_reduce_below": 40.0,
+        "quality_score_v2_short_block_below": 16.0,
+        "quality_score_v2_short_reduce_below": 45.0,
+        "quality_score_v2_short_15m_block_below": 16.0,
+        "quality_score_v2_short_15m_reduce_below": 45.0,
+        "market_quality_long_hard_block_on_multi_adverse_enabled": False,
+        "market_quality_long_multi_adverse_min_reasons": 5,
+        "market_quality_long_multi_adverse_max_multiplier": 0.35,
+        "market_quality_min_risk_multiplier": 0.55,
+        "final_risk_multiplier_floor": 0.20,
+
+        # Set32
+        "set32_min_relative_volume": 1.15,
+        "set32_require_direction_candle": True,
+        "set32_require_ema50_side": True,
+        "set32_require_orderflow_confirmation": True,
+        "set32_orderflow_min_samples": 2,
+        "set32_min_taker_ratio_long": 0.97,
+        "set32_max_taker_ratio_short": 1.03,
+        "set32_max_spread_pct": 0.09,
+
+        # TP and runner
+        "fixed_take_profit_enabled": True,
+        "partial_take_profit_enabled": True,
+        "partial_take_profit_r_multiple": 1.00,
+        "partial_take_profit_ratio": 0.20,
+        "second_take_profit_enabled": True,
+        "second_take_profit_r_multiple": 3.50,
+        "second_take_profit_ratio": 0.40,
+        "dynamic_take_profit_enabled": True,
+        "dynamic_tp2_base_r_multiple": 3.20,
+        "dynamic_tp2_strong_r_multiple": 5.00,
+        "dynamic_tp2_elite_r_multiple": 7.00,
+        "atr_trailing_enabled": True,
+        "atr_trailing_activation_r": 1.60,
+        "atr_trailing_multiplier": 3.50,
+        "shadow_runner_exit_enabled": True,
+        "runner_exit_enabled": True,
+        "runner_chandelier_enabled": True,
+        "runner_chandelier_multiplier": 3.80,
+        "runner_chandelier_multiplier_max": 4.50,
+
+        # Adaptive exit must not shrink TP1 back to 60%+.
+        "adaptive_exit_partial_r_min": 1.0,
+        "adaptive_exit_partial_r_max": 1.2,
+        "adaptive_exit_ratio_min": 0.20,
+        "adaptive_exit_ratio_max": 0.35,
+        "adaptive_exit_trailing_multiplier_min": 3.0,
+        "adaptive_exit_trailing_multiplier_max": 4.0,
+        "adaptive_exit_activation_r_min": 1.4,
+        "adaptive_exit_activation_r_max": 1.8,
+
+        # Bounded activity
+        "max_daily_trades": 14,
+        "max_consecutive_losses": 5,
+    })
+
+    try:
+        current_take_profit = float(cfg.get("take_profit_r_multiple", 0) or 0)
+    except (TypeError, ValueError):
+        current_take_profit = 0.0
+    cfg["take_profit_r_multiple"] = max(
+        current_take_profit,
+        float(cfg.get("second_take_profit_r_multiple", 3.50) or 3.50),
+    )
+    return cfg
+
+
 def apply_stable_utbreak_final_overrides(cfg):
     """Apply final UTBreak config overrides after selected Set params are merged.
 
@@ -839,6 +967,7 @@ def apply_stable_utbreak_final_overrides(cfg):
         "max_daily_trades": 14,
         "max_consecutive_losses": 5,
     })
+    cfg = apply_profit_opportunity_effective_overrides(cfg)
     return cfg
 
 
@@ -878,7 +1007,7 @@ def build_utbreakout_set_registry():
         'utbot_key_value': 2.5,
         'utbot_atr_period': 14,
         'stop_atr_multiplier': 1.5,
-        'take_profit_r_multiple': 2.0,
+        'take_profit_r_multiple': 3.50,
         'fixed_take_profit_enabled': True,
         'partial_take_profit_enabled': True,
         'partial_take_profit_r_multiple': 1.00,
@@ -1396,7 +1525,7 @@ def build_default_utbot_filtered_breakout_config():
         'htf_ema_gap_min_percent': 0.15,
         'donchian_width_min_percent': 0.50,
         'stop_atr_multiplier': 1.5,
-        'take_profit_r_multiple': 2.0,
+        'take_profit_r_multiple': 3.50,
         'fixed_take_profit_enabled': True,
         'partial_take_profit_enabled': True,
         'partial_take_profit_r_multiple': 1.00,
@@ -5527,7 +5656,7 @@ class SignalEngine(BaseEngine):
             'htf_ema_gap_min_percent': 0.15,
             'donchian_width_min_percent': 0.50,
             'stop_atr_multiplier': 1.5,
-            'take_profit_r_multiple': 2.0,
+            'take_profit_r_multiple': 3.50,
             'min_risk_reward': 2.0,
             'risk_per_trade_percent': DEFAULT_RISK_PER_TRADE_PERCENT,
             'min_risk_per_trade_percent': DEFAULT_MIN_RISK_PER_TRADE_PERCENT,
@@ -5860,6 +5989,7 @@ class SignalEngine(BaseEngine):
         if cfg['atr_max_percent'] < cfg['atr_min_percent']:
             cfg['atr_max_percent'] = cfg['atr_min_percent']
         cfg = apply_stable_utbreak_final_overrides(cfg)
+        cfg = apply_profit_opportunity_effective_overrides(cfg)
         return cfg
 
     def _get_utbot_filtered_breakout_ut_params(self, cfg):
@@ -8013,7 +8143,7 @@ class SignalEngine(BaseEngine):
             return None
         if risk_distance <= 0 or initial_qty <= 0 or entry <= 0:
             return None
-        ratio = min(0.9, max(0.0, float(cfg.get('partial_take_profit_ratio', 0.5) or 0.5)))
+        ratio = min(0.9, max(0.0, float(cfg.get('partial_take_profit_ratio', 0.20) or 0.20)))
         runner_ratio = min(
             1.0,
             max(
@@ -8031,12 +8161,12 @@ class SignalEngine(BaseEngine):
             second_room = max(0.0, 1.0 - partial_ratio)
         second_ratio = min(
             second_room,
-            max(0.0, float(cfg.get('second_take_profit_ratio', 0.5) or 0.5))
+            max(0.0, float(cfg.get('second_take_profit_ratio', 0.40) or 0.40))
         ) if second_enabled else 0.0
         raw_tp_quantities = []
         planned_tp_orders = []
-        partial_r = max(0.1, float(cfg.get('partial_take_profit_r_multiple', 1.5) or 1.5))
-        second_r = max(0.1, float(cfg.get('second_take_profit_r_multiple', cfg.get('take_profit_r_multiple', 2.0)) or 2.0))
+        partial_r = max(0.1, float(cfg.get('partial_take_profit_r_multiple', 1.00) or 1.00))
+        second_r = max(0.1, float(cfg.get('second_take_profit_r_multiple', cfg.get('take_profit_r_multiple', 3.50)) or 3.50))
         if partial_enabled and partial_ratio > 0:
             raw_tp_quantities.append(initial_qty * partial_ratio)
             planned_tp_orders.append({
@@ -8626,17 +8756,17 @@ class SignalEngine(BaseEngine):
 
         volume_ratio = _f('volume_ratio')
         min_volume = (
-            _cfg_float('bias_continuation_15m_min_volume_ratio', 0.80)
+            _cfg_float('bias_continuation_15m_min_volume_ratio', 0.45)
             if is_fast_tf else
-            _cfg_float('bias_continuation_min_volume_ratio', 0.75)
+            _cfg_float('bias_continuation_min_volume_ratio', 0.40)
         )
         if volume_ratio is None:
             if is_fast_tf:
                 reasons.append('volume ratio missing')
             else:
                 positives.append('volume neutral')
-        elif volume_ratio < 0.35:
-            reasons.append(f"volume ratio extremely weak {volume_ratio:.2f}<0.35")
+        elif volume_ratio < 0.25:
+            reasons.append(f"volume ratio extremely weak {volume_ratio:.2f}<0.25")
         elif volume_ratio < min_volume:
             pass
         else:
@@ -8953,7 +9083,7 @@ class SignalEngine(BaseEngine):
     def _build_utbreakout_dynamic_tp2(self, side, cfg, quality_score_v2, trend_health=None, strategy_quality=None):
         cfg = dict(cfg or {})
         if not bool(cfg.get('dynamic_take_profit_enabled', True)):
-            base_r = float(cfg.get('second_take_profit_r_multiple', cfg.get('take_profit_r_multiple', 2.0)) or 2.0)
+            base_r = float(cfg.get('second_take_profit_r_multiple', cfg.get('take_profit_r_multiple', 3.50)) or 3.50)
             return {
                 'enabled': False,
                 'second_take_profit_r_multiple': base_r,
@@ -8966,9 +9096,9 @@ class SignalEngine(BaseEngine):
         score = float(quality_score_v2.get('score', 0.0) or 0.0)
         trend_score = float(trend_health.get('score', 0.0) or 0.0)
         strategy_score = float(strategy_quality.get('score', 0.0) or 0.0)
-        base_r = float(cfg.get('dynamic_tp2_base_r_multiple', 2.0) or 2.0)
-        strong_r = float(cfg.get('dynamic_tp2_strong_r_multiple', 2.5) or 2.5)
-        elite_r = float(cfg.get('dynamic_tp2_elite_r_multiple', 3.0) or 3.0)
+        base_r = float(cfg.get('dynamic_tp2_base_r_multiple', 3.20) or 3.20)
+        strong_r = float(cfg.get('dynamic_tp2_strong_r_multiple', 5.00) or 5.00)
+        elite_r = float(cfg.get('dynamic_tp2_elite_r_multiple', 7.00) or 7.00)
         strong_score = float(cfg.get('dynamic_tp2_strong_score', 72.0) or 72.0)
         elite_score = float(cfg.get('dynamic_tp2_elite_score', 82.0) or 82.0)
         if score >= elite_score and trend_score >= 75.0 and strategy_score >= 75.0:
@@ -9155,7 +9285,7 @@ class SignalEngine(BaseEngine):
             'stop_loss': plan.get('stop_loss'),
             'take_profit': plan.get('take_profit'),
             'risk_distance': plan.get('risk_distance'),
-            'take_profit_r_multiple': plan.get('rr_multiple') or cfg.get('take_profit_r_multiple', 2.0),
+            'take_profit_r_multiple': plan.get('rr_multiple') or cfg.get('take_profit_r_multiple', 3.50),
             'max_bars': int(cfg.get('shadow_triple_barrier_max_bars', 24) or 24),
             'shadow_triple_logged': False,
             'shadow_runner_logged': False,
@@ -9227,7 +9357,7 @@ class SignalEngine(BaseEngine):
                     stop_loss=item.get('stop_loss'),
                     take_profit=item.get('take_profit'),
                     risk_distance=item.get('risk_distance'),
-                    take_profit_r_multiple=item.get('take_profit_r_multiple', 2.0),
+                    take_profit_r_multiple=item.get('take_profit_r_multiple', 3.50),
                     decision_ts=item.get('decision_ts'),
                     bars=closed,
                     max_bars=item.get('max_bars', cfg.get('shadow_triple_barrier_max_bars', 24)),
@@ -9687,6 +9817,7 @@ class SignalEngine(BaseEngine):
         strategy_label = STRATEGY_DISPLAY_NAMES.get(active_strategy, 'UTBOT_FILTERED_BREAKOUT_V1')
         status = {
             'strategy': strategy_label,
+            'effective_profile_version': cfg.get('effective_profile_version'),
             'stage': 'evaluate',
             'entry_timeframe': cfg.get('entry_timeframe', '15m'),
             'htf_timeframe': cfg.get('htf_timeframe', '1h'),
@@ -9727,6 +9858,7 @@ class SignalEngine(BaseEngine):
         if bool(cfg.get('adaptive_timeframe_enabled', False)):
             try:
                 cfg, df, adaptive_decision = await self._resolve_utbreakout_adaptive_timeframe(symbol, df, cfg)
+                cfg = apply_profit_opportunity_effective_overrides(cfg)
                 status.update({
                     'entry_timeframe': cfg.get('entry_timeframe', '15m'),
                     'exit_timeframe': cfg.get('exit_timeframe', cfg.get('entry_timeframe', '15m')),
@@ -9763,6 +9895,7 @@ class SignalEngine(BaseEngine):
         effective_cfg['active_set_id'] = int(selected_set.get('id', cfg.get('active_set_id', UTBREAKOUT_DEFAULT_SET_ID)))
         effective_cfg['profile'] = f"set{effective_cfg['active_set_id']}"
         cfg = apply_stable_utbreak_final_overrides(effective_cfg)
+        cfg = apply_profit_opportunity_effective_overrides(cfg)
         if bool(cfg.get('auto_select_enabled', False)):
             if not isinstance(getattr(self, 'utbreakout_last_selected_set_ids', None), dict):
                 self.utbreakout_last_selected_set_ids = {}
@@ -10397,12 +10530,22 @@ class SignalEngine(BaseEngine):
                 float(dynamic_tp2.get('second_take_profit_r_multiple', 3.20) or 3.20),
             )
             cfg['take_profit_r_multiple'] = max(
-                float(cfg.get('take_profit_r_multiple', 2.0) or 2.0),
-                float(cfg.get('second_take_profit_r_multiple', 2.0) or 2.0),
+                float(cfg.get('take_profit_r_multiple', 3.50) or 3.50),
+                float(cfg.get('second_take_profit_r_multiple', 3.50) or 3.50),
             )
         status['dynamic_take_profit'] = dynamic_tp2
         status['dynamic_take_profit_summary'] = dynamic_tp2.get('summary')
         status['dynamic_tp2_r_multiple'] = dynamic_tp2.get('second_take_profit_r_multiple')
+        cfg = apply_profit_opportunity_effective_overrides(cfg)
+        if dynamic_tp2.get('enabled'):
+            cfg['second_take_profit_r_multiple'] = max(
+                float(cfg.get('second_take_profit_r_multiple', 3.50) or 3.50),
+                float(dynamic_tp2.get('second_take_profit_r_multiple', 3.20) or 3.20),
+            )
+            cfg['take_profit_r_multiple'] = max(
+                float(cfg.get('take_profit_r_multiple', 3.50) or 3.50),
+                float(cfg.get('second_take_profit_r_multiple', 3.50) or 3.50),
+            )
 
         # 4-layer direction decision overlay
         dir_decision = None
@@ -10688,7 +10831,7 @@ class SignalEngine(BaseEngine):
                 atr_value=atr_value,
                 stop_atr_multiplier=cfg.get('stop_atr_multiplier', 1.5),
                 ut_stop=ut_detail.get('curr_stop'),
-                take_profit_r_multiple=cfg.get('take_profit_r_multiple', 2.0),
+                take_profit_r_multiple=cfg.get('take_profit_r_multiple', 3.50),
                 min_risk_reward=cfg.get('min_risk_reward', 2.0),
                 balance_usdt=balance_for_risk,
                 risk_per_trade_percent=risk_per_trade_percent,
@@ -10809,8 +10952,19 @@ class SignalEngine(BaseEngine):
                     )
                 except Exception:
                     logger.debug("Aggressive growth blocked notice skipped", exc_info=True)
+        cfg = apply_profit_opportunity_effective_overrides(cfg)
+        if dynamic_tp2.get('enabled'):
+            cfg['second_take_profit_r_multiple'] = max(
+                float(cfg.get('second_take_profit_r_multiple', 3.50) or 3.50),
+                float(dynamic_tp2.get('second_take_profit_r_multiple', 3.20) or 3.20),
+            )
+            cfg['take_profit_r_multiple'] = max(
+                float(cfg.get('take_profit_r_multiple', 3.50) or 3.50),
+                float(cfg.get('second_take_profit_r_multiple', 3.50) or 3.50),
+            )
         plan.update({
             'strategy': active_strategy if active_strategy in UTBREAKOUT_STRATEGIES else UTBOT_FILTERED_BREAKOUT_STRATEGY,
+            'effective_profile_version': cfg.get('effective_profile_version'),
             'entry_timeframe': cfg.get('entry_timeframe', '15m'),
             'exit_timeframe': cfg.get('exit_timeframe', cfg.get('entry_timeframe', '15m')),
             'htf_timeframe': cfg.get('htf_timeframe', '1h'),
@@ -10822,14 +10976,14 @@ class SignalEngine(BaseEngine):
             'decision_candle_ts': decision_ts,
             'fixed_take_profit_enabled': bool(cfg.get('fixed_take_profit_enabled', True)),
             'partial_take_profit_enabled': bool(cfg.get('partial_take_profit_enabled', True)),
-            'partial_take_profit_r_multiple': float(cfg.get('partial_take_profit_r_multiple', 1.5) or 1.5),
-            'partial_take_profit_ratio': float(cfg.get('partial_take_profit_ratio', 0.5) or 0.5),
+            'partial_take_profit_r_multiple': float(cfg.get('partial_take_profit_r_multiple', 1.00) or 1.00),
+            'partial_take_profit_ratio': float(cfg.get('partial_take_profit_ratio', 0.20) or 0.20),
             'second_take_profit_enabled': bool(cfg.get('second_take_profit_enabled', True)),
-            'second_take_profit_r_multiple': float(cfg.get('second_take_profit_r_multiple', cfg.get('take_profit_r_multiple', 2.0)) or 2.0),
-            'second_take_profit_ratio': float(cfg.get('second_take_profit_ratio', 0.5) or 0.5),
+            'second_take_profit_r_multiple': float(cfg.get('second_take_profit_r_multiple', cfg.get('take_profit_r_multiple', 3.50)) or 3.50),
+            'second_take_profit_ratio': float(cfg.get('second_take_profit_ratio', 0.40) or 0.40),
             'atr_trailing_enabled': bool(cfg.get('atr_trailing_enabled', True)),
-            'atr_trailing_multiplier': float(cfg.get('atr_trailing_multiplier', 2.0) or 2.0),
-            'atr_trailing_activation_r': float(cfg.get('atr_trailing_activation_r', 1.5) or 1.5),
+            'atr_trailing_multiplier': float(cfg.get('atr_trailing_multiplier', 3.50) or 3.50),
+            'atr_trailing_activation_r': float(cfg.get('atr_trailing_activation_r', 1.60) or 1.60),
             'short_conservative_enabled': bool(cfg.get('short_conservative_enabled', True)),
             'short_risk_multiplier': float(cfg.get('short_risk_multiplier', 0.5) or 0.5),
             'bias_continuation_summary': status.get('bias_continuation_summary'),
@@ -10870,7 +11024,7 @@ class SignalEngine(BaseEngine):
             'aggressive_growth_risk_pct': plan.get('aggressive_growth_risk_pct'),
             'runner_pct': plan.get('runner_pct', cfg.get('runner_pct')),
             'tp1_breakeven_enabled': bool(cfg.get('tp1_breakeven_enabled', True)),
-            'tp1_breakeven_trigger_r': float(cfg.get('tp1_breakeven_trigger_r', cfg.get('partial_take_profit_r_multiple', 1.5)) or 1.5),
+            'tp1_breakeven_trigger_r': float(cfg.get('tp1_breakeven_trigger_r', cfg.get('partial_take_profit_r_multiple', 1.00)) or 1.00),
             'tp1_breakeven_offset_r': float(cfg.get('tp1_breakeven_offset_r', 0.03) or 0.03),
             'tp1_breakeven_wait_for_partial': bool(cfg.get('tp1_breakeven_wait_for_partial', True)),
             'tp1_breakeven_qty_tolerance': float(cfg.get('tp1_breakeven_qty_tolerance', 0.08) or 0.08),
@@ -11203,6 +11357,7 @@ class SignalEngine(BaseEngine):
     async def build_utbreakout_condition_status_text(self, symbol):
         cfg = self._get_utbot_filtered_breakout_config(self.get_runtime_strategy_params())
         cfg = apply_stable_utbreak_final_overrides(cfg)
+        cfg = apply_profit_opportunity_effective_overrides(cfg)
         common_cfg = self.get_runtime_common_settings()
         lev = int(max(1.0, float(common_cfg.get('leverage', 5) or 5)))
         entry_tf = cfg.get('entry_timeframe', '15m')
@@ -11273,6 +11428,7 @@ class SignalEngine(BaseEngine):
         if bool(cfg.get('adaptive_timeframe_enabled', False)):
             try:
                 cfg, df, adaptive_decision = await self._resolve_utbreakout_adaptive_timeframe(symbol, df, cfg)
+                cfg = apply_profit_opportunity_effective_overrides(cfg)
                 entry_tf = cfg.get('entry_timeframe', entry_tf)
                 htf_tf = cfg.get('htf_timeframe', htf_tf)
                 for col in ['open', 'high', 'low', 'close', 'volume']:
@@ -11290,6 +11446,7 @@ class SignalEngine(BaseEngine):
         effective_cfg['profile'] = f"set{effective_cfg['active_set_id']}"
         cfg = effective_cfg
         cfg = apply_stable_utbreak_final_overrides(cfg)
+        cfg = apply_profit_opportunity_effective_overrides(cfg)
         entry_tf = cfg.get('entry_timeframe', '15m')
         htf_tf = cfg.get('htf_timeframe', '1h')
 
@@ -11486,7 +11643,7 @@ class SignalEngine(BaseEngine):
                 if trend_health_for_plan.get('state') is False:
                     risk_note += " / 추세건강 BLOCK"
                 cfg['take_profit_r_multiple'] = max(
-                    float(cfg.get('take_profit_r_multiple', 2.0) or 2.0),
+                    float(cfg.get('take_profit_r_multiple', 3.50) or 3.50),
                     float(cfg.get('second_take_profit_r_multiple', 3.50) or 3.50),
                 )
                 plan = calculate_risk_plan(
@@ -11495,7 +11652,7 @@ class SignalEngine(BaseEngine):
                     atr_value=atr_value,
                     stop_atr_multiplier=cfg.get('stop_atr_multiplier', 1.5),
                     ut_stop=ut_detail.get('curr_stop'),
-                    take_profit_r_multiple=cfg.get('take_profit_r_multiple', 2.0),
+                    take_profit_r_multiple=cfg.get('take_profit_r_multiple', 3.50),
                     min_risk_reward=cfg.get('min_risk_reward', 2.0),
                     balance_usdt=balance_for_risk,
                     risk_per_trade_percent=risk_per_trade_percent,
@@ -11912,6 +12069,7 @@ class SignalEngine(BaseEngine):
             f"Feature Score: {_fmt(status_feature_score.get('score'), 1)} / "
             f"{status_feature_score.get('reason') or 'n/a'}"
         )
+        cfg = apply_profit_opportunity_effective_overrides(cfg)
         adaptive_tfs = cfg.get("adaptive_timeframes", ["15m", "30m", "1h"])
         tp2 = float(cfg.get("second_take_profit_r_multiple", 3.50) or 3.50)
         vol_base = float(cfg.get("bias_continuation_min_volume_ratio", 0.40) or 0.40)
@@ -11919,6 +12077,7 @@ class SignalEngine(BaseEngine):
 
         text_lines = [
             "🚦 UT Breakout 조건 스테이터스",
+            f"Effective Profile: {cfg.get('effective_profile_version', 'UNKNOWN')}",
             *position_scan_context,
             f"Runtime Profile: {cfg.get('runtime_profile', UTBREAKOUT_RUNTIME_PROFILE)}",
             f"Effective TF: entry {entry_tf} / htf {htf_tf} / adaptive {', '.join(map(str, adaptive_tfs))}",
@@ -12453,7 +12612,7 @@ class SignalEngine(BaseEngine):
                 atr_value=atr_value,
                 stop_atr_multiplier=cfg.get('stop_atr_multiplier', 1.5),
                 ut_stop=ut_detail.get('curr_stop'),
-                take_profit_r_multiple=cfg.get('take_profit_r_multiple', 2.0),
+                take_profit_r_multiple=cfg.get('take_profit_r_multiple', 3.50),
                 min_risk_reward=cfg.get('min_risk_reward', 2.0),
                 balance_usdt=balance_for_risk,
                 risk_per_trade_percent=cfg.get('risk_per_trade_percent', 1.0),
@@ -22871,7 +23030,7 @@ class SignalEngine(BaseEngine):
             'partial_take_profit_r_multiple': 1.0,
             'partial_take_profit_ratio': split['tp1_pct'],
             'second_take_profit_enabled': split['tp2_pct'] > 0,
-            'second_take_profit_r_multiple': 2.0,
+            'second_take_profit_r_multiple': 3.50,
             'second_take_profit_ratio': split['tp2_pct'],
             'runner_pct': split['runner_pct'],
             'atr_trailing_enabled': True,
@@ -29340,15 +29499,15 @@ UTBot:
                 coin_mode = f"Watchlist `{', '.join(watchlist[:6]) if watchlist else '없음'}`"
             partial_enabled = bool(cfg.get('partial_take_profit_enabled', True))
             partial_text = (
-                f"{float(cfg.get('partial_take_profit_ratio', 0.5) or 0.5) * 100:.0f}% @ "
-                f"{float(cfg.get('partial_take_profit_r_multiple', 1.5) or 1.5):.1f}R"
+                f"{float(cfg.get('partial_take_profit_ratio', 0.20) or 0.20) * 100:.0f}% @ "
+                f"{float(cfg.get('partial_take_profit_r_multiple', 1.00) or 1.00):.1f}R"
                 if partial_enabled else
                 "OFF"
             )
             second_enabled = bool(cfg.get('second_take_profit_enabled', True))
             second_text = (
-                f"{float(cfg.get('second_take_profit_ratio', 0.5) or 0.5) * 100:.0f}% @ "
-                f"{float(cfg.get('second_take_profit_r_multiple', cfg.get('take_profit_r_multiple', 2.0)) or 2.0):.1f}R"
+                f"{float(cfg.get('second_take_profit_ratio', 0.40) or 0.40) * 100:.0f}% @ "
+                f"{float(cfg.get('second_take_profit_r_multiple', cfg.get('take_profit_r_multiple', 3.50)) or 3.50):.1f}R"
                 if second_enabled else
                 "OFF"
             )
@@ -29360,16 +29519,16 @@ UTBot:
             if cfg.get('dynamic_take_profit_enabled', True):
                 take_profit_text += (
                     f" / Dynamic TP2 ON "
-                    f"({float(cfg.get('dynamic_tp2_base_r_multiple', 2.0) or 2.0):.1f}~"
-                    f"{float(cfg.get('dynamic_tp2_elite_r_multiple', 3.0) or 3.0):.1f}R)"
+                    f"({float(cfg.get('dynamic_tp2_base_r_multiple', 3.20) or 3.20):.1f}~"
+                    f"{float(cfg.get('dynamic_tp2_elite_r_multiple', 7.00) or 7.00):.1f}R)"
                 )
             if cfg.get('tp1_breakeven_enabled', True):
                 take_profit_text += (
                     f" / TP1 BE+{float(cfg.get('tp1_breakeven_offset_r', 0.03) or 0.03):.2f}R"
                 )
             trailing_text = (
-                f"{float(cfg.get('atr_trailing_multiplier', 2.0) or 2.0):.1f}ATR + Chandelier / "
-                f"{float(cfg.get('atr_trailing_activation_r', 1.5) or 1.5):.1f}R부터"
+                f"{float(cfg.get('atr_trailing_multiplier', 3.50) or 3.50):.1f}ATR + Chandelier / "
+                f"{float(cfg.get('atr_trailing_activation_r', 1.60) or 1.60):.1f}R부터"
                 if cfg.get('atr_trailing_enabled', True) else
                 "OFF"
             )
