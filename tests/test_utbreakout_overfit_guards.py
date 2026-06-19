@@ -2,6 +2,8 @@ import pytest
 
 from emas import (
     SignalEngine,
+    _apply_utbreakout_risk_multiplier_floor,
+    apply_stable_utbreak_final_overrides,
     build_default_utbot_filtered_breakout_config,
     build_utbreakout_effective_config_diff_text,
     get_utbreakout_set_definition,
@@ -11,6 +13,34 @@ from emas import (
 
 def _engine():
     return object.__new__(SignalEngine)
+
+
+def test_profit_opportunity_final_overrides_are_authoritative():
+    cfg = apply_stable_utbreak_final_overrides({
+        "partial_take_profit_r_multiple": 1.2,
+        "second_take_profit_r_multiple": 2.5,
+        "bias_continuation_min_volume_ratio": 0.5,
+        "selected_set_core_filter_hard_block_enabled": False,
+    })
+
+    assert cfg["live_auto_set_whitelist"] == [5, 12, 22, 32, 51, 63]
+    assert cfg["selected_set_core_filter_hard_block_enabled"] is True
+    assert cfg["partial_take_profit_r_multiple"] == 1.0
+    assert cfg["partial_take_profit_ratio"] == 0.20
+    assert cfg["second_take_profit_r_multiple"] == 3.5
+    assert cfg["second_take_profit_ratio"] == 0.40
+    assert cfg["bias_continuation_min_volume_ratio"] == 0.40
+    assert cfg["bias_continuation_15m_min_volume_ratio"] == 0.45
+    assert cfg["max_daily_trades"] == 14
+    assert cfg["runner_chandelier_enabled"] is True
+
+
+def test_accepted_soft_reductions_keep_meaningful_final_risk_floor():
+    cfg = {"final_risk_multiplier_floor": 0.20}
+
+    assert _apply_utbreakout_risk_multiplier_floor(0.016, cfg) == 0.20
+    assert _apply_utbreakout_risk_multiplier_floor(0.35, cfg) == 0.35
+    assert _apply_utbreakout_risk_multiplier_floor(0.0, cfg) == 0.0
 
 
 def test_live_auto_whitelist_blocks_non_whitelisted_set():

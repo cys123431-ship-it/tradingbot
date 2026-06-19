@@ -2218,21 +2218,21 @@ def test_protection_audit_deduplicates_short_stop_loss_orders():
     assert remaining_ids == {"sl-new", "tp"}
 
 
-def test_utbreakout_defaults_enable_fixed_tp_ladder_and_disable_runner():
+def test_utbreakout_defaults_enable_profit_opportunity_tp_ladder_and_runner():
     emas = _emas_module()
 
     cfg = emas.build_default_utbot_filtered_breakout_config()
 
     assert cfg["fixed_take_profit_enabled"] is True
     assert cfg["partial_take_profit_enabled"] is True
-    assert cfg["partial_take_profit_r_multiple"] == 1.5
-    assert cfg["partial_take_profit_ratio"] == 0.5
+    assert cfg["partial_take_profit_r_multiple"] == 1.0
+    assert cfg["partial_take_profit_ratio"] == 0.2
     assert cfg["second_take_profit_enabled"] is True
-    assert cfg["second_take_profit_r_multiple"] == 2.0
-    assert cfg["second_take_profit_ratio"] == 0.5
-    assert cfg["atr_trailing_enabled"] is False
-    assert cfg["atr_trailing_multiplier"] == 2.0
-    assert cfg["atr_trailing_activation_r"] == 1.5
+    assert cfg["second_take_profit_r_multiple"] == 3.5
+    assert cfg["second_take_profit_ratio"] == 0.4
+    assert cfg["atr_trailing_enabled"] is True
+    assert cfg["atr_trailing_multiplier"] == 3.5
+    assert cfg["atr_trailing_activation_r"] == 1.6
     assert cfg["short_conservative_enabled"] is True
     assert cfg["short_risk_multiplier"] == 0.5
     assert cfg["short_adx_threshold"] == 25.0
@@ -2243,43 +2243,43 @@ def test_utbreakout_defaults_enable_fixed_tp_ladder_and_disable_runner():
     assert cfg["bias_continuation_enabled"] is True
     assert cfg["bias_continuation_risk_multiplier"] == 0.65
     assert cfg["bias_continuation_15m_risk_multiplier"] == 0.5
-    assert cfg["bias_continuation_15m_max_signal_age_candles"] == 3
-    assert cfg["bias_continuation_min_adx"] == 18.0
-    assert cfg["bias_continuation_15m_min_adx"] == 20.0
-    assert cfg["bias_continuation_min_volume_ratio"] == 0.75
-    assert cfg["bias_continuation_15m_min_volume_ratio"] == 0.80
+    assert cfg["bias_continuation_15m_max_signal_age_candles"] == 10
+    assert cfg["bias_continuation_min_adx"] == 10.0
+    assert cfg["bias_continuation_15m_min_adx"] == 11.0
+    assert cfg["bias_continuation_min_volume_ratio"] == 0.40
+    assert cfg["bias_continuation_15m_min_volume_ratio"] == 0.45
     assert cfg["bias_continuation_max_extension_atr"] == 1.60
     assert cfg["bias_continuation_15m_max_extension_atr"] == 1.50
-    assert cfg["bias_continuation_min_adaptive_tf_score"] == 42.0
-    assert cfg["bias_continuation_15m_min_adaptive_tf_score"] == 50.0
+    assert cfg["bias_continuation_min_adaptive_tf_score"] == 30.0
+    assert cfg["bias_continuation_15m_min_adaptive_tf_score"] == 32.0
     assert cfg["quality_score_v2_enabled"] is True
-    assert cfg["quality_score_v2_block_below"] == 60.0
-    assert cfg["quality_score_v2_reduce_below"] == 70.0
-    assert cfg["quality_score_v2_min_risk_multiplier"] == 0.5
-    assert cfg["quality_score_v2_long_block_below"] == 50.0
-    assert cfg["quality_score_v2_long_reduce_below"] == 60.0
-    assert cfg["quality_score_v2_long_15m_block_below"] == 50.0
-    assert cfg["quality_score_v2_long_15m_reduce_below"] == 60.0
-    assert cfg["quality_score_v2_short_15m_block_below"] == 70.0
+    assert cfg["quality_score_v2_block_below"] == 12.0
+    assert cfg["quality_score_v2_reduce_below"] == 40.0
+    assert cfg["quality_score_v2_min_risk_multiplier"] == 0.6
+    assert cfg["quality_score_v2_long_block_below"] == 12.0
+    assert cfg["quality_score_v2_long_reduce_below"] == 40.0
+    assert cfg["quality_score_v2_long_15m_block_below"] == 12.0
+    assert cfg["quality_score_v2_long_15m_reduce_below"] == 40.0
+    assert cfg["quality_score_v2_short_15m_block_below"] == 16.0
     assert cfg["dynamic_take_profit_enabled"] is True
-    assert cfg["dynamic_tp2_base_r_multiple"] == 2.0
-    assert cfg["dynamic_tp2_strong_r_multiple"] == 2.5
-    assert cfg["dynamic_tp2_elite_r_multiple"] == 3.0
+    assert cfg["dynamic_tp2_base_r_multiple"] == 3.2
+    assert cfg["dynamic_tp2_strong_r_multiple"] == 5.0
+    assert cfg["dynamic_tp2_elite_r_multiple"] == 7.0
     assert cfg["tp1_breakeven_enabled"] is True
     assert cfg["tp1_breakeven_wait_for_partial"] is True
     assert cfg["market_quality_enabled"] is True
     assert cfg["market_quality_data_required"] is False
-    assert cfg["market_quality_min_risk_multiplier"] == 0.25
+    assert cfg["market_quality_min_risk_multiplier"] == 0.55
     assert cfg["shadow_triple_barrier_enabled"] is True
     assert cfg["adaptive_exit_enabled"] is True
     assert cfg["volatility_targeting_enabled"] is True
     assert cfg["volatility_target_atr_pct"] == 1.0
     assert cfg["meta_labeling_enabled"] is True
     assert cfg["short_asymmetry_enabled"] is True
-    assert cfg["shadow_runner_exit_enabled"] is False
-    assert cfg["runner_exit_enabled"] is False
-    assert cfg["runner_chandelier_enabled"] is False
-    assert cfg["runner_chandelier_multiplier"] == 2.4
+    assert cfg["shadow_runner_exit_enabled"] is True
+    assert cfg["runner_exit_enabled"] is True
+    assert cfg["runner_chandelier_enabled"] is True
+    assert cfg["runner_chandelier_multiplier"] == 3.8
     assert cfg["trend_health_enabled"] is True
     assert cfg["aggressive_growth_enabled"] is False
     assert cfg["aggressive_growth_balance_sleeve_pct"] == 0.20
@@ -2438,7 +2438,7 @@ def test_utbreakout_bias_continuation_rejects_stale_15m_state():
         cfg,
         {
             "candidate_type": "bias_state",
-            "decision_candle_ts": 6 * 900_000,
+            "decision_candle_ts": 12 * 900_000,
             "ut_signal_ts": 1 * 900_000,
             "adaptive_timeframe_decision": {"selected_score": 70.0},
         },
@@ -2491,8 +2491,8 @@ def test_utbreakout_bias_continuation_long_soft_failures_reduce_risk_without_blo
         "ema50_prev": 99.7,
         "vwap": 99.8,
         "bb_mid": 100.5,
-        "adx": 15.0,
-        "volume_ratio": 0.60,
+        "adx": 8.0,
+        "volume_ratio": 0.35,
         "atr_pct": 0.5,
     })
 
@@ -2503,7 +2503,7 @@ def test_utbreakout_bias_continuation_long_soft_failures_reduce_risk_without_blo
             "candidate_type": "bias_state",
             "decision_candle_ts": 3 * 900_000,
             "ut_signal_ts": 1 * 900_000,
-            "adaptive_timeframe_decision": {"selected_score": 45.0},
+            "adaptive_timeframe_decision": {"selected_score": 28.0},
         },
         values,
         {"id": 7},
@@ -2525,12 +2525,12 @@ def test_utbreakout_quality_score_v2_blocks_weak_confluence_and_reduces_mixed():
     blocked = engine._build_utbreakout_quality_score_v2(
         "long",
         cfg,
-        {"candidate_type": "fresh_signal", "entry_timeframe": "15m", "adaptive_timeframe_decision": {"selected_score": 50}},
+        {"candidate_type": "fresh_signal", "entry_timeframe": "15m", "adaptive_timeframe_decision": {"selected_score": 0}},
         {},
         trend_health={"score": 0, "risk_multiplier": 0.35},
         strategy_quality={"score": 0, "risk_multiplier": 0.35},
-        market_quality={"state": True, "risk_multiplier": 1.0},
-        selector_quality={"score": 70},
+        market_quality={"state": False, "risk_multiplier": 0.0},
+        selector_quality={"score": 0},
     )
     assert blocked["state"] is False
     assert blocked["risk_multiplier"] == 0
@@ -2558,14 +2558,14 @@ def test_utbreakout_quality_score_v2_uses_stricter_short_thresholds():
     status = {
         "candidate_type": "fresh_signal",
         "entry_timeframe": "15m",
-        "adaptive_timeframe_decision": {"selected_score": 65},
+        "adaptive_timeframe_decision": {"selected_score": 20},
     }
 
     common_kwargs = {
-        "trend_health": {"score": 60, "risk_multiplier": 0.7},
-        "strategy_quality": {"score": 60, "risk_multiplier": 0.7},
-        "market_quality": {"state": "reduced", "risk_multiplier": 0.5},
-        "selector_quality": {"score": 70},
+        "trend_health": {"score": 0, "risk_multiplier": 0.0},
+        "strategy_quality": {"score": 0, "risk_multiplier": 0.0},
+        "market_quality": {"state": False, "risk_multiplier": 0.0},
+        "selector_quality": {"score": 20},
     }
 
     long_result = engine._build_utbreakout_quality_score_v2("long", cfg, status, {}, **common_kwargs)
@@ -2589,7 +2589,7 @@ def test_utbreakout_dynamic_tp2_expands_only_on_strong_confluence():
         trend_health={"score": 80},
         strategy_quality={"score": 80},
     )
-    assert base["second_take_profit_r_multiple"] == 2.0
+    assert base["second_take_profit_r_multiple"] == 3.2
     assert base["tier"] == "base"
 
     strong = engine._build_utbreakout_dynamic_tp2(
@@ -2599,7 +2599,7 @@ def test_utbreakout_dynamic_tp2_expands_only_on_strong_confluence():
         trend_health={"score": 72},
         strategy_quality={"score": 71},
     )
-    assert strong["second_take_profit_r_multiple"] == 2.5
+    assert strong["second_take_profit_r_multiple"] == 5.0
     assert strong["tier"] == "strong"
 
     elite = engine._build_utbreakout_dynamic_tp2(
@@ -2609,7 +2609,7 @@ def test_utbreakout_dynamic_tp2_expands_only_on_strong_confluence():
         trend_health={"score": 80},
         strategy_quality={"score": 79},
     )
-    assert elite["second_take_profit_r_multiple"] == 3.0
+    assert elite["second_take_profit_r_multiple"] == 7.0
     assert elite["tier"] == "elite"
 
 

@@ -9,6 +9,19 @@ def test_enforce_core_hardening_config_forces_flag_on():
     assert effective["selected_set_core_filter_hard_block_enabled"] is True
 
 
+def test_profit_patch_matches_opportunity_profile_values():
+    cfg = patch.tune_effective_config({})
+
+    assert cfg["live_auto_set_whitelist"] == [5, 12, 22, 32, 51, 63]
+    assert cfg["partial_take_profit_r_multiple"] == 1.0
+    assert cfg["partial_take_profit_ratio"] == 0.20
+    assert cfg["second_take_profit_r_multiple"] == 3.5
+    assert cfg["second_take_profit_ratio"] == 0.40
+    assert cfg["dynamic_tp2_elite_r_multiple"] == 7.0
+    assert cfg["market_quality_min_risk_multiplier"] == 0.55
+    assert cfg["max_daily_trades"] == 14
+
+
 def test_mark_core_filter_failure_as_hard_block_compatible():
     items = [{
         "name": "상대 거래량",

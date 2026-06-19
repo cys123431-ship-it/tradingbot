@@ -486,7 +486,7 @@ UTBREAKOUT_RUNTIME_PROFILE = "stable_15m_direction_filter_v1"
 
 # Live AUTO set hardening:
 # Keep live AUTO narrow to reduce many-set overfitting / multiple-testing risk.
-UTBREAKOUT_LIVE_AUTO_SET_WHITELIST = frozenset({22, 32, 51, 63})
+UTBREAKOUT_LIVE_AUTO_SET_WHITELIST = frozenset({5, 12, 22, 32, 51, 63})
 
 # Selected Set identity filters that must hard-block when they fail in live mode.
 # These are the core filters that define the selected Set itself.
@@ -685,6 +685,25 @@ def _classify_set_filter_result(side, passed, detail, metrics=None, cfg=None):
     return "reduced", 0.50, f"{detail}; set confirmation soft fail"
 
 
+def _apply_utbreakout_risk_multiplier_floor(value, cfg=None):
+    """Keep accepted soft-reduced entries meaningful without bypassing hard blocks."""
+    cfg = cfg or {}
+    try:
+        multiplier = max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        multiplier = 1.0
+    if multiplier <= 0.0:
+        return 0.0
+    try:
+        floor = max(
+            0.0,
+            min(1.0, float(cfg.get("final_risk_multiplier_floor", 0.20) or 0.20)),
+        )
+    except (TypeError, ValueError):
+        floor = 0.20
+    return max(multiplier, floor)
+
+
 def apply_stable_utbreak_final_overrides(cfg):
     """Apply final UTBreak config overrides after selected Set params are merged.
 
@@ -716,38 +735,76 @@ def apply_stable_utbreak_final_overrides(cfg):
         "set_selection_min_score_gap": 2.0,
         "set_complexity_penalty_enabled": True,
 
-        # Selected-Set confirmations are sizing overlays by default.
-        "selected_set_core_filter_hard_block_enabled": False,
+        # Keep the selected Set identity intact; auxiliary misses only reduce size.
+        "selected_set_core_filter_hard_block_enabled": True,
         "set_filter_soft_fail_enabled": True,
+        "set_filter_soft_fail_multiplier": 0.90,
+        "set_filter_multi_soft_fail_multiplier": 0.80,
+
+        # Opportunity-oriented AUTO selection with a bounded overfit guard.
+        "live_auto_set_whitelist_enabled": True,
+        "live_auto_set_whitelist": [5, 12, 22, 32, 51, 63],
+        "auto_min_score_margin_live": 0.5,
+        "auto_min_adjusted_score_live": 40.0,
+        "auto_block_on_weak_margin_live": True,
+        "auto_multiple_testing_penalty_enabled": True,
+        "multiple_testing_free_trials": 25,
+        "multiple_testing_max_score_penalty": 4.0,
 
         # Bias continuation thresholds
-        "bias_continuation_min_volume_ratio": 0.50,
-        "bias_continuation_15m_min_volume_ratio": 0.55,
-        "bias_continuation_min_adaptive_tf_score": 35.0,
-        "bias_continuation_15m_min_adaptive_tf_score": 38.0,
-        "bias_continuation_min_adx": 14.0,
-        "bias_continuation_15m_min_adx": 15.0,
+        "bias_continuation_min_volume_ratio": 0.40,
+        "bias_continuation_15m_min_volume_ratio": 0.45,
+        "bias_continuation_min_adaptive_tf_score": 30.0,
+        "bias_continuation_15m_min_adaptive_tf_score": 32.0,
+        "bias_continuation_min_adx": 10.0,
+        "bias_continuation_15m_min_adx": 11.0,
+        "bias_continuation_max_signal_age_candles": 10,
+        "bias_continuation_15m_max_signal_age_candles": 10,
 
         # Hard block should be reserved for extreme bad states only
-        "trend_health_hard_block_below": 20.0,
-        "trend_health_reduce_below": 42.0,
-        "strategy_quality_hard_block_below": 12.0,
-        "strategy_quality_reduce_below": 42.0,
+        "trend_health_hard_block_below": 12.0,
+        "trend_health_reduce_below": 35.0,
+        "trend_health_full_score": 62.0,
+        "trend_health_min_multiplier": 0.55,
 
-        "quality_score_v2_block_below": 20.0,
-        "quality_score_v2_reduce_below": 50.0,
-        "quality_score_v2_15m_block_below": 20.0,
-        "quality_score_v2_15m_reduce_below": 50.0,
+        "strategy_quality_hard_block_below": 8.0,
+        "strategy_quality_reduce_below": 25.0,
+        "strategy_quality_full_score": 60.0,
+        "strategy_quality_min_multiplier": 0.55,
+        "strategy_adaptive_min_risk_multiplier": 0.50,
 
-        "quality_score_v2_long_block_below": 20.0,
-        "quality_score_v2_long_reduce_below": 50.0,
-        "quality_score_v2_long_15m_block_below": 20.0,
-        "quality_score_v2_long_15m_reduce_below": 50.0,
+        "quality_score_v2_block_below": 12.0,
+        "quality_score_v2_reduce_below": 40.0,
+        "quality_score_v2_15m_block_below": 12.0,
+        "quality_score_v2_15m_reduce_below": 40.0,
+        "quality_score_v2_min_risk_multiplier": 0.60,
 
-        "quality_score_v2_short_block_below": 25.0,
-        "quality_score_v2_short_reduce_below": 60.0,
-        "quality_score_v2_short_15m_block_below": 25.0,
-        "quality_score_v2_short_15m_reduce_below": 60.0,
+        "quality_score_v2_long_block_below": 12.0,
+        "quality_score_v2_long_reduce_below": 40.0,
+        "quality_score_v2_long_15m_block_below": 12.0,
+        "quality_score_v2_long_15m_reduce_below": 40.0,
+
+        "quality_score_v2_short_block_below": 16.0,
+        "quality_score_v2_short_reduce_below": 45.0,
+        "quality_score_v2_short_15m_block_below": 16.0,
+        "quality_score_v2_short_15m_reduce_below": 45.0,
+
+        # Soft reductions may stack, but accepted entries keep meaningful size.
+        "market_quality_long_hard_block_on_multi_adverse_enabled": False,
+        "market_quality_long_multi_adverse_min_reasons": 5,
+        "market_quality_long_multi_adverse_max_multiplier": 0.35,
+        "market_quality_min_risk_multiplier": 0.55,
+        "final_risk_multiplier_floor": 0.20,
+
+        # Set32 keeps structure confirmation with more tolerant flow inputs.
+        "set32_min_relative_volume": 1.15,
+        "set32_require_direction_candle": True,
+        "set32_require_ema50_side": True,
+        "set32_require_orderflow_confirmation": True,
+        "set32_orderflow_min_samples": 2,
+        "set32_min_taker_ratio_long": 0.97,
+        "set32_max_taker_ratio_short": 1.03,
+        "set32_max_spread_pct": 0.09,
 
         # Short remains stricter than long, but not dead
         "short_adx_threshold": 20.0,
@@ -755,15 +812,32 @@ def apply_stable_utbreak_final_overrides(cfg):
         "short_risk_multiplier": 0.60,
 
         # Exit profile
-        "partial_take_profit_r_multiple": 1.20,
-        "partial_take_profit_ratio": 0.35,
-        "second_take_profit_r_multiple": 2.50,
-        "second_take_profit_ratio": 0.35,
-        "dynamic_tp2_base_r_multiple": 2.30,
-        "dynamic_tp2_strong_r_multiple": 3.00,
-        "dynamic_tp2_elite_r_multiple": 4.00,
-        "atr_trailing_activation_r": 1.20,
-        "atr_trailing_multiplier": 2.50,
+        "partial_take_profit_r_multiple": 1.00,
+        "partial_take_profit_ratio": 0.20,
+        "second_take_profit_r_multiple": 3.50,
+        "second_take_profit_ratio": 0.40,
+        "dynamic_tp2_base_r_multiple": 3.20,
+        "dynamic_tp2_strong_r_multiple": 5.00,
+        "dynamic_tp2_elite_r_multiple": 7.00,
+        "atr_trailing_activation_r": 1.60,
+        "atr_trailing_multiplier": 3.50,
+        "atr_trailing_enabled": True,
+        "shadow_runner_exit_enabled": True,
+        "runner_exit_enabled": True,
+        "runner_chandelier_enabled": True,
+        "runner_chandelier_multiplier": 3.80,
+        "runner_chandelier_multiplier_max": 4.50,
+        "adaptive_exit_partial_r_min": 1.0,
+        "adaptive_exit_partial_r_max": 1.2,
+        "adaptive_exit_ratio_min": 0.20,
+        "adaptive_exit_ratio_max": 0.35,
+        "adaptive_exit_trailing_multiplier_min": 3.0,
+        "adaptive_exit_trailing_multiplier_max": 4.0,
+        "adaptive_exit_activation_r_min": 1.4,
+        "adaptive_exit_activation_r_max": 1.8,
+
+        "max_daily_trades": 14,
+        "max_consecutive_losses": 5,
     })
     return cfg
 
@@ -807,17 +881,17 @@ def build_utbreakout_set_registry():
         'take_profit_r_multiple': 2.0,
         'fixed_take_profit_enabled': True,
         'partial_take_profit_enabled': True,
-        'partial_take_profit_r_multiple': 1.5,
-        'partial_take_profit_ratio': 0.5,
+        'partial_take_profit_r_multiple': 1.00,
+        'partial_take_profit_ratio': 0.20,
         'second_take_profit_enabled': True,
-        'second_take_profit_r_multiple': 2.8,
-        'second_take_profit_ratio': 0.5,
+        'second_take_profit_r_multiple': 3.50,
+        'second_take_profit_ratio': 0.40,
         'enable_tp2_fallback_close': False,
         'tp2_fallback_confirm_loops': 2,
         'tp2_fallback_use_market': True,
-        'atr_trailing_enabled': False,
-        'atr_trailing_multiplier': 2.0,
-        'atr_trailing_activation_r': 1.5,
+        'atr_trailing_enabled': True,
+        'atr_trailing_multiplier': 3.50,
+        'atr_trailing_activation_r': 1.60,
         'atr_trailing_breakeven_enabled': True,
         'short_conservative_enabled': True,
         'short_risk_multiplier': 0.5,
@@ -829,31 +903,31 @@ def build_utbreakout_set_registry():
         'bias_continuation_enabled': True,
         'bias_continuation_risk_multiplier': 0.65,
         'bias_continuation_15m_risk_multiplier': 0.50,
-        'bias_continuation_max_signal_age_candles': 6,
-        'bias_continuation_15m_max_signal_age_candles': 3,
-        'bias_continuation_min_adx': 18.0,
-        'bias_continuation_15m_min_adx': 20.0,
-        'bias_continuation_min_volume_ratio': 0.50,
-        'bias_continuation_15m_min_volume_ratio': 0.55,
+        'bias_continuation_max_signal_age_candles': 10,
+        'bias_continuation_15m_max_signal_age_candles': 10,
+        'bias_continuation_min_adx': 10.0,
+        'bias_continuation_15m_min_adx': 11.0,
+        'bias_continuation_min_volume_ratio': 0.40,
+        'bias_continuation_15m_min_volume_ratio': 0.45,
         'bias_continuation_max_extension_atr': 1.60,
         'bias_continuation_15m_max_extension_atr': 1.50,
-        'bias_continuation_min_adaptive_tf_score': 42.0,
-        'bias_continuation_15m_min_adaptive_tf_score': 50.0,
+        'bias_continuation_min_adaptive_tf_score': 30.0,
+        'bias_continuation_15m_min_adaptive_tf_score': 32.0,
         'quality_score_v2_enabled': True,
-        'quality_score_v2_block_below': 60.0,
-        'quality_score_v2_reduce_below': 70.0,
+        'quality_score_v2_block_below': 12.0,
+        'quality_score_v2_reduce_below': 40.0,
         'quality_score_v2_full_score': 82.0,
-        'quality_score_v2_min_risk_multiplier': 0.50,
-        'quality_score_v2_15m_block_below': 62.0,
-        'quality_score_v2_15m_reduce_below': 72.0,
-        'quality_score_v2_long_block_below': 30.0,
-        'quality_score_v2_long_reduce_below': 60.0,
-        'quality_score_v2_long_15m_block_below': 50.0,
-        'quality_score_v2_long_15m_reduce_below': 60.0,
-        'quality_score_v2_short_block_below': 35.0,
-        'quality_score_v2_short_reduce_below': 78.0,
-        'quality_score_v2_short_15m_block_below': 70.0,
-        'quality_score_v2_short_15m_reduce_below': 80.0,
+        'quality_score_v2_min_risk_multiplier': 0.60,
+        'quality_score_v2_15m_block_below': 12.0,
+        'quality_score_v2_15m_reduce_below': 40.0,
+        'quality_score_v2_long_block_below': 12.0,
+        'quality_score_v2_long_reduce_below': 40.0,
+        'quality_score_v2_long_15m_block_below': 12.0,
+        'quality_score_v2_long_15m_reduce_below': 40.0,
+        'quality_score_v2_short_block_below': 16.0,
+        'quality_score_v2_short_reduce_below': 45.0,
+        'quality_score_v2_short_15m_block_below': 16.0,
+        'quality_score_v2_short_15m_reduce_below': 45.0,
         'feature_score_enabled': True,
         'feature_score_block_below': 55.0,
         'feature_score_reduce_below': 65.0,
@@ -880,9 +954,9 @@ def build_utbreakout_set_registry():
         'dynamic_take_profit_enabled': True,
         'dynamic_tp2_strong_score': 72.0,
         'dynamic_tp2_elite_score': 82.0,
-        'dynamic_tp2_base_r_multiple': 2.0,
-        'dynamic_tp2_strong_r_multiple': 2.5,
-        'dynamic_tp2_elite_r_multiple': 3.0,
+        'dynamic_tp2_base_r_multiple': 3.20,
+        'dynamic_tp2_strong_r_multiple': 5.00,
+        'dynamic_tp2_elite_r_multiple': 7.00,
         'tp1_breakeven_enabled': True,
         'tp1_breakeven_trigger_r': 1.5,
         'tp1_breakeven_offset_r': 0.03,
@@ -902,7 +976,7 @@ def build_utbreakout_set_registry():
         'engine_kill_switch_enabled': True,
         'live_parity_signal_enabled': False,
         'market_quality_data_required': False,
-        'market_quality_min_risk_multiplier': 0.25,
+        'market_quality_min_risk_multiplier': 0.55,
         'market_quality_high_atr_pct': 1.5,
         'market_quality_extreme_atr_pct': 2.5,
         'market_quality_adverse_funding_soft': 0.0006,
@@ -913,31 +987,31 @@ def build_utbreakout_set_registry():
         'market_quality_regime_strong_move_pct': 1.5,
         'shadow_triple_barrier_enabled': True,
         'shadow_triple_barrier_max_bars': 24,
-        'shadow_runner_exit_enabled': False,
+        'shadow_runner_exit_enabled': True,
         'shadow_runner_max_bars': 48,
-        'runner_exit_enabled': False,
-        'runner_chandelier_enabled': False,
+        'runner_exit_enabled': True,
+        'runner_chandelier_enabled': True,
         'runner_chandelier_lookback': 22,
         'runner_structure_lookback': 5,
         'runner_structure_buffer_atr': 0.20,
         'runner_dynamic_multiplier_enabled': True,
-        'runner_chandelier_multiplier': 2.4,
+        'runner_chandelier_multiplier': 3.80,
         'runner_chandelier_multiplier_min': 1.4,
-        'runner_chandelier_multiplier_max': 3.2,
+        'runner_chandelier_multiplier_max': 4.50,
         'runner_mfe_tighten_r': 3.0,
         'runner_mfe_tighten_delta': 0.20,
         'trend_health_enabled': True,
         'trend_health_directional_lookback': 12,
         'trend_health_volatility_long_length': 50,
-        'trend_health_hard_block_below': 25.0,
-        'trend_health_reduce_below': 55.0,
-        'trend_health_full_score': 75.0,
-        'trend_health_min_multiplier': 0.35,
+        'trend_health_hard_block_below': 12.0,
+        'trend_health_reduce_below': 35.0,
+        'trend_health_full_score': 62.0,
+        'trend_health_min_multiplier': 0.55,
         'strategy_quality_enabled': True,
         'strategy_quality_hard_block_below': 8.0,
-        'strategy_quality_reduce_below': 58.0,
-        'strategy_quality_full_score': 78.0,
-        'strategy_quality_min_multiplier': 0.35,
+        'strategy_quality_reduce_below': 25.0,
+        'strategy_quality_full_score': 60.0,
+        'strategy_quality_min_multiplier': 0.55,
         'strategy_quality_regression_lookback': 24,
         'strategy_quality_hurst_lookback': 64,
         'strategy_quality_rebound_lookback': 12,
@@ -945,12 +1019,12 @@ def build_utbreakout_set_registry():
         'adaptive_exit_min_samples': 8,
         'adaptive_exit_lookback_days': 14,
         'adaptive_exit_partial_r_min': 1.0,
-        'adaptive_exit_partial_r_max': 1.8,
-        'adaptive_exit_ratio_min': 0.35,
-        'adaptive_exit_ratio_max': 0.65,
-        'adaptive_exit_trailing_multiplier_min': 1.4,
-        'adaptive_exit_trailing_multiplier_max': 2.6,
-        'adaptive_exit_activation_r_min': 1.0,
+        'adaptive_exit_partial_r_max': 1.2,
+        'adaptive_exit_ratio_min': 0.20,
+        'adaptive_exit_ratio_max': 0.35,
+        'adaptive_exit_trailing_multiplier_min': 3.0,
+        'adaptive_exit_trailing_multiplier_max': 4.0,
+        'adaptive_exit_activation_r_min': 1.4,
         'adaptive_exit_activation_r_max': 1.8,
         'volatility_targeting_enabled': True,
         'volatility_target_atr_pct': 1.0,
@@ -958,7 +1032,7 @@ def build_utbreakout_set_registry():
         'meta_labeling_enabled': True,
         'meta_labeling_min_samples': 12,
         'meta_labeling_min_multiplier': 0.5,
-        'strategy_adaptive_min_risk_multiplier': 0.25,
+        'strategy_adaptive_min_risk_multiplier': 0.50,
         'short_asymmetry_enabled': True,
         'short_partial_take_profit_r_delta': 0.20,
         'short_partial_take_profit_ratio_add': 0.10,
@@ -1280,12 +1354,12 @@ def build_default_utbot_filtered_breakout_config():
         # Live AUTO overfit guards
         'live_auto_set_whitelist_enabled': True,
         'live_auto_set_whitelist': list(sorted(UTBREAKOUT_LIVE_AUTO_SET_WHITELIST)),
-        'auto_min_score_margin_live': 3.0,
-        'auto_min_adjusted_score_live': 50.0,
+        'auto_min_score_margin_live': 0.5,
+        'auto_min_adjusted_score_live': 40.0,
         'auto_block_on_weak_margin_live': True,
         'auto_multiple_testing_penalty_enabled': True,
-        'multiple_testing_free_trials': 10,
-        'multiple_testing_max_score_penalty': 12.0,
+        'multiple_testing_free_trials': 25,
+        'multiple_testing_max_score_penalty': 4.0,
         'set_selection_hysteresis_enabled': True,
         'set_selection_switch_margin': 3.0,
         'set_selection_min_score_gap': 2.0,
@@ -1325,17 +1399,17 @@ def build_default_utbot_filtered_breakout_config():
         'take_profit_r_multiple': 2.0,
         'fixed_take_profit_enabled': True,
         'partial_take_profit_enabled': True,
-        'partial_take_profit_r_multiple': 1.5,
-        'partial_take_profit_ratio': 0.5,
+        'partial_take_profit_r_multiple': 1.00,
+        'partial_take_profit_ratio': 0.20,
         'second_take_profit_enabled': True,
-        'second_take_profit_r_multiple': 2.0,
-        'second_take_profit_ratio': 0.5,
+        'second_take_profit_r_multiple': 3.50,
+        'second_take_profit_ratio': 0.40,
         'enable_tp2_fallback_close': False,
         'tp2_fallback_confirm_loops': 2,
         'tp2_fallback_use_market': True,
-        'atr_trailing_enabled': False,
-        'atr_trailing_multiplier': 2.0,
-        'atr_trailing_activation_r': 1.5,
+        'atr_trailing_enabled': True,
+        'atr_trailing_multiplier': 3.50,
+        'atr_trailing_activation_r': 1.60,
         'atr_trailing_breakeven_enabled': True,
         'short_conservative_enabled': True,
         'short_risk_multiplier': 0.5,
@@ -1347,37 +1421,37 @@ def build_default_utbot_filtered_breakout_config():
         'bias_continuation_enabled': True,
         'bias_continuation_risk_multiplier': 0.65,
         'bias_continuation_15m_risk_multiplier': 0.50,
-        'bias_continuation_max_signal_age_candles': 6,
-        'bias_continuation_15m_max_signal_age_candles': 3,
-        'bias_continuation_min_adx': 18.0,
-        'bias_continuation_15m_min_adx': 20.0,
-        'bias_continuation_min_volume_ratio': 0.75,
-        'bias_continuation_15m_min_volume_ratio': 0.80,
+        'bias_continuation_max_signal_age_candles': 10,
+        'bias_continuation_15m_max_signal_age_candles': 10,
+        'bias_continuation_min_adx': 10.0,
+        'bias_continuation_15m_min_adx': 11.0,
+        'bias_continuation_min_volume_ratio': 0.40,
+        'bias_continuation_15m_min_volume_ratio': 0.45,
         'bias_continuation_max_extension_atr': 1.60,
         'bias_continuation_15m_max_extension_atr': 1.50,
-        'bias_continuation_min_adaptive_tf_score': 42.0,
-        'bias_continuation_15m_min_adaptive_tf_score': 50.0,
+        'bias_continuation_min_adaptive_tf_score': 30.0,
+        'bias_continuation_15m_min_adaptive_tf_score': 32.0,
         'quality_score_v2_enabled': True,
-        'quality_score_v2_block_below': 60.0,
-        'quality_score_v2_reduce_below': 70.0,
+        'quality_score_v2_block_below': 12.0,
+        'quality_score_v2_reduce_below': 40.0,
         'quality_score_v2_full_score': 82.0,
-        'quality_score_v2_min_risk_multiplier': 0.50,
-        'quality_score_v2_15m_block_below': 62.0,
-        'quality_score_v2_15m_reduce_below': 72.0,
-        'quality_score_v2_long_block_below': 50.0,
-        'quality_score_v2_long_reduce_below': 60.0,
-        'quality_score_v2_long_15m_block_below': 50.0,
-        'quality_score_v2_long_15m_reduce_below': 60.0,
-        'quality_score_v2_short_block_below': 68.0,
-        'quality_score_v2_short_reduce_below': 78.0,
-        'quality_score_v2_short_15m_block_below': 70.0,
-        'quality_score_v2_short_15m_reduce_below': 80.0,
+        'quality_score_v2_min_risk_multiplier': 0.60,
+        'quality_score_v2_15m_block_below': 12.0,
+        'quality_score_v2_15m_reduce_below': 40.0,
+        'quality_score_v2_long_block_below': 12.0,
+        'quality_score_v2_long_reduce_below': 40.0,
+        'quality_score_v2_long_15m_block_below': 12.0,
+        'quality_score_v2_long_15m_reduce_below': 40.0,
+        'quality_score_v2_short_block_below': 16.0,
+        'quality_score_v2_short_reduce_below': 45.0,
+        'quality_score_v2_short_15m_block_below': 16.0,
+        'quality_score_v2_short_15m_reduce_below': 45.0,
         'dynamic_take_profit_enabled': True,
         'dynamic_tp2_strong_score': 72.0,
         'dynamic_tp2_elite_score': 82.0,
-        'dynamic_tp2_base_r_multiple': 2.0,
-        'dynamic_tp2_strong_r_multiple': 2.5,
-        'dynamic_tp2_elite_r_multiple': 3.0,
+        'dynamic_tp2_base_r_multiple': 3.20,
+        'dynamic_tp2_strong_r_multiple': 5.00,
+        'dynamic_tp2_elite_r_multiple': 7.00,
         'tp1_breakeven_enabled': True,
         'tp1_breakeven_trigger_r': 1.5,
         'tp1_breakeven_offset_r': 0.03,
@@ -1391,9 +1465,9 @@ def build_default_utbot_filtered_breakout_config():
         'adaptive_exit_v2_enabled': False,
         'walk_forward_report_enabled': False,
         'market_quality_data_required': False,
-        'market_quality_min_risk_multiplier': 0.25,
-        'market_quality_long_hard_block_on_multi_adverse_enabled': True,
-        'market_quality_long_multi_adverse_min_reasons': 3,
+        'market_quality_min_risk_multiplier': 0.55,
+        'market_quality_long_hard_block_on_multi_adverse_enabled': False,
+        'market_quality_long_multi_adverse_min_reasons': 5,
         'market_quality_long_multi_adverse_max_multiplier': 0.35,
         'market_quality_high_atr_pct': 1.5,
         'market_quality_extreme_atr_pct': 2.5,
@@ -1405,36 +1479,40 @@ def build_default_utbot_filtered_breakout_config():
         'market_quality_regime_strong_move_pct': 1.5,
         'shadow_triple_barrier_enabled': True,
         'shadow_triple_barrier_max_bars': 24,
-        'shadow_runner_exit_enabled': False,
+        'shadow_runner_exit_enabled': True,
         'shadow_runner_max_bars': 48,
-        'runner_exit_enabled': False,
-        'runner_chandelier_enabled': False,
+        'runner_exit_enabled': True,
+        'runner_chandelier_enabled': True,
         'runner_chandelier_lookback': 22,
         'runner_structure_lookback': 5,
         'runner_structure_buffer_atr': 0.20,
         'runner_dynamic_multiplier_enabled': True,
-        'runner_chandelier_multiplier': 2.4,
+        'runner_chandelier_multiplier': 3.80,
         'runner_chandelier_multiplier_min': 1.4,
-        'runner_chandelier_multiplier_max': 3.2,
+        'runner_chandelier_multiplier_max': 4.50,
         'runner_mfe_tighten_r': 3.0,
         'runner_mfe_tighten_delta': 0.20,
         'trend_health_enabled': True,
         'trend_health_directional_lookback': 12,
         'trend_health_volatility_long_length': 50,
-        'trend_health_hard_block_below': 40.0,
-        'trend_health_reduce_below': 55.0,
-        'trend_health_full_score': 75.0,
-        'trend_health_min_multiplier': 0.35,
+        'trend_health_hard_block_below': 12.0,
+        'trend_health_reduce_below': 35.0,
+        'trend_health_full_score': 62.0,
+        'trend_health_min_multiplier': 0.55,
+        'strategy_quality_hard_block_below': 8.0,
+        'strategy_quality_reduce_below': 25.0,
+        'strategy_quality_full_score': 60.0,
+        'strategy_quality_min_multiplier': 0.55,
         'adaptive_exit_enabled': True,
         'adaptive_exit_min_samples': 8,
         'adaptive_exit_lookback_days': 14,
         'adaptive_exit_partial_r_min': 1.0,
-        'adaptive_exit_partial_r_max': 1.8,
-        'adaptive_exit_ratio_min': 0.35,
-        'adaptive_exit_ratio_max': 0.65,
-        'adaptive_exit_trailing_multiplier_min': 1.4,
-        'adaptive_exit_trailing_multiplier_max': 2.6,
-        'adaptive_exit_activation_r_min': 1.0,
+        'adaptive_exit_partial_r_max': 1.2,
+        'adaptive_exit_ratio_min': 0.20,
+        'adaptive_exit_ratio_max': 0.35,
+        'adaptive_exit_trailing_multiplier_min': 3.0,
+        'adaptive_exit_trailing_multiplier_max': 4.0,
+        'adaptive_exit_activation_r_min': 1.4,
         'adaptive_exit_activation_r_max': 1.8,
         'volatility_targeting_enabled': True,
         'volatility_target_atr_pct': 1.0,
@@ -1442,21 +1520,22 @@ def build_default_utbot_filtered_breakout_config():
         'meta_labeling_enabled': True,
         'meta_labeling_min_samples': 12,
         'meta_labeling_min_multiplier': 0.5,
-        'strategy_adaptive_min_risk_multiplier': 0.25,
-        'selected_set_core_filter_hard_block_enabled': False,
+        'strategy_adaptive_min_risk_multiplier': 0.50,
+        'selected_set_core_filter_hard_block_enabled': True,
         'set_filter_soft_fail_enabled': True,
-        'set_filter_soft_fail_multiplier': 0.70,
-        'set_filter_multi_soft_fail_multiplier': 0.50,
+        'set_filter_soft_fail_multiplier': 0.90,
+        'set_filter_multi_soft_fail_multiplier': 0.80,
+        'final_risk_multiplier_floor': 0.20,
 
         # Set32 live strengthening
-        'set32_min_relative_volume': 1.50,
+        'set32_min_relative_volume': 1.15,
         'set32_require_direction_candle': True,
         'set32_require_ema50_side': True,
         'set32_require_orderflow_confirmation': True,
-        'set32_orderflow_min_samples': 3,
-        'set32_min_taker_ratio_long': 1.00,
-        'set32_max_taker_ratio_short': 1.00,
-        'set32_max_spread_pct': 0.05,
+        'set32_orderflow_min_samples': 2,
+        'set32_min_taker_ratio_long': 0.97,
+        'set32_max_taker_ratio_short': 1.03,
+        'set32_max_spread_pct': 0.09,
         'short_asymmetry_enabled': True,
         'short_partial_take_profit_r_delta': 0.20,
         'short_partial_take_profit_ratio_add': 0.10,
@@ -1506,8 +1585,8 @@ def build_default_utbot_filtered_breakout_config():
         'aggressive_growth_cppi_max_sleeve_pct': 0.20,
         'max_risk_per_trade_usdt': 1.0,
         'daily_max_loss_usdt': 3.0,
-        'max_daily_trades': 5,
-        'max_consecutive_losses': 3,
+        'max_daily_trades': 14,
+        'max_consecutive_losses': 5,
         'daily_profit_target_enabled': False,
         'daily_profit_target_usdt': 5.0,
         'opposite_signal_exit_enabled': False,
@@ -5458,20 +5537,20 @@ class SignalEngine(BaseEngine):
             'daily_max_loss_usdt': 3.0,
             'daily_profit_target_usdt': 5.0,
             'opposite_set_exit_min_pnl_usdt': 0.0,
-            'auto_min_score_margin_live': 3.0,
-            'auto_min_adjusted_score_live': 50.0,
-            'multiple_testing_max_score_penalty': 12.0,
+            'auto_min_score_margin_live': 0.5,
+            'auto_min_adjusted_score_live': 40.0,
+            'multiple_testing_max_score_penalty': 4.0,
             'set_selection_switch_margin': 3.0,
             'set_selection_min_score_gap': 2.0,
             'adaptive_timeframe_min_score': 38.0,
             'adaptive_timeframe_switch_margin': 10.0,
-            'partial_take_profit_r_multiple': 1.20,
-            'partial_take_profit_ratio': 0.35,
-            'second_take_profit_r_multiple': 2.50,
-            'second_take_profit_ratio': 0.35,
-            'atr_trailing_multiplier': 2.0,
-            'atr_trailing_activation_r': 1.5,
-            'market_quality_min_risk_multiplier': 0.25,
+            'partial_take_profit_r_multiple': 1.00,
+            'partial_take_profit_ratio': 0.20,
+            'second_take_profit_r_multiple': 3.50,
+            'second_take_profit_ratio': 0.40,
+            'atr_trailing_multiplier': 3.50,
+            'atr_trailing_activation_r': 1.60,
+            'market_quality_min_risk_multiplier': 0.55,
             'market_quality_high_atr_pct': 1.5,
             'market_quality_extreme_atr_pct': 2.5,
             'market_quality_adverse_funding_soft': 0.0006,
@@ -5480,37 +5559,38 @@ class SignalEngine(BaseEngine):
             'market_quality_regime_strong_move_pct': 1.5,
             'squeeze_volume_ratio_min': 1.20,
             'runner_structure_buffer_atr': 0.20,
-            'runner_chandelier_multiplier': 2.4,
+            'runner_chandelier_multiplier': 3.80,
             'runner_chandelier_multiplier_min': 1.4,
-            'runner_chandelier_multiplier_max': 3.2,
+            'runner_chandelier_multiplier_max': 4.50,
             'runner_mfe_tighten_r': 3.0,
             'runner_mfe_tighten_delta': 0.20,
-            'trend_health_hard_block_below': 25.0,
-            'trend_health_reduce_below': 42.0,
-            'trend_health_full_score': 75.0,
-            'trend_health_min_multiplier': 0.35,
-            'strategy_quality_hard_block_below': 12.0,
-            'strategy_quality_reduce_below': 42.0,
-            'strategy_quality_full_score': 78.0,
-            'strategy_quality_min_multiplier': 0.35,
+            'trend_health_hard_block_below': 12.0,
+            'trend_health_reduce_below': 35.0,
+            'trend_health_full_score': 62.0,
+            'trend_health_min_multiplier': 0.55,
+            'strategy_quality_hard_block_below': 8.0,
+            'strategy_quality_reduce_below': 25.0,
+            'strategy_quality_full_score': 60.0,
+            'strategy_quality_min_multiplier': 0.55,
             'adaptive_exit_partial_r_min': 1.0,
-            'adaptive_exit_partial_r_max': 1.8,
-            'adaptive_exit_ratio_min': 0.35,
-            'adaptive_exit_ratio_max': 0.65,
-            'adaptive_exit_trailing_multiplier_min': 1.4,
-            'adaptive_exit_trailing_multiplier_max': 2.6,
-            'adaptive_exit_activation_r_min': 1.0,
+            'adaptive_exit_partial_r_max': 1.2,
+            'adaptive_exit_ratio_min': 0.20,
+            'adaptive_exit_ratio_max': 0.35,
+            'adaptive_exit_trailing_multiplier_min': 3.0,
+            'adaptive_exit_trailing_multiplier_max': 4.0,
+            'adaptive_exit_activation_r_min': 1.4,
             'adaptive_exit_activation_r_max': 1.8,
             'volatility_target_atr_pct': 1.0,
             'volatility_target_min_multiplier': 0.25,
             'meta_labeling_min_multiplier': 0.5,
-            'strategy_adaptive_min_risk_multiplier': 0.25,
-            'set_filter_soft_fail_multiplier': 0.70,
-            'set_filter_multi_soft_fail_multiplier': 0.50,
-            'set32_min_relative_volume': 1.50,
-            'set32_min_taker_ratio_long': 1.00,
-            'set32_max_taker_ratio_short': 1.00,
-            'set32_max_spread_pct': 0.05,
+            'strategy_adaptive_min_risk_multiplier': 0.50,
+            'set_filter_soft_fail_multiplier': 0.90,
+            'set_filter_multi_soft_fail_multiplier': 0.80,
+            'final_risk_multiplier_floor': 0.20,
+            'set32_min_relative_volume': 1.15,
+            'set32_min_taker_ratio_long': 0.97,
+            'set32_max_taker_ratio_short': 1.03,
+            'set32_max_spread_pct': 0.09,
             'short_partial_take_profit_r_delta': 0.20,
             'short_partial_take_profit_ratio_add': 0.10,
             'short_atr_trailing_multiplier_delta': 0.25,
@@ -5519,33 +5599,33 @@ class SignalEngine(BaseEngine):
             'short_dmi_min_gap': 4.0,
             'bias_continuation_risk_multiplier': 0.65,
             'bias_continuation_15m_risk_multiplier': 0.50,
-            'bias_continuation_min_adx': 14.0,
-            'bias_continuation_15m_min_adx': 15.0,
-            'bias_continuation_min_volume_ratio': 0.50,
-            'bias_continuation_15m_min_volume_ratio': 0.55,
+            'bias_continuation_min_adx': 10.0,
+            'bias_continuation_15m_min_adx': 11.0,
+            'bias_continuation_min_volume_ratio': 0.40,
+            'bias_continuation_15m_min_volume_ratio': 0.45,
             'bias_continuation_max_extension_atr': 1.60,
             'bias_continuation_15m_max_extension_atr': 1.50,
-            'bias_continuation_min_adaptive_tf_score': 35.0,
-            'bias_continuation_15m_min_adaptive_tf_score': 38.0,
-            'quality_score_v2_block_below': 30.0,
-            'quality_score_v2_reduce_below': 50.0,
+            'bias_continuation_min_adaptive_tf_score': 30.0,
+            'bias_continuation_15m_min_adaptive_tf_score': 32.0,
+            'quality_score_v2_block_below': 12.0,
+            'quality_score_v2_reduce_below': 40.0,
             'quality_score_v2_full_score': 82.0,
-            'quality_score_v2_min_risk_multiplier': 0.50,
-            'quality_score_v2_15m_block_below': 35.0,
-            'quality_score_v2_15m_reduce_below': 55.0,
-            'quality_score_v2_long_block_below': 30.0,
-            'quality_score_v2_long_reduce_below': 50.0,
-            'quality_score_v2_long_15m_block_below': 35.0,
-            'quality_score_v2_long_15m_reduce_below': 55.0,
-            'quality_score_v2_short_block_below': 40.0,
-            'quality_score_v2_short_reduce_below': 60.0,
-            'quality_score_v2_short_15m_block_below': 42.0,
-            'quality_score_v2_short_15m_reduce_below': 62.0,
+            'quality_score_v2_min_risk_multiplier': 0.60,
+            'quality_score_v2_15m_block_below': 12.0,
+            'quality_score_v2_15m_reduce_below': 40.0,
+            'quality_score_v2_long_block_below': 12.0,
+            'quality_score_v2_long_reduce_below': 40.0,
+            'quality_score_v2_long_15m_block_below': 12.0,
+            'quality_score_v2_long_15m_reduce_below': 40.0,
+            'quality_score_v2_short_block_below': 16.0,
+            'quality_score_v2_short_reduce_below': 45.0,
+            'quality_score_v2_short_15m_block_below': 16.0,
+            'quality_score_v2_short_15m_reduce_below': 45.0,
             'dynamic_tp2_strong_score': 72.0,
             'dynamic_tp2_elite_score': 82.0,
-            'dynamic_tp2_base_r_multiple': 2.0,
-            'dynamic_tp2_strong_r_multiple': 2.5,
-            'dynamic_tp2_elite_r_multiple': 3.0,
+            'dynamic_tp2_base_r_multiple': 3.20,
+            'dynamic_tp2_strong_r_multiple': 5.00,
+            'dynamic_tp2_elite_r_multiple': 7.00,
             'tp1_breakeven_trigger_r': 1.5,
             'tp1_breakeven_offset_r': 0.03,
             'tp1_breakeven_qty_tolerance': 0.08,
@@ -5587,13 +5667,13 @@ class SignalEngine(BaseEngine):
             'adx_length': 14,
             'atr_length': 14,
             'donchian_length': 20,
-            'max_daily_trades': 5,
-            'max_consecutive_losses': 3,
+            'max_daily_trades': 14,
+            'max_consecutive_losses': 5,
             'sl_place_max_retries': 3,
             'opposite_set_exit_min_hold_candles': 3,
-            'multiple_testing_free_trials': 10,
-            'market_quality_long_multi_adverse_min_reasons': 3,
-            'set32_orderflow_min_samples': 3,
+            'multiple_testing_free_trials': 25,
+            'market_quality_long_multi_adverse_min_reasons': 5,
+            'set32_orderflow_min_samples': 2,
             'adaptive_timeframe_min_hold_candles': 6,
             'shadow_triple_barrier_max_bars': 24,
             'shadow_runner_max_bars': 48,
@@ -5607,8 +5687,8 @@ class SignalEngine(BaseEngine):
             'adaptive_exit_min_samples': 8,
             'adaptive_exit_lookback_days': 14,
             'meta_labeling_min_samples': 12,
-            'bias_continuation_max_signal_age_candles': 6,
-            'bias_continuation_15m_max_signal_age_candles': 3,
+            'bias_continuation_max_signal_age_candles': 10,
+            'bias_continuation_15m_max_signal_age_candles': 10,
             'tp2_fallback_confirm_loops': 2,
             'aggressive_growth_max_open_positions': 2,
             'aggressive_growth_pyramid_max_adds': 2,
@@ -5751,15 +5831,29 @@ class SignalEngine(BaseEngine):
         })
         if bool(cfg.get('fixed_take_profit_enabled', True)):
             cfg['partial_take_profit_enabled'] = True
-            cfg['partial_take_profit_r_multiple'] = 1.5
-            cfg['partial_take_profit_ratio'] = 0.5
             cfg['second_take_profit_enabled'] = True
-            cfg['second_take_profit_r_multiple'] = 2.0
-            cfg['second_take_profit_ratio'] = 0.5
-            cfg['atr_trailing_enabled'] = False
-            cfg['shadow_runner_exit_enabled'] = False
-            cfg['runner_exit_enabled'] = False
-            cfg['runner_chandelier_enabled'] = False
+
+            # Keep opportunity-mode TP values. The final stable override remains
+            # the single source of truth after selected Set parameters are merged.
+            cfg['partial_take_profit_r_multiple'] = float(
+                cfg.get('partial_take_profit_r_multiple', 1.00) or 1.00
+            )
+            cfg['partial_take_profit_ratio'] = float(
+                cfg.get('partial_take_profit_ratio', 0.20) or 0.20
+            )
+            cfg['second_take_profit_r_multiple'] = float(
+                cfg.get('second_take_profit_r_multiple', 3.50) or 3.50
+            )
+            cfg['second_take_profit_ratio'] = float(
+                cfg.get('second_take_profit_ratio', 0.40) or 0.40
+            )
+
+            # Fixed TP ladder and runner/trailing operate together in the
+            # profit-opportunity profile.
+            cfg['atr_trailing_enabled'] = True
+            cfg['shadow_runner_exit_enabled'] = True
+            cfg['runner_exit_enabled'] = True
+            cfg['runner_chandelier_enabled'] = True
         # A-option (opposite UT signal only) is intentionally rejected for UT Breakout.
         # Only the stricter opposite-set exit can be enabled from Telegram.
         cfg['opposite_signal_exit_enabled'] = False
@@ -9510,6 +9604,7 @@ class SignalEngine(BaseEngine):
                 'runner_sample_count': status.get('runner_sample_count'),
                 'runner_avg_mfe_capture_ratio': _safe_float_or_none(status.get('runner_avg_mfe_capture_ratio')),
                 'runner_avg_pnl_r': _safe_float_or_none(status.get('runner_avg_pnl_r')),
+                'raw_final_risk_multiplier': _safe_float_or_none(status.get('raw_final_risk_multiplier')),
                 'final_risk_multiplier': _safe_float_or_none(status.get('final_risk_multiplier')),
                 'decision_trace': status.get('decision_trace'),
                 'protection_status': protection_status
@@ -10112,7 +10207,15 @@ class SignalEngine(BaseEngine):
             name = item.get('name') or ''
             detail = item.get('detail') or ''
             code = item.get('code') or 'SET_FILTER_SOFT_FAIL'
-            if name in hard_filter_names or code == 'REJECTED_RISK_REWARD_LOW':
+            is_core_set_failure = (
+                bool(cfg.get('selected_set_core_filter_hard_block_enabled', True))
+                and (
+                    name in UTBREAKOUT_CORE_SET_FILTER_HARD_NAMES
+                    or code in UTBREAKOUT_CORE_SET_FILTER_HARD_CODES
+                    or bool(item.get('core_set_hard_block'))
+                )
+            )
+            if is_core_set_failure or name in hard_filter_names or code == 'REJECTED_RISK_REWARD_LOW':
                 classified_state = False
                 classified_multiplier = 0.0
                 classified_detail = detail
@@ -10289,7 +10392,10 @@ class SignalEngine(BaseEngine):
         )
         if dynamic_tp2.get('enabled') and bool(cfg.get('fixed_take_profit_enabled', True)):
             cfg = dict(cfg)
-            cfg['second_take_profit_r_multiple'] = dynamic_tp2.get('second_take_profit_r_multiple', cfg.get('second_take_profit_r_multiple', 2.0))
+            cfg['second_take_profit_r_multiple'] = max(
+                float(cfg.get('second_take_profit_r_multiple', 3.50) or 3.50),
+                float(dynamic_tp2.get('second_take_profit_r_multiple', 3.20) or 3.20),
+            )
             cfg['take_profit_r_multiple'] = max(
                 float(cfg.get('take_profit_r_multiple', 2.0) or 2.0),
                 float(cfg.get('second_take_profit_r_multiple', 2.0) or 2.0),
@@ -10431,10 +10537,10 @@ class SignalEngine(BaseEngine):
         if fixed_take_profit:
             status['adaptive_exit_summary'] = (
                 f"fixed TP ladder "
-                f"{float(cfg.get('partial_take_profit_ratio', 0.35) or 0.35):.0%}@"
-                f"{float(cfg.get('partial_take_profit_r_multiple', 1.20) or 1.20):.1f}R + "
-                f"{float(cfg.get('second_take_profit_ratio', 0.35) or 0.35):.0%}@"
-                f"{float(cfg.get('second_take_profit_r_multiple', 2.50) or 2.50):.1f}R; "
+                f"{float(cfg.get('partial_take_profit_ratio', 0.20) or 0.20):.0%}@"
+                f"{float(cfg.get('partial_take_profit_r_multiple', 1.00) or 1.00):.1f}R + "
+                f"{float(cfg.get('second_take_profit_ratio', 0.40) or 0.40):.0%}@"
+                f"{float(cfg.get('second_take_profit_r_multiple', 3.50) or 3.50):.1f}R; "
                 f"dynamic={dynamic_tp2.get('summary')}; "
                 f"runner/chandelier policy active if enabled; "
                 f"TP1 BE {'ON' if cfg.get('tp1_breakeven_enabled', True) else 'OFF'}"
@@ -10467,7 +10573,7 @@ class SignalEngine(BaseEngine):
             if continuation_decision is not None
             else 1.0
         )
-        final_risk_multiplier = (
+        raw_final_risk_multiplier = (
             short_risk_multiplier
             * bias_continuation_multiplier
             * market_quality_multiplier
@@ -10479,7 +10585,14 @@ class SignalEngine(BaseEngine):
             * direction_multiplier
             * continuation_multiplier
         )
-        final_risk_multiplier = max(0.0, min(1.0, float(final_risk_multiplier)))
+        final_risk_multiplier = _apply_utbreakout_risk_multiplier_floor(
+            raw_final_risk_multiplier,
+            cfg,
+        )
+        status['raw_final_risk_multiplier'] = max(
+            0.0,
+            min(1.0, float(raw_final_risk_multiplier)),
+        )
         status['final_risk_multiplier'] = final_risk_multiplier
         status['decision_trace'] = {
             'runtime_profile': cfg.get('runtime_profile'),
@@ -10497,6 +10610,7 @@ class SignalEngine(BaseEngine):
             'trend_health_state': trend_health.get('state'),
             'strategy_quality_state': strategy_quality.get('state'),
             'quality_score_v2_state': quality_score_v2.get('state'),
+            'raw_final_risk_multiplier': status.get('raw_final_risk_multiplier'),
             'final_risk_multiplier': final_risk_multiplier,
         }
 
@@ -10559,39 +10673,14 @@ class SignalEngine(BaseEngine):
         risk_per_trade_percent = float(cfg.get('risk_per_trade_percent', 1.0) or 1.0)
         max_risk_per_trade_usdt = float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
         if side == 'short' and bool(cfg.get('short_conservative_enabled', True)):
-            risk_per_trade_percent *= short_risk_multiplier
-            max_risk_per_trade_usdt *= short_risk_multiplier
             status['short_risk_multiplier'] = short_risk_multiplier
-        if bias_continuation_multiplier < 0.999:
-            risk_per_trade_percent *= bias_continuation_multiplier
-            max_risk_per_trade_usdt *= bias_continuation_multiplier
-        if market_quality_multiplier < 0.999:
-            risk_per_trade_percent *= market_quality_multiplier
-            max_risk_per_trade_usdt *= market_quality_multiplier
-        if strategy_risk_multiplier < 0.999:
-            risk_per_trade_percent *= strategy_risk_multiplier
-            max_risk_per_trade_usdt *= strategy_risk_multiplier
-        if quality_score_v2_multiplier < 0.999:
-            risk_per_trade_percent *= quality_score_v2_multiplier
-            max_risk_per_trade_usdt *= quality_score_v2_multiplier
-        if selector_quality_multiplier < 0.999:
-            risk_per_trade_percent *= selector_quality_multiplier
-            max_risk_per_trade_usdt *= selector_quality_multiplier
-        if feature_score_multiplier < 0.999:
-            risk_per_trade_percent *= feature_score_multiplier
-            max_risk_per_trade_usdt *= feature_score_multiplier
-        if dir_decision and dir_decision.size_multiplier < 0.999:
-            risk_per_trade_percent *= dir_decision.size_multiplier
-            max_risk_per_trade_usdt *= dir_decision.size_multiplier
-        if 'set_filter_multiplier' in locals() and set_filter_multiplier < 0.999:
-            risk_per_trade_percent *= set_filter_multiplier
-            max_risk_per_trade_usdt *= set_filter_multiplier
+        if set_filter_multiplier < 0.999:
             status['set_filter_risk_multiplier'] = set_filter_multiplier
-
         if continuation_decision and continuation_decision.risk_multiplier < 0.999:
-            risk_per_trade_percent *= continuation_decision.risk_multiplier
-            max_risk_per_trade_usdt *= continuation_decision.risk_multiplier
             status['trend_continuation_risk_multiplier'] = continuation_decision.risk_multiplier
+
+        risk_per_trade_percent *= final_risk_multiplier
+        max_risk_per_trade_usdt *= final_risk_multiplier
         try:
             plan = calculate_risk_plan(
                 side=side,
@@ -10794,6 +10883,7 @@ class SignalEngine(BaseEngine):
             'set_filter_soft_fail_summary': status.get('set_filter_soft_fail_summary'),
             'set_filter_soft_fail_count': status.get('set_filter_soft_fail_count'),
             'set_filter_state': status.get('set_filter_state'),
+            'raw_final_risk_multiplier': status.get('raw_final_risk_multiplier'),
             'final_risk_multiplier': status.get('final_risk_multiplier'),
             'decision_trace': status.get('decision_trace'),
             'direction_decision': status.get('direction_decision'),
@@ -10820,16 +10910,7 @@ class SignalEngine(BaseEngine):
             ut_stop=ut_detail.get('curr_stop'),
             total_balance=total_balance,
             free_balance=free_balance,
-            market_quality_risk_multiplier=(
-                bias_continuation_multiplier
-                * market_quality_multiplier
-                * strategy_risk_multiplier
-                * quality_score_v2_multiplier
-                * selector_quality_multiplier
-                * feature_score_multiplier
-                * (set_filter_multiplier if 'set_filter_multiplier' in locals() else 1.0)
-                * (continuation_decision.risk_multiplier if continuation_decision else 1.0)
-            ),
+            market_quality_risk_multiplier=final_risk_multiplier,
         )
         if micro_reject:
             code = micro_reject.get('reject_code') or 'REJECTED_MICRO_AUTO'
@@ -11406,7 +11487,7 @@ class SignalEngine(BaseEngine):
                     risk_note += " / 추세건강 BLOCK"
                 cfg['take_profit_r_multiple'] = max(
                     float(cfg.get('take_profit_r_multiple', 2.0) or 2.0),
-                    float(cfg.get('second_take_profit_r_multiple', 2.50) or 2.50),
+                    float(cfg.get('second_take_profit_r_multiple', 3.50) or 3.50),
                 )
                 plan = calculate_risk_plan(
                     side=side_for_plan,
@@ -11441,10 +11522,10 @@ class SignalEngine(BaseEngine):
                     f"포지션 {_fmt(planned_notional, 2)} USDT / 레버리지 {lev}x / "
                     f"손절시 손실 {_fmt(risk_usdt, 2)} USDT"
                 )
-                tp1_r = float(cfg.get('partial_take_profit_r_multiple', 1.20) or 1.20)
-                tp2_r = float(cfg.get('second_take_profit_r_multiple', 2.50) or 2.50)
-                tp1_ratio = float(cfg.get('partial_take_profit_ratio', 0.35) or 0.35)
-                tp2_ratio = float(cfg.get('second_take_profit_ratio', 0.35) or 0.35)
+                tp1_r = float(cfg.get('partial_take_profit_r_multiple', 1.00) or 1.00)
+                tp2_r = float(cfg.get('second_take_profit_r_multiple', 3.50) or 3.50)
+                tp1_ratio = float(cfg.get('partial_take_profit_ratio', 0.20) or 0.20)
+                tp2_ratio = float(cfg.get('second_take_profit_ratio', 0.40) or 0.40)
                 take_profit_detail = (
                     f"익절 계획: TP1 {tp1_r:.2f}R({tp1_ratio:.0%}) / "
                     f"TP2 {tp2_r:.2f}R({tp2_ratio:.0%}) / "
@@ -11577,7 +11658,15 @@ class SignalEngine(BaseEngine):
                 name = item.get('name') or ''
                 detail = item.get('detail') or ''
                 code = item.get('code') or ''
-                if name in {'ATR% 변동성', '손익비', '스프레드', '유동성'} or code == 'REJECTED_RISK_REWARD_LOW':
+                is_core_set_failure = (
+                    bool(cfg.get('selected_set_core_filter_hard_block_enabled', True))
+                    and (
+                        name in UTBREAKOUT_CORE_SET_FILTER_HARD_NAMES
+                        or code in UTBREAKOUT_CORE_SET_FILTER_HARD_CODES
+                        or bool(item.get('core_set_hard_block'))
+                    )
+                )
+                if is_core_set_failure or name in {'ATR% 변동성', '손익비', '스프레드', '유동성'} or code == 'REJECTED_RISK_REWARD_LOW':
                     state, multiplier, classified_detail = False, 0.0, detail
                 elif name in {'상대 거래량', 'Rolling OFI 확인', 'Futures 수급 불균형', 'Spread/Depth 비용'}:
                     state, multiplier, classified_detail = _classify_set_filter_result(
@@ -11715,14 +11804,17 @@ class SignalEngine(BaseEngine):
             elif set_soft_failures:
                 set_filter_multiplier_status = 0.0
 
-            final_risk_multiplier_status = (
+            raw_final_risk_multiplier_status = (
                 market_multiplier
                 * selector_multiplier
                 * adaptation_multiplier
                 * q2_multiplier
                 * set_filter_multiplier_status
             )
-            final_risk_multiplier_status = max(0.0, min(1.0, float(final_risk_multiplier_status)))
+            final_risk_multiplier_status = _apply_utbreakout_risk_multiplier_floor(
+                raw_final_risk_multiplier_status,
+                cfg,
+            )
 
             base_max_risk = float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
             effective_max_risk = base_max_risk * final_risk_multiplier_status
@@ -11737,6 +11829,7 @@ class SignalEngine(BaseEngine):
                     (
                         f"x{final_risk_multiplier_status:.3f} "
                         f"(base ${base_max_risk:.2f} -> effective ${effective_max_risk:.2f}; "
+                        f"raw x{float(raw_final_risk_multiplier_status):.3f}, "
                         f"market x{market_multiplier:.2f}, selector x{selector_multiplier:.2f}, "
                         f"strategy x{adaptation_multiplier:.2f}, qscore x{q2_multiplier:.2f}, "
                         f"set x{set_filter_multiplier_status:.2f})"
@@ -11820,9 +11913,9 @@ class SignalEngine(BaseEngine):
             f"{status_feature_score.get('reason') or 'n/a'}"
         )
         adaptive_tfs = cfg.get("adaptive_timeframes", ["15m", "30m", "1h"])
-        tp2 = float(cfg.get("second_take_profit_r_multiple", 2.50) or 2.50)
-        vol_base = float(cfg.get("bias_continuation_min_volume_ratio", 0.50) or 0.50)
-        vol_15m = float(cfg.get("bias_continuation_15m_min_volume_ratio", 0.55) or 0.55)
+        tp2 = float(cfg.get("second_take_profit_r_multiple", 3.50) or 3.50)
+        vol_base = float(cfg.get("bias_continuation_min_volume_ratio", 0.40) or 0.40)
+        vol_15m = float(cfg.get("bias_continuation_15m_min_volume_ratio", 0.45) or 0.45)
 
         text_lines = [
             "🚦 UT Breakout 조건 스테이터스",
@@ -12275,7 +12368,15 @@ class SignalEngine(BaseEngine):
             name = item.get('name') or ''
             detail = item.get('detail') or ''
             code = item.get('code') or ''
-            if name in {'ATR% 변동성', '손익비', '스프레드', '유동성'} or code == 'REJECTED_RISK_REWARD_LOW':
+            is_core_set_failure = (
+                bool(cfg.get('selected_set_core_filter_hard_block_enabled', True))
+                and (
+                    name in UTBREAKOUT_CORE_SET_FILTER_HARD_NAMES
+                    or code in UTBREAKOUT_CORE_SET_FILTER_HARD_CODES
+                    or bool(item.get('core_set_hard_block'))
+                )
+            )
+            if is_core_set_failure or name in {'ATR% 변동성', '손익비', '스프레드', '유동성'} or code == 'REJECTED_RISK_REWARD_LOW':
                 state, multiplier, classified_detail = False, 0.0, detail
             elif name in {'상대 거래량', 'Rolling OFI 확인', 'Futures 수급 불균형', 'Spread/Depth 비용'}:
                 state, multiplier, classified_detail = _classify_set_filter_result(
@@ -28802,15 +28903,15 @@ class MainController:
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'fixed_take_profit_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'partial_take_profit_enabled'], True)
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'partial_take_profit_r_multiple'], 1.5)
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'partial_take_profit_ratio'], 0.5)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'partial_take_profit_r_multiple'], 1.0)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'partial_take_profit_ratio'], 0.20)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'second_take_profit_enabled'], True)
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'second_take_profit_r_multiple'], 2.0)
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'second_take_profit_ratio'], 0.5)
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'atr_trailing_enabled'], False)
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'shadow_runner_exit_enabled'], False)
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'runner_exit_enabled'], False)
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'runner_chandelier_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'second_take_profit_r_multiple'], 3.50)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'second_take_profit_ratio'], 0.40)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'atr_trailing_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'shadow_runner_exit_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'runner_exit_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'runner_chandelier_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'quality_score_v2_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'dynamic_take_profit_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'tp1_breakeven_enabled'], True)
@@ -29191,19 +29292,7 @@ UTBot:
             raw_cfg = strategy_params.get('UTBotFilteredBreakoutV1', {})
             if isinstance(raw_cfg, dict):
                 cfg.update(raw_cfg)
-            if bool(cfg.get('fixed_take_profit_enabled', True)):
-                cfg.update({
-                    'partial_take_profit_enabled': True,
-                    'partial_take_profit_r_multiple': 1.5,
-                    'partial_take_profit_ratio': 0.5,
-                    'second_take_profit_enabled': True,
-                    'second_take_profit_r_multiple': 2.0,
-                    'second_take_profit_ratio': 0.5,
-                    'atr_trailing_enabled': False,
-                    'shadow_runner_exit_enabled': False,
-                    'runner_exit_enabled': False,
-                    'runner_chandelier_enabled': False,
-                })
+            cfg = apply_stable_utbreak_final_overrides(cfg)
             coin_cfg = sig_cfg.get('coin_selector', {}) if isinstance(sig_cfg.get('coin_selector', {}), dict) else {}
             common_cfg = sig_cfg.get('common_settings', {}) if isinstance(sig_cfg.get('common_settings', {}), dict) else {}
             watchlist = self.get_active_watchlist()
