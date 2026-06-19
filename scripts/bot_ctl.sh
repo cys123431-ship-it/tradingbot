@@ -109,25 +109,57 @@ legacy_bot_pids() {
   '
 }
 
-stop_legacy_bot_processes() {
+legacy_bot_process_details() {
   local pids
   pids="$(legacy_bot_pids)"
   if [[ -z "$pids" ]]; then
     return 0
   fi
 
-  echo "stopping legacy direct emas.py process(es): $(echo "$pids" | tr '\n' ' ')"
   while read -r pid; do
-    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+    [[ -z "$pid" ]] && continue
+    ps -o user=,pid=,ppid=,lstart=,args= -p "$pid" 2>/dev/null || true
+    if [[ -r "/proc/$pid/cgroup" ]]; then
+      sed "s/^/cgroup[$pid]: /" "/proc/$pid/cgroup" 2>/dev/null || true
+    fi
   done <<< "$pids"
-  sleep 2
+}
+
+stop_legacy_bot_processes() {
+  local attempt pids
+  for attempt in 1 2 3; do
+    pids="$(legacy_bot_pids)"
+    if [[ -z "$pids" ]]; then
+      return 0
+    fi
+
+    echo "stopping legacy direct emas.py process(es), attempt $attempt: $(echo "$pids" | tr '\n' ' ')"
+    legacy_bot_process_details
+    while read -r pid; do
+      [[ -z "$pid" ]] && continue
+      if ! kill "$pid" 2>/dev/null; then
+        sudo -n kill "$pid" 2>/dev/null || true
+      fi
+    done <<< "$pids"
+    sleep 2
+
+    pids="$(legacy_bot_pids)"
+    if [[ -n "$pids" ]]; then
+      while read -r pid; do
+        [[ -z "$pid" ]] && continue
+        if ! kill -9 "$pid" 2>/dev/null; then
+          sudo -n kill -9 "$pid" 2>/dev/null || true
+        fi
+      done <<< "$pids"
+      sleep 1
+    fi
+  done
 
   pids="$(legacy_bot_pids)"
   if [[ -n "$pids" ]]; then
-    while read -r pid; do
-      [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null || true
-    done <<< "$pids"
-    sleep 1
+    echo "failed to stop legacy direct emas.py process(es): $(echo "$pids" | tr '\n' ' ')" >&2
+    legacy_bot_process_details >&2
+    return 1
   fi
 }
 
@@ -232,6 +264,7 @@ status_bot() {
   legacy_pids="$(legacy_bot_pids)"
   if [[ -n "$legacy_pids" ]]; then
     echo "bot unhealthy: legacy direct emas.py process detected: $(echo "$legacy_pids" | tr '\n' ' ')"
+    legacy_bot_process_details
     return 1
   fi
 
