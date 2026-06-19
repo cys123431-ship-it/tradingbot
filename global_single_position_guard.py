@@ -26,83 +26,114 @@ OPPORTUNITY_OVERRIDES = {
     "exit_timeframe": "15m",
     "htf_timeframe": "1h",
 
+    # AUTO opportunity: keep core overfit guards, but don't choke entries.
+    "live_auto_set_whitelist_enabled": True,
+    "live_auto_set_whitelist": [12, 22, 32, 51, 63],
+    "auto_min_score_margin_live": 1.0,
+    "auto_min_adjusted_score_live": 42.0,
+    "auto_block_on_weak_margin_live": True,
+    "auto_multiple_testing_penalty_enabled": True,
+    "multiple_testing_free_trials": 20,
+    "multiple_testing_max_score_penalty": 5.0,
+
     # less frequent timeframe switching
-    "adaptive_timeframe_min_score": 38.0,
-    "adaptive_timeframe_switch_margin": 10.0,
-    "adaptive_timeframe_min_hold_candles": 6,
+    "adaptive_timeframe_min_score": 36.0,
+    "adaptive_timeframe_switch_margin": 8.0,
+    "adaptive_timeframe_min_hold_candles": 5,
 
-    # reduce overfitted hard blocks
-    "trend_health_hard_block_below": 20.0,
-    "trend_health_reduce_below": 42.0,
-    "trend_health_full_score": 68.0,
-    "trend_health_min_multiplier": 0.35,
+    # quality filters: loosen enough for profit opportunity mode.
+    "trend_health_hard_block_below": 16.0,
+    "trend_health_reduce_below": 38.0,
+    "trend_health_full_score": 66.0,
+    "trend_health_min_multiplier": 0.40,
 
-    "strategy_quality_hard_block_below": 12.0,
-    "strategy_quality_reduce_below": 42.0,
-    "strategy_quality_full_score": 70.0,
-    "strategy_quality_min_multiplier": 0.35,
+    "strategy_quality_hard_block_below": 10.0,
+    "strategy_quality_reduce_below": 38.0,
+    "strategy_quality_full_score": 68.0,
+    "strategy_quality_min_multiplier": 0.40,
 
-    "quality_score_v2_block_below": 20.0,
-    "quality_score_v2_reduce_below": 50.0,
+    "quality_score_v2_block_below": 16.0,
+    "quality_score_v2_reduce_below": 45.0,
 
-    "quality_score_v2_long_block_below": 20.0,
-    "quality_score_v2_long_reduce_below": 50.0,
-    "quality_score_v2_long_15m_block_below": 20.0,
-    "quality_score_v2_long_15m_reduce_below": 50.0,
+    "quality_score_v2_long_block_below": 16.0,
+    "quality_score_v2_long_reduce_below": 45.0,
+    "quality_score_v2_long_15m_block_below": 16.0,
+    "quality_score_v2_long_15m_reduce_below": 45.0,
 
-    "quality_score_v2_short_block_below": 25.0,
-    "quality_score_v2_short_reduce_below": 60.0,
-    "quality_score_v2_short_15m_block_below": 25.0,
-    "quality_score_v2_short_15m_reduce_below": 60.0,
+    "quality_score_v2_short_block_below": 20.0,
+    "quality_score_v2_short_reduce_below": 52.0,
+    "quality_score_v2_short_15m_block_below": 20.0,
+    "quality_score_v2_short_15m_reduce_below": 52.0,
 
-    # volume should rarely be the only hard block
-    "bias_continuation_min_volume_ratio": 0.50,
-    "bias_continuation_15m_min_volume_ratio": 0.55,
-    "bias_continuation_min_adaptive_tf_score": 35.0,
-    "bias_continuation_15m_min_adaptive_tf_score": 38.0,
-    "bias_continuation_min_adx": 14.0,
-    "bias_continuation_15m_min_adx": 15.0,
+    # continuation path: allow more continuation entries.
+    "bias_continuation_min_volume_ratio": 0.45,
+    "bias_continuation_15m_min_volume_ratio": 0.50,
+    "bias_continuation_min_adaptive_tf_score": 32.0,
+    "bias_continuation_15m_min_adaptive_tf_score": 34.0,
+    "bias_continuation_min_adx": 12.0,
+    "bias_continuation_15m_min_adx": 13.0,
+    "bias_continuation_max_signal_age_candles": 8,
+    "bias_continuation_15m_max_signal_age_candles": 8,
+    "bias_continuation_max_signal_age": 8,
+    "bias_continuation_15m_max_signal_age": 8,
 
-    # short filter: stricter than long, but not dead
-    "short_adx_threshold": 20.0,
-    "short_dmi_min_gap": 2.0,
-    "short_risk_multiplier": 0.60,
+    # short filter: keep short possible, but not dead.
+    "short_adx_threshold": 18.0,
+    "short_dmi_min_gap": 1.5,
+    "short_risk_multiplier": 0.65,
 
-    # exits
-    "partial_take_profit_r_multiple": 1.20,
-    "partial_take_profit_ratio": 0.35,
-    "second_take_profit_r_multiple": 2.50,
+    # Set32: tradable again, while still keeping structure confirmation.
+    "set32_min_relative_volume": 1.20,
+    "set32_require_direction_candle": True,
+    "set32_require_ema50_side": True,
+    "set32_require_orderflow_confirmation": True,
+    "set32_orderflow_min_samples": 2,
+    "set32_min_taker_ratio_long": 0.98,
+    "set32_max_taker_ratio_short": 1.02,
+    "set32_max_spread_pct": 0.08,
+
+    # Do not hard-kill long just because market quality is noisy; reduce size instead.
+    "market_quality_long_hard_block_on_multi_adverse_enabled": False,
+    "market_quality_long_multi_adverse_min_reasons": 5,
+    "market_quality_long_multi_adverse_max_multiplier": 0.20,
+    "market_quality_min_risk_multiplier": 0.30,
+
+    # exits: smaller TP1, larger TP2, more runner room.
+    "partial_take_profit_r_multiple": 1.00,
+    "partial_take_profit_ratio": 0.25,
+    "second_take_profit_r_multiple": 3.00,
     "second_take_profit_ratio": 0.35,
-    "dynamic_tp2_base_r_multiple": 2.30,
-    "dynamic_tp2_strong_r_multiple": 3.00,
-    "dynamic_tp2_elite_r_multiple": 4.00,
-    "atr_trailing_activation_r": 1.20,
-    "atr_trailing_multiplier": 2.50,
-    "runner_chandelier_multiplier": 2.80,
+    "dynamic_tp2_base_r_multiple": 2.80,
+    "dynamic_tp2_strong_r_multiple": 4.00,
+    "dynamic_tp2_elite_r_multiple": 5.50,
+    "atr_trailing_activation_r": 1.40,
+    "atr_trailing_multiplier": 3.00,
+    "runner_chandelier_multiplier": 3.30,
 
-    # bounded activity
-    "max_daily_trades": 8,
-    "max_consecutive_losses": 4,
+    # bounded activity, but more opportunity than old profile.
+    "max_daily_trades": 12,
+    "max_consecutive_losses": 5,
 
     # Trend continuation entry path
     "trend_continuation_entry_enabled": True,
-    "trend_continuation_base_risk_multiplier": 0.60,
-    "trend_continuation_min_risk_multiplier": 0.25,
-    "trend_continuation_min_adx": 14.0,
-    "trend_continuation_max_extension_atr": 2.20,
-    "trend_continuation_flow_min_volume_ratio": 0.45,
-    "trend_continuation_min_range_expansion": 1.03,
-    "trend_continuation_quality_hard_floor": 20.0,
-    "trend_continuation_quality_reduce_floor": 45.0,
-    "trend_continuation_trend_hard_floor": 18.0,
-    "trend_continuation_trend_reduce_floor": 42.0,
-    "trend_continuation_strategy_hard_floor": 12.0,
-    "trend_continuation_strategy_reduce_floor": 42.0,
+    "trend_continuation_base_risk_multiplier": 0.75,
+    "trend_continuation_min_risk_multiplier": 0.35,
+    "trend_continuation_min_adx": 12.0,
+    "trend_continuation_max_extension_atr": 2.60,
+    "trend_continuation_flow_min_volume_ratio": 0.40,
+    "trend_continuation_min_range_expansion": 1.01,
+    "trend_continuation_quality_hard_floor": 16.0,
+    "trend_continuation_quality_reduce_floor": 40.0,
+    "trend_continuation_trend_hard_floor": 14.0,
+    "trend_continuation_trend_reduce_floor": 38.0,
+    "trend_continuation_strategy_hard_floor": 10.0,
+    "trend_continuation_strategy_reduce_floor": 38.0,
 
-    # Set filter failures should mostly reduce size, not block continuation entries
+    # Core Set identity remains hard-block; other soft failures only reduce size.
+    "selected_set_core_filter_hard_block_enabled": True,
     "set_filter_soft_fail_enabled": True,
-    "set_filter_soft_fail_multiplier": 0.70,
-    "set_filter_multi_soft_fail_multiplier": 0.50,
+    "set_filter_soft_fail_multiplier": 0.80,
+    "set_filter_multi_soft_fail_multiplier": 0.65,
 }
 
 
@@ -183,13 +214,7 @@ def _set_if_different(container, key_name, value):
 
 
 def apply_opportunity_tuning(engine):
-    """Make UTBreakout less under-active while keeping one-position safety.
-
-    The goal is not to guarantee profit. It increases the chance of taking the
-    strongest breakout by relaxing selector/filter thresholds and opening the
-    runner side of exits, while retaining global one-position protection.
-    """
-
+    """Make UTBreakout more opportunity-oriented while keeping one-position safety."""
 
     root = _config_root(engine)
     if not isinstance(root, dict):
@@ -239,8 +264,7 @@ def apply_opportunity_tuning(engine):
         selector["excluded_sectors"] = [item for item in excluded if item != "meme"]
         changed = True
 
-    # Adaptive strategy: use OPPORTUNITY_OVERRIDES for faster discovery,
-    # lower blocks, and let winners run more.
+    # Adaptive strategy: use OPPORTUNITY_OVERRIDES for faster discovery and bigger winner capture.
     for k, v in OPPORTUNITY_OVERRIDES.items():
         changed |= _set_if_different(ut, k, v)
     if changed:
@@ -271,66 +295,7 @@ def patch_signal_engine(cls):
             cfg = original_get_cfg(self, strategy_params)
 
         if isinstance(cfg, dict):
-            cfg.update({
-                "auto_timeframes": ["15m", "30m", "1h"],
-                "adaptive_timeframes": ["15m", "30m", "1h"],
-                "entry_timeframe": "15m",
-                "exit_timeframe": "15m",
-                "htf_timeframe": "1h",
-
-                "adaptive_timeframe_min_score": 38.0,
-                "adaptive_timeframe_switch_margin": 10.0,
-                "adaptive_timeframe_min_hold_candles": 6,
-
-                "bias_continuation_min_volume_ratio": 0.50,
-                "bias_continuation_15m_min_volume_ratio": 0.55,
-                "bias_continuation_min_adaptive_tf_score": 35.0,
-                "bias_continuation_15m_min_adaptive_tf_score": 38.0,
-                "bias_continuation_min_adx": 14.0,
-                "bias_continuation_15m_min_adx": 15.0,
-
-                "trend_health_hard_block_below": 20.0,
-                "trend_health_reduce_below": 42.0,
-                "strategy_quality_hard_block_below": 12.0,
-                "strategy_quality_reduce_below": 42.0,
-
-                "quality_score_v2_block_below": 20.0,
-                "quality_score_v2_reduce_below": 50.0,
-                "quality_score_v2_long_block_below": 20.0,
-                "quality_score_v2_long_reduce_below": 50.0,
-                "quality_score_v2_long_15m_block_below": 20.0,
-                "quality_score_v2_long_15m_reduce_below": 50.0,
-                "quality_score_v2_short_block_below": 25.0,
-                "quality_score_v2_short_reduce_below": 60.0,
-                "quality_score_v2_short_15m_block_below": 25.0,
-                "quality_score_v2_short_15m_reduce_below": 60.0,
-
-                "partial_take_profit_r_multiple": 1.20,
-                "second_take_profit_r_multiple": 2.50,
-                "dynamic_tp2_base_r_multiple": 2.30,
-                "dynamic_tp2_strong_r_multiple": 3.00,
-                "dynamic_tp2_elite_r_multiple": 4.00,
-                "atr_trailing_activation_r": 1.20,
-                "atr_trailing_multiplier": 2.50,
-
-                "trend_continuation_entry_enabled": True,
-                "trend_continuation_base_risk_multiplier": 0.60,
-                "trend_continuation_min_risk_multiplier": 0.25,
-                "trend_continuation_min_adx": 14.0,
-                "trend_continuation_max_extension_atr": 2.20,
-                "trend_continuation_flow_min_volume_ratio": 0.45,
-                "trend_continuation_min_range_expansion": 1.03,
-                "trend_continuation_quality_hard_floor": 20.0,
-                "trend_continuation_quality_reduce_floor": 45.0,
-                "trend_continuation_trend_hard_floor": 18.0,
-                "trend_continuation_trend_reduce_floor": 42.0,
-                "trend_continuation_strategy_hard_floor": 12.0,
-                "trend_continuation_strategy_reduce_floor": 42.0,
-
-                "set_filter_soft_fail_enabled": True,
-                "set_filter_soft_fail_multiplier": 0.70,
-                "set_filter_multi_soft_fail_multiplier": 0.50,
-            })
+            cfg.update(OPPORTUNITY_OVERRIDES)
 
         return cfg
 
