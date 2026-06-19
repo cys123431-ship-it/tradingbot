@@ -22,5 +22,8 @@ class SafeRotatingFileHandler(OriginalRotatingFileHandler):
 logging.handlers.RotatingFileHandler = SafeRotatingFileHandler
 
 import global_single_position_guard
+import outbreakout_live_hardening_patch
+
 global_single_position_guard.install()
+utbreakout_live_hardening_patch.install()
 runpy.run_path(str(ROOT / 'emas.py'), run_name='__main__')
