@@ -1,4 +1,4 @@
-import outbreakout_live_hardening_patch as patch
+import utbreakout_live_hardening_patch as patch
 
 
 def test_enforce_core_hardening_config_forces_flag_on():
