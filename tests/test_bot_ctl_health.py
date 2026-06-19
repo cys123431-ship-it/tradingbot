@@ -19,6 +19,14 @@ def _start_marker_process(marker):
     )
 
 
+def _start_shell_process_with_legacy_text():
+    return subprocess.Popen(
+        ["bash", "-c", "sleep 60", "python emas.py"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def _bot_ctl_env(tmp_path, marker, heartbeat_file, max_age="30"):
     env = os.environ.copy()
     env.update({
@@ -108,3 +116,30 @@ def test_bot_ctl_status_rejects_legacy_direct_emas_process(tmp_path):
 
     assert result.returncode == 1
     assert "legacy direct emas.py process detected" in result.stdout
+
+
+@pytest.mark.skipif(shutil.which("pgrep") is None, reason="pgrep is required by bot_ctl.sh")
+def test_bot_ctl_does_not_treat_shell_script_text_as_legacy_python_process(tmp_path):
+    marker = tmp_path / "fake_launcher.py"
+    heartbeat_file = tmp_path / "heartbeat.json"
+    heartbeat_file.write_text('{"epoch": 1}', encoding="utf-8")
+    launcher = _start_marker_process(marker)
+    shell = _start_shell_process_with_legacy_text()
+    try:
+        time.sleep(0.2)
+        result = subprocess.run(
+            ["bash", "scripts/bot_ctl.sh", "status"],
+            cwd=ROOT_DIR,
+            env=_bot_ctl_env(tmp_path, marker, heartbeat_file),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    finally:
+        launcher.terminate()
+        shell.terminate()
+        launcher.wait(timeout=5)
+        shell.wait(timeout=5)
+
+    assert result.returncode == 0
+    assert "heartbeat healthy" in result.stdout

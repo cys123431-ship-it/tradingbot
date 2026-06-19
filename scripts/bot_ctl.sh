@@ -100,9 +100,9 @@ bot_process_count() {
 }
 
 legacy_bot_pids() {
-  ps -eo pid=,args= | awk -v launcher="$BOT_ENTRY" '
+  ps -eo pid=,comm=,args= | awk -v launcher="$BOT_ENTRY" '
+    $2 ~ /^python([0-9.]+)?$/ &&
     index($0, launcher) == 0 &&
-    $0 ~ /[Pp]ython/ &&
     $0 ~ /(^|[[:space:]])([^[:space:]]*\/)?emas\.py([[:space:]]|$)/ {
       print $1
     }
