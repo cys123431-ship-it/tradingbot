@@ -156,6 +156,28 @@ def test_adaptive_exit_overlay_strong_quality_keeps_runner_wider():
     assert strong["atr_trailing_multiplier"] >= 2.0
 
 
+def test_profit_opportunity_profile_clamps_adaptive_exit_to_runner_ranges():
+    overlay = build_adaptive_exit_overlay(
+        {
+            "effective_profile_version": "profit_opportunity_v4_tp350_runner",
+            "partial_take_profit_r_multiple": 1.15,
+            "partial_take_profit_ratio": 0.62,
+            "atr_trailing_multiplier": 1.65,
+            "atr_trailing_activation_r": 1.15,
+            "adaptive_exit_min_samples": 1,
+        },
+        {"sample_count": 2, "tp_rate": 0.20, "avg_mfe_r": 1.3, "avg_pnl_r": -0.2},
+        "long",
+    )
+
+    assert 1.0 <= overlay["partial_take_profit_r_multiple"] <= 1.2
+    assert 0.20 <= overlay["partial_take_profit_ratio"] <= 0.35
+    assert 3.0 <= overlay["atr_trailing_multiplier"] <= 4.0
+    assert 1.4 <= overlay["atr_trailing_activation_r"] <= 1.8
+    assert "62%@1.15R" not in overlay["summary"]
+    assert "1.65ATR" not in overlay["summary"]
+
+
 def test_trend_health_compresses_quality_into_single_multiplier():
     strong = build_trend_health_score(
         {

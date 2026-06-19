@@ -24,6 +24,8 @@ def test_profit_opportunity_effective_profile_overrides_old_values():
     assert out["effective_profile_version"] == "profit_opportunity_v4_tp350_runner"
     assert out["selection_mode"] == "auto"
     assert out["auto_select_enabled"] is True
+    assert out["active_set_id"] == 22
+    assert out["profile"] == "set22"
     assert out["live_auto_set_whitelist"] == [5, 12, 22, 32, 51, 63]
     assert out["partial_take_profit_r_multiple"] == 1.00
     assert out["partial_take_profit_ratio"] == 0.20
@@ -60,6 +62,8 @@ def test_runtime_config_path_reapplies_effective_profile_after_persisted_values(
     assert cfg["effective_profile_version"] == emas.UTBREAKOUT_EFFECTIVE_PROFILE_VERSION
     assert cfg["selection_mode"] == "auto"
     assert cfg["auto_select_enabled"] is True
+    assert cfg["active_set_id"] == 22
+    assert cfg["profile"] == "set22"
     assert cfg["live_auto_set_whitelist"] == [5, 12, 22, 32, 51, 63]
     assert cfg["partial_take_profit_r_multiple"] == 1.00
     assert cfg["second_take_profit_r_multiple"] == 3.50
@@ -67,3 +71,37 @@ def test_runtime_config_path_reapplies_effective_profile_after_persisted_values(
     assert cfg["max_daily_trades"] == 14
     assert cfg["bias_continuation_min_volume_ratio"] == 0.40
     assert cfg["bias_continuation_15m_min_volume_ratio"] == 0.45
+
+
+def test_status_render_contract_replaces_stale_telegram_summary_values():
+    stale = "\n".join([
+        "🚦 UT Breakout 조건 스테이터스",
+        "익절 계획: 2.0R",
+        "Effective TP2: 2.00R",
+        "Effective volume: base 0.75 / 15m 0.80",
+        "일일 리스크: trades 0/10",
+        "Bias continuation: volume ratio 0.25<0.75",
+        "전략 적응 요약: exit partial 62%@1.15R, trail 1.65ATR from 1.15R",
+        "선택 Set: Set47",
+    ])
+
+    rendered = emas.enforce_utbreakout_effective_status_contract(
+        stale,
+        {},
+        daily_entries=0,
+    )
+
+    assert "Effective Profile: profit_opportunity_v4_tp350_runner" in rendered
+    assert "Effective TP2: 3.50R" in rendered
+    assert "Effective volume: base 0.40 / 15m 0.45" in rendered
+    assert "익절 계획: TP1 1.00R(20%) / TP2 3.50R(40%)" in rendered
+    assert "일일 리스크: trades 0/14" in rendered
+    assert "익절 계획: 2.0R" not in rendered
+    assert "Effective TP2: 2.00R" not in rendered
+    assert "trades 0/10" not in rendered
+    assert "volume ratio 0.25<0.75" not in rendered
+    assert "volume ratio 0.25<0.45" in rendered
+    assert "exit partial 62%@1.15R" not in rendered
+    assert "trail 3.00-4.00ATR" in rendered
+    assert "선택 Set: Set47" not in rendered
+    assert "선택 Set: Set22 (effective AUTO fallback; legacy Set47 blocked)" in rendered

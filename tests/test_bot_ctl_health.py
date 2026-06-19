@@ -80,3 +80,31 @@ def test_bot_ctl_status_fails_on_stale_heartbeat(tmp_path):
 
     assert result.returncode == 1
     assert "heartbeat stale" in result.stdout
+
+
+@pytest.mark.skipif(shutil.which("pgrep") is None, reason="pgrep is required by bot_ctl.sh")
+def test_bot_ctl_status_rejects_legacy_direct_emas_process(tmp_path):
+    marker = tmp_path / "fake_launcher.py"
+    legacy_marker = tmp_path / "emas.py"
+    heartbeat_file = tmp_path / "heartbeat.json"
+    heartbeat_file.write_text('{"epoch": 1}', encoding="utf-8")
+    launcher = _start_marker_process(marker)
+    legacy = _start_marker_process(legacy_marker)
+    try:
+        time.sleep(0.2)
+        result = subprocess.run(
+            ["bash", "scripts/bot_ctl.sh", "status"],
+            cwd=ROOT_DIR,
+            env=_bot_ctl_env(tmp_path, marker, heartbeat_file),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    finally:
+        launcher.terminate()
+        legacy.terminate()
+        launcher.wait(timeout=5)
+        legacy.wait(timeout=5)
+
+    assert result.returncode == 1
+    assert "legacy direct emas.py process detected" in result.stdout

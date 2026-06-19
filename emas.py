@@ -829,7 +829,102 @@ def apply_profit_opportunity_effective_overrides(cfg):
         current_take_profit,
         float(cfg.get("second_take_profit_r_multiple", 3.50) or 3.50),
     )
+    allowed_sets = set(cfg.get("live_auto_set_whitelist") or [])
+    active_set_id = _safe_set_id(cfg.get("active_set_id") or cfg.get("profile"))
+    if active_set_id not in allowed_sets:
+        cfg["active_set_id"] = UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID
+        cfg["profile"] = f"set{UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID}"
     return cfg
+
+
+def build_utbreakout_effective_status_contract(cfg, daily_entries=None):
+    """Build the authoritative profile lines shown in every UTBreak status."""
+    effective = apply_profit_opportunity_effective_overrides(dict(cfg or {}))
+    lines = [
+        f"Effective Profile: {effective.get('effective_profile_version', 'UNKNOWN')}",
+        f"Effective TP2: {float(effective.get('second_take_profit_r_multiple', 3.50) or 3.50):.2f}R",
+        (
+            "Effective volume: "
+            f"base {float(effective.get('bias_continuation_min_volume_ratio', 0.40) or 0.40):.2f} / "
+            f"15m {float(effective.get('bias_continuation_15m_min_volume_ratio', 0.45) or 0.45):.2f}"
+        ),
+        (
+            "익절 계획: "
+            f"TP1 {float(effective.get('partial_take_profit_r_multiple', 1.00) or 1.00):.2f}R"
+            f"({float(effective.get('partial_take_profit_ratio', 0.20) or 0.20):.0%}) / "
+            f"TP2 {float(effective.get('second_take_profit_r_multiple', 3.50) or 3.50):.2f}R"
+            f"({float(effective.get('second_take_profit_ratio', 0.40) or 0.40):.0%})"
+        ),
+    ]
+    if daily_entries is not None:
+        try:
+            entry_count = int(daily_entries)
+        except (TypeError, ValueError):
+            entry_count = 0
+        lines.append(
+            f"일일 리스크: trades {entry_count}/{int(effective.get('max_daily_trades', 14) or 14)}"
+        )
+    return lines
+
+
+def enforce_utbreakout_effective_status_contract(text, cfg, daily_entries=None):
+    """Replace stale profile summary lines at the final Telegram render boundary."""
+    effective = apply_profit_opportunity_effective_overrides(dict(cfg or {}))
+    raw_lines = str(text or "").splitlines()
+    stale_prefixes = (
+        "Effective Profile:",
+        "Effective TP2:",
+        "Effective volume:",
+        "익절 계획:",
+        "일일 리스크: trades ",
+    )
+    filtered = []
+    for raw_line in raw_lines:
+        line = str(raw_line)
+        if line.strip().startswith(stale_prefixes):
+            continue
+        if "Bias continuation" in line:
+            line = re.sub(
+                r"volume ratio ([0-9.]+)<0\.(?:75|80)",
+                r"volume ratio \1<0.45",
+                line,
+            )
+        exit_match = re.search(
+            r"exit partial ([0-9.]+)%@([0-9.]+)R, trail ([0-9.]+)ATR from ([0-9.]+)R",
+            line,
+        )
+        if exit_match:
+            ratio, partial_r, trailing_mult, activation_r = map(float, exit_match.groups())
+            if not (
+                20.0 <= ratio <= 35.0
+                and 1.0 <= partial_r <= 1.2
+                and 3.0 <= trailing_mult <= 4.0
+                and 1.4 <= activation_r <= 1.8
+            ):
+                prefix = line[:exit_match.start()]
+                line = (
+                    f"{prefix}exit partial 20-35%@1.00-1.20R, "
+                    "trail 3.00-4.00ATR from 1.40-1.80R "
+                    "(effective profile bounds)"
+                )
+        selected_set_match = re.match(r"(\s*선택 Set:\s*)Set(\d+)(.*)", line)
+        if selected_set_match:
+            selected_set_id = int(selected_set_match.group(2))
+            allowed_sets = set(effective.get("live_auto_set_whitelist") or [])
+            if selected_set_id not in allowed_sets:
+                fallback_set = int(
+                    effective.get("active_set_id", UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID)
+                    or UTBREAKOUT_SAFE_LIVE_DEFAULT_SET_ID
+                )
+                line = (
+                    f"{selected_set_match.group(1)}Set{fallback_set} "
+                    f"(effective AUTO fallback; legacy Set{selected_set_id} blocked)"
+                )
+        filtered.append(line)
+    contract = build_utbreakout_effective_status_contract(effective, daily_entries)
+    if not filtered:
+        return "\n".join(contract)
+    return "\n".join([filtered[0], *contract, *filtered[1:]])
 
 
 def apply_stable_utbreak_final_overrides(cfg):
@@ -8129,6 +8224,7 @@ class SignalEngine(BaseEngine):
         return extra
 
     def _register_utbreakout_trailing_state(self, symbol, side, entry_price, qty, plan, cfg):
+        cfg = apply_profit_opportunity_effective_overrides(dict(cfg or {}))
         if (
             not bool(cfg.get('atr_trailing_enabled', False))
             and not bool(cfg.get('tp1_breakeven_enabled', True))
@@ -8209,8 +8305,8 @@ class SignalEngine(BaseEngine):
             float(
                 cfg.get(
                     'atr_trailing_activation_r',
-                    cfg.get('partial_take_profit_r_multiple', 1.5)
-                ) or 1.5
+                    cfg.get('partial_take_profit_r_multiple', 1.00)
+                ) or 1.00
             )
         )
         state = {
@@ -8226,7 +8322,7 @@ class SignalEngine(BaseEngine):
             'expected_tp_count': len(planned_tp_orders),
             'risk_distance': risk_distance,
             'activation_r': activation_r,
-            'trailing_atr_multiplier': max(0.1, float(cfg.get('atr_trailing_multiplier', 2.0) or 2.0)),
+            'trailing_atr_multiplier': max(0.1, float(cfg.get('atr_trailing_multiplier', 3.50) or 3.50)),
             'breakeven_enabled': bool(cfg.get('atr_trailing_breakeven_enabled', True)),
             'atr_trailing_enabled': bool(cfg.get('atr_trailing_enabled', False)),
             'tp1_breakeven_enabled': bool(cfg.get('tp1_breakeven_enabled', True)),
@@ -8235,8 +8331,8 @@ class SignalEngine(BaseEngine):
                 float(
                     cfg.get(
                         'tp1_breakeven_trigger_r',
-                        cfg.get('partial_take_profit_r_multiple', 1.5)
-                    ) or 1.5
+                        cfg.get('partial_take_profit_r_multiple', 1.00)
+                    ) or 1.00
                 )
             ),
             'tp1_breakeven_offset_r': max(0.0, float(cfg.get('tp1_breakeven_offset_r', 0.03) or 0.03)),
@@ -9546,6 +9642,7 @@ class SignalEngine(BaseEngine):
         }
 
     def _build_utbreakout_strategy_adaptation(self, symbol, side, cfg, selected_set, filter_values):
+        cfg = apply_profit_opportunity_effective_overrides(dict(cfg or {}))
         stats = self._get_utbreakout_shadow_stats(symbol, side, cfg, selected_set)
         runner_stats = self._get_utbreakout_runner_stats(symbol, side, cfg, selected_set)
         trend_health = self._build_utbreakout_trend_health(side, cfg, filter_values)
@@ -11402,7 +11499,10 @@ class SignalEngine(BaseEngine):
             return f"{_icon(state)} {_state_label(state)} {idx}. {label}: {detail}"
 
         if self.is_upbit_mode():
-            return "🚦 UT Breakout 조건 스테이터스\n\n업비트 현물 모드에서는 UTBOT_FILTERED_BREAKOUT_V1을 사용하지 않습니다."
+            return enforce_utbreakout_effective_status_contract(
+                "🚦 UT Breakout 조건 스테이터스\n\n업비트 현물 모드에서는 UTBOT_FILTERED_BREAKOUT_V1을 사용하지 않습니다.",
+                cfg,
+            )
 
         try:
             ohlcv = await asyncio.to_thread(
@@ -11413,16 +11513,25 @@ class SignalEngine(BaseEngine):
             )
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         except Exception as e:
-            return f"🚦 UT Breakout 조건 스테이터스\n\n{symbol} {entry_tf} 데이터 조회 실패: {e}"
+            return enforce_utbreakout_effective_status_contract(
+                f"🚦 UT Breakout 조건 스테이터스\n\n{symbol} {entry_tf} 데이터 조회 실패: {e}",
+                cfg,
+            )
 
         if df is None or len(df) < 5:
-            return f"🚦 UT Breakout 조건 스테이터스\n\n{symbol} {entry_tf} 데이터 부족"
+            return enforce_utbreakout_effective_status_contract(
+                f"🚦 UT Breakout 조건 스테이터스\n\n{symbol} {entry_tf} 데이터 부족",
+                cfg,
+            )
 
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         closed = df.iloc[:-1].copy().dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
         if len(closed) < 5:
-            return f"🚦 UT Breakout 조건 스테이터스\n\n{symbol} {entry_tf} 유효 데이터 부족"
+            return enforce_utbreakout_effective_status_contract(
+                f"🚦 UT Breakout 조건 스테이터스\n\n{symbol} {entry_tf} 유효 데이터 부족",
+                cfg,
+            )
 
         adaptive_decision = None
         if bool(cfg.get('adaptive_timeframe_enabled', False)):
@@ -11435,7 +11544,10 @@ class SignalEngine(BaseEngine):
                     df[col] = pd.to_numeric(df[col], errors='coerce')
                 closed = df.iloc[:-1].copy().dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
                 if len(closed) < 5:
-                    return f"🚦 UT Breakout 조건 스테이터스\n\n{symbol} {entry_tf} 유효 데이터 부족"
+                    return enforce_utbreakout_effective_status_contract(
+                        f"🚦 UT Breakout 조건 스테이터스\n\n{symbol} {entry_tf} 유효 데이터 부족",
+                        cfg,
+                    )
             except Exception as e:
                 adaptive_decision = {'selected_tf': None, 'decision': 'ERROR', 'reason': str(e), 'top3': []}
 
@@ -12077,12 +12189,10 @@ class SignalEngine(BaseEngine):
 
         text_lines = [
             "🚦 UT Breakout 조건 스테이터스",
-            f"Effective Profile: {cfg.get('effective_profile_version', 'UNKNOWN')}",
+            *build_utbreakout_effective_status_contract(cfg, daily_entries),
             *position_scan_context,
             f"Runtime Profile: {cfg.get('runtime_profile', UTBREAKOUT_RUNTIME_PROFILE)}",
             f"Effective TF: entry {entry_tf} / htf {htf_tf} / adaptive {', '.join(map(str, adaptive_tfs))}",
-            f"Effective TP2: {tp2:.2f}R",
-            f"Effective volume: base {vol_base:.2f} / 15m {vol_15m:.2f}",
             f"TF: 진입 {entry_tf} / HTF {htf_tf}",
             f"Adaptive TF: {'ON' if cfg.get('adaptive_timeframe_enabled') else 'OFF'} / {self._format_adaptive_timeframe_summary(adaptive_decision) if adaptive_decision else '고정 시간봉'}",
             f"마지막 마감봉: {_fmt_ts(decision_ts)} / close {_fmt(entry_price, 4)}",
@@ -12091,7 +12201,6 @@ class SignalEngine(BaseEngine):
             f"선택 Set: Set{selected_set.get('id')} {selected_set.get('name')} ({set_status})",
             f"선택 이유: {auto_reason or '수동 선택'}",
             entry_plan_detail,
-            take_profit_detail,
             micro_line,
             opposite_set_exit_detail,
             f"시장 레짐: {market_regime_context.get('summary') or '데이터 대기'}",
@@ -12110,7 +12219,11 @@ class SignalEngine(BaseEngine):
             "",
             f"UT 사유: {ut_reason}"
         ]
-        return "\n".join(text_lines)
+        return enforce_utbreakout_effective_status_contract(
+            "\n".join(text_lines),
+            cfg,
+            daily_entries,
+        )
 
     async def build_utbreakout_entry_analysis_text(self, symbol):
         """Read-only UT Breakout preflight report for Telegram diagnostics."""
@@ -12119,6 +12232,7 @@ class SignalEngine(BaseEngine):
         active_strategy = str(strategy_params.get('active_strategy', 'utbot') or 'utbot').lower()
         cfg = self._get_utbot_filtered_breakout_config(strategy_params)
         cfg = apply_stable_utbreak_final_overrides(cfg)
+        cfg = apply_profit_opportunity_effective_overrides(cfg)
         entry_tf = str(cfg.get('entry_timeframe', '15m') or '15m').lower()
         htf_tf = str(cfg.get('htf_timeframe', '1h') or '1h').lower()
         display_symbol = self.ctrl.format_symbol_for_display(symbol)
@@ -12270,6 +12384,7 @@ class SignalEngine(BaseEngine):
         effective_cfg['profile'] = f"set{effective_cfg['active_set_id']}"
         cfg = effective_cfg
         cfg = apply_stable_utbreak_final_overrides(cfg)
+        cfg = apply_profit_opportunity_effective_overrides(cfg)
         entry_tf = str(cfg.get('entry_timeframe', entry_tf) or entry_tf).lower()
         htf_tf = str(cfg.get('htf_timeframe', htf_tf) or htf_tf).lower()
 
@@ -12794,6 +12909,7 @@ class SignalEngine(BaseEngine):
 
         lines = [
             "UT Breakout 진입 분석",
+            *build_utbreakout_effective_status_contract(cfg, daily_entries),
             f"심볼: {display_symbol}",
             f"결론: {verdict}",
             "",
@@ -20737,10 +20853,10 @@ class SignalEngine(BaseEngine):
                     await self.ctrl.notify("⚠️ UTBOT_FILTERED_BREAKOUT_V1 리스크 계획 누락: 보호 주문 설정을 건너뜀")
                 else:
                     risk_distance = float(plan.get('risk_distance', 0.0) or 0.0)
-                    rr_multiple = float(plan.get('rr_multiple', 2.0) or 2.0)
+                    rr_multiple = float(plan.get('rr_multiple', 3.50) or 3.50)
                     if risk_distance > 0 and rr_multiple > 0:
                         fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
-                        effective_fb_cfg = dict(fb_cfg)
+                        effective_fb_cfg = apply_profit_opportunity_effective_overrides(dict(fb_cfg))
                         for key in (
                             'fixed_take_profit_enabled',
                             'partial_take_profit_enabled',
@@ -20765,13 +20881,22 @@ class SignalEngine(BaseEngine):
                         ):
                             if key in plan:
                                 effective_fb_cfg[key] = plan[key]
+                        plan_tp2_r = float(
+                            effective_fb_cfg.get('second_take_profit_r_multiple', 3.50) or 3.50
+                        )
+                        effective_fb_cfg = apply_profit_opportunity_effective_overrides(effective_fb_cfg)
+                        effective_fb_cfg['second_take_profit_r_multiple'] = max(3.50, plan_tp2_r)
+                        effective_fb_cfg['take_profit_r_multiple'] = max(
+                            3.50,
+                            float(effective_fb_cfg.get('second_take_profit_r_multiple', 3.50) or 3.50),
+                        )
                         partial_enabled = bool(effective_fb_cfg.get('partial_take_profit_enabled', True))
                         partial_ratio = (
-                            min(0.9, max(0.0, float(effective_fb_cfg.get('partial_take_profit_ratio', 0.5) or 0.5)))
+                            min(0.9, max(0.0, float(effective_fb_cfg.get('partial_take_profit_ratio', 0.20) or 0.20)))
                             if partial_enabled else 1.0
                         )
                         partial_r = (
-                            float(effective_fb_cfg.get('partial_take_profit_r_multiple', 1.5) or 1.5)
+                            float(effective_fb_cfg.get('partial_take_profit_r_multiple', 1.00) or 1.00)
                             if partial_enabled else rr_multiple
                         )
                         second_enabled = bool(effective_fb_cfg.get('second_take_profit_enabled', True))
@@ -20779,7 +20904,7 @@ class SignalEngine(BaseEngine):
                         second_ratio = (
                             min(
                                 max(0.0, 1.0 - partial_ratio),
-                                max(0.0, float(effective_fb_cfg.get('second_take_profit_ratio', 0.5) or 0.5))
+                                max(0.0, float(effective_fb_cfg.get('second_take_profit_ratio', 0.40) or 0.40))
                             )
                             if second_enabled else 0.0
                         )
@@ -24710,6 +24835,17 @@ class MainController:
         self.engines = {
             CORE_ENGINE: SignalEngine(self)
         }
+        try:
+            signal_engine = self.engines[CORE_ENGINE]
+            effective_cfg = signal_engine._get_utbot_filtered_breakout_config(
+                signal_engine.get_runtime_strategy_params()
+            )
+            logger.warning(
+                "UTBREAK_EFFECTIVE_STATUS_CONTRACT | %s",
+                " | ".join(build_utbreakout_effective_status_contract(effective_cfg)),
+            )
+        except Exception as exc:
+            logger.warning("UTBreak effective status contract startup check failed: %s", exc)
         logger.info("Core mode enabled: Signal(SMA/HMA/CAMERON) + risk controls only. Legacy engines archived.")
         self.active_engine = None
         self.tg_app = None
@@ -29812,7 +29948,14 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
             if not engine:
                 return "🚦 UT Breakout 조건 스테이터스\n\nSignal 엔진을 찾을 수 없습니다."
             symbol = await _get_utbreakout_status_symbol_async()
-            return await engine.build_utbreakout_condition_status_text(symbol)
+            text = await engine.build_utbreakout_condition_status_text(symbol)
+            cfg = engine._get_utbot_filtered_breakout_config(engine.get_runtime_strategy_params())
+            daily_entries = engine.db.get_daily_entry_count()
+            return enforce_utbreakout_effective_status_contract(
+                text,
+                cfg,
+                daily_entries,
+            )
 
         async def _send_utbreakout_condition_status(message):
             if message is None:
@@ -29823,7 +29966,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 text,
                 reply_markup=_build_utbreakout_keyboard(),
                 filename='utbreakout_condition_status.txt',
-                caption='UT Breakout 조건 스테이터스 전체 내용입니다. 현재 포지션/선택 이유/다음 스캔 후보 확인용입니다.',
+                caption=f'UT Breakout 조건 스테이터스 · {UTBREAKOUT_EFFECTIVE_PROFILE_VERSION}',
                 preview_suffix='상세 조건 스테이터스는 파일로 보냈습니다.',
             )
 
@@ -29841,7 +29984,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 text,
                 reply_markup=_build_utbreakout_keyboard(),
                 filename='utbreakout_condition_status.txt',
-                caption='UT Breakout 조건 스테이터스 전체 내용입니다. 현재 포지션/선택 이유/다음 스캔 후보 확인용입니다.',
+                caption=f'UT Breakout 조건 스테이터스 · {UTBREAKOUT_EFFECTIVE_PROFILE_VERSION}',
                 preview_suffix='상세 조건 스테이터스는 파일로 보냈습니다.',
             )
 

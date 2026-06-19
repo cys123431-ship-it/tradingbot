@@ -40,6 +40,8 @@ CORE_SET_FILTER_HARD_CODES = {
 # Profit-opportunity profile: keep core overfit guards, but stop choking entries
 # and push more of each winner toward TP2/runner capture.
 PROFIT_MAX_OVERRIDES = {
+    "effective_profile_version": "profit_opportunity_v4_tp350_runner",
+
     # Keep AUTO, but do not make the margin guard so strict that no trade appears.
     "selection_mode": "auto",
     "auto_select_enabled": True,
@@ -115,8 +117,12 @@ PROFIT_MAX_OVERRIDES = {
     "max_consecutive_losses": 5,
 
     # Profit capture: smaller TP1, larger TP2, more runner room.
+    "take_profit_r_multiple": 3.50,
+    "fixed_take_profit_enabled": True,
+    "partial_take_profit_enabled": True,
     "partial_take_profit_r_multiple": 1.00,
     "partial_take_profit_ratio": 0.20,
+    "second_take_profit_enabled": True,
     "second_take_profit_r_multiple": 3.50,
     "second_take_profit_ratio": 0.40,
     "dynamic_tp2_base_r_multiple": 3.20,

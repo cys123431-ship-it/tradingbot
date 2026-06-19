@@ -95,12 +95,50 @@ bot_process_running() {
   pgrep -f "$BOT_ENTRY" >/dev/null 2>&1
 }
 
+bot_process_count() {
+  pgrep -fc "$BOT_ENTRY" 2>/dev/null || true
+}
+
+legacy_bot_pids() {
+  ps -eo pid=,args= | awk -v launcher="$BOT_ENTRY" '
+    index($0, launcher) == 0 &&
+    $0 ~ /[Pp]ython/ &&
+    $0 ~ /(^|[[:space:]])([^[:space:]]*\/)?emas\.py([[:space:]]|$)/ {
+      print $1
+    }
+  '
+}
+
+stop_legacy_bot_processes() {
+  local pids
+  pids="$(legacy_bot_pids)"
+  if [[ -z "$pids" ]]; then
+    return 0
+  fi
+
+  echo "stopping legacy direct emas.py process(es): $(echo "$pids" | tr '\n' ' ')"
+  while read -r pid; do
+    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+  done <<< "$pids"
+  sleep 2
+
+  pids="$(legacy_bot_pids)"
+  if [[ -n "$pids" ]]; then
+    while read -r pid; do
+      [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null || true
+    done <<< "$pids"
+    sleep 1
+  fi
+}
+
 start_bot() {
   local launch_reason="${BOT_LAUNCH_REASON:-manual_start}"
   local last_heartbeat_age="${BOT_LAST_HEARTBEAT_AGE:-}"
   local last_pid="${BOT_LAST_PID:-}"
   local last_log_line="${BOT_LAST_LOG_LINE:-}"
   local prev_paused="${BOT_PREV_PAUSED:-}"
+
+  stop_legacy_bot_processes
 
   if [[ -f "$PID_FILE" ]]; then
     local old_pid
@@ -113,8 +151,14 @@ start_bot() {
   fi
 
   if bot_process_running; then
-    echo "bot already running via process scan"
-    return 0
+    local running_count
+    running_count="$(bot_process_count)"
+    if [[ "$running_count" -eq 1 ]]; then
+      echo "bot already running via process scan"
+      return 0
+    fi
+    echo "multiple launcher processes detected: count=$running_count" >&2
+    return 1
   fi
 
   if [[ ! -x "$PYTHON_BIN" ]]; then
@@ -178,11 +222,27 @@ stop_bot() {
     sleep 2
   fi
 
+  stop_legacy_bot_processes
+
   echo "bot stopped"
 }
 
 status_bot() {
+  local legacy_pids
+  legacy_pids="$(legacy_bot_pids)"
+  if [[ -n "$legacy_pids" ]]; then
+    echo "bot unhealthy: legacy direct emas.py process detected: $(echo "$legacy_pids" | tr '\n' ' ')"
+    return 1
+  fi
+
   if bot_process_running; then
+    local running_count
+    running_count="$(bot_process_count)"
+    if [[ "$running_count" -ne 1 ]]; then
+      echo "bot unhealthy: launcher process count=$running_count"
+      pgrep -af "$BOT_ENTRY" || true
+      return 1
+    fi
     pgrep -af "$BOT_ENTRY"
     local hb_status
     if hb_status="$(heartbeat_health_status)"; then
@@ -214,6 +274,8 @@ status_bot() {
 }
 
 ensure_bot() {
+  stop_legacy_bot_processes
+
   if bot_process_running; then
     local hb_status
     if hb_status="$(heartbeat_health_status)"; then

@@ -894,9 +894,22 @@ def build_strategy_quality_score(cfg, values, side):
 def build_adaptive_exit_overlay(cfg, stats, side, runner_stats=None, trend_health=None, strategy_quality=None):
     cfg = dict(cfg or {})
     side = str(side or "").lower()
-    partial_r = finite_float(cfg.get("partial_take_profit_r_multiple"), 1.5)
-    partial_ratio = finite_float(cfg.get("partial_take_profit_ratio"), 0.5)
-    trailing_mult = finite_float(cfg.get("atr_trailing_multiplier"), 2.0)
+    opportunity_profile = (
+        str(cfg.get("effective_profile_version") or "")
+        == "profit_opportunity_v4_tp350_runner"
+    )
+    partial_r = finite_float(
+        cfg.get("partial_take_profit_r_multiple"),
+        1.0 if opportunity_profile else 1.5,
+    )
+    partial_ratio = finite_float(
+        cfg.get("partial_take_profit_ratio"),
+        0.20 if opportunity_profile else 0.5,
+    )
+    trailing_mult = finite_float(
+        cfg.get("atr_trailing_multiplier"),
+        3.50 if opportunity_profile else 2.0,
+    )
     activation_r = finite_float(cfg.get("atr_trailing_activation_r"), partial_r)
     reasons = []
 
@@ -989,10 +1002,26 @@ def build_adaptive_exit_overlay(cfg, stats, side, runner_stats=None, trend_healt
         activation_r -= 0.10
         reasons.append(f"exhaustion guard {exhaustion_score:.0f}")
 
-    partial_r = clamp(partial_r, cfg.get("adaptive_exit_partial_r_min", 1.0), cfg.get("adaptive_exit_partial_r_max", 1.8))
-    partial_ratio = clamp(partial_ratio, cfg.get("adaptive_exit_ratio_min", 0.35), cfg.get("adaptive_exit_ratio_max", 0.65))
-    trailing_mult = clamp(trailing_mult, cfg.get("adaptive_exit_trailing_multiplier_min", 1.4), cfg.get("adaptive_exit_trailing_multiplier_max", 2.6))
-    activation_r = clamp(activation_r, cfg.get("adaptive_exit_activation_r_min", 1.0), cfg.get("adaptive_exit_activation_r_max", 1.8))
+    partial_r = clamp(
+        partial_r,
+        cfg.get("adaptive_exit_partial_r_min", 1.0),
+        cfg.get("adaptive_exit_partial_r_max", 1.2 if opportunity_profile else 1.8),
+    )
+    partial_ratio = clamp(
+        partial_ratio,
+        cfg.get("adaptive_exit_ratio_min", 0.20 if opportunity_profile else 0.35),
+        cfg.get("adaptive_exit_ratio_max", 0.35 if opportunity_profile else 0.65),
+    )
+    trailing_mult = clamp(
+        trailing_mult,
+        cfg.get("adaptive_exit_trailing_multiplier_min", 3.0 if opportunity_profile else 1.4),
+        cfg.get("adaptive_exit_trailing_multiplier_max", 4.0 if opportunity_profile else 2.6),
+    )
+    activation_r = clamp(
+        activation_r,
+        cfg.get("adaptive_exit_activation_r_min", 1.4 if opportunity_profile else 1.0),
+        cfg.get("adaptive_exit_activation_r_max", 1.8),
+    )
     return {
         "partial_take_profit_r_multiple": round(partial_r, 4),
         "partial_take_profit_ratio": round(partial_ratio, 4),
