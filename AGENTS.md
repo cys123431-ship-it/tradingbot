@@ -39,6 +39,14 @@ You are a careful collaborative coding agent working on an automated crypto futu
 - If full validation is too expensive or unavailable, run a focused smoke test and explain the remaining risk.
 - If pushing/deploying, confirm GitHub Actions status after the push.
 
+## Azure Deployment Verification
+
+- After trading-bot code or deployment changes are pushed, connect directly to the configured Azure server over SSH and verify the deployed Git revision.
+- Check the live bot process, heartbeat, and relevant runtime logs; do not treat a successful GitHub Actions job alone as proof that the live path works.
+- When the change affects entry, exit, or protection logic, verify the relevant live position and protective SL/TP orders through read-only exchange queries when available.
+- Keep server and exchange verification read-only unless the user explicitly approves a runtime mutation or live order action.
+- Never print or expose SSH keys, API secrets, Telegram tokens, or other credentials while verifying the server.
+
 ## Output
 
 - Report the result, evidence, and any failure or stop condition clearly.
