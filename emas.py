@@ -1690,6 +1690,8 @@ def build_default_utbot_filtered_breakout_config():
         'bias_continuation_min_adaptive_tf_score': 30.0,
         'bias_continuation_15m_min_adaptive_tf_score': 32.0,
         'utbreakout_no_position_retry_interval_sec': 20.0,
+        'utbreakout_trace_watchdog_wait_sec': 90.0,
+        'utbreakout_trace_watchdog_cooldown_sec': 180.0,
         'quality_score_v2_enabled': True,
         'quality_score_v2_block_below': 12.0,
         'quality_score_v2_reduce_below': 40.0,
@@ -4012,6 +4014,12 @@ class SignalEngine(BaseEngine):
         self.last_state_sync_candle_ts = {}
         self.last_stateful_retry_ts = {}
         self.last_utbreakout_no_position_retry_ts = {}
+        self.utbreakout_entry_trace = {}
+        self.utbreakout_last_ready_ts = {}
+        self.utbreakout_last_ready_side = {}
+        self.utbreakout_last_order_attempt_ts = {}
+        self.utbreakout_last_watchdog_report_ts = {}
+        self.utbreakout_trace_watchdog_enabled = True
         self.last_stateful_diag = {}
         self.last_stateful_diag_notice = {}
         self.last_processed_exit_candle_ts = {}
@@ -5869,6 +5877,8 @@ class SignalEngine(BaseEngine):
             'bias_continuation_min_adaptive_tf_score': 30.0,
             'bias_continuation_15m_min_adaptive_tf_score': 32.0,
             'utbreakout_no_position_retry_interval_sec': 20.0,
+            'utbreakout_trace_watchdog_wait_sec': 90.0,
+            'utbreakout_trace_watchdog_cooldown_sec': 180.0,
             'quality_score_v2_block_below': 12.0,
             'quality_score_v2_reduce_below': 40.0,
             'quality_score_v2_full_score': 82.0,
@@ -8083,6 +8093,18 @@ class SignalEngine(BaseEngine):
         stored.setdefault('plan_symbol', symbol)
         for key in self._utbreakout_plan_symbol_keys(symbol):
             self.utbot_filtered_breakout_entry_plans[key] = stored
+        self._utbreakout_trace_event(
+            symbol,
+            'PLAN_CREATED',
+            'OK',
+            side=stored.get('side'),
+            entry_price=stored.get('entry_price'),
+            qty=stored.get('qty'),
+            margin=stored.get('planned_margin', stored.get('margin_to_use')),
+            notional=stored.get('planned_notional', stored.get('target_notional')),
+            risk=stored.get('risk_usdt', stored.get('risk_amount')),
+            plan_symbol=stored.get('plan_symbol'),
+        )
 
     def _clear_utbot_filtered_breakout_entry_plan(self, symbol):
         for key in self._utbreakout_plan_symbol_keys(symbol):
@@ -8146,6 +8168,400 @@ class SignalEngine(BaseEngine):
             return plan
 
         return None
+
+    def _utbreakout_trace_key(self, symbol):
+        raw = str(symbol or '').strip()
+        if not raw:
+            return 'UNKNOWN'
+        try:
+            return self._futures_symbol_key(raw)
+        except Exception:
+            return (
+                raw.upper()
+                .replace(':USDT', '')
+                .replace(':USDC', '')
+                .replace(':BUSD', '')
+                .replace('/', '')
+                .replace('-', '')
+                .replace('_', '')
+            )
+
+    def _ensure_utbreakout_trace_state(self):
+        for name in (
+            'utbreakout_entry_trace',
+            'utbreakout_last_ready_ts',
+            'utbreakout_last_ready_side',
+            'utbreakout_last_order_attempt_ts',
+            'utbreakout_last_watchdog_report_ts',
+        ):
+            if not isinstance(getattr(self, name, None), dict):
+                setattr(self, name, {})
+        if not hasattr(self, 'utbreakout_trace_watchdog_enabled'):
+            self.utbreakout_trace_watchdog_enabled = True
+
+    def _utbreakout_trace_event(self, symbol, stage, status='INFO', **data):
+        """Record a bounded, best-effort UTBreakout entry-pipeline breadcrumb."""
+        try:
+            self._ensure_utbreakout_trace_state()
+            key = self._utbreakout_trace_key(symbol)
+            events = self.utbreakout_entry_trace.setdefault(key, [])
+            safe_data = {}
+            for data_key, value in (data or {}).items():
+                try:
+                    if isinstance(value, float):
+                        safe_data[data_key] = round(value, 8)
+                    elif isinstance(value, (str, int, bool)) or value is None:
+                        safe_data[data_key] = value
+                    else:
+                        safe_data[data_key] = str(value)
+                except Exception:
+                    safe_data[data_key] = '<unserializable>'
+            now_ts = time.time()
+            rec = {
+                'ts': now_ts,
+                'time': datetime.now(timezone(timedelta(hours=9))).strftime(
+                    '%m-%d %H:%M:%S KST'
+                ),
+                'symbol': str(symbol or ''),
+                'stage': str(stage or ''),
+                'status': str(status or 'INFO'),
+                'data': safe_data,
+            }
+            events.append(rec)
+            if len(events) > 200:
+                del events[:len(events) - 200]
+
+            stage_upper = str(stage or '').upper()
+            if stage_upper == 'STATUS_READY':
+                ready_side = str(safe_data.get('side') or '').lower()
+                prior_ready = float(self.utbreakout_last_ready_ts.get(key, 0.0) or 0.0)
+                prior_side = str(self.utbreakout_last_ready_side.get(key) or '').lower()
+                prior_order = float(
+                    self.utbreakout_last_order_attempt_ts.get(key, 0.0) or 0.0
+                )
+                if prior_ready <= 0 or prior_order >= prior_ready or ready_side != prior_side:
+                    self.utbreakout_last_ready_ts[key] = now_ts
+                self.utbreakout_last_ready_side[key] = ready_side
+            elif stage_upper == 'STATUS_NOT_READY':
+                self.utbreakout_last_ready_ts[key] = 0.0
+                self.utbreakout_last_ready_side.pop(key, None)
+            elif stage_upper == 'ORDER_ATTEMPT':
+                self.utbreakout_last_order_attempt_ts[key] = now_ts
+
+            logger.info(
+                "[UTBREAK_TRACE] %s %s %s %s",
+                key,
+                stage,
+                status,
+                safe_data,
+            )
+        except Exception:
+            logger.debug("UTBreakout trace event failed", exc_info=True)
+
+    def _utbreakout_recent_trace_events(self, symbol=None, limit=60):
+        try:
+            self._ensure_utbreakout_trace_state()
+            if symbol:
+                key = self._utbreakout_trace_key(symbol)
+                return list(self.utbreakout_entry_trace.get(key, []))[-limit:]
+            all_events = []
+            for events in self.utbreakout_entry_trace.values():
+                all_events.extend(events)
+            all_events.sort(key=lambda item: float(item.get('ts', 0.0) or 0.0))
+            return all_events[-limit:]
+        except Exception:
+            return []
+
+    async def _notify_long_text(self, text, chunk_size=3400):
+        text = str(text or '')
+        if not text:
+            return
+        chunks = [text[index:index + chunk_size] for index in range(0, len(text), chunk_size)]
+        total = len(chunks)
+        for index, chunk in enumerate(chunks, start=1):
+            prefix = f"[{index}/{total}]\n" if total > 1 else ""
+            try:
+                await self.ctrl.notify(prefix + chunk)
+            except Exception:
+                logger.exception(
+                    "Failed to send long Telegram text chunk %s/%s",
+                    index,
+                    total,
+                )
+                break
+
+    def _format_utbreakout_trace_report(self, symbol=None, full=False):
+        self._ensure_utbreakout_trace_state()
+        events = self._utbreakout_recent_trace_events(
+            symbol,
+            limit=120 if full else 40,
+        )
+        if symbol:
+            key = self._utbreakout_trace_key(symbol)
+            report_symbol = str(symbol)
+        elif events:
+            report_symbol = str(events[-1].get('symbol') or '')
+            key = self._utbreakout_trace_key(report_symbol)
+        else:
+            report_symbol = 'UNKNOWN'
+            key = 'UNKNOWN'
+
+        try:
+            cfg = self._get_utbot_filtered_breakout_config(
+                self.get_runtime_strategy_params()
+            )
+        except Exception:
+            cfg = {}
+        try:
+            diag = self._utbreakout_diag_for_symbol(report_symbol)
+        except Exception:
+            diag = {}
+        plan = {}
+        try:
+            plan = self._get_utbot_filtered_breakout_entry_plan(report_symbol) or {}
+        except Exception:
+            plan = {}
+
+        stage_last = {}
+        for event in events:
+            stage_last[str(event.get('stage', '')).upper()] = event
+
+        ready_event = stage_last.get('STATUS_READY')
+        ready_ts = float(
+            self.utbreakout_last_ready_ts.get(key, 0.0)
+            or (ready_event or {}).get('ts', 0.0)
+            or 0.0
+        )
+
+        def _last(stage):
+            return stage_last.get(stage.upper())
+
+        def _after_ready(stage):
+            event = _last(stage)
+            if not event:
+                return None
+            if ready_ts > 0 and float(event.get('ts', 0.0) or 0.0) < ready_ts:
+                return None
+            return event
+
+        important_stages = [
+            'STATUS_READY', 'COIN_SELECTED', 'SCANNER_SEEN', 'POLL_TICK',
+            'POLL_ALREADY_PROCESSED', 'NO_POSITION_RETRY',
+            'PROCESS_PRIMARY_START', 'SIGNAL_CALCULATED', 'PLAN_CREATED',
+            'ENTRY_CALL', 'ENTRY_ENTERED', 'PLAN_LOOKUP', 'BALANCE_CHECK',
+            'ENTRY_BLOCKED', 'ORDER_ATTEMPT', 'ORDER_SUCCESS', 'ORDER_FAILED',
+            'POSITION_CONFIRMED', 'NO_POSITION_AFTER_ENTRY', 'WATCHDOG',
+        ]
+        lines = [
+            "🧪 UTBreakout Entry Trace Report",
+            f"symbol_key: {key}",
+            f"현재 후보 심볼: {report_symbol}",
+            f"full: {bool(full)}",
+            "report_time: "
+            + datetime.now(timezone(timedelta(hours=9))).strftime(
+                '%Y-%m-%d %H:%M:%S KST'
+            ),
+            f"Effective Profile: {cfg.get('effective_profile_version', 'UNKNOWN')}",
+            f"조건 스테이터스 ready 여부: {bool(ready_event)}",
+            f"ready side: {((ready_event or {}).get('data') or {}).get('side') or diag.get('accepted_side') or 'none'}",
+            f"accepted_side: {diag.get('accepted_side') or 'none'}",
+            f"entry plan 생성/보관 여부: {bool(plan)}",
+            "",
+            "== Last Stage Summary ==",
+        ]
+        for stage in important_stages:
+            event = _last(stage)
+            if not event:
+                lines.append(f"- {stage}: 없음")
+                continue
+            compact = ', '.join(
+                f"{data_key}={value}"
+                for data_key, value in (event.get('data') or {}).items()
+            )
+            lines.append(
+                f"- {stage}: {event.get('time')} | {event.get('status')} | {compact}"
+            )
+
+        has_ready = ready_event is not None
+        has_process = _after_ready('PROCESS_PRIMARY_START') is not None
+        has_signal = _after_ready('SIGNAL_CALCULATED') is not None
+        plan_lookup_event = _after_ready('PLAN_LOOKUP')
+        has_plan = bool(plan) or (
+            _after_ready('PLAN_CREATED') is not None
+            or (
+                plan_lookup_event is not None
+                and str(plan_lookup_event.get('status', '')).upper() == 'FOUND'
+            )
+        )
+        has_entry_call = _after_ready('ENTRY_CALL') is not None
+        has_entry_entered = _after_ready('ENTRY_ENTERED') is not None
+        has_order_attempt = _after_ready('ORDER_ATTEMPT') is not None
+        has_order_success = _after_ready('ORDER_SUCCESS') is not None
+        order_failed = _after_ready('ORDER_FAILED')
+        has_position = _after_ready('POSITION_CONFIRMED') is not None
+        entry_blocked = _after_ready('ENTRY_BLOCKED')
+
+        lines.extend(["", "== Diagnosis =="])
+        if has_ready and not has_process and not has_entry_call:
+            diagnosis = "STATUS_READY 이후 process_primary_candle/entry 호출 전에서 끊김"
+            meaning = "조건창은 진입 가능인데 poll/scanner 실행 루프가 entry 경로로 전달하지 않음"
+        elif has_process and not has_signal:
+            diagnosis = "process_primary_candle 내부 signal 계산 전/중단"
+            meaning = "_calculate_utbot_filtered_breakout_signal 결과가 trace에 남지 않음"
+        elif has_signal and not has_entry_call:
+            diagnosis = "signal 계산 후 entry() 호출 전에서 끊김"
+            meaning = "sig 또는 live entry 분기 전달 상태 확인 필요"
+        elif has_entry_call and not has_entry_entered:
+            diagnosis = "entry() 호출 기록 후 함수 진입 기록 없음"
+            meaning = "await/call 경로 또는 호출 직전 예외 확인 필요"
+        elif has_entry_entered and not has_plan:
+            diagnosis = "entry() 내부 plan 조회 전/실패"
+            meaning = "entry plan alias 또는 생성/조회 경로 확인 필요"
+        elif entry_blocked and not has_order_attempt:
+            diagnosis = "entry() 내부 주문 전 차단"
+            meaning = str((entry_blocked.get('data') or {}).get('reason') or '차단 상세 확인 필요')
+        elif has_plan and not has_order_attempt:
+            diagnosis = "plan 확인 후 create_order 전에서 차단"
+            meaning = "잔고·수량·최소주문금액·live flag·symbol 설정 확인 필요"
+        elif order_failed:
+            diagnosis = "거래소 주문 실패"
+            meaning = str((order_failed.get('data') or {}).get('error') or 'unknown')
+        elif has_order_attempt and not has_order_success:
+            diagnosis = "ORDER_ATTEMPT 이후 결과 기록 없음"
+            meaning = "create_order 응답 또는 비동기 중단 확인 필요"
+        elif has_order_success and not has_position:
+            diagnosis = "주문 성공 후 포지션 확인 실패"
+            meaning = "체결 지연·심볼 불일치·position fetch 확인 필요"
+        elif has_position:
+            diagnosis = "포지션 확인까지 완료됨"
+            meaning = "정상 완료"
+        elif not has_ready:
+            diagnosis = "최근 trace에 STATUS_READY 없음"
+            meaning = "먼저 /utbreak status 또는 scanner 상태 확인 필요"
+        else:
+            diagnosis = "명확한 중단 지점 없음"
+            meaning = "tracefull Recent Events 확인 필요"
+        balance_event = _after_ready('BALANCE_CHECK') or _last('BALANCE_CHECK')
+        balance_data = (balance_event or {}).get('data') or {}
+        order_failed_data = (order_failed or {}).get('data') or {}
+        plan_created = _after_ready('PLAN_CREATED') is not None
+        plan_lookup = _after_ready('PLAN_LOOKUP') is not None
+        lines.extend([
+            f"suspected_break_stage: {diagnosis}",
+            f"의미: {meaning}",
+            "",
+            "== Pipeline Flags ==",
+            f"scanner_seen 여부: {_after_ready('SCANNER_SEEN') is not None}",
+            f"poll_tick 여부: {_after_ready('POLL_TICK') is not None}",
+            f"already_processed 여부: {_after_ready('POLL_ALREADY_PROCESSED') is not None}",
+            f"no_position_retry 여부: {_after_ready('NO_POSITION_RETRY') is not None}",
+            f"process_primary_candle 호출 여부: {has_process}",
+            f"signal 계산 결과: {((_after_ready('SIGNAL_CALCULATED') or {}).get('data') or {}).get('sig', '없음')}",
+            f"entry plan 생성 여부: {plan_created}",
+            f"entry plan 조회 여부: {plan_lookup}",
+            f"entry() 호출 여부: {has_entry_call}",
+            f"entry() 함수 진입 여부: {has_entry_entered}",
+            f"잔고 확인 여부: {balance_event is not None}",
+            f"order_attempt 여부: {has_order_attempt}",
+            f"order_success 여부: {has_order_success}",
+            f"order_failed 여부: {order_failed is not None}",
+            f"주문 실패 에러: {order_failed_data.get('error', '없음')}",
+            f"position_confirmed 여부: {has_position}",
+            f"no_position_after_entry 여부: {_after_ready('NO_POSITION_AFTER_ENTRY') is not None}",
+            "",
+            "== Key Runtime Values ==",
+            f"qty: {balance_data.get('qty', plan.get('qty', 'n/a'))}",
+            f"entry_price: {plan.get('entry_price', 'n/a')}",
+            f"target_notional: {balance_data.get('target_notional', plan.get('planned_notional', plan.get('target_notional', 'n/a')))}",
+            f"margin_to_use: {balance_data.get('margin_to_use', plan.get('planned_margin', plan.get('margin_to_use', 'n/a')))}",
+            f"free balance: {balance_data.get('free_balance', balance_data.get('free', 'n/a'))}",
+            f"min_notional: {balance_data.get('min_notional', 'n/a')}",
+            f"risk_usdt: {plan.get('risk_usdt', 'n/a')}",
+            "",
+            "== Recent Events ==",
+        ])
+        if not events:
+            lines.append("no trace events")
+        else:
+            for event in events[-(80 if full else 25):]:
+                compact = ', '.join(
+                    f"{data_key}={value}"
+                    for data_key, value in (event.get('data') or {}).items()
+                )
+                lines.append(
+                    f"{event.get('time')} | {event.get('symbol')} | "
+                    f"{event.get('stage')} | {event.get('status')} | {compact}"
+                )
+        lines.extend([
+            "",
+            "== Copy Guide ==",
+            "이 보고서를 그대로 ChatGPT에게 붙여넣으면 주문 파이프라인 중단 지점을 분석할 수 있습니다.",
+        ])
+        return "\n".join(lines)
+
+    async def _utbreakout_entry_watchdog_check(
+        self,
+        symbol,
+        ready_side=None,
+        source='unknown',
+    ):
+        """Report ready-without-order; diagnostic only and never places orders."""
+        try:
+            self._ensure_utbreakout_trace_state()
+            if not bool(self.utbreakout_trace_watchdog_enabled):
+                return False
+            key = self._utbreakout_trace_key(symbol)
+            now_ts = time.time()
+            ready_ts = float(self.utbreakout_last_ready_ts.get(key, 0.0) or 0.0)
+            order_ts = float(
+                self.utbreakout_last_order_attempt_ts.get(key, 0.0) or 0.0
+            )
+            report_ts = float(
+                self.utbreakout_last_watchdog_report_ts.get(key, 0.0) or 0.0
+            )
+            if ready_ts <= 0:
+                return False
+            try:
+                cfg = self._get_utbot_filtered_breakout_config(
+                    self.get_runtime_strategy_params()
+                )
+            except Exception:
+                cfg = {}
+            wait_sec = float(
+                cfg.get('utbreakout_trace_watchdog_wait_sec', 90.0) or 90.0
+            )
+            cooldown_sec = float(
+                cfg.get('utbreakout_trace_watchdog_cooldown_sec', 180.0)
+                or 180.0
+            )
+            if now_ts - ready_ts < wait_sec or order_ts >= ready_ts:
+                return False
+            if now_ts - report_ts < cooldown_sec:
+                return False
+            self.utbreakout_last_watchdog_report_ts[key] = now_ts
+            self._utbreakout_trace_event(
+                symbol,
+                'WATCHDOG',
+                'READY_BUT_NO_ORDER_ATTEMPT',
+                ready_side=ready_side or self.utbreakout_last_ready_side.get(key) or '',
+                source=source,
+                seconds_since_ready=round(now_ts - ready_ts, 1),
+                seconds_since_order_attempt=(
+                    round(now_ts - order_ts, 1) if order_ts > 0 else 'never'
+                ),
+            )
+            report = self._format_utbreakout_trace_report(symbol, full=True)
+            await self._notify_long_text(
+                "🚨 UTBreakout Watchdog\n"
+                "조건 스테이터스는 진입 가능인데 주문 시도 기록이 없습니다.\n"
+                f"symbol={symbol}\n"
+                f"ready_side={ready_side or self.utbreakout_last_ready_side.get(key) or 'unknown'}\n"
+                f"source={source}\n\n{report}"
+            )
+            return True
+        except Exception:
+            logger.exception("UTBreakout entry watchdog failed")
+            return False
 
     def _clear_utbreakout_trailing_state(self, symbol, *, finalize=False, reason='cleared', exit_price=None):
         states = getattr(self, 'utbreakout_trailing_states', None)
@@ -11727,6 +12143,14 @@ class SignalEngine(BaseEngine):
 
         plan = self._get_utbot_filtered_breakout_entry_plan(symbol, sig) or {}
         price = float(plan.get('entry_price') or df.iloc[-2]['close'])
+        self._utbreakout_trace_event(
+            symbol,
+            'ENTRY_CALL',
+            'CALLING',
+            side=sig,
+            entry_ref_price=price,
+            source='force_utbreakout_entry_from_status',
+        )
         await self.ctrl.notify(
             f"🟡 UTBreakout forceentry 시도: {symbol} {sig.upper()} price={price}"
         )
@@ -12432,6 +12856,55 @@ class SignalEngine(BaseEngine):
 
         long_ok, long_lines = await _side_conditions('long')
         short_ok, short_lines = await _side_conditions('short')
+        ready_side = (
+            candidate_side
+            if candidate_side == 'long' and long_ok
+            else candidate_side
+            if candidate_side == 'short' and short_ok
+            else 'long'
+            if long_ok
+            else 'short'
+            if short_ok
+            else None
+        )
+        if ready_side:
+            self._utbreakout_trace_event(
+                symbol,
+                'STATUS_READY',
+                'READY',
+                side=ready_side,
+                final='LONG 가능' if ready_side == 'long' else 'SHORT 가능',
+                entry_tf=cfg.get('entry_timeframe'),
+                htf=cfg.get('htf_timeframe'),
+                effective_profile=cfg.get('effective_profile_version'),
+                selected_set=(
+                    f"Set{selected_set.get('id')} {selected_set.get('name')}"
+                    if isinstance(selected_set, dict) else ''
+                ),
+                candidate_type=candidate_type,
+                decision_candle_ts=decision_ts,
+                qty=planned_qty,
+                entry_price=entry_price,
+                margin=planned_margin,
+                notional=planned_notional,
+                risk_usdt=risk_usdt,
+            )
+            await self._utbreakout_entry_watchdog_check(
+                symbol,
+                ready_side=ready_side,
+                source='status',
+            )
+        else:
+            self._utbreakout_trace_event(
+                symbol,
+                'STATUS_NOT_READY',
+                'WAIT',
+                candidate_side=candidate_side,
+                candidate_type=candidate_type,
+                long_ok=long_ok,
+                short_ok=short_ok,
+                decision_candle_ts=decision_ts,
+            )
         ut_label = f"{str(candidate_side or 'none').upper()} ({candidate_type})"
         scores = (auto_analysis or {}).get('scores') if isinstance(auto_analysis, dict) else {}
         if scores:
@@ -15841,6 +16314,17 @@ class SignalEngine(BaseEngine):
             active_strategy = strategy_params.get('active_strategy', 'utbot').lower()
             uses_stateful_primary_sync = active_strategy in STATEFUL_UT_STRATEGIES
             processed_primary_this_tick = False
+            if active_strategy in UTBREAKOUT_STRATEGIES:
+                self._utbreakout_trace_event(
+                    symbol,
+                    'POLL_TICK',
+                    'SEEN',
+                    active_strategy=active_strategy,
+                    primary_tf=primary_tf,
+                    pos_side=pos_side,
+                    current_price=current_price,
+                    candle_ts=ts_p,
+                )
 
             if ts_p > self.last_processed_candle_ts[symbol]:
                 logger.info(f"?빉截?[Primary {primary_tf}] {symbol} New Candle: {ts_p} close={last_closed_p[4]}")
@@ -15874,6 +16358,21 @@ class SignalEngine(BaseEngine):
                         self.last_state_sync_candle_ts[symbol] = ts_p
                     pos_side = await self.check_status(symbol, current_price)
 
+            if (
+                active_strategy in UTBREAKOUT_STRATEGIES
+                and not processed_primary_this_tick
+                and ts_p <= self.last_processed_candle_ts[symbol]
+            ):
+                self._utbreakout_trace_event(
+                    symbol,
+                    'POLL_ALREADY_PROCESSED',
+                    'WAIT',
+                    primary_tf=primary_tf,
+                    candle_ts=ts_p,
+                    last_processed=self.last_processed_candle_ts.get(symbol),
+                    pos_side=pos_side,
+                )
+
             # UTBreakout no-position retry:
             # If status can be entry-ready but the current candle was already processed,
             # retry the primary entry path periodically while no position exists.
@@ -15895,6 +16394,14 @@ class SignalEngine(BaseEngine):
                 )
                 if now_ts - last_retry >= retry_interval:
                     self.last_utbreakout_no_position_retry_ts[retry_key] = now_ts
+                    self._utbreakout_trace_event(
+                        symbol,
+                        'NO_POSITION_RETRY',
+                        'FORCE_PROCESS_PRIMARY',
+                        primary_tf=primary_tf,
+                        candle_ts=ts_p,
+                        retry_interval=retry_interval,
+                    )
                     logger.warning(
                         "[UTBOT_FILTERED_BREAKOUT_V1] no-position entry retry: "
                         "symbol=%s tf=%s candle=%s",
@@ -15905,6 +16412,12 @@ class SignalEngine(BaseEngine):
                     await self.process_primary_candle(symbol, k_p, force=True)
                     processed_primary_this_tick = True
                     pos_side = await self.check_status(symbol, current_price)
+
+            if active_strategy in UTBREAKOUT_STRATEGIES:
+                await self._utbreakout_entry_watchdog_check(
+                    symbol,
+                    source='poll_symbol',
+                )
 
             if active_strategy == 'utsmc':
                 live_candle_ts = int(ohlcv_p[-1][0])
@@ -17320,6 +17833,15 @@ class SignalEngine(BaseEngine):
 
         for target_coin in candidates:
             symbol = target_coin.get('exchange_symbol') or target_coin.get('normalized_symbol')
+            self._utbreakout_trace_event(
+                symbol,
+                'COIN_SELECTED',
+                'SELECTED',
+                score=target_coin.get('score'),
+                set_name=target_coin.get('auto_set_name') or target_coin.get('auto_set_id'),
+                timeframe=target_coin.get('adaptive_tf'),
+                reason=target_coin.get('auto_selection_reason') or target_coin.get('adaptive_reason'),
+            )
             cooldown_remaining, cooldown_state = self._coin_selector_cooldown_remaining(
                 symbol,
                 cfg,
@@ -17353,6 +17875,15 @@ class SignalEngine(BaseEngine):
                     scan_tf = self._get_utbot_filtered_breakout_config(scan_params).get('entry_timeframe', '15m')
                     if target_coin.get('adaptive_tf') and target_coin.get('adaptive_tf') != 'NO_TRADE':
                         scan_tf = target_coin.get('adaptive_tf')
+                    self._utbreakout_trace_event(
+                        symbol,
+                        'SCANNER_SEEN',
+                        'EVALUATING',
+                        active_strategy=active_strategy,
+                        scan_tf=scan_tf,
+                        score=target_coin.get('score'),
+                        selected_set=target_coin.get('auto_set_id'),
+                    )
 
                 ohlcv = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, scan_tf, limit=300)
                 if not ohlcv:
@@ -17443,6 +17974,15 @@ class SignalEngine(BaseEngine):
                 if not pos:
                     logger.info(f"CoinSelector locking in: {symbol} [{sig.upper()}]")
                     current_price = float(ohlcv[-1][4])
+                    if active_strategy in UTBREAKOUT_STRATEGIES:
+                        self._utbreakout_trace_event(
+                            symbol,
+                            'ENTRY_CALL',
+                            'CALLING',
+                            side=sig,
+                            entry_ref_price=current_price,
+                            source='coin_selector_scanner',
+                        )
                     await self.entry(symbol, sig, current_price)
                     post_pos = await self.get_server_position(symbol, use_cache=False)
                     if not post_pos:
@@ -17461,10 +18001,21 @@ class SignalEngine(BaseEngine):
                             sig,
                             entry_reason,
                         )
+                        self._utbreakout_trace_event(
+                            symbol,
+                            'NO_POSITION_AFTER_ENTRY',
+                            'WARN',
+                            side=sig,
+                            reason=entry_reason,
+                            source='scanner_post_entry_check',
+                        )
                         try:
                             await self.ctrl.notify(
-                                "⚠️ UTBreakout 조건 통과 후 포지션 미생성: "
-                                f"{symbol} {sig.upper()} / reason={entry_reason or 'unknown'}"
+                                "⚠️ UTBreakout 조건 통과 후 포지션 미생성\n"
+                                f"symbol={symbol}\n"
+                                f"side={sig.upper()}\n"
+                                f"reason={entry_reason or 'unknown'}\n"
+                                "자세한 분석: /utbreak tracefull"
                             )
                         except Exception:
                             logger.debug("entry failure notify skipped", exc_info=True)
@@ -17475,6 +18026,14 @@ class SignalEngine(BaseEngine):
                     self.last_processed_candle_ts[symbol] = current_ts
                     self.last_candle_time[symbol] = current_ts
                     self.last_candle_success[symbol] = True
+                    self._utbreakout_trace_event(
+                        symbol,
+                        'POSITION_CONFIRMED',
+                        'OK',
+                        side=post_pos.get('side'),
+                        contracts=post_pos.get('contracts'),
+                        source='scanner_post_entry_check',
+                    )
                     break
                 self._record_coin_selector_candidate_outcome(symbol, accepted=True, cfg=cfg)
                 logger.info(f"CoinSelector checked {symbol}: position exists ({pos.get('side')})")
@@ -19376,6 +19935,16 @@ class SignalEngine(BaseEngine):
         logger.info(f"?빉截?[Signal] Processing candle: {symbol} close={k['c']}")
         strategy_params = self.get_runtime_strategy_params()
         active_strategy = strategy_params.get('active_strategy', 'utbot').lower()
+        if active_strategy in UTBREAKOUT_STRATEGIES:
+            self._utbreakout_trace_event(
+                symbol,
+                'PROCESS_PRIMARY_START',
+                'START',
+                active_strategy=active_strategy,
+                force=force,
+                candle_close=k.get('c') if isinstance(k, dict) else None,
+                candle_ts=k.get('t') if isinstance(k, dict) else None,
+            )
 
         if await self.check_daily_loss_limit():
             logger.info("??Daily loss limit reached, skipping trade")
@@ -19420,6 +19989,23 @@ class SignalEngine(BaseEngine):
                     force and active_strategy in UTBREAKOUT_STRATEGIES
                 ),
             )
+            if active_strategy in UTBREAKOUT_STRATEGIES:
+                signal_diag = self._utbreakout_diag_for_symbol(symbol)
+                self._utbreakout_trace_event(
+                    symbol,
+                    'SIGNAL_CALCULATED',
+                    'RESULT',
+                    sig=sig,
+                    reason=(
+                        signal_diag.get('reason')
+                        or self.last_entry_reason.get(symbol)
+                        or ''
+                    ),
+                    accepted_side=signal_diag.get('accepted_side'),
+                    reject_code=signal_diag.get('reject_code'),
+                    decision_candle_ts=signal_diag.get('decision_candle_ts'),
+                    force=force,
+                )
             strategy_sig = sig
             utbot_entry_filter_eval = None
             utbot_rsi_momentum_entry_eval = None
@@ -19777,6 +20363,14 @@ class SignalEngine(BaseEngine):
                             list(getattr(self, 'utbot_filtered_breakout_entry_plans', {}).keys())[:20],
                         )
                     entry_ref_price = float(plan.get('entry_price') or k['c'])
+                    self._utbreakout_trace_event(
+                        symbol,
+                        'ENTRY_CALL',
+                        'CALLING',
+                        side=sig,
+                        entry_ref_price=entry_ref_price,
+                        source='process_primary_candle',
+                    )
                     await self.entry(symbol, sig, entry_ref_price)
                 else:
                     self._clear_utbreakout_trailing_state(symbol, finalize=True, reason='position closed while UTBreak waiting')
@@ -20724,11 +21318,33 @@ class SignalEngine(BaseEngine):
     async def entry(self, symbol, side, price):
         try:
             raw_symbol = symbol
+            trace_strategy_params = self.get_runtime_strategy_params()
+            trace_active_strategy = str(
+                trace_strategy_params.get('active_strategy', '') or ''
+            ).lower()
+            trace_utbreakout = trace_active_strategy in UTBREAKOUT_STRATEGIES
+            if trace_utbreakout:
+                self._utbreakout_trace_event(
+                    raw_symbol,
+                    'ENTRY_ENTERED',
+                    'START',
+                    side=side,
+                    price=price,
+                    active_strategy=trace_active_strategy,
+                )
             cfg = self.get_runtime_common_settings()
             cfg = apply_runtime_safety_defaults(cfg)
             try:
                 cfg = enforce_activation_stage(cfg)
             except Exception as stage_err:
+                if trace_utbreakout:
+                    self._utbreakout_trace_event(
+                        raw_symbol,
+                        'ENTRY_BLOCKED',
+                        'ACTIVATION_STAGE',
+                        side=side,
+                        reason=str(stage_err),
+                    )
                 logger.error(f"Error enforcing activation stage: {stage_err}")
                 self.last_entry_reason[symbol] = f"Activation stage blocked: {stage_err}"
                 await self.ctrl.notify(f"⚠️ **진입 차단**: activation stage 오류 ({stage_err})")
@@ -20737,6 +21353,14 @@ class SignalEngine(BaseEngine):
             try:
                 symbol = await self.ctrl._assert_symbol_tradeable_in_current_exchange_mode(symbol)
             except Exception as symbol_err:
+                if trace_utbreakout:
+                    self._utbreakout_trace_event(
+                        raw_symbol,
+                        'ENTRY_BLOCKED',
+                        'SYMBOL_PREFLIGHT',
+                        side=side,
+                        reason=str(symbol_err),
+                    )
                 logger.error(f"Exchange-mode symbol preflight blocked entry: {raw_symbol} ({symbol_err})")
                 self.last_entry_reason[raw_symbol] = f"Exchange-mode symbol blocked: {symbol_err}"
                 await self.ctrl.notify(
@@ -20748,6 +21372,14 @@ class SignalEngine(BaseEngine):
             try:
                 assert_trading_allowed(symbol, cfg)
             except Exception as pause_err:
+                if trace_utbreakout:
+                    self._utbreakout_trace_event(
+                        symbol,
+                        'ENTRY_BLOCKED',
+                        'TRADING_PAUSED',
+                        side=side,
+                        reason=str(pause_err),
+                    )
                 logger.error(f"Trading blocked by pause state: {pause_err}")
                 self.last_entry_reason[symbol] = f"Trading Blocked: {pause_err}"
                 await self.ctrl.notify(f"⚠️ **진입 차단**: {symbol} 거래 정지 상태 ({pause_err})")
@@ -20757,6 +21389,14 @@ class SignalEngine(BaseEngine):
                 try:
                     await self.preflight_live_real_check(symbol, cfg)
                 except Exception as safety_err:
+                    if trace_utbreakout:
+                        self._utbreakout_trace_event(
+                            symbol,
+                            'ENTRY_BLOCKED',
+                            'LIVE_PREFLIGHT',
+                            side=side,
+                            reason=str(safety_err),
+                        )
                     logger.error(f"Live real preflight blocked entry: {safety_err}")
                     self.last_entry_reason[symbol] = f"Live real preflight blocked: {safety_err}"
                     await self.ctrl.notify(f"⚠️ **실거래 진입 차단**: {symbol} ({safety_err})")
@@ -20833,6 +21473,14 @@ class SignalEngine(BaseEngine):
                 return result
             if not self.is_trade_direction_allowed(side):
                 block_reason = self.format_trade_direction_block_reason(side)
+                if trace_utbreakout:
+                    self._utbreakout_trace_event(
+                        symbol,
+                        'ENTRY_BLOCKED',
+                        'DIRECTION_FILTER',
+                        side=side,
+                        reason=block_reason,
+                    )
                 display_symbol = self.ctrl.format_symbol_for_display(symbol)
                 logger.info(
                     f"[Signal] Entry blocked by direction filter: "
@@ -20857,23 +21505,54 @@ class SignalEngine(BaseEngine):
                         target_sym = symbol.replace(':USDT', '').replace('/', '')
 
                         if active_sym != target_sym:
+                            if trace_utbreakout:
+                                self._utbreakout_trace_event(
+                                    symbol,
+                                    'ENTRY_BLOCKED',
+                                    'SINGLE_POSITION_LIMIT',
+                                    side=side,
+                                    reason=f"holding {p.get('symbol')}",
+                                )
                             logger.warning(f"?슟 [Single Limit] Entry blocked: Already holding {p['symbol']}")
                             await self.ctrl.notify(f"⚠️ **진입 차단**: 단일 포지션 제한 (보유 중: {p['symbol']})")
                             return
             except Exception as e:
+                if trace_utbreakout:
+                    self._utbreakout_trace_event(
+                        symbol,
+                        'ENTRY_BLOCKED',
+                        'POSITION_CHECK_ERROR',
+                        side=side,
+                        reason=str(e),
+                    )
                 logger.error(f"Single position check failed: {e}")
                 return # ?덉쟾???꾪빐 ?뺤씤 ?ㅽ뙣 ??吏꾩엯 以묐떒
 
             logger.info(f"?뱿 [Signal] Attempting {side.upper()} entry @ {price}")
 
             cfg = self.get_runtime_common_settings()
-            strategy_params = self.get_runtime_strategy_params()
-            active_strategy = strategy_params.get('active_strategy', '').lower()
+            strategy_params = trace_strategy_params
+            active_strategy = trace_active_strategy
             filtered_breakout_plan = None
             if active_strategy in UTBREAKOUT_STRATEGIES:
                 filtered_breakout_plan = (
                     self._get_utbot_filtered_breakout_entry_plan(symbol, side)
                     or self._get_utbot_filtered_breakout_entry_plan(raw_symbol, side)
+                )
+                self._utbreakout_trace_event(
+                    symbol,
+                    'PLAN_LOOKUP',
+                    'FOUND' if filtered_breakout_plan else 'MISSING',
+                    side=side,
+                    raw_symbol=raw_symbol,
+                    normalized_symbol=symbol,
+                    plan_symbol=(
+                        filtered_breakout_plan.get('plan_symbol')
+                        if filtered_breakout_plan else None
+                    ),
+                    available_plan_keys=list(
+                        getattr(self, 'utbot_filtered_breakout_entry_plans', {}).keys()
+                    )[:20],
                 )
 
             def _record_filtered_breakout_entry_block(code, reason, extra=None):
@@ -20901,6 +21580,17 @@ class SignalEngine(BaseEngine):
                     event='entry_blocked',
                     extra=payload_extra
                 )
+                trace_payload = dict(payload_extra)
+                for reserved_key in ('symbol', 'stage', 'status'):
+                    trace_payload.pop(reserved_key, None)
+                trace_payload.setdefault('side', side)
+                trace_payload.setdefault('reason', reason)
+                self._utbreakout_trace_event(
+                    symbol,
+                    'ENTRY_BLOCKED',
+                    code,
+                    **trace_payload,
+                )
 
             lev_default = 5 if active_strategy in UTBREAKOUT_STRATEGIES else 10
             lev = int(max(1.0, float(cfg.get('leverage', lev_default) or lev_default)))
@@ -20914,8 +21604,21 @@ class SignalEngine(BaseEngine):
             risk_pct = bounded_risk_pct / 100.0
 
             _, free, _ = await self.get_balance_info()
+            if active_strategy in UTBREAKOUT_STRATEGIES:
+                self._utbreakout_trace_event(
+                    symbol,
+                    'BALANCE_CHECK',
+                    'OK' if free > 0 else 'INSUFFICIENT',
+                    side=side,
+                    free_balance=free,
+                )
 
             if free <= 0:
+                _record_filtered_breakout_entry_block(
+                    'ENTRY_BLOCKED_BALANCE',
+                    f'Insufficient balance: {free}',
+                    {'free_balance': free},
+                )
                 logger.warning(f"Insufficient balance: {free}")
                 await self.ctrl.notify(f"⚠️ 잔고 부족: ${free:.2f}")
                 return
@@ -21158,6 +21861,15 @@ class SignalEngine(BaseEngine):
                 return
 
             if float(qty) <= 0:
+                _record_filtered_breakout_entry_block(
+                    'ENTRY_BLOCKED_INVALID_QTY',
+                    f'Invalid quantity: {qty}',
+                    {
+                        'free_balance': free,
+                        'target_notional': target_notional,
+                        'price': price,
+                    },
+                )
                 logger.warning(f"Invalid quantity: {qty} (free={free}, risk={risk_pct}, lev={lev}, price={price}, target_notional={target_notional})")
                 await self.ctrl.notify(f"⚠️ 주문 수량 계산 오류: {qty} (잔고: {free:.2f})")
                 return
@@ -21165,6 +21877,18 @@ class SignalEngine(BaseEngine):
             if active_strategy not in UTBREAKOUT_STRATEGIES and bounded_risk_pct != req_risk_pct:
                 await self.ctrl.notify(f"⚠️ 리스크 상한 적용: {req_risk_pct:.2f}% -> {bounded_risk_pct:.2f}%")
             if active_strategy in UTBREAKOUT_STRATEGIES:
+                self._utbreakout_trace_event(
+                    symbol,
+                    'BALANCE_CHECK',
+                    'READY',
+                    side=side,
+                    free_balance=free,
+                    qty=qty,
+                    target_notional=target_notional,
+                    margin_to_use=margin_to_use,
+                    min_notional=min_notional,
+                    leverage=lev,
+                )
                 logger.info(
                     f"[UTBOT_FILTERED_BREAKOUT_V1] Entry params: qty={qty}, lev={lev}x, "
                     f"risk_usdt={float(filtered_breakout_plan.get('risk_usdt', 0) or 0):.4f}, "
@@ -21226,6 +21950,17 @@ class SignalEngine(BaseEngine):
                 active_strategy,
             )
             if active_strategy in UTBREAKOUT_STRATEGIES:
+                self._utbreakout_trace_event(
+                    symbol,
+                    'ORDER_ATTEMPT',
+                    'SENT',
+                    side=side,
+                    qty=qty,
+                    price=price,
+                    target_notional=target_notional,
+                    margin_to_use=margin_to_use,
+                    free_balance=free,
+                )
                 try:
                     await self.ctrl.notify(
                         "🟡 UTBreakout 주문 시도: "
@@ -21244,6 +21979,17 @@ class SignalEngine(BaseEngine):
                     qty,
                 )
             except Exception as order_exc:
+                if active_strategy in UTBREAKOUT_STRATEGIES:
+                    self._utbreakout_trace_event(
+                        symbol,
+                        'ORDER_FAILED',
+                        type(order_exc).__name__,
+                        side=side,
+                        qty=qty,
+                        target_notional=target_notional,
+                        margin_to_use=margin_to_use,
+                        error=str(order_exc),
+                    )
                 logger.exception(
                     "[ORDER_FAILED] symbol=%s side=%s qty=%s notional=%.4f "
                     "margin=%.4f free=%.4f error=%s",
@@ -21289,6 +22035,16 @@ class SignalEngine(BaseEngine):
                     )
                 return
 
+            if active_strategy in UTBREAKOUT_STRATEGIES:
+                self._utbreakout_trace_event(
+                    symbol,
+                    'ORDER_SUCCESS',
+                    'ACCEPTED',
+                    side=side,
+                    qty=qty,
+                    order_id=order.get('id') if isinstance(order, dict) else None,
+                )
+
             # 罹먯떆 ?꾩쟾 臾댄슚??
             self.position_cache = None
             self.position_cache_time = 0
@@ -21301,6 +22057,16 @@ class SignalEngine(BaseEngine):
             self.position_cache = None
             verify_pos = await self.get_server_position(symbol, use_cache=False)
             actual_entry_price = float(verify_pos['entryPrice']) if verify_pos else price
+            if active_strategy in UTBREAKOUT_STRATEGIES:
+                self._utbreakout_trace_event(
+                    symbol,
+                    'POSITION_CONFIRMED' if verify_pos else 'NO_POSITION_AFTER_ENTRY',
+                    'FOUND' if verify_pos else 'MISSING',
+                    side=side,
+                    qty=qty,
+                    actual_entry_price=actual_entry_price,
+                    order_id=order.get('id') if isinstance(order, dict) else None,
+                )
             await self.ctrl.notify(
                 self._build_signal_entry_notice(
                     symbol,
@@ -21639,6 +22405,14 @@ class SignalEngine(BaseEngine):
             import traceback
             traceback.print_exc()
             if locals().get('active_strategy') in UTBREAKOUT_STRATEGIES:
+                self._utbreakout_trace_event(
+                    locals().get('symbol', locals().get('raw_symbol', 'UNKNOWN')),
+                    'ENTRY_BLOCKED',
+                    'UNHANDLED_EXCEPTION',
+                    side=locals().get('side'),
+                    reason=str(e),
+                    error_type=type(e).__name__,
+                )
                 self._clear_utbot_filtered_breakout_entry_plan(symbol)
             await self.ctrl.notify(f"❌ 진입 실패: {e}")
 
@@ -30286,6 +31060,9 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 `/utbreak auto on` / `auto off` - 코인선택 포함 AUTO 묶음 ON/OFF
 `/utbreak set 57`, `/utbreak risk 5`, `/utbreak dailytrades 3`
 `/utbreak sets`, `/utbreak why`, `/utbreak status`, `/utbreak forceentry`, `/utbreak analyze [EWY]`, `/utbreak research`, `/utbreak config`, `/utbreak configdiff`, `/utbreak log`
+`/utbreak trace [SYMBOL]` - 최근 진입 경로 요약 진단 보고서
+`/utbreak tracefull [SYMBOL]` - 최근 진입 경로 전체 진단 보고서
+`/utbreak watchdog on|off` - 진입 가능 후 주문 미시도 자동 보고 ON/OFF
 """.strip()
 
         def _format_utbreakout_config_text(diff=False):
@@ -30601,6 +31378,15 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 "⏳ UTBreak 진입 분석 조회 중입니다. 완료되면 새 메시지/파일로 보냅니다."
             )
             await _send_utbreakout_entry_analysis(getattr(query, 'message', None))
+
+        async def _send_utbreakout_trace(message, raw_symbol=None, *, full=False):
+            engine = self.engines.get('signal')
+            if not engine:
+                await message.reply_text("⚠️ trace 실패: Signal 엔진을 찾을 수 없습니다.")
+                return
+            symbol = _get_utbreakout_analysis_symbol(raw_symbol)
+            report = engine._format_utbreakout_trace_report(symbol, full=full)
+            await engine._notify_long_text(report)
 
         async def _force_utbreakout_entry(message):
             engine = self.engines.get('signal')
@@ -31198,6 +31984,37 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 return
             elif action in {'status', 'conditions', 'condition_status'}:
                 await _send_utbreakout_condition_status(u.message)
+                return
+            elif action in {'trace'}:
+                symbol_arg = args[1] if len(args) > 1 else None
+                await _send_utbreakout_trace(u.message, symbol_arg, full=False)
+                return
+            elif action in {'tracefull', 'trace_full', 'fulltrace'}:
+                symbol_arg = args[1] if len(args) > 1 else None
+                await _send_utbreakout_trace(u.message, symbol_arg, full=True)
+                return
+            elif action in {'watchdog', 'tracewatchdog', 'trace_watchdog'}:
+                engine = self.engines.get('signal')
+                if not engine:
+                    await u.message.reply_text("⚠️ watchdog 설정 실패: Signal 엔진을 찾을 수 없습니다.")
+                    return
+                mode = str(args[1]).strip().lower() if len(args) > 1 else ''
+                if mode in {'on', 'enable', '1', 'true'}:
+                    engine.utbreakout_trace_watchdog_enabled = True
+                elif mode in {'off', 'disable', '0', 'false'}:
+                    engine.utbreakout_trace_watchdog_enabled = False
+                elif mode:
+                    await u.message.reply_text(
+                        "❌ 예: `/utbreak watchdog on` 또는 `/utbreak watchdog off`",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                    return
+                state = bool(
+                    getattr(engine, 'utbreakout_trace_watchdog_enabled', True)
+                )
+                await u.message.reply_text(
+                    f"UTBreakout trace watchdog: {'ON' if state else 'OFF'}"
+                )
                 return
             elif action in {'forceentry', 'force_entry', 'retryentry', 'retry_entry'}:
                 await _force_utbreakout_entry(u.message)
