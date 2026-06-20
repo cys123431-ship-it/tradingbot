@@ -8061,6 +8061,15 @@ class SignalEngine(BaseEngine):
         except (TypeError, ValueError):
             return False
 
+    async def fetch_ohlcv_async(self, symbol, timeframe, limit=300):
+        """Fetch market data without blocking the live scanner event loop."""
+        return await asyncio.to_thread(
+            self.market_data_exchange.fetch_ohlcv,
+            symbol,
+            timeframe,
+            limit=limit,
+        )
+
     def _canonical_futures_symbol(self, symbol, quote='USDT'):
         """Return one ccxt USD-M perpetual symbol for common symbol aliases."""
         raw = str(symbol or '').strip()
