@@ -8004,16 +8004,110 @@ class SignalEngine(BaseEngine):
         except (TypeError, ValueError):
             return False
 
+    def _utbreakout_plan_symbol_keys(self, symbol):
+        raw = str(symbol or '').strip()
+        if not raw:
+            return []
+        variants = [
+            raw,
+            raw.replace(':USDT', ''),
+            raw.replace(':USDC', ''),
+            raw.replace(':BUSD', ''),
+        ]
+        if '/USDT' in raw and ':USDT' not in raw:
+            variants.append(raw + ':USDT')
+        if '/USDC' in raw and ':USDC' not in raw:
+            variants.append(raw + ':USDC')
+        if '/BUSD' in raw and ':BUSD' not in raw:
+            variants.append(raw + ':BUSD')
+
+        try:
+            variants.append('__key__:' + self._futures_symbol_key(raw))
+        except Exception:
+            variants.append(
+                '__key__:'
+                + raw.upper().replace(':USDT', '').replace('/', '').replace('-', '').replace('_', '')
+            )
+
+        out = []
+        seen = set()
+        for item in variants:
+            item = str(item or '').strip()
+            if item and item not in seen:
+                seen.add(item)
+                out.append(item)
+        return out
+
+    def _set_utbot_filtered_breakout_entry_plan(self, symbol, plan):
+        if not isinstance(plan, dict):
+            return
+        stored = dict(plan)
+        stored.setdefault('plan_symbol', symbol)
+        for key in self._utbreakout_plan_symbol_keys(symbol):
+            self.utbot_filtered_breakout_entry_plans[key] = stored
+
     def _clear_utbot_filtered_breakout_entry_plan(self, symbol):
-        self.utbot_filtered_breakout_entry_plans.pop(symbol, None)
+        for key in self._utbreakout_plan_symbol_keys(symbol):
+            self.utbot_filtered_breakout_entry_plans.pop(key, None)
+        try:
+            target_key = self._futures_symbol_key(symbol)
+        except Exception:
+            target_key = (
+                str(symbol or '').upper().replace(':USDT', '').replace('/', '').replace('-', '').replace('_', '')
+            )
+        for stored_key, plan in list(self.utbot_filtered_breakout_entry_plans.items()):
+            if not isinstance(plan, dict):
+                continue
+            plan_symbol = plan.get('plan_symbol') or plan.get('symbol') or stored_key
+            try:
+                plan_key = self._futures_symbol_key(plan_symbol)
+            except Exception:
+                plan_key = (
+                    str(plan_symbol or '').upper()
+                    .replace(':USDT', '')
+                    .replace('/', '')
+                    .replace('-', '')
+                    .replace('_', '')
+                )
+            if plan_key == target_key:
+                self.utbot_filtered_breakout_entry_plans.pop(stored_key, None)
 
     def _get_utbot_filtered_breakout_entry_plan(self, symbol, side=None):
-        plan = self.utbot_filtered_breakout_entry_plans.get(symbol)
-        if not isinstance(plan, dict):
-            return None
-        if side and str(plan.get('side', '')).lower() != str(side).lower():
-            return None
-        return plan
+        for key in self._utbreakout_plan_symbol_keys(symbol):
+            plan = self.utbot_filtered_breakout_entry_plans.get(key)
+            if isinstance(plan, dict):
+                if side and str(plan.get('side', '')).lower() != str(side).lower():
+                    continue
+                return plan
+
+        # Last-resort fallback: match by normalized futures key.
+        try:
+            target_key = self._futures_symbol_key(symbol)
+        except Exception:
+            target_key = (
+                str(symbol or '').upper().replace(':USDT', '').replace('/', '').replace('-', '').replace('_', '')
+            )
+        for stored_key, plan in list(self.utbot_filtered_breakout_entry_plans.items()):
+            if not isinstance(plan, dict):
+                continue
+            plan_symbol = plan.get('plan_symbol') or plan.get('symbol') or stored_key
+            try:
+                plan_key = self._futures_symbol_key(plan_symbol)
+            except Exception:
+                plan_key = (
+                    str(plan_symbol or '').upper()
+                    .replace(':USDT', '')
+                    .replace('/', '')
+                    .replace('-', '')
+                    .replace('_', '')
+                )
+            if plan_key != target_key:
+                continue
+            if side and str(plan.get('side', '')).lower() != str(side).lower():
+                continue
+            return plan
+
+        return None
 
     def _clear_utbreakout_trailing_state(self, symbol, *, finalize=False, reason='cleared', exit_price=None):
         states = getattr(self, 'utbreakout_trailing_states', None)
@@ -11178,7 +11272,7 @@ class SignalEngine(BaseEngine):
                 f"{plan.get('planned_margin', 0):.2f} margin / "
                 f"{plan.get('leverage', 0)}x / fee burden {plan.get('fee_burden_pct', 0):.1f}%"
             )
-        self.utbot_filtered_breakout_entry_plans[symbol] = plan
+        self._set_utbot_filtered_breakout_entry_plan(symbol, plan)
         status['risk_summary'] = (
             f"risk={plan['risk_usdt']:.4f} USDT, distance={plan['risk_distance']:.4f}, "
             f"SL={plan['stop_loss']:.4f}, TP={plan['take_profit']:.4f}, "
@@ -15568,6 +15662,29 @@ class SignalEngine(BaseEngine):
                         self.last_state_sync_candle_ts[symbol] = ts_p
                     pos_side = await self.check_status(symbol, current_price)
 
+            # UTBreakout no-position retry:
+            # If status can be entry-ready but the current candle was already processed,
+            # retry the primary entry path periodically while no position exists.
+            if (
+                active_strategy in UTBREAKOUT_STRATEGIES
+                and pos_side == 'NONE'
+                and not processed_primary_this_tick
+            ):
+                retry_interval = 20.0
+                now_ts = time.time()
+                last_retry = float(self.last_stateful_retry_ts.get(symbol, 0.0) or 0.0)
+                if now_ts - last_retry >= retry_interval:
+                    self.last_stateful_retry_ts[symbol] = now_ts
+                    logger.warning(
+                        "[UTBOT_FILTERED_BREAKOUT_V1] no-position entry retry: %s %s candle=%s",
+                        symbol,
+                        primary_tf,
+                        ts_p,
+                    )
+                    await self.process_primary_candle(symbol, k_p, force=True)
+                    processed_primary_this_tick = True
+                    pos_side = await self.check_status(symbol, current_price)
+
             if active_strategy == 'utsmc':
                 live_candle_ts = int(ohlcv_p[-1][0])
                 pos_side = await self._maybe_execute_utsmc_live_entry(
@@ -17037,6 +17154,17 @@ class SignalEngine(BaseEngine):
                     precomputed=strategy_context.get('precomputed')
                 )
 
+                if not sig and active_strategy in UTBREAKOUT_STRATEGIES:
+                    diag = self._utbreakout_diag_for_symbol(symbol)
+                    accepted_side = str((diag or {}).get('accepted_side') or '').lower()
+                    if accepted_side in {'long', 'short'}:
+                        sig = accepted_side
+                        logger.warning(
+                            "CoinSelector recovered UTBreakout accepted side from diagnostic: %s %s",
+                            symbol,
+                            sig,
+                        )
+
                 if not sig:
                     last_reason = ''
                     if isinstance(getattr(self, 'last_entry_reason', None), dict):
@@ -17106,7 +17234,19 @@ class SignalEngine(BaseEngine):
                             cfg=cfg,
                             decision_key=decision_key
                         )
-                        logger.info(f"CoinSelector scanner did not open {symbol}; continuing candidates.")
+                        logger.warning(
+                            "CoinSelector scanner entry call did not open position: %s %s reason=%s",
+                            symbol,
+                            sig,
+                            entry_reason,
+                        )
+                        try:
+                            await self.ctrl.notify(
+                                "⚠️ UTBreakout 조건 통과 후 주문 미체결: "
+                                f"{symbol} {sig.upper()} / reason={entry_reason or 'unknown'}"
+                            )
+                        except Exception:
+                            logger.debug("entry failure notify skipped", exc_info=True)
                         continue
                     self._record_coin_selector_candidate_outcome(symbol, accepted=True, cfg=cfg)
                     self.scanner_active_symbol = symbol
@@ -19382,6 +19522,14 @@ class SignalEngine(BaseEngine):
                     self.last_entry_reason[symbol] = f"ACCEPTED_ENTRY: {sig.upper()} filtered breakout -> 진입"
                     logger.info(f"[UTBOT_FILTERED_BREAKOUT_V1] New {sig.upper()} entry")
                     plan = self._get_utbot_filtered_breakout_entry_plan(symbol, sig) or {}
+                    if not plan:
+                        logger.warning(
+                            "[UTBOT_FILTERED_BREAKOUT_V1] signal exists but entry plan missing before entry(): "
+                            "%s %s keys=%s",
+                            symbol,
+                            sig,
+                            list(getattr(self, 'utbot_filtered_breakout_entry_plans', {}).keys())[:20],
+                        )
                     entry_ref_price = float(plan.get('entry_price') or k['c'])
                     await self.entry(symbol, sig, entry_ref_price)
                 else:
@@ -20461,14 +20609,20 @@ class SignalEngine(BaseEngine):
             cfg = self.get_runtime_common_settings()
             strategy_params = self.get_runtime_strategy_params()
             active_strategy = strategy_params.get('active_strategy', '').lower()
-            filtered_breakout_plan = (
-                self._get_utbot_filtered_breakout_entry_plan(symbol, side)
-                if active_strategy in UTBREAKOUT_STRATEGIES else None
-            )
+            filtered_breakout_plan = None
+            if active_strategy in UTBREAKOUT_STRATEGIES:
+                filtered_breakout_plan = (
+                    self._get_utbot_filtered_breakout_entry_plan(symbol, side)
+                    or self._get_utbot_filtered_breakout_entry_plan(raw_symbol, side)
+                )
 
             def _record_filtered_breakout_entry_block(code, reason, extra=None):
                 if active_strategy not in UTBREAKOUT_STRATEGIES:
                     return
+                entry_reason = f"{code}: {reason}"
+                self.last_entry_reason[symbol] = entry_reason
+                if raw_symbol != symbol:
+                    self.last_entry_reason[raw_symbol] = entry_reason
                 fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
                 status = {
                     'candidate_side': side,
@@ -20522,12 +20676,79 @@ class SignalEngine(BaseEngine):
             safety_buffer = 0.98
             if active_strategy in UTBREAKOUT_STRATEGIES:
                 if not filtered_breakout_plan:
+                    # Rebuild the UTBreakout plan once before giving up.
+                    try:
+                        fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+                        entry_tf = fb_cfg.get('entry_timeframe', '15m')
+                        ohlcv = await asyncio.to_thread(
+                            self.market_data_exchange.fetch_ohlcv,
+                            symbol,
+                            entry_tf,
+                            limit=300,
+                        )
+                        df = pd.DataFrame(
+                            ohlcv,
+                            columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'],
+                        )
+                        for col in ['open', 'high', 'low', 'close', 'volume']:
+                            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+                        rebuilt_sig, rebuilt_reason, _ = await self._calculate_utbot_filtered_breakout_signal(
+                            symbol,
+                            df,
+                            strategy_params,
+                        )
+                        logger.warning(
+                            "[UTBOT_FILTERED_BREAKOUT_V1] rebuilt missing entry plan: "
+                            "symbol=%s raw=%s side=%s sig=%s reason=%s",
+                            symbol,
+                            raw_symbol,
+                            side,
+                            rebuilt_sig,
+                            rebuilt_reason,
+                        )
+                        filtered_breakout_plan = (
+                            self._get_utbot_filtered_breakout_entry_plan(symbol, side)
+                            or self._get_utbot_filtered_breakout_entry_plan(raw_symbol, side)
+                        )
+                    except Exception as rebuild_exc:
+                        logger.exception(
+                            "UTBreakout missing-plan rebuild failed for %s: %s",
+                            symbol,
+                            rebuild_exc,
+                        )
+
+                if not filtered_breakout_plan:
+                    try:
+                        aliases = (
+                            self._utbreakout_plan_symbol_keys(symbol)
+                            + self._utbreakout_plan_symbol_keys(raw_symbol)
+                        )
+                    except Exception:
+                        aliases = [str(symbol), str(raw_symbol)]
                     _record_filtered_breakout_entry_block(
                         'ENTRY_BLOCKED_MISSING_PLAN',
-                        'UTBOT_FILTERED_BREAKOUT_V1 entry blocked: missing risk plan'
+                        'UTBOT_FILTERED_BREAKOUT_V1 entry blocked: missing risk plan',
+                        {
+                            'symbol': symbol,
+                            'raw_symbol': raw_symbol,
+                            'side': side,
+                            'plan_aliases': aliases,
+                            'available_plan_keys': list(
+                                getattr(self, 'utbot_filtered_breakout_entry_plans', {}).keys()
+                            )[:20],
+                        },
                     )
-                    await self.ctrl.notify("⚠️ UTBOT_FILTERED_BREAKOUT_V1 진입 계획이 없어 주문을 중단합니다.")
+                    await self.ctrl.notify(
+                        "⚠️ UTBreakout 진입 계획 누락으로 주문 중단: "
+                        f"{raw_symbol}->{symbol} {side}. aliases={aliases[:4]}"
+                    )
                     return
+                if filtered_breakout_plan.get('micro_auto'):
+                    try:
+                        lev = int(max(1.0, float(filtered_breakout_plan.get('leverage', lev) or lev)))
+                    except (TypeError, ValueError):
+                        pass
                 planned_qty = float(filtered_breakout_plan.get('qty', 0.0) or 0.0)
                 target_notional = planned_qty * float(price)
                 margin_to_use = target_notional / max(float(lev), 1e-9)
@@ -20731,10 +20952,81 @@ class SignalEngine(BaseEngine):
             await self.ensure_market_settings(symbol, leverage=lev)
 
             # await asyncio.to_thread(self.exchange.set_leverage, lev, symbol) # Redundant, handled above
-            order = await asyncio.to_thread(
-                self.exchange.create_order, symbol, 'market',
-                'buy' if side == 'long' else 'sell', qty
+            logger.warning(
+                "[ORDER_ATTEMPT] symbol=%s side=%s qty=%s price=%s notional=%.4f "
+                "margin=%.4f free=%.4f strategy=%s",
+                symbol,
+                side,
+                qty,
+                price,
+                target_notional,
+                margin_to_use,
+                free,
+                active_strategy,
             )
+            if active_strategy in UTBREAKOUT_STRATEGIES:
+                try:
+                    await self.ctrl.notify(
+                        "🟡 UTBreakout 주문 시도: "
+                        f"{symbol} {side.upper()} qty={qty} "
+                        f"notional={target_notional:.2f} margin={margin_to_use:.2f}"
+                    )
+                except Exception:
+                    logger.debug("order attempt notify skipped", exc_info=True)
+
+            try:
+                order = await asyncio.to_thread(
+                    self.exchange.create_order,
+                    symbol,
+                    'market',
+                    'buy' if side == 'long' else 'sell',
+                    qty,
+                )
+            except Exception as order_exc:
+                logger.exception(
+                    "[ORDER_FAILED] symbol=%s side=%s qty=%s notional=%.4f "
+                    "margin=%.4f free=%.4f error=%s",
+                    symbol,
+                    side,
+                    qty,
+                    target_notional,
+                    margin_to_use,
+                    free,
+                    order_exc,
+                )
+                if active_strategy in UTBREAKOUT_STRATEGIES:
+                    _record_filtered_breakout_entry_block(
+                        'ENTRY_ORDER_FAILED',
+                        f'UTBOT_FILTERED_BREAKOUT_V1 order failed: {order_exc}',
+                        {
+                            'symbol': symbol,
+                            'side': side,
+                            'qty': str(qty),
+                            'target_notional': target_notional,
+                            'margin_to_use': margin_to_use,
+                            'free_balance': free,
+                            'error_type': type(order_exc).__name__,
+                            'error': str(order_exc),
+                        },
+                    )
+                order_failure_reason = (
+                    f"ORDER_FAILED: {type(order_exc).__name__}: {order_exc}"
+                )
+                self.last_entry_reason[symbol] = order_failure_reason
+                if raw_symbol != symbol:
+                    self.last_entry_reason[raw_symbol] = order_failure_reason
+                if active_strategy in UTBREAKOUT_STRATEGIES:
+                    await self.ctrl.notify(
+                        "❌ UTBreakout 주문 실패: "
+                        f"{symbol} {side.upper()} qty={qty} / "
+                        f"{type(order_exc).__name__}: {order_exc}"
+                    )
+                else:
+                    await self.ctrl.notify(
+                        f"❌ 주문 실패: {symbol} {side.upper()} qty={qty} / "
+                        f"{type(order_exc).__name__}: {order_exc}"
+                    )
+                return
 
             # 罹먯떆 ?꾩쟾 臾댄슚??
             self.position_cache = None
