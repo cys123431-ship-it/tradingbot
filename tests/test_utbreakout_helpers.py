@@ -2430,7 +2430,7 @@ def test_utbreakout_bias_continuation_passes_recent_aligned_15m_state():
     assert result["extension_atr"] < 1.0
 
 
-def test_utbreakout_bias_continuation_rejects_stale_15m_state():
+def test_utbreakout_bias_continuation_reduces_stale_15m_state():
     engine, cfg = _bias_continuation_engine_and_cfg()
 
     result = engine._evaluate_utbreakout_bias_continuation(
@@ -2446,8 +2446,10 @@ def test_utbreakout_bias_continuation_rejects_stale_15m_state():
         {"id": 7},
     )
 
-    assert result["state"] is False
-    assert "stale" in result["summary"]
+    assert result["state"] == "reduced"
+    assert result["risk_multiplier"] == pytest.approx(0.375)
+    assert "UT signal stale REDUCE x0.75" in result["summary"]
+    assert "BLOCK: UT signal stale" not in result["summary"]
 
 
 def test_utbreakout_bias_continuation_treats_overextension_as_long_soft_filter():

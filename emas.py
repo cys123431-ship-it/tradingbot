@@ -705,6 +705,35 @@ def _apply_utbreakout_risk_multiplier_floor(value, cfg=None):
     return max(multiplier, floor)
 
 
+def _utbreakout_stale_signal_multiplier(cfg, ut_signal_age, max_signal_age):
+    """Return the configured soft-reduction multiplier for an aged UT signal."""
+    cfg = cfg or {}
+    try:
+        age = max(0.0, float(ut_signal_age))
+    except (TypeError, ValueError):
+        return 1.0
+    try:
+        max_age = max(1.0, float(max_signal_age))
+    except (TypeError, ValueError):
+        max_age = 1.0
+    if age <= max_age:
+        return 1.0
+
+    stale_ratio = age / max_age
+    if stale_ratio >= 6.0:
+        key, default = "bias_continuation_stale_reduce_6x", 0.45
+    elif stale_ratio >= 3.0:
+        key, default = "bias_continuation_stale_reduce_3x", 0.55
+    elif stale_ratio >= 1.5:
+        key, default = "bias_continuation_stale_reduce_1_5x", 0.65
+    else:
+        key, default = "bias_continuation_stale_reduce_1x", 0.75
+    try:
+        return max(0.0, min(1.0, float(cfg.get(key, default) or default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def apply_profit_opportunity_effective_overrides(cfg):
     """Single source of truth for live UTBreakout effective config.
 
@@ -745,6 +774,11 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "bias_continuation_15m_min_adx": 11.0,
         "bias_continuation_max_signal_age_candles": 10,
         "bias_continuation_15m_max_signal_age_candles": 10,
+        "bias_continuation_stale_soft_reduce_enabled": True,
+        "bias_continuation_stale_reduce_1x": 0.75,
+        "bias_continuation_stale_reduce_1_5x": 0.65,
+        "bias_continuation_stale_reduce_3x": 0.55,
+        "bias_continuation_stale_reduce_6x": 0.45,
 
         # Quality and risk floors
         "trend_health_hard_block_below": 12.0,
@@ -8821,6 +8855,7 @@ class SignalEngine(BaseEngine):
 
         reasons = []
         positives = []
+        soft_reductions = []
         selected_score = None
         signal_age_candles = None
         extension_atr = None
@@ -8849,7 +8884,19 @@ class SignalEngine(BaseEngine):
         else:
             signal_age_candles = (decision_ts - signal_ts) / max(float(tf_ms), 1.0)
             if signal_age_candles > max_age:
-                reasons.append(f"UT signal stale {signal_age_candles:.1f}>{max_age} candles")
+                if bool(cfg.get('bias_continuation_stale_soft_reduce_enabled', True)):
+                    stale_multiplier = _utbreakout_stale_signal_multiplier(
+                        cfg,
+                        signal_age_candles,
+                        max_age,
+                    )
+                    risk_multiplier *= stale_multiplier
+                    soft_reductions.append(
+                        f"UT signal stale REDUCE x{stale_multiplier:.2f}: "
+                        f"{signal_age_candles:.1f}>{max_age} candles"
+                    )
+                else:
+                    reasons.append(f"UT signal stale {signal_age_candles:.1f}>{max_age} candles")
             else:
                 positives.append(f"UT age {signal_age_candles:.1f}/{max_age} candles")
 
@@ -9077,8 +9124,11 @@ class SignalEngine(BaseEngine):
                 soft_multiplier = 0.35
             adjusted_multiplier = max(0.0, min(1.0, risk_multiplier * soft_multiplier))
             state = True if soft_multiplier >= 0.999 else 'reduced'
+            if soft_reductions:
+                state = 'reduced'
             state_label = 'PASS' if state is True else 'REDUCE'
-            summary_bits = list(positives[:5])
+            summary_bits = list(soft_reductions)
+            summary_bits.extend(positives[:5])
             if soft_failures:
                 summary_bits.append('soft misses: ' + '; '.join(soft_failures[:3]))
             return {
@@ -9092,6 +9142,7 @@ class SignalEngine(BaseEngine):
                 'reasons': soft_failures,
                 'hard_reasons': [],
                 'soft_failures': soft_failures,
+                'soft_reductions': soft_reductions,
                 'soft_pass_count': soft_pass_count,
                 'soft_total': soft_total,
                 'positives': positives,
@@ -9114,10 +9165,14 @@ class SignalEngine(BaseEngine):
             }
         return {
             'enabled': True,
-            'state': True,
+            'state': 'reduced' if soft_reductions else True,
             'risk_multiplier': round(risk_multiplier, 4),
-            'summary': f"PASS x{risk_multiplier:.2f}: " + '; '.join(positives[:5]),
+            'summary': (
+                f"{'REDUCE' if soft_reductions else 'PASS'} x{risk_multiplier:.2f}: "
+                + '; '.join([*soft_reductions, *positives][:5])
+            ),
             'reasons': [],
+            'soft_reductions': soft_reductions,
             'positives': positives,
             'signal_age_candles': signal_age_candles,
             'extension_atr': extension_atr,
@@ -12082,6 +12137,7 @@ class SignalEngine(BaseEngine):
                 ("UTBot 방향", ut_state, ut_detail_text),
             ]
             core_items.insert(1, ("방향 필터", direction_state, direction_detail))
+            bias_multiplier_status = 1.0
             if candidate_side == side and candidate_type == 'bias_state':
                 bias_status = {
                     'candidate_type': candidate_type,
@@ -12091,15 +12147,25 @@ class SignalEngine(BaseEngine):
                     'auto_selected_set_id': selected_set.get('id') if isinstance(selected_set, dict) else None,
                     'entry_timeframe': entry_tf,
                 }
-                core_items.append(
-                    self._build_utbreakout_bias_continuation_status_item(
-                        side,
-                        cfg,
-                        bias_status,
-                        filter_values,
-                        selected_set,
-                    )
+                bias_continuation_status = self._evaluate_utbreakout_bias_continuation(
+                    side,
+                    cfg,
+                    bias_status,
+                    filter_values,
+                    selected_set,
                 )
+                bias_multiplier_status = min(
+                    1.0,
+                    max(
+                        0.0,
+                        float(bias_continuation_status.get('risk_multiplier', 1.0) or 0.0),
+                    ),
+                )
+                core_items.append((
+                    "Bias continuation",
+                    bias_continuation_status.get('state'),
+                    bias_continuation_status.get('summary'),
+                ))
             core_items.append(("선택 Set 필터", set_state, set_detail))
             if side == 'short':
                 core_items.append(self._build_utbreakout_short_guard_status_item(cfg, filter_values))
@@ -12168,7 +12234,8 @@ class SignalEngine(BaseEngine):
                 set_filter_multiplier_status = 0.0
 
             raw_final_risk_multiplier_status = (
-                market_multiplier
+                bias_multiplier_status
+                * market_multiplier
                 * selector_multiplier
                 * adaptation_multiplier
                 * q2_multiplier
@@ -12193,7 +12260,8 @@ class SignalEngine(BaseEngine):
                         f"x{final_risk_multiplier_status:.3f} "
                         f"(base ${base_max_risk:.2f} -> effective ${effective_max_risk:.2f}; "
                         f"raw x{float(raw_final_risk_multiplier_status):.3f}, "
-                        f"market x{market_multiplier:.2f}, selector x{selector_multiplier:.2f}, "
+                        f"bias x{bias_multiplier_status:.2f}, market x{market_multiplier:.2f}, "
+                        f"selector x{selector_multiplier:.2f}, "
                         f"strategy x{adaptation_multiplier:.2f}, qscore x{q2_multiplier:.2f}, "
                         f"set x{set_filter_multiplier_status:.2f})"
                     ),
