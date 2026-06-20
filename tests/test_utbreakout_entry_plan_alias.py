@@ -55,6 +55,7 @@ def test_utbreakout_poll_retries_processed_candle_when_no_position():
     engine.last_processed_candle_ts = {symbol: closed_ts}
     engine.last_state_sync_candle_ts = {symbol: closed_ts}
     engine.last_stateful_retry_ts = {symbol: 0.0}
+    engine.last_utbreakout_no_position_retry_ts = {}
     engine.last_processed_exit_candle_ts = {}
     engine.last_candle_time = {}
     engine.utbreakout_adaptive_tf_state = {}
@@ -85,12 +86,154 @@ def test_utbreakout_poll_retries_processed_candle_when_no_position():
                 "strategy_params": {
                     "active_strategy": emas.UTBOT_FILTERED_BREAKOUT_STRATEGY,
                     "entry_mode": "cross",
+                    "UTBotFilteredBreakoutV1": {
+                        "utbreakout_no_position_retry_interval_sec": 7.0,
+                    },
                 }
             },
         )
     )
 
     assert calls == [(symbol, closed_ts, True)]
+    assert f"{symbol}:15m:{closed_ts}" in engine.last_utbreakout_no_position_retry_ts
+
+
+def test_utbreakout_force_reprocess_bypasses_adaptive_duplicate_guard():
+    engine = object.__new__(emas.SignalEngine)
+    engine.utbreakout_adaptive_last_decision_ts = {
+        "SOL/USDT:USDT": {"15m": 1_718_800_000_000}
+    }
+
+    skipped, last_ts = engine._utbreakout_should_skip_adaptive_decision(
+        "SOL/USDT:USDT",
+        "15m",
+        1_718_800_000_000,
+    )
+    forced_skip, forced_last_ts = engine._utbreakout_should_skip_adaptive_decision(
+        "SOL/USDT:USDT",
+        "15m",
+        1_718_800_000_000,
+        force_reprocess=True,
+    )
+
+    assert skipped is True
+    assert last_ts == 1_718_800_000_000
+    assert forced_skip is False
+    assert forced_last_ts == 1_718_800_000_000
+
+
+def test_utbreakout_strategy_signal_propagates_force_reprocess():
+    engine = object.__new__(emas.SignalEngine)
+    engine.last_entry_filter_status = {}
+    engine.last_entry_reason = {}
+    engine.vbo_states = {}
+    engine.fisher_states = {}
+    engine.cameron_states = {}
+    engine.kalman_states = {}
+    calls = []
+
+    async def calculate(symbol, df, strategy_params, *, force_reprocess=False):
+        calls.append(force_reprocess)
+        return "long", "accepted", {}
+
+    engine._calculate_utbot_filtered_breakout_signal = calculate
+
+    result = asyncio.run(
+        engine._calculate_strategy_signal(
+            "SOL/USDT:USDT",
+            None,
+            {"active_strategy": emas.UTBOT_FILTERED_BREAKOUT_STRATEGY},
+            emas.UTBOT_FILTERED_BREAKOUT_STRATEGY,
+            force_utbreakout_reprocess=True,
+        )
+    )
+
+    assert calls == [True]
+    assert result[0] == "long"
+
+
+def test_utbreakout_diagnostic_recovery_requires_current_plan_and_candle():
+    engine = object.__new__(emas.SignalEngine)
+    engine.last_utbot_filtered_breakout_status = {
+        "SOL/USDT:USDT": {
+            "accepted_side": "long",
+            "decision_candle_ts": 1_718_800_000_000,
+        }
+    }
+    engine.utbot_filtered_breakout_entry_plans = {}
+    engine.is_trade_direction_allowed = lambda side: side == "long"
+    engine._set_utbot_filtered_breakout_entry_plan(
+        "SOL/USDT:USDT",
+        {"side": "long", "entry_price": 71.74, "qty": 0.295},
+    )
+
+    assert engine._recover_utbreakout_accepted_side(
+        "SOL/USDT",
+        1_718_800_000_000,
+    ) == "long"
+    assert engine._recover_utbreakout_accepted_side(
+        "SOL/USDT",
+        1_718_800_900_000,
+    ) is None
+
+
+def test_force_utbreakout_entry_revalidates_and_uses_normal_entry_path():
+    symbol = "SOL/USDT:USDT"
+    notifications = []
+    entry_calls = []
+    position_state = {"position": None}
+
+    class Controller:
+        async def notify(self, text):
+            notifications.append(text)
+
+    class MarketDataExchange:
+        def fetch_ohlcv(self, requested_symbol, timeframe, limit=300):
+            assert requested_symbol == symbol
+            assert timeframe == "15m"
+            return [
+                [index * 900_000, 70.0, 72.0, 69.0, 71.0, 1000.0]
+                for index in range(300)
+            ]
+
+    engine = object.__new__(emas.SignalEngine)
+    engine.ctrl = Controller()
+    engine.market_data_exchange = MarketDataExchange()
+    engine.last_entry_reason = {}
+    engine.utbot_filtered_breakout_entry_plans = {}
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": emas.UTBOT_FILTERED_BREAKOUT_STRATEGY,
+    }
+    engine.get_runtime_trade_config = lambda: {
+        "strategy_params": engine.get_runtime_strategy_params(),
+    }
+    engine._get_primary_poll_timeframe = lambda requested_symbol, cfg: "15m"
+    engine.is_trade_direction_allowed = lambda side: True
+
+    async def get_server_position(requested_symbol, use_cache=False):
+        return position_state["position"]
+
+    async def calculate(requested_symbol, df, strategy_params, *, force_reprocess=False):
+        assert force_reprocess is True
+        engine._set_utbot_filtered_breakout_entry_plan(
+            requested_symbol,
+            {"side": "long", "entry_price": 71.25, "qty": 0.295},
+        )
+        return "long", "accepted", {"accepted_side": "long"}
+
+    async def entry(requested_symbol, side, price):
+        entry_calls.append((requested_symbol, side, price))
+        position_state["position"] = {"side": side, "contracts": 0.295}
+
+    engine.get_server_position = get_server_position
+    engine._calculate_utbot_filtered_breakout_signal = calculate
+    engine.entry = entry
+
+    result = asyncio.run(engine.force_utbreakout_entry_from_status(symbol))
+
+    assert entry_calls == [(symbol, "long", 71.25)]
+    assert result["status"] == "POSITION_OPENED"
+    assert any(text.startswith("🟡 UTBreakout forceentry 시도:") for text in notifications)
 
 
 def test_utbreakout_entry_reaches_market_order_and_reports_exchange_failure(monkeypatch):

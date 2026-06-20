@@ -1689,6 +1689,7 @@ def build_default_utbot_filtered_breakout_config():
         'bias_continuation_15m_max_extension_atr': 1.50,
         'bias_continuation_min_adaptive_tf_score': 30.0,
         'bias_continuation_15m_min_adaptive_tf_score': 32.0,
+        'utbreakout_no_position_retry_interval_sec': 20.0,
         'quality_score_v2_enabled': True,
         'quality_score_v2_block_below': 12.0,
         'quality_score_v2_reduce_below': 40.0,
@@ -4010,6 +4011,7 @@ class SignalEngine(BaseEngine):
         self.last_processed_candle_ts = {}
         self.last_state_sync_candle_ts = {}
         self.last_stateful_retry_ts = {}
+        self.last_utbreakout_no_position_retry_ts = {}
         self.last_stateful_diag = {}
         self.last_stateful_diag_notice = {}
         self.last_processed_exit_candle_ts = {}
@@ -4110,6 +4112,7 @@ class SignalEngine(BaseEngine):
     def reset_stateful_strategy_runtime_state(self):
         self.last_state_sync_candle_ts = {}
         self.last_stateful_retry_ts = {}
+        self.last_utbreakout_no_position_retry_ts = {}
         self.last_stateful_diag = {}
         self.last_stateful_diag_notice = {}
         self.last_entry_filter_status = {}
@@ -5865,6 +5868,7 @@ class SignalEngine(BaseEngine):
             'bias_continuation_15m_max_extension_atr': 1.50,
             'bias_continuation_min_adaptive_tf_score': 30.0,
             'bias_continuation_15m_min_adaptive_tf_score': 32.0,
+            'utbreakout_no_position_retry_interval_sec': 20.0,
             'quality_score_v2_block_below': 12.0,
             'quality_score_v2_reduce_below': 40.0,
             'quality_score_v2_full_score': 82.0,
@@ -10056,7 +10060,14 @@ class SignalEngine(BaseEngine):
         except Exception as e:
             logger.debug(f"UT breakout diagnostic log write failed: {e}")
 
-    async def _calculate_utbot_filtered_breakout_signal(self, symbol, df, strategy_params):
+    async def _calculate_utbot_filtered_breakout_signal(
+        self,
+        symbol,
+        df,
+        strategy_params,
+        *,
+        force_reprocess=False,
+    ):
         cfg = self._get_utbot_filtered_breakout_config(strategy_params)
         self._clear_utbot_filtered_breakout_entry_plan(symbol)
         active_strategy = str((strategy_params or {}).get('active_strategy', UTBOT_FILTERED_BREAKOUT_STRATEGY) or UTBOT_FILTERED_BREAKOUT_STRATEGY).lower()
@@ -10072,6 +10083,8 @@ class SignalEngine(BaseEngine):
             'utbot_atr_period': cfg.get('utbot_atr_period'),
             'use_heikin_ashi': cfg.get('use_heikin_ashi', False)
         }
+        if force_reprocess:
+            status['force_reprocess'] = True
 
         def _finish(sig, reason, code=None, *, record_failure=False, side=None):
             status['reason'] = reason
@@ -10209,15 +10222,27 @@ class SignalEngine(BaseEngine):
         status['entry_price'] = entry_price
         if bool(cfg.get('adaptive_timeframe_enabled', False)):
             tf_key = str(cfg.get('entry_timeframe', '15m') or '15m')
-            symbol_decisions = self.utbreakout_adaptive_last_decision_ts.setdefault(symbol, {})
-            last_adaptive_ts = int(symbol_decisions.get(tf_key, 0) or 0)
-            if decision_ts <= last_adaptive_ts:
+            skip_decision, last_adaptive_ts = self._utbreakout_should_skip_adaptive_decision(
+                symbol,
+                tf_key,
+                decision_ts,
+                force_reprocess=force_reprocess,
+            )
+            if skip_decision:
                 return _finish(
                     None,
                     f"ADAPTIVE_TF 대기: {tf_key} 마감봉 {decision_ts} 이미 평가 완료",
                     None
                 )
-            symbol_decisions[tf_key] = decision_ts
+            if force_reprocess and decision_ts <= last_adaptive_ts:
+                logger.warning(
+                    "[UTBOT_FILTERED_BREAKOUT_V1] force reprocessing adaptive decision: "
+                    "symbol=%s tf=%s candle=%s last=%s",
+                    symbol,
+                    tf_key,
+                    decision_ts,
+                    last_adaptive_ts,
+                )
 
         ut_sig, ut_reason, ut_detail = self._calculate_utbot_signal(
             df,
@@ -11357,6 +11382,45 @@ class SignalEngine(BaseEngine):
                 return status
         return {}
 
+    def _utbreakout_should_skip_adaptive_decision(
+        self,
+        symbol,
+        timeframe,
+        decision_ts,
+        *,
+        force_reprocess=False,
+    ):
+        decisions = self._ensure_runtime_state_container(
+            'utbreakout_adaptive_last_decision_ts'
+        )
+        symbol_decisions = decisions.setdefault(symbol, {})
+        tf_key = str(timeframe or '15m')
+        current_ts = int(decision_ts or 0)
+        last_ts = int(symbol_decisions.get(tf_key, 0) or 0)
+        if current_ts <= last_ts and not force_reprocess:
+            return True, last_ts
+        symbol_decisions[tf_key] = max(last_ts, current_ts)
+        return False, last_ts
+
+    def _recover_utbreakout_accepted_side(self, symbol, decision_ts=None):
+        diag = self._utbreakout_diag_for_symbol(symbol)
+        accepted_side = str((diag or {}).get('accepted_side') or '').lower()
+        if accepted_side not in {'long', 'short'}:
+            return None
+        if decision_ts is not None:
+            try:
+                diag_ts = int((diag or {}).get('decision_candle_ts') or 0)
+                if diag_ts <= 0 or diag_ts != int(decision_ts):
+                    return None
+            except (TypeError, ValueError):
+                return None
+        plan = self._get_utbot_filtered_breakout_entry_plan(symbol, accepted_side)
+        if not isinstance(plan, dict):
+            return None
+        if not self.is_trade_direction_allowed(accepted_side):
+            return None
+        return accepted_side
+
     def _utbreakout_status_row_for_symbol(self, symbol):
         status_data = getattr(self.ctrl, 'status_data', {}) if getattr(self, 'ctrl', None) else {}
         if not isinstance(status_data, dict):
@@ -11599,6 +11663,85 @@ class SignalEngine(BaseEngine):
         except Exception as exc:
             logger.exception("direction filter status evaluation failed")
             return 'reduced', f"방향 필터 평가 오류: {exc}", None
+
+    async def force_utbreakout_entry_from_status(self, symbol):
+        strategy_params = self.get_runtime_strategy_params()
+        active_strategy = str(
+            strategy_params.get('active_strategy', '') or ''
+        ).lower()
+        if active_strategy not in UTBREAKOUT_STRATEGIES:
+            message = f"⚠️ forceentry 실패: 현재 전략이 UTBreakout이 아닙니다 ({active_strategy or 'unknown'})"
+            await self.ctrl.notify(message)
+            return {'status': 'BLOCKED', 'reason': message}
+        if bool(getattr(self.ctrl, 'is_paused', False)):
+            message = "⚠️ forceentry 실패: 현재 거래가 PAUSE 상태입니다"
+            await self.ctrl.notify(message)
+            return {'status': 'PAUSED', 'reason': message}
+
+        existing = await self.get_server_position(symbol, use_cache=False)
+        if existing:
+            message = (
+                f"⚠️ forceentry 중단: {symbol} 포지션이 이미 있습니다 "
+                f"({str(existing.get('side') or 'unknown').upper()})"
+            )
+            await self.ctrl.notify(message)
+            return {'status': 'POSITION_EXISTS', 'reason': message}
+
+        trade_cfg = self.get_runtime_trade_config()
+        primary_tf = self._get_primary_poll_timeframe(symbol, trade_cfg)
+        ohlcv = await asyncio.to_thread(
+            self.market_data_exchange.fetch_ohlcv,
+            symbol,
+            primary_tf,
+            limit=300,
+        )
+        if not ohlcv or len(ohlcv) < 5:
+            message = f"⚠️ forceentry 실패: {symbol} {primary_tf} 데이터 부족"
+            await self.ctrl.notify(message)
+            return {'status': 'NO_DATA', 'reason': message}
+
+        df = pd.DataFrame(
+            ohlcv,
+            columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'],
+        )
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        sig, reason, status = await self._calculate_utbot_filtered_breakout_signal(
+            symbol,
+            df,
+            strategy_params,
+            force_reprocess=True,
+        )
+        if sig not in {'long', 'short'}:
+            message = (
+                f"⚠️ forceentry 실패: 현재 accepted_side 없음 / "
+                f"{symbol} / {reason or (status or {}).get('reason') or 'unknown'}"
+            )
+            await self.ctrl.notify(message)
+            return {'status': 'NO_ACCEPTED_SIDE', 'reason': message}
+        if not self.is_trade_direction_allowed(sig):
+            message = f"⚠️ forceentry 실패: {symbol} {self.format_trade_direction_block_reason(sig)}"
+            await self.ctrl.notify(message)
+            return {'status': 'DIRECTION_BLOCKED', 'reason': message}
+
+        plan = self._get_utbot_filtered_breakout_entry_plan(symbol, sig) or {}
+        price = float(plan.get('entry_price') or df.iloc[-2]['close'])
+        await self.ctrl.notify(
+            f"🟡 UTBreakout forceentry 시도: {symbol} {sig.upper()} price={price}"
+        )
+        await self.entry(symbol, sig, price)
+
+        post_pos = await self.get_server_position(symbol, use_cache=False)
+        if not post_pos:
+            entry_reason = self.last_entry_reason.get(symbol) or 'unknown'
+            message = (
+                f"⚠️ UTBreakout forceentry 후 포지션 미생성: "
+                f"{symbol} {sig.upper()} / reason={entry_reason}"
+            )
+            await self.ctrl.notify(message)
+            return {'status': 'NO_POSITION', 'reason': message, 'side': sig}
+        return {'status': 'POSITION_OPENED', 'side': sig, 'position': post_pos}
 
     async def build_utbreakout_condition_status_text(self, symbol):
         cfg = self._get_utbot_filtered_breakout_config(self.get_runtime_strategy_params())
@@ -15654,6 +15797,7 @@ class SignalEngine(BaseEngine):
             'last_processed_candle_ts',
             'last_state_sync_candle_ts',
             'last_stateful_retry_ts',
+            'last_utbreakout_no_position_retry_ts',
             'last_processed_exit_candle_ts',
             'last_candle_time',
             'utbreakout_adaptive_tf_state',
@@ -15738,13 +15882,22 @@ class SignalEngine(BaseEngine):
                 and pos_side == 'NONE'
                 and not processed_primary_this_tick
             ):
-                retry_interval = 20.0
+                filtered_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+                retry_interval = float(
+                    filtered_cfg.get('utbreakout_no_position_retry_interval_sec', 20.0)
+                    or 20.0
+                )
                 now_ts = time.time()
-                last_retry = float(self.last_stateful_retry_ts.get(symbol, 0.0) or 0.0)
+                retry_key = f"{symbol}:{primary_tf}:{ts_p}"
+                last_retry = float(
+                    self.last_utbreakout_no_position_retry_ts.get(retry_key, 0.0)
+                    or 0.0
+                )
                 if now_ts - last_retry >= retry_interval:
-                    self.last_stateful_retry_ts[symbol] = now_ts
+                    self.last_utbreakout_no_position_retry_ts[retry_key] = now_ts
                     logger.warning(
-                        "[UTBOT_FILTERED_BREAKOUT_V1] no-position entry retry: %s %s candle=%s",
+                        "[UTBOT_FILTERED_BREAKOUT_V1] no-position entry retry: "
+                        "symbol=%s tf=%s candle=%s",
                         symbol,
                         primary_tf,
                         ts_p,
@@ -17310,7 +17463,7 @@ class SignalEngine(BaseEngine):
                         )
                         try:
                             await self.ctrl.notify(
-                                "⚠️ UTBreakout 조건 통과 후 주문 미체결: "
+                                "⚠️ UTBreakout 조건 통과 후 포지션 미생성: "
                                 f"{symbol} {sig.upper()} / reason={entry_reason or 'unknown'}"
                             )
                         except Exception:
@@ -19262,7 +19415,10 @@ class SignalEngine(BaseEngine):
                 df,
                 strategy_params,
                 active_strategy,
-                precomputed=strategy_context['precomputed']
+                precomputed=strategy_context['precomputed'],
+                force_utbreakout_reprocess=bool(
+                    force and active_strategy in UTBREAKOUT_STRATEGIES
+                ),
             )
             strategy_sig = sig
             utbot_entry_filter_eval = None
@@ -19309,6 +19465,28 @@ class SignalEngine(BaseEngine):
             pos = await self.get_server_position(symbol, use_cache=False)
 
             current_side = pos['side'] if pos else 'NONE'
+            if not sig and not pos and active_strategy in UTBREAKOUT_STRATEGIES:
+                try:
+                    decision_ts = int(df.iloc[-2]['timestamp']) if len(df) >= 2 else None
+                    recovered_side = self._recover_utbreakout_accepted_side(
+                        symbol,
+                        decision_ts,
+                    )
+                    if recovered_side:
+                        sig = recovered_side
+                        is_bullish = sig == 'long'
+                        is_bearish = sig == 'short'
+                        logger.warning(
+                            "[UTBOT_FILTERED_BREAKOUT_V1] recovered accepted side from "
+                            "diagnostic: symbol=%s side=%s",
+                            symbol,
+                            sig,
+                        )
+                except Exception:
+                    logger.debug(
+                        "UTBreakout diagnostic recovery skipped",
+                        exc_info=True,
+                    )
             logger.info(f"?뱧 Current position: {current_side}, Signal: {sig or 'NONE'}, Mode: {entry_mode}")
             if active_strategy in STATEFUL_UT_STRATEGIES:
                 signal_ts = raw_ut_detail.get('signal_ts')
@@ -20370,7 +20548,16 @@ class SignalEngine(BaseEngine):
             traceback.print_exc()
             return False
 
-    async def _calculate_strategy_signal(self, symbol, df, strategy_params, active_strategy, allow_utbot_stateful=True, precomputed=None):
+    async def _calculate_strategy_signal(
+        self,
+        symbol,
+        df,
+        strategy_params,
+        active_strategy,
+        allow_utbot_stateful=True,
+        precomputed=None,
+        force_utbreakout_reprocess=False,
+    ):
         """
         ?꾨왂蹂??좏샇 怨꾩궛
 
@@ -20452,7 +20639,12 @@ class SignalEngine(BaseEngine):
             is_bearish = sig == 'short'
         elif active_strategy in UTBREAKOUT_STRATEGIES:
             entry_mode = active_strategy
-            sig, entry_reason, _ = await self._calculate_utbot_filtered_breakout_signal(symbol, df, strategy_params)
+            sig, entry_reason, _ = await self._calculate_utbot_filtered_breakout_signal(
+                symbol,
+                df,
+                strategy_params,
+                force_reprocess=force_utbreakout_reprocess,
+            )
             is_bullish = sig == 'long'
             is_bearish = sig == 'short'
 
@@ -20765,6 +20957,7 @@ class SignalEngine(BaseEngine):
                             symbol,
                             df,
                             strategy_params,
+                            force_reprocess=True,
                         )
                         logger.warning(
                             "[UTBOT_FILTERED_BREAKOUT_V1] rebuilt missing entry plan: "
@@ -30092,7 +30285,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 `/utbreak on`, `/utbreak watch BTC ETH AAPL`, `/utbreak coin EWY`, `/utbreak autoscan on BTC ETH`
 `/utbreak auto on` / `auto off` - 코인선택 포함 AUTO 묶음 ON/OFF
 `/utbreak set 57`, `/utbreak risk 5`, `/utbreak dailytrades 3`
-`/utbreak sets`, `/utbreak why`, `/utbreak status`, `/utbreak analyze [EWY]`, `/utbreak research`, `/utbreak config`, `/utbreak configdiff`, `/utbreak log`
+`/utbreak sets`, `/utbreak why`, `/utbreak status`, `/utbreak forceentry`, `/utbreak analyze [EWY]`, `/utbreak research`, `/utbreak config`, `/utbreak configdiff`, `/utbreak log`
 """.strip()
 
         def _format_utbreakout_config_text(diff=False):
@@ -30408,6 +30601,31 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 "⏳ UTBreak 진입 분석 조회 중입니다. 완료되면 새 메시지/파일로 보냅니다."
             )
             await _send_utbreakout_entry_analysis(getattr(query, 'message', None))
+
+        async def _force_utbreakout_entry(message):
+            engine = self.engines.get('signal')
+            if not engine:
+                await message.reply_text("⚠️ forceentry 실패: Signal 엔진을 찾을 수 없습니다.")
+                return
+            symbol = await _get_utbreakout_status_symbol_async()
+            await message.reply_text(
+                f"🟡 UTBreakout forceentry 재검증 시작: {symbol}\n"
+                "현재 조건을 다시 계산한 뒤 기존 entry() 안전검사를 그대로 통과시킵니다."
+            )
+            try:
+                result = await engine.force_utbreakout_entry_from_status(symbol)
+            except Exception as exc:
+                logger.exception("UTBreakout forceentry failed for %s: %s", symbol, exc)
+                await message.reply_text(
+                    f"❌ UTBreakout forceentry 오류: {symbol} / "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return
+            if result.get('status') == 'POSITION_OPENED':
+                await message.reply_text(
+                    f"✅ UTBreakout forceentry 포지션 확인: "
+                    f"{symbol} {str(result.get('side') or '').upper()}"
+                )
 
         def _format_utbreakout_sets_text(page=1):
             try:
@@ -30980,6 +31198,9 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 return
             elif action in {'status', 'conditions', 'condition_status'}:
                 await _send_utbreakout_condition_status(u.message)
+                return
+            elif action in {'forceentry', 'force_entry', 'retryentry', 'retry_entry'}:
+                await _force_utbreakout_entry(u.message)
                 return
             elif action in {'analyze', 'analysis', 'entry_analyze', 'why_entry', 'debug'}:
                 symbol_arg = args[1] if len(args) > 1 else None
