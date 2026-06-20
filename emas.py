@@ -4020,6 +4020,9 @@ class SignalEngine(BaseEngine):
         self.utbreakout_last_order_attempt_ts = {}
         self.utbreakout_last_watchdog_report_ts = {}
         self.utbreakout_trace_watchdog_enabled = True
+        self.utbreakout_last_status_symbol = None
+        self.utbreakout_last_ready_symbol = None
+        self.current_utbreakout_candidate_symbol = None
         self.last_stateful_diag = {}
         self.last_stateful_diag_notice = {}
         self.last_processed_exit_candle_ts = {}
@@ -8198,6 +8201,31 @@ class SignalEngine(BaseEngine):
                 setattr(self, name, {})
         if not hasattr(self, 'utbreakout_trace_watchdog_enabled'):
             self.utbreakout_trace_watchdog_enabled = True
+        for name in (
+            'utbreakout_last_status_symbol',
+            'utbreakout_last_ready_symbol',
+            'current_utbreakout_candidate_symbol',
+        ):
+            if not hasattr(self, name):
+                setattr(self, name, None)
+
+    def _resolve_utbreakout_trace_symbol(self, symbol_arg=None):
+        raw = str(symbol_arg or '').strip()
+        if raw:
+            if raw.lower() in {'all', '*'}:
+                return None
+            return raw
+        for attr in (
+            'utbreakout_last_status_symbol',
+            'utbreakout_last_ready_symbol',
+            'current_utbreakout_candidate_symbol',
+            'current_coin_selector_symbol',
+            'symbol',
+        ):
+            value = getattr(self, attr, None)
+            if value:
+                return value
+        return None
 
     def _utbreakout_trace_event(self, symbol, stage, status='INFO', **data):
         """Record a bounded, best-effort UTBreakout entry-pipeline breadcrumb."""
@@ -8217,13 +8245,14 @@ class SignalEngine(BaseEngine):
                 except Exception:
                     safe_data[data_key] = '<unserializable>'
             now_ts = time.time()
+            stage_text = str(stage or '').upper()
             rec = {
                 'ts': now_ts,
                 'time': datetime.now(timezone(timedelta(hours=9))).strftime(
                     '%m-%d %H:%M:%S KST'
                 ),
                 'symbol': str(symbol or ''),
-                'stage': str(stage or ''),
+                'stage': stage_text,
                 'status': str(status or 'INFO'),
                 'data': safe_data,
             }
@@ -8231,8 +8260,11 @@ class SignalEngine(BaseEngine):
             if len(events) > 200:
                 del events[:len(events) - 200]
 
-            stage_upper = str(stage or '').upper()
-            if stage_upper == 'STATUS_READY':
+            stage_upper = stage_text
+            if stage_upper == 'STATUS_EVALUATED':
+                self.utbreakout_last_status_symbol = str(symbol or '') or None
+            elif stage_upper == 'STATUS_READY':
+                self.utbreakout_last_ready_symbol = str(symbol or '') or None
                 ready_side = str(safe_data.get('side') or '').lower()
                 prior_ready = float(self.utbreakout_last_ready_ts.get(key, 0.0) or 0.0)
                 prior_side = str(self.utbreakout_last_ready_side.get(key) or '').lower()
@@ -8247,6 +8279,8 @@ class SignalEngine(BaseEngine):
                 self.utbreakout_last_ready_side.pop(key, None)
             elif stage_upper == 'ORDER_ATTEMPT':
                 self.utbreakout_last_order_attempt_ts[key] = now_ts
+            elif stage_upper == 'COIN_SELECTED':
+                self.current_utbreakout_candidate_symbol = str(symbol or '') or None
 
             logger.info(
                 "[UTBREAK_TRACE] %s %s %s %s",
@@ -8281,7 +8315,11 @@ class SignalEngine(BaseEngine):
         for index, chunk in enumerate(chunks, start=1):
             prefix = f"[{index}/{total}]\n" if total > 1 else ""
             try:
-                await self.ctrl.notify(prefix + chunk)
+                notify_plain = getattr(self.ctrl, 'notify_plain', None)
+                if callable(notify_plain):
+                    await notify_plain(prefix + chunk)
+                else:
+                    await self.ctrl.notify(prefix + chunk)
             except Exception:
                 logger.exception(
                     "Failed to send long Telegram text chunk %s/%s",
@@ -8292,6 +8330,7 @@ class SignalEngine(BaseEngine):
 
     def _format_utbreakout_trace_report(self, symbol=None, full=False):
         self._ensure_utbreakout_trace_state()
+        available_keys = sorted(self.utbreakout_entry_trace.keys())
         events = self._utbreakout_recent_trace_events(
             symbol,
             limit=120 if full else 40,
@@ -8299,12 +8338,15 @@ class SignalEngine(BaseEngine):
         if symbol:
             key = self._utbreakout_trace_key(symbol)
             report_symbol = str(symbol)
+            report_scope = 'symbol'
         elif events:
             report_symbol = str(events[-1].get('symbol') or '')
             key = self._utbreakout_trace_key(report_symbol)
+            report_scope = 'all'
         else:
             report_symbol = 'UNKNOWN'
             key = 'UNKNOWN'
+            report_scope = 'all'
 
         try:
             cfg = self._get_utbot_filtered_breakout_config(
@@ -8327,6 +8369,19 @@ class SignalEngine(BaseEngine):
             stage_last[str(event.get('stage', '')).upper()] = event
 
         ready_event = stage_last.get('STATUS_READY')
+        evaluated_event = stage_last.get('STATUS_EVALUATED')
+        status_data = (
+            (ready_event or {}).get('data')
+            or (evaluated_event or {}).get('data')
+            or {}
+        )
+        status_ready_side = (
+            status_data.get('side')
+            or status_data.get('ready_side')
+            or diag.get('accepted_side')
+            or 'none'
+        )
+        status_has_plan = bool(plan) or bool(status_data.get('qty'))
         ready_ts = float(
             self.utbreakout_last_ready_ts.get(key, 0.0)
             or (ready_event or {}).get('ts', 0.0)
@@ -8345,7 +8400,8 @@ class SignalEngine(BaseEngine):
             return event
 
         important_stages = [
-            'STATUS_READY', 'COIN_SELECTED', 'SCANNER_SEEN', 'POLL_TICK',
+            'STATUS_EVALUATED', 'STATUS_READY', 'COIN_SELECTED',
+            'SCANNER_SEEN', 'POLL_TICK',
             'POLL_ALREADY_PROCESSED', 'NO_POSITION_RETRY',
             'PROCESS_PRIMARY_START', 'SIGNAL_CALCULATED', 'PLAN_CREATED',
             'ENTRY_CALL', 'ENTRY_ENTERED', 'PLAN_LOOKUP', 'BALANCE_CHECK',
@@ -8356,6 +8412,7 @@ class SignalEngine(BaseEngine):
             "🧪 UTBreakout Entry Trace Report",
             f"symbol_key: {key}",
             f"현재 후보 심볼: {report_symbol}",
+            f"report scope: {report_scope}",
             f"full: {bool(full)}",
             "report_time: "
             + datetime.now(timezone(timedelta(hours=9))).strftime(
@@ -8363,9 +8420,15 @@ class SignalEngine(BaseEngine):
             ),
             f"Effective Profile: {cfg.get('effective_profile_version', 'UNKNOWN')}",
             f"조건 스테이터스 ready 여부: {bool(ready_event)}",
-            f"ready side: {((ready_event or {}).get('data') or {}).get('side') or diag.get('accepted_side') or 'none'}",
-            f"accepted_side: {diag.get('accepted_side') or 'none'}",
-            f"entry plan 생성/보관 여부: {bool(plan)}",
+            f"ready side: {status_ready_side}",
+            f"accepted_side: {diag.get('accepted_side') or status_ready_side}",
+            f"entry plan 생성/보관 여부: {status_has_plan}",
+            f"available trace keys: {available_keys[:30]}",
+            f"utbreakout_last_status_symbol: {getattr(self, 'utbreakout_last_status_symbol', None)}",
+            f"utbreakout_last_ready_symbol: {getattr(self, 'utbreakout_last_ready_symbol', None)}",
+            f"current_utbreakout_candidate_symbol: {getattr(self, 'current_utbreakout_candidate_symbol', None)}",
+            f"current_coin_selector_symbol: {getattr(self, 'current_coin_selector_symbol', None)}",
+            f"default symbol: {getattr(self, 'symbol', None)}",
             "",
             "== Last Stage Summary ==",
         ]
@@ -8436,8 +8499,12 @@ class SignalEngine(BaseEngine):
             diagnosis = "포지션 확인까지 완료됨"
             meaning = "정상 완료"
         elif not has_ready:
-            diagnosis = "최근 trace에 STATUS_READY 없음"
-            meaning = "먼저 /utbreak status 또는 scanner 상태 확인 필요"
+            if _last('STATUS_EVALUATED'):
+                diagnosis = "STATUS_EVALUATED 완료, STATUS_READY 없음"
+                meaning = "상태 평가는 실행됐지만 현재 LONG/SHORT 진입 가능 판정은 아님"
+            else:
+                diagnosis = "최근 trace에 STATUS_EVALUATED/STATUS_READY 없음"
+                meaning = "status hook 또는 선택한 report symbol 확인 필요"
         else:
             diagnosis = "명확한 중단 지점 없음"
             meaning = "tracefull Recent Events 확인 필요"
@@ -8470,18 +8537,26 @@ class SignalEngine(BaseEngine):
             f"no_position_after_entry 여부: {_after_ready('NO_POSITION_AFTER_ENTRY') is not None}",
             "",
             "== Key Runtime Values ==",
-            f"qty: {balance_data.get('qty', plan.get('qty', 'n/a'))}",
-            f"entry_price: {plan.get('entry_price', 'n/a')}",
-            f"target_notional: {balance_data.get('target_notional', plan.get('planned_notional', plan.get('target_notional', 'n/a')))}",
-            f"margin_to_use: {balance_data.get('margin_to_use', plan.get('planned_margin', plan.get('margin_to_use', 'n/a')))}",
+            f"qty: {balance_data.get('qty', plan.get('qty', status_data.get('qty', 'n/a')))}",
+            f"entry_price: {plan.get('entry_price', status_data.get('entry_price', 'n/a'))}",
+            f"target_notional: {balance_data.get('target_notional', plan.get('planned_notional', plan.get('target_notional', status_data.get('notional', 'n/a'))))}",
+            f"margin_to_use: {balance_data.get('margin_to_use', plan.get('planned_margin', plan.get('margin_to_use', status_data.get('margin', 'n/a'))))}",
             f"free balance: {balance_data.get('free_balance', balance_data.get('free', 'n/a'))}",
             f"min_notional: {balance_data.get('min_notional', 'n/a')}",
-            f"risk_usdt: {plan.get('risk_usdt', 'n/a')}",
+            f"risk_usdt: {plan.get('risk_usdt', status_data.get('risk_usdt', 'n/a'))}",
             "",
             "== Recent Events ==",
         ])
         if not events:
             lines.append("no trace events")
+            lines.append(
+                "available trace keys가 비어 있으면 trace hook이 실제 "
+                "status/poll/process/entry 경로에 연결되지 않은 것입니다."
+            )
+            lines.append(
+                "available trace keys에 다른 심볼 키가 있으면 trace 명령의 "
+                "기본 심볼 선택 또는 명시 심볼을 확인하세요."
+            )
         else:
             for event in events[-(80 if full else 25):]:
                 compact = ', '.join(
@@ -12007,6 +12082,20 @@ class SignalEngine(BaseEngine):
 
         coin_cfg = self._get_coin_selector_config()
         if next_candidate:
+            self.current_utbreakout_candidate_symbol = next_symbol
+            self._utbreakout_trace_event(
+                next_symbol,
+                'COIN_SELECTED',
+                'SELECTED',
+                score=next_candidate.get('score'),
+                set_name=(
+                    next_candidate.get('auto_set_name')
+                    or next_candidate.get('auto_set_id')
+                ),
+                timeframe=next_candidate.get('adaptive_tf'),
+                reason=self._format_coin_selector_candidate_reason(next_candidate),
+                source='status_scan_context',
+            )
             lines.append(f"다음 스캔 후보: {next_symbol}")
             lines.append(f"다음 후보 선택 이유: {self._format_coin_selector_candidate_reason(next_candidate)}")
         elif bool(coin_cfg.get('enabled', False)):
@@ -12171,10 +12260,27 @@ class SignalEngine(BaseEngine):
         cfg = self._get_utbot_filtered_breakout_config(self.get_runtime_strategy_params())
         cfg = apply_stable_utbreak_final_overrides(cfg)
         cfg = apply_profit_opportunity_effective_overrides(cfg)
+        self.utbreakout_last_status_symbol = symbol
         common_cfg = self.get_runtime_common_settings()
         lev = int(max(1.0, float(common_cfg.get('leverage', 5) or 5)))
         entry_tf = cfg.get('entry_timeframe', '15m')
         htf_tf = cfg.get('htf_timeframe', '1h')
+
+        def _record_status_evaluated(status='OK', **data):
+            self._utbreakout_trace_event(
+                symbol,
+                'STATUS_EVALUATED',
+                status,
+                effective_profile=cfg.get('effective_profile_version'),
+                entry_tf=cfg.get('entry_timeframe', entry_tf),
+                htf=cfg.get('htf_timeframe', htf_tf),
+                **data,
+            )
+
+        _record_status_evaluated(
+            'START',
+            phase='status_build_started',
+        )
 
         def _icon(state):
             if state is True:
@@ -12215,6 +12321,10 @@ class SignalEngine(BaseEngine):
             return f"{_icon(state)} {_state_label(state)} {idx}. {label}: {detail}"
 
         if self.is_upbit_mode():
+            _record_status_evaluated(
+                'UNSUPPORTED_MODE',
+                reason='Upbit spot mode does not use UTBreakout',
+            )
             return enforce_utbreakout_effective_status_contract(
                 "🚦 UT Breakout 조건 스테이터스\n\n업비트 현물 모드에서는 UTBOT_FILTERED_BREAKOUT_V1을 사용하지 않습니다.",
                 cfg,
@@ -12229,12 +12339,20 @@ class SignalEngine(BaseEngine):
             )
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         except Exception as e:
+            _record_status_evaluated(
+                'DATA_ERROR',
+                reason=str(e),
+            )
             return enforce_utbreakout_effective_status_contract(
                 f"🚦 UT Breakout 조건 스테이터스\n\n{symbol} {entry_tf} 데이터 조회 실패: {e}",
                 cfg,
             )
 
         if df is None or len(df) < 5:
+            _record_status_evaluated(
+                'INSUFFICIENT_DATA',
+                rows=0 if df is None else len(df),
+            )
             return enforce_utbreakout_effective_status_contract(
                 f"🚦 UT Breakout 조건 스테이터스\n\n{symbol} {entry_tf} 데이터 부족",
                 cfg,
@@ -12244,6 +12362,10 @@ class SignalEngine(BaseEngine):
             df[col] = pd.to_numeric(df[col], errors='coerce')
         closed = df.iloc[:-1].copy().dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
         if len(closed) < 5:
+            _record_status_evaluated(
+                'INSUFFICIENT_VALID_DATA',
+                rows=len(closed),
+            )
             return enforce_utbreakout_effective_status_contract(
                 f"🚦 UT Breakout 조건 스테이터스\n\n{symbol} {entry_tf} 유효 데이터 부족",
                 cfg,
@@ -12260,6 +12382,10 @@ class SignalEngine(BaseEngine):
                     df[col] = pd.to_numeric(df[col], errors='coerce')
                 closed = df.iloc[:-1].copy().dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
                 if len(closed) < 5:
+                    _record_status_evaluated(
+                        'INSUFFICIENT_ADAPTIVE_DATA',
+                        rows=len(closed),
+                    )
                     return enforce_utbreakout_effective_status_contract(
                         f"🚦 UT Breakout 조건 스테이터스\n\n{symbol} {entry_tf} 유효 데이터 부족",
                         cfg,
@@ -12867,7 +12993,31 @@ class SignalEngine(BaseEngine):
             if short_ok
             else None
         )
+        _record_status_evaluated(
+            'OK',
+            candidate_side=candidate_side,
+            candidate_type=candidate_type,
+            long_ok=long_ok,
+            short_ok=short_ok,
+            ready_side=ready_side,
+            final=(
+                f"LONG {'가능' if long_ok else '대기'} / "
+                f"SHORT {'가능' if short_ok else '대기'}"
+            ),
+            selected_set=(
+                f"Set{selected_set.get('id')} {selected_set.get('name')}"
+                if isinstance(selected_set, dict) else ''
+            ),
+            current_position='see position scan context',
+            decision_candle_ts=decision_ts,
+            qty=planned_qty,
+            entry_price=entry_price,
+            margin=planned_margin,
+            notional=planned_notional,
+            risk_usdt=risk_usdt,
+        )
         if ready_side:
+            self.utbreakout_last_ready_symbol = symbol
             self._utbreakout_trace_event(
                 symbol,
                 'STATUS_READY',
@@ -31384,7 +31534,29 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
             if not engine:
                 await message.reply_text("⚠️ trace 실패: Signal 엔진을 찾을 수 없습니다.")
                 return
-            symbol = _get_utbreakout_analysis_symbol(raw_symbol)
+            raw = str(raw_symbol or '').strip()
+            show_all = raw.lower() in {'all', '*'}
+            explicit_symbol = (
+                _get_utbreakout_analysis_symbol(raw)
+                if raw and not show_all else raw
+            )
+            symbol = engine._resolve_utbreakout_trace_symbol(explicit_symbol)
+            if not show_all and not symbol:
+                symbol = await _get_utbreakout_status_symbol_async()
+
+            if not show_all and not engine._utbreakout_recent_trace_events(symbol, limit=1):
+                try:
+                    await engine.build_utbreakout_condition_status_text(symbol)
+                except Exception:
+                    logger.debug(
+                        "UTBreakout pre-trace status build skipped for %s",
+                        symbol,
+                        exc_info=True,
+                    )
+                symbol = engine._resolve_utbreakout_trace_symbol(
+                    explicit_symbol
+                ) or symbol
+
             report = engine._format_utbreakout_trace_report(symbol, full=full)
             await engine._notify_long_text(report)
 
@@ -35477,6 +35649,20 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     raise
         except Exception as e:
             logger.error(f"Notify error: {e}")
+
+    async def notify_plain(self, text):
+        """Send diagnostics without Telegram Markdown consuming underscores."""
+        try:
+            if self._should_suppress_telegram_notice(text):
+                first_line = str(text or '').strip().splitlines()[0][:120] if str(text or '').strip() else ''
+                logger.info(f"Telegram plain notice suppressed by event-only alert mode: {first_line}")
+                return
+            cid = self.cfg.get_chat_id()
+            if not cid or not self.tg_app:
+                return
+            await self.tg_app.bot.send_message(chat_id=cid, text=text)
+        except Exception as e:
+            logger.error(f"Plain notify error: {e}")
 
 # ==============================================================================
 # Live Features Integration & Hardening Layers for UT Breakout
