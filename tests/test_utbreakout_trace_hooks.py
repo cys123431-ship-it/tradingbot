@@ -25,7 +25,7 @@ def test_trace_symbol_resolution_prefers_last_status_symbol():
     engine.symbol = "XRP/USDT"
 
     assert engine._resolve_utbreakout_trace_symbol(None) == "SOL/USDT:USDT"
-    assert engine._resolve_utbreakout_trace_symbol("ADA/USDT") == "ADA/USDT"
+    assert engine._resolve_utbreakout_trace_symbol("ADA/USDT") == "ADA/USDT:USDT"
     assert engine._resolve_utbreakout_trace_symbol("all") is None
 
 

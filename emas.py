@@ -8055,30 +8055,78 @@ class SignalEngine(BaseEngine):
         except (TypeError, ValueError):
             return False
 
+    def _canonical_futures_symbol(self, symbol, quote='USDT'):
+        """Return one ccxt USD-M perpetual symbol for common symbol aliases."""
+        raw = str(symbol or '').strip()
+        if not raw:
+            return raw
+
+        default_quote = str(quote or 'USDT').upper().strip()
+        text = raw.upper().replace(' ', '')
+        supported_quotes = ('USDT', 'USDC', 'BUSD')
+
+        if '/' in text:
+            left, right = text.split('/', 1)
+            left = left.replace('-', '').replace('_', '')
+            if ':' in right:
+                quote_part, settle_part = right.split(':', 1)
+            else:
+                quote_part, settle_part = right, right
+            quote_part = quote_part.replace('-', '').replace('_', '')
+            settle_part = settle_part.replace('-', '').replace('_', '')
+            if (
+                quote_part in supported_quotes
+                and left.endswith(quote_part)
+                and len(left) > len(quote_part)
+            ):
+                left = left[:-len(quote_part)]
+            if left and quote_part:
+                return f"{left}/{quote_part}:{settle_part or quote_part}"
+
+        compact = text
+        for settle_quote in supported_quotes:
+            compact = compact.replace(f":{settle_quote}", '')
+        compact = (
+            compact
+            .replace('/', '')
+            .replace('-', '')
+            .replace('_', '')
+            .replace(':', '')
+        )
+        for compact_quote in supported_quotes:
+            if compact.endswith(compact_quote) and len(compact) > len(compact_quote):
+                base = compact[:-len(compact_quote)]
+                return f"{base}/{compact_quote}:{compact_quote}"
+        return f"{compact}/{default_quote}:{default_quote}"
+
+    def _canonicalize_utbreakout_symbol_for_use(self, symbol, source='unknown'):
+        canonical = self._canonical_futures_symbol(symbol)
+        if str(symbol or '') != str(canonical):
+            logger.warning(
+                "[UTBREAK_SYMBOL_NORMALIZED] source=%s raw=%s canonical=%s",
+                source,
+                symbol,
+                canonical,
+            )
+        return canonical
+
     def _utbreakout_plan_symbol_keys(self, symbol):
         raw = str(symbol or '').strip()
         if not raw:
             return []
+        canonical = self._canonical_futures_symbol(raw)
         variants = [
+            canonical,
+            canonical.replace(':USDT', ''),
+            canonical.replace(':USDC', ''),
+            canonical.replace(':BUSD', ''),
             raw,
-            raw.replace(':USDT', ''),
-            raw.replace(':USDC', ''),
-            raw.replace(':BUSD', ''),
         ]
-        if '/USDT' in raw and ':USDT' not in raw:
-            variants.append(raw + ':USDT')
-        if '/USDC' in raw and ':USDC' not in raw:
-            variants.append(raw + ':USDC')
-        if '/BUSD' in raw and ':BUSD' not in raw:
-            variants.append(raw + ':BUSD')
 
         try:
-            variants.append('__key__:' + self._futures_symbol_key(raw))
+            variants.append('__key__:' + self._futures_symbol_key(canonical))
         except Exception:
-            variants.append(
-                '__key__:'
-                + raw.upper().replace(':USDT', '').replace('/', '').replace('-', '').replace('_', '')
-            )
+            variants.append('__key__:' + self._utbreakout_trace_key(canonical))
 
         out = []
         seen = set()
@@ -8093,11 +8141,14 @@ class SignalEngine(BaseEngine):
         if not isinstance(plan, dict):
             return
         stored = dict(plan)
-        stored.setdefault('plan_symbol', symbol)
-        for key in self._utbreakout_plan_symbol_keys(symbol):
+        canonical = self._canonical_futures_symbol(
+            stored.get('plan_symbol') or symbol
+        )
+        stored['plan_symbol'] = canonical
+        for key in self._utbreakout_plan_symbol_keys(canonical):
             self.utbot_filtered_breakout_entry_plans[key] = stored
         self._utbreakout_trace_event(
-            symbol,
+            canonical,
             'PLAN_CREATED',
             'OK',
             side=stored.get('side'),
@@ -8112,26 +8163,12 @@ class SignalEngine(BaseEngine):
     def _clear_utbot_filtered_breakout_entry_plan(self, symbol):
         for key in self._utbreakout_plan_symbol_keys(symbol):
             self.utbot_filtered_breakout_entry_plans.pop(key, None)
-        try:
-            target_key = self._futures_symbol_key(symbol)
-        except Exception:
-            target_key = (
-                str(symbol or '').upper().replace(':USDT', '').replace('/', '').replace('-', '').replace('_', '')
-            )
+        target_key = self._utbreakout_trace_key(symbol)
         for stored_key, plan in list(self.utbot_filtered_breakout_entry_plans.items()):
             if not isinstance(plan, dict):
                 continue
             plan_symbol = plan.get('plan_symbol') or plan.get('symbol') or stored_key
-            try:
-                plan_key = self._futures_symbol_key(plan_symbol)
-            except Exception:
-                plan_key = (
-                    str(plan_symbol or '').upper()
-                    .replace(':USDT', '')
-                    .replace('/', '')
-                    .replace('-', '')
-                    .replace('_', '')
-                )
+            plan_key = self._utbreakout_trace_key(plan_symbol)
             if plan_key == target_key:
                 self.utbot_filtered_breakout_entry_plans.pop(stored_key, None)
 
@@ -8144,26 +8181,12 @@ class SignalEngine(BaseEngine):
                 return plan
 
         # Last-resort fallback: match by normalized futures key.
-        try:
-            target_key = self._futures_symbol_key(symbol)
-        except Exception:
-            target_key = (
-                str(symbol or '').upper().replace(':USDT', '').replace('/', '').replace('-', '').replace('_', '')
-            )
+        target_key = self._utbreakout_trace_key(symbol)
         for stored_key, plan in list(self.utbot_filtered_breakout_entry_plans.items()):
             if not isinstance(plan, dict):
                 continue
             plan_symbol = plan.get('plan_symbol') or plan.get('symbol') or stored_key
-            try:
-                plan_key = self._futures_symbol_key(plan_symbol)
-            except Exception:
-                plan_key = (
-                    str(plan_symbol or '').upper()
-                    .replace(':USDT', '')
-                    .replace('/', '')
-                    .replace('-', '')
-                    .replace('_', '')
-                )
+            plan_key = self._utbreakout_trace_key(plan_symbol)
             if plan_key != target_key:
                 continue
             if side and str(plan.get('side', '')).lower() != str(side).lower():
@@ -8176,12 +8199,21 @@ class SignalEngine(BaseEngine):
         raw = str(symbol or '').strip()
         if not raw:
             return 'UNKNOWN'
+        canonical = self._canonical_futures_symbol(raw)
         try:
-            return self._futures_symbol_key(raw)
+            return self._futures_symbol_key(canonical)
         except Exception:
+            text = str(canonical or raw).upper()
+            if '/' in text:
+                base, rest = text.split('/', 1)
+                quote_part = rest.split(':', 1)[0]
+                return (
+                    (base + quote_part)
+                    .replace('-', '')
+                    .replace('_', '')
+                )
             return (
-                raw.upper()
-                .replace(':USDT', '')
+                text.replace(':USDT', '')
                 .replace(':USDC', '')
                 .replace(':BUSD', '')
                 .replace('/', '')
@@ -8214,7 +8246,7 @@ class SignalEngine(BaseEngine):
         if raw:
             if raw.lower() in {'all', '*'}:
                 return None
-            return raw
+            return self._canonical_futures_symbol(raw)
         for attr in (
             'utbreakout_last_status_symbol',
             'utbreakout_last_ready_symbol',
@@ -8224,14 +8256,15 @@ class SignalEngine(BaseEngine):
         ):
             value = getattr(self, attr, None)
             if value:
-                return value
+                return self._canonical_futures_symbol(value)
         return None
 
     def _utbreakout_trace_event(self, symbol, stage, status='INFO', **data):
         """Record a bounded, best-effort UTBreakout entry-pipeline breadcrumb."""
         try:
             self._ensure_utbreakout_trace_state()
-            key = self._utbreakout_trace_key(symbol)
+            canonical_symbol = self._canonical_futures_symbol(symbol)
+            key = self._utbreakout_trace_key(canonical_symbol)
             events = self.utbreakout_entry_trace.setdefault(key, [])
             safe_data = {}
             for data_key, value in (data or {}).items():
@@ -8251,7 +8284,7 @@ class SignalEngine(BaseEngine):
                 'time': datetime.now(timezone(timedelta(hours=9))).strftime(
                     '%m-%d %H:%M:%S KST'
                 ),
-                'symbol': str(symbol or ''),
+                'symbol': canonical_symbol,
                 'stage': stage_text,
                 'status': str(status or 'INFO'),
                 'data': safe_data,
@@ -8262,9 +8295,9 @@ class SignalEngine(BaseEngine):
 
             stage_upper = stage_text
             if stage_upper == 'STATUS_EVALUATED':
-                self.utbreakout_last_status_symbol = str(symbol or '') or None
+                self.utbreakout_last_status_symbol = canonical_symbol or None
             elif stage_upper == 'STATUS_READY':
-                self.utbreakout_last_ready_symbol = str(symbol or '') or None
+                self.utbreakout_last_ready_symbol = canonical_symbol or None
                 ready_side = str(safe_data.get('side') or '').lower()
                 prior_ready = float(self.utbreakout_last_ready_ts.get(key, 0.0) or 0.0)
                 prior_side = str(self.utbreakout_last_ready_side.get(key) or '').lower()
@@ -8280,7 +8313,7 @@ class SignalEngine(BaseEngine):
             elif stage_upper == 'ORDER_ATTEMPT':
                 self.utbreakout_last_order_attempt_ts[key] = now_ts
             elif stage_upper == 'COIN_SELECTED':
-                self.current_utbreakout_candidate_symbol = str(symbol or '') or None
+                self.current_utbreakout_candidate_symbol = canonical_symbol or None
 
             logger.info(
                 "[UTBREAK_TRACE] %s %s %s %s",
@@ -8330,6 +8363,9 @@ class SignalEngine(BaseEngine):
 
     def _format_utbreakout_trace_report(self, symbol=None, full=False):
         self._ensure_utbreakout_trace_state()
+        raw_report_symbol = str(symbol or '').strip()
+        if symbol:
+            symbol = self._canonical_futures_symbol(symbol)
         available_keys = sorted(self.utbreakout_entry_trace.keys())
         events = self._utbreakout_recent_trace_events(
             symbol,
@@ -8432,6 +8468,24 @@ class SignalEngine(BaseEngine):
             "",
             "== Last Stage Summary ==",
         ]
+        raw_upper = raw_report_symbol.upper()
+        normalized_input = bool(
+            raw_report_symbol
+            and raw_report_symbol != report_symbol
+        )
+        suspicious_input = (
+            'USDT/USDT' in raw_upper
+            or raw_upper.endswith('USDT/USDT')
+            or str(key or '').endswith('USDTUSDT')
+        )
+        if normalized_input or suspicious_input:
+            lines[0:0] = [
+                "🚨 Symbol Normalization Notice",
+                f"input symbol: {raw_report_symbol}",
+                f"canonical symbol: {report_symbol}",
+                f"canonical key: {key}",
+                "",
+            ]
         for stage in important_stages:
             event = _last(stage)
             if not event:
@@ -12082,6 +12136,10 @@ class SignalEngine(BaseEngine):
 
         coin_cfg = self._get_coin_selector_config()
         if next_candidate:
+            next_symbol = self._canonicalize_utbreakout_symbol_for_use(
+                next_symbol,
+                source='status_next_candidate',
+            )
             self.current_utbreakout_candidate_symbol = next_symbol
             self._utbreakout_trace_event(
                 next_symbol,
@@ -12170,6 +12228,10 @@ class SignalEngine(BaseEngine):
             return 'reduced', f"방향 필터 평가 오류: {exc}", None
 
     async def force_utbreakout_entry_from_status(self, symbol):
+        symbol = self._canonicalize_utbreakout_symbol_for_use(
+            symbol,
+            source='forceentry',
+        )
         strategy_params = self.get_runtime_strategy_params()
         active_strategy = str(
             strategy_params.get('active_strategy', '') or ''
@@ -12257,6 +12319,11 @@ class SignalEngine(BaseEngine):
         return {'status': 'POSITION_OPENED', 'side': sig, 'position': post_pos}
 
     async def build_utbreakout_condition_status_text(self, symbol):
+        if not self.is_upbit_mode():
+            symbol = self._canonicalize_utbreakout_symbol_for_use(
+                symbol,
+                source='status',
+            )
         cfg = self._get_utbot_filtered_breakout_config(self.get_runtime_strategy_params())
         cfg = apply_stable_utbreak_final_overrides(cfg)
         cfg = apply_profit_opportunity_effective_overrides(cfg)
@@ -16339,6 +16406,27 @@ class SignalEngine(BaseEngine):
                 # Merge: Config + Chat Manual + Positions
                 target_symbols = self.active_symbols | config_symbols | active_position_symbols
 
+            strategy_params = cfg.get('strategy_params', {})
+            active_strategy = str(
+                strategy_params.get('active_strategy', 'utbot') or 'utbot'
+            ).lower()
+            if active_strategy in UTBREAKOUT_STRATEGIES and not self.is_upbit_mode():
+                target_symbols = {
+                    self._canonicalize_utbreakout_symbol_for_use(
+                        target_symbol,
+                        source='poll_tick_target',
+                    )
+                    for target_symbol in target_symbols
+                    if target_symbol
+                }
+                if self.scanner_active_symbol:
+                    self.scanner_active_symbol = (
+                        self._canonicalize_utbreakout_symbol_for_use(
+                            self.scanner_active_symbol,
+                            source='poll_tick_scanner_active',
+                        )
+                    )
+
             if self.ctrl.is_paused:
                 total, free, mmr = await self.get_balance_info()
                 count, daily_pnl = self.db.get_daily_stats()
@@ -16432,6 +16520,14 @@ class SignalEngine(BaseEngine):
         ))
 
         try:
+            strategy_params = cfg.get('strategy_params', {})
+            entry_mode = strategy_params.get('entry_mode', 'cross').lower()
+            active_strategy = strategy_params.get('active_strategy', 'utbot').lower()
+            if active_strategy in UTBREAKOUT_STRATEGIES:
+                symbol = self._canonicalize_utbreakout_symbol_for_use(
+                    symbol,
+                    source='poll_symbol',
+                )
             primary_tf = self._get_primary_poll_timeframe(symbol, cfg)
             # 1. OHLCV (Primary) - Basic monitoring
             ohlcv_p = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, primary_tf, limit=5)
@@ -16459,9 +16555,6 @@ class SignalEngine(BaseEngine):
             if symbol not in self.last_stateful_retry_ts:
                 self.last_stateful_retry_ts[symbol] = 0.0
 
-            strategy_params = cfg.get('strategy_params', {})
-            entry_mode = strategy_params.get('entry_mode', 'cross').lower()
-            active_strategy = strategy_params.get('active_strategy', 'utbot').lower()
             uses_stateful_primary_sync = active_strategy in STATEFUL_UT_STRATEGIES
             processed_primary_this_tick = False
             if active_strategy in UTBREAKOUT_STRATEGIES:
@@ -17983,6 +18076,10 @@ class SignalEngine(BaseEngine):
 
         for target_coin in candidates:
             symbol = target_coin.get('exchange_symbol') or target_coin.get('normalized_symbol')
+            symbol = self._canonicalize_utbreakout_symbol_for_use(
+                symbol,
+                source='coin_selector_scanner',
+            )
             self._utbreakout_trace_event(
                 symbol,
                 'COIN_SELECTED',
@@ -20066,6 +20163,13 @@ class SignalEngine(BaseEngine):
             return
 
     async def process_primary_candle(self, symbol, k, force=False):
+        strategy_params = self.get_runtime_strategy_params()
+        active_strategy = strategy_params.get('active_strategy', 'utbot').lower()
+        if active_strategy in UTBREAKOUT_STRATEGIES:
+            symbol = self._canonicalize_utbreakout_symbol_for_use(
+                symbol,
+                source='process_primary_candle',
+            )
         candle_time = k['t']
 
         # ?щ낵蹂??곹깭 珥덇린??
@@ -20083,8 +20187,6 @@ class SignalEngine(BaseEngine):
         self.last_candle_success[symbol] = False
 
         logger.info(f"?빉截?[Signal] Processing candle: {symbol} close={k['c']}")
-        strategy_params = self.get_runtime_strategy_params()
-        active_strategy = strategy_params.get('active_strategy', 'utbot').lower()
         if active_strategy in UTBREAKOUT_STRATEGIES:
             self._utbreakout_trace_event(
                 symbol,
@@ -21467,12 +21569,17 @@ class SignalEngine(BaseEngine):
 
     async def entry(self, symbol, side, price):
         try:
-            raw_symbol = symbol
             trace_strategy_params = self.get_runtime_strategy_params()
             trace_active_strategy = str(
                 trace_strategy_params.get('active_strategy', '') or ''
             ).lower()
             trace_utbreakout = trace_active_strategy in UTBREAKOUT_STRATEGIES
+            if trace_utbreakout:
+                symbol = self._canonicalize_utbreakout_symbol_for_use(
+                    symbol,
+                    source='entry',
+                )
+            raw_symbol = symbol
             if trace_utbreakout:
                 self._utbreakout_trace_event(
                     raw_symbol,
@@ -21502,6 +21609,11 @@ class SignalEngine(BaseEngine):
 
             try:
                 symbol = await self.ctrl._assert_symbol_tradeable_in_current_exchange_mode(symbol)
+                if trace_utbreakout:
+                    symbol = self._canonicalize_utbreakout_symbol_for_use(
+                        symbol,
+                        source='entry_preflight',
+                    )
             except Exception as symbol_err:
                 if trace_utbreakout:
                     self._utbreakout_trace_event(

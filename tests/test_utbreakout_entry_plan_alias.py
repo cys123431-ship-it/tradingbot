@@ -238,7 +238,8 @@ def test_force_utbreakout_entry_revalidates_and_uses_normal_entry_path():
 
 def test_utbreakout_entry_reaches_market_order_and_reports_exchange_failure(monkeypatch):
     raw_symbol = "SOL/USDT:USDT"
-    order_symbol = "SOL/USDT"
+    preflight_symbol = "SOL/USDT"
+    order_symbol = "SOL/USDT:USDT"
     notifications = []
     order_calls = []
     diagnostics = []
@@ -246,7 +247,7 @@ def test_utbreakout_entry_reaches_market_order_and_reports_exchange_failure(monk
     class Controller:
         async def _assert_symbol_tradeable_in_current_exchange_mode(self, symbol):
             assert symbol == raw_symbol
-            return order_symbol
+            return preflight_symbol
 
         async def notify(self, text):
             notifications.append(text)
