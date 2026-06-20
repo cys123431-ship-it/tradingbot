@@ -11896,7 +11896,7 @@ class SignalEngine(BaseEngine):
                         last_error = exc
                         continue
                 if last_error is not None:
-                    log.warning(
+                    logger.warning(
                         "direction filter OHLCV fallback failed for %s %s: %s",
                         candidates,
                         timeframe,
@@ -11952,7 +11952,7 @@ class SignalEngine(BaseEngine):
                 )
         except Exception as exc:
             status["direction_decision_error"] = str(exc)
-            log.exception("decide_direction overlay failed")
+            logger.exception("decide_direction overlay failed")
 
         continuation_decision = None
         try:
@@ -11994,7 +11994,7 @@ class SignalEngine(BaseEngine):
                         side=side
                     )
         except Exception as exc:
-            log.error("trend continuation evaluation failed: %s", exc)
+            logger.error("trend continuation evaluation failed: %s", exc)
             status['trend_continuation_error'] = str(exc)
             if candidate_type in {'bias_state', 'bias_continuation'}:
                 return _finish(
