@@ -1692,6 +1692,8 @@ def build_default_utbot_filtered_breakout_config():
         'utbreakout_no_position_retry_interval_sec': 20.0,
         'utbreakout_trace_watchdog_wait_sec': 90.0,
         'utbreakout_trace_watchdog_cooldown_sec': 180.0,
+        'utbreakout_auto_entry_bridge_cooldown_sec': 60.0,
+        'utbreakout_auto_entry_bridge_max_ready_age_sec': 180.0,
         'quality_score_v2_enabled': True,
         'quality_score_v2_block_below': 12.0,
         'quality_score_v2_reduce_below': 40.0,
@@ -4020,6 +4022,8 @@ class SignalEngine(BaseEngine):
         self.utbreakout_last_order_attempt_ts = {}
         self.utbreakout_last_watchdog_report_ts = {}
         self.utbreakout_trace_watchdog_enabled = True
+        self.utbreakout_auto_entry_bridge_last_attempt_ts = {}
+        self.utbreakout_auto_entry_bridge_enabled = True
         self.utbreakout_last_status_symbol = None
         self.utbreakout_last_ready_symbol = None
         self.current_utbreakout_candidate_symbol = None
@@ -5882,6 +5886,8 @@ class SignalEngine(BaseEngine):
             'utbreakout_no_position_retry_interval_sec': 20.0,
             'utbreakout_trace_watchdog_wait_sec': 90.0,
             'utbreakout_trace_watchdog_cooldown_sec': 180.0,
+            'utbreakout_auto_entry_bridge_cooldown_sec': 60.0,
+            'utbreakout_auto_entry_bridge_max_ready_age_sec': 180.0,
             'quality_score_v2_block_below': 12.0,
             'quality_score_v2_reduce_below': 40.0,
             'quality_score_v2_full_score': 82.0,
@@ -8110,6 +8116,82 @@ class SignalEngine(BaseEngine):
             )
         return canonical
 
+    def _utbreakout_restricted_symbol_bases(self):
+        """Account-region exclusions supplied by the user; never scan or trade."""
+        return {'SKHYNIX', 'HYUNDAI', 'SAMSUNG'}
+
+    def _utbreakout_symbol_base(self, symbol):
+        raw = str(symbol or '').upper().strip()
+        if not raw:
+            return ''
+        try:
+            canonical = self._canonical_futures_symbol(raw)
+        except Exception:
+            canonical = raw
+        text = str(canonical or raw).upper().strip()
+        if '/' in text:
+            return (
+                text.split('/', 1)[0]
+                .replace('-', '')
+                .replace('_', '')
+                .strip()
+            )
+        for quote in ('USDT', 'USDC', 'BUSD'):
+            if text.endswith(quote) and len(text) > len(quote):
+                return (
+                    text[:-len(quote)]
+                    .replace('-', '')
+                    .replace('_', '')
+                    .strip()
+                )
+        return (
+            text.replace(':USDT', '')
+            .replace(':USDC', '')
+            .replace(':BUSD', '')
+            .replace('/', '')
+            .replace('-', '')
+            .replace('_', '')
+            .strip()
+        )
+
+    def _is_utbreakout_restricted_symbol(self, symbol):
+        return (
+            self._utbreakout_symbol_base(symbol)
+            in self._utbreakout_restricted_symbol_bases()
+        )
+
+    def _utbreakout_restricted_symbol_reason(self, symbol):
+        base = self._utbreakout_symbol_base(symbol)
+        return (
+            f"{base} is excluded because this user's Korean Binance account "
+            "cannot trade this restricted ticker."
+        )
+
+    def _record_utbreakout_restricted_symbol(self, symbol, source='unknown'):
+        canonical = self._canonical_futures_symbol(symbol)
+        reason = self._utbreakout_restricted_symbol_reason(canonical)
+        try:
+            self._utbreakout_trace_event(
+                canonical,
+                'SYMBOL_BLOCKED_REGION_RESTRICTED',
+                'BLOCK',
+                source=source,
+                raw_symbol=str(symbol),
+                canonical_symbol=canonical,
+                base=self._utbreakout_symbol_base(canonical),
+                reason=reason,
+            )
+        except Exception:
+            logger.debug("restricted symbol trace skipped", exc_info=True)
+        logger.warning(
+            "[UTBREAK_RESTRICTED_SYMBOL] source=%s raw=%s canonical=%s reason=%s",
+            source,
+            symbol,
+            canonical,
+            reason,
+        )
+        return reason
+
     def _utbreakout_plan_symbol_keys(self, symbol):
         raw = str(symbol or '').strip()
         if not raw:
@@ -8440,9 +8522,11 @@ class SignalEngine(BaseEngine):
             'SCANNER_SEEN', 'POLL_TICK',
             'POLL_ALREADY_PROCESSED', 'NO_POSITION_RETRY',
             'PROCESS_PRIMARY_START', 'SIGNAL_CALCULATED', 'PLAN_CREATED',
+            'AUTO_ENTRY_BRIDGE', 'AUTO_ENTRY_BRIDGE_BLOCKED',
             'ENTRY_CALL', 'ENTRY_ENTERED', 'PLAN_LOOKUP', 'BALANCE_CHECK',
             'ENTRY_BLOCKED', 'ORDER_ATTEMPT', 'ORDER_SUCCESS', 'ORDER_FAILED',
-            'POSITION_CONFIRMED', 'NO_POSITION_AFTER_ENTRY', 'WATCHDOG',
+            'POSITION_CONFIRMED', 'NO_POSITION_AFTER_ENTRY',
+            'SYMBOL_BLOCKED_REGION_RESTRICTED', 'WATCHDOG',
         ]
         lines = [
             "🧪 UTBreakout Entry Trace Report",
@@ -8512,6 +8596,8 @@ class SignalEngine(BaseEngine):
         )
         has_entry_call = _after_ready('ENTRY_CALL') is not None
         has_entry_entered = _after_ready('ENTRY_ENTERED') is not None
+        bridge_event = _after_ready('AUTO_ENTRY_BRIDGE')
+        bridge_blocked = _after_ready('AUTO_ENTRY_BRIDGE_BLOCKED')
         has_order_attempt = _after_ready('ORDER_ATTEMPT') is not None
         has_order_success = _after_ready('ORDER_SUCCESS') is not None
         order_failed = _after_ready('ORDER_FAILED')
@@ -8519,9 +8605,19 @@ class SignalEngine(BaseEngine):
         entry_blocked = _after_ready('ENTRY_BLOCKED')
 
         lines.extend(["", "== Diagnosis =="])
-        if has_ready and not has_process and not has_entry_call:
-            diagnosis = "STATUS_READY 이후 process_primary_candle/entry 호출 전에서 끊김"
-            meaning = "조건창은 진입 가능인데 poll/scanner 실행 루프가 entry 경로로 전달하지 않음"
+        if has_ready and bridge_event is None and bridge_blocked is None and not has_entry_call:
+            diagnosis = "STATUS_READY 이후 AUTO_ENTRY_BRIDGE/ENTRY_CALL 전에서 끊김"
+            meaning = "조건창은 진입 가능인데 ready plan을 실제 주문 실행 브리지로 넘기지 못함"
+        elif bridge_blocked is not None and not has_entry_call:
+            diagnosis = "AUTO_ENTRY_BRIDGE guard에서 차단"
+            meaning = str(
+                (bridge_blocked.get('data') or {}).get('reason')
+                or bridge_blocked.get('status')
+                or 'bridge 차단 상세 확인 필요'
+            )
+        elif bridge_event is not None and not has_entry_call:
+            diagnosis = "AUTO_ENTRY_BRIDGE 이후 entry() 호출 전에서 끊김"
+            meaning = "bridge는 작동했지만 entry call 직전 오류 또는 guard에서 중단됨"
         elif has_process and not has_signal:
             diagnosis = "process_primary_candle 내부 signal 계산 전/중단"
             meaning = "_calculate_utbot_filtered_breakout_signal 결과가 trace에 남지 않음"
@@ -8580,6 +8676,8 @@ class SignalEngine(BaseEngine):
             f"signal 계산 결과: {((_after_ready('SIGNAL_CALCULATED') or {}).get('data') or {}).get('sig', '없음')}",
             f"entry plan 생성 여부: {plan_created}",
             f"entry plan 조회 여부: {plan_lookup}",
+            f"auto entry bridge 여부: {bridge_event is not None}",
+            f"auto entry bridge blocked 여부: {bridge_blocked is not None}",
             f"entry() 호출 여부: {has_entry_call}",
             f"entry() 함수 진입 여부: {has_entry_entered}",
             f"잔고 확인 여부: {balance_event is not None}",
@@ -8690,6 +8788,266 @@ class SignalEngine(BaseEngine):
             return True
         except Exception:
             logger.exception("UTBreakout entry watchdog failed")
+            return False
+
+    def _ensure_utbreakout_auto_entry_bridge_state(self):
+        if not isinstance(
+            getattr(self, 'utbreakout_auto_entry_bridge_last_attempt_ts', None),
+            dict,
+        ):
+            self.utbreakout_auto_entry_bridge_last_attempt_ts = {}
+        if not hasattr(self, 'utbreakout_auto_entry_bridge_enabled'):
+            self.utbreakout_auto_entry_bridge_enabled = True
+
+    async def _maybe_run_utbreakout_auto_entry_bridge(
+        self,
+        symbol,
+        source='scanner',
+    ):
+        """Connect a recent ready plan to entry(), only from a live loop."""
+        try:
+            self._ensure_utbreakout_trace_state()
+            self._ensure_utbreakout_auto_entry_bridge_state()
+            symbol = self._canonicalize_utbreakout_symbol_for_use(
+                symbol,
+                source=f'auto_entry_bridge:{source}',
+            )
+
+            if not bool(self.utbreakout_auto_entry_bridge_enabled):
+                self._utbreakout_trace_event(
+                    symbol,
+                    'AUTO_ENTRY_BRIDGE_BLOCKED',
+                    'DISABLED',
+                    source=source,
+                    reason='bridge disabled',
+                )
+                return False
+
+            strategy_params = self.get_runtime_strategy_params()
+            active_strategy = str(
+                strategy_params.get('active_strategy', '') or ''
+            ).lower()
+            if active_strategy not in UTBREAKOUT_STRATEGIES:
+                self._utbreakout_trace_event(
+                    symbol,
+                    'AUTO_ENTRY_BRIDGE_BLOCKED',
+                    'NOT_UTBREAKOUT',
+                    source=source,
+                    active_strategy=active_strategy,
+                    reason='active strategy is not UTBreakout',
+                )
+                return False
+
+            if self._is_utbreakout_restricted_symbol(symbol):
+                reason = self._record_utbreakout_restricted_symbol(
+                    symbol,
+                    source='auto_entry_bridge',
+                )
+                self._utbreakout_trace_event(
+                    symbol,
+                    'AUTO_ENTRY_BRIDGE_BLOCKED',
+                    'RESTRICTED_SYMBOL',
+                    source=source,
+                    reason=reason,
+                )
+                return False
+
+            cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+            key = self._utbreakout_trace_key(symbol)
+            now_ts = time.time()
+            cooldown_sec = float(
+                cfg.get('utbreakout_auto_entry_bridge_cooldown_sec', 60.0)
+                or 60.0
+            )
+            last_attempt = float(
+                self.utbreakout_auto_entry_bridge_last_attempt_ts.get(key, 0.0)
+                or 0.0
+            )
+            if now_ts - last_attempt < cooldown_sec:
+                self._utbreakout_trace_event(
+                    symbol,
+                    'AUTO_ENTRY_BRIDGE_BLOCKED',
+                    'COOLDOWN',
+                    source=source,
+                    reason='duplicate bridge attempt cooldown',
+                    cooldown_sec=cooldown_sec,
+                    elapsed=round(now_ts - last_attempt, 1),
+                )
+                return False
+
+            ready_ts = float(
+                self.utbreakout_last_ready_ts.get(key, 0.0) or 0.0
+            )
+            if ready_ts <= 0:
+                self._utbreakout_trace_event(
+                    symbol,
+                    'AUTO_ENTRY_BRIDGE_BLOCKED',
+                    'NO_STATUS_READY',
+                    source=source,
+                    reason='no STATUS_READY event for symbol',
+                )
+                return False
+
+            max_ready_age_sec = float(
+                cfg.get('utbreakout_auto_entry_bridge_max_ready_age_sec', 180.0)
+                or 180.0
+            )
+            ready_age_sec = now_ts - ready_ts
+            if ready_age_sec > max_ready_age_sec:
+                self._utbreakout_trace_event(
+                    symbol,
+                    'AUTO_ENTRY_BRIDGE_BLOCKED',
+                    'READY_TOO_OLD',
+                    source=source,
+                    reason='STATUS_READY event is too old',
+                    ready_age_sec=round(ready_age_sec, 1),
+                    max_ready_age_sec=max_ready_age_sec,
+                )
+                return False
+
+            ready_events = [
+                event
+                for event in self._utbreakout_recent_trace_events(
+                    symbol,
+                    limit=80,
+                )
+                if str(event.get('stage', '')).upper() == 'STATUS_READY'
+                and float(event.get('ts', 0.0) or 0.0) >= ready_ts
+            ]
+            ready_event = ready_events[-1] if ready_events else {}
+            ready_data = (
+                ready_event.get('data')
+                if isinstance(ready_event, dict)
+                and isinstance(ready_event.get('data'), dict)
+                else {}
+            )
+            side = str(
+                ready_data.get('side')
+                or self.utbreakout_last_ready_side.get(key)
+                or ''
+            ).lower()
+            if side not in {'long', 'short'}:
+                self._utbreakout_trace_event(
+                    symbol,
+                    'AUTO_ENTRY_BRIDGE_BLOCKED',
+                    'NO_READY_SIDE',
+                    source=source,
+                    reason='STATUS_READY side is missing',
+                    side=side,
+                )
+                return False
+
+            pos = await self.get_server_position(symbol, use_cache=False)
+            if pos:
+                self._utbreakout_trace_event(
+                    symbol,
+                    'AUTO_ENTRY_BRIDGE_BLOCKED',
+                    'POSITION_EXISTS',
+                    source=source,
+                    reason='position already exists',
+                    side=side,
+                    position=str(pos)[:300],
+                )
+                return False
+
+            plan = self._get_utbot_filtered_breakout_entry_plan(symbol, side)
+            if not isinstance(plan, dict):
+                self._utbreakout_trace_event(
+                    symbol,
+                    'AUTO_ENTRY_BRIDGE_BLOCKED',
+                    'MISSING_PLAN',
+                    source=source,
+                    reason='ready entry plan is missing',
+                    side=side,
+                    available_plan_keys=list(
+                        getattr(
+                            self,
+                            'utbot_filtered_breakout_entry_plans',
+                            {},
+                        ).keys()
+                    )[:20],
+                )
+                return False
+
+            entry_price = float(
+                plan.get('entry_price')
+                or ready_data.get('entry_price')
+                or 0.0
+            )
+            if entry_price <= 0:
+                self._utbreakout_trace_event(
+                    symbol,
+                    'AUTO_ENTRY_BRIDGE_BLOCKED',
+                    'INVALID_ENTRY_PRICE',
+                    source=source,
+                    reason='entry plan has no valid entry price',
+                    side=side,
+                    entry_price=entry_price,
+                )
+                return False
+
+            self.utbreakout_auto_entry_bridge_last_attempt_ts[key] = now_ts
+            self._utbreakout_trace_event(
+                symbol,
+                'AUTO_ENTRY_BRIDGE',
+                'CALL_ENTRY',
+                source=source,
+                side=side,
+                entry_price=entry_price,
+                qty=plan.get('qty'),
+                margin=plan.get(
+                    'planned_margin',
+                    plan.get('margin_to_use'),
+                ),
+                notional=plan.get(
+                    'planned_notional',
+                    plan.get('target_notional'),
+                ),
+                risk=plan.get('risk_usdt', plan.get('risk_amount')),
+                ready_age_sec=round(ready_age_sec, 1),
+            )
+            try:
+                await self.ctrl.notify(
+                    "🟡 UTBreakout Auto Entry Bridge\n"
+                    f"symbol={symbol}\n"
+                    f"side={side.upper()}\n"
+                    f"source={source}\n"
+                    f"qty={plan.get('qty')}\n"
+                    f"notional={plan.get('planned_notional', plan.get('target_notional'))}\n"
+                    f"margin={plan.get('planned_margin', plan.get('margin_to_use'))}\n"
+                    "entry() 호출을 시도합니다."
+                )
+            except Exception:
+                logger.debug("bridge notify skipped", exc_info=True)
+
+            self._utbreakout_trace_event(
+                symbol,
+                'ENTRY_CALL',
+                'CALLING',
+                side=side,
+                entry_ref_price=entry_price,
+                source=f'auto_entry_bridge:{source}',
+            )
+            await self.entry(symbol, side, entry_price)
+            return True
+        except Exception as exc:
+            try:
+                self._utbreakout_trace_event(
+                    symbol,
+                    'AUTO_ENTRY_BRIDGE_BLOCKED',
+                    'ERROR',
+                    source=source,
+                    reason='bridge raised an exception',
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+            except Exception:
+                pass
+            logger.exception(
+                "UTBreakout auto entry bridge failed for %s: %s",
+                symbol,
+                exc,
+            )
             return False
 
     def _clear_utbreakout_trailing_state(self, symbol, *, finalize=False, reason='cleared', exit_price=None):
@@ -12133,6 +12491,16 @@ class SignalEngine(BaseEngine):
         next_symbol, next_candidate = await self._resolve_next_utbreakout_scan_candidate(
             excluded_symbols=position_symbols
         )
+        if (
+            next_symbol
+            and self._is_utbreakout_restricted_symbol(next_symbol)
+        ):
+            self._record_utbreakout_restricted_symbol(
+                next_symbol,
+                source='status_next_candidate_filter',
+            )
+            next_symbol = None
+            next_candidate = None
 
         coin_cfg = self._get_coin_selector_config()
         if next_candidate:
@@ -12348,6 +12716,26 @@ class SignalEngine(BaseEngine):
             'START',
             phase='status_build_started',
         )
+
+        if self._is_utbreakout_restricted_symbol(symbol):
+            reason = self._record_utbreakout_restricted_symbol(
+                symbol,
+                source='status',
+            )
+            _record_status_evaluated(
+                'BLOCKED',
+                reason='REJECTED_REGION_RESTRICTED_SYMBOL: ' + reason,
+            )
+            return enforce_utbreakout_effective_status_contract(
+                "\n".join([
+                    "🚦 UT Breakout 조건 스테이터스",
+                    f"조건 평가 심볼: {symbol}",
+                    "최종: 진입 차단",
+                    f"🔴 제한 티커 제외: {reason}",
+                    "이 심볼은 한국계정 거래 제한으로 스캔/진입 대상에서 제외됩니다.",
+                ]),
+                cfg,
+            )
 
         def _icon(state):
             if state is True:
@@ -17819,6 +18207,10 @@ class SignalEngine(BaseEngine):
 
     async def evaluate_coin_selector(self, *, force=False, custom_universe_override=False):
         cfg = self._get_coin_selector_config()
+        strategy_params = self.get_runtime_strategy_params()
+        active_strategy = str(
+            strategy_params.get('active_strategy', 'utbot') or 'utbot'
+        ).lower()
         custom_symbols = normalize_coin_selector_custom_symbols(cfg.get('custom_symbols'))
         custom_enabled = bool(cfg.get('custom_universe_enabled', False)) or bool(custom_universe_override)
         now = time.time()
@@ -17877,6 +18269,30 @@ class SignalEngine(BaseEngine):
             ctrl = getattr(self, 'ctrl', None)
             mode = ctrl.get_exchange_mode() if ctrl and hasattr(ctrl, 'get_exchange_mode') else None
             for requested_symbol in custom_symbols:
+                if (
+                    active_strategy in UTBREAKOUT_STRATEGIES
+                    and self._is_utbreakout_restricted_symbol(requested_symbol)
+                ):
+                    reason = self._record_utbreakout_restricted_symbol(
+                        requested_symbol,
+                        source='coin_selector_custom_universe',
+                    )
+                    normalized = self._canonical_futures_symbol(
+                        requested_symbol
+                    )
+                    custom_resolution_rejected.append({
+                        'symbol': normalized,
+                        'exchange_symbol': normalized,
+                        'normalized_symbol': normalized,
+                        'accepted': False,
+                        'reject_reasons': [
+                            'REJECTED_REGION_RESTRICTED_SYMBOL',
+                        ],
+                        'analysis_error': reason,
+                        'selection_state': 'REJECTED',
+                        'custom_universe': True,
+                    })
+                    continue
                 try:
                     if ctrl and hasattr(ctrl, '_resolve_futures_watch_symbol_from_markets'):
                         exchange_symbol = ctrl._resolve_futures_watch_symbol_from_markets(
@@ -17921,6 +18337,27 @@ class SignalEngine(BaseEngine):
         rejected = list(custom_resolution_rejected)
         include_tradifi_universe = self._coin_selector_should_include_tradifi_universe(cfg, custom_enabled)
         for symbol, ticker in ticker_items:
+            if (
+                active_strategy in UTBREAKOUT_STRATEGIES
+                and self._is_utbreakout_restricted_symbol(symbol)
+            ):
+                reason = self._record_utbreakout_restricted_symbol(
+                    symbol,
+                    source='coin_selector_candidate_filter',
+                )
+                canonical = self._canonical_futures_symbol(symbol)
+                rejected.append({
+                    'symbol': canonical,
+                    'exchange_symbol': canonical,
+                    'normalized_symbol': canonical,
+                    'accepted': False,
+                    'reject_reasons': [
+                        'REJECTED_REGION_RESTRICTED_SYMBOL',
+                    ],
+                    'analysis_error': reason,
+                    'selection_state': 'REJECTED',
+                })
+                continue
             market = self._coin_selector_market_for_symbol(symbol, markets)
             tags = coin_selector_sector_tags_for_symbol(symbol, cfg.get('sector_overrides'))
             candidate_cfg = cfg
@@ -17956,7 +18393,6 @@ class SignalEngine(BaseEngine):
         selector_context = {
             'cross_sectional_dispersion_pct': float(np.std(dispersion_values)) if len(dispersion_values) >= 2 else 0.0,
         }
-        strategy_params = self.get_runtime_strategy_params()
         analysis_limit = len(accepted_base) if custom_enabled else int(cfg.get('analysis_limit', 20) or 20)
         analysis_candidates = list(accepted_base[:analysis_limit])
         tradifi_candidates_considered = 0
@@ -18044,6 +18480,10 @@ class SignalEngine(BaseEngine):
 
     async def _scan_and_trade_coin_selector(self):
         cfg = self._get_coin_selector_config()
+        scanner_strategy_params = self.get_runtime_strategy_params()
+        scanner_active_strategy = str(
+            scanner_strategy_params.get('active_strategy', 'utbot') or 'utbot'
+        ).lower()
         scan_started_at = time.time()
         if self._micro_auto_enabled():
             report = await self.evaluate_micro_auto_candidates(force=False)
@@ -18054,6 +18494,32 @@ class SignalEngine(BaseEngine):
                 item for item in report.get('selected', [])
                 if item.get('selection_state') == 'SELECTED'
             ]
+        if scanner_active_strategy in UTBREAKOUT_STRATEGIES:
+            allowed_candidates = []
+            for item in candidates:
+                candidate_symbol = (
+                    item.get('exchange_symbol')
+                    or item.get('normalized_symbol')
+                    or item.get('symbol')
+                )
+                if self._is_utbreakout_restricted_symbol(candidate_symbol):
+                    reason = self._record_utbreakout_restricted_symbol(
+                        candidate_symbol,
+                        source='coin_selector_selected_filter',
+                    )
+                    self._record_coin_selector_candidate_outcome(
+                        candidate_symbol,
+                        reason=(
+                            'REJECTED_REGION_RESTRICTED_SYMBOL: ' + reason
+                        ),
+                        cfg=cfg,
+                        decision_key=(
+                            f"restricted:{self._utbreakout_trace_key(candidate_symbol)}"
+                        ),
+                    )
+                    continue
+                allowed_candidates.append(item)
+            candidates = allowed_candidates
         if not candidates:
             logger.info("CoinSelector scanner: no selected candidates.")
             return
@@ -18080,6 +18546,23 @@ class SignalEngine(BaseEngine):
                 symbol,
                 source='coin_selector_scanner',
             )
+            if (
+                scanner_active_strategy in UTBREAKOUT_STRATEGIES
+                and self._is_utbreakout_restricted_symbol(symbol)
+            ):
+                reason = self._record_utbreakout_restricted_symbol(
+                    symbol,
+                    source='coin_selector_candidate_guard',
+                )
+                self._record_coin_selector_candidate_outcome(
+                    symbol,
+                    reason='REJECTED_REGION_RESTRICTED_SYMBOL: ' + reason,
+                    cfg=cfg,
+                    decision_key=(
+                        f"restricted:{self._utbreakout_trace_key(symbol)}"
+                    ),
+                )
+                continue
             self._utbreakout_trace_event(
                 symbol,
                 'COIN_SELECTED',
@@ -18150,8 +18633,85 @@ class SignalEngine(BaseEngine):
                     scan_params,
                     active_strategy,
                     allow_utbot_stateful=False,
-                    precomputed=strategy_context.get('precomputed')
+                    precomputed=strategy_context.get('precomputed'),
+                    force_utbreakout_reprocess=(
+                        active_strategy in UTBREAKOUT_STRATEGIES
+                    ),
                 )
+                if active_strategy in UTBREAKOUT_STRATEGIES:
+                    signal_diag = self._utbreakout_diag_for_symbol(symbol)
+                    self._utbreakout_trace_event(
+                        symbol,
+                        'SIGNAL_CALCULATED',
+                        'RESULT',
+                        sig=sig,
+                        reason=(
+                            signal_diag.get('reason')
+                            or self.last_entry_reason.get(symbol)
+                            or ''
+                        ),
+                        accepted_side=signal_diag.get('accepted_side'),
+                        reject_code=signal_diag.get('reject_code'),
+                        decision_candle_ts=signal_diag.get(
+                            'decision_candle_ts'
+                        ),
+                        source='coin_selector_scanner',
+                        force=True,
+                    )
+                    bridge_called = (
+                        await self._maybe_run_utbreakout_auto_entry_bridge(
+                            symbol,
+                            source='scanner_seen',
+                        )
+                    )
+                    if bridge_called:
+                        bridge_pos = await self.get_server_position(
+                            symbol,
+                            use_cache=False,
+                        )
+                        if bridge_pos:
+                            self._record_coin_selector_candidate_outcome(
+                                symbol,
+                                accepted=True,
+                                cfg=cfg,
+                            )
+                            self.scanner_active_symbol = symbol
+                            self._utbreakout_trace_event(
+                                symbol,
+                                'POSITION_CONFIRMED',
+                                'OK',
+                                side=bridge_pos.get('side'),
+                                contracts=bridge_pos.get('contracts'),
+                                source='auto_entry_bridge_post_check',
+                            )
+                            break
+                        entry_reason = (
+                            self.last_entry_reason.get(symbol)
+                            if isinstance(
+                                getattr(self, 'last_entry_reason', None),
+                                dict,
+                            )
+                            else ''
+                        )
+                        self._record_coin_selector_candidate_outcome(
+                            symbol,
+                            reason=(
+                                entry_reason
+                                or 'auto entry bridge did not open position'
+                            ),
+                            cfg=cfg,
+                            decision_key=(
+                                f"bridge_no_position:{int(scan_started_at // 60)}"
+                            ),
+                        )
+                        self._utbreakout_trace_event(
+                            symbol,
+                            'NO_POSITION_AFTER_ENTRY',
+                            'WARN',
+                            reason=entry_reason,
+                            source='auto_entry_bridge_post_check',
+                        )
+                        continue
 
                 if not sig and active_strategy in UTBREAKOUT_STRATEGIES:
                     diag = self._utbreakout_diag_for_symbol(symbol)
@@ -21580,6 +22140,36 @@ class SignalEngine(BaseEngine):
                     source='entry',
                 )
             raw_symbol = symbol
+            if (
+                trace_utbreakout
+                and self._is_utbreakout_restricted_symbol(symbol)
+            ):
+                reason = self._record_utbreakout_restricted_symbol(
+                    symbol,
+                    source='entry_guard',
+                )
+                self._utbreakout_trace_event(
+                    symbol,
+                    'ENTRY_BLOCKED',
+                    'BLOCK',
+                    side=side,
+                    reason='REJECTED_REGION_RESTRICTED_SYMBOL: ' + reason,
+                )
+                self.last_entry_reason[symbol] = (
+                    'REJECTED_REGION_RESTRICTED_SYMBOL: ' + reason
+                )
+                try:
+                    await self.ctrl.notify(
+                        "🔴 UTBreakout 진입 차단: 한국계정 제한 티커\n"
+                        f"symbol={symbol}\n"
+                        f"reason={reason}"
+                    )
+                except Exception:
+                    logger.debug(
+                        "restricted symbol notify skipped",
+                        exc_info=True,
+                    )
+                return
             if trace_utbreakout:
                 self._utbreakout_trace_event(
                     raw_symbol,
@@ -31210,6 +31800,13 @@ UTBot:
             scanner_on = bool(common_cfg.get('scanner_enabled', False))
             coin_auto_on = bool(coin_cfg.get('enabled', False)) and scanner_on and not bool(coin_cfg.get('fixed_symbol_mode_enabled', False))
             auto_bundle_on = adaptive_on and auto_set_on and coin_auto_on
+            bridge_on = bool(
+                getattr(
+                    engine,
+                    'utbreakout_auto_entry_bridge_enabled',
+                    True,
+                )
+            ) if engine else True
             fixed_symbol = coin_cfg.get('fixed_symbol') or ''
             custom_symbols = coin_cfg.get('custom_symbols') or []
             if coin_cfg.get('fixed_symbol_mode_enabled') and fixed_symbol:
@@ -31283,6 +31880,8 @@ UTBot:
 상태: `{active_label}`
 코인: {coin_mode}
 AUTO 묶음: `{'ON' if auto_bundle_on else 'OFF'}` (코인 자동선택 + Set 자동 + Adaptive TF)
+Auto Entry Bridge: `{'ON' if bridge_on else 'OFF'}`
+제외 티커: `SKHYNIX, HYUNDAI, SAMSUNG`
 Set: `{mode_label}` / 수동 `Set{set_id} {set_info.get('name')}` / 최근 AUTO `{('Set' + str(auto_set) + ' ' + str(auto_name)) if auto_set else '대기'}`
 시간봉: 진입 `{cfg.get('entry_timeframe', '15m')}` / 청산 `{cfg.get('exit_timeframe', cfg.get('entry_timeframe', '15m'))}` / HTF `{cfg.get('htf_timeframe', '1h')}`
 Adaptive 최근: `{adaptive_summary}`
@@ -31325,6 +31924,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 `/utbreak trace [SYMBOL]` - 최근 진입 경로 요약 진단 보고서
 `/utbreak tracefull [SYMBOL]` - 최근 진입 경로 전체 진단 보고서
 `/utbreak watchdog on|off` - 진입 가능 후 주문 미시도 자동 보고 ON/OFF
+`/utbreak bridge on|off` - ready plan을 live scanner의 entry()로 연결
 """.strip()
 
         def _format_utbreakout_config_text(diff=False):
@@ -31373,6 +31973,8 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 'partial_take_profit_ratio',
                 'second_take_profit_r_multiple',
                 'second_take_profit_ratio',
+                'utbreakout_auto_entry_bridge_cooldown_sec',
+                'utbreakout_auto_entry_bridge_max_ready_age_sec',
             ]
             lines = [
                 '🧾 UT Breakout Effective Config',
@@ -31380,6 +31982,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
             ]
             for key in keys:
                 lines.append(f"- {key}: {effective_cfg.get(key)!r}")
+            lines.append("- restricted_symbols: ['SKHYNIX', 'HYUNDAI', 'SAMSUNG']")
             return '\n'.join(lines)
 
         def _build_utbreakout_keyboard():
@@ -32298,6 +32901,32 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 )
                 await u.message.reply_text(
                     f"UTBreakout trace watchdog: {'ON' if state else 'OFF'}"
+                )
+                return
+            elif action in {'bridge', 'autoentrybridge', 'auto_entry_bridge'}:
+                engine = self.engines.get('signal')
+                if not engine:
+                    await u.message.reply_text(
+                        "⚠️ bridge 설정 실패: Signal 엔진을 찾을 수 없습니다."
+                    )
+                    return
+                engine._ensure_utbreakout_auto_entry_bridge_state()
+                mode = str(args[1]).strip().lower() if len(args) > 1 else ''
+                if mode in {'on', 'enable', '1', 'true'}:
+                    engine.utbreakout_auto_entry_bridge_enabled = True
+                elif mode in {'off', 'disable', '0', 'false'}:
+                    engine.utbreakout_auto_entry_bridge_enabled = False
+                elif mode:
+                    await u.message.reply_text(
+                        "❌ 예: `/utbreak bridge on` 또는 `/utbreak bridge off`",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                    return
+                state = bool(engine.utbreakout_auto_entry_bridge_enabled)
+                await u.message.reply_text(
+                    "UTBreakout Auto Entry Bridge: "
+                    + ("ON" if state else "OFF")
+                    + "\n사용법: /utbreak bridge on 또는 /utbreak bridge off"
                 )
                 return
             elif action in {'forceentry', 'force_entry', 'retryentry', 'retry_entry'}:

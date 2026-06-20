@@ -47,7 +47,7 @@ def test_utbreakout_trace_report_detects_ready_without_entry():
     assert "scanner_seen 여부: False" in report
     assert "order_attempt 여부: False" in report
     assert "suspected_break_stage" in report
-    assert "STATUS_READY 이후 process_primary_candle/entry 호출 전" in report
+    assert "STATUS_READY 이후 AUTO_ENTRY_BRIDGE/ENTRY_CALL 전" in report
 
 
 def test_utbreakout_trace_is_bounded_and_symbol_aliases_share_state():
