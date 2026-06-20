@@ -26,6 +26,18 @@ def test_canonical_futures_symbol_normalizes_common_forms():
     assert engine._canonical_futures_symbol("BTCUSDT") == "BTC/USDT:USDT"
 
 
+def test_allo_and_al_are_not_confused():
+    engine = _build_engine()
+
+    assert (
+        engine._canonical_futures_symbol("ALLOUSDT")
+        == "ALLO/USDT:USDT"
+    )
+    assert engine._canonical_futures_symbol("ALUSDT") == "AL/USDT:USDT"
+    assert engine._utbreakout_trace_key("ALLOUSDT") == "ALLOUSDT"
+    assert engine._utbreakout_trace_key("ALUSDT") == "ALUSDT"
+
+
 def test_utbreakout_trace_key_does_not_duplicate_quote():
     engine = _build_engine()
 

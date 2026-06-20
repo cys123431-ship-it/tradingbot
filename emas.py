@@ -8116,6 +8116,68 @@ class SignalEngine(BaseEngine):
             )
         return canonical
 
+    def _get_exchange_markets_safe(self):
+        """Return loaded exchange markets without raising."""
+        for exchange_name in ('exchange', 'market_data_exchange'):
+            try:
+                exchange = getattr(self, exchange_name, None)
+                markets = getattr(exchange, 'markets', None)
+                if isinstance(markets, dict) and markets:
+                    return markets
+            except Exception:
+                continue
+        return {}
+
+    def _is_valid_exchange_market_symbol(self, symbol):
+        """Validate a canonical symbol when ccxt markets are already loaded."""
+        try:
+            canonical = self._canonical_futures_symbol(symbol)
+        except Exception:
+            canonical = str(symbol or '')
+        markets = self._get_exchange_markets_safe()
+        if not markets:
+            return True
+        raw = str(symbol or '').strip()
+        return canonical in markets or raw in markets
+
+    def _record_invalid_exchange_market_symbol(
+        self,
+        symbol,
+        source='unknown',
+    ):
+        """Record a nonexistent exchange market before data or order calls."""
+        try:
+            canonical = self._canonical_futures_symbol(symbol)
+        except Exception:
+            canonical = str(symbol or '')
+        markets = self._get_exchange_markets_safe()
+        market_count = len(markets) if isinstance(markets, dict) else 0
+        reason = (
+            f"exchange.markets does not contain canonical symbol {canonical}"
+        )
+        try:
+            self._utbreakout_trace_event(
+                canonical,
+                'SYMBOL_INVALID_MARKET',
+                'BLOCK',
+                source=source,
+                raw_symbol=str(symbol),
+                canonical_symbol=canonical,
+                market_count=market_count,
+                reason=reason,
+            )
+        except Exception:
+            logger.debug("invalid market trace skipped", exc_info=True)
+        logger.warning(
+            "[UTBREAK_INVALID_MARKET] source=%s raw=%s canonical=%s "
+            "market_count=%s",
+            source,
+            symbol,
+            canonical,
+            market_count,
+        )
+        return reason
+
     def _utbreakout_restricted_symbol_bases(self):
         """Account-region exclusions supplied by the user; never scan or trade."""
         return {'SKHYNIX', 'HYUNDAI', 'SAMSUNG'}
@@ -8191,6 +8253,59 @@ class SignalEngine(BaseEngine):
             reason,
         )
         return reason
+
+    def _ensure_valid_utbreakout_market_symbol(
+        self,
+        symbol,
+        source='unknown',
+    ):
+        """Return a canonical, account-allowed, loaded futures market."""
+        try:
+            canonical = self._canonical_futures_symbol(symbol)
+        except Exception:
+            canonical = str(symbol or '')
+
+        try:
+            if self._is_utbreakout_restricted_symbol(canonical):
+                reason = self._record_utbreakout_restricted_symbol(
+                    canonical,
+                    source=source,
+                )
+                return (
+                    False,
+                    canonical,
+                    'REJECTED_REGION_RESTRICTED_SYMBOL: ' + reason,
+                )
+        except Exception:
+            logger.debug(
+                "restricted symbol validation skipped",
+                exc_info=True,
+            )
+
+        if not self._is_valid_exchange_market_symbol(canonical):
+            reason = self._record_invalid_exchange_market_symbol(
+                canonical,
+                source=source,
+            )
+            return (
+                False,
+                canonical,
+                'REJECTED_INVALID_MARKET_SYMBOL: ' + reason,
+            )
+
+        try:
+            self._utbreakout_trace_event(
+                canonical,
+                'MARKET_VALIDATED',
+                'OK',
+                source=source,
+                raw_symbol=str(symbol),
+                canonical_symbol=canonical,
+                market_count=len(self._get_exchange_markets_safe()),
+            )
+        except Exception:
+            logger.debug("market validated trace skipped", exc_info=True)
+        return True, canonical, ''
 
     def _utbreakout_plan_symbol_keys(self, symbol):
         raw = str(symbol or '').strip()
@@ -8519,7 +8634,8 @@ class SignalEngine(BaseEngine):
 
         important_stages = [
             'STATUS_EVALUATED', 'STATUS_READY', 'COIN_SELECTED',
-            'SCANNER_SEEN', 'POLL_TICK',
+            'SCANNER_SEEN', 'MARKET_VALIDATED', 'SYMBOL_INVALID_MARKET',
+            'POLL_TICK',
             'POLL_ALREADY_PROCESSED', 'NO_POSITION_RETRY',
             'PROCESS_PRIMARY_START', 'SIGNAL_CALCULATED', 'PLAN_CREATED',
             'AUTO_ENTRY_BRIDGE', 'AUTO_ENTRY_BRIDGE_BLOCKED',
@@ -8570,6 +8686,29 @@ class SignalEngine(BaseEngine):
                 f"canonical key: {key}",
                 "",
             ]
+        try:
+            if report_symbol and not self._is_valid_exchange_market_symbol(
+                report_symbol
+            ):
+                lines.extend([
+                    "",
+                    "🚨 Invalid Market Warning",
+                    "현재 심볼은 exchange.markets에 없습니다: "
+                    f"{report_symbol}",
+                    "이 심볼은 스캔/상태평가/진입 대상에서 제외되어야 합니다.",
+                ])
+        except Exception:
+            pass
+        if 'ALUSDT' in available_keys and 'ALLOUSDT' in available_keys:
+            lines.extend([
+                "",
+                "ℹ️ AL/ALLO Symbol Note",
+                "ALUSDT와 ALLOUSDT가 모두 trace keys에 있습니다.",
+                "ALUSDT가 exchange.markets에 없다면 "
+                "SYMBOL_INVALID_MARKET으로 제외되어야 합니다.",
+                "ALLOUSDT는 ALLO/USDT:USDT로 유지되어야 하며 "
+                "AL/USDT:USDT로 축약되면 안 됩니다.",
+            ])
         for stage in important_stages:
             event = _last(stage)
             if not event:
@@ -8603,9 +8742,16 @@ class SignalEngine(BaseEngine):
         order_failed = _after_ready('ORDER_FAILED')
         has_position = _after_ready('POSITION_CONFIRMED') is not None
         entry_blocked = _after_ready('ENTRY_BLOCKED')
+        invalid_market_event = _last('SYMBOL_INVALID_MARKET')
 
         lines.extend(["", "== Diagnosis =="])
-        if has_ready and bridge_event is None and bridge_blocked is None and not has_entry_call:
+        if invalid_market_event is not None:
+            diagnosis = "존재하지 않는 Binance Futures 심볼 차단"
+            meaning = (
+                "exchange.markets에 없는 심볼입니다. data="
+                f"{invalid_market_event.get('data')}"
+            )
+        elif has_ready and bridge_event is None and bridge_blocked is None and not has_entry_call:
             diagnosis = "STATUS_READY 이후 AUTO_ENTRY_BRIDGE/ENTRY_CALL 전에서 끊김"
             meaning = "조건창은 진입 가능인데 ready plan을 실제 주문 실행 브리지로 넘기지 못함"
         elif bridge_blocked is not None and not has_entry_call:
@@ -8838,17 +8984,25 @@ class SignalEngine(BaseEngine):
                 )
                 return False
 
-            if self._is_utbreakout_restricted_symbol(symbol):
-                reason = self._record_utbreakout_restricted_symbol(
+            ok_market, symbol, invalid_reason = (
+                self._ensure_valid_utbreakout_market_symbol(
                     symbol,
                     source='auto_entry_bridge',
                 )
+            )
+            if not ok_market:
                 self._utbreakout_trace_event(
                     symbol,
                     'AUTO_ENTRY_BRIDGE_BLOCKED',
-                    'RESTRICTED_SYMBOL',
+                    (
+                        'RESTRICTED_SYMBOL'
+                        if invalid_reason.startswith(
+                            'REJECTED_REGION_RESTRICTED_SYMBOL:'
+                        )
+                        else 'INVALID_MARKET'
+                    ),
                     source=source,
-                    reason=reason,
+                    reason=invalid_reason,
                 )
                 return False
 
@@ -12491,14 +12645,16 @@ class SignalEngine(BaseEngine):
         next_symbol, next_candidate = await self._resolve_next_utbreakout_scan_candidate(
             excluded_symbols=position_symbols
         )
-        if (
-            next_symbol
-            and self._is_utbreakout_restricted_symbol(next_symbol)
-        ):
-            self._record_utbreakout_restricted_symbol(
-                next_symbol,
-                source='status_next_candidate_filter',
+        if next_symbol:
+            ok_market, next_symbol, _ = (
+                self._ensure_valid_utbreakout_market_symbol(
+                    next_symbol,
+                    source='status_next_candidate_filter',
+                )
             )
+        else:
+            ok_market = True
+        if not ok_market:
             next_symbol = None
             next_candidate = None
 
@@ -12717,22 +12873,46 @@ class SignalEngine(BaseEngine):
             phase='status_build_started',
         )
 
-        if self._is_utbreakout_restricted_symbol(symbol):
-            reason = self._record_utbreakout_restricted_symbol(
-                symbol,
-                source='status',
+        if self.is_upbit_mode():
+            ok_market = True
+            validation_reason = ''
+        else:
+            ok_market, symbol, validation_reason = (
+                self._ensure_valid_utbreakout_market_symbol(
+                    symbol,
+                    source='status',
+                )
+            )
+        self.utbreakout_last_status_symbol = symbol
+        if not ok_market:
+            restricted_symbol = validation_reason.startswith(
+                'REJECTED_REGION_RESTRICTED_SYMBOL:'
             )
             _record_status_evaluated(
-                'BLOCKED',
-                reason='REJECTED_REGION_RESTRICTED_SYMBOL: ' + reason,
+                'BLOCKED' if restricted_symbol else 'INVALID_MARKET',
+                reason=validation_reason,
             )
+            if restricted_symbol:
+                return enforce_utbreakout_effective_status_contract(
+                    "\n".join([
+                        "🚦 UT Breakout 조건 스테이터스",
+                        f"조건 평가 심볼: {symbol}",
+                        "최종: 진입 차단",
+                        f"🔴 제한 티커 제외: {validation_reason}",
+                        "이 심볼은 한국계정 거래 제한으로 "
+                        "스캔/진입 대상에서 제외됩니다.",
+                    ]),
+                    cfg,
+                )
             return enforce_utbreakout_effective_status_contract(
                 "\n".join([
                     "🚦 UT Breakout 조건 스테이터스",
                     f"조건 평가 심볼: {symbol}",
                     "최종: 진입 차단",
-                    f"🔴 제한 티커 제외: {reason}",
-                    "이 심볼은 한국계정 거래 제한으로 스캔/진입 대상에서 제외됩니다.",
+                    "🔴 유효하지 않은 Binance Futures 심볼: "
+                    f"{validation_reason}",
+                    "이 심볼은 exchange.markets에 없으므로 "
+                    "스캔/진입 대상에서 제외됩니다.",
                 ]),
                 cfg,
             )
@@ -18269,30 +18449,32 @@ class SignalEngine(BaseEngine):
             ctrl = getattr(self, 'ctrl', None)
             mode = ctrl.get_exchange_mode() if ctrl and hasattr(ctrl, 'get_exchange_mode') else None
             for requested_symbol in custom_symbols:
-                if (
-                    active_strategy in UTBREAKOUT_STRATEGIES
-                    and self._is_utbreakout_restricted_symbol(requested_symbol)
-                ):
-                    reason = self._record_utbreakout_restricted_symbol(
-                        requested_symbol,
-                        source='coin_selector_custom_universe',
+                if active_strategy in UTBREAKOUT_STRATEGIES:
+                    ok_market, normalized, invalid_reason = (
+                        self._ensure_valid_utbreakout_market_symbol(
+                            requested_symbol,
+                            source='coin_selector_custom_universe',
+                        )
                     )
-                    normalized = self._canonical_futures_symbol(
-                        requested_symbol
-                    )
-                    custom_resolution_rejected.append({
-                        'symbol': normalized,
-                        'exchange_symbol': normalized,
-                        'normalized_symbol': normalized,
-                        'accepted': False,
-                        'reject_reasons': [
-                            'REJECTED_REGION_RESTRICTED_SYMBOL',
-                        ],
-                        'analysis_error': reason,
-                        'selection_state': 'REJECTED',
-                        'custom_universe': True,
-                    })
-                    continue
+                    if not ok_market:
+                        reject_code = (
+                            'REJECTED_REGION_RESTRICTED_SYMBOL'
+                            if invalid_reason.startswith(
+                                'REJECTED_REGION_RESTRICTED_SYMBOL:'
+                            )
+                            else 'REJECTED_INVALID_MARKET_SYMBOL'
+                        )
+                        custom_resolution_rejected.append({
+                            'symbol': normalized,
+                            'exchange_symbol': normalized,
+                            'normalized_symbol': normalized,
+                            'accepted': False,
+                            'reject_reasons': [reject_code],
+                            'analysis_error': invalid_reason,
+                            'selection_state': 'REJECTED',
+                            'custom_universe': True,
+                        })
+                        continue
                 try:
                     if ctrl and hasattr(ctrl, '_resolve_futures_watch_symbol_from_markets'):
                         exchange_symbol = ctrl._resolve_futures_watch_symbol_from_markets(
@@ -18337,27 +18519,31 @@ class SignalEngine(BaseEngine):
         rejected = list(custom_resolution_rejected)
         include_tradifi_universe = self._coin_selector_should_include_tradifi_universe(cfg, custom_enabled)
         for symbol, ticker in ticker_items:
-            if (
-                active_strategy in UTBREAKOUT_STRATEGIES
-                and self._is_utbreakout_restricted_symbol(symbol)
-            ):
-                reason = self._record_utbreakout_restricted_symbol(
-                    symbol,
-                    source='coin_selector_candidate_filter',
+            if active_strategy in UTBREAKOUT_STRATEGIES:
+                ok_market, canonical, invalid_reason = (
+                    self._ensure_valid_utbreakout_market_symbol(
+                        symbol,
+                        source='coin_selector_candidate_filter',
+                    )
                 )
-                canonical = self._canonical_futures_symbol(symbol)
-                rejected.append({
-                    'symbol': canonical,
-                    'exchange_symbol': canonical,
-                    'normalized_symbol': canonical,
-                    'accepted': False,
-                    'reject_reasons': [
-                        'REJECTED_REGION_RESTRICTED_SYMBOL',
-                    ],
-                    'analysis_error': reason,
-                    'selection_state': 'REJECTED',
-                })
-                continue
+                if not ok_market:
+                    reject_code = (
+                        'REJECTED_REGION_RESTRICTED_SYMBOL'
+                        if invalid_reason.startswith(
+                            'REJECTED_REGION_RESTRICTED_SYMBOL:'
+                        )
+                        else 'REJECTED_INVALID_MARKET_SYMBOL'
+                    )
+                    rejected.append({
+                        'symbol': canonical,
+                        'exchange_symbol': canonical,
+                        'normalized_symbol': canonical,
+                        'accepted': False,
+                        'reject_reasons': [reject_code],
+                        'analysis_error': invalid_reason,
+                        'selection_state': 'REJECTED',
+                    })
+                    continue
             market = self._coin_selector_market_for_symbol(symbol, markets)
             tags = coin_selector_sector_tags_for_symbol(symbol, cfg.get('sector_overrides'))
             candidate_cfg = cfg
@@ -18502,22 +18688,25 @@ class SignalEngine(BaseEngine):
                     or item.get('normalized_symbol')
                     or item.get('symbol')
                 )
-                if self._is_utbreakout_restricted_symbol(candidate_symbol):
-                    reason = self._record_utbreakout_restricted_symbol(
+                ok_market, canonical_symbol, invalid_reason = (
+                    self._ensure_valid_utbreakout_market_symbol(
                         candidate_symbol,
                         source='coin_selector_selected_filter',
                     )
+                )
+                if not ok_market:
                     self._record_coin_selector_candidate_outcome(
-                        candidate_symbol,
-                        reason=(
-                            'REJECTED_REGION_RESTRICTED_SYMBOL: ' + reason
-                        ),
+                        canonical_symbol,
+                        reason=invalid_reason,
                         cfg=cfg,
                         decision_key=(
-                            f"restricted:{self._utbreakout_trace_key(candidate_symbol)}"
+                            "invalid_market:"
+                            f"{self._utbreakout_trace_key(canonical_symbol)}"
                         ),
                     )
                     continue
+                if item.get('exchange_symbol'):
+                    item['exchange_symbol'] = canonical_symbol
                 allowed_candidates.append(item)
             candidates = allowed_candidates
         if not candidates:
@@ -18546,23 +18735,24 @@ class SignalEngine(BaseEngine):
                 symbol,
                 source='coin_selector_scanner',
             )
-            if (
-                scanner_active_strategy in UTBREAKOUT_STRATEGIES
-                and self._is_utbreakout_restricted_symbol(symbol)
-            ):
-                reason = self._record_utbreakout_restricted_symbol(
-                    symbol,
-                    source='coin_selector_candidate_guard',
+            if scanner_active_strategy in UTBREAKOUT_STRATEGIES:
+                ok_market, symbol, invalid_reason = (
+                    self._ensure_valid_utbreakout_market_symbol(
+                        symbol,
+                        source='coin_selector_candidate_guard',
+                    )
                 )
-                self._record_coin_selector_candidate_outcome(
-                    symbol,
-                    reason='REJECTED_REGION_RESTRICTED_SYMBOL: ' + reason,
-                    cfg=cfg,
-                    decision_key=(
-                        f"restricted:{self._utbreakout_trace_key(symbol)}"
-                    ),
-                )
-                continue
+                if not ok_market:
+                    self._record_coin_selector_candidate_outcome(
+                        symbol,
+                        reason=invalid_reason,
+                        cfg=cfg,
+                        decision_key=(
+                            "invalid_market:"
+                            f"{self._utbreakout_trace_key(symbol)}"
+                        ),
+                    )
+                    continue
             self._utbreakout_trace_event(
                 symbol,
                 'COIN_SELECTED',
@@ -22140,36 +22330,49 @@ class SignalEngine(BaseEngine):
                     source='entry',
                 )
             raw_symbol = symbol
-            if (
-                trace_utbreakout
-                and self._is_utbreakout_restricted_symbol(symbol)
-            ):
-                reason = self._record_utbreakout_restricted_symbol(
-                    symbol,
-                    source='entry_guard',
+            if trace_utbreakout:
+                ok_market, symbol, validation_reason = (
+                    self._ensure_valid_utbreakout_market_symbol(
+                        symbol,
+                        source='entry_guard',
+                    )
+                )
+            else:
+                ok_market = True
+                validation_reason = ''
+            if not ok_market:
+                restricted_symbol = validation_reason.startswith(
+                    'REJECTED_REGION_RESTRICTED_SYMBOL:'
                 )
                 self._utbreakout_trace_event(
                     symbol,
                     'ENTRY_BLOCKED',
-                    'BLOCK',
+                    'BLOCK' if restricted_symbol else 'INVALID_MARKET',
                     side=side,
-                    reason='REJECTED_REGION_RESTRICTED_SYMBOL: ' + reason,
+                    reason=validation_reason,
                 )
-                self.last_entry_reason[symbol] = (
-                    'REJECTED_REGION_RESTRICTED_SYMBOL: ' + reason
-                )
+                self.last_entry_reason[symbol] = validation_reason
                 try:
-                    await self.ctrl.notify(
-                        "🔴 UTBreakout 진입 차단: 한국계정 제한 티커\n"
-                        f"symbol={symbol}\n"
-                        f"reason={reason}"
-                    )
+                    if restricted_symbol:
+                        await self.ctrl.notify(
+                            "🔴 UTBreakout 진입 차단: 한국계정 제한 티커\n"
+                            f"symbol={symbol}\n"
+                            f"reason={validation_reason}"
+                        )
+                    else:
+                        await self.ctrl.notify(
+                            "🔴 UTBreakout 진입 차단: 유효하지 않은 "
+                            "Binance Futures 심볼\n"
+                            f"symbol={symbol}\n"
+                            f"reason={validation_reason}"
+                        )
                 except Exception:
                     logger.debug(
-                        "restricted symbol notify skipped",
+                        "invalid UTBreakout symbol notify skipped",
                         exc_info=True,
                     )
                 return
+            raw_symbol = symbol
             if trace_utbreakout:
                 self._utbreakout_trace_event(
                     raw_symbol,
@@ -32259,7 +32462,21 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
             if not show_all and not symbol:
                 symbol = await _get_utbreakout_status_symbol_async()
 
-            if not show_all and not engine._utbreakout_recent_trace_events(symbol, limit=1):
+            invalid_market = False
+            if not show_all and symbol:
+                ok_market, symbol, _ = (
+                    engine._ensure_valid_utbreakout_market_symbol(
+                        symbol,
+                        source='trace_command',
+                    )
+                )
+                invalid_market = not ok_market
+
+            if (
+                not show_all
+                and not invalid_market
+                and not engine._utbreakout_recent_trace_events(symbol, limit=1)
+            ):
                 try:
                     await engine.build_utbreakout_condition_status_text(symbol)
                 except Exception:
