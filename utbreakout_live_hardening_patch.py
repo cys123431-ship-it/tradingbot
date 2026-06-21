@@ -113,7 +113,7 @@ PROFIT_MAX_OVERRIDES = {
     "bias_continuation_15m_max_signal_age": 10,
 
     # More trades in opportunity mode, but still bounded.
-    "max_daily_trades": 14,
+    "max_daily_trades": 7,
     "max_consecutive_losses": 5,
 
     # Profit capture: smaller TP1, larger TP2, more runner room.

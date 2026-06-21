@@ -19,7 +19,7 @@ def test_profit_patch_matches_opportunity_profile_values():
     assert cfg["second_take_profit_ratio"] == 0.40
     assert cfg["dynamic_tp2_elite_r_multiple"] == 7.0
     assert cfg["market_quality_min_risk_multiplier"] == 0.55
-    assert cfg["max_daily_trades"] == 14
+    assert cfg["max_daily_trades"] == 7
 
 
 def test_mark_core_filter_failure_as_hard_block_compatible():

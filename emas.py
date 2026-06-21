@@ -851,7 +851,7 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "adaptive_exit_activation_r_max": 1.8,
 
         # Bounded activity
-        "max_daily_trades": 14,
+        "max_daily_trades": 7,
         "max_consecutive_losses": 5,
     })
 
@@ -896,7 +896,7 @@ def build_utbreakout_effective_status_contract(cfg, daily_entries=None):
         except (TypeError, ValueError):
             entry_count = 0
         lines.append(
-            f"일일 리스크: trades {entry_count}/{int(effective.get('max_daily_trades', 14) or 14)}"
+            f"일일 리스크: trades {entry_count}/{int(effective.get('max_daily_trades', 7) or 7)}"
         )
     return lines
 
@@ -1093,7 +1093,7 @@ def apply_stable_utbreak_final_overrides(cfg):
         "adaptive_exit_activation_r_min": 1.4,
         "adaptive_exit_activation_r_max": 1.8,
 
-        "max_daily_trades": 14,
+        "max_daily_trades": 7,
         "max_consecutive_losses": 5,
     })
     cfg = apply_profit_opportunity_effective_overrides(cfg)
@@ -1848,7 +1848,7 @@ def build_default_utbot_filtered_breakout_config():
         'aggressive_growth_cppi_max_sleeve_pct': 0.20,
         'max_risk_per_trade_usdt': 1.0,
         'daily_max_loss_usdt': 3.0,
-        'max_daily_trades': 14,
+        'max_daily_trades': 7,
         'max_consecutive_losses': 5,
         'daily_profit_target_enabled': False,
         'daily_profit_target_usdt': 5.0,
@@ -5948,7 +5948,7 @@ class SignalEngine(BaseEngine):
             'adx_length': 14,
             'atr_length': 14,
             'donchian_length': 20,
-            'max_daily_trades': 14,
+            'max_daily_trades': 7,
             'max_consecutive_losses': 5,
             'sl_place_max_retries': 3,
             'opposite_set_exit_min_hold_candles': 3,
@@ -21347,8 +21347,8 @@ class SignalEngine(BaseEngine):
                 )
 
             elif active_strategy in UTBREAKOUT_STRATEGIES:
+                filtered_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
                 if pos:
-                    filtered_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
                     await self._manage_utbreakout_partial_trailing(symbol, pos, df, filtered_cfg)
                     pyramid_status = await self._maybe_apply_aggressive_growth_pyramiding(symbol, pos, df, filtered_cfg)
                     if isinstance(pyramid_status, dict) and pyramid_status.get('status') == 'ADDED':
@@ -21359,34 +21359,52 @@ class SignalEngine(BaseEngine):
                         f"포지션 보유 중 ({pos['side'].upper()}), UTBOT_FILTERED_BREAKOUT_V1 신규 진입 대기"
                     )
                     self._clear_utbot_filtered_breakout_entry_plan(symbol)
-                elif sig:
-                    self._clear_utbreakout_trailing_state(symbol, finalize=True, reason='position closed before new UTBreak signal')
-                    self._clear_aggressive_growth_position(symbol)
-                    self.last_entry_reason[symbol] = f"ACCEPTED_ENTRY: {sig.upper()} filtered breakout -> 진입"
-                    logger.info(f"[UTBOT_FILTERED_BREAKOUT_V1] New {sig.upper()} entry")
-                    plan = self._get_utbot_filtered_breakout_entry_plan(symbol, sig) or {}
-                    if not plan:
-                        logger.warning(
-                            "[UTBOT_FILTERED_BREAKOUT_V1] signal exists but entry plan missing before entry(): "
-                            "%s %s keys=%s",
-                            symbol,
-                            sig,
-                            list(getattr(self, 'utbot_filtered_breakout_entry_plans', {}).keys())[:20],
-                        )
-                    entry_ref_price = float(plan.get('entry_price') or k['c'])
-                    self._utbreakout_trace_event(
-                        symbol,
-                        'ENTRY_CALL',
-                        'CALLING',
-                        side=sig,
-                        entry_ref_price=entry_ref_price,
-                        source='process_primary_candle',
-                    )
-                    await self.entry(symbol, sig, entry_ref_price)
                 else:
-                    self._clear_utbreakout_trailing_state(symbol, finalize=True, reason='position closed while UTBreak waiting')
-                    self._clear_aggressive_growth_position(symbol)
-                    self._clear_utbot_filtered_breakout_entry_plan(symbol)
+                    flat_cleanup = await self._manage_live_ladder_exit_policy(
+                        symbol,
+                        None,
+                        df,
+                        filtered_cfg,
+                    )
+                    position_reappeared = (
+                        isinstance(flat_cleanup, dict)
+                        and flat_cleanup.get('status') == 'POSITION_ACTIVE'
+                    )
+                    cleanup_pending = (
+                        isinstance(flat_cleanup, dict)
+                        and flat_cleanup.get('status') == 'FLAT_CLEANUP_PENDING'
+                    )
+                    if position_reappeared or cleanup_pending:
+                        self.last_entry_reason[symbol] = (
+                            "포지션 재확인 또는 보호주문 정리 미확인: 신규 진입 보류"
+                        )
+                        self._clear_utbot_filtered_breakout_entry_plan(symbol)
+                    elif sig:
+                        self._clear_utbreakout_trailing_state(symbol, finalize=True, reason='position closed before new UTBreak signal')
+                        self._clear_aggressive_growth_position(symbol)
+                        self.last_entry_reason[symbol] = f"ACCEPTED_ENTRY: {sig.upper()} filtered breakout -> 진입"
+                        logger.info(f"[UTBOT_FILTERED_BREAKOUT_V1] New {sig.upper()} entry")
+                        plan = self._get_utbot_filtered_breakout_entry_plan(symbol, sig) or {}
+                        if not plan:
+                            logger.warning(
+                                "[UTBOT_FILTERED_BREAKOUT_V1] signal exists but entry plan missing before entry(): "
+                                "%s %s keys=%s",
+                                symbol,
+                                sig,
+                                list(getattr(self, 'utbot_filtered_breakout_entry_plans', {}).keys())[:20],
+                            )
+                        entry_ref_price = float(plan.get('entry_price') or k['c'])
+                        self._utbreakout_trace_event(
+                            symbol,
+                            'ENTRY_CALL',
+                            'CALLING',
+                            side=sig,
+                            entry_ref_price=entry_ref_price,
+                            source='process_primary_candle',
+                        )
+                        await self.entry(symbol, sig, entry_ref_price)
+                    else:
+                        self._clear_utbot_filtered_breakout_entry_plan(symbol)
 
             elif (active_strategy in MA_STRATEGIES and entry_mode in ['cross', 'position']) or active_strategy == 'cameron':
                 # Cross/Position 紐⑤뱶: Primary TF?먯꽌??"吏꾩엯(Entry)"留?泥섎━
@@ -24162,9 +24180,19 @@ class SignalEngine(BaseEngine):
                 alert=alert
             )
             if pos:
+                final_status['position_active'] = True
+                final_status['cleanup_confirmed'] = False
                 return final_status
-            remaining = await self._collect_protection_orders(symbol)
+            fetch_ok, remaining = await self._collect_protection_orders_checked(symbol)
+            if not fetch_ok:
+                final_status['position_active'] = False
+                final_status['cleanup_confirmed'] = False
+                final_status['remaining_orders'] = None
+                return final_status
             if not remaining:
+                final_status['position_active'] = False
+                final_status['cleanup_confirmed'] = True
+                final_status['remaining_orders'] = 0
                 return final_status
             await self._cancel_protection_orders(
                 symbol,
@@ -24173,6 +24201,16 @@ class SignalEngine(BaseEngine):
             )
             if attempt < total_attempts - 1:
                 await asyncio.sleep(0.5)
+        fetch_ok, remaining = await self._collect_protection_orders_checked(symbol)
+        if final_status is None:
+            final_status = {}
+        final_status['position_active'] = False
+        final_status['cleanup_confirmed'] = bool(fetch_ok and not remaining)
+        final_status['remaining_orders'] = len(remaining or []) if fetch_ok else None
+        if fetch_ok and remaining:
+            final_status['status'] = 'ORPHAN_CANCEL_FAILED'
+        elif not fetch_ok:
+            final_status['status'] = 'OPEN_ORDERS_FETCH_FAILED'
         return final_status
 
     async def _notify_protection_issue(self, symbol, kind, message, cooldown_sec=300):
@@ -38388,10 +38426,25 @@ async def _manage_live_ladder_exit_policy(self, symbol, pos, df, cfg):
     state = getattr(self, "utbreakout_trailing_states", {}).get(symbol)
     if not isinstance(state, dict):
         return None
-    if not bool(state.get("advanced_live_ladder_state", False)):
-        return None
     if not pos:
-        self._clear_utbreakout_trailing_state(symbol, finalize=True, reason="position closed")
+        cleanup_status = await self._reconcile_closed_position_protection(
+            symbol,
+            reason="take profit closed position",
+            alert=True,
+            attempts=3,
+        )
+        if isinstance(cleanup_status, dict) and cleanup_status.get("position_active"):
+            return {"status": "POSITION_ACTIVE", "audit": cleanup_status}
+        if isinstance(cleanup_status, dict) and cleanup_status.get("cleanup_confirmed"):
+            self._clear_utbreakout_trailing_state(
+                symbol,
+                finalize=True,
+                reason="take profit closed position",
+            )
+            self._clear_aggressive_growth_position(symbol)
+            return {"status": "FLAT_CLEANED", "audit": cleanup_status}
+        return {"status": "FLAT_CLEANUP_PENDING", "audit": cleanup_status}
+    if not bool(state.get("advanced_live_ladder_state", False)):
         return None
     if df is None or len(df) < 5:
         return None

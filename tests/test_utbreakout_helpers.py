@@ -2044,7 +2044,81 @@ def test_reconcile_closed_position_cancels_leftover_tp_and_sl_orders():
 
     assert status["status"] == "ORPHAN_CANCELLED"
     assert status["orphan_cancelled"] == 2
+    assert status["cleanup_confirmed"] is True
+    assert status["remaining_orders"] == 0
     assert engine.exchange.orders == []
+
+
+def test_live_ladder_flat_position_cancels_leftover_sl_before_clearing_state():
+    engine = _protection_engine(
+        [
+            {
+                "id": "sl-left",
+                "side": "sell",
+                "type": "market",
+                "clientOrderId": "utbslBTCUSDTleft",
+                "info": {
+                    "origType": "STOP_MARKET",
+                    "stopPrice": "95",
+                    "reduceOnly": "true",
+                    "symbol": "BTCUSDT",
+                },
+            }
+        ],
+        positions=[],
+    )
+    engine.utbreakout_trailing_states = {
+        "BTC/USDT": {
+            "side": "long",
+            "entry_price": 100.0,
+            "risk_distance": 5.0,
+            "last_stop_price": 95.0,
+        }
+    }
+
+    result = asyncio.run(
+        engine._manage_live_ladder_exit_policy(
+            "BTC/USDT",
+            None,
+            None,
+            {},
+        )
+    )
+
+    assert result["status"] == "FLAT_CLEANED"
+    assert result["audit"]["cleanup_confirmed"] is True
+    assert engine.exchange.orders == []
+    assert "BTC/USDT" not in engine.utbreakout_trailing_states
+
+
+def test_live_ladder_flat_cleanup_keeps_state_when_order_fetch_is_unverified():
+    class _FetchFailExchange(_FakeExchange):
+        def fetch_open_orders(self, symbol=None):
+            raise RuntimeError("open orders unavailable")
+
+    engine = _protection_engine([], positions=[])
+    engine.exchange = _FetchFailExchange([], positions=[])
+    engine.utbreakout_trailing_states = {
+        "BTC/USDT": {
+            "side": "long",
+            "entry_price": 100.0,
+            "risk_distance": 5.0,
+            "last_stop_price": 95.0,
+        }
+    }
+
+    result = asyncio.run(
+        engine._manage_live_ladder_exit_policy(
+            "BTC/USDT",
+            None,
+            None,
+            {},
+        )
+    )
+
+    assert result["status"] == "FLAT_CLEANUP_PENDING"
+    assert result["audit"]["cleanup_confirmed"] is False
+    assert "BTC/USDT" in engine.utbreakout_trailing_states
 
 
 def test_global_orphan_sweep_cancels_leftover_stop_loss_without_tracked_symbol():

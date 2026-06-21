@@ -31,7 +31,7 @@ def test_profit_opportunity_final_overrides_are_authoritative():
     assert cfg["second_take_profit_ratio"] == 0.40
     assert cfg["bias_continuation_min_volume_ratio"] == 0.40
     assert cfg["bias_continuation_15m_min_volume_ratio"] == 0.45
-    assert cfg["max_daily_trades"] == 14
+    assert cfg["max_daily_trades"] == 7
     assert cfg["runner_chandelier_enabled"] is True
 
 

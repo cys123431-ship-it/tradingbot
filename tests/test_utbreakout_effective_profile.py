@@ -32,7 +32,7 @@ def test_profit_opportunity_effective_profile_overrides_old_values():
     assert out["second_take_profit_r_multiple"] == 3.50
     assert out["second_take_profit_ratio"] == 0.40
     assert out["take_profit_r_multiple"] >= 3.50
-    assert out["max_daily_trades"] == 14
+    assert out["max_daily_trades"] == 7
     assert out["bias_continuation_min_volume_ratio"] == 0.40
     assert out["bias_continuation_15m_min_volume_ratio"] == 0.45
     assert out["selected_set_core_filter_hard_block_enabled"] is True
@@ -68,7 +68,7 @@ def test_runtime_config_path_reapplies_effective_profile_after_persisted_values(
     assert cfg["partial_take_profit_r_multiple"] == 1.00
     assert cfg["second_take_profit_r_multiple"] == 3.50
     assert cfg["take_profit_r_multiple"] == 3.50
-    assert cfg["max_daily_trades"] == 14
+    assert cfg["max_daily_trades"] == 7
     assert cfg["bias_continuation_min_volume_ratio"] == 0.40
     assert cfg["bias_continuation_15m_min_volume_ratio"] == 0.45
 
@@ -95,7 +95,7 @@ def test_status_render_contract_replaces_stale_telegram_summary_values():
     assert "Effective TP2: 3.50R" in rendered
     assert "Effective volume: base 0.40 / 15m 0.45" in rendered
     assert "익절 계획: TP1 1.00R(20%) / TP2 3.50R(40%)" in rendered
-    assert "일일 리스크: trades 0/14" in rendered
+    assert "일일 리스크: trades 0/7" in rendered
     assert "익절 계획: 2.0R" not in rendered
     assert "Effective TP2: 2.00R" not in rendered
     assert "trades 0/10" not in rendered
