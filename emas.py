@@ -13732,6 +13732,96 @@ class SignalEngine(BaseEngine):
             return {'status': 'NO_POSITION', 'reason': message, 'side': sig}
         return {'status': 'POSITION_OPENED', 'side': sig, 'position': post_pos}
 
+    def _compact_side_gate_summary(self, side: str, ok: bool, side_lines: list[str]) -> str:
+        # 1. Side label
+        side_label = "LONG" if side == "long" else "SHORT"
+        
+        # 2. Entry status
+        entry_status = "진입 가능" if ok else "진입 안함"
+        
+        # Extract "필수 게이트" slice
+        required_start = -1
+        required_end = len(side_lines)
+        for i, line in enumerate(side_lines):
+            if "필수 게이트" in line:
+                required_start = i + 1
+            elif "참고/감액" in line and required_start != -1:
+                required_end = i
+                break
+                
+        required_lines = []
+        if required_start != -1 and required_start < required_end:
+            required_lines = side_lines[required_start:required_end]
+            
+        # 3. Gate icons
+        icons = []
+        for line in required_lines:
+            if "🔴" in line or "불만족" in line or "차단" in line or "REJECTED" in line:
+                icons.append("🔴")
+            elif "🟢" in line or "만족" in line:
+                icons.append("🟢")
+            elif "🟡" in line or "축소" in line or "대기" in line or "감액" in line:
+                icons.append("🟡")
+            else:
+                icons.append("⚪")
+                
+        # Pad or truncate to 7
+        if len(icons) < 7:
+            icons.extend(["⚪"] * (7 - len(icons)))
+        else:
+            icons = icons[:7]
+        icon_str = "".join(icons)
+        
+        # 4. Score extraction
+        score_val = "n/a"
+        # Search all lines
+        for line in side_lines:
+            m = re.search(r"score\s+([0-9]+(?:\.[0-9]+)?)", line, re.IGNORECASE)
+            if m:
+                score_val = m.group(1)
+                break
+        if score_val == "n/a":
+            for line in side_lines:
+                m = re.search(r"Feature Score:\s*([0-9]+(?:\.[0-9]+)?)", line)
+                if m:
+                    score_val = m.group(1)
+                    break
+        score_str = f"점수 {score_val}"
+        
+        # 5. Reason extraction
+        raw_reason = ""
+        # Find blocker lines in required_lines
+        blocker_candidates = []
+        for line in required_lines:
+            if "🔴" in line:
+                blocker_candidates.append((0, line))
+            elif "불만족" in line:
+                blocker_candidates.append((1, line))
+            elif "REJECTED" in line:
+                blocker_candidates.append((2, line))
+            elif "EV Adaptive 기대값" in line:
+                blocker_candidates.append((3, line))
+                
+        if blocker_candidates:
+            # sort by priority
+            blocker_candidates.sort(key=lambda x: x[0])
+            raw_reason = blocker_candidates[0][1]
+        
+        # Clean the reason
+        reason_str = ""
+        if raw_reason:
+            # Remove prefix like 🔴 불만족 5. or 🟢 만족 1.
+            cleaned = re.sub(r"^[🟢🔴🟡⚪]\s*(?:만족|불만족|축소|대기)?\s*[0-9]+\.\s*", "", raw_reason)
+            # Replace multiple spaces with single space
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            if len(cleaned) > 90:
+                cleaned = cleaned[:87] + "..."
+            reason_str = cleaned
+        else:
+            reason_str = "조건 충족" if ok else "대기 조건"
+            
+        return f"{side_label}: {icon_str} | {score_str} | {entry_status} | 이유: {reason_str}"
+
     async def build_utbreakout_condition_status_text(self, symbol):
         if not self.is_upbit_mode():
             symbol = self._canonicalize_utbreakout_symbol_for_use(
@@ -14922,6 +15012,9 @@ class SignalEngine(BaseEngine):
         vol_base = float(cfg.get("bias_continuation_min_volume_ratio", 0.40) or 0.40)
         vol_15m = float(cfg.get("bias_continuation_15m_min_volume_ratio", 0.45) or 0.45)
 
+        compact_long = self._compact_side_gate_summary("long", long_ok, long_lines)
+        compact_short = self._compact_side_gate_summary("short", short_ok, short_lines)
+
         text_lines = [
             "🚦 UT Breakout 조건 스테이터스",
             *build_utbreakout_effective_status_contract(cfg, daily_entries),
@@ -14947,6 +15040,10 @@ class SignalEngine(BaseEngine):
             self.get_coin_selector_symbol_summary(symbol),
             "주의: 빨간 필수 게이트만 진입 차단입니다. 노란 항목은 진입 차단이 아니라 수량/리스크 축소입니다.",
             f"최종: LONG {'가능' if long_ok else '대기'} / SHORT {'가능' if short_ok else '대기'}",
+            "",
+            "요약 신호등",
+            compact_long,
+            compact_short,
             "",
             *long_lines,
             "",
@@ -31329,7 +31426,7 @@ class MainController:
         return "message is too long" in message or "message_too_long" in message
 
     @staticmethod
-    def _build_telegram_long_text_preview(text, max_chars=3600, max_lines=45, suffix="상세 내용은 파일로 보냈습니다."):
+    def _build_telegram_long_text_preview(text, max_chars=3600, max_lines=55, suffix="상세 내용은 파일로 보냈습니다."):
         raw = str(text or "").strip()
         if not raw:
             return suffix

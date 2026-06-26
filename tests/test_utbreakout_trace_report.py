@@ -137,3 +137,74 @@ def test_utbreakout_watchdog_does_not_report_after_order_attempt():
 
     assert sent is False
     assert notifications == []
+
+
+def test_utbreakout_status_includes_compact_long_short_traffic_lights():
+    engine = _build_trace_engine()
+    
+    long_lines = [
+        "LONG: 대기",
+        "필수 게이트",
+        "🟢 만족 1. UTBot 방향: LONG bias_state",
+        "🟢 만족 2. 방향 필터: EV Adaptive 통합 방향 판정 사용",
+        "🟢 만족 3. 선택 Set 필터: 선택 Set 추가 필터 없음",
+        "🟡 축소 4. 시장 품질: REDUCE x0.25",
+        "🔴 불만족 5. EV Adaptive 기대값: NO_TRADE score 41.5: MTF alignment 0/3; score 41.5<60.0",
+        "🟢 만족 6. 일일 리스크: PnL 0.00 / trades 0/7",
+        "🟡 대기 7. ATR 손절/RR/수량: 리스크 예산 없음",
+    ]
+    short_lines = [
+        "SHORT: 대기",
+        "필수 게이트",
+        "🔴 불만족 1. UTBot 방향: 현재 LONG / bias LONG",
+        "🟢 만족 2. 방향 필터: EV Adaptive 통합 방향 판정 사용",
+        "🟢 만족 3. 선택 Set 필터: 선택 Set 추가 필터 없음",
+        "🟡 축소 4. 시장 품질: REDUCE x0.25",
+        "🔴 불만족 5. EV Adaptive 기대값: NO_TRADE score 38.2: no trend or squeeze edge",
+        "🟢 만족 6. 일일 리스크: PnL 0.00 / trades 0/7",
+        "🟡 대기 7. ATR 손절/RR/수량: 리스크 예산 없음",
+    ]
+    
+    compact_long = engine._compact_side_gate_summary("long", False, long_lines)
+    compact_short = engine._compact_side_gate_summary("short", False, short_lines)
+    
+    assert "LONG: 🟢🟢🟢🟡🔴🟢🟡 | 점수 41.5 | 진입 안함 | 이유: EV Adaptive 기대값: NO_TRADE score 41.5: MTF alignment 0/3; score 41.5<60.0" in compact_long
+    assert "SHORT: 🔴🟢🟢🟡🔴🟢🟡 | 점수 38.2 | 진입 안함 | 이유: UTBot 방향: 현재 LONG / bias LONG" in compact_short
+
+
+def test_compact_side_summary_preserves_short_visibility_before_preview_cutoff():
+    engine = _build_trace_engine()
+    
+    long_lines = [
+        "LONG: 대기",
+        "필수 게이트",
+        "🟢 만족 1. UTBot 방향: LONG bias_state",
+        "🟡 축소 2. 시장 품질: REDUCE x0.25",
+        "🔴 불만족 3. EV Adaptive 기대값: NO_TRADE score 41.5: MTF alignment 0/3",
+    ]
+    short_lines = [
+        "SHORT: 대기",
+        "필수 게이트",
+        "🔴 불만족 1. UTBot 방향: 현재 LONG",
+        "🟡 축소 2. 시장 품질: REDUCE x0.25",
+        "🔴 불만족 3. EV Adaptive 기대값: NO_TRADE score 38.2",
+    ]
+    
+    text = "\n".join([
+        "🚦 UT Breakout 조건 스테이터스",
+        "최종: LONG 대기 / SHORT 대기",
+        "",
+        "요약 신호등",
+        engine._compact_side_gate_summary("long", False, long_lines),
+        engine._compact_side_gate_summary("short", False, short_lines),
+        "",
+        *long_lines,
+        "",
+        *short_lines
+    ])
+    
+    preview = emas.MainController._build_telegram_long_text_preview(text, max_lines=55)
+    
+    assert "요약 신호등" in preview
+    assert "LONG: 🟢🟡🔴⚪⚪⚪⚪ | 점수 41.5" in preview
+    assert "SHORT: 🔴🟡🔴⚪⚪⚪⚪ | 점수 38.2" in preview
