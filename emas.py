@@ -9316,6 +9316,99 @@ class SignalEngine(BaseEngine):
             logger.exception("UTBreakout entry watchdog failed")
             return False
 
+    def _build_utbreakout_execution_eligibility(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        candidate_side: str | None,
+        candidate_type: str | None,
+        side_condition_ok: bool,
+        risk_ok: bool,
+        planned_qty: float | None,
+        risk_usdt: float | None,
+        entry_plan_detail: str,
+        cooldown_reasons: list[str],
+        has_open_position: bool,
+        has_other_position: bool,
+        auto_entry_enabled: bool,
+        daily_risk_ok: bool,
+        plan_lookup_ready: bool,
+        cfg: dict,
+    ):
+        blockers = []
+        warnings = []
+
+        # 1. auto entry master switch
+        if not auto_entry_enabled:
+            blockers.append("bridge disabled")
+        if self.ctrl.is_paused:
+            blockers.append("bot is paused")
+
+        # 2. strategy check
+        strategy_params = self.get_runtime_strategy_params()
+        active_strategy = str(strategy_params.get('active_strategy', '') or '').lower()
+        if active_strategy not in UTBREAKOUT_STRATEGIES:
+            blockers.append("active strategy not UTBreakout")
+
+        # 3. side match
+        if not candidate_side or candidate_side != side:
+            blockers.append("direction mismatch")
+
+        # 4. side condition
+        if not side_condition_ok:
+            blockers.append("side condition failed")
+
+        # 5. risk plan & quantity
+        if not risk_ok:
+            blockers.append("risk plan blocked")
+        if planned_qty is None or not np.isfinite(planned_qty) or planned_qty <= 0:
+            blockers.append("planned quantity zero")
+        if risk_usdt is None or not np.isfinite(risk_usdt) or risk_usdt <= 0:
+            blockers.append("planned risk zero")
+
+        # 6. daily risk limit
+        if not daily_risk_ok:
+            blockers.append("daily risk limit reached")
+
+        # 7. position checks
+        if has_open_position:
+            blockers.append("position already exists")
+        if has_other_position:
+            blockers.append("other symbol position exists")
+
+        # 8. cooldowns
+        if cooldown_reasons:
+            for r in cooldown_reasons:
+                blockers.append(f"cooldown: {r}")
+
+        # 9. plan lookup
+        if not plan_lookup_ready:
+            blockers.append("ready entry plan missing")
+
+        # 10. continuation entries config
+        allow_continuation = bool(cfg.get('utbreakout_allow_continuation_auto_entry', True))
+        if candidate_type == 'bias_state' and not allow_continuation:
+            blockers.append("continuation entry disabled")
+
+        can_attempt = len(blockers) == 0
+
+        expected_trace = []
+        if can_attempt:
+            expected_trace = ["STATUS_READY", "AUTO_ENTRY_BRIDGE", "ENTRY_CALL", "PLAN_LOOKUP", "ORDER_ATTEMPT"]
+
+        return {
+            'side': side,
+            'symbol': symbol,
+            'condition_ok': side_condition_ok,
+            'risk_ok': risk_ok,
+            'can_attempt': can_attempt,
+            'blockers': blockers,
+            'warnings': warnings,
+            'candidate_type': candidate_type,
+            'expected_trace': expected_trace
+        }
+
     def _ensure_utbreakout_auto_entry_bridge_state(self):
         if not isinstance(
             getattr(self, 'utbreakout_auto_entry_bridge_last_attempt_ts', None),
@@ -9455,6 +9548,17 @@ class SignalEngine(BaseEngine):
                 and isinstance(ready_event.get('data'), dict)
                 else {}
             )
+            ctx = await self._evaluate_utbreakout_eligibility_context(symbol)
+            if not ctx.get('ok_market'):
+                self._utbreakout_trace_event(
+                    symbol,
+                    'AUTO_ENTRY_BRIDGE_BLOCKED',
+                    'INVALID_MARKET_CONTEXT',
+                    source=source,
+                    reason=ctx.get('validation_reason') or ctx.get('reason') or 'invalid market context',
+                )
+                return False
+
             side = str(
                 ready_data.get('side')
                 or self.utbreakout_last_ready_side.get(key)
@@ -9471,19 +9575,22 @@ class SignalEngine(BaseEngine):
                 )
                 return False
 
-            pos = await self.get_server_position(symbol, use_cache=False)
-            if pos:
+            eligibility = ctx['long_eligibility'] if side == 'long' else ctx['short_eligibility']
+            
+            if not eligibility['can_attempt']:
+                block_reason = "; ".join(eligibility['blockers']) or "execution blocked"
                 self._utbreakout_trace_event(
                     symbol,
                     'AUTO_ENTRY_BRIDGE_BLOCKED',
-                    'POSITION_EXISTS',
+                    'ELIGIBILITY_REJECTED',
                     source=source,
-                    reason='position already exists',
+                    reason=block_reason,
                     side=side,
-                    position=str(pos)[:300],
+                    blockers=eligibility['blockers'],
                 )
                 return False
 
+            # Get the plan
             plan = self._get_utbot_filtered_breakout_entry_plan(symbol, side)
             if not isinstance(plan, dict):
                 self._utbreakout_trace_event(
@@ -9493,13 +9600,6 @@ class SignalEngine(BaseEngine):
                     source=source,
                     reason='ready entry plan is missing',
                     side=side,
-                    available_plan_keys=list(
-                        getattr(
-                            self,
-                            'utbot_filtered_breakout_entry_plans',
-                            {},
-                        ).keys()
-                    )[:20],
                 )
                 return False
 
@@ -13552,7 +13652,6 @@ class SignalEngine(BaseEngine):
         if next_candidate:
             next_symbol = self._canonicalize_utbreakout_symbol_for_use(
                 next_symbol,
-                source='status_next_candidate',
             )
             self.current_utbreakout_candidate_symbol = next_symbol
             self._utbreakout_trace_event(
@@ -13583,6 +13682,126 @@ class SignalEngine(BaseEngine):
                     f"⚠️ 상태 경고: 다음 후보({next_symbol})와 조건 평가 심볼({evaluated_symbol})이 다릅니다."
                 )
         return lines
+
+    async def build_utbreakout_condition_status_text(self, symbol):
+        ctx = await self._evaluate_utbreakout_eligibility_context(symbol)
+        if not ctx.get('ok_market'):
+            if ctx.get('unsupported_mode'):
+                return enforce_utbreakout_effective_status_contract(
+                    "🚦 UT Breakout 조건 스테이터스\n\n업비트 현물 모드에서는 UTBOT_FILTERED_BREAKOUT_V1을 사용하지 않습니다.",
+                    ctx['cfg']
+                )
+            if ctx.get('insufficient_data'):
+                return enforce_utbreakout_effective_status_contract(
+                    f"🚦 UT Breakout 조건 스테이터스\n\n{ctx.get('reason', '')}",
+                    ctx['cfg']
+                )
+            if ctx.get('restricted_symbol'):
+                return enforce_utbreakout_effective_status_contract(
+                    "\n".join([
+                        "🚦 UT Breakout 조건 스테이터스",
+                        f"조건 평가 심볼: {ctx['symbol']}",
+                        "최종: 진입 차단",
+                        f"🔴 제한 티커 제외: {ctx['validation_reason']}",
+                        "이 심볼은 한국계정 거래 제한으로 스캔/진입 대상에서 제외됩니다.",
+                    ]),
+                    ctx['cfg']
+                )
+            return enforce_utbreakout_effective_status_contract(
+                "\n".join([
+                    "🚦 UT Breakout 조건 스테이터스",
+                    f"조건 평가 심볼: {ctx['symbol']}",
+                    "최종: 진입 차단",
+                    f"🔴 유효하지 않은 Binance Futures 심볼: {ctx['validation_reason']}",
+                    "이 심볼은 exchange.markets에 없으므로 스캔/진입 대상에서 제외됩니다.",
+                ]),
+                ctx['cfg']
+            )
+
+        cfg = ctx['cfg']
+        long_eligibility = ctx['long_eligibility']
+        short_eligibility = ctx['short_eligibility']
+        long_ok = ctx['long_ok']
+        short_ok = ctx['short_ok']
+        long_lines = ctx['long_lines']
+        short_lines = ctx['short_lines']
+        
+        compact_long = self._compact_side_gate_summary("long", long_ok, long_lines, execution_eligibility=long_eligibility)
+        compact_short = self._compact_side_gate_summary("short", short_ok, short_lines, execution_eligibility=short_eligibility)
+
+        long_gate_lbl = "주문시도 대상 - STATUS_READY → AUTO_ENTRY_BRIDGE → ENTRY_CALL 예상" if long_eligibility['can_attempt'] else f"차단 - {'; '.join(long_eligibility['blockers'])}" if long_eligibility['blockers'] else "대기"
+        short_gate_lbl = "주문시도 대상 - STATUS_READY → AUTO_ENTRY_BRIDGE → ENTRY_CALL 예상" if short_eligibility['can_attempt'] else f"차단 - {'; '.join(short_eligibility['blockers'])}" if short_eligibility['blockers'] else "대기"
+
+        long_final_lbl = "주문시도 대상" if long_eligibility['can_attempt'] else "조건통과-실행차단" if long_ok else "대기"
+        short_final_lbl = "주문시도 대상" if short_eligibility['can_attempt'] else "조건통과-실행차단" if short_ok else "대기"
+
+        adaptive_tfs = cfg.get("adaptive_timeframes", ["15m", "30m", "1h"])
+        position_scan_context = await self._build_utbreakout_position_scan_context_lines(ctx['symbol'])
+
+        def _fmt(value, digits=2):
+            try:
+                if value is None or not np.isfinite(float(value)):
+                    return "n/a"
+                return f"{float(value):.{digits}f}"
+            except (TypeError, ValueError):
+                return "n/a"
+
+        def _fmt_ts(ms):
+            try:
+                ts = int(ms or 0)
+                if ts <= 0:
+                    return "n/a"
+                return datetime.fromtimestamp(ts / 1000, timezone.utc).astimezone(
+                    timezone(timedelta(hours=9))
+                ).strftime('%m-%d %H:%M KST')
+            except Exception:
+                return "n/a"
+
+        text_lines = [
+            "🚦 UT Breakout 조건 스테이터스",
+            *build_utbreakout_effective_status_contract(cfg, ctx['daily_entries']),
+            *position_scan_context,
+            "실행 게이트",
+            f"LONG: {long_gate_lbl}",
+            f"SHORT: {short_gate_lbl}",
+            "",
+            f"Runtime Profile: {cfg.get('runtime_profile', UTBREAKOUT_RUNTIME_PROFILE)}",
+            f"Effective TF: entry {ctx['entry_tf']} / htf {ctx['htf_tf']} / adaptive {', '.join(map(str, adaptive_tfs))}",
+            f"TF: 진입 {ctx['entry_tf']} / HTF {ctx['htf_tf']}",
+            f"Adaptive TF: {'ON' if cfg.get('adaptive_timeframe_enabled') else 'OFF'} / {self._format_adaptive_timeframe_summary(ctx['adaptive_decision']) if ctx['adaptive_decision'] else '고정 시간봉'}",
+            f"마지막 마감봉: {_fmt_ts(ctx['decision_ts'])} / close {_fmt(ctx['entry_price'], 4)}",
+            f"현재 UTBot 방향: {ctx['ut_label']}",
+            f"선택모드: {ctx['mode_label']}",
+            f"선택 Set: Set{ctx['selected_set'].get('id')} {ctx['selected_set'].get('name')} ({ctx['set_status']})",
+            f"선택 이유: {ctx['auto_reason'] or '수동 선택'}",
+            ctx['entry_plan_detail'],
+            ctx['micro_line'],
+            ctx['opposite_set_exit_detail'],
+            f"시장 레짐: {ctx['market_regime_context'].get('summary') or '데이터 대기'}",
+            f"AUTO 점수: {ctx['score_line']}",
+            ctx['orderflow_line'],
+            ctx['oi_line'],
+            ctx['squeeze_line'],
+            ctx['feature_line'],
+            self.get_coin_selector_symbol_summary(ctx['symbol']),
+            "주의: 빨간 필수 게이트만 진입 차단입니다. 노란 항목은 진입 차단이 아니라 수량/리스크 축소입니다.",
+            f"최종: LONG {long_final_lbl} / SHORT {short_final_lbl}",
+            "",
+            "요약 신호등",
+            compact_long,
+            compact_short,
+            "",
+            *long_lines,
+            "",
+            *short_lines,
+            "",
+            f"UT 사유: {ctx['ut_reason']}"
+        ]
+        return enforce_utbreakout_effective_status_contract(
+            "\n".join(text_lines),
+            cfg,
+            ctx['daily_entries'],
+        )
 
     async def _build_direction_decision_for_status(self, symbol, side, filter_values):
         try:
@@ -13732,12 +13951,26 @@ class SignalEngine(BaseEngine):
             return {'status': 'NO_POSITION', 'reason': message, 'side': sig}
         return {'status': 'POSITION_OPENED', 'side': sig, 'position': post_pos}
 
-    def _compact_side_gate_summary(self, side: str, ok: bool, side_lines: list[str]) -> str:
+    def _compact_side_gate_summary(
+        self,
+        side: str,
+        ok: bool,
+        side_lines: list[str],
+        execution_eligibility: dict | None = None
+    ) -> str:
         # 1. Side label
         side_label = "LONG" if side == "long" else "SHORT"
         
         # 2. Entry status
-        entry_status = "진입 가능" if ok else "진입 안함"
+        if execution_eligibility is not None:
+            if execution_eligibility.get('can_attempt'):
+                entry_status = "진입 가능 / 주문시도 대상"
+            elif ok:
+                entry_status = "조건통과 / 주문 안함"
+            else:
+                entry_status = "진입 안함"
+        else:
+            entry_status = "진입 가능" if ok else "진입 안함"
         
         # Extract "필수 게이트" slice
         required_start = -1
@@ -13817,10 +14050,1050 @@ class SignalEngine(BaseEngine):
             if len(cleaned) > 90:
                 cleaned = cleaned[:87] + "..."
             reason_str = cleaned
+        elif execution_eligibility is not None and not execution_eligibility.get('can_attempt') and ok:
+            # Filter passed but execution is blocked
+            blockers = execution_eligibility.get('blockers') or []
+            cleaned = "; ".join(blockers)
+            if len(cleaned) > 90:
+                cleaned = cleaned[:87] + "..."
+            reason_str = cleaned
         else:
             reason_str = "조건 충족" if ok else "대기 조건"
             
         return f"{side_label}: {icon_str} | {score_str} | {entry_status} | 이유: {reason_str}"
+
+    async def _evaluate_utbreakout_eligibility_context(self, symbol):
+        if not self.is_upbit_mode():
+            symbol = self._canonicalize_utbreakout_symbol_for_use(
+                symbol,
+                source='status',
+            )
+        cfg = self._get_utbot_filtered_breakout_config(self.get_runtime_strategy_params())
+        cfg = apply_stable_utbreak_final_overrides(cfg)
+        cfg = apply_profit_opportunity_effective_overrides(cfg)
+        self.utbreakout_last_status_symbol = symbol
+        common_cfg = self.get_runtime_common_settings()
+        lev = int(max(1.0, float(common_cfg.get('leverage', 5) or 5)))
+        entry_tf = cfg.get('entry_timeframe', '15m')
+        htf_tf = cfg.get('htf_timeframe', '1h')
+
+        def _record_status_evaluated(status='OK', **data):
+            self._utbreakout_trace_event(
+                symbol,
+                'STATUS_EVALUATED',
+                status,
+                effective_profile=cfg.get('effective_profile_version'),
+                entry_tf=cfg.get('entry_timeframe', entry_tf),
+                htf=cfg.get('htf_timeframe', htf_tf),
+                **data,
+            )
+
+        _record_status_evaluated(
+            'START',
+            phase='status_build_started',
+        )
+
+        if self.is_upbit_mode():
+            ok_market = True
+            validation_reason = ''
+        else:
+            ok_market, symbol, validation_reason = (
+                self._ensure_valid_utbreakout_market_symbol(
+                    symbol,
+                    source='status',
+                )
+            )
+        self.utbreakout_last_status_symbol = symbol
+        if not ok_market:
+            restricted_symbol = validation_reason.startswith(
+                'REJECTED_REGION_RESTRICTED_SYMBOL:'
+            )
+            _record_status_evaluated(
+                'BLOCKED' if restricted_symbol else 'INVALID_MARKET',
+                reason=validation_reason,
+            )
+            return {
+                'ok_market': False,
+                'restricted_symbol': restricted_symbol,
+                'validation_reason': validation_reason,
+                'symbol': symbol,
+                'cfg': cfg
+            }
+
+        def _icon(state):
+            if state is True:
+                return "🟢"
+            if state is False:
+                return "🔴"
+            return "🟡"
+
+        def _state_label(state):
+            if state is True:
+                return "만족"
+            if state is False:
+                return "불만족"
+            if state == 'reduced':
+                return "축소"
+            return "대기"
+
+        def _fmt(value, digits=2):
+            try:
+                if value is None or not np.isfinite(float(value)):
+                    return "n/a"
+                return f"{float(value):.{digits}f}"
+            except (TypeError, ValueError):
+                return "n/a"
+
+        def _fmt_ts(ms):
+            try:
+                ts = int(ms or 0)
+                if ts <= 0:
+                    return "n/a"
+                return datetime.fromtimestamp(ts / 1000, timezone.utc).astimezone(
+                    timezone(timedelta(hours=9))
+                ).strftime('%m-%d %H:%M KST')
+            except Exception:
+                return "n/a"
+
+        def _line(idx, label, state, detail):
+            return f"{_icon(state)} {_state_label(state)} {idx}. {label}: {detail}"
+
+        if self.is_upbit_mode():
+            _record_status_evaluated(
+                'UNSUPPORTED_MODE',
+                reason='Upbit spot mode does not use UTBreakout',
+            )
+            return {
+                'ok_market': False,
+                'unsupported_mode': True,
+                'cfg': cfg
+            }
+
+        ohlcv = await asyncio.to_thread(
+            self.market_data_exchange.fetch_ohlcv,
+            symbol,
+            entry_tf,
+            limit=300
+        )
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        closed = df.iloc[:-1].copy().dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+        if len(closed) < 5:
+            _record_status_evaluated(
+                'INSUFFICIENT_VALID_DATA',
+                rows=len(closed),
+            )
+            return {
+                'ok_market': False,
+                'insufficient_data': True,
+                'cfg': cfg,
+                'reason': f"{symbol} {entry_tf} 유효 데이터 부족"
+            }
+
+        adaptive_decision = None
+        if bool(cfg.get('adaptive_timeframe_enabled', False)):
+            try:
+                cfg, df, adaptive_decision = await self._resolve_utbreakout_adaptive_timeframe(symbol, df, cfg)
+                cfg = apply_profit_opportunity_effective_overrides(cfg)
+                entry_tf = cfg.get('entry_timeframe', entry_tf)
+                htf_tf = cfg.get('htf_timeframe', htf_tf)
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                closed = df.iloc[:-1].copy().dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+                if len(closed) < 5:
+                    _record_status_evaluated(
+                        'INSUFFICIENT_ADAPTIVE_DATA',
+                        rows=len(closed),
+                    )
+                    return {
+                        'ok_market': False,
+                        'insufficient_data': True,
+                        'cfg': cfg,
+                        'reason': f"{symbol} {entry_tf} 유효 데이터 부족"
+                    }
+            except Exception as e:
+                adaptive_decision = {'selected_tf': None, 'decision': 'ERROR', 'reason': str(e), 'top3': []}
+
+        selected_set, auto_analysis, auto_reason = await self._resolve_utbreakout_selected_set(symbol, df, cfg)
+        effective_cfg = dict(cfg)
+        effective_cfg.update(selected_set.get('params', {}) if isinstance(selected_set, dict) else {})
+        effective_cfg['active_set_id'] = selected_set.get('id', cfg.get('active_set_id', UTBREAKOUT_DEFAULT_SET_ID))
+        effective_cfg['profile'] = f"set{effective_cfg['active_set_id']}"
+        cfg = effective_cfg
+        cfg = apply_stable_utbreak_final_overrides(cfg)
+        cfg = apply_profit_opportunity_effective_overrides(cfg)
+        entry_tf = cfg.get('entry_timeframe', '15m')
+        htf_tf = cfg.get('htf_timeframe', '1h')
+
+        decision_ts = int(closed.iloc[-1].get('timestamp') or 0) if len(closed) else 0
+        entry_price = float(closed.iloc[-1]['close']) if len(closed) else np.nan
+
+        ut_sig, ut_reason, ut_detail = self._calculate_utbot_signal(
+            df,
+            self._get_utbot_filtered_breakout_ut_params(cfg)
+        )
+        ut_detail = ut_detail or {}
+        ut_bias_side = str(ut_detail.get('bias_side') or '').lower()
+        candidate_side = ut_sig if ut_sig in {'long', 'short'} else ut_bias_side if ut_bias_side in {'long', 'short'} else None
+        candidate_type = 'fresh_signal' if ut_sig in {'long', 'short'} else 'bias_state' if candidate_side else 'waiting'
+
+        metrics = self._calculate_utbreakout_timeframe_metrics(closed, cfg)
+        ema_fast_len = int(cfg.get('ema_fast', 50) or 50)
+        ema_slow_len = int(cfg.get('ema_slow', 200) or 200)
+        htf_ready = False
+        htf_error = None
+        htf_close = htf_ema_fast = htf_ema_slow = htf_gap_pct = np.nan
+        htf_supertrend_direction = None
+        htf_supertrend_reason = None
+        try:
+            htf_ohlcv = await asyncio.to_thread(
+                self.market_data_exchange.fetch_ohlcv,
+                symbol,
+                htf_tf,
+                limit=300
+            )
+            htf_df = pd.DataFrame(htf_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                htf_df[col] = pd.to_numeric(htf_df[col], errors='coerce')
+            htf_closed = htf_df.iloc[:-1].dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+            if len(htf_closed) >= ema_slow_len + 2:
+                htf_close_series = htf_closed['close'].astype(float)
+                htf_ema_fast = float(htf_close_series.ewm(span=ema_fast_len, adjust=False).mean().iloc[-1])
+                htf_ema_slow = float(htf_close_series.ewm(span=ema_slow_len, adjust=False).mean().iloc[-1])
+                htf_close = float(htf_close_series.iloc[-1])
+                htf_gap_pct = abs(htf_ema_fast - htf_ema_slow) / max(abs(htf_close), 1e-9) * 100.0
+                htf_ready = True
+            else:
+                htf_error = f"데이터 부족 {len(htf_closed)}/{ema_slow_len + 2}"
+            htf_supertrend_direction, _, htf_supertrend_reason = self._calculate_utbot_filter_pack_supertrend_direction(
+                htf_closed,
+                length=10,
+                multiplier=3.0
+            )
+        except Exception as e:
+            htf_error = str(e)
+
+        futures_context = {}
+        try:
+            futures_context = (
+                (auto_analysis or {}).get('futures_context')
+                if isinstance(auto_analysis, dict) and isinstance((auto_analysis or {}).get('futures_context'), dict)
+                else None
+            )
+            if futures_context is None:
+                futures_context = await self._fetch_utbreakout_futures_context(symbol)
+            futures_context = dict(futures_context or {})
+        except Exception as e:
+            futures_context = {'futures_context_error': str(e)}
+        market_regime_context = {}
+        try:
+            market_regime_context = await self._fetch_utbreakout_market_regime_context(cfg)
+            market_regime_context = dict(market_regime_context or {})
+        except Exception as e:
+            market_regime_context = {'error': str(e)}
+
+        try:
+            status_atr_series = self._calculate_wilder_atr_series(closed, int(cfg.get('atr_length', 14) or 14))
+        except Exception:
+            status_atr_series = None
+
+        def _market_quality_filter_values():
+            def _candidate_signal_age_candles():
+                try:
+                    signal_ts = float(ut_detail.get('signal_ts') or 0.0)
+                    timeframe_ms = float(
+                        self._timeframe_to_ms(entry_tf) or (15 * 60 * 1000)
+                    )
+                    if signal_ts > 0 and decision_ts >= signal_ts:
+                        return (float(decision_ts) - signal_ts) / max(timeframe_ms, 1.0)
+                    if candidate_type == 'fresh_signal':
+                        return 0.0
+                except (TypeError, ValueError):
+                    if candidate_type == 'fresh_signal':
+                        return 0.0
+                return None
+
+            values = {
+                'entry_price': entry_price,
+                'open': metrics.get('open'),
+                'rsi': metrics.get('rsi'),
+                'macd_hist': metrics.get('macd_hist'),
+                'macd_hist_prev': metrics.get('macd_hist_prev'),
+                'roc_pct': metrics.get('roc_pct'),
+                'cci': metrics.get('cci'),
+                'stoch_k': metrics.get('stoch_k'),
+                'stoch_d': metrics.get('stoch_d'),
+                'atr': metrics.get('atr'),
+                'atr_pct': metrics.get('atr_pct'),
+                'adx': metrics.get('adx'),
+                'plus_di': metrics.get('plus_di'),
+                'minus_di': metrics.get('minus_di'),
+                'adx_reason': metrics.get('adx_reason'),
+                'chop': metrics.get('chop'),
+                'chop_reason': metrics.get('chop_reason'),
+                'ema50': metrics.get('ema_fast'),
+                'ema50_prev': metrics.get('ema_fast_prev'),
+                'ema200': metrics.get('ema_slow'),
+                'donchian_high_prev': metrics.get('donchian_high_prev'),
+                'donchian_low_prev': metrics.get('donchian_low_prev'),
+                'donchian_width_pct': metrics.get('donchian_width_pct'),
+                'bb_upper': metrics.get('bb_upper'),
+                'bb_lower': metrics.get('bb_lower'),
+                'bb_mid': metrics.get('bb_mid'),
+                'bb_width_pct': metrics.get('bb_width_pct'),
+                'bb_width_prev_pct': metrics.get('bb_width_prev_pct'),
+                'bb_width_min_pct': metrics.get('bb_width_min_pct'),
+                'bb_width_percentile': metrics.get('bb_width_percentile'),
+                'keltner_upper': metrics.get('keltner_upper'),
+                'keltner_lower': metrics.get('keltner_lower'),
+                'keltner_mid': metrics.get('keltner_mid'),
+                'keltner_width_pct': metrics.get('keltner_width_pct'),
+                'keltner_width_prev_pct': metrics.get('keltner_width_prev_pct'),
+                'keltner_squeeze_on': metrics.get('keltner_squeeze_on'),
+                'range_expansion_ratio': metrics.get('range_expansion_ratio'),
+                'range_compression_ratio': metrics.get('range_compression_ratio'),
+                'squeeze_release_state': metrics.get('squeeze_release_state'),
+                'volume_ratio': metrics.get('volume_ratio'),
+                'obv_slope_ratio': metrics.get('obv_slope_ratio'),
+                'mfi': metrics.get('mfi'),
+                'vwap': metrics.get('vwap'),
+                'vwap_slope': metrics.get('vwap_slope'),
+                'vwap_reason': metrics.get('vwap_reason'),
+                'psar_direction': metrics.get('psar_direction'),
+                'psar': metrics.get('psar'),
+                'psar_reason': metrics.get('psar_reason'),
+                'ichimoku_bias': metrics.get('ichimoku_bias'),
+                'ichimoku_top': metrics.get('ichimoku_top'),
+                'ichimoku_bottom': metrics.get('ichimoku_bottom'),
+                'vortex_plus': metrics.get('vortex_plus'),
+                'vortex_minus': metrics.get('vortex_minus'),
+                'vortex_reason': metrics.get('vortex_reason'),
+                'aroon_up': metrics.get('aroon_up'),
+                'aroon_down': metrics.get('aroon_down'),
+                'aroon_reason': metrics.get('aroon_reason'),
+                'session_hour_kst': metrics.get('session_hour_kst'),
+                'auto_scores': (auto_analysis or {}).get('scores') if isinstance(auto_analysis, dict) else {},
+                'mtf_metrics': (auto_analysis or {}).get('timeframes') if isinstance(auto_analysis, dict) else {},
+                'htf_ready': htf_ready,
+                'htf_error': htf_error,
+                'htf_close': htf_close,
+                'htf_ema_fast': htf_ema_fast,
+                'htf_ema_slow': htf_ema_slow,
+                'htf_gap_pct': htf_gap_pct,
+                'htf_supertrend_direction': htf_supertrend_direction,
+                'htf_supertrend_reason': htf_supertrend_reason,
+                'funding_rate': futures_context.get('funding_rate'),
+                'next_funding_time': futures_context.get('next_funding_time'),
+                'open_interest_delta_pct': futures_context.get('open_interest_delta_pct'),
+                'open_interest_delta_z': futures_context.get('open_interest_delta_z'),
+                'open_interest_acceleration': futures_context.get('open_interest_acceleration'),
+                'open_interest_hist_samples': futures_context.get('open_interest_hist_samples'),
+                'taker_buy_sell_ratio': futures_context.get('taker_buy_sell_ratio'),
+                'long_short_ratio': futures_context.get('long_short_ratio'),
+                'orderbook_imbalance_pct': futures_context.get('orderbook_imbalance_pct'),
+                'rolling_orderbook_imbalance_pct': futures_context.get('rolling_orderbook_imbalance_pct'),
+                'rolling_orderbook_imbalance_delta': futures_context.get('rolling_orderbook_imbalance_delta'),
+                'rolling_ofi_score': futures_context.get('rolling_ofi_score'),
+                'rolling_ofi_samples': futures_context.get('rolling_ofi_samples'),
+                'futures_spread_pct': futures_context.get('futures_spread_pct'),
+                'bid_depth_usdt': futures_context.get('bid_depth_usdt'),
+                'ask_depth_usdt': futures_context.get('ask_depth_usdt'),
+                'basis_pct': futures_context.get('basis_pct'),
+                'market_regime_context': market_regime_context,
+            }
+            signal_age = _candidate_signal_age_candles()
+            if signal_age is not None:
+                values['signal_age_candles'] = signal_age
+            values = self._enrich_utbreakout_trend_health_values(values, closed, cfg, status_atr_series)
+            return self._enrich_utbreakout_strategy_quality_values(values, closed, cfg)
+
+        daily_count, daily_pnl = self.db.get_daily_stats()
+        daily_entries = self.db.get_daily_entry_count()
+        max_losses = int(cfg.get('max_consecutive_losses', 3) or 3)
+        recent_pnls = self.db.get_recent_closed_trade_pnls(max_losses, today_only=True)
+        daily_ok = True
+        daily_detail = f"PnL {_fmt(daily_pnl, 2)} / trades {daily_entries}/{int(cfg['max_daily_trades'])}"
+        if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
+            daily_ok = False
+            daily_detail = f"일손실 한도 도달 PnL {_fmt(daily_pnl, 2)}"
+        elif int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
+            daily_ok = False
+            daily_detail = f"일일 거래수 한도 {daily_entries}/{int(cfg['max_daily_trades'])}"
+        elif bool(cfg.get('daily_profit_target_enabled', False)) and float(daily_pnl or 0) >= float(cfg.get('daily_profit_target_usdt', 0) or 0):
+            daily_ok = False
+            daily_detail = f"일 목표수익 도달 {_fmt(daily_pnl, 2)}"
+        elif len(recent_pnls) >= max_losses and all(float(pnl) < 0 for pnl in recent_pnls[:max_losses]):
+            daily_ok = False
+            daily_detail = f"연속 손절 {max_losses}회"
+
+        balance_detail = "잔고 조회 대기"
+        entry_plan_detail = "진입 계획: ATR/잔고 계산 대기"
+        take_profit_detail = "익절 계획: ATR/잔고 계산 대기"
+        risk_ok = None
+        risk_distance = np.nan
+        risk_distance_pct = np.nan
+        risk_usdt = np.nan
+        planned_qty = np.nan
+        planned_notional = np.nan
+        planned_margin = np.nan
+        take_profit_distance = np.nan
+        take_profit_pct = np.nan
+        expected_profit_usdt = np.nan
+        status_micro_result = None
+        atr_value = metrics.get('atr')
+        atr_pct = metrics.get('atr_pct')
+        if self._is_valid_number(atr_value):
+            try:
+                total_balance, free_balance, _ = await self.get_balance_info()
+                balance_for_risk = total_balance if total_balance > 0 else free_balance
+                side_for_plan = candidate_side if candidate_side in {'long', 'short'} else 'long'
+                risk_per_trade_percent = float(cfg.get('risk_per_trade_percent', 1.0) or 1.0)
+                max_risk_per_trade_usdt = float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
+                risk_note = ""
+                ev_plan_enabled = bool(cfg.get('ev_adaptive_enabled', False))
+                if (
+                    not ev_plan_enabled
+                    and side_for_plan == 'short'
+                    and bool(cfg.get('short_conservative_enabled', True))
+                ):
+                    short_risk_multiplier = min(1.0, max(0.0, float(cfg.get('short_risk_multiplier', 0.5) or 0.5)))
+                    risk_per_trade_percent *= short_risk_multiplier
+                    max_risk_per_trade_usdt *= short_risk_multiplier
+                    risk_note = f" / 숏 리스크 x{short_risk_multiplier:.2f}"
+                market_quality_for_plan = self._evaluate_utbreakout_market_quality(
+                    side_for_plan,
+                    cfg,
+                    _market_quality_filter_values()
+                )
+                market_quality_multiplier = min(
+                    1.0,
+                    max(0.0, float(market_quality_for_plan.get('risk_multiplier', 1.0) or 0.0))
+                )
+                if market_quality_for_plan.get('state') is False:
+                    risk_note += " / 시장품질 BLOCK"
+                elif not ev_plan_enabled and market_quality_multiplier < 0.999:
+                    risk_per_trade_percent *= market_quality_multiplier
+                    max_risk_per_trade_usdt *= market_quality_multiplier
+                    risk_note += f" / 시장품질 x{market_quality_multiplier:.2f}"
+                elif market_quality_multiplier < 0.999:
+                    risk_note += f" / 시장품질 x{market_quality_multiplier:.2f}"
+                adaptation_for_plan = self._build_utbreakout_strategy_adaptation(
+                    symbol,
+                    side_for_plan,
+                    cfg,
+                    selected_set,
+                    _market_quality_filter_values()
+                )
+                adaptation_multiplier = min(
+                    1.0,
+                    max(0.0, float(adaptation_for_plan.get('risk_multiplier', 1.0) or 0.0))
+                )
+                trend_health_for_plan = adaptation_for_plan.get('trend_health') if isinstance(adaptation_for_plan.get('trend_health'), dict) else {}
+                if not ev_plan_enabled and adaptation_multiplier < 0.999:
+                    risk_per_trade_percent *= adaptation_multiplier
+                    max_risk_per_trade_usdt *= adaptation_multiplier
+                    risk_note += f" / 적응 x{adaptation_multiplier:.2f}"
+                if trend_health_for_plan.get('state') is False:
+                    risk_note += " / 추세건강 BLOCK"
+                plan_cfg = dict(cfg)
+                if ev_plan_enabled:
+                    ev_plan_values = _market_quality_filter_values()
+                    ev_plan_decision = evaluate_ev_adaptive_entry(
+                        side=side_for_plan,
+                        candidate_type=(
+                            candidate_type
+                            if candidate_side == side_for_plan
+                            else 'waiting'
+                        ),
+                        values=ev_plan_values,
+                        config=_ev_adaptive_runtime_config(cfg),
+                    )
+                    plan_cfg = _apply_ev_exit_profile(
+                        plan_cfg,
+                        ev_plan_decision.exit_profile,
+                    )
+                    volatility_multiplier = min(
+                        1.0,
+                        max(
+                            0.0,
+                            float(
+                                adaptation_for_plan.get(
+                                    'volatility_risk_multiplier',
+                                    1.0,
+                                )
+                                or 0.0
+                            ),
+                        ),
+                    )
+                    ev_plan_multiplier = min(
+                        float(ev_plan_decision.risk_multiplier),
+                        market_quality_multiplier,
+                        volatility_multiplier,
+                    )
+                    risk_per_trade_percent *= ev_plan_multiplier
+                    max_risk_per_trade_usdt *= ev_plan_multiplier
+
+                    if ev_plan_multiplier <= 0:
+                        ev_plan_blockers = "; ".join(ev_plan_decision.blockers[:3]) or "unknown EV plan blocker"
+                        risk_note += (
+                            f" / EV {ev_plan_decision.mode} x0.00 "
+                            f"BLOCK: {ev_plan_blockers}"
+                        )
+                    else:
+                        risk_note += (
+                            f" / EV {ev_plan_decision.mode} "
+                            f"x{ev_plan_multiplier:.2f}"
+                        )
+                plan_cfg['take_profit_r_multiple'] = max(
+                    float(plan_cfg.get('take_profit_r_multiple', 2.00) or 2.00),
+                    float(plan_cfg.get('second_take_profit_r_multiple', 2.00) or 2.00),
+                )
+                plan = calculate_risk_plan(
+                    side=side_for_plan,
+                    entry_price=entry_price,
+                    atr_value=atr_value,
+                    stop_atr_multiplier=plan_cfg.get('stop_atr_multiplier', 1.5),
+                    ut_stop=ut_detail.get('curr_stop'),
+                    take_profit_r_multiple=plan_cfg.get('take_profit_r_multiple', 2.00),
+                    min_risk_reward=plan_cfg.get('min_risk_reward', 2.0),
+                    balance_usdt=balance_for_risk,
+                    risk_per_trade_percent=risk_per_trade_percent,
+                    max_risk_per_trade_usdt=max_risk_per_trade_usdt,
+                    leverage=lev,
+                )
+                if self._micro_auto_enabled():
+                    status_micro_cfg = self._get_micro_auto_config()
+                    if ev_plan_enabled:
+                        status_micro_cfg = dict(status_micro_cfg)
+                        status_micro_cfg['risk_per_trade_pct'] = (
+                            float(status_micro_cfg.get('risk_per_trade_pct', 0.0) or 0.0)
+                            * ev_plan_multiplier
+                        )
+                        status_micro_cfg['max_risk_usdt'] = (
+                            float(status_micro_cfg.get('max_risk_usdt', 0.0) or 0.0)
+                            * ev_plan_multiplier
+                        )
+                    status_micro_result = build_micro_entry_plan(
+                        side=side_for_plan,
+                        entry_price=entry_price,
+                        atr_value=atr_value,
+                        ut_stop=ut_detail.get('curr_stop'),
+                        base_plan=dict(
+                            plan,
+                            stop_atr_multiplier=plan_cfg.get('stop_atr_multiplier', 1.5),
+                        ),
+                        cfg=status_micro_cfg,
+                        selected_set=selected_set,
+                        auto_scores=(
+                            (auto_analysis or {}).get('scores')
+                            if isinstance(auto_analysis, dict)
+                            else {}
+                        ),
+                        selected_timeframe=entry_tf,
+                        total_equity_usdt=total_balance,
+                        free_usdt=free_balance,
+                        min_notional_usdt=await self._get_symbol_min_notional(symbol),
+                        max_symbol_leverage=status_micro_cfg.get('max_leverage', 10),
+                    )
+                    if status_micro_result.get('accepted'):
+                        plan = dict(plan)
+                        plan.update(status_micro_result)
+                        risk_note += (
+                            f" / Micro {int(status_micro_result.get('leverage', lev) or lev)}x"
+                        )
+                    else:
+                        risk_note += (
+                            f" / Micro BLOCK {status_micro_result.get('reject_code')}"
+                        )
+                risk_distance = plan['risk_distance']
+                risk_distance_pct = plan['risk_distance_pct']
+                rr_multiple = plan['rr_multiple']
+                take_profit_distance = plan['take_profit_distance']
+                take_profit_pct = plan['take_profit_pct']
+                risk_usdt = plan['risk_usdt']
+                planned_qty = plan['qty']
+                planned_notional = plan['planned_notional']
+                planned_margin = plan['planned_margin']
+                expected_profit_usdt = plan['expected_profit_usdt']
+                risk_ok = (
+                    bool(
+                        status_micro_result.get('accepted')
+                        and not status_micro_result.get('dry_run', True)
+                        and status_micro_result.get('live_enabled', False)
+                    )
+                    if isinstance(status_micro_result, dict)
+                    else True
+                )
+                balance_detail = (
+                    f"손실한도 {_fmt(risk_usdt, 2)} USDT / 손절거리 {_fmt(risk_distance, 4)} "
+                    f"({_fmt(risk_distance_pct, 3)}%) / qty {_fmt(planned_qty, 6)}{risk_note}"
+                )
+                entry_plan_detail = (
+                    f"진입 계획: 증거금 {_fmt(planned_margin, 2)} USDT / "
+                    f"포지션 {_fmt(planned_notional, 2)} USDT / 레버리지 {lev}x / "
+                    f"손절시 손실 {_fmt(risk_usdt, 2)} USDT"
+                )
+                tp1_r = float(plan_cfg.get('partial_take_profit_r_multiple', 1.00) or 1.00)
+                tp2_r = float(plan_cfg.get('second_take_profit_r_multiple', 2.00) or 2.00)
+                tp1_ratio = float(plan_cfg.get('partial_take_profit_ratio', 0.30) or 0.30)
+                tp2_ratio = float(plan_cfg.get('second_take_profit_ratio', 0.40) or 0.40)
+                take_profit_detail = (
+                    f"익절 계획: TP1 {tp1_r:.2f}R({tp1_ratio:.0%}) / "
+                    f"TP2 {tp2_r:.2f}R({tp2_ratio:.0%}) / "
+                    f"익절거리 {take_profit_distance:.4f} ({take_profit_pct:.3f}%) / "
+                    f"예상수익 {expected_profit_usdt:.2f} USDT"
+                )
+            except ValueError as e:
+                reason = str(e)
+                if "risk budget unavailable" in reason:
+                    multiplier_note = ""
+                    if ev_plan_enabled:
+                        multiplier_note = f" (effective x{ev_plan_multiplier:.3f})"
+                    entry_plan_detail = f"진입 계획: 일손실 한도 초과로 진입 제한{multiplier_note}"
+                    risk_ok = False
+                else:
+                    entry_plan_detail = f"진입 계획: 수량 계산 실패 ({reason})"
+                    risk_ok = False
+        else:
+            balance_detail = "진입 계획: ATR 지표 없음"
+            risk_ok = False
+
+        # side conditions
+        async def _side_conditions(side):
+            side_upper = side.upper()
+            if candidate_side == side:
+                ut_state = True
+                ut_detail_text = f"{side_upper} {candidate_type}"
+            else:
+                ut_state = False if candidate_side in {'long', 'short'} else None
+                ut_detail_text = f"현재 {str(candidate_side or 'none').upper()} / bias {str(ut_bias_side or 'none').upper()}"
+
+            filter_values = _market_quality_filter_values()
+            feature_score = self._calculate_utbreakout_feature_score(side, cfg, filter_values)
+            filter_values['feature_score'] = feature_score
+            selected_items = self._evaluate_utbreakout_set_filter_items(side, selected_set, cfg, filter_values)
+            failed_set_items = [item for item in selected_items if item.get('state') is not True]
+            set_hard_failures = []
+            set_soft_failures = []
+            set_item_multipliers = []
+            for item in failed_set_items:
+                name = item.get('name') or ''
+                detail = item.get('detail') or ''
+                code = item.get('code') or ''
+                is_core_set_failure = (
+                    bool(cfg.get('selected_set_core_filter_hard_block_enabled', True))
+                    and (
+                        name in UTBREAKOUT_CORE_SET_FILTER_HARD_NAMES
+                        or code in UTBREAKOUT_CORE_SET_FILTER_HARD_CODES
+                        or bool(item.get('core_set_hard_block'))
+                    )
+                )
+                if is_core_set_failure or name in {'ATR% 변동성', '손익비', '스프레드', '유동성'} or code == 'REJECTED_RISK_REWARD_LOW':
+                    state, multiplier, classified_detail = False, 0.0, detail
+                elif name in {'상대 거래량', 'Rolling OFI 확인', 'Futures 수급 불균형', 'Spread/Depth 비용'}:
+                    state, multiplier, classified_detail = _classify_set_filter_result(
+                        side,
+                        False,
+                        detail,
+                        metrics=filter_values,
+                        cfg=cfg,
+                    )
+                else:
+                    state = 'reduced'
+                    multiplier = 0.65 if item.get('state') is None else 0.50
+                    classified_detail = f"{detail}; set confirmation soft fail"
+                classified = dict(item)
+                classified.update({
+                    'state': state,
+                    'risk_multiplier': multiplier,
+                    'detail': classified_detail,
+                })
+                if state is False:
+                    set_hard_failures.append(classified)
+                else:
+                    set_soft_failures.append(classified)
+                    set_item_multipliers.append(float(multiplier))
+
+            if set_hard_failures:
+                set_state = False
+                set_detail = "; ".join(
+                    f"{item.get('name')}: {item.get('detail')}"
+                    for item in set_hard_failures[:3]
+                )
+            elif set_soft_failures:
+                set_state = 'reduced'
+                set_detail = "; ".join(
+                    f"{item.get('name')}: {item.get('detail')}"
+                    for item in set_soft_failures[:3]
+                )
+            elif selected_items:
+                set_state = True
+                set_detail = "모든 필수 필터 만족"
+            else:
+                set_state = None
+                set_detail = "필터 미등록 또는 조회 실패"
+
+            selector_quality = self.db.get_coin_selector_symbol_quality(symbol)
+            selector_quality = dict(selector_quality or {})
+            selector_state = selector_quality.get('state')
+            if selector_state is None:
+                selector_state = True
+
+            adaptation = self._build_utbreakout_strategy_adaptation(
+                symbol,
+                side,
+                cfg,
+                selected_set,
+                filter_values
+            )
+            adaptation_state = adaptation.get('state')
+
+            quality_score_v2 = self._build_utbreakout_quality_score_v2(
+                symbol,
+                side,
+                cfg,
+                selected_set,
+                filter_values
+            )
+
+            core_items = [
+                ("UTBot 시그널 방향", ut_state, ut_detail_text),
+                ("Set 필터 세부조건", set_state, set_detail),
+            ]
+
+            ev_status_decision = None
+            if bool(cfg.get('ev_adaptive_enabled', False)):
+                ev_status_decision = evaluate_ev_adaptive_entry(
+                    side=side,
+                    candidate_type=(
+                        candidate_type
+                        if candidate_side == side
+                        else 'waiting'
+                    ),
+                    values=filter_values,
+                    config=_ev_adaptive_runtime_config(cfg),
+                )
+                if not ev_status_decision.allowed:
+                    ev_state = False
+                    ev_detail = (
+                        f"{ev_status_decision.mode} score {ev_status_decision.score:.1f}: "
+                        f"{'; '.join(ev_status_decision.blockers[:4])}"
+                    )
+                elif (
+                    self._is_valid_number(planned_qty)
+                    and self._is_valid_number(risk_usdt)
+                    and self._is_valid_number(planned_notional)
+                ):
+                    ev_status_exit = adapt_exit_for_quantity(
+                        ev_status_decision.exit_profile,
+                        total_qty=planned_qty,
+                        min_amount=self._get_min_amount_for_symbol(symbol),
+                    )
+                    ev_status_net = evaluate_net_edge(
+                        risk_usdt=risk_usdt,
+                        planned_notional=planned_notional,
+                        win_probability=ev_status_decision.win_probability,
+                        gross_win_r=profile_gross_win_r(ev_status_exit.profile),
+                        config=_ev_adaptive_runtime_config(cfg),
+                    )
+                    ev_state = bool(
+                        ev_status_exit.executable and ev_status_net.allowed
+                    )
+                    ev_detail = (
+                        f"{ev_status_decision.mode} score {ev_status_decision.score:.1f}, "
+                        f"p={ev_status_decision.win_probability:.2f}, "
+                        f"MTF={ev_status_decision.mtf_alignment}, "
+                        f"leader={ev_status_decision.leadership_score:.0f}, "
+                        f"exit={ev_status_exit.mode}, "
+                        f"net={ev_status_net.expected_net_r:.3f}R "
+                        f"(cost {ev_status_net.cost_r:.3f}R)"
+                    )
+                else:
+                    ev_state = None
+                    ev_detail = (
+                        f"{ev_status_decision.mode} score {ev_status_decision.score:.1f}; "
+                        "수량/비용 계산 대기"
+                    )
+                core_items.append(("EV Adaptive 기대값", ev_state, ev_detail))
+
+            set_filter_multiplier_status = 1.0
+            if set_hard_failures:
+                set_filter_multiplier_status = 0.0
+            elif set_soft_failures and bool(cfg.get('set_filter_soft_fail_enabled', True)):
+                configured_set_multiplier = (
+                    float(cfg.get('set_filter_multi_soft_fail_multiplier', 0.50) or 0.50)
+                    if len(set_soft_failures) >= 2
+                    else float(cfg.get('set_filter_soft_fail_multiplier', 0.70) or 0.70)
+                )
+                set_filter_multiplier_status = min(
+                    [configured_set_multiplier, *set_item_multipliers]
+                )
+            elif set_soft_failures:
+                set_filter_multiplier_status = 0.0
+
+            if ev_status_decision is not None:
+                volatility_multiplier = min(
+                    1.0,
+                    max(
+                        0.0,
+                        float(adaptation.get('volatility_risk_multiplier', 1.0) or 0.0),
+                    ),
+                )
+                raw_final_risk_multiplier_status = min(
+                    float(ev_status_decision.risk_multiplier),
+                    market_multiplier,
+                    volatility_multiplier,
+                )
+            else:
+                raw_final_risk_multiplier_status = (
+                    bias_multiplier_status
+                    * market_multiplier
+                    * selector_multiplier
+                    * adaptation_multiplier
+                    * q2_multiplier
+                    * set_filter_multiplier_status
+                )
+            final_risk_multiplier_status = _apply_utbreakout_risk_multiplier_floor(
+                raw_final_risk_multiplier_status,
+                cfg,
+            )
+
+            base_max_risk = float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
+            effective_max_risk = base_max_risk * final_risk_multiplier_status
+            core_items.extend([
+                ("일일 리스크", daily_ok, daily_detail),
+                ("ATR 손절/RR/수량", risk_ok, balance_detail),
+            ])
+            advisory_items = [
+                (
+                    "최종 누적 리스크",
+                    'reduced' if final_risk_multiplier_status < 0.999 else True,
+                    (
+                        f"x{final_risk_multiplier_status:.3f} "
+                        f"(base ${base_max_risk:.2f} -> effective ${effective_max_risk:.2f}; "
+                        f"raw x{float(raw_final_risk_multiplier_status):.3f}, "
+                        f"bias x{bias_multiplier_status:.2f}, market x{market_multiplier:.2f}, "
+                        f"selector x{selector_multiplier:.2f}, "
+                        f"strategy x{adaptation_multiplier:.2f}, qscore x{q2_multiplier:.2f}, "
+                        f"set x{set_filter_multiplier_status:.2f})"
+                    ),
+                ),
+                ("코인 선택 품질", selector_state, selector_quality.get('summary')),
+                ("Feature Score", True, f"{feature_score.get('score', 0):.1f} / {feature_score.get('reason')}"),
+                (
+                    "전략 적응 요약",
+                    'reduced' if adaptation_multiplier < 0.999 else True,
+                    adaptation.get('summary'),
+                ),
+                (
+                    "레거시 통합 품질(참고)",
+                    (
+                        False
+                        if adaptation_state is False or quality_score_v2.get('state') is False
+                        else 'reduced'
+                        if adaptation_state == 'reduced' or quality_score_v2.get('state') == 'reduced'
+                        else True
+                    ),
+                    (
+                        f"trend/strategy={adaptation.get('summary')}; "
+                        f"qscore={quality_score_v2.get('summary')}"
+                    ),
+                ),
+            ]
+            ok = all(item[1] is True or item[1] == 'reduced' for item in core_items)
+            lines = [
+                f"{side_upper}: {'진입 가능' if ok else '대기'}",
+                "필수 게이트",
+            ]
+            lines.extend(_line(idx, label, state, detail) for idx, (label, state, detail) in enumerate(core_items, 1))
+            lines.append("참고/감액")
+            lines.extend(
+                f"{_icon(state)} {_state_label(state)} - {label}: {detail}"
+                for label, state, detail in advisory_items
+            )
+            return ok, lines
+
+        long_ok, long_lines = await _side_conditions('long')
+        short_ok, short_lines = await _side_conditions('short')
+
+        def _side_has_red_gate(side_lines):
+            return any("🔴" in line or "불만족" in line for line in side_lines if "필수 게이트" not in line)
+
+        candidate_lines = short_lines if candidate_side == 'short' else long_lines if candidate_side == 'long' else []
+        if candidate_side in {'long', 'short'} and not _side_has_red_gate(candidate_lines):
+            if not self._is_valid_number(planned_qty) or not self._is_valid_number(risk_usdt) or float(risk_usdt or 0) <= 0:
+                entry_plan_detail += " / 상태진단: 후보 EV는 통과처럼 보이나 수량계산 risk=0"
+
+        # Gather eligibility details
+        cooldown_reasons = []
+        now_ts = time.time()
+        cooldown_remaining, cooldown_state = self._coin_selector_cooldown_remaining(
+            symbol,
+            cfg,
+            now=now_ts
+        )
+        if cooldown_remaining > 0:
+            last_r = "unknown"
+            if isinstance(cooldown_state, dict):
+                last_r = cooldown_state.get('last_reason') or "unknown"
+            cooldown_reasons.append(f"candidate cooldown {cooldown_remaining / 60.0:.1f}m ({last_r})")
+        
+        # Bridge cooldown
+        key = self._utbreakout_trace_key(symbol)
+        last_attempt = float(self.utbreakout_auto_entry_bridge_last_attempt_ts.get(key, 0.0) or 0.0)
+        cooldown_sec = float(cfg.get('utbreakout_auto_entry_bridge_cooldown_sec', 60.0) or 60.0)
+        if now_ts - last_attempt < cooldown_sec:
+            cooldown_reasons.append(f"bridge cooldown (elapsed {now_ts - last_attempt:.1f}s)")
+            
+        pos = await self.get_server_position(symbol, use_cache=False)
+        has_open_position = pos is not None
+        
+        active_positions = []
+        try:
+            active_positions = await self.get_active_position_symbols(use_cache=False)
+        except Exception:
+            pass
+        has_other_position = any(
+            self._utbreakout_status_symbol_key(p) != self._utbreakout_status_symbol_key(symbol)
+            for p in active_positions
+        )
+        
+        auto_entry_enabled = bool(getattr(self, 'utbreakout_auto_entry_bridge_enabled', True))
+        
+        long_plan = self._get_utbot_filtered_breakout_entry_plan(symbol, 'long')
+        long_eligibility = self._build_utbreakout_execution_eligibility(
+            symbol=symbol,
+            side='long',
+            candidate_side=candidate_side,
+            candidate_type=candidate_type,
+            side_condition_ok=long_ok,
+            risk_ok=bool(risk_ok),
+            planned_qty=planned_qty,
+            risk_usdt=risk_usdt,
+            entry_plan_detail=entry_plan_detail,
+            cooldown_reasons=cooldown_reasons,
+            has_open_position=has_open_position,
+            has_other_position=has_other_position,
+            auto_entry_enabled=auto_entry_enabled,
+            daily_risk_ok=bool(daily_ok),
+            plan_lookup_ready=isinstance(long_plan, dict),
+            cfg=cfg,
+        )
+        
+        short_plan = self._get_utbot_filtered_breakout_entry_plan(symbol, 'short')
+        short_eligibility = self._build_utbreakout_execution_eligibility(
+            symbol=symbol,
+            side='short',
+            candidate_side=candidate_side,
+            candidate_type=candidate_type,
+            side_condition_ok=short_ok,
+            risk_ok=bool(risk_ok),
+            planned_qty=planned_qty,
+            risk_usdt=risk_usdt,
+            entry_plan_detail=entry_plan_detail,
+            cooldown_reasons=cooldown_reasons,
+            has_open_position=has_open_position,
+            has_other_position=has_other_position,
+            auto_entry_enabled=auto_entry_enabled,
+            daily_risk_ok=bool(daily_ok),
+            plan_lookup_ready=isinstance(short_plan, dict),
+            cfg=cfg,
+        )
+
+        ready_side = (
+            candidate_side
+            if candidate_side == 'long' and long_ok
+            else candidate_side
+            if candidate_side == 'short' and short_ok
+            else 'long'
+            if long_ok
+            else 'short'
+            if short_ok
+            else None
+        )
+        _record_status_evaluated(
+            'OK',
+            candidate_side=candidate_side,
+            candidate_type=candidate_type,
+            long_ok=long_ok,
+            short_ok=short_ok,
+            ready_side=ready_side,
+            final=(
+                f"LONG {'주문시도 대상' if long_eligibility['can_attempt'] else '조건통과-실행차단' if long_ok else '대기'} / "
+                f"SHORT {'주문시도 대상' if short_eligibility['can_attempt'] else '조건통과-실행차단' if short_ok else '대기'}"
+            ),
+            selected_set=(
+                f"Set{selected_set.get('id')} {selected_set.get('name')}"
+                if isinstance(selected_set, dict) else ''
+            ),
+            current_position='see position scan context',
+            decision_candle_ts=decision_ts,
+            qty=planned_qty,
+            entry_price=entry_price,
+            margin=planned_margin,
+            notional=planned_notional,
+            risk_usdt=risk_usdt,
+        )
+
+        return {
+            'ok_market': True,
+            'symbol': symbol,
+            'cfg': cfg,
+            'daily_entries': daily_entries,
+            'entry_tf': entry_tf,
+            'htf_tf': htf_tf,
+            'adaptive_decision': adaptive_decision,
+            'decision_ts': decision_ts,
+            'entry_price': entry_price,
+            'ut_label': f"{str(candidate_side or 'none').upper()} ({candidate_type})",
+            'mode_label': 'AUTO' if cfg.get('auto_select_enabled') else 'MANUAL',
+            'selected_set': selected_set,
+            'set_status': '실거래 연결' if selected_set.get('status') == 'active' else 'planned only',
+            'auto_reason': auto_reason,
+            'entry_plan_detail': entry_plan_detail,
+            'micro_line': micro_line or 'Micro Auto: OFF',
+            'opposite_set_exit_detail': opposite_set_exit_detail,
+            'market_regime_context': market_regime_context,
+            'score_line': (
+                f"trend {auto_analysis.get('scores', {}).get('trend_score', 0):.1f} / chop {auto_analysis.get('scores', {}).get('chop_score', 0):.1f} / "
+                f"vol {auto_analysis.get('scores', {}).get('volatility_score', 0):.1f} / breakout {auto_analysis.get('scores', {}).get('breakout_score', 0):.1f} / "
+                f"momentum {auto_analysis.get('scores', {}).get('momentum_score', 0):.1f} / flow {auto_analysis.get('scores', {}).get('flow_score', 0):.1f}"
+                if isinstance(auto_analysis, dict) and auto_analysis.get('scores') else "AUTO OFF 또는 분석 대기"
+            ),
+            'orderflow_line': (
+                f"Orderflow: imb {_fmt(futures_context.get('rolling_orderbook_imbalance_pct'), 2)}% / "
+                f"Δ {_fmt(futures_context.get('rolling_orderbook_imbalance_delta'), 2)} / "
+                f"OFI {_fmt(futures_context.get('rolling_ofi_score'), 2)} / "
+                f"samples {int(float(futures_context.get('rolling_ofi_samples') or 0))}"
+            ),
+            'oi_line': (
+                f"OI/Funding: OI z {_fmt(futures_context.get('open_interest_delta_z'), 2)} / "
+                f"1h {_fmt(futures_context.get('open_interest_change_1h'), 2)}% / "
+                f"4h {_fmt(futures_context.get('open_interest_change_4h'), 2)}% / "
+                f"accel {_fmt(futures_context.get('open_interest_acceleration'), 3)} / "
+                f"funding {_fmt(futures_context.get('funding_rate'), 6)} / "
+                f"fpct {_fmt(futures_context.get('funding_percentile_7d'), 0)}/{_fmt(futures_context.get('funding_percentile_30d'), 0)} / "
+                f"L/S {_fmt(futures_context.get('long_short_ratio'), 3)} / "
+                f"liq {_fmt(futures_context.get('liquidation_imbalance'), 2)}"
+            ),
+            'squeeze_line': (
+                f"Squeeze: BB pct {_fmt(metrics.get('bb_width_percentile'), 2)} / "
+                f"Keltner {'ON' if metrics.get('keltner_squeeze_on') is True else 'OFF' if metrics.get('keltner_squeeze_on') is False else 'n/a'} / "
+                f"range {_fmt(metrics.get('range_expansion_ratio'), 2)} / state {metrics.get('squeeze_release_state') or 'n/a'}"
+            ),
+            'feature_line': (
+                f"Feature Score: {_fmt(status_feature_score.get('score'), 1)} / "
+                f"{status_feature_score.get('reason') or 'n/a'}"
+            ),
+            'ut_reason': ut_reason,
+            'long_ok': long_ok,
+            'long_lines': long_lines,
+            'short_ok': short_ok,
+            'short_lines': short_lines,
+            'long_eligibility': long_eligibility,
+            'short_eligibility': short_eligibility,
+        }
 
     async def build_utbreakout_condition_status_text(self, symbol):
         if not self.is_upbit_mode():
@@ -14839,6 +16112,82 @@ class SignalEngine(BaseEngine):
             if not self._is_valid_number(planned_qty) or not self._is_valid_number(risk_usdt) or float(risk_usdt or 0) <= 0:
                 entry_plan_detail += " / 상태진단: 후보 EV는 통과처럼 보이나 수량계산 risk=0"
 
+        # Gather eligibility details
+        cooldown_reasons = []
+        now_ts = time.time()
+        cooldown_remaining, cooldown_state = self._coin_selector_cooldown_remaining(
+            symbol,
+            cfg,
+            now=now_ts
+        )
+        if cooldown_remaining > 0:
+            last_r = "unknown"
+            if isinstance(cooldown_state, dict):
+                last_r = cooldown_state.get('last_reason') or "unknown"
+            cooldown_reasons.append(f"candidate cooldown {cooldown_remaining / 60.0:.1f}m ({last_r})")
+        
+        # Bridge cooldown
+        key = self._utbreakout_trace_key(symbol)
+        last_attempt = float(self.utbreakout_auto_entry_bridge_last_attempt_ts.get(key, 0.0) or 0.0)
+        cooldown_sec = float(cfg.get('utbreakout_auto_entry_bridge_cooldown_sec', 60.0) or 60.0)
+        if now_ts - last_attempt < cooldown_sec:
+            cooldown_reasons.append(f"bridge cooldown (elapsed {now_ts - last_attempt:.1f}s)")
+            
+        pos = await self.get_server_position(symbol, use_cache=False)
+        has_open_position = pos is not None
+        
+        active_positions = []
+        try:
+            active_positions = await self.get_active_position_symbols(use_cache=False)
+        except Exception:
+            pass
+        has_other_position = any(
+            self._utbreakout_status_symbol_key(p) != self._utbreakout_status_symbol_key(symbol)
+            for p in active_positions
+        )
+        
+        auto_entry_enabled = bool(getattr(self, 'utbreakout_auto_entry_bridge_enabled', True))
+        
+        long_plan = self._get_utbot_filtered_breakout_entry_plan(symbol, 'long')
+        long_eligibility = self._build_utbreakout_execution_eligibility(
+            symbol=symbol,
+            side='long',
+            candidate_side=candidate_side,
+            candidate_type=candidate_type,
+            side_condition_ok=long_ok,
+            risk_ok=bool(risk_ok),
+            planned_qty=planned_qty,
+            risk_usdt=risk_usdt,
+            entry_plan_detail=entry_plan_detail,
+            cooldown_reasons=cooldown_reasons,
+            has_open_position=has_open_position,
+            has_other_position=has_other_position,
+            auto_entry_enabled=auto_entry_enabled,
+            daily_risk_ok=bool(daily_ok),
+            plan_lookup_ready=isinstance(long_plan, dict),
+            cfg=cfg,
+        )
+        
+        short_plan = self._get_utbot_filtered_breakout_entry_plan(symbol, 'short')
+        short_eligibility = self._build_utbreakout_execution_eligibility(
+            symbol=symbol,
+            side='short',
+            candidate_side=candidate_side,
+            candidate_type=candidate_type,
+            side_condition_ok=short_ok,
+            risk_ok=bool(risk_ok),
+            planned_qty=planned_qty,
+            risk_usdt=risk_usdt,
+            entry_plan_detail=entry_plan_detail,
+            cooldown_reasons=cooldown_reasons,
+            has_open_position=has_open_position,
+            has_other_position=has_other_position,
+            auto_entry_enabled=auto_entry_enabled,
+            daily_risk_ok=bool(daily_ok),
+            plan_lookup_ready=isinstance(short_plan, dict),
+            cfg=cfg,
+        )
+
         ready_side = (
             candidate_side
             if candidate_side == 'long' and long_ok
@@ -14858,8 +16207,8 @@ class SignalEngine(BaseEngine):
             short_ok=short_ok,
             ready_side=ready_side,
             final=(
-                f"LONG {'가능' if long_ok else '대기'} / "
-                f"SHORT {'가능' if short_ok else '대기'}"
+                f"LONG {'주문시도 대상' if long_eligibility['can_attempt'] else '조건통과-실행차단' if long_ok else '대기'} / "
+                f"SHORT {'주문시도 대상' if short_eligibility['can_attempt'] else '조건통과-실행차단' if short_ok else '대기'}"
             ),
             selected_set=(
                 f"Set{selected_set.get('id')} {selected_set.get('name')}"
@@ -14988,13 +16337,23 @@ class SignalEngine(BaseEngine):
         vol_base = float(cfg.get("bias_continuation_min_volume_ratio", 0.40) or 0.40)
         vol_15m = float(cfg.get("bias_continuation_15m_min_volume_ratio", 0.45) or 0.45)
 
-        compact_long = self._compact_side_gate_summary("long", long_ok, long_lines)
-        compact_short = self._compact_side_gate_summary("short", short_ok, short_lines)
+        compact_long = self._compact_side_gate_summary("long", long_ok, long_lines, execution_eligibility=long_eligibility)
+        compact_short = self._compact_side_gate_summary("short", short_ok, short_lines, execution_eligibility=short_eligibility)
+
+        long_gate_lbl = "주문시도 대상 - STATUS_READY → AUTO_ENTRY_BRIDGE → ENTRY_CALL 예상" if long_eligibility['can_attempt'] else f"차단 - {'; '.join(long_eligibility['blockers'])}" if long_eligibility['blockers'] else "대기"
+        short_gate_lbl = "주문시도 대상 - STATUS_READY → AUTO_ENTRY_BRIDGE → ENTRY_CALL 예상" if short_eligibility['can_attempt'] else f"차단 - {'; '.join(short_eligibility['blockers'])}" if short_eligibility['blockers'] else "대기"
+
+        long_final_lbl = "주문시도 대상" if long_eligibility['can_attempt'] else "조건통과-실행차단" if long_ok else "대기"
+        short_final_lbl = "주문시도 대상" if short_eligibility['can_attempt'] else "조건통과-실행차단" if short_ok else "대기"
 
         text_lines = [
             "🚦 UT Breakout 조건 스테이터스",
             *build_utbreakout_effective_status_contract(cfg, daily_entries),
             *position_scan_context,
+            "실행 게이트",
+            f"LONG: {long_gate_lbl}",
+            f"SHORT: {short_gate_lbl}",
+            "",
             f"Runtime Profile: {cfg.get('runtime_profile', UTBREAKOUT_RUNTIME_PROFILE)}",
             f"Effective TF: entry {entry_tf} / htf {htf_tf} / adaptive {', '.join(map(str, adaptive_tfs))}",
             f"TF: 진입 {entry_tf} / HTF {htf_tf}",
@@ -15015,7 +16374,7 @@ class SignalEngine(BaseEngine):
             feature_line,
             self.get_coin_selector_symbol_summary(symbol),
             "주의: 빨간 필수 게이트만 진입 차단입니다. 노란 항목은 진입 차단이 아니라 수량/리스크 축소입니다.",
-            f"최종: LONG {'가능' if long_ok else '대기'} / SHORT {'가능' if short_ok else '대기'}",
+            f"최종: LONG {long_final_lbl} / SHORT {short_final_lbl}",
             "",
             "요약 신호등",
             compact_long,
