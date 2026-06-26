@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+venv/
+*.log
+*.db
+runtime/
+config.json
+prediction_paper_ledger.json
+prediction_paper_ledger.json.tmp

@@ -1,0 +1,8 @@
+ccxt>=4.5.6
+pandas
+pandas_ta
+numpy
+pykalman
+python-telegram-bot
+hurst
+predict-sdk==0.0.16

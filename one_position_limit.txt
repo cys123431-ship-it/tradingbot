@@ -1,0 +1,2 @@
+max open positions: 1
+redeploy: 2026-06-15
