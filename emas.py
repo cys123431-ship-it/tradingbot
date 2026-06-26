@@ -14092,32 +14092,90 @@ class SignalEngine(BaseEngine):
             status_atr_series = None
 
         def _market_quality_filter_values():
+            def _candidate_signal_age_candles():
+                try:
+                    signal_ts = float(ut_detail.get('signal_ts') or 0.0)
+                    timeframe_ms = float(
+                        self._timeframe_to_ms(entry_tf) or (15 * 60 * 1000)
+                    )
+                    if signal_ts > 0 and decision_ts >= signal_ts:
+                        return (float(decision_ts) - signal_ts) / max(timeframe_ms, 1.0)
+                    if candidate_type == 'fresh_signal':
+                        return 0.0
+                except (TypeError, ValueError):
+                    if candidate_type == 'fresh_signal':
+                        return 0.0
+                return None
+
             values = {
                 'entry_price': entry_price,
                 'open': metrics.get('open'),
+                'rsi': metrics.get('rsi'),
+                'macd_hist': metrics.get('macd_hist'),
+                'macd_hist_prev': metrics.get('macd_hist_prev'),
+                'roc_pct': metrics.get('roc_pct'),
+                'cci': metrics.get('cci'),
+                'stoch_k': metrics.get('stoch_k'),
+                'stoch_d': metrics.get('stoch_d'),
                 'atr': metrics.get('atr'),
                 'atr_pct': metrics.get('atr_pct'),
                 'adx': metrics.get('adx'),
                 'plus_di': metrics.get('plus_di'),
                 'minus_di': metrics.get('minus_di'),
+                'adx_reason': metrics.get('adx_reason'),
                 'chop': metrics.get('chop'),
-                'volume_ratio': metrics.get('volume_ratio'),
+                'chop_reason': metrics.get('chop_reason'),
                 'ema50': metrics.get('ema_fast'),
                 'ema50_prev': metrics.get('ema_fast_prev'),
                 'ema200': metrics.get('ema_slow'),
                 'donchian_high_prev': metrics.get('donchian_high_prev'),
                 'donchian_low_prev': metrics.get('donchian_low_prev'),
+                'donchian_width_pct': metrics.get('donchian_width_pct'),
+                'bb_upper': metrics.get('bb_upper'),
+                'bb_lower': metrics.get('bb_lower'),
+                'bb_mid': metrics.get('bb_mid'),
+                'bb_width_pct': metrics.get('bb_width_pct'),
+                'bb_width_prev_pct': metrics.get('bb_width_prev_pct'),
+                'bb_width_min_pct': metrics.get('bb_width_min_pct'),
+                'bb_width_percentile': metrics.get('bb_width_percentile'),
                 'keltner_upper': metrics.get('keltner_upper'),
                 'keltner_lower': metrics.get('keltner_lower'),
-                'bb_width_percentile': metrics.get('bb_width_percentile'),
+                'keltner_mid': metrics.get('keltner_mid'),
+                'keltner_width_pct': metrics.get('keltner_width_pct'),
+                'keltner_width_prev_pct': metrics.get('keltner_width_prev_pct'),
                 'keltner_squeeze_on': metrics.get('keltner_squeeze_on'),
                 'range_expansion_ratio': metrics.get('range_expansion_ratio'),
+                'range_compression_ratio': metrics.get('range_compression_ratio'),
                 'squeeze_release_state': metrics.get('squeeze_release_state'),
+                'volume_ratio': metrics.get('volume_ratio'),
+                'obv_slope_ratio': metrics.get('obv_slope_ratio'),
+                'mfi': metrics.get('mfi'),
+                'vwap': metrics.get('vwap'),
+                'vwap_slope': metrics.get('vwap_slope'),
+                'vwap_reason': metrics.get('vwap_reason'),
+                'psar_direction': metrics.get('psar_direction'),
+                'psar': metrics.get('psar'),
+                'psar_reason': metrics.get('psar_reason'),
+                'ichimoku_bias': metrics.get('ichimoku_bias'),
+                'ichimoku_top': metrics.get('ichimoku_top'),
+                'ichimoku_bottom': metrics.get('ichimoku_bottom'),
+                'vortex_plus': metrics.get('vortex_plus'),
+                'vortex_minus': metrics.get('vortex_minus'),
+                'vortex_reason': metrics.get('vortex_reason'),
+                'aroon_up': metrics.get('aroon_up'),
+                'aroon_down': metrics.get('aroon_down'),
+                'aroon_reason': metrics.get('aroon_reason'),
+                'session_hour_kst': metrics.get('session_hour_kst'),
+                'auto_scores': (auto_analysis or {}).get('scores') if isinstance(auto_analysis, dict) else {},
+                'mtf_metrics': (auto_analysis or {}).get('timeframes') if isinstance(auto_analysis, dict) else {},
                 'htf_ready': htf_ready,
+                'htf_error': htf_error,
                 'htf_close': htf_close,
                 'htf_ema_fast': htf_ema_fast,
                 'htf_ema_slow': htf_ema_slow,
+                'htf_gap_pct': htf_gap_pct,
                 'htf_supertrend_direction': htf_supertrend_direction,
+                'htf_supertrend_reason': htf_supertrend_reason,
                 'funding_rate': futures_context.get('funding_rate'),
                 'next_funding_time': futures_context.get('next_funding_time'),
                 'open_interest_delta_pct': futures_context.get('open_interest_delta_pct'),
@@ -14137,6 +14195,9 @@ class SignalEngine(BaseEngine):
                 'basis_pct': futures_context.get('basis_pct'),
                 'market_regime_context': market_regime_context,
             }
+            signal_age = _candidate_signal_age_candles()
+            if signal_age is not None:
+                values['signal_age_candles'] = signal_age
             values = self._enrich_utbreakout_trend_health_values(values, closed, cfg, status_atr_series)
             return self._enrich_utbreakout_strategy_quality_values(values, closed, cfg)
 
@@ -14265,10 +14326,18 @@ class SignalEngine(BaseEngine):
                     )
                     risk_per_trade_percent *= ev_plan_multiplier
                     max_risk_per_trade_usdt *= ev_plan_multiplier
-                    risk_note += (
-                        f" / EV {ev_plan_decision.mode} "
-                        f"x{ev_plan_multiplier:.2f}"
-                    )
+
+                    if ev_plan_multiplier <= 0:
+                        ev_plan_blockers = "; ".join(ev_plan_decision.blockers[:3]) or "unknown EV plan blocker"
+                        risk_note += (
+                            f" / EV {ev_plan_decision.mode} x0.00 "
+                            f"BLOCK: {ev_plan_blockers}"
+                        )
+                    else:
+                        risk_note += (
+                            f" / EV {ev_plan_decision.mode} "
+                            f"x{ev_plan_multiplier:.2f}"
+                        )
                 plan_cfg['take_profit_r_multiple'] = max(
                     float(plan_cfg.get('take_profit_r_multiple', 2.00) or 2.00),
                     float(plan_cfg.get('second_take_profit_r_multiple', 2.00) or 2.00),
@@ -14414,109 +14483,7 @@ class SignalEngine(BaseEngine):
                 ut_state = False if candidate_side in {'long', 'short'} else None
                 ut_detail_text = f"현재 {str(candidate_side or 'none').upper()} / bias {str(ut_bias_side or 'none').upper()}"
 
-            filter_values = {
-                'entry_price': entry_price,
-                'open': metrics.get('open'),
-                'rsi': metrics.get('rsi'),
-                'macd_hist': metrics.get('macd_hist'),
-                'macd_hist_prev': metrics.get('macd_hist_prev'),
-                'roc_pct': metrics.get('roc_pct'),
-                'cci': metrics.get('cci'),
-                'stoch_k': metrics.get('stoch_k'),
-                'stoch_d': metrics.get('stoch_d'),
-                'adx': metrics.get('adx'),
-                'plus_di': metrics.get('plus_di'),
-                'minus_di': metrics.get('minus_di'),
-                'adx_reason': metrics.get('adx_reason'),
-                'atr_pct': metrics.get('atr_pct'),
-                'ema50': metrics.get('ema_fast'),
-                'ema50_prev': metrics.get('ema_fast_prev'),
-                'ema200': metrics.get('ema_slow'),
-                'donchian_high_prev': metrics.get('donchian_high_prev'),
-                'donchian_low_prev': metrics.get('donchian_low_prev'),
-                'donchian_width_pct': metrics.get('donchian_width_pct'),
-                'bb_upper': metrics.get('bb_upper'),
-                'bb_lower': metrics.get('bb_lower'),
-                'bb_mid': metrics.get('bb_mid'),
-                'bb_width_pct': metrics.get('bb_width_pct'),
-                'bb_width_prev_pct': metrics.get('bb_width_prev_pct'),
-                'bb_width_min_pct': metrics.get('bb_width_min_pct'),
-                'bb_width_percentile': metrics.get('bb_width_percentile'),
-                'keltner_upper': metrics.get('keltner_upper'),
-                'keltner_lower': metrics.get('keltner_lower'),
-                'keltner_mid': metrics.get('keltner_mid'),
-                'keltner_width_pct': metrics.get('keltner_width_pct'),
-                'keltner_width_prev_pct': metrics.get('keltner_width_prev_pct'),
-                'keltner_squeeze_on': metrics.get('keltner_squeeze_on'),
-                'range_expansion_ratio': metrics.get('range_expansion_ratio'),
-                'range_compression_ratio': metrics.get('range_compression_ratio'),
-                'squeeze_release_state': metrics.get('squeeze_release_state'),
-                'vwap': metrics.get('vwap'),
-                'vwap_slope': metrics.get('vwap_slope'),
-                'vwap_reason': metrics.get('vwap_reason'),
-                'volume_ratio': metrics.get('volume_ratio'),
-                'obv_slope_ratio': metrics.get('obv_slope_ratio'),
-                'mfi': metrics.get('mfi'),
-                'psar_direction': metrics.get('psar_direction'),
-                'psar': metrics.get('psar'),
-                'psar_reason': metrics.get('psar_reason'),
-                'ichimoku_bias': metrics.get('ichimoku_bias'),
-                'ichimoku_top': metrics.get('ichimoku_top'),
-                'ichimoku_bottom': metrics.get('ichimoku_bottom'),
-                'session_hour_kst': metrics.get('session_hour_kst'),
-                'auto_scores': (auto_analysis or {}).get('scores') if isinstance(auto_analysis, dict) else {},
-                'mtf_metrics': (auto_analysis or {}).get('timeframes') if isinstance(auto_analysis, dict) else {},
-                'chop': metrics.get('chop'),
-                'chop_reason': metrics.get('chop_reason'),
-                'vortex_plus': metrics.get('vortex_plus'),
-                'vortex_minus': metrics.get('vortex_minus'),
-                'vortex_reason': metrics.get('vortex_reason'),
-                'aroon_up': metrics.get('aroon_up'),
-                'aroon_down': metrics.get('aroon_down'),
-                'aroon_reason': metrics.get('aroon_reason'),
-                'htf_ready': htf_ready,
-                'htf_error': htf_error,
-                'htf_close': htf_close,
-                'htf_ema_fast': htf_ema_fast,
-                'htf_ema_slow': htf_ema_slow,
-                'htf_gap_pct': htf_gap_pct,
-                'htf_supertrend_direction': htf_supertrend_direction,
-                'htf_supertrend_reason': htf_supertrend_reason,
-                'funding_rate': futures_context.get('funding_rate'),
-                'next_funding_time': futures_context.get('next_funding_time'),
-                'open_interest_delta_pct': futures_context.get('open_interest_delta_pct'),
-                'open_interest_delta_z': futures_context.get('open_interest_delta_z'),
-                'open_interest_acceleration': futures_context.get('open_interest_acceleration'),
-                'open_interest_hist_samples': futures_context.get('open_interest_hist_samples'),
-                'taker_buy_sell_ratio': futures_context.get('taker_buy_sell_ratio'),
-                'long_short_ratio': futures_context.get('long_short_ratio'),
-                'orderbook_imbalance_pct': futures_context.get('orderbook_imbalance_pct'),
-                'rolling_orderbook_imbalance_pct': futures_context.get('rolling_orderbook_imbalance_pct'),
-                'rolling_orderbook_imbalance_delta': futures_context.get('rolling_orderbook_imbalance_delta'),
-                'rolling_ofi_score': futures_context.get('rolling_ofi_score'),
-                'rolling_ofi_samples': futures_context.get('rolling_ofi_samples'),
-                'futures_spread_pct': futures_context.get('futures_spread_pct'),
-                'bid_depth_usdt': futures_context.get('bid_depth_usdt'),
-                'ask_depth_usdt': futures_context.get('ask_depth_usdt'),
-                'basis_pct': futures_context.get('basis_pct'),
-                'market_regime_context': market_regime_context,
-            }
-            filter_values = self._enrich_utbreakout_trend_health_values(filter_values, closed, cfg, status_atr_series)
-            filter_values = self._enrich_utbreakout_strategy_quality_values(filter_values, closed, cfg)
-            try:
-                signal_ts = float(ut_detail.get('signal_ts') or 0.0)
-                timeframe_ms = float(
-                    self._timeframe_to_ms(entry_tf) or (15 * 60 * 1000)
-                )
-                if signal_ts > 0 and decision_ts >= signal_ts:
-                    filter_values['signal_age_candles'] = (
-                        float(decision_ts) - signal_ts
-                    ) / max(timeframe_ms, 1.0)
-                elif candidate_type == 'fresh_signal':
-                    filter_values['signal_age_candles'] = 0.0
-            except (TypeError, ValueError):
-                if candidate_type == 'fresh_signal':
-                    filter_values['signal_age_candles'] = 0.0
+            filter_values = _market_quality_filter_values()
             feature_score = self._calculate_utbreakout_feature_score(side, cfg, filter_values)
             filter_values['feature_score'] = feature_score
             selected_items = self._evaluate_utbreakout_set_filter_items(side, selected_set, cfg, filter_values)
@@ -14863,6 +14830,15 @@ class SignalEngine(BaseEngine):
 
         long_ok, long_lines = await _side_conditions('long')
         short_ok, short_lines = await _side_conditions('short')
+
+        def _side_has_red_gate(side_lines):
+            return any("🔴" in line or "불만족" in line for line in side_lines if "필수 게이트" not in line)
+
+        candidate_lines = short_lines if candidate_side == 'short' else long_lines if candidate_side == 'long' else []
+        if candidate_side in {'long', 'short'} and not _side_has_red_gate(candidate_lines):
+            if not self._is_valid_number(planned_qty) or not self._is_valid_number(risk_usdt) or float(risk_usdt or 0) <= 0:
+                entry_plan_detail += " / 상태진단: 후보 EV는 통과처럼 보이나 수량계산 risk=0"
+
         ready_side = (
             candidate_side
             if candidate_side == 'long' and long_ok

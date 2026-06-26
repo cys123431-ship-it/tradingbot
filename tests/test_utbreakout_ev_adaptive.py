@@ -699,3 +699,105 @@ def test_opposite_orderflow_blocks_otherwise_valid_entry():
 
     assert decision.allowed is False
     assert any("opposite orderflow" in blocker for blocker in decision.blockers)
+
+
+def test_ev_adaptive_continuation_requires_signal_age():
+    decision = evaluate_ev_adaptive_entry(
+        side="short",
+        candidate_type="bias_state",
+        values={
+            "entry_price": 100.0,
+            "ema50": 101.0,
+            "ema50_prev": 101.5,
+            "htf_close": 98.0,
+            "htf_ema_fast": 99.0,
+            "htf_ema_slow": 101.0,
+            "adx": 32.0,
+            "plus_di": 12.0,
+            "minus_di": 31.0,
+            "chop": 38.0,
+            "volume_ratio": 1.45,
+            "directional_efficiency": 0.42,
+            "momentum_6_pct": -0.8,
+            "momentum_12_pct": -1.5,
+            "momentum_24_pct": -2.4,
+            "donchian_low_prev": 101.0,
+            "range_expansion_ratio": 1.30,
+            "mtf_metrics": {
+                "15m": {"ema_bias": "short"},
+                "30m": {"ema_bias": "short"},
+                "1h": {"ema_bias": "short"},
+            },
+        },
+    )
+    assert decision.allowed is False
+    assert any("signal age missing" in blocker for blocker in decision.blockers)
+    assert decision.risk_multiplier == 0
+
+
+def test_ev_adaptive_continuation_with_signal_age_can_size_short():
+    decision = evaluate_ev_adaptive_entry(
+        side="short",
+        candidate_type="bias_state",
+        values={
+            "entry_price": 100.0,
+            "ema50": 101.0,
+            "ema50_prev": 101.5,
+            "htf_close": 98.0,
+            "htf_ema_fast": 99.0,
+            "htf_ema_slow": 101.0,
+            "adx": 32.0,
+            "plus_di": 12.0,
+            "minus_di": 31.0,
+            "chop": 38.0,
+            "volume_ratio": 1.45,
+            "directional_efficiency": 0.42,
+            "momentum_6_pct": -0.8,
+            "momentum_12_pct": -1.5,
+            "momentum_24_pct": -2.4,
+            "signal_age_candles": 2.0,
+            "donchian_low_prev": 101.0,
+            "range_expansion_ratio": 1.30,
+            "mtf_metrics": {
+                "15m": {"ema_bias": "short"},
+                "30m": {"ema_bias": "short"},
+                "1h": {"ema_bias": "short"},
+            },
+        },
+    )
+    assert decision.allowed is True
+    assert decision.risk_multiplier > 0
+
+
+def test_ev_adaptive_continuation_with_signal_age_can_size_long():
+    decision = evaluate_ev_adaptive_entry(
+        side="long",
+        candidate_type="bias_state",
+        values={
+            "entry_price": 100.0,
+            "ema50": 99.0,
+            "ema50_prev": 98.5,
+            "htf_close": 102.0,
+            "htf_ema_fast": 101.0,
+            "htf_ema_slow": 99.0,
+            "adx": 32.0,
+            "plus_di": 31.0,
+            "minus_di": 12.0,
+            "chop": 38.0,
+            "volume_ratio": 1.45,
+            "directional_efficiency": 0.42,
+            "momentum_6_pct": 0.8,
+            "momentum_12_pct": 1.5,
+            "momentum_24_pct": 2.4,
+            "signal_age_candles": 2.0,
+            "donchian_high_prev": 99.0,
+            "range_expansion_ratio": 1.30,
+            "mtf_metrics": {
+                "15m": {"ema_bias": "long"},
+                "30m": {"ema_bias": "long"},
+                "1h": {"ema_bias": "long"},
+            },
+        },
+    )
+    assert decision.allowed is True
+    assert decision.risk_multiplier > 0
