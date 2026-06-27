@@ -52,8 +52,22 @@ def test_auto_entry_bridge_calls_entry_for_recent_ready_plan():
     async def entry(requested_symbol, side, price):
         entry_calls.append((requested_symbol, side, price))
 
+    async def mock_evaluate_eligibility(requested_symbol):
+        return {
+            'ok_market': True,
+            'symbol': requested_symbol,
+            'long_ok': True,
+            'short_ok': True,
+            'long_eligibility': {'can_attempt': True, 'blockers': []},
+            'short_eligibility': {'can_attempt': True, 'blockers': []},
+            'long_lines': [],
+            'short_lines': [],
+            'ut_reason': 'mocked',
+        }
+
     engine.get_server_position = get_server_position
     engine.entry = entry
+    engine._evaluate_utbreakout_eligibility_context = mock_evaluate_eligibility
     engine._set_utbot_filtered_breakout_entry_plan(
         symbol,
         {
@@ -79,7 +93,6 @@ def test_auto_entry_bridge_calls_entry_for_recent_ready_plan():
             source="scanner_seen",
         )
     )
-
     assert called is True
     assert entry_calls == [(symbol, "long", 101.25)]
     assert any("Auto Entry Bridge" in text for text in notifications)
