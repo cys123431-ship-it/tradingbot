@@ -1836,6 +1836,7 @@ def build_default_utbot_filtered_breakout_config():
         'utbreakout_trace_watchdog_cooldown_sec': 180.0,
         'utbreakout_auto_entry_bridge_cooldown_sec': 60.0,
         'utbreakout_auto_entry_bridge_max_ready_age_sec': 180.0,
+        'utbreakout_require_scanner_candidate_for_auto_entry': True,
         'quality_score_v2_enabled': True,
         'quality_score_v2_block_below': 12.0,
         'quality_score_v2_reduce_below': 40.0,
@@ -6265,6 +6266,7 @@ class SignalEngine(BaseEngine):
             'utbreakout_trace_watchdog_cooldown_sec': 180.0,
             'utbreakout_auto_entry_bridge_cooldown_sec': 60.0,
             'utbreakout_auto_entry_bridge_max_ready_age_sec': 180.0,
+            'utbreakout_require_scanner_candidate_for_auto_entry': True,
             'quality_score_v2_block_below': 12.0,
             'quality_score_v2_reduce_below': 40.0,
             'quality_score_v2_full_score': 82.0,
@@ -8904,8 +8906,9 @@ class SignalEngine(BaseEngine):
                     self.utbreakout_last_ready_ts[key] = now_ts
                 self.utbreakout_last_ready_side[key] = ready_side
             elif stage_upper == 'STATUS_NOT_READY':
-                self.utbreakout_last_ready_ts[key] = 0.0
-                self.utbreakout_last_ready_side.pop(key, None)
+                if str(safe_data.get('source') or '').lower() != 'manual_status':
+                    self.utbreakout_last_ready_ts[key] = 0.0
+                    self.utbreakout_last_ready_side.pop(key, None)
             elif stage_upper == 'ORDER_ATTEMPT':
                 self.utbreakout_last_order_attempt_ts[key] = now_ts
             elif stage_upper == 'COIN_SELECTED':
@@ -9032,7 +9035,7 @@ class SignalEngine(BaseEngine):
             return event
 
         important_stages = [
-            'STATUS_EVALUATED', 'STATUS_READY', 'COIN_SELECTED',
+            'STATUS_EVALUATED', 'STATUS_DIAGNOSTIC_READY', 'STATUS_READY', 'COIN_SELECTED',
             'SCANNER_SEEN', 'MARKET_VALIDATED', 'SYMBOL_INVALID_MARKET',
             'POLL_TICK',
             'POLL_ALREADY_PROCESSED', 'NO_POSITION_RETRY',
@@ -9353,61 +9356,115 @@ class SignalEngine(BaseEngine):
         daily_risk_ok: bool,
         plan_lookup_ready: bool,
         cfg: dict,
+        scanner_source: str | None = None,
+        is_live_scanner_context: bool = False,
+        is_current_scanner_candidate: bool = False,
+        is_coinselector_top_candidate: bool | None = None,
+        next_scan_symbol: str | None = None,
+        evaluated_symbol: str | None = None,
+        manual_status_only: bool = False,
     ):
+        cfg = cfg if isinstance(cfg, dict) else {}
         blockers = []
         warnings = []
-
-        # 1. auto entry master switch
-        if not auto_entry_enabled:
-            blockers.append("bridge disabled")
-        if getattr(self.ctrl, 'is_paused', False):
-            blockers.append("bot is paused")
-
-        # 2. strategy check
         strategy_params = self.get_runtime_strategy_params()
         active_strategy = str(strategy_params.get('active_strategy', '') or '').lower()
+
         if active_strategy not in UTBREAKOUT_STRATEGIES:
             blockers.append("active strategy not UTBreakout")
-
-        # 3. side match
         if not candidate_side or candidate_side != side:
             blockers.append("direction mismatch")
-
-        # 4. side condition
         if not side_condition_ok:
             blockers.append("side condition failed")
 
-        # 5. risk plan & quantity
+        evaluated_symbol = evaluated_symbol or symbol
+        evaluated_key = self._utbreakout_status_symbol_key(evaluated_symbol)
+        candidate_symbol = (
+            next_scan_symbol
+            or getattr(self, 'current_utbreakout_candidate_symbol', None)
+            or getattr(self, 'current_coin_selector_symbol', None)
+            or None
+        )
+        candidate_key = self._utbreakout_status_symbol_key(candidate_symbol)
+        require_scanner_candidate = bool(
+            cfg.get('utbreakout_require_scanner_candidate_for_auto_entry', True)
+        )
+
+        if manual_status_only:
+            blockers.append("manual status only; live scanner has not selected this symbol")
+        elif not is_live_scanner_context:
+            blockers.append("not live scanner context")
+
+        if require_scanner_candidate:
+            if is_live_scanner_context and not is_current_scanner_candidate:
+                blockers.append("not current scanner candidate")
+            elif candidate_key and evaluated_key and candidate_key != evaluated_key:
+                blockers.append("not current scanner candidate")
+
+        if is_coinselector_top_candidate is None:
+            scores = getattr(self, 'coin_selector_symbol_scores', {})
+            if isinstance(scores, dict) and scores:
+                aliases = {
+                    symbol,
+                    evaluated_symbol,
+                    str(symbol or '').replace(':USDT', ''),
+                    str(evaluated_symbol or '').replace(':USDT', ''),
+                }
+                wanted = {
+                    self._utbreakout_status_symbol_key(item)
+                    for item in aliases
+                    if item
+                }
+                is_coinselector_top_candidate = any(
+                    self._utbreakout_status_symbol_key(score_key) in wanted
+                    for score_key in scores.keys()
+                )
+
+        coin_selector_enabled = False
+        try:
+            coin_selector_enabled = bool(
+                self._get_coin_selector_config().get('enabled', False)
+            )
+        except Exception:
+            coin_selector_enabled = False
+        if (
+            coin_selector_enabled
+            and is_coinselector_top_candidate is None
+            and not is_live_scanner_context
+        ):
+            is_coinselector_top_candidate = False
+        if coin_selector_enabled and is_coinselector_top_candidate is False:
+            if require_scanner_candidate:
+                blockers.append("CoinSelector not selected/top candidate")
+            else:
+                warnings.append(
+                    "CoinSelector not top candidate; selector used as risk reducer only"
+                )
+
+        if cooldown_reasons:
+            for r in cooldown_reasons:
+                blockers.append(f"cooldown: {r}")
         if not risk_ok:
             blockers.append("risk plan blocked")
         if planned_qty is None or not np.isfinite(planned_qty) or planned_qty <= 0:
             blockers.append("planned quantity zero")
         if risk_usdt is None or not np.isfinite(risk_usdt) or risk_usdt <= 0:
             blockers.append("planned risk zero")
-
-        # 6. daily risk limit
         if not daily_risk_ok:
             blockers.append("daily risk limit reached")
-
-        # 7. position checks
+        if not plan_lookup_ready:
+            blockers.append("ready entry plan missing")
+        allow_continuation = bool(cfg.get('utbreakout_allow_continuation_auto_entry', True))
+        if candidate_type == 'bias_state' and not allow_continuation:
+            blockers.append("continuation entry disabled")
         if has_open_position:
             blockers.append("position already exists")
         if has_other_position:
             blockers.append("other symbol position exists")
-
-        # 8. cooldowns
-        if cooldown_reasons:
-            for r in cooldown_reasons:
-                blockers.append(f"cooldown: {r}")
-
-        # 9. plan lookup
-        if not plan_lookup_ready:
-            blockers.append("ready entry plan missing")
-
-        # 10. continuation entries config
-        allow_continuation = bool(cfg.get('utbreakout_allow_continuation_auto_entry', True))
-        if candidate_type == 'bias_state' and not allow_continuation:
-            blockers.append("continuation entry disabled")
+        if not auto_entry_enabled:
+            blockers.append("bridge disabled")
+        if getattr(getattr(self, 'ctrl', None), 'is_paused', False):
+            blockers.append("bot is paused")
 
         can_attempt = len(blockers) == 0
 
@@ -9424,8 +9481,68 @@ class SignalEngine(BaseEngine):
             'blockers': blockers,
             'warnings': warnings,
             'candidate_type': candidate_type,
+            'scanner_source': scanner_source,
+            'is_live_scanner_context': bool(is_live_scanner_context),
+            'is_current_scanner_candidate': bool(is_current_scanner_candidate),
+            'is_coinselector_top_candidate': is_coinselector_top_candidate,
             'expected_trace': expected_trace
         }
+
+    def _record_utbreakout_live_ready_from_diag(
+        self,
+        symbol: str,
+        *,
+        source: str,
+        scan_tf: str | None = None,
+    ) -> str | None:
+        """Record real live readiness only from scanner-side accepted diagnostics."""
+        try:
+            self._ensure_utbreakout_trace_state()
+            symbol = self._canonicalize_utbreakout_symbol_for_use(
+                symbol,
+                source=f'live_ready:{source}',
+            )
+            diag = self._utbreakout_diag_for_symbol(symbol)
+            side = str((diag or {}).get('accepted_side') or '').lower()
+            if side not in {'long', 'short'}:
+                return None
+
+            plan = self._get_utbot_filtered_breakout_entry_plan(symbol, side)
+            if not isinstance(plan, dict):
+                self._utbreakout_trace_event(
+                    symbol,
+                    'STATUS_NOT_READY',
+                    'MISSING_PLAN',
+                    source=source,
+                    side=side,
+                    reason='accepted_side exists but entry plan missing',
+                )
+                return None
+
+            self._utbreakout_trace_event(
+                symbol,
+                'STATUS_READY',
+                'READY',
+                source=source,
+                side=side,
+                candidate_type=diag.get('candidate_type'),
+                decision_candle_ts=diag.get('decision_candle_ts'),
+                entry_tf=diag.get('entry_timeframe') or scan_tf,
+                effective_profile=diag.get('effective_profile_version'),
+                selected_set=(
+                    diag.get('auto_selected_set_name')
+                    or diag.get('auto_selected_set_id')
+                ),
+                qty=plan.get('qty'),
+                entry_price=plan.get('entry_price'),
+                margin=plan.get('planned_margin', plan.get('margin_to_use')),
+                notional=plan.get('planned_notional', plan.get('target_notional')),
+                risk_usdt=plan.get('risk_usdt', plan.get('risk_amount')),
+            )
+            return side
+        except Exception:
+            logger.exception("UTBreakout live ready recording failed")
+            return None
 
     def _ensure_utbreakout_auto_entry_bridge_state(self):
         if not isinstance(
@@ -9524,14 +9641,39 @@ class SignalEngine(BaseEngine):
                 self.utbreakout_last_ready_ts.get(key, 0.0) or 0.0
             )
             if ready_ts <= 0:
-                self._utbreakout_trace_event(
-                    symbol,
-                    'AUTO_ENTRY_BRIDGE_BLOCKED',
-                    'NO_STATUS_READY',
-                    source=source,
-                    reason='no STATUS_READY event for symbol',
-                )
-                return False
+                live_ready_sources = {
+                    'scanner',
+                    'scanner_seen',
+                    'coin_selector',
+                    'high_volume_scanner',
+                }
+                if str(source) in live_ready_sources:
+                    synthesized_side = self._record_utbreakout_live_ready_from_diag(
+                        symbol,
+                        source=f"{source}:synthesized_ready",
+                    )
+                    if synthesized_side in {'long', 'short'}:
+                        ready_ts = float(
+                            self.utbreakout_last_ready_ts.get(key, 0.0) or 0.0
+                        )
+                    else:
+                        self._utbreakout_trace_event(
+                            symbol,
+                            'AUTO_ENTRY_BRIDGE_BLOCKED',
+                            'NO_STATUS_READY',
+                            source=source,
+                            reason='no live STATUS_READY and no accepted diagnostic/plan',
+                        )
+                        return False
+                else:
+                    self._utbreakout_trace_event(
+                        symbol,
+                        'AUTO_ENTRY_BRIDGE_BLOCKED',
+                        'NO_STATUS_READY',
+                        source=source,
+                        reason='no STATUS_READY event for symbol',
+                    )
+                    return False
 
             max_ready_age_sec = float(
                 cfg.get('utbreakout_auto_entry_bridge_max_ready_age_sec', 180.0)
@@ -9566,7 +9708,14 @@ class SignalEngine(BaseEngine):
                 and isinstance(ready_event.get('data'), dict)
                 else {}
             )
-            ctx = await self._evaluate_utbreakout_eligibility_context(symbol)
+            ctx = await self._evaluate_utbreakout_eligibility_context(
+                symbol,
+                scanner_source=source,
+                is_live_scanner_context=True,
+                is_current_scanner_candidate=True,
+                next_scan_symbol=symbol,
+                evaluated_symbol=symbol,
+            )
             if not ctx.get('ok_market'):
                 self._utbreakout_trace_event(
                     symbol,
@@ -13701,126 +13850,6 @@ class SignalEngine(BaseEngine):
                 )
         return lines
 
-    async def build_utbreakout_condition_status_text(self, symbol):
-        ctx = await self._evaluate_utbreakout_eligibility_context(symbol)
-        if not ctx.get('ok_market'):
-            if ctx.get('unsupported_mode'):
-                return enforce_utbreakout_effective_status_contract(
-                    "🚦 UT Breakout 조건 스테이터스\n\n업비트 현물 모드에서는 UTBOT_FILTERED_BREAKOUT_V1을 사용하지 않습니다.",
-                    ctx['cfg']
-                )
-            if ctx.get('insufficient_data'):
-                return enforce_utbreakout_effective_status_contract(
-                    f"🚦 UT Breakout 조건 스테이터스\n\n{ctx.get('reason', '')}",
-                    ctx['cfg']
-                )
-            if ctx.get('restricted_symbol'):
-                return enforce_utbreakout_effective_status_contract(
-                    "\n".join([
-                        "🚦 UT Breakout 조건 스테이터스",
-                        f"조건 평가 심볼: {ctx['symbol']}",
-                        "최종: 진입 차단",
-                        f"🔴 제한 티커 제외: {ctx['validation_reason']}",
-                        "이 심볼은 한국계정 거래 제한으로 스캔/진입 대상에서 제외됩니다.",
-                    ]),
-                    ctx['cfg']
-                )
-            return enforce_utbreakout_effective_status_contract(
-                "\n".join([
-                    "🚦 UT Breakout 조건 스테이터스",
-                    f"조건 평가 심볼: {ctx['symbol']}",
-                    "최종: 진입 차단",
-                    f"🔴 유효하지 않은 Binance Futures 심볼: {ctx['validation_reason']}",
-                    "이 심볼은 exchange.markets에 없으므로 스캔/진입 대상에서 제외됩니다.",
-                ]),
-                ctx['cfg']
-            )
-
-        cfg = ctx['cfg']
-        long_eligibility = ctx['long_eligibility']
-        short_eligibility = ctx['short_eligibility']
-        long_ok = ctx['long_ok']
-        short_ok = ctx['short_ok']
-        long_lines = ctx['long_lines']
-        short_lines = ctx['short_lines']
-        
-        compact_long = self._compact_side_gate_summary("long", long_ok, long_lines, execution_eligibility=long_eligibility)
-        compact_short = self._compact_side_gate_summary("short", short_ok, short_lines, execution_eligibility=short_eligibility)
-
-        long_gate_lbl = "주문시도 대상 - STATUS_READY → AUTO_ENTRY_BRIDGE → ENTRY_CALL 예상" if long_eligibility['can_attempt'] else f"차단 - {'; '.join(long_eligibility['blockers'])}" if long_eligibility['blockers'] else "대기"
-        short_gate_lbl = "주문시도 대상 - STATUS_READY → AUTO_ENTRY_BRIDGE → ENTRY_CALL 예상" if short_eligibility['can_attempt'] else f"차단 - {'; '.join(short_eligibility['blockers'])}" if short_eligibility['blockers'] else "대기"
-
-        long_final_lbl = "주문시도 대상" if long_eligibility['can_attempt'] else "조건통과-실행차단" if long_ok else "대기"
-        short_final_lbl = "주문시도 대상" if short_eligibility['can_attempt'] else "조건통과-실행차단" if short_ok else "대기"
-
-        adaptive_tfs = cfg.get("adaptive_timeframes", ["15m", "30m", "1h"])
-        position_scan_context = await self._build_utbreakout_position_scan_context_lines(ctx['symbol'])
-
-        def _fmt(value, digits=2):
-            try:
-                if value is None or not np.isfinite(float(value)):
-                    return "n/a"
-                return f"{float(value):.{digits}f}"
-            except (TypeError, ValueError):
-                return "n/a"
-
-        def _fmt_ts(ms):
-            try:
-                ts = int(ms or 0)
-                if ts <= 0:
-                    return "n/a"
-                return datetime.fromtimestamp(ts / 1000, timezone.utc).astimezone(
-                    timezone(timedelta(hours=9))
-                ).strftime('%m-%d %H:%M KST')
-            except Exception:
-                return "n/a"
-
-        text_lines = [
-            "🚦 UT Breakout 조건 스테이터스",
-            *build_utbreakout_effective_status_contract(cfg, ctx['daily_entries']),
-            *position_scan_context,
-            "실행 게이트",
-            f"LONG: {long_gate_lbl}",
-            f"SHORT: {short_gate_lbl}",
-            "",
-            f"Runtime Profile: {cfg.get('runtime_profile', UTBREAKOUT_RUNTIME_PROFILE)}",
-            f"Effective TF: entry {ctx['entry_tf']} / htf {ctx['htf_tf']} / adaptive {', '.join(map(str, adaptive_tfs))}",
-            f"TF: 진입 {ctx['entry_tf']} / HTF {ctx['htf_tf']}",
-            f"Adaptive TF: {'ON' if cfg.get('adaptive_timeframe_enabled') else 'OFF'} / {self._format_adaptive_timeframe_summary(ctx['adaptive_decision']) if ctx['adaptive_decision'] else '고정 시간봉'}",
-            f"마지막 마감봉: {_fmt_ts(ctx['decision_ts'])} / close {_fmt(ctx['entry_price'], 4)}",
-            f"현재 UTBot 방향: {ctx['ut_label']}",
-            f"선택모드: {ctx['mode_label']}",
-            f"선택 Set: Set{ctx['selected_set'].get('id')} {ctx['selected_set'].get('name')} ({ctx['set_status']})",
-            f"선택 이유: {ctx['auto_reason'] or '수동 선택'}",
-            ctx['entry_plan_detail'],
-            ctx['micro_line'],
-            ctx['opposite_set_exit_detail'],
-            f"시장 레짐: {ctx['market_regime_context'].get('summary') or '데이터 대기'}",
-            f"AUTO 점수: {ctx['score_line']}",
-            ctx['orderflow_line'],
-            ctx['oi_line'],
-            ctx['squeeze_line'],
-            ctx['feature_line'],
-            self.get_coin_selector_symbol_summary(ctx['symbol']),
-            "주의: 빨간 필수 게이트만 진입 차단입니다. 노란 항목은 진입 차단이 아니라 수량/리스크 축소입니다.",
-            f"최종: LONG {long_final_lbl} / SHORT {short_final_lbl}",
-            "",
-            "요약 신호등",
-            compact_long,
-            compact_short,
-            "",
-            *long_lines,
-            "",
-            *short_lines,
-            "",
-            f"UT 사유: {ctx['ut_reason']}"
-        ]
-        return enforce_utbreakout_effective_status_contract(
-            "\n".join(text_lines),
-            cfg,
-            ctx['daily_entries'],
-        )
-
     async def _build_direction_decision_for_status(self, symbol, side, filter_values):
         try:
             from utbreakout.direction_filter import decide_direction
@@ -14080,7 +14109,18 @@ class SignalEngine(BaseEngine):
             
         return f"{side_label}: {icon_str} | {score_str} | {entry_status} | 이유: {reason_str}"
 
-    async def _evaluate_utbreakout_eligibility_context(self, symbol):
+    async def _evaluate_utbreakout_eligibility_context(
+        self,
+        symbol,
+        *,
+        scanner_source: str | None = None,
+        is_live_scanner_context: bool = False,
+        is_current_scanner_candidate: bool = False,
+        is_coinselector_top_candidate: bool | None = None,
+        next_scan_symbol: str | None = None,
+        evaluated_symbol: str | None = None,
+        manual_status_only: bool = False,
+    ):
         if not self.is_upbit_mode():
             symbol = self._canonicalize_utbreakout_symbol_for_use(
                 symbol,
@@ -15031,6 +15071,23 @@ class SignalEngine(BaseEngine):
         )
         
         auto_entry_enabled = bool(getattr(self, 'utbreakout_auto_entry_bridge_enabled', True))
+        evaluated_symbol = evaluated_symbol or symbol
+        gate_next_symbol = next_scan_symbol
+        if not gate_next_symbol:
+            gate_next_symbol = (
+                getattr(self, 'current_utbreakout_candidate_symbol', None)
+                or getattr(self, 'current_coin_selector_symbol', None)
+                or None
+            )
+        if is_live_scanner_context and not gate_next_symbol:
+            gate_next_symbol = symbol
+        if (
+            not is_current_scanner_candidate
+            and gate_next_symbol
+            and self._utbreakout_status_symbol_key(gate_next_symbol)
+            == self._utbreakout_status_symbol_key(evaluated_symbol)
+        ):
+            is_current_scanner_candidate = True
         
         long_plan = self._get_utbot_filtered_breakout_entry_plan(symbol, 'long')
         long_eligibility = self._build_utbreakout_execution_eligibility(
@@ -15050,6 +15107,13 @@ class SignalEngine(BaseEngine):
             daily_risk_ok=bool(daily_ok),
             plan_lookup_ready=isinstance(long_plan, dict),
             cfg=cfg,
+            scanner_source=scanner_source,
+            is_live_scanner_context=is_live_scanner_context,
+            is_current_scanner_candidate=is_current_scanner_candidate,
+            is_coinselector_top_candidate=is_coinselector_top_candidate,
+            next_scan_symbol=gate_next_symbol,
+            evaluated_symbol=evaluated_symbol,
+            manual_status_only=manual_status_only,
         )
         
         short_plan = self._get_utbot_filtered_breakout_entry_plan(symbol, 'short')
@@ -15070,6 +15134,13 @@ class SignalEngine(BaseEngine):
             daily_risk_ok=bool(daily_ok),
             plan_lookup_ready=isinstance(short_plan, dict),
             cfg=cfg,
+            scanner_source=scanner_source,
+            is_live_scanner_context=is_live_scanner_context,
+            is_current_scanner_candidate=is_current_scanner_candidate,
+            is_coinselector_top_candidate=is_coinselector_top_candidate,
+            next_scan_symbol=gate_next_symbol,
+            evaluated_symbol=evaluated_symbol,
+            manual_status_only=manual_status_only,
         )
 
         ready_side = (
@@ -15091,8 +15162,8 @@ class SignalEngine(BaseEngine):
             short_ok=short_ok,
             ready_side=ready_side,
             final=(
-                f"LONG {'주문시도 대상' if long_eligibility['can_attempt'] else '조건통과-실행차단' if long_ok else '대기'} / "
-                f"SHORT {'주문시도 대상' if short_eligibility['can_attempt'] else '조건통과-실행차단' if short_ok else '대기'}"
+                f"LONG {'주문시도 대상' if long_eligibility['can_attempt'] else '조건통과 / 주문 안함' if long_ok else '대기'} / "
+                f"SHORT {'주문시도 대상' if short_eligibility['can_attempt'] else '조건통과 / 주문 안함' if short_ok else '대기'}"
             ),
             selected_set=(
                 f"Set{selected_set.get('id')} {selected_set.get('name')}"
@@ -16252,6 +16323,11 @@ class SignalEngine(BaseEngine):
         )
         
         auto_entry_enabled = bool(getattr(self, 'utbreakout_auto_entry_bridge_enabled', True))
+        gate_next_symbol = (
+            getattr(self, 'current_utbreakout_candidate_symbol', None)
+            or getattr(self, 'current_coin_selector_symbol', None)
+            or None
+        )
         
         long_plan = self._get_utbot_filtered_breakout_entry_plan(symbol, 'long')
         long_eligibility = self._build_utbreakout_execution_eligibility(
@@ -16271,6 +16347,13 @@ class SignalEngine(BaseEngine):
             daily_risk_ok=bool(daily_ok),
             plan_lookup_ready=isinstance(long_plan, dict),
             cfg=cfg,
+            scanner_source='manual_status',
+            is_live_scanner_context=False,
+            is_current_scanner_candidate=False,
+            is_coinselector_top_candidate=None,
+            next_scan_symbol=gate_next_symbol,
+            evaluated_symbol=symbol,
+            manual_status_only=True,
         )
         
         short_plan = self._get_utbot_filtered_breakout_entry_plan(symbol, 'short')
@@ -16291,6 +16374,13 @@ class SignalEngine(BaseEngine):
             daily_risk_ok=bool(daily_ok),
             plan_lookup_ready=isinstance(short_plan, dict),
             cfg=cfg,
+            scanner_source='manual_status',
+            is_live_scanner_context=False,
+            is_current_scanner_candidate=False,
+            is_coinselector_top_candidate=None,
+            next_scan_symbol=gate_next_symbol,
+            evaluated_symbol=symbol,
+            manual_status_only=True,
         )
 
         ready_side = (
@@ -16312,8 +16402,8 @@ class SignalEngine(BaseEngine):
             short_ok=short_ok,
             ready_side=ready_side,
             final=(
-                f"LONG {'주문시도 대상' if long_eligibility['can_attempt'] else '조건통과-실행차단' if long_ok else '대기'} / "
-                f"SHORT {'주문시도 대상' if short_eligibility['can_attempt'] else '조건통과-실행차단' if short_ok else '대기'}"
+                f"LONG {'주문시도 대상' if long_eligibility['can_attempt'] else '조건통과 / 주문 안함' if long_ok else '대기'} / "
+                f"SHORT {'주문시도 대상' if short_eligibility['can_attempt'] else '조건통과 / 주문 안함' if short_ok else '대기'}"
             ),
             selected_set=(
                 f"Set{selected_set.get('id')} {selected_set.get('name')}"
@@ -16327,14 +16417,20 @@ class SignalEngine(BaseEngine):
             notional=planned_notional,
             risk_usdt=risk_usdt,
         )
-        if ready_side:
-            self.utbreakout_last_ready_symbol = symbol
+        diagnostic_ready_side = (
+            candidate_side
+            if candidate_side == 'long' and long_ok
+            else candidate_side
+            if candidate_side == 'short' and short_ok
+            else None
+        )
+        if diagnostic_ready_side:
             self._utbreakout_trace_event(
                 symbol,
-                'STATUS_READY',
-                'READY',
-                side=ready_side,
-                final='LONG 가능' if ready_side == 'long' else 'SHORT 가능',
+                'STATUS_DIAGNOSTIC_READY',
+                'DIAGNOSTIC_ONLY',
+                source='manual_status',
+                side=diagnostic_ready_side,
                 entry_tf=cfg.get('entry_timeframe'),
                 htf=cfg.get('htf_timeframe'),
                 effective_profile=cfg.get('effective_profile_version'),
@@ -16349,17 +16445,14 @@ class SignalEngine(BaseEngine):
                 margin=planned_margin,
                 notional=planned_notional,
                 risk_usdt=risk_usdt,
-            )
-            await self._utbreakout_entry_watchdog_check(
-                symbol,
-                ready_side=ready_side,
-                source='status',
+                reason='manual /utbreak status is diagnostic only; live scanner must emit STATUS_READY',
             )
         else:
             self._utbreakout_trace_event(
                 symbol,
                 'STATUS_NOT_READY',
                 'WAIT',
+                source='manual_status',
                 candidate_side=candidate_side,
                 candidate_type=candidate_type,
                 long_ok=long_ok,
@@ -16448,8 +16541,8 @@ class SignalEngine(BaseEngine):
         long_gate_lbl = "주문시도 대상 - STATUS_READY → AUTO_ENTRY_BRIDGE → ENTRY_CALL 예상" if long_eligibility['can_attempt'] else f"차단 - {'; '.join(long_eligibility['blockers'])}" if long_eligibility['blockers'] else "대기"
         short_gate_lbl = "주문시도 대상 - STATUS_READY → AUTO_ENTRY_BRIDGE → ENTRY_CALL 예상" if short_eligibility['can_attempt'] else f"차단 - {'; '.join(short_eligibility['blockers'])}" if short_eligibility['blockers'] else "대기"
 
-        long_final_lbl = "주문시도 대상" if long_eligibility['can_attempt'] else "조건통과-실행차단" if long_ok else "대기"
-        short_final_lbl = "주문시도 대상" if short_eligibility['can_attempt'] else "조건통과-실행차단" if short_ok else "대기"
+        long_final_lbl = "주문시도 대상" if long_eligibility['can_attempt'] else "조건통과 / 주문 안함" if long_ok else "대기"
+        short_final_lbl = "주문시도 대상" if short_eligibility['can_attempt'] else "조건통과 / 주문 안함" if short_ok else "대기"
 
         text_lines = [
             "🚦 UT Breakout 조건 스테이터스",
@@ -21707,6 +21800,11 @@ class SignalEngine(BaseEngine):
                         ),
                         source='coin_selector_scanner',
                         force=True,
+                    )
+                    self._record_utbreakout_live_ready_from_diag(
+                        symbol,
+                        source='scanner_seen',
+                        scan_tf=scan_tf,
                     )
                     bridge_called = (
                         await self._maybe_run_utbreakout_auto_entry_bridge(
@@ -35681,6 +35779,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 'second_take_profit_ratio',
                 'utbreakout_auto_entry_bridge_cooldown_sec',
                 'utbreakout_auto_entry_bridge_max_ready_age_sec',
+                'utbreakout_require_scanner_candidate_for_auto_entry',
             ]
             lines = [
                 '🧾 UT Breakout Effective Config',

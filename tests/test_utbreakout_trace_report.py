@@ -1,4 +1,6 @@
 import asyncio
+import ast
+from pathlib import Path
 
 import emas
 
@@ -48,6 +50,41 @@ def test_utbreakout_trace_report_detects_ready_without_entry():
     assert "order_attempt 여부: False" in report
     assert "suspected_break_stage" in report
     assert "STATUS_READY 이후 AUTO_ENTRY_BRIDGE/ENTRY_CALL 전" in report
+
+
+def test_no_duplicate_utbreakout_status_builder_definition():
+    tree = ast.parse(Path("emas.py").read_text(encoding="utf-8"))
+    names = [
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+    ]
+
+    assert names.count("build_utbreakout_condition_status_text") == 1
+
+
+def test_manual_status_uses_diagnostic_ready_not_status_ready():
+    tree = ast.parse(Path("emas.py").read_text(encoding="utf-8"))
+    status_fn = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "build_utbreakout_condition_status_text"
+    )
+    emitted_stages = []
+    for node in ast.walk(status_fn):
+        if not isinstance(node, ast.Call):
+            continue
+        if not (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_utbreakout_trace_event"
+        ):
+            continue
+        if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+            emitted_stages.append(node.args[1].value)
+
+    assert "STATUS_DIAGNOSTIC_READY" in emitted_stages
+    assert "STATUS_READY" not in emitted_stages
 
 
 def test_utbreakout_trace_is_bounded_and_symbol_aliases_share_state():
