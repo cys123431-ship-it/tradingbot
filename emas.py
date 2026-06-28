@@ -14099,7 +14099,11 @@ class SignalEngine(BaseEngine):
             reason_str = cleaned
         elif execution_eligibility is not None and not execution_eligibility.get('can_attempt') and ok:
             # Filter passed but execution is blocked
-            blockers = execution_eligibility.get('blockers') or []
+            blockers = self._format_utbreakout_execution_blockers_for_display(
+                side,
+                side_lines,
+                execution_eligibility,
+            )
             cleaned = "; ".join(blockers)
             if len(cleaned) > 90:
                 cleaned = cleaned[:87] + "..."
@@ -14108,6 +14112,193 @@ class SignalEngine(BaseEngine):
             reason_str = "조건 충족" if ok else "대기 조건"
             
         return f"{side_label}: {icon_str} | {score_str} | {entry_status} | 이유: {reason_str}"
+
+    @staticmethod
+    def _required_gate_lines_for_preview(side_lines: list[str], max_required_gate_lines: int = 7) -> list[str]:
+        lines = [str(line) for line in (side_lines or [])]
+        if not lines:
+            return []
+        required_start = -1
+        for index, line in enumerate(lines):
+            if "필수 게이트" in line:
+                required_start = index
+                break
+        if required_start < 0:
+            return lines[:max_required_gate_lines + 2]
+
+        preview_lines = list(lines[:required_start + 1])
+        required_count = 0
+        for line in lines[required_start + 1:]:
+            if "참고/감액" in line:
+                break
+            preview_lines.append(line)
+            required_count += 1
+            if required_count >= max_required_gate_lines:
+                break
+        return preview_lines
+
+    @staticmethod
+    def _clean_utbreakout_status_gate_line(line: str) -> str:
+        cleaned = re.sub(
+            r"^[🟢🔴🟡⚪]\s*(?:만족|불만족|축소|대기)?\s*[0-9]+\.\s*",
+            "",
+            str(line or ""),
+        )
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    def _format_utbreakout_execution_blockers_for_display(
+        self,
+        side: str,
+        side_lines: list[str],
+        execution_eligibility: dict | None,
+        limit: int = 3,
+    ) -> list[str]:
+        if not execution_eligibility or execution_eligibility.get('can_attempt'):
+            return []
+        raw_blockers = [
+            str(blocker)
+            for blocker in (execution_eligibility.get('blockers') or [])
+            if str(blocker or "").strip()
+        ]
+        required_lines = self._required_gate_lines_for_preview(side_lines)
+        display_blockers = []
+
+        def _add(reason):
+            reason = re.sub(r"\s+", " ", str(reason or "")).strip()
+            if reason and reason not in display_blockers:
+                display_blockers.append(reason)
+
+        def _raw_has(*needles):
+            lowered_needles = [needle.lower() for needle in needles]
+            return any(
+                any(needle in blocker.lower() for needle in lowered_needles)
+                for blocker in raw_blockers
+            )
+
+        direction_line = next(
+            (
+                line for line in required_lines
+                if "UTBot 방향" in line
+                and ("🔴" in line or "불만족" in line or "불일치" in line)
+            ),
+            None,
+        )
+        has_direction_root_blocker = bool(direction_line or _raw_has("direction mismatch"))
+        if has_direction_root_blocker:
+            cleaned = self._clean_utbreakout_status_gate_line(direction_line or "")
+            detail = cleaned.split(":", 1)[1].strip() if ":" in cleaned else ""
+            _add(f"UTBot 방향 불일치: {detail}" if detail else "UTBot 방향 불일치")
+
+        ev_line = next(
+            (
+                line for line in required_lines
+                if "EV Adaptive 기대값" in line
+                and (
+                    "🔴" in line
+                    or "불만족" in line
+                    or "NO_TRADE" in line.upper()
+                    or "<" in line
+                    or "stale" in line.lower()
+                )
+            ),
+            None,
+        )
+        has_ev_root_blocker = bool(ev_line)
+        if ev_line:
+            cleaned = self._clean_utbreakout_status_gate_line(ev_line)
+            detail = cleaned.split(":", 1)[1].strip() if ":" in cleaned else cleaned
+            upper_detail = detail.upper()
+            if upper_detail.startswith("NO_TRADE"):
+                rest = detail[len("NO_TRADE"):].lstrip(" :")
+                _add(f"EV Adaptive NO_TRADE: {rest}" if rest else "EV Adaptive NO_TRADE")
+            elif "score" in detail.lower() and "<" in detail:
+                _add(f"EV Adaptive 점수 미달: {detail}")
+            else:
+                _add(f"EV Adaptive 기대값: {detail}")
+
+        if _raw_has("not current scanner candidate"):
+            _add("현재 scanner/CoinSelector 후보 아님")
+        elif _raw_has("coinselector not selected/top candidate"):
+            _add("CoinSelector top 후보 아님")
+
+        for blocker in raw_blockers:
+            lowered = blocker.lower()
+            if "cooldown" in lowered:
+                _add(f"쿨다운: {blocker.split(':', 1)[1].strip() if ':' in blocker else blocker}")
+        if _raw_has("continuation entry disabled"):
+            _add("continuation entry disabled")
+
+        if _raw_has("manual status only"):
+            _add("manual status only: live scanner 미선택")
+        elif _raw_has("not live scanner context"):
+            _add("live scanner context 아님")
+
+        if _raw_has("risk plan blocked"):
+            _add("risk plan blocked")
+        if _raw_has("daily risk limit reached"):
+            _add("daily risk limit reached")
+        has_side_root_blocker = has_direction_root_blocker or has_ev_root_blocker
+        if not has_side_root_blocker:
+            if _raw_has("planned quantity zero", "planned risk zero"):
+                _add("계획 수량/리스크 0")
+            if _raw_has("ready entry plan missing"):
+                _add("ready entry plan missing")
+        if _raw_has("position already exists"):
+            _add("open position guard: same symbol position exists")
+        if _raw_has("other symbol position exists"):
+            _add("open position guard: other symbol position exists")
+        if _raw_has("bridge disabled"):
+            _add("bridge disabled")
+        if _raw_has("bot is paused"):
+            _add("bot paused")
+        if _raw_has("exchange", "testnet", "connection", "api"):
+            _add("exchange/testnet connection problem")
+        if not display_blockers and _raw_has("side condition failed"):
+            _add("필수 조건 불만족")
+        if not display_blockers:
+            display_blockers.extend(raw_blockers[:limit])
+        return display_blockers[:limit]
+
+    def _build_utbreakout_active_side_preview_lines(
+        self,
+        candidate_side: str | None,
+        long_lines: list[str],
+        short_lines: list[str],
+        compact_long: str,
+        compact_short: str,
+    ) -> list[str]:
+        candidate_side = str(candidate_side or "").lower()
+        if candidate_side not in {'long', 'short'}:
+            return []
+
+        active_lines = short_lines if candidate_side == 'short' else long_lines
+        inactive_compact = compact_long if candidate_side == 'short' else compact_short
+        return [
+            f"활성 후보 상세: {candidate_side.upper()}",
+            *self._required_gate_lines_for_preview(active_lines),
+            "",
+            "비활성 방향 요약",
+            inactive_compact,
+        ]
+
+    @staticmethod
+    def _ordered_utbreakout_side_detail_lines(
+        candidate_side: str | None,
+        long_lines: list[str],
+        short_lines: list[str],
+    ) -> list[str]:
+        candidate_side = str(candidate_side or "").lower()
+        ordered_sections = (
+            (short_lines, long_lines)
+            if candidate_side == 'short'
+            else (long_lines, short_lines)
+        )
+        detail_lines = []
+        for section in ordered_sections:
+            if detail_lines:
+                detail_lines.append("")
+            detail_lines.extend(section or [])
+        return detail_lines
 
     async def _evaluate_utbreakout_eligibility_context(
         self,
@@ -16538,11 +16729,35 @@ class SignalEngine(BaseEngine):
         compact_long = self._compact_side_gate_summary("long", long_ok, long_lines, execution_eligibility=long_eligibility)
         compact_short = self._compact_side_gate_summary("short", short_ok, short_lines, execution_eligibility=short_eligibility)
 
-        long_gate_lbl = "주문시도 대상 - STATUS_READY → AUTO_ENTRY_BRIDGE → ENTRY_CALL 예상" if long_eligibility['can_attempt'] else f"차단 - {'; '.join(long_eligibility['blockers'])}" if long_eligibility['blockers'] else "대기"
-        short_gate_lbl = "주문시도 대상 - STATUS_READY → AUTO_ENTRY_BRIDGE → ENTRY_CALL 예상" if short_eligibility['can_attempt'] else f"차단 - {'; '.join(short_eligibility['blockers'])}" if short_eligibility['blockers'] else "대기"
+        long_gate_blockers = self._format_utbreakout_execution_blockers_for_display(
+            "long",
+            long_lines,
+            long_eligibility,
+        )
+        short_gate_blockers = self._format_utbreakout_execution_blockers_for_display(
+            "short",
+            short_lines,
+            short_eligibility,
+        )
+
+        long_gate_lbl = "주문시도 대상 - STATUS_READY → AUTO_ENTRY_BRIDGE → ENTRY_CALL 예상" if long_eligibility['can_attempt'] else f"차단 - {'; '.join(long_gate_blockers)}" if long_gate_blockers else "대기"
+        short_gate_lbl = "주문시도 대상 - STATUS_READY → AUTO_ENTRY_BRIDGE → ENTRY_CALL 예상" if short_eligibility['can_attempt'] else f"차단 - {'; '.join(short_gate_blockers)}" if short_gate_blockers else "대기"
 
         long_final_lbl = "주문시도 대상" if long_eligibility['can_attempt'] else "조건통과 / 주문 안함" if long_ok else "대기"
         short_final_lbl = "주문시도 대상" if short_eligibility['can_attempt'] else "조건통과 / 주문 안함" if short_ok else "대기"
+
+        active_side_preview_lines = self._build_utbreakout_active_side_preview_lines(
+            candidate_side,
+            long_lines,
+            short_lines,
+            compact_long,
+            compact_short,
+        )
+        full_side_detail_lines = self._ordered_utbreakout_side_detail_lines(
+            candidate_side,
+            long_lines,
+            short_lines,
+        )
 
         text_lines = [
             "🚦 UT Breakout 조건 스테이터스",
@@ -16578,9 +16793,10 @@ class SignalEngine(BaseEngine):
             compact_long,
             compact_short,
             "",
-            *long_lines,
+            *active_side_preview_lines,
             "",
-            *short_lines,
+            "전체 방향 상세",
+            *full_side_detail_lines,
             "",
             f"UT 사유: {ut_reason}"
         ]

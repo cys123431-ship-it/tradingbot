@@ -245,3 +245,156 @@ def test_compact_side_summary_preserves_short_visibility_before_preview_cutoff()
     assert "요약 신호등" in preview
     assert "LONG: 🟢🟡🔴⚪⚪⚪⚪ | 점수 41.5" in preview
     assert "SHORT: 🔴🟡🔴⚪⚪⚪⚪ | 점수 38.2" in preview
+
+
+def _sample_long_short_status_lines():
+    long_lines = [
+        "LONG: 대기",
+        "필수 게이트",
+        "🔴 불만족 1. UTBot 방향: 현재 SHORT / bias SHORT",
+        "🟢 만족 2. 방향 필터: EV Adaptive 통합 방향 판정 사용",
+        "🟢 만족 3. 선택 Set 필터: 선택 Set 추가 필터 없음",
+        "🟡 축소 4. 시장 품질: REDUCE x0.25",
+        "🔴 불만족 5. EV Adaptive 기대값: NO_TRADE score 33.4: stale continuation 112>10, MTF 1/3, score 33.4<60",
+        "🟢 만족 6. 일일 리스크: PnL 0.00 / trades 0/7",
+        "🟡 대기 7. ATR 손절/RR/수량: 리스크 예산 없음",
+        "참고/감액",
+        "🟢 만족 - Feature Score: 33.4 / sample",
+    ]
+    short_lines = [
+        "SHORT: 조건통과 / 주문 안함",
+        "필수 게이트",
+        "🟢 만족 1. UTBot 방향: SHORT bias_state",
+        "🟢 만족 2. 방향 필터: EV Adaptive 통합 방향 판정 사용",
+        "🟢 만족 3. 선택 Set 필터: 선택 Set 추가 필터 없음",
+        "🟡 축소 4. 시장 품질: REDUCE x0.25",
+        "🟢 만족 5. EV Adaptive 기대값: GO score 66.2 net=0.410R",
+        "🟢 만족 6. 일일 리스크: PnL 0.00 / trades 0/7",
+        "🟢 만족 7. ATR 손절/RR/수량: qty 12.0 risk 1.10",
+        "참고/감액",
+        "🟢 만족 - Feature Score: 66.2 / sample",
+    ]
+    return long_lines, short_lines
+
+
+def test_utbreakout_status_shows_active_short_required_gates_in_visible_body():
+    engine = _build_trace_engine()
+    long_lines, short_lines = _sample_long_short_status_lines()
+    compact_long = engine._compact_side_gate_summary("long", False, long_lines)
+    compact_short = engine._compact_side_gate_summary("short", True, short_lines)
+
+    visible_lines = [
+        "실행 게이트",
+        "LONG: 차단 - UTBot 방향 불일치: 현재 SHORT / bias SHORT",
+        "SHORT: 차단 - manual status only: live scanner 미선택",
+        "",
+        "요약 신호등",
+        compact_long,
+        compact_short,
+        "",
+        *engine._build_utbreakout_active_side_preview_lines(
+            "short",
+            long_lines,
+            short_lines,
+            compact_long,
+            compact_short,
+        ),
+    ]
+    visible_body = "\n".join(visible_lines)
+
+    assert visible_body.index("요약 신호등") < visible_body.index("활성 후보 상세: SHORT")
+    inactive_index = visible_body.index("비활성 방향 요약")
+    assert visible_body.index("SHORT: 조건통과 / 주문 안함") < inactive_index
+    assert inactive_index < visible_body.index("LONG: 🔴", inactive_index)
+    for index in range(1, 8):
+        assert f"{index}. " in visible_body
+    assert "참고/감액" not in visible_body.split("비활성 방향 요약", 1)[0]
+
+
+def test_utbreakout_status_shows_active_long_required_gates_in_visible_body():
+    engine = _build_trace_engine()
+    long_lines, short_lines = _sample_long_short_status_lines()
+    compact_long = engine._compact_side_gate_summary("long", False, long_lines)
+    compact_short = engine._compact_side_gate_summary("short", True, short_lines)
+
+    visible_body = "\n".join(
+        engine._build_utbreakout_active_side_preview_lines(
+            "long",
+            long_lines,
+            short_lines,
+            compact_long,
+            compact_short,
+        )
+    )
+
+    assert visible_body.startswith("활성 후보 상세: LONG\nLONG: 대기")
+    assert visible_body.index("LONG: 대기") < visible_body.index("SHORT: 🟢")
+    for index in range(1, 8):
+        assert f"{index}. " in visible_body
+
+
+def test_utbreakout_status_full_file_still_contains_both_long_and_short_details():
+    engine = _build_trace_engine()
+    long_lines, short_lines = _sample_long_short_status_lines()
+
+    short_first_full_text = "\n".join(
+        engine._ordered_utbreakout_side_detail_lines("short", long_lines, short_lines)
+    )
+    long_first_full_text = "\n".join(
+        engine._ordered_utbreakout_side_detail_lines("long", long_lines, short_lines)
+    )
+    default_full_text = "\n".join(
+        engine._ordered_utbreakout_side_detail_lines(None, long_lines, short_lines)
+    )
+
+    assert "LONG: 대기" in short_first_full_text
+    assert "SHORT: 조건통과 / 주문 안함" in short_first_full_text
+    assert short_first_full_text.index("SHORT: 조건통과 / 주문 안함") < short_first_full_text.index("LONG: 대기")
+    assert long_first_full_text.index("LONG: 대기") < long_first_full_text.index("SHORT: 조건통과 / 주문 안함")
+    assert default_full_text.index("LONG: 대기") < default_full_text.index("SHORT: 조건통과 / 주문 안함")
+
+
+def test_execution_gate_display_prioritizes_root_blockers_over_downstream_noise():
+    engine = _build_trace_engine()
+    long_lines, short_lines = _sample_long_short_status_lines()
+
+    ev_blockers = engine._format_utbreakout_execution_blockers_for_display(
+        "long",
+        long_lines,
+        {
+            "can_attempt": False,
+            "blockers": [
+                "side condition failed",
+                "risk plan blocked",
+                "planned quantity zero",
+                "planned risk zero",
+                "ready entry plan missing",
+            ],
+        },
+    )
+    direction_blockers = engine._format_utbreakout_execution_blockers_for_display(
+        "short",
+        [
+            "SHORT: 대기",
+            "필수 게이트",
+            "🔴 불만족 1. UTBot 방향: 현재 LONG",
+            *short_lines[3:],
+        ],
+        {
+            "can_attempt": False,
+            "blockers": [
+                "direction mismatch",
+                "side condition failed",
+                "planned quantity zero",
+                "planned risk zero",
+                "ready entry plan missing",
+            ],
+        },
+    )
+
+    assert ev_blockers == [
+        "UTBot 방향 불일치: 현재 SHORT / bias SHORT",
+        "EV Adaptive NO_TRADE: score 33.4: stale continuation 112>10, MTF 1/3, score 33.4<60",
+        "risk plan blocked",
+    ]
+    assert direction_blockers == ["UTBot 방향 불일치: 현재 LONG"]

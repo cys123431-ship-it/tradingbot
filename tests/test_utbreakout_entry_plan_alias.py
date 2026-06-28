@@ -1,6 +1,7 @@
 import asyncio
 
 import emas
+import pytest
 
 
 def test_utbreakout_entry_plan_symbol_alias_lookup():
@@ -236,7 +237,18 @@ def test_force_utbreakout_entry_revalidates_and_uses_normal_entry_path():
     assert any(text.startswith("🟡 UTBreakout forceentry 시도:") for text in notifications)
 
 
-def test_utbreakout_entry_reaches_market_order_and_reports_exchange_failure(monkeypatch):
+@pytest.mark.parametrize(
+    ("entry_side", "order_side"),
+    [
+        ("long", "buy"),
+        ("short", "sell"),
+    ],
+)
+def test_utbreakout_entry_reaches_market_order_and_reports_exchange_failure(
+    monkeypatch,
+    entry_side,
+    order_side,
+):
     raw_symbol = "SOL/USDT:USDT"
     preflight_symbol = "SOL/USDT"
     order_symbol = "SOL/USDT:USDT"
@@ -311,7 +323,7 @@ def test_utbreakout_entry_reaches_market_order_and_reports_exchange_failure(monk
     engine._set_utbot_filtered_breakout_entry_plan(
         raw_symbol,
         {
-            "side": "long",
+            "side": entry_side,
             "entry_price": 71.74,
             "qty": 0.295,
             "risk_usdt": 0.54,
@@ -320,9 +332,9 @@ def test_utbreakout_entry_reaches_market_order_and_reports_exchange_failure(monk
     )
     monkeypatch.setattr(emas, "assert_trading_allowed", lambda symbol, cfg=None: True)
 
-    asyncio.run(engine.entry(raw_symbol, "long", 71.74))
+    asyncio.run(engine.entry(raw_symbol, entry_side, 71.74))
 
-    assert order_calls == [(order_symbol, "market", "buy", "0.295")]
+    assert order_calls == [(order_symbol, "market", order_side, "0.295")]
     assert any(text.startswith("🟡 UTBreakout 주문 시도:") for text in notifications)
     assert any(text.startswith("❌ UTBreakout 주문 실패:") for text in notifications)
     assert engine.last_entry_reason[order_symbol].startswith("ORDER_FAILED: RuntimeError:")
