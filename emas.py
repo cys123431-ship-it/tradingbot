@@ -2245,6 +2245,7 @@ class TradingConfig:
                     'scanner_enabled': False,
                     'scanner_timeframe': '15m', # [New] Dedicated Scanner TF
                     'scanner_exit_timeframe': '1h', # [New] Dedicated Scanner Exit TF
+                    'scanner_scan_interval_seconds': 60,
                     'scanner_min_rise_pct': 0.5,
                     'scanner_max_rise_pct': 8.0,
                     'r2_entry_enabled': True,
@@ -2602,6 +2603,14 @@ class TradingConfig:
         elif scanner_min_rise >= scanner_max_rise:
             common_cfg['scanner_min_rise_pct'] = max(0.1, scanner_max_rise * 0.25)
             changed = True
+        try:
+            scanner_scan_interval = float(common_cfg.get('scanner_scan_interval_seconds', 60.0) or 60.0)
+        except (TypeError, ValueError):
+            scanner_scan_interval = 60.0
+        scanner_scan_interval = max(10.0, min(300.0, scanner_scan_interval))
+        if common_cfg.get('scanner_scan_interval_seconds') != scanner_scan_interval:
+            common_cfg['scanner_scan_interval_seconds'] = scanner_scan_interval
+            changed = True
 
         coin_selector_cfg = signal_cfg.setdefault('coin_selector', {})
         if not isinstance(coin_selector_cfg, dict):
@@ -2882,6 +2891,7 @@ class TradingConfig:
                     "scanner_enabled": False,
                     "scanner_timeframe": "15m",
                     "scanner_exit_timeframe": "1h",
+                    "scanner_scan_interval_seconds": 60,
                     "scanner_min_rise_pct": 0.5,
                     "scanner_max_rise_pct": 8.0,
                     "r2_entry_enabled": True,
@@ -13831,6 +13841,19 @@ class SignalEngine(BaseEngine):
         scanner_symbol = getattr(self, 'scanner_active_symbol', None)
         if scanner_symbol:
             lines.append(f"현재 scanner lock: {scanner_symbol}")
+        try:
+            common_cfg = self.get_runtime_common_settings()
+            selector_cfg = self._get_coin_selector_config()
+            scanner_interval = self._get_scanner_scan_interval_seconds(common_cfg)
+            selector_interval = float(
+                selector_cfg.get('refresh_interval_seconds', 300.0) or 300.0
+            )
+            lines.append(
+                f"스캐너 주기: 후보 확인 {scanner_interval:.0f}초 / "
+                f"CoinSelector 새로고침 {selector_interval:.0f}초"
+            )
+        except Exception:
+            pass
 
         next_symbol, next_candidate = await self._resolve_next_utbreakout_scan_candidate(
             excluded_symbols=position_symbols
@@ -20030,7 +20053,8 @@ class SignalEngine(BaseEngine):
                     # ?ㅼ틪 寃곌낵? 蹂꾧컻濡?湲곗〈 ?ъ??섏? ?대? target_symbols??異붽???
 
                     # 荑⑦???濡쒖쭅: ?ъ???泥?궛 吏곹썑?쇰㈃ 諛붾줈 ?ㅼ틪?댁빞 ??
-                    if time.time() - self.last_volume_scan > 60: # 1遺?荑⑦???
+                    scanner_scan_interval = self._get_scanner_scan_interval_seconds(common_cfg)
+                    if time.time() - self.last_volume_scan > scanner_scan_interval:
                         await self.scan_and_trade_high_volume()
                         self.last_volume_scan = time.time()
 
@@ -20429,6 +20453,20 @@ class SignalEngine(BaseEngine):
     def _micro_auto_enabled(self):
         cfg = self._get_micro_auto_config()
         return bool(cfg.get('enabled', False)) and not self.is_upbit_mode()
+
+    def _get_scanner_scan_interval_seconds(self, common_cfg=None):
+        if common_cfg is None:
+            try:
+                common_cfg = self.get_runtime_common_settings()
+            except Exception:
+                common_cfg = {}
+        if not isinstance(common_cfg, dict):
+            common_cfg = {}
+        try:
+            interval = float(common_cfg.get('scanner_scan_interval_seconds', 60.0) or 60.0)
+        except (TypeError, ValueError):
+            interval = 60.0
+        return max(10.0, min(300.0, interval))
 
     def _extract_market_min_notional(self, market):
         def _safe_positive(value):
@@ -39662,14 +39700,20 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 # [MODIFIED] Prioritize entry_timeframe for polling interval
                 sys_cfg = self.get_active_common_settings()
                 tf = sys_cfg.get('entry_timeframe', sys_cfg.get('timeframe', '15m'))
-                poll_interval = self._get_poll_interval(tf)
+                monitoring_interval = self.cfg.get('system_settings', {}).get(
+                    'monitoring_interval_seconds'
+                )
+                poll_interval = self._get_poll_interval(
+                    tf,
+                    monitoring_interval_seconds=monitoring_interval,
+                )
                 await asyncio.sleep(poll_interval)
 
             except Exception as e:
                 logger.error(f"Main polling loop error: {e}")
                 await asyncio.sleep(30)
 
-    def _get_poll_interval(self, tf):
+    def _get_poll_interval(self, tf, monitoring_interval_seconds=None):
         """??꾪봽?덉엫???곕Ⅸ ?대쭅 媛꾧꺽 怨꾩궛"""
         tf_seconds = {
             '1m': 60, '3m': 180, '5m': 300, '15m': 900,
@@ -39679,7 +39723,17 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
         candle_seconds = tf_seconds.get(tf, 900)  # 湲곕낯 15遺?
         # 罹붾뱾 ?쒓컙??1/6 媛꾧꺽?쇰줈 ?대쭅 (理쒖냼 10珥? 理쒕? 60珥?
         # 2H = 7200珥???1200珥?20遺?... 理쒕? 60珥덈줈 ?쒗븳
-        return max(10, min(60, candle_seconds // 6))
+        interval = max(10, min(60, candle_seconds // 6))
+        if monitoring_interval_seconds is None:
+            return interval
+        try:
+            configured_interval = float(monitoring_interval_seconds)
+        except (TypeError, ValueError):
+            return interval
+        if configured_interval <= 0:
+            return interval
+        configured_interval = max(10, min(60, configured_interval))
+        return min(interval, configured_interval)
 
     # ---------------- ??쒕낫??----------------
     async def _dashboard_loop(self):

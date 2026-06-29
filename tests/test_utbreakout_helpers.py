@@ -975,6 +975,30 @@ def test_status_symbol_marks_watchlist_fallback_when_no_live_candidate():
     )
 
 
+def test_poll_interval_respects_monitoring_interval_as_faster_cap():
+    from emas import MainController
+
+    ctrl = MainController.__new__(MainController)
+
+    assert ctrl._get_poll_interval("4h") == 60
+    assert ctrl._get_poll_interval("4h", monitoring_interval_seconds=10) == 10
+    assert ctrl._get_poll_interval("15m", monitoring_interval_seconds=3) == 10
+    assert ctrl._get_poll_interval("1m", monitoring_interval_seconds=60) == 10
+    assert ctrl._get_poll_interval("4h", monitoring_interval_seconds="bad") == 60
+
+
+def test_scanner_scan_interval_is_configurable_and_bounded():
+    from emas import SignalEngine
+
+    engine = object.__new__(SignalEngine)
+
+    assert engine._get_scanner_scan_interval_seconds({}) == 60
+    assert engine._get_scanner_scan_interval_seconds({"scanner_scan_interval_seconds": 30}) == 30
+    assert engine._get_scanner_scan_interval_seconds({"scanner_scan_interval_seconds": 3}) == 10
+    assert engine._get_scanner_scan_interval_seconds({"scanner_scan_interval_seconds": 999}) == 300
+    assert engine._get_scanner_scan_interval_seconds({"scanner_scan_interval_seconds": "bad"}) == 60
+
+
 def test_main_keyboard_removes_utbot_button():
     emas = _emas_module()
     controller = emas.MainController.__new__(emas.MainController)
