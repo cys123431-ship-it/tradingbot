@@ -259,6 +259,26 @@ def _config_root(engine):
     return None
 
 
+def _persist_config_if_changed(engine, changed):
+    if not changed:
+        return False
+    ctrl = getattr(engine, "ctrl", None)
+    cfg = getattr(ctrl, "cfg", None)
+    save = getattr(cfg, "save_config_sync", None)
+    if not callable(save):
+        return False
+    try:
+        result = save()
+    except Exception as exc:
+        log.error("UTBreak opportunity profile config persist failed: %s", exc)
+        return False
+    if result is False:
+        log.error("UTBreak opportunity profile config persist returned False")
+        return False
+    log.warning("UTBreak opportunity profile persisted to config.json: %s", OPPORTUNITY_PROFILE_NAME)
+    return True
+
+
 def _is_utbreak_enabled(signal_cfg):
     if not isinstance(signal_cfg, dict):
         return False
@@ -340,6 +360,7 @@ def apply_opportunity_tuning(engine):
         changed |= _set_if_different(ut, k, v)
     if changed:
         log.warning("UTBreak opportunity profile applied: %s", OPPORTUNITY_PROFILE_NAME)
+        _persist_config_if_changed(engine, changed)
     return changed
 
 
