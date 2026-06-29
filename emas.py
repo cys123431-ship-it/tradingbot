@@ -13820,13 +13820,15 @@ class SignalEngine(BaseEngine):
 
         status_source = str(getattr(self, 'utbreakout_status_symbol_source', '') or '')
         status_detail = getattr(self, 'utbreakout_status_symbol_detail', None)
-        if status_source == 'watchlist_fallback_no_live_candidate':
+        if status_source in {'no_live_candidate', 'watchlist_fallback_no_live_candidate'}:
             lines.append("현재 live 후보: 없음")
-            if evaluated_symbol:
+            if status_source == 'watchlist_fallback_no_live_candidate' and evaluated_symbol:
                 lines.append(
                     f"상태 화면 참고 심볼: {evaluated_symbol} "
                     "(live 후보가 없어 watchlist 첫 항목을 참고 평가)"
                 )
+            elif not evaluated_symbol:
+                lines.append("조건 평가 심볼: 없음 (live 후보 발생 전에는 참고 심볼 조건표를 표시하지 않음)")
         elif status_source == 'live_candidate':
             lines.append(f"현재 live 후보: {evaluated_symbol}")
         elif status_source == 'scanner_lock':
@@ -15571,6 +15573,35 @@ class SignalEngine(BaseEngine):
             'long_eligibility': long_eligibility,
             'short_eligibility': short_eligibility,
         }
+
+    async def build_utbreakout_no_live_candidate_status_text(self):
+        cfg = self._get_utbot_filtered_breakout_config(self.get_runtime_strategy_params())
+        cfg = apply_stable_utbreak_final_overrides(cfg)
+        cfg = apply_profit_opportunity_effective_overrides(cfg)
+        self.utbreakout_last_status_symbol = None
+
+        lines = [
+            "🚦 UT Breakout 조건 스테이터스",
+            "현재 live 후보: 없음",
+            "조건 평가 심볼: 없음 (참고 심볼 조건표 표시 안 함)",
+            "최종: live 후보 대기 / 주문 안함",
+        ]
+        try:
+            context_lines = await self._build_utbreakout_position_scan_context_lines(None)
+        except Exception as exc:
+            context_lines = [f"스캐너 상태 조회 실패: {exc}"]
+
+        for line in context_lines:
+            if line and line not in lines:
+                lines.append(line)
+
+        lines.extend([
+            "",
+            "실제 주문 규칙:",
+            "live scanner 후보가 선택되고 해당 방향 필수 게이트가 모두 만족되면 STATUS_READY -> AUTO_ENTRY_BRIDGE -> entry() 순서로 주문을 시도합니다.",
+            "상태 조회 화면은 참고 심볼을 만들어 주문 판단처럼 표시하지 않습니다.",
+        ])
+        return enforce_utbreakout_effective_status_contract("\n".join(lines), cfg)
 
     async def build_utbreakout_condition_status_text(self, symbol):
         if not self.is_upbit_mode():
@@ -33018,7 +33049,7 @@ class MainController:
         2. Current scanner_active_symbol
         3. Next selected CoinSelector candidate
         4. Non-stale status_data position symbol
-        5. current watchlist fallback
+        5. None when no live candidate exists
         """
         engine = self.engines.get(CORE_ENGINE)
 
@@ -33096,12 +33127,11 @@ class MainController:
                 _mark_status_symbol_source('status_data_position', 'recent non-flat status_data')
                 return symbol
 
-        symbol = self._get_current_symbol()
         _mark_status_symbol_source(
-            'watchlist_fallback_no_live_candidate',
-            'no position/scanner lock/CoinSelector candidate; using watchlist fallback',
+            'no_live_candidate',
+            'no position/scanner lock/CoinSelector candidate',
         )
-        return symbol
+        return None
 
     async def reinit_exchange(self, target_mode):
         """거래소 연결 재초기화. 중복 전환 방지 + 실패 시 이전 상태 롤백."""
@@ -36353,7 +36383,10 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
             if not engine:
                 return "🚦 UT Breakout 조건 스테이터스\n\nSignal 엔진을 찾을 수 없습니다."
             symbol = await _get_utbreakout_status_symbol_async()
-            text = await engine.build_utbreakout_condition_status_text(symbol)
+            if not symbol:
+                text = await engine.build_utbreakout_no_live_candidate_status_text()
+            else:
+                text = await engine.build_utbreakout_condition_status_text(symbol)
             cfg = engine._get_utbot_filtered_breakout_config(engine.get_runtime_strategy_params())
             daily_entries = engine.db.get_daily_entry_count()
             return enforce_utbreakout_effective_status_contract(

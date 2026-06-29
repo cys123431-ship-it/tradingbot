@@ -438,9 +438,9 @@ def test_execution_gate_display_prioritizes_root_blockers_over_downstream_noise(
     assert live_status_blockers == ["상태조회 진단용: 실제 주문은 live scanner 루프가 시도"]
 
 
-def test_position_scan_context_identifies_watchlist_fallback_reference_symbol():
+def test_position_scan_context_does_not_show_watchlist_reference_symbol():
     engine = _build_trace_engine()
-    engine.utbreakout_status_symbol_source = "watchlist_fallback_no_live_candidate"
+    engine.utbreakout_status_symbol_source = "no_live_candidate"
 
     async def get_active_position_symbols(use_cache=False):
         return set()
@@ -453,13 +453,53 @@ def test_position_scan_context_identifies_watchlist_fallback_reference_symbol():
     engine._get_coin_selector_config = lambda: {"enabled": True}
 
     lines = asyncio.run(
-        engine._build_utbreakout_position_scan_context_lines("DOGE/USDT:USDT")
+        engine._build_utbreakout_position_scan_context_lines(None)
     )
 
     assert "현재 포지션: 없음" in lines
     assert "현재 live 후보: 없음" in lines
     assert any(
-        "상태 화면 참고 심볼: DOGE/USDT:USDT" in line
-        and "watchlist 첫 항목" in line
+        "조건 평가 심볼: 없음" in line
         for line in lines
     )
+    assert not any("상태 화면 참고 심볼" in line for line in lines)
+
+
+def test_no_live_candidate_status_does_not_render_symbol_gate_table():
+    engine = _build_trace_engine()
+    engine.utbreakout_status_symbol_source = "no_live_candidate"
+    engine.get_runtime_common_settings = lambda: {
+        "scanner_scan_interval_seconds": 30,
+    }
+    engine._get_coin_selector_config = lambda: {
+        "enabled": True,
+        "refresh_interval_seconds": 90,
+    }
+    engine.coin_selector_last_result = {
+        "watch_only": [
+            {
+                "normalized_symbol": "SOL/USDT:USDT",
+                "score": 88.0,
+                "selection_state": "WATCH_ONLY",
+                "ev_reason": "EV_EDGE_NOT_ACTIONABLE",
+            }
+        ],
+        "watch_only_reason_counts": {"EV_EDGE_NOT_ACTIONABLE": 1},
+    }
+
+    async def get_active_position_symbols(use_cache=False):
+        return set()
+
+    async def resolve_next_utbreakout_scan_candidate(excluded_symbols=None):
+        return None, None
+
+    engine.get_active_position_symbols = get_active_position_symbols
+    engine._resolve_next_utbreakout_scan_candidate = resolve_next_utbreakout_scan_candidate
+
+    text = asyncio.run(engine.build_utbreakout_no_live_candidate_status_text())
+
+    assert "조건 평가 심볼: 없음" in text
+    assert "상태 화면 참고 심볼" not in text
+    assert "DOGE/USDT" not in text
+    assert "\nLONG:" not in text
+    assert "\nSHORT:" not in text

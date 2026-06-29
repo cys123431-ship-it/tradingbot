@@ -947,7 +947,7 @@ def test_status_symbol_uses_engine_next_candidate_before_stale_status():
     assert ctrl.engines[CORE_ENGINE].utbreakout_status_symbol_source == "live_candidate"
 
 
-def test_status_symbol_marks_watchlist_fallback_when_no_live_candidate():
+def test_status_symbol_returns_none_when_no_live_candidate():
     from emas import MainController, CORE_ENGINE
 
     class DummyEngine:
@@ -968,10 +968,10 @@ def test_status_symbol_marks_watchlist_fallback_when_no_live_candidate():
 
     result = asyncio.run(ctrl._resolve_utbreakout_status_symbol())
 
-    assert result == "DOGE/USDT"
+    assert result is None
     assert (
         ctrl.engines[CORE_ENGINE].utbreakout_status_symbol_source
-        == "watchlist_fallback_no_live_candidate"
+        == "no_live_candidate"
     )
 
 
