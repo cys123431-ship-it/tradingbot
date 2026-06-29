@@ -4714,7 +4714,7 @@ class SignalEngine(BaseEngine):
             return False, ""
             
         reason = record.get("reason", "UNKNOWN")
-        return True, f"daily SL lockout: {reason} today"
+        return True, f"당일 SL lockout: {reason} today (daily SL lockout)"
 
     def _save_utbreakout_daily_sl_lockouts(self):
         try:
@@ -15592,7 +15592,7 @@ class SignalEngine(BaseEngine):
             sl_lockout_reason = sl_lockout_reason or "daily SL lockout active"
             lockout_msg = "🔴 [Lockout] Stop Loss 일일 거래 제한 활성화 중 (24시간 차단)"
             lockout_msg = (
-                f"[Lockout] {sl_lockout_reason}; "
+                f"당일 재진입 차단: {symbol} - {sl_lockout_reason}; "
                 "same-day symbol re-entry blocked for both LONG and SHORT"
             )
             long_lines.append(lockout_msg)

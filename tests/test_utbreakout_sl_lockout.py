@@ -104,6 +104,7 @@ def test_daily_sl_lockout_status_blocker_keeps_reason_for_display(tmp_path):
     )
 
     assert any("daily SL lockout" in item for item in display)
+    assert any("당일 SL lockout" in item for item in display)
     assert any("STOP_LOSS_FILLED" in item for item in display)
 
 
