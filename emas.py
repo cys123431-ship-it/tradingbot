@@ -32061,7 +32061,10 @@ class MainController:
         return ccxt.binance({
             'apiKey': creds.get('api_key', ''),
             'secret': creds.get('secret_key', ''),
-            'options': {'defaultType': 'future'},
+            'options': {
+                'defaultType': 'future',
+                'warnOnFetchOpenOrdersWithoutSymbol': False,
+            },
             'enableRateLimit': True
         })
 
@@ -32072,7 +32075,10 @@ class MainController:
                 'enableRateLimit': True
             })
         return ccxt.binance({
-            'options': {'defaultType': 'future'},
+            'options': {
+                'defaultType': 'future',
+                'warnOnFetchOpenOrdersWithoutSymbol': False,
+            },
             'enableRateLimit': True
         })
 
