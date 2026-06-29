@@ -3625,7 +3625,7 @@ def test_utbreakout_split_tp_short_side_prices_and_labels_audit_ok():
     assert status["tp2_present"] is True
 
 
-def test_place_tp_sl_orders_emergency_closes_when_stop_loss_creation_fails():
+def test_place_tp_sl_orders_emergency_closes_when_stop_loss_creation_fails(tmp_path):
     emas = _emas_module()
 
     class StopFailingExchange(_FakeExchange):
@@ -3649,6 +3649,14 @@ def test_place_tp_sl_orders_emergency_closes_when_stop_loss_creation_fails():
     engine.last_orphan_protection_sweep_ts = 0.0
     engine.orphan_protection_candidates = {}
     engine.ORPHAN_PROTECTION_SWEEP_INTERVAL = 10.0
+    engine.runtime_dir = str(tmp_path)
+    engine.utbreakout_daily_sl_symbol_lockouts = {}
+    engine.utbreakout_entry_trace = {}
+    engine.utbreakout_last_ready_ts = {}
+    engine.utbreakout_last_ready_side = {}
+    engine.utbreakout_last_order_attempt_ts = {}
+    engine.utbreakout_last_watchdog_report_ts = {}
+    engine.utbreakout_trace_watchdog_enabled = True
     engine.position_cache = {}
     engine.POSITION_CACHE_TTL = 0.0
     engine.is_upbit_mode = lambda: False
@@ -3681,6 +3689,9 @@ def test_place_tp_sl_orders_emergency_closes_when_stop_loss_creation_fails():
     assert float(market_orders[0]["amount"]) == 2.0
     assert float(engine.exchange.positions[0]["contracts"]) == 0.0
     assert engine.last_protection_order_status["BTC/USDT"]["emergency_close_status"] == "EMERGENCY_CLOSED"
+    locked, reason = engine._is_utbreakout_daily_sl_locked("BTCUSDT")
+    assert locked is True
+    assert "STOP_LOSS_PROTECTION_FAILED_FORCE_CLOSED" in reason
 
 
 def test_emergency_close_failure_sets_critical_paused_state():

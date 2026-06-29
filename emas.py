@@ -4519,6 +4519,7 @@ class SignalEngine(BaseEngine):
         self.coin_selector_symbol_scores = {}  # normalized symbol -> latest selector score
         self.coin_selector_last_run_ts = 0.0
         self.coin_selector_candidate_cooldowns = {}  # normalized symbol -> no-entry miss / cooldown state
+        self._load_utbreakout_daily_sl_lockouts()
         self.micro_auto_last_plan = {}  # symbol -> latest accepted Micro Auto plan
         self.micro_auto_last_rejects = {}  # symbol -> latest Micro Auto reject payload
         self.micro_auto_last_scan = {}  # latest Micro Auto feasibility scan report
@@ -4595,6 +4596,7 @@ class SignalEngine(BaseEngine):
         self.coin_selector_last_run_ts = 0.0
         self.coin_selector_candidate_cooldowns = {}
         self.utbreakout_daily_sl_symbol_lockouts = {}
+        self._load_utbreakout_daily_sl_lockouts()
         self.micro_auto_last_plan = {}
         self.micro_auto_last_rejects = {}
         self.micro_auto_last_scan = {}
@@ -4633,6 +4635,20 @@ class SignalEngine(BaseEngine):
 
     def _utbreakout_today_key(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _normalize_market_symbol(self, symbol: str) -> str:
+        try:
+            return self._canonical_futures_symbol(symbol)
+        except Exception:
+            return str(symbol or "").strip().upper()
+
+    def _utbreakout_daily_sl_lockouts_path(self) -> str:
+        runtime_dir = (
+            getattr(self, 'runtime_dir', None)
+            or os.environ.get('TRADINGBOT_RUNTIME_DIR')
+            or "runtime"
+        )
+        return os.path.join(str(runtime_dir), "utbreakout_daily_sl_lockouts.json")
 
     def _record_utbreakout_daily_sl_lockout(
         self,
@@ -4703,31 +4719,51 @@ class SignalEngine(BaseEngine):
     def _save_utbreakout_daily_sl_lockouts(self):
         try:
             lockouts = getattr(self, 'utbreakout_daily_sl_symbol_lockouts', {})
-            os.makedirs("runtime", exist_ok=True)
-            with open("runtime/utbreakout_daily_sl_lockouts.json", "w", encoding="utf-8") as f:
+            path = self._utbreakout_daily_sl_lockouts_path()
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
                 json.dump(lockouts, f, indent=4)
+            logger.info(
+                "Saved UTBreakout daily SL lockouts: count=%s path=%s",
+                len(lockouts) if isinstance(lockouts, dict) else 0,
+                path,
+            )
         except Exception as e:
             logger.warning(f"Failed to save daily SL lockouts to disk: {e}")
 
     def _load_utbreakout_daily_sl_lockouts(self):
         default_lockouts = {}
-        path = "runtime/utbreakout_daily_sl_lockouts.json"
+        path = self._utbreakout_daily_sl_lockouts_path()
         if not os.path.exists(path):
             self.utbreakout_daily_sl_symbol_lockouts = default_lockouts
+            logger.info("No UTBreakout daily SL lockouts file found: %s", path)
             return
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
                 today_key = self._utbreakout_today_key()
-                filtered = {
-                    symbol: record
-                    for symbol, record in data.items()
-                    if isinstance(record, dict) and record.get("date") == today_key
-                }
+                filtered = {}
+                for symbol, record in data.items():
+                    if not isinstance(record, dict) or record.get("date") != today_key:
+                        continue
+                    normalized_symbol = self._normalize_market_symbol(symbol)
+                    if normalized_symbol:
+                        filtered[normalized_symbol] = dict(record)
                 self.utbreakout_daily_sl_symbol_lockouts = filtered
+                if len(filtered) != len(data):
+                    self._save_utbreakout_daily_sl_lockouts()
+                logger.info(
+                    "Loaded UTBreakout daily SL lockouts: count=%s path=%s",
+                    len(filtered),
+                    path,
+                )
             else:
                 self.utbreakout_daily_sl_symbol_lockouts = default_lockouts
+                logger.warning(
+                    "Ignored malformed UTBreakout daily SL lockouts file: %s",
+                    path,
+                )
         except Exception as e:
             logger.warning(f"Failed to load daily SL lockouts from disk: {e}")
             self.utbreakout_daily_sl_symbol_lockouts = default_lockouts
@@ -9563,6 +9599,18 @@ class SignalEngine(BaseEngine):
 
         if active_strategy not in UTBREAKOUT_STRATEGIES:
             blockers.append("active strategy not UTBreakout")
+        try:
+            daily_sl_locked, daily_sl_reason = self._is_utbreakout_daily_sl_locked(symbol)
+        except Exception as exc:
+            daily_sl_locked = False
+            daily_sl_reason = ""
+            logger.warning(
+                "UTBreakout daily SL lockout check failed for %s: %s",
+                symbol,
+                exc,
+            )
+        if daily_sl_locked:
+            blockers.append(daily_sl_reason or "daily SL lockout active")
         if side in {'long', 'short'} and not self.is_trade_direction_allowed(side):
             blockers.append(self.format_trade_direction_block_reason(side))
         if not candidate_side or candidate_side != side:
@@ -9752,6 +9800,11 @@ class SignalEngine(BaseEngine):
             self.utbreakout_auto_entry_bridge_last_attempt_ts = {}
         if not hasattr(self, 'utbreakout_auto_entry_bridge_enabled'):
             self.utbreakout_auto_entry_bridge_enabled = True
+        if not isinstance(
+            getattr(self, 'utbreakout_daily_sl_symbol_lockouts', None),
+            dict,
+        ):
+            self.utbreakout_daily_sl_symbol_lockouts = {}
 
     async def _maybe_run_utbreakout_auto_entry_bridge(
         self,
@@ -9984,6 +10037,18 @@ class SignalEngine(BaseEngine):
                     reason='entry plan has no valid entry price',
                     side=side,
                     entry_price=entry_price,
+                )
+                return False
+
+            daily_sl_locked, daily_sl_reason = self._is_utbreakout_daily_sl_locked(symbol)
+            if daily_sl_locked:
+                self._utbreakout_trace_event(
+                    symbol,
+                    'AUTO_ENTRY_BRIDGE_BLOCKED',
+                    'DAILY_SL_LOCKOUT',
+                    source=source,
+                    reason=daily_sl_reason,
+                    side=side,
                 )
                 return False
 
@@ -15520,11 +15585,16 @@ class SignalEngine(BaseEngine):
         long_ok, long_lines = await _side_conditions('long')
         short_ok, short_lines = await _side_conditions('short')
 
-        sl_lockout_active = await self._is_sl_lockout_active(symbol)
+        sl_lockout_active, sl_lockout_reason = self._is_utbreakout_daily_sl_locked(symbol)
         if sl_lockout_active:
             long_ok = False
             short_ok = False
+            sl_lockout_reason = sl_lockout_reason or "daily SL lockout active"
             lockout_msg = "🔴 [Lockout] Stop Loss 일일 거래 제한 활성화 중 (24시간 차단)"
+            lockout_msg = (
+                f"[Lockout] {sl_lockout_reason}; "
+                "same-day symbol re-entry blocked for both LONG and SHORT"
+            )
             long_lines.append(lockout_msg)
             short_lines.append(lockout_msg)
 
@@ -28675,6 +28745,22 @@ class SignalEngine(BaseEngine):
             if not remaining:
                 await self._cancel_all_orders_variants(symbol, reason=f'after emergency close: {reason}')
                 await self._reconcile_closed_position_protection(symbol, reason=reason, alert=True, attempts=3)
+                try:
+                    self._record_utbreakout_daily_sl_lockout(
+                        symbol,
+                        side=side,
+                        reason="STOP_LOSS_PROTECTION_FAILED_FORCE_CLOSED",
+                        detail=(
+                            f"{reason}; emergency close qty={qty}; "
+                            f"attempt={attempt}/{total_attempts}"
+                        ),
+                    )
+                except Exception as lockout_error:
+                    logger.warning(
+                        "Failed to record daily SL lockout after emergency close for %s: %s",
+                        symbol,
+                        lockout_error,
+                    )
                 status.update({'status': 'EMERGENCY_CLOSED', 'closed': True})
                 await self.ctrl.notify(
                     f"🚨 {self.ctrl.format_symbol_for_display(symbol)} SL 생성 실패로 포지션을 즉시 시장가 청산했습니다."

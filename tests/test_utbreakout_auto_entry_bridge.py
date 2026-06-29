@@ -104,6 +104,70 @@ def test_auto_entry_bridge_calls_entry_for_recent_ready_plan():
     assert "ENTRY_CALL" in stages
 
 
+def test_auto_entry_bridge_daily_sl_lockout_blocks_before_entry_call(tmp_path):
+    entry_calls = []
+
+    engine = _build_engine()
+    engine.runtime_dir = str(tmp_path)
+    engine.utbreakout_daily_sl_symbol_lockouts = {}
+    symbol = "SOL/USDT:USDT"
+
+    async def entry(*args):
+        entry_calls.append(args)
+
+    async def mock_evaluate_eligibility(requested_symbol, **kwargs):
+        return {
+            "ok_market": True,
+            "symbol": requested_symbol,
+            "long_eligibility": {"can_attempt": False, "blockers": ["direction mismatch"]},
+            "short_eligibility": {"can_attempt": True, "blockers": []},
+        }
+
+    engine.entry = entry
+    engine._evaluate_utbreakout_eligibility_context = mock_evaluate_eligibility
+    engine._record_utbreakout_daily_sl_lockout(
+        symbol,
+        side="short",
+        reason="STOP_LOSS_FILLED",
+    )
+    engine._set_utbot_filtered_breakout_entry_plan(
+        symbol,
+        {
+            "side": "short",
+            "entry_price": 98.5,
+            "qty": 0.4,
+            "planned_notional": 39.4,
+            "planned_margin": 7.88,
+            "risk_usdt": 1.2,
+        },
+    )
+    engine._utbreakout_trace_event(
+        symbol,
+        "STATUS_READY",
+        "READY",
+        side="short",
+        entry_price=98.5,
+    )
+
+    called = asyncio.run(
+        engine._maybe_run_utbreakout_auto_entry_bridge(
+            symbol,
+            source="scanner_seen",
+        )
+    )
+
+    assert called is False
+    assert entry_calls == []
+    events = engine._utbreakout_recent_trace_events(symbol, limit=30)
+    assert any(
+        event["stage"] == "AUTO_ENTRY_BRIDGE_BLOCKED"
+        and event["status"] == "DAILY_SL_LOCKOUT"
+        for event in events
+    )
+    assert not any(event["stage"] == "ENTRY_CALL" for event in events)
+    assert not any(event["stage"] == "ORDER_ATTEMPT" for event in events)
+
+
 def test_auto_entry_bridge_restricted_symbol_is_blocked():
     entry_calls = []
 
