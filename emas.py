@@ -4442,6 +4442,7 @@ class SignalEngine(BaseEngine):
         self.utbreakout_entry_trace = {}
         self.utbreakout_last_ready_ts = {}
         self.utbreakout_last_ready_side = {}
+        self.utbreakout_daily_sl_symbol_lockouts = {}
         self.utbreakout_last_order_attempt_ts = {}
         self.utbreakout_last_watchdog_report_ts = {}
         self.utbreakout_trace_watchdog_enabled = False
@@ -4593,6 +4594,7 @@ class SignalEngine(BaseEngine):
         self.coin_selector_symbol_scores = {}
         self.coin_selector_last_run_ts = 0.0
         self.coin_selector_candidate_cooldowns = {}
+        self.utbreakout_daily_sl_symbol_lockouts = {}
         self.micro_auto_last_plan = {}
         self.micro_auto_last_rejects = {}
         self.micro_auto_last_scan = {}
@@ -4628,6 +4630,138 @@ class SignalEngine(BaseEngine):
     def _ensure_runtime_state_containers(self, attr_names):
         for attr_name in attr_names:
             self._ensure_runtime_state_container(attr_name)
+
+    def _utbreakout_today_key(self) -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _record_utbreakout_daily_sl_lockout(
+        self,
+        symbol: str,
+        *,
+        side: str | None = None,
+        reason: str,
+        detail: str = "",
+    ) -> None:
+        normalized_symbol = self._normalize_market_symbol(symbol)
+        if not normalized_symbol:
+            return
+        
+        lockouts = self._ensure_runtime_state_container('utbreakout_daily_sl_symbol_lockouts')
+        today_key = self._utbreakout_today_key()
+        now_ms = int(time.time() * 1000)
+        
+        lockouts[normalized_symbol] = {
+            "date": today_key,
+            "reason": reason,
+            "side": side,
+            "ts": now_ms,
+            "detail": detail[:240],
+        }
+        
+        self._save_utbreakout_daily_sl_lockouts()
+        
+        self._utbreakout_trace_event(
+            normalized_symbol,
+            "DAILY_SL_LOCKOUT",
+            "RECORDED",
+            side=side,
+            reason=reason,
+            detail=detail[:240],
+        )
+        
+        try:
+            tg_msg = (
+                f"🛑 UTBreakout daily symbol lockout\n"
+                f"Symbol: {normalized_symbol}\n"
+                f"Reason: {reason}\n"
+                f"Action: same symbol re-entry blocked until tomorrow ({today_key})"
+            )
+            if hasattr(self, 'telegram') and self.telegram:
+                self.telegram.send_message_to_all(tg_msg)
+        except Exception as e:
+            logger.warning(f"Failed to send lockout Telegram notification: {e}")
+
+    def _is_utbreakout_daily_sl_locked(self, symbol: str) -> tuple[bool, str]:
+        normalized_symbol = self._normalize_market_symbol(symbol)
+        if not normalized_symbol:
+            return False, ""
+        
+        lockouts = self._ensure_runtime_state_container('utbreakout_daily_sl_symbol_lockouts')
+        record = lockouts.get(normalized_symbol)
+        if not record:
+            return False, ""
+            
+        today_key = self._utbreakout_today_key()
+        if record.get("date") != today_key:
+            lockouts.pop(normalized_symbol, None)
+            self._save_utbreakout_daily_sl_lockouts()
+            return False, ""
+            
+        reason = record.get("reason", "UNKNOWN")
+        return True, f"daily SL lockout: {reason} today"
+
+    def _save_utbreakout_daily_sl_lockouts(self):
+        try:
+            lockouts = getattr(self, 'utbreakout_daily_sl_symbol_lockouts', {})
+            os.makedirs("runtime", exist_ok=True)
+            with open("runtime/utbreakout_daily_sl_lockouts.json", "w", encoding="utf-8") as f:
+                json.dump(lockouts, f, indent=4)
+        except Exception as e:
+            logger.warning(f"Failed to save daily SL lockouts to disk: {e}")
+
+    def _load_utbreakout_daily_sl_lockouts(self):
+        default_lockouts = {}
+        path = "runtime/utbreakout_daily_sl_lockouts.json"
+        if not os.path.exists(path):
+            self.utbreakout_daily_sl_symbol_lockouts = default_lockouts
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                today_key = self._utbreakout_today_key()
+                filtered = {
+                    symbol: record
+                    for symbol, record in data.items()
+                    if isinstance(record, dict) and record.get("date") == today_key
+                }
+                self.utbreakout_daily_sl_symbol_lockouts = filtered
+            else:
+                self.utbreakout_daily_sl_symbol_lockouts = default_lockouts
+        except Exception as e:
+            logger.warning(f"Failed to load daily SL lockouts from disk: {e}")
+            self.utbreakout_daily_sl_symbol_lockouts = default_lockouts
+
+    async def _check_and_record_sl_lockout_async(self, symbol, state, exit_price):
+        if not isinstance(state, dict):
+            return
+        is_sl_hit = False
+        sl_id = state.get("sl_order_id")
+        if sl_id:
+            try:
+                ord_info = await asyncio.to_thread(self.exchange.fetch_order, sl_id, symbol)
+                if isinstance(ord_info, dict) and ord_info.get("status") == "closed":
+                    is_sl_hit = True
+            except Exception:
+                pass
+        if not is_sl_hit:
+            last_stop = state.get("last_stop_price") or state.get("initial_stop_price")
+            if last_stop and exit_price:
+                diff_pct = abs(exit_price - last_stop) / last_stop
+                if diff_pct <= 0.002:
+                    is_sl_hit = True
+        
+        if is_sl_hit:
+            self._record_utbreakout_daily_sl_lockout(
+                symbol,
+                side=state.get("side"),
+                reason="STOP_LOSS_FILLED",
+                detail=f"position closed by stop loss at {exit_price:.4f}" if exit_price else "position closed by stop loss",
+            )
+
+    async def _is_sl_lockout_active(self, symbol):
+        locked, reason = self._is_utbreakout_daily_sl_locked(symbol)
+        return locked
 
     def _coin_selector_candidate_key(self, symbol):
         return (
@@ -9920,6 +10054,22 @@ class SignalEngine(BaseEngine):
     def _clear_utbreakout_trailing_state(self, symbol, *, finalize=False, reason='cleared', exit_price=None):
         states = getattr(self, 'utbreakout_trailing_states', None)
         if isinstance(states, dict):
+            state = states.get(symbol)
+            if state and finalize:
+                try:
+                    price_val = None
+                    if exit_price is not None:
+                        price_val = float(exit_price)
+                    import asyncio
+                    asyncio.create_task(
+                        self._check_and_record_sl_lockout_async(
+                            symbol,
+                            state,
+                            exit_price=price_val
+                        )
+                    )
+                except Exception as e:
+                    logger.debug(f"Failed to spawn SL fill check task: {e}")
             if finalize:
                 self._finalize_utbreakout_runner_state(symbol, reason=reason, exit_price=exit_price)
             states.pop(symbol, None)
@@ -15369,6 +15519,14 @@ class SignalEngine(BaseEngine):
 
         long_ok, long_lines = await _side_conditions('long')
         short_ok, short_lines = await _side_conditions('short')
+
+        sl_lockout_active = await self._is_sl_lockout_active(symbol)
+        if sl_lockout_active:
+            long_ok = False
+            short_ok = False
+            lockout_msg = "🔴 [Lockout] Stop Loss 일일 거래 제한 활성화 중 (24시간 차단)"
+            long_lines.append(lockout_msg)
+            short_lines.append(lockout_msg)
 
         def _side_has_red_gate(side_lines):
             return any("🔴" in line or "불만족" in line for line in side_lines if "필수 게이트" not in line)
@@ -33229,6 +33387,8 @@ class MainController:
                         state['active_symbols'] = set(getattr(engine, 'active_symbols') or set())
                     if hasattr(engine, 'scanner_active_symbol'):
                         state['scanner_active_symbol'] = getattr(engine, 'scanner_active_symbol', None)
+                    if hasattr(engine, 'utbreakout_daily_sl_symbol_lockouts'):
+                        state['utbreakout_daily_sl_symbol_lockouts'] = dict(getattr(engine, 'utbreakout_daily_sl_symbol_lockouts', {}) or {})
                     old_engine_state[key] = state
 
                 try:
@@ -33311,6 +33471,8 @@ class MainController:
                             engine.active_symbols = set(state.get('active_symbols') or set())
                         if hasattr(engine, 'scanner_active_symbol') and 'scanner_active_symbol' in state:
                             engine.scanner_active_symbol = state.get('scanner_active_symbol')
+                        if hasattr(engine, 'utbreakout_daily_sl_symbol_lockouts') and 'utbreakout_daily_sl_symbol_lockouts' in state:
+                            engine.utbreakout_daily_sl_symbol_lockouts = dict(state.get('utbreakout_daily_sl_symbol_lockouts', {}) or {})
 
                     try:
                         if self.active_engine and not getattr(self.active_engine, 'running', False):
@@ -42582,6 +42744,7 @@ async def _audit_and_repair_live_ladder_protection(self, symbol, pos, state, cfg
             if repaired_sl:
                 state["active"] = True
                 state["last_stop_price"] = float(stop_price)
+                state["sl_order_id"] = repaired_sl.get("id") if isinstance(repaired_sl, dict) else None
                 getattr(self, "utbreakout_trailing_states", {})[symbol] = state
     if audit.get("missing_tp1") and "TP1" in planned:
         logger.warning("[Protection Audit] TP1 repair required for %s: %s", symbol, audit.get("status"))
@@ -42954,6 +43117,7 @@ def _register_live_ladder_position_state(self, plan, pos, sl_order, tp_orders, c
         "runner_chandelier_enabled": False,
         "tp2_fallback_reached_loops": 0,
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "sl_order_id": sl_order.get("id") if isinstance(sl_order, dict) else None,
     }
     self.utbreakout_trailing_states[plan.symbol] = state
     return state
@@ -42984,6 +43148,7 @@ async def _refresh_ladder_fill_state(self, symbol, pos, state, cfg):
             state["sl_moved_to_be"] = True
             state["active"] = True
             state["last_stop_price"] = float(breakeven_stop)
+            state["sl_order_id"] = replacement.get("id") if isinstance(replacement, dict) else None
             self.utbreakout_trailing_states[symbol] = state
 
     if state.get("tp2_filled") and not state.get("sl_moved_to_tp1_area"):
@@ -42998,6 +43163,7 @@ async def _refresh_ladder_fill_state(self, symbol, pos, state, cfg):
             state["sl_moved_to_tp1_area"] = True
             state["active"] = True
             state["last_stop_price"] = float(tp1_area_stop)
+            state["sl_order_id"] = replacement.get("id") if isinstance(replacement, dict) else None
             self.utbreakout_trailing_states[symbol] = state
 
     if hasattr(self, "_audit_protection_orders"):
