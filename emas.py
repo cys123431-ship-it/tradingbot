@@ -9372,6 +9372,8 @@ class SignalEngine(BaseEngine):
 
         if active_strategy not in UTBREAKOUT_STRATEGIES:
             blockers.append("active strategy not UTBreakout")
+        if side in {'long', 'short'} and not self.is_trade_direction_allowed(side):
+            blockers.append(self.format_trade_direction_block_reason(side))
         if not candidate_side or candidate_side != side:
             blockers.append("direction mismatch")
         if not side_condition_ok:
@@ -14188,6 +14190,18 @@ class SignalEngine(BaseEngine):
             cleaned = self._clean_utbreakout_status_gate_line(direction_line or "")
             detail = cleaned.split(":", 1)[1].strip() if ":" in cleaned else ""
             _add(f"UTBot 방향 불일치: {detail}" if detail else "UTBot 방향 불일치")
+
+        trade_direction_blocker = next(
+            (
+                blocker
+                for blocker in raw_blockers
+                if "방향 필터 차단" in blocker
+                or "direction filter" in blocker.lower()
+            ),
+            None,
+        )
+        if trade_direction_blocker:
+            _add(trade_direction_blocker)
 
         ev_line = next(
             (

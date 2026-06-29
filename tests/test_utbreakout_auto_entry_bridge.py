@@ -442,6 +442,42 @@ def test_execution_gate_reports_not_current_scanner_candidate():
     assert "not current scanner candidate" in eligibility["blockers"]
 
 
+def test_execution_eligibility_blocks_short_when_global_direction_is_long():
+    class Controller:
+        is_paused = False
+
+    engine = _build_engine()
+    engine.ctrl = Controller()
+    engine.trade_direction = "long"
+    eligibility = engine._build_utbreakout_execution_eligibility(
+        symbol="SOL/USDT:USDT",
+        side="short",
+        candidate_side="short",
+        candidate_type="fresh_signal",
+        side_condition_ok=True,
+        risk_ok=True,
+        planned_qty=1.0,
+        risk_usdt=1.0,
+        entry_plan_detail="ok",
+        cooldown_reasons=[],
+        has_open_position=False,
+        has_other_position=False,
+        auto_entry_enabled=True,
+        daily_risk_ok=True,
+        plan_lookup_ready=True,
+        cfg={"utbreakout_require_scanner_candidate_for_auto_entry": True},
+        scanner_source="scanner_seen",
+        is_live_scanner_context=True,
+        is_current_scanner_candidate=True,
+        is_coinselector_top_candidate=True,
+        next_scan_symbol="SOL/USDT:USDT",
+        evaluated_symbol="SOL/USDT:USDT",
+    )
+
+    assert eligibility["can_attempt"] is False
+    assert "방향 필터 차단 (SHORT vs LONG)" in eligibility["blockers"]
+
+
 def test_execution_eligibility_covers_long_and_short_manual_vs_live():
     class Controller:
         is_paused = False

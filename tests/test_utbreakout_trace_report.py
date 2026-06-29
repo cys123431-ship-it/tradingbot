@@ -398,3 +398,17 @@ def test_execution_gate_display_prioritizes_root_blockers_over_downstream_noise(
         "risk plan blocked",
     ]
     assert direction_blockers == ["UTBot 방향 불일치: 현재 LONG"]
+
+    trade_direction_blockers = engine._format_utbreakout_execution_blockers_for_display(
+        "short",
+        short_lines,
+        {
+            "can_attempt": False,
+            "blockers": [
+                "방향 필터 차단 (SHORT vs LONG)",
+                "ready entry plan missing",
+            ],
+        },
+    )
+
+    assert "방향 필터 차단 (SHORT vs LONG)" in trade_direction_blockers
