@@ -106,7 +106,7 @@ OPPORTUNITY_OVERRIDES = {
     "aggressive_growth_enabled": False,
     "aggressive_growth_pyramiding_enabled": False,
 
-    "ev_min_entry_score": 60.0,
+    "ev_min_entry_score": 55.0,
     "ev_min_net_expectancy_r": 0.08,
     "ev_entry_fee_rate_pct": 0.04,
     "ev_exit_fee_rate_pct": 0.04,
@@ -141,11 +141,11 @@ OPPORTUNITY_OVERRIDES = {
     "ev_stale_relief_min_volume_ratio": 1.10,
 
     "ev_no_edge_relief_enabled": True,
-    "ev_no_edge_relief_min_score": 72.0,
-    "ev_no_edge_relief_min_adx": 26.0,
-    "ev_no_edge_relief_min_volume_ratio": 1.20,
-    "ev_no_edge_relief_min_efficiency": 0.30,
-    "ev_no_edge_relief_min_range_expansion": 1.15,
+    "ev_no_edge_relief_min_score": 67.0,
+    "ev_no_edge_relief_min_adx": 23.0,
+    "ev_no_edge_relief_min_volume_ratio": 1.05,
+    "ev_no_edge_relief_min_efficiency": 0.24,
+    "ev_no_edge_relief_min_range_expansion": 1.08,
     "ev_time_stop_enabled": True,
     "ev_time_stop_bars": 8,
     "ev_time_stop_min_mfe_r": 0.45,
@@ -311,7 +311,7 @@ def apply_opportunity_tuning(engine):
     # CoinSelector: lower the discovery threshold and refresh more often.
     selector_updates = {
         "enabled": True,
-        "analysis_limit": 60,
+        "analysis_limit": 80,
         "top_n": 20,
         "min_final_score": 45.0,
         "min_quote_volume_usdt": 25_000_000.0,
@@ -324,6 +324,7 @@ def apply_opportunity_tuning(engine):
         "candidate_cooldown_enabled": False,
         "custom_relax_discovery": True,
         "selection_quality_enabled": True,
+        "selection_max_rebound_pct": 22.0,
     }
     for k, v in selector_updates.items():
         changed |= _set_if_different(selector, k, v)

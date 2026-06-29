@@ -82,7 +82,7 @@ class MfeProfitLockDecision:
 def default_ev_adaptive_config():
     return {
         "enabled": True,
-        "min_entry_score": 60.0,
+        "min_entry_score": 55.0,
         "min_net_expectancy_r": 0.08,
         "max_spread_pct": 0.08,
         "high_vol_atr_pct": 1.5,
@@ -126,11 +126,11 @@ def default_ev_adaptive_config():
         "stale_relief_min_volume_ratio": 1.10,
 
         "no_edge_relief_enabled": True,
-        "no_edge_relief_min_score": 72.0,
-        "no_edge_relief_min_adx": 26.0,
-        "no_edge_relief_min_volume_ratio": 1.20,
-        "no_edge_relief_min_efficiency": 0.30,
-        "no_edge_relief_min_range_expansion": 1.15,
+        "no_edge_relief_min_score": 67.0,
+        "no_edge_relief_min_adx": 23.0,
+        "no_edge_relief_min_volume_ratio": 1.05,
+        "no_edge_relief_min_efficiency": 0.24,
+        "no_edge_relief_min_range_expansion": 1.08,
         "derivatives_funding_soft": 0.0006,
         "derivatives_funding_hard": 0.0015,
         "derivatives_funding_extreme_percentile": 90.0,
@@ -321,7 +321,9 @@ def _derivatives_quality_overlay(side, values, cfg):
             risk_multiplier *= 1.03
             reasons.append(f"orderflow confirms {signed_ofi:.2f}")
         elif signed_ofi <= -opposite_hard:
-            blockers.append(f"opposite orderflow {signed_ofi:.2f}")
+            score_delta -= 8.0
+            risk_multiplier *= 0.55
+            reasons.append(f"hard opposite orderflow reduced {signed_ofi:.2f}")
         elif signed_ofi <= -aligned:
             score_delta -= 5.0
             risk_multiplier *= 0.75

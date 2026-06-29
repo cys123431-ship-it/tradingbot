@@ -707,9 +707,9 @@ def _classify_set_filter_result(side, passed, detail, metrics=None, cfg=None):
 
     side_l = str(side or "").lower()
     if side_l == "long" and imbalance <= -8.0 and taker <= 0.98:
-        return False, 0.0, f"{detail}; hard opposite orderflow for LONG"
+        return "reduced", 0.35, f"{detail}; hard opposite orderflow reduced for LONG"
     if side_l == "short" and imbalance >= 8.0 and taker >= 1.02:
-        return False, 0.0, f"{detail}; hard opposite orderflow for SHORT"
+        return "reduced", 0.35, f"{detail}; hard opposite orderflow reduced for SHORT"
     return "reduced", 0.50, f"{detail}; set confirmation soft fail"
 
 
@@ -841,7 +841,7 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "aggressive_growth_pyramiding_enabled": False,
 
         # Cost-aware EV gate.
-        "ev_min_entry_score": 60.0,
+        "ev_min_entry_score": 55.0,
         "ev_min_net_expectancy_r": 0.08,
         "ev_entry_fee_rate_pct": 0.04,
         "ev_exit_fee_rate_pct": 0.04,
@@ -876,11 +876,11 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "ev_stale_relief_min_volume_ratio": 1.10,
 
         "ev_no_edge_relief_enabled": True,
-        "ev_no_edge_relief_min_score": 72.0,
-        "ev_no_edge_relief_min_adx": 26.0,
-        "ev_no_edge_relief_min_volume_ratio": 1.20,
-        "ev_no_edge_relief_min_efficiency": 0.30,
-        "ev_no_edge_relief_min_range_expansion": 1.15,
+        "ev_no_edge_relief_min_score": 67.0,
+        "ev_no_edge_relief_min_adx": 23.0,
+        "ev_no_edge_relief_min_volume_ratio": 1.05,
+        "ev_no_edge_relief_min_efficiency": 0.24,
+        "ev_no_edge_relief_min_range_expansion": 1.08,
         "ev_time_stop_enabled": True,
         "ev_time_stop_bars": 8,
         "ev_time_stop_min_mfe_r": 0.45,
@@ -938,7 +938,7 @@ def apply_profit_opportunity_effective_overrides(cfg):
 def _ev_adaptive_runtime_config(cfg):
     cfg = dict(cfg or {})
     return {
-        "min_entry_score": cfg.get("ev_min_entry_score", 60.0),
+        "min_entry_score": cfg.get("ev_min_entry_score", 55.0),
         "min_net_expectancy_r": cfg.get("ev_min_net_expectancy_r", 0.08),
         "entry_fee_rate_pct": cfg.get("ev_entry_fee_rate_pct", 0.04),
         "exit_fee_rate_pct": cfg.get("ev_exit_fee_rate_pct", 0.04),
@@ -981,11 +981,11 @@ def _ev_adaptive_runtime_config(cfg):
         "stale_relief_min_volume_ratio": cfg.get("ev_stale_relief_min_volume_ratio", 1.10),
 
         "no_edge_relief_enabled": cfg.get("ev_no_edge_relief_enabled", True),
-        "no_edge_relief_min_score": cfg.get("ev_no_edge_relief_min_score", 72.0),
-        "no_edge_relief_min_adx": cfg.get("ev_no_edge_relief_min_adx", 26.0),
-        "no_edge_relief_min_volume_ratio": cfg.get("ev_no_edge_relief_min_volume_ratio", 1.20),
-        "no_edge_relief_min_efficiency": cfg.get("ev_no_edge_relief_min_efficiency", 0.30),
-        "no_edge_relief_min_range_expansion": cfg.get("ev_no_edge_relief_min_range_expansion", 1.15),
+        "no_edge_relief_min_score": cfg.get("ev_no_edge_relief_min_score", 67.0),
+        "no_edge_relief_min_adx": cfg.get("ev_no_edge_relief_min_adx", 23.0),
+        "no_edge_relief_min_volume_ratio": cfg.get("ev_no_edge_relief_min_volume_ratio", 1.05),
+        "no_edge_relief_min_efficiency": cfg.get("ev_no_edge_relief_min_efficiency", 0.24),
+        "no_edge_relief_min_range_expansion": cfg.get("ev_no_edge_relief_min_range_expansion", 1.08),
     }
 
 

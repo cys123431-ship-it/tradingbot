@@ -14,7 +14,7 @@ def test_orderflow_low_samples_soft_fail_not_block():
     assert "low samples" in detail
 
 
-def test_orderflow_strong_opposite_with_enough_samples_blocks():
+def test_orderflow_strong_opposite_with_enough_samples_reduces():
     state, mult, detail = _classify_set_filter_result(
         "long",
         False,
@@ -22,8 +22,8 @@ def test_orderflow_strong_opposite_with_enough_samples_blocks():
         metrics={"imb": -20, "taker": 0.9, "samples": 8},
         cfg={},
     )
-    assert state is False
-    assert mult == 0.0
+    assert state == "reduced"
+    assert 0.0 < mult < 0.50
     assert "hard opposite" in detail
 
 

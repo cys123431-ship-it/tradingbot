@@ -673,7 +673,7 @@ def test_derivatives_confirmation_improves_score_and_size():
     assert any("orderflow confirms" in reason for reason in confirmed.reasons)
 
 
-def test_opposite_orderflow_blocks_otherwise_valid_entry():
+def test_opposite_orderflow_reduces_otherwise_valid_entry():
     decision = evaluate_ev_adaptive_entry(
         side="long",
         candidate_type="fresh_signal",
@@ -697,8 +697,10 @@ def test_opposite_orderflow_blocks_otherwise_valid_entry():
         },
     )
 
-    assert decision.allowed is False
-    assert any("opposite orderflow" in blocker for blocker in decision.blockers)
+    assert decision.allowed is True
+    assert decision.risk_multiplier < 0.60
+    assert not any("opposite orderflow" in blocker for blocker in decision.blockers)
+    assert any("opposite orderflow" in reason for reason in decision.reasons)
 
 
 def test_ev_adaptive_continuation_requires_signal_age():
