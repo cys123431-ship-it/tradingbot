@@ -26131,13 +26131,37 @@ class SignalEngine(BaseEngine):
                             "Binance Futures 심볼\n"
                             f"symbol={symbol}\n"
                             f"reason={validation_reason}"
-                        )
+                    )
                 except Exception:
                     logger.debug(
                         "invalid UTBreakout symbol notify skipped",
                         exc_info=True,
                     )
                 return
+            if trace_utbreakout:
+                daily_sl_locked, daily_sl_reason = self._is_utbreakout_daily_sl_locked(symbol)
+                if daily_sl_locked:
+                    self._utbreakout_trace_event(
+                        symbol,
+                        'ENTRY_BLOCKED',
+                        'DAILY_SL_LOCKOUT',
+                        side=side,
+                        reason=daily_sl_reason,
+                    )
+                    self.last_entry_reason[symbol] = (
+                        daily_sl_reason or "daily SL lockout active"
+                    )
+                    try:
+                        await self.ctrl.notify(
+                            f"UTBreakout entry blocked: {symbol} {side.upper()} "
+                            f"/ {daily_sl_reason}"
+                        )
+                    except Exception:
+                        logger.debug(
+                            "daily SL lockout entry notify skipped",
+                            exc_info=True,
+                        )
+                    return
             raw_symbol = symbol
             if trace_utbreakout:
                 self._utbreakout_trace_event(

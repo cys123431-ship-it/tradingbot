@@ -229,7 +229,7 @@ def test_bridge_stage_names_and_diagnosis_are_in_report():
     assert "AUTO_ENTRY_BRIDGE 이후 entry() 호출 전" in report
 
 
-def test_coin_selector_scanner_invokes_bridge_after_scanner_seen():
+def test_coin_selector_scanner_invokes_bridge_after_scanner_seen(tmp_path):
     bridge_calls = []
 
     class Controller:
@@ -243,11 +243,18 @@ def test_coin_selector_scanner_invokes_bridge_after_scanner_seen():
             ]
 
     engine = _build_engine()
+    engine.runtime_dir = str(tmp_path)
+    engine.utbreakout_daily_sl_symbol_lockouts = {}
     engine.ctrl = Controller()
     engine.market_data_exchange = MarketDataExchange()
     engine.coin_selector_candidate_cooldowns = {}
     engine.last_entry_reason = {}
     engine.scanner_active_symbol = None
+    engine._record_utbreakout_daily_sl_lockout(
+        "SOL/USDT:USDT",
+        side="long",
+        reason="STOP_LOSS_FILLED",
+    )
     engine._get_coin_selector_config = lambda: {
         "top_n": 10,
         "candidate_cooldown_enabled": False,
@@ -309,6 +316,9 @@ def test_coin_selector_scanner_invokes_bridge_after_scanner_seen():
 
     asyncio.run(engine._scan_and_trade_coin_selector())
 
+    locked, reason = engine._is_utbreakout_daily_sl_locked("SOLUSDT")
+    assert locked is True
+    assert "STOP_LOSS_FILLED" in reason
     assert bridge_calls == [("SOL/USDT:USDT", "scanner_seen")]
     assert engine.scanner_active_symbol == "SOL/USDT:USDT"
     stages = [

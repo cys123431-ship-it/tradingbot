@@ -14,6 +14,7 @@ def _build_engine(tmp_path):
     engine.utbreakout_last_order_attempt_ts = {}
     engine.utbreakout_last_watchdog_report_ts = {}
     engine.utbreakout_trace_watchdog_enabled = True
+    engine.last_entry_reason = {}
     engine.get_runtime_strategy_params = lambda: {
         "active_strategy": emas.UTBOT_FILTERED_BREAKOUT_STRATEGY,
     }
@@ -22,6 +23,10 @@ def _build_engine(tmp_path):
 
     class Controller:
         is_paused = False
+        messages = []
+
+        async def notify(self, message):
+            self.messages.append(message)
 
     engine.ctrl = Controller()
     return engine
@@ -79,6 +84,47 @@ def test_daily_sl_lockout_blocks_long_and_short_for_same_symbol_only(tmp_path):
         **_eligible_kwargs("ETH/USDT:USDT", "short")
     )
     assert other["can_attempt"] is True
+
+
+def test_daily_sl_lockout_status_blocker_keeps_reason_for_display(tmp_path):
+    engine = _build_engine(tmp_path)
+    engine._record_utbreakout_daily_sl_lockout(
+        "DOGEUSDT",
+        side="long",
+        reason="STOP_LOSS_FILLED",
+    )
+    eligibility = engine._build_utbreakout_execution_eligibility(
+        **_eligible_kwargs("DOGE/USDT:USDT", "short")
+    )
+
+    display = engine._format_utbreakout_execution_blockers_for_display(
+        "short",
+        [],
+        eligibility,
+    )
+
+    assert any("daily SL lockout" in item for item in display)
+    assert any("STOP_LOSS_FILLED" in item for item in display)
+
+
+def test_daily_sl_lockout_blocks_direct_entry_before_order_attempt(tmp_path):
+    engine = _build_engine(tmp_path)
+    engine._record_utbreakout_daily_sl_lockout(
+        "SOLUSDT",
+        side="short",
+        reason="STOP_LOSS_FILLED",
+    )
+
+    asyncio.run(engine.entry("SOL/USDT:USDT", "short", 98.5))
+
+    events = engine._utbreakout_recent_trace_events("SOLUSDT", limit=20)
+    assert any(
+        event["stage"] == "ENTRY_BLOCKED"
+        and event["status"] == "DAILY_SL_LOCKOUT"
+        for event in events
+    )
+    assert not any(event["stage"] == "ORDER_ATTEMPT" for event in events)
+    assert "STOP_LOSS_FILLED" in engine.last_entry_reason["SOL/USDT:USDT"]
 
 
 def test_daily_sl_lockout_persists_and_expires_by_day(tmp_path):
