@@ -75,6 +75,77 @@ def test_short_momentum_is_blocked_during_panic_rebound():
     assert any("panic rebound" in blocker for blocker in decision.blockers)
 
 
+def test_short_relaxation_allows_small_aligned_downtrend_size():
+    decision = evaluate_ev_adaptive_entry(
+        side="short",
+        candidate_type="fresh_signal",
+        values={
+            "entry_price": 100.0,
+            "open": 100.6,
+            "ema50": 101.0,
+            "ema50_prev": 101.5,
+            "htf_ready": True,
+            "htf_close": 99.5,
+            "htf_ema_fast": 100.0,
+            "htf_ema_slow": 101.0,
+            "htf_supertrend_direction": "short",
+            "adx": 15.0,
+            "plus_di": 14.0,
+            "minus_di": 24.0,
+            "chop": 50.0,
+            "volume_ratio": 0.55,
+            "directional_efficiency": 0.18,
+            "momentum_6_pct": -0.4,
+            "momentum_12_pct": -0.8,
+            "momentum_24_pct": -1.3,
+            "atr_pct": 0.9,
+            "futures_spread_pct": 0.02,
+            "recent_rebound_pct": 1.0,
+            "mtf_metrics": {
+                "15m": {"ema_bias": "short"},
+                "30m": {"ema_bias": "short"},
+                "1h": {"ema_bias": "short"},
+            },
+        },
+    )
+
+    assert decision.allowed is True
+    assert decision.mode == "TREND"
+    assert decision.risk_multiplier <= 0.45
+    assert "short relaxation risk cap" in decision.reasons
+
+
+def test_short_relaxation_does_not_override_rebound_protection():
+    decision = evaluate_ev_adaptive_entry(
+        side="short",
+        candidate_type="fresh_signal",
+        values={
+            "entry_price": 100.0,
+            "ema50": 101.0,
+            "ema50_prev": 101.5,
+            "htf_supertrend_direction": "short",
+            "adx": 15.0,
+            "plus_di": 14.0,
+            "minus_di": 24.0,
+            "chop": 50.0,
+            "volume_ratio": 0.55,
+            "directional_efficiency": 0.18,
+            "momentum_6_pct": -0.4,
+            "momentum_12_pct": -0.8,
+            "momentum_24_pct": -1.3,
+            "recent_rebound_pct": 7.0,
+            "mtf_metrics": {
+                "15m": {"ema_bias": "short"},
+                "30m": {"ema_bias": "short"},
+                "1h": {"ema_bias": "short"},
+            },
+        },
+    )
+
+    assert decision.allowed is False
+    assert any("panic rebound" in blocker for blocker in decision.blockers)
+
+
 def test_squeeze_release_gets_its_own_exit_profile():
     decision = evaluate_ev_adaptive_entry(
         side="long",

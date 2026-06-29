@@ -33,6 +33,7 @@ def test_opportunity_tuning_persists_changed_runtime_config():
                 "UTBotFilteredBreakoutV1": {
                     "ev_min_entry_score": 72.0,
                     "ev_no_edge_relief_min_score": 80.0,
+                    "ev_short_min_entry_score": 60.0,
                 },
             },
         },
@@ -51,6 +52,8 @@ def test_opportunity_tuning_persists_changed_runtime_config():
     assert "meme" not in selector["excluded_sectors"]
     assert ut_cfg["ev_min_entry_score"] == 55.0
     assert ut_cfg["ev_no_edge_relief_min_score"] == 67.0
+    assert ut_cfg["ev_short_min_entry_score"] == 52.0
+    assert ut_cfg["ev_short_relaxed_signal_risk_cap"] == 0.45
 
 
 def test_opportunity_tuning_does_not_rewrite_when_already_current():

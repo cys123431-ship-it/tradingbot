@@ -131,6 +131,16 @@ def default_ev_adaptive_config():
         "no_edge_relief_min_volume_ratio": 1.05,
         "no_edge_relief_min_efficiency": 0.24,
         "no_edge_relief_min_range_expansion": 1.08,
+        "short_min_entry_score": 52.0,
+        "short_trend_min_adx": 14.0,
+        "short_trend_min_volume_ratio": 0.50,
+        "short_no_edge_relief_min_score": 63.0,
+        "short_no_edge_relief_min_adx": 20.0,
+        "short_no_edge_relief_min_volume_ratio": 0.95,
+        "short_no_edge_relief_min_efficiency": 0.20,
+        "short_no_edge_relief_min_range_expansion": 1.03,
+        "short_conditional_relief_risk_cap": 0.35,
+        "short_relaxed_signal_risk_cap": 0.45,
         "derivatives_funding_soft": 0.0006,
         "derivatives_funding_hard": 0.0015,
         "derivatives_funding_extreme_percentile": 90.0,
@@ -171,6 +181,13 @@ def _first_finite(values, *keys):
         if parsed is not None:
             return parsed
     return None
+
+
+def _side_config(cfg, side, key):
+    side_key = f"{str(side or '').lower()}_{key}"
+    if side_key in cfg and cfg.get(side_key) is not None:
+        return cfg.get(side_key)
+    return cfg.get(key)
 
 
 def _percentile_100(value):
@@ -668,19 +685,24 @@ def evaluate_ev_adaptive_entry(*, side, candidate_type, values=None, config=None
         and votes >= 2
     )
 
+    trend_min_adx = float(_side_config(cfg, side, "trend_min_adx"))
+    trend_min_volume_ratio = float(_side_config(cfg, side, "trend_min_volume_ratio"))
+    strong_trend_min_adx = float(_side_config(cfg, side, "strong_trend_min_adx"))
+    strong_trend_min_volume_ratio = float(_side_config(cfg, side, "strong_trend_min_volume_ratio"))
+
     trend = (
         votes >= 2
-        and adx >= float(cfg["trend_min_adx"])
+        and adx >= trend_min_adx
         and chop <= float(cfg["trend_max_chop"])
-        and volume >= float(cfg["trend_min_volume_ratio"])
+        and volume >= trend_min_volume_ratio
         and momentum_aligned
     )
     strong = (
         trend
         and votes >= 3
-        and adx >= float(cfg["strong_trend_min_adx"])
+        and adx >= strong_trend_min_adx
         and chop <= float(cfg["strong_trend_max_chop"])
-        and volume >= float(cfg["strong_trend_min_volume_ratio"])
+        and volume >= strong_trend_min_volume_ratio
         and efficiency >= 0.25
     )
 
@@ -763,7 +785,10 @@ def evaluate_ev_adaptive_entry(*, side, candidate_type, values=None, config=None
         reasons.append(
             f"OR relief: MTF {mtf_votes}/{mtf_available} accepted by breakout/reacceleration quality"
         )
-        relief_risk_cap = min(relief_risk_cap, float(cfg.get("conditional_relief_risk_cap", 0.55)))
+        relief_risk_cap = min(
+            relief_risk_cap,
+            float(_side_config(cfg, side, "conditional_relief_risk_cap")),
+        )
 
     # 2. Stale continuation relief
     stale_relief_ok = (
@@ -784,18 +809,21 @@ def evaluate_ev_adaptive_entry(*, side, candidate_type, values=None, config=None
         reasons.append(
             f"OR relief: stale continuation {signal_age:.1f} bars accepted by substitute momentum/breakout evidence"
         )
-        relief_risk_cap = min(relief_risk_cap, float(cfg.get("conditional_relief_risk_cap", 0.55)))
+        relief_risk_cap = min(
+            relief_risk_cap,
+            float(_side_config(cfg, side, "conditional_relief_risk_cap")),
+        )
 
     # 3. No-edge relief
     no_edge_relief_ok = (
         conditional_relief
         and bool(cfg.get("no_edge_relief_enabled", True))
         and no_edge_blocker is not None
-        and score >= float(cfg.get("no_edge_relief_min_score", 72.0))
-        and adx >= float(cfg.get("no_edge_relief_min_adx", 26.0))
-        and volume >= float(cfg.get("no_edge_relief_min_volume_ratio", 1.20))
-        and efficiency >= float(cfg.get("no_edge_relief_min_efficiency", 0.30))
-        and range_expansion >= float(cfg.get("no_edge_relief_min_range_expansion", 1.15))
+        and score >= float(_side_config(cfg, side, "no_edge_relief_min_score"))
+        and adx >= float(_side_config(cfg, side, "no_edge_relief_min_adx"))
+        and volume >= float(_side_config(cfg, side, "no_edge_relief_min_volume_ratio"))
+        and efficiency >= float(_side_config(cfg, side, "no_edge_relief_min_efficiency"))
+        and range_expansion >= float(_side_config(cfg, side, "no_edge_relief_min_range_expansion"))
         and price_breakout
         and momentum_available >= 2
         and momentum_votes >= 2
@@ -807,7 +835,10 @@ def evaluate_ev_adaptive_entry(*, side, candidate_type, values=None, config=None
         reasons.append(
             "OR relief: no trend/squeeze edge accepted as TREND by breakout + momentum + MTF substitute"
         )
-        relief_risk_cap = min(relief_risk_cap, float(cfg.get("conditional_relief_risk_cap", 0.55)))
+        relief_risk_cap = min(
+            relief_risk_cap,
+            float(_side_config(cfg, side, "conditional_relief_risk_cap")),
+        )
 
     win_probability = _calibrated_win_probability(
         score,
@@ -818,8 +849,9 @@ def evaluate_ev_adaptive_entry(*, side, candidate_type, values=None, config=None
     gross_win_r = profile_gross_win_r(profile)
     expected_before_cost = win_probability * gross_win_r - (1.0 - win_probability)
 
-    if score < float(cfg["min_entry_score"]):
-        blockers.append(f"score {score:.1f}<{float(cfg['min_entry_score']):.1f}")
+    min_entry_score = float(_side_config(cfg, side, "min_entry_score"))
+    if score < min_entry_score:
+        blockers.append(f"score {score:.1f}<{min_entry_score:.1f}")
     if score >= 82.0:
         risk_multiplier = 1.0
     elif score >= 74.0:
@@ -845,6 +877,16 @@ def evaluate_ev_adaptive_entry(*, side, candidate_type, values=None, config=None
     if side == "short":
         risk_multiplier *= 0.60
         reasons.append("short risk asymmetry")
+        if (
+            score < float(cfg["min_entry_score"])
+            or adx < float(cfg["trend_min_adx"])
+            or volume < float(cfg["trend_min_volume_ratio"])
+        ):
+            risk_multiplier = min(
+                risk_multiplier,
+                float(cfg.get("short_relaxed_signal_risk_cap", 0.45)),
+            )
+            reasons.append("short relaxation risk cap")
     risk_multiplier *= float(derivatives_overlay["risk_multiplier"])
     risk_multiplier = min(risk_multiplier, relief_risk_cap)
 

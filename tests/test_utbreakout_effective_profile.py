@@ -40,6 +40,12 @@ def test_profit_opportunity_effective_profile_overrides_old_values():
     assert out["selected_set_core_filter_hard_block_enabled"] is False
     assert out["atr_trailing_enabled"] is True
     assert out["runner_exit_enabled"] is True
+    assert out["ev_short_min_entry_score"] == 52.0
+    assert out["ev_short_trend_min_adx"] == 14.0
+    assert out["ev_short_trend_min_volume_ratio"] == 0.50
+    assert out["ev_short_no_edge_relief_min_score"] == 63.0
+    assert out["ev_short_conditional_relief_risk_cap"] == 0.35
+    assert out["ev_short_relaxed_signal_risk_cap"] == 0.45
 
 
 def test_runtime_config_path_reapplies_effective_profile_after_persisted_values():
@@ -74,6 +80,19 @@ def test_runtime_config_path_reapplies_effective_profile_after_persisted_values(
     assert cfg["max_daily_trades"] == 7
     assert cfg["bias_continuation_min_volume_ratio"] == 0.40
     assert cfg["bias_continuation_15m_min_volume_ratio"] == 0.45
+
+
+def test_ev_runtime_config_maps_short_relaxation_keys():
+    cfg = emas.apply_profit_opportunity_effective_overrides({})
+
+    runtime = emas._ev_adaptive_runtime_config(cfg)
+
+    assert runtime["short_min_entry_score"] == 52.0
+    assert runtime["short_trend_min_adx"] == 14.0
+    assert runtime["short_trend_min_volume_ratio"] == 0.50
+    assert runtime["short_no_edge_relief_min_score"] == 63.0
+    assert runtime["short_conditional_relief_risk_cap"] == 0.35
+    assert runtime["short_relaxed_signal_risk_cap"] == 0.45
 
 
 def test_status_render_contract_replaces_stale_telegram_summary_values():
@@ -127,6 +146,12 @@ def test_prelaunch_runtime_patches_cannot_restore_the_retired_profile():
         "atr_trailing_activation_r",
         "atr_trailing_multiplier",
         "max_daily_trades",
+        "ev_short_min_entry_score",
+        "ev_short_trend_min_adx",
+        "ev_short_trend_min_volume_ratio",
+        "ev_short_no_edge_relief_min_score",
+        "ev_short_conditional_relief_risk_cap",
+        "ev_short_relaxed_signal_risk_cap",
     )
 
     for key in keys:
