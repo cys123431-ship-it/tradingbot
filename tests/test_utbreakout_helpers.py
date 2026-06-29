@@ -881,6 +881,10 @@ def test_utbreakout_status_symbol_prefers_live_position_over_watchlist():
     symbol = asyncio.run(controller._resolve_utbreakout_status_symbol())
 
     assert symbol == "XRP/USDT"
+    assert (
+        controller.engines[emas.CORE_ENGINE].utbreakout_status_symbol_source
+        == "position"
+    )
 
 
 def test_utbreakout_status_symbol_uses_scanner_when_no_position():
@@ -902,6 +906,10 @@ def test_utbreakout_status_symbol_uses_scanner_when_no_position():
     symbol = asyncio.run(controller._resolve_utbreakout_status_symbol())
 
     assert symbol == "SOL/USDT"
+    assert (
+        controller.engines[emas.CORE_ENGINE].utbreakout_status_symbol_source
+        == "scanner_lock"
+    )
 
 
 def test_main_controller_status_symbol_key_exists():
@@ -936,6 +944,35 @@ def test_status_symbol_uses_engine_next_candidate_before_stale_status():
 
     result = asyncio.run(ctrl._resolve_utbreakout_status_symbol())
     assert result == "BTC/USDT:USDT"
+    assert ctrl.engines[CORE_ENGINE].utbreakout_status_symbol_source == "live_candidate"
+
+
+def test_status_symbol_marks_watchlist_fallback_when_no_live_candidate():
+    from emas import MainController, CORE_ENGINE
+
+    class DummyEngine:
+        scanner_active_symbol = None
+
+        async def get_active_position_symbols(self, use_cache=False):
+            return set()
+
+        async def _resolve_next_utbreakout_scan_candidate(self, excluded_symbols=None):
+            return None, None
+
+    ctrl = MainController.__new__(MainController)
+    ctrl.engines = {CORE_ENGINE: DummyEngine()}
+    ctrl.status_data = {}
+    ctrl.is_upbit_mode = lambda: False
+    ctrl.get_active_watchlist = lambda: ["DOGE/USDT", "BTC/USDT"]
+    ctrl._get_current_symbol = lambda: "DOGE/USDT"
+
+    result = asyncio.run(ctrl._resolve_utbreakout_status_symbol())
+
+    assert result == "DOGE/USDT"
+    assert (
+        ctrl.engines[CORE_ENGINE].utbreakout_status_symbol_source
+        == "watchlist_fallback_no_live_candidate"
+    )
 
 
 def test_main_keyboard_removes_utbot_button():

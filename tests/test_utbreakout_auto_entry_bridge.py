@@ -533,4 +533,45 @@ def test_execution_eligibility_covers_long_and_short_manual_vs_live():
 
         assert live["can_attempt"] is True
         assert manual["can_attempt"] is False
-        assert "manual status only; live scanner has not selected this symbol" in manual["blockers"]
+        assert "status screen only; no live scanner candidate for this symbol" in manual["blockers"]
+
+
+def test_execution_eligibility_distinguishes_status_for_live_candidate():
+    class Controller:
+        is_paused = False
+
+    engine = _build_engine()
+    engine.ctrl = Controller()
+    engine.current_utbreakout_candidate_symbol = "SOL/USDT:USDT"
+
+    eligibility = engine._build_utbreakout_execution_eligibility(
+        symbol="SOL/USDT:USDT",
+        side="short",
+        candidate_side="short",
+        candidate_type="fresh_signal",
+        side_condition_ok=True,
+        risk_ok=True,
+        planned_qty=1.0,
+        risk_usdt=1.0,
+        entry_plan_detail="ok",
+        cooldown_reasons=[],
+        has_open_position=False,
+        has_other_position=False,
+        auto_entry_enabled=True,
+        daily_risk_ok=True,
+        plan_lookup_ready=True,
+        cfg={"utbreakout_require_scanner_candidate_for_auto_entry": True},
+        scanner_source="manual_status",
+        is_live_scanner_context=False,
+        is_current_scanner_candidate=False,
+        is_coinselector_top_candidate=True,
+        next_scan_symbol="SOL/USDT:USDT",
+        evaluated_symbol="SOL/USDT:USDT",
+        manual_status_only=True,
+    )
+
+    assert eligibility["can_attempt"] is False
+    assert (
+        "status screen only; live scanner candidate, scanner loop must emit STATUS_READY"
+        in eligibility["blockers"]
+    )

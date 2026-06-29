@@ -4397,6 +4397,8 @@ class SignalEngine(BaseEngine):
         self.utbreakout_last_status_symbol = None
         self.utbreakout_last_ready_symbol = None
         self.current_utbreakout_candidate_symbol = None
+        self.utbreakout_status_symbol_source = None
+        self.utbreakout_status_symbol_detail = None
         self.last_stateful_diag = {}
         self.last_stateful_diag_notice = {}
         self.last_processed_exit_candle_ts = {}
@@ -8835,6 +8837,8 @@ class SignalEngine(BaseEngine):
             'utbreakout_last_status_symbol',
             'utbreakout_last_ready_symbol',
             'current_utbreakout_candidate_symbol',
+            'utbreakout_status_symbol_source',
+            'utbreakout_status_symbol_detail',
         ):
             if not hasattr(self, name):
                 setattr(self, name, None)
@@ -9393,7 +9397,14 @@ class SignalEngine(BaseEngine):
         )
 
         if manual_status_only:
-            blockers.append("manual status only; live scanner has not selected this symbol")
+            if candidate_key and evaluated_key and candidate_key == evaluated_key:
+                blockers.append(
+                    "status screen only; live scanner candidate, scanner loop must emit STATUS_READY"
+                )
+            else:
+                blockers.append(
+                    "status screen only; no live scanner candidate for this symbol"
+                )
         elif not is_live_scanner_context:
             blockers.append("not live scanner context")
 
@@ -13797,6 +13808,26 @@ class SignalEngine(BaseEngine):
         else:
             lines.append("현재 포지션: 없음")
 
+        status_source = str(getattr(self, 'utbreakout_status_symbol_source', '') or '')
+        status_detail = getattr(self, 'utbreakout_status_symbol_detail', None)
+        if status_source == 'watchlist_fallback_no_live_candidate':
+            lines.append("현재 live 후보: 없음")
+            if evaluated_symbol:
+                lines.append(
+                    f"상태 화면 참고 심볼: {evaluated_symbol} "
+                    "(live 후보가 없어 watchlist 첫 항목을 참고 평가)"
+                )
+        elif status_source == 'live_candidate':
+            lines.append(f"현재 live 후보: {evaluated_symbol}")
+        elif status_source == 'scanner_lock':
+            lines.append(f"현재 live 후보: {evaluated_symbol} (scanner lock)")
+        elif status_source == 'position':
+            lines.append(f"현재 live 후보: 포지션 보유 심볼 {evaluated_symbol}")
+        elif status_source == 'status_data_position':
+            lines.append(f"현재 live 후보: 최근 포지션 상태 {evaluated_symbol}")
+        elif status_detail:
+            lines.append(f"상태 심볼 출처: {status_detail}")
+
         scanner_symbol = getattr(self, 'scanner_active_symbol', None)
         if scanner_symbol:
             lines.append(f"현재 scanner lock: {scanner_symbol}")
@@ -14242,8 +14273,13 @@ class SignalEngine(BaseEngine):
         if _raw_has("continuation entry disabled"):
             _add("continuation entry disabled")
 
-        if _raw_has("manual status only"):
-            _add("상태조회 진단용: live scanner가 이 심볼을 선택하지 않음")
+        if _raw_has("status screen only; live scanner candidate"):
+            _add("상태조회 진단용: 실제 주문은 live scanner 루프가 시도")
+        elif _raw_has(
+            "manual status only",
+            "status screen only; no live scanner candidate",
+        ):
+            _add("상태조회 진단용: 이 심볼은 현재 live 후보 아님")
         elif _raw_has("not live scanner context"):
             _add("live scanner context 아님")
 
@@ -32866,6 +32902,14 @@ class MainController:
         """
         engine = self.engines.get(CORE_ENGINE)
 
+        def _mark_status_symbol_source(source, detail=None):
+            if engine:
+                try:
+                    engine.utbreakout_status_symbol_source = source
+                    engine.utbreakout_status_symbol_detail = detail
+                except Exception:
+                    pass
+
         position_symbols = set()
         if engine and hasattr(engine, 'get_active_position_symbols'):
             try:
@@ -32874,10 +32918,13 @@ class MainController:
                 logger.warning(f"UTBreak status position symbol lookup failed: {exc}")
 
         if position_symbols:
-            return sorted(position_symbols, key=self._utbreakout_status_symbol_key)[0]
+            symbol = sorted(position_symbols, key=self._utbreakout_status_symbol_key)[0]
+            _mark_status_symbol_source('position', 'active exchange position')
+            return symbol
 
         scanner_symbol = getattr(engine, 'scanner_active_symbol', None) if engine else None
         if scanner_symbol:
+            _mark_status_symbol_source('scanner_lock', 'current scanner_active_symbol')
             return scanner_symbol
 
         next_symbol = None
@@ -32894,6 +32941,7 @@ class MainController:
             logger.warning(f"UTBreak next candidate status lookup failed: {exc}")
 
         if next_symbol:
+            _mark_status_symbol_source('live_candidate', 'selected CoinSelector candidate')
             return next_symbol
 
         if isinstance(self.status_data, dict):
@@ -32924,9 +32972,16 @@ class MainController:
                     status_symbols.append(symbol)
 
             if status_symbols:
-                return sorted(status_symbols, key=self._utbreakout_status_symbol_key)[0]
+                symbol = sorted(status_symbols, key=self._utbreakout_status_symbol_key)[0]
+                _mark_status_symbol_source('status_data_position', 'recent non-flat status_data')
+                return symbol
 
-        return self._get_current_symbol()
+        symbol = self._get_current_symbol()
+        _mark_status_symbol_source(
+            'watchlist_fallback_no_live_candidate',
+            'no position/scanner lock/CoinSelector candidate; using watchlist fallback',
+        )
+        return symbol
 
     async def reinit_exchange(self, target_mode):
         """거래소 연결 재초기화. 중복 전환 방지 + 실패 시 이전 상태 롤백."""

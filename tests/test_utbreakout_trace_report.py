@@ -286,7 +286,7 @@ def test_utbreakout_status_shows_active_short_required_gates_in_visible_body():
     visible_lines = [
         "실행 게이트",
         "LONG: 차단 - UTBot 방향 불일치: 현재 SHORT / bias SHORT",
-        "SHORT: 차단 - 상태조회 진단용: live scanner가 이 심볼을 선택하지 않음",
+        "SHORT: 차단 - 상태조회 진단용: 이 심볼은 현재 live 후보 아님",
         "",
         "요약 신호등",
         compact_long,
@@ -412,3 +412,54 @@ def test_execution_gate_display_prioritizes_root_blockers_over_downstream_noise(
     )
 
     assert "방향 필터 차단 (SHORT vs LONG)" in trade_direction_blockers
+
+    fallback_blockers = engine._format_utbreakout_execution_blockers_for_display(
+        "short",
+        short_lines,
+        {
+            "can_attempt": False,
+            "blockers": [
+                "status screen only; no live scanner candidate for this symbol",
+            ],
+        },
+    )
+    live_status_blockers = engine._format_utbreakout_execution_blockers_for_display(
+        "short",
+        short_lines,
+        {
+            "can_attempt": False,
+            "blockers": [
+                "status screen only; live scanner candidate, scanner loop must emit STATUS_READY",
+            ],
+        },
+    )
+
+    assert fallback_blockers == ["상태조회 진단용: 이 심볼은 현재 live 후보 아님"]
+    assert live_status_blockers == ["상태조회 진단용: 실제 주문은 live scanner 루프가 시도"]
+
+
+def test_position_scan_context_identifies_watchlist_fallback_reference_symbol():
+    engine = _build_trace_engine()
+    engine.utbreakout_status_symbol_source = "watchlist_fallback_no_live_candidate"
+
+    async def get_active_position_symbols(use_cache=False):
+        return set()
+
+    async def resolve_next_utbreakout_scan_candidate(excluded_symbols=None):
+        return None, None
+
+    engine.get_active_position_symbols = get_active_position_symbols
+    engine._resolve_next_utbreakout_scan_candidate = resolve_next_utbreakout_scan_candidate
+    engine._get_coin_selector_config = lambda: {"enabled": True}
+
+    lines = asyncio.run(
+        engine._build_utbreakout_position_scan_context_lines("DOGE/USDT:USDT")
+    )
+
+    assert "현재 포지션: 없음" in lines
+    assert "현재 live 후보: 없음" in lines
+    assert any(
+        "상태 화면 참고 심볼: DOGE/USDT:USDT" in line
+        and "watchlist 첫 항목" in line
+        for line in lines
+    )
