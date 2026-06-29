@@ -13806,15 +13806,11 @@ class SignalEngine(BaseEngine):
             if symbol_key in excluded_keys:
                 continue
 
-            if item.get('selection_state') not in (None, 'SELECTED') and not item.get('micro_accepted'):
-                continue
-
-            try:
-                cooldown_remaining, _ = self._coin_selector_cooldown_remaining(symbol, coin_cfg, now=now)
-            except Exception:
-                cooldown_remaining = 0
-
-            if cooldown_remaining > 0:
+            ok_market, _, _ = self._ensure_valid_utbreakout_market_symbol(
+                symbol,
+                source='resolve_next_scan_candidate',
+            )
+            if not ok_market:
                 continue
 
             next_candidate = item
@@ -21731,8 +21727,8 @@ class SignalEngine(BaseEngine):
                         else '; '.join(ev_candidate.blockers)
                     ),
                 })
+                result.setdefault('scanner_warnings', []).append("EV diagnostic only at scanner stage")
                 if not result['ev_allowed']:
-                    result['selection_state'] = 'WATCH_ONLY'
                     result.setdefault('soft_warnings', []).append('EV_EDGE_NOT_ACTIONABLE')
             return result
         except Exception as exc:
@@ -22091,7 +22087,7 @@ class SignalEngine(BaseEngine):
             report = await self.evaluate_coin_selector(force=False)
             candidates = [
                 item for item in report.get('selected', [])
-                if item.get('selection_state') == 'SELECTED'
+                if item.get('scanner_accepted', True)
             ]
         if scanner_active_strategy in UTBREAKOUT_STRATEGIES:
             allowed_candidates = []
@@ -22180,15 +22176,16 @@ class SignalEngine(BaseEngine):
                 cfg,
                 now=scan_started_at
             )
+            target_coin["cooldown_remaining"] = cooldown_remaining
+            target_coin.setdefault("scanner_warnings", []).append(f"cooldown remaining {cooldown_remaining:.0f}s")
             if cooldown_remaining > 0:
                 cooldown_reason = ''
                 if isinstance(cooldown_state, dict):
                     cooldown_reason = cooldown_state.get('last_reason') or ''
                 logger.info(
-                    f"CoinSelector skip {symbol}: candidate cooldown "
-                    f"{cooldown_remaining / 60.0:.1f}m remaining ({cooldown_reason})"
+                    f"CoinSelector cooldown noted for {symbol}: "
+                    f"{cooldown_remaining / 60.0:.1f}m remaining ({cooldown_reason}) - not blocked"
                 )
-                continue
             logger.info(
                 f"CoinSelector evaluating {symbol}: score={float(target_coin.get('score', 0) or 0):.1f}, "
                 f"Set{target_coin.get('auto_set_id')}, TF={target_coin.get('adaptive_tf')}"

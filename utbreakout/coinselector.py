@@ -256,31 +256,43 @@ def extract_ticker_metrics(symbol, ticker):
     }
 
 
+def _scanner_hard_reject_reason(candidate: dict, cfg: dict) -> str | None:
+    # A. Invalid market:
+    market = candidate.get("market")
+    symbol = candidate.get("symbol") or candidate.get("exchange_symbol")
+    if not market_is_usdt_perpetual(symbol, market):
+        return "INVALID_MARKET"
+    # B. Low 24h quote volume:
+    min_vol = finite_float(cfg.get("min_quote_volume_usdt"), 100_000_000.0)
+    if finite_float(candidate.get("quote_volume"), 0.0) < min_vol:
+        return "LOW_QUOTE_VOLUME"
+    # C. Low 24h trade count:
+    min_count = finite_int(cfg.get("min_trade_count"), 0)
+    trade_count = finite_int(candidate.get("trade_count"), 0)
+    if min_count > 0 and trade_count > 0 and trade_count < min_count:
+        return "LOW_TRADE_COUNT"
+    # D. Bad spread:
+    max_spread = finite_float(cfg.get("max_spread_pct"), 0.08)
+    spread = candidate.get("spread_pct")
+    if spread is not None and spread > max_spread:
+        return "BAD_SPREAD"
+    return None
+
+
 def build_base_candidate(symbol, ticker, market=None, cfg=None, sector_tags=None):
     cfg = {**default_coin_selector_config(), **(cfg or {})}
     metrics = extract_ticker_metrics(symbol, ticker)
     sector_tags = sorted(set(sector_tags if sector_tags is not None else sector_tags_for_symbol(symbol, cfg.get("sector_overrides"))))
-    excluded_sectors = {str(item).strip().lower() for item in cfg.get("excluded_sectors", [])}
-    blacklist = {normalize_symbol(item) for item in cfg.get("blacklist", [])}
-    reject_reasons = []
 
-    if not market_is_usdt_perpetual(symbol, market):
-        reject_reasons.append("REJECTED_NOT_USDT_PERPETUAL_TRADING")
-    if metrics["normalized_symbol"] in blacklist or metrics["base"] in blacklist:
-        reject_reasons.append("REJECTED_BLACKLIST")
-    if metrics["quote_volume"] < finite_float(cfg.get("min_quote_volume_usdt"), 100_000_000.0):
-        reject_reasons.append("REJECTED_VOLUME_LOW")
-    min_count = finite_int(cfg.get("min_trade_count"), 0)
-    if min_count > 0 and metrics["trade_count"] > 0 and metrics["trade_count"] < min_count:
-        reject_reasons.append("REJECTED_TRADE_COUNT_LOW")
-    max_spread = finite_float(cfg.get("max_spread_pct"), 0.08)
-    if metrics["spread_pct"] is not None and metrics["spread_pct"] > max_spread:
-        reject_reasons.append("REJECTED_SPREAD_WIDE")
-    max_abs_change = finite_float(cfg.get("max_abs_price_change_pct"), 0.0)
-    if max_abs_change > 0 and abs(metrics["percentage"]) > max_abs_change:
-        reject_reasons.append("REJECTED_PRICE_CHANGE_EXTREME")
-    if excluded_sectors.intersection(sector_tags):
-        reject_reasons.append("REJECTED_EXCLUDED_SECTOR")
+    # Scanner hard filters are intentionally limited to:
+    # valid USDT futures market, quote volume, trade count, and spread.
+    # Sector/category is informational only at scanner stage.
+    temp_cand = {**metrics, "market": market}
+    reject_reason = _scanner_hard_reject_reason(temp_cand, cfg)
+
+    reject_reasons = []
+    if reject_reason:
+        reject_reasons.append(reject_reason)
 
     metrics.update({
         "exchange_symbol": symbol,
@@ -288,6 +300,8 @@ def build_base_candidate(symbol, ticker, market=None, cfg=None, sector_tags=None
         "sector_tags": sector_tags,
         "accepted": not reject_reasons,
         "reject_reasons": reject_reasons,
+        "scanner_accepted": not reject_reasons,
+        "scanner_reject_reason": reject_reason,
     })
     return metrics
 
@@ -500,6 +514,7 @@ def finalize_candidate(
     cfg=None,
 ):
     cfg = {**default_coin_selector_config(), **(cfg or {})}
+    cfg.setdefault("scanner_min_score", 0.0)
     auto_scores = (auto_analysis or {}).get("scores", {}) if isinstance(auto_analysis, dict) else {}
     enriched_candidate = dict(candidate)
     if isinstance(selection_metrics, dict):
@@ -517,10 +532,13 @@ def finalize_candidate(
     result = dict(enriched_candidate)
     set_info = selected_set_info or {}
     adaptive_decision = adaptive_decision or {}
+    accepted_flag = candidate.get("accepted", False)
     result.update({
         "score": total,
         "component_scores": components,
-        "selection_state": "SELECTED" if candidate.get("accepted") and total >= finite_float(cfg.get("min_final_score"), 55.0) else "WATCH_ONLY",
+        "selection_state": "SELECTED" if accepted_flag else "WATCH_ONLY",
+        "scanner_accepted": accepted_flag,
+        "scanner_reject_reason": candidate.get("scanner_reject_reason"),
         "auto_set_id": finite_int(selected_set_id or auto_scores.get("auto_final_set_id"), None),
         "auto_set_name": set_info.get("name"),
         "auto_set_family": set_info.get("family"),
@@ -561,13 +579,12 @@ def finalize_candidate(
 
 
 def rank_candidates(candidates, top_n=10):
-    accepted = [
-        item
-        for item in candidates
-        if item.get("accepted") and item.get("ev_allowed", True) is not False
+    eligible = [
+        item for item in candidates
+        if item.get("scanner_accepted", item.get("accepted", False))
     ]
-    use_ev_edge = any(item.get("ev_net_edge_r") is not None for item in accepted)
-    accepted.sort(
+    use_ev_edge = any(item.get("ev_net_edge_r") is not None for item in eligible)
+    eligible.sort(
         key=lambda item: (
             finite_float(item.get("ev_net_edge_r"), float("-inf"))
             if use_ev_edge
@@ -578,7 +595,10 @@ def rank_candidates(candidates, top_n=10):
         ),
         reverse=True,
     )
-    return accepted[:max(1, int(top_n or 10))]
+    selected = eligible[:max(1, int(top_n or 10))]
+    for item in selected:
+        item["selection_state"] = "SELECTED"
+    return selected
 
 
 def detect_concentration(candidates, key="auto_set_id", threshold_pct=50.0):
@@ -645,4 +665,10 @@ def build_selection_report(candidates, rejects=None, *, top_n=10):
         "concentration_warning": concentration,
         "total_scored": len(candidates),
         "total_rejected": len(rejects or []),
+        "scanner_rules": [
+            "valid_usdt_perp",
+            "min_quote_volume",
+            "min_trade_count",
+            "max_spread",
+        ],
     }

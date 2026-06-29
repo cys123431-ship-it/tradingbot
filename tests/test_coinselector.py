@@ -7,6 +7,7 @@ from utbreakout.coinselector import (
     normalize_custom_symbols,
     rank_candidates,
     score_selection_quality,
+    _scanner_hard_reject_reason,
 )
 
 
@@ -61,17 +62,17 @@ def test_coinselector_rejects_low_volume_and_non_usdt_perpetual():
     coin_margin = build_base_candidate("BTC/USDC:USDC", _ticker(), _market(quote="USDC", settle="USDC"), cfg)
 
     assert low_volume["accepted"] is False
-    assert "REJECTED_VOLUME_LOW" in low_volume["reject_reasons"]
+    assert "LOW_QUOTE_VOLUME" in low_volume["reject_reasons"]
     assert coin_margin["accepted"] is False
-    assert "REJECTED_NOT_USDT_PERPETUAL_TRADING" in coin_margin["reject_reasons"]
+    assert "INVALID_MARKET" in coin_margin["reject_reasons"]
 
 
-def test_coinselector_rejects_default_excluded_sector():
+def test_coinselector_does_not_reject_default_excluded_sector():
     cfg = default_coin_selector_config()
     candidate = build_base_candidate("DOGE/USDT:USDT", _ticker(quoteVolume=500_000_000), _market(), cfg)
 
-    assert candidate["accepted"] is False
-    assert "REJECTED_EXCLUDED_SECTOR" in candidate["reject_reasons"]
+    assert candidate["accepted"] is True
+    assert "REJECTED_EXCLUDED_SECTOR" not in candidate["reject_reasons"]
 
 
 def test_coinselector_accepts_tradifi_usdt_perpetual():
@@ -86,7 +87,7 @@ def test_coinselector_accepts_tradifi_usdt_perpetual():
     assert candidate["accepted"] is True
     assert candidate["tradifi_perpetual"] is True
     assert market_is_tradifi_perpetual("EWY/USDT:USDT", _market(info={"contractType": "TRADIFI_PERPETUAL", "status": "TRADING"})) is True
-    assert "REJECTED_NOT_USDT_PERPETUAL_TRADING" not in candidate["reject_reasons"]
+    assert "INVALID_MARKET" not in candidate["reject_reasons"]
 
 
 def test_custom_symbols_normalize_and_dedupe_to_usdt_pairs():
@@ -113,14 +114,13 @@ def test_custom_discovery_relax_only_volume_and_trade_count():
     wide_spread = build_base_candidate("ABC/USDT:USDT", _ticker(quoteVolume=1_000, count=5, ask=101.0), _market(), relaxed_cfg)
 
     assert strict["accepted"] is False
-    assert "REJECTED_VOLUME_LOW" in strict["reject_reasons"]
+    assert "LOW_QUOTE_VOLUME" in strict["reject_reasons"]
     assert relaxed["accepted"] is True
     assert non_usdt["accepted"] is False
-    assert "REJECTED_NOT_USDT_PERPETUAL_TRADING" in non_usdt["reject_reasons"]
-    assert blacklisted["accepted"] is False
-    assert "REJECTED_BLACKLIST" in blacklisted["reject_reasons"]
+    assert "INVALID_MARKET" in non_usdt["reject_reasons"]
+    assert blacklisted["accepted"] is True  # Blacklist no longer a hard reject
     assert wide_spread["accepted"] is False
-    assert "REJECTED_SPREAD_WIDE" in wide_spread["reject_reasons"]
+    assert "BAD_SPREAD" in wide_spread["reject_reasons"]
 
 
 def test_coinselector_scores_utbreakout_set_and_adaptive_tf():
@@ -136,7 +136,7 @@ def test_coinselector_scores_utbreakout_set_and_adaptive_tf():
         cfg=cfg,
     )
 
-    assert result["score"] >= cfg["min_final_score"]
+    assert result["score"] >= 0.0
     assert result["auto_set_id"] == 22
     assert result["adaptive_tf"] == "30m"
     assert result["component_scores"]["utbreakout_regime"] > 15
@@ -191,11 +191,12 @@ def test_coinselector_report_detects_set_concentration():
     assert report["concentration_warning"]["share_pct"] == 100.0
 
 
-def test_coinselector_ranking_uses_ev_edge_and_excludes_non_actionable_candidates():
+def test_coinselector_ranking_uses_ev_edge_and_does_not_exclude_candidates():
     candidates = [
         {
             "symbol": "LEGACY/USDT",
             "accepted": True,
+            "scanner_accepted": True,
             "score": 92.0,
             "selection_state": "SELECTED",
             "rolling_sharpe": 2.0,
@@ -206,6 +207,7 @@ def test_coinselector_ranking_uses_ev_edge_and_excludes_non_actionable_candidate
         {
             "symbol": "EDGE/USDT",
             "accepted": True,
+            "scanner_accepted": True,
             "score": 72.0,
             "selection_state": "SELECTED",
             "rolling_sharpe": 1.0,
@@ -216,8 +218,9 @@ def test_coinselector_ranking_uses_ev_edge_and_excludes_non_actionable_candidate
         {
             "symbol": "BLOCKED/USDT",
             "accepted": True,
+            "scanner_accepted": True,
             "score": 99.0,
-            "selection_state": "WATCH_ONLY",
+            "selection_state": "SELECTED",
             "soft_warnings": ["EV_EDGE_NOT_ACTIONABLE"],
             "ev_reason": "no trend or squeeze edge",
             "ev_allowed": False,
@@ -227,12 +230,8 @@ def test_coinselector_ranking_uses_ev_edge_and_excludes_non_actionable_candidate
     ranked = rank_candidates(candidates, top_n=3)
     report = build_selection_report(candidates, [], top_n=3)
 
-    assert [item["symbol"] for item in ranked] == ["EDGE/USDT", "LEGACY/USDT"]
-    assert [item["symbol"] for item in report["selected"]] == ["EDGE/USDT", "LEGACY/USDT"]
-    assert report["watch_only"][0]["symbol"] == "BLOCKED/USDT"
-    assert report["actionability_counts"]["WATCH_ONLY"] == 1
-    assert report["watch_only_reason_counts"]["EV_EDGE_NOT_ACTIONABLE"] == 1
-    assert report["watch_only_reason_counts"]["no trend or squeeze edge"] == 1
+    assert "BLOCKED/USDT" in [item["symbol"] for item in ranked]
+    assert report["actionability_counts"]["SELECTED"] == 3
 
 
 def test_coinselector_selection_quality_rewards_persistent_implementable_momentum():
@@ -319,3 +318,118 @@ def test_coinselector_selection_quality_penalizes_short_rebound_risk():
     )
 
     assert calm_short > rebound_short
+
+
+# ----------------------------------------------------
+# TASK 12: New Scanner-specific Hard Filter Unit Tests
+# ----------------------------------------------------
+
+def test_scanner_does_not_reject_by_sector_category():
+    cfg = default_coin_selector_config()
+    candidate = build_base_candidate("DOGE/USDT:USDT", _ticker(quoteVolume=500_000_000), _market(), cfg)
+    assert candidate["scanner_accepted"] is True
+    result = finalize_candidate(candidate, auto_analysis=_auto_scores(), cfg=cfg)
+    assert result["selection_state"] == "SELECTED"
+
+
+def test_scanner_does_not_reject_by_24h_change():
+    cfg = default_coin_selector_config()
+    candidate = build_base_candidate("SOL/USDT:USDT", _ticker(quoteVolume=500_000_000, percentage=50.0), _market(), cfg)
+    assert candidate["scanner_accepted"] is True
+    result = finalize_candidate(candidate, auto_analysis=_auto_scores(), cfg=cfg)
+    assert result["selection_state"] == "SELECTED"
+
+
+def test_scanner_does_not_downgrade_for_ev_not_allowed():
+    cfg = default_coin_selector_config()
+    candidate = build_base_candidate("SOL/USDT:USDT", _ticker(quoteVolume=500_000_000), _market(), cfg)
+    result = finalize_candidate(candidate, auto_analysis=_auto_scores(), cfg=cfg)
+    result["ev_allowed"] = False
+    
+    ranked = rank_candidates([result], top_n=1)
+    assert len(ranked) == 1
+    assert ranked[0]["scanner_accepted"] is True
+    assert ranked[0]["selection_state"] == "SELECTED"
+
+
+def test_scanner_does_not_downgrade_for_adaptive_no_trade():
+    cfg = default_coin_selector_config()
+    candidate = build_base_candidate("SOL/USDT:USDT", _ticker(quoteVolume=500_000_000), _market(), cfg)
+    result = finalize_candidate(
+        candidate, 
+        auto_analysis=_auto_scores(), 
+        adaptive_decision={"selected_tf": None, "selected_score": 0.0, "decision": "NO_TRADE"},
+        cfg=cfg
+    )
+    
+    assert result["scanner_accepted"] is True
+    assert result["selection_state"] == "SELECTED"
+
+
+def test_scanner_candidate_cooldown_does_not_remove_candidate_from_selected():
+    cfg = default_coin_selector_config()
+    candidate = build_base_candidate("SOL/USDT:USDT", _ticker(quoteVolume=500_000_000), _market(), cfg)
+    result = finalize_candidate(candidate, auto_analysis=_auto_scores(), cfg=cfg)
+    result["cooldown_remaining"] = 1200.0
+    
+    ranked = rank_candidates([result], top_n=1)
+    assert len(ranked) == 1
+    assert ranked[0]["selection_state"] == "SELECTED"
+
+
+def test_scanner_selected_not_blocked_by_old_min_final_score():
+    cfg = default_coin_selector_config()
+    cfg["min_final_score"] = 99.0
+    candidate = build_base_candidate("SOL/USDT:USDT", _ticker(quoteVolume=500_000_000), _market(), cfg)
+    result = finalize_candidate(candidate, auto_analysis=_auto_scores(), cfg=cfg)
+    
+    assert result["scanner_accepted"] is True
+    assert result["selection_state"] == "SELECTED"
+
+
+def test_scanner_only_hard_rejects_valid_market_volume_trades_spread():
+    cfg = default_coin_selector_config()
+    
+    reject1 = build_base_candidate("BTC/USDC:USDC", _ticker(), _market(quote="USDC", settle="USDC"), cfg)
+    reject2 = build_base_candidate("SOL/USDT:USDT", _ticker(quoteVolume=1_000), _market(), cfg)
+    reject3 = build_base_candidate("SOL/USDT:USDT", _ticker(count=5), _market(), cfg)
+    reject4 = build_base_candidate("SOL/USDT:USDT", _ticker(ask=105.0), _market(), cfg)
+    
+    reject_reasons = (
+        reject1["reject_reasons"] +
+        reject2["reject_reasons"] +
+        reject3["reject_reasons"] +
+        reject4["reject_reasons"]
+    )
+    
+    assert set(reject_reasons) <= {
+        "INVALID_MARKET",
+        "LOW_QUOTE_VOLUME",
+        "LOW_TRADE_COUNT",
+        "BAD_SPREAD",
+    }
+
+
+def test_resolve_next_scan_candidate_ignores_diagnostic_warnings():
+    import emas
+    engine = object.__new__(emas.SignalEngine)
+    engine._utbreakout_status_symbol_key = lambda s: str(s).upper()
+    engine._ensure_valid_utbreakout_market_symbol = lambda s, source=None: (True, s, None)
+    engine.coin_selector_last_result = {
+        "selected": [
+            {
+                "symbol": "SOL/USDT",
+                "scanner_accepted": True,
+                "selection_state": "SELECTED",
+            }
+        ]
+    }
+    engine._get_coin_selector_config = lambda: {"enabled": True}
+    
+    async def run_test():
+        symbol, item = await engine._resolve_next_utbreakout_scan_candidate()
+        assert symbol == "SOL/USDT"
+        assert item["scanner_accepted"] is True
+
+    import asyncio
+    asyncio.run(run_test())
