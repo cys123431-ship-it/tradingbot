@@ -14229,7 +14229,7 @@ class SignalEngine(BaseEngine):
             _add("continuation entry disabled")
 
         if _raw_has("manual status only"):
-            _add("manual status only: live scanner 미선택")
+            _add("상태조회 진단용: live scanner가 이 심볼을 선택하지 않음")
         elif _raw_has("not live scanner context"):
             _add("live scanner context 아님")
 

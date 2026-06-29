@@ -286,7 +286,7 @@ def test_utbreakout_status_shows_active_short_required_gates_in_visible_body():
     visible_lines = [
         "실행 게이트",
         "LONG: 차단 - UTBot 방향 불일치: 현재 SHORT / bias SHORT",
-        "SHORT: 차단 - manual status only: live scanner 미선택",
+        "SHORT: 차단 - 상태조회 진단용: live scanner가 이 심볼을 선택하지 않음",
         "",
         "요약 신호등",
         compact_long,
