@@ -601,6 +601,36 @@ def detect_concentration(candidates, key="auto_set_id", threshold_pct=50.0):
 
 def build_selection_report(candidates, rejects=None, *, top_n=10):
     selected = rank_candidates(candidates, top_n)
+    selected_ids = {id(item) for item in selected}
+    watch_only = [
+        item
+        for item in candidates
+        if id(item) not in selected_ids and item.get("accepted")
+    ]
+    watch_only.sort(
+        key=lambda item: (
+            finite_float(item.get("score"), 0.0),
+            finite_float(item.get("rolling_sharpe"), 0.0),
+            finite_float(item.get("quote_volume"), 0.0),
+        ),
+        reverse=True,
+    )
+    actionability_counts = Counter()
+    watch_only_reason_counts = Counter()
+    for item in candidates:
+        state = item.get("selection_state") or ("ACCEPTED" if item.get("accepted") else "REJECTED")
+        actionability_counts[state] += 1
+        if item.get("accepted") and id(item) not in selected_ids:
+            reasons = []
+            if item.get("ev_allowed") is False:
+                reasons.append("EV_EDGE_NOT_ACTIONABLE")
+            reasons.extend(item.get("soft_warnings") or [])
+            if item.get("ev_reason"):
+                reasons.append(str(item.get("ev_reason"))[:160])
+            if not reasons:
+                reasons.append(state)
+            for reason in dict.fromkeys(reasons):
+                watch_only_reason_counts[reason] += 1
     reject_counts = Counter()
     for item in rejects or []:
         for reason in item.get("reject_reasons", []) or ["UNKNOWN"]:
@@ -608,6 +638,9 @@ def build_selection_report(candidates, rejects=None, *, top_n=10):
     concentration = detect_concentration(selected)
     return {
         "selected": selected,
+        "watch_only": watch_only[:max(1, int(top_n or 10))],
+        "actionability_counts": dict(actionability_counts),
+        "watch_only_reason_counts": dict(watch_only_reason_counts),
         "reject_counts": dict(reject_counts),
         "concentration_warning": concentration,
         "total_scored": len(candidates),

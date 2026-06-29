@@ -999,6 +999,37 @@ def test_scanner_scan_interval_is_configurable_and_bounded():
     assert engine._get_scanner_scan_interval_seconds({"scanner_scan_interval_seconds": "bad"}) == 60
 
 
+def test_coin_selector_no_actionable_summary_includes_watch_only_reasons():
+    from emas import SignalEngine
+
+    engine = object.__new__(SignalEngine)
+    report = {
+        "selected": [],
+        "watch_only": [
+            {
+                "normalized_symbol": "BTC/USDT",
+                "score": 74.2,
+                "selection_state": "WATCH_ONLY",
+                "ev_score": 51.0,
+                "ev_reason": "no trend or squeeze edge",
+            }
+        ],
+        "actionability_counts": {"WATCH_ONLY": 1},
+        "watch_only_reason_counts": {
+            "EV_EDGE_NOT_ACTIONABLE": 1,
+            "no trend or squeeze edge": 1,
+        },
+    }
+
+    summary = engine._format_coin_selector_no_actionable_summary(report)
+
+    assert "no actionable candidates" in summary
+    assert "watch_only=1" in summary
+    assert "BTC/USDT score=74.2" in summary
+    assert "EV_EDGE_NOT_ACTIONABLE=1" in summary
+    assert "no trend or squeeze edge" in summary
+
+
 def test_main_keyboard_removes_utbot_button():
     emas = _emas_module()
     controller = emas.MainController.__new__(emas.MainController)

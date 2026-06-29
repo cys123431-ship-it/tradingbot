@@ -192,38 +192,47 @@ def test_coinselector_report_detects_set_concentration():
 
 
 def test_coinselector_ranking_uses_ev_edge_and_excludes_non_actionable_candidates():
-    ranked = rank_candidates(
-        [
-            {
-                "symbol": "LEGACY/USDT",
-                "accepted": True,
-                "score": 92.0,
-                "rolling_sharpe": 2.0,
-                "quote_volume": 1_000_000_000,
-                "ev_allowed": True,
-                "ev_net_edge_r": 0.09,
-            },
-            {
-                "symbol": "EDGE/USDT",
-                "accepted": True,
-                "score": 72.0,
-                "rolling_sharpe": 1.0,
-                "quote_volume": 100_000_000,
-                "ev_allowed": True,
-                "ev_net_edge_r": 0.31,
-            },
-            {
-                "symbol": "BLOCKED/USDT",
-                "accepted": True,
-                "score": 99.0,
-                "ev_allowed": False,
-                "ev_net_edge_r": 0.50,
-            },
-        ],
-        top_n=3,
-    )
+    candidates = [
+        {
+            "symbol": "LEGACY/USDT",
+            "accepted": True,
+            "score": 92.0,
+            "selection_state": "SELECTED",
+            "rolling_sharpe": 2.0,
+            "quote_volume": 1_000_000_000,
+            "ev_allowed": True,
+            "ev_net_edge_r": 0.09,
+        },
+        {
+            "symbol": "EDGE/USDT",
+            "accepted": True,
+            "score": 72.0,
+            "selection_state": "SELECTED",
+            "rolling_sharpe": 1.0,
+            "quote_volume": 100_000_000,
+            "ev_allowed": True,
+            "ev_net_edge_r": 0.31,
+        },
+        {
+            "symbol": "BLOCKED/USDT",
+            "accepted": True,
+            "score": 99.0,
+            "selection_state": "WATCH_ONLY",
+            "soft_warnings": ["EV_EDGE_NOT_ACTIONABLE"],
+            "ev_reason": "no trend or squeeze edge",
+            "ev_allowed": False,
+            "ev_net_edge_r": 0.50,
+        },
+    ]
+    ranked = rank_candidates(candidates, top_n=3)
+    report = build_selection_report(candidates, [], top_n=3)
 
     assert [item["symbol"] for item in ranked] == ["EDGE/USDT", "LEGACY/USDT"]
+    assert [item["symbol"] for item in report["selected"]] == ["EDGE/USDT", "LEGACY/USDT"]
+    assert report["watch_only"][0]["symbol"] == "BLOCKED/USDT"
+    assert report["actionability_counts"]["WATCH_ONLY"] == 1
+    assert report["watch_only_reason_counts"]["EV_EDGE_NOT_ACTIONABLE"] == 1
+    assert report["watch_only_reason_counts"]["no trend or squeeze edge"] == 1
 
 
 def test_coinselector_selection_quality_rewards_persistent_implementable_momentum():

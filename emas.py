@@ -13894,6 +13894,43 @@ class SignalEngine(BaseEngine):
             lines.append(f"다음 후보 선택 이유: {self._format_coin_selector_candidate_reason(next_candidate)}")
         elif bool(coin_cfg.get('enabled', False)):
             lines.append("다음 스캔 후보: 없음 또는 후보 쿨다운/대기")
+            report = (
+                self.coin_selector_last_result
+                if isinstance(getattr(self, 'coin_selector_last_result', None), dict)
+                else {}
+            )
+            watch_only = list(report.get('watch_only') or [])
+            if watch_only:
+                preview_parts = []
+                for item in watch_only[:3]:
+                    preview_symbol = (
+                        item.get('normalized_symbol')
+                        or item.get('exchange_symbol')
+                        or item.get('symbol')
+                    )
+                    ev_reason = str(item.get('ev_reason') or '').replace('\n', ' ')
+                    if len(ev_reason) > 45:
+                        ev_reason = ev_reason[:42] + "..."
+                    preview_parts.append(
+                        f"{preview_symbol} {float(item.get('score', 0) or 0):.1f}점 "
+                        f"{item.get('selection_state') or 'WATCH_ONLY'}"
+                        + (f"({ev_reason})" if ev_reason else "")
+                    )
+                lines.append(
+                    "상위 감시 후보(진입 차단): "
+                    + " / ".join(preview_parts)
+                )
+            reason_counts = report.get('watch_only_reason_counts') if isinstance(report, dict) else {}
+            if reason_counts:
+                reason_preview = ", ".join(
+                    f"{reason} {count}"
+                    for reason, count in sorted(
+                        reason_counts.items(),
+                        key=lambda item: item[1],
+                        reverse=True,
+                    )[:3]
+                )
+                lines.append(f"후보 차단 요약: {reason_preview}")
         else:
             lines.append("다음 스캔 후보: CoinSelector OFF")
 
@@ -21892,7 +21929,8 @@ class SignalEngine(BaseEngine):
                 2,
             )
         self.coin_selector_symbol_scores = {}
-        for item in selected:
+        score_items = list(selected) + list(report.get('watch_only') or [])
+        for item in score_items:
             for key in (item.get('normalized_symbol'), item.get('exchange_symbol')):
                 if key:
                     self.coin_selector_symbol_scores[key] = item
@@ -21919,6 +21957,50 @@ class SignalEngine(BaseEngine):
             f"CoinSelector: {float(item.get('score', 0.0) or 0.0):.1f}점 / "
             f"Set{item.get('auto_set_id') or '?'} / TF {item.get('adaptive_tf') or 'n/a'} / "
             f"{item.get('selection_state', 'WATCH')}"
+        )
+
+    def _format_coin_selector_no_actionable_summary(self, report, limit=3):
+        if not isinstance(report, dict):
+            return "CoinSelector scanner: no actionable candidates (no report)."
+        selected_count = len(report.get('selected') or [])
+        watch_only = list(report.get('watch_only') or [])
+        actionability = report.get('actionability_counts') or {}
+        reason_counts = report.get('watch_only_reason_counts') or {}
+        reason_text = ", ".join(
+            f"{reason}={count}"
+            for reason, count in sorted(
+                reason_counts.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:limit]
+        ) or "n/a"
+        top_parts = []
+        for item in watch_only[:limit]:
+            symbol = (
+                item.get('normalized_symbol')
+                or item.get('exchange_symbol')
+                or item.get('symbol')
+            )
+            score = float(item.get('score', 0.0) or 0.0)
+            state = item.get('selection_state') or 'WATCH_ONLY'
+            ev_score = item.get('ev_score')
+            ev_score_text = (
+                f"{float(ev_score):.1f}"
+                if self._is_valid_number(ev_score)
+                else "n/a"
+            )
+            ev_reason = str(item.get('ev_reason') or '').replace('\n', ' ')
+            if len(ev_reason) > 80:
+                ev_reason = ev_reason[:77] + "..."
+            top_parts.append(
+                f"{symbol} score={score:.1f} state={state} "
+                f"ev={ev_score_text} reason={ev_reason or 'n/a'}"
+            )
+        top_text = " | ".join(top_parts) or "none"
+        return (
+            "CoinSelector scanner: no actionable candidates "
+            f"(selected={selected_count}, watch_only={len(watch_only)}, "
+            f"states={actionability}, reasons={reason_text}; top={top_text})"
         )
 
     async def _scan_and_trade_coin_selector(self):
@@ -21967,7 +22049,7 @@ class SignalEngine(BaseEngine):
                 allowed_candidates.append(item)
             candidates = allowed_candidates
         if not candidates:
-            logger.info("CoinSelector scanner: no selected candidates.")
+            logger.info(self._format_coin_selector_no_actionable_summary(report))
             return
 
         log_lines = ["🧭 [CoinSelector] Top candidates:"]
