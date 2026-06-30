@@ -14982,7 +14982,6 @@ class SignalEngine(BaseEngine):
                 limit=300
             )
         else:
-            import time
             now = int(time.time() * 1000)
             ohlcv = []
             for i in range(20):
@@ -15073,7 +15072,6 @@ class SignalEngine(BaseEngine):
                     limit=300
                 )
             else:
-                import time
                 now = int(time.time() * 1000)
                 htf_ohlcv = []
                 for i in range(250):
