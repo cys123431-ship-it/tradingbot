@@ -837,6 +837,15 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "market_quality_long_multi_adverse_max_multiplier": 0.35,
         "market_quality_min_risk_multiplier": 0.0,
         "final_risk_multiplier_floor": 0.0,
+        "entry_quality_gate_enabled": True,
+        "entry_quality_gate_min_final_risk_multiplier": 0.35,
+        "entry_quality_gate_long_min_final_risk_multiplier": 0.40,
+        "entry_quality_gate_short_min_final_risk_multiplier": 0.35,
+        "entry_quality_gate_hard_market_multiplier_below": 0.25,
+        "entry_quality_gate_min_ev_score": 58.0,
+        "entry_quality_gate_min_ev_probability": 0.53,
+        "entry_quality_gate_min_ev_net_expectancy_r": 0.18,
+        "entry_quality_gate_min_ev_mtf_votes": 2,
         "aggressive_growth_enabled": False,
         "aggressive_growth_pyramiding_enabled": False,
 
@@ -1214,6 +1223,15 @@ def apply_stable_utbreak_final_overrides(cfg):
         "market_quality_long_multi_adverse_max_multiplier": 0.35,
         "market_quality_min_risk_multiplier": 0.0,
         "final_risk_multiplier_floor": 0.0,
+        "entry_quality_gate_enabled": True,
+        "entry_quality_gate_min_final_risk_multiplier": 0.35,
+        "entry_quality_gate_long_min_final_risk_multiplier": 0.40,
+        "entry_quality_gate_short_min_final_risk_multiplier": 0.35,
+        "entry_quality_gate_hard_market_multiplier_below": 0.25,
+        "entry_quality_gate_min_ev_score": 58.0,
+        "entry_quality_gate_min_ev_probability": 0.53,
+        "entry_quality_gate_min_ev_net_expectancy_r": 0.18,
+        "entry_quality_gate_min_ev_mtf_votes": 2,
 
         # Set32 keeps structure confirmation with more tolerant flow inputs.
         "set32_min_relative_volume": 1.15,
@@ -1647,6 +1665,14 @@ def build_utbreakout_effective_config_diff_text(raw_cfg, effective_cfg):
         'market_quality_long_hard_block_on_multi_adverse_enabled',
         'market_quality_long_multi_adverse_min_reasons',
         'market_quality_long_multi_adverse_max_multiplier',
+        'entry_quality_gate_enabled',
+        'entry_quality_gate_min_final_risk_multiplier',
+        'entry_quality_gate_long_min_final_risk_multiplier',
+        'entry_quality_gate_short_min_final_risk_multiplier',
+        'entry_quality_gate_min_ev_score',
+        'entry_quality_gate_min_ev_probability',
+        'entry_quality_gate_min_ev_net_expectancy_r',
+        'entry_quality_gate_min_ev_mtf_votes',
         'ev_min_entry_score',
         'ev_min_net_expectancy_r',
         'ev_no_edge_relief_enabled',
@@ -1918,6 +1944,15 @@ def build_default_utbot_filtered_breakout_config():
         'market_quality_long_hard_block_on_multi_adverse_enabled': False,
         'market_quality_long_multi_adverse_min_reasons': 5,
         'market_quality_long_multi_adverse_max_multiplier': 0.35,
+        'entry_quality_gate_enabled': True,
+        'entry_quality_gate_min_final_risk_multiplier': 0.35,
+        'entry_quality_gate_long_min_final_risk_multiplier': 0.40,
+        'entry_quality_gate_short_min_final_risk_multiplier': 0.35,
+        'entry_quality_gate_hard_market_multiplier_below': 0.25,
+        'entry_quality_gate_min_ev_score': 58.0,
+        'entry_quality_gate_min_ev_probability': 0.53,
+        'entry_quality_gate_min_ev_net_expectancy_r': 0.18,
+        'entry_quality_gate_min_ev_mtf_votes': 2,
         'market_quality_high_atr_pct': 1.5,
         'market_quality_extreme_atr_pct': 2.5,
         'market_quality_adverse_funding_soft': 0.0006,
@@ -6435,6 +6470,13 @@ class SignalEngine(BaseEngine):
             'market_quality_adverse_funding_soft': 0.0006,
             'market_quality_adverse_funding_hard': 0.0015,
             'market_quality_long_multi_adverse_max_multiplier': 0.35,
+            'entry_quality_gate_min_final_risk_multiplier': 0.35,
+            'entry_quality_gate_long_min_final_risk_multiplier': 0.40,
+            'entry_quality_gate_short_min_final_risk_multiplier': 0.35,
+            'entry_quality_gate_hard_market_multiplier_below': 0.25,
+            'entry_quality_gate_min_ev_score': 58.0,
+            'entry_quality_gate_min_ev_probability': 0.53,
+            'entry_quality_gate_min_ev_net_expectancy_r': 0.18,
             'market_quality_regime_strong_move_pct': 1.5,
             'squeeze_volume_ratio_min': 1.20,
             'runner_structure_buffer_atr': 0.20,
@@ -6558,6 +6600,7 @@ class SignalEngine(BaseEngine):
             'opposite_set_exit_min_hold_candles': 3,
             'multiple_testing_free_trials': 25,
             'market_quality_long_multi_adverse_min_reasons': 5,
+            'entry_quality_gate_min_ev_mtf_votes': 2,
             'set32_orderflow_min_samples': 2,
             'adaptive_timeframe_min_hold_candles': 6,
             'shadow_triple_barrier_max_bars': 24,
@@ -9563,6 +9606,151 @@ class SignalEngine(BaseEngine):
         except Exception:
             logger.exception("UTBreakout entry watchdog failed")
             return False
+
+    def _evaluate_utbreakout_entry_quality_gate(
+        self,
+        side,
+        cfg,
+        *,
+        final_risk_multiplier,
+        market_quality=None,
+        ev_decision=None,
+        ev_net=None,
+        ev_exit=None,
+    ):
+        """Execution-only quality gate for already-selected UTBreakout candidates."""
+        cfg = cfg if isinstance(cfg, dict) else {}
+        if not bool(cfg.get('entry_quality_gate_enabled', True)):
+            return True, "OFF"
+
+        side = str(side or '').lower()
+        if side not in {'long', 'short'}:
+            return False, "BLOCK: invalid side"
+
+        def _cfg_float(key, default):
+            try:
+                return float(cfg.get(key, default))
+            except (TypeError, ValueError):
+                return float(default)
+
+        def _cfg_int(key, default):
+            try:
+                return int(float(cfg.get(key, default)))
+            except (TypeError, ValueError):
+                return int(default)
+
+        def _num(value, default=None):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return default
+            if not np.isfinite(value):
+                return default
+            return value
+
+        def _attr(obj, name, default=None):
+            if obj is None:
+                return default
+            if isinstance(obj, dict):
+                return obj.get(name, default)
+            return getattr(obj, name, default)
+
+        def _mtf_votes(value):
+            text = str(value or '').strip()
+            match = re.match(r"^\s*(\d+)\s*/\s*(\d+)\s*$", text)
+            if not match:
+                return None, None
+            return int(match.group(1)), int(match.group(2))
+
+        final_multiplier = max(0.0, min(1.0, _num(final_risk_multiplier, 0.0)))
+        base_min = _cfg_float('entry_quality_gate_min_final_risk_multiplier', 0.35)
+        min_final = _cfg_float(
+            f'entry_quality_gate_{side}_min_final_risk_multiplier',
+            base_min,
+        )
+        min_final = max(0.0, min(1.0, min_final))
+
+        blockers = []
+        if final_multiplier + 1e-12 < min_final:
+            blockers.append(
+                f"final risk multiplier x{final_multiplier:.3f}<x{min_final:.2f}"
+            )
+
+        market_quality = market_quality if isinstance(market_quality, dict) else {}
+        market_multiplier = max(
+            0.0,
+            min(1.0, _num(market_quality.get('risk_multiplier'), 1.0)),
+        )
+        market_floor = max(
+            0.0,
+            min(1.0, _cfg_float('entry_quality_gate_hard_market_multiplier_below', 0.25)),
+        )
+        if market_quality.get('hard_block') or market_quality.get('state') is False:
+            blockers.append("market quality hard block")
+        elif market_multiplier + 1e-12 < market_floor:
+            blockers.append(
+                f"market quality x{market_multiplier:.2f}<x{market_floor:.2f}"
+            )
+
+        ev_parts = []
+        if ev_decision is not None:
+            ev_allowed = bool(_attr(ev_decision, 'allowed', False))
+            ev_mode = str(_attr(ev_decision, 'mode', 'EV') or 'EV')
+            ev_score = _num(_attr(ev_decision, 'score'), 0.0)
+            ev_probability = _num(_attr(ev_decision, 'win_probability'), 0.0)
+            ev_net_r = _num(_attr(ev_net, 'expected_net_r'), None)
+            mtf_alignment = _attr(ev_decision, 'mtf_alignment', 'n/a')
+            mtf_votes, mtf_total = _mtf_votes(mtf_alignment)
+
+            if not ev_allowed:
+                blockers.append(f"EV {ev_mode} not allowed")
+
+            min_ev_score = _cfg_float('entry_quality_gate_min_ev_score', 58.0)
+            if ev_score + 1e-12 < min_ev_score:
+                blockers.append(f"EV score {ev_score:.1f}<{min_ev_score:.1f}")
+            ev_parts.append(f"score {ev_score:.1f}")
+
+            min_ev_probability = _cfg_float(
+                'entry_quality_gate_min_ev_probability',
+                0.53,
+            )
+            if ev_probability + 1e-12 < min_ev_probability:
+                blockers.append(
+                    f"EV p {ev_probability:.2f}<{min_ev_probability:.2f}"
+                )
+            ev_parts.append(f"p {ev_probability:.2f}")
+
+            min_ev_net = _cfg_float(
+                'entry_quality_gate_min_ev_net_expectancy_r',
+                0.18,
+            )
+            if ev_net_r is not None:
+                if ev_net_r + 1e-12 < min_ev_net:
+                    blockers.append(f"EV net {ev_net_r:.3f}R<{min_ev_net:.2f}R")
+                ev_parts.append(f"net {ev_net_r:.3f}R")
+
+            if ev_exit is not None and not bool(_attr(ev_exit, 'executable', True)):
+                blockers.append("exit ladder not executable")
+
+            min_mtf_votes = max(0, _cfg_int('entry_quality_gate_min_ev_mtf_votes', 2))
+            if mtf_total and mtf_votes is not None:
+                if mtf_votes < min_mtf_votes:
+                    blockers.append(
+                        f"MTF {mtf_votes}/{mtf_total}<{min_mtf_votes}/{mtf_total}"
+                    )
+                ev_parts.append(f"MTF {mtf_votes}/{mtf_total}")
+
+        if blockers:
+            return False, "BLOCK: " + "; ".join(blockers[:5])
+
+        state = 'reduced' if final_multiplier < 0.999 else True
+        detail_parts = [
+            f"PASS final x{final_multiplier:.3f}>=x{min_final:.2f}",
+            f"market x{market_multiplier:.2f}",
+        ]
+        if ev_parts:
+            detail_parts.append("EV " + ", ".join(ev_parts[:4]))
+        return state, "; ".join(detail_parts)
 
     def _build_utbreakout_execution_eligibility(
         self,
@@ -15431,6 +15619,8 @@ class SignalEngine(BaseEngine):
             ]
 
             ev_status_decision = None
+            ev_status_net = None
+            ev_status_exit = None
             if bool(cfg.get('ev_adaptive_enabled', False)):
                 ev_status_decision = evaluate_ev_adaptive_entry(
                     side=side,
@@ -15529,6 +15719,18 @@ class SignalEngine(BaseEngine):
 
             base_max_risk = float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
             effective_max_risk = base_max_risk * final_risk_multiplier_status
+            entry_quality_state, entry_quality_detail = (
+                self._evaluate_utbreakout_entry_quality_gate(
+                    side,
+                    cfg,
+                    final_risk_multiplier=final_risk_multiplier_status,
+                    market_quality=market_quality,
+                    ev_decision=ev_status_decision,
+                    ev_net=ev_status_net,
+                    ev_exit=ev_status_exit,
+                )
+            )
+            core_items.append(("Entry Quality Gate", entry_quality_state, entry_quality_detail))
             core_items.extend([
                 ("일일 리스크", daily_ok, daily_detail),
                 ("ATR 손절/RR/수량", risk_ok, balance_detail),
@@ -16823,6 +17025,18 @@ class SignalEngine(BaseEngine):
 
             base_max_risk = float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
             effective_max_risk = base_max_risk * final_risk_multiplier_status
+            entry_quality_state, entry_quality_detail = (
+                self._evaluate_utbreakout_entry_quality_gate(
+                    side,
+                    cfg,
+                    final_risk_multiplier=final_risk_multiplier_status,
+                    market_quality=market_quality,
+                    ev_decision=ev_status_decision,
+                    ev_net=ev_status_net,
+                    ev_exit=ev_status_exit,
+                )
+            )
+            core_items.append(("Entry Quality Gate", entry_quality_state, entry_quality_detail))
             core_items.extend([
                 ("일일 리스크", daily_ok, daily_detail),
                 ("ATR 손절/RR/수량", risk_ok, balance_detail),
@@ -36543,6 +36757,14 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 'ev_short_no_edge_relief_min_range_expansion',
                 'ev_short_conditional_relief_risk_cap',
                 'ev_short_relaxed_signal_risk_cap',
+                'entry_quality_gate_enabled',
+                'entry_quality_gate_min_final_risk_multiplier',
+                'entry_quality_gate_long_min_final_risk_multiplier',
+                'entry_quality_gate_short_min_final_risk_multiplier',
+                'entry_quality_gate_min_ev_score',
+                'entry_quality_gate_min_ev_probability',
+                'entry_quality_gate_min_ev_net_expectancy_r',
+                'entry_quality_gate_min_ev_mtf_votes',
                 'trend_continuation_entry_enabled',
                 'trend_continuation_base_risk_multiplier',
                 'trend_continuation_min_risk_multiplier',
