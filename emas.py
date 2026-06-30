@@ -4749,7 +4749,7 @@ class SignalEngine(BaseEngine):
             return False, ""
             
         reason = record.get("reason", "UNKNOWN")
-        return True, f"당일 SL lockout: {reason} today (daily SL lockout)"
+        return True, f"당일 SL lockout / protection lockout: {reason} today (daily SL lockout)"
 
     def _save_utbreakout_daily_sl_lockouts(self):
         try:
@@ -28863,6 +28863,40 @@ class SignalEngine(BaseEngine):
                     issue_message,
                     cooldown_sec=30 * 24 * 60 * 60
                 )
+            protection_lockout_reason = None
+            protection_label = None
+            if confirmed and active_strategy in UTBREAKOUT_STRATEGIES:
+                if status.get('missing_sl'):
+                    protection_lockout_reason = "STOP_LOSS_PROTECTION_FAILED_FORCE_CLOSED"
+                    protection_label = "SL"
+                elif (
+                    status.get('missing_tp')
+                    or status.get('missing_tp1')
+                    or status.get('missing_tp2')
+                ):
+                    protection_lockout_reason = "TAKE_PROFIT_PROTECTION_FAILED_FORCE_CLOSED"
+                    protection_label = "TP"
+            if protection_lockout_reason:
+                close_status = await self._emergency_close_position_without_stop_loss(
+                    symbol,
+                    reason=(
+                        f"{protection_label} protection missing confirmed after entry: "
+                        f"{issue_key}"
+                    ),
+                    max_attempts=5,
+                    lockout_reason=protection_lockout_reason,
+                    protection_label=protection_label,
+                    critical_pause_reason_code=(
+                        "SL_FAILED_AND_EMERGENCY_CLOSE_FAILED"
+                        if protection_label == "SL"
+                        else "TP_FAILED_AND_EMERGENCY_CLOSE_FAILED"
+                    ),
+                )
+                status['emergency_close_status'] = close_status.get('status')
+                status['emergency_close_closed'] = bool(close_status.get('closed'))
+                status['daily_lockout_reason'] = (
+                    protection_lockout_reason if close_status.get('closed') else None
+                )
         else:
             if getattr(self, 'protection_missing_candidates', {}).get(symbol):
                 logger.info(f"Protection audit recovered: {symbol} SL/TP present")
@@ -28911,7 +28945,10 @@ class SignalEngine(BaseEngine):
         symbol,
         *,
         reason='SL placement failed',
-        max_attempts=5
+        max_attempts=5,
+        lockout_reason="STOP_LOSS_PROTECTION_FAILED_FORCE_CLOSED",
+        protection_label="SL",
+        critical_pause_reason_code="SL_FAILED_AND_EMERGENCY_CLOSE_FAILED",
     ):
         status = {
             'status': 'SKIPPED',
@@ -28964,7 +29001,7 @@ class SignalEngine(BaseEngine):
             except Exception as close_error:
                 last_error = close_error
                 logger.error(
-                    f"Emergency close after SL failure attempt {attempt}/{total_attempts} "
+                    f"Emergency close after {protection_label} failure attempt {attempt}/{total_attempts} "
                     f"failed for {symbol}: {close_error}"
                 )
                 if attempt < total_attempts:
@@ -28985,7 +29022,7 @@ class SignalEngine(BaseEngine):
                     self._record_utbreakout_daily_sl_lockout(
                         symbol,
                         side=side,
-                        reason="STOP_LOSS_PROTECTION_FAILED_FORCE_CLOSED",
+                        reason=lockout_reason,
                         detail=(
                             f"{reason}; emergency close qty={qty}; "
                             f"attempt={attempt}/{total_attempts}"
@@ -28999,12 +29036,12 @@ class SignalEngine(BaseEngine):
                     )
                 status.update({'status': 'EMERGENCY_CLOSED', 'closed': True})
                 await self.ctrl.notify(
-                    f"🚨 {self.ctrl.format_symbol_for_display(symbol)} SL 생성 실패로 포지션을 즉시 시장가 청산했습니다."
+                    f"🚨 {self.ctrl.format_symbol_for_display(symbol)} {protection_label} 생성 실패로 포지션을 즉시 시장가 청산했습니다."
                 )
                 return status
 
             logger.warning(
-                f"Emergency close order accepted but position still open after SL failure: "
+                f"Emergency close order accepted but position still open after {protection_label} failure: "
                 f"{symbol} {remaining.get('side')} {remaining.get('contracts')}"
             )
 
@@ -29017,7 +29054,7 @@ class SignalEngine(BaseEngine):
         try:
             write_critical_pause_state(
                 symbol=symbol,
-                reason="SL_FAILED_AND_EMERGENCY_CLOSE_FAILED",
+                reason=critical_pause_reason_code,
                 exception=last_error if last_error else RuntimeError("position still open"),
                 cfg=self.get_runtime_common_settings() if hasattr(self, "get_runtime_common_settings") else None,
             )
@@ -29025,7 +29062,7 @@ class SignalEngine(BaseEngine):
             logger.error(f"Failed to persist CRITICAL_PAUSED state for {symbol}: {persist_error}")
 
         try:
-            self.critical_pause_reason = f"Emergency close failed after SL placement failure: {status['error']}"
+            self.critical_pause_reason = f"Emergency close failed after {protection_label} placement failure: {status['error']}"
             self.critical_pause_status = dict(status)
             if getattr(self, 'ctrl', None) is not None and hasattr(self.ctrl, 'is_paused'):
                 self.ctrl.is_paused = True
@@ -29035,7 +29072,7 @@ class SignalEngine(BaseEngine):
         if audit_fetch_ok:
             await self._audit_protection_orders(symbol, pos=audit_pos, alert=True)
         await self.ctrl.notify(
-            f"🚨 {self.ctrl.format_symbol_for_display(symbol)} SL 생성 실패 후 긴급 청산도 실패했습니다. "
+            f"🚨 {self.ctrl.format_symbol_for_display(symbol)} {protection_label} 생성 실패 후 긴급 청산도 실패했습니다. "
             f"CRITICAL_PAUSED 상태로 전환했습니다. 거래소에서 즉시 수동 청산하세요: {status['error']}"
         )
         return status
@@ -43056,6 +43093,8 @@ async def _audit_and_repair_live_ladder_protection(self, symbol, pos, state, cfg
     )
     if collapse:
         audit["tp_min_amount_fallback"] = collapse
+    if audit.get("emergency_close_status"):
+        return audit
     if audit.get("missing_sl") or audit.get("sl_qty_mismatch"):
         stop_price = float((state or {}).get("last_stop_price") or (state or {}).get("initial_stop_price") or 0.0)
         if stop_price > 0:
