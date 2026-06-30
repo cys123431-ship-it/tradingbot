@@ -40,12 +40,14 @@ def test_profit_opportunity_effective_profile_overrides_old_values():
     assert out["selected_set_core_filter_hard_block_enabled"] is False
     assert out["atr_trailing_enabled"] is True
     assert out["runner_exit_enabled"] is True
-    assert out["ev_short_min_entry_score"] == 52.0
-    assert out["ev_short_trend_min_adx"] == 14.0
-    assert out["ev_short_trend_min_volume_ratio"] == 0.50
-    assert out["ev_short_no_edge_relief_min_score"] == 63.0
-    assert out["ev_short_conditional_relief_risk_cap"] == 0.35
-    assert out["ev_short_relaxed_signal_risk_cap"] == 0.45
+    assert out["ev_min_entry_score"] == 57.0
+    assert out["entry_quality_gate_min_ev_score"] == 60.0
+    assert out["ev_short_min_entry_score"] == 57.0
+    assert out["ev_short_trend_min_adx"] == 16.0
+    assert out["ev_short_trend_min_volume_ratio"] == 0.60
+    assert out["ev_short_no_edge_relief_min_score"] == 68.0
+    assert out["ev_short_conditional_relief_risk_cap"] == 0.30
+    assert out["ev_short_relaxed_signal_risk_cap"] == 0.30
 
 
 def test_runtime_config_path_reapplies_effective_profile_after_persisted_values():
@@ -87,12 +89,15 @@ def test_ev_runtime_config_maps_short_relaxation_keys():
 
     runtime = emas._ev_adaptive_runtime_config(cfg)
 
-    assert runtime["short_min_entry_score"] == 52.0
-    assert runtime["short_trend_min_adx"] == 14.0
-    assert runtime["short_trend_min_volume_ratio"] == 0.50
-    assert runtime["short_no_edge_relief_min_score"] == 63.0
-    assert runtime["short_conditional_relief_risk_cap"] == 0.35
-    assert runtime["short_relaxed_signal_risk_cap"] == 0.45
+    assert runtime["min_entry_score"] == 57.0
+    assert runtime["continuation_max_signal_age_bars"] == 8.0
+    assert runtime["short_min_entry_score"] == 57.0
+    assert runtime["short_trend_min_adx"] == 16.0
+    assert runtime["short_trend_min_volume_ratio"] == 0.60
+    assert runtime["short_no_edge_relief_min_score"] == 68.0
+    assert runtime["short_conditional_relief_risk_cap"] == 0.30
+    assert runtime["short_relaxed_signal_risk_cap"] == 0.30
+    assert runtime["derivatives_multi_adverse_block_enabled"] is True
 
 
 def test_status_render_contract_replaces_stale_telegram_summary_values():

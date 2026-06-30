@@ -75,7 +75,7 @@ def test_short_momentum_is_blocked_during_panic_rebound():
     assert any("panic rebound" in blocker for blocker in decision.blockers)
 
 
-def test_short_relaxation_allows_small_aligned_downtrend_size():
+def test_short_relaxation_blocks_weak_aligned_downtrend_size():
     decision = evaluate_ev_adaptive_entry(
         side="short",
         candidate_type="fresh_signal",
@@ -109,10 +109,9 @@ def test_short_relaxation_allows_small_aligned_downtrend_size():
         },
     )
 
-    assert decision.allowed is True
-    assert decision.mode == "TREND"
-    assert decision.risk_multiplier <= 0.45
-    assert "short relaxation risk cap" in decision.reasons
+    assert decision.allowed is False
+    assert decision.mode == "NO_TRADE"
+    assert decision.risk_multiplier == 0
 
 
 def test_short_relaxation_does_not_override_rebound_protection():
@@ -508,7 +507,7 @@ def test_mtf_one_of_three_can_be_relieved_by_strong_breakout_substitute():
     assert 0 < decision.risk_multiplier <= 0.55
 
 
-def test_stale_continuation_can_be_conditionally_relieved_with_size_cap():
+def test_stale_continuation_can_be_conditionally_relieved_when_reacceleration_requirement_disabled():
     decision = evaluate_ev_adaptive_entry(
         side="long",
         candidate_type="bias_continuation",
@@ -534,6 +533,7 @@ def test_stale_continuation_can_be_conditionally_relieved_with_size_cap():
                 "1h": {"ema_bias": "short"},
             },
         },
+        config={"stale_relief_requires_reacceleration": False},
     )
     assert decision.allowed is True
     assert not any("stale continuation" in blocker for blocker in decision.blockers)
@@ -601,6 +601,7 @@ def test_conditional_relief_does_not_bypass_extreme_volatility_or_spread():
                 "1h": {"ema_bias": "long"},
             },
         },
+        config={"min_entry_score": 78.0},
     )
     assert decision.allowed is False
     assert any("spread" in blocker or "extreme volatility" in blocker for blocker in decision.blockers)
@@ -772,6 +773,137 @@ def test_opposite_orderflow_reduces_otherwise_valid_entry():
     assert decision.risk_multiplier < 0.60
     assert not any("opposite orderflow" in blocker for blocker in decision.blockers)
     assert any("opposite orderflow" in reason for reason in decision.reasons)
+
+
+def test_derivatives_multi_adverse_blocks_long_and_short():
+    base_values = {
+        "entry_price": 100.0,
+        "ema50": 98.0,
+        "ema50_prev": 97.5,
+        "htf_supertrend_direction": "long",
+        "adx": 31.0,
+        "plus_di": 32.0,
+        "minus_di": 12.0,
+        "chop": 38.0,
+        "volume_ratio": 1.45,
+        "directional_efficiency": 0.42,
+        "momentum_6_pct": 0.9,
+        "momentum_12_pct": 1.8,
+        "momentum_24_pct": 2.6,
+        "rolling_ofi_samples": 5,
+    }
+    long_decision = evaluate_ev_adaptive_entry(
+        side="long",
+        candidate_type="fresh_signal",
+        values={
+            **base_values,
+            "funding_rate": 0.0010,
+            "open_interest_delta_pct": 1.10,
+            "price_change_1h": 0.02,
+            "rolling_ofi_score": -7.5,
+            "taker_buy_sell_ratio": 0.92,
+            "basis_pct": 0.22,
+        },
+    )
+    short_decision = evaluate_ev_adaptive_entry(
+        side="short",
+        candidate_type="fresh_signal",
+        values={
+            **base_values,
+            "ema50": 102.0,
+            "ema50_prev": 102.5,
+            "htf_supertrend_direction": "short",
+            "plus_di": 12.0,
+            "minus_di": 32.0,
+            "momentum_6_pct": -0.9,
+            "momentum_12_pct": -1.8,
+            "momentum_24_pct": -2.6,
+            "funding_rate": -0.0010,
+            "open_interest_delta_pct": 1.10,
+            "price_change_1h": -0.02,
+            "rolling_ofi_score": 7.5,
+            "taker_buy_sell_ratio": 1.08,
+            "basis_pct": -0.22,
+        },
+    )
+
+    assert long_decision.allowed is False
+    assert short_decision.allowed is False
+    assert any("adverse derivatives" in blocker or "multi-adverse" in blocker for blocker in long_decision.blockers)
+    assert any("adverse derivatives" in blocker or "multi-adverse" in blocker for blocker in short_decision.blockers)
+
+
+def test_opposite_btc_eth_regime_raises_entry_score_threshold():
+    decision = evaluate_ev_adaptive_entry(
+        side="long",
+        candidate_type="fresh_signal",
+        values={
+            "entry_price": 100.0,
+            "ema50": 99.0,
+            "ema50_prev": 98.7,
+            "htf_supertrend_direction": "long",
+            "adx": 20.0,
+            "plus_di": 26.0,
+            "minus_di": 14.0,
+            "chop": 48.0,
+            "volume_ratio": 0.92,
+            "directional_efficiency": 0.22,
+            "momentum_6_pct": 0.5,
+            "momentum_12_pct": 1.0,
+            "momentum_24_pct": 1.5,
+            "market_regime_context": {
+                "items": {
+                    "BTC/USDT": {"direction": "short", "return_lookback_pct": -0.8},
+                    "ETH/USDT": {"direction": "short", "return_lookback_pct": -0.6},
+                }
+            },
+        },
+        config={"min_entry_score": 78.0},
+    )
+
+    assert decision.allowed is False
+    assert any("regime adjusted" in blocker for blocker in decision.blockers)
+    assert any("opposite regime" in reason for reason in decision.reasons)
+
+
+def test_stale_continuation_relief_requires_reacceleration():
+    decision = evaluate_ev_adaptive_entry(
+        side="long",
+        candidate_type="bias_state",
+        values={
+            "entry_price": 101.0,
+            "ema50": 99.0,
+            "ema50_prev": 98.5,
+            "htf_close": 103.0,
+            "htf_ema_fast": 102.0,
+            "htf_ema_slow": 99.0,
+            "adx": 34.0,
+            "plus_di": 33.0,
+            "minus_di": 11.0,
+            "chop": 36.0,
+            "volume_ratio": 1.55,
+            "directional_efficiency": 0.47,
+            "momentum_6_pct": 1.1,
+            "momentum_12_pct": 2.0,
+            "momentum_24_pct": 3.0,
+            "signal_age_candles": 12.0,
+            "donchian_high_prev": 100.0,
+            "range_expansion_ratio": 1.20,
+            "mtf_metrics": {
+                "15m": {"ema_bias": "long"},
+                "30m": {"ema_bias": "long"},
+                "1h": {"ema_bias": "long"},
+            },
+        },
+        config={
+            "continuation_max_signal_age_bars": 8.0,
+            "continuation_reacceleration_volume_min": 2.0,
+            "stale_relief_requires_reacceleration": True,
+        },
+    )
+
+    assert decision.allowed is False
+    assert any("stale continuation" in blocker for blocker in decision.blockers)
 
 
 def test_ev_adaptive_continuation_requires_signal_age():

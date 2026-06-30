@@ -50,10 +50,11 @@ def test_opportunity_tuning_persists_changed_runtime_config():
     assert selector["analysis_limit"] == 80
     assert selector["selection_max_rebound_pct"] == 22.0
     assert "meme" not in selector["excluded_sectors"]
-    assert ut_cfg["ev_min_entry_score"] == 55.0
-    assert ut_cfg["ev_no_edge_relief_min_score"] == 67.0
-    assert ut_cfg["ev_short_min_entry_score"] == 52.0
-    assert ut_cfg["ev_short_relaxed_signal_risk_cap"] == 0.45
+    assert ut_cfg["ev_min_entry_score"] == 57.0
+    assert ut_cfg["entry_quality_gate_min_ev_score"] == 60.0
+    assert ut_cfg["ev_no_edge_relief_min_score"] == 70.0
+    assert ut_cfg["ev_short_min_entry_score"] == 57.0
+    assert ut_cfg["ev_short_relaxed_signal_risk_cap"] == 0.30
 
 
 def test_opportunity_tuning_does_not_rewrite_when_already_current():

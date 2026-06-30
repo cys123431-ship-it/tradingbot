@@ -832,26 +832,29 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "quality_score_v2_short_reduce_below": 45.0,
         "quality_score_v2_short_15m_block_below": 16.0,
         "quality_score_v2_short_15m_reduce_below": 45.0,
-        "market_quality_long_hard_block_on_multi_adverse_enabled": False,
-        "market_quality_long_multi_adverse_min_reasons": 5,
-        "market_quality_long_multi_adverse_max_multiplier": 0.35,
+        "market_quality_long_hard_block_on_multi_adverse_enabled": True,
+        "market_quality_long_multi_adverse_min_reasons": 4,
+        "market_quality_long_multi_adverse_max_multiplier": 0.30,
         "market_quality_min_risk_multiplier": 0.0,
         "final_risk_multiplier_floor": 0.0,
         "entry_quality_gate_enabled": True,
-        "entry_quality_gate_min_final_risk_multiplier": 0.35,
-        "entry_quality_gate_long_min_final_risk_multiplier": 0.40,
-        "entry_quality_gate_short_min_final_risk_multiplier": 0.35,
-        "entry_quality_gate_hard_market_multiplier_below": 0.25,
-        "entry_quality_gate_min_ev_score": 58.0,
-        "entry_quality_gate_min_ev_probability": 0.53,
-        "entry_quality_gate_min_ev_net_expectancy_r": 0.18,
+        "entry_quality_gate_min_final_risk_multiplier": 0.40,
+        "entry_quality_gate_long_min_final_risk_multiplier": 0.45,
+        "entry_quality_gate_short_min_final_risk_multiplier": 0.40,
+        "entry_quality_gate_hard_market_multiplier_below": 0.30,
+        "entry_quality_gate_min_ev_score": 60.0,
+        "entry_quality_gate_min_ev_probability": 0.54,
+        "entry_quality_gate_min_ev_net_expectancy_r": 0.22,
         "entry_quality_gate_min_ev_mtf_votes": 2,
         "aggressive_growth_enabled": False,
         "aggressive_growth_pyramiding_enabled": False,
+        "utbreakout_recent_loss_cooldown_enabled": True,
+        "utbreakout_recent_loss_cooldown_seconds": 21600,
+        "utbreakout_recent_loss_cooldown_min_loss_usdt": 0.0,
 
         # Cost-aware EV gate.
-        "ev_min_entry_score": 55.0,
-        "ev_min_net_expectancy_r": 0.08,
+        "ev_min_entry_score": 57.0,
+        "ev_min_net_expectancy_r": 0.10,
         "ev_entry_fee_rate_pct": 0.04,
         "ev_exit_fee_rate_pct": 0.04,
         "ev_slippage_rate_pct_each_side": 0.02,
@@ -861,9 +864,9 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "ev_high_vol_atr_pct": 1.50,
         "ev_extreme_atr_pct": 2.50,
         "ev_panic_rebound_block_pct": 6.0,
-        "ev_continuation_max_signal_age_bars": 10.0,
-        "ev_continuation_reacceleration_range_min": 1.05,
-        "ev_continuation_reacceleration_volume_min": 0.80,
+        "ev_continuation_max_signal_age_bars": 8.0,
+        "ev_continuation_reacceleration_range_min": 1.08,
+        "ev_continuation_reacceleration_volume_min": 0.95,
         "ev_max_extension_atr": 2.40,
         "ev_preferred_extension_atr": 1.60,
         "ev_mtf_min_aligned": 2,
@@ -880,26 +883,40 @@ def apply_profit_opportunity_effective_overrides(cfg):
 
         "ev_stale_relief_enabled": True,
         "ev_stale_relief_max_age_bars": 24.0,
-        "ev_stale_relief_min_score": 70.0,
-        "ev_stale_relief_min_adx": 24.0,
-        "ev_stale_relief_min_volume_ratio": 1.10,
+        "ev_stale_relief_min_score": 73.0,
+        "ev_stale_relief_min_adx": 25.0,
+        "ev_stale_relief_min_volume_ratio": 1.15,
+        "ev_stale_relief_requires_reacceleration": True,
 
         "ev_no_edge_relief_enabled": True,
-        "ev_no_edge_relief_min_score": 67.0,
-        "ev_no_edge_relief_min_adx": 23.0,
-        "ev_no_edge_relief_min_volume_ratio": 1.05,
-        "ev_no_edge_relief_min_efficiency": 0.24,
-        "ev_no_edge_relief_min_range_expansion": 1.08,
-        "ev_short_min_entry_score": 52.0,
-        "ev_short_trend_min_adx": 14.0,
-        "ev_short_trend_min_volume_ratio": 0.50,
-        "ev_short_no_edge_relief_min_score": 63.0,
-        "ev_short_no_edge_relief_min_adx": 20.0,
-        "ev_short_no_edge_relief_min_volume_ratio": 0.95,
-        "ev_short_no_edge_relief_min_efficiency": 0.20,
-        "ev_short_no_edge_relief_min_range_expansion": 1.03,
-        "ev_short_conditional_relief_risk_cap": 0.35,
-        "ev_short_relaxed_signal_risk_cap": 0.45,
+        "ev_no_edge_relief_min_score": 70.0,
+        "ev_no_edge_relief_min_adx": 24.0,
+        "ev_no_edge_relief_min_volume_ratio": 1.10,
+        "ev_no_edge_relief_min_efficiency": 0.27,
+        "ev_no_edge_relief_min_range_expansion": 1.10,
+        "ev_short_min_entry_score": 57.0,
+        "ev_short_trend_min_adx": 16.0,
+        "ev_short_trend_min_volume_ratio": 0.60,
+        "ev_short_no_edge_relief_min_score": 68.0,
+        "ev_short_no_edge_relief_min_adx": 23.0,
+        "ev_short_no_edge_relief_min_volume_ratio": 1.05,
+        "ev_short_no_edge_relief_min_efficiency": 0.24,
+        "ev_short_no_edge_relief_min_range_expansion": 1.08,
+        "ev_short_conditional_relief_risk_cap": 0.30,
+        "ev_short_relaxed_signal_risk_cap": 0.30,
+        "ev_derivatives_basis_soft_pct": 0.15,
+        "ev_derivatives_basis_hard_pct": 0.35,
+        "ev_derivatives_multi_adverse_block_enabled": True,
+        "ev_derivatives_multi_adverse_min_count": 3,
+        "ev_derivatives_multi_adverse_min_hard_count": 2,
+        "ev_derivatives_multi_adverse_max_risk_multiplier": 0.50,
+        "ev_regime_opposition_score_add_btc": 4.0,
+        "ev_regime_opposition_score_add_eth": 2.0,
+        "ev_regime_strong_opposition_score_add_btc": 7.0,
+        "ev_regime_opposition_risk_reduce_btc": 0.85,
+        "ev_regime_opposition_risk_reduce_eth": 0.92,
+        "ev_regime_strong_opposition_risk_reduce_btc": 0.70,
+        "ev_regime_opposition_strong_move_pct": 1.5,
         "ev_time_stop_enabled": True,
         "ev_time_stop_bars": 8,
         "ev_time_stop_min_mfe_r": 0.45,
@@ -957,8 +974,8 @@ def apply_profit_opportunity_effective_overrides(cfg):
 def _ev_adaptive_runtime_config(cfg):
     cfg = dict(cfg or {})
     return {
-        "min_entry_score": cfg.get("ev_min_entry_score", 55.0),
-        "min_net_expectancy_r": cfg.get("ev_min_net_expectancy_r", 0.08),
+        "min_entry_score": cfg.get("ev_min_entry_score", 57.0),
+        "min_net_expectancy_r": cfg.get("ev_min_net_expectancy_r", 0.10),
         "entry_fee_rate_pct": cfg.get("ev_entry_fee_rate_pct", 0.04),
         "exit_fee_rate_pct": cfg.get("ev_exit_fee_rate_pct", 0.04),
         "slippage_rate_pct_each_side": cfg.get("ev_slippage_rate_pct_each_side", 0.02),
@@ -969,13 +986,13 @@ def _ev_adaptive_runtime_config(cfg):
         "extreme_atr_pct": cfg.get("ev_extreme_atr_pct", 2.50),
         "panic_rebound_block_pct": cfg.get("ev_panic_rebound_block_pct", 6.0),
         "continuation_max_signal_age_bars": cfg.get(
-            "ev_continuation_max_signal_age_bars", 10.0
+            "ev_continuation_max_signal_age_bars", 8.0
         ),
         "continuation_reacceleration_range_min": cfg.get(
-            "ev_continuation_reacceleration_range_min", 1.05
+            "ev_continuation_reacceleration_range_min", 1.08
         ),
         "continuation_reacceleration_volume_min": cfg.get(
-            "ev_continuation_reacceleration_volume_min", 0.80
+            "ev_continuation_reacceleration_volume_min", 0.95
         ),
         "max_extension_atr": cfg.get("ev_max_extension_atr", 2.40),
         "preferred_extension_atr": cfg.get("ev_preferred_extension_atr", 1.60),
@@ -995,26 +1012,40 @@ def _ev_adaptive_runtime_config(cfg):
 
         "stale_relief_enabled": cfg.get("ev_stale_relief_enabled", True),
         "stale_relief_max_age_bars": cfg.get("ev_stale_relief_max_age_bars", 24.0),
-        "stale_relief_min_score": cfg.get("ev_stale_relief_min_score", 70.0),
-        "stale_relief_min_adx": cfg.get("ev_stale_relief_min_adx", 24.0),
-        "stale_relief_min_volume_ratio": cfg.get("ev_stale_relief_min_volume_ratio", 1.10),
+        "stale_relief_min_score": cfg.get("ev_stale_relief_min_score", 73.0),
+        "stale_relief_min_adx": cfg.get("ev_stale_relief_min_adx", 25.0),
+        "stale_relief_min_volume_ratio": cfg.get("ev_stale_relief_min_volume_ratio", 1.15),
+        "stale_relief_requires_reacceleration": cfg.get("ev_stale_relief_requires_reacceleration", True),
 
         "no_edge_relief_enabled": cfg.get("ev_no_edge_relief_enabled", True),
-        "no_edge_relief_min_score": cfg.get("ev_no_edge_relief_min_score", 67.0),
-        "no_edge_relief_min_adx": cfg.get("ev_no_edge_relief_min_adx", 23.0),
-        "no_edge_relief_min_volume_ratio": cfg.get("ev_no_edge_relief_min_volume_ratio", 1.05),
-        "no_edge_relief_min_efficiency": cfg.get("ev_no_edge_relief_min_efficiency", 0.24),
-        "no_edge_relief_min_range_expansion": cfg.get("ev_no_edge_relief_min_range_expansion", 1.08),
-        "short_min_entry_score": cfg.get("ev_short_min_entry_score", 52.0),
-        "short_trend_min_adx": cfg.get("ev_short_trend_min_adx", 14.0),
-        "short_trend_min_volume_ratio": cfg.get("ev_short_trend_min_volume_ratio", 0.50),
-        "short_no_edge_relief_min_score": cfg.get("ev_short_no_edge_relief_min_score", 63.0),
-        "short_no_edge_relief_min_adx": cfg.get("ev_short_no_edge_relief_min_adx", 20.0),
-        "short_no_edge_relief_min_volume_ratio": cfg.get("ev_short_no_edge_relief_min_volume_ratio", 0.95),
-        "short_no_edge_relief_min_efficiency": cfg.get("ev_short_no_edge_relief_min_efficiency", 0.20),
-        "short_no_edge_relief_min_range_expansion": cfg.get("ev_short_no_edge_relief_min_range_expansion", 1.03),
-        "short_conditional_relief_risk_cap": cfg.get("ev_short_conditional_relief_risk_cap", 0.35),
-        "short_relaxed_signal_risk_cap": cfg.get("ev_short_relaxed_signal_risk_cap", 0.45),
+        "no_edge_relief_min_score": cfg.get("ev_no_edge_relief_min_score", 70.0),
+        "no_edge_relief_min_adx": cfg.get("ev_no_edge_relief_min_adx", 24.0),
+        "no_edge_relief_min_volume_ratio": cfg.get("ev_no_edge_relief_min_volume_ratio", 1.10),
+        "no_edge_relief_min_efficiency": cfg.get("ev_no_edge_relief_min_efficiency", 0.27),
+        "no_edge_relief_min_range_expansion": cfg.get("ev_no_edge_relief_min_range_expansion", 1.10),
+        "short_min_entry_score": cfg.get("ev_short_min_entry_score", 57.0),
+        "short_trend_min_adx": cfg.get("ev_short_trend_min_adx", 16.0),
+        "short_trend_min_volume_ratio": cfg.get("ev_short_trend_min_volume_ratio", 0.60),
+        "short_no_edge_relief_min_score": cfg.get("ev_short_no_edge_relief_min_score", 68.0),
+        "short_no_edge_relief_min_adx": cfg.get("ev_short_no_edge_relief_min_adx", 23.0),
+        "short_no_edge_relief_min_volume_ratio": cfg.get("ev_short_no_edge_relief_min_volume_ratio", 1.05),
+        "short_no_edge_relief_min_efficiency": cfg.get("ev_short_no_edge_relief_min_efficiency", 0.24),
+        "short_no_edge_relief_min_range_expansion": cfg.get("ev_short_no_edge_relief_min_range_expansion", 1.08),
+        "short_conditional_relief_risk_cap": cfg.get("ev_short_conditional_relief_risk_cap", 0.30),
+        "short_relaxed_signal_risk_cap": cfg.get("ev_short_relaxed_signal_risk_cap", 0.30),
+        "derivatives_basis_soft_pct": cfg.get("ev_derivatives_basis_soft_pct", 0.15),
+        "derivatives_basis_hard_pct": cfg.get("ev_derivatives_basis_hard_pct", 0.35),
+        "derivatives_multi_adverse_block_enabled": cfg.get("ev_derivatives_multi_adverse_block_enabled", True),
+        "derivatives_multi_adverse_min_count": cfg.get("ev_derivatives_multi_adverse_min_count", 3),
+        "derivatives_multi_adverse_min_hard_count": cfg.get("ev_derivatives_multi_adverse_min_hard_count", 2),
+        "derivatives_multi_adverse_max_risk_multiplier": cfg.get("ev_derivatives_multi_adverse_max_risk_multiplier", 0.50),
+        "regime_opposition_score_add_btc": cfg.get("ev_regime_opposition_score_add_btc", 4.0),
+        "regime_opposition_score_add_eth": cfg.get("ev_regime_opposition_score_add_eth", 2.0),
+        "regime_strong_opposition_score_add_btc": cfg.get("ev_regime_strong_opposition_score_add_btc", 7.0),
+        "regime_opposition_risk_reduce_btc": cfg.get("ev_regime_opposition_risk_reduce_btc", 0.85),
+        "regime_opposition_risk_reduce_eth": cfg.get("ev_regime_opposition_risk_reduce_eth", 0.92),
+        "regime_strong_opposition_risk_reduce_btc": cfg.get("ev_regime_strong_opposition_risk_reduce_btc", 0.70),
+        "regime_opposition_strong_move_pct": cfg.get("ev_regime_opposition_strong_move_pct", 1.5),
     }
 
 
@@ -4443,6 +4474,20 @@ class TemaEngine(BaseEngine):
             close_reason,
         )
         result['status'] = 'RECORDED' if updated is not False else 'NO_OPEN_TRADE'
+        if updated is not False:
+            try:
+                self._record_utbreakout_recent_loss_cooldown(
+                    symbol,
+                    side=(open_trade or {}).get('side'),
+                    pnl_usdt=result.get('pnl'),
+                    reason=close_reason,
+                )
+            except Exception:
+                logger.debug(
+                    "UTBreakout recent loss cooldown record failed for %s",
+                    symbol,
+                    exc_info=True,
+                )
         return result
 
     async def exit_position(self, symbol, reason):
@@ -4478,6 +4523,7 @@ class SignalEngine(BaseEngine):
         self.utbreakout_last_ready_ts = {}
         self.utbreakout_last_ready_side = {}
         self.utbreakout_daily_sl_symbol_lockouts = {}
+        self.utbreakout_recent_loss_symbol_cooldowns = {}
         self.utbreakout_last_order_attempt_ts = {}
         self.utbreakout_last_watchdog_report_ts = {}
         self.utbreakout_trace_watchdog_enabled = False
@@ -4631,6 +4677,7 @@ class SignalEngine(BaseEngine):
         self.coin_selector_last_run_ts = 0.0
         self.coin_selector_candidate_cooldowns = {}
         self.utbreakout_daily_sl_symbol_lockouts = {}
+        self.utbreakout_recent_loss_symbol_cooldowns = {}
         self._load_utbreakout_daily_sl_lockouts()
         self.micro_auto_last_plan = {}
         self.micro_auto_last_rejects = {}
@@ -4750,6 +4797,175 @@ class SignalEngine(BaseEngine):
             
         reason = record.get("reason", "UNKNOWN")
         return True, f"당일 SL lockout / protection lockout: {reason} today (daily SL lockout)"
+
+    def _utbreakout_recent_loss_cooldown_config(self, cfg=None):
+        if not isinstance(cfg, dict):
+            try:
+                cfg = self._get_utbot_filtered_breakout_config(
+                    self.get_runtime_strategy_params()
+                )
+            except Exception:
+                cfg = {}
+        cfg = apply_profit_opportunity_effective_overrides(dict(cfg or {}))
+        try:
+            seconds = float(
+                cfg.get('utbreakout_recent_loss_cooldown_seconds', 21600)
+                or 21600
+            )
+        except (TypeError, ValueError):
+            seconds = 21600.0
+        try:
+            min_loss = float(
+                cfg.get('utbreakout_recent_loss_cooldown_min_loss_usdt', 0.0)
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            min_loss = 0.0
+        return {
+            'enabled': bool(cfg.get('utbreakout_recent_loss_cooldown_enabled', True)),
+            'seconds': max(0.0, seconds),
+            'min_loss_usdt': max(0.0, min_loss),
+        }
+
+    def _record_utbreakout_recent_loss_cooldown(
+        self,
+        symbol: str,
+        *,
+        side: str | None = None,
+        pnl_usdt: float | None = None,
+        reason: str = "RECENT_LOSS",
+        cfg: dict | None = None,
+    ) -> None:
+        cd_cfg = self._utbreakout_recent_loss_cooldown_config(cfg)
+        if not cd_cfg.get('enabled') or cd_cfg.get('seconds', 0.0) <= 0:
+            return
+        pnl_value = _safe_float_or_none(pnl_usdt)
+        min_loss = float(cd_cfg.get('min_loss_usdt', 0.0) or 0.0)
+        if pnl_value is not None and pnl_value >= -min_loss:
+            return
+        normalized_symbol = self._normalize_market_symbol(symbol)
+        if not normalized_symbol:
+            return
+        cooldowns = self._ensure_runtime_state_container(
+            'utbreakout_recent_loss_symbol_cooldowns'
+        )
+        now_ts = time.time()
+        until_ts = now_ts + float(cd_cfg.get('seconds', 0.0) or 0.0)
+        cooldowns[normalized_symbol] = {
+            'until': until_ts,
+            'side': side,
+            'pnl_usdt': pnl_value,
+            'reason': str(reason or 'RECENT_LOSS')[:120],
+            'recorded_at': now_ts,
+        }
+        try:
+            self._utbreakout_trace_event(
+                normalized_symbol,
+                'RECENT_LOSS_COOLDOWN',
+                'RECORDED',
+                side=side,
+                pnl_usdt=pnl_value,
+                reason=reason,
+                cooldown_seconds=float(cd_cfg.get('seconds', 0.0) or 0.0),
+            )
+        except Exception:
+            logger.debug("UTBreakout recent loss cooldown trace skipped", exc_info=True)
+
+    def _recent_loss_cooldown_db_lookup(self, normalized_symbol: str, cd_cfg: dict):
+        db = getattr(self, 'db', None)
+        conn = getattr(db, 'conn', None)
+        lock = getattr(db, 'lock', None)
+        if conn is None or lock is None:
+            return None
+        aliases = {
+            normalized_symbol,
+            str(normalized_symbol or '').replace(':USDT', ''),
+            str(normalized_symbol or '').replace('/', '').replace(':USDT', ''),
+        }
+        aliases = [item for item in aliases if item]
+        if not aliases:
+            return None
+        placeholders = ",".join("?" for _ in aliases)
+        query = (
+            "SELECT side, pnl_usdt, exit_time, exit_reason "
+            f"FROM trades WHERE symbol IN ({placeholders}) "
+            "AND exit_time IS NOT NULL ORDER BY exit_time DESC, id DESC LIMIT 1"
+        )
+        try:
+            with lock:
+                row = conn.execute(query, tuple(aliases)).fetchone()
+        except Exception:
+            logger.debug("UTBreakout recent loss DB lookup failed", exc_info=True)
+            return None
+        if not row:
+            return None
+        side, pnl_usdt, exit_time, exit_reason = row
+        pnl_value = _safe_float_or_none(pnl_usdt)
+        min_loss = float(cd_cfg.get('min_loss_usdt', 0.0) or 0.0)
+        if pnl_value is None or pnl_value >= -min_loss:
+            return None
+        try:
+            exit_dt = datetime.fromisoformat(str(exit_time).replace('Z', '+00:00'))
+            if exit_dt.tzinfo is None:
+                exit_dt = exit_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+        age_sec = (datetime.now(timezone.utc) - exit_dt.astimezone(timezone.utc)).total_seconds()
+        if age_sec < 0 or age_sec > float(cd_cfg.get('seconds', 0.0) or 0.0):
+            return None
+        remaining_sec = max(0.0, float(cd_cfg.get('seconds', 0.0) or 0.0) - age_sec)
+        return {
+            'side': side,
+            'pnl_usdt': pnl_value,
+            'reason': str(exit_reason or 'RECENT_LOSS')[:120],
+            'remaining_sec': remaining_sec,
+        }
+
+    def _is_utbreakout_recent_loss_cooldown_active(
+        self,
+        symbol: str,
+        cfg: dict | None = None,
+    ) -> tuple[bool, str]:
+        cd_cfg = self._utbreakout_recent_loss_cooldown_config(cfg)
+        if not cd_cfg.get('enabled') or cd_cfg.get('seconds', 0.0) <= 0:
+            return False, ""
+        normalized_symbol = self._normalize_market_symbol(symbol)
+        if not normalized_symbol:
+            return False, ""
+        cooldowns = self._ensure_runtime_state_container(
+            'utbreakout_recent_loss_symbol_cooldowns'
+        )
+        now_ts = time.time()
+        record = cooldowns.get(normalized_symbol)
+        if isinstance(record, dict):
+            until_ts = _safe_float_or_none(record.get('until')) or 0.0
+            if until_ts > now_ts:
+                remaining_min = max(1, int((until_ts - now_ts + 59) // 60))
+                reason = str(record.get('reason') or 'RECENT_LOSS')
+                return True, (
+                    f"recent loss cooldown: {reason}; "
+                    f"{remaining_min}m remaining for {normalized_symbol}"
+                )
+            cooldowns.pop(normalized_symbol, None)
+        db_record = self._recent_loss_cooldown_db_lookup(normalized_symbol, cd_cfg)
+        if isinstance(db_record, dict):
+            remaining_min = max(
+                1,
+                int((float(db_record.get('remaining_sec', 0.0) or 0.0) + 59) // 60),
+            )
+            reason = str(db_record.get('reason') or 'RECENT_LOSS')
+            self._record_utbreakout_recent_loss_cooldown(
+                normalized_symbol,
+                side=db_record.get('side'),
+                pnl_usdt=db_record.get('pnl_usdt'),
+                reason=reason,
+                cfg=cfg,
+            )
+            return True, (
+                f"recent loss cooldown: {reason}; "
+                f"{remaining_min}m remaining for {normalized_symbol}"
+            )
+        return False, ""
 
     def _save_utbreakout_daily_sl_lockouts(self):
         try:
@@ -9799,6 +10015,20 @@ class SignalEngine(BaseEngine):
             )
         if daily_sl_locked:
             blockers.append(daily_sl_reason or "daily SL lockout active")
+        try:
+            recent_loss_locked, recent_loss_reason = (
+                self._is_utbreakout_recent_loss_cooldown_active(symbol, cfg)
+            )
+        except Exception as exc:
+            recent_loss_locked = False
+            recent_loss_reason = ""
+            logger.warning(
+                "UTBreakout recent loss cooldown check failed for %s: %s",
+                symbol,
+                exc,
+            )
+        if recent_loss_locked:
+            blockers.append(recent_loss_reason or "recent loss cooldown active")
         if side in {'long', 'short'} and not self.is_trade_direction_allowed(side):
             blockers.append(self.format_trade_direction_block_reason(side))
         if not candidate_side or candidate_side != side:
@@ -9993,6 +10223,11 @@ class SignalEngine(BaseEngine):
             dict,
         ):
             self.utbreakout_daily_sl_symbol_lockouts = {}
+        if not isinstance(
+            getattr(self, 'utbreakout_recent_loss_symbol_cooldowns', None),
+            dict,
+        ):
+            self.utbreakout_recent_loss_symbol_cooldowns = {}
 
     async def _maybe_run_utbreakout_auto_entry_bridge(
         self,
@@ -10236,6 +10471,19 @@ class SignalEngine(BaseEngine):
                     'DAILY_SL_LOCKOUT',
                     source=source,
                     reason=daily_sl_reason,
+                    side=side,
+                )
+                return False
+            recent_loss_locked, recent_loss_reason = (
+                self._is_utbreakout_recent_loss_cooldown_active(symbol, cfg)
+            )
+            if recent_loss_locked:
+                self._utbreakout_trace_event(
+                    symbol,
+                    'AUTO_ENTRY_BRIDGE_BLOCKED',
+                    'RECENT_LOSS_COOLDOWN',
+                    source=source,
+                    reason=recent_loss_reason,
                     side=side,
                 )
                 return False

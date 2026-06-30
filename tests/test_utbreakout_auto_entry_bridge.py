@@ -168,6 +168,137 @@ def test_auto_entry_bridge_daily_sl_lockout_blocks_before_entry_call(tmp_path):
     assert not any(event["stage"] == "ORDER_ATTEMPT" for event in events)
 
 
+def test_recent_loss_cooldown_blocks_execution_same_symbol_only():
+    class Controller:
+        is_paused = False
+
+    engine = _build_engine()
+    engine.ctrl = Controller()
+    engine.utbreakout_recent_loss_symbol_cooldowns = {}
+    engine._record_utbreakout_recent_loss_cooldown(
+        "SOL/USDT:USDT",
+        side="long",
+        pnl_usdt=-2.5,
+        reason="test loss",
+    )
+
+    for side in ("long", "short"):
+        eligibility = engine._build_utbreakout_execution_eligibility(
+            symbol="SOL/USDT:USDT",
+            side=side,
+            candidate_side=side,
+            candidate_type="fresh_signal",
+            side_condition_ok=True,
+            risk_ok=True,
+            planned_qty=1.0,
+            risk_usdt=1.0,
+            entry_plan_detail="ok",
+            cooldown_reasons=[],
+            has_open_position=False,
+            has_other_position=False,
+            auto_entry_enabled=True,
+            daily_risk_ok=True,
+            plan_lookup_ready=True,
+            cfg={"utbreakout_require_scanner_candidate_for_auto_entry": True},
+            scanner_source="scanner_seen",
+            is_live_scanner_context=True,
+            is_current_scanner_candidate=True,
+            is_coinselector_top_candidate=True,
+            next_scan_symbol="SOL/USDT:USDT",
+            evaluated_symbol="SOL/USDT:USDT",
+        )
+        assert eligibility["can_attempt"] is False
+        assert any("recent loss cooldown" in blocker for blocker in eligibility["blockers"])
+
+    other = engine._build_utbreakout_execution_eligibility(
+        symbol="ETH/USDT:USDT",
+        side="long",
+        candidate_side="long",
+        candidate_type="fresh_signal",
+        side_condition_ok=True,
+        risk_ok=True,
+        planned_qty=1.0,
+        risk_usdt=1.0,
+        entry_plan_detail="ok",
+        cooldown_reasons=[],
+        has_open_position=False,
+        has_other_position=False,
+        auto_entry_enabled=True,
+        daily_risk_ok=True,
+        plan_lookup_ready=True,
+        cfg={"utbreakout_require_scanner_candidate_for_auto_entry": True},
+        scanner_source="scanner_seen",
+        is_live_scanner_context=True,
+        is_current_scanner_candidate=True,
+        is_coinselector_top_candidate=True,
+        next_scan_symbol="ETH/USDT:USDT",
+        evaluated_symbol="ETH/USDT:USDT",
+    )
+    assert other["can_attempt"] is True
+
+
+def test_auto_entry_bridge_recent_loss_cooldown_blocks_before_entry_call():
+    entry_calls = []
+
+    engine = _build_engine()
+    symbol = "SOL/USDT:USDT"
+
+    async def entry(*args):
+        entry_calls.append(args)
+
+    async def mock_evaluate_eligibility(requested_symbol, **kwargs):
+        return {
+            "ok_market": True,
+            "symbol": requested_symbol,
+            "long_eligibility": {"can_attempt": True, "blockers": []},
+            "short_eligibility": {"can_attempt": True, "blockers": []},
+        }
+
+    engine.entry = entry
+    engine._evaluate_utbreakout_eligibility_context = mock_evaluate_eligibility
+    engine._record_utbreakout_recent_loss_cooldown(
+        symbol,
+        side="long",
+        pnl_usdt=-1.0,
+        reason="test loss",
+    )
+    engine._set_utbot_filtered_breakout_entry_plan(
+        symbol,
+        {
+            "side": "long",
+            "entry_price": 101.25,
+            "qty": 0.5,
+            "planned_notional": 50.625,
+            "planned_margin": 10.125,
+            "risk_usdt": 1.0,
+        },
+    )
+    engine._utbreakout_trace_event(
+        symbol,
+        "STATUS_READY",
+        "READY",
+        side="long",
+        entry_price=101.25,
+    )
+
+    called = asyncio.run(
+        engine._maybe_run_utbreakout_auto_entry_bridge(
+            symbol,
+            source="scanner_seen",
+        )
+    )
+
+    assert called is False
+    assert entry_calls == []
+    events = engine._utbreakout_recent_trace_events(symbol, limit=30)
+    assert any(
+        event["stage"] == "AUTO_ENTRY_BRIDGE_BLOCKED"
+        and event["status"] == "RECENT_LOSS_COOLDOWN"
+        for event in events
+    )
+    assert not any(event["stage"] == "ENTRY_CALL" for event in events)
+
+
 def test_auto_entry_bridge_restricted_symbol_is_blocked():
     entry_calls = []
 

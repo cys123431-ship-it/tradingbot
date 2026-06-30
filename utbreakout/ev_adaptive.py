@@ -124,23 +124,24 @@ def default_ev_adaptive_config():
         "stale_relief_min_score": 70.0,
         "stale_relief_min_adx": 24.0,
         "stale_relief_min_volume_ratio": 1.10,
+        "stale_relief_requires_reacceleration": True,
 
         "no_edge_relief_enabled": True,
-        "no_edge_relief_min_score": 67.0,
-        "no_edge_relief_min_adx": 23.0,
-        "no_edge_relief_min_volume_ratio": 1.05,
-        "no_edge_relief_min_efficiency": 0.24,
-        "no_edge_relief_min_range_expansion": 1.08,
-        "short_min_entry_score": 52.0,
-        "short_trend_min_adx": 14.0,
-        "short_trend_min_volume_ratio": 0.50,
-        "short_no_edge_relief_min_score": 63.0,
-        "short_no_edge_relief_min_adx": 20.0,
-        "short_no_edge_relief_min_volume_ratio": 0.95,
-        "short_no_edge_relief_min_efficiency": 0.20,
-        "short_no_edge_relief_min_range_expansion": 1.03,
-        "short_conditional_relief_risk_cap": 0.35,
-        "short_relaxed_signal_risk_cap": 0.45,
+        "no_edge_relief_min_score": 70.0,
+        "no_edge_relief_min_adx": 24.0,
+        "no_edge_relief_min_volume_ratio": 1.10,
+        "no_edge_relief_min_efficiency": 0.27,
+        "no_edge_relief_min_range_expansion": 1.10,
+        "short_min_entry_score": 57.0,
+        "short_trend_min_adx": 16.0,
+        "short_trend_min_volume_ratio": 0.60,
+        "short_no_edge_relief_min_score": 68.0,
+        "short_no_edge_relief_min_adx": 23.0,
+        "short_no_edge_relief_min_volume_ratio": 1.05,
+        "short_no_edge_relief_min_efficiency": 0.24,
+        "short_no_edge_relief_min_range_expansion": 1.08,
+        "short_conditional_relief_risk_cap": 0.30,
+        "short_relaxed_signal_risk_cap": 0.30,
         "derivatives_funding_soft": 0.0006,
         "derivatives_funding_hard": 0.0015,
         "derivatives_funding_extreme_percentile": 90.0,
@@ -160,6 +161,19 @@ def default_ev_adaptive_config():
         "derivatives_taker_long_against": 0.95,
         "derivatives_taker_short_confirm": 0.97,
         "derivatives_taker_short_against": 1.05,
+        "derivatives_basis_soft_pct": 0.15,
+        "derivatives_basis_hard_pct": 0.35,
+        "derivatives_multi_adverse_block_enabled": True,
+        "derivatives_multi_adverse_min_count": 3,
+        "derivatives_multi_adverse_min_hard_count": 2,
+        "derivatives_multi_adverse_max_risk_multiplier": 0.50,
+        "regime_opposition_score_add_btc": 4.0,
+        "regime_opposition_score_add_eth": 2.0,
+        "regime_strong_opposition_score_add_btc": 7.0,
+        "regime_opposition_risk_reduce_btc": 0.85,
+        "regime_opposition_risk_reduce_eth": 0.92,
+        "regime_strong_opposition_risk_reduce_btc": 0.70,
+        "regime_opposition_strong_move_pct": 1.5,
     }
 
 
@@ -208,6 +222,13 @@ def _derivatives_quality_overlay(side, values, cfg):
     risk_multiplier = 1.0
     blockers = []
     reasons = []
+    adverse_details = []
+    hard_adverse_details = []
+
+    def _adverse(label, *, hard=False):
+        adverse_details.append(str(label))
+        if hard:
+            hard_adverse_details.append(str(label))
 
     funding = _first_finite(values, "funding_rate")
     funding_pct = max(
@@ -232,6 +253,7 @@ def _derivatives_quality_overlay(side, values, cfg):
     ofi = _first_finite(values, "rolling_ofi_score", "rolling_orderbook_imbalance_pct")
     ofi_samples = int(max(0.0, _finite(values.get("rolling_ofi_samples"), 0.0)))
     liquidation = _first_finite(values, "liquidation_imbalance")
+    basis_pct = _first_finite(values, "basis_pct", "mark_index_basis_pct")
 
     adverse_funding = None if funding is None else (funding if side == "long" else -funding)
     funding_soft = float(cfg["derivatives_funding_soft"])
@@ -269,14 +291,17 @@ def _derivatives_quality_overlay(side, values, cfg):
                 f"derivatives crowding: funding {funding:.6f}, "
                 f"L/S {long_short_text}, OI {oi_text}%"
             )
+            _adverse(f"funding {funding:.6f}", hard=True)
         elif adverse_funding >= funding_hard:
             score_delta -= 8.0
             risk_multiplier *= 0.55
             reasons.append(f"hard adverse funding {funding:.6f}")
+            _adverse(f"funding {funding:.6f}", hard=True)
         elif adverse_funding >= funding_soft:
             score_delta -= 4.0
             risk_multiplier *= 0.75
             reasons.append(f"adverse funding {funding:.6f}")
+            _adverse(f"funding {funding:.6f}")
         elif adverse_funding <= -funding_soft:
             score_delta += 2.0
             reasons.append(f"funding tailwind {funding:.6f}")
@@ -289,15 +314,18 @@ def _derivatives_quality_overlay(side, values, cfg):
         score_delta -= 3.0
         risk_multiplier *= 0.85
         reasons.append(f"funding percentile crowded {funding_pct:.0f}")
+        _adverse(f"funding percentile {funding_pct:.0f}")
 
     if crowd_hard and oi_rising and price_stalling:
         blockers.append(
             f"crowded OI stall: L/S {long_short:.2f}, OI {oi_delta:.2f}%, price {side_price:.2f}%"
         )
+        _adverse(f"L/S {long_short:.2f} with OI stall", hard=True)
     elif crowd_soft:
         score_delta -= 4.0
         risk_multiplier *= 0.75
         reasons.append(f"crowding reduced L/S {long_short:.2f}")
+        _adverse(f"L/S crowding {long_short:.2f}", hard=crowd_hard)
 
     if oi_delta is not None:
         if oi_delta >= float(cfg["derivatives_oi_confirm_min_pct"]) and price_confirming:
@@ -308,10 +336,12 @@ def _derivatives_quality_overlay(side, values, cfg):
             score_delta -= 5.0
             risk_multiplier *= 0.75
             reasons.append(f"OI rising without price follow-through {oi_delta:.2f}%")
+            _adverse(f"OI stall {oi_delta:.2f}%")
         elif oi_delta <= -0.40:
             score_delta -= 3.0
             risk_multiplier *= 0.85
             reasons.append(f"OI leaving trend {oi_delta:.2f}%")
+            _adverse(f"OI leaving {oi_delta:.2f}%")
     if oi_delta_4h is not None and side_price_4h is not None:
         if oi_delta_4h >= 1.0 and side_price_4h >= 0.35:
             score_delta += 2.0
@@ -320,14 +350,17 @@ def _derivatives_quality_overlay(side, values, cfg):
             score_delta -= 3.0
             risk_multiplier *= 0.85
             reasons.append(f"4h OI divergence {oi_delta_4h:.2f}%")
+            _adverse(f"4h OI divergence {oi_delta_4h:.2f}%")
     if oi_z is not None and oi_z >= float(cfg["derivatives_oi_z_extreme"]) and (crowd_soft or price_stalling):
         score_delta -= 4.0
         risk_multiplier *= 0.80
         reasons.append(f"extreme OI z {oi_z:.2f}")
+        _adverse(f"OI z {oi_z:.2f}", hard=True)
     if oi_acceleration is not None and oi_acceleration < -0.30 and not price_confirming:
         score_delta -= 2.0
         risk_multiplier *= 0.90
         reasons.append(f"OI acceleration fading {oi_acceleration:.3f}")
+        _adverse(f"OI acceleration fading {oi_acceleration:.3f}")
 
     if ofi is not None and ofi_samples >= int(cfg["derivatives_ofi_min_samples"]):
         signed_ofi = ofi if side == "long" else -ofi
@@ -341,10 +374,12 @@ def _derivatives_quality_overlay(side, values, cfg):
             score_delta -= 8.0
             risk_multiplier *= 0.55
             reasons.append(f"hard opposite orderflow reduced {signed_ofi:.2f}")
+            _adverse(f"opposite OFI {signed_ofi:.2f}", hard=True)
         elif signed_ofi <= -aligned:
             score_delta -= 5.0
             risk_multiplier *= 0.75
             reasons.append(f"orderflow against {signed_ofi:.2f}")
+            _adverse(f"opposite OFI {signed_ofi:.2f}")
 
     if taker_confirm:
         score_delta += 3.0
@@ -353,6 +388,25 @@ def _derivatives_quality_overlay(side, values, cfg):
         score_delta -= 4.0
         risk_multiplier *= 0.85
         reasons.append(f"taker flow against {taker:.3f}")
+        _adverse(f"taker {taker:.3f}")
+
+    if basis_pct is not None:
+        adverse_basis = basis_pct if side == "long" else -basis_pct
+        basis_soft = float(cfg.get("derivatives_basis_soft_pct", 0.15))
+        basis_hard = float(cfg.get("derivatives_basis_hard_pct", 0.35))
+        if adverse_basis >= basis_hard:
+            score_delta -= 6.0
+            risk_multiplier *= 0.60
+            reasons.append(f"hard adverse basis {basis_pct:.3f}%")
+            _adverse(f"basis {basis_pct:.3f}%", hard=True)
+        elif adverse_basis >= basis_soft:
+            score_delta -= 3.0
+            risk_multiplier *= 0.80
+            reasons.append(f"adverse basis {basis_pct:.3f}%")
+            _adverse(f"basis {basis_pct:.3f}%")
+        elif adverse_basis <= -basis_soft:
+            score_delta += 1.0
+            reasons.append(f"basis tailwind {basis_pct:.3f}%")
 
     if liquidation is not None:
         signed_liq = liquidation if side == "long" else -liquidation
@@ -363,11 +417,95 @@ def _derivatives_quality_overlay(side, values, cfg):
             score_delta -= 4.0
             risk_multiplier *= 0.80
             reasons.append("liquidation pressure")
+            _adverse("liquidation pressure")
+
+    adverse_count = len(adverse_details)
+    hard_count = len(hard_adverse_details)
+    if bool(cfg.get("derivatives_multi_adverse_block_enabled", True)):
+        min_count = int(cfg.get("derivatives_multi_adverse_min_count", 3) or 3)
+        min_hard_count = int(cfg.get("derivatives_multi_adverse_min_hard_count", 2) or 2)
+        max_risk = float(cfg.get("derivatives_multi_adverse_max_risk_multiplier", 0.50) or 0.50)
+        has_hard_orderflow = any("opposite OFI" in item for item in hard_adverse_details)
+        has_non_flow_adverse = any(
+            not (item.startswith("opposite OFI") or item.startswith("taker "))
+            for item in adverse_details
+        )
+        if has_hard_orderflow and adverse_count >= 2 and has_non_flow_adverse:
+            blockers.append(
+                "hard opposite orderflow with adverse derivatives: "
+                + "; ".join(adverse_details[:5])
+            )
+        elif (
+            adverse_count >= min_count
+            and (risk_multiplier <= max_risk or hard_count >= min_hard_count)
+        ):
+            blockers.append(
+                "derivatives multi-adverse: " + "; ".join(adverse_details[:5])
+            )
 
     return {
         "score_delta": score_delta,
         "risk_multiplier": _clamp(risk_multiplier, 0.0, 1.15),
         "blockers": tuple(blockers),
+        "reasons": tuple(reasons),
+    }
+
+
+def _regime_opposition_overlay(side, values, cfg):
+    side = str(side or "").lower()
+    if side not in {"long", "short"}:
+        return {"score_threshold_add": 0.0, "risk_multiplier": 1.0, "reasons": ()}
+
+    regime = values.get("market_regime_context")
+    if not isinstance(regime, dict):
+        return {"score_threshold_add": 0.0, "risk_multiplier": 1.0, "reasons": ()}
+
+    items = regime.get("items") if isinstance(regime.get("items"), dict) else {}
+    if not items:
+        return {"score_threshold_add": 0.0, "risk_multiplier": 1.0, "reasons": ()}
+
+    score_threshold_add = 0.0
+    risk_multiplier = 1.0
+    reasons = []
+    strong_move = float(cfg.get("regime_opposition_strong_move_pct", 1.5) or 1.5)
+    opposite_direction = "short" if side == "long" else "long"
+
+    for raw_symbol, item in items.items():
+        if not isinstance(item, dict):
+            continue
+        direction = str(item.get("direction") or "").lower()
+        if direction != opposite_direction:
+            continue
+        symbol_label = str(raw_symbol or "").upper()
+        ret_value = _finite(item.get("return_lookback_pct"), 0.0)
+        strong_opposite = (
+            (side == "long" and ret_value <= -strong_move)
+            or (side == "short" and ret_value >= strong_move)
+        )
+        is_btc = symbol_label.startswith("BTC")
+        is_eth = symbol_label.startswith("ETH")
+        if is_btc and strong_opposite:
+            add = float(cfg.get("regime_strong_opposition_score_add_btc", 7.0) or 7.0)
+            reduce = float(cfg.get("regime_strong_opposition_risk_reduce_btc", 0.70) or 0.70)
+            reasons.append(f"BTC strong opposite regime {direction.upper()} {ret_value:.2f}%")
+        elif is_btc:
+            add = float(cfg.get("regime_opposition_score_add_btc", 4.0) or 4.0)
+            reduce = float(cfg.get("regime_opposition_risk_reduce_btc", 0.85) or 0.85)
+            reasons.append(f"BTC opposite regime {direction.upper()}")
+        elif is_eth:
+            add = float(cfg.get("regime_opposition_score_add_eth", 2.0) or 2.0)
+            reduce = float(cfg.get("regime_opposition_risk_reduce_eth", 0.92) or 0.92)
+            reasons.append(f"ETH opposite regime {direction.upper()}")
+        else:
+            add = 1.0
+            reduce = 0.95
+            reasons.append(f"{symbol_label} opposite regime {direction.upper()}")
+        score_threshold_add += max(0.0, add)
+        risk_multiplier *= _clamp(reduce, 0.0, 1.0)
+
+    return {
+        "score_threshold_add": score_threshold_add,
+        "risk_multiplier": _clamp(risk_multiplier, 0.0, 1.0),
         "reasons": tuple(reasons),
     }
 
@@ -760,6 +898,8 @@ def evaluate_ev_adaptive_entry(*, side, candidate_type, values=None, config=None
     score += derivatives_overlay["score_delta"]
     blockers.extend(derivatives_overlay["blockers"])
     reasons.extend(derivatives_overlay["reasons"])
+    regime_overlay = _regime_opposition_overlay(side, values, cfg)
+    reasons.extend(regime_overlay["reasons"])
 
     score = _clamp(score, 0.0, 100.0)
 
@@ -804,6 +944,10 @@ def evaluate_ev_adaptive_entry(*, side, candidate_type, values=None, config=None
         and momentum_votes >= 2
         and mtf_votes >= 1
         and (price_breakout or range_expansion >= 1.15)
+        and (
+            not bool(cfg.get("stale_relief_requires_reacceleration", True))
+            or reacceleration
+        )
     )
     if stale_relief_ok and _remove_blocker(blockers, stale_blocker):
         reasons.append(
@@ -825,6 +969,7 @@ def evaluate_ev_adaptive_entry(*, side, candidate_type, values=None, config=None
         and efficiency >= float(_side_config(cfg, side, "no_edge_relief_min_efficiency"))
         and range_expansion >= float(_side_config(cfg, side, "no_edge_relief_min_range_expansion"))
         and price_breakout
+        and (not continuation or reacceleration)
         and momentum_available >= 2
         and momentum_votes >= 2
         and mtf_votes >= 1
@@ -850,8 +995,16 @@ def evaluate_ev_adaptive_entry(*, side, candidate_type, values=None, config=None
     expected_before_cost = win_probability * gross_win_r - (1.0 - win_probability)
 
     min_entry_score = float(_side_config(cfg, side, "min_entry_score"))
-    if score < min_entry_score:
-        blockers.append(f"score {score:.1f}<{min_entry_score:.1f}")
+    regime_score_add = float(regime_overlay.get("score_threshold_add", 0.0) or 0.0)
+    adjusted_min_entry_score = min_entry_score + regime_score_add
+    if score < adjusted_min_entry_score:
+        if regime_score_add > 0:
+            blockers.append(
+                f"score {score:.1f}<{adjusted_min_entry_score:.1f} "
+                f"(regime adjusted +{regime_score_add:.1f})"
+            )
+        else:
+            blockers.append(f"score {score:.1f}<{min_entry_score:.1f}")
     if score >= 82.0:
         risk_multiplier = 1.0
     elif score >= 74.0:
@@ -878,9 +1031,9 @@ def evaluate_ev_adaptive_entry(*, side, candidate_type, values=None, config=None
         risk_multiplier *= 0.60
         reasons.append("short risk asymmetry")
         if (
-            score < float(cfg["min_entry_score"])
-            or adx < float(cfg["trend_min_adx"])
-            or volume < float(cfg["trend_min_volume_ratio"])
+            score < adjusted_min_entry_score
+            or adx < trend_min_adx
+            or volume < trend_min_volume_ratio
         ):
             risk_multiplier = min(
                 risk_multiplier,
@@ -888,6 +1041,7 @@ def evaluate_ev_adaptive_entry(*, side, candidate_type, values=None, config=None
             )
             reasons.append("short relaxation risk cap")
     risk_multiplier *= float(derivatives_overlay["risk_multiplier"])
+    risk_multiplier *= float(regime_overlay.get("risk_multiplier", 1.0) or 1.0)
     risk_multiplier = min(risk_multiplier, relief_risk_cap)
 
     allowed = not blockers
