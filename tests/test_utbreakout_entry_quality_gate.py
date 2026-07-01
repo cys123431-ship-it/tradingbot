@@ -41,15 +41,15 @@ def test_entry_quality_gate_allows_moderate_short_signal():
     state, detail = _engine()._evaluate_utbreakout_entry_quality_gate(
         "short",
         _cfg(),
-        final_risk_multiplier=0.42,
+        final_risk_multiplier=0.46,
         market_quality={"state": "reduced", "risk_multiplier": 0.75},
         ev_decision=_ev_decision(),
-        ev_net=_ev_net(0.24),
+        ev_net=_ev_net(0.32),
         ev_exit=_ev_exit(True),
     )
 
     assert state == "reduced"
-    assert "PASS final x0.420>=x0.40" in detail
+    assert "PASS final x0.460>=x0.45" in detail
 
 
 def test_entry_quality_gate_blocks_weak_long_final_multiplier():
@@ -64,15 +64,15 @@ def test_entry_quality_gate_blocks_weak_long_final_multiplier():
     )
 
     assert state is False
-    assert "final risk multiplier x0.360<x0.45" in detail
+    assert "final risk multiplier x0.360<x0.50" in detail
 
 
 @pytest.mark.parametrize(
     "decision,net,expected",
     [
-        (_ev_decision(score=55.0), _ev_net(0.30), "EV score 55.0<60.0"),
+        (_ev_decision(score=55.0), _ev_net(0.30), "EV score 55.0<66.0"),
         (_ev_decision(win_probability=0.51), _ev_net(0.30), "EV p 0.51<0.54"),
-        (_ev_decision(), _ev_net(0.12), "EV net 0.120R<0.22R"),
+        (_ev_decision(), _ev_net(0.12), "EV net 0.120R<0.30R"),
         (_ev_decision(mtf_alignment="1/3"), _ev_net(0.30), "MTF 1/3<2/3"),
     ],
 )

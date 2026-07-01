@@ -187,7 +187,7 @@ def test_utbreakout_status_includes_compact_long_short_traffic_lights():
         "🟢 만족 3. 선택 Set 필터: 선택 Set 추가 필터 없음",
         "🟡 축소 4. 시장 품질: REDUCE x0.25",
         "🔴 불만족 5. EV Adaptive 기대값: NO_TRADE score 41.5: MTF alignment 0/3; score 41.5<60.0",
-        "🟢 만족 6. 일일 리스크: PnL 0.00 / trades 0/7",
+        "🟢 만족 6. 일일 리스크: PnL 0.00 / trades 0/5",
         "🟡 대기 7. ATR 손절/RR/수량: 리스크 예산 없음",
     ]
     short_lines = [
@@ -198,7 +198,7 @@ def test_utbreakout_status_includes_compact_long_short_traffic_lights():
         "🟢 만족 3. 선택 Set 필터: 선택 Set 추가 필터 없음",
         "🟡 축소 4. 시장 품질: REDUCE x0.25",
         "🔴 불만족 5. EV Adaptive 기대값: NO_TRADE score 38.2: no trend or squeeze edge",
-        "🟢 만족 6. 일일 리스크: PnL 0.00 / trades 0/7",
+        "🟢 만족 6. 일일 리스크: PnL 0.00 / trades 0/5",
         "🟡 대기 7. ATR 손절/RR/수량: 리스크 예산 없음",
     ]
     
@@ -256,7 +256,7 @@ def _sample_long_short_status_lines():
         "🟢 만족 3. 선택 Set 필터: 선택 Set 추가 필터 없음",
         "🟡 축소 4. 시장 품질: REDUCE x0.25",
         "🔴 불만족 5. EV Adaptive 기대값: NO_TRADE score 33.4: stale continuation 112>10, MTF 1/3, score 33.4<60",
-        "🟢 만족 6. 일일 리스크: PnL 0.00 / trades 0/7",
+        "🟢 만족 6. 일일 리스크: PnL 0.00 / trades 0/5",
         "🟡 대기 7. ATR 손절/RR/수량: 리스크 예산 없음",
         "참고/감액",
         "🟢 만족 - Feature Score: 33.4 / sample",
@@ -269,7 +269,7 @@ def _sample_long_short_status_lines():
         "🟢 만족 3. 선택 Set 필터: 선택 Set 추가 필터 없음",
         "🟡 축소 4. 시장 품질: REDUCE x0.25",
         "🟢 만족 5. EV Adaptive 기대값: GO score 66.2 net=0.410R",
-        "🟢 만족 6. 일일 리스크: PnL 0.00 / trades 0/7",
+        "🟢 만족 6. 일일 리스크: PnL 0.00 / trades 0/5",
         "🟢 만족 7. ATR 손절/RR/수량: qty 12.0 risk 1.10",
         "참고/감액",
         "🟢 만족 - Feature Score: 66.2 / sample",

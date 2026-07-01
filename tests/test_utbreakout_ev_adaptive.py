@@ -41,8 +41,8 @@ def test_strong_trend_uses_convex_exit_without_increasing_initial_risk():
     assert decision.mode == "STRONG_TREND"
     assert decision.risk_multiplier <= 1.0
     assert decision.exit_profile.tp1_r == 1.0
-    assert decision.exit_profile.tp2_r == 3.5
-    assert decision.exit_profile.runner_ratio == 0.45
+    assert decision.exit_profile.tp2_r == 4.2
+    assert decision.exit_profile.runner_ratio == 0.55
 
 
 def test_short_momentum_is_blocked_during_panic_rebound():
@@ -57,7 +57,7 @@ def test_short_momentum_is_blocked_during_panic_rebound():
             "htf_close": 88.0,
             "htf_ema_fast": 90.0,
             "htf_ema_slow": 94.0,
-            "adx": 28.0,
+            "adx": 30.0,
             "plus_di": 12.0,
             "minus_di": 29.0,
             "chop": 42.0,
@@ -175,7 +175,7 @@ def test_squeeze_release_gets_its_own_exit_profile():
     assert decision.allowed is True
     assert decision.mode == "SQUEEZE_BREAKOUT"
     assert decision.exit_profile.tp1_r == 1.2
-    assert decision.exit_profile.tp2_r == 2.8
+    assert decision.exit_profile.tp2_r == 3.2
 
 
 def test_cost_gate_rejects_positive_gross_edge_when_fees_consume_it():
@@ -258,12 +258,12 @@ def test_candidate_ranking_prefers_net_edge_over_legacy_indicator_score():
 def test_live_effective_profile_retires_legacy_set_selection_and_risk_floor():
     cfg = apply_profit_opportunity_effective_overrides({})
 
-    assert cfg["effective_profile_version"] == "ev_adaptive_v2"
+    assert cfg["effective_profile_version"] == "ev_adaptive_v3_profit_engine"
     assert cfg["live_auto_set_whitelist"] == [64]
     assert cfg["active_set_id"] == 64
     assert cfg["final_risk_multiplier_floor"] == 0.0
-    assert cfg["partial_take_profit_ratio"] == 0.30
-    assert cfg["second_take_profit_r_multiple"] == 2.0
+    assert cfg["partial_take_profit_ratio"] == 0.25
+    assert cfg["second_take_profit_r_multiple"] == 2.4
 
 
 def test_live_auto_selection_uses_only_ev_adaptive_set():
@@ -287,7 +287,7 @@ def test_live_auto_selection_uses_only_ev_adaptive_set():
     assert analysis["scores"]["auto_final_set_id"] == 64
 
 
-def test_live_auto_selection_reason_says_ev_adaptive_v2():
+def test_live_auto_selection_reason_says_ev_adaptive_v3_profit_engine():
     engine = object.__new__(SignalEngine)
     cfg = apply_profit_opportunity_effective_overrides(
         {"live_trading": True, "mode": "live"}
@@ -295,8 +295,8 @@ def test_live_auto_selection_reason_says_ev_adaptive_v2():
     selected, reason = engine._select_utbreakout_auto_set({"scores": {}}, cfg)
 
     assert selected == 64
-    assert "EV Adaptive V2" in reason
-    assert "EV Adaptive V1" not in reason
+    assert "EV Adaptive V3_PROFIT_ENGINE" in reason
+    assert "EV Adaptive V2" not in reason
 
 
 def test_live_trailing_state_preserves_normal_ev_runner_without_growth_overlay():
@@ -553,8 +553,8 @@ def test_no_edge_can_be_relieved_only_by_strict_breakout_substitute():
             "plus_di": 31.0,
             "minus_di": 12.0,
             "chop": 64.0,  # prevents normal TREND because trend_max_chop is 60
-            "volume_ratio": 1.45,
-            "directional_efficiency": 0.36,
+            "volume_ratio": 1.55,
+            "directional_efficiency": 0.40,
             "momentum_6_pct": 0.8,
             "momentum_12_pct": 1.5,
             "momentum_24_pct": 2.4,

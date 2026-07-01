@@ -977,13 +977,13 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "market_quality_min_risk_multiplier": 0.0,
         "final_risk_multiplier_floor": 0.0,
         "entry_quality_gate_enabled": True,
-        "entry_quality_gate_min_final_risk_multiplier": 0.40,
-        "entry_quality_gate_long_min_final_risk_multiplier": 0.45,
-        "entry_quality_gate_short_min_final_risk_multiplier": 0.40,
+        "entry_quality_gate_min_final_risk_multiplier": 0.45,
+        "entry_quality_gate_long_min_final_risk_multiplier": 0.50,
+        "entry_quality_gate_short_min_final_risk_multiplier": 0.45,
         "entry_quality_gate_hard_market_multiplier_below": 0.30,
-        "entry_quality_gate_min_ev_score": 60.0,
+        "entry_quality_gate_min_ev_score": 66.0,
         "entry_quality_gate_min_ev_probability": 0.54,
-        "entry_quality_gate_min_ev_net_expectancy_r": 0.22,
+        "entry_quality_gate_min_ev_net_expectancy_r": 0.30,
         "entry_quality_gate_min_ev_mtf_votes": 2,
         "aggressive_growth_enabled": False,
         "aggressive_growth_pyramiding_enabled": False,
@@ -992,8 +992,8 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "utbreakout_recent_loss_cooldown_min_loss_usdt": 0.0,
 
         # Cost-aware EV gate.
-        "ev_min_entry_score": 57.0,
-        "ev_min_net_expectancy_r": 0.10,
+        "ev_min_entry_score": 62.0,
+        "ev_min_net_expectancy_r": 0.14,
         "ev_entry_fee_rate_pct": 0.04,
         "ev_exit_fee_rate_pct": 0.04,
         "ev_slippage_rate_pct_each_side": 0.02,
@@ -1004,8 +1004,8 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "ev_extreme_atr_pct": 2.50,
         "ev_panic_rebound_block_pct": 6.0,
         "ev_continuation_max_signal_age_bars": 8.0,
-        "ev_continuation_reacceleration_range_min": 1.08,
-        "ev_continuation_reacceleration_volume_min": 0.95,
+        "ev_continuation_reacceleration_range_min": 1.10,
+        "ev_continuation_reacceleration_volume_min": 1.00,
         "ev_max_extension_atr": 2.40,
         "ev_preferred_extension_atr": 1.60,
         "ev_mtf_min_aligned": 2,
@@ -1015,34 +1015,34 @@ def apply_profit_opportunity_effective_overrides(cfg):
 
         "ev_mtf_relief_enabled": True,
         "ev_mtf_relief_min_votes": 1,
-        "ev_mtf_relief_min_score": 70.0,
+        "ev_mtf_relief_min_score": 74.0,
         "ev_mtf_relief_min_adx": 26.0,
         "ev_mtf_relief_min_volume_ratio": 1.15,
         "ev_mtf_relief_min_efficiency": 0.28,
 
         "ev_stale_relief_enabled": True,
         "ev_stale_relief_max_age_bars": 24.0,
-        "ev_stale_relief_min_score": 73.0,
-        "ev_stale_relief_min_adx": 25.0,
-        "ev_stale_relief_min_volume_ratio": 1.15,
+        "ev_stale_relief_min_score": 76.0,
+        "ev_stale_relief_min_adx": 26.0,
+        "ev_stale_relief_min_volume_ratio": 1.18,
         "ev_stale_relief_requires_reacceleration": True,
 
         "ev_no_edge_relief_enabled": True,
-        "ev_no_edge_relief_min_score": 70.0,
-        "ev_no_edge_relief_min_adx": 24.0,
-        "ev_no_edge_relief_min_volume_ratio": 1.10,
+        "ev_no_edge_relief_min_score": 74.0,
+        "ev_no_edge_relief_min_adx": 25.0,
+        "ev_no_edge_relief_min_volume_ratio": 1.16,
         "ev_no_edge_relief_min_efficiency": 0.27,
         "ev_no_edge_relief_min_range_expansion": 1.10,
-        "ev_short_min_entry_score": 57.0,
+        "ev_short_min_entry_score": 62.0,
         "ev_short_trend_min_adx": 16.0,
         "ev_short_trend_min_volume_ratio": 0.60,
-        "ev_short_no_edge_relief_min_score": 68.0,
-        "ev_short_no_edge_relief_min_adx": 23.0,
-        "ev_short_no_edge_relief_min_volume_ratio": 1.05,
+        "ev_short_no_edge_relief_min_score": 72.0,
+        "ev_short_no_edge_relief_min_adx": 24.0,
+        "ev_short_no_edge_relief_min_volume_ratio": 1.12,
         "ev_short_no_edge_relief_min_efficiency": 0.24,
         "ev_short_no_edge_relief_min_range_expansion": 1.08,
-        "ev_short_conditional_relief_risk_cap": 0.30,
-        "ev_short_relaxed_signal_risk_cap": 0.30,
+        "ev_short_conditional_relief_risk_cap": 0.25,
+        "ev_short_relaxed_signal_risk_cap": 0.25,
         "ev_derivatives_basis_soft_pct": 0.15,
         "ev_derivatives_basis_hard_pct": 0.35,
         "ev_derivatives_multi_adverse_block_enabled": True,
@@ -1069,20 +1069,20 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "fixed_take_profit_enabled": True,
         "partial_take_profit_enabled": True,
         "partial_take_profit_r_multiple": 1.00,
-        "partial_take_profit_ratio": 0.30,
+        "partial_take_profit_ratio": 0.25,
         "second_take_profit_enabled": True,
-        "second_take_profit_r_multiple": 2.00,
-        "second_take_profit_ratio": 0.40,
-        "runner_pct": 0.30,
+        "second_take_profit_r_multiple": 2.40,
+        "second_take_profit_ratio": 0.35,
+        "runner_pct": 0.40,
         "dynamic_take_profit_enabled": False,
         "atr_trailing_enabled": True,
-        "atr_trailing_activation_r": 1.00,
-        "atr_trailing_multiplier": 2.70,
+        "atr_trailing_activation_r": 1.10,
+        "atr_trailing_multiplier": 3.00,
         "shadow_runner_exit_enabled": True,
         "runner_exit_enabled": True,
         "runner_chandelier_enabled": True,
-        "runner_chandelier_multiplier": 2.70,
-        "runner_chandelier_multiplier_max": 3.50,
+        "runner_chandelier_multiplier": 3.00,
+        "runner_chandelier_multiplier_max": 4.20,
 
         # Keep adaptive research bounded around the EV baseline.
         "adaptive_exit_partial_r_min": 1.0,
@@ -1095,12 +1095,12 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "adaptive_exit_activation_r_max": 1.4,
 
         # Bounded activity
-        "max_daily_trades": 7,
+        "max_daily_trades": 5,
         "max_consecutive_losses": 5,
     })
 
     cfg["take_profit_r_multiple"] = float(
-        cfg.get("second_take_profit_r_multiple", 2.00) or 2.00
+        cfg.get("second_take_profit_r_multiple", 2.40) or 2.40
     )
     allowed_sets = set(cfg.get("live_auto_set_whitelist") or [])
     active_set_id = _safe_set_id(cfg.get("active_set_id") or cfg.get("profile"))
@@ -1113,8 +1113,8 @@ def apply_profit_opportunity_effective_overrides(cfg):
 def _ev_adaptive_runtime_config(cfg):
     cfg = dict(cfg or {})
     return {
-        "min_entry_score": cfg.get("ev_min_entry_score", 57.0),
-        "min_net_expectancy_r": cfg.get("ev_min_net_expectancy_r", 0.10),
+        "min_entry_score": cfg.get("ev_min_entry_score", 62.0),
+        "min_net_expectancy_r": cfg.get("ev_min_net_expectancy_r", 0.14),
         "entry_fee_rate_pct": cfg.get("ev_entry_fee_rate_pct", 0.04),
         "exit_fee_rate_pct": cfg.get("ev_exit_fee_rate_pct", 0.04),
         "slippage_rate_pct_each_side": cfg.get("ev_slippage_rate_pct_each_side", 0.02),
@@ -1162,7 +1162,7 @@ def _ev_adaptive_runtime_config(cfg):
         "no_edge_relief_min_volume_ratio": cfg.get("ev_no_edge_relief_min_volume_ratio", 1.10),
         "no_edge_relief_min_efficiency": cfg.get("ev_no_edge_relief_min_efficiency", 0.27),
         "no_edge_relief_min_range_expansion": cfg.get("ev_no_edge_relief_min_range_expansion", 1.10),
-        "short_min_entry_score": cfg.get("ev_short_min_entry_score", 57.0),
+        "short_min_entry_score": cfg.get("ev_short_min_entry_score", 62.0),
         "short_trend_min_adx": cfg.get("ev_short_trend_min_adx", 16.0),
         "short_trend_min_volume_ratio": cfg.get("ev_short_trend_min_volume_ratio", 0.60),
         "short_no_edge_relief_min_score": cfg.get("ev_short_no_edge_relief_min_score", 68.0),
@@ -1226,7 +1226,7 @@ def build_utbreakout_effective_status_contract(cfg, daily_entries=None):
     lines = [
         f"Effective Profile: {effective.get('effective_profile_version', 'UNKNOWN')}",
         "Strategy Router: EV Adaptive (TREND / STRONG_TREND / SQUEEZE_BREAKOUT / NO_TRADE)",
-        f"Effective TP2: {float(effective.get('second_take_profit_r_multiple', 2.00) or 2.00):.2f}R",
+        f"Effective TP2: {float(effective.get('second_take_profit_r_multiple', 2.40) or 2.40):.2f}R",
         (
             "Effective volume: "
             f"base {float(effective.get('bias_continuation_min_volume_ratio', 0.40) or 0.40):.2f} / "
@@ -1236,7 +1236,7 @@ def build_utbreakout_effective_status_contract(cfg, daily_entries=None):
             "익절 계획: "
             f"TP1 {float(effective.get('partial_take_profit_r_multiple', 1.00) or 1.00):.2f}R"
             f"({float(effective.get('partial_take_profit_ratio', 0.30) or 0.30):.0%}) / "
-            f"TP2 {float(effective.get('second_take_profit_r_multiple', 2.00) or 2.00):.2f}R"
+            f"TP2 {float(effective.get('second_take_profit_r_multiple', 2.40) or 2.40):.2f}R"
             f"({float(effective.get('second_take_profit_ratio', 0.40) or 0.40):.0%})"
         ),
     ]
@@ -1246,7 +1246,7 @@ def build_utbreakout_effective_status_contract(cfg, daily_entries=None):
         except (TypeError, ValueError):
             entry_count = 0
         lines.append(
-            f"일일 리스크: trades {entry_count}/{int(effective.get('max_daily_trades', 7) or 7)}"
+            f"일일 리스크: trades {entry_count}/{int(effective.get('max_daily_trades', 5) or 5)}"
         )
     return lines
 
@@ -1394,13 +1394,13 @@ def apply_stable_utbreak_final_overrides(cfg):
         "market_quality_min_risk_multiplier": 0.0,
         "final_risk_multiplier_floor": 0.0,
         "entry_quality_gate_enabled": True,
-        "entry_quality_gate_min_final_risk_multiplier": 0.35,
-        "entry_quality_gate_long_min_final_risk_multiplier": 0.40,
-        "entry_quality_gate_short_min_final_risk_multiplier": 0.35,
+        "entry_quality_gate_min_final_risk_multiplier": 0.45,
+        "entry_quality_gate_long_min_final_risk_multiplier": 0.50,
+        "entry_quality_gate_short_min_final_risk_multiplier": 0.45,
         "entry_quality_gate_hard_market_multiplier_below": 0.25,
-        "entry_quality_gate_min_ev_score": 58.0,
-        "entry_quality_gate_min_ev_probability": 0.53,
-        "entry_quality_gate_min_ev_net_expectancy_r": 0.18,
+        "entry_quality_gate_min_ev_score": 66.0,
+        "entry_quality_gate_min_ev_probability": 0.54,
+        "entry_quality_gate_min_ev_net_expectancy_r": 0.30,
         "entry_quality_gate_min_ev_mtf_votes": 2,
 
         # Set32 keeps structure confirmation with more tolerant flow inputs.
@@ -1420,19 +1420,19 @@ def apply_stable_utbreak_final_overrides(cfg):
 
         # Exit profile
         "partial_take_profit_r_multiple": 1.00,
-        "partial_take_profit_ratio": 0.30,
-        "second_take_profit_r_multiple": 2.00,
-        "second_take_profit_ratio": 0.40,
-        "runner_pct": 0.30,
+        "partial_take_profit_ratio": 0.25,
+        "second_take_profit_r_multiple": 2.40,
+        "second_take_profit_ratio": 0.35,
+        "runner_pct": 0.40,
         "dynamic_take_profit_enabled": False,
-        "atr_trailing_activation_r": 1.00,
-        "atr_trailing_multiplier": 2.70,
+        "atr_trailing_activation_r": 1.10,
+        "atr_trailing_multiplier": 3.00,
         "atr_trailing_enabled": True,
         "shadow_runner_exit_enabled": True,
         "runner_exit_enabled": True,
         "runner_chandelier_enabled": True,
-        "runner_chandelier_multiplier": 2.70,
-        "runner_chandelier_multiplier_max": 3.50,
+        "runner_chandelier_multiplier": 3.00,
+        "runner_chandelier_multiplier_max": 4.20,
         "adaptive_exit_partial_r_min": 1.0,
         "adaptive_exit_partial_r_max": 1.2,
         "adaptive_exit_ratio_min": 0.20,
@@ -1442,7 +1442,7 @@ def apply_stable_utbreak_final_overrides(cfg):
         "adaptive_exit_activation_r_min": 1.4,
         "adaptive_exit_activation_r_max": 1.8,
 
-        "max_daily_trades": 7,
+        "max_daily_trades": 5,
         "max_consecutive_losses": 5,
     })
     cfg = apply_profit_opportunity_effective_overrides(cfg)
@@ -2239,7 +2239,7 @@ def build_default_utbot_filtered_breakout_config():
         'aggressive_growth_cppi_max_sleeve_pct': 0.20,
         'max_risk_per_trade_usdt': 1.0,
         'daily_max_loss_usdt': 3.0,
-        'max_daily_trades': 7,
+        'max_daily_trades': 5,
         'max_consecutive_losses': 5,
         'daily_profit_target_enabled': False,
         'daily_profit_target_usdt': 5.0,
@@ -6949,7 +6949,7 @@ class SignalEngine(BaseEngine):
             'adx_length': 14,
             'atr_length': 14,
             'donchian_length': 20,
-            'max_daily_trades': 7,
+            'max_daily_trades': 5,
             'max_consecutive_losses': 5,
             'sl_place_max_retries': 3,
             'opposite_set_exit_min_hold_candles': 3,
@@ -15766,8 +15766,8 @@ class SignalEngine(BaseEngine):
                             f"x{ev_plan_multiplier:.2f}"
                         )
                 plan_cfg['take_profit_r_multiple'] = max(
-                    float(plan_cfg.get('take_profit_r_multiple', 2.00) or 2.00),
-                    float(plan_cfg.get('second_take_profit_r_multiple', 2.00) or 2.00),
+                    float(plan_cfg.get('take_profit_r_multiple', 2.40) or 2.40),
+                    float(plan_cfg.get('second_take_profit_r_multiple', 2.40) or 2.40),
                 )
                 plan = calculate_risk_plan(
                     side=side_for_plan,
@@ -15775,7 +15775,7 @@ class SignalEngine(BaseEngine):
                     atr_value=atr_value,
                     stop_atr_multiplier=plan_cfg.get('stop_atr_multiplier', 1.5),
                     ut_stop=ut_detail.get('curr_stop'),
-                    take_profit_r_multiple=plan_cfg.get('take_profit_r_multiple', 2.00),
+                    take_profit_r_multiple=plan_cfg.get('take_profit_r_multiple', 2.40),
                     min_risk_reward=plan_cfg.get('min_risk_reward', 2.0),
                     balance_usdt=balance_for_risk,
                     risk_per_trade_percent=risk_per_trade_percent,
@@ -15855,7 +15855,7 @@ class SignalEngine(BaseEngine):
                     f"손절시 손실 {_fmt(risk_usdt, 2)} USDT"
                 )
                 tp1_r = float(plan_cfg.get('partial_take_profit_r_multiple', 1.00) or 1.00)
-                tp2_r = float(plan_cfg.get('second_take_profit_r_multiple', 2.00) or 2.00)
+                tp2_r = float(plan_cfg.get('second_take_profit_r_multiple', 2.40) or 2.40)
                 tp1_ratio = float(plan_cfg.get('partial_take_profit_ratio', 0.30) or 0.30)
                 tp2_ratio = float(plan_cfg.get('second_take_profit_ratio', 0.40) or 0.40)
                 take_profit_detail = (
@@ -16974,8 +16974,8 @@ class SignalEngine(BaseEngine):
                             f"x{ev_plan_multiplier:.2f}"
                         )
                 plan_cfg['take_profit_r_multiple'] = max(
-                    float(plan_cfg.get('take_profit_r_multiple', 2.00) or 2.00),
-                    float(plan_cfg.get('second_take_profit_r_multiple', 2.00) or 2.00),
+                    float(plan_cfg.get('take_profit_r_multiple', 2.40) or 2.40),
+                    float(plan_cfg.get('second_take_profit_r_multiple', 2.40) or 2.40),
                 )
                 plan = calculate_risk_plan(
                     side=side_for_plan,
@@ -16983,7 +16983,7 @@ class SignalEngine(BaseEngine):
                     atr_value=atr_value,
                     stop_atr_multiplier=plan_cfg.get('stop_atr_multiplier', 1.5),
                     ut_stop=ut_detail.get('curr_stop'),
-                    take_profit_r_multiple=plan_cfg.get('take_profit_r_multiple', 2.00),
+                    take_profit_r_multiple=plan_cfg.get('take_profit_r_multiple', 2.40),
                     min_risk_reward=plan_cfg.get('min_risk_reward', 2.0),
                     balance_usdt=balance_for_risk,
                     risk_per_trade_percent=risk_per_trade_percent,
@@ -17063,7 +17063,7 @@ class SignalEngine(BaseEngine):
                     f"손절시 손실 {_fmt(risk_usdt, 2)} USDT"
                 )
                 tp1_r = float(plan_cfg.get('partial_take_profit_r_multiple', 1.00) or 1.00)
-                tp2_r = float(plan_cfg.get('second_take_profit_r_multiple', 2.00) or 2.00)
+                tp2_r = float(plan_cfg.get('second_take_profit_r_multiple', 2.40) or 2.40)
                 tp1_ratio = float(plan_cfg.get('partial_take_profit_ratio', 0.30) or 0.30)
                 tp2_ratio = float(plan_cfg.get('second_take_profit_ratio', 0.40) or 0.40)
                 take_profit_detail = (
@@ -23178,6 +23178,15 @@ class SignalEngine(BaseEngine):
                             source='auto_entry_bridge_post_check',
                         )
                         continue
+                    self._record_coin_selector_candidate_outcome(
+                        symbol,
+                        reason='auto entry bridge blocked before direct entry',
+                        cfg=cfg,
+                        decision_key=(
+                            f"bridge_blocked:{int(scan_started_at // 60)}"
+                        ),
+                    )
+                    continue
 
                 if not sig and active_strategy in UTBREAKOUT_STRATEGIES:
                     diag = self._utbreakout_diag_for_symbol(symbol)

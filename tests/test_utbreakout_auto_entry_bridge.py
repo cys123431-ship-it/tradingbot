@@ -464,6 +464,96 @@ def test_coin_selector_scanner_invokes_bridge_after_scanner_seen(tmp_path):
     assert "POSITION_CONFIRMED" in stages
 
 
+def test_coin_selector_scanner_does_not_direct_entry_when_bridge_blocks(tmp_path):
+    bridge_calls = []
+    entry_calls = []
+
+    class Controller:
+        is_paused = False
+
+    class MarketDataExchange:
+        def fetch_ohlcv(self, symbol, timeframe, limit=300):
+            return [
+                [index * 900_000, 100.0, 101.0, 99.0, 100.5, 1000.0]
+                for index in range(300)
+            ]
+
+    engine = _build_engine()
+    engine.runtime_dir = str(tmp_path)
+    engine.ctrl = Controller()
+    engine.market_data_exchange = MarketDataExchange()
+    engine.coin_selector_candidate_cooldowns = {}
+    engine.last_entry_reason = {}
+    engine.scanner_active_symbol = None
+    engine._get_coin_selector_config = lambda: {
+        "top_n": 10,
+        "candidate_cooldown_enabled": False,
+    }
+    engine.get_runtime_trade_config = lambda: {
+        "strategy_params": engine.get_runtime_strategy_params(),
+    }
+    engine.get_runtime_common_settings = lambda: {
+        "scanner_timeframe": "15m",
+    }
+    engine._micro_auto_enabled = lambda: False
+
+    async def evaluate_coin_selector(force=False):
+        return {
+            "selected": [{
+                "exchange_symbol": "SOL/USDT:USDT",
+                "normalized_symbol": "SOL/USDT",
+                "selection_state": "SELECTED",
+                "score": 90.0,
+                "quote_volume": 1_000_000.0,
+                "auto_set_id": 64,
+                "adaptive_tf": "15m",
+            }]
+        }
+
+    async def bridge(symbol, source="scanner"):
+        bridge_calls.append((symbol, source))
+        return False
+
+    async def calculate_strategy_signal(*args, **kwargs):
+        engine._set_utbot_filtered_breakout_entry_plan(
+            "SOL/USDT:USDT",
+            {
+                "side": "long",
+                "entry_price": 100.5,
+                "qty": 0.5,
+                "planned_notional": 50.25,
+                "planned_margin": 10.05,
+                "risk_usdt": 1.0,
+            },
+        )
+        return "long", True, False, "UTBreakout", "utbreakout", False
+
+    async def entry(symbol, side, price):
+        entry_calls.append((symbol, side, price))
+
+    async def get_server_position(symbol, use_cache=False):
+        return None
+
+    engine.evaluate_coin_selector = evaluate_coin_selector
+    engine._collect_primary_strategy_context = lambda *args, **kwargs: {
+        "precomputed": {},
+    }
+    engine._calculate_strategy_signal = calculate_strategy_signal
+    engine._utbreakout_diag_for_symbol = lambda symbol: {
+        "accepted_side": "long",
+        "reason": "accepted",
+    }
+    engine._maybe_run_utbreakout_auto_entry_bridge = bridge
+    engine.entry = entry
+    engine.get_server_position = get_server_position
+
+    asyncio.run(engine._scan_and_trade_coin_selector())
+
+    assert bridge_calls == [("SOL/USDT:USDT", "scanner_seen")]
+    assert entry_calls == []
+    assert engine.scanner_active_symbol is None
+
+
 def test_live_scanner_records_status_ready_from_accepted_diag_and_plan():
     engine = _build_engine()
     symbol = "SOL/USDT:USDT"
@@ -473,7 +563,7 @@ def test_live_scanner_records_status_ready_from_accepted_diag_and_plan():
             "candidate_type": "fresh_signal",
             "decision_candle_ts": 1234567890,
             "entry_timeframe": "15m",
-            "effective_profile_version": "ev_adaptive_v2",
+            "effective_profile_version": "ev_adaptive_v3_profit_engine",
             "auto_selected_set_id": 64,
         }
     }
