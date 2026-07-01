@@ -176,7 +176,7 @@ jobs:
 
             echo "=== Verify deployed UTBreak status contract ==="
             echo "deployed revision: $(git rev-parse HEAD)"
-            grep -F 'EV_ADAPTIVE_PROFILE_VERSION = "ev_adaptive_v2"' utbreakout/ev_adaptive.py >/dev/null
+            grep -F 'EV_ADAPTIVE_PROFILE_VERSION = "ev_adaptive_v3_profit_engine"' utbreakout/ev_adaptive.py >/dev/null
             if ! grep -F 'UTBREAK_EFFECTIVE_STATUS_CONTRACT' "$LOG_FILE" | tail -n 1; then
               echo "UTBreak effective status contract startup log missing"
               tail -n 80 "$LOG_FILE" || true
