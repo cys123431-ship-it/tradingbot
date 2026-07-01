@@ -727,6 +727,7 @@ def test_coin_selector_tradifi_universe_only_auto_on_binance_mainnet():
     signal_engine = _signal_engine_cls()
     engine = signal_engine.__new__(signal_engine)
     engine.is_upbit_mode = lambda: False
+    engine._coin_selector_tradifi_regular_session_status = lambda: {"open": True}
     cfg = {"include_tradifi_universe": True}
 
     class MainnetCtrl:
@@ -741,8 +742,99 @@ def test_coin_selector_tradifi_universe_only_auto_on_binance_mainnet():
     assert engine._coin_selector_should_include_tradifi_universe(cfg, custom_enabled=False) is True
     assert engine._coin_selector_should_include_tradifi_universe(cfg, custom_enabled=True) is False
 
+    engine._coin_selector_tradifi_regular_session_status = lambda: {
+        "open": False,
+        "reason": "outside_regular_session",
+    }
+    assert engine._coin_selector_should_include_tradifi_universe(cfg, custom_enabled=False) is False
+
+    engine._coin_selector_tradifi_regular_session_status = lambda: {"open": True}
     engine.ctrl = TestnetCtrl()
     assert engine._coin_selector_should_include_tradifi_universe(cfg, custom_enabled=False) is False
+
+
+def test_us_equity_regular_session_status_uses_core_hours_and_holidays():
+    emas = _emas_module()
+
+    regular_open = emas.us_equity_regular_session_status(
+        datetime(2026, 7, 1, 14, 0, tzinfo=timezone.utc)
+    )
+    before_open = emas.us_equity_regular_session_status(
+        datetime(2026, 7, 1, 13, 0, tzinfo=timezone.utc)
+    )
+    observed_holiday = emas.us_equity_regular_session_status(
+        datetime(2026, 7, 3, 14, 0, tzinfo=timezone.utc)
+    )
+    early_close_open = emas.us_equity_regular_session_status(
+        datetime(2026, 7, 2, 16, 30, tzinfo=timezone.utc)
+    )
+    early_close_closed = emas.us_equity_regular_session_status(
+        datetime(2026, 7, 2, 17, 30, tzinfo=timezone.utc)
+    )
+
+    assert regular_open["open"] is True
+    assert before_open["open"] is False
+    assert before_open["reason"] == "outside_regular_session"
+    assert observed_holiday["open"] is False
+    assert observed_holiday["reason"] == "holiday"
+    assert early_close_open["open"] is True
+    assert early_close_open["early_close"] is True
+    assert early_close_closed["open"] is False
+    assert early_close_closed["regular_close"].endswith("13:00:00-04:00")
+
+
+def test_coin_selector_rejects_tradifi_custom_symbol_when_regular_session_closed():
+    emas = _emas_module()
+    signal_engine = _signal_engine_cls()
+    controller = emas.MainController.__new__(emas.MainController)
+    controller.cfg = {"api": {"exchange_mode": emas.BINANCE_MAINNET, "use_testnet": False}}
+    validation_markets = {
+        "BTC/USDT:USDT": _market(symbol="BTC/USDT:USDT"),
+        "QQQ/USDT:USDT": _market(
+            symbol="QQQ/USDT:USDT",
+            info={"contractType": "TRADIFI_PERPETUAL", "status": "TRADING"},
+        ),
+    }
+
+    engine = signal_engine.__new__(signal_engine)
+    engine.ctrl = controller
+    engine.exchange = _FakeMarketExchange(validation_markets)
+    engine.market_data_exchange = _FakeMarketExchange(validation_markets)
+    engine.coin_selector_last_result = {}
+    engine.coin_selector_symbol_scores = {}
+    engine.coin_selector_last_run_ts = 0
+    engine.is_upbit_mode = lambda: False
+    engine._coin_selector_tradifi_regular_session_status = lambda: {
+        "open": False,
+        "reason": "outside_regular_session",
+        "local_time": "2026-07-01T08:00:00-04:00",
+    }
+    engine.get_runtime_trade_config = lambda: {
+        "coin_selector": {
+            "enabled": True,
+            "custom_universe_enabled": True,
+            "custom_symbols": ["BTC/USDT", "QQQ/USDT"],
+            "custom_relax_discovery": True,
+            "top_n": 5,
+        }
+    }
+    engine.get_runtime_strategy_params = lambda: {}
+
+    async def _score_candidate(base_candidate, cfg, strategy_params, selector_context=None):
+        scored = dict(base_candidate)
+        scored["accepted"] = True
+        scored["score"] = 80.0
+        scored["selection_state"] = "SELECTED"
+        return scored
+
+    engine._score_coin_selector_candidate = _score_candidate
+
+    report = asyncio.run(engine.evaluate_coin_selector(force=True))
+
+    selected_symbols = [item.get("normalized_symbol") for item in report["selected"]]
+    assert selected_symbols == ["BTC/USDT"]
+    assert report["tradifi_regular_session_open"] is False
+    assert report["reject_counts"]["REJECTED_TRADFI_REGULAR_SESSION_CLOSED"] == 1
 
 
 def test_coin_selector_custom_universe_blocks_testnet_tradifi_symbols():

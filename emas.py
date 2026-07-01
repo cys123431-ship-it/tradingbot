@@ -31,6 +31,7 @@ import numpy as np
 from pykalman import KalmanFilter as PyKalmanFilter
 from datetime import datetime, timezone, timedelta
 from collections import Counter, deque
+from zoneinfo import ZoneInfo
 try:
     from dual_mode_fractal_strategy import DualModeFractalStrategy
     DUAL_MODE_AVAILABLE = True
@@ -492,6 +493,144 @@ EXCHANGE_MODE_SYMBOL_POLICY = {
         "allow_upbit_krw": True,
     },
 }
+US_EQUITY_MARKET_TZ = ZoneInfo("America/New_York")
+US_EQUITY_REGULAR_OPEN = (9, 30)
+US_EQUITY_REGULAR_CLOSE = (16, 0)
+US_EQUITY_EARLY_CLOSE = (13, 0)
+
+
+def _nth_weekday_of_month(year, month, weekday, n):
+    day = datetime(year, month, 1).date()
+    offset = (weekday - day.weekday()) % 7
+    return day + timedelta(days=offset + (n - 1) * 7)
+
+
+def _last_weekday_of_month(year, month, weekday):
+    if month == 12:
+        day = datetime(year + 1, 1, 1).date() - timedelta(days=1)
+    else:
+        day = datetime(year, month + 1, 1).date() - timedelta(days=1)
+    return day - timedelta(days=(day.weekday() - weekday) % 7)
+
+
+def _observed_fixed_us_holiday(year, month, day):
+    raw = datetime(year, month, day).date()
+    if raw.weekday() == 5:
+        return raw - timedelta(days=1)
+    if raw.weekday() == 6:
+        return raw + timedelta(days=1)
+    return raw
+
+
+def _western_easter_date(year):
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return datetime(year, month, day).date()
+
+
+def _previous_weekday(day):
+    candidate = day - timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def _us_equity_market_closed_dates(year):
+    closed = {
+        _observed_fixed_us_holiday(year, 1, 1),
+        _nth_weekday_of_month(year, 1, 0, 3),
+        _nth_weekday_of_month(year, 2, 0, 3),
+        _western_easter_date(year) - timedelta(days=2),
+        _last_weekday_of_month(year, 5, 0),
+        _observed_fixed_us_holiday(year, 6, 19),
+        _observed_fixed_us_holiday(year, 7, 4),
+        _nth_weekday_of_month(year, 9, 0, 1),
+        _nth_weekday_of_month(year, 11, 3, 4),
+        _observed_fixed_us_holiday(year, 12, 25),
+        _observed_fixed_us_holiday(year + 1, 1, 1),
+    }
+    return {day for day in closed if day.year == year}
+
+
+def _us_equity_market_early_close_dates(year):
+    closed = _us_equity_market_closed_dates(year)
+    thanksgiving = _nth_weekday_of_month(year, 11, 3, 4)
+    candidates = {
+        thanksgiving + timedelta(days=1),
+        _previous_weekday(_observed_fixed_us_holiday(year, 7, 4)),
+        datetime(year, 12, 24).date(),
+    }
+    return {
+        day
+        for day in candidates
+        if day.year == year and day.weekday() < 5 and day not in closed
+    }
+
+
+def us_equity_regular_session_status(now=None):
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    local = current.astimezone(US_EQUITY_MARKET_TZ)
+    local_date = local.date()
+    closed_dates = _us_equity_market_closed_dates(local_date.year)
+    early_close_dates = _us_equity_market_early_close_dates(local_date.year)
+    close_hour, close_minute = (
+        US_EQUITY_EARLY_CLOSE
+        if local_date in early_close_dates
+        else US_EQUITY_REGULAR_CLOSE
+    )
+    open_dt = local.replace(
+        hour=US_EQUITY_REGULAR_OPEN[0],
+        minute=US_EQUITY_REGULAR_OPEN[1],
+        second=0,
+        microsecond=0,
+    )
+    close_dt = local.replace(
+        hour=close_hour,
+        minute=close_minute,
+        second=0,
+        microsecond=0,
+    )
+    if local.weekday() >= 5:
+        reason = "weekend"
+        is_open = False
+    elif local_date in closed_dates:
+        reason = "holiday"
+        is_open = False
+    elif not (open_dt <= local < close_dt):
+        reason = "outside_regular_session"
+        is_open = False
+    else:
+        reason = "regular_session_open"
+        is_open = True
+    return {
+        "open": is_open,
+        "reason": reason,
+        "timezone": "America/New_York",
+        "local_time": local.isoformat(),
+        "regular_open": open_dt.isoformat(),
+        "regular_close": close_dt.isoformat(),
+        "early_close": local_date in early_close_dates,
+    }
+
+
+def is_us_equity_regular_session_open(now=None):
+    return bool(us_equity_regular_session_status(now).get("open"))
+
+
 UTBOT_FILTER_PACK_LABELS = {
     1: 'CHOP',
     2: 'ADX+DMI',
@@ -22205,7 +22344,21 @@ class SignalEngine(BaseEngine):
         ctrl = getattr(self, 'ctrl', None)
         if ctrl is None or not hasattr(ctrl, 'get_exchange_mode'):
             return False
-        return ctrl.get_exchange_mode() == BINANCE_MAINNET
+        if ctrl.get_exchange_mode() != BINANCE_MAINNET:
+            return False
+        return bool(self._coin_selector_tradifi_regular_session_status().get('open'))
+
+    def _coin_selector_tradifi_regular_session_status(self):
+        return us_equity_regular_session_status()
+
+    def _coin_selector_tradifi_closed_reject_reason(self, status):
+        status = status if isinstance(status, dict) else {}
+        reason = status.get('reason') or 'closed'
+        local_time = status.get('local_time') or 'unknown'
+        return (
+            "REJECTED_TRADFI_REGULAR_SESSION_CLOSED: "
+            f"US equity regular session is closed ({reason}, {local_time})"
+        )
 
     def _coin_selector_is_tradifi_market(self, symbol, market):
         return coin_selector_market_is_tradifi_perpetual(symbol, market)
@@ -22437,13 +22590,21 @@ class SignalEngine(BaseEngine):
         custom_symbols = normalize_coin_selector_custom_symbols(cfg.get('custom_symbols'))
         custom_enabled = bool(cfg.get('custom_universe_enabled', False)) or bool(custom_universe_override)
         now = time.time()
+        tradifi_session_status = self._coin_selector_tradifi_regular_session_status()
+        tradifi_session_open = bool(tradifi_session_status.get('open'))
         cached = self.coin_selector_last_result if isinstance(self.coin_selector_last_result, dict) else {}
         refresh_interval = float(cfg.get('refresh_interval_seconds', 300.0) or 300.0)
         if (not force) and cached and (now - float(cached.get('generated_at_ts', 0) or 0)) < refresh_interval:
             cached_cfg = cached.get('criteria') if isinstance(cached.get('criteria'), dict) else {}
             cached_custom = bool(cached_cfg.get('custom_universe_enabled', False))
             cached_symbols = normalize_coin_selector_custom_symbols(cached_cfg.get('custom_symbols'))
-            if cached_custom == custom_enabled and (not custom_enabled or cached_symbols == custom_symbols):
+            cached_tradifi_open = cached.get('tradifi_regular_session_open')
+            if (
+                cached_custom == custom_enabled
+                and (not custom_enabled or cached_symbols == custom_symbols)
+                and cached_tradifi_open is not None
+                and bool(cached_tradifi_open) == tradifi_session_open
+            ):
                 return cached
 
         if self.is_upbit_mode():
@@ -22597,6 +22758,16 @@ class SignalEngine(BaseEngine):
             candidate = build_coin_selector_base_candidate(symbol, ticker, market, candidate_cfg, tags)
             if self._coin_selector_is_tradifi_market(symbol, market):
                 candidate['tradifi_perpetual'] = True
+                candidate['tradifi_regular_session'] = dict(tradifi_session_status)
+                if not tradifi_session_open:
+                    candidate['accepted'] = False
+                    candidate['selection_state'] = 'REJECTED'
+                    candidate.setdefault('reject_reasons', []).append(
+                        'REJECTED_TRADFI_REGULAR_SESSION_CLOSED'
+                    )
+                    candidate['analysis_error'] = self._coin_selector_tradifi_closed_reject_reason(
+                        tradifi_session_status
+                    )
             if custom_enabled:
                 candidate['custom_universe'] = True
                 candidate['custom_discovery_relaxed'] = bool(cfg.get('custom_relax_discovery', True))
@@ -22673,6 +22844,8 @@ class SignalEngine(BaseEngine):
             'custom_universe_enabled': custom_enabled,
             'custom_symbols': custom_symbols if custom_enabled else [],
             'tradifi_universe_included': include_tradifi_universe,
+            'tradifi_regular_session_open': tradifi_session_open,
+            'tradifi_regular_session': dict(tradifi_session_status),
             'tradifi_candidates_considered': tradifi_candidates_considered,
             'reject_samples': reject_samples,
         })
