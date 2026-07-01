@@ -28856,6 +28856,7 @@ class SignalEngine(BaseEngine):
             pos_entry_price = float(pos.get('entryPrice') or 0.0)
         except (TypeError, ValueError):
             pos_entry_price = 0.0
+        current_qty = abs(float(self._position_signed_contracts(pos) or pos.get('contracts', 0) or 0))
         runner_state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
         managed_sl_active = (
             isinstance(runner_state, dict)
@@ -28870,6 +28871,52 @@ class SignalEngine(BaseEngine):
             for plan in planned_tp_orders
             if isinstance(plan, dict) and _normalize_tp_plan_label(plan.get('tp_label') or plan.get('tp_name'))
         }
+        inferred_filled_labels = []
+        if planned_by_label and isinstance(runner_state, dict) and current_qty > 0:
+            try:
+                initial_qty = float(runner_state.get('initial_qty') or 0.0)
+            except (TypeError, ValueError):
+                initial_qty = 0.0
+            try:
+                qty_tolerance_ratio = min(
+                    0.5,
+                    max(0.0, float(runner_state.get('tp1_breakeven_qty_tolerance', 0.08) or 0.08))
+                )
+            except (TypeError, ValueError):
+                qty_tolerance_ratio = 0.08
+            if initial_qty > 0 and current_qty < initial_qty:
+                cumulative_target_qty = 0.0
+                sorted_plans = sorted(
+                    planned_by_label.items(),
+                    key=lambda item: int((item[1] or {}).get('tp_index') or 99),
+                )
+                for label, plan in sorted_plans:
+                    expected_qty = _safe_float_or_none(plan.get('qty'))
+                    if expected_qty is None or expected_qty <= 0:
+                        continue
+                    cumulative_target_qty += float(expected_qty)
+                    expected_remaining_qty = max(0.0, initial_qty - cumulative_target_qty)
+                    tolerance_qty = max(initial_qty * qty_tolerance_ratio, float(expected_qty) * 0.1, 1e-9)
+                    if current_qty <= expected_remaining_qty + tolerance_qty:
+                        label_key = label.lower()
+                        if not bool(runner_state.get(f"{label_key}_filled", False)):
+                            runner_state[f"{label_key}_filled"] = True
+                            runner_state[f"{label_key}_filled_inferred_by_qty"] = True
+                            inferred_filled_labels.append(label)
+                            for item in runner_state.get('planned_tp_orders') or runner_state.get('tp_orders') or []:
+                                if (
+                                    isinstance(item, dict)
+                                    and _normalize_tp_plan_label(item.get('tp_label') or item.get('tp_name')) == label
+                                ):
+                                    item['filled'] = True
+                        planned_by_label[label]['filled'] = True
+                    else:
+                        break
+                if inferred_filled_labels:
+                    runner_state['last_tp_fill_inferred_qty'] = current_qty
+                    runner_state['last_tp_fill_inferred_at'] = datetime.now(timezone.utc).isoformat()
+                    self.utbreakout_trailing_states[symbol] = runner_state
+                    status['tp_filled_inferred_labels'] = list(inferred_filled_labels)
         expected_tp_labels = []
         if planned_by_label:
             for label, plan in planned_by_label.items():
@@ -28991,7 +29038,6 @@ class SignalEngine(BaseEngine):
         else:
             status['missing_tp'] = bool(expected_tp) and not status['tp_present']
         status['missing_sl'] = bool(expected_sl) and not status['sl_present']
-        current_qty = abs(float(self._position_signed_contracts(pos) or pos.get('contracts', 0) or 0))
         tp_qty_mismatches = []
         tp_price_mismatches = []
         for label in expected_tp_labels:

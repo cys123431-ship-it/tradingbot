@@ -3512,6 +3512,83 @@ def test_protection_audit_marks_tp1_only_as_missing_tp2():
     assert status["missing_tp2"] is True
 
 
+def test_protection_audit_treats_absent_tp1_as_filled_when_position_qty_drops(tmp_path):
+    emas = _emas_module()
+    pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "1.4", "entryPrice": "100"}
+    engine = _protection_engine(
+        [
+            {
+                "id": "tp2-existing",
+                "side": "sell",
+                "type": "limit",
+                "price": "120",
+                "amount": "1.4",
+                "clientOrderId": "utbtp2BTCUSDTopen",
+                "reduceOnly": True,
+                "info": {"symbol": "BTCUSDT", "reduceOnly": "true"},
+            },
+            {
+                "id": "sl-existing",
+                "side": "sell",
+                "type": "stop_market",
+                "amount": "1.4",
+                "reduceOnly": True,
+                "info": {
+                    "symbol": "BTCUSDT",
+                    "origType": "STOP_MARKET",
+                    "stopPrice": "90",
+                    "reduceOnly": "true",
+                },
+            },
+        ],
+        positions=[pos],
+    )
+    state = {
+        "side": "long",
+        "entry_price": 100.0,
+        "initial_qty": 2.0,
+        "last_stop_price": 90.0,
+        "tp1_expected_remaining_ratio": 0.70,
+        "tp1_breakeven_qty_tolerance": 0.08,
+        "planned_tp_orders": [
+            {"tp_index": 1, "tp_label": "TP1", "tp_name": "TP1", "side": "sell", "price": 115.0, "qty": 0.6},
+            {"tp_index": 2, "tp_label": "TP2", "tp_name": "TP2", "side": "sell", "price": 120.0, "qty": 0.8},
+        ],
+        "tp1_filled": False,
+        "tp2_filled": False,
+    }
+    engine.runtime_dir = str(tmp_path)
+    engine.utbreakout_trailing_states = {"BTC/USDT": state}
+    engine.utbreakout_daily_sl_symbol_lockouts = {}
+    engine.PROTECTION_MISSING_REQUIRED_COUNT = 1
+    engine.PROTECTION_MISSING_MIN_AGE_SEC = 0.0
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": emas.UTBOT_FILTERED_BREAKOUT_STRATEGY,
+        "UTBotFilteredBreakoutV1": {},
+    }
+
+    status = asyncio.run(
+        engine._audit_protection_orders(
+            "BTC/USDT",
+            pos=pos,
+            expected_tp=True,
+            expected_sl=True,
+            planned_tp_orders=state["planned_tp_orders"],
+            alert=True,
+        )
+    )
+
+    assert status["status"] == "OK"
+    assert status["missing_tp1"] is False
+    assert status["missing_tp2"] is False
+    assert status["tp_filled_inferred_labels"] == ["TP1"]
+    assert state["tp1_filled"] is True
+    assert not [order for order in engine.exchange.created if order["type"] == "market"]
+    locked, reason = engine._is_utbreakout_daily_sl_locked("BTCUSDT")
+    assert locked is False
+    assert "lockout" not in reason.lower()
+
+
 def test_missing_tp2_repair_recreates_planned_residual_order():
     pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "2", "entryPrice": "100"}
     engine = _protection_engine(
