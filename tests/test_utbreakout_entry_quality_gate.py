@@ -37,6 +37,19 @@ def _ev_exit(executable=True):
     return SimpleNamespace(executable=executable)
 
 
+def _alpha_decision(**overrides):
+    values = {
+        "allowed": True,
+        "engine": "TREND_CONTINUATION",
+        "score": 75.0,
+        "probability": 0.58,
+        "risk_multiplier": 0.78,
+        "blockers": (),
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_entry_quality_gate_allows_moderate_short_signal():
     state, detail = _engine()._evaluate_utbreakout_entry_quality_gate(
         "short",
@@ -46,6 +59,7 @@ def test_entry_quality_gate_allows_moderate_short_signal():
         ev_decision=_ev_decision(),
         ev_net=_ev_net(0.32),
         ev_exit=_ev_exit(True),
+        alpha_decision=_alpha_decision(),
     )
 
     assert state == "reduced"
@@ -61,6 +75,7 @@ def test_entry_quality_gate_blocks_weak_long_final_multiplier():
         ev_decision=_ev_decision(),
         ev_net=_ev_net(0.30),
         ev_exit=_ev_exit(True),
+        alpha_decision=_alpha_decision(),
     )
 
     assert state is False
@@ -85,6 +100,7 @@ def test_entry_quality_gate_blocks_weak_ev_inputs(decision, net, expected):
         ev_decision=decision,
         ev_net=net,
         ev_exit=_ev_exit(True),
+        alpha_decision=_alpha_decision(),
     )
 
     assert state is False
@@ -100,7 +116,30 @@ def test_entry_quality_gate_blocks_extreme_market_reduction():
         ev_decision=_ev_decision(),
         ev_net=_ev_net(0.30),
         ev_exit=_ev_exit(True),
+        alpha_decision=_alpha_decision(),
     )
 
     assert state is False
     assert "market quality x0.20<x0.30" in detail
+
+
+def test_entry_quality_gate_blocks_profit_alpha_rejection():
+    state, detail = _engine()._evaluate_utbreakout_entry_quality_gate(
+        "long",
+        _cfg(),
+        final_risk_multiplier=0.60,
+        market_quality={"state": True, "risk_multiplier": 1.0},
+        ev_decision=_ev_decision(),
+        ev_net=_ev_net(0.32),
+        ev_exit=_ev_exit(True),
+        alpha_decision=_alpha_decision(
+            allowed=False,
+            score=61.0,
+            probability=0.52,
+            blockers=("derivatives adverse stack",),
+        ),
+    )
+
+    assert state is False
+    assert "Profit Alpha" in detail
+    assert "derivatives adverse stack" in detail

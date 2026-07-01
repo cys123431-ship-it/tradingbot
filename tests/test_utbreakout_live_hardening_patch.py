@@ -23,6 +23,9 @@ def test_profit_patch_matches_opportunity_profile_values():
     assert cfg["atr_trailing_multiplier"] == 3.0
     assert cfg["market_quality_min_risk_multiplier"] == 0.0
     assert cfg["max_daily_trades"] == 5
+    assert cfg["profit_alpha_enabled"] is True
+    assert cfg["profit_alpha_min_score"] == 68.0
+    assert cfg["entry_quality_gate_min_profit_alpha_score"] == 68.0
 
 
 def test_mark_core_filter_failure_as_hard_block_compatible():

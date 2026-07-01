@@ -86,6 +86,14 @@ from .ev_adaptive import (
     profile_gross_win_r,
     rank_ev_candidates,
 )
+from .alpha_engine import (
+    AlphaFollowThroughExit,
+    ProfitAlphaDecision,
+    apply_profit_alpha_exit_overrides,
+    default_profit_alpha_config,
+    evaluate_alpha_follow_through_exit,
+    evaluate_profit_alpha,
+)
 from .market_context import MarketContext, MarketContextQuality, build_market_context
 from .derivatives import (
     DerivativesDecision,
@@ -181,6 +189,12 @@ __all__ = [
     "evaluate_net_edge",
     "profile_gross_win_r",
     "rank_ev_candidates",
+    "AlphaFollowThroughExit",
+    "ProfitAlphaDecision",
+    "apply_profit_alpha_exit_overrides",
+    "default_profit_alpha_config",
+    "evaluate_alpha_follow_through_exit",
+    "evaluate_profit_alpha",
     "MarketContext",
     "MarketContextQuality",
     "build_market_context",

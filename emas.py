@@ -113,6 +113,13 @@ from utbreakout.ev_adaptive import (
     evaluate_net_edge,
     profile_gross_win_r,
 )
+from utbreakout.alpha_engine import (
+    ProfitAlphaDecision,
+    apply_profit_alpha_exit_overrides,
+    default_profit_alpha_config,
+    evaluate_alpha_follow_through_exit,
+    evaluate_profit_alpha,
+)
 from utbreakout.macro_guard import is_macro_risk_window
 from prediction import (
     PREDICTION_STRATEGY_CATALOG,
@@ -985,6 +992,29 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "entry_quality_gate_min_ev_probability": 0.54,
         "entry_quality_gate_min_ev_net_expectancy_r": 0.30,
         "entry_quality_gate_min_ev_mtf_votes": 2,
+        "entry_quality_gate_min_profit_alpha_score": 68.0,
+        "entry_quality_gate_min_profit_alpha_probability": 0.555,
+        "profit_alpha_enabled": True,
+        "profit_alpha_min_score": 68.0,
+        "profit_alpha_long_min_score": 69.0,
+        "profit_alpha_short_min_score": 68.0,
+        "profit_alpha_min_probability": 0.555,
+        "profit_alpha_long_min_probability": 0.560,
+        "profit_alpha_short_min_probability": 0.555,
+        "profit_alpha_opposite_regime_score_add": 5.0,
+        "profit_alpha_opposite_regime_probability_add": 0.010,
+        "profit_alpha_stale_signal_max_age_bars": 8.0,
+        "profit_alpha_stale_signal_reaccel_min_range": 1.10,
+        "profit_alpha_stale_signal_reaccel_min_volume": 1.00,
+        "profit_alpha_derivatives_multi_adverse_block_count": 3,
+        "profit_alpha_derivatives_multi_adverse_strong_count": 2,
+        "profit_alpha_meta_min_samples": 8,
+        "profit_alpha_meta_expectancy_block_below": -0.12,
+        "profit_alpha_meta_probability_weight": 0.20,
+        "profit_alpha_follow_through_enabled": True,
+        "profit_alpha_default_follow_through_bars": 3,
+        "profit_alpha_default_follow_through_min_mfe_r": 0.35,
+        "profit_alpha_default_early_exit_max_mae_r": 0.75,
         "aggressive_growth_enabled": False,
         "aggressive_growth_pyramiding_enabled": False,
         "utbreakout_recent_loss_cooldown_enabled": True,
@@ -1225,7 +1255,7 @@ def build_utbreakout_effective_status_contract(cfg, daily_entries=None):
     effective = apply_profit_opportunity_effective_overrides(dict(cfg or {}))
     lines = [
         f"Effective Profile: {effective.get('effective_profile_version', 'UNKNOWN')}",
-        "Strategy Router: EV Adaptive (TREND / STRONG_TREND / SQUEEZE_BREAKOUT / NO_TRADE)",
+        "Strategy Router: EV Candidate + Profit Alpha (trend / squeeze / regime / meta)",
         f"Effective TP2: {float(effective.get('second_take_profit_r_multiple', 2.40) or 2.40):.2f}R",
         (
             "Effective volume: "
@@ -1402,6 +1432,8 @@ def apply_stable_utbreak_final_overrides(cfg):
         "entry_quality_gate_min_ev_probability": 0.54,
         "entry_quality_gate_min_ev_net_expectancy_r": 0.30,
         "entry_quality_gate_min_ev_mtf_votes": 2,
+        "entry_quality_gate_min_profit_alpha_score": 68.0,
+        "entry_quality_gate_min_profit_alpha_probability": 0.555,
 
         # Set32 keeps structure confirmation with more tolerant flow inputs.
         "set32_min_relative_volume": 1.15,
@@ -1441,6 +1473,28 @@ def apply_stable_utbreak_final_overrides(cfg):
         "adaptive_exit_trailing_multiplier_max": 4.0,
         "adaptive_exit_activation_r_min": 1.4,
         "adaptive_exit_activation_r_max": 1.8,
+
+        "profit_alpha_enabled": True,
+        "profit_alpha_min_score": 68.0,
+        "profit_alpha_long_min_score": 69.0,
+        "profit_alpha_short_min_score": 68.0,
+        "profit_alpha_min_probability": 0.555,
+        "profit_alpha_long_min_probability": 0.560,
+        "profit_alpha_short_min_probability": 0.555,
+        "profit_alpha_opposite_regime_score_add": 5.0,
+        "profit_alpha_opposite_regime_probability_add": 0.010,
+        "profit_alpha_stale_signal_max_age_bars": 8.0,
+        "profit_alpha_stale_signal_reaccel_min_range": 1.10,
+        "profit_alpha_stale_signal_reaccel_min_volume": 1.00,
+        "profit_alpha_derivatives_multi_adverse_block_count": 3,
+        "profit_alpha_derivatives_multi_adverse_strong_count": 2,
+        "profit_alpha_meta_min_samples": 8,
+        "profit_alpha_meta_expectancy_block_below": -0.12,
+        "profit_alpha_meta_probability_weight": 0.20,
+        "profit_alpha_follow_through_enabled": True,
+        "profit_alpha_default_follow_through_bars": 3,
+        "profit_alpha_default_follow_through_min_mfe_r": 0.35,
+        "profit_alpha_default_early_exit_max_mae_r": 0.75,
 
         "max_daily_trades": 5,
         "max_consecutive_losses": 5,
@@ -4726,6 +4780,7 @@ class SignalEngine(BaseEngine):
         self.utbreakout_shadow_resolved_keys = set()  # keys already logged in this runtime
         self.utbreakout_shadow_stats_cache = {}  # cache key -> recent shadow stats
         self.utbreakout_runner_stats_cache = {}  # cache key -> recent runner stats
+        self.utbreakout_profit_alpha_meta_stats = {}  # side:engine -> realized R stats
         self.utbreakout_adaptive_tf_state = {}  # symbol -> selected TF stability state
         self.utbreakout_adaptive_last_decision_ts = {}  # symbol -> tf -> last closed candle evaluated
         self.utbreakout_last_selected_set_ids = {}  # symbol -> last validated AUTO Set
@@ -4740,6 +4795,7 @@ class SignalEngine(BaseEngine):
         self.coin_selector_last_run_ts = 0.0
         self.coin_selector_candidate_cooldowns = {}  # normalized symbol -> no-entry miss / cooldown state
         self._load_utbreakout_daily_sl_lockouts()
+        self._load_utbreakout_profit_alpha_meta_stats()
         self.micro_auto_last_plan = {}  # symbol -> latest accepted Micro Auto plan
         self.micro_auto_last_rejects = {}  # symbol -> latest Micro Auto reject payload
         self.micro_auto_last_scan = {}  # latest Micro Auto feasibility scan report
@@ -4803,6 +4859,7 @@ class SignalEngine(BaseEngine):
         self.utbreakout_shadow_resolved_keys = set()
         self.utbreakout_shadow_stats_cache = {}
         self.utbreakout_runner_stats_cache = {}
+        self.utbreakout_profit_alpha_meta_stats = {}
         self.utbreakout_adaptive_tf_state = {}
         self.utbreakout_adaptive_last_decision_ts = {}
         self.utbreakout_last_selected_set_ids = {}
@@ -4818,6 +4875,7 @@ class SignalEngine(BaseEngine):
         self.utbreakout_daily_sl_symbol_lockouts = {}
         self.utbreakout_recent_loss_symbol_cooldowns = {}
         self._load_utbreakout_daily_sl_lockouts()
+        self._load_utbreakout_profit_alpha_meta_stats()
         self.micro_auto_last_plan = {}
         self.micro_auto_last_rejects = {}
         self.micro_auto_last_scan = {}
@@ -4870,6 +4928,131 @@ class SignalEngine(BaseEngine):
             or "runtime"
         )
         return os.path.join(str(runtime_dir), "utbreakout_daily_sl_lockouts.json")
+
+    def _utbreakout_profit_alpha_meta_path(self) -> str:
+        runtime_dir = (
+            getattr(self, 'runtime_dir', None)
+            or os.environ.get('TRADINGBOT_RUNTIME_DIR')
+            or "runtime"
+        )
+        return os.path.join(str(runtime_dir), "utbreakout_profit_alpha_meta.json")
+
+    def _save_utbreakout_profit_alpha_meta_stats(self):
+        try:
+            stats = getattr(self, 'utbreakout_profit_alpha_meta_stats', {})
+            path = self._utbreakout_profit_alpha_meta_path()
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(stats if isinstance(stats, dict) else {}, f, indent=4)
+            logger.info(
+                "Saved UTBreakout profit alpha meta stats: count=%s path=%s",
+                len(stats) if isinstance(stats, dict) else 0,
+                path,
+            )
+        except Exception as exc:
+            logger.warning("Failed to save UTBreakout profit alpha meta stats: %s", exc)
+
+    def _load_utbreakout_profit_alpha_meta_stats(self):
+        path = self._utbreakout_profit_alpha_meta_path()
+        if not os.path.exists(path):
+            self.utbreakout_profit_alpha_meta_stats = {}
+            logger.info("No UTBreakout profit alpha meta file found: %s", path)
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                self.utbreakout_profit_alpha_meta_stats = {}
+                logger.warning("Ignored malformed UTBreakout profit alpha meta file: %s", path)
+                return
+            normalized = {}
+            for key, record in data.items():
+                if not isinstance(record, dict):
+                    continue
+                try:
+                    count = int(float(record.get('sample_count', record.get('trades', 0)) or 0))
+                except (TypeError, ValueError):
+                    count = 0
+                if count <= 0:
+                    continue
+                normalized[str(key)] = {
+                    'sample_count': count,
+                    'win_count': int(float(record.get('win_count', 0) or 0)),
+                    'loss_count': int(float(record.get('loss_count', 0) or 0)),
+                    'avg_pnl_r': float(record.get('avg_pnl_r', 0.0) or 0.0),
+                    'expectancy_r': float(record.get('expectancy_r', record.get('avg_pnl_r', 0.0)) or 0.0),
+                    'last_pnl_r': float(record.get('last_pnl_r', 0.0) or 0.0),
+                    'updated_at': record.get('updated_at'),
+                }
+            self.utbreakout_profit_alpha_meta_stats = normalized
+            logger.info(
+                "Loaded UTBreakout profit alpha meta stats: count=%s path=%s",
+                len(normalized),
+                path,
+            )
+        except Exception as exc:
+            logger.warning("Failed to load UTBreakout profit alpha meta stats: %s", exc)
+            self.utbreakout_profit_alpha_meta_stats = {}
+
+    def _profit_alpha_meta_key(self, side, engine):
+        side_key = str(side or '').lower()
+        engine_key = str(engine or 'UNKNOWN').upper()
+        if side_key not in {'long', 'short'}:
+            side_key = 'unknown'
+        return f"{side_key}:{engine_key}"
+
+    def _profit_alpha_meta_snapshot(self, side=None, engine=None):
+        stats = getattr(self, 'utbreakout_profit_alpha_meta_stats', {})
+        if not isinstance(stats, dict):
+            stats = {}
+            self.utbreakout_profit_alpha_meta_stats = stats
+        if side and engine:
+            key = self._profit_alpha_meta_key(side, engine)
+            return {key: dict(stats.get(key, {}))}
+        return dict(stats)
+
+    def _record_profit_alpha_meta_outcome(self, symbol, state, outcome):
+        if not isinstance(state, dict) or not isinstance(outcome, dict):
+            return
+        side = str(state.get('side') or '').lower()
+        engine = str(state.get('profit_alpha_engine') or '').upper()
+        if side not in {'long', 'short'} or not engine or engine in {'DISABLED', 'NONE'}:
+            return
+        pnl_r = _safe_float_or_none(outcome.get('pnl_r'))
+        if pnl_r is None:
+            return
+        stats = self._ensure_runtime_state_container('utbreakout_profit_alpha_meta_stats')
+        key = self._profit_alpha_meta_key(side, engine)
+        record = stats.get(key) if isinstance(stats.get(key), dict) else {}
+        count = int(record.get('sample_count', 0) or 0) + 1
+        prev_avg = float(record.get('avg_pnl_r', 0.0) or 0.0)
+        avg_pnl_r = prev_avg + (float(pnl_r) - prev_avg) / max(count, 1)
+        win_count = int(record.get('win_count', 0) or 0) + (1 if pnl_r > 0 else 0)
+        loss_count = int(record.get('loss_count', 0) or 0) + (1 if pnl_r < 0 else 0)
+        stats[key] = {
+            'sample_count': count,
+            'win_count': win_count,
+            'loss_count': loss_count,
+            'avg_pnl_r': avg_pnl_r,
+            'expectancy_r': avg_pnl_r,
+            'last_pnl_r': float(pnl_r),
+            'symbol': self._normalize_market_symbol(symbol),
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+        }
+        self._save_utbreakout_profit_alpha_meta_stats()
+        try:
+            self._utbreakout_trace_event(
+                symbol,
+                'PROFIT_ALPHA_META',
+                'UPDATED',
+                side=side,
+                engine=engine,
+                sample_count=count,
+                expectancy_r=round(avg_pnl_r, 4),
+                last_pnl_r=round(float(pnl_r), 4),
+            )
+        except Exception:
+            logger.debug("UTBreakout profit alpha meta trace skipped", exc_info=True)
 
     def _record_utbreakout_daily_sl_lockout(
         self,
@@ -9962,6 +10145,130 @@ class SignalEngine(BaseEngine):
             logger.exception("UTBreakout entry watchdog failed")
             return False
 
+    def _evaluate_utbreakout_profit_alpha(
+        self,
+        *,
+        side,
+        cfg,
+        values,
+        ev_decision=None,
+        ev_net=None,
+    ):
+        try:
+            alpha_cfg = default_profit_alpha_config()
+            if isinstance(cfg, dict):
+                alpha_cfg.update(cfg)
+            return evaluate_profit_alpha(
+                side=side,
+                values=values if isinstance(values, dict) else {},
+                config=alpha_cfg,
+                ev_decision=ev_decision,
+                ev_net=ev_net,
+                meta_stats=self._profit_alpha_meta_snapshot(),
+            )
+        except Exception as exc:
+            logger.exception("UTBreakout profit alpha evaluation failed")
+            return ProfitAlphaDecision(
+                allowed=False,
+                side=str(side or '').lower(),
+                engine='ERROR',
+                score=0.0,
+                probability=0.0,
+                risk_multiplier=0.0,
+                exit_profile='NONE',
+                follow_through_bars=0,
+                follow_through_min_mfe_r=0.0,
+                early_exit_max_mae_r=0.0,
+                blockers=(f"profit alpha error: {exc}",),
+            )
+
+    def _profit_alpha_status_payload(self, decision):
+        if not isinstance(decision, ProfitAlphaDecision):
+            return None
+        return {
+            'allowed': decision.allowed,
+            'engine': decision.engine,
+            'score': decision.score,
+            'probability': decision.probability,
+            'risk_multiplier': decision.risk_multiplier,
+            'exit_profile': decision.exit_profile,
+            'follow_through_bars': decision.follow_through_bars,
+            'follow_through_min_mfe_r': decision.follow_through_min_mfe_r,
+            'early_exit_max_mae_r': decision.early_exit_max_mae_r,
+            'meta_key': decision.meta_key,
+            'meta_sample_count': decision.meta_sample_count,
+            'meta_expectancy_r': decision.meta_expectancy_r,
+            'components': dict(decision.components or {}),
+            'reasons': list(decision.reasons),
+            'blockers': list(decision.blockers),
+            'summary': decision.summary,
+        }
+
+    def _append_profit_alpha_status_item(
+        self,
+        core_items,
+        *,
+        side,
+        cfg,
+        filter_values,
+        market_regime_context,
+        selector_quality,
+        quality_score_v2,
+        adaptation,
+        ev_status_decision=None,
+        ev_status_net=None,
+    ):
+        decision = None
+        if not bool((cfg or {}).get('profit_alpha_enabled', True)):
+            return None
+        adaptation = adaptation if isinstance(adaptation, dict) else {}
+        trend_health = (
+            adaptation.get('trend_health')
+            if isinstance(adaptation.get('trend_health'), dict)
+            else {}
+        )
+        strategy_quality = (
+            adaptation.get('strategy_quality')
+            if isinstance(adaptation.get('strategy_quality'), dict)
+            else {}
+        )
+        filter_values.update({
+            'trend_health_score': trend_health.get('score'),
+            'strategy_quality_score': strategy_quality.get('score'),
+            'quality_score_v2_score': (quality_score_v2 or {}).get('score'),
+            'coin_selector_score': (selector_quality or {}).get('score'),
+            'market_regime_context': market_regime_context,
+            'ev_adaptive_mode': ev_status_decision.mode if ev_status_decision is not None else None,
+            'ev_win_probability': (
+                ev_status_decision.win_probability
+                if ev_status_decision is not None
+                else None
+            ),
+            'ev_leadership_score': (
+                ev_status_decision.leadership_score
+                if ev_status_decision is not None
+                else None
+            ),
+            'ev_reacceleration': (
+                ev_status_decision.reacceleration
+                if ev_status_decision is not None
+                else False
+            ),
+        })
+        decision = self._evaluate_utbreakout_profit_alpha(
+            side=side,
+            cfg=cfg,
+            values=filter_values,
+            ev_decision=ev_status_decision,
+            ev_net=ev_status_net,
+        )
+        alpha_state = bool(decision.allowed)
+        alpha_detail = decision.summary
+        if not decision.allowed:
+            alpha_detail += ": " + "; ".join(decision.blockers[:4])
+        core_items.append(("Profit Alpha", alpha_state, alpha_detail))
+        return decision
+
     def _evaluate_utbreakout_entry_quality_gate(
         self,
         side,
@@ -9972,6 +10279,7 @@ class SignalEngine(BaseEngine):
         ev_decision=None,
         ev_net=None,
         ev_exit=None,
+        alpha_decision=None,
     ):
         """Execution-only quality gate for already-selected UTBreakout candidates."""
         cfg = cfg if isinstance(cfg, dict) else {}
@@ -10095,6 +10403,42 @@ class SignalEngine(BaseEngine):
                     )
                 ev_parts.append(f"MTF {mtf_votes}/{mtf_total}")
 
+        alpha_parts = []
+        if alpha_decision is not None:
+            alpha_allowed = bool(_attr(alpha_decision, 'allowed', False))
+            alpha_engine = str(_attr(alpha_decision, 'engine', 'ALPHA') or 'ALPHA')
+            alpha_score = _num(_attr(alpha_decision, 'score'), 0.0)
+            alpha_probability = _num(_attr(alpha_decision, 'probability'), 0.0)
+            alpha_risk = _num(_attr(alpha_decision, 'risk_multiplier'), 0.0)
+            alpha_blockers = _attr(alpha_decision, 'blockers', ()) or ()
+            if not alpha_allowed:
+                blocker_text = '; '.join(str(item) for item in list(alpha_blockers)[:3])
+                blockers.append(
+                    f"Profit Alpha {alpha_engine} not allowed"
+                    + (f": {blocker_text}" if blocker_text else "")
+                )
+
+            min_alpha_score = _cfg_float(
+                'entry_quality_gate_min_profit_alpha_score',
+                _cfg_float('profit_alpha_min_score', 68.0),
+            )
+            if alpha_score + 1e-12 < min_alpha_score:
+                blockers.append(
+                    f"Profit Alpha score {alpha_score:.1f}<{min_alpha_score:.1f}"
+                )
+            alpha_parts.append(f"{alpha_engine} score {alpha_score:.1f}")
+
+            min_alpha_probability = _cfg_float(
+                'entry_quality_gate_min_profit_alpha_probability',
+                _cfg_float('profit_alpha_min_probability', 0.555),
+            )
+            if alpha_probability + 1e-12 < min_alpha_probability:
+                blockers.append(
+                    f"Profit Alpha p {alpha_probability:.3f}<{min_alpha_probability:.3f}"
+                )
+            alpha_parts.append(f"p {alpha_probability:.3f}")
+            alpha_parts.append(f"risk x{alpha_risk:.2f}")
+
         if blockers:
             return False, "BLOCK: " + "; ".join(blockers[:5])
 
@@ -10105,6 +10449,8 @@ class SignalEngine(BaseEngine):
         ]
         if ev_parts:
             detail_parts.append("EV " + ", ".join(ev_parts[:4]))
+        if alpha_parts:
+            detail_parts.append("Alpha " + ", ".join(alpha_parts[:4]))
         return state, "; ".join(detail_parts)
 
     def _build_utbreakout_execution_eligibility(
@@ -10909,6 +11255,7 @@ class SignalEngine(BaseEngine):
         }
         try:
             self._record_utbreakout_diagnostic_event(symbol, status, event='runner_outcome', extra=extra)
+            self._record_profit_alpha_meta_outcome(symbol, state, extra)
             if isinstance(getattr(self, 'utbreakout_runner_stats_cache', None), dict):
                 self.utbreakout_runner_stats_cache.clear()
         except Exception:
@@ -10941,6 +11288,10 @@ class SignalEngine(BaseEngine):
             'ev_mfe_lock_trigger_1_r',
             'ev_mfe_lock_trigger_2_r',
             'ev_mfe_lock_trigger_3_r',
+            'profit_alpha_follow_through_enabled',
+            'profit_alpha_follow_through_bars',
+            'profit_alpha_follow_through_min_mfe_r',
+            'profit_alpha_early_exit_max_mae_r',
         ):
             if key in plan:
                 cfg[key] = plan[key]
@@ -11141,6 +11492,39 @@ class SignalEngine(BaseEngine):
             ),
             'ev_mfe_lock_stage': 0,
             'ev_mfe_lock_r': 0.0,
+            'profit_alpha_enabled': bool(plan.get('profit_alpha_enabled', False)),
+            'profit_alpha_engine': plan.get('profit_alpha_engine'),
+            'profit_alpha_score': plan.get('profit_alpha_score'),
+            'profit_alpha_probability': plan.get('profit_alpha_probability'),
+            'profit_alpha_risk_multiplier': plan.get('profit_alpha_risk_multiplier'),
+            'profit_alpha_meta_key': plan.get('profit_alpha_meta_key'),
+            'profit_alpha_follow_through_enabled': bool(
+                plan.get(
+                    'profit_alpha_follow_through_enabled',
+                    cfg.get('profit_alpha_follow_through_enabled', True),
+                )
+            ),
+            'profit_alpha_follow_through_bars': int(
+                plan.get(
+                    'profit_alpha_follow_through_bars',
+                    cfg.get('profit_alpha_follow_through_bars', 3),
+                )
+                or 3
+            ),
+            'profit_alpha_follow_through_min_mfe_r': float(
+                plan.get(
+                    'profit_alpha_follow_through_min_mfe_r',
+                    cfg.get('profit_alpha_follow_through_min_mfe_r', 0.35),
+                )
+                or 0.35
+            ),
+            'profit_alpha_early_exit_max_mae_r': float(
+                plan.get(
+                    'profit_alpha_early_exit_max_mae_r',
+                    cfg.get('profit_alpha_early_exit_max_mae_r', 0.75),
+                )
+                or 0.75
+            ),
             'bars_seen': 0,
             'last_bar_ts': plan.get('decision_candle_ts'),
             'active': False,
@@ -13661,6 +14045,53 @@ class SignalEngine(BaseEngine):
                 )
             cfg = _apply_ev_exit_profile(cfg, ev_decision.exit_profile)
 
+        profit_alpha_decision = None
+        if bool(cfg.get('profit_alpha_enabled', True)):
+            filter_values.update({
+                'trend_health_score': trend_health.get('score'),
+                'strategy_quality_score': strategy_quality.get('score'),
+                'quality_score_v2_score': quality_score_v2.get('score'),
+                'coin_selector_score': selector_quality.get('score'),
+                'market_regime_context': market_regime_context,
+                'ev_adaptive_mode': ev_decision.mode if ev_decision is not None else None,
+                'ev_win_probability': (
+                    ev_decision.win_probability if ev_decision is not None else None
+                ),
+                'ev_leadership_score': (
+                    ev_decision.leadership_score if ev_decision is not None else None
+                ),
+                'ev_reacceleration': (
+                    ev_decision.reacceleration if ev_decision is not None else False
+                ),
+            })
+            profit_alpha_decision = self._evaluate_utbreakout_profit_alpha(
+                side=side,
+                cfg=cfg,
+                values=filter_values,
+                ev_decision=ev_decision,
+                ev_net=None,
+            )
+            status['profit_alpha'] = self._profit_alpha_status_payload(
+                profit_alpha_decision
+            )
+            status['profit_alpha_summary'] = profit_alpha_decision.summary
+            status['profit_alpha_engine'] = profit_alpha_decision.engine
+            status['profit_alpha_score'] = profit_alpha_decision.score
+            status['profit_alpha_probability'] = profit_alpha_decision.probability
+            status['profit_alpha_risk_multiplier'] = profit_alpha_decision.risk_multiplier
+            if not profit_alpha_decision.allowed:
+                return _finish(
+                    None,
+                    (
+                        "REJECTED_PROFIT_ALPHA: "
+                        + "; ".join(profit_alpha_decision.blockers[:5])
+                    ),
+                    'REJECTED_PROFIT_ALPHA',
+                    record_failure=True,
+                    side=side,
+                )
+            cfg = apply_profit_alpha_exit_overrides(cfg, profit_alpha_decision)
+
         dynamic_tp2 = self._build_utbreakout_dynamic_tp2(
             side,
             cfg,
@@ -13688,6 +14119,8 @@ class SignalEngine(BaseEngine):
         cfg = apply_profit_opportunity_effective_overrides(cfg)
         if ev_decision is not None:
             cfg = _apply_ev_exit_profile(cfg, ev_decision.exit_profile)
+        if profit_alpha_decision is not None and profit_alpha_decision.allowed:
+            cfg = apply_profit_alpha_exit_overrides(cfg, profit_alpha_decision)
         elif dynamic_tp2.get('enabled'):
             cfg['second_take_profit_r_multiple'] = max(
                 float(cfg.get('second_take_profit_r_multiple', 3.50) or 3.50),
@@ -13881,6 +14314,18 @@ class SignalEngine(BaseEngine):
         else:
             status['adaptive_exit_summary'] = exit_overlay.get('summary')
 
+        if profit_alpha_decision is not None and profit_alpha_decision.allowed:
+            status['adaptive_exit_summary'] = (
+                f"Profit Alpha {profit_alpha_decision.engine}: "
+                f"TP1 {float(cfg.get('partial_take_profit_r_multiple', 1.0) or 1.0):.2f}R"
+                f"({float(cfg.get('partial_take_profit_ratio', 0.0) or 0.0):.0%}) / "
+                f"TP2 {float(cfg.get('second_take_profit_r_multiple', cfg.get('take_profit_r_multiple', 2.4)) or 2.4):.2f}R"
+                f"({float(cfg.get('second_take_profit_ratio', 0.0) or 0.0):.0%}) / "
+                f"runner {float(cfg.get('runner_pct', 0.0) or 0.0):.0%}; "
+                f"follow {profit_alpha_decision.follow_through_bars} bars "
+                f">={profit_alpha_decision.follow_through_min_mfe_r:.2f}R"
+            )
+
         shadow_stats = strategy_adaptation.get('shadow_stats') if isinstance(strategy_adaptation.get('shadow_stats'), dict) else {}
         runner_stats = strategy_adaptation.get('runner_stats') if isinstance(strategy_adaptation.get('runner_stats'), dict) else {}
         status['shadow_sample_count'] = shadow_stats.get('sample_count')
@@ -13914,10 +14359,22 @@ class SignalEngine(BaseEngine):
                     float(strategy_adaptation.get('volatility_risk_multiplier', 1.0) or 0.0),
                 ),
             )
+            profit_alpha_multiplier = (
+                min(
+                    1.0,
+                    max(
+                        0.0,
+                        float(profit_alpha_decision.risk_multiplier),
+                    ),
+                )
+                if profit_alpha_decision is not None
+                else 1.0
+            )
             raw_final_risk_multiplier = min(
                 float(ev_decision.risk_multiplier),
                 market_quality_multiplier,
                 volatility_multiplier,
+                profit_alpha_multiplier,
             )
         else:
             raw_final_risk_multiplier = (
@@ -13931,6 +14388,14 @@ class SignalEngine(BaseEngine):
                 * set_filter_multiplier
                 * direction_multiplier
                 * continuation_multiplier
+                * (
+                    min(
+                        1.0,
+                        max(0.0, float(profit_alpha_decision.risk_multiplier)),
+                    )
+                    if profit_alpha_decision is not None
+                    else 1.0
+                )
             )
         final_risk_multiplier = _apply_utbreakout_risk_multiplier_floor(
             raw_final_risk_multiplier,
@@ -13959,6 +14424,15 @@ class SignalEngine(BaseEngine):
             'quality_score_v2_state': quality_score_v2.get('state'),
             'ev_adaptive_mode': ev_decision.mode if ev_decision is not None else None,
             'ev_adaptive_score': ev_decision.score if ev_decision is not None else None,
+            'profit_alpha_engine': (
+                profit_alpha_decision.engine if profit_alpha_decision is not None else None
+            ),
+            'profit_alpha_score': (
+                profit_alpha_decision.score if profit_alpha_decision is not None else None
+            ),
+            'profit_alpha_probability': (
+                profit_alpha_decision.probability if profit_alpha_decision is not None else None
+            ),
             'raw_final_risk_multiplier': status.get('raw_final_risk_multiplier'),
             'final_risk_multiplier': final_risk_multiplier,
         }
@@ -14168,6 +14642,8 @@ class SignalEngine(BaseEngine):
         cfg = apply_profit_opportunity_effective_overrides(cfg)
         if ev_decision is not None:
             cfg = _apply_ev_exit_profile(cfg, ev_decision.exit_profile)
+        if profit_alpha_decision is not None and profit_alpha_decision.allowed:
+            cfg = apply_profit_alpha_exit_overrides(cfg, profit_alpha_decision)
         elif dynamic_tp2.get('enabled'):
             cfg['second_take_profit_r_multiple'] = max(
                 float(cfg.get('second_take_profit_r_multiple', 3.50) or 3.50),
@@ -14230,6 +14706,43 @@ class SignalEngine(BaseEngine):
             'quality_score_v2_state': quality_score_v2.get('state'),
             'quality_score_v2_summary': quality_score_v2.get('summary'),
             'quality_score_v2_risk_multiplier': quality_score_v2_multiplier,
+            'profit_alpha_enabled': profit_alpha_decision is not None,
+            'profit_alpha_engine': (
+                profit_alpha_decision.engine if profit_alpha_decision is not None else None
+            ),
+            'profit_alpha_score': (
+                profit_alpha_decision.score if profit_alpha_decision is not None else None
+            ),
+            'profit_alpha_probability': (
+                profit_alpha_decision.probability if profit_alpha_decision is not None else None
+            ),
+            'profit_alpha_risk_multiplier': (
+                profit_alpha_decision.risk_multiplier if profit_alpha_decision is not None else None
+            ),
+            'profit_alpha_meta_key': (
+                profit_alpha_decision.meta_key if profit_alpha_decision is not None else None
+            ),
+            'profit_alpha_meta_sample_count': (
+                profit_alpha_decision.meta_sample_count if profit_alpha_decision is not None else None
+            ),
+            'profit_alpha_summary': status.get('profit_alpha_summary'),
+            'profit_alpha_components': (
+                dict(profit_alpha_decision.components or {})
+                if profit_alpha_decision is not None
+                else None
+            ),
+            'profit_alpha_follow_through_enabled': bool(
+                cfg.get('profit_alpha_follow_through_enabled', True)
+            ),
+            'profit_alpha_follow_through_bars': int(
+                cfg.get('profit_alpha_follow_through_bars', 3) or 3
+            ),
+            'profit_alpha_follow_through_min_mfe_r': float(
+                cfg.get('profit_alpha_follow_through_min_mfe_r', 0.35) or 0.35
+            ),
+            'profit_alpha_early_exit_max_mae_r': float(
+                cfg.get('profit_alpha_early_exit_max_mae_r', 0.75) or 0.75
+            ),
             'dynamic_take_profit_enabled': bool(cfg.get('dynamic_take_profit_enabled', True)),
             'dynamic_take_profit_summary': dynamic_tp2.get('summary'),
             'dynamic_tp2_r_multiple': dynamic_tp2.get('second_take_profit_r_multiple'),
@@ -14350,6 +14863,8 @@ class SignalEngine(BaseEngine):
                 )
 
             cfg = _apply_ev_exit_profile(cfg, exit_feasibility.profile)
+            if profit_alpha_decision is not None and profit_alpha_decision.allowed:
+                cfg = apply_profit_alpha_exit_overrides(cfg, profit_alpha_decision)
             target_r = float(cfg.get('take_profit_r_multiple', 0.0) or 0.0)
             risk_distance = float(plan.get('risk_distance', 0.0) or 0.0)
             plan.update({
@@ -14420,6 +14935,16 @@ class SignalEngine(BaseEngine):
                 f"runner {exit_feasibility.profile.runner_ratio:.0%}; "
                 f"net {net_edge.expected_net_r:.3f}R"
             )
+            if profit_alpha_decision is not None and profit_alpha_decision.allowed:
+                status['adaptive_exit_summary'] = (
+                    f"Profit Alpha {profit_alpha_decision.engine}: "
+                    f"TP1 {float(cfg.get('partial_take_profit_r_multiple', 1.0) or 1.0):.2f}R"
+                    f"({float(cfg.get('partial_take_profit_ratio', 0.0) or 0.0):.0%}) / "
+                    f"TP2 {float(cfg.get('second_take_profit_r_multiple', target_r) or target_r):.2f}R"
+                    f"({float(cfg.get('second_take_profit_ratio', 0.0) or 0.0):.0%}) / "
+                    f"runner {float(cfg.get('runner_pct', 0.0) or 0.0):.0%}; "
+                    f"net {net_edge.expected_net_r:.3f}R"
+                )
             plan['adaptive_exit_summary'] = status['adaptive_exit_summary']
 
         self._set_utbot_filtered_breakout_entry_plan(symbol, plan)
@@ -16060,6 +16585,19 @@ class SignalEngine(BaseEngine):
                     )
                 core_items.append(("EV Adaptive 기대값", ev_state, ev_detail))
 
+            profit_alpha_status_decision = self._append_profit_alpha_status_item(
+                core_items,
+                side=side,
+                cfg=cfg,
+                filter_values=filter_values,
+                market_regime_context=market_regime_context,
+                selector_quality=selector_quality,
+                quality_score_v2=quality_score_v2,
+                adaptation=adaptation,
+                ev_status_decision=ev_status_decision,
+                ev_status_net=ev_status_net,
+            )
+
             set_filter_multiplier_status = 1.0
             if set_hard_failures:
                 set_filter_multiplier_status = 0.0
@@ -16087,6 +16625,14 @@ class SignalEngine(BaseEngine):
                     float(ev_status_decision.risk_multiplier),
                     market_multiplier,
                     volatility_multiplier,
+                    (
+                        min(
+                            1.0,
+                            max(0.0, float(profit_alpha_status_decision.risk_multiplier)),
+                        )
+                        if profit_alpha_status_decision is not None
+                        else 1.0
+                    ),
                 )
             else:
                 raw_final_risk_multiplier_status = (
@@ -16096,6 +16642,14 @@ class SignalEngine(BaseEngine):
                     * adaptation_multiplier
                     * q2_multiplier
                     * set_filter_multiplier_status
+                    * (
+                        min(
+                            1.0,
+                            max(0.0, float(profit_alpha_status_decision.risk_multiplier)),
+                        )
+                        if profit_alpha_status_decision is not None
+                        else 1.0
+                    )
                 )
             final_risk_multiplier_status = _apply_utbreakout_risk_multiplier_floor(
                 raw_final_risk_multiplier_status,
@@ -16113,6 +16667,7 @@ class SignalEngine(BaseEngine):
                     ev_decision=ev_status_decision,
                     ev_net=ev_status_net,
                     ev_exit=ev_status_exit,
+                    alpha_decision=profit_alpha_status_decision,
                 )
             )
             core_items.append(("Entry Quality Gate", entry_quality_state, entry_quality_detail))
@@ -17366,6 +17921,19 @@ class SignalEngine(BaseEngine):
                     )
                 core_items.append(("EV Adaptive 기대값", ev_state, ev_detail))
 
+            profit_alpha_status_decision = self._append_profit_alpha_status_item(
+                core_items,
+                side=side,
+                cfg=cfg,
+                filter_values=filter_values,
+                market_regime_context=market_regime_context,
+                selector_quality=selector_quality,
+                quality_score_v2=quality_score_v2,
+                adaptation=adaptation,
+                ev_status_decision=ev_status_decision,
+                ev_status_net=ev_status_net,
+            )
+
             set_filter_multiplier_status = 1.0
             if set_hard_failures:
                 set_filter_multiplier_status = 0.0
@@ -17393,6 +17961,14 @@ class SignalEngine(BaseEngine):
                     float(ev_status_decision.risk_multiplier),
                     market_multiplier,
                     volatility_multiplier,
+                    (
+                        min(
+                            1.0,
+                            max(0.0, float(profit_alpha_status_decision.risk_multiplier)),
+                        )
+                        if profit_alpha_status_decision is not None
+                        else 1.0
+                    ),
                 )
             else:
                 raw_final_risk_multiplier_status = (
@@ -17402,6 +17978,14 @@ class SignalEngine(BaseEngine):
                     * adaptation_multiplier
                     * q2_multiplier
                     * set_filter_multiplier_status
+                    * (
+                        min(
+                            1.0,
+                            max(0.0, float(profit_alpha_status_decision.risk_multiplier)),
+                        )
+                        if profit_alpha_status_decision is not None
+                        else 1.0
+                    )
                 )
             final_risk_multiplier_status = _apply_utbreakout_risk_multiplier_floor(
                 raw_final_risk_multiplier_status,
@@ -17419,6 +18003,7 @@ class SignalEngine(BaseEngine):
                     ev_decision=ev_status_decision,
                     ev_net=ev_status_net,
                     ev_exit=ev_status_exit,
+                    alpha_decision=profit_alpha_status_decision,
                 )
             )
             core_items.append(("Entry Quality Gate", entry_quality_state, entry_quality_detail))
@@ -29820,6 +30405,65 @@ class SignalEngine(BaseEngine):
             'mae_r': float(mae_r),
         })
         self.utbreakout_trailing_states[symbol] = state
+
+        alpha_follow_exit = evaluate_alpha_follow_through_exit(
+            enabled=bool(state.get('profit_alpha_enabled')) and bool(
+                state.get('profit_alpha_follow_through_enabled', False)
+            ),
+            bars_held=int(state.get('bars_seen', 0) or 0),
+            mfe_r=float(mfe_r),
+            mae_r=float(mae_r),
+            tp1_filled=bool(state.get('tp1_filled')) or partial_qty_seen,
+            follow_through_bars=int(
+                state.get(
+                    'profit_alpha_follow_through_bars',
+                    cfg.get('profit_alpha_follow_through_bars', 3),
+                )
+                or 3
+            ),
+            follow_through_min_mfe_r=float(
+                state.get(
+                    'profit_alpha_follow_through_min_mfe_r',
+                    cfg.get('profit_alpha_follow_through_min_mfe_r', 0.35),
+                )
+                or 0.35
+            ),
+            early_exit_max_mae_r=float(
+                state.get(
+                    'profit_alpha_early_exit_max_mae_r',
+                    cfg.get('profit_alpha_early_exit_max_mae_r', 0.75),
+                )
+                or 0.75
+            ),
+        )
+        state['profit_alpha_follow_through_reason'] = alpha_follow_exit.reason
+        if alpha_follow_exit.should_exit:
+            close_result = await self._close_position_reduce_only_market(
+                symbol,
+                pos,
+                reason=f"Profit alpha follow-through: {alpha_follow_exit.reason}",
+                cfg=cfg,
+            )
+            if (
+                bool((close_result or {}).get('_flat_confirmed'))
+                and bool((close_result or {}).get('_cleanup_confirmed'))
+            ):
+                self._clear_utbreakout_trailing_state(
+                    symbol,
+                    finalize=True,
+                    reason=alpha_follow_exit.reason,
+                )
+                return {
+                    'status': 'EXITED',
+                    'reason': 'PROFIT_ALPHA_FOLLOW_THROUGH',
+                    'detail': alpha_follow_exit.reason,
+                }
+            return {
+                'status': 'EXIT_PENDING',
+                'reason': 'PROFIT_ALPHA_FOLLOW_THROUGH',
+                'detail': alpha_follow_exit.reason,
+                'order': close_result,
+            }
 
         if bool(state.get('ev_time_stop_enabled', cfg.get('ev_time_stop_enabled', False))):
             time_stop = evaluate_ev_time_stop(

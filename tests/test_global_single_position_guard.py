@@ -52,6 +52,8 @@ def test_opportunity_tuning_persists_changed_runtime_config():
     assert "meme" not in selector["excluded_sectors"]
     assert ut_cfg["ev_min_entry_score"] == 62.0
     assert ut_cfg["entry_quality_gate_min_ev_score"] == 66.0
+    assert ut_cfg["entry_quality_gate_min_profit_alpha_score"] == 68.0
+    assert ut_cfg["profit_alpha_enabled"] is True
     assert ut_cfg["ev_no_edge_relief_min_score"] == 74.0
     assert ut_cfg["ev_short_min_entry_score"] == 62.0
     assert ut_cfg["ev_short_relaxed_signal_risk_cap"] == 0.25
