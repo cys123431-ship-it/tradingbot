@@ -18289,7 +18289,7 @@ class SignalEngine(BaseEngine):
                         f"{ev_status_decision.mode} score {ev_status_decision.score:.1f}; "
                         "수량/비용 계산 대기"
                     )
-                status['ev_adaptive_status_summary'] = ev_detail
+                q_status['ev_adaptive_status_summary'] = ev_detail
 
             entry_edge_status_decision = self._append_entry_edge_status_item(
                 core_items,
@@ -18305,7 +18305,7 @@ class SignalEngine(BaseEngine):
                 ev_status_exit=ev_status_exit,
             )
             if entry_edge_status_decision is not None:
-                status['entry_edge_status_summary'] = entry_edge_status_decision.summary
+                q_status['entry_edge_status_summary'] = entry_edge_status_decision.summary
 
             set_filter_multiplier_status = 1.0
             if set_hard_failures:

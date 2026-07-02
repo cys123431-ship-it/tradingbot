@@ -87,6 +87,38 @@ def test_manual_status_uses_diagnostic_ready_not_status_ready():
     assert "STATUS_READY" not in emitted_stages
 
 
+def test_utbreakout_condition_status_builder_does_not_write_missing_status_local():
+    source = Path("emas.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    status_fn = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "build_utbreakout_condition_status_text"
+    )
+    status_source = ast.get_source_segment(source, status_fn) or ""
+    invalid_status_writes = []
+    for node in ast.walk(status_fn):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if not isinstance(target, ast.Subscript):
+                continue
+            if not (
+                isinstance(target.value, ast.Name)
+                and target.value.id == "status"
+            ):
+                continue
+            key = target.slice
+            if isinstance(key, ast.Constant):
+                invalid_status_writes.append(key.value)
+
+    assert "ev_adaptive_status_summary" not in invalid_status_writes
+    assert "entry_edge_status_summary" not in invalid_status_writes
+    assert "q_status['ev_adaptive_status_summary']" in status_source
+    assert "q_status['entry_edge_status_summary']" in status_source
+
+
 def test_utbreakout_trace_is_bounded_and_symbol_aliases_share_state():
     engine = _build_trace_engine()
 
