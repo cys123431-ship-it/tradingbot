@@ -88,8 +88,10 @@ from .ev_adaptive import (
 )
 from .alpha_engine import (
     AlphaFollowThroughExit,
+    EntryEdgeDecision,
     ProfitAlphaDecision,
     apply_profit_alpha_exit_overrides,
+    build_entry_edge_decision,
     default_profit_alpha_config,
     evaluate_alpha_follow_through_exit,
     evaluate_profit_alpha,
@@ -190,8 +192,10 @@ __all__ = [
     "profile_gross_win_r",
     "rank_ev_candidates",
     "AlphaFollowThroughExit",
+    "EntryEdgeDecision",
     "ProfitAlphaDecision",
     "apply_profit_alpha_exit_overrides",
+    "build_entry_edge_decision",
     "default_profit_alpha_config",
     "evaluate_alpha_follow_through_exit",
     "evaluate_profit_alpha",

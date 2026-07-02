@@ -51,6 +51,9 @@ def test_profit_opportunity_effective_profile_overrides_old_values():
     assert out["profit_alpha_enabled"] is True
     assert out["profit_alpha_min_score"] == 68.0
     assert out["entry_quality_gate_min_profit_alpha_score"] == 68.0
+    assert out["entry_edge_enabled"] is True
+    assert out["entry_edge_min_score"] == 68.0
+    assert out["entry_quality_gate_min_entry_edge_score"] == 68.0
 
 
 def test_runtime_config_path_reapplies_effective_profile_after_persisted_values():
@@ -122,7 +125,7 @@ def test_status_render_contract_replaces_stale_telegram_summary_values():
     )
 
     assert "Effective Profile: ev_adaptive_v3_profit_engine" in rendered
-    assert "Strategy Router: EV Candidate + Profit Alpha" in rendered
+    assert "Strategy Router: Entry Edge (UT trigger + EV/Alpha integrated)" in rendered
     assert "Effective TP2: 2.40R" in rendered
     assert "Effective volume: base 0.40 / 15m 0.45" in rendered
     assert "익절 계획: TP1 1.00R(25%) / TP2 2.40R(35%)" in rendered
@@ -165,6 +168,11 @@ def test_prelaunch_runtime_patches_cannot_restore_the_retired_profile():
         "profit_alpha_long_min_score",
         "profit_alpha_short_min_score",
         "entry_quality_gate_min_profit_alpha_score",
+        "entry_edge_enabled",
+        "entry_edge_min_score",
+        "entry_edge_long_min_score",
+        "entry_edge_short_min_score",
+        "entry_quality_gate_min_entry_edge_score",
     )
 
     for key in keys:

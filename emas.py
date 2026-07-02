@@ -114,8 +114,10 @@ from utbreakout.ev_adaptive import (
     profile_gross_win_r,
 )
 from utbreakout.alpha_engine import (
+    EntryEdgeDecision,
     ProfitAlphaDecision,
     apply_profit_alpha_exit_overrides,
+    build_entry_edge_decision,
     default_profit_alpha_config,
     evaluate_alpha_follow_through_exit,
     evaluate_profit_alpha,
@@ -994,6 +996,16 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "entry_quality_gate_min_ev_mtf_votes": 2,
         "entry_quality_gate_min_profit_alpha_score": 68.0,
         "entry_quality_gate_min_profit_alpha_probability": 0.555,
+        "entry_quality_gate_min_entry_edge_score": 68.0,
+        "entry_quality_gate_min_entry_edge_probability": 0.555,
+        "entry_edge_enabled": True,
+        "entry_edge_min_score": 68.0,
+        "entry_edge_long_min_score": 69.0,
+        "entry_edge_short_min_score": 68.0,
+        "entry_edge_min_probability": 0.555,
+        "entry_edge_long_min_probability": 0.560,
+        "entry_edge_short_min_probability": 0.555,
+        "entry_edge_min_net_expectancy_r": 0.14,
         "profit_alpha_enabled": True,
         "profit_alpha_min_score": 68.0,
         "profit_alpha_long_min_score": 69.0,
@@ -1255,7 +1267,7 @@ def build_utbreakout_effective_status_contract(cfg, daily_entries=None):
     effective = apply_profit_opportunity_effective_overrides(dict(cfg or {}))
     lines = [
         f"Effective Profile: {effective.get('effective_profile_version', 'UNKNOWN')}",
-        "Strategy Router: EV Candidate + Profit Alpha (trend / squeeze / regime / meta)",
+        "Strategy Router: Entry Edge (UT trigger + EV/Alpha integrated)",
         f"Effective TP2: {float(effective.get('second_take_profit_r_multiple', 2.40) or 2.40):.2f}R",
         (
             "Effective volume: "
@@ -1434,6 +1446,16 @@ def apply_stable_utbreak_final_overrides(cfg):
         "entry_quality_gate_min_ev_mtf_votes": 2,
         "entry_quality_gate_min_profit_alpha_score": 68.0,
         "entry_quality_gate_min_profit_alpha_probability": 0.555,
+        "entry_quality_gate_min_entry_edge_score": 68.0,
+        "entry_quality_gate_min_entry_edge_probability": 0.555,
+        "entry_edge_enabled": True,
+        "entry_edge_min_score": 68.0,
+        "entry_edge_long_min_score": 69.0,
+        "entry_edge_short_min_score": 68.0,
+        "entry_edge_min_probability": 0.555,
+        "entry_edge_long_min_probability": 0.560,
+        "entry_edge_short_min_probability": 0.555,
+        "entry_edge_min_net_expectancy_r": 0.14,
 
         # Set32 keeps structure confirmation with more tolerant flow inputs.
         "set32_min_relative_volume": 1.15,
@@ -1897,6 +1919,16 @@ def build_utbreakout_effective_config_diff_text(raw_cfg, effective_cfg):
         'entry_quality_gate_min_ev_probability',
         'entry_quality_gate_min_ev_net_expectancy_r',
         'entry_quality_gate_min_ev_mtf_votes',
+        'entry_quality_gate_min_entry_edge_score',
+        'entry_quality_gate_min_entry_edge_probability',
+        'entry_edge_enabled',
+        'entry_edge_min_score',
+        'entry_edge_long_min_score',
+        'entry_edge_short_min_score',
+        'entry_edge_min_probability',
+        'entry_edge_long_min_probability',
+        'entry_edge_short_min_probability',
+        'entry_edge_min_net_expectancy_r',
         'ev_min_entry_score',
         'ev_min_net_expectancy_r',
         'ev_no_edge_relief_enabled',
@@ -10204,7 +10236,28 @@ class SignalEngine(BaseEngine):
             'summary': decision.summary,
         }
 
-    def _append_profit_alpha_status_item(
+    def _entry_edge_status_payload(self, decision):
+        if not isinstance(decision, EntryEdgeDecision):
+            return None
+        return {
+            'allowed': decision.allowed,
+            'engine': decision.engine,
+            'score': decision.score,
+            'probability': decision.probability,
+            'net_expectancy_r': decision.net_expectancy_r,
+            'risk_multiplier': decision.risk_multiplier,
+            'exit_profile': decision.exit_profile,
+            'ev_mode': decision.ev_mode,
+            'ev_score': decision.ev_score,
+            'alpha_score': decision.alpha_score,
+            'mtf_alignment': decision.mtf_alignment,
+            'components': dict(decision.components or {}),
+            'reasons': list(decision.reasons),
+            'blockers': list(decision.blockers),
+            'summary': decision.summary,
+        }
+
+    def _append_entry_edge_status_item(
         self,
         core_items,
         *,
@@ -10217,9 +10270,9 @@ class SignalEngine(BaseEngine):
         adaptation,
         ev_status_decision=None,
         ev_status_net=None,
+        ev_status_exit=None,
     ):
-        decision = None
-        if not bool((cfg or {}).get('profit_alpha_enabled', True)):
+        if not bool((cfg or {}).get('entry_edge_enabled', True)):
             return None
         adaptation = adaptation if isinstance(adaptation, dict) else {}
         trend_health = (
@@ -10255,18 +10308,25 @@ class SignalEngine(BaseEngine):
                 else False
             ),
         })
-        decision = self._evaluate_utbreakout_profit_alpha(
+        alpha_decision = self._evaluate_utbreakout_profit_alpha(
             side=side,
             cfg=cfg,
             values=filter_values,
             ev_decision=ev_status_decision,
             ev_net=ev_status_net,
         )
-        alpha_state = bool(decision.allowed)
-        alpha_detail = decision.summary
+        decision = build_entry_edge_decision(
+            side=side,
+            ev_decision=ev_status_decision,
+            alpha_decision=alpha_decision,
+            ev_net=ev_status_net,
+            ev_exit=ev_status_exit,
+            config=cfg,
+        )
+        detail = decision.summary
         if not decision.allowed:
-            alpha_detail += ": " + "; ".join(decision.blockers[:4])
-        core_items.append(("Profit Alpha", alpha_state, alpha_detail))
+            detail += ": " + "; ".join(decision.blockers[:4])
+        core_items.append(("Entry Edge", bool(decision.allowed), detail))
         return decision
 
     def _evaluate_utbreakout_entry_quality_gate(
@@ -10280,6 +10340,7 @@ class SignalEngine(BaseEngine):
         ev_net=None,
         ev_exit=None,
         alpha_decision=None,
+        entry_edge_decision=None,
     ):
         """Execution-only quality gate for already-selected UTBreakout candidates."""
         cfg = cfg if isinstance(cfg, dict) else {}
@@ -10355,8 +10416,45 @@ class SignalEngine(BaseEngine):
                 f"market quality x{market_multiplier:.2f}<x{market_floor:.2f}"
             )
 
+        edge_parts = []
+        if entry_edge_decision is not None:
+            edge_allowed = bool(_attr(entry_edge_decision, 'allowed', False))
+            edge_engine = str(_attr(entry_edge_decision, 'engine', 'ENTRY_EDGE') or 'ENTRY_EDGE')
+            edge_score = _num(_attr(entry_edge_decision, 'score'), 0.0)
+            edge_probability = _num(_attr(entry_edge_decision, 'probability'), 0.0)
+            edge_net_r = _num(_attr(entry_edge_decision, 'net_expectancy_r'), None)
+            edge_risk = _num(_attr(entry_edge_decision, 'risk_multiplier'), 0.0)
+            edge_blockers = _attr(entry_edge_decision, 'blockers', ()) or ()
+            if not edge_allowed:
+                blocker_text = '; '.join(str(item) for item in list(edge_blockers)[:3])
+                blockers.append(
+                    f"Entry Edge {edge_engine} not allowed"
+                    + (f": {blocker_text}" if blocker_text else "")
+                )
+            min_edge_score = _cfg_float(
+                'entry_quality_gate_min_entry_edge_score',
+                _cfg_float('entry_edge_min_score', 68.0),
+            )
+            if edge_score + 1e-12 < min_edge_score:
+                blockers.append(f"Entry Edge score {edge_score:.1f}<{min_edge_score:.1f}")
+            min_edge_probability = _cfg_float(
+                'entry_quality_gate_min_entry_edge_probability',
+                _cfg_float('entry_edge_min_probability', 0.555),
+            )
+            if edge_probability + 1e-12 < min_edge_probability:
+                blockers.append(
+                    f"Entry Edge p {edge_probability:.3f}<{min_edge_probability:.3f}"
+                )
+            edge_parts.extend([
+                f"{edge_engine} score {edge_score:.1f}",
+                f"p {edge_probability:.3f}",
+                f"risk x{edge_risk:.2f}",
+            ])
+            if edge_net_r is not None:
+                edge_parts.append(f"net {edge_net_r:.3f}R")
+
         ev_parts = []
-        if ev_decision is not None:
+        if entry_edge_decision is None and ev_decision is not None:
             ev_allowed = bool(_attr(ev_decision, 'allowed', False))
             ev_mode = str(_attr(ev_decision, 'mode', 'EV') or 'EV')
             ev_score = _num(_attr(ev_decision, 'score'), 0.0)
@@ -10404,7 +10502,7 @@ class SignalEngine(BaseEngine):
                 ev_parts.append(f"MTF {mtf_votes}/{mtf_total}")
 
         alpha_parts = []
-        if alpha_decision is not None:
+        if entry_edge_decision is None and alpha_decision is not None:
             alpha_allowed = bool(_attr(alpha_decision, 'allowed', False))
             alpha_engine = str(_attr(alpha_decision, 'engine', 'ALPHA') or 'ALPHA')
             alpha_score = _num(_attr(alpha_decision, 'score'), 0.0)
@@ -10451,6 +10549,8 @@ class SignalEngine(BaseEngine):
             detail_parts.append("EV " + ", ".join(ev_parts[:4]))
         if alpha_parts:
             detail_parts.append("Alpha " + ", ".join(alpha_parts[:4]))
+        if edge_parts:
+            detail_parts.append("Entry Edge " + ", ".join(edge_parts[:4]))
         return state, "; ".join(detail_parts)
 
     def _build_utbreakout_execution_eligibility(
@@ -14035,15 +14135,8 @@ class SignalEngine(BaseEngine):
                 f"MTF={ev_decision.mtf_alignment} "
                 f"leader={ev_decision.leadership_score:.0f}"
             )
-            if not ev_decision.allowed:
-                return _finish(
-                    None,
-                    f"REJECTED_EV_ADAPTIVE: {'; '.join(ev_decision.blockers[:5])}",
-                    'REJECTED_EV_ADAPTIVE',
-                    record_failure=True,
-                    side=side,
-                )
-            cfg = _apply_ev_exit_profile(cfg, ev_decision.exit_profile)
+            if ev_decision.allowed:
+                cfg = _apply_ev_exit_profile(cfg, ev_decision.exit_profile)
 
         profit_alpha_decision = None
         if bool(cfg.get('profit_alpha_enabled', True)):
@@ -14079,18 +14172,29 @@ class SignalEngine(BaseEngine):
             status['profit_alpha_score'] = profit_alpha_decision.score
             status['profit_alpha_probability'] = profit_alpha_decision.probability
             status['profit_alpha_risk_multiplier'] = profit_alpha_decision.risk_multiplier
-            if not profit_alpha_decision.allowed:
-                return _finish(
-                    None,
-                    (
-                        "REJECTED_PROFIT_ALPHA: "
-                        + "; ".join(profit_alpha_decision.blockers[:5])
-                    ),
-                    'REJECTED_PROFIT_ALPHA',
-                    record_failure=True,
-                    side=side,
-                )
-            cfg = apply_profit_alpha_exit_overrides(cfg, profit_alpha_decision)
+            if profit_alpha_decision.allowed:
+                cfg = apply_profit_alpha_exit_overrides(cfg, profit_alpha_decision)
+
+        entry_edge_decision = build_entry_edge_decision(
+            side=side,
+            ev_decision=ev_decision,
+            alpha_decision=profit_alpha_decision,
+            config=cfg,
+        )
+        status['entry_edge'] = self._entry_edge_status_payload(entry_edge_decision)
+        status['entry_edge_summary'] = entry_edge_decision.summary
+        status['entry_edge_engine'] = entry_edge_decision.engine
+        status['entry_edge_score'] = entry_edge_decision.score
+        status['entry_edge_probability'] = entry_edge_decision.probability
+        status['entry_edge_risk_multiplier'] = entry_edge_decision.risk_multiplier
+        if not entry_edge_decision.allowed:
+            return _finish(
+                None,
+                "REJECTED_ENTRY_EDGE: " + "; ".join(entry_edge_decision.blockers[:6]),
+                'REJECTED_ENTRY_EDGE',
+                record_failure=True,
+                side=side,
+            )
 
         dynamic_tp2 = self._build_utbreakout_dynamic_tp2(
             side,
@@ -14314,16 +14418,16 @@ class SignalEngine(BaseEngine):
         else:
             status['adaptive_exit_summary'] = exit_overlay.get('summary')
 
-        if profit_alpha_decision is not None and profit_alpha_decision.allowed:
+        if entry_edge_decision is not None and entry_edge_decision.allowed:
             status['adaptive_exit_summary'] = (
-                f"Profit Alpha {profit_alpha_decision.engine}: "
+                f"Entry Edge {entry_edge_decision.engine}: "
                 f"TP1 {float(cfg.get('partial_take_profit_r_multiple', 1.0) or 1.0):.2f}R"
                 f"({float(cfg.get('partial_take_profit_ratio', 0.0) or 0.0):.0%}) / "
                 f"TP2 {float(cfg.get('second_take_profit_r_multiple', cfg.get('take_profit_r_multiple', 2.4)) or 2.4):.2f}R"
                 f"({float(cfg.get('second_take_profit_ratio', 0.0) or 0.0):.0%}) / "
                 f"runner {float(cfg.get('runner_pct', 0.0) or 0.0):.0%}; "
-                f"follow {profit_alpha_decision.follow_through_bars} bars "
-                f">={profit_alpha_decision.follow_through_min_mfe_r:.2f}R"
+                f"score {entry_edge_decision.score:.1f} "
+                f"p={entry_edge_decision.probability:.3f}"
             )
 
         shadow_stats = strategy_adaptation.get('shadow_stats') if isinstance(strategy_adaptation.get('shadow_stats'), dict) else {}
@@ -14359,22 +14463,10 @@ class SignalEngine(BaseEngine):
                     float(strategy_adaptation.get('volatility_risk_multiplier', 1.0) or 0.0),
                 ),
             )
-            profit_alpha_multiplier = (
-                min(
-                    1.0,
-                    max(
-                        0.0,
-                        float(profit_alpha_decision.risk_multiplier),
-                    ),
-                )
-                if profit_alpha_decision is not None
-                else 1.0
-            )
             raw_final_risk_multiplier = min(
-                float(ev_decision.risk_multiplier),
+                float(entry_edge_decision.risk_multiplier),
                 market_quality_multiplier,
                 volatility_multiplier,
-                profit_alpha_multiplier,
             )
         else:
             raw_final_risk_multiplier = (
@@ -14391,9 +14483,9 @@ class SignalEngine(BaseEngine):
                 * (
                     min(
                         1.0,
-                        max(0.0, float(profit_alpha_decision.risk_multiplier)),
+                        max(0.0, float(entry_edge_decision.risk_multiplier)),
                     )
-                    if profit_alpha_decision is not None
+                    if entry_edge_decision is not None
                     else 1.0
                 )
             )
@@ -14432,6 +14524,11 @@ class SignalEngine(BaseEngine):
             ),
             'profit_alpha_probability': (
                 profit_alpha_decision.probability if profit_alpha_decision is not None else None
+            ),
+            'entry_edge_engine': entry_edge_decision.engine if entry_edge_decision is not None else None,
+            'entry_edge_score': entry_edge_decision.score if entry_edge_decision is not None else None,
+            'entry_edge_probability': (
+                entry_edge_decision.probability if entry_edge_decision is not None else None
             ),
             'raw_final_risk_multiplier': status.get('raw_final_risk_multiplier'),
             'final_risk_multiplier': final_risk_multiplier,
@@ -14853,14 +14950,6 @@ class SignalEngine(BaseEngine):
                 'mode': exit_feasibility.mode,
                 'reason': exit_feasibility.reason,
             }
-            if not exit_feasibility.executable:
-                return _finish(
-                    None,
-                    f"REJECTED_EV_EXIT_UNEXECUTABLE: {exit_feasibility.reason}",
-                    'REJECTED_EV_EXIT_UNEXECUTABLE',
-                    record_failure=True,
-                    side=side,
-                )
 
             cfg = _apply_ev_exit_profile(cfg, exit_feasibility.profile)
             if profit_alpha_decision is not None and profit_alpha_decision.allowed:
@@ -14899,7 +14988,7 @@ class SignalEngine(BaseEngine):
             net_edge = evaluate_net_edge(
                 risk_usdt=plan.get('risk_usdt'),
                 planned_notional=plan.get('planned_notional'),
-                win_probability=ev_decision.win_probability,
+                win_probability=entry_edge_decision.probability,
                 gross_win_r=profile_gross_win_r(exit_feasibility.profile),
                 config=_ev_adaptive_runtime_config(cfg),
             )
@@ -14911,11 +15000,26 @@ class SignalEngine(BaseEngine):
                 'cost_r': net_edge.cost_r,
                 'reason': net_edge.reason,
             }
-            if not net_edge.allowed:
+            entry_edge_decision = build_entry_edge_decision(
+                side=side,
+                ev_decision=ev_decision,
+                alpha_decision=profit_alpha_decision,
+                ev_net=net_edge,
+                ev_exit=exit_feasibility,
+                config=cfg,
+            )
+            status['entry_edge'] = self._entry_edge_status_payload(entry_edge_decision)
+            status['entry_edge_summary'] = entry_edge_decision.summary
+            status['entry_edge_engine'] = entry_edge_decision.engine
+            status['entry_edge_score'] = entry_edge_decision.score
+            status['entry_edge_probability'] = entry_edge_decision.probability
+            status['entry_edge_net_expectancy_r'] = entry_edge_decision.net_expectancy_r
+            status['entry_edge_risk_multiplier'] = entry_edge_decision.risk_multiplier
+            if not entry_edge_decision.allowed:
                 return _finish(
                     None,
-                    f"REJECTED_EV_NET_EDGE: {net_edge.reason}",
-                    'REJECTED_EV_NET_EDGE',
+                    "REJECTED_ENTRY_EDGE: " + "; ".join(entry_edge_decision.blockers[:6]),
+                    'REJECTED_ENTRY_EDGE',
                     record_failure=True,
                     side=side,
                 )
@@ -14935,17 +15039,27 @@ class SignalEngine(BaseEngine):
                 f"runner {exit_feasibility.profile.runner_ratio:.0%}; "
                 f"net {net_edge.expected_net_r:.3f}R"
             )
-            if profit_alpha_decision is not None and profit_alpha_decision.allowed:
+            if entry_edge_decision is not None and entry_edge_decision.allowed:
                 status['adaptive_exit_summary'] = (
-                    f"Profit Alpha {profit_alpha_decision.engine}: "
+                    f"Entry Edge {entry_edge_decision.engine}: "
                     f"TP1 {float(cfg.get('partial_take_profit_r_multiple', 1.0) or 1.0):.2f}R"
                     f"({float(cfg.get('partial_take_profit_ratio', 0.0) or 0.0):.0%}) / "
                     f"TP2 {float(cfg.get('second_take_profit_r_multiple', target_r) or target_r):.2f}R"
                     f"({float(cfg.get('second_take_profit_ratio', 0.0) or 0.0):.0%}) / "
                     f"runner {float(cfg.get('runner_pct', 0.0) or 0.0):.0%}; "
+                    f"score {entry_edge_decision.score:.1f}, "
+                    f"p={entry_edge_decision.probability:.3f}, "
                     f"net {net_edge.expected_net_r:.3f}R"
                 )
             plan['adaptive_exit_summary'] = status['adaptive_exit_summary']
+            plan.update({
+                'entry_edge_engine': entry_edge_decision.engine,
+                'entry_edge_score': entry_edge_decision.score,
+                'entry_edge_probability': entry_edge_decision.probability,
+                'entry_edge_net_expectancy_r': entry_edge_decision.net_expectancy_r,
+                'entry_edge_risk_multiplier': entry_edge_decision.risk_multiplier,
+                'entry_edge_summary': entry_edge_decision.summary,
+            })
 
         self._set_utbot_filtered_breakout_entry_plan(symbol, plan)
         status['risk_summary'] = (
@@ -15528,6 +15642,8 @@ class SignalEngine(BaseEngine):
                 blocker_candidates.append((1, line))
             elif "REJECTED" in line:
                 blocker_candidates.append((2, line))
+            elif "Entry Edge" in line:
+                blocker_candidates.append((3, line))
             elif "EV Adaptive 기대값" in line:
                 blocker_candidates.append((3, line))
                 
@@ -15650,6 +15766,25 @@ class SignalEngine(BaseEngine):
         if trade_direction_blocker:
             _add(trade_direction_blocker)
 
+        edge_line = next(
+            (
+                line for line in required_lines
+                if "Entry Edge" in line
+                and (
+                    "?뵶" in line
+                    or "BLOCK" in line.upper()
+                    or "NO_TRADE" in line.upper()
+                    or "<" in line
+                )
+            ),
+            None,
+        )
+        has_entry_edge_root_blocker = bool(edge_line)
+        if edge_line:
+            cleaned = self._clean_utbreakout_status_gate_line(edge_line)
+            detail = cleaned.split(":", 1)[1].strip() if ":" in cleaned else cleaned
+            _add(f"Entry Edge: {detail}")
+
         ev_line = next(
             (
                 line for line in required_lines
@@ -15703,7 +15838,11 @@ class SignalEngine(BaseEngine):
             _add("risk plan blocked")
         if _raw_has("daily risk limit reached"):
             _add("daily risk limit reached")
-        has_side_root_blocker = has_direction_root_blocker or has_ev_root_blocker
+        has_side_root_blocker = (
+            has_direction_root_blocker
+            or has_entry_edge_root_blocker
+            or has_ev_root_blocker
+        )
         if not has_side_root_blocker:
             if _raw_has("planned quantity zero", "planned risk zero"):
                 _add("계획 수량/리스크 0")
@@ -16583,9 +16722,9 @@ class SignalEngine(BaseEngine):
                         f"{ev_status_decision.mode} score {ev_status_decision.score:.1f}; "
                         "수량/비용 계산 대기"
                     )
-                core_items.append(("EV Adaptive 기대값", ev_state, ev_detail))
+                status['ev_adaptive_status_summary'] = ev_detail
 
-            profit_alpha_status_decision = self._append_profit_alpha_status_item(
+            entry_edge_status_decision = self._append_entry_edge_status_item(
                 core_items,
                 side=side,
                 cfg=cfg,
@@ -16596,7 +16735,10 @@ class SignalEngine(BaseEngine):
                 adaptation=adaptation,
                 ev_status_decision=ev_status_decision,
                 ev_status_net=ev_status_net,
+                ev_status_exit=ev_status_exit,
             )
+            if entry_edge_status_decision is not None:
+                status['entry_edge_status_summary'] = entry_edge_status_decision.summary
 
             set_filter_multiplier_status = 1.0
             if set_hard_failures:
@@ -16622,17 +16764,16 @@ class SignalEngine(BaseEngine):
                     ),
                 )
                 raw_final_risk_multiplier_status = min(
-                    float(ev_status_decision.risk_multiplier),
-                    market_multiplier,
-                    volatility_multiplier,
                     (
                         min(
                             1.0,
-                            max(0.0, float(profit_alpha_status_decision.risk_multiplier)),
+                            max(0.0, float(entry_edge_status_decision.risk_multiplier)),
                         )
-                        if profit_alpha_status_decision is not None
-                        else 1.0
+                        if entry_edge_status_decision is not None
+                        else float(ev_status_decision.risk_multiplier)
                     ),
+                    market_multiplier,
+                    volatility_multiplier,
                 )
             else:
                 raw_final_risk_multiplier_status = (
@@ -16645,9 +16786,9 @@ class SignalEngine(BaseEngine):
                     * (
                         min(
                             1.0,
-                            max(0.0, float(profit_alpha_status_decision.risk_multiplier)),
+                            max(0.0, float(entry_edge_status_decision.risk_multiplier)),
                         )
-                        if profit_alpha_status_decision is not None
+                        if entry_edge_status_decision is not None
                         else 1.0
                     )
                 )
@@ -16667,7 +16808,7 @@ class SignalEngine(BaseEngine):
                     ev_decision=ev_status_decision,
                     ev_net=ev_status_net,
                     ev_exit=ev_status_exit,
-                    alpha_decision=profit_alpha_status_decision,
+                    entry_edge_decision=entry_edge_status_decision,
                 )
             )
             core_items.append(("Entry Quality Gate", entry_quality_state, entry_quality_detail))
@@ -17919,9 +18060,9 @@ class SignalEngine(BaseEngine):
                         f"{ev_status_decision.mode} score {ev_status_decision.score:.1f}; "
                         "수량/비용 계산 대기"
                     )
-                core_items.append(("EV Adaptive 기대값", ev_state, ev_detail))
+                status['ev_adaptive_status_summary'] = ev_detail
 
-            profit_alpha_status_decision = self._append_profit_alpha_status_item(
+            entry_edge_status_decision = self._append_entry_edge_status_item(
                 core_items,
                 side=side,
                 cfg=cfg,
@@ -17932,7 +18073,10 @@ class SignalEngine(BaseEngine):
                 adaptation=adaptation,
                 ev_status_decision=ev_status_decision,
                 ev_status_net=ev_status_net,
+                ev_status_exit=ev_status_exit,
             )
+            if entry_edge_status_decision is not None:
+                status['entry_edge_status_summary'] = entry_edge_status_decision.summary
 
             set_filter_multiplier_status = 1.0
             if set_hard_failures:
@@ -17958,17 +18102,16 @@ class SignalEngine(BaseEngine):
                     ),
                 )
                 raw_final_risk_multiplier_status = min(
-                    float(ev_status_decision.risk_multiplier),
-                    market_multiplier,
-                    volatility_multiplier,
                     (
                         min(
                             1.0,
-                            max(0.0, float(profit_alpha_status_decision.risk_multiplier)),
+                            max(0.0, float(entry_edge_status_decision.risk_multiplier)),
                         )
-                        if profit_alpha_status_decision is not None
-                        else 1.0
+                        if entry_edge_status_decision is not None
+                        else float(ev_status_decision.risk_multiplier)
                     ),
+                    market_multiplier,
+                    volatility_multiplier,
                 )
             else:
                 raw_final_risk_multiplier_status = (
@@ -17981,9 +18124,9 @@ class SignalEngine(BaseEngine):
                     * (
                         min(
                             1.0,
-                            max(0.0, float(profit_alpha_status_decision.risk_multiplier)),
+                            max(0.0, float(entry_edge_status_decision.risk_multiplier)),
                         )
-                        if profit_alpha_status_decision is not None
+                        if entry_edge_status_decision is not None
                         else 1.0
                     )
                 )
@@ -18003,7 +18146,7 @@ class SignalEngine(BaseEngine):
                     ev_decision=ev_status_decision,
                     ev_net=ev_status_net,
                     ev_exit=ev_status_exit,
-                    alpha_decision=profit_alpha_status_decision,
+                    entry_edge_decision=entry_edge_status_decision,
                 )
             )
             core_items.append(("Entry Quality Gate", entry_quality_state, entry_quality_detail))
@@ -37920,6 +38063,16 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 'entry_quality_gate_min_ev_probability',
                 'entry_quality_gate_min_ev_net_expectancy_r',
                 'entry_quality_gate_min_ev_mtf_votes',
+                'entry_quality_gate_min_entry_edge_score',
+                'entry_quality_gate_min_entry_edge_probability',
+                'entry_edge_enabled',
+                'entry_edge_min_score',
+                'entry_edge_long_min_score',
+                'entry_edge_short_min_score',
+                'entry_edge_min_probability',
+                'entry_edge_long_min_probability',
+                'entry_edge_short_min_probability',
+                'entry_edge_min_net_expectancy_r',
                 'trend_continuation_entry_enabled',
                 'trend_continuation_base_risk_multiplier',
                 'trend_continuation_min_risk_multiplier',

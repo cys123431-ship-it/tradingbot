@@ -26,6 +26,9 @@ def test_profit_patch_matches_opportunity_profile_values():
     assert cfg["profit_alpha_enabled"] is True
     assert cfg["profit_alpha_min_score"] == 68.0
     assert cfg["entry_quality_gate_min_profit_alpha_score"] == 68.0
+    assert cfg["entry_edge_enabled"] is True
+    assert cfg["entry_edge_min_score"] == 68.0
+    assert cfg["entry_quality_gate_min_entry_edge_score"] == 68.0
 
 
 def test_mark_core_filter_failure_as_hard_block_compatible():

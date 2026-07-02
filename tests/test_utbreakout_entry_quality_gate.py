@@ -50,6 +50,20 @@ def _alpha_decision(**overrides):
     return SimpleNamespace(**values)
 
 
+def _entry_edge_decision(**overrides):
+    values = {
+        "allowed": True,
+        "engine": "TREND_CONTINUATION",
+        "score": 72.0,
+        "probability": 0.58,
+        "risk_multiplier": 0.74,
+        "net_expectancy_r": 0.24,
+        "blockers": (),
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_entry_quality_gate_allows_moderate_short_signal():
     state, detail = _engine()._evaluate_utbreakout_entry_quality_gate(
         "short",
@@ -143,3 +157,45 @@ def test_entry_quality_gate_blocks_profit_alpha_rejection():
     assert state is False
     assert "Profit Alpha" in detail
     assert "derivatives adverse stack" in detail
+
+
+def test_entry_quality_gate_uses_entry_edge_as_single_integrated_gate():
+    state, detail = _engine()._evaluate_utbreakout_entry_quality_gate(
+        "long",
+        _cfg(),
+        final_risk_multiplier=0.60,
+        market_quality={"state": True, "risk_multiplier": 1.0},
+        ev_decision=_ev_decision(score=52.0, win_probability=0.50),
+        ev_net=_ev_net(0.12),
+        ev_exit=_ev_exit(True),
+        alpha_decision=_alpha_decision(allowed=False, blockers=("legacy alpha fail",)),
+        entry_edge_decision=_entry_edge_decision(),
+    )
+
+    assert state == "reduced"
+    assert "Entry Edge TREND_CONTINUATION score 72.0" in detail
+    assert "EV score" not in detail
+    assert "Profit Alpha" not in detail
+
+
+def test_entry_quality_gate_blocks_entry_edge_rejection():
+    state, detail = _engine()._evaluate_utbreakout_entry_quality_gate(
+        "short",
+        _cfg(),
+        final_risk_multiplier=0.62,
+        market_quality={"state": True, "risk_multiplier": 1.0},
+        ev_decision=_ev_decision(),
+        ev_net=_ev_net(0.30),
+        ev_exit=_ev_exit(True),
+        alpha_decision=_alpha_decision(),
+        entry_edge_decision=_entry_edge_decision(
+            allowed=False,
+            score=61.0,
+            probability=0.52,
+            blockers=("Entry Edge score 61.0<68.0",),
+        ),
+    )
+
+    assert state is False
+    assert "Entry Edge TREND_CONTINUATION not allowed" in detail
+    assert "Entry Edge score 61.0<68.0" in detail

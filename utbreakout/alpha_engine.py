@@ -48,6 +48,40 @@ class AlphaFollowThroughExit:
     reason: str
 
 
+@dataclass(frozen=True)
+class EntryEdgeDecision:
+    allowed: bool
+    side: str
+    engine: str
+    score: float
+    probability: float
+    net_expectancy_r: float | None
+    risk_multiplier: float
+    exit_profile: str
+    ev_mode: str = "NONE"
+    ev_score: float | None = None
+    alpha_score: float | None = None
+    ev_probability: float | None = None
+    alpha_probability: float | None = None
+    mtf_alignment: str = "n/a"
+    reasons: tuple[str, ...] = ()
+    blockers: tuple[str, ...] = ()
+    components: Mapping[str, float] = field(default_factory=dict)
+
+    @property
+    def summary(self) -> str:
+        state = "ALLOW" if self.allowed else "BLOCK"
+        net = (
+            f"net={self.net_expectancy_r:.3f}R"
+            if self.net_expectancy_r is not None
+            else "net=pending"
+        )
+        return (
+            f"{state} {self.engine} score {self.score:.1f} "
+            f"p={self.probability:.3f} {net} risk x{self.risk_multiplier:.2f}"
+        )
+
+
 def default_profit_alpha_config() -> dict[str, Any]:
     return {
         "profit_alpha_enabled": True,
@@ -71,6 +105,14 @@ def default_profit_alpha_config() -> dict[str, Any]:
         "profit_alpha_default_follow_through_bars": 3,
         "profit_alpha_default_follow_through_min_mfe_r": 0.35,
         "profit_alpha_default_early_exit_max_mae_r": 0.75,
+        "entry_edge_enabled": True,
+        "entry_edge_min_score": 68.0,
+        "entry_edge_long_min_score": 69.0,
+        "entry_edge_short_min_score": 68.0,
+        "entry_edge_min_probability": 0.555,
+        "entry_edge_long_min_probability": 0.560,
+        "entry_edge_short_min_probability": 0.555,
+        "entry_edge_min_net_expectancy_r": 0.14,
     }
 
 
@@ -661,6 +703,153 @@ def apply_profit_alpha_exit_overrides(cfg: Mapping[str, Any] | None, decision: P
     if "second_take_profit_r_multiple" in effective:
         effective["take_profit_r_multiple"] = float(effective["second_take_profit_r_multiple"])
     return effective
+
+
+def build_entry_edge_decision(
+    *,
+    side: str,
+    ev_decision: Any = None,
+    alpha_decision: ProfitAlphaDecision | None = None,
+    ev_net: Any = None,
+    ev_exit: Any = None,
+    config: Mapping[str, Any] | None = None,
+) -> EntryEdgeDecision:
+    cfg = default_profit_alpha_config()
+    if isinstance(config, Mapping):
+        cfg.update(dict(config))
+    side = str(side or "").lower()
+
+    if not bool(cfg.get("entry_edge_enabled", True)):
+        return EntryEdgeDecision(
+            allowed=True,
+            side=side,
+            engine="DISABLED",
+            score=100.0,
+            probability=1.0,
+            net_expectancy_r=None,
+            risk_multiplier=1.0,
+            exit_profile="BASELINE",
+            reasons=("entry edge disabled",),
+        )
+
+    blockers: list[str] = []
+    reasons: list[str] = []
+
+    ev_allowed = bool(_attr(ev_decision, "allowed", False)) if ev_decision is not None else False
+    ev_mode = str(_attr(ev_decision, "mode", "NONE") or "NONE")
+    ev_score = _finite(_attr(ev_decision, "score", None), None)
+    ev_probability = _finite(_attr(ev_decision, "win_probability", None), None)
+    ev_risk = _finite(_attr(ev_decision, "risk_multiplier", None), 1.0) or 1.0
+    mtf_alignment = str(_attr(ev_decision, "mtf_alignment", "n/a") or "n/a")
+    ev_blockers = _attr(ev_decision, "blockers", ()) or ()
+    ev_reasons = _attr(ev_decision, "reasons", ()) or ()
+    if ev_decision is None:
+        blockers.append("EV candidate unavailable")
+    elif not ev_allowed:
+        blockers.extend(f"EV: {item}" for item in list(ev_blockers)[:4])
+    else:
+        reasons.extend(f"EV: {item}" for item in list(ev_reasons)[:4])
+
+    if not isinstance(alpha_decision, ProfitAlphaDecision):
+        alpha_allowed = False
+        alpha_score = None
+        alpha_probability = None
+        alpha_risk = 1.0
+        alpha_engine = "NO_ALPHA"
+        alpha_exit = "NONE"
+        alpha_components = {}
+        blockers.append("Profit Alpha unavailable")
+    else:
+        alpha_allowed = bool(alpha_decision.allowed)
+        alpha_score = float(alpha_decision.score)
+        alpha_probability = float(alpha_decision.probability)
+        alpha_risk = float(alpha_decision.risk_multiplier)
+        alpha_engine = str(alpha_decision.engine or "ALPHA")
+        alpha_exit = str(alpha_decision.exit_profile or alpha_engine)
+        alpha_components = dict(alpha_decision.components or {})
+        if not alpha_allowed:
+            blockers.extend(f"Alpha: {item}" for item in list(alpha_decision.blockers)[:4])
+        else:
+            reasons.extend(f"Alpha: {item}" for item in list(alpha_decision.reasons)[:4])
+
+    net_expectancy_r = _finite(_attr(ev_net, "expected_net_r", None), None)
+    if ev_exit is not None and not bool(_attr(ev_exit, "executable", True)):
+        blockers.append(f"Exit ladder: {_attr(ev_exit, 'reason', 'not executable')}")
+    if ev_net is not None and not bool(_attr(ev_net, "allowed", True)):
+        blockers.append(f"Net edge: {_attr(ev_net, 'reason', 'not allowed')}")
+
+    score_inputs = []
+    if ev_score is not None:
+        score_inputs.append((float(ev_score), 0.42))
+    if alpha_score is not None:
+        score_inputs.append((float(alpha_score), 0.58))
+    if score_inputs:
+        total_weight = sum(weight for _, weight in score_inputs)
+        score = sum(value * weight for value, weight in score_inputs) / max(total_weight, 1e-9)
+    else:
+        score = 0.0
+
+    probability_inputs = []
+    if ev_probability is not None:
+        probability_inputs.append((float(ev_probability), 0.45))
+    if alpha_probability is not None:
+        probability_inputs.append((float(alpha_probability), 0.55))
+    if probability_inputs:
+        total_weight = sum(weight for _, weight in probability_inputs)
+        probability = sum(value * weight for value, weight in probability_inputs) / max(total_weight, 1e-9)
+    else:
+        probability = 0.0
+    if net_expectancy_r is not None:
+        probability += _clamp(net_expectancy_r, -0.20, 0.80) * 0.015
+    probability = _clamp(probability, 0.0, 1.0)
+
+    base_min_score = float(cfg.get("entry_edge_min_score", 68.0) or 68.0)
+    min_score = float(cfg.get(f"entry_edge_{side}_min_score", base_min_score) or base_min_score)
+    base_min_probability = float(cfg.get("entry_edge_min_probability", 0.555) or 0.555)
+    min_probability = float(
+        cfg.get(f"entry_edge_{side}_min_probability", base_min_probability)
+        or base_min_probability
+    )
+    if score < min_score:
+        blockers.append(f"Entry Edge score {score:.1f}<{min_score:.1f}")
+    if probability < min_probability:
+        blockers.append(f"Entry Edge p {probability:.3f}<{min_probability:.3f}")
+    if net_expectancy_r is not None:
+        min_net = float(cfg.get("entry_edge_min_net_expectancy_r", 0.14) or 0.14)
+        if net_expectancy_r < min_net:
+            blockers.append(f"Entry Edge net {net_expectancy_r:.3f}R<{min_net:.2f}R")
+
+    risk_multiplier = _clamp(min(float(ev_risk), float(alpha_risk)), 0.0, 1.0)
+    engine = alpha_engine if alpha_engine not in {"NO_ALPHA", "NO_TRADE"} else ev_mode
+    components = {
+        "ev_score": float(ev_score or 0.0),
+        "alpha_score": float(alpha_score or 0.0),
+        "ev_probability": float(ev_probability or 0.0),
+        "alpha_probability": float(alpha_probability or 0.0),
+        "ev_risk_multiplier": float(ev_risk),
+        "alpha_risk_multiplier": float(alpha_risk),
+    }
+    components.update({f"alpha_{key}": float(value) for key, value in alpha_components.items()})
+
+    return EntryEdgeDecision(
+        allowed=not blockers,
+        side=side,
+        engine=engine,
+        score=_clamp(score, 0.0, 100.0),
+        probability=probability,
+        net_expectancy_r=net_expectancy_r,
+        risk_multiplier=risk_multiplier,
+        exit_profile=alpha_exit,
+        ev_mode=ev_mode,
+        ev_score=ev_score,
+        alpha_score=alpha_score,
+        ev_probability=ev_probability,
+        alpha_probability=alpha_probability,
+        mtf_alignment=mtf_alignment,
+        reasons=tuple(dict.fromkeys(str(item) for item in reasons if item)),
+        blockers=tuple(dict.fromkeys(str(item) for item in blockers if item)),
+        components=components,
+    )
 
 
 def evaluate_alpha_follow_through_exit(

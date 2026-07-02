@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from utbreakout.alpha_engine import (
     apply_profit_alpha_exit_overrides,
+    build_entry_edge_decision,
     evaluate_alpha_follow_through_exit,
     evaluate_profit_alpha,
 )
@@ -52,11 +53,17 @@ def _base_values(side="long"):
 
 def _ev(mode="STRONG_TREND"):
     return SimpleNamespace(
+        allowed=True,
         mode=mode,
+        score=78.0,
         win_probability=0.58,
+        risk_multiplier=0.82,
+        mtf_alignment="3/3",
         leadership_score=78.0,
         signal_age_candles=3.0,
         reacceleration=True,
+        reasons=("EV trend edge",),
+        blockers=(),
     )
 
 
@@ -163,6 +170,85 @@ def test_profit_alpha_exit_overrides_expand_strong_trend_runner():
     assert cfg["runner_pct"] >= 0.40
     assert cfg["take_profit_r_multiple"] >= 2.8
     assert cfg["profit_alpha_follow_through_enabled"] is True
+
+
+def test_entry_edge_combines_ev_and_profit_alpha_into_single_decision():
+    alpha = evaluate_profit_alpha(
+        side="long",
+        values=_base_values("long"),
+        ev_decision=_ev(),
+    )
+
+    decision = build_entry_edge_decision(
+        side="long",
+        ev_decision=_ev(),
+        alpha_decision=alpha,
+        ev_net=SimpleNamespace(allowed=True, expected_net_r=0.32, reason="ok"),
+        ev_exit=SimpleNamespace(executable=True, reason="ok"),
+    )
+
+    assert decision.allowed is True
+    assert decision.engine == alpha.engine
+    assert decision.score >= 68.0
+    assert decision.probability >= 0.555
+    assert decision.net_expectancy_r == 0.32
+    assert decision.risk_multiplier <= 0.82
+
+
+def test_entry_edge_blocks_when_either_source_is_not_allowed():
+    alpha = evaluate_profit_alpha(
+        side="long",
+        values=_base_values("long"),
+        ev_decision=_ev(),
+    )
+    weak_ev = _ev()
+    weak_ev.allowed = False
+    weak_ev.blockers = ("MTF alignment 0/3",)
+
+    decision = build_entry_edge_decision(
+        side="long",
+        ev_decision=weak_ev,
+        alpha_decision=alpha,
+    )
+
+    assert decision.allowed is False
+    assert any(item.startswith("EV:") for item in decision.blockers)
+
+
+def test_entry_edge_includes_net_edge_blocker():
+    alpha = evaluate_profit_alpha(
+        side="short",
+        values=_base_values("short"),
+        ev_decision=_ev(),
+    )
+
+    decision = build_entry_edge_decision(
+        side="short",
+        ev_decision=_ev(),
+        alpha_decision=alpha,
+        ev_net=SimpleNamespace(
+            allowed=False,
+            expected_net_r=0.05,
+            reason="expected net too low",
+        ),
+    )
+
+    assert decision.allowed is False
+    assert any("Net edge" in item for item in decision.blockers)
+    assert any("Entry Edge net" in item for item in decision.blockers)
+
+
+def test_entry_edge_disabled_is_explicit_pass_through():
+    decision = build_entry_edge_decision(
+        side="long",
+        ev_decision=None,
+        alpha_decision=None,
+        config={"entry_edge_enabled": False},
+    )
+
+    assert decision.allowed is True
+    assert decision.engine == "DISABLED"
+    assert decision.risk_multiplier == 1.0
 
 
 def test_alpha_follow_through_exits_when_no_mfe_after_required_bars():
