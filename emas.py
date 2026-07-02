@@ -201,6 +201,7 @@ UTBREAKOUT_CALLBACK_ACTIONS = UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS | frozenset({
     "research_download",
     "research",
     "entry_analyze",
+    "conditions",
     "status",
     "menu",
 })
@@ -38210,6 +38211,11 @@ UTBot:
             data = str(query.data or '')
             if not data.startswith('utbot:'):
                 return
+            parts = data.split(':')
+            action = parts[1] if len(parts) > 1 else 'menu'
+            if action == 'status':
+                await _send_utbreakout_condition_status_from_callback(query)
+                return
             await _edit_integrated_utbreak_notice(query, "UTBot")
 
         def _format_utbreakout_menu_text():
@@ -38544,7 +38550,10 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     return
                 message = getattr(query, 'message', None)
                 if message is not None:
-                    await message.reply_text(text, reply_markup=_build_utbreakout_keyboard())
+                    try:
+                        await message.reply_text(text, reply_markup=_build_utbreakout_keyboard())
+                    except Exception as exc:
+                        logger.debug(f"UTBreak callback progress fallback failed: {exc}")
             except Exception as exc:
                 logger.debug(f"UTBreak callback progress message failed: {exc}")
 
@@ -38653,23 +38662,40 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 
         async def _send_utbreakout_condition_status(message):
             if message is None:
-                return
-            text = await _get_utbreakout_condition_status_text()
-            await self._reply_long_text_with_document(
-                message,
-                text,
-                reply_markup=_build_utbreakout_keyboard(),
-                filename='utbreakout_condition_status.txt',
-                caption=f'UT Breakout 조건 스테이터스 · {UTBREAKOUT_EFFECTIVE_PROFILE_VERSION}',
-                preview_suffix='상세 조건 스테이터스는 파일로 보냈습니다.',
-            )
+                return False
+            try:
+                text = await _get_utbreakout_condition_status_text()
+                await self._reply_long_text_with_document(
+                    message,
+                    text,
+                    reply_markup=_build_utbreakout_keyboard(),
+                    filename='utbreakout_condition_status.txt',
+                    caption=f'UT Breakout 조건 스테이터스 · {UTBREAKOUT_EFFECTIVE_PROFILE_VERSION}',
+                    preview_suffix='상세 조건 스테이터스는 파일로 보냈습니다.',
+                )
+                return True
+            except Exception as exc:
+                logger.exception("UTBreakout condition status send failed")
+                try:
+                    await message.reply_text(
+                        f"⚠️ UTBreak 조건 스테이터스 전송 실패: {exc}",
+                        reply_markup=_build_utbreakout_keyboard(),
+                    )
+                except Exception:
+                    logger.exception("UTBreakout condition status failure reply failed")
+                return False
 
         async def _send_utbreakout_condition_status_from_callback(query):
             await _show_utbreakout_callback_progress(
                 query,
                 "⏳ UTBreak 조건 스테이터스 조회 중입니다. 완료되면 새 메시지/파일로 보냅니다."
             )
-            await _send_utbreakout_condition_status(getattr(query, 'message', None))
+            ok = await _send_utbreakout_condition_status(getattr(query, 'message', None))
+            if not ok:
+                try:
+                    await query.answer("UTBreak 조건 스테이터스 전송 실패", show_alert=True)
+                except Exception:
+                    logger.debug("UTBreak callback failure alert failed", exc_info=True)
 
         async def _edit_utbreakout_condition_status(query):
             text = await _get_utbreakout_condition_status_text()
@@ -39806,7 +39832,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     raise
                 return
 
-            if action == 'condition_status':
+            if action in {'condition_status', 'conditions', 'status'}:
                 await _send_utbreakout_condition_status_from_callback(query)
                 return
 

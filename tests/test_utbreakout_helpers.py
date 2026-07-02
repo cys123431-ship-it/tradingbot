@@ -1197,6 +1197,7 @@ def test_utbreakout_visible_callback_actions_include_watchlist_button():
 
     assert emas.UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS == {"on", "off", "condition_status", "watchlist"}
     assert {"fixed", "auto_scan", "sets", "why", "entry_analyze"}.issubset(emas.UTBREAKOUT_CALLBACK_ACTIONS)
+    assert {"condition_status", "conditions", "status"}.issubset(emas.UTBREAKOUT_CALLBACK_ACTIONS)
 
 
 def test_setup_keyboard_keeps_exchange_button_choices():
