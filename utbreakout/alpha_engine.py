@@ -25,6 +25,9 @@ class ProfitAlphaDecision:
     follow_through_bars: int
     follow_through_min_mfe_r: float
     early_exit_max_mae_r: float
+    entry_type: str = "TREND_CONTINUATION"
+    direction_score: float = 0.0
+    exit_policy: str = ""
     reasons: tuple[str, ...] = ()
     blockers: tuple[str, ...] = ()
     components: Mapping[str, float] = field(default_factory=dict)
@@ -37,8 +40,9 @@ class ProfitAlphaDecision:
     def summary(self) -> str:
         state = "ALLOW" if self.allowed else "BLOCK"
         return (
-            f"{state} {self.engine} score {self.score:.1f} "
-            f"p={self.probability:.2f} risk x{self.risk_multiplier:.2f}"
+            f"{state} {self.engine}/{self.entry_type} score {self.score:.1f} "
+            f"dir={self.direction_score:.1f} p={self.probability:.2f} "
+            f"risk x{self.risk_multiplier:.2f}"
         )
 
 
@@ -64,6 +68,9 @@ class EntryEdgeDecision:
     ev_probability: float | None = None
     alpha_probability: float | None = None
     mtf_alignment: str = "n/a"
+    entry_type: str = "TREND_CONTINUATION"
+    direction_score: float = 0.0
+    exit_policy: str = ""
     reasons: tuple[str, ...] = ()
     blockers: tuple[str, ...] = ()
     components: Mapping[str, float] = field(default_factory=dict)
@@ -77,8 +84,9 @@ class EntryEdgeDecision:
             else "net=pending"
         )
         return (
-            f"{state} {self.engine} score {self.score:.1f} "
-            f"p={self.probability:.3f} {net} risk x{self.risk_multiplier:.2f}"
+            f"{state} {self.engine}/{self.entry_type} score {self.score:.1f} "
+            f"dir={self.direction_score:.1f} p={self.probability:.3f} "
+            f"{net} risk x{self.risk_multiplier:.2f}"
         )
 
 
@@ -101,6 +109,23 @@ def default_profit_alpha_config() -> dict[str, Any]:
         "profit_alpha_meta_min_samples": 8,
         "profit_alpha_meta_expectancy_block_below": -0.12,
         "profit_alpha_meta_probability_weight": 0.20,
+        "direction_engine_min_score": 62.0,
+        "direction_engine_opposite_regime_min_score": 68.0,
+        "entry_type_max_chase_extension_atr": 2.35,
+        "entry_type_pullback_extension_atr": 1.35,
+        "entry_type_breakout_min_range": 1.12,
+        "entry_type_sweep_wick_ratio": 0.38,
+        "exit_meta_min_samples": 8,
+        "exit_meta_expectancy_block_below": -0.16,
+        "exit_meta_expectancy_reduce_below": 0.0,
+        "take_profit_front_run_atr": 0.10,
+        "take_profit_front_run_pct": 0.035,
+        "structure_stop_buffer_atr": 0.20,
+        "soft_stop_enabled": True,
+        "soft_stop_confirm_bars": 1,
+        "near_miss_tp_enabled": True,
+        "near_miss_tp_arm_ratio": 0.90,
+        "near_miss_tp_lock_r": 0.18,
         "profit_alpha_follow_through_enabled": True,
         "profit_alpha_default_follow_through_bars": 3,
         "profit_alpha_default_follow_through_min_mfe_r": 0.35,
@@ -409,6 +434,141 @@ def _derivatives_score(side: str, values: Mapping[str, Any]) -> tuple[float, flo
     return _clamp(score, 0.0, 100.0), risk_multiplier, adverse, strong_adverse, tuple(reasons), tuple(blockers)
 
 
+def _direction_engine_score(
+    side: str,
+    values: Mapping[str, Any],
+    *,
+    trend: float,
+    relative: float,
+    regime: float,
+    derivatives: float,
+    squeeze: float,
+    ev_decision: Any = None,
+) -> tuple[float, tuple[str, ...], tuple[str, ...]]:
+    ev_score = _finite(_attr(ev_decision, "score", None), None)
+    mtf = str(_attr(ev_decision, "mtf_alignment", values.get("mtf_alignment", "")) or "")
+    momentum = str(_attr(ev_decision, "momentum_alignment", values.get("momentum_alignment", "")) or "")
+
+    score = (
+        trend * 0.30
+        + relative * 0.18
+        + regime * 0.24
+        + derivatives * 0.22
+        + squeeze * 0.06
+    )
+    if ev_score is not None:
+        score = score * 0.82 + float(ev_score) * 0.18
+
+    reasons = [
+        f"direction trend {trend:.1f}",
+        f"regime {regime:.1f}",
+        f"flow {derivatives:.1f}",
+    ]
+    blockers: list[str] = []
+    if mtf and mtf not in {"n/a", "None"}:
+        reasons.append(f"MTF {mtf}")
+        try:
+            aligned, total = mtf.split("/", 1)
+            if int(aligned) <= 1 and int(total) >= 3:
+                score -= 5.0
+                blockers.append(f"weak MTF alignment {mtf}")
+        except Exception:
+            pass
+    if momentum:
+        if _is_aligned_direction(side, momentum):
+            score += 3.0
+            reasons.append("momentum aligned")
+        elif _is_opposite_direction(side, momentum):
+            score -= 4.0
+            blockers.append("momentum against")
+    return _clamp(score, 0.0, 100.0), tuple(reasons), tuple(blockers)
+
+
+def _extension_atr(side: str, values: Mapping[str, Any]) -> float | None:
+    direct = _first(values, "extension_atr", "bias_continuation_extension_atr", "ev_extension_atr", default=None)
+    if direct is not None:
+        return max(0.0, float(direct))
+    close = _first(values, "close", "entry_price", default=None)
+    atr_pct = _first(values, "atr_pct", default=None)
+    if close is None or close <= 0 or atr_pct is None or atr_pct <= 0:
+        return None
+    candidates = []
+    for key in ("ema50", "vwap", "bb_mid"):
+        ref = _first(values, key, default=None)
+        if ref is None or ref <= 0:
+            continue
+        if side == "long" and close < ref:
+            continue
+        if side == "short" and close > ref:
+            continue
+        dist_pct = abs(close - ref) / max(abs(close), 1e-9) * 100.0
+        candidates.append(dist_pct / max(atr_pct, 1e-9))
+    return min(candidates) if candidates else None
+
+
+def _entry_type(
+    side: str,
+    values: Mapping[str, Any],
+    *,
+    engine: str,
+    squeeze_active: bool,
+    cfg: Mapping[str, Any],
+) -> tuple[str, float, tuple[str, ...], tuple[str, ...]]:
+    extension = _extension_atr(side, values)
+    range_expansion = _first(values, "range_expansion", "range_expansion_ratio", default=1.0) or 1.0
+    close = _first(values, "close", "entry_price", default=None)
+    open_ = _first(values, "open", default=None)
+    high = _first(values, "high", default=None)
+    low = _first(values, "low", default=None)
+    reaccel = bool(_attr(values, "reacceleration", values.get("ev_reacceleration", False)))
+    reasons: list[str] = []
+    blockers: list[str] = []
+
+    if extension is not None:
+        reasons.append(f"extension {extension:.2f}ATR")
+    reasons.append(f"range {range_expansion:.2f}")
+
+    wick_ratio = 0.0
+    if close is not None and open_ is not None and high is not None and low is not None and high > low:
+        body_high = max(close, open_)
+        body_low = min(close, open_)
+        if side == "long":
+            wick_ratio = max(0.0, min(close, open_) - low) / max(high - low, 1e-9)
+        else:
+            wick_ratio = max(0.0, high - max(close, open_)) / max(high - low, 1e-9)
+        reasons.append(f"sweep wick {wick_ratio:.2f}")
+
+    max_chase = float(cfg.get("entry_type_max_chase_extension_atr", 2.35) or 2.35)
+    pullback_extension = float(cfg.get("entry_type_pullback_extension_atr", 1.35) or 1.35)
+    breakout_range = float(cfg.get("entry_type_breakout_min_range", 1.12) or 1.12)
+    sweep_wick = float(cfg.get("entry_type_sweep_wick_ratio", 0.38) or 0.38)
+
+    if wick_ratio >= sweep_wick and range_expansion >= 0.95:
+        return "LIQUIDITY_SWEEP_REVERSAL", extension or 0.0, tuple(reasons), tuple(blockers)
+    if squeeze_active or engine == "SQUEEZE_BREAKOUT":
+        return "SQUEEZE_BREAKOUT", extension or 0.0, tuple(reasons), tuple(blockers)
+    if extension is not None and extension >= max_chase and not reaccel:
+        blockers.append(f"chase extension {extension:.2f}ATR without reacceleration")
+        return "OVEREXTENDED_WAIT_PULLBACK", extension, tuple(reasons), tuple(blockers)
+    if extension is not None and extension >= pullback_extension:
+        return "PULLBACK_RETEST", extension, tuple(reasons), tuple(blockers)
+    if range_expansion >= breakout_range:
+        return "BREAKOUT", extension or 0.0, tuple(reasons), tuple(blockers)
+    return "TREND_CONTINUATION", extension or 0.0, tuple(reasons), tuple(blockers)
+
+
+def _exit_policy_name(engine: str, entry_type: str) -> str:
+    if entry_type == "LIQUIDITY_SWEEP_REVERSAL":
+        return "SWEEP_FAST_CAPTURE"
+    if entry_type == "SQUEEZE_BREAKOUT" or engine == "SQUEEZE_BREAKOUT":
+        return "SQUEEZE_RELEASE_LADDER"
+    if entry_type == "PULLBACK_RETEST":
+        return "PULLBACK_BALANCED_LADDER"
+    if engine in {"STRONG_UPTREND_LONG", "STRONG_DOWNTREND_SHORT", "TREND_CONTINUATION"}:
+        return "TREND_RUNNER"
+    return "CHOP_DEFENSIVE_LADDER"
+
+
 def _choose_engine(
     side: str,
     trend_score: float,
@@ -432,9 +592,62 @@ def _choose_engine(
     return "NO_TRADE"
 
 
-def _exit_overrides(engine: str, cfg: Mapping[str, Any]) -> dict[str, Any]:
+def _exit_overrides(
+    engine: str,
+    cfg: Mapping[str, Any],
+    *,
+    entry_type: str = "TREND_CONTINUATION",
+    direction_score: float | None = None,
+    exit_meta_expectancy: float | None = None,
+) -> dict[str, Any]:
+    front_run = {
+        "take_profit_front_run_atr": float(cfg.get("take_profit_front_run_atr", 0.10) or 0.10),
+        "take_profit_front_run_pct": float(cfg.get("take_profit_front_run_pct", 0.035) or 0.035),
+        "structure_stop_buffer_atr": float(cfg.get("structure_stop_buffer_atr", 0.20) or 0.20),
+        "soft_stop_enabled": bool(cfg.get("soft_stop_enabled", True)),
+        "soft_stop_confirm_bars": int(cfg.get("soft_stop_confirm_bars", 1) or 1),
+        "near_miss_tp_enabled": bool(cfg.get("near_miss_tp_enabled", True)),
+        "near_miss_tp_arm_ratio": float(cfg.get("near_miss_tp_arm_ratio", 0.90) or 0.90),
+        "near_miss_tp_lock_r": float(cfg.get("near_miss_tp_lock_r", 0.18) or 0.18),
+    }
+    if entry_type == "LIQUIDITY_SWEEP_REVERSAL":
+        result = {
+            "partial_take_profit_ratio": 0.35,
+            "second_take_profit_r_multiple": 2.05,
+            "second_take_profit_ratio": 0.30,
+            "runner_pct": 0.25,
+            "take_profit_r_multiple": 2.05,
+            "atr_trailing_activation_r": 0.95,
+            "atr_trailing_multiplier": 2.45,
+            "runner_chandelier_multiplier": 2.45,
+            "ev_time_stop_bars": 5,
+            "ev_time_stop_min_mfe_r": 0.30,
+            "profit_alpha_follow_through_bars": 2,
+            "profit_alpha_follow_through_min_mfe_r": 0.28,
+            "profit_alpha_early_exit_max_mae_r": 0.65,
+        }
+        result.update(front_run)
+        return result
+    if entry_type == "PULLBACK_RETEST":
+        result = {
+            "partial_take_profit_ratio": 0.28,
+            "second_take_profit_r_multiple": 2.45,
+            "second_take_profit_ratio": 0.35,
+            "runner_pct": 0.37,
+            "take_profit_r_multiple": 2.45,
+            "atr_trailing_activation_r": 1.05,
+            "atr_trailing_multiplier": 2.85,
+            "runner_chandelier_multiplier": 2.85,
+            "ev_time_stop_bars": 7,
+            "ev_time_stop_min_mfe_r": 0.38,
+            "profit_alpha_follow_through_bars": 3,
+            "profit_alpha_follow_through_min_mfe_r": 0.35,
+            "profit_alpha_early_exit_max_mae_r": 0.70,
+        }
+        result.update(front_run)
+        return result
     if engine in {"STRONG_UPTREND_LONG", "STRONG_DOWNTREND_SHORT", "TREND_CONTINUATION"}:
-        return {
+        result = {
             "partial_take_profit_ratio": 0.20,
             "second_take_profit_r_multiple": 3.20,
             "second_take_profit_ratio": 0.30,
@@ -449,8 +662,14 @@ def _exit_overrides(engine: str, cfg: Mapping[str, Any]) -> dict[str, Any]:
             "profit_alpha_follow_through_min_mfe_r": 0.40,
             "profit_alpha_early_exit_max_mae_r": 0.85,
         }
+        if direction_score is not None and direction_score >= 78.0:
+            result["runner_pct"] = 0.55
+            result["second_take_profit_r_multiple"] = 3.40
+            result["take_profit_r_multiple"] = 3.40
+        result.update(front_run)
+        return result
     if engine == "SQUEEZE_BREAKOUT":
-        return {
+        result = {
             "partial_take_profit_ratio": 0.25,
             "second_take_profit_r_multiple": 2.80,
             "second_take_profit_ratio": 0.35,
@@ -465,7 +684,9 @@ def _exit_overrides(engine: str, cfg: Mapping[str, Any]) -> dict[str, Any]:
             "profit_alpha_follow_through_min_mfe_r": 0.40,
             "profit_alpha_early_exit_max_mae_r": 0.75,
         }
-    return {
+        result.update(front_run)
+        return result
+    result = {
         "partial_take_profit_ratio": 0.30,
         "second_take_profit_r_multiple": 2.20,
         "second_take_profit_ratio": 0.35,
@@ -486,6 +707,15 @@ def _exit_overrides(engine: str, cfg: Mapping[str, Any]) -> dict[str, Any]:
             cfg.get("profit_alpha_default_early_exit_max_mae_r", 0.75) or 0.75
         ),
     }
+    if exit_meta_expectancy is not None and exit_meta_expectancy < 0:
+        result["partial_take_profit_ratio"] = max(0.35, float(result["partial_take_profit_ratio"]))
+        result["second_take_profit_r_multiple"] = min(2.05, float(result["second_take_profit_r_multiple"]))
+        result["take_profit_r_multiple"] = result["second_take_profit_r_multiple"]
+        result["runner_pct"] = min(0.25, float(result["runner_pct"]))
+        result["atr_trailing_multiplier"] = min(2.45, float(result["atr_trailing_multiplier"]))
+        result["runner_chandelier_multiplier"] = min(2.45, float(result["runner_chandelier_multiplier"]))
+    result.update(front_run)
+    return result
 
 
 def _meta_stats(meta_stats: Any, engine: str, side: str) -> tuple[str, Mapping[str, Any]]:
@@ -502,6 +732,21 @@ def _meta_stats(meta_stats: Any, engine: str, side: str) -> tuple[str, Mapping[s
         if isinstance(item, Mapping):
             return key, item
     return f"{side}:{engine}", {}
+
+
+def _exit_meta_stats(meta_stats: Any, side: str, engine: str, exit_policy: str) -> tuple[str, Mapping[str, Any]]:
+    if not isinstance(meta_stats, Mapping) or not exit_policy:
+        return f"{side}:{engine}:{exit_policy}", {}
+    keys = (
+        f"{side}:{engine}:{exit_policy}",
+        f"{engine}:{exit_policy}",
+        f"exit:{exit_policy}",
+    )
+    for key in keys:
+        item = meta_stats.get(key)
+        if isinstance(item, Mapping):
+            return key, item
+    return f"{side}:{engine}:{exit_policy}", {}
 
 
 def evaluate_profit_alpha(
@@ -544,12 +789,31 @@ def evaluate_profit_alpha(
     derivatives, deriv_risk, adverse_count, strong_adverse, deriv_reasons, deriv_blockers = _derivatives_score(side, values)
 
     engine = _choose_engine(side, trend, relative, regime, squeeze, squeeze_active, ev_mode)
+    entry_type, extension_atr, entry_type_reasons, entry_type_blockers = _entry_type(
+        side,
+        values,
+        engine=engine,
+        squeeze_active=squeeze_active,
+        cfg=cfg,
+    )
+    exit_policy = _exit_policy_name(engine, entry_type)
+    direction_score, direction_reasons, direction_blockers = _direction_engine_score(
+        side,
+        values,
+        trend=trend,
+        relative=relative,
+        regime=regime,
+        derivatives=derivatives,
+        squeeze=squeeze,
+        ev_decision=ev_decision,
+    )
     if engine == "NO_TRADE":
         score = trend * 0.30 + relative * 0.25 + regime * 0.15 + derivatives * 0.20 + squeeze * 0.10
     elif engine == "SQUEEZE_BREAKOUT":
         score = trend * 0.25 + relative * 0.20 + regime * 0.15 + derivatives * 0.20 + squeeze * 0.20
     else:
         score = trend * 0.32 + relative * 0.26 + regime * 0.16 + derivatives * 0.18 + squeeze * 0.08
+    score = score * 0.78 + direction_score * 0.22
     score = _clamp(score, 0.0, 100.0)
 
     blockers: list[str] = []
@@ -559,9 +823,15 @@ def evaluate_profit_alpha(
     reasons.extend(regime_reasons[:3])
     reasons.extend(deriv_reasons[:3])
     reasons.extend(squeeze_reasons[:2])
+    reasons.extend(direction_reasons[:3])
+    reasons.extend(entry_type_reasons[:3])
+    reasons.append(f"entry type {entry_type}")
+    reasons.append(f"exit policy {exit_policy}")
 
     if engine == "NO_TRADE":
         blockers.append("no alpha sub-strategy selected")
+    blockers.extend(direction_blockers[:2])
+    blockers.extend(entry_type_blockers[:2])
 
     base_min_score = float(cfg.get("profit_alpha_min_score", 68.0) or 68.0)
     min_score = float(cfg.get(f"profit_alpha_{side}_min_score", base_min_score) or base_min_score)
@@ -574,6 +844,13 @@ def evaluate_profit_alpha(
         min_score += float(cfg.get("profit_alpha_opposite_regime_score_add", 5.0) or 5.0)
         min_probability += float(cfg.get("profit_alpha_opposite_regime_probability_add", 0.010) or 0.010)
         blockers.append("top market regime opposite; raised alpha hurdle")
+        min_direction_score = float(
+            cfg.get("direction_engine_opposite_regime_min_score", 68.0) or 68.0
+        )
+    else:
+        min_direction_score = float(cfg.get("direction_engine_min_score", 62.0) or 62.0)
+    if direction_score < min_direction_score:
+        blockers.append(f"direction engine {direction_score:.1f}<{min_direction_score:.1f}")
 
     stale_age = _finite(_attr(ev_decision, "signal_age_candles", values.get("signal_age_candles")), None)
     if stale_age is None:
@@ -612,6 +889,20 @@ def evaluate_profit_alpha(
     elif meta_samples > 0:
         reasons.append(f"meta warmup {meta_samples} samples")
 
+    exit_meta_key, exit_meta = _exit_meta_stats(meta_stats, side, engine, exit_policy)
+    exit_meta_samples = int(_finite(exit_meta.get("sample_count", exit_meta.get("trades", 0)), 0) or 0) if isinstance(exit_meta, Mapping) else 0
+    exit_meta_expectancy = _finite(exit_meta.get("expectancy_r", exit_meta.get("avg_pnl_r")), None) if isinstance(exit_meta, Mapping) else None
+    if exit_meta_samples >= int(cfg.get("exit_meta_min_samples", 8) or 8) and exit_meta_expectancy is not None:
+        if exit_meta_expectancy < float(cfg.get("exit_meta_expectancy_block_below", -0.16) or -0.16):
+            blockers.append(
+                f"exit meta {exit_policy} {exit_meta_expectancy:.3f}R after {exit_meta_samples} samples"
+            )
+        else:
+            score += _clamp(exit_meta_expectancy * 8.0, -5.0, 5.0)
+            reasons.append(f"exit meta {exit_policy} {exit_meta_expectancy:.3f}R/{exit_meta_samples}")
+    elif exit_meta_samples > 0:
+        reasons.append(f"exit meta warmup {exit_policy} {exit_meta_samples}")
+
     probability = 0.46 + (score - 50.0) * 0.004
     probability += (ev_probability - 0.50) * 0.45
     if net_r is not None:
@@ -620,6 +911,8 @@ def evaluate_profit_alpha(
         probability += _clamp(meta_expectancy, -0.40, 0.60) * float(
             cfg.get("profit_alpha_meta_probability_weight", 0.20) or 0.20
         )
+    if exit_meta_expectancy is not None and exit_meta_samples >= int(cfg.get("exit_meta_min_samples", 8) or 8):
+        probability += _clamp(exit_meta_expectancy, -0.40, 0.60) * 0.12
     probability = _clamp(probability, 0.40, 0.70)
 
     if score < min_score:
@@ -631,13 +924,26 @@ def evaluate_profit_alpha(
     risk_multiplier = min(risk_multiplier, deriv_risk)
     if strong_opposite:
         risk_multiplier = min(risk_multiplier, 0.55)
+    if entry_type == "OVEREXTENDED_WAIT_PULLBACK":
+        risk_multiplier = min(risk_multiplier, 0.35)
+    elif entry_type == "PULLBACK_RETEST":
+        risk_multiplier = min(risk_multiplier, 0.88)
     if meta_expectancy is not None and meta_samples >= int(cfg.get("profit_alpha_meta_min_samples", 8) or 8):
         if meta_expectancy < 0:
             risk_multiplier = min(risk_multiplier, 0.70)
         elif meta_expectancy > 0.18:
             risk_multiplier = min(1.0, risk_multiplier * 1.08)
+    if exit_meta_expectancy is not None and exit_meta_samples >= int(cfg.get("exit_meta_min_samples", 8) or 8):
+        if exit_meta_expectancy < float(cfg.get("exit_meta_expectancy_reduce_below", 0.0) or 0.0):
+            risk_multiplier = min(risk_multiplier, 0.78)
 
-    overrides = _exit_overrides(engine, cfg)
+    overrides = _exit_overrides(
+        engine,
+        cfg,
+        entry_type=entry_type,
+        direction_score=direction_score,
+        exit_meta_expectancy=exit_meta_expectancy,
+    )
     follow_bars = int(overrides.get("profit_alpha_follow_through_bars", cfg.get("profit_alpha_default_follow_through_bars", 3)) or 3)
     follow_min_mfe = float(
         overrides.get(
@@ -660,8 +966,12 @@ def evaluate_profit_alpha(
         "regime": round(float(regime), 4),
         "derivatives": round(float(derivatives), 4),
         "squeeze": round(float(squeeze), 4),
+        "direction": round(float(direction_score), 4),
+        "extension_atr": round(float(extension_atr or 0.0), 4),
         "adverse_count": float(adverse_count),
         "strong_adverse_count": float(strong_adverse),
+        "exit_meta_samples": float(exit_meta_samples),
+        "exit_meta_expectancy_r": float(exit_meta_expectancy or 0.0),
     }
     return ProfitAlphaDecision(
         allowed=not blockers,
@@ -674,10 +984,13 @@ def evaluate_profit_alpha(
         follow_through_bars=follow_bars,
         follow_through_min_mfe_r=follow_min_mfe,
         early_exit_max_mae_r=early_mae,
+        entry_type=entry_type,
+        direction_score=direction_score,
+        exit_policy=exit_policy,
         reasons=tuple(dict.fromkeys(str(item) for item in reasons if item)),
         blockers=tuple(dict.fromkeys(str(item) for item in blockers if item)),
         components=components,
-        meta_key=meta_key,
+        meta_key=meta_key if not exit_meta else exit_meta_key,
         meta_sample_count=meta_samples,
         meta_expectancy_r=meta_expectancy,
         exit_overrides=overrides,
@@ -757,6 +1070,9 @@ def build_entry_edge_decision(
         alpha_risk = 1.0
         alpha_engine = "NO_ALPHA"
         alpha_exit = "NONE"
+        alpha_entry_type = "NONE"
+        alpha_direction_score = 0.0
+        alpha_exit_policy = "NONE"
         alpha_components = {}
         blockers.append("Profit Alpha unavailable")
     else:
@@ -766,6 +1082,9 @@ def build_entry_edge_decision(
         alpha_risk = float(alpha_decision.risk_multiplier)
         alpha_engine = str(alpha_decision.engine or "ALPHA")
         alpha_exit = str(alpha_decision.exit_profile or alpha_engine)
+        alpha_entry_type = str(alpha_decision.entry_type or "TREND_CONTINUATION")
+        alpha_direction_score = float(alpha_decision.direction_score or 0.0)
+        alpha_exit_policy = str(alpha_decision.exit_policy or alpha_exit)
         alpha_components = dict(alpha_decision.components or {})
         if not alpha_allowed:
             blockers.extend(f"Alpha: {item}" for item in list(alpha_decision.blockers)[:4])
@@ -828,6 +1147,7 @@ def build_entry_edge_decision(
         "alpha_probability": float(alpha_probability or 0.0),
         "ev_risk_multiplier": float(ev_risk),
         "alpha_risk_multiplier": float(alpha_risk),
+        "alpha_direction_score": float(alpha_direction_score),
     }
     components.update({f"alpha_{key}": float(value) for key, value in alpha_components.items()})
 
@@ -846,6 +1166,9 @@ def build_entry_edge_decision(
         ev_probability=ev_probability,
         alpha_probability=alpha_probability,
         mtf_alignment=mtf_alignment,
+        entry_type=alpha_entry_type,
+        direction_score=alpha_direction_score,
+        exit_policy=alpha_exit_policy,
         reasons=tuple(dict.fromkeys(str(item) for item in reasons if item)),
         blockers=tuple(dict.fromkeys(str(item) for item in blockers if item)),
         components=components,

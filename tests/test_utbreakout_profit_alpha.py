@@ -78,6 +78,9 @@ def test_profit_alpha_allows_strong_long_trend():
     assert decision.engine in {"STRONG_UPTREND_LONG", "TREND_CONTINUATION"}
     assert decision.score >= 68.0
     assert decision.probability >= 0.555
+    assert decision.direction_score >= 62.0
+    assert decision.entry_type in {"BREAKOUT", "TREND_CONTINUATION", "PULLBACK_RETEST"}
+    assert decision.exit_policy
 
 
 def test_profit_alpha_allows_strong_short_downtrend():
@@ -90,6 +93,7 @@ def test_profit_alpha_allows_strong_short_downtrend():
     assert decision.allowed is True
     assert decision.engine in {"STRONG_DOWNTREND_SHORT", "TREND_CONTINUATION"}
     assert decision.score >= 68.0
+    assert decision.direction_score >= 62.0
 
 
 def test_profit_alpha_blocks_opposite_market_regime_when_edge_is_not_strong():
@@ -170,6 +174,47 @@ def test_profit_alpha_exit_overrides_expand_strong_trend_runner():
     assert cfg["runner_pct"] >= 0.40
     assert cfg["take_profit_r_multiple"] >= 2.8
     assert cfg["profit_alpha_follow_through_enabled"] is True
+    assert cfg["soft_stop_enabled"] is True
+    assert cfg["near_miss_tp_enabled"] is True
+
+
+def test_profit_alpha_splits_pullback_entry_type_and_exit_policy():
+    values = _base_values("long")
+    values.update({
+        "extension_atr": 1.55,
+        "range_expansion": 1.02,
+    })
+
+    decision = evaluate_profit_alpha(
+        side="long",
+        values=values,
+        ev_decision=_ev(),
+    )
+
+    assert decision.allowed is True
+    assert decision.entry_type == "PULLBACK_RETEST"
+    assert decision.exit_policy == "PULLBACK_BALANCED_LADDER"
+    cfg = apply_profit_alpha_exit_overrides({}, decision)
+    assert cfg["second_take_profit_r_multiple"] == 2.45
+
+
+def test_profit_alpha_exit_meta_blocks_losing_exit_policy():
+    values = _base_values("short")
+
+    decision = evaluate_profit_alpha(
+        side="short",
+        values=values,
+        ev_decision=_ev(),
+        meta_stats={
+            "short:STRONG_DOWNTREND_SHORT:TREND_RUNNER": {
+                "sample_count": 10,
+                "expectancy_r": -0.22,
+            }
+        },
+    )
+
+    assert decision.allowed is False
+    assert any("exit meta" in item for item in decision.blockers)
 
 
 def test_entry_edge_combines_ev_and_profit_alpha_into_single_decision():
@@ -193,6 +238,9 @@ def test_entry_edge_combines_ev_and_profit_alpha_into_single_decision():
     assert decision.probability >= 0.555
     assert decision.net_expectancy_r == 0.32
     assert decision.risk_multiplier <= 0.82
+    assert decision.entry_type == alpha.entry_type
+    assert decision.exit_policy == alpha.exit_policy
+    assert decision.direction_score == alpha.direction_score
 
 
 def test_entry_edge_blocks_when_either_source_is_not_allowed():

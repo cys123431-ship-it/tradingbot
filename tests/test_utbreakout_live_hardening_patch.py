@@ -29,6 +29,9 @@ def test_profit_patch_matches_opportunity_profile_values():
     assert cfg["entry_edge_enabled"] is True
     assert cfg["entry_edge_min_score"] == 68.0
     assert cfg["entry_quality_gate_min_entry_edge_score"] == 68.0
+    assert cfg["direction_engine_min_score"] == 62.0
+    assert cfg["structure_stop_buffer_atr"] == 0.20
+    assert cfg["near_miss_tp_enabled"] is True
 
 
 def test_mark_core_filter_failure_as_hard_block_compatible():

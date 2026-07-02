@@ -241,6 +241,52 @@ def test_risk_plan_uses_loss_budget_not_fixed_margin():
     assert plan["take_profit"] == 108.0
 
 
+def test_risk_plan_uses_structure_stop_with_atr_buffer():
+    plan = calculate_risk_plan(
+        side="long",
+        entry_price=100.0,
+        atr_value=2.0,
+        stop_atr_multiplier=1.0,
+        ut_stop=98.5,
+        structure_stop=96.0,
+        structure_buffer_atr=0.25,
+        take_profit_r_multiple=2.0,
+        min_risk_reward=2.0,
+        balance_usdt=4000.0,
+        risk_per_trade_percent=1.0,
+        max_risk_per_trade_usdt=50.0,
+        leverage=10.0,
+    )
+
+    assert plan["hard_stop_loss"] == pytest.approx(95.5)
+    assert plan["soft_stop_loss"] == pytest.approx(98.5)
+    assert plan["structure_anchor_distance"] == pytest.approx(4.5)
+    assert plan["risk_distance"] == pytest.approx(4.5)
+    assert plan["qty"] == pytest.approx(40.0 / 4.5)
+
+
+def test_risk_plan_front_runs_take_profit_without_breaking_min_rr():
+    plan = calculate_risk_plan(
+        side="short",
+        entry_price=100.0,
+        atr_value=2.0,
+        stop_atr_multiplier=1.5,
+        take_profit_r_multiple=2.5,
+        take_profit_front_run_atr=0.25,
+        take_profit_front_run_pct=0.10,
+        min_risk_reward=2.0,
+        balance_usdt=4000.0,
+        risk_per_trade_percent=1.0,
+        max_risk_per_trade_usdt=50.0,
+        leverage=10.0,
+    )
+
+    assert plan["risk_distance"] == pytest.approx(3.0)
+    assert plan["take_profit_front_run_distance"] == pytest.approx(0.75)
+    assert plan["effective_rr_multiple"] == pytest.approx((7.5 - 0.75) / 3.0)
+    assert plan["take_profit"] == pytest.approx(93.25)
+
+
 def test_risk_percent_normalization_clamps_legacy_live_defaults():
     assert normalize_risk_percent({"risk_per_trade_pct": 10.0, "max_risk_per_trade_pct": 100.0}) == 1.0
     assert normalize_risk_percent({"risk_per_trade_percent": 0.01}) == 0.05
@@ -4192,6 +4238,71 @@ def test_utbreakout_ev_time_stop_closes_only_after_no_follow_through():
     assert result["status"] == "EXITED"
     assert result["reason"] == "EV_TIME_STOP"
     assert len(close_calls) == 1
+    assert cleared[0][0] == "BTC/USDT"
+
+
+def test_utbreakout_soft_structure_stop_closes_on_confirmed_breach():
+    pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "1", "entryPrice": "100"}
+    engine = _protection_engine([], positions=[pos])
+    engine.utbreakout_trailing_states = {
+        "BTC/USDT": {
+            "side": "long",
+            "entry_price": 100.0,
+            "initial_qty": 1.0,
+            "remaining_ratio": 1.0,
+            "risk_distance": 5.0,
+            "activation_r": 1.0,
+            "atr_trailing_enabled": False,
+            "tp1_breakeven_enabled": False,
+            "soft_stop_enabled": True,
+            "soft_stop_price": 97.0,
+            "soft_stop_confirm_bars": 1,
+            "last_stop_price": 94.0,
+            "active": False,
+            "bars_seen": 0,
+            "last_bar_ts": 22,
+        }
+    }
+    close_calls = []
+    cleared = []
+
+    async def close_position(symbol, current_pos, reason, cfg):
+        close_calls.append((symbol, current_pos, reason, cfg))
+        return {"_flat_confirmed": True, "_cleanup_confirmed": True}
+
+    engine._close_position_reduce_only_market = close_position
+    engine._clear_utbreakout_trailing_state = (
+        lambda symbol, **kwargs: cleared.append((symbol, kwargs))
+    )
+    rows = [
+        {
+            "timestamp": idx,
+            "open": 100.0,
+            "high": 101.0,
+            "low": 95.5 if idx == 23 else 99.0,
+            "close": 96.5 if idx == 23 else 100.0,
+        }
+        for idx in range(25)
+    ]
+
+    result = asyncio.run(
+        engine._manage_utbreakout_partial_trailing(
+            "BTC/USDT",
+            pos,
+            pd.DataFrame(rows),
+            {
+                "atr_length": 14,
+                "atr_trailing_enabled": False,
+                "tp1_breakeven_enabled": False,
+                "soft_stop_enabled": True,
+            },
+        )
+    )
+
+    assert result["status"] == "EXITED"
+    assert result["reason"] == "SOFT_STRUCTURE_STOP"
+    assert len(close_calls) == 1
+    assert "Soft structure stop" in close_calls[0][2]
     assert cleared[0][0] == "BTC/USDT"
 
 
