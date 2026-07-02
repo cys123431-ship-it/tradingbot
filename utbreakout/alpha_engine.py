@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from math import isfinite
 from typing import Any, Mapping
 
+from .direction_engine import evaluate_direction_engine
+
 
 @dataclass(frozen=True)
 class ProfitAlphaDecision:
@@ -434,56 +436,6 @@ def _derivatives_score(side: str, values: Mapping[str, Any]) -> tuple[float, flo
     return _clamp(score, 0.0, 100.0), risk_multiplier, adverse, strong_adverse, tuple(reasons), tuple(blockers)
 
 
-def _direction_engine_score(
-    side: str,
-    values: Mapping[str, Any],
-    *,
-    trend: float,
-    relative: float,
-    regime: float,
-    derivatives: float,
-    squeeze: float,
-    ev_decision: Any = None,
-) -> tuple[float, tuple[str, ...], tuple[str, ...]]:
-    ev_score = _finite(_attr(ev_decision, "score", None), None)
-    mtf = str(_attr(ev_decision, "mtf_alignment", values.get("mtf_alignment", "")) or "")
-    momentum = str(_attr(ev_decision, "momentum_alignment", values.get("momentum_alignment", "")) or "")
-
-    score = (
-        trend * 0.30
-        + relative * 0.18
-        + regime * 0.24
-        + derivatives * 0.22
-        + squeeze * 0.06
-    )
-    if ev_score is not None:
-        score = score * 0.82 + float(ev_score) * 0.18
-
-    reasons = [
-        f"direction trend {trend:.1f}",
-        f"regime {regime:.1f}",
-        f"flow {derivatives:.1f}",
-    ]
-    blockers: list[str] = []
-    if mtf and mtf not in {"n/a", "None"}:
-        reasons.append(f"MTF {mtf}")
-        try:
-            aligned, total = mtf.split("/", 1)
-            if int(aligned) <= 1 and int(total) >= 3:
-                score -= 5.0
-                blockers.append(f"weak MTF alignment {mtf}")
-        except Exception:
-            pass
-    if momentum:
-        if _is_aligned_direction(side, momentum):
-            score += 3.0
-            reasons.append("momentum aligned")
-        elif _is_opposite_direction(side, momentum):
-            score -= 4.0
-            blockers.append("momentum against")
-    return _clamp(score, 0.0, 100.0), tuple(reasons), tuple(blockers)
-
-
 def _extension_atr(side: str, values: Mapping[str, Any]) -> float | None:
     direct = _first(values, "extension_atr", "bias_continuation_extension_atr", "ev_extension_atr", default=None)
     if direct is not None:
@@ -797,16 +749,20 @@ def evaluate_profit_alpha(
         cfg=cfg,
     )
     exit_policy = _exit_policy_name(engine, entry_type)
-    direction_score, direction_reasons, direction_blockers = _direction_engine_score(
-        side,
-        values,
+    opposite_regime = regime_opposite > 0 and regime_aligned == 0
+    direction_decision = evaluate_direction_engine(
+        side=side,
+        values=values,
         trend=trend,
         relative=relative,
         regime=regime,
         derivatives=derivatives,
         squeeze=squeeze,
         ev_decision=ev_decision,
+        config=cfg,
+        opposite_regime=opposite_regime,
     )
+    direction_score = direction_decision.score
     if engine == "NO_TRADE":
         score = trend * 0.30 + relative * 0.25 + regime * 0.15 + derivatives * 0.20 + squeeze * 0.10
     elif engine == "SQUEEZE_BREAKOUT":
@@ -823,14 +779,14 @@ def evaluate_profit_alpha(
     reasons.extend(regime_reasons[:3])
     reasons.extend(deriv_reasons[:3])
     reasons.extend(squeeze_reasons[:2])
-    reasons.extend(direction_reasons[:3])
+    reasons.extend(direction_decision.reasons[:3])
     reasons.extend(entry_type_reasons[:3])
     reasons.append(f"entry type {entry_type}")
     reasons.append(f"exit policy {exit_policy}")
 
     if engine == "NO_TRADE":
         blockers.append("no alpha sub-strategy selected")
-    blockers.extend(direction_blockers[:2])
+    blockers.extend(direction_decision.blockers[:3])
     blockers.extend(entry_type_blockers[:2])
 
     base_min_score = float(cfg.get("profit_alpha_min_score", 68.0) or 68.0)
@@ -840,17 +796,10 @@ def evaluate_profit_alpha(
         cfg.get(f"profit_alpha_{side}_min_probability", base_min_probability)
         or base_min_probability
     )
-    if regime_opposite > 0 and regime_aligned == 0:
+    if opposite_regime:
         min_score += float(cfg.get("profit_alpha_opposite_regime_score_add", 5.0) or 5.0)
         min_probability += float(cfg.get("profit_alpha_opposite_regime_probability_add", 0.010) or 0.010)
         blockers.append("top market regime opposite; raised alpha hurdle")
-        min_direction_score = float(
-            cfg.get("direction_engine_opposite_regime_min_score", 68.0) or 68.0
-        )
-    else:
-        min_direction_score = float(cfg.get("direction_engine_min_score", 62.0) or 62.0)
-    if direction_score < min_direction_score:
-        blockers.append(f"direction engine {direction_score:.1f}<{min_direction_score:.1f}")
 
     stale_age = _finite(_attr(ev_decision, "signal_age_candles", values.get("signal_age_candles")), None)
     if stale_age is None:
@@ -967,6 +916,8 @@ def evaluate_profit_alpha(
         "derivatives": round(float(derivatives), 4),
         "squeeze": round(float(squeeze), 4),
         "direction": round(float(direction_score), 4),
+        "direction_min_score": round(float(direction_decision.min_score), 4),
+        "direction_risk_multiplier": round(float(direction_decision.risk_multiplier), 4),
         "extension_atr": round(float(extension_atr or 0.0), 4),
         "adverse_count": float(adverse_count),
         "strong_adverse_count": float(strong_adverse),

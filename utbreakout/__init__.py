@@ -96,6 +96,7 @@ from .alpha_engine import (
     evaluate_alpha_follow_through_exit,
     evaluate_profit_alpha,
 )
+from .direction_engine import DirectionDecision, default_direction_engine_config, evaluate_direction_engine
 from .market_context import MarketContext, MarketContextQuality, build_market_context
 from .derivatives import (
     DerivativesDecision,
@@ -199,6 +200,9 @@ __all__ = [
     "default_profit_alpha_config",
     "evaluate_alpha_follow_through_exit",
     "evaluate_profit_alpha",
+    "DirectionDecision",
+    "default_direction_engine_config",
+    "evaluate_direction_engine",
     "MarketContext",
     "MarketContextQuality",
     "build_market_context",
