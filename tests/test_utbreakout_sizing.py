@@ -61,6 +61,66 @@ def test_position_sizing_keeps_good_signal_near_full_risk():
     assert result["risk_multiplier"] == 1.0
 
 
+def test_position_sizing_reduces_weak_edge_without_blocking():
+    result = build_position_risk_multiplier({
+        "atr_pct": 0.9,
+        "meta_probability": 0.57,
+        "entry_edge_score": 66.0,
+        "entry_edge_probability": 0.565,
+    })
+
+    assert result["blocked"] is False
+    assert 0 < result["risk_multiplier"] < 1.0
+    assert result["components"]["edge_score"] < 1.0
+    assert result["components"]["edge_probability"] < 1.0
+
+
+def test_position_sizing_uses_fractional_kelly_as_conservative_cap():
+    trades = [{"r_multiple": -1.0}] * 14 + [{"r_multiple": 0.6}] * 8
+
+    result = build_position_risk_multiplier({
+        "atr_pct": 0.8,
+        "meta_probability": 0.70,
+        "recent_trades": trades,
+    })
+
+    assert result["blocked"] is False
+    assert result["components"]["kelly"] < 1.0
+    assert result["risk_multiplier"] <= result["components"]["kelly"]
+    assert result["kelly_reason"] in {"negative_kelly", "kelly_applied"}
+
+
+def test_position_sizing_blocks_negative_meta_expectancy_with_samples():
+    result = build_position_risk_multiplier({
+        "atr_pct": 0.8,
+        "meta_probability": 0.70,
+        "recent_avg_pnl_r": -0.50,
+        "meta_sample_count": 12,
+    })
+
+    assert result["blocked"] is True
+    assert result["risk_multiplier"] == 0.0
+    assert any("negative expectancy" in reason for reason in result["reasons"])
+
+
+def test_position_sizing_reduces_or_blocks_portfolio_heat():
+    reduced = build_position_risk_multiplier({
+        "atr_pct": 0.8,
+        "meta_probability": 0.70,
+        "total_open_risk_pct": 1.5,
+    })
+    blocked = build_position_risk_multiplier({
+        "atr_pct": 0.8,
+        "meta_probability": 0.70,
+        "total_open_risk_pct": 2.2,
+    })
+
+    assert reduced["blocked"] is False
+    assert 0 < reduced["risk_multiplier"] < 1.0
+    assert blocked["blocked"] is True
+    assert blocked["risk_multiplier"] == 0.0
+
+
 def test_adaptive_risk_reduces_and_caps_multiplier_stack():
     risk = calculate_adaptive_risk_pct(
         {"side": "long"},

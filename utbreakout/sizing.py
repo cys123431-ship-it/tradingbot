@@ -31,7 +31,27 @@ def default_sizing_config():
         "base_risk_percent": 0.5,
         "volatility_target_atr_pct": 1.0,
         "volatility_target_min_multiplier": 0.25,
+        "volatility_low_atr_pct": 0.35,
+        "volatility_low_atr_multiplier": 0.80,
         "meta_min_multiplier": 0.25,
+        "edge_score_reduce_below": 72.0,
+        "edge_score_min_multiplier": 0.70,
+        "edge_probability_reduce_below": 0.58,
+        "edge_probability_min_multiplier": 0.70,
+        "position_kelly_enabled": True,
+        "position_kelly_min_samples": 20,
+        "position_kelly_fraction": 0.25,
+        "position_kelly_min_multiplier": 0.35,
+        "position_kelly_max_multiplier": 1.0,
+        "position_meta_min_samples": 8,
+        "position_meta_reduce_below_expectancy_r": 0.0,
+        "position_meta_block_below_expectancy_r": -0.35,
+        "position_meta_min_multiplier": 0.50,
+        "portfolio_heat_reduce_above_pct": 1.0,
+        "portfolio_heat_block_above_pct": 2.0,
+        "same_direction_reduce_at": 1,
+        "same_direction_block_at": 2,
+        "liquidity_min_multiplier": 0.65,
         "drawdown_soft_pct": 5.0,
         "drawdown_hard_pct": 15.0,
         "consecutive_loss_soft": 2,
@@ -154,6 +174,61 @@ def _optional_float(value):
     except (TypeError, ValueError):
         return None
     return parsed if isfinite(parsed) else None
+
+
+def _consecutive_losses(values):
+    count = 0
+    for value in values or []:
+        parsed = _optional_float(value)
+        if parsed is None or parsed >= 0:
+            break
+        count += 1
+    return count
+
+
+def _r_multiples_from_trades(trades=None):
+    values = []
+    for trade in trades or []:
+        value = _field(trade, "r_multiple", _field(trade, "pnl_r", trade))
+        parsed = _optional_float(value)
+        if parsed is not None:
+            values.append(parsed)
+    return values
+
+
+def _conservative_fractional_kelly_multiplier(values=None, cfg=None):
+    cfg = {**default_sizing_config(), **(cfg or {})}
+    if not bool(cfg.get("position_kelly_enabled", True)):
+        return 1.0, "kelly_disabled"
+    samples = list(values or [])
+    min_samples = max(1, int(_finite_float(cfg.get("position_kelly_min_samples"), 20) or 20))
+    if len(samples) < min_samples:
+        return 1.0, "kelly_not_enough_samples"
+
+    wins = [value for value in samples if value > 0]
+    losses = [abs(value) for value in samples if value < 0]
+    if not wins or not losses:
+        return 1.0, "kelly_insufficient_win_loss_data"
+
+    win_rate = len(wins) / len(samples)
+    avg_win = sum(wins) / len(wins)
+    avg_loss = sum(losses) / len(losses)
+    b = avg_win / max(avg_loss, 1e-12)
+    raw_kelly = (b * win_rate - (1.0 - win_rate)) / max(b, 1e-12)
+    if raw_kelly <= 0:
+        return _clamp(
+            cfg.get("position_kelly_min_multiplier", 0.35),
+            0.0,
+            cfg.get("position_kelly_max_multiplier", 1.0),
+        ), "negative_kelly"
+
+    multiplier = raw_kelly * _finite_float(cfg.get("position_kelly_fraction"), 0.25)
+    multiplier = _clamp(
+        multiplier,
+        cfg.get("position_kelly_min_multiplier", 0.35),
+        cfg.get("position_kelly_max_multiplier", 1.0),
+    )
+    return round(multiplier, 6), "kelly_applied"
 
 
 def is_aggressive_symbol_trend_bullish(trend_health=None):
@@ -731,6 +806,12 @@ def build_position_risk_multiplier(inputs=None, cfg=None):
     atr_pct = _finite_float(data.get("atr_pct"), cfg["volatility_target_atr_pct"])
     target_atr = max(0.01, _finite_float(cfg.get("volatility_target_atr_pct"), 1.0))
     vol_multiplier = _clamp(target_atr / max(atr_pct, target_atr), cfg["volatility_target_min_multiplier"], 1.0)
+    low_atr = max(0.0, _finite_float(cfg.get("volatility_low_atr_pct"), 0.35))
+    if atr_pct < low_atr:
+        vol_multiplier = min(
+            vol_multiplier,
+            _clamp(cfg.get("volatility_low_atr_multiplier", 0.80), cfg["volatility_target_min_multiplier"], 1.0),
+        )
     if vol_multiplier < 0.999:
         reasons.append(f"volatility x{vol_multiplier:.2f}")
 
@@ -746,13 +827,49 @@ def build_position_risk_multiplier(inputs=None, cfg=None):
         blocked = True
         reasons.append("meta block")
 
+    edge_score = _optional_float(data.get("entry_edge_score", data.get("edge_score")))
+    edge_score_multiplier = 1.0
+    if edge_score is not None:
+        edge_reduce = max(1.0, _finite_float(cfg.get("edge_score_reduce_below"), 72.0))
+        edge_min = _clamp(cfg.get("edge_score_min_multiplier", 0.70), 0.0, 1.0)
+        if edge_score < edge_reduce:
+            edge_score_multiplier = max(edge_min, _clamp(edge_score / edge_reduce, 0.0, 1.0))
+            reasons.append(f"edge score x{edge_score_multiplier:.2f}")
+
+    edge_probability = _optional_float(data.get("edge_probability", data.get("entry_edge_probability")))
+    if edge_probability is None:
+        edge_probability = meta_probability
+    edge_probability_multiplier = 1.0
+    if edge_probability is not None:
+        prob_reduce = _finite_float(cfg.get("edge_probability_reduce_below"), 0.58)
+        prob_min = _clamp(cfg.get("edge_probability_min_multiplier", 0.70), 0.0, 1.0)
+        if edge_probability < prob_reduce:
+            edge_probability_multiplier = max(prob_min, _clamp(edge_probability / max(prob_reduce, 1e-9), 0.0, 1.0))
+            reasons.append(f"edge probability x{edge_probability_multiplier:.2f}")
+
     trend_multiplier = _clamp(_finite_float(data.get("trend_health_multiplier"), 1.0), 0.0, 1.0)
     quality_multiplier = _clamp(_finite_float(data.get("strategy_quality_multiplier"), 1.0), 0.0, 1.0)
     regime_multiplier = _clamp(_finite_float(data.get("regime_risk_multiplier"), 1.0), 0.0, 1.0)
     performance_multiplier = 1.0
-    if _finite_float(data.get("recent_avg_pnl_r"), 0.0) < 0:
+    recent_avg_pnl = _optional_float(data.get("recent_avg_pnl_r", data.get("expectancy_r")))
+    meta_samples = int(_finite_float(data.get("meta_sample_count", data.get("sample_count", 0)), 0) or 0)
+    meta_min_samples = max(1, int(_finite_float(cfg.get("position_meta_min_samples"), 8) or 8))
+    if recent_avg_pnl is not None and meta_samples >= meta_min_samples:
+        if recent_avg_pnl <= _finite_float(cfg.get("position_meta_block_below_expectancy_r"), -0.35):
+            performance_multiplier = 0.0
+            blocked = True
+            reasons.append(f"negative expectancy block {recent_avg_pnl:.2f}R")
+        elif recent_avg_pnl < _finite_float(cfg.get("position_meta_reduce_below_expectancy_r"), 0.0):
+            performance_multiplier = _clamp(cfg.get("position_meta_min_multiplier", 0.50), 0.0, 1.0)
+            reasons.append(f"negative expectancy x{performance_multiplier:.2f}")
+    elif _finite_float(data.get("recent_avg_pnl_r"), 0.0) < 0:
         performance_multiplier = 0.75
         reasons.append("recent performance")
+
+    r_values = _r_multiples_from_trades(data.get("recent_trades", data.get("r_multiples")))
+    kelly_multiplier, kelly_reason = _conservative_fractional_kelly_multiplier(r_values, cfg)
+    if kelly_multiplier < 0.999:
+        reasons.append(f"kelly x{kelly_multiplier:.2f}")
 
     drawdown_pct = max(0.0, _finite_float(data.get("drawdown_pct"), 0.0))
     soft_dd = max(0.0, _finite_float(cfg.get("drawdown_soft_pct"), 5.0))
@@ -768,6 +885,9 @@ def build_position_risk_multiplier(inputs=None, cfg=None):
         drawdown_multiplier = 1.0
 
     losses = int(_finite_float(data.get("consecutive_losses"), 0))
+    supplied_losses = data.get("recent_closed_pnls")
+    if supplied_losses is not None and "consecutive_losses" not in data:
+        losses = max(losses, _consecutive_losses(supplied_losses))
     soft_loss = int(cfg.get("consecutive_loss_soft", 2) or 2)
     hard_loss = int(cfg.get("consecutive_loss_hard", 5) or 5)
     if losses >= hard_loss:
@@ -781,6 +901,39 @@ def build_position_risk_multiplier(inputs=None, cfg=None):
         loss_multiplier = 1.0
 
     exposure_multiplier = _clamp(_finite_float(data.get("portfolio_exposure_multiplier"), 1.0), 0.0, 1.0)
+    total_open_risk_pct = _optional_float(data.get("total_open_risk_pct"))
+    if total_open_risk_pct is not None:
+        heat_reduce = max(0.0, _finite_float(cfg.get("portfolio_heat_reduce_above_pct"), 1.0))
+        heat_block = max(heat_reduce + 0.01, _finite_float(cfg.get("portfolio_heat_block_above_pct"), 2.0))
+        if total_open_risk_pct >= heat_block:
+            exposure_multiplier = 0.0
+            blocked = True
+            reasons.append("portfolio heat block")
+        elif total_open_risk_pct > heat_reduce:
+            heat_multiplier = _clamp(
+                1.0 - (total_open_risk_pct - heat_reduce) / max(heat_block - heat_reduce, 1e-9),
+                0.35,
+                1.0,
+            )
+            exposure_multiplier = min(exposure_multiplier, heat_multiplier)
+            reasons.append(f"portfolio heat x{heat_multiplier:.2f}")
+
+    same_direction = int(_finite_float(data.get("same_direction_positions"), 0) or 0)
+    reduce_at = int(_finite_float(cfg.get("same_direction_reduce_at"), 1) or 1)
+    block_at = int(_finite_float(cfg.get("same_direction_block_at"), 2) or 2)
+    if same_direction >= block_at:
+        exposure_multiplier = 0.0
+        blocked = True
+        reasons.append("same direction heat block")
+    elif same_direction >= reduce_at:
+        exposure_multiplier = min(exposure_multiplier, 0.70)
+        reasons.append("same direction heat x0.70")
+
+    liquidity_multiplier = 1.0
+    if data.get("liquidity_ok") is False or data.get("spread_ok") is False:
+        liquidity_multiplier = _clamp(cfg.get("liquidity_min_multiplier", 0.65), 0.0, 1.0)
+        reasons.append(f"liquidity x{liquidity_multiplier:.2f}")
+
     if bool(data.get("daily_loss_limit_hit")):
         blocked = True
         reasons.append("daily loss limit")
@@ -788,13 +941,17 @@ def build_position_risk_multiplier(inputs=None, cfg=None):
     multiplier = (
         vol_multiplier
         * meta_multiplier
+        * edge_score_multiplier
+        * edge_probability_multiplier
         * trend_multiplier
         * quality_multiplier
         * regime_multiplier
         * performance_multiplier
+        * kelly_multiplier
         * drawdown_multiplier
         * loss_multiplier
         * exposure_multiplier
+        * liquidity_multiplier
     )
     if blocked:
         multiplier = 0.0
@@ -806,14 +963,19 @@ def build_position_risk_multiplier(inputs=None, cfg=None):
         "components": {
             "volatility": round(vol_multiplier, 4),
             "meta": round(meta_multiplier, 4),
+            "edge_score": round(edge_score_multiplier, 4),
+            "edge_probability": round(edge_probability_multiplier, 4),
             "trend_health": round(trend_multiplier, 4),
             "strategy_quality": round(quality_multiplier, 4),
             "market_regime": round(regime_multiplier, 4),
             "recent_performance": round(performance_multiplier, 4),
+            "kelly": round(kelly_multiplier, 4),
             "drawdown": round(drawdown_multiplier, 4),
             "consecutive_loss": round(loss_multiplier, 4),
             "portfolio_exposure": round(exposure_multiplier, 4),
+            "liquidity": round(liquidity_multiplier, 4),
         },
+        "kelly_reason": kelly_reason,
         "reasons": reasons,
     }
 

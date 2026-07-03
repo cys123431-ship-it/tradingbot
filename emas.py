@@ -72,6 +72,7 @@ from utbreakout.risk import (
 from utbreakout.sizing import (
     build_aggressive_growth_overlay_plan,
     build_aggressive_growth_pyramid_plan,
+    build_position_risk_multiplier,
     calculate_aggressive_sleeve_notional_cap,
     choose_aggressive_exit_split,
     evaluate_derivatives_growth_score,
@@ -13497,6 +13498,14 @@ class SignalEngine(BaseEngine):
                 'runner_sample_count': status.get('runner_sample_count'),
                 'runner_avg_mfe_capture_ratio': _safe_float_or_none(status.get('runner_avg_mfe_capture_ratio')),
                 'runner_avg_pnl_r': _safe_float_or_none(status.get('runner_avg_pnl_r')),
+                'raw_final_risk_multiplier_before_position_sizing': _safe_float_or_none(
+                    status.get('raw_final_risk_multiplier_before_position_sizing')
+                ),
+                'position_sizing_risk_multiplier': _safe_float_or_none(
+                    status.get('position_sizing_risk_multiplier')
+                ),
+                'position_sizing_components': status.get('position_sizing_components'),
+                'position_sizing_reasons': status.get('position_sizing_reasons'),
                 'raw_final_risk_multiplier': _safe_float_or_none(status.get('raw_final_risk_multiplier')),
                 'final_risk_multiplier': _safe_float_or_none(status.get('final_risk_multiplier')),
                 'decision_trace': status.get('decision_trace'),
@@ -14740,6 +14749,94 @@ class SignalEngine(BaseEngine):
                     else 1.0
                 )
             )
+        raw_final_risk_multiplier_before_position_sizing = max(
+            0.0,
+            min(1.0, float(raw_final_risk_multiplier)),
+        )
+        position_sizing = {
+            'risk_multiplier': 1.0,
+            'blocked': False,
+            'components': {},
+            'reasons': [],
+            'kelly_reason': 'disabled',
+        }
+        if bool(cfg.get('position_sizing_engine_enabled', True)):
+            try:
+                position_sizing = build_position_risk_multiplier(
+                    {
+                        'atr_pct': atr_pct,
+                        'meta_probability': (
+                            entry_edge_decision.probability
+                            if entry_edge_decision is not None
+                            else (
+                                ev_decision.win_probability
+                                if ev_decision is not None
+                                else 0.65
+                            )
+                        ),
+                        'entry_edge_probability': (
+                            entry_edge_decision.probability
+                            if entry_edge_decision is not None
+                            else None
+                        ),
+                        'entry_edge_score': (
+                            entry_edge_decision.score
+                            if entry_edge_decision is not None
+                            else None
+                        ),
+                        'direction_score': (
+                            entry_edge_decision.direction_score
+                            if entry_edge_decision is not None
+                            else None
+                        ),
+                        'recent_avg_pnl_r': (
+                            profit_alpha_decision.meta_expectancy_r
+                            if profit_alpha_decision is not None
+                            else None
+                        ),
+                        'meta_sample_count': (
+                            profit_alpha_decision.meta_sample_count
+                            if profit_alpha_decision is not None
+                            else 0
+                        ),
+                        'recent_closed_pnls': recent_pnls,
+                        'daily_loss_limit_hit': False,
+                        'liquidity_ok': market_quality.get('state') is not False,
+                        'spread_ok': market_quality.get('hard_block') is not True,
+                    },
+                    cfg,
+                )
+                position_multiplier = min(
+                    1.0,
+                    max(0.0, float(position_sizing.get('risk_multiplier', 1.0) or 0.0)),
+                )
+                raw_final_risk_multiplier = min(
+                    raw_final_risk_multiplier_before_position_sizing,
+                    position_multiplier,
+                )
+            except Exception as exc:
+                logger.warning("UTBreakout position sizing engine failed for %s: %s", symbol, exc)
+                position_sizing = {
+                    'risk_multiplier': 1.0,
+                    'blocked': False,
+                    'components': {},
+                    'reasons': [f'position sizing unavailable: {exc}'],
+                    'kelly_reason': 'error',
+                }
+                raw_final_risk_multiplier = raw_final_risk_multiplier_before_position_sizing
+        status['position_sizing'] = position_sizing
+        status['position_sizing_risk_multiplier'] = position_sizing.get('risk_multiplier')
+        status['position_sizing_components'] = position_sizing.get('components')
+        status['position_sizing_reasons'] = position_sizing.get('reasons')
+        status['raw_final_risk_multiplier_before_position_sizing'] = raw_final_risk_multiplier_before_position_sizing
+        if bool(position_sizing.get('blocked')) and float(raw_final_risk_multiplier or 0.0) <= 0.0:
+            return _finish(
+                None,
+                "REJECTED_POSITION_SIZING: " + "; ".join(position_sizing.get('reasons') or ['position sizing blocked']),
+                'REJECTED_POSITION_SIZING',
+                record_failure=True,
+                side=side,
+            )
         final_risk_multiplier = _apply_utbreakout_risk_multiplier_floor(
             raw_final_risk_multiplier,
             cfg,
@@ -14789,6 +14886,11 @@ class SignalEngine(BaseEngine):
             ),
             'entry_edge_exit_policy': (
                 entry_edge_decision.exit_policy if entry_edge_decision is not None else None
+            ),
+            'position_sizing_risk_multiplier': position_sizing.get('risk_multiplier'),
+            'position_sizing_reasons': list(position_sizing.get('reasons') or []),
+            'raw_final_risk_multiplier_before_position_sizing': (
+                status.get('raw_final_risk_multiplier_before_position_sizing')
             ),
             'raw_final_risk_multiplier': status.get('raw_final_risk_multiplier'),
             'final_risk_multiplier': final_risk_multiplier,
@@ -15086,6 +15188,13 @@ class SignalEngine(BaseEngine):
             'quality_score_v2_state': quality_score_v2.get('state'),
             'quality_score_v2_summary': quality_score_v2.get('summary'),
             'quality_score_v2_risk_multiplier': quality_score_v2_multiplier,
+            'position_sizing_enabled': bool(cfg.get('position_sizing_engine_enabled', True)),
+            'position_sizing_risk_multiplier': status.get('position_sizing_risk_multiplier'),
+            'position_sizing_components': status.get('position_sizing_components'),
+            'position_sizing_reasons': status.get('position_sizing_reasons'),
+            'raw_final_risk_multiplier_before_position_sizing': status.get(
+                'raw_final_risk_multiplier_before_position_sizing'
+            ),
             'profit_alpha_enabled': profit_alpha_decision is not None,
             'profit_alpha_engine': (
                 profit_alpha_decision.engine if profit_alpha_decision is not None else None
@@ -17104,6 +17213,60 @@ class SignalEngine(BaseEngine):
                         else 1.0
                     )
                 )
+            raw_before_position_sizing_status = max(
+                0.0,
+                min(1.0, float(raw_final_risk_multiplier_status)),
+            )
+            position_sizing_status = {
+                'risk_multiplier': 1.0,
+                'blocked': False,
+                'components': {},
+                'reasons': [],
+                'kelly_reason': 'disabled',
+            }
+            if bool(cfg.get('position_sizing_engine_enabled', True)):
+                try:
+                    position_sizing_status = build_position_risk_multiplier(
+                        {
+                            'atr_pct': filter_values.get('atr_pct'),
+                            'meta_probability': (
+                                entry_edge_status_decision.probability
+                                if entry_edge_status_decision is not None
+                                else (
+                                    ev_status_decision.win_probability
+                                    if ev_status_decision is not None
+                                    else 0.65
+                                )
+                            ),
+                            'entry_edge_probability': (
+                                entry_edge_status_decision.probability
+                                if entry_edge_status_decision is not None
+                                else None
+                            ),
+                            'entry_edge_score': (
+                                entry_edge_status_decision.score
+                                if entry_edge_status_decision is not None
+                                else None
+                            ),
+                            'direction_score': (
+                                entry_edge_status_decision.direction_score
+                                if entry_edge_status_decision is not None
+                                else None
+                            ),
+                            'recent_closed_pnls': recent_pnls,
+                            'daily_loss_limit_hit': daily_ok is False,
+                            'liquidity_ok': market_quality.get('state') is not False,
+                            'spread_ok': market_quality.get('hard_block') is not True,
+                        },
+                        cfg,
+                    )
+                    raw_final_risk_multiplier_status = min(
+                        raw_before_position_sizing_status,
+                        min(1.0, max(0.0, float(position_sizing_status.get('risk_multiplier', 1.0) or 0.0))),
+                    )
+                except Exception as exc:
+                    logger.warning("UTBreakout status position sizing failed for %s: %s", symbol, exc)
+                    raw_final_risk_multiplier_status = raw_before_position_sizing_status
             final_risk_multiplier_status = _apply_utbreakout_risk_multiplier_floor(
                 raw_final_risk_multiplier_status,
                 cfg,
@@ -17135,7 +17298,8 @@ class SignalEngine(BaseEngine):
                     (
                         f"x{final_risk_multiplier_status:.3f} "
                         f"(base ${base_max_risk:.2f} -> effective ${effective_max_risk:.2f}; "
-                        f"raw x{float(raw_final_risk_multiplier_status):.3f}, "
+                        f"raw x{float(raw_before_position_sizing_status):.3f}, "
+                        f"sizing x{float(position_sizing_status.get('risk_multiplier', 1.0) or 0.0):.2f}, "
                         f"bias x{bias_multiplier_status:.2f}, market x{market_multiplier:.2f}, "
                         f"selector x{selector_multiplier:.2f}, "
                         f"strategy x{adaptation_multiplier:.2f}, qscore x{q2_multiplier:.2f}, "
@@ -18445,6 +18609,60 @@ class SignalEngine(BaseEngine):
                         else 1.0
                     )
                 )
+            raw_before_position_sizing_status = max(
+                0.0,
+                min(1.0, float(raw_final_risk_multiplier_status)),
+            )
+            position_sizing_status = {
+                'risk_multiplier': 1.0,
+                'blocked': False,
+                'components': {},
+                'reasons': [],
+                'kelly_reason': 'disabled',
+            }
+            if bool(cfg.get('position_sizing_engine_enabled', True)):
+                try:
+                    position_sizing_status = build_position_risk_multiplier(
+                        {
+                            'atr_pct': filter_values.get('atr_pct'),
+                            'meta_probability': (
+                                entry_edge_status_decision.probability
+                                if entry_edge_status_decision is not None
+                                else (
+                                    ev_status_decision.win_probability
+                                    if ev_status_decision is not None
+                                    else 0.65
+                                )
+                            ),
+                            'entry_edge_probability': (
+                                entry_edge_status_decision.probability
+                                if entry_edge_status_decision is not None
+                                else None
+                            ),
+                            'entry_edge_score': (
+                                entry_edge_status_decision.score
+                                if entry_edge_status_decision is not None
+                                else None
+                            ),
+                            'direction_score': (
+                                entry_edge_status_decision.direction_score
+                                if entry_edge_status_decision is not None
+                                else None
+                            ),
+                            'recent_closed_pnls': recent_pnls,
+                            'daily_loss_limit_hit': daily_ok is False,
+                            'liquidity_ok': market_quality.get('state') is not False,
+                            'spread_ok': market_quality.get('hard_block') is not True,
+                        },
+                        cfg,
+                    )
+                    raw_final_risk_multiplier_status = min(
+                        raw_before_position_sizing_status,
+                        min(1.0, max(0.0, float(position_sizing_status.get('risk_multiplier', 1.0) or 0.0))),
+                    )
+                except Exception as exc:
+                    logger.warning("UTBreakout status position sizing failed for %s: %s", symbol, exc)
+                    raw_final_risk_multiplier_status = raw_before_position_sizing_status
             final_risk_multiplier_status = _apply_utbreakout_risk_multiplier_floor(
                 raw_final_risk_multiplier_status,
                 cfg,
@@ -18476,7 +18694,8 @@ class SignalEngine(BaseEngine):
                     (
                         f"x{final_risk_multiplier_status:.3f} "
                         f"(base ${base_max_risk:.2f} -> effective ${effective_max_risk:.2f}; "
-                        f"raw x{float(raw_final_risk_multiplier_status):.3f}, "
+                        f"raw x{float(raw_before_position_sizing_status):.3f}, "
+                        f"sizing x{float(position_sizing_status.get('risk_multiplier', 1.0) or 0.0):.2f}, "
                         f"bias x{bias_multiplier_status:.2f}, market x{market_multiplier:.2f}, "
                         f"selector x{selector_multiplier:.2f}, "
                         f"strategy x{adaptation_multiplier:.2f}, qscore x{q2_multiplier:.2f}, "
