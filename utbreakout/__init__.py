@@ -157,6 +157,15 @@ from .adaptive import (
     summarize_runner_outcomes,
     summarize_shadow_outcomes,
 )
+from .relative_strength_pullback import (
+    ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+    ENTRY_STRATEGY_UT_BREAKOUT,
+    PullbackTrendDecision,
+    build_relative_strength_pullback_shadow_events,
+    default_relative_strength_pullback_config,
+    evaluate_relative_strength_pullback_trend,
+    resolve_entry_strategy,
+)
 
 __all__ = [
     "build_base_candidate",
@@ -306,4 +315,11 @@ __all__ = [
     "pbo_proxy",
     "group_performance",
     "walk_forward_splits",
+    "ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND",
+    "ENTRY_STRATEGY_UT_BREAKOUT",
+    "PullbackTrendDecision",
+    "build_relative_strength_pullback_shadow_events",
+    "default_relative_strength_pullback_config",
+    "evaluate_relative_strength_pullback_trend",
+    "resolve_entry_strategy",
 ]

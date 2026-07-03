@@ -1195,7 +1195,7 @@ def test_legacy_utbot_command_routes_to_integrated_menu_handler():
 def test_utbreakout_visible_callback_actions_include_watchlist_button():
     emas = _emas_module()
 
-    assert emas.UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS == {"on", "off", "condition_status", "watchlist"}
+    assert emas.UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS == {"on", "off", "condition_status", "rsp_status", "watchlist"}
     assert {"fixed", "auto_scan", "sets", "why", "entry_analyze"}.issubset(emas.UTBREAKOUT_CALLBACK_ACTIONS)
     assert {"condition_status", "conditions", "status"}.issubset(emas.UTBREAKOUT_CALLBACK_ACTIONS)
 
