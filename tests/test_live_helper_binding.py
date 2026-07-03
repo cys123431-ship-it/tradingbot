@@ -18,6 +18,7 @@ def test_main_controller_has_all_live_advanced_alpha_methods():
         "_fetch_live_derivatives_values",
         "_fetch_live_liquidity_values",
         "_validate_live_context_or_block",
+        "assert_binance_futures_one_way_mode",
         "_fetch_futures_account_equity",
         "_normalize_live_order_plan_for_exchange",
         "_get_min_notional_for_symbol",
@@ -48,6 +49,7 @@ def test_live_advanced_alpha_async_helpers_are_coroutines():
         "_calculate_live_htf_trend",
         "_fetch_live_derivatives_values",
         "_fetch_live_liquidity_values",
+        "assert_binance_futures_one_way_mode",
         "_fetch_futures_account_equity",
         "execute_live_order_plan",
         "_place_initial_sl_from_plan",
@@ -173,5 +175,63 @@ def test_entry_live_parity_path_does_not_fail_from_missing_helpers(monkeypatch):
         result = await bot.entry("BTC/USDT:USDT", "LONG", 100.0)
 
         assert result is None or isinstance(result, dict)
+
+    asyncio.run(run())
+
+
+def test_build_live_context_uses_last_closed_candle(monkeypatch):
+    async def run():
+        cls = emas.MainController
+        bot = cls.__new__(cls)
+        captured = {}
+        minute = 60_000
+
+        async def fake_fetch_rows(symbol, cfg):
+            return [
+                {"index": 0, "timestamp": 0, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+                {"index": 1, "timestamp": 15 * minute, "open": 101.0, "high": 102.0, "low": 100.0, "close": 101.0, "volume": 1000.0},
+                {"index": 2, "timestamp": 30 * minute, "open": 200.0, "high": 220.0, "low": 180.0, "close": 210.0, "volume": 9999.0},
+            ]
+
+        async def fake_build_values(symbol, side, rows, idx, cfg):
+            captured["idx"] = idx
+            captured["close"] = rows[idx]["close"]
+            return {
+                "symbol": symbol,
+                "timeframe": "15m",
+                "utbot_direction": "LONG",
+                "open": rows[idx]["open"],
+                "high": rows[idx]["high"],
+                "low": rows[idx]["low"],
+                "close": rows[idx]["close"],
+                "volume": rows[idx]["volume"],
+                "adx": 30.0,
+                "plus_di": 35.0,
+                "minus_di": 10.0,
+                "atr": 2.0,
+                "atr_percentile": 50.0,
+                "htf_trend": "UP",
+                "supertrend_direction": "UP",
+                "spread_bps": 1.0,
+            }
+
+        bot._fetch_live_ohlcv_rows_for_context = fake_fetch_rows
+        bot._build_live_indicator_values = fake_build_values
+
+        context = await bot.build_live_context_for_symbol(
+            "BTC/USDT:USDT",
+            {
+                "timeframe": "15m",
+                "live_context_min_bars": 2,
+                "live_context_now_ms": (30 * minute) + 1,
+                "require_derivatives_data_for_advanced_alpha": False,
+                "require_live_htf_for_advanced_alpha": True,
+                "require_live_dmi_for_advanced_alpha": True,
+            },
+        )
+
+        assert captured["idx"] == 1
+        assert captured["close"] == 101.0
+        assert context.close == 101.0
 
     asyncio.run(run())

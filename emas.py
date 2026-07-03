@@ -43575,6 +43575,7 @@ def enforce_activation_stage(cfg):
         cfg.setdefault("live_real_allowlist", list(LIVE_REAL_ALLOWED_SYMBOLS_DEFAULT))
         cfg.setdefault("live_real_blocklist", [])
         cfg.setdefault("min_notional_usdt", 5.0)
+        cfg.setdefault("require_derivatives_data_for_advanced_alpha", False)
     elif stage == "LIVE_REAL_FULL_LOCKED":
         raise ValueError("LIVE_REAL_FULL_LOCKED is intentionally locked; use LIVE_REAL_SMALL_CAP only")
     else:
@@ -43742,6 +43743,55 @@ def configure_binance_futures_environment(exchange, cfg):
         "adjustForTimeDifference": exchange.options.get("adjustForTimeDifference"),
         "sandbox": bool(sandbox),
     }
+
+
+def _parse_binance_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y", "on"}:
+        return True
+    if text in {"false", "0", "no", "n", "off"}:
+        return False
+    return None
+
+
+async def assert_binance_futures_one_way_mode(self, cfg):
+    cfg = cfg if isinstance(cfg, dict) else {}
+    if _normalize_live_real_stage(cfg.get("live_activation_stage")) != "LIVE_REAL_SMALL_CAP":
+        return {"status": "SKIPPED"}
+
+    exchange = getattr(self, "exchange", None)
+    if exchange is None:
+        raise TradingSafetyError("could not verify Binance Futures position mode: exchange is unavailable")
+
+    method = getattr(exchange, "fapiPrivateGetPositionSideDual", None)
+    if method is None:
+        method = getattr(exchange, "fapiPrivate_get_position_side_dual", None)
+    if method is None or not callable(method):
+        raise TradingSafetyError("could not verify Binance Futures position mode")
+
+    try:
+        response = await asyncio.to_thread(method)
+    except Exception as exc:
+        raise TradingSafetyError(f"could not verify Binance Futures position mode: {exc}") from exc
+
+    raw = None
+    if isinstance(response, dict):
+        raw = response.get("dualSidePosition")
+        if raw is None and isinstance(response.get("info"), dict):
+            raw = response["info"].get("dualSidePosition")
+    hedged = _parse_binance_bool(raw)
+    if hedged is None:
+        raise TradingSafetyError(f"could not verify Binance Futures position mode: {response}")
+    if hedged:
+        raise TradingSafetyError(
+            "LIVE trading blocked: Binance Futures account is in hedge mode. "
+            "Switch to one-way mode or enable hedge-mode support."
+        )
+    return {"status": "OK", "hedge_mode": False}
 
 
 def assert_symbol_allowed_for_live_real(symbol, cfg):
@@ -44061,6 +44111,64 @@ def validate_live_order_plan(plan, cfg):
 # Hardening Support & Calculation Helpers
 # ==============================================================================
 
+def _live_timeframe_to_ms(tf):
+    multipliers = {
+        "m": 60 * 1000,
+        "h": 60 * 60 * 1000,
+        "d": 24 * 60 * 60 * 1000,
+        "w": 7 * 24 * 60 * 60 * 1000,
+    }
+    try:
+        text = str(tf or "").strip().lower()
+        if not text:
+            return 0
+        if text.isdigit():
+            return int(text) * multipliers["m"]
+        return int(text[:-1]) * multipliers.get(text[-1], 0)
+    except Exception:
+        return 0
+
+
+def _live_timestamp_to_ms(value):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if parsed <= 0:
+        return 0.0
+    return parsed * 1000.0 if parsed < 10_000_000_000 else parsed
+
+
+def _live_context_now_ms(cfg):
+    cfg = cfg if isinstance(cfg, dict) else {}
+    override = cfg.get("live_context_now_ms")
+    if override is not None:
+        parsed = _live_timestamp_to_ms(override)
+        if parsed > 0:
+            return parsed
+    return time.time() * 1000.0
+
+
+def _closed_live_ohlcv_rows(rows, cfg):
+    cfg = cfg if isinstance(cfg, dict) else {}
+    cleaned = [dict(row) for row in (rows or []) if isinstance(row, dict)]
+    if not cleaned or not bool(cfg.get("exclude_incomplete_live_candle", True)):
+        return cleaned
+
+    tf = cfg.get("timeframe") or cfg.get("entry_timeframe") or "15m"
+    tf_ms = _live_timeframe_to_ms(tf)
+    if tf_ms <= 0:
+        return cleaned
+
+    last_ts = _live_timestamp_to_ms(cleaned[-1].get("timestamp"))
+    if last_ts <= 0:
+        return cleaned
+
+    if last_ts + tf_ms > _live_context_now_ms(cfg):
+        return cleaned[:-1]
+    return cleaned
+
+
 async def _fetch_live_ohlcv_rows_for_context(self, symbol, cfg):
     tf = cfg.get("timeframe", "15m")
     limit = max(120, int(cfg.get("live_context_ohlcv_limit", 200) or 200))
@@ -44197,7 +44305,19 @@ async def _calculate_live_htf_trend(self, symbol, cfg):
     htf = cfg.get("htf_timeframe", cfg.get("higher_timeframe", "1h"))
     limit = max(220, int(cfg.get("htf_ohlcv_limit", 250) or 250))
     raw = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, htf, limit=limit)
-    closes = [float(x[4]) for x in raw or [] if len(x) >= 5]
+    rows = []
+    for item in raw or []:
+        if len(item) < 6:
+            continue
+        rows.append({
+            "timestamp": item[0],
+            "open": float(item[1]),
+            "high": float(item[2]),
+            "low": float(item[3]),
+            "close": float(item[4]),
+            "volume": float(item[5]),
+        })
+    closes = [float(item["close"]) for item in _closed_live_ohlcv_rows(rows, {**cfg, "timeframe": htf})]
     if len(closes) < 200:
         return {
             "htf_trend": "FLAT",
@@ -44261,10 +44381,15 @@ async def _fetch_live_liquidity_values(self, symbol, cfg):
     return {"spread_bps": None}
 
 def _validate_live_context_or_block(self, symbol, context, cfg):
+    cfg = cfg if isinstance(cfg, dict) else {}
     reasons = []
     quality = getattr(context, "quality", None)
+    require_derivatives = bool(cfg.get("require_derivatives_data_for_advanced_alpha", False))
     if quality is not None:
-        reasons.extend(list(getattr(quality, "reasons", ()) or ()))
+        for item in list(getattr(quality, "reasons", ()) or ()):
+            if item == "MISSING_DERIVATIVES_DATA" and not require_derivatives:
+                continue
+            reasons.append(item)
 
     if bool(cfg.get("require_live_dmi_for_advanced_alpha", True)):
         if float(getattr(context, "plus_di", 0.0) or 0.0) <= 0 and float(getattr(context, "minus_di", 0.0) or 0.0) <= 0:
@@ -44274,9 +44399,19 @@ def _validate_live_context_or_block(self, symbol, context, cfg):
         if str(getattr(context, "htf_trend", "FLAT")).upper() == "FLAT":
             reasons.append("MISSING_HTF_TREND")
 
-    if bool(cfg.get("require_derivatives_data_for_advanced_alpha", True)):
-        if getattr(context, "funding_rate", None) is None or getattr(context, "oi_change_pct", None) is None or getattr(context, "long_short_ratio", None) is None:
+    derivatives_missing = (
+        getattr(context, "funding_rate", None) is None
+        or getattr(context, "oi_change_pct", None) is None
+        or getattr(context, "long_short_ratio", None) is None
+    )
+    if require_derivatives:
+        if derivatives_missing:
             reasons.append("MISSING_DERIVATIVES_DATA")
+    elif derivatives_missing:
+        logger.info(
+            "[Live Parity] derivatives data incomplete for %s; keeping signal eligible with reduced confidence/size overlays",
+            symbol,
+        )
 
     if getattr(context, "spread_bps", None) is None:
         reasons.append("MISSING_SPREAD")
@@ -44306,7 +44441,8 @@ def _infer_live_utbot_direction_from_rows(rows, cfg):
     if not rows or len(rows) < max(atr_period + 3, 20):
         return ""
     try:
-        closed = pd.DataFrame(rows).iloc[:-1].copy().reset_index(drop=True)
+        closed_rows = _closed_live_ohlcv_rows(rows, cfg)
+        closed = pd.DataFrame(closed_rows).copy().reset_index(drop=True)
         if len(closed) < max(atr_period + 3, 20):
             closed = pd.DataFrame(rows).copy().reset_index(drop=True)
         prev_close = closed["close"].shift(1)
@@ -44357,7 +44493,8 @@ def _infer_live_utbot_direction_from_rows(rows, cfg):
 
 async def build_live_context_for_symbol(self, symbol, cfg):
     cfg = cfg if isinstance(cfg, dict) else {}
-    rows = await self._fetch_live_ohlcv_rows_for_context(symbol, cfg)
+    raw_rows = await self._fetch_live_ohlcv_rows_for_context(symbol, cfg)
+    rows = _closed_live_ohlcv_rows(raw_rows, cfg)
     if not rows or len(rows) < int(cfg.get("live_context_min_bars", 80) or 80):
         raise TradingSafetyError(f"insufficient live OHLCV context for {symbol}")
 
@@ -44438,6 +44575,7 @@ async def preflight_live_real_check(self, symbol, cfg):
     configure_binance_futures_environment(self.exchange, cfg)
     if hasattr(self.exchange, "load_markets"):
         await asyncio.to_thread(self.exchange.load_markets)
+    await self.assert_binance_futures_one_way_mode(cfg)
 
     active_positions = []
     if hasattr(self.exchange, "fetch_positions"):
@@ -45748,6 +45886,7 @@ def _bind_live_advanced_alpha_helpers_to_main_controller():
         "_fetch_live_derivatives_values",
         "_fetch_live_liquidity_values",
         "_validate_live_context_or_block",
+        "assert_binance_futures_one_way_mode",
         "_fetch_futures_account_equity",
         "preflight_live_real_check",
         "_normalize_live_order_plan_for_exchange",

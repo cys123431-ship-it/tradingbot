@@ -28,6 +28,7 @@ class FakeExchange:
         self.sandbox_calls = []
         self.positions = []
         self.open_orders = []
+        self.dual_side_position = False
         self.balance = {"USDT": {"total": 62.0, "free": 62.0}, "info": {"totalWalletBalance": "62"}}
         self.markets = {
             "BTC/USDT:USDT": {
@@ -54,6 +55,9 @@ class FakeExchange:
 
     def fetch_balance(self):
         return self.balance
+
+    def fapiPrivateGetPositionSideDual(self):
+        return {"dualSidePosition": self.dual_side_position}
 
     def amount_to_precision(self, symbol, amount):
         return f"{float(amount):.6f}"
@@ -206,6 +210,18 @@ def test_preflight_blocks_pause_positions_orders_and_passes_clean(monkeypatch):
     ordered.exchange.open_orders = [{"id": "open"}]
     with pytest.raises(emas.TradingSafetyError):
         asyncio.run(ordered.preflight_live_real_check("BTC/USDT:USDT", live_cfg()))
+
+
+def test_preflight_blocks_binance_hedge_mode(monkeypatch):
+    monkeypatch.setattr(emas, "load_critical_pause_state", lambda: None)
+    monkeypatch.setattr(emas, "load_live_real_risk_state", lambda: {"daily_realized_pnl_usdt": 0, "weekly_realized_pnl_usdt": 0})
+
+    exchange = FakeExchange()
+    exchange.dual_side_position = True
+    bot = make_fake_bot(exchange)
+
+    with pytest.raises(emas.TradingSafetyError, match="hedge mode"):
+        asyncio.run(bot.preflight_live_real_check("BTC/USDT:USDT", live_cfg()))
 
 
 def test_live_real_order_caps_scale_qty_and_tp_quantities():

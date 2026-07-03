@@ -649,7 +649,11 @@ def simulate_utbot_rr(
             continue
         if effective_risk_pct < risk_per_trade_percent:
             counts["size_reduction_count"] += 1
-        entry = _apply_slippage(row["close"], side, slippage_bps, is_entry=True)
+        entry_idx = idx + 1
+        if entry_idx >= len(rows):
+            continue
+        entry_row = rows[entry_idx]
+        entry = _apply_slippage(entry_row["open"], side, slippage_bps, is_entry=True)
         try:
             plan = calculate_risk_plan(
                 side=side,
@@ -690,9 +694,14 @@ def simulate_utbot_rr(
         tp1_r = ladder_targets[0]["r"] if ladder_targets else policy.tp1_r
         final_tp_r = ladder_targets[-1]["r"] if ladder_targets else policy.tp2_r
         position = {
-            "entry_idx": idx,
+            "entry_idx": entry_idx,
+            "signal_idx": idx,
             "side": side,
             "entry_price": entry,
+            "signal_price": row["close"],
+            "entry_fill_price_source": "NEXT_OPEN",
+            "entry_signal_timestamp": row.get("timestamp"),
+            "entry_fill_timestamp": entry_row.get("timestamp"),
             "qty": plan["qty"],
             "initial_qty": plan["qty"],
             "stop_loss": plan["stop_loss"],
@@ -714,7 +723,7 @@ def simulate_utbot_rr(
             "move_sl_to_tp1_after_tp2": bool(getattr(ladder, "move_sl_to_tp1_after_tp2", False)),
             "partial_filled": False,
             "tp1_filled": False,
-            "entry_bar_index": idx,
+            "entry_bar_index": entry_idx,
             "timeframe": timeframe,
             "exit_policy_name": policy.name,
             "time_stop_enabled": bool(policy.time_stop_enabled and time_stop_enabled),

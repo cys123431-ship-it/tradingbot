@@ -51,6 +51,68 @@ def test_backtest_closes_open_position_at_end_of_data(monkeypatch):
     assert trade["fee_paid"] > 0
 
 
+def test_backtest_fills_entry_on_next_candle_open(monkeypatch):
+    rows = [_row(idx, 100.0) for idx in range(5)]
+    rows[1]["close"] = 100.0
+    rows[2]["open"] = 110.0
+    rows[2]["high"] = 111.0
+    rows[2]["low"] = 109.0
+    rows[2]["close"] = 110.0
+
+    def forced_utbot_rows(rows, *, key_value, atr_period):
+        atr = [10.0 for _ in rows]
+        trail = [50.0 for _ in rows]
+        signal = [None for _ in rows]
+        bias = ["long" for _ in rows]
+        signal[1] = "long"
+        return atr, trail, signal, bias
+
+    monkeypatch.setattr(bt, "utbot_rows", forced_utbot_rows)
+
+    result = bt.simulate_utbot_rr(
+        rows,
+        key_value=2.0,
+        atr_period=10,
+        stop_atr_multiplier=10.0,
+        rr_multiple=2.0,
+        partial_take_profit_r_multiple=0.0,
+        partial_take_profit_ratio=0.0,
+        fee_bps=0.0,
+        slippage_bps=10.0,
+    )
+
+    trade = result["trades_detail"][0]
+    assert trade["signal_idx"] == 1
+    assert trade["entry_idx"] == 2
+    assert trade["entry_bar_index"] == 2
+    assert trade["entry_fill_price_source"] == "NEXT_OPEN"
+    assert trade["entry_price"] == 110.0 * (1.0 + 10.0 / 10000.0)
+
+
+def test_backtest_skips_signal_without_next_candle(monkeypatch):
+    rows = [_row(idx, 100.0 + idx) for idx in range(2)]
+
+    def forced_utbot_rows(rows, *, key_value, atr_period):
+        atr = [10.0 for _ in rows]
+        trail = [50.0 for _ in rows]
+        signal = [None for _ in rows]
+        bias = ["long" for _ in rows]
+        signal[-1] = "long"
+        return atr, trail, signal, bias
+
+    monkeypatch.setattr(bt, "utbot_rows", forced_utbot_rows)
+
+    result = bt.simulate_utbot_rr(
+        rows,
+        key_value=2.0,
+        atr_period=10,
+        fee_bps=0.0,
+        slippage_bps=0.0,
+    )
+
+    assert result["trades"] == 0
+
+
 def test_backtest_applies_time_stop_before_tp1(monkeypatch):
     rows = [_row(idx, 100.0) for idx in range(20)]
 
