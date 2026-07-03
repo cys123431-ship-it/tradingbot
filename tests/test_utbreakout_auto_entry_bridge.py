@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import emas
 
@@ -31,6 +32,41 @@ def test_auto_entry_bridge_state_helpers_exist():
 
     assert engine.utbreakout_auto_entry_bridge_last_attempt_ts == {}
     assert engine.utbreakout_auto_entry_bridge_enabled is True
+
+
+def test_live_ready_synthesis_rejects_stale_diagnostic():
+    engine = _build_engine()
+    symbol = "SOL/USDT:USDT"
+    stale_decision_ts = int((time.time() - 60 * 60) * 1000)
+    engine.last_utbot_filtered_breakout_status[symbol] = {
+        "accepted_side": "long",
+        "decision_candle_ts": stale_decision_ts,
+        "entry_timeframe": "15m",
+    }
+    engine._set_utbot_filtered_breakout_entry_plan(
+        symbol,
+        {
+            "side": "long",
+            "entry_price": 101.25,
+            "qty": 0.5,
+            "risk_usdt": 1.0,
+        },
+    )
+
+    result = engine._record_utbreakout_live_ready_from_diag(
+        symbol,
+        source="scanner_seen",
+        scan_tf="15m",
+    )
+
+    events = engine._utbreakout_recent_trace_events(symbol)
+    assert result is None
+    assert not any(event["stage"] == "STATUS_READY" for event in events)
+    assert any(
+        event["stage"] == "STATUS_NOT_READY"
+        and event["status"] == "STALE_DIAGNOSTIC"
+        for event in events
+    )
 
 
 def test_auto_entry_bridge_calls_entry_for_recent_ready_plan():
@@ -561,7 +597,7 @@ def test_live_scanner_records_status_ready_from_accepted_diag_and_plan():
         symbol: {
             "accepted_side": "short",
             "candidate_type": "fresh_signal",
-            "decision_candle_ts": 1234567890,
+            "decision_candle_ts": int((time.time() - 60) * 1000),
             "entry_timeframe": "15m",
             "effective_profile_version": "ev_adaptive_v3_profit_engine",
             "auto_selected_set_id": 64,
@@ -607,7 +643,7 @@ def test_auto_entry_bridge_does_not_require_manual_status_when_diag_plan_ready()
         symbol: {
             "accepted_side": "short",
             "candidate_type": "fresh_signal",
-            "decision_candle_ts": 1234567890,
+            "decision_candle_ts": int((time.time() - 60) * 1000),
         }
     }
     engine._set_utbot_filtered_breakout_entry_plan(

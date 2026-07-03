@@ -10929,6 +10929,46 @@ class SignalEngine(BaseEngine):
                 )
                 return None
 
+            try:
+                strategy_params = self.get_runtime_strategy_params()
+                cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+                entry_tf = str(
+                    diag.get('entry_timeframe')
+                    or scan_tf
+                    or cfg.get('entry_timeframe', '15m')
+                    or '15m'
+                ).lower()
+                decision_ts = _safe_float_or_none(diag.get('decision_candle_ts'))
+                if decision_ts is not None and decision_ts > 0:
+                    decision_ms = decision_ts * 1000.0 if decision_ts < 10_000_000_000 else decision_ts
+                    tf_ms = self._timeframe_to_ms(entry_tf) or (15 * 60 * 1000)
+                    max_age_bars = float(
+                        cfg.get('utbreakout_status_ready_max_decision_age_bars', 2.0)
+                        or 2.0
+                    )
+                    max_age_ms = max(tf_ms, tf_ms * max_age_bars) + 60_000
+                    decision_age_ms = (time.time() * 1000.0) - decision_ms
+                    if decision_age_ms > max_age_ms:
+                        self._utbreakout_trace_event(
+                            symbol,
+                            'STATUS_NOT_READY',
+                            'STALE_DIAGNOSTIC',
+                            source=source,
+                            side=side,
+                            decision_candle_ts=diag.get('decision_candle_ts'),
+                            entry_tf=entry_tf,
+                            decision_age_sec=round(decision_age_ms / 1000.0, 1),
+                            max_age_sec=round(max_age_ms / 1000.0, 1),
+                            reason='accepted diagnostic is too old to synthesize STATUS_READY',
+                        )
+                        return None
+            except Exception as stale_check_exc:
+                logger.debug(
+                    "UTBreakout live ready stale check skipped for %s: %s",
+                    symbol,
+                    stale_check_exc,
+                )
+
             self._utbreakout_trace_event(
                 symbol,
                 'STATUS_READY',
@@ -11462,6 +11502,41 @@ class SignalEngine(BaseEngine):
             'symbol_notional': float(symbol_total),
             'open_positions': len(active),
             'positions': active,
+        }
+
+    def _build_utbreakout_position_sizing_portfolio_context(
+        self,
+        symbol=None,
+        side=None,
+        cfg=None,
+        positions=None,
+    ):
+        cfg = dict(cfg or {})
+        side = str(side or '').lower()
+        risk_pct = (
+            _safe_float_or_none(cfg.get('risk_per_trade_percent'))
+            or _safe_float_or_none(cfg.get('risk_per_trade_pct'))
+            or 1.0
+        )
+        open_positions = 0
+        same_direction_positions = 0
+        target_key = self._futures_symbol_key(symbol) if symbol else ''
+        for pos in positions or []:
+            if not isinstance(pos, dict):
+                continue
+            normalized = self._normalize_server_position(pos)
+            if not normalized:
+                continue
+            open_positions += 1
+            pos_side = str(normalized.get('side') or '').lower()
+            if side and pos_side == side:
+                same_direction_positions += 1
+        return {
+            'open_positions': int(open_positions),
+            'same_direction_positions': int(same_direction_positions),
+            # Conservative estimate: each active position consumes one configured trade risk budget.
+            'total_open_risk_pct': float(open_positions) * float(risk_pct),
+            'target_symbol_key': target_key,
         }
 
     def _finalize_utbreakout_runner_state(self, symbol, *, reason='position closed', exit_price=None):
@@ -14762,6 +14837,28 @@ class SignalEngine(BaseEngine):
         }
         if bool(cfg.get('position_sizing_engine_enabled', True)):
             try:
+                portfolio_sizing_context = {
+                    'open_positions': 0,
+                    'same_direction_positions': 0,
+                    'total_open_risk_pct': 0.0,
+                }
+                try:
+                    if hasattr(getattr(self, 'exchange', None), 'fetch_positions'):
+                        sizing_positions = await asyncio.to_thread(self.exchange.fetch_positions)
+                        portfolio_sizing_context = (
+                            self._build_utbreakout_position_sizing_portfolio_context(
+                                symbol=symbol,
+                                side=side,
+                                cfg=cfg,
+                                positions=sizing_positions,
+                            )
+                        )
+                except Exception as portfolio_exc:
+                    logger.debug(
+                        "UTBreakout position sizing portfolio context unavailable for %s: %s",
+                        symbol,
+                        portfolio_exc,
+                    )
                 position_sizing = build_position_risk_multiplier(
                     {
                         'atr_pct': atr_pct,
@@ -14801,11 +14898,14 @@ class SignalEngine(BaseEngine):
                         ),
                         'recent_closed_pnls': recent_pnls,
                         'daily_loss_limit_hit': False,
+                        'total_open_risk_pct': portfolio_sizing_context.get('total_open_risk_pct'),
+                        'same_direction_positions': portfolio_sizing_context.get('same_direction_positions'),
                         'liquidity_ok': market_quality.get('state') is not False,
                         'spread_ok': market_quality.get('hard_block') is not True,
                     },
                     cfg,
                 )
+                status['position_sizing_portfolio_context'] = portfolio_sizing_context
                 position_multiplier = min(
                     1.0,
                     max(0.0, float(position_sizing.get('risk_multiplier', 1.0) or 0.0)),
@@ -28255,6 +28355,29 @@ class SignalEngine(BaseEngine):
                     if float(p.get('contracts', 0)) > 0:
                         active_sym = p.get('symbol', '').replace(':USDT', '').replace('/', '')
                         target_sym = symbol.replace(':USDT', '').replace('/', '')
+
+                        if active_sym == target_sym:
+                            if trace_utbreakout:
+                                self._utbreakout_trace_event(
+                                    symbol,
+                                    'ENTRY_BLOCKED',
+                                    'SAME_SYMBOL_POSITION_EXISTS',
+                                    side=side,
+                                    reason=f"already holding {p.get('symbol')}",
+                                )
+                            logger.warning(
+                                "[Single Limit] Entry blocked: already holding same symbol %s",
+                                p.get('symbol'),
+                            )
+                            self.last_entry_reason[symbol] = (
+                                f"SAME_SYMBOL_POSITION_EXISTS: already holding {p.get('symbol')}"
+                            )
+                            entry_label = "UTBreakout" if trace_utbreakout else "Entry"
+                            await self.ctrl.notify(
+                                f"{entry_label} blocked: same-symbol position already exists "
+                                f"({p.get('symbol')})"
+                            )
+                            return
 
                         if active_sym != target_sym:
                             if trace_utbreakout:

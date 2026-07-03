@@ -1,5 +1,6 @@
 import pytest
 
+import emas
 from utbreakout.sizing import (
     apply_aggressive_volatility_targeting,
     build_aggressive_growth_overlay_plan,
@@ -119,6 +120,25 @@ def test_position_sizing_reduces_or_blocks_portfolio_heat():
     assert 0 < reduced["risk_multiplier"] < 1.0
     assert blocked["blocked"] is True
     assert blocked["risk_multiplier"] == 0.0
+
+
+def test_utbreakout_position_sizing_portfolio_context_counts_positions():
+    engine = object.__new__(emas.SignalEngine)
+
+    context = engine._build_utbreakout_position_sizing_portfolio_context(
+        symbol="SOL/USDT:USDT",
+        side="long",
+        cfg={"risk_per_trade_percent": 0.4},
+        positions=[
+            {"symbol": "SOL/USDT:USDT", "side": "long", "contracts": 1.0},
+            {"symbol": "ETH/USDT:USDT", "side": "short", "contracts": 2.0},
+            {"symbol": "XRP/USDT:USDT", "side": "long", "contracts": 0.0},
+        ],
+    )
+
+    assert context["open_positions"] == 2
+    assert context["same_direction_positions"] == 1
+    assert context["total_open_risk_pct"] == pytest.approx(0.8)
 
 
 def test_adaptive_risk_reduces_and_caps_multiplier_stack():

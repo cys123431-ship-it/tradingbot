@@ -341,3 +341,53 @@ def test_utbreakout_entry_reaches_market_order_and_reports_exchange_failure(
     assert engine.last_entry_reason[raw_symbol] == engine.last_entry_reason[order_symbol]
     assert diagnostics[-1][1] == "entry_blocked"
     assert diagnostics[-1][2]["code"] == "ENTRY_ORDER_FAILED"
+
+
+def test_utbreakout_entry_blocks_same_symbol_existing_position(monkeypatch):
+    raw_symbol = "SOL/USDT:USDT"
+    preflight_symbol = "SOL/USDT"
+    order_symbol = "SOL/USDT:USDT"
+    notifications = []
+    order_calls = []
+
+    class Controller:
+        async def _assert_symbol_tradeable_in_current_exchange_mode(self, symbol):
+            assert symbol == raw_symbol
+            return preflight_symbol
+
+        async def notify(self, text):
+            notifications.append(text)
+
+    class Exchange:
+        id = "test"
+
+        def fetch_positions(self):
+            return [{"symbol": order_symbol, "side": "long", "contracts": 0.5}]
+
+        def create_order(self, *args, **kwargs):
+            order_calls.append((args, kwargs))
+            raise AssertionError("create_order should not be called")
+
+    engine = object.__new__(emas.SignalEngine)
+    engine.ctrl = Controller()
+    engine.exchange = Exchange()
+    engine.last_entry_reason = {}
+    engine.utbot_filtered_breakout_entry_plans = {}
+    engine.utbreakout_daily_sl_symbol_lockouts = {}
+    engine.get_runtime_common_settings = lambda: {
+        "leverage": 5,
+        "risk_per_trade_pct": 1.0,
+        "live_activation_stage": "DISABLED",
+    }
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": emas.UTBOT_FILTERED_BREAKOUT_STRATEGY,
+    }
+    engine.is_trade_direction_allowed = lambda side: True
+    engine.is_upbit_mode = lambda: False
+    monkeypatch.setattr(emas, "assert_trading_allowed", lambda symbol, cfg=None: True)
+
+    asyncio.run(engine.entry(raw_symbol, "long", 71.74))
+
+    assert order_calls == []
+    assert engine.last_entry_reason[order_symbol].startswith("SAME_SYMBOL_POSITION_EXISTS:")
+    assert any("same-symbol position already exists" in text for text in notifications)
