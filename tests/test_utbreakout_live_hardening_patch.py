@@ -30,8 +30,15 @@ def test_profit_patch_matches_opportunity_profile_values():
     assert cfg["entry_edge_min_score"] == 68.0
     assert cfg["entry_quality_gate_min_entry_edge_score"] == 68.0
     assert cfg["direction_engine_min_score"] == 62.0
-    assert cfg["structure_stop_buffer_atr"] == 0.20
+    assert cfg["structure_stop_buffer_atr"] == 0.28
+    assert cfg["take_profit_front_run_pct"] == 0.055
+    assert cfg["soft_stop_confirm_bars"] == 2
     assert cfg["near_miss_tp_enabled"] is True
+    assert cfg["market_regime_engine_enabled"] is True
+    assert cfg["data_quality_engine_enabled"] is True
+    assert cfg["execution_quality_engine_enabled"] is True
+    assert cfg["protection_health_execution_gate_enabled"] is True
+    assert cfg["overfit_governance_enabled"] is True
 
 
 def test_mark_core_filter_failure_as_hard_block_compatible():

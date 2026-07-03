@@ -122,6 +122,7 @@ from utbreakout.alpha_engine import (
     evaluate_alpha_follow_through_exit,
     evaluate_profit_alpha,
 )
+from utbreakout.intelligence import evaluate_protection_health_engine
 from utbreakout.macro_guard import is_macro_risk_window
 from prediction import (
     PREDICTION_STRATEGY_CATALOG,
@@ -1034,14 +1035,40 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "exit_meta_expectancy_block_below": -0.16,
         "exit_meta_expectancy_reduce_below": 0.0,
         "structure_stop_lookback_bars": 5,
-        "structure_stop_buffer_atr": 0.20,
-        "take_profit_front_run_atr": 0.10,
-        "take_profit_front_run_pct": 0.035,
+        "structure_stop_buffer_atr": 0.28,
+        "take_profit_front_run_atr": 0.14,
+        "take_profit_front_run_pct": 0.055,
         "soft_stop_enabled": True,
-        "soft_stop_confirm_bars": 1,
+        "soft_stop_confirm_bars": 2,
         "near_miss_tp_enabled": True,
-        "near_miss_tp_arm_ratio": 0.90,
-        "near_miss_tp_lock_r": 0.18,
+        "near_miss_tp_arm_ratio": 0.86,
+        "near_miss_tp_lock_r": 0.28,
+        "market_regime_engine_enabled": True,
+        "market_regime_opposite_risk_multiplier": 0.62,
+        "market_regime_chop_risk_multiplier": 0.72,
+        "market_regime_high_vol_risk_multiplier": 0.58,
+        "market_regime_block_extreme_chaos": True,
+        "data_quality_engine_enabled": True,
+        "data_quality_min_derivative_sources": 2,
+        "data_quality_block_on_stale_feed": True,
+        "data_quality_max_feed_age_sec": 240.0,
+        "execution_quality_engine_enabled": True,
+        "execution_quality_max_spread_pct": 0.12,
+        "execution_quality_soft_spread_pct": 0.07,
+        "execution_quality_min_depth_usdt": 25000.0,
+        "protection_health_engine_enabled": True,
+        "protection_health_require_plan_fields": False,
+        "protection_health_execution_gate_enabled": True,
+        "signal_attribution_engine_enabled": True,
+        "strategy_replay_engine_enabled": True,
+        "overfit_governance_enabled": True,
+        "overfit_min_samples": 12,
+        "overfit_warmup_risk_multiplier": 0.92,
+        "overfit_expectancy_block_below": -0.12,
+        "overfit_oos_expectancy_block_below": -0.05,
+        "overfit_min_profit_factor": 0.92,
+        "overfit_max_pbo": 0.65,
+        "overfit_multiple_testing_trials": 24,
         "profit_alpha_follow_through_enabled": True,
         "profit_alpha_default_follow_through_bars": 3,
         "profit_alpha_default_follow_through_min_mfe_r": 0.35,
@@ -1542,14 +1569,40 @@ def apply_stable_utbreak_final_overrides(cfg):
         "exit_meta_expectancy_block_below": -0.16,
         "exit_meta_expectancy_reduce_below": 0.0,
         "structure_stop_lookback_bars": 5,
-        "structure_stop_buffer_atr": 0.20,
-        "take_profit_front_run_atr": 0.10,
-        "take_profit_front_run_pct": 0.035,
+        "structure_stop_buffer_atr": 0.28,
+        "take_profit_front_run_atr": 0.14,
+        "take_profit_front_run_pct": 0.055,
         "soft_stop_enabled": True,
-        "soft_stop_confirm_bars": 1,
+        "soft_stop_confirm_bars": 2,
         "near_miss_tp_enabled": True,
-        "near_miss_tp_arm_ratio": 0.90,
-        "near_miss_tp_lock_r": 0.18,
+        "near_miss_tp_arm_ratio": 0.86,
+        "near_miss_tp_lock_r": 0.28,
+        "market_regime_engine_enabled": True,
+        "market_regime_opposite_risk_multiplier": 0.62,
+        "market_regime_chop_risk_multiplier": 0.72,
+        "market_regime_high_vol_risk_multiplier": 0.58,
+        "market_regime_block_extreme_chaos": True,
+        "data_quality_engine_enabled": True,
+        "data_quality_min_derivative_sources": 2,
+        "data_quality_block_on_stale_feed": True,
+        "data_quality_max_feed_age_sec": 240.0,
+        "execution_quality_engine_enabled": True,
+        "execution_quality_max_spread_pct": 0.12,
+        "execution_quality_soft_spread_pct": 0.07,
+        "execution_quality_min_depth_usdt": 25000.0,
+        "protection_health_engine_enabled": True,
+        "protection_health_require_plan_fields": False,
+        "protection_health_execution_gate_enabled": True,
+        "signal_attribution_engine_enabled": True,
+        "strategy_replay_engine_enabled": True,
+        "overfit_governance_enabled": True,
+        "overfit_min_samples": 12,
+        "overfit_warmup_risk_multiplier": 0.92,
+        "overfit_expectancy_block_below": -0.12,
+        "overfit_oos_expectancy_block_below": -0.05,
+        "overfit_min_profit_factor": 0.92,
+        "overfit_max_pbo": 0.65,
+        "overfit_multiple_testing_trials": 24,
         "profit_alpha_follow_through_enabled": True,
         "profit_alpha_default_follow_through_bars": 3,
         "profit_alpha_default_follow_through_min_mfe_r": 0.35,
@@ -2012,6 +2065,16 @@ def build_utbreakout_effective_config_diff_text(raw_cfg, effective_cfg):
         'near_miss_tp_enabled',
         'near_miss_tp_arm_ratio',
         'near_miss_tp_lock_r',
+        'market_regime_engine_enabled',
+        'data_quality_engine_enabled',
+        'execution_quality_engine_enabled',
+        'protection_health_engine_enabled',
+        'protection_health_execution_gate_enabled',
+        'signal_attribution_engine_enabled',
+        'strategy_replay_engine_enabled',
+        'overfit_governance_enabled',
+        'overfit_min_samples',
+        'overfit_max_pbo',
         'atr_trailing_activation_r',
         'atr_trailing_multiplier',
     ]
@@ -10777,6 +10840,29 @@ class SignalEngine(BaseEngine):
             blockers.append("daily risk limit reached")
         if not plan_lookup_ready:
             blockers.append("ready entry plan missing")
+        elif bool(cfg.get('protection_health_execution_gate_enabled', False)):
+            try:
+                plan = self._get_utbot_filtered_breakout_entry_plan(symbol, side)
+                protection_cfg = dict(cfg)
+                protection_cfg['protection_health_require_plan_fields'] = True
+                protection_decision = evaluate_protection_health_engine(
+                    values=plan if isinstance(plan, dict) else {},
+                    config=protection_cfg,
+                )
+                if not protection_decision.allowed:
+                    blockers.append(
+                        "protection health blocked: "
+                        + "; ".join(protection_decision.blockers[:3])
+                    )
+                elif protection_decision.risk_multiplier < 1.0:
+                    warnings.append(protection_decision.summary)
+            except Exception as exc:
+                logger.warning(
+                    "UTBreakout protection health gate failed for %s %s: %s",
+                    symbol,
+                    side,
+                    exc,
+                )
         allow_continuation = bool(cfg.get('utbreakout_allow_continuation_auto_entry', True))
         if candidate_type == 'bias_state' and not allow_continuation:
             blockers.append("continuation entry disabled")
@@ -11668,11 +11754,11 @@ class SignalEngine(BaseEngine):
             'structure_stop': _safe_float_or_none(plan.get('structure_stop')),
             'structure_stop_with_buffer': _safe_float_or_none(plan.get('structure_stop_with_buffer')),
             'soft_stop_enabled': bool(plan.get('soft_stop_enabled', cfg.get('soft_stop_enabled', True))),
-            'soft_stop_confirm_bars': int(plan.get('soft_stop_confirm_bars', cfg.get('soft_stop_confirm_bars', 1)) or 1),
+            'soft_stop_confirm_bars': int(plan.get('soft_stop_confirm_bars', cfg.get('soft_stop_confirm_bars', 2)) or 2),
             'soft_stop_breach_count': 0,
             'near_miss_tp_enabled': bool(plan.get('near_miss_tp_enabled', cfg.get('near_miss_tp_enabled', True))),
-            'near_miss_tp_arm_ratio': max(0.50, min(0.99, float(plan.get('near_miss_tp_arm_ratio', cfg.get('near_miss_tp_arm_ratio', 0.90)) or 0.90))),
-            'near_miss_tp_lock_r': max(0.0, float(plan.get('near_miss_tp_lock_r', cfg.get('near_miss_tp_lock_r', 0.18)) or 0.18)),
+            'near_miss_tp_arm_ratio': max(0.50, min(0.99, float(plan.get('near_miss_tp_arm_ratio', cfg.get('near_miss_tp_arm_ratio', 0.86)) or 0.86))),
+            'near_miss_tp_lock_r': max(0.0, float(plan.get('near_miss_tp_lock_r', cfg.get('near_miss_tp_lock_r', 0.28)) or 0.28)),
             'near_miss_tp1_armed': False,
             'near_miss_tp2_armed': False,
             'runner_exit_enabled': bool(cfg.get('runner_exit_enabled', False)),
@@ -14788,10 +14874,10 @@ class SignalEngine(BaseEngine):
                 stop_atr_multiplier=cfg.get('stop_atr_multiplier', 1.5),
                 ut_stop=ut_detail.get('curr_stop'),
                 structure_stop=structure_stop,
-                structure_buffer_atr=cfg.get('structure_stop_buffer_atr', 0.20),
+                structure_buffer_atr=cfg.get('structure_stop_buffer_atr', 0.28),
                 take_profit_r_multiple=cfg.get('take_profit_r_multiple', 3.50),
-                take_profit_front_run_atr=cfg.get('take_profit_front_run_atr', 0.10),
-                take_profit_front_run_pct=cfg.get('take_profit_front_run_pct', 0.035),
+                take_profit_front_run_atr=cfg.get('take_profit_front_run_atr', 0.14),
+                take_profit_front_run_pct=cfg.get('take_profit_front_run_pct', 0.055),
                 min_risk_reward=cfg.get('min_risk_reward', 2.0),
                 balance_usdt=balance_for_risk,
                 risk_per_trade_percent=risk_per_trade_percent,
@@ -14960,15 +15046,15 @@ class SignalEngine(BaseEngine):
             'structure_stop': plan.get('structure_stop'),
             'structure_stop_with_buffer': plan.get('structure_stop_with_buffer'),
             'structure_anchor_distance': plan.get('structure_anchor_distance'),
-            'structure_stop_buffer_atr': float(cfg.get('structure_stop_buffer_atr', 0.20) or 0.20),
-            'take_profit_front_run_atr': float(cfg.get('take_profit_front_run_atr', 0.10) or 0.10),
-            'take_profit_front_run_pct': float(cfg.get('take_profit_front_run_pct', 0.035) or 0.035),
+            'structure_stop_buffer_atr': float(cfg.get('structure_stop_buffer_atr', 0.28) or 0.28),
+            'take_profit_front_run_atr': float(cfg.get('take_profit_front_run_atr', 0.14) or 0.14),
+            'take_profit_front_run_pct': float(cfg.get('take_profit_front_run_pct', 0.055) or 0.055),
             'tp_front_run_min_r_multiple': float(cfg.get('tp_front_run_min_r_multiple', 0.0) or 0.0),
             'soft_stop_enabled': bool(cfg.get('soft_stop_enabled', True)),
-            'soft_stop_confirm_bars': int(cfg.get('soft_stop_confirm_bars', 1) or 1),
+            'soft_stop_confirm_bars': int(cfg.get('soft_stop_confirm_bars', 2) or 2),
             'near_miss_tp_enabled': bool(cfg.get('near_miss_tp_enabled', True)),
-            'near_miss_tp_arm_ratio': float(cfg.get('near_miss_tp_arm_ratio', 0.90) or 0.90),
-            'near_miss_tp_lock_r': float(cfg.get('near_miss_tp_lock_r', 0.18) or 0.18),
+            'near_miss_tp_arm_ratio': float(cfg.get('near_miss_tp_arm_ratio', 0.86) or 0.86),
+            'near_miss_tp_lock_r': float(cfg.get('near_miss_tp_lock_r', 0.28) or 0.28),
             'short_conservative_enabled': bool(cfg.get('short_conservative_enabled', True)),
             'short_risk_multiplier': float(cfg.get('short_risk_multiplier', 0.5) or 0.5),
             'bias_continuation_summary': status.get('bias_continuation_summary'),
@@ -15193,8 +15279,8 @@ class SignalEngine(BaseEngine):
                 'rr_multiple': target_r,
                 'effective_rr_multiple': effective_tp_distance / max(risk_distance, 1e-9),
                 'take_profit_distance': effective_tp_distance,
-                'take_profit_front_run_atr': float(cfg.get('take_profit_front_run_atr', 0.10) or 0.10),
-                'take_profit_front_run_pct': float(cfg.get('take_profit_front_run_pct', 0.035) or 0.035),
+                'take_profit_front_run_atr': float(cfg.get('take_profit_front_run_atr', 0.14) or 0.14),
+                'take_profit_front_run_pct': float(cfg.get('take_profit_front_run_pct', 0.055) or 0.055),
                 'take_profit': (
                     entry_price + effective_tp_distance
                     if side == 'long'
@@ -30828,7 +30914,7 @@ class SignalEngine(BaseEngine):
                 self.utbreakout_trailing_states[symbol] = state
                 confirm_bars = max(
                     1,
-                    int(cfg.get('soft_stop_confirm_bars', state.get('soft_stop_confirm_bars', 1)) or 1),
+                    int(cfg.get('soft_stop_confirm_bars', state.get('soft_stop_confirm_bars', 2)) or 2),
                 )
                 if int(state.get('soft_stop_breach_count', 0) or 0) >= confirm_bars:
                     reason = (
@@ -30868,16 +30954,16 @@ class SignalEngine(BaseEngine):
                     0.50,
                     min(
                         0.99,
-                        float(cfg.get('near_miss_tp_arm_ratio', state.get('near_miss_tp_arm_ratio', 0.90)) or 0.90),
+                        float(cfg.get('near_miss_tp_arm_ratio', state.get('near_miss_tp_arm_ratio', 0.86)) or 0.86),
                     ),
                 )
                 base_lock_r = max(
                     0.0,
-                    float(cfg.get('near_miss_tp_lock_r', state.get('near_miss_tp_lock_r', 0.18)) or 0.18),
+                    float(cfg.get('near_miss_tp_lock_r', state.get('near_miss_tp_lock_r', 0.28)) or 0.28),
                 )
             except (TypeError, ValueError):
-                arm_ratio = 0.90
-                base_lock_r = 0.18
+                arm_ratio = 0.86
+                base_lock_r = 0.28
             for tp_order in self._planned_tp_orders_from_state(symbol, state):
                 label = _normalize_tp_plan_label(tp_order.get('tp_label') or tp_order.get('tp_name') or tp_order.get('label'), 'TP')
                 label_key = label.lower()
@@ -30892,14 +30978,14 @@ class SignalEngine(BaseEngine):
                 if side == 'long':
                     arm_price = entry_price + target_distance * arm_ratio
                     near_reached = current_high >= arm_price and current_high < target_price
-                    lock_r = min(max(base_lock_r, (arm_ratio * target_distance / risk_distance) - 0.18), 0.80)
+                    lock_r = min(max(base_lock_r, (arm_ratio * target_distance / risk_distance) - 0.12), 0.80)
                     near_stop = entry_price + risk_distance * lock_r
                     valid_stop = near_stop < current_close
                     improved = near_stop > float(state.get('last_stop_price') or 0.0)
                 else:
                     arm_price = entry_price - target_distance * arm_ratio
                     near_reached = current_low <= arm_price and current_low > target_price
-                    lock_r = min(max(base_lock_r, (arm_ratio * target_distance / risk_distance) - 0.18), 0.80)
+                    lock_r = min(max(base_lock_r, (arm_ratio * target_distance / risk_distance) - 0.12), 0.80)
                     near_stop = entry_price - risk_distance * lock_r
                     last_stop = float(state.get('last_stop_price') or 0.0)
                     valid_stop = near_stop > current_close

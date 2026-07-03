@@ -57,6 +57,11 @@ def test_opportunity_tuning_persists_changed_runtime_config():
     assert ut_cfg["entry_edge_enabled"] is True
     assert ut_cfg["entry_edge_min_score"] == 68.0
     assert ut_cfg["entry_quality_gate_min_entry_edge_score"] == 68.0
+    assert ut_cfg["market_regime_engine_enabled"] is True
+    assert ut_cfg["data_quality_engine_enabled"] is True
+    assert ut_cfg["execution_quality_engine_enabled"] is True
+    assert ut_cfg["protection_health_execution_gate_enabled"] is True
+    assert ut_cfg["overfit_governance_enabled"] is True
     assert ut_cfg["ev_no_edge_relief_min_score"] == 74.0
     assert ut_cfg["ev_short_min_entry_score"] == 62.0
     assert ut_cfg["ev_short_relaxed_signal_risk_cap"] == 0.25

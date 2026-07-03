@@ -97,6 +97,21 @@ from .alpha_engine import (
     evaluate_profit_alpha,
 )
 from .direction_engine import DirectionDecision, default_direction_engine_config, evaluate_direction_engine
+from .intelligence import (
+    IntelligenceDecision,
+    MarketRegimeDecision,
+    OverfitBacktestReport,
+    SignalAttribution,
+    build_signal_attribution,
+    default_intelligence_config,
+    evaluate_data_quality_engine,
+    evaluate_execution_quality_engine,
+    evaluate_market_regime_engine,
+    evaluate_overfit_governance,
+    evaluate_protection_health_engine,
+    run_overfit_backtest,
+    run_strategy_replay,
+)
 from .market_context import MarketContext, MarketContextQuality, build_market_context
 from .derivatives import (
     DerivativesDecision,
@@ -203,6 +218,19 @@ __all__ = [
     "DirectionDecision",
     "default_direction_engine_config",
     "evaluate_direction_engine",
+    "IntelligenceDecision",
+    "MarketRegimeDecision",
+    "OverfitBacktestReport",
+    "SignalAttribution",
+    "build_signal_attribution",
+    "default_intelligence_config",
+    "evaluate_data_quality_engine",
+    "evaluate_execution_quality_engine",
+    "evaluate_market_regime_engine",
+    "evaluate_overfit_governance",
+    "evaluate_protection_health_engine",
+    "run_overfit_backtest",
+    "run_strategy_replay",
     "MarketContext",
     "MarketContextQuality",
     "build_market_context",

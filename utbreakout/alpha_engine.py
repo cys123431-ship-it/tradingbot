@@ -13,6 +13,15 @@ from math import isfinite
 from typing import Any, Mapping
 
 from .direction_engine import evaluate_direction_engine
+from .intelligence import (
+    build_signal_attribution,
+    default_intelligence_config,
+    evaluate_data_quality_engine,
+    evaluate_execution_quality_engine,
+    evaluate_market_regime_engine,
+    evaluate_overfit_governance,
+    evaluate_protection_health_engine,
+)
 
 
 @dataclass(frozen=True)
@@ -32,7 +41,7 @@ class ProfitAlphaDecision:
     exit_policy: str = ""
     reasons: tuple[str, ...] = ()
     blockers: tuple[str, ...] = ()
-    components: Mapping[str, float] = field(default_factory=dict)
+    components: Mapping[str, Any] = field(default_factory=dict)
     meta_key: str = ""
     meta_sample_count: int = 0
     meta_expectancy_r: float | None = None
@@ -93,7 +102,7 @@ class EntryEdgeDecision:
 
 
 def default_profit_alpha_config() -> dict[str, Any]:
-    return {
+    cfg = {
         "profit_alpha_enabled": True,
         "profit_alpha_min_score": 68.0,
         "profit_alpha_long_min_score": 69.0,
@@ -120,14 +129,14 @@ def default_profit_alpha_config() -> dict[str, Any]:
         "exit_meta_min_samples": 8,
         "exit_meta_expectancy_block_below": -0.16,
         "exit_meta_expectancy_reduce_below": 0.0,
-        "take_profit_front_run_atr": 0.10,
-        "take_profit_front_run_pct": 0.035,
-        "structure_stop_buffer_atr": 0.20,
+        "take_profit_front_run_atr": 0.14,
+        "take_profit_front_run_pct": 0.055,
+        "structure_stop_buffer_atr": 0.28,
         "soft_stop_enabled": True,
-        "soft_stop_confirm_bars": 1,
+        "soft_stop_confirm_bars": 2,
         "near_miss_tp_enabled": True,
-        "near_miss_tp_arm_ratio": 0.90,
-        "near_miss_tp_lock_r": 0.18,
+        "near_miss_tp_arm_ratio": 0.86,
+        "near_miss_tp_lock_r": 0.28,
         "profit_alpha_follow_through_enabled": True,
         "profit_alpha_default_follow_through_bars": 3,
         "profit_alpha_default_follow_through_min_mfe_r": 0.35,
@@ -141,6 +150,8 @@ def default_profit_alpha_config() -> dict[str, Any]:
         "entry_edge_short_min_probability": 0.555,
         "entry_edge_min_net_expectancy_r": 0.14,
     }
+    cfg.update(default_intelligence_config())
+    return cfg
 
 
 def _finite(value: Any, default: float | None = None) -> float | None:
@@ -553,15 +564,33 @@ def _exit_overrides(
     exit_meta_expectancy: float | None = None,
 ) -> dict[str, Any]:
     front_run = {
-        "take_profit_front_run_atr": float(cfg.get("take_profit_front_run_atr", 0.10) or 0.10),
-        "take_profit_front_run_pct": float(cfg.get("take_profit_front_run_pct", 0.035) or 0.035),
-        "structure_stop_buffer_atr": float(cfg.get("structure_stop_buffer_atr", 0.20) or 0.20),
+        "take_profit_front_run_atr": float(cfg.get("take_profit_front_run_atr", 0.14) or 0.14),
+        "take_profit_front_run_pct": float(cfg.get("take_profit_front_run_pct", 0.055) or 0.055),
+        "structure_stop_buffer_atr": float(cfg.get("structure_stop_buffer_atr", 0.28) or 0.28),
         "soft_stop_enabled": bool(cfg.get("soft_stop_enabled", True)),
-        "soft_stop_confirm_bars": int(cfg.get("soft_stop_confirm_bars", 1) or 1),
+        "soft_stop_confirm_bars": int(cfg.get("soft_stop_confirm_bars", 2) or 2),
         "near_miss_tp_enabled": bool(cfg.get("near_miss_tp_enabled", True)),
-        "near_miss_tp_arm_ratio": float(cfg.get("near_miss_tp_arm_ratio", 0.90) or 0.90),
-        "near_miss_tp_lock_r": float(cfg.get("near_miss_tp_lock_r", 0.18) or 0.18),
+        "near_miss_tp_arm_ratio": float(cfg.get("near_miss_tp_arm_ratio", 0.86) or 0.86),
+        "near_miss_tp_lock_r": float(cfg.get("near_miss_tp_lock_r", 0.28) or 0.28),
     }
+
+    def _profile_controls(
+        *,
+        front_atr: float,
+        front_pct: float,
+        structure_buffer: float,
+        soft_confirm: int,
+        arm_ratio: float,
+        lock_r: float,
+    ) -> dict[str, Any]:
+        profile = dict(front_run)
+        profile["take_profit_front_run_atr"] = max(float(profile["take_profit_front_run_atr"]), float(front_atr))
+        profile["take_profit_front_run_pct"] = max(float(profile["take_profit_front_run_pct"]), float(front_pct))
+        profile["structure_stop_buffer_atr"] = max(float(profile["structure_stop_buffer_atr"]), float(structure_buffer))
+        profile["soft_stop_confirm_bars"] = max(1, int(soft_confirm or profile["soft_stop_confirm_bars"]))
+        profile["near_miss_tp_arm_ratio"] = min(float(profile["near_miss_tp_arm_ratio"]), float(arm_ratio))
+        profile["near_miss_tp_lock_r"] = max(float(profile["near_miss_tp_lock_r"]), float(lock_r))
+        return profile
     if entry_type == "LIQUIDITY_SWEEP_REVERSAL":
         result = {
             "partial_take_profit_ratio": 0.35,
@@ -578,7 +607,14 @@ def _exit_overrides(
             "profit_alpha_follow_through_min_mfe_r": 0.28,
             "profit_alpha_early_exit_max_mae_r": 0.65,
         }
-        result.update(front_run)
+        result.update(_profile_controls(
+            front_atr=0.20,
+            front_pct=0.080,
+            structure_buffer=0.24,
+            soft_confirm=1,
+            arm_ratio=0.82,
+            lock_r=0.36,
+        ))
         return result
     if entry_type == "PULLBACK_RETEST":
         result = {
@@ -596,7 +632,14 @@ def _exit_overrides(
             "profit_alpha_follow_through_min_mfe_r": 0.35,
             "profit_alpha_early_exit_max_mae_r": 0.70,
         }
-        result.update(front_run)
+        result.update(_profile_controls(
+            front_atr=0.14,
+            front_pct=0.055,
+            structure_buffer=0.32,
+            soft_confirm=2,
+            arm_ratio=0.86,
+            lock_r=0.28,
+        ))
         return result
     if engine in {"STRONG_UPTREND_LONG", "STRONG_DOWNTREND_SHORT", "TREND_CONTINUATION"}:
         result = {
@@ -618,7 +661,14 @@ def _exit_overrides(
             result["runner_pct"] = 0.55
             result["second_take_profit_r_multiple"] = 3.40
             result["take_profit_r_multiple"] = 3.40
-        result.update(front_run)
+        result.update(_profile_controls(
+            front_atr=0.10,
+            front_pct=0.040,
+            structure_buffer=0.34,
+            soft_confirm=2,
+            arm_ratio=0.88,
+            lock_r=0.24,
+        ))
         return result
     if engine == "SQUEEZE_BREAKOUT":
         result = {
@@ -636,7 +686,14 @@ def _exit_overrides(
             "profit_alpha_follow_through_min_mfe_r": 0.40,
             "profit_alpha_early_exit_max_mae_r": 0.75,
         }
-        result.update(front_run)
+        result.update(_profile_controls(
+            front_atr=0.16,
+            front_pct=0.065,
+            structure_buffer=0.28,
+            soft_confirm=2,
+            arm_ratio=0.84,
+            lock_r=0.32,
+        ))
         return result
     result = {
         "partial_take_profit_ratio": 0.30,
@@ -666,7 +723,14 @@ def _exit_overrides(
         result["runner_pct"] = min(0.25, float(result["runner_pct"]))
         result["atr_trailing_multiplier"] = min(2.45, float(result["atr_trailing_multiplier"]))
         result["runner_chandelier_multiplier"] = min(2.45, float(result["runner_chandelier_multiplier"]))
-    result.update(front_run)
+    result.update(_profile_controls(
+        front_atr=0.18,
+        front_pct=0.080,
+        structure_buffer=0.26,
+        soft_confirm=1,
+        arm_ratio=0.82,
+        lock_r=0.36,
+    ))
     return result
 
 
@@ -763,6 +827,27 @@ def evaluate_profit_alpha(
         opposite_regime=opposite_regime,
     )
     direction_score = direction_decision.score
+    market_regime_decision = evaluate_market_regime_engine(side=side, values=values, config=cfg)
+    data_quality_decision = evaluate_data_quality_engine(values=values, config=cfg)
+    execution_quality_decision = evaluate_execution_quality_engine(values=values, config=cfg)
+    protection_health_decision = evaluate_protection_health_engine(values=values, config=cfg)
+    attribution = build_signal_attribution(
+        side=side,
+        engine=engine,
+        entry_type=entry_type,
+        exit_policy=exit_policy,
+        market_regime=market_regime_decision.regime,
+        values=values,
+    )
+    overfit_decision = evaluate_overfit_governance(
+        meta_stats=meta_stats,
+        side=side,
+        engine=engine,
+        entry_type=entry_type,
+        exit_policy=exit_policy,
+        regime=market_regime_decision.regime,
+        config=cfg,
+    )
     if engine == "NO_TRADE":
         score = trend * 0.30 + relative * 0.25 + regime * 0.15 + derivatives * 0.20 + squeeze * 0.10
     elif engine == "SQUEEZE_BREAKOUT":
@@ -770,6 +855,10 @@ def evaluate_profit_alpha(
     else:
         score = trend * 0.32 + relative * 0.26 + regime * 0.16 + derivatives * 0.18 + squeeze * 0.08
     score = score * 0.78 + direction_score * 0.22
+    score += (market_regime_decision.score - 55.0) * 0.04
+    score += (data_quality_decision.score - 80.0) * 0.02
+    score += (execution_quality_decision.score - 80.0) * 0.02
+    score += (overfit_decision.score - 72.0) * 0.03
     score = _clamp(score, 0.0, 100.0)
 
     blockers: list[str] = []
@@ -781,13 +870,29 @@ def evaluate_profit_alpha(
     reasons.extend(squeeze_reasons[:2])
     reasons.extend(direction_decision.reasons[:3])
     reasons.extend(entry_type_reasons[:3])
+    reasons.extend(market_regime_decision.reasons[:3])
+    reasons.extend(data_quality_decision.reasons[:2])
+    reasons.extend(execution_quality_decision.reasons[:2])
+    reasons.extend(protection_health_decision.reasons[:2])
+    reasons.extend(overfit_decision.reasons[:2])
     reasons.append(f"entry type {entry_type}")
     reasons.append(f"exit policy {exit_policy}")
+    reasons.append(f"attribution {attribution.key}")
 
     if engine == "NO_TRADE":
         blockers.append("no alpha sub-strategy selected")
     blockers.extend(direction_decision.blockers[:3])
     blockers.extend(entry_type_blockers[:2])
+    if not market_regime_decision.allowed:
+        blockers.extend(f"Market Regime: {item}" for item in market_regime_decision.blockers[:2])
+    if not data_quality_decision.allowed:
+        blockers.extend(f"Data Quality: {item}" for item in data_quality_decision.blockers[:2])
+    if not execution_quality_decision.allowed:
+        blockers.extend(f"Execution Quality: {item}" for item in execution_quality_decision.blockers[:2])
+    if not protection_health_decision.allowed:
+        blockers.extend(f"Protection Health: {item}" for item in protection_health_decision.blockers[:2])
+    if not overfit_decision.allowed:
+        blockers.extend(f"Overfit Governance: {item}" for item in overfit_decision.blockers[:3])
 
     base_min_score = float(cfg.get("profit_alpha_min_score", 68.0) or 68.0)
     min_score = float(cfg.get(f"profit_alpha_{side}_min_score", base_min_score) or base_min_score)
@@ -885,6 +990,14 @@ def evaluate_profit_alpha(
     if exit_meta_expectancy is not None and exit_meta_samples >= int(cfg.get("exit_meta_min_samples", 8) or 8):
         if exit_meta_expectancy < float(cfg.get("exit_meta_expectancy_reduce_below", 0.0) or 0.0):
             risk_multiplier = min(risk_multiplier, 0.78)
+    risk_multiplier = min(
+        risk_multiplier,
+        market_regime_decision.risk_multiplier,
+        data_quality_decision.risk_multiplier,
+        execution_quality_decision.risk_multiplier,
+        protection_health_decision.risk_multiplier,
+        overfit_decision.risk_multiplier,
+    )
 
     overrides = _exit_overrides(
         engine,
@@ -923,7 +1036,20 @@ def evaluate_profit_alpha(
         "strong_adverse_count": float(strong_adverse),
         "exit_meta_samples": float(exit_meta_samples),
         "exit_meta_expectancy_r": float(exit_meta_expectancy or 0.0),
+        "market_regime_engine_score": round(float(market_regime_decision.score), 4),
+        "market_regime_engine_risk": round(float(market_regime_decision.risk_multiplier), 4),
+        "data_quality_score": round(float(data_quality_decision.score), 4),
+        "data_quality_risk": round(float(data_quality_decision.risk_multiplier), 4),
+        "execution_quality_score": round(float(execution_quality_decision.score), 4),
+        "execution_quality_risk": round(float(execution_quality_decision.risk_multiplier), 4),
+        "protection_health_score": round(float(protection_health_decision.score), 4),
+        "overfit_governance_score": round(float(overfit_decision.score), 4),
+        "overfit_governance_risk": round(float(overfit_decision.risk_multiplier), 4),
+        "overfit_sample_count": round(float(overfit_decision.components.get("sample_count", 0.0)), 4),
     }
+    if isinstance(attribution.tags, Mapping):
+        for key, value in attribution.tags.items():
+            components[f"tag_{key}"] = str(value)
     return ProfitAlphaDecision(
         allowed=not blockers,
         side=side,
@@ -1100,7 +1226,10 @@ def build_entry_edge_decision(
         "alpha_risk_multiplier": float(alpha_risk),
         "alpha_direction_score": float(alpha_direction_score),
     }
-    components.update({f"alpha_{key}": float(value) for key, value in alpha_components.items()})
+    for key, value in alpha_components.items():
+        parsed = _finite(value, None)
+        if parsed is not None:
+            components[f"alpha_{key}"] = float(parsed)
 
     return EntryEdgeDecision(
         allowed=not blockers,

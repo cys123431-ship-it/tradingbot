@@ -56,10 +56,16 @@ def test_profit_opportunity_effective_profile_overrides_old_values():
     assert out["entry_quality_gate_min_entry_edge_score"] == 68.0
     assert out["direction_engine_min_score"] == 62.0
     assert out["entry_type_max_chase_extension_atr"] == 2.35
-    assert out["structure_stop_buffer_atr"] == 0.20
-    assert out["take_profit_front_run_pct"] == 0.035
+    assert out["structure_stop_buffer_atr"] == 0.28
+    assert out["take_profit_front_run_pct"] == 0.055
+    assert out["soft_stop_confirm_bars"] == 2
     assert out["soft_stop_enabled"] is True
     assert out["near_miss_tp_enabled"] is True
+    assert out["market_regime_engine_enabled"] is True
+    assert out["data_quality_engine_enabled"] is True
+    assert out["execution_quality_engine_enabled"] is True
+    assert out["protection_health_execution_gate_enabled"] is True
+    assert out["overfit_governance_enabled"] is True
 
 
 def test_runtime_config_path_reapplies_effective_profile_after_persisted_values():
@@ -185,6 +191,11 @@ def test_prelaunch_runtime_patches_cannot_restore_the_retired_profile():
         "take_profit_front_run_pct",
         "soft_stop_enabled",
         "near_miss_tp_enabled",
+        "market_regime_engine_enabled",
+        "data_quality_engine_enabled",
+        "execution_quality_engine_enabled",
+        "protection_health_execution_gate_enabled",
+        "overfit_governance_enabled",
     )
 
     for key in keys:

@@ -175,7 +175,10 @@ def test_profit_alpha_exit_overrides_expand_strong_trend_runner():
     assert cfg["take_profit_r_multiple"] >= 2.8
     assert cfg["profit_alpha_follow_through_enabled"] is True
     assert cfg["soft_stop_enabled"] is True
+    assert cfg["soft_stop_confirm_bars"] == 2
+    assert cfg["structure_stop_buffer_atr"] >= 0.34
     assert cfg["near_miss_tp_enabled"] is True
+    assert cfg["near_miss_tp_arm_ratio"] <= 0.88
 
 
 def test_profit_alpha_splits_pullback_entry_type_and_exit_policy():
@@ -196,6 +199,31 @@ def test_profit_alpha_splits_pullback_entry_type_and_exit_policy():
     assert decision.exit_policy == "PULLBACK_BALANCED_LADDER"
     cfg = apply_profit_alpha_exit_overrides({}, decision)
     assert cfg["second_take_profit_r_multiple"] == 2.45
+    assert cfg["structure_stop_buffer_atr"] >= 0.32
+
+
+def test_profit_alpha_sweep_exit_profile_front_runs_and_locks_profit_earlier():
+    values = _base_values("long")
+    values.update({
+        "open": 108.0,
+        "high": 111.0,
+        "low": 100.0,
+        "close": 110.0,
+        "range_expansion": 1.10,
+    })
+
+    decision = evaluate_profit_alpha(
+        side="long",
+        values=values,
+        ev_decision=_ev("TREND"),
+    )
+
+    cfg = apply_profit_alpha_exit_overrides({}, decision)
+    assert decision.entry_type == "LIQUIDITY_SWEEP_REVERSAL"
+    assert cfg["take_profit_front_run_pct"] >= 0.08
+    assert cfg["near_miss_tp_arm_ratio"] <= 0.82
+    assert cfg["near_miss_tp_lock_r"] >= 0.36
+    assert cfg["soft_stop_confirm_bars"] == 1
 
 
 def test_profit_alpha_exit_meta_blocks_losing_exit_policy():
