@@ -19,6 +19,7 @@ import sys
 import traceback
 import re
 import hashlib
+import copy
 import atexit
 import signal
 import faulthandler
@@ -174,6 +175,7 @@ UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS = frozenset({
     "on",
     "off",
     "condition_status",
+    "dual_status",
     "rsp_status",
     "watchlist",
 })
@@ -194,6 +196,9 @@ UTBREAKOUT_CALLBACK_ACTIONS = UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS | frozenset({
     "auto",
     "auto_bundle",
     "adaptive",
+    "dual",
+    "dualt",
+    "dual_status",
     "rsp",
     "rspt",
     "rsp_status",
@@ -459,10 +464,12 @@ def format_utbreakout_research_summary(protection_status=None, days=7):
 CORE_ENGINE = 'signal'
 UTBOT_FILTERED_BREAKOUT_STRATEGY = 'utbot_filtered_breakout_v1'
 UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY = 'utbot_adaptive_timeframe_v1'
+DUAL_ALPHA_STRATEGY = 'dual_alpha_v1'
 UTBREAKOUT_STRATEGIES = {
     UTBOT_FILTERED_BREAKOUT_STRATEGY,
     UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY,
     ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+    DUAL_ALPHA_STRATEGY,
 }
 UT_ONLY_STRATEGIES = {'utbot', 'rsibb', 'utrsibb', 'utrsi', 'utbb', 'utsmc'}
 MA_STRATEGIES = set()
@@ -483,6 +490,7 @@ STRATEGY_DISPLAY_NAMES = {
     UTBOT_FILTERED_BREAKOUT_STRATEGY: 'UTBOT_FILTERED_BREAKOUT_V1',
     UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY: 'UTBOT_ADAPTIVE_TIMEFRAME_V1',
     ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND: 'RELATIVE_STRENGTH_PULLBACK_TREND',
+    DUAL_ALPHA_STRATEGY: 'DUAL_ALPHA',
 }
 UT_HYBRID_TIMING_LABELS = {
     'utrsibb': 'RSI+BB',
@@ -4953,6 +4961,8 @@ class SignalEngine(BaseEngine):
         self.utbreakout_profit_alpha_meta_stats = {}  # side:engine -> realized R stats
         self.relative_strength_pullback_states = {}  # symbol -> breakout/pullback wait state
         self.relative_strength_pullback_last_decisions = {}  # symbol -> latest shadow/live decision
+        self.relative_strength_pullback_eval_cache = {}  # short-lived scanner evaluation cache
+        self.dual_alpha_last_status = {}  # symbol -> latest dual alpha selection summary
         self.utbreakout_adaptive_tf_state = {}  # symbol -> selected TF stability state
         self.utbreakout_adaptive_last_decision_ts = {}  # symbol -> tf -> last closed candle evaluated
         self.utbreakout_last_selected_set_ids = {}  # symbol -> last validated AUTO Set
@@ -5034,6 +5044,8 @@ class SignalEngine(BaseEngine):
         self.utbreakout_profit_alpha_meta_stats = {}
         self.relative_strength_pullback_states = {}
         self.relative_strength_pullback_last_decisions = {}
+        self.relative_strength_pullback_eval_cache = {}
+        self.dual_alpha_last_status = {}
         self.utbreakout_adaptive_tf_state = {}
         self.utbreakout_adaptive_last_decision_ts = {}
         self.utbreakout_last_selected_set_ids = {}
@@ -7392,13 +7404,19 @@ class SignalEngine(BaseEngine):
         if active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY:
             cfg['adaptive_timeframe_enabled'] = True
         entry_strategy_key = resolve_entry_strategy({'entry_strategy': cfg.get('entry_strategy')})
-        if active_strategy == ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND or entry_strategy_key == ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND:
+        if (
+            active_strategy == ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
+            or (
+                active_strategy != DUAL_ALPHA_STRATEGY
+                and entry_strategy_key == ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
+            )
+        ):
             rsp_cfg = default_relative_strength_pullback_config()
             nested_rsp_cfg = cfg.get('relative_strength_pullback_trend')
             if isinstance(nested_rsp_cfg, dict):
                 rsp_cfg.update(nested_rsp_cfg)
             cfg['entry_strategy'] = ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
-            cfg['entry_timeframe'] = str(rsp_cfg.get('signal_tf') or '6h').strip().lower() or '6h'
+            cfg['entry_timeframe'] = str(rsp_cfg.get('signal_tf') or '4h').strip().lower() or '4h'
             cfg['htf_timeframe'] = str(rsp_cfg.get('trend_htf') or '1d').strip().lower() or '1d'
             cfg['adaptive_timeframe_enabled'] = False
         for key in (
@@ -11220,7 +11238,27 @@ class SignalEngine(BaseEngine):
                 )
                 return False
 
-            if active_strategy != ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND:
+            plan = self._get_utbot_filtered_breakout_entry_plan(symbol, side)
+            if not isinstance(plan, dict):
+                self._utbreakout_trace_event(
+                    symbol,
+                    'AUTO_ENTRY_BRIDGE_BLOCKED',
+                    'MISSING_PLAN',
+                    source=source,
+                    reason='ready entry plan is missing',
+                    side=side,
+                )
+                return False
+            plan_strategy = str(plan.get('strategy') or '').lower()
+            skip_ut_eligibility = (
+                active_strategy == ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
+                or (
+                    active_strategy == DUAL_ALPHA_STRATEGY
+                    and plan_strategy == ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
+                )
+            )
+
+            if not skip_ut_eligibility:
                 ctx = await self._evaluate_utbreakout_eligibility_context(
                     symbol,
                     scanner_source=source,
@@ -11260,19 +11298,6 @@ class SignalEngine(BaseEngine):
                     'DIRECTION_FILTER',
                     source=source,
                     reason=self.format_trade_direction_block_reason(side),
-                    side=side,
-                )
-                return False
-
-            # Get the plan
-            plan = self._get_utbot_filtered_breakout_entry_plan(symbol, side)
-            if not isinstance(plan, dict):
-                self._utbreakout_trace_event(
-                    symbol,
-                    'AUTO_ENTRY_BRIDGE_BLOCKED',
-                    'MISSING_PLAN',
-                    source=source,
-                    reason='ready entry plan is missing',
                     side=side,
                 )
                 return False
@@ -13756,7 +13781,7 @@ class SignalEngine(BaseEngine):
         )
         rsp_cfg = self._relative_strength_pullback_runtime_config(cfg)
         candidates = self._relative_strength_pullback_candidate_items()
-        signal_tf = str(rsp_cfg.get('signal_tf') or '6h').strip().lower() or '6h'
+        signal_tf = str(rsp_cfg.get('signal_tf') or '4h').strip().lower() or '4h'
         htf_tf = str(rsp_cfg.get('trend_htf') or '1d').strip().lower() or '1d'
         signal_limit = max(
             260,
@@ -13806,13 +13831,43 @@ class SignalEngine(BaseEngine):
             else:
                 normalized_candidates.append(canonical)
 
-        signal_rows_by_symbol = {}
-        htf_rows_by_symbol = {}
+        symbol_values = []
         for item in normalized_candidates:
             symbol_value = item.get('exchange_symbol') if isinstance(item, dict) else item
             symbol_value = str(symbol_value or '').strip()
-            if not symbol_value:
-                continue
+            if symbol_value:
+                symbol_values.append(symbol_value)
+
+        if not isinstance(getattr(self, 'relative_strength_pullback_eval_cache', None), dict):
+            self.relative_strength_pullback_eval_cache = {}
+        cache_key = (
+            tuple(symbol_values),
+            signal_tf,
+            htf_tf,
+            int(time.time() // 60),
+        )
+        cached = self.relative_strength_pullback_eval_cache.get(cache_key)
+        if isinstance(cached, dict):
+            decisions = list(cached.get('decisions') or [])
+            if not isinstance(getattr(self, 'relative_strength_pullback_last_decisions', None), dict):
+                self.relative_strength_pullback_last_decisions = {}
+            for decision in decisions:
+                self.relative_strength_pullback_last_decisions[decision.symbol] = decision
+                if record_state and decision.state_update:
+                    if not isinstance(getattr(self, 'relative_strength_pullback_states', None), dict):
+                        self.relative_strength_pullback_states = {}
+                    self.relative_strength_pullback_states[decision.symbol] = dict(decision.state_update)
+            return (
+                decisions,
+                cached.get('signal_rows_by_symbol') or {},
+                cached.get('htf_rows_by_symbol') or {},
+                list(cached.get('normalized_candidates') or normalized_candidates),
+                dict(cached.get('rsp_cfg') or rsp_cfg),
+            )
+
+        signal_rows_by_symbol = {}
+        htf_rows_by_symbol = {}
+        for symbol_value in symbol_values:
             try:
                 signal_ohlcv = await asyncio.to_thread(
                     self.market_data_exchange.fetch_ohlcv,
@@ -13855,6 +13910,15 @@ class SignalEngine(BaseEngine):
                 if not isinstance(getattr(self, 'relative_strength_pullback_states', None), dict):
                     self.relative_strength_pullback_states = {}
                 self.relative_strength_pullback_states[decision.symbol] = dict(decision.state_update)
+        self.relative_strength_pullback_eval_cache = {
+            cache_key: {
+                'decisions': list(decisions or []),
+                'signal_rows_by_symbol': signal_rows_by_symbol,
+                'htf_rows_by_symbol': htf_rows_by_symbol,
+                'normalized_candidates': list(normalized_candidates or []),
+                'rsp_cfg': dict(rsp_cfg or {}),
+            }
+        }
         return decisions, signal_rows_by_symbol, htf_rows_by_symbol, normalized_candidates, rsp_cfg
 
     def _relative_strength_pullback_find_decision(self, symbol, decisions):
@@ -13882,7 +13946,7 @@ class SignalEngine(BaseEngine):
             ),
             'entry_strategy': ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
             'stage': 'evaluate',
-            'entry_timeframe': rsp_cfg.get('signal_tf', '6h'),
+            'entry_timeframe': rsp_cfg.get('signal_tf', '4h'),
             'htf_timeframe': rsp_cfg.get('trend_htf', '1d'),
             'relative_strength_pullback_live_enabled': bool(
                 rsp_cfg.get('relative_strength_pullback_trend_live_enabled', False)
@@ -13923,7 +13987,7 @@ class SignalEngine(BaseEngine):
         status['scanner_candidate_count'] = len(candidates)
         status['rspt_candidate_count'] = len(decisions)
         if not candidates:
-            return _finish(None, 'RSPT waiting: no scanner candidates', 'REJECTED_RSPT_NO_SCANNER_CANDIDATE')
+            return _finish(None, 'no_scanner_candidates', 'REJECTED_RSPT_NO_SCANNER_CANDIDATE')
         decision = self._relative_strength_pullback_find_decision(symbol, decisions)
         if decision is None:
             return _finish(None, 'RSPT waiting: symbol is not in scanner candidates', 'REJECTED_RSPT_NOT_SCANNER_CANDIDATE')
@@ -13936,6 +14000,10 @@ class SignalEngine(BaseEngine):
             'reason': decision.reason,
             'logs': dict(decision.logs or {}),
         }
+        decision_logs = dict(decision.logs or {})
+        status['setup_type'] = decision_logs.get('setup_type')
+        status['rspt_size_multiplier'] = decision_logs.get('size_multiplier', decision_logs.get('risk_multiplier', 1.0))
+        status['rspt_size_reduction_reasons'] = decision_logs.get('size_reduction_reasons')
         status.update({
             'candidate_signal': decision.side,
             'candidate_side': decision.side,
@@ -13971,14 +14039,14 @@ class SignalEngine(BaseEngine):
         if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
             return _finish(
                 None,
-                f"REJECTED_DAILY_LOSS_LIMIT: daily pnl {daily_pnl:.2f}",
+                f"risk_limit_blocked: daily pnl {daily_pnl:.2f}",
                 'REJECTED_DAILY_LOSS_LIMIT',
                 side=side,
             )
         if int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
             return _finish(
                 None,
-                f"REJECTED_DAILY_LOSS_LIMIT: daily trade count {daily_entries}",
+                f"risk_limit_blocked: daily trade count {daily_entries}",
                 'REJECTED_DAILY_LOSS_LIMIT',
                 side=side,
             )
@@ -14038,7 +14106,7 @@ class SignalEngine(BaseEngine):
         if market_quality.get('state') is False or market_quality.get('hard_block'):
             return _finish(
                 None,
-                f"REJECTED_MARKET_QUALITY: {market_quality.get('summary')}",
+                f"market_quality_rejected: {market_quality.get('summary')}",
                 'REJECTED_MARKET_QUALITY',
                 record_failure=True,
                 side=side,
@@ -14048,7 +14116,9 @@ class SignalEngine(BaseEngine):
         balance_for_risk = total_balance if total_balance > 0 else free_balance
         common_cfg = self.get_runtime_common_settings()
         leverage = int(max(1.0, float(common_cfg.get('leverage', 5) or 5)))
-        risk_multiplier = max(0.0, min(1.0, float(market_quality.get('risk_multiplier', 1.0) or 1.0)))
+        market_quality_multiplier = max(0.0, min(1.0, float(market_quality.get('risk_multiplier', 1.0) or 1.0)))
+        rspt_size_multiplier = max(0.0, min(1.0, float(decision_logs.get('size_multiplier', decision_logs.get('risk_multiplier', 1.0)) or 1.0)))
+        risk_multiplier = market_quality_multiplier * rspt_size_multiplier
         risk_per_trade_percent = float(cfg.get('risk_per_trade_percent', 1.0) or 1.0) * risk_multiplier
         max_risk_per_trade_usdt = float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0) * risk_multiplier
         structure_stop = (
@@ -14087,14 +14157,16 @@ class SignalEngine(BaseEngine):
             'strategy': ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
             'plan_symbol': symbol,
             'effective_profile_version': cfg.get('effective_profile_version'),
-            'entry_timeframe': rsp_cfg.get('signal_tf', '6h'),
+            'entry_timeframe': rsp_cfg.get('signal_tf', '4h'),
             'exit_timeframe': cfg.get('exit_timeframe', cfg.get('entry_timeframe', '15m')),
             'htf_timeframe': rsp_cfg.get('trend_htf', '1d'),
             'decision_candle_ts': decision_ts,
             'atr': atr_value,
             'atr_pct': atr_pct,
             'market_quality_enabled': bool(cfg.get('market_quality_enabled', True)),
-            'market_quality_risk_multiplier': risk_multiplier,
+            'market_quality_risk_multiplier': market_quality_multiplier,
+            'rspt_size_multiplier': rspt_size_multiplier,
+            'rspt_risk_multiplier': risk_multiplier,
             'market_quality_summary': market_quality.get('summary'),
             'fixed_take_profit_enabled': bool(cfg.get('fixed_take_profit_enabled', True)),
             'partial_take_profit_enabled': bool(cfg.get('partial_take_profit_enabled', True)),
@@ -14112,7 +14184,8 @@ class SignalEngine(BaseEngine):
             'tp1_breakeven_wait_for_partial': bool(cfg.get('tp1_breakeven_wait_for_partial', True)),
             'tp1_breakeven_qty_tolerance': float(cfg.get('tp1_breakeven_qty_tolerance', 0.08) or 0.08),
             'rspt_reason': decision.reason,
-            'rspt_logs': dict(decision.logs or {}),
+            'rspt_setup_type': decision_logs.get('setup_type'),
+            'rspt_logs': decision_logs,
         })
         self._set_utbot_filtered_breakout_entry_plan(symbol, plan)
         if isinstance(getattr(self, 'relative_strength_pullback_states', None), dict):
@@ -14126,7 +14199,7 @@ class SignalEngine(BaseEngine):
         )
         return _finish(
             side,
-            f"ACCEPTED_ENTRY: RSPT {side.upper()} pullback/rebreakout confirmed",
+            f"ACCEPTED_ENTRY: RSPT {side.upper()} {decision_logs.get('setup_type') or decision.reason} confirmed",
             None,
         )
 
@@ -14138,7 +14211,7 @@ class SignalEngine(BaseEngine):
             "RelativeStrengthPullbackTrend status",
             f"Active strategy: {active_strategy or 'n/a'}",
             f"Live enabled: {bool(rsp_cfg.get('relative_strength_pullback_trend_live_enabled', False))}",
-            f"TF: signal {rsp_cfg.get('signal_tf', '6h')} / HTF {rsp_cfg.get('trend_htf', '1d')} / execution {rsp_cfg.get('entry_execution', 'next_open')}",
+            f"TF: signal {rsp_cfg.get('signal_tf', '4h')} / HTF {rsp_cfg.get('trend_htf', '1d')} / execution {rsp_cfg.get('entry_execution', 'next_open')}",
         ]
         try:
             decisions, _, _, candidates, _ = await self._evaluate_relative_strength_pullback_candidates(
@@ -14154,7 +14227,10 @@ class SignalEngine(BaseEngine):
                     continue
                 side = (decision.side or '-').upper()
                 ready = "READY" if decision.entry_ready else "WAIT"
-                lines.append(f"- {decision.symbol}: {ready} {side} / {decision.reason}")
+                logs = dict(decision.logs or {})
+                setup = logs.get('setup_type') or '-'
+                size_mult = logs.get('size_multiplier', logs.get('risk_multiplier', 1.0))
+                lines.append(f"- {decision.symbol}: {ready} {side} / {decision.reason} / setup {setup} / size x{float(size_mult or 1.0):.2f}")
                 shown += 1
                 if shown >= 8:
                     break
@@ -14163,6 +14239,306 @@ class SignalEngine(BaseEngine):
         except Exception as exc:
             lines.append(f"Status error: {type(exc).__name__}: {exc}")
         lines.append("Note: scanner/selector/risk/TP/SL/order safety paths are still the existing bot paths.")
+        return "\n".join(lines)
+
+    def _dual_alpha_strategy_params(self, strategy_params, branch):
+        params = copy.deepcopy(strategy_params if isinstance(strategy_params, dict) else {})
+        cfg = dict(params.get('UTBotFilteredBreakoutV1') or {})
+        branch = str(branch or '').lower()
+        if branch == ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND:
+            rsp_cfg = default_relative_strength_pullback_config()
+            nested = cfg.get('relative_strength_pullback_trend')
+            if isinstance(nested, dict):
+                rsp_cfg.update(nested)
+            rsp_cfg['entry_strategy'] = ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
+            rsp_cfg['relative_strength_pullback_trend_shadow_enabled'] = True
+            rsp_cfg['relative_strength_pullback_trend_live_enabled'] = True
+            rsp_cfg['relative_strength_pullback_trend_paper_enabled'] = False
+            cfg['entry_strategy'] = ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
+            cfg['relative_strength_pullback_trend'] = rsp_cfg
+            cfg['relative_strength_pullback_trend_shadow_enabled'] = True
+            cfg['relative_strength_pullback_trend_live_enabled'] = True
+            cfg['relative_strength_pullback_trend_paper_enabled'] = False
+            cfg['adaptive_timeframe_enabled'] = False
+            params['active_strategy'] = ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
+        else:
+            cfg['entry_strategy'] = ENTRY_STRATEGY_UT_BREAKOUT
+            cfg['relative_strength_pullback_trend_live_enabled'] = False
+            cfg['relative_strength_pullback_trend_paper_enabled'] = False
+            cfg['adaptive_timeframe_enabled'] = True
+            params['active_strategy'] = UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY
+        params['UTBotFilteredBreakoutV1'] = cfg
+        return params
+
+    def _dual_alpha_light(self, status, label):
+        status = status if isinstance(status, dict) else {}
+        side = str(status.get('accepted_side') or status.get('candidate_side') or status.get('candidate_signal') or '').lower()
+        reason = str(status.get('reason') or status.get('reject_code') or 'no recent decision')
+        stage = str(status.get('stage') or '').lower()
+        accepted = side in {'long', 'short'} and status.get('accepted_code') == 'ACCEPTED_ENTRY'
+        if accepted:
+            light = 'green'
+            state = 'READY'
+        elif status.get('reject_code'):
+            light = 'red'
+            state = 'BLOCKED'
+        elif stage in {'waiting', 'evaluate'} or reason:
+            light = 'yellow'
+            state = 'WAIT'
+        else:
+            light = 'gray'
+            state = 'NONE'
+        logs = status.get('rspt_decision', {}).get('logs') if isinstance(status.get('rspt_decision'), dict) else {}
+        if not isinstance(logs, dict):
+            logs = {}
+        setup_type = status.get('setup_type') or logs.get('setup_type') or status.get('candidate_type')
+        return {
+            'label': label,
+            'light': light,
+            'state': state,
+            'side': side or None,
+            'reason': reason,
+            'setup_type': setup_type,
+        }
+
+    def _dual_alpha_score(self, strategy_key, side, status, plan):
+        status = status if isinstance(status, dict) else {}
+        plan = plan if isinstance(plan, dict) else {}
+        score = None
+        for source in (status, plan, status.get('auto_scores') if isinstance(status.get('auto_scores'), dict) else {}):
+            if not isinstance(source, dict):
+                continue
+            for key in (
+                'profit_alpha_score',
+                'entry_edge_score',
+                'feature_score',
+                'feature_score_value',
+                'auto_selected_score',
+                'score',
+            ):
+                value = _safe_float_or_none(source.get(key))
+                if value is not None:
+                    score = max(score if score is not None else value, value)
+        if score is None:
+            score = 72.0
+        if strategy_key == ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND:
+            size_mult = _safe_float_or_none(
+                status.get('rspt_size_multiplier')
+                or plan.get('rspt_size_multiplier')
+                or plan.get('rspt_risk_multiplier')
+            )
+            if size_mult is not None:
+                score += max(0.0, min(1.0, size_mult)) * 8.0
+            setup_type = str(
+                status.get('setup_type')
+                or plan.get('rspt_setup_type')
+                or ''
+            )
+            if setup_type == 'breakout_continuation':
+                score += 3.0
+        else:
+            score += 2.0
+        if side not in {'long', 'short'}:
+            score -= 100.0
+        return float(score)
+
+    async def _calculate_dual_alpha_signal(
+        self,
+        symbol,
+        df,
+        strategy_params,
+        *,
+        force_reprocess=False,
+    ):
+        self._clear_utbot_filtered_breakout_entry_plan(symbol)
+        base_symbol = symbol
+        ut_params = self._dual_alpha_strategy_params(strategy_params, ENTRY_STRATEGY_UT_BREAKOUT)
+        ut_sig, ut_reason, ut_status = await self._calculate_utbot_filtered_breakout_signal(
+            base_symbol,
+            df,
+            ut_params,
+            force_reprocess=force_reprocess,
+        )
+        ut_status = dict(ut_status or self._utbreakout_diag_for_symbol(base_symbol) or {})
+        ut_plan = (
+            dict(self._get_utbot_filtered_breakout_entry_plan(base_symbol, ut_sig) or {})
+            if ut_sig in {'long', 'short'}
+            else None
+        )
+
+        rsp_params = self._dual_alpha_strategy_params(
+            strategy_params,
+            ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+        )
+        rsp_sig, rsp_reason, rsp_status = await self._calculate_relative_strength_pullback_signal(
+            base_symbol,
+            df,
+            rsp_params,
+            force_reprocess=force_reprocess,
+        )
+        rsp_status = dict(rsp_status or self._utbreakout_diag_for_symbol(base_symbol) or {})
+        rsp_symbol = rsp_status.get('plan_symbol') or rsp_status.get('symbol') or base_symbol
+        rsp_plan = (
+            dict(self._get_utbot_filtered_breakout_entry_plan(rsp_symbol, rsp_sig) or {})
+            if rsp_sig in {'long', 'short'}
+            else None
+        )
+
+        choices = []
+        if ut_sig in {'long', 'short'} and isinstance(ut_plan, dict):
+            choices.append({
+                'key': ENTRY_STRATEGY_UT_BREAKOUT,
+                'label': 'UTBreakout',
+                'side': ut_sig,
+                'reason': ut_reason,
+                'status': ut_status,
+                'plan': ut_plan,
+                'score': self._dual_alpha_score(ENTRY_STRATEGY_UT_BREAKOUT, ut_sig, ut_status, ut_plan),
+                'priority': 0,
+            })
+        if rsp_sig in {'long', 'short'} and isinstance(rsp_plan, dict):
+            choices.append({
+                'key': ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+                'label': 'RSPT',
+                'side': rsp_sig,
+                'reason': rsp_reason,
+                'status': rsp_status,
+                'plan': rsp_plan,
+                'score': self._dual_alpha_score(
+                    ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+                    rsp_sig,
+                    rsp_status,
+                    rsp_plan,
+                ),
+                'priority': 1,
+            })
+
+        choices.sort(key=lambda item: (-float(item.get('score') or 0.0), int(item.get('priority') or 0)))
+        selected = choices[0] if choices else None
+        final_status = dict((selected or {}).get('status') or rsp_status or ut_status or {})
+        if selected and isinstance(selected.get('plan'), dict):
+            selected_plan = dict(selected['plan'])
+            selected_plan['dual_alpha_selected_strategy'] = selected['key']
+            selected_plan['dual_alpha_score'] = selected['score']
+            if selected['key'] == ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND:
+                selected_plan['strategy'] = ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
+            else:
+                selected_plan['strategy'] = (
+                    selected_plan.get('strategy')
+                    if str(selected_plan.get('strategy') or '').lower() in UTBREAKOUT_STRATEGIES
+                    else UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY
+                )
+            self._set_utbot_filtered_breakout_entry_plan(
+                selected_plan.get('plan_symbol') or base_symbol,
+                selected_plan,
+            )
+
+        dual_summary = {
+            'enabled': True,
+            'utbreak': self._dual_alpha_light(ut_status, 'UTBreakout'),
+            'rspt': self._dual_alpha_light(rsp_status, 'RSPT'),
+            'selected': selected.get('key') if selected else None,
+            'selected_label': selected.get('label') if selected else None,
+            'selected_side': selected.get('side') if selected else None,
+            'selection_score': selected.get('score') if selected else None,
+            'utbreak_score': next((choice.get('score') for choice in choices if choice.get('key') == ENTRY_STRATEGY_UT_BREAKOUT), None),
+            'rspt_score': next((choice.get('score') for choice in choices if choice.get('key') == ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND), None),
+        }
+        final_status.update({
+            'strategy': STRATEGY_DISPLAY_NAMES.get(DUAL_ALPHA_STRATEGY, 'DUAL_ALPHA'),
+            'entry_strategy': DUAL_ALPHA_STRATEGY,
+            'dual_alpha_enabled': True,
+            'dual_selected_strategy': dual_summary['selected'],
+            'dual_alpha': dual_summary,
+        })
+        if selected:
+            final_status['accepted_code'] = 'ACCEPTED_ENTRY'
+            final_status['accepted_side'] = selected['side']
+            final_status['reason'] = (
+                f"DUAL_ALPHA selected {selected['label']} "
+                f"{selected['side'].upper()}: {selected['reason']}"
+            )
+            final_status['stage'] = 'entry_ready'
+            self._utbreakout_trace_event(
+                base_symbol,
+                'DUAL_ALPHA',
+                'SELECTED',
+                selected=selected['key'],
+                side=selected['side'],
+                score=round(float(selected.get('score') or 0.0), 2),
+            )
+        else:
+            final_status['reason'] = (
+                f"DUAL_ALPHA waiting: UT={ut_reason}; RSPT={rsp_reason}"
+            )
+            final_status['stage'] = 'waiting'
+            self._utbreakout_trace_event(
+                base_symbol,
+                'DUAL_ALPHA',
+                'WAIT',
+                ut_reason=ut_reason,
+                rspt_reason=rsp_reason,
+            )
+
+        canonical = self._canonical_futures_symbol(final_status.get('plan_symbol') or base_symbol)
+        if not isinstance(getattr(self, 'dual_alpha_last_status', None), dict):
+            self.dual_alpha_last_status = {}
+        self.dual_alpha_last_status[canonical] = dict(final_status)
+        self._store_utbot_filtered_breakout_status(canonical, final_status)
+        self.last_entry_reason[canonical] = final_status.get('reason')
+        if selected:
+            return selected['side'], final_status['reason'], final_status
+        return None, final_status['reason'], final_status
+
+    async def build_dual_alpha_status_text(self, symbol=None):
+        strategy_params = self.get_runtime_strategy_params()
+        active_strategy = str(strategy_params.get('active_strategy', '') or '').lower()
+        symbol = symbol or getattr(self, 'scanner_active_symbol', None) or getattr(self, 'utbreakout_last_status_symbol', None)
+        status = None
+        if symbol:
+            canonical = self._canonical_futures_symbol(symbol)
+            status = (
+                (getattr(self, 'dual_alpha_last_status', {}) or {}).get(canonical)
+                or self._utbreakout_diag_for_symbol(canonical)
+            )
+        status = status if isinstance(status, dict) else {}
+        dual = status.get('dual_alpha') if isinstance(status.get('dual_alpha'), dict) else {}
+
+        def _emoji(light):
+            return {
+                'green': '🟢',
+                'yellow': '🟡',
+                'red': '🔴',
+                'gray': '⚪',
+            }.get(str(light or '').lower(), '⚪')
+
+        def _line(item, fallback_label):
+            item = item if isinstance(item, dict) else {}
+            label = item.get('label') or fallback_label
+            side = str(item.get('side') or '-').upper()
+            state = item.get('state') or 'NONE'
+            setup = item.get('setup_type') or '-'
+            reason = item.get('reason') or 'no recent decision'
+            return f"{label}: {_emoji(item.get('light'))} {state} {side} / setup {setup} / {reason}"
+
+        lines = [
+            "DUAL Alpha status",
+            f"Active: {active_strategy == DUAL_ALPHA_STRATEGY}",
+            "Mode: UTBreakout + RSPT both watched, one selected, existing risk/TP/SL/order path.",
+            f"Symbol: {symbol or 'no recent symbol'}",
+        ]
+        if dual:
+            lines.append(_line(dual.get('utbreak'), 'UTBreakout'))
+            lines.append(_line(dual.get('rspt'), 'RSPT'))
+            selected = dual.get('selected_label') or dual.get('selected') or 'none'
+            selected_side = str(dual.get('selected_side') or '-').upper()
+            score = _safe_float_or_none(dual.get('selection_score'))
+            score_text = f" / score {score:.1f}" if score is not None else ""
+            lines.append(f"Selected: {selected} {selected_side}{score_text}")
+        else:
+            lines.append("UTBreakout: ⚪ NONE - / no recent dual evaluation")
+            lines.append("RSPT: ⚪ NONE - / no recent dual evaluation")
+            lines.append("Selected: none")
         return "\n".join(lines)
 
     async def _calculate_utbot_filtered_breakout_signal(
@@ -28470,6 +28846,16 @@ class SignalEngine(BaseEngine):
             )
             is_bullish = sig == 'long'
             is_bearish = sig == 'short'
+        elif active_strategy == DUAL_ALPHA_STRATEGY:
+            entry_mode = active_strategy
+            sig, entry_reason, _ = await self._calculate_dual_alpha_signal(
+                symbol,
+                df,
+                strategy_params,
+                force_reprocess=force_utbreakout_reprocess,
+            )
+            is_bullish = sig == 'long'
+            is_bearish = sig == 'short'
         elif active_strategy in UTBREAKOUT_STRATEGIES:
             entry_mode = active_strategy
             sig, entry_reason, _ = await self._calculate_utbot_filtered_breakout_signal(
@@ -38891,11 +39277,12 @@ class MainController:
                 engine.active_symbols.clear()
                 engine.relative_strength_pullback_states = {}
                 engine.relative_strength_pullback_last_decisions = {}
+                engine.relative_strength_pullback_eval_cache = {}
                 if not engine.running:
                     engine.start()
             return (
                 "RelativeStrengthPullbackTrend ON. "
-                "scanner/CoinSelector candidates only, signal 6h + HTF 1d, live order path enabled."
+                "scanner/CoinSelector candidates only, signal 4h + HTF 1d, live order path enabled."
             )
 
         async def _deactivate_relative_strength_pullback_strategy():
@@ -38920,7 +39307,85 @@ class MainController:
             if engine:
                 engine.relative_strength_pullback_states = {}
                 engine.relative_strength_pullback_last_decisions = {}
+                engine.relative_strength_pullback_eval_cache = {}
             return "RelativeStrengthPullbackTrend OFF. active strategy returned to UTBreakout default."
+
+        async def _activate_dual_alpha_strategy():
+            await _ensure_signal_engine_active()
+            self.is_paused = False
+            rsp_cfg = default_relative_strength_pullback_config()
+            rsp_cfg['entry_strategy'] = ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
+            rsp_cfg['relative_strength_pullback_trend_shadow_enabled'] = True
+            rsp_cfg['relative_strength_pullback_trend_live_enabled'] = True
+            rsp_cfg['relative_strength_pullback_trend_paper_enabled'] = False
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'active_strategy'],
+                DUAL_ALPHA_STRATEGY,
+            )
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'entry_strategy'],
+                ENTRY_STRATEGY_UT_BREAKOUT,
+            )
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend'],
+                rsp_cfg,
+            )
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend_shadow_enabled'],
+                True,
+            )
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend_live_enabled'],
+                True,
+            )
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend_paper_enabled'],
+                False,
+            )
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'],
+                True,
+            )
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'],
+                'auto',
+            )
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'auto_select_enabled'],
+                True,
+            )
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol'], '')
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
+            engine = self._reset_signal_engine_runtime_state(
+                reset_entry_cache=True,
+                reset_exit_cache=True,
+                reset_stateful_strategy=True,
+            )
+            if engine:
+                engine.scanner_active_symbol = None
+                engine.active_symbols.clear()
+                engine.relative_strength_pullback_states = {}
+                engine.relative_strength_pullback_last_decisions = {}
+                engine.relative_strength_pullback_eval_cache = {}
+                engine.dual_alpha_last_status = {}
+                if not engine.running:
+                    engine.start()
+            return (
+                "DUAL Alpha ON. UTBreakout + RSPT are both watched; "
+                "one selected plan uses the existing risk/TP/SL/order path with no extra small-cap limit."
+            )
+
+        async def _deactivate_dual_alpha_strategy():
+            notice = await _activate_utbreak_strategy()
+            engine = self.engines.get('signal')
+            if engine:
+                engine.relative_strength_pullback_eval_cache = {}
+                engine.dual_alpha_last_status = {}
+            return f"DUAL Alpha OFF. {notice}"
 
         async def _stop_utbreak_trading():
             await _ensure_signal_engine_active()
@@ -39298,6 +39763,8 @@ UTBot:
             active_label = "ON" if active_strategy in UTBREAKOUT_STRATEGIES else f"OFF ({active_strategy.upper()})"
             if active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY:
                 active_label = "ON (ADAPTIVE TF)"
+            elif active_strategy == DUAL_ALPHA_STRATEGY:
+                active_label = "ON (DUAL ALPHA)"
             last_reason = diag.get('reject_code') or diag.get('accepted_code') or diag.get('reason') or '대기'
             diag_summary = format_utbreakout_diagnostic_summary()
             set_id = normalize_utbreakout_set_id(cfg.get('active_set_id') or cfg.get('profile'), UTBREAKOUT_DEFAULT_SET_ID)
@@ -39309,6 +39776,9 @@ UTBot:
             adaptive_summary = diag.get('adaptive_timeframe_summary') or '아직 Adaptive TF 분석 기록 없음'
             strategy_adaptation_summary = diag.get('strategy_adaptation_summary') or '아직 전략 적응 기록 없음'
             menu_title = (
+                'UTBreak 전략 메뉴 (Dual Alpha)'
+                if active_strategy == DUAL_ALPHA_STRATEGY
+                else
                 'UTBreak 전략 메뉴 (Adaptive TF)'
                 if active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY
                 else 'UTBreak 전략 메뉴'
@@ -39445,6 +39915,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 `/utbreak tracefull [SYMBOL]` - 최근 진입 경로 전체 진단 보고서
 `/utbreak watchdog on|off` - 진입 가능 후 주문 미시도 진단 기록 ON/OFF (텔레그램 자동 발송 없음)
 `/utbreak bridge on|off` - ready plan을 live scanner의 entry()로 연결
+`/utbreak dual on|off|status` - UTBreakout + RSPT 듀얼 감시/신호등 상태
 """.strip()
 
         def _format_utbreakout_config_text(diff=False):
@@ -39558,6 +40029,11 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     InlineKeyboardButton("RSPT ON", callback_data="utb:rsp:on"),
                     InlineKeyboardButton("RSPT OFF", callback_data="utb:rsp:off"),
                     InlineKeyboardButton("RSPT STATUS", callback_data="utb:rsp_status")
+                ],
+                [
+                    InlineKeyboardButton("DUAL ON", callback_data="utb:dual:on"),
+                    InlineKeyboardButton("DUAL OFF", callback_data="utb:dual:off"),
+                    InlineKeyboardButton("DUAL STATUS", callback_data="utb:dual_status")
                 ],
                 [
                     InlineKeyboardButton("코인 감시 목록", callback_data="utb:watchlist")
@@ -39805,6 +40281,50 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     await query.answer("RSPT status 전송 실패", show_alert=True)
                 except Exception:
                     logger.debug("RSPT callback failure alert failed", exc_info=True)
+
+        async def _get_dual_alpha_status_text():
+            engine = self.engines.get('signal')
+            if not engine:
+                return "DUAL Alpha status\n\nSignal engine not found."
+            symbol = await _get_utbreakout_status_symbol_async()
+            return await engine.build_dual_alpha_status_text(symbol)
+
+        async def _send_dual_alpha_status(message):
+            if message is None:
+                return False
+            try:
+                text = await _get_dual_alpha_status_text()
+                await self._reply_long_text_with_document(
+                    message,
+                    text,
+                    reply_markup=_build_utbreakout_keyboard(),
+                    filename='dual_alpha_status.txt',
+                    caption='DUAL Alpha status',
+                    preview_suffix='DUAL Alpha status was sent as a file.',
+                )
+                return True
+            except Exception as exc:
+                logger.exception("DUAL Alpha status send failed")
+                try:
+                    await message.reply_text(
+                        f"DUAL Alpha status failed: {type(exc).__name__}: {exc}",
+                        reply_markup=_build_utbreakout_keyboard(),
+                    )
+                except Exception:
+                    logger.exception("DUAL Alpha status failure reply failed")
+                return False
+
+        async def _send_dual_alpha_status_from_callback(query):
+            await _show_utbreakout_callback_progress(
+                query,
+                "DUAL Alpha status 조회 중입니다. 완료되면 새 메시지/파일로 보냅니다.",
+            )
+            ok = await _send_dual_alpha_status(getattr(query, 'message', None))
+            if not ok:
+                try:
+                    await query.answer("DUAL Alpha status 전송 실패", show_alert=True)
+                except Exception:
+                    logger.debug("DUAL Alpha callback failure alert failed", exc_info=True)
 
         async def _edit_utbreakout_condition_status(query):
             text = await _get_utbreakout_condition_status_text()
@@ -40352,6 +40872,29 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                         reply_markup=_build_utbreakout_keyboard(),
                     )
                     return
+            elif action in {'dual', 'dualt', 'dualalpha', 'dual_alpha'}:
+                mode = str(args[1]).strip().lower() if len(args) > 1 else 'status'
+                if mode in {'on', 'enable', 'start', 'live'}:
+                    await u.message.reply_text(
+                        await _activate_dual_alpha_strategy(),
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=_build_utbreakout_keyboard(),
+                    )
+                elif mode in {'off', 'disable', 'stop'}:
+                    await u.message.reply_text(
+                        await _deactivate_dual_alpha_strategy(),
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=_build_utbreakout_keyboard(),
+                    )
+                elif mode in {'status', 'stat', 'menu', ''}:
+                    await _send_dual_alpha_status(u.message)
+                else:
+                    await u.message.reply_text(
+                        "Usage: `/utbreak dual on`, `/utbreak dual off`, `/utbreak dual status`",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=_build_utbreakout_keyboard(),
+                    )
+                    return
             elif action == 'set' or re.fullmatch(r'set\d+', action or '') or action in {'1', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'aggressive', 'conservative'}:
                 set_arg = args[1] if action == 'set' and len(args) > 1 else action
                 set_text = str(set_arg or '').strip().lower()
@@ -40784,8 +41327,22 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     await _send_relative_strength_pullback_status_from_callback(query)
                 return
 
+            if action in {'dual', 'dualt'}:
+                mode = str(value or '').lower()
+                if mode in {'on', 'enable', '1', 'true', 'live'}:
+                    await _edit_utbreakout_menu(query, await _activate_dual_alpha_strategy())
+                elif mode in {'off', 'disable', '0', 'false', 'stop'}:
+                    await _edit_utbreakout_menu(query, await _deactivate_dual_alpha_strategy())
+                else:
+                    await _send_dual_alpha_status_from_callback(query)
+                return
+
             if action == 'rsp_status':
                 await _send_relative_strength_pullback_status_from_callback(query)
+                return
+
+            if action == 'dual_status':
+                await _send_dual_alpha_status_from_callback(query)
                 return
 
             if action == 'set' or re.fullmatch(r'set\d+', action or ''):

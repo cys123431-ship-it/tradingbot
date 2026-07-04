@@ -36,25 +36,37 @@ def default_relative_strength_pullback_config():
         "relative_strength_pullback_trend_live_enabled": False,
         "relative_strength_pullback_trend_paper_enabled": False,
         "trend_htf": "1d",
-        "signal_tf": "6h",
+        "signal_tf": "4h",
         "entry_execution": "next_open",
         "donchian_length": 20,
+        "ema_pullback": 20,
         "ema_fast": 20,
         "ema_trend": 100,
         "ema_htf_fast": 50,
         "ema_htf": 200,
         "adx_length": 14,
+        "adx_pass": 20.0,
+        "adx_soft_min": 15.0,
+        "adx_soft_multiplier": 0.60,
         "adx_threshold": 20.0,
         "relative_strength_short_lookback_bars": 28,
         "relative_strength_long_lookback_bars": 120,
-        "relative_strength_block_quantile": 0.30,
-        "relative_strength_min_candidates": 4,
+        "relative_strength_block_quantile": 0.20,
+        "relative_strength_min_candidates": 2,
+        "rs_hard_filter_min_candidates": 10,
+        "rs_long_block_bottom_pct": 20.0,
+        "rs_short_block_top_pct": 20.0,
+        "relative_strength_soft_multiplier": 0.75,
         "atr_length": 14,
         "breakout_atr_max": 2.80,
         "breakout_wick_max_ratio": 0.45,
         "extreme_atr_pct": 6.0,
         "pullback_tolerance_atr": 0.50,
+        "pullback_confirmation_lookback": 1,
         "rebreakout_tolerance_atr": 0.20,
+        "stale_entry_minutes_4h": 30.0,
+        "stale_entry_minutes_6h": 45.0,
+        "stale_entry_minutes_1h": 10.0,
         "exclude_incomplete_live_candle": True,
     }
 
@@ -232,13 +244,22 @@ def _candidate_symbols(candidates):
 
 def _relative_strength_percentiles(symbols, signal_rows_by_symbol, cfg, now_ms=None):
     min_candidates = max(2, int(cfg.get("relative_strength_min_candidates", 4) or 4))
+    candidate_count = len(symbols)
     if len(symbols) < min_candidates:
-        return {symbol: {"percentile": None, "reason": "skipped_few_candidates"} for symbol in symbols}
+        return {
+            symbol: {
+                "percentile": None,
+                "reason": "skipped_few_candidates",
+                "candidate_count": candidate_count,
+                "ranked_count": 0,
+            }
+            for symbol in symbols
+        }
     short_lb = int(cfg.get("relative_strength_short_lookback_bars", 28) or 28)
     long_lb = int(cfg.get("relative_strength_long_lookback_bars", 120) or 120)
     values = []
     for symbol in symbols:
-        rows = _closed_rows(signal_rows_by_symbol.get(symbol, []), cfg.get("signal_tf", "6h"), cfg, now_ms)
+        rows = _closed_rows(signal_rows_by_symbol.get(symbol, []), cfg.get("signal_tf", "4h"), cfg, now_ms)
         short_ret = _return_over_rows(rows, short_lb)
         long_ret = _return_over_rows(rows, long_lb)
         if short_ret is None or long_ret is None:
@@ -246,14 +267,39 @@ def _relative_strength_percentiles(symbols, signal_rows_by_symbol, cfg, now_ms=N
         score = 0.60 * long_ret + 0.40 * short_ret
         values.append((symbol, score))
     if len(values) < min_candidates:
-        return {symbol: {"percentile": None, "reason": "skipped_insufficient_rs_data"} for symbol in symbols}
+        return {
+            symbol: {
+                "percentile": None,
+                "reason": "skipped_insufficient_rs_data",
+                "candidate_count": candidate_count,
+                "ranked_count": len(values),
+            }
+            for symbol in symbols
+        }
     values.sort(key=lambda item: item[1])
     denom = max(len(values) - 1, 1)
     percentiles = {
-        symbol: {"percentile": rank / denom, "score": score, "reason": "ok"}
+        symbol: {
+            "percentile": rank / denom,
+            "score": score,
+            "reason": "ok",
+            "candidate_count": candidate_count,
+            "ranked_count": len(values),
+        }
         for rank, (symbol, score) in enumerate(values)
     }
-    return {symbol: percentiles.get(symbol, {"percentile": None, "reason": "missing_rs_data"}) for symbol in symbols}
+    return {
+        symbol: percentiles.get(
+            symbol,
+            {
+                "percentile": None,
+                "reason": "missing_rs_data",
+                "candidate_count": candidate_count,
+                "ranked_count": len(values),
+            },
+        )
+        for symbol in symbols
+    }
 
 
 def _trend_side(signal_rows, htf_rows, cfg):
@@ -262,10 +308,10 @@ def _trend_side(signal_rows, htf_rows, cfg):
     htf_ema_slow = _ema([_row_value(row, "close") for row in htf_rows], cfg.get("ema_htf", 200))
     signal_close = _row_value(signal_rows[-1], "close")
     signal_closes = [_row_value(row, "close") for row in signal_rows]
-    signal_ema_fast = _ema(signal_closes, cfg.get("ema_fast", 20))
+    signal_ema_fast = _ema(signal_closes, cfg.get("ema_pullback", cfg.get("ema_fast", 20)))
     signal_ema_trend = _ema(signal_closes, cfg.get("ema_trend", 100))
     adx = _adx(signal_rows, cfg.get("adx_length", 14))
-    adx_threshold = _finite_float(cfg.get("adx_threshold"), 20.0)
+    adx_threshold = _finite_float(cfg.get("adx_pass", cfg.get("adx_threshold")), 20.0)
     return {
         "long_htf": bool(htf_ema_slow and htf_close > htf_ema_slow) or bool(htf_ema_fast and htf_ema_slow and htf_ema_fast > htf_ema_slow),
         "short_htf": bool(htf_ema_slow and htf_close < htf_ema_slow) or bool(htf_ema_fast and htf_ema_slow and htf_ema_fast < htf_ema_slow),
@@ -273,11 +319,156 @@ def _trend_side(signal_rows, htf_rows, cfg):
         "short_signal": bool(signal_ema_fast and signal_ema_trend and signal_close < signal_ema_fast and signal_close < signal_ema_trend),
         "adx": adx,
         "adx_passed": adx is not None and adx >= adx_threshold,
+        "adx_threshold": adx_threshold,
         "signal_ema_fast": signal_ema_fast,
+        "signal_ema_pullback": signal_ema_fast,
         "signal_ema_trend": signal_ema_trend,
         "htf_ema_fast": htf_ema_fast,
         "htf_ema_slow": htf_ema_slow,
     }
+
+
+def _pct_to_fraction(value, default_pct):
+    parsed = _finite_float(value, default_pct)
+    if parsed > 1.0:
+        parsed /= 100.0
+    return max(0.0, min(1.0, parsed))
+
+
+def _adx_gate(adx, cfg):
+    pass_level = _finite_float(cfg.get("adx_pass", cfg.get("adx_threshold")), 20.0)
+    soft_min = _finite_float(cfg.get("adx_soft_min"), 15.0)
+    soft_multiplier = max(0.0, min(1.0, _finite_float(cfg.get("adx_soft_multiplier"), 0.60)))
+    if adx is None or adx < soft_min:
+        return {
+            "passed": False,
+            "reason": "adx_too_low",
+            "risk_multiplier": 0.0,
+            "state": "blocked",
+        }
+    if adx < pass_level:
+        return {
+            "passed": True,
+            "reason": "adx_weak_size_reduced",
+            "risk_multiplier": soft_multiplier,
+            "state": "reduced",
+        }
+    return {
+        "passed": True,
+        "reason": "adx_passed",
+        "risk_multiplier": 1.0,
+        "state": "passed",
+    }
+
+
+def _relative_strength_gate(side, rs, cfg):
+    pct = rs.get("percentile")
+    candidate_count = int(rs.get("candidate_count", 0) or 0)
+    hard_min = max(2, int(cfg.get("rs_hard_filter_min_candidates", 10) or 10))
+    long_block = _pct_to_fraction(cfg.get("rs_long_block_bottom_pct"), 20.0)
+    short_block = _pct_to_fraction(cfg.get("rs_short_block_top_pct"), 20.0)
+    soft_multiplier = max(0.0, min(1.0, _finite_float(cfg.get("relative_strength_soft_multiplier"), 0.75)))
+    if pct is None:
+        return {
+            "passed": True,
+            "reason": rs.get("reason", "missing_rs_data"),
+            "risk_multiplier": 1.0,
+            "hard_filter_applied": False,
+        }
+    hard_filter_applies = candidate_count >= hard_min
+    adverse = (side == "long" and pct < long_block) or (side == "short" and pct > 1.0 - short_block)
+    if hard_filter_applies and adverse:
+        return {
+            "passed": False,
+            "reason": "relative_strength_hard_block",
+            "risk_multiplier": 0.0,
+            "hard_filter_applied": True,
+        }
+    if adverse:
+        return {
+            "passed": True,
+            "reason": "relative_strength_size_reduced",
+            "risk_multiplier": soft_multiplier,
+            "hard_filter_applied": False,
+        }
+    return {
+        "passed": True,
+        "reason": "relative_strength_passed",
+        "risk_multiplier": 1.0,
+        "hard_filter_applied": hard_filter_applies,
+    }
+
+
+def _stale_entry_limit_minutes(signal_tf, cfg):
+    text = str(signal_tf or "4h").strip().lower()
+    key = "stale_entry_minutes_" + text
+    defaults = {"1h": 10.0, "4h": 30.0, "6h": 45.0}
+    return max(0.0, _finite_float(cfg.get(key), defaults.get(text, 30.0)))
+
+
+def _stale_signal_reason(row, cfg, now_ms=None):
+    if now_ms is None:
+        return None
+    tf = str(cfg.get("signal_tf", "4h") or "4h").strip().lower()
+    tf_ms = _timeframe_to_ms(tf)
+    row_ts = _timestamp_ms(row.get("timestamp") if isinstance(row, dict) else 0.0)
+    current_ms = _timestamp_ms(now_ms)
+    if tf_ms <= 0 or row_ts <= 0 or current_ms <= 0:
+        return None
+    close_ts = row_ts + tf_ms
+    if current_ms <= close_ts:
+        return None
+    allowed_ms = _stale_entry_limit_minutes(tf, cfg) * 60_000.0
+    if allowed_ms > 0 and current_ms - close_ts > allowed_ms:
+        return {
+            "reason": "stale_signal",
+            "signal_close_ts": close_ts,
+            "elapsed_minutes": (current_ms - close_ts) / 60_000.0,
+            "allowed_minutes": allowed_ms / 60_000.0,
+        }
+    return None
+
+
+def _trend_pullback_setup(side, row, prev, donchian, atr, trend, cfg):
+    close = _row_value(row, "close")
+    open_ = _row_value(row, "open", close)
+    high = _row_value(row, "high")
+    low = _row_value(row, "low")
+    prev_high = _row_value(prev, "high")
+    prev_low = _row_value(prev, "low")
+    ema_pullback = trend.get("signal_ema_pullback")
+    if ema_pullback is None or donchian is None or atr is None or atr <= 0:
+        return False, {"reason": "no_pullback_setup"}
+    tolerance = atr * _finite_float(cfg.get("pullback_tolerance_atr"), 0.50)
+    if side == "long":
+        pullback_target = max(float(ema_pullback), float(donchian["mid"]))
+        near_pullback = low <= pullback_target + tolerance
+        confirmation = close > open_ or close > prev_high
+    else:
+        pullback_target = min(float(ema_pullback), float(donchian["mid"]))
+        near_pullback = high >= pullback_target - tolerance
+        confirmation = close < open_ or close < prev_low
+    return bool(near_pullback and confirmation), {
+        "reason": "trend_pullback" if near_pullback and confirmation else "no_pullback_setup",
+        "pullback_target": pullback_target,
+        "pullback_tolerance": tolerance,
+        "pullback_near": bool(near_pullback),
+        "pullback_confirmation": bool(confirmation),
+    }
+
+
+def _breakout_continuation_setup(side, row, donchian, atr, cfg):
+    close = _row_value(row, "close")
+    if side == "long":
+        breakout_now = close > _finite_float(donchian.get("high"), 0.0)
+    else:
+        breakout_now = close < _finite_float(donchian.get("low"), 0.0)
+    if not breakout_now:
+        return False, {"reason": "no_breakout_setup", "breakout_now": False}
+    extension_reason = _extended_candle_block(row, atr, side, cfg)
+    if extension_reason:
+        return False, {"reason": extension_reason, "breakout_now": True}
+    return True, {"reason": "breakout_continuation", "breakout_now": True}
 
 
 def _extended_candle_block(row, atr, side, cfg):
@@ -301,7 +492,7 @@ def _extended_candle_block(row, atr, side, cfg):
     return None
 
 
-def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg):
+def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None):
     base_logs = {
         "scanner_passed": True,
         "symbol": symbol,
@@ -327,13 +518,12 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg):
 
     rs_pct = rs.get("percentile")
     rs_reason = rs.get("reason", "missing")
-    q = _finite_float(cfg.get("relative_strength_block_quantile"), 0.30)
-    long_rs_passed = rs_pct is None or rs_pct >= q
-    short_rs_passed = rs_pct is None or rs_pct <= 1.0 - q
+    long_trend = bool(trend["long_htf"] and trend["long_signal"])
+    short_trend = bool(trend["short_htf"] and trend["short_signal"])
     candidate_sides = []
-    if trend["long_htf"] and trend["long_signal"] and trend["adx_passed"] and long_rs_passed:
+    if long_trend:
         candidate_sides.append("long")
-    if trend["short_htf"] and trend["short_signal"] and trend["adx_passed"] and short_rs_passed:
+    if short_trend:
         candidate_sides.append("short")
 
     logs = {
@@ -342,81 +532,128 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg):
         "htf_trend_passed_short": trend["short_htf"],
         "signal_tf_trend_passed_long": trend["long_signal"],
         "signal_tf_trend_passed_short": trend["short_signal"],
+        "trend_filter_passed_long": long_trend,
+        "trend_filter_passed_short": short_trend,
         "adx_passed": trend["adx_passed"],
         "adx": trend["adx"],
+        "adx_pass": trend["adx_threshold"],
         "relative_strength_percentile": rs_pct,
         "relative_strength_reason": rs_reason,
-        "relative_strength_passed_long": long_rs_passed,
-        "relative_strength_passed_short": short_rs_passed,
+        "relative_strength_candidate_count": rs.get("candidate_count"),
+        "relative_strength_ranked_count": rs.get("ranked_count"),
     }
 
     if not candidate_sides:
-        if rs_pct is not None and not long_rs_passed and trend["long_htf"] and trend["long_signal"]:
-            reason = "relative_strength_too_weak_for_long"
-        elif rs_pct is not None and not short_rs_passed and trend["short_htf"] and trend["short_signal"]:
-            reason = "relative_strength_too_strong_for_short"
-        elif not trend["adx_passed"]:
-            reason = "adx_below_threshold"
-        else:
-            reason = "trend_filters_not_met"
+        reason = "trend_filter_failed"
         return PullbackTrendDecision(symbol, reason=reason, logs={**logs, "rejected_reason": reason})
 
-    state = dict(state or {})
     for side in candidate_sides:
-        extension_reason = _extended_candle_block(row, atr, side, cfg)
-        if extension_reason:
-            return PullbackTrendDecision(symbol, side=side, reason=extension_reason, logs={**logs, "rejected_reason": extension_reason})
+        adx_gate = _adx_gate(trend.get("adx"), cfg)
+        if not adx_gate["passed"]:
+            return PullbackTrendDecision(
+                symbol,
+                side=side,
+                reason="adx_too_low",
+                logs={
+                    **logs,
+                    "adx_state": adx_gate["state"],
+                    "adx_size_multiplier": adx_gate["risk_multiplier"],
+                    "rejected_reason": "adx_too_low",
+                },
+            )
 
-        if side == "long":
-            breakout_now = close > donchian["high"]
-            prior_breakout = state.get("breakout_side") == "long"
-            near_pullback = low <= max(trend["signal_ema_fast"], donchian["mid"]) + atr * _finite_float(cfg.get("pullback_tolerance_atr"), 0.50)
-            confirmation = close > open_ or close > _row_value(prev, "high")
-            rebreakout = high >= max(donchian["high"], _finite_float(state.get("breakout_price"), donchian["high"])) + atr * _finite_float(cfg.get("rebreakout_tolerance_atr"), 0.20)
-            if prior_breakout and ((near_pullback and confirmation) or rebreakout):
-                return PullbackTrendDecision(
-                    symbol,
-                    side="long",
-                    entry_ready=True,
-                    entry_execution=cfg.get("entry_execution", "next_open"),
-                    reason="pullback_or_rebreakout_confirmed",
-                    logs={**logs, "breakout_confirmed": True, "pullback_confirmed": bool(near_pullback and confirmation), "rebreakout_confirmed": bool(rebreakout)},
-                )
-            if breakout_now:
-                return PullbackTrendDecision(
-                    symbol,
-                    side="long",
-                    entry_ready=False,
-                    reason="waiting_for_pullback",
-                    logs={**logs, "breakout_confirmed": True, "waiting_for_pullback": True, "rejected_reason": "waiting_for_pullback"},
-                    state_update={"breakout_side": "long", "breakout_price": close, "breakout_ts": row.get("timestamp")},
-                )
-        else:
-            breakdown_now = close < donchian["low"]
-            prior_breakdown = state.get("breakout_side") == "short"
-            near_pullback = high >= min(trend["signal_ema_fast"], donchian["mid"]) - atr * _finite_float(cfg.get("pullback_tolerance_atr"), 0.50)
-            confirmation = close < open_ or close < _row_value(prev, "low")
-            rebreakdown = low <= min(donchian["low"], _finite_float(state.get("breakout_price"), donchian["low"])) - atr * _finite_float(cfg.get("rebreakout_tolerance_atr"), 0.20)
-            if prior_breakdown and ((near_pullback and confirmation) or rebreakdown):
-                return PullbackTrendDecision(
-                    symbol,
-                    side="short",
-                    entry_ready=True,
-                    entry_execution=cfg.get("entry_execution", "next_open"),
-                    reason="pullback_or_rebreakout_confirmed",
-                    logs={**logs, "breakout_confirmed": True, "pullback_confirmed": bool(near_pullback and confirmation), "rebreakout_confirmed": bool(rebreakdown)},
-                )
-            if breakdown_now:
-                return PullbackTrendDecision(
-                    symbol,
-                    side="short",
-                    entry_ready=False,
-                    reason="waiting_for_pullback",
-                    logs={**logs, "breakout_confirmed": True, "waiting_for_pullback": True, "rejected_reason": "waiting_for_pullback"},
-                    state_update={"breakout_side": "short", "breakout_price": close, "breakout_ts": row.get("timestamp")},
-                )
+        rs_gate = _relative_strength_gate(side, rs, cfg)
+        side_logs = {
+            **logs,
+            "side": side,
+            "adx_state": adx_gate["state"],
+            "adx_size_multiplier": adx_gate["risk_multiplier"],
+            "relative_strength_gate_reason": rs_gate["reason"],
+            "relative_strength_hard_filter_applied": rs_gate["hard_filter_applied"],
+            "relative_strength_size_multiplier": rs_gate["risk_multiplier"],
+            "relative_strength_passed": rs_gate["passed"],
+        }
+        if not rs_gate["passed"]:
+            return PullbackTrendDecision(
+                symbol,
+                side=side,
+                reason="relative_strength_hard_block",
+                logs={**side_logs, "rejected_reason": "relative_strength_hard_block"},
+            )
 
-    return PullbackTrendDecision(symbol, reason="no_breakout_or_pullback", logs={**logs, "rejected_reason": "no_breakout_or_pullback"})
+        stale = _stale_signal_reason(row, cfg, now_ms)
+        if stale:
+            return PullbackTrendDecision(
+                symbol,
+                side=side,
+                reason="stale_signal",
+                logs={**side_logs, **stale, "rejected_reason": "stale_signal"},
+            )
+
+        size_multiplier = min(
+            1.0,
+            max(0.0, float(adx_gate["risk_multiplier"])),
+            max(0.0, float(rs_gate["risk_multiplier"])),
+        )
+        size_reduction_reasons = [
+            reason
+            for reason in (adx_gate["reason"], rs_gate["reason"])
+            if reason in {"adx_weak_size_reduced", "relative_strength_size_reduced"}
+        ]
+
+        breakout_ok, breakout_detail = _breakout_continuation_setup(side, row, donchian, atr, cfg)
+        if breakout_ok:
+            return PullbackTrendDecision(
+                symbol,
+                side=side,
+                entry_ready=True,
+                entry_execution=cfg.get("entry_execution", "next_open"),
+                reason="breakout_continuation_confirmed",
+                logs={
+                    **side_logs,
+                    **breakout_detail,
+                    "setup_type": "breakout_continuation",
+                    "size_multiplier": size_multiplier,
+                    "risk_multiplier": size_multiplier,
+                    "size_reduction_reasons": size_reduction_reasons,
+                    "rejected_reason": None,
+                },
+            )
+
+        pullback_ok, pullback_detail = _trend_pullback_setup(side, row, prev, donchian, atr, trend, cfg)
+        if pullback_ok:
+            return PullbackTrendDecision(
+                symbol,
+                side=side,
+                entry_ready=True,
+                entry_execution=cfg.get("entry_execution", "next_open"),
+                reason="trend_pullback_confirmed",
+                logs={
+                    **side_logs,
+                    **pullback_detail,
+                    "setup_type": "trend_pullback",
+                    "size_multiplier": size_multiplier,
+                    "risk_multiplier": size_multiplier,
+                    "size_reduction_reasons": size_reduction_reasons,
+                    "rejected_reason": None,
+                },
+            )
+
+        rejected_reasons = [pullback_detail.get("reason", "no_pullback_setup"), breakout_detail.get("reason", "no_breakout_setup")]
+        return PullbackTrendDecision(
+            symbol,
+            side=side,
+            reason="no_entry_setup",
+            logs={
+                **side_logs,
+                "pullback_detail": pullback_detail,
+                "breakout_detail": breakout_detail,
+                "rejected_reason": ";".join(rejected_reasons),
+                "rejected_reasons": rejected_reasons,
+            },
+        )
+
+    return PullbackTrendDecision(symbol, reason="trend_filter_failed", logs={**logs, "rejected_reason": "trend_filter_failed"})
 
 
 def evaluate_relative_strength_pullback_trend(
@@ -435,9 +672,9 @@ def evaluate_relative_strength_pullback_trend(
     state_by_symbol = state_by_symbol or {}
     decisions = []
     for symbol in symbols:
-        signal_rows = _closed_rows((signal_rows_by_symbol or {}).get(symbol, []), cfg.get("signal_tf", "6h"), cfg, now_ms)
+        signal_rows = _closed_rows((signal_rows_by_symbol or {}).get(symbol, []), cfg.get("signal_tf", "4h"), cfg, now_ms)
         htf_rows = _closed_rows((htf_rows_by_symbol or {}).get(symbol, []), cfg.get("trend_htf", "1d"), cfg, now_ms)
-        decisions.append(_evaluate_symbol(symbol, signal_rows, htf_rows, rs.get(symbol, {}), state_by_symbol.get(symbol), cfg))
+        decisions.append(_evaluate_symbol(symbol, signal_rows, htf_rows, rs.get(symbol, {}), state_by_symbol.get(symbol), cfg, now_ms))
     return decisions
 
 

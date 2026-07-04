@@ -1,6 +1,7 @@
 from utbreakout.relative_strength_pullback import (
     ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
     ENTRY_STRATEGY_UT_BREAKOUT,
+    _adx_gate,
     default_relative_strength_pullback_config,
     evaluate_relative_strength_pullback_trend,
     resolve_entry_strategy,
@@ -35,7 +36,8 @@ def _base_config(**overrides):
     cfg = default_relative_strength_pullback_config()
     cfg.update({
         "relative_strength_min_candidates": 1,
-        "adx_threshold": 10.0,
+        "adx_pass": 10.0,
+        "adx_soft_min": 5.0,
         "breakout_atr_max": 20.0,
         "extreme_atr_pct": 99.0,
     })
@@ -47,6 +49,8 @@ def test_defaults_keep_new_strategy_shadow_only():
     cfg = default_relative_strength_pullback_config()
 
     assert cfg["entry_strategy"] == ENTRY_STRATEGY_UT_BREAKOUT
+    assert cfg["signal_tf"] == "4h"
+    assert cfg["trend_htf"] == "1d"
     assert cfg["relative_strength_pullback_trend_shadow_enabled"] is True
     assert cfg["relative_strength_pullback_trend_live_enabled"] is False
     assert cfg["relative_strength_pullback_trend_paper_enabled"] is False
@@ -92,49 +96,59 @@ def test_single_candidate_skips_relative_strength_instead_of_self_ranking_bottom
         config=_base_config(relative_strength_min_candidates=1),
     )
 
-    assert decisions[0].reason == "waiting_for_pullback"
+    assert decisions[0].entry_ready is True
     assert decisions[0].logs["relative_strength_reason"] == "skipped_few_candidates"
 
 
-def test_long_blocks_bottom_relative_strength_candidate():
-    candidates = ["WEAK/USDT:USDT", "MID/USDT:USDT", "GOOD/USDT:USDT", "BEST/USDT:USDT"]
-    slopes = [0.02, 0.06, 0.10, 0.14]
-    signal = {symbol: _rows(130, 100.0, slope) for symbol, slope in zip(candidates, slopes)}
+def _breakout_rows(start, slope, *, side="long"):
+    rows = _rows(130, start, slope)
+    prev = rows[-21:-1]
+    if side == "long":
+        prev_high = max(row["high"] for row in prev)
+        return _with_last(rows, open=prev_high + 0.05, high=prev_high + 0.45, low=prev_high - 0.05, close=prev_high + 0.30)
+    prev_low = min(row["low"] for row in prev)
+    return _with_last(rows, open=prev_low - 0.05, high=prev_low + 0.05, low=prev_low - 0.45, close=prev_low - 0.30)
+
+
+def test_long_hard_blocks_bottom_relative_strength_only_with_enough_candidates():
+    candidates = [f"COIN{idx}/USDT:USDT" for idx in range(10)]
+    slopes = [0.02 + idx * 0.015 for idx in range(10)]
+    signal = {symbol: _breakout_rows(100.0, slope, side="long") for symbol, slope in zip(candidates, slopes)}
     htf = {symbol: _rows(220, 100.0, 0.10, timestamp_step=86_400_000) for symbol in candidates}
 
     decisions = evaluate_relative_strength_pullback_trend(
         candidates,
         signal,
         htf,
-        config=_base_config(relative_strength_min_candidates=4, relative_strength_block_quantile=0.30),
+        config=_base_config(relative_strength_min_candidates=10, rs_hard_filter_min_candidates=10),
     )
-    weak = next(decision for decision in decisions if decision.symbol.startswith("WEAK/"))
+    weak = next(decision for decision in decisions if decision.symbol.startswith("COIN0/"))
 
     assert weak.entry_ready is False
-    assert weak.reason == "relative_strength_too_weak_for_long"
-    assert weak.logs["relative_strength_passed_long"] is False
+    assert weak.reason == "relative_strength_hard_block"
+    assert weak.logs["rejected_reason"] == "relative_strength_hard_block"
 
 
-def test_short_blocks_top_relative_strength_candidate():
-    candidates = ["STRONG/USDT:USDT", "MID/USDT:USDT", "WEAK/USDT:USDT", "WORST/USDT:USDT"]
-    slopes = [-0.02, -0.06, -0.10, -0.14]
-    signal = {symbol: _rows(130, 120.0, slope) for symbol, slope in zip(candidates, slopes)}
+def test_short_hard_blocks_top_relative_strength_only_with_enough_candidates():
+    candidates = [f"COIN{idx}/USDT:USDT" for idx in range(10)]
+    slopes = [-0.02 - idx * 0.015 for idx in range(10)]
+    signal = {symbol: _breakout_rows(120.0, slope, side="short") for symbol, slope in zip(candidates, slopes)}
     htf = {symbol: _rows(220, 120.0, -0.10, timestamp_step=86_400_000) for symbol in candidates}
 
     decisions = evaluate_relative_strength_pullback_trend(
         candidates,
         signal,
         htf,
-        config=_base_config(relative_strength_min_candidates=4, relative_strength_block_quantile=0.30),
+        config=_base_config(relative_strength_min_candidates=10, rs_hard_filter_min_candidates=10),
     )
-    strong = next(decision for decision in decisions if decision.symbol.startswith("STRONG/"))
+    strong = next(decision for decision in decisions if decision.symbol.startswith("COIN0/"))
 
     assert strong.entry_ready is False
-    assert strong.reason == "relative_strength_too_strong_for_short"
-    assert strong.logs["relative_strength_passed_short"] is False
+    assert strong.reason == "relative_strength_hard_block"
+    assert strong.logs["rejected_reason"] == "relative_strength_hard_block"
 
 
-def test_donchian_breakout_waits_for_pullback_instead_of_chasing():
+def test_breakout_continuation_enters_without_waiting_for_pullback():
     symbol = "PULL/USDT:USDT"
     base = _rows(130, 100.0, 0.06)
     rows = _with_last(base, open=108.0, high=112.0, low=107.5, close=111.5)
@@ -147,22 +161,20 @@ def test_donchian_breakout_waits_for_pullback_instead_of_chasing():
     )
     decision = decisions[0]
 
-    assert decision.entry_ready is False
-    assert decision.reason == "waiting_for_pullback"
-    assert decision.state_update["breakout_side"] == "long"
-    assert decision.logs["waiting_for_pullback"] is True
+    assert decision.entry_ready is True
+    assert decision.reason == "breakout_continuation_confirmed"
+    assert decision.logs["setup_type"] == "breakout_continuation"
 
 
-def test_pullback_after_breakout_is_next_open_entry_candidate():
+def test_trend_pullback_enters_without_prior_breakout_state():
     symbol = "PULL/USDT:USDT"
     base = _rows(130, 100.0, 0.06)
-    rows = _with_last(base, open=107.0, high=108.2, low=106.0, close=108.0)
+    rows = _with_last(base, open=107.2, high=107.7, low=106.2, close=107.6)
 
     decisions = evaluate_relative_strength_pullback_trend(
         [symbol],
         {symbol: rows},
         {symbol: _rows(220, 100.0, 0.10, timestamp_step=86_400_000)},
-        state_by_symbol={symbol: {"breakout_side": "long", "breakout_price": 111.5}},
         config=_base_config(),
     )
     decision = decisions[0]
@@ -170,7 +182,56 @@ def test_pullback_after_breakout_is_next_open_entry_candidate():
     assert decision.entry_ready is True
     assert decision.side == "long"
     assert decision.entry_execution == "next_open"
-    assert decision.reason == "pullback_or_rebreakout_confirmed"
+    assert decision.reason == "trend_pullback_confirmed"
+    assert decision.logs["setup_type"] == "trend_pullback"
+
+
+def test_adx_soft_zone_reduces_size_instead_of_hard_blocking():
+    gate = _adx_gate(17.0, default_relative_strength_pullback_config())
+
+    assert gate["passed"] is True
+    assert gate["reason"] == "adx_weak_size_reduced"
+    assert 0.0 < gate["risk_multiplier"] < 1.0
+
+
+def test_small_candidate_set_uses_relative_strength_size_reduction_not_hard_block():
+    candidates = ["WEAK/USDT:USDT", "MID/USDT:USDT", "GOOD/USDT:USDT", "BEST/USDT:USDT"]
+    slopes = [0.02, 0.06, 0.10, 0.14]
+    signal = {symbol: _breakout_rows(100.0, slope, side="long") for symbol, slope in zip(candidates, slopes)}
+    htf = {symbol: _rows(220, 100.0, 0.10, timestamp_step=86_400_000) for symbol in candidates}
+
+    decisions = evaluate_relative_strength_pullback_trend(
+        candidates,
+        signal,
+        htf,
+        config=_base_config(relative_strength_min_candidates=4, rs_hard_filter_min_candidates=10),
+    )
+    weak = next(decision for decision in decisions if decision.symbol.startswith("WEAK/"))
+
+    assert weak.entry_ready is True
+    assert weak.logs["relative_strength_gate_reason"] == "relative_strength_size_reduced"
+    assert weak.logs["size_multiplier"] < 1.0
+
+
+def test_stale_signal_is_rejected_after_configured_entry_window():
+    symbol = "STALE/USDT:USDT"
+    tf_ms = 14_400_000
+    rows = _breakout_rows(100.0, 0.06, side="long")
+    for idx, row in enumerate(rows):
+        row["timestamp"] = idx * tf_ms
+    last_close_ms = rows[-1]["timestamp"] + tf_ms
+
+    decisions = evaluate_relative_strength_pullback_trend(
+        [symbol],
+        {symbol: rows},
+        {symbol: _rows(220, 100.0, 0.10, timestamp_step=86_400_000)},
+        config=_base_config(signal_tf="4h", stale_entry_minutes_4h=30),
+        now_ms=last_close_ms + 31 * 60_000,
+    )
+
+    assert decisions[0].entry_ready is False
+    assert decisions[0].reason == "stale_signal"
+    assert decisions[0].logs["rejected_reason"] == "stale_signal"
 
 
 def test_unfinished_last_candle_is_excluded_from_signal_calculation():
