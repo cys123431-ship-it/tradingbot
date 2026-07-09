@@ -13739,6 +13739,10 @@ class SignalEngine(BaseEngine):
             'relative_strength_pullback_trend_shadow_enabled',
             'relative_strength_pullback_trend_live_enabled',
             'relative_strength_pullback_trend_paper_enabled',
+            'forced_direction',
+            'rspt_forced_direction',
+            'direction_source',
+            'rspt_direction_source',
         ):
             if key in source:
                 base[key] = source[key]
@@ -13844,6 +13848,8 @@ class SignalEngine(BaseEngine):
             tuple(symbol_values),
             signal_tf,
             htf_tf,
+            str(rsp_cfg.get('forced_direction') or rsp_cfg.get('rspt_forced_direction') or '').lower(),
+            str(rsp_cfg.get('direction_source') or rsp_cfg.get('rspt_direction_source') or '').lower(),
             int(time.time() // 60),
         )
         cached = self.relative_strength_pullback_eval_cache.get(cache_key)
@@ -13928,7 +13934,24 @@ class SignalEngine(BaseEngine):
                 return decision
         return None
 
-    async def _calculate_relative_strength_pullback_signal(
+    def _normalize_relative_strength_pullback_direction(self, value):
+        text = str(value or '').strip().lower()
+        if text in {'long', 'buy', 'bull', 'bullish'}:
+            return 'long'
+        if text in {'short', 'sell', 'bear', 'bearish'}:
+            return 'short'
+        return None
+
+    def _extract_relative_strength_pullback_ut_direction(self, sig=None, status=None):
+        side = self._normalize_relative_strength_pullback_direction(sig)
+        if side:
+            return side
+        status = status if isinstance(status, dict) else {}
+        if status.get('accepted_code') == 'ACCEPTED_ENTRY':
+            return self._normalize_relative_strength_pullback_direction(status.get('accepted_side'))
+        return None
+
+    async def _resolve_relative_strength_pullback_ut_direction(
         self,
         symbol,
         df,
@@ -13936,9 +13959,52 @@ class SignalEngine(BaseEngine):
         *,
         force_reprocess=False,
     ):
+        ut_params = self._dual_alpha_strategy_params(strategy_params, ENTRY_STRATEGY_UT_BREAKOUT)
+        ut_sig, ut_reason, ut_status = await self._calculate_utbot_filtered_breakout_signal(
+            symbol,
+            df,
+            ut_params,
+            force_reprocess=force_reprocess,
+        )
+        forced_direction = self._extract_relative_strength_pullback_ut_direction(ut_sig, ut_status)
+        return forced_direction, ut_reason, dict(ut_status or {})
+
+    async def _calculate_relative_strength_pullback_signal(
+        self,
+        symbol,
+        df,
+        strategy_params,
+        *,
+        force_reprocess=False,
+        forced_direction=None,
+        direction_source=None,
+        resolve_ut_direction=True,
+    ):
         cfg = self._get_utbot_filtered_breakout_config(strategy_params)
         self._clear_utbot_filtered_breakout_entry_plan(symbol)
         rsp_cfg = self._relative_strength_pullback_runtime_config(cfg)
+        resolved_direction = self._normalize_relative_strength_pullback_direction(forced_direction)
+        direction_reason = None
+        resolved_via_provider = False
+        if resolved_direction is None and resolve_ut_direction:
+            resolved_direction, direction_reason, provider_status = await self._resolve_relative_strength_pullback_ut_direction(
+                symbol,
+                df,
+                strategy_params,
+                force_reprocess=force_reprocess,
+            )
+            resolved_via_provider = True
+        else:
+            provider_status = {}
+        if resolved_via_provider:
+            self._clear_utbot_filtered_breakout_entry_plan(symbol)
+        source_label = direction_source or 'UTBreakout'
+        rsp_cfg['forced_direction'] = resolved_direction
+        rsp_cfg['direction_source'] = source_label
+        nested_rsp_cfg = dict(cfg.get('relative_strength_pullback_trend') or {})
+        nested_rsp_cfg['forced_direction'] = resolved_direction
+        nested_rsp_cfg['direction_source'] = source_label
+        cfg['relative_strength_pullback_trend'] = nested_rsp_cfg
         status = {
             'strategy': STRATEGY_DISPLAY_NAMES.get(
                 ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
@@ -13951,7 +14017,17 @@ class SignalEngine(BaseEngine):
             'relative_strength_pullback_live_enabled': bool(
                 rsp_cfg.get('relative_strength_pullback_trend_live_enabled', False)
             ),
+            'rspt_forced_direction': resolved_direction,
+            'rspt_direction_source': source_label,
+            'rspt_direction_provider_reason': direction_reason,
         }
+        if provider_status:
+            status['rspt_direction_provider_status'] = {
+                'stage': provider_status.get('stage'),
+                'accepted_side': provider_status.get('accepted_side'),
+                'reject_code': provider_status.get('reject_code'),
+                'reason': provider_status.get('reason'),
+            }
 
         def _finish(sig, reason, code=None, *, record_failure=False, side=None):
             status['reason'] = reason
@@ -13979,6 +14055,8 @@ class SignalEngine(BaseEngine):
             return _finish(None, 'RSPT unsupported in Upbit mode', 'REJECTED_UNSUPPORTED_MODE')
         if not bool(rsp_cfg.get('relative_strength_pullback_trend_live_enabled', False)):
             return _finish(None, 'RSPT live disabled; enable from Telegram first', 'REJECTED_RSPT_LIVE_DISABLED')
+        if resolved_direction not in {'long', 'short'}:
+            return _finish(None, 'RSPT waiting: no_ut_direction', 'REJECTED_RSPT_NO_UT_DIRECTION')
 
         decisions, signal_rows_by_symbol, _, candidates, rsp_cfg = await self._evaluate_relative_strength_pullback_candidates(
             focus_symbol=symbol,
@@ -14001,6 +14079,10 @@ class SignalEngine(BaseEngine):
             'logs': dict(decision.logs or {}),
         }
         decision_logs = dict(decision.logs or {})
+        status['rspt_forced_direction'] = decision_logs.get('rspt_forced_direction', resolved_direction)
+        status['rspt_direction_source'] = decision_logs.get('rspt_direction_source', source_label)
+        status['rspt_ignored_opposite_side'] = decision_logs.get('rspt_ignored_opposite_side')
+        status['rspt_original_candidate_sides'] = decision_logs.get('rspt_original_candidate_sides')
         status['setup_type'] = decision_logs.get('setup_type')
         status['rspt_size_multiplier'] = decision_logs.get('size_multiplier', decision_logs.get('risk_multiplier', 1.0))
         status['rspt_size_reduction_reasons'] = decision_logs.get('size_reduction_reasons')
@@ -14299,6 +14381,8 @@ class SignalEngine(BaseEngine):
             'side': side or None,
             'reason': reason,
             'setup_type': setup_type,
+            'direction_by': status.get('rspt_direction_source') or status.get('direction_by'),
+            'forced_direction': status.get('rspt_forced_direction'),
         }
 
     def _dual_alpha_score(self, strategy_key, side, status, plan):
@@ -14365,6 +14449,7 @@ class SignalEngine(BaseEngine):
             if ut_sig in {'long', 'short'}
             else None
         )
+        rspt_forced_direction = self._extract_relative_strength_pullback_ut_direction(ut_sig, ut_status)
 
         rsp_params = self._dual_alpha_strategy_params(
             strategy_params,
@@ -14375,6 +14460,9 @@ class SignalEngine(BaseEngine):
             df,
             rsp_params,
             force_reprocess=force_reprocess,
+            forced_direction=rspt_forced_direction,
+            direction_source='UTBreakout',
+            resolve_ut_direction=False,
         )
         rsp_status = dict(rsp_status or self._utbreakout_diag_for_symbol(base_symbol) or {})
         rsp_symbol = rsp_status.get('plan_symbol') or rsp_status.get('symbol') or base_symbol
@@ -14397,21 +14485,30 @@ class SignalEngine(BaseEngine):
                 'priority': 0,
             })
         if rsp_sig in {'long', 'short'} and isinstance(rsp_plan, dict):
-            choices.append({
-                'key': ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
-                'label': 'RSPT',
-                'side': rsp_sig,
-                'reason': rsp_reason,
-                'status': rsp_status,
-                'plan': rsp_plan,
-                'score': self._dual_alpha_score(
-                    ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
-                    rsp_sig,
-                    rsp_status,
-                    rsp_plan,
-                ),
-                'priority': 1,
-            })
+            if rspt_forced_direction and rsp_sig != rspt_forced_direction:
+                self._utbreakout_trace_event(
+                    base_symbol,
+                    'DUAL_ALPHA',
+                    'RSPT_OPPOSITE_DIRECTION_BLOCKED',
+                    ut_direction=rspt_forced_direction,
+                    rspt_direction=rsp_sig,
+                )
+            else:
+                choices.append({
+                    'key': ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+                    'label': 'RSPT',
+                    'side': rsp_sig,
+                    'reason': rsp_reason,
+                    'status': rsp_status,
+                    'plan': rsp_plan,
+                    'score': self._dual_alpha_score(
+                        ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+                        rsp_sig,
+                        rsp_status,
+                        rsp_plan,
+                    ),
+                    'priority': 1,
+                })
 
         choices.sort(key=lambda item: (-float(item.get('score') or 0.0), int(item.get('priority') or 0)))
         selected = choices[0] if choices else None
@@ -14519,7 +14616,9 @@ class SignalEngine(BaseEngine):
             state = item.get('state') or 'NONE'
             setup = item.get('setup_type') or '-'
             reason = item.get('reason') or 'no recent decision'
-            return f"{label}: {_emoji(item.get('light'))} {state} {side} / setup {setup} / {reason}"
+            direction_by = item.get('direction_by')
+            direction_note = f" / direction_by {direction_by}" if direction_by else ""
+            return f"{label}: {_emoji(item.get('light'))} {state} {side} / setup {setup}{direction_note} / {reason}"
 
         lines = [
             "DUAL Alpha status",
@@ -39068,6 +39167,94 @@ class MainController:
 """
             await u.message.reply_text(msg.strip(), parse_mode=ParseMode.MARKDOWN)
 
+        async def risk_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            args = list(getattr(c, "args", []) or [])
+            sig_cfg = self.cfg.get('signal_engine', {}) or {}
+            common_cfg = dict(sig_cfg.get('common_settings', {}) or {})
+            strategy_params = sig_cfg.get('strategy_params', {}) or {}
+            ut_cfg = dict(strategy_params.get('UTBotFilteredBreakoutV1', {}) or {})
+            cfg_for_risk = dict(common_cfg)
+            for key in (
+                "default_real_risk_pct",
+                "min_real_risk_pct",
+                "max_real_risk_pct",
+                "max_risk_pct_increases_per_day",
+                "max_risk_pct_changes_per_day",
+                "risk_pct_change_reset_timezone",
+                "account_reference_equity_usdt",
+                "max_real_position_notional_pct_of_equity",
+                "max_daily_real_loss_pct_of_equity",
+                "max_weekly_real_loss_pct_of_equity",
+            ):
+                if key in ut_cfg and key not in cfg_for_risk:
+                    cfg_for_risk[key] = ut_cfg[key]
+            current_fraction = _live_real_risk_fraction_from_cfg(cfg_for_risk)
+            state = load_live_real_risk_state()
+            if not args:
+                limits = resolve_live_small_cap_limits(cfg_for_risk)
+                limit = int(cfg_for_risk.get(
+                    "max_risk_pct_increases_per_day",
+                    cfg_for_risk.get(
+                        "max_risk_pct_changes_per_day",
+                        LIVE_REAL_SMALL_CAP_DEFAULTS["max_risk_pct_increases_per_day"],
+                    ),
+                ) or 0)
+                await u.message.reply_text(
+                    "\n".join([
+                        "LIVE_REAL_SMALL_CAP risk",
+                        f"Current: {current_fraction * 100.0:.2f}%",
+                        f"Per-trade loss budget: {limits['max_loss_per_trade_usdt']:.4f} USDT "
+                        f"@ equity {limits['account_equity_usdt']:.2f}",
+                        f"Notional cap: {limits['max_position_notional_usdt']:.4f} USDT "
+                        f"({limits['max_position_notional_pct'] * 100.0:.2f}% equity)",
+                        f"KST increases today: {int(state.get('risk_pct_increases_today', 0) or 0)}/{limit}",
+                        "Usage: /risk 0.5, /risk 1, /risk safe",
+                    ])
+                )
+                return
+            try:
+                requested_fraction = parse_live_real_risk_pct_input(args[0], cfg_for_risk)
+            except ValueError as exc:
+                await u.message.reply_text(f"Invalid /risk value: {exc}\nUsage: /risk 0.5, /risk 1, /risk safe")
+                return
+            change = apply_live_real_risk_pct_change(state, current_fraction, requested_fraction, cfg_for_risk)
+            if not change.get("allowed"):
+                await u.message.reply_text(
+                    "Risk increase blocked: daily KST increase limit reached. "
+                    "Lowering risk is still allowed with /risk safe."
+                )
+                return
+            save_live_real_risk_state(change.get("state") or state)
+            risk_percent = requested_fraction * 100.0
+            max_percent = _live_real_min_max_risk_fraction(cfg_for_risk)[1] * 100.0
+            update_paths = [
+                (['signal_engine', 'common_settings', 'live_real_risk_pct_user'], requested_fraction),
+                (['signal_engine', 'common_settings', 'risk_per_trade_pct'], risk_percent),
+                (['signal_engine', 'common_settings', 'max_risk_per_trade_pct'], max_percent),
+                (['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'live_real_risk_pct_user'], requested_fraction),
+                (['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'risk_per_trade_percent'], risk_percent),
+                (['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'max_risk_per_trade_pct'], max_percent),
+            ]
+            for path, value in update_paths:
+                await self.cfg.update_value(path, value)
+            engine = self._reset_signal_engine_runtime_state(reset_entry_cache=True)
+            if engine and not getattr(engine, "running", False):
+                engine.start()
+            limits = resolve_live_small_cap_limits({**cfg_for_risk, "live_real_risk_pct_user": requested_fraction})
+            changed_state = change.get("state") or {}
+            await u.message.reply_text(
+                "\n".join([
+                    "Risk updated",
+                    f"Current: {risk_percent:.2f}%",
+                    f"Per-trade loss budget: {limits['max_loss_per_trade_usdt']:.4f} USDT "
+                    f"@ equity {limits['account_equity_usdt']:.2f}",
+                    f"Notional cap: {limits['max_position_notional_usdt']:.4f} USDT",
+                    f"Reason: {change.get('reason')}",
+                    f"KST increases today: {int(changed_state.get('risk_pct_increases_today', 0) or 0)}/"
+                    f"{int(change.get('limit', cfg_for_risk.get('max_risk_pct_increases_per_day', LIVE_REAL_SMALL_CAP_DEFAULTS['max_risk_pct_increases_per_day'])) or 0)}",
+                ])
+            )
+
         def _parse_bool_mode(value):
             text = str(value or '').strip().lower()
             if text in {'on', '1', 'true', 'yes', 'enable', 'enabled', 'start'}:
@@ -43486,6 +43673,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
         self.tg_app.add_handler(CommandHandler("log", owner_only(log_cmd)))
         self.tg_app.add_handler(CommandHandler("close", owner_only(close_cmd)))
         self.tg_app.add_handler(CommandHandler("stats", owner_only(stats_cmd)))
+        self.tg_app.add_handler(CommandHandler("risk", owner_only(risk_cmd)))
         self.tg_app.add_handler(CommandHandler("utbreak", owner_only(utbreakout_cmd)))
         self.tg_app.add_handler(CommandHandler("utbreakout", owner_only(utbreakout_cmd)))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(legacy_utbot_callback), pattern=r"^utbot:"))
@@ -43541,6 +43729,8 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 return await help_cmd(u, c)
             if command == "/stats":
                 return await stats_cmd(u, c)
+            if command == "/risk":
+                return await risk_cmd(u, c)
             if command == "/close":
                 return await close_cmd(u, c)
             if command in {"/utbreak", "/utbreakout"}:
@@ -44837,16 +45027,20 @@ def enforce_activation_stage(cfg):
         cfg["real_order_enabled"] = True
         cfg["testnet"] = False
         cfg["live_trading"] = True
-        cfg["account_reference_equity_usdt"] = float(cfg.get("account_reference_equity_usdt", 62.0) or 62.0)
+        cfg["account_reference_equity_usdt"] = float(
+            cfg.get(
+                "account_reference_equity_usdt",
+                LIVE_REAL_SMALL_CAP_DEFAULTS["account_reference_equity_usdt"],
+            )
+            or LIVE_REAL_SMALL_CAP_DEFAULTS["account_reference_equity_usdt"]
+        )
         cfg["max_leverage"] = min(int(cfg.get("max_leverage", 5) or 5), 5)
         cfg["leverage"] = min(float(cfg.get("leverage", cfg["max_leverage"]) or cfg["max_leverage"]), cfg["max_leverage"])
-        cfg["max_real_position_notional_usdt"] = min(float(cfg.get("max_real_position_notional_usdt", 15.0) or 15.0), 15.0)
-        cfg["max_real_loss_per_trade_usdt"] = min(float(cfg.get("max_real_loss_per_trade_usdt", 3.0) or 3.0), 3.0)
-        cfg["max_risk_per_trade_pct"] = min(float(cfg.get("max_risk_per_trade_pct", 0.50) or 0.50), 0.50)
+        for key, value in LIVE_REAL_SMALL_CAP_DEFAULTS.items():
+            cfg.setdefault(key, value)
         cfg["max_open_positions"] = min(int(cfg.get("max_open_positions", 1) or 1), 1)
         cfg["max_same_direction_positions"] = min(int(cfg.get("max_same_direction_positions", 1) or 1), 1)
-        cfg["max_daily_real_loss_usdt"] = min(float(cfg.get("max_daily_real_loss_usdt", 6.0) or 6.0), 6.0)
-        cfg["max_weekly_real_loss_usdt"] = min(float(cfg.get("max_weekly_real_loss_usdt", 30.0) or 30.0), 30.0)
+        apply_live_small_cap_limits_to_config(cfg, cfg["account_reference_equity_usdt"])
         cfg.setdefault("live_real_allowlist", list(LIVE_REAL_ALLOWED_SYMBOLS_DEFAULT))
         cfg.setdefault("live_real_blocklist", [])
         cfg.setdefault("min_notional_usdt", 5.0)
@@ -44859,6 +45053,19 @@ def enforce_activation_stage(cfg):
 
 PAUSE_STATE_FILE = "runtime/critical_pause_state.json"
 LIVE_REAL_RISK_STATE_FILE = "runtime/live_real_risk_state.json"
+LIVE_REAL_SMALL_CAP_DEFAULTS = {
+    "account_reference_equity_usdt": 62.0,
+    "max_real_position_notional_pct_of_equity": 0.09,
+    "default_real_risk_pct": 0.005,
+    "min_real_risk_pct": 0.001,
+    "max_real_risk_pct": 0.05,
+    "max_daily_real_loss_pct_of_equity": 0.036,
+    "max_weekly_real_loss_pct_of_equity": 0.18,
+    "max_risk_pct_increases_per_day": 2,
+    "risk_pct_change_reset_timezone": "Asia/Seoul",
+    "scale_notional_cap_with_risk_pct": False,
+    "max_position_notional_pct_hard_limit": 0.50,
+}
 
 def write_critical_pause_state(symbol, reason, exception, cfg=None):
     state = {
@@ -44955,6 +45162,224 @@ def _safe_float_value(value, default=0.0):
     except (TypeError, ValueError):
         pass
     return float(default)
+
+
+def _bounded_fraction(value, default, *, minimum=0.0, maximum=1.0):
+    number = _safe_float_value(value, default)
+    if number > 1.0:
+        number /= 100.0
+    return max(float(minimum), min(float(maximum), float(number)))
+
+
+def _live_real_config_float(cfg, key, default):
+    cfg = cfg if isinstance(cfg, dict) else {}
+    return _safe_float_value(cfg.get(key), default)
+
+
+def _live_real_kst_date_key(cfg=None, now=None):
+    cfg = cfg if isinstance(cfg, dict) else {}
+    tz_name = str(
+        cfg.get("risk_pct_change_reset_timezone")
+        or LIVE_REAL_SMALL_CAP_DEFAULTS["risk_pct_change_reset_timezone"]
+    )
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("Asia/Seoul")
+    current = now or datetime.now(timezone.utc)
+    if getattr(current, "tzinfo", None) is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return current.astimezone(tz).strftime("%Y-%m-%d")
+
+
+def _live_real_min_max_risk_fraction(cfg=None):
+    cfg = cfg if isinstance(cfg, dict) else {}
+    min_frac = _bounded_fraction(
+        cfg.get("min_real_risk_pct"),
+        LIVE_REAL_SMALL_CAP_DEFAULTS["min_real_risk_pct"],
+        minimum=0.0001,
+        maximum=1.0,
+    )
+    max_frac = _bounded_fraction(
+        cfg.get("max_real_risk_pct"),
+        LIVE_REAL_SMALL_CAP_DEFAULTS["max_real_risk_pct"],
+        minimum=min_frac,
+        maximum=1.0,
+    )
+    return min_frac, max_frac
+
+
+def _live_real_risk_fraction_from_cfg(cfg=None):
+    cfg = cfg if isinstance(cfg, dict) else {}
+    min_frac, max_frac = _live_real_min_max_risk_fraction(cfg)
+    default_frac = _bounded_fraction(
+        cfg.get("default_real_risk_pct"),
+        LIVE_REAL_SMALL_CAP_DEFAULTS["default_real_risk_pct"],
+        minimum=min_frac,
+        maximum=max_frac,
+    )
+    if cfg.get("live_real_risk_pct_user") is not None:
+        raw = _safe_float_value(cfg.get("live_real_risk_pct_user"), default_frac)
+        if raw > max_frac and raw <= 100.0:
+            raw /= 100.0
+        return max(min_frac, min(max_frac, raw))
+    if cfg.get("risk_per_trade_pct") is not None:
+        return max(min_frac, min(max_frac, _safe_float_value(cfg.get("risk_per_trade_pct"), default_frac * 100.0) / 100.0))
+    if cfg.get("risk_per_trade_percent") is not None:
+        return max(min_frac, min(max_frac, _safe_float_value(cfg.get("risk_per_trade_percent"), default_frac * 100.0) / 100.0))
+    return default_frac
+
+
+def parse_live_real_risk_pct_input(value, cfg=None):
+    text = str(value or "").strip().lower().replace("%", "")
+    min_frac, max_frac = _live_real_min_max_risk_fraction(cfg)
+    if text in {"safe", "min", "minimum", "low", "lowest"}:
+        return min_frac
+    if not text:
+        raise ValueError("risk percent is required")
+    try:
+        percent = float(text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("risk percent must be numeric, safe, or min") from exc
+    fraction = percent / 100.0
+    if fraction < min_frac or fraction > max_frac:
+        raise ValueError(f"risk percent must be between {min_frac * 100.0:.1f}% and {max_frac * 100.0:.1f}%")
+    return fraction
+
+
+def normalize_live_real_risk_state(state, cfg=None, now=None):
+    state = dict(state) if isinstance(state, dict) else {}
+    today, week = _live_real_period_keys(now)
+    kst_date = _live_real_kst_date_key(cfg, now)
+    state.setdefault("date", today)
+    state.setdefault("week", week)
+    if state.get("date") != today:
+        state["date"] = today
+        state["daily_realized_pnl_usdt"] = 0.0
+        state["daily_loss_usdt"] = 0.0
+    if state.get("week") != week:
+        state["week"] = week
+        state["weekly_realized_pnl_usdt"] = 0.0
+        state["weekly_loss_usdt"] = 0.0
+    if state.get("risk_pct_change_date_kst") != kst_date:
+        state["risk_pct_change_date_kst"] = kst_date
+        state["risk_pct_increases_today"] = 0
+    state.setdefault("daily_realized_pnl_usdt", 0.0)
+    state.setdefault("weekly_realized_pnl_usdt", 0.0)
+    state.setdefault("risk_pct_increases_today", 0)
+    return state
+
+
+def apply_live_real_risk_pct_change(state, current_fraction, requested_fraction, cfg=None, now=None):
+    cfg = cfg if isinstance(cfg, dict) else {}
+    state = normalize_live_real_risk_state(state, cfg, now)
+    current = _live_real_risk_fraction_from_cfg({**cfg, "live_real_risk_pct_user": current_fraction})
+    requested = _live_real_risk_fraction_from_cfg({**cfg, "live_real_risk_pct_user": requested_fraction})
+    if abs(requested - current) <= 1e-12:
+        state["live_real_risk_pct_user"] = requested
+        return {"allowed": True, "changed": False, "state": state, "reason": "same_value"}
+    increasing = requested > current
+    limit = int(cfg.get("max_risk_pct_increases_per_day", cfg.get("max_risk_pct_changes_per_day", LIVE_REAL_SMALL_CAP_DEFAULTS["max_risk_pct_increases_per_day"])) or 0)
+    used = int(state.get("risk_pct_increases_today", 0) or 0)
+    if increasing and limit > 0 and used >= limit:
+        return {
+            "allowed": False,
+            "changed": False,
+            "state": state,
+            "reason": "daily_risk_increase_limit",
+            "limit": limit,
+            "used": used,
+        }
+    state["live_real_risk_pct_user"] = requested
+    state["last_live_real_risk_pct_user"] = current
+    state["last_risk_pct_changed_at"] = datetime.now(timezone.utc).isoformat()
+    if increasing:
+        state["risk_pct_increases_today"] = used + 1
+    return {
+        "allowed": True,
+        "changed": True,
+        "state": state,
+        "reason": "risk_increased" if increasing else "risk_decreased",
+        "limit": limit,
+        "used": int(state.get("risk_pct_increases_today", 0) or 0),
+    }
+
+
+def resolve_live_small_cap_limits(cfg=None, account_equity=None):
+    cfg = cfg if isinstance(cfg, dict) else {}
+    equity = _safe_float_value(
+        account_equity if account_equity is not None else cfg.get("account_reference_equity_usdt"),
+        LIVE_REAL_SMALL_CAP_DEFAULTS["account_reference_equity_usdt"],
+    )
+    equity = max(equity, 0.0)
+    min_frac, max_frac = _live_real_min_max_risk_fraction(cfg)
+    risk_frac = _live_real_risk_fraction_from_cfg(cfg)
+    default_risk_frac = _bounded_fraction(
+        cfg.get("default_real_risk_pct"),
+        LIVE_REAL_SMALL_CAP_DEFAULTS["default_real_risk_pct"],
+        minimum=min_frac,
+        maximum=max_frac,
+    )
+    hard_notional_pct = _bounded_fraction(
+        cfg.get("max_position_notional_pct_hard_limit"),
+        LIVE_REAL_SMALL_CAP_DEFAULTS["max_position_notional_pct_hard_limit"],
+        minimum=0.01,
+        maximum=1.0,
+    )
+    notional_pct = _bounded_fraction(
+        cfg.get("max_real_position_notional_pct_of_equity"),
+        LIVE_REAL_SMALL_CAP_DEFAULTS["max_real_position_notional_pct_of_equity"],
+        minimum=0.0,
+        maximum=hard_notional_pct,
+    )
+    if bool(cfg.get("scale_notional_cap_with_risk_pct", LIVE_REAL_SMALL_CAP_DEFAULTS["scale_notional_cap_with_risk_pct"])):
+        scale = risk_frac / max(default_risk_frac, 1e-12)
+        notional_pct = min(hard_notional_pct, notional_pct * scale)
+    daily_pct = _bounded_fraction(
+        cfg.get("max_daily_real_loss_pct_of_equity"),
+        LIVE_REAL_SMALL_CAP_DEFAULTS["max_daily_real_loss_pct_of_equity"],
+        minimum=0.0,
+        maximum=1.0,
+    )
+    weekly_pct = _bounded_fraction(
+        cfg.get("max_weekly_real_loss_pct_of_equity"),
+        LIVE_REAL_SMALL_CAP_DEFAULTS["max_weekly_real_loss_pct_of_equity"],
+        minimum=0.0,
+        maximum=1.0,
+    )
+    limits = {
+        "account_equity_usdt": equity,
+        "risk_fraction": risk_frac,
+        "risk_pct": risk_frac * 100.0,
+        "min_risk_fraction": min_frac,
+        "max_risk_fraction": max_frac,
+        "max_position_notional_pct": notional_pct,
+        "max_position_notional_usdt": equity * notional_pct,
+        "max_loss_per_trade_usdt": equity * risk_frac,
+        "max_daily_loss_usdt": equity * daily_pct,
+        "max_weekly_loss_usdt": equity * weekly_pct,
+        "daily_loss_pct": daily_pct,
+        "weekly_loss_pct": weekly_pct,
+        "notional_scaled_by_risk": bool(cfg.get("scale_notional_cap_with_risk_pct", False)),
+    }
+    return limits
+
+
+def apply_live_small_cap_limits_to_config(cfg, account_equity=None):
+    if not isinstance(cfg, dict):
+        return {}
+    limits = resolve_live_small_cap_limits(cfg, account_equity)
+    cfg["account_reference_equity_usdt"] = limits["account_equity_usdt"]
+    cfg["live_real_risk_pct_user"] = limits["risk_fraction"]
+    cfg["risk_per_trade_pct"] = limits["risk_pct"]
+    cfg["risk_per_trade_percent"] = limits["risk_pct"]
+    cfg["max_risk_per_trade_pct"] = limits["max_risk_fraction"] * 100.0
+    cfg["max_real_position_notional_usdt"] = limits["max_position_notional_usdt"]
+    cfg["max_real_loss_per_trade_usdt"] = limits["max_loss_per_trade_usdt"]
+    cfg["max_daily_real_loss_usdt"] = limits["max_daily_loss_usdt"]
+    cfg["max_weekly_real_loss_usdt"] = limits["max_weekly_loss_usdt"]
+    cfg["live_real_effective_limits"] = dict(limits)
+    return limits
 
 
 def _normalize_tp_plan_label(value, fallback=None):
@@ -45106,6 +45531,7 @@ def load_live_real_risk_state():
         "daily_realized_pnl_usdt": 0.0,
         "weekly_realized_pnl_usdt": 0.0,
     }
+    default_state = normalize_live_real_risk_state(default_state)
     if not os.path.exists(LIVE_REAL_RISK_STATE_FILE):
         return default_state
     try:
@@ -45115,19 +45541,7 @@ def load_live_real_risk_state():
         return default_state
     if not isinstance(state, dict):
         return default_state
-    state.setdefault("date", today)
-    state.setdefault("week", week)
-    if state.get("date") != today:
-        state["date"] = today
-        state["daily_realized_pnl_usdt"] = 0.0
-        state["daily_loss_usdt"] = 0.0
-    if state.get("week") != week:
-        state["week"] = week
-        state["weekly_realized_pnl_usdt"] = 0.0
-        state["weekly_loss_usdt"] = 0.0
-    state.setdefault("daily_realized_pnl_usdt", 0.0)
-    state.setdefault("weekly_realized_pnl_usdt", 0.0)
-    return state
+    return normalize_live_real_risk_state(state)
 
 
 def save_live_real_risk_state(state):
@@ -45158,11 +45572,12 @@ def assert_live_real_loss_limits_not_exceeded(cfg):
     cfg = cfg if isinstance(cfg, dict) else {}
     if _normalize_live_real_stage(cfg.get("live_activation_stage")) != "LIVE_REAL_SMALL_CAP":
         return True
+    apply_live_small_cap_limits_to_config(cfg, cfg.get("account_reference_equity_usdt"))
     state = load_live_real_risk_state()
     daily_loss = _realized_loss_from_state(state, "daily_realized_pnl_usdt", "daily_loss_usdt")
     weekly_loss = _realized_loss_from_state(state, "weekly_realized_pnl_usdt", "weekly_loss_usdt")
-    max_daily = float(cfg.get("max_daily_real_loss_usdt", 6.0) or 6.0)
-    max_weekly = float(cfg.get("max_weekly_real_loss_usdt", 30.0) or 30.0)
+    max_daily = float(cfg.get("max_daily_real_loss_usdt", 0.0) or 0.0)
+    max_weekly = float(cfg.get("max_weekly_real_loss_usdt", 0.0) or 0.0)
     if daily_loss >= max_daily:
         raise TradingPausedError(f"daily real loss limit reached: {daily_loss:.4f} >= {max_daily:.4f}")
     if weekly_loss >= max_weekly:
@@ -45174,7 +45589,8 @@ def validate_min_notional_against_live_cap(min_notional, cfg):
     cfg = cfg if isinstance(cfg, dict) else {}
     if _normalize_live_real_stage(cfg.get("live_activation_stage")) != "LIVE_REAL_SMALL_CAP":
         return True
-    cap = float(cfg.get("max_real_position_notional_usdt", 15.0) or 15.0)
+    limits = resolve_live_small_cap_limits(cfg, cfg.get("account_reference_equity_usdt"))
+    cap = float(limits.get("max_position_notional_usdt") or 0.0)
     if float(min_notional) > cap:
         raise InvalidOrderPlan(f"minNotional {float(min_notional):.4f} exceeds live real notional cap {cap:.4f}")
     return True
@@ -45204,35 +45620,45 @@ def enforce_live_real_order_caps(plan, context, cfg):
     cfg = cfg if isinstance(cfg, dict) else {}
     if _normalize_live_real_stage(cfg.get("live_activation_stage")) != "LIVE_REAL_SMALL_CAP":
         return plan
+    limits = apply_live_small_cap_limits_to_config(cfg, cfg.get("account_reference_equity_usdt"))
     entry_ref = float(getattr(plan, "entry_price", None) or getattr(context, "close", 0.0) or cfg.get("last_price") or 0.0)
     if entry_ref <= 0:
         raise InvalidOrderPlan("missing entry reference price for LIVE_REAL_SMALL_CAP cap check")
-    qty = float(plan.qty)
+    original_qty = float(plan.qty)
+    qty = original_qty
     notional = qty * entry_ref
-    notional_cap = float(cfg.get("max_real_position_notional_usdt", 15.0) or 15.0)
+    notional_cap = float(limits.get("max_position_notional_usdt") or 0.0)
+    cap_reasons = []
     if notional > notional_cap:
         qty = notional_cap / entry_ref
+        cap_reasons.append("notional_cap")
 
     stop_ref = float(plan.initial_sl_price)
     risk_per_unit = abs(entry_ref - stop_ref)
-    loss_cap = float(cfg.get("max_real_loss_per_trade_usdt", 3.0) or 3.0)
+    loss_cap = float(limits.get("max_loss_per_trade_usdt") or 0.0)
     if risk_per_unit <= 0:
         raise InvalidOrderPlan("invalid SL distance for LIVE_REAL_SMALL_CAP cap check")
     if qty * risk_per_unit > loss_cap:
         qty = loss_cap / risk_per_unit
-    return _scale_live_order_plan_qty(plan, qty)
+        cap_reasons.append("loss_cap")
+    plan = _scale_live_order_plan_qty(plan, qty)
+    plan.live_real_effective_limits = dict(limits)
+    plan.live_real_cap_reasons = cap_reasons
+    plan.live_real_original_qty = original_qty
+    return plan
 
 
 def validate_live_real_order_caps_after_rounding(plan, cfg):
     cfg = cfg if isinstance(cfg, dict) else {}
     if _normalize_live_real_stage(cfg.get("live_activation_stage")) != "LIVE_REAL_SMALL_CAP":
         return True
+    limits = apply_live_small_cap_limits_to_config(cfg, cfg.get("account_reference_equity_usdt"))
     entry_ref = _live_real_entry_reference(plan, cfg)
     if entry_ref <= 0:
         raise InvalidOrderPlan("missing entry reference price for LIVE_REAL_SMALL_CAP rounded cap check")
     qty = float(plan.qty)
-    notional_cap = float(cfg.get("max_real_position_notional_usdt", 15.0) or 15.0)
-    loss_cap = float(cfg.get("max_real_loss_per_trade_usdt", 3.0) or 3.0)
+    notional_cap = float(limits.get("max_position_notional_usdt") or 0.0)
+    loss_cap = float(limits.get("max_loss_per_trade_usdt") or 0.0)
     notional = qty * entry_ref
     loss = qty * abs(entry_ref - float(plan.initial_sl_price))
     if notional > notional_cap * 1.001:
@@ -45301,10 +45727,18 @@ def build_live_order_plan_from_decision(symbol, decision, context, cfg, *, accou
     if account_equity is None or float(account_equity) <= 0:
         raise InvalidOrderPlan("live order plan requires real account equity")
     equity = float(account_equity)
+    limits = None
+    if _normalize_live_real_stage((cfg or {}).get("live_activation_stage")) == "LIVE_REAL_SMALL_CAP":
+        limits = apply_live_small_cap_limits_to_config(cfg, equity)
 
+    requested_risk_pct = float((limits or {}).get("risk_pct") or cfg.get("risk_per_trade_pct") or cfg.get("risk_per_trade_percent") or decision.risk_pct)
+    decision_risk_pct = _safe_float_value(getattr(decision, "risk_pct", None), requested_risk_pct)
+    if decision_risk_pct <= 0:
+        decision_risk_pct = requested_risk_pct
     risk_pct = min(
-        float(decision.risk_pct),
-        float(cfg.get("max_risk_per_trade_pct", 1.0)),
+        float(decision_risk_pct),
+        float(requested_risk_pct),
+        float(cfg.get("max_risk_per_trade_pct", requested_risk_pct)),
     )
     if risk_pct <= 0:
         raise InvalidOrderPlan("risk_pct <= 0")
@@ -45341,7 +45775,7 @@ def build_live_order_plan_from_decision(symbol, decision, context, cfg, *, accou
         config=tp_config,
     )
 
-    return LiveOrderPlan(
+    plan = LiveOrderPlan(
         symbol=symbol,
         side=decision.side,
         entry_type=cfg.get("entry_order_type", "MARKET"),
@@ -45358,6 +45792,9 @@ def build_live_order_plan_from_decision(symbol, decision, context, cfg, *, accou
         expected_r=decision.expected_r,
         reasons=decision.reasons,
     )
+    if limits is not None:
+        plan.live_real_effective_limits = dict(limits)
+    return plan
 
 def validate_live_order_plan(plan, cfg):
     if plan.qty <= 0:
@@ -45842,14 +46279,18 @@ async def preflight_live_real_check(self, symbol, cfg):
         raise TradingSafetyError("LIVE_REAL_SMALL_CAP real order flags are not enabled")
 
     assert_symbol_allowed_for_live_real(symbol, cfg)
+    configure_binance_futures_environment(self.exchange, cfg)
+    if hasattr(self.exchange, "load_markets"):
+        await asyncio.to_thread(self.exchange.load_markets)
+    account_equity = await self._fetch_futures_account_equity(cfg)
+    if float(account_equity) <= 0:
+        raise TradingSafetyError("real futures account equity must be positive")
+    limits = apply_live_small_cap_limits_to_config(cfg, account_equity)
     assert_live_real_loss_limits_not_exceeded(cfg)
     state = load_critical_pause_state()
     if state and state.get("status") == "CRITICAL_PAUSED":
         raise TradingPausedError(f"TRADING_CRITICAL_PAUSED: {state.get('reason')}")
 
-    configure_binance_futures_environment(self.exchange, cfg)
-    if hasattr(self.exchange, "load_markets"):
-        await asyncio.to_thread(self.exchange.load_markets)
     await self.assert_binance_futures_one_way_mode(cfg)
 
     active_positions = []
@@ -45882,13 +46323,11 @@ async def preflight_live_real_check(self, symbol, cfg):
     if open_orders:
         raise TradingSafetyError("LIVE_REAL_SMALL_CAP blocks new entries while open orders exist")
 
-    account_equity = await self._fetch_futures_account_equity(cfg)
-    if float(account_equity) <= 0:
-        raise TradingSafetyError("real futures account equity must be positive")
     return {
         "status": "OK",
         "symbol": symbol,
         "account_equity": float(account_equity),
+        "live_real_limits": dict(limits),
         "open_positions": 0,
         "open_orders": 0,
     }
@@ -46142,6 +46581,13 @@ async def execute_live_order_plan(self, plan, cfg):
             raise TradingSafetyError("LIVE_REAL_SMALL_CAP must not use testnet")
         if not bool(cfg.get("real_order_enabled", False)) or not bool(cfg.get("live_trading", False)):
             raise TradingSafetyError("LIVE_REAL_SMALL_CAP real order flags are not enabled")
+        plan_limits = getattr(plan, "live_real_effective_limits", None)
+        plan_equity = (
+            plan_limits.get("account_equity_usdt")
+            if isinstance(plan_limits, dict)
+            else cfg.get("account_reference_equity_usdt")
+        )
+        apply_live_small_cap_limits_to_config(cfg, plan_equity)
         assert_symbol_allowed_for_live_real(plan.symbol, cfg)
         assert_live_real_loss_limits_not_exceeded(cfg)
         configure_binance_futures_environment(self.exchange, cfg)

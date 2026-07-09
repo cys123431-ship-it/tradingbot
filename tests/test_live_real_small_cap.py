@@ -112,9 +112,9 @@ def test_live_real_stage_requires_exact_confirmation_and_clamps_caps():
     assert enforced["testnet"] is False
     assert enforced["max_leverage"] <= 5
     assert enforced["leverage"] <= 5
-    assert enforced["max_real_position_notional_usdt"] <= 15.0
-    assert enforced["max_real_loss_per_trade_usdt"] <= 3.0
-    assert enforced["max_risk_per_trade_pct"] <= 0.50
+    assert enforced["max_real_position_notional_usdt"] == pytest.approx(5.58)
+    assert enforced["max_real_loss_per_trade_usdt"] == pytest.approx(0.31)
+    assert enforced["max_risk_per_trade_pct"] == pytest.approx(5.0)
     assert enforced["max_open_positions"] == 1
 
 
@@ -134,12 +134,13 @@ def test_live_real_small_cap_updated_user_requested_limits():
     assert cfg["real_order_enabled"] is True
 
     assert cfg["max_leverage"] == 5
-    assert cfg["max_real_position_notional_usdt"] == 15.0
-    assert cfg["max_real_loss_per_trade_usdt"] == 3.0
-    assert cfg["max_daily_real_loss_usdt"] == 6.0
-    assert cfg["max_weekly_real_loss_usdt"] == 30.0
+    assert cfg["max_real_position_notional_usdt"] == pytest.approx(5.58)
+    assert cfg["max_real_loss_per_trade_usdt"] == pytest.approx(0.31)
+    assert cfg["max_daily_real_loss_usdt"] == pytest.approx(2.232)
+    assert cfg["max_weekly_real_loss_usdt"] == pytest.approx(11.16)
     assert cfg["max_open_positions"] == 1
     assert cfg["max_same_direction_positions"] == 1
+    assert cfg["live_real_effective_limits"]["max_position_notional_pct"] == pytest.approx(0.09)
 
 
 def test_disabled_paper_and_testnet_stage_flags_remain_safe():
@@ -195,6 +196,7 @@ def test_preflight_blocks_pause_positions_orders_and_passes_clean(monkeypatch):
     result = asyncio.run(bot.preflight_live_real_check("BTC/USDT:USDT", live_cfg()))
     assert result["status"] == "OK"
     assert result["account_equity"] == 62.0
+    assert result["live_real_limits"]["max_position_notional_usdt"] == pytest.approx(5.58)
 
     monkeypatch.setattr(emas, "load_critical_pause_state", lambda: {"status": "CRITICAL_PAUSED", "reason": "SL failed"})
     with pytest.raises(emas.TradingPausedError):
@@ -231,7 +233,7 @@ def test_live_real_order_caps_scale_qty_and_tp_quantities():
 
     capped = emas.enforce_live_real_order_caps(plan, context, cfg)
 
-    assert capped.qty <= 0.150151
+    assert capped.qty <= 0.055856
     assert sum(tp.qty for tp in capped.tp_orders) <= capped.qty * 1.0001
     assert emas.validate_live_real_order_caps_after_rounding(capped, cfg) is True
 
@@ -239,22 +241,52 @@ def test_live_real_order_caps_scale_qty_and_tp_quantities():
 def test_live_real_validation_rejects_rounding_and_min_notional_over_cap():
     cfg = emas.enforce_activation_stage(live_cfg())
     with pytest.raises(emas.InvalidOrderPlan):
-        emas.validate_live_real_order_caps_after_rounding(make_plan(qty=0.16, entry=100.0, sl=95.0), cfg)
+        emas.validate_live_real_order_caps_after_rounding(make_plan(qty=0.06, entry=100.0, sl=95.0), cfg)
 
     with pytest.raises(emas.InvalidOrderPlan):
-        emas.validate_min_notional_against_live_cap(16.0, cfg)
+        emas.validate_min_notional_against_live_cap(6.0, cfg)
 
 
 def test_live_real_loss_limits_block_daily_and_weekly(monkeypatch):
     cfg = emas.enforce_activation_stage(live_cfg())
 
-    monkeypatch.setattr(emas, "load_live_real_risk_state", lambda: {"daily_realized_pnl_usdt": -6.0, "weekly_realized_pnl_usdt": 0})
+    monkeypatch.setattr(emas, "load_live_real_risk_state", lambda: {"daily_realized_pnl_usdt": -2.232, "weekly_realized_pnl_usdt": 0})
     with pytest.raises(emas.TradingPausedError):
         emas.assert_live_real_loss_limits_not_exceeded(cfg)
 
-    monkeypatch.setattr(emas, "load_live_real_risk_state", lambda: {"daily_realized_pnl_usdt": 0, "weekly_realized_pnl_usdt": -30.0})
+    monkeypatch.setattr(emas, "load_live_real_risk_state", lambda: {"daily_realized_pnl_usdt": 0, "weekly_realized_pnl_usdt": -11.16})
     with pytest.raises(emas.TradingPausedError):
         emas.assert_live_real_loss_limits_not_exceeded(cfg)
+
+
+def test_live_real_risk_pct_change_limit_counts_only_increases():
+    cfg = emas.enforce_activation_stage(live_cfg())
+    state = {
+        "risk_pct_change_date_kst": emas._live_real_kst_date_key(cfg),
+        "risk_pct_increases_today": 1,
+    }
+
+    first = emas.apply_live_real_risk_pct_change(state, 0.005, 0.01, cfg)
+    assert first["allowed"] is True
+    assert first["state"]["risk_pct_increases_today"] == 2
+
+    second = emas.apply_live_real_risk_pct_change(first["state"], 0.01, 0.02, cfg)
+    assert second["allowed"] is False
+    assert second["reason"] == "daily_risk_increase_limit"
+
+    lowered = emas.apply_live_real_risk_pct_change(first["state"], 0.01, 0.001, cfg)
+    assert lowered["allowed"] is True
+    assert lowered["state"]["risk_pct_increases_today"] == 2
+
+
+def test_live_real_risk_input_safe_and_bounds():
+    cfg = emas.enforce_activation_stage(live_cfg())
+
+    assert emas.parse_live_real_risk_pct_input("safe", cfg) == pytest.approx(0.001)
+    assert emas.parse_live_real_risk_pct_input("0.5", cfg) == pytest.approx(0.005)
+    assert emas.parse_live_real_risk_pct_input("5", cfg) == pytest.approx(0.05)
+    with pytest.raises(ValueError):
+        emas.parse_live_real_risk_pct_input("5.1", cfg)
 
 
 def test_run_live_real_once_requires_stage(monkeypatch):
@@ -320,5 +352,5 @@ def test_run_live_real_once_builds_capped_plan_and_executes(monkeypatch):
 
     result = asyncio.run(bot.run_live_real_once("BTC/USDT:USDT", cfg))
     assert result["status"] == "LIVE_ORDER_PLAN_EXECUTED"
-    assert captured["plan"].qty * 100.0 <= 15.015
-    assert captured["plan"].qty * abs(100.0 - captured["plan"].initial_sl_price) <= 3.003
+    assert captured["plan"].qty * 100.0 <= 5.58558
+    assert captured["plan"].qty * abs(100.0 - captured["plan"].initial_sl_price) <= 0.31031

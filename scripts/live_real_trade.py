@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
 
 from emas import (  # noqa: E402
     LIVE_REAL_CONFIRM_TEXT,
+    LIVE_REAL_SMALL_CAP_DEFAULTS,
     MainController,
     enforce_activation_stage,
 )
@@ -41,13 +42,15 @@ def build_live_real_config(args, base_cfg=None):
         "account_reference_equity_usdt": 62.0,
         "max_leverage": min(int(args.leverage), 5),
         "leverage": min(int(args.leverage), 5),
-        "max_real_position_notional_usdt": min(float(args.max_notional), 15.0),
-        "max_real_loss_per_trade_usdt": min(float(args.max_loss), 3.0),
-        "max_risk_per_trade_pct": 0.50,
+        "max_real_position_notional_pct_of_equity": LIVE_REAL_SMALL_CAP_DEFAULTS["max_real_position_notional_pct_of_equity"],
+        "default_real_risk_pct": LIVE_REAL_SMALL_CAP_DEFAULTS["default_real_risk_pct"],
+        "live_real_risk_pct_user": LIVE_REAL_SMALL_CAP_DEFAULTS["default_real_risk_pct"],
+        "min_real_risk_pct": LIVE_REAL_SMALL_CAP_DEFAULTS["min_real_risk_pct"],
+        "max_real_risk_pct": LIVE_REAL_SMALL_CAP_DEFAULTS["max_real_risk_pct"],
+        "max_daily_real_loss_pct_of_equity": LIVE_REAL_SMALL_CAP_DEFAULTS["max_daily_real_loss_pct_of_equity"],
+        "max_weekly_real_loss_pct_of_equity": LIVE_REAL_SMALL_CAP_DEFAULTS["max_weekly_real_loss_pct_of_equity"],
         "max_open_positions": 1,
         "max_same_direction_positions": 1,
-        "max_daily_real_loss_usdt": 6.0,
-        "max_weekly_real_loss_usdt": 30.0,
     })
     if args.side:
         cfg["live_real_side_hint"] = args.side

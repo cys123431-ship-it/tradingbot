@@ -57,10 +57,11 @@ def test_cli_builds_real_small_cap_config_with_updated_caps():
     assert cfg["real_order_enabled"] is True
     assert cfg["max_leverage"] == 5
     assert cfg["leverage"] == 5
-    assert cfg["max_real_position_notional_usdt"] == 15.0
-    assert cfg["max_real_loss_per_trade_usdt"] == 3.0
-    assert cfg["max_daily_real_loss_usdt"] == 6.0
-    assert cfg["max_weekly_real_loss_usdt"] == 30.0
+    assert cfg["max_real_position_notional_usdt"] == pytest.approx(5.58)
+    assert cfg["max_real_loss_per_trade_usdt"] == pytest.approx(0.31)
+    assert cfg["max_daily_real_loss_usdt"] == pytest.approx(2.232)
+    assert cfg["max_weekly_real_loss_usdt"] == pytest.approx(11.16)
+    assert cfg["max_real_position_notional_pct_of_equity"] == pytest.approx(0.09)
 
 
 def test_cli_main_runs_once_when_safety_tokens_are_present(monkeypatch, capsys):

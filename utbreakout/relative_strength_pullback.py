@@ -38,6 +38,8 @@ def default_relative_strength_pullback_config():
         "trend_htf": "1d",
         "signal_tf": "4h",
         "entry_execution": "next_open",
+        "forced_direction": None,
+        "direction_source": "UTBreakout",
         "donchian_length": 20,
         "ema_pullback": 20,
         "ema_fast": 20,
@@ -93,6 +95,15 @@ def _finite_float(value, default=0.0):
     except (TypeError, ValueError):
         return float(default)
     return parsed if isfinite(parsed) else float(default)
+
+
+def _normalize_forced_direction(value):
+    text = str(value or "").strip().lower()
+    if text in {"long", "buy", "bull", "bullish"}:
+        return "long"
+    if text in {"short", "sell", "bear", "bearish"}:
+        return "short"
+    return None
 
 
 def _row_value(row, key, default=0.0):
@@ -493,11 +504,24 @@ def _extended_candle_block(row, atr, side, cfg):
 
 
 def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None):
+    forced_direction = _normalize_forced_direction(
+        cfg.get("forced_direction")
+        or cfg.get("rspt_forced_direction")
+        or cfg.get("utbreakout_direction")
+    )
+    direction_source = str(
+        cfg.get("direction_source")
+        or cfg.get("rspt_direction_source")
+        or "UTBreakout"
+    )
     base_logs = {
         "scanner_passed": True,
         "symbol": symbol,
         "entry_strategy": ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
         "entry_execution": cfg.get("entry_execution", "next_open"),
+        "direction_by": direction_source,
+        "rspt_direction_source": direction_source,
+        "rspt_forced_direction": forced_direction,
     }
     min_signal = max(int(cfg.get("ema_trend", 100) or 100), int(cfg.get("donchian_length", 20) or 20)) + 2
     min_htf = max(int(cfg.get("ema_htf", 200) or 200), int(cfg.get("ema_htf_fast", 50) or 50)) + 1
@@ -525,6 +549,7 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
         candidate_sides.append("long")
     if short_trend:
         candidate_sides.append("short")
+    original_candidate_sides = list(candidate_sides)
 
     logs = {
         **base_logs,
@@ -541,11 +566,25 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
         "relative_strength_reason": rs_reason,
         "relative_strength_candidate_count": rs.get("candidate_count"),
         "relative_strength_ranked_count": rs.get("ranked_count"),
+        "rspt_original_candidate_sides": original_candidate_sides,
+        "rspt_ignored_opposite_side": False,
     }
+
+    if forced_direction not in {"long", "short"}:
+        reason = "no_ut_direction"
+        return PullbackTrendDecision(symbol, reason=reason, logs={**logs, "rejected_reason": reason})
+
+    logs["rspt_final_side"] = forced_direction
+    logs["rspt_ignored_opposite_side"] = any(side != forced_direction for side in original_candidate_sides)
 
     if not candidate_sides:
         reason = "trend_filter_failed"
-        return PullbackTrendDecision(symbol, reason=reason, logs={**logs, "rejected_reason": reason})
+        return PullbackTrendDecision(symbol, side=forced_direction, reason=reason, logs={**logs, "rejected_reason": reason})
+
+    candidate_sides = [forced_direction] if forced_direction in candidate_sides else []
+    if not candidate_sides:
+        reason = "trend_filter_failed"
+        return PullbackTrendDecision(symbol, side=forced_direction, reason=reason, logs={**logs, "rejected_reason": reason})
 
     for side in candidate_sides:
         adx_gate = _adx_gate(trend.get("adx"), cfg)

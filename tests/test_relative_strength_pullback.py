@@ -40,6 +40,8 @@ def _base_config(**overrides):
         "adx_soft_min": 5.0,
         "breakout_atr_max": 20.0,
         "extreme_atr_pct": 99.0,
+        "forced_direction": "long",
+        "direction_source": "UTBreakout",
     })
     cfg.update(overrides)
     return cfg
@@ -51,6 +53,8 @@ def test_defaults_keep_new_strategy_shadow_only():
     assert cfg["entry_strategy"] == ENTRY_STRATEGY_UT_BREAKOUT
     assert cfg["signal_tf"] == "4h"
     assert cfg["trend_htf"] == "1d"
+    assert cfg["forced_direction"] is None
+    assert cfg["direction_source"] == "UTBreakout"
     assert cfg["relative_strength_pullback_trend_shadow_enabled"] is True
     assert cfg["relative_strength_pullback_trend_live_enabled"] is False
     assert cfg["relative_strength_pullback_trend_paper_enabled"] is False
@@ -68,6 +72,25 @@ def test_strategy_uses_only_scanner_candidates_without_hardcoded_universe():
     assert [decision.symbol for decision in decisions] == ["FOO/USDT:USDT", "BAR/USDT:USDT"]
     assert "BTC/USDT:USDT" not in {decision.symbol for decision in decisions}
     assert all(decision.logs["scanner_passed"] is True for decision in decisions)
+    assert all(decision.logs["direction_by"] == "UTBreakout" for decision in decisions)
+
+
+def test_strategy_waits_without_utbreakout_forced_direction():
+    symbol = "FOO/USDT:USDT"
+    signal = {symbol: _breakout_rows(100.0, 0.08)}
+    htf = {symbol: _rows(220, 100.0, 0.10, timestamp_step=86_400_000)}
+
+    decisions = evaluate_relative_strength_pullback_trend(
+        [symbol],
+        signal,
+        htf,
+        config=_base_config(forced_direction=None),
+    )
+
+    assert decisions[0].entry_ready is False
+    assert decisions[0].side is None
+    assert decisions[0].reason == "no_ut_direction"
+    assert decisions[0].logs["rejected_reason"] == "no_ut_direction"
 
 
 def test_candidate_symbol_prefers_exchange_symbol_from_scanner_item():
@@ -120,7 +143,11 @@ def test_long_hard_blocks_bottom_relative_strength_only_with_enough_candidates()
         candidates,
         signal,
         htf,
-        config=_base_config(relative_strength_min_candidates=10, rs_hard_filter_min_candidates=10),
+        config=_base_config(
+            forced_direction="long",
+            relative_strength_min_candidates=10,
+            rs_hard_filter_min_candidates=10,
+        ),
     )
     weak = next(decision for decision in decisions if decision.symbol.startswith("COIN0/"))
 
@@ -139,7 +166,11 @@ def test_short_hard_blocks_top_relative_strength_only_with_enough_candidates():
         candidates,
         signal,
         htf,
-        config=_base_config(relative_strength_min_candidates=10, rs_hard_filter_min_candidates=10),
+        config=_base_config(
+            forced_direction="short",
+            relative_strength_min_candidates=10,
+            rs_hard_filter_min_candidates=10,
+        ),
     )
     strong = next(decision for decision in decisions if decision.symbol.startswith("COIN0/"))
 
@@ -184,6 +215,25 @@ def test_trend_pullback_enters_without_prior_breakout_state():
     assert decision.entry_execution == "next_open"
     assert decision.reason == "trend_pullback_confirmed"
     assert decision.logs["setup_type"] == "trend_pullback"
+
+
+def test_forced_utbreakout_direction_blocks_opposite_rspt_side():
+    symbol = "PULL/USDT:USDT"
+    base = _rows(130, 100.0, 0.06)
+    rows = _with_last(base, open=107.2, high=107.7, low=106.2, close=107.6)
+
+    decisions = evaluate_relative_strength_pullback_trend(
+        [symbol],
+        {symbol: rows},
+        {symbol: _rows(220, 100.0, 0.10, timestamp_step=86_400_000)},
+        config=_base_config(forced_direction="short"),
+    )
+    decision = decisions[0]
+
+    assert decision.entry_ready is False
+    assert decision.side == "short"
+    assert decision.reason == "trend_filter_failed"
+    assert decision.logs["rspt_ignored_opposite_side"] is True
 
 
 def test_adx_soft_zone_reduces_size_instead_of_hard_blocking():
