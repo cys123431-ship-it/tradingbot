@@ -1721,6 +1721,122 @@ def test_return_signal_engine_to_utbot_turns_off_utbreakout_customcoins_and_scan
     }
 
 
+def test_dual_alpha_keeps_adaptive_entries_but_uses_fixed_4h_direction_filter():
+    emas = _emas_module()
+    engine = object.__new__(emas.SignalEngine)
+    params = {
+        "active_strategy": emas.DUAL_ALPHA_STRATEGY,
+        "UTBotFilteredBreakoutV1": {
+            "entry_timeframe": "15m",
+            "exit_timeframe": "15m",
+            "htf_timeframe": "1h",
+            "adaptive_timeframe_enabled": True,
+            "relative_strength_pullback_trend": {
+                "signal_tf": "4h",
+                "trend_htf": "1d",
+            },
+        },
+    }
+
+    effective_cfg = engine._get_utbot_filtered_breakout_config(params)
+    ut_params = engine._dual_alpha_strategy_params(params, emas.ENTRY_STRATEGY_UT_BREAKOUT)
+    direction_params = engine._dual_alpha_direction_strategy_params(params)
+    direction_cfg = engine._get_utbot_filtered_breakout_config(direction_params)
+    rsp_params = engine._dual_alpha_strategy_params(
+        params,
+        emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+    )
+    ut_cfg = ut_params["UTBotFilteredBreakoutV1"]
+    rsp_cfg = rsp_params["UTBotFilteredBreakoutV1"]
+
+    assert effective_cfg["entry_timeframe"] == "15m"
+    assert effective_cfg["htf_timeframe"] == "1h"
+    assert effective_cfg["adaptive_timeframe_enabled"] is True
+    assert ut_params["active_strategy"] == emas.UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY
+    assert ut_cfg["adaptive_timeframe_enabled"] is True
+    assert direction_params["active_strategy"] == emas.ENTRY_STRATEGY_UT_BREAKOUT
+    assert direction_cfg["entry_timeframe"] == "4h"
+    assert direction_cfg["exit_timeframe"] == "4h"
+    assert direction_cfg["htf_timeframe"] == "1d"
+    assert direction_cfg["adaptive_timeframe_enabled"] is False
+    assert rsp_params["active_strategy"] == emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
+    assert rsp_cfg["adaptive_timeframe_enabled"] is False
+    assert rsp_cfg["relative_strength_pullback_trend"]["signal_tf"] == "4h"
+    assert rsp_cfg["relative_strength_pullback_trend"]["trend_htf"] == "1d"
+
+
+def test_dual_alpha_direction_filter_blocks_opposite_adaptive_ut_candidate():
+    emas = _emas_module()
+    engine = object.__new__(emas.SignalEngine)
+    engine.dual_alpha_last_status = {}
+    engine.last_entry_reason = {}
+    events = []
+    selected_plans = []
+    stored = {}
+
+    engine._clear_utbot_filtered_breakout_entry_plan = lambda symbol: None
+    engine._utbreakout_diag_for_symbol = lambda symbol: {}
+    engine._canonical_futures_symbol = lambda symbol: symbol
+    engine._store_utbot_filtered_breakout_status = lambda symbol, status: stored.update({symbol: dict(status)})
+    engine._utbreakout_trace_event = (
+        lambda symbol, stage, status, **kwargs: events.append((symbol, stage, status, kwargs))
+    )
+    engine._set_utbot_filtered_breakout_entry_plan = (
+        lambda symbol, plan: selected_plans.append((symbol, dict(plan)))
+    )
+    engine._get_utbot_filtered_breakout_entry_plan = (
+        lambda symbol, side=None: {
+            "plan_symbol": symbol,
+            "strategy": emas.UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY,
+        }
+        if side == "short"
+        else None
+    )
+
+    async def direction_filter(symbol, strategy_params, *, force_reprocess=False):
+        return "long", "4h/1d UT direction LONG", {
+            "accepted_side": "long",
+            "entry_timeframe": "4h",
+            "htf_timeframe": "1d",
+        }
+
+    async def adaptive_ut_signal(symbol, df, strategy_params, *, force_reprocess=False):
+        return "short", "adaptive UT short ready", {
+            "accepted_code": "ACCEPTED_ENTRY",
+            "accepted_side": "short",
+            "stage": "entry_ready",
+        }
+
+    async def rspt_signal(symbol, df, strategy_params, *, force_reprocess=False, forced_direction=None, direction_source=None, resolve_ut_direction=True):
+        assert forced_direction == "long"
+        assert direction_source == "UTBreakout"
+        return None, "RSPT waiting", {}
+
+    engine._dual_alpha_ut_direction_filter = direction_filter
+    engine._calculate_utbot_filtered_breakout_signal = adaptive_ut_signal
+    engine._calculate_relative_strength_pullback_signal = rspt_signal
+
+    side, reason, status = asyncio.run(
+        engine._calculate_dual_alpha_signal(
+            "DOGE/USDT:USDT",
+            pd.DataFrame(
+                [
+                    [1, 1.0, 1.0, 1.0, 1.0, 1.0],
+                    [2, 1.0, 1.0, 1.0, 1.0, 1.0],
+                ],
+                columns=["timestamp", "open", "high", "low", "close", "volume"],
+            ),
+            {"active_strategy": emas.DUAL_ALPHA_STRATEGY, "UTBotFilteredBreakoutV1": {}},
+        )
+    )
+
+    assert side is None
+    assert "Direction=4h/1d UT direction LONG" in reason
+    assert status["dual_alpha"]["direction_filter"]["side"] == "long"
+    assert selected_plans == []
+    assert any(event[2] == "UT_OPPOSITE_DIRECTION_BLOCKED" for event in events)
+
+
 def test_rsibb_is_selectable_without_becoming_default(tmp_path):
     emas = _emas_module()
 

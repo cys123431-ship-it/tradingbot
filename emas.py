@@ -2250,6 +2250,9 @@ def build_default_utbot_filtered_breakout_config():
         'entry_timeframe': '15m',
         'exit_timeframe': '15m',
         'htf_timeframe': '1h',
+        'dual_alpha_direction_filter_enabled': False,
+        'dual_alpha_direction_filter_timeframe': '4h',
+        'dual_alpha_direction_filter_htf': '1d',
         'entry_strategy': ENTRY_STRATEGY_UT_BREAKOUT,
         'relative_strength_pullback_trend': default_relative_strength_pullback_config(),
         'relative_strength_pullback_trend_shadow_enabled': True,
@@ -7567,6 +7570,13 @@ class SignalEngine(BaseEngine):
             cfg['atr_max_percent'] = cfg['atr_min_percent']
         cfg = apply_stable_utbreak_final_overrides(cfg)
         cfg = apply_profit_opportunity_effective_overrides(cfg)
+        if bool(cfg.get('dual_alpha_direction_filter_enabled', False)):
+            direction_tf = str(cfg.get('dual_alpha_direction_filter_timeframe') or '4h').strip().lower() or '4h'
+            direction_htf = str(cfg.get('dual_alpha_direction_filter_htf') or '1d').strip().lower() or '1d'
+            cfg['entry_timeframe'] = direction_tf
+            cfg['exit_timeframe'] = direction_tf
+            cfg['htf_timeframe'] = direction_htf
+            cfg['adaptive_timeframe_enabled'] = False
         return cfg
 
     def _get_utbot_filtered_breakout_ut_params(self, cfg):
@@ -14091,6 +14101,10 @@ class SignalEngine(BaseEngine):
         status = status if isinstance(status, dict) else {}
         if status.get('accepted_code') == 'ACCEPTED_ENTRY':
             return self._normalize_relative_strength_pullback_direction(status.get('accepted_side'))
+        for key in ('candidate_side', 'candidate_signal', 'ut_bias_side', 'fresh_signal'):
+            side = self._normalize_relative_strength_pullback_direction(status.get(key))
+            if side:
+                return side
         return None
 
     async def _resolve_relative_strength_pullback_ut_direction(
@@ -14101,7 +14115,7 @@ class SignalEngine(BaseEngine):
         *,
         force_reprocess=False,
     ):
-        ut_params = self._dual_alpha_strategy_params(strategy_params, ENTRY_STRATEGY_UT_BREAKOUT)
+        ut_params = self._dual_alpha_direction_strategy_params(strategy_params)
         ut_sig, ut_reason, ut_status = await self._calculate_utbot_filtered_breakout_signal(
             symbol,
             df,
@@ -14184,7 +14198,7 @@ class SignalEngine(BaseEngine):
             self._store_utbot_filtered_breakout_status(symbol, status)
             self.last_entry_reason[symbol] = reason
             self._record_utbreakout_diagnostic_event(symbol, status)
-            if record_failure and side:
+            if record_failure and side and not bool(cfg.get('dual_alpha_direction_filter_enabled', False)):
                 self._record_utbot_filtered_breakout_failure(
                     symbol,
                     side,
@@ -14489,10 +14503,77 @@ class SignalEngine(BaseEngine):
             cfg['entry_strategy'] = ENTRY_STRATEGY_UT_BREAKOUT
             cfg['relative_strength_pullback_trend_live_enabled'] = False
             cfg['relative_strength_pullback_trend_paper_enabled'] = False
+            cfg['dual_alpha_direction_filter_enabled'] = False
             cfg['adaptive_timeframe_enabled'] = True
             params['active_strategy'] = UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY
         params['UTBotFilteredBreakoutV1'] = cfg
         return params
+
+    def _dual_alpha_direction_strategy_params(self, strategy_params):
+        params = copy.deepcopy(strategy_params if isinstance(strategy_params, dict) else {})
+        cfg = dict(params.get('UTBotFilteredBreakoutV1') or {})
+        cfg['entry_strategy'] = ENTRY_STRATEGY_UT_BREAKOUT
+        cfg['relative_strength_pullback_trend_live_enabled'] = False
+        cfg['relative_strength_pullback_trend_paper_enabled'] = False
+        cfg['dual_alpha_direction_filter_enabled'] = True
+        cfg['dual_alpha_direction_filter_timeframe'] = '4h'
+        cfg['dual_alpha_direction_filter_htf'] = '1d'
+        cfg['entry_timeframe'] = '4h'
+        cfg['exit_timeframe'] = '4h'
+        cfg['htf_timeframe'] = '1d'
+        cfg['adaptive_timeframe_enabled'] = False
+        params['active_strategy'] = ENTRY_STRATEGY_UT_BREAKOUT
+        params['UTBotFilteredBreakoutV1'] = cfg
+        return params
+
+    async def _dual_alpha_ut_direction_filter(self, symbol, strategy_params, *, force_reprocess=False):
+        direction_params = self._dual_alpha_direction_strategy_params(strategy_params)
+        direction_cfg = self._get_utbot_filtered_breakout_config(direction_params)
+        direction_tf = str(direction_cfg.get('entry_timeframe') or '4h').strip().lower() or '4h'
+        try:
+            ohlcv = await asyncio.to_thread(
+                self.market_data_exchange.fetch_ohlcv,
+                symbol,
+                direction_tf,
+                limit=300,
+            )
+            direction_df = pd.DataFrame(
+                ohlcv,
+                columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'],
+            )
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                direction_df[col] = pd.to_numeric(direction_df[col], errors='coerce')
+        except Exception as exc:
+            reason = f"DUAL direction filter fetch failed ({direction_tf}): {exc}"
+            self._utbreakout_trace_event(
+                symbol,
+                'DUAL_ALPHA',
+                'DIRECTION_FILTER_ERROR',
+                entry_timeframe=direction_tf,
+                htf_timeframe=direction_cfg.get('htf_timeframe'),
+                reason=str(exc),
+            )
+            return None, reason, {}
+
+        sig, reason, status = await self._calculate_utbot_filtered_breakout_signal(
+            symbol,
+            direction_df,
+            direction_params,
+            force_reprocess=force_reprocess,
+        )
+        status = dict(status or self._utbreakout_diag_for_symbol(symbol) or {})
+        side = self._extract_relative_strength_pullback_ut_direction(sig, status)
+        self._clear_utbot_filtered_breakout_entry_plan(symbol)
+        self._utbreakout_trace_event(
+            symbol,
+            'DUAL_ALPHA',
+            'DIRECTION_FILTER',
+            side=side,
+            entry_timeframe=direction_cfg.get('entry_timeframe'),
+            htf_timeframe=direction_cfg.get('htf_timeframe'),
+            reason=reason,
+        )
+        return side, reason, status
 
     def _dual_alpha_light(self, status, label):
         status = status if isinstance(status, dict) else {}
@@ -14578,6 +14659,11 @@ class SignalEngine(BaseEngine):
     ):
         self._clear_utbot_filtered_breakout_entry_plan(symbol)
         base_symbol = symbol
+        direction_side, direction_reason, direction_status = await self._dual_alpha_ut_direction_filter(
+            base_symbol,
+            strategy_params,
+            force_reprocess=force_reprocess,
+        )
         ut_params = self._dual_alpha_strategy_params(strategy_params, ENTRY_STRATEGY_UT_BREAKOUT)
         ut_sig, ut_reason, ut_status = await self._calculate_utbot_filtered_breakout_signal(
             base_symbol,
@@ -14591,7 +14677,7 @@ class SignalEngine(BaseEngine):
             if ut_sig in {'long', 'short'}
             else None
         )
-        rspt_forced_direction = self._extract_relative_strength_pullback_ut_direction(ut_sig, ut_status)
+        rspt_forced_direction = direction_side
 
         rsp_params = self._dual_alpha_strategy_params(
             strategy_params,
@@ -14616,16 +14702,39 @@ class SignalEngine(BaseEngine):
 
         choices = []
         if ut_sig in {'long', 'short'} and isinstance(ut_plan, dict):
-            choices.append({
-                'key': ENTRY_STRATEGY_UT_BREAKOUT,
-                'label': 'UTBreakout',
-                'side': ut_sig,
-                'reason': ut_reason,
-                'status': ut_status,
-                'plan': ut_plan,
-                'score': self._dual_alpha_score(ENTRY_STRATEGY_UT_BREAKOUT, ut_sig, ut_status, ut_plan),
-                'priority': 0,
-            })
+            if direction_side and ut_sig != direction_side:
+                ut_status['dual_direction_filter_blocked'] = True
+                ut_status['dual_direction_filter_side'] = direction_side
+                ut_status['dual_direction_filter_reason'] = direction_reason
+                self._utbreakout_trace_event(
+                    base_symbol,
+                    'DUAL_ALPHA',
+                    'UT_OPPOSITE_DIRECTION_BLOCKED',
+                    direction_filter_side=direction_side,
+                    ut_direction=ut_sig,
+                    reason=direction_reason,
+                )
+            elif direction_side not in {'long', 'short'}:
+                ut_status['dual_direction_filter_blocked'] = True
+                ut_status['dual_direction_filter_reason'] = direction_reason or 'no 4h/1d UT direction'
+                self._utbreakout_trace_event(
+                    base_symbol,
+                    'DUAL_ALPHA',
+                    'UT_DIRECTION_FILTER_MISSING',
+                    ut_direction=ut_sig,
+                    reason=direction_reason or 'no 4h/1d UT direction',
+                )
+            else:
+                choices.append({
+                    'key': ENTRY_STRATEGY_UT_BREAKOUT,
+                    'label': 'UTBreakout',
+                    'side': ut_sig,
+                    'reason': ut_reason,
+                    'status': ut_status,
+                    'plan': ut_plan,
+                    'score': self._dual_alpha_score(ENTRY_STRATEGY_UT_BREAKOUT, ut_sig, ut_status, ut_plan),
+                    'priority': 0,
+                })
         if rsp_sig in {'long', 'short'} and isinstance(rsp_plan, dict):
             if rspt_forced_direction and rsp_sig != rspt_forced_direction:
                 self._utbreakout_trace_event(
@@ -14674,6 +14783,12 @@ class SignalEngine(BaseEngine):
 
         dual_summary = {
             'enabled': True,
+            'direction_filter': {
+                'side': direction_side,
+                'reason': direction_reason,
+                'entry_timeframe': (direction_status or {}).get('entry_timeframe', '4h'),
+                'htf_timeframe': (direction_status or {}).get('htf_timeframe', '1d'),
+            },
             'utbreak': self._dual_alpha_light(ut_status, 'UTBreakout'),
             'rspt': self._dual_alpha_light(rsp_status, 'RSPT'),
             'selected': selected.get('key') if selected else None,
@@ -14708,7 +14823,7 @@ class SignalEngine(BaseEngine):
             )
         else:
             final_status['reason'] = (
-                f"DUAL_ALPHA waiting: UT={ut_reason}; RSPT={rsp_reason}"
+                f"DUAL_ALPHA waiting: Direction={direction_reason}; UT={ut_reason}; RSPT={rsp_reason}"
             )
             final_status['stage'] = 'waiting'
             self._utbreakout_trace_event(
@@ -14833,7 +14948,7 @@ class SignalEngine(BaseEngine):
             self._store_utbot_filtered_breakout_status(symbol, status)
             self.last_entry_reason[symbol] = reason
             self._record_utbreakout_diagnostic_event(symbol, status)
-            if record_failure and side:
+            if record_failure and side and not bool(cfg.get('dual_alpha_direction_filter_enabled', False)):
                 self._record_utbot_filtered_breakout_failure(
                     symbol,
                     side,
@@ -39760,6 +39875,7 @@ class MainController:
                     engine.start()
             return (
                 "DUAL Alpha ON. UTBreakout + RSPT are both watched; "
+                "4h signal + 1d HTF UT direction is used as the DUAL direction filter. "
                 "one selected plan uses the existing risk/TP/SL/order path with no extra small-cap limit."
             )
 
