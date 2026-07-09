@@ -4892,3 +4892,183 @@ def test_replace_stop_loss_aborts_when_open_order_fetch_fails():
     assert order is None
     assert engine.exchange.created == []
     assert engine.last_protection_order_status["BTC/USDT"]["status"] == "SL_REPLACE_FETCH_FAILED"
+
+
+def _build_dual_status_engine():
+    emas = _emas_module()
+    engine_cls = emas.SignalEngine
+    engine = engine_cls.__new__(engine_cls)
+
+    class Controller:
+        is_paused = False
+
+        def get_exchange_mode(self):
+            return emas.BINANCE_MAINNET
+
+    engine.ctrl = Controller()
+    engine.utbreakout_auto_entry_bridge_enabled = True
+    engine.dual_alpha_last_status = {}
+    engine.last_live_entry_snapshot = {}
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": emas.DUAL_ALPHA_STRATEGY,
+    }
+    engine.get_runtime_common_settings = lambda: {
+        "live_activation_stage": "LIVE_REAL_SMALL_CAP",
+        "real_order_enabled": True,
+        "live_trading": True,
+        "testnet": False,
+    }
+    engine._get_micro_auto_config = lambda: {}
+    engine._utbreakout_diag_for_symbol = lambda symbol: {}
+
+    async def no_active_positions(use_cache=False):
+        return set()
+
+    async def no_position(symbol, use_cache=False):
+        return True, None
+
+    engine.get_active_position_symbols = no_active_positions
+    engine._fetch_server_position_checked = no_position
+    return emas, engine
+
+
+def test_dual_order_path_reads_bridge_off_as_signal_only():
+    emas, engine = _build_dual_status_engine()
+    engine.utbreakout_auto_entry_bridge_enabled = False
+
+    summary = engine.resolve_live_order_path_status(
+        engine.get_runtime_common_settings(),
+        selected="RSPT LONG",
+    )
+
+    assert summary["bridge_enabled"] is False
+    assert summary["live_order_enabled"] is False
+    assert summary["order_action"] == "signal_only"
+    assert summary["reason"] == "bridge_off_signal_only"
+    assert summary["trading_mode"] == "LIVE_REAL_SMALL_CAP"
+
+
+def test_dual_order_path_bridge_on_selected_none_keeps_live_enabled():
+    emas, engine = _build_dual_status_engine()
+
+    summary = engine.resolve_live_order_path_status(
+        engine.get_runtime_common_settings(),
+        selected=None,
+    )
+
+    assert summary["bridge_enabled"] is True
+    assert summary["live_order_enabled"] is True
+    assert summary["order_action"] == "live_entry_enabled"
+    assert summary["reason"] == "bridge_on_but_no_selected_signal"
+    assert summary["trading_mode"] != ""
+
+
+def test_dual_order_path_never_displays_blank_trading_mode():
+    emas, engine = _build_dual_status_engine()
+    cfg = {
+        "real_order_enabled": False,
+        "live_trading": False,
+        "testnet": False,
+    }
+
+    summary = engine.resolve_live_order_path_status(cfg, selected="UTBreakout LONG")
+
+    assert summary["trading_mode"] == "unknown"
+    assert summary["mode_reason"] == "missing_trading_mode_config"
+
+
+def test_dual_status_selected_none_is_not_position_none():
+    emas, engine = _build_dual_status_engine()
+    text = asyncio.run(engine.build_dual_alpha_status_text("AAVE/USDT:USDT"))
+
+    assert "Order Path:" in text
+    assert "bridge_enabled=true" in text
+    assert "live_order_enabled=true" in text
+    assert "Current Position:" in text
+    assert "Signal Status:" in text
+    assert "Selected: none" in text
+    assert "현재 새 진입 후보 없음" in text
+    assert "final_action=no_new_entry_signal" in text
+
+
+def test_dual_status_current_position_and_protection_ok():
+    emas, engine = _build_dual_status_engine()
+
+    async def active_positions(use_cache=False):
+        return {"AAVE/USDT"}
+
+    async def position(symbol, use_cache=False):
+        return True, {
+            "symbol": "AAVE/USDT:USDT",
+            "side": "long",
+            "contracts": 0.1,
+            "entryPrice": 92.10,
+            "markPrice": 93.0,
+            "unrealizedPnl": 0.09,
+        }
+
+    async def protection_orders(symbol):
+        return True, [
+            {"type": "TAKE_PROFIT_MARKET", "side": "sell", "reduceOnly": True, "stopPrice": 106.1773},
+            {"type": "STOP_MARKET", "side": "sell", "reduceOnly": True, "stopPrice": 86.0948},
+        ]
+
+    engine.get_active_position_symbols = active_positions
+    engine._fetch_server_position_checked = position
+    engine._collect_protection_orders_checked = protection_orders
+
+    text = asyncio.run(engine.build_dual_alpha_status_text("AAVE/USDT:USDT"))
+
+    assert "Current Position:" in text
+    assert "symbol=AAVE/USDT:USDT" in text
+    assert "side=LONG" in text
+    assert "Protection Orders:" in text
+    assert "status=OK" in text
+    assert "tp_count=1" in text
+    assert "sl_count=1" in text
+    assert "reduce_only_ok=true" in text
+
+
+def test_dual_protection_status_warns_when_sl_missing():
+    emas, engine = _build_dual_status_engine()
+
+    async def protection_orders(symbol):
+        return True, [
+            {"type": "TAKE_PROFIT_MARKET", "side": "sell", "reduceOnly": True, "stopPrice": 106.1773},
+        ]
+
+    engine._collect_protection_orders_checked = protection_orders
+    status = asyncio.run(
+        engine._dual_alpha_read_protection_order_status(
+            "AAVE/USDT:USDT",
+            {"symbol": "AAVE/USDT:USDT", "side": "long", "contracts": 0.1, "entryPrice": 92.10},
+        )
+    )
+
+    assert status["status"] == "WARNING"
+    assert status["reason"] == "sl_order_missing"
+
+
+def test_dual_entry_execution_snapshot_uses_filled_qty_for_actual_risk():
+    emas, engine = _build_dual_status_engine()
+
+    snapshot = engine._build_entry_execution_snapshot(
+        "AAVE/USDT:USDT",
+        "long",
+        requested_price=92.10,
+        actual_entry_price=92.10,
+        entry_plan={
+            "qty": 0.17517917,
+            "stop_loss": 86.0948,
+            "risk_usdt": 1.0765,
+        },
+        final_order_qty=0.1,
+        filled_qty=0.1,
+        strategy="DUAL_ALPHA_V1",
+    )
+
+    assert snapshot["planned_qty"] == pytest.approx(0.17517917)
+    assert snapshot["filled_qty"] == pytest.approx(0.1)
+    assert snapshot["actual_notional"] == pytest.approx(9.21)
+    assert snapshot["actual_risk_estimate"] == pytest.approx(0.60052)
+    assert snapshot["qty_limiter_reason"] == "exchange_step_size_or_min_qty_rounding"

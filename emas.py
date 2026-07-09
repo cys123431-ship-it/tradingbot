@@ -4986,6 +4986,7 @@ class SignalEngine(BaseEngine):
         self.relative_strength_pullback_last_decisions = {}  # symbol -> latest shadow/live decision
         self.relative_strength_pullback_eval_cache = {}  # short-lived scanner evaluation cache
         self.dual_alpha_last_status = {}  # symbol -> latest dual alpha selection summary
+        self.last_live_entry_snapshot = {}  # latest confirmed live entry, for status fallback only
         self.utbreakout_adaptive_tf_state = {}  # symbol -> selected TF stability state
         self.utbreakout_adaptive_last_decision_ts = {}  # symbol -> tf -> last closed candle evaluated
         self.utbreakout_last_selected_set_ids = {}  # symbol -> last validated AUTO Set
@@ -5069,6 +5070,7 @@ class SignalEngine(BaseEngine):
         self.relative_strength_pullback_last_decisions = {}
         self.relative_strength_pullback_eval_cache = {}
         self.dual_alpha_last_status = {}
+        self.last_live_entry_snapshot = {}
         self.utbreakout_adaptive_tf_state = {}
         self.utbreakout_adaptive_last_decision_ts = {}
         self.utbreakout_last_selected_set_ids = {}
@@ -11500,6 +11502,21 @@ class SignalEngine(BaseEngine):
                 entry_ref_price=entry_price,
                 source=f'auto_entry_bridge:{source}',
             )
+            try:
+                order_path_status = self.resolve_live_order_path_status(
+                    self.get_runtime_common_settings(),
+                    selected=f"{side.upper()} {symbol}",
+                )
+                logger.info(
+                    "LIVE_ENTRY_DISPATCH bridge_enabled=%s live_order_enabled=%s "
+                    "selected=%s symbol=%s",
+                    order_path_status.get('bridge_enabled'),
+                    order_path_status.get('live_order_enabled'),
+                    f"{side.upper()}",
+                    symbol,
+                )
+            except Exception:
+                logger.debug("LIVE_ENTRY_DISPATCH status log skipped", exc_info=True)
             await self.entry(symbol, side, entry_price)
             return True
         except Exception as exc:
@@ -14864,6 +14881,404 @@ class SignalEngine(BaseEngine):
             return selected['side'], final_status['reason'], final_status
         return None, final_status['reason'], final_status
 
+    def _resolve_dual_alpha_trading_mode(self, cfg, exchange_mode=None):
+        cfg = cfg if isinstance(cfg, dict) else {}
+        raw_stage = (
+            cfg.get('live_activation_stage')
+            or cfg.get('trading_mode')
+            or cfg.get('mode')
+            or ''
+        )
+        stage = _normalize_live_real_stage(raw_stage)
+        if stage:
+            return stage, None
+        if (
+            bool(cfg.get('live_trading', False))
+            and bool(cfg.get('real_order_enabled', False))
+            and not bool(cfg.get('testnet', False))
+        ):
+            return 'LIVE_REAL_SMALL_CAP', None
+        if str(exchange_mode or '').lower() == BINANCE_TESTNET or bool(cfg.get('testnet', False)):
+            return 'TESTNET_ONLY', None
+        return 'unknown', 'missing_trading_mode_config'
+
+    def resolve_live_order_path_status(self, cfg=None, exchange=None, *, selected=None):
+        cfg = dict(cfg or {})
+        ctrl = getattr(self, 'ctrl', None)
+        try:
+            exchange_mode = (
+                ctrl.get_exchange_mode()
+                if ctrl is not None and hasattr(ctrl, 'get_exchange_mode')
+                else cfg.get('exchange_mode')
+            )
+        except Exception:
+            exchange_mode = cfg.get('exchange_mode')
+        exchange_mode = str(exchange_mode or 'unknown').lower()
+        trading_mode, mode_reason = self._resolve_dual_alpha_trading_mode(cfg, exchange_mode)
+        micro_cfg = self._get_micro_auto_config() if hasattr(self, '_get_micro_auto_config') else {}
+        micro_cfg = micro_cfg if isinstance(micro_cfg, dict) else {}
+        bridge_enabled = bool(getattr(self, 'utbreakout_auto_entry_bridge_enabled', False))
+        dry_run = bool(cfg.get('dry_run', False)) or (
+            bool(micro_cfg.get('enabled', False)) and bool(micro_cfg.get('dry_run', False))
+        )
+        demo_order_enabled = (
+            exchange_mode == BINANCE_TESTNET
+            or trading_mode == 'TESTNET_ONLY'
+            or bool(cfg.get('testnet', False))
+        ) and not dry_run
+        paper_order_enabled = dry_run or trading_mode in {'PAPER_ONLY', 'DISABLED'}
+        live_stage = trading_mode == 'LIVE_REAL_SMALL_CAP'
+        live_flags_enabled = (
+            bool(cfg.get('real_order_enabled', False))
+            and bool(cfg.get('live_trading', False))
+            and not bool(cfg.get('testnet', False))
+        )
+        has_live_flags = (
+            'real_order_enabled' in cfg
+            or 'live_trading' in cfg
+            or 'testnet' in cfg
+        )
+        live_exchange = exchange_mode == BINANCE_MAINNET
+        live_capable = live_stage and live_exchange and (live_flags_enabled or not has_live_flags)
+        try:
+            paused = bool(getattr(ctrl, 'is_paused', False)) if ctrl is not None else False
+        except Exception:
+            paused = False
+        paused = paused or bool(cfg.get('global_trading_paused', False))
+        active_strategy = ''
+        try:
+            params = self.get_runtime_strategy_params()
+            active_strategy = str(params.get('active_strategy', '') or '').lower()
+        except Exception:
+            active_strategy = ''
+        dispatcher_ready = active_strategy in UTBREAKOUT_STRATEGIES or not active_strategy
+        if paused:
+            order_action = 'signal_only'
+            reason = 'bot_paused'
+            live_order_enabled = False
+        elif not bridge_enabled:
+            order_action = 'signal_only'
+            reason = 'bridge_off_signal_only'
+            live_order_enabled = False
+        elif dry_run:
+            order_action = 'signal_only'
+            reason = 'dry_run_signal_only'
+            live_order_enabled = False
+        elif demo_order_enabled:
+            order_action = 'demo_order_enabled'
+            reason = 'demo_or_testnet_exchange_path'
+            live_order_enabled = False
+        elif paper_order_enabled:
+            order_action = 'signal_only'
+            reason = 'paper_order_path'
+            live_order_enabled = False
+        elif not dispatcher_ready:
+            order_action = 'signal_only'
+            reason = 'active_strategy_not_entry_dispatchable'
+            live_order_enabled = False
+        elif live_capable:
+            order_action = 'live_entry_enabled'
+            reason = 'bridge_on_live_entry_path_enabled'
+            live_order_enabled = True
+        else:
+            order_action = 'signal_only'
+            reason = mode_reason or 'live_order_path_not_enabled'
+            live_order_enabled = False
+        selected_value = None if selected is None else (str(selected or '').strip() or None)
+        display_reason = (
+            'bridge_on_but_no_selected_signal'
+            if live_order_enabled and not selected_value
+            else reason
+        )
+        summary = {
+            'bridge_enabled': bool(bridge_enabled),
+            'exchange_mode': exchange_mode,
+            'trading_mode': trading_mode or 'unknown',
+            'live_order_enabled': bool(live_order_enabled),
+            'paper_order_enabled': bool(paper_order_enabled),
+            'demo_order_enabled': bool(demo_order_enabled),
+            'dry_run': bool(dry_run),
+            'order_executor': (
+                'execute_live_order_plan'
+                if bool(cfg.get('live_parity_signal_enabled', False))
+                else 'legacy_signal_entry'
+            ),
+            'order_action': order_action,
+            'reason': display_reason,
+            'base_reason': reason,
+            'active_strategy': active_strategy or 'unknown',
+        }
+        if mode_reason:
+            summary['mode_reason'] = mode_reason
+        return summary
+
+    def _format_dual_alpha_order_path_status(self, summary):
+        summary = summary if isinstance(summary, dict) else {}
+        return "\n".join([
+            "Order Path:",
+            f"bridge_enabled={str(bool(summary.get('bridge_enabled'))).lower()}",
+            f"exchange_mode={summary.get('exchange_mode') or 'unknown'}",
+            f"trading_mode={summary.get('trading_mode') or 'unknown'}",
+            f"live_order_enabled={str(bool(summary.get('live_order_enabled'))).lower()}",
+            f"paper_order_enabled={str(bool(summary.get('paper_order_enabled'))).lower()}",
+            f"demo_order_enabled={str(bool(summary.get('demo_order_enabled'))).lower()}",
+            f"dry_run={str(bool(summary.get('dry_run'))).lower()}",
+            f"order_executor={summary.get('order_executor') or 'unknown'}",
+            f"order_action={summary.get('order_action') or 'unknown'}",
+            f"reason={summary.get('reason') or 'unknown'}",
+        ])
+
+    async def _dual_alpha_fetch_current_position_status(self, symbol=None):
+        candidates = []
+        if symbol:
+            candidates.append(self._futures_symbol_for_order(symbol))
+        try:
+            active_symbols = await self.get_active_position_symbols(use_cache=False)
+            for item in sorted(active_symbols or []):
+                order_symbol = self._futures_symbol_for_order(item)
+                if order_symbol and order_symbol not in candidates:
+                    candidates.append(order_symbol)
+        except Exception as exc:
+            if candidates:
+                logger.debug("DUAL status active-position scan failed: %s", exc)
+            else:
+                return {
+                    'state': 'unknown',
+                    'reason': 'exchange_position_fetch_failed',
+                    'error': str(exc),
+                }
+        fetch_failed = False
+        fetch_error = None
+        for candidate in candidates:
+            try:
+                fetch_ok, pos = await self._fetch_server_position_checked(candidate)
+            except Exception as exc:
+                fetch_ok, pos = False, None
+                fetch_error = str(exc)
+            if not fetch_ok:
+                fetch_failed = True
+                continue
+            if pos:
+                return {'state': 'exists', 'source': 'exchange', 'symbol': candidate, 'position': pos}
+        if fetch_failed:
+            snapshot = getattr(self, 'last_live_entry_snapshot', None)
+            if isinstance(snapshot, dict) and snapshot.get('symbol'):
+                return {
+                    'state': 'fallback',
+                    'source': 'last_live_entry_snapshot',
+                    'symbol': snapshot.get('symbol'),
+                    'position': None,
+                    'snapshot': dict(snapshot),
+                    'reason': 'exchange_position_fetch_failed',
+                }
+            return {
+                'state': 'unknown',
+                'reason': 'exchange_position_fetch_failed',
+                'error': fetch_error,
+            }
+        return {'state': 'none', 'source': 'exchange'}
+
+    async def _dual_alpha_read_protection_order_status(self, symbol, pos=None):
+        if not symbol or not pos:
+            return {'status': 'SKIPPED', 'reason': 'no_position'}
+        try:
+            fetch_ok, orders = await self._collect_protection_orders_checked(symbol)
+        except Exception as exc:
+            return {
+                'status': 'UNKNOWN',
+                'reason': 'open_orders_fetch_failed',
+                'error': str(exc),
+            }
+        if not fetch_ok:
+            return {'status': 'UNKNOWN', 'reason': 'open_orders_fetch_failed'}
+        tp_orders = []
+        sl_orders = []
+        reduce_only_bad = []
+        for order in orders or []:
+            kind = self._classify_protection_order(order)
+            if kind == 'tp':
+                tp_orders.append(order)
+            elif kind == 'sl':
+                sl_orders.append(order)
+            if kind in {'tp', 'sl'} and not self._is_reduce_only_order(order):
+                reduce_only_bad.append(order)
+        if sl_orders and tp_orders and not reduce_only_bad:
+            status = 'OK'
+            reason = None
+        elif not sl_orders:
+            status = 'WARNING'
+            reason = 'sl_order_missing'
+        elif not tp_orders:
+            status = 'WARNING'
+            reason = 'tp_order_missing'
+        else:
+            status = 'WARNING'
+            reason = 'reduce_only_missing'
+        return {
+            'status': status,
+            'reason': reason,
+            'tp_count': len(tp_orders),
+            'sl_count': len(sl_orders),
+            'reduce_only_ok': not bool(reduce_only_bad),
+            'orphan_orders': 0,
+        }
+
+    def _format_dual_alpha_current_position_lines(self, position_status):
+        status = position_status if isinstance(position_status, dict) else {}
+        state = status.get('state')
+        lines = ["Current Position:"]
+        if state == 'exists':
+            pos = status.get('position') if isinstance(status.get('position'), dict) else {}
+            qty = abs(float(self._position_signed_contracts(pos) or pos.get('contracts', 0) or 0))
+            lines.extend([
+                f"symbol={pos.get('symbol') or status.get('symbol')}",
+                f"side={str(pos.get('side') or '').upper() or 'unknown'}",
+                f"qty={self._fmt_signal_trade_value(qty)}",
+                f"entry={self._fmt_signal_trade_value(pos.get('entryPrice'))}",
+                f"mark={self._fmt_signal_trade_value(pos.get('markPrice'))}",
+                f"unrealized_pnl={self._fmt_signal_trade_value(pos.get('unrealizedPnl'))}",
+                "source=exchange",
+            ])
+            return lines
+        if state == 'fallback':
+            snapshot = status.get('snapshot') if isinstance(status.get('snapshot'), dict) else {}
+            lines.extend([
+                "unknown",
+                "source=last_live_entry_snapshot",
+                f"reason={status.get('reason') or 'exchange_position_fetch_failed'}",
+                f"last_symbol={snapshot.get('symbol') or 'unknown'}",
+                f"last_side={str(snapshot.get('side') or '').upper() or 'unknown'}",
+                f"last_qty={snapshot.get('filled_qty') or snapshot.get('final_order_qty') or 'unknown'}",
+                f"last_entry={snapshot.get('price') or 'unknown'}",
+            ])
+            return lines
+        if state == 'unknown':
+            lines.extend([
+                "unknown",
+                f"reason={status.get('reason') or 'exchange_position_fetch_failed'}",
+            ])
+            return lines
+        lines.append("none")
+        return lines
+
+    def _format_dual_alpha_protection_lines(self, protection_status):
+        status = protection_status if isinstance(protection_status, dict) else {}
+        lines = ["Protection Orders:"]
+        state = status.get('status') or 'UNKNOWN'
+        lines.append(f"status={state}")
+        if status.get('reason'):
+            lines.append(f"reason={status.get('reason')}")
+        if 'tp_count' in status:
+            lines.append(f"tp_count={int(status.get('tp_count') or 0)}")
+        if 'sl_count' in status:
+            lines.append(f"sl_count={int(status.get('sl_count') or 0)}")
+        if 'reduce_only_ok' in status:
+            lines.append(f"reduce_only_ok={str(bool(status.get('reduce_only_ok'))).lower()}")
+        if 'orphan_orders' in status:
+            lines.append(f"orphan_orders={int(status.get('orphan_orders') or 0)}")
+        return lines
+
+    def _dual_alpha_signal_final_action(self, order_path, position_status, selected):
+        selected_present = bool(str(selected or '').strip() and str(selected or '').strip().lower() != 'none')
+        position_exists = (
+            isinstance(position_status, dict)
+            and position_status.get('state') == 'exists'
+        )
+        if selected_present and position_exists:
+            return 'preflight_blocked_existing_position'
+        if selected_present and not bool((order_path or {}).get('live_order_enabled')):
+            return 'signal_only_not_ordered'
+        if selected_present:
+            return 'ready_to_order'
+        if position_exists:
+            return 'holding_position_no_new_signal'
+        return 'no_new_entry_signal'
+
+    def _build_entry_execution_snapshot(
+        self,
+        symbol,
+        side,
+        *,
+        requested_price=None,
+        actual_entry_price=None,
+        entry_plan=None,
+        planned_qty=None,
+        final_order_qty=None,
+        filled_qty=None,
+        target_notional=None,
+        margin_to_use=None,
+        leverage=None,
+        strategy=None,
+        order=None,
+    ):
+        plan = entry_plan if isinstance(entry_plan, dict) else {}
+        entry_price = _safe_float_or_none(actual_entry_price) or _safe_float_or_none(requested_price)
+        planned_qty_value = _safe_float_or_none(planned_qty)
+        if planned_qty_value is None:
+            planned_qty_value = _safe_float_or_none(plan.get('qty'))
+        final_qty_value = _safe_float_or_none(final_order_qty)
+        filled_qty_value = _safe_float_or_none(filled_qty)
+        if filled_qty_value is None:
+            filled_qty_value = final_qty_value
+        risk_distance = _safe_float_or_none(plan.get('risk_distance'))
+        sl_price = _safe_float_or_none(
+            plan.get('stop_loss')
+            or plan.get('stop_loss_price')
+            or plan.get('sl_price')
+            or plan.get('initial_sl_price')
+        )
+        if risk_distance is None and entry_price is not None and sl_price is not None:
+            risk_distance = abs(float(entry_price) - float(sl_price))
+        planned_notional = _safe_float_or_none(
+            plan.get('planned_notional')
+            or plan.get('target_notional')
+            or target_notional
+        )
+        if planned_notional is None and planned_qty_value is not None and entry_price is not None:
+            planned_notional = float(planned_qty_value) * float(entry_price)
+        actual_notional = None
+        if filled_qty_value is not None and entry_price is not None:
+            actual_notional = float(filled_qty_value) * float(entry_price)
+        planned_risk = _safe_float_or_none(plan.get('risk_usdt') or plan.get('risk_amount'))
+        if planned_risk is None and planned_qty_value is not None and risk_distance is not None:
+            planned_risk = float(planned_qty_value) * float(risk_distance)
+        actual_risk = None
+        if filled_qty_value is not None and risk_distance is not None:
+            actual_risk = float(filled_qty_value) * float(risk_distance)
+        qty_limiter = 'none'
+        if (
+            planned_qty_value is not None
+            and final_qty_value is not None
+            and abs(float(planned_qty_value) - float(final_qty_value)) > max(1e-12, abs(float(planned_qty_value)) * 1e-6)
+        ):
+            qty_limiter = 'exchange_step_size_or_min_qty_rounding'
+        order_id = order.get('id') if isinstance(order, dict) else None
+        return {
+            'symbol': symbol,
+            'side': str(side or '').lower(),
+            'requested_price': _safe_float_or_none(requested_price),
+            'price': entry_price,
+            'planned_qty': planned_qty_value,
+            'final_order_qty': final_qty_value,
+            'filled_qty': filled_qty_value,
+            'planned_notional': planned_notional,
+            'actual_notional': actual_notional,
+            'planned_risk': planned_risk,
+            'actual_risk_estimate': actual_risk,
+            'risk_distance': risk_distance,
+            'sl_price': sl_price,
+            'margin_to_use': _safe_float_or_none(margin_to_use),
+            'leverage': _safe_float_or_none(leverage),
+            'qty_limiter_reason': qty_limiter,
+            'strategy': strategy,
+            'order_id': order_id,
+            'ts': datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _record_last_live_entry_snapshot(self, snapshot):
+        if isinstance(snapshot, dict):
+            self.last_live_entry_snapshot = dict(snapshot)
+
     async def build_dual_alpha_status_text(self, symbol=None):
         strategy_params = self.get_runtime_strategy_params()
         active_strategy = str(strategy_params.get('active_strategy', '') or '').lower()
@@ -14927,6 +15342,119 @@ class SignalEngine(BaseEngine):
             lines.append("UTBreakout: ⚪ NONE - / no recent dual evaluation")
             lines.append("RSPT: ⚪ NONE - / no recent dual evaluation")
             lines.append("Selected: none")
+        return "\n".join(lines)
+
+    async def build_dual_alpha_status_text(self, symbol=None):
+        strategy_params = self.get_runtime_strategy_params()
+        active_strategy = str(strategy_params.get('active_strategy', '') or '').lower()
+        common_cfg = self.get_runtime_common_settings() if hasattr(self, 'get_runtime_common_settings') else {}
+        common_cfg = dict(common_cfg or {})
+        symbol = symbol or getattr(self, 'scanner_active_symbol', None) or getattr(self, 'utbreakout_last_status_symbol', None)
+        status = None
+        if symbol:
+            canonical = self._canonical_futures_symbol(symbol)
+            status = (
+                (getattr(self, 'dual_alpha_last_status', {}) or {}).get(canonical)
+                or self._utbreakout_diag_for_symbol(canonical)
+            )
+        status = status if isinstance(status, dict) else {}
+        dual = status.get('dual_alpha') if isinstance(status.get('dual_alpha'), dict) else {}
+        selected = dual.get('selected_label') or dual.get('selected') if dual else None
+        selected_for_path = selected if selected and str(selected).lower() != 'none' else None
+        order_path = self.resolve_live_order_path_status(common_cfg, selected=selected_for_path)
+        position_status = await self._dual_alpha_fetch_current_position_status(symbol)
+        position = None
+        position_symbol = None
+        if isinstance(position_status, dict) and position_status.get('state') == 'exists':
+            position = position_status.get('position') if isinstance(position_status.get('position'), dict) else {}
+            position_symbol = position.get('symbol') or position_status.get('symbol')
+        protection_status = await self._dual_alpha_read_protection_order_status(position_symbol, position)
+
+        def _emoji(light):
+            return {
+                'green': 'GREEN',
+                'yellow': 'YELLOW',
+                'red': 'RED',
+                'gray': 'GRAY',
+            }.get(str(light or '').lower(), 'GRAY')
+
+        def _line(item, fallback_label):
+            item = item if isinstance(item, dict) else {}
+            label = item.get('label') or fallback_label
+            side = str(item.get('side') or '-').upper()
+            state = item.get('state') or 'NONE'
+            setup = item.get('setup_type') or '-'
+            reason = item.get('reason') or 'no recent decision'
+            direction_by = item.get('direction_by')
+            direction_note = f" / direction_by {direction_by}" if direction_by else ""
+            return f"{label}: {_emoji(item.get('light'))} {state} {side} / setup {setup}{direction_note} / {reason}"
+
+        lines = [
+            "DUAL Alpha status",
+            f"Active: {active_strategy == DUAL_ALPHA_STRATEGY}",
+            "Mode: UTBreakout + RSPT both watched, one selected, existing risk/TP/SL/order path.",
+            f"Symbol: {symbol or 'no recent symbol'}",
+            self._format_dual_alpha_order_path_status(order_path),
+            "",
+            *self._format_dual_alpha_current_position_lines(position_status),
+            "",
+            *self._format_dual_alpha_protection_lines(protection_status),
+            "",
+            "Signal Status:",
+        ]
+        if dual:
+            lines.append(_line(dual.get('utbreak'), 'UTBreakout'))
+            lines.append(_line(dual.get('rspt'), 'RSPT'))
+            selected = dual.get('selected_label') or dual.get('selected') or 'none'
+            selected_side = str(dual.get('selected_side') or '-').upper()
+            score = _safe_float_or_none(dual.get('selection_score'))
+            score_text = f" / score {score:.1f}" if score is not None else ""
+            lines.append(f"Selected: {selected} {selected_side}{score_text}")
+        else:
+            lines.append("UTBreakout: GRAY NONE - / no recent dual evaluation")
+            lines.append("RSPT: GRAY NONE - / no recent dual evaluation")
+            lines.append("Selected: none")
+            selected = 'none'
+        if not selected or str(selected).lower() == 'none':
+            lines.append("meaning=현재 새 진입 후보 없음. 현재 보유 포지션 존재 여부와는 별개.")
+            signal_action = 'no_new_entry_signal'
+        else:
+            signal_action = 'selected_entry_signal'
+        final_action = self._dual_alpha_signal_final_action(order_path, position_status, selected)
+        lines.append(f"signal_action={signal_action}")
+        lines.append(f"final_action={final_action}")
+        snapshot = getattr(self, 'last_live_entry_snapshot', None)
+        if isinstance(snapshot, dict) and snapshot.get('symbol'):
+            lines.extend([
+                "",
+                "Last Live Entry:",
+                f"symbol={snapshot.get('symbol')}",
+                f"side={str(snapshot.get('side') or '').upper()}",
+                f"filled_qty={snapshot.get('filled_qty')}",
+                f"price={snapshot.get('price')}",
+                f"strategy={snapshot.get('strategy')}",
+                f"ts={snapshot.get('ts')}",
+            ])
+            if snapshot.get('planned_qty') is not None or snapshot.get('actual_risk_estimate') is not None:
+                lines.extend([
+                    "Execution Qty/Risk:",
+                    f"planned_qty={snapshot.get('planned_qty')}",
+                    f"final_order_qty={snapshot.get('final_order_qty')}",
+                    f"filled_qty={snapshot.get('filled_qty')}",
+                    f"planned_notional={snapshot.get('planned_notional')}",
+                    f"actual_notional={snapshot.get('actual_notional')}",
+                    f"planned_risk={snapshot.get('planned_risk')}",
+                    f"actual_risk_estimate={snapshot.get('actual_risk_estimate')}",
+                    f"qty_limiter={snapshot.get('qty_limiter_reason')}",
+                ])
+        logger.info(
+            "DUAL_STATUS_ORDER_PATH bridge_enabled=%s live_order_enabled=%s "
+            "trading_mode=%s order_action=%s",
+            order_path.get('bridge_enabled'),
+            order_path.get('live_order_enabled'),
+            order_path.get('trading_mode'),
+            order_path.get('order_action'),
+        )
         return "\n".join(lines)
 
     async def _calculate_utbot_filtered_breakout_signal(
@@ -26771,7 +27299,8 @@ class SignalEngine(BaseEngine):
         entry_plan=None,
         leverage=None,
         target_notional=None,
-        margin_to_use=None
+        margin_to_use=None,
+        execution_snapshot=None
     ):
         display_symbol = self.ctrl.format_symbol_for_display(symbol)
         diag = dict(self.last_stateful_diag.get(symbol, {}) or {})
@@ -26816,6 +27345,22 @@ class SignalEngine(BaseEngine):
                     f"익절계획: `{rr_multiple:.1f}R / 거리 {take_profit_distance:.4f} "
                     f"({take_profit_pct:.3f}%) / 예상수익 {expected_profit:.2f} USDT`"
                 )
+                snapshot = execution_snapshot if isinstance(execution_snapshot, dict) else {}
+                if snapshot:
+                    lines.append(
+                        "리스크 계획: "
+                        f"`requested_risk={self._fmt_signal_trade_value(snapshot.get('planned_risk'))} USDT / "
+                        f"planned_qty={self._fmt_signal_trade_value(snapshot.get('planned_qty'))} / "
+                        f"final_order_qty={self._fmt_signal_trade_value(snapshot.get('final_order_qty'))} / "
+                        f"filled_qty={self._fmt_signal_trade_value(snapshot.get('filled_qty'))}`"
+                    )
+                    lines.append(
+                        "실제 체결 기준: "
+                        f"`planned_notional={self._fmt_signal_trade_value(snapshot.get('planned_notional'))} USDT / "
+                        f"actual_notional={self._fmt_signal_trade_value(snapshot.get('actual_notional'))} USDT / "
+                        f"actual_risk_estimate={self._fmt_signal_trade_value(snapshot.get('actual_risk_estimate'))} USDT / "
+                        f"qty_limiter={snapshot.get('qty_limiter_reason') or 'none'}`"
+                    )
             except Exception as e:
                 logger.debug(f"UT breakout entry notice sizing detail failed: {e}")
         self._append_signal_diag_lines(lines, diag, include_exit=False)
@@ -30329,6 +30874,24 @@ class SignalEngine(BaseEngine):
                     actual_entry_price=actual_entry_price,
                     order_id=order.get('id') if isinstance(order, dict) else None,
                 )
+            execution_snapshot = None
+            if active_strategy in UTBREAKOUT_STRATEGIES:
+                execution_snapshot = self._build_entry_execution_snapshot(
+                    symbol,
+                    side,
+                    requested_price=price,
+                    actual_entry_price=actual_entry_price,
+                    entry_plan=filtered_breakout_plan,
+                    planned_qty=(filtered_breakout_plan or {}).get('qty') if isinstance(filtered_breakout_plan, dict) else None,
+                    final_order_qty=qty,
+                    filled_qty=qty,
+                    target_notional=target_notional,
+                    margin_to_use=margin_to_use,
+                    leverage=lev,
+                    strategy=STRATEGY_DISPLAY_NAMES.get(active_strategy, active_strategy),
+                    order=order,
+                )
+                self._record_last_live_entry_snapshot(execution_snapshot)
             await self.ctrl.notify(
                 self._build_signal_entry_notice(
                     symbol,
@@ -30339,7 +30902,8 @@ class SignalEngine(BaseEngine):
                     entry_plan=filtered_breakout_plan if active_strategy in UTBREAKOUT_STRATEGIES else None,
                     leverage=lev,
                     target_notional=target_notional,
-                    margin_to_use=margin_to_use
+                    margin_to_use=margin_to_use,
+                    execution_snapshot=execution_snapshot,
                 )
             )
 
@@ -41781,6 +42345,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     return
                 engine._ensure_utbreakout_auto_entry_bridge_state()
                 mode = str(args[1]).strip().lower() if len(args) > 1 else ''
+                old_state = bool(engine.utbreakout_auto_entry_bridge_enabled)
                 if mode in {'on', 'enable', '1', 'true'}:
                     engine.utbreakout_auto_entry_bridge_enabled = True
                 elif mode in {'off', 'disable', '0', 'false'}:
@@ -41792,6 +42357,12 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     )
                     return
                 state = bool(engine.utbreakout_auto_entry_bridge_enabled)
+                logger.info(
+                    "UTBREAK_BRIDGE_STATE changed old=%s new=%s source=telegram_command persisted=%s",
+                    old_state,
+                    state,
+                    'runtime',
+                )
                 await u.message.reply_text(
                     "UTBreakout Auto Entry Bridge: "
                     + ("ON" if state else "OFF")
