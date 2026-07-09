@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 
 from utbreakout.alpha_engine import (
@@ -118,10 +119,146 @@ def test_profit_alpha_blocks_opposite_market_regime_when_edge_is_not_strong():
         side="long",
         values=values,
         ev_decision=_ev("TREND"),
+        config={"utbreak_entry_relaxation_mode": "strict"},
     )
 
     assert decision.allowed is False
     assert any("top market regime opposite" in item for item in decision.blockers)
+
+
+def test_profit_alpha_balanced_softens_weak_opposite_regime_with_size_reduction():
+    values = _base_values("long")
+    values["market_regime_context"] = {
+        "items": {
+            "BTC/USDT": {"direction": "short", "return_lookback_pct": -0.8},
+            "ETH/USDT": {"direction": "short", "return_lookback_pct": -0.6},
+        }
+    }
+
+    decision = evaluate_profit_alpha(
+        side="long",
+        values=values,
+        ev_decision=_ev("TREND"),
+        config={"utbreak_entry_relaxation_mode": "balanced"},
+    )
+
+    assert decision.allowed is True
+    assert decision.risk_multiplier <= 0.65
+    assert "regime_action=size_reduce" in decision.components["entry_relaxation_actions"]
+
+
+def test_profit_alpha_strict_blocks_borderline_stale_signal():
+    ev = _ev("TREND")
+    ev.signal_age_candles = 10.0
+    ev.reacceleration = False
+
+    decision = evaluate_profit_alpha(
+        side="long",
+        values=_base_values("long"),
+        ev_decision=ev,
+        config={"utbreak_entry_relaxation_mode": "strict"},
+    )
+
+    assert decision.allowed is False
+    assert any("stale signal" in item for item in decision.blockers)
+
+
+def test_profit_alpha_balanced_softens_borderline_stale_signal():
+    ev = _ev("TREND")
+    ev.signal_age_candles = 10.0
+    ev.reacceleration = False
+
+    decision = evaluate_profit_alpha(
+        side="long",
+        values=_base_values("long"),
+        ev_decision=ev,
+        config={"utbreak_entry_relaxation_mode": "balanced"},
+    )
+
+    assert decision.allowed is True
+    assert decision.risk_multiplier <= 0.65
+    assert any("stale_signal" in item for item in decision.reasons)
+
+
+def test_profit_alpha_active_allows_wider_stale_window_than_balanced():
+    ev = _ev("TREND")
+    ev.signal_age_candles = 14.0
+    ev.reacceleration = False
+
+    balanced = evaluate_profit_alpha(
+        side="long",
+        values=_base_values("long"),
+        ev_decision=ev,
+        config={"utbreak_entry_relaxation_mode": "balanced"},
+    )
+    active = evaluate_profit_alpha(
+        side="long",
+        values=_base_values("long"),
+        ev_decision=ev,
+        config={"utbreak_entry_relaxation_mode": "active"},
+    )
+
+    assert balanced.allowed is False
+    assert active.allowed is True
+    assert active.risk_multiplier <= 0.55
+
+
+def test_profit_alpha_balanced_reduces_size_for_weak_adx_but_blocks_very_low_adx():
+    weak = _base_values("long")
+    weak["adx"] = 17.0
+    very_low = _base_values("long")
+    very_low["adx"] = 14.0
+
+    weak_decision = evaluate_profit_alpha(
+        side="long",
+        values=weak,
+        ev_decision=_ev("TREND"),
+        config={
+            "utbreak_entry_relaxation_mode": "balanced",
+            "direction_engine_min_score": 0.0,
+        },
+    )
+    low_decision = evaluate_profit_alpha(
+        side="long",
+        values=very_low,
+        ev_decision=_ev("TREND"),
+        config={
+            "utbreak_entry_relaxation_mode": "balanced",
+            "direction_engine_min_score": 0.0,
+        },
+    )
+
+    assert weak_decision.allowed is True
+    assert weak_decision.risk_multiplier <= 0.65
+    assert any("adx_weak_size_reduced" in item for item in weak_decision.reasons)
+    assert low_decision.allowed is False
+    assert any("adx_too_low" in item for item in low_decision.blockers)
+
+
+def test_profit_alpha_balanced_penalizes_missing_derivatives_without_hard_block():
+    values = _base_values("short")
+    for key in (
+        "taker_buy_sell_ratio",
+        "rolling_ofi",
+        "orderbook_imbalance_pct",
+        "open_interest_change_1h",
+        "open_interest_acceleration",
+        "funding_rate",
+        "basis_pct",
+        "long_short_ratio",
+    ):
+        values.pop(key, None)
+
+    decision = evaluate_profit_alpha(
+        side="short",
+        values=values,
+        ev_decision=_ev("TREND"),
+        config={"utbreak_entry_relaxation_mode": "balanced"},
+    )
+
+    assert decision.allowed is True
+    assert decision.risk_multiplier <= 0.80
+    assert any("derivatives_data_missing" in item for item in decision.reasons)
 
 
 def test_profit_alpha_blocks_derivatives_adverse_stack():
@@ -269,6 +406,55 @@ def test_entry_edge_combines_ev_and_profit_alpha_into_single_decision():
     assert decision.entry_type == alpha.entry_type
     assert decision.exit_policy == alpha.exit_policy
     assert decision.direction_score == alpha.direction_score
+
+
+def test_entry_edge_balanced_softens_borderline_thresholds_with_size_reduction():
+    alpha = evaluate_profit_alpha(
+        side="long",
+        values=_base_values("long"),
+        ev_decision=_ev(),
+    )
+    alpha = replace(alpha, allowed=True, score=68.0, probability=0.558, risk_multiplier=1.0, blockers=())
+    ev = _ev()
+    ev.score = 68.0
+    ev.win_probability = 0.558
+    ev.risk_multiplier = 1.0
+
+    decision = build_entry_edge_decision(
+        side="long",
+        ev_decision=ev,
+        alpha_decision=alpha,
+        config={"utbreak_entry_relaxation_mode": "balanced"},
+    )
+
+    assert decision.allowed is True
+    assert decision.risk_multiplier <= 0.60
+    assert any("Entry Edge score borderline" in item for item in decision.reasons)
+    assert any("Entry Edge p borderline" in item for item in decision.reasons)
+
+
+def test_entry_edge_strict_blocks_same_borderline_thresholds():
+    alpha = evaluate_profit_alpha(
+        side="long",
+        values=_base_values("long"),
+        ev_decision=_ev(),
+    )
+    alpha = replace(alpha, allowed=True, score=68.0, probability=0.558, risk_multiplier=1.0, blockers=())
+    ev = _ev()
+    ev.score = 68.0
+    ev.win_probability = 0.558
+    ev.risk_multiplier = 1.0
+
+    decision = build_entry_edge_decision(
+        side="long",
+        ev_decision=ev,
+        alpha_decision=alpha,
+        config={"utbreak_entry_relaxation_mode": "strict"},
+    )
+
+    assert decision.allowed is False
+    assert any("Entry Edge score" in item for item in decision.blockers)
+    assert any("Entry Edge p" in item for item in decision.blockers)
 
 
 def test_entry_edge_blocks_when_either_source_is_not_allowed():

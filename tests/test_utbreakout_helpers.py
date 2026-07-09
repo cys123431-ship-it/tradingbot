@@ -3193,7 +3193,7 @@ def test_utbreakout_market_quality_blocks_extreme_short_adverse_funding():
         cfg,
         {
             "atr_pct": 0.5,
-            "funding_rate": -0.002,
+            "funding_rate": -0.003,
             "futures_spread_pct": 0.02,
         },
     )

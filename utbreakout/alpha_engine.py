@@ -23,6 +23,8 @@ from .intelligence import (
     evaluate_protection_health_engine,
 )
 
+UTBREAK_RELAXATION_MODES = {"strict", "balanced", "active"}
+
 
 @dataclass(frozen=True)
 class ProfitAlphaDecision:
@@ -84,7 +86,7 @@ class EntryEdgeDecision:
     exit_policy: str = ""
     reasons: tuple[str, ...] = ()
     blockers: tuple[str, ...] = ()
-    components: Mapping[str, float] = field(default_factory=dict)
+    components: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def summary(self) -> str:
@@ -103,6 +105,7 @@ class EntryEdgeDecision:
 
 def default_profit_alpha_config() -> dict[str, Any]:
     cfg = {
+        "utbreak_entry_relaxation_mode": "balanced",
         "profit_alpha_enabled": True,
         "profit_alpha_min_score": 68.0,
         "profit_alpha_long_min_score": 69.0,
@@ -149,9 +152,47 @@ def default_profit_alpha_config() -> dict[str, Any]:
         "entry_edge_long_min_probability": 0.560,
         "entry_edge_short_min_probability": 0.555,
         "entry_edge_min_net_expectancy_r": 0.14,
+        "entry_relaxation_balanced_score_buffer": 1.5,
+        "entry_relaxation_active_score_buffer": 3.0,
+        "entry_relaxation_balanced_probability_buffer": 0.005,
+        "entry_relaxation_active_probability_buffer": 0.010,
     }
     cfg.update(default_intelligence_config())
     return cfg
+
+
+def normalize_utbreakout_relaxation_mode(value: Any) -> str:
+    mode = str(value or "balanced").strip().lower()
+    return mode if mode in UTBREAK_RELAXATION_MODES else "balanced"
+
+
+def _relaxation_mode_from_cfg(cfg: Mapping[str, Any] | None) -> str:
+    cfg = cfg if isinstance(cfg, Mapping) else {}
+    return normalize_utbreakout_relaxation_mode(cfg.get("utbreak_entry_relaxation_mode"))
+
+
+def _relaxation_score_buffer(cfg: Mapping[str, Any], mode: str) -> float:
+    if mode == "active":
+        return float(cfg.get("entry_relaxation_active_score_buffer", 3.0) or 3.0)
+    if mode == "balanced":
+        return float(cfg.get("entry_relaxation_balanced_score_buffer", 1.5) or 1.5)
+    return 0.0
+
+
+def _relaxation_probability_buffer(cfg: Mapping[str, Any], mode: str) -> float:
+    if mode == "active":
+        return float(cfg.get("entry_relaxation_active_probability_buffer", 0.010) or 0.010)
+    if mode == "balanced":
+        return float(cfg.get("entry_relaxation_balanced_probability_buffer", 0.005) or 0.005)
+    return 0.0
+
+
+def _risk_cap_for_mode(mode: str, balanced: float, active: float) -> float:
+    if mode == "active":
+        return float(active)
+    if mode == "balanced":
+        return float(balanced)
+    return 1.0
 
 
 def _finite(value: Any, default: float | None = None) -> float | None:
@@ -332,7 +373,13 @@ def _squeeze_score(values: Mapping[str, Any]) -> tuple[float, bool, tuple[str, .
     )
 
 
-def _derivatives_score(side: str, values: Mapping[str, Any]) -> tuple[float, float, int, int, tuple[str, ...], tuple[str, ...]]:
+def _derivatives_score(
+    side: str,
+    values: Mapping[str, Any],
+    cfg: Mapping[str, Any] | None = None,
+) -> tuple[float, float, int, int, tuple[str, ...], tuple[str, ...]]:
+    cfg = cfg if isinstance(cfg, Mapping) else {}
+    relaxation_mode = _relaxation_mode_from_cfg(cfg)
     taker = _first(values, "taker_buy_sell_ratio", "taker_ratio", default=None)
     ofi = _first(values, "rolling_ofi", "ofi", "order_flow_imbalance", default=None)
     orderbook = _first(values, "orderbook_imbalance_pct", "orderbook_imbalance", default=None)
@@ -443,6 +490,24 @@ def _derivatives_score(side: str, values: Mapping[str, Any]) -> tuple[float, flo
         risk_multiplier = 0.55
     if strong_adverse >= 2:
         risk_multiplier = min(risk_multiplier, 0.45)
+
+    watched_inputs = {
+        "taker": taker,
+        "OFI": ofi,
+        "orderbook": orderbook,
+        "OI": oi_1h,
+        "funding": funding,
+        "basis": basis,
+        "long_short": long_short,
+    }
+    missing = [label for label, raw in watched_inputs.items() if raw is None]
+    if missing and relaxation_mode != "strict":
+        cap = _risk_cap_for_mode(relaxation_mode, balanced=0.80, active=0.90)
+        risk_multiplier = min(risk_multiplier, cap)
+        reasons.append(
+            f"derivatives_data_missing={','.join(missing[:4])}; "
+            f"derivatives_action=size_reduce x{cap:.2f}"
+        )
 
     return _clamp(score, 0.0, 100.0), risk_multiplier, adverse, strong_adverse, tuple(reasons), tuple(blockers)
 
@@ -778,6 +843,9 @@ def evaluate_profit_alpha(
     if isinstance(config, Mapping):
         cfg.update(dict(config))
     side = str(side or "").lower()
+    relaxation_mode = _relaxation_mode_from_cfg(cfg)
+    relaxation_risk_cap = 1.0
+    relaxation_actions: list[str] = [f"entry_edge_policy={relaxation_mode}"]
     if side not in {"long", "short"}:
         return ProfitAlphaDecision(False, side, "NO_TRADE", 0.0, 0.0, 0.0, "NONE", 0, 0.0, 0.0, blockers=("invalid side",))
 
@@ -797,12 +865,15 @@ def evaluate_profit_alpha(
         )
 
     values = values if isinstance(values, Mapping) else {}
+    relaxation_mode = _relaxation_mode_from_cfg(cfg)
+    relaxation_risk_cap = 1.0
+    relaxation_actions: list[str] = [f"stale_policy={relaxation_mode}"]
     ev_mode = str(_attr(ev_decision, "mode", values.get("ev_adaptive_mode", "")) or "")
     trend, trend_reasons = _trend_score(side, values)
     relative, relative_reasons = _relative_strength_score(values, ev_decision)
     regime, regime_aligned, regime_opposite, strong_opposite, regime_reasons = _market_regime_score(side, values)
     squeeze, squeeze_active, squeeze_reasons = _squeeze_score(values)
-    derivatives, deriv_risk, adverse_count, strong_adverse, deriv_reasons, deriv_blockers = _derivatives_score(side, values)
+    derivatives, deriv_risk, adverse_count, strong_adverse, deriv_reasons, deriv_blockers = _derivatives_score(side, values, cfg)
 
     engine = _choose_engine(side, trend, relative, regime, squeeze, squeeze_active, ev_mode)
     entry_type, extension_atr, entry_type_reasons, entry_type_blockers = _entry_type(
@@ -904,7 +975,19 @@ def evaluate_profit_alpha(
     if opposite_regime:
         min_score += float(cfg.get("profit_alpha_opposite_regime_score_add", 5.0) or 5.0)
         min_probability += float(cfg.get("profit_alpha_opposite_regime_probability_add", 0.010) or 0.010)
-        blockers.append("top market regime opposite; raised alpha hurdle")
+        if relaxation_mode == "strict":
+            blockers.append("top market regime opposite; raised alpha hurdle")
+        elif strong_opposite and relaxation_mode == "balanced":
+            blockers.append("top market regime strong opposite")
+            relaxation_actions.append("regime_action=block")
+        else:
+            cap = _risk_cap_for_mode(relaxation_mode, balanced=0.65, active=0.55)
+            relaxation_risk_cap = min(relaxation_risk_cap, cap)
+            reasons.append(
+                "top market regime opposite; "
+                f"regime_action=size_reduce x{cap:.2f}"
+            )
+            relaxation_actions.append("regime_action=size_reduce")
 
     stale_age = _finite(_attr(ev_decision, "signal_age_candles", values.get("signal_age_candles")), None)
     if stale_age is None:
@@ -912,18 +995,62 @@ def evaluate_profit_alpha(
     range_expansion = _first(values, "range_expansion", "range_expansion_ratio", default=1.0) or 1.0
     volume = _first(values, "volume_ratio", "relative_volume", default=1.0) or 1.0
     reaccel = bool(_attr(ev_decision, "reacceleration", values.get("ev_reacceleration", False)))
-    if stale_age is not None and stale_age > float(cfg.get("profit_alpha_stale_signal_max_age_bars", 8.0) or 8.0):
+    base_stale_limit = float(cfg.get("profit_alpha_stale_signal_max_age_bars", 8.0) or 8.0)
+    stale_limit = base_stale_limit
+    if relaxation_mode == "balanced":
+        stale_limit = base_stale_limit * 1.5
+    elif relaxation_mode == "active":
+        stale_limit = base_stale_limit * 2.0
+    if stale_age is not None and stale_age > base_stale_limit:
         range_ok = range_expansion >= float(cfg.get("profit_alpha_stale_signal_reaccel_min_range", 1.10) or 1.10)
         volume_ok = volume >= float(cfg.get("profit_alpha_stale_signal_reaccel_min_volume", 1.0) or 1.0)
-        if not (reaccel and range_ok and volume_ok):
+        if reaccel and range_ok and volume_ok:
+            reasons.append(f"stale signal {stale_age:.1f} bars but reaccelerated")
+            relaxation_actions.append("stale_action=pass_reaccelerated")
+        elif relaxation_mode != "strict" and stale_age <= stale_limit:
+            cap = _risk_cap_for_mode(relaxation_mode, balanced=0.65, active=0.55)
+            relaxation_risk_cap = min(relaxation_risk_cap, cap)
+            reasons.append(
+                f"stale_signal age {stale_age:.1f}/{stale_limit:.1f}; "
+                f"stale_action=allow_with_size_reduction x{cap:.2f}"
+            )
+            relaxation_actions.append("stale_action=allow_with_size_reduction")
+        else:
             blockers.append(f"stale signal {stale_age:.1f} bars without reacceleration")
+            relaxation_actions.append("stale_action=block")
+
+    adx_value = _first(values, "adx", "ADX", default=None)
+    if relaxation_mode != "strict" and adx_value is not None:
+        if adx_value < 15.0:
+            blockers.append(f"adx_too_low {adx_value:.1f}<15.0")
+            relaxation_actions.append("adx_action=block")
+        elif adx_value < 20.0:
+            cap = _risk_cap_for_mode(relaxation_mode, balanced=0.65, active=0.50)
+            relaxation_risk_cap = min(relaxation_risk_cap, cap)
+            reasons.append(f"adx_weak_size_reduced {adx_value:.1f}<20.0 x{cap:.2f}")
+            relaxation_actions.append("adx_action=size_reduce")
 
     multi_adverse_block = int(cfg.get("profit_alpha_derivatives_multi_adverse_block_count", 3) or 3)
     strong_adverse_block = int(cfg.get("profit_alpha_derivatives_multi_adverse_strong_count", 2) or 2)
-    if adverse_count >= multi_adverse_block or strong_adverse >= strong_adverse_block:
+    if strong_adverse >= strong_adverse_block:
         blockers.append(
             f"derivatives adverse stack {adverse_count}/{multi_adverse_block}, strong {strong_adverse}"
         )
+        relaxation_actions.append("derivatives_action=block")
+    elif adverse_count >= multi_adverse_block:
+        if relaxation_mode == "strict":
+            blockers.append(
+                f"derivatives adverse stack {adverse_count}/{multi_adverse_block}, strong {strong_adverse}"
+            )
+            relaxation_actions.append("derivatives_action=block")
+        else:
+            cap = _risk_cap_for_mode(relaxation_mode, balanced=0.60, active=0.55)
+            relaxation_risk_cap = min(relaxation_risk_cap, cap)
+            reasons.append(
+                f"derivatives adverse stack {adverse_count}/{multi_adverse_block}; "
+                f"derivatives_action=size_reduce x{cap:.2f}"
+            )
+            relaxation_actions.append("derivatives_action=size_reduce")
     elif adverse_count > 0:
         reasons.extend(deriv_blockers[:2])
 
@@ -969,10 +1096,32 @@ def evaluate_profit_alpha(
         probability += _clamp(exit_meta_expectancy, -0.40, 0.60) * 0.12
     probability = _clamp(probability, 0.40, 0.70)
 
-    if score < min_score:
-        blockers.append(f"profit alpha score {score:.1f}<{min_score:.1f}")
-    if probability < min_probability:
-        blockers.append(f"profit alpha p {probability:.3f}<{min_probability:.3f}")
+    score_gap = float(min_score) - float(score)
+    probability_gap = float(min_probability) - float(probability)
+    score_buffer = _relaxation_score_buffer(cfg, relaxation_mode)
+    probability_buffer = _relaxation_probability_buffer(cfg, relaxation_mode)
+    if score_gap > 1e-12:
+        if relaxation_mode != "strict" and score_gap <= score_buffer:
+            cap = _risk_cap_for_mode(relaxation_mode, balanced=0.60, active=0.50)
+            relaxation_risk_cap = min(relaxation_risk_cap, cap)
+            reasons.append(
+                f"profit alpha score borderline {score:.1f}<{min_score:.1f}; "
+                f"score_override_applied=true x{cap:.2f}"
+            )
+            relaxation_actions.append("score_override_applied=true")
+        else:
+            blockers.append(f"profit alpha score {score:.1f}<{min_score:.1f}")
+    if probability_gap > 1e-12:
+        if relaxation_mode != "strict" and probability_gap <= probability_buffer:
+            cap = _risk_cap_for_mode(relaxation_mode, balanced=0.60, active=0.50)
+            relaxation_risk_cap = min(relaxation_risk_cap, cap)
+            reasons.append(
+                f"profit alpha p borderline {probability:.3f}<{min_probability:.3f}; "
+                f"entry_edge_action=size_reduce x{cap:.2f}"
+            )
+            relaxation_actions.append("entry_edge_action=size_reduce")
+        else:
+            blockers.append(f"profit alpha p {probability:.3f}<{min_probability:.3f}")
 
     risk_multiplier = _clamp(0.35 + (score - 60.0) / 40.0 * 0.55, 0.25, 1.0)
     risk_multiplier = min(risk_multiplier, deriv_risk)
@@ -990,6 +1139,7 @@ def evaluate_profit_alpha(
     if exit_meta_expectancy is not None and exit_meta_samples >= int(cfg.get("exit_meta_min_samples", 8) or 8):
         if exit_meta_expectancy < float(cfg.get("exit_meta_expectancy_reduce_below", 0.0) or 0.0):
             risk_multiplier = min(risk_multiplier, 0.78)
+    risk_multiplier = min(risk_multiplier, relaxation_risk_cap)
     risk_multiplier = min(
         risk_multiplier,
         market_regime_decision.risk_multiplier,
@@ -1046,6 +1196,9 @@ def evaluate_profit_alpha(
         "overfit_governance_score": round(float(overfit_decision.score), 4),
         "overfit_governance_risk": round(float(overfit_decision.risk_multiplier), 4),
         "overfit_sample_count": round(float(overfit_decision.components.get("sample_count", 0.0)), 4),
+        "entry_relaxation_mode": relaxation_mode,
+        "entry_relaxation_risk_cap": round(float(relaxation_risk_cap), 4),
+        "entry_relaxation_actions": "|".join(relaxation_actions[:8]),
     }
     if isinstance(attribution.tags, Mapping):
         for key, value in attribution.tags.items():
@@ -1108,6 +1261,9 @@ def build_entry_edge_decision(
     if isinstance(config, Mapping):
         cfg.update(dict(config))
     side = str(side or "").lower()
+    relaxation_mode = _relaxation_mode_from_cfg(cfg)
+    relaxation_risk_cap = 1.0
+    relaxation_actions: list[str] = [f"entry_edge_policy={relaxation_mode}"]
 
     if not bool(cfg.get("entry_edge_enabled", True)):
         return EntryEdgeDecision(
@@ -1206,16 +1362,42 @@ def build_entry_edge_decision(
         cfg.get(f"entry_edge_{side}_min_probability", base_min_probability)
         or base_min_probability
     )
-    if score < min_score:
-        blockers.append(f"Entry Edge score {score:.1f}<{min_score:.1f}")
-    if probability < min_probability:
-        blockers.append(f"Entry Edge p {probability:.3f}<{min_probability:.3f}")
+    score_gap = float(min_score) - float(score)
+    probability_gap = float(min_probability) - float(probability)
+    score_buffer = _relaxation_score_buffer(cfg, relaxation_mode)
+    probability_buffer = _relaxation_probability_buffer(cfg, relaxation_mode)
+    if score_gap > 1e-12:
+        if relaxation_mode != "strict" and score_gap <= score_buffer:
+            cap = _risk_cap_for_mode(relaxation_mode, balanced=0.60, active=0.50)
+            relaxation_risk_cap = min(relaxation_risk_cap, cap)
+            reasons.append(
+                f"Entry Edge score borderline {score:.1f}<{min_score:.1f}; "
+                f"score_override_applied=true x{cap:.2f}"
+            )
+            relaxation_actions.append("score_override_applied=true")
+        else:
+            blockers.append(f"Entry Edge score {score:.1f}<{min_score:.1f}")
+    if probability_gap > 1e-12:
+        if relaxation_mode != "strict" and probability_gap <= probability_buffer:
+            cap = _risk_cap_for_mode(relaxation_mode, balanced=0.60, active=0.50)
+            relaxation_risk_cap = min(relaxation_risk_cap, cap)
+            reasons.append(
+                f"Entry Edge p borderline {probability:.3f}<{min_probability:.3f}; "
+                f"entry_edge_action=size_reduce x{cap:.2f}"
+            )
+            relaxation_actions.append("entry_edge_action=size_reduce")
+        else:
+            blockers.append(f"Entry Edge p {probability:.3f}<{min_probability:.3f}")
     if net_expectancy_r is not None:
         min_net = float(cfg.get("entry_edge_min_net_expectancy_r", 0.14) or 0.14)
         if net_expectancy_r < min_net:
             blockers.append(f"Entry Edge net {net_expectancy_r:.3f}R<{min_net:.2f}R")
 
-    risk_multiplier = _clamp(min(float(ev_risk), float(alpha_risk)), 0.0, 1.0)
+    risk_multiplier = _clamp(
+        min(float(ev_risk), float(alpha_risk), float(relaxation_risk_cap)),
+        0.0,
+        1.0,
+    )
     engine = alpha_engine if alpha_engine not in {"NO_ALPHA", "NO_TRADE"} else ev_mode
     components = {
         "ev_score": float(ev_score or 0.0),
@@ -1225,6 +1407,9 @@ def build_entry_edge_decision(
         "ev_risk_multiplier": float(ev_risk),
         "alpha_risk_multiplier": float(alpha_risk),
         "alpha_direction_score": float(alpha_direction_score),
+        "entry_relaxation_mode": relaxation_mode,
+        "entry_relaxation_risk_cap": float(relaxation_risk_cap),
+        "entry_relaxation_actions": "|".join(relaxation_actions[:8]),
     }
     for key, value in alpha_components.items():
         parsed = _finite(value, None)

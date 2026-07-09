@@ -218,6 +218,7 @@ def test_live_long_market_quality_multi_adverse_hard_blocks():
     cfg = build_default_utbot_filtered_breakout_config()
     cfg.update({
         "live_trading": True,
+        "utbreak_entry_relaxation_mode": "strict",
         "market_quality_long_hard_block_on_multi_adverse_enabled": True,
         "market_quality_long_multi_adverse_min_reasons": 3,
         "market_quality_long_multi_adverse_max_multiplier": 0.35,

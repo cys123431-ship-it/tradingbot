@@ -950,6 +950,11 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "effective_profile_version": UTBREAKOUT_EFFECTIVE_PROFILE_VERSION,
         "ev_adaptive_enabled": True,
         "legacy_sets_research_only": True,
+        "utbreak_entry_relaxation_mode": "balanced",
+        "entry_relaxation_balanced_score_buffer": 1.5,
+        "entry_relaxation_active_score_buffer": 3.0,
+        "entry_relaxation_balanced_probability_buffer": 0.005,
+        "entry_relaxation_active_probability_buffer": 0.010,
 
         # AUTO selection
         "selection_mode": "auto",
@@ -1457,6 +1462,12 @@ def apply_stable_utbreak_final_overrides(cfg):
         "safe_live_default_set_id": 64,
         "auto_block_on_weak_margin_live": False,
         "auto_multiple_testing_penalty_enabled": False,
+
+        "utbreak_entry_relaxation_mode": "balanced",
+        "entry_relaxation_balanced_score_buffer": 1.5,
+        "entry_relaxation_active_score_buffer": 3.0,
+        "entry_relaxation_balanced_probability_buffer": 0.005,
+        "entry_relaxation_active_probability_buffer": 0.010,
 
         # Bias continuation thresholds
         "bias_continuation_min_volume_ratio": 0.40,
@@ -2341,6 +2352,11 @@ def build_default_utbot_filtered_breakout_config():
         'drawdown_brake_enabled': False,
         'adaptive_exit_v2_enabled': False,
         'walk_forward_report_enabled': False,
+        'utbreak_entry_relaxation_mode': 'balanced',
+        'entry_relaxation_balanced_score_buffer': 1.5,
+        'entry_relaxation_active_score_buffer': 3.0,
+        'entry_relaxation_balanced_probability_buffer': 0.005,
+        'entry_relaxation_active_probability_buffer': 0.010,
         'market_quality_data_required': False,
         'market_quality_min_risk_multiplier': 0.55,
         'market_quality_long_hard_block_on_multi_adverse_enabled': False,
@@ -7199,6 +7215,10 @@ class SignalEngine(BaseEngine):
             'second_take_profit_ratio': 0.40,
             'atr_trailing_multiplier': 3.50,
             'atr_trailing_activation_r': 1.60,
+            'entry_relaxation_balanced_score_buffer': 1.5,
+            'entry_relaxation_active_score_buffer': 3.0,
+            'entry_relaxation_balanced_probability_buffer': 0.005,
+            'entry_relaxation_active_probability_buffer': 0.010,
             'market_quality_min_risk_multiplier': 0.55,
             'market_quality_high_atr_pct': 1.5,
             'market_quality_extreme_atr_pct': 2.5,
@@ -7504,6 +7524,10 @@ class SignalEngine(BaseEngine):
                 if self._is_utbreakout_live_runtime(cfg)
                 else bool(cfg.get('advanced_alpha_paper_testnet_default_enabled', True))
             )
+        relaxation_mode = str(cfg.get('utbreak_entry_relaxation_mode') or 'balanced').strip().lower()
+        if relaxation_mode not in {'strict', 'balanced', 'active'}:
+            relaxation_mode = 'balanced'
+        cfg['utbreak_entry_relaxation_mode'] = relaxation_mode
         sleeve_mode = str(cfg.get('aggressive_growth_sleeve_mode') or 'notional').strip().lower()
         cfg['aggressive_growth_sleeve_mode'] = sleeve_mode if sleeve_mode in {'notional', 'margin'} else 'notional'
         cfg['risk_per_trade_percent'] = normalize_risk_percent({
@@ -9962,6 +9986,66 @@ class SignalEngine(BaseEngine):
         except Exception:
             return []
 
+    def _format_utbreakout_entry_diagnostics_lines(self, symbol=None):
+        events = self._utbreakout_recent_trace_events(symbol, limit=50)
+        if not events:
+            return [
+                "UTBreakout Entry Diagnostics",
+                "last 50 candidates: no trace events yet",
+            ]
+        category_counts = Counter()
+        reason_counts = Counter()
+        last_no_entry = None
+        for event in events:
+            stage = str(event.get('stage') or '').upper()
+            status = str(event.get('status') or '').upper()
+            data = event.get('data') if isinstance(event.get('data'), dict) else {}
+            reason = str(data.get('reason') or status or stage or 'unknown')
+            if stage == 'ORDER_ATTEMPT':
+                category = 'ordered'
+            elif stage in {'ENTRY_BLOCKED', 'AUTO_ENTRY_BRIDGE_BLOCKED'}:
+                if any(token in status for token in {'PREFLIGHT', 'POSITION', 'ORDER', 'PROTECTION'}):
+                    category = 'selected_but_preflight_blocked'
+                elif any(token in status for token in {'RISK', 'QTY', 'NOTIONAL', 'BALANCE'}):
+                    category = 'selected_but_risk_blocked'
+                elif any(token in status for token in {'EXCHANGE', 'FAILED', 'ERROR'}):
+                    category = 'selected_but_exchange_blocked'
+                else:
+                    category = 'strategy_blocked'
+                last_no_entry = (event, category, reason)
+            elif stage in {'STATUS_NOT_READY', 'STATUS_EVALUATED'} and ('REJECT' in status or 'BLOCK' in status):
+                category = 'strategy_blocked'
+                last_no_entry = (event, category, reason)
+            else:
+                category = 'strategy_blocked'
+            category_counts[category] += 1
+            if category != 'ordered':
+                reason_counts[reason[:90]] += 1
+
+        lines = ["UTBreakout Entry Diagnostics", "last 50 candidates:"]
+        for label in (
+            'strategy_blocked',
+            'selected_but_risk_blocked',
+            'selected_but_preflight_blocked',
+            'selected_but_exchange_blocked',
+            'ordered',
+        ):
+            if category_counts.get(label):
+                lines.append(f"- {label}: {category_counts[label]}")
+        if reason_counts:
+            lines.append("top block reasons:")
+            for reason, count in reason_counts.most_common(5):
+                lines.append(f"- {reason}: {count}")
+        if last_no_entry:
+            event, category, reason = last_no_entry
+            data = event.get('data') if isinstance(event.get('data'), dict) else {}
+            lines.append(
+                "last selected no-entry: "
+                f"symbol={event.get('symbol')} category={category} "
+                f"side={data.get('side') or '-'} reason={reason}"
+            )
+        return lines
+
     async def _notify_long_text(self, text, chunk_size=3400):
         text = str(text or '')
         if not text:
@@ -12254,11 +12338,22 @@ class SignalEngine(BaseEngine):
             }
 
         values = dict(values or {})
+        relaxation_mode = str(cfg.get('utbreak_entry_relaxation_mode') or 'balanced').strip().lower()
+        if relaxation_mode not in {'strict', 'balanced', 'active'}:
+            relaxation_mode = 'balanced'
         risk_multiplier = 1.0
         hard_block = False
         reasons = []
         positives = []
         data_seen = 0
+        diagnostics = {
+            'stale_policy': relaxation_mode,
+            'funding_action': 'pass',
+            'oi_action': 'pass',
+            'taker_flow_action': 'pass',
+            'regime_action': 'pass',
+            'market_quality_action': 'pass',
+        }
 
         def _f(key):
             value = values.get(key)
@@ -12276,6 +12371,14 @@ class SignalEngine(BaseEngine):
             hard_block = True
             risk_multiplier = 0.0
             reasons.append(reason)
+
+        def _soft_or_block(factor, reason, action_key, *, severe=False):
+            if relaxation_mode == 'strict' or severe:
+                diagnostics[action_key] = 'block'
+                _block(reason)
+                return
+            diagnostics[action_key] = 'size_reduce'
+            _reduce(factor, f"{reason}; {action_key}=size_reduce x{float(factor):.2f}")
 
         atr_pct = _f('atr_pct')
         if atr_pct is not None:
@@ -12302,10 +12405,17 @@ class SignalEngine(BaseEngine):
                 if side == 'long':
                     _reduce(0.50, f"funding adverse {funding:.6f}")
                 else:
-                    _block(f"funding adverse {funding:.6f}")
+                    _soft_or_block(
+                        0.55 if relaxation_mode == 'balanced' else 0.65,
+                        f"funding adverse {funding:.6f}",
+                        'funding_action',
+                        severe=adverse_funding >= hard * 1.5,
+                    )
             elif adverse_funding >= soft * 1.5:
+                diagnostics['funding_action'] = 'size_reduce'
                 _reduce(0.50, f"funding adverse {funding:.6f}")
             elif adverse_funding >= soft:
+                diagnostics['funding_action'] = 'size_reduce'
                 _reduce(0.75, f"funding mildly adverse {funding:.6f}")
             else:
                 positives.append(f"funding {funding:.6f}")
@@ -12324,6 +12434,7 @@ class SignalEngine(BaseEngine):
         if oi_delta is not None:
             data_seen += 1
             if oi_delta <= -0.40:
+                diagnostics['oi_action'] = 'size_reduce'
                 _reduce(0.75, f"OI not confirming {oi_delta:.2f}%")
             elif oi_delta >= 0.20:
                 positives.append(f"OI confirms {oi_delta:.2f}%")
@@ -12335,11 +12446,13 @@ class SignalEngine(BaseEngine):
             data_seen += 1
             if side == 'long':
                 if taker_ratio < 0.95:
+                    diagnostics['taker_flow_action'] = 'size_reduce'
                     _reduce(0.75, f"taker flow against {taker_ratio:.3f}")
                 elif taker_ratio >= 1.03:
                     positives.append(f"taker flow {taker_ratio:.3f}")
             else:
                 if taker_ratio > 1.05:
+                    diagnostics['taker_flow_action'] = 'size_reduce'
                     _reduce(0.75, f"taker flow against {taker_ratio:.3f}")
                 elif taker_ratio <= 0.97:
                     positives.append(f"taker flow {taker_ratio:.3f}")
@@ -12386,12 +12499,20 @@ class SignalEngine(BaseEngine):
                 is_btc = symbol_label.upper().startswith('BTC')
                 if opposite and is_btc and strong_opposite:
                     if side == 'long':
+                        diagnostics['regime_action'] = 'size_reduce'
                         _reduce(0.50, f"BTC strong opposite regime {direction.upper()} {ret_value:.2f}%")
                     else:
-                        _block(f"BTC strong opposite regime {direction.upper()} {ret_value:.2f}%")
+                        _soft_or_block(
+                            0.50 if relaxation_mode == 'balanced' else 0.60,
+                            f"BTC strong opposite regime {direction.upper()} {ret_value:.2f}%",
+                            'regime_action',
+                            severe=abs(ret_value) >= strong_move * 2.0,
+                        )
                 elif opposite and is_btc:
+                    diagnostics['regime_action'] = 'size_reduce'
                     _reduce(0.50, f"BTC opposite regime {direction.upper()}")
                 elif opposite:
+                    diagnostics['regime_action'] = 'size_reduce'
                     _reduce(0.75, f"{symbol_label} opposite regime {direction.upper()}")
                 elif aligned:
                     positives.append(f"{symbol_label} {direction.upper()}")
@@ -12403,10 +12524,20 @@ class SignalEngine(BaseEngine):
             and len(reasons) >= int(cfg.get('market_quality_long_multi_adverse_min_reasons', 3) or 3)
             and risk_multiplier <= float(cfg.get('market_quality_long_multi_adverse_max_multiplier', 0.35) or 0.35)
         ):
-            _block(
-                "LONG market multi-adverse: "
-                + "; ".join(str(reason) for reason in reasons[:6])
-            )
+            if relaxation_mode == 'strict':
+                diagnostics['market_quality_action'] = 'block'
+                _block(
+                    "LONG market multi-adverse: "
+                    + "; ".join(str(reason) for reason in reasons[:6])
+                )
+            else:
+                diagnostics['market_quality_action'] = 'size_reduce'
+                floor = 0.30 if relaxation_mode == 'balanced' else 0.35
+                risk_multiplier = max(risk_multiplier, floor)
+                reasons.append(
+                    "LONG market multi-adverse softened; "
+                    f"market_quality_action=size_reduce floor x{floor:.2f}"
+                )
 
         min_multiplier = float(cfg.get('market_quality_min_risk_multiplier', 0.25) or 0.25)
         if data_seen <= 0 and bool(cfg.get('market_quality_data_required', False)):
@@ -12418,7 +12549,17 @@ class SignalEngine(BaseEngine):
                 reasons.append(f"risk floor {min_multiplier:.2f} after reductions")
                 risk_multiplier = min_multiplier
             else:
-                _block(f"risk multiplier {risk_multiplier:.2f} < min {min_multiplier:.2f}")
+                relaxed_floor = min_multiplier * (0.75 if relaxation_mode == 'balanced' else 0.60)
+                if relaxation_mode != 'strict' and risk_multiplier + 1e-12 >= relaxed_floor:
+                    diagnostics['market_quality_action'] = 'size_reduce'
+                    reasons.append(
+                        f"risk floor {min_multiplier:.2f} after reductions; "
+                        "market_quality_action=size_reduce"
+                    )
+                    risk_multiplier = min_multiplier
+                else:
+                    diagnostics['market_quality_action'] = 'block'
+                    _block(f"risk multiplier {risk_multiplier:.2f} < min {min_multiplier:.2f}")
 
         risk_multiplier = max(0.0, min(1.0, float(risk_multiplier)))
         if hard_block:
@@ -12442,6 +12583,7 @@ class SignalEngine(BaseEngine):
             'summary': summary,
             'reasons': list(reasons),
             'positives': list(positives),
+            'diagnostics': diagnostics,
         }
 
     def _build_utbreakout_market_quality_status_item(self, side, cfg, values):
@@ -14590,6 +14732,17 @@ class SignalEngine(BaseEngine):
     async def build_dual_alpha_status_text(self, symbol=None):
         strategy_params = self.get_runtime_strategy_params()
         active_strategy = str(strategy_params.get('active_strategy', '') or '').lower()
+        cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+        cfg = apply_stable_utbreak_final_overrides(cfg)
+        cfg = apply_profit_opportunity_effective_overrides(cfg)
+        micro_cfg = self._get_micro_auto_config() if hasattr(self, '_get_micro_auto_config') else {}
+        order_path_line = format_utbreakout_order_path_summary(
+            build_utbreakout_order_path_summary(
+                cfg,
+                exchange_mode=self.ctrl.get_exchange_mode() if getattr(self, 'ctrl', None) else None,
+                micro_cfg=micro_cfg,
+            )
+        )
         symbol = symbol or getattr(self, 'scanner_active_symbol', None) or getattr(self, 'utbreakout_last_status_symbol', None)
         status = None
         if symbol:
@@ -14625,6 +14778,7 @@ class SignalEngine(BaseEngine):
             f"Active: {active_strategy == DUAL_ALPHA_STRATEGY}",
             "Mode: UTBreakout + RSPT both watched, one selected, existing risk/TP/SL/order path.",
             f"Symbol: {symbol or 'no recent symbol'}",
+            order_path_line,
         ]
         if dual:
             lines.append(_line(dual.get('utbreak'), 'UTBreakout'))
@@ -18623,6 +18777,13 @@ class SignalEngine(BaseEngine):
                 micro_line = "Micro Auto: ON / 아직 계획 없음"
         else:
             micro_line = "Micro Auto: OFF"
+        order_path_line = format_utbreakout_order_path_summary(
+            build_utbreakout_order_path_summary(
+                cfg,
+                exchange_mode=self.ctrl.get_exchange_mode() if getattr(self, 'ctrl', None) else None,
+                micro_cfg=micro_cfg,
+            )
+        )
 
         return {
             'ok_market': True,
@@ -18641,6 +18802,7 @@ class SignalEngine(BaseEngine):
             'auto_reason': auto_reason,
             'entry_plan_detail': entry_plan_detail,
             'micro_line': micro_line or 'Micro Auto: OFF',
+            'order_path_line': order_path_line,
             'opposite_set_exit_detail': opposite_set_exit_detail,
             'market_regime_context': market_regime_context,
             'score_line': (
@@ -18703,6 +18865,18 @@ class SignalEngine(BaseEngine):
         for line in context_lines:
             if line and line not in lines:
                 lines.append(line)
+        try:
+            micro_cfg = self._get_micro_auto_config() if hasattr(self, '_get_micro_auto_config') else {}
+            lines.append(format_utbreakout_order_path_summary(
+                build_utbreakout_order_path_summary(
+                    cfg,
+                    exchange_mode=self.ctrl.get_exchange_mode() if getattr(self, 'ctrl', None) else None,
+                    micro_cfg=micro_cfg,
+                )
+            ))
+            lines.extend(self._format_utbreakout_entry_diagnostics_lines(None))
+        except Exception as exc:
+            lines.append(f"Order Path: unavailable ({exc})")
 
         lines.extend([
             "",
@@ -20044,6 +20218,13 @@ class SignalEngine(BaseEngine):
                 micro_line = "Micro Auto: ON / 아직 계획 없음"
         else:
             micro_line = "Micro Auto: OFF"
+        order_path_line = format_utbreakout_order_path_summary(
+            build_utbreakout_order_path_summary(
+                cfg,
+                exchange_mode=self.ctrl.get_exchange_mode() if getattr(self, 'ctrl', None) else None,
+                micro_cfg=micro_cfg,
+            )
+        )
         status_side = candidate_side if candidate_side in {'long', 'short'} else 'long'
         status_filter_values = _market_quality_filter_values()
         status_feature_score = self._calculate_utbreakout_feature_score(status_side, cfg, status_filter_values)
@@ -20130,6 +20311,8 @@ class SignalEngine(BaseEngine):
             f"선택 이유: {auto_reason or '수동 선택'}",
             entry_plan_detail,
             micro_line,
+            order_path_line,
+            *self._format_utbreakout_entry_diagnostics_lines(symbol),
             opposite_set_exit_detail,
             f"시장 레짐: {market_regime_context.get('summary') or '데이터 대기'}",
             f"AUTO 점수: {score_line}",
@@ -39167,64 +39350,52 @@ class MainController:
 """
             await u.message.reply_text(msg.strip(), parse_mode=ParseMode.MARKDOWN)
 
-        async def risk_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-            args = list(getattr(c, "args", []) or [])
-            sig_cfg = self.cfg.get('signal_engine', {}) or {}
-            common_cfg = dict(sig_cfg.get('common_settings', {}) or {})
-            strategy_params = sig_cfg.get('strategy_params', {}) or {}
-            ut_cfg = dict(strategy_params.get('UTBotFilteredBreakoutV1', {}) or {})
-            cfg_for_risk = dict(common_cfg)
-            for key in (
-                "default_real_risk_pct",
-                "min_real_risk_pct",
-                "max_real_risk_pct",
-                "max_risk_pct_increases_per_day",
-                "max_risk_pct_changes_per_day",
-                "risk_pct_change_reset_timezone",
-                "account_reference_equity_usdt",
-                "max_real_position_notional_pct_of_equity",
-                "max_daily_real_loss_pct_of_equity",
-                "max_weekly_real_loss_pct_of_equity",
-            ):
-                if key in ut_cfg and key not in cfg_for_risk:
-                    cfg_for_risk[key] = ut_cfg[key]
+        def _live_real_risk_cfg():
+            return build_live_real_risk_config(self.cfg.get('signal_engine', {}) or {})
+
+        async def _live_real_risk_limits(cfg_for_risk):
+            account_equity = None
+            equity_source = "reference"
+            engine = self.engines.get('signal')
+            if engine is not None and hasattr(engine, 'get_balance_info'):
+                try:
+                    total_balance, free_balance, _ = await engine.get_balance_info()
+                    candidate_equity = total_balance if total_balance and total_balance > 0 else free_balance
+                    if candidate_equity and candidate_equity > 0:
+                        account_equity = float(candidate_equity)
+                        equity_source = "actual"
+                except Exception as exc:
+                    logger.debug("LIVE_REAL risk equity lookup fallback to reference: %s", exc)
+            return resolve_live_small_cap_limits(cfg_for_risk, account_equity), equity_source
+
+        async def _set_live_real_risk_pct_from_user(requested_fraction, *, source):
+            cfg_for_risk = _live_real_risk_cfg()
             current_fraction = _live_real_risk_fraction_from_cfg(cfg_for_risk)
             state = load_live_real_risk_state()
-            if not args:
-                limits = resolve_live_small_cap_limits(cfg_for_risk)
-                limit = int(cfg_for_risk.get(
-                    "max_risk_pct_increases_per_day",
-                    cfg_for_risk.get(
-                        "max_risk_pct_changes_per_day",
-                        LIVE_REAL_SMALL_CAP_DEFAULTS["max_risk_pct_increases_per_day"],
-                    ),
-                ) or 0)
-                await u.message.reply_text(
-                    "\n".join([
-                        "LIVE_REAL_SMALL_CAP risk",
-                        f"Current: {current_fraction * 100.0:.2f}%",
-                        f"Per-trade loss budget: {limits['max_loss_per_trade_usdt']:.4f} USDT "
-                        f"@ equity {limits['account_equity_usdt']:.2f}",
-                        f"Notional cap: {limits['max_position_notional_usdt']:.4f} USDT "
-                        f"({limits['max_position_notional_pct'] * 100.0:.2f}% equity)",
-                        f"KST increases today: {int(state.get('risk_pct_increases_today', 0) or 0)}/{limit}",
-                        "Usage: /risk 0.5, /risk 1, /risk safe",
-                    ])
-                )
-                return
-            try:
-                requested_fraction = parse_live_real_risk_pct_input(args[0], cfg_for_risk)
-            except ValueError as exc:
-                await u.message.reply_text(f"Invalid /risk value: {exc}\nUsage: /risk 0.5, /risk 1, /risk safe")
-                return
-            change = apply_live_real_risk_pct_change(state, current_fraction, requested_fraction, cfg_for_risk)
+            change_cfg = dict(cfg_for_risk)
+            change_cfg["_risk_change_source"] = source
+            change = apply_live_real_risk_pct_change(
+                state,
+                current_fraction,
+                requested_fraction,
+                change_cfg,
+            )
             if not change.get("allowed"):
-                await u.message.reply_text(
-                    "Risk increase blocked: daily KST increase limit reached. "
-                    "Lowering risk is still allowed with /risk safe."
+                limits, equity_source = await _live_real_risk_limits(cfg_for_risk)
+                text = render_live_real_risk_status_text(
+                    cfg_for_risk,
+                    state,
+                    limits,
+                    equity_source=equity_source,
+                    notice=(
+                        "리스크 상향이 차단되었습니다. KST 기준 하루 상향 변경 한도에 도달했습니다. "
+                        "리스크를 낮추는 변경은 계속 허용됩니다."
+                    ),
                 )
-                return
-            save_live_real_risk_state(change.get("state") or state)
+                return False, text
+
+            changed_state = change.get("state") or state
+            save_live_real_risk_state(changed_state)
             risk_percent = requested_fraction * 100.0
             max_percent = _live_real_min_max_risk_fraction(cfg_for_risk)[1] * 100.0
             update_paths = [
@@ -39240,20 +39411,46 @@ class MainController:
             engine = self._reset_signal_engine_runtime_state(reset_entry_cache=True)
             if engine and not getattr(engine, "running", False):
                 engine.start()
-            limits = resolve_live_small_cap_limits({**cfg_for_risk, "live_real_risk_pct_user": requested_fraction})
-            changed_state = change.get("state") or {}
-            await u.message.reply_text(
-                "\n".join([
-                    "Risk updated",
-                    f"Current: {risk_percent:.2f}%",
-                    f"Per-trade loss budget: {limits['max_loss_per_trade_usdt']:.4f} USDT "
-                    f"@ equity {limits['account_equity_usdt']:.2f}",
-                    f"Notional cap: {limits['max_position_notional_usdt']:.4f} USDT",
-                    f"Reason: {change.get('reason')}",
-                    f"KST increases today: {int(changed_state.get('risk_pct_increases_today', 0) or 0)}/"
-                    f"{int(change.get('limit', cfg_for_risk.get('max_risk_pct_increases_per_day', LIVE_REAL_SMALL_CAP_DEFAULTS['max_risk_pct_increases_per_day'])) or 0)}",
-                ])
+            next_cfg = {**cfg_for_risk, "live_real_risk_pct_user": requested_fraction}
+            limits, equity_source = await _live_real_risk_limits(next_cfg)
+            text = render_live_real_risk_status_text(
+                next_cfg,
+                changed_state,
+                limits,
+                equity_source=equity_source,
+                notice=f"1회 리스크가 {risk_percent:.2f}%로 변경되었습니다. ({change.get('reason')})",
             )
+            return True, text
+
+        async def _live_real_risk_status_text(*, menu=False, notice=None):
+            cfg_for_risk = _live_real_risk_cfg()
+            state = load_live_real_risk_state()
+            limits, equity_source = await _live_real_risk_limits(cfg_for_risk)
+            return render_live_real_risk_status_text(
+                cfg_for_risk,
+                state,
+                limits,
+                equity_source=equity_source,
+                menu=menu,
+                notice=notice,
+            )
+
+        async def risk_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            args = list(getattr(c, "args", []) or [])
+            cfg_for_risk = _live_real_risk_cfg()
+            if not args:
+                await u.message.reply_text(await _live_real_risk_status_text())
+                return
+            try:
+                requested_fraction = parse_live_real_risk_pct_input(args[0], cfg_for_risk)
+            except ValueError as exc:
+                await u.message.reply_text(f"Invalid /risk value: {exc}\nUsage: /risk 0.5, /risk 1, /risk safe")
+                return
+            _, text = await _set_live_real_risk_pct_from_user(
+                requested_fraction,
+                source="command",
+            )
+            await u.message.reply_text(text)
 
         def _parse_bool_mode(value):
             text = str(value or '').strip().lower()
@@ -40175,6 +40372,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 'entry_quality_gate_min_entry_edge_score',
                 'entry_quality_gate_min_entry_edge_probability',
                 'entry_edge_enabled',
+                'utbreak_entry_relaxation_mode',
                 'entry_edge_min_score',
                 'entry_edge_long_min_score',
                 'entry_edge_short_min_score',
@@ -40206,7 +40404,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
             return '\n'.join(lines)
 
         def _build_utbreakout_keyboard():
-            return InlineKeyboardMarkup([
+            rows = [
                 [
                     InlineKeyboardButton("UTBreak ON", callback_data="utb:on"),
                     InlineKeyboardButton("UTBreak OFF", callback_data="utb:off"),
@@ -40225,7 +40423,8 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 [
                     InlineKeyboardButton("코인 감시 목록", callback_data="utb:watchlist")
                 ]
-            ])
+            ]
+            return InlineKeyboardMarkup(append_live_real_risk_buttons_to_utbreakout_rows(rows))
 
         async def _edit_utbreakout_menu(query, notice=None):
             text = _format_utbreakout_menu_text()
@@ -40239,6 +40438,130 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 caption='UT Breakout 메뉴 전체 내용입니다.',
                 preview_suffix='상세 UTBreak 메뉴는 파일로 보냈습니다.',
             )
+
+        async def risk_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            query = getattr(u, 'callback_query', None)
+            if query is None:
+                return
+            try:
+                await query.answer()
+            except Exception:
+                logger.debug("risk callback answer skipped", exc_info=True)
+
+            data = str(getattr(query, 'data', '') or '')
+            parts = data.split(':')
+            try:
+                if data == 'risk:menu':
+                    await self._edit_markdown_safe(
+                        query,
+                        await _live_real_risk_status_text(menu=True),
+                        reply_markup=build_live_real_risk_menu_keyboard(),
+                        filename='risk_menu.txt',
+                        caption='LIVE_REAL_SMALL_CAP 리스크 설정 메뉴',
+                    )
+                    return
+                if data == 'risk:status':
+                    await self._edit_markdown_safe(
+                        query,
+                        await _live_real_risk_status_text(menu=False),
+                        reply_markup=build_live_real_risk_status_keyboard(),
+                        filename='risk_status.txt',
+                        caption='LIVE_REAL_SMALL_CAP 리스크 상태',
+                    )
+                    return
+                if data == 'risk:manual':
+                    await self._edit_markdown_safe(
+                        query,
+                        render_live_real_risk_manual_text(),
+                        reply_markup=build_live_real_risk_status_keyboard(),
+                        filename='risk_manual.txt',
+                        caption='LIVE_REAL_SMALL_CAP 리스크 직접 입력 안내',
+                    )
+                    return
+                if data == 'risk:safe':
+                    cfg_for_risk = _live_real_risk_cfg()
+                    requested_fraction = _live_real_min_max_risk_fraction(cfg_for_risk)[0]
+                    _, text = await _set_live_real_risk_pct_from_user(
+                        requested_fraction,
+                        source="button",
+                    )
+                    await self._edit_markdown_safe(
+                        query,
+                        text,
+                        reply_markup=build_live_real_risk_status_keyboard(),
+                        filename='risk_status.txt',
+                        caption='LIVE_REAL_SMALL_CAP 리스크 상태',
+                    )
+                    return
+                if data == 'risk:back:utbreak':
+                    await _edit_utbreakout_menu(query)
+                    return
+                if data == 'risk:cancel':
+                    await self._edit_markdown_safe(
+                        query,
+                        await _live_real_risk_status_text(menu=True, notice="변경을 취소했습니다."),
+                        reply_markup=build_live_real_risk_menu_keyboard(),
+                        filename='risk_menu.txt',
+                        caption='LIVE_REAL_SMALL_CAP 리스크 설정 메뉴',
+                    )
+                    return
+                if len(parts) >= 3 and parts[0] == 'risk' and parts[1] == 'set':
+                    cfg_for_risk = _live_real_risk_cfg()
+                    requested_fraction = parse_live_real_risk_pct_input(str(float(parts[2]) * 100.0), cfg_for_risk)
+                    if requested_fraction >= 0.05 - 1e-12:
+                        await self._edit_markdown_safe(
+                            query,
+                            "\n".join([
+                                "⚠️ 5% 리스크는 매우 공격적인 설정입니다.",
+                                "1회 거래에서 계좌의 최대 5% 손실을 허용합니다.",
+                                "그래도 변경하시겠습니까?",
+                            ]),
+                            reply_markup=build_live_real_risk_confirm_keyboard(requested_fraction),
+                            filename='risk_confirm.txt',
+                            caption='LIVE_REAL_SMALL_CAP 리스크 확인',
+                        )
+                        return
+                    _, text = await _set_live_real_risk_pct_from_user(
+                        requested_fraction,
+                        source="button",
+                    )
+                    await self._edit_markdown_safe(
+                        query,
+                        text,
+                        reply_markup=build_live_real_risk_status_keyboard(),
+                        filename='risk_status.txt',
+                        caption='LIVE_REAL_SMALL_CAP 리스크 상태',
+                    )
+                    return
+                if len(parts) >= 4 and parts[0] == 'risk' and parts[1] == 'confirm' and parts[2] == 'set':
+                    cfg_for_risk = _live_real_risk_cfg()
+                    requested_fraction = parse_live_real_risk_pct_input(str(float(parts[3]) * 100.0), cfg_for_risk)
+                    _, text = await _set_live_real_risk_pct_from_user(
+                        requested_fraction,
+                        source="button_confirm",
+                    )
+                    await self._edit_markdown_safe(
+                        query,
+                        text,
+                        reply_markup=build_live_real_risk_status_keyboard(),
+                        filename='risk_status.txt',
+                        caption='LIVE_REAL_SMALL_CAP 리스크 상태',
+                    )
+                    return
+                await self._edit_markdown_safe(
+                    query,
+                    await _live_real_risk_status_text(menu=True, notice="처리할 수 없는 리스크 버튼입니다."),
+                    reply_markup=build_live_real_risk_menu_keyboard(),
+                )
+            except ValueError as exc:
+                await self._edit_markdown_safe(
+                    query,
+                    await _live_real_risk_status_text(menu=True, notice=f"리스크 값 오류: {exc}"),
+                    reply_markup=build_live_real_risk_menu_keyboard(),
+                )
+            except BadRequest as exc:
+                if not self._is_telegram_message_not_modified_error(exc):
+                    raise
 
         async def _reply_utbreakout_interaction(message_or_query, text, *, parse_mode=ParseMode.MARKDOWN):
             target = getattr(message_or_query, 'message', None)
@@ -43678,6 +44001,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
         self.tg_app.add_handler(CommandHandler("utbreakout", owner_only(utbreakout_cmd)))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(legacy_utbot_callback), pattern=r"^utbot:"))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(utbreakout_callback), pattern=r"^utb:"))
+        self.tg_app.add_handler(CallbackQueryHandler(owner_only(risk_callback), pattern=r"^risk:"))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(coinscan_callback), pattern=r"^cs:"))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(customcoins_callback), pattern=r"^cc:"))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(microauto_callback), pattern=r"^ma:"))
@@ -45292,9 +45616,23 @@ def apply_live_real_risk_pct_change(state, current_fraction, requested_fraction,
         }
     state["live_real_risk_pct_user"] = requested
     state["last_live_real_risk_pct_user"] = current
-    state["last_risk_pct_changed_at"] = datetime.now(timezone.utc).isoformat()
+    changed_at = now or datetime.now(timezone.utc)
+    if getattr(changed_at, "tzinfo", None) is None:
+        changed_at = changed_at.replace(tzinfo=timezone.utc)
+    state["last_risk_pct_changed_at"] = changed_at.isoformat()
     if increasing:
         state["risk_pct_increases_today"] = used + 1
+    history = state.get("risk_pct_change_history")
+    if not isinstance(history, list):
+        history = []
+    history.append({
+        "at": changed_at.isoformat(),
+        "from": current,
+        "to": requested,
+        "source": str(cfg.get("_risk_change_source") or "unknown"),
+        "reason": "risk_increased" if increasing else "risk_decreased",
+    })
+    state["risk_pct_change_history"] = history[-20:]
     return {
         "allowed": True,
         "changed": True,
@@ -45380,6 +45718,246 @@ def apply_live_small_cap_limits_to_config(cfg, account_equity=None):
     cfg["max_weekly_real_loss_usdt"] = limits["max_weekly_loss_usdt"]
     cfg["live_real_effective_limits"] = dict(limits)
     return limits
+
+
+LIVE_REAL_RISK_BUTTON_PRESETS = (
+    ("0.25%", "risk:set:0.0025"),
+    ("0.5%", "risk:set:0.005"),
+    ("1%", "risk:set:0.01"),
+    ("2%", "risk:set:0.02"),
+    ("3%", "risk:set:0.03"),
+    ("5%", "risk:set:0.05"),
+)
+
+
+def build_live_real_risk_config(signal_engine_cfg):
+    sig_cfg = signal_engine_cfg if isinstance(signal_engine_cfg, dict) else {}
+    common_cfg = dict(sig_cfg.get("common_settings", {}) or {})
+    strategy_params = sig_cfg.get("strategy_params", {}) or {}
+    ut_cfg = dict(strategy_params.get("UTBotFilteredBreakoutV1", {}) or {})
+    cfg_for_risk = dict(common_cfg)
+    for key in (
+        "default_real_risk_pct",
+        "min_real_risk_pct",
+        "max_real_risk_pct",
+        "max_risk_pct_increases_per_day",
+        "max_risk_pct_changes_per_day",
+        "risk_pct_change_reset_timezone",
+        "account_reference_equity_usdt",
+        "max_real_position_notional_pct_of_equity",
+        "max_daily_real_loss_pct_of_equity",
+        "max_weekly_real_loss_pct_of_equity",
+        "scale_notional_cap_with_risk_pct",
+    ):
+        if key in ut_cfg and key not in cfg_for_risk:
+            cfg_for_risk[key] = ut_cfg[key]
+    return cfg_for_risk
+
+
+def build_live_real_risk_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("0.25%", callback_data="risk:set:0.0025"),
+            InlineKeyboardButton("0.5%", callback_data="risk:set:0.005"),
+            InlineKeyboardButton("1%", callback_data="risk:set:0.01"),
+        ],
+        [
+            InlineKeyboardButton("2%", callback_data="risk:set:0.02"),
+            InlineKeyboardButton("3%", callback_data="risk:set:0.03"),
+            InlineKeyboardButton("5%", callback_data="risk:set:0.05"),
+        ],
+        [
+            InlineKeyboardButton("SAFE 0.1%", callback_data="risk:safe"),
+            InlineKeyboardButton("직접 입력", callback_data="risk:manual"),
+        ],
+        [InlineKeyboardButton("뒤로", callback_data="risk:back:utbreak")],
+    ])
+
+
+def build_live_real_risk_status_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("리스크 설정", callback_data="risk:menu")],
+        [InlineKeyboardButton("뒤로", callback_data="risk:back:utbreak")],
+    ])
+
+
+def build_live_real_risk_confirm_keyboard(fraction):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("예, 5%로 변경", callback_data=f"risk:confirm:set:{float(fraction):.4g}"),
+            InlineKeyboardButton("취소", callback_data="risk:cancel"),
+        ]
+    ])
+
+
+def append_live_real_risk_buttons_to_utbreakout_rows(rows):
+    new_rows = [list(row) for row in (rows or [])]
+    risk_row = [
+        InlineKeyboardButton("리스크 설정", callback_data="risk:menu"),
+        InlineKeyboardButton("리스크 상태", callback_data="risk:status"),
+    ]
+    insert_at = max(0, len(new_rows) - 1)
+    if any(
+        getattr(button, "callback_data", None) in {"risk:menu", "risk:status"}
+        for row in new_rows
+        for button in row
+    ):
+        return new_rows
+    new_rows.insert(insert_at, risk_row)
+    return new_rows
+
+
+def _format_live_real_risk_percent(fraction):
+    return f"{float(fraction) * 100.0:.2f}%"
+
+
+def _format_live_real_risk_history(state, *, limit=5):
+    history = state.get("risk_pct_change_history") if isinstance(state, dict) else None
+    if not isinstance(history, list) or not history:
+        return ["- 없음"]
+    tz = ZoneInfo("Asia/Seoul")
+    lines = []
+    for item in history[-limit:]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            at = datetime.fromisoformat(str(item.get("at"))).astimezone(tz).strftime("%H:%M")
+        except Exception:
+            at = "??:??"
+        old = _safe_float_value(item.get("from"), 0.0) * 100.0
+        new = _safe_float_value(item.get("to"), 0.0) * 100.0
+        lines.append(f"- {at} {old:.2f}% -> {new:.2f}%")
+    return lines or ["- 없음"]
+
+
+def render_live_real_risk_status_text(
+    cfg,
+    state,
+    limits,
+    *,
+    equity_source="reference",
+    menu=False,
+    notice=None,
+):
+    cfg = cfg if isinstance(cfg, dict) else {}
+    state = normalize_live_real_risk_state(state, cfg)
+    limits = limits if isinstance(limits, dict) else resolve_live_small_cap_limits(cfg)
+    current = _live_real_risk_fraction_from_cfg(cfg)
+    limit = int(cfg.get(
+        "max_risk_pct_increases_per_day",
+        cfg.get(
+            "max_risk_pct_changes_per_day",
+            LIVE_REAL_SMALL_CAP_DEFAULTS["max_risk_pct_increases_per_day"],
+        ),
+    ) or 0)
+    title = "🧭 리스크 설정" if menu else "📊 현재 리스크 상태"
+    equity_label = "actual equity" if equity_source == "actual" else "reference equity"
+    lines = []
+    if notice:
+        lines.extend([str(notice), ""])
+    lines.extend([
+        title,
+        "",
+        f"현재 1회 리스크: {current * 100.0:.2f}%",
+        f"내부 저장값: {current:.6f}",
+        f"계좌 equity: {float(limits.get('account_equity_usdt', 0.0) or 0.0):.2f} USDT ({equity_label} 기준)",
+        f"1회 손실 예산: {float(limits.get('max_loss_per_trade_usdt', 0.0) or 0.0):.4f} USDT",
+        f"포지션 명목가 상한: {float(limits.get('max_position_notional_usdt', 0.0) or 0.0):.4f} USDT",
+        f"일 손실 한도: {float(limits.get('max_daily_loss_usdt', 0.0) or 0.0):.4f} USDT",
+        f"주 손실 한도: {float(limits.get('max_weekly_loss_usdt', 0.0) or 0.0):.4f} USDT",
+        f"오늘 리스크 상향 변경 횟수: {int(state.get('risk_pct_increases_today', 0) or 0)}/{limit} KST",
+        "리스크 변경 초기화 기준: Asia/Seoul 자정",
+    ])
+    if menu:
+        lines.extend([
+            "",
+            "원하는 리스크를 선택하세요.",
+            "리스크는 1회 최대 허용 손실 기준이며 실제 수량은 market quality, risk multiplier, cap에 따라 더 작아질 수 있습니다.",
+        ])
+    else:
+        lines.extend(["", "최근 변경 기록:", *_format_live_real_risk_history(state)])
+    return "\n".join(lines)
+
+
+def render_live_real_risk_manual_text():
+    return "\n".join([
+        "직접 입력은 아래처럼 입력하세요.",
+        "",
+        "/risk 1.5",
+        "",
+        "입력 가능 범위: 0.1% ~ 5%",
+    ])
+
+
+def build_utbreakout_order_path_summary(
+    cfg,
+    *,
+    exchange_mode=None,
+    micro_cfg=None,
+):
+    cfg = cfg if isinstance(cfg, dict) else {}
+    micro_cfg = micro_cfg if isinstance(micro_cfg, dict) else {}
+    mode = str(exchange_mode or cfg.get("exchange_mode") or "unknown")
+    stage = _normalize_live_real_stage(cfg.get("live_activation_stage"))
+    dry_run = bool(cfg.get("dry_run", False)) or (
+        bool(micro_cfg.get("enabled", False)) and bool(micro_cfg.get("dry_run", False))
+    )
+    live_order_enabled = (
+        stage == "LIVE_REAL_SMALL_CAP"
+        and bool(cfg.get("real_order_enabled", False))
+        and bool(cfg.get("live_trading", False))
+        and not bool(cfg.get("testnet", False))
+    )
+    demo_order_enabled = (
+        mode == BINANCE_TESTNET
+        or stage == "TESTNET_ONLY"
+        or bool(cfg.get("testnet", False))
+    ) and not dry_run
+    paper_order_enabled = dry_run or stage in {"PAPER_ONLY", "DISABLED"}
+    order_executor = (
+        "execute_live_order_plan"
+        if bool(cfg.get("live_parity_signal_enabled", False))
+        else "legacy_signal_entry"
+    )
+    if dry_run:
+        order_action = "signal_only"
+        reason = "dry_run_or_micro_auto_live_locked"
+    elif live_order_enabled:
+        order_action = "ready_to_order"
+        reason = "LIVE_REAL_SMALL_CAP preflight still required"
+    elif demo_order_enabled:
+        order_action = "testnet_or_demo_order"
+        reason = "demo/testnet exchange path"
+    else:
+        order_action = "signal_only"
+        reason = "live order path not enabled"
+    return {
+        "exchange_mode": mode,
+        "trading_mode": stage,
+        "live_order_enabled": bool(live_order_enabled),
+        "paper_order_enabled": bool(paper_order_enabled),
+        "demo_order_enabled": bool(demo_order_enabled),
+        "dry_run": bool(dry_run),
+        "order_executor": order_executor,
+        "order_action": order_action,
+        "reason": reason,
+    }
+
+
+def format_utbreakout_order_path_summary(summary):
+    summary = summary if isinstance(summary, dict) else {}
+    return (
+        "Order Path: "
+        f"exchange_mode={summary.get('exchange_mode')} / "
+        f"trading_mode={summary.get('trading_mode')} / "
+        f"live_order_enabled={str(bool(summary.get('live_order_enabled'))).lower()} / "
+        f"paper_order_enabled={str(bool(summary.get('paper_order_enabled'))).lower()} / "
+        f"demo_order_enabled={str(bool(summary.get('demo_order_enabled'))).lower()} / "
+        f"dry_run={str(bool(summary.get('dry_run'))).lower()} / "
+        f"order_executor={summary.get('order_executor')} / "
+        f"order_action={summary.get('order_action')} / "
+        f"reason={summary.get('reason')}"
+    )
 
 
 def _normalize_tp_plan_label(value, fallback=None):
