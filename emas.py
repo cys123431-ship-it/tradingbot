@@ -1193,6 +1193,13 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "second_take_profit_r_multiple": 2.40,
         "second_take_profit_ratio": 0.35,
         "runner_pct": 0.40,
+        "live_tp_ladder_mode": "tp1_tp2_full_exit",
+        "live_tp1_pct": 0.25,
+        "live_tp2_pct": 0.75,
+        "live_tp1_rr": 1.00,
+        "live_tp2_rr": 2.40,
+        "live_min_tp2_rr": 2.00,
+        "tp_split_failure_policy": "single_tp2_with_warning",
         "dynamic_take_profit_enabled": False,
         "atr_trailing_enabled": True,
         "atr_trailing_activation_r": 1.10,
@@ -15114,7 +15121,12 @@ class SignalEngine(BaseEngine):
         else:
             status = 'WARNING'
             reason = 'reduce_only_missing'
-        return {
+        latest_status = dict((getattr(self, 'last_protection_order_status', {}) or {}).get(symbol, {}) or {})
+        ladder_status = latest_status.get('tp_ladder') if isinstance(latest_status.get('tp_ladder'), dict) else None
+        if ladder_status and ladder_status.get('mode') == 'single_tp2_with_warning' and status == 'OK':
+            status = 'OK_WITH_WARNING'
+            reason = ladder_status.get('reason') or 'qty_too_small_for_tp1_tp2_split'
+        result = {
             'status': status,
             'reason': reason,
             'tp_count': len(tp_orders),
@@ -15122,6 +15134,11 @@ class SignalEngine(BaseEngine):
             'reduce_only_ok': not bool(reduce_only_bad),
             'orphan_orders': 0,
         }
+        if ladder_status:
+            result['tp_ladder'] = dict(ladder_status)
+            result['tp_ladder_mode'] = ladder_status.get('mode')
+            result['tp_ladder_reason'] = ladder_status.get('reason')
+        return result
 
     def _format_dual_alpha_current_position_lines(self, position_status):
         status = position_status if isinstance(position_status, dict) else {}
@@ -15139,6 +15156,13 @@ class SignalEngine(BaseEngine):
                 f"unrealized_pnl={self._fmt_signal_trade_value(pos.get('unrealizedPnl'))}",
                 "source=exchange",
             ])
+            snapshot = getattr(self, 'last_live_entry_snapshot', None)
+            if (
+                isinstance(snapshot, dict)
+                and isinstance(snapshot.get('tp_ladder'), dict)
+                and self._canonical_futures_symbol(snapshot.get('symbol')) == self._canonical_futures_symbol(pos.get('symbol') or status.get('symbol'))
+            ):
+                lines.extend(self._format_tp_ladder_lines(snapshot.get('tp_ladder')))
             return lines
         if state == 'fallback':
             snapshot = status.get('snapshot') if isinstance(status.get('snapshot'), dict) else {}
@@ -15151,6 +15175,8 @@ class SignalEngine(BaseEngine):
                 f"last_qty={snapshot.get('filled_qty') or snapshot.get('final_order_qty') or 'unknown'}",
                 f"last_entry={snapshot.get('price') or 'unknown'}",
             ])
+            if isinstance(snapshot.get('tp_ladder'), dict):
+                lines.extend(self._format_tp_ladder_lines(snapshot.get('tp_ladder')))
             return lines
         if state == 'unknown':
             lines.extend([
@@ -15176,6 +15202,8 @@ class SignalEngine(BaseEngine):
             lines.append(f"reduce_only_ok={str(bool(status.get('reduce_only_ok'))).lower()}")
         if 'orphan_orders' in status:
             lines.append(f"orphan_orders={int(status.get('orphan_orders') or 0)}")
+        if isinstance(status.get('tp_ladder'), dict):
+            lines.extend(self._format_tp_ladder_lines(status.get('tp_ladder')))
         return lines
 
     def _dual_alpha_signal_final_action(self, order_path, position_status, selected):
@@ -15447,6 +15475,8 @@ class SignalEngine(BaseEngine):
                     f"actual_risk_estimate={snapshot.get('actual_risk_estimate')}",
                     f"qty_limiter={snapshot.get('qty_limiter_reason')}",
                 ])
+            if isinstance(snapshot.get('tp_ladder'), dict):
+                lines.extend(self._format_tp_ladder_lines(snapshot.get('tp_ladder')))
         logger.info(
             "DUAL_STATUS_ORDER_PATH bridge_enabled=%s live_order_enabled=%s "
             "trading_mode=%s order_action=%s",
@@ -18874,6 +18904,7 @@ class SignalEngine(BaseEngine):
 
         # side conditions
         async def _side_conditions(side):
+            side_status_summary = {}
             side_upper = side.upper()
             if candidate_side == side:
                 ut_state = True
@@ -19043,7 +19074,7 @@ class SignalEngine(BaseEngine):
                         f"{ev_status_decision.mode} score {ev_status_decision.score:.1f}; "
                         "수량/비용 계산 대기"
                     )
-                status['ev_adaptive_status_summary'] = ev_detail
+                side_status_summary['ev_adaptive_status_summary'] = ev_detail
 
             entry_edge_status_decision = self._append_entry_edge_status_item(
                 core_items,
@@ -19059,7 +19090,7 @@ class SignalEngine(BaseEngine):
                 ev_status_exit=ev_status_exit,
             )
             if entry_edge_status_decision is not None:
-                status['entry_edge_status_summary'] = entry_edge_status_decision.summary
+                side_status_summary['entry_edge_status_summary'] = entry_edge_status_decision.summary
 
             set_filter_multiplier_status = 1.0
             if set_hard_failures:
@@ -27361,6 +27392,8 @@ class SignalEngine(BaseEngine):
                         f"actual_risk_estimate={self._fmt_signal_trade_value(snapshot.get('actual_risk_estimate'))} USDT / "
                         f"qty_limiter={snapshot.get('qty_limiter_reason') or 'none'}`"
                     )
+                    if isinstance(snapshot.get("tp_ladder"), dict):
+                        lines.extend(self._format_tp_ladder_lines(snapshot.get("tp_ladder")))
             except Exception as e:
                 logger.debug(f"UT breakout entry notice sizing detail failed: {e}")
         self._append_signal_diag_lines(lines, diag, include_exit=False)
@@ -30693,6 +30726,68 @@ class SignalEngine(BaseEngine):
                 self._clear_utbot_filtered_breakout_entry_plan(symbol)
                 return
 
+            if active_strategy in UTBREAKOUT_STRATEGIES and filtered_breakout_plan:
+                try:
+                    fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+                    live_ladder_cfg = dict(fb_cfg or {})
+                    live_ladder_cfg.update(dict(cfg or {}))
+                    live_ladder_cfg.update(dict(filtered_breakout_plan or {}))
+                    split_policy = str(
+                        live_ladder_cfg.get("tp_split_failure_policy", "single_tp2_with_warning")
+                        or "single_tp2_with_warning"
+                    ).lower()
+                    live_ladder_enabled = (
+                        _normalize_live_real_stage(cfg.get("live_activation_stage")) == "LIVE_REAL_SMALL_CAP"
+                        and str(live_ladder_cfg.get("live_tp_ladder_mode", "tp1_tp2_full_exit") or "").lower()
+                        == "tp1_tp2_full_exit"
+                    )
+                    risk_distance = _safe_float_or_none(filtered_breakout_plan.get("risk_distance"))
+                    sl_price_for_preview = _safe_float_or_none(
+                        filtered_breakout_plan.get("stop_loss")
+                        or filtered_breakout_plan.get("stop_loss_price")
+                        or filtered_breakout_plan.get("sl_price")
+                        or filtered_breakout_plan.get("initial_sl_price")
+                    )
+                    if sl_price_for_preview is None and risk_distance is not None:
+                        sl_price_for_preview = (
+                            float(price) - float(risk_distance)
+                            if str(side).lower() == "long"
+                            else float(price) + float(risk_distance)
+                        )
+                    if live_ladder_enabled and split_policy == "block_entry" and sl_price_for_preview:
+                        ladder_preview = self._build_tp_ladder_orders(
+                            symbol,
+                            side,
+                            price,
+                            sl_price_for_preview,
+                            qty,
+                            live_ladder_cfg,
+                        )
+                        filtered_breakout_plan["tp_ladder_preflight"] = dict(ladder_preview)
+                        if not ladder_preview.get("ok"):
+                            reason = ladder_preview.get("reason") or "tp_ladder_not_possible"
+                            _record_filtered_breakout_entry_block(
+                                'ENTRY_BLOCKED_TP_LADDER',
+                                f'TP ladder not possible: {reason}',
+                                {
+                                    'tp_ladder_mode': ladder_preview.get('mode'),
+                                    'tp_ladder_reason': reason,
+                                    'tp_split_failure_policy': split_policy,
+                                },
+                            )
+                            await self.ctrl.notify(
+                                f"UTBreakout entry blocked: {symbol} {side.upper()} / "
+                                f"TP ladder not possible ({reason})"
+                            )
+                            self._clear_utbot_filtered_breakout_entry_plan(symbol)
+                            return
+                except Exception as ladder_preflight_exc:
+                    logger.warning(
+                        "[UTBOT_FILTERED_BREAKOUT_V1] TP ladder preflight skipped for %s: %s",
+                        symbol,
+                        ladder_preflight_exc,
+                    )
+
             # [Enforce] Market Settings (Isolated + Leverage)
             await self.ensure_market_settings(symbol, leverage=lev)
 
@@ -30891,6 +30986,43 @@ class SignalEngine(BaseEngine):
                     strategy=STRATEGY_DISPLAY_NAMES.get(active_strategy, active_strategy),
                     order=order,
                 )
+                try:
+                    risk_distance = _safe_float_or_none((filtered_breakout_plan or {}).get("risk_distance"))
+                    if risk_distance is not None and risk_distance > 0:
+                        sl_price_for_ladder = (
+                            float(actual_entry_price) - float(risk_distance)
+                            if str(side).lower() == "long"
+                            else float(actual_entry_price) + float(risk_distance)
+                        )
+                        sl_price_for_ladder = float(self.safe_price(symbol, sl_price_for_ladder))
+                        fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+                        live_ladder_cfg = dict(fb_cfg or {})
+                        live_ladder_cfg.update(dict(cfg or {}))
+                        live_ladder_cfg.update(dict(filtered_breakout_plan or {}))
+                        ladder_snapshot = self._build_tp_ladder_orders(
+                            symbol,
+                            side,
+                            actual_entry_price,
+                            sl_price_for_ladder,
+                            qty,
+                            live_ladder_cfg,
+                        )
+                        execution_snapshot["tp_ladder"] = ladder_snapshot
+                        if isinstance(ladder_snapshot, dict) and ladder_snapshot.get("sl_distance") is not None:
+                            execution_snapshot["sl_price"] = ladder_snapshot.get("sl_price")
+                            execution_snapshot["risk_distance"] = ladder_snapshot.get("sl_distance")
+                            filled_qty_value = _safe_float_or_none(execution_snapshot.get("filled_qty"))
+                            if filled_qty_value is not None:
+                                execution_snapshot["actual_risk_estimate"] = (
+                                    float(filled_qty_value)
+                                    * float(ladder_snapshot.get("sl_distance") or 0.0)
+                                )
+                except Exception as ladder_snapshot_exc:
+                    logger.debug(
+                        "entry TP ladder snapshot skipped for %s: %s",
+                        symbol,
+                        ladder_snapshot_exc,
+                    )
                 self._record_last_live_entry_snapshot(execution_snapshot)
             await self.ctrl.notify(
                 self._build_signal_entry_notice(
@@ -34064,6 +34196,12 @@ class SignalEngine(BaseEngine):
                 protection_cfg = self._get_utbot_filtered_breakout_config(self.get_runtime_strategy_params())
             except Exception:
                 protection_cfg = build_default_utbot_filtered_breakout_config()
+            try:
+                common_cfg = self.get_runtime_common_settings()
+            except Exception:
+                common_cfg = {}
+            common_cfg = common_cfg if isinstance(common_cfg, dict) else {}
+            protection_cfg = dict(protection_cfg or {})
             sl_max_attempts = max(1, int(protection_cfg.get('sl_place_max_retries', 3) or 3))
             sl_retry_delay = max(0.0, float(protection_cfg.get('sl_retry_delay_sec', 0.7) or 0.0))
             emergency_close_on_sl_fail = bool(protection_cfg.get('emergency_close_on_sl_fail', True))
@@ -34105,8 +34243,37 @@ class SignalEngine(BaseEngine):
                 if sl_distance is not None and sl_distance > 0:
                     sl_price = self.safe_price(symbol, entry_price + sl_distance)
 
-            normalized_tp_targets = []
+            tp_ladder_status = None
             raw_targets = tp_targets
+            combined_ladder_cfg = dict(protection_cfg)
+            combined_ladder_cfg.update(common_cfg)
+            use_live_ladder = (
+                _normalize_live_real_stage(common_cfg.get("live_activation_stage")) == "LIVE_REAL_SMALL_CAP"
+                and str(combined_ladder_cfg.get("live_tp_ladder_mode", "tp1_tp2_full_exit") or "").lower()
+                == "tp1_tp2_full_exit"
+                and sl_price is not None
+            )
+            if use_live_ladder:
+                tp_ladder_status = self._build_tp_ladder_orders(
+                    symbol,
+                    side,
+                    entry_price,
+                    sl_price,
+                    raw_qty,
+                    combined_ladder_cfg,
+                )
+                if tp_ladder_status.get("ok") and tp_ladder_status.get("tp_targets"):
+                    raw_targets = list(tp_ladder_status.get("tp_targets") or [])
+                    preserve_runner_qty = False
+                elif tp_ladder_status.get("reason"):
+                    raw_targets = []
+                    logger.warning(
+                        "[Protection] TP ladder unavailable for %s: %s",
+                        symbol,
+                        tp_ladder_status.get("reason"),
+                    )
+
+            normalized_tp_targets = []
             if raw_targets is None and tp_distance is not None:
                 raw_targets = [{
                     'label': 'TP',
@@ -34165,6 +34332,14 @@ class SignalEngine(BaseEngine):
                 normalized_tp_targets,
             )
             if tp_collapse:
+                if isinstance(tp_ladder_status, dict):
+                    tp_ladder_status = dict(tp_ladder_status)
+                    tp_ladder_status.update({
+                        "ok": True,
+                        "mode": tp_collapse.get("mode", "single_tp2_with_warning"),
+                        "reason": tp_collapse.get("reason", "qty_too_small_for_tp1_tp2_split"),
+                        "warnings": list(tp_ladder_status.get("warnings") or []) + [tp_collapse.get("reason", "qty_too_small_for_tp1_tp2_split")],
+                    })
                 logger.warning(
                     "[Protection] collapsed TP ladder for %s to one order: "
                     "qty=%.12f min_amount=%.12f",
@@ -34172,6 +34347,17 @@ class SignalEngine(BaseEngine):
                     float(tp_collapse["total_qty"]),
                     float(tp_collapse["min_amount"]),
                 )
+            if isinstance(tp_ladder_status, dict) and normalized_tp_targets:
+                placed_orders = []
+                for target in normalized_tp_targets:
+                    placed_orders.append({
+                        "name": target.get("label") or target.get("tp_label") or "TP",
+                        "price": target.get("price"),
+                        "qty": target.get("qty"),
+                        "rr": target.get("effective_r") or target.get("target_r"),
+                    })
+                tp_ladder_status["tp_orders"] = placed_orders
+                tp_ladder_status["tp_targets"] = [dict(target) for target in normalized_tp_targets]
             if normalized_tp_targets:
                 logger.info(
                     "[Protection] planned TP ladder for %s: entry=%.12f qty=%.12f targets=%s",
@@ -34327,6 +34513,15 @@ class SignalEngine(BaseEngine):
                     )
 
             notice_parts = []
+            if isinstance(tp_ladder_status, dict):
+                notice_parts.append(
+                    "TP Ladder: "
+                    f"`mode={tp_ladder_status.get('mode')}`"
+                    + (
+                        f" / reason `{tp_ladder_status.get('reason')}`"
+                        if tp_ladder_status.get('reason') else ""
+                    )
+                )
             for target in valid_tp_targets:
                 notice_parts.append(
                     f"🎯 {target.get('label')}: `{float(target.get('price')):.2f}` "
@@ -34354,11 +34549,19 @@ class SignalEngine(BaseEngine):
             first_audit = await self._audit_protection_orders(
                 symbol,
                 pos=audit_pos,
-                expected_tp=bool(valid_tp_targets),
+                expected_tp=bool(valid_tp_targets) or bool(use_live_ladder and isinstance(tp_ladder_status, dict)),
                 expected_sl=sl_price is not None,
                 planned_tp_orders=normalized_tp_targets,
                 alert=False
             )
+            if isinstance(tp_ladder_status, dict):
+                current_status = dict((getattr(self, 'last_protection_order_status', {}) or {}).get(symbol, {}) or {})
+                current_status['tp_ladder'] = dict(tp_ladder_status)
+                current_status['tp_ladder_mode'] = tp_ladder_status.get('mode')
+                current_status['tp_ladder_reason'] = tp_ladder_status.get('reason')
+                if tp_ladder_status.get('mode') == 'single_tp2_with_warning' and current_status.get('status') == 'OK':
+                    current_status['status'] = 'OK_WITH_WARNING'
+                self.last_protection_order_status[symbol] = current_status
             if (
                 first_audit.get('fetch_ok', True)
                 and (
@@ -34378,7 +34581,7 @@ class SignalEngine(BaseEngine):
                 await self._audit_protection_orders(
                     symbol,
                     pos=audit_pos,
-                    expected_tp=bool(valid_tp_targets),
+                    expected_tp=bool(valid_tp_targets) or bool(use_live_ladder and isinstance(tp_ladder_status, dict)),
                     expected_sl=sl_price is not None,
                     planned_tp_orders=normalized_tp_targets,
                     alert=True
@@ -47714,6 +47917,254 @@ def _get_min_amount_for_symbol(self, symbol):
     return max(0.0, min_amount)
 
 
+def _get_amount_step_for_symbol(self, symbol):
+    try:
+        market = self.exchange.market(symbol)
+    except Exception:
+        market = None
+    if not isinstance(market, dict):
+        return 0.0
+    info = market.get("info", {}) if isinstance(market.get("info"), dict) else {}
+    filters = info.get("filters", []) if isinstance(info.get("filters"), list) else []
+    for item in filters:
+        if not isinstance(item, dict):
+            continue
+        for key in ("stepSize", "qtyStep", "minQty"):
+            try:
+                value = float(item.get(key) or 0.0)
+                if value > 0:
+                    return value
+            except (TypeError, ValueError):
+                continue
+    precision = (market.get("precision") or {}).get("amount") if isinstance(market.get("precision"), dict) else None
+    try:
+        if isinstance(precision, int):
+            return 10 ** (-precision)
+        value = float(precision)
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    return self._get_min_amount_for_symbol(symbol)
+
+
+def _tp_ladder_rr_for_price(side, entry_price, sl_distance, tp_price):
+    try:
+        entry = float(entry_price)
+        distance = float(sl_distance)
+        price = float(tp_price)
+    except (TypeError, ValueError):
+        return 0.0
+    if distance <= 0:
+        return 0.0
+    if str(side).lower() == "long":
+        return (price - entry) / distance
+    return (entry - price) / distance
+
+
+def _build_tp_ladder_orders(
+    self,
+    symbol,
+    side,
+    entry_price,
+    sl_price,
+    actual_qty,
+    cfg=None,
+):
+    cfg = cfg if isinstance(cfg, dict) else {}
+    side = str(side or "").lower()
+    entry = _safe_float_or_none(entry_price)
+    sl = _safe_float_or_none(sl_price)
+    qty = _safe_float_or_none(actual_qty)
+    if side not in {"long", "short"}:
+        return {"ok": False, "mode": "invalid", "reason": "invalid_side", "tp_targets": []}
+    if entry is None or entry <= 0:
+        return {"ok": False, "mode": "invalid", "reason": "missing_entry_ref", "tp_targets": []}
+    if sl is None or sl <= 0:
+        return {"ok": False, "mode": "invalid", "reason": "missing_sl_price", "tp_targets": []}
+    if qty is None or qty <= 0:
+        return {"ok": False, "mode": "invalid", "reason": "invalid_actual_qty", "tp_targets": []}
+
+    if side == "long":
+        sl_distance = entry - sl
+    else:
+        sl_distance = sl - entry
+    if sl_distance <= 0:
+        return {
+            "ok": False,
+            "mode": "invalid",
+            "reason": "invalid_sl_distance",
+            "entry_ref": entry,
+            "sl_price": sl,
+            "tp_targets": [],
+        }
+
+    tp1_rr = max(0.1, float(cfg.get("live_tp1_rr", cfg.get("partial_take_profit_r_multiple", 1.0)) or 1.0))
+    tp2_rr = max(
+        float(cfg.get("live_min_tp2_rr", 2.0) or 2.0),
+        float(cfg.get("live_tp2_rr", cfg.get("second_take_profit_r_multiple", 2.4)) or 2.4),
+    )
+    min_tp2_rr = max(0.1, float(cfg.get("live_min_tp2_rr", 2.0) or 2.0))
+    tp1_pct = min(1.0, max(0.0, float(cfg.get("live_tp1_pct", 0.25) or 0.25)))
+    tp2_pct = min(1.0, max(0.0, float(cfg.get("live_tp2_pct", 0.75) or 0.75)))
+    if tp1_pct <= 0 or tp2_pct <= 0 or tp1_pct + tp2_pct <= 0:
+        tp1_pct, tp2_pct = 0.25, 0.75
+    total_pct = tp1_pct + tp2_pct
+    tp1_pct /= total_pct
+    tp2_pct /= total_pct
+    policy = str(cfg.get("tp_split_failure_policy", "single_tp2_with_warning") or "single_tp2_with_warning").lower()
+    if policy not in {"single_tp2_with_warning", "block_entry", "try_adaptive_split"}:
+        policy = "single_tp2_with_warning"
+
+    def _price_for_rr(rr):
+        raw = entry + sl_distance * rr if side == "long" else entry - sl_distance * rr
+        rounded = float(self.safe_price(symbol, raw))
+        actual_rr = _tp_ladder_rr_for_price(side, entry, sl_distance, rounded)
+        if actual_rr + 1e-9 < min_tp2_rr and rr >= min_tp2_rr:
+            raw = entry + sl_distance * (min_tp2_rr * 1.001) if side == "long" else entry - sl_distance * (min_tp2_rr * 1.001)
+            rounded = float(self.safe_price(symbol, raw))
+            actual_rr = _tp_ladder_rr_for_price(side, entry, sl_distance, rounded)
+        return rounded, actual_rr
+
+    tp1_price, tp1_actual_rr = _price_for_rr(tp1_rr)
+    tp2_price, tp2_actual_rr = _price_for_rr(tp2_rr)
+    if tp2_actual_rr + 1e-9 < min_tp2_rr:
+        return {
+            "ok": False,
+            "mode": "invalid",
+            "reason": "tp2_rr_below_min_after_rounding",
+            "entry_ref": entry,
+            "sl_price": sl,
+            "sl_distance": sl_distance,
+            "tp2_price": tp2_price,
+            "tp2_rr": tp2_actual_rr,
+            "min_tp2_rr": min_tp2_rr,
+            "tp_targets": [],
+        }
+    if side == "long" and not (tp1_price > entry and tp2_price > tp1_price):
+        return {"ok": False, "mode": "invalid", "reason": "invalid_long_tp_ordering", "tp_targets": []}
+    if side == "short" and not (tp1_price < entry and tp2_price < tp1_price):
+        return {"ok": False, "mode": "invalid", "reason": "invalid_short_tp_ordering", "tp_targets": []}
+
+    min_amount = self._get_min_amount_for_symbol(symbol)
+    step_size = self._get_amount_step_for_symbol(symbol)
+
+    def _split_targets(first_pct, second_pct, mode):
+        residual = _calculate_residual_tp_quantities(
+            symbol,
+            qty,
+            [qty * first_pct, qty * second_pct],
+            self.safe_amount,
+        )
+        tp1_qty = float(residual[0]) if len(residual) > 0 else 0.0
+        tp2_qty = float(residual[1]) if len(residual) > 1 else 0.0
+        min_ok = (
+            (min_amount <= 0 or tp1_qty + 1e-12 >= min_amount)
+            and (min_amount <= 0 or tp2_qty + 1e-12 >= min_amount)
+        )
+        if tp1_qty <= 0 or tp2_qty <= 0 or not min_ok or tp1_qty + tp2_qty > qty * 1.000001:
+            return None
+        return {
+            "ok": True,
+            "mode": mode,
+            "tp_orders": [
+                {"name": "TP1", "price": tp1_price, "qty": tp1_qty, "rr": tp1_actual_rr, "pct": first_pct},
+                {"name": "TP2", "price": tp2_price, "qty": tp2_qty, "rr": tp2_actual_rr, "pct": second_pct},
+            ],
+            "tp_targets": [
+                {"label": "TP1", "kind": "tp1", "distance": abs(tp1_price - entry), "qty_ratio": first_pct, "target_r": tp1_rr, "effective_r": tp1_actual_rr},
+                {"label": "TP2", "kind": "tp2", "distance": abs(tp2_price - entry), "qty_ratio": second_pct, "target_r": tp2_rr, "effective_r": tp2_actual_rr},
+            ],
+            "warnings": [],
+        }
+
+    split = _split_targets(tp1_pct, tp2_pct, "split_tp1_tp2")
+    if split is None and policy == "try_adaptive_split":
+        split = _split_targets(0.5, 0.5, "adaptive_split_50_50")
+    if split is not None:
+        split.update({
+            "entry_ref": entry,
+            "sl_price": sl,
+            "sl_distance": sl_distance,
+            "actual_qty": qty,
+            "step_size": step_size,
+            "min_amount": min_amount,
+            "policy": policy,
+        })
+        return split
+
+    required_base = min_amount or step_size or 0.0
+    min_leg_pct = max(1e-9, min(tp1_pct, tp2_pct))
+    required_min_qty_for_split = required_base / min_leg_pct if required_base > 0 else None
+    reason = "qty_too_small_for_tp1_tp2_split"
+    base = {
+        "ok": False,
+        "mode": "split_not_possible",
+        "reason": reason,
+        "entry_ref": entry,
+        "sl_price": sl,
+        "sl_distance": sl_distance,
+        "actual_qty": qty,
+        "step_size": step_size,
+        "min_amount": min_amount,
+        "required_min_qty_for_split": required_min_qty_for_split,
+        "policy": policy,
+        "tp_targets": [],
+        "warnings": [reason],
+    }
+    if policy == "block_entry":
+        return base
+
+    full_qty = float(self.safe_amount(symbol, qty))
+    if full_qty <= 0 or (min_amount > 0 and full_qty + 1e-12 < min_amount):
+        return dict(base, reason="actual_qty_below_exchange_min_amount")
+    return dict(
+        base,
+        ok=True,
+        mode="single_tp2_with_warning",
+        tp_orders=[
+            {"name": "TP2", "price": tp2_price, "qty": full_qty, "rr": tp2_actual_rr, "pct": 1.0},
+        ],
+        tp_targets=[
+            {"label": "TP2", "kind": "tp2", "distance": abs(tp2_price - entry), "qty_ratio": 1.0, "target_r": tp2_rr, "effective_r": tp2_actual_rr},
+        ],
+    )
+
+
+def _format_tp_ladder_lines(self, ladder):
+    ladder = ladder if isinstance(ladder, dict) else {}
+    lines = ["TP Ladder:"]
+    mode = ladder.get("mode") or "unknown"
+    lines.append(f"mode={mode}")
+    if ladder.get("reason"):
+        lines.append(f"reason={ladder.get('reason')}")
+    if ladder.get("entry_ref") is not None:
+        lines.append(f"entry_ref={self._fmt_signal_trade_value(ladder.get('entry_ref'))}")
+    if ladder.get("sl_price") is not None:
+        lines.append(f"SL={self._fmt_signal_trade_value(ladder.get('sl_price'))}")
+    if ladder.get("sl_distance") is not None:
+        lines.append(f"SL_distance={self._fmt_signal_trade_value(ladder.get('sl_distance'))}")
+    orders = ladder.get("tp_orders") if isinstance(ladder.get("tp_orders"), list) else []
+    if not orders and mode == "split_not_possible":
+        lines.append("TP1=not_created")
+        lines.append("TP2=not_created")
+    else:
+        labels = {str(order.get("name") or "").upper() for order in orders if isinstance(order, dict)}
+        if "TP1" not in labels and mode == "single_tp2_with_warning":
+            lines.append("TP1=not_created")
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            lines.append(
+                f"{order.get('name') or 'TP'}={self._fmt_signal_trade_value(order.get('price'))} / "
+                f"RR={float(order.get('rr') or 0.0):.2f} / "
+                f"qty={self._fmt_signal_trade_value(order.get('qty'))}"
+            )
+    if mode == "single_tp2_with_warning":
+        lines.append("exit=full_at_TP2")
+    return lines
+
+
 def _collapse_tp_targets_for_exchange(self, symbol, total_qty, targets):
     normalized_targets = [dict(target) for target in (targets or []) if isinstance(target, dict)]
     if not normalized_targets:
@@ -47731,17 +48182,31 @@ def _collapse_tp_targets_for_exchange(self, symbol, total_qty, targets):
     if not undersized:
         return normalized_targets, None
 
-    first_target = min(
+    exit_target = max(
         normalized_targets,
-        key=lambda target: int(target.get("tp_index") or 1),
+        key=lambda target: (
+            _safe_float_value(target.get("effective_r"), 0.0),
+            _safe_float_value(target.get("target_r"), 0.0),
+            _safe_float_value(target.get("distance"), 0.0),
+            int(target.get("tp_index") or 1),
+        ),
     )
-    collapsed = dict(first_target)
+    collapsed = dict(exit_target)
+    collapsed_label = str(
+        collapsed.get("tp_label")
+        or collapsed.get("label")
+        or collapsed.get("tp_name")
+        or "TP2"
+    )
     collapsed.update({
         "qty": executable_total,
         "raw_qty": executable_total,
         "qty_ratio": 1.0,
         "pct": 100.0,
         "collapsed_min_amount": True,
+        "tp_split_failure_policy": "single_tp2_with_warning",
+        "tp_ladder_mode": "single_tp2_with_warning",
+        "tp_ladder_reason": "qty_too_small_for_tp1_tp2_split",
         "collapsed_from": [
             str(target.get("tp_label") or target.get("label") or target.get("tp_name") or "TP")
             for target in normalized_targets
@@ -47750,12 +48215,9 @@ def _collapse_tp_targets_for_exchange(self, symbol, total_qty, targets):
     return [collapsed], {
         "min_amount": min_amount,
         "total_qty": executable_total,
-        "collapsed_label": str(
-            collapsed.get("tp_label")
-            or collapsed.get("label")
-            or collapsed.get("tp_name")
-            or "TP"
-        ),
+        "collapsed_label": collapsed_label,
+        "mode": "single_tp2_with_warning",
+        "reason": "qty_too_small_for_tp1_tp2_split",
     }
 
 
@@ -48898,6 +49360,9 @@ def _bind_live_advanced_alpha_helpers_to_main_controller():
         "_normalize_live_order_plan_for_exchange",
         "_get_min_notional_for_symbol",
         "_get_min_amount_for_symbol",
+        "_get_amount_step_for_symbol",
+        "_build_tp_ladder_orders",
+        "_format_tp_ladder_lines",
         "_collapse_tp_targets_for_exchange",
         "_collapse_state_tp_plan_for_exchange",
         "_validate_live_order_plan_for_exchange",

@@ -3555,7 +3555,7 @@ def test_place_tp_sl_orders_makes_final_tp_residual_after_precision():
     assert sum(float(order["amount"]) for order in tp_orders) == pytest.approx(1.0)
 
 
-def test_place_tp_sl_orders_collapses_undersized_split_to_full_tp1():
+def test_place_tp_sl_orders_collapses_undersized_split_to_full_tp2_warning():
     pos = {
         "symbol": "SNDK/USDT:USDT",
         "side": "long",
@@ -3585,13 +3585,14 @@ def test_place_tp_sl_orders_collapses_undersized_split_to_full_tp1():
     tp_orders = [order for order in engine.exchange.created if order["type"] == "limit"]
     assert len(tp_orders) == 1
     assert float(tp_orders[0]["amount"]) == pytest.approx(0.01)
-    assert float(tp_orders[0]["price"]) == pytest.approx(2258.70)
+    assert float(tp_orders[0]["price"]) == pytest.approx(2329.34)
     status = engine.last_protection_order_status["SNDK/USDT"]
-    assert status["tp1_present"] is True
+    assert status["tp1_present"] is False
+    assert status["tp2_present"] is True
     assert status["missing_tp2"] is False
 
 
-def test_ladder_audit_repairs_existing_undersized_plan_as_full_tp1():
+def test_ladder_audit_repairs_existing_undersized_plan_as_full_tp2():
     pos = {
         "symbol": "SNDK/USDT:USDT",
         "side": "long",
@@ -3640,12 +3641,12 @@ def test_ladder_audit_repairs_existing_undersized_plan_as_full_tp1():
         )
     )
 
-    assert result["tp1_repair"]["status"] == "TP1_REPAIRED"
+    assert result["tp2_repair"]["status"] == "TP2_REPAIRED"
     created_tp = [order for order in engine.exchange.created if order["type"] == "limit"][-1]
     assert float(created_tp["amount"]) == pytest.approx(0.01)
-    assert float(created_tp["price"]) == pytest.approx(2258.70)
+    assert float(created_tp["price"]) == pytest.approx(2329.34)
     assert state["expected_tp_count"] == 1
-    assert [item["tp_label"] for item in state["planned_tp_orders"]] == ["TP1"]
+    assert [item["tp_label"] for item in state["planned_tp_orders"]] == ["TP2"]
     assert state["tp2_disabled_min_amount"] is True
 
 
@@ -3714,10 +3715,10 @@ def test_restart_recovery_rebuilds_small_position_tp_from_bot_algo_stops():
     assert state["recovered_from_exchange"] is True
     assert state["risk_distance"] == pytest.approx(9.0)
     assert state["last_stop_price"] == pytest.approx(100.0)
-    assert [item["tp_label"] for item in state["planned_tp_orders"]] == ["TP1"]
+    assert [item["tp_label"] for item in state["planned_tp_orders"]] == ["TP2"]
     created_tp = [order for order in engine.exchange.created if order["type"] == "limit"][-1]
     assert float(created_tp["amount"]) == pytest.approx(0.01)
-    assert float(created_tp["price"]) == pytest.approx(109.0)
+    assert float(created_tp["price"]) == pytest.approx(121.6)
     assert engine.exchange.algo_cancelled == ["4000001", "4000002"]
     assert [order["algoId"] for order in engine.exchange.algo_orders] == ["4000003"]
 
@@ -5072,3 +5073,270 @@ def test_dual_entry_execution_snapshot_uses_filled_qty_for_actual_risk():
     assert snapshot["actual_notional"] == pytest.approx(9.21)
     assert snapshot["actual_risk_estimate"] == pytest.approx(0.60052)
     assert snapshot["qty_limiter_reason"] == "exchange_step_size_or_min_qty_rounding"
+
+
+def test_live_tp_ladder_long_uses_1r_and_24r_targets():
+    engine = _protection_engine([])
+
+    ladder = engine._build_tp_ladder_orders(
+        "BTC/USDT:USDT",
+        "long",
+        100,
+        90,
+        1.0,
+        {
+            "live_tp1_rr": 1.0,
+            "live_tp2_rr": 2.4,
+            "live_min_tp2_rr": 2.0,
+            "live_tp1_pct": 0.25,
+            "live_tp2_pct": 0.75,
+        },
+    )
+
+    assert ladder["ok"] is True
+    assert ladder["mode"] == "split_tp1_tp2"
+    assert ladder["tp_orders"][0]["price"] == pytest.approx(110.0)
+    assert ladder["tp_orders"][1]["price"] == pytest.approx(124.0)
+    assert ladder["tp_orders"][1]["rr"] >= 2.0
+
+
+def test_live_tp_ladder_short_uses_1r_and_24r_targets():
+    engine = _protection_engine([])
+
+    ladder = engine._build_tp_ladder_orders(
+        "BTC/USDT:USDT",
+        "short",
+        100,
+        110,
+        1.0,
+        {
+            "live_tp1_rr": 1.0,
+            "live_tp2_rr": 2.4,
+            "live_min_tp2_rr": 2.0,
+            "live_tp1_pct": 0.25,
+            "live_tp2_pct": 0.75,
+        },
+    )
+
+    assert ladder["ok"] is True
+    assert ladder["mode"] == "split_tp1_tp2"
+    assert ladder["tp_orders"][0]["price"] == pytest.approx(90.0)
+    assert ladder["tp_orders"][1]["price"] == pytest.approx(76.0)
+    assert ladder["tp_orders"][1]["rr"] >= 2.0
+
+
+def test_live_tp_ladder_enforces_min_tp2_rr_after_config_and_rounding():
+    engine = _protection_engine([])
+
+    ladder = engine._build_tp_ladder_orders(
+        "BTC/USDT:USDT",
+        "long",
+        100,
+        90,
+        1.0,
+        {
+            "live_tp1_rr": 1.0,
+            "live_tp2_rr": 1.5,
+            "live_min_tp2_rr": 2.0,
+        },
+    )
+
+    assert ladder["ok"] is True
+    assert ladder["tp_orders"][1]["rr"] >= 2.0
+    assert ladder["tp_orders"][1]["price"] >= 120.0
+
+
+def test_live_tp_ladder_small_qty_single_tp2_warning():
+    pos = {"symbol": "AAVE/USDT:USDT", "side": "long", "contracts": "0.1", "entryPrice": "92.10"}
+    engine = _protection_engine([], positions=[pos])
+    engine.exchange = _BinanceAlgoExchange([], positions=[pos], min_amount=0.1)
+
+    ladder = engine._build_tp_ladder_orders(
+        "AAVE/USDT:USDT",
+        "long",
+        92.10,
+        86.0948,
+        0.1,
+        {
+            "live_tp1_rr": 1.0,
+            "live_tp2_rr": 2.4,
+            "live_min_tp2_rr": 2.0,
+            "tp_split_failure_policy": "single_tp2_with_warning",
+        },
+    )
+
+    assert ladder["ok"] is True
+    assert ladder["mode"] == "single_tp2_with_warning"
+    assert ladder["reason"] == "qty_too_small_for_tp1_tp2_split"
+    assert ladder["tp_orders"][0]["name"] == "TP2"
+    assert ladder["tp_orders"][0]["qty"] == pytest.approx(0.1)
+    assert ladder["tp_orders"][0]["price"] == pytest.approx(106.51)
+    assert ladder["tp_orders"][0]["rr"] >= 2.0
+
+
+def test_place_tp_sl_orders_live_small_qty_places_single_tp2_warning():
+    emas = _emas_module()
+    pos = {"symbol": "AAVE/USDT:USDT", "side": "long", "contracts": "0.1", "entryPrice": "92.10"}
+    engine = _protection_engine([], positions=[pos])
+    engine.exchange = _BinanceAlgoExchange([], positions=[pos], min_amount=0.1)
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": emas.DUAL_ALPHA_STRATEGY,
+        "UTBotFilteredBreakoutV1": emas.build_default_utbot_filtered_breakout_config(),
+    }
+    engine.get_runtime_common_settings = lambda: {
+        "live_activation_stage": "LIVE_REAL_SMALL_CAP",
+        "live_tp_ladder_mode": "tp1_tp2_full_exit",
+        "tp_split_failure_policy": "single_tp2_with_warning",
+    }
+
+    async def _get_position(symbol, use_cache=False):
+        return pos
+
+    engine.get_server_position = _get_position
+
+    asyncio.run(
+        engine._place_tp_sl_orders(
+            "AAVE/USDT:USDT",
+            "long",
+            92.10,
+            "0.1",
+            sl_distance=6.0052,
+        )
+    )
+
+    tp_orders = [order for order in engine.exchange.created if order["type"] == "limit"]
+    stop_order = next(order for order in engine.exchange.created if order["type"] == "stop_market")
+    assert len(tp_orders) == 1
+    assert "tp2" in str(tp_orders[0]["clientOrderId"]).lower()
+    assert float(tp_orders[0]["amount"]) == pytest.approx(0.1)
+    assert float(tp_orders[0]["price"]) == pytest.approx(106.52)
+    assert float(stop_order["params"]["stopPrice"]) == pytest.approx(86.09)
+    status = engine.last_protection_order_status["AAVE/USDT:USDT"]
+    assert status["status"] == "OK_WITH_WARNING"
+    assert status["tp_ladder_mode"] == "single_tp2_with_warning"
+    assert status["tp_ladder"]["tp_orders"][0]["name"] == "TP2"
+
+
+def test_live_tp_ladder_small_qty_block_entry_policy():
+    engine = _protection_engine([])
+    engine.exchange = _BinanceAlgoExchange([], min_amount=0.1)
+
+    ladder = engine._build_tp_ladder_orders(
+        "AAVE/USDT:USDT",
+        "long",
+        92.10,
+        86.0948,
+        0.1,
+        {
+            "tp_split_failure_policy": "block_entry",
+        },
+    )
+
+    assert ladder["ok"] is False
+    assert ladder["mode"] == "split_not_possible"
+    assert ladder["reason"] == "qty_too_small_for_tp1_tp2_split"
+
+
+def test_live_tp_ladder_sufficient_qty_splits_and_does_not_exceed_qty():
+    engine = _protection_engine([])
+    engine.exchange = _BinanceAlgoExchange([], min_amount=0.1)
+
+    ladder = engine._build_tp_ladder_orders(
+        "BTC/USDT:USDT",
+        "long",
+        100,
+        90,
+        1.0,
+        {},
+    )
+
+    assert ladder["ok"] is True
+    assert ladder["mode"] == "split_tp1_tp2"
+    assert [order["name"] for order in ladder["tp_orders"]] == ["TP1", "TP2"]
+    total_qty = sum(order["qty"] for order in ladder["tp_orders"])
+    assert total_qty <= 1.0 + 1e-12
+    assert total_qty == pytest.approx(1.0)
+
+
+def test_aave_example_tp2_uses_filled_entry_and_24r():
+    engine = _protection_engine([])
+    engine.exchange = _BinanceAlgoExchange([], min_amount=0.1)
+
+    ladder = engine._build_tp_ladder_orders(
+        "AAVE/USDT:USDT",
+        "long",
+        92.10,
+        86.0948,
+        0.1,
+        {"tp_split_failure_policy": "single_tp2_with_warning"},
+    )
+
+    assert ladder["tp_orders"][0]["price"] == pytest.approx(106.51)
+    assert ladder["tp_orders"][0]["rr"] == pytest.approx(2.398, rel=1e-3)
+
+
+def test_tp_ladder_format_does_not_claim_missing_tp1_exists():
+    engine = _protection_engine([])
+    ladder = {
+        "mode": "single_tp2_with_warning",
+        "reason": "qty_too_small_for_tp1_tp2_split",
+        "entry_ref": 92.10,
+        "sl_price": 86.0948,
+        "sl_distance": 6.0052,
+        "tp_orders": [
+            {"name": "TP2", "price": 106.51, "qty": 0.1, "rr": 2.398},
+        ],
+    }
+
+    text = "\n".join(engine._format_tp_ladder_lines(ladder))
+
+    assert "TP1=not_created" in text
+    assert "TP2=106.51" in text
+    assert "exit=full_at_TP2" in text
+
+
+def test_dual_status_shows_tp_ladder_from_protection_status():
+    emas, engine = _build_dual_status_engine()
+    engine.last_protection_order_status = {
+        "AAVE/USDT:USDT": {
+            "tp_ladder": {
+                "mode": "single_tp2_with_warning",
+                "reason": "qty_too_small_for_tp1_tp2_split",
+                "entry_ref": 92.10,
+                "sl_price": 86.0948,
+                "sl_distance": 6.0052,
+                "tp_orders": [
+                    {"name": "TP2", "price": 106.51, "qty": 0.1, "rr": 2.398},
+                ],
+            }
+        }
+    }
+
+    async def active_positions(use_cache=False):
+        return {"AAVE/USDT"}
+
+    async def position(symbol, use_cache=False):
+        return True, {
+            "symbol": "AAVE/USDT:USDT",
+            "side": "long",
+            "contracts": 0.1,
+            "entryPrice": 92.10,
+        }
+
+    async def protection_orders(symbol):
+        return True, [
+            {"type": "limit", "side": "sell", "reduceOnly": True, "price": 106.51, "clientOrderId": "utbtp2AAVE"},
+            {"type": "STOP_MARKET", "side": "sell", "reduceOnly": True, "stopPrice": 86.0948},
+        ]
+
+    engine.get_active_position_symbols = active_positions
+    engine._fetch_server_position_checked = position
+    engine._collect_protection_orders_checked = protection_orders
+
+    text = asyncio.run(engine.build_dual_alpha_status_text("AAVE/USDT:USDT"))
+
+    assert "status=OK_WITH_WARNING" in text
+    assert "TP Ladder:" in text
+    assert "mode=single_tp2_with_warning" in text
+    assert "TP1=not_created" in text
+    assert "TP2=106.51" in text
