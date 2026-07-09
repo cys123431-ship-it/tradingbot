@@ -55,6 +55,7 @@ def test_defaults_keep_new_strategy_shadow_only():
     assert cfg["trend_htf"] == "1d"
     assert cfg["forced_direction"] is None
     assert cfg["direction_source"] == "UTBreakout"
+    assert cfg["require_internal_trend_confirmation"] is False
     assert cfg["relative_strength_pullback_trend_shadow_enabled"] is True
     assert cfg["relative_strength_pullback_trend_live_enabled"] is False
     assert cfg["relative_strength_pullback_trend_paper_enabled"] is False
@@ -236,10 +237,9 @@ def test_htf_ema100_fallback_prevents_insufficient_data_when_1d_history_is_short
     assert decision.logs["ema_htf_effective"] == 100
 
 
-def test_forced_utbreakout_direction_blocks_opposite_rspt_side():
-    symbol = "PULL/USDT:USDT"
-    base = _rows(130, 100.0, 0.06)
-    rows = _with_last(base, open=107.2, high=107.7, low=106.2, close=107.6)
+def test_forced_utbreakout_direction_allows_setup_without_internal_trend_confirmation():
+    symbol = "SHORT/USDT:USDT"
+    rows = _breakout_rows(120.0, -0.06, side="short")
 
     decisions = evaluate_relative_strength_pullback_trend(
         [symbol],
@@ -249,10 +249,33 @@ def test_forced_utbreakout_direction_blocks_opposite_rspt_side():
     )
     decision = decisions[0]
 
+    assert decision.entry_ready is True
+    assert decision.side == "short"
+    assert decision.reason == "breakout_continuation_confirmed"
+    assert decision.logs["internal_trend_confirmation_required"] is False
+    assert decision.logs["htf_trend_passed_short"] is False
+    assert decision.logs["trend_filter_passed_short"] is False
+
+
+def test_internal_trend_confirmation_can_still_be_required_by_config():
+    symbol = "SHORT/USDT:USDT"
+    rows = _breakout_rows(120.0, -0.06, side="short")
+
+    decisions = evaluate_relative_strength_pullback_trend(
+        [symbol],
+        {symbol: rows},
+        {symbol: _rows(220, 100.0, 0.10, timestamp_step=86_400_000)},
+        config=_base_config(
+            forced_direction="short",
+            require_internal_trend_confirmation=True,
+        ),
+    )
+    decision = decisions[0]
+
     assert decision.entry_ready is False
     assert decision.side == "short"
     assert decision.reason == "trend_filter_failed"
-    assert decision.logs["rspt_ignored_opposite_side"] is True
+    assert decision.logs["internal_trend_confirmation_required"] is True
 
 
 def test_adx_soft_zone_reduces_size_instead_of_hard_blocking():

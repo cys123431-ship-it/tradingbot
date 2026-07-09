@@ -40,6 +40,7 @@ def default_relative_strength_pullback_config():
         "entry_execution": "next_open",
         "forced_direction": None,
         "direction_source": "UTBreakout",
+        "require_internal_trend_confirmation": False,
         "donchian_length": 20,
         "ema_pullback": 20,
         "ema_fast": 20,
@@ -316,7 +317,7 @@ def _relative_strength_percentiles(symbols, signal_rows_by_symbol, cfg, now_ms=N
 
 
 def _trend_side(signal_rows, htf_rows, cfg):
-    htf_close = _row_value(htf_rows[-1], "close")
+    htf_close = _row_value(htf_rows[-1], "close") if htf_rows else None
     htf_ema_fast = _ema([_row_value(row, "close") for row in htf_rows], cfg.get("ema_htf_fast", 50))
     htf_ema_slow = _ema([_row_value(row, "close") for row in htf_rows], cfg.get("ema_htf", 200))
     signal_close = _row_value(signal_rows[-1], "close")
@@ -326,8 +327,8 @@ def _trend_side(signal_rows, htf_rows, cfg):
     adx = _adx(signal_rows, cfg.get("adx_length", 14))
     adx_threshold = _finite_float(cfg.get("adx_pass", cfg.get("adx_threshold")), 20.0)
     return {
-        "long_htf": bool(htf_ema_slow and htf_close > htf_ema_slow) or bool(htf_ema_fast and htf_ema_slow and htf_ema_fast > htf_ema_slow),
-        "short_htf": bool(htf_ema_slow and htf_close < htf_ema_slow) or bool(htf_ema_fast and htf_ema_slow and htf_ema_fast < htf_ema_slow),
+        "long_htf": bool(htf_ema_slow and htf_close and htf_close > htf_ema_slow) or bool(htf_ema_fast and htf_ema_slow and htf_ema_fast > htf_ema_slow),
+        "short_htf": bool(htf_ema_slow and htf_close and htf_close < htf_ema_slow) or bool(htf_ema_fast and htf_ema_slow and htf_ema_fast < htf_ema_slow),
         "long_signal": bool(signal_ema_fast and signal_ema_trend and signal_close > signal_ema_fast and signal_close > signal_ema_trend),
         "short_signal": bool(signal_ema_fast and signal_ema_trend and signal_close < signal_ema_fast and signal_close < signal_ema_trend),
         "adx": adx,
@@ -531,6 +532,7 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
     min_htf = max(htf_slow_len, htf_fast_len) + 1
     effective_cfg = cfg
     htf_fallback_used = False
+    internal_trend_required = bool(cfg.get("require_internal_trend_confirmation", False))
     if len(signal_rows) < min_signal:
         return PullbackTrendDecision(
             symbol,
@@ -542,9 +544,9 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
                 "signal_rows_required": min_signal,
             },
         )
+    fallback_len = max(1, int(cfg.get("ema_htf_fallback", 100) or 100))
+    fallback_min_htf = max(fallback_len, htf_fast_len) + 1
     if len(htf_rows) < min_htf:
-        fallback_len = max(1, int(cfg.get("ema_htf_fallback", 100) or 100))
-        fallback_min_htf = max(fallback_len, htf_fast_len) + 1
         if (
             bool(cfg.get("ema_htf_fallback_enabled", True))
             and fallback_len < htf_slow_len
@@ -554,7 +556,7 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
             effective_cfg["ema_htf"] = fallback_len
             htf_fallback_used = True
             min_htf = fallback_min_htf
-        else:
+        elif internal_trend_required:
             return PullbackTrendDecision(
                 symbol,
                 reason="insufficient_data",
@@ -608,7 +610,10 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
         "rspt_original_candidate_sides": original_candidate_sides,
         "rspt_ignored_opposite_side": False,
         "htf_fallback_used": htf_fallback_used,
+        "htf_rows": len(htf_rows),
+        "htf_rows_required": min_htf,
         "ema_htf_effective": effective_cfg.get("ema_htf", cfg.get("ema_htf", 200)),
+        "internal_trend_confirmation_required": internal_trend_required,
     }
 
     if forced_direction not in {"long", "short"}:
@@ -618,14 +623,17 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
     logs["rspt_final_side"] = forced_direction
     logs["rspt_ignored_opposite_side"] = any(side != forced_direction for side in original_candidate_sides)
 
-    if not candidate_sides:
-        reason = "trend_filter_failed"
-        return PullbackTrendDecision(symbol, side=forced_direction, reason=reason, logs={**logs, "rejected_reason": reason})
+    if internal_trend_required:
+        if not candidate_sides:
+            reason = "trend_filter_failed"
+            return PullbackTrendDecision(symbol, side=forced_direction, reason=reason, logs={**logs, "rejected_reason": reason})
 
-    candidate_sides = [forced_direction] if forced_direction in candidate_sides else []
-    if not candidate_sides:
-        reason = "trend_filter_failed"
-        return PullbackTrendDecision(symbol, side=forced_direction, reason=reason, logs={**logs, "rejected_reason": reason})
+        candidate_sides = [forced_direction] if forced_direction in candidate_sides else []
+        if not candidate_sides:
+            reason = "trend_filter_failed"
+            return PullbackTrendDecision(symbol, side=forced_direction, reason=reason, logs={**logs, "rejected_reason": reason})
+    else:
+        candidate_sides = [forced_direction]
 
     for side in candidate_sides:
         adx_gate = _adx_gate(trend.get("adx"), cfg)
