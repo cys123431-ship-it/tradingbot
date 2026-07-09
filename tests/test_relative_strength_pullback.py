@@ -217,6 +217,25 @@ def test_trend_pullback_enters_without_prior_breakout_state():
     assert decision.logs["setup_type"] == "trend_pullback"
 
 
+def test_htf_ema100_fallback_prevents_insufficient_data_when_1d_history_is_short():
+    symbol = "FALLBACK/USDT:USDT"
+    signal_rows = _breakout_rows(100.0, 0.06, side="long")
+    htf_rows = _rows(130, 100.0, 0.10, timestamp_step=86_400_000)
+
+    decisions = evaluate_relative_strength_pullback_trend(
+        [symbol],
+        {symbol: signal_rows},
+        {symbol: htf_rows},
+        config=_base_config(),
+    )
+    decision = decisions[0]
+
+    assert decision.reason != "insufficient_data"
+    assert decision.entry_ready is True
+    assert decision.logs["htf_fallback_used"] is True
+    assert decision.logs["ema_htf_effective"] == 100
+
+
 def test_forced_utbreakout_direction_blocks_opposite_rspt_side():
     symbol = "PULL/USDT:USDT"
     base = _rows(130, 100.0, 0.06)

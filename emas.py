@@ -471,6 +471,10 @@ UTBREAKOUT_STRATEGIES = {
     ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
     DUAL_ALPHA_STRATEGY,
 }
+UTBREAKOUT_RECENT_LOSS_COOLDOWN_SECONDS = 7200.0
+UTBREAKOUT_RECENT_LOSS_COOLDOWN_MIN_LOSS_USDT = 2.0
+UTBREAKOUT_RECENT_LOSS_LEGACY_COOLDOWN_SECONDS = 21600.0
+UTBREAKOUT_RECENT_LOSS_LEGACY_MIN_LOSS_USDT = 0.0
 UT_ONLY_STRATEGIES = {'utbot', 'rsibb', 'utrsibb', 'utrsi', 'utbb', 'utsmc'}
 MA_STRATEGIES = set()
 PATTERN_STRATEGIES = set(UT_ONLY_STRATEGIES)
@@ -1103,8 +1107,8 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "aggressive_growth_enabled": False,
         "aggressive_growth_pyramiding_enabled": False,
         "utbreakout_recent_loss_cooldown_enabled": True,
-        "utbreakout_recent_loss_cooldown_seconds": 21600,
-        "utbreakout_recent_loss_cooldown_min_loss_usdt": 0.0,
+        "utbreakout_recent_loss_cooldown_seconds": UTBREAKOUT_RECENT_LOSS_COOLDOWN_SECONDS,
+        "utbreakout_recent_loss_cooldown_min_loss_usdt": UTBREAKOUT_RECENT_LOSS_COOLDOWN_MIN_LOSS_USDT,
 
         # Cost-aware EV gate.
         "ev_min_entry_score": 62.0,
@@ -5345,20 +5349,32 @@ class SignalEngine(BaseEngine):
             except Exception:
                 cfg = {}
         cfg = apply_profit_opportunity_effective_overrides(dict(cfg or {}))
+        raw_seconds = cfg.get(
+            'utbreakout_recent_loss_cooldown_seconds',
+            UTBREAKOUT_RECENT_LOSS_COOLDOWN_SECONDS,
+        )
+        if raw_seconds in (None, ''):
+            raw_seconds = UTBREAKOUT_RECENT_LOSS_COOLDOWN_SECONDS
         try:
-            seconds = float(
-                cfg.get('utbreakout_recent_loss_cooldown_seconds', 21600)
-                or 21600
-            )
+            seconds = float(raw_seconds)
         except (TypeError, ValueError):
-            seconds = 21600.0
+            seconds = UTBREAKOUT_RECENT_LOSS_COOLDOWN_SECONDS
+        raw_min_loss = cfg.get(
+            'utbreakout_recent_loss_cooldown_min_loss_usdt',
+            UTBREAKOUT_RECENT_LOSS_COOLDOWN_MIN_LOSS_USDT,
+        )
+        if raw_min_loss in (None, ''):
+            raw_min_loss = UTBREAKOUT_RECENT_LOSS_COOLDOWN_MIN_LOSS_USDT
         try:
-            min_loss = float(
-                cfg.get('utbreakout_recent_loss_cooldown_min_loss_usdt', 0.0)
-                or 0.0
-            )
+            min_loss = float(raw_min_loss)
         except (TypeError, ValueError):
-            min_loss = 0.0
+            min_loss = UTBREAKOUT_RECENT_LOSS_COOLDOWN_MIN_LOSS_USDT
+        if (
+            seconds == UTBREAKOUT_RECENT_LOSS_LEGACY_COOLDOWN_SECONDS
+            and min_loss == UTBREAKOUT_RECENT_LOSS_LEGACY_MIN_LOSS_USDT
+        ):
+            seconds = UTBREAKOUT_RECENT_LOSS_COOLDOWN_SECONDS
+            min_loss = UTBREAKOUT_RECENT_LOSS_COOLDOWN_MIN_LOSS_USDT
         return {
             'enabled': bool(cfg.get('utbreakout_recent_loss_cooldown_enabled', True)),
             'seconds': max(0.0, seconds),
@@ -10978,7 +10994,11 @@ class SignalEngine(BaseEngine):
 
         if cooldown_reasons:
             for r in cooldown_reasons:
-                blockers.append(f"cooldown: {r}")
+                cooldown_text = str(r or '').strip()
+                if cooldown_text.lower().startswith('candidate cooldown'):
+                    warnings.append(f"candidate cooldown advisory: {cooldown_text}")
+                else:
+                    blockers.append(f"cooldown: {cooldown_text}")
         if not risk_ok:
             blockers.append("risk plan blocked")
         if planned_qty is None or not np.isfinite(planned_qty) or planned_qty <= 0:

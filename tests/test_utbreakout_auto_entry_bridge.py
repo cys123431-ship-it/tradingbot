@@ -273,6 +273,72 @@ def test_recent_loss_cooldown_blocks_execution_same_symbol_only():
     assert other["can_attempt"] is True
 
 
+def test_candidate_cooldown_warns_without_blocking_execution():
+    class Controller:
+        is_paused = False
+
+    engine = _build_engine()
+    engine.ctrl = Controller()
+
+    eligibility = engine._build_utbreakout_execution_eligibility(
+        symbol="SOL/USDT:USDT",
+        side="long",
+        candidate_side="long",
+        candidate_type="fresh_signal",
+        side_condition_ok=True,
+        risk_ok=True,
+        planned_qty=1.0,
+        risk_usdt=1.0,
+        entry_plan_detail="ok",
+        cooldown_reasons=["candidate cooldown 29.0m (no entry setup)"],
+        has_open_position=False,
+        has_other_position=False,
+        auto_entry_enabled=True,
+        daily_risk_ok=True,
+        plan_lookup_ready=True,
+        cfg={"utbreakout_require_scanner_candidate_for_auto_entry": True},
+        scanner_source="scanner_seen",
+        is_live_scanner_context=True,
+        is_current_scanner_candidate=True,
+        is_coinselector_top_candidate=True,
+        next_scan_symbol="SOL/USDT:USDT",
+        evaluated_symbol="SOL/USDT:USDT",
+    )
+
+    assert eligibility["can_attempt"] is True
+    assert not any("candidate cooldown" in blocker for blocker in eligibility["blockers"])
+    assert any("candidate cooldown" in warning for warning in eligibility["warnings"])
+
+
+def test_recent_loss_cooldown_default_ignores_small_losses_and_uses_two_hours():
+    engine = _build_engine()
+    engine.utbreakout_recent_loss_symbol_cooldowns = {}
+
+    engine._record_utbreakout_recent_loss_cooldown(
+        "SOL/USDT:USDT",
+        side="long",
+        pnl_usdt=-1.0,
+        reason="small loss",
+    )
+    locked, _ = engine._is_utbreakout_recent_loss_cooldown_active("SOL/USDT:USDT")
+    assert locked is False
+
+    before = time.time()
+    engine._record_utbreakout_recent_loss_cooldown(
+        "SOL/USDT:USDT",
+        side="long",
+        pnl_usdt=-2.5,
+        reason="meaningful loss",
+    )
+    key = engine._normalize_market_symbol("SOL/USDT:USDT")
+    record = engine.utbreakout_recent_loss_symbol_cooldowns[key]
+
+    assert record["until"] - before <= emas.UTBREAKOUT_RECENT_LOSS_COOLDOWN_SECONDS + 2.0
+    locked, reason = engine._is_utbreakout_recent_loss_cooldown_active("SOL/USDT:USDT")
+    assert locked is True
+    assert "recent loss cooldown" in reason
+
+
 def test_auto_entry_bridge_recent_loss_cooldown_blocks_before_entry_call():
     entry_calls = []
 
@@ -295,7 +361,7 @@ def test_auto_entry_bridge_recent_loss_cooldown_blocks_before_entry_call():
     engine._record_utbreakout_recent_loss_cooldown(
         symbol,
         side="long",
-        pnl_usdt=-1.0,
+        pnl_usdt=-2.5,
         reason="test loss",
     )
     engine._set_utbot_filtered_breakout_entry_plan(

@@ -46,6 +46,8 @@ def default_relative_strength_pullback_config():
         "ema_trend": 100,
         "ema_htf_fast": 50,
         "ema_htf": 200,
+        "ema_htf_fallback_enabled": True,
+        "ema_htf_fallback": 100,
         "adx_length": 14,
         "adx_pass": 20.0,
         "adx_soft_min": 15.0,
@@ -524,13 +526,50 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
         "rspt_forced_direction": forced_direction,
     }
     min_signal = max(int(cfg.get("ema_trend", 100) or 100), int(cfg.get("donchian_length", 20) or 20)) + 2
-    min_htf = max(int(cfg.get("ema_htf", 200) or 200), int(cfg.get("ema_htf_fast", 50) or 50)) + 1
-    if len(signal_rows) < min_signal or len(htf_rows) < min_htf:
-        return PullbackTrendDecision(symbol, reason="insufficient_data", logs={**base_logs, "rejected_reason": "insufficient_data"})
+    htf_fast_len = max(1, int(cfg.get("ema_htf_fast", 50) or 50))
+    htf_slow_len = max(1, int(cfg.get("ema_htf", 200) or 200))
+    min_htf = max(htf_slow_len, htf_fast_len) + 1
+    effective_cfg = cfg
+    htf_fallback_used = False
+    if len(signal_rows) < min_signal:
+        return PullbackTrendDecision(
+            symbol,
+            reason="insufficient_data",
+            logs={
+                **base_logs,
+                "rejected_reason": "insufficient_data",
+                "signal_rows": len(signal_rows),
+                "signal_rows_required": min_signal,
+            },
+        )
+    if len(htf_rows) < min_htf:
+        fallback_len = max(1, int(cfg.get("ema_htf_fallback", 100) or 100))
+        fallback_min_htf = max(fallback_len, htf_fast_len) + 1
+        if (
+            bool(cfg.get("ema_htf_fallback_enabled", True))
+            and fallback_len < htf_slow_len
+            and len(htf_rows) >= fallback_min_htf
+        ):
+            effective_cfg = dict(cfg)
+            effective_cfg["ema_htf"] = fallback_len
+            htf_fallback_used = True
+            min_htf = fallback_min_htf
+        else:
+            return PullbackTrendDecision(
+                symbol,
+                reason="insufficient_data",
+                logs={
+                    **base_logs,
+                    "rejected_reason": "insufficient_data",
+                    "htf_rows": len(htf_rows),
+                    "htf_rows_required": min_htf,
+                    "htf_fallback_rows_required": fallback_min_htf,
+                },
+            )
 
-    trend = _trend_side(signal_rows, htf_rows, cfg)
-    donchian = _previous_donchian(signal_rows, cfg.get("donchian_length", 20))
-    atr = _atr(signal_rows, cfg.get("atr_length", 14))
+    trend = _trend_side(signal_rows, htf_rows, effective_cfg)
+    donchian = _previous_donchian(signal_rows, effective_cfg.get("donchian_length", 20))
+    atr = _atr(signal_rows, effective_cfg.get("atr_length", 14))
     row = signal_rows[-1]
     prev = signal_rows[-2]
     close = _row_value(row, "close")
@@ -568,6 +607,8 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
         "relative_strength_ranked_count": rs.get("ranked_count"),
         "rspt_original_candidate_sides": original_candidate_sides,
         "rspt_ignored_opposite_side": False,
+        "htf_fallback_used": htf_fallback_used,
+        "ema_htf_effective": effective_cfg.get("ema_htf", cfg.get("ema_htf", 200)),
     }
 
     if forced_direction not in {"long", "short"}:
