@@ -121,6 +121,7 @@ from utbreakout.ev_adaptive import (
     evaluate_ev_time_stop,
     evaluate_net_edge,
     profile_gross_win_r,
+    scale_atr_percent_threshold,
 )
 from utbreakout.alpha_engine import (
     EntryEdgeDecision,
@@ -1121,6 +1122,9 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "ev_max_spread_pct": 0.08,
         "ev_high_vol_atr_pct": 1.50,
         "ev_extreme_atr_pct": 2.50,
+        "atr_threshold_reference_timeframe": "15m",
+        "atr_threshold_timeframe_scaling_enabled": True,
+        "atr_threshold_max_scale": 5.0,
         "ev_panic_rebound_block_pct": 6.0,
         "ev_continuation_max_signal_age_bars": 8.0,
         "ev_continuation_reacceleration_range_min": 1.10,
@@ -1249,6 +1253,13 @@ def _ev_adaptive_runtime_config(cfg):
         "max_spread_pct": cfg.get("ev_max_spread_pct", 0.08),
         "high_vol_atr_pct": cfg.get("ev_high_vol_atr_pct", 1.50),
         "extreme_atr_pct": cfg.get("ev_extreme_atr_pct", 2.50),
+        "atr_threshold_reference_timeframe": cfg.get(
+            "atr_threshold_reference_timeframe", "15m"
+        ),
+        "atr_threshold_timeframe_scaling_enabled": cfg.get(
+            "atr_threshold_timeframe_scaling_enabled", True
+        ),
+        "atr_threshold_max_scale": cfg.get("atr_threshold_max_scale", 5.0),
         "panic_rebound_block_pct": cfg.get("ev_panic_rebound_block_pct", 6.0),
         "continuation_max_signal_age_bars": cfg.get(
             "ev_continuation_max_signal_age_bars", 8.0
@@ -4852,7 +4863,22 @@ class TemaEngine(BaseEngine):
         db = getattr(self, 'db', None)
         if db is None or not hasattr(db, 'get_latest_open_trade'):
             return {'status': 'NO_DB'}
-        open_trade = db.get_latest_open_trade(symbol)
+        try:
+            symbol_candidates = list(self._utbreakout_plan_symbol_keys(symbol))
+        except Exception:
+            symbol_candidates = [str(symbol or '')]
+        raw_symbol = str(symbol or '')
+        if raw_symbol and raw_symbol not in symbol_candidates:
+            symbol_candidates.insert(0, raw_symbol)
+        if raw_symbol.endswith('/USDT'):
+            symbol_candidates.append(raw_symbol + ':USDT')
+        open_trade = None
+        accounting_symbol = raw_symbol
+        for candidate in dict.fromkeys(item for item in symbol_candidates if item):
+            open_trade = db.get_latest_open_trade(candidate)
+            if open_trade:
+                accounting_symbol = candidate
+                break
         if not open_trade:
             return {'status': 'NO_OPEN_TRADE'}
         result = await self._resolve_closed_trade_accounting(
@@ -4868,7 +4894,7 @@ class TemaEngine(BaseEngine):
         if result.get('estimated'):
             close_reason = f"{close_reason} [estimated-price]"
         updated = db.log_trade_close(
-            symbol,
+            accounting_symbol,
             result['pnl'],
             result['pnl_pct'],
             result['exit_price'],
@@ -4877,8 +4903,15 @@ class TemaEngine(BaseEngine):
         result['status'] = 'RECORDED' if updated is not False else 'NO_OPEN_TRADE'
         if updated is not False:
             try:
-                self._record_utbreakout_recent_loss_cooldown(
+                record_bot_realized_pnl(result.get('pnl', 0.0))
+            except Exception:
+                logger.exception(
+                    "Bot realized PnL state update failed for %s",
                     symbol,
+                )
+            try:
+                self._record_utbreakout_recent_loss_cooldown(
+                    accounting_symbol,
                     side=(open_trade or {}).get('side'),
                     pnl_usdt=result.get('pnl'),
                     reason=close_reason,
@@ -4886,7 +4919,7 @@ class TemaEngine(BaseEngine):
             except Exception:
                 logger.debug(
                     "UTBreakout recent loss cooldown record failed for %s",
-                    symbol,
+                    accounting_symbol,
                     exc_info=True,
                 )
         return result
@@ -11190,6 +11223,98 @@ class SignalEngine(BaseEngine):
         ):
             self.utbreakout_recent_loss_symbol_cooldowns = {}
 
+    async def _build_utbreakout_bridge_execution_eligibility(
+        self,
+        *,
+        symbol,
+        side,
+        plan,
+        cfg,
+        source,
+        ready_data=None,
+    ):
+        """Recheck execution safety without rerunning an already accepted alpha plan."""
+        plan = plan if isinstance(plan, dict) else {}
+        ready_data = ready_data if isinstance(ready_data, dict) else {}
+        live_sources = {'scanner', 'scanner_seen', 'coin_selector', 'high_volume_scanner'}
+        is_live_source = str(source or '') in live_sources
+        extra_blockers = []
+
+        daily_risk_ok = True
+        db = getattr(self, 'db', None)
+        if db is not None:
+            try:
+                _, daily_pnl = db.get_daily_stats()
+                daily_entries = db.get_daily_entry_count()
+                daily_limit = float(cfg.get('daily_max_loss_usdt', 0) or 0)
+                trade_limit = int(cfg.get('max_daily_trades', 0) or 0)
+                if daily_limit > 0 and float(daily_pnl or 0) <= -daily_limit:
+                    daily_risk_ok = False
+                if trade_limit > 0 and int(daily_entries or 0) >= trade_limit:
+                    daily_risk_ok = False
+            except Exception as exc:
+                extra_blockers.append(f"daily risk check failed: {exc}")
+
+        active_positions = []
+        if getattr(self, 'exchange', None) is not None and hasattr(
+            self, 'get_active_position_symbols'
+        ):
+            try:
+                active_positions = await self.get_active_position_symbols(use_cache=False)
+            except Exception as exc:
+                extra_blockers.append(f"position check failed: {exc}")
+        evaluated_key = self._utbreakout_status_symbol_key(symbol)
+        active_keys = {
+            self._utbreakout_status_symbol_key(item)
+            for item in (active_positions or [])
+            if item
+        }
+        has_open_position = evaluated_key in active_keys
+        has_other_position = any(key != evaluated_key for key in active_keys)
+
+        planned_qty = _safe_float_or_none(plan.get('qty'))
+        risk_usdt = _safe_float_or_none(
+            plan.get('risk_usdt', plan.get('risk_amount'))
+        )
+        risk_ok = bool(
+            planned_qty is not None
+            and planned_qty > 0
+            and risk_usdt is not None
+            and risk_usdt > 0
+        )
+        eligibility = self._build_utbreakout_execution_eligibility(
+            symbol=symbol,
+            side=side,
+            candidate_side=side,
+            candidate_type='accepted_plan',
+            side_condition_ok=True,
+            risk_ok=risk_ok,
+            planned_qty=planned_qty,
+            risk_usdt=risk_usdt,
+            entry_plan_detail='accepted plan execution safety recheck',
+            cooldown_reasons=[],
+            has_open_position=has_open_position,
+            has_other_position=has_other_position,
+            auto_entry_enabled=bool(self.utbreakout_auto_entry_bridge_enabled),
+            daily_risk_ok=daily_risk_ok,
+            plan_lookup_ready=bool(plan),
+            cfg=cfg,
+            scanner_source=source,
+            is_live_scanner_context=is_live_source,
+            is_current_scanner_candidate=is_live_source,
+            is_coinselector_top_candidate=True,
+            next_scan_symbol=symbol,
+            evaluated_symbol=symbol,
+            manual_status_only=False,
+        )
+        if extra_blockers:
+            eligibility['blockers'] = [
+                *list(eligibility.get('blockers') or []),
+                *extra_blockers,
+            ]
+            eligibility['can_attempt'] = False
+        return eligibility
+
     async def _maybe_run_utbreakout_auto_entry_bridge(
         self,
         symbol,
@@ -11372,76 +11497,6 @@ class SignalEngine(BaseEngine):
                     side=side,
                 )
                 return False
-            plan_strategy = str(plan.get('strategy') or '').lower()
-            skip_ut_eligibility = (
-                active_strategy == ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
-                or (
-                    active_strategy == DUAL_ALPHA_STRATEGY
-                    and plan_strategy == ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
-                )
-            )
-
-            if not skip_ut_eligibility:
-                ctx = await self._evaluate_utbreakout_eligibility_context(
-                    symbol,
-                    scanner_source=source,
-                    is_live_scanner_context=True,
-                    is_current_scanner_candidate=True,
-                    next_scan_symbol=symbol,
-                    evaluated_symbol=symbol,
-                )
-                if not ctx.get('ok_market'):
-                    self._utbreakout_trace_event(
-                        symbol,
-                        'AUTO_ENTRY_BRIDGE_BLOCKED',
-                        'INVALID_MARKET_CONTEXT',
-                        source=source,
-                        reason=ctx.get('validation_reason') or ctx.get('reason') or 'invalid market context',
-                    )
-                    return False
-
-                eligibility = ctx['long_eligibility'] if side == 'long' else ctx['short_eligibility']
-
-                if not eligibility['can_attempt']:
-                    block_reason = "; ".join(eligibility['blockers']) or "execution blocked"
-                    self._utbreakout_trace_event(
-                        symbol,
-                        'AUTO_ENTRY_BRIDGE_BLOCKED',
-                        'ELIGIBILITY_REJECTED',
-                        source=source,
-                        reason=block_reason,
-                        side=side,
-                        blockers=eligibility['blockers'],
-                    )
-                    return False
-            elif not self.is_trade_direction_allowed(side):
-                self._utbreakout_trace_event(
-                    symbol,
-                    'AUTO_ENTRY_BRIDGE_BLOCKED',
-                    'DIRECTION_FILTER',
-                    source=source,
-                    reason=self.format_trade_direction_block_reason(side),
-                    side=side,
-                )
-                return False
-
-            entry_price = float(
-                plan.get('entry_price')
-                or ready_data.get('entry_price')
-                or 0.0
-            )
-            if entry_price <= 0:
-                self._utbreakout_trace_event(
-                    symbol,
-                    'AUTO_ENTRY_BRIDGE_BLOCKED',
-                    'INVALID_ENTRY_PRICE',
-                    source=source,
-                    reason='entry plan has no valid entry price',
-                    side=side,
-                    entry_price=entry_price,
-                )
-                return False
-
             daily_sl_locked, daily_sl_reason = self._is_utbreakout_daily_sl_locked(symbol)
             if daily_sl_locked:
                 self._utbreakout_trace_event(
@@ -11464,6 +11519,52 @@ class SignalEngine(BaseEngine):
                     source=source,
                     reason=recent_loss_reason,
                     side=side,
+                )
+                return False
+            eligibility = await self._build_utbreakout_bridge_execution_eligibility(
+                symbol=symbol,
+                side=side,
+                plan=plan,
+                cfg=cfg,
+                source=source,
+                ready_data=ready_data,
+            )
+            self._utbreakout_trace_event(
+                symbol,
+                'EXECUTION_SAFETY_GATE',
+                'PASS' if eligibility.get('can_attempt') else 'BLOCKED',
+                source=source,
+                side=side,
+                accepted_plan=True,
+                blockers=list(eligibility.get('blockers') or []),
+            )
+            if not eligibility.get('can_attempt'):
+                block_reason = "; ".join(eligibility.get('blockers') or []) or "execution blocked"
+                self._utbreakout_trace_event(
+                    symbol,
+                    'AUTO_ENTRY_BRIDGE_BLOCKED',
+                    'EXECUTION_SAFETY_REJECTED',
+                    source=source,
+                    reason=block_reason,
+                    side=side,
+                    blockers=list(eligibility.get('blockers') or []),
+                )
+                return False
+
+            entry_price = float(
+                plan.get('entry_price')
+                or ready_data.get('entry_price')
+                or 0.0
+            )
+            if entry_price <= 0:
+                self._utbreakout_trace_event(
+                    symbol,
+                    'AUTO_ENTRY_BRIDGE_BLOCKED',
+                    'INVALID_ENTRY_PRICE',
+                    source=source,
+                    reason='entry plan has no valid entry price',
+                    side=side,
+                    entry_price=entry_price,
                 )
                 return False
 
@@ -12437,15 +12538,45 @@ class SignalEngine(BaseEngine):
         atr_pct = _f('atr_pct')
         if atr_pct is not None:
             data_seen += 1
-            high_atr = float(cfg.get('market_quality_high_atr_pct', 1.5) or 1.5)
-            extreme_atr = float(cfg.get('market_quality_extreme_atr_pct', 2.5) or 2.5)
+            entry_timeframe = (
+                values.get('entry_timeframe')
+                or values.get('timeframe')
+                or cfg.get('entry_timeframe')
+                or '15m'
+            )
+            atr_scale_kwargs = {
+                'reference_timeframe': cfg.get('atr_threshold_reference_timeframe', '15m'),
+                'enabled': bool(cfg.get('atr_threshold_timeframe_scaling_enabled', True)),
+                'max_scale': cfg.get('atr_threshold_max_scale', 5.0),
+            }
+            high_atr = scale_atr_percent_threshold(
+                cfg.get('market_quality_high_atr_pct', 1.5),
+                entry_timeframe,
+                **atr_scale_kwargs,
+            )
+            extreme_atr = scale_atr_percent_threshold(
+                cfg.get('market_quality_extreme_atr_pct', 2.5),
+                entry_timeframe,
+                **atr_scale_kwargs,
+            )
+            diagnostics['atr_timeframe'] = str(entry_timeframe)
+            diagnostics['atr_high_threshold_pct'] = round(float(high_atr), 6)
+            diagnostics['atr_extreme_threshold_pct'] = round(float(extreme_atr), 6)
             if atr_pct >= extreme_atr:
                 if side == 'long':
-                    _reduce(0.50, f"ATR% {atr_pct:.3f} extreme")
+                    _reduce(
+                        0.50,
+                        f"ATR% {atr_pct:.3f} extreme >= {extreme_atr:.3f} ({entry_timeframe})",
+                    )
                 else:
-                    _block(f"ATR% {atr_pct:.3f} >= extreme {extreme_atr:.2f}")
+                    _block(
+                        f"ATR% {atr_pct:.3f} >= extreme {extreme_atr:.3f} ({entry_timeframe})"
+                    )
             elif atr_pct >= high_atr:
-                _reduce(0.50, f"ATR% {atr_pct:.3f} high")
+                _reduce(
+                    0.50,
+                    f"ATR% {atr_pct:.3f} high >= {high_atr:.3f} ({entry_timeframe})",
+                )
             else:
                 positives.append(f"ATR% {atr_pct:.3f}")
 
@@ -14357,6 +14488,7 @@ class SignalEngine(BaseEngine):
         filter_values = dict(metrics or {})
         filter_values['entry_price'] = entry_price
         filter_values['atr_pct'] = atr_pct
+        filter_values['entry_timeframe'] = rsp_cfg.get('signal_tf', '4h')
         try:
             futures_context = await self._fetch_utbreakout_futures_context(symbol)
             if isinstance(futures_context, dict):
@@ -14947,6 +15079,18 @@ class SignalEngine(BaseEngine):
         )
         live_exchange = exchange_mode == BINANCE_MAINNET
         live_capable = live_stage and live_exchange and (live_flags_enabled or not has_live_flags)
+        legacy_mainnet_live = bool(
+            live_exchange
+            and not dry_run
+            and not bool(cfg.get('testnet', False))
+            and not bool(cfg.get('live_parity_signal_enabled', False))
+            and trading_mode in {'unknown', 'DISABLED'}
+        )
+        if legacy_mainnet_live:
+            trading_mode = 'LEGACY_MAINNET_LIVE'
+            live_capable = True
+            paper_order_enabled = False
+            mode_reason = None
         try:
             paused = bool(getattr(ctrl, 'is_paused', False)) if ctrl is not None else False
         except Exception:
@@ -14985,7 +15129,11 @@ class SignalEngine(BaseEngine):
             live_order_enabled = False
         elif live_capable:
             order_action = 'live_entry_enabled'
-            reason = 'bridge_on_live_entry_path_enabled'
+            reason = (
+                'legacy_mainnet_entry_path_enabled'
+                if legacy_mainnet_live
+                else 'bridge_on_live_entry_path_enabled'
+            )
             live_order_enabled = True
         else:
             order_action = 'signal_only'
@@ -15014,6 +15162,7 @@ class SignalEngine(BaseEngine):
             'reason': display_reason,
             'base_reason': reason,
             'active_strategy': active_strategy or 'unknown',
+            'legacy_mainnet_live': bool(legacy_mainnet_live),
         }
         if mode_reason:
             summary['mode_reason'] = mode_reason
@@ -15877,6 +16026,7 @@ class SignalEngine(BaseEngine):
 
         filter_values = {
             'entry_price': entry_price,
+            'entry_timeframe': cfg.get('entry_timeframe', '15m'),
             'open': entry_metrics.get('open'),
             'rsi': rsi_value,
             'macd_hist': entry_metrics.get('macd_hist'),
@@ -35899,7 +36049,7 @@ class MainController:
         self.active_engine = None
         self.tg_app = None
         self.status_data = {}
-        self.is_paused = False  # 기본: 재시작/수동 시작 모두 자동 실행 상태로 시작
+        self.is_paused = bool(self.prev_paused_state) if self.prev_paused_state is not None else False
         if self.prev_paused_state is not None:
             logger.info(
                 f"Startup pause override applied: paused={self.is_paused} "
@@ -46015,16 +46165,35 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     logger.info(f"??Emergency Close: {sym} {side} {qty}")
                     if signal_engine:
                         await asyncio.sleep(0.5)
+                        trailing_state = None
+                        if isinstance(
+                            getattr(signal_engine, 'utbreakout_trailing_states', None),
+                            dict,
+                        ):
+                            trailing_state = signal_engine.utbreakout_trailing_states.get(sym)
+                        emergency_exit_price = (
+                            order.get('average')
+                            if isinstance(order, dict) and order.get('average')
+                            else pos.get('mark_price') or pos.get('markPrice')
+                        )
+                        if hasattr(signal_engine, '_record_closed_trade_accounting'):
+                            accounting = await signal_engine._record_closed_trade_accounting(
+                                sym,
+                                'EmergencyStop',
+                                exit_price=emergency_exit_price,
+                                state=trailing_state,
+                            )
+                            logger.info(
+                                "Emergency close accounting %s: %s",
+                                sym,
+                                accounting.get('status') if isinstance(accounting, dict) else accounting,
+                            )
                         if hasattr(signal_engine, '_clear_utbreakout_trailing_state'):
                             signal_engine._clear_utbreakout_trailing_state(
                                 sym,
                                 finalize=True,
                                 reason='EmergencyStop',
-                                exit_price=(
-                                    order.get('average')
-                                    if isinstance(order, dict) and order.get('average')
-                                    else pos.get('mark_price')
-                                )
+                                exit_price=emergency_exit_price,
                             )
                         await signal_engine._cancel_all_orders_variants(sym, reason='after emergency close')
                         await signal_engine._reconcile_closed_position_protection(
@@ -47036,6 +47205,22 @@ def save_live_real_risk_state(state):
     os.makedirs(os.path.dirname(LIVE_REAL_RISK_STATE_FILE) or ".", exist_ok=True)
     with open(LIVE_REAL_RISK_STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state if isinstance(state, dict) else {}, f, indent=4)
+    return state
+
+
+def record_bot_realized_pnl(pnl_usdt, *, now=None):
+    """Persist bot-confirmed realized PnL once the matching DB trade is closed."""
+    state = normalize_live_real_risk_state(load_live_real_risk_state(), now=now)
+    pnl = _safe_float_value(pnl_usdt, 0.0)
+    state["daily_realized_pnl_usdt"] = (
+        _safe_float_value(state.get("daily_realized_pnl_usdt"), 0.0) + pnl
+    )
+    state["weekly_realized_pnl_usdt"] = (
+        _safe_float_value(state.get("weekly_realized_pnl_usdt"), 0.0) + pnl
+    )
+    state["last_realized_pnl_usdt"] = pnl
+    state["last_realized_pnl_at"] = (now or datetime.now(timezone.utc)).isoformat()
+    save_live_real_risk_state(state)
     return state
 
 

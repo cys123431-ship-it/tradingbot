@@ -6,7 +6,7 @@ survives trading costs.  It never places orders or mutates runtime state.
 """
 
 from dataclasses import dataclass, replace
-from math import isfinite
+from math import isfinite, sqrt
 
 
 EV_ADAPTIVE_PROFILE_VERSION = "ev_adaptive_v3_profit_engine"
@@ -87,6 +87,9 @@ def default_ev_adaptive_config():
         "max_spread_pct": 0.08,
         "high_vol_atr_pct": 1.5,
         "extreme_atr_pct": 2.5,
+        "atr_threshold_reference_timeframe": "15m",
+        "atr_threshold_timeframe_scaling_enabled": True,
+        "atr_threshold_max_scale": 5.0,
         "panic_rebound_block_pct": 6.0,
         "trend_min_adx": 16.0,
         "strong_trend_min_adx": 25.0,
@@ -175,6 +178,44 @@ def default_ev_adaptive_config():
         "regime_strong_opposition_risk_reduce_btc": 0.70,
         "regime_opposition_strong_move_pct": 1.5,
     }
+
+
+def _timeframe_minutes(value):
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    units = {"m": 1.0, "h": 60.0, "d": 1440.0, "w": 10080.0}
+    unit = text[-1]
+    if unit not in units:
+        return None
+    try:
+        amount = float(text[:-1])
+    except (TypeError, ValueError):
+        return None
+    if amount <= 0:
+        return None
+    return amount * units[unit]
+
+
+def scale_atr_percent_threshold(
+    base_threshold,
+    timeframe,
+    *,
+    reference_timeframe="15m",
+    enabled=True,
+    max_scale=5.0,
+):
+    """Scale ATR-percent thresholds by sqrt(time) across candle durations."""
+    base = max(0.0, float(base_threshold or 0.0))
+    if not enabled or base <= 0:
+        return base
+    current_minutes = _timeframe_minutes(timeframe)
+    reference_minutes = _timeframe_minutes(reference_timeframe)
+    if current_minutes is None or reference_minutes is None:
+        return base
+    scale = sqrt(max(current_minutes / reference_minutes, 1.0))
+    scale = min(scale, max(1.0, float(max_scale or 1.0)))
+    return base * scale
 
 
 def _finite(value, default=None):
@@ -743,10 +784,28 @@ def evaluate_ev_adaptive_entry(*, side, candidate_type, values=None, config=None
 
     spread = _finite(values.get("futures_spread_pct"))
     atr_pct = _finite(values.get("atr_pct"))
+    entry_timeframe = values.get("entry_timeframe") or values.get("timeframe") or "15m"
+    atr_scale_kwargs = {
+        "reference_timeframe": cfg.get("atr_threshold_reference_timeframe", "15m"),
+        "enabled": bool(cfg.get("atr_threshold_timeframe_scaling_enabled", True)),
+        "max_scale": cfg.get("atr_threshold_max_scale", 5.0),
+    }
+    high_vol_atr_pct = scale_atr_percent_threshold(
+        cfg["high_vol_atr_pct"],
+        entry_timeframe,
+        **atr_scale_kwargs,
+    )
+    extreme_atr_pct = scale_atr_percent_threshold(
+        cfg["extreme_atr_pct"],
+        entry_timeframe,
+        **atr_scale_kwargs,
+    )
     if spread is not None and spread > float(cfg["max_spread_pct"]):
         blockers.append(f"spread {spread:.4f}%>{float(cfg['max_spread_pct']):.4f}%")
-    if atr_pct is not None and atr_pct >= float(cfg["extreme_atr_pct"]):
-        blockers.append(f"extreme volatility {atr_pct:.3f}%")
+    if atr_pct is not None and atr_pct >= extreme_atr_pct:
+        blockers.append(
+            f"extreme volatility {atr_pct:.3f}%>={extreme_atr_pct:.3f}% ({entry_timeframe})"
+        )
     rebound = _finite(values.get("recent_rebound_pct"), 0.0)
     if side == "short" and rebound >= float(cfg["panic_rebound_block_pct"]):
         blockers.append(f"panic rebound {rebound:.2f}%")
@@ -1024,9 +1083,11 @@ def evaluate_ev_adaptive_entry(*, side, candidate_type, values=None, config=None
             risk_multiplier *= 0.75
         elif leadership < 55.0:
             risk_multiplier *= 0.90
-    if atr_pct is not None and atr_pct >= float(cfg["high_vol_atr_pct"]):
+    if atr_pct is not None and atr_pct >= high_vol_atr_pct:
         risk_multiplier *= 0.60
-        reasons.append("high volatility risk reduction")
+        reasons.append(
+            f"high volatility risk reduction ({atr_pct:.3f}%>={high_vol_atr_pct:.3f}% {entry_timeframe})"
+        )
     if side == "short":
         risk_multiplier *= 0.60
         reasons.append("short risk asymmetry")

@@ -80,6 +80,11 @@ def test_auto_entry_bridge_calls_entry_for_recent_ready_plan():
     engine = _build_engine()
     engine.ctrl = Controller()
     symbol = "SOL/USDT:USDT"
+    base_config = engine._get_utbot_filtered_breakout_config({})
+    engine._get_utbot_filtered_breakout_config = lambda params: {
+        **base_config,
+        "utbreakout_allow_continuation_auto_entry": False,
+    }
 
     async def get_server_position(requested_symbol, use_cache=False):
         assert requested_symbol == symbol
@@ -88,22 +93,12 @@ def test_auto_entry_bridge_calls_entry_for_recent_ready_plan():
     async def entry(requested_symbol, side, price):
         entry_calls.append((requested_symbol, side, price))
 
-    async def mock_evaluate_eligibility(requested_symbol, **kwargs):
-        return {
-            'ok_market': True,
-            'symbol': requested_symbol,
-            'long_ok': True,
-            'short_ok': True,
-            'long_eligibility': {'can_attempt': True, 'blockers': []},
-            'short_eligibility': {'can_attempt': True, 'blockers': []},
-            'long_lines': [],
-            'short_lines': [],
-            'ut_reason': 'mocked',
-        }
+    async def fail_if_alpha_is_rechecked(*args, **kwargs):
+        raise AssertionError("accepted entry plan must not rerun alpha eligibility")
 
     engine.get_server_position = get_server_position
     engine.entry = entry
-    engine._evaluate_utbreakout_eligibility_context = mock_evaluate_eligibility
+    engine._evaluate_utbreakout_eligibility_context = fail_if_alpha_is_rechecked
     engine._set_utbot_filtered_breakout_entry_plan(
         symbol,
         {
@@ -113,6 +108,7 @@ def test_auto_entry_bridge_calls_entry_for_recent_ready_plan():
             "planned_notional": 50.625,
             "planned_margin": 10.125,
             "risk_usdt": 1.0,
+            "candidate_type": "bias_state",
         },
     )
     engine._utbreakout_trace_event(

@@ -131,6 +131,10 @@ jobs:
             TELEGRAM_EXPECTED_USERNAME=YosebiBot ./venv/bin/python scripts/validate_telegram_token.py
             chmod +x "$BOT_CTL"
 
+            echo "=== Preserve manual pause state ==="
+            PREV_PAUSED="$(./venv/bin/python -c 'import json, pathlib; p=pathlib.Path("runtime/bot_heartbeat.json"); d=json.loads(p.read_text()) if p.exists() else {}; v=d.get("paused"); print("true" if v is True else "false" if v is False else "")' 2>/dev/null || true)"
+            echo "previous paused state: ${PREV_PAUSED:-unknown}"
+
             echo "=== Stop previous bot ==="
             PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" BOT_ENTRY="$BOT_ENTRY" "$BOT_CTL" stop
 
@@ -138,7 +142,7 @@ jobs:
             START_OK=0
             for ATTEMPT in 1 2 3; do
               echo "start attempt #$ATTEMPT"
-              if PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" STATE_DIR="$STATE_DIR" BOT_ENTRY="$BOT_ENTRY" TRUNCATE_LOG=1 BOT_LAUNCH_REASON=deploy_start "$BOT_CTL" start; then
+              if PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" STATE_DIR="$STATE_DIR" BOT_ENTRY="$BOT_ENTRY" TRUNCATE_LOG=1 BOT_LAUNCH_REASON=deploy_start BOT_PREV_PAUSED="$PREV_PAUSED" "$BOT_CTL" start; then
                 sleep 5
                 if PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" STATE_DIR="$STATE_DIR" BOT_ENTRY="$BOT_ENTRY" "$BOT_CTL" status; then
                   START_OK=1

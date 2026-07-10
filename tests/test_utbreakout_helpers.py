@@ -1630,6 +1630,55 @@ def test_emergency_stop_closes_binance_position_amt_when_contracts_missing():
     assert any("청산 완료" in notice for notice in notices)
 
 
+def test_emergency_stop_records_closed_trade_after_exchange_confirms_flat():
+    emas = _emas_module()
+    controller, exchange, _ = _emergency_controller([
+        {
+            "symbol": "POWER/USDT:USDT",
+            "contracts": "2.0",
+            "side": "long",
+            "markPrice": "0.25",
+            "info": {
+                "symbol": "POWERUSDT",
+                "positionAmt": "2.0",
+                "positionSide": "BOTH",
+            },
+        }
+    ])
+    accounting_calls = []
+
+    class _AccountingEngine:
+        active_symbols = set()
+        last_protection_order_status = {}
+        scanner_active_symbol = None
+        utbreakout_trailing_states = {}
+
+        async def _cancel_all_orders_variants(self, *args, **kwargs):
+            return None
+
+        async def _cancel_protection_orders(self, *args, **kwargs):
+            return None
+
+        async def _record_closed_trade_accounting(self, symbol, reason, **kwargs):
+            accounting_calls.append((symbol, reason, kwargs))
+            return {"status": "RECORDED"}
+
+        def _clear_utbreakout_trailing_state(self, *args, **kwargs):
+            return None
+
+        async def _reconcile_closed_position_protection(self, *args, **kwargs):
+            return None
+
+    controller.engines[emas.CORE_ENGINE] = _AccountingEngine()
+
+    result = asyncio.run(controller.emergency_stop())
+
+    assert result["status"] == "closed"
+    assert all(float(item.get("contracts") or 0.0) == 0.0 for item in exchange.positions)
+    assert accounting_calls[0][0] == "POWER/USDT"
+    assert accounting_calls[0][1] == "EmergencyStop"
+
+
 def test_emergency_stop_retries_until_position_is_flat():
     class _PartialEmergencyExchange(_EmergencyExchange):
         def _apply_market_close(self, symbol, side, amount):
@@ -3320,6 +3369,29 @@ def test_utbreakout_market_quality_blocks_extreme_short_adverse_funding():
     assert result["summary"].startswith("BLOCK")
 
 
+def test_utbreakout_market_quality_uses_timeframe_aware_atr_threshold():
+    emas = _emas_module()
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    cfg = emas.build_default_utbot_filtered_breakout_config()
+    values = {
+        "atr_pct": 3.0,
+        "funding_rate": 0.0,
+        "futures_spread_pct": 0.02,
+    }
+
+    short_tf = engine._evaluate_utbreakout_market_quality(
+        "short", cfg, {**values, "entry_timeframe": "15m"}
+    )
+    long_tf = engine._evaluate_utbreakout_market_quality(
+        "short", cfg, {**values, "entry_timeframe": "4h"}
+    )
+
+    assert short_tf["hard_block"] is True
+    assert long_tf["hard_block"] is False
+    assert long_tf["diagnostics"]["atr_extreme_threshold_pct"] == pytest.approx(10.0)
+
+
 def test_utbreakout_market_quality_status_item_shows_reduced_state():
     emas = _emas_module()
     signal_engine = _signal_engine_cls()
@@ -4719,7 +4791,8 @@ def test_stop_replacement_creates_new_sl_when_cancel_confirmation_fetch_fails():
     assert engine.last_protection_order_status["BTC/USDT"]["status"] == "SL_REPLACED_CONFIRMATION_UNVERIFIED"
 
 
-def test_closed_trade_accounting_uses_exchange_realized_pnl():
+def test_closed_trade_accounting_uses_exchange_realized_pnl(monkeypatch):
+    emas = _emas_module()
     class _TradeExchange(_FakeExchange):
         def fetch_my_trades(self, symbol, since=None, limit=None):
             return [
@@ -4756,6 +4829,8 @@ def test_closed_trade_accounting_uses_exchange_realized_pnl():
             self.closed = (symbol, pnl, pnl_pct, exit_price, reason)
             return True
 
+    recorded_pnl = []
+    monkeypatch.setattr(emas, "record_bot_realized_pnl", recorded_pnl.append)
     engine = _protection_engine([])
     engine.exchange = _TradeExchange([])
     engine.db = _DB()
@@ -4773,6 +4848,48 @@ def test_closed_trade_accounting_uses_exchange_realized_pnl():
     assert result["exit_price"] == pytest.approx(98.0)
     assert engine.db.closed[1] == pytest.approx(-2.0)
     assert engine.db.closed[4] == "automatic protection fill"
+    assert recorded_pnl == [pytest.approx(-2.0)]
+
+
+def test_closed_trade_accounting_matches_usdt_settlement_symbol_alias(monkeypatch):
+    emas = _emas_module()
+
+    class _DB:
+        def __init__(self):
+            self.closed = None
+
+        def get_latest_open_trade(self, symbol):
+            if symbol != "POWER/USDT:USDT":
+                return None
+            return {
+                "symbol": symbol,
+                "side": "long",
+                "entry_price": 0.30,
+                "quantity": 10.0,
+                "entry_time": "1970-01-01T00:00:01+00:00",
+            }
+
+        def log_trade_close(self, symbol, pnl, pnl_pct, exit_price, reason):
+            self.closed = (symbol, pnl, pnl_pct, exit_price, reason)
+            return True
+
+    recorded_pnl = []
+    monkeypatch.setattr(emas, "record_bot_realized_pnl", recorded_pnl.append)
+    engine = _protection_engine([])
+    engine.db = _DB()
+
+    result = asyncio.run(
+        engine._record_closed_trade_accounting(
+            "POWER/USDT",
+            "EmergencyStop",
+            exit_price=0.25,
+        )
+    )
+
+    assert result["status"] == "RECORDED"
+    assert engine.db.closed[0] == "POWER/USDT:USDT"
+    assert engine.db.closed[1] == pytest.approx(-0.5)
+    assert recorded_pnl == [pytest.approx(-0.5)]
 
 
 def test_entry_confirmation_accepts_filled_order_when_position_endpoint_is_unavailable():
@@ -4974,8 +5091,9 @@ def test_dual_order_path_never_displays_blank_trading_mode():
 
     summary = engine.resolve_live_order_path_status(cfg, selected="UTBreakout LONG")
 
-    assert summary["trading_mode"] == "unknown"
-    assert summary["mode_reason"] == "missing_trading_mode_config"
+    assert summary["trading_mode"] == "LEGACY_MAINNET_LIVE"
+    assert summary["live_order_enabled"] is True
+    assert summary["reason"] == "legacy_mainnet_entry_path_enabled"
 
 
 def test_dual_status_selected_none_is_not_position_none():

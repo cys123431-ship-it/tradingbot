@@ -5,8 +5,50 @@ from utbreakout.ev_adaptive import (
     evaluate_mfe_profit_lock,
     evaluate_net_edge,
     rank_ev_candidates,
+    scale_atr_percent_threshold,
 )
 from emas import SignalEngine, apply_profit_opportunity_effective_overrides
+
+
+def test_atr_threshold_scales_with_signal_timeframe_and_has_a_cap():
+    assert scale_atr_percent_threshold(2.5, "15m") == 2.5
+    assert scale_atr_percent_threshold(2.5, "4h") == 10.0
+    assert scale_atr_percent_threshold(2.5, "1d") == 12.5
+
+
+def test_ev_adaptive_does_not_apply_15m_extreme_atr_limit_to_4h_signal():
+    values = {
+        "entry_price": 100.0,
+        "ema50": 99.0,
+        "ema50_prev": 98.5,
+        "htf_ready": True,
+        "htf_close": 102.0,
+        "htf_ema_fast": 101.0,
+        "htf_ema_slow": 99.0,
+        "adx": 25.0,
+        "plus_di": 28.0,
+        "minus_di": 15.0,
+        "chop": 42.0,
+        "volume_ratio": 1.2,
+        "directional_efficiency": 0.30,
+        "momentum_12_pct": 1.2,
+        "atr_pct": 3.0,
+        "futures_spread_pct": 0.02,
+    }
+
+    short_tf = evaluate_ev_adaptive_entry(
+        side="long",
+        candidate_type="fresh_signal",
+        values={**values, "entry_timeframe": "15m"},
+    )
+    long_tf = evaluate_ev_adaptive_entry(
+        side="long",
+        candidate_type="fresh_signal",
+        values={**values, "entry_timeframe": "4h"},
+    )
+
+    assert any("extreme volatility" in item for item in short_tf.blockers)
+    assert not any("extreme volatility" in item for item in long_tf.blockers)
 
 
 def test_strong_trend_uses_convex_exit_without_increasing_initial_risk():
