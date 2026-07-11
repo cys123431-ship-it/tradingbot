@@ -244,17 +244,43 @@ stop_bot() {
     old_pid="$(cat "$PID_FILE" || true)"
     if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
       kill "$old_pid"
-      sleep 2
+      for _ in {1..15}; do
+        if ! kill -0 "$old_pid" 2>/dev/null; then
+          break
+        fi
+        sleep 1
+      done
+      if kill -0 "$old_pid" 2>/dev/null; then
+        echo "launcher did not stop after SIGTERM; sending SIGKILL: pid=$old_pid" >&2
+        kill -9 "$old_pid" 2>/dev/null || true
+        sleep 1
+      fi
     fi
     rm -f "$PID_FILE"
   fi
 
   if bot_process_running; then
     pkill -f "$BOT_ENTRY" || true
-    sleep 2
+    for _ in {1..10}; do
+      if ! bot_process_running; then
+        break
+      fi
+      sleep 1
+    done
+    if bot_process_running; then
+      echo "launcher process still present after SIGTERM; sending SIGKILL" >&2
+      pkill -9 -f "$BOT_ENTRY" || true
+      sleep 1
+    fi
   fi
 
   stop_legacy_bot_processes
+
+  if bot_process_running; then
+    echo "failed to stop launcher process: $BOT_ENTRY" >&2
+    pgrep -af "$BOT_ENTRY" >&2 || true
+    return 1
+  fi
 
   echo "bot stopped"
 }
