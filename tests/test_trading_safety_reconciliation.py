@@ -73,6 +73,42 @@ def test_local_active_without_exchange_position_requires_reconciliation(tmp_path
     asyncio.run(scenario())
 
 
+def test_startup_closes_synthetic_record_after_confirmed_emergency_close(tmp_path):
+    async def scenario():
+        store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+        store.upsert(
+            OrderRecord(
+                "recon-hmstr", "HMSTR/USDT:USDT", "LONG",
+                "EXTERNAL_OR_PRE_RECONCILIATION", "1", 10.0,
+                filled_qty=10.0,
+                order_state=OrderState.FILLED_UNPROTECTED.value,
+                created_at="2026-07-11T12:53:15+00:00",
+                updated_at="2026-07-11T12:53:15+00:00",
+            )
+        )
+        store.upsert(
+            OrderRecord(
+                "emerg-hmstr", "HMSTR/USDT", "LONG",
+                "EMERGENCY_PROTECTION_CLOSE", "2", 10.0,
+                filled_qty=10.0,
+                order_state=OrderState.CLOSED.value,
+                created_at="2026-07-11T12:53:21+00:00",
+                updated_at="2026-07-11T12:53:22+00:00",
+            )
+        )
+
+        result = await reconcile_exchange_state(ReconcileExchange([], []), store)
+
+        assert result.safe_to_trade is True
+        assert store.get("recon-hmstr").order_state == OrderState.CLOSED.value
+        assert (
+            store.get("recon-hmstr").metadata["reconciled_by_close_client_order_id"]
+            == "emerg-hmstr"
+        )
+
+    asyncio.run(scenario())
+
+
 def test_oversized_reduce_only_order_blocks_startup(tmp_path):
     async def scenario():
         store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")

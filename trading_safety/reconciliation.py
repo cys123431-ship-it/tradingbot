@@ -413,6 +413,29 @@ async def reconcile_exchange_state(
             OrderState.CLOSING.value,
             OrderState.EMERGENCY_CLOSE_FAILED.value,
         } and normalized not in position_symbols:
+            completed_emergency_close = next(
+                (
+                    candidate
+                    for candidate in store.records_for_symbol(record.symbol)
+                    if candidate.strategy == "EMERGENCY_PROTECTION_CLOSE"
+                    and candidate.order_state == OrderState.CLOSED.value
+                    and candidate.updated_at >= record.created_at
+                ),
+                None,
+            )
+            if (
+                record.strategy == "EXTERNAL_OR_PRE_RECONCILIATION"
+                and completed_emergency_close is not None
+            ):
+                store.transition(
+                    record.client_order_id,
+                    OrderState.CLOSED,
+                    last_error=None,
+                    reconciled_by_close_client_order_id=(
+                        completed_emergency_close.client_order_id
+                    ),
+                )
+                continue
             issues.append(f"local_active_without_exchange_position:{record.client_order_id}")
 
     for order in open_orders:

@@ -444,6 +444,19 @@ class SQLiteTradingStateStore:
             ).fetchall()
         return [record for row in rows if (record := self._row_to_record(row)) is not None]
 
+    def records_for_symbol(self, symbol: str) -> list[OrderRecord]:
+        normalized = _normalize_order_symbol(symbol)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM crypto_orders ORDER BY created_at"
+            ).fetchall()
+        return [
+            record
+            for row in rows
+            if (record := self._row_to_record(row)) is not None
+            and _normalize_order_symbol(record.symbol) == normalized
+        ]
+
     def active_for_symbol(self, symbol: str) -> list[OrderRecord]:
         normalized = _normalize_order_symbol(symbol)
         return [
