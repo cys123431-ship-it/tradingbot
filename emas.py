@@ -5284,10 +5284,18 @@ class SignalEngine(BaseEngine):
             liquidation_config=common,
         )
         self.last_crypto_reconciliation = result.__dict__
-        if result.safe_to_trade and not load_critical_pause_state():
-            self._set_crypto_entry_lock(None)
+        critical_pause = load_critical_pause_state()
+        if not result.safe_to_trade:
+            self._set_crypto_entry_lock(
+                'RECONCILIATION_REQUIRED: ' + ', '.join(result.issues[:5])
+            )
+        elif critical_pause:
+            self._set_crypto_entry_lock(
+                'CRITICAL_PAUSE:'
+                + str(critical_pause.get('reason') or 'manual reconciliation required')
+            )
         else:
-            self._set_crypto_entry_lock('RECONCILIATION_REQUIRED: ' + ', '.join(result.issues[:5]))
+            self._set_crypto_entry_lock(None)
         logger.warning(
             "CRYPTO_RECONCILIATION safe=%s positions=%d open_orders=%d issues=%s",
             result.safe_to_trade,
