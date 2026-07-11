@@ -136,6 +136,63 @@ def test_auto_entry_bridge_calls_entry_for_recent_ready_plan():
     assert "ENTRY_CALL" in stages
 
 
+def test_auto_entry_bridge_allows_ready_plan_within_timeframe_scan_window():
+    entry_calls = []
+
+    class Controller:
+        async def notify(self, text):
+            return None
+
+    engine = _build_engine()
+    engine.ctrl = Controller()
+    symbol = "KAT/USDT:USDT"
+    engine.last_utbot_filtered_breakout_status[symbol] = {
+        "accepted_side": "long",
+        "entry_timeframe": "15m",
+    }
+
+    async def get_server_position(requested_symbol, use_cache=False):
+        return None
+
+    async def entry(requested_symbol, side, price):
+        entry_calls.append((requested_symbol, side, price))
+
+    engine.get_server_position = get_server_position
+    engine.entry = entry
+    engine._set_utbot_filtered_breakout_entry_plan(
+        symbol,
+        {
+            "side": "long",
+            "entry_price": 0.005703,
+            "qty": 1000.0,
+            "planned_notional": 5.703,
+            "planned_margin": 1.1406,
+            "risk_usdt": 0.5,
+            "candidate_type": "fresh_signal",
+        },
+    )
+    engine._utbreakout_trace_event(
+        symbol,
+        "STATUS_READY",
+        "READY",
+        side="long",
+        entry_price=0.005703,
+    )
+    key = engine._utbreakout_trace_key(symbol)
+    engine.utbreakout_last_ready_ts[key] = time.time() - 300.0
+
+    called = asyncio.run(
+        engine._maybe_run_utbreakout_auto_entry_bridge(
+            symbol,
+            source="scanner_seen",
+        )
+    )
+
+    assert called is True
+    assert entry_calls == [(symbol, "long", 0.005703)]
+    assert emas.resolve_utbreakout_bridge_ready_age_sec({}, "15m") == 600.0
+
+
 def test_auto_entry_bridge_daily_sl_lockout_blocks_before_entry_call(tmp_path):
     entry_calls = []
 

@@ -477,6 +477,13 @@ UTBREAKOUT_RECENT_LOSS_COOLDOWN_SECONDS = 7200.0
 UTBREAKOUT_RECENT_LOSS_COOLDOWN_MIN_LOSS_USDT = 2.0
 UTBREAKOUT_RECENT_LOSS_LEGACY_COOLDOWN_SECONDS = 21600.0
 UTBREAKOUT_RECENT_LOSS_LEGACY_MIN_LOSS_USDT = 0.0
+UTBREAKOUT_READY_AGE_MIN_SECONDS_BY_TIMEFRAME = {
+    '15m': 600.0,
+    '30m': 900.0,
+    '1h': 1200.0,
+    '4h': 1800.0,
+    '6h': 2700.0,
+}
 UT_ONLY_STRATEGIES = {'utbot', 'rsibb', 'utrsibb', 'utrsi', 'utbb', 'utsmc'}
 MA_STRATEGIES = set()
 PATTERN_STRATEGIES = set(UT_ONLY_STRATEGIES)
@@ -2613,6 +2620,18 @@ def cap_utbreakout_risk_plan_to_margin(plan, *, free_balance, leverage, entry_pr
         'position_cap_max_notional': max_notional,
     })
     return plan
+
+
+def resolve_utbreakout_bridge_ready_age_sec(cfg, entry_timeframe=None):
+    """Keep bridge freshness compatible with sequential multi-timeframe scans."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    configured = max(
+        0.0,
+        float(cfg.get('utbreakout_auto_entry_bridge_max_ready_age_sec', 180.0) or 180.0),
+    )
+    timeframe = str(entry_timeframe or cfg.get('entry_timeframe') or '15m').strip().lower()
+    minimum = UTBREAKOUT_READY_AGE_MIN_SECONDS_BY_TIMEFRAME.get(timeframe, 600.0)
+    return max(configured, minimum)
 
 
 def build_utbot_filtered_breakout_profile(profile):
@@ -11529,9 +11548,15 @@ class SignalEngine(BaseEngine):
                     )
                     return False
 
-            max_ready_age_sec = float(
-                cfg.get('utbreakout_auto_entry_bridge_max_ready_age_sec', 180.0)
-                or 180.0
+            ready_diag = self._utbreakout_diag_for_symbol(symbol)
+            ready_entry_tf = (
+                ready_diag.get('entry_timeframe')
+                if isinstance(ready_diag, dict)
+                else None
+            )
+            max_ready_age_sec = resolve_utbreakout_bridge_ready_age_sec(
+                cfg,
+                ready_entry_tf,
             )
             ready_age_sec = now_ts - ready_ts
             if ready_age_sec > max_ready_age_sec:
@@ -11543,6 +11568,7 @@ class SignalEngine(BaseEngine):
                     reason='STATUS_READY event is too old',
                     ready_age_sec=round(ready_age_sec, 1),
                     max_ready_age_sec=max_ready_age_sec,
+                    entry_timeframe=ready_entry_tf or cfg.get('entry_timeframe') or '15m',
                 )
                 return False
 
