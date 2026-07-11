@@ -138,12 +138,14 @@ def default_profit_alpha_config() -> dict[str, Any]:
         "soft_stop_enabled": True,
         "soft_stop_confirm_bars": 2,
         "near_miss_tp_enabled": True,
-        "near_miss_tp_arm_ratio": 0.86,
+        "near_miss_tp_arm_ratio": 0.94,
         "near_miss_tp_lock_r": 0.28,
+        "near_miss_tp_rejection_atr": 0.12,
         "profit_alpha_follow_through_enabled": True,
         "profit_alpha_default_follow_through_bars": 3,
         "profit_alpha_default_follow_through_min_mfe_r": 0.35,
         "profit_alpha_default_early_exit_max_mae_r": 0.75,
+        "profit_alpha_stall_exit_max_current_r": 0.0,
         "entry_edge_enabled": True,
         "entry_edge_min_score": 68.0,
         "entry_edge_long_min_score": 69.0,
@@ -635,8 +637,9 @@ def _exit_overrides(
         "soft_stop_enabled": bool(cfg.get("soft_stop_enabled", True)),
         "soft_stop_confirm_bars": int(cfg.get("soft_stop_confirm_bars", 2) or 2),
         "near_miss_tp_enabled": bool(cfg.get("near_miss_tp_enabled", True)),
-        "near_miss_tp_arm_ratio": float(cfg.get("near_miss_tp_arm_ratio", 0.86) or 0.86),
+        "near_miss_tp_arm_ratio": float(cfg.get("near_miss_tp_arm_ratio", 0.94) or 0.94),
         "near_miss_tp_lock_r": float(cfg.get("near_miss_tp_lock_r", 0.28) or 0.28),
+        "near_miss_tp_rejection_atr": float(cfg.get("near_miss_tp_rejection_atr", 0.12) or 0.12),
     }
 
     def _profile_controls(
@@ -653,7 +656,7 @@ def _exit_overrides(
         profile["take_profit_front_run_pct"] = max(float(profile["take_profit_front_run_pct"]), float(front_pct))
         profile["structure_stop_buffer_atr"] = max(float(profile["structure_stop_buffer_atr"]), float(structure_buffer))
         profile["soft_stop_confirm_bars"] = max(1, int(soft_confirm or profile["soft_stop_confirm_bars"]))
-        profile["near_miss_tp_arm_ratio"] = min(float(profile["near_miss_tp_arm_ratio"]), float(arm_ratio))
+        profile["near_miss_tp_arm_ratio"] = max(float(profile["near_miss_tp_arm_ratio"]), float(arm_ratio))
         profile["near_miss_tp_lock_r"] = max(float(profile["near_miss_tp_lock_r"]), float(lock_r))
         return profile
     if entry_type == "LIQUIDITY_SWEEP_REVERSAL":
@@ -1450,6 +1453,8 @@ def evaluate_alpha_follow_through_exit(
     follow_through_bars: int,
     follow_through_min_mfe_r: float,
     early_exit_max_mae_r: float,
+    current_r: float | None = None,
+    stall_exit_max_current_r: float = 0.0,
 ) -> AlphaFollowThroughExit:
     if not enabled:
         return AlphaFollowThroughExit(False, "disabled")
@@ -1461,6 +1466,8 @@ def evaluate_alpha_follow_through_exit(
     follow_bars = max(1, int(follow_through_bars or 1))
     min_mfe = max(0.0, float(follow_through_min_mfe_r or 0.0))
     max_mae = max(0.0, float(early_exit_max_mae_r or 0.0))
+    current = float(current_r or 0.0)
+    stall_exit_ceiling = float(stall_exit_max_current_r or 0.0)
 
     if max_mae > 0 and mae >= max_mae and mfe < min(0.20, min_mfe):
         return AlphaFollowThroughExit(
@@ -1468,6 +1475,11 @@ def evaluate_alpha_follow_through_exit(
             f"early adverse move MAE {mae:.2f}R with MFE {mfe:.2f}R",
         )
     if bars >= follow_bars and mfe < min_mfe:
+        if current > stall_exit_ceiling:
+            return AlphaFollowThroughExit(
+                False,
+                f"hold profitable stall: current {current:.2f}R>{stall_exit_ceiling:.2f}R",
+            )
         return AlphaFollowThroughExit(
             True,
             f"no follow-through after {bars} bars: MFE {mfe:.2f}R<{min_mfe:.2f}R",

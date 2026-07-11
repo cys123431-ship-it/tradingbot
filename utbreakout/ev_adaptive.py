@@ -1263,6 +1263,8 @@ def evaluate_ev_time_stop(
     tp1_filled,
     max_bars,
     min_mfe_r,
+    current_r=None,
+    max_current_r=0.0,
 ):
     if bool(tp1_filled):
         return TimeStopDecision(False, "TP1 already filled")
@@ -1271,6 +1273,13 @@ def evaluate_ev_time_stop(
     progress = max(0.0, _finite(mfe_r, 0.0))
     threshold = max(0.0, _finite(min_mfe_r, 0.45))
     if bars >= limit and progress < threshold:
+        current = _finite(current_r, 0.0)
+        ceiling = _finite(max_current_r, 0.0)
+        if current > ceiling:
+            return TimeStopDecision(
+                False,
+                f"profitable hold: current {current:.2f}R>{ceiling:.2f}R",
+            )
         return TimeStopDecision(
             True,
             f"no follow-through: {progress:.2f}R<{threshold:.2f}R after {bars} bars",

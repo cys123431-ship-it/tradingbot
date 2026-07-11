@@ -1073,8 +1073,9 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "soft_stop_enabled": True,
         "soft_stop_confirm_bars": 2,
         "near_miss_tp_enabled": True,
-        "near_miss_tp_arm_ratio": 0.86,
+        "near_miss_tp_arm_ratio": 0.94,
         "near_miss_tp_lock_r": 0.28,
+        "near_miss_tp_rejection_atr": 0.12,
         "market_regime_engine_enabled": True,
         "market_regime_opposite_risk_multiplier": 0.62,
         "market_regime_chop_risk_multiplier": 0.72,
@@ -1105,6 +1106,9 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "profit_alpha_default_follow_through_bars": 3,
         "profit_alpha_default_follow_through_min_mfe_r": 0.35,
         "profit_alpha_default_early_exit_max_mae_r": 0.75,
+        "profit_alpha_stall_exit_max_current_r": 0.0,
+        "ev_time_stop_max_current_r": 0.0,
+        "time_stop_max_current_r": 0.0,
         "aggressive_growth_enabled": False,
         "aggressive_growth_pyramiding_enabled": False,
         "utbreakout_recent_loss_cooldown_enabled": True,
@@ -1630,8 +1634,9 @@ def apply_stable_utbreak_final_overrides(cfg):
         "soft_stop_enabled": True,
         "soft_stop_confirm_bars": 2,
         "near_miss_tp_enabled": True,
-        "near_miss_tp_arm_ratio": 0.86,
+        "near_miss_tp_arm_ratio": 0.94,
         "near_miss_tp_lock_r": 0.28,
+        "near_miss_tp_rejection_atr": 0.12,
         "market_regime_engine_enabled": True,
         "market_regime_opposite_risk_multiplier": 0.62,
         "market_regime_chop_risk_multiplier": 0.72,
@@ -1662,6 +1667,9 @@ def apply_stable_utbreak_final_overrides(cfg):
         "profit_alpha_default_follow_through_bars": 3,
         "profit_alpha_default_follow_through_min_mfe_r": 0.35,
         "profit_alpha_default_early_exit_max_mae_r": 0.75,
+        "profit_alpha_stall_exit_max_current_r": 0.0,
+        "ev_time_stop_max_current_r": 0.0,
+        "time_stop_max_current_r": 0.0,
 
         "max_daily_trades": 5,
         "max_consecutive_losses": 5,
@@ -2120,6 +2128,10 @@ def build_utbreakout_effective_config_diff_text(raw_cfg, effective_cfg):
         'near_miss_tp_enabled',
         'near_miss_tp_arm_ratio',
         'near_miss_tp_lock_r',
+        'near_miss_tp_rejection_atr',
+        'profit_alpha_stall_exit_max_current_r',
+        'ev_time_stop_max_current_r',
+        'time_stop_max_current_r',
         'market_regime_engine_enabled',
         'data_quality_engine_enabled',
         'execution_quality_engine_enabled',
@@ -11977,6 +11989,10 @@ class SignalEngine(BaseEngine):
             'near_miss_tp_enabled',
             'near_miss_tp_arm_ratio',
             'near_miss_tp_lock_r',
+            'near_miss_tp_rejection_atr',
+            'profit_alpha_stall_exit_max_current_r',
+            'ev_time_stop_max_current_r',
+            'time_stop_max_current_r',
         ):
             if key in plan:
                 cfg[key] = plan[key]
@@ -12144,10 +12160,13 @@ class SignalEngine(BaseEngine):
             'soft_stop_confirm_bars': int(plan.get('soft_stop_confirm_bars', cfg.get('soft_stop_confirm_bars', 2)) or 2),
             'soft_stop_breach_count': 0,
             'near_miss_tp_enabled': bool(plan.get('near_miss_tp_enabled', cfg.get('near_miss_tp_enabled', True))),
-            'near_miss_tp_arm_ratio': max(0.50, min(0.99, float(plan.get('near_miss_tp_arm_ratio', cfg.get('near_miss_tp_arm_ratio', 0.86)) or 0.86))),
+            'near_miss_tp_arm_ratio': max(0.50, min(0.99, float(plan.get('near_miss_tp_arm_ratio', cfg.get('near_miss_tp_arm_ratio', 0.94)) or 0.94))),
             'near_miss_tp_lock_r': max(0.0, float(plan.get('near_miss_tp_lock_r', cfg.get('near_miss_tp_lock_r', 0.28)) or 0.28)),
+            'near_miss_tp_rejection_atr': max(0.0, float(plan.get('near_miss_tp_rejection_atr', cfg.get('near_miss_tp_rejection_atr', 0.12)) or 0.12)),
             'near_miss_tp1_armed': False,
             'near_miss_tp2_armed': False,
+            'profit_alpha_stall_exit_max_current_r': float(plan.get('profit_alpha_stall_exit_max_current_r', cfg.get('profit_alpha_stall_exit_max_current_r', 0.0)) or 0.0),
+            'ev_time_stop_max_current_r': float(plan.get('ev_time_stop_max_current_r', cfg.get('ev_time_stop_max_current_r', 0.0)) or 0.0),
             'runner_exit_enabled': bool(cfg.get('runner_exit_enabled', False)),
             'runner_chandelier_enabled': bool(cfg.get('runner_chandelier_enabled', False)),
             'runner_mode': 'dynamic_chandelier' if cfg.get('runner_chandelier_enabled', False) else 'atr_close',
@@ -14705,7 +14724,17 @@ class SignalEngine(BaseEngine):
     async def _dual_alpha_ut_direction_filter(self, symbol, strategy_params, *, force_reprocess=False):
         direction_params = self._dual_alpha_direction_strategy_params(strategy_params)
         direction_cfg = self._get_utbot_filtered_breakout_config(direction_params)
-        direction_tf = str(direction_cfg.get('entry_timeframe') or '4h').strip().lower() or '4h'
+        direction_cfg.update({
+            'dual_alpha_direction_filter_enabled': True,
+            'dual_alpha_direction_filter_timeframe': '4h',
+            'dual_alpha_direction_filter_htf': '1d',
+            'entry_timeframe': '4h',
+            'exit_timeframe': '4h',
+            'htf_timeframe': '1d',
+            'adaptive_timeframe_enabled': False,
+        })
+        direction_params['UTBotFilteredBreakoutV1'] = direction_cfg
+        direction_tf = '4h'
         try:
             ohlcv = await asyncio.to_thread(
                 self.market_data_exchange.fetch_ohlcv,
@@ -14738,6 +14767,11 @@ class SignalEngine(BaseEngine):
             force_reprocess=force_reprocess,
         )
         status = dict(status or self._utbreakout_diag_for_symbol(symbol) or {})
+        status['entry_timeframe'] = '4h'
+        status['exit_timeframe'] = '4h'
+        status['htf_timeframe'] = '1d'
+        status['dual_direction_filter_timeframe'] = '4h'
+        status['dual_direction_filter_htf'] = '1d'
         side = self._extract_relative_strength_pullback_ut_direction(sig, status)
         self._clear_utbot_filtered_breakout_entry_plan(symbol)
         self._utbreakout_trace_event(
@@ -17235,8 +17269,11 @@ class SignalEngine(BaseEngine):
             'soft_stop_enabled': bool(cfg.get('soft_stop_enabled', True)),
             'soft_stop_confirm_bars': int(cfg.get('soft_stop_confirm_bars', 2) or 2),
             'near_miss_tp_enabled': bool(cfg.get('near_miss_tp_enabled', True)),
-            'near_miss_tp_arm_ratio': float(cfg.get('near_miss_tp_arm_ratio', 0.86) or 0.86),
+            'near_miss_tp_arm_ratio': float(cfg.get('near_miss_tp_arm_ratio', 0.94) or 0.94),
             'near_miss_tp_lock_r': float(cfg.get('near_miss_tp_lock_r', 0.28) or 0.28),
+            'near_miss_tp_rejection_atr': float(cfg.get('near_miss_tp_rejection_atr', 0.12) or 0.12),
+            'profit_alpha_stall_exit_max_current_r': float(cfg.get('profit_alpha_stall_exit_max_current_r', 0.0) or 0.0),
+            'ev_time_stop_max_current_r': float(cfg.get('ev_time_stop_max_current_r', 0.0) or 0.0),
             'short_conservative_enabled': bool(cfg.get('short_conservative_enabled', True)),
             'short_risk_multiplier': float(cfg.get('short_risk_multiplier', 0.5) or 0.5),
             'bias_continuation_summary': status.get('bias_continuation_summary'),
@@ -29059,12 +29096,19 @@ class SignalEngine(BaseEngine):
             elif active_strategy in UTBREAKOUT_STRATEGIES:
                 filtered_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
                 if pos:
-                    await self._manage_utbreakout_partial_trailing(symbol, pos, df, filtered_cfg)
+                    trailing_state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
+                    advanced_ladder = bool(
+                        isinstance(trailing_state, dict)
+                        and trailing_state.get('advanced_live_ladder_state')
+                    )
+                    if not advanced_ladder:
+                        await self._manage_utbreakout_partial_trailing(symbol, pos, df, filtered_cfg)
                     pyramid_status = await self._maybe_apply_aggressive_growth_pyramiding(symbol, pos, df, filtered_cfg)
                     if isinstance(pyramid_status, dict) and pyramid_status.get('status') == 'ADDED':
                         self.position_cache = None
                         pos = await self.get_server_position(symbol, use_cache=False) or pos
-                    await self._manage_live_ladder_exit_policy(symbol, pos, df, filtered_cfg)
+                    if advanced_ladder:
+                        await self._manage_live_ladder_exit_policy(symbol, pos, df, filtered_cfg)
                     self.last_entry_reason[symbol] = (
                         f"포지션 보유 중 ({pos['side'].upper()}), UTBOT_FILTERED_BREAKOUT_V1 신규 진입 대기"
                     )
@@ -31319,6 +31363,10 @@ class SignalEngine(BaseEngine):
                             'near_miss_tp_enabled',
                             'near_miss_tp_arm_ratio',
                             'near_miss_tp_lock_r',
+                            'near_miss_tp_rejection_atr',
+                            'profit_alpha_stall_exit_max_current_r',
+                            'ev_time_stop_max_current_r',
+                            'time_stop_max_current_r',
                         ):
                             if key in plan:
                                 effective_fb_cfg[key] = plan[key]
@@ -33205,6 +33253,22 @@ class SignalEngine(BaseEngine):
             order for order in (initial_orders or [])
             if self._classify_protection_order(order) == 'sl'
         ]
+        newest_existing_sl = self._newest_protection_order(existing_sl)
+        existing_stop = (
+            self._protection_trigger_price(newest_existing_sl)
+            if newest_existing_sl
+            else None
+        )
+        if existing_stop is not None:
+            stop_tolerance = max(abs(float(safe_stop)) * 1e-9, 1e-12)
+            if abs(float(existing_stop) - float(safe_stop)) <= stop_tolerance:
+                logger.debug(
+                    "SL replacement skipped for %s: existing stop already matches %s (%s)",
+                    symbol,
+                    safe_stop,
+                    reason,
+                )
+                return newest_existing_sl
         cancelled_count = await self._cancel_protection_orders(
             symbol,
             reason=reason,
@@ -33326,6 +33390,8 @@ class SignalEngine(BaseEngine):
         state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
         if not isinstance(state, dict):
             return None
+        if bool(state.get('advanced_live_ladder_state', False)):
+            return None
         if not pos:
             self._clear_utbreakout_trailing_state(symbol, finalize=True, reason='position closed before runner update')
             return None
@@ -33398,6 +33464,7 @@ class SignalEngine(BaseEngine):
             if side == 'long'
             else entry_price - current_close
         )
+        current_r = favorable_move / risk_distance
         remaining_ratio = float(state.get('remaining_ratio', 0.5) or 0.5)
         tp1_remaining_value = state.get('tp1_expected_remaining_ratio', remaining_ratio)
         if tp1_remaining_value is None:
@@ -33489,9 +33556,20 @@ class SignalEngine(BaseEngine):
                     0.0,
                     float(cfg.get('near_miss_tp_lock_r', state.get('near_miss_tp_lock_r', 0.28)) or 0.28),
                 )
+                rejection_atr = max(
+                    0.0,
+                    float(
+                        cfg.get(
+                            'near_miss_tp_rejection_atr',
+                            state.get('near_miss_tp_rejection_atr', 0.12),
+                        )
+                        or 0.12
+                    ),
+                )
             except (TypeError, ValueError):
-                arm_ratio = 0.86
+                arm_ratio = 0.94
                 base_lock_r = 0.28
+                rejection_atr = 0.12
             for tp_order in self._planned_tp_orders_from_state(symbol, state):
                 label = _normalize_tp_plan_label(tp_order.get('tp_label') or tp_order.get('tp_name') or tp_order.get('label'), 'TP')
                 label_key = label.lower()
@@ -33505,21 +33583,43 @@ class SignalEngine(BaseEngine):
                     continue
                 if side == 'long':
                     arm_price = entry_price + target_distance * arm_ratio
-                    near_reached = current_high >= arm_price and current_high < target_price
+                    target_reached = highest_price >= target_price
+                    near_reached = highest_price >= arm_price and not target_reached
+                    rejection_confirmed = (
+                        highest_price - current_close
+                    ) >= atr_value * rejection_atr
                     lock_r = min(max(base_lock_r, (arm_ratio * target_distance / risk_distance) - 0.12), 0.80)
                     near_stop = entry_price + risk_distance * lock_r
                     valid_stop = near_stop < current_close
                     improved = near_stop > float(state.get('last_stop_price') or 0.0)
                 else:
                     arm_price = entry_price - target_distance * arm_ratio
-                    near_reached = current_low <= arm_price and current_low > target_price
+                    target_reached = lowest_price <= target_price
+                    near_reached = lowest_price <= arm_price and not target_reached
+                    rejection_confirmed = (
+                        current_close - lowest_price
+                    ) >= atr_value * rejection_atr
                     lock_r = min(max(base_lock_r, (arm_ratio * target_distance / risk_distance) - 0.12), 0.80)
                     near_stop = entry_price - risk_distance * lock_r
                     last_stop = float(state.get('last_stop_price') or 0.0)
                     valid_stop = near_stop > current_close
                     improved = last_stop <= 0 or near_stop < last_stop
-                if not (near_reached and valid_stop and improved):
+                if near_reached:
+                    state[f'near_miss_{label_key}_touched'] = True
+                touched = bool(state.get(f'near_miss_{label_key}_touched'))
+                if not (
+                    touched
+                    and not target_reached
+                    and rejection_confirmed
+                    and valid_stop
+                    and improved
+                ):
                     continue
+                attempt_key = f'near_miss_{label_key}_last_attempt_bar_ts'
+                if state.get(attempt_key) == current_bar_ts:
+                    continue
+                state[attempt_key] = current_bar_ts
+                self.utbreakout_trailing_states[symbol] = state
                 replacement_order = await self._replace_stop_loss_order(
                     symbol,
                     pos,
@@ -33530,6 +33630,7 @@ class SignalEngine(BaseEngine):
                     state.update({
                         'active': True,
                         f'near_miss_{label_key}_armed': True,
+                        f'near_miss_{label_key}_rejection_confirmed': True,
                         'last_stop_price': float(near_stop),
                         'last_atr': float(atr_value),
                         'last_close': float(current_close),
@@ -33578,6 +33679,14 @@ class SignalEngine(BaseEngine):
                 )
                 or 0.75
             ),
+            current_r=current_r,
+            stall_exit_max_current_r=float(
+                state.get(
+                    'profit_alpha_stall_exit_max_current_r',
+                    cfg.get('profit_alpha_stall_exit_max_current_r', 0.0),
+                )
+                or 0.0
+            ),
         )
         state['profit_alpha_follow_through_reason'] = alpha_follow_exit.reason
         if alpha_follow_exit.should_exit:
@@ -33617,6 +33726,11 @@ class SignalEngine(BaseEngine):
                 min_mfe_r=state.get(
                     'ev_time_stop_min_mfe_r',
                     cfg.get('ev_time_stop_min_mfe_r', 0.45),
+                ),
+                current_r=current_r,
+                max_current_r=state.get(
+                    'ev_time_stop_max_current_r',
+                    cfg.get('ev_time_stop_max_current_r', 0.0),
                 ),
             )
             state['ev_time_stop_reason'] = time_stop.reason
@@ -49174,29 +49288,39 @@ async def _manage_live_ladder_exit_policy(self, symbol, pos, df, cfg):
         return {"status": "FLAT_CLEANUP_PENDING", "audit": cleanup_status}
     if not bool(state.get("advanced_live_ladder_state", False)):
         return None
-    if df is None or len(df) < 5:
+    if df is None or len(df) < 6:
         return None
 
     try:
+        closed_df = df.iloc[:-1].copy().reset_index(drop=True)
+        closed_bar = closed_df.iloc[-1]
         current_bar = {
-            "index": int(state.get("bars_seen", 0)) + 1,
-            "open": float(df.iloc[-1]["open"]),
-            "high": float(df.iloc[-1]["high"]),
-            "low": float(df.iloc[-1]["low"]),
-            "close": float(df.iloc[-1]["close"]),
-            "volume": float(df.iloc[-1].get("volume", 0.0)),
+            "index": int(state.get("bars_seen", 0)),
+            "open": float(closed_bar["open"]),
+            "high": float(closed_bar["high"]),
+            "low": float(closed_bar["low"]),
+            "close": float(closed_bar["close"]),
+            "volume": float(closed_bar.get("volume", 0.0)),
         }
-        state["bars_seen"] = current_bar["index"]
+        raw_bar_ts = closed_bar.get("timestamp", len(closed_df) - 1)
+        try:
+            closed_bar_ts = int(raw_bar_ts)
+        except (TypeError, ValueError, OverflowError):
+            closed_bar_ts = str(raw_bar_ts)
+        previous_bar_ts = state.get("last_bar_ts")
+        if previous_bar_ts is None:
+            state["last_bar_ts"] = closed_bar_ts
+            new_closed_bar = False
+            self.utbreakout_trailing_states[symbol] = state
+        else:
+            new_closed_bar = closed_bar_ts != previous_bar_ts
+        if new_closed_bar:
+            state["bars_seen"] = int(state.get("bars_seen", 0) or 0) + 1
+            state["last_bar_ts"] = closed_bar_ts
+            current_bar["index"] = int(state["bars_seen"])
+            self.utbreakout_trailing_states[symbol] = state
     except Exception:
         return None
-
-    position_proxy = {
-        "side": str(pos.get("side") or state.get("side")).upper(),
-        "timeframe": cfg.get("timeframe", "15m"),
-        "entry_bar_index": int(state.get("entry_bar_index", 0)),
-        "tp1_filled": bool(state.get("tp1_filled", False)),
-        "partial_filled": bool(state.get("tp1_filled", False)),
-    }
 
     state = await self._refresh_ladder_fill_state(symbol, pos, state, cfg)
     audit_status = None
@@ -49213,6 +49337,29 @@ async def _manage_live_ladder_exit_policy(self, symbol, pos, df, cfg):
         self._clear_utbreakout_trailing_state(symbol, finalize=True, reason="TP2 fallback close")
         return {"status": "EXITED", "reason": "TP2_FALLBACK_CLOSE", "fallback": fallback_status}
 
+    if not new_closed_bar:
+        return state
+
+    side = str(pos.get("side") or state.get("side") or "").lower()
+    entry_price = _safe_float_or_none(pos.get("entryPrice")) or _safe_float_or_none(state.get("entry_price"))
+    risk_distance = _safe_float_or_none(state.get("risk_distance"))
+    current_r = None
+    if entry_price and risk_distance and risk_distance > 0 and side in {"long", "short"}:
+        favorable_move = (
+            current_bar["close"] - entry_price
+            if side == "long"
+            else entry_price - current_bar["close"]
+        )
+        current_r = favorable_move / risk_distance
+    position_proxy = {
+        "side": side.upper(),
+        "timeframe": cfg.get("timeframe", "15m"),
+        "entry_bar_index": int(state.get("entry_bar_index", 0)),
+        "tp1_filled": bool(state.get("tp1_filled", False)),
+        "partial_filled": bool(state.get("tp1_filled", False)),
+        "current_r": current_r,
+    }
+
     time_stop = evaluate_time_stop(position_proxy, current_bar, cfg)
     if time_stop.should_exit:
         close_result = await self._close_position_reduce_only_market(symbol, pos, reason=time_stop.reason, cfg=cfg)
@@ -49226,7 +49373,7 @@ async def _manage_live_ladder_exit_policy(self, symbol, pos, df, cfg):
 
     rows = []
     try:
-        for i, row in enumerate(df.to_dict("records")):
+        for i, row in enumerate(closed_df.to_dict("records")):
             rows.append({
                 "index": i,
                 "open": float(row["open"]),

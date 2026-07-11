@@ -285,6 +285,21 @@ def test_time_stop_only_exits_when_trade_has_no_follow_through():
     assert progressing.should_exit is False
 
 
+def test_ev_time_stop_does_not_exit_profitable_position_before_tp():
+    decision = evaluate_ev_time_stop(
+        bars_held=8,
+        mfe_r=0.30,
+        tp1_filled=False,
+        max_bars=8,
+        min_mfe_r=0.45,
+        current_r=0.12,
+        max_current_r=0.0,
+    )
+
+    assert decision.should_exit is False
+    assert "profitable hold" in decision.reason
+
+
 def test_candidate_ranking_prefers_net_edge_over_legacy_indicator_score():
     ranked = rank_ev_candidates(
         [

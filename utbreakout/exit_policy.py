@@ -216,6 +216,10 @@ def evaluate_time_stop(position, current_bar, config=None):
     entry_index = int(_finite_float(_field(position, "entry_bar_index", _field(position, "entry_idx", 0)), 0) or 0)
     current_index = int(_finite_float(_field(current_bar, "index", _field(current_bar, "idx", 0)), 0) or 0)
     if current_index - entry_index >= max_bars:
+        current_r = _finite_float(_field(position, "current_r", None))
+        max_current_r = _finite_float(config.get("time_stop_max_current_r"), 0.0)
+        if current_r is not None and current_r > max_current_r:
+            return ExitSignal.none()
         return ExitSignal(True, "MARKET", "TIME_STOP_NO_FOLLOW_THROUGH")
     return ExitSignal.none()
 

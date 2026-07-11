@@ -1814,6 +1814,54 @@ def test_dual_alpha_keeps_adaptive_entries_but_uses_fixed_4h_direction_filter():
     assert rsp_cfg["relative_strength_pullback_trend"]["trend_htf"] == "1d"
 
 
+def test_dual_alpha_direction_filter_normalizes_runtime_status_to_4h_1d():
+    emas = _emas_module()
+    engine = object.__new__(emas.SignalEngine)
+    events = []
+
+    class _MarketData:
+        def fetch_ohlcv(self, symbol, timeframe, limit=300):
+            assert timeframe == "4h"
+            return [
+                [idx, 100.0, 101.0, 99.0, 100.5, 1000.0]
+                for idx in range(60)
+            ]
+
+    engine.market_data_exchange = _MarketData()
+    engine._clear_utbot_filtered_breakout_entry_plan = lambda symbol: None
+    engine._utbreakout_diag_for_symbol = lambda symbol: {}
+    engine._utbreakout_trace_event = (
+        lambda symbol, stage, status, **kwargs: events.append((stage, status, kwargs))
+    )
+
+    async def calculate(symbol, df, params, *, force_reprocess=False):
+        cfg = engine._get_utbot_filtered_breakout_config(params)
+        assert cfg["entry_timeframe"] == "4h"
+        assert cfg["htf_timeframe"] == "1d"
+        return "long", "direction ready", {
+            "accepted_side": "long",
+            "entry_timeframe": "15m",
+            "htf_timeframe": "1h",
+        }
+
+    engine._calculate_utbot_filtered_breakout_signal = calculate
+    side, _, status = asyncio.run(
+        engine._dual_alpha_ut_direction_filter(
+            "BTC/USDT:USDT",
+            {
+                "active_strategy": emas.DUAL_ALPHA_STRATEGY,
+                "UTBotFilteredBreakoutV1": {},
+            },
+        )
+    )
+
+    assert side == "long"
+    assert status["entry_timeframe"] == "4h"
+    assert status["htf_timeframe"] == "1d"
+    assert events[-1][2]["entry_timeframe"] == "4h"
+    assert events[-1][2]["htf_timeframe"] == "1d"
+
+
 def test_dual_alpha_direction_filter_blocks_opposite_adaptive_ut_candidate():
     emas = _emas_module()
     engine = object.__new__(emas.SignalEngine)
@@ -2723,6 +2771,178 @@ def test_live_ladder_flat_cleanup_keeps_state_when_order_fetch_is_unverified():
     assert result["status"] == "FLAT_CLEANUP_PENDING"
     assert result["audit"]["cleanup_confirmed"] is False
     assert "BTC/USDT" in engine.utbreakout_trailing_states
+
+
+def test_live_ladder_repeated_poll_does_not_increment_closed_bar_count():
+    pos = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": "1",
+        "entryPrice": "100",
+    }
+    engine = _protection_engine([], positions=[pos])
+    state = {
+        "advanced_live_ladder_state": True,
+        "side": "long",
+        "entry_price": 100.0,
+        "initial_qty": 1.0,
+        "risk_distance": 10.0,
+        "last_stop_price": 90.0,
+        "planned_tp_orders": [],
+        "bars_seen": 7,
+        "last_bar_ts": 23,
+        "tp1_filled": False,
+    }
+    engine.utbreakout_trailing_states = {"BTC/USDT": state}
+
+    async def refresh(symbol, current_pos, current_state, cfg):
+        return current_state
+
+    async def audit(*args, **kwargs):
+        return {"status": "OK"}
+
+    async def fallback(*args, **kwargs):
+        return {"status": "NOT_REACHED"}
+
+    engine._refresh_ladder_fill_state = refresh
+    engine._audit_and_repair_live_ladder_protection = audit
+    engine._maybe_tp2_fallback_close = fallback
+    df = pd.DataFrame([
+        {
+            "timestamp": idx,
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.5,
+            "volume": 1000.0,
+        }
+        for idx in range(25)
+    ])
+
+    first = asyncio.run(
+        engine._manage_live_ladder_exit_policy(
+            "BTC/USDT", pos, df, {"time_stop_enabled": True}
+        )
+    )
+    second = asyncio.run(
+        engine._manage_live_ladder_exit_policy(
+            "BTC/USDT", pos, df, {"time_stop_enabled": True}
+        )
+    )
+
+    assert first is state
+    assert second is state
+    assert state["bars_seen"] == 7
+
+
+def test_live_ladder_first_poll_only_establishes_closed_bar_baseline():
+    pos = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": "1",
+        "entryPrice": "100",
+    }
+    engine = _protection_engine([], positions=[pos])
+    state = {
+        "advanced_live_ladder_state": True,
+        "side": "long",
+        "entry_price": 100.0,
+        "initial_qty": 1.0,
+        "risk_distance": 10.0,
+        "last_stop_price": 90.0,
+        "planned_tp_orders": [],
+        "bars_seen": 0,
+        "tp1_filled": False,
+    }
+    engine.utbreakout_trailing_states = {"BTC/USDT": state}
+
+    async def refresh(symbol, current_pos, current_state, cfg):
+        return current_state
+
+    async def audit(*args, **kwargs):
+        return {"status": "OK"}
+
+    async def fallback(*args, **kwargs):
+        return {"status": "NOT_REACHED"}
+
+    engine._refresh_ladder_fill_state = refresh
+    engine._audit_and_repair_live_ladder_protection = audit
+    engine._maybe_tp2_fallback_close = fallback
+    df = pd.DataFrame([
+        {
+            "timestamp": idx,
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.5,
+            "volume": 1000.0,
+        }
+        for idx in range(25)
+    ])
+
+    result = asyncio.run(
+        engine._manage_live_ladder_exit_policy(
+            "BTC/USDT", pos, df, {"time_stop_enabled": True}
+        )
+    )
+
+    assert result is state
+    assert state["bars_seen"] == 0
+    assert state["last_bar_ts"] == 23
+
+
+def test_advanced_live_ladder_is_not_managed_by_legacy_exit_engine():
+    pos = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": "1",
+        "entryPrice": "100",
+    }
+    engine = _protection_engine([], positions=[pos])
+    state = {
+        "advanced_live_ladder_state": True,
+        "side": "long",
+        "entry_price": 100.0,
+        "initial_qty": 1.0,
+        "risk_distance": 10.0,
+        "last_stop_price": 90.0,
+        "profit_alpha_enabled": True,
+        "profit_alpha_follow_through_enabled": True,
+        "profit_alpha_follow_through_bars": 1,
+        "profit_alpha_follow_through_min_mfe_r": 1.0,
+        "bars_seen": 10,
+    }
+    engine.utbreakout_trailing_states = {"BTC/USDT": state}
+    close_calls = []
+
+    async def close_position(*args, **kwargs):
+        close_calls.append((args, kwargs))
+        return {"_flat_confirmed": True, "_cleanup_confirmed": True}
+
+    engine._close_position_reduce_only_market = close_position
+    df = pd.DataFrame([
+        {
+            "timestamp": idx,
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0,
+        }
+        for idx in range(25)
+    ])
+
+    result = asyncio.run(
+        engine._manage_utbreakout_partial_trailing(
+            "BTC/USDT",
+            pos,
+            df,
+            {"atr_length": 14, "atr_trailing_enabled": True},
+        )
+    )
+
+    assert result is None
+    assert close_calls == []
+    assert state["bars_seen"] == 10
 
 
 def test_global_orphan_sweep_cancels_leftover_stop_loss_without_tracked_symbol():
@@ -4436,6 +4656,146 @@ def test_utbreakout_ev_time_stop_closes_only_after_no_follow_through():
     assert result["reason"] == "EV_TIME_STOP"
     assert len(close_calls) == 1
     assert cleared[0][0] == "BTC/USDT"
+
+
+def test_near_miss_profit_lock_requires_close_approach_and_rejection():
+    pos = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": "1",
+        "entryPrice": "100",
+    }
+    engine = _protection_engine([], positions=[pos])
+    state = {
+        "side": "long",
+        "entry_price": 100.0,
+        "initial_qty": 1.0,
+        "remaining_ratio": 1.0,
+        "risk_distance": 10.0,
+        "activation_r": 1.0,
+        "atr_trailing_enabled": False,
+        "tp1_breakeven_enabled": False,
+        "soft_stop_enabled": False,
+        "near_miss_tp_enabled": True,
+        "near_miss_tp_arm_ratio": 0.94,
+        "near_miss_tp_rejection_atr": 0.12,
+        "last_stop_price": 90.0,
+        "highest_price": 100.0,
+        "lowest_price": 100.0,
+        "bars_seen": 0,
+        "last_bar_ts": 22,
+        "profit_alpha_enabled": False,
+        "ev_time_stop_enabled": False,
+        "planned_tp_orders": [
+            {
+                "tp_label": "TP1",
+                "tp_name": "TP1",
+                "side": "sell",
+                "price": 110.0,
+                "qty": 1.0,
+                "filled": False,
+            }
+        ],
+    }
+    engine.utbreakout_trailing_states = {"BTC/USDT": state}
+    replacements = []
+
+    async def audit(*args, **kwargs):
+        return {"status": "OK"}
+
+    async def fallback(*args, **kwargs):
+        return {"status": "NOT_REACHED"}
+
+    async def replace(symbol, current_pos, stop_price, reason=""):
+        replacements.append((symbol, stop_price, reason))
+        return {"id": "sl-near-miss"}
+
+    engine._audit_and_repair_live_ladder_protection = audit
+    engine._maybe_tp2_fallback_close = fallback
+    engine._replace_stop_loss_order = replace
+
+    rows = [
+        {
+            "timestamp": idx,
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0,
+        }
+        for idx in range(23)
+    ]
+    rows.extend([
+        {
+            "timestamp": 23,
+            "open": 109.0,
+            "high": 109.5,
+            "low": 108.8,
+            "close": 109.45,
+        },
+        {
+            "timestamp": 24,
+            "open": 109.45,
+            "high": 109.5,
+            "low": 109.3,
+            "close": 109.4,
+        },
+    ])
+    first_df = pd.DataFrame(rows)
+    first = asyncio.run(
+        engine._manage_utbreakout_partial_trailing(
+            "BTC/USDT",
+            pos,
+            first_df,
+            {
+                "atr_length": 14,
+                "atr_trailing_enabled": False,
+                "tp1_breakeven_enabled": False,
+                "near_miss_tp_enabled": True,
+                "near_miss_tp_arm_ratio": 0.94,
+                "near_miss_tp_rejection_atr": 0.12,
+            },
+        )
+    )
+
+    assert first is None
+    assert replacements == []
+    assert state["near_miss_tp1_touched"] is True
+
+    second_rows = rows[:-1] + [
+        {
+            "timestamp": 24,
+            "open": 109.4,
+            "high": 109.45,
+            "low": 108.6,
+            "close": 108.8,
+        },
+        {
+            "timestamp": 25,
+            "open": 108.8,
+            "high": 108.9,
+            "low": 108.7,
+            "close": 108.8,
+        },
+    ]
+    second = asyncio.run(
+        engine._manage_utbreakout_partial_trailing(
+            "BTC/USDT",
+            pos,
+            pd.DataFrame(second_rows),
+            {
+                "atr_length": 14,
+                "atr_trailing_enabled": False,
+                "tp1_breakeven_enabled": False,
+                "near_miss_tp_enabled": True,
+                "near_miss_tp_arm_ratio": 0.94,
+                "near_miss_tp_rejection_atr": 0.12,
+            },
+        )
+    )
+
+    assert second["near_miss_tp1_armed"] is True
+    assert len(replacements) == 1
+    assert replacements[0][2] == "UTBreak near-miss TP1 profit lock"
 
 
 def test_utbreakout_soft_structure_stop_closes_on_confirmed_breach():

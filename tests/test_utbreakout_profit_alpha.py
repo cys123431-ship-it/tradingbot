@@ -315,7 +315,7 @@ def test_profit_alpha_exit_overrides_expand_strong_trend_runner():
     assert cfg["soft_stop_confirm_bars"] == 2
     assert cfg["structure_stop_buffer_atr"] >= 0.34
     assert cfg["near_miss_tp_enabled"] is True
-    assert cfg["near_miss_tp_arm_ratio"] <= 0.88
+    assert cfg["near_miss_tp_arm_ratio"] >= 0.94
 
 
 def test_profit_alpha_splits_pullback_entry_type_and_exit_policy():
@@ -339,7 +339,7 @@ def test_profit_alpha_splits_pullback_entry_type_and_exit_policy():
     assert cfg["structure_stop_buffer_atr"] >= 0.32
 
 
-def test_profit_alpha_sweep_exit_profile_front_runs_and_locks_profit_earlier():
+def test_profit_alpha_sweep_exit_profile_requires_close_tp_approach():
     values = _base_values("long")
     values.update({
         "open": 108.0,
@@ -358,7 +358,7 @@ def test_profit_alpha_sweep_exit_profile_front_runs_and_locks_profit_earlier():
     cfg = apply_profit_alpha_exit_overrides({}, decision)
     assert decision.entry_type == "LIQUIDITY_SWEEP_REVERSAL"
     assert cfg["take_profit_front_run_pct"] >= 0.08
-    assert cfg["near_miss_tp_arm_ratio"] <= 0.82
+    assert cfg["near_miss_tp_arm_ratio"] >= 0.94
     assert cfg["near_miss_tp_lock_r"] >= 0.36
     assert cfg["soft_stop_confirm_bars"] == 1
 
@@ -543,3 +543,21 @@ def test_alpha_follow_through_does_not_exit_after_tp1_fill():
 
     assert result.should_exit is False
     assert result.reason == "tp1 already filled"
+
+
+def test_alpha_follow_through_does_not_market_exit_profitable_stall_before_tp():
+    result = evaluate_alpha_follow_through_exit(
+        enabled=True,
+        bars_held=3,
+        mfe_r=0.31,
+        mae_r=0.20,
+        tp1_filled=False,
+        follow_through_bars=3,
+        follow_through_min_mfe_r=0.35,
+        early_exit_max_mae_r=0.75,
+        current_r=0.18,
+        stall_exit_max_current_r=0.0,
+    )
+
+    assert result.should_exit is False
+    assert "hold profitable stall" in result.reason

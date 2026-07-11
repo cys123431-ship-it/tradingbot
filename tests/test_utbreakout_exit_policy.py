@@ -41,6 +41,21 @@ def test_time_stop_does_not_exit_after_tp1_filled():
     assert signal.should_exit is False
 
 
+def test_time_stop_does_not_exit_profitable_position_before_tp():
+    signal = evaluate_time_stop(
+        {
+            "timeframe": "15m",
+            "entry_bar_index": 0,
+            "tp1_filled": False,
+            "current_r": 0.10,
+        },
+        {"index": 8},
+        {"time_stop_enabled": True, "max_bars_to_tp1": 8},
+    )
+
+    assert signal.should_exit is False
+
+
 def test_signal_invalid_exit_detects_long_and_short_reversals():
     long_exit = evaluate_signal_invalid_exit(
         {"side": "long"},
