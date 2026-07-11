@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import socket
 import time
-from typing import IO
+from typing import IO, Any
 
 
 class ProcessLockError(RuntimeError):
@@ -26,12 +26,18 @@ class ProcessLock:
             if os.name == "nt":
                 import msvcrt
 
+                msvcrt_module: Any = msvcrt
+
                 handle.seek(0)
                 if handle.read(1) == "":
                     handle.write("0")
                     handle.flush()
                 handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                getattr(msvcrt_module, "locking")(
+                    handle.fileno(),
+                    getattr(msvcrt_module, "LK_NBLCK"),
+                    1,
+                )
             else:
                 import fcntl
 
@@ -62,8 +68,14 @@ class ProcessLock:
             if os.name == "nt":
                 import msvcrt
 
+                msvcrt_module: Any = msvcrt
+
                 self._file.seek(0)
-                msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
+                getattr(msvcrt_module, "locking")(
+                    self._file.fileno(),
+                    getattr(msvcrt_module, "LK_UNLCK"),
+                    1,
+                )
             else:
                 import fcntl
 

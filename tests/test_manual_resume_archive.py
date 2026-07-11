@@ -5,7 +5,7 @@ import pytest
 import emas
 
 
-def test_manual_resume_archives_pause_file(tmp_path, monkeypatch):
+def test_manual_resume_requests_reconciliation_without_archiving_pause(tmp_path, monkeypatch):
     runtime = tmp_path / "runtime"
     runtime.mkdir()
 
@@ -24,9 +24,8 @@ def test_manual_resume_archives_pause_file(tmp_path, monkeypatch):
         "I_CONFIRM_MANUAL_RISK_CHECK_DONE",
     )
 
-    assert result["status"] == "RESUMED"
-    assert not pause_file.exists()
-    assert Path(result["archived"]).exists()
+    assert result["status"] == "RESUME_REQUESTED"
+    assert pause_file.exists()
 
 
 def test_manual_resume_wrong_confirm_does_not_remove_pause_file(tmp_path, monkeypatch):

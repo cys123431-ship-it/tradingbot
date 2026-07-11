@@ -34,15 +34,35 @@ from datetime import datetime, timezone, timedelta
 from collections import Counter, deque
 from zoneinfo import ZoneInfo
 from trading_safety.order_gateway import IdempotentOrderGateway
+from trading_safety.execution_service import CryptoExecutionService
+from trading_safety.trade_accounting import (
+    TradeAccountingFinalizer,
+    rebuild_engine_performance_stats,
+)
 from trading_safety.order_state import (
+    ENTRY_BLOCKING_STATES,
     OrderState,
     SQLiteTradingStateStore,
     atomic_write_json,
 )
+from trading_safety.manual_resume import (
+    ManualResumeResult,
+    archive_critical_pause,
+    archive_processed_request,
+    load_manual_resume_request,
+    write_manual_resume_request,
+    write_manual_resume_result,
+)
 from trading_safety.reconciliation import reconcile_exchange_state
 from trading_safety.user_data_stream import BinanceUserDataStream
 from trading_safety.process_lock import ProcessLock, ProcessLockError
-from trading_safety.binance_algo_gateway import BinanceAlgoOrderGateway, CONDITIONAL_TYPES
+from trading_safety.binance_algo_gateway import (
+    AlgoLookupStatus,
+    BinanceAlgoOrderGateway,
+    CONDITIONAL_TYPES,
+    ProtectionOrderSnapshot,
+    ProtectionOrderLookupUnavailable,
+)
 from trading_safety.liquidation_guard import (
     as_decimal,
     estimate_isolated_liquidation_price,
@@ -3884,6 +3904,99 @@ class BaseEngine:
         self.running = False
         logger.info(f"??{self.__class__.__name__} stopped")
 
+    @property
+    def crypto_execution(self):
+        service = getattr(self.ctrl, 'crypto_execution_service', None)
+        if service is None:
+            gateway = _ensure_trading_safety_runtime(self)
+            service = getattr(self.ctrl, 'crypto_execution_service', None)
+            if service is None:
+                service = CryptoExecutionService(
+                    self.exchange,
+                    gateway.store,
+                    gateway,
+                    BinanceAlgoOrderGateway(self.exchange),
+                    accounting_service=TradeAccountingFinalizer(self.exchange, gateway.store),
+                )
+                self.ctrl.crypto_execution_service = service
+        return service
+
+    async def submit_futures_entry(self, **kwargs):
+        if self.is_upbit_mode():
+            raise RuntimeError("Futures execution service cannot route Upbit spot orders")
+        return await self.crypto_execution.submit_entry(**kwargs)
+
+    async def submit_futures_close(self, **kwargs):
+        if self.is_upbit_mode():
+            raise RuntimeError("Futures execution service cannot route Upbit spot orders")
+        return await self.crypto_execution.submit_reduce_only_close(**kwargs)
+
+    async def place_futures_protection(self, kind, **kwargs):
+        if self.is_upbit_mode():
+            raise RuntimeError("Futures execution service cannot route Upbit spot protection")
+        target = self
+        if not hasattr(target, '_create_protection_order_with_retries'):
+            target = getattr(self.ctrl, 'engines', {}).get('signal')
+        if target is None or not hasattr(target, '_create_protection_order_with_retries'):
+            raise RuntimeError("CRYPTO_PROTECTION_MANAGER_UNAVAILABLE")
+        service = self.crypto_execution
+
+        async def protection_manager(protection_kind, **payload):
+            symbol = payload['symbol']
+            side = payload['side']
+            qty = payload['qty']
+            trigger_price = payload.get('trigger_price')
+            order_type = payload.get('order_type') or (
+                'stop_market' if protection_kind == 'sl' else 'take_profit_market'
+            )
+            params = dict(payload.get('params') or {})
+            params['reduceOnly'] = True
+            if trigger_price is not None:
+                params['stopPrice'] = trigger_price
+            pos = payload.get('position')
+            if protection_kind == 'sl' and hasattr(target, '_verify_actual_liquidation_safety'):
+                position_side = 'long' if str(side).lower() == 'sell' else 'short'
+                safety = await target._verify_actual_liquidation_safety(
+                    symbol,
+                    position_side,
+                    trigger_price,
+                    pos,
+                    payload.get('config') or {},
+                    payload.get('entry_client_order_id'),
+                )
+                if not safety.get('valid'):
+                    raise RuntimeError(
+                        f"SL liquidation safety failed: {safety.get('status')}"
+                    )
+                pos = safety.get('position') or pos
+            if 'newClientOrderId' not in params and hasattr(target, '_build_protection_client_order_id'):
+                params['newClientOrderId'] = target._build_protection_client_order_id(
+                    symbol,
+                    'long' if str(side).lower() == 'sell' else 'short',
+                    protection_kind,
+                    pos,
+                    trigger_price=trigger_price or payload.get('price'),
+                    quantity=qty,
+                    leg=payload.get('label') or protection_kind,
+                    position_identity=payload.get('entry_client_order_id'),
+                )
+            return await target._create_protection_order_with_retries(
+                symbol,
+                order_type,
+                side,
+                qty,
+                payload.get('price'),
+                params,
+                payload.get('label') or protection_kind.upper(),
+            )
+
+        service.protection_manager = protection_manager
+        if str(kind).lower() == 'sl':
+            return await service.place_stop_loss(**kwargs)
+        if str(kind).lower() == 'tp':
+            return await service.place_take_profit(**kwargs)
+        return await service.cancel_protection(**kwargs)
+
     async def on_tick(self, data_type, data):
         pass
 
@@ -4829,10 +4942,28 @@ class TemaEngine(BaseEngine):
 
             params = {'leverage': leverage}
 
-            if side == 'long':
-                order = await asyncio.to_thread(self.exchange.create_market_buy_order, symbol, float(amount_str), params)
-            else:
-                order = await asyncio.to_thread(self.exchange.create_market_sell_order, symbol, float(amount_str), params)
+            signal_timestamp = _resolve_crypto_signal_timestamp(
+                self,
+                symbol,
+                {'entry_price': price, 'timeframe': common_cfg.get('timeframe', '1m')},
+            )
+            submission = await self.submit_futures_entry(
+                strategy='TEMA',
+                symbol=symbol,
+                side=side,
+                signal_timestamp=signal_timestamp,
+                qty=float(amount_str),
+                params=params,
+            )
+            if not submission.accepted:
+                raise RuntimeError(
+                    f"TEMA safe entry rejected: {submission.state} {submission.error}"
+                )
+            order = submission.order or {}
+            position = submission.position or await self.get_server_position(
+                symbol,
+                use_cache=False,
+            )
 
             await self.ctrl.notify(f"✅ **TEMA 진입**: {symbol} {side.upper()}\n가격: {price}\n수량: {amount_str}")
 
@@ -4861,25 +4992,47 @@ class TemaEngine(BaseEngine):
                             'stopPrice': self.safe_price(symbol, tp_price),
                             'reduceOnly': True
                         }
-                        if side == 'long':
-                            await asyncio.to_thread(self.exchange.create_order, symbol, 'TAKE_PROFIT_MARKET', 'sell', amount_str, None, params_tp)
-                        else:
-                            await asyncio.to_thread(self.exchange.create_order, symbol, 'TAKE_PROFIT_MARKET', 'buy', amount_str, None, params_tp)
+                        await self.place_futures_protection(
+                            'tp',
+                            symbol=symbol,
+                            side='sell' if side == 'long' else 'buy',
+                            qty=float(amount_str),
+                            trigger_price=params_tp['stopPrice'],
+                            order_type='take_profit_market',
+                            label='TP',
+                            position=position,
+                            entry_client_order_id=submission.client_order_id,
+                            config=common_cfg,
+                        )
 
                     if sl_enabled:
                         params_sl = {
                             'stopPrice': self.safe_price(symbol, sl_price),
                             'reduceOnly': True
                         }
-                        if side == 'long':
-                            await asyncio.to_thread(self.exchange.create_order, symbol, 'STOP_MARKET', 'sell', amount_str, None, params_sl)
-                        else:
-                            await asyncio.to_thread(self.exchange.create_order, symbol, 'STOP_MARKET', 'buy', amount_str, None, params_sl)
+                        await self.place_futures_protection(
+                            'sl',
+                            symbol=symbol,
+                            side='sell' if side == 'long' else 'buy',
+                            qty=float(amount_str),
+                            trigger_price=params_sl['stopPrice'],
+                            order_type='stop_market',
+                            label='SL',
+                            position=position,
+                            entry_client_order_id=submission.client_order_id,
+                            config=common_cfg,
+                        )
 
                     logger.info(f"??Protective orders placed: TP={'ON' if tp_enabled else 'OFF'}, SL={'ON' if sl_enabled else 'OFF'}")
                 except Exception as e:
                     logger.error(f"Failed to place TP/SL order: {e}")
                     await self.ctrl.notify(f"⚠️ TP/SL 주문 실패: {e}")
+                    signal_engine = getattr(self.ctrl, 'engines', {}).get('signal')
+                    if signal_engine is not None:
+                        await signal_engine._emergency_close_position_without_stop_loss(
+                            symbol,
+                            reason=f'TEMA protection placement failed: {e}',
+                        )
 
         except Exception as e:
             logger.error(f"TEMA entry failed: {e}")
@@ -5122,10 +5275,17 @@ class TemaEngine(BaseEngine):
 
             amount = abs(float(pos.get('contracts', 0) or 0))
             pos_side = str(pos.get('side', '')).lower()
-            side = 'sell' if pos_side == 'long' else 'buy'
 
             if amount > 0:
-                await asyncio.to_thread(self.exchange.create_market_order, symbol, side, amount)
+                await self.submit_futures_close(
+                    strategy='TEMA',
+                    symbol=symbol,
+                    position_side=pos_side,
+                    position_signature=pos.get('timestamp') or pos.get('entryPrice'),
+                    qty=amount,
+                    reason=reason,
+                    order_purpose=f'close_{str(reason).lower().replace(" ", "_")}',
+                )
                 await self.ctrl.notify(f"🔄 **TEMA 청산**: {symbol} ({reason})")
         except Exception as e:
             logger.error(f"TEMA exit failed: {e}")
@@ -5274,7 +5434,12 @@ class SignalEngine(BaseEngine):
         if store is not None:
             store.set_runtime_state('entry_lock_reason', self.crypto_entry_lock_reason)
 
-    async def _reconcile_crypto_exchange_state(self):
+    async def _reconcile_crypto_exchange_state(
+        self,
+        *,
+        user_stream_ready=False,
+        require_user_stream=False,
+    ):
         _ensure_trading_safety_runtime(self)
         common = self.get_runtime_common_settings() if hasattr(self, 'get_runtime_common_settings') else {}
         result = await reconcile_exchange_state(
@@ -5282,6 +5447,8 @@ class SignalEngine(BaseEngine):
             self.trading_state_store,
             single_position=bool(common.get('single_position_mode', True)),
             liquidation_config=common,
+            user_stream_ready=bool(user_stream_ready),
+            require_user_stream=bool(require_user_stream),
         )
         self.last_crypto_reconciliation = result.__dict__
         critical_pause = load_critical_pause_state()
@@ -5308,9 +5475,24 @@ class SignalEngine(BaseEngine):
     async def _startup_crypto_safety_reconciliation(self):
         self._set_crypto_entry_lock('RECONCILIATION_REQUIRED')
         try:
-            await self._reconcile_crypto_exchange_state()
+            common = self.get_runtime_common_settings() if hasattr(self, 'get_runtime_common_settings') else {}
+            stream_required = bool(
+                common.get('user_data_stream_enabled', True)
+                and not self.is_upbit_mode()
+            )
+            await self._reconcile_crypto_exchange_state(
+                user_stream_ready=False,
+                require_user_stream=False,
+            )
+            if stream_required:
+                self._set_crypto_entry_lock('USER_STREAM_CONNECTING')
             await self._recover_open_utbreakout_positions_on_start()
-            final = await self._reconcile_crypto_exchange_state()
+            final = await self._reconcile_crypto_exchange_state(
+                user_stream_ready=False,
+                require_user_stream=False,
+            )
+            if stream_required:
+                self._set_crypto_entry_lock('USER_STREAM_CONNECTING')
             if not final.safe_to_trade:
                 if getattr(self, 'ctrl', None) is not None:
                     await self.ctrl.notify(
@@ -5318,11 +5500,13 @@ class SignalEngine(BaseEngine):
                         + '; '.join(final.issues[:5])
                     )
                 return
-            common = self.get_runtime_common_settings() if hasattr(self, 'get_runtime_common_settings') else {}
-            if bool(common.get('user_data_stream_enabled', True)) and not self.is_upbit_mode():
+            if stream_required:
                 self._set_crypto_entry_lock('USER_STREAM_CONNECTING')
                 async def _stream_reconcile():
-                    refreshed = await self._reconcile_crypto_exchange_state()
+                    refreshed = await self._reconcile_crypto_exchange_state(
+                        user_stream_ready=True,
+                        require_user_stream=True,
+                    )
                     return bool(refreshed.safe_to_trade)
 
                 self.user_data_stream = BinanceUserDataStream(
@@ -16004,7 +16188,6 @@ class SignalEngine(BaseEngine):
             'auto_selected_set_family': selected_set.get('family'),
             'auto_selected_set_status': selected_set.get('status'),
             'auto_selection_reason': auto_reason,
-            'auto_stable_selection_detail': selected_set.get('_stable_selection_detail'),
             'auto_scores': (auto_analysis or {}).get('scores') if isinstance(auto_analysis, dict) else None,
             'set_filters': list(selected_set.get('entry_filters') or []),
             'utbot_key_value': cfg.get('utbot_key_value'),
@@ -27273,7 +27456,7 @@ class SignalEngine(BaseEngine):
             unit = tf[-1]
             value = int(tf[:-1])
             return value * multipliers.get(unit, 0)
-        except:
+        except (TypeError, ValueError, IndexError):
             return 0
 
     def _timeframes_equivalent(self, tf_a, tf_b):
@@ -32463,30 +32646,73 @@ class SignalEngine(BaseEngine):
                 continue
         return 0
 
-    def _build_protection_client_order_id(self, symbol, side, kind, pos=None):
-        kind_part = re.sub(r'[^a-zA-Z0-9]', '', str(kind or '').lower())[:4] or 'xx'
+    def _build_protection_client_order_id(
+        self,
+        symbol,
+        side,
+        kind,
+        pos=None,
+        *,
+        trigger_price=None,
+        quantity=None,
+        leg=None,
+        position_identity=None,
+    ):
+        kind_full = re.sub(r'[^a-zA-Z0-9]', '', str(kind or '').lower()) or 'unknown'
+        leg_full = re.sub(r'[^a-zA-Z0-9]', '', str(leg or kind_full).lower()) or kind_full
+        try:
+            normalized_trigger = self.safe_price(symbol, trigger_price) if trigger_price is not None else 'none'
+        except (TypeError, ValueError):
+            normalized_trigger = str(trigger_price or 'none')
+        if quantity is None and isinstance(pos, dict):
+            quantity = abs(float(self._position_signed_contracts(pos) or pos.get('contracts', 0) or 0))
+        try:
+            normalized_qty = self.safe_amount(symbol, quantity) if quantity is not None else 'none'
+        except (TypeError, ValueError):
+            normalized_qty = str(quantity or 'none')
+        stable_position_identity = str(position_identity or '')
+        if not stable_position_identity and isinstance(pos, dict):
+            stable_position_identity = str(
+                pos.get('entry_client_order_id')
+                or pos.get('clientOrderId')
+                or pos.get('client_order_id')
+                or pos.get('timestamp')
+                or pos.get('datetime')
+                or self._protection_position_signature(pos)
+            )
         raw = "|".join([
             self._normalize_protection_symbol(symbol),
             str(side or '').lower(),
-            kind_part,
-            self._protection_position_signature(pos),
-            str(int(time.time() * 1000)),
+            kind_full,
+            leg_full,
+            stable_position_identity or self._protection_position_signature(pos),
+            str(normalized_trigger),
+            str(normalized_qty),
         ])
-        digest = hashlib.sha1(raw.encode('utf-8')).hexdigest()[:10]
+        digest = hashlib.sha256(raw.encode('utf-8')).hexdigest()[:12]
         symbol_part = self._normalize_protection_symbol(symbol)[-8:] or 'SYMBOL'
-        return f"utb{kind_part}{symbol_part}{digest}"[:36]
+        prefix = f"utb{kind_full[:3]}{leg_full[:3]}{symbol_part}"
+        return f"{prefix}{digest}"[:36]
 
     async def _collect_protection_orders(self, symbol):
-        _, orders = await self._collect_protection_orders_checked(symbol)
-        return orders
+        snapshot = await self._collect_protection_order_snapshot(symbol)
+        if not snapshot.complete:
+            raise ProtectionOrderLookupUnavailable('; '.join(snapshot.errors))
+        return list(snapshot.orders)
 
     async def _collect_protection_orders_checked(self, symbol):
+        snapshot = await self._collect_protection_order_snapshot(symbol)
+        return snapshot.complete, list(snapshot.orders)
+
+    async def _collect_protection_order_snapshot(self, symbol):
         merged = []
         seen = set()
         regular_fetch_ok = False
+        errors = []
         for scope in (symbol, None):
             open_orders = await self._fetch_open_orders_safe(scope)
             if open_orders is None:
+                errors.append(f"regular_open_orders_failed:{scope or 'all'}")
                 continue
             regular_fetch_ok = True
             for order in open_orders or []:
@@ -32502,30 +32728,35 @@ class SignalEngine(BaseEngine):
                     continue
                 seen.add(key)
                 merged.append(order)
-
-        algo_supported = callable(getattr(self.exchange, 'fapiPrivateGetOpenAlgoOrders', None))
-        algo_fetch_ok = not algo_supported
-        if algo_supported:
-            for scope in (symbol, None):
-                algo_orders = await self._fetch_binance_algo_orders_safe(scope)
-                if algo_orders is None:
-                    continue
-                algo_fetch_ok = True
-                for order in algo_orders:
-                    if not self._protection_order_matches_symbol(order, symbol):
-                        continue
-                    if not self._is_protection_order(order):
-                        continue
-                    key = (
-                        str(order.get('_protection_source') or 'binance_algo'),
-                        self._protection_order_id(order) or str(id(order)),
-                    )
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    merged.append(order)
+            if open_orders or scope is None:
                 break
-        return bool(regular_fetch_ok and algo_fetch_ok), merged
+
+        is_binance = str(getattr(self.exchange, 'id', '') or '').lower() in {'binance', 'binanceusdm'}
+        algo_fetch_ok = not is_binance
+        if is_binance:
+            algo_snapshot = await BinanceAlgoOrderGateway(self.exchange).fetch_open_orders()
+            algo_fetch_ok = algo_snapshot.ok
+            if not algo_snapshot.ok:
+                errors.append(algo_snapshot.error or 'algo_open_orders_failed')
+            for order in algo_snapshot.orders:
+                if not self._protection_order_matches_symbol(order, symbol):
+                    continue
+                if not self._is_protection_order(order):
+                    continue
+                key = (
+                    str(order.get('_protection_source') or 'binance_algo'),
+                    self._protection_order_id(order) or str(id(order)),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(order)
+        return ProtectionOrderSnapshot(
+            regular_orders_ok=regular_fetch_ok,
+            algo_orders_ok=algo_fetch_ok,
+            orders=tuple(merged),
+            errors=tuple(errors),
+        )
 
     async def _cancel_single_protection_order(self, symbol, order, reason='protection cleanup'):
         order_id = self._protection_order_id(order)
@@ -33639,7 +33870,9 @@ class SignalEngine(BaseEngine):
                 return None
             fetch_ok, open_orders = await self._collect_protection_orders_checked(symbol)
             if not fetch_ok:
-                return None
+                reason = f"ALGO_ORDER_SNAPSHOT_UNAVAILABLE:{symbol}"
+                self._set_crypto_entry_lock(reason)
+                raise ProtectionOrderLookupUnavailable(reason)
             existing = next(
                 (
                     order for order in (open_orders or [])
@@ -33650,7 +33883,21 @@ class SignalEngine(BaseEngine):
             if existing is not None:
                 return existing
             if algo_gateway is not None:
-                return await algo_gateway.fetch_by_client_id(client_order_id)
+                lookup = await algo_gateway.fetch_by_client_id(client_order_id)
+                if lookup.status == AlgoLookupStatus.FOUND:
+                    return lookup.order
+                if lookup.status == AlgoLookupStatus.UNKNOWN:
+                    reason = f"ALGO_ORDER_LOOKUP_UNKNOWN:{symbol}:{lookup.error}"
+                    self._set_crypto_entry_lock(reason)
+                    if getattr(self, 'ctrl', None) is not None:
+                        try:
+                            await self.ctrl.notify(
+                                f"CRITICAL: {symbol} protection order lookup unavailable. "
+                                "New protection submission and entries are locked pending reconciliation."
+                            )
+                        except Exception:
+                            logger.exception("Protection lookup warning notification failed")
+                    raise ProtectionOrderLookupUnavailable(reason)
             return None
 
         for attempt in range(1, total_attempts + 1):
@@ -33769,8 +34016,8 @@ class SignalEngine(BaseEngine):
 
             try:
                 status['attempts'] = attempt
-                gateway = _ensure_trading_safety_runtime(self)
-                close_submission = await gateway.submit_reduce_only_close(
+                _ensure_trading_safety_runtime(self)
+                close_submission = await self.crypto_execution.submit_reduce_only_close(
                     strategy='EMERGENCY_PROTECTION_CLOSE',
                     symbol=symbol,
                     position_side=side,
@@ -34051,7 +34298,21 @@ class SignalEngine(BaseEngine):
             {
                 'stopPrice': safe_stop,
                 'reduceOnly': True,
-                'newClientOrderId': self._build_protection_client_order_id(symbol, side, 'sl', pos)
+                'newClientOrderId': self._build_protection_client_order_id(
+                    symbol,
+                    side,
+                    'sl',
+                    pos,
+                    trigger_price=safe_stop,
+                    quantity=qty,
+                    leg='sl',
+                    position_identity=(
+                        pos.get('entry_client_order_id')
+                        or pos.get('clientOrderId')
+                        or pos.get('timestamp')
+                        or self._protection_position_signature(pos)
+                    ),
+                )
             },
             'SL',
             max_attempts=3
@@ -35021,9 +35282,9 @@ class SignalEngine(BaseEngine):
                 'status': 'BLOCKED',
                 'reason': liquidation_preflight.get('reason') or liquidation_preflight.get('status'),
             }
-        gateway = _ensure_trading_safety_runtime(self)
+        _ensure_trading_safety_runtime(self)
         add_stage = int(meta.get('pyramid_add_count', 0) or 0) + 1
-        add_submission = await gateway.submit_position_add(
+        add_submission = await self.crypto_execution.submit_position_add(
             strategy='AGGRESSIVE_GROWTH_PYRAMID',
             symbol=symbol,
             side='long',
@@ -35463,7 +35724,21 @@ class SignalEngine(BaseEngine):
                             {
                                 'stopPrice': sl_price,
                                 'reduceOnly': True,
-                                'newClientOrderId': self._build_protection_client_order_id(symbol, side, 'sl', pos)
+                                'newClientOrderId': self._build_protection_client_order_id(
+                                    symbol,
+                                    side,
+                                    'sl',
+                                    pos,
+                                    trigger_price=sl_price,
+                                    quantity=sl_qty,
+                                    leg='sl',
+                                    position_identity=(
+                                        pos.get('entry_client_order_id')
+                                        or pos.get('clientOrderId')
+                                        or pos.get('timestamp')
+                                        or self._protection_position_signature(pos)
+                                    ),
+                                )
                             },
                             'SL',
                             max_attempts=sl_max_attempts,
@@ -35531,7 +35806,16 @@ class SignalEngine(BaseEngine):
                             symbol,
                             side,
                             target.get('kind') or 'tp',
-                            pos
+                            pos,
+                            trigger_price=target_price,
+                            quantity=target_qty,
+                            leg=target_label,
+                            position_identity=(
+                                pos.get('entry_client_order_id')
+                                or pos.get('clientOrderId')
+                                or pos.get('timestamp')
+                                or self._protection_position_signature(pos)
+                            ),
                         )
                     }
                     if order_type == 'take_profit_market':
@@ -35690,8 +35974,8 @@ class SignalEngine(BaseEngine):
                     f"Exit params attempt {attempt}/{max_retries}: "
                     f"{side} {qty} (position: {remaining_pos['side']} {remaining_contracts})"
                 )
-                gateway = _ensure_trading_safety_runtime(self)
-                close_submission = await gateway.submit_reduce_only_close(
+                _ensure_trading_safety_runtime(self)
+                close_submission = await self.crypto_execution.submit_reduce_only_close(
                     strategy='SIGNAL_ENGINE_EXIT',
                     symbol=symbol,
                     position_side=str(remaining_pos.get('side') or ''),
@@ -36058,8 +36342,14 @@ class ShannonEngine(BaseEngine):
 
                     if self.trend_direction == 'long':
                         # 200 EMA ????濡?吏꾩엯
-                        order = await asyncio.to_thread(
-                            self.exchange.create_order, symbol, 'market', 'buy', entry_qty
+                        order = await self.submit_futures_entry(
+                            strategy='SHANNON',
+                            symbol=symbol,
+                            side='long',
+                            signal_timestamp=_resolve_crypto_signal_timestamp(
+                                self, symbol, {'entry_price': price}
+                            ),
+                            qty=float(entry_qty),
                         )
                         self.position_cache = None
                         self.position_cache_time = 0
@@ -36070,8 +36360,14 @@ class ShannonEngine(BaseEngine):
 
                     elif self.trend_direction == 'short':
                         # 200 EMA ?꾨옒 ????吏꾩엯
-                        order = await asyncio.to_thread(
-                            self.exchange.create_order, symbol, 'market', 'sell', entry_qty
+                        order = await self.submit_futures_entry(
+                            strategy='SHANNON',
+                            symbol=symbol,
+                            side='short',
+                            signal_timestamp=_resolve_crypto_signal_timestamp(
+                                self, symbol, {'entry_price': price}
+                            ),
+                            qty=float(entry_qty),
                         )
                         self.position_cache = None
                         self.position_cache_time = 0
@@ -36114,8 +36410,13 @@ class ShannonEngine(BaseEngine):
                         # ?ъ???怨쇰떎 ???쇰? 泥?궛 (留ㅻ룄)
                         reduce_qty = self.safe_amount(symbol, (contracts - target_contracts) * dd_multiplier)
                         if float(reduce_qty) > 0:
-                            order = await asyncio.to_thread(
-                                self.exchange.create_order, symbol, 'market', 'sell', reduce_qty
+                            order = await self.submit_futures_close(
+                                strategy='SHANNON_REBALANCE',
+                                symbol=symbol,
+                                position_side='long',
+                                position_signature=pos.get('timestamp') or pos.get('entryPrice'),
+                                qty=float(reduce_qty),
+                                reason='rebalance_reduce',
                             )
                             self.position_cache = None
                             self.position_cache_time = 0
@@ -36126,8 +36427,15 @@ class ShannonEngine(BaseEngine):
                         if self.trend_direction == 'long':
                             add_qty = self.safe_amount(symbol, (target_contracts - contracts) * dd_multiplier)
                             if float(add_qty) > 0:
-                                order = await asyncio.to_thread(
-                                    self.exchange.create_order, symbol, 'market', 'buy', add_qty
+                                order = await self.crypto_execution.submit_position_add(
+                                    strategy='SHANNON_REBALANCE',
+                                    symbol=symbol,
+                                    side='long',
+                                    signal_timestamp=_resolve_crypto_signal_timestamp(
+                                        self, symbol, {'entry_price': price}
+                                    ),
+                                    qty=float(add_qty),
+                                    stage='rebalance_long',
                                 )
                                 self.position_cache = None
                                 self.position_cache_time = 0
@@ -36141,8 +36449,13 @@ class ShannonEngine(BaseEngine):
                         # ??怨쇰떎 ???쇰? 泥?궛 (留ㅼ닔濡?而ㅻ쾭)
                         reduce_qty = self.safe_amount(symbol, (contracts - target_contracts) * dd_multiplier)
                         if float(reduce_qty) > 0:
-                            order = await asyncio.to_thread(
-                                self.exchange.create_order, symbol, 'market', 'buy', reduce_qty
+                            order = await self.submit_futures_close(
+                                strategy='SHANNON_REBALANCE',
+                                symbol=symbol,
+                                position_side='short',
+                                position_signature=pos.get('timestamp') or pos.get('entryPrice'),
+                                qty=float(reduce_qty),
+                                reason='rebalance_reduce',
                             )
                             self.position_cache = None
                             self.position_cache_time = 0
@@ -36153,8 +36466,15 @@ class ShannonEngine(BaseEngine):
                         if self.trend_direction == 'short':
                             add_qty = self.safe_amount(symbol, (target_contracts - contracts) * dd_multiplier)
                             if float(add_qty) > 0:
-                                order = await asyncio.to_thread(
-                                    self.exchange.create_order, symbol, 'market', 'sell', add_qty
+                                order = await self.crypto_execution.submit_position_add(
+                                    strategy='SHANNON_REBALANCE',
+                                    symbol=symbol,
+                                    side='short',
+                                    signal_timestamp=_resolve_crypto_signal_timestamp(
+                                        self, symbol, {'entry_price': price}
+                                    ),
+                                    qty=float(add_qty),
+                                    stage='rebalance_short',
                                 )
                                 self.position_cache = None
                                 self.position_cache_time = 0
@@ -36177,10 +36497,17 @@ class ShannonEngine(BaseEngine):
                (d_mode == 'short' and new_direction == 'long'):
                 # 諛⑺뼢 ?꾪꽣???섑빐 ?ъ쭊??遺덇? ??泥?궛留?
                 close_qty = self.safe_amount(symbol, abs(float(pos['contracts'])))
-                close_side = 'sell' if pos['side'] == 'long' else 'buy'
-                await asyncio.to_thread(
-                    self.exchange.create_order, symbol, 'market', close_side, close_qty
+                close_result = await self.submit_futures_close(
+                    strategy='SHANNON_REVERSE',
+                    symbol=symbol,
+                    position_side=pos['side'],
+                    position_signature=pos.get('timestamp') or pos.get('entryPrice'),
+                    qty=float(close_qty),
+                    reason='direction_filter_close',
                 )
+                if close_result.state != OrderState.CLOSED.value:
+                    logger.warning("Shannon close not confirmed; reverse entry blocked")
+                    return
                 pnl = float(pos.get('unrealizedPnl', 0))
                 await self.ctrl.notify(f"🔄 [Shannon] {pos['side'].upper()} 청산 (방향 필터) PnL: {pnl:+.2f}")
                 self.position_cache = None
@@ -36189,11 +36516,18 @@ class ShannonEngine(BaseEngine):
 
             # 湲곗〈 ?ъ???泥?궛
             close_qty = self.safe_amount(symbol, abs(float(pos['contracts'])))
-            close_side = 'sell' if pos['side'] == 'long' else 'buy'
 
-            await asyncio.to_thread(
-                self.exchange.create_order, symbol, 'market', close_side, close_qty
+            close_result = await self.submit_futures_close(
+                strategy='SHANNON_REVERSE',
+                symbol=symbol,
+                position_side=pos['side'],
+                position_signature=pos.get('timestamp') or pos.get('entryPrice'),
+                qty=float(close_qty),
+                reason='trend_reverse_close',
             )
+            if close_result.state != OrderState.CLOSED.value:
+                logger.warning("Shannon reverse blocked until close is confirmed CLOSED")
+                return
 
             pnl = float(pos.get('unrealizedPnl', 0))
             await self.ctrl.notify(f"🔄 [Shannon] {pos['side'].upper()} 청산 (추세 반전) PnL: {pnl:+.2f}")
@@ -36204,11 +36538,16 @@ class ShannonEngine(BaseEngine):
             # 諛섎? 諛⑺뼢 ???ъ???吏꾩엯
             target_value = total * self.ratio * dd_multiplier
             entry_qty = self.safe_amount(symbol, target_value / price)
-            entry_side = 'buy' if new_direction == 'long' else 'sell'
 
             if float(entry_qty) > 0:
-                await asyncio.to_thread(
-                    self.exchange.create_order, symbol, 'market', entry_side, entry_qty
+                await self.submit_futures_entry(
+                    strategy='SHANNON_REVERSE',
+                    symbol=symbol,
+                    side=new_direction,
+                    signal_timestamp=_resolve_crypto_signal_timestamp(
+                        self, symbol, {'entry_price': price}
+                    ),
+                    qty=float(entry_qty),
                 )
                 self.position_cache = None
                 self.position_cache_time = 0
@@ -36321,10 +36660,32 @@ class ShannonEngine(BaseEngine):
                     # 留ㅼ닔 二쇰Ц (異붿꽭 ?꾪꽣 ?곸슜)
                     if allow_buy and not buy_exists and float(buy_qty) > 0:
                         try:
-                            await asyncio.to_thread(
-                                self.exchange.create_order, symbol, 'limit', 'buy',
-                                buy_qty, self.safe_price(symbol, buy_price)
-                            )
+                            if has_short_position:
+                                await self.submit_futures_close(
+                                    strategy='SHANNON_GRID',
+                                    symbol=symbol,
+                                    position_side='short',
+                                    position_signature=pos.get('timestamp') or pos.get('entryPrice'),
+                                    qty=float(buy_qty),
+                                    reason=f'grid_exit_{i}',
+                                    order_intent='GRID_EXIT',
+                                    order_type='limit',
+                                    price=float(self.safe_price(symbol, buy_price)),
+                                    leg=f'buy_{i:02d}',
+                                )
+                            else:
+                                await self.crypto_execution.submit_limit_entry(
+                                    strategy='SHANNON_GRID',
+                                    symbol=symbol,
+                                    side='long',
+                                    signal_timestamp=_resolve_crypto_signal_timestamp(
+                                        self, symbol, {'entry_price': price}
+                                    ),
+                                    grid_leg=f'buy_{i:02d}',
+                                    qty=float(buy_qty),
+                                    price=float(self.safe_price(symbol, buy_price)),
+                                    position_add=bool(has_long_position),
+                                )
                             logger.info(f"Grid BUY: {buy_qty} @ {buy_price:.2f} (ATR step: {step_pct*100:.2f}%)")
                         except Exception as e:
                             logger.error(f"Grid buy order error: {e}")
@@ -36332,10 +36693,32 @@ class ShannonEngine(BaseEngine):
                     # 留ㅻ룄 二쇰Ц (異붿꽭 ?꾪꽣 + ?ъ???泥댄겕 ?곸슜)
                     if allow_sell and not sell_exists and float(sell_qty) > 0:
                         try:
-                            await asyncio.to_thread(
-                                self.exchange.create_order, symbol, 'limit', 'sell',
-                                sell_qty, self.safe_price(symbol, sell_price)
-                            )
+                            if has_long_position:
+                                await self.submit_futures_close(
+                                    strategy='SHANNON_GRID',
+                                    symbol=symbol,
+                                    position_side='long',
+                                    position_signature=pos.get('timestamp') or pos.get('entryPrice'),
+                                    qty=float(sell_qty),
+                                    reason=f'grid_exit_{i}',
+                                    order_intent='GRID_EXIT',
+                                    order_type='limit',
+                                    price=float(self.safe_price(symbol, sell_price)),
+                                    leg=f'sell_{i:02d}',
+                                )
+                            else:
+                                await self.crypto_execution.submit_limit_entry(
+                                    strategy='SHANNON_GRID',
+                                    symbol=symbol,
+                                    side='short',
+                                    signal_timestamp=_resolve_crypto_signal_timestamp(
+                                        self, symbol, {'entry_price': price}
+                                    ),
+                                    grid_leg=f'sell_{i:02d}',
+                                    qty=float(sell_qty),
+                                    price=float(self.safe_price(symbol, sell_price)),
+                                    position_add=bool(has_short_position),
+                                )
                             logger.info(f"Grid SELL: {sell_qty} @ {sell_price:.2f} (ATR step: {step_pct*100:.2f}%)")
                         except Exception as e:
                             logger.error(f"Grid sell order error: {e}")
@@ -36552,9 +36935,14 @@ class DualThrustEngine(BaseEngine):
                 logger.warning(f"[DualThrust] Invalid qty: {qty}")
                 return
 
-            order = await asyncio.to_thread(
-                self.exchange.create_order, symbol, 'market',
-                'buy' if side == 'long' else 'sell', qty
+            order = await self.submit_futures_entry(
+                strategy='DUAL_THRUST',
+                symbol=symbol,
+                side=side,
+                signal_timestamp=_resolve_crypto_signal_timestamp(
+                    self, symbol, {'entry_price': price}
+                ),
+                qty=float(qty),
             )
 
             self.position_cache = None
@@ -36580,13 +36968,20 @@ class DualThrustEngine(BaseEngine):
 
             # 湲곗〈 ?ъ???泥?궛
             close_qty = self.safe_amount(symbol, abs(float(pos['contracts'])))
-            close_side = 'sell' if pos['side'] == 'long' else 'buy'
 
             pnl = float(pos.get('unrealizedPnl', 0))
 
-            await asyncio.to_thread(
-                self.exchange.create_order, symbol, 'market', close_side, close_qty
+            close_result = await self.submit_futures_close(
+                strategy='DUAL_THRUST',
+                symbol=symbol,
+                position_side=pos['side'],
+                position_signature=pos.get('timestamp') or pos.get('entryPrice'),
+                qty=float(close_qty),
+                reason='switch_close',
             )
+            if close_result.state != OrderState.CLOSED.value:
+                logger.warning("DualThrust switch blocked until prior position is CLOSED")
+                return
 
             self.db.log_trade_close(symbol, pnl, float(pos.get('percentage', 0)), price, "Switch")
             await self.ctrl.notify(f"🔄 [DualThrust] {pos['side'].upper()} 청산 -> {new_side.upper()} 전환 | PnL: {pnl:+.2f}")
@@ -36613,10 +37008,14 @@ class DualThrustEngine(BaseEngine):
                 return
 
             qty = self.safe_amount(symbol, contracts)
-            side = 'sell' if pos['side'] == 'long' else 'buy'
 
-            order = await asyncio.to_thread(
-                self.exchange.create_order, symbol, 'market', side, qty
+            order = await self.submit_futures_close(
+                strategy='DUAL_THRUST',
+                symbol=symbol,
+                position_side=pos['side'],
+                position_signature=pos.get('timestamp') or pos.get('entryPrice'),
+                qty=float(qty),
+                reason=reason,
             )
 
             pnl = float(pos.get('unrealizedPnl', 0))
@@ -36775,13 +37174,26 @@ class DualModeFractalEngine(BaseEngine):
         qty = self.safe_amount(symbol, (cost * lev) / price)
 
         if float(qty) > 0:
-            actual_side = 'buy' if side == 'long' else 'sell'
-
             # 1. 吏꾩엯 二쇰Ц
-            order = await asyncio.to_thread(
-                self.exchange.create_order, symbol, 'market', actual_side, qty
+            submission = await self.submit_futures_entry(
+                strategy='DUAL_MODE_FRACTAL',
+                symbol=symbol,
+                side=side,
+                signal_timestamp=_resolve_crypto_signal_timestamp(
+                    self, symbol, {'entry_price': price}
+                ),
+                qty=float(qty),
             )
-            entry_price = float(order.get('average', price))
+            if not submission.accepted:
+                raise RuntimeError(
+                    f"DualMode safe entry rejected: {submission.state} {submission.error}"
+                )
+            order = submission.order or {}
+            position = submission.position or await self.get_server_position(
+                symbol,
+                use_cache=False,
+            )
+            entry_price = float(order.get('average') or price)
             self.position_cache = None
             self.db.log_trade_entry(symbol, side, entry_price, float(qty))
 
@@ -36803,56 +37215,65 @@ class DualModeFractalEngine(BaseEngine):
                     if side == 'long':
                         if tp_pct > 0:
                             tp_price = entry_price * (1 + tp_pct / 100 / lev)
-                            await asyncio.to_thread(
-                                self.exchange.create_order,
-                                symbol,
-                                'limit',
-                                'sell',
-                                qty,
-                                tp_price,
-                                {'reduceOnly': True}
+                            await self.place_futures_protection(
+                                'tp', symbol=symbol, side='sell', qty=float(qty),
+                                price=tp_price, order_type='limit', label='TP',
+                                position=position,
+                                entry_client_order_id=submission.client_order_id,
+                                config=common_cfg,
                             )
                             msg += f" | TP: {tp_price:.2f}"
                         if sl_pct > 0:
                             sl_price = entry_price * (1 - sl_pct / 100 / lev)
-                            await asyncio.to_thread(
-                                self.exchange.create_order,
-                                symbol,
-                                'stop_market',
-                                'sell',
-                                qty,
-                                None,
-                                {'stopPrice': sl_price, 'reduceOnly': True}
+                            await self.place_futures_protection(
+                                'sl', symbol=symbol, side='sell', qty=float(qty),
+                                trigger_price=sl_price, order_type='stop_market', label='SL',
+                                position=position,
+                                entry_client_order_id=submission.client_order_id,
+                                config=common_cfg,
                             )
                             msg += f" | SL: {sl_price:.2f}"
                     else: # short
                         if tp_pct > 0:
                             tp_price = entry_price * (1 - tp_pct / 100 / lev)
-                            await asyncio.to_thread(
-                                self.exchange.create_order,
-                                symbol,
-                                'limit',
-                                'buy',
-                                qty,
-                                tp_price,
-                                {'reduceOnly': True}
+                            await self.place_futures_protection(
+                                'tp', symbol=symbol, side='buy', qty=float(qty),
+                                price=tp_price, order_type='limit', label='TP',
+                                position=position,
+                                entry_client_order_id=submission.client_order_id,
+                                config=common_cfg,
                             )
                             msg += f" | TP: {tp_price:.2f}"
                         if sl_pct > 0:
                             sl_price = entry_price * (1 + sl_pct / 100 / lev)
-                            await asyncio.to_thread(
-                                self.exchange.create_order,
-                                symbol,
-                                'stop_market',
-                                'buy',
-                                qty,
-                                None,
-                                {'stopPrice': sl_price, 'reduceOnly': True}
+                            await self.place_futures_protection(
+                                'sl', symbol=symbol, side='buy', qty=float(qty),
+                                trigger_price=sl_price, order_type='stop_market', label='SL',
+                                position=position,
+                                entry_client_order_id=submission.client_order_id,
+                                config=common_cfg,
                             )
                             msg += f" | SL: {sl_price:.2f}"
                 except Exception as e:
                     logger.error(f"TP/SL Order Failed: {e}")
                     msg += " | ⚠️ TP/SL 오류"
+                    safety_engine = self.ctrl.engines.get(CORE_ENGINE)
+                    if safety_engine and hasattr(
+                        safety_engine,
+                        '_emergency_close_position_without_stop_loss',
+                    ):
+                        await safety_engine._emergency_close_position_without_stop_loss(
+                            symbol,
+                            reason=f'DualMode TP/SL protection placement failed: {e}',
+                            max_attempts=5,
+                            lockout_reason='TAKE_PROFIT_PROTECTION_FAILED_FORCE_CLOSED',
+                            protection_label='TP/SL',
+                            critical_pause_reason_code='TP_SL_FAILED_AND_EMERGENCY_CLOSE_FAILED',
+                        )
+                    else:
+                        raise RuntimeError(
+                            'DualMode protection failed and emergency close service is unavailable'
+                        ) from e
 
             await self.ctrl.notify(msg)
 
@@ -36860,14 +37281,28 @@ class DualModeFractalEngine(BaseEngine):
         pos = await self.get_server_position(symbol)
         if pos:
             qty = self.safe_amount(symbol, abs(float(pos['contracts'])))
-            side = 'sell' if pos['side'] == 'long' else 'buy'
-            await asyncio.to_thread(
-                self.exchange.create_order, symbol, 'market', side, qty
+            close_result = await self.submit_futures_close(
+                strategy='DUAL_MODE_FRACTAL',
+                symbol=symbol,
+                position_side=pos['side'],
+                position_signature=(
+                    pos.get('timestamp')
+                    or pos.get('entryPrice')
+                    or f"{pos['side']}:{qty}"
+                ),
+                qty=float(qty),
+                reason=reason,
             )
+            if close_result.state != OrderState.CLOSED.value:
+                raise RuntimeError(
+                    f"DualMode close not confirmed: {close_result.state} {close_result.error}"
+                )
             pnl = float(pos.get('unrealizedPnl', 0))
             self.db.log_trade_close(symbol, pnl, 0, 0, reason)
             await self.ctrl.notify(f"📊 [DualMode] 청산 [{reason}]: PnL {pnl:.2f}")
             self.position_cache = None
+            return close_result
+        return None
 
     async def _update_status(self, symbol, price, tf):
         total, free, mmr = await self.get_balance_info()
@@ -39114,6 +39549,18 @@ class MainController:
             await update.message.reply_text("⏸ 일시정지 (매매 중단, 모니터링 유지)")
             return ConversationHandler.END
         elif action == "RESUME":
+            critical_pause = load_critical_pause_state()
+            if critical_pause:
+                write_manual_resume_request(
+                    critical_pause.get("symbol") or "*",
+                    "I_CONFIRM_MANUAL_RISK_CHECK_DONE",
+                    requested_by="telegram",
+                )
+                result = await self.process_manual_resume_request()
+                await update.message.reply_text(
+                    f"Resume safety check: {result.get('status')}"
+                )
+                return ConversationHandler.END
             self.is_paused = False
             # Restart engine if it is not running
             if self.active_engine and not self.active_engine.running:
@@ -46236,12 +46683,139 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 logger.error(f"Hourly report error: {e}")
                 await asyncio.sleep(60)
 
+    async def process_manual_resume_request(self):
+        request = load_manual_resume_request()
+        if request is None:
+            return {"status": "NO_RESUME_REQUEST"}
+        pause = load_critical_pause_state()
+        issues = []
+        reconciled_at = None
+        approved = False
+        status = "RESUME_REJECTED_RECONCILIATION_FAILED"
+        try:
+            if pause is None:
+                issues.append("critical_pause_state_missing")
+                status = "RESUME_REJECTED_NO_PAUSE_STATE"
+            elif request.symbol not in {str(pause.get('symbol') or ''), '*'}:
+                issues.append("resume_symbol_mismatch")
+                status = "RESUME_REJECTED_SYMBOL_MISMATCH"
+            else:
+                engine = getattr(self, 'engines', {}).get('signal') or getattr(self, 'active_engine', None)
+                if engine is None or not hasattr(engine, '_reconcile_crypto_exchange_state'):
+                    issues.append("signal_engine_unavailable")
+                else:
+                    _ensure_trading_safety_runtime(engine)
+                    stream_state = engine.trading_state_store.get_runtime_state(
+                        'user_data_stream',
+                        {},
+                    ) or {}
+                    stream_ready = bool(
+                        stream_state.get('connected')
+                        and stream_state.get('reason') == 'connected_and_reconciled'
+                    )
+                    if not stream_ready:
+                        issues.append("user_stream_not_ready")
+                        status = "RESUME_REJECTED_USER_STREAM_NOT_READY"
+                    else:
+                        reconciliation = await engine._reconcile_crypto_exchange_state(
+                            user_stream_ready=True,
+                            require_user_stream=True,
+                        )
+                        reconciled_at = reconciliation.reconciled_at
+                        blocking = engine.trading_state_store.list_by_states(
+                            ENTRY_BLOCKING_STATES
+                        )
+                        unresolved = [
+                            record.client_order_id
+                            for record in blocking
+                            if record.order_state != OrderState.PROTECTED.value
+                        ]
+                        issues.extend(reconciliation.issues)
+                        issues.extend(reconciliation.unresolved_records)
+                        if unresolved:
+                            issues.extend(f"active_order:{item}" for item in unresolved)
+                            status = "RESUME_REJECTED_UNRESOLVED_ORDER"
+                        elif reconciliation.positions and any(
+                            record.order_state == OrderState.FILLED_UNPROTECTED.value
+                            for record in blocking
+                        ):
+                            issues.append("unprotected_position")
+                            status = "RESUME_REJECTED_UNPROTECTED_POSITION"
+                        elif not reconciliation.algo_orders_ok:
+                            issues.append("algo_snapshot_unavailable")
+                            status = "RESUME_REJECTED_ALGO_SNAPSHOT_UNAVAILABLE"
+                        elif reconciliation.safe_to_trade:
+                            archive_critical_pause(PAUSE_STATE_FILE, request)
+                            approved = True
+                            status = "RESUME_APPROVED"
+                            engine._set_crypto_entry_lock(None)
+                            self.is_paused = False
+                            if getattr(engine, 'ctrl', None) is not None:
+                                engine.ctrl.is_paused = False
+            result = ManualResumeResult(
+                request_id=request.request_id,
+                approved=approved,
+                status=status,
+                issues=tuple(issues),
+                reconciled_at=reconciled_at,
+            )
+            write_manual_resume_result(result)
+            archive_processed_request(request)
+            notifier = getattr(self, 'notify', None)
+            if callable(notifier):
+                try:
+                    await notifier(
+                        f"Manual resume {status}: {request.symbol}"
+                        + (f" / {', '.join(issues[:5])}" if issues else "")
+                    )
+                except Exception:
+                    logger.exception("Manual resume Telegram notification failed")
+            return {
+                "request_id": request.request_id,
+                "approved": approved,
+                "status": status,
+                "issues": issues,
+                "reconciled_at": reconciled_at,
+            }
+        except Exception as exc:
+            logger.exception("Manual resume reconciliation failed")
+            result = ManualResumeResult(
+                request_id=request.request_id,
+                approved=False,
+                status="RESUME_REJECTED_RECONCILIATION_FAILED",
+                issues=(f"{type(exc).__name__}:{exc}",),
+                reconciled_at=reconciled_at,
+            )
+            write_manual_resume_result(result)
+            archive_processed_request(request)
+            return {
+                "request_id": request.request_id,
+                "approved": False,
+                "status": result.status,
+                "issues": list(result.issues),
+                "reconciled_at": reconciled_at,
+            }
+
     async def _heartbeat_loop(self):
         """런타임 heartbeat 파일 갱신."""
         await asyncio.sleep(5)
 
         while True:
             try:
+                await self.process_manual_resume_request()
+                service = getattr(self, 'crypto_execution_service', None)
+                accounting = getattr(service, 'accounting_service', None)
+                if accounting is not None:
+                    try:
+                        await accounting.finalize_pending(limit=5)
+                        ENGINE_PERFORMANCE_STATS.clear()
+                        ENGINE_PERFORMANCE_STATS.update(
+                            rebuild_engine_performance_stats(
+                                service.state_store.load_trade_results()
+                            )
+                        )
+                    except Exception:
+                        logger.exception("Provisional trade accounting finalization failed")
                 self._write_heartbeat()
                 await asyncio.sleep(60)
             except Exception as e:
@@ -46959,6 +47533,37 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 
             # 1. ?ㅽ뵂??紐⑤뱺 ?ъ???議고쉶
             signal_engine = engine if hasattr(engine, '_cancel_protection_orders') else self.engines.get(CORE_ENGINE)
+            emergency_service = None
+            if signal_engine is not None:
+                try:
+                    emergency_service = getattr(signal_engine, 'crypto_execution', None)
+                except Exception:
+                    logger.exception("Emergency stop could not resolve the engine execution service")
+            if emergency_service is None:
+                store = getattr(self, 'trading_state_store', None)
+                if store is None:
+                    store = SQLiteTradingStateStore(':memory:')
+                    self.trading_state_store = store
+
+                async def _emergency_position_fetcher(target_symbol):
+                    return await self._fetch_emergency_position_by_symbol(target_symbol)
+
+                gateway = getattr(self, 'idempotent_order_gateway', None)
+                if gateway is None or gateway.exchange is not self.exchange:
+                    gateway = IdempotentOrderGateway(
+                        self.exchange,
+                        store,
+                        position_fetcher=_emergency_position_fetcher,
+                    )
+                    self.idempotent_order_gateway = gateway
+                emergency_service = CryptoExecutionService(
+                    self.exchange,
+                    store,
+                    gateway,
+                    BinanceAlgoOrderGateway(self.exchange),
+                    accounting_service=TradeAccountingFinalizer(self.exchange, store),
+                )
+                self.crypto_execution_service = emergency_service
             positions = await asyncio.to_thread(self.exchange.fetch_positions)
             open_positions = []
             for p in positions:
@@ -47026,15 +47631,26 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                             raise ValueError(f"invalid emergency close qty: {qty}")
                         params = self._close_order_params_for_position(current_pos)
                         try:
-                            order = await asyncio.to_thread(
-                                self.exchange.create_order,
-                                sym,
-                                'market',
-                                side,
-                                qty,
-                                None,
-                                params
+                            close_submission = await emergency_service.submit_reduce_only_close(
+                                strategy='MAIN_CONTROLLER_EMERGENCY_STOP',
+                                symbol=sym,
+                                position_side=current_pos['side'],
+                                position_signature=(
+                                    current_pos.get('timestamp')
+                                    or current_pos.get('entryPrice')
+                                    or f"{current_pos['side']}:{qty}"
+                                ),
+                                qty=float(qty),
+                                reason='close_emergency_stop',
+                                params=params,
+                                leg=f'attempt_{attempt}',
                             )
+                            order = close_submission.order or {}
+                            if close_submission.state == OrderState.SUBMITTED_UNKNOWN.value:
+                                raise RuntimeError(
+                                    'emergency close submission remains unresolved: '
+                                    f'{close_submission.client_order_id}'
+                                )
                         except Exception as close_error:
                             last_error = close_error
                             logger.error(
@@ -47431,46 +48047,15 @@ def assert_trading_allowed(symbol, cfg=None):
     return True
 
 def manual_resume_trading(symbol, confirm_text):
-    required = "I_CONFIRM_MANUAL_RISK_CHECK_DONE"
-
-    if confirm_text != required:
-        raise ValueError("Manual Confirmation Required: exact verification token missing.")
-
-    state = load_critical_pause_state()
-
-    if not state:
-        return {"status": "NO_PAUSE_STATE"}
-
-    if symbol not in {state.get("symbol"), "*"}:
-        raise ValueError("symbol does not match pause state")
-
-    from pathlib import Path
-    import shutil
-    from datetime import datetime, timezone
-
-    archive_dir = Path("runtime/pause_archive")
-    archive_dir.mkdir(parents=True, exist_ok=True)
-
-    safe_symbol = symbol.replace("/", "_").replace(":", "_")
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    archive_file = archive_dir / f"critical_pause_{safe_symbol}_{ts}.json"
-
-    try:
-        shutil.move(str(PAUSE_STATE_FILE), str(archive_file))
-    except Exception:
-        logger.exception("Failed to archive pause state before manual resume")
-        raise
-
-    try:
-        if globals().get("notify_telegram_warning"):
-            notify_telegram_warning(f"Manual trading resume completed for {symbol}")
-    except Exception:
-        pass
-
+    request = write_manual_resume_request(
+        symbol,
+        confirm_text,
+        requested_by="compatibility_wrapper",
+    )
     return {
-        "status": "RESUMED",
+        "status": "RESUME_REQUESTED",
         "symbol": symbol,
-        "archived": str(archive_file),
+        "request_id": request.request_id,
     }
 
 class InvalidOrderPlan(Exception):
@@ -49457,10 +50042,14 @@ def _validate_live_order_plan_for_exchange(self, plan, cfg):
 # ==============================================================================
 
 def _ensure_trading_safety_runtime(self):
-    store = getattr(self, "trading_state_store", None)
+    owner = getattr(self, "ctrl", None) or self
+    store = (
+        getattr(owner, "trading_state_store", None)
+        or getattr(self, "trading_state_store", None)
+    )
     if store is None:
         exchange_id = str(getattr(getattr(self, "exchange", None), "id", "") or "").lower()
-        runtime_dir = getattr(self, "runtime_dir", None)
+        runtime_dir = getattr(owner, "runtime_dir", None) or getattr(self, "runtime_dir", None)
         uninitialized_signal_engine = (
             self.__class__.__name__ == "SignalEngine"
             and not hasattr(self, "crypto_entry_lock_reason")
@@ -49474,11 +50063,16 @@ def _ensure_trading_safety_runtime(self):
         )
         state_path = os.getenv("CRYPTO_TRADING_STATE_DB", default_state_path)
         store = SQLiteTradingStateStore(state_path)
-        self.trading_state_store = store
-    if not getattr(self, "_engine_performance_stats_restored", False):
+    owner.trading_state_store = store
+    self.trading_state_store = store
+    if not getattr(owner, "_engine_performance_stats_restored", False):
         _restore_engine_performance_stats(store)
-        self._engine_performance_stats_restored = True
-    gateway = getattr(self, "idempotent_order_gateway", None)
+        owner._engine_performance_stats_restored = True
+    self._engine_performance_stats_restored = True
+    gateway = (
+        getattr(owner, "idempotent_order_gateway", None)
+        or getattr(self, "idempotent_order_gateway", None)
+    )
     if gateway is None or gateway.exchange is not getattr(self, "exchange", None):
         async def _position_fetcher(symbol):
             if not hasattr(self, "position_cache"):
@@ -49495,7 +50089,18 @@ def _ensure_trading_safety_runtime(self):
             store,
             position_fetcher=_position_fetcher,
         )
-        self.idempotent_order_gateway = gateway
+        owner.idempotent_order_gateway = gateway
+    self.idempotent_order_gateway = gateway
+    service = getattr(owner, 'crypto_execution_service', None)
+    if service is None or service.exchange is not getattr(self, 'exchange', None):
+        service = CryptoExecutionService(
+            self.exchange,
+            store,
+            gateway,
+            BinanceAlgoOrderGateway(self.exchange),
+            accounting_service=TradeAccountingFinalizer(self.exchange, store),
+        )
+        owner.crypto_execution_service = service
     return gateway
 
 
@@ -49946,8 +50551,9 @@ async def _submit_idempotent_crypto_entry(self, symbol, side, qty, strategy, pay
     blocker = _crypto_entry_block_reason(self, symbol)
     if blocker:
         return None, blocker
-    gateway = _ensure_trading_safety_runtime(self)
-    result = await gateway.submit_entry(
+    _ensure_trading_safety_runtime(self)
+    owner = getattr(self, 'ctrl', None) or self
+    result = await owner.crypto_execution_service.submit_entry(
         strategy=strategy,
         symbol=symbol,
         side=side,
@@ -50311,7 +50917,21 @@ async def _place_initial_sl_from_plan(self, plan, pos, cfg):
         {
             "stopPrice": stop_price,
             "reduceOnly": True,
-            "newClientOrderId": self._build_protection_client_order_id(plan.symbol, plan.side.lower(), "sl", pos),
+            "newClientOrderId": self._build_protection_client_order_id(
+                plan.symbol,
+                plan.side.lower(),
+                "sl",
+                pos,
+                trigger_price=stop_price,
+                quantity=qty,
+                leg="sl",
+                position_identity=(
+                    pos.get('entry_client_order_id')
+                    or pos.get('clientOrderId')
+                    or pos.get('timestamp')
+                    or self._protection_position_signature(pos)
+                ),
+            ),
         },
         "SL",
         max_attempts=int(cfg.get("sl_place_max_retries", 3) or 3),
@@ -50342,6 +50962,21 @@ async def _place_reduce_only_tp_from_plan(self, plan, tp, cfg):
         str(plan.side).lower(),
         tp.tp_name.lower(),
         {"side": str(plan.side).lower(), "entryPrice": plan.entry_price, "contracts": plan.qty},
+        trigger_price=price,
+        quantity=qty,
+        leg=tp_label,
+        position_identity=(
+            getattr(plan, 'entry_client_order_id', None)
+            or getattr(plan, 'signal_timestamp', None)
+            or "|".join(
+                (
+                    str(plan.symbol),
+                    str(plan.side).lower(),
+                    str(plan.entry_price),
+                    str(plan.qty),
+                )
+            )
+        ),
     )
 
     if tp_order_type in {"LIMIT", "TAKE_PROFIT_LIMIT"}:
@@ -50944,9 +51579,10 @@ async def _close_position_reduce_only_market(self, symbol, pos, reason, cfg):
 
     params = self._close_order_params_for_position(pos)
     params["reduceOnly"] = True
-    gateway = _ensure_trading_safety_runtime(self)
+    _ensure_trading_safety_runtime(self)
+    owner = getattr(self, 'ctrl', None) or self
     state = getattr(self, "utbreakout_trailing_states", {}).get(symbol) or {}
-    close_submission = await gateway.submit_reduce_only_close(
+    close_submission = await owner.crypto_execution_service.submit_reduce_only_close(
         strategy=str(state.get("engine") or "UTBREAKOUT_EXIT"),
         symbol=symbol,
         position_side=side,
@@ -51228,11 +51864,14 @@ def record_live_trade_result(trade, cfg=None, store=None):
         persistent_store = SQLiteTradingStateStore(
             os.getenv("CRYPTO_TRADING_STATE_DB", "runtime/trading_state.sqlite3")
         )
-    inserted = persistent_store.record_trade_result(trade)
-    if not inserted:
-        logger.info("Duplicate live trade result ignored: %s", trade.get("trade_id"))
+    outcome = persistent_store.upsert_trade_result(trade)
+    if not outcome.inserted and not outcome.updated:
+        logger.info("Unchanged live trade result ignored: %s", trade.get("trade_id"))
         return False
-    _update_engine_performance_stats(trade, cfg)
+    ENGINE_PERFORMANCE_STATS.clear()
+    ENGINE_PERFORMANCE_STATS.update(
+        rebuild_engine_performance_stats(persistent_store.load_trade_results())
+    )
     return True
 
 
@@ -51240,10 +51879,13 @@ def _restore_engine_performance_stats(store):
     if store is None:
         return 0
     ENGINE_PERFORMANCE_STATS.clear()
-    restored = 0
-    for trade in store.load_trade_results():
-        if _update_engine_performance_stats(trade):
-            restored += 1
+    trades = store.load_trade_results()
+    ENGINE_PERFORMANCE_STATS.update(rebuild_engine_performance_stats(trades))
+    restored = sum(
+        1
+        for trade in trades
+        if not trade.get('provisional') and trade.get('engine') not in {None, '', 'NONE'}
+    )
     logger.info("Restored live engine performance: trades=%d engines=%d", restored, len(ENGINE_PERFORMANCE_STATS))
     return restored
 

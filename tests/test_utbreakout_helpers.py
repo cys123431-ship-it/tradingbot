@@ -1675,7 +1675,7 @@ def test_emergency_stop_closes_binance_position_amt_when_contracts_missing():
     assert controller.is_paused is True
     assert exchange.created[0]["symbol"] == "BTC/USDT"
     assert exchange.created[0]["side"] == "buy"
-    assert exchange.created[0]["amount"] == "0.25"
+    assert float(exchange.created[0]["amount"]) == 0.25
     assert exchange.created[0]["params"]["reduceOnly"] is True
     assert any("청산 완료" in notice for notice in notices)
 
@@ -2334,7 +2334,7 @@ class _BinanceAlgoExchange(_FakeExchange):
         for order in self.algo_orders:
             if str(order.get("clientAlgoId") or "") == client_id:
                 return dict(order)
-        return {}
+        raise RuntimeError("-2013 Order does not exist")
 
     def fapiPrivateGetOpenAlgoOrders(self, params=None):
         params = dict(params or {})
@@ -5216,7 +5216,7 @@ def test_ladder_fill_state_retries_stop_move_when_replacement_fails():
     assert updated["last_stop_price"] == 90.0
 
 
-def test_stop_replacement_creates_new_sl_when_cancel_confirmation_fetch_fails():
+def test_stop_replacement_blocks_when_cancel_confirmation_fetch_fails():
     class _ConfirmFetchFailExchange(_FakeExchange):
         def __init__(self, orders, positions=None):
             super().__init__(orders, positions=positions)
@@ -5247,19 +5247,22 @@ def test_stop_replacement_creates_new_sl_when_cancel_confirmation_fetch_fails():
     engine.PROTECTION_REPLACE_CONFIRM_ATTEMPTS = 1
     engine.PROTECTION_REPLACE_CONFIRM_DELAY = 0
 
-    replacement = asyncio.run(
-        engine._replace_stop_loss_order(
-            "BTC/USDT",
-            pos,
-            100.3,
-            reason="confirmation failure regression",
+    with pytest.raises(
+        _emas_module().ProtectionOrderLookupUnavailable,
+        match="ALGO_ORDER_SNAPSHOT_UNAVAILABLE",
+    ):
+        asyncio.run(
+            engine._replace_stop_loss_order(
+                "BTC/USDT",
+                pos,
+                100.3,
+                reason="confirmation failure regression",
+            )
         )
-    )
 
-    assert replacement is not None
     assert ("sl-old", "BTC/USDT") in engine.exchange.cancelled
-    assert any(order["id"] == replacement["id"] for order in engine.exchange.orders)
-    assert engine.last_protection_order_status["BTC/USDT"]["status"] == "SL_REPLACED_CONFIRMATION_UNVERIFIED"
+    assert not engine.exchange.created
+    assert "ALGO_ORDER_SNAPSHOT_UNAVAILABLE" in engine.crypto_entry_lock_reason
 
 
 def test_closed_trade_accounting_uses_exchange_realized_pnl(monkeypatch):

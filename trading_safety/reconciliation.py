@@ -8,12 +8,14 @@ from datetime import datetime, timezone
 import logging
 from typing import Any, Awaitable, Callable
 
+from .binance_algo_gateway import BinanceAlgoOrderGateway
 from .liquidation_guard import (
     resolve_liquidation_safety_config,
     validate_stop_against_liquidation,
 )
 from .order_state import (
     ACTIVE_ORDER_STATES,
+    OrderIntent,
     OrderRecord,
     OrderState,
     SQLiteTradingStateStore,
@@ -31,10 +33,34 @@ def _as_dict(value: Any) -> dict[str, Any]:
 @dataclass
 class ReconciliationResult:
     safe_to_trade: bool
+    snapshot_complete: bool = False
+    user_stream_ready: bool = False
+    positions_ok: bool = False
+    regular_orders_ok: bool = False
+    algo_orders_ok: bool = False
     positions: list[dict[str, Any]] = field(default_factory=list)
+    regular_orders: list[dict[str, Any]] = field(default_factory=list)
+    algo_orders: list[dict[str, Any]] = field(default_factory=list)
     open_orders: list[dict[str, Any]] = field(default_factory=list)
+    unresolved_records: list[str] = field(default_factory=list)
     issues: list[str] = field(default_factory=list)
     reconciled_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+@dataclass(frozen=True)
+class ExchangeStateSnapshot:
+    positions: tuple[dict[str, Any], ...] = ()
+    regular_orders: tuple[dict[str, Any], ...] = ()
+    algo_orders: tuple[dict[str, Any], ...] = ()
+    positions_ok: bool = False
+    regular_orders_ok: bool = False
+    algo_orders_ok: bool = False
+    errors: tuple[str, ...] = ()
+    fetched_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    @property
+    def complete(self) -> bool:
+        return self.positions_ok and self.regular_orders_ok and self.algo_orders_ok
 
 
 def _position_qty(position: dict[str, Any]) -> float:
@@ -246,6 +272,95 @@ async def _fetch_open_orders(exchange: Any) -> list[dict[str, Any]]:
     return merged
 
 
+async def _fetch_exchange_snapshot(
+    exchange: Any,
+    *,
+    position_fetcher: Callable[[], Awaitable[list[dict[str, Any]]]] | None = None,
+    open_orders_fetcher: Callable[[], Awaitable[list[dict[str, Any]]]] | None = None,
+) -> ExchangeStateSnapshot:
+    errors: list[str] = []
+    positions: list[dict[str, Any]] = []
+    regular_orders: list[dict[str, Any]] = []
+    algo_orders: list[dict[str, Any]] = []
+    try:
+        positions = await (position_fetcher() if position_fetcher else _fetch_positions(exchange))
+        positions_ok = True
+    except Exception as exc:
+        positions_ok = False
+        errors.append(f"position_fetch_failed:{type(exc).__name__}:{exc}")
+
+    if open_orders_fetcher is not None:
+        try:
+            regular_orders = [dict(item) for item in await open_orders_fetcher() or []]
+            regular_orders_ok = True
+            algo_orders_ok = True
+        except Exception as exc:
+            regular_orders_ok = False
+            algo_orders_ok = False
+            errors.append(f"injected_order_snapshot_failed:{type(exc).__name__}:{exc}")
+    else:
+        fetch_open = getattr(exchange, "fetch_open_orders", None)
+        if not callable(fetch_open):
+            regular_orders_ok = False
+            errors.append("regular_open_orders_endpoint_unavailable")
+        else:
+            try:
+                regular_orders = [
+                    dict(item)
+                    for item in await asyncio.to_thread(fetch_open) or []
+                ]
+                regular_orders_ok = True
+            except Exception as exc:
+                regular_orders_ok = False
+                errors.append(f"regular_open_orders_failed:{type(exc).__name__}:{exc}")
+
+        is_binance = str(getattr(exchange, "id", "") or "").lower() in {
+            "binance",
+            "binanceusdm",
+        }
+        if is_binance:
+            algo_snapshot = await BinanceAlgoOrderGateway(exchange).fetch_open_orders()
+            algo_orders_ok = algo_snapshot.ok
+            algo_orders = list(algo_snapshot.orders)
+            if not algo_snapshot.ok:
+                errors.append(algo_snapshot.error or "algo_open_orders_failed")
+        else:
+            algo_orders_ok = True
+
+    return ExchangeStateSnapshot(
+        positions=tuple(positions),
+        regular_orders=tuple(regular_orders),
+        algo_orders=tuple(algo_orders),
+        positions_ok=positions_ok,
+        regular_orders_ok=regular_orders_ok,
+        algo_orders_ok=algo_orders_ok,
+        errors=tuple(errors),
+    )
+
+
+async def _lookup_regular_order(
+    exchange: Any,
+    record: OrderRecord,
+) -> tuple[str, dict[str, Any] | None, str | None]:
+    method = getattr(exchange, "fapiPrivateGetOrder", None)
+    if not callable(method):
+        return "UNKNOWN", None, "regular_order_lookup_endpoint_unavailable"
+    market_id = _normalize_symbol(record.symbol)
+    try:
+        raw = await asyncio.to_thread(
+            method,
+            {"symbol": market_id, "origClientOrderId": record.client_order_id},
+        )
+    except Exception as exc:
+        text = str(exc).lower()
+        if any(token in text for token in ("unknown order", "does not exist", "-2013")):
+            return "NOT_FOUND", None, None
+        return "UNKNOWN", None, f"{type(exc).__name__}:{exc}"
+    if not isinstance(raw, dict):
+        return "UNKNOWN", None, "invalid_regular_order_response"
+    return "FOUND", raw, None
+
+
 async def reconcile_exchange_state(
     exchange: Any,
     store: SQLiteTradingStateStore,
@@ -254,6 +369,8 @@ async def reconcile_exchange_state(
     open_orders_fetcher: Callable[[], Awaitable[list[dict[str, Any]]]] | None = None,
     single_position: bool = True,
     liquidation_config: dict[str, Any] | None = None,
+    user_stream_ready: bool = True,
+    require_user_stream: bool = False,
 ) -> ReconciliationResult:
     """Reconcile without placing or canceling orders.
 
@@ -262,31 +379,29 @@ async def reconcile_exchange_state(
     sufficient to prove a safe state.
     """
 
-    issues: list[str] = []
-    try:
-        positions = await (position_fetcher() if position_fetcher else _fetch_positions(exchange))
-    except Exception as exc:
-        logger.exception("Startup position reconciliation failed")
-        result = ReconciliationResult(False, issues=[f"position_fetch_failed:{type(exc).__name__}"])
-        store.set_runtime_state("last_reconciliation", result.__dict__)
-        return result
-    try:
-        open_orders = await (open_orders_fetcher() if open_orders_fetcher else _fetch_open_orders(exchange))
-    except Exception as exc:
-        logger.exception("Startup open-order reconciliation failed")
-        result = ReconciliationResult(
-            False,
-            positions=positions,
-            issues=[f"open_orders_fetch_failed:{type(exc).__name__}"],
-        )
-        store.set_runtime_state("last_reconciliation", result.__dict__)
-        return result
+    snapshot = await _fetch_exchange_snapshot(
+        exchange,
+        position_fetcher=position_fetcher,
+        open_orders_fetcher=open_orders_fetcher,
+    )
+    issues: list[str] = list(snapshot.errors)
+    positions = list(snapshot.positions)
+    regular_orders = list(snapshot.regular_orders)
+    algo_orders = list(snapshot.algo_orders)
+    open_orders = regular_orders + algo_orders
+    unresolved_records: list[str] = []
+    if require_user_stream and not user_stream_ready:
+        issues.append("user_stream_not_ready")
 
     if single_position and len(positions) > 1:
         issues.append(f"multiple_positions:{len(positions)}")
 
     open_by_client_id = {_order_client_id(order): order for order in open_orders if _order_client_id(order)}
     active_records = store.list_by_states(ACTIVE_ORDER_STATES)
+    strict_individual_lookup = (
+        open_orders_fetcher is None
+        and str(getattr(exchange, "id", "") or "").lower() in {"binance", "binanceusdm"}
+    )
     active_by_symbol: dict[str, list[OrderRecord]] = {}
     for record in active_records:
         active_by_symbol.setdefault(_normalize_symbol(record.symbol), []).append(record)
@@ -400,17 +515,66 @@ async def reconcile_exchange_state(
 
     for record in active_records:
         normalized = _normalize_symbol(record.symbol)
+        position_present = normalized in position_symbols
+        lookup_required_states = {
+            OrderState.PLANNED.value,
+            OrderState.SUBMITTING.value,
+            OrderState.SUBMITTED_UNKNOWN.value,
+            OrderState.ACKNOWLEDGED.value,
+            OrderState.PARTIALLY_FILLED.value,
+            OrderState.CLOSING.value,
+            OrderState.PARTIALLY_CLOSED.value,
+        }
+        if strict_individual_lookup:
+            lookup_required_states.update(ACTIVE_ORDER_STATES)
+        if (
+            record.order_state in lookup_required_states
+            and record.client_order_id not in open_by_client_id
+        ):
+            try:
+                intent = OrderIntent(record.order_intent)
+            except ValueError:
+                unresolved_records.append(f"invalid_intent:{record.client_order_id}")
+                intent = OrderIntent.ENTRY
+            if open_orders_fetcher is not None:
+                lookup_status, lookup_error = "NOT_FOUND", None
+            elif intent in {OrderIntent.PROTECTION_SL, OrderIntent.PROTECTION_TP}:
+                lookup = await BinanceAlgoOrderGateway(exchange).fetch_by_client_id(
+                    record.client_order_id
+                )
+                lookup_status, lookup_error = lookup.status.value, lookup.error
+            else:
+                lookup_status, _, lookup_error = await _lookup_regular_order(exchange, record)
+            if lookup_status == "UNKNOWN":
+                unresolved_records.append(
+                    f"order_lookup_unknown:{record.client_order_id}:{lookup_error}"
+                )
+            elif lookup_status == "NOT_FOUND":
+                close_intents = {
+                    OrderIntent.CLOSE,
+                    OrderIntent.EMERGENCY_CLOSE,
+                    OrderIntent.MANUAL_CLOSE,
+                    OrderIntent.GRID_EXIT,
+                }
+                if intent in close_intents and not position_present:
+                    store.transition(record.client_order_id, OrderState.CLOSED, last_error=None)
+                elif intent not in close_intents and not position_present:
+                    store.transition(record.client_order_id, OrderState.FAILED, last_error="order not found")
+                else:
+                    unresolved_records.append(f"order_not_found:{record.client_order_id}")
+            record = store.get(record.client_order_id) or record
         if record.order_state == OrderState.SUBMITTED_UNKNOWN.value:
             if record.client_order_id in open_by_client_id:
                 store.transition(record.client_order_id, OrderState.ACKNOWLEDGED, last_error=None)
             else:
-                issues.append(f"submitted_unknown:{record.client_order_id}")
+                unresolved_records.append(f"submitted_unknown:{record.client_order_id}")
         if record.order_state in {
             OrderState.FILLED_UNVERIFIED_LIQUIDATION.value,
             OrderState.FILLED_LIQUIDATION_CONFLICT.value,
             OrderState.FILLED_UNPROTECTED.value,
             OrderState.PROTECTED.value,
             OrderState.CLOSING.value,
+            OrderState.PARTIALLY_CLOSED.value,
             OrderState.EMERGENCY_CLOSE_FAILED.value,
         } and normalized not in position_symbols:
             completed_emergency_close = next(
@@ -443,9 +607,22 @@ async def reconcile_exchange_state(
             issues.append(f"orphan_reduce_only_order:{_order_symbol(order)}:{_order_client_id(order)}")
 
     result = ReconciliationResult(
-        safe_to_trade=not issues,
+        safe_to_trade=(
+            snapshot.complete
+            and (user_stream_ready or not require_user_stream)
+            and not unresolved_records
+            and not issues
+        ),
+        snapshot_complete=snapshot.complete,
+        user_stream_ready=bool(user_stream_ready),
+        positions_ok=snapshot.positions_ok,
+        regular_orders_ok=snapshot.regular_orders_ok,
+        algo_orders_ok=snapshot.algo_orders_ok,
         positions=positions,
+        regular_orders=regular_orders,
+        algo_orders=algo_orders,
         open_orders=open_orders,
+        unresolved_records=unresolved_records,
         issues=issues,
     )
     store.set_runtime_state("last_reconciliation", result.__dict__)

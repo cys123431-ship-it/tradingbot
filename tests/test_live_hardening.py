@@ -148,8 +148,8 @@ def test_manual_resume_archives_pause_file():
         manual_resume_trading("BTC/USDT", "WRONG_TOKEN")
 
     res = manual_resume_trading("BTC/USDT", "I_CONFIRM_MANUAL_RISK_CHECK_DONE")
-    assert res["status"] == "RESUMED"
-    assert os.path.exists(PAUSE_STATE_FILE) is False
+    assert res["status"] == "RESUME_REQUESTED"
+    assert os.path.exists(PAUSE_STATE_FILE) is True
 
 # 5. Testing stages and settings defaults
 def test_safety_stage_enforcement():

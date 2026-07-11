@@ -4,12 +4,15 @@ from .order_gateway import IdempotentOrderGateway, OrderSubmissionResult
 from .order_state import (
     ACTIVE_ORDER_STATES,
     ENTRY_BLOCKING_STATES,
+    OrderIntent,
     OrderRecord,
     OrderState,
     SQLiteTradingStateStore,
     atomic_write_json,
     build_client_order_id,
 )
+from .execution_service import CryptoExecutionService
+from .trade_accounting import TradeAccountingFinalizer, rebuild_engine_performance_stats
 from .liquidation_guard import (
     LiquidationSafetyConfig,
     LiquidationSafetyResult,
@@ -24,6 +27,8 @@ __all__ = [
     "ACTIVE_ORDER_STATES",
     "ENTRY_BLOCKING_STATES",
     "IdempotentOrderGateway",
+    "CryptoExecutionService",
+    "OrderIntent",
     "OrderRecord",
     "OrderState",
     "OrderSubmissionResult",
@@ -38,4 +43,6 @@ __all__ = [
     "validate_stop_against_liquidation",
     "atomic_write_json",
     "build_client_order_id",
+    "TradeAccountingFinalizer",
+    "rebuild_engine_performance_stats",
 ]
