@@ -46,7 +46,7 @@ def test_live_real_risk_menu_and_status_keyboards_have_expected_callbacks():
     assert _callbacks(menu) == [
         ["risk:set:0.0025", "risk:set:0.005", "risk:set:0.01"],
         ["risk:set:0.02", "risk:set:0.03", "risk:set:0.05"],
-        ["risk:safe", "risk:manual"],
+        ["risk:set:0.10", "risk:safe", "risk:manual"],
         ["risk:back:utbreak"],
     ]
     assert _callbacks(status) == [["risk:menu"], ["risk:back:utbreak"]]

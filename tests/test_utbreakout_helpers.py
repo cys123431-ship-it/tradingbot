@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import asyncio
+import inspect
 import re
 
 import math
@@ -291,6 +292,55 @@ def test_risk_percent_normalization_clamps_legacy_live_defaults():
     assert normalize_risk_percent({"risk_per_trade_pct": 10.0, "max_risk_per_trade_pct": 100.0}) == 1.0
     assert normalize_risk_percent({"risk_per_trade_percent": 0.01}) == 0.05
     assert normalize_risk_percent({"risk_per_trade_percent": 0.5}) == 0.5
+
+
+def test_utbreakout_risk_budget_supports_ten_percent_and_tracks_equity():
+    emas = _emas_module()
+
+    budget = emas.resolve_utbreakout_risk_budget(
+        250.0,
+        {
+            "risk_per_trade_percent": 10.0,
+            "max_risk_per_trade_percent": 10.0,
+            "max_risk_per_trade_usdt": 1.0,
+            "risk_budget_tracks_account_equity": True,
+        },
+    )
+
+    assert budget["risk_per_trade_percent"] == pytest.approx(10.0)
+    assert budget["max_risk_per_trade_usdt"] == pytest.approx(25.0)
+    assert budget["source"] == "account_equity_percent"
+
+
+def test_utbreakout_margin_cap_reduces_plan_instead_of_rejecting_signal():
+    emas = _emas_module()
+    plan = {
+        "qty": 5.0,
+        "planned_notional": 500.0,
+        "planned_margin": 100.0,
+        "risk_distance": 4.0,
+        "risk_usdt": 20.0,
+        "effective_rr_multiple": 2.4,
+    }
+
+    capped = emas.cap_utbreakout_risk_plan_to_margin(
+        plan,
+        free_balance=50.0,
+        leverage=5.0,
+        entry_price=100.0,
+    )
+
+    assert capped["position_cap_applied"] is True
+    assert capped["position_cap_reason"] == "available_margin_and_leverage"
+    assert capped["planned_notional"] == pytest.approx(245.0)
+    assert capped["qty"] == pytest.approx(2.45)
+    assert capped["risk_usdt"] == pytest.approx(9.8)
+    assert capped["expected_profit_usdt"] == pytest.approx(23.52)
+
+
+def test_signal_engine_has_one_dual_alpha_status_builder():
+    source = inspect.getsource(_signal_engine_cls())
+    assert source.count("async def build_dual_alpha_status_text") == 1
 
 
 def test_trading_config_clamps_signal_futures_risk_defaults(tmp_path):

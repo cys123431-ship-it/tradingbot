@@ -466,6 +466,7 @@ CORE_ENGINE = 'signal'
 UTBOT_FILTERED_BREAKOUT_STRATEGY = 'utbot_filtered_breakout_v1'
 UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY = 'utbot_adaptive_timeframe_v1'
 DUAL_ALPHA_STRATEGY = 'dual_alpha_v1'
+UTBREAKOUT_MAX_RISK_PER_TRADE_PERCENT = 10.0
 UTBREAKOUT_STRATEGIES = {
     UTBOT_FILTERED_BREAKOUT_STRATEGY,
     UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY,
@@ -2483,7 +2484,9 @@ def build_default_utbot_filtered_breakout_config():
         'min_risk_reward': 2.0,
         'risk_per_trade_percent': DEFAULT_RISK_PER_TRADE_PERCENT,
         'min_risk_per_trade_percent': DEFAULT_MIN_RISK_PER_TRADE_PERCENT,
-        'max_risk_per_trade_percent': DEFAULT_MAX_RISK_PER_TRADE_PERCENT,
+        'max_risk_per_trade_percent': UTBREAKOUT_MAX_RISK_PER_TRADE_PERCENT,
+        'risk_budget_tracks_account_equity': True,
+        'max_risk_per_trade_usdt_hard_cap': 0.0,
         'sl_place_max_retries': 3,
         'sl_retry_delay_sec': 0.7,
         'emergency_close_on_sl_fail': True,
@@ -2536,6 +2539,80 @@ def build_default_utbot_filtered_breakout_config():
         'ema_rsi_exit_enabled': False,
         'adx_donchian_exit_enabled': False
     }
+
+
+def resolve_utbreakout_risk_budget(balance_usdt, cfg, *, multiplier=1.0):
+    """Resolve the UT/RSPT/DUAL loss budget from the selected account percentage."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    balance = max(0.0, float(balance_usdt or 0.0))
+    risk_percent = normalize_risk_percent(
+        {
+            'risk_per_trade_percent': cfg.get(
+                'risk_per_trade_percent',
+                cfg.get('risk_per_trade_pct', DEFAULT_RISK_PER_TRADE_PERCENT),
+            ),
+            'min_risk_per_trade_percent': cfg.get(
+                'min_risk_per_trade_percent',
+                cfg.get('min_risk_per_trade_pct', DEFAULT_MIN_RISK_PER_TRADE_PERCENT),
+            ),
+            'max_risk_per_trade_percent': cfg.get(
+                'max_risk_per_trade_percent',
+                cfg.get('max_risk_per_trade_pct', UTBREAKOUT_MAX_RISK_PER_TRADE_PERCENT),
+            ),
+        },
+        max_default=UTBREAKOUT_MAX_RISK_PER_TRADE_PERCENT,
+    )
+    tracks_equity = bool(cfg.get('risk_budget_tracks_account_equity', True))
+    if tracks_equity:
+        max_risk_usdt = balance * risk_percent / 100.0
+        hard_cap = max(0.0, float(cfg.get('max_risk_per_trade_usdt_hard_cap', 0.0) or 0.0))
+        if hard_cap > 0:
+            max_risk_usdt = min(max_risk_usdt, hard_cap)
+        source = 'account_equity_percent'
+    else:
+        max_risk_usdt = max(0.0, float(cfg.get('max_risk_per_trade_usdt', 1.0) or 0.0))
+        source = 'fixed_usdt_cap'
+
+    applied_multiplier = max(0.0, float(multiplier or 0.0))
+    return {
+        'risk_per_trade_percent': risk_percent * applied_multiplier,
+        'max_risk_per_trade_usdt': max_risk_usdt * applied_multiplier,
+        'base_risk_per_trade_percent': risk_percent,
+        'base_max_risk_per_trade_usdt': max_risk_usdt,
+        'multiplier': applied_multiplier,
+        'source': source,
+    }
+
+
+def cap_utbreakout_risk_plan_to_margin(plan, *, free_balance, leverage, entry_price, safety_buffer=0.98):
+    """Cap a risk plan to available isolated margin without rejecting the signal."""
+    plan = dict(plan or {})
+    price = float(entry_price or 0.0)
+    free = max(0.0, float(free_balance or 0.0))
+    lev = max(1.0, float(leverage or 1.0))
+    max_notional = free * lev * max(0.0, min(1.0, float(safety_buffer or 0.0)))
+    planned_notional = max(0.0, float(plan.get('planned_notional', 0.0) or 0.0))
+    if price <= 0 or max_notional <= 0 or planned_notional <= max_notional:
+        plan.setdefault('position_cap_applied', False)
+        return plan
+
+    capped_qty = max_notional / price
+    risk_distance = max(0.0, float(plan.get('risk_distance', 0.0) or 0.0))
+    original_notional = planned_notional
+    original_risk = max(0.0, float(plan.get('risk_usdt', 0.0) or 0.0))
+    plan.update({
+        'qty': capped_qty,
+        'planned_notional': max_notional,
+        'planned_margin': max_notional / lev,
+        'risk_usdt': capped_qty * risk_distance,
+        'expected_profit_usdt': capped_qty * risk_distance * float(plan.get('effective_rr_multiple', plan.get('rr_multiple', 0.0)) or 0.0),
+        'position_cap_applied': True,
+        'position_cap_reason': 'available_margin_and_leverage',
+        'position_cap_original_notional': original_notional,
+        'position_cap_original_risk_usdt': original_risk,
+        'position_cap_max_notional': max_notional,
+    })
+    return plan
 
 
 def build_utbot_filtered_breakout_profile(profile):
@@ -7269,7 +7346,7 @@ class SignalEngine(BaseEngine):
             'min_risk_reward': 2.0,
             'risk_per_trade_percent': DEFAULT_RISK_PER_TRADE_PERCENT,
             'min_risk_per_trade_percent': DEFAULT_MIN_RISK_PER_TRADE_PERCENT,
-            'max_risk_per_trade_percent': DEFAULT_MAX_RISK_PER_TRADE_PERCENT,
+            'max_risk_per_trade_percent': UTBREAKOUT_MAX_RISK_PER_TRADE_PERCENT,
             'sl_retry_delay_sec': 0.7,
             'max_risk_per_trade_usdt': 1.0,
             'daily_max_loss_usdt': 3.0,
@@ -7603,11 +7680,14 @@ class SignalEngine(BaseEngine):
         cfg['utbreak_entry_relaxation_mode'] = relaxation_mode
         sleeve_mode = str(cfg.get('aggressive_growth_sleeve_mode') or 'notional').strip().lower()
         cfg['aggressive_growth_sleeve_mode'] = sleeve_mode if sleeve_mode in {'notional', 'margin'} else 'notional'
-        cfg['risk_per_trade_percent'] = normalize_risk_percent({
-            'risk_per_trade_percent': cfg.get('risk_per_trade_percent'),
-            'min_risk_per_trade_percent': cfg.get('min_risk_per_trade_percent'),
-            'max_risk_per_trade_percent': cfg.get('max_risk_per_trade_percent'),
-        })
+        cfg['risk_per_trade_percent'] = normalize_risk_percent(
+            {
+                'risk_per_trade_percent': cfg.get('risk_per_trade_percent'),
+                'min_risk_per_trade_percent': cfg.get('min_risk_per_trade_percent'),
+                'max_risk_per_trade_percent': cfg.get('max_risk_per_trade_percent'),
+            },
+            max_default=UTBREAKOUT_MAX_RISK_PER_TRADE_PERCENT,
+        )
         if bool(cfg.get('fixed_take_profit_enabled', True)):
             cfg['partial_take_profit_enabled'] = True
             cfg['second_take_profit_enabled'] = True
@@ -14552,8 +14632,13 @@ class SignalEngine(BaseEngine):
         market_quality_multiplier = max(0.0, min(1.0, float(market_quality.get('risk_multiplier', 1.0) or 1.0)))
         rspt_size_multiplier = max(0.0, min(1.0, float(decision_logs.get('size_multiplier', decision_logs.get('risk_multiplier', 1.0)) or 1.0)))
         risk_multiplier = market_quality_multiplier * rspt_size_multiplier
-        risk_per_trade_percent = float(cfg.get('risk_per_trade_percent', 1.0) or 1.0) * risk_multiplier
-        max_risk_per_trade_usdt = float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0) * risk_multiplier
+        risk_budget = resolve_utbreakout_risk_budget(
+            balance_for_risk,
+            cfg,
+            multiplier=risk_multiplier,
+        )
+        risk_per_trade_percent = risk_budget['risk_per_trade_percent']
+        max_risk_per_trade_usdt = risk_budget['max_risk_per_trade_usdt']
         structure_stop = (
             filter_values.get('recent_swing_low')
             if side == 'long'
@@ -14576,6 +14661,12 @@ class SignalEngine(BaseEngine):
                 risk_per_trade_percent=risk_per_trade_percent,
                 max_risk_per_trade_usdt=max_risk_per_trade_usdt,
                 leverage=leverage,
+            )
+            plan = cap_utbreakout_risk_plan_to_margin(
+                plan,
+                free_balance=free_balance,
+                leverage=leverage,
+                entry_price=entry_price,
             )
         except ValueError as exc:
             return _finish(
@@ -15489,71 +15580,6 @@ class SignalEngine(BaseEngine):
     def _record_last_live_entry_snapshot(self, snapshot):
         if isinstance(snapshot, dict):
             self.last_live_entry_snapshot = dict(snapshot)
-
-    async def build_dual_alpha_status_text(self, symbol=None):
-        strategy_params = self.get_runtime_strategy_params()
-        active_strategy = str(strategy_params.get('active_strategy', '') or '').lower()
-        cfg = self._get_utbot_filtered_breakout_config(strategy_params)
-        cfg = apply_stable_utbreak_final_overrides(cfg)
-        cfg = apply_profit_opportunity_effective_overrides(cfg)
-        micro_cfg = self._get_micro_auto_config() if hasattr(self, '_get_micro_auto_config') else {}
-        order_path_line = format_utbreakout_order_path_summary(
-            build_utbreakout_order_path_summary(
-                cfg,
-                exchange_mode=self.ctrl.get_exchange_mode() if getattr(self, 'ctrl', None) else None,
-                micro_cfg=micro_cfg,
-            )
-        )
-        symbol = symbol or getattr(self, 'scanner_active_symbol', None) or getattr(self, 'utbreakout_last_status_symbol', None)
-        status = None
-        if symbol:
-            canonical = self._canonical_futures_symbol(symbol)
-            status = (
-                (getattr(self, 'dual_alpha_last_status', {}) or {}).get(canonical)
-                or self._utbreakout_diag_for_symbol(canonical)
-            )
-        status = status if isinstance(status, dict) else {}
-        dual = status.get('dual_alpha') if isinstance(status.get('dual_alpha'), dict) else {}
-
-        def _emoji(light):
-            return {
-                'green': '🟢',
-                'yellow': '🟡',
-                'red': '🔴',
-                'gray': '⚪',
-            }.get(str(light or '').lower(), '⚪')
-
-        def _line(item, fallback_label):
-            item = item if isinstance(item, dict) else {}
-            label = item.get('label') or fallback_label
-            side = str(item.get('side') or '-').upper()
-            state = item.get('state') or 'NONE'
-            setup = item.get('setup_type') or '-'
-            reason = item.get('reason') or 'no recent decision'
-            direction_by = item.get('direction_by')
-            direction_note = f" / direction_by {direction_by}" if direction_by else ""
-            return f"{label}: {_emoji(item.get('light'))} {state} {side} / setup {setup}{direction_note} / {reason}"
-
-        lines = [
-            "DUAL Alpha status",
-            f"Active: {active_strategy == DUAL_ALPHA_STRATEGY}",
-            "Mode: UTBreakout + RSPT both watched, one selected, existing risk/TP/SL/order path.",
-            f"Symbol: {symbol or 'no recent symbol'}",
-            order_path_line,
-        ]
-        if dual:
-            lines.append(_line(dual.get('utbreak'), 'UTBreakout'))
-            lines.append(_line(dual.get('rspt'), 'RSPT'))
-            selected = dual.get('selected_label') or dual.get('selected') or 'none'
-            selected_side = str(dual.get('selected_side') or '-').upper()
-            score = _safe_float_or_none(dual.get('selection_score'))
-            score_text = f" / score {score:.1f}" if score is not None else ""
-            lines.append(f"Selected: {selected} {selected_side}{score_text}")
-        else:
-            lines.append("UTBreakout: ⚪ NONE - / no recent dual evaluation")
-            lines.append("RSPT: ⚪ NONE - / no recent dual evaluation")
-            lines.append("Selected: none")
-        return "\n".join(lines)
 
     async def build_dual_alpha_status_text(self, symbol=None):
         strategy_params = self.get_runtime_strategy_params()
@@ -17066,8 +17092,9 @@ class SignalEngine(BaseEngine):
         balance_for_risk = total_balance if total_balance > 0 else free_balance
         common_cfg = self.get_runtime_common_settings()
         leverage = int(max(1.0, float(common_cfg.get('leverage', 5) or 5)))
-        risk_per_trade_percent = float(cfg.get('risk_per_trade_percent', 1.0) or 1.0)
-        max_risk_per_trade_usdt = float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
+        risk_budget = resolve_utbreakout_risk_budget(balance_for_risk, cfg)
+        risk_per_trade_percent = risk_budget['risk_per_trade_percent']
+        max_risk_per_trade_usdt = risk_budget['max_risk_per_trade_usdt']
         if side == 'short' and bool(cfg.get('short_conservative_enabled', True)):
             status['short_risk_multiplier'] = short_risk_multiplier
         if set_filter_multiplier < 0.999:
@@ -17099,6 +17126,12 @@ class SignalEngine(BaseEngine):
                 risk_per_trade_percent=risk_per_trade_percent,
                 max_risk_per_trade_usdt=max_risk_per_trade_usdt,
                 leverage=leverage,
+            )
+            plan = cap_utbreakout_risk_plan_to_margin(
+                plan,
+                free_balance=free_balance,
+                leverage=leverage,
+                entry_price=entry_price,
             )
         except ValueError as e:
             reason = str(e)
@@ -18870,8 +18903,9 @@ class SignalEngine(BaseEngine):
                 total_balance, free_balance, _ = await self.get_balance_info()
                 balance_for_risk = total_balance if total_balance > 0 else free_balance
                 side_for_plan = candidate_side if candidate_side in {'long', 'short'} else 'long'
-                risk_per_trade_percent = float(cfg.get('risk_per_trade_percent', 1.0) or 1.0)
-                max_risk_per_trade_usdt = float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
+                risk_budget = resolve_utbreakout_risk_budget(balance_for_risk, cfg)
+                risk_per_trade_percent = risk_budget['risk_per_trade_percent']
+                max_risk_per_trade_usdt = risk_budget['max_risk_per_trade_usdt']
                 risk_note = ""
                 ev_plan_enabled = bool(cfg.get('ev_adaptive_enabled', False))
                 if (
@@ -18983,6 +19017,12 @@ class SignalEngine(BaseEngine):
                     risk_per_trade_percent=risk_per_trade_percent,
                     max_risk_per_trade_usdt=max_risk_per_trade_usdt,
                     leverage=lev,
+                )
+                plan = cap_utbreakout_risk_plan_to_margin(
+                    plan,
+                    free_balance=free_balance,
+                    leverage=lev,
+                    entry_price=entry_price,
                 )
                 if self._micro_auto_enabled():
                     status_micro_cfg = self._get_micro_auto_config()
@@ -20189,8 +20229,9 @@ class SignalEngine(BaseEngine):
                 total_balance, free_balance, _ = await self.get_balance_info()
                 balance_for_risk = total_balance if total_balance > 0 else free_balance
                 side_for_plan = candidate_side if candidate_side in {'long', 'short'} else 'long'
-                risk_per_trade_percent = float(cfg.get('risk_per_trade_percent', 1.0) or 1.0)
-                max_risk_per_trade_usdt = float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
+                risk_budget = resolve_utbreakout_risk_budget(balance_for_risk, cfg)
+                risk_per_trade_percent = risk_budget['risk_per_trade_percent']
+                max_risk_per_trade_usdt = risk_budget['max_risk_per_trade_usdt']
                 risk_note = ""
                 ev_plan_enabled = bool(cfg.get('ev_adaptive_enabled', False))
                 if (
@@ -20302,6 +20343,12 @@ class SignalEngine(BaseEngine):
                     risk_per_trade_percent=risk_per_trade_percent,
                     max_risk_per_trade_usdt=max_risk_per_trade_usdt,
                     leverage=lev,
+                )
+                plan = cap_utbreakout_risk_plan_to_margin(
+                    plan,
+                    free_balance=free_balance,
+                    leverage=lev,
+                    entry_price=entry_price,
                 )
                 if self._micro_auto_enabled():
                     status_micro_cfg = self._get_micro_auto_config()
@@ -21721,6 +21768,7 @@ class SignalEngine(BaseEngine):
             if not self._is_valid_number(atr_value) or float(atr_value) <= 0:
                 raise ValueError("ATR 값 없음")
             balance_for_risk = total_balance if total_balance > 0 else free_balance
+            risk_budget = resolve_utbreakout_risk_budget(balance_for_risk, cfg)
             risk_plan = calculate_risk_plan(
                 side='long',
                 entry_price=entry_price,
@@ -21730,9 +21778,15 @@ class SignalEngine(BaseEngine):
                 take_profit_r_multiple=cfg.get('take_profit_r_multiple', 3.50),
                 min_risk_reward=cfg.get('min_risk_reward', 2.0),
                 balance_usdt=balance_for_risk,
-                risk_per_trade_percent=cfg.get('risk_per_trade_percent', 1.0),
-                max_risk_per_trade_usdt=cfg.get('max_risk_per_trade_usdt', 1.0),
+                risk_per_trade_percent=risk_budget['risk_per_trade_percent'],
+                max_risk_per_trade_usdt=risk_budget['max_risk_per_trade_usdt'],
                 leverage=lev,
+            )
+            risk_plan = cap_utbreakout_risk_plan_to_margin(
+                risk_plan,
+                free_balance=free_balance,
+                leverage=lev,
+                entry_price=entry_price,
             )
         except Exception as exc:
             risk_error = str(exc)
@@ -30796,24 +30850,38 @@ class SignalEngine(BaseEngine):
 
             if active_strategy in UTBREAKOUT_STRATEGIES and target_notional > max_notional:
                 logger.warning(
-                    f"[UTBOT_FILTERED_BREAKOUT_V1] Entry blocked by margin cap: "
+                    f"[UTBOT_FILTERED_BREAKOUT_V1] Entry resized by margin cap: "
                     f"target={target_notional:.2f}, max={max_notional:.2f}, free={free:.2f}, lev={lev}"
                 )
-                _record_filtered_breakout_entry_block(
-                    'ENTRY_BLOCKED_MARGIN_CAP',
-                    'UTBOT_FILTERED_BREAKOUT_V1 entry blocked by margin cap',
-                    {
-                        'target_notional': target_notional,
-                        'max_notional': max_notional,
-                        'free_balance': free,
-                        'leverage': lev
-                    }
+                original_target_notional = target_notional
+                target_notional = max_notional
+                margin_to_use = target_notional / max(float(lev), 1e-9)
+                capped_qty = target_notional / max(float(price), 1e-9)
+                risk_distance = float(filtered_breakout_plan.get('risk_distance', 0.0) or 0.0)
+                filtered_breakout_plan.update({
+                    'qty': capped_qty,
+                    'planned_notional': target_notional,
+                    'planned_margin': margin_to_use,
+                    'risk_usdt': capped_qty * risk_distance,
+                    'position_cap_applied': True,
+                    'position_cap_reason': 'available_margin_changed_before_order',
+                    'position_cap_original_notional': original_target_notional,
+                    'position_cap_max_notional': max_notional,
+                })
+                self._utbreakout_trace_event(
+                    symbol,
+                    'POSITION_SIZE_CAP',
+                    'RESIZED',
+                    side=side,
+                    original_notional=original_target_notional,
+                    capped_notional=target_notional,
+                    free_balance=free,
+                    leverage=lev,
                 )
                 await self.ctrl.notify(
-                    f"⚠️ UTBOT_FILTERED_BREAKOUT_V1 증거금 부족: 계획 {target_notional:.2f} > 가능 {max_notional:.2f} USDT"
+                    f"UTBreakout 수량 축소: 계획 {original_target_notional:.2f} -> "
+                    f"가능 {target_notional:.2f} USDT (증거금/레버리지 상한)"
                 )
-                self._clear_utbot_filtered_breakout_entry_plan(symbol)
-                return
 
             qty = self.safe_amount(symbol, target_notional / price)
             try:
@@ -40564,21 +40632,25 @@ class MainController:
             save_live_real_risk_state(changed_state)
             risk_percent = requested_fraction * 100.0
             max_percent = _live_real_min_max_risk_fraction(cfg_for_risk)[1] * 100.0
+            next_cfg = {**cfg_for_risk, "live_real_risk_pct_user": requested_fraction}
+            limits, equity_source = await _live_real_risk_limits(next_cfg)
             update_paths = [
                 (['signal_engine', 'common_settings', 'live_real_risk_pct_user'], requested_fraction),
                 (['signal_engine', 'common_settings', 'risk_per_trade_pct'], risk_percent),
                 (['signal_engine', 'common_settings', 'max_risk_per_trade_pct'], max_percent),
+                (['signal_engine', 'common_settings', 'max_real_position_notional_usdt'], limits['max_position_notional_usdt']),
+                (['signal_engine', 'common_settings', 'max_real_loss_per_trade_usdt'], limits['max_loss_per_trade_usdt']),
                 (['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'live_real_risk_pct_user'], requested_fraction),
                 (['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'risk_per_trade_percent'], risk_percent),
-                (['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'max_risk_per_trade_pct'], max_percent),
+                (['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'max_risk_per_trade_percent'], max_percent),
+                (['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'max_risk_per_trade_usdt'], limits['max_loss_per_trade_usdt']),
+                (['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'risk_budget_tracks_account_equity'], True),
             ]
             for path, value in update_paths:
                 await self.cfg.update_value(path, value)
             engine = self._reset_signal_engine_runtime_state(reset_entry_cache=True)
             if engine and not getattr(engine, "running", False):
                 engine.start()
-            next_cfg = {**cfg_for_risk, "live_real_risk_pct_user": requested_fraction}
-            limits, equity_source = await _live_real_risk_limits(next_cfg)
             text = render_live_real_risk_status_text(
                 next_cfg,
                 changed_state,
@@ -40610,7 +40682,7 @@ class MainController:
             try:
                 requested_fraction = parse_live_real_risk_pct_input(args[0], cfg_for_risk)
             except ValueError as exc:
-                await u.message.reply_text(f"Invalid /risk value: {exc}\nUsage: /risk 0.5, /risk 1, /risk safe")
+                await u.message.reply_text(f"Invalid /risk value: {exc}\nUsage: /risk 0.5, /risk 1, /risk 10, /risk safe")
                 return
             _, text = await _set_live_real_risk_pct_from_user(
                 requested_fraction,
@@ -46555,6 +46627,15 @@ def enforce_activation_stage(cfg):
         cfg["leverage"] = min(float(cfg.get("leverage", cfg["max_leverage"]) or cfg["max_leverage"]), cfg["max_leverage"])
         for key, value in LIVE_REAL_SMALL_CAP_DEFAULTS.items():
             cfg.setdefault(key, value)
+        cfg["max_real_risk_pct"] = max(
+            _safe_float_value(cfg.get("max_real_risk_pct"), 0.0),
+            LIVE_REAL_SMALL_CAP_DEFAULTS["max_real_risk_pct"],
+        )
+        cfg["scale_notional_cap_with_risk_pct"] = True
+        cfg["max_position_notional_pct_hard_limit"] = max(
+            _safe_float_value(cfg.get("max_position_notional_pct_hard_limit"), 0.0),
+            LIVE_REAL_SMALL_CAP_DEFAULTS["max_position_notional_pct_hard_limit"],
+        )
         cfg["max_open_positions"] = min(int(cfg.get("max_open_positions", 1) or 1), 1)
         cfg["max_same_direction_positions"] = min(int(cfg.get("max_same_direction_positions", 1) or 1), 1)
         apply_live_small_cap_limits_to_config(cfg, cfg["account_reference_equity_usdt"])
@@ -46575,13 +46656,13 @@ LIVE_REAL_SMALL_CAP_DEFAULTS = {
     "max_real_position_notional_pct_of_equity": 0.09,
     "default_real_risk_pct": 0.005,
     "min_real_risk_pct": 0.001,
-    "max_real_risk_pct": 0.05,
+    "max_real_risk_pct": 0.10,
     "max_daily_real_loss_pct_of_equity": 0.036,
     "max_weekly_real_loss_pct_of_equity": 0.18,
     "max_risk_pct_increases_per_day": 2,
     "risk_pct_change_reset_timezone": "Asia/Seoul",
-    "scale_notional_cap_with_risk_pct": False,
-    "max_position_notional_pct_hard_limit": 0.50,
+    "scale_notional_cap_with_risk_pct": True,
+    "max_position_notional_pct_hard_limit": 1.00,
 }
 
 def write_critical_pause_state(symbol, reason, exception, cfg=None):
@@ -46920,6 +47001,7 @@ LIVE_REAL_RISK_BUTTON_PRESETS = (
     ("2%", "risk:set:0.02"),
     ("3%", "risk:set:0.03"),
     ("5%", "risk:set:0.05"),
+    ("10%", "risk:set:0.10"),
 )
 
 
@@ -46941,9 +47023,19 @@ def build_live_real_risk_config(signal_engine_cfg):
         "max_daily_real_loss_pct_of_equity",
         "max_weekly_real_loss_pct_of_equity",
         "scale_notional_cap_with_risk_pct",
+        "max_position_notional_pct_hard_limit",
     ):
         if key in ut_cfg and key not in cfg_for_risk:
             cfg_for_risk[key] = ut_cfg[key]
+    cfg_for_risk["max_real_risk_pct"] = max(
+        _safe_float_value(cfg_for_risk.get("max_real_risk_pct"), 0.0),
+        LIVE_REAL_SMALL_CAP_DEFAULTS["max_real_risk_pct"],
+    )
+    cfg_for_risk["scale_notional_cap_with_risk_pct"] = True
+    cfg_for_risk["max_position_notional_pct_hard_limit"] = max(
+        _safe_float_value(cfg_for_risk.get("max_position_notional_pct_hard_limit"), 0.0),
+        LIVE_REAL_SMALL_CAP_DEFAULTS["max_position_notional_pct_hard_limit"],
+    )
     return cfg_for_risk
 
 
@@ -46960,6 +47052,7 @@ def build_live_real_risk_menu_keyboard():
             InlineKeyboardButton("5%", callback_data="risk:set:0.05"),
         ],
         [
+            InlineKeyboardButton("10%", callback_data="risk:set:0.10"),
             InlineKeyboardButton("SAFE 0.1%", callback_data="risk:safe"),
             InlineKeyboardButton("직접 입력", callback_data="risk:manual"),
         ],
@@ -46975,9 +47068,10 @@ def build_live_real_risk_status_keyboard():
 
 
 def build_live_real_risk_confirm_keyboard(fraction):
+    percent = float(fraction) * 100.0
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("예, 5%로 변경", callback_data=f"risk:confirm:set:{float(fraction):.4g}"),
+            InlineKeyboardButton(f"예, {percent:g}%로 변경", callback_data=f"risk:confirm:set:{float(fraction):.4g}"),
             InlineKeyboardButton("취소", callback_data="risk:cancel"),
         ]
     ])
@@ -47061,6 +47155,13 @@ def render_live_real_risk_status_text(
         f"오늘 리스크 상향 변경 횟수: {int(state.get('risk_pct_increases_today', 0) or 0)}/{limit} KST",
         "리스크 변경 초기화 기준: Asia/Seoul 자정",
     ])
+    if limits.get('notional_scaled_by_risk'):
+        lines.append(
+            f"포지션 상한 연동: ON / equity의 "
+            f"{float(limits.get('max_position_notional_pct', 0.0) or 0.0) * 100.0:.1f}%"
+        )
+    if float(limits.get('max_loss_per_trade_usdt', 0.0) or 0.0) > float(limits.get('max_daily_loss_usdt', 0.0) or 0.0):
+        lines.append("주의: 1회 최대 손실예산이 일 손실한도보다 커서 한 번의 완전 SL 후 당일 거래가 중단될 수 있습니다.")
     if menu:
         lines.extend([
             "",
@@ -47078,7 +47179,7 @@ def render_live_real_risk_manual_text():
         "",
         "/risk 1.5",
         "",
-        "입력 가능 범위: 0.1% ~ 5%",
+        "입력 가능 범위: 0.1% ~ 10%",
     ])
 
 

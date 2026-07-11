@@ -114,7 +114,7 @@ def test_live_real_stage_requires_exact_confirmation_and_clamps_caps():
     assert enforced["leverage"] <= 5
     assert enforced["max_real_position_notional_usdt"] == pytest.approx(5.58)
     assert enforced["max_real_loss_per_trade_usdt"] == pytest.approx(0.31)
-    assert enforced["max_risk_per_trade_pct"] == pytest.approx(5.0)
+    assert enforced["max_risk_per_trade_pct"] == pytest.approx(10.0)
     assert enforced["max_open_positions"] == 1
 
 
@@ -285,8 +285,45 @@ def test_live_real_risk_input_safe_and_bounds():
     assert emas.parse_live_real_risk_pct_input("safe", cfg) == pytest.approx(0.001)
     assert emas.parse_live_real_risk_pct_input("0.5", cfg) == pytest.approx(0.005)
     assert emas.parse_live_real_risk_pct_input("5", cfg) == pytest.approx(0.05)
+    assert emas.parse_live_real_risk_pct_input("10", cfg) == pytest.approx(0.10)
     with pytest.raises(ValueError):
-        emas.parse_live_real_risk_pct_input("5.1", cfg)
+        emas.parse_live_real_risk_pct_input("10.1", cfg)
+
+
+def test_ten_percent_risk_scales_account_proportional_position_cap():
+    limits = emas.resolve_live_small_cap_limits(
+        {
+            "live_real_risk_pct_user": 0.10,
+            "default_real_risk_pct": 0.005,
+            "max_real_risk_pct": 0.10,
+            "max_real_position_notional_pct_of_equity": 0.09,
+            "scale_notional_cap_with_risk_pct": True,
+            "max_position_notional_pct_hard_limit": 1.0,
+        },
+        account_equity=100.0,
+    )
+
+    assert limits["risk_pct"] == pytest.approx(10.0)
+    assert limits["max_loss_per_trade_usdt"] == pytest.approx(10.0)
+    assert limits["max_position_notional_pct"] == pytest.approx(1.0)
+    assert limits["max_position_notional_usdt"] == pytest.approx(100.0)
+    assert limits["notional_scaled_by_risk"] is True
+
+
+def test_legacy_five_percent_live_cap_is_upgraded_without_changing_selected_risk():
+    cfg = live_cfg(
+        max_real_risk_pct=0.05,
+        scale_notional_cap_with_risk_pct=False,
+        max_position_notional_pct_hard_limit=0.50,
+        live_real_risk_pct_user=0.02,
+    )
+
+    enforced = emas.enforce_activation_stage(cfg)
+
+    assert enforced["max_real_risk_pct"] == pytest.approx(0.10)
+    assert enforced["scale_notional_cap_with_risk_pct"] is True
+    assert enforced["max_position_notional_pct_hard_limit"] == pytest.approx(1.0)
+    assert enforced["live_real_risk_pct_user"] == pytest.approx(0.02)
 
 
 def test_run_live_real_once_requires_stage(monkeypatch):
