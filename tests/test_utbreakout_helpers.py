@@ -2265,15 +2265,76 @@ class _BinanceAlgoExchange(_FakeExchange):
         self.algo_cancelled = []
         self.min_amount = float(min_amount or 0.0)
         self.min_cost = float(min_cost or 0.0)
+        for position in self.positions:
+            entry = float(position.get("entryPrice") or 0.0)
+            side = str(position.get("side") or "").lower()
+            if entry > 0 and not position.get("liquidationPrice"):
+                position["liquidationPrice"] = entry * (0.5 if side == "long" else 1.5)
+            position.setdefault("markPrice", entry)
+            position.setdefault("marginType", "isolated")
+            position.setdefault("leverage", 5)
+        for order in self.algo_orders:
+            if str(order.get("orderType") or "").upper() == "STOP_MARKET":
+                order.setdefault("workingType", "MARK_PRICE")
+                order.setdefault("priceProtect", False)
 
     def market(self, symbol):
         return {
+            "id": self._symbol_key(symbol),
             "symbol": symbol,
+            "precision": {"price": 0.01},
+            "info": {
+                "filters": [{"filterType": "PRICE_FILTER", "tickSize": "0.01"}],
+            },
             "limits": {
                 "amount": {"min": self.min_amount or None},
                 "cost": {"min": self.min_cost or None},
             },
         }
+
+    def fapiPrivatePostAlgoOrder(self, params=None):
+        params = dict(params or {})
+        algo_id = str(4000000 + len(self.algo_orders) + 1)
+        raw = {
+            "algoId": algo_id,
+            "clientAlgoId": params.get("clientAlgoId"),
+            "symbol": params.get("symbol"),
+            "orderType": params.get("type"),
+            "side": params.get("side"),
+            "quantity": params.get("quantity"),
+            "triggerPrice": params.get("triggerPrice"),
+            "reduceOnly": params.get("reduceOnly"),
+            "workingType": params.get("workingType"),
+            "priceProtect": params.get("priceProtect"),
+            "algoStatus": "NEW",
+            "createTime": 1000 + len(self.algo_orders),
+        }
+        self.algo_orders.append(raw)
+        self.created.append({
+            "id": algo_id,
+            "symbol": params.get("symbol"),
+            "type": str(params.get("type") or "").lower(),
+            "side": str(params.get("side") or "").lower(),
+            "amount": params.get("quantity"),
+            "price": None,
+            "reduceOnly": str(params.get("reduceOnly")).lower() == "true",
+            "clientOrderId": params.get("clientAlgoId"),
+            "workingType": params.get("workingType"),
+            "params": {
+                "stopPrice": params.get("triggerPrice"),
+                "workingType": params.get("workingType"),
+                "priceProtect": params.get("priceProtect"),
+            },
+            "info": dict(raw),
+        })
+        return raw
+
+    def fapiPrivateGetAlgoOrder(self, params=None):
+        client_id = str((params or {}).get("clientAlgoId") or "")
+        for order in self.algo_orders:
+            if str(order.get("clientAlgoId") or "") == client_id:
+                return dict(order)
+        return {}
 
     def fapiPrivateGetOpenAlgoOrders(self, params=None):
         params = dict(params or {})

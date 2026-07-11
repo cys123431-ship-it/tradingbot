@@ -161,7 +161,7 @@ OPPORTUNITY_OVERRIDES = {
     "soft_stop_enabled": True,
     "soft_stop_confirm_bars": 2,
     "near_miss_tp_enabled": True,
-    "near_miss_tp_arm_ratio": 0.94,
+    "near_miss_tp_arm_ratio": 0.86,
     "near_miss_tp_lock_r": 0.28,
     "near_miss_tp_rejection_atr": 0.12,
     "profit_alpha_stall_exit_max_current_r": 0.0,
@@ -531,30 +531,9 @@ def patch_signal_engine(cls):
             lock = asyncio.Lock()
             setattr(self, "_global_one_position_lock", lock)
         async with lock:
-            target = key(symbol)
-            try:
-                positions = await asyncio.to_thread(self.exchange.fetch_positions)
-                if not isinstance(positions, list):
-                    positions = []
-                for raw in positions:
-                    pos = active_position(self, raw)
-                    if not pos:
-                        continue
-                    info = pos.get("info", {}) if isinstance(pos.get("info"), dict) else {}
-                    held_symbol = pos.get("symbol") or info.get("symbol") or "unknown"
-                    if key(held_symbol) != target:
-                        reason = f"전체 동시 포지션 1개 제한: 보유 중 {held_symbol}"
-                        try:
-                            self.last_entry_reason[symbol] = reason
-                        except Exception:
-                            pass
-                        log.warning("entry blocked by one-position guard: %s %s; holding %s", symbol, side, held_symbol)
-                        await notify(self, f"⚠️ 진입 차단: {reason}")
-                        return None
-            except Exception as exc:
-                log.error("one-position guard position check failed: %s", exc)
-                await notify(self, f"⚠️ 진입 차단: 포지션 확인 실패 ({exc})")
-                return None
+            # The durable order gateway inside entry() owns the final portfolio
+            # decision and performs the last exchange check immediately before
+            # submission. This wrapper only serializes concurrent callers.
             return await original_entry(self, symbol, side, price, *args, **kwargs)
 
     if original_get_cfg is not None:

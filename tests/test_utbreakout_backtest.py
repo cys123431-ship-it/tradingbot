@@ -1,4 +1,7 @@
 import argparse
+import csv
+
+import pytest
 
 import scripts.utbreakout_backtest as bt
 from utbreakout.engine_router import LadderTP, TradeDecision
@@ -281,3 +284,138 @@ def test_backtest_uses_final_trade_decision_and_records_ladder_counts(monkeypatc
     assert result["engine_performance"]["TREND_CONTINUATION_LONG"]["trades"] >= 1
     assert result["ladder_tp1_count"] >= 1
     assert result["ladder_tp2_count"] >= 1
+
+
+def test_trailing_stop_calculated_at_close_activates_next_bar(monkeypatch):
+    rows = [_row(idx, 100.0) for idx in range(6)]
+    rows[2].update({"open": 100.0, "high": 161.0, "low": 90.0, "close": 160.0})
+    rows[3].update({"open": 160.0, "high": 171.0, "low": 164.0, "close": 170.0})
+    rows[4].update({"open": 170.0, "high": 171.0, "low": 167.0, "close": 168.0})
+
+    def forced_utbot_rows(rows, *, key_value, atr_period):
+        atr = [2.0 for _ in rows]
+        trail = [50.0 for _ in rows]
+        signal = [None for _ in rows]
+        bias = ["long" for _ in rows]
+        signal[0] = "long"
+        return atr, trail, signal, bias
+
+    monkeypatch.setattr(bt, "utbot_rows", forced_utbot_rows)
+    result = bt.simulate_utbot_rr(
+        rows,
+        key_value=2.0,
+        atr_period=10,
+        stop_atr_multiplier=5.0,
+        rr_multiple=10.0,
+        partial_take_profit_r_multiple=0.5,
+        partial_take_profit_ratio=0.5,
+        breakeven_after_partial=False,
+        trailing_atr_multiplier=1.0,
+        fee_bps=0.0,
+        slippage_bps=0.0,
+        time_stop_enabled=False,
+        signal_invalid_exit_enabled=False,
+    )
+
+    trade = result["trades_detail"][0]
+    assert trade["exit_idx"] == 4
+    assert trade["exit_reason"] == "SL"
+
+
+def test_mark_to_market_drawdown_includes_open_position_loss(monkeypatch):
+    rows = [_row(idx, 100.0) for idx in range(5)]
+    rows[2].update({"open": 100.0, "high": 101.0, "low": 79.0, "close": 80.0})
+    rows[3].update({"open": 100.0, "high": 111.0, "low": 99.0, "close": 110.0})
+    rows[4].update({"open": 110.0, "high": 111.0, "low": 109.0, "close": 110.0})
+
+    def forced_utbot_rows(rows, *, key_value, atr_period):
+        atr = [10.0 for _ in rows]
+        trail = [40.0 for _ in rows]
+        signal = [None for _ in rows]
+        bias = ["long" for _ in rows]
+        signal[0] = "long"
+        return atr, trail, signal, bias
+
+    monkeypatch.setattr(bt, "utbot_rows", forced_utbot_rows)
+    result = bt.simulate_utbot_rr(
+        rows,
+        key_value=2.0,
+        atr_period=10,
+        stop_atr_multiplier=5.0,
+        rr_multiple=10.0,
+        partial_take_profit_r_multiple=0.0,
+        partial_take_profit_ratio=0.0,
+        fee_bps=0.0,
+        slippage_bps=0.0,
+        time_stop_enabled=False,
+        signal_invalid_exit_enabled=False,
+    )
+
+    assert result["net_pnl"] > 0
+    assert result["max_drawdown_usdt"] > 0
+    assert any(point["unrealized_pnl"] < 0 for point in result["equity_curve"])
+
+
+def test_actual_funding_applies_only_on_marked_funding_event(monkeypatch):
+    rows = [_row(idx, 100.0) for idx in range(5)]
+    for row in rows:
+        row["funding_rate"] = 0.001
+    rows[2]["funding_event"] = True
+
+    def forced_utbot_rows(rows, *, key_value, atr_period):
+        atr = [10.0 for _ in rows]
+        trail = [40.0 for _ in rows]
+        signal = [None for _ in rows]
+        bias = ["long" for _ in rows]
+        signal[0] = "long"
+        return atr, trail, signal, bias
+
+    monkeypatch.setattr(bt, "utbot_rows", forced_utbot_rows)
+    result = bt.simulate_utbot_rr(
+        rows,
+        key_value=2.0,
+        atr_period=10,
+        stop_atr_multiplier=5.0,
+        rr_multiple=10.0,
+        fee_bps=0.0,
+        slippage_bps=0.0,
+        funding_mode="actual",
+        time_stop_enabled=False,
+        signal_invalid_exit_enabled=False,
+    )
+
+    trade = result["trades_detail"][0]
+    expected_once = trade["entry_price"] * trade["initial_qty"] * 0.001
+    assert result["funding_mode"] == "actual"
+    assert trade["funding_abs"] == pytest.approx(expected_once)
+
+
+def test_csv_loader_preserves_actual_funding_event_fields(tmp_path):
+    path = tmp_path / "ohlcv.csv"
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "timestamp", "open", "high", "low", "close", "volume",
+                "funding_rate", "funding_timestamp", "funding_event",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "timestamp": 1,
+                "open": 100,
+                "high": 101,
+                "low": 99,
+                "close": 100,
+                "volume": 10,
+                "funding_rate": 0.001,
+                "funding_timestamp": 1,
+                "funding_event": "true",
+            }
+        )
+
+    row = bt.load_ohlcv_csv(path)[0]
+    assert row["funding_rate"] == pytest.approx(0.001)
+    assert row["funding_timestamp"] == "1"
+    assert row["funding_event"] is True

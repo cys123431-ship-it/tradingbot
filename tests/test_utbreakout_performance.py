@@ -26,6 +26,10 @@ def test_performance_metrics_include_risk_and_capture_stats():
     assert result["profit_factor"] == 2.8
     assert result["max_drawdown_usdt"] == 10
     assert result["avg_mfe_capture_ratio"] == 0.5
+    assert result["expectancy_r"] == result["avg_r"]
+    assert result["net_profit_usdt"] == result["total_pnl_usdt"]
+    assert result["daily_sharpe_annualized"] is None
+    assert result["sharpe_basis"] == "trade_return_unannualized"
 
 
 def test_performance_profit_factor_is_infinite_without_losses():
@@ -63,3 +67,16 @@ def test_deflated_sharpe_proxy_rejects_low_sharpe_many_trials():
 def test_oos_failure_and_pbo_proxy_reject_strategy():
     assert passes_oos_rules({"trades": 3, "average_R": 1.0, "profit_factor": 2.0}) is False
     assert pbo_proxy([True, False, False, True]) == 0.5
+
+
+def test_missing_drawdown_is_not_treated_as_zero():
+    incomplete = {
+        "trade_count": 20,
+        "expectancy_r": 0.2,
+        "profit_factor": 2.0,
+        "max_drawdown_usdt": 10.0,
+        "win_rate": 0.6,
+        "net_profit_usdt": 20.0,
+    }
+
+    assert passes_oos_rules(incomplete) is False

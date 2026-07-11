@@ -33,6 +33,22 @@ from pykalman import KalmanFilter as PyKalmanFilter
 from datetime import datetime, timezone, timedelta
 from collections import Counter, deque
 from zoneinfo import ZoneInfo
+from trading_safety.order_gateway import IdempotentOrderGateway
+from trading_safety.order_state import (
+    OrderState,
+    SQLiteTradingStateStore,
+    atomic_write_json,
+)
+from trading_safety.reconciliation import reconcile_exchange_state
+from trading_safety.user_data_stream import BinanceUserDataStream
+from trading_safety.process_lock import ProcessLock, ProcessLockError
+from trading_safety.binance_algo_gateway import BinanceAlgoOrderGateway, CONDITIONAL_TYPES
+from trading_safety.liquidation_guard import (
+    as_decimal,
+    estimate_isolated_liquidation_price,
+    resolve_liquidation_safety_config,
+    validate_stop_against_liquidation,
+)
 try:
     from dual_mode_fractal_strategy import DualModeFractalStrategy
     DUAL_MODE_AVAILABLE = True
@@ -1081,7 +1097,7 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "soft_stop_enabled": True,
         "soft_stop_confirm_bars": 2,
         "near_miss_tp_enabled": True,
-        "near_miss_tp_arm_ratio": 0.94,
+        "near_miss_tp_arm_ratio": 0.86,
         "near_miss_tp_lock_r": 0.28,
         "near_miss_tp_rejection_atr": 0.12,
         "market_regime_engine_enabled": True,
@@ -1642,7 +1658,7 @@ def apply_stable_utbreak_final_overrides(cfg):
         "soft_stop_enabled": True,
         "soft_stop_confirm_bars": 2,
         "near_miss_tp_enabled": True,
-        "near_miss_tp_arm_ratio": 0.94,
+        "near_miss_tp_arm_ratio": 0.86,
         "near_miss_tp_lock_r": 0.28,
         "near_miss_tp_rejection_atr": 0.12,
         "market_regime_engine_enabled": True,
@@ -3664,8 +3680,7 @@ class TradingConfig:
 
     def save_config_sync(self):
         try:
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(self.config, f, indent=4, ensure_ascii=False)
+            atomic_write_json(self.config_file, self.config, indent=4, ensure_ascii=False)
             return True
         except Exception as e:
             logger.error(f"Config save error: {e}")
@@ -4122,6 +4137,9 @@ class BaseEngine:
         for field, keys in {
             'entryPrice': ('entryPrice', 'entry_price', 'entry_price', 'entryPrice'),
             'markPrice': ('markPrice', 'mark_price', 'markPrice'),
+            'liquidationPrice': ('liquidationPrice', 'liquidation_price', 'liquidationPrice'),
+            'leverage': ('leverage',),
+            'isolatedMargin': ('isolatedMargin', 'isolated_margin'),
             'unrealizedPnl': ('unrealizedPnl', 'unRealizedProfit', 'unrealizedProfit'),
             'percentage': ('percentage', 'unrealizedPnlPercent'),
         }.items():
@@ -4132,6 +4150,13 @@ class BaseEngine:
                 normalized[field] = value
         normalized['raw_position'] = position
         normalized['positionSide'] = str(info.get('positionSide') or position.get('positionSide') or '').upper()
+        normalized['marginType'] = str(
+            position.get('marginType')
+            or position.get('marginMode')
+            or info.get('marginType')
+            or info.get('marginMode')
+            or ''
+        ).lower()
         return normalized
 
     def _close_order_params_for_position(self, position):
@@ -4159,15 +4184,13 @@ class BaseEngine:
         try:
             await asyncio.to_thread(self.exchange.set_position_mode, hedged=False, symbol=symbol)
         except Exception as e:
-            # ?대? ?ㅼ젙?섏뼱 ?덇굅??吏?먰븯吏 ?딅뒗 寃쎌슦 臾댁떆 (濡쒓렇 ?앸왂 媛??
-            pass
+            logger.warning("Position mode verification/setup failed for %s: %s", symbol, e)
 
         # 2. Margin Mode: ISOLATED (媛뺤젣)
         try:
             await asyncio.to_thread(self.exchange.set_margin_mode, 'ISOLATED', symbol)
         except Exception as e:
-            # ?대? 寃⑸━ 紐⑤뱶?????덉쓬
-            pass
+            logger.warning("Isolated margin setup failed for %s: %s", symbol, e)
 
             # 3. Leverage Setting
         try:
@@ -5030,6 +5053,66 @@ class TemaEngine(BaseEngine):
                     accounting_symbol,
                     exc_info=True,
                 )
+            try:
+                state_data = state if isinstance(state, dict) else {}
+                risk_distance = float(state_data.get('risk_distance') or 0.0)
+                filled_qty = float((open_trade or {}).get('quantity') or 0.0)
+                risk_usdt = risk_distance * filled_qty
+                realized_r = (
+                    float(result.get('pnl') or 0.0) / risk_usdt
+                    if risk_usdt > 0
+                    else 0.0
+                )
+                active_records = []
+                store = getattr(self, 'trading_state_store', None)
+                if store is None and hasattr(self, 'crypto_entry_lock_reason'):
+                    _ensure_trading_safety_runtime(self)
+                    store = getattr(self, 'trading_state_store', None)
+                if store is not None:
+                    active_records = store.active_for_symbol(accounting_symbol)
+                entry_record = active_records[0] if active_records else None
+                trade_key = "|".join(
+                    (
+                        accounting_symbol,
+                        str((open_trade or {}).get('side') or ''),
+                        str((open_trade or {}).get('entry_time') or ''),
+                    )
+                )
+                live_trade = {
+                    'trade_id': hashlib.sha256(trade_key.encode('utf-8')).hexdigest()[:24],
+                    'client_order_id': getattr(entry_record, 'client_order_id', None),
+                    'strategy': getattr(entry_record, 'strategy', None) or state_data.get('strategy'),
+                    'engine': state_data.get('engine') or getattr(entry_record, 'strategy', None),
+                    'symbol': accounting_symbol,
+                    'side': (open_trade or {}).get('side'),
+                    'entry_time': (open_trade or {}).get('entry_time'),
+                    'exit_time': datetime.now(timezone.utc).isoformat(),
+                    'entry_price': (open_trade or {}).get('entry_price'),
+                    'exit_price': result.get('exit_price'),
+                    'requested_qty': getattr(entry_record, 'requested_qty', filled_qty),
+                    'filled_qty': filled_qty,
+                    'gross_pnl_usdt': result.get('pnl'),
+                    'entry_fee_usdt': None,
+                    'exit_fee_usdt': None,
+                    'funding_usdt': None,
+                    'slippage_usdt': None,
+                    'net_pnl_usdt': result.get('pnl'),
+                    'r_multiple': realized_r,
+                    'realized_r': realized_r,
+                    'mfe_r': state_data.get('mfe_r'),
+                    'mae_r': state_data.get('mae_r'),
+                    'exit_reason': close_reason,
+                    'provisional': True,
+                }
+                if store is not None:
+                    record_live_trade_result(live_trade, store=store)
+                else:
+                    logger.warning(
+                        "Live trade persistence unavailable for %s outside initialized runtime",
+                        accounting_symbol,
+                    )
+            except Exception:
+                logger.exception("Persistent live trade result recording failed for %s", accounting_symbol)
         return result
 
     async def exit_position(self, symbol, reason):
@@ -5154,6 +5237,10 @@ class SignalEngine(BaseEngine):
         self.micro_auto_last_rejects = {}  # symbol -> latest Micro Auto reject payload
         self.micro_auto_last_scan = {}  # latest Micro Auto feasibility scan report
         self.last_entry_reason = {}        # symbol -> latest entry decision reason
+        self.trading_state_store = None
+        self.idempotent_order_gateway = None
+        self.user_data_stream = None
+        self.crypto_entry_lock_reason = 'RECONCILIATION_REQUIRED'
 
     def start(self):
         super().start()
@@ -5175,11 +5262,80 @@ class SignalEngine(BaseEngine):
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(
-                self._recover_open_utbreakout_positions_on_start(),
-                name='utbreakout-protection-startup-recovery',
+                self._startup_crypto_safety_reconciliation(),
+                name='crypto-trading-safety-startup-reconciliation',
             )
         except RuntimeError:
-            logger.warning("UTBreak startup protection recovery skipped: no running event loop")
+            logger.warning("Crypto startup reconciliation skipped: no running event loop")
+
+    def _set_crypto_entry_lock(self, reason):
+        self.crypto_entry_lock_reason = str(reason or '') or None
+        store = getattr(self, 'trading_state_store', None)
+        if store is not None:
+            store.set_runtime_state('entry_lock_reason', self.crypto_entry_lock_reason)
+
+    async def _reconcile_crypto_exchange_state(self):
+        _ensure_trading_safety_runtime(self)
+        common = self.get_runtime_common_settings() if hasattr(self, 'get_runtime_common_settings') else {}
+        result = await reconcile_exchange_state(
+            self.exchange,
+            self.trading_state_store,
+            single_position=bool(common.get('single_position_mode', True)),
+            liquidation_config=common,
+        )
+        self.last_crypto_reconciliation = result.__dict__
+        if result.safe_to_trade and not load_critical_pause_state():
+            self._set_crypto_entry_lock(None)
+        else:
+            self._set_crypto_entry_lock('RECONCILIATION_REQUIRED: ' + ', '.join(result.issues[:5]))
+        logger.warning(
+            "CRYPTO_RECONCILIATION safe=%s positions=%d open_orders=%d issues=%s",
+            result.safe_to_trade,
+            len(result.positions),
+            len(result.open_orders),
+            result.issues,
+        )
+        return result
+
+    async def _startup_crypto_safety_reconciliation(self):
+        self._set_crypto_entry_lock('RECONCILIATION_REQUIRED')
+        try:
+            await self._reconcile_crypto_exchange_state()
+            await self._recover_open_utbreakout_positions_on_start()
+            final = await self._reconcile_crypto_exchange_state()
+            if not final.safe_to_trade:
+                if getattr(self, 'ctrl', None) is not None:
+                    await self.ctrl.notify(
+                        "CRITICAL: exchange reconciliation required. New entries are locked. "
+                        + '; '.join(final.issues[:5])
+                    )
+                return
+            common = self.get_runtime_common_settings() if hasattr(self, 'get_runtime_common_settings') else {}
+            if bool(common.get('user_data_stream_enabled', True)) and not self.is_upbit_mode():
+                self._set_crypto_entry_lock('USER_STREAM_CONNECTING')
+                async def _stream_reconcile():
+                    refreshed = await self._reconcile_crypto_exchange_state()
+                    return bool(refreshed.safe_to_trade)
+
+                self.user_data_stream = BinanceUserDataStream(
+                    self.exchange,
+                    self.trading_state_store,
+                    testnet=bool(common.get('testnet', False)),
+                    reconcile_callback=_stream_reconcile,
+                    lock_callback=self._set_crypto_entry_lock,
+                )
+                self.user_data_stream.start()
+        except Exception as exc:
+            self._set_crypto_entry_lock(f'RECONCILIATION_REQUIRED: {type(exc).__name__}')
+            logger.exception("Crypto startup safety reconciliation failed")
+            if getattr(self, 'ctrl', None) is not None:
+                try:
+                    await self.ctrl.notify(
+                        f"CRITICAL: startup exchange reconciliation failed ({type(exc).__name__}). "
+                        "New entries are locked."
+                    )
+                except Exception:
+                    logger.exception("Startup reconciliation Telegram alert failed")
 
     def reset_entry_runtime_state(self):
         self.last_candle_time = {}
@@ -5301,8 +5457,7 @@ class SignalEngine(BaseEngine):
             stats = getattr(self, 'utbreakout_profit_alpha_meta_stats', {})
             path = self._utbreakout_profit_alpha_meta_path()
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(stats if isinstance(stats, dict) else {}, f, indent=4)
+            atomic_write_json(path, stats if isinstance(stats, dict) else {}, indent=4)
             logger.info(
                 "Saved UTBreakout profit alpha meta stats: count=%s path=%s",
                 len(stats) if isinstance(stats, dict) else 0,
@@ -5676,8 +5831,7 @@ class SignalEngine(BaseEngine):
             lockouts = getattr(self, 'utbreakout_daily_sl_symbol_lockouts', {})
             path = self._utbreakout_daily_sl_lockouts_path()
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(lockouts, f, indent=4)
+            atomic_write_json(path, lockouts, indent=4)
             logger.info(
                 "Saved UTBreakout daily SL lockouts: count=%s path=%s",
                 len(lockouts) if isinstance(lockouts, dict) else 0,
@@ -12266,7 +12420,7 @@ class SignalEngine(BaseEngine):
             'soft_stop_confirm_bars': int(plan.get('soft_stop_confirm_bars', cfg.get('soft_stop_confirm_bars', 2)) or 2),
             'soft_stop_breach_count': 0,
             'near_miss_tp_enabled': bool(plan.get('near_miss_tp_enabled', cfg.get('near_miss_tp_enabled', True))),
-            'near_miss_tp_arm_ratio': max(0.50, min(0.99, float(plan.get('near_miss_tp_arm_ratio', cfg.get('near_miss_tp_arm_ratio', 0.94)) or 0.94))),
+            'near_miss_tp_arm_ratio': max(0.50, min(0.99, float(plan.get('near_miss_tp_arm_ratio', cfg.get('near_miss_tp_arm_ratio', 0.86)) or 0.86))),
             'near_miss_tp_lock_r': max(0.0, float(plan.get('near_miss_tp_lock_r', cfg.get('near_miss_tp_lock_r', 0.28)) or 0.28)),
             'near_miss_tp_rejection_atr': max(0.0, float(plan.get('near_miss_tp_rejection_atr', cfg.get('near_miss_tp_rejection_atr', 0.12)) or 0.12)),
             'near_miss_tp1_armed': False,
@@ -12485,7 +12639,7 @@ class SignalEngine(BaseEngine):
         try:
             strategy_params = self.get_runtime_strategy_params()
             active_strategy = str(strategy_params.get('active_strategy') or '').lower()
-            if active_strategy not in UTBREAKOUT_STRATEGIES or self.is_upbit_mode():
+            if self.is_upbit_mode():
                 return {'status': 'SKIPPED', 'recovered': 0}
             positions = await asyncio.to_thread(self.exchange.fetch_positions)
         except Exception as exc:
@@ -12505,22 +12659,31 @@ class SignalEngine(BaseEngine):
                 if not symbol:
                     continue
                 self.active_symbols.add(symbol)
-                state = await self._recover_utbreakout_trailing_state_from_exchange(
-                    symbol,
-                    pos,
-                    strategy_params,
-                )
-                if not isinstance(state, dict):
-                    continue
-                recovered += 1
-                cfg = self._get_utbot_filtered_breakout_config(strategy_params)
-                await self._audit_and_repair_live_ladder_protection(
-                    symbol,
-                    pos,
-                    state,
-                    cfg,
-                    reason='UTBreak startup protection recovery',
-                )
+                state = None
+                if active_strategy in UTBREAKOUT_STRATEGIES:
+                    state = await self._recover_utbreakout_trailing_state_from_exchange(
+                        symbol,
+                        pos,
+                        strategy_params,
+                    )
+                if isinstance(state, dict):
+                    recovered += 1
+                    cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+                    await self._audit_and_repair_live_ladder_protection(
+                        symbol,
+                        pos,
+                        state,
+                        cfg,
+                        reason='UTBreak startup protection recovery',
+                    )
+                else:
+                    await self._audit_protection_orders(
+                        symbol,
+                        pos=pos,
+                        expected_tp=False,
+                        expected_sl=True,
+                        alert=True,
+                    )
                 audited += 1
             except Exception as exc:
                 logger.exception(
@@ -15657,6 +15820,7 @@ class SignalEngine(BaseEngine):
             f"Active: {active_strategy == DUAL_ALPHA_STRATEGY}",
             "Mode: UTBreakout + RSPT both watched, one selected, existing risk/TP/SL/order path.",
             f"Symbol: {symbol or 'no recent symbol'}",
+            *_crypto_safety_status_lines(self),
             self._format_dual_alpha_order_path_status(order_path),
             "",
             *self._format_dual_alpha_current_position_lines(position_status),
@@ -16995,7 +17159,7 @@ class SignalEngine(BaseEngine):
         status['position_sizing_components'] = position_sizing.get('components')
         status['position_sizing_reasons'] = position_sizing.get('reasons')
         status['raw_final_risk_multiplier_before_position_sizing'] = raw_final_risk_multiplier_before_position_sizing
-        if bool(position_sizing.get('blocked')) and float(raw_final_risk_multiplier or 0.0) <= 0.0:
+        if bool(position_sizing.get('blocked')):
             return _finish(
                 None,
                 "REJECTED_POSITION_SIZING: " + "; ".join(position_sizing.get('reasons') or ['position sizing blocked']),
@@ -17328,7 +17492,7 @@ class SignalEngine(BaseEngine):
             'soft_stop_enabled': bool(cfg.get('soft_stop_enabled', True)),
             'soft_stop_confirm_bars': int(cfg.get('soft_stop_confirm_bars', 2) or 2),
             'near_miss_tp_enabled': bool(cfg.get('near_miss_tp_enabled', True)),
-            'near_miss_tp_arm_ratio': float(cfg.get('near_miss_tp_arm_ratio', 0.94) or 0.94),
+            'near_miss_tp_arm_ratio': float(cfg.get('near_miss_tp_arm_ratio', 0.86) or 0.86),
             'near_miss_tp_lock_r': float(cfg.get('near_miss_tp_lock_r', 0.28) or 0.28),
             'near_miss_tp_rejection_atr': float(cfg.get('near_miss_tp_rejection_atr', 0.12) or 0.12),
             'profit_alpha_stall_exit_max_current_r': float(cfg.get('profit_alpha_stall_exit_max_current_r', 0.0) or 0.0),
@@ -19451,9 +19615,10 @@ class SignalEngine(BaseEngine):
                 except Exception as exc:
                     logger.warning("UTBreakout status position sizing failed for %s: %s", symbol, exc)
                     raw_final_risk_multiplier_status = raw_before_position_sizing_status
-            final_risk_multiplier_status = _apply_utbreakout_risk_multiplier_floor(
-                raw_final_risk_multiplier_status,
-                cfg,
+            final_risk_multiplier_status = (
+                0.0
+                if bool(position_sizing_status.get('blocked'))
+                else _apply_utbreakout_risk_multiplier_floor(raw_final_risk_multiplier_status, cfg)
             )
 
             base_max_risk = float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
@@ -20874,9 +21039,10 @@ class SignalEngine(BaseEngine):
                 except Exception as exc:
                     logger.warning("UTBreakout status position sizing failed for %s: %s", symbol, exc)
                     raw_final_risk_multiplier_status = raw_before_position_sizing_status
-            final_risk_multiplier_status = _apply_utbreakout_risk_multiplier_floor(
-                raw_final_risk_multiplier_status,
-                cfg,
+            final_risk_multiplier_status = (
+                0.0
+                if bool(position_sizing_status.get('blocked'))
+                else _apply_utbreakout_risk_multiplier_floor(raw_final_risk_multiplier_status, cfg)
             )
 
             base_max_risk = float(cfg.get('max_risk_per_trade_usdt', 1.0) or 1.0)
@@ -21250,6 +21416,7 @@ class SignalEngine(BaseEngine):
             "🚦 UT Breakout 조건 스테이터스",
             *build_utbreakout_effective_status_contract(cfg, daily_entries),
             *position_scan_context,
+            *_crypto_safety_status_lines(self),
             "실행 게이트",
             f"LONG: {long_gate_lbl}",
             f"SHORT: {short_gate_lbl}",
@@ -31079,6 +31246,71 @@ class SignalEngine(BaseEngine):
             # [Enforce] Market Settings (Isolated + Leverage)
             await self.ensure_market_settings(symbol, leverage=lev)
 
+            liquidation_payload = dict(cfg or {})
+            if isinstance(filtered_breakout_plan, dict):
+                liquidation_payload.update(filtered_breakout_plan)
+            liquidation_stop = self._extract_liquidation_stop_price(
+                side,
+                price,
+                liquidation_payload,
+                lev,
+            )
+            liquidation_preflight = await self._preflight_liquidation_safety(
+                symbol,
+                side,
+                price,
+                liquidation_stop,
+                lev,
+                qty,
+                liquidation_payload,
+            )
+            if not liquidation_preflight.get('valid'):
+                reason = liquidation_preflight.get('reason') or liquidation_preflight.get('status')
+                self.last_entry_reason[symbol] = f"ENTRY_REJECTED_LIQUIDATION_CONFLICT:{reason}"
+                if active_strategy in UTBREAKOUT_STRATEGIES:
+                    self._utbreakout_trace_event(
+                        symbol,
+                        'ENTRY_BLOCKED',
+                        'ENTRY_REJECTED_LIQUIDATION_CONFLICT',
+                        side=side,
+                        stop_price=liquidation_stop,
+                        liquidation_price=liquidation_preflight.get('liquidation_price'),
+                        reason=reason,
+                    )
+                    self._clear_utbot_filtered_breakout_entry_plan(symbol)
+                await self.ctrl.notify(
+                    "[진입 거부] 전략 스탑이 청산가보다 늦게 발동합니다.\n"
+                    f"심볼: {self.ctrl.format_symbol_for_display(symbol)}\n"
+                    f"방향: {side.upper()}\n스탑: {liquidation_stop}\n"
+                    f"예상 청산가: {liquidation_preflight.get('liquidation_price')}\n"
+                    f"이유: {reason}"
+                )
+                return
+            selected_leverage = int(liquidation_preflight.get('selected_leverage') or lev)
+            if selected_leverage < lev:
+                lev = selected_leverage
+                max_notional = free * lev * safety_buffer
+                if target_notional > max_notional:
+                    target_notional = max_notional
+                    qty = self.safe_amount(symbol, target_notional / max(float(price), 1e-9))
+                    margin_to_use = target_notional / max(float(lev), 1e-9)
+                await self.ensure_market_settings(symbol, leverage=lev)
+                liquidation_preflight = await self._preflight_liquidation_safety(
+                    symbol,
+                    side,
+                    price,
+                    liquidation_stop,
+                    lev,
+                    qty,
+                    liquidation_payload,
+                )
+                if not liquidation_preflight.get('valid'):
+                    await self.ctrl.notify(
+                        f"[진입 거부] 자동 레버리지 감소 후 청산가 검증 실패: {symbol} / "
+                        f"{liquidation_preflight.get('reason')}"
+                    )
+                    return
+
             # await asyncio.to_thread(self.exchange.set_leverage, lev, symbol) # Redundant, handled above
             logger.warning(
                 "[ORDER_ATTEMPT] symbol=%s side=%s qty=%s price=%s notional=%.4f "
@@ -31113,14 +31345,23 @@ class SignalEngine(BaseEngine):
                 except Exception:
                     logger.debug("order attempt notify skipped", exc_info=True)
 
+            entry_client_order_id = None
             try:
-                order = await asyncio.to_thread(
-                    self.exchange.create_order,
+                submission, submission_error = await _submit_idempotent_crypto_entry(
+                    self,
                     symbol,
-                    'market',
-                    'buy' if side == 'long' else 'sell',
+                    side,
                     qty,
+                    active_strategy or 'SIGNAL_ENGINE',
+                    filtered_breakout_plan or cfg,
                 )
+                if submission_error:
+                    raise RuntimeError(
+                        f"idempotent order gate: "
+                        f"{getattr(submission, 'state', 'BLOCKED')} / {submission_error}"
+                    )
+                order = submission.order or {}
+                entry_client_order_id = submission.client_order_id
             except Exception as order_exc:
                 if active_strategy in UTBREAKOUT_STRATEGIES:
                     self._utbreakout_trace_event(
@@ -31211,6 +31452,17 @@ class SignalEngine(BaseEngine):
                     f"(order_id={order.get('id') if isinstance(order, dict) else None})"
                 )
                 self.last_entry_reason[symbol] = failure_reason
+                _mark_crypto_entry_state(
+                    self,
+                    entry_client_order_id,
+                    OrderState.SUBMITTED_UNKNOWN,
+                    last_error=failure_reason,
+                )
+                self.crypto_entry_lock_reason = f"SUBMITTED_UNKNOWN:{entry_client_order_id}"
+                self.trading_state_store.set_runtime_state(
+                    'entry_lock_reason',
+                    self.crypto_entry_lock_reason,
+                )
                 if raw_symbol != symbol:
                     self.last_entry_reason[raw_symbol] = failure_reason
                 if not confirmation.get('position_fetch_ok'):
@@ -31240,8 +31492,46 @@ class SignalEngine(BaseEngine):
             ))
             if actual_qty <= 0:
                 logger.error(f"Confirmed entry has invalid quantity for {symbol}: {verify_pos}")
+                _mark_crypto_entry_state(
+                    self,
+                    entry_client_order_id,
+                    OrderState.SUBMITTED_UNKNOWN,
+                    last_error='confirmed entry quantity was invalid',
+                )
+                self.crypto_entry_lock_reason = f"SUBMITTED_UNKNOWN:{entry_client_order_id}"
                 return
             qty = self.safe_amount(symbol, actual_qty)
+            _mark_crypto_entry_state(
+                self,
+                entry_client_order_id,
+                OrderState.FILLED_UNVERIFIED_LIQUIDATION,
+                exchange_order_id=(order.get('id') if isinstance(order, dict) else None),
+                filled_qty=actual_qty,
+                average_fill_price=actual_entry_price,
+            )
+            actual_liquidation_payload = dict(cfg or {})
+            if isinstance(filtered_breakout_plan, dict):
+                actual_liquidation_payload.update(filtered_breakout_plan)
+            actual_stop_price = self._extract_liquidation_stop_price(
+                side,
+                actual_entry_price,
+                actual_liquidation_payload,
+                lev,
+            )
+            actual_liquidation_check = await self._verify_actual_liquidation_safety(
+                symbol,
+                side,
+                actual_stop_price,
+                verify_pos,
+                actual_liquidation_payload,
+                entry_client_order_id,
+            )
+            if not actual_liquidation_check.get('valid'):
+                self.last_entry_reason[symbol] = str(actual_liquidation_check.get('status'))
+                if active_strategy in UTBREAKOUT_STRATEGIES:
+                    self._clear_utbot_filtered_breakout_entry_plan(symbol)
+                return
+            verify_pos = actual_liquidation_check.get('position') or verify_pos
             self.db.log_trade_entry(symbol, side, actual_entry_price, float(qty))
             logger.info(
                 f"Entry confirmed: order={order.get('id', 'N/A')} "
@@ -31689,6 +31979,48 @@ class SignalEngine(BaseEngine):
                         )
 
             if verify_pos:
+                protection_audit = await self._audit_protection_orders(
+                    symbol,
+                    pos=verify_pos,
+                    expected_tp=None,
+                    expected_sl=True,
+                    alert=True,
+                )
+                if (
+                    protection_audit.get('fetch_ok')
+                    and protection_audit.get('sl_present')
+                    and not protection_audit.get('sl_qty_mismatch')
+                ):
+                    stop_orders = await self._collect_protection_orders(symbol)
+                    stop_order = next(
+                        (
+                            item for item in (stop_orders or [])
+                            if self._classify_protection_order(item) == 'sl'
+                        ),
+                        None,
+                    )
+                    _mark_crypto_entry_state(
+                        self,
+                        entry_client_order_id,
+                        OrderState.PROTECTED,
+                        stop_order_id=(
+                            self._protection_order_id(stop_order)
+                            if stop_order is not None
+                            else None
+                        ),
+                    )
+                    if str(getattr(self, 'crypto_entry_lock_reason', '') or '').startswith('FILLED_'):
+                        self._set_crypto_entry_lock(None)
+                else:
+                    self.crypto_entry_lock_reason = f"FILLED_UNPROTECTED:{entry_client_order_id}"
+                    self.trading_state_store.set_runtime_state(
+                        'entry_lock_reason',
+                        self.crypto_entry_lock_reason,
+                    )
+                    await self.ctrl.notify(
+                        f"CRITICAL: {self.ctrl.format_symbol_for_display(symbol)} is not verified "
+                        "as stop-loss protected. New entries are locked."
+                    )
                 logger.info(f"??Position verified: {verify_pos['side']} {verify_pos['contracts']}")
             else:
                 logger.warning("?좑툘 Position not found after entry (may take time to update)")
@@ -31814,6 +32146,76 @@ class SignalEngine(BaseEngine):
                 info.get('reduce_only'),
                 info.get('closePosition')
             )
+        )
+
+    def _protection_working_type(self, order):
+        if not isinstance(order, dict):
+            return ''
+        info = self._protection_order_info(order)
+        return str(
+            order.get('workingType')
+            or order.get('working_type')
+            or info.get('workingType')
+            or info.get('working_type')
+            or ''
+        ).strip().upper()
+
+    def _liquidation_safety_config(self, extra=None):
+        values = {}
+        try:
+            common = self.get_runtime_common_settings()
+            if isinstance(common, dict):
+                values.update(common)
+        except Exception:
+            logger.debug("Liquidation safety common config unavailable", exc_info=True)
+        if isinstance(extra, dict):
+            values.update(extra)
+        return resolve_liquidation_safety_config(values)
+
+    def _liquidation_tick_size(self, symbol):
+        try:
+            market = self.exchange.market(symbol)
+        except Exception:
+            market = {}
+        info = market.get('info', {}) if isinstance(market, dict) else {}
+        for item in info.get('filters', []) if isinstance(info, dict) else []:
+            if isinstance(item, dict) and item.get('filterType') == 'PRICE_FILTER':
+                tick = _safe_float_or_none(item.get('tickSize'))
+                if tick is not None and tick > 0:
+                    return tick
+        precision = market.get('precision', {}) if isinstance(market, dict) else {}
+        value = precision.get('price') if isinstance(precision, dict) else None
+        try:
+            number = float(value)
+            if number > 0:
+                return number if number < 1 else 10 ** (-int(number))
+        except (TypeError, ValueError, OverflowError):
+            pass
+        return 0.0
+
+    def _validate_position_stop_liquidation(self, symbol, pos, stop_price, working_type='MARK_PRICE', cfg=None):
+        if not pos:
+            return None
+        side = str(pos.get('side') or '').lower()
+        liquidation_price = _safe_float_or_none(
+            pos.get('liquidationPrice')
+            or pos.get('liquidation_price')
+            or self._protection_order_info(pos).get('liquidationPrice')
+        )
+        entry_price = _safe_float_or_none(pos.get('entryPrice') or pos.get('entry_price')) or 0.0
+        tick_size = self._liquidation_tick_size(symbol)
+        if side not in {'long', 'short'} or liquidation_price is None or liquidation_price <= 0 or tick_size <= 0:
+            return None
+        safety_cfg = self._liquidation_safety_config(cfg)
+        return validate_stop_against_liquidation(
+            side,
+            stop_price,
+            liquidation_price,
+            tick_size,
+            safety_cfg.minimum_buffer_pct,
+            safety_cfg.minimum_buffer_ticks,
+            working_type,
+            entry_price,
         )
 
     def _protection_order_type(self, order):
@@ -32206,6 +32608,9 @@ class SignalEngine(BaseEngine):
             'stopPrice': trigger_price,
             'triggerPrice': trigger_price,
             'reduceOnly': self._protection_bool(order.get('reduceOnly')),
+            'workingType': order.get('workingType'),
+            'priceProtect': order.get('priceProtect'),
+            'status': order.get('algoStatus') or order.get('status'),
             'timestamp': timestamp,
             'info': info,
             '_protection_source': 'binance_algo',
@@ -32734,6 +33139,10 @@ class SignalEngine(BaseEngine):
             'mismatch_cancelled': 0,
             'duplicate_cancelled': 0,
             'invalid_price_cancelled': 0,
+            'liquidation_safety': 'UNKNOWN',
+            'liquidation_safety_reason': None,
+            'liquidation_price': None,
+            'stop_working_type': None,
             'fetch_ok': True,
             'missing_confirmed': False,
             'status': 'SKIPPED'
@@ -32874,6 +33283,12 @@ class SignalEngine(BaseEngine):
         valid_sl = []
         mismatched = []
         invalid_price_orders = []
+        liquidation_unsafe_orders = []
+        liquidation_safety_results = []
+        enforce_liquidation_safety = (
+            str(getattr(self.exchange, 'id', '') or '').lower() == 'binance'
+            or _safe_float_or_none(pos.get('liquidationPrice') or pos.get('liquidation_price')) is not None
+        )
         for order in protection_orders:
             kind = self._classify_protection_order(order)
             order_side = self._protection_order_side(order)
@@ -32887,6 +33302,32 @@ class SignalEngine(BaseEngine):
             order_price = _safe_float_or_none(order.get('price')) or trigger_price
             if pos_entry_price > 0 and order_price:
                 if kind == 'sl':
+                    working_type = self._protection_working_type(order)
+                    liquidation_result = self._validate_position_stop_liquidation(
+                        symbol,
+                        pos,
+                        order_price,
+                        working_type,
+                    )
+                    if enforce_liquidation_safety:
+                        if liquidation_result is None:
+                            status['liquidation_safety'] = 'UNKNOWN'
+                            status['liquidation_safety_reason'] = 'LIQUIDATION_PRICE_UNAVAILABLE'
+                            status['stop_working_type'] = working_type or 'UNKNOWN'
+                            liquidation_unsafe_orders.append(order)
+                            continue
+                        liquidation_safety_results.append(liquidation_result)
+                        status['liquidation_price'] = float(liquidation_result.liquidation_price)
+                        status['liquidation_buffer_pct'] = float(liquidation_result.buffer_pct)
+                        status['stop_price'] = float(liquidation_result.stop_price)
+                        status['stop_working_type'] = liquidation_result.working_type
+                        if not liquidation_result.valid:
+                            status['liquidation_safety'] = 'UNSAFE'
+                            status['liquidation_safety_reason'] = liquidation_result.reason
+                            liquidation_unsafe_orders.append(order)
+                            continue
+                        status['liquidation_safety'] = 'SAFE'
+                        status['liquidation_safety_reason'] = liquidation_result.reason
                     invalid_sl = False if managed_sl_active else (
                         (pos_side == 'long' and float(order_price) >= pos_entry_price)
                         or (pos_side == 'short' and float(order_price) <= pos_entry_price)
@@ -32921,6 +33362,30 @@ class SignalEngine(BaseEngine):
                 reason='invalid protection price for current position',
                 orders=invalid_price_orders
             )
+
+        if liquidation_unsafe_orders:
+            status['invalid_price_cancelled'] += await self._cancel_protection_orders(
+                symbol,
+                reason='liquidation safety validation failed',
+                orders=liquidation_unsafe_orders,
+            )
+            status['sl_present'] = False
+            status['missing_sl'] = True
+            status['status'] = 'LIQUIDATION_SAFETY_FAILED'
+            reason = status.get('liquidation_safety_reason') or 'LIQUIDATION_PRICE_UNAVAILABLE'
+            self.last_protection_order_status[symbol] = status
+            if hasattr(self, '_handle_liquidation_safety_failure'):
+                close_status = await self._handle_liquidation_safety_failure(
+                    symbol,
+                    pos,
+                    reason,
+                    stop_price=status.get('stop_price'),
+                    working_type=status.get('stop_working_type'),
+                    cfg=None,
+                )
+                status['emergency_close_status'] = close_status.get('status')
+                status['emergency_close_closed'] = bool(close_status.get('closed'))
+            return status
 
         try:
             strategy_params = self.get_runtime_strategy_params()
@@ -33145,23 +33610,105 @@ class SignalEngine(BaseEngine):
         last_error = None
         total_attempts = max(1, int(max_attempts or 1))
         retry_delay = max(0.0, float(retry_delay_sec or 0.0))
+        client_order_id = str((params or {}).get('newClientOrderId') or '')
+        canonical_type = str(order_type or '').upper().replace('-', '_')
+        canonical_type = {
+            'STOP_MARKET': 'STOP_MARKET',
+            'TAKE_PROFIT_MARKET': 'TAKE_PROFIT_MARKET',
+        }.get(canonical_type, canonical_type)
+        is_binance_algo = (
+            str(getattr(self.exchange, 'id', '') or '').lower() == 'binance'
+            and canonical_type in CONDITIONAL_TYPES
+        )
+        algo_gateway = BinanceAlgoOrderGateway(self.exchange) if is_binance_algo else None
+        submit_params = dict(params or {})
+        if canonical_type == 'STOP_MARKET':
+            submit_params['workingType'] = 'MARK_PRICE'
+            submit_params['priceProtect'] = False
+
+        async def _recover_existing_protection_order():
+            if not client_order_id:
+                return None
+            fetch_ok, open_orders = await self._collect_protection_orders_checked(symbol)
+            if not fetch_ok:
+                return None
+            existing = next(
+                (
+                    order for order in (open_orders or [])
+                    if self._protection_client_order_id(order) == client_order_id
+                ),
+                None,
+            )
+            if existing is not None:
+                return existing
+            if algo_gateway is not None:
+                return await algo_gateway.fetch_by_client_id(client_order_id)
+            return None
+
         for attempt in range(1, total_attempts + 1):
-            try:
-                order = await asyncio.to_thread(
-                    self.exchange.create_order,
+            existing = await _recover_existing_protection_order()
+            if existing is not None:
+                logger.info(
+                    "%s protection order recovered before submit: %s clientOrderId=%s",
+                    label,
                     symbol,
-                    order_type,
-                    side,
-                    qty,
-                    price,
-                    params
+                    client_order_id,
                 )
+                return existing
+            try:
+                if algo_gateway is not None:
+                    trigger_price = submit_params.get('triggerPrice') or submit_params.get('stopPrice')
+                    if trigger_price in (None, ''):
+                        raise ValueError(f"{label} conditional order requires trigger price")
+                    order = await algo_gateway.create_conditional_order(
+                        symbol,
+                        canonical_type,
+                        side,
+                        qty,
+                        trigger_price=trigger_price,
+                        client_algo_id=client_order_id,
+                        reduce_only=bool(submit_params.get('reduceOnly', True)),
+                        working_type=str(submit_params.get('workingType') or 'MARK_PRICE'),
+                        price_protect=bool(submit_params.get('priceProtect', False)),
+                        position_side=submit_params.get('positionSide'),
+                        close_position=bool(submit_params.get('closePosition', False)),
+                        price=price,
+                    )
+                else:
+                    order = await asyncio.to_thread(
+                        self.exchange.create_order,
+                        symbol,
+                        order_type,
+                        side,
+                        qty,
+                        price,
+                        submit_params,
+                    )
                 if attempt > 1:
                     logger.info(f"{label} protection order succeeded on retry {attempt}: {symbol}")
                 return order
             except Exception as e:
                 last_error = e
                 logger.error(f"{label} order attempt {attempt}/{total_attempts} failed for {symbol}: {e}")
+                recovered = await _recover_existing_protection_order()
+                if recovered is not None:
+                    logger.warning(
+                        "%s protection response was lost but exchange order was recovered: %s clientOrderId=%s",
+                        label,
+                        symbol,
+                        client_order_id,
+                    )
+                    return recovered
+                error_name = type(e).__name__.lower()
+                error_text = str(e).lower()
+                ambiguous = (
+                    any(token in error_name for token in ('timeout', 'network', 'connection', 'exchangeunavailable'))
+                    or any(token in error_text for token in ('timed out', 'timeout', 'connection reset', 'response lost'))
+                )
+                if ambiguous:
+                    raise RuntimeError(
+                        f"{label} SUBMITTED_UNKNOWN and could not be reconciled: {e}"
+                    ) from e
             if attempt < total_attempts and retry_delay > 0:
                 await asyncio.sleep(retry_delay)
         raise last_error
@@ -33210,20 +33757,28 @@ class SignalEngine(BaseEngine):
             if float(qty) <= 0:
                 last_error = ValueError(f"invalid emergency close qty: {qty}")
                 break
-            close_side = 'sell' if side == 'long' else 'buy'
             params = self._close_order_params_for_position(pos)
 
             try:
                 status['attempts'] = attempt
-                await asyncio.to_thread(
-                    self.exchange.create_order,
-                    symbol,
-                    'market',
-                    close_side,
-                    qty,
-                    None,
-                    params
+                gateway = _ensure_trading_safety_runtime(self)
+                close_submission = await gateway.submit_reduce_only_close(
+                    strategy='EMERGENCY_PROTECTION_CLOSE',
+                    symbol=symbol,
+                    position_side=side,
+                    position_signature=(
+                        pos.get('timestamp')
+                        or pos.get('entryPrice')
+                        or f"{side}:{contracts}"
+                    ),
+                    qty=float(qty),
+                    reason=reason,
+                    params=params,
                 )
+                if close_submission.state == OrderState.SUBMITTED_UNKNOWN.value:
+                    raise RuntimeError(
+                        f"emergency close submission unknown: {close_submission.client_order_id}"
+                    )
             except Exception as close_error:
                 last_error = close_error
                 logger.error(
@@ -33261,6 +33816,7 @@ class SignalEngine(BaseEngine):
                         lockout_error,
                     )
                 status.update({'status': 'EMERGENCY_CLOSED', 'closed': True})
+                _mark_crypto_symbol_closed(self, symbol, reason)
                 await self.ctrl.notify(
                     f"🚨 {self.ctrl.format_symbol_for_display(symbol)} {protection_label} 생성 실패로 포지션을 즉시 시장가 청산했습니다."
                 )
@@ -33295,7 +33851,7 @@ class SignalEngine(BaseEngine):
         except Exception as pause_error:
             logger.error(f"Critical pause state update failed for {symbol}: {pause_error}")
         audit_fetch_ok, audit_pos = await self._fetch_server_position_checked(symbol)
-        if audit_fetch_ok:
+        if audit_fetch_ok and protection_label != 'LIQUIDATION_SAFETY':
             await self._audit_protection_orders(symbol, pos=audit_pos, alert=True)
         await self.ctrl.notify(
             f"🚨 {self.ctrl.format_symbol_for_display(symbol)} {protection_label} 생성 실패 후 긴급 청산도 실패했습니다. "
@@ -33325,6 +33881,33 @@ class SignalEngine(BaseEngine):
             return None
         sl_side = 'sell' if side == 'long' else 'buy'
         safe_stop = self.safe_price(symbol, float(stop_price))
+        if str(getattr(self.exchange, 'id', '') or '').lower() == 'binance':
+            position_fetch_ok, fresh_pos = await self._fetch_position_with_liquidation(symbol, pos)
+            liquidation_result = (
+                self._validate_position_stop_liquidation(
+                    symbol,
+                    fresh_pos,
+                    safe_stop,
+                    'MARK_PRICE',
+                )
+                if position_fetch_ok and fresh_pos
+                else None
+            )
+            if liquidation_result is None or not liquidation_result.valid:
+                failure_reason = (
+                    liquidation_result.reason
+                    if liquidation_result is not None
+                    else 'LIQUIDATION_PRICE_UNAVAILABLE'
+                )
+                await self._handle_liquidation_safety_failure(
+                    symbol,
+                    fresh_pos or pos,
+                    failure_reason,
+                    stop_price=safe_stop,
+                    working_type='MARK_PRICE',
+                )
+                return None
+            pos = fresh_pos
         initial_fetch_ok, initial_orders = await self._collect_protection_orders_checked(symbol)
         if not initial_fetch_ok:
             self.last_protection_order_status[symbol] = {
@@ -34412,13 +34995,49 @@ class SignalEngine(BaseEngine):
         add_qty = self.safe_amount(symbol, float(pyramid_plan.get('add_qty') or 0.0))
         if float(add_qty) <= 0:
             return {'status': 'BLOCKED', 'reason': 'pyramid quantity rounded to zero'}
+        entry_blocker = _crypto_entry_block_reason(self, symbol)
+        if entry_blocker:
+            return {'status': 'BLOCKED', 'reason': entry_blocker}
         await self.ensure_market_settings(symbol, leverage=int(max(1, float(leverage or 1))))
-        order = await asyncio.to_thread(self.exchange.create_order, symbol, 'market', 'buy', add_qty)
+        liquidation_preflight = await self._preflight_liquidation_safety(
+            symbol,
+            'long',
+            current_price,
+            breakeven_stop,
+            int(max(1, float(leverage or 1))),
+            base_qty + float(add_qty),
+            cfg,
+        )
+        if not liquidation_preflight.get('valid'):
+            return {
+                'status': 'BLOCKED',
+                'reason': liquidation_preflight.get('reason') or liquidation_preflight.get('status'),
+            }
+        gateway = _ensure_trading_safety_runtime(self)
+        add_stage = int(meta.get('pyramid_add_count', 0) or 0) + 1
+        add_submission = await gateway.submit_position_add(
+            strategy='AGGRESSIVE_GROWTH_PYRAMID',
+            symbol=symbol,
+            side='long',
+            signal_timestamp=state.get('last_bar_ts') or meta.get('last_update_ts') or int(time.time()),
+            qty=float(add_qty),
+            stage=str(add_stage),
+        )
+        if not add_submission.accepted:
+            return {
+                'status': add_submission.state,
+                'reason': add_submission.error or 'pyramid add order not accepted',
+                'client_order_id': add_submission.client_order_id,
+            }
+        order = add_submission.order or {}
         self.position_cache = None
         self.position_cache_time = 0
-        await asyncio.sleep(1)
-        new_pos = await self.get_server_position(symbol, use_cache=False)
+        _, new_pos = await self._fetch_position_with_liquidation(
+            symbol,
+            add_submission.position,
+        )
         if not new_pos or str(new_pos.get('side', '') or '').lower() != 'long':
+            self._set_crypto_entry_lock(f'SUBMITTED_UNKNOWN:{add_submission.client_order_id}')
             await self.ctrl.notify(
                 f"⚠️ Aggressive Growth 추가진입 후 포지션 확인 실패: {self.ctrl.format_symbol_for_display(symbol)}"
             )
@@ -34431,6 +35050,21 @@ class SignalEngine(BaseEngine):
                 f"⚠️ Aggressive Growth 추가진입 후 평균가/SL 검증 실패: {self.ctrl.format_symbol_for_display(symbol)}"
             )
             return {'status': 'BLOCKED', 'reason': 'average entry not above breakeven stop'}
+        actual_liquidation = await self._verify_actual_liquidation_safety(
+            symbol,
+            'long',
+            breakeven_stop,
+            new_pos,
+            cfg,
+            add_submission.client_order_id,
+        )
+        if not actual_liquidation.get('valid'):
+            return {
+                'status': actual_liquidation.get('status'),
+                'reason': 'pyramid post-fill liquidation safety failed',
+                'close_status': actual_liquidation.get('close_status'),
+            }
+        new_pos = actual_liquidation.get('position') or new_pos
         new_risk_distance = avg_entry - breakeven_stop
         growth_score = (
             pyramid_plan.get('growth_score')
@@ -34452,6 +35086,31 @@ class SignalEngine(BaseEngine):
             tp_targets=tp_targets,
             preserve_runner_qty=True
         )
+        post_add_audit = await self._audit_protection_orders(
+            symbol,
+            pos=new_pos,
+            expected_tp=True,
+            expected_sl=True,
+            alert=True,
+        )
+        if not (
+            post_add_audit.get('fetch_ok')
+            and post_add_audit.get('sl_present')
+            and not post_add_audit.get('sl_qty_mismatch')
+        ):
+            self._set_crypto_entry_lock(f'FILLED_UNPROTECTED:{add_submission.client_order_id}')
+            return {
+                'status': 'FILLED_UNPROTECTED',
+                'reason': 'pyramid add protection audit failed',
+                'audit': post_add_audit,
+            }
+        _mark_crypto_entry_state(
+            self,
+            add_submission.client_order_id,
+            OrderState.PROTECTED,
+        )
+        if str(getattr(self, 'crypto_entry_lock_reason', '') or '').startswith('FILLED_'):
+            self._set_crypto_entry_lock(None)
         effective_cfg = dict(cfg or {})
         effective_cfg.update({
             'partial_take_profit_enabled': True,
@@ -34600,6 +35259,30 @@ class SignalEngine(BaseEngine):
                 sl_side = 'buy'
                 if sl_distance is not None and sl_distance > 0:
                     sl_price = self.safe_price(symbol, entry_price + sl_distance)
+
+            if sl_price is not None and pos:
+                rounded_liquidation_check = await self._verify_actual_liquidation_safety(
+                    symbol,
+                    side,
+                    sl_price,
+                    pos,
+                    protection_cfg,
+                    None,
+                )
+                if not rounded_liquidation_check.get('valid'):
+                    self.last_protection_order_status[symbol] = {
+                        'tp_expected': bool(tp_targets or tp_distance),
+                        'sl_expected': True,
+                        'tp_present': False,
+                        'sl_present': False,
+                        'missing_tp': bool(tp_targets or tp_distance),
+                        'missing_sl': True,
+                        'liquidation_safety': 'UNSAFE',
+                        'liquidation_safety_reason': rounded_liquidation_check.get('status'),
+                        'status': 'LIQUIDATION_SAFETY_FAILED',
+                    }
+                    return
+                pos = rounded_liquidation_check.get('position') or pos
 
             tp_ladder_status = None
             raw_targets = tp_targets
@@ -34999,10 +35682,25 @@ class SignalEngine(BaseEngine):
                     f"Exit params attempt {attempt}/{max_retries}: "
                     f"{side} {qty} (position: {remaining_pos['side']} {remaining_contracts})"
                 )
-                order = await asyncio.to_thread(
-                    self.exchange.create_order, symbol, 'market', side, qty, None,
-                    params
+                gateway = _ensure_trading_safety_runtime(self)
+                close_submission = await gateway.submit_reduce_only_close(
+                    strategy='SIGNAL_ENGINE_EXIT',
+                    symbol=symbol,
+                    position_side=str(remaining_pos.get('side') or ''),
+                    position_signature=(
+                        initial_pos.get('timestamp')
+                        or initial_pos.get('entryPrice')
+                        or f"{initial_pos.get('side')}:{contracts}"
+                    ),
+                    qty=qty,
+                    reason=reason,
+                    params=params,
                 )
+                if close_submission.state == OrderState.SUBMITTED_UNKNOWN.value:
+                    raise RuntimeError(
+                        f"close order state unknown: {close_submission.client_order_id}"
+                    )
+                order = close_submission.order or {}
             except Exception as e:
                 last_error = e
                 logger.error(f"Exit attempt {attempt}/{max_retries} failed: {e}")
@@ -35081,7 +35779,14 @@ class SignalEngine(BaseEngine):
             self._clear_utsmc_fixed_exit_ob(symbol)
             self.utsmc_last_entry_signal_ts.pop(symbol, None)
 
-        self.db.log_trade_close(symbol, pnl, pnl_pct, exit_price, reason)
+        accounting_state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
+        await self._record_closed_trade_accounting(
+            symbol,
+            reason,
+            exit_price=exit_price,
+            state=accounting_state,
+        )
+        _mark_crypto_symbol_closed(self, symbol, reason)
         self._clear_utbreakout_trailing_state(symbol, finalize=True, reason=reason, exit_price=exit_price)
         self._clear_aggressive_growth_position(symbol)
         await self.ctrl.notify(
@@ -37252,9 +37957,7 @@ class MainController:
             'rss_mb': self._get_rss_mb()
         }
         try:
-            os.makedirs(os.path.dirname(self.heartbeat_file), exist_ok=True)
-            with open(self.heartbeat_file, 'w', encoding='utf-8') as f:
-                json.dump(payload, f, ensure_ascii=False)
+            atomic_write_json(self.heartbeat_file, payload, ensure_ascii=False, indent=None)
         except Exception as e:
             logger.error(f"Heartbeat write error: {e}")
 
@@ -37271,9 +37974,7 @@ class MainController:
             'rss_mb': self._get_rss_mb()
         }
         try:
-            os.makedirs(os.path.dirname(self.exit_file), exist_ok=True)
-            with open(self.exit_file, 'w', encoding='utf-8') as f:
-                json.dump(payload, f, ensure_ascii=False)
+            atomic_write_json(self.exit_file, payload, ensure_ascii=False, indent=None)
             logger.info(f"Exit marker recorded: {payload}")
         except Exception as e:
             logger.error(f"Exit marker write error: {e}")
@@ -46700,9 +47401,7 @@ def write_critical_pause_state(symbol, reason, exception, cfg=None):
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "manual_resume_required": True,
     }
-    os.makedirs("runtime", exist_ok=True)
-    with open(PAUSE_STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=4)
+    atomic_write_json(PAUSE_STATE_FILE, state, indent=4)
     return state
 
 def load_critical_pause_state():
@@ -47443,9 +48142,11 @@ def load_live_real_risk_state():
 
 
 def save_live_real_risk_state(state):
-    os.makedirs(os.path.dirname(LIVE_REAL_RISK_STATE_FILE) or ".", exist_ok=True)
-    with open(LIVE_REAL_RISK_STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state if isinstance(state, dict) else {}, f, indent=4)
+    atomic_write_json(
+        LIVE_REAL_RISK_STATE_FILE,
+        state if isinstance(state, dict) else {},
+        indent=4,
+    )
     return state
 
 
@@ -48747,6 +49448,541 @@ def _validate_live_order_plan_for_exchange(self, plan, cfg):
 # Hardened Execution Orchestrator
 # ==============================================================================
 
+def _ensure_trading_safety_runtime(self):
+    store = getattr(self, "trading_state_store", None)
+    if store is None:
+        exchange_id = str(getattr(getattr(self, "exchange", None), "id", "") or "").lower()
+        runtime_dir = getattr(self, "runtime_dir", None)
+        uninitialized_signal_engine = (
+            self.__class__.__name__ == "SignalEngine"
+            and not hasattr(self, "crypto_entry_lock_reason")
+        )
+        default_state_path = (
+            os.path.join(str(runtime_dir), "trading_state.sqlite3")
+            if runtime_dir
+            else ":memory:"
+            if exchange_id == "test" or uninitialized_signal_engine
+            else "runtime/trading_state.sqlite3"
+        )
+        state_path = os.getenv("CRYPTO_TRADING_STATE_DB", default_state_path)
+        store = SQLiteTradingStateStore(state_path)
+        self.trading_state_store = store
+    if not getattr(self, "_engine_performance_stats_restored", False):
+        _restore_engine_performance_stats(store)
+        self._engine_performance_stats_restored = True
+    gateway = getattr(self, "idempotent_order_gateway", None)
+    if gateway is None or gateway.exchange is not getattr(self, "exchange", None):
+        async def _position_fetcher(symbol):
+            if not hasattr(self, "position_cache"):
+                self.position_cache = None
+            if not hasattr(self, "position_cache_time"):
+                self.position_cache_time = 0
+            getter = getattr(self, "get_server_position")
+            try:
+                return await getter(symbol, use_cache=False)
+            except TypeError:
+                return await getter(symbol)
+        gateway = IdempotentOrderGateway(
+            self.exchange,
+            store,
+            position_fetcher=_position_fetcher,
+        )
+        self.idempotent_order_gateway = gateway
+    return gateway
+
+
+def _extract_liquidation_stop_price(self, side, entry_price, payload=None, leverage=None):
+    payload = payload if isinstance(payload, dict) else {}
+    for key in ('stop_loss', 'stop_loss_price', 'sl_price', 'initial_sl_price', 'stop_price'):
+        value = _safe_float_or_none(payload.get(key))
+        if value is not None and value > 0:
+            return value
+    risk_distance = _safe_float_or_none(payload.get('risk_distance'))
+    if risk_distance is not None and risk_distance > 0:
+        return (
+            float(entry_price) - risk_distance
+            if str(side).lower() == 'long'
+            else float(entry_price) + risk_distance
+        )
+    stop_loss_pct = _safe_float_or_none(payload.get('stop_loss_pct'))
+    if stop_loss_pct is not None and stop_loss_pct > 0 and leverage:
+        distance = float(entry_price) * (stop_loss_pct / 100.0) / max(float(leverage), 1.0)
+        return float(entry_price) - distance if str(side).lower() == 'long' else float(entry_price) + distance
+    return None
+
+
+def _binance_symbol_id(self, symbol):
+    try:
+        market = self.exchange.market(symbol)
+    except Exception:
+        market = {}
+    if isinstance(market, dict) and market.get('id'):
+        return str(market.get('id'))
+    return self._normalize_protection_symbol(symbol)
+
+
+async def _preflight_liquidation_safety(self, symbol, side, entry_price, stop_price, leverage, qty, cfg=None):
+    if self.is_upbit_mode() or str(getattr(self.exchange, 'id', '') or '').lower() != 'binance':
+        return {'valid': True, 'status': 'NOT_BINANCE_FUTURES', 'selected_leverage': int(leverage)}
+    if stop_price is None or float(stop_price or 0.0) <= 0:
+        return {'valid': False, 'status': 'LIQUIDATION_SAFETY_UNKNOWN', 'reason': 'STOP_PRICE_UNAVAILABLE'}
+
+    safety_cfg = self._liquidation_safety_config(cfg)
+    symbol_id = _binance_symbol_id(self, symbol)
+    tick_size = self._liquidation_tick_size(symbol)
+    if tick_size <= 0:
+        return {'valid': False, 'status': 'LIQUIDATION_SAFETY_UNKNOWN', 'reason': 'TICK_SIZE_UNAVAILABLE'}
+
+    symbol_config_method = getattr(self.exchange, 'fapiPrivateGetSymbolConfig', None)
+    bracket_method = getattr(self.exchange, 'fapiPrivateGetLeverageBracket', None)
+    if not callable(symbol_config_method) or not callable(bracket_method):
+        return {'valid': False, 'status': 'LIQUIDATION_SAFETY_UNKNOWN', 'reason': 'BINANCE_RISK_ENDPOINT_UNAVAILABLE'}
+    try:
+        symbol_config_raw = await asyncio.to_thread(symbol_config_method, {'symbol': symbol_id})
+        bracket_raw = await asyncio.to_thread(bracket_method, {'symbol': symbol_id})
+    except Exception as exc:
+        logger.exception("Liquidation safety preflight exchange lookup failed for %s", symbol)
+        return {
+            'valid': False,
+            'status': 'LIQUIDATION_SAFETY_UNKNOWN',
+            'reason': f'BINANCE_RISK_LOOKUP_FAILED:{type(exc).__name__}',
+        }
+
+    symbol_rows = symbol_config_raw if isinstance(symbol_config_raw, list) else [symbol_config_raw]
+    symbol_config = next(
+        (row for row in symbol_rows if isinstance(row, dict) and str(row.get('symbol') or symbol_id) == symbol_id),
+        None,
+    )
+    if not isinstance(symbol_config, dict):
+        return {'valid': False, 'status': 'LIQUIDATION_SAFETY_UNKNOWN', 'reason': 'SYMBOL_CONFIG_UNAVAILABLE'}
+    margin_type = str(symbol_config.get('marginType') or '').upper()
+    configured_leverage = int(float(symbol_config.get('leverage') or 0))
+    if margin_type != 'ISOLATED':
+        return {
+            'valid': False,
+            'status': 'LIQUIDATION_SAFETY_UNKNOWN',
+            'reason': f'MARGIN_MODE_NOT_ISOLATED:{margin_type or "UNKNOWN"}',
+        }
+    if configured_leverage != int(leverage):
+        return {
+            'valid': False,
+            'status': 'LIQUIDATION_SAFETY_UNKNOWN',
+            'reason': f'LEVERAGE_NOT_CONFIRMED:{configured_leverage}!={int(leverage)}',
+        }
+
+    bracket_rows = bracket_raw if isinstance(bracket_raw, list) else [bracket_raw]
+    bracket_entry = next(
+        (row for row in bracket_rows if isinstance(row, dict) and str(row.get('symbol') or symbol_id) == symbol_id),
+        None,
+    )
+    notional = abs(float(entry_price) * float(qty))
+    selected_bracket = None
+    for bracket in (bracket_entry or {}).get('brackets', []) if isinstance(bracket_entry, dict) else []:
+        try:
+            floor = float(bracket.get('notionalFloor') or 0.0)
+            cap = float(bracket.get('notionalCap') or float('inf'))
+        except (TypeError, ValueError):
+            continue
+        if floor <= notional <= cap:
+            selected_bracket = bracket
+            break
+    mmr = _safe_float_or_none((selected_bracket or {}).get('maintMarginRatio'))
+    if mmr is None or mmr < 0:
+        return {'valid': False, 'status': 'LIQUIDATION_SAFETY_UNKNOWN', 'reason': 'MAINTENANCE_MARGIN_RATE_UNAVAILABLE'}
+
+    candidate_leverages = [int(leverage)]
+    if safety_cfg.auto_reduce_leverage:
+        candidate_leverages.extend(range(int(leverage) - 1, 0, -1))
+    last_result = None
+    for candidate_leverage in candidate_leverages:
+        estimated_liquidation = estimate_isolated_liquidation_price(
+            side,
+            entry_price,
+            candidate_leverage,
+            mmr,
+        )
+        result = validate_stop_against_liquidation(
+            side,
+            stop_price,
+            estimated_liquidation,
+            tick_size,
+            safety_cfg.minimum_buffer_pct,
+            safety_cfg.minimum_buffer_ticks,
+            safety_cfg.stop_working_type,
+            entry_price,
+        )
+        last_result = result
+        if result.valid:
+            snapshot = {
+                'valid': True,
+                'status': 'SAFE',
+                'reason': result.reason,
+                'symbol': symbol,
+                'side': str(side).lower(),
+                'entry_price': float(result.entry_price),
+                'stop_price': float(result.stop_price),
+                'liquidation_price': float(result.liquidation_price),
+                'buffer_pct': float(result.buffer_pct),
+                'working_type': result.working_type,
+                'selected_leverage': candidate_leverage,
+                'margin_type': margin_type,
+                'estimated': True,
+            }
+            _ensure_trading_safety_runtime(self)
+            self.trading_state_store.set_runtime_state(f'liquidation_safety:{symbol}', snapshot)
+            return snapshot
+    return {
+        'valid': False,
+        'status': 'ENTRY_REJECTED_LIQUIDATION_CONFLICT',
+        'reason': last_result.reason if last_result is not None else 'LIQUIDATION_SAFETY_UNKNOWN',
+        'selected_leverage': None,
+        'liquidation_price': float(last_result.liquidation_price) if last_result is not None else None,
+        'stop_price': float(stop_price),
+        'working_type': safety_cfg.stop_working_type,
+        'estimated': True,
+    }
+
+
+async def _fetch_position_with_liquidation(self, symbol, initial_position=None):
+    if str(getattr(self.exchange, 'id', '') or '').lower() != 'binance':
+        if initial_position is not None:
+            return True, self._normalize_server_position(initial_position, symbol) or initial_position
+        return await self._fetch_server_position_checked(symbol)
+    delays = (0.0, 0.5, 1.0, 2.0, 4.0, 8.0)
+    candidate = initial_position
+    last_fetch_ok = candidate is not None
+    for delay in delays:
+        if delay:
+            await asyncio.sleep(delay)
+        if candidate is not None:
+            normalized = self._normalize_server_position(candidate, symbol) or candidate
+            liquidation = _safe_float_or_none(
+                normalized.get('liquidationPrice')
+                or normalized.get('liquidation_price')
+                or self._protection_order_info(normalized).get('liquidationPrice')
+            )
+            if liquidation is not None and liquidation > 0:
+                return True, normalized
+        last_fetch_ok, candidate = await self._fetch_server_position_checked(symbol)
+        if last_fetch_ok and not candidate:
+            return True, None
+    return bool(last_fetch_ok), candidate
+
+
+async def _handle_liquidation_safety_failure(
+    self,
+    symbol,
+    pos,
+    reason,
+    *,
+    stop_price=None,
+    working_type=None,
+    cfg=None,
+    client_order_id=None,
+):
+    _ensure_trading_safety_runtime(self)
+    state = (
+        OrderState.FILLED_LIQUIDATION_CONFLICT
+        if reason not in {'LIQUIDATION_PRICE_UNAVAILABLE', 'LIQUIDATION_SAFETY_UNKNOWN'}
+        else OrderState.FILLED_UNVERIFIED_LIQUIDATION
+    )
+    records = self.trading_state_store.active_for_symbol(symbol)
+    for record in records:
+        if client_order_id and record.client_order_id != client_order_id:
+            continue
+        self.trading_state_store.transition(record.client_order_id, state, last_error=str(reason))
+    self._set_crypto_entry_lock(f'{state.value}:{symbol}:{reason}')
+    liquidation_price = _safe_float_or_none(
+        (pos or {}).get('liquidationPrice')
+        or (pos or {}).get('liquidation_price')
+        or self._protection_order_info(pos or {}).get('liquidationPrice')
+    )
+    mark_price = _safe_float_or_none((pos or {}).get('markPrice') or (pos or {}).get('mark_price'))
+    side = str((pos or {}).get('side') or '').lower()
+    qty = abs(float(self._position_signed_contracts(pos or {}) or (pos or {}).get('contracts', 0) or 0))
+    await self.ctrl.notify(
+        "[긴급] 스탑로스·청산가 충돌\n"
+        f"심볼: {self.ctrl.format_symbol_for_display(symbol)}\n"
+        f"방향: {side.upper() or 'UNKNOWN'}\n"
+        f"수량: {qty}\nMark Price: {mark_price}\n"
+        f"스탑로스: {stop_price}\n청산가: {liquidation_price}\n"
+        f"스탑 트리거 기준: {working_type or 'UNKNOWN'}\n"
+        f"상태: {state.value}\n자동 대응: reduceOnly 긴급 청산\n신규 진입 잠금: ON"
+    )
+    await self._cancel_protection_orders(symbol, reason='liquidation safety conflict')
+    close_status = await self._emergency_close_position_without_stop_loss(
+        symbol,
+        reason=f'liquidation safety failure: {reason}',
+        max_attempts=5,
+        lockout_reason='LIQUIDATION_SAFETY_FORCE_CLOSED',
+        protection_label='LIQUIDATION_SAFETY',
+        critical_pause_reason_code='LIQUIDATION_SAFETY_EMERGENCY_CLOSE_FAILED',
+    )
+    if not close_status.get('closed'):
+        for record in self.trading_state_store.active_for_symbol(symbol):
+            self.trading_state_store.transition(
+                record.client_order_id,
+                OrderState.EMERGENCY_CLOSE_FAILED,
+                last_error=str(close_status.get('error') or reason),
+            )
+    write_critical_pause_state(
+        symbol,
+        'LIQUIDATION_SAFETY_CONFLICT',
+        reason,
+        cfg or {},
+    )
+    self.critical_pause_reason = f'Liquidation safety conflict: {reason}'
+    self.critical_pause_status = dict(close_status)
+    if getattr(self, 'ctrl', None) is not None and hasattr(self.ctrl, 'is_paused'):
+        self.ctrl.is_paused = True
+    self._set_crypto_entry_lock(f'CRITICAL_PAUSE:LIQUIDATION_SAFETY_CONFLICT:{symbol}')
+    close_status['liquidation_safety_reason'] = reason
+    return close_status
+
+
+async def _verify_actual_liquidation_safety(
+    self,
+    symbol,
+    side,
+    stop_price,
+    pos,
+    cfg=None,
+    client_order_id=None,
+):
+    if self.is_upbit_mode() or str(getattr(self.exchange, 'id', '') or '').lower() != 'binance':
+        return {'valid': True, 'status': 'NOT_BINANCE_FUTURES', 'position': pos}
+    if client_order_id:
+        _mark_crypto_entry_state(
+            self,
+            client_order_id,
+            OrderState.FILLED_UNVERIFIED_LIQUIDATION,
+        )
+    self._set_crypto_entry_lock(f'FILLED_UNVERIFIED_LIQUIDATION:{symbol}')
+    fetch_ok, actual_pos = await _fetch_position_with_liquidation(self, symbol, pos)
+    if not fetch_ok or not actual_pos:
+        reason = 'LIQUIDATION_PRICE_UNAVAILABLE'
+        close_status = await _handle_liquidation_safety_failure(
+            self,
+            symbol,
+            actual_pos or pos,
+            reason,
+            stop_price=stop_price,
+            working_type='MARK_PRICE',
+            cfg=cfg,
+            client_order_id=client_order_id,
+        )
+        return {'valid': False, 'status': reason, 'close_status': close_status, 'position': actual_pos or pos}
+    result = self._validate_position_stop_liquidation(
+        symbol,
+        actual_pos,
+        stop_price,
+        'MARK_PRICE',
+        cfg,
+    )
+    if result is None:
+        reason = 'LIQUIDATION_PRICE_UNAVAILABLE'
+    elif not result.valid:
+        reason = result.reason
+    else:
+        snapshot = {
+            'valid': True,
+            'status': 'SAFE',
+            'reason': result.reason,
+            'symbol': symbol,
+            'side': str(side).lower(),
+            'entry_price': float(result.entry_price),
+            'mark_price': _safe_float_or_none(actual_pos.get('markPrice')),
+            'stop_price': float(result.stop_price),
+            'liquidation_price': float(result.liquidation_price),
+            'buffer_pct': float(result.buffer_pct),
+            'working_type': result.working_type,
+            'margin_type': actual_pos.get('marginType'),
+            'leverage': actual_pos.get('leverage'),
+            'estimated': False,
+        }
+        _ensure_trading_safety_runtime(self)
+        self.trading_state_store.set_runtime_state(f'liquidation_safety:{symbol}', snapshot)
+        if client_order_id:
+            _mark_crypto_entry_state(self, client_order_id, OrderState.FILLED_UNPROTECTED)
+        self._set_crypto_entry_lock(f'FILLED_UNPROTECTED:{client_order_id or symbol}')
+        return {**snapshot, 'position': actual_pos, 'result': result}
+    close_status = await _handle_liquidation_safety_failure(
+        self,
+        symbol,
+        actual_pos,
+        reason,
+        stop_price=stop_price,
+        working_type='MARK_PRICE',
+        cfg=cfg,
+        client_order_id=client_order_id,
+    )
+    return {'valid': False, 'status': reason, 'close_status': close_status, 'position': actual_pos, 'result': result}
+
+
+def _resolve_crypto_signal_timestamp(self, symbol, payload=None):
+    payload = payload if isinstance(payload, dict) else {}
+    for key in (
+        "signal_timestamp", "signal_ts", "signal_candle_ts",
+        "candle_timestamp", "closed_candle_ts", "last_closed_candle_ts",
+    ):
+        value = payload.get(key)
+        if value not in (None, ""):
+            return value
+    for mapping_name in (
+        "last_processed_candle_ts",
+        "utbreakout_adaptive_last_decision_ts",
+        "utbreakout_last_ready_ts",
+    ):
+        mapping = getattr(self, mapping_name, None)
+        if not isinstance(mapping, dict):
+            continue
+        value = mapping.get(symbol)
+        if isinstance(value, dict):
+            values = [item for item in value.values() if isinstance(item, (int, float))]
+            value = max(values) if values else None
+        if value not in (None, ""):
+            return value
+    timeframe_seconds = 15 * 60
+    timeframe = str(payload.get("timeframe") or payload.get("entry_tf") or "15m").lower()
+    match = re.fullmatch(r"(\d+)([mhd])", timeframe)
+    if match:
+        unit_seconds = {"m": 60, "h": 3600, "d": 86400}[match.group(2)]
+        timeframe_seconds = max(60, int(match.group(1)) * unit_seconds)
+    now = int(time.time())
+    return now - (now % timeframe_seconds)
+
+
+def _crypto_entry_block_reason(self, symbol=None):
+    _ensure_trading_safety_runtime(self)
+    uninitialized_test_engine = (
+        self.__class__.__name__ == 'SignalEngine'
+        and not hasattr(self, 'crypto_entry_lock_reason')
+    )
+    critical_pause = None if uninitialized_test_engine else load_critical_pause_state()
+    if critical_pause and critical_pause.get('status') == 'CRITICAL_PAUSED':
+        return f"CRITICAL_PAUSE:{critical_pause.get('reason') or 'manual reconciliation required'}"
+    runtime_reason = getattr(self, "crypto_entry_lock_reason", None)
+    if runtime_reason:
+        return str(runtime_reason)
+    if getattr(getattr(self, "ctrl", None), "is_paused", False):
+        return "CRITICAL_PAUSE_OR_BOT_PAUSED"
+    persisted = self.trading_state_store.get_runtime_state("entry_lock_reason")
+    if persisted:
+        return str(persisted)
+    return self.trading_state_store.entry_block_reason(symbol)
+
+
+def _crypto_safety_status_lines(self):
+    try:
+        _ensure_trading_safety_runtime(self)
+        lock_reason = _crypto_entry_block_reason(self)
+        stream = self.trading_state_store.get_runtime_state(
+            "user_data_stream",
+            {"connected": False, "reason": "not_started"},
+        )
+        reconciliation = self.trading_state_store.get_runtime_state(
+            "last_reconciliation",
+            {},
+        )
+        last_stream_event = self.trading_state_store.get_runtime_state(
+            "last_user_stream_event",
+            {},
+        )
+        critical_pause = load_critical_pause_state()
+        active = self.trading_state_store.list_by_states(
+            {
+                OrderState.SUBMITTED_UNKNOWN,
+                OrderState.PARTIALLY_FILLED,
+                OrderState.FILLED_UNVERIFIED_LIQUIDATION,
+                OrderState.FILLED_LIQUIDATION_CONFLICT,
+                OrderState.FILLED_UNPROTECTED,
+                OrderState.PROTECTED,
+                OrderState.CLOSING,
+                OrderState.EMERGENCY_CLOSE_FAILED,
+            }
+        )
+        active_text = ", ".join(
+            f"{item.symbol}:{item.order_state}"
+            for item in active[:4]
+        ) or "none"
+        lines = [
+            "Trading Safety:",
+            f"entry_lock={lock_reason or 'none'}",
+            f"user_stream_connected={bool((stream or {}).get('connected'))} / reason={(stream or {}).get('reason') or 'n/a'}",
+            f"reconciliation_safe={bool((reconciliation or {}).get('safe_to_trade'))} / last={(reconciliation or {}).get('reconciled_at') or 'n/a'}",
+            f"exchange_positions={len((reconciliation or {}).get('positions') or [])} / exchange_open_orders={len((reconciliation or {}).get('open_orders') or [])}",
+            f"local_active_orders={active_text}",
+            f"critical_pause={bool(critical_pause)} / last_user_event={(last_stream_event or {}).get('event_type') or 'none'}",
+        ]
+        positions = (reconciliation or {}).get('positions') or []
+        if positions:
+            raw_pos = positions[0]
+            pos = self._normalize_server_position(raw_pos) or raw_pos
+            symbol = self._protection_position_symbol(pos)
+            snapshot = self.trading_state_store.get_runtime_state(f'liquidation_safety:{symbol}', {}) or {}
+            protection = (getattr(self, 'last_protection_order_status', {}) or {}).get(symbol, {}) or {}
+            lines.extend([
+                "Liquidation Safety:",
+                f"symbol={symbol} / entry={pos.get('entryPrice')} / mark={pos.get('markPrice')}",
+                f"liquidation={pos.get('liquidationPrice')} / stop={protection.get('stop_price') or snapshot.get('stop_price')}",
+                f"working_type={protection.get('stop_working_type') or snapshot.get('working_type') or 'UNKNOWN'} / safety={protection.get('liquidation_safety') or snapshot.get('status') or 'UNKNOWN'}",
+                f"reason={protection.get('liquidation_safety_reason') or snapshot.get('reason') or 'not_evaluated'}",
+            ])
+        return lines
+    except Exception as exc:
+        logger.exception("Trading safety status rendering failed")
+        return ["Trading Safety: unknown", f"reason={type(exc).__name__}"]
+
+
+async def _submit_idempotent_crypto_entry(self, symbol, side, qty, strategy, payload=None):
+    blocker = _crypto_entry_block_reason(self, symbol)
+    if blocker:
+        return None, blocker
+    gateway = _ensure_trading_safety_runtime(self)
+    result = await gateway.submit_entry(
+        strategy=strategy,
+        symbol=symbol,
+        side=side,
+        signal_timestamp=_resolve_crypto_signal_timestamp(self, symbol, payload),
+        qty=qty,
+    )
+    if result.recovered and result.state == OrderState.PROTECTED.value:
+        return result, "duplicate signal already protected"
+    if not result.accepted:
+        return result, result.error or result.state
+    return result, None
+
+
+def _mark_crypto_entry_state(self, client_order_id, state, **changes):
+    if not client_order_id:
+        return None
+    _ensure_trading_safety_runtime(self)
+    try:
+        return self.trading_state_store.transition(client_order_id, state, **changes)
+    except KeyError:
+        logger.warning("Order state transition skipped for unknown client ID: %s", client_order_id)
+        return None
+
+
+def _mark_crypto_symbol_closed(self, symbol, reason):
+    _ensure_trading_safety_runtime(self)
+    for record in self.trading_state_store.active_for_symbol(symbol):
+        if record.order_state in {
+            OrderState.PROTECTED.value,
+            OrderState.FILLED_UNVERIFIED_LIQUIDATION.value,
+            OrderState.FILLED_LIQUIDATION_CONFLICT.value,
+            OrderState.FILLED_UNPROTECTED.value,
+            OrderState.PARTIALLY_FILLED.value,
+            OrderState.CLOSING.value,
+            OrderState.EMERGENCY_CLOSE_FAILED.value,
+        }:
+            self.trading_state_store.transition(
+                record.client_order_id,
+                OrderState.CLOSED,
+                last_error=None,
+                close_reason=str(reason or "position closed"),
+            )
+
 async def execute_live_order_plan(self, plan, cfg):
     cfg = enforce_activation_stage(cfg if isinstance(cfg, dict) else {})
     if _normalize_live_real_stage(cfg.get("live_activation_stage")) == "LIVE_REAL_SMALL_CAP":
@@ -48775,38 +50011,138 @@ async def execute_live_order_plan(self, plan, cfg):
     else:
         lev = int(max(1.0, float(cfg.get("leverage", 5))))
     await self.ensure_market_settings(plan.symbol, leverage=lev)
-    entry_side = "buy" if str(plan.side).upper() == "LONG" else "sell"
-
-    try:
-        entry_order = await asyncio.to_thread(
-            self.exchange.create_order,
-            plan.symbol,
-            "market",
-            entry_side,
-            plan.qty,
-            None,
-            {}
+    liquidation_preflight = await self._preflight_liquidation_safety(
+        plan.symbol,
+        plan.side,
+        plan.entry_price,
+        plan.initial_sl_price,
+        lev,
+        plan.qty,
+        cfg,
+    )
+    if not liquidation_preflight.get('valid'):
+        reason = liquidation_preflight.get('reason') or liquidation_preflight.get('status')
+        await self.ctrl.notify(
+            f"[진입 거부] 전략 스탑이 청산가보다 늦게 발동합니다.\n"
+            f"심볼: {plan.symbol}\n방향: {plan.side}\n"
+            f"스탑: {plan.initial_sl_price}\n예상 청산가: {liquidation_preflight.get('liquidation_price')}\n"
+            f"이유: {reason}"
         )
-    except Exception as order_err:
-        logger.error("[LiveOrderPlan] entry order failed: %s", order_err)
-        await self.ctrl.notify(f"❌ 시장가 진입 실패: {order_err}")
-        return {"status": "ENTRY_FAILED", "error": str(order_err)}
+        return {'status': 'ENTRY_REJECTED_LIQUIDATION_CONFLICT', 'error': reason}
+    selected_leverage = int(liquidation_preflight.get('selected_leverage') or lev)
+    if selected_leverage < lev:
+        lev = selected_leverage
+        cfg['leverage'] = lev
+        await self.ensure_market_settings(plan.symbol, leverage=lev)
+        liquidation_preflight = await self._preflight_liquidation_safety(
+            plan.symbol,
+            plan.side,
+            plan.entry_price,
+            plan.initial_sl_price,
+            lev,
+            plan.qty,
+            cfg,
+        )
+        if not liquidation_preflight.get('valid'):
+            return {
+                'status': 'ENTRY_REJECTED_LIQUIDATION_CONFLICT',
+                'error': liquidation_preflight.get('reason'),
+            }
+    strategy_name = str(getattr(plan, "engine", None) or cfg.get("active_strategy") or "UTBREAKOUT")
+    submission, submission_error = await _submit_idempotent_crypto_entry(
+        self,
+        plan.symbol,
+        plan.side,
+        plan.qty,
+        strategy_name,
+        {**dict(cfg or {}), **getattr(plan, "__dict__", {})},
+    )
+    if submission_error:
+        status = getattr(submission, "state", "ENTRY_BLOCKED") if submission is not None else "ENTRY_BLOCKED"
+        logger.error("[LiveOrderPlan] idempotent entry blocked/failed: %s", submission_error)
+        await self.ctrl.notify(
+            f"UTBreakout entry not sent: {plan.symbol} {plan.side} / {status} / {submission_error}"
+        )
+        return {
+            "status": status,
+            "error": str(submission_error),
+            "client_order_id": getattr(submission, "client_order_id", None),
+        }
+    entry_order = submission.order or {}
+    client_order_id = submission.client_order_id
 
-    await asyncio.sleep(float(cfg.get("entry_fill_wait_sec", 1.0) or 1.0))
     self.position_cache = None
     self.position_cache_time = 0
 
-    pos = await self.get_server_position(plan.symbol, use_cache=False)
+    confirmation = await self._confirm_entry_position(
+        plan.symbol,
+        str(plan.side).lower(),
+        entry_order,
+        plan.entry_price,
+        plan.qty,
+    )
+    pos = submission.position or confirmation.get("position")
     if not pos:
-        await self.ctrl.notify(f"⚠️ 진입 주문 후 포지션 확인 실패: {plan.symbol}")
-        return {"status": "ENTRY_UNVERIFIED", "entry_order": entry_order}
+        _mark_crypto_entry_state(
+            self,
+            client_order_id,
+            OrderState.SUBMITTED_UNKNOWN,
+            last_error="entry accepted but fill/position remained unverified",
+        )
+        self.crypto_entry_lock_reason = f"SUBMITTED_UNKNOWN:{client_order_id}"
+        await self.ctrl.notify(
+            f"CRITICAL: {plan.symbol} entry state is unknown. New entries are locked pending reconciliation."
+        )
+        return {
+            "status": "SUBMITTED_UNKNOWN",
+            "entry_order": entry_order,
+            "client_order_id": client_order_id,
+        }
 
     actual_entry = float(pos.get("entryPrice") or plan.entry_price or 0.0)
     actual_qty = abs(float(self._position_signed_contracts(pos) or pos.get("contracts", 0) or plan.qty))
 
     if actual_entry <= 0 or actual_qty <= 0:
-        await self.ctrl.notify(f"⚠️ 포지션 체결값 오류: {plan.symbol}")
-        return {"status": "ENTRY_BAD_FILL", "entry_order": entry_order}
+        _mark_crypto_entry_state(
+            self,
+            client_order_id,
+            OrderState.SUBMITTED_UNKNOWN,
+            last_error="invalid confirmed fill values",
+        )
+        self.crypto_entry_lock_reason = f"SUBMITTED_UNKNOWN:{client_order_id}"
+        await self.ctrl.notify(f"CRITICAL: invalid confirmed fill for {plan.symbol}; entries locked")
+        return {
+            "status": "SUBMITTED_UNKNOWN",
+            "entry_order": entry_order,
+            "client_order_id": client_order_id,
+        }
+
+    plan = self._rebuild_plan_after_fill(plan, actual_entry, actual_qty, cfg)
+    _mark_crypto_entry_state(
+        self,
+        client_order_id,
+        OrderState.FILLED_UNVERIFIED_LIQUIDATION,
+        exchange_order_id=(entry_order.get("id") if isinstance(entry_order, dict) else None),
+        filled_qty=actual_qty,
+        average_fill_price=actual_entry,
+    )
+
+    actual_liquidation_check = await self._verify_actual_liquidation_safety(
+        plan.symbol,
+        plan.side,
+        plan.initial_sl_price,
+        pos,
+        cfg,
+        client_order_id,
+    )
+    if not actual_liquidation_check.get('valid'):
+        return {
+            'status': actual_liquidation_check.get('status'),
+            'entry_order': entry_order,
+            'client_order_id': client_order_id,
+            'close_status': actual_liquidation_check.get('close_status'),
+        }
+    pos = actual_liquidation_check.get('position') or pos
 
     logger.info(
         "[LiveOrderPlan] entry fill verified: %s side=%s entry=%.12f qty=%.12f",
@@ -48815,11 +50151,16 @@ async def execute_live_order_plan(self, plan, cfg):
         actual_entry,
         actual_qty,
     )
-    plan = self._rebuild_plan_after_fill(plan, actual_entry, actual_qty, cfg)
-
     try:
         sl_order = await self._place_initial_sl_from_plan(plan, pos, cfg)
     except Exception as sl_error:
+        if 'SL liquidation safety failed' in str(sl_error):
+            return {
+                'status': 'FILLED_LIQUIDATION_CONFLICT',
+                'entry_order': entry_order,
+                'client_order_id': client_order_id,
+                'error': str(sl_error),
+            }
         # SL 체결 오류 시 영구 락 발동
         return await self._handle_sl_failure_with_persistent_pause(
             symbol=plan.symbol,
@@ -48849,6 +50190,43 @@ async def execute_live_order_plan(self, plan, cfg):
             reason="initial ladder placement audit",
         )
 
+    sl_order_id = (
+        self._protection_order_id(sl_order)
+        if hasattr(self, "_protection_order_id")
+        else (sl_order or {}).get("id")
+    )
+    tp_order_ids = [
+        self._protection_order_id(order)
+        if hasattr(self, "_protection_order_id")
+        else order.get("id")
+        for order in tp_orders
+        if isinstance(order, dict)
+    ]
+    sl_verified = bool(
+        sl_order_id
+        and isinstance(audit_status, dict)
+        and audit_status.get("fetch_ok")
+        and audit_status.get("sl_present")
+        and not audit_status.get("sl_qty_mismatch")
+    )
+    if sl_verified:
+        _mark_crypto_entry_state(
+            self,
+            client_order_id,
+            OrderState.PROTECTED,
+            stop_order_id=str(sl_order_id),
+            take_profit_order_ids=[str(value) for value in tp_order_ids if value],
+        )
+        if str(getattr(self, 'crypto_entry_lock_reason', '') or '').startswith('FILLED_'):
+            self._set_crypto_entry_lock(None)
+    else:
+        self.crypto_entry_lock_reason = f"FILLED_UNPROTECTED:{client_order_id}"
+        self.trading_state_store.set_runtime_state("entry_lock_reason", self.crypto_entry_lock_reason)
+        await self.ctrl.notify(
+            f"CRITICAL: {plan.symbol} position is not yet verified as stop-loss protected. "
+            "New entries are locked while protection recovery continues."
+        )
+
     await self.ctrl.notify(
         f"✅ LiveOrderPlan 진입 완료: {plan.symbol} {plan.side} qty={plan.qty} "
         f"SL={plan.initial_sl_price} TP={len(tp_orders)}/{len(plan.tp_orders)} engine={plan.engine}"
@@ -48861,6 +50239,7 @@ async def execute_live_order_plan(self, plan, cfg):
         "tp_orders": tp_orders,
         "plan": plan,
         "protection_audit": audit_status,
+        "client_order_id": client_order_id,
     }
 
 def _rebuild_plan_after_fill(self, plan, actual_entry, actual_qty, cfg):
@@ -48894,6 +50273,19 @@ async def _place_initial_sl_from_plan(self, plan, pos, cfg):
     stop_price = self.safe_price(plan.symbol, plan.initial_sl_price)
     if float(qty) <= 0:
         raise InvalidOrderPlan("SL qty <= 0")
+    liquidation_check = await self._verify_actual_liquidation_safety(
+        plan.symbol,
+        plan.side,
+        stop_price,
+        pos,
+        cfg,
+        None,
+    )
+    if not liquidation_check.get('valid'):
+        raise InvalidOrderPlan(
+            f"SL liquidation safety failed: {liquidation_check.get('status')}"
+        )
+    pos = liquidation_check.get('position') or pos
 
     logger.info(
         "[LiveOrderPlan] placing SL: %s side=%s qty=%s stop=%s reduceOnly=True",
@@ -49542,19 +50934,38 @@ async def _close_position_reduce_only_market(self, symbol, pos, reason, cfg):
     if float(qty) <= 0:
         raise ValueError("close qty <= 0")
 
-    close_side = "sell" if side == "long" else "buy"
     params = self._close_order_params_for_position(pos)
     params["reduceOnly"] = True
-
-    order = await asyncio.to_thread(
-        self.exchange.create_order,
-        symbol,
-        "market",
-        close_side,
-        qty,
-        None,
-        params,
+    gateway = _ensure_trading_safety_runtime(self)
+    state = getattr(self, "utbreakout_trailing_states", {}).get(symbol) or {}
+    close_submission = await gateway.submit_reduce_only_close(
+        strategy=str(state.get("engine") or "UTBREAKOUT_EXIT"),
+        symbol=symbol,
+        position_side=side,
+        position_signature=(
+            pos.get("timestamp")
+            or pos.get("entryPrice")
+            or state.get("created_at")
+            or "open-position"
+        ),
+        qty=float(qty),
+        reason=reason,
+        params=params,
     )
+    order = close_submission.order or {}
+    if close_submission.state == OrderState.SUBMITTED_UNKNOWN.value:
+        self.crypto_entry_lock_reason = f"SUBMITTED_UNKNOWN:{close_submission.client_order_id}"
+        self.trading_state_store.set_runtime_state("entry_lock_reason", self.crypto_entry_lock_reason)
+        await self.ctrl.notify(
+            f"CRITICAL: {symbol} close order status is unknown. New entries remain locked."
+        )
+        return {
+            "status": OrderState.SUBMITTED_UNKNOWN.value,
+            "client_order_id": close_submission.client_order_id,
+            "error": close_submission.error,
+            "_flat_confirmed": False,
+            "_cleanup_confirmed": False,
+        }
     await self.ctrl.notify(f"⚠️ {symbol} {reason} 사유로 reduceOnly 시장가 청산 실행")
     await asyncio.sleep(0.5)
     self.position_cache = None
@@ -49595,6 +51006,7 @@ async def _close_position_reduce_only_market(self, symbol, pos, reason, cfg):
         exit_price=order_exit_price,
         state=state,
     )
+    _mark_crypto_symbol_closed(self, symbol, reason)
     return result
 
 def _register_live_ladder_position_state(self, plan, pos, sl_order, tp_orders, cfg):
@@ -49750,10 +51162,10 @@ def _calculate_tp1_area_stop(self, pos, state, cfg):
 
 ENGINE_PERFORMANCE_STATS = {}
 
-def record_live_trade_result(trade, cfg=None):
+def _update_engine_performance_stats(trade, cfg=None):
     engine = trade.get("engine")
     if not engine or engine == "NONE":
-        return
+        return False
     if engine not in ENGINE_PERFORMANCE_STATS:
         ENGINE_PERFORMANCE_STATS[engine] = {
             "trade_count": 0,
@@ -49765,11 +51177,22 @@ def record_live_trade_result(trade, cfg=None):
             "fee_burden": 0.0,
             "funding_burden": 0.0,
             "oos_expectancy": None,
+            "gross_profit_r": 0.0,
+            "gross_loss_r": 0.0,
         }
     stats = ENGINE_PERFORMANCE_STATS[engine]
     stats["trade_count"] += 1
-    pnl_r = float(trade.get("r_multiple", 0.0))
+    pnl_r = float(trade.get("realized_r", trade.get("r_multiple", 0.0)) or 0.0)
     stats["expectancy_r"] += (pnl_r - stats["expectancy_r"]) / stats["trade_count"]
+    if pnl_r > 0:
+        stats["gross_profit_r"] += pnl_r
+    elif pnl_r < 0:
+        stats["gross_loss_r"] += abs(pnl_r)
+    stats["profit_factor"] = (
+        stats["gross_profit_r"] / stats["gross_loss_r"]
+        if stats["gross_loss_r"] > 0
+        else (float('inf') if stats["gross_profit_r"] > 0 else 0.0)
+    )
 
     if pnl_r < 0:
         stats["consecutive_losses"] += 1
@@ -49784,6 +51207,37 @@ def record_live_trade_result(trade, cfg=None):
                 disabled.append(engine)
                 cfg["disabled_engines"] = disabled
                 logger.warning(f"Engine {engine} disabled due to poor live performance.")
+    return True
+
+
+def record_live_trade_result(trade, cfg=None, store=None):
+    if not isinstance(trade, dict):
+        raise TypeError("trade must be a dictionary")
+    if not trade.get("trade_id"):
+        raise ValueError("trade_id is required")
+    persistent_store = store
+    if persistent_store is None:
+        persistent_store = SQLiteTradingStateStore(
+            os.getenv("CRYPTO_TRADING_STATE_DB", "runtime/trading_state.sqlite3")
+        )
+    inserted = persistent_store.record_trade_result(trade)
+    if not inserted:
+        logger.info("Duplicate live trade result ignored: %s", trade.get("trade_id"))
+        return False
+    _update_engine_performance_stats(trade, cfg)
+    return True
+
+
+def _restore_engine_performance_stats(store):
+    if store is None:
+        return 0
+    ENGINE_PERFORMANCE_STATS.clear()
+    restored = 0
+    for trade in store.load_trade_results():
+        if _update_engine_performance_stats(trade):
+            restored += 1
+    logger.info("Restored live engine performance: trades=%d engines=%d", restored, len(ENGINE_PERFORMANCE_STATS))
+    return restored
 
 
 def _bind_live_advanced_alpha_helpers_to_main_controller():
@@ -49825,6 +51279,11 @@ def _bind_live_advanced_alpha_helpers_to_main_controller():
         "_collapse_tp_targets_for_exchange",
         "_collapse_state_tp_plan_for_exchange",
         "_validate_live_order_plan_for_exchange",
+        "_extract_liquidation_stop_price",
+        "_preflight_liquidation_safety",
+        "_fetch_position_with_liquidation",
+        "_verify_actual_liquidation_safety",
+        "_handle_liquidation_safety_failure",
         "execute_live_order_plan",
         "run_live_real_once",
         "get_runtime_models",
@@ -49899,6 +51358,7 @@ _bind_live_advanced_alpha_helpers_to_main_controller()
 
 if __name__ == "__main__":
     controller = None
+    direct_process_lock = None
 
     def _handle_exit_signal(signum, frame):
         signame = signal.Signals(signum).name
@@ -49907,6 +51367,13 @@ if __name__ == "__main__":
         raise SystemExit(128 + signum)
 
     try:
+        if os.getenv('TRADINGBOT_PROCESS_LOCK_HELD') != '1':
+            direct_process_lock = ProcessLock('runtime/crypto_trading_bot.lock')
+            try:
+                direct_process_lock.acquire()
+            except ProcessLockError as exc:
+                logger.critical("DUPLICATE_PROCESS_DETECTED: %s", exc)
+                raise SystemExit(73) from exc
         controller = MainController()
         atexit.register(lambda: controller and controller.record_exit_marker("atexit", "process exiting"))
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -49922,6 +51389,8 @@ if __name__ == "__main__":
         logger.error(f"Fatal error: {e}")
         traceback.print_exc()
     finally:
+        if direct_process_lock is not None:
+            direct_process_lock.release()
         if controller:
             controller.record_exit_marker("process_finally", "finally block reached")
         # DB ?곌껐 醫낅즺

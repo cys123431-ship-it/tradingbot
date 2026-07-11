@@ -954,7 +954,27 @@ def build_position_risk_multiplier(inputs=None, cfg=None):
         * liquidity_multiplier
     )
     if blocked:
-        multiplier = 0.0
+        return {
+            "risk_multiplier": 0.0,
+            "blocked": True,
+            "components": {
+                "volatility": round(vol_multiplier, 4),
+                "meta": round(meta_multiplier, 4),
+                "edge_score": round(edge_score_multiplier, 4),
+                "edge_probability": round(edge_probability_multiplier, 4),
+                "trend_health": round(trend_multiplier, 4),
+                "strategy_quality": round(quality_multiplier, 4),
+                "market_regime": round(regime_multiplier, 4),
+                "recent_performance": round(performance_multiplier, 4),
+                "kelly": round(kelly_multiplier, 4),
+                "drawdown": round(drawdown_multiplier, 4),
+                "consecutive_loss": round(loss_multiplier, 4),
+                "portfolio_exposure": round(exposure_multiplier, 4),
+                "liquidity": round(liquidity_multiplier, 4),
+            },
+            "kelly_reason": kelly_reason,
+            "reasons": reasons,
+        }
 
     multiplier = _clamp(multiplier, cfg["min_risk_multiplier"], cfg["max_risk_multiplier"])
     return {

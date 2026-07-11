@@ -19,8 +19,8 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from utbreakout.risk import calculate_risk_plan
-from utbreakout.exit_policy import (
+from utbreakout.risk import calculate_risk_plan  # noqa: E402
+from utbreakout.exit_policy import (  # noqa: E402
     DEFAULT_EXIT_POLICY,
     EXIT_POLICY_CANDIDATES,
     build_exit_policy,
@@ -28,11 +28,11 @@ from utbreakout.exit_policy import (
     evaluate_time_stop,
     rank_exit_policies,
 )
-from utbreakout.engine_router import ALPHA_ENGINE_NAMES, evaluate_final_trade_decision
-from utbreakout.market_context import build_market_context
-from utbreakout.meta import meta_label_gate
-from utbreakout.regime import classify_regime, regime_action
-from utbreakout.sizing import calculate_adaptive_risk_pct
+from utbreakout.engine_router import ALPHA_ENGINE_NAMES, evaluate_final_trade_decision  # noqa: E402
+from utbreakout.market_context import build_market_context  # noqa: E402
+from utbreakout.meta import meta_label_gate  # noqa: E402
+from utbreakout.regime import classify_regime, regime_action  # noqa: E402
+from utbreakout.sizing import calculate_adaptive_risk_pct  # noqa: E402
 
 
 def _float(value, default=0.0):
@@ -48,14 +48,22 @@ def load_ohlcv_csv(path):
     with open(path, "r", encoding="utf-8-sig", newline="") as fp:
         reader = csv.DictReader(fp)
         for row in reader:
-            rows.append({
+            parsed = {
                 "timestamp": row.get("timestamp") or row.get("time") or "",
                 "open": _float(row.get("open")),
                 "high": _float(row.get("high")),
                 "low": _float(row.get("low")),
                 "close": _float(row.get("close")),
                 "volume": _float(row.get("volume")),
-            })
+            }
+            if row.get("funding_rate") not in (None, ""):
+                parsed["funding_rate"] = _float(row.get("funding_rate"))
+            if row.get("funding_timestamp") not in (None, ""):
+                parsed["funding_timestamp"] = row.get("funding_timestamp")
+            funding_event = str(row.get("funding_event") or row.get("is_funding_time") or "").lower()
+            if funding_event:
+                parsed["funding_event"] = funding_event in {"1", "true", "yes", "y"}
+            rows.append(parsed)
     return [row for row in rows if row["open"] > 0 and row["high"] > 0 and row["low"] > 0 and row["close"] > 0]
 
 
@@ -290,6 +298,46 @@ def _performance_summary(trades):
     }
 
 
+def _funding_payment_for_bar(row, position, funding_mode, funding_bps_per_bar):
+    mode = str(funding_mode or "").lower()
+    if mode == "disabled":
+        return 0.0
+    notional = float(position["entry_price"]) * float(position["qty"])
+    if mode == "estimated":
+        rate = float(funding_bps_per_bar or 0.0) / 10000.0
+    elif mode == "actual":
+        has_event = bool(
+            row.get("funding_event")
+            or row.get("is_funding_time")
+            or row.get("funding_timestamp") not in (None, "")
+        )
+        if not has_event or row.get("funding_rate") in (None, ""):
+            return 0.0
+        rate = float(row.get("funding_rate") or 0.0)
+    else:
+        raise ValueError(f"unsupported funding_mode: {funding_mode}")
+    payment = notional * rate
+    return -payment if position["side"] == "long" else payment
+
+
+def _mark_to_market_equity(balance, position, close, fee_bps):
+    if not position:
+        return float(balance), 0.0, 0.0
+    qty = float(position.get("qty") or 0.0)
+    entry = float(position.get("entry_price") or 0.0)
+    unrealized = (float(close) - entry) * qty
+    if position.get("side") == "short":
+        unrealized *= -1.0
+    estimated_close_cost = abs(float(close) * qty) * float(fee_bps or 0.0) / 10000.0
+    equity = (
+        float(balance)
+        + unrealized
+        + float(position.get("funding_pnl") or 0.0)
+        - estimated_close_cost
+    )
+    return equity, unrealized, estimated_close_cost
+
+
 def simulate_utbot_rr(
     rows,
     *,
@@ -312,6 +360,7 @@ def simulate_utbot_rr(
     fee_bps=4.0,
     slippage_bps=1.0,
     funding_bps_per_bar=0.0,
+    funding_mode=None,
     meta_label_gate_enabled=False,
     regime_router_enabled=False,
     signal_invalid_exit_enabled=True,
@@ -328,6 +377,7 @@ def simulate_utbot_rr(
     balance = float(initial_balance)
     equity_peak = balance
     max_drawdown = 0.0
+    equity_curve = []
     trades = []
     position = None
     counts = {
@@ -346,6 +396,12 @@ def simulate_utbot_rr(
         "end_of_data_count": 0,
     }
 
+    effective_funding_mode = str(
+        funding_mode or ("estimated" if funding_bps_per_bar else "disabled")
+    ).lower()
+    if effective_funding_mode not in {"actual", "estimated", "disabled"}:
+        raise ValueError(f"invalid funding_mode: {effective_funding_mode}")
+
     for idx in range(len(rows)):
         row = rows[idx]
         if position:
@@ -359,23 +415,35 @@ def simulate_utbot_rr(
             position["mfe_r"] = max(position["mfe_r"], favorable / max(position["risk_distance"], 1e-9))
             position["mae_r"] = max(position["mae_r"], adverse / max(position["risk_distance"], 1e-9))
 
-            if funding_bps_per_bar:
-                notional = position["entry_price"] * position["qty"]
-                funding = notional * funding_bps_per_bar / 10000.0
-                position["funding_pnl"] -= funding if side == "long" else -funding
-                position["funding_abs"] += abs(funding)
+            funding_pnl = _funding_payment_for_bar(
+                row,
+                position,
+                effective_funding_mode,
+                funding_bps_per_bar,
+            )
+            position["funding_pnl"] += funding_pnl
+            position["funding_abs"] += abs(funding_pnl)
 
-            if position.get("partial_filled") and trailing_atr_multiplier > 0 and atr[idx] is not None:
-                if side == "long":
-                    position["stop_loss"] = max(
-                        position["stop_loss"],
-                        row["close"] - (atr[idx] * trailing_atr_multiplier),
-                    )
-                else:
-                    position["stop_loss"] = min(
-                        position["stop_loss"],
-                        row["close"] + (atr[idx] * trailing_atr_multiplier),
-                    )
+            marked_equity, unrealized_pnl, estimated_close_cost = _mark_to_market_equity(
+                balance,
+                position,
+                row["close"],
+                fee_bps,
+            )
+            equity_peak = max(equity_peak, marked_equity)
+            max_drawdown = max(max_drawdown, equity_peak - marked_equity)
+            equity_curve.append(
+                {
+                    "index": idx,
+                    "timestamp": row.get("timestamp"),
+                    "cash": balance,
+                    "unrealized_pnl": unrealized_pnl,
+                    "estimated_close_cost": estimated_close_cost,
+                    "equity": marked_equity,
+                    "equity_peak": equity_peak,
+                    "drawdown_usdt": equity_peak - marked_equity,
+                }
+            )
 
             stop_hit = row["low"] <= position["stop_loss"] if side == "long" else row["high"] >= position["stop_loss"]
             target_hit = row["high"] >= position["take_profit"] if side == "long" else row["low"] <= position["take_profit"]
@@ -548,7 +616,35 @@ def simulate_utbot_rr(
                 equity_peak = max(equity_peak, balance)
                 max_drawdown = max(max_drawdown, equity_peak - balance)
                 position = None
+            elif position.get("partial_filled") and trailing_atr_multiplier > 0 and atr[idx] is not None:
+                # The close of this candle is only known after its high/low path.
+                # Store the new trailing stop for the next candle.
+                if side == "long":
+                    position["stop_loss"] = max(
+                        position["stop_loss"],
+                        row["close"] - (atr[idx] * trailing_atr_multiplier),
+                    )
+                else:
+                    position["stop_loss"] = min(
+                        position["stop_loss"],
+                        row["close"] + (atr[idx] * trailing_atr_multiplier),
+                    )
             continue
+
+        equity_peak = max(equity_peak, balance)
+        max_drawdown = max(max_drawdown, equity_peak - balance)
+        equity_curve.append(
+            {
+                "index": idx,
+                "timestamp": row.get("timestamp"),
+                "cash": balance,
+                "unrealized_pnl": 0.0,
+                "estimated_close_cost": 0.0,
+                "equity": balance,
+                "equity_peak": equity_peak,
+                "drawdown_usdt": equity_peak - balance,
+            }
+        )
 
         if atr[idx] is None:
             continue
@@ -819,6 +915,7 @@ def simulate_utbot_rr(
         "average_MAE_R": sum(t.get("mae_r", 0.0) for t in trades) / len(trades) if trades else None,
         "fee_burden_pct": total_fee / max(total_notional, 1e-9) * 100.0 if trades else None,
         "funding_burden_pct": total_funding_abs / max(total_notional, 1e-9) * 100.0 if trades else None,
+        "funding_mode": effective_funding_mode,
         "trades_per_month": len(trades) / months if months and months > 0 else None,
         "long_performance": _performance_summary(long_trades),
         "short_performance": _performance_summary(short_trades),
@@ -828,6 +925,7 @@ def simulate_utbot_rr(
         "max_drawdown_usdt": max_drawdown,
         "max_drawdown_pct": max_drawdown / max(initial_balance, 1e-9) * 100.0,
         "ending_balance": balance,
+        "equity_curve": equity_curve,
         "time_stop_count": time_stop_trades or counts["time_stop_count"],
         "signal_invalid_exit_count": signal_invalid_trades or counts["signal_invalid_exit_count"],
         "meta_gate_reject_count": counts["meta_gate_reject_count"],
@@ -859,6 +957,7 @@ def _simulate_variant(rows, params, args):
         fee_bps=args.fee_bps,
         slippage_bps=args.slippage_bps,
         funding_bps_per_bar=args.funding_bps_per_bar,
+        funding_mode=getattr(args, "funding_mode", None),
         partial_take_profit_r_multiple=args.partial_tp_r,
         partial_take_profit_ratio=args.partial_tp_ratio,
         breakeven_after_partial=not args.no_breakeven_after_partial,
@@ -1097,6 +1196,12 @@ def main():
     parser.add_argument("--fee-bps", type=float, default=4.0)
     parser.add_argument("--slippage-bps", type=float, default=1.0)
     parser.add_argument("--funding-bps-per-bar", type=float, default=0.0)
+    parser.add_argument(
+        "--funding-mode",
+        choices=["actual", "estimated", "disabled"],
+        default=None,
+        help="actual requires event-marked historical funding rows",
+    )
     parser.add_argument("--partial-tp-r", type=float, default=1.5)
     parser.add_argument("--partial-tp-ratio", type=float, default=0.5)
     parser.add_argument("--no-breakeven-after-partial", action="store_true")

@@ -44,6 +44,7 @@ from .meta import (
 from .sizing import build_position_risk_multiplier, calculate_adaptive_risk_pct, default_sizing_config
 from .portfolio import evaluate_portfolio_risk, default_portfolio_config
 from .performance import (
+    PerformanceMetrics,
     apply_multiple_testing_penalty,
     calculate_performance_metrics,
     deflated_sharpe_proxy,
@@ -308,6 +309,7 @@ __all__ = [
     "evaluate_portfolio_risk",
     "default_portfolio_config",
     "calculate_performance_metrics",
+    "PerformanceMetrics",
     "passes_train_rules",
     "passes_oos_rules",
     "apply_multiple_testing_penalty",

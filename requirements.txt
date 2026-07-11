@@ -1,8 +1,9 @@
-ccxt>=4.5.6
+ccxt>=4.5.60
 pandas
 pandas_ta
 numpy
 pykalman
 python-telegram-bot
+websockets>=12
 hurst
 predict-sdk==0.0.16

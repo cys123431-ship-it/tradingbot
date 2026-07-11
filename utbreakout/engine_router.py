@@ -171,13 +171,12 @@ def should_disable_engine(stats, config=None):
 def _expected_r(engine, stats=None, config=None):
     config = config or {}
     stat = _engine_stats(stats or {}, engine)
-    if stat.trade_count > 0:
+    minimum = int(config.get("min_engine_trades_before_judgment", 30) or 30)
+    if stat.trade_count >= minimum:
         if stat.oos_expectancy is not None:
             return _finite_float(stat.oos_expectancy, stat.expectancy_r)
         return stat.expectancy_r
-    if bool(config.get("require_engine_stats", False)):
-        return 0.0
-    return _finite_float(config.get("default_engine_expected_r"), 0.30)
+    return 0.0
 
 
 def _score_liquidation(context):
@@ -212,9 +211,20 @@ def _trend_confidence(context, config=None):
 
 
 def _valid_signal(engine, side, confidence, expected_r, size_multiplier, reasons):
-    if expected_r <= 0:
+    if expected_r < 0:
         return AlphaSignal.invalid(engine, f"{engine}_EXPECTANCY_NEGATIVE", side, confidence, expected_r)
-    return AlphaSignal(True, side, engine, _clamp(confidence), expected_r, _clamp(size_multiplier, 0.0, 1.5), list(reasons))
+    evidence_reasons = list(reasons)
+    if expected_r == 0:
+        evidence_reasons.append("ENGINE_EXPECTANCY_UNKNOWN_OR_INSUFFICIENT_DATA")
+    return AlphaSignal(
+        True,
+        side,
+        engine,
+        _clamp(confidence),
+        expected_r,
+        _clamp(size_multiplier, 0.0, 1.5),
+        evidence_reasons,
+    )
 
 
 def evaluate_trend_continuation_long(context, config=None, stats=None):

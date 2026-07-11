@@ -47,6 +47,16 @@ def test_position_sizing_blocks_after_hard_loss_streak():
     assert result["risk_multiplier"] == 0.0
 
 
+def test_position_sizing_block_wins_over_positive_minimum_multiplier():
+    result = build_position_risk_multiplier(
+        {"daily_loss_limit_hit": True},
+        {"min_risk_multiplier": 0.25},
+    )
+
+    assert result["blocked"] is True
+    assert result["risk_multiplier"] == 0.0
+
+
 def test_position_sizing_keeps_good_signal_near_full_risk():
     result = build_position_risk_multiplier({
         "atr_pct": 0.8,
