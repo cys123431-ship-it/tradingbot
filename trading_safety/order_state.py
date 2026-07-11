@@ -132,6 +132,15 @@ def _normalize_signal_timestamp(value: Any) -> str:
     return str(int(number))
 
 
+def _normalize_order_symbol(value: Any) -> str:
+    """Normalize CCXT, Binance, and display symbols for state lookups."""
+
+    text = str(value or "").upper().strip()
+    if ":" in text:
+        text = text.split(":", 1)[0]
+    return re.sub(r"[^A-Z0-9]", "", text)
+
+
 def build_client_order_id(
     strategy: str,
     symbol: str,
@@ -436,11 +445,11 @@ class SQLiteTradingStateStore:
         return [record for row in rows if (record := self._row_to_record(row)) is not None]
 
     def active_for_symbol(self, symbol: str) -> list[OrderRecord]:
-        normalized = str(symbol or "").upper()
+        normalized = _normalize_order_symbol(symbol)
         return [
             record
             for record in self.list_by_states(ACTIVE_ORDER_STATES)
-            if str(record.symbol or "").upper() == normalized
+            if _normalize_order_symbol(record.symbol) == normalized
         ]
 
     def entry_block_reason(self, symbol: str | None = None) -> str | None:
@@ -449,7 +458,7 @@ class SQLiteTradingStateStore:
             return None
         same_symbol = [
             record for record in records
-            if symbol and str(record.symbol).upper() == str(symbol).upper()
+            if symbol and _normalize_order_symbol(record.symbol) == _normalize_order_symbol(symbol)
         ]
         selected = same_symbol[0] if same_symbol else records[0]
         return f"{selected.order_state}:{selected.symbol}:{selected.client_order_id}"

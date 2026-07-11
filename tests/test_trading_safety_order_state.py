@@ -42,6 +42,33 @@ def test_order_state_persists_across_restart(tmp_path):
     assert second.entry_block_reason("BTC/USDT:USDT").startswith("FILLED_UNPROTECTED")
 
 
+def test_symbol_lookup_matches_ccxt_and_binance_forms(tmp_path):
+    store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+    store.upsert(
+        OrderRecord(
+            client_order_id="recon-hmstr",
+            symbol="HMSTR/USDT:USDT",
+            side="LONG",
+            strategy="EXTERNAL_OR_PRE_RECONCILIATION",
+            signal_timestamp="1",
+            requested_qty=10,
+            filled_qty=10,
+            order_state=OrderState.FILLED_UNPROTECTED.value,
+        )
+    )
+
+    assert [record.client_order_id for record in store.active_for_symbol("HMSTR/USDT")] == [
+        "recon-hmstr"
+    ]
+    assert [record.client_order_id for record in store.active_for_symbol("HMSTRUSDT")] == [
+        "recon-hmstr"
+    ]
+    assert store.entry_block_reason("HMSTR/USDT").startswith("FILLED_UNPROTECTED")
+
+    store.transition("recon-hmstr", OrderState.CLOSED)
+    assert store.active_for_symbol("HMSTR/USDT") == []
+
+
 def test_trade_result_is_idempotent(tmp_path):
     store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
     trade = {"trade_id": "trade-1", "symbol": "BTC/USDT", "net_pnl_usdt": 1.0}
