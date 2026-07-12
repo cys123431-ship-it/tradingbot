@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from types import SimpleNamespace
 
 import emas
@@ -33,6 +34,16 @@ def _engine(decisions):
 
     engine._evaluate_relative_strength_pullback_candidates = evaluate_candidates
     return engine
+
+
+def test_rspt_status_source_contract_uses_new_header():
+    source = inspect.getsource(
+        emas.SignalEngine.build_relative_strength_pullback_status_text
+    )
+
+    assert "📊 RSPT 전략 상태" in source
+    assert "RelativeStrengthPullbackTrend status" not in source
+    assert "Scanner candidates evaluated" not in source
 
 
 def test_rspt_status_uses_traffic_lights_and_korean_explanations():
