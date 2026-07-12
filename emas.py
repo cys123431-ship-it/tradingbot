@@ -14553,9 +14553,23 @@ class SignalEngine(BaseEngine):
             return selected
         return []
 
-    async def _evaluate_relative_strength_pullback_candidates(self, focus_symbol=None, cfg=None, *, record_state=True):
+    async def _evaluate_relative_strength_pullback_candidates(
+        self,
+        focus_symbol=None,
+        cfg=None,
+        *,
+        record_state=True,
+        resolve_ut_directions=False,
+        strategy_params=None,
+        direction_consumer='RSPT_STATUS',
+    ):
+        strategy_params = (
+            strategy_params
+            if isinstance(strategy_params, dict)
+            else self.get_runtime_strategy_params()
+        )
         cfg = cfg if isinstance(cfg, dict) else self._get_utbot_filtered_breakout_config(
-            self.get_runtime_strategy_params()
+            strategy_params
         )
         rsp_cfg = self._relative_strength_pullback_runtime_config(cfg)
         candidates = self._relative_strength_pullback_candidate_items()
@@ -14624,6 +14638,8 @@ class SignalEngine(BaseEngine):
             htf_tf,
             str(rsp_cfg.get('forced_direction') or rsp_cfg.get('rspt_forced_direction') or '').lower(),
             str(rsp_cfg.get('direction_source') or rsp_cfg.get('rspt_direction_source') or '').lower(),
+            bool(resolve_ut_directions),
+            str(direction_consumer or '').upper(),
             int(time.time() // 60),
         )
         cached = self.relative_strength_pullback_eval_cache.get(cache_key)
@@ -14649,17 +14665,19 @@ class SignalEngine(BaseEngine):
         htf_rows_by_symbol = {}
         for symbol_value in symbol_values:
             try:
-                signal_ohlcv = await asyncio.to_thread(
-                    self.market_data_exchange.fetch_ohlcv,
-                    symbol_value,
-                    signal_tf,
-                    limit=signal_limit,
-                )
-                htf_ohlcv = await asyncio.to_thread(
-                    self.market_data_exchange.fetch_ohlcv,
-                    symbol_value,
-                    htf_tf,
-                    limit=htf_limit,
+                signal_ohlcv, htf_ohlcv = await asyncio.gather(
+                    asyncio.to_thread(
+                        self.market_data_exchange.fetch_ohlcv,
+                        symbol_value,
+                        signal_tf,
+                        limit=signal_limit,
+                    ),
+                    asyncio.to_thread(
+                        self.market_data_exchange.fetch_ohlcv,
+                        symbol_value,
+                        htf_tf,
+                        limit=htf_limit,
+                    ),
                 )
             except Exception as exc:
                 self._utbreakout_trace_event(
@@ -14674,14 +14692,80 @@ class SignalEngine(BaseEngine):
             signal_rows_by_symbol[symbol_value] = self._relative_strength_pullback_rows_from_ohlcv(signal_ohlcv)
             htf_rows_by_symbol[symbol_value] = self._relative_strength_pullback_rows_from_ohlcv(htf_ohlcv)
 
-        decisions = evaluate_relative_strength_pullback_trend(
-            normalized_candidates,
-            signal_rows_by_symbol,
-            htf_rows_by_symbol,
-            state_by_symbol=getattr(self, 'relative_strength_pullback_states', {}),
-            config=rsp_cfg,
-            now_ms=int(time.time() * 1000),
-        )
+        direction_status_by_symbol = {}
+        if resolve_ut_directions:
+            for symbol_value in symbol_values:
+                signal_rows = signal_rows_by_symbol.get(symbol_value) or []
+                htf_rows = htf_rows_by_symbol.get(symbol_value) or []
+                side, reason, direction_status = self._calculate_shared_ut_direction_from_frames(
+                    signal_rows,
+                    htf_rows,
+                    strategy_params,
+                    consumer=direction_consumer,
+                )
+                direction_status = dict(direction_status or {})
+                direction_status['resolved_side'] = side
+                direction_status['reason'] = reason
+                direction_status_by_symbol[symbol_value] = direction_status
+
+            def _evaluate_for_direction(direction):
+                scoped_cfg = dict(rsp_cfg)
+                scoped_cfg['forced_direction'] = direction
+                scoped_cfg['rspt_forced_direction'] = direction
+                scoped_cfg['direction_source'] = 'UTBreakout'
+                scoped_cfg['rspt_direction_source'] = 'UTBreakout'
+                return evaluate_relative_strength_pullback_trend(
+                    normalized_candidates,
+                    signal_rows_by_symbol,
+                    htf_rows_by_symbol,
+                    state_by_symbol=getattr(self, 'relative_strength_pullback_states', {}),
+                    config=scoped_cfg,
+                    now_ms=int(time.time() * 1000),
+                )
+
+            evaluated = {
+                'long': _evaluate_for_direction('long'),
+                'short': _evaluate_for_direction('short'),
+                None: _evaluate_for_direction(None),
+            }
+            indexed = {
+                key: {
+                    self._utbreakout_trace_key(decision.symbol): decision
+                    for decision in decisions_for_side or []
+                }
+                for key, decisions_for_side in evaluated.items()
+            }
+            decisions = []
+            for symbol_value in symbol_values:
+                status = direction_status_by_symbol.get(symbol_value) or {}
+                side = self._normalize_relative_strength_pullback_direction(status.get('resolved_side'))
+                decision = indexed.get(side, indexed[None]).get(
+                    self._utbreakout_trace_key(symbol_value)
+                )
+                if decision is None:
+                    continue
+                decision.logs.update({
+                    'ut_direction_consumer': str(direction_consumer or 'RSPT_STATUS'),
+                    'ut_direction_authority': 'UTBreakout',
+                    'ut_direction_reason': status.get('reason'),
+                    'ut_direction_reason_code': status.get('direction_reason_code'),
+                    'ut_direction_4h_side': status.get('ut_4h_side'),
+                    'ut_direction_1d_side': status.get('ut_1d_side'),
+                    'ut_direction_4h_fresh_signal': status.get('ut_4h_fresh_signal'),
+                    'ut_direction_1d_fresh_signal': status.get('ut_1d_fresh_signal'),
+                    'ut_direction_resolved_side': side,
+                })
+                decisions.append(decision)
+        else:
+            decisions = evaluate_relative_strength_pullback_trend(
+                normalized_candidates,
+                signal_rows_by_symbol,
+                htf_rows_by_symbol,
+                state_by_symbol=getattr(self, 'relative_strength_pullback_states', {}),
+                config=rsp_cfg,
+                now_ms=int(time.time() * 1000),
+            )
+
         if not isinstance(getattr(self, 'relative_strength_pullback_last_decisions', None), dict):
             self.relative_strength_pullback_last_decisions = {}
         for decision in decisions:
@@ -14697,6 +14781,7 @@ class SignalEngine(BaseEngine):
                 'htf_rows_by_symbol': htf_rows_by_symbol,
                 'normalized_candidates': list(normalized_candidates or []),
                 'rsp_cfg': dict(rsp_cfg or {}),
+                'direction_status_by_symbol': direction_status_by_symbol,
             }
         }
         return decisions, signal_rows_by_symbol, htf_rows_by_symbol, normalized_candidates, rsp_cfg
@@ -15222,6 +15307,9 @@ class SignalEngine(BaseEngine):
                 focus_symbol=symbol,
                 cfg=cfg,
                 record_state=False,
+                resolve_ut_directions=True,
+                strategy_params=strategy_params,
+                direction_consumer='RSPT_STATUS',
             )
             classified = [_classify(decision) for decision in decisions]
             counts = {
@@ -15283,9 +15371,15 @@ class SignalEngine(BaseEngine):
                         f"   이유: {item['reason_text']} | 주문 없음 | 코드: {code}",
                     ])
                 elif code == 'no_ut_direction':
+                    direction_reason = str(item['logs'].get('ut_direction_reason') or 'UT 방향 계산 대기')
+                    side_4h = str(item['logs'].get('ut_direction_4h_side') or '-').upper()
+                    side_1d = str(item['logs'].get('ut_direction_1d_side') or '-').upper()
                     lines.extend([
                         f"⚪ {symbol_text} — UT 방향 대기",
-                        '   주문 없음 | UT 방향 확인 후 RSPT 조건 검사 | 코드: no_ut_direction',
+                        (
+                            f"   {direction_reason} | 4h {side_4h} / 1d {side_1d} | "
+                            'UT 방향 확인 후 RSPT 조건 검사 | 주문 없음 | 코드: no_ut_direction'
+                        ),
                     ])
                 else:
                     lines.extend([
@@ -15354,12 +15448,12 @@ class SignalEngine(BaseEngine):
         params['UTBotFilteredBreakoutV1'] = cfg
         return params
 
-    async def _shared_ut_direction_filter(
+    def _calculate_shared_ut_direction_from_frames(
         self,
-        symbol,
+        direction_rows,
+        htf_rows,
         strategy_params,
         *,
-        force_reprocess=False,
         consumer='UNKNOWN',
     ):
         direction_params = self._dual_alpha_direction_strategy_params(strategy_params)
@@ -15373,58 +15467,141 @@ class SignalEngine(BaseEngine):
             'htf_timeframe': '1d',
             'adaptive_timeframe_enabled': False,
         })
-        direction_params['UTBotFilteredBreakoutV1'] = direction_cfg
-        direction_tf = '4h'
+
+        def _frame(rows):
+            if isinstance(rows, pd.DataFrame):
+                frame = rows.copy()
+            else:
+                frame = pd.DataFrame(list(rows or []))
+            required = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            for column in required:
+                if column not in frame.columns:
+                    frame[column] = np.nan
+            frame = frame[required].copy()
+            for column in ['timestamp', 'open', 'high', 'low', 'close', 'volume']:
+                frame[column] = pd.to_numeric(frame[column], errors='coerce')
+            return frame.dropna(subset=['timestamp', 'open', 'high', 'low', 'close']).reset_index(drop=True)
+
+        direction_df = _frame(direction_rows)
+        htf_df = _frame(htf_rows)
+        ut_params = self._get_utbot_filtered_breakout_ut_params(direction_cfg)
+        signal_4h, reason_4h, detail_4h = self._calculate_utbot_signal(direction_df, ut_params)
+        signal_1d, reason_1d, detail_1d = self._calculate_utbot_signal(htf_df, ut_params)
+        detail_4h = dict(detail_4h or {})
+        detail_1d = dict(detail_1d or {})
+        side_4h = self._normalize_relative_strength_pullback_direction(
+            signal_4h or detail_4h.get('bias_side')
+        )
+        side_1d = self._normalize_relative_strength_pullback_direction(
+            signal_1d or detail_1d.get('bias_side')
+        )
+
+        if side_4h is None:
+            side = None
+            reason_code = 'UT_DIRECTION_4H_UNAVAILABLE'
+            reason = f'UT 4h 방향 계산 대기: {reason_4h}'
+        elif side_1d is None:
+            side = None
+            reason_code = 'UT_DIRECTION_1D_UNAVAILABLE'
+            reason = f'UT 1d 방향 계산 대기: {reason_1d}'
+        elif side_4h != side_1d:
+            side = None
+            reason_code = 'UT_DIRECTION_CONFLICT'
+            reason = f'UT 방향 불일치: 4h {side_4h.upper()} / 1d {side_1d.upper()}'
+        else:
+            side = side_4h
+            reason_code = 'UT_DIRECTION_READY'
+            reason = f'UT 방향 일치: 4h/1d {side.upper()}'
+
+        status = {
+            'entry_timeframe': '4h',
+            'exit_timeframe': '4h',
+            'htf_timeframe': '1d',
+            'dual_direction_filter_timeframe': '4h',
+            'dual_direction_filter_htf': '1d',
+            'ut_direction_consumer': str(consumer or 'UNKNOWN'),
+            'ut_direction_authority': 'UTBreakout',
+            'direction_reason_code': reason_code,
+            'candidate_side': side,
+            'candidate_signal': side,
+            'accepted_side': side,
+            'ut_bias_side': side_4h,
+            'ut_4h_side': side_4h,
+            'ut_1d_side': side_1d,
+            'ut_4h_fresh_signal': self._normalize_relative_strength_pullback_direction(signal_4h),
+            'ut_1d_fresh_signal': self._normalize_relative_strength_pullback_direction(signal_1d),
+            'ut_4h_reason': reason_4h,
+            'ut_1d_reason': reason_1d,
+            'ut_4h_detail': detail_4h,
+            'ut_1d_detail': detail_1d,
+            'stage': 'direction_ready' if side else 'direction_wait',
+            'reason': reason,
+        }
+        return side, reason, status
+
+    async def _shared_ut_direction_filter(
+        self,
+        symbol,
+        strategy_params,
+        *,
+        force_reprocess=False,
+        consumer='UNKNOWN',
+    ):
         try:
-            ohlcv = await asyncio.to_thread(
-                self.market_data_exchange.fetch_ohlcv,
-                symbol,
-                direction_tf,
-                limit=300,
+            direction_ohlcv, htf_ohlcv = await asyncio.gather(
+                asyncio.to_thread(
+                    self.market_data_exchange.fetch_ohlcv,
+                    symbol,
+                    '4h',
+                    limit=300,
+                ),
+                asyncio.to_thread(
+                    self.market_data_exchange.fetch_ohlcv,
+                    symbol,
+                    '1d',
+                    limit=300,
+                ),
             )
-            direction_df = pd.DataFrame(
-                ohlcv,
-                columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'],
-            )
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                direction_df[col] = pd.to_numeric(direction_df[col], errors='coerce')
         except Exception as exc:
-            reason = f"UT direction filter fetch failed ({direction_tf}): {exc}"
+            reason = f'UT direction fetch failed (4h/1d): {exc}'
+            status = {
+                'entry_timeframe': '4h',
+                'exit_timeframe': '4h',
+                'htf_timeframe': '1d',
+                'direction_reason_code': 'UT_DIRECTION_FETCH_ERROR',
+                'ut_direction_consumer': consumer,
+                'ut_direction_authority': 'UTBreakout',
+                'reason': reason,
+            }
             self._utbreakout_trace_event(
                 symbol,
                 'UT_DIRECTION',
                 'FILTER_ERROR',
-                entry_timeframe=direction_tf,
-                htf_timeframe=direction_cfg.get('htf_timeframe'),
+                entry_timeframe='4h',
+                htf_timeframe='1d',
                 reason=str(exc),
                 consumer=consumer,
             )
-            return None, reason, {}
+            return None, reason, status
 
-        sig, reason, status = await self._calculate_utbot_filtered_breakout_signal(
-            symbol,
-            direction_df,
-            direction_params,
-            force_reprocess=force_reprocess,
+        side, reason, status = self._calculate_shared_ut_direction_from_frames(
+            direction_ohlcv,
+            htf_ohlcv,
+            strategy_params,
+            consumer=consumer,
         )
-        status = dict(status or self._utbreakout_diag_for_symbol(symbol) or {})
-        status['entry_timeframe'] = '4h'
-        status['exit_timeframe'] = '4h'
-        status['htf_timeframe'] = '1d'
-        status['dual_direction_filter_timeframe'] = '4h'
-        status['dual_direction_filter_htf'] = '1d'
-        side = self._extract_relative_strength_pullback_ut_direction(sig, status)
+        status = dict(status or {})
+        status['force_reprocess'] = bool(force_reprocess)
         self._clear_utbot_filtered_breakout_entry_plan(symbol)
-        status['ut_direction_consumer'] = consumer
-        status['ut_direction_authority'] = 'UTBreakout'
         self._utbreakout_trace_event(
             symbol,
             'UT_DIRECTION',
             'FILTER_RESULT',
             side=side,
-            entry_timeframe=direction_cfg.get('entry_timeframe'),
-            htf_timeframe=direction_cfg.get('htf_timeframe'),
+            entry_timeframe='4h',
+            htf_timeframe='1d',
             reason=reason,
+            reason_code=status.get('direction_reason_code'),
             consumer=consumer,
         )
         return side, reason, status
@@ -42010,7 +42187,14 @@ class MainController:
         async def _set_live_real_risk_pct_from_user(requested_fraction, *, source):
             cfg_for_risk = _live_real_risk_cfg()
             current_fraction = _live_real_risk_fraction_from_cfg(cfg_for_risk)
-            state = load_live_real_risk_state()
+            try:
+                state = load_live_real_risk_state()
+            except LiveRealRiskStateUnreadable as exc:
+                return False, (
+                    "🔴 실거래 리스크 상태 파일을 신뢰할 수 없어 신규 거래와 리스크 변경을 차단했습니다.\n"
+                    "상태 파일을 복구하거나 운영자가 확인한 뒤 다시 시도하세요.\n"
+                    f"오류: {exc}"
+                )
             change_cfg = dict(cfg_for_risk)
             change_cfg["_risk_change_source"] = source
             change = apply_live_real_risk_pct_change(
@@ -42067,7 +42251,15 @@ class MainController:
 
         async def _live_real_risk_status_text(*, menu=False, notice=None):
             cfg_for_risk = _live_real_risk_cfg()
-            state = load_live_real_risk_state()
+            try:
+                state = load_live_real_risk_state()
+            except LiveRealRiskStateUnreadable as exc:
+                return (
+                    "🔴 실거래 리스크 상태: 거래 차단\n"
+                    "누적 손실 상태 파일을 신뢰할 수 없어 fail-closed로 신규 거래를 막았습니다.\n"
+                    "상태 파일을 복구하거나 운영자가 확인해야 합니다.\n"
+                    f"오류: {exc}"
+                )
             limits, equity_source = await _live_real_risk_limits(cfg_for_risk)
             return render_live_real_risk_status_text(
                 cfg_for_risk,
@@ -48540,6 +48732,12 @@ class TradingPausedError(TradingSafetyError):
     pass
 
 
+class LiveRealRiskStateUnreadable(TradingPausedError):
+    """Raised when persisted live loss state cannot be trusted."""
+
+    pass
+
+
 def _safe_float_value(value, default=0.0):
     try:
         number = float(value)
@@ -48562,20 +48760,25 @@ def _live_real_config_float(cfg, key, default):
     return _safe_float_value(cfg.get(key), default)
 
 
-def _live_real_kst_date_key(cfg=None, now=None):
+def _live_real_timezone(cfg=None):
     cfg = cfg if isinstance(cfg, dict) else {}
     tz_name = str(
-        cfg.get("risk_pct_change_reset_timezone")
-        or LIVE_REAL_SMALL_CAP_DEFAULTS["risk_pct_change_reset_timezone"]
+        cfg.get('risk_pct_change_reset_timezone')
+        or LIVE_REAL_SMALL_CAP_DEFAULTS['risk_pct_change_reset_timezone']
     )
     try:
-        tz = ZoneInfo(tz_name)
+        return tz_name, ZoneInfo(tz_name)
     except Exception:
-        tz = ZoneInfo("Asia/Seoul")
+        fallback = LIVE_REAL_SMALL_CAP_DEFAULTS['risk_pct_change_reset_timezone']
+        return fallback, ZoneInfo(fallback)
+
+
+def _live_real_kst_date_key(cfg=None, now=None):
+    _, tz = _live_real_timezone(cfg)
     current = now or datetime.now(timezone.utc)
-    if getattr(current, "tzinfo", None) is None:
+    if getattr(current, 'tzinfo', None) is None:
         current = current.replace(tzinfo=timezone.utc)
-    return current.astimezone(tz).strftime("%Y-%m-%d")
+    return current.astimezone(tz).strftime('%Y-%m-%d')
 
 
 def _live_real_min_max_risk_fraction(cfg=None):
@@ -48635,24 +48838,25 @@ def parse_live_real_risk_pct_input(value, cfg=None):
 
 def normalize_live_real_risk_state(state, cfg=None, now=None):
     state = dict(state) if isinstance(state, dict) else {}
-    today, week = _live_real_period_keys(now)
-    kst_date = _live_real_kst_date_key(cfg, now)
-    state.setdefault("date", today)
-    state.setdefault("week", week)
-    if state.get("date") != today:
-        state["date"] = today
-        state["daily_realized_pnl_usdt"] = 0.0
-        state["daily_loss_usdt"] = 0.0
-    if state.get("week") != week:
-        state["week"] = week
-        state["weekly_realized_pnl_usdt"] = 0.0
-        state["weekly_loss_usdt"] = 0.0
-    if state.get("risk_pct_change_date_kst") != kst_date:
-        state["risk_pct_change_date_kst"] = kst_date
-        state["risk_pct_increases_today"] = 0
-    state.setdefault("daily_realized_pnl_usdt", 0.0)
-    state.setdefault("weekly_realized_pnl_usdt", 0.0)
-    state.setdefault("risk_pct_increases_today", 0)
+    today, week = _live_real_period_keys(now, cfg)
+    timezone_name, _ = _live_real_timezone(cfg)
+    state.setdefault('date', today)
+    state.setdefault('week', week)
+    if state.get('date') != today:
+        state['date'] = today
+        state['daily_realized_pnl_usdt'] = 0.0
+        state['daily_loss_usdt'] = 0.0
+    if state.get('week') != week:
+        state['week'] = week
+        state['weekly_realized_pnl_usdt'] = 0.0
+        state['weekly_loss_usdt'] = 0.0
+    if state.get('risk_pct_change_date_kst') != today:
+        state['risk_pct_change_date_kst'] = today
+        state['risk_pct_increases_today'] = 0
+    state.setdefault('daily_realized_pnl_usdt', 0.0)
+    state.setdefault('weekly_realized_pnl_usdt', 0.0)
+    state.setdefault('risk_pct_increases_today', 0)
+    state['loss_period_timezone'] = timezone_name
     return state
 
 
@@ -48708,59 +48912,93 @@ def apply_live_real_risk_pct_change(state, current_fraction, requested_fraction,
 def resolve_live_small_cap_limits(cfg=None, account_equity=None):
     cfg = cfg if isinstance(cfg, dict) else {}
     equity = _safe_float_value(
-        account_equity if account_equity is not None else cfg.get("account_reference_equity_usdt"),
-        LIVE_REAL_SMALL_CAP_DEFAULTS["account_reference_equity_usdt"],
+        account_equity if account_equity is not None else cfg.get('account_reference_equity_usdt'),
+        LIVE_REAL_SMALL_CAP_DEFAULTS['account_reference_equity_usdt'],
     )
     equity = max(equity, 0.0)
     min_frac, max_frac = _live_real_min_max_risk_fraction(cfg)
     risk_frac = _live_real_risk_fraction_from_cfg(cfg)
     default_risk_frac = _bounded_fraction(
-        cfg.get("default_real_risk_pct"),
-        LIVE_REAL_SMALL_CAP_DEFAULTS["default_real_risk_pct"],
+        cfg.get('default_real_risk_pct'),
+        LIVE_REAL_SMALL_CAP_DEFAULTS['default_real_risk_pct'],
         minimum=min_frac,
         maximum=max_frac,
     )
     hard_notional_pct = _bounded_fraction(
-        cfg.get("max_position_notional_pct_hard_limit"),
-        LIVE_REAL_SMALL_CAP_DEFAULTS["max_position_notional_pct_hard_limit"],
+        cfg.get('max_position_notional_pct_hard_limit'),
+        LIVE_REAL_SMALL_CAP_DEFAULTS['max_position_notional_pct_hard_limit'],
         minimum=0.01,
         maximum=1.0,
     )
     notional_pct = _bounded_fraction(
-        cfg.get("max_real_position_notional_pct_of_equity"),
-        LIVE_REAL_SMALL_CAP_DEFAULTS["max_real_position_notional_pct_of_equity"],
+        cfg.get('max_real_position_notional_pct_of_equity'),
+        LIVE_REAL_SMALL_CAP_DEFAULTS['max_real_position_notional_pct_of_equity'],
         minimum=0.0,
         maximum=hard_notional_pct,
     )
-    if bool(cfg.get("scale_notional_cap_with_risk_pct", LIVE_REAL_SMALL_CAP_DEFAULTS["scale_notional_cap_with_risk_pct"])):
+    if bool(cfg.get('scale_notional_cap_with_risk_pct', LIVE_REAL_SMALL_CAP_DEFAULTS['scale_notional_cap_with_risk_pct'])):
         scale = risk_frac / max(default_risk_frac, 1e-12)
         notional_pct = min(hard_notional_pct, notional_pct * scale)
     daily_pct = _bounded_fraction(
-        cfg.get("max_daily_real_loss_pct_of_equity"),
-        LIVE_REAL_SMALL_CAP_DEFAULTS["max_daily_real_loss_pct_of_equity"],
+        cfg.get('max_daily_real_loss_pct_of_equity'),
+        LIVE_REAL_SMALL_CAP_DEFAULTS['max_daily_real_loss_pct_of_equity'],
         minimum=0.0,
         maximum=1.0,
     )
     weekly_pct = _bounded_fraction(
-        cfg.get("max_weekly_real_loss_pct_of_equity"),
-        LIVE_REAL_SMALL_CAP_DEFAULTS["max_weekly_real_loss_pct_of_equity"],
+        cfg.get('max_weekly_real_loss_pct_of_equity'),
+        LIVE_REAL_SMALL_CAP_DEFAULTS['max_weekly_real_loss_pct_of_equity'],
         minimum=0.0,
         maximum=1.0,
     )
+
+    percentage_notional_cap = equity * notional_pct
+    percentage_loss_cap = equity * risk_frac
+
+    def _positive_optional(key):
+        if cfg.get(key) is None:
+            return None
+        value = _safe_float_value(cfg.get(key), 0.0)
+        return value if value > 0 else None
+
+    absolute_notional_cap = _positive_optional('live_real_absolute_max_notional_usdt')
+    absolute_loss_cap = _positive_optional('live_real_absolute_max_loss_usdt')
+    effective_notional_cap = (
+        min(percentage_notional_cap, absolute_notional_cap)
+        if absolute_notional_cap is not None
+        else percentage_notional_cap
+    )
+    effective_loss_cap = (
+        min(percentage_loss_cap, absolute_loss_cap)
+        if absolute_loss_cap is not None
+        else percentage_loss_cap
+    )
+    timezone_name, _ = _live_real_timezone(cfg)
     limits = {
-        "account_equity_usdt": equity,
-        "risk_fraction": risk_frac,
-        "risk_pct": risk_frac * 100.0,
-        "min_risk_fraction": min_frac,
-        "max_risk_fraction": max_frac,
-        "max_position_notional_pct": notional_pct,
-        "max_position_notional_usdt": equity * notional_pct,
-        "max_loss_per_trade_usdt": equity * risk_frac,
-        "max_daily_loss_usdt": equity * daily_pct,
-        "max_weekly_loss_usdt": equity * weekly_pct,
-        "daily_loss_pct": daily_pct,
-        "weekly_loss_pct": weekly_pct,
-        "notional_scaled_by_risk": bool(cfg.get("scale_notional_cap_with_risk_pct", False)),
+        'account_equity_usdt': equity,
+        'risk_fraction': risk_frac,
+        'risk_pct': risk_frac * 100.0,
+        'min_risk_fraction': min_frac,
+        'max_risk_fraction': max_frac,
+        'max_position_notional_pct': notional_pct,
+        'percentage_max_position_notional_usdt': percentage_notional_cap,
+        'percentage_max_loss_per_trade_usdt': percentage_loss_cap,
+        'requested_absolute_max_notional_usdt': absolute_notional_cap,
+        'requested_absolute_max_loss_usdt': absolute_loss_cap,
+        'absolute_notional_cap_applied': (
+            absolute_notional_cap is not None and absolute_notional_cap < percentage_notional_cap
+        ),
+        'absolute_loss_cap_applied': (
+            absolute_loss_cap is not None and absolute_loss_cap < percentage_loss_cap
+        ),
+        'max_position_notional_usdt': effective_notional_cap,
+        'max_loss_per_trade_usdt': effective_loss_cap,
+        'max_daily_loss_usdt': equity * daily_pct,
+        'max_weekly_loss_usdt': equity * weekly_pct,
+        'daily_loss_pct': daily_pct,
+        'weekly_loss_pct': weekly_pct,
+        'loss_period_timezone': timezone_name,
+        'notional_scaled_by_risk': bool(cfg.get('scale_notional_cap_with_risk_pct', False)),
     }
     return limits
 
@@ -48812,6 +49050,8 @@ def build_live_real_risk_config(signal_engine_cfg):
         "max_weekly_real_loss_pct_of_equity",
         "scale_notional_cap_with_risk_pct",
         "max_position_notional_pct_hard_limit",
+        "live_real_absolute_max_notional_usdt",
+        "live_real_absolute_max_loss_usdt",
     ):
         if key in ut_cfg and key not in cfg_for_risk:
             cfg_for_risk[key] = ut_cfg[key]
@@ -48886,11 +49126,11 @@ def _format_live_real_risk_percent(fraction):
     return f"{float(fraction) * 100.0:.2f}%"
 
 
-def _format_live_real_risk_history(state, *, limit=5):
+def _format_live_real_risk_history(state, cfg=None, *, limit=5):
     history = state.get("risk_pct_change_history") if isinstance(state, dict) else None
     if not isinstance(history, list) or not history:
         return ["- 없음"]
-    tz = ZoneInfo("Asia/Seoul")
+    _, tz = _live_real_timezone(cfg)
     lines = []
     for item in history[-limit:]:
         if not isinstance(item, dict):
@@ -48941,7 +49181,8 @@ def render_live_real_risk_status_text(
         f"일 손실 한도: {float(limits.get('max_daily_loss_usdt', 0.0) or 0.0):.4f} USDT",
         f"주 손실 한도: {float(limits.get('max_weekly_loss_usdt', 0.0) or 0.0):.4f} USDT",
         f"오늘 리스크 상향 변경 횟수: {int(state.get('risk_pct_increases_today', 0) or 0)}/{limit} KST",
-        "리스크 변경 초기화 기준: Asia/Seoul 자정",
+        f"손실·리스크 집계 초기화 기준: "
+        f"{str(limits.get('loss_period_timezone') or 'Asia/Seoul')} 자정",
     ])
     if limits.get('notional_scaled_by_risk'):
         lines.append(
@@ -48957,7 +49198,7 @@ def render_live_real_risk_status_text(
             "리스크는 1회 최대 허용 손실 기준이며 실제 수량은 market quality, risk multiplier, cap에 따라 더 작아질 수 있습니다.",
         ])
     else:
-        lines.extend(["", "최근 변경 기록:", *_format_live_real_risk_history(state)])
+        lines.extend(["", "최근 변경 기록:", *_format_live_real_risk_history(state, cfg)])
     return "\n".join(lines)
 
 
@@ -49177,31 +49418,62 @@ def assert_symbol_allowed_for_live_real(symbol, cfg):
     return True
 
 
-def _live_real_period_keys(now=None):
-    now = now or datetime.now(timezone.utc)
-    iso = now.isocalendar()
-    return now.strftime("%Y-%m-%d"), f"{iso.year}-W{iso.week:02d}"
+def _live_real_period_keys(now=None, cfg=None):
+    _, tz = _live_real_timezone(cfg)
+    current = now or datetime.now(timezone.utc)
+    if getattr(current, 'tzinfo', None) is None:
+        current = current.replace(tzinfo=timezone.utc)
+    local = current.astimezone(tz)
+    iso = local.isocalendar()
+    return local.strftime('%Y-%m-%d'), f'{iso.year}-W{iso.week:02d}'
 
 
-def load_live_real_risk_state():
-    today, week = _live_real_period_keys()
-    default_state = {
-        "date": today,
-        "week": week,
-        "daily_realized_pnl_usdt": 0.0,
-        "weekly_realized_pnl_usdt": 0.0,
-    }
-    default_state = normalize_live_real_risk_state(default_state)
+def load_live_real_risk_state(cfg=None, now=None, *, fail_closed=True):
+    today, week = _live_real_period_keys(now, cfg)
+    default_state = normalize_live_real_risk_state({
+        'date': today,
+        'week': week,
+        'daily_realized_pnl_usdt': 0.0,
+        'weekly_realized_pnl_usdt': 0.0,
+    }, cfg, now)
     if not os.path.exists(LIVE_REAL_RISK_STATE_FILE):
         return default_state
+
     try:
-        with open(LIVE_REAL_RISK_STATE_FILE, "r", encoding="utf-8") as f:
+        with open(LIVE_REAL_RISK_STATE_FILE, 'r', encoding='utf-8') as f:
             state = json.load(f)
-    except Exception:
-        return default_state
-    if not isinstance(state, dict):
-        return default_state
-    return normalize_live_real_risk_state(state)
+        if not isinstance(state, dict):
+            raise ValueError('risk state root must be a JSON object')
+        numeric_fields = (
+            'daily_realized_pnl_usdt',
+            'weekly_realized_pnl_usdt',
+            'daily_loss_usdt',
+            'weekly_loss_usdt',
+            'risk_pct_increases_today',
+        )
+        for key in numeric_fields:
+            if key not in state:
+                continue
+            value = float(state[key])
+            if not math.isfinite(value):
+                raise ValueError(f'risk state field {key} is not finite')
+    except Exception as exc:
+        message = (
+            'LIVE_REAL_RISK_STATE_UNREADABLE: persisted loss state cannot be trusted; '
+            f'new entries are blocked ({type(exc).__name__}: {exc})'
+        )
+        logger.critical(message)
+        if fail_closed:
+            raise LiveRealRiskStateUnreadable(message) from exc
+        blocked = dict(default_state)
+        blocked.update({
+            'risk_state_unreadable': True,
+            'trading_blocked': True,
+            'reason_code': 'LIVE_REAL_RISK_STATE_UNREADABLE',
+            'error': f'{type(exc).__name__}: {exc}',
+        })
+        return blocked
+    return normalize_live_real_risk_state(state, cfg, now)
 
 
 def save_live_real_risk_state(state):
@@ -49213,18 +49485,25 @@ def save_live_real_risk_state(state):
     return state
 
 
-def record_bot_realized_pnl(pnl_usdt, *, now=None):
+def record_bot_realized_pnl(pnl_usdt, *, now=None, cfg=None):
     """Persist bot-confirmed realized PnL once the matching DB trade is closed."""
-    state = normalize_live_real_risk_state(load_live_real_risk_state(), now=now)
+    state = normalize_live_real_risk_state(
+        load_live_real_risk_state(cfg, now),
+        cfg,
+        now,
+    )
     pnl = _safe_float_value(pnl_usdt, 0.0)
-    state["daily_realized_pnl_usdt"] = (
-        _safe_float_value(state.get("daily_realized_pnl_usdt"), 0.0) + pnl
+    state['daily_realized_pnl_usdt'] = (
+        _safe_float_value(state.get('daily_realized_pnl_usdt'), 0.0) + pnl
     )
-    state["weekly_realized_pnl_usdt"] = (
-        _safe_float_value(state.get("weekly_realized_pnl_usdt"), 0.0) + pnl
+    state['weekly_realized_pnl_usdt'] = (
+        _safe_float_value(state.get('weekly_realized_pnl_usdt'), 0.0) + pnl
     )
-    state["last_realized_pnl_usdt"] = pnl
-    state["last_realized_pnl_at"] = (now or datetime.now(timezone.utc)).isoformat()
+    state['last_realized_pnl_usdt'] = pnl
+    changed_at = now or datetime.now(timezone.utc)
+    if getattr(changed_at, 'tzinfo', None) is None:
+        changed_at = changed_at.replace(tzinfo=timezone.utc)
+    state['last_realized_pnl_at'] = changed_at.isoformat()
     save_live_real_risk_state(state)
     return state
 
@@ -49964,6 +50243,22 @@ async def preflight_live_real_check(self, symbol, cfg):
     if float(account_equity) <= 0:
         raise TradingSafetyError("real futures account equity must be positive")
     limits = apply_live_small_cap_limits_to_config(cfg, account_equity)
+    logger.warning(
+        "LIVE_REAL_EFFECTIVE_LIMITS symbol=%s equity=%.4f risk_pct=%.4f "
+        "max_notional=%.4f max_loss_per_trade=%.4f daily_loss_limit=%.4f "
+        "weekly_loss_limit=%.4f timezone=%s requested_abs_notional=%s "
+        "requested_abs_loss=%s",
+        symbol,
+        float(limits.get('account_equity_usdt', 0.0) or 0.0),
+        float(limits.get('risk_pct', 0.0) or 0.0),
+        float(limits.get('max_position_notional_usdt', 0.0) or 0.0),
+        float(limits.get('max_loss_per_trade_usdt', 0.0) or 0.0),
+        float(limits.get('max_daily_loss_usdt', 0.0) or 0.0),
+        float(limits.get('max_weekly_loss_usdt', 0.0) or 0.0),
+        limits.get('loss_period_timezone'),
+        limits.get('requested_absolute_max_notional_usdt'),
+        limits.get('requested_absolute_max_loss_usdt'),
+    )
     assert_live_real_loss_limits_not_exceeded(cfg)
     state = load_critical_pause_state()
     if state and state.get("status") == "CRITICAL_PAUSED":
@@ -52786,6 +53081,10 @@ _bind_live_advanced_alpha_helpers_to_main_controller()
 
 
 if __name__ == "__main__":
+    if os.getenv('TRADINGBOT_OFFICIAL_LAUNCHER') != '1':
+        raise SystemExit(
+            'Direct execution is disabled. Use: python3 scripts/launch_emas.py'
+        )
     controller = None
     direct_process_lock = None
 
