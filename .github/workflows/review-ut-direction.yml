@@ -17,7 +17,7 @@ jobs:
           ref: main
           fetch-depth: 1
 
-      - name: Extract direction logic
+      - name: Extract focused direction internals
         shell: bash
         run: |
           set -euo pipefail
@@ -25,102 +25,85 @@ jobs:
           import ast
           from pathlib import Path
 
-          files = [
-              Path('emas.py'),
-              Path('utbreakout/relative_strength_pullback.py'),
-              Path('utbreakout/engine_router.py'),
-              Path('utbreakout/timeframe.py'),
-          ]
-          selected_names = {
+          path = Path('emas.py')
+          text = path.read_text(encoding='utf-8')
+          lines = text.splitlines()
+          tree = ast.parse(text)
+          defs = {}
+          for node in ast.walk(tree):
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                  defs.setdefault(node.name, []).append((node.lineno, getattr(node, 'end_lineno', node.lineno)))
+
+          selected = [
               '_calculate_utbot_signal',
-              '_evaluate_relative_strength_pullback_candidates',
-              '_normalize_relative_strength_pullback_direction',
+              '_get_utbot_filtered_breakout_config',
+              '_dual_alpha_direction_strategy_params',
+              '_shared_ut_direction_filter',
               '_extract_relative_strength_pullback_ut_direction',
               '_resolve_relative_strength_pullback_ut_direction',
               '_calculate_relative_strength_pullback_signal',
-              '_dual_alpha_strategy_params',
-              '_dual_alpha_direction_strategy_params',
-              '_shared_ut_direction_filter',
-              '_dual_alpha_ut_direction_filter',
               '_calculate_dual_alpha_signal',
-              '_handle_utbot_primary_strategy',
-              '_infer_live_utbot_direction_from_rows',
-              'default_relative_strength_pullback_config',
-              '_evaluate_symbol',
-              'evaluate_relative_strength_pullback_trend',
-              'resolve_entry_strategy',
-              'evaluate_final_trade_decision',
-          }
-          tokens = ('direction', 'relative_strength', 'dual_alpha', 'utbreakout', 'utbot')
+          ]
           out = []
-          for path in files:
-              if not path.exists():
-                  continue
-              text = path.read_text(encoding='utf-8')
-              lines = text.splitlines()
-              tree = ast.parse(text)
-              defs = []
-              for node in ast.walk(tree):
-                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                      end = getattr(node, 'end_lineno', node.lineno)
-                      defs.append((node.name, node.lineno, end))
-              out.append(f'===== FILE {path} =====')
-              out.append('--- matching definitions ---')
-              for name, start, end in sorted(defs, key=lambda x: x[1]):
-                  low = name.lower()
-                  if name in selected_names or any(tok in low for tok in tokens):
-                      out.append(f'{name}\t{start}-{end}')
-              out.append('--- selected source ---')
-              for name, start, end in sorted(defs, key=lambda x: x[1]):
-                  if name in selected_names:
-                      out.append(f'\n### {path}:{start}-{end} {name}\n')
-                      for number in range(start, end + 1):
-                          out.append(f'{number:06d}: {lines[number - 1]}')
+          out.append(f'HEAD_FUNCTION_REVIEW main source lines={len(lines)}')
+          for name in selected:
+              for start, end in defs.get(name, []):
+                  out.append(f'\n### emas.py:{start}-{end} {name}\n')
+                  for number in range(start, end + 1):
+                      out.append(f'{number:06d}: {lines[number - 1]}')
 
-          context_terms = [
-              '_calculate_utbot_filtered_breakout_signal(',
-              '_shared_ut_direction_filter(',
-              'forced_direction=',
-              'resolve_ut_direction=',
-              "consumer='RSPT_STANDALONE'",
-              "consumer='DUAL_ALPHA'",
-              "'no_ut_direction'",
-              "'accepted_side'",
+          target_ranges = defs.get('_calculate_utbot_filtered_breakout_signal', [])
+          terms = [
+              '_calculate_utbot_signal(',
+              "status['fresh_signal']",
+              "status['candidate_signal']",
+              "status['candidate_side']",
+              "status['ut_bias_side']",
+              "status['accepted_side']",
+              "'fresh_signal':",
+              "'candidate_signal':",
+              "'candidate_side':",
+              "'ut_bias_side':",
+              'dual_alpha_direction_filter_enabled',
+              'dual_alpha_direction_filter_timeframe',
+              'dual_alpha_direction_filter_htf',
+              'bias_side',
+              'signal_side',
+              'entry_timeframe',
+              'htf_timeframe',
+              'return _finish(',
           ]
-          out.append('\n===== CALL-SITE CONTEXTS =====')
-          path = Path('emas.py')
-          lines = path.read_text(encoding='utf-8').splitlines()
+          out.append('\n===== _calculate_utbot_filtered_breakout_signal focused contexts =====')
           emitted = set()
-          for idx, line in enumerate(lines):
-              if not any(term in line for term in context_terms):
-                  continue
-              lo = max(0, idx - 10)
-              hi = min(len(lines), idx + 16)
-              key = (lo, hi)
-              if key in emitted:
-                  continue
-              emitted.add(key)
-              out.append(f'\n--- emas.py:{lo + 1}-{hi} ---')
-              for number in range(lo, hi):
-                  out.append(f'{number + 1:06d}: {lines[number]}')
+          for start, end in target_ranges:
+              out.append(f'FUNCTION_RANGE={start}-{end}')
+              for idx in range(start - 1, end):
+                  line = lines[idx]
+                  if not any(term in line for term in terms):
+                      continue
+                  lo = max(start - 1, idx - 14)
+                  hi = min(end, idx + 20)
+                  key = (lo, hi)
+                  if key in emitted:
+                      continue
+                  emitted.add(key)
+                  out.append(f'\n--- emas.py:{lo + 1}-{hi} ---')
+                  for number in range(lo, hi):
+                      out.append(f'{number + 1:06d}: {lines[number]}')
 
-          grep_terms = [
-              'forced_direction',
-              'no_ut_direction',
-              'direction_source',
-              'shared_ut_direction',
-              'ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND',
-              'DUAL_ALPHA',
-              'dual_alpha',
-          ]
-          out.append('\n===== CROSS REFERENCES =====')
-          for path in Path('.').rglob('*.py'):
-              if '.git' in path.parts:
-                  continue
-              lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
-              for number, line in enumerate(lines, 1):
-                  if any(term in line for term in grep_terms):
-                      out.append(f'{path}:{number}: {line}')
+          rsp_path = Path('utbreakout/relative_strength_pullback.py')
+          rsp_text = rsp_path.read_text(encoding='utf-8')
+          rsp_lines = rsp_text.splitlines()
+          rsp_tree = ast.parse(rsp_text)
+          for node in ast.walk(rsp_tree):
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {
+                  'default_relative_strength_pullback_config', '_evaluate_symbol', 'evaluate_relative_strength_pullback_trend'
+              }:
+                  start = node.lineno
+                  end = getattr(node, 'end_lineno', start)
+                  out.append(f'\n### {rsp_path}:{start}-{end} {node.name}\n')
+                  for number in range(start, end + 1):
+                      out.append(f'{number:06d}: {rsp_lines[number - 1]}')
 
           Path('ut-direction-review.txt').write_text('\n'.join(out) + '\n', encoding='utf-8')
           PY
