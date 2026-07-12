@@ -1,0 +1,118 @@
+name: Review UT direction logic
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Extract direction logic
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          files = [
+              Path('emas.py'),
+              Path('utbreakout/relative_strength_pullback.py'),
+              Path('utbreakout/engine_router.py'),
+              Path('utbreakout/timeframe.py'),
+          ]
+          selected_names = {
+              '_resolve_relative_strength_pullback_ut_direction',
+              '_calculate_relative_strength_pullback_signal',
+              '_evaluate_relative_strength_pullback_candidates',
+              '_calculate_dual_alpha_signal',
+              '_calculate_dual_alpha_candidate',
+              '_dual_alpha_strategy_params',
+              '_resolve_utbreakout_direction',
+              '_calculate_utbreakout_signal',
+              'evaluate_relative_strength_pullback_trend',
+              'resolve_entry_strategy',
+              'evaluate_final_trade_decision',
+          }
+          tokens = ('direction', 'relative_strength', 'dual_alpha', 'utbreakout', 'utbot')
+          out = []
+          for path in files:
+              if not path.exists():
+                  continue
+              text = path.read_text(encoding='utf-8')
+              lines = text.splitlines()
+              tree = ast.parse(text)
+              defs = []
+              for node in ast.walk(tree):
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                      end = getattr(node, 'end_lineno', node.lineno)
+                      defs.append((node.name, node.lineno, end))
+              out.append(f'===== FILE {path} =====')
+              out.append('--- matching definitions ---')
+              for name, start, end in sorted(defs, key=lambda x: x[1]):
+                  low = name.lower()
+                  if name in selected_names or any(tok in low for tok in tokens):
+                      out.append(f'{name}\t{start}-{end}')
+              out.append('--- selected source ---')
+              for name, start, end in sorted(defs, key=lambda x: x[1]):
+                  if name in selected_names:
+                      out.append(f'\n### {path}:{start}-{end} {name}\n')
+                      for number in range(start, end + 1):
+                          out.append(f'{number:06d}: {lines[number - 1]}')
+
+          grep_terms = [
+              'forced_direction',
+              'no_ut_direction',
+              'direction_source',
+              'shared_ut_direction',
+              'ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND',
+              'DUAL_ALPHA',
+              'dual_alpha',
+          ]
+          out.append('\n===== CROSS REFERENCES =====')
+          for path in Path('.').rglob('*.py'):
+              if '.git' in path.parts:
+                  continue
+              lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+              for number, line in enumerate(lines, 1):
+                  if any(term in line for term in grep_terms):
+                      out.append(f'{path}:{number}: {line}')
+
+          Path('ut-direction-review.txt').write_text('\n'.join(out) + '\n', encoding='utf-8')
+          PY
+
+      - name: Run focused tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+          python -m pytest -q \
+            tests/test_rspt_shared_ut_direction.py \
+            tests/test_rspt_standalone_shared_direction.py \
+            tests/test_rspt_status_traffic_lights.py \
+            tests/test_dual_alpha*.py \
+            tests/test_utbreakout*.py \
+            > ut-direction-tests.txt 2>&1 || {
+              cat ut-direction-tests.txt
+              exit 1
+            }
+          cat ut-direction-tests.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ut-direction-review
+          path: |
+            ut-direction-review.txt
+            ut-direction-tests.txt
+          retention-days: 1
