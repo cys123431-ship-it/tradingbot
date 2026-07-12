@@ -1,6 +1,9 @@
 name: Inspect RSPT status formatter
 
 on:
+  pull_request:
+    branches:
+      - main
   push:
     branches:
       - rspt-status-inspect
