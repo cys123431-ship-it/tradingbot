@@ -1,6 +1,9 @@
 name: Validate live-risk and RSPT hardening
 
 on:
+  push:
+    branches:
+      - hardening-live-risk-rspt
   pull_request:
     branches:
       - main
@@ -31,7 +34,6 @@ jobs:
           echo "20868998870a87fbfa4e119e73bf909ccf00b21384c18e703a91d97445ea543b  /tmp/hardening.patch" | sha256sum -c -
           git apply --check /tmp/hardening.patch
           git apply /tmp/hardening.patch
-          git diff --check
 
       - name: Apply final review corrections
         shell: bash
@@ -39,10 +41,8 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
-
           path = Path('emas.py')
           text = path.read_text(encoding='utf-8')
-
           replacements = [
               (
                   """                        (
@@ -60,10 +60,7 @@ jobs:
                   "def _format_live_real_risk_history(state, *, limit=5):\n",
                   "def _format_live_real_risk_history(state, cfg=None, *, limit=5):\n",
               ),
-              (
-                  '    tz = ZoneInfo("Asia/Seoul")\n',
-                  '    _, tz = _live_real_timezone(cfg)\n',
-              ),
+              ('    tz = ZoneInfo("Asia/Seoul")\n', '    _, tz = _live_real_timezone(cfg)\n'),
               (
                   'lines.extend(["", "최근 변경 기록:", *_format_live_real_risk_history(state)])',
                   'lines.extend(["", "최근 변경 기록:", *_format_live_real_risk_history(state, cfg)])',
@@ -110,33 +107,25 @@ jobs:
 """,
               ),
           ]
-
           for old, new in replacements:
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f'expected exactly one correction target, found {count}: {old[:80]!r}')
+              if text.count(old) != 1:
+                  raise SystemExit(f'correction target mismatch: {old[:80]!r}')
               text = text.replace(old, new, 1)
-
           path.write_text(text, encoding='utf-8')
           PY
           git diff --check
 
-      - name: Install test dependencies
-        shell: bash
+      - name: Install dependencies
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pytest
 
-      - name: Compile changed Python files
-        shell: bash
+      - name: Compile and run targeted tests
         run: |
           set -euo pipefail
-          python -m py_compile \
-            emas.py \
-            scripts/live_real_trade.py \
-            scripts/launch_emas.py \
-            trading_safety/binance_algo_gateway.py \
+          python -m py_compile emas.py scripts/live_real_trade.py scripts/launch_emas.py trading_safety/binance_algo_gateway.py
+          python -m pytest -q \
             tests/test_live_real_trade_cli.py \
             tests/test_live_real_small_cap.py \
             tests/test_binance_algo_gateway.py \
@@ -144,56 +133,10 @@ jobs:
             tests/test_rspt_status_traffic_lights.py \
             tests/test_official_launcher_contract.py
 
-      - name: Run targeted safety tests
-        id: targeted
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -o pipefail
-          python -m pytest -q \
-            tests/test_live_real_trade_cli.py \
-            tests/test_live_real_small_cap.py \
-            tests/test_binance_algo_gateway.py \
-            tests/test_utbreakout_helpers.py \
-            tests/test_rspt_status_traffic_lights.py \
-            tests/test_official_launcher_contract.py \
-            2>&1 | tee targeted-tests.log
-
-      - name: Upload targeted diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hardening-targeted-tests
-          path: targeted-tests.log
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: Stop on targeted failure
-        if: steps.targeted.outcome == 'failure'
-        shell: bash
-        run: exit 1
-
       - name: Run full test suite
-        id: full
-        continue-on-error: true
-        shell: bash
         run: |
-          set -o pipefail
-          python -m pytest -q 2>&1 | tee full-tests.log
-
-      - name: Upload full diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hardening-full-tests
-          path: full-tests.log
-          if-no-files-found: ignore
-          retention-days: 1
-
-      - name: Stop on full-suite failure
-        if: steps.full.outcome == 'failure'
-        shell: bash
-        run: exit 1
+          set -euo pipefail
+          python -m pytest -q
 
       - name: Commit verified production changes to work branch
         shell: bash
@@ -201,18 +144,9 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add \
-            README.md \
-            emas.py \
-            scripts/live_real_trade.py \
-            scripts/launch_emas.py \
-            trading_safety/binance_algo_gateway.py \
-            tests/test_live_real_trade_cli.py \
-            tests/test_live_real_small_cap.py \
-            tests/test_binance_algo_gateway.py \
-            tests/test_utbreakout_helpers.py \
-            tests/test_rspt_status_traffic_lights.py \
-            tests/test_official_launcher_contract.py
+          git add README.md emas.py scripts/live_real_trade.py scripts/launch_emas.py trading_safety/binance_algo_gateway.py \
+            tests/test_live_real_trade_cli.py tests/test_live_real_small_cap.py tests/test_binance_algo_gateway.py \
+            tests/test_utbreakout_helpers.py tests/test_rspt_status_traffic_lights.py tests/test_official_launcher_contract.py
           git diff --cached --check
           git commit -m "fix: harden live risk and shared UT direction"
           git push origin HEAD:hardening-live-risk-rspt
