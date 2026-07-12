@@ -62,6 +62,16 @@ jobs:
               )
           emas.write_text(text, encoding='utf-8')
 
+          existing_test = Path('tests/test_relative_strength_pullback.py')
+          test_text = existing_test.read_text(encoding='utf-8')
+          old_assert = 'assert decision.entry_execution == "next_open"'
+          if test_text.count(old_assert) != 1:
+              raise SystemExit('expected exactly one RSPT next_open assertion')
+          existing_test.write_text(
+              test_text.replace(old_assert, 'assert decision.entry_execution == "market"', 1),
+              encoding='utf-8',
+          )
+
           test_path = Path('tests/test_rspt_closed_candle_market_entry.py')
           test_path.write_text('''from utbreakout.relative_strength_pullback import (\n    PullbackTrendDecision,\n    _closed_rows,\n    default_relative_strength_pullback_config,\n)\n\n\ndef test_rspt_defaults_to_market_entry_after_closed_candle_confirmation():\n    cfg = default_relative_strength_pullback_config()\n    assert cfg["entry_execution"] == "market"\n    assert cfg["exclude_incomplete_live_candle"] is True\n    assert PullbackTrendDecision(symbol="BTC/USDT").entry_execution == "market"\n\n\ndef test_rspt_excludes_the_live_4h_candle_before_signal_evaluation():\n    tf_ms = 4 * 60 * 60 * 1000\n    rows = [\n        {"timestamp": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},\n        {"timestamp": tf_ms + 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},\n    ]\n    closed = _closed_rows(rows, "4h", {"exclude_incomplete_live_candle": True}, now_ms=tf_ms + 2)\n    assert len(closed) == 1\n    assert closed[0]["timestamp"] == 1\n''', encoding='utf-8')
           PY
@@ -74,34 +84,18 @@ jobs:
           python -m pip install -r requirements.txt pytest
 
       - name: Compile and test
-        id: tests
-        continue-on-error: true
         run: |
-          set -o pipefail
-          {
-            python -m py_compile emas.py utbreakout/relative_strength_pullback.py tests/test_rspt_closed_candle_market_entry.py
-            python -m pytest -q tests/test_rspt_closed_candle_market_entry.py tests/test_rspt_status_traffic_lights.py tests/test_utbreakout_helpers.py
-            python -m pytest -q
-          } 2>&1 | tee rspt-market-entry-tests.log
-
-      - name: Upload test log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rspt-market-entry-tests
-          path: rspt-market-entry-tests.log
-          retention-days: 1
-
-      - name: Stop on test failure
-        if: steps.tests.outcome == 'failure'
-        run: exit 1
+          set -euo pipefail
+          python -m py_compile emas.py utbreakout/relative_strength_pullback.py tests/test_rspt_closed_candle_market_entry.py tests/test_relative_strength_pullback.py
+          python -m pytest -q tests/test_rspt_closed_candle_market_entry.py tests/test_relative_strength_pullback.py tests/test_rspt_status_traffic_lights.py tests/test_utbreakout_helpers.py
+          python -m pytest -q
 
       - name: Commit verified change
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add emas.py utbreakout/relative_strength_pullback.py tests/test_rspt_closed_candle_market_entry.py
+          git add emas.py utbreakout/relative_strength_pullback.py tests/test_relative_strength_pullback.py tests/test_rspt_closed_candle_market_entry.py
           git diff --cached --check
           git commit -m "feat: enter RSPT immediately after closed-candle confirmation"
           git push origin HEAD:rspt-market-entry-20260712
