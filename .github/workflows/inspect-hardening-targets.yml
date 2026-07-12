@@ -4,9 +4,6 @@ on:
   push:
     branches:
       - hardening-live-risk-rspt
-  pull_request:
-    branches:
-      - main
 
 permissions:
   contents: write
@@ -26,7 +23,7 @@ jobs:
           ref: hardening-live-risk-rspt
           fetch-depth: 0
 
-      - name: Reconstruct and apply reviewed patch
+      - name: Apply reviewed hardening changes
         shell: bash
         run: |
           set -euo pipefail
@@ -34,97 +31,30 @@ jobs:
           echo "20868998870a87fbfa4e119e73bf909ccf00b21384c18e703a91d97445ea543b  /tmp/hardening.patch" | sha256sum -c -
           git apply --check /tmp/hardening.patch
           git apply /tmp/hardening.patch
-
-      - name: Apply final review corrections
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          from pathlib import Path
-          path = Path('emas.py')
-          text = path.read_text(encoding='utf-8')
-          replacements = [
-              (
-                  """                        (
-                            f"   {direction_reason} | 4h {side_4h} / 1d {side_1d} | "
-                            '주문 없음 | 코드: no_ut_direction'
-                        ),
-""",
-                  """                        (
-                            f"   {direction_reason} | 4h {side_4h} / 1d {side_1d} | "
-                            'UT 방향 확인 후 RSPT 조건 검사 | 주문 없음 | 코드: no_ut_direction'
-                        ),
-""",
-              ),
-              (
-                  "def _format_live_real_risk_history(state, *, limit=5):\n",
-                  "def _format_live_real_risk_history(state, cfg=None, *, limit=5):\n",
-              ),
-              ('    tz = ZoneInfo("Asia/Seoul")\n', '    _, tz = _live_real_timezone(cfg)\n'),
-              (
-                  'lines.extend(["", "최근 변경 기록:", *_format_live_real_risk_history(state)])',
-                  'lines.extend(["", "최근 변경 기록:", *_format_live_real_risk_history(state, cfg)])',
-              ),
-              (
-                  """        async def _set_live_real_risk_pct_from_user(requested_fraction, *, source):
-            cfg_for_risk = _live_real_risk_cfg()
-            current_fraction = _live_real_risk_fraction_from_cfg(cfg_for_risk)
-            state = load_live_real_risk_state()
-            change_cfg = dict(cfg_for_risk)
-""",
-                  """        async def _set_live_real_risk_pct_from_user(requested_fraction, *, source):
-            cfg_for_risk = _live_real_risk_cfg()
-            current_fraction = _live_real_risk_fraction_from_cfg(cfg_for_risk)
-            try:
-                state = load_live_real_risk_state()
-            except LiveRealRiskStateUnreadable as exc:
-                return False, (
-                    "🔴 실거래 리스크 상태 파일을 신뢰할 수 없어 신규 거래와 리스크 변경을 차단했습니다.\n"
-                    "상태 파일을 복구하거나 운영자가 확인한 뒤 다시 시도하세요.\n"
-                    f"오류: {exc}"
-                )
-            change_cfg = dict(cfg_for_risk)
-""",
-              ),
-              (
-                  """        async def _live_real_risk_status_text(*, menu=False, notice=None):
-            cfg_for_risk = _live_real_risk_cfg()
-            state = load_live_real_risk_state()
-            limits, equity_source = await _live_real_risk_limits(cfg_for_risk)
-""",
-                  """        async def _live_real_risk_status_text(*, menu=False, notice=None):
-            cfg_for_risk = _live_real_risk_cfg()
-            try:
-                state = load_live_real_risk_state()
-            except LiveRealRiskStateUnreadable as exc:
-                return (
-                    "🔴 실거래 리스크 상태: 거래 차단\n"
-                    "누적 손실 상태 파일을 신뢰할 수 없어 fail-closed로 신규 거래를 막았습니다.\n"
-                    "상태 파일을 복구하거나 운영자가 확인해야 합니다.\n"
-                    f"오류: {exc}"
-                )
-            limits, equity_source = await _live_real_risk_limits(cfg_for_risk)
-""",
-              ),
-          ]
-          for old, new in replacements:
-              if text.count(old) != 1:
-                  raise SystemExit(f'correction target mismatch: {old[:80]!r}')
-              text = text.replace(old, new, 1)
-          path.write_text(text, encoding='utf-8')
-          PY
+          python .github/patches/final_corrections.py
           git diff --check
 
       - name: Install dependencies
+        shell: bash
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pytest
 
-      - name: Compile and run targeted tests
+      - name: Compile changed Python files
+        shell: bash
         run: |
           set -euo pipefail
-          python -m py_compile emas.py scripts/live_real_trade.py scripts/launch_emas.py trading_safety/binance_algo_gateway.py
+          python -m py_compile \
+            emas.py \
+            scripts/live_real_trade.py \
+            scripts/launch_emas.py \
+            trading_safety/binance_algo_gateway.py
+
+      - name: Run targeted safety tests
+        shell: bash
+        run: |
+          set -euo pipefail
           python -m pytest -q \
             tests/test_live_real_trade_cli.py \
             tests/test_live_real_small_cap.py \
@@ -134,19 +64,29 @@ jobs:
             tests/test_official_launcher_contract.py
 
       - name: Run full test suite
+        shell: bash
         run: |
           set -euo pipefail
           python -m pytest -q
 
-      - name: Commit verified production changes to work branch
+      - name: Commit verified production changes
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add README.md emas.py scripts/live_real_trade.py scripts/launch_emas.py trading_safety/binance_algo_gateway.py \
-            tests/test_live_real_trade_cli.py tests/test_live_real_small_cap.py tests/test_binance_algo_gateway.py \
-            tests/test_utbreakout_helpers.py tests/test_rspt_status_traffic_lights.py tests/test_official_launcher_contract.py
+          git add \
+            README.md \
+            emas.py \
+            scripts/live_real_trade.py \
+            scripts/launch_emas.py \
+            trading_safety/binance_algo_gateway.py \
+            tests/test_live_real_trade_cli.py \
+            tests/test_live_real_small_cap.py \
+            tests/test_binance_algo_gateway.py \
+            tests/test_utbreakout_helpers.py \
+            tests/test_rspt_status_traffic_lights.py \
+            tests/test_official_launcher_contract.py
           git diff --cached --check
           git commit -m "fix: harden live risk and shared UT direction"
           git push origin HEAD:hardening-live-risk-rspt
