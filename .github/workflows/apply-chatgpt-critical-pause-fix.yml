@@ -1,0 +1,90 @@
+name: Apply ChatGPT critical pause fix
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/apply-chatgpt-critical-pause-fix.yml
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-chatgpt-critical-pause-fix
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          path: repo
+
+      - name: Checkout staged patch assets
+        uses: actions/checkout@v4
+        with:
+          ref: chatgpt-critical-pause-stage
+          path: stage-assets
+
+      - name: Reconstruct and verify patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          gzip -dc stage-assets/.github/patches/critical-pause-fix.patch.gz \
+            > /tmp/critical-pause-fix.patch
+          echo "be4fa51e2ba2a2216a3a5fbf5c89ee7d6507336ab26df64828f8fcf7984b24cb  /tmp/critical-pause-fix.patch" \
+            | sha256sum -c -
+
+      - name: Apply patch safely
+        shell: bash
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor a93e09560bf6b014c38c10d15defccf573447fcb HEAD
+          git diff --quiet a93e09560bf6b014c38c10d15defccf573447fcb -- . \
+            ':(exclude).github/workflows/apply-chatgpt-critical-pause-fix.yml'
+          git apply --check /tmp/critical-pause-fix.patch
+          git apply /tmp/critical-pause-fix.patch
+          cp ../stage-assets/.github/patches/test_critical_pause_real_order_error.py \
+            tests/test_critical_pause_real_order_error.py
+          rm -f .github/workflows/apply-chatgpt-critical-pause-fix.yml
+          git diff --check
+
+      - name: Install test dependencies
+        shell: bash
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+
+      - name: Run compile and full test suite
+        shell: bash
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m compileall -q emas.py trading_safety tests
+          python -m pytest -q
+
+      - name: Commit directly to main
+        shell: bash
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix: harden critical pause entry handling"
+          git push origin HEAD:main
