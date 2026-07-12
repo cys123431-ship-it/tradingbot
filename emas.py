@@ -150,6 +150,7 @@ from utbreakout.engine_router import (
 from utbreakout.relative_strength_pullback import (
     ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
     ENTRY_STRATEGY_UT_BREAKOUT,
+    completed_candle_rows,
     default_relative_strength_pullback_config,
     evaluate_relative_strength_pullback_trend,
     resolve_entry_strategy,
@@ -14522,7 +14523,53 @@ class SignalEngine(BaseEngine):
                 base[key] = source[key]
         if source.get('entry_strategy'):
             base['entry_strategy'] = resolve_entry_strategy(source)
+        # RSPT always confirms on the last completed candle and submits the
+        # accepted signal immediately through the existing market-order path.
+        # Legacy persisted next_open/incomplete-candle values cannot override it.
+        base['entry_execution'] = 'market'
+        base['exclude_incomplete_live_candle'] = True
+        base['signal_basis'] = 'last_completed_candle'
         return base
+
+    @staticmethod
+    def _relative_strength_pullback_timestamp_ms(value):
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return 0
+        if not np.isfinite(parsed) or parsed <= 0:
+            return 0
+        return int(parsed * 1000.0 if parsed < 10_000_000_000 else parsed)
+
+    def _relative_strength_pullback_completed_rows(
+        self,
+        rows,
+        rsp_cfg,
+        decision_logs=None,
+        *,
+        now_ms=None,
+    ):
+        completed = completed_candle_rows(
+            rows,
+            str((rsp_cfg or {}).get('signal_tf') or '4h'),
+            rsp_cfg,
+            now_ms,
+        )
+        expected_ts = self._relative_strength_pullback_timestamp_ms(
+            (decision_logs or {}).get('signal_candle_ts')
+        )
+        if expected_ts <= 0:
+            return completed
+        exact_index = None
+        for idx, row in enumerate(completed):
+            row_ts = self._relative_strength_pullback_timestamp_ms(
+                row.get('timestamp') if isinstance(row, dict) else None
+            )
+            if row_ts == expected_ts:
+                exact_index = idx
+        if exact_index is None:
+            return []
+        return completed[:exact_index + 1]
 
     def _relative_strength_pullback_rows_from_ohlcv(self, ohlcv):
         rows = []
@@ -14886,6 +14933,9 @@ class SignalEngine(BaseEngine):
             'rspt_direction_provider_reason': direction_reason,
             'rspt_internal_direction_disabled': True,
             'rspt_direction_authority': 'UTBreakout',
+            'entry_execution': 'market',
+            'signal_basis': 'last_completed_candle',
+            'exclude_incomplete_live_candle': True,
         }
         if provider_status:
             status['rspt_direction_provider_status'] = {
@@ -15000,19 +15050,44 @@ class SignalEngine(BaseEngine):
             )
 
         rows = signal_rows_by_symbol.get(symbol) or []
-        if len(rows) < 30:
-            return _finish(None, 'REJECTED_RSPT_DATA: signal rows insufficient', 'REJECTED_RSPT_DATA', side=side)
-        signal_df = pd.DataFrame(rows)
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            signal_df[col] = pd.to_numeric(signal_df[col], errors='coerce')
-        closed = signal_df.dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+        completed_rows = self._relative_strength_pullback_completed_rows(
+            rows,
+            rsp_cfg,
+            decision_logs,
+            now_ms=int(time.time() * 1000),
+        )
+        if len(completed_rows) < 30:
+            return _finish(
+                None,
+                'REJECTED_RSPT_DATA: completed signal rows insufficient or decision candle mismatch',
+                'REJECTED_RSPT_DATA',
+                side=side,
+            )
+        signal_df = pd.DataFrame(completed_rows)
+        for col in ['timestamp', 'open', 'high', 'low', 'close', 'volume']:
+            if col in signal_df.columns:
+                signal_df[col] = pd.to_numeric(signal_df[col], errors='coerce')
+        closed = signal_df.dropna(subset=['timestamp', 'open', 'high', 'low', 'close']).reset_index(drop=True)
         if len(closed) < 30:
-            return _finish(None, 'REJECTED_RSPT_DATA: valid rows insufficient', 'REJECTED_RSPT_DATA', side=side)
+            return _finish(None, 'REJECTED_RSPT_DATA: valid completed rows insufficient', 'REJECTED_RSPT_DATA', side=side)
 
         decision_row = closed.iloc[-1]
-        decision_ts = int(decision_row.get('timestamp') or 0)
+        decision_ts = self._relative_strength_pullback_timestamp_ms(decision_row.get('timestamp'))
+        expected_decision_ts = self._relative_strength_pullback_timestamp_ms(
+            decision_logs.get('signal_candle_ts')
+        )
+        if expected_decision_ts > 0 and decision_ts != expected_decision_ts:
+            return _finish(
+                None,
+                'REJECTED_RSPT_DATA: completed decision candle mismatch',
+                'REJECTED_RSPT_DATA',
+                side=side,
+            )
         entry_price = float(decision_row['close'])
         status['decision_candle_ts'] = decision_ts
+        status['signal_candle_close_ts'] = decision_logs.get('signal_candle_close_ts')
+        status['signal_candle_closed'] = True
+        status['entry_execution'] = 'market'
         status['entry_price'] = entry_price
         metrics = self._calculate_utbreakout_timeframe_metrics(closed, cfg)
         atr_value = metrics.get('atr')
@@ -15121,6 +15196,11 @@ class SignalEngine(BaseEngine):
             'exit_timeframe': cfg.get('exit_timeframe', cfg.get('entry_timeframe', '15m')),
             'htf_timeframe': rsp_cfg.get('trend_htf', '1d'),
             'decision_candle_ts': decision_ts,
+            'signal_candle_close_ts': decision_logs.get('signal_candle_close_ts'),
+            'signal_candle_closed': True,
+            'signal_basis': 'last_completed_candle',
+            'entry_execution': 'market',
+            'entry_execution_policy': 'market_immediately_after_completed_candle',
             'atr': atr_value,
             'atr_pct': atr_pct,
             'market_quality_enabled': bool(cfg.get('market_quality_enabled', True)),
@@ -15159,7 +15239,7 @@ class SignalEngine(BaseEngine):
         )
         return _finish(
             side,
-            f"ACCEPTED_ENTRY: RSPT {side.upper()} {decision_logs.get('setup_type') or decision.reason} confirmed",
+            f"ACCEPTED_ENTRY: RSPT {side.upper()} {decision_logs.get('setup_type') or decision.reason} confirmed on completed candle; market entry",
             None,
         )
 
@@ -15173,11 +15253,10 @@ class SignalEngine(BaseEngine):
         )
         signal_tf = str(rsp_cfg.get('signal_tf', '4h') or '4h')
         htf_tf = str(rsp_cfg.get('trend_htf', '1d') or '1d')
-        execution = str(rsp_cfg.get('entry_execution', 'market') or 'next_open')
+        execution = str(rsp_cfg.get('entry_execution', 'market') or 'market')
         execution_label = {
             'next_open': '다음 봉 시가',
-                  'market': '완성봉 확인 직후 시장가',
-            'market': '시장가',
+            'market': '완성봉 확인 직후 시장가',
             'close': '현재 봉 종가',
         }.get(execution, execution)
 

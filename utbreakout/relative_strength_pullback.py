@@ -153,6 +153,17 @@ def _closed_rows(rows, timeframe, config=None, now_ms=None):
     return clean
 
 
+def completed_candle_rows(rows, timeframe, config=None, now_ms=None):
+    """Return only completed candles for RSPT signal and plan construction.
+
+    The live RSPT contract is intentionally fail-closed: a persisted legacy
+    setting cannot re-enable the in-progress candle.
+    """
+    cfg = dict(config or {})
+    cfg["exclude_incomplete_live_candle"] = True
+    return _closed_rows(rows, timeframe, cfg, now_ms)
+
+
 def _ema(values, length):
     length = max(1, int(length or 1))
     clean = [_finite_float(value) for value in values if isfinite(_finite_float(value, float("nan")))]
@@ -522,7 +533,7 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
         "scanner_passed": True,
         "symbol": symbol,
         "entry_strategy": ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
-        "entry_execution": cfg.get("entry_execution", "market"),
+        "entry_execution": "market",
         "direction_by": direction_source,
         "rspt_direction_source": direction_source,
         "rspt_forced_direction": forced_direction,
@@ -566,6 +577,14 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
     atr = _atr(signal_rows, effective_cfg.get("atr_length", 14))
     row = signal_rows[-1]
     prev = signal_rows[-2]
+    signal_tf = str(cfg.get("signal_tf") or "4h")
+    signal_candle_ts = int(_timestamp_ms(row.get("timestamp")))
+    signal_tf_ms = _timeframe_to_ms(signal_tf)
+    signal_candle_close_ts = (
+        signal_candle_ts + signal_tf_ms
+        if signal_candle_ts > 0 and signal_tf_ms > 0
+        else 0
+    )
     close = _row_value(row, "close")
     open_ = _row_value(row, "open", close)
     high = _row_value(row, "high")
@@ -610,6 +629,12 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
         "ema_htf_effective": effective_cfg.get("ema_htf", cfg.get("ema_htf", 200)),
         "internal_trend_confirmation_required": False,
         "internal_trend_confirmation_requested_but_ignored": internal_trend_requested,
+        "signal_candle_ts": signal_candle_ts,
+        "signal_candle_close_ts": signal_candle_close_ts,
+        "signal_candle_closed": True,
+        "signal_basis": "last_completed_candle",
+        "entry_execution": "market",
+        "entry_execution_policy": "market_immediately_after_completed_candle",
     }
 
     if forced_direction not in {"long", "short"}:
@@ -685,7 +710,7 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
                 symbol,
                 side=side,
                 entry_ready=True,
-                entry_execution=cfg.get("entry_execution", "market"),
+                entry_execution="market",
                 reason="breakout_continuation_confirmed",
                 logs={
                     **side_logs,
@@ -704,7 +729,7 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
                 symbol,
                 side=side,
                 entry_ready=True,
-                entry_execution=cfg.get("entry_execution", "market"),
+                entry_execution="market",
                 reason="trend_pullback_confirmed",
                 logs={
                     **side_logs,
@@ -745,13 +770,17 @@ def evaluate_relative_strength_pullback_trend(
 ):
     cfg = default_relative_strength_pullback_config()
     cfg.update(config or {})
+    # Live contract: decide only from completed candles and submit immediately
+    # as a market entry after confirmation. Legacy persisted values are ignored.
+    cfg["entry_execution"] = "market"
+    cfg["exclude_incomplete_live_candle"] = True
     symbols = _candidate_symbols(candidates)
     rs = _relative_strength_percentiles(symbols, signal_rows_by_symbol or {}, cfg, now_ms)
     state_by_symbol = state_by_symbol or {}
     decisions = []
     for symbol in symbols:
-        signal_rows = _closed_rows((signal_rows_by_symbol or {}).get(symbol, []), cfg.get("signal_tf", "4h"), cfg, now_ms)
-        htf_rows = _closed_rows((htf_rows_by_symbol or {}).get(symbol, []), cfg.get("trend_htf", "1d"), cfg, now_ms)
+        signal_rows = completed_candle_rows((signal_rows_by_symbol or {}).get(symbol, []), cfg.get("signal_tf", "4h"), cfg, now_ms)
+        htf_rows = completed_candle_rows((htf_rows_by_symbol or {}).get(symbol, []), cfg.get("trend_htf", "1d"), cfg, now_ms)
         decisions.append(_evaluate_symbol(symbol, signal_rows, htf_rows, rs.get(symbol, {}), state_by_symbol.get(symbol), cfg, now_ms))
     return decisions
 
