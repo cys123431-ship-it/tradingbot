@@ -57,22 +57,55 @@ jobs:
             tests/test_official_launcher_contract.py
 
       - name: Run targeted safety tests
+        id: targeted
+        continue-on-error: true
         shell: bash
         run: |
-          set -euo pipefail
+          set -o pipefail
           python -m pytest -q \
             tests/test_live_real_trade_cli.py \
             tests/test_live_real_small_cap.py \
             tests/test_binance_algo_gateway.py \
             tests/test_utbreakout_helpers.py \
             tests/test_rspt_status_traffic_lights.py \
-            tests/test_official_launcher_contract.py
+            tests/test_official_launcher_contract.py \
+            2>&1 | tee targeted-tests.log
+
+      - name: Upload targeted diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hardening-targeted-tests
+          path: targeted-tests.log
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Stop on targeted failure
+        if: steps.targeted.outcome == 'failure'
+        shell: bash
+        run: exit 1
 
       - name: Run full test suite
+        id: full
+        continue-on-error: true
         shell: bash
         run: |
-          set -euo pipefail
-          python -m pytest -q
+          set -o pipefail
+          python -m pytest -q 2>&1 | tee full-tests.log
+
+      - name: Upload full diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hardening-full-tests
+          path: full-tests.log
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Stop on full-suite failure
+        if: steps.full.outcome == 'failure'
+        shell: bash
+        run: exit 1
 
       - name: Commit verified production changes to work branch
         shell: bash
