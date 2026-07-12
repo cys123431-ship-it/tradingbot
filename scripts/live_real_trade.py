@@ -23,14 +23,26 @@ def parse_args(argv=None):
     parser.add_argument("--symbol", required=True)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--confirm", required=True)
-    parser.add_argument("--max-notional", type=float, default=15.0)
-    parser.add_argument("--max-loss", type=float, default=3.0)
+    parser.add_argument(
+        "--max-notional", type=float, default=15.0,
+        help="Absolute USDT hard cap; effective cap is the lower of this value and the equity-based cap.",
+    )
+    parser.add_argument(
+        "--max-loss", type=float, default=3.0,
+        help="Absolute USDT loss hard cap; effective cap is the lower of this value and the risk-percent budget.",
+    )
     parser.add_argument("--leverage", type=int, default=5)
     parser.add_argument("--side", choices=("LONG", "SHORT"), default=None)
     return parser.parse_args(argv)
 
 
 def build_live_real_config(args, base_cfg=None):
+    max_notional = float(args.max_notional)
+    max_loss = float(args.max_loss)
+    if max_notional <= 0:
+        raise ValueError("--max-notional must be greater than zero")
+    if max_loss <= 0:
+        raise ValueError("--max-loss must be greater than zero")
     cfg = dict(base_cfg or {})
     cfg.update({
         "mode": "live",
@@ -49,6 +61,8 @@ def build_live_real_config(args, base_cfg=None):
         "max_real_risk_pct": LIVE_REAL_SMALL_CAP_DEFAULTS["max_real_risk_pct"],
         "max_daily_real_loss_pct_of_equity": LIVE_REAL_SMALL_CAP_DEFAULTS["max_daily_real_loss_pct_of_equity"],
         "max_weekly_real_loss_pct_of_equity": LIVE_REAL_SMALL_CAP_DEFAULTS["max_weekly_real_loss_pct_of_equity"],
+        "live_real_absolute_max_notional_usdt": max_notional,
+        "live_real_absolute_max_loss_usdt": max_loss,
         "max_open_positions": 1,
         "max_same_direction_positions": 1,
     })

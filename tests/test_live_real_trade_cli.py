@@ -81,3 +81,45 @@ def test_cli_main_runs_once_when_safety_tokens_are_present(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert result["status"] == "NO_TRADE"
     assert '"status": "NO_TRADE"' in out
+
+
+def test_cli_absolute_caps_reduce_effective_limits():
+    args = live_real_trade.parse_args([
+        "--symbol",
+        "BTC/USDT:USDT",
+        "--once",
+        "--confirm",
+        live_real_trade.LIVE_REAL_CONFIRM_TEXT,
+        "--max-notional",
+        "4",
+        "--max-loss",
+        "0.2",
+    ])
+
+    cfg = live_real_trade.build_live_real_config(args)
+
+    assert cfg["live_real_absolute_max_notional_usdt"] == pytest.approx(4.0)
+    assert cfg["live_real_absolute_max_loss_usdt"] == pytest.approx(0.2)
+    assert cfg["max_real_position_notional_usdt"] == pytest.approx(4.0)
+    assert cfg["max_real_loss_per_trade_usdt"] == pytest.approx(0.2)
+    assert cfg["live_real_effective_limits"]["absolute_notional_cap_applied"] is True
+    assert cfg["live_real_effective_limits"]["absolute_loss_cap_applied"] is True
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    (("--max-notional", "0"), ("--max-notional", "-1"), ("--max-loss", "0"), ("--max-loss", "-1")),
+)
+def test_cli_rejects_nonpositive_absolute_caps(flag, value):
+    argv = [
+        "--symbol",
+        "BTC/USDT:USDT",
+        "--once",
+        "--confirm",
+        live_real_trade.LIVE_REAL_CONFIRM_TEXT,
+        flag,
+        value,
+    ]
+    args = live_real_trade.parse_args(argv)
+    with pytest.raises(ValueError):
+        live_real_trade.build_live_real_config(args)

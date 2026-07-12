@@ -132,3 +132,39 @@ def test_rspt_status_keeps_waiting_reasons_white():
     assert "신호가 오래되어 새 신호 대기" in text
     assert "⚪ SETUP/USDT:USDT — SHORT 신호 대기" in text
     assert "RSPT 진입 패턴 대기" in text
+
+
+def test_rspt_status_requests_real_shared_ut_directions():
+    engine = _engine([])
+    captured = {}
+
+    async def evaluate_candidates(**kwargs):
+        captured.update(kwargs)
+        return [], {}, {}, [], {}
+
+    engine._evaluate_relative_strength_pullback_candidates = evaluate_candidates
+    asyncio.run(engine.build_relative_strength_pullback_status_text())
+
+    assert captured["resolve_ut_directions"] is True
+    assert captured["direction_consumer"] == "RSPT_STATUS"
+    assert captured["record_state"] is False
+
+
+def test_rspt_status_explains_4h_1d_direction_conflict():
+    decision = _decision(
+        "CONFLICT/USDT:USDT",
+        None,
+        False,
+        "no_ut_direction",
+        size_multiplier=1.0,
+        ut_direction_reason="UT 방향 불일치: 4h LONG / 1d SHORT",
+        ut_direction_4h_side="long",
+        ut_direction_1d_side="short",
+    )
+
+    text = asyncio.run(
+        _engine([decision]).build_relative_strength_pullback_status_text()
+    )
+
+    assert "UT 방향 불일치: 4h LONG / 1d SHORT" in text
+    assert "4h LONG / 1d SHORT" in text

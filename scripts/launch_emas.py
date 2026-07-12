@@ -65,9 +65,11 @@ except ProcessLockError as exc:
 
 try:
     os.environ['TRADINGBOT_PROCESS_LOCK_HELD'] = '1'
+    os.environ['TRADINGBOT_OFFICIAL_LAUNCHER'] = '1'
     global_single_position_guard.install()
     utbreakout_live_hardening_patch.install()
     runpy.run_path(str(ROOT / 'emas.py'), run_name='__main__')
 finally:
+    os.environ.pop('TRADINGBOT_OFFICIAL_LAUNCHER', None)
     os.environ.pop('TRADINGBOT_PROCESS_LOCK_HELD', None)
     process_lock.release()

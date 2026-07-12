@@ -1868,10 +1868,11 @@ def test_dual_alpha_direction_filter_normalizes_runtime_status_to_4h_1d():
     emas = _emas_module()
     engine = object.__new__(emas.SignalEngine)
     events = []
+    fetched = []
 
     class _MarketData:
         def fetch_ohlcv(self, symbol, timeframe, limit=300):
-            assert timeframe == "4h"
+            fetched.append(timeframe)
             return [
                 [idx, 100.0, 101.0, 99.0, 100.5, 1000.0]
                 for idx in range(60)
@@ -1879,22 +1880,14 @@ def test_dual_alpha_direction_filter_normalizes_runtime_status_to_4h_1d():
 
     engine.market_data_exchange = _MarketData()
     engine._clear_utbot_filtered_breakout_entry_plan = lambda symbol: None
-    engine._utbreakout_diag_for_symbol = lambda symbol: {}
     engine._utbreakout_trace_event = (
         lambda symbol, stage, status, **kwargs: events.append((stage, status, kwargs))
     )
 
-    async def calculate(symbol, df, params, *, force_reprocess=False):
-        cfg = engine._get_utbot_filtered_breakout_config(params)
-        assert cfg["entry_timeframe"] == "4h"
-        assert cfg["htf_timeframe"] == "1d"
-        return "long", "direction ready", {
-            "accepted_side": "long",
-            "entry_timeframe": "15m",
-            "htf_timeframe": "1h",
-        }
+    def calculate(df, params):
+        return None, "UT bias long", {"bias_side": "long"}
 
-    engine._calculate_utbot_filtered_breakout_signal = calculate
+    engine._calculate_utbot_signal = calculate
     side, _, status = asyncio.run(
         engine._dual_alpha_ut_direction_filter(
             "BTC/USDT:USDT",
@@ -1905,11 +1898,49 @@ def test_dual_alpha_direction_filter_normalizes_runtime_status_to_4h_1d():
         )
     )
 
+    assert sorted(fetched) == ["1d", "4h"]
     assert side == "long"
     assert status["entry_timeframe"] == "4h"
     assert status["htf_timeframe"] == "1d"
+    assert status["ut_4h_side"] == "long"
+    assert status["ut_1d_side"] == "long"
+    assert status["direction_reason_code"] == "UT_DIRECTION_READY"
     assert events[-1][2]["entry_timeframe"] == "4h"
     assert events[-1][2]["htf_timeframe"] == "1d"
+
+
+def test_shared_ut_direction_blocks_4h_1d_conflict_without_full_entry_pipeline():
+    emas = _emas_module()
+    engine = object.__new__(emas.SignalEngine)
+    calls = []
+
+    def calculate(df, params):
+        calls.append(len(df))
+        side = "long" if len(calls) == 1 else "short"
+        return None, f"UT bias {side}", {"bias_side": side}
+
+    async def forbidden_full_pipeline(*args, **kwargs):
+        raise AssertionError("shared UT direction must not execute the full UTBreakout entry pipeline")
+
+    engine._calculate_utbot_signal = calculate
+    engine._calculate_utbot_filtered_breakout_signal = forbidden_full_pipeline
+    rows = [
+        [idx, 100.0, 101.0, 99.0, 100.5, 1000.0]
+        for idx in range(60)
+    ]
+
+    side, reason, status = engine._calculate_shared_ut_direction_from_frames(
+        rows,
+        rows,
+        {"UTBotFilteredBreakoutV1": {}},
+        consumer="TEST",
+    )
+
+    assert side is None
+    assert "4h LONG / 1d SHORT" in reason
+    assert status["direction_reason_code"] == "UT_DIRECTION_CONFLICT"
+    assert status["ut_4h_side"] == "long"
+    assert status["ut_1d_side"] == "short"
 
 
 

@@ -120,19 +120,28 @@ class BinanceAlgoOrderGateway:
         order_type_value = str(order_type or "").upper()
         if order_type_value not in CONDITIONAL_TYPES:
             raise ValueError(f"unsupported Binance conditional order type: {order_type}")
+        if close_position and order_type_value not in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}:
+            raise ValueError("closePosition=true is only valid for STOP_MARKET or TAKE_PROFIT_MARKET")
+        if close_position and price is not None:
+            raise ValueError("closePosition=true market triggers must not include price")
+        if not close_position and quantity is None:
+            raise ValueError("quantity is required when closePosition is false")
+
         params: dict[str, Any] = {
             "algoType": "CONDITIONAL",
             "symbol": self._market_id(symbol),
             "side": str(side).upper(),
             "type": order_type_value,
-            "quantity": quantity,
             "triggerPrice": trigger_price,
             "clientAlgoId": str(client_algo_id)[:36],
             "workingType": str(working_type).upper(),
             "priceProtect": _bool_text(price_protect),
-            "reduceOnly": _bool_text(reduce_only),
-            "closePosition": _bool_text(close_position),
         }
+        if close_position:
+            params["closePosition"] = "true"
+        else:
+            params["quantity"] = quantity
+            params["reduceOnly"] = _bool_text(reduce_only)
         if position_side:
             params["positionSide"] = str(position_side).upper()
         if price is not None:

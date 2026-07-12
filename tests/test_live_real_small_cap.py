@@ -391,3 +391,79 @@ def test_run_live_real_once_builds_capped_plan_and_executes(monkeypatch):
     assert result["status"] == "LIVE_ORDER_PLAN_EXECUTED"
     assert captured["plan"].qty * 100.0 <= 5.58558
     assert captured["plan"].qty * abs(100.0 - captured["plan"].initial_sl_price) <= 0.31031
+
+
+def test_live_real_absolute_caps_only_tighten_percentage_limits():
+    limits = emas.resolve_live_small_cap_limits(
+        {
+            "account_reference_equity_usdt": 62.0,
+            "live_real_risk_pct_user": 0.005,
+            "max_real_position_notional_pct_of_equity": 0.09,
+            "live_real_absolute_max_notional_usdt": 4.0,
+            "live_real_absolute_max_loss_usdt": 0.2,
+        }
+    )
+    assert limits["percentage_max_position_notional_usdt"] == pytest.approx(5.58)
+    assert limits["percentage_max_loss_per_trade_usdt"] == pytest.approx(0.31)
+    assert limits["max_position_notional_usdt"] == pytest.approx(4.0)
+    assert limits["max_loss_per_trade_usdt"] == pytest.approx(0.2)
+
+
+def test_live_real_period_keys_use_same_kst_boundary_as_risk_changes():
+    from datetime import datetime, timezone
+
+    before_kst_midnight = datetime(2026, 1, 1, 14, 59, tzinfo=timezone.utc)
+    after_kst_midnight = datetime(2026, 1, 1, 15, 1, tzinfo=timezone.utc)
+
+    assert emas._live_real_period_keys(before_kst_midnight)[0] == "2026-01-01"
+    assert emas._live_real_period_keys(after_kst_midnight)[0] == "2026-01-02"
+    assert emas._live_real_kst_date_key(now=after_kst_midnight) == "2026-01-02"
+
+
+def test_live_real_risk_state_missing_file_is_clean_first_run(tmp_path, monkeypatch):
+    state_path = tmp_path / "risk.json"
+    monkeypatch.setattr(emas, "LIVE_REAL_RISK_STATE_FILE", str(state_path))
+
+    state = emas.load_live_real_risk_state()
+
+    assert state["daily_realized_pnl_usdt"] == 0.0
+    assert state["weekly_realized_pnl_usdt"] == 0.0
+    assert state["loss_period_timezone"] == "Asia/Seoul"
+
+
+def test_live_real_risk_state_corruption_fails_closed(tmp_path, monkeypatch):
+    state_path = tmp_path / "risk.json"
+    state_path.write_text("{broken", encoding="utf-8")
+    monkeypatch.setattr(emas, "LIVE_REAL_RISK_STATE_FILE", str(state_path))
+
+    with pytest.raises(emas.LiveRealRiskStateUnreadable, match="LIVE_REAL_RISK_STATE_UNREADABLE"):
+        emas.load_live_real_risk_state()
+
+    diagnostic = emas.load_live_real_risk_state(fail_closed=False)
+    assert diagnostic["trading_blocked"] is True
+    assert diagnostic["reason_code"] == "LIVE_REAL_RISK_STATE_UNREADABLE"
+
+
+def test_live_real_risk_state_non_object_and_bad_number_fail_closed(tmp_path, monkeypatch):
+    state_path = tmp_path / "risk.json"
+    monkeypatch.setattr(emas, "LIVE_REAL_RISK_STATE_FILE", str(state_path))
+
+    state_path.write_text("[]", encoding="utf-8")
+    with pytest.raises(emas.LiveRealRiskStateUnreadable):
+        emas.load_live_real_risk_state()
+
+    state_path.write_text('{"daily_realized_pnl_usdt": "nan"}', encoding="utf-8")
+    with pytest.raises(emas.LiveRealRiskStateUnreadable):
+        emas.load_live_real_risk_state()
+
+
+def test_corrupt_risk_state_is_not_overwritten_by_realized_pnl(tmp_path, monkeypatch):
+    state_path = tmp_path / "risk.json"
+    original = "{broken"
+    state_path.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(emas, "LIVE_REAL_RISK_STATE_FILE", str(state_path))
+
+    with pytest.raises(emas.LiveRealRiskStateUnreadable):
+        emas.record_bot_realized_pnl(-1.0)
+
+    assert state_path.read_text(encoding="utf-8") == original
