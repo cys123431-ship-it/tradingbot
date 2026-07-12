@@ -15173,9 +15173,10 @@ class SignalEngine(BaseEngine):
         )
         signal_tf = str(rsp_cfg.get('signal_tf', '4h') or '4h')
         htf_tf = str(rsp_cfg.get('trend_htf', '1d') or '1d')
-        execution = str(rsp_cfg.get('entry_execution', 'next_open') or 'next_open')
+        execution = str(rsp_cfg.get('entry_execution', 'market') or 'next_open')
         execution_label = {
             'next_open': '다음 봉 시가',
+                  'market': '완성봉 확인 직후 시장가',
             'market': '시장가',
             'close': '현재 봉 종가',
         }.get(execution, execution)

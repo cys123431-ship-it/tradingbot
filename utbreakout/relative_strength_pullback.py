@@ -19,7 +19,7 @@ class PullbackTrendDecision:
     symbol: str
     side: str | None = None
     entry_ready: bool = False
-    entry_execution: str = "next_open"
+    entry_execution: str = "market"
     reason: str = "not_evaluated"
     logs: dict = field(default_factory=dict)
     state_update: dict | None = None
@@ -37,7 +37,7 @@ def default_relative_strength_pullback_config():
         "relative_strength_pullback_trend_paper_enabled": False,
         "trend_htf": "1d",
         "signal_tf": "4h",
-        "entry_execution": "next_open",
+        "entry_execution": "market",
         "forced_direction": None,
         "direction_source": "UTBreakout",
         # Kept for backward-compatible config loading only. Direction is always supplied by UT.
@@ -522,7 +522,7 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
         "scanner_passed": True,
         "symbol": symbol,
         "entry_strategy": ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
-        "entry_execution": cfg.get("entry_execution", "next_open"),
+        "entry_execution": cfg.get("entry_execution", "market"),
         "direction_by": direction_source,
         "rspt_direction_source": direction_source,
         "rspt_forced_direction": forced_direction,
@@ -685,7 +685,7 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
                 symbol,
                 side=side,
                 entry_ready=True,
-                entry_execution=cfg.get("entry_execution", "next_open"),
+                entry_execution=cfg.get("entry_execution", "market"),
                 reason="breakout_continuation_confirmed",
                 logs={
                     **side_logs,
@@ -704,7 +704,7 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
                 symbol,
                 side=side,
                 entry_ready=True,
-                entry_execution=cfg.get("entry_execution", "next_open"),
+                entry_execution=cfg.get("entry_execution", "market"),
                 reason="trend_pullback_confirmed",
                 logs={
                     **side_logs,

@@ -213,7 +213,7 @@ def test_trend_pullback_enters_without_prior_breakout_state():
 
     assert decision.entry_ready is True
     assert decision.side == "long"
-    assert decision.entry_execution == "next_open"
+    assert decision.entry_execution == "market"
     assert decision.reason == "trend_pullback_confirmed"
     assert decision.logs["setup_type"] == "trend_pullback"
 
