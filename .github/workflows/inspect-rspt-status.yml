@@ -1,4 +1,4 @@
-name: Apply RSPT traffic-light status
+name: Validate RSPT traffic-light status
 
 on:
   pull_request:
@@ -6,14 +6,10 @@ on:
       - main
 
 permissions:
-  contents: write
-
-concurrency:
-  group: apply-rspt-traffic-light-status
-  cancel-in-progress: false
+  contents: read
 
 jobs:
-  apply:
+  validate:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -22,409 +18,39 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          path: repo
 
-      - name: Update RSPT status formatter and tests
+      - name: Checkout patch assets
+        uses: actions/checkout@v4
+        with:
+          ref: rspt-status-inspect
+          path: patch-assets
+
+      - name: Reconstruct and apply patch
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path('emas.py')
-          text = path.read_text(encoding='utf-8')
-          start_marker = '    async def build_relative_strength_pullback_status_text(self, symbol=None):\n'
-          end_marker = '    def _dual_alpha_strategy_params(self, strategy_params, branch):\n'
-          start = text.index(start_marker)
-          end = text.index(end_marker, start)
-
-          replacement = '''    async def build_relative_strength_pullback_status_text(self, symbol=None):
-              strategy_params = self.get_runtime_strategy_params()
-              cfg = self._get_utbot_filtered_breakout_config(strategy_params)
-              rsp_cfg = self._relative_strength_pullback_runtime_config(cfg)
-              active_strategy = str(strategy_params.get('active_strategy', '') or '').lower()
-              live_enabled = bool(
-                  rsp_cfg.get('relative_strength_pullback_trend_live_enabled', False)
-              )
-              signal_tf = str(rsp_cfg.get('signal_tf', '4h') or '4h')
-              htf_tf = str(rsp_cfg.get('trend_htf', '1d') or '1d')
-              execution = str(rsp_cfg.get('entry_execution', 'next_open') or 'next_open')
-              execution_label = {
-                  'next_open': '다음 봉 시가',
-                  'market': '시장가',
-                  'close': '현재 봉 종가',
-              }.get(execution, execution)
-
-              reason_labels = {
-                  'no_ut_direction': 'UT 방향 대기',
-                  'no_entry_setup': 'RSPT 진입 패턴 대기',
-                  'stale_signal': '신호가 오래되어 새 신호 대기',
-                  'insufficient_data': '분석 데이터 부족',
-                  'indicator_not_ready': '지표 계산 대기',
-                  'adx_too_low': 'ADX 추세 강도 기준 미달',
-                  'relative_strength_hard_block': '상대강도 기준 미달',
-                  'trend_filter_failed': '추세 조건 불일치',
-                  'breakout_continuation_confirmed': '돌파 지속 확인',
-                  'trend_pullback_confirmed': '추세 눌림 확인',
-                  'market_quality_rejected': '시장 품질 기준 미달',
-                  'risk_limit_blocked': '리스크 한도 차단',
-                  'no_scanner_candidates': '스캐너 후보 없음',
-              }
-              setup_labels = {
-                  'breakout_continuation': '돌파 지속',
-                  'trend_pullback': '추세 눌림',
-                  'relative_strength_pullback_trend': '상대강도 눌림 추세',
-              }
-              reduction_labels = {
-                  'adx_weak_size_reduced': 'ADX 약세',
-                  'relative_strength_size_reduced': '상대강도 약세',
-                  'market_quality_size_reduced': '시장 품질 감액',
-              }
-              explicit_wait_reasons = {
-                  'no_ut_direction',
-                  'no_entry_setup',
-                  'stale_signal',
-                  'insufficient_data',
-                  'indicator_not_ready',
-                  'no_scanner_candidates',
-              }
-              explicit_block_reasons = {
-                  'adx_too_low',
-                  'relative_strength_hard_block',
-                  'trend_filter_failed',
-                  'market_quality_rejected',
-                  'risk_limit_blocked',
-              }
-
-              def _safe_multiplier(value):
-                  try:
-                      parsed = float(value)
-                  except (TypeError, ValueError):
-                      return 1.0
-                  if not np.isfinite(parsed):
-                      return 1.0
-                  return max(0.0, min(1.0, parsed))
-
-              def _reason_text(reason):
-                  key = str(reason or 'not_evaluated').strip()
-                  return reason_labels.get(key, key.replace('_', ' '))
-
-              def _setup_text(value):
-                  key = str(value or '').strip()
-                  return setup_labels.get(key, key.replace('_', ' ') if key else '대기')
-
-              def _reduction_text(logs, size_mult):
-                  raw = logs.get('size_reduction_reasons')
-                  if isinstance(raw, str):
-                      reasons = [raw]
-                  elif isinstance(raw, (list, tuple, set)):
-                      reasons = list(raw)
-                  else:
-                      reasons = []
-                  labels = []
-                  for item in reasons:
-                      key = str(item or '').strip()
-                      label = reduction_labels.get(key, key.replace('_', ' '))
-                      if label and label not in labels:
-                          labels.append(label)
-                  if not labels and size_mult < 0.999:
-                      adx_mult = _safe_multiplier(logs.get('adx_size_multiplier', 1.0))
-                      rs_mult = _safe_multiplier(logs.get('relative_strength_size_multiplier', 1.0))
-                      if adx_mult < 0.999:
-                          labels.append('ADX 약세')
-                      if rs_mult < 0.999:
-                          labels.append('상대강도 약세')
-                  return ', '.join(labels) if labels else '품질 필터에 따른 자동 감액'
-
-              def _classify(decision):
-                  logs = dict(decision.logs or {})
-                  reason = str(decision.reason or 'not_evaluated').strip()
-                  side = str(decision.side or '').upper()
-                  setup = _setup_text(logs.get('setup_type'))
-                  size_mult = _safe_multiplier(
-                      logs.get('size_multiplier', logs.get('risk_multiplier', 1.0))
-                  )
-                  if bool(decision.entry_ready):
-                      light = 'yellow' if size_mult < 0.999 else 'green'
-                  elif reason in explicit_block_reasons or any(
-                      token in reason
-                      for token in ('hard_block', 'blocked', 'rejected', 'too_low', 'failed', 'risk_limit')
-                  ):
-                      light = 'red'
-                  else:
-                      light = 'white'
-                  if reason in explicit_wait_reasons:
-                      light = 'white'
-                  return {
-                      'decision': decision,
-                      'logs': logs,
-                      'reason': reason,
-                      'reason_text': _reason_text(reason),
-                      'side': side,
-                      'setup': setup,
-                      'size_mult': size_mult,
-                      'percent': int(round(size_mult * 100)),
-                      'light': light,
-                  }
-
-              active_label = '🟢 활성화' if live_enabled else '⚪ 비활성화'
-              lines = [
-                  '📊 RSPT 전략 상태',
-                  f"전략: Relative Strength Pullback Trend ({active_strategy or 'n/a'})",
-                  f'상태: {active_label}',
-                  f'시간 프레임: 신호 {signal_tf} / 상위 추세 {htf_tf}',
-                  '방향 기준: UT 4시간봉 + 1일 추세만 사용',
-                  f'진입 실행: {execution_label} ({execution})',
-              ]
-
-              try:
-                  decisions, _, _, candidates, _ = await self._evaluate_relative_strength_pullback_candidates(
-                      focus_symbol=symbol,
-                      cfg=cfg,
-                      record_state=False,
-                  )
-                  classified = [_classify(decision) for decision in decisions]
-                  counts = {
-                      light: sum(1 for item in classified if item['light'] == light)
-                      for light in ('green', 'yellow', 'red', 'white')
-                  }
-                  lines.extend([
-                      f'분석 종목: {len(decisions)}/{len(candidates)}',
-                      (
-                          '상태 요약: '
-                          f"🟢 진입 가능 {counts['green']} | "
-                          f"🟡 수량 감소 {counts['yellow']} | "
-                          f"🔴 진입 차단 {counts['red']} | "
-                          f"⚪ 신호 대기 {counts['white']}"
-                      ),
-                      '',
-                      '종목별 상태',
-                  ])
-
-                  if symbol:
-                      focus_key = self._utbreakout_trace_key(symbol)
-                      classified.sort(
-                          key=lambda item: 0
-                          if self._utbreakout_trace_key(item['decision'].symbol) == focus_key
-                          else 1
-                      )
-
-                  for item in classified[:8]:
-                      decision = item['decision']
-                      symbol_text = str(decision.symbol)
-                      side_text = item['side'] or '방향 미정'
-                      code = item['reason']
-                      if item['light'] == 'green':
-                          lines.extend([
-                              f"🟢 {symbol_text} — {side_text} 진입 가능",
-                              (
-                                  f"   진입 형태: {item['setup']} | "
-                                  f"수량/증거금 {item['percent']}% (x{item['size_mult']:.2f}) | "
-                                  f"실행: {execution_label}"
-                              ),
-                              f"   근거: {item['reason_text']} | 코드: {code}",
-                          ])
-                      elif item['light'] == 'yellow':
-                          reduction = _reduction_text(item['logs'], item['size_mult'])
-                          lines.extend([
-                              f"🟡 {symbol_text} — {side_text} 조건부 진입",
-                              (
-                                  f"   수량/증거금 {item['percent']}% (x{item['size_mult']:.2f}) | "
-                                  f"감소 이유: {reduction}"
-                              ),
-                              (
-                                  f"   진입 형태: {item['setup']} | 실행: {execution_label} | "
-                                  f"코드: {code}"
-                              ),
-                          ])
-                      elif item['light'] == 'red':
-                          lines.extend([
-                              f"🔴 {symbol_text} — {side_text} 진입 차단",
-                              f"   이유: {item['reason_text']} | 주문 없음 | 코드: {code}",
-                          ])
-                      elif code == 'no_ut_direction':
-                          lines.extend([
-                              f"⚪ {symbol_text} — UT 방향 대기",
-                              '   주문 없음 | UT 방향 확인 후 RSPT 조건 검사 | 코드: no_ut_direction',
-                          ])
-                      else:
-                          lines.extend([
-                              f"⚪ {symbol_text} — {side_text} 신호 대기",
-                              f"   이유: {item['reason_text']} | 주문 없음 | 코드: {code}",
-                          ])
-
-                  if not classified:
-                      lines.append('⚪ 분석 가능한 스캐너 후보 없음')
-              except Exception as exc:
-                  lines.extend([
-                      '',
-                      f'🔴 상태 조회 오류: {type(exc).__name__}: {exc}',
-                  ])
-
-              lines.extend([
-                  '',
-                  '안내: 스캐너·리스크·TP/SL·주문 안전 경로는 기존 로직을 그대로 사용합니다.',
-              ])
-              return "\n".join(lines)
-
-'''
-
-          path.write_text(text[:start] + replacement + text[end:], encoding='utf-8')
-
-          test_path = Path('tests/test_rspt_status_traffic_lights.py')
-          test_path.write_text('''import asyncio
-          from types import SimpleNamespace
-
-          import emas
-
-
-          def _decision(symbol, side, ready, reason, **logs):
-              return SimpleNamespace(
-                  symbol=symbol,
-                  side=side,
-                  entry_ready=ready,
-                  reason=reason,
-                  logs=logs,
-              )
-
-
-          def test_rspt_status_uses_traffic_lights_and_korean_explanations():
-              engine = object.__new__(emas.SignalEngine)
-              params = {
-                  "active_strategy": emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
-              }
-              engine.get_runtime_strategy_params = lambda: params
-              engine._get_utbot_filtered_breakout_config = lambda strategy_params: {}
-              engine._relative_strength_pullback_runtime_config = lambda cfg: {
-                  "relative_strength_pullback_trend_live_enabled": True,
-                  "signal_tf": "4h",
-                  "trend_htf": "1d",
-                  "entry_execution": "next_open",
-              }
-              decisions = [
-                  _decision(
-                      "GREEN/USDT:USDT",
-                      "long",
-                      True,
-                      "breakout_continuation_confirmed",
-                      setup_type="breakout_continuation",
-                      size_multiplier=1.0,
-                  ),
-                  _decision(
-                      "YELLOW/USDT:USDT",
-                      "short",
-                      True,
-                      "trend_pullback_confirmed",
-                      setup_type="trend_pullback",
-                      size_multiplier=0.60,
-                      size_reduction_reasons=["adx_weak_size_reduced"],
-                  ),
-                  _decision(
-                      "RED/USDT:USDT",
-                      "long",
-                      False,
-                      "relative_strength_hard_block",
-                      size_multiplier=1.0,
-                  ),
-                  _decision(
-                      "WHITE/USDT:USDT",
-                      None,
-                      False,
-                      "no_ut_direction",
-                      size_multiplier=1.0,
-                  ),
-              ]
-
-              async def evaluate_candidates(**kwargs):
-                  return decisions, {}, {}, [item.symbol for item in decisions], {}
-
-              engine._evaluate_relative_strength_pullback_candidates = evaluate_candidates
-
-              text = asyncio.run(engine.build_relative_strength_pullback_status_text())
-
-              assert "📊 RSPT 전략 상태" in text
-              assert "상태 요약: 🟢 진입 가능 1 | 🟡 수량 감소 1 | 🔴 진입 차단 1 | ⚪ 신호 대기 1" in text
-              assert "🟢 GREEN/USDT:USDT — LONG 진입 가능" in text
-              assert "🟡 YELLOW/USDT:USDT — SHORT 조건부 진입" in text
-              assert "수량/증거금 60% (x0.60)" in text
-              assert "감소 이유: ADX 약세" in text
-              assert "🔴 RED/USDT:USDT — LONG 진입 차단" in text
-              assert "이유: 상대강도 기준 미달" in text
-              assert "⚪ WHITE/USDT:USDT — UT 방향 대기" in text
-              assert "UT 방향 확인 후 RSPT 조건 검사" in text
-              assert "RelativeStrengthPullbackTrend status" not in text
-              assert "Scanner candidates evaluated" not in text
-
-
-          def test_rspt_status_keeps_waiting_reasons_white():
-              engine = object.__new__(emas.SignalEngine)
-              engine.get_runtime_strategy_params = lambda: {
-                  "active_strategy": emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
-              }
-              engine._get_utbot_filtered_breakout_config = lambda strategy_params: {}
-              engine._relative_strength_pullback_runtime_config = lambda cfg: {
-                  "relative_strength_pullback_trend_live_enabled": True,
-                  "signal_tf": "4h",
-                  "trend_htf": "1d",
-                  "entry_execution": "next_open",
-              }
-              decisions = [
-                  _decision(
-                      "STALE/USDT:USDT",
-                      "long",
-                      False,
-                      "stale_signal",
-                      size_multiplier=1.0,
-                  ),
-                  _decision(
-                      "SETUP/USDT:USDT",
-                      "short",
-                      False,
-                      "no_entry_setup",
-                      size_multiplier=1.0,
-                  ),
-              ]
-
-              async def evaluate_candidates(**kwargs):
-                  return decisions, {}, {}, [item.symbol for item in decisions], {}
-
-              engine._evaluate_relative_strength_pullback_candidates = evaluate_candidates
-              text = asyncio.run(engine.build_relative_strength_pullback_status_text())
-
-              assert "🟢 진입 가능 0" in text
-              assert "🟡 수량 감소 0" in text
-              assert "🔴 진입 차단 0" in text
-              assert "⚪ 신호 대기 2" in text
-              assert "⚪ STALE/USDT:USDT — LONG 신호 대기" in text
-              assert "신호가 오래되어 새 신호 대기" in text
-              assert "⚪ SETUP/USDT:USDT — SHORT 신호 대기" in text
-              assert "RSPT 진입 패턴 대기" in text
-          ''', encoding='utf-8')
-          PY
+          base64 -d patch-assets/.github/patches/apply_rspt_traffic_status.py.gz.b64 \
+            | gzip -dc > /tmp/apply_rspt_traffic_status.py
+          echo "c3cfb3a67b8b7f06bc4d9ef7c3a0796d86813daa63fc97f0940e22101835216d  /tmp/apply_rspt_traffic_status.py" \
+            | sha256sum -c -
+          python /tmp/apply_rspt_traffic_status.py
 
       - name: Install test dependencies
         shell: bash
+        working-directory: repo
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
           python -m pip install pytest
 
-      - name: Compile and run tests
+      - name: Compile and test
         shell: bash
+        working-directory: repo
         run: |
           set -euo pipefail
           python -m compileall -q emas.py tests/test_rspt_status_traffic_lights.py
           python -m pytest -q tests/test_rspt_status_traffic_lights.py
           python -m pytest -q
           git diff --check
-
-      - name: Commit directly to main
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add emas.py tests/test_rspt_status_traffic_lights.py
-          git diff --cached --check
-          git commit -m "feat: add traffic-light RSPT status"
-          git push origin HEAD:main
