@@ -1,1 +1,1 @@
-Trigger push-based final validation for live-risk and RSPT hardening.
+Trigger simplified final validation workflow.
