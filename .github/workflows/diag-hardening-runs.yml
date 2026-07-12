@@ -1,4 +1,4 @@
-name: Diagnose hardening runs
+name: Diagnose hardening deployment
 
 on:
   pull_request:
@@ -12,20 +12,45 @@ permissions:
 jobs:
   diagnose:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: Query hardening branch runs
+      - name: Wait for merged revision deployment
         env:
           GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ec0e9910bb0b7aa18e91f6fa651d6b07da2e2705
         run: |
           set -euo pipefail
-          echo "Refreshed after simplified validation trigger" > hardening-runs.txt
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs?branch=hardening-live-risk-rspt&per_page=30" \
-            --jq '.workflow_runs[] | [.id,.name,.event,.status,.conclusion,.head_sha,.run_number,.html_url] | @tsv' \
-            >> hardening-runs.txt
-          cat hardening-runs.txt
+          run_json=''
+          deploy_id=''
+          deploy_status=''
+          for attempt in $(seq 1 120); do
+            run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${TARGET_SHA}&per_page=20")"
+            deploy_id="$(jq -r '[.workflow_runs[] | select(.name == "Deploy Trading Bot")][0].id // empty' <<<"$run_json")"
+            deploy_status="$(jq -r '[.workflow_runs[] | select(.name == "Deploy Trading Bot")][0].status // empty' <<<"$run_json")"
+            if [ -n "$deploy_id" ] && [ "$deploy_status" = "completed" ]; then
+              break
+            fi
+            sleep 10
+          done
+          {
+            echo "TARGET_SHA=${TARGET_SHA}"
+            echo "DEPLOY_ID=${deploy_id}"
+            echo "DEPLOY_STATUS=${deploy_status}"
+            echo "RUNS"
+            jq -r '.workflow_runs[] | [.id,.name,.event,.status,.conclusion,.head_sha,.run_number,.html_url] | @tsv' <<<"$run_json"
+            if [ -n "$deploy_id" ]; then
+              echo "JOBS"
+              gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${deploy_id}/jobs" \
+                --jq '.jobs[] | [.id,.name,.status,.conclusion] | @tsv'
+            fi
+          } > hardening-deploy.txt
+          cat hardening-deploy.txt
+          conclusion="$(jq -r '[.workflow_runs[] | select(.name == "Deploy Trading Bot")][0].conclusion // empty' <<<"$run_json")"
+          test "$conclusion" = "success"
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: hardening-runs
-          path: hardening-runs.txt
+          name: hardening-deploy
+          path: hardening-deploy.txt
           retention-days: 1
