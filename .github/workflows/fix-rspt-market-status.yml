@@ -1,11 +1,9 @@
 name: Fix RSPT market status label
 
 on:
-  push:
+  pull_request:
     branches:
-      - fix-rspt-market-status-label
-    paths:
-      - .github/workflows/fix-rspt-market-status.yml
+      - main
 
 permissions:
   contents: write
