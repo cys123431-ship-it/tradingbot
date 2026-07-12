@@ -32,14 +32,21 @@ jobs:
               Path('utbreakout/timeframe.py'),
           ]
           selected_names = {
+              '_calculate_utbot_signal',
+              '_evaluate_relative_strength_pullback_candidates',
+              '_normalize_relative_strength_pullback_direction',
+              '_extract_relative_strength_pullback_ut_direction',
               '_resolve_relative_strength_pullback_ut_direction',
               '_calculate_relative_strength_pullback_signal',
-              '_evaluate_relative_strength_pullback_candidates',
-              '_calculate_dual_alpha_signal',
-              '_calculate_dual_alpha_candidate',
               '_dual_alpha_strategy_params',
-              '_resolve_utbreakout_direction',
-              '_calculate_utbreakout_signal',
+              '_dual_alpha_direction_strategy_params',
+              '_shared_ut_direction_filter',
+              '_dual_alpha_ut_direction_filter',
+              '_calculate_dual_alpha_signal',
+              '_handle_utbot_primary_strategy',
+              '_infer_live_utbot_direction_from_rows',
+              'default_relative_strength_pullback_config',
+              '_evaluate_symbol',
               'evaluate_relative_strength_pullback_trend',
               'resolve_entry_strategy',
               'evaluate_final_trade_decision',
@@ -69,6 +76,33 @@ jobs:
                       out.append(f'\n### {path}:{start}-{end} {name}\n')
                       for number in range(start, end + 1):
                           out.append(f'{number:06d}: {lines[number - 1]}')
+
+          context_terms = [
+              '_calculate_utbot_filtered_breakout_signal(',
+              '_shared_ut_direction_filter(',
+              'forced_direction=',
+              'resolve_ut_direction=',
+              "consumer='RSPT_STANDALONE'",
+              "consumer='DUAL_ALPHA'",
+              "'no_ut_direction'",
+              "'accepted_side'",
+          ]
+          out.append('\n===== CALL-SITE CONTEXTS =====')
+          path = Path('emas.py')
+          lines = path.read_text(encoding='utf-8').splitlines()
+          emitted = set()
+          for idx, line in enumerate(lines):
+              if not any(term in line for term in context_terms):
+                  continue
+              lo = max(0, idx - 10)
+              hi = min(len(lines), idx + 16)
+              key = (lo, hi)
+              if key in emitted:
+                  continue
+              emitted.add(key)
+              out.append(f'\n--- emas.py:{lo + 1}-{hi} ---')
+              for number in range(lo, hi):
+                  out.append(f'{number + 1:06d}: {lines[number]}')
 
           grep_terms = [
               'forced_direction',
