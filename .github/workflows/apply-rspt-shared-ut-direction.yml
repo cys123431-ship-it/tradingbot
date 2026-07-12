@@ -70,3 +70,5 @@ jobs:
           git diff --cached --check
           git commit -m "fix: unify standalone RSPT with shared UT direction"
           git push origin HEAD:main
+
+# Trigger after workflow registration on the default branch.
