@@ -15,28 +15,41 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: rspt-status-inspect
-      - name: Extract exact RSPT status formatter context
+      - name: Extract RSPT status tests
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
-          lines = Path('emas.py').read_text(encoding='utf-8').splitlines()
-          needle = 'RelativeStrengthPullbackTrend status'
-          matches = [i for i, line in enumerate(lines) if needle in line]
-          if not matches:
-              raise SystemExit('RSPT status title not found')
-          i = matches[0]
-          lo = max(0, i - 140)
-          hi = min(len(lines), i + 240)
-          out = [f'MATCH_LINE={i + 1}']
-          out.extend(f'{number + 1:06d}: {lines[number]}' for number in range(lo, hi))
-          Path('rspt-status-context.txt').write_text('\n'.join(out) + '\n', encoding='utf-8')
+          needles = (
+              'build_relative_strength_pullback_status_text',
+              'RelativeStrengthPullbackTrend status',
+              'Scanner candidates evaluated',
+          )
+          out = []
+          for path in sorted(Path('tests').rglob('test_*.py')):
+              lines = path.read_text(encoding='utf-8').splitlines()
+              matches = [i for i, line in enumerate(lines) if any(n in line for n in needles)]
+              if not matches:
+                  continue
+              out.append(f'===== {path} =====')
+              covered = set()
+              for i in matches:
+                  lo = max(0, i - 70)
+                  hi = min(len(lines), i + 110)
+                  for number in range(lo, hi):
+                      if number in covered:
+                          continue
+                      covered.add(number)
+                      out.append(f'{number + 1:06d}: {lines[number]}')
+          if not out:
+              out.append('NO MATCHING TESTS')
+          Path('rspt-status-tests.txt').write_text('\n'.join(out) + '\n', encoding='utf-8')
           PY
-      - name: Upload formatter context
+      - name: Upload test context
         uses: actions/upload-artifact@v4
         with:
-          name: rspt-status-context
-          path: rspt-status-context.txt
+          name: rspt-status-tests
+          path: rspt-status-tests.txt
           if-no-files-found: error
           retention-days: 1
