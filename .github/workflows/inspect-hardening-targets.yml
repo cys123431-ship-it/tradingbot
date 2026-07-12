@@ -57,22 +57,61 @@ jobs:
             tests/test_official_launcher_contract.py
 
       - name: Run targeted safety tests
+        id: targeted
+        continue-on-error: true
         shell: bash
         run: |
-          set -euo pipefail
+          set +e
           python -m pytest -q \
             tests/test_live_real_trade_cli.py \
             tests/test_live_real_small_cap.py \
             tests/test_binance_algo_gateway.py \
             tests/test_utbreakout_helpers.py \
             tests/test_rspt_status_traffic_lights.py \
-            tests/test_official_launcher_contract.py
+            tests/test_official_launcher_contract.py \
+            > targeted-tests.log 2>&1
+          status=$?
+          cat targeted-tests.log
+          exit "$status"
+
+      - name: Upload targeted test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hardening-targeted-tests
+          path: targeted-tests.log
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Fail after targeted test report
+        if: steps.targeted.outcome != 'success'
+        shell: bash
+        run: exit 1
 
       - name: Run full test suite
+        id: full
+        continue-on-error: true
         shell: bash
         run: |
-          set -euo pipefail
-          python -m pytest -q
+          set +e
+          python -m pytest -q > full-tests.log 2>&1
+          status=$?
+          cat full-tests.log
+          exit "$status"
+
+      - name: Upload full test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hardening-full-tests
+          path: full-tests.log
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Fail after full test report
+        if: steps.full.outcome != 'success'
+        shell: bash
+        run: exit 1
 
       - name: Commit verified production changes to work branch
         shell: bash
