@@ -1,0 +1,127 @@
+name: Inspect hardening targets
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Extract target sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p hardening-inspect
+          cp scripts/live_real_trade.py hardening-inspect/live_real_trade.py
+          cp trading_safety/binance_algo_gateway.py hardening-inspect/binance_algo_gateway.py
+          cp scripts/launch_emas.py hardening-inspect/launch_emas.py
+          cp README.md hardening-inspect/README.md
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          path = Path('emas.py')
+          text = path.read_text(encoding='utf-8')
+          lines = text.splitlines()
+          tree = ast.parse(text)
+          wanted = {
+              'load_live_real_risk_state',
+              'save_live_real_risk_state',
+              '_default_live_real_risk_state',
+              '_live_real_day_key',
+              '_live_real_week_key',
+              'build_relative_strength_pullback_status_text',
+              '_evaluate_relative_strength_pullback_candidates',
+              '_resolve_relative_strength_pullback_ut_direction',
+              '_shared_ut_direction_filter',
+              '_calculate_utbot_signal',
+              '_calculate_utbot_filtered_breakout_signal',
+              '_dual_alpha_direction_strategy_params',
+              '_calculate_relative_strength_pullback_signal',
+              '_calculate_dual_alpha_signal',
+              'enforce_activation_stage',
+              'normalize_live_real_config',
+              'build_live_real_risk_plan',
+          }
+          out = []
+          found = set()
+          for node in ast.walk(tree):
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted:
+                  found.add(node.name)
+                  start = node.lineno
+                  end = getattr(node, 'end_lineno', start)
+                  out.append(f'\n### emas.py:{start}-{end} {node.name}\n')
+                  out.extend(f'{n:06d}: {lines[n-1]}' for n in range(start, end + 1))
+          out.append('\n### missing names\n' + '\n'.join(sorted(wanted - found)))
+          Path('hardening-inspect/emas-targets.txt').write_text('\n'.join(out) + '\n', encoding='utf-8')
+
+          terms = [
+              'load_live_real_risk_state(',
+              'save_live_real_risk_state(',
+              'daily_loss',
+              'weekly_loss',
+              'day_key',
+              'week_key',
+              'max_real_position_notional',
+              'max_real_loss',
+              'max_notional',
+              'max_loss',
+              'close_position',
+              'closePosition',
+              'build_relative_strength_pullback_status_text(',
+              '_shared_ut_direction_filter(',
+          ]
+          refs = []
+          for py in Path('.').rglob('*.py'):
+              if '.git' in py.parts:
+                  continue
+              content = py.read_text(encoding='utf-8', errors='replace').splitlines()
+              for i, line in enumerate(content, 1):
+                  if any(term in line for term in terms):
+                      refs.append(f'{py}:{i}: {line}')
+          Path('hardening-inspect/references.txt').write_text('\n'.join(refs) + '\n', encoding='utf-8')
+
+          test_refs = []
+          test_terms = [
+              'live_real_risk_state',
+              'max-notional',
+              'max_loss',
+              'closePosition',
+              'close_position',
+              'RSPT 전략 상태',
+              'no_ut_direction',
+              'shared_ut_direction',
+          ]
+          for py in Path('tests').rglob('test_*.py'):
+              content = py.read_text(encoding='utf-8', errors='replace').splitlines()
+              matches = [i for i, line in enumerate(content) if any(term in line for term in test_terms)]
+              if not matches:
+                  continue
+              test_refs.append(f'===== {py} =====')
+              covered = set()
+              for idx in matches:
+                  lo = max(0, idx - 30)
+                  hi = min(len(content), idx + 50)
+                  for n in range(lo, hi):
+                      if n in covered:
+                          continue
+                      covered.add(n)
+                      test_refs.append(f'{n+1:06d}: {content[n]}')
+          Path('hardening-inspect/tests.txt').write_text('\n'.join(test_refs) + '\n', encoding='utf-8')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hardening-inspect
+          path: hardening-inspect
+          retention-days: 1
