@@ -1,0 +1,51 @@
+name: Inspect RSPT status formatter
+
+on:
+  push:
+    branches:
+      - rspt-status-inspect
+    paths:
+      - .github/workflows/inspect-rspt-status.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: rspt-status-inspect
+      - name: Print RSPT status formatter context
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('emas.py').read_text(encoding='utf-8')
+          needles = [
+              'RelativeStrengthPullbackTrend status',
+              'Scanner candidates evaluated',
+              'rsp_status',
+          ]
+          for needle in needles:
+              print(f'===== NEEDLE: {needle} =====')
+              start = 0
+              found = False
+              while True:
+                  idx = text.find(needle, start)
+                  if idx < 0:
+                      break
+                  found = True
+                  line = text.count('\n', 0, idx) + 1
+                  lines = text.splitlines()
+                  lo = max(1, line - 90)
+                  hi = min(len(lines), line + 180)
+                  print(f'----- lines {lo}-{hi}, match line {line} -----')
+                  for number in range(lo, hi + 1):
+                      print(f'{number:06d}: {lines[number - 1]}')
+                  start = idx + len(needle)
+              if not found:
+                  print('NOT FOUND')
+          PY
