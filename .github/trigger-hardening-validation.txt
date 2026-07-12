@@ -1,1 +1,1 @@
-Trigger final validation after preserving risk-state loader call compatibility.
+Trigger push-based final validation for live-risk and RSPT hardening.
