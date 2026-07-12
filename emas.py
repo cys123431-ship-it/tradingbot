@@ -17,6 +17,7 @@ import asyncio
 import time
 import sys
 import traceback
+import inspect
 import re
 import hashlib
 import copy
@@ -33,6 +34,12 @@ from pykalman import KalmanFilter as PyKalmanFilter
 from datetime import datetime, timezone, timedelta
 from collections import Counter, deque
 from zoneinfo import ZoneInfo
+from trading_safety.entry_block import (
+    CriticalPauseBlockDecision,
+    EntrySubmitOutcome,
+    canonical_futures_symbol,
+    build_critical_pause_notice_key,
+)
 from trading_safety.order_gateway import IdempotentOrderGateway
 from trading_safety.execution_service import CryptoExecutionService
 from trading_safety.trade_accounting import (
@@ -10035,47 +10042,7 @@ class SignalEngine(BaseEngine):
 
     def _canonical_futures_symbol(self, symbol, quote='USDT'):
         """Return one ccxt USD-M perpetual symbol for common symbol aliases."""
-        raw = str(symbol or '').strip()
-        if not raw:
-            return raw
-
-        default_quote = str(quote or 'USDT').upper().strip()
-        text = raw.upper().replace(' ', '')
-        supported_quotes = ('USDT', 'USDC', 'BUSD')
-
-        if '/' in text:
-            left, right = text.split('/', 1)
-            left = left.replace('-', '').replace('_', '')
-            if ':' in right:
-                quote_part, settle_part = right.split(':', 1)
-            else:
-                quote_part, settle_part = right, right
-            quote_part = quote_part.replace('-', '').replace('_', '')
-            settle_part = settle_part.replace('-', '').replace('_', '')
-            if (
-                quote_part in supported_quotes
-                and left.endswith(quote_part)
-                and len(left) > len(quote_part)
-            ):
-                left = left[:-len(quote_part)]
-            if left and quote_part:
-                return f"{left}/{quote_part}:{settle_part or quote_part}"
-
-        compact = text
-        for settle_quote in supported_quotes:
-            compact = compact.replace(f":{settle_quote}", '')
-        compact = (
-            compact
-            .replace('/', '')
-            .replace('-', '')
-            .replace('_', '')
-            .replace(':', '')
-        )
-        for compact_quote in supported_quotes:
-            if compact.endswith(compact_quote) and len(compact) > len(compact_quote):
-                base = compact[:-len(compact_quote)]
-                return f"{base}/{compact_quote}:{compact_quote}"
-        return f"{compact}/{default_quote}:{default_quote}"
+        return canonical_futures_symbol(symbol, quote)
 
     def _canonicalize_utbreakout_symbol_for_use(self, symbol, source='unknown'):
         canonical = self._canonical_futures_symbol(symbol)
@@ -30771,8 +30738,22 @@ class SignalEngine(BaseEngine):
                 )
                 return
 
+            pause_state = load_critical_pause_state()
+            pause_decision = evaluate_critical_pause_block(state=pause_state, requested_symbol=symbol)
+            if pause_decision.blocked:
+                await _handle_critical_pause_entry_block(
+                    self,
+                    symbol=symbol,
+                    raw_symbol=raw_symbol,
+                    side=side,
+                    decision=pause_decision,
+                    qty=None,
+                    phase="ENTRY_PREFLIGHT",
+                )
+                return
+
             try:
-                assert_trading_allowed(symbol, cfg)
+                assert_trading_allowed(symbol, cfg, include_critical_pause=False)
             except Exception as pause_err:
                 if trace_utbreakout:
                     self._utbreakout_trace_event(
@@ -31502,9 +31483,8 @@ class SignalEngine(BaseEngine):
                     )
                     return
 
-            # await asyncio.to_thread(self.exchange.set_leverage, lev, symbol) # Redundant, handled above
-            logger.warning(
-                "[ORDER_ATTEMPT] symbol=%s side=%s qty=%s price=%s notional=%.4f "
+            logger.info(
+                "[ORDER_PLAN_READY] symbol=%s side=%s qty=%s price=%s notional=%.4f "
                 "margin=%.4f free=%.4f strategy=%s",
                 symbol,
                 side,
@@ -31515,30 +31495,10 @@ class SignalEngine(BaseEngine):
                 free,
                 active_strategy,
             )
-            if active_strategy in UTBREAKOUT_STRATEGIES:
-                self._utbreakout_trace_event(
-                    symbol,
-                    'ORDER_ATTEMPT',
-                    'SENT',
-                    side=side,
-                    qty=qty,
-                    price=price,
-                    target_notional=target_notional,
-                    margin_to_use=margin_to_use,
-                    free_balance=free,
-                )
-                try:
-                    await self.ctrl.notify(
-                        "🟡 UTBreakout 주문 시도: "
-                        f"{symbol} {side.upper()} qty={qty} "
-                        f"notional={target_notional:.2f} margin={margin_to_use:.2f}"
-                    )
-                except Exception:
-                    logger.debug("order attempt notify skipped", exc_info=True)
 
             entry_client_order_id = None
             try:
-                submission, submission_error = await _submit_idempotent_crypto_entry(
+                outcome = await _submit_idempotent_crypto_entry(
                     self,
                     symbol,
                     side,
@@ -31546,13 +31506,50 @@ class SignalEngine(BaseEngine):
                     active_strategy or 'SIGNAL_ENGINE',
                     filtered_breakout_plan or cfg,
                 )
-                if submission_error:
-                    raise RuntimeError(
-                        f"idempotent order gate: "
-                        f"{getattr(submission, 'state', 'BLOCKED')} / {submission_error}"
+                if outcome.critical_pause_block is not None:
+                    await _handle_critical_pause_entry_block(
+                        self,
+                        symbol=symbol,
+                        raw_symbol=raw_symbol,
+                        side=side,
+                        decision=outcome.critical_pause_block,
+                        qty=qty,
+                        phase="ENTRY_LATE_GATE",
                     )
+                    return
+
+                if outcome.entry_block_reason is not None:
+                    await _handle_noncritical_entry_block(
+                        self,
+                        symbol=symbol,
+                        raw_symbol=raw_symbol,
+                        side=side,
+                        reason=outcome.entry_block_reason,
+                        qty=qty,
+                        phase="ENTRY_LATE_GATE",
+                    )
+                    return
+
+                if outcome.duplicate_protected:
+                    entry_client_order_id = outcome.client_order_id
+                    self.last_entry_reason[symbol] = "DUPLICATE:duplicate signal already protected"
+                    if raw_symbol != symbol:
+                        self.last_entry_reason[raw_symbol] = "DUPLICATE:duplicate signal already protected"
+                    return
+
+                if outcome.submission_error is not None:
+                    raw_sub = outcome.submission
+                    raw_state = getattr(raw_sub, "state", None)
+                    state_value = getattr(raw_state, "value", raw_state)
+                    state_name = str(state_value or "").strip().upper() or "UNKNOWN"
+                    raise RuntimeError(
+                        "entry submission not accepted: "
+                        f"{state_name} / {outcome.submission_error}"
+                    )
+
+                submission = outcome.submission
                 order = submission.order or {}
-                entry_client_order_id = submission.client_order_id
+                entry_client_order_id = outcome.client_order_id
             except Exception as order_exc:
                 if active_strategy in UTBREAKOUT_STRATEGIES:
                     self._utbreakout_trace_event(
@@ -33977,6 +33974,7 @@ class SignalEngine(BaseEngine):
         lockout_reason="STOP_LOSS_PROTECTION_FAILED_FORCE_CLOSED",
         protection_label="SL",
         critical_pause_reason_code="SL_FAILED_AND_EMERGENCY_CLOSE_FAILED",
+        persist_critical_pause=True,
     ):
         status = {
             'status': 'SKIPPED',
@@ -34088,23 +34086,32 @@ class SignalEngine(BaseEngine):
             'closed': False,
             'error': str(last_error) if last_error else 'position still open',
         })
-        try:
-            write_critical_pause_state(
-                symbol=symbol,
-                reason=critical_pause_reason_code,
-                exception=last_error if last_error else RuntimeError("position still open"),
-                cfg=self.get_runtime_common_settings() if hasattr(self, "get_runtime_common_settings") else None,
-            )
-        except Exception as persist_error:
-            logger.error(f"Failed to persist CRITICAL_PAUSED state for {symbol}: {persist_error}")
+        if persist_critical_pause:
+            try:
+                self.critical_pause_reason = (
+                    f"Emergency close failed after {protection_label} placement failure: {status['error']}"
+                )
+                self.critical_pause_status = dict(status)
+                if getattr(self, 'ctrl', None) is not None and hasattr(self.ctrl, 'is_paused'):
+                    self.ctrl.is_paused = True
+                self._set_crypto_entry_lock(
+                    f"CRITICAL_PAUSE:{critical_pause_reason_code}:{symbol}"
+                )
+            except Exception as pause_error:
+                logger.exception("Critical pause runtime state update failed for %s", symbol)
 
-        try:
-            self.critical_pause_reason = f"Emergency close failed after {protection_label} placement failure: {status['error']}"
-            self.critical_pause_status = dict(status)
-            if getattr(self, 'ctrl', None) is not None and hasattr(self.ctrl, 'is_paused'):
-                self.ctrl.is_paused = True
-        except Exception as pause_error:
-            logger.error(f"Critical pause state update failed for {symbol}: {pause_error}")
+            try:
+                write_critical_pause_state(
+                    symbol=symbol,
+                    reason=critical_pause_reason_code,
+                    exception=last_error if last_error else RuntimeError("position still open"),
+                    cfg=self.get_runtime_common_settings() if hasattr(self, "get_runtime_common_settings") else None,
+                    scope="GLOBAL",
+                    reason_code=critical_pause_reason_code,
+                    origin_symbol=symbol,
+                )
+            except Exception:
+                logger.exception("Failed to persist CRITICAL_PAUSED state for %s", symbol)
         audit_fetch_ok, audit_pos = await self._fetch_server_position_checked(symbol)
         if audit_fetch_ok and protection_label != 'LIQUIDATION_SAFETY':
             await self._audit_protection_orders(symbol, pos=audit_pos, alert=True)
@@ -48016,32 +48023,275 @@ LIVE_REAL_SMALL_CAP_DEFAULTS = {
     "max_position_notional_pct_hard_limit": 1.00,
 }
 
-def write_critical_pause_state(symbol, reason, exception, cfg=None):
-    state = {
-        "status": "CRITICAL_PAUSED",
-        "symbol": symbol,
-        "reason": reason,
-        "exception": repr(exception),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "manual_resume_required": True,
-    }
-    atomic_write_json(PAUSE_STATE_FILE, state, indent=4)
-    return state
+def evaluate_critical_pause_block(*, state: dict | None, requested_symbol: str) -> CriticalPauseBlockDecision:
+    if not state:
+        return CriticalPauseBlockDecision(blocked=False)
+
+    raw_status = str(state.get("status") or "").upper().strip()
+    if raw_status != "CRITICAL_PAUSED":
+        return CriticalPauseBlockDecision(blocked=False)
+
+    raw_scope = str(state.get("scope") or "GLOBAL").upper().strip()
+    if raw_scope not in {"GLOBAL", "SYMBOL"}:
+        raw_scope = "GLOBAL"
+
+    reason_code = state.get("reason_code") or state.get("reason") or "CRITICAL_PAUSE"
+    origin_symbol = state.get("origin_symbol") or state.get("symbol")
+
+    def _valid_canonical_symbol(value: str) -> bool:
+        return bool(
+            re.fullmatch(
+                r"[A-Z0-9]+/(USDT|USDC|BUSD):(USDT|USDC|BUSD)",
+                str(value or "").upper(),
+            )
+        )
+
+    if raw_scope == "GLOBAL":
+        origin_symbol = origin_symbol or "*"
+    else:
+        try:
+            canonical_origin = canonical_futures_symbol(origin_symbol) if origin_symbol else ""
+            canonical_requested = canonical_futures_symbol(requested_symbol)
+        except Exception:
+            canonical_origin = ""
+            canonical_requested = ""
+
+        if not _valid_canonical_symbol(canonical_origin) or not _valid_canonical_symbol(canonical_requested):
+            raw_scope = "GLOBAL"
+            origin_symbol = "*"
+        else:
+            origin_symbol = canonical_origin
+
+    created_at = state.get("created_at") or state.get("timestamp") or state.get("updated_at")
+    decision = CriticalPauseBlockDecision(
+        blocked=True,
+        reason_code=str(reason_code),
+        pause_id=state.get("pause_id"),
+        scope=raw_scope,
+        origin_symbol=str(origin_symbol or "*"),
+        created_at=created_at,
+    )
+
+    if raw_scope == "GLOBAL":
+        return decision
+
+    clean_requested = canonical_futures_symbol(requested_symbol)
+    return decision if clean_requested == origin_symbol else CriticalPauseBlockDecision(blocked=False)
+
+def write_critical_pause_state(symbol, reason, exception, cfg=None, *, scope="GLOBAL", reason_code=None, origin_symbol=None):
+    import uuid
+    resolved_reason_code = reason_code or reason
+    resolved_origin_symbol = origin_symbol or symbol or "*"
+    resolved_scope = str(scope or "GLOBAL").upper().strip()
+    if resolved_scope not in {"GLOBAL", "SYMBOL"}:
+        resolved_scope = "GLOBAL"
+
+    now_str = datetime.now(timezone.utc).isoformat()
+
+    if os.path.exists(PAUSE_STATE_FILE):
+        try:
+            with open(PAUSE_STATE_FILE, "r", encoding="utf-8") as f:
+                raw_content = f.read()
+            existing = json.loads(raw_content)
+        except Exception:
+            raise RuntimeError(
+                "CRITICAL_PAUSE_STATE_WRITE_BLOCKED_BY_UNREADABLE_EXISTING_FILE"
+            )
+
+        if not isinstance(existing, dict):
+            raise RuntimeError(
+                "CRITICAL_PAUSE_STATE_WRITE_BLOCKED_BY_UNREADABLE_EXISTING_FILE"
+            )
+
+        existing_status = existing.get("status")
+        legacy_active = (
+            existing_status is None
+            and bool(existing.get("symbol"))
+            and any(
+                key in existing
+                for key in ("reason", "reason_code", "manual_resume_required")
+            )
+        )
+        if str(existing_status).upper().strip() == "CRITICAL_PAUSED" or legacy_active:
+            existing_reason_code = existing.get("reason_code") or existing.get("reason")
+            existing_scope = str(existing.get("scope") or "GLOBAL").upper().strip()
+            if existing_scope not in {"GLOBAL", "SYMBOL"}:
+                existing_scope = "GLOBAL"
+            existing_origin_symbol = existing.get("origin_symbol") or existing.get("symbol") or "*"
+            existing_created_at = existing.get("created_at") or existing.get("timestamp") or existing.get("updated_at")
+
+            same_reason = (existing_reason_code == resolved_reason_code)
+            same_scope = (existing_scope == resolved_scope)
+            same_origin = (canonical_futures_symbol(existing_origin_symbol) == canonical_futures_symbol(resolved_origin_symbol))
+
+            if same_reason and same_scope and same_origin:
+                pause_id = existing.get("pause_id") or uuid.uuid4().hex
+                created_at = existing_created_at or now_str
+                try:
+                    count = int(existing.get("occurrence_count", 1)) + 1
+                except Exception:
+                    count = 2
+
+                state = {
+                    "status": "CRITICAL_PAUSED",
+                    "symbol": symbol,
+                    "reason": reason,
+                    "exception": repr(exception),
+                    "timestamp": now_str,
+                    "manual_resume_required": True,
+                    "pause_id": pause_id,
+                    "origin_symbol": resolved_origin_symbol,
+                    "scope": resolved_scope,
+                    "reason_code": resolved_reason_code,
+                    "created_at": created_at,
+                    "updated_at": now_str,
+                    "occurrence_count": count,
+                }
+                atomic_write_json(PAUSE_STATE_FILE, state, indent=4)
+                return state
+
+        pause_id = uuid.uuid4().hex
+        state = {
+            "status": "CRITICAL_PAUSED",
+            "symbol": symbol,
+            "reason": reason,
+            "exception": repr(exception),
+            "timestamp": now_str,
+            "manual_resume_required": True,
+            "pause_id": pause_id,
+            "origin_symbol": resolved_origin_symbol,
+            "scope": resolved_scope,
+            "reason_code": resolved_reason_code,
+            "created_at": now_str,
+            "updated_at": now_str,
+            "occurrence_count": 1,
+        }
+        atomic_write_json(PAUSE_STATE_FILE, state, indent=4)
+        return state
+    else:
+        pause_id = uuid.uuid4().hex
+        state = {
+            "status": "CRITICAL_PAUSED",
+            "symbol": symbol,
+            "reason": reason,
+            "exception": repr(exception),
+            "timestamp": now_str,
+            "manual_resume_required": True,
+            "pause_id": pause_id,
+            "origin_symbol": resolved_origin_symbol,
+            "scope": resolved_scope,
+            "reason_code": resolved_reason_code,
+            "created_at": now_str,
+            "updated_at": now_str,
+            "occurrence_count": 1,
+        }
+        atomic_write_json(PAUSE_STATE_FILE, state, indent=4)
+        return state
 
 def load_critical_pause_state():
     if not os.path.exists(PAUSE_STATE_FILE):
         return None
+
+    mtime_ns = 0
+    size = 0
+    try:
+        st = os.stat(PAUSE_STATE_FILE)
+        mtime_ns = st.st_mtime_ns
+        size = st.st_size
+    except Exception:
+        pass
+
+    normalized_path = os.path.abspath(PAUSE_STATE_FILE).replace("\\", "/")
+
+    def make_unreadable_state(err_type_str):
+        material = f"{normalized_path}|{mtime_ns}|{size}|{err_type_str}"
+        pause_id = "unreadable:" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+        try:
+            mtime_utc = datetime.fromtimestamp(mtime_ns / 1e9, tz=timezone.utc).isoformat()
+        except Exception:
+            mtime_utc = datetime.now(timezone.utc).isoformat()
+
+        return {
+            "status": "CRITICAL_PAUSED",
+            "scope": "GLOBAL",
+            "origin_symbol": "*",
+            "symbol": "*",
+            "reason_code": "CRITICAL_PAUSE_STATE_UNREADABLE",
+            "reason": "CRITICAL_PAUSE_STATE_UNREADABLE",
+            "manual_resume_required": True,
+            "pause_id": pause_id,
+            "created_at": mtime_utc,
+            "updated_at": mtime_utc,
+            "timestamp": mtime_utc,
+        }
+
     try:
         with open(PAUSE_STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+            content = f.read()
+    except Exception as e:
+        logger.exception("Failed to read critical pause state file")
+        return make_unreadable_state(e.__class__.__name__)
 
-def assert_trading_allowed(symbol, cfg=None):
-    state = load_critical_pause_state()
-    if state and state.get("status") == "CRITICAL_PAUSED":
-        if state.get("symbol") in {symbol, "*"}:
-            raise RuntimeError(f"TRADING_CRITICAL_PAUSED for {symbol}: {state.get('reason')}")
+    try:
+        payload = json.loads(content)
+    except Exception as e:
+        logger.exception("Failed to parse critical pause state file as JSON")
+        return make_unreadable_state(e.__class__.__name__)
+
+    if not isinstance(payload, dict):
+        logger.error("Loaded critical pause payload is not a dict")
+        return make_unreadable_state("MALFORMED_CRITICAL_PAUSE_STATE")
+
+    status = payload.get("status")
+    is_legacy = False
+    if status is None:
+        has_symbol = "symbol" in payload
+        has_reason_or_code = "reason" in payload or "reason_code" in payload or "manual_resume_required" in payload
+        if has_symbol and has_reason_or_code:
+            is_legacy = True
+
+    if is_legacy:
+        res = dict(payload)
+        res["status"] = "CRITICAL_PAUSED"
+        if "scope" not in res:
+            res["scope"] = "GLOBAL"
+        if "origin_symbol" not in res:
+            res["origin_symbol"] = res["symbol"]
+        if "reason_code" not in res:
+            res["reason_code"] = res.get("reason", "UNKNOWN")
+
+        reason = res.get("reason_code") or "UNKNOWN"
+        scope = str(res.get("scope") or "GLOBAL").upper().strip()
+        origin = res.get("origin_symbol") or res.get("symbol") or "*"
+        material = f"{normalized_path}|{mtime_ns}|{size}|{reason}|{scope}|{origin}"
+        if not res.get("pause_id"):
+            res["pause_id"] = "legacy:" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+        return res
+
+    if status is None:
+        logger.error("Loaded critical pause status is missing and not legacy")
+        return make_unreadable_state("MALFORMED_CRITICAL_PAUSE_STATE")
+
+    if str(status).upper().strip() != "CRITICAL_PAUSED":
+        logger.error("Loaded critical pause status is invalid: %s", status)
+        return make_unreadable_state("UNKNOWN_CRITICAL_PAUSE_STATUS")
+
+    res = dict(payload)
+    if not res.get("pause_id"):
+        reason = res.get("reason_code") or res.get("reason") or "UNKNOWN"
+        scope = str(res.get("scope") or "GLOBAL").upper().strip()
+        origin = res.get("origin_symbol") or res.get("symbol") or "*"
+        material = f"{normalized_path}|{mtime_ns}|{size}|{reason}|{scope}|{origin}"
+        res["pause_id"] = "legacy:" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+
+    return res
+
+def assert_trading_allowed(symbol, cfg=None, *, include_critical_pause=True):
+    if include_critical_pause:
+        state = load_critical_pause_state()
+        decision = evaluate_critical_pause_block(state=state, requested_symbol=symbol)
+        if decision.blocked:
+            raise RuntimeError(f"TRADING_CRITICAL_PAUSED: Trading safety conflict (critical pause): {decision.reason_code}")
     if cfg and bool(cfg.get("global_trading_paused", False)):
         raise RuntimeError("TRADING_GLOBAL_PAUSED")
     return True
@@ -50305,6 +50555,10 @@ async def _handle_liquidation_safety_failure(
             continue
         self.trading_state_store.transition(record.client_order_id, state, last_error=str(reason))
     self._set_crypto_entry_lock(f'{state.value}:{symbol}:{reason}')
+    self.critical_pause_reason = f'Liquidation safety conflict: {reason}'
+    if getattr(self, 'ctrl', None) is not None and hasattr(self.ctrl, 'is_paused'):
+        self.ctrl.is_paused = True
+    self._set_crypto_entry_lock(f'CRITICAL_PAUSE:LIQUIDATION_SAFETY_CONFLICT:{symbol}')
     liquidation_price = _safe_float_or_none(
         (pos or {}).get('liquidationPrice')
         or (pos or {}).get('liquidation_price')
@@ -50330,6 +50584,7 @@ async def _handle_liquidation_safety_failure(
         lockout_reason='LIQUIDATION_SAFETY_FORCE_CLOSED',
         protection_label='LIQUIDATION_SAFETY',
         critical_pause_reason_code='LIQUIDATION_SAFETY_EMERGENCY_CLOSE_FAILED',
+        persist_critical_pause=False,
     )
     if not close_status.get('closed'):
         for record in self.trading_state_store.active_for_symbol(symbol):
@@ -50338,17 +50593,19 @@ async def _handle_liquidation_safety_failure(
                 OrderState.EMERGENCY_CLOSE_FAILED,
                 last_error=str(close_status.get('error') or reason),
             )
-    write_critical_pause_state(
-        symbol,
-        'LIQUIDATION_SAFETY_CONFLICT',
-        reason,
-        cfg or {},
-    )
-    self.critical_pause_reason = f'Liquidation safety conflict: {reason}'
     self.critical_pause_status = dict(close_status)
-    if getattr(self, 'ctrl', None) is not None and hasattr(self.ctrl, 'is_paused'):
-        self.ctrl.is_paused = True
-    self._set_crypto_entry_lock(f'CRITICAL_PAUSE:LIQUIDATION_SAFETY_CONFLICT:{symbol}')
+    try:
+        write_critical_pause_state(
+            symbol,
+            'LIQUIDATION_SAFETY_CONFLICT',
+            reason,
+            cfg or {},
+            scope="GLOBAL",
+            reason_code="LIQUIDATION_SAFETY_CONFLICT",
+            origin_symbol=symbol,
+        )
+    except Exception:
+        logger.exception("Failed to persist liquidation safety critical pause")
     close_status['liquidation_safety_reason'] = reason
     return close_status
 
@@ -50465,15 +50722,22 @@ def _resolve_crypto_signal_timestamp(self, symbol, payload=None):
     return now - (now % timeframe_seconds)
 
 
-def _crypto_entry_block_reason(self, symbol=None):
+def _crypto_entry_block_reason(self, symbol=None, *, include_critical_pause=True):
     _ensure_trading_safety_runtime(self)
     uninitialized_test_engine = (
         self.__class__.__name__ == 'SignalEngine'
         and not hasattr(self, 'crypto_entry_lock_reason')
     )
-    critical_pause = None if uninitialized_test_engine else load_critical_pause_state()
-    if critical_pause and critical_pause.get('status') == 'CRITICAL_PAUSED':
-        return f"CRITICAL_PAUSE:{critical_pause.get('reason') or 'manual reconciliation required'}"
+    if include_critical_pause:
+        critical_pause = None if uninitialized_test_engine else load_critical_pause_state()
+        if symbol:
+            decision = evaluate_critical_pause_block(state=critical_pause, requested_symbol=symbol)
+            if decision.blocked:
+                return f"CRITICAL_PAUSE:{decision.reason_code}"
+        else:
+            if critical_pause and str(critical_pause.get('status')).upper().strip() == 'CRITICAL_PAUSED':
+                return f"CRITICAL_PAUSE:{critical_pause.get('reason') or 'manual reconciliation required'}"
+
     runtime_reason = getattr(self, "crypto_entry_lock_reason", None)
     if runtime_reason:
         return str(runtime_reason)
@@ -50547,10 +50811,209 @@ def _crypto_safety_status_lines(self):
         return ["Trading Safety: unknown", f"reason={type(exc).__name__}"]
 
 
+def _resolve_entry_block_context(owner):
+    engine = None
+    controller = None
+
+    if isinstance(owner, SignalEngine):
+        engine = owner
+        controller = getattr(owner, "ctrl", None)
+    else:
+        controller = owner
+        engine = getattr(owner, "active_engine", None)
+        if engine is None:
+            engines = getattr(owner, "engines", None)
+            if isinstance(engines, dict):
+                engine = engines.get(CORE_ENGINE) or engines.get("signal")
+                if engine is None:
+                    engine = next((item for item in engines.values() if isinstance(item, SignalEngine)), None)
+
+    runtime_owner = engine or owner
+    try:
+        if runtime_owner is not None:
+            _ensure_trading_safety_runtime(runtime_owner)
+    except Exception:
+        logger.exception("Failed to initialize trading safety runtime for entry block handling")
+
+    notifier = getattr(controller, "notify", None) if controller is not None else None
+    if notifier is None and engine is not None:
+        notifier = getattr(getattr(engine, "ctrl", None), "notify", None)
+
+    store = getattr(owner, "trading_state_store", None)
+    if store is None and controller is not None:
+        store = getattr(controller, "trading_state_store", None)
+    if store is None and engine is not None:
+        store = getattr(engine, "trading_state_store", None)
+
+    trace_callback = getattr(engine, "_utbreakout_trace_event", None) if engine is not None else None
+    return engine, controller, notifier, store, trace_callback
+
+
+def _record_entry_block_state(
+    owner,
+    *,
+    symbol,
+    raw_symbol,
+    side,
+    reason_text,
+    trace_code,
+    qty,
+    phase,
+    trace_extra=None,
+):
+    engine, controller, notifier, store, trace_callback = _resolve_entry_block_context(owner)
+    last_reasons = getattr(engine, "last_entry_reason", None) if engine is not None else None
+    if isinstance(last_reasons, dict):
+        last_reasons[symbol] = reason_text
+        if raw_symbol and raw_symbol != symbol:
+            last_reasons[raw_symbol] = reason_text
+    else:
+        logger.warning("Entry block reason store unavailable for symbol=%s", symbol)
+
+    if callable(trace_callback):
+        try:
+            data = {
+                "side": side,
+                "qty": qty,
+                "reason": reason_text,
+                "phase": phase,
+                "order_sent": False,
+            }
+            if trace_extra:
+                data.update(trace_extra)
+            trace_callback(symbol, "ENTRY_BLOCKED", trace_code, **data)
+        except Exception:
+            logger.exception("Failed to record ENTRY_BLOCKED trace for %s", symbol)
+    else:
+        logger.warning("ENTRY_BLOCKED trace callback unavailable for symbol=%s", symbol)
+    return engine, controller, notifier, store
+
+
+async def _handle_critical_pause_entry_block(
+    owner,
+    *,
+    symbol: str,
+    raw_symbol: str,
+    side: str,
+    decision: CriticalPauseBlockDecision,
+    qty: float | None = None,
+    phase: str = "ENTRY",
+) -> None:
+    reason_text = f"CRITICAL_PAUSE:{decision.reason_code}"
+    engine, controller, notifier, store = _record_entry_block_state(
+        owner,
+        symbol=symbol,
+        raw_symbol=raw_symbol,
+        side=side,
+        reason_text=reason_text,
+        trace_code="CRITICAL_PAUSE",
+        qty=qty,
+        phase=phase,
+        trace_extra={
+            "pause_id": decision.pause_id,
+            "scope": decision.scope,
+            "origin_symbol": decision.origin_symbol,
+        },
+    )
+
+    if store is None:
+        logger.warning("Critical pause notice store unavailable; notification skipped")
+        return
+
+    notice_key = build_critical_pause_notice_key(decision, requested_symbol=symbol)
+    claim_payload = {
+        "status": "SENDING",
+        "pause_id": decision.pause_id,
+        "reason_code": decision.reason_code,
+        "scope": decision.scope,
+        "origin_symbol": decision.origin_symbol,
+        "requested_symbol": symbol,
+        "side": side,
+        "qty": qty,
+        "phase": phase,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        claimed = store.create_runtime_state_if_absent(notice_key, claim_payload)
+    except Exception:
+        logger.exception("Failed to claim critical pause notification")
+        return
+    if not claimed:
+        return
+
+    if not callable(notifier):
+        logger.warning("Critical pause notifier unavailable; releasing notice claim")
+        try:
+            store.delete_runtime_state(notice_key)
+        except Exception:
+            logger.exception("Failed to release critical pause notice claim")
+        return
+
+    qty_text = "계산 전 차단" if qty is None else str(qty)
+    message = (
+        "⛔ UTBreakout 진입 차단 — 주문 미전송\n\n"
+        f"요청 심볼: {symbol}\n"
+        f"요청 방향: {side}\n"
+        f"주문 수량: {qty_text}\n"
+        f"차단 사유: {decision.reason_code}\n"
+        f"정지 범위: {decision.scope}\n"
+        f"정지 발생 심볼: {decision.origin_symbol}\n"
+        f"차단 단계: {phase}\n"
+        "실제 Binance 주문 전송: 없음"
+    )
+    try:
+        notify_result = notifier(message)
+        if inspect.isawaitable(notify_result):
+            await notify_result
+    except Exception:
+        logger.exception("Critical pause notification failed")
+        try:
+            store.delete_runtime_state(notice_key)
+        except Exception:
+            logger.exception("Failed to release exact critical pause notice claim")
+        return
+
+    sent_payload = dict(claim_payload)
+    sent_payload["status"] = "SENT"
+    sent_payload["sent_at"] = datetime.now(timezone.utc).isoformat()
+    try:
+        store.set_runtime_state(notice_key, sent_payload)
+    except Exception:
+        logger.exception("Failed to mark critical pause notice as SENT")
+
+
+async def _handle_noncritical_entry_block(
+    owner,
+    *,
+    symbol: str,
+    raw_symbol: str,
+    side: str,
+    reason: str,
+    qty: float | None = None,
+    phase: str = "ENTRY",
+) -> None:
+    _record_entry_block_state(
+        owner,
+        symbol=symbol,
+        raw_symbol=raw_symbol,
+        side=side,
+        reason_text=f"ENTRY_BLOCKED:{reason}",
+        trace_code="ENTRY_BLOCKED",
+        qty=qty,
+        phase=phase,
+    )
+    logger.info("Entry blocked before exchange submission: symbol=%s reason=%s phase=%s", symbol, reason, phase)
+
 async def _submit_idempotent_crypto_entry(self, symbol, side, qty, strategy, payload=None):
-    blocker = _crypto_entry_block_reason(self, symbol)
+    pause_state = load_critical_pause_state()
+    pause_decision = evaluate_critical_pause_block(state=pause_state, requested_symbol=symbol)
+    if pause_decision.blocked:
+        return EntrySubmitOutcome.critical_block(pause_decision)
+
+    blocker = _crypto_entry_block_reason(self, symbol, include_critical_pause=False)
     if blocker:
-        return None, blocker
+        return EntrySubmitOutcome.entry_block(str(blocker))
+
     _ensure_trading_safety_runtime(self)
     owner = getattr(self, 'ctrl', None) or self
     result = await owner.crypto_execution_service.submit_entry(
@@ -50560,11 +51023,37 @@ async def _submit_idempotent_crypto_entry(self, symbol, side, qty, strategy, pay
         signal_timestamp=_resolve_crypto_signal_timestamp(self, symbol, payload),
         qty=qty,
     )
-    if result.recovered and result.state == OrderState.PROTECTED.value:
-        return result, "duplicate signal already protected"
-    if not result.accepted:
-        return result, result.error or result.state
-    return result, None
+
+    if result is None:
+        raise RuntimeError("ENTRY_SUBMISSION_RESULT_MISSING")
+
+    raw_state = getattr(result, "state", None)
+    state_value = getattr(raw_state, "value", raw_state)
+    state_name = str(state_value or "").strip().upper()
+    accepted = bool(getattr(result, "accepted", False))
+    recovered = bool(getattr(result, "recovered", False))
+    client_order_id = getattr(result, "client_order_id", None)
+    result_error = getattr(result, "error", None) or getattr(result, "reason", None)
+
+    if state_name == "BLOCKED":
+        latest_pause = load_critical_pause_state()
+        latest_decision = evaluate_critical_pause_block(state=latest_pause, requested_symbol=symbol)
+        if latest_decision.blocked:
+            return EntrySubmitOutcome.critical_block(latest_decision, client_order_id=client_order_id)
+        else:
+            return EntrySubmitOutcome.entry_block(result_error or "ENTRY_BLOCKED", client_order_id=client_order_id)
+
+    if recovered and state_name == "PROTECTED":
+        return EntrySubmitOutcome.duplicate(result, client_order_id=client_order_id)
+
+    if accepted:
+        return EntrySubmitOutcome.success(result, client_order_id=client_order_id)
+    else:
+        return EntrySubmitOutcome.not_accepted(
+            result,
+            result_error or state_name or "ENTRY_SUBMISSION_NOT_ACCEPTED",
+            client_order_id=client_order_id
+        )
 
 
 def _mark_crypto_entry_state(self, client_order_id, state, **changes):
@@ -50614,7 +51103,26 @@ async def execute_live_order_plan(self, plan, cfg):
         assert_symbol_allowed_for_live_real(plan.symbol, cfg)
         assert_live_real_loss_limits_not_exceeded(cfg)
         configure_binance_futures_environment(self.exchange, cfg)
-    assert_trading_allowed(plan.symbol, cfg)
+    pause_state = load_critical_pause_state()
+    pause_decision = evaluate_critical_pause_block(state=pause_state, requested_symbol=plan.symbol)
+    if pause_decision.blocked:
+        await _handle_critical_pause_entry_block(
+            self,
+            symbol=plan.symbol,
+            raw_symbol=plan.symbol,
+            side=plan.side,
+            decision=pause_decision,
+            qty=getattr(plan, "qty", None),
+            phase="EXECUTE_PLAN_PREFLIGHT",
+        )
+        return {
+            "status": "ENTRY_BLOCKED",
+            "error": pause_decision.reason_code,
+            "client_order_id": None,
+            "order_sent": False,
+        }
+
+    assert_trading_allowed(plan.symbol, cfg, include_critical_pause=False)
     plan = self._normalize_live_order_plan_for_exchange(plan, cfg)
     cfg["last_price"] = plan.entry_price or cfg.get("last_price") or 0.0
     cfg["last_context_atr"] = abs(float(cfg["last_price"]) - plan.initial_sl_price) / 2.0
@@ -50663,7 +51171,7 @@ async def execute_live_order_plan(self, plan, cfg):
                 'error': liquidation_preflight.get('reason'),
             }
     strategy_name = str(getattr(plan, "engine", None) or cfg.get("active_strategy") or "UTBREAKOUT")
-    submission, submission_error = await _submit_idempotent_crypto_entry(
+    outcome = await _submit_idempotent_crypto_entry(
         self,
         plan.symbol,
         plan.side,
@@ -50671,19 +51179,74 @@ async def execute_live_order_plan(self, plan, cfg):
         strategy_name,
         {**dict(cfg or {}), **getattr(plan, "__dict__", {})},
     )
-    if submission_error:
-        status = getattr(submission, "state", "ENTRY_BLOCKED") if submission is not None else "ENTRY_BLOCKED"
-        logger.error("[LiveOrderPlan] idempotent entry blocked/failed: %s", submission_error)
-        await self.ctrl.notify(
-            f"UTBreakout entry not sent: {plan.symbol} {plan.side} / {status} / {submission_error}"
+    if outcome.critical_pause_block is not None:
+        await _handle_critical_pause_entry_block(
+            self,
+            symbol=plan.symbol,
+            raw_symbol=plan.symbol,
+            side=plan.side,
+            decision=outcome.critical_pause_block,
+            qty=plan.qty,
+            phase="EXECUTE_PLAN_LATE_GATE",
         )
         return {
-            "status": status,
-            "error": str(submission_error),
-            "client_order_id": getattr(submission, "client_order_id", None),
+            "status": "ENTRY_BLOCKED",
+            "error": outcome.critical_pause_block.reason_code,
+            "client_order_id": outcome.client_order_id,
+            "order_sent": False,
         }
-    entry_order = submission.order or {}
-    client_order_id = submission.client_order_id
+
+    if outcome.entry_block_reason is not None:
+        await _handle_noncritical_entry_block(
+            self,
+            symbol=plan.symbol,
+            raw_symbol=plan.symbol,
+            side=plan.side,
+            reason=outcome.entry_block_reason,
+            qty=plan.qty,
+            phase="EXECUTE_PLAN_LATE_GATE",
+        )
+        return {
+            "status": "ENTRY_BLOCKED",
+            "error": outcome.entry_block_reason,
+            "client_order_id": outcome.client_order_id,
+            "order_sent": False,
+        }
+
+    if outcome.duplicate_protected:
+        return {
+            "status": "DUPLICATE",
+            "error": "duplicate signal already protected",
+            "client_order_id": outcome.client_order_id,
+            "order_sent": False,
+            "submission": outcome.submission,
+        }
+
+    if outcome.submission_error is not None:
+        submission = outcome.submission
+        logger.error(
+            "[LiveOrderPlan] entry submission not accepted: %s",
+            outcome.submission_error,
+        )
+        await self.ctrl.notify(
+            "UTBreakout entry not sent: "
+            f"{plan.symbol} {plan.side} / "
+            "ENTRY_FAILED / "
+            f"{outcome.submission_error}"
+        )
+        return {
+            "status": "ENTRY_FAILED",
+            "error": outcome.submission_error,
+            "client_order_id": outcome.client_order_id,
+            "order_sent": False,
+            "submission": submission,
+        }
+
+    submission = outcome.submission
+    if submission is None:
+        raise RuntimeError("ENTRY_SUBMISSION_RESULT_MISSING")
+    entry_order = getattr(submission, "order", None) or {}
+    client_order_id = outcome.client_order_id
 
     self.position_cache = None
     self.position_cache_time = 0
@@ -51037,10 +51600,6 @@ async def _handle_sl_failure_with_persistent_pause(self, symbol, position, plan,
         reason=f"SL placement failure: {error}",
         max_attempts=5,
     )
-    if not close_status.get("closed"):
-        write_critical_pause_state(symbol, "SL_AND_EMERGENCY_CLOSE_FAILED", error, cfg)
-        if getattr(self, "ctrl", None) is not None:
-            self.ctrl.is_paused = True
     return {"status": "SL_PLACEMENT_FAILED", "close_status": close_status, "error": str(error)}
 
 

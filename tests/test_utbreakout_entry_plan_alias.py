@@ -246,6 +246,7 @@ def test_force_utbreakout_entry_revalidates_and_uses_normal_entry_path():
 )
 def test_utbreakout_entry_reaches_market_order_and_reports_exchange_failure(
     monkeypatch,
+    tmp_path,
     entry_side,
     order_side,
 ):
@@ -330,12 +331,13 @@ def test_utbreakout_entry_reaches_market_order_and_reports_exchange_failure(
             "risk_distance": 1.83,
         },
     )
-    monkeypatch.setattr(emas, "assert_trading_allowed", lambda symbol, cfg=None: True)
+    monkeypatch.setattr(emas, "PAUSE_STATE_FILE", str(tmp_path / "critical_pause_state.json"))
+    monkeypatch.setattr(emas, "assert_trading_allowed", lambda symbol, cfg=None, **kwargs: True)
 
     asyncio.run(engine.entry(raw_symbol, entry_side, 71.74))
 
     assert order_calls == [(order_symbol, "market", order_side, "0.295")]
-    assert any(text.startswith("🟡 UTBreakout 주문 시도:") for text in notifications)
+    assert not any(text.startswith("🟡 UTBreakout 주문 시도:") for text in notifications)
     assert any(text.startswith("❌ UTBreakout 주문 실패:") for text in notifications)
     assert engine.last_entry_reason[order_symbol].startswith("ORDER_FAILED: RuntimeError:")
     assert engine.last_entry_reason[raw_symbol] == engine.last_entry_reason[order_symbol]
@@ -343,7 +345,7 @@ def test_utbreakout_entry_reaches_market_order_and_reports_exchange_failure(
     assert diagnostics[-1][2]["code"] == "ENTRY_ORDER_FAILED"
 
 
-def test_utbreakout_entry_blocks_same_symbol_existing_position(monkeypatch):
+def test_utbreakout_entry_blocks_same_symbol_existing_position(monkeypatch, tmp_path):
     raw_symbol = "SOL/USDT:USDT"
     preflight_symbol = "SOL/USDT"
     order_symbol = "SOL/USDT:USDT"
@@ -384,7 +386,8 @@ def test_utbreakout_entry_blocks_same_symbol_existing_position(monkeypatch):
     }
     engine.is_trade_direction_allowed = lambda side: True
     engine.is_upbit_mode = lambda: False
-    monkeypatch.setattr(emas, "assert_trading_allowed", lambda symbol, cfg=None: True)
+    monkeypatch.setattr(emas, "PAUSE_STATE_FILE", str(tmp_path / "critical_pause_state.json"))
+    monkeypatch.setattr(emas, "assert_trading_allowed", lambda symbol, cfg=None, **kwargs: True)
 
     asyncio.run(engine.entry(raw_symbol, "long", 71.74))
 

@@ -649,6 +649,46 @@ class SQLiteTradingStateStore:
             logger.exception("Invalid runtime safety state for key=%s", key)
             return default
 
+    def create_runtime_state_if_absent(self, key: str, value: Any) -> bool:
+        now = utc_now_iso()
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                cursor = self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO runtime_safety_state(state_key, value_json, updated_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (key, _safe_json(value), now),
+                )
+                inserted = cursor.rowcount == 1
+                self._connection.execute("COMMIT")
+                return inserted
+            except Exception:
+                try:
+                    self._connection.execute("ROLLBACK")
+                except Exception:
+                    logger.exception("runtime state rollback failed")
+                raise
+
+    def delete_runtime_state(self, key: str) -> bool:
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                cursor = self._connection.execute(
+                    "DELETE FROM runtime_safety_state WHERE state_key = ?",
+                    (key,),
+                )
+                deleted = cursor.rowcount == 1
+                self._connection.execute("COMMIT")
+                return deleted
+            except Exception:
+                try:
+                    self._connection.execute("ROLLBACK")
+                except Exception:
+                    logger.exception("runtime state rollback failed")
+                raise
+
     def try_acquire_entry_lease(
         self,
         owner_id: str,
