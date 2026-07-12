@@ -6,6 +6,9 @@ on:
       - main
     paths:
       - .github/workflows/apply-chatgpt-critical-pause-fix.yml
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
   schedule:
     - cron: '*/5 * * * *'
