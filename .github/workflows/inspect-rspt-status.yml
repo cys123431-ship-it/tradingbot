@@ -34,6 +34,17 @@ jobs:
             | gzip -dc > /tmp/apply_rspt_traffic_status.py
           echo "c3cfb3a67b8b7f06bc4d9ef7c3a0796d86813daa63fc97f0940e22101835216d  /tmp/apply_rspt_traffic_status.py" \
             | sha256sum -c -
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('/tmp/apply_rspt_traffic_status.py')
+          text = path.read_text(encoding='utf-8')
+          old = 'return "\\n".join(lines)'
+          new = 'return "\\\\n".join(lines)'
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f'expected one newline-escape target, found {count}')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
           python /tmp/apply_rspt_traffic_status.py
 
       - name: Install test dependencies
