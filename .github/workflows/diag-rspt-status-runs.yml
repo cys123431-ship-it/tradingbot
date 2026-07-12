@@ -14,31 +14,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Query latest failure details
+      - name: Query branch workflow runs
         env:
           GH_TOKEN: ${{ github.token }}
-          RUN_ID: 29195570992
         run: |
           set -euo pipefail
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs?branch=fix-rspt-market-status-label&per_page=20" \
-            --jq '.workflow_runs[] | [.id,.name,.event,.status,.conclusion,.head_sha,.run_number,.html_url] | @tsv' \
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs?branch=fix-rspt-market-status-label&per_page=30" \
+            --jq '.workflow_runs[] | [.id,.name,.path,.event,.status,.conclusion,.head_sha,.run_number,.html_url] | @tsv' \
             > rspt-status-runs.txt
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs" \
-            --jq '.jobs[] | [.id,.name,.status,.conclusion] | @tsv' \
-            > rspt-status-jobs.txt
-          job_id="$(cut -f1 rspt-status-jobs.txt | head -n1)"
-          if [ -n "$job_id" ]; then
-            gh api -H 'Accept: application/vnd.github+json' "repos/${GITHUB_REPOSITORY}/actions/jobs/${job_id}/logs" > job-log.txt || true
-          fi
           cat rspt-status-runs.txt
-          cat rspt-status-jobs.txt
-          test -f job-log.txt && tail -n 120 job-log.txt || true
       - uses: actions/upload-artifact@v4
         with:
-          name: rspt-status-diagnostics
-          path: |
-            rspt-status-runs.txt
-            rspt-status-jobs.txt
-            job-log.txt
-          if-no-files-found: ignore
+          name: rspt-status-runs-refresh
+          path: rspt-status-runs.txt
           retention-days: 1
