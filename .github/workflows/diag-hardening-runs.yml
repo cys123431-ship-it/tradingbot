@@ -19,9 +19,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          echo "Refreshed after simplified validation trigger" > hardening-runs.txt
           gh api "repos/${GITHUB_REPOSITORY}/actions/runs?branch=hardening-live-risk-rspt&per_page=30" \
             --jq '.workflow_runs[] | [.id,.name,.event,.status,.conclusion,.head_sha,.run_number,.html_url] | @tsv' \
-            > hardening-runs.txt
+            >> hardening-runs.txt
           cat hardening-runs.txt
       - uses: actions/upload-artifact@v4
         with:
