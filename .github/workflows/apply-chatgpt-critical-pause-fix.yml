@@ -42,7 +42,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat stage-assets/.github/patches/critical-pause-fix-*.b64 \
+          cat stage-assets/.github/patches/exact-*.b64 \
             | base64 -d > /tmp/critical-pause-fix.patch.gz
           gzip -dc /tmp/critical-pause-fix.patch.gz \
             > /tmp/critical-pause-fix.patch
