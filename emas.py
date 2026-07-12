@@ -15079,42 +15079,232 @@ class SignalEngine(BaseEngine):
         )
 
     async def build_relative_strength_pullback_status_text(self, symbol=None):
-        cfg = self._get_utbot_filtered_breakout_config(self.get_runtime_strategy_params())
+        strategy_params = self.get_runtime_strategy_params()
+        cfg = self._get_utbot_filtered_breakout_config(strategy_params)
         rsp_cfg = self._relative_strength_pullback_runtime_config(cfg)
-        active_strategy = str(self.get_runtime_strategy_params().get('active_strategy', '') or '').lower()
+        active_strategy = str(strategy_params.get('active_strategy', '') or '').lower()
+        live_enabled = bool(
+            rsp_cfg.get('relative_strength_pullback_trend_live_enabled', False)
+        )
+        signal_tf = str(rsp_cfg.get('signal_tf', '4h') or '4h')
+        htf_tf = str(rsp_cfg.get('trend_htf', '1d') or '1d')
+        execution = str(rsp_cfg.get('entry_execution', 'next_open') or 'next_open')
+        execution_label = {
+            'next_open': '다음 봉 시가',
+            'market': '시장가',
+            'close': '현재 봉 종가',
+        }.get(execution, execution)
+
+        reason_labels = {
+            'no_ut_direction': 'UT 방향 대기',
+            'no_entry_setup': 'RSPT 진입 패턴 대기',
+            'stale_signal': '신호가 오래되어 새 신호 대기',
+            'insufficient_data': '분석 데이터 부족',
+            'indicator_not_ready': '지표 계산 대기',
+            'adx_too_low': 'ADX 추세 강도 기준 미달',
+            'relative_strength_hard_block': '상대강도 기준 미달',
+            'trend_filter_failed': '추세 조건 불일치',
+            'breakout_continuation_confirmed': '돌파 지속 확인',
+            'trend_pullback_confirmed': '추세 눌림 확인',
+            'market_quality_rejected': '시장 품질 기준 미달',
+            'risk_limit_blocked': '리스크 한도 차단',
+            'no_scanner_candidates': '스캐너 후보 없음',
+        }
+        setup_labels = {
+            'breakout_continuation': '돌파 지속',
+            'trend_pullback': '추세 눌림',
+            'relative_strength_pullback_trend': '상대강도 눌림 추세',
+        }
+        reduction_labels = {
+            'adx_weak_size_reduced': 'ADX 약세',
+            'relative_strength_size_reduced': '상대강도 약세',
+            'market_quality_size_reduced': '시장 품질 감액',
+        }
+        explicit_wait_reasons = {
+            'no_ut_direction',
+            'no_entry_setup',
+            'stale_signal',
+            'insufficient_data',
+            'indicator_not_ready',
+            'no_scanner_candidates',
+        }
+        explicit_block_reasons = {
+            'adx_too_low',
+            'relative_strength_hard_block',
+            'trend_filter_failed',
+            'market_quality_rejected',
+            'risk_limit_blocked',
+        }
+
+        def _safe_multiplier(value):
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return 1.0
+            if not np.isfinite(parsed):
+                return 1.0
+            return max(0.0, min(1.0, parsed))
+
+        def _reason_text(reason):
+            key = str(reason or 'not_evaluated').strip()
+            return reason_labels.get(key, key.replace('_', ' '))
+
+        def _setup_text(value):
+            key = str(value or '').strip()
+            return setup_labels.get(key, key.replace('_', ' ') if key else '대기')
+
+        def _reduction_text(logs, size_mult):
+            raw = logs.get('size_reduction_reasons')
+            if isinstance(raw, str):
+                reasons = [raw]
+            elif isinstance(raw, (list, tuple, set)):
+                reasons = list(raw)
+            else:
+                reasons = []
+            labels = []
+            for item in reasons:
+                key = str(item or '').strip()
+                label = reduction_labels.get(key, key.replace('_', ' '))
+                if label and label not in labels:
+                    labels.append(label)
+            if not labels and size_mult < 0.999:
+                adx_mult = _safe_multiplier(logs.get('adx_size_multiplier', 1.0))
+                rs_mult = _safe_multiplier(logs.get('relative_strength_size_multiplier', 1.0))
+                if adx_mult < 0.999:
+                    labels.append('ADX 약세')
+                if rs_mult < 0.999:
+                    labels.append('상대강도 약세')
+            return ', '.join(labels) if labels else '품질 필터에 따른 자동 감액'
+
+        def _classify(decision):
+            logs = dict(decision.logs or {})
+            reason = str(decision.reason or 'not_evaluated').strip()
+            side = str(decision.side or '').upper()
+            setup = _setup_text(logs.get('setup_type'))
+            size_mult = _safe_multiplier(
+                logs.get('size_multiplier', logs.get('risk_multiplier', 1.0))
+            )
+            if bool(decision.entry_ready):
+                light = 'yellow' if size_mult < 0.999 else 'green'
+            elif reason in explicit_block_reasons or any(
+                token in reason
+                for token in ('hard_block', 'blocked', 'rejected', 'too_low', 'failed', 'risk_limit')
+            ):
+                light = 'red'
+            else:
+                light = 'white'
+            if reason in explicit_wait_reasons:
+                light = 'white'
+            return {
+                'decision': decision,
+                'logs': logs,
+                'reason': reason,
+                'reason_text': _reason_text(reason),
+                'side': side,
+                'setup': setup,
+                'size_mult': size_mult,
+                'percent': int(round(size_mult * 100)),
+                'light': light,
+            }
+
+        active_label = '🟢 활성화' if live_enabled else '⚪ 비활성화'
         lines = [
-            "RelativeStrengthPullbackTrend status",
-            f"Active strategy: {active_strategy or 'n/a'}",
-            f"Live enabled: {bool(rsp_cfg.get('relative_strength_pullback_trend_live_enabled', False))}",
-            f"TF: signal {rsp_cfg.get('signal_tf', '4h')} / HTF {rsp_cfg.get('trend_htf', '1d')} / execution {rsp_cfg.get('entry_execution', 'next_open')}",
-            "Direction: shared UT 4h/1d only (RSPT internal LONG/SHORT selection disabled)",
+            '📊 RSPT 전략 상태',
+            f"전략: Relative Strength Pullback Trend ({active_strategy or 'n/a'})",
+            f'상태: {active_label}',
+            f'시간 프레임: 신호 {signal_tf} / 상위 추세 {htf_tf}',
+            '방향 기준: UT 4시간봉 + 1일 추세만 사용',
+            f'진입 실행: {execution_label} ({execution})',
         ]
+
         try:
             decisions, _, _, candidates, _ = await self._evaluate_relative_strength_pullback_candidates(
                 focus_symbol=symbol,
                 cfg=cfg,
                 record_state=False,
             )
-            lines.append(f"Scanner candidates evaluated: {len(decisions)}/{len(candidates)}")
-            focus_key = self._utbreakout_trace_key(symbol) if symbol else None
-            shown = 0
-            for decision in decisions:
-                if focus_key and self._utbreakout_trace_key(decision.symbol) != focus_key and shown >= 6:
-                    continue
-                side = (decision.side or '-').upper()
-                ready = "READY" if decision.entry_ready else "WAIT"
-                logs = dict(decision.logs or {})
-                setup = logs.get('setup_type') or '-'
-                size_mult = logs.get('size_multiplier', logs.get('risk_multiplier', 1.0))
-                lines.append(f"- {decision.symbol}: {ready} {side} / {decision.reason} / setup {setup} / size x{float(size_mult or 1.0):.2f}")
-                shown += 1
-                if shown >= 8:
-                    break
-            if not decisions:
-                lines.append("- no scanner candidates available")
+            classified = [_classify(decision) for decision in decisions]
+            counts = {
+                light: sum(1 for item in classified if item['light'] == light)
+                for light in ('green', 'yellow', 'red', 'white')
+            }
+            lines.extend([
+                f'분석 종목: {len(decisions)}/{len(candidates)}',
+                (
+                    '상태 요약: '
+                    f"🟢 진입 가능 {counts['green']} | "
+                    f"🟡 수량 감소 {counts['yellow']} | "
+                    f"🔴 진입 차단 {counts['red']} | "
+                    f"⚪ 신호 대기 {counts['white']}"
+                ),
+                '',
+                '종목별 상태',
+            ])
+
+            if symbol:
+                focus_key = self._utbreakout_trace_key(symbol)
+                classified.sort(
+                    key=lambda item: 0
+                    if self._utbreakout_trace_key(item['decision'].symbol) == focus_key
+                    else 1
+                )
+
+            for item in classified[:8]:
+                decision = item['decision']
+                symbol_text = str(decision.symbol)
+                side_text = item['side'] or '방향 미정'
+                code = item['reason']
+                if item['light'] == 'green':
+                    lines.extend([
+                        f"🟢 {symbol_text} — {side_text} 진입 가능",
+                        (
+                            f"   진입 형태: {item['setup']} | "
+                            f"수량/증거금 {item['percent']}% (x{item['size_mult']:.2f}) | "
+                            f"실행: {execution_label}"
+                        ),
+                        f"   근거: {item['reason_text']} | 코드: {code}",
+                    ])
+                elif item['light'] == 'yellow':
+                    reduction = _reduction_text(item['logs'], item['size_mult'])
+                    lines.extend([
+                        f"🟡 {symbol_text} — {side_text} 조건부 진입",
+                        (
+                            f"   수량/증거금 {item['percent']}% (x{item['size_mult']:.2f}) | "
+                            f"감소 이유: {reduction}"
+                        ),
+                        (
+                            f"   진입 형태: {item['setup']} | 실행: {execution_label} | "
+                            f"코드: {code}"
+                        ),
+                    ])
+                elif item['light'] == 'red':
+                    lines.extend([
+                        f"🔴 {symbol_text} — {side_text} 진입 차단",
+                        f"   이유: {item['reason_text']} | 주문 없음 | 코드: {code}",
+                    ])
+                elif code == 'no_ut_direction':
+                    lines.extend([
+                        f"⚪ {symbol_text} — UT 방향 대기",
+                        '   주문 없음 | UT 방향 확인 후 RSPT 조건 검사 | 코드: no_ut_direction',
+                    ])
+                else:
+                    lines.extend([
+                        f"⚪ {symbol_text} — {side_text} 신호 대기",
+                        f"   이유: {item['reason_text']} | 주문 없음 | 코드: {code}",
+                    ])
+
+            if not classified:
+                lines.append('⚪ 분석 가능한 스캐너 후보 없음')
         except Exception as exc:
-            lines.append(f"Status error: {type(exc).__name__}: {exc}")
-        lines.append("Note: scanner/selector/risk/TP/SL/order safety paths are still the existing bot paths.")
+            lines.extend([
+                '',
+                f'🔴 상태 조회 오류: {type(exc).__name__}: {exc}',
+            ])
+
+        lines.extend([
+            '',
+            '안내: 스캐너·리스크·TP/SL·주문 안전 경로는 기존 로직을 그대로 사용합니다.',
+        ])
         return "\n".join(lines)
 
     def _dual_alpha_strategy_params(self, strategy_params, branch):
