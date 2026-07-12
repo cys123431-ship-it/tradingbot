@@ -1,9 +1,9 @@
 name: Fix RSPT market status label
 
 on:
-  pull_request:
+  push:
     branches:
-      - main
+      - fix-rspt-market-status-label
 
 permissions:
   contents: write
