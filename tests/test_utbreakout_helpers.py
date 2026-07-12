@@ -1820,6 +1820,60 @@ def test_return_signal_engine_to_utbot_turns_off_utbreakout_customcoins_and_scan
     }
 
 
+def test_rspt_runtime_config_forces_completed_candle_market_entry():
+    emas = _emas_module()
+    engine = object.__new__(emas.SignalEngine)
+
+    cfg = engine._relative_strength_pullback_runtime_config({
+        "relative_strength_pullback_trend": {
+            "entry_execution": "next_open",
+            "exclude_incomplete_live_candle": False,
+            "signal_tf": "4h",
+        }
+    })
+
+    assert cfg["entry_execution"] == "market"
+    assert cfg["exclude_incomplete_live_candle"] is True
+    assert cfg["signal_basis"] == "last_completed_candle"
+
+
+def test_rspt_plan_rows_stop_at_the_confirmed_completed_candle():
+    emas = _emas_module()
+    engine = object.__new__(emas.SignalEngine)
+    tf_ms = 14_400_000
+    closed = [
+        {
+            "timestamp": idx * tf_ms,
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.5,
+            "volume": 1000.0,
+        }
+        for idx in range(40)
+    ]
+    incomplete = {
+        "timestamp": 40 * tf_ms,
+        "open": 100.5,
+        "high": 150.0,
+        "low": 80.0,
+        "close": 140.0,
+        "volume": 99999.0,
+    }
+    now_ms = incomplete["timestamp"] + 1
+
+    selected = engine._relative_strength_pullback_completed_rows(
+        closed + [incomplete],
+        {"signal_tf": "4h", "exclude_incomplete_live_candle": False},
+        {"signal_candle_ts": closed[-1]["timestamp"]},
+        now_ms=now_ms,
+    )
+
+    assert len(selected) == len(closed)
+    assert selected[-1]["timestamp"] == closed[-1]["timestamp"]
+    assert incomplete not in selected
+
+
 def test_dual_alpha_keeps_adaptive_entries_but_uses_fixed_4h_direction_filter():
     emas = _emas_module()
     engine = object.__new__(emas.SignalEngine)

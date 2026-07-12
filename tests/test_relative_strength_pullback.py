@@ -53,6 +53,8 @@ def test_defaults_keep_new_strategy_shadow_only():
     assert cfg["entry_strategy"] == ENTRY_STRATEGY_UT_BREAKOUT
     assert cfg["signal_tf"] == "4h"
     assert cfg["trend_htf"] == "1d"
+    assert cfg["entry_execution"] == "market"
+    assert cfg["exclude_incomplete_live_candle"] is True
     assert cfg["forced_direction"] is None
     assert cfg["direction_source"] == "UTBreakout"
     assert cfg["require_internal_trend_confirmation"] is False
@@ -214,6 +216,9 @@ def test_trend_pullback_enters_without_prior_breakout_state():
     assert decision.entry_ready is True
     assert decision.side == "long"
     assert decision.entry_execution == "market"
+    assert decision.logs["signal_candle_closed"] is True
+    assert decision.logs["signal_basis"] == "last_completed_candle"
+    assert decision.logs["entry_execution_policy"] == "market_immediately_after_completed_candle"
     assert decision.reason == "trend_pullback_confirmed"
     assert decision.logs["setup_type"] == "trend_pullback"
 
@@ -352,5 +357,29 @@ def test_unfinished_last_candle_is_excluded_from_signal_calculation():
         now_ms=incomplete_ts + 1,
     )
 
-    assert decisions[0].entry_ready is False
-    assert decisions[0].reason != "waiting_for_pullback"
+    decision = decisions[0]
+    assert decision.entry_ready is False
+    assert decision.reason != "waiting_for_pullback"
+    assert decision.logs["signal_candle_ts"] == closed[-1]["timestamp"] * 1000
+    assert decision.logs["signal_candle_closed"] is True
+    assert decision.logs["entry_execution"] == "market"
+
+
+def test_legacy_next_open_and_incomplete_candle_settings_are_ignored():
+    symbol = "LEGACY/USDT:USDT"
+    rows = _breakout_rows(100.0, 0.06, side="long")
+
+    decision = evaluate_relative_strength_pullback_trend(
+        [symbol],
+        {symbol: rows},
+        {symbol: _rows(220, 100.0, 0.10, timestamp_step=86_400_000)},
+        config=_base_config(
+            entry_execution="next_open",
+            exclude_incomplete_live_candle=False,
+        ),
+    )[0]
+
+    assert decision.entry_ready is True
+    assert decision.entry_execution == "market"
+    assert decision.logs["signal_candle_closed"] is True
+    assert decision.logs["signal_basis"] == "last_completed_candle"

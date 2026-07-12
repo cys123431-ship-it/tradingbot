@@ -26,7 +26,7 @@ def _engine(decisions):
         "relative_strength_pullback_trend_live_enabled": True,
         "signal_tf": "4h",
         "trend_htf": "1d",
-        "entry_execution": "next_open",
+        "entry_execution": "market",
     }
 
     async def evaluate_candidates(**kwargs):
@@ -86,6 +86,7 @@ def test_rspt_status_uses_traffic_lights_and_korean_explanations():
     )
 
     assert "📊 RSPT 전략 상태" in text
+    assert "진입 실행: 완성봉 확인 직후 시장가 (market)" in text
     assert (
         "상태 요약: 🟢 진입 가능 1 | 🟡 수량 감소 1 | "
         "🔴 진입 차단 1 | ⚪ 신호 대기 1"
