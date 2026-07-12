@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - .github/workflows/apply-chatgpt-critical-pause-fix.yml
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -48,7 +49,9 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "a93e09560bf6b014c38c10d15defccf573447fcb"
+          git merge-base --is-ancestor a93e09560bf6b014c38c10d15defccf573447fcb HEAD
+          git diff --quiet a93e09560bf6b014c38c10d15defccf573447fcb -- . \
+            ':(exclude).github/workflows/apply-chatgpt-critical-pause-fix.yml'
           git apply --check /tmp/critical-pause-fix.patch
           git apply /tmp/critical-pause-fix.patch
           cp ../stage-assets/.github/patches/test_critical_pause_real_order_error.py \
