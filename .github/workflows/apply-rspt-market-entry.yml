@@ -1,11 +1,9 @@
 name: Apply closed-candle immediate RSPT entry
 
 on:
-  push:
+  pull_request:
     branches:
-      - rspt-market-entry-20260712
-    paths:
-      - .github/workflows/apply-rspt-market-entry.yml
+      - main
 
 permissions:
   contents: write
@@ -57,7 +55,11 @@ jobs:
                   changed += count
           if changed < 1:
               raise SystemExit('no RSPT runtime entry_execution fallback found in emas.py')
-          text = text.replace("'next_open': '다음 봉 시가'", "'next_open': '다음 봉 시가',\n                  'market': '완성봉 확인 직후 시장가'")
+          if "'market': '완성봉 확인 직후 시장가'" not in text:
+              text = text.replace(
+                  "'next_open': '다음 봉 시가'",
+                  "'next_open': '다음 봉 시가',\n                  'market': '완성봉 확인 직후 시장가'",
+              )
           emas.write_text(text, encoding='utf-8')
 
           test_path = Path('tests/test_rspt_closed_candle_market_entry.py')
