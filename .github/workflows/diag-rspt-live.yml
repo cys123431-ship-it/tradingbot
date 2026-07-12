@@ -1,0 +1,43 @@
+name: Diagnose live RSPT status
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Build diagnosis report
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "HEAD=$(git rev-parse HEAD)"
+            echo "OLD_STRING_MATCHES"
+            grep -RFn --include='*.py' 'RelativeStrengthPullbackTrend status' . || true
+            echo "NEW_STRING_MATCHES"
+            grep -RFn --include='*.py' '📊 RSPT 전략 상태' . || true
+            echo "RSP_STATUS_CALLS"
+            grep -RFn --include='*.py' 'build_relative_strength_pullback_status_text' . || true
+            echo "WORKFLOW_RUNS_FOR_E837"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=e837c21c56eff42b0457f4c68fa0f6a361a9a7cd&per_page=20" \
+              --jq '.workflow_runs[] | [.id,.name,.event,.status,.conclusion,.head_sha,.run_number,.html_url] | @tsv' || true
+          } > rspt-live-diagnosis.txt
+          cat rspt-live-diagnosis.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rspt-live-diagnosis
+          path: rspt-live-diagnosis.txt
+          retention-days: 1
