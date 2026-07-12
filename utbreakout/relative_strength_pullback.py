@@ -40,6 +40,7 @@ def default_relative_strength_pullback_config():
         "entry_execution": "next_open",
         "forced_direction": None,
         "direction_source": "UTBreakout",
+        # Kept for backward-compatible config loading only. Direction is always supplied by UT.
         "require_internal_trend_confirmation": False,
         "donchian_length": 20,
         "ema_pullback": 20,
@@ -532,7 +533,10 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
     min_htf = max(htf_slow_len, htf_fast_len) + 1
     effective_cfg = cfg
     htf_fallback_used = False
-    internal_trend_required = bool(cfg.get("require_internal_trend_confirmation", False))
+    # RSPT no longer owns LONG/SHORT selection. Even if an older runtime config
+    # still contains this flag, it must not re-enable the legacy direction gate.
+    internal_trend_requested = bool(cfg.get("require_internal_trend_confirmation", False))
+    internal_trend_required = False
     if len(signal_rows) < min_signal:
         return PullbackTrendDecision(
             symbol,
@@ -556,18 +560,6 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
             effective_cfg["ema_htf"] = fallback_len
             htf_fallback_used = True
             min_htf = fallback_min_htf
-        elif internal_trend_required:
-            return PullbackTrendDecision(
-                symbol,
-                reason="insufficient_data",
-                logs={
-                    **base_logs,
-                    "rejected_reason": "insufficient_data",
-                    "htf_rows": len(htf_rows),
-                    "htf_rows_required": min_htf,
-                    "htf_fallback_rows_required": fallback_min_htf,
-                },
-            )
 
     trend = _trend_side(signal_rows, htf_rows, effective_cfg)
     donchian = _previous_donchian(signal_rows, effective_cfg.get("donchian_length", 20))
@@ -583,14 +575,15 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
 
     rs_pct = rs.get("percentile")
     rs_reason = rs.get("reason", "missing")
+    # These trend values remain diagnostic/setup inputs only. They are never
+    # allowed to choose or veto the trade direction; UT is authoritative.
     long_trend = bool(trend["long_htf"] and trend["long_signal"])
     short_trend = bool(trend["short_htf"] and trend["short_signal"])
-    candidate_sides = []
+    diagnostic_candidate_sides = []
     if long_trend:
-        candidate_sides.append("long")
+        diagnostic_candidate_sides.append("long")
     if short_trend:
-        candidate_sides.append("short")
-    original_candidate_sides = list(candidate_sides)
+        diagnostic_candidate_sides.append("short")
 
     logs = {
         **base_logs,
@@ -607,13 +600,16 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
         "relative_strength_reason": rs_reason,
         "relative_strength_candidate_count": rs.get("candidate_count"),
         "relative_strength_ranked_count": rs.get("ranked_count"),
-        "rspt_original_candidate_sides": original_candidate_sides,
+        "rspt_original_candidate_sides": diagnostic_candidate_sides,
         "rspt_ignored_opposite_side": False,
+        "rspt_internal_direction_disabled": True,
+        "rspt_direction_authority": "UTBreakout",
         "htf_fallback_used": htf_fallback_used,
         "htf_rows": len(htf_rows),
         "htf_rows_required": min_htf,
         "ema_htf_effective": effective_cfg.get("ema_htf", cfg.get("ema_htf", 200)),
-        "internal_trend_confirmation_required": internal_trend_required,
+        "internal_trend_confirmation_required": False,
+        "internal_trend_confirmation_requested_but_ignored": internal_trend_requested,
     }
 
     if forced_direction not in {"long", "short"}:
@@ -621,19 +617,13 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
         return PullbackTrendDecision(symbol, reason=reason, logs={**logs, "rejected_reason": reason})
 
     logs["rspt_final_side"] = forced_direction
-    logs["rspt_ignored_opposite_side"] = any(side != forced_direction for side in original_candidate_sides)
+    logs["rspt_ignored_opposite_side"] = any(
+        side != forced_direction for side in diagnostic_candidate_sides
+    )
 
-    if internal_trend_required:
-        if not candidate_sides:
-            reason = "trend_filter_failed"
-            return PullbackTrendDecision(symbol, side=forced_direction, reason=reason, logs={**logs, "rejected_reason": reason})
-
-        candidate_sides = [forced_direction] if forced_direction in candidate_sides else []
-        if not candidate_sides:
-            reason = "trend_filter_failed"
-            return PullbackTrendDecision(symbol, side=forced_direction, reason=reason, logs={**logs, "rejected_reason": reason})
-    else:
-        candidate_sides = [forced_direction]
+    # The only direction entering RSPT quality/setup checks is the shared UT
+    # direction. Legacy RSPT trend direction is diagnostic-only.
+    candidate_sides = [forced_direction]
 
     for side in candidate_sides:
         adx_gate = _adx_gate(trend.get("adx"), cfg)

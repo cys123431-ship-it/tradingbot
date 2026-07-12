@@ -14737,15 +14737,16 @@ class SignalEngine(BaseEngine):
         *,
         force_reprocess=False,
     ):
-        ut_params = self._dual_alpha_direction_strategy_params(strategy_params)
-        ut_sig, ut_reason, ut_status = await self._calculate_utbot_filtered_breakout_signal(
+        # Standalone RSPT and DUAL must use the exact same 4h/1d UT direction
+        # provider. The caller's signal dataframe is intentionally not used for
+        # direction selection because it may belong to a different timeframe.
+        _ = df
+        return await self._shared_ut_direction_filter(
             symbol,
-            df,
-            ut_params,
+            strategy_params,
             force_reprocess=force_reprocess,
+            consumer='RSPT_STANDALONE',
         )
-        forced_direction = self._extract_relative_strength_pullback_ut_direction(ut_sig, ut_status)
-        return forced_direction, ut_reason, dict(ut_status or {})
 
     async def _calculate_relative_strength_pullback_signal(
         self,
@@ -14776,7 +14777,7 @@ class SignalEngine(BaseEngine):
             provider_status = {}
         if resolved_via_provider:
             self._clear_utbot_filtered_breakout_entry_plan(symbol)
-        source_label = direction_source or 'UTBreakout'
+        source_label = direction_source or 'UTBreakout 4h/1d shared direction'
         rsp_cfg['forced_direction'] = resolved_direction
         rsp_cfg['direction_source'] = source_label
         nested_rsp_cfg = dict(cfg.get('relative_strength_pullback_trend') or {})
@@ -14798,6 +14799,8 @@ class SignalEngine(BaseEngine):
             'rspt_forced_direction': resolved_direction,
             'rspt_direction_source': source_label,
             'rspt_direction_provider_reason': direction_reason,
+            'rspt_internal_direction_disabled': True,
+            'rspt_direction_authority': 'UTBreakout',
         }
         if provider_status:
             status['rspt_direction_provider_status'] = {
@@ -15084,6 +15087,7 @@ class SignalEngine(BaseEngine):
             f"Active strategy: {active_strategy or 'n/a'}",
             f"Live enabled: {bool(rsp_cfg.get('relative_strength_pullback_trend_live_enabled', False))}",
             f"TF: signal {rsp_cfg.get('signal_tf', '4h')} / HTF {rsp_cfg.get('trend_htf', '1d')} / execution {rsp_cfg.get('entry_execution', 'next_open')}",
+            "Direction: shared UT 4h/1d only (RSPT internal LONG/SHORT selection disabled)",
         ]
         try:
             decisions, _, _, candidates, _ = await self._evaluate_relative_strength_pullback_candidates(
@@ -15160,7 +15164,14 @@ class SignalEngine(BaseEngine):
         params['UTBotFilteredBreakoutV1'] = cfg
         return params
 
-    async def _dual_alpha_ut_direction_filter(self, symbol, strategy_params, *, force_reprocess=False):
+    async def _shared_ut_direction_filter(
+        self,
+        symbol,
+        strategy_params,
+        *,
+        force_reprocess=False,
+        consumer='UNKNOWN',
+    ):
         direction_params = self._dual_alpha_direction_strategy_params(strategy_params)
         direction_cfg = self._get_utbot_filtered_breakout_config(direction_params)
         direction_cfg.update({
@@ -15188,14 +15199,15 @@ class SignalEngine(BaseEngine):
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 direction_df[col] = pd.to_numeric(direction_df[col], errors='coerce')
         except Exception as exc:
-            reason = f"DUAL direction filter fetch failed ({direction_tf}): {exc}"
+            reason = f"UT direction filter fetch failed ({direction_tf}): {exc}"
             self._utbreakout_trace_event(
                 symbol,
-                'DUAL_ALPHA',
-                'DIRECTION_FILTER_ERROR',
+                'UT_DIRECTION',
+                'FILTER_ERROR',
                 entry_timeframe=direction_tf,
                 htf_timeframe=direction_cfg.get('htf_timeframe'),
                 reason=str(exc),
+                consumer=consumer,
             )
             return None, reason, {}
 
@@ -15213,16 +15225,29 @@ class SignalEngine(BaseEngine):
         status['dual_direction_filter_htf'] = '1d'
         side = self._extract_relative_strength_pullback_ut_direction(sig, status)
         self._clear_utbot_filtered_breakout_entry_plan(symbol)
+        status['ut_direction_consumer'] = consumer
+        status['ut_direction_authority'] = 'UTBreakout'
         self._utbreakout_trace_event(
             symbol,
-            'DUAL_ALPHA',
-            'DIRECTION_FILTER',
+            'UT_DIRECTION',
+            'FILTER_RESULT',
             side=side,
             entry_timeframe=direction_cfg.get('entry_timeframe'),
             htf_timeframe=direction_cfg.get('htf_timeframe'),
             reason=reason,
+            consumer=consumer,
         )
         return side, reason, status
+
+    async def _dual_alpha_ut_direction_filter(self, symbol, strategy_params, *, force_reprocess=False):
+        # Backward-compatible wrapper. Direction calculation remains centralized
+        # in _shared_ut_direction_filter.
+        return await self._shared_ut_direction_filter(
+            symbol,
+            strategy_params,
+            force_reprocess=force_reprocess,
+            consumer='DUAL_ALPHA',
+        )
 
     def _dual_alpha_light(self, status, label):
         status = status if isinstance(status, dict) else {}
@@ -15308,10 +15333,11 @@ class SignalEngine(BaseEngine):
     ):
         self._clear_utbot_filtered_breakout_entry_plan(symbol)
         base_symbol = symbol
-        direction_side, direction_reason, direction_status = await self._dual_alpha_ut_direction_filter(
+        direction_side, direction_reason, direction_status = await self._shared_ut_direction_filter(
             base_symbol,
             strategy_params,
             force_reprocess=force_reprocess,
+            consumer='DUAL_ALPHA',
         )
         ut_params = self._dual_alpha_strategy_params(strategy_params, ENTRY_STRATEGY_UT_BREAKOUT)
         ut_sig, ut_reason, ut_status = await self._calculate_utbot_filtered_breakout_signal(
@@ -42036,6 +42062,9 @@ class MainController:
             rsp_cfg['relative_strength_pullback_trend_shadow_enabled'] = True
             rsp_cfg['relative_strength_pullback_trend_live_enabled'] = True
             rsp_cfg['relative_strength_pullback_trend_paper_enabled'] = False
+            rsp_cfg['forced_direction'] = None
+            rsp_cfg['direction_source'] = 'UTBreakout'
+            rsp_cfg['require_internal_trend_confirmation'] = False
             await self.cfg.update_value(
                 ['signal_engine', 'strategy_params', 'active_strategy'],
                 ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
@@ -42093,7 +42122,8 @@ class MainController:
                     engine.start()
             return (
                 "RelativeStrengthPullbackTrend ON. "
-                "scanner/CoinSelector candidates only, signal 4h + HTF 1d, live order path enabled."
+                "shared UT 4h/1d direction only; RSPT internal LONG/SHORT selection is disabled. "
+                "scanner/CoinSelector candidates and the existing live order path remain enabled."
             )
 
         async def _deactivate_relative_strength_pullback_strategy():

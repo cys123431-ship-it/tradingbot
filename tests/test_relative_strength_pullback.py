@@ -253,11 +253,13 @@ def test_forced_utbreakout_direction_allows_setup_without_internal_trend_confirm
     assert decision.side == "short"
     assert decision.reason == "breakout_continuation_confirmed"
     assert decision.logs["internal_trend_confirmation_required"] is False
+    assert decision.logs["rspt_internal_direction_disabled"] is True
+    assert decision.logs["rspt_direction_authority"] == "UTBreakout"
     assert decision.logs["htf_trend_passed_short"] is False
     assert decision.logs["trend_filter_passed_short"] is False
 
 
-def test_internal_trend_confirmation_can_still_be_required_by_config():
+def test_legacy_internal_trend_confirmation_setting_cannot_override_ut_direction():
     symbol = "SHORT/USDT:USDT"
     rows = _breakout_rows(120.0, -0.06, side="short")
 
@@ -272,10 +274,13 @@ def test_internal_trend_confirmation_can_still_be_required_by_config():
     )
     decision = decisions[0]
 
-    assert decision.entry_ready is False
+    assert decision.entry_ready is True
     assert decision.side == "short"
-    assert decision.reason == "trend_filter_failed"
-    assert decision.logs["internal_trend_confirmation_required"] is True
+    assert decision.reason == "breakout_continuation_confirmed"
+    assert decision.logs["internal_trend_confirmation_required"] is False
+    assert decision.logs["internal_trend_confirmation_requested_but_ignored"] is True
+    assert decision.logs["rspt_internal_direction_disabled"] is True
+    assert decision.logs["rspt_direction_authority"] == "UTBreakout"
 
 
 def test_adx_soft_zone_reduces_size_instead_of_hard_blocking():

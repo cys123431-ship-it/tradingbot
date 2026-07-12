@@ -1912,6 +1912,54 @@ def test_dual_alpha_direction_filter_normalizes_runtime_status_to_4h_1d():
     assert events[-1][2]["htf_timeframe"] == "1d"
 
 
+
+def test_standalone_rspt_uses_shared_ut_direction_without_dual_activation():
+    emas = _emas_module()
+    engine = object.__new__(emas.SignalEngine)
+    calls = []
+
+    async def shared_direction(symbol, strategy_params, *, force_reprocess=False, consumer="UNKNOWN"):
+        calls.append({
+            "symbol": symbol,
+            "active_strategy": strategy_params.get("active_strategy"),
+            "force_reprocess": force_reprocess,
+            "consumer": consumer,
+        })
+        return "short", "shared UT direction SHORT", {
+            "accepted_side": "short",
+            "entry_timeframe": "4h",
+            "htf_timeframe": "1d",
+            "ut_direction_authority": "UTBreakout",
+        }
+
+    async def forbidden_direct_calculation(*args, **kwargs):
+        raise AssertionError("standalone RSPT must not use a second UT calculation path")
+
+    engine._shared_ut_direction_filter = shared_direction
+    engine._calculate_utbot_filtered_breakout_signal = forbidden_direct_calculation
+
+    side, reason, status = asyncio.run(
+        engine._resolve_relative_strength_pullback_ut_direction(
+            "ETH/USDT:USDT",
+            pd.DataFrame(),
+            {
+                "active_strategy": emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+                "UTBotFilteredBreakoutV1": {},
+            },
+        )
+    )
+
+    assert side == "short"
+    assert reason == "shared UT direction SHORT"
+    assert status["entry_timeframe"] == "4h"
+    assert status["htf_timeframe"] == "1d"
+    assert calls == [{
+        "symbol": "ETH/USDT:USDT",
+        "active_strategy": emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+        "force_reprocess": False,
+        "consumer": "RSPT_STANDALONE",
+    }]
+
 def test_dual_alpha_direction_filter_blocks_opposite_adaptive_ut_candidate():
     emas = _emas_module()
     engine = object.__new__(emas.SignalEngine)
@@ -1940,7 +1988,8 @@ def test_dual_alpha_direction_filter_blocks_opposite_adaptive_ut_candidate():
         else None
     )
 
-    async def direction_filter(symbol, strategy_params, *, force_reprocess=False):
+    async def direction_filter(symbol, strategy_params, *, force_reprocess=False, consumer="UNKNOWN"):
+        assert consumer == "DUAL_ALPHA"
         return "long", "4h/1d UT direction LONG", {
             "accepted_side": "long",
             "entry_timeframe": "4h",
@@ -1959,7 +2008,7 @@ def test_dual_alpha_direction_filter_blocks_opposite_adaptive_ut_candidate():
         assert direction_source == "UTBreakout"
         return None, "RSPT waiting", {}
 
-    engine._dual_alpha_ut_direction_filter = direction_filter
+    engine._shared_ut_direction_filter = direction_filter
     engine._calculate_utbot_filtered_breakout_signal = adaptive_ut_signal
     engine._calculate_relative_strength_pullback_signal = rspt_signal
 
