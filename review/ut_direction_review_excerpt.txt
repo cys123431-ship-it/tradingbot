@@ -1,0 +1,135 @@
+Latest main reviewed: aaa48c26503a2cfe5cc37f500fc41967a7e95b38
+
+[1] Base UT state, emas.py 7547-7676
+
+007553: closed = df.iloc[:-1].copy().reset_index(drop=True)
+007638: buy = curr_src > curr_stop and prev_src <= prev_stop
+007639: sell = curr_src < curr_stop and prev_src >= prev_stop
+007641: detail = {
+007653:     'signal_side': signal_side,
+007654:     'bias_side': 'long' if curr_src > curr_stop else 'short' if curr_src < curr_stop else None
+007655: }
+007657: if buy:
+007662:     return 'long', reason, detail
+007664: if sell:
+007669:     return 'short', reason, detail
+007676: return None, reason, detail
+
+Meaning: a fresh side is emitted only on a closed-candle crossover, but the current persistent bias is always exposed as bias_side after indicators are ready.
+
+[2] Full UTBreakout candidate side, emas.py 16447-16469
+
+016447: ut_sig, ut_reason, ut_detail = self._calculate_utbot_signal(utbot_df, utbot_params)
+016448: ut_bias_side = str(ut_detail.get('bias_side') or '').lower()
+016449: candidate_side = ut_sig if ut_sig in {'long', 'short'} else (
+016450:     ut_bias_side if ut_bias_side in {'long', 'short'} else None
+016451: )
+016452: candidate_type = 'fresh_signal' if ut_sig in {'long', 'short'} else (
+016453:     'bias_state' if candidate_side else None
+016454: )
+016455: status.update({
+016456:     'fresh_signal': ut_sig,
+016457:     'candidate_signal': candidate_side,
+016458:     'candidate_side': candidate_side,
+016459:     'candidate_type': candidate_type,
+016460:     'ut_bias_side': ut_bias_side,
+016461: })
+
+Meaning: the UTBreakout direction candidate does not wait for a new crossover; it falls back to the persistent UT bias.
+
+[3] Shared 4h/1d provider, emas.py 15340-15430
+
+015340: def _dual_alpha_direction_strategy_params(self, strategy_params):
+015346:     cfg['dual_alpha_direction_filter_enabled'] = True
+015347:     cfg['dual_alpha_direction_filter_timeframe'] = '4h'
+015348:     cfg['dual_alpha_direction_filter_htf'] = '1d'
+015349:     cfg['entry_timeframe'] = '4h'
+015351:     cfg['htf_timeframe'] = '1d'
+015352:     cfg['adaptive_timeframe_enabled'] = False
+
+015357: async def _shared_ut_direction_filter(...):
+015365:     direction_params = self._dual_alpha_direction_strategy_params(strategy_params)
+015377:     direction_tf = '4h'
+015379:     ohlcv = await asyncio.to_thread(
+015380:         self.market_data_exchange.fetch_ohlcv,
+015381:         symbol,
+015382:         direction_tf,
+015383:         limit=300,
+015404:     sig, reason, status = await self._calculate_utbot_filtered_breakout_signal(
+015405:         symbol,
+015406:         direction_df,
+015407:         direction_params,
+015408:         force_reprocess=force_reprocess,
+015416:     side = self._extract_relative_strength_pullback_ut_direction(sig, status)
+015430:     return side, reason, status
+
+[4] Direction extraction, emas.py 14719-14730
+
+014719: def _extract_relative_strength_pullback_ut_direction(self, sig=None, status=None):
+014720:     side = self._normalize_relative_strength_pullback_direction(sig)
+014721:     if side:
+014722:         return side
+014723:     status = status if isinstance(status, dict) else {}
+014724:     if status.get('accepted_code') == 'ACCEPTED_ENTRY':
+014725:         return self._normalize_relative_strength_pullback_direction(status.get('accepted_side'))
+014726:     for key in ('candidate_side', 'candidate_signal', 'ut_bias_side', 'fresh_signal'):
+014727:         side = self._normalize_relative_strength_pullback_direction(status.get(key))
+014728:         if side:
+014729:             return side
+014730:     return None
+
+[5] Standalone RSPT runtime, emas.py 14732-15079
+
+014740: # Standalone RSPT and DUAL must use the exact same 4h/1d UT direction provider.
+014744: return await self._shared_ut_direction_filter(
+014748:     consumer='RSPT_STANDALONE',
+014768: if resolved_direction is None and resolve_ut_direction:
+014769:     resolved_direction, direction_reason, provider_status = await self._resolve_relative_strength_pullback_ut_direction(...)
+014781: rsp_cfg['forced_direction'] = resolved_direction
+014782: rsp_cfg['direction_source'] = source_label
+014799: 'rspt_forced_direction': resolved_direction,
+014802: 'rspt_internal_direction_disabled': True,
+014803: 'rspt_direction_authority': 'UTBreakout',
+
+[6] DUAL_ALPHA runtime, emas.py 15516-15710
+
+015530: direction_side, direction_reason, direction_status = await self._shared_ut_direction_filter(
+015534:     consumer='DUAL_ALPHA',
+015552: rsp_sig, rsp_reason, rsp_status = await self._calculate_relative_strength_pullback_signal(
+015557:     forced_direction=direction_side,
+015558:     direction_source='UTBreakout',
+015559:     resolve_ut_direction=False,
+
+Meaning: DUAL resolves the shared direction once and passes it into RSPT without a duplicate direction calculation.
+
+[7] RSPT evaluator, utbreakout/relative_strength_pullback.py 510 onward
+
+000514: forced_direction = _normalize_forced_direction(
+000515:     cfg.get('forced_direction')
+000538: # RSPT no longer owns LONG/SHORT selection.
+000540: internal_trend_required = False
+000580: # These trend values remain diagnostic/setup inputs only.
+000617: if forced_direction not in {'long', 'short'}:
+000618:     reason = 'no_ut_direction'
+000621: logs['rspt_final_side'] = forced_direction
+000626: candidate_sides = [forced_direction]
+
+[8] RSPT status path, emas.py build_relative_strength_pullback_status_text
+
+The status function obtains cfg and rsp_cfg, then calls:
+
+    decisions, _, _, candidates, _ = await self._evaluate_relative_strength_pullback_candidates(
+        focus_symbol=symbol,
+        cfg=cfg,
+        record_state=False,
+    )
+
+It does not call _shared_ut_direction_filter or _resolve_relative_strength_pullback_ut_direction for each candidate, and it does not inject forced_direction into cfg before evaluating. Therefore the evaluator sees forced_direction=None and returns no_ut_direction for every status candidate, even though the real standalone execution path resolves UT direction first.
+
+[9] Architectural coupling risk
+
+_shared_ut_direction_filter calls the complete _calculate_utbot_filtered_breakout_signal pipeline. That full pipeline has early returns before _calculate_utbot_signal/candidate_side population (for example unsupported mode, insufficient dataframe, adaptive-timeframe failure, inactive selected set, auto-selection weak margin, or insufficient closed rows). Such unrelated UT entry-eligibility failures can cause the shared direction provider to return None even though a pure UT bias could otherwise be calculated.
+
+[10] Focused test result
+
+476 passed, 216 deselected, 1 warning; test_status=0.
