@@ -1,0 +1,1 @@
+Trigger the main safety patch workflow using critical-pause-fix.patch.gz.
