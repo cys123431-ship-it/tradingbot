@@ -43,6 +43,25 @@ def _float(value, default=0.0):
     return parsed if math.isfinite(parsed) else default
 
 
+def candles_for_months(months, timeframe, days_per_month=30):
+    """Convert calendar-style months to candles for the selected timeframe."""
+    text = str(timeframe or "15m").strip().lower()
+    if not text:
+        raise ValueError("timeframe is required")
+    unit_seconds = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+    try:
+        if text.isdigit():
+            seconds = int(text) * 60
+        else:
+            seconds = int(text[:-1]) * unit_seconds[text[-1]]
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(f"unsupported timeframe: {timeframe}") from None
+    if seconds <= 0:
+        raise ValueError(f"unsupported timeframe: {timeframe}")
+    total_seconds = max(0, int(months or 0)) * max(1, int(days_per_month or 30)) * 86400
+    return max(1, math.ceil(total_seconds / seconds)) if total_seconds else 0
+
+
 def load_ohlcv_csv(path):
     rows = []
     with open(path, "r", encoding="utf-8-sig", newline="") as fp:
@@ -1243,9 +1262,15 @@ def main():
     else:
         args.enabled_engines = None
     if args.train_months:
-        args.wf_train_candles = max(args.wf_train_candles, int(args.train_months) * 30)
+        args.wf_train_candles = max(
+            args.wf_train_candles,
+            candles_for_months(args.train_months, args.timeframe),
+        )
     if args.test_months:
-        args.wf_test_candles = max(args.wf_test_candles, int(args.test_months) * 30)
+        args.wf_test_candles = max(
+            args.wf_test_candles,
+            candles_for_months(args.test_months, args.timeframe),
+        )
 
     rows = load_ohlcv_csv(args.csv)
     variants = {

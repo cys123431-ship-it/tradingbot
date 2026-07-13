@@ -40,6 +40,10 @@ def _base_config(**overrides):
         "adx_soft_min": 5.0,
         "breakout_atr_max": 20.0,
         "extreme_atr_pct": 99.0,
+        "rspt_v2_enabled": False,
+        "independent_direction_enabled": False,
+        "allow_breakout_continuation": True,
+        "pullback_tolerance_atr": 0.50,
         "forced_direction": "long",
         "direction_source": "UTBreakout",
     })
@@ -56,8 +60,11 @@ def test_defaults_keep_new_strategy_shadow_only():
     assert cfg["entry_execution"] == "market"
     assert cfg["exclude_incomplete_live_candle"] is True
     assert cfg["forced_direction"] is None
-    assert cfg["direction_source"] == "UTBreakout"
-    assert cfg["require_internal_trend_confirmation"] is False
+    assert cfg["direction_source"] == "RSPT-v2 residual strength"
+    assert cfg["require_internal_trend_confirmation"] is True
+    assert cfg["rspt_v2_enabled"] is True
+    assert cfg["independent_direction_enabled"] is True
+    assert cfg["allow_breakout_continuation"] is False
     assert cfg["relative_strength_pullback_trend_shadow_enabled"] is True
     assert cfg["relative_strength_pullback_trend_live_enabled"] is False
     assert cfg["relative_strength_pullback_trend_paper_enabled"] is False

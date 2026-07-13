@@ -9,6 +9,12 @@ filters.
 from dataclasses import dataclass, field
 from math import isfinite
 
+from .rspt_v2 import (
+    evaluate_pullback_setup as evaluate_rspt_v2_pullback_setup,
+    residual_strength_percentiles,
+    volatility_risk_multiplier as rspt_v2_volatility_risk_multiplier,
+)
+
 
 ENTRY_STRATEGY_UT_BREAKOUT = "ut_breakout"
 ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND = "relative_strength_pullback_trend"
@@ -38,10 +44,19 @@ def default_relative_strength_pullback_config():
         "trend_htf": "1d",
         "signal_tf": "4h",
         "entry_execution": "market",
+        "strategy_version": "v2",
+        "rspt_v2_enabled": True,
+        "independent_direction_enabled": True,
         "forced_direction": None,
-        "direction_source": "UTBreakout",
-        # Kept for backward-compatible config loading only. Direction is always supplied by UT.
-        "require_internal_trend_confirmation": False,
+        "direction_source": "RSPT-v2 residual strength",
+        "require_internal_trend_confirmation": True,
+        "relative_strength_reference_symbols": ["BTC/USDT:USDT", "ETH/USDT:USDT"],
+        "residual_strength_enabled": True,
+        "residual_strength_ridge": 0.000001,
+        "residual_strength_min_aligned_returns": 40,
+        "rs_long_entry_top_pct": 20.0,
+        "rs_short_entry_bottom_pct": 10.0,
+        "short_enabled": True,
         "donchian_length": 20,
         "ema_pullback": 20,
         "ema_fast": 20,
@@ -58,7 +73,8 @@ def default_relative_strength_pullback_config():
         "relative_strength_short_lookback_bars": 28,
         "relative_strength_long_lookback_bars": 120,
         "relative_strength_block_quantile": 0.20,
-        "relative_strength_min_candidates": 2,
+        "relative_strength_min_candidates": 4,
+        "relative_strength_universe_size": 30,
         "rs_hard_filter_min_candidates": 10,
         "rs_long_block_bottom_pct": 20.0,
         "rs_short_block_top_pct": 20.0,
@@ -67,9 +83,35 @@ def default_relative_strength_pullback_config():
         "breakout_atr_max": 2.80,
         "breakout_wick_max_ratio": 0.45,
         "extreme_atr_pct": 6.0,
-        "pullback_tolerance_atr": 0.50,
+        "pullback_tolerance_atr": 0.25,
         "pullback_confirmation_lookback": 1,
         "rebreakout_tolerance_atr": 0.20,
+        "allow_breakout_continuation": False,
+        "require_prior_impulse": True,
+        "impulse_lookback_min_bars": 2,
+        "impulse_lookback_max_bars": 8,
+        "impulse_body_atr_min": 0.55,
+        "pullback_depth_atr_min": 0.40,
+        "pullback_depth_atr_max": 1.20,
+        "pullback_body_atr_min": 0.25,
+        "pullback_max_wick_ratio": 0.45,
+        "volatility_high_atr_pct": 3.5,
+        "volatility_extreme_atr_pct": 5.5,
+        "volatility_high_multiplier": 0.70,
+        "volatility_extreme_multiplier": 0.35,
+        "stop_distance_min_atr": 0.60,
+        "stop_distance_max_atr": 2.00,
+        "structure_stop_buffer_atr": 0.20,
+        "partial_take_profit_r_multiple": 1.50,
+        "partial_take_profit_ratio": 0.25,
+        "atr_trailing_activation_r": 2.00,
+        "atr_trailing_multiplier": 2.75,
+        "tp1_breakeven_enabled": False,
+        "ev_time_stop_enabled": True,
+        "ev_time_stop_bars": 8,
+        "ev_time_stop_min_mfe_r": 0.50,
+        "entry_chase_guard_enabled": True,
+        "entry_chase_max_atr": 0.35,
         "stale_entry_minutes_4h": 30.0,
         "stale_entry_minutes_6h": 45.0,
         "stale_entry_minutes_1h": 10.0,
@@ -269,6 +311,21 @@ def _candidate_symbols(candidates):
 
 
 def _relative_strength_percentiles(symbols, signal_rows_by_symbol, cfg, now_ms=None):
+    forced_direction = _normalize_forced_direction(
+        cfg.get("forced_direction") or cfg.get("rspt_forced_direction") or cfg.get("utbreakout_direction")
+    )
+    v2_active = (
+        bool(cfg.get("rspt_v2_enabled", True))
+        and bool(cfg.get("independent_direction_enabled", True))
+        and forced_direction is None
+    )
+    if v2_active and bool(cfg.get("residual_strength_enabled", True)):
+        closed_rows_by_symbol = {
+            symbol: _closed_rows(rows, cfg.get("signal_tf", "4h"), cfg, now_ms)
+            for symbol, rows in (signal_rows_by_symbol or {}).items()
+        }
+        return residual_strength_percentiles(symbols, closed_rows_by_symbol, cfg)
+
     min_candidates = max(2, int(cfg.get("relative_strength_min_candidates", 4) or 4))
     candidate_count = len(symbols)
     if len(symbols) < min_candidates:
@@ -390,6 +447,34 @@ def _adx_gate(adx, cfg):
 def _relative_strength_gate(side, rs, cfg):
     pct = rs.get("percentile")
     candidate_count = int(rs.get("candidate_count", 0) or 0)
+    forced_direction = _normalize_forced_direction(
+        cfg.get("forced_direction") or cfg.get("rspt_forced_direction") or cfg.get("utbreakout_direction")
+    )
+    v2_active = (
+        bool(cfg.get("rspt_v2_enabled", True))
+        and bool(cfg.get("independent_direction_enabled", True))
+        and forced_direction is None
+    )
+    if v2_active:
+        if pct is None:
+            return {
+                "passed": False,
+                "reason": rs.get("reason", "residual_strength_unavailable"),
+                "risk_multiplier": 0.0,
+                "hard_filter_applied": True,
+            }
+        long_top = _pct_to_fraction(cfg.get("rs_long_entry_top_pct"), 20.0)
+        short_bottom = _pct_to_fraction(cfg.get("rs_short_entry_bottom_pct"), 10.0)
+        passed = (side == "long" and pct >= 1.0 - long_top) or (
+            side == "short" and pct <= short_bottom and bool(cfg.get("short_enabled", True))
+        )
+        return {
+            "passed": bool(passed),
+            "reason": "residual_strength_passed" if passed else "residual_strength_rank_block",
+            "risk_multiplier": 1.0 if passed else 0.0,
+            "hard_filter_applied": True,
+        }
+
     hard_min = max(2, int(cfg.get("rs_hard_filter_min_candidates", 10) or 10))
     long_block = _pct_to_fraction(cfg.get("rs_long_block_bottom_pct"), 20.0)
     short_block = _pct_to_fraction(cfg.get("rs_short_block_top_pct"), 20.0)
@@ -519,20 +604,32 @@ def _extended_candle_block(row, atr, side, cfg):
 
 
 def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None):
+    v2_enabled = bool(cfg.get("rspt_v2_enabled", True))
     forced_direction = _normalize_forced_direction(
         cfg.get("forced_direction")
         or cfg.get("rspt_forced_direction")
         or cfg.get("utbreakout_direction")
     )
+    independent_direction = (
+        v2_enabled
+        and bool(cfg.get("independent_direction_enabled", True))
+        and forced_direction is None
+    )
+    v2_active = independent_direction
     direction_source = str(
         cfg.get("direction_source")
         or cfg.get("rspt_direction_source")
-        or "UTBreakout"
+        or ("RSPT-v2 residual strength" if independent_direction else "UTBreakout")
     )
+    if independent_direction:
+        direction_source = "RSPT-v2 residual strength"
+        forced_direction = None
     base_logs = {
         "scanner_passed": True,
         "symbol": symbol,
         "entry_strategy": ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+        "strategy_version": "v2" if v2_enabled else "legacy",
+        "rspt_v2_enabled": v2_enabled,
         "entry_execution": "market",
         "direction_by": direction_source,
         "rspt_direction_source": direction_source,
@@ -544,10 +641,6 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
     min_htf = max(htf_slow_len, htf_fast_len) + 1
     effective_cfg = cfg
     htf_fallback_used = False
-    # RSPT no longer owns LONG/SHORT selection. Even if an older runtime config
-    # still contains this flag, it must not re-enable the legacy direction gate.
-    internal_trend_requested = bool(cfg.get("require_internal_trend_confirmation", False))
-    internal_trend_required = False
     if len(signal_rows) < min_signal:
         return PullbackTrendDecision(
             symbol,
@@ -586,22 +679,19 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
         else 0
     )
     close = _row_value(row, "close")
-    open_ = _row_value(row, "open", close)
-    high = _row_value(row, "high")
-    low = _row_value(row, "low")
     if not donchian or not atr or atr <= 0:
-        return PullbackTrendDecision(symbol, reason="indicator_not_ready", logs={**base_logs, "rejected_reason": "indicator_not_ready"})
+        return PullbackTrendDecision(
+            symbol,
+            reason="indicator_not_ready",
+            logs={**base_logs, "rejected_reason": "indicator_not_ready"},
+        )
 
-    rs_pct = rs.get("percentile")
-    rs_reason = rs.get("reason", "missing")
-    # These trend values remain diagnostic/setup inputs only. They are never
-    # allowed to choose or veto the trade direction; UT is authoritative.
     long_trend = bool(trend["long_htf"] and trend["long_signal"])
     short_trend = bool(trend["short_htf"] and trend["short_signal"])
     diagnostic_candidate_sides = []
     if long_trend:
         diagnostic_candidate_sides.append("long")
-    if short_trend:
+    if short_trend and (not v2_enabled or bool(cfg.get("short_enabled", True))):
         diagnostic_candidate_sides.append("short")
 
     logs = {
@@ -615,55 +705,62 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
         "adx_passed": trend["adx_passed"],
         "adx": trend["adx"],
         "adx_pass": trend["adx_threshold"],
-        "relative_strength_percentile": rs_pct,
-        "relative_strength_reason": rs_reason,
+        "relative_strength_percentile": rs.get("percentile"),
+        "relative_strength_score": rs.get("score"),
+        "relative_strength_method": rs.get("method"),
+        "relative_strength_reason": rs.get("reason", "missing"),
         "relative_strength_candidate_count": rs.get("candidate_count"),
         "relative_strength_ranked_count": rs.get("ranked_count"),
+        "relative_strength_reference_symbols": rs.get("reference_symbols"),
+        "residual_aligned_returns": rs.get("aligned_returns"),
+        "residual_volatility": rs.get("residual_volatility"),
         "rspt_original_candidate_sides": diagnostic_candidate_sides,
         "rspt_ignored_opposite_side": False,
-        "rspt_internal_direction_disabled": True,
-        "rspt_direction_authority": "UTBreakout",
+        "rspt_internal_direction_disabled": not independent_direction,
+        "rspt_direction_authority": "RSPT-v2" if independent_direction else "UTBreakout",
         "htf_fallback_used": htf_fallback_used,
         "htf_rows": len(htf_rows),
         "htf_rows_required": min_htf,
         "ema_htf_effective": effective_cfg.get("ema_htf", cfg.get("ema_htf", 200)),
-        "internal_trend_confirmation_required": False,
-        "internal_trend_confirmation_requested_but_ignored": internal_trend_requested,
+        "internal_trend_confirmation_required": independent_direction,
+        "internal_trend_confirmation_requested_but_ignored": (
+            bool(cfg.get("require_internal_trend_confirmation", False)) and not independent_direction
+        ),
         "signal_candle_ts": signal_candle_ts,
         "signal_candle_close_ts": signal_candle_close_ts,
         "signal_candle_closed": True,
         "signal_basis": "last_completed_candle",
         "entry_execution": "market",
-        "entry_execution_policy": "market_immediately_after_completed_candle",
+        "entry_execution_policy": (
+            "market_after_completed_candle_confirmation"
+            if v2_active
+            else "market_immediately_after_completed_candle"
+        ),
     }
 
-    if forced_direction not in {"long", "short"}:
-        reason = "no_ut_direction"
-        return PullbackTrendDecision(symbol, reason=reason, logs={**logs, "rejected_reason": reason})
+    if independent_direction:
+        candidate_sides = list(diagnostic_candidate_sides)
+        if not candidate_sides:
+            return PullbackTrendDecision(
+                symbol,
+                reason="trend_filter_failed",
+                logs={**logs, "rejected_reason": "trend_filter_failed"},
+            )
+    else:
+        if forced_direction not in {"long", "short"}:
+            reason = "no_ut_direction"
+            return PullbackTrendDecision(symbol, reason=reason, logs={**logs, "rejected_reason": reason})
+        candidate_sides = [forced_direction]
+        logs["rspt_ignored_opposite_side"] = any(
+            side != forced_direction for side in diagnostic_candidate_sides
+        )
 
-    logs["rspt_final_side"] = forced_direction
-    logs["rspt_ignored_opposite_side"] = any(
-        side != forced_direction for side in diagnostic_candidate_sides
-    )
-
-    # The only direction entering RSPT quality/setup checks is the shared UT
-    # direction. Legacy RSPT trend direction is diagnostic-only.
-    candidate_sides = [forced_direction]
-
+    rejection_details = []
     for side in candidate_sides:
         adx_gate = _adx_gate(trend.get("adx"), cfg)
         if not adx_gate["passed"]:
-            return PullbackTrendDecision(
-                symbol,
-                side=side,
-                reason="adx_too_low",
-                logs={
-                    **logs,
-                    "adx_state": adx_gate["state"],
-                    "adx_size_multiplier": adx_gate["risk_multiplier"],
-                    "rejected_reason": "adx_too_low",
-                },
-            )
+            rejection_details.append({"side": side, "reason": "adx_too_low"})
+            continue
 
         rs_gate = _relative_strength_gate(side, rs, cfg)
         side_logs = {
@@ -677,12 +774,8 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
             "relative_strength_passed": rs_gate["passed"],
         }
         if not rs_gate["passed"]:
-            return PullbackTrendDecision(
-                symbol,
-                side=side,
-                reason="relative_strength_hard_block",
-                logs={**side_logs, "rejected_reason": "relative_strength_hard_block"},
-            )
+            rejection_details.append({"side": side, "reason": rs_gate["reason"]})
+            continue
 
         stale = _stale_signal_reason(row, cfg, now_ms)
         if stale:
@@ -693,19 +786,59 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
                 logs={**side_logs, **stale, "rejected_reason": "stale_signal"},
             )
 
+        volatility_multiplier, volatility_reason, atr_pct = rspt_v2_volatility_risk_multiplier(
+            atr, close, cfg
+        ) if v2_active else (1.0, "legacy", atr / close * 100.0 if close > 0 else None)
         size_multiplier = min(
             1.0,
             max(0.0, float(adx_gate["risk_multiplier"])),
             max(0.0, float(rs_gate["risk_multiplier"])),
+            max(0.0, float(volatility_multiplier)),
         )
         size_reduction_reasons = [
             reason
-            for reason in (adx_gate["reason"], rs_gate["reason"])
-            if reason in {"adx_weak_size_reduced", "relative_strength_size_reduced"}
+            for reason in (adx_gate["reason"], rs_gate["reason"], volatility_reason)
+            if reason in {
+                "adx_weak_size_reduced",
+                "relative_strength_size_reduced",
+                "volatility_high_size_reduced",
+                "volatility_extreme_size_reduced",
+            }
         ]
+        setup_logs = {
+            **side_logs,
+            "rspt_final_side": side,
+            "volatility_atr_pct": atr_pct,
+            "volatility_size_multiplier": volatility_multiplier,
+            "volatility_state": volatility_reason,
+            "size_multiplier": size_multiplier,
+            "risk_multiplier": size_multiplier,
+            "size_reduction_reasons": size_reduction_reasons,
+        }
+
+        if v2_active:
+            pullback_ok, pullback_detail = evaluate_rspt_v2_pullback_setup(
+                side, signal_rows, trend, atr, cfg
+            )
+            if pullback_ok:
+                return PullbackTrendDecision(
+                    symbol,
+                    side=side,
+                    entry_ready=True,
+                    entry_execution="market",
+                    reason="rspt_v2_pullback_confirmed",
+                    logs={
+                        **setup_logs,
+                        **pullback_detail,
+                        "setup_type": "residual_strength_pullback",
+                        "rejected_reason": None,
+                    },
+                )
+            rejection_details.append({"side": side, **pullback_detail})
+            continue
 
         breakout_ok, breakout_detail = _breakout_continuation_setup(side, row, donchian, atr, cfg)
-        if breakout_ok:
+        if breakout_ok and bool(cfg.get("allow_breakout_continuation", True)):
             return PullbackTrendDecision(
                 symbol,
                 side=side,
@@ -713,16 +846,12 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
                 entry_execution="market",
                 reason="breakout_continuation_confirmed",
                 logs={
-                    **side_logs,
+                    **setup_logs,
                     **breakout_detail,
                     "setup_type": "breakout_continuation",
-                    "size_multiplier": size_multiplier,
-                    "risk_multiplier": size_multiplier,
-                    "size_reduction_reasons": size_reduction_reasons,
                     "rejected_reason": None,
                 },
             )
-
         pullback_ok, pullback_detail = _trend_pullback_setup(side, row, prev, donchian, atr, trend, cfg)
         if pullback_ok:
             return PullbackTrendDecision(
@@ -732,31 +861,34 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
                 entry_execution="market",
                 reason="trend_pullback_confirmed",
                 logs={
-                    **side_logs,
+                    **setup_logs,
                     **pullback_detail,
                     "setup_type": "trend_pullback",
-                    "size_multiplier": size_multiplier,
-                    "risk_multiplier": size_multiplier,
-                    "size_reduction_reasons": size_reduction_reasons,
                     "rejected_reason": None,
                 },
             )
+        rejection_details.append({
+            "side": side,
+            "reason": "no_entry_setup",
+            "pullback_detail": pullback_detail,
+            "breakout_detail": breakout_detail,
+        })
 
-        rejected_reasons = [pullback_detail.get("reason", "no_pullback_setup"), breakout_detail.get("reason", "no_breakout_setup")]
-        return PullbackTrendDecision(
-            symbol,
-            side=side,
-            reason="no_entry_setup",
-            logs={
-                **side_logs,
-                "pullback_detail": pullback_detail,
-                "breakout_detail": breakout_detail,
-                "rejected_reason": ";".join(rejected_reasons),
-                "rejected_reasons": rejected_reasons,
-            },
-        )
-
-    return PullbackTrendDecision(symbol, reason="trend_filter_failed", logs={**logs, "rejected_reason": "trend_filter_failed"})
+    reason = "no_entry_setup"
+    if rejection_details and all(
+        item.get("reason") in {"relative_strength_hard_block", "residual_strength_rank_block", "residual_strength_unavailable", "skipped_few_candidates", "residual_data_insufficient", "residual_benchmark_missing"}
+        for item in rejection_details
+    ):
+        reason = "relative_strength_hard_block"
+    return PullbackTrendDecision(
+        symbol,
+        reason=reason,
+        logs={
+            **logs,
+            "rejected_reason": reason,
+            "rejected_reasons": rejection_details,
+        },
+    )
 
 
 def evaluate_relative_strength_pullback_trend(
@@ -775,7 +907,10 @@ def evaluate_relative_strength_pullback_trend(
     cfg["entry_execution"] = "market"
     cfg["exclude_incomplete_live_candle"] = True
     symbols = _candidate_symbols(candidates)
-    rs = _relative_strength_percentiles(symbols, signal_rows_by_symbol or {}, cfg, now_ms)
+    rank_symbols = list(cfg.get("_relative_strength_rank_symbols") or symbols)
+    if not rank_symbols:
+        rank_symbols = list(symbols)
+    rs = _relative_strength_percentiles(rank_symbols, signal_rows_by_symbol or {}, cfg, now_ms)
     state_by_symbol = state_by_symbol or {}
     decisions = []
     for symbol in symbols:

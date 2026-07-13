@@ -2089,8 +2089,9 @@ def test_dual_alpha_direction_filter_blocks_opposite_adaptive_ut_candidate():
         }
 
     async def rspt_signal(symbol, df, strategy_params, *, force_reprocess=False, forced_direction=None, direction_source=None, resolve_ut_direction=True):
-        assert forced_direction == "long"
-        assert direction_source == "UTBreakout"
+        assert forced_direction is None
+        assert direction_source == "RSPT-v2 residual strength"
+        assert resolve_ut_direction is False
         return None, "RSPT waiting", {}
 
     engine._shared_ut_direction_filter = direction_filter
@@ -2117,6 +2118,177 @@ def test_dual_alpha_direction_filter_blocks_opposite_adaptive_ut_candidate():
     assert selected_plans == []
     assert any(event[2] == "UT_OPPOSITE_DIRECTION_BLOCKED" for event in events)
 
+
+
+def test_dual_alpha_scale_plan_reduces_all_risk_dimensions():
+    emas = _emas_module()
+    engine = object.__new__(emas.SignalEngine)
+
+    scaled = engine._dual_alpha_scale_plan(
+        {
+            "qty": 10.0,
+            "risk_usdt": 5.0,
+            "max_risk_per_trade_usdt": 6.0,
+            "planned_notional": 100.0,
+            "planned_margin": 20.0,
+            "expected_profit_usdt": 15.0,
+            "risk_per_trade_percent": 0.5,
+            "entry_price": 100.0,
+        },
+        0.60,
+    )
+
+    assert scaled["qty"] == pytest.approx(6.0)
+    assert scaled["risk_usdt"] == pytest.approx(3.0)
+    assert scaled["max_risk_per_trade_usdt"] == pytest.approx(3.6)
+    assert scaled["planned_notional"] == pytest.approx(60.0)
+    assert scaled["planned_margin"] == pytest.approx(12.0)
+    assert scaled["expected_profit_usdt"] == pytest.approx(9.0)
+    assert scaled["risk_per_trade_percent"] == pytest.approx(0.30)
+    assert scaled["entry_price"] == pytest.approx(100.0)
+    assert scaled["dual_alpha_risk_multiplier"] == pytest.approx(0.60)
+
+
+def _dual_alpha_test_engine(emas, *, ut_side, rspt_side):
+    engine = object.__new__(emas.SignalEngine)
+    engine.dual_alpha_last_status = {}
+    engine.last_entry_reason = {}
+    engine._dual_test_branch = None
+    engine._dual_test_selected = []
+    engine._clear_utbot_filtered_breakout_entry_plan = lambda symbol: None
+    engine._utbreakout_diag_for_symbol = lambda symbol: {}
+    engine._canonical_futures_symbol = lambda symbol: symbol
+    engine._store_utbot_filtered_breakout_status = lambda symbol, status: None
+    engine._utbreakout_trace_event = lambda *args, **kwargs: None
+    engine._set_utbot_filtered_breakout_entry_plan = (
+        lambda symbol, plan: engine._dual_test_selected.append((symbol, dict(plan)))
+    )
+
+    def get_plan(symbol, side=None):
+        if engine._dual_test_branch == "ut" and ut_side in {"long", "short"} and side == ut_side:
+            return {
+                "qty": 10.0,
+                "risk_usdt": 5.0,
+                "planned_notional": 100.0,
+                "strategy": emas.UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY,
+            }
+        if engine._dual_test_branch == "rspt" and rspt_side in {"long", "short"} and side == rspt_side:
+            return {
+                "qty": 8.0,
+                "risk_usdt": 4.0,
+                "planned_notional": 80.0,
+                "strategy": emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+            }
+        return None
+
+    engine._get_utbot_filtered_breakout_entry_plan = get_plan
+
+    async def direction_filter(symbol, strategy_params, *, force_reprocess=False, consumer="UNKNOWN"):
+        return "long", "4h/1d UT direction LONG", {
+            "accepted_side": "long",
+            "entry_timeframe": "4h",
+            "htf_timeframe": "1d",
+        }
+
+    async def ut_signal(symbol, df, strategy_params, *, force_reprocess=False):
+        engine._dual_test_branch = "ut"
+        if ut_side not in {"long", "short"}:
+            return None, "UT waiting", {}
+        return ut_side, f"UT {ut_side} ready", {
+            "accepted_code": "ACCEPTED_ENTRY",
+            "accepted_side": ut_side,
+            "stage": "entry_ready",
+            "expected_net_r": 0.8,
+        }
+
+    async def rspt_signal(
+        symbol,
+        df,
+        strategy_params,
+        *,
+        force_reprocess=False,
+        forced_direction=None,
+        direction_source=None,
+        resolve_ut_direction=True,
+    ):
+        engine._dual_test_branch = "rspt"
+        assert forced_direction is None
+        assert direction_source == "RSPT-v2 residual strength"
+        assert resolve_ut_direction is False
+        if rspt_side not in {"long", "short"}:
+            return None, "RSPT waiting", {}
+        return rspt_side, f"RSPT {rspt_side} ready", {
+            "accepted_code": "ACCEPTED_ENTRY",
+            "accepted_side": rspt_side,
+            "stage": "entry_ready",
+            "relative_strength_percentile": 0.95 if rspt_side == "long" else 0.05,
+        }
+
+    engine._shared_ut_direction_filter = direction_filter
+    engine._calculate_utbot_filtered_breakout_signal = ut_signal
+    engine._calculate_relative_strength_pullback_signal = rspt_signal
+    return engine
+
+
+def test_dual_alpha_single_rspt_signal_uses_reduced_risk():
+    emas = _emas_module()
+    engine = _dual_alpha_test_engine(emas, ut_side=None, rspt_side="long")
+
+    side, _, status = asyncio.run(
+        engine._calculate_dual_alpha_signal(
+            "SOL/USDT:USDT",
+            pd.DataFrame(),
+            {
+                "active_strategy": emas.DUAL_ALPHA_STRATEGY,
+                "UTBotFilteredBreakoutV1": {
+                    "dual_alpha_single_signal_risk_multiplier": 0.60,
+                },
+            },
+        )
+    )
+
+    assert side == "long"
+    assert status["dual_alpha"]["agreement_state"] == "single"
+    assert status["dual_alpha"]["agreement_risk_multiplier"] == pytest.approx(0.60)
+    assert engine._dual_test_selected[-1][1]["qty"] == pytest.approx(4.8)
+    assert engine._dual_test_selected[-1][1]["risk_usdt"] == pytest.approx(2.4)
+
+
+def test_dual_alpha_conflicting_independent_signals_are_rejected():
+    emas = _emas_module()
+    engine = _dual_alpha_test_engine(emas, ut_side="long", rspt_side="short")
+
+    side, reason, status = asyncio.run(
+        engine._calculate_dual_alpha_signal(
+            "ETH/USDT:USDT",
+            pd.DataFrame(),
+            {"active_strategy": emas.DUAL_ALPHA_STRATEGY, "UTBotFilteredBreakoutV1": {}},
+        )
+    )
+
+    assert side is None
+    assert "strategy conflict" in reason
+    assert status["dual_alpha"]["agreement_state"] == "conflict"
+    assert status["reject_code"] == "REJECTED_DUAL_DIRECTION_CONFLICT"
+    assert engine._dual_test_selected == []
+
+
+def test_dual_alpha_matching_signals_keep_full_risk():
+    emas = _emas_module()
+    engine = _dual_alpha_test_engine(emas, ut_side="long", rspt_side="long")
+
+    side, _, status = asyncio.run(
+        engine._calculate_dual_alpha_signal(
+            "BTC/USDT:USDT",
+            pd.DataFrame(),
+            {"active_strategy": emas.DUAL_ALPHA_STRATEGY, "UTBotFilteredBreakoutV1": {}},
+        )
+    )
+
+    assert side == "long"
+    assert status["dual_alpha"]["agreement_state"] == "confirmed"
+    assert status["dual_alpha"]["agreement_risk_multiplier"] == pytest.approx(1.0)
+    assert engine._dual_test_selected[-1][1]["dual_alpha_risk_multiplier"] == pytest.approx(1.0)
 
 def test_rsibb_is_selectable_without_becoming_default(tmp_path):
     emas = _emas_module()

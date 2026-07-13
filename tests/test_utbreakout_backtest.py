@@ -419,3 +419,15 @@ def test_csv_loader_preserves_actual_funding_event_fields(tmp_path):
     assert row["funding_rate"] == pytest.approx(0.001)
     assert row["funding_timestamp"] == "1"
     assert row["funding_event"] is True
+
+
+def test_month_to_candle_conversion_respects_timeframe():
+    assert bt.candles_for_months(1, "15m") == 2880
+    assert bt.candles_for_months(1, "1h") == 720
+    assert bt.candles_for_months(1, "4h") == 180
+    assert bt.candles_for_months(2, "1d") == 60
+
+
+def test_month_to_candle_conversion_rejects_unknown_timeframe():
+    with pytest.raises(ValueError, match="unsupported timeframe"):
+        bt.candles_for_months(1, "banana")
