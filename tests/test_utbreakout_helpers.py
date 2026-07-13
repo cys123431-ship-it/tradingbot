@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 import asyncio
 import inspect
 import re
+from unittest.mock import AsyncMock
 
 import math
 
@@ -6238,3 +6239,117 @@ def test_dual_status_shows_tp_ladder_from_protection_status():
     assert "mode=single_tp2_with_warning" in text
     assert "TP1=not_created" in text
     assert "TP2=106.51" in text
+
+
+def test_manual_short_close_position_sl_is_preserved_and_not_force_closed():
+    pos = {
+        "symbol": "KORU/USDT:USDT",
+        "side": "short",
+        "contracts": "60.11",
+        "entryPrice": "424.6755308",
+        "markPrice": "443.45",
+        "liquidationPrice": "518.3729034",
+    }
+    manual_sl = {
+        "id": "manual-koru-sl",
+        "symbol": "KORU/USDT:USDT",
+        "side": "buy",
+        "type": "stop_market",
+        "amount": None,
+        "reduceOnly": False,
+        "closePosition": True,
+        "workingType": "CONTRACT_PRICE",
+        "triggerPrice": "467.14",
+        "info": {
+            "symbol": "KORUUSDT",
+            "origType": "STOP_MARKET",
+            "triggerPrice": "467.14",
+            "closePosition": "true",
+            "workingType": "CONTRACT_PRICE",
+        },
+    }
+    engine = _protection_engine([manual_sl], positions=[pos])
+    engine.exchange.id = "binance"
+    engine.exchange.market = lambda symbol: {
+        "precision": {"price": 0.01},
+        "info": {"filters": [{"filterType": "PRICE_FILTER", "tickSize": "0.01"}]},
+    }
+    engine.exchange.fapiPrivateGetOpenAlgoOrders = lambda params=None: {"orders": []}
+    engine.get_runtime_common_settings = lambda: {}
+    engine._set_crypto_entry_lock = lambda reason: setattr(engine, "crypto_entry_lock_reason", reason)
+    engine._handle_liquidation_safety_failure = AsyncMock()
+
+    status = asyncio.run(
+        engine._audit_protection_orders(
+            "KORU/USDT",
+            pos=pos,
+            expected_tp=None,
+            expected_sl=True,
+            alert=True,
+        )
+    )
+
+    assert status["status"] == "OK"
+    assert status["external_position"] is True
+    assert status["tp_expected"] is False
+    assert status["sl_present"] is True
+    assert status["liquidation_safety"] == "SAFE_EXTERNAL"
+    assert status["liquidation_safety_reason"] == "SAFE_EXTERNAL_CONTRACT_PRICE"
+    assert engine.exchange.cancelled == []
+    assert not [order for order in engine.exchange.created if order["type"] == "market"]
+    engine._handle_liquidation_safety_failure.assert_not_awaited()
+
+
+def test_manual_external_sl_is_preserved_when_liquidation_price_is_temporarily_missing():
+    pos = {
+        "symbol": "KORU/USDT:USDT",
+        "side": "short",
+        "contracts": "60.11",
+        "entryPrice": "424.6755308",
+        "markPrice": "443.45",
+        "liquidationPrice": "0",
+    }
+    manual_sl = {
+        "id": "manual-koru-sl-no-liq",
+        "symbol": "KORU/USDT:USDT",
+        "side": "buy",
+        "type": "stop_market",
+        "closePosition": True,
+        "workingType": "CONTRACT_PRICE",
+        "triggerPrice": "467.14",
+        "info": {
+            "symbol": "KORUUSDT",
+            "origType": "STOP_MARKET",
+            "triggerPrice": "467.14",
+            "closePosition": "true",
+            "workingType": "CONTRACT_PRICE",
+        },
+    }
+    engine = _protection_engine([manual_sl], positions=[pos])
+    engine.exchange.id = "binance"
+    engine.exchange.market = lambda symbol: {
+        "precision": {"price": 0.01},
+        "info": {"filters": [{"filterType": "PRICE_FILTER", "tickSize": "0.01"}]},
+    }
+    engine.exchange.fapiPrivateGetOpenAlgoOrders = lambda params=None: {"orders": []}
+    engine.get_runtime_common_settings = lambda: {}
+    engine._set_crypto_entry_lock = lambda reason: setattr(engine, "crypto_entry_lock_reason", reason)
+    engine._handle_liquidation_safety_failure = AsyncMock()
+
+    status = asyncio.run(
+        engine._audit_protection_orders(
+            "KORU/USDT",
+            pos=pos,
+            expected_tp=False,
+            expected_sl=True,
+            alert=True,
+        )
+    )
+
+    assert status["status"] == "OK"
+    assert status["sl_present"] is True
+    assert status["liquidation_safety"] == "UNVERIFIED_EXTERNAL_SL_PRESERVED"
+    assert "FILLED_UNVERIFIED_LIQUIDATION" in engine.crypto_entry_lock_reason
+    assert engine.exchange.cancelled == []
+    assert not [order for order in engine.exchange.created if order["type"] == "market"]
+    engine._handle_liquidation_safety_failure.assert_not_awaited()

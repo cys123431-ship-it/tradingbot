@@ -128,3 +128,21 @@ def test_close_position_rejects_invalid_parameter_combinations():
             raise AssertionError("closePosition market trigger with price must be rejected")
 
     asyncio.run(scenario())
+
+
+def test_normalize_preserves_manual_close_position_fields():
+    normalized = BinanceAlgoOrderGateway.normalize({
+        "algoId": 77,
+        "clientAlgoId": "manual-stop",
+        "symbol": "KORUUSDT",
+        "orderType": "STOP_MARKET",
+        "side": "BUY",
+        "triggerPrice": "467.14",
+        "closePosition": "true",
+        "positionSide": "BOTH",
+        "workingType": "CONTRACT_PRICE",
+        "algoStatus": "NEW",
+    })
+    assert normalized["closePosition"] is True
+    assert normalized["positionSide"] == "BOTH"
+    assert normalized["triggerPrice"] == "467.14"
