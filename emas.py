@@ -155,6 +155,16 @@ from utbreakout.relative_strength_pullback import (
     evaluate_relative_strength_pullback_trend,
     resolve_entry_strategy,
 )
+from utbreakout.qh_flow import (
+    QH_FLOW_STRATEGY,
+    TRIPLE_ALPHA_STRATEGY,
+    boundary_phase as qh_boundary_phase,
+    default_qh_flow_config,
+    evaluate_l2_gate,
+    evaluate_qh_flow,
+    quarter_hour_boundary_ms,
+    summarize_agg_trades,
+)
 from utbreakout.market_context import build_market_context
 from utbreakout.exit_policy import evaluate_time_stop, evaluate_signal_invalid_exit
 from utbreakout.ev_adaptive import (
@@ -515,7 +525,9 @@ UTBREAKOUT_STRATEGIES = {
     UTBOT_FILTERED_BREAKOUT_STRATEGY,
     UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY,
     ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+    QH_FLOW_STRATEGY,
     DUAL_ALPHA_STRATEGY,
+    TRIPLE_ALPHA_STRATEGY,
 }
 UTBREAKOUT_RECENT_LOSS_COOLDOWN_SECONDS = 7200.0
 UTBREAKOUT_RECENT_LOSS_COOLDOWN_MIN_LOSS_USDT = 2.0
@@ -547,7 +559,9 @@ STRATEGY_DISPLAY_NAMES = {
     UTBOT_FILTERED_BREAKOUT_STRATEGY: 'UTBOT_FILTERED_BREAKOUT_V1',
     UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY: 'UTBOT_ADAPTIVE_TIMEFRAME_V1',
     ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND: 'RELATIVE_STRENGTH_PULLBACK_TREND',
+    QH_FLOW_STRATEGY: 'QH_FLOW',
     DUAL_ALPHA_STRATEGY: 'DUAL_ALPHA',
+    TRIPLE_ALPHA_STRATEGY: 'TRIPLE_ALPHA',
 }
 UT_HYBRID_TIMING_LABELS = {
     'utrsibb': 'RSI+BB',
@@ -2340,6 +2354,13 @@ def build_default_utbot_filtered_breakout_config():
         'dual_alpha_direction_filter_timeframe': '4h',
         'dual_alpha_direction_filter_htf': '1d',
         'dual_alpha_single_signal_risk_multiplier': 0.60,
+        'triple_alpha_three_signal_risk_multiplier': 1.00,
+        'triple_alpha_two_signal_risk_multiplier': 0.85,
+        'triple_alpha_single_signal_risk_multiplier': 0.55,
+        'qh_flow': default_qh_flow_config(),
+        'qh_flow_live_enabled': False,
+        'qh_flow_confirmation_enabled': True,
+        'l2_gate_enabled': True,
         'entry_strategy': ENTRY_STRATEGY_UT_BREAKOUT,
         'relative_strength_pullback_trend': default_relative_strength_pullback_config(),
         'relative_strength_pullback_trend_shadow_enabled': True,
@@ -5386,6 +5407,10 @@ class SignalEngine(BaseEngine):
         self.relative_strength_pullback_last_decisions = {}  # symbol -> latest shadow/live decision
         self.relative_strength_pullback_eval_cache = {}  # short-lived scanner evaluation cache
         self.dual_alpha_last_status = {}  # symbol -> latest dual alpha selection summary
+        self.qh_flow_signal_cache = {}  # symbol:boundary -> live quarter-hour evaluation
+        self.qh_flow_last_status = {}  # symbol -> latest QH-Flow status
+        self.l2_gate_cache = {}  # symbol -> short-lived shared L2 state
+        self.triple_alpha_last_status = {}  # symbol -> latest triple strategy summary
         self.last_live_entry_snapshot = {}  # latest confirmed live entry, for status fallback only
         self.utbreakout_adaptive_tf_state = {}  # symbol -> selected TF stability state
         self.utbreakout_adaptive_last_decision_ts = {}  # symbol -> tf -> last closed candle evaluated
@@ -5575,6 +5600,10 @@ class SignalEngine(BaseEngine):
         self.relative_strength_pullback_last_decisions = {}
         self.relative_strength_pullback_eval_cache = {}
         self.dual_alpha_last_status = {}
+        self.qh_flow_signal_cache = {}
+        self.qh_flow_last_status = {}
+        self.l2_gate_cache = {}
+        self.triple_alpha_last_status = {}
         self.last_live_entry_snapshot = {}
         self.utbreakout_adaptive_tf_state = {}
         self.utbreakout_adaptive_last_decision_ts = {}
@@ -7951,7 +7980,7 @@ class SignalEngine(BaseEngine):
         if (
             active_strategy == ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
             or (
-                active_strategy != DUAL_ALPHA_STRATEGY
+                active_strategy not in {DUAL_ALPHA_STRATEGY, TRIPLE_ALPHA_STRATEGY}
                 and entry_strategy_key == ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
             )
         ):
@@ -15213,6 +15242,36 @@ class SignalEngine(BaseEngine):
         except Exception:
             logger.debug("RSPT structure stop values unavailable for %s", symbol, exc_info=True)
 
+        l2_gate = await self._evaluate_shared_l2_gate(symbol, cfg, force_refresh=force_reprocess)
+        status['l2_gate'] = l2_gate
+        status['l2_state'] = l2_gate.get('state')
+        status['l2_risk_multiplier'] = l2_gate.get('risk_multiplier')
+        if not l2_gate.get('allowed', False):
+            return _finish(
+                None,
+                f"REJECTED_L2_STRESSED: {l2_gate.get('reason')}",
+                'REJECTED_L2_STRESSED',
+                record_failure=True,
+                side=side,
+            )
+        qh_confirmation = await self._qh_flow_confirmation(
+            symbol,
+            side,
+            cfg,
+            force_reprocess=force_reprocess,
+        )
+        status['qh_confirmation'] = qh_confirmation
+        status['qh_confirmation_state'] = qh_confirmation.get('state')
+        status['qh_confirmation_risk_multiplier'] = qh_confirmation.get('risk_multiplier')
+        if not qh_confirmation.get('allowed', True):
+            return _finish(
+                None,
+                f"{qh_confirmation.get('reject_code') or 'REJECTED_QH_CONFIRMATION'}: {qh_confirmation.get('reason')}",
+                qh_confirmation.get('reject_code') or 'REJECTED_QH_CONFIRMATION',
+                record_failure=False,
+                side=side,
+            )
+
         market_quality = self._evaluate_utbreakout_market_quality(side, cfg, filter_values)
         status['market_quality'] = market_quality
         status['market_quality_summary'] = market_quality.get('summary')
@@ -15231,7 +15290,9 @@ class SignalEngine(BaseEngine):
         leverage = int(max(1.0, float(common_cfg.get('leverage', 5) or 5)))
         market_quality_multiplier = max(0.0, min(1.0, float(market_quality.get('risk_multiplier', 1.0) or 1.0)))
         rspt_size_multiplier = max(0.0, min(1.0, float(decision_logs.get('size_multiplier', decision_logs.get('risk_multiplier', 1.0)) or 1.0)))
-        risk_multiplier = market_quality_multiplier * rspt_size_multiplier
+        l2_multiplier = max(0.0, min(1.0, float(l2_gate.get('risk_multiplier', 1.0) or 0.0)))
+        qh_multiplier = max(0.0, min(1.0, float(qh_confirmation.get('risk_multiplier', 1.0) or 0.0)))
+        risk_multiplier = market_quality_multiplier * rspt_size_multiplier * l2_multiplier * qh_multiplier
         risk_budget = resolve_utbreakout_risk_budget(
             balance_for_risk,
             cfg,
@@ -15307,6 +15368,12 @@ class SignalEngine(BaseEngine):
             'market_quality_risk_multiplier': market_quality_multiplier,
             'rspt_size_multiplier': rspt_size_multiplier,
             'rspt_risk_multiplier': risk_multiplier,
+            'l2_gate': l2_gate,
+            'l2_state': l2_gate.get('state'),
+            'l2_risk_multiplier': l2_multiplier,
+            'qh_confirmation': qh_confirmation,
+            'qh_confirmation_state': qh_confirmation.get('state'),
+            'qh_confirmation_risk_multiplier': qh_multiplier,
             'market_quality_summary': market_quality.get('summary'),
             'fixed_take_profit_enabled': bool(cfg.get('fixed_take_profit_enabled', True)),
             'partial_take_profit_enabled': bool(cfg.get('partial_take_profit_enabled', True)),
@@ -15585,6 +15652,462 @@ class SignalEngine(BaseEngine):
             '안내: 스캐너·리스크·TP/SL·주문 안전 경로는 기존 로직을 그대로 사용합니다.',
         ])
         return "\n".join(lines)
+
+    def _qh_flow_runtime_config(self, cfg=None):
+        source = dict(cfg or {})
+        base = default_qh_flow_config()
+        nested = source.get('qh_flow')
+        if isinstance(nested, dict):
+            base.update(nested)
+        aliases = {
+            'qh_flow_live_enabled': 'qh_flow_live_enabled',
+            'qh_flow_confirmation_enabled': 'qh_confirmation_enabled',
+            'l2_gate_enabled': 'l2_gate_enabled',
+            'triple_alpha_three_signal_risk_multiplier': 'triple_three_signal_multiplier',
+            'triple_alpha_two_signal_risk_multiplier': 'triple_two_signal_multiplier',
+            'triple_alpha_single_signal_risk_multiplier': 'triple_single_signal_multiplier',
+        }
+        for source_key, target_key in aliases.items():
+            if source_key in source:
+                base[target_key] = source[source_key]
+        return base
+
+    async def _qh_flow_fetch_trade_window(self, symbol, start_ms, end_ms):
+        rest_symbol = self.ctrl._build_binance_futures_rest_symbol(symbol)
+        if not rest_symbol:
+            return []
+        rows = await self.ctrl._fetch_binance_public_json(
+            '/fapi/v1/aggTrades',
+            {
+                'symbol': rest_symbol,
+                'startTime': int(start_ms),
+                'endTime': int(end_ms),
+                'limit': 1000,
+            },
+        )
+        return rows if isinstance(rows, list) else []
+
+    async def _evaluate_shared_l2_gate(self, symbol, cfg=None, *, force_refresh=False):
+        qh_cfg = self._qh_flow_runtime_config(cfg)
+        if not bool(qh_cfg.get('l2_gate_enabled', True)) or self.is_upbit_mode():
+            return {
+                'state': 'disabled',
+                'allowed': True,
+                'risk_multiplier': 1.0,
+                'reason': 'L2 gate disabled',
+            }
+        canonical = self._canonical_futures_symbol(symbol)
+        now = time.time()
+        if not isinstance(getattr(self, 'l2_gate_cache', None), dict):
+            self.l2_gate_cache = {}
+        cached = self.l2_gate_cache.get(canonical)
+        if (
+            not force_refresh
+            and isinstance(cached, dict)
+            and now - float(cached.get('cached_at', 0.0) or 0.0) < 5.0
+        ):
+            return dict(cached.get('data') or {})
+        fetcher = getattr(getattr(self, 'ctrl', None), '_fetch_binance_public_json', None)
+        if not callable(fetcher):
+            result = {
+                'state': 'unavailable',
+                'allowed': True,
+                'risk_multiplier': 1.0,
+                'reason': 'L2 fetcher unavailable in this runtime',
+            }
+            self.l2_gate_cache[canonical] = {'cached_at': now, 'data': dict(result)}
+            return result
+        try:
+            rest_symbol = self.ctrl._build_binance_futures_rest_symbol(canonical)
+            depth = await fetcher(
+                '/fapi/v1/depth',
+                {'symbol': rest_symbol, 'limit': 20},
+            )
+            result = evaluate_l2_gate(depth, qh_cfg)
+        except Exception as exc:
+            result = {
+                'state': 'stressed',
+                'allowed': False,
+                'risk_multiplier': 0.0,
+                'reason': f'L2 fetch failed: {type(exc).__name__}: {exc}',
+                'error': str(exc),
+            }
+        self.l2_gate_cache[canonical] = {'cached_at': now, 'data': dict(result)}
+        return result
+
+    async def _fetch_qh_flow_evaluation(self, symbol, cfg=None, *, force_refresh=False, now_ms=None):
+        qh_cfg = self._qh_flow_runtime_config(cfg)
+        canonical = self._canonical_futures_symbol(symbol)
+        now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+        phase = qh_boundary_phase(now_ms, qh_cfg)
+        boundary_ms = int(phase['boundary_ms'])
+        cache_key = f'{canonical}:{boundary_ms}'
+        if not isinstance(getattr(self, 'qh_flow_signal_cache', None), dict):
+            self.qh_flow_signal_cache = {}
+        cached = self.qh_flow_signal_cache.get(cache_key)
+        if not force_refresh and isinstance(cached, dict):
+            cached_phase = str(cached.get('phase') or '')
+            if cached_phase in {'ready', 'stale'}:
+                return dict(cached)
+        status = {
+            'strategy': STRATEGY_DISPLAY_NAMES.get(QH_FLOW_STRATEGY, 'QH_FLOW'),
+            'entry_strategy': QH_FLOW_STRATEGY,
+            'symbol': canonical,
+            'phase': phase['phase'],
+            'boundary_ms': boundary_ms,
+            'capture_end_ms': phase['capture_end_ms'],
+            'boundary_age_seconds': phase['age_seconds'],
+            'seconds_to_next_boundary': phase['seconds_to_next_boundary'],
+            'allowed': False,
+            'side': None,
+            'score': 0.0,
+            'risk_multiplier': 0.0,
+        }
+        if phase['phase'] != 'ready':
+            status['reason'] = (
+                'QH collecting first 10 seconds'
+                if phase['phase'] == 'collecting'
+                else 'QH signal window expired'
+            )
+            self.qh_flow_signal_cache[cache_key] = dict(status)
+            return status
+
+        capture_ms = max(1, int(float(qh_cfg.get('capture_seconds', 10) or 10) * 1000))
+        baseline_windows = max(1, int(qh_cfg.get('baseline_windows', 8) or 8))
+        current_task = self._qh_flow_fetch_trade_window(
+            canonical,
+            boundary_ms,
+            boundary_ms + capture_ms - 1,
+        )
+        previous_boundaries = [
+            boundary_ms - (index * 15 * 60 * 1000)
+            for index in range(1, baseline_windows + 1)
+        ]
+        baseline_tasks = [
+            self._qh_flow_fetch_trade_window(
+                canonical,
+                previous_boundary,
+                previous_boundary + capture_ms - 1,
+            )
+            for previous_boundary in previous_boundaries
+        ]
+        results = await asyncio.gather(current_task, *baseline_tasks, return_exceptions=True)
+        current_rows = [] if isinstance(results[0], Exception) else results[0]
+        baseline_snapshots = []
+        baseline_errors = []
+        for boundary, result in zip(previous_boundaries, results[1:]):
+            if isinstance(result, Exception):
+                baseline_errors.append(f'{boundary}:{type(result).__name__}')
+                continue
+            snapshot = summarize_agg_trades(
+                result,
+                start_ms=boundary,
+                end_ms=boundary + capture_ms - 1,
+            )
+            if snapshot.get('total_notional', 0.0) > 0:
+                baseline_snapshots.append(snapshot)
+        current_snapshot = summarize_agg_trades(
+            current_rows,
+            start_ms=boundary_ms,
+            end_ms=boundary_ms + capture_ms - 1,
+        )
+        l2_gate, derivatives = await asyncio.gather(
+            self._evaluate_shared_l2_gate(canonical, cfg, force_refresh=force_refresh),
+            self._fetch_utbreakout_futures_context(canonical),
+        )
+        decision = evaluate_qh_flow(
+            current_snapshot,
+            baseline_snapshots,
+            l2_gate,
+            derivatives,
+            qh_cfg,
+        )
+        status.update({
+            'allowed': bool(decision.allowed),
+            'side': decision.side,
+            'score': float(decision.score),
+            'risk_multiplier': float(decision.risk_multiplier),
+            'reason': decision.reason,
+            'metrics': dict(decision.metrics),
+            'l2_gate': dict(l2_gate or {}),
+            'futures_context': dict(derivatives or {}),
+            'current_trade_count': current_snapshot.get('trade_count'),
+            'current_notional': current_snapshot.get('total_notional'),
+            'current_imbalance': current_snapshot.get('imbalance'),
+            'current_return_pct': current_snapshot.get('return_pct'),
+            'entry_reference_price': current_snapshot.get('last_price'),
+            'baseline_windows_loaded': len(baseline_snapshots),
+            'baseline_errors': baseline_errors,
+        })
+        self.qh_flow_signal_cache[cache_key] = dict(status)
+        if not isinstance(getattr(self, 'qh_flow_last_status', None), dict):
+            self.qh_flow_last_status = {}
+        self.qh_flow_last_status[canonical] = dict(status)
+        return status
+
+    async def _qh_flow_confirmation(self, symbol, side, cfg=None, *, force_reprocess=False):
+        qh_cfg = self._qh_flow_runtime_config(cfg)
+        if not bool(qh_cfg.get('qh_confirmation_enabled', True)):
+            return {
+                'state': 'disabled',
+                'allowed': True,
+                'risk_multiplier': 1.0,
+                'reason': 'QH confirmation disabled',
+            }
+        now_ms = int(time.time() * 1000)
+        phase = qh_boundary_phase(now_ms, qh_cfg)
+        pre_boundary = max(
+            0.0,
+            float(qh_cfg.get('qh_confirmation_pre_boundary_seconds', 180) or 180),
+        )
+        if phase['phase'] == 'stale' and 0.0 < phase['seconds_to_next_boundary'] <= pre_boundary:
+            return {
+                'state': 'pending',
+                'allowed': False,
+                'risk_multiplier': 0.0,
+                'reason': (
+                    f"QH boundary in {phase['seconds_to_next_boundary']:.0f}s; "
+                    'wait for first 10-second flow'
+                ),
+                'reject_code': 'REJECTED_QH_CONFIRMATION_PENDING',
+            }
+        if phase['phase'] != 'ready':
+            return {
+                'state': 'not_applicable',
+                'allowed': True,
+                'risk_multiplier': 1.0,
+                'reason': f"QH confirmation not active ({phase['phase']})",
+            }
+        qh_status = await self._fetch_qh_flow_evaluation(
+            symbol,
+            cfg,
+            force_refresh=force_reprocess,
+            now_ms=now_ms,
+        )
+        if qh_status.get('allowed') and qh_status.get('side') == side:
+            return {
+                'state': 'confirmed',
+                'allowed': True,
+                'risk_multiplier': 1.0,
+                'reason': qh_status.get('reason'),
+                'qh_flow': qh_status,
+            }
+        if qh_status.get('allowed') and qh_status.get('side') in {'long', 'short'}:
+            if bool(qh_cfg.get('qh_confirmation_opposite_blocks', True)):
+                return {
+                    'state': 'conflict',
+                    'allowed': False,
+                    'risk_multiplier': 0.0,
+                    'reason': (
+                        f"QH {str(qh_status.get('side')).upper()} conflicts with "
+                        f"{str(side).upper()}"
+                    ),
+                    'reject_code': 'REJECTED_QH_DIRECTION_CONFLICT',
+                    'qh_flow': qh_status,
+                }
+        multiplier = max(
+            0.0,
+            min(1.0, float(qh_cfg.get('qh_confirmation_no_signal_multiplier', 0.60) or 0.60)),
+        )
+        return {
+            'state': 'no_signal',
+            'allowed': True,
+            'risk_multiplier': multiplier,
+            'reason': f"QH has no accepted signal: {qh_status.get('reason')}",
+            'qh_flow': qh_status,
+        }
+
+    async def _calculate_qh_flow_signal(
+        self,
+        symbol,
+        df,
+        strategy_params,
+        *,
+        force_reprocess=False,
+    ):
+        cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+        qh_cfg = self._qh_flow_runtime_config(cfg)
+        canonical = self._canonical_futures_symbol(symbol)
+        self._clear_utbot_filtered_breakout_entry_plan(canonical)
+        status = {
+            'strategy': STRATEGY_DISPLAY_NAMES.get(QH_FLOW_STRATEGY, 'QH_FLOW'),
+            'entry_strategy': QH_FLOW_STRATEGY,
+            'symbol': canonical,
+            'stage': 'waiting',
+        }
+
+        def _finish(sig, reason, code=None):
+            status['reason'] = reason
+            status['accepted_side'] = sig
+            if code:
+                status['reject_code'] = code
+            if sig:
+                status['accepted_code'] = 'ACCEPTED_ENTRY'
+                status['stage'] = 'entry_ready'
+            self.qh_flow_last_status[canonical] = dict(status)
+            self._store_utbot_filtered_breakout_status(canonical, status)
+            self.last_entry_reason[canonical] = reason
+            return sig, reason, status
+
+        if self.is_upbit_mode():
+            return _finish(None, 'QH-Flow unsupported in Upbit mode', 'REJECTED_UNSUPPORTED_MODE')
+        if not bool(qh_cfg.get('qh_flow_enabled', True)) or not bool(qh_cfg.get('qh_flow_live_enabled', False)):
+            return _finish(None, 'QH-Flow live disabled', 'REJECTED_QH_LIVE_DISABLED')
+
+        qh_status = await self._fetch_qh_flow_evaluation(
+            canonical,
+            cfg,
+            force_refresh=force_reprocess,
+        )
+        status.update(qh_status)
+        if not qh_status.get('allowed') or qh_status.get('side') not in {'long', 'short'}:
+            return _finish(None, f"QH waiting: {qh_status.get('reason')}")
+        side = qh_status['side']
+        if not self.is_trade_direction_allowed(side):
+            return _finish(None, self.format_trade_direction_block_reason(side), 'REJECTED_DIRECTION_FILTER')
+
+        daily_count, daily_pnl = self.db.get_daily_stats()
+        daily_entries = self.db.get_daily_entry_count()
+        status['daily_pnl'] = daily_pnl
+        status['daily_entries'] = daily_entries
+        if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
+            return _finish(None, f"risk_limit_blocked: daily pnl {daily_pnl:.2f}", 'REJECTED_DAILY_LOSS_LIMIT')
+        if int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
+            return _finish(None, f"risk_limit_blocked: daily trade count {daily_entries}", 'REJECTED_DAILY_TRADE_LIMIT')
+
+        try:
+            ohlcv = await asyncio.to_thread(
+                self.market_data_exchange.fetch_ohlcv,
+                canonical,
+                '15m',
+                limit=220,
+            )
+        except Exception as exc:
+            return _finish(None, f'QH 15m OHLCV unavailable: {exc}', 'REJECTED_QH_DATA')
+        rows = self._relative_strength_pullback_rows_from_ohlcv(ohlcv)
+        closed_rows = completed_candle_rows(rows, '15m', {'exclude_incomplete_live_candle': True})
+        closed = pd.DataFrame(closed_rows)
+        for column in ['open', 'high', 'low', 'close', 'volume']:
+            if column in closed.columns:
+                closed[column] = pd.to_numeric(closed[column], errors='coerce')
+        closed = closed.dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+        if len(closed) < 30:
+            return _finish(None, 'QH insufficient completed 15m candles', 'REJECTED_QH_DATA')
+        metrics = self._calculate_utbreakout_timeframe_metrics(closed, cfg)
+        atr_value = _safe_float_or_none(metrics.get('atr'))
+        if atr_value is None or atr_value <= 0:
+            return _finish(None, 'QH ATR unavailable', 'REJECTED_ATR_TOO_LOW')
+        entry_price = _safe_float_or_none(qh_status.get('entry_reference_price'))
+        if entry_price is None or entry_price <= 0:
+            ticker = await asyncio.to_thread(self.market_data_exchange.fetch_ticker, canonical)
+            entry_price = _safe_float_or_none((ticker or {}).get('last') or (ticker or {}).get('close'))
+        if entry_price is None or entry_price <= 0:
+            return _finish(None, 'QH entry price unavailable', 'REJECTED_QH_DATA')
+
+        filter_values = dict(metrics or {})
+        filter_values.update(qh_status.get('futures_context') or {})
+        filter_values['entry_price'] = entry_price
+        filter_values['entry_timeframe'] = '15m'
+        market_quality = self._evaluate_utbreakout_market_quality(side, cfg, filter_values)
+        status['market_quality'] = market_quality
+        if market_quality.get('hard_block') or market_quality.get('state') is False:
+            return _finish(None, f"market_quality_rejected: {market_quality.get('summary')}", 'REJECTED_MARKET_QUALITY')
+        l2_gate = dict(qh_status.get('l2_gate') or {})
+        if not l2_gate.get('allowed', False):
+            return _finish(None, f"L2 stressed: {l2_gate.get('reason')}", 'REJECTED_L2_STRESSED')
+
+        total_balance, free_balance, _ = await self.get_balance_info()
+        balance_for_risk = total_balance if total_balance > 0 else free_balance
+        common_cfg = self.get_runtime_common_settings()
+        leverage = int(max(1.0, float(common_cfg.get('leverage', 5) or 5)))
+        risk_multiplier = min(
+            1.0,
+            max(0.0, float(qh_status.get('risk_multiplier', 0.0) or 0.0)),
+            max(0.0, float(market_quality.get('risk_multiplier', 1.0) or 1.0)),
+            max(0.0, float(l2_gate.get('risk_multiplier', 0.0) or 0.0)),
+        )
+        risk_budget = resolve_utbreakout_risk_budget(balance_for_risk, cfg, multiplier=risk_multiplier)
+        try:
+            plan = calculate_risk_plan(
+                side=side,
+                entry_price=entry_price,
+                atr_value=atr_value,
+                stop_atr_multiplier=float(qh_cfg.get('stop_atr_multiplier', 1.25) or 1.25),
+                ut_stop=None,
+                structure_stop=None,
+                structure_buffer_atr=0.0,
+                take_profit_r_multiple=float(qh_cfg.get('take_profit_r_multiple', 2.50) or 2.50),
+                take_profit_front_run_atr=0.0,
+                take_profit_front_run_pct=0.0,
+                min_risk_reward=min(2.0, float(qh_cfg.get('take_profit_r_multiple', 2.50) or 2.50)),
+                balance_usdt=balance_for_risk,
+                risk_per_trade_percent=risk_budget['risk_per_trade_percent'],
+                max_risk_per_trade_usdt=risk_budget['max_risk_per_trade_usdt'],
+                leverage=leverage,
+            )
+            plan = cap_utbreakout_risk_plan_to_margin(
+                plan,
+                free_balance=free_balance,
+                leverage=leverage,
+                entry_price=entry_price,
+            )
+        except ValueError as exc:
+            return _finish(None, f'QH risk plan rejected: {exc}', 'REJECTED_QH_RISK_PLAN')
+
+        plan.update({
+            'strategy': QH_FLOW_STRATEGY,
+            'plan_symbol': canonical,
+            'entry_timeframe': '15m',
+            'exit_timeframe': cfg.get('exit_timeframe', '15m'),
+            'htf_timeframe': cfg.get('htf_timeframe', '1h'),
+            'entry_execution': 'market',
+            'decision_candle_ts': int(qh_status.get('boundary_ms') or 0),
+            'qh_boundary_ms': int(qh_status.get('boundary_ms') or 0),
+            'qh_score': float(qh_status.get('score') or 0.0),
+            'qh_risk_multiplier': risk_multiplier,
+            'qh_metrics': dict(qh_status.get('metrics') or {}),
+            'l2_gate': l2_gate,
+            'l2_state': l2_gate.get('state'),
+            'l2_risk_multiplier': l2_gate.get('risk_multiplier'),
+            'market_quality_summary': market_quality.get('summary'),
+            'atr': atr_value,
+            'atr_pct': metrics.get('atr_pct'),
+            'partial_take_profit_enabled': True,
+            'partial_take_profit_r_multiple': 1.25,
+            'partial_take_profit_ratio': 0.25,
+            'second_take_profit_enabled': True,
+            'second_take_profit_r_multiple': float(qh_cfg.get('take_profit_r_multiple', 2.50) or 2.50),
+            'second_take_profit_ratio': 0.50,
+            'atr_trailing_enabled': True,
+            'atr_trailing_activation_r': 1.50,
+            'atr_trailing_multiplier': 2.25,
+            'ev_time_stop_enabled': True,
+            'ev_time_stop_bars': 32,
+            'ev_time_stop_min_mfe_r': 0.50,
+        })
+        self._set_utbot_filtered_breakout_entry_plan(canonical, plan)
+        status['entry_plan'] = dict(plan)
+        return _finish(side, f"ACCEPTED_ENTRY: {qh_status.get('reason')}")
+
+    async def build_qh_flow_status_text(self, symbol=None):
+        cfg = self._get_utbot_filtered_breakout_config()
+        qh_cfg = self._qh_flow_runtime_config(cfg)
+        target = self._canonical_futures_symbol(symbol or self.current_utbreakout_candidate_symbol or 'BTC/USDT')
+        status = await self._fetch_qh_flow_evaluation(target, cfg, force_refresh=True)
+        l2 = status.get('l2_gate') if isinstance(status.get('l2_gate'), dict) else {}
+        metrics = status.get('metrics') if isinstance(status.get('metrics'), dict) else {}
+        return '\n'.join([
+            '📊 QH-Flow 전략 상태',
+            f"Symbol: {target}",
+            f"Live: {bool(qh_cfg.get('qh_flow_live_enabled', False))}",
+            f"Phase: {status.get('phase')} / boundary age {float(status.get('boundary_age_seconds', 0.0) or 0.0):.1f}s",
+            f"Signal: {str(status.get('side') or 'NONE').upper()} / allowed={bool(status.get('allowed'))}",
+            f"Score: {float(status.get('score', 0.0) or 0.0):.1f} / risk x{float(status.get('risk_multiplier', 0.0) or 0.0):.2f}",
+            f"Flow: imbalance={float(status.get('current_imbalance', 0.0) or 0.0):+.3f}, notional={float(status.get('current_notional', 0.0) or 0.0):.0f}, z={float(metrics.get('imbalance_z', 0.0) or 0.0):+.2f}",
+            f"L2: {str(l2.get('state') or 'unknown').upper()} / {l2.get('reason') or '-'}",
+            f"Reason: {status.get('reason') or '-'}",
+        ])
+
 
     def _dual_alpha_strategy_params(self, strategy_params, branch):
         params = copy.deepcopy(strategy_params if isinstance(strategy_params, dict) else {})
@@ -16128,6 +16651,247 @@ class SignalEngine(BaseEngine):
         if selected:
             return selected['side'], final_status['reason'], final_status
         return None, final_status['reason'], final_status
+
+    def _triple_alpha_strategy_params(self, strategy_params, branch):
+        branch = str(branch or '').lower()
+        if branch in {ENTRY_STRATEGY_UT_BREAKOUT, ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND}:
+            params = self._dual_alpha_strategy_params(strategy_params, branch)
+            cfg = dict(params.get('UTBotFilteredBreakoutV1') or {})
+            qh_cfg = self._qh_flow_runtime_config(cfg)
+            qh_cfg['qh_confirmation_enabled'] = False
+            cfg['qh_flow'] = qh_cfg
+            cfg['qh_flow_confirmation_enabled'] = False
+            params['UTBotFilteredBreakoutV1'] = cfg
+            return params
+        params = copy.deepcopy(strategy_params if isinstance(strategy_params, dict) else {})
+        cfg = dict(params.get('UTBotFilteredBreakoutV1') or {})
+        qh_cfg = self._qh_flow_runtime_config(cfg)
+        qh_cfg['qh_flow_enabled'] = True
+        qh_cfg['qh_flow_live_enabled'] = True
+        qh_cfg['qh_confirmation_enabled'] = False
+        cfg['qh_flow'] = qh_cfg
+        cfg['qh_flow_live_enabled'] = True
+        cfg['qh_flow_confirmation_enabled'] = False
+        cfg['relative_strength_pullback_trend_live_enabled'] = False
+        cfg['entry_strategy'] = ENTRY_STRATEGY_UT_BREAKOUT
+        params['active_strategy'] = QH_FLOW_STRATEGY
+        params['UTBotFilteredBreakoutV1'] = cfg
+        return params
+
+    async def _calculate_triple_alpha_signal(
+        self,
+        symbol,
+        df,
+        strategy_params,
+        *,
+        force_reprocess=False,
+    ):
+        base_symbol = self._canonical_futures_symbol(symbol)
+        self._clear_utbot_filtered_breakout_entry_plan(base_symbol)
+        base_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+        qh_cfg = self._qh_flow_runtime_config(base_cfg)
+        multipliers = {
+            3: max(0.0, min(1.0, float(base_cfg.get('triple_alpha_three_signal_risk_multiplier', qh_cfg.get('triple_three_signal_multiplier', 1.0)) or 1.0))),
+            2: max(0.0, min(1.0, float(base_cfg.get('triple_alpha_two_signal_risk_multiplier', qh_cfg.get('triple_two_signal_multiplier', 0.85)) or 0.85))),
+            1: max(0.0, min(1.0, float(base_cfg.get('triple_alpha_single_signal_risk_multiplier', qh_cfg.get('triple_single_signal_multiplier', 0.55)) or 0.55))),
+        }
+
+        branch_results = []
+
+        ut_params = self._triple_alpha_strategy_params(strategy_params, ENTRY_STRATEGY_UT_BREAKOUT)
+        ut_sig, ut_reason, ut_status = await self._calculate_utbot_filtered_breakout_signal(
+            base_symbol,
+            df,
+            ut_params,
+            force_reprocess=force_reprocess,
+        )
+        ut_status = dict(ut_status or self._utbreakout_diag_for_symbol(base_symbol) or {})
+        ut_plan = (
+            dict(self._get_utbot_filtered_breakout_entry_plan(base_symbol, ut_sig) or {})
+            if ut_sig in {'long', 'short'}
+            else None
+        )
+        branch_results.append((ENTRY_STRATEGY_UT_BREAKOUT, 'UTBreakout', ut_sig, ut_reason, ut_status, ut_plan, 0))
+        self._clear_utbot_filtered_breakout_entry_plan(base_symbol)
+
+        rsp_params = self._triple_alpha_strategy_params(
+            strategy_params,
+            ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+        )
+        rsp_sig, rsp_reason, rsp_status = await self._calculate_relative_strength_pullback_signal(
+            base_symbol,
+            df,
+            rsp_params,
+            force_reprocess=force_reprocess,
+            forced_direction=None,
+            direction_source='RSPT-v2 residual strength',
+            resolve_ut_direction=False,
+        )
+        rsp_status = dict(rsp_status or self._utbreakout_diag_for_symbol(base_symbol) or {})
+        rsp_symbol = self._canonical_futures_symbol(
+            rsp_status.get('plan_symbol') or rsp_status.get('symbol') or base_symbol
+        )
+        rsp_plan = (
+            dict(self._get_utbot_filtered_breakout_entry_plan(rsp_symbol, rsp_sig) or {})
+            if rsp_sig in {'long', 'short'}
+            else None
+        )
+        branch_results.append((
+            ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+            'RSPT-v2',
+            rsp_sig,
+            rsp_reason,
+            rsp_status,
+            rsp_plan,
+            1,
+        ))
+        self._clear_utbot_filtered_breakout_entry_plan(rsp_symbol)
+
+        qh_params = self._triple_alpha_strategy_params(strategy_params, QH_FLOW_STRATEGY)
+        qh_sig, qh_reason, qh_status = await self._calculate_qh_flow_signal(
+            base_symbol,
+            df,
+            qh_params,
+            force_reprocess=force_reprocess,
+        )
+        qh_status = dict(qh_status or {})
+        qh_symbol = self._canonical_futures_symbol(
+            qh_status.get('plan_symbol') or qh_status.get('symbol') or base_symbol
+        )
+        qh_plan = (
+            dict(self._get_utbot_filtered_breakout_entry_plan(qh_symbol, qh_sig) or {})
+            if qh_sig in {'long', 'short'}
+            else None
+        )
+        branch_results.append((QH_FLOW_STRATEGY, 'QH-Flow', qh_sig, qh_reason, qh_status, qh_plan, 2))
+        self._clear_utbot_filtered_breakout_entry_plan(qh_symbol)
+
+        choices = []
+        for key, label, side, reason, status, plan, priority in branch_results:
+            if side not in {'long', 'short'} or not isinstance(plan, dict):
+                continue
+            choices.append({
+                'key': key,
+                'label': label,
+                'side': side,
+                'reason': reason,
+                'status': status,
+                'plan': plan,
+                'score': self._dual_alpha_score(key, side, status, plan),
+                'priority': priority,
+            })
+
+        unique_sides = {choice['side'] for choice in choices}
+        selected = None
+        agreement_state = 'none'
+        agreement_multiplier = 0.0
+        if len(unique_sides) > 1:
+            agreement_state = 'conflict'
+        elif choices:
+            confirmation_count = len(choices)
+            agreement_state = {1: 'single', 2: 'double', 3: 'triple'}.get(confirmation_count, 'confirmed')
+            agreement_multiplier = multipliers.get(confirmation_count, multipliers[1])
+            selected = sorted(
+                choices,
+                key=lambda item: (-float(item.get('score') or 0.0), int(item.get('priority') or 0)),
+            )[0]
+
+        statuses = {key: status for key, _, _, _, status, _, _ in branch_results}
+        reasons = {key: reason for key, _, _, reason, _, _, _ in branch_results}
+        final_status = dict((selected or {}).get('status') or qh_status or rsp_status or ut_status or {})
+        if selected:
+            selected_plan = self._dual_alpha_scale_plan(selected['plan'], agreement_multiplier)
+            selected_plan.pop('dual_alpha_risk_multiplier', None)
+            selected_plan.update({
+                'strategy': selected['key'],
+                'triple_alpha_selected_strategy': selected['key'],
+                'triple_alpha_score': selected['score'],
+                'triple_alpha_agreement_state': agreement_state,
+                'triple_alpha_confirmation_count': len(choices),
+                'triple_alpha_risk_multiplier': agreement_multiplier,
+            })
+            self._set_utbot_filtered_breakout_entry_plan(
+                selected_plan.get('plan_symbol') or base_symbol,
+                selected_plan,
+            )
+
+        summary = {
+            'enabled': True,
+            'utbreak': self._dual_alpha_light(statuses.get(ENTRY_STRATEGY_UT_BREAKOUT), 'UTBreakout'),
+            'rspt': self._dual_alpha_light(statuses.get(ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND), 'RSPT-v2'),
+            'qh_flow': self._dual_alpha_light(statuses.get(QH_FLOW_STRATEGY), 'QH-Flow'),
+            'agreement_state': agreement_state,
+            'agreement_risk_multiplier': agreement_multiplier,
+            'confirmation_count': len(choices),
+            'selected': selected.get('key') if selected else None,
+            'selected_label': selected.get('label') if selected else None,
+            'selected_side': selected.get('side') if selected else None,
+            'selection_score': selected.get('score') if selected else None,
+            'scores': {choice['key']: choice['score'] for choice in choices},
+        }
+        final_status.update({
+            'strategy': STRATEGY_DISPLAY_NAMES.get(TRIPLE_ALPHA_STRATEGY, 'TRIPLE_ALPHA'),
+            'entry_strategy': TRIPLE_ALPHA_STRATEGY,
+            'triple_alpha_enabled': True,
+            'triple_selected_strategy': summary['selected'],
+            'triple_alpha': summary,
+        })
+        if selected:
+            final_status.update({
+                'accepted_code': 'ACCEPTED_ENTRY',
+                'accepted_side': selected['side'],
+                'stage': 'entry_ready',
+                'reason': (
+                    f"TRIPLE_ALPHA {agreement_state} selected {selected['label']} "
+                    f"{selected['side'].upper()} at {agreement_multiplier:.0%} risk: "
+                    f"{selected['reason']}"
+                ),
+            })
+        else:
+            final_status['stage'] = 'waiting'
+            if agreement_state == 'conflict':
+                final_status['reject_code'] = 'REJECTED_TRIPLE_DIRECTION_CONFLICT'
+            final_status['reason'] = (
+                f"TRIPLE_ALPHA waiting ({agreement_state}): "
+                f"UT={reasons.get(ENTRY_STRATEGY_UT_BREAKOUT)}; "
+                f"RSPT={reasons.get(ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND)}; "
+                f"QH={reasons.get(QH_FLOW_STRATEGY)}"
+            )
+
+        canonical = self._canonical_futures_symbol(final_status.get('plan_symbol') or base_symbol)
+        if not isinstance(getattr(self, 'triple_alpha_last_status', None), dict):
+            self.triple_alpha_last_status = {}
+        self.triple_alpha_last_status[canonical] = dict(final_status)
+        self._store_utbot_filtered_breakout_status(canonical, final_status)
+        self.last_entry_reason[canonical] = final_status.get('reason')
+        if selected:
+            return selected['side'], final_status['reason'], final_status
+        return None, final_status['reason'], final_status
+
+    async def build_triple_alpha_status_text(self, symbol=None):
+        target = self._canonical_futures_symbol(symbol or self.current_utbreakout_candidate_symbol or 'BTC/USDT')
+        status = dict((getattr(self, 'triple_alpha_last_status', {}) or {}).get(target) or {})
+        summary = status.get('triple_alpha') if isinstance(status.get('triple_alpha'), dict) else {}
+        if not summary:
+            return '\n'.join([
+                '🚦 Triple 전략 상태',
+                f'Symbol: {target}',
+                '아직 Triple 평가 기록이 없습니다.',
+            ])
+        lines = [
+            '🚦 Triple 전략 상태',
+            f'Symbol: {target}',
+            f"Agreement: {str(summary.get('agreement_state') or 'none').upper()} / confirmations={int(summary.get('confirmation_count') or 0)} / risk x{float(summary.get('agreement_risk_multiplier', 0.0) or 0.0):.2f}",
+            f"Selected: {summary.get('selected_label') or 'NONE'} {str(summary.get('selected_side') or '').upper()}",
+        ]
+        for key, label in (('utbreak', 'UTBreak'), ('rspt', 'RSPT-v2'), ('qh_flow', 'QH-Flow')):
+            item = summary.get(key) if isinstance(summary.get(key), dict) else {}
+            lines.append(
+                f"{label}: {str(item.get('light') or 'gray').upper()} {str(item.get('side') or 'NONE').upper()} - {item.get('reason') or '-'}"
+            )
+        lines.append(f"Reason: {status.get('reason') or '-'}")
+        return '\n'.join(lines)
+
 
     def _resolve_dual_alpha_trading_mode(self, cfg, exchange_mode=None):
         cfg = cfg if isinstance(cfg, dict) else {}
@@ -17059,6 +17823,36 @@ class SignalEngine(BaseEngine):
                 status.update(futures_context)
         except Exception as e:
             status['futures_context_error'] = str(e)
+
+        l2_gate = await self._evaluate_shared_l2_gate(symbol, cfg, force_refresh=force_reprocess)
+        status['l2_gate'] = l2_gate
+        status['l2_state'] = l2_gate.get('state')
+        status['l2_risk_multiplier'] = l2_gate.get('risk_multiplier')
+        if not l2_gate.get('allowed', False):
+            return _finish(
+                None,
+                f"REJECTED_L2_STRESSED: {l2_gate.get('reason')}",
+                'REJECTED_L2_STRESSED',
+                record_failure=True,
+                side=side,
+            )
+        qh_confirmation = await self._qh_flow_confirmation(
+            symbol,
+            side,
+            cfg,
+            force_reprocess=force_reprocess,
+        )
+        status['qh_confirmation'] = qh_confirmation
+        status['qh_confirmation_state'] = qh_confirmation.get('state')
+        status['qh_confirmation_risk_multiplier'] = qh_confirmation.get('risk_multiplier')
+        if not qh_confirmation.get('allowed', True):
+            return _finish(
+                None,
+                f"{qh_confirmation.get('reject_code') or 'REJECTED_QH_CONFIRMATION'}: {qh_confirmation.get('reason')}",
+                qh_confirmation.get('reject_code') or 'REJECTED_QH_CONFIRMATION',
+                record_failure=False,
+                side=side,
+            )
         market_regime_context = {}
         try:
             market_regime_context = await self._fetch_utbreakout_market_regime_context(cfg)
@@ -17814,6 +18608,11 @@ class SignalEngine(BaseEngine):
             if continuation_decision is not None
             else 1.0
         )
+        l2_multiplier = max(0.0, min(1.0, float(l2_gate.get('risk_multiplier', 1.0) or 0.0)))
+        qh_confirmation_multiplier = max(
+            0.0,
+            min(1.0, float(qh_confirmation.get('risk_multiplier', 1.0) or 0.0)),
+        )
         if ev_decision is not None:
             volatility_multiplier = min(
                 1.0,
@@ -17826,12 +18625,16 @@ class SignalEngine(BaseEngine):
                 float(entry_edge_decision.risk_multiplier),
                 market_quality_multiplier,
                 volatility_multiplier,
+                l2_multiplier,
+                qh_confirmation_multiplier,
             )
         else:
             raw_final_risk_multiplier = (
                 short_risk_multiplier
                 * bias_continuation_multiplier
                 * market_quality_multiplier
+                * l2_multiplier
+                * qh_confirmation_multiplier
                 * strategy_risk_multiplier
                 * quality_score_v2_multiplier
                 * selector_quality_multiplier
@@ -18301,6 +19104,12 @@ class SignalEngine(BaseEngine):
             'market_quality_enabled': bool(cfg.get('market_quality_enabled', True)),
             'market_quality_risk_multiplier': market_quality_multiplier,
             'market_quality_summary': market_quality.get('summary'),
+            'l2_gate': l2_gate,
+            'l2_state': l2_gate.get('state'),
+            'l2_risk_multiplier': l2_multiplier,
+            'qh_confirmation': qh_confirmation,
+            'qh_confirmation_state': qh_confirmation.get('state'),
+            'qh_confirmation_risk_multiplier': qh_confirmation_multiplier,
             'selector_quality_risk_multiplier': selector_quality_multiplier,
             'selector_quality_score': selector_quality.get('score'),
             'selector_quality_summary': selector_quality.get('summary'),
@@ -31076,9 +31885,29 @@ class SignalEngine(BaseEngine):
             )
             is_bullish = sig == 'long'
             is_bearish = sig == 'short'
+        elif active_strategy == QH_FLOW_STRATEGY:
+            entry_mode = active_strategy
+            sig, entry_reason, _ = await self._calculate_qh_flow_signal(
+                symbol,
+                df,
+                strategy_params,
+                force_reprocess=force_utbreakout_reprocess,
+            )
+            is_bullish = sig == 'long'
+            is_bearish = sig == 'short'
         elif active_strategy == DUAL_ALPHA_STRATEGY:
             entry_mode = active_strategy
             sig, entry_reason, _ = await self._calculate_dual_alpha_signal(
+                symbol,
+                df,
+                strategy_params,
+                force_reprocess=force_utbreakout_reprocess,
+            )
+            is_bullish = sig == 'long'
+            is_bearish = sig == 'short'
+        elif active_strategy == TRIPLE_ALPHA_STRATEGY:
+            entry_mode = active_strategy
+            sig, entry_reason, _ = await self._calculate_triple_alpha_signal(
                 symbol,
                 df,
                 strategy_params,
@@ -42688,8 +43517,10 @@ class MainController:
             rsp_cfg['relative_strength_pullback_trend_live_enabled'] = True
             rsp_cfg['relative_strength_pullback_trend_paper_enabled'] = False
             rsp_cfg['forced_direction'] = None
-            rsp_cfg['direction_source'] = 'UTBreakout'
-            rsp_cfg['require_internal_trend_confirmation'] = False
+            rsp_cfg['direction_source'] = 'RSPT-v2 residual strength'
+            rsp_cfg['require_internal_trend_confirmation'] = True
+            rsp_cfg['rspt_v2_enabled'] = True
+            rsp_cfg['independent_direction_enabled'] = True
             await self.cfg.update_value(
                 ['signal_engine', 'strategy_params', 'active_strategy'],
                 ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
@@ -42746,9 +43577,8 @@ class MainController:
                 if not engine.running:
                     engine.start()
             return (
-                "RelativeStrengthPullbackTrend ON. "
-                "shared UT 4h/1d direction only; RSPT internal LONG/SHORT selection is disabled. "
-                "scanner/CoinSelector candidates and the existing live order path remain enabled."
+                "RSPT-v2 ON. BTC/ETH residual strength, independent LONG/SHORT direction, "
+                "prior impulse + pullback + reclaim, shared L2 gate and QH confirmation are enabled."
             )
 
         async def _deactivate_relative_strength_pullback_strategy():
@@ -42853,6 +43683,96 @@ class MainController:
                 engine.relative_strength_pullback_eval_cache = {}
                 engine.dual_alpha_last_status = {}
             return f"DUAL Alpha OFF. {notice}"
+
+        async def _activate_qh_flow_strategy():
+            await _ensure_signal_engine_active()
+            self.is_paused = False
+            current = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
+            qh_cfg = default_qh_flow_config()
+            if isinstance(current, dict) and isinstance(current.get('qh_flow'), dict):
+                qh_cfg.update(current.get('qh_flow'))
+            qh_cfg['qh_flow_enabled'] = True
+            qh_cfg['qh_flow_live_enabled'] = True
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], QH_FLOW_STRATEGY)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow'], qh_cfg)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow_live_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'l2_gate_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend_live_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol'], '')
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
+            engine = self._reset_signal_engine_runtime_state(reset_entry_cache=True, reset_exit_cache=True, reset_stateful_strategy=True)
+            if engine:
+                engine.qh_flow_signal_cache = {}
+                engine.qh_flow_last_status = {}
+                engine.l2_gate_cache = {}
+                if not engine.running:
+                    engine.start()
+            return 'QH-Flow ON. Quarter-hour first-10-second taker flow, L2 gate, funding/basis crowding and live order path are enabled.'
+
+        async def _deactivate_qh_flow_strategy():
+            notice = await _activate_utbreak_strategy()
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow_live_enabled'], False)
+            engine = self.engines.get('signal')
+            if engine:
+                engine.qh_flow_signal_cache = {}
+                engine.qh_flow_last_status = {}
+            return f'QH-Flow OFF. {notice}'
+
+        async def _activate_triple_alpha_strategy():
+            await _ensure_signal_engine_active()
+            self.is_paused = False
+            rsp_cfg = default_relative_strength_pullback_config()
+            rsp_cfg.update({
+                'entry_strategy': ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+                'relative_strength_pullback_trend_shadow_enabled': True,
+                'relative_strength_pullback_trend_live_enabled': True,
+                'relative_strength_pullback_trend_paper_enabled': False,
+                'rspt_v2_enabled': True,
+                'independent_direction_enabled': True,
+                'direction_source': 'RSPT-v2 residual strength',
+                'forced_direction': None,
+            })
+            qh_cfg = default_qh_flow_config()
+            qh_cfg['qh_flow_enabled'] = True
+            qh_cfg['qh_flow_live_enabled'] = True
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], TRIPLE_ALPHA_STRATEGY)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'entry_strategy'], ENTRY_STRATEGY_UT_BREAKOUT)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend'], rsp_cfg)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend_live_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow'], qh_cfg)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow_live_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'l2_gate_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'], 'auto')
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'auto_select_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol'], '')
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
+            engine = self._reset_signal_engine_runtime_state(reset_entry_cache=True, reset_exit_cache=True, reset_stateful_strategy=True)
+            if engine:
+                engine.qh_flow_signal_cache = {}
+                engine.qh_flow_last_status = {}
+                engine.triple_alpha_last_status = {}
+                engine.relative_strength_pullback_eval_cache = {}
+                if not engine.running:
+                    engine.start()
+            return 'TRIPLE Alpha ON. UTBreak + RSPT-v2 + QH-Flow are evaluated independently; conflicts block and 1/2/3 confirmations scale risk.'
+
+        async def _deactivate_triple_alpha_strategy():
+            notice = await _activate_utbreak_strategy()
+            engine = self.engines.get('signal')
+            if engine:
+                engine.triple_alpha_last_status = {}
+                engine.qh_flow_signal_cache = {}
+            return f'TRIPLE Alpha OFF. {notice}'
 
         async def _stop_utbreak_trading():
             await _ensure_signal_engine_active()
@@ -43230,8 +44150,12 @@ UTBot:
             active_label = "ON" if active_strategy in UTBREAKOUT_STRATEGIES else f"OFF ({active_strategy.upper()})"
             if active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY:
                 active_label = "ON (ADAPTIVE TF)"
+            elif active_strategy == QH_FLOW_STRATEGY:
+                active_label = "ON (QH FLOW)"
             elif active_strategy == DUAL_ALPHA_STRATEGY:
                 active_label = "ON (DUAL ALPHA)"
+            elif active_strategy == TRIPLE_ALPHA_STRATEGY:
+                active_label = "ON (TRIPLE ALPHA)"
             last_reason = diag.get('reject_code') or diag.get('accepted_code') or diag.get('reason') or '대기'
             diag_summary = format_utbreakout_diagnostic_summary()
             set_id = normalize_utbreakout_set_id(cfg.get('active_set_id') or cfg.get('profile'), UTBREAKOUT_DEFAULT_SET_ID)
@@ -43243,10 +44167,13 @@ UTBot:
             adaptive_summary = diag.get('adaptive_timeframe_summary') or '아직 Adaptive TF 분석 기록 없음'
             strategy_adaptation_summary = diag.get('strategy_adaptation_summary') or '아직 전략 적응 기록 없음'
             menu_title = (
-                'UTBreak 전략 메뉴 (Dual Alpha)'
+                'UTBreak 전략 메뉴 (Triple Alpha)'
+                if active_strategy == TRIPLE_ALPHA_STRATEGY
+                else 'UTBreak 전략 메뉴 (QH-Flow)'
+                if active_strategy == QH_FLOW_STRATEGY
+                else 'UTBreak 전략 메뉴 (Dual Alpha)'
                 if active_strategy == DUAL_ALPHA_STRATEGY
-                else
-                'UTBreak 전략 메뉴 (Adaptive TF)'
+                else 'UTBreak 전략 메뉴 (Adaptive TF)'
                 if active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY
                 else 'UTBreak 전략 메뉴'
             )
@@ -43382,7 +44309,9 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 `/utbreak tracefull [SYMBOL]` - 최근 진입 경로 전체 진단 보고서
 `/utbreak watchdog on|off` - 진입 가능 후 주문 미시도 진단 기록 ON/OFF (텔레그램 자동 발송 없음)
 `/utbreak bridge on|off` - ready plan을 live scanner의 entry()로 연결
+`/utbreak qh on|off|status` - QH-Flow 단독 전략
 `/utbreak dual on|off|status` - UTBreakout + RSPT 듀얼 감시/신호등 상태
+`/utbreak triple on|off|status` - UTBreakout + RSPT-v2 + QH-Flow 결합
 """.strip()
 
         def _format_utbreakout_config_text(diff=False):
@@ -43499,9 +44428,19 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     InlineKeyboardButton("RSPT STATUS", callback_data="utb:rsp_status")
                 ],
                 [
+                    InlineKeyboardButton("QH ON", callback_data="utb:qh:on"),
+                    InlineKeyboardButton("QH OFF", callback_data="utb:qh:off"),
+                    InlineKeyboardButton("QH STATUS", callback_data="utb:qh_status")
+                ],
+                [
                     InlineKeyboardButton("DUAL ON", callback_data="utb:dual:on"),
                     InlineKeyboardButton("DUAL OFF", callback_data="utb:dual:off"),
                     InlineKeyboardButton("DUAL STATUS", callback_data="utb:dual_status")
+                ],
+                [
+                    InlineKeyboardButton("TRIPLE ON", callback_data="utb:triple:on"),
+                    InlineKeyboardButton("TRIPLE OFF", callback_data="utb:triple:off"),
+                    InlineKeyboardButton("TRIPLE STATUS", callback_data="utb:triple_status")
                 ],
                 [
                     InlineKeyboardButton("코인 감시 목록", callback_data="utb:watchlist")
@@ -43918,6 +44857,72 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     await query.answer("DUAL Alpha status 전송 실패", show_alert=True)
                 except Exception:
                     logger.debug("DUAL Alpha callback failure alert failed", exc_info=True)
+
+        async def _get_qh_flow_status_text():
+            engine = self.engines.get('signal')
+            if not engine:
+                return "QH-Flow status\n\nSignal engine not found."
+            symbol = await _get_utbreakout_status_symbol_async()
+            return await engine.build_qh_flow_status_text(symbol)
+
+        async def _send_qh_flow_status(message):
+            if message is None:
+                return False
+            try:
+                text = await _get_qh_flow_status_text()
+                await self._reply_long_text_with_document(
+                    message,
+                    text,
+                    reply_markup=_build_utbreakout_keyboard(),
+                    filename='qh_flow_status.txt',
+                    caption='QH-Flow status',
+                    preview_suffix='QH-Flow status was sent as a file.',
+                )
+                return True
+            except Exception as exc:
+                logger.exception('QH-Flow status send failed')
+                await message.reply_text(
+                    f"QH-Flow status failed: {type(exc).__name__}: {exc}",
+                    reply_markup=_build_utbreakout_keyboard(),
+                )
+                return False
+
+        async def _send_qh_flow_status_from_callback(query):
+            await _show_utbreakout_callback_progress(query, 'QH-Flow status 조회 중입니다.')
+            await _send_qh_flow_status(getattr(query, 'message', None))
+
+        async def _get_triple_alpha_status_text():
+            engine = self.engines.get('signal')
+            if not engine:
+                return "TRIPLE Alpha status\n\nSignal engine not found."
+            symbol = await _get_utbreakout_status_symbol_async()
+            return await engine.build_triple_alpha_status_text(symbol)
+
+        async def _send_triple_alpha_status(message):
+            if message is None:
+                return False
+            try:
+                text = await _get_triple_alpha_status_text()
+                await self._reply_long_text_with_document(
+                    message,
+                    text,
+                    reply_markup=_build_utbreakout_keyboard(),
+                    filename='triple_alpha_status.txt',
+                    caption='TRIPLE Alpha status',
+                    preview_suffix='TRIPLE Alpha status was sent as a file.',
+                )
+                return True
+            except Exception as exc:
+                logger.exception('TRIPLE Alpha status send failed')
+                await message.reply_text(
+                    f"TRIPLE Alpha status failed: {type(exc).__name__}: {exc}",
+                    reply_markup=_build_utbreakout_keyboard(),
+                )
+                return False
+
+        async def _send_triple_alpha_status_from_callback(query):
+            await _show_utbreakout_callback_progress(query, 'TRIPLE Alpha status 조회 중입니다.')
+            await _send_triple_alpha_status(getattr(query, 'message', None))
 
         async def _edit_utbreakout_condition_status(query):
             text = await _get_utbreakout_condition_status_text()
@@ -44465,6 +45470,44 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                         reply_markup=_build_utbreakout_keyboard(),
                     )
                     return
+            elif action in {'qh', 'qhflow', 'qh_flow'}:
+                mode = str(args[1]).strip().lower() if len(args) > 1 else 'status'
+                if mode in {'on', 'enable', 'start', 'live'}:
+                    await u.message.reply_text(
+                        await _activate_qh_flow_strategy(),
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=_build_utbreakout_keyboard(),
+                    )
+                elif mode in {'off', 'disable', 'stop'}:
+                    await u.message.reply_text(
+                        await _deactivate_qh_flow_strategy(),
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=_build_utbreakout_keyboard(),
+                    )
+                elif mode in {'status', 'stat', 'menu', ''}:
+                    await _send_qh_flow_status(u.message)
+                else:
+                    await u.message.reply_text('Usage: `/utbreak qh on`, `/utbreak qh off`, `/utbreak qh status`', parse_mode=ParseMode.MARKDOWN)
+                    return
+            elif action in {'triple', 'triplealpha', 'triple_alpha'}:
+                mode = str(args[1]).strip().lower() if len(args) > 1 else 'status'
+                if mode in {'on', 'enable', 'start', 'live'}:
+                    await u.message.reply_text(
+                        await _activate_triple_alpha_strategy(),
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=_build_utbreakout_keyboard(),
+                    )
+                elif mode in {'off', 'disable', 'stop'}:
+                    await u.message.reply_text(
+                        await _deactivate_triple_alpha_strategy(),
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=_build_utbreakout_keyboard(),
+                    )
+                elif mode in {'status', 'stat', 'menu', ''}:
+                    await _send_triple_alpha_status(u.message)
+                else:
+                    await u.message.reply_text('Usage: `/utbreak triple on`, `/utbreak triple off`, `/utbreak triple status`', parse_mode=ParseMode.MARKDOWN)
+                    return
             elif action in {'dual', 'dualt', 'dualalpha', 'dual_alpha'}:
                 mode = str(args[1]).strip().lower() if len(args) > 1 else 'status'
                 if mode in {'on', 'enable', 'start', 'live'}:
@@ -44927,6 +45970,26 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     await _send_relative_strength_pullback_status_from_callback(query)
                 return
 
+            if action in {'qh', 'qhflow'}:
+                mode = str(value or '').lower()
+                if mode in {'on', 'enable', '1', 'true', 'live'}:
+                    await _edit_utbreakout_menu(query, await _activate_qh_flow_strategy())
+                elif mode in {'off', 'disable', '0', 'false', 'stop'}:
+                    await _edit_utbreakout_menu(query, await _deactivate_qh_flow_strategy())
+                else:
+                    await _send_qh_flow_status_from_callback(query)
+                return
+
+            if action in {'triple', 'triplet'}:
+                mode = str(value or '').lower()
+                if mode in {'on', 'enable', '1', 'true', 'live'}:
+                    await _edit_utbreakout_menu(query, await _activate_triple_alpha_strategy())
+                elif mode in {'off', 'disable', '0', 'false', 'stop'}:
+                    await _edit_utbreakout_menu(query, await _deactivate_triple_alpha_strategy())
+                else:
+                    await _send_triple_alpha_status_from_callback(query)
+                return
+
             if action in {'dual', 'dualt'}:
                 mode = str(value or '').lower()
                 if mode in {'on', 'enable', '1', 'true', 'live'}:
@@ -44941,8 +46004,16 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 await _send_relative_strength_pullback_status_from_callback(query)
                 return
 
+            if action == 'qh_status':
+                await _send_qh_flow_status_from_callback(query)
+                return
+
             if action == 'dual_status':
                 await _send_dual_alpha_status_from_callback(query)
+                return
+
+            if action == 'triple_status':
+                await _send_triple_alpha_status_from_callback(query)
                 return
 
             if action == 'set' or re.fullmatch(r'set\d+', action or ''):
