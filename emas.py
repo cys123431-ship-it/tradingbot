@@ -2339,6 +2339,7 @@ def build_default_utbot_filtered_breakout_config():
         'dual_alpha_direction_filter_enabled': False,
         'dual_alpha_direction_filter_timeframe': '4h',
         'dual_alpha_direction_filter_htf': '1d',
+        'dual_alpha_single_signal_risk_multiplier': 0.60,
         'entry_strategy': ENTRY_STRATEGY_UT_BREAKOUT,
         'relative_strength_pullback_trend': default_relative_strength_pullback_config(),
         'relative_strength_pullback_trend_shadow_enabled': True,
@@ -14677,10 +14678,57 @@ class SignalEngine(BaseEngine):
             if symbol_value:
                 symbol_values.append(symbol_value)
 
+        # Rank against the broader liquid selector universe (selected + watch)
+        # while keeping actual entry decisions restricted to selected symbols.
+        rank_symbol_values = list(symbol_values)
+        if bool(rsp_cfg.get('rspt_v2_enabled', True)):
+            selector_report = (
+                self.coin_selector_last_result
+                if isinstance(getattr(self, 'coin_selector_last_result', None), dict)
+                else {}
+            )
+            universe_size = max(
+                len(symbol_values),
+                int(rsp_cfg.get('relative_strength_universe_size', 30) or 30),
+            )
+            broader_items = list(selector_report.get('selected') or []) + list(
+                selector_report.get('watch_only') or []
+            )
+            for item in broader_items:
+                if len(rank_symbol_values) >= universe_size:
+                    break
+                raw_symbol = (
+                    item.get('exchange_symbol')
+                    or item.get('normalized_symbol')
+                    or item.get('symbol')
+                    or ''
+                ) if isinstance(item, dict) else str(item or '')
+                if not raw_symbol:
+                    continue
+                ok_market, canonical_rank, _ = self._ensure_valid_utbreakout_market_symbol(
+                    raw_symbol,
+                    source='relative_strength_pullback_rank_universe',
+                )
+                if ok_market and canonical_rank not in rank_symbol_values:
+                    rank_symbol_values.append(canonical_rank)
+            rsp_cfg['_relative_strength_rank_symbols'] = list(rank_symbol_values)
+
+        # RSPT-v2 ranks scanner candidates against a broader liquid universe;
+        # BTC/ETH reference returns are additionally fetched to remove market beta.
+        fetch_symbol_values = list(rank_symbol_values)
+        if bool(rsp_cfg.get('rspt_v2_enabled', True)) and bool(rsp_cfg.get('residual_strength_enabled', True)):
+            for reference_symbol in list(rsp_cfg.get('relative_strength_reference_symbols') or []):
+                ok_market, canonical_reference, _ = self._ensure_valid_utbreakout_market_symbol(
+                    reference_symbol,
+                    source='relative_strength_pullback_reference',
+                )
+                if ok_market and canonical_reference not in fetch_symbol_values:
+                    fetch_symbol_values.append(canonical_reference)
+
         if not isinstance(getattr(self, 'relative_strength_pullback_eval_cache', None), dict):
             self.relative_strength_pullback_eval_cache = {}
         cache_key = (
-            tuple(symbol_values),
+            tuple(fetch_symbol_values),
             signal_tf,
             htf_tf,
             str(rsp_cfg.get('forced_direction') or rsp_cfg.get('rspt_forced_direction') or '').lower(),
@@ -14710,7 +14758,7 @@ class SignalEngine(BaseEngine):
 
         signal_rows_by_symbol = {}
         htf_rows_by_symbol = {}
-        for symbol_value in symbol_values:
+        for symbol_value in fetch_symbol_values:
             try:
                 signal_ohlcv, htf_ohlcv = await asyncio.gather(
                     asyncio.to_thread(
@@ -14894,10 +14942,13 @@ class SignalEngine(BaseEngine):
         cfg = self._get_utbot_filtered_breakout_config(strategy_params)
         self._clear_utbot_filtered_breakout_entry_plan(symbol)
         rsp_cfg = self._relative_strength_pullback_runtime_config(cfg)
-        resolved_direction = self._normalize_relative_strength_pullback_direction(forced_direction)
-        direction_reason = None
+        independent_direction = bool(rsp_cfg.get('rspt_v2_enabled', True)) and bool(
+            rsp_cfg.get('independent_direction_enabled', True)
+        )
+        resolved_direction = None if independent_direction else self._normalize_relative_strength_pullback_direction(forced_direction)
+        direction_reason = 'RSPT-v2 residual-strength direction' if independent_direction else None
         resolved_via_provider = False
-        if resolved_direction is None and resolve_ut_direction:
+        if not independent_direction and resolved_direction is None and resolve_ut_direction:
             resolved_direction, direction_reason, provider_status = await self._resolve_relative_strength_pullback_ut_direction(
                 symbol,
                 df,
@@ -14909,12 +14960,20 @@ class SignalEngine(BaseEngine):
             provider_status = {}
         if resolved_via_provider:
             self._clear_utbot_filtered_breakout_entry_plan(symbol)
-        source_label = direction_source or 'UTBreakout 4h/1d shared direction'
+        source_label = (
+            'RSPT-v2 residual strength'
+            if independent_direction
+            else (direction_source or 'UTBreakout 4h/1d shared direction')
+        )
         rsp_cfg['forced_direction'] = resolved_direction
         rsp_cfg['direction_source'] = source_label
         nested_rsp_cfg = dict(cfg.get('relative_strength_pullback_trend') or {})
-        nested_rsp_cfg['forced_direction'] = resolved_direction
-        nested_rsp_cfg['direction_source'] = source_label
+        nested_rsp_cfg.update({
+            'forced_direction': resolved_direction,
+            'direction_source': source_label,
+            'rspt_v2_enabled': bool(rsp_cfg.get('rspt_v2_enabled', True)),
+            'independent_direction_enabled': independent_direction,
+        })
         cfg['relative_strength_pullback_trend'] = nested_rsp_cfg
         status = {
             'strategy': STRATEGY_DISPLAY_NAMES.get(
@@ -14931,8 +14990,9 @@ class SignalEngine(BaseEngine):
             'rspt_forced_direction': resolved_direction,
             'rspt_direction_source': source_label,
             'rspt_direction_provider_reason': direction_reason,
-            'rspt_internal_direction_disabled': True,
-            'rspt_direction_authority': 'UTBreakout',
+            'rspt_internal_direction_disabled': not independent_direction,
+            'rspt_direction_authority': 'RSPT-v2' if independent_direction else 'UTBreakout',
+            'rspt_v2_enabled': bool(rsp_cfg.get('rspt_v2_enabled', True)),
             'entry_execution': 'market',
             'signal_basis': 'last_completed_candle',
             'exclude_incomplete_live_candle': True,
@@ -14971,7 +15031,7 @@ class SignalEngine(BaseEngine):
             return _finish(None, 'RSPT unsupported in Upbit mode', 'REJECTED_UNSUPPORTED_MODE')
         if not bool(rsp_cfg.get('relative_strength_pullback_trend_live_enabled', False)):
             return _finish(None, 'RSPT live disabled; enable from Telegram first', 'REJECTED_RSPT_LIVE_DISABLED')
-        if resolved_direction not in {'long', 'short'}:
+        if not independent_direction and resolved_direction not in {'long', 'short'}:
             return _finish(None, 'RSPT waiting: no_ut_direction', 'REJECTED_RSPT_NO_UT_DIRECTION')
 
         decisions, signal_rows_by_symbol, _, candidates, rsp_cfg = await self._evaluate_relative_strength_pullback_candidates(
@@ -15095,6 +15155,35 @@ class SignalEngine(BaseEngine):
         if not self._is_valid_number(atr_value) or float(atr_value) <= 0:
             return _finish(None, 'REJECTED_ATR_TOO_LOW: ATR unavailable', 'REJECTED_ATR_TOO_LOW', record_failure=True, side=side)
 
+        if bool(rsp_cfg.get('entry_chase_guard_enabled', True)):
+            fetch_ticker = getattr(self.market_data_exchange, 'fetch_ticker', None)
+            if callable(fetch_ticker):
+                try:
+                    ticker = await asyncio.to_thread(fetch_ticker, symbol)
+                    live_price = _safe_float_or_none(
+                        (ticker or {}).get('last')
+                        or (ticker or {}).get('close')
+                        or (ticker or {}).get('mark')
+                    )
+                    if live_price and live_price > 0:
+                        adverse_move_atr = (live_price - entry_price) / float(atr_value)
+                        if side == 'short':
+                            adverse_move_atr = (entry_price - live_price) / float(atr_value)
+                        status['rspt_live_entry_reference'] = live_price
+                        status['rspt_entry_chase_atr'] = adverse_move_atr
+                        max_chase_atr = float(rsp_cfg.get('entry_chase_max_atr', 0.35) or 0.35)
+                        if adverse_move_atr > max_chase_atr:
+                            return _finish(
+                                None,
+                                f'RSPT waiting: entry chase {adverse_move_atr:.2f} ATR exceeds {max_chase_atr:.2f}',
+                                'REJECTED_RSPT_ENTRY_CHASE',
+                                side=side,
+                            )
+                        entry_price = float(live_price)
+                        status['entry_price'] = entry_price
+                except Exception as exc:
+                    status['rspt_entry_chase_guard_error'] = str(exc)
+
         filter_values = dict(metrics or {})
         filter_values['entry_price'] = entry_price
         filter_values['atr_pct'] = atr_pct
@@ -15150,11 +15239,14 @@ class SignalEngine(BaseEngine):
         )
         risk_per_trade_percent = risk_budget['risk_per_trade_percent']
         max_risk_per_trade_usdt = risk_budget['max_risk_per_trade_usdt']
-        structure_stop = (
-            filter_values.get('recent_swing_low')
-            if side == 'long'
-            else filter_values.get('recent_swing_high')
-        )
+        structure_stop = _safe_float_or_none(decision_logs.get('pullback_structure_stop'))
+        if structure_stop is None:
+            structure_stop = (
+                filter_values.get('recent_swing_low')
+                if side == 'long'
+                else filter_values.get('recent_swing_high')
+            )
+        status['rspt_structure_stop'] = structure_stop
         try:
             plan = calculate_risk_plan(
                 side=side,
@@ -15163,7 +15255,7 @@ class SignalEngine(BaseEngine):
                 stop_atr_multiplier=cfg.get('stop_atr_multiplier', 1.5),
                 ut_stop=None,
                 structure_stop=structure_stop,
-                structure_buffer_atr=cfg.get('structure_stop_buffer_atr', 0.28),
+                structure_buffer_atr=rsp_cfg.get('structure_stop_buffer_atr', cfg.get('structure_stop_buffer_atr', 0.20)),
                 take_profit_r_multiple=cfg.get('take_profit_r_multiple', 3.50),
                 take_profit_front_run_atr=cfg.get('take_profit_front_run_atr', 0.14),
                 take_profit_front_run_pct=cfg.get('take_profit_front_run_pct', 0.055),
@@ -15173,6 +15265,14 @@ class SignalEngine(BaseEngine):
                 max_risk_per_trade_usdt=max_risk_per_trade_usdt,
                 leverage=leverage,
             )
+            stop_distance_atr = float(plan.get('risk_distance', 0.0) or 0.0) / float(atr_value)
+            stop_distance_min_atr = float(rsp_cfg.get('stop_distance_min_atr', 0.60) or 0.60)
+            stop_distance_max_atr = float(rsp_cfg.get('stop_distance_max_atr', 2.00) or 2.00)
+            if stop_distance_atr < stop_distance_min_atr or stop_distance_atr > stop_distance_max_atr:
+                raise ValueError(
+                    f'RSPT stop distance {stop_distance_atr:.2f} ATR outside '
+                    f'{stop_distance_min_atr:.2f}-{stop_distance_max_atr:.2f} ATR'
+                )
             plan = cap_utbreakout_risk_plan_to_margin(
                 plan,
                 free_balance=free_balance,
@@ -15210,19 +15310,24 @@ class SignalEngine(BaseEngine):
             'market_quality_summary': market_quality.get('summary'),
             'fixed_take_profit_enabled': bool(cfg.get('fixed_take_profit_enabled', True)),
             'partial_take_profit_enabled': bool(cfg.get('partial_take_profit_enabled', True)),
-            'partial_take_profit_r_multiple': float(cfg.get('partial_take_profit_r_multiple', 1.00) or 1.00),
-            'partial_take_profit_ratio': float(cfg.get('partial_take_profit_ratio', 0.20) or 0.20),
+            'partial_take_profit_r_multiple': float(rsp_cfg.get('partial_take_profit_r_multiple', 1.50) or 1.50),
+            'partial_take_profit_ratio': float(rsp_cfg.get('partial_take_profit_ratio', 0.25) or 0.25),
             'second_take_profit_enabled': bool(cfg.get('second_take_profit_enabled', True)),
             'second_take_profit_r_multiple': float(cfg.get('second_take_profit_r_multiple', cfg.get('take_profit_r_multiple', 3.50)) or 3.50),
             'second_take_profit_ratio': float(cfg.get('second_take_profit_ratio', 0.40) or 0.40),
             'atr_trailing_enabled': bool(cfg.get('atr_trailing_enabled', True)),
-            'atr_trailing_multiplier': float(cfg.get('atr_trailing_multiplier', 3.50) or 3.50),
-            'atr_trailing_activation_r': float(cfg.get('atr_trailing_activation_r', 1.60) or 1.60),
-            'tp1_breakeven_enabled': bool(cfg.get('tp1_breakeven_enabled', True)),
+            'atr_trailing_multiplier': float(rsp_cfg.get('atr_trailing_multiplier', 2.75) or 2.75),
+            'atr_trailing_activation_r': float(rsp_cfg.get('atr_trailing_activation_r', 2.00) or 2.00),
+            'tp1_breakeven_enabled': bool(rsp_cfg.get('tp1_breakeven_enabled', False)),
             'tp1_breakeven_trigger_r': float(cfg.get('tp1_breakeven_trigger_r', cfg.get('partial_take_profit_r_multiple', 1.00)) or 1.00),
             'tp1_breakeven_offset_r': float(cfg.get('tp1_breakeven_offset_r', 0.03) or 0.03),
             'tp1_breakeven_wait_for_partial': bool(cfg.get('tp1_breakeven_wait_for_partial', True)),
             'tp1_breakeven_qty_tolerance': float(cfg.get('tp1_breakeven_qty_tolerance', 0.08) or 0.08),
+            'ev_time_stop_enabled': bool(rsp_cfg.get('ev_time_stop_enabled', True)),
+            'ev_time_stop_bars': int(rsp_cfg.get('ev_time_stop_bars', 8) or 8),
+            'ev_time_stop_min_mfe_r': float(rsp_cfg.get('ev_time_stop_min_mfe_r', 0.50) or 0.50),
+            'rspt_stop_distance_atr': stop_distance_atr,
+            'rspt_structure_stop': structure_stop,
             'rspt_reason': decision.reason,
             'rspt_setup_type': decision_logs.get('setup_type'),
             'rspt_logs': decision_logs,
@@ -15494,6 +15599,13 @@ class SignalEngine(BaseEngine):
             rsp_cfg['relative_strength_pullback_trend_shadow_enabled'] = True
             rsp_cfg['relative_strength_pullback_trend_live_enabled'] = True
             rsp_cfg['relative_strength_pullback_trend_paper_enabled'] = False
+            rsp_cfg['strategy_version'] = 'v2'
+            rsp_cfg['rspt_v2_enabled'] = True
+            rsp_cfg['independent_direction_enabled'] = True
+            rsp_cfg['direction_source'] = 'RSPT-v2 residual strength'
+            rsp_cfg['forced_direction'] = None
+            rsp_cfg['allow_breakout_continuation'] = False
+            rsp_cfg['require_prior_impulse'] = True
             cfg['entry_strategy'] = ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
             cfg['relative_strength_pullback_trend'] = rsp_cfg
             cfg['relative_strength_pullback_trend_shadow_enabled'] = True
@@ -15770,6 +15882,27 @@ class SignalEngine(BaseEngine):
             score -= 100.0
         return float(score)
 
+    def _dual_alpha_scale_plan(self, plan, multiplier):
+        scaled = dict(plan or {})
+        multiplier = max(0.0, min(1.0, float(multiplier or 0.0)))
+        for key in (
+            'qty',
+            'risk_usdt',
+            'max_risk_per_trade_usdt',
+            'planned_notional',
+            'planned_margin',
+            'expected_profit_usdt',
+            'position_notional',
+        ):
+            value = _safe_float_or_none(scaled.get(key))
+            if value is not None:
+                scaled[key] = value * multiplier
+        percent = _safe_float_or_none(scaled.get('risk_per_trade_percent'))
+        if percent is not None:
+            scaled['risk_per_trade_percent'] = percent * multiplier
+        scaled['dual_alpha_risk_multiplier'] = multiplier
+        return scaled
+
     async def _calculate_dual_alpha_signal(
         self,
         symbol,
@@ -15780,6 +15913,12 @@ class SignalEngine(BaseEngine):
     ):
         self._clear_utbot_filtered_breakout_entry_plan(symbol)
         base_symbol = symbol
+        base_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+        single_signal_multiplier = max(
+            0.0,
+            min(1.0, float(base_cfg.get('dual_alpha_single_signal_risk_multiplier', 0.60) or 0.60)),
+        )
+
         direction_side, direction_reason, direction_status = await self._shared_ut_direction_filter(
             base_symbol,
             strategy_params,
@@ -15799,7 +15938,6 @@ class SignalEngine(BaseEngine):
             if ut_sig in {'long', 'short'}
             else None
         )
-        rspt_forced_direction = direction_side
 
         rsp_params = self._dual_alpha_strategy_params(
             strategy_params,
@@ -15810,8 +15948,8 @@ class SignalEngine(BaseEngine):
             df,
             rsp_params,
             force_reprocess=force_reprocess,
-            forced_direction=rspt_forced_direction,
-            direction_source='UTBreakout',
+            forced_direction=None,
+            direction_source='RSPT-v2 residual strength',
             resolve_ut_direction=False,
         )
         rsp_status = dict(rsp_status or self._utbreakout_diag_for_symbol(base_symbol) or {})
@@ -15822,32 +15960,16 @@ class SignalEngine(BaseEngine):
             else None
         )
 
-        choices = []
+        # Branch evaluations can each leave a plan behind.  DUAL owns the final
+        # plan and therefore clears both before applying agreement rules.
+        self._clear_utbot_filtered_breakout_entry_plan(base_symbol)
+        if rsp_symbol != base_symbol:
+            self._clear_utbot_filtered_breakout_entry_plan(rsp_symbol)
+
+        valid_ut = None
         if ut_sig in {'long', 'short'} and isinstance(ut_plan, dict):
-            if direction_side and ut_sig != direction_side:
-                ut_status['dual_direction_filter_blocked'] = True
-                ut_status['dual_direction_filter_side'] = direction_side
-                ut_status['dual_direction_filter_reason'] = direction_reason
-                self._utbreakout_trace_event(
-                    base_symbol,
-                    'DUAL_ALPHA',
-                    'UT_OPPOSITE_DIRECTION_BLOCKED',
-                    direction_filter_side=direction_side,
-                    ut_direction=ut_sig,
-                    reason=direction_reason,
-                )
-            elif direction_side not in {'long', 'short'}:
-                ut_status['dual_direction_filter_blocked'] = True
-                ut_status['dual_direction_filter_reason'] = direction_reason or 'no 4h/1d UT direction'
-                self._utbreakout_trace_event(
-                    base_symbol,
-                    'DUAL_ALPHA',
-                    'UT_DIRECTION_FILTER_MISSING',
-                    ut_direction=ut_sig,
-                    reason=direction_reason or 'no 4h/1d UT direction',
-                )
-            else:
-                choices.append({
+            if direction_side in {'long', 'short'} and ut_sig == direction_side:
+                valid_ut = {
                     'key': ENTRY_STRATEGY_UT_BREAKOUT,
                     'label': 'UTBreakout',
                     'side': ut_sig,
@@ -15856,40 +15978,71 @@ class SignalEngine(BaseEngine):
                     'plan': ut_plan,
                     'score': self._dual_alpha_score(ENTRY_STRATEGY_UT_BREAKOUT, ut_sig, ut_status, ut_plan),
                     'priority': 0,
-                })
-        if rsp_sig in {'long', 'short'} and isinstance(rsp_plan, dict):
-            if rspt_forced_direction and rsp_sig != rspt_forced_direction:
+                }
+            else:
+                ut_status['dual_direction_filter_blocked'] = True
+                ut_status['dual_direction_filter_side'] = direction_side
+                ut_status['dual_direction_filter_reason'] = direction_reason
                 self._utbreakout_trace_event(
                     base_symbol,
                     'DUAL_ALPHA',
-                    'RSPT_OPPOSITE_DIRECTION_BLOCKED',
-                    ut_direction=rspt_forced_direction,
-                    rspt_direction=rsp_sig,
+                    'UT_OPPOSITE_DIRECTION_BLOCKED' if direction_side else 'UT_DIRECTION_FILTER_MISSING',
+                    direction_filter_side=direction_side,
+                    ut_direction=ut_sig,
+                    reason=direction_reason,
+                )
+
+        valid_rsp = None
+        if rsp_sig in {'long', 'short'} and isinstance(rsp_plan, dict):
+            valid_rsp = {
+                'key': ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+                'label': 'RSPT-v2',
+                'side': rsp_sig,
+                'reason': rsp_reason,
+                'status': rsp_status,
+                'plan': rsp_plan,
+                'score': self._dual_alpha_score(
+                    ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+                    rsp_sig,
+                    rsp_status,
+                    rsp_plan,
+                ),
+                'priority': 1,
+            }
+
+        selected = None
+        agreement_state = 'none'
+        agreement_multiplier = 0.0
+        choices = [choice for choice in (valid_ut, valid_rsp) if choice]
+        if valid_ut and valid_rsp:
+            if valid_ut['side'] != valid_rsp['side']:
+                agreement_state = 'conflict'
+                self._utbreakout_trace_event(
+                    base_symbol,
+                    'DUAL_ALPHA',
+                    'STRATEGY_DIRECTION_CONFLICT',
+                    ut_direction=valid_ut['side'],
+                    rspt_direction=valid_rsp['side'],
                 )
             else:
-                choices.append({
-                    'key': ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
-                    'label': 'RSPT',
-                    'side': rsp_sig,
-                    'reason': rsp_reason,
-                    'status': rsp_status,
-                    'plan': rsp_plan,
-                    'score': self._dual_alpha_score(
-                        ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
-                        rsp_sig,
-                        rsp_status,
-                        rsp_plan,
-                    ),
-                    'priority': 1,
-                })
+                agreement_state = 'confirmed'
+                agreement_multiplier = 1.0
+                selected = sorted(
+                    choices,
+                    key=lambda item: (-float(item.get('score') or 0.0), int(item.get('priority') or 0)),
+                )[0]
+        elif choices:
+            agreement_state = 'single'
+            agreement_multiplier = single_signal_multiplier
+            selected = choices[0]
 
-        choices.sort(key=lambda item: (-float(item.get('score') or 0.0), int(item.get('priority') or 0)))
-        selected = choices[0] if choices else None
         final_status = dict((selected or {}).get('status') or rsp_status or ut_status or {})
         if selected and isinstance(selected.get('plan'), dict):
-            selected_plan = dict(selected['plan'])
+            selected_plan = self._dual_alpha_scale_plan(selected['plan'], agreement_multiplier)
             selected_plan['dual_alpha_selected_strategy'] = selected['key']
             selected_plan['dual_alpha_score'] = selected['score']
+            selected_plan['dual_alpha_agreement_state'] = agreement_state
+            selected_plan['dual_alpha_confirmation_count'] = len(choices)
             if selected['key'] == ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND:
                 selected_plan['strategy'] = ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
             else:
@@ -15912,13 +16065,16 @@ class SignalEngine(BaseEngine):
                 'htf_timeframe': (direction_status or {}).get('htf_timeframe', '1d'),
             },
             'utbreak': self._dual_alpha_light(ut_status, 'UTBreakout'),
-            'rspt': self._dual_alpha_light(rsp_status, 'RSPT'),
+            'rspt': self._dual_alpha_light(rsp_status, 'RSPT-v2'),
+            'agreement_state': agreement_state,
+            'agreement_risk_multiplier': agreement_multiplier,
+            'confirmation_count': len(choices),
             'selected': selected.get('key') if selected else None,
             'selected_label': selected.get('label') if selected else None,
             'selected_side': selected.get('side') if selected else None,
             'selection_score': selected.get('score') if selected else None,
-            'utbreak_score': next((choice.get('score') for choice in choices if choice.get('key') == ENTRY_STRATEGY_UT_BREAKOUT), None),
-            'rspt_score': next((choice.get('score') for choice in choices if choice.get('key') == ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND), None),
+            'utbreak_score': valid_ut.get('score') if valid_ut else None,
+            'rspt_score': valid_rsp.get('score') if valid_rsp else None,
         }
         final_status.update({
             'strategy': STRATEGY_DISPLAY_NAMES.get(DUAL_ALPHA_STRATEGY, 'DUAL_ALPHA'),
@@ -15931,8 +16087,8 @@ class SignalEngine(BaseEngine):
             final_status['accepted_code'] = 'ACCEPTED_ENTRY'
             final_status['accepted_side'] = selected['side']
             final_status['reason'] = (
-                f"DUAL_ALPHA selected {selected['label']} "
-                f"{selected['side'].upper()}: {selected['reason']}"
+                f"DUAL_ALPHA {agreement_state} selected {selected['label']} "
+                f"{selected['side'].upper()} at {agreement_multiplier:.0%} risk: {selected['reason']}"
             )
             final_status['stage'] = 'entry_ready'
             self._utbreakout_trace_event(
@@ -15942,16 +16098,23 @@ class SignalEngine(BaseEngine):
                 selected=selected['key'],
                 side=selected['side'],
                 score=round(float(selected.get('score') or 0.0), 2),
+                agreement_state=agreement_state,
+                risk_multiplier=agreement_multiplier,
             )
         else:
+            conflict_text = ' strategy conflict' if agreement_state == 'conflict' else ''
             final_status['reason'] = (
-                f"DUAL_ALPHA waiting: Direction={direction_reason}; UT={ut_reason}; RSPT={rsp_reason}"
+                f"DUAL_ALPHA waiting{conflict_text}: Direction={direction_reason}; "
+                f"UT={ut_reason}; RSPT={rsp_reason}"
             )
             final_status['stage'] = 'waiting'
+            if agreement_state == 'conflict':
+                final_status['reject_code'] = 'REJECTED_DUAL_DIRECTION_CONFLICT'
             self._utbreakout_trace_event(
                 base_symbol,
                 'DUAL_ALPHA',
                 'WAIT',
+                agreement_state=agreement_state,
                 ut_reason=ut_reason,
                 rspt_reason=rsp_reason,
             )

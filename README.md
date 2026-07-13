@@ -46,3 +46,7 @@ python3 scripts/launch_emas.py
 ```
 
 공식 실행 진입점은 `scripts/launch_emas.py` 하나입니다. 이 런처가 프로세스 락과 실거래 안전 패치를 적용하므로 `emas.py`를 직접 실행하지 마세요. 실운영 환경에서는 Azure/GitHub Actions 배포 설정을 먼저 확인하고, 로컬에서 live bot을 실행하지 않는 운영 원칙을 유지하세요.
+
+## RSPT-v2 / Dual 전략
+
+RSPT는 BTC·ETH 공통 움직임을 제거한 잔차 상대강도와 실제 돌파 후 눌림을 이용해 UTBreakout과 독립적으로 방향을 결정합니다. Dual은 두 전략이 같은 방향이면 정상 위험, 한 전략만 신호면 60% 위험, 서로 반대면 거래하지 않습니다. 세부 설정과 검증 방법은 [`docs/RSPT_V2.md`](docs/RSPT_V2.md)를 참고하세요.
