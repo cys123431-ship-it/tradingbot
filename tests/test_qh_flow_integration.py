@@ -89,3 +89,15 @@ def test_triple_plan_scaling_preserves_prices_and_scales_risk_fields():
     assert scaled["entry_price"] == 50.0
     assert scaled["stop_loss"] == 48.0
     assert scaled["take_profit"] == 55.0
+
+
+def test_qh_and_triple_callback_actions_are_registered():
+    emas = _emas_module()
+    assert {
+        "qh",
+        "qhflow",
+        "qh_status",
+        "triple",
+        "triplet",
+        "triple_status",
+    } <= emas.UTBREAKOUT_CALLBACK_ACTIONS
