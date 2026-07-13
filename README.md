@@ -1,52 +1,291 @@
-# Advanced Crypto Trading Bot
+# Trading Bot
 
-Python 기반 crypto futures trading bot입니다. 이 문서는 현재 실제 코드 기준으로 정리되어 있으며, 핵심 live 경로는 `emas.py`, `utbreakout/`, `prediction/`, `tests/`에 있습니다.
+바이낸스 USDT 무기한 선물을 중심으로 동작하는 Python 자동매매 봇입니다.  
+현재 실운영 핵심은 **UTBreak Set64(EV Adaptive)**, **RSPT-v2**, 그리고 두 전략을 독립적으로 결합하는 **Dual**입니다.
 
-> 주의: mainnet 실거래 전에는 반드시 testnet/paper forward test로 주문, TP/SL, 텔레그램 제어, 네트워크 설정을 확인해야 합니다. API key, secret, token은 저장소에 커밋하지 마세요.
+> **주의**  
+> 이 저장소는 실주문·레버리지·TP/SL·자동 배포 코드를 포함합니다. 메인넷 사용 전 반드시 테스트넷과 paper/forward test로 주문 수량, 최소 주문금액, 포지션 모드, 보호 주문, 텔레그램 제어를 확인하세요. API Key, Secret, Telegram Token, SSH Key는 절대 저장소에 커밋하지 마세요.
 
-## 현재 Live Core
+## 현재 운영 기준
 
-현재 `MA_STRATEGIES = set()` 상태라 README에 오래 남아 있던 Triple SMA/HMA 계열은 live core가 아닙니다. 실제 선택 가능한 core 전략은 다음 계열입니다.
+| 항목 | 현재 코드 기준 |
+|---|---|
+| 공식 실행 진입점 | `scripts/launch_emas.py` |
+| 기본 거래소 모드 | `binance_testnet` |
+| 지원 모드 | Binance Testnet, Binance Mainnet, Upbit |
+| 핵심 런타임 프로필 | `ev_adaptive_v3_profit_engine` |
+| UTBreak 실거래 Set | **Set64만 허용** |
+| 기존 Set1~63 | 연구·진단용 레거시 Set |
+| UTBreak 시간프레임 | AUTO `15m / 30m / 1h`, 진입·청산 `15m`, HTF `1h` |
+| RSPT-v2 시간프레임 | 신호 `4h`, 장기 추세 `1d` |
+| 포지션 제한 | 전체 봇 기준 동시 포지션 1개 |
+| 배포 | `main` push → 전체 테스트 → Azure 자동 배포 |
 
-- `UTBOT`: 기본 UTBot 방향 전략
-- `UTSMC`: UTBot + SMC/internal structure 조합
-- `UTRSI`: UTBot + RSI timing 조합
-- `UTRSIBB`: UTBot + RSI/Bollinger timing 조합
-- `UTBB`: UTBot + Bollinger Band 조합
-- `UTBOT_FILTERED_BREAKOUT_V1`: UT Breakout set registry 기반 필터 전략
-- `UTBOT_ADAPTIVE_TIMEFRAME_V1`: UT Breakout adaptive timeframe 변형
-- `RSIBB`: 순수 RSI Bollinger mean-reversion. 선택은 가능하지만 기본값은 `rsibb_enabled=false`, `rsibb_paper_only=true`, `rsibb_regime_guard_enabled=true`입니다.
+`Set64`는 여러 고정 필터를 중첩한 과거 Set의 연장선이 아니라, **EV Adaptive 라우터를 안정적으로 식별하기 위한 단일 실거래 껍데기**입니다. 실제 진입 여부는 장세, 방향, 거래비용, 품질, 기대값과 위험 배율을 종합해 결정합니다.
 
-## UT Breakout Sets
+## 전략 구조
 
-UT Breakout은 `build_utbreakout_set_registry()`에서 Set1~Set63으로 구성됩니다. Set1~60은 기존 UT/volatility/prediction 계열이며, Set61~63이 추가되었습니다.
+### 1. UTBreak Set64 — EV Adaptive
 
-- Set61 `UT + Rolling OFI Confirmation`: rolling orderbook imbalance, taker buy/sell ratio, spread/depth guard를 UTBot 방향과 같이 확인합니다.
-- Set62 `UT + OI Funding Squeeze`: OI 변화 z-score, OI acceleration, funding, long/short ratio, basis, liquidity guard를 조합합니다.
-- Set63 `UT + Squeeze Release Breakout`: BB width percentile, Keltner squeeze state, range expansion, Donchian breakout, ATR guard를 같이 확인합니다.
+UTBot 신호를 그대로 주문하지 않고 다음 단계를 통과한 후보만 진입 계획으로 만듭니다.
 
-새 set은 lightweight deterministic feature score를 보조 gate로 사용합니다. Deep Learning 모델은 포함하지 않습니다.
-
-## Legacy / Inactive Notes
-
-과거 README에 있던 Triple SMA, HMA, MicroVBO, Fractal Fisher 설명은 현재 live core 설명으로 보지 마세요. 일부 보조 코드나 legacy 흔적이 남아 있을 수 있지만 현재 전략 선택 집합과 실행 경로는 UTBot/UT hybrid/UT Breakout 중심입니다.
-
-## Risk And Operations
-
-- 기본 exchange mode는 testnet 쪽으로 유지됩니다.
-- live 주문을 켜는 기본 설정은 추가하지 않습니다.
-- UT Breakout은 fixed TP ladder, ATR 기반 risk plan, market quality, selector quality, diagnostic log를 함께 사용합니다.
-- Telegram status/diagnostic에는 포지션, 선택 set, 후보, orderflow/OI/squeeze/feature score 정보가 표시됩니다.
-
-## Setup
-
-```bash
-pip install -r requirements.txt
-python3 scripts/launch_emas.py
+```text
+CoinSelector 후보
+    ↓
+15m / 30m / 1h 추세·돌파 판단
+    ↓
+장세·방향·재가속·신호 노후도 확인
+    ↓
+거래량·ADX·상대강도·파생시장·시장 품질 확인
+    ↓
+수수료·슬리피지·펀딩·스프레드 차감 기대값
+    ↓
+위험 배율·손절·익절·추적청산 계획
+    ↓
+공통 주문 게이트웨이
 ```
 
-공식 실행 진입점은 `scripts/launch_emas.py` 하나입니다. 이 런처가 프로세스 락과 실거래 안전 패치를 적용하므로 `emas.py`를 직접 실행하지 마세요. 실운영 환경에서는 Azure/GitHub Actions 배포 설정을 먼저 확인하고, 로컬에서 live bot을 실행하지 않는 운영 원칙을 유지하세요.
+주요 특징:
 
-## RSPT-v2 / Dual 전략
+- 라이브 AUTO는 Set64만 사용하며 Set1~63 자동 전환을 차단합니다.
+- `15m`, `30m`, `1h` 중 적합한 시간프레임을 선택하되 잦은 전환을 제한합니다.
+- 추세 지속, 압축 후 돌파, 재가속 여부를 구분하고 불리한 횡보·극단 변동 구간은 차단하거나 수량을 줄입니다.
+- 수수료, 예상 슬리피지, 펀딩 버퍼, 스프레드를 기대값에 포함합니다.
+- OI, 펀딩, 베이시스, 롱·숏 비율, 오더플로는 독립적인 확정 신호라기보다 품질·과열·위험 판단에 사용합니다.
+- 약한 신호를 최소 주문수량으로 억지 복원하지 않고 최종 위험 배율이 낮으면 거래하지 않습니다.
 
-RSPT는 BTC·ETH 공통 움직임을 제거한 잔차 상대강도와 실제 돌파 후 눌림을 이용해 UTBreakout과 독립적으로 방향을 결정합니다. Dual은 두 전략이 같은 방향이면 정상 위험, 한 전략만 신호면 60% 위험, 서로 반대면 거래하지 않습니다. 세부 설정과 검증 방법은 [`docs/RSPT_V2.md`](docs/RSPT_V2.md)를 참고하세요.
+### 2. RSPT-v2 — Residual Relative Strength Pullback Trend
+
+RSPT-v2는 UTBreak 방향을 전달받지 않고 **자체적으로 롱·숏을 판단하는 독립 전략**입니다.
+
+```text
+유동성 후보군 구성
+    ↓
+BTC·ETH 공통 움직임 제거
+    ↓
+잔차 상대강도 순위 계산
+    ↓
+1d 장기 추세 + 4h 방향 확인
+    ↓
+선행 충격/돌파 → 정상 눌림 → 재돌파 확인
+    ↓
+추격 진입·과도한 변동성·부적절한 손절거리 차단
+```
+
+현재 기본 설계:
+
+- BTC·ETH 수익률에 대한 베타를 제거한 잔차 모멘텀을 사용합니다.
+- 최대 30개 유동성 후보군에서 롱 상위 20%, 숏 하위 10%를 기본 진입 구간으로 사용합니다.
+- 선행 돌파가 없는 단순 EMA 접촉은 눌림목으로 인정하지 않습니다.
+- 최근 2~8개 봉 안의 충격, `0.4~1.2 ATR` 눌림, 재돌파를 확인합니다.
+- 신호 종가보다 실제 가격이 불리하게 `0.35 ATR` 이상 이동하면 추격 진입을 차단합니다.
+- 변동성이 높으면 기본 위험을 70%, 극단적이면 35%로 축소합니다.
+- 구조적 손절거리가 `0.6~2.0 ATR` 범위를 벗어나면 거래하지 않습니다.
+- 세부 내용은 [`docs/RSPT_V2.md`](docs/RSPT_V2.md)를 참고하세요.
+
+### 3. Dual — 독립 전략 합의 라우팅
+
+Dual은 UTBreak와 RSPT-v2를 각각 계산한 뒤 결과만 결합합니다.
+
+| UTBreak | RSPT-v2 | 처리 |
+|---|---|---|
+| LONG | LONG | 정상 위험 100% |
+| SHORT | SHORT | 정상 위험 100% |
+| 신호 있음 | 상대 전략 신호 없음 | 정상 위험의 60% |
+| LONG | SHORT | 거래 차단 |
+| SHORT | LONG | 거래 차단 |
+
+따라서 Dual은 같은 UT 방향을 두 번 확인하는 구조가 아니라, **돌파 기반 전략과 잔차 상대강도 눌림목 전략의 합의 여부**를 확인합니다.
+
+### 4. 레거시 전략
+
+`UTBOT`, `UTSMC`, `UTRSI`, `UTRSIBB`, `UTBB`, `RSIBB` 등의 코드 경로는 호환·연구 목적으로 남아 있습니다. 현재 README의 실운영 기준은 UTBreak Set64, RSPT-v2, Dual이며, 과거 Triple SMA/HMA 설명은 현재 핵심 런타임을 나타내지 않습니다.
+
+## 위험관리와 주문 안전장치
+
+전략 신호와 실제 주문은 분리되어 있으며, 모든 실주문은 공통 안전 계층을 통과합니다.
+
+- **공식 런처 강제**: `emas.py` 직접 실행 대신 `scripts/launch_emas.py`를 사용합니다.
+- **프로세스 락**: 동일 서버에서 봇 중복 실행을 차단합니다.
+- **글로벌 단일 포지션**: 전략이 달라도 전체 봇에서 포지션 하나만 허용합니다.
+- **주문 상태 저장**: 로컬 SQLite 상태와 거래소 주문 상태를 연결합니다.
+- **멱등 보호 주문**: TP/SL 중복 생성과 재시작 후 중복 주문을 방지합니다.
+- **시작·재접속 조정**: 포지션, 일반 주문, Algo 주문을 다시 조회하고 불완전하면 신규 진입을 막습니다.
+- **User Data Stream**: 체결·부분체결·취소 이벤트를 추적하고 연결 복구 시 REST 조정을 수행합니다.
+- **청산가 보호**: 손절가가 청산가 안전 버퍼 안쪽에 들어가면 레버리지·주문 계획을 재검사합니다.
+- **Critical Pause**: 주문·상태 불일치 등 위험 상황에서는 자동 진입을 잠그고 수동 재개 절차를 요구합니다.
+- **최종 손익 정산**: 거래소 체결 수수료와 펀딩을 포함해 종료된 거래 통계를 확정합니다.
+- **텔레그램 소유자 제한**: 설정된 `chat_id` 외 명령을 거부합니다.
+
+## 프로젝트 구조
+
+```text
+.
+├── emas.py                         # 메인 엔진, 텔레그램, 전략·주문 연결
+├── scripts/launch_emas.py          # 유일한 공식 실행 진입점
+├── global_single_position_guard.py # 단일 포지션·실운영 런타임 오버라이드
+├── utbreakout_live_hardening_patch.py
+├── utbreakout/                     # UTBreak, EV, 장세, 방향, RSPT 등 전략 모듈
+├── trading_safety/                 # 주문 게이트웨이, 상태 저장, 조정, 보호 주문
+├── prediction/                     # Prediction/Predict.fun 보조 모듈
+├── scripts/                        # 운영, 백테스트, 리서치 도구
+├── tests/                          # 전략·주문·안전·배포 회귀 테스트
+├── tradingview/                    # TradingView 참고 스크립트
+├── docs/                           # 전략 및 운영 문서
+└── kstockbot/                      # 한국주식용 별도 하위 프로젝트
+```
+
+## 설치와 로컬 실행
+
+Python 3.12 기준입니다.
+
+```bash
+python3.12 -m venv venv
+source venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python scripts/launch_emas.py
+```
+
+Windows PowerShell에서는 가상환경 활성화만 다음처럼 바꿉니다.
+
+```powershell
+.\venv\Scripts\Activate.ps1
+```
+
+### 설정 파일
+
+첫 실행 시 `config.json`이 생성될 수 있으며 이 파일은 `.gitignore` 대상입니다. 메인넷 실행 전 다음 항목을 직접 확인하세요.
+
+- `api.exchange_mode`
+- Binance testnet/mainnet API Key와 Secret
+- `telegram.token`, `telegram.chat_id`
+- 포지션 모드와 레버리지
+- UTBreak/RSPT/Dual 활성 상태
+- 1회 위험, 일일 손실, 일일 거래 횟수 제한
+- TP/SL와 보호 주문 설정
+
+`runtime/`, `config.json`, 로그, DB, Prediction 원장은 저장소에 커밋하지 않습니다.
+
+> `python emas.py`로 직접 실행하지 마세요. 공식 런처가 프로세스 락, 단일 포지션 가드, 실운영 하드닝 패치를 먼저 적용합니다.
+
+## 서버 운영
+
+```bash
+# 시작
+scripts/bot_ctl.sh start
+
+# 상태 및 heartbeat 확인
+scripts/bot_ctl.sh status
+
+# 비정상 상태면 재시작
+scripts/bot_ctl.sh ensure
+
+# 중지
+scripts/bot_ctl.sh stop
+```
+
+기본 heartbeat 파일은 `runtime/bot_heartbeat.json`이며, 서버 배포에서는 5분마다 `ensure`를 실행하고 재부팅 시 자동 시작하도록 cron을 등록합니다.
+
+## 텔레그램 명령
+
+주요 명령은 다음과 같습니다.
+
+| 명령 | 기능 |
+|---|---|
+| `/start` | 메인 메뉴 |
+| `/status` | 현재 엔진·포지션·전략 상태 |
+| `/history` | 최근 상태·거래 기록 |
+| `/stats` | 거래 통계 |
+| `/risk` | 위험 설정 메뉴 |
+| `/strat` | 전략 선택 메뉴 |
+| `/utbreak` | UTBreak/Set64/RSPT/Dual 메뉴 |
+| `/prediction` | Prediction Micro Auto / Predict.fun 메뉴 |
+| `/setup` | 거래소·네트워크 전환만 지원 |
+| `/log` | 최근 로그 |
+| `/close` | 현재 포지션 긴급 청산 |
+| `/stop` | 봇 긴급 정지 및 포지션 청산 |
+| `/help` | 명령 도움말 |
+
+UTBreak 진단에서 자주 사용하는 하위 명령:
+
+```text
+/utbreak status
+/utbreak why
+/utbreak config
+/utbreak configdiff
+/utbreak trace [SYMBOL]
+/utbreak tracefull [SYMBOL]
+/utbreak research
+/utbreak dual on|off|status
+/utbreak bridge on|off
+/utbreak watchdog on|off
+```
+
+텔레그램 버튼과 텍스트 명령으로 `STOP`, `PAUSE`, `RESUME`도 처리합니다. `/setup`의 오래된 전략 설정 메뉴는 제거되었으며 현재는 거래소·네트워크 전환만 담당합니다.
+
+## 백테스트와 리서치
+
+```bash
+python scripts/utbreakout_backtest.py --help
+python scripts/utbreakout_research_report.py --help
+```
+
+`--train-months`, `--test-months`는 선택한 봉 간격에 맞춰 캔들 수로 변환됩니다.
+
+- `15m` 한 달: 약 2,880개
+- `1h` 한 달: 약 720개
+- `4h` 한 달: 약 180개
+
+백테스트에서는 수수료, 슬리피지, 펀딩, 스프레드와 표본외 구간을 동일 조건으로 비교해야 합니다. 최종 holdout 구간을 파라미터 조정에 사용하지 마세요.
+
+관련 문서:
+
+- [`docs/RSPT_V2.md`](docs/RSPT_V2.md)
+- [`docs/utbreakout_research_workflow.md`](docs/utbreakout_research_workflow.md)
+- [`docs/codex_ops_notes.md`](docs/codex_ops_notes.md)
+
+## 테스트
+
+```bash
+python -m py_compile \
+  emas.py \
+  scripts/launch_emas.py \
+  scripts/utbreakout_backtest.py \
+  scripts/utbreakout_research_report.py
+
+python -m pytest -q
+```
+
+전략이나 주문 코드를 수정할 때는 전체 테스트 외에도 해당 전략, 주문 게이트웨이, TP/SL, 조정, 단일 포지션 테스트를 함께 확인해야 합니다.
+
+## GitHub Actions와 Azure 배포
+
+`main` 브랜치에 push하면 `.github/workflows/deploy.yml`이 실행됩니다.
+
+1. Python 3.12 설정
+2. 주요 파일 `py_compile`
+3. 의존성 설치
+4. 전체 `pytest`
+5. Azure 서버에서 `main` 강제 동기화
+6. 기존 `config.json` 백업·복원
+7. Telegram Token 검증
+8. 기존 프로세스 종료 후 공식 런처로 재시작
+9. heartbeat·프로세스·UTBreak 상태 계약 확인
+10. 중복 Telegram poller 확인
+11. 재부팅 및 5분 health-check cron 등록
+
+테스트가 실패하면 Azure 배포 단계로 진행하지 않습니다.
+
+## 보안
+
+- API Key에는 출금 권한을 부여하지 마세요.
+- 가능하면 IP 화이트리스트를 사용하세요.
+- Testnet과 Mainnet 키를 분리하세요.
+- Telegram `chat_id`를 반드시 고정하세요.
+- `config.json`, `runtime/`, 로그, DB를 외부에 공유하지 마세요.
+- 실거래 설정 변경 후에는 포지션과 TP/SL 주문을 읽기 전용으로 다시 확인하세요.
+
+## 면책
+
+이 프로젝트는 개인 연구·자동화 목적의 소프트웨어입니다. 어떤 전략도 수익을 보장하지 않으며, 레버리지 선물 거래에서는 원금 전액을 잃을 수 있습니다. 실제 주문 여부와 손실 책임은 운영자에게 있습니다.
