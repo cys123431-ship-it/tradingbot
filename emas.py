@@ -10158,6 +10158,12 @@ class SignalEngine(BaseEngine):
         """Account-region exclusions supplied by the user; never scan or trade."""
         return {'SKHYNIX', 'HYUNDAI', 'SAMSUNG'}
 
+    def _utbreakout_restricted_symbol_exceptions(self):
+        """Explicitly allowed Binance contracts that must not match legacy names."""
+        # SKHY is the Nasdaq ADR-linked Binance TradFi perpetual. It is a
+        # different contract from the legacy SKHYNIX synthetic ticker.
+        return {'SKHY'}
+
     def _utbreakout_symbol_base(self, symbol):
         raw = str(symbol or '').upper().strip()
         if not raw:
@@ -10193,10 +10199,10 @@ class SignalEngine(BaseEngine):
         )
 
     def _is_utbreakout_restricted_symbol(self, symbol):
-        return (
-            self._utbreakout_symbol_base(symbol)
-            in self._utbreakout_restricted_symbol_bases()
-        )
+        base = self._utbreakout_symbol_base(symbol)
+        if base in self._utbreakout_restricted_symbol_exceptions():
+            return False
+        return base in self._utbreakout_restricted_symbol_bases()
 
     def _utbreakout_restricted_symbol_reason(self, symbol):
         base = self._utbreakout_symbol_base(symbol)
@@ -44271,7 +44277,7 @@ UTBot:
 코인: {coin_mode}
 AUTO 묶음: `{'ON' if auto_bundle_on else 'OFF'}` (코인 자동선택 + Set 자동 + Adaptive TF)
 Auto Entry Bridge: `{'ON' if bridge_on else 'OFF'}`
-제외 티커: `SKHYNIX, HYUNDAI, SAMSUNG`
+제외 티커: `SKHYNIX, HYUNDAI, SAMSUNG` (SKHY ADR perpetual은 허용)
 Set: `{mode_label}` / 수동 `Set{set_id} {set_info.get('name')}` / 최근 AUTO `{('Set' + str(auto_set) + ' ' + str(auto_name)) if auto_set else '대기'}`
 시간봉: 진입 `{cfg.get('entry_timeframe', '15m')}` / 청산 `{cfg.get('exit_timeframe', cfg.get('entry_timeframe', '15m'))}` / HTF `{cfg.get('htf_timeframe', '1h')}`
 Adaptive 최근: `{adaptive_summary}`

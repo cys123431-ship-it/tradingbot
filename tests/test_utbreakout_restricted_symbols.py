@@ -32,6 +32,13 @@ def test_restricted_symbol_base_detection():
     ):
         assert engine._is_utbreakout_restricted_symbol(symbol)
 
+    for symbol in (
+        "SKHY",
+        "SKHYUSDT",
+        "SKHY/USDT:USDT",
+    ):
+        assert not engine._is_utbreakout_restricted_symbol(symbol)
+
     assert not engine._is_utbreakout_restricted_symbol("SOLUSDT")
     assert not engine._is_utbreakout_restricted_symbol("BTC/USDT:USDT")
     assert not engine._is_utbreakout_restricted_symbol("ETHUSDT")

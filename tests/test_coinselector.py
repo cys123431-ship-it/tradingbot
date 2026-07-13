@@ -90,6 +90,31 @@ def test_coinselector_accepts_tradifi_usdt_perpetual():
     assert "INVALID_MARKET" not in candidate["reject_reasons"]
 
 
+def test_coinselector_accepts_skhy_tradifi_perpetual():
+    cfg = default_coin_selector_config()
+    market = _market(
+        symbol="SKHY/USDT:USDT",
+        id="SKHYUSDT",
+        base="SKHY",
+        info={
+            "symbol": "SKHYUSDT",
+            "contractType": "TRADIFI_PERPETUAL",
+            "status": "TRADING",
+        },
+    )
+    candidate = build_base_candidate(
+        "SKHY/USDT:USDT",
+        _ticker(quoteVolume=500_000_000),
+        market,
+        cfg,
+    )
+
+    assert candidate["accepted"] is True
+    assert candidate["tradifi_perpetual"] is True
+    assert market_is_tradifi_perpetual("SKHY/USDT:USDT", market) is True
+    assert "INVALID_MARKET" not in candidate["reject_reasons"]
+
+
 def test_custom_symbols_normalize_and_dedupe_to_usdt_pairs():
     symbols = normalize_custom_symbols("BTC BTCUSDT BTC/USDT BTC/USDT:USDT eth, SOL")
 
