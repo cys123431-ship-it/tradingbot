@@ -78,6 +78,10 @@ def validate_stop_against_liquidation(
     minimum_buffer_ticks: int,
     working_type: str,
     entry_price: Any = 0,
+    *,
+    accepted_working_types: set[str] | frozenset[str] | tuple[str, ...] | None = None,
+    non_mark_minimum_buffer_pct: Any | None = None,
+    non_mark_buffer_multiplier: Any = 1,
 ) -> LiquidationSafetyResult:
     side_value = str(side or "").strip().lower()
     stop = as_decimal(stop_price, name="stop_price")
@@ -86,6 +90,27 @@ def validate_stop_against_liquidation(
     entry = as_decimal(entry_price, name="entry_price")
     buffer_rate = as_decimal(minimum_buffer_pct, name="minimum_buffer_pct")
     working = str(working_type or "").strip().upper()
+    accepted = {
+        str(value or "").strip().upper()
+        for value in (accepted_working_types or {"MARK_PRICE"})
+        if str(value or "").strip()
+    }
+    if not accepted:
+        accepted = {"MARK_PRICE"}
+    effective_buffer_rate = buffer_rate
+    if working != "MARK_PRICE" and working in accepted:
+        multiplier = as_decimal(non_mark_buffer_multiplier, name="non_mark_buffer_multiplier")
+        if multiplier < Decimal("1"):
+            multiplier = Decimal("1")
+        effective_buffer_rate = buffer_rate * multiplier
+        if non_mark_minimum_buffer_pct is not None:
+            effective_buffer_rate = max(
+                effective_buffer_rate,
+                as_decimal(
+                    non_mark_minimum_buffer_pct,
+                    name="non_mark_minimum_buffer_pct",
+                ),
+            )
 
     if side_value not in {"long", "short"}:
         raise ValueError(f"invalid side: {side!r}")
@@ -106,7 +131,7 @@ def validate_stop_against_liquidation(
         )
 
     buffer_abs = max(
-        liquidation * buffer_rate,
+        liquidation * effective_buffer_rate,
         tick * max(0, int(minimum_buffer_ticks or 0)),
     )
     buffer_pct = buffer_abs / liquidation
@@ -115,8 +140,12 @@ def validate_stop_against_liquidation(
     minimum_safe_stop = long_minimum if side_value == "long" else None
     maximum_safe_stop = short_maximum if side_value == "short" else None
 
-    if working != "MARK_PRICE":
-        reason = "STOP_WORKING_TYPE_NOT_MARK_PRICE"
+    if working not in accepted:
+        reason = (
+            "STOP_WORKING_TYPE_NOT_MARK_PRICE"
+            if accepted == {"MARK_PRICE"}
+            else "STOP_WORKING_TYPE_NOT_ACCEPTED"
+        )
         valid = False
     elif side_value == "long" and stop < liquidation:
         reason = "LONG_STOP_BELOW_LIQUIDATION"
@@ -137,7 +166,7 @@ def validate_stop_against_liquidation(
         reason = "SHORT_STOP_LIQUIDATION_BUFFER_INSUFFICIENT"
         valid = False
     else:
-        reason = "SAFE"
+        reason = "SAFE" if working == "MARK_PRICE" else f"SAFE_EXTERNAL_{working}"
         valid = True
 
     return LiquidationSafetyResult(

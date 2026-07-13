@@ -88,3 +88,36 @@ def test_unsafe_replacement_stop_never_becomes_protected():
     replacement = validate("short", "119", "120", tick="0.1", ticks=0)
     assert safe.valid is True
     assert replacement.valid is False
+
+
+def test_external_contract_price_stop_requires_larger_buffer():
+    safe = validate_stop_against_liquidation(
+        "short",
+        "467.14",
+        "518.3729034",
+        "0.01",
+        "0.02",
+        20,
+        "CONTRACT_PRICE",
+        entry_price="424.6755308",
+        accepted_working_types={"MARK_PRICE", "CONTRACT_PRICE"},
+        non_mark_minimum_buffer_pct="0.05",
+        non_mark_buffer_multiplier="2",
+    )
+    too_close = validate_stop_against_liquidation(
+        "short",
+        "500",
+        "518.3729034",
+        "0.01",
+        "0.02",
+        20,
+        "CONTRACT_PRICE",
+        entry_price="424.6755308",
+        accepted_working_types={"MARK_PRICE", "CONTRACT_PRICE"},
+        non_mark_minimum_buffer_pct="0.05",
+        non_mark_buffer_multiplier="2",
+    )
+    assert safe.valid is True
+    assert safe.reason == "SAFE_EXTERNAL_CONTRACT_PRICE"
+    assert too_close.valid is False
+    assert too_close.reason == "SHORT_STOP_LIQUIDATION_BUFFER_INSUFFICIENT"

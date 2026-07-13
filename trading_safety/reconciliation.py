@@ -100,7 +100,12 @@ def _order_symbol(order: dict[str, Any]) -> str:
 
 def _is_reduce_only(order: dict[str, Any]) -> bool:
     info = _as_dict(order.get("info"))
-    for value in (order.get("reduceOnly"), info.get("reduceOnly"), info.get("closePosition")):
+    for value in (
+        order.get("reduceOnly"),
+        order.get("closePosition"),
+        info.get("reduceOnly"),
+        info.get("closePosition"),
+    ):
         if isinstance(value, bool) and value:
             return True
         if str(value or "").strip().lower() in {"true", "1", "yes"}:
@@ -125,6 +130,16 @@ def _is_take_profit_order(order: dict[str, Any]) -> bool:
     order_type = str(order.get("type") or info.get("type") or "").upper()
     client_id = _order_client_id(order).lower()
     return "TAKE_PROFIT" in order_type or order_type == "LIMIT" or "-tp" in client_id
+
+
+def _is_close_position_order(order: dict[str, Any]) -> bool:
+    info = _as_dict(order.get("info"))
+    for value in (order.get("closePosition"), info.get("closePosition")):
+        if isinstance(value, bool) and value:
+            return True
+        if str(value or "").strip().lower() in {"true", "1", "yes"}:
+            return True
+    return False
 
 
 def _order_qty(order: dict[str, Any]) -> float:
@@ -473,12 +488,16 @@ async def reconcile_exchange_state(
             if _order_side(stop) != close_side:
                 stop_failures.append("stop_wrong_side")
                 continue
-            if _order_qty(stop) + max(position_qty * 0.01, 1e-12) < position_qty:
+            if (
+                not _is_close_position_order(stop)
+                and _order_qty(stop) + max(position_qty * 0.01, 1e-12) < position_qty
+            ):
                 stop_failures.append("stop_qty_insufficient")
                 continue
             if liquidation_price <= 0 or tick_size <= 0:
                 stop_failures.append("liquidation_price_unavailable")
                 continue
+            working_type = _order_working_type(stop) or "CONTRACT_PRICE"
             safety = validate_stop_against_liquidation(
                 side,
                 _order_trigger_price(stop),
@@ -486,8 +505,11 @@ async def reconcile_exchange_state(
                 tick_size,
                 safety_cfg.minimum_buffer_pct,
                 safety_cfg.minimum_buffer_ticks,
-                _order_working_type(stop),
+                working_type,
                 entry_price,
+                accepted_working_types={"MARK_PRICE", "CONTRACT_PRICE"},
+                non_mark_minimum_buffer_pct="0.05",
+                non_mark_buffer_multiplier="2",
             )
             if not safety.valid:
                 stop_failures.append(safety.reason)

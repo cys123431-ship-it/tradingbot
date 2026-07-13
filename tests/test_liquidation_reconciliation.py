@@ -66,20 +66,42 @@ def test_restart_blocks_position_with_stop_below_liquidation():
     asyncio.run(scenario())
 
 
-def test_restart_rejects_last_price_stop_and_missing_liquidation():
+def test_restart_accepts_wide_contract_price_stop_but_rejects_missing_liquidation():
     async def scenario():
-        for pos, order, issue in (
-            (position(), stop("0.00021", "CONTRACT_PRICE"), "STOP_WORKING_TYPE_NOT_MARK_PRICE"),
-            (position("0"), stop("0.00021"), "liquidation_price_unavailable"),
-        ):
-            result = await reconcile_exchange_state(
-                FakeExchange(),
-                SQLiteTradingStateStore(":memory:"),
-                position_fetcher=lambda pos=pos: _async([pos]),
-                open_orders_fetcher=lambda order=order: _async([order]),
+        external_stop = stop("0.00021", "CONTRACT_PRICE")
+        external_stop["closePosition"] = True
+        external_stop["amount"] = 0
+        external_stop["reduceOnly"] = False
+        store = SQLiteTradingStateStore(":memory:")
+        store.upsert(
+            OrderRecord(
+                client_order_id="entry-external-stop",
+                symbol="HMSTR/USDT:USDT",
+                side="LONG",
+                strategy="UTBREAKOUT",
+                signal_timestamp="1",
+                requested_qty=1000,
+                filled_qty=1000,
+                order_state=OrderState.FILLED_UNPROTECTED.value,
             )
-            assert result.safe_to_trade is False
-            assert any(issue in value for value in result.issues)
+        )
+        accepted = await reconcile_exchange_state(
+            FakeExchange(),
+            store,
+            position_fetcher=lambda: _async([position()]),
+            open_orders_fetcher=lambda: _async([external_stop]),
+        )
+        assert accepted.safe_to_trade is True
+        assert store.get("entry-external-stop").order_state == OrderState.PROTECTED.value
+
+        missing = await reconcile_exchange_state(
+            FakeExchange(),
+            SQLiteTradingStateStore(":memory:"),
+            position_fetcher=lambda: _async([position("0")]),
+            open_orders_fetcher=lambda: _async([stop("0.00021")]),
+        )
+        assert missing.safe_to_trade is False
+        assert any("liquidation_price_unavailable" in value for value in missing.issues)
 
     asyncio.run(scenario())
 

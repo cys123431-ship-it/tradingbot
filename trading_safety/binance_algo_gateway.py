@@ -90,6 +90,10 @@ class BinanceAlgoOrderGateway:
             "reduceOnly": str(info.get("reduceOnly", "false")).lower() == "true"
             if not isinstance(info.get("reduceOnly"), bool)
             else info.get("reduceOnly"),
+            "closePosition": str(info.get("closePosition", "false")).lower() == "true"
+            if not isinstance(info.get("closePosition"), bool)
+            else info.get("closePosition"),
+            "positionSide": info.get("positionSide"),
             "workingType": info.get("workingType"),
             "priceProtect": info.get("priceProtect"),
             "status": info.get("algoStatus") or info.get("status"),

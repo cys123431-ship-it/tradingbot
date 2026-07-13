@@ -33825,6 +33825,14 @@ class SignalEngine(BaseEngine):
             or ''
         ).strip().upper()
 
+    def _is_bot_managed_protection_order(self, order):
+        client_id = re.sub(
+            r'[^a-z0-9]',
+            '',
+            self._protection_client_order_id(order).lower(),
+        )
+        return client_id.startswith('utb')
+
     def _liquidation_safety_config(self, extra=None):
         values = {}
         try:
@@ -33881,6 +33889,67 @@ class SignalEngine(BaseEngine):
             safety_cfg.minimum_buffer_ticks,
             working_type,
             entry_price,
+        )
+
+    def _validate_existing_position_stop_liquidation(
+        self,
+        symbol,
+        pos,
+        stop_price,
+        working_type,
+        order,
+        cfg=None,
+    ):
+        result = self._validate_position_stop_liquidation(
+            symbol,
+            pos,
+            stop_price,
+            working_type,
+            cfg,
+        )
+        if result is None or result.valid or self._is_bot_managed_protection_order(order):
+            return result
+        if result.reason not in {
+            'STOP_WORKING_TYPE_NOT_MARK_PRICE',
+            'STOP_WORKING_TYPE_NOT_ACCEPTED',
+        }:
+            return result
+        actual_working_type = str(working_type or 'CONTRACT_PRICE').strip().upper()
+        if actual_working_type not in {'CONTRACT_PRICE', 'LAST_PRICE'}:
+            return result
+        side = str((pos or {}).get('side') or '').lower()
+        liquidation_price = _safe_float_or_none(
+            (pos or {}).get('liquidationPrice')
+            or (pos or {}).get('liquidation_price')
+            or self._protection_order_info(pos or {}).get('liquidationPrice')
+        )
+        entry_price = _safe_float_or_none(
+            (pos or {}).get('entryPrice') or (pos or {}).get('entry_price')
+        ) or 0.0
+        tick_size = self._liquidation_tick_size(symbol)
+        if side not in {'long', 'short'} or not liquidation_price or tick_size <= 0:
+            return None
+        safety_cfg = self._liquidation_safety_config(cfg)
+        try:
+            common = self.get_runtime_common_settings()
+        except Exception:
+            common = {}
+        minimum_external_buffer_pct = max(
+            0.05,
+            float((common or {}).get('external_stop_minimum_liquidation_buffer_pct', 0.05) or 0.05),
+        )
+        return validate_stop_against_liquidation(
+            side,
+            stop_price,
+            liquidation_price,
+            tick_size,
+            safety_cfg.minimum_buffer_pct,
+            safety_cfg.minimum_buffer_ticks,
+            'CONTRACT_PRICE',
+            entry_price,
+            accepted_working_types={'MARK_PRICE', 'CONTRACT_PRICE'},
+            non_mark_minimum_buffer_pct=minimum_external_buffer_pct,
+            non_mark_buffer_multiplier=2,
         )
 
     def _protection_order_type(self, order):
@@ -34912,6 +34981,17 @@ class SignalEngine(BaseEngine):
             pos_entry_price = 0.0
         current_qty = abs(float(self._position_signed_contracts(pos) or pos.get('contracts', 0) or 0))
         runner_state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
+        tracked_records = []
+        try:
+            if hasattr(self, 'trading_state_store'):
+                tracked_records = self.trading_state_store.active_for_symbol(symbol) or []
+        except Exception:
+            tracked_records = []
+        external_position = not isinstance(runner_state, dict) and not bool(tracked_records)
+        status['external_position'] = bool(external_position)
+        if external_position:
+            expected_tp = False
+            status['tp_expected'] = False
         managed_sl_active = (
             isinstance(runner_state, dict)
             and bool(runner_state.get('active'))
@@ -35016,31 +35096,46 @@ class SignalEngine(BaseEngine):
             if pos_entry_price > 0 and order_price:
                 if kind == 'sl':
                     working_type = self._protection_working_type(order)
-                    liquidation_result = self._validate_position_stop_liquidation(
+                    liquidation_result = self._validate_existing_position_stop_liquidation(
                         symbol,
                         pos,
                         order_price,
                         working_type,
+                        order,
                     )
                     if enforce_liquidation_safety:
                         if liquidation_result is None:
                             status['liquidation_safety'] = 'UNKNOWN'
                             status['liquidation_safety_reason'] = 'LIQUIDATION_PRICE_UNAVAILABLE'
                             status['stop_working_type'] = working_type or 'UNKNOWN'
-                            liquidation_unsafe_orders.append(order)
-                            continue
-                        liquidation_safety_results.append(liquidation_result)
-                        status['liquidation_price'] = float(liquidation_result.liquidation_price)
-                        status['liquidation_buffer_pct'] = float(liquidation_result.buffer_pct)
-                        status['stop_price'] = float(liquidation_result.stop_price)
-                        status['stop_working_type'] = liquidation_result.working_type
-                        if not liquidation_result.valid:
-                            status['liquidation_safety'] = 'UNSAFE'
+                            if external_position:
+                                status['liquidation_safety'] = 'UNVERIFIED_EXTERNAL_SL_PRESERVED'
+                                status['liquidation_safety_reason'] = (
+                                    'LIQUIDATION_PRICE_UNAVAILABLE_EXTERNAL_SL_PRESERVED'
+                                )
+                                self._set_crypto_entry_lock(
+                                    f'FILLED_UNVERIFIED_LIQUIDATION:{symbol}'
+                                )
+                            else:
+                                liquidation_unsafe_orders.append(order)
+                                continue
+                        else:
+                            liquidation_safety_results.append(liquidation_result)
+                            status['liquidation_price'] = float(liquidation_result.liquidation_price)
+                            status['liquidation_buffer_pct'] = float(liquidation_result.buffer_pct)
+                            status['stop_price'] = float(liquidation_result.stop_price)
+                            status['stop_working_type'] = liquidation_result.working_type
+                            if not liquidation_result.valid:
+                                status['liquidation_safety'] = 'UNSAFE'
+                                status['liquidation_safety_reason'] = liquidation_result.reason
+                                liquidation_unsafe_orders.append(order)
+                                continue
+                            status['liquidation_safety'] = (
+                                'SAFE_EXTERNAL'
+                                if str(liquidation_result.reason).startswith('SAFE_EXTERNAL_')
+                                else 'SAFE'
+                            )
                             status['liquidation_safety_reason'] = liquidation_result.reason
-                            liquidation_unsafe_orders.append(order)
-                            continue
-                        status['liquidation_safety'] = 'SAFE'
-                        status['liquidation_safety_reason'] = liquidation_result.reason
                     invalid_sl = False if managed_sl_active else (
                         (pos_side == 'long' and float(order_price) >= pos_entry_price)
                         or (pos_side == 'short' and float(order_price) <= pos_entry_price)
