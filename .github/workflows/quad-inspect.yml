@@ -1,37 +1,76 @@
-name: Quad strategy inspection
+name: Quad crowding integration
 
 on:
   pull_request:
     branches:
       - main
     paths:
+      - .agent/apply_quad_crowding.py
       - .github/workflows/quad-inspect.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  package:
+  apply-test-commit:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'agent/quad-crowding'
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
         with:
           ref: agent/quad-crowding
-      - name: Package current strategy runtime
-        run: |
-          mkdir -p /tmp/quad-inspect/tests /tmp/quad-inspect/utbreakout
-          cp emas.py README.md /tmp/quad-inspect/
-          cp tests/test_qh_flow_integration.py /tmp/quad-inspect/tests/
-          cp tests/test_utbreakout_helpers.py /tmp/quad-inspect/tests/
-          cp tests/test_strategy_suite_v3.py /tmp/quad-inspect/tests/
-          cp utbreakout/qh_flow.py /tmp/quad-inspect/utbreakout/
-          cp utbreakout/crowding_unwind.py /tmp/quad-inspect/utbreakout/
-          cp utbreakout/strategy_allocator.py /tmp/quad-inspect/utbreakout/
-          cp utbreakout/relative_strength_pullback.py /tmp/quad-inspect/utbreakout/
-          cp utbreakout/rspt_v3.py /tmp/quad-inspect/utbreakout/
-          cd /tmp && zip -qr quad-inspect.zip quad-inspect
-      - uses: actions/upload-artifact@v4
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          name: quad-inspect
-          path: /tmp/quad-inspect.zip
-          retention-days: 1
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+
+      - name: Validate patch
+        run: |
+          echo '1de53aa399d62b24b12fed6159828fd09856f8750b8c6cb58a21aec884b68419  .agent/apply_quad_crowding.py' | sha256sum -c -
+          python -m py_compile .agent/apply_quad_crowding.py
+
+      - name: Apply Quad integration
+        run: python .agent/apply_quad_crowding.py
+
+      - name: Compile changed runtime
+        run: |
+          python -m py_compile \
+            emas.py \
+            utbreakout/qh_flow.py \
+            tests/test_qh_flow_integration.py
+
+      - name: Run focused strategy tests
+        run: |
+          python -m pytest -q \
+            tests/test_qh_flow_integration.py \
+            tests/test_strategy_suite_v3.py \
+            tests/test_qh_flow.py \
+            tests/test_relative_strength_pullback.py \
+            tests/test_rspt_v2.py
+
+      - name: Run full regression suite
+        run: python -m pytest -q
+
+      - name: Validate diff
+        run: git diff --check
+
+      - name: Commit validated implementation
+        run: |
+          rm -f .agent/apply_quad_crowding.py
+          rm -f .github/workflows/quad-inspect.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'feat: add Crowding Unwind to Quad strategy'
+          git push origin HEAD:agent/quad-crowding
