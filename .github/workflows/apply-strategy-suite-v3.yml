@@ -97,7 +97,21 @@ jobs:
         run: python -m pytest -q tests/test_rspt_v2.py
 
       - name: Run full regression suite
-        run: python -m pytest -q
+        run: |
+          set +e
+          python -m pytest -q -x > /tmp/pytest-full.log 2>&1
+          status=$?
+          cat /tmp/pytest-full.log
+          exit $status
+
+      - name: Upload full regression failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strategy-suite-v3-pytest-failure
+          path: /tmp/pytest-full.log
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Validate diff
         run: git diff --check
