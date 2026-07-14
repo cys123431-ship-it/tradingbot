@@ -14,6 +14,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 QH_FLOW_STRATEGY = "qh_flow_v1"
 TRIPLE_ALPHA_STRATEGY = "triple_alpha_v1"
+QUAD_ALPHA_STRATEGY = "quad_alpha_v1"
 
 
 def default_qh_flow_config() -> dict[str, Any]:
@@ -51,6 +52,10 @@ def default_qh_flow_config() -> dict[str, Any]:
         "triple_three_signal_multiplier": 1.00,
         "triple_two_signal_multiplier": 0.85,
         "triple_single_signal_multiplier": 0.55,
+        "quad_four_signal_multiplier": 1.00,
+        "quad_three_signal_multiplier": 0.90,
+        "quad_two_signal_multiplier": 0.75,
+        "quad_single_signal_multiplier": 0.45,
     }
 
 
