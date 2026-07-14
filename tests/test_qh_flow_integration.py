@@ -11,8 +11,10 @@ def test_qh_and_triple_are_selectable_live_strategies():
     emas = _emas_module()
     assert emas.QH_FLOW_STRATEGY in emas.UTBREAKOUT_STRATEGIES
     assert emas.TRIPLE_ALPHA_STRATEGY in emas.UTBREAKOUT_STRATEGIES
+    assert emas.QUAD_ALPHA_STRATEGY in emas.UTBREAKOUT_STRATEGIES
     assert emas.STRATEGY_DISPLAY_NAMES[emas.QH_FLOW_STRATEGY] == "QH_FLOW"
     assert emas.STRATEGY_DISPLAY_NAMES[emas.TRIPLE_ALPHA_STRATEGY] == "TRIPLE_ALPHA"
+    assert emas.STRATEGY_DISPLAY_NAMES[emas.QUAD_ALPHA_STRATEGY] == "QUAD_ALPHA"
 
 
 def test_triple_branch_params_keep_three_engines_independent():
@@ -100,6 +102,9 @@ def test_qh_and_triple_callback_actions_are_registered():
         "triple",
         "triplet",
         "triple_status",
+        "quad",
+        "quadalpha",
+        "quad_status",
     } <= emas.UTBREAKOUT_CALLBACK_ACTIONS
 
 def test_crowding_and_allocator_are_registered():
@@ -124,3 +129,105 @@ def test_strategy_allocator_plan_hook_scales_once(monkeypatch):
     second = engine._apply_strategy_allocator_to_plan(first)
     assert first["qty"] < 2.0
     assert second["qty"] == first["qty"]
+
+def test_quad_branch_params_enable_crowding_without_cross_branch_confirmation():
+    emas = _emas_module()
+    engine = object.__new__(emas.SignalEngine)
+    params = {
+        "active_strategy": emas.QUAD_ALPHA_STRATEGY,
+        "UTBotFilteredBreakoutV1": {
+            "qh_flow_confirmation_enabled": True,
+            "crowding_unwind_live_enabled": False,
+            "crowding_unwind": {"enabled": False, "live_enabled": False},
+        },
+    }
+    engine._crowding_unwind_runtime_config = lambda cfg=None: {
+        "enabled": False,
+        "live_enabled": False,
+    }
+
+    crowd = engine._quad_alpha_strategy_params(params, emas.CROWDING_UNWIND_STRATEGY)
+
+    assert crowd["active_strategy"] == emas.CROWDING_UNWIND_STRATEGY
+    cfg = crowd["UTBotFilteredBreakoutV1"]
+    assert cfg["crowding_unwind_live_enabled"] is True
+    assert cfg["crowding_unwind"]["enabled"] is True
+    assert cfg["crowding_unwind"]["live_enabled"] is True
+    assert cfg["qh_flow_confirmation_enabled"] is False
+
+
+def test_quad_four_way_agreement_selects_full_risk_plan():
+    emas = _emas_module()
+    engine = object.__new__(emas.SignalEngine)
+    engine.quad_alpha_last_status = {}
+    engine.last_entry_reason = {}
+    selected_plans = []
+    plans = {
+        emas.ENTRY_STRATEGY_UT_BREAKOUT: {"strategy": emas.ENTRY_STRATEGY_UT_BREAKOUT, "plan_symbol": "BTC/USDT:USDT", "qty": 1.0, "risk_usdt": 1.0},
+        emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND: {"strategy": emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND, "plan_symbol": "BTC/USDT:USDT", "qty": 1.0, "risk_usdt": 1.0},
+        emas.QH_FLOW_STRATEGY: {"strategy": emas.QH_FLOW_STRATEGY, "plan_symbol": "BTC/USDT:USDT", "qty": 1.0, "risk_usdt": 1.0},
+        emas.CROWDING_UNWIND_STRATEGY: {"strategy": emas.CROWDING_UNWIND_STRATEGY, "plan_symbol": "BTC/USDT:USDT", "qty": 1.0, "risk_usdt": 1.0},
+    }
+    current = {"key": None}
+
+    engine._canonical_futures_symbol = lambda symbol: symbol
+    engine._clear_utbot_filtered_breakout_entry_plan = lambda symbol: None
+    engine._get_utbot_filtered_breakout_config = lambda params=None: {}
+    engine._qh_flow_runtime_config = lambda cfg=None: {}
+    engine._quad_alpha_strategy_params = lambda params, branch: {"branch": branch}
+    engine._utbreakout_diag_for_symbol = lambda symbol: {}
+    engine._get_utbot_filtered_breakout_entry_plan = lambda symbol, side=None: plans[current["key"]]
+    engine._dual_alpha_score = lambda key, side, status, plan: {
+        emas.ENTRY_STRATEGY_UT_BREAKOUT: 90,
+        emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND: 80,
+        emas.QH_FLOW_STRATEGY: 70,
+        emas.CROWDING_UNWIND_STRATEGY: 60,
+    }[key]
+    engine._dual_alpha_scale_plan = lambda plan, multiplier: {
+        **plan,
+        "qty": plan["qty"] * multiplier,
+        "risk_usdt": plan["risk_usdt"] * multiplier,
+    }
+    engine._dual_alpha_light = lambda status, label: {
+        "light": "green",
+        "side": status.get("accepted_side"),
+        "reason": status.get("reason"),
+    }
+    engine._set_utbot_filtered_breakout_entry_plan = lambda symbol, plan: selected_plans.append((symbol, dict(plan)))
+    engine._store_utbot_filtered_breakout_status = lambda symbol, status: None
+
+    async def ut(*args, **kwargs):
+        current["key"] = emas.ENTRY_STRATEGY_UT_BREAKOUT
+        return "long", "ut long", {"accepted_side": "long", "reason": "ut long"}
+
+    async def rsp(*args, **kwargs):
+        current["key"] = emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
+        return "long", "rsp long", {"accepted_side": "long", "reason": "rsp long"}
+
+    async def qh(*args, **kwargs):
+        current["key"] = emas.QH_FLOW_STRATEGY
+        return "long", "qh long", {"accepted_side": "long", "reason": "qh long"}
+
+    async def crowd(*args, **kwargs):
+        current["key"] = emas.CROWDING_UNWIND_STRATEGY
+        return "long", "crowd long", {"accepted_side": "long", "reason": "crowd long"}
+
+    engine._calculate_utbot_filtered_breakout_signal = ut
+    engine._calculate_relative_strength_pullback_signal = rsp
+    engine._calculate_qh_flow_signal = qh
+    engine._calculate_crowding_unwind_signal = crowd
+
+    side, _, status = asyncio.run(
+        engine._calculate_quad_alpha_signal(
+            "BTC/USDT:USDT",
+            None,
+            {"active_strategy": emas.QUAD_ALPHA_STRATEGY},
+        )
+    )
+
+    assert side == "long"
+    assert status["quad_alpha"]["confirmation_count"] == 4
+    assert status["quad_alpha"]["agreement_state"] == "quad"
+    assert status["quad_alpha"]["agreement_risk_multiplier"] == pytest.approx(1.0)
+    assert selected_plans[-1][1]["quad_alpha_confirmation_count"] == 4
+    assert selected_plans[-1][1]["qty"] == pytest.approx(1.0)
