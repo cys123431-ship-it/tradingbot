@@ -60,8 +60,22 @@ jobs:
       - name: Run full regression suite
         run: python -m pytest -q
 
-      - name: Validate diff
-        run: git diff --check
+      - name: Normalize and validate diff
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          for name in (
+              'README.md',
+              'emas.py',
+              'tests/test_qh_flow_integration.py',
+              'utbreakout/qh_flow.py',
+          ):
+              path = Path(name)
+              lines = path.read_text(encoding='utf-8').splitlines()
+              path.write_text('\n'.join(line.rstrip() for line in lines).rstrip() + '\n', encoding='utf-8')
+          PY
+          git diff --check
 
       - name: Commit validated implementation
         run: |
