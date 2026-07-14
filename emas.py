@@ -165,6 +165,17 @@ from utbreakout.qh_flow import (
     quarter_hour_boundary_ms,
     summarize_agg_trades,
 )
+from utbreakout.crowding_unwind import (
+    CROWDING_UNWIND_STRATEGY,
+    default_crowding_unwind_config,
+    evaluate_crowding_unwind,
+)
+from utbreakout.strategy_allocator import (
+    default_strategy_allocator_config,
+    evaluate_strategy_allocation,
+    scale_plan_risk,
+    summarize_strategy_trades,
+)
 from utbreakout.market_context import build_market_context
 from utbreakout.exit_policy import evaluate_time_stop, evaluate_signal_invalid_exit
 from utbreakout.ev_adaptive import (
@@ -251,6 +262,9 @@ UTBREAKOUT_CALLBACK_ACTIONS = UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS | frozenset({
     "auto",
     "auto_bundle",
     "adaptive",
+    "crowd",
+    "crowding",
+    "crowding_status",
     "dual",
     "dualt",
     "dual_status",
@@ -532,6 +546,7 @@ UTBREAKOUT_STRATEGIES = {
     UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY,
     ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
     QH_FLOW_STRATEGY,
+    CROWDING_UNWIND_STRATEGY,
     DUAL_ALPHA_STRATEGY,
     TRIPLE_ALPHA_STRATEGY,
 }
@@ -566,6 +581,7 @@ STRATEGY_DISPLAY_NAMES = {
     UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY: 'UTBOT_ADAPTIVE_TIMEFRAME_V1',
     ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND: 'RELATIVE_STRENGTH_PULLBACK_TREND',
     QH_FLOW_STRATEGY: 'QH_FLOW',
+    CROWDING_UNWIND_STRATEGY: 'FUNDING_OI_CROWDING_UNWIND',
     DUAL_ALPHA_STRATEGY: 'DUAL_ALPHA',
     TRIPLE_ALPHA_STRATEGY: 'TRIPLE_ALPHA',
 }
@@ -2367,6 +2383,10 @@ def build_default_utbot_filtered_breakout_config():
         'qh_flow_live_enabled': False,
         'qh_flow_confirmation_enabled': True,
         'l2_gate_enabled': True,
+        'crowding_unwind': default_crowding_unwind_config(),
+        'crowding_unwind_live_enabled': False,
+        'strategy_allocator': default_strategy_allocator_config(),
+        'strategy_allocator_enabled': True,
         'entry_strategy': ENTRY_STRATEGY_UT_BREAKOUT,
         'relative_strength_pullback_trend': default_relative_strength_pullback_config(),
         'relative_strength_pullback_trend_shadow_enabled': True,
@@ -5416,6 +5436,10 @@ class SignalEngine(BaseEngine):
         self.qh_flow_signal_cache = {}  # symbol:boundary -> live quarter-hour evaluation
         self.qh_flow_last_status = {}  # symbol -> latest QH-Flow status
         self.l2_gate_cache = {}  # symbol -> short-lived shared L2 state
+        self.l2_gate_history = {}  # symbol -> dynamic L2 replenishment/depletion samples
+        self.crowding_unwind_last_status = {}  # symbol -> latest funding/OI unwind status
+        self.strategy_allocator_last_status = {}  # strategy -> adaptive risk summary
+        self.strategy_allocator_cache = {}  # short-lived finalized trade summaries
         self.triple_alpha_last_status = {}  # symbol -> latest triple strategy summary
         self.last_live_entry_snapshot = {}  # latest confirmed live entry, for status fallback only
         self.utbreakout_adaptive_tf_state = {}  # symbol -> selected TF stability state
@@ -5609,6 +5633,10 @@ class SignalEngine(BaseEngine):
         self.qh_flow_signal_cache = {}
         self.qh_flow_last_status = {}
         self.l2_gate_cache = {}
+        self.l2_gate_history = {}
+        self.crowding_unwind_last_status = {}
+        self.strategy_allocator_last_status = {}
+        self.strategy_allocator_cache = {}
         self.triple_alpha_last_status = {}
         self.last_live_entry_snapshot = {}
         self.utbreakout_adaptive_tf_state = {}
@@ -10320,6 +10348,8 @@ class SignalEngine(BaseEngine):
         if not isinstance(plan, dict):
             return
         stored = dict(plan)
+        if not bool(stored.get('strategy_allocator_applied')):
+            stored = self._apply_strategy_allocator_to_plan(stored)
         canonical = self._canonical_futures_symbol(
             stored.get('plan_symbol') or symbol
         )
@@ -15002,7 +15032,7 @@ class SignalEngine(BaseEngine):
         if resolved_via_provider:
             self._clear_utbot_filtered_breakout_entry_plan(symbol)
         source_label = (
-            'RSPT-v2 residual strength'
+            'RSPT-v3 BTC/ETH/alt/vol residual strength'
             if independent_direction
             else (direction_source or 'UTBreakout 4h/1d shared direction')
         )
@@ -15032,7 +15062,7 @@ class SignalEngine(BaseEngine):
             'rspt_direction_source': source_label,
             'rspt_direction_provider_reason': direction_reason,
             'rspt_internal_direction_disabled': not independent_direction,
-            'rspt_direction_authority': 'RSPT-v2' if independent_direction else 'UTBreakout',
+            'rspt_direction_authority': 'RSPT-v3' if independent_direction else 'UTBreakout',
             'rspt_v2_enabled': bool(rsp_cfg.get('rspt_v2_enabled', True)),
             'entry_execution': 'market',
             'signal_basis': 'last_completed_candle',
@@ -16121,6 +16151,484 @@ class SignalEngine(BaseEngine):
         ])
 
 
+
+    def _strategy_allocator_runtime_config(self, cfg=None):
+        source = dict(cfg or {})
+        base = default_strategy_allocator_config()
+        nested = source.get('strategy_allocator')
+        if isinstance(nested, dict):
+            base.update(nested)
+        if 'strategy_allocator_enabled' in source:
+            base['enabled'] = bool(source.get('strategy_allocator_enabled'))
+        return base
+
+    def _strategy_allocator_key_for_plan(self, plan):
+        plan = dict(plan or {})
+        if plan.get('triple_alpha_agreement_state') or plan.get('triple_alpha_selected_strategy'):
+            return TRIPLE_ALPHA_STRATEGY
+        if plan.get('dual_alpha_agreement_state') or plan.get('dual_alpha_selected_strategy'):
+            return DUAL_ALPHA_STRATEGY
+        return str(plan.get('strategy') or plan.get('entry_strategy') or 'unknown').strip().lower()
+
+    def _load_strategy_allocator_trades(self):
+        store = getattr(self, 'trading_state_store', None)
+        if store is None:
+            store = getattr(getattr(self, 'ctrl', None), 'trading_state_store', None)
+        loader = getattr(store, 'load_trade_results', None)
+        if not callable(loader):
+            return []
+        try:
+            rows = loader()
+        except TypeError:
+            rows = loader(limit=500)
+        except Exception:
+            logger.debug('strategy allocator trade load failed', exc_info=True)
+            return []
+        return list(rows or [])
+
+    def _apply_strategy_allocator_to_plan(self, plan):
+        stored = dict(plan or {})
+        if stored.get('strategy_allocator_applied'):
+            return stored
+        try:
+            cfg = self._get_utbot_filtered_breakout_config()
+        except Exception:
+            cfg = {}
+        allocator_cfg = self._strategy_allocator_runtime_config(cfg)
+        strategy_key = self._strategy_allocator_key_for_plan(stored)
+        metrics = summarize_strategy_trades(
+            self._load_strategy_allocator_trades(),
+            strategy_key,
+            allocator_cfg,
+        )
+        allocation = evaluate_strategy_allocation(metrics, allocator_cfg)
+        scaled = scale_plan_risk(stored, allocation.multiplier)
+        scaled.update({
+            'strategy_allocator_applied': True,
+            'strategy_allocator_key': strategy_key,
+            'strategy_allocator_multiplier': float(allocation.multiplier),
+            'strategy_allocator_reason': allocation.reason,
+            'strategy_allocator_metrics': dict(allocation.metrics),
+        })
+        if not isinstance(getattr(self, 'strategy_allocator_last_status', None), dict):
+            self.strategy_allocator_last_status = {}
+        self.strategy_allocator_last_status[strategy_key] = {
+            'multiplier': float(allocation.multiplier),
+            'reason': allocation.reason,
+            'metrics': dict(allocation.metrics),
+        }
+        return scaled
+
+    async def _evaluate_shared_l2_gate(
+        self,
+        symbol,
+        cfg=None,
+        *,
+        force_refresh=False,
+        side=None,
+    ):
+        qh_cfg = self._qh_flow_runtime_config(cfg)
+        if not bool(qh_cfg.get('l2_gate_enabled', True)) or self.is_upbit_mode():
+            return {
+                'state': 'disabled',
+                'dynamic_state': 'disabled',
+                'allowed': True,
+                'risk_multiplier': 1.0,
+                'reason': 'L2 gate disabled',
+            }
+        canonical = self._canonical_futures_symbol(symbol)
+        cache_key = f"{canonical}:{str(side or 'none').lower()}"
+        now = time.time()
+        if not isinstance(getattr(self, 'l2_gate_cache', None), dict):
+            self.l2_gate_cache = {}
+        if not isinstance(getattr(self, 'l2_gate_history', None), dict):
+            self.l2_gate_history = {}
+        cached = self.l2_gate_cache.get(cache_key)
+        if (
+            not force_refresh
+            and isinstance(cached, dict)
+            and now - float(cached.get('cached_at', 0.0) or 0.0) < 5.0
+        ):
+            return dict(cached.get('data') or {})
+        fetcher = getattr(getattr(self, 'ctrl', None), '_fetch_binance_public_json', None)
+        if not callable(fetcher):
+            result = {
+                'state': 'unavailable',
+                'dynamic_state': 'unavailable',
+                'allowed': True,
+                'risk_multiplier': 1.0,
+                'reason': 'L2 fetcher unavailable in this runtime',
+            }
+            self.l2_gate_cache[cache_key] = {'cached_at': now, 'data': dict(result)}
+            return result
+        try:
+            rest_symbol = self.ctrl._build_binance_futures_rest_symbol(canonical)
+            depth = await fetcher('/fapi/v1/depth', {'symbol': rest_symbol, 'limit': 20})
+            history = list(self.l2_gate_history.get(canonical) or [])[-8:]
+            result = evaluate_l2_gate(
+                depth,
+                qh_cfg,
+                history=history,
+                side=side,
+                symbol=canonical,
+            )
+            sample = {
+                key: result.get(key)
+                for key in (
+                    'bid_depth_usdt',
+                    'ask_depth_usdt',
+                    'imbalance_pct',
+                    'spread_pct',
+                )
+            }
+            sample['timestamp'] = now
+            history.append(sample)
+            self.l2_gate_history[canonical] = history[-12:]
+        except Exception as exc:
+            result = {
+                'state': 'stressed_thin',
+                'dynamic_state': 'stressed_thin',
+                'allowed': False,
+                'risk_multiplier': 0.0,
+                'reason': f'L2 fetch failed: {type(exc).__name__}: {exc}',
+                'error': str(exc),
+            }
+        self.l2_gate_cache[cache_key] = {'cached_at': now, 'data': dict(result)}
+        return result
+
+    async def _fetch_qh_flow_evaluation(self, symbol, cfg=None, *, force_refresh=False, now_ms=None):
+        qh_cfg = self._qh_flow_runtime_config(cfg)
+        canonical = self._canonical_futures_symbol(symbol)
+        now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+        phase = qh_boundary_phase(now_ms, qh_cfg)
+        boundary_ms = int(phase['boundary_ms'])
+        cache_key = f'{canonical}:{boundary_ms}:v2'
+        if not isinstance(getattr(self, 'qh_flow_signal_cache', None), dict):
+            self.qh_flow_signal_cache = {}
+        cached = self.qh_flow_signal_cache.get(cache_key)
+        if not force_refresh and isinstance(cached, dict) and str(cached.get('phase')) in {'ready', 'stale'}:
+            return dict(cached)
+        status = {
+            'strategy': STRATEGY_DISPLAY_NAMES.get(QH_FLOW_STRATEGY, 'QH_FLOW_V2'),
+            'entry_strategy': QH_FLOW_STRATEGY,
+            'strategy_version': 'v2',
+            'symbol': canonical,
+            'phase': phase['phase'],
+            'boundary_ms': boundary_ms,
+            'capture_end_ms': phase['capture_end_ms'],
+            'persistence_end_ms': phase.get('persistence_end_ms'),
+            'boundary_age_seconds': phase['age_seconds'],
+            'seconds_to_next_boundary': phase['seconds_to_next_boundary'],
+            'allowed': False,
+            'side': None,
+            'score': 0.0,
+            'risk_multiplier': 0.0,
+        }
+        if phase['phase'] != 'ready':
+            status['reason'] = {
+                'collecting': 'QH-v2 collecting first 10 seconds',
+                'confirming': 'QH-v2 checking 10-30 second persistence',
+                'stale': 'QH signal window expired',
+            }.get(phase['phase'], f"QH phase {phase['phase']}")
+            self.qh_flow_signal_cache[cache_key] = dict(status)
+            return status
+
+        capture_ms = max(1, int(float(qh_cfg.get('capture_seconds', 10) or 10) * 1000))
+        persistence_ms = max(1, int(float(qh_cfg.get('persistence_seconds', 20) or 20) * 1000))
+        baseline_windows = max(1, int(qh_cfg.get('baseline_windows', 8) or 8))
+        previous_boundaries = [boundary_ms - index * 15 * 60 * 1000 for index in range(1, baseline_windows + 1)]
+        benchmark_symbols = list(qh_cfg.get('benchmark_symbols') or ['BTC/USDT:USDT', 'ETH/USDT:USDT'])
+        tasks = [
+            self._qh_flow_fetch_trade_window(canonical, boundary_ms, boundary_ms + capture_ms - 1),
+            self._qh_flow_fetch_trade_window(
+                canonical,
+                boundary_ms + capture_ms,
+                boundary_ms + capture_ms + persistence_ms - 1,
+            ),
+        ]
+        tasks.extend(
+            self._qh_flow_fetch_trade_window(item, boundary_ms, boundary_ms + capture_ms - 1)
+            for item in benchmark_symbols
+        )
+        tasks.extend(
+            self._qh_flow_fetch_trade_window(canonical, item, item + capture_ms - 1)
+            for item in previous_boundaries
+        )
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        current_rows = [] if isinstance(results[0], Exception) else results[0]
+        persistence_rows = [] if isinstance(results[1], Exception) else results[1]
+        benchmark_results = results[2:2 + len(benchmark_symbols)]
+        baseline_results = results[2 + len(benchmark_symbols):]
+        current_snapshot = summarize_agg_trades(
+            current_rows,
+            start_ms=boundary_ms,
+            end_ms=boundary_ms + capture_ms - 1,
+        )
+        persistence_snapshot = summarize_agg_trades(
+            persistence_rows,
+            start_ms=boundary_ms + capture_ms,
+            end_ms=boundary_ms + capture_ms + persistence_ms - 1,
+        )
+        benchmarks = {}
+        for benchmark, result in zip(benchmark_symbols, benchmark_results):
+            if isinstance(result, Exception):
+                continue
+            benchmarks[benchmark] = summarize_agg_trades(
+                result,
+                start_ms=boundary_ms,
+                end_ms=boundary_ms + capture_ms - 1,
+            )
+        baseline_snapshots = []
+        baseline_errors = []
+        for previous_boundary, result in zip(previous_boundaries, baseline_results):
+            if isinstance(result, Exception):
+                baseline_errors.append(f'{previous_boundary}:{type(result).__name__}')
+                continue
+            snapshot = summarize_agg_trades(
+                result,
+                start_ms=previous_boundary,
+                end_ms=previous_boundary + capture_ms - 1,
+            )
+            if snapshot.get('total_notional', 0.0) > 0:
+                baseline_snapshots.append(snapshot)
+        preliminary_side = (
+            'long'
+            if float(current_snapshot.get('imbalance', 0.0) or 0.0) > 0
+            else 'short'
+            if float(current_snapshot.get('imbalance', 0.0) or 0.0) < 0
+            else None
+        )
+        l2_gate, derivatives = await asyncio.gather(
+            self._evaluate_shared_l2_gate(
+                canonical,
+                cfg,
+                force_refresh=force_refresh,
+                side=preliminary_side,
+            ),
+            self._fetch_utbreakout_futures_context(canonical),
+        )
+        decision = evaluate_qh_flow(
+            current_snapshot,
+            baseline_snapshots,
+            l2_gate,
+            derivatives,
+            qh_cfg,
+            benchmarks=benchmarks,
+            persistence=persistence_snapshot,
+        )
+        status.update({
+            'allowed': bool(decision.allowed),
+            'side': decision.side,
+            'score': float(decision.score),
+            'risk_multiplier': float(decision.risk_multiplier),
+            'reason': decision.reason,
+            'metrics': dict(decision.metrics),
+            'l2_gate': dict(l2_gate or {}),
+            'futures_context': dict(derivatives or {}),
+            'benchmarks': benchmarks,
+            'persistence': persistence_snapshot,
+            'current_trade_count': current_snapshot.get('trade_count'),
+            'current_notional': current_snapshot.get('total_notional'),
+            'current_imbalance': current_snapshot.get('imbalance'),
+            'current_return_pct': current_snapshot.get('return_pct'),
+            'entry_reference_price': current_snapshot.get('last_price'),
+            'baseline_windows_loaded': len(baseline_snapshots),
+            'baseline_errors': baseline_errors,
+        })
+        self.qh_flow_signal_cache[cache_key] = dict(status)
+        if not isinstance(getattr(self, 'qh_flow_last_status', None), dict):
+            self.qh_flow_last_status = {}
+        self.qh_flow_last_status[canonical] = dict(status)
+        return status
+
+    def _crowding_unwind_runtime_config(self, cfg=None):
+        source = dict(cfg or {})
+        base = default_crowding_unwind_config()
+        nested = source.get('crowding_unwind')
+        if isinstance(nested, dict):
+            base.update(nested)
+        if 'crowding_unwind_live_enabled' in source:
+            base['live_enabled'] = bool(source.get('crowding_unwind_live_enabled'))
+        return base
+
+    async def _calculate_crowding_unwind_signal(
+        self,
+        symbol,
+        df,
+        strategy_params,
+        *,
+        force_reprocess=False,
+    ):
+        cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+        crowd_cfg = self._crowding_unwind_runtime_config(cfg)
+        canonical = self._canonical_futures_symbol(symbol)
+        self._clear_utbot_filtered_breakout_entry_plan(canonical)
+        status = {
+            'strategy': STRATEGY_DISPLAY_NAMES.get(CROWDING_UNWIND_STRATEGY, 'FUNDING_OI_CROWDING_UNWIND'),
+            'entry_strategy': CROWDING_UNWIND_STRATEGY,
+            'symbol': canonical,
+            'stage': 'waiting',
+        }
+
+        def _finish(sig, reason, code=None):
+            status['reason'] = reason
+            status['accepted_side'] = sig
+            if code:
+                status['reject_code'] = code
+            if sig:
+                status['accepted_code'] = 'ACCEPTED_ENTRY'
+                status['stage'] = 'entry_ready'
+            if not isinstance(getattr(self, 'crowding_unwind_last_status', None), dict):
+                self.crowding_unwind_last_status = {}
+            self.crowding_unwind_last_status[canonical] = dict(status)
+            self._store_utbot_filtered_breakout_status(canonical, status)
+            self.last_entry_reason[canonical] = reason
+            return sig, reason, status
+
+        if self.is_upbit_mode():
+            return _finish(None, 'Crowding Unwind unsupported in Upbit mode', 'REJECTED_UNSUPPORTED_MODE')
+        if not bool(crowd_cfg.get('enabled', True)) or not bool(crowd_cfg.get('live_enabled', False)):
+            return _finish(None, 'Crowding Unwind live disabled', 'REJECTED_CROWDING_LIVE_DISABLED')
+        try:
+            ohlcv = await asyncio.to_thread(
+                self.market_data_exchange.fetch_ohlcv,
+                canonical,
+                '15m',
+                limit=220,
+            )
+            rows = self._relative_strength_pullback_rows_from_ohlcv(ohlcv)
+            rows = completed_candle_rows(rows, '15m', {'exclude_incomplete_live_candle': True})
+        except Exception as exc:
+            return _finish(None, f'Crowding 15m data unavailable: {exc}', 'REJECTED_CROWDING_DATA')
+        derivatives = await self._fetch_utbreakout_futures_context(canonical)
+        base_l2 = await self._evaluate_shared_l2_gate(
+            canonical,
+            cfg,
+            force_refresh=force_reprocess,
+        )
+        preliminary = evaluate_crowding_unwind(rows, derivatives, base_l2, crowd_cfg)
+        side = preliminary.side
+        l2_gate = await self._evaluate_shared_l2_gate(
+            canonical,
+            cfg,
+            force_refresh=True,
+            side=side,
+        ) if side in {'long', 'short'} else base_l2
+        decision = evaluate_crowding_unwind(rows, derivatives, l2_gate, crowd_cfg)
+        status.update({
+            'allowed': bool(decision.allowed),
+            'side': decision.side,
+            'score': float(decision.score),
+            'risk_multiplier': float(decision.risk_multiplier),
+            'metrics': dict(decision.metrics),
+            'l2_gate': dict(l2_gate or {}),
+            'futures_context': dict(derivatives or {}),
+        })
+        if not decision.allowed or decision.side not in {'long', 'short'}:
+            return _finish(None, f'Crowding waiting: {decision.reason}')
+        side = decision.side
+        if not self.is_trade_direction_allowed(side):
+            return _finish(None, self.format_trade_direction_block_reason(side), 'REJECTED_DIRECTION_FILTER')
+        latest = rows[-1]
+        entry_price = _safe_float_or_none(latest.get('close'))
+        atr_value = _safe_float_or_none(decision.metrics.get('atr'))
+        if entry_price is None or entry_price <= 0 or atr_value is None or atr_value <= 0:
+            return _finish(None, 'Crowding entry price/ATR unavailable', 'REJECTED_CROWDING_DATA')
+        total_balance, free_balance, _ = await self.get_balance_info()
+        balance_for_risk = total_balance if total_balance > 0 else free_balance
+        common_cfg = self.get_runtime_common_settings()
+        leverage = int(max(1.0, float(common_cfg.get('leverage', 5) or 5)))
+        risk_multiplier = min(
+            1.0,
+            max(0.0, float(decision.risk_multiplier or 0.0)),
+            max(0.0, float(l2_gate.get('risk_multiplier', 0.0) or 0.0)),
+        )
+        risk_budget = resolve_utbreakout_risk_budget(
+            balance_for_risk,
+            cfg,
+            multiplier=risk_multiplier,
+        )
+        try:
+            plan = calculate_risk_plan(
+                side=side,
+                entry_price=entry_price,
+                atr_value=atr_value,
+                stop_atr_multiplier=float(crowd_cfg.get('stop_atr_multiplier', 1.35) or 1.35),
+                ut_stop=None,
+                structure_stop=None,
+                structure_buffer_atr=0.0,
+                take_profit_r_multiple=float(crowd_cfg.get('take_profit_r_multiple', 2.25) or 2.25),
+                take_profit_front_run_atr=0.0,
+                take_profit_front_run_pct=0.0,
+                min_risk_reward=min(2.0, float(crowd_cfg.get('take_profit_r_multiple', 2.25) or 2.25)),
+                balance_usdt=balance_for_risk,
+                risk_per_trade_percent=risk_budget['risk_per_trade_percent'],
+                max_risk_per_trade_usdt=risk_budget['max_risk_per_trade_usdt'],
+                leverage=leverage,
+            )
+            plan = cap_utbreakout_risk_plan_to_margin(
+                plan,
+                free_balance=free_balance,
+                leverage=leverage,
+                entry_price=entry_price,
+            )
+        except ValueError as exc:
+            return _finish(None, f'Crowding risk plan rejected: {exc}', 'REJECTED_CROWDING_RISK_PLAN')
+        plan.update({
+            'strategy': CROWDING_UNWIND_STRATEGY,
+            'plan_symbol': canonical,
+            'entry_timeframe': '15m',
+            'exit_timeframe': cfg.get('exit_timeframe', '15m'),
+            'htf_timeframe': cfg.get('htf_timeframe', '1h'),
+            'entry_execution': 'market',
+            'crowding_score': float(decision.score),
+            'crowding_risk_multiplier': risk_multiplier,
+            'crowding_metrics': dict(decision.metrics),
+            'l2_gate': dict(l2_gate or {}),
+            'l2_state': l2_gate.get('state'),
+            'l2_risk_multiplier': l2_gate.get('risk_multiplier'),
+            'atr': atr_value,
+            'partial_take_profit_enabled': True,
+            'partial_take_profit_r_multiple': 1.25,
+            'partial_take_profit_ratio': 0.30,
+            'second_take_profit_enabled': True,
+            'second_take_profit_r_multiple': float(crowd_cfg.get('take_profit_r_multiple', 2.25) or 2.25),
+            'second_take_profit_ratio': 0.50,
+            'atr_trailing_enabled': True,
+            'atr_trailing_activation_r': 1.50,
+            'atr_trailing_multiplier': 2.25,
+            'ev_time_stop_enabled': True,
+            'ev_time_stop_bars': int(crowd_cfg.get('time_stop_bars', 24) or 24),
+            'ev_time_stop_min_mfe_r': 0.50,
+        })
+        self._set_utbot_filtered_breakout_entry_plan(canonical, plan)
+        status['entry_plan'] = dict(plan)
+        return _finish(side, f'ACCEPTED_ENTRY: {decision.reason}')
+
+    async def build_crowding_unwind_status_text(self, symbol=None):
+        target = self._canonical_futures_symbol(
+            symbol or self.current_utbreakout_candidate_symbol or 'BTC/USDT'
+        )
+        status = dict((getattr(self, 'crowding_unwind_last_status', {}) or {}).get(target) or {})
+        if not status:
+            return '\n'.join([
+                '🧨 Funding-OI Crowding Unwind 상태',
+                f'Symbol: {target}',
+                '아직 전략 평가 기록이 없습니다.',
+            ])
+        metrics = status.get('metrics') if isinstance(status.get('metrics'), dict) else {}
+        l2 = status.get('l2_gate') if isinstance(status.get('l2_gate'), dict) else {}
+        return '\n'.join([
+            '🧨 Funding-OI Crowding Unwind 상태',
+            f'Symbol: {target}',
+            f"Signal: {str(status.get('side') or 'NONE').upper()} / allowed={bool(status.get('allowed'))}",
+            f"Score: {float(status.get('score', 0.0) or 0.0):.1f} / risk x{float(status.get('risk_multiplier', 0.0) or 0.0):.2f}",
+            f"Funding: {float(metrics.get('funding_rate', 0.0) or 0.0):+.6f} / percentile {float(metrics.get('funding_percentile', 0.0) or 0.0):.1f}",
+            f"OI: z {float(metrics.get('oi_z', 0.0) or 0.0):+.2f} / 4h {float(metrics.get('oi_change_4h_pct', 0.0) or 0.0):+.2f}%",
+            f"Confirmations: {int(metrics.get('confirmations', 0) or 0)} / L2 {str(l2.get('state') or 'unknown').upper()}",
+            f"Reason: {status.get('reason') or '-'}",
+        ])
+
     def _dual_alpha_strategy_params(self, strategy_params, branch):
         params = copy.deepcopy(strategy_params if isinstance(strategy_params, dict) else {})
         cfg = dict(params.get('UTBotFilteredBreakoutV1') or {})
@@ -16137,7 +16645,7 @@ class SignalEngine(BaseEngine):
             rsp_cfg['strategy_version'] = 'v2'
             rsp_cfg['rspt_v2_enabled'] = True
             rsp_cfg['independent_direction_enabled'] = True
-            rsp_cfg['direction_source'] = 'RSPT-v2 residual strength'
+            rsp_cfg['direction_source'] = 'RSPT-v3 BTC/ETH/alt/vol residual strength'
             rsp_cfg['forced_direction'] = None
             rsp_cfg['allow_breakout_continuation'] = False
             rsp_cfg['require_prior_impulse'] = True
@@ -16484,7 +16992,7 @@ class SignalEngine(BaseEngine):
             rsp_params,
             force_reprocess=force_reprocess,
             forced_direction=None,
-            direction_source='RSPT-v2 residual strength',
+            direction_source='RSPT-v3 BTC/ETH/alt/vol residual strength',
             resolve_ut_direction=False,
         )
         rsp_status = dict(rsp_status or self._utbreakout_diag_for_symbol(base_symbol) or {})
@@ -16531,7 +17039,7 @@ class SignalEngine(BaseEngine):
         if rsp_sig in {'long', 'short'} and isinstance(rsp_plan, dict):
             valid_rsp = {
                 'key': ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
-                'label': 'RSPT-v2',
+                'label': 'RSPT-v3',
                 'side': rsp_sig,
                 'reason': rsp_reason,
                 'status': rsp_status,
@@ -16600,7 +17108,7 @@ class SignalEngine(BaseEngine):
                 'htf_timeframe': (direction_status or {}).get('htf_timeframe', '1d'),
             },
             'utbreak': self._dual_alpha_light(ut_status, 'UTBreakout'),
-            'rspt': self._dual_alpha_light(rsp_status, 'RSPT-v2'),
+            'rspt': self._dual_alpha_light(rsp_status, 'RSPT-v3'),
             'agreement_state': agreement_state,
             'agreement_risk_multiplier': agreement_multiplier,
             'confirmation_count': len(choices),
@@ -16736,7 +17244,7 @@ class SignalEngine(BaseEngine):
             rsp_params,
             force_reprocess=force_reprocess,
             forced_direction=None,
-            direction_source='RSPT-v2 residual strength',
+            direction_source='RSPT-v3 BTC/ETH/alt/vol residual strength',
             resolve_ut_direction=False,
         )
         rsp_status = dict(rsp_status or self._utbreakout_diag_for_symbol(base_symbol) or {})
@@ -16750,7 +17258,7 @@ class SignalEngine(BaseEngine):
         )
         branch_results.append((
             ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
-            'RSPT-v2',
+            'RSPT-v3',
             rsp_sig,
             rsp_reason,
             rsp_status,
@@ -16830,7 +17338,7 @@ class SignalEngine(BaseEngine):
         summary = {
             'enabled': True,
             'utbreak': self._dual_alpha_light(statuses.get(ENTRY_STRATEGY_UT_BREAKOUT), 'UTBreakout'),
-            'rspt': self._dual_alpha_light(statuses.get(ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND), 'RSPT-v2'),
+            'rspt': self._dual_alpha_light(statuses.get(ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND), 'RSPT-v3'),
             'qh_flow': self._dual_alpha_light(statuses.get(QH_FLOW_STRATEGY), 'QH-Flow'),
             'agreement_state': agreement_state,
             'agreement_risk_multiplier': agreement_multiplier,
@@ -16896,7 +17404,7 @@ class SignalEngine(BaseEngine):
             f"Agreement: {str(summary.get('agreement_state') or 'none').upper()} / confirmations={int(summary.get('confirmation_count') or 0)} / risk x{float(summary.get('agreement_risk_multiplier', 0.0) or 0.0):.2f}",
             f"Selected: {summary.get('selected_label') or 'NONE'} {str(summary.get('selected_side') or '').upper()}",
         ]
-        for key, label in (('utbreak', 'UTBreak'), ('rspt', 'RSPT-v2'), ('qh_flow', 'QH-Flow')):
+        for key, label in (('utbreak', 'UTBreak'), ('rspt', 'RSPT-v3'), ('qh_flow', 'QH-Flow')):
             item = summary.get(key) if isinstance(summary.get(key), dict) else {}
             lines.append(
                 f"{label}: {str(item.get('light') or 'gray').upper()} {str(item.get('side') or 'NONE').upper()} - {item.get('reason') or '-'}"
@@ -31897,6 +32405,16 @@ class SignalEngine(BaseEngine):
             )
             is_bullish = sig == 'long'
             is_bearish = sig == 'short'
+        elif active_strategy == CROWDING_UNWIND_STRATEGY:
+            entry_mode = active_strategy
+            sig, entry_reason, _ = await self._calculate_crowding_unwind_signal(
+                symbol,
+                df,
+                strategy_params,
+                force_reprocess=force_utbreakout_reprocess,
+            )
+            is_bullish = sig == 'long'
+            is_bearish = sig == 'short'
         elif active_strategy == QH_FLOW_STRATEGY:
             entry_mode = active_strategy
             sig, entry_reason, _ = await self._calculate_qh_flow_signal(
@@ -43624,7 +44142,7 @@ class MainController:
             rsp_cfg['relative_strength_pullback_trend_live_enabled'] = True
             rsp_cfg['relative_strength_pullback_trend_paper_enabled'] = False
             rsp_cfg['forced_direction'] = None
-            rsp_cfg['direction_source'] = 'RSPT-v2 residual strength'
+            rsp_cfg['direction_source'] = 'RSPT-v3 BTC/ETH/alt/vol residual strength'
             rsp_cfg['require_internal_trend_confirmation'] = True
             rsp_cfg['rspt_v2_enabled'] = True
             rsp_cfg['independent_direction_enabled'] = True
@@ -43841,7 +44359,7 @@ class MainController:
                 'relative_strength_pullback_trend_paper_enabled': False,
                 'rspt_v2_enabled': True,
                 'independent_direction_enabled': True,
-                'direction_source': 'RSPT-v2 residual strength',
+                'direction_source': 'RSPT-v3 BTC/ETH/alt/vol residual strength',
                 'forced_direction': None,
             })
             qh_cfg = default_qh_flow_config()
@@ -43871,7 +44389,7 @@ class MainController:
                 engine.relative_strength_pullback_eval_cache = {}
                 if not engine.running:
                     engine.start()
-            return 'TRIPLE Alpha ON. UTBreak + RSPT-v2 + QH-Flow are evaluated independently; conflicts block and 1/2/3 confirmations scale risk.'
+            return 'TRIPLE Alpha ON. UTBreak + RSPT-v3 + QH-Flow v2 are evaluated independently; conflicts block and 1/2/3 confirmations scale risk.'
 
         async def _deactivate_triple_alpha_strategy():
             notice = await _activate_utbreak_strategy()
@@ -43880,6 +44398,55 @@ class MainController:
                 engine.triple_alpha_last_status = {}
                 engine.qh_flow_signal_cache = {}
             return f'TRIPLE Alpha OFF. {notice}'
+
+
+        async def _activate_crowding_unwind_strategy():
+            await _ensure_signal_engine_active()
+            self.is_paused = False
+            current = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
+            crowd_cfg = default_crowding_unwind_config()
+            if isinstance(current, dict) and isinstance(current.get('crowding_unwind'), dict):
+                crowd_cfg.update(current.get('crowding_unwind'))
+            crowd_cfg['enabled'] = True
+            crowd_cfg['live_enabled'] = True
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], CROWDING_UNWIND_STRATEGY)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'crowding_unwind'], crowd_cfg)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'crowding_unwind_live_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'l2_gate_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend_live_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol'], '')
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
+            engine = self._reset_signal_engine_runtime_state(
+                reset_entry_cache=True,
+                reset_exit_cache=True,
+                reset_stateful_strategy=True,
+            )
+            if engine:
+                engine.crowding_unwind_last_status = {}
+                engine.l2_gate_cache = {}
+                engine.l2_gate_history = {}
+                if not engine.running:
+                    engine.start()
+            return (
+                'Funding-OI Crowding Unwind ON. Extreme funding/OI crowding, '
+                'price failure, absorption, structure break and dynamic L2 reversal support are required.'
+            )
+
+        async def _deactivate_crowding_unwind_strategy():
+            notice = await _activate_utbreak_strategy()
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'crowding_unwind_live_enabled'],
+                False,
+            )
+            engine = self.engines.get('signal')
+            if engine:
+                engine.crowding_unwind_last_status = {}
+            return f'Funding-OI Crowding Unwind OFF. {notice}'
 
         async def _stop_utbreak_trading():
             await _ensure_signal_engine_active()
@@ -44258,7 +44825,9 @@ UTBot:
             if active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY:
                 active_label = "ON (ADAPTIVE TF)"
             elif active_strategy == QH_FLOW_STRATEGY:
-                active_label = "ON (QH FLOW)"
+                active_label = "ON (QH FLOW V2)"
+            elif active_strategy == CROWDING_UNWIND_STRATEGY:
+                active_label = "ON (CROWDING UNWIND)"
             elif active_strategy == DUAL_ALPHA_STRATEGY:
                 active_label = "ON (DUAL ALPHA)"
             elif active_strategy == TRIPLE_ALPHA_STRATEGY:
@@ -44276,7 +44845,9 @@ UTBot:
             menu_title = (
                 'UTBreak 전략 메뉴 (Triple Alpha)'
                 if active_strategy == TRIPLE_ALPHA_STRATEGY
-                else 'UTBreak 전략 메뉴 (QH-Flow)'
+                else 'UTBreak 전략 메뉴 (Crowding Unwind)'
+                if active_strategy == CROWDING_UNWIND_STRATEGY
+                else 'UTBreak 전략 메뉴 (QH-Flow v2)'
                 if active_strategy == QH_FLOW_STRATEGY
                 else 'UTBreak 전략 메뉴 (Dual Alpha)'
                 if active_strategy == DUAL_ALPHA_STRATEGY
@@ -44416,9 +44987,10 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 `/utbreak tracefull [SYMBOL]` - 최근 진입 경로 전체 진단 보고서
 `/utbreak watchdog on|off` - 진입 가능 후 주문 미시도 진단 기록 ON/OFF (텔레그램 자동 발송 없음)
 `/utbreak bridge on|off` - ready plan을 live scanner의 entry()로 연결
-`/utbreak qh on|off|status` - QH-Flow 단독 전략
+`/utbreak qh on|off|status` - QH-Flow v2 단독 전략
+`/utbreak crowding on|off|status` - Funding-OI 과밀 해소 단독 전략
 `/utbreak dual on|off|status` - UTBreakout + RSPT 듀얼 감시/신호등 상태
-`/utbreak triple on|off|status` - UTBreakout + RSPT-v2 + QH-Flow 결합
+`/utbreak triple on|off|status` - UTBreakout + RSPT-v3 + QH-Flow v2 결합
 """.strip()
 
         def _format_utbreakout_config_text(diff=False):
@@ -44538,6 +45110,11 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     InlineKeyboardButton("QH ON", callback_data="utb:qh:on"),
                     InlineKeyboardButton("QH OFF", callback_data="utb:qh:off"),
                     InlineKeyboardButton("QH STATUS", callback_data="utb:qh_status")
+                ],
+                [
+                    InlineKeyboardButton("CROWD ON", callback_data="utb:crowding:on"),
+                    InlineKeyboardButton("CROWD OFF", callback_data="utb:crowding:off"),
+                    InlineKeyboardButton("CROWD STATUS", callback_data="utb:crowding_status")
                 ],
                 [
                     InlineKeyboardButton("DUAL ON", callback_data="utb:dual:on"),
@@ -45030,6 +45607,40 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
         async def _send_triple_alpha_status_from_callback(query):
             await _show_utbreakout_callback_progress(query, 'TRIPLE Alpha status 조회 중입니다.')
             await _send_triple_alpha_status(getattr(query, 'message', None))
+
+
+        async def _get_crowding_unwind_status_text():
+            engine = self.engines.get('signal')
+            if not engine:
+                return 'Crowding Unwind status\n\nSignal engine not found.'
+            symbol = await _get_utbreakout_status_symbol_async()
+            return await engine.build_crowding_unwind_status_text(symbol)
+
+        async def _send_crowding_unwind_status(message):
+            if message is None:
+                return False
+            try:
+                text = await _get_crowding_unwind_status_text()
+                await self._reply_long_text_with_document(
+                    message,
+                    text,
+                    reply_markup=_build_utbreakout_keyboard(),
+                    filename='crowding_unwind_status.txt',
+                    caption='Funding-OI Crowding Unwind status',
+                    preview_suffix='Crowding Unwind status was sent as a file.',
+                )
+                return True
+            except Exception as exc:
+                logger.exception('Crowding Unwind status send failed')
+                await message.reply_text(
+                    f'Crowding Unwind status failed: {type(exc).__name__}: {exc}',
+                    reply_markup=_build_utbreakout_keyboard(),
+                )
+                return False
+
+        async def _send_crowding_unwind_status_from_callback(query):
+            await _show_utbreakout_callback_progress(query, 'Crowding Unwind status 조회 중입니다.')
+            await _send_crowding_unwind_status(getattr(query, 'message', None))
 
         async def _edit_utbreakout_condition_status(query):
             text = await _get_utbreakout_condition_status_text()
@@ -45577,6 +46188,28 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                         reply_markup=_build_utbreakout_keyboard(),
                     )
                     return
+            elif action in {'crowding', 'crowd', 'fundingoi', 'funding_oi'}:
+                mode = str(args[1]).strip().lower() if len(args) > 1 else 'status'
+                if mode in {'on', 'enable', 'start', 'live'}:
+                    await u.message.reply_text(
+                        await _activate_crowding_unwind_strategy(),
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=_build_utbreakout_keyboard(),
+                    )
+                elif mode in {'off', 'disable', 'stop'}:
+                    await u.message.reply_text(
+                        await _deactivate_crowding_unwind_strategy(),
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=_build_utbreakout_keyboard(),
+                    )
+                elif mode in {'status', 'stat', 'menu', ''}:
+                    await _send_crowding_unwind_status(u.message)
+                else:
+                    await u.message.reply_text(
+                        'Usage: `/utbreak crowding on`, `/utbreak crowding off`, `/utbreak crowding status`',
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                    return
             elif action in {'qh', 'qhflow', 'qh_flow'}:
                 mode = str(args[1]).strip().lower() if len(args) > 1 else 'status'
                 if mode in {'on', 'enable', 'start', 'live'}:
@@ -46077,6 +46710,16 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     await _send_relative_strength_pullback_status_from_callback(query)
                 return
 
+            if action in {'crowding', 'crowd'}:
+                mode = str(value or '').lower()
+                if mode in {'on', 'enable', '1', 'true', 'live'}:
+                    await _edit_utbreakout_menu(query, await _activate_crowding_unwind_strategy())
+                elif mode in {'off', 'disable', '0', 'false', 'stop'}:
+                    await _edit_utbreakout_menu(query, await _deactivate_crowding_unwind_strategy())
+                else:
+                    await _send_crowding_unwind_status_from_callback(query)
+                return
+
             if action in {'qh', 'qhflow'}:
                 mode = str(value or '').lower()
                 if mode in {'on', 'enable', '1', 'true', 'live'}:
@@ -46113,6 +46756,10 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 
             if action == 'qh_status':
                 await _send_qh_flow_status_from_callback(query)
+                return
+
+            if action == 'crowding_status':
+                await _send_crowding_unwind_status_from_callback(query)
                 return
 
             if action == 'dual_status':
