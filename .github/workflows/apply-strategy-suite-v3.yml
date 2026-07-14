@@ -40,9 +40,21 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install pytest
 
+      - name: Validate patch module 01
+        run: python -m py_compile .agent/apply_strategy_suite_v3_part01.py
+      - name: Validate patch module 02
+        run: python -m py_compile .agent/apply_strategy_suite_v3_part02.py
+      - name: Validate patch module 03
+        run: python -m py_compile .agent/apply_strategy_suite_v3_part03.py
+      - name: Validate patch module 04
+        run: python -m py_compile .agent/apply_strategy_suite_v3_part04.py
+      - name: Validate patch module 05
+        run: python -m py_compile .agent/apply_strategy_suite_v3_part05.py
+      - name: Validate patch module 06
+        run: python -m py_compile .agent/apply_strategy_suite_v3_part06.py
+
       - name: Reconstruct validated patch
         run: |
-          python -m py_compile .agent/apply_strategy_suite_v3_part*.py
           cp .agent/apply_strategy_suite_v3.part00 /tmp/apply_strategy_suite_v3.py
           python -c "from pathlib import Path; import runpy; target=Path('/tmp/apply_strategy_suite_v3.py'); content=target.read_text(encoding='utf-8') + ''.join(runpy.run_path(f'.agent/apply_strategy_suite_v3_part{i:02d}.py')['PART'] for i in range(1,7)); target.write_text(content, encoding='utf-8')"
           wc -c /tmp/apply_strategy_suite_v3.py
