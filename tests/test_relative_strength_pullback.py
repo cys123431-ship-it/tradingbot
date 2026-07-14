@@ -60,9 +60,12 @@ def test_defaults_keep_new_strategy_shadow_only():
     assert cfg["entry_execution"] == "market"
     assert cfg["exclude_incomplete_live_candle"] is True
     assert cfg["forced_direction"] is None
-    assert cfg["direction_source"] == "RSPT-v2 residual strength"
+    assert cfg["direction_source"] == "RSPT-v3 BTC/ETH/alt/vol residual strength"
     assert cfg["require_internal_trend_confirmation"] is True
     assert cfg["rspt_v2_enabled"] is True
+    assert cfg["rspt_v3_enabled"] is True
+    assert cfg["alt_common_factor_enabled"] is True
+    assert cfg["market_volatility_factor_enabled"] is True
     assert cfg["independent_direction_enabled"] is True
     assert cfg["allow_breakout_continuation"] is False
     assert cfg["relative_strength_pullback_trend_shadow_enabled"] is True

@@ -101,3 +101,26 @@ def test_qh_and_triple_callback_actions_are_registered():
         "triplet",
         "triple_status",
     } <= emas.UTBREAKOUT_CALLBACK_ACTIONS
+
+def test_crowding_and_allocator_are_registered():
+    emas = _emas_module()
+    assert emas.CROWDING_UNWIND_STRATEGY in emas.UTBREAKOUT_STRATEGIES
+    assert emas.STRATEGY_DISPLAY_NAMES[emas.CROWDING_UNWIND_STRATEGY] == "FUNDING_OI_CROWDING_UNWIND"
+    assert {"crowd", "crowding", "crowding_status"} <= emas.UTBREAKOUT_CALLBACK_ACTIONS
+
+
+def test_strategy_allocator_plan_hook_scales_once(monkeypatch):
+    emas = _emas_module()
+    engine = object.__new__(emas.SignalEngine)
+    engine.strategy_allocator_last_status = {}
+    engine._get_utbot_filtered_breakout_config = lambda *args, **kwargs: {
+        "strategy_allocator": {"minimum_samples": 1, "full_confidence_samples": 1}
+    }
+    engine._load_strategy_allocator_trades = lambda: [
+        {"strategy": emas.QH_FLOW_STRATEGY, "net_r": -1.0, "net_pnl": -1.0}
+    ]
+    plan = {"strategy": emas.QH_FLOW_STRATEGY, "qty": 2.0, "risk_usdt": 1.0}
+    first = engine._apply_strategy_allocator_to_plan(plan)
+    second = engine._apply_strategy_allocator_to_plan(first)
+    assert first["qty"] < 2.0
+    assert second["qty"] == first["qty"]

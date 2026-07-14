@@ -2091,7 +2091,7 @@ def test_dual_alpha_direction_filter_blocks_opposite_adaptive_ut_candidate():
 
     async def rspt_signal(symbol, df, strategy_params, *, force_reprocess=False, forced_direction=None, direction_source=None, resolve_ut_direction=True):
         assert forced_direction is None
-        assert direction_source == "RSPT-v2 residual strength"
+        assert direction_source == "RSPT-v3 BTC/ETH/alt/vol residual strength"
         assert resolve_ut_direction is False
         return None, "RSPT waiting", {}
 
@@ -2214,7 +2214,7 @@ def _dual_alpha_test_engine(emas, *, ut_side, rspt_side):
     ):
         engine._dual_test_branch = "rspt"
         assert forced_direction is None
-        assert direction_source == "RSPT-v2 residual strength"
+        assert direction_source == "RSPT-v3 BTC/ETH/alt/vol residual strength"
         assert resolve_ut_direction is False
         if rspt_side not in {"long", "short"}:
             return None, "RSPT waiting", {}

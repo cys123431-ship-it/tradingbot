@@ -9,7 +9,7 @@ filters.
 from dataclasses import dataclass, field
 from math import isfinite
 
-from .rspt_v2 import (
+from .rspt_v3 import (
     evaluate_pullback_setup as evaluate_rspt_v2_pullback_setup,
     residual_strength_percentiles,
     volatility_risk_multiplier as rspt_v2_volatility_risk_multiplier,
@@ -44,11 +44,15 @@ def default_relative_strength_pullback_config():
         "trend_htf": "1d",
         "signal_tf": "4h",
         "entry_execution": "market",
-        "strategy_version": "v2",
+        "strategy_version": "v3",
         "rspt_v2_enabled": True,
+        "rspt_v3_enabled": True,
+        "alt_common_factor_enabled": True,
+        "market_volatility_factor_enabled": True,
+        "alt_common_factor_min_symbols": 4,
         "independent_direction_enabled": True,
         "forced_direction": None,
-        "direction_source": "RSPT-v2 residual strength",
+        "direction_source": "RSPT-v3 BTC/ETH/alt/vol residual strength",
         "require_internal_trend_confirmation": True,
         "relative_strength_reference_symbols": ["BTC/USDT:USDT", "ETH/USDT:USDT"],
         "residual_strength_enabled": True,
