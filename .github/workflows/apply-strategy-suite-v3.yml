@@ -1,0 +1,98 @@
+name: Apply strategy suite v3
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .agent/apply_strategy_suite_v3.part00
+      - .agent/apply_strategy_suite_v3_part*.py
+      - .github/workflows/apply-strategy-suite-v3.yml
+      - utbreakout/crowding_unwind.py
+      - utbreakout/rspt_v3.py
+      - utbreakout/strategy_allocator.py
+      - tests/test_strategy_suite_v3.py
+
+permissions:
+  contents: write
+
+jobs:
+  apply-test-commit:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'agent/strategy-suite-v3'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/strategy-suite-v3
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+
+      - name: Reconstruct validated patch
+        run: |
+          cp .agent/apply_strategy_suite_v3.part00 /tmp/apply_strategy_suite_v3.py
+          python - <<'PY'
+          from pathlib import Path
+
+          target = Path('/tmp/apply_strategy_suite_v3.py')
+          content = target.read_text(encoding='utf-8')
+          for index in range(1, 7):
+              namespace = {}
+              path = Path(f'.agent/apply_strategy_suite_v3_part{index:02d}.py')
+              exec(path.read_text(encoding='utf-8'), namespace)
+              content += namespace['PART']
+          target.write_text(content, encoding='utf-8')
+          PY
+          echo 'd104bacad94638715232b01ee01bf78d7e0bf1f4d442884a8e3739a9821272b2  /tmp/apply_strategy_suite_v3.py' | sha256sum -c -
+          python -m py_compile /tmp/apply_strategy_suite_v3.py
+
+      - name: Apply runtime integration
+        run: python /tmp/apply_strategy_suite_v3.py
+
+      - name: Compile changed runtime
+        run: |
+          python -m py_compile \
+            emas.py \
+            utbreakout/qh_flow.py \
+            utbreakout/crowding_unwind.py \
+            utbreakout/rspt_v3.py \
+            utbreakout/strategy_allocator.py \
+            utbreakout/relative_strength_pullback.py
+
+      - name: Run focused strategy tests
+        run: |
+          python -m pytest -q \
+            tests/test_strategy_suite_v3.py \
+            tests/test_qh_flow.py \
+            tests/test_qh_flow_integration.py \
+            tests/test_relative_strength_pullback.py \
+            tests/test_rspt_v2.py
+
+      - name: Run full regression suite
+        run: python -m pytest -q
+
+      - name: Validate diff
+        run: git diff --check
+
+      - name: Commit validated implementation
+        run: |
+          rm -f .agent/apply_strategy_suite_v3.part00
+          rm -f .agent/apply_strategy_suite_v3_part*.py
+          rm -f .github/workflows/apply-strategy-suite-v3.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'feat: add QH v2 RSPT v3 crowding and adaptive allocation'
+          git push origin HEAD:agent/strategy-suite-v3
