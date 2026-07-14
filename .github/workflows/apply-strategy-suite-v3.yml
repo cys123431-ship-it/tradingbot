@@ -60,13 +60,15 @@ jobs:
           text = text.replace("QH_FLOW_STRATEGY: 'QH_FLOW_V2',", "QH_FLOW_STRATEGY: 'QH_FLOW',", 1)
           path.write_text(text, encoding='utf-8')
 
+          old_source = 'RSPT-v2 residual strength'
+          new_source = 'RSPT-v3 BTC/ETH/alt/vol residual strength'
+          for test_path in Path('tests').glob('test_*.py'):
+              test_text = test_path.read_text(encoding='utf-8')
+              if old_source in test_text:
+                  test_path.write_text(test_text.replace(old_source, new_source), encoding='utf-8')
+
           test_path = Path('tests/test_relative_strength_pullback.py')
           test_text = test_path.read_text(encoding='utf-8')
-          test_text = test_text.replace(
-              'assert cfg["direction_source"] == "RSPT-v2 residual strength"',
-              'assert cfg["direction_source"] == "RSPT-v3 BTC/ETH/alt/vol residual strength"',
-              1,
-          )
           test_text = test_text.replace(
               'assert cfg["rspt_v2_enabled"] is True\n',
               'assert cfg["rspt_v2_enabled"] is True\n    assert cfg["rspt_v3_enabled"] is True\n    assert cfg["alt_common_factor_enabled"] is True\n    assert cfg["market_volatility_factor_enabled"] is True\n',
