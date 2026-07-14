@@ -40,18 +40,8 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install pytest
 
-      - name: Validate patch module 01
-        run: python -m py_compile .agent/apply_strategy_suite_v3_part01.py
-      - name: Validate patch module 02
-        run: python -m py_compile .agent/apply_strategy_suite_v3_part02.py
-      - name: Validate patch module 03
-        run: python -m py_compile .agent/apply_strategy_suite_v3_part03.py
-      - name: Validate patch module 04
-        run: python -m py_compile .agent/apply_strategy_suite_v3_part04.py
-      - name: Validate patch module 05
-        run: python -m py_compile .agent/apply_strategy_suite_v3_part05.py
-      - name: Validate patch module 06
-        run: python -m py_compile .agent/apply_strategy_suite_v3_part06.py
+      - name: Validate patch modules
+        run: python -m py_compile .agent/apply_strategy_suite_v3_part*.py
 
       - name: Reconstruct validated patch
         run: |
@@ -60,7 +50,15 @@ jobs:
           python -m py_compile /tmp/apply_strategy_suite_v3.py
 
       - name: Apply runtime integration
-        run: python /tmp/apply_strategy_suite_v3.py
+        run: |
+          python /tmp/apply_strategy_suite_v3.py
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('emas.py')
+          text = path.read_text(encoding='utf-8')
+          text = text.replace("QH_FLOW_STRATEGY: 'QH_FLOW_V2',", "QH_FLOW_STRATEGY: 'QH_FLOW',", 1)
+          path.write_text(text, encoding='utf-8')
+          PY
 
       - name: Compile changed runtime
         run: |
