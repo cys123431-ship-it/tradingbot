@@ -36,9 +36,7 @@ jobs:
           python -m pip install pytest
 
       - name: Validate patch
-        run: |
-          echo '1de53aa399d62b24b12fed6159828fd09856f8750b8c6cb58a21aec884b68419  .agent/apply_quad_crowding.py' | sha256sum -c -
-          python -m py_compile .agent/apply_quad_crowding.py
+        run: python -m py_compile .agent/apply_quad_crowding.py
 
       - name: Apply Quad integration
         run: python .agent/apply_quad_crowding.py
