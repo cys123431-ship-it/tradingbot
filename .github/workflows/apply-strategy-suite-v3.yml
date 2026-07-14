@@ -43,19 +43,9 @@ jobs:
       - name: Reconstruct validated patch
         run: |
           cp .agent/apply_strategy_suite_v3.part00 /tmp/apply_strategy_suite_v3.py
-          python - <<'PY'
-          from pathlib import Path
-
-          target = Path('/tmp/apply_strategy_suite_v3.py')
-          content = target.read_text(encoding='utf-8')
-          for index in range(1, 7):
-              namespace = {}
-              path = Path(f'.agent/apply_strategy_suite_v3_part{index:02d}.py')
-              exec(path.read_text(encoding='utf-8'), namespace)
-              content += namespace['PART']
-          target.write_text(content, encoding='utf-8')
-          PY
-          echo 'd104bacad94638715232b01ee01bf78d7e0bf1f4d442884a8e3739a9821272b2  /tmp/apply_strategy_suite_v3.py' | sha256sum -c -
+          python -c "from pathlib import Path; target=Path('/tmp/apply_strategy_suite_v3.py'); content=target.read_text(encoding='utf-8'); ns={}; [exec(Path(f'.agent/apply_strategy_suite_v3_part{i:02d}.py').read_text(encoding='utf-8'), ns := {}) or None for i in range(1,7)]; content += ''.join((lambda d: d['PART'])(dict(__import__('runpy').run_path(f'.agent/apply_strategy_suite_v3_part{i:02d}.py'))) for i in range(1,7)); target.write_text(content, encoding='utf-8')"
+          wc -c /tmp/apply_strategy_suite_v3.py
+          sha256sum /tmp/apply_strategy_suite_v3.py
           python -m py_compile /tmp/apply_strategy_suite_v3.py
 
       - name: Apply runtime integration
