@@ -105,7 +105,7 @@ replacement = r'''    async def build_quad_alpha_status_text(self, symbol=None):
         ])
         return '\n'.join(lines)
 '''
-updated, count = re.subn(pattern, replacement, text, count=1, flags=re.S)
+updated, count = re.subn(pattern, lambda match: replacement, text, count=1, flags=re.S)
 if count != 1:
     raise SystemExit(f"Quad status function replacement failed: matches={count}")
 EMAS.write_text(updated, encoding="utf-8")
