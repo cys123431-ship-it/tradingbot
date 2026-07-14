@@ -17687,26 +17687,91 @@ class SignalEngine(BaseEngine):
             return '\n'.join([
                 '🧩 Quad 전략 상태',
                 f'Symbol: {target}',
+                '',
+                '🚦 전략 신호등',
+                'UTBreak          ⚪ 미평가',
+                'RSPT-v3          ⚪ 미평가',
+                'QH-Flow v2       ⚪ 미평가',
+                'Crowding Unwind  ⚪ 미평가',
+                '',
                 '아직 Quad 평가 기록이 없습니다.',
             ])
-        lines = [
-            '🧩 Quad 전략 상태',
-            f'Symbol: {target}',
-            f"Agreement: {str(summary.get('agreement_state') or 'none').upper()} / confirmations={int(summary.get('confirmation_count') or 0)} / risk x{float(summary.get('agreement_risk_multiplier', 0.0) or 0.0):.2f}",
-            f"Selected: {summary.get('selected_label') or 'NONE'} {str(summary.get('selected_side') or '').upper()}",
-        ]
-        for key, label in (
+
+        def _traffic_view(item):
+            item = item if isinstance(item, dict) else {}
+            light = str(item.get('light') or 'gray').strip().lower()
+            side = str(item.get('side') or '').strip().upper()
+            reason = str(item.get('reason') or '-').strip()
+            if light == 'green':
+                icon = '🟢'
+                state = f'유효 {side} 신호' if side else '유효 진입 신호'
+                meaning = 'Quad confirmations에 포함'
+            elif light == 'red':
+                icon = '🔴'
+                state = f'{side} 후보 거절' if side else '진입 거절'
+                meaning = '안전·품질 필터에서 차단되어 confirmations 제외'
+            elif light == 'yellow':
+                icon = '🟡'
+                state = f'{side} 조건 대기' if side else '조건 대기'
+                meaning = '유효 신호가 아직 없어 confirmations 제외'
+            else:
+                icon = '⚪'
+                state = '미평가 또는 데이터 없음'
+                meaning = '전략 평가가 완료되지 않아 confirmations 제외'
+            return {
+                'icon': icon,
+                'state': state,
+                'meaning': meaning,
+                'reason': reason,
+                'side': side,
+                'light': light,
+            }
+
+        strategy_rows = (
             ('utbreak', 'UTBreak'),
             ('rspt', 'RSPT-v3'),
             ('qh_flow', 'QH-Flow v2'),
             ('crowding_unwind', 'Crowding Unwind'),
-        ):
-            item = summary.get(key) if isinstance(summary.get(key), dict) else {}
-            lines.append(
-                f"{label}: {str(item.get('light') or 'gray').upper()} "
-                f"{str(item.get('side') or 'NONE').upper()} - {item.get('reason') or '-'}"
-            )
-        lines.append(f"Reason: {status.get('reason') or '-'}")
+        )
+        traffic = {
+            key: _traffic_view(summary.get(key))
+            for key, _ in strategy_rows
+        }
+        green_count = sum(
+            1 for item in traffic.values() if item['light'] == 'green'
+        )
+
+        lines = [
+            '🧩 Quad 전략 상태',
+            f'Symbol: {target}',
+            '',
+            '🚦 전략 신호등',
+        ]
+        label_width = max(len(label) for _, label in strategy_rows)
+        for key, label in strategy_rows:
+            item = traffic[key]
+            lines.append(f"{label.ljust(label_width)}  {item['icon']} {item['state']}")
+        lines.extend([
+            f'🟢 유효 신호: {green_count}/4 — 초록불만 confirmations에 포함',
+            '',
+            f"Agreement: {str(summary.get('agreement_state') or 'none').upper()} / confirmations={int(summary.get('confirmation_count') or 0)} / risk x{float(summary.get('agreement_risk_multiplier', 0.0) or 0.0):.2f}",
+            f"Selected: {summary.get('selected_label') or 'NONE'} {str(summary.get('selected_side') or '').upper()}",
+            '',
+            '📋 전략별 상세 설명',
+        ])
+        for key, label in strategy_rows:
+            item = traffic[key]
+            lines.extend([
+                f"{item['icon']} {label} — {item['state']}",
+                f"  사유: {item['reason']}",
+                f"  판정: {item['meaning']}",
+            ])
+        lines.extend([
+            '',
+            f"최종 사유: {status.get('reason') or '-'}",
+            '',
+            '범례: 🟢 유효 신호 | 🟡 조건 대기 | 🔴 후보 거절·충돌 | ⚪ 미평가·데이터 없음',
+        ])
         return '\n'.join(lines)
 
     def _resolve_dual_alpha_trading_mode(self, cfg, exchange_mode=None):

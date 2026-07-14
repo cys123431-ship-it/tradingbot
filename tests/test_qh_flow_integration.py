@@ -231,3 +231,56 @@ def test_quad_four_way_agreement_selects_full_risk_plan():
     assert status["quad_alpha"]["agreement_risk_multiplier"] == pytest.approx(1.0)
     assert selected_plans[-1][1]["quad_alpha_confirmation_count"] == 4
     assert selected_plans[-1][1]["qty"] == pytest.approx(1.0)
+
+
+
+def test_quad_status_text_shows_four_traffic_lights_and_details():
+    emas = _emas_module()
+    engine = object.__new__(emas.SignalEngine)
+    symbol = "ALLO/USDT:USDT"
+    engine.current_utbreakout_candidate_symbol = symbol
+    engine._canonical_futures_symbol = lambda value: value
+    engine.quad_alpha_last_status = {
+        symbol: {
+            "reason": "QUAD_ALPHA waiting (none)",
+            "quad_alpha": {
+                "agreement_state": "none",
+                "agreement_risk_multiplier": 0.0,
+                "confirmation_count": 0,
+                "selected_label": None,
+                "selected_side": None,
+                "utbreak": {
+                    "light": "red",
+                    "side": "short",
+                    "reason": "REJECTED_L2_STRESSED",
+                },
+                "rspt": {
+                    "light": "yellow",
+                    "side": None,
+                    "reason": "trend_filter_failed",
+                },
+                "qh_flow": {
+                    "light": "yellow",
+                    "side": None,
+                    "reason": "QH signal window expired",
+                },
+                "crowding_unwind": {
+                    "light": "yellow",
+                    "side": None,
+                    "reason": "crowding_not_extreme",
+                },
+            },
+        }
+    }
+
+    text = asyncio.run(engine.build_quad_alpha_status_text(symbol))
+
+    assert "🚦 전략 신호등" in text
+    assert "UTBreak" in text and "🔴 SHORT 후보 거절" in text
+    assert "RSPT-v3" in text and "🟡 조건 대기" in text
+    assert "QH-Flow v2" in text
+    assert "Crowding Unwind" in text
+    assert "🟢 유효 신호: 0/4" in text
+    assert "📋 전략별 상세 설명" in text
+    assert "초록불만 confirmations에 포함" in text
+    assert "범례: 🟢 유효 신호" in text
