@@ -1,0 +1,37 @@
+name: Quad strategy inspection
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/quad-inspect.yml
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/quad-crowding
+      - name: Package current strategy runtime
+        run: |
+          mkdir -p /tmp/quad-inspect/tests /tmp/quad-inspect/utbreakout
+          cp emas.py README.md /tmp/quad-inspect/
+          cp tests/test_qh_flow_integration.py /tmp/quad-inspect/tests/
+          cp tests/test_utbreakout_helpers.py /tmp/quad-inspect/tests/
+          cp tests/test_strategy_suite_v3.py /tmp/quad-inspect/tests/
+          cp utbreakout/qh_flow.py /tmp/quad-inspect/utbreakout/
+          cp utbreakout/crowding_unwind.py /tmp/quad-inspect/utbreakout/
+          cp utbreakout/strategy_allocator.py /tmp/quad-inspect/utbreakout/
+          cp utbreakout/relative_strength_pullback.py /tmp/quad-inspect/utbreakout/
+          cp utbreakout/rspt_v3.py /tmp/quad-inspect/utbreakout/
+          cd /tmp && zip -qr quad-inspect.zip quad-inspect
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quad-inspect
+          path: /tmp/quad-inspect.zip
+          retention-days: 1
