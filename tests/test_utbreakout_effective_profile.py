@@ -53,7 +53,6 @@ def test_profit_opportunity_effective_profile_overrides_old_values():
     assert out["entry_quality_gate_min_profit_alpha_score"] == 68.0
     assert out["entry_edge_enabled"] is True
     assert out["entry_edge_min_score"] == 68.0
-    assert out["entry_quality_gate_min_entry_edge_score"] == 68.0
     assert out["direction_engine_min_score"] == 62.0
     assert out["entry_type_max_chase_extension_atr"] == 2.35
     assert out["structure_stop_buffer_atr"] == 0.28
@@ -185,7 +184,6 @@ def test_prelaunch_runtime_patches_cannot_restore_the_retired_profile():
         "entry_edge_min_score",
         "entry_edge_long_min_score",
         "entry_edge_short_min_score",
-        "entry_quality_gate_min_entry_edge_score",
         "direction_engine_min_score",
         "entry_type_max_chase_extension_atr",
         "structure_stop_buffer_atr",

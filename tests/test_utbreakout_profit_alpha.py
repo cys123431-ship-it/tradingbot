@@ -1,6 +1,8 @@
 from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
+
 from utbreakout.alpha_engine import (
     apply_profit_alpha_exit_overrides,
     build_entry_edge_decision,
@@ -384,6 +386,30 @@ def test_profit_alpha_exit_meta_only_reduces_position_size():
     assert any("exit meta advisory" in item for item in decision.reasons)
 
 
+def test_profit_alpha_exit_meta_does_not_rewrite_exit_plan():
+    values = _base_values("short")
+    baseline = evaluate_profit_alpha(
+        side="short",
+        values=values,
+        ev_decision=_ev(),
+    )
+    negative_meta = evaluate_profit_alpha(
+        side="short",
+        values=values,
+        ev_decision=_ev(),
+        meta_stats={
+            "short:STRONG_DOWNTREND_SHORT:TREND_RUNNER": {
+                "sample_count": 10,
+                "expectancy_r": -0.22,
+            }
+        },
+    )
+
+    assert negative_meta.allowed is True
+    assert negative_meta.risk_multiplier <= 0.78
+    assert negative_meta.exit_overrides == baseline.exit_overrides
+
+
 def test_entry_edge_combines_ev_and_profit_alpha_into_single_decision():
     alpha = evaluate_profit_alpha(
         side="long",
@@ -459,7 +485,7 @@ def test_entry_edge_strict_blocks_same_borderline_thresholds():
     assert any("Entry Edge p" in item for item in decision.blockers)
 
 
-def test_entry_edge_blocks_when_either_source_is_not_allowed():
+def test_entry_edge_preserves_non_threshold_source_blocker():
     alpha = evaluate_profit_alpha(
         side="long",
         values=_base_values("long"),
@@ -477,6 +503,83 @@ def test_entry_edge_blocks_when_either_source_is_not_allowed():
 
     assert decision.allowed is False
     assert any(item.startswith("EV:") for item in decision.blockers)
+
+
+def test_entry_edge_balanced_defers_ev_score_threshold_to_integrated_decision():
+    alpha = evaluate_profit_alpha(
+        side="long",
+        values=_base_values("long"),
+        ev_decision=_ev(),
+    )
+    alpha = replace(alpha, allowed=True, score=76.0, probability=0.58, blockers=())
+    weak_ev = _ev()
+    weak_ev.allowed = False
+    weak_ev.score = 67.5
+    weak_ev.win_probability = 0.58
+    weak_ev.risk_multiplier = 0.0
+    weak_ev.blockers = ("score 67.5<68.0",)
+
+    decision = build_entry_edge_decision(
+        side="long",
+        ev_decision=weak_ev,
+        alpha_decision=alpha,
+        config={"utbreak_entry_relaxation_mode": "balanced"},
+    )
+
+    assert decision.allowed is True
+    assert decision.risk_multiplier == pytest.approx(0.60)
+    assert any("EV threshold deferred to Entry Edge" in item for item in decision.reasons)
+
+
+def test_entry_edge_balanced_defers_alpha_numeric_thresholds():
+    alpha = evaluate_profit_alpha(
+        side="long",
+        values=_base_values("long"),
+        ev_decision=_ev(),
+    )
+    alpha = replace(
+        alpha,
+        allowed=False,
+        score=68.0,
+        probability=0.58,
+        risk_multiplier=0.0,
+        blockers=("direction engine 61.5<62.0", "profit alpha score 68.0<69.0"),
+    )
+    ev = _ev()
+    ev.score = 76.0
+    ev.win_probability = 0.58
+
+    decision = build_entry_edge_decision(
+        side="long",
+        ev_decision=ev,
+        alpha_decision=alpha,
+        config={"utbreak_entry_relaxation_mode": "balanced"},
+    )
+
+    assert decision.allowed is True
+    assert decision.risk_multiplier == pytest.approx(0.60)
+    assert any("Alpha threshold deferred to Entry Edge" in item for item in decision.reasons)
+
+
+def test_entry_edge_strict_preserves_source_score_blocker():
+    alpha = evaluate_profit_alpha(
+        side="long",
+        values=_base_values("long"),
+        ev_decision=_ev(),
+    )
+    weak_ev = _ev()
+    weak_ev.allowed = False
+    weak_ev.blockers = ("score 67.5<68.0",)
+
+    decision = build_entry_edge_decision(
+        side="long",
+        ev_decision=weak_ev,
+        alpha_decision=alpha,
+        config={"utbreak_entry_relaxation_mode": "strict"},
+    )
+
+    assert decision.allowed is False
+    assert any(item.startswith("EV: score") for item in decision.blockers)
 
 
 def test_entry_edge_includes_net_edge_blocker():

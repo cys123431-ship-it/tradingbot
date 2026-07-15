@@ -121,8 +121,6 @@ def default_profit_alpha_config() -> dict[str, Any]:
         "profit_alpha_derivatives_multi_adverse_block_count": 3,
         "profit_alpha_derivatives_multi_adverse_strong_count": 2,
         "profit_alpha_meta_min_samples": 8,
-        "profit_alpha_meta_expectancy_block_below": -0.12,
-        "profit_alpha_meta_probability_weight": 0.20,
         "direction_engine_min_score": 62.0,
         "direction_engine_opposite_regime_min_score": 68.0,
         "entry_type_max_chase_extension_atr": 2.35,
@@ -130,7 +128,6 @@ def default_profit_alpha_config() -> dict[str, Any]:
         "entry_type_breakout_min_range": 1.12,
         "entry_type_sweep_wick_ratio": 0.38,
         "exit_meta_min_samples": 8,
-        "exit_meta_expectancy_block_below": -0.16,
         "exit_meta_expectancy_reduce_below": 0.0,
         "take_profit_front_run_atr": 0.14,
         "take_profit_front_run_pct": 0.055,
@@ -195,6 +192,30 @@ def _risk_cap_for_mode(mode: str, balanced: float, active: float) -> float:
     if mode == "balanced":
         return float(balanced)
     return 1.0
+
+
+def _split_entry_edge_source_blockers(
+    blockers: Any,
+    *,
+    source: str,
+    relaxation_mode: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    items = tuple(str(item) for item in (blockers or ()) if item)
+    if relaxation_mode == "strict":
+        return items, ()
+    threshold_prefixes = {
+        "ev": ("score ",),
+        "alpha": (
+            "direction engine ",
+            "profit alpha score ",
+            "profit alpha p ",
+        ),
+    }.get(str(source or "").lower(), ())
+    deferred = tuple(
+        item for item in items if item.strip().lower().startswith(threshold_prefixes)
+    )
+    hard = tuple(item for item in items if item not in deferred)
+    return hard, deferred
 
 
 def _finite(value: Any, default: float | None = None) -> float | None:
@@ -628,7 +649,6 @@ def _exit_overrides(
     *,
     entry_type: str = "TREND_CONTINUATION",
     direction_score: float | None = None,
-    exit_meta_expectancy: float | None = None,
 ) -> dict[str, Any]:
     front_run = {
         "take_profit_front_run_atr": float(cfg.get("take_profit_front_run_atr", 0.14) or 0.14),
@@ -784,13 +804,6 @@ def _exit_overrides(
             cfg.get("profit_alpha_default_early_exit_max_mae_r", 0.75) or 0.75
         ),
     }
-    if exit_meta_expectancy is not None and exit_meta_expectancy < 0:
-        result["partial_take_profit_ratio"] = max(0.35, float(result["partial_take_profit_ratio"]))
-        result["second_take_profit_r_multiple"] = min(2.05, float(result["second_take_profit_r_multiple"]))
-        result["take_profit_r_multiple"] = result["second_take_profit_r_multiple"]
-        result["runner_pct"] = min(0.25, float(result["runner_pct"]))
-        result["atr_trailing_multiplier"] = min(2.45, float(result["atr_trailing_multiplier"]))
-        result["runner_chandelier_multiplier"] = min(2.45, float(result["runner_chandelier_multiplier"]))
     result.update(_profile_controls(
         front_atr=0.18,
         front_pct=0.080,
@@ -1142,7 +1155,6 @@ def evaluate_profit_alpha(
         cfg,
         entry_type=entry_type,
         direction_score=direction_score,
-        exit_meta_expectancy=exit_meta_expectancy,
     )
     follow_bars = int(overrides.get("profit_alpha_follow_through_bars", cfg.get("profit_alpha_default_follow_through_bars", 3)) or 3)
     follow_min_mfe = float(
@@ -1280,7 +1292,21 @@ def build_entry_edge_decision(
     if ev_decision is None:
         blockers.append("EV candidate unavailable")
     elif not ev_allowed:
-        blockers.extend(f"EV: {item}" for item in list(ev_blockers)[:4])
+        hard_ev_blockers, deferred_ev_blockers = _split_entry_edge_source_blockers(
+            ev_blockers,
+            source="ev",
+            relaxation_mode=relaxation_mode,
+        )
+        blockers.extend(f"EV: {item}" for item in hard_ev_blockers[:4])
+        if deferred_ev_blockers and not hard_ev_blockers:
+            cap = _risk_cap_for_mode(relaxation_mode, balanced=0.60, active=0.50)
+            ev_risk = cap
+            relaxation_risk_cap = min(relaxation_risk_cap, cap)
+            reasons.extend(
+                f"EV threshold deferred to Entry Edge: {item}"
+                for item in deferred_ev_blockers[:4]
+            )
+            relaxation_actions.append("ev_thresholds_deferred=true")
     else:
         reasons.extend(f"EV: {item}" for item in list(ev_reasons)[:4])
 
@@ -1308,7 +1334,21 @@ def build_entry_edge_decision(
         alpha_exit_policy = str(alpha_decision.exit_policy or alpha_exit)
         alpha_components = dict(alpha_decision.components or {})
         if not alpha_allowed:
-            blockers.extend(f"Alpha: {item}" for item in list(alpha_decision.blockers)[:4])
+            hard_alpha_blockers, deferred_alpha_blockers = _split_entry_edge_source_blockers(
+                alpha_decision.blockers,
+                source="alpha",
+                relaxation_mode=relaxation_mode,
+            )
+            blockers.extend(f"Alpha: {item}" for item in hard_alpha_blockers[:4])
+            if deferred_alpha_blockers and not hard_alpha_blockers:
+                cap = _risk_cap_for_mode(relaxation_mode, balanced=0.60, active=0.50)
+                alpha_risk = cap
+                relaxation_risk_cap = min(relaxation_risk_cap, cap)
+                reasons.extend(
+                    f"Alpha threshold deferred to Entry Edge: {item}"
+                    for item in deferred_alpha_blockers[:4]
+                )
+                relaxation_actions.append("alpha_thresholds_deferred=true")
         else:
             reasons.extend(f"Alpha: {item}" for item in list(alpha_decision.reasons)[:4])
 

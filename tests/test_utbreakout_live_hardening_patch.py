@@ -28,7 +28,6 @@ def test_profit_patch_matches_opportunity_profile_values():
     assert cfg["entry_quality_gate_min_profit_alpha_score"] == 68.0
     assert cfg["entry_edge_enabled"] is True
     assert cfg["entry_edge_min_score"] == 68.0
-    assert cfg["entry_quality_gate_min_entry_edge_score"] == 68.0
     assert cfg["direction_engine_min_score"] == 62.0
     assert cfg["structure_stop_buffer_atr"] == 0.28
     assert cfg["take_profit_front_run_pct"] == 0.055
