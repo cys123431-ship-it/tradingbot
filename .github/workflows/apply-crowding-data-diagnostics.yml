@@ -42,8 +42,24 @@ jobs:
 
       - name: Compile Crowding module
         run: python -m py_compile utbreakout/crowding_unwind.py
+
       - name: Compile runtime
-        run: python -m py_compile emas.py
+        run: |
+          set +e
+          python -m py_compile emas.py > /tmp/emas-compile.log 2>&1
+          status=$?
+          cat /tmp/emas-compile.log
+          exit $status
+
+      - name: Upload runtime compile failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crowding-runtime-compile-failure
+          path: /tmp/emas-compile.log
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Compile strategy tests
         run: python -m py_compile tests/test_strategy_suite_v3.py
       - name: Compile Quad tests
