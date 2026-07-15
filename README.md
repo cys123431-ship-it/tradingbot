@@ -1,7 +1,7 @@
 # Trading Bot
 
 바이낸스 USDT 무기한 선물을 중심으로 동작하는 Python 자동매매 봇입니다.
-현재 실운영 핵심은 **UTBreak Set64(EV Adaptive)**, **RSPT-v3**, **QH-Flow v2**, **Funding-OI Crowding Unwind**, 두 전략을 묶는 **Dual**, 세 전략을 결합하는 **Triple**, 네 전략을 결합하는 **Quad**입니다.
+현재 실운영 핵심은 **UTBreak Set64(EV Adaptive)**, **RSPT-v3**, **QH-Flow v2**, **Funding-OI Crowding Unwind**, **M-TREND**, 두 전략을 묶는 **Dual**, 세 전략을 결합하는 **Triple**, 다섯 전략을 결합하는 **5-Strategy Alpha**입니다.
 
 > **주의**
 > 이 저장소는 실주문·레버리지·TP/SL·자동 배포 코드를 포함합니다. 메인넷 사용 전 반드시 테스트넷과 paper/forward test로 주문 수량, 최소 주문금액, 포지션 모드, 보호 주문, 텔레그램 제어를 확인하세요. API Key, Secret, Telegram Token, SSH Key는 절대 저장소에 커밋하지 마세요.
@@ -19,6 +19,7 @@
 | UTBreak 시간프레임 | AUTO `15m / 30m / 1h`, 진입·청산 `15m`, HTF `1h` |
 | RSPT-v3 시간프레임 | 신호 `4h`, 장기 추세 `1d` |
 | QH-Flow v2 시간구조 | 매시각 `00/15/30/45분` 첫 10초, 신호 유효 120초 |
+| M-TREND 시간프레임 | 완료된 `15m / 1h / 4h` Donchian 돌파 + `4h` EMA 추세 |
 | 공통 유동성 보호 | 상위 20호가 기반 L2 `CALM/MIXED/STRESSED` Gate |
 | 포지션 제한 | 전체 봇 기준 동시 포지션 1개 |
 | 배포 | `main` push → 전체 테스트 → Azure 자동 배포 |
@@ -139,21 +140,28 @@ Triple은 세 전략을 각각 독립적으로 계산하고, 방향이 충돌하
 
 Triple 내부에서는 UTBreak와 RSPT의 QH 확인을 잠시 끄고 QH-Flow v2를 별도 세 번째 투표로 계산하므로, 같은 정보를 중복 계산하지 않습니다. 최종 주문은 점수가 가장 높은 전략의 기존 TP/SL 계획을 선택한 뒤 합의 개수에 따라 수량과 위험금액만 축소합니다.
 
-### 6. Quad — UTBreak + RSPT-v3 + QH-Flow v2 + Crowding Unwind
+### 6. M-TREND — Multi-Timeframe Volatility-Adjusted Trend
 
-Quad는 네 전략을 각각 독립적으로 계산합니다. Crowding Unwind가 다른 전략과 반대 방향이면 과밀 해소 신호를 무시하지 않고 **방향 충돌로 신규 진입을 차단**합니다.
+M-TREND는 완료된 `15m`, `1h`, `4h` 봉에서 새 Donchian 돌파를 찾고 `4h EMA20/EMA50` 추세와 같은 방향일 때만 후보를 만듭니다. 세 시간프레임이 모두 일치해야 하는 AND 구조가 아니며, 한 시간프레임의 신선한 돌파만 있어도 45% 위험으로 단독 진입할 수 있습니다. 두 시간프레임은 75%, 세 시간프레임은 100% 위험을 사용합니다. L2·시장 품질·데이터·주문·단일 포지션 보호는 기존 공통 경로를 그대로 사용합니다.
+
+단독 선택은 `/utbreak mtrend on`, 상태 확인은 `/utbreak mtrend status`입니다.
+
+### 7. 5-Strategy Alpha — UTBreak + RSPT-v3 + QH-Flow v2 + Crowding + M-TREND
+
+기존 `QUAD_ALPHA` 호환 키를 유지하면서 다섯 전략을 각각 독립적으로 계산합니다. 한 전략만 유효해도 진입 후보가 되며, 다른 전략이 같은 방향이면 위험과 신뢰도를 올립니다. 반대 방향 신호가 섞이면 **방향 충돌로 신규 진입을 차단**합니다.
 
 | 유효한 동일 방향 신호 | 위험 배율 |
 |---|---:|
+| 5개 | 100% |
 | 4개 | 100% |
 | 3개 | 90% |
 | 2개 | 75% |
 | 1개 | 45% |
 | LONG·SHORT 혼재 | 거래 차단 |
 
-최종 주문은 네 전략 중 점수가 가장 높은 기존 진입 계획을 사용하며, 진입가·손절가·익절가는 유지하고 수량과 위험금액만 합의 배율에 맞춰 줄입니다. 단독 Crowding 전략과 기존 Dual·Triple도 계속 별도로 사용할 수 있습니다.
+최종 주문은 다섯 전략 중 점수가 가장 높은 기존 진입 계획을 사용하며, 진입가·손절가·익절가는 유지하고 수량과 위험금액만 합의 배율에 맞춰 줄입니다. 텔레그램의 `5-ALL ON/OFF/STATUS` 버튼으로 전체를 제어하며 각 단독 전략 버튼도 유지합니다.
 
-### 7. 레거시 전략
+### 8. 레거시 전략
 
 `UTBOT`, `UTSMC`, `UTRSI`, `UTRSIBB`, `UTBB`, `RSIBB` 등의 코드 경로는 호환·연구 목적으로 남아 있습니다. 현재 README의 실운영 기준은 UTBreak Set64, RSPT-v3, Dual이며, 과거 Triple SMA/HMA 설명은 현재 핵심 런타임을 나타내지 않습니다.
 
@@ -168,7 +176,7 @@ Quad는 네 전략을 각각 독립적으로 계산합니다. Crowding Unwind가
 - **멱등 보호 주문**: TP/SL 중복 생성과 재시작 후 중복 주문을 방지합니다.
 - **시작·재접속 조정**: 포지션, 일반 주문, Algo 주문을 다시 조회하고 불완전하면 신규 진입을 막습니다.
 - **User Data Stream**: 체결·부분체결·취소 이벤트를 추적하고 연결 복구 시 REST 조정을 수행합니다.
-- **공통 L2 Gate**: UTBreak, RSPT-v3, QH-Flow v2, Crowding, Dual, Triple, Quad 모두 상위 20호가의 스프레드·깊이·불균형을 확인합니다.
+- **공통 L2 Gate**: UTBreak, RSPT-v3, QH-Flow v2, Crowding, M-TREND와 합산 전략 모두 상위 20호가의 스프레드·깊이·불균형을 확인합니다.
 - **QH 확인**: UTBreak와 RSPT-v3는 15분 경계가 가까우면 첫 10초 주문흐름을 기다리고, 반대 QH 신호면 진입을 취소합니다.
 - **청산가 보호**: 손절가가 청산가 안전 버퍼 안쪽에 들어가면 레버리지·주문 계획을 재검사합니다.
 - **Critical Pause**: 주문·상태 불일치 등 위험 상황에서는 자동 진입을 잠그고 수동 재개 절차를 요구합니다.
@@ -257,7 +265,7 @@ scripts/bot_ctl.sh stop
 | `/stats` | 거래 통계 |
 | `/risk` | 위험 설정 메뉴 |
 | `/strat` | 전략 선택 메뉴 |
-| `/utbreak` | UTBreak/Set64/RSPT/QH-Flow v2/Crowding/Dual/Triple/Quad 메뉴 |
+| `/utbreak` | UTBreak/Set64/RSPT/QH-Flow v2/Crowding/M-TREND/Dual/Triple/5-Strategy 메뉴 |
 | `/prediction` | Prediction Micro Auto / Predict.fun 메뉴 |
 | `/setup` | 거래소·네트워크 전환만 지원 |
 | `/log` | 최근 로그 |
@@ -277,12 +285,15 @@ UTBreak 진단에서 자주 사용하는 하위 명령:
 /utbreak research
 /utbreak qh on|off|status
 /utbreak crowding on|off|status
+/utbreak mtrend on|off|status
 /utbreak dual on|off|status
 /utbreak triple on|off|status
 /utbreak quad on|off|status
 /utbreak bridge on|off
 /utbreak watchdog on|off
 ```
+
+모든 실전 포지션의 주전략·동의전략·수수료·펀딩·R·TP1/TP2/runner/SL 체결 기여를 한 포지션당 한 번만 기록합니다. 매월 1일 오전 9시(KST)에 전월 리포트를 UTF-8 TXT 파일로 같은 텔레그램 채팅에 보내며, 거래가 0건이어도 발송하고 재시작 후 중복 발송을 막습니다.
 
 텔레그램 버튼과 텍스트 명령으로 `STOP`, `PAUSE`, `RESUME`도 처리합니다. `/setup`의 오래된 전략 설정 메뉴는 제거되었으며 현재는 거래소·네트워크 전환만 담당합니다.
 

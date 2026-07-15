@@ -114,6 +114,27 @@ def test_crowding_and_allocator_are_registered():
     assert {"crowd", "crowding", "crowding_status"} <= emas.UTBREAKOUT_CALLBACK_ACTIONS
 
 
+def test_mtrend_strategy_and_telegram_actions_are_registered():
+    emas = _emas_module()
+    assert emas.M_TREND_STRATEGY in emas.UTBREAKOUT_STRATEGIES
+    assert emas.STRATEGY_DISPLAY_NAMES[emas.M_TREND_STRATEGY] == "M_TREND"
+    assert {"mtrend", "m_trend", "mtrend_status"} <= emas.UTBREAKOUT_CALLBACK_ACTIONS
+
+    engine = object.__new__(emas.SignalEngine)
+    engine._multi_timeframe_trend_runtime_config = lambda cfg=None: {
+        "enabled": False,
+        "live_enabled": False,
+    }
+    params = engine._quad_alpha_strategy_params(
+        {"UTBotFilteredBreakoutV1": {}},
+        emas.M_TREND_STRATEGY,
+    )
+    cfg = params["UTBotFilteredBreakoutV1"]
+    assert params["active_strategy"] == emas.M_TREND_STRATEGY
+    assert cfg["multi_timeframe_trend_live_enabled"] is True
+    assert cfg["multi_timeframe_trend"]["live_enabled"] is True
+
+
 def test_strategy_allocator_plan_hook_scales_once(monkeypatch):
     emas = _emas_module()
     engine = object.__new__(emas.SignalEngine)
@@ -156,7 +177,7 @@ def test_quad_branch_params_enable_crowding_without_cross_branch_confirmation():
     assert cfg["qh_flow_confirmation_enabled"] is False
 
 
-def test_quad_four_way_agreement_selects_full_risk_plan():
+def test_quad_five_way_agreement_selects_full_risk_plan():
     emas = _emas_module()
     engine = object.__new__(emas.SignalEngine)
     engine.quad_alpha_last_status = {}
@@ -167,6 +188,7 @@ def test_quad_four_way_agreement_selects_full_risk_plan():
         emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND: {"strategy": emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND, "plan_symbol": "BTC/USDT:USDT", "qty": 1.0, "risk_usdt": 1.0},
         emas.QH_FLOW_STRATEGY: {"strategy": emas.QH_FLOW_STRATEGY, "plan_symbol": "BTC/USDT:USDT", "qty": 1.0, "risk_usdt": 1.0},
         emas.CROWDING_UNWIND_STRATEGY: {"strategy": emas.CROWDING_UNWIND_STRATEGY, "plan_symbol": "BTC/USDT:USDT", "qty": 1.0, "risk_usdt": 1.0},
+        emas.M_TREND_STRATEGY: {"strategy": emas.M_TREND_STRATEGY, "plan_symbol": "BTC/USDT:USDT", "qty": 1.0, "risk_usdt": 1.0},
     }
     current = {"key": None}
 
@@ -182,6 +204,7 @@ def test_quad_four_way_agreement_selects_full_risk_plan():
         emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND: 80,
         emas.QH_FLOW_STRATEGY: 70,
         emas.CROWDING_UNWIND_STRATEGY: 60,
+        emas.M_TREND_STRATEGY: 50,
     }[key]
     engine._dual_alpha_scale_plan = lambda plan, multiplier: {
         **plan,
@@ -212,10 +235,15 @@ def test_quad_four_way_agreement_selects_full_risk_plan():
         current["key"] = emas.CROWDING_UNWIND_STRATEGY
         return "long", "crowd long", {"accepted_side": "long", "reason": "crowd long"}
 
+    async def mtrend(*args, **kwargs):
+        current["key"] = emas.M_TREND_STRATEGY
+        return "long", "mtrend long", {"accepted_side": "long", "reason": "mtrend long"}
+
     engine._calculate_utbot_filtered_breakout_signal = ut
     engine._calculate_relative_strength_pullback_signal = rsp
     engine._calculate_qh_flow_signal = qh
     engine._calculate_crowding_unwind_signal = crowd
+    engine._calculate_multi_timeframe_trend_signal = mtrend
 
     side, _, status = asyncio.run(
         engine._calculate_quad_alpha_signal(
@@ -226,15 +254,88 @@ def test_quad_four_way_agreement_selects_full_risk_plan():
     )
 
     assert side == "long"
-    assert status["quad_alpha"]["confirmation_count"] == 4
-    assert status["quad_alpha"]["agreement_state"] == "quad"
+    assert status["quad_alpha"]["confirmation_count"] == 5
+    assert status["quad_alpha"]["agreement_state"] == "five"
     assert status["quad_alpha"]["agreement_risk_multiplier"] == pytest.approx(1.0)
-    assert selected_plans[-1][1]["quad_alpha_confirmation_count"] == 4
+    assert selected_plans[-1][1]["quad_alpha_confirmation_count"] == 5
+    assert selected_plans[-1][1]["quad_alpha_confirmation_strategies"][-1] == emas.M_TREND_STRATEGY
     assert selected_plans[-1][1]["qty"] == pytest.approx(1.0)
 
 
+def test_quad_accepts_mtrend_as_the_only_signal_at_single_signal_risk():
+    emas = _emas_module()
+    engine = object.__new__(emas.SignalEngine)
+    engine.quad_alpha_last_status = {}
+    engine.last_entry_reason = {}
+    selected_plans = []
+    current = {"key": None}
+    mtrend_plan = {
+        "strategy": emas.M_TREND_STRATEGY,
+        "plan_symbol": "BTC/USDT:USDT",
+        "qty": 2.0,
+        "risk_usdt": 2.0,
+    }
 
-def test_quad_status_text_shows_four_traffic_lights_and_details():
+    engine._canonical_futures_symbol = lambda symbol: symbol
+    engine._clear_utbot_filtered_breakout_entry_plan = lambda symbol: None
+    engine._get_utbot_filtered_breakout_config = lambda params=None: {
+        "quad_alpha_single_signal_risk_multiplier": 0.45,
+    }
+    engine._qh_flow_runtime_config = lambda cfg=None: {}
+    engine._quad_alpha_strategy_params = lambda params, branch: {"branch": branch}
+    engine._utbreakout_diag_for_symbol = lambda symbol: {}
+    engine._get_utbot_filtered_breakout_entry_plan = lambda symbol, side=None: (
+        mtrend_plan if current["key"] == emas.M_TREND_STRATEGY else None
+    )
+    engine._dual_alpha_score = lambda key, side, status, plan: 80.0
+    engine._dual_alpha_scale_plan = lambda plan, multiplier: {
+        **plan,
+        "qty": plan["qty"] * multiplier,
+        "risk_usdt": plan["risk_usdt"] * multiplier,
+    }
+    engine._dual_alpha_light = lambda status, label: {
+        "light": "green" if (status or {}).get("accepted_side") else "yellow",
+        "side": (status or {}).get("accepted_side"),
+        "reason": (status or {}).get("reason"),
+    }
+    engine._set_utbot_filtered_breakout_entry_plan = lambda symbol, plan: selected_plans.append(dict(plan))
+    engine._store_utbot_filtered_breakout_status = lambda symbol, status: None
+
+    async def waiting(*args, **kwargs):
+        return None, "waiting", {"stage": "waiting", "reason": "waiting"}
+
+    async def mtrend(*args, **kwargs):
+        current["key"] = emas.M_TREND_STRATEGY
+        return "long", "mtrend long", {
+            "accepted_side": "long",
+            "accepted_code": "ACCEPTED_ENTRY",
+            "reason": "mtrend long",
+        }
+
+    engine._calculate_utbot_filtered_breakout_signal = waiting
+    engine._calculate_relative_strength_pullback_signal = waiting
+    engine._calculate_qh_flow_signal = waiting
+    engine._calculate_crowding_unwind_signal = waiting
+    engine._calculate_multi_timeframe_trend_signal = mtrend
+
+    side, _, status = asyncio.run(
+        engine._calculate_quad_alpha_signal(
+            "BTC/USDT:USDT",
+            None,
+            {"active_strategy": emas.QUAD_ALPHA_STRATEGY},
+        )
+    )
+
+    assert side == "long"
+    assert status["quad_alpha"]["confirmation_count"] == 1
+    assert status["quad_alpha"]["agreement_state"] == "single"
+    assert status["quad_alpha"]["agreement_risk_multiplier"] == pytest.approx(0.45)
+    assert selected_plans[-1]["strategy"] == emas.M_TREND_STRATEGY
+    assert selected_plans[-1]["qty"] == pytest.approx(0.9)
+
+
+
+def test_quad_status_text_shows_five_traffic_lights_and_details():
     emas = _emas_module()
     engine = object.__new__(emas.SignalEngine)
     symbol = "ALLO/USDT:USDT"
@@ -269,6 +370,11 @@ def test_quad_status_text_shows_four_traffic_lights_and_details():
                     "side": None,
                     "reason": "crowding_not_extreme",
                 },
+                "mtrend": {
+                    "light": "yellow",
+                    "side": None,
+                    "reason": "no fresh Donchian breakout",
+                },
             },
         }
     }
@@ -280,7 +386,8 @@ def test_quad_status_text_shows_four_traffic_lights_and_details():
     assert "RSPT-v3" in text and "🟡 조건 대기" in text
     assert "QH-Flow v2" in text
     assert "Crowding Unwind" in text
-    assert "🟢 유효 신호: 0/4" in text
+    assert "M-TREND" in text
+    assert "🟢 유효 신호: 0/5" in text
     assert "📋 전략별 상세 설명" in text
     assert "초록불만 confirmations에 포함" in text
     assert "범례: 🟢 유효 신호" in text
@@ -322,6 +429,7 @@ def test_quad_status_distinguishes_crowding_data_missing_from_not_extreme():
                         ],
                     },
                 },
+                "mtrend": {"light": "yellow", "side": None, "reason": "waiting"},
             },
         }
     }

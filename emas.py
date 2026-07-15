@@ -46,6 +46,11 @@ from trading_safety.trade_accounting import (
     TradeAccountingFinalizer,
     rebuild_engine_performance_stats,
 )
+from trading_safety.monthly_report import (
+    KST as MONTHLY_REPORT_KST,
+    build_monthly_trade_report,
+    previous_calendar_month,
+)
 from trading_safety.order_state import (
     ENTRY_BLOCKING_STATES,
     OrderState,
@@ -171,6 +176,11 @@ from utbreakout.crowding_unwind import (
     default_crowding_unwind_config,
     evaluate_crowding_unwind,
 )
+from utbreakout.multi_timeframe_trend import (
+    M_TREND_STRATEGY,
+    default_multi_timeframe_trend_config,
+    evaluate_multi_timeframe_trend,
+)
 from utbreakout.strategy_allocator import (
     default_strategy_allocator_config,
     evaluate_strategy_allocation,
@@ -266,6 +276,9 @@ UTBREAKOUT_CALLBACK_ACTIONS = UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS | frozenset({
     "crowd",
     "crowding",
     "crowding_status",
+    "mtrend",
+    "m_trend",
+    "mtrend_status",
     "dual",
     "dualt",
     "dual_status",
@@ -551,6 +564,7 @@ UTBREAKOUT_STRATEGIES = {
     ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
     QH_FLOW_STRATEGY,
     CROWDING_UNWIND_STRATEGY,
+    M_TREND_STRATEGY,
     DUAL_ALPHA_STRATEGY,
     TRIPLE_ALPHA_STRATEGY,
     QUAD_ALPHA_STRATEGY,
@@ -587,6 +601,7 @@ STRATEGY_DISPLAY_NAMES = {
     ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND: 'RELATIVE_STRENGTH_PULLBACK_TREND',
     QH_FLOW_STRATEGY: 'QH_FLOW',
     CROWDING_UNWIND_STRATEGY: 'FUNDING_OI_CROWDING_UNWIND',
+    M_TREND_STRATEGY: 'M_TREND',
     DUAL_ALPHA_STRATEGY: 'DUAL_ALPHA',
     TRIPLE_ALPHA_STRATEGY: 'TRIPLE_ALPHA',
     QUAD_ALPHA_STRATEGY: 'QUAD_ALPHA',
@@ -2384,6 +2399,7 @@ def build_default_utbot_filtered_breakout_config():
         'triple_alpha_two_signal_risk_multiplier': 0.85,
         'triple_alpha_single_signal_risk_multiplier': 0.55,
         'quad_alpha_four_signal_risk_multiplier': 1.00,
+        'quad_alpha_five_signal_risk_multiplier': 1.00,
         'quad_alpha_three_signal_risk_multiplier': 0.90,
         'quad_alpha_two_signal_risk_multiplier': 0.75,
         'quad_alpha_single_signal_risk_multiplier': 0.45,
@@ -2393,6 +2409,8 @@ def build_default_utbot_filtered_breakout_config():
         'l2_gate_enabled': True,
         'crowding_unwind': default_crowding_unwind_config(),
         'crowding_unwind_live_enabled': False,
+        'multi_timeframe_trend': default_multi_timeframe_trend_config(),
+        'multi_timeframe_trend_live_enabled': False,
         'strategy_allocator': default_strategy_allocator_config(),
         'strategy_allocator_enabled': True,
         'entry_strategy': ENTRY_STRATEGY_UT_BREAKOUT,
@@ -2931,6 +2949,9 @@ class TradingConfig:
                     'startup_keyboard_enabled': False,
                     'hourly_report_enabled': False,
                     'stateful_diag_enabled': False,
+                    'monthly_trade_report_enabled': True,
+                    'monthly_trade_report_timezone': 'Asia/Seoul',
+                    'monthly_trade_report_hour': 9,
                     'alt_trend_alert_enabled': False,
                     'alt_trend_alert_timeframes': ['1d'],
                     'alt_trend_alert_scope': 'binance_futures_all',
@@ -3535,6 +3556,9 @@ class TradingConfig:
             'startup_keyboard_enabled': False,
             'hourly_report_enabled': False,
             'stateful_diag_enabled': False,
+            'monthly_trade_report_enabled': True,
+            'monthly_trade_report_timezone': 'Asia/Seoul',
+            'monthly_trade_report_hour': 9,
             'alt_trend_alert_enabled': False
         }
         for key, default_value in reporting_defaults.items():
@@ -3583,6 +3607,9 @@ class TradingConfig:
                     "startup_keyboard_enabled": False,
                     "hourly_report_enabled": False,
                     "stateful_diag_enabled": False,
+                    "monthly_trade_report_enabled": True,
+                    "monthly_trade_report_timezone": "Asia/Seoul",
+                    "monthly_trade_report_hour": 9,
                     "alt_trend_alert_enabled": False,
                     "alt_trend_alert_timeframes": ["1d"],
                     "alt_trend_alert_scope": "binance_futures_all",
@@ -5122,6 +5149,51 @@ class TemaEngine(BaseEngine):
                 realized_seen = False
                 weighted_exit = 0.0
                 closing_qty = 0.0
+                exit_legs = []
+                state_data = state if isinstance(state, dict) else {}
+                planned_targets = list(
+                    state_data.get('planned_tp_orders')
+                    or state_data.get('tp_orders')
+                    or []
+                )
+
+                def _fill_label(order_id, fill_price):
+                    order_id_text = str(order_id or '')
+                    for target in planned_targets:
+                        if not isinstance(target, dict):
+                            continue
+                        target_ids = {
+                            str(target.get(key) or '')
+                            for key in ('order_id', 'id', 'client_order_id')
+                        }
+                        if order_id_text and order_id_text in target_ids:
+                            return str(
+                                target.get('tp_label')
+                                or target.get('tp_name')
+                                or f"TP{target.get('tp_index') or ''}"
+                            ).upper()
+                    priced_targets = []
+                    for target in planned_targets:
+                        if not isinstance(target, dict):
+                            continue
+                        target_price = _safe_float_or_none(target.get('price'))
+                        if target_price and fill_price > 0:
+                            priced_targets.append((abs(fill_price / target_price - 1.0), target))
+                    if priced_targets:
+                        distance, target = min(priced_targets, key=lambda item: item[0])
+                        if distance <= 0.003:
+                            return str(
+                                target.get('tp_label')
+                                or target.get('tp_name')
+                                or f"TP{target.get('tp_index') or ''}"
+                            ).upper()
+                    stop_price = _safe_float_or_none(
+                        state_data.get('last_stop_price') or state_data.get('hard_stop_price')
+                    )
+                    if stop_price and fill_price > 0 and abs(fill_price / stop_price - 1.0) <= 0.005:
+                        return 'SL'
+                    return 'EXIT'
+
                 for trade in trades or []:
                     info = trade.get('info') if isinstance(trade.get('info'), dict) else {}
                     trade_side = str(trade.get('side') or info.get('side') or '').lower()
@@ -5159,6 +5231,17 @@ class TemaEngine(BaseEngine):
                     if fill_qty > 0 and fill_price > 0:
                         closing_qty += fill_qty
                         weighted_exit += fill_qty * fill_price
+                        exit_legs.append({
+                            'label': _fill_label(
+                                trade.get('order') or info.get('orderId') or info.get('order'),
+                                fill_price,
+                            ),
+                            'timestamp': trade_ts,
+                            'order_id': trade.get('order') or info.get('orderId') or info.get('order'),
+                            'qty': fill_qty,
+                            'price': fill_price,
+                            'realized_pnl_usdt': float(pnl_value or 0.0),
+                        })
                 if realized_seen and closing_qty > 0:
                     resolved_exit = weighted_exit / closing_qty
                     cost_basis = entry_price * max(entry_qty, closing_qty)
@@ -5169,6 +5252,7 @@ class TemaEngine(BaseEngine):
                         'exit_price': float(resolved_exit),
                         'estimated': False,
                         'source': 'exchange_trades',
+                        'exit_legs': exit_legs,
                     }
             except Exception as exc:
                 logger.warning(f"Closed-trade fill lookup failed for {symbol}: {exc}")
@@ -5205,6 +5289,14 @@ class TemaEngine(BaseEngine):
             'exit_price': float(fallback_exit),
             'estimated': True,
             'source': 'fallback_price',
+            'exit_legs': [{
+                'label': 'EXIT',
+                'timestamp': int(time.time() * 1000),
+                'order_id': None,
+                'qty': entry_qty,
+                'price': float(fallback_exit),
+                'realized_pnl_usdt': float(pnl),
+            }],
         }
 
     async def _record_closed_trade_accounting(self, symbol, reason, *, exit_price=None, state=None):
@@ -5241,6 +5333,24 @@ class TemaEngine(BaseEngine):
         close_reason = str(reason or 'automatic close')
         if result.get('estimated'):
             close_reason = f"{close_reason} [estimated-price]"
+        reason_upper = close_reason.upper()
+        exit_legs = [dict(item) for item in result.get('exit_legs') or [] if isinstance(item, dict)]
+        for leg in exit_legs:
+            if str(leg.get('label') or '').upper() != 'EXIT':
+                continue
+            if 'TP1' in reason_upper:
+                leg['label'] = 'TP1'
+            elif 'TP2' in reason_upper or 'TAKE_PROFIT' in reason_upper:
+                leg['label'] = 'TP2'
+            elif 'TRAIL' in reason_upper or 'RUNNER' in reason_upper or 'CHANDELIER' in reason_upper:
+                leg['label'] = 'RUNNER'
+            elif 'STOP' in reason_upper or re.search(r'(^|[^A-Z])SL([^A-Z]|$)', reason_upper):
+                leg['label'] = 'SL'
+            elif 'MANUAL' in reason_upper or 'EMERGENCY' in reason_upper:
+                leg['label'] = 'MANUAL'
+            elif 'TIME' in reason_upper:
+                leg['label'] = 'TIME_STOP'
+        result['exit_legs'] = exit_legs
         updated = db.log_trade_close(
             accounting_symbol,
             result['pnl'],
@@ -5287,7 +5397,39 @@ class TemaEngine(BaseEngine):
                     store = getattr(self, 'trading_state_store', None)
                 if store is not None:
                     active_records = store.active_for_symbol(accounting_symbol)
+                    if not active_records:
+                        historic_records = store.records_for_symbol(accounting_symbol)
+                        entry_records = [
+                            record for record in historic_records
+                            if str(getattr(record, 'order_intent', '') or '').upper() == 'ENTRY'
+                        ]
+                        active_records = list(reversed(entry_records[-10:]))
                 entry_record = active_records[0] if active_records else None
+                entry_metadata = dict(getattr(entry_record, 'metadata', {}) or {})
+                primary_strategy = str(
+                    entry_metadata.get('primary_strategy')
+                    or getattr(entry_record, 'strategy', None)
+                    or state_data.get('strategy')
+                    or 'UNKNOWN'
+                )
+                confirmation_strategies = entry_metadata.get('confirmation_strategies') or [primary_strategy]
+                confirmation_strategies = list(dict.fromkeys(
+                    str(value) for value in confirmation_strategies if str(value).strip()
+                ))
+                aggregate_strategy = entry_metadata.get('aggregate_strategy')
+                exit_timestamp_ms = max(
+                    (
+                        int(float(item.get('timestamp') or 0))
+                        for item in exit_legs
+                        if item.get('timestamp') not in (None, '')
+                    ),
+                    default=0,
+                )
+                resolved_exit_time = (
+                    datetime.fromtimestamp(exit_timestamp_ms / 1000.0, tz=timezone.utc).isoformat()
+                    if exit_timestamp_ms > 0
+                    else datetime.now(timezone.utc).isoformat()
+                )
                 trade_key = "|".join(
                     (
                         accounting_symbol,
@@ -5298,16 +5440,22 @@ class TemaEngine(BaseEngine):
                 live_trade = {
                     'trade_id': hashlib.sha256(trade_key.encode('utf-8')).hexdigest()[:24],
                     'client_order_id': getattr(entry_record, 'client_order_id', None),
-                    'strategy': getattr(entry_record, 'strategy', None) or state_data.get('strategy'),
-                    'engine': state_data.get('engine') or getattr(entry_record, 'strategy', None),
+                    'strategy': primary_strategy,
+                    'primary_strategy': primary_strategy,
+                    'selected_strategy': primary_strategy,
+                    'confirmation_strategies': confirmation_strategies,
+                    'aggregate_strategy': aggregate_strategy,
+                    'engine': aggregate_strategy or state_data.get('engine') or getattr(entry_record, 'strategy', None),
                     'symbol': accounting_symbol,
                     'side': (open_trade or {}).get('side'),
                     'entry_time': (open_trade or {}).get('entry_time'),
-                    'exit_time': datetime.now(timezone.utc).isoformat(),
+                    'exit_time': resolved_exit_time,
                     'entry_price': (open_trade or {}).get('entry_price'),
                     'exit_price': result.get('exit_price'),
+                    'pnl_pct': result.get('pnl_pct'),
                     'requested_qty': getattr(entry_record, 'requested_qty', filled_qty),
                     'filled_qty': filled_qty,
+                    'leverage': entry_metadata.get('leverage'),
                     'gross_pnl_usdt': result.get('pnl'),
                     'entry_fee_usdt': None,
                     'exit_fee_usdt': None,
@@ -5319,6 +5467,9 @@ class TemaEngine(BaseEngine):
                     'mfe_r': state_data.get('mfe_r'),
                     'mae_r': state_data.get('mae_r'),
                     'exit_reason': close_reason,
+                    'exit_legs': exit_legs,
+                    'entry_plan_summary': entry_metadata.get('entry_plan_summary') or {},
+                    'accounting_source': result.get('source'),
                     'provisional': True,
                 }
                 if store is not None:
@@ -5446,10 +5597,11 @@ class SignalEngine(BaseEngine):
         self.l2_gate_cache = {}  # symbol -> short-lived shared L2 state
         self.l2_gate_history = {}  # symbol -> dynamic L2 replenishment/depletion samples
         self.crowding_unwind_last_status = {}  # symbol -> latest funding/OI unwind status
+        self.multi_timeframe_trend_last_status = {}  # symbol -> latest M-TREND status
         self.strategy_allocator_last_status = {}  # strategy -> adaptive risk summary
         self.strategy_allocator_cache = {}  # short-lived finalized trade summaries
         self.triple_alpha_last_status = {}  # symbol -> latest triple strategy summary
-        self.quad_alpha_last_status = {}  # symbol -> latest four-strategy agreement summary
+        self.quad_alpha_last_status = {}  # symbol -> latest five-strategy agreement summary
         self.last_live_entry_snapshot = {}  # latest confirmed live entry, for status fallback only
         self.utbreakout_adaptive_tf_state = {}  # symbol -> selected TF stability state
         self.utbreakout_adaptive_last_decision_ts = {}  # symbol -> tf -> last closed candle evaluated
@@ -5644,6 +5796,7 @@ class SignalEngine(BaseEngine):
         self.l2_gate_cache = {}
         self.l2_gate_history = {}
         self.crowding_unwind_last_status = {}
+        self.multi_timeframe_trend_last_status = {}
         self.strategy_allocator_last_status = {}
         self.strategy_allocator_cache = {}
         self.triple_alpha_last_status = {}
@@ -16642,6 +16795,243 @@ class SignalEngine(BaseEngine):
             lines.append(f"Missing fields: {', '.join(str(value) for value in missing)}")
         return '\n'.join(lines)
 
+    def _multi_timeframe_trend_runtime_config(self, cfg=None):
+        source = dict(cfg or {})
+        base = default_multi_timeframe_trend_config()
+        nested = source.get('multi_timeframe_trend')
+        if isinstance(nested, dict):
+            base.update(nested)
+        if 'multi_timeframe_trend_live_enabled' in source:
+            base['live_enabled'] = bool(source.get('multi_timeframe_trend_live_enabled'))
+        return base
+
+    async def _calculate_multi_timeframe_trend_signal(
+        self,
+        symbol,
+        df,
+        strategy_params,
+        *,
+        force_reprocess=False,
+    ):
+        cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+        trend_cfg = self._multi_timeframe_trend_runtime_config(cfg)
+        canonical = self._canonical_futures_symbol(symbol)
+        self._clear_utbot_filtered_breakout_entry_plan(canonical)
+        status = {
+            'strategy': STRATEGY_DISPLAY_NAMES.get(M_TREND_STRATEGY, 'M_TREND'),
+            'entry_strategy': M_TREND_STRATEGY,
+            'symbol': canonical,
+            'stage': 'waiting',
+        }
+
+        def _finish(sig, reason, code=None):
+            status['reason'] = reason
+            status['accepted_side'] = sig
+            if code:
+                status['reject_code'] = code
+            if sig:
+                status['accepted_code'] = 'ACCEPTED_ENTRY'
+                status['stage'] = 'entry_ready'
+            if not isinstance(getattr(self, 'multi_timeframe_trend_last_status', None), dict):
+                self.multi_timeframe_trend_last_status = {}
+            self.multi_timeframe_trend_last_status[canonical] = dict(status)
+            self._store_utbot_filtered_breakout_status(canonical, status)
+            self.last_entry_reason[canonical] = reason
+            return sig, reason, status
+
+        if self.is_upbit_mode():
+            return _finish(None, 'M-TREND unsupported in Upbit mode', 'REJECTED_UNSUPPORTED_MODE')
+        if not bool(trend_cfg.get('enabled', True)) or not bool(trend_cfg.get('live_enabled', False)):
+            return _finish(None, 'M-TREND live disabled', 'REJECTED_M_TREND_LIVE_DISABLED')
+
+        timeframes = ('15m', '1h', '4h')
+        try:
+            results = await asyncio.gather(*(
+                asyncio.to_thread(
+                    self.market_data_exchange.fetch_ohlcv,
+                    canonical,
+                    timeframe,
+                    limit=220,
+                )
+                for timeframe in timeframes
+            ))
+            frames = {}
+            for timeframe, ohlcv in zip(timeframes, results):
+                rows = self._relative_strength_pullback_rows_from_ohlcv(ohlcv)
+                frames[timeframe] = completed_candle_rows(
+                    rows,
+                    timeframe,
+                    {'exclude_incomplete_live_candle': True},
+                )
+        except Exception as exc:
+            return _finish(None, f'M-TREND OHLCV unavailable: {exc}', 'REJECTED_M_TREND_DATA')
+
+        decision = evaluate_multi_timeframe_trend(frames, trend_cfg)
+        status.update({
+            'allowed': bool(decision.allowed),
+            'side': decision.side,
+            'score': float(decision.score),
+            'risk_multiplier': float(decision.risk_multiplier),
+            'confirmations': list(decision.confirmations),
+            'metrics': dict(decision.metrics),
+        })
+        if not decision.allowed or decision.side not in {'long', 'short'}:
+            return _finish(None, decision.reason)
+        side = decision.side
+        if not self.is_trade_direction_allowed(side):
+            return _finish(None, self.format_trade_direction_block_reason(side), 'REJECTED_DIRECTION_FILTER')
+
+        daily_count, daily_pnl = self.db.get_daily_stats()
+        daily_entries = self.db.get_daily_entry_count()
+        status['daily_pnl'] = daily_pnl
+        status['daily_entries'] = daily_entries
+        if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
+            return _finish(None, f'risk_limit_blocked: daily pnl {daily_pnl:.2f}', 'REJECTED_DAILY_LOSS_LIMIT')
+        if int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
+            return _finish(None, f'risk_limit_blocked: daily trade count {daily_entries}', 'REJECTED_DAILY_TRADE_LIMIT')
+
+        latest_15m = (frames.get('15m') or [])[-1] if frames.get('15m') else {}
+        entry_price = _safe_float_or_none(latest_15m.get('close'))
+        metrics = dict(decision.metrics or {})
+        tf_metrics = metrics.get('timeframes') if isinstance(metrics.get('timeframes'), dict) else {}
+        atr_value = _safe_float_or_none((tf_metrics.get('15m') or {}).get('atr'))
+        if entry_price is None or entry_price <= 0 or atr_value is None or atr_value <= 0:
+            return _finish(None, 'M-TREND entry price/ATR unavailable', 'REJECTED_M_TREND_DATA')
+
+        filter_values = {
+            'entry_price': entry_price,
+            'entry_timeframe': '15m',
+            'atr': atr_value,
+            'atr_pct': atr_value / entry_price * 100.0,
+        }
+        market_quality = self._evaluate_utbreakout_market_quality(side, cfg, filter_values)
+        status['market_quality'] = market_quality
+        if market_quality.get('hard_block') or market_quality.get('state') is False:
+            return _finish(None, f"market_quality_rejected: {market_quality.get('summary')}", 'REJECTED_MARKET_QUALITY')
+        l2_gate = await self._evaluate_shared_l2_gate(
+            canonical,
+            cfg,
+            force_refresh=force_reprocess,
+            side=side,
+        )
+        status['l2_gate'] = dict(l2_gate or {})
+        if not l2_gate.get('allowed', False):
+            return _finish(None, f"L2 stressed: {l2_gate.get('reason')}", 'REJECTED_L2_STRESSED')
+
+        total_balance, free_balance, _ = await self.get_balance_info()
+        balance_for_risk = total_balance if total_balance > 0 else free_balance
+        common_cfg = self.get_runtime_common_settings()
+        leverage = int(max(1.0, float(common_cfg.get('leverage', 5) or 5)))
+        risk_multiplier = min(
+            1.0,
+            max(0.0, float(decision.risk_multiplier or 0.0)),
+            max(0.0, float(market_quality.get('risk_multiplier', 1.0) or 1.0)),
+            max(0.0, float(l2_gate.get('risk_multiplier', 0.0) or 0.0)),
+        )
+        risk_budget = resolve_utbreakout_risk_budget(
+            balance_for_risk,
+            cfg,
+            multiplier=risk_multiplier,
+        )
+        try:
+            plan = calculate_risk_plan(
+                side=side,
+                entry_price=entry_price,
+                atr_value=atr_value,
+                stop_atr_multiplier=float(trend_cfg.get('stop_atr_multiplier', 1.50) or 1.50),
+                ut_stop=None,
+                structure_stop=None,
+                structure_buffer_atr=0.0,
+                take_profit_r_multiple=float(trend_cfg.get('take_profit_r_multiple', 3.0) or 3.0),
+                take_profit_front_run_atr=0.0,
+                take_profit_front_run_pct=0.0,
+                min_risk_reward=min(2.0, float(trend_cfg.get('take_profit_r_multiple', 3.0) or 3.0)),
+                balance_usdt=balance_for_risk,
+                risk_per_trade_percent=risk_budget['risk_per_trade_percent'],
+                max_risk_per_trade_usdt=risk_budget['max_risk_per_trade_usdt'],
+                leverage=leverage,
+            )
+            plan = cap_utbreakout_risk_plan_to_margin(
+                plan,
+                free_balance=free_balance,
+                leverage=leverage,
+                entry_price=entry_price,
+            )
+        except ValueError as exc:
+            return _finish(None, f'M-TREND risk plan rejected: {exc}', 'REJECTED_M_TREND_RISK_PLAN')
+
+        plan.update({
+            'strategy': M_TREND_STRATEGY,
+            'plan_symbol': canonical,
+            'signal_candle_ts': latest_15m.get('timestamp'),
+            'entry_timeframe': '15m',
+            'timeframe': '15m',
+            'exit_timeframe': '15m',
+            'htf_timeframe': '4h',
+            'entry_execution': 'market',
+            'mtrend_score': float(decision.score),
+            'mtrend_risk_multiplier': risk_multiplier,
+            'mtrend_confirmations': list(decision.confirmations),
+            'mtrend_metrics': metrics,
+            'l2_gate': dict(l2_gate or {}),
+            'l2_state': l2_gate.get('state'),
+            'l2_risk_multiplier': l2_gate.get('risk_multiplier'),
+            'market_quality_summary': market_quality.get('summary'),
+            'atr': atr_value,
+            'atr_pct': atr_value / entry_price * 100.0,
+            'partial_take_profit_enabled': True,
+            'partial_take_profit_r_multiple': 1.0,
+            'partial_take_profit_ratio': 0.25,
+            'second_take_profit_enabled': True,
+            'second_take_profit_r_multiple': float(trend_cfg.get('take_profit_r_multiple', 3.0) or 3.0),
+            'second_take_profit_ratio': 0.35,
+            'runner_pct': 0.40,
+            'atr_trailing_enabled': True,
+            'atr_trailing_activation_r': 1.0,
+            'atr_trailing_multiplier': float(trend_cfg.get('trailing_atr_multiplier', 3.0) or 3.0),
+            'runner_exit_enabled': True,
+            'runner_chandelier_enabled': True,
+            'tp1_breakeven_enabled': True,
+            'tp1_breakeven_wait_for_partial': True,
+            'ev_time_stop_enabled': True,
+            'ev_time_stop_bars': int(trend_cfg.get('time_stop_bars', 48) or 48),
+            'ev_time_stop_min_mfe_r': 0.50,
+        })
+        self._set_utbot_filtered_breakout_entry_plan(canonical, plan)
+        status['entry_plan'] = dict(plan)
+        return _finish(side, f'ACCEPTED_ENTRY: {decision.reason}')
+
+    async def build_multi_timeframe_trend_status_text(self, symbol=None):
+        target = self._canonical_futures_symbol(
+            symbol or self.current_utbreakout_candidate_symbol or 'BTC/USDT'
+        )
+        status = dict((getattr(self, 'multi_timeframe_trend_last_status', {}) or {}).get(target) or {})
+        if not status:
+            return '\n'.join([
+                'M-TREND strategy status',
+                f'Symbol: {target}',
+                'No completed M-TREND evaluation is available yet.',
+            ])
+        metrics = status.get('metrics') if isinstance(status.get('metrics'), dict) else {}
+        l2 = status.get('l2_gate') if isinstance(status.get('l2_gate'), dict) else {}
+        rows = [
+            'M-TREND strategy status',
+            f'Symbol: {target}',
+            f"Signal: {str(status.get('side') or 'NONE').upper()} / allowed={bool(status.get('allowed'))}",
+            f"Score: {float(status.get('score', 0.0) or 0.0):.1f} / risk x{float(status.get('risk_multiplier', 0.0) or 0.0):.2f}",
+            f"4h bias: {str(metrics.get('bias') or 'NEUTRAL').upper()}",
+            f"Breakout confirmations: {', '.join(status.get('confirmations') or []) or 'NONE'}",
+            f"L2: {str(l2.get('state') or 'unknown').upper()} / {l2.get('reason') or '-'}",
+            f"Reason: {status.get('reason') or '-'}",
+        ]
+        for timeframe in ('15m', '1h', '4h'):
+            item = (metrics.get('timeframes') or {}).get(timeframe) or {}
+            rows.append(
+                f"{timeframe}: {str(item.get('side') or 'WAIT').upper()} / "
+                f"breakout ATR={float(item.get('breakout_atr', 0.0) or 0.0):.2f}"
+            )
+        return '\n'.join(rows)
+
     def _dual_alpha_strategy_params(self, strategy_params, branch):
         params = copy.deepcopy(strategy_params if isinstance(strategy_params, dict) else {})
         cfg = dict(params.get('UTBotFilteredBreakoutV1') or {})
@@ -17099,6 +17489,9 @@ class SignalEngine(BaseEngine):
             selected_plan['dual_alpha_score'] = selected['score']
             selected_plan['dual_alpha_agreement_state'] = agreement_state
             selected_plan['dual_alpha_confirmation_count'] = len(choices)
+            selected_plan['dual_alpha_confirmation_strategies'] = [
+                choice['key'] for choice in choices
+            ]
             if selected['key'] == ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND:
                 selected_plan['strategy'] = ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
             else:
@@ -17342,6 +17735,9 @@ class SignalEngine(BaseEngine):
                 'triple_alpha_agreement_state': agreement_state,
                 'triple_alpha_confirmation_count': len(choices),
                 'triple_alpha_risk_multiplier': agreement_multiplier,
+                'triple_alpha_confirmation_strategies': [
+                    choice['key'] for choice in choices
+                ],
             })
             self._set_utbot_filtered_breakout_entry_plan(
                 selected_plan.get('plan_symbol') or base_symbol,
@@ -17429,10 +17825,23 @@ class SignalEngine(BaseEngine):
 
     def _quad_alpha_strategy_params(self, strategy_params, branch):
         branch = str(branch or '').lower()
-        if branch != CROWDING_UNWIND_STRATEGY:
+        if branch not in {CROWDING_UNWIND_STRATEGY, M_TREND_STRATEGY}:
             return self._triple_alpha_strategy_params(strategy_params, branch)
         params = copy.deepcopy(strategy_params if isinstance(strategy_params, dict) else {})
         cfg = dict(params.get('UTBotFilteredBreakoutV1') or {})
+        if branch == M_TREND_STRATEGY:
+            trend_cfg = self._multi_timeframe_trend_runtime_config(cfg)
+            trend_cfg['enabled'] = True
+            trend_cfg['live_enabled'] = True
+            cfg['multi_timeframe_trend'] = trend_cfg
+            cfg['multi_timeframe_trend_live_enabled'] = True
+            cfg['qh_flow_confirmation_enabled'] = False
+            cfg['relative_strength_pullback_trend_live_enabled'] = False
+            cfg['adaptive_timeframe_enabled'] = False
+            cfg['entry_strategy'] = ENTRY_STRATEGY_UT_BREAKOUT
+            params['active_strategy'] = M_TREND_STRATEGY
+            params['UTBotFilteredBreakoutV1'] = cfg
+            return params
         crowd_cfg = self._crowding_unwind_runtime_config(cfg)
         crowd_cfg['enabled'] = True
         crowd_cfg['live_enabled'] = True
@@ -17459,6 +17868,7 @@ class SignalEngine(BaseEngine):
         base_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
         qh_cfg = self._qh_flow_runtime_config(base_cfg)
         multipliers = {
+            5: max(0.0, min(1.0, float(base_cfg.get('quad_alpha_five_signal_risk_multiplier', 1.0) or 1.0))),
             4: max(0.0, min(1.0, float(base_cfg.get('quad_alpha_four_signal_risk_multiplier', qh_cfg.get('quad_four_signal_multiplier', 1.0)) or 1.0))),
             3: max(0.0, min(1.0, float(base_cfg.get('quad_alpha_three_signal_risk_multiplier', qh_cfg.get('quad_three_signal_multiplier', 0.90)) or 0.90))),
             2: max(0.0, min(1.0, float(base_cfg.get('quad_alpha_two_signal_risk_multiplier', qh_cfg.get('quad_two_signal_multiplier', 0.75)) or 0.75))),
@@ -17561,6 +17971,33 @@ class SignalEngine(BaseEngine):
         ))
         self._clear_utbot_filtered_breakout_entry_plan(crowd_symbol)
 
+        trend_params = self._quad_alpha_strategy_params(strategy_params, M_TREND_STRATEGY)
+        trend_sig, trend_reason, trend_status = await self._calculate_multi_timeframe_trend_signal(
+            base_symbol,
+            df,
+            trend_params,
+            force_reprocess=force_reprocess,
+        )
+        trend_status = dict(trend_status or {})
+        trend_symbol = self._canonical_futures_symbol(
+            trend_status.get('plan_symbol') or trend_status.get('symbol') or base_symbol
+        )
+        trend_plan = (
+            dict(self._get_utbot_filtered_breakout_entry_plan(trend_symbol, trend_sig) or {})
+            if trend_sig in {'long', 'short'}
+            else None
+        )
+        branch_results.append((
+            M_TREND_STRATEGY,
+            'M-TREND',
+            trend_sig,
+            trend_reason,
+            trend_status,
+            trend_plan,
+            4,
+        ))
+        self._clear_utbot_filtered_breakout_entry_plan(trend_symbol)
+
         choices = []
         for key, label, side, reason, status, plan, priority in branch_results:
             if side not in {'long', 'short'} or not isinstance(plan, dict):
@@ -17584,7 +18021,7 @@ class SignalEngine(BaseEngine):
             agreement_state = 'conflict'
         elif choices:
             confirmation_count = len(choices)
-            agreement_state = {1: 'single', 2: 'double', 3: 'triple', 4: 'quad'}.get(
+            agreement_state = {1: 'single', 2: 'double', 3: 'triple', 4: 'quad', 5: 'five'}.get(
                 confirmation_count,
                 'confirmed',
             )
@@ -17598,6 +18035,7 @@ class SignalEngine(BaseEngine):
         reasons = {key: reason for key, _, _, reason, _, _, _ in branch_results}
         final_status = dict(
             (selected or {}).get('status')
+            or trend_status
             or crowd_status
             or qh_status
             or rsp_status
@@ -17615,6 +18053,10 @@ class SignalEngine(BaseEngine):
                 'quad_alpha_agreement_state': agreement_state,
                 'quad_alpha_confirmation_count': len(choices),
                 'quad_alpha_risk_multiplier': agreement_multiplier,
+                'quad_alpha_confirmation_strategies': [choice['key'] for choice in choices],
+                'quad_alpha_signal_sides': {
+                    choice['key']: choice['side'] for choice in choices
+                },
             })
             self._set_utbot_filtered_breakout_entry_plan(
                 selected_plan.get('plan_symbol') or base_symbol,
@@ -17637,6 +18079,7 @@ class SignalEngine(BaseEngine):
             'rspt': self._dual_alpha_light(statuses.get(ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND), 'RSPT-v3'),
             'qh_flow': self._dual_alpha_light(statuses.get(QH_FLOW_STRATEGY), 'QH-Flow v2'),
             'crowding_unwind': crowding_light,
+            'mtrend': self._dual_alpha_light(statuses.get(M_TREND_STRATEGY), 'M-TREND'),
             'agreement_state': agreement_state,
             'agreement_risk_multiplier': agreement_multiplier,
             'confirmation_count': len(choices),
@@ -17673,7 +18116,8 @@ class SignalEngine(BaseEngine):
                 f"UT={reasons.get(ENTRY_STRATEGY_UT_BREAKOUT)}; "
                 f"RSPT={reasons.get(ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND)}; "
                 f"QH={reasons.get(QH_FLOW_STRATEGY)}; "
-                f"CROWD={reasons.get(CROWDING_UNWIND_STRATEGY)}"
+                f"CROWD={reasons.get(CROWDING_UNWIND_STRATEGY)}; "
+                f"M-TREND={reasons.get(M_TREND_STRATEGY)}"
             )
 
         canonical = self._canonical_futures_symbol(final_status.get('plan_symbol') or base_symbol)
@@ -17694,7 +18138,7 @@ class SignalEngine(BaseEngine):
         summary = status.get('quad_alpha') if isinstance(status.get('quad_alpha'), dict) else {}
         if not summary:
             return '\n'.join([
-                '🧩 Quad 전략 상태',
+                '🧩 5-Strategy Alpha 상태',
                 f'Symbol: {target}',
                 '',
                 '🚦 전략 신호등',
@@ -17702,8 +18146,9 @@ class SignalEngine(BaseEngine):
                 'RSPT-v3          ⚪ 미평가',
                 'QH-Flow v2       ⚪ 미평가',
                 'Crowding Unwind  ⚪ 미평가',
+                'M-TREND          ⚪ 미평가',
                 '',
-                '아직 Quad 평가 기록이 없습니다.',
+                '아직 5전략 평가 기록이 없습니다.',
             ])
 
         def _traffic_view(item):
@@ -17720,7 +18165,7 @@ class SignalEngine(BaseEngine):
             elif light == 'green':
                 icon = '🟢'
                 state = f'유효 {side} 신호' if side else '유효 진입 신호'
-                meaning = 'Quad confirmations에 포함'
+                meaning = '5전략 confirmations에 포함'
             elif light == 'red':
                 icon = '🔴'
                 state = f'{side} 후보 거절' if side else '진입 거절'
@@ -17748,6 +18193,7 @@ class SignalEngine(BaseEngine):
             ('rspt', 'RSPT-v3'),
             ('qh_flow', 'QH-Flow v2'),
             ('crowding_unwind', 'Crowding Unwind'),
+            ('mtrend', 'M-TREND'),
         )
         traffic = {
             key: _traffic_view(summary.get(key))
@@ -17758,7 +18204,7 @@ class SignalEngine(BaseEngine):
         )
 
         lines = [
-            '🧩 Quad 전략 상태',
+            '🧩 5-Strategy Alpha 상태',
             f'Symbol: {target}',
             '',
             '🚦 전략 신호등',
@@ -17768,7 +18214,7 @@ class SignalEngine(BaseEngine):
             item = traffic[key]
             lines.append(f"{label.ljust(label_width)}  {item['icon']} {item['state']}")
         lines.extend([
-            f'🟢 유효 신호: {green_count}/4 — 초록불만 confirmations에 포함',
+            f'🟢 유효 신호: {green_count}/5 — 초록불만 confirmations에 포함',
             '',
             f"Agreement: {str(summary.get('agreement_state') or 'none').upper()} / confirmations={int(summary.get('confirmation_count') or 0)} / risk x{float(summary.get('agreement_risk_multiplier', 0.0) or 0.0):.2f}",
             f"Selected: {summary.get('selected_label') or 'NONE'} {str(summary.get('selected_side') or '').upper()}",
@@ -32813,6 +33259,16 @@ class SignalEngine(BaseEngine):
             )
             is_bullish = sig == 'long'
             is_bearish = sig == 'short'
+        elif active_strategy == M_TREND_STRATEGY:
+            entry_mode = active_strategy
+            sig, entry_reason, _ = await self._calculate_multi_timeframe_trend_signal(
+                symbol,
+                df,
+                strategy_params,
+                force_reprocess=force_utbreakout_reprocess,
+            )
+            is_bullish = sig == 'long'
+            is_bearish = sig == 'short'
         elif active_strategy == QH_FLOW_STRATEGY:
             entry_mode = active_strategy
             sig, entry_reason, _ = await self._calculate_qh_flow_signal(
@@ -34092,6 +34548,21 @@ class SignalEngine(BaseEngine):
                 self.crypto_entry_lock_reason = f"SUBMITTED_UNKNOWN:{entry_client_order_id}"
                 return
             qty = self.safe_amount(symbol, actual_qty)
+            entry_plan_attribution = dict(filtered_breakout_plan or {})
+            primary_strategy = str(
+                entry_plan_attribution.get('strategy')
+                or active_strategy
+                or 'SIGNAL_ENGINE'
+            )
+            confirmation_strategies = (
+                entry_plan_attribution.get('quad_alpha_confirmation_strategies')
+                or entry_plan_attribution.get('triple_alpha_confirmation_strategies')
+                or entry_plan_attribution.get('dual_alpha_confirmation_strategies')
+                or [primary_strategy]
+            )
+            confirmation_strategies = list(dict.fromkeys(
+                str(value) for value in confirmation_strategies if str(value).strip()
+            ))
             _mark_crypto_entry_state(
                 self,
                 entry_client_order_id,
@@ -34099,6 +34570,32 @@ class SignalEngine(BaseEngine):
                 exchange_order_id=(order.get('id') if isinstance(order, dict) else None),
                 filled_qty=actual_qty,
                 average_fill_price=actual_entry_price,
+                primary_strategy=primary_strategy,
+                confirmation_strategies=confirmation_strategies,
+                aggregate_strategy=(
+                    active_strategy
+                    if active_strategy in {DUAL_ALPHA_STRATEGY, TRIPLE_ALPHA_STRATEGY, QUAD_ALPHA_STRATEGY}
+                    else None
+                ),
+                leverage=lev,
+                entry_plan_summary={
+                    key: entry_plan_attribution.get(key)
+                    for key in (
+                        'strategy',
+                        'plan_symbol',
+                        'risk_distance',
+                        'rr_multiple',
+                        'entry_timeframe',
+                        'exit_timeframe',
+                        'htf_timeframe',
+                        'partial_take_profit_r_multiple',
+                        'partial_take_profit_ratio',
+                        'second_take_profit_r_multiple',
+                        'second_take_profit_ratio',
+                        'runner_pct',
+                    )
+                    if entry_plan_attribution.get(key) is not None
+                },
             )
             actual_liquidation_payload = dict(cfg or {})
             if isinstance(filtered_breakout_plan, dict):
@@ -41757,6 +42254,7 @@ class MainController:
         await asyncio.gather(
             self._main_polling_loop(),  # [?대쭅 ?꾩슜] 硫붿씤 ?대쭅 猷⑦봽
             self._hourly_report_loop(),
+            self._monthly_trade_report_loop(),
             self._alt_trend_alert_loop(),
             self._heartbeat_loop()
         )
@@ -44807,6 +45305,54 @@ class MainController:
                 engine.qh_flow_signal_cache = {}
             return f'TRIPLE Alpha OFF. {notice}'
 
+        async def _activate_multi_timeframe_trend_strategy():
+            await _ensure_signal_engine_active()
+            self.is_paused = False
+            current = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
+            trend_cfg = default_multi_timeframe_trend_config()
+            if isinstance(current, dict) and isinstance(current.get('multi_timeframe_trend'), dict):
+                trend_cfg.update(current.get('multi_timeframe_trend'))
+            trend_cfg['enabled'] = True
+            trend_cfg['live_enabled'] = True
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], M_TREND_STRATEGY)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'multi_timeframe_trend'], trend_cfg)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'multi_timeframe_trend_live_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'l2_gate_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend_live_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol'], '')
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
+            engine = self._reset_signal_engine_runtime_state(
+                reset_entry_cache=True,
+                reset_exit_cache=True,
+                reset_stateful_strategy=True,
+            )
+            if engine:
+                engine.multi_timeframe_trend_last_status = {}
+                engine.l2_gate_cache = {}
+                engine.l2_gate_history = {}
+                if not engine.running:
+                    engine.start()
+            return (
+                'M-TREND ON. A fresh 15m, 1h, or 4h Donchian breakout aligned with the '
+                '4h EMA trend can enter through the existing live order and protection path.'
+            )
+
+        async def _deactivate_multi_timeframe_trend_strategy():
+            notice = await _activate_utbreak_strategy()
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'multi_timeframe_trend_live_enabled'],
+                False,
+            )
+            engine = self.engines.get('signal')
+            if engine:
+                engine.multi_timeframe_trend_last_status = {}
+            return f'M-TREND OFF. {notice}'
+
 
 
         async def _activate_quad_alpha_strategy():
@@ -44837,6 +45383,11 @@ class MainController:
                 crowd_cfg.update(current.get('crowding_unwind'))
             crowd_cfg['enabled'] = True
             crowd_cfg['live_enabled'] = True
+            trend_cfg = default_multi_timeframe_trend_config()
+            if isinstance(current, dict) and isinstance(current.get('multi_timeframe_trend'), dict):
+                trend_cfg.update(current.get('multi_timeframe_trend'))
+            trend_cfg['enabled'] = True
+            trend_cfg['live_enabled'] = True
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], QUAD_ALPHA_STRATEGY)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'entry_strategy'], ENTRY_STRATEGY_UT_BREAKOUT)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend'], rsp_cfg)
@@ -44845,6 +45396,8 @@ class MainController:
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow_live_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'crowding_unwind'], crowd_cfg)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'crowding_unwind_live_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'multi_timeframe_trend'], trend_cfg)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'multi_timeframe_trend_live_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'l2_gate_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'], 'auto')
@@ -44864,6 +45417,7 @@ class MainController:
                 engine.qh_flow_signal_cache = {}
                 engine.qh_flow_last_status = {}
                 engine.crowding_unwind_last_status = {}
+                engine.multi_timeframe_trend_last_status = {}
                 engine.quad_alpha_last_status = {}
                 engine.relative_strength_pullback_eval_cache = {}
                 engine.l2_gate_cache = {}
@@ -44871,22 +45425,30 @@ class MainController:
                 if not engine.running:
                     engine.start()
             return (
-                'QUAD Alpha ON. UTBreak + RSPT-v3 + QH-Flow v2 + Crowding Unwind are '
-                'evaluated independently; direction conflicts block and 1/2/3/4 confirmations scale risk.'
+                '5-Strategy Alpha ON. UTBreak + RSPT-v3 + QH-Flow v2 + Crowding Unwind + '
+                'M-TREND are evaluated independently; one valid signal can enter, direction conflicts '
+                'block, and 1/2/3/4/5 confirmations scale risk.'
             )
 
         async def _deactivate_quad_alpha_strategy():
-            notice = await _activate_utbreak_strategy()
-            await self.cfg.update_value(
-                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'crowding_unwind_live_enabled'],
-                False,
-            )
+            notice = await _stop_utbreak_trading()
+            for key in (
+                'relative_strength_pullback_trend_live_enabled',
+                'qh_flow_live_enabled',
+                'crowding_unwind_live_enabled',
+                'multi_timeframe_trend_live_enabled',
+            ):
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', key],
+                    False,
+                )
             engine = self.engines.get('signal')
             if engine:
                 engine.quad_alpha_last_status = {}
                 engine.qh_flow_signal_cache = {}
                 engine.crowding_unwind_last_status = {}
-            return f'QUAD Alpha OFF. {notice}'
+                engine.multi_timeframe_trend_last_status = {}
+            return f'5-Strategy Alpha ALL OFF. {notice}'
 
         async def _activate_crowding_unwind_strategy():
             await _ensure_signal_engine_active()
@@ -45608,6 +46170,11 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     InlineKeyboardButton("CROWD STATUS", callback_data="utb:crowding_status")
                 ],
                 [
+                    InlineKeyboardButton("M-TREND ON", callback_data="utb:mtrend:on"),
+                    InlineKeyboardButton("M-TREND OFF", callback_data="utb:mtrend:off"),
+                    InlineKeyboardButton("M-TREND STATUS", callback_data="utb:mtrend_status")
+                ],
+                [
                     InlineKeyboardButton("DUAL ON", callback_data="utb:dual:on"),
                     InlineKeyboardButton("DUAL OFF", callback_data="utb:dual:off"),
                     InlineKeyboardButton("DUAL STATUS", callback_data="utb:dual_status")
@@ -45618,9 +46185,9 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     InlineKeyboardButton("TRIPLE STATUS", callback_data="utb:triple_status")
                 ],
                 [
-                    InlineKeyboardButton("QUAD ON", callback_data="utb:quad:on"),
-                    InlineKeyboardButton("QUAD OFF", callback_data="utb:quad:off"),
-                    InlineKeyboardButton("QUAD STATUS", callback_data="utb:quad_status")
+                    InlineKeyboardButton("5-ALL ON", callback_data="utb:quad:on"),
+                    InlineKeyboardButton("5-ALL OFF", callback_data="utb:quad:off"),
+                    InlineKeyboardButton("5-ALL STATUS", callback_data="utb:quad_status")
                 ],
                 [
                     InlineKeyboardButton("코인 감시 목록", callback_data="utb:watchlist")
@@ -46109,7 +46676,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
         async def _get_quad_alpha_status_text():
             engine = self.engines.get('signal')
             if not engine:
-                return 'QUAD Alpha status\n\nSignal engine not found.'
+                return '5-Strategy Alpha status\n\nSignal engine not found.'
             symbol = await _get_utbreakout_status_symbol_async()
             return await engine.build_quad_alpha_status_text(symbol)
 
@@ -46123,20 +46690,20 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     text,
                     reply_markup=_build_utbreakout_keyboard(),
                     filename='quad_alpha_status.txt',
-                    caption='QUAD Alpha status',
-                    preview_suffix='QUAD Alpha status was sent as a file.',
+                    caption='5-Strategy Alpha status',
+                    preview_suffix='5-Strategy Alpha status was sent as a file.',
                 )
                 return True
             except Exception as exc:
-                logger.exception('QUAD Alpha status send failed')
+                logger.exception('5-Strategy Alpha status send failed')
                 await message.reply_text(
-                    f'QUAD Alpha status failed: {type(exc).__name__}: {exc}',
+                    f'5-Strategy Alpha status failed: {type(exc).__name__}: {exc}',
                     reply_markup=_build_utbreakout_keyboard(),
                 )
                 return False
 
         async def _send_quad_alpha_status_from_callback(query):
-            await _show_utbreakout_callback_progress(query, 'QUAD Alpha status 조회 중입니다.')
+            await _show_utbreakout_callback_progress(query, '5-Strategy Alpha status 조회 중입니다.')
             await _send_quad_alpha_status(getattr(query, 'message', None))
 
         async def _get_crowding_unwind_status_text():
@@ -46171,6 +46738,39 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
         async def _send_crowding_unwind_status_from_callback(query):
             await _show_utbreakout_callback_progress(query, 'Crowding Unwind status 조회 중입니다.')
             await _send_crowding_unwind_status(getattr(query, 'message', None))
+
+        async def _get_multi_timeframe_trend_status_text():
+            engine = self.engines.get('signal')
+            if not engine:
+                return 'M-TREND status\n\nSignal engine not found.'
+            symbol = await _get_utbreakout_status_symbol_async()
+            return await engine.build_multi_timeframe_trend_status_text(symbol)
+
+        async def _send_multi_timeframe_trend_status(message):
+            if message is None:
+                return False
+            try:
+                text = await _get_multi_timeframe_trend_status_text()
+                await self._reply_long_text_with_document(
+                    message,
+                    text,
+                    reply_markup=_build_utbreakout_keyboard(),
+                    filename='mtrend_status.txt',
+                    caption='M-TREND strategy status',
+                    preview_suffix='M-TREND status was sent as a file.',
+                )
+                return True
+            except Exception as exc:
+                logger.exception('M-TREND status send failed')
+                await message.reply_text(
+                    f'M-TREND status failed: {type(exc).__name__}: {exc}',
+                    reply_markup=_build_utbreakout_keyboard(),
+                )
+                return False
+
+        async def _send_multi_timeframe_trend_status_from_callback(query):
+            await _show_utbreakout_callback_progress(query, 'M-TREND status 조회 중입니다.')
+            await _send_multi_timeframe_trend_status(getattr(query, 'message', None))
 
         async def _edit_utbreakout_condition_status(query):
             text = await _get_utbreakout_condition_status_text()
@@ -46740,6 +47340,28 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                         parse_mode=ParseMode.MARKDOWN,
                     )
                     return
+            elif action in {'mtrend', 'm_trend', 'trend5'}:
+                mode = str(args[1]).strip().lower() if len(args) > 1 else 'status'
+                if mode in {'on', 'enable', 'start', 'live'}:
+                    await u.message.reply_text(
+                        await _activate_multi_timeframe_trend_strategy(),
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=_build_utbreakout_keyboard(),
+                    )
+                elif mode in {'off', 'disable', 'stop'}:
+                    await u.message.reply_text(
+                        await _deactivate_multi_timeframe_trend_strategy(),
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=_build_utbreakout_keyboard(),
+                    )
+                elif mode in {'status', 'stat', 'menu', ''}:
+                    await _send_multi_timeframe_trend_status(u.message)
+                else:
+                    await u.message.reply_text(
+                        'Usage: `/utbreak mtrend on`, `/utbreak mtrend off`, `/utbreak mtrend status`',
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                    return
             elif action in {'qh', 'qhflow', 'qh_flow'}:
                 mode = str(args[1]).strip().lower() if len(args) > 1 else 'status'
                 if mode in {'on', 'enable', 'start', 'live'}:
@@ -46778,7 +47400,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 else:
                     await u.message.reply_text('Usage: `/utbreak triple on`, `/utbreak triple off`, `/utbreak triple status`', parse_mode=ParseMode.MARKDOWN)
                     return
-            elif action in {'quad', 'quadalpha', 'quad_alpha'}:
+            elif action in {'quad', 'quadalpha', 'quad_alpha', 'five', 'all5'}:
                 mode = str(args[1]).strip().lower() if len(args) > 1 else 'status'
                 if mode in {'on', 'enable', 'start', 'live'}:
                     await u.message.reply_text(
@@ -47273,6 +47895,16 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     await _send_crowding_unwind_status_from_callback(query)
                 return
 
+            if action in {'mtrend', 'm_trend'}:
+                mode = str(value or '').lower()
+                if mode in {'on', 'enable', '1', 'true', 'live'}:
+                    await _edit_utbreakout_menu(query, await _activate_multi_timeframe_trend_strategy())
+                elif mode in {'off', 'disable', '0', 'false', 'stop'}:
+                    await _edit_utbreakout_menu(query, await _deactivate_multi_timeframe_trend_strategy())
+                else:
+                    await _send_multi_timeframe_trend_status_from_callback(query)
+                return
+
             if action in {'qh', 'qhflow'}:
                 mode = str(value or '').lower()
                 if mode in {'on', 'enable', '1', 'true', 'live'}:
@@ -47323,6 +47955,10 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 
             if action == 'crowding_status':
                 await _send_crowding_unwind_status_from_callback(query)
+                return
+
+            if action == 'mtrend_status':
+                await _send_multi_timeframe_trend_status_from_callback(query)
                 return
 
             if action == 'dual_status':
@@ -49691,6 +50327,118 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
         await self._restore_main_keyboard(update)
         await self.show_setup_menu(update)
         return SELECT
+
+    async def _capture_month_end_open_positions(self):
+        engine = self.engines.get(CORE_ENGINE) or self.active_engine
+        if engine is None:
+            return []
+        symbols = await engine.get_active_position_symbols(use_cache=False)
+        positions = []
+        for symbol in sorted(symbols or []):
+            position = await engine.get_server_position(symbol, use_cache=False)
+            if not position:
+                continue
+            positions.append({
+                'symbol': position.get('symbol') or symbol,
+                'side': position.get('side'),
+                'contracts': position.get('contracts'),
+                'entryPrice': position.get('entryPrice'),
+                'markPrice': position.get('markPrice'),
+                'unrealizedPnl': position.get('unrealizedPnl'),
+                'percentage': position.get('percentage'),
+            })
+        return positions
+
+    async def _send_monthly_trade_report(self, year, month, store, open_positions):
+        engine = self.engines.get(CORE_ENGINE) or self.active_engine
+        if engine is not None:
+            try:
+                finalizer = TradeAccountingFinalizer(engine.exchange, store)
+                await finalizer.finalize_pending(limit=100)
+            except Exception:
+                logger.exception(
+                    'Monthly trade accounting finalization failed; provisional rows will be reported'
+                )
+        text = build_monthly_trade_report(
+            store.load_trade_results(),
+            year,
+            month,
+            open_positions=open_positions,
+            generated_at=datetime.now(MONTHLY_REPORT_KST),
+        )
+        cid = self.cfg.get_chat_id()
+        if not cid or not self.tg_app:
+            raise RuntimeError('Telegram chat/application unavailable for monthly report')
+        filename = f'monthly_trade_report_{int(year):04d}-{int(month):02d}.txt'
+        bio = io.BytesIO(text.encode('utf-8'))
+        bio.name = filename
+        await self.tg_app.bot.send_document(
+            chat_id=cid,
+            document=bio,
+            filename=filename,
+            caption=(
+                f'{int(year):04d}-{int(month):02d} 실전 자동매매 월말 리포트입니다. '
+                '손익은 실제 포지션별로 한 번만 집계했습니다.'
+            ),
+        )
+
+    async def _monthly_trade_report_loop(self):
+        await asyncio.sleep(5)
+        while True:
+            try:
+                reporting = self._telegram_reporting_cfg()
+                if not bool(reporting.get('monthly_trade_report_enabled', True)):
+                    await asyncio.sleep(60)
+                    continue
+                now = datetime.now(MONTHLY_REPORT_KST)
+                if now.day != 1:
+                    await asyncio.sleep(60)
+                    continue
+                engine = self.engines.get(CORE_ENGINE) or self.active_engine
+                if engine is None:
+                    await asyncio.sleep(60)
+                    continue
+                _ensure_trading_safety_runtime(engine)
+                store = getattr(engine, 'trading_state_store', None)
+                if store is None:
+                    raise RuntimeError('trading state store unavailable')
+                report_year, report_month = previous_calendar_month(now)
+                report_key = f'{int(report_year):04d}-{int(report_month):02d}'
+                snapshot_key = f'monthly_trade_report_open_positions:{report_key}'
+                snapshot = store.get_runtime_state(snapshot_key)
+                if not isinstance(snapshot, dict):
+                    snapshot = {
+                        'captured_at': now.isoformat(),
+                        'positions': await self._capture_month_end_open_positions(),
+                    }
+                    store.set_runtime_state(snapshot_key, snapshot)
+
+                hour = max(
+                    0,
+                    min(23, int(reporting.get('monthly_trade_report_hour', 9) or 9)),
+                )
+                if now.hour < hour:
+                    await asyncio.sleep(60)
+                    continue
+                sent_key = f'monthly_trade_report_sent:{report_key}'
+                if store.get_runtime_state(sent_key):
+                    await asyncio.sleep(60)
+                    continue
+                await self._send_monthly_trade_report(
+                    report_year,
+                    report_month,
+                    store,
+                    list(snapshot.get('positions') or []),
+                )
+                store.set_runtime_state(sent_key, {
+                    'sent_at': datetime.now(MONTHLY_REPORT_KST).isoformat(),
+                    'period': report_key,
+                })
+                logger.info('Monthly live trade report sent for %s', report_key)
+                await asyncio.sleep(60)
+            except Exception as exc:
+                logger.error('Monthly trade report error: %s', exc, exc_info=True)
+                await asyncio.sleep(60)
 
     # ---------------- Hourly Report ----------------
     async def _hourly_report_loop(self):
