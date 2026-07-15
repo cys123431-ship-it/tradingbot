@@ -16632,16 +16632,31 @@ class SignalEngine(BaseEngine):
             ])
         metrics = status.get('metrics') if isinstance(status.get('metrics'), dict) else {}
         l2 = status.get('l2_gate') if isinstance(status.get('l2_gate'), dict) else {}
-        return '\n'.join([
+
+        def _fmt(value, digits=2, signed=False, suffix=''):
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return 'N/A'
+            sign = '+' if signed else ''
+            return f"{number:{sign}.{digits}f}{suffix}"
+
+        missing = list(metrics.get('missing_derivatives_fields') or [])
+        lines = [
             '🧨 Funding-OI Crowding Unwind 상태',
             f'Symbol: {target}',
             f"Signal: {str(status.get('side') or 'NONE').upper()} / allowed={bool(status.get('allowed'))}",
             f"Score: {float(status.get('score', 0.0) or 0.0):.1f} / risk x{float(status.get('risk_multiplier', 0.0) or 0.0):.2f}",
-            f"Funding: {float(metrics.get('funding_rate', 0.0) or 0.0):+.6f} / percentile {float(metrics.get('funding_percentile', 0.0) or 0.0):.1f}",
-            f"OI: z {float(metrics.get('oi_z', 0.0) or 0.0):+.2f} / 4h {float(metrics.get('oi_change_4h_pct', 0.0) or 0.0):+.2f}%",
+            f"Funding: {_fmt(metrics.get('funding_rate'), 6, True)} / percentile {_fmt(metrics.get('funding_percentile'), 1)}",
+            f"OI: z {_fmt(metrics.get('oi_z'), 2, True)} / 4h {_fmt(metrics.get('oi_change_4h_pct'), 2, True, '%')}",
+            f"Long/Short ratio: {_fmt(metrics.get('long_short_ratio'), 2)}",
+            f"Derivatives data: {'READY' if metrics.get('derivatives_data_ready') else 'MISSING'}",
             f"Confirmations: {int(metrics.get('confirmations', 0) or 0)} / L2 {str(l2.get('state') or 'unknown').upper()}",
             f"Reason: {status.get('reason') or '-'}",
-        ])
+        ]
+        if missing:
+            lines.append(f"Missing fields: {', '.join(str(value) for value in missing)}")
+        return '\n'.join(lines)
 
     def _dual_alpha_strategy_params(self, strategy_params, branch):
         params = copy.deepcopy(strategy_params if isinstance(strategy_params, dict) else {})
@@ -17622,12 +17637,22 @@ class SignalEngine(BaseEngine):
                 selected_plan,
             )
 
+        crowding_light = self._dual_alpha_light(
+            statuses.get(CROWDING_UNWIND_STRATEGY),
+            'Crowding Unwind',
+        )
+        crowding_status_metrics = (
+            statuses.get(CROWDING_UNWIND_STRATEGY, {}).get('metrics')
+            if isinstance(statuses.get(CROWDING_UNWIND_STRATEGY), dict)
+            else None
+        )
+        crowding_light['metrics'] = dict(crowding_status_metrics or {})
         summary = {
             'enabled': True,
             'utbreak': self._dual_alpha_light(statuses.get(ENTRY_STRATEGY_UT_BREAKOUT), 'UTBreakout'),
             'rspt': self._dual_alpha_light(statuses.get(ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND), 'RSPT-v3'),
             'qh_flow': self._dual_alpha_light(statuses.get(QH_FLOW_STRATEGY), 'QH-Flow v2'),
-            'crowding_unwind': self._dual_alpha_light(statuses.get(CROWDING_UNWIND_STRATEGY), 'Crowding Unwind'),
+            'crowding_unwind': crowding_light,
             'agreement_state': agreement_state,
             'agreement_risk_multiplier': agreement_multiplier,
             'confirmation_count': len(choices),
@@ -17702,7 +17727,13 @@ class SignalEngine(BaseEngine):
             light = str(item.get('light') or 'gray').strip().lower()
             side = str(item.get('side') or '').strip().upper()
             reason = str(item.get('reason') or '-').strip()
-            if light == 'green':
+            metrics = dict(item.get('metrics') or {}) if isinstance(item, dict) else {}
+            if 'crowding_derivatives_data_missing' in reason:
+                icon = '⚪'
+                light = 'gray'
+                state = '파생데이터 누락'
+                meaning = '과밀 여부를 계산할 수 없어 confirmations 제외'
+            elif light == 'green':
                 icon = '🟢'
                 state = f'유효 {side} 신호' if side else '유효 진입 신호'
                 meaning = 'Quad confirmations에 포함'
@@ -17725,6 +17756,7 @@ class SignalEngine(BaseEngine):
                 'reason': reason,
                 'side': side,
                 'light': light,
+                'metrics': metrics,
             }
 
         strategy_rows = (
@@ -17759,6 +17791,14 @@ class SignalEngine(BaseEngine):
             '',
             '📋 전략별 상세 설명',
         ])
+        def _metric_text(value, *, digits=2, signed=False):
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return 'N/A'
+            pattern = f"{{:{'+' if signed else ''}.{digits}f}}"
+            return pattern.format(number)
+
         for key, label in strategy_rows:
             item = traffic[key]
             lines.extend([
@@ -17766,6 +17806,19 @@ class SignalEngine(BaseEngine):
                 f"  사유: {item['reason']}",
                 f"  판정: {item['meaning']}",
             ])
+            if key == 'crowding_unwind':
+                metrics = item.get('metrics') if isinstance(item.get('metrics'), dict) else {}
+                lines.append(
+                    '  파생데이터: '
+                    f"funding={_metric_text(metrics.get('funding_rate'), digits=6, signed=True)} | "
+                    f"funding pct={_metric_text(metrics.get('funding_percentile'), digits=1)} | "
+                    f"OI z={_metric_text(metrics.get('oi_z'), digits=2, signed=True)} | "
+                    f"OI 4h={_metric_text(metrics.get('oi_change_4h_pct'), digits=2, signed=True)}% | "
+                    f"L/S={_metric_text(metrics.get('long_short_ratio'), digits=2)}"
+                )
+                missing = list(metrics.get('missing_derivatives_fields') or [])
+                if missing:
+                    lines.append(f"  누락 필드: {', '.join(str(value) for value in missing)}")
         lines.extend([
             '',
             f"최종 사유: {status.get('reason') or '-'}",

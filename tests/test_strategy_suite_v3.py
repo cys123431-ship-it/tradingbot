@@ -206,3 +206,38 @@ def test_rspt_v3_removes_alt_common_and_volatility_factors():
     assert result["MID/USDT:USDT"]["percentile"] > result["WEAK/USDT:USDT"]["percentile"]
     assert result["STRONG/USDT:USDT"]["method"] == "btc_eth_alt_vol_residual_momentum"
     assert "ALT_EQUAL_WEIGHT" in result["STRONG/USDT:USDT"]["factor_names"]
+
+
+def test_crowding_missing_derivatives_is_not_reported_as_not_extreme():
+    decision = evaluate_crowding_unwind(
+        _crowding_rows("short"),
+        {
+            "funding_rate": None,
+            "open_interest_delta_z": None,
+            "open_interest_change_4h": None,
+            "long_short_ratio": None,
+        },
+        {"allowed": True, "state": "deep_balanced", "risk_multiplier": 1.0},
+    )
+    assert decision.allowed is False
+    assert decision.reason == "crowding_derivatives_data_missing"
+    assert decision.metrics["derivatives_data_ready"] is False
+    assert "funding_rate" in decision.metrics["missing_derivatives_fields"]
+    assert "long_short_ratio" in decision.metrics["missing_derivatives_fields"]
+
+
+def test_crowding_not_extreme_requires_complete_derivatives_data():
+    decision = evaluate_crowding_unwind(
+        _crowding_rows("short"),
+        {
+            "funding_rate": 0.0001,
+            "funding_percentile_30d": 50.0,
+            "open_interest_delta_z": 0.2,
+            "open_interest_change_4h": 0.5,
+            "long_short_ratio": 1.1,
+        },
+        {"allowed": True, "state": "deep_balanced", "risk_multiplier": 1.0},
+    )
+    assert decision.reason == "crowding_not_extreme"
+    assert decision.metrics["derivatives_data_ready"] is True
+    assert decision.metrics["missing_derivatives_fields"] == []
