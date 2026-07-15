@@ -3123,6 +3123,12 @@ def test_reconcile_closed_position_cancels_leftover_tp_and_sl_orders():
         symbol_scope_returns=False,
     )
     client_order_id = _add_protected_record(engine)
+    assert engine.trading_state_store.try_acquire_entry_lease(
+        "test-owner",
+        120,
+        "BTC/USDT:USDT",
+        client_order_id,
+    ) is True
 
     async def _no_position(symbol, use_cache=False):
         return None
@@ -3144,6 +3150,7 @@ def test_reconcile_closed_position_cancels_leftover_tp_and_sl_orders():
     assert status["remaining_orders"] == 0
     assert status["closed_records"] == 1
     assert engine.trading_state_store.get(client_order_id).order_state == OrderState.CLOSED.value
+    assert engine.trading_state_store.get_entry_lease() is None
     assert engine.exchange.orders == []
 
 
@@ -3367,6 +3374,12 @@ def test_orphan_sweep_keeps_protected_state_when_position_is_active():
         symbol="SXT/USDT:USDT",
         client_order_id="quada-sxtusdt-l-entry-live",
     )
+    assert engine.trading_state_store.try_acquire_entry_lease(
+        "live-owner",
+        120,
+        "SXT/USDT:USDT",
+        client_order_id,
+    ) is True
 
     status = asyncio.run(
         engine._cleanup_orphan_protection_orders(
@@ -3380,6 +3393,38 @@ def test_orphan_sweep_keeps_protected_state_when_position_is_active():
     assert status["status"] == "OK"
     assert status["closed_records"] == 0
     assert engine.trading_state_store.get(client_order_id).order_state == OrderState.PROTECTED.value
+    assert engine.trading_state_store.get_entry_lease() is not None
+
+
+def test_orphan_sweep_releases_expired_lease_for_terminal_flat_entry(monkeypatch):
+    engine = _protection_engine([], positions=[])
+    client_order_id = _add_protected_record(
+        engine,
+        symbol="SXT/USDT:USDT",
+        client_order_id="quada-sxtusdt-l-entry-terminal",
+    )
+    assert engine.trading_state_store.try_acquire_entry_lease(
+        "old-process",
+        120,
+        "SXT/USDT:USDT",
+        client_order_id,
+    ) is True
+    lease = engine.trading_state_store.get_entry_lease()
+    engine.trading_state_store.transition(client_order_id, OrderState.CLOSED)
+    monkeypatch.setattr(_emas_module().time, "time", lambda: float(lease["expires_at"]) + 1)
+
+    status = asyncio.run(
+        engine._cleanup_orphan_protection_orders(
+            reason="terminal lease recovery",
+            alert=False,
+            min_interval=0,
+            confirm_delay_sec=0,
+        )
+    )
+
+    assert status["status"] == "STALE_ENTRY_LEASE_RELEASED"
+    assert status["released_leases"] == 1
+    assert engine.trading_state_store.get_entry_lease() is None
 
 
 def test_orphan_sweep_keeps_protected_state_when_order_snapshot_fails():

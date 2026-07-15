@@ -36309,6 +36309,7 @@ class SignalEngine(BaseEngine):
             'status': 'SKIPPED',
             'cancelled': 0,
             'closed_records': 0,
+            'released_leases': 0,
             'pending': 0,
             'symbols': {}
         }
@@ -36526,10 +36527,54 @@ class SignalEngine(BaseEngine):
                     reason,
                 )
 
+        entry_lease = state_store.get_entry_lease() if state_store is not None else None
+        if entry_lease:
+            lease_client_order_id = str(entry_lease.get('client_order_id') or '')
+            lease_symbol = str(entry_lease.get('symbol') or '')
+            lease_symbol_key = self._normalize_protection_symbol(lease_symbol)
+            lease_record = state_store.get(lease_client_order_id) if lease_client_order_id else None
+            lease_terminal = bool(
+                lease_record
+                and lease_record.order_state in {
+                    OrderState.CLOSED.value,
+                    OrderState.CANCELED.value,
+                    OrderState.FAILED.value,
+                }
+            )
+            lease_expired = float(entry_lease.get('expires_at') or 0.0) <= now_ts
+            if (
+                lease_terminal
+                and lease_expired
+                and lease_symbol_key
+                and lease_symbol_key not in active_keys
+                and lease_symbol_key not in grouped
+            ):
+                self.position_cache = None
+                self.position_cache_time = 0
+                position_fetch_ok, pos = await self._fetch_server_position_checked(lease_symbol)
+                protection_fetch_ok = False
+                remaining = None
+                if position_fetch_ok and not pos:
+                    protection_fetch_ok, remaining = await self._collect_protection_orders_checked(lease_symbol)
+                if position_fetch_ok and not pos and protection_fetch_ok and not remaining:
+                    released = state_store.release_entry_lease_for_symbol(
+                        lease_symbol,
+                        reconciliation_confirmed=True,
+                    )
+                    status['released_leases'] += int(bool(released))
+                    if released:
+                        logger.warning(
+                            "Protection orphan sweep released stale global entry lease for %s (%s)",
+                            lease_symbol,
+                            reason,
+                        )
+
         if status['cancelled']:
             status['status'] = 'ORPHAN_CANCELLED'
         elif status['closed_records']:
             status['status'] = 'STALE_PROTECTED_CLOSED'
+        elif status['released_leases']:
+            status['status'] = 'STALE_ENTRY_LEASE_RELEASED'
         elif status['pending']:
             status['status'] = 'PENDING_CONFIRMATION'
         else:
@@ -55633,6 +55678,10 @@ def _mark_crypto_symbol_closed(self, symbol, reason):
                 OrderState.CLOSED,
                 last_error=None,
                 close_reason=str(reason or "position closed"),
+            )
+            self.trading_state_store.release_entry_lease(
+                record.client_order_id,
+                OrderState.CLOSED,
             )
             closed_count += 1
     return closed_count
