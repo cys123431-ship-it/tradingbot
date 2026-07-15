@@ -295,6 +295,8 @@ UTBREAKOUT_CALLBACK_ACTIONS = UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS | frozenset({
     "quad",
     "quadalpha",
     "quad_status",
+    "qselect",
+    "qsel",
     "set",
     "sets",
     "why",
@@ -607,6 +609,95 @@ STRATEGY_DISPLAY_NAMES = {
     TRIPLE_ALPHA_STRATEGY: 'TRIPLE_ALPHA',
     QUAD_ALPHA_STRATEGY: 'QUAD_ALPHA',
 }
+
+QUAD_ALPHA_BRANCH_ORDER = (
+    ENTRY_STRATEGY_UT_BREAKOUT,
+    ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+    QH_FLOW_STRATEGY,
+    CROWDING_UNWIND_STRATEGY,
+    M_TREND_STRATEGY,
+)
+QUAD_ALPHA_BRANCH_LABELS = {
+    ENTRY_STRATEGY_UT_BREAKOUT: 'UTBreak',
+    ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND: 'RSPT-v3',
+    QH_FLOW_STRATEGY: 'QH-Flow v2',
+    CROWDING_UNWIND_STRATEGY: 'Crowding Unwind',
+    M_TREND_STRATEGY: 'M-TREND',
+}
+QUAD_ALPHA_SELECTOR_KEYS = {
+    'ut': ENTRY_STRATEGY_UT_BREAKOUT,
+    'rsp': ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+    'qh': QH_FLOW_STRATEGY,
+    'crowd': CROWDING_UNWIND_STRATEGY,
+    'mtrend': M_TREND_STRATEGY,
+}
+
+
+def normalize_quad_alpha_enabled_strategies(value):
+    """Return a stable, de-duplicated subset of the five live alpha branches."""
+    if value is None:
+        return list(QUAD_ALPHA_BRANCH_ORDER)
+    if isinstance(value, str):
+        value = [part.strip() for part in value.split(',') if part.strip()]
+    if not isinstance(value, (list, tuple, set)):
+        return list(QUAD_ALPHA_BRANCH_ORDER)
+
+    aliases = {
+        **QUAD_ALPHA_SELECTOR_KEYS,
+        'utbreak': ENTRY_STRATEGY_UT_BREAKOUT,
+        'utbreakout': ENTRY_STRATEGY_UT_BREAKOUT,
+        'rspt': ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+        'qhflow': QH_FLOW_STRATEGY,
+        'crowding': CROWDING_UNWIND_STRATEGY,
+        'm-trend': M_TREND_STRATEGY,
+    }
+    requested = set()
+    for raw_key in value:
+        key = str(raw_key or '').strip().lower()
+        canonical = aliases.get(key, key)
+        if canonical in QUAD_ALPHA_BRANCH_ORDER:
+            requested.add(canonical)
+    return [key for key in QUAD_ALPHA_BRANCH_ORDER if key in requested]
+
+
+def quad_alpha_selection_text(enabled_strategies):
+    enabled = set(normalize_quad_alpha_enabled_strategies(enabled_strategies))
+    lines = [
+        '5-Strategy Alpha selection',
+        '',
+        'Choose one or more strategies, then press APPLY.',
+        'Changes affect new entries only; open-position exits and protection stay active.',
+        '',
+    ]
+    for index, key in enumerate(QUAD_ALPHA_BRANCH_ORDER, start=1):
+        marker = 'ON ' if key in enabled else 'OFF'
+        lines.append(f'{index}. [{marker}] {QUAD_ALPHA_BRANCH_LABELS[key]}')
+    lines.extend([
+        '',
+        f'Selected: {len(enabled)}/5',
+        'At least one strategy must remain selected.',
+    ])
+    return '\n'.join(lines)
+
+
+def build_quad_alpha_selection_keyboard(enabled_strategies):
+    enabled = set(normalize_quad_alpha_enabled_strategies(enabled_strategies))
+    callback_by_strategy = {value: key for key, value in QUAD_ALPHA_SELECTOR_KEYS.items()}
+    rows = []
+    for index, key in enumerate(QUAD_ALPHA_BRANCH_ORDER, start=1):
+        marker = '✅' if key in enabled else '⬜'
+        rows.append([
+            InlineKeyboardButton(
+                f'{marker} {index}. {QUAD_ALPHA_BRANCH_LABELS[key]}',
+                callback_data=f'utb:qsel:{callback_by_strategy[key]}',
+            )
+        ])
+    rows.append([
+        InlineKeyboardButton('APPLY', callback_data='utb:qsel:apply'),
+        InlineKeyboardButton('CANCEL', callback_data='utb:qsel:cancel'),
+    ])
+    return InlineKeyboardMarkup(rows)
+
 UT_HYBRID_TIMING_LABELS = {
     'utrsibb': 'RSI+BB',
     'utrsi': 'RSI',
@@ -2404,6 +2495,7 @@ def build_default_utbot_filtered_breakout_config():
         'quad_alpha_three_signal_risk_multiplier': 0.90,
         'quad_alpha_two_signal_risk_multiplier': 0.75,
         'quad_alpha_single_signal_risk_multiplier': 0.45,
+        'quad_alpha_enabled_strategies': list(QUAD_ALPHA_BRANCH_ORDER),
         'qh_flow': default_qh_flow_config(),
         'qh_flow_live_enabled': False,
         'qh_flow_confirmation_enabled': True,
@@ -17298,6 +17390,18 @@ class SignalEngine(BaseEngine):
 
     def _dual_alpha_light(self, status, label):
         status = status if isinstance(status, dict) else {}
+        if status.get('disabled') or str(status.get('stage') or '').lower() == 'disabled':
+            return {
+                'label': label,
+                'light': 'off',
+                'state': 'OFF',
+                'side': None,
+                'reason': str(status.get('reason') or 'disabled by Telegram strategy selection'),
+                'setup_type': None,
+                'direction_by': None,
+                'forced_direction': None,
+                'disabled': True,
+            }
         side = str(status.get('accepted_side') or status.get('candidate_side') or status.get('candidate_signal') or '').lower()
         reason = str(status.get('reason') or status.get('reject_code') or 'no recent decision')
         stage = str(status.get('stage') or '').lower()
@@ -17908,6 +18012,10 @@ class SignalEngine(BaseEngine):
         base_symbol = self._canonical_futures_symbol(symbol)
         self._clear_utbot_filtered_breakout_entry_plan(base_symbol)
         base_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+        enabled_strategies = normalize_quad_alpha_enabled_strategies(
+            base_cfg.get('quad_alpha_enabled_strategies')
+        )
+        enabled_set = set(enabled_strategies)
         qh_cfg = self._qh_flow_runtime_config(base_cfg)
         multipliers = {
             5: max(0.0, min(1.0, float(base_cfg.get('quad_alpha_five_signal_risk_multiplier', 1.0) or 1.0))),
@@ -17917,6 +18025,17 @@ class SignalEngine(BaseEngine):
             1: max(0.0, min(1.0, float(base_cfg.get('quad_alpha_single_signal_risk_multiplier', qh_cfg.get('quad_single_signal_multiplier', 0.45)) or 0.45))),
         }
         branch_results = []
+
+        def _disabled_branch(key, label, priority):
+            reason = 'OFF: disabled by Telegram strategy selection'
+            status = {
+                'strategy': label,
+                'symbol': base_symbol,
+                'stage': 'disabled',
+                'disabled': True,
+                'reason': reason,
+            }
+            return key, label, None, reason, status, None, priority
 
         async def _run_branch(key, label, priority, evaluator, *, fallback_diag=False):
             plan_symbol = base_symbol
@@ -17953,84 +18072,97 @@ class SignalEngine(BaseEngine):
                 if plan_symbol != base_symbol:
                     self._clear_utbot_filtered_breakout_entry_plan(base_symbol)
 
-        ut_params = self._quad_alpha_strategy_params(strategy_params, ENTRY_STRATEGY_UT_BREAKOUT)
-        branch_results.append(await _run_branch(
-            ENTRY_STRATEGY_UT_BREAKOUT,
-            'UTBreakout',
-            0,
-            lambda: self._calculate_utbot_filtered_breakout_signal(
-                base_symbol,
-                df,
-                ut_params,
-                force_reprocess=force_reprocess,
-            ),
-            fallback_diag=True,
-        ))
+        if ENTRY_STRATEGY_UT_BREAKOUT in enabled_set:
+            ut_params = self._quad_alpha_strategy_params(strategy_params, ENTRY_STRATEGY_UT_BREAKOUT)
+            branch_results.append(await _run_branch(
+                ENTRY_STRATEGY_UT_BREAKOUT,
+                'UTBreakout',
+                0,
+                lambda: self._calculate_utbot_filtered_breakout_signal(
+                    base_symbol,
+                    df,
+                    ut_params,
+                    force_reprocess=force_reprocess,
+                ),
+                fallback_diag=True,
+            ))
+        else:
+            branch_results.append(_disabled_branch(ENTRY_STRATEGY_UT_BREAKOUT, 'UTBreakout', 0))
 
-        rsp_params = self._quad_alpha_strategy_params(
-            strategy_params,
-            ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
-        )
-        branch_results.append(await _run_branch(
-            ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
-            'RSPT-v3',
-            1,
-            lambda: self._calculate_relative_strength_pullback_signal(
-                base_symbol,
-                df,
-                rsp_params,
-                force_reprocess=force_reprocess,
-                forced_direction=None,
-                direction_source='RSPT-v3 BTC/ETH/alt/vol residual strength',
-                resolve_ut_direction=False,
-            ),
-            fallback_diag=True,
-        ))
+        if ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND in enabled_set:
+            rsp_params = self._quad_alpha_strategy_params(
+                strategy_params,
+                ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+            )
+            branch_results.append(await _run_branch(
+                ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+                'RSPT-v3',
+                1,
+                lambda: self._calculate_relative_strength_pullback_signal(
+                    base_symbol,
+                    df,
+                    rsp_params,
+                    force_reprocess=force_reprocess,
+                    forced_direction=None,
+                    direction_source='RSPT-v3 BTC/ETH/alt/vol residual strength',
+                    resolve_ut_direction=False,
+                ),
+                fallback_diag=True,
+            ))
+        else:
+            branch_results.append(_disabled_branch(
+                ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+                'RSPT-v3',
+                1,
+            ))
 
-        qh_params = self._quad_alpha_strategy_params(strategy_params, QH_FLOW_STRATEGY)
-        branch_results.append(await _run_branch(
-            QH_FLOW_STRATEGY,
-            'QH-Flow v2',
-            2,
-            lambda: self._calculate_qh_flow_signal(
-                base_symbol,
-                df,
-                qh_params,
-                force_reprocess=force_reprocess,
-            ),
-        ))
+        if QH_FLOW_STRATEGY in enabled_set:
+            qh_params = self._quad_alpha_strategy_params(strategy_params, QH_FLOW_STRATEGY)
+            branch_results.append(await _run_branch(
+                QH_FLOW_STRATEGY,
+                'QH-Flow v2',
+                2,
+                lambda: self._calculate_qh_flow_signal(
+                    base_symbol,
+                    df,
+                    qh_params,
+                    force_reprocess=force_reprocess,
+                ),
+            ))
+        else:
+            branch_results.append(_disabled_branch(QH_FLOW_STRATEGY, 'QH-Flow v2', 2))
 
-        crowd_params = self._quad_alpha_strategy_params(strategy_params, CROWDING_UNWIND_STRATEGY)
-        branch_results.append(await _run_branch(
-            CROWDING_UNWIND_STRATEGY,
-            'Crowding Unwind',
-            3,
-            lambda: self._calculate_crowding_unwind_signal(
-                base_symbol,
-                df,
-                crowd_params,
-                force_reprocess=force_reprocess,
-            ),
-        ))
+        if CROWDING_UNWIND_STRATEGY in enabled_set:
+            crowd_params = self._quad_alpha_strategy_params(strategy_params, CROWDING_UNWIND_STRATEGY)
+            branch_results.append(await _run_branch(
+                CROWDING_UNWIND_STRATEGY,
+                'Crowding Unwind',
+                3,
+                lambda: self._calculate_crowding_unwind_signal(
+                    base_symbol,
+                    df,
+                    crowd_params,
+                    force_reprocess=force_reprocess,
+                ),
+            ))
+        else:
+            branch_results.append(_disabled_branch(CROWDING_UNWIND_STRATEGY, 'Crowding Unwind', 3))
 
-        trend_params = self._quad_alpha_strategy_params(strategy_params, M_TREND_STRATEGY)
-        branch_results.append(await _run_branch(
-            M_TREND_STRATEGY,
-            'M-TREND',
-            4,
-            lambda: self._calculate_multi_timeframe_trend_signal(
-                base_symbol,
-                df,
-                trend_params,
-                force_reprocess=force_reprocess,
-            ),
-        ))
-
-        ut_status = branch_results[0][4]
-        rsp_status = branch_results[1][4]
-        qh_status = branch_results[2][4]
-        crowd_status = branch_results[3][4]
-        trend_status = branch_results[4][4]
+        if M_TREND_STRATEGY in enabled_set:
+            trend_params = self._quad_alpha_strategy_params(strategy_params, M_TREND_STRATEGY)
+            branch_results.append(await _run_branch(
+                M_TREND_STRATEGY,
+                'M-TREND',
+                4,
+                lambda: self._calculate_multi_timeframe_trend_signal(
+                    base_symbol,
+                    df,
+                    trend_params,
+                    force_reprocess=force_reprocess,
+                ),
+            ))
+        else:
+            branch_results.append(_disabled_branch(M_TREND_STRATEGY, 'M-TREND', 4))
 
         choices = []
         for key, label, side, reason, status, plan, priority in branch_results:
@@ -18067,13 +18199,17 @@ class SignalEngine(BaseEngine):
 
         statuses = {key: status for key, _, _, _, status, _, _ in branch_results}
         reasons = {key: reason for key, _, _, reason, _, _, _ in branch_results}
+        fallback_status = next(
+            (
+                statuses.get(key)
+                for key in reversed(QUAD_ALPHA_BRANCH_ORDER)
+                if key in enabled_set and statuses.get(key)
+            ),
+            {},
+        )
         final_status = dict(
             (selected or {}).get('status')
-            or trend_status
-            or crowd_status
-            or qh_status
-            or rsp_status
-            or ut_status
+            or fallback_status
             or {}
         )
         if selected:
@@ -18109,6 +18245,11 @@ class SignalEngine(BaseEngine):
         crowding_light['metrics'] = dict(crowding_status_metrics or {})
         summary = {
             'enabled': True,
+            'enabled_strategies': list(enabled_strategies),
+            'enabled_count': len(enabled_strategies),
+            'disabled_strategies': [
+                key for key in QUAD_ALPHA_BRANCH_ORDER if key not in enabled_set
+            ],
             'utbreak': self._dual_alpha_light(statuses.get(ENTRY_STRATEGY_UT_BREAKOUT), 'UTBreakout'),
             'rspt': self._dual_alpha_light(statuses.get(ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND), 'RSPT-v3'),
             'qh_flow': self._dual_alpha_light(statuses.get(QH_FLOW_STRATEGY), 'QH-Flow v2'),
@@ -18171,19 +18312,40 @@ class SignalEngine(BaseEngine):
         status = dict((getattr(self, 'quad_alpha_last_status', {}) or {}).get(target) or {})
         summary = status.get('quad_alpha') if isinstance(status.get('quad_alpha'), dict) else {}
         if not summary:
-            return '\n'.join([
-                '🧩 5-Strategy Alpha 상태',
-                f'Symbol: {target}',
-                '',
-                '🚦 전략 신호등',
-                'UTBreak          ⚪ 미평가',
-                'RSPT-v3          ⚪ 미평가',
-                'QH-Flow v2       ⚪ 미평가',
-                'Crowding Unwind  ⚪ 미평가',
-                'M-TREND          ⚪ 미평가',
-                '',
-                '아직 5전략 평가 기록이 없습니다.',
-            ])
+            configured = normalize_quad_alpha_enabled_strategies(
+                self._get_utbot_filtered_breakout_config().get('quad_alpha_enabled_strategies')
+            )
+            configured_set = set(configured)
+
+            def _empty_light(key):
+                if key not in configured_set:
+                    return self._dual_alpha_light({
+                        'stage': 'disabled',
+                        'disabled': True,
+                        'reason': 'OFF: disabled by Telegram strategy selection',
+                    }, QUAD_ALPHA_BRANCH_LABELS[key])
+                return {
+                    'label': QUAD_ALPHA_BRANCH_LABELS[key],
+                    'light': 'gray',
+                    'state': 'NONE',
+                    'side': None,
+                    'reason': 'not evaluated since the latest strategy selection',
+                }
+
+            summary = {
+                'enabled': True,
+                'enabled_strategies': list(configured),
+                'enabled_count': len(configured),
+                'confirmation_count': 0,
+                'agreement_state': 'none',
+                'agreement_risk_multiplier': 0.0,
+                'utbreak': _empty_light(ENTRY_STRATEGY_UT_BREAKOUT),
+                'rspt': _empty_light(ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND),
+                'qh_flow': _empty_light(QH_FLOW_STRATEGY),
+                'crowding_unwind': _empty_light(CROWDING_UNWIND_STRATEGY),
+                'mtrend': _empty_light(M_TREND_STRATEGY),
+            }
+            status['reason'] = 'No evaluation has completed since the latest strategy selection.'
 
         def _traffic_view(item):
             item = item if isinstance(item, dict) else {}
@@ -18191,7 +18353,12 @@ class SignalEngine(BaseEngine):
             side = str(item.get('side') or '').strip().upper()
             reason = str(item.get('reason') or '-').strip()
             metrics = dict(item.get('metrics') or {}) if isinstance(item, dict) else {}
-            if 'crowding_derivatives_data_missing' in reason:
+            if light == 'off' or item.get('disabled'):
+                icon = '⚫'
+                light = 'off'
+                state = 'OFF'
+                meaning = 'Excluded from evaluation, confirmations, conflicts, and new entries'
+            elif 'crowding_derivatives_data_missing' in reason:
                 icon = '⚪'
                 light = 'gray'
                 state = '파생데이터 누락'
@@ -18236,10 +18403,12 @@ class SignalEngine(BaseEngine):
         green_count = sum(
             1 for item in traffic.values() if item['light'] == 'green'
         )
+        enabled_count = max(0, min(5, int(summary.get('enabled_count', 5) or 0)))
 
         lines = [
             '🧩 5-Strategy Alpha 상태',
             f'Symbol: {target}',
+            f'Active strategies: {enabled_count}/5',
             '',
             '🚦 전략 신호등',
         ]
@@ -18248,7 +18417,7 @@ class SignalEngine(BaseEngine):
             item = traffic[key]
             lines.append(f"{label.ljust(label_width)}  {item['icon']} {item['state']}")
         lines.extend([
-            f'🟢 유효 신호: {green_count}/5 — 초록불만 confirmations에 포함',
+            f'🟢 유효 신호: {green_count}/{enabled_count} — 초록불만 confirmations에 포함',
             '',
             f"Agreement: {str(summary.get('agreement_state') or 'none').upper()} / confirmations={int(summary.get('confirmation_count') or 0)} / risk x{float(summary.get('agreement_risk_multiplier', 0.0) or 0.0):.2f}",
             f"Selected: {summary.get('selected_label') or 'NONE'} {str(summary.get('selected_side') or '').upper()}",
@@ -18287,7 +18456,7 @@ class SignalEngine(BaseEngine):
             '',
             f"최종 사유: {status.get('reason') or '-'}",
             '',
-            '범례: 🟢 유효 신호 | 🟡 조건 대기 | 🔴 후보 거절·충돌 | ⚪ 미평가·데이터 없음',
+            '범례: 🟢 유효 신호 | 🟡 조건 대기 | 🔴 후보 거절·충돌 | ⚪ 미평가·데이터 없음 | ⚫ OFF',
         ])
         return '\n'.join(lines)
 
@@ -45633,9 +45802,21 @@ class MainController:
 
 
 
-        async def _activate_quad_alpha_strategy():
+        def _configured_quad_alpha_strategies():
+            current = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get(
+                'UTBotFilteredBreakoutV1', {}
+            )
+            raw_value = current.get('quad_alpha_enabled_strategies') if isinstance(current, dict) else None
+            return normalize_quad_alpha_enabled_strategies(raw_value)
+
+        async def _activate_quad_alpha_strategy(enabled_strategies=None):
             await _ensure_signal_engine_active()
             self.is_paused = False
+            enabled_strategies = normalize_quad_alpha_enabled_strategies(
+                list(QUAD_ALPHA_BRANCH_ORDER) if enabled_strategies is None else enabled_strategies
+            )
+            if not enabled_strategies:
+                raise ValueError('At least one strategy must remain selected.')
             current = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
             rsp_cfg = default_relative_strength_pullback_config()
             if isinstance(current, dict) and isinstance(current.get('relative_strength_pullback_trend'), dict):
@@ -45667,6 +45848,10 @@ class MainController:
             trend_cfg['enabled'] = True
             trend_cfg['live_enabled'] = True
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], QUAD_ALPHA_STRATEGY)
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'quad_alpha_enabled_strategies'],
+                list(enabled_strategies),
+            )
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'entry_strategy'], ENTRY_STRATEGY_UT_BREAKOUT)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend'], rsp_cfg)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend_live_enabled'], True)
@@ -45688,8 +45873,8 @@ class MainController:
             await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
             engine = self._reset_signal_engine_runtime_state(
                 reset_entry_cache=True,
-                reset_exit_cache=True,
-                reset_stateful_strategy=True,
+                reset_exit_cache=False,
+                reset_stateful_strategy=False,
             )
             if engine:
                 engine.qh_flow_signal_cache = {}
@@ -45702,11 +45887,26 @@ class MainController:
                 engine.l2_gate_history = {}
                 if not engine.running:
                     engine.start()
-            return (
-                '5-Strategy Alpha ON. UTBreak + RSPT-v3 + QH-Flow v2 + Crowding Unwind + '
-                'M-TREND are evaluated independently; one valid signal can enter, direction conflicts '
-                'block, and 1/2/3/4/5 confirmations scale risk.'
+            enabled_labels = ', '.join(
+                QUAD_ALPHA_BRANCH_LABELS[key] for key in enabled_strategies
             )
+            return (
+                f'5-Strategy Alpha ON ({len(enabled_strategies)}/5): {enabled_labels}. '
+                'Selected strategies are evaluated independently; one valid signal can enter, '
+                'direction conflicts block, and confirmations scale risk. Open-position exits '
+                'and protection are unchanged.'
+            )
+
+        async def _set_quad_alpha_branch_enabled(strategy_key, enabled):
+            selected = set(_configured_quad_alpha_strategies())
+            if enabled:
+                selected.add(strategy_key)
+            else:
+                selected.discard(strategy_key)
+            ordered = [key for key in QUAD_ALPHA_BRANCH_ORDER if key in selected]
+            if not ordered:
+                return 'At least one strategy must remain selected. Use 5-ALL OFF to stop new entries.'
+            return await _activate_quad_alpha_strategy(ordered)
 
         async def _deactivate_quad_alpha_strategy():
             notice = await _stop_utbreak_trading()
@@ -46141,6 +46341,12 @@ UTBot:
             if isinstance(raw_cfg, dict):
                 cfg.update(raw_cfg)
             cfg = apply_stable_utbreak_final_overrides(cfg)
+            quad_enabled = normalize_quad_alpha_enabled_strategies(
+                cfg.get('quad_alpha_enabled_strategies')
+            )
+            quad_enabled_labels = ', '.join(
+                QUAD_ALPHA_BRANCH_LABELS[key] for key in quad_enabled
+            ) or 'NONE'
             coin_cfg = sig_cfg.get('coin_selector', {}) if isinstance(sig_cfg.get('coin_selector', {}), dict) else {}
             common_cfg = sig_cfg.get('common_settings', {}) if isinstance(sig_cfg.get('common_settings', {}), dict) else {}
             watchlist = self.get_active_watchlist()
@@ -46272,6 +46478,7 @@ UTBot:
 {_format_common_strategy_summary('utbreak')}
 
 상태: `{active_label}`
+5전략 선택: `{len(quad_enabled)}/5` (`{quad_enabled_labels}`)
 코인: {coin_mode}
 AUTO 묶음: `{'ON' if auto_bundle_on else 'OFF'}` (코인 자동선택 + Set 자동 + Adaptive TF)
 Auto Entry Bridge: `{'ON' if bridge_on else 'OFF'}`
@@ -46319,11 +46526,8 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 `/utbreak tracefull [SYMBOL]` - 최근 진입 경로 전체 진단 보고서
 `/utbreak watchdog on|off` - 진입 가능 후 주문 미시도 진단 기록 ON/OFF (텔레그램 자동 발송 없음)
 `/utbreak bridge on|off` - ready plan을 live scanner의 entry()로 연결
-`/utbreak qh on|off|status` - QH-Flow v2 단독 전략
-`/utbreak crowding on|off|status` - Funding-OI 과밀 해소 단독 전략
-`/utbreak dual on|off|status` - UTBreakout + RSPT 듀얼 감시/신호등 상태
-`/utbreak triple on|off|status` - UTBreakout + RSPT-v3 + QH-Flow v2 결합
-`/utbreak quad on|off|status` - UTBreakout + RSPT-v3 + QH-Flow v2 + Crowding 결합
+`SELECT 전략` - 5개 전략을 복수 선택하고 APPLY (신규 진입에만 적용)
+`/utbreak quad on|off|status` - 5전략 전체 ON/OFF/상태
 """.strip()
 
         def _format_utbreakout_config_text(diff=False):
@@ -46428,44 +46632,12 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
         def _build_utbreakout_keyboard():
             rows = [
                 [
-                    InlineKeyboardButton("UTBreak ON", callback_data="utb:on"),
-                    InlineKeyboardButton("UTBreak OFF", callback_data="utb:off"),
-                    InlineKeyboardButton("조건 스테이터스", callback_data="utb:condition_status")
-                ],
-                [
-                    InlineKeyboardButton("RSPT ON", callback_data="utb:rsp:on"),
-                    InlineKeyboardButton("RSPT OFF", callback_data="utb:rsp:off"),
-                    InlineKeyboardButton("RSPT STATUS", callback_data="utb:rsp_status")
-                ],
-                [
-                    InlineKeyboardButton("QH ON", callback_data="utb:qh:on"),
-                    InlineKeyboardButton("QH OFF", callback_data="utb:qh:off"),
-                    InlineKeyboardButton("QH STATUS", callback_data="utb:qh_status")
-                ],
-                [
-                    InlineKeyboardButton("CROWD ON", callback_data="utb:crowding:on"),
-                    InlineKeyboardButton("CROWD OFF", callback_data="utb:crowding:off"),
-                    InlineKeyboardButton("CROWD STATUS", callback_data="utb:crowding_status")
-                ],
-                [
-                    InlineKeyboardButton("M-TREND ON", callback_data="utb:mtrend:on"),
-                    InlineKeyboardButton("M-TREND OFF", callback_data="utb:mtrend:off"),
-                    InlineKeyboardButton("M-TREND STATUS", callback_data="utb:mtrend_status")
-                ],
-                [
-                    InlineKeyboardButton("DUAL ON", callback_data="utb:dual:on"),
-                    InlineKeyboardButton("DUAL OFF", callback_data="utb:dual:off"),
-                    InlineKeyboardButton("DUAL STATUS", callback_data="utb:dual_status")
-                ],
-                [
-                    InlineKeyboardButton("TRIPLE ON", callback_data="utb:triple:on"),
-                    InlineKeyboardButton("TRIPLE OFF", callback_data="utb:triple:off"),
-                    InlineKeyboardButton("TRIPLE STATUS", callback_data="utb:triple_status")
-                ],
-                [
                     InlineKeyboardButton("5-ALL ON", callback_data="utb:quad:on"),
                     InlineKeyboardButton("5-ALL OFF", callback_data="utb:quad:off"),
                     InlineKeyboardButton("5-ALL STATUS", callback_data="utb:quad_status")
+                ],
+                [
+                    InlineKeyboardButton("SELECT 전략", callback_data="utb:qselect")
                 ],
                 [
                     InlineKeyboardButton("코인 감시 목록", callback_data="utb:watchlist")
@@ -47300,6 +47472,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 'adaptive_timeframe_min_score',
                 'adaptive_timeframe_switch_margin',
                 'adaptive_timeframe_min_hold_candles',
+                'quad_alpha_enabled_strategies',
                 'risk_per_trade_percent',
                 'max_risk_per_trade_usdt',
                 'daily_max_loss_usdt',
@@ -48025,12 +48198,67 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 )
                 return
 
+            if action == 'qselect':
+                draft = _configured_quad_alpha_strategies()
+                if c is not None and c.user_data is not None:
+                    c.user_data['quad_alpha_selection_draft'] = list(draft)
+                await query.edit_message_text(
+                    quad_alpha_selection_text(draft),
+                    reply_markup=build_quad_alpha_selection_keyboard(draft),
+                )
+                return
+
+            if action == 'qsel':
+                user_data = c.user_data if c is not None and c.user_data is not None else {}
+                draft = normalize_quad_alpha_enabled_strategies(
+                    user_data.get('quad_alpha_selection_draft', _configured_quad_alpha_strategies())
+                )
+                selection_action = str(value or '').lower()
+                if selection_action == 'cancel':
+                    user_data.pop('quad_alpha_selection_draft', None)
+                    await _edit_utbreakout_menu(query, 'Strategy selection cancelled.')
+                    return
+                if selection_action == 'apply':
+                    if not draft:
+                        await query.edit_message_text(
+                            'Select at least one strategy before APPLY. Use 5-ALL OFF to stop new entries.\n\n'
+                            + quad_alpha_selection_text(draft),
+                            reply_markup=build_quad_alpha_selection_keyboard(draft),
+                        )
+                        return
+                    notice = await _activate_quad_alpha_strategy(draft)
+                    user_data.pop('quad_alpha_selection_draft', None)
+                    await _edit_utbreakout_menu(query, notice)
+                    return
+                strategy_key = QUAD_ALPHA_SELECTOR_KEYS.get(selection_action)
+                if strategy_key is None:
+                    await _edit_utbreakout_menu(query, 'Unknown strategy selection.')
+                    return
+                selected = set(draft)
+                if strategy_key in selected:
+                    selected.remove(strategy_key)
+                else:
+                    selected.add(strategy_key)
+                draft = [key for key in QUAD_ALPHA_BRANCH_ORDER if key in selected]
+                user_data['quad_alpha_selection_draft'] = list(draft)
+                await query.edit_message_text(
+                    quad_alpha_selection_text(draft),
+                    reply_markup=build_quad_alpha_selection_keyboard(draft),
+                )
+                return
+
             if action == 'on':
-                await _edit_utbreakout_menu(query, await _activate_utbreak_strategy())
+                await _edit_utbreakout_menu(
+                    query,
+                    await _set_quad_alpha_branch_enabled(ENTRY_STRATEGY_UT_BREAKOUT, True),
+                )
                 return
 
             if action == 'off':
-                await _edit_utbreakout_menu(query, await _stop_utbreak_trading())
+                await _edit_utbreakout_menu(
+                    query,
+                    await _set_quad_alpha_branch_enabled(ENTRY_STRATEGY_UT_BREAKOUT, False),
+                )
                 return
 
             if action == 'pause':
@@ -48156,9 +48384,21 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
             if action in {'rsp', 'rspt'}:
                 mode = str(value or '').lower()
                 if mode in {'on', 'enable', '1', 'true', 'live'}:
-                    await _edit_utbreakout_menu(query, await _activate_relative_strength_pullback_strategy())
+                    await _edit_utbreakout_menu(
+                        query,
+                        await _set_quad_alpha_branch_enabled(
+                            ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+                            True,
+                        ),
+                    )
                 elif mode in {'off', 'disable', '0', 'false', 'stop'}:
-                    await _edit_utbreakout_menu(query, await _deactivate_relative_strength_pullback_strategy())
+                    await _edit_utbreakout_menu(
+                        query,
+                        await _set_quad_alpha_branch_enabled(
+                            ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+                            False,
+                        ),
+                    )
                 else:
                     await _send_relative_strength_pullback_status_from_callback(query)
                 return
@@ -48166,9 +48406,15 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
             if action in {'crowding', 'crowd'}:
                 mode = str(value or '').lower()
                 if mode in {'on', 'enable', '1', 'true', 'live'}:
-                    await _edit_utbreakout_menu(query, await _activate_crowding_unwind_strategy())
+                    await _edit_utbreakout_menu(
+                        query,
+                        await _set_quad_alpha_branch_enabled(CROWDING_UNWIND_STRATEGY, True),
+                    )
                 elif mode in {'off', 'disable', '0', 'false', 'stop'}:
-                    await _edit_utbreakout_menu(query, await _deactivate_crowding_unwind_strategy())
+                    await _edit_utbreakout_menu(
+                        query,
+                        await _set_quad_alpha_branch_enabled(CROWDING_UNWIND_STRATEGY, False),
+                    )
                 else:
                     await _send_crowding_unwind_status_from_callback(query)
                 return
@@ -48176,9 +48422,15 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
             if action in {'mtrend', 'm_trend'}:
                 mode = str(value or '').lower()
                 if mode in {'on', 'enable', '1', 'true', 'live'}:
-                    await _edit_utbreakout_menu(query, await _activate_multi_timeframe_trend_strategy())
+                    await _edit_utbreakout_menu(
+                        query,
+                        await _set_quad_alpha_branch_enabled(M_TREND_STRATEGY, True),
+                    )
                 elif mode in {'off', 'disable', '0', 'false', 'stop'}:
-                    await _edit_utbreakout_menu(query, await _deactivate_multi_timeframe_trend_strategy())
+                    await _edit_utbreakout_menu(
+                        query,
+                        await _set_quad_alpha_branch_enabled(M_TREND_STRATEGY, False),
+                    )
                 else:
                     await _send_multi_timeframe_trend_status_from_callback(query)
                 return
@@ -48186,9 +48438,15 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
             if action in {'qh', 'qhflow'}:
                 mode = str(value or '').lower()
                 if mode in {'on', 'enable', '1', 'true', 'live'}:
-                    await _edit_utbreakout_menu(query, await _activate_qh_flow_strategy())
+                    await _edit_utbreakout_menu(
+                        query,
+                        await _set_quad_alpha_branch_enabled(QH_FLOW_STRATEGY, True),
+                    )
                 elif mode in {'off', 'disable', '0', 'false', 'stop'}:
-                    await _edit_utbreakout_menu(query, await _deactivate_qh_flow_strategy())
+                    await _edit_utbreakout_menu(
+                        query,
+                        await _set_quad_alpha_branch_enabled(QH_FLOW_STRATEGY, False),
+                    )
                 else:
                     await _send_qh_flow_status_from_callback(query)
                 return

@@ -262,6 +262,114 @@ def test_quad_five_way_agreement_selects_full_risk_plan():
     assert selected_plans[-1][1]["qty"] == pytest.approx(1.0)
 
 
+def test_quad_strategy_selector_supports_multi_select_and_stable_order():
+    emas = _emas_module()
+    selected = emas.normalize_quad_alpha_enabled_strategies([
+        emas.M_TREND_STRATEGY,
+        "ut",
+        "ut",
+        "unknown",
+    ])
+
+    assert selected == [
+        emas.ENTRY_STRATEGY_UT_BREAKOUT,
+        emas.M_TREND_STRATEGY,
+    ]
+    assert emas.normalize_quad_alpha_enabled_strategies(None) == list(
+        emas.QUAD_ALPHA_BRANCH_ORDER
+    )
+    assert emas.normalize_quad_alpha_enabled_strategies([]) == []
+
+    keyboard = emas.build_quad_alpha_selection_keyboard(selected)
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+    assert len(buttons) == 7
+    assert buttons[0].text.startswith("✅ 1.")
+    assert buttons[1].text.startswith("⬜ 2.")
+    assert buttons[4].text.startswith("✅ 5.")
+    assert buttons[0].callback_data == "utb:qsel:ut"
+    assert buttons[-2].callback_data == "utb:qsel:apply"
+    assert buttons[-1].callback_data == "utb:qsel:cancel"
+
+
+def test_quad_disabled_branches_are_not_evaluated_or_counted():
+    emas = _emas_module()
+    engine = object.__new__(emas.SignalEngine)
+    engine.quad_alpha_last_status = {}
+    engine.last_entry_reason = {}
+    selected_plans = []
+    current = {"key": None}
+    mtrend_plan = {
+        "strategy": emas.M_TREND_STRATEGY,
+        "plan_symbol": "BTC/USDT:USDT",
+        "qty": 2.0,
+        "risk_usdt": 2.0,
+    }
+
+    engine._canonical_futures_symbol = lambda symbol: symbol
+    engine._clear_utbot_filtered_breakout_entry_plan = lambda symbol: None
+    engine._get_utbot_filtered_breakout_config = lambda params=None: {
+        "quad_alpha_enabled_strategies": [emas.M_TREND_STRATEGY],
+        "quad_alpha_single_signal_risk_multiplier": 0.45,
+    }
+    engine._qh_flow_runtime_config = lambda cfg=None: {}
+    engine._quad_alpha_strategy_params = lambda params, branch: {"branch": branch}
+    engine._utbreakout_diag_for_symbol = lambda symbol: {}
+    engine._get_utbot_filtered_breakout_entry_plan = lambda symbol, side=None: (
+        mtrend_plan if current["key"] == emas.M_TREND_STRATEGY else None
+    )
+    engine._dual_alpha_score = lambda key, side, status, plan: 80.0
+    engine._dual_alpha_scale_plan = lambda plan, multiplier: {
+        **plan,
+        "qty": plan["qty"] * multiplier,
+        "risk_usdt": plan["risk_usdt"] * multiplier,
+    }
+    engine._set_utbot_filtered_breakout_entry_plan = lambda symbol, plan: selected_plans.append(dict(plan))
+    engine._store_utbot_filtered_breakout_status = lambda symbol, status: None
+
+    async def disabled_branch_called(*args, **kwargs):
+        raise AssertionError("disabled branch was evaluated")
+
+    async def mtrend(*args, **kwargs):
+        current["key"] = emas.M_TREND_STRATEGY
+        return "long", "mtrend long", {
+            "accepted_side": "long",
+            "accepted_code": "ACCEPTED_ENTRY",
+            "reason": "mtrend long",
+        }
+
+    engine._calculate_utbot_filtered_breakout_signal = disabled_branch_called
+    engine._calculate_relative_strength_pullback_signal = disabled_branch_called
+    engine._calculate_qh_flow_signal = disabled_branch_called
+    engine._calculate_crowding_unwind_signal = disabled_branch_called
+    engine._calculate_multi_timeframe_trend_signal = mtrend
+
+    side, _, status = asyncio.run(
+        engine._calculate_quad_alpha_signal(
+            "BTC/USDT:USDT",
+            None,
+            {"active_strategy": emas.QUAD_ALPHA_STRATEGY},
+        )
+    )
+
+    summary = status["quad_alpha"]
+    assert side == "long"
+    assert summary["enabled_count"] == 1
+    assert summary["enabled_strategies"] == [emas.M_TREND_STRATEGY]
+    assert summary["confirmation_count"] == 1
+    assert summary["agreement_risk_multiplier"] == pytest.approx(0.45)
+    assert summary["utbreak"]["light"] == "off"
+    assert summary["rspt"]["light"] == "off"
+    assert summary["qh_flow"]["light"] == "off"
+    assert summary["crowding_unwind"]["light"] == "off"
+    assert summary["mtrend"]["light"] == "green"
+    assert selected_plans[-1]["qty"] == pytest.approx(0.9)
+
+    report = asyncio.run(engine.build_quad_alpha_status_text("BTC/USDT:USDT"))
+    assert "Active strategies: 1/5" in report
+    assert "🟢 유효 신호: 1/1" in report
+    assert report.count("⚫ OFF") >= 4
+
+
 def test_quad_accepts_mtrend_as_the_only_signal_at_single_signal_risk():
     emas = _emas_module()
     engine = object.__new__(emas.SignalEngine)

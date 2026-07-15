@@ -124,6 +124,22 @@ def test_main_reply_keyboard_does_not_add_risk_button():
     assert 'KeyboardButton("/risk")' not in main_menu_source
 
 
+def test_utbreakout_menu_uses_integrated_five_strategy_selector():
+    source = Path("emas.py").read_text(encoding="utf-8")
+    menu_start = source.index("def _build_utbreakout_keyboard():")
+    menu_end = source.index("async def _edit_utbreakout_menu", menu_start)
+    menu_source = source[menu_start:menu_end]
+
+    assert 'callback_data="utb:quad:on"' in menu_source
+    assert 'callback_data="utb:quad:off"' in menu_source
+    assert 'callback_data="utb:quad_status"' in menu_source
+    assert 'callback_data="utb:qselect"' in menu_source
+    assert 'callback_data="utb:rsp:on"' not in menu_source
+    assert 'callback_data="utb:qh:on"' not in menu_source
+    assert 'callback_data="utb:crowding:on"' not in menu_source
+    assert 'callback_data="utb:mtrend:on"' not in menu_source
+
+
 def test_order_path_summary_distinguishes_live_demo_and_dry_run():
     live = emas.build_utbreakout_order_path_summary(
         {
