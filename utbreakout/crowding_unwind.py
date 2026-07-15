@@ -76,37 +76,65 @@ class CrowdingUnwindDecision:
 
 
 def _crowding_side(context: Mapping[str, Any], cfg: Mapping[str, Any]) -> tuple[str | None, dict[str, Any]]:
-    funding = float(_finite(context.get("funding_rate"), 0.0) or 0.0)
-    percentile = float(
-        _finite(
-            context.get("funding_percentile_30d", context.get("funding_percentile_7d")),
-            0.0,
-        )
-        or 0.0
-    )
-    oi_z = float(_finite(context.get("open_interest_delta_z"), 0.0) or 0.0)
-    oi_4h = float(_finite(context.get("open_interest_change_4h"), 0.0) or 0.0)
-    long_short = float(_finite(context.get("long_short_ratio"), 1.0) or 1.0)
-    oi_extreme = oi_z >= float(cfg["oi_z_min"]) or oi_4h >= float(cfg["oi_change_4h_min_pct"])
-    positive_funding = funding >= float(cfg["funding_abs_min"]) or (
-        funding > 0 and percentile >= float(cfg["funding_percentile_min"])
-    )
-    negative_funding = funding <= -float(cfg["funding_abs_min"]) or (
-        funding < 0 and percentile >= float(cfg["funding_percentile_min"])
-    )
-    long_crowded = oi_extreme and positive_funding and long_short >= float(cfg["long_short_ratio_high"])
-    short_crowded = oi_extreme and negative_funding and long_short <= float(cfg["long_short_ratio_low"])
-    side = "short" if long_crowded else "long" if short_crowded else None
-    return side, {
+    funding_raw = context.get("funding_rate")
+    funding = _finite(funding_raw)
+    percentile_raw = context.get("funding_percentile_30d", context.get("funding_percentile_7d"))
+    percentile = _finite(percentile_raw)
+    oi_z_raw = context.get("open_interest_delta_z")
+    oi_z = _finite(oi_z_raw)
+    oi_4h_raw = context.get("open_interest_change_4h")
+    oi_4h = _finite(oi_4h_raw)
+    long_short_raw = context.get("long_short_ratio")
+    long_short = _finite(long_short_raw)
+
+    missing_fields: list[str] = []
+    if funding is None:
+        missing_fields.append("funding_rate")
+    if oi_z is None and oi_4h is None:
+        missing_fields.append("open_interest_delta_z|open_interest_change_4h")
+    if long_short is None:
+        missing_fields.append("long_short_ratio")
+
+    metrics = {
         "funding_rate": funding,
         "funding_percentile": percentile,
         "oi_z": oi_z,
         "oi_change_4h_pct": oi_4h,
         "long_short_ratio": long_short,
+        "funding_rate_present": funding is not None,
+        "funding_percentile_present": percentile is not None,
+        "oi_z_present": oi_z is not None,
+        "oi_change_4h_present": oi_4h is not None,
+        "long_short_ratio_present": long_short is not None,
+        "derivatives_data_ready": not missing_fields,
+        "missing_derivatives_fields": missing_fields,
+        "oi_extreme": False,
+        "long_crowded": False,
+        "short_crowded": False,
+    }
+    if missing_fields:
+        return None, metrics
+
+    oi_extreme = (
+        (oi_z is not None and oi_z >= float(cfg["oi_z_min"]))
+        or (oi_4h is not None and oi_4h >= float(cfg["oi_change_4h_min_pct"]))
+    )
+    percentile_value = float(percentile or 0.0)
+    positive_funding = float(funding) >= float(cfg["funding_abs_min"]) or (
+        float(funding) > 0 and percentile_value >= float(cfg["funding_percentile_min"])
+    )
+    negative_funding = float(funding) <= -float(cfg["funding_abs_min"]) or (
+        float(funding) < 0 and percentile_value >= float(cfg["funding_percentile_min"])
+    )
+    long_crowded = oi_extreme and positive_funding and float(long_short) >= float(cfg["long_short_ratio_high"])
+    short_crowded = oi_extreme and negative_funding and float(long_short) <= float(cfg["long_short_ratio_low"])
+    side = "short" if long_crowded else "long" if short_crowded else None
+    metrics.update({
         "oi_extreme": oi_extreme,
         "long_crowded": long_crowded,
         "short_crowded": short_crowded,
-    }
+    })
+    return side, metrics
 
 
 def evaluate_crowding_unwind(
@@ -124,6 +152,11 @@ def evaluate_crowding_unwind(
     context = dict(derivatives or {})
     side, metrics = _crowding_side(context, cfg)
     metrics["l2_gate"] = dict(l2_gate or {})
+    if not bool(metrics.get("derivatives_data_ready", False)):
+        return CrowdingUnwindDecision(
+            reason="crowding_derivatives_data_missing",
+            metrics=metrics,
+        )
     if side is None:
         return CrowdingUnwindDecision(reason="crowding_not_extreme", metrics=metrics)
     if not bool((l2_gate or {}).get("allowed", False)):

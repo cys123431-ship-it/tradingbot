@@ -284,3 +284,52 @@ def test_quad_status_text_shows_four_traffic_lights_and_details():
     assert "📋 전략별 상세 설명" in text
     assert "초록불만 confirmations에 포함" in text
     assert "범례: 🟢 유효 신호" in text
+
+
+def test_quad_status_distinguishes_crowding_data_missing_from_not_extreme():
+    emas = _emas_module()
+    engine = object.__new__(emas.SignalEngine)
+    symbol = "PUMP/USDT:USDT"
+    engine.current_utbreakout_candidate_symbol = symbol
+    engine._canonical_futures_symbol = lambda value: value
+    engine.quad_alpha_last_status = {
+        symbol: {
+            "reason": "QUAD_ALPHA waiting",
+            "quad_alpha": {
+                "agreement_state": "none",
+                "agreement_risk_multiplier": 0.0,
+                "confirmation_count": 0,
+                "selected_label": None,
+                "selected_side": None,
+                "utbreak": {"light": "yellow", "side": None, "reason": "waiting"},
+                "rspt": {"light": "yellow", "side": None, "reason": "waiting"},
+                "qh_flow": {"light": "yellow", "side": None, "reason": "waiting"},
+                "crowding_unwind": {
+                    "light": "yellow",
+                    "side": None,
+                    "reason": "Crowding waiting: crowding_derivatives_data_missing",
+                    "metrics": {
+                        "funding_rate": None,
+                        "funding_percentile": None,
+                        "oi_z": None,
+                        "oi_change_4h_pct": None,
+                        "long_short_ratio": None,
+                        "derivatives_data_ready": False,
+                        "missing_derivatives_fields": [
+                            "funding_rate",
+                            "open_interest_delta_z|open_interest_change_4h",
+                            "long_short_ratio",
+                        ],
+                    },
+                },
+            },
+        }
+    }
+
+    report = asyncio.run(engine.build_quad_alpha_status_text(symbol))
+
+    assert "Crowding Unwind  ⚪ 파생데이터 누락" in report
+    assert "funding=N/A" in report
+    assert "OI z=N/A" in report
+    assert "L/S=N/A" in report
+    assert "누락 필드: funding_rate" in report
