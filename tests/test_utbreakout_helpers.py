@@ -16,6 +16,7 @@ from utbreakout.indicators import (
 )
 from utbreakout.research import summarize_diagnostic_events
 from utbreakout.risk import calculate_risk_plan, normalize_risk_percent
+from trading_safety.order_state import OrderRecord, OrderState, SQLiteTradingStateStore
 
 
 def _signal_engine_cls():
@@ -2804,12 +2805,31 @@ def _protection_engine(orders, symbol_scope_returns=True, positions=None):
     engine.protection_missing_candidates = {}
     engine.last_orphan_protection_sweep_ts = 0.0
     engine.orphan_protection_candidates = {}
+    engine.flat_protected_state_candidates = {}
     engine.ORPHAN_PROTECTION_SWEEP_INTERVAL = 10.0
     engine.position_cache = {}
     engine.POSITION_CACHE_TTL = 0.0
     engine.active_symbols = set()
     engine.is_upbit_mode = lambda: False
     return engine
+
+
+def _add_protected_record(engine, symbol="BTC/USDT:USDT", client_order_id="entry-protected"):
+    if not getattr(engine, "trading_state_store", None):
+        engine.trading_state_store = SQLiteTradingStateStore(":memory:")
+        engine.ctrl.trading_state_store = engine.trading_state_store
+    engine.trading_state_store.upsert(
+        OrderRecord(
+            client_order_id=client_order_id,
+            symbol=symbol,
+            side="LONG",
+            strategy="QUAD",
+            signal_timestamp="2026-07-15T00:00:00+00:00",
+            requested_qty=1.0,
+            order_state=OrderState.PROTECTED.value,
+        )
+    )
+    return client_order_id
 
 
 def test_aggressive_growth_exposure_counts_only_tracked_positions():
@@ -3102,6 +3122,7 @@ def test_reconcile_closed_position_cancels_leftover_tp_and_sl_orders():
         ],
         symbol_scope_returns=False,
     )
+    client_order_id = _add_protected_record(engine)
 
     async def _no_position(symbol, use_cache=False):
         return None
@@ -3121,6 +3142,8 @@ def test_reconcile_closed_position_cancels_leftover_tp_and_sl_orders():
     assert status["orphan_cancelled"] == 2
     assert status["cleanup_confirmed"] is True
     assert status["remaining_orders"] == 0
+    assert status["closed_records"] == 1
+    assert engine.trading_state_store.get(client_order_id).order_state == OrderState.CLOSED.value
     assert engine.exchange.orders == []
 
 
@@ -3276,6 +3299,7 @@ def test_position_fetch_failure_does_not_cancel_protection_orders():
     ]
     engine = _protection_engine(orders)
     engine.exchange = _PositionFetchFailExchange(orders)
+    client_order_id = _add_protected_record(engine)
 
     status = asyncio.run(
         engine._reconcile_closed_position_protection(
@@ -3290,6 +3314,98 @@ def test_position_fetch_failure_does_not_cancel_protection_orders():
     assert status["cleanup_confirmed"] is False
     assert engine.exchange.cancelled == []
     assert [order["id"] for order in engine.exchange.orders] == ["sl-live"]
+    assert engine.trading_state_store.get(client_order_id).order_state == OrderState.PROTECTED.value
+
+
+def test_orphan_sweep_releases_stale_protected_state_after_two_flat_snapshots():
+    engine = _protection_engine([], positions=[])
+    client_order_id = _add_protected_record(
+        engine,
+        symbol="SXT/USDT:USDT",
+        client_order_id="quada-sxtusdt-l-entry-test",
+    )
+
+    first = asyncio.run(
+        engine._cleanup_orphan_protection_orders(
+            reason="manual close recovery",
+            alert=False,
+            min_interval=0,
+            confirm_delay_sec=10,
+        )
+    )
+
+    assert first["status"] == "PENDING_CONFIRMATION"
+    assert engine.trading_state_store.get(client_order_id).order_state == OrderState.PROTECTED.value
+    engine.flat_protected_state_candidates[client_order_id]["first_seen_ts"] -= 11
+
+    second = asyncio.run(
+        engine._cleanup_orphan_protection_orders(
+            reason="manual close recovery",
+            alert=False,
+            min_interval=0,
+            confirm_delay_sec=10,
+        )
+    )
+
+    assert second["status"] == "STALE_PROTECTED_CLOSED"
+    assert second["closed_records"] == 1
+    closed = engine.trading_state_store.get(client_order_id)
+    assert closed.order_state == OrderState.CLOSED.value
+    assert "confirmed exchange-flat protected state" in closed.metadata["close_reason"]
+
+
+def test_orphan_sweep_keeps_protected_state_when_position_is_active():
+    position = {
+        "symbol": "SXT/USDT:USDT",
+        "side": "long",
+        "contracts": "1",
+        "entryPrice": "0.10",
+    }
+    engine = _protection_engine([], positions=[position])
+    client_order_id = _add_protected_record(
+        engine,
+        symbol="SXT/USDT:USDT",
+        client_order_id="quada-sxtusdt-l-entry-live",
+    )
+
+    status = asyncio.run(
+        engine._cleanup_orphan_protection_orders(
+            reason="active position safety",
+            alert=False,
+            min_interval=0,
+            confirm_delay_sec=0,
+        )
+    )
+
+    assert status["status"] == "OK"
+    assert status["closed_records"] == 0
+    assert engine.trading_state_store.get(client_order_id).order_state == OrderState.PROTECTED.value
+
+
+def test_orphan_sweep_keeps_protected_state_when_order_snapshot_fails():
+    class _OpenOrdersFailExchange(_FakeExchange):
+        def fetch_open_orders(self, symbol=None):
+            raise RuntimeError("open orders unavailable")
+
+    engine = _protection_engine([], positions=[])
+    engine.exchange = _OpenOrdersFailExchange([], positions=[])
+    client_order_id = _add_protected_record(
+        engine,
+        symbol="SXT/USDT:USDT",
+        client_order_id="quada-sxtusdt-l-entry-unverified",
+    )
+
+    status = asyncio.run(
+        engine._cleanup_orphan_protection_orders(
+            reason="snapshot failure safety",
+            alert=False,
+            min_interval=0,
+            confirm_delay_sec=0,
+        )
+    )
+
+    assert status["status"] == "OPEN_ORDERS_FETCH_FAILED"
+    assert engine.trading_state_store.get(client_order_id).order_state == OrderState.PROTECTED.value
 
 
 def test_live_ladder_flat_cleanup_keeps_state_when_order_fetch_is_unverified():

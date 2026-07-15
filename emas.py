@@ -5711,6 +5711,7 @@ class SignalEngine(BaseEngine):
         self.protection_missing_candidates = {}  # symbol -> missing TP/SL debounce candidates
         self.last_orphan_protection_sweep_ts = 0.0
         self.orphan_protection_candidates = {}  # normalized symbol -> first-seen orphan order signature
+        self.flat_protected_state_candidates = {}  # client ID -> first confirmed exchange-flat observation
         self.ORPHAN_PROTECTION_SWEEP_INTERVAL = 10.0
         self.coin_selector_last_result = {}  # runtime CoinSelector V2 report
         self.coin_selector_symbol_scores = {}  # normalized symbol -> latest selector score
@@ -5937,6 +5938,7 @@ class SignalEngine(BaseEngine):
         self.protection_missing_candidates = {}
         self.last_orphan_protection_sweep_ts = 0.0
         self.orphan_protection_candidates = {}
+        self.flat_protected_state_candidates = {}
         self.coin_selector_last_result = {}
         self.coin_selector_symbol_scores = {}
         self.coin_selector_last_run_ts = 0.0
@@ -36306,6 +36308,7 @@ class SignalEngine(BaseEngine):
         status = {
             'status': 'SKIPPED',
             'cancelled': 0,
+            'closed_records': 0,
             'pending': 0,
             'symbols': {}
         }
@@ -36419,8 +36422,114 @@ class SignalEngine(BaseEngine):
                     f"ℹ️ {self.ctrl.format_symbol_for_display(symbol)} 포지션 없음: 잔존 보호주문 {cancelled}건 자동 취소"
                 )
 
+        state_store = getattr(self, 'trading_state_store', None)
+        state_candidates = getattr(self, 'flat_protected_state_candidates', None)
+        if not isinstance(state_candidates, dict):
+            state_candidates = {}
+            self.flat_protected_state_candidates = state_candidates
+        protected_records = (
+            state_store.list_by_states([OrderState.PROTECTED])
+            if state_store is not None
+            else []
+        )
+        protected_client_ids = {record.client_order_id for record in protected_records}
+        for client_order_id in list(state_candidates.keys()):
+            if client_order_id not in protected_client_ids:
+                state_candidates.pop(client_order_id, None)
+
+        confirm_delay = max(0.0, float(confirm_delay_sec or 0.0))
+        for record in protected_records:
+            symbol = record.symbol
+            symbol_key = self._normalize_protection_symbol(symbol)
+            client_order_id = record.client_order_id
+            if not symbol_key or symbol_key in active_keys or symbol_key in grouped:
+                state_candidates.pop(client_order_id, None)
+                continue
+
+            candidate = state_candidates.get(client_order_id)
+            if not candidate:
+                state_candidates[client_order_id] = {
+                    'first_seen_ts': now_ts,
+                    'symbol': symbol,
+                }
+                if confirm_delay > 0:
+                    status['pending'] += 1
+                    status['symbols'][symbol] = {
+                        'pending': 1,
+                        'cancelled': 0,
+                        'closed_records': 0,
+                        'status': 'FLAT_STATE_PENDING_CONFIRMATION',
+                    }
+                    continue
+                first_seen = now_ts
+            else:
+                first_seen = float(candidate.get('first_seen_ts', now_ts) or now_ts)
+
+            if now_ts - first_seen < confirm_delay:
+                status['pending'] += 1
+                status['symbols'][symbol] = {
+                    'pending': 1,
+                    'cancelled': 0,
+                    'closed_records': 0,
+                    'status': 'FLAT_STATE_PENDING_CONFIRMATION',
+                }
+                continue
+
+            self.position_cache = None
+            self.position_cache_time = 0
+            position_fetch_ok, pos = await self._fetch_server_position_checked(symbol)
+            if not position_fetch_ok:
+                status['pending'] += 1
+                status['symbols'][symbol] = {
+                    'pending': 1,
+                    'cancelled': 0,
+                    'closed_records': 0,
+                    'status': 'POSITION_FETCH_FAILED',
+                }
+                continue
+            if pos:
+                state_candidates.pop(client_order_id, None)
+                continue
+
+            protection_fetch_ok, remaining = await self._collect_protection_orders_checked(symbol)
+            if not protection_fetch_ok:
+                status['pending'] += 1
+                status['symbols'][symbol] = {
+                    'pending': 1,
+                    'cancelled': 0,
+                    'closed_records': 0,
+                    'status': 'OPEN_ORDERS_FETCH_FAILED',
+                }
+                continue
+            if remaining:
+                state_candidates.pop(client_order_id, None)
+                continue
+
+            closed_records = _mark_crypto_symbol_closed(
+                self,
+                symbol,
+                f'{reason}: confirmed exchange-flat protected state',
+            )
+            state_candidates.pop(client_order_id, None)
+            status['closed_records'] += closed_records
+            status['symbols'][symbol] = {
+                'pending': 0,
+                'cancelled': 0,
+                'closed_records': closed_records,
+                'status': 'STALE_PROTECTED_CLOSED' if closed_records else 'ALREADY_CLOSED',
+            }
+            if closed_records:
+                logger.warning(
+                    "Protection orphan sweep released %s stale protected state record(s) for %s (%s)",
+                    closed_records,
+                    symbol,
+                    reason,
+                )
+
         if status['cancelled']:
             status['status'] = 'ORPHAN_CANCELLED'
+        elif status['closed_records']:
+            status['status'] = 'STALE_PROTECTED_CLOSED'
         elif status['pending']:
             status['status'] = 'PENDING_CONFIRMATION'
         else:
@@ -36528,10 +36637,12 @@ class SignalEngine(BaseEngine):
                 final_status['remaining_orders'] = None
                 return final_status
             if not remaining:
+                closed_records = _mark_crypto_symbol_closed(self, symbol, reason)
                 final_status['position_fetch_ok'] = True
                 final_status['position_active'] = False
                 final_status['cleanup_confirmed'] = True
                 final_status['remaining_orders'] = 0
+                final_status['closed_records'] = closed_records
                 return final_status
             await self._cancel_protection_orders(
                 symbol,
@@ -36547,10 +36658,13 @@ class SignalEngine(BaseEngine):
         final_status['position_active'] = False
         final_status['cleanup_confirmed'] = bool(fetch_ok and not remaining)
         final_status['remaining_orders'] = len(remaining or []) if fetch_ok else None
+        final_status['closed_records'] = 0
         if fetch_ok and remaining:
             final_status['status'] = 'ORPHAN_CANCEL_FAILED'
         elif not fetch_ok:
             final_status['status'] = 'OPEN_ORDERS_FETCH_FAILED'
+        else:
+            final_status['closed_records'] = _mark_crypto_symbol_closed(self, symbol, reason)
         return final_status
 
     async def _notify_protection_issue(self, symbol, kind, message, cooldown_sec=300):
@@ -55503,6 +55617,7 @@ def _mark_crypto_entry_state(self, client_order_id, state, **changes):
 
 def _mark_crypto_symbol_closed(self, symbol, reason):
     _ensure_trading_safety_runtime(self)
+    closed_count = 0
     for record in self.trading_state_store.active_for_symbol(symbol):
         if record.order_state in {
             OrderState.PROTECTED.value,
@@ -55519,6 +55634,8 @@ def _mark_crypto_symbol_closed(self, symbol, reason):
                 last_error=None,
                 close_reason=str(reason or "position closed"),
             )
+            closed_count += 1
+    return closed_count
 
 async def execute_live_order_plan(self, plan, cfg):
     cfg = enforce_activation_stage(cfg if isinstance(cfg, dict) else {})
