@@ -334,6 +334,81 @@ def test_quad_accepts_mtrend_as_the_only_signal_at_single_signal_risk():
     assert selected_plans[-1]["qty"] == pytest.approx(0.9)
 
 
+def test_quad_keeps_valid_branch_when_another_branch_crashes():
+    emas = _emas_module()
+    engine = object.__new__(emas.SignalEngine)
+    engine.quad_alpha_last_status = {}
+    engine.last_entry_reason = {}
+    selected_plans = []
+    current = {"key": None}
+    mtrend_plan = {
+        "strategy": emas.M_TREND_STRATEGY,
+        "plan_symbol": "BTC/USDT:USDT",
+        "qty": 2.0,
+        "risk_usdt": 2.0,
+    }
+
+    engine._canonical_futures_symbol = lambda symbol: symbol
+    engine._clear_utbot_filtered_breakout_entry_plan = lambda symbol: None
+    engine._get_utbot_filtered_breakout_config = lambda params=None: {
+        "quad_alpha_single_signal_risk_multiplier": 0.45,
+    }
+    engine._qh_flow_runtime_config = lambda cfg=None: {}
+    engine._quad_alpha_strategy_params = lambda params, branch: {"branch": branch}
+    engine._utbreakout_diag_for_symbol = lambda symbol: {}
+    engine._get_utbot_filtered_breakout_entry_plan = lambda symbol, side=None: (
+        mtrend_plan if current["key"] == emas.M_TREND_STRATEGY else None
+    )
+    engine._dual_alpha_score = lambda key, side, status, plan: 80.0
+    engine._dual_alpha_scale_plan = lambda plan, multiplier: {
+        **plan,
+        "qty": plan["qty"] * multiplier,
+        "risk_usdt": plan["risk_usdt"] * multiplier,
+    }
+    engine._dual_alpha_light = lambda status, label: {
+        "light": "green" if (status or {}).get("accepted_side") else "yellow",
+        "side": (status or {}).get("accepted_side"),
+        "reason": (status or {}).get("reason"),
+    }
+    engine._set_utbot_filtered_breakout_entry_plan = lambda symbol, plan: selected_plans.append(dict(plan))
+    engine._store_utbot_filtered_breakout_status = lambda symbol, status: None
+
+    async def waiting(*args, **kwargs):
+        return None, "waiting", {"stage": "waiting", "reason": "waiting"}
+
+    async def broken_qh(*args, **kwargs):
+        raise RuntimeError("temporary data failure")
+
+    async def mtrend(*args, **kwargs):
+        current["key"] = emas.M_TREND_STRATEGY
+        return "long", "mtrend long", {
+            "accepted_side": "long",
+            "accepted_code": "ACCEPTED_ENTRY",
+            "reason": "mtrend long",
+        }
+
+    engine._calculate_utbot_filtered_breakout_signal = waiting
+    engine._calculate_relative_strength_pullback_signal = waiting
+    engine._calculate_qh_flow_signal = broken_qh
+    engine._calculate_crowding_unwind_signal = waiting
+    engine._calculate_multi_timeframe_trend_signal = mtrend
+
+    side, _, status = asyncio.run(
+        engine._calculate_quad_alpha_signal(
+            "BTC/USDT:USDT",
+            None,
+            {"active_strategy": emas.QUAD_ALPHA_STRATEGY},
+        )
+    )
+
+    assert side == "long"
+    assert status["quad_alpha"]["confirmation_count"] == 1
+    assert status["quad_alpha"]["agreement_state"] == "single"
+    assert "QH-Flow v2 unavailable: RuntimeError" in status["quad_alpha"]["qh_flow"]["reason"]
+    assert selected_plans[-1]["strategy"] == emas.M_TREND_STRATEGY
+    assert selected_plans[-1]["qty"] == pytest.approx(0.9)
+
+
 
 def test_quad_status_text_shows_five_traffic_lights_and_details():
     emas = _emas_module()

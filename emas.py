@@ -2699,6 +2699,11 @@ def resolve_utbreakout_risk_budget(balance_usdt, cfg, *, multiplier=1.0):
         max_risk_usdt = max(0.0, float(cfg.get('max_risk_per_trade_usdt', 1.0) or 0.0))
         source = 'fixed_usdt_cap'
 
+    daily_loss_cap = max(0.0, float(cfg.get('daily_max_loss_usdt', 0.0) or 0.0))
+    daily_cap_applied = daily_loss_cap > 0 and max_risk_usdt > daily_loss_cap
+    if daily_loss_cap > 0:
+        max_risk_usdt = min(max_risk_usdt, daily_loss_cap)
+
     applied_multiplier = max(0.0, float(multiplier or 0.0))
     return {
         'risk_per_trade_percent': risk_percent * applied_multiplier,
@@ -2707,6 +2712,8 @@ def resolve_utbreakout_risk_budget(balance_usdt, cfg, *, multiplier=1.0):
         'base_max_risk_per_trade_usdt': max_risk_usdt,
         'multiplier': applied_multiplier,
         'source': source,
+        'daily_loss_cap_usdt': daily_loss_cap,
+        'daily_loss_cap_applied': daily_cap_applied,
     }
 
 
@@ -5617,6 +5624,9 @@ class SignalEngine(BaseEngine):
         self.coin_selector_symbol_scores = {}  # normalized symbol -> latest selector score
         self.coin_selector_last_run_ts = 0.0
         self.coin_selector_candidate_cooldowns = {}  # normalized symbol -> no-entry miss / cooldown state
+        self.coin_selector_analysis_cursor = 0
+        self.coin_selector_strategy_cursor = 0
+        self.coin_selector_rate_limit_backoff_until = 0.0
         self._load_utbreakout_daily_sl_lockouts()
         self._load_utbreakout_profit_alpha_meta_stats()
         self.micro_auto_last_plan = {}  # symbol -> latest accepted Micro Auto plan
@@ -5839,6 +5849,9 @@ class SignalEngine(BaseEngine):
         self.coin_selector_symbol_scores = {}
         self.coin_selector_last_run_ts = 0.0
         self.coin_selector_candidate_cooldowns = {}
+        self.coin_selector_analysis_cursor = 0
+        self.coin_selector_strategy_cursor = 0
+        self.coin_selector_rate_limit_backoff_until = 0.0
         self.utbreakout_daily_sl_symbol_lockouts = {}
         self.utbreakout_recent_loss_symbol_cooldowns = {}
         self._load_utbreakout_daily_sl_lockouts()
@@ -17901,127 +17914,119 @@ class SignalEngine(BaseEngine):
         }
         branch_results = []
 
+        async def _run_branch(key, label, priority, evaluator, *, fallback_diag=False):
+            plan_symbol = base_symbol
+            self._clear_utbot_filtered_breakout_entry_plan(base_symbol)
+            try:
+                signal, reason, status = await evaluator()
+                status = dict(
+                    status
+                    or (self._utbreakout_diag_for_symbol(base_symbol) if fallback_diag else {})
+                    or {}
+                )
+                plan_symbol = self._canonical_futures_symbol(
+                    status.get('plan_symbol') or status.get('symbol') or base_symbol
+                )
+                plan = (
+                    dict(self._get_utbot_filtered_breakout_entry_plan(plan_symbol, signal) or {})
+                    if signal in {'long', 'short'}
+                    else None
+                )
+                return key, label, signal, reason, status, plan, priority
+            except Exception as exc:
+                reason = f"{label} unavailable: {type(exc).__name__}: {exc}"
+                logger.exception("QUAD_ALPHA branch failed for %s: %s", base_symbol, label)
+                status = {
+                    'strategy': label,
+                    'symbol': base_symbol,
+                    'stage': 'waiting',
+                    'reject_code': 'REJECTED_BRANCH_UNAVAILABLE',
+                    'reason': reason,
+                }
+                return key, label, None, reason, status, None, priority
+            finally:
+                self._clear_utbot_filtered_breakout_entry_plan(plan_symbol)
+                if plan_symbol != base_symbol:
+                    self._clear_utbot_filtered_breakout_entry_plan(base_symbol)
+
         ut_params = self._quad_alpha_strategy_params(strategy_params, ENTRY_STRATEGY_UT_BREAKOUT)
-        ut_sig, ut_reason, ut_status = await self._calculate_utbot_filtered_breakout_signal(
-            base_symbol,
-            df,
-            ut_params,
-            force_reprocess=force_reprocess,
-        )
-        ut_status = dict(ut_status or self._utbreakout_diag_for_symbol(base_symbol) or {})
-        ut_plan = (
-            dict(self._get_utbot_filtered_breakout_entry_plan(base_symbol, ut_sig) or {})
-            if ut_sig in {'long', 'short'}
-            else None
-        )
-        branch_results.append((ENTRY_STRATEGY_UT_BREAKOUT, 'UTBreakout', ut_sig, ut_reason, ut_status, ut_plan, 0))
-        self._clear_utbot_filtered_breakout_entry_plan(base_symbol)
+        branch_results.append(await _run_branch(
+            ENTRY_STRATEGY_UT_BREAKOUT,
+            'UTBreakout',
+            0,
+            lambda: self._calculate_utbot_filtered_breakout_signal(
+                base_symbol,
+                df,
+                ut_params,
+                force_reprocess=force_reprocess,
+            ),
+            fallback_diag=True,
+        ))
 
         rsp_params = self._quad_alpha_strategy_params(
             strategy_params,
             ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
         )
-        rsp_sig, rsp_reason, rsp_status = await self._calculate_relative_strength_pullback_signal(
-            base_symbol,
-            df,
-            rsp_params,
-            force_reprocess=force_reprocess,
-            forced_direction=None,
-            direction_source='RSPT-v3 BTC/ETH/alt/vol residual strength',
-            resolve_ut_direction=False,
-        )
-        rsp_status = dict(rsp_status or self._utbreakout_diag_for_symbol(base_symbol) or {})
-        rsp_symbol = self._canonical_futures_symbol(
-            rsp_status.get('plan_symbol') or rsp_status.get('symbol') or base_symbol
-        )
-        rsp_plan = (
-            dict(self._get_utbot_filtered_breakout_entry_plan(rsp_symbol, rsp_sig) or {})
-            if rsp_sig in {'long', 'short'}
-            else None
-        )
-        branch_results.append((
+        branch_results.append(await _run_branch(
             ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
             'RSPT-v3',
-            rsp_sig,
-            rsp_reason,
-            rsp_status,
-            rsp_plan,
             1,
+            lambda: self._calculate_relative_strength_pullback_signal(
+                base_symbol,
+                df,
+                rsp_params,
+                force_reprocess=force_reprocess,
+                forced_direction=None,
+                direction_source='RSPT-v3 BTC/ETH/alt/vol residual strength',
+                resolve_ut_direction=False,
+            ),
+            fallback_diag=True,
         ))
-        self._clear_utbot_filtered_breakout_entry_plan(rsp_symbol)
 
         qh_params = self._quad_alpha_strategy_params(strategy_params, QH_FLOW_STRATEGY)
-        qh_sig, qh_reason, qh_status = await self._calculate_qh_flow_signal(
-            base_symbol,
-            df,
-            qh_params,
-            force_reprocess=force_reprocess,
-        )
-        qh_status = dict(qh_status or {})
-        qh_symbol = self._canonical_futures_symbol(
-            qh_status.get('plan_symbol') or qh_status.get('symbol') or base_symbol
-        )
-        qh_plan = (
-            dict(self._get_utbot_filtered_breakout_entry_plan(qh_symbol, qh_sig) or {})
-            if qh_sig in {'long', 'short'}
-            else None
-        )
-        branch_results.append((QH_FLOW_STRATEGY, 'QH-Flow v2', qh_sig, qh_reason, qh_status, qh_plan, 2))
-        self._clear_utbot_filtered_breakout_entry_plan(qh_symbol)
+        branch_results.append(await _run_branch(
+            QH_FLOW_STRATEGY,
+            'QH-Flow v2',
+            2,
+            lambda: self._calculate_qh_flow_signal(
+                base_symbol,
+                df,
+                qh_params,
+                force_reprocess=force_reprocess,
+            ),
+        ))
 
         crowd_params = self._quad_alpha_strategy_params(strategy_params, CROWDING_UNWIND_STRATEGY)
-        crowd_sig, crowd_reason, crowd_status = await self._calculate_crowding_unwind_signal(
-            base_symbol,
-            df,
-            crowd_params,
-            force_reprocess=force_reprocess,
-        )
-        crowd_status = dict(crowd_status or {})
-        crowd_symbol = self._canonical_futures_symbol(
-            crowd_status.get('plan_symbol') or crowd_status.get('symbol') or base_symbol
-        )
-        crowd_plan = (
-            dict(self._get_utbot_filtered_breakout_entry_plan(crowd_symbol, crowd_sig) or {})
-            if crowd_sig in {'long', 'short'}
-            else None
-        )
-        branch_results.append((
+        branch_results.append(await _run_branch(
             CROWDING_UNWIND_STRATEGY,
             'Crowding Unwind',
-            crowd_sig,
-            crowd_reason,
-            crowd_status,
-            crowd_plan,
             3,
+            lambda: self._calculate_crowding_unwind_signal(
+                base_symbol,
+                df,
+                crowd_params,
+                force_reprocess=force_reprocess,
+            ),
         ))
-        self._clear_utbot_filtered_breakout_entry_plan(crowd_symbol)
 
         trend_params = self._quad_alpha_strategy_params(strategy_params, M_TREND_STRATEGY)
-        trend_sig, trend_reason, trend_status = await self._calculate_multi_timeframe_trend_signal(
-            base_symbol,
-            df,
-            trend_params,
-            force_reprocess=force_reprocess,
-        )
-        trend_status = dict(trend_status or {})
-        trend_symbol = self._canonical_futures_symbol(
-            trend_status.get('plan_symbol') or trend_status.get('symbol') or base_symbol
-        )
-        trend_plan = (
-            dict(self._get_utbot_filtered_breakout_entry_plan(trend_symbol, trend_sig) or {})
-            if trend_sig in {'long', 'short'}
-            else None
-        )
-        branch_results.append((
+        branch_results.append(await _run_branch(
             M_TREND_STRATEGY,
             'M-TREND',
-            trend_sig,
-            trend_reason,
-            trend_status,
-            trend_plan,
             4,
+            lambda: self._calculate_multi_timeframe_trend_signal(
+                base_symbol,
+                df,
+                trend_params,
+                force_reprocess=force_reprocess,
+            ),
         ))
-        self._clear_utbot_filtered_breakout_entry_plan(trend_symbol)
+
+        ut_status = branch_results[0][4]
+        rsp_status = branch_results[1][4]
+        qh_status = branch_results[2][4]
+        crowd_status = branch_results[3][4]
+        trend_status = branch_results[4][4]
 
         choices = []
         for key, label, side, reason, status, plan, priority in branch_results:
@@ -28006,6 +28011,7 @@ class SignalEngine(BaseEngine):
             'max_abs_price_change_pct': 18.0,
             'min_final_score': 55.0,
             'refresh_interval_seconds': 300.0,
+            'rate_limit_backoff_seconds': 120.0,
             'candidate_cooldown_seconds': 1800.0,
             'selection_target_realized_vol_pct': 0.65,
             'selection_max_drawdown_pct': 18.0,
@@ -28020,7 +28026,9 @@ class SignalEngine(BaseEngine):
             'min_trade_count': 20_000,
             'ideal_trade_count': 500_000,
             'analysis_limit': 20,
+            'analysis_batch_size': 12,
             'top_n': 10,
+            'max_strategy_evaluations_per_cycle': 3,
             'candidate_cooldown_misses': 3,
             'selection_return_lookback_bars': 96,
             'tradifi_universe_max_candidates': 20,
@@ -28030,6 +28038,76 @@ class SignalEngine(BaseEngine):
             except (TypeError, ValueError):
                 cfg[key] = int(default)
         return cfg
+
+    @staticmethod
+    def _is_exchange_rate_limit_error(value):
+        """Recognize Binance/HTTP throttling even when buried in a diagnostic payload."""
+        if isinstance(value, dict):
+            return any(
+                SignalEngine._is_exchange_rate_limit_error(item)
+                for item in value.values()
+            )
+        if isinstance(value, (list, tuple, set)):
+            return any(
+                SignalEngine._is_exchange_rate_limit_error(item)
+                for item in value
+            )
+        text = str(value or '').strip().lower()
+        return any(marker in text for marker in (
+            '429 too many requests',
+            'http 429',
+            'status code 429',
+            'code=-1003',
+            'code -1003',
+            '"code":-1003',
+            "'code': -1003",
+            'too many requests',
+            'request weight limit',
+            'way too much request weight',
+            'ip banned until',
+        ))
+
+    def _coin_selector_rate_limit_backoff_remaining(self, *, now=None):
+        current = time.time() if now is None else float(now)
+        until = float(
+            getattr(self, 'coin_selector_rate_limit_backoff_until', 0.0) or 0.0
+        )
+        return max(0.0, until - current)
+
+    def _activate_coin_selector_rate_limit_backoff(self, cfg, reason):
+        try:
+            duration = float((cfg or {}).get('rate_limit_backoff_seconds', 120.0) or 120.0)
+        except (TypeError, ValueError):
+            duration = 120.0
+        duration = max(60.0, min(900.0, duration))
+        now = time.time()
+        current_until = float(
+            getattr(self, 'coin_selector_rate_limit_backoff_until', 0.0) or 0.0
+        )
+        self.coin_selector_rate_limit_backoff_until = max(current_until, now + duration)
+        logger.warning(
+            "CoinSelector exchange rate limit detected; scanner backing off %.0fs: %s",
+            duration,
+            str(reason or 'rate limited')[:300],
+        )
+        return duration
+
+    def _rotating_coin_selector_batch(self, items, limit, *, cursor_attr):
+        items = list(items or [])
+        if not items:
+            setattr(self, cursor_attr, 0)
+            return []
+        try:
+            batch_limit = max(1, int(limit))
+        except (TypeError, ValueError):
+            batch_limit = len(items)
+        if batch_limit >= len(items):
+            setattr(self, cursor_attr, 0)
+            return items
+        start = int(getattr(self, cursor_attr, 0) or 0) % len(items)
+        batch = [items[(start + offset) % len(items)] for offset in range(batch_limit)]
+        setattr(self, cursor_attr, (start + batch_limit) % len(items))
+        return batch
 
     def _get_micro_auto_config(self):
         raw = self.get_runtime_trade_config().get('micro_auto', {})
@@ -29245,6 +29323,10 @@ class SignalEngine(BaseEngine):
         tradifi_session_open = bool(tradifi_session_status.get('open'))
         cached = self.coin_selector_last_result if isinstance(self.coin_selector_last_result, dict) else {}
         refresh_interval = float(cfg.get('refresh_interval_seconds', 300.0) or 300.0)
+        backoff_remaining = self._coin_selector_rate_limit_backoff_remaining(now=now)
+        if backoff_remaining > 0 and cached:
+            cached['rate_limit_backoff_remaining_seconds'] = round(backoff_remaining, 1)
+            return cached
         if (not force) and cached and (now - float(cached.get('generated_at_ts', 0) or 0)) < refresh_interval:
             cached_cfg = cached.get('criteria') if isinstance(cached.get('criteria'), dict) else {}
             cached_custom = bool(cached_cfg.get('custom_universe_enabled', False))
@@ -29445,13 +29527,13 @@ class SignalEngine(BaseEngine):
             'cross_sectional_dispersion_pct': float(np.std(dispersion_values)) if len(dispersion_values) >= 2 else 0.0,
         }
         analysis_limit = len(accepted_base) if custom_enabled else int(cfg.get('analysis_limit', 20) or 20)
-        analysis_candidates = list(accepted_base[:analysis_limit])
+        analysis_universe = list(accepted_base[:analysis_limit])
         tradifi_candidates_considered = 0
         if include_tradifi_universe:
             tradifi_limit = max(1, int(cfg.get('tradifi_universe_max_candidates', 20) or 20))
             seen_symbols = {
                 str(item.get('normalized_symbol') or item.get('exchange_symbol') or item.get('symbol') or '').upper()
-                for item in analysis_candidates
+                for item in analysis_universe
             }
             tradifi_candidates = [
                 item for item in accepted_base
@@ -29465,12 +29547,20 @@ class SignalEngine(BaseEngine):
                 key = str(item.get('normalized_symbol') or item.get('exchange_symbol') or item.get('symbol') or '').upper()
                 if key in seen_symbols:
                     continue
-                analysis_candidates.append(item)
+                analysis_universe.append(item)
                 seen_symbols.add(key)
             tradifi_candidates_considered = len(tradifi_candidates[:tradifi_limit])
+        analysis_candidates = self._rotating_coin_selector_batch(
+            analysis_universe,
+            cfg.get('analysis_batch_size', 12),
+            cursor_attr='coin_selector_analysis_cursor',
+        )
         scored = []
         analysis_errors = []
+        rate_limited = False
+        analysis_attempted = 0
         for candidate in analysis_candidates:
+            analysis_attempted += 1
             scored_candidate = await self._score_coin_selector_candidate(
                 candidate,
                 cfg,
@@ -29481,6 +29571,18 @@ class SignalEngine(BaseEngine):
                 scored.append(scored_candidate)
             else:
                 analysis_errors.append(scored_candidate)
+                if self._is_exchange_rate_limit_error(scored_candidate):
+                    self._activate_coin_selector_rate_limit_backoff(
+                        cfg,
+                        scored_candidate.get('analysis_error') or scored_candidate,
+                    )
+                    rate_limited = True
+                    break
+        if rate_limited and analysis_attempted < len(analysis_candidates) and analysis_universe:
+            deferred_count = len(analysis_candidates) - analysis_attempted
+            self.coin_selector_analysis_cursor = (
+                int(getattr(self, 'coin_selector_analysis_cursor', 0) or 0) - deferred_count
+            ) % len(analysis_universe)
 
         top_n = int(cfg.get('top_n', 10) or 10)
         report = build_coin_selector_report(scored, rejected + analysis_errors, top_n=top_n)
@@ -29490,8 +29592,12 @@ class SignalEngine(BaseEngine):
             'generated_at': datetime.now(timezone.utc).isoformat(),
             'criteria': dict(cfg, custom_universe_enabled=custom_enabled, custom_symbols=custom_symbols),
             'analysis_limit': len(analysis_candidates),
+            'analysis_universe_size': len(analysis_universe),
+            'analysis_batch_size': len(analysis_candidates),
+            'analysis_attempted': analysis_attempted,
             'total_base_candidates': len(accepted_base),
-            'total_unanalyzed': max(0, len(accepted_base) - len(analysis_candidates)),
+            'total_unanalyzed': max(0, len(analysis_universe) - analysis_attempted),
+            'rate_limited': rate_limited,
             'custom_universe_enabled': custom_enabled,
             'custom_symbols': custom_symbols if custom_enabled else [],
             'tradifi_universe_included': include_tradifi_universe,
@@ -29587,20 +29693,33 @@ class SignalEngine(BaseEngine):
 
     async def _scan_and_trade_coin_selector(self):
         cfg = self._get_coin_selector_config()
+        backoff_remaining = self._coin_selector_rate_limit_backoff_remaining()
+        if backoff_remaining > 0:
+            logger.warning(
+                "CoinSelector scan deferred for %.0fs after exchange rate limiting",
+                backoff_remaining,
+            )
+            return
         scanner_strategy_params = self.get_runtime_strategy_params()
         scanner_active_strategy = str(
             scanner_strategy_params.get('active_strategy', 'utbot') or 'utbot'
         ).lower()
         scan_started_at = time.time()
-        if self._micro_auto_enabled():
-            report = await self.evaluate_micro_auto_candidates(force=False)
-            candidates = list(report.get('selected', []))
-        else:
-            report = await self.evaluate_coin_selector(force=False)
-            candidates = [
-                item for item in report.get('selected', [])
-                if item.get('scanner_accepted', True)
-            ]
+        try:
+            if self._micro_auto_enabled():
+                report = await self.evaluate_micro_auto_candidates(force=False)
+                candidates = list(report.get('selected', []))
+            else:
+                report = await self.evaluate_coin_selector(force=False)
+                candidates = [
+                    item for item in report.get('selected', [])
+                    if item.get('scanner_accepted', True)
+                ]
+        except Exception as exc:
+            if self._is_exchange_rate_limit_error(exc):
+                self._activate_coin_selector_rate_limit_backoff(cfg, exc)
+                return
+            raise
         if scanner_active_strategy in UTBREAKOUT_STRATEGIES:
             allowed_candidates = []
             for item in candidates:
@@ -29630,6 +29749,11 @@ class SignalEngine(BaseEngine):
                     item['exchange_symbol'] = canonical_symbol
                 allowed_candidates.append(item)
             candidates = allowed_candidates
+        candidates = self._rotating_coin_selector_batch(
+            candidates,
+            cfg.get('max_strategy_evaluations_per_cycle', 3),
+            cursor_attr='coin_selector_strategy_cursor',
+        )
         if not candidates:
             logger.info(self._format_coin_selector_no_actionable_summary(report))
             return
@@ -29756,6 +29880,20 @@ class SignalEngine(BaseEngine):
                 )
                 if active_strategy in UTBREAKOUT_STRATEGIES:
                     signal_diag = self._utbreakout_diag_for_symbol(symbol)
+                    last_entry_reason = (
+                        self.last_entry_reason.get(symbol)
+                        if isinstance(getattr(self, 'last_entry_reason', None), dict)
+                        else None
+                    )
+                    if self._is_exchange_rate_limit_error((
+                        signal_diag,
+                        last_entry_reason,
+                    )):
+                        self._activate_coin_selector_rate_limit_backoff(
+                            cfg,
+                            signal_diag.get('reason') or last_entry_reason,
+                        )
+                        break
                     self._utbreakout_trace_event(
                         symbol,
                         'SIGNAL_CALCULATED',
@@ -29990,6 +30128,9 @@ class SignalEngine(BaseEngine):
                 self._record_coin_selector_candidate_outcome(symbol, accepted=True, cfg=cfg)
                 logger.info(f"CoinSelector checked {symbol}: position exists ({pos.get('side')})")
             except Exception as exc:
+                if self._is_exchange_rate_limit_error(exc):
+                    self._activate_coin_selector_rate_limit_backoff(cfg, exc)
+                    break
                 self._record_coin_selector_candidate_outcome(
                     symbol,
                     reason=f"strategy check error: {type(exc).__name__}",
@@ -34817,8 +34958,19 @@ class SignalEngine(BaseEngine):
             elif active_strategy in UTBREAKOUT_STRATEGIES:
                 plan = filtered_breakout_plan or self._get_utbot_filtered_breakout_entry_plan(symbol, side)
                 if not plan:
-                    logger.warning("[UTBOT_FILTERED_BREAKOUT_V1] Missing risk plan after entry; TP/SL placement skipped.")
-                    await self.ctrl.notify("⚠️ UTBOT_FILTERED_BREAKOUT_V1 리스크 계획 누락: 보호 주문 설정을 건너뜀")
+                    logger.error("[UTBOT_FILTERED_BREAKOUT_V1] Missing risk plan after entry; flattening unprotected position.")
+                    fail_status = await self._fail_closed_unprotected_position(
+                        symbol,
+                        reason='UTBreakout risk plan missing after entry fill',
+                        status_code='MISSING_RISK_PLAN_AFTER_FILL',
+                        expected_tp=True,
+                    )
+                    if (fail_status.get('emergency_close') or {}).get('closed'):
+                        verify_pos = None
+                    await self.ctrl.notify(
+                        "🚨 UTBOT_FILTERED_BREAKOUT_V1 리스크 계획 누락: "
+                        "무방비 포지션 긴급 청산을 실행했습니다."
+                    )
                 else:
                     risk_distance = float(plan.get('risk_distance', 0.0) or 0.0)
                     rr_multiple = float(plan.get('rr_multiple', 3.50) or 3.50)
@@ -35029,7 +35181,18 @@ class SignalEngine(BaseEngine):
                                     f"protection audit={audit_status}"
                                 )
                     else:
-                        await self.ctrl.notify("⚠️ UTBOT_FILTERED_BREAKOUT_V1 보호 주문 거리 계산 오류")
+                        fail_status = await self._fail_closed_unprotected_position(
+                            symbol,
+                            reason='UTBreakout protection distance invalid after entry fill',
+                            status_code='INVALID_RISK_DISTANCE_AFTER_FILL',
+                            expected_tp=True,
+                        )
+                        if (fail_status.get('emergency_close') or {}).get('closed'):
+                            verify_pos = None
+                        await self.ctrl.notify(
+                            "🚨 UTBOT_FILTERED_BREAKOUT_V1 보호 주문 거리 계산 오류: "
+                            "무방비 포지션 긴급 청산을 실행했습니다."
+                        )
                 if plan and not plan.get('aggressive_growth_overlay'):
                     self._clear_aggressive_growth_position(symbol)
                 if plan:
@@ -36980,6 +37143,38 @@ class SignalEngine(BaseEngine):
                 await asyncio.sleep(retry_delay)
         raise last_error
 
+    async def _fail_closed_unprotected_position(
+        self,
+        symbol,
+        *,
+        reason,
+        status_code,
+        expected_tp=False,
+        emergency_close=True,
+    ):
+        """Record a protection construction failure and flatten instead of leaving naked risk."""
+        status = {
+            'tp_expected': bool(expected_tp),
+            'sl_expected': True,
+            'tp_present': False,
+            'sl_present': False,
+            'missing_tp': bool(expected_tp),
+            'missing_sl': True,
+            'status': str(status_code or 'PROTECTION_SETUP_FAILED'),
+            'reason': str(reason or 'protection setup failed'),
+        }
+        self.last_protection_order_status[symbol] = status
+        if emergency_close:
+            close_status = await self._emergency_close_position_without_stop_loss(
+                symbol,
+                reason=str(reason or 'protection setup failed'),
+                max_attempts=5,
+            )
+            status['emergency_close_status'] = close_status.get('status')
+            status['emergency_close'] = close_status
+            self.last_protection_order_status[symbol] = status
+        return status
+
     async def _emergency_close_position_without_stop_loss(
         self,
         symbol,
@@ -38515,6 +38710,14 @@ class SignalEngine(BaseEngine):
             emergency_close_on_sl_fail = bool(protection_cfg.get('emergency_close_on_sl_fail', True))
             if side not in {'long', 'short'} or entry_price <= 0:
                 logger.error(f"Protection placement skipped: invalid side/entry ({symbol}, {side}, {entry_price})")
+                if sl_distance is not None:
+                    await self._fail_closed_unprotected_position(
+                        symbol,
+                        reason=f'invalid protection side/entry: side={side}, entry={entry_price}',
+                        status_code='INVALID_PROTECTION_INPUT',
+                        expected_tp=bool(tp_targets or tp_distance),
+                        emergency_close=emergency_close_on_sl_fail,
+                    )
                 return
 
             pos = await self.get_server_position(symbol, use_cache=False)
@@ -38529,6 +38732,14 @@ class SignalEngine(BaseEngine):
             sl_qty = self.safe_amount(symbol, raw_qty)
             if float(sl_qty) <= 0:
                 logger.error(f"Protection placement skipped: invalid qty for {symbol}: {sl_qty}")
+                if sl_distance is not None:
+                    await self._fail_closed_unprotected_position(
+                        symbol,
+                        reason=f'invalid protection quantity: {sl_qty}',
+                        status_code='INVALID_PROTECTION_QTY',
+                        expected_tp=bool(tp_targets or tp_distance),
+                        emergency_close=emergency_close_on_sl_fail,
+                    )
                 return
             await self._cancel_protection_orders(symbol, reason='before new protection placement')
             await asyncio.sleep(0.25)
@@ -38734,6 +38945,14 @@ class SignalEngine(BaseEngine):
                         'missing_sl': True,
                         'status': 'INVALID_SL_PRICE'
                     }
+                    if emergency_close_on_sl_fail:
+                        await self._fail_closed_unprotected_position(
+                            symbol,
+                            reason=f'invalid stop-loss price after rounding: entry={entry_price}, stop={sl_price}',
+                            status_code='INVALID_SL_PRICE',
+                            expected_tp=tp_price is not None,
+                            emergency_close=True,
+                        )
                     return
                 else:
                     try:
@@ -38943,7 +39162,22 @@ class SignalEngine(BaseEngine):
                 )
 
         except Exception as e:
-            logger.error(f"TP/SL order placement error: {e}")
+            logger.exception("TP/SL order placement error for %s", symbol)
+            if (
+                locals().get('sl_distance') is not None
+                and not locals().get('sl_order')
+                and bool(locals().get('emergency_close_on_sl_fail', True))
+            ):
+                try:
+                    await self._fail_closed_unprotected_position(
+                        symbol,
+                        reason=f'unhandled protection setup error: {type(e).__name__}: {e}',
+                        status_code='PROTECTION_SETUP_EXCEPTION',
+                        expected_tp=bool(locals().get('tp_targets') or locals().get('tp_distance')),
+                        emergency_close=True,
+                    )
+                except Exception:
+                    logger.exception("Emergency close after protection setup exception failed for %s", symbol)
 
     async def exit_position(self, symbol, reason):
         logger.info(f"?뱾 [Signal] Attempting exit: {reason}")

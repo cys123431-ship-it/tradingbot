@@ -85,7 +85,9 @@ def test_opportunity_tuning_does_not_rewrite_when_already_current():
             "coin_selector": {
                 "enabled": True,
                 "analysis_limit": 80,
+                "analysis_batch_size": 12,
                 "top_n": 20,
+                "max_strategy_evaluations_per_cycle": 3,
                 "min_final_score": 45.0,
                 "min_quote_volume_usdt": 25_000_000.0,
                 "ideal_quote_volume_usdt": 250_000_000.0,
@@ -94,6 +96,7 @@ def test_opportunity_tuning_does_not_rewrite_when_already_current():
                 "max_spread_pct": 0.12,
                 "max_abs_price_change_pct": 24.0,
                 "refresh_interval_seconds": 90,
+                "rate_limit_backoff_seconds": 120,
                 "candidate_cooldown_enabled": False,
                 "custom_relax_discovery": True,
                 "selection_quality_enabled": True,

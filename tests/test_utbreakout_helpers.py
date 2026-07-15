@@ -313,6 +313,26 @@ def test_utbreakout_risk_budget_supports_ten_percent_and_tracks_equity():
     assert budget["source"] == "account_equity_percent"
 
 
+def test_utbreakout_risk_budget_never_exceeds_daily_loss_cap():
+    emas = _emas_module()
+
+    budget = emas.resolve_utbreakout_risk_budget(
+        5_000.0,
+        {
+            "risk_per_trade_percent": 10.0,
+            "max_risk_per_trade_percent": 10.0,
+            "risk_budget_tracks_account_equity": True,
+            "daily_max_loss_usdt": 100.0,
+        },
+        multiplier=0.45,
+    )
+
+    assert budget["base_max_risk_per_trade_usdt"] == pytest.approx(100.0)
+    assert budget["max_risk_per_trade_usdt"] == pytest.approx(45.0)
+    assert budget["daily_loss_cap_applied"] is True
+    assert budget["daily_loss_cap_usdt"] == pytest.approx(100.0)
+
+
 def test_utbreakout_margin_cap_reduces_plan_instead_of_rejecting_signal():
     emas = _emas_module()
     plan = {
@@ -980,6 +1000,117 @@ def test_coin_selector_custom_universe_blocks_testnet_tradifi_symbols():
     selected_symbols = [item.get("normalized_symbol") for item in report["selected"]]
     assert selected_symbols == ["BTC/USDT"]
     assert report["reject_counts"]["REJECTED_EXCHANGE_MODE_SYMBOL"] == 1
+
+
+def test_coin_selector_stops_deep_fanout_and_backs_off_on_rate_limit():
+    emas = _emas_module()
+    signal_engine = _signal_engine_cls()
+    controller = emas.MainController.__new__(emas.MainController)
+    controller.cfg = {"api": {"exchange_mode": emas.BINANCE_MAINNET, "use_testnet": False}}
+    markets = {
+        "BTC/USDT:USDT": _market(symbol="BTC/USDT:USDT"),
+        "ETH/USDT:USDT": _market(symbol="ETH/USDT:USDT"),
+    }
+
+    engine = signal_engine.__new__(signal_engine)
+    engine.ctrl = controller
+    engine.exchange = _FakeMarketExchange(markets)
+    engine.market_data_exchange = _FakeMarketExchange(markets)
+    engine.coin_selector_last_result = {}
+    engine.coin_selector_symbol_scores = {}
+    engine.coin_selector_last_run_ts = 0
+    engine.coin_selector_analysis_cursor = 0
+    engine.coin_selector_rate_limit_backoff_until = 0.0
+    engine.is_upbit_mode = lambda: False
+    engine._coin_selector_tradifi_regular_session_status = lambda: {"open": True}
+    engine.get_runtime_trade_config = lambda: {
+        "coin_selector": {
+            "enabled": True,
+            "custom_universe_enabled": True,
+            "custom_symbols": ["BTC/USDT", "ETH/USDT"],
+            "custom_relax_discovery": True,
+            "analysis_batch_size": 2,
+            "rate_limit_backoff_seconds": 120,
+            "top_n": 2,
+        }
+    }
+    engine.get_runtime_strategy_params = lambda: {}
+    calls = []
+
+    async def _score_candidate(base_candidate, cfg, strategy_params, selector_context=None):
+        calls.append(base_candidate["normalized_symbol"])
+        rejected = dict(base_candidate)
+        rejected.update({
+            "accepted": False,
+            "score": 0.0,
+            "selection_state": "REJECTED",
+            "reject_reasons": ["REJECTED_ANALYSIS_ERROR"],
+            "analysis_error": "binance code=-1003 Too many requests",
+        })
+        return rejected
+
+    engine._score_coin_selector_candidate = _score_candidate
+
+    report = asyncio.run(engine.evaluate_coin_selector(force=True))
+
+    assert len(calls) == 1
+    assert report["rate_limited"] is True
+    assert engine.coin_selector_rate_limit_backoff_until > 0
+
+
+def test_coin_selector_rotating_batches_cover_full_universe_without_fanout():
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    engine.coin_selector_analysis_cursor = 0
+    universe = list(range(8))
+
+    first = engine._rotating_coin_selector_batch(
+        universe,
+        3,
+        cursor_attr="coin_selector_analysis_cursor",
+    )
+    second = engine._rotating_coin_selector_batch(
+        universe,
+        3,
+        cursor_attr="coin_selector_analysis_cursor",
+    )
+    third = engine._rotating_coin_selector_batch(
+        universe,
+        3,
+        cursor_attr="coin_selector_analysis_cursor",
+    )
+
+    assert first == [0, 1, 2]
+    assert second == [3, 4, 5]
+    assert third == [6, 7, 0]
+    assert set(first + second + third) == set(universe)
+
+
+def test_coin_selector_rate_limit_detection_handles_nested_binance_payloads():
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+
+    assert engine._is_exchange_rate_limit_error({
+        "quad": {"reason": "binance {\"code\":-1003,\"msg\":\"Too many requests\"}"}
+    }) is True
+    assert engine._is_exchange_rate_limit_error("HTTP 429 Too Many Requests") is True
+    assert engine._is_exchange_rate_limit_error({"reason": "no entry signal"}) is False
+
+
+def test_coin_selector_rate_limit_backoff_is_bounded_and_extended(monkeypatch):
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    engine.coin_selector_rate_limit_backoff_until = 0.0
+    monkeypatch.setattr("emas.time.time", lambda: 1000.0)
+
+    duration = engine._activate_coin_selector_rate_limit_backoff(
+        {"rate_limit_backoff_seconds": 10},
+        "HTTP 429",
+    )
+
+    assert duration == 60.0
+    assert engine.coin_selector_rate_limit_backoff_until == 1060.0
+    assert engine._coin_selector_rate_limit_backoff_remaining(now=1025.0) == 35.0
 
 
 def test_coin_selector_candidate_cooldown_counts_unique_decision_keys():
@@ -4742,6 +4873,33 @@ def test_place_tp_sl_orders_emergency_closes_when_stop_loss_creation_fails(tmp_p
     locked, reason = engine._is_utbreakout_daily_sl_locked("BTCUSDT")
     assert locked is True
     assert "STOP_LOSS_PROTECTION_FAILED_FORCE_CLOSED" in reason
+
+
+def test_place_tp_sl_orders_fail_closes_when_rounded_stop_is_invalid():
+    pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "2", "entryPrice": "100"}
+    engine = _protection_engine([], positions=[pos])
+    engine.safe_price = lambda symbol, price: 100.0
+    engine._emergency_close_position_without_stop_loss = AsyncMock(return_value={
+        "status": "EMERGENCY_CLOSED",
+        "closed": True,
+    })
+
+    asyncio.run(
+        engine._place_tp_sl_orders(
+            "BTC/USDT",
+            "long",
+            100,
+            "2",
+            tp_distance=15,
+            sl_distance=10,
+        )
+    )
+
+    engine._emergency_close_position_without_stop_loss.assert_awaited_once()
+    status = engine.last_protection_order_status["BTC/USDT"]
+    assert status["status"] == "INVALID_SL_PRICE"
+    assert status["missing_sl"] is True
+    assert status["emergency_close_status"] == "EMERGENCY_CLOSED"
 
 
 def test_missing_take_profit_audit_emergency_closes_and_locks_symbol(tmp_path):
