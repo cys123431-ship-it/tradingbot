@@ -996,12 +996,20 @@ def _simulate_variant(rows, params, args):
 def walk_forward_report(rows, variants, args):
     train_size = max(50, int(args.wf_train_candles))
     test_size = max(20, int(args.wf_test_candles))
+    purge_size = max(0, int(getattr(args, "wf_purge_candles", 4) or 0))
     min_trades = max(1, int(args.wf_min_trades))
+    concentration_warning_threshold = max(
+        0.0,
+        min(1.0, float(getattr(args, "wf_selection_warning_threshold", 0.60) or 0.60)),
+    )
     windows = []
     start = 0
-    while start + train_size + test_size <= len(rows):
-        train_rows = rows[start:start + train_size]
-        test_rows = rows[start + train_size:start + train_size + test_size]
+    while start + train_size + purge_size + test_size <= len(rows):
+        train_end = start + train_size
+        test_start = train_end + purge_size
+        test_end = test_start + test_size
+        train_rows = rows[start:train_end]
+        test_rows = rows[test_start:test_end]
         train_results = {}
         candidates = []
         for name, params in variants.items():
@@ -1019,27 +1027,78 @@ def walk_forward_report(rows, variants, args):
             selected_params = variants[selected_name]
             test_result = _simulate_variant(test_rows, selected_params, args)
             test_result.pop("trades_detail", None)
+            train_selected_result = train_results[selected_name]
+            train_expectancy = train_selected_result.get(
+                "average_R", train_selected_result.get("expectancy_r", 0.0)
+            ) or 0.0
+            test_expectancy = test_result.get(
+                "average_R", test_result.get("expectancy_r", 0.0)
+            ) or 0.0
+            expectancy_retention = (
+                test_expectancy / train_expectancy if train_expectancy > 0 else None
+            )
+            generalization_gap_r = train_expectancy - test_expectancy
         else:
             selected_name = None
             test_result = {"trades": 0, "net_pnl": 0.0, "reason": "no_train_candidate"}
+            expectancy_retention = None
+            generalization_gap_r = None
         windows.append({
             "start": start,
-            "train_end": start + train_size - 1,
-            "test_end": start + train_size + test_size - 1,
+            "train_end": train_end - 1,
+            "purge_start": train_end,
+            "purge_end": test_start - 1 if purge_size else None,
+            "test_start": test_start,
+            "test_end": test_end - 1,
             "selected": selected_name,
             "train_results": train_results,
             "test_result": test_result,
+            "expectancy_retention": expectancy_retention,
+            "generalization_gap_r": generalization_gap_r,
         })
         start += test_size
+    selected_names = [window["selected"] for window in windows if window.get("selected")]
+    selection_counts = {
+        name: selected_names.count(name)
+        for name in sorted(set(selected_names))
+    }
+    selection_concentration = (
+        max(selection_counts.values()) / len(selected_names)
+        if selected_names
+        else 0.0
+    )
+    retention_values = [
+        float(window["expectancy_retention"])
+        for window in windows
+        if window.get("expectancy_retention") is not None
+    ]
+    gap_values = [
+        float(window["generalization_gap_r"])
+        for window in windows
+        if window.get("generalization_gap_r") is not None
+    ]
     return {
         "windows": windows,
         "window_count": len(windows),
+        "purge_candles": purge_size,
         "out_of_sample_net_pnl": sum(w.get("test_result", {}).get("net_pnl", 0.0) for w in windows),
         "out_of_sample_trades": sum(w.get("test_result", {}).get("trades", 0) for w in windows),
         "oos_pass_rate": (
             sum(1 for w in windows if (w.get("test_result", {}).get("average_R") or 0.0) > 0 and (w.get("test_result", {}).get("profit_factor") or 0.0) >= 1.05)
             / len(windows)
             if windows else 0.0
+        ),
+        "selection_counts": selection_counts,
+        "selection_concentration": selection_concentration,
+        "selection_concentration_warning": (
+            bool(selected_names)
+            and selection_concentration > concentration_warning_threshold
+        ),
+        "mean_expectancy_retention": (
+            sum(retention_values) / len(retention_values) if retention_values else None
+        ),
+        "mean_generalization_gap_r": (
+            sum(gap_values) / len(gap_values) if gap_values else None
         ),
     }
 
@@ -1230,7 +1289,19 @@ def main():
     parser.add_argument("--test-months", type=int, default=None)
     parser.add_argument("--wf-train-candles", type=int, default=600)
     parser.add_argument("--wf-test-candles", type=int, default=200)
+    parser.add_argument(
+        "--wf-purge-candles",
+        type=int,
+        default=4,
+        help="candles excluded between each train and OOS test window",
+    )
     parser.add_argument("--wf-min-trades", type=int, default=5)
+    parser.add_argument(
+        "--wf-selection-warning-threshold",
+        type=float,
+        default=0.60,
+        help="warn when one variant dominates more than this share of walk-forward windows",
+    )
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args()
     if args.strategy in {"BI_DIRECTIONAL_ALPHA", "TREND_AND_REVERSAL_COMBO", "LIQUIDITY_SWEEP_ENGINE", "AGGRESSIVE_BUT_CAPPED_ALPHA"}:
@@ -1304,9 +1375,11 @@ def main():
             if name == "walk_forward":
                 print(
                     f"walk_forward: windows={result['window_count']} "
+                    f"purge={result['purge_candles']} "
                     f"OOS_trades={result['out_of_sample_trades']} "
                     f"OOS_net={result['out_of_sample_net_pnl']:.2f} "
-                    f"OOS_pass={result['oos_pass_rate']:.1%}"
+                    f"OOS_pass={result['oos_pass_rate']:.1%} "
+                    f"selection_concentration={result['selection_concentration']:.1%}"
                 )
                 continue
             if name == "exit_policy_comparison":

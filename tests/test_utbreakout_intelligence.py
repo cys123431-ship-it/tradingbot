@@ -1,3 +1,5 @@
+import pytest
+
 from utbreakout.alpha_engine import evaluate_profit_alpha
 from utbreakout.intelligence import (
     build_signal_attribution,
@@ -96,6 +98,35 @@ def test_overfit_governance_blocks_negative_oos_after_enough_samples():
 
     assert decision.allowed is False
     assert any("OOS expectancy" in item for item in decision.blockers)
+
+
+def test_overfit_governance_reduces_warmup_risk_and_requires_positive_realized_edge():
+    warmup = evaluate_overfit_governance(
+        meta_stats={},
+        side="long",
+        engine="TREND_CONTINUATION",
+        entry_type="BREAKOUT",
+        exit_policy="TREND_RUNNER",
+        regime="BULL_TREND",
+    )
+    failed = evaluate_overfit_governance(
+        meta_stats={
+            "long:TREND_CONTINUATION": {
+                "sample_count": 20,
+                "expectancy_r": -0.001,
+            }
+        },
+        side="long",
+        engine="TREND_CONTINUATION",
+        entry_type="BREAKOUT",
+        exit_policy="TREND_RUNNER",
+        regime="BULL_TREND",
+    )
+
+    assert warmup.allowed is True
+    assert warmup.risk_multiplier == pytest.approx(0.70)
+    assert failed.allowed is False
+    assert any("overfit expectancy" in item for item in failed.blockers)
 
 
 def test_overfit_backtest_reports_multiple_testing_failure():

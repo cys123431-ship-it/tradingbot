@@ -50,6 +50,18 @@ def test_performance_groups_by_side_and_builds_walk_forward_splits():
     assert splits[0]["test"]["trade_count"] == 2
 
 
+def test_walk_forward_splits_purge_boundary_observations():
+    trades = [{"pnl_r": idx, "pnl_usdt": idx} for idx in range(12)]
+
+    splits = walk_forward_splits(trades, train_size=4, test_size=2, purge_size=1)
+
+    assert len(splits) == 3
+    assert splits[0]["train_end"] == 4
+    assert splits[0]["test_start"] == 5
+    assert splits[0]["purge_size"] == 1
+    assert splits[0]["test"]["trade_count"] == 2
+
+
 def test_multiple_testing_penalty_increases_with_trials():
     low_trials = apply_multiple_testing_penalty({"expectancy_r": 1.0, "profit_factor": 2.0}, 5)
     many_trials = apply_multiple_testing_penalty({"expectancy_r": 1.0, "profit_factor": 2.0}, 100)

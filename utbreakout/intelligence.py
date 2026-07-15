@@ -88,13 +88,17 @@ def default_intelligence_config() -> dict[str, Any]:
         "signal_attribution_engine_enabled": True,
         "strategy_replay_engine_enabled": True,
         "overfit_governance_enabled": True,
-        "overfit_min_samples": 12,
-        "overfit_warmup_risk_multiplier": 0.92,
-        "overfit_expectancy_block_below": -0.12,
-        "overfit_oos_expectancy_block_below": -0.05,
-        "overfit_min_profit_factor": 0.92,
-        "overfit_max_pbo": 0.65,
-        "overfit_multiple_testing_trials": 24,
+        "overfit_min_samples": 20,
+        "overfit_warmup_risk_multiplier": 0.70,
+        "overfit_expectancy_block_below": 0.0,
+        "overfit_oos_expectancy_block_below": 0.0,
+        "overfit_min_profit_factor": 1.05,
+        "overfit_max_pbo": 0.50,
+        "overfit_multiple_testing_trials": 64,
+        "overfit_walk_forward_train_size": 20,
+        "overfit_walk_forward_test_size": 10,
+        "overfit_walk_forward_purge_size": 1,
+        "overfit_min_oos_windows": 2,
     }
 
 
@@ -489,11 +493,13 @@ def evaluate_overfit_governance(
         reasons.append(f"overfit samples {samples}")
         if expectancy is not None:
             score += _clamp(expectancy * 18.0, -18.0, 18.0)
-            if expectancy < float(cfg.get("overfit_expectancy_block_below", -0.12) or -0.12):
+            expectancy_floor = float(_finite(cfg.get("overfit_expectancy_block_below"), 0.0) or 0.0)
+            if expectancy < expectancy_floor:
                 blockers.append(f"overfit expectancy {expectancy:.3f}R/{samples}")
         if oos_expectancy is not None:
             score += _clamp(oos_expectancy * 16.0, -16.0, 16.0)
-            if oos_expectancy < float(cfg.get("overfit_oos_expectancy_block_below", -0.05) or -0.05):
+            oos_floor = float(_finite(cfg.get("overfit_oos_expectancy_block_below"), 0.0) or 0.0)
+            if oos_expectancy < oos_floor:
                 blockers.append(f"overfit OOS expectancy {oos_expectancy:.3f}R")
         if profit_factor is not None and profit_factor < float(cfg.get("overfit_min_profit_factor", 0.92) or 0.92):
             risk = min(risk, 0.70)
@@ -567,6 +573,7 @@ def run_overfit_backtest(trades=None, config=None, *, number_of_trials=None) -> 
         trades,
         train_size=int(cfg.get("overfit_walk_forward_train_size", 20) or 20),
         test_size=int(cfg.get("overfit_walk_forward_test_size", 10) or 10),
+        purge_size=int(cfg.get("overfit_walk_forward_purge_size", 1) or 0),
     )
     oos_passes = [
         (split.get("test") or {}).get("avg_r", 0.0) > 0
@@ -582,6 +589,9 @@ def run_overfit_backtest(trades=None, config=None, *, number_of_trials=None) -> 
     reasons: list[str] = []
     if len(trades) < int(cfg.get("overfit_min_samples", 12) or 12):
         reasons.append("sample warmup")
+    min_oos_windows = max(1, int(cfg.get("overfit_min_oos_windows", 2) or 2))
+    if len(trades) >= int(cfg.get("overfit_min_samples", 20) or 20) and len(splits) < min_oos_windows:
+        reasons.append(f"insufficient OOS windows {len(splits)}/{min_oos_windows}")
     if oos_passes and pbo > float(cfg.get("overfit_max_pbo", 0.65) or 0.65):
         reasons.append(f"PBO {pbo:.2f}")
     if not sharpe_pass and len(trades) >= int(cfg.get("overfit_min_samples", 12) or 12):

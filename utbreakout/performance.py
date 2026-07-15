@@ -244,21 +244,26 @@ def group_performance(trades=None, key="side"):
     return {name: calculate_performance_metrics(rows) for name, rows in groups.items()}
 
 
-def walk_forward_splits(trades=None, train_size=50, test_size=20):
+def walk_forward_splits(trades=None, train_size=50, test_size=20, purge_size=0):
     trades = list(trades or [])
     train_size = max(1, int(train_size or 1))
     test_size = max(1, int(test_size or 1))
+    purge_size = max(0, int(purge_size or 0))
     splits = []
     start = 0
-    while start + train_size + test_size <= len(trades):
+    while start + train_size + purge_size + test_size <= len(trades):
+        train_end = start + train_size
+        test_start = train_end + purge_size
+        test_end = test_start + test_size
         train = trades[start:start + train_size]
-        test = trades[start + train_size:start + train_size + test_size]
+        test = trades[test_start:test_end]
         splits.append(
             {
                 "train_start": start,
-                "train_end": start + train_size,
-                "test_start": start + train_size,
-                "test_end": start + train_size + test_size,
+                "train_end": train_end,
+                "purge_size": purge_size,
+                "test_start": test_start,
+                "test_end": test_end,
                 "train": calculate_performance_metrics(train),
                 "test": calculate_performance_metrics(test),
             }

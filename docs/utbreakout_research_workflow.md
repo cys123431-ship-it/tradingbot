@@ -20,3 +20,11 @@ Operational checks:
 - If one set is selected in more than 50% of recent AUTO events, review score concentration before changing live settings.
 - If rejection is dominated by one reason, inspect that filter before assuming the market is simply bad.
 - If average planned margin or slippage drifts up, treat it as execution/risk pressure rather than a strategy edge.
+
+## Generalization controls
+
+- Run walk-forward reports with a non-zero purge gap. The default CLI gap is four candles and can be changed with `--wf-purge-candles`.
+- Review `selection_concentration`, `mean_expectancy_retention`, and `mean_generalization_gap_r`; do not promote a variant only because its full-sample score is highest.
+- Keep the final holdout period untouched until the strategy and thresholds are frozen.
+- Live risk starts below full size and increases with finalized strategy-specific R-multiple evidence. The allocator compares an older reference segment with a chronological validation tail and reduces risk when the recent edge is negative, statistically uncertain, or materially degraded.
+- The overfit governance gate requires positive realized expectancy after warmup, a profit factor above costs, and at least two purged OOS windows in research reports.

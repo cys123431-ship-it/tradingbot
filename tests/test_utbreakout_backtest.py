@@ -431,3 +431,47 @@ def test_month_to_candle_conversion_respects_timeframe():
 def test_month_to_candle_conversion_rejects_unknown_timeframe():
     with pytest.raises(ValueError, match="unsupported timeframe"):
         bt.candles_for_months(1, "banana")
+
+
+def test_walk_forward_report_purges_boundaries_and_reports_selection_stability(monkeypatch):
+    observed_test_starts = []
+
+    def fake_simulate(rows, params, args):
+        is_test = len(rows) == 20
+        if is_test:
+            observed_test_starts.append(rows[0])
+        return {
+            "trades": 10,
+            "profit_factor": 1.20 if is_test else params["profit_factor"],
+            "average_R": 0.10 if is_test else params["average_R"],
+            "max_drawdown_pct": 1.0,
+            "net_pnl": 1.0,
+            "trades_detail": [],
+        }
+
+    monkeypatch.setattr(bt, "_simulate_variant", fake_simulate)
+    args = argparse.Namespace(
+        wf_train_candles=50,
+        wf_test_candles=20,
+        wf_purge_candles=5,
+        wf_min_trades=5,
+        wf_selection_warning_threshold=0.60,
+    )
+
+    report = bt.walk_forward_report(
+        list(range(100)),
+        {
+            "stable": {"profit_factor": 1.50, "average_R": 0.40},
+            "weak": {"profit_factor": 1.10, "average_R": 0.10},
+        },
+        args,
+    )
+
+    assert report["window_count"] == 2
+    assert observed_test_starts == [55, 75]
+    assert report["windows"][0]["purge_start"] == 50
+    assert report["windows"][0]["purge_end"] == 54
+    assert report["selection_counts"] == {"stable": 2}
+    assert report["selection_concentration"] == pytest.approx(1.0)
+    assert report["selection_concentration_warning"] is True
+    assert report["mean_generalization_gap_r"] == pytest.approx(0.30)
