@@ -1,0 +1,85 @@
+name: Apply Crowding data diagnostics
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .agent/apply_crowding_data_diagnostics.py
+      - .github/workflows/apply-crowding-data-diagnostics.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-test-commit:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'agent/crowding-data-diagnostics'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/crowding-data-diagnostics
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+
+      - name: Validate and apply patch
+        run: |
+          python -m py_compile .agent/apply_crowding_data_diagnostics.py
+          python .agent/apply_crowding_data_diagnostics.py
+
+      - name: Compile changed runtime
+        run: |
+          python -m py_compile \
+            emas.py \
+            utbreakout/crowding_unwind.py \
+            tests/test_strategy_suite_v3.py \
+            tests/test_qh_flow_integration.py
+
+      - name: Run focused diagnostics tests
+        run: |
+          python -m pytest -q \
+            tests/test_strategy_suite_v3.py \
+            tests/test_qh_flow_integration.py \
+            tests/test_utbreakout_helpers.py
+
+      - name: Run full regression suite
+        run: python -m pytest -q
+
+      - name: Normalize and validate diff
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          for name in (
+              'emas.py',
+              'utbreakout/crowding_unwind.py',
+              'tests/test_strategy_suite_v3.py',
+              'tests/test_qh_flow_integration.py',
+          ):
+              path = Path(name)
+              lines = path.read_text(encoding='utf-8').splitlines()
+              path.write_text('\n'.join(line.rstrip() for line in lines).rstrip() + '\n', encoding='utf-8')
+          PY
+          git diff --check
+
+      - name: Commit validated implementation
+        run: |
+          rm -f .agent/apply_crowding_data_diagnostics.py
+          rm -f .github/workflows/apply-crowding-data-diagnostics.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'fix: distinguish missing Crowding derivatives data'
+          git push origin HEAD:agent/crowding-data-diagnostics
