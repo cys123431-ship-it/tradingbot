@@ -186,6 +186,7 @@ OPPORTUNITY_OVERRIDES = {
     "signal_attribution_engine_enabled": True,
     "strategy_replay_engine_enabled": True,
     "overfit_governance_enabled": True,
+    "overfit_governance_hard_block_enabled": False,
     "overfit_min_samples": 12,
     "overfit_warmup_risk_multiplier": 0.92,
     "overfit_expectancy_block_below": -0.12,

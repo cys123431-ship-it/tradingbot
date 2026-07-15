@@ -993,6 +993,16 @@ def _simulate_variant(rows, params, args):
     )
 
 
+def _walk_forward_candidate_score(result):
+    profit_factor = result.get("profit_factor")
+    average_r = result.get("average_R", result.get("expectancy_r"))
+    max_drawdown_pct = result.get("max_drawdown_pct")
+    profit_factor = float(profit_factor) if profit_factor is not None else 0.0
+    average_r = float(average_r) if average_r is not None else 0.0
+    max_drawdown_pct = float(max_drawdown_pct) if max_drawdown_pct is not None else 0.0
+    return min(profit_factor, 3.0) + average_r - (max_drawdown_pct * 0.03)
+
+
 def walk_forward_report(rows, variants, args):
     train_size = max(50, int(args.wf_train_candles))
     test_size = max(20, int(args.wf_test_candles))
@@ -1002,6 +1012,8 @@ def walk_forward_report(rows, variants, args):
         0.0,
         min(1.0, float(getattr(args, "wf_selection_warning_threshold", 0.60) or 0.60)),
     )
+    robust_selection = bool(getattr(args, "wf_robust_selection", True))
+    half_min_trades = max(1, (min_trades + 1) // 2)
     windows = []
     start = 0
     while start + train_size + purge_size + test_size <= len(rows):
@@ -1011,6 +1023,7 @@ def walk_forward_report(rows, variants, args):
         train_rows = rows[start:train_end]
         test_rows = rows[test_start:test_end]
         train_results = {}
+        train_stability_results = {}
         candidates = []
         for name, params in variants.items():
             result = _simulate_variant(train_rows, params, args)
@@ -1018,12 +1031,30 @@ def walk_forward_report(rows, variants, args):
             train_results[name] = result
             if result["trades"] < min_trades:
                 continue
-            pf = result["profit_factor"] if result["profit_factor"] is not None else 0.0
-            avg_r = result["average_R"] if result["average_R"] is not None else 0.0
-            score = pf + avg_r - (result["max_drawdown_pct"] * 0.03)
+            score = _walk_forward_candidate_score(result)
+            if robust_selection:
+                midpoint = len(train_rows) // 2
+                first_half = _simulate_variant(train_rows[:midpoint], params, args)
+                second_half = _simulate_variant(train_rows[midpoint:], params, args)
+                first_half.pop("trades_detail", None)
+                second_half.pop("trades_detail", None)
+                train_stability_results[name] = {
+                    "first_half": first_half,
+                    "second_half": second_half,
+                }
+                if (
+                    first_half.get("trades", 0) < half_min_trades
+                    or second_half.get("trades", 0) < half_min_trades
+                ):
+                    continue
+                score = min(
+                    score,
+                    _walk_forward_candidate_score(first_half),
+                    _walk_forward_candidate_score(second_half),
+                )
             candidates.append((score, name))
         if candidates:
-            _, selected_name = max(candidates, key=lambda item: item[0])
+            selection_score, selected_name = max(candidates, key=lambda item: item[0])
             selected_params = variants[selected_name]
             test_result = _simulate_variant(test_rows, selected_params, args)
             test_result.pop("trades_detail", None)
@@ -1040,6 +1071,7 @@ def walk_forward_report(rows, variants, args):
             generalization_gap_r = train_expectancy - test_expectancy
         else:
             selected_name = None
+            selection_score = None
             test_result = {"trades": 0, "net_pnl": 0.0, "reason": "no_train_candidate"}
             expectancy_retention = None
             generalization_gap_r = None
@@ -1051,7 +1083,9 @@ def walk_forward_report(rows, variants, args):
             "test_start": test_start,
             "test_end": test_end - 1,
             "selected": selected_name,
+            "selection_score": selection_score,
             "train_results": train_results,
+            "train_stability_results": train_stability_results,
             "test_result": test_result,
             "expectancy_retention": expectancy_retention,
             "generalization_gap_r": generalization_gap_r,
@@ -1081,6 +1115,7 @@ def walk_forward_report(rows, variants, args):
         "windows": windows,
         "window_count": len(windows),
         "purge_candles": purge_size,
+        "robust_selection_enabled": robust_selection,
         "out_of_sample_net_pnl": sum(w.get("test_result", {}).get("net_pnl", 0.0) for w in windows),
         "out_of_sample_trades": sum(w.get("test_result", {}).get("trades", 0) for w in windows),
         "oos_pass_rate": (
@@ -1296,6 +1331,13 @@ def main():
         help="candles excluded between each train and OOS test window",
     )
     parser.add_argument("--wf-min-trades", type=int, default=5)
+    parser.add_argument(
+        "--no-wf-robust-selection",
+        action="store_false",
+        dest="wf_robust_selection",
+        default=True,
+        help="select on the full train score only instead of worst-half temporal stability",
+    )
     parser.add_argument(
         "--wf-selection-warning-threshold",
         type=float,

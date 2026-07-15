@@ -932,7 +932,6 @@ def evaluate_profit_alpha(
     score += (market_regime_decision.score - 55.0) * 0.04
     score += (data_quality_decision.score - 80.0) * 0.02
     score += (execution_quality_decision.score - 80.0) * 0.02
-    score += (overfit_decision.score - 72.0) * 0.03
     score = _clamp(score, 0.0, 100.0)
 
     blockers: list[str] = []
@@ -1065,11 +1064,9 @@ def evaluate_profit_alpha(
     meta_samples = int(_finite(meta.get("sample_count", meta.get("trades", 0)), 0) or 0) if isinstance(meta, Mapping) else 0
     meta_expectancy = _finite(meta.get("expectancy_r", meta.get("avg_pnl_r")), None) if isinstance(meta, Mapping) else None
     if meta_samples >= int(cfg.get("profit_alpha_meta_min_samples", 8) or 8) and meta_expectancy is not None:
-        if meta_expectancy < float(cfg.get("profit_alpha_meta_expectancy_block_below", -0.12) or -0.12):
-            blockers.append(f"meta expectancy {meta_expectancy:.3f}R after {meta_samples} samples")
-        else:
-            score += _clamp(meta_expectancy * 10.0, -6.0, 6.0)
-            reasons.append(f"meta expectancy {meta_expectancy:.3f}R/{meta_samples}")
+        reasons.append(
+            f"meta performance advisory {meta_expectancy:.3f}R/{meta_samples}; sizing only"
+        )
     elif meta_samples > 0:
         reasons.append(f"meta warmup {meta_samples} samples")
 
@@ -1077,13 +1074,9 @@ def evaluate_profit_alpha(
     exit_meta_samples = int(_finite(exit_meta.get("sample_count", exit_meta.get("trades", 0)), 0) or 0) if isinstance(exit_meta, Mapping) else 0
     exit_meta_expectancy = _finite(exit_meta.get("expectancy_r", exit_meta.get("avg_pnl_r")), None) if isinstance(exit_meta, Mapping) else None
     if exit_meta_samples >= int(cfg.get("exit_meta_min_samples", 8) or 8) and exit_meta_expectancy is not None:
-        if exit_meta_expectancy < float(cfg.get("exit_meta_expectancy_block_below", -0.16) or -0.16):
-            blockers.append(
-                f"exit meta {exit_policy} {exit_meta_expectancy:.3f}R after {exit_meta_samples} samples"
-            )
-        else:
-            score += _clamp(exit_meta_expectancy * 8.0, -5.0, 5.0)
-            reasons.append(f"exit meta {exit_policy} {exit_meta_expectancy:.3f}R/{exit_meta_samples}")
+        reasons.append(
+            f"exit meta advisory {exit_policy} {exit_meta_expectancy:.3f}R/{exit_meta_samples}; sizing only"
+        )
     elif exit_meta_samples > 0:
         reasons.append(f"exit meta warmup {exit_policy} {exit_meta_samples}")
 
@@ -1091,12 +1084,6 @@ def evaluate_profit_alpha(
     probability += (ev_probability - 0.50) * 0.45
     if net_r is not None:
         probability += _clamp(net_r, -0.20, 0.80) * 0.035
-    if meta_expectancy is not None and meta_samples >= int(cfg.get("profit_alpha_meta_min_samples", 8) or 8):
-        probability += _clamp(meta_expectancy, -0.40, 0.60) * float(
-            cfg.get("profit_alpha_meta_probability_weight", 0.20) or 0.20
-        )
-    if exit_meta_expectancy is not None and exit_meta_samples >= int(cfg.get("exit_meta_min_samples", 8) or 8):
-        probability += _clamp(exit_meta_expectancy, -0.40, 0.60) * 0.12
     probability = _clamp(probability, 0.40, 0.70)
 
     score_gap = float(min_score) - float(score)
@@ -1137,8 +1124,6 @@ def evaluate_profit_alpha(
     if meta_expectancy is not None and meta_samples >= int(cfg.get("profit_alpha_meta_min_samples", 8) or 8):
         if meta_expectancy < 0:
             risk_multiplier = min(risk_multiplier, 0.70)
-        elif meta_expectancy > 0.18:
-            risk_multiplier = min(1.0, risk_multiplier * 1.08)
     if exit_meta_expectancy is not None and exit_meta_samples >= int(cfg.get("exit_meta_min_samples", 8) or 8):
         if exit_meta_expectancy < float(cfg.get("exit_meta_expectancy_reduce_below", 0.0) or 0.0):
             risk_multiplier = min(risk_multiplier, 0.78)

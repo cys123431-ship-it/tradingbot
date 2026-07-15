@@ -24,7 +24,9 @@ Operational checks:
 ## Generalization controls
 
 - Run walk-forward reports with a non-zero purge gap. The default CLI gap is four candles and can be changed with `--wf-purge-candles`.
+- Walk-forward selection uses the worst score across the full training window and its chronological first/second halves. This favors time stability over a single full-sample peak; `--no-wf-robust-selection` exists only for baseline comparisons.
 - Review `selection_concentration`, `mean_expectancy_retention`, and `mean_generalization_gap_r`; do not promote a variant only because its full-sample score is highest.
 - Keep the final holdout period untouched until the strategy and thresholds are frozen.
-- Live risk starts below full size and increases with finalized strategy-specific R-multiple evidence. The allocator compares an older reference segment with a chronological validation tail and reduces risk when the recent edge is negative, statistically uncertain, or materially degraded.
-- The overfit governance gate requires positive realized expectancy after warmup, a profit factor above costs, and at least two purged OOS windows in research reports.
+- Live entry uses the integrated Entry Edge decision once; downstream quality checks do not reapply the same score or probability thresholds.
+- Recent realized expectancy is diagnostic and position-sizing input by default. It can reduce risk, but it does not raise the alpha score, increase risk after a lucky streak, or block an otherwise valid entry.
+- Strict expectancy, profit-factor, multiple-testing, and purged OOS requirements remain in research reports. Live hard blocking is an explicit opt-in, not the default.

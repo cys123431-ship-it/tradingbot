@@ -282,7 +282,7 @@ def test_profit_alpha_blocks_derivatives_adverse_stack():
     assert any("derivatives adverse stack" in item for item in decision.blockers)
 
 
-def test_profit_alpha_meta_filter_blocks_negative_realized_engine():
+def test_profit_alpha_meta_performance_only_reduces_position_size():
     decision = evaluate_profit_alpha(
         side="long",
         values=_base_values("long"),
@@ -295,8 +295,9 @@ def test_profit_alpha_meta_filter_blocks_negative_realized_engine():
         },
     )
 
-    assert decision.allowed is False
-    assert any("meta expectancy" in item for item in decision.blockers)
+    assert decision.allowed is True
+    assert decision.risk_multiplier <= 0.70
+    assert any("meta performance advisory" in item for item in decision.reasons)
 
 
 def test_profit_alpha_exit_overrides_expand_strong_trend_runner():
@@ -363,7 +364,7 @@ def test_profit_alpha_sweep_exit_profile_requires_close_tp_approach():
     assert cfg["soft_stop_confirm_bars"] == 1
 
 
-def test_profit_alpha_exit_meta_blocks_losing_exit_policy():
+def test_profit_alpha_exit_meta_only_reduces_position_size():
     values = _base_values("short")
 
     decision = evaluate_profit_alpha(
@@ -378,8 +379,9 @@ def test_profit_alpha_exit_meta_blocks_losing_exit_policy():
         },
     )
 
-    assert decision.allowed is False
-    assert any("exit meta" in item for item in decision.blockers)
+    assert decision.allowed is True
+    assert decision.risk_multiplier <= 0.78
+    assert any("exit meta advisory" in item for item in decision.reasons)
 
 
 def test_entry_edge_combines_ev_and_profit_alpha_into_single_decision():

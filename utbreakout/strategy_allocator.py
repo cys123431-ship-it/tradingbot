@@ -1,14 +1,14 @@
 """Adaptive strategy risk allocator based on finalized live-trade outcomes.
 
 The allocator only scales risk; it never changes direction, entry, stop or take
-profit.  Risk ramps up with evidence, and a chronological validation tail
-detects live degradation without adding another fitted entry rule.
+profit. Small samples remain at neutral risk, while sufficiently poor recent
+results reduce allocation without silently disabling a strategy.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from math import ceil, isfinite, sqrt
+from math import isfinite
 from typing import Any, Iterable, Mapping
 
 
@@ -18,7 +18,6 @@ def default_strategy_allocator_config() -> dict[str, Any]:
         "lookback_trades": 30,
         "minimum_samples": 8,
         "full_confidence_samples": 20,
-        "warmup_risk_multiplier": 0.50,
         "risk_floor": 0.30,
         "risk_cap": 1.00,
         "negative_expectancy_multiplier": 0.60,
@@ -31,13 +30,6 @@ def default_strategy_allocator_config() -> dict[str, Any]:
         "mfe_capture_min": 0.35,
         "good_expectancy_r": 0.12,
         "good_profit_factor": 1.20,
-        "validation_fraction": 0.35,
-        "validation_min_samples": 6,
-        "validation_negative_multiplier": 0.55,
-        "generalization_gap_r": 0.25,
-        "generalization_gap_multiplier": 0.75,
-        "uncertainty_z_score": 1.0,
-        "uncertain_edge_multiplier": 0.80,
     }
 
 
@@ -47,23 +39,6 @@ def _finite(value: Any, default: float | None = None) -> float | None:
     except (TypeError, ValueError):
         return default
     return parsed if isfinite(parsed) else default
-
-
-def _mean(values: list[float]) -> float:
-    return sum(values) / len(values) if values else 0.0
-
-
-def _sample_std(values: list[float]) -> float:
-    if len(values) < 2:
-        return 0.0
-    mean = _mean(values)
-    return sqrt(sum((value - mean) ** 2 for value in values) / (len(values) - 1))
-
-
-def _r_profit_factor(values: list[float]) -> float:
-    wins = sum(value for value in values if value > 0)
-    losses = abs(sum(value for value in values if value < 0))
-    return wins / losses if losses > 0 else (999.0 if wins > 0 else 0.0)
 
 
 def _payload(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -153,25 +128,6 @@ def summarize_strategy_trades(
         if mfe is not None and mfe > 0:
             captures.append(max(-1.0, min(1.5, r_value / mfe)))
     capture = sum(captures) / len(captures) if captures else None
-    validation_fraction = max(0.10, min(0.50, float(cfg["validation_fraction"])))
-    validation_min = max(2, int(cfg["validation_min_samples"]))
-    prior_values: list[float] = []
-    validation_values: list[float] = []
-    if len(values) >= validation_min * 2:
-        validation_size = max(validation_min, int(ceil(len(values) * validation_fraction)))
-        validation_size = min(validation_size, len(values) - validation_min)
-        prior_values = values[:-validation_size]
-        validation_values = values[-validation_size:]
-    prior_expectancy = _mean(prior_values) if prior_values else None
-    validation_expectancy = _mean(validation_values) if validation_values else None
-    validation_std = _sample_std(validation_values) if validation_values else None
-    validation_lcb = None
-    if validation_values:
-        validation_lcb = validation_expectancy - (
-            float(cfg["uncertainty_z_score"])
-            * float(validation_std or 0.0)
-            / sqrt(len(validation_values))
-        )
     return {
         "strategy": wanted,
         "trade_count": len(rows),
@@ -183,17 +139,6 @@ def summarize_strategy_trades(
         "current_consecutive_losses": loss_streak,
         "mfe_capture_ratio": capture,
         "net_pnl": sum(pnl_values),
-        "prior_samples": len(prior_values),
-        "validation_samples": len(validation_values),
-        "prior_expectancy_r": prior_expectancy,
-        "validation_expectancy_r": validation_expectancy,
-        "validation_profit_factor": _r_profit_factor(validation_values) if validation_values else None,
-        "validation_expectancy_lcb_r": validation_lcb,
-        "generalization_gap_r": (
-            prior_expectancy - validation_expectancy
-            if prior_expectancy is not None and validation_expectancy is not None
-            else None
-        ),
     }
 
 
@@ -212,25 +157,12 @@ def evaluate_strategy_allocation(
     cfg = {**default_strategy_allocator_config(), **dict(config or {})}
     values = dict(metrics or {})
     strategy = str(values.get("strategy") or "unknown")
-    samples = int(values.get("r_samples", values.get("trade_count")) or 0)
+    samples = int(values.get("trade_count") or 0)
     minimum = max(1, int(cfg["minimum_samples"]))
     if not cfg.get("enabled", True):
         return StrategyAllocation(strategy, 1.0, "allocator_disabled", values)
-    risk_floor = float(cfg["risk_floor"])
-    risk_cap = float(cfg["risk_cap"])
-    warmup_risk = max(risk_floor, min(risk_cap, float(cfg["warmup_risk_multiplier"])))
-    full_samples = max(minimum, int(cfg["full_confidence_samples"]))
-    sample_confidence = min(1.0, max(0.0, samples / max(full_samples, 1)))
-    sample_risk_cap = warmup_risk + (risk_cap - warmup_risk) * sample_confidence
-    values["confidence"] = sample_confidence
-    values["sample_risk_cap"] = sample_risk_cap
     if samples < minimum:
-        return StrategyAllocation(
-            strategy,
-            sample_risk_cap,
-            f"evidence_warmup:{samples}/{minimum}",
-            values,
-        )
+        return StrategyAllocation(strategy, 1.0, f"insufficient_samples:{samples}/{minimum}", values)
 
     multiplier = 1.0
     reasons: list[str] = []
@@ -239,9 +171,6 @@ def evaluate_strategy_allocation(
     loss_streak = int(values.get("current_consecutive_losses") or 0)
     drawdown = float(_finite(values.get("max_drawdown_r"), 0.0) or 0.0)
     capture = _finite(values.get("mfe_capture_ratio"))
-    validation_expectancy = _finite(values.get("validation_expectancy_r"))
-    validation_lcb = _finite(values.get("validation_expectancy_lcb_r"))
-    generalization_gap = _finite(values.get("generalization_gap_r"))
     if expectancy < 0:
         multiplier *= float(cfg["negative_expectancy_multiplier"])
         reasons.append("negative_expectancy")
@@ -262,22 +191,11 @@ def evaluate_strategy_allocation(
         multiplier *= float(cfg["poor_capture_multiplier"])
         reasons.append("poor_mfe_capture")
 
-    if validation_expectancy is not None and validation_expectancy < 0:
-        multiplier *= float(cfg["validation_negative_multiplier"])
-        reasons.append("negative_validation_expectancy")
-    if validation_lcb is not None and validation_lcb < 0:
-        multiplier *= float(cfg["uncertain_edge_multiplier"])
-        reasons.append("validation_edge_uncertain")
-    if (
-        generalization_gap is not None
-        and generalization_gap > float(cfg["generalization_gap_r"])
-    ):
-        multiplier *= float(cfg["generalization_gap_multiplier"])
-        reasons.append("generalization_gap")
-
-    performance_target = min(sample_risk_cap, multiplier)
-    multiplier = sample_risk_cap - (sample_risk_cap - performance_target) * sample_confidence
-    multiplier = max(risk_floor, min(risk_cap, multiplier))
+    full_samples = max(minimum, int(cfg["full_confidence_samples"]))
+    confidence = min(1.0, max(0.0, (samples - minimum + 1) / max(full_samples - minimum + 1, 1)))
+    multiplier = 1.0 - (1.0 - multiplier) * confidence
+    multiplier = max(float(cfg["risk_floor"]), min(float(cfg["risk_cap"]), multiplier))
+    values["confidence"] = confidence
     return StrategyAllocation(
         strategy=strategy,
         multiplier=multiplier,

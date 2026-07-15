@@ -79,7 +79,7 @@ def test_protection_health_execution_gate_requires_sl_and_tp_when_enabled():
     assert any("take-profit" in item for item in decision.blockers)
 
 
-def test_overfit_governance_blocks_negative_oos_after_enough_samples():
+def test_overfit_governance_can_hard_block_when_explicitly_enabled():
     decision = evaluate_overfit_governance(
         meta_stats={
             "short:STRONG_DOWNTREND_SHORT:BREAKOUT:TREND_RUNNER:BEAR_TREND": {
@@ -94,13 +94,14 @@ def test_overfit_governance_blocks_negative_oos_after_enough_samples():
         entry_type="BREAKOUT",
         exit_policy="TREND_RUNNER",
         regime="BEAR_TREND",
+        config={"overfit_governance_hard_block_enabled": True},
     )
 
     assert decision.allowed is False
     assert any("OOS expectancy" in item for item in decision.blockers)
 
 
-def test_overfit_governance_reduces_warmup_risk_and_requires_positive_realized_edge():
+def test_overfit_governance_is_advisory_and_risk_only_by_default():
     warmup = evaluate_overfit_governance(
         meta_stats={},
         side="long",
@@ -109,11 +110,11 @@ def test_overfit_governance_reduces_warmup_risk_and_requires_positive_realized_e
         exit_policy="TREND_RUNNER",
         regime="BULL_TREND",
     )
-    failed = evaluate_overfit_governance(
+    advisory = evaluate_overfit_governance(
         meta_stats={
             "long:TREND_CONTINUATION": {
                 "sample_count": 20,
-                "expectancy_r": -0.001,
+                "expectancy_r": -0.20,
             }
         },
         side="long",
@@ -124,9 +125,12 @@ def test_overfit_governance_reduces_warmup_risk_and_requires_positive_realized_e
     )
 
     assert warmup.allowed is True
-    assert warmup.risk_multiplier == pytest.approx(0.70)
-    assert failed.allowed is False
-    assert any("overfit expectancy" in item for item in failed.blockers)
+    assert warmup.risk_multiplier == pytest.approx(0.92)
+    assert advisory.allowed is True
+    assert advisory.risk_multiplier == pytest.approx(0.70)
+    assert advisory.blockers == ()
+    assert advisory.components["violation_count"] == pytest.approx(1.0)
+    assert any("overfit advisory: overfit expectancy" in item for item in advisory.reasons)
 
 
 def test_overfit_backtest_reports_multiple_testing_failure():

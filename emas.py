@@ -1189,13 +1189,14 @@ def apply_profit_opportunity_effective_overrides(cfg):
         "signal_attribution_engine_enabled": True,
         "strategy_replay_engine_enabled": True,
         "overfit_governance_enabled": True,
-        "overfit_min_samples": 20,
-        "overfit_warmup_risk_multiplier": 0.70,
-        "overfit_expectancy_block_below": 0.0,
-        "overfit_oos_expectancy_block_below": 0.0,
-        "overfit_min_profit_factor": 1.05,
-        "overfit_max_pbo": 0.50,
-        "overfit_multiple_testing_trials": 64,
+        "overfit_governance_hard_block_enabled": False,
+        "overfit_min_samples": 12,
+        "overfit_warmup_risk_multiplier": 0.92,
+        "overfit_expectancy_block_below": -0.12,
+        "overfit_oos_expectancy_block_below": -0.05,
+        "overfit_min_profit_factor": 0.92,
+        "overfit_max_pbo": 0.65,
+        "overfit_multiple_testing_trials": 24,
         "overfit_walk_forward_train_size": 20,
         "overfit_walk_forward_test_size": 10,
         "overfit_walk_forward_purge_size": 1,
@@ -1754,13 +1755,14 @@ def apply_stable_utbreak_final_overrides(cfg):
         "signal_attribution_engine_enabled": True,
         "strategy_replay_engine_enabled": True,
         "overfit_governance_enabled": True,
-        "overfit_min_samples": 20,
-        "overfit_warmup_risk_multiplier": 0.70,
-        "overfit_expectancy_block_below": 0.0,
-        "overfit_oos_expectancy_block_below": 0.0,
-        "overfit_min_profit_factor": 1.05,
-        "overfit_max_pbo": 0.50,
-        "overfit_multiple_testing_trials": 64,
+        "overfit_governance_hard_block_enabled": False,
+        "overfit_min_samples": 12,
+        "overfit_warmup_risk_multiplier": 0.92,
+        "overfit_expectancy_block_below": -0.12,
+        "overfit_oos_expectancy_block_below": -0.05,
+        "overfit_min_profit_factor": 0.92,
+        "overfit_max_pbo": 0.65,
+        "overfit_multiple_testing_trials": 24,
         "overfit_walk_forward_train_size": 20,
         "overfit_walk_forward_test_size": 10,
         "overfit_walk_forward_purge_size": 1,
@@ -2242,6 +2244,7 @@ def build_utbreakout_effective_config_diff_text(raw_cfg, effective_cfg):
         'signal_attribution_engine_enabled',
         'strategy_replay_engine_enabled',
         'overfit_governance_enabled',
+        'overfit_governance_hard_block_enabled',
         'overfit_min_samples',
         'overfit_max_pbo',
         'atr_trailing_activation_r',
@@ -11289,20 +11292,6 @@ class SignalEngine(BaseEngine):
                 blockers.append(
                     f"Entry Edge {edge_engine} not allowed"
                     + (f": {blocker_text}" if blocker_text else "")
-                )
-            min_edge_score = _cfg_float(
-                'entry_quality_gate_min_entry_edge_score',
-                _cfg_float('entry_edge_min_score', 68.0),
-            )
-            if edge_score + 1e-12 < min_edge_score:
-                blockers.append(f"Entry Edge score {edge_score:.1f}<{min_edge_score:.1f}")
-            min_edge_probability = _cfg_float(
-                'entry_quality_gate_min_entry_edge_probability',
-                _cfg_float('entry_edge_min_probability', 0.555),
-            )
-            if edge_probability + 1e-12 < min_edge_probability:
-                blockers.append(
-                    f"Entry Edge p {edge_probability:.3f}<{min_edge_probability:.3f}"
                 )
             edge_parts.extend([
                 f"{edge_engine} score {edge_score:.1f}",

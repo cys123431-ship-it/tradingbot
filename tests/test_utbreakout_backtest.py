@@ -475,3 +475,52 @@ def test_walk_forward_report_purges_boundaries_and_reports_selection_stability(m
     assert report["selection_concentration"] == pytest.approx(1.0)
     assert report["selection_concentration_warning"] is True
     assert report["mean_generalization_gap_r"] == pytest.approx(0.30)
+
+
+def test_walk_forward_selection_prefers_temporal_stability_over_full_train_peak(monkeypatch):
+    def fake_simulate(rows, params, args):
+        if len(rows) == 50:
+            profit_factor = 2.20 if params["profile"] == "spiky" else 1.55
+            average_r = 0.65 if params["profile"] == "spiky" else 0.32
+        elif len(rows) == 25 and params["profile"] == "spiky":
+            is_early_half = rows[0] < 25
+            profit_factor = 3.00 if is_early_half else 0.65
+            average_r = 1.10 if is_early_half else -0.35
+        elif len(rows) == 25:
+            profit_factor = 1.50
+            average_r = 0.30
+        else:
+            profit_factor = 1.20
+            average_r = 0.10
+        return {
+            "trades": 10,
+            "profit_factor": profit_factor,
+            "average_R": average_r,
+            "max_drawdown_pct": 1.0,
+            "net_pnl": 1.0,
+            "trades_detail": [],
+        }
+
+    monkeypatch.setattr(bt, "_simulate_variant", fake_simulate)
+    args = argparse.Namespace(
+        wf_train_candles=50,
+        wf_test_candles=20,
+        wf_purge_candles=5,
+        wf_min_trades=5,
+        wf_selection_warning_threshold=0.60,
+        wf_robust_selection=True,
+    )
+
+    report = bt.walk_forward_report(
+        list(range(75)),
+        {
+            "spiky": {"profile": "spiky"},
+            "stable": {"profile": "stable"},
+        },
+        args,
+    )
+
+    assert report["robust_selection_enabled"] is True
+    assert report["windows"][0]["selected"] == "stable"
+    assert report["windows"][0]["train_results"]["spiky"]["average_R"] == pytest.approx(0.65)
+    assert report["windows"][0]["train_stability_results"]["spiky"]["second_half"]["average_R"] == pytest.approx(-0.35)

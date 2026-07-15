@@ -141,14 +141,12 @@ def test_funding_oi_crowding_unwind_short_and_long():
     assert long.side == "long"
 
 
-def test_strategy_allocator_caps_risk_during_warmup_and_reduces_bad_strategy():
+def test_strategy_allocator_is_neutral_for_small_sample_and_reduces_bad_strategy():
     small = summarize_strategy_trades(
         [{"strategy": "qh_flow_v1", "net_r": -1.0, "net_pnl": -1.0}],
         "qh_flow_v1",
     )
-    warmup = evaluate_strategy_allocation(small)
-    assert 0.50 <= warmup.multiplier < 1.0
-    assert warmup.reason == "evidence_warmup:1/8"
+    assert evaluate_strategy_allocation(small).multiplier == pytest.approx(1.0)
 
     rows = []
     for idx in range(20):
@@ -164,40 +162,6 @@ def test_strategy_allocator_caps_risk_during_warmup_and_reduces_bad_strategy():
     scaled = scale_plan_risk({"qty": 10, "risk_usdt": 5, "entry_price": 100}, allocation.multiplier)
     assert scaled["qty"] < 10
     assert scaled["entry_price"] == 100
-
-
-def test_strategy_allocator_detects_chronological_generalization_failure():
-    rows = [
-        {"strategy": "quad_alpha_v1", "net_r": 0.4, "net_pnl": 0.4}
-        for _ in range(10)
-    ] + [
-        {"strategy": "quad_alpha_v1", "net_r": -0.3, "net_pnl": -0.3}
-        for _ in range(10)
-    ]
-
-    metrics = summarize_strategy_trades(rows, "quad_alpha_v1")
-    allocation = evaluate_strategy_allocation(metrics)
-
-    assert metrics["prior_expectancy_r"] > 0
-    assert metrics["validation_expectancy_r"] < 0
-    assert metrics["generalization_gap_r"] > 0.25
-    assert allocation.multiplier < 0.50
-    assert "negative_validation_expectancy" in allocation.reason
-    assert "generalization_gap" in allocation.reason
-
-
-def test_strategy_allocator_restores_full_risk_only_with_stable_evidence():
-    rows = [
-        {"strategy": "dual_alpha_v1", "net_r": 0.2, "net_pnl": 0.2}
-        for _ in range(20)
-    ]
-
-    metrics = summarize_strategy_trades(rows, "dual_alpha_v1")
-    allocation = evaluate_strategy_allocation(metrics)
-
-    assert metrics["validation_expectancy_lcb_r"] > 0
-    assert metrics["generalization_gap_r"] == pytest.approx(0.0)
-    assert allocation.multiplier == pytest.approx(1.0)
 
 from utbreakout.rspt_v3 import residual_strength_percentiles
 

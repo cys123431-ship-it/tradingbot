@@ -305,7 +305,6 @@ def test_utbreakout_entry_reaches_market_order_and_reports_exchange_failure(
     engine._get_utbot_filtered_breakout_config = lambda strategy_params=None: {
         "entry_timeframe": "15m",
         "htf_timeframe": "1h",
-        "strategy_allocator_enabled": False,
     }
     engine._record_utbreakout_diagnostic_event = (
         lambda symbol, status, event=None, extra=None: diagnostics.append(

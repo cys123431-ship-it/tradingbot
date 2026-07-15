@@ -178,6 +178,25 @@ def test_entry_quality_gate_uses_entry_edge_as_single_integrated_gate():
     assert "Profit Alpha" not in detail
 
 
+def test_entry_quality_gate_does_not_reapply_integrated_edge_thresholds():
+    state, detail = _engine()._evaluate_utbreakout_entry_quality_gate(
+        "long",
+        _cfg(),
+        final_risk_multiplier=0.60,
+        market_quality={"state": True, "risk_multiplier": 1.0},
+        entry_edge_decision=_entry_edge_decision(
+            allowed=True,
+            score=67.0,
+            probability=0.552,
+            risk_multiplier=0.60,
+        ),
+    )
+
+    assert state == "reduced"
+    assert "Entry Edge TREND_CONTINUATION score 67.0" in detail
+    assert "BLOCK" not in detail
+
+
 def test_entry_quality_gate_blocks_entry_edge_rejection():
     state, detail = _engine()._evaluate_utbreakout_entry_quality_gate(
         "short",
