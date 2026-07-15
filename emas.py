@@ -10504,18 +10504,22 @@ class SignalEngine(BaseEngine):
                 'REJECTED_INVALID_MARKET_SYMBOL: ' + reason,
             )
 
-        try:
-            self._utbreakout_trace_event(
-                canonical,
-                'MARKET_VALIDATED',
-                'OK',
-                source=source,
-                raw_symbol=str(symbol),
-                canonical_symbol=canonical,
-                market_count=len(self._get_exchange_markets_safe()),
-            )
-        except Exception:
-            logger.debug("market validated trace skipped", exc_info=True)
+        # The selector's first pass touches every loaded Binance market. Recording
+        # thousands of successful validations every refresh adds no diagnostic
+        # value; selected/entry-path validations remain fully traced below.
+        if str(source or '') != 'coin_selector_candidate_filter':
+            try:
+                self._utbreakout_trace_event(
+                    canonical,
+                    'MARKET_VALIDATED',
+                    'OK',
+                    source=source,
+                    raw_symbol=str(symbol),
+                    canonical_symbol=canonical,
+                    market_count=len(self._get_exchange_markets_safe()),
+                )
+            except Exception:
+                logger.debug("market validated trace skipped", exc_info=True)
         return True, canonical, ''
 
     def _utbreakout_plan_symbol_keys(self, symbol):

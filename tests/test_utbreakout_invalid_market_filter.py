@@ -54,6 +54,26 @@ def test_valid_market_filter_accepts_existing_symbol():
     assert reason == ""
 
 
+def test_selector_discovery_suppresses_only_bulk_success_trace():
+    engine = _build_engine()
+
+    ok, canonical, _ = engine._ensure_valid_utbreakout_market_symbol(
+        "SOLUSDT",
+        source="coin_selector_candidate_filter",
+    )
+    bulk_events = engine._utbreakout_recent_trace_events(canonical, limit=20)
+
+    assert ok is True
+    assert not any(event["stage"] == "MARKET_VALIDATED" for event in bulk_events)
+
+    engine._ensure_valid_utbreakout_market_symbol(
+        "SOLUSDT",
+        source="coin_selector_candidate_guard",
+    )
+    selected_events = engine._utbreakout_recent_trace_events(canonical, limit=20)
+    assert any(event["stage"] == "MARKET_VALIDATED" for event in selected_events)
+
+
 def test_allo_does_not_get_shortened_to_al():
     engine = _build_engine()
 
