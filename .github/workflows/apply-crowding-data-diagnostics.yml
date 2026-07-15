@@ -40,13 +40,14 @@ jobs:
           python -m py_compile .agent/apply_crowding_data_diagnostics.py
           python .agent/apply_crowding_data_diagnostics.py
 
-      - name: Compile changed runtime
-        run: |
-          python -m py_compile \
-            emas.py \
-            utbreakout/crowding_unwind.py \
-            tests/test_strategy_suite_v3.py \
-            tests/test_qh_flow_integration.py
+      - name: Compile Crowding module
+        run: python -m py_compile utbreakout/crowding_unwind.py
+      - name: Compile runtime
+        run: python -m py_compile emas.py
+      - name: Compile strategy tests
+        run: python -m py_compile tests/test_strategy_suite_v3.py
+      - name: Compile Quad tests
+        run: python -m py_compile tests/test_qh_flow_integration.py
 
       - name: Run focused diagnostics tests
         run: |
