@@ -146,3 +146,14 @@ def test_normalize_preserves_manual_close_position_fields():
     assert normalized["closePosition"] is True
     assert normalized["positionSide"] == "BOTH"
     assert normalized["triggerPrice"] == "467.14"
+
+
+def test_market_id_fallback_handles_usdc_settlement_without_duplicate_quote():
+    class MarketLookupUnavailable:
+        def market(self, symbol):
+            raise KeyError(symbol)
+
+    gateway = BinanceAlgoOrderGateway(MarketLookupUnavailable())
+
+    assert gateway._market_id("LTC/USDC:USDC") == "LTCUSDC"
+    assert gateway._market_id("BTC/USDT:USDT") == "BTCUSDT"

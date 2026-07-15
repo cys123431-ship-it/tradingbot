@@ -3,6 +3,11 @@ from types import SimpleNamespace
 import global_single_position_guard as guard
 
 
+def test_position_key_handles_usdc_settlement_without_duplicate_quote():
+    assert guard.key("LTC/USDC:USDC") == "LTCUSDC"
+    assert guard.key("LTCUSDC") == "LTCUSDC"
+
+
 class DummyConfig:
     def __init__(self, config):
         self.config = config

@@ -8,6 +8,7 @@ import json
 import logging
 from typing import Any, Awaitable, Callable
 
+from .binance_algo_gateway import normalize_futures_market_id
 from .order_state import (
     ACTIVE_ORDER_STATES,
     OrderIntent,
@@ -190,7 +191,7 @@ class BinanceUserDataStream:
 
     @staticmethod
     def _normalize_symbol(value: Any) -> str:
-        return "".join(character for character in str(value or "").upper() if character.isalnum())
+        return normalize_futures_market_id(value)
 
     def _handle_account_event(self, payload: dict[str, Any]) -> None:
         account = _as_dict(payload.get("a"))

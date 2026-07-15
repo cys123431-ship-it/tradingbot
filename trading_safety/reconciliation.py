@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import logging
 from typing import Any, Awaitable, Callable
 
-from .binance_algo_gateway import BinanceAlgoOrderGateway
+from .binance_algo_gateway import BinanceAlgoOrderGateway, normalize_futures_market_id
 from .liquidation_guard import (
     resolve_liquidation_safety_config,
     validate_stop_against_liquidation,
@@ -78,8 +78,19 @@ def _position_symbol(position: dict[str, Any]) -> str:
 
 
 def _normalize_symbol(value: Any) -> str:
-    text = str(value or "").upper().replace(":USDT", "").replace(":USDC", "")
-    return "".join(character for character in text if character.isalnum())
+    return normalize_futures_market_id(value)
+
+
+def _exchange_order_status(order: dict[str, Any] | None) -> str:
+    payload = _as_dict(order)
+    info = _as_dict(payload.get("info"))
+    return str(
+        payload.get("status")
+        or payload.get("algoStatus")
+        or info.get("status")
+        or info.get("algoStatus")
+        or ""
+    ).upper()
 
 
 def _order_client_id(order: dict[str, Any]) -> str:
@@ -538,6 +549,7 @@ async def reconcile_exchange_state(
     for record in active_records:
         normalized = _normalize_symbol(record.symbol)
         position_present = normalized in position_symbols
+        lookup_order: dict[str, Any] | None = None
         lookup_required_states = {
             OrderState.PLANNED.value,
             OrderState.SUBMITTING.value,
@@ -565,8 +577,9 @@ async def reconcile_exchange_state(
                     record.client_order_id
                 )
                 lookup_status, lookup_error = lookup.status.value, lookup.error
+                lookup_order = lookup.order
             else:
-                lookup_status, _, lookup_error = await _lookup_regular_order(exchange, record)
+                lookup_status, lookup_order, lookup_error = await _lookup_regular_order(exchange, record)
             if lookup_status == "UNKNOWN":
                 unresolved_records.append(
                     f"order_lookup_unknown:{record.client_order_id}:{lookup_error}"
@@ -585,6 +598,29 @@ async def reconcile_exchange_state(
                 else:
                     unresolved_records.append(f"order_not_found:{record.client_order_id}")
             record = store.get(record.client_order_id) or record
+        position_bound_states = {
+            OrderState.FILLED_UNVERIFIED_LIQUIDATION.value,
+            OrderState.FILLED_LIQUIDATION_CONFLICT.value,
+            OrderState.FILLED_UNPROTECTED.value,
+            OrderState.PROTECTED.value,
+            OrderState.CLOSING.value,
+            OrderState.PARTIALLY_CLOSED.value,
+            OrderState.EMERGENCY_CLOSE_FAILED.value,
+        }
+        if (
+            not position_present
+            and record.order_state in position_bound_states
+            and _exchange_order_status(lookup_order)
+            in {"FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
+        ):
+            store.transition(
+                record.client_order_id,
+                OrderState.CLOSED,
+                last_error=None,
+                reconciled_without_exchange_position=True,
+                reconciled_terminal_order_status=_exchange_order_status(lookup_order),
+            )
+            continue
         if record.order_state == OrderState.SUBMITTED_UNKNOWN.value:
             if record.client_order_id in open_by_client_id:
                 store.transition(record.client_order_id, OrderState.ACKNOWLEDGED, last_error=None)

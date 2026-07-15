@@ -57,6 +57,15 @@ def _bool_text(value: Any) -> str:
     return "true" if bool(value) else "false"
 
 
+def normalize_futures_market_id(value: Any) -> str:
+    """Return Binance's compact market id for CCXT or exchange symbols."""
+
+    text = str(value or "").upper().strip()
+    if ":" in text:
+        text = text.split(":", 1)[0]
+    return "".join(character for character in text if character.isalnum())
+
+
 class BinanceAlgoOrderGateway:
     def __init__(self, exchange: Any) -> None:
         self.exchange = exchange
@@ -64,10 +73,13 @@ class BinanceAlgoOrderGateway:
     def _market_id(self, symbol: str) -> str:
         market = None
         if hasattr(self.exchange, "market"):
-            market = self.exchange.market(symbol)
+            try:
+                market = self.exchange.market(symbol)
+            except Exception:
+                market = None
         if isinstance(market, dict) and market.get("id"):
             return str(market["id"])
-        return str(symbol).upper().replace(":USDT", "").replace("/", "")
+        return normalize_futures_market_id(symbol)
 
     @staticmethod
     def normalize(raw: dict[str, Any]) -> dict[str, Any]:

@@ -74,3 +74,37 @@ def test_algo_rejection_locks_new_entries(tmp_path):
     assert stream.handle_event(payload) is True
     assert locks == ["PROTECTION_ALGO_REJECTED:BTCUSDT"]
     assert store.get_runtime_state("last_algo_order_event")["working_type"] == "MARK_PRICE"
+
+
+def test_account_update_matches_ccxt_usdc_symbol_to_binance_market_id(tmp_path):
+    store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+    store.upsert(
+        OrderRecord(
+            "cid-usdc",
+            "LTC/USDC:USDC",
+            "LONG",
+            "UTB",
+            "1",
+            1.0,
+            order_state=OrderState.PROTECTED.value,
+        )
+    )
+    locks = []
+    stream = BinanceUserDataStream(object(), store, lock_callback=locks.append)
+
+    stream.handle_event(
+        {
+            "e": "ACCOUNT_UPDATE",
+            "E": 500,
+            "T": 500,
+            "a": {
+                "m": "ORDER",
+                "P": [
+                    {"s": "LTCUSDC", "pa": "1", "ep": "80", "up": "0", "ps": "BOTH"}
+                ],
+            },
+        }
+    )
+
+    assert locks == []
+    assert store.get_runtime_state("entry_lock_reason") is None

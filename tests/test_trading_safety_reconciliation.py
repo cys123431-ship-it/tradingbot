@@ -73,6 +73,51 @@ def test_local_active_without_exchange_position_requires_reconciliation(tmp_path
     asyncio.run(scenario())
 
 
+def test_binance_terminal_entry_record_closes_when_exchange_position_is_flat(tmp_path):
+    class BinanceFlatExchange:
+        id = "binance"
+
+        def fetch_positions(self):
+            return []
+
+        def fetch_open_orders(self):
+            return []
+
+        def fapiPrivateGetOpenAlgoOrders(self, params):
+            return []
+
+        def fapiPrivateGetOrder(self, params):
+            assert params["symbol"] == "LTCUSDC"
+            return {
+                "symbol": "LTCUSDC",
+                "clientOrderId": params["origClientOrderId"],
+                "status": "FILLED",
+            }
+
+    async def scenario():
+        store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+        store.upsert(
+            OrderRecord(
+                "cid-usdc",
+                "LTC/USDC:USDC",
+                "LONG",
+                "UTB",
+                "1",
+                1.0,
+                order_state=OrderState.PROTECTED.value,
+            )
+        )
+
+        result = await reconcile_exchange_state(BinanceFlatExchange(), store)
+
+        assert result.safe_to_trade is True
+        record = store.get("cid-usdc")
+        assert record.order_state == OrderState.CLOSED.value
+        assert record.metadata["reconciled_terminal_order_status"] == "FILLED"
+
+    asyncio.run(scenario())
+
+
 def test_startup_closes_synthetic_record_after_confirmed_emergency_close(tmp_path):
     async def scenario():
         store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")

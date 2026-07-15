@@ -326,7 +326,10 @@ OPPORTUNITY_OVERRIDES = {
 
 
 def key(symbol):
-    return str(symbol or "").upper().replace(":USDT", "").replace("/", "").strip()
+    text = str(symbol or "").upper().strip()
+    if ":" in text:
+        text = text.split(":", 1)[0]
+    return "".join(character for character in text if character.isalnum())
 
 
 def active_position(engine, raw):

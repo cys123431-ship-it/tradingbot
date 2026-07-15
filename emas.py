@@ -74,6 +74,7 @@ from trading_safety.binance_algo_gateway import (
     CONDITIONAL_TYPES,
     ProtectionOrderSnapshot,
     ProtectionOrderLookupUnavailable,
+    normalize_futures_market_id,
 )
 from trading_safety.liquidation_guard import (
     as_decimal,
@@ -4589,7 +4590,7 @@ class BaseEngine:
             for p in positions:
                 normalized_pos = self._normalize_server_position(p)
                 if normalized_pos:
-                    sym = str(normalized_pos.get('symbol', '')).replace(':USDT', '')
+                    sym = str(normalized_pos.get('symbol', '')).split(':', 1)[0]
                     if sym:
                         active_symbols.add(sym)
             self.all_positions_cache = set(active_symbols)
@@ -4752,7 +4753,7 @@ class BaseEngine:
             pos_side = str(row.get('pos_side', 'NONE')).upper()
             symbol = row.get('symbol')
             if symbol and pos_side != 'NONE':
-                norm_symbol = str(symbol).replace(':USDT', '')
+                norm_symbol = str(symbol).split(':', 1)[0]
                 if active_symbols_on_exchange and norm_symbol not in active_symbols_on_exchange:
                     continue
                 unrealized_pnl += float(row.get('pnl_usdt', 0) or 0)
@@ -4998,8 +4999,8 @@ class TemaEngine(BaseEngine):
                 for p in all_positions:
                     normalized_pos = self._normalize_server_position(p)
                     if normalized_pos:
-                        active_sym = str(normalized_pos.get('symbol', '')).replace(':USDT', '').replace('/', '')
-                        target_sym = symbol.replace(':USDT', '').replace('/', '')
+                        active_sym = normalize_futures_market_id(normalized_pos.get('symbol'))
+                        target_sym = normalize_futures_market_id(symbol)
 
                         if active_sym != target_sym:
                             logger.warning(f"?슟 [Single Limit] Entry blocked: Already holding {normalized_pos['symbol']}")
@@ -5625,6 +5626,7 @@ class SignalEngine(BaseEngine):
         self.trading_state_store = None
         self.idempotent_order_gateway = None
         self.user_data_stream = None
+        self.crypto_safety_startup_task = None
         self.crypto_entry_lock_reason = 'RECONCILIATION_REQUIRED'
 
     def start(self):
@@ -5646,12 +5648,27 @@ class SignalEngine(BaseEngine):
         logger.info(f"?? [Signal] Engine started (Multi-Symbol Mode). Watching: {self.active_symbols}")
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(
+            self.crypto_safety_startup_task = loop.create_task(
                 self._startup_crypto_safety_reconciliation(),
                 name='crypto-trading-safety-startup-reconciliation',
             )
         except RuntimeError:
             logger.warning("Crypto startup reconciliation skipped: no running event loop")
+
+    async def _shutdown_crypto_safety_runtime(self):
+        startup_task = getattr(self, 'crypto_safety_startup_task', None)
+        self.crypto_safety_startup_task = None
+        if startup_task is not None and not startup_task.done():
+            startup_task.cancel()
+            try:
+                await startup_task
+            except asyncio.CancelledError:
+                pass
+
+        stream = getattr(self, 'user_data_stream', None)
+        self.user_data_stream = None
+        if stream is not None:
+            await stream.stop()
 
     def _set_crypto_entry_lock(self, reason):
         self.crypto_entry_lock_reason = str(reason or '') or None
@@ -5734,10 +5751,18 @@ class SignalEngine(BaseEngine):
                     )
                     return bool(refreshed.safe_to_trade)
 
+                controller_mode = None
+                if getattr(self, 'ctrl', None) is not None and hasattr(self.ctrl, 'get_exchange_mode'):
+                    controller_mode = self.ctrl.get_exchange_mode()
+                stream_testnet = (
+                    str(controller_mode or '').lower() == BINANCE_TESTNET
+                    if controller_mode is not None
+                    else bool(common.get('testnet', False))
+                )
                 self.user_data_stream = BinanceUserDataStream(
                     self.exchange,
                     self.trading_state_store,
-                    testnet=bool(common.get('testnet', False)),
+                    testnet=stream_testnet,
                     reconcile_callback=_stream_reconcile,
                     lock_callback=self._set_crypto_entry_lock,
                 )
@@ -20801,7 +20826,7 @@ class SignalEngine(BaseEngine):
         )
 
     def _utbreakout_status_symbol_key(self, symbol):
-        return str(symbol or '').upper().replace(':USDT', '').replace('/', '').replace('-', '').strip()
+        return normalize_futures_market_id(symbol)
 
     def _utbreakout_diag_for_symbol(self, symbol):
         statuses = getattr(self, 'last_utbot_filtered_breakout_status', {})
@@ -33743,8 +33768,8 @@ class SignalEngine(BaseEngine):
                 all_positions = await asyncio.to_thread(self.exchange.fetch_positions)
                 for p in all_positions:
                     if float(p.get('contracts', 0)) > 0:
-                        active_sym = p.get('symbol', '').replace(':USDT', '').replace('/', '')
-                        target_sym = symbol.replace(':USDT', '').replace('/', '')
+                        active_sym = normalize_futures_market_id(p.get('symbol'))
+                        target_sym = normalize_futures_market_id(symbol)
 
                         if active_sym == target_sym:
                             if trace_utbreakout:
@@ -35450,15 +35475,7 @@ class SignalEngine(BaseEngine):
         return None
 
     def _normalize_protection_symbol(self, value):
-        return (
-            str(value or '')
-            .upper()
-            .replace(':USDT', '')
-            .replace('/', '')
-            .replace('-', '')
-            .replace('_', '')
-            .strip()
-        )
+        return normalize_futures_market_id(value)
 
     def _protection_order_symbol(self, order):
         if not isinstance(order, dict):
@@ -35889,10 +35906,11 @@ class SignalEngine(BaseEngine):
     def _protection_unified_symbol_from_key(self, symbol_key, fallback=None):
         raw = str(fallback or '').strip()
         if '/' in raw:
-            return raw.replace(':USDT', '')
+            return raw.split(':', 1)[0]
         normalized = self._normalize_protection_symbol(symbol_key or raw)
-        if normalized.endswith('USDT') and len(normalized) > 4:
-            return f"{normalized[:-4]}/USDT"
+        for quote in ('USDT', 'USDC', 'BUSD'):
+            if normalized.endswith(quote) and len(normalized) > len(quote):
+                return f"{normalized[:-len(quote)]}/{quote}"
         return raw or normalized
 
     async def _fetch_active_protection_symbol_keys(self):
@@ -36090,10 +36108,12 @@ class SignalEngine(BaseEngine):
             if not normalized:
                 continue
             _add(normalized)
-            if normalized.endswith('USDT') and len(normalized) > 4:
-                base = normalized[:-4]
-                _add(f"{base}/USDT")
-                _add(f"{base}/USDT:USDT")
+            for quote in ('USDT', 'USDC', 'BUSD'):
+                if normalized.endswith(quote) and len(normalized) > len(quote):
+                    base = normalized[:-len(quote)]
+                    _add(f"{base}/{quote}")
+                    _add(f"{base}/{quote}:{quote}")
+                    break
         return candidates
 
     async def _cancel_all_orders_variants(self, symbol, reason='order cleanup'):
@@ -41117,7 +41137,8 @@ class MainController:
         text = str(raw_symbol or '').strip().upper()
         if not text:
             return ''
-        text = text.replace(':USDT', '')
+        for suffix in (':USDT', ':USDC', ':BUSD'):
+            text = text.replace(suffix, '')
         if '/' in text:
             return text
         for quote in ('USDT', 'USDC', 'BUSD'):
@@ -42271,6 +42292,9 @@ class MainController:
             return
 
         if self.active_engine:
+            shutdown_safety = getattr(self.active_engine, '_shutdown_crypto_safety_runtime', None)
+            if callable(shutdown_safety):
+                await shutdown_safety()
             self.active_engine.stop()
 
         # ?붿쭊 ?꾪솚 ???곹깭 ?곗씠??珥덇린??
@@ -42291,7 +42315,7 @@ class MainController:
 
 
     def _utbreakout_status_symbol_key(self, symbol):
-        return str(symbol or '').upper().replace(':USDT', '').replace('/', '').replace('-', '').strip()
+        return normalize_futures_market_id(symbol)
 
     async def _resolve_utbreakout_status_symbol(self):
         """Pick the symbol operators expect to inspect.
@@ -42441,6 +42465,13 @@ class MainController:
 
                 try:
                     if self.active_engine:
+                        shutdown_safety = getattr(
+                            self.active_engine,
+                            '_shutdown_crypto_safety_runtime',
+                            None,
+                        )
+                        if callable(shutdown_safety):
+                            await shutdown_safety()
                         self.active_engine.stop()
                         logger.info("Engine stopped for exchange reinit")
 
@@ -42523,7 +42554,16 @@ class MainController:
                             engine.utbreakout_daily_sl_symbol_lockouts = dict(state.get('utbreakout_daily_sl_symbol_lockouts', {}) or {})
 
                     try:
-                        if self.active_engine and not getattr(self.active_engine, 'running', False):
+                        if self.active_engine:
+                            shutdown_safety = getattr(
+                                self.active_engine,
+                                '_shutdown_crypto_safety_runtime',
+                                None,
+                            )
+                            if callable(shutdown_safety):
+                                await shutdown_safety()
+                            if getattr(self.active_engine, 'running', False):
+                                self.active_engine.stop()
                             self.active_engine.start()
                             logger.info("Previous engine restarted after exchange reinit rollback")
                     except Exception as engine_rollback_error:
