@@ -114,6 +114,38 @@ def test_position_sizing_blocks_negative_meta_expectancy_with_samples():
     assert any("negative expectancy" in reason for reason in result["reasons"])
 
 
+def test_position_sizing_ignores_negative_meta_expectancy_without_samples():
+    result = build_position_risk_multiplier({
+        "atr_pct": 0.8,
+        "meta_probability": 0.70,
+        "recent_avg_pnl_r": -0.50,
+        "meta_sample_count": 0,
+    })
+
+    assert result["blocked"] is False
+    assert result["components"]["recent_performance"] == 1.0
+    assert not any("performance" in reason for reason in result["reasons"])
+
+
+def test_position_sizing_rave_like_edge_keeps_independent_risk_brakes():
+    result = build_position_risk_multiplier({
+        "atr_pct": 1.9068,
+        "meta_probability": 0.65,
+        "entry_edge_probability": 0.5837,
+        "entry_edge_score": 88.7,
+        "recent_avg_pnl_r": -0.90,
+        "meta_sample_count": 0,
+        "recent_closed_pnls": [-0.34, -0.38, -0.92],
+    })
+
+    assert result["blocked"] is False
+    assert result["components"]["meta"] == 1.0
+    assert result["components"]["recent_performance"] == 1.0
+    assert result["components"]["volatility"] < 1.0
+    assert result["components"]["consecutive_loss"] == pytest.approx(0.6)
+    assert result["risk_multiplier"] == pytest.approx(0.3146, abs=0.001)
+
+
 def test_position_sizing_reduces_or_blocks_portfolio_heat():
     reduced = build_position_risk_multiplier({
         "atr_pct": 0.8,

@@ -862,9 +862,6 @@ def build_position_risk_multiplier(inputs=None, cfg=None):
         elif recent_avg_pnl < _finite_float(cfg.get("position_meta_reduce_below_expectancy_r"), 0.0):
             performance_multiplier = _clamp(cfg.get("position_meta_min_multiplier", 0.50), 0.0, 1.0)
             reasons.append(f"negative expectancy x{performance_multiplier:.2f}")
-    elif _finite_float(data.get("recent_avg_pnl_r"), 0.0) < 0:
-        performance_multiplier = 0.75
-        reasons.append("recent performance")
 
     r_values = _r_multiples_from_trades(data.get("recent_trades", data.get("r_multiples")))
     kelly_multiplier, kelly_reason = _conservative_fractional_kelly_multiplier(r_values, cfg)

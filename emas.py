@@ -20392,19 +20392,19 @@ class SignalEngine(BaseEngine):
                 position_sizing = build_position_risk_multiplier(
                     {
                         'atr_pct': atr_pct,
-                        'meta_probability': (
+                        # The Entry Edge probability is already applied by the
+                        # dedicated edge-probability component below.  Feeding
+                        # the same number into the independent meta bucket cut
+                        # otherwise-strong trades twice.
+                        'meta_probability': 0.65,
+                        'entry_edge_probability': (
                             entry_edge_decision.probability
                             if entry_edge_decision is not None
                             else (
                                 ev_decision.win_probability
                                 if ev_decision is not None
-                                else 0.65
+                                else None
                             )
-                        ),
-                        'entry_edge_probability': (
-                            entry_edge_decision.probability
-                            if entry_edge_decision is not None
-                            else None
                         ),
                         'entry_edge_score': (
                             entry_edge_decision.score
@@ -22883,19 +22883,15 @@ class SignalEngine(BaseEngine):
                     position_sizing_status = build_position_risk_multiplier(
                         {
                             'atr_pct': filter_values.get('atr_pct'),
-                            'meta_probability': (
+                            'meta_probability': 0.65,
+                            'entry_edge_probability': (
                                 entry_edge_status_decision.probability
                                 if entry_edge_status_decision is not None
                                 else (
                                     ev_status_decision.win_probability
                                     if ev_status_decision is not None
-                                    else 0.65
+                                    else None
                                 )
-                            ),
-                            'entry_edge_probability': (
-                                entry_edge_status_decision.probability
-                                if entry_edge_status_decision is not None
-                                else None
                             ),
                             'entry_edge_score': (
                                 entry_edge_status_decision.score
@@ -24307,19 +24303,15 @@ class SignalEngine(BaseEngine):
                     position_sizing_status = build_position_risk_multiplier(
                         {
                             'atr_pct': filter_values.get('atr_pct'),
-                            'meta_probability': (
+                            'meta_probability': 0.65,
+                            'entry_edge_probability': (
                                 entry_edge_status_decision.probability
                                 if entry_edge_status_decision is not None
                                 else (
                                     ev_status_decision.win_probability
                                     if ev_status_decision is not None
-                                    else 0.65
+                                    else None
                                 )
-                            ),
-                            'entry_edge_probability': (
-                                entry_edge_status_decision.probability
-                                if entry_edge_status_decision is not None
-                                else None
                             ),
                             'entry_edge_score': (
                                 entry_edge_status_decision.score
