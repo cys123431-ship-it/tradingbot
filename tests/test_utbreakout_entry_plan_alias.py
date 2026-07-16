@@ -37,6 +37,33 @@ def test_utbreakout_entry_plan_clear_removes_all_aliases():
     assert engine.utbot_filtered_breakout_entry_plans == {}
 
 
+def test_all_five_strategy_modes_use_stateful_position_reconciliation():
+    expected = {
+        emas.UTBOT_FILTERED_BREAKOUT_STRATEGY,
+        emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+        emas.QH_FLOW_STRATEGY,
+        emas.CROWDING_UNWIND_STRATEGY,
+        emas.LXR_STRATEGY,
+        emas.QUAD_ALPHA_STRATEGY,
+    }
+
+    assert expected.issubset(emas.STATEFUL_UT_STRATEGIES)
+
+
+def test_trailing_state_alias_is_migrated_to_canonical_futures_symbol():
+    engine = object.__new__(emas.SignalEngine)
+    state = {"side": "long", "initial_qty": 31.0}
+    engine.utbreakout_trailing_states = {"RAVE/USDT": state}
+
+    resolved = engine._get_utbreakout_trailing_state("RAVE/USDT:USDT")
+
+    assert resolved is state
+    assert engine.utbreakout_trailing_states == {
+        "RAVE/USDT:USDT": state,
+    }
+    assert state["state_symbol_migrated_from"] == "RAVE/USDT"
+
+
 def test_utbreakout_poll_retries_processed_candle_when_no_position():
     symbol = "SOL/USDT:USDT"
     closed_ts = 1_718_800_000_000
@@ -97,6 +124,63 @@ def test_utbreakout_poll_retries_processed_candle_when_no_position():
 
     assert calls == [(symbol, closed_ts, True)]
     assert f"{symbol}:15m:{closed_ts}" in engine.last_utbreakout_no_position_retry_ts
+
+
+def test_five_strategy_position_reconciles_on_processed_candle():
+    symbol = "RAVE/USDT:USDT"
+    closed_ts = 1_784_187_000_000
+
+    class MarketDataExchange:
+        def fetch_ohlcv(self, requested_symbol, timeframe, limit=5):
+            assert requested_symbol == symbol
+            return [
+                [closed_ts - 900_000, 0.30, 0.31, 0.29, 0.305, 1000.0],
+                [closed_ts, 0.305, 0.34, 0.30, 0.332, 1200.0],
+                [closed_ts + 900_000, 0.332, 0.333, 0.328, 0.330, 800.0],
+            ]
+
+    engine = object.__new__(emas.SignalEngine)
+    engine.market_data_exchange = MarketDataExchange()
+    engine.last_processed_candle_ts = {symbol: closed_ts}
+    engine.last_state_sync_candle_ts = {symbol: closed_ts}
+    engine.last_stateful_retry_ts = {symbol: 0.0}
+    engine.last_utbreakout_no_position_retry_ts = {}
+    engine.last_processed_exit_candle_ts = {}
+    engine.last_candle_time = {}
+    engine.last_candle_success = {symbol: True}
+    engine.utbreakout_adaptive_tf_state = {}
+    engine.utbreakout_adaptive_last_decision_ts = {}
+    engine.utbreakout_last_selected_set_ids = {}
+    engine.fisher_states = {}
+    engine.vbo_states = {}
+    engine.cameron_states = {}
+    engine._get_primary_poll_timeframe = lambda requested_symbol, cfg: "15m"
+    engine.is_upbit_mode = lambda: False
+    calls = []
+
+    async def check_status(requested_symbol, current_price):
+        return "LONG"
+
+    async def process_primary_candle(requested_symbol, candle, force=False):
+        calls.append((requested_symbol, candle["t"], force))
+
+    engine.check_status = check_status
+    engine.process_primary_candle = process_primary_candle
+
+    asyncio.run(
+        engine.poll_symbol(
+            symbol,
+            "15m",
+            {
+                "strategy_params": {
+                    "active_strategy": emas.QUAD_ALPHA_STRATEGY,
+                    "entry_mode": "cross",
+                }
+            },
+        )
+    )
+
+    assert calls == [(symbol, closed_ts, True)]
 
 
 def test_utbreakout_force_reprocess_bypasses_adaptive_duplicate_guard():

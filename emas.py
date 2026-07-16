@@ -588,7 +588,11 @@ MA_STRATEGIES = set()
 PATTERN_STRATEGIES = set(UT_ONLY_STRATEGIES)
 CORE_STRATEGIES = set(UT_ONLY_STRATEGIES) | UTBREAKOUT_STRATEGIES
 UT_HYBRID_STRATEGIES = {'utrsibb', 'utrsi', 'utbb'}
-STATEFUL_UT_STRATEGIES = {'utbot', 'utsmc'} | UT_HYBRID_STRATEGIES
+STATEFUL_UT_STRATEGIES = (
+    {'utbot', 'utsmc'}
+    | UT_HYBRID_STRATEGIES
+    | UTBREAKOUT_STRATEGIES
+)
 STRATEGY_DISPLAY_NAMES = {
     'sma': 'SMA',
     'hma': 'HMA',
@@ -5445,9 +5449,48 @@ class TemaEngine(BaseEngine):
                     or state_data.get('tp_orders')
                     or []
                 )
+                entry_record = self._utbreakout_entry_record_for_symbol(
+                    symbol,
+                    include_historic=True,
+                )
+                entry_metadata = dict(
+                    getattr(entry_record, 'metadata', {}) or {}
+                )
+                persisted_tp_labels = {
+                    str(order_id): str(label).upper()
+                    for order_id, label in dict(
+                        entry_metadata.get('take_profit_order_labels') or {}
+                    ).items()
+                    if order_id not in (None, '') and label not in (None, '')
+                }
+                persisted_tp_ids = [
+                    str(value)
+                    for value in (
+                        getattr(entry_record, 'take_profit_order_ids', None)
+                        or []
+                    )
+                    if value not in (None, '')
+                ]
+                for index, order_id in enumerate(persisted_tp_ids, 1):
+                    persisted_tp_labels.setdefault(
+                        order_id,
+                        f'TP{index}',
+                    )
+                persisted_stop_ids = {
+                    str(value)
+                    for value in (
+                        getattr(entry_record, 'stop_order_id', None),
+                        state_data.get('sl_order_id'),
+                    )
+                    if value not in (None, '')
+                }
 
                 def _fill_label(order_id, fill_price):
                     order_id_text = str(order_id or '')
+                    if order_id_text in persisted_tp_labels:
+                        return persisted_tp_labels[order_id_text]
+                    if order_id_text in persisted_stop_ids:
+                        return 'SL'
                     for target in planned_targets:
                         if not isinstance(target, dict):
                             continue
@@ -5623,22 +5666,37 @@ class TemaEngine(BaseEngine):
         if result.get('estimated'):
             close_reason = f"{close_reason} [estimated-price]"
         reason_upper = close_reason.upper()
+        generic_flat_reason = (
+            'TAKE PROFIT/STOP LOSS CLOSED POSITION' in reason_upper
+            or 'AUTOMATIC PROTECTION FILL' in reason_upper
+        )
         exit_legs = [dict(item) for item in result.get('exit_legs') or [] if isinstance(item, dict)]
         for leg in exit_legs:
             if str(leg.get('label') or '').upper() != 'EXIT':
                 continue
-            if 'TP1' in reason_upper:
+            if 'MANUAL' in reason_upper or 'EMERGENCY' in reason_upper:
+                leg['label'] = 'MANUAL'
+            elif 'TP1' in reason_upper:
                 leg['label'] = 'TP1'
-            elif 'TP2' in reason_upper or 'TAKE_PROFIT' in reason_upper:
+            elif 'TP2' in reason_upper or (
+                'TAKE_PROFIT' in reason_upper
+                and not generic_flat_reason
+            ):
                 leg['label'] = 'TP2'
             elif 'TRAIL' in reason_upper or 'RUNNER' in reason_upper or 'CHANDELIER' in reason_upper:
                 leg['label'] = 'RUNNER'
-            elif 'STOP' in reason_upper or re.search(r'(^|[^A-Z])SL([^A-Z]|$)', reason_upper):
+            elif (
+                not generic_flat_reason
+                and (
+                    'STOP' in reason_upper
+                    or re.search(r'(^|[^A-Z])SL([^A-Z]|$)', reason_upper)
+                )
+            ):
                 leg['label'] = 'SL'
-            elif 'MANUAL' in reason_upper or 'EMERGENCY' in reason_upper:
-                leg['label'] = 'MANUAL'
             elif 'TIME' in reason_upper:
                 leg['label'] = 'TIME_STOP'
+            elif generic_flat_reason:
+                leg['label'] = 'EXTERNAL_EXIT'
         result['exit_legs'] = exit_legs
         updated = db.log_trade_close(
             accounting_symbol,
@@ -12647,10 +12705,64 @@ class SignalEngine(BaseEngine):
             )
             return False
 
+    def _utbreakout_trailing_state_aliases(self, symbol):
+        try:
+            aliases = [
+                key
+                for key in self._utbreakout_plan_symbol_keys(symbol)
+                if not str(key).startswith('__key__:')
+            ]
+        except Exception:
+            aliases = [str(symbol or '').strip()]
+        out = []
+        for alias in aliases:
+            alias = str(alias or '').strip()
+            if alias and alias not in out:
+                out.append(alias)
+        return out
+
+    def _get_utbreakout_trailing_state(self, symbol, *, migrate=True):
+        states = getattr(self, 'utbreakout_trailing_states', None)
+        if not isinstance(states, dict):
+            return None
+        aliases = self._utbreakout_trailing_state_aliases(symbol)
+        canonical = aliases[0] if aliases else str(symbol or '').strip()
+        for alias in aliases:
+            state = states.get(alias)
+            if not isinstance(state, dict):
+                continue
+            if migrate and canonical and alias != canonical:
+                states[canonical] = state
+                states.pop(alias, None)
+                state['state_symbol_migrated_from'] = alias
+                state['state_symbol'] = canonical
+            return state
+        return None
+
+    def _set_utbreakout_trailing_state(self, symbol, state):
+        if not isinstance(state, dict):
+            return None
+        states = getattr(self, 'utbreakout_trailing_states', None)
+        if not isinstance(states, dict):
+            states = {}
+            self.utbreakout_trailing_states = states
+        aliases = self._utbreakout_trailing_state_aliases(symbol)
+        canonical = aliases[0] if aliases else str(symbol or '').strip()
+        if not canonical:
+            return None
+        for alias in aliases:
+            if alias != canonical:
+                states.pop(alias, None)
+        state['state_symbol'] = canonical
+        states[canonical] = state
+        return state
+
     def _clear_utbreakout_trailing_state(self, symbol, *, finalize=False, reason='cleared', exit_price=None):
         states = getattr(self, 'utbreakout_trailing_states', None)
         if isinstance(states, dict):
-            state = states.get(symbol)
+            aliases = self._utbreakout_trailing_state_aliases(symbol)
+            canonical = aliases[0] if aliases else str(symbol or '').strip()
+            state = self._get_utbreakout_trailing_state(symbol)
             if state and finalize:
                 try:
                     price_val = None
@@ -12659,7 +12771,7 @@ class SignalEngine(BaseEngine):
                     import asyncio
                     asyncio.create_task(
                         self._check_and_record_sl_lockout_async(
-                            symbol,
+                            canonical,
                             state,
                             exit_price=price_val
                         )
@@ -12667,8 +12779,13 @@ class SignalEngine(BaseEngine):
                 except Exception as e:
                     logger.debug(f"Failed to spawn SL fill check task: {e}")
             if finalize:
-                self._finalize_utbreakout_runner_state(symbol, reason=reason, exit_price=exit_price)
-            states.pop(symbol, None)
+                self._finalize_utbreakout_runner_state(
+                    canonical,
+                    reason=reason,
+                    exit_price=exit_price,
+                )
+            for alias in aliases:
+                states.pop(alias, None)
 
     def _aggressive_growth_symbol_key(self, symbol):
         return self._normalize_protection_symbol(symbol)
@@ -12920,8 +13037,7 @@ class SignalEngine(BaseEngine):
             return []
 
     def _finalize_utbreakout_runner_state(self, symbol, *, reason='position closed', exit_price=None):
-        states = getattr(self, 'utbreakout_trailing_states', None)
-        state = states.get(symbol) if isinstance(states, dict) else None
+        state = self._get_utbreakout_trailing_state(symbol)
         if not isinstance(state, dict):
             return None
         side = str(state.get('side') or '').lower()
@@ -13330,12 +13446,241 @@ class SignalEngine(BaseEngine):
             'tp2_fallback_reached_loops': 0,
             'created_at': datetime.now(timezone.utc).isoformat(),
         }
-        self.utbreakout_trailing_states[symbol] = state
+        return self._set_utbreakout_trailing_state(symbol, state)
+
+    def _utbreakout_entry_record_for_symbol(self, symbol, *, include_historic=False):
+        store = getattr(self, 'trading_state_store', None)
+        if store is None:
+            return None
+        try:
+            records = list(store.active_for_symbol(symbol) or [])
+            if include_historic and not records:
+                records = list(store.records_for_symbol(symbol) or [])
+        except Exception:
+            logger.debug(
+                "UTBreak entry-state lookup failed for %s",
+                symbol,
+                exc_info=True,
+            )
+            return None
+        entries = [
+            record
+            for record in records
+            if str(getattr(record, 'order_intent', '') or '').upper() == 'ENTRY'
+        ]
+        if not entries:
+            return None
+        return max(
+            entries,
+            key=lambda record: str(
+                getattr(record, 'updated_at', None)
+                or getattr(record, 'created_at', None)
+                or ''
+            ),
+        )
+
+    def _persist_active_entry_protection_refs(
+        self,
+        symbol,
+        *,
+        stop_order_id=None,
+        take_profit_order_ids=None,
+        take_profit_order_labels=None,
+    ):
+        record = self._utbreakout_entry_record_for_symbol(symbol)
+        store = getattr(self, 'trading_state_store', None)
+        if record is None or store is None:
+            return None
+        changes = {}
+        if stop_order_id not in (None, ''):
+            changes['stop_order_id'] = str(stop_order_id)
+        existing_ids = [
+            str(value)
+            for value in (getattr(record, 'take_profit_order_ids', None) or [])
+            if value not in (None, '')
+        ]
+        if take_profit_order_ids is not None:
+            for value in take_profit_order_ids:
+                text = str(value or '').strip()
+                if text and text not in existing_ids:
+                    existing_ids.append(text)
+            changes['take_profit_order_ids'] = existing_ids
+        labels = dict(
+            (getattr(record, 'metadata', {}) or {}).get(
+                'take_profit_order_labels',
+                {},
+            )
+            or {}
+        )
+        if isinstance(take_profit_order_labels, dict):
+            labels.update({
+                str(order_id): str(label).upper()
+                for order_id, label in take_profit_order_labels.items()
+                if order_id not in (None, '') and label not in (None, '')
+            })
+            changes['take_profit_order_labels'] = labels
+        if not changes:
+            return record
+        try:
+            return store.transition(
+                record.client_order_id,
+                record.order_state,
+                **changes,
+            )
+        except Exception:
+            logger.debug(
+                "UTBreak protection reference persistence failed for %s",
+                symbol,
+                exc_info=True,
+            )
+            return None
+
+    def _update_utbreakout_fill_flags_from_position_qty(
+        self,
+        symbol,
+        state,
+        current_qty,
+    ):
+        if not isinstance(state, dict):
+            return state
+        initial_qty = max(0.0, float(state.get('initial_qty', 0.0) or 0.0))
+        remaining_qty = max(0.0, float(current_qty or 0.0))
+        if initial_qty <= 0:
+            return state
+        try:
+            amount_step = max(
+                0.0,
+                float(self._get_amount_step_for_symbol(symbol) or 0.0),
+            )
+        except Exception:
+            amount_step = 0.0
+        qty_tolerance = max(
+            initial_qty * 1e-8,
+            amount_step * 0.51,
+            1e-12,
+        )
+        raw_orders = [
+            item
+            for item in (
+                state.get('planned_tp_orders')
+                or state.get('tp_orders')
+                or []
+            )
+            if isinstance(item, dict)
+        ]
+        raw_orders.sort(key=lambda item: int(item.get('tp_index') or 999))
+        cumulative_exit_qty = 0.0
+        newly_filled = []
+        for index, item in enumerate(raw_orders, 1):
+            label = _normalize_tp_plan_label(
+                item.get('tp_label') or item.get('tp_name') or item.get('label'),
+                f'TP{index}',
+            )
+            planned_qty = max(
+                0.0,
+                float(item.get('qty') or item.get('quantity') or 0.0),
+            )
+            if planned_qty <= 0:
+                continue
+            cumulative_exit_qty = min(
+                initial_qty,
+                cumulative_exit_qty + planned_qty,
+            )
+            expected_remaining = max(0.0, initial_qty - cumulative_exit_qty)
+            filled = remaining_qty <= expected_remaining + qty_tolerance
+            state_key = f'{label.lower()}_filled'
+            if filled and not bool(state.get(state_key)):
+                newly_filled.append(label)
+                state[state_key] = True
+                state[f'{label.lower()}_filled_at_qty'] = remaining_qty
+                state[f'{label.lower()}_expected_remaining_qty'] = (
+                    expected_remaining
+                )
+            if filled:
+                item['filled'] = True
+        state['current_qty'] = remaining_qty
+        state['current_remaining_ratio'] = remaining_qty / initial_qty
+        state['last_fill_sync_new'] = newly_filled
         return state
 
+    def _sync_utbreakout_state_with_protection_orders(
+        self,
+        symbol,
+        state,
+        protection_orders,
+    ):
+        if not isinstance(state, dict):
+            return state
+        planned = [
+            item
+            for item in (
+                state.get('planned_tp_orders')
+                or state.get('tp_orders')
+                or []
+            )
+            if isinstance(item, dict)
+        ]
+        actual_tps = [
+            order
+            for order in (protection_orders or [])
+            if self._classify_protection_order(order) == 'tp'
+        ]
+        labels_by_id = {}
+        for order in actual_tps:
+            label = self._protection_tp_label(order, planned)
+            if not label:
+                continue
+            label = _normalize_tp_plan_label(label)
+            target = next(
+                (
+                    item
+                    for item in planned
+                    if _normalize_tp_plan_label(
+                        item.get('tp_label') or item.get('tp_name')
+                    ) == label
+                ),
+                None,
+            )
+            if target is None:
+                continue
+            info = self._protection_order_info(order)
+            price = _safe_float_or_none(
+                order.get('price')
+                or info.get('price')
+                or self._protection_trigger_price(order)
+            )
+            qty = self._protection_order_amount(order)
+            order_id = self._protection_order_id(order)
+            client_id = self._protection_client_order_id(order)
+            if price is not None:
+                target['price'] = float(price)
+            if qty is not None:
+                target['qty'] = float(qty)
+            target['order_id'] = order_id
+            target['client_order_id'] = client_id
+            if order_id:
+                labels_by_id[str(order_id)] = label
+        state['planned_tp_orders'] = planned
+        state['tp_orders'] = list(planned)
+        sl_orders = [
+            order
+            for order in (protection_orders or [])
+            if self._classify_protection_order(order) == 'sl'
+        ]
+        newest_sl = self._newest_protection_order(sl_orders)
+        if newest_sl is not None:
+            state['sl_order_id'] = self._protection_order_id(newest_sl)
+        self._persist_active_entry_protection_refs(
+            symbol,
+            stop_order_id=state.get('sl_order_id'),
+            take_profit_order_ids=list(labels_by_id),
+            take_profit_order_labels=labels_by_id,
+        )
+        return self._set_utbreakout_trailing_state(symbol, state)
+
     async def _recover_utbreakout_trailing_state_from_exchange(self, symbol, pos, strategy_params=None):
-        states = getattr(self, 'utbreakout_trailing_states', {})
-        existing = states.get(symbol) if isinstance(states, dict) else None
+        symbol = self._canonical_futures_symbol(symbol)
+        existing = self._get_utbreakout_trailing_state(symbol)
         if isinstance(existing, dict):
             return existing
         if not pos:
@@ -13343,9 +13688,31 @@ class SignalEngine(BaseEngine):
         side = str(pos.get('side') or '').lower()
         if side not in {'long', 'short'}:
             return None
-        entry_price = _safe_float_or_none(pos.get('entryPrice'))
-        qty = abs(float(self._position_signed_contracts(pos) or pos.get('contracts', 0) or 0))
-        if entry_price is None or entry_price <= 0 or qty <= 0:
+        current_qty = abs(float(
+            self._position_signed_contracts(pos)
+            or pos.get('contracts', 0)
+            or 0
+        ))
+        entry_record = self._utbreakout_entry_record_for_symbol(symbol)
+        entry_metadata = dict(getattr(entry_record, 'metadata', {}) or {})
+        entry_plan = dict(entry_metadata.get('entry_plan_summary') or {})
+        record_entry_price = _safe_float_or_none(
+            getattr(entry_record, 'average_fill_price', None)
+        )
+        entry_price = (
+            record_entry_price
+            or _safe_float_or_none(pos.get('entryPrice'))
+        )
+        record_filled_qty = float(
+            getattr(entry_record, 'filled_qty', 0.0) or 0.0
+        )
+        record_initial_qty = (
+            record_filled_qty
+            if record_filled_qty > 0
+            else float(getattr(entry_record, 'requested_qty', 0.0) or 0.0)
+        )
+        original_qty = max(current_qty, record_initial_qty)
+        if entry_price is None or entry_price <= 0 or current_qty <= 0:
             return None
 
         fetch_ok, protection_orders = await self._collect_protection_orders_checked(symbol)
@@ -13362,9 +13729,6 @@ class SignalEngine(BaseEngine):
                 and self._protection_trigger_price(order) is not None
             )
         ]
-        if not bot_stop_orders:
-            return None
-
         adverse_stops = [
             order
             for order in bot_stop_orders
@@ -13376,20 +13740,52 @@ class SignalEngine(BaseEngine):
                 and float(self._protection_trigger_price(order)) > float(entry_price)
             )
         ]
-        if not adverse_stops:
-            return None
-        initial_stop_order = self._newest_protection_order(adverse_stops)
-        initial_stop = float(self._protection_trigger_price(initial_stop_order))
-        risk_distance = abs(float(entry_price) - initial_stop)
+        persisted_risk_distance = _safe_float_or_none(
+            entry_plan.get('risk_distance')
+        )
+        if persisted_risk_distance is not None:
+            persisted_risk_distance = abs(float(persisted_risk_distance))
+        initial_stop = None
+        if persisted_risk_distance is not None and persisted_risk_distance > 0:
+            initial_stop = (
+                float(entry_price) - persisted_risk_distance
+                if side == 'long'
+                else float(entry_price) + persisted_risk_distance
+            )
+        elif adverse_stops:
+            initial_stop_order = self._newest_protection_order(adverse_stops)
+            initial_stop = float(
+                self._protection_trigger_price(initial_stop_order)
+            )
+        risk_distance = (
+            abs(float(entry_price) - float(initial_stop))
+            if initial_stop is not None
+            else 0.0
+        )
         if risk_distance <= 0:
             return None
 
-        protective_stop_order = (
-            max(bot_stop_orders, key=lambda order: float(self._protection_trigger_price(order)))
-            if side == 'long'
-            else min(bot_stop_orders, key=lambda order: float(self._protection_trigger_price(order)))
-        )
-        protective_stop = float(self._protection_trigger_price(protective_stop_order))
+        protective_stop_order = None
+        protective_stop = float(initial_stop)
+        if bot_stop_orders:
+            protective_stop_order = (
+                max(
+                    bot_stop_orders,
+                    key=lambda order: float(
+                        self._protection_trigger_price(order)
+                    ),
+                )
+                if side == 'long'
+                else min(
+                    bot_stop_orders,
+                    key=lambda order: float(
+                        self._protection_trigger_price(order)
+                    ),
+                )
+            )
+            protective_stop = float(
+                self._protection_trigger_price(protective_stop_order)
+            )
         try:
             cfg = self._get_utbot_filtered_breakout_config(
                 strategy_params if isinstance(strategy_params, dict) else self.get_runtime_strategy_params()
@@ -13397,21 +13793,28 @@ class SignalEngine(BaseEngine):
         except Exception:
             cfg = build_default_utbot_filtered_breakout_config()
         cfg = apply_profit_opportunity_effective_overrides(dict(cfg or {}))
+        recovery_plan = dict(entry_plan)
+        recovery_plan.update({
+            'risk_distance': risk_distance,
+            'stop_loss': float(initial_stop),
+            'recovered_from_exchange': True,
+        })
         state = self._register_utbreakout_trailing_state(
             symbol,
             side,
             float(entry_price),
-            qty,
-            {
-                'risk_distance': risk_distance,
-                'stop_loss': initial_stop,
-                'recovered_from_exchange': True,
-            },
+            original_qty,
+            recovery_plan,
             cfg,
         )
         if not isinstance(state, dict):
             return None
         state['last_stop_price'] = protective_stop
+        state['sl_order_id'] = (
+            self._protection_order_id(protective_stop_order)
+            if protective_stop_order is not None
+            else None
+        )
         state['active'] = (
             protective_stop >= float(entry_price)
             if side == 'long'
@@ -13419,15 +13822,28 @@ class SignalEngine(BaseEngine):
         )
         state['recovered_from_exchange'] = True
         state['recovered_at'] = datetime.now(timezone.utc).isoformat()
-        self.utbreakout_trailing_states[symbol] = state
+        state['recovered_current_qty'] = current_qty
+        state['recovered_original_qty'] = original_qty
+        state = self._sync_utbreakout_state_with_protection_orders(
+            symbol,
+            state,
+            protection_orders,
+        )
+        state = self._update_utbreakout_fill_flags_from_position_qty(
+            symbol,
+            state,
+            current_qty,
+        )
+        self._set_utbreakout_trailing_state(symbol, state)
         logger.warning(
-            "[Protection Recovery] restored UTBreak state for %s: side=%s qty=%.12f "
+            "[Protection Recovery] restored UTBreak state for %s: side=%s qty=%.12f/%.12f "
             "entry=%.12f initial_stop=%.12f active_stop=%.12f",
             symbol,
             side,
-            qty,
+            current_qty,
+            original_qty,
             float(entry_price),
-            initial_stop,
+            float(initial_stop),
             protective_stop,
         )
         return state
@@ -13452,7 +13868,12 @@ class SignalEngine(BaseEngine):
                     continue
                 raw_symbol = self._protection_position_symbol(pos)
                 symbol_key = self._normalize_protection_symbol(raw_symbol)
-                symbol = self._protection_unified_symbol_from_key(symbol_key, raw_symbol)
+                symbol = self._canonical_futures_symbol(
+                    self._protection_unified_symbol_from_key(
+                        symbol_key,
+                        raw_symbol,
+                    )
+                )
                 if not symbol:
                     continue
                 self.active_symbols.add(symbol)
@@ -31041,7 +31462,7 @@ class SignalEngine(BaseEngine):
             tp_enabled = tp_master_enabled and bool(comm_cfg.get('take_profit_enabled', True))
             sl_enabled = tp_master_enabled and bool(comm_cfg.get('stop_loss_enabled', True))
             expected_tp, expected_sl = self._protection_expected_from_config(symbol, pos)
-            runner_state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
+            runner_state = self._get_utbreakout_trailing_state(symbol)
             if active_strategy in UTBREAKOUT_STRATEGIES and pos and not isinstance(runner_state, dict):
                 runner_state = await self._recover_utbreakout_trailing_state_from_exchange(
                     symbol,
@@ -33033,7 +33454,7 @@ class SignalEngine(BaseEngine):
             elif active_strategy in UTBREAKOUT_STRATEGIES:
                 filtered_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
                 if pos:
-                    trailing_state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
+                    trailing_state = self._get_utbreakout_trailing_state(symbol)
                     advanced_ladder = bool(
                         isinstance(trailing_state, dict)
                         and trailing_state.get('advanced_live_ladder_state')
@@ -35474,6 +35895,7 @@ class SignalEngine(BaseEngine):
                     for key in (
                         'strategy',
                         'plan_symbol',
+                        'stop_loss',
                         'risk_distance',
                         'rr_multiple',
                         'entry_timeframe',
@@ -35484,6 +35906,16 @@ class SignalEngine(BaseEngine):
                         'second_take_profit_r_multiple',
                         'second_take_profit_ratio',
                         'runner_pct',
+                        'atr_trailing_enabled',
+                        'atr_trailing_multiplier',
+                        'atr_trailing_activation_r',
+                        'runner_exit_enabled',
+                        'runner_chandelier_enabled',
+                        'tp1_breakeven_enabled',
+                        'tp1_breakeven_trigger_r',
+                        'tp1_breakeven_offset_r',
+                        'tp1_breakeven_wait_for_partial',
+                        'tp1_breakeven_qty_tolerance',
                     )
                     if entry_plan_attribution.get(key) is not None
                 },
@@ -35860,7 +36292,7 @@ class SignalEngine(BaseEngine):
                         )
                         if bool(plan.get('aggressive_growth_overlay')):
                             position_fetch_ok, fresh_pos = await self._fetch_server_position_checked(symbol)
-                            runner_state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
+                            runner_state = self._get_utbreakout_trailing_state(symbol)
                             audit_status = (
                                 await self._audit_protection_orders(
                                     symbol,
@@ -35998,14 +36430,44 @@ class SignalEngine(BaseEngine):
                     and protection_audit.get('sl_present')
                     and not protection_audit.get('sl_qty_mismatch')
                 ):
-                    stop_orders = await self._collect_protection_orders(symbol)
+                    protection_orders = await self._collect_protection_orders(symbol)
                     stop_order = next(
                         (
-                            item for item in (stop_orders or [])
+                            item for item in (protection_orders or [])
                             if self._classify_protection_order(item) == 'sl'
                         ),
                         None,
                     )
+                    trailing_state = self._get_utbreakout_trailing_state(symbol)
+                    if isinstance(trailing_state, dict):
+                        trailing_state = (
+                            self._sync_utbreakout_state_with_protection_orders(
+                                symbol,
+                                trailing_state,
+                                protection_orders,
+                            )
+                        )
+                    planned_tp_orders = self._planned_tp_orders_from_state(
+                        symbol,
+                        trailing_state,
+                    )
+                    take_profit_order_ids = []
+                    take_profit_order_labels = {}
+                    for item in protection_orders or []:
+                        if self._classify_protection_order(item) != 'tp':
+                            continue
+                        order_id = self._protection_order_id(item)
+                        if not order_id:
+                            continue
+                        label = self._protection_tp_label(
+                            item,
+                            planned_tp_orders,
+                        )
+                        take_profit_order_ids.append(str(order_id))
+                        if label:
+                            take_profit_order_labels[str(order_id)] = str(
+                                label
+                            ).upper()
                     _mark_crypto_entry_state(
                         self,
                         entry_client_order_id,
@@ -36015,6 +36477,8 @@ class SignalEngine(BaseEngine):
                             if stop_order is not None
                             else None
                         ),
+                        take_profit_order_ids=take_profit_order_ids,
+                        take_profit_order_labels=take_profit_order_labels,
                     )
                     if str(getattr(self, 'crypto_entry_lock_reason', '') or '').startswith('FILLED_'):
                         self._set_crypto_entry_lock(None)
@@ -36438,7 +36902,7 @@ class SignalEngine(BaseEngine):
 
     def _planned_tp_orders_from_state(self, symbol, state=None):
         if state is None:
-            state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
+            state = self._get_utbreakout_trailing_state(symbol)
         if not isinstance(state, dict):
             return []
         planned = []
@@ -37474,7 +37938,7 @@ class SignalEngine(BaseEngine):
         except (TypeError, ValueError):
             pos_entry_price = 0.0
         current_qty = abs(float(self._position_signed_contracts(pos) or pos.get('contracts', 0) or 0))
-        runner_state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
+        runner_state = self._get_utbreakout_trailing_state(symbol)
         tracked_records = []
         try:
             if hasattr(self, 'trading_state_store'):
@@ -37501,50 +37965,31 @@ class SignalEngine(BaseEngine):
         }
         inferred_filled_labels = []
         if planned_by_label and isinstance(runner_state, dict) and current_qty > 0:
-            try:
-                initial_qty = float(runner_state.get('initial_qty') or 0.0)
-            except (TypeError, ValueError):
-                initial_qty = 0.0
-            try:
-                qty_tolerance_ratio = min(
-                    0.5,
-                    max(0.0, float(runner_state.get('tp1_breakeven_qty_tolerance', 0.08) or 0.08))
+            before = {
+                label: bool(runner_state.get(f"{label.lower()}_filled"))
+                for label in planned_by_label
+            }
+            runner_state = self._update_utbreakout_fill_flags_from_position_qty(
+                symbol,
+                runner_state,
+                current_qty,
+            )
+            for label in planned_by_label:
+                filled = bool(
+                    runner_state.get(f"{label.lower()}_filled")
                 )
-            except (TypeError, ValueError):
-                qty_tolerance_ratio = 0.08
-            if initial_qty > 0 and current_qty < initial_qty:
-                cumulative_target_qty = 0.0
-                sorted_plans = sorted(
-                    planned_by_label.items(),
-                    key=lambda item: int((item[1] or {}).get('tp_index') or 99),
+                planned_by_label[label]['filled'] = filled
+                if filled and not before.get(label):
+                    inferred_filled_labels.append(label)
+            if inferred_filled_labels:
+                runner_state['last_tp_fill_inferred_qty'] = current_qty
+                runner_state['last_tp_fill_inferred_at'] = (
+                    datetime.now(timezone.utc).isoformat()
                 )
-                for label, plan in sorted_plans:
-                    expected_qty = _safe_float_or_none(plan.get('qty'))
-                    if expected_qty is None or expected_qty <= 0:
-                        continue
-                    cumulative_target_qty += float(expected_qty)
-                    expected_remaining_qty = max(0.0, initial_qty - cumulative_target_qty)
-                    tolerance_qty = max(initial_qty * qty_tolerance_ratio, float(expected_qty) * 0.1, 1e-9)
-                    if current_qty <= expected_remaining_qty + tolerance_qty:
-                        label_key = label.lower()
-                        if not bool(runner_state.get(f"{label_key}_filled", False)):
-                            runner_state[f"{label_key}_filled"] = True
-                            runner_state[f"{label_key}_filled_inferred_by_qty"] = True
-                            inferred_filled_labels.append(label)
-                            for item in runner_state.get('planned_tp_orders') or runner_state.get('tp_orders') or []:
-                                if (
-                                    isinstance(item, dict)
-                                    and _normalize_tp_plan_label(item.get('tp_label') or item.get('tp_name')) == label
-                                ):
-                                    item['filled'] = True
-                        planned_by_label[label]['filled'] = True
-                    else:
-                        break
-                if inferred_filled_labels:
-                    runner_state['last_tp_fill_inferred_qty'] = current_qty
-                    runner_state['last_tp_fill_inferred_at'] = datetime.now(timezone.utc).isoformat()
-                    self.utbreakout_trailing_states[symbol] = runner_state
-                    status['tp_filled_inferred_labels'] = list(inferred_filled_labels)
+                self._set_utbreakout_trailing_state(symbol, runner_state)
+                status['tp_filled_inferred_labels'] = list(
+                    inferred_filled_labels
+                )
         expected_tp_labels = []
         if planned_by_label:
             for label, plan in planned_by_label.items():
@@ -37745,7 +38190,22 @@ class SignalEngine(BaseEngine):
                 continue
             plan = planned_by_label.get(label, {})
             expected_qty = plan.get('qty')
-            if label == 'TP2' and isinstance(runner_state, dict) and bool(runner_state.get('tp1_filled', False)):
+            preserve_runner = bool(
+                isinstance(runner_state, dict)
+                and (
+                    runner_state.get('preserve_runner_qty')
+                    or _safe_float_value(
+                        runner_state.get('runner_pct'),
+                        0.0,
+                    ) > 0
+                )
+            )
+            if (
+                label == 'TP2'
+                and isinstance(runner_state, dict)
+                and bool(runner_state.get('tp1_filled', False))
+                and not preserve_runner
+            ):
                 expected_qty = current_qty
             actual_qty = self._protection_order_amount(order)
             if expected_qty is not None and actual_qty is not None and not self._qty_matches_plan(expected_qty, actual_qty):
@@ -38296,6 +38756,66 @@ class SignalEngine(BaseEngine):
             if newest_existing_sl
             else None
         )
+        reference_price = _safe_float_or_none(
+            pos.get('markPrice')
+            or pos.get('mark_price')
+            or pos.get('last')
+            or pos.get('currentPrice')
+        )
+        if reference_price is not None:
+            stop_is_live_safe = (
+                float(safe_stop) < float(reference_price)
+                if side == 'long'
+                else float(safe_stop) > float(reference_price)
+            )
+            if not stop_is_live_safe:
+                logger.warning(
+                    "SL replacement skipped for %s: requested stop %.12f is "
+                    "already beyond current mark %.12f (%s)",
+                    symbol,
+                    float(safe_stop),
+                    float(reference_price),
+                    reason,
+                )
+                if existing_sl:
+                    await self._notify_protection_issue(
+                        symbol,
+                        f"sl_replace_price_crossed:{self._protection_position_signature(pos)}",
+                        f"UTBreak {self.ctrl.format_symbol_for_display(symbol)} SL 교체 보류: "
+                        f"목표 SL {float(safe_stop):.8f}가 현재가 "
+                        f"{float(reference_price):.8f}를 이미 통과했습니다. 기존 SL을 유지합니다.",
+                        cooldown_sec=60,
+                    )
+                    return None
+                self.last_protection_order_status[symbol] = {
+                    'tp_expected': False,
+                    'sl_expected': True,
+                    'tp_present': False,
+                    'sl_present': False,
+                    'tp_count': 0,
+                    'sl_count': 0,
+                    'missing_tp': False,
+                    'missing_sl': True,
+                    'duplicate_cancelled': 0,
+                    'status': 'SL_REPLACE_TARGET_CROSSED_UNPROTECTED',
+                }
+                await self._notify_protection_issue(
+                    symbol,
+                    f"sl_replace_crossed_unprotected:{self._protection_position_signature(pos)}",
+                    f"🚨 {self.ctrl.format_symbol_for_display(symbol)} 보호 SL이 없고 "
+                    f"교체 목표 {float(safe_stop):.8f}도 현재가 "
+                    f"{float(reference_price):.8f}를 이미 통과했습니다. 즉시 비상청산합니다.",
+                    cooldown_sec=60,
+                )
+                await self._emergency_close_position_without_stop_loss(
+                    symbol,
+                    reason=(
+                        "SL replacement target already crossed while no "
+                        f"existing SL was open: {reason}"
+                    ),
+                    max_attempts=5,
+                )
+                return None
         if existing_stop is not None:
             stop_tolerance = max(abs(float(safe_stop)) * 1e-9, 1e-12)
             if abs(float(existing_stop) - float(safe_stop)) <= stop_tolerance:
@@ -38435,10 +38955,15 @@ class SignalEngine(BaseEngine):
                 'duplicate_cancelled': 0,
                 'status': 'SL_REPLACED_CONFIRMATION_UNVERIFIED'
             }
+        if replacement:
+            self._persist_active_entry_protection_refs(
+                symbol,
+                stop_order_id=self._protection_order_id(replacement),
+            )
         return replacement
 
     async def _manage_utbreakout_partial_trailing(self, symbol, pos, df, cfg):
-        state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
+        state = self._get_utbreakout_trailing_state(symbol)
         if not isinstance(state, dict):
             return None
         if bool(state.get('advanced_live_ladder_state', False)):
@@ -38470,12 +38995,21 @@ class SignalEngine(BaseEngine):
             return None
 
         if state.get('planned_tp_orders') or state.get('tp_orders'):
-            audit_status = await self._audit_and_repair_live_ladder_protection(
+            # Record quantity reductions as filled TP legs before auditing.
+            # Auditing first could misread a legitimately filled TP as missing
+            # and recreate it, producing an unintended extra partial exit.
+            state = await self._refresh_ladder_fill_state(
                 symbol,
                 pos,
                 state,
                 cfg,
-                reason='UTBreak monitor residual audit'
+            )
+            audit_status = dict(
+                (getattr(self, 'last_protection_order_status', {}) or {}).get(
+                    symbol,
+                    {},
+                )
+                or {}
             )
             fallback_status = await self._maybe_tp2_fallback_close(symbol, pos, state, cfg, audit_status=audit_status)
             if fallback_status.get('status') == 'TP2_FALLBACK_CLOSED':
@@ -38525,9 +39059,11 @@ class SignalEngine(BaseEngine):
             0.5,
             max(0.0, float(cfg.get('tp1_breakeven_qty_tolerance', state.get('tp1_breakeven_qty_tolerance', 0.08)) or 0.08))
         )
-        partial_qty_seen = current_qty <= initial_qty * min(
-            0.98,
-            max(0.05, tp1_expected_remaining_ratio + qty_tolerance),
+        partial_qty_seen = bool(state.get('tp1_filled')) or (
+            current_qty <= initial_qty * min(
+                0.98,
+                max(0.05, tp1_expected_remaining_ratio + qty_tolerance),
+            )
         )
         raw_bar_ts = (
             closed.iloc[-1].get('timestamp')
@@ -38547,7 +39083,7 @@ class SignalEngine(BaseEngine):
             'mfe_r': float(mfe_r),
             'mae_r': float(mae_r),
         })
-        self.utbreakout_trailing_states[symbol] = state
+        self._set_utbreakout_trailing_state(symbol, state)
 
         if soft_stop_enabled:
             soft_stop = _safe_float_or_none(state.get('soft_stop_price'))
@@ -38557,7 +39093,7 @@ class SignalEngine(BaseEngine):
                     state['soft_stop_breach_count'] = int(state.get('soft_stop_breach_count', 0) or 0) + 1
                 else:
                     state['soft_stop_breach_count'] = 0
-                self.utbreakout_trailing_states[symbol] = state
+                self._set_utbreakout_trailing_state(symbol, state)
                 confirm_bars = max(
                     1,
                     int(cfg.get('soft_stop_confirm_bars', state.get('soft_stop_confirm_bars', 2)) or 2),
@@ -38670,7 +39206,7 @@ class SignalEngine(BaseEngine):
                 if state.get(attempt_key) == current_bar_ts:
                     continue
                 state[attempt_key] = current_bar_ts
-                self.utbreakout_trailing_states[symbol] = state
+                self._set_utbreakout_trailing_state(symbol, state)
                 replacement_order = await self._replace_stop_loss_order(
                     symbol,
                     pos,
@@ -38694,7 +39230,7 @@ class SignalEngine(BaseEngine):
                         'runner_updates': int(state.get('runner_updates') or 0) + 1,
                         'last_update_ts': datetime.now(timezone.utc).isoformat(),
                     })
-                    self.utbreakout_trailing_states[symbol] = state
+                    self._set_utbreakout_trailing_state(symbol, state)
                     await self.ctrl.notify(
                         f"?㎛ UTBreak near-miss {label}: {self.ctrl.format_symbol_for_display(symbol)} "
                         f"{side.upper()} SL `{float(near_stop):.4f}` ({lock_r:.2f}R lock)"
@@ -38860,7 +39396,7 @@ class SignalEngine(BaseEngine):
                         'runner_updates': int(state.get('runner_updates') or 0) + 1,
                         'last_update_ts': datetime.now(timezone.utc).isoformat(),
                     })
-                    self.utbreakout_trailing_states[symbol] = state
+                    self._set_utbreakout_trailing_state(symbol, state)
                     audit_status = await self._audit_protection_orders(
                         symbol,
                         pos=pos,
@@ -38982,7 +39518,7 @@ class SignalEngine(BaseEngine):
                 raw_trail = lock_stop
                 runner_mode = f'mfe_lock_stage_{mfe_lock.stage}'
                 runner_multiplier = None
-        self.utbreakout_trailing_states[symbol] = state
+        self._set_utbreakout_trailing_state(symbol, state)
 
         last_stop = float(state.get('last_stop_price') or 0.0)
         new_stop = max(last_stop, raw_trail) if side == 'long' else (min(last_stop, raw_trail) if last_stop > 0 else raw_trail)
@@ -39025,7 +39561,7 @@ class SignalEngine(BaseEngine):
             'runner_updates': int(state.get('runner_updates') or 0) + 1,
             'last_update_ts': datetime.now(timezone.utc).isoformat(),
         })
-        self.utbreakout_trailing_states[symbol] = state
+        self._set_utbreakout_trailing_state(symbol, state)
         audit_status = await self._audit_protection_orders(
             symbol,
             pos=pos,
@@ -39111,7 +39647,7 @@ class SignalEngine(BaseEngine):
         key = self._aggressive_growth_symbol_key(symbol)
         tracked = getattr(self, 'aggressive_growth_positions', {})
         meta = tracked.get(key) if isinstance(tracked, dict) else None
-        state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
+        state = self._get_utbreakout_trailing_state(symbol)
         if not isinstance(meta, dict) and isinstance(state, dict) and bool(state.get('aggressive_growth_overlay')):
             meta = self._record_aggressive_growth_position(symbol, pos, state)
         if not isinstance(meta, dict):
@@ -39335,7 +39871,7 @@ class SignalEngine(BaseEngine):
                     'last_stop_price': breakeven_stop,
                     'last_update_ts': datetime.now(timezone.utc).isoformat(),
                 })
-                self.utbreakout_trailing_states[symbol] = state
+                self._set_utbreakout_trailing_state(symbol, state)
             pre_add_audit = await self._audit_protection_orders(
                 symbol,
                 pos=pos,
@@ -39520,7 +40056,7 @@ class SignalEngine(BaseEngine):
             state_plan,
             effective_cfg,
         )
-        runner_state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
+        runner_state = self._get_utbreakout_trailing_state(symbol)
         audit_status = await self._audit_protection_orders(
             symbol,
             pos=new_pos,
@@ -40215,7 +40751,7 @@ class SignalEngine(BaseEngine):
             self._clear_utsmc_fixed_exit_ob(symbol)
             self.utsmc_last_entry_signal_ts.pop(symbol, None)
 
-        accounting_state = getattr(self, 'utbreakout_trailing_states', {}).get(symbol)
+        accounting_state = self._get_utbreakout_trailing_state(symbol)
         await self._record_closed_trade_accounting(
             symbol,
             reason,
@@ -52773,11 +53309,10 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     if signal_engine:
                         await asyncio.sleep(0.5)
                         trailing_state = None
-                        if isinstance(
-                            getattr(signal_engine, 'utbreakout_trailing_states', None),
-                            dict,
-                        ):
-                            trailing_state = signal_engine.utbreakout_trailing_states.get(sym)
+                        if hasattr(signal_engine, '_get_utbreakout_trailing_state'):
+                            trailing_state = (
+                                signal_engine._get_utbreakout_trailing_state(sym)
+                            )
                         emergency_exit_price = (
                             order.get('average')
                             if isinstance(order, dict) and order.get('average')
@@ -55374,7 +55909,7 @@ def _collapse_state_tp_plan_for_exchange(self, symbol, pos, state):
     state["tp_min_amount_fallback"] = dict(details)
     state["tp2_disabled_min_amount"] = True
     state["remaining_ratio"] = 0.0
-    getattr(self, "utbreakout_trailing_states", {})[symbol] = state
+    self._set_utbreakout_trailing_state(symbol, state)
     logger.warning(
         "[Protection] collapsed TP state for %s to one executable order: qty=%.12f min_amount=%.12f",
         symbol,
@@ -56825,7 +57360,11 @@ async def _repair_missing_tp_order(
     label = _normalize_tp_plan_label(label, "TP2")
     label_key = label.lower()
     status = {"status": "SKIPPED", "symbol": symbol, "label": label}
-    state = state if isinstance(state, dict) else getattr(self, "utbreakout_trailing_states", {}).get(symbol)
+    state = (
+        state
+        if isinstance(state, dict)
+        else self._get_utbreakout_trailing_state(symbol)
+    )
     if not isinstance(state, dict) or not pos:
         status["status"] = "NO_STATE_OR_POSITION"
         return status
@@ -56854,15 +57393,28 @@ async def _repair_missing_tp_order(
 
     audit_status = audit_status or {}
     planned_qty = _safe_float_value(tp_plan.get("qty"), 0.0)
+    preserve_runner = bool(
+        state.get("preserve_runner_qty")
+        or _safe_float_value(state.get("runner_pct"), 0.0) > 0
+    )
     use_current_residual = (
-        label == "TP2"
-        and (
-            bool(state.get("tp1_filled", False))
-            or current_qty < float(state.get("initial_qty", current_qty) or current_qty) * 0.98
+        planned_qty <= 0
+        or (
+            label == "TP2"
+            and bool(state.get("tp1_filled", False))
+            and not preserve_runner
         )
     )
-    repair_qty_source = "current_position" if use_current_residual else "planned_residual"
-    raw_qty = current_qty if use_current_residual or planned_qty <= 0 else min(planned_qty, current_qty)
+    repair_qty_source = (
+        "current_position"
+        if use_current_residual
+        else "planned_residual"
+    )
+    raw_qty = (
+        current_qty
+        if use_current_residual
+        else min(planned_qty, current_qty)
+    )
     repair_qty = _safe_float_value(self.safe_amount(symbol, raw_qty), 0.0)
     if repair_qty <= 0:
         logger.error("[%s Repair] %s qty <= 0 after precision for %s: raw=%s", label, label, symbol, raw_qty)
@@ -56891,8 +57443,13 @@ async def _repair_missing_tp_order(
         min_notional = float((cfg or {}).get("min_notional_usdt", 5.0) or 5.0)
     notional = repair_qty * target_price
     if min_notional > 0 and notional < min_notional:
-        logger.critical(
-            "[%s Repair] min notional failed for %s: qty=%.12f price=%.12f notional=%.8f min=%.8f",
+        # Partial fills can leave a valid reduce-only protection order below
+        # the ordinary entry minimum. Let the exchange decide, matching the
+        # initial protection path, instead of locally abandoning the repair.
+        logger.warning(
+            "[%s Repair] reduce-only notional below configured entry minimum "
+            "for %s; submitting to exchange: qty=%.12f price=%.12f "
+            "notional=%.8f min=%.8f",
             label,
             symbol,
             repair_qty,
@@ -56900,9 +57457,10 @@ async def _repair_missing_tp_order(
             notional,
             min_notional,
         )
-        await self.ctrl.notify(f"🚨 {symbol} {label} 재생성 실패: 최소 주문금액 미달 notional={notional:.6f} < {min_notional:.6f}")
-        status.update({"status": f"{label}_REPAIR_MIN_NOTIONAL_FAILED", "qty": repair_qty, "price": target_price, "notional": notional})
-        return status
+        status["min_notional_warning"] = {
+            "notional": float(notional),
+            "configured_min": float(min_notional),
+        }
 
     tp_order = TakeProfitOrderPlan(
         label,
@@ -56961,7 +57519,16 @@ async def _repair_missing_tp_order(
             item["filled"] = False
     state[f"{label_key}_order_id"] = order_id
     state[f"last_{label_key}_repair_ts"] = datetime.now(timezone.utc).isoformat()
-    getattr(self, "utbreakout_trailing_states", {})[symbol] = state
+    self._set_utbreakout_trailing_state(symbol, state)
+    self._persist_active_entry_protection_refs(
+        symbol,
+        take_profit_order_ids=[order_id] if order_id else [],
+        take_profit_order_labels=(
+            {str(order_id): label}
+            if order_id
+            else {}
+        ),
+    )
     logger.info(
         "[%s Repair] recreated %s for %s: side=%s qty=%.12f price=%.12f source=%s order_id=%s",
         label,
@@ -57025,7 +57592,7 @@ async def _audit_and_repair_live_ladder_protection(self, symbol, pos, state, cfg
                 state["active"] = True
                 state["last_stop_price"] = float(stop_price)
                 state["sl_order_id"] = repaired_sl.get("id") if isinstance(repaired_sl, dict) else None
-                getattr(self, "utbreakout_trailing_states", {})[symbol] = state
+                self._set_utbreakout_trailing_state(symbol, state)
     if audit.get("missing_tp1") and "TP1" in planned:
         logger.warning("[Protection Audit] TP1 repair required for %s: %s", symbol, audit.get("status"))
         repair = await _repair_missing_tp_order(
@@ -57100,12 +57667,12 @@ async def _maybe_tp2_fallback_close(self, symbol, pos, state, cfg, audit_status=
     snapshot = await _fetch_tp2_price_snapshot(self, symbol)
     if not _tp2_target_reached(side, tp2_plan.get("price"), snapshot):
         state["tp2_fallback_reached_loops"] = 0
-        getattr(self, "utbreakout_trailing_states", {})[symbol] = state
+        self._set_utbreakout_trailing_state(symbol, state)
         return {"status": "NOT_REACHED", "snapshot": snapshot}
 
     loops = int(state.get("tp2_fallback_reached_loops", 0) or 0) + 1
     state["tp2_fallback_reached_loops"] = loops
-    getattr(self, "utbreakout_trailing_states", {})[symbol] = state
+    self._set_utbreakout_trailing_state(symbol, state)
     confirm_loops = max(1, int((cfg or {}).get("tp2_fallback_confirm_loops", 2) or 2))
     logger.warning(
         "[TP2 Fallback] target reached for %s loop %s/%s, price=%s snapshot=%s audit=%s",
@@ -57128,7 +57695,7 @@ async def _maybe_tp2_fallback_close(self, symbol, pos, state, cfg, audit_status=
         return {"status": "POSITION_FETCH_FAILED"}
     if not fresh_pos:
         state["tp2_fallback_reached_loops"] = 0
-        getattr(self, "utbreakout_trailing_states", {})[symbol] = state
+        self._set_utbreakout_trailing_state(symbol, state)
         return {"status": "ALREADY_FLAT"}
     order = await self._close_position_reduce_only_market(symbol, fresh_pos, reason="TP2 fallback close", cfg=cfg or {})
     state["tp2_fallback_reached_loops"] = 0
@@ -57136,14 +57703,14 @@ async def _maybe_tp2_fallback_close(self, symbol, pos, state, cfg, audit_status=
         bool((order or {}).get("_flat_confirmed"))
         and bool((order or {}).get("_cleanup_confirmed"))
     ):
-        getattr(self, "utbreakout_trailing_states", {})[symbol] = state
+        self._set_utbreakout_trailing_state(symbol, state)
         return {
             "status": "TP2_FALLBACK_CLOSE_PENDING",
             "order": order,
             "snapshot": snapshot,
         }
     state["tp2_fallback_closed_at"] = datetime.now(timezone.utc).isoformat()
-    getattr(self, "utbreakout_trailing_states", {})[symbol] = state
+    self._set_utbreakout_trailing_state(symbol, state)
     logger.warning("[TP2 Fallback] reduceOnly market close executed for %s: %s", symbol, order)
     await self.ctrl.notify(f"⚠️ {symbol} TP2 도달 후 미체결 fallback 시장가 청산 실행")
     return {"status": "TP2_FALLBACK_CLOSED", "order": order, "snapshot": snapshot}
@@ -57154,7 +57721,7 @@ async def _maybe_tp2_fallback_close(self, symbol, pos, state, cfg, audit_status=
 # ==============================================================================
 
 async def _manage_live_ladder_exit_policy(self, symbol, pos, df, cfg):
-    state = getattr(self, "utbreakout_trailing_states", {}).get(symbol)
+    state = self._get_utbreakout_trailing_state(symbol)
     if not isinstance(state, dict):
         return None
     if not pos:
@@ -57205,14 +57772,14 @@ async def _manage_live_ladder_exit_policy(self, symbol, pos, df, cfg):
         if previous_bar_ts is None:
             state["last_bar_ts"] = closed_bar_ts
             new_closed_bar = False
-            self.utbreakout_trailing_states[symbol] = state
+            self._set_utbreakout_trailing_state(symbol, state)
         else:
             new_closed_bar = closed_bar_ts != previous_bar_ts
         if new_closed_bar:
             state["bars_seen"] = int(state.get("bars_seen", 0) or 0) + 1
             state["last_bar_ts"] = closed_bar_ts
             current_bar["index"] = int(state["bars_seen"])
-            self.utbreakout_trailing_states[symbol] = state
+            self._set_utbreakout_trailing_state(symbol, state)
     except Exception:
         return None
 
@@ -57313,7 +57880,7 @@ async def _close_position_reduce_only_market(self, symbol, pos, reason, cfg):
     params["reduceOnly"] = True
     _ensure_trading_safety_runtime(self)
     owner = getattr(self, 'ctrl', None) or self
-    state = getattr(self, "utbreakout_trailing_states", {}).get(symbol) or {}
+    state = self._get_utbreakout_trailing_state(symbol) or {}
     close_submission = await owner.crypto_execution_service.submit_reduce_only_close(
         strategy=str(state.get("engine") or "UTBREAKOUT_EXIT"),
         symbol=symbol,
@@ -57375,7 +57942,7 @@ async def _close_position_reduce_only_market(self, symbol, pos, reason, cfg):
         _safe_float_or_none(result.get('average'))
         or _safe_float_or_none(result.get('price'))
     )
-    state = getattr(self, "utbreakout_trailing_states", {}).get(symbol)
+    state = self._get_utbreakout_trailing_state(symbol)
     result['_accounting'] = await self._record_closed_trade_accounting(
         symbol,
         reason,
@@ -57453,8 +58020,7 @@ def _register_live_ladder_position_state(self, plan, pos, sl_order, tp_orders, c
         "created_at": datetime.now(timezone.utc).isoformat(),
         "sl_order_id": sl_order.get("id") if isinstance(sl_order, dict) else None,
     }
-    self.utbreakout_trailing_states[plan.symbol] = state
-    return state
+    return self._set_utbreakout_trailing_state(plan.symbol, state)
 
 async def _refresh_ladder_fill_state(self, symbol, pos, state, cfg):
     current_qty = abs(float(self._position_signed_contracts(pos) or pos.get("contracts", 0) or 0))
@@ -57462,15 +58028,23 @@ async def _refresh_ladder_fill_state(self, symbol, pos, state, cfg):
     if initial_qty <= 0:
         return state
 
-    remaining_ratio = current_qty / initial_qty
-    if not state.get("tp1_filled") and remaining_ratio <= 0.75:
-        state["tp1_filled"] = True
-    if not state.get("tp2_filled") and remaining_ratio <= 0.35:
-        state["tp2_filled"] = True
-    if not state.get("tp3_filled") and remaining_ratio <= 0.05:
-        state["tp3_filled"] = True
-
-    if state.get("tp1_filled") and not state.get("sl_moved_to_be"):
+    state = self._update_utbreakout_fill_flags_from_position_qty(
+        symbol,
+        state,
+        current_qty,
+    )
+    tp1_breakeven_enabled = bool(
+        (cfg or {}).get(
+            "tp1_breakeven_enabled",
+            state.get("tp1_breakeven_enabled", True),
+        )
+    )
+    if (
+        state.get("tp1_filled")
+        and not state.get("tp2_filled")
+        and tp1_breakeven_enabled
+        and not state.get("sl_moved_to_be")
+    ):
         breakeven_stop = self._calculate_be_plus_fees_stop(pos, state, cfg)
         replacement = await self._replace_stop_loss_order(
             symbol,
@@ -57480,28 +58054,63 @@ async def _refresh_ladder_fill_state(self, symbol, pos, state, cfg):
         )
         if replacement:
             state["sl_moved_to_be"] = True
+            state["breakeven_armed"] = True
             state["active"] = True
             state["last_stop_price"] = float(breakeven_stop)
             state["sl_order_id"] = replacement.get("id") if isinstance(replacement, dict) else None
-            self.utbreakout_trailing_states[symbol] = state
+            state["runner_mode"] = "tp1_breakeven"
+            self._set_utbreakout_trailing_state(symbol, state)
 
     if state.get("tp2_filled") and not state.get("sl_moved_to_tp1_area"):
         tp1_area_stop = self._calculate_tp1_area_stop(pos, state, cfg)
+        side = str(state.get("side") or pos.get("side") or "").lower()
+        current_price = _safe_float_or_none(
+            pos.get("markPrice")
+            or pos.get("mark_price")
+            or pos.get("last")
+            or pos.get("currentPrice")
+        )
+        chosen_stop = float(tp1_area_stop)
+        lock_mode = "tp2_tp1_area"
+        if current_price is not None:
+            tp1_area_valid = (
+                chosen_stop < current_price
+                if side == "long"
+                else chosen_stop > current_price
+            )
+            if not tp1_area_valid:
+                fallback_stop = float(
+                    self._calculate_be_plus_fees_stop(pos, state, cfg)
+                )
+                fallback_valid = (
+                    fallback_stop < current_price
+                    if side == "long"
+                    else fallback_stop > current_price
+                )
+                if fallback_valid:
+                    chosen_stop = fallback_stop
+                    lock_mode = "tp2_breakeven_fallback"
         replacement = await self._replace_stop_loss_order(
             symbol,
             pos,
-            tp1_area_stop,
+            chosen_stop,
             reason="TP2 filled -> profit protection stop"
         )
         if replacement:
-            state["sl_moved_to_tp1_area"] = True
+            state["sl_moved_to_tp1_area"] = lock_mode == "tp2_tp1_area"
+            state["tp2_profit_lock_pending"] = (
+                lock_mode != "tp2_tp1_area"
+            )
+            state["sl_moved_to_be"] = True
+            state["breakeven_armed"] = True
             state["active"] = True
-            state["last_stop_price"] = float(tp1_area_stop)
+            state["last_stop_price"] = float(chosen_stop)
             state["sl_order_id"] = replacement.get("id") if isinstance(replacement, dict) else None
-            self.utbreakout_trailing_states[symbol] = state
+            state["runner_mode"] = lock_mode
+            self._set_utbreakout_trailing_state(symbol, state)
 
     if hasattr(self, "_audit_protection_orders"):
-        self.utbreakout_trailing_states[symbol] = state
+        self._set_utbreakout_trailing_state(symbol, state)
         await self._audit_and_repair_live_ladder_protection(
             symbol,
             pos,
@@ -57510,8 +58119,7 @@ async def _refresh_ladder_fill_state(self, symbol, pos, state, cfg):
             reason="ladder fill-state residual audit",
         )
 
-    self.utbreakout_trailing_states[symbol] = state
-    return state
+    return self._set_utbreakout_trailing_state(symbol, state)
 
 def _calculate_be_plus_fees_stop(self, pos, state, cfg):
     entry = float(state["entry_price"])
@@ -57528,10 +58136,23 @@ def _calculate_tp1_area_stop(self, pos, state, cfg):
     side = str(state["side"]).lower()
     tp1_r = 1.0
 
-    tp_orders = state.get("tp_orders", [])
+    tp_orders = (
+        state.get("planned_tp_orders")
+        or state.get("tp_orders")
+        or []
+    )
     for tp in tp_orders:
-        if tp.get("tp_name") == "TP1":
-            return float(tp.get("price"))
+        if not isinstance(tp, dict):
+            continue
+        label = _normalize_tp_plan_label(
+            tp.get("tp_label")
+            or tp.get("tp_name")
+            or tp.get("label"),
+            "",
+        )
+        price = _safe_float_or_none(tp.get("price"))
+        if label == "TP1" and price is not None and price > 0:
+            return float(price)
     if side == "long":
         return entry + risk * tp1_r
     return entry - risk * tp1_r

@@ -3666,7 +3666,7 @@ def test_live_ladder_flat_cleanup_keeps_state_when_order_fetch_is_unverified():
 
     assert result["status"] == "FLAT_CLEANUP_PENDING"
     assert result["audit"]["cleanup_confirmed"] is False
-    assert "BTC/USDT" in engine.utbreakout_trailing_states
+    assert "BTC/USDT:USDT" in engine.utbreakout_trailing_states
 
 
 def test_live_ladder_repeated_poll_does_not_increment_closed_bar_count():
@@ -4897,7 +4897,7 @@ def test_restart_recovery_rebuilds_small_position_tp_from_bot_algo_stops():
     engine.get_runtime_strategy_params = lambda: strategy_params
 
     result = asyncio.run(engine._recover_open_utbreakout_positions_on_start())
-    state = engine.utbreakout_trailing_states["SNDK/USDT"]
+    state = engine.utbreakout_trailing_states["SNDK/USDT:USDT"]
 
     assert result == {"status": "OK", "recovered": 1, "audited": 1}
     assert state["recovered_from_exchange"] is True
@@ -4909,6 +4909,92 @@ def test_restart_recovery_rebuilds_small_position_tp_from_bot_algo_stops():
     assert float(created_tp["price"]) == pytest.approx(121.6)
     assert engine.exchange.algo_cancelled == ["4000001", "4000002"]
     assert [order["algoId"] for order in engine.exchange.algo_orders] == ["4000003"]
+
+
+def test_restart_recovery_uses_persisted_entry_risk_after_profit_stop():
+    emas = _emas_module()
+    pos = {
+        "symbol": "RAVE/USDT:USDT",
+        "side": "long",
+        "contracts": "13",
+        "entryPrice": "0.3007",
+        "markPrice": "0.3320",
+    }
+    profit_stop = {
+        "algoId": "4000009",
+        "clientAlgoId": "utbslRAVEprofit",
+        "symbol": "RAVEUSDT",
+        "orderType": "STOP_MARKET",
+        "side": "SELL",
+        "quantity": "13",
+        "triggerPrice": "0.3142",
+        "reduceOnly": "true",
+        "createTime": 3000,
+    }
+    engine = _protection_engine([], positions=[pos])
+    engine.exchange = _BinanceAlgoExchange(
+        [],
+        algo_orders=[profit_stop],
+        positions=[pos],
+        min_amount=1.0,
+        min_cost=1.0,
+    )
+    engine.exchange.amount_to_precision = (
+        lambda symbol, amount: str(math.floor(float(amount)))
+    )
+    engine.utbreakout_trailing_states = {}
+    engine.trading_state_store = SQLiteTradingStateStore(":memory:")
+    engine.trading_state_store.upsert(
+        OrderRecord(
+            client_order_id="quada-rave-entry",
+            exchange_order_id="entry-order",
+            symbol="RAVE/USDT:USDT",
+            side="LONG",
+            strategy="quad_alpha_v1",
+            signal_timestamp="2026-07-16T03:48:00+00:00",
+            requested_qty=31.0,
+            filled_qty=31.0,
+            average_fill_price=0.3007,
+            order_state=OrderState.PROTECTED.value,
+            order_intent="ENTRY",
+            stop_order_id="4000009",
+            metadata={
+                "entry_plan_summary": {
+                    "risk_distance": 0.01430587774618658,
+                    "partial_take_profit_ratio": 0.28,
+                    "partial_take_profit_r_multiple": 1.0,
+                    "second_take_profit_ratio": 0.35,
+                    "second_take_profit_r_multiple": 2.45,
+                    "runner_pct": 0.37,
+                    "atr_trailing_enabled": True,
+                    "tp1_breakeven_enabled": True,
+                }
+            },
+        )
+    )
+    strategy_params = {
+        "active_strategy": emas.QUAD_ALPHA_STRATEGY,
+        "UTBotFilteredBreakoutV1": emas.build_default_utbot_filtered_breakout_config(),
+    }
+    engine.get_runtime_strategy_params = lambda: strategy_params
+
+    state = asyncio.run(
+        engine._recover_utbreakout_trailing_state_from_exchange(
+            "RAVE/USDT",
+            pos,
+            strategy_params,
+        )
+    )
+
+    assert state["state_symbol"] == "RAVE/USDT:USDT"
+    assert state["initial_qty"] == pytest.approx(31.0)
+    assert state["recovered_current_qty"] == pytest.approx(13.0)
+    assert state["risk_distance"] == pytest.approx(0.01430587774618658)
+    assert state["last_stop_price"] == pytest.approx(0.3142)
+    assert [item["qty"] for item in state["planned_tp_orders"]] == [8.0, 10.0]
+    assert state["tp1_filled"] is True
+    assert state["tp2_filled"] is True
+    assert set(engine.utbreakout_trailing_states) == {"RAVE/USDT:USDT"}
 
 
 def test_protection_audit_marks_tp1_only_as_missing_tp2():
@@ -5092,6 +5178,84 @@ def test_missing_tp2_repair_recreates_planned_residual_order():
     assert float(created_tp2["amount"]) == 1.0
     assert float(created_tp2["price"]) == 120.0
     assert "tp2" in created_tp2["clientOrderId"].lower()
+
+
+def test_missing_tp2_repair_preserves_planned_runner_quantity():
+    pos = {
+        "symbol": "RAVE/USDT:USDT",
+        "side": "long",
+        "contracts": "23",
+        "entryPrice": "0.3007",
+        "markPrice": "0.3200",
+    }
+    stop = {
+        "id": "sl-existing",
+        "side": "sell",
+        "type": "stop_market",
+        "amount": "23",
+        "reduceOnly": True,
+        "info": {
+            "symbol": "RAVEUSDT",
+            "origType": "STOP_MARKET",
+            "stopPrice": "0.3012",
+            "reduceOnly": "true",
+        },
+    }
+    engine = _protection_engine([stop], positions=[pos])
+    state = {
+        "side": "long",
+        "entry_price": 0.3007,
+        "initial_qty": 31.0,
+        "last_stop_price": 0.3012,
+        "planned_tp_orders": [
+            {
+                "tp_index": 1,
+                "tp_label": "TP1",
+                "tp_name": "TP1",
+                "side": "sell",
+                "price": 0.3142,
+                "qty": 8.0,
+                "filled": True,
+            },
+            {
+                "tp_index": 2,
+                "tp_label": "TP2",
+                "tp_name": "TP2",
+                "side": "sell",
+                "price": 0.3338,
+                "qty": 10.0,
+                "filled": False,
+            },
+        ],
+        "tp1_filled": True,
+        "tp2_filled": False,
+        "runner_pct": 0.37,
+        "preserve_runner_qty": True,
+        "active": True,
+    }
+    engine.utbreakout_trailing_states = {"RAVE/USDT:USDT": state}
+
+    result = asyncio.run(
+        engine._audit_and_repair_live_ladder_protection(
+            "RAVE/USDT:USDT",
+            pos,
+            state,
+            {"min_notional_usdt": 0.0},
+            reason="runner TP2 recovery",
+        )
+    )
+
+    assert result["tp2_repair"]["status"] == "TP2_REPAIRED"
+    assert result["tp2_repair"]["qty_source"] == "planned_residual"
+    created_tp2 = [
+        order
+        for order in engine.exchange.created
+        if order["type"] == "limit" and order["side"] == "sell"
+    ][-1]
+    assert float(created_tp2["amount"]) == pytest.approx(10.0)
+    assert float(pos["contracts"]) - float(created_tp2["amount"]) == pytest.approx(
+        13.0
+    )
 
 
 def test_place_tp_sl_orders_uses_position_amt_for_short_futures_symbol():
@@ -5913,7 +6077,7 @@ def test_utbreakout_trailing_does_not_create_duplicate_sl_when_cancel_does_not_c
     assert state is None
     assert ("sl-old", "BTC/USDT") in engine.exchange.cancelled
     assert engine.exchange.created == []
-    assert engine.utbreakout_trailing_states["BTC/USDT"]["last_stop_price"] == 90.0
+    assert engine.utbreakout_trailing_states["BTC/USDT:USDT"]["last_stop_price"] == 90.0
     remaining_sl = [
         order for order in engine.exchange.orders
         if engine._classify_protection_order(order) == "sl"
@@ -5985,6 +6149,81 @@ def test_ladder_fill_state_repairs_sl_and_tp2_to_current_residual_qty():
     assert engine.last_protection_order_status["BTC/USDT"]["sl_present"] is True
 
 
+def test_rave_style_tp_ratios_lock_runner_after_tp2_fill():
+    pos = {
+        "symbol": "RAVE/USDT:USDT",
+        "side": "long",
+        "contracts": "13",
+        "entryPrice": "0.3007",
+        "markPrice": "0.3320",
+    }
+    engine = _protection_engine([], positions=[pos])
+    state = {
+        "side": "long",
+        "entry_price": 0.3007,
+        "initial_qty": 31.0,
+        "risk_distance": 0.01430587774618658,
+        "initial_stop_price": 0.2864,
+        "last_stop_price": 0.2864,
+        "planned_tp_orders": [
+            {
+                "tp_index": 1,
+                "tp_label": "TP1",
+                "tp_name": "TP1",
+                "side": "sell",
+                "price": 0.3142,
+                "qty": 8.0,
+                "filled": False,
+            },
+            {
+                "tp_index": 2,
+                "tp_label": "TP2",
+                "tp_name": "TP2",
+                "side": "sell",
+                "price": 0.3338,
+                "qty": 10.0,
+                "filled": False,
+            },
+        ],
+        "tp1_filled": False,
+        "tp2_filled": False,
+        "sl_moved_to_be": False,
+        "sl_moved_to_tp1_area": False,
+        "tp1_breakeven_enabled": True,
+    }
+    engine.utbreakout_trailing_states = {"RAVE/USDT:USDT": state}
+    replacements = []
+
+    async def replace(symbol, current_pos, stop_price, reason):
+        replacements.append((symbol, stop_price, reason))
+        return {"id": "sl-profit-lock"}
+
+    async def audit(*args, **kwargs):
+        return {"status": "OK"}
+
+    engine._replace_stop_loss_order = replace
+    engine._audit_and_repair_live_ladder_protection = audit
+
+    updated = asyncio.run(
+        engine._refresh_ladder_fill_state(
+            "RAVE/USDT:USDT",
+            pos,
+            state,
+            {"tp1_breakeven_enabled": True},
+        )
+    )
+
+    assert updated["tp1_filled"] is True
+    assert updated["tp2_filled"] is True
+    assert updated["sl_moved_to_tp1_area"] is True
+    assert updated["last_stop_price"] == pytest.approx(0.3142)
+    assert replacements == [(
+        "RAVE/USDT:USDT",
+        pytest.approx(0.3142),
+        "TP2 filled -> profit protection stop",
+    )]
+
+
 def test_ladder_fill_state_retries_stop_move_when_replacement_fails():
     pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "1", "entryPrice": "100"}
     engine = _protection_engine([], positions=[pos])
@@ -5996,7 +6235,17 @@ def test_ladder_fill_state_retries_stop_move_when_replacement_fails():
         "risk_distance": 10.0,
         "initial_stop_price": 90.0,
         "last_stop_price": 90.0,
-        "planned_tp_orders": [],
+        "planned_tp_orders": [
+            {
+                "tp_index": 1,
+                "tp_label": "TP1",
+                "tp_name": "TP1",
+                "side": "sell",
+                "price": 110.0,
+                "qty": 1.0,
+                "filled": False,
+            },
+        ],
         "tp1_filled": False,
         "tp2_filled": False,
         "sl_moved_to_be": False,
@@ -6026,6 +6275,81 @@ def test_ladder_fill_state_retries_stop_move_when_replacement_fails():
     assert updated["sl_moved_to_be"] is False
     assert updated.get("active") is not True
     assert updated["last_stop_price"] == 90.0
+
+
+def test_stop_replacement_keeps_existing_sl_when_target_is_already_crossed():
+    pos = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": "1",
+        "entryPrice": "100",
+        "markPrice": "99",
+    }
+    old_sl = {
+        "id": "sl-old",
+        "side": "sell",
+        "type": "stop_market",
+        "amount": "1",
+        "reduceOnly": True,
+        "clientOrderId": "utbslBTCUSDTold",
+        "info": {
+            "symbol": "BTCUSDT",
+            "origType": "STOP_MARKET",
+            "stopPrice": "90",
+            "reduceOnly": "true",
+        },
+    }
+    engine = _protection_engine([old_sl], positions=[pos])
+
+    replacement = asyncio.run(
+        engine._replace_stop_loss_order(
+            "BTC/USDT:USDT",
+            pos,
+            100.3,
+            reason="late BE update",
+        )
+    )
+
+    assert replacement is None
+    assert engine.exchange.cancelled == []
+    assert [order["id"] for order in engine.exchange.orders] == ["sl-old"]
+    assert engine.exchange.created == []
+
+
+def test_stop_replacement_emergency_closes_crossed_target_without_existing_sl():
+    pos = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": "1",
+        "entryPrice": "100",
+        "markPrice": "99",
+    }
+    engine = _protection_engine([], positions=[pos])
+    emergency_calls = []
+
+    async def emergency_close(symbol, **kwargs):
+        emergency_calls.append((symbol, kwargs))
+        return {"status": "EMERGENCY_CLOSED", "closed": True}
+
+    engine._emergency_close_position_without_stop_loss = emergency_close
+
+    replacement = asyncio.run(
+        engine._replace_stop_loss_order(
+            "BTC/USDT:USDT",
+            pos,
+            100.3,
+            reason="late BE update with missing SL",
+        )
+    )
+
+    assert replacement is None
+    assert engine.exchange.cancelled == []
+    assert engine.exchange.created == []
+    assert emergency_calls[0][0] == "BTC/USDT:USDT"
+    assert (
+        engine.last_protection_order_status["BTC/USDT:USDT"]["status"]
+        == "SL_REPLACE_TARGET_CROSSED_UNPROTECTED"
+    )
 
 
 def test_stop_replacement_blocks_when_cancel_confirmation_fetch_fails():
@@ -6176,6 +6500,155 @@ def test_closed_trade_accounting_matches_usdt_settlement_symbol_alias(monkeypatc
     assert engine.db.closed[0] == "POWER/USDT:USDT"
     assert engine.db.closed[1] == pytest.approx(-0.5)
     assert recorded_pnl == [pytest.approx(-0.5)]
+
+
+def test_closed_trade_accounting_preserves_tp_legs_and_manual_emergency_exit(
+    monkeypatch,
+):
+    emas = _emas_module()
+
+    class _RaveTradeExchange(_FakeExchange):
+        def fetch_my_trades(self, symbol, since=None, limit=None):
+            return [
+                {
+                    "order": "tp1-order",
+                    "side": "sell",
+                    "amount": 8.0,
+                    "price": 0.3142,
+                    "timestamp": 2_000,
+                    "info": {
+                        "positionSide": "LONG",
+                        "realizedPnl": "0.108",
+                    },
+                },
+                {
+                    "order": "tp2-order",
+                    "side": "sell",
+                    "amount": 10.0,
+                    "price": 0.3338,
+                    "timestamp": 3_000,
+                    "info": {
+                        "positionSide": "LONG",
+                        "realizedPnl": "0.331",
+                    },
+                },
+                {
+                    "order": "manual-order",
+                    "side": "sell",
+                    "amount": 13.0,
+                    "price": 0.3090,
+                    "timestamp": 4_000,
+                    "info": {
+                        "positionSide": "LONG",
+                        "realizedPnl": "0.1079",
+                    },
+                },
+            ]
+
+    class _DB:
+        def __init__(self):
+            self.closed = None
+
+        def get_latest_open_trade(self, symbol):
+            if symbol != "RAVE/USDT:USDT":
+                return None
+            return {
+                "symbol": symbol,
+                "side": "long",
+                "entry_price": 0.3007,
+                "quantity": 31.0,
+                "entry_time": "1970-01-01T00:00:01+00:00",
+            }
+
+        def log_trade_close(self, symbol, pnl, pnl_pct, exit_price, reason):
+            self.closed = (symbol, pnl, pnl_pct, exit_price, reason)
+            return True
+
+    monkeypatch.setattr(emas, "record_bot_realized_pnl", lambda pnl: None)
+    engine = _protection_engine([])
+    engine.exchange = _RaveTradeExchange([])
+    engine.db = _DB()
+    engine.trading_state_store = SQLiteTradingStateStore(":memory:")
+    engine.trading_state_store.upsert(
+        OrderRecord(
+            client_order_id="quad-rave-entry",
+            exchange_order_id="entry-order",
+            symbol="RAVE/USDT:USDT",
+            side="LONG",
+            strategy="quad_alpha_v1",
+            signal_timestamp="1970-01-01T00:00:01+00:00",
+            requested_qty=31.0,
+            filled_qty=31.0,
+            average_fill_price=0.3007,
+            order_state=OrderState.PROTECTED.value,
+            order_intent="ENTRY",
+            stop_order_id="sl-order",
+            take_profit_order_ids=["tp1-order", "tp2-order"],
+            metadata={
+                "primary_strategy": "UTBREAKOUT",
+                "take_profit_order_labels": {
+                    "tp1-order": "TP1",
+                    "tp2-order": "TP2",
+                },
+            },
+        )
+    )
+
+    result = asyncio.run(
+        engine._record_closed_trade_accounting(
+            "RAVE/USDT",
+            "EmergencyStop",
+            state={"risk_distance": 0.01430587774618658},
+        )
+    )
+
+    assert result["status"] == "RECORDED"
+    assert result["pnl"] == pytest.approx(0.5469)
+    assert [leg["label"] for leg in result["exit_legs"]] == [
+        "TP1",
+        "TP2",
+        "MANUAL",
+    ]
+    assert engine.db.closed[0] == "RAVE/USDT:USDT"
+    assert engine.db.closed[4] == "EmergencyStop"
+
+
+def test_active_entry_persists_replaced_stop_and_take_profit_references():
+    engine = _protection_engine([])
+    engine.trading_state_store = SQLiteTradingStateStore(":memory:")
+    engine.trading_state_store.upsert(
+        OrderRecord(
+            client_order_id="quad-rave-entry",
+            symbol="RAVE/USDT:USDT",
+            side="LONG",
+            strategy="quad_alpha_v1",
+            signal_timestamp="2026-07-16T03:48:00+00:00",
+            requested_qty=31.0,
+            filled_qty=31.0,
+            average_fill_price=0.3007,
+            order_state=OrderState.PROTECTED.value,
+            order_intent="ENTRY",
+            stop_order_id="old-sl",
+            take_profit_order_ids=["tp1-order"],
+        )
+    )
+
+    updated = engine._persist_active_entry_protection_refs(
+        "RAVE/USDT",
+        stop_order_id="new-sl",
+        take_profit_order_ids=["tp2-order"],
+        take_profit_order_labels={
+            "tp1-order": "TP1",
+            "tp2-order": "TP2",
+        },
+    )
+
+    assert updated.stop_order_id == "new-sl"
+    assert updated.take_profit_order_ids == ["tp1-order", "tp2-order"]
+    assert updated.metadata["take_profit_order_labels"] == {
+        "tp1-order": "TP1",
+        "tp2-order": "TP2",
+    }
 
 
 def test_entry_confirmation_accepts_filled_order_when_position_endpoint_is_unavailable():
