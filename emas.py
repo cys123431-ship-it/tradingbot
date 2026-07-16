@@ -2766,7 +2766,13 @@ def build_default_utbot_filtered_breakout_config():
     }
 
 
-def resolve_utbreakout_risk_budget(balance_usdt, cfg, *, multiplier=1.0):
+def resolve_utbreakout_risk_budget(
+    balance_usdt,
+    cfg,
+    *,
+    multiplier=1.0,
+    daily_pnl_usdt=None,
+):
     """Resolve the UT/RSPT/DUAL loss budget from the selected account percentage."""
     cfg = cfg if isinstance(cfg, dict) else {}
     balance = max(0.0, float(balance_usdt or 0.0))
@@ -2799,9 +2805,16 @@ def resolve_utbreakout_risk_budget(balance_usdt, cfg, *, multiplier=1.0):
         source = 'fixed_usdt_cap'
 
     daily_loss_cap = max(0.0, float(cfg.get('daily_max_loss_usdt', 0.0) or 0.0))
-    daily_cap_applied = daily_loss_cap > 0 and max_risk_usdt > daily_loss_cap
+    daily_pnl = _safe_float_or_none(daily_pnl_usdt)
+    daily_remaining_loss_usdt = daily_loss_cap
+    if daily_loss_cap > 0 and daily_pnl is not None and daily_pnl < 0:
+        daily_remaining_loss_usdt = max(0.0, daily_loss_cap + daily_pnl)
+    daily_cap_applied = (
+        daily_loss_cap > 0
+        and max_risk_usdt > daily_remaining_loss_usdt
+    )
     if daily_loss_cap > 0:
-        max_risk_usdt = min(max_risk_usdt, daily_loss_cap)
+        max_risk_usdt = min(max_risk_usdt, daily_remaining_loss_usdt)
 
     applied_multiplier = max(0.0, float(multiplier or 0.0))
     return {
@@ -2812,6 +2825,8 @@ def resolve_utbreakout_risk_budget(balance_usdt, cfg, *, multiplier=1.0):
         'multiplier': applied_multiplier,
         'source': source,
         'daily_loss_cap_usdt': daily_loss_cap,
+        'daily_pnl_usdt': daily_pnl,
+        'daily_remaining_loss_usdt': daily_remaining_loss_usdt,
         'daily_loss_cap_applied': daily_cap_applied,
     }
 
@@ -2845,6 +2860,48 @@ def cap_utbreakout_risk_plan_to_margin(plan, *, free_balance, leverage, entry_pr
         'position_cap_max_notional': max_notional,
     })
     return plan
+
+
+def reconcile_utbreakout_risk_plan_to_order_qty(
+    plan,
+    *,
+    qty,
+    entry_price,
+    leverage,
+    reason='exchange_amount_precision',
+):
+    """Keep stored risk diagnostics aligned with the quantity actually submitted."""
+    reconciled = dict(plan or {})
+    actual_qty = max(0.0, float(qty or 0.0))
+    price = max(0.0, float(entry_price or 0.0))
+    lev = max(1.0, float(leverage or 1.0))
+    actual_notional = actual_qty * price
+    risk_distance = max(0.0, float(reconciled.get('risk_distance', 0.0) or 0.0))
+    rr_multiple = float(
+        reconciled.get(
+            'effective_rr_multiple',
+            reconciled.get('rr_multiple', 0.0),
+        )
+        or 0.0
+    )
+    previous_qty = max(0.0, float(reconciled.get('qty', 0.0) or 0.0))
+    previous_notional = max(
+        0.0,
+        float(reconciled.get('planned_notional', previous_qty * price) or 0.0),
+    )
+    reconciled.update({
+        'qty': actual_qty,
+        'planned_notional': actual_notional,
+        'planned_margin': actual_notional / lev,
+        'risk_usdt': actual_qty * risk_distance,
+        'expected_profit_usdt': actual_qty * risk_distance * rr_multiple,
+        'leverage': int(lev),
+        'order_qty_reconciled': True,
+        'order_qty_reconcile_reason': str(reason or 'order_sizing'),
+        'order_qty_before_reconcile': previous_qty,
+        'order_notional_before_reconcile': previous_notional,
+    })
+    return reconciled
 
 
 def resolve_utbreakout_bridge_ready_age_sec(cfg, entry_timeframe=None):
@@ -4017,8 +4074,15 @@ class DBManager:
                 id INTEGER PRIMARY KEY, symbol TEXT, side TEXT,
                 entry_price REAL, exit_price REAL, quantity REAL,
                 pnl_usdt REAL, pnl_pct REAL,
-                entry_time TEXT, exit_time TEXT, exit_reason TEXT
+                entry_time TEXT, exit_time TEXT, exit_reason TEXT,
+                strategy TEXT
             )""")
+            trade_columns = {
+                str(row[1])
+                for row in self.conn.execute("PRAGMA table_info(trades)").fetchall()
+            }
+            if 'strategy' not in trade_columns:
+                self.conn.execute("ALTER TABLE trades ADD COLUMN strategy TEXT")
             self.conn.execute("""CREATE TABLE IF NOT EXISTS shannon_log (
                 id INTEGER PRIMARY KEY, timestamp TEXT,
                 total_equity REAL, action TEXT,
@@ -4045,11 +4109,18 @@ class DBManager:
             )
             self.conn.commit()
 
-    def log_trade_entry(self, symbol, side, price, quantity=0):
+    def log_trade_entry(self, symbol, side, price, quantity=0, strategy=None):
         with self.lock:
             self.conn.execute(
-                "INSERT INTO trades (symbol, side, entry_price, quantity, entry_time) VALUES (?,?,?,?,?)",
-                (symbol, side, price, quantity, datetime.now(timezone.utc).isoformat())
+                "INSERT INTO trades (symbol, side, entry_price, quantity, entry_time, strategy) VALUES (?,?,?,?,?,?)",
+                (
+                    symbol,
+                    side,
+                    price,
+                    quantity,
+                    datetime.now(timezone.utc).isoformat(),
+                    str(strategy or '').strip().lower() or None,
+                )
             )
             self.conn.commit()
 
@@ -4057,7 +4128,11 @@ class DBManager:
         with self.lock:
             cur = self.conn.execute(
                 """UPDATE trades SET exit_time=?, exit_price=?, pnl_usdt=?, pnl_pct=?, exit_reason=?
-                WHERE symbol=? AND exit_time IS NULL ORDER BY id DESC LIMIT 1""",
+                WHERE id=(
+                    SELECT id FROM trades
+                    WHERE symbol=? AND exit_time IS NULL
+                    ORDER BY id DESC LIMIT 1
+                )""",
                 (datetime.now(timezone.utc).isoformat(), exit_price, pnl, pnl_pct, reason, symbol)
             )
             self.conn.commit()
@@ -4087,21 +4162,39 @@ class DBManager:
             res = cur.fetchone()
             return res[0] if res and res[0] else 0
 
-    def get_recent_closed_trade_pnls(self, limit=10, today_only=False):
+    def get_recent_closed_trade_pnls(
+        self,
+        limit=10,
+        today_only=False,
+        strategies=None,
+    ):
         limit = max(1, int(limit or 1))
+        if isinstance(strategies, str):
+            strategies = [strategies]
+        strategy_values = sorted({
+            str(value or '').strip().lower()
+            for value in (strategies or [])
+            if str(value or '').strip()
+        })
+        where = ["exit_time IS NOT NULL"]
+        params = []
+        if today_only:
+            today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            where.append("exit_time LIKE ?")
+            params.append(f"{today}%")
+        if strategy_values:
+            placeholders = ','.join('?' for _ in strategy_values)
+            where.append(f"LOWER(COALESCE(strategy, '')) IN ({placeholders})")
+            params.extend(strategy_values)
+        params.append(limit)
         with self.lock:
             cur = self.conn.cursor()
-            if today_only:
-                today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-                cur.execute(
-                    "SELECT pnl_usdt FROM trades WHERE exit_time LIKE ? ORDER BY exit_time DESC, id DESC LIMIT ?",
-                    (f"{today}%", limit)
-                )
-            else:
-                cur.execute(
-                    "SELECT pnl_usdt FROM trades WHERE exit_time IS NOT NULL ORDER BY exit_time DESC, id DESC LIMIT ?",
-                    (limit,)
-                )
+            cur.execute(
+                "SELECT pnl_usdt FROM trades WHERE "
+                + " AND ".join(where)
+                + " ORDER BY exit_time DESC, id DESC LIMIT ?",
+                tuple(params),
+            )
             return [float(row[0] or 0.0) for row in cur.fetchall()]
 
     def get_latest_open_trade(self, symbol):
@@ -12757,6 +12850,75 @@ class SignalEngine(BaseEngine):
             'target_symbol_key': target_key,
         }
 
+    def _get_recent_strategy_closed_trade_pnls(
+        self,
+        strategies,
+        limit,
+        *,
+        today_only=False,
+    ):
+        """Return loss-streak inputs attributed only to the selected strategy family."""
+        limit = max(1, int(limit or 1))
+        if isinstance(strategies, str):
+            strategies = [strategies]
+        strategy_values = {
+            str(value or '').strip().lower()
+            for value in (strategies or [])
+            if str(value or '').strip()
+        }
+        if not strategy_values:
+            return []
+
+        store = getattr(self, 'trading_state_store', None)
+        load_results = getattr(store, 'load_trade_results', None)
+        if callable(load_results):
+            try:
+                today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+                matches = []
+                for trade in load_results() or []:
+                    if not isinstance(trade, dict):
+                        continue
+                    attributed = {
+                        str(trade.get(key) or '').strip().lower()
+                        for key in ('primary_strategy', 'selected_strategy', 'strategy')
+                        if str(trade.get(key) or '').strip()
+                    }
+                    if not attributed.intersection(strategy_values):
+                        continue
+                    exit_time = str(trade.get('exit_time') or '').strip()
+                    if not exit_time or (today_only and not exit_time.startswith(today)):
+                        continue
+                    pnl = _safe_float_or_none(
+                        trade.get('net_pnl_usdt')
+                        if trade.get('net_pnl_usdt') is not None
+                        else trade.get('gross_pnl_usdt')
+                    )
+                    if pnl is None:
+                        continue
+                    matches.append((exit_time, float(pnl)))
+                matches.sort(key=lambda item: item[0], reverse=True)
+                if matches:
+                    return [pnl for _, pnl in matches[:limit]]
+            except Exception as exc:
+                logger.debug(
+                    "Strategy-attributed live trade history unavailable: %s",
+                    exc,
+                )
+
+        db = getattr(self, 'db', None)
+        getter = getattr(db, 'get_recent_closed_trade_pnls', None)
+        if not callable(getter):
+            return []
+        try:
+            return getter(
+                limit,
+                today_only=today_only,
+                strategies=strategy_values,
+            )
+        except TypeError:
+            # A legacy DB implementation cannot safely provide attribution.
+            return []
+
     def _finalize_utbreakout_runner_state(self, symbol, *, reason='position closed', exit_price=None):
         states = getattr(self, 'utbreakout_trailing_states', None)
         state = states.get(symbol) if isinstance(states, dict) else None
@@ -15742,6 +15904,7 @@ class SignalEngine(BaseEngine):
             balance_for_risk,
             cfg,
             multiplier=risk_multiplier,
+            daily_pnl_usdt=daily_pnl,
         )
         risk_per_trade_percent = risk_budget['risk_per_trade_percent']
         max_risk_per_trade_usdt = risk_budget['max_risk_per_trade_usdt']
@@ -16471,7 +16634,12 @@ class SignalEngine(BaseEngine):
             max(0.0, float(market_quality.get('risk_multiplier', 1.0) or 1.0)),
             max(0.0, float(l2_gate.get('risk_multiplier', 0.0) or 0.0)),
         )
-        risk_budget = resolve_utbreakout_risk_budget(balance_for_risk, cfg, multiplier=risk_multiplier)
+        risk_budget = resolve_utbreakout_risk_budget(
+            balance_for_risk,
+            cfg,
+            multiplier=risk_multiplier,
+            daily_pnl_usdt=daily_pnl,
+        )
         try:
             plan = calculate_risk_plan(
                 side=side,
@@ -16934,6 +17102,22 @@ class SignalEngine(BaseEngine):
         side = decision.side
         if not self.is_trade_direction_allowed(side):
             return _finish(None, self.format_trade_direction_block_reason(side), 'REJECTED_DIRECTION_FILTER')
+        daily_count, daily_pnl = self.db.get_daily_stats()
+        daily_entries = self.db.get_daily_entry_count()
+        status['daily_pnl'] = daily_pnl
+        status['daily_entries'] = daily_entries
+        if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
+            return _finish(
+                None,
+                f'risk_limit_blocked: daily pnl {daily_pnl:.2f}',
+                'REJECTED_DAILY_LOSS_LIMIT',
+            )
+        if int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
+            return _finish(
+                None,
+                f'risk_limit_blocked: daily trade count {daily_entries}',
+                'REJECTED_DAILY_TRADE_LIMIT',
+            )
         latest = rows[-1]
         entry_price = _safe_float_or_none(latest.get('close'))
         atr_value = _safe_float_or_none(decision.metrics.get('atr'))
@@ -16952,6 +17136,7 @@ class SignalEngine(BaseEngine):
             balance_for_risk,
             cfg,
             multiplier=risk_multiplier,
+            daily_pnl_usdt=daily_pnl,
         )
         try:
             plan = calculate_risk_plan(
@@ -17188,6 +17373,7 @@ class SignalEngine(BaseEngine):
             balance_for_risk,
             cfg,
             multiplier=risk_multiplier,
+            daily_pnl_usdt=daily_pnl,
         )
         try:
             plan = calculate_risk_plan(
@@ -19393,8 +19579,18 @@ class SignalEngine(BaseEngine):
             )
 
         max_losses = int(cfg.get('max_consecutive_losses', 3) or 3)
-        recent_pnls = self.db.get_recent_closed_trade_pnls(max_losses, today_only=True)
+        utbreak_strategy_family = {
+            ENTRY_STRATEGY_UT_BREAKOUT,
+            UTBOT_FILTERED_BREAKOUT_STRATEGY,
+            UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY,
+        }
+        recent_pnls = self._get_recent_strategy_closed_trade_pnls(
+            utbreak_strategy_family,
+            max_losses,
+            today_only=True,
+        )
         status['recent_closed_pnls'] = recent_pnls
+        status['recent_closed_pnl_scope'] = 'utbreak_strategy_family'
         if len(recent_pnls) >= max_losses and all(float(pnl) < 0 for pnl in recent_pnls[:max_losses]):
             return _finish(
                 None,
@@ -20365,6 +20561,13 @@ class SignalEngine(BaseEngine):
             'reasons': [],
             'kelly_reason': 'disabled',
         }
+        strategy_allocator_cfg = self._strategy_allocator_runtime_config(cfg)
+        performance_delegated_to_allocator = bool(
+            strategy_allocator_cfg.get('enabled', True)
+        )
+        status['position_sizing_performance_delegated_to_allocator'] = (
+            performance_delegated_to_allocator
+        )
         if bool(cfg.get('position_sizing_engine_enabled', True)):
             try:
                 portfolio_sizing_context = {
@@ -20418,15 +20621,29 @@ class SignalEngine(BaseEngine):
                         ),
                         'recent_avg_pnl_r': (
                             profit_alpha_decision.meta_expectancy_r
-                            if profit_alpha_decision is not None
+                            if (
+                                profit_alpha_decision is not None
+                                and not performance_delegated_to_allocator
+                            )
                             else None
                         ),
                         'meta_sample_count': (
                             profit_alpha_decision.meta_sample_count
-                            if profit_alpha_decision is not None
+                            if (
+                                profit_alpha_decision is not None
+                                and not performance_delegated_to_allocator
+                            )
                             else 0
                         ),
-                        'recent_closed_pnls': recent_pnls,
+                        # Finalized strategy performance is applied once by the
+                        # strategy allocator when the plan is stored. Feeding
+                        # the same loss streak into this engine compounded the
+                        # same evidence twice.
+                        'recent_closed_pnls': (
+                            None
+                            if performance_delegated_to_allocator
+                            else recent_pnls
+                        ),
                         'daily_loss_limit_hit': False,
                         'total_open_risk_pct': portfolio_sizing_context.get('total_open_risk_pct'),
                         'same_direction_positions': portfolio_sizing_context.get('same_direction_positions'),
@@ -20582,7 +20799,11 @@ class SignalEngine(BaseEngine):
         balance_for_risk = total_balance if total_balance > 0 else free_balance
         common_cfg = self.get_runtime_common_settings()
         leverage = int(max(1.0, float(common_cfg.get('leverage', 5) or 5)))
-        risk_budget = resolve_utbreakout_risk_budget(balance_for_risk, cfg)
+        risk_budget = resolve_utbreakout_risk_budget(
+            balance_for_risk,
+            cfg,
+            daily_pnl_usdt=daily_pnl,
+        )
         risk_per_trade_percent = risk_budget['risk_per_trade_percent']
         max_risk_per_trade_usdt = risk_budget['max_risk_per_trade_usdt']
         if side == 'short' and bool(cfg.get('short_conservative_enabled', True)):
@@ -20838,6 +21059,9 @@ class SignalEngine(BaseEngine):
             'position_sizing_risk_multiplier': status.get('position_sizing_risk_multiplier'),
             'position_sizing_components': status.get('position_sizing_components'),
             'position_sizing_reasons': status.get('position_sizing_reasons'),
+            'position_sizing_performance_delegated_to_allocator': status.get(
+                'position_sizing_performance_delegated_to_allocator'
+            ),
             'raw_final_risk_multiplier_before_position_sizing': status.get(
                 'raw_final_risk_multiplier_before_position_sizing'
             ),
@@ -22357,7 +22581,15 @@ class SignalEngine(BaseEngine):
             daily_count, daily_pnl = db.get_daily_stats()
             daily_entries = db.get_daily_entry_count()
             max_losses = int(cfg.get('max_consecutive_losses', 3) or 3)
-            recent_pnls = db.get_recent_closed_trade_pnls(max_losses, today_only=True)
+            recent_pnls = self._get_recent_strategy_closed_trade_pnls(
+                {
+                    ENTRY_STRATEGY_UT_BREAKOUT,
+                    UTBOT_FILTERED_BREAKOUT_STRATEGY,
+                    UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY,
+                },
+                max_losses,
+                today_only=True,
+            )
         else:
             daily_count, daily_pnl = 0, 0.0
             daily_entries = 0
@@ -22399,7 +22631,11 @@ class SignalEngine(BaseEngine):
                 total_balance, free_balance, _ = await self.get_balance_info()
                 balance_for_risk = total_balance if total_balance > 0 else free_balance
                 side_for_plan = candidate_side if candidate_side in {'long', 'short'} else 'long'
-                risk_budget = resolve_utbreakout_risk_budget(balance_for_risk, cfg)
+                risk_budget = resolve_utbreakout_risk_budget(
+                    balance_for_risk,
+                    cfg,
+                    daily_pnl_usdt=daily_pnl,
+                )
                 risk_per_trade_percent = risk_budget['risk_per_trade_percent']
                 max_risk_per_trade_usdt = risk_budget['max_risk_per_trade_usdt']
                 risk_note = ""
@@ -23685,7 +23921,15 @@ class SignalEngine(BaseEngine):
         daily_count, daily_pnl = self.db.get_daily_stats()
         daily_entries = self.db.get_daily_entry_count()
         max_losses = int(cfg.get('max_consecutive_losses', 3) or 3)
-        recent_pnls = self.db.get_recent_closed_trade_pnls(max_losses, today_only=True)
+        recent_pnls = self._get_recent_strategy_closed_trade_pnls(
+            {
+                ENTRY_STRATEGY_UT_BREAKOUT,
+                UTBOT_FILTERED_BREAKOUT_STRATEGY,
+                UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY,
+            },
+            max_losses,
+            today_only=True,
+        )
         daily_ok = True
         daily_detail = f"PnL {_fmt(daily_pnl, 2)} / trades {daily_entries}/{int(cfg['max_daily_trades'])}"
         if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
@@ -23722,7 +23966,11 @@ class SignalEngine(BaseEngine):
                 total_balance, free_balance, _ = await self.get_balance_info()
                 balance_for_risk = total_balance if total_balance > 0 else free_balance
                 side_for_plan = candidate_side if candidate_side in {'long', 'short'} else 'long'
-                risk_budget = resolve_utbreakout_risk_budget(balance_for_risk, cfg)
+                risk_budget = resolve_utbreakout_risk_budget(
+                    balance_for_risk,
+                    cfg,
+                    daily_pnl_usdt=daily_pnl,
+                )
                 risk_per_trade_percent = risk_budget['risk_per_trade_percent']
                 max_risk_per_trade_usdt = risk_budget['max_risk_per_trade_usdt']
                 risk_note = ""
@@ -24996,7 +25244,15 @@ class SignalEngine(BaseEngine):
         daily_entries = self.db.get_daily_entry_count()
         _, daily_pnl = self.db.get_daily_stats()
         max_losses = int(cfg.get('max_consecutive_losses', 3) or 3)
-        recent_pnls = self.db.get_recent_closed_trade_pnls(max_losses, today_only=True)
+        recent_pnls = self._get_recent_strategy_closed_trade_pnls(
+            {
+                ENTRY_STRATEGY_UT_BREAKOUT,
+                UTBOT_FILTERED_BREAKOUT_STRATEGY,
+                UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY,
+            },
+            max_losses,
+            today_only=True,
+        )
         daily_ok = True
         daily_detail = f"PnL {_fmt(daily_pnl, 2)} / trades {daily_entries}/{int(cfg.get('max_daily_trades', 0) or 0)}"
         if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
@@ -33933,6 +34189,42 @@ class SignalEngine(BaseEngine):
             'requested_qty': float(requested_qty),
         }
 
+    async def _rebuild_utbreakout_entry_plan_for_active_strategy(
+        self,
+        symbol,
+        side,
+        strategy_params,
+        active_strategy,
+    ):
+        """Re-evaluate the configured strategy aggregate when an accepted plan was lost."""
+        fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+        entry_tf = fb_cfg.get('entry_timeframe', '15m')
+        ohlcv = await asyncio.to_thread(
+            self.market_data_exchange.fetch_ohlcv,
+            symbol,
+            entry_tf,
+            limit=300,
+        )
+        df = pd.DataFrame(
+            ohlcv,
+            columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'],
+        )
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        rebuilt_sig, _, _, _, _, _ = await self._calculate_strategy_signal(
+            symbol,
+            df,
+            strategy_params,
+            active_strategy,
+            force_utbreakout_reprocess=True,
+        )
+        rebuilt_reason = self.last_entry_reason.get(symbol) or ''
+        if rebuilt_sig != side:
+            return None, rebuilt_sig, rebuilt_reason
+        rebuilt_plan = self._get_utbot_filtered_breakout_entry_plan(symbol, side)
+        return rebuilt_plan, rebuilt_sig, rebuilt_reason
+
     async def entry(self, symbol, side, price):
         try:
             trace_strategy_params = self.get_runtime_strategy_params()
@@ -34371,41 +34663,30 @@ class SignalEngine(BaseEngine):
             safety_buffer = 0.98
             if active_strategy in UTBREAKOUT_STRATEGIES:
                 if not filtered_breakout_plan:
-                    # Rebuild the UTBreakout plan once before giving up.
+                    # Rebuild the currently configured strategy/aggregate once
+                    # before giving up. Rebuilding UTBreak alone here could
+                    # discard a valid RSPT/QH/Crowding/LXR selection.
                     try:
-                        fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
-                        entry_tf = fb_cfg.get('entry_timeframe', '15m')
-                        ohlcv = await asyncio.to_thread(
-                            self.market_data_exchange.fetch_ohlcv,
+                        (
+                            filtered_breakout_plan,
+                            rebuilt_sig,
+                            rebuilt_reason,
+                        ) = await self._rebuild_utbreakout_entry_plan_for_active_strategy(
                             symbol,
-                            entry_tf,
-                            limit=300,
-                        )
-                        df = pd.DataFrame(
-                            ohlcv,
-                            columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'],
-                        )
-                        for col in ['open', 'high', 'low', 'close', 'volume']:
-                            df[col] = pd.to_numeric(df[col], errors='coerce')
-
-                        rebuilt_sig, rebuilt_reason, _ = await self._calculate_utbot_filtered_breakout_signal(
-                            symbol,
-                            df,
+                            side,
                             strategy_params,
-                            force_reprocess=True,
+                            active_strategy,
                         )
                         logger.warning(
-                            "[UTBOT_FILTERED_BREAKOUT_V1] rebuilt missing entry plan: "
-                            "symbol=%s raw=%s side=%s sig=%s reason=%s",
+                            "[UTBOT_FILTERED_BREAKOUT_V1] rebuilt missing entry plan "
+                            "through active strategy: symbol=%s raw=%s side=%s "
+                            "active=%s sig=%s reason=%s",
                             symbol,
                             raw_symbol,
                             side,
+                            active_strategy,
                             rebuilt_sig,
                             rebuilt_reason,
-                        )
-                        filtered_breakout_plan = (
-                            self._get_utbot_filtered_breakout_entry_plan(symbol, side)
-                            or self._get_utbot_filtered_breakout_entry_plan(raw_symbol, side)
                         )
                     except Exception as rebuild_exc:
                         logger.exception(
@@ -34579,6 +34860,16 @@ class SignalEngine(BaseEngine):
                 qty_notional = float(qty) * float(price)
             except (TypeError, ValueError):
                 qty_notional = 0.0
+            if active_strategy in UTBREAKOUT_STRATEGIES and filtered_breakout_plan:
+                filtered_breakout_plan = reconcile_utbreakout_risk_plan_to_order_qty(
+                    filtered_breakout_plan,
+                    qty=qty,
+                    entry_price=price,
+                    leverage=lev,
+                    reason='exchange_amount_precision',
+                )
+                target_notional = qty_notional
+                margin_to_use = target_notional / max(float(lev), 1e-9)
             if min_notional > 0 and qty_notional < min_notional:
                 logger.warning(
                     f"Entry quantity below min notional after precision: qty={qty}, "
@@ -34788,10 +35079,143 @@ class SignalEngine(BaseEngine):
             if selected_leverage < lev:
                 lev = selected_leverage
                 max_notional = free * lev * safety_buffer
+                leverage_qty_reduced = False
                 if target_notional > max_notional:
+                    original_target_notional = target_notional
                     target_notional = max_notional
                     qty = self.safe_amount(symbol, target_notional / max(float(price), 1e-9))
+                    target_notional = float(qty) * float(price)
                     margin_to_use = target_notional / max(float(lev), 1e-9)
+                    leverage_qty_reduced = True
+                    if isinstance(filtered_breakout_plan, dict):
+                        filtered_breakout_plan.update({
+                            'position_cap_applied': True,
+                            'position_cap_reason': 'liquidation_safe_leverage_margin_cap',
+                            'position_cap_original_notional': original_target_notional,
+                            'position_cap_max_notional': max_notional,
+                        })
+                if isinstance(filtered_breakout_plan, dict):
+                    filtered_breakout_plan = reconcile_utbreakout_risk_plan_to_order_qty(
+                        filtered_breakout_plan,
+                        qty=qty,
+                        entry_price=price,
+                        leverage=lev,
+                        reason='liquidation_safe_leverage',
+                    )
+                if float(qty) <= 0 or (
+                    min_notional > 0 and target_notional < min_notional
+                ):
+                    reason = (
+                        'leverage-safe quantity rounded to zero'
+                        if float(qty) <= 0
+                        else (
+                            f'leverage-safe quantity below minimum notional: '
+                            f'{target_notional:.4f} < {min_notional:.4f}'
+                        )
+                    )
+                    _record_filtered_breakout_entry_block(
+                        'ENTRY_BLOCKED_LEVERAGE_MIN_NOTIONAL',
+                        reason,
+                        {
+                            'qty': qty,
+                            'target_notional': target_notional,
+                            'min_notional': min_notional,
+                            'selected_leverage': lev,
+                        },
+                    )
+                    entry_label = (
+                        'UTBreakout'
+                        if active_strategy in UTBREAKOUT_STRATEGIES
+                        else 'Entry'
+                    )
+                    await self.ctrl.notify(
+                        f"{entry_label} blocked after safe leverage sizing: "
+                        f"{symbol} / {reason}"
+                    )
+                    if active_strategy in UTBREAKOUT_STRATEGIES:
+                        self._clear_utbot_filtered_breakout_entry_plan(symbol)
+                    return
+                if (
+                    leverage_qty_reduced
+                    and active_strategy in UTBREAKOUT_STRATEGIES
+                    and isinstance(filtered_breakout_plan, dict)
+                ):
+                    try:
+                        fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+                        live_ladder_cfg = dict(fb_cfg or {})
+                        live_ladder_cfg.update(dict(cfg or {}))
+                        live_ladder_cfg.update(filtered_breakout_plan)
+                        split_policy = str(
+                            live_ladder_cfg.get(
+                                'tp_split_failure_policy',
+                                'single_tp2_with_warning',
+                            )
+                            or 'single_tp2_with_warning'
+                        ).lower()
+                        live_ladder_enabled = (
+                            _normalize_live_real_stage(cfg.get('live_activation_stage'))
+                            == 'LIVE_REAL_SMALL_CAP'
+                            and str(
+                                live_ladder_cfg.get(
+                                    'live_tp_ladder_mode',
+                                    'tp1_tp2_full_exit',
+                                )
+                                or ''
+                            ).lower() == 'tp1_tp2_full_exit'
+                        )
+                        risk_distance = _safe_float_or_none(
+                            filtered_breakout_plan.get('risk_distance')
+                        )
+                        stop_price = _safe_float_or_none(
+                            filtered_breakout_plan.get('stop_loss')
+                            or filtered_breakout_plan.get('stop_loss_price')
+                            or filtered_breakout_plan.get('sl_price')
+                            or filtered_breakout_plan.get('initial_sl_price')
+                        )
+                        if stop_price is None and risk_distance is not None:
+                            stop_price = (
+                                float(price) - risk_distance
+                                if side == 'long'
+                                else float(price) + risk_distance
+                            )
+                        if live_ladder_enabled and split_policy == 'block_entry' and stop_price:
+                            ladder_preview = self._build_tp_ladder_orders(
+                                symbol,
+                                side,
+                                price,
+                                stop_price,
+                                qty,
+                                live_ladder_cfg,
+                            )
+                            filtered_breakout_plan['tp_ladder_preflight'] = dict(
+                                ladder_preview
+                            )
+                            if not ladder_preview.get('ok'):
+                                reason = (
+                                    ladder_preview.get('reason')
+                                    or 'tp_ladder_not_possible_after_leverage_resize'
+                                )
+                                _record_filtered_breakout_entry_block(
+                                    'ENTRY_BLOCKED_TP_LADDER_AFTER_RESIZE',
+                                    f'TP ladder not possible after safe leverage resize: {reason}',
+                                    {
+                                        'qty': qty,
+                                        'selected_leverage': lev,
+                                        'tp_ladder_reason': reason,
+                                    },
+                                )
+                                await self.ctrl.notify(
+                                    f"UTBreakout entry blocked after safe leverage resize: "
+                                    f"TP ladder unavailable ({reason})"
+                                )
+                                self._clear_utbot_filtered_breakout_entry_plan(symbol)
+                                return
+                    except Exception as ladder_preflight_exc:
+                        logger.warning(
+                            'TP ladder resize preflight skipped for %s: %s',
+                            symbol,
+                            ladder_preflight_exc,
+                        )
                 await self.ensure_market_settings(symbol, leverage=lev)
                 liquidation_preflight = await self._preflight_liquidation_safety(
                     symbol,
@@ -35087,7 +35511,13 @@ class SignalEngine(BaseEngine):
                     self._clear_utbot_filtered_breakout_entry_plan(symbol)
                 return
             verify_pos = actual_liquidation_check.get('position') or verify_pos
-            self.db.log_trade_entry(symbol, side, actual_entry_price, float(qty))
+            self.db.log_trade_entry(
+                symbol,
+                side,
+                actual_entry_price,
+                float(qty),
+                strategy=primary_strategy,
+            )
             logger.info(
                 f"Entry confirmed: order={order.get('id', 'N/A')} "
                 f"source={confirmation.get('source')} qty={qty} price={actual_entry_price}"

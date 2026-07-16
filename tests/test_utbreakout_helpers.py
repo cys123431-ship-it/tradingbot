@@ -374,6 +374,72 @@ def test_utbreakout_risk_budget_never_exceeds_daily_loss_cap():
     assert budget["daily_loss_cap_usdt"] == pytest.approx(100.0)
 
 
+def test_utbreakout_risk_budget_uses_remaining_daily_loss_capacity():
+    emas = _emas_module()
+
+    budget = emas.resolve_utbreakout_risk_budget(
+        1_000.0,
+        {
+            "risk_per_trade_percent": 10.0,
+            "max_risk_per_trade_percent": 10.0,
+            "risk_budget_tracks_account_equity": True,
+            "daily_max_loss_usdt": 30.0,
+        },
+        daily_pnl_usdt=-24.0,
+    )
+
+    assert budget["daily_remaining_loss_usdt"] == pytest.approx(6.0)
+    assert budget["base_max_risk_per_trade_usdt"] == pytest.approx(6.0)
+    assert budget["max_risk_per_trade_usdt"] == pytest.approx(6.0)
+    assert budget["daily_loss_cap_applied"] is True
+
+
+def test_reconcile_risk_plan_uses_actual_exchange_quantity_and_leverage():
+    emas = _emas_module()
+
+    plan = emas.reconcile_utbreakout_risk_plan_to_order_qty(
+        {
+            "qty": 10.0,
+            "planned_notional": 100.0,
+            "planned_margin": 20.0,
+            "risk_distance": 0.5,
+            "risk_usdt": 5.0,
+            "rr_multiple": 2.0,
+        },
+        qty=7.0,
+        entry_price=10.0,
+        leverage=3,
+        reason="liquidation_safe_leverage",
+    )
+
+    assert plan["qty"] == pytest.approx(7.0)
+    assert plan["planned_notional"] == pytest.approx(70.0)
+    assert plan["planned_margin"] == pytest.approx(70.0 / 3.0)
+    assert plan["risk_usdt"] == pytest.approx(3.5)
+    assert plan["expected_profit_usdt"] == pytest.approx(7.0)
+    assert plan["leverage"] == 3
+    assert plan["order_qty_before_reconcile"] == pytest.approx(10.0)
+    assert plan["order_qty_reconcile_reason"] == "liquidation_safe_leverage"
+
+
+def test_trade_history_can_filter_recent_pnl_by_strategy(tmp_path):
+    emas = _emas_module()
+    db = emas.DBManager(str(tmp_path / "trades.db"))
+    try:
+        db.log_trade_entry("UT/USDT:USDT", "long", 1.0, 1.0, strategy="ut_breakout")
+        db.log_trade_close("UT/USDT:USDT", -0.4, -1.0, 0.99, "test")
+        db.log_trade_entry("OLD/USDT:USDT", "long", 1.0, 1.0, strategy="multi_timeframe_trend_v1")
+        db.log_trade_close("OLD/USDT:USDT", -2.0, -2.0, 0.98, "test")
+
+        assert db.get_recent_closed_trade_pnls(5) == pytest.approx([-2.0, -0.4])
+        assert db.get_recent_closed_trade_pnls(
+            5,
+            strategies={"ut_breakout"},
+        ) == pytest.approx([-0.4])
+    finally:
+        db.conn.close()
+
+
 def test_utbreakout_margin_cap_reduces_plan_instead_of_rejecting_signal():
     emas = _emas_module()
     plan = {

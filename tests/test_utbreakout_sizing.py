@@ -183,6 +183,46 @@ def test_utbreakout_position_sizing_portfolio_context_counts_positions():
     assert context["total_open_risk_pct"] == pytest.approx(0.8)
 
 
+def test_recent_strategy_pnls_exclude_retired_strategy_losses():
+    engine = object.__new__(emas.SignalEngine)
+
+    class Store:
+        def load_trade_results(self):
+            return [
+                {
+                    "strategy": "ut_breakout",
+                    "exit_time": "2026-07-16T02:45:00+00:00",
+                    "net_pnl_usdt": -0.34,
+                },
+                {
+                    "strategy": "multi_timeframe_trend_v1",
+                    "exit_time": "2026-07-16T03:00:00+00:00",
+                    "net_pnl_usdt": -0.92,
+                },
+                {
+                    "primary_strategy": "ut_breakout",
+                    "exit_time": "2026-07-16T03:45:00+00:00",
+                    "net_pnl_usdt": -0.38,
+                },
+            ]
+
+    engine.trading_state_store = Store()
+    engine.db = None
+
+    pnls = engine._get_recent_strategy_closed_trade_pnls(
+        {"ut_breakout", "utbot_adaptive_timeframe_v1"},
+        5,
+    )
+
+    assert pnls == pytest.approx([-0.38, -0.34])
+    sizing = build_position_risk_multiplier({
+        "atr_pct": 1.0,
+        "meta_probability": 0.65,
+        "recent_closed_pnls": pnls,
+    })
+    assert sizing["components"]["consecutive_loss"] == pytest.approx(0.8)
+
+
 def test_adaptive_risk_reduces_and_caps_multiplier_stack():
     risk = calculate_adaptive_risk_pct(
         {"side": "long"},

@@ -3,6 +3,7 @@ import time
 
 import pytest
 
+from utbreakout.crowding_unwind import CrowdingUnwindDecision
 from utbreakout.liquidation_exhaustion_reversal import LiquidationExhaustionDecision
 
 
@@ -231,6 +232,109 @@ def test_lxr_live_signal_builds_structure_anchored_plan(monkeypatch):
     assert captured["hard_stop_loss"] < 96.0
     assert captured["ev_time_stop_bars"] == 8
     assert captured["second_take_profit_r_multiple"] == pytest.approx(2.6)
+
+
+def test_crowding_signal_cannot_bypass_daily_loss_limit(monkeypatch):
+    emas = _emas_module()
+    engine = object.__new__(emas.SignalEngine)
+    now_ms = int(time.time() * 1000)
+
+    class MarketData:
+        def fetch_ohlcv(self, symbol, timeframe, limit=220):
+            return [
+                [now_ms - (60 - index) * 900_000, 100.0, 101.0, 99.0, 100.0, 10.0]
+                for index in range(55)
+            ]
+
+    class DailyStats:
+        def get_daily_stats(self):
+            return 3, -3.1
+
+        def get_daily_entry_count(self):
+            return 3
+
+    decision = CrowdingUnwindDecision(
+        side="short",
+        allowed=True,
+        score=85.0,
+        risk_multiplier=0.45,
+        reason="crowding confirmed",
+        metrics={"atr": 1.0},
+    )
+    monkeypatch.setattr(emas, "evaluate_crowding_unwind", lambda *args, **kwargs: decision)
+    engine.market_data_exchange = MarketData()
+    engine.db = DailyStats()
+    engine.last_entry_reason = {}
+    engine.crowding_unwind_last_status = {}
+    engine._get_utbot_filtered_breakout_config = lambda params=None: {
+        "crowding_unwind_live_enabled": True,
+        "crowding_unwind": {"enabled": True, "live_enabled": True},
+        "daily_max_loss_usdt": 3.0,
+        "max_daily_trades": 5,
+    }
+    engine._canonical_futures_symbol = lambda symbol: symbol
+    engine._clear_utbot_filtered_breakout_entry_plan = lambda symbol: None
+    engine._store_utbot_filtered_breakout_status = lambda symbol, status: None
+    engine.is_upbit_mode = lambda: False
+    engine.is_trade_direction_allowed = lambda side: True
+    engine._fetch_utbreakout_futures_context = _async_value({})
+    engine._evaluate_shared_l2_gate = _async_value({
+        "allowed": True,
+        "state": "ask_pressure",
+        "direction_support": "short",
+        "risk_multiplier": 1.0,
+    })
+
+    side, reason, status = asyncio.run(
+        engine._calculate_crowding_unwind_signal(
+            "BTC/USDT:USDT",
+            None,
+            {"active_strategy": emas.CROWDING_UNWIND_STRATEGY},
+        )
+    )
+
+    assert side is None
+    assert "daily pnl" in reason
+    assert status["reject_code"] == "REJECTED_DAILY_LOSS_LIMIT"
+
+
+def test_missing_plan_rebuild_uses_active_five_strategy_aggregate():
+    emas = _emas_module()
+    engine = object.__new__(emas.SignalEngine)
+    calls = []
+
+    class MarketData:
+        def fetch_ohlcv(self, symbol, timeframe, limit=300):
+            return [[index, 1.0, 1.1, 0.9, 1.0, 10.0] for index in range(30)]
+
+    async def calculate(symbol, df, params, active_strategy, **kwargs):
+        calls.append((symbol, active_strategy, kwargs))
+        return "short", False, True, "5-Strategy", active_strategy, False
+
+    plan = {"side": "short", "strategy": emas.LXR_STRATEGY, "qty": 2.0}
+    engine.market_data_exchange = MarketData()
+    engine.last_entry_reason = {"BTC/USDT:USDT": "LXR short"}
+    engine._get_utbot_filtered_breakout_config = lambda params=None: {"entry_timeframe": "15m"}
+    engine._calculate_strategy_signal = calculate
+    engine._get_utbot_filtered_breakout_entry_plan = lambda symbol, side=None: plan
+
+    rebuilt, signal, reason = asyncio.run(
+        engine._rebuild_utbreakout_entry_plan_for_active_strategy(
+            "BTC/USDT:USDT",
+            "short",
+            {"active_strategy": emas.QUAD_ALPHA_STRATEGY},
+            emas.QUAD_ALPHA_STRATEGY,
+        )
+    )
+
+    assert rebuilt is plan
+    assert signal == "short"
+    assert reason == "LXR short"
+    assert calls == [(
+        "BTC/USDT:USDT",
+        emas.QUAD_ALPHA_STRATEGY,
+        {"force_utbreakout_reprocess": True},
+    )]
 
 
 def test_strategy_allocator_plan_hook_scales_once(monkeypatch):
