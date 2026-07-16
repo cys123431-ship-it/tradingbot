@@ -102,6 +102,7 @@ from utbreakout.indicators import (
     previous_donchian,
 )
 from utbreakout.coinselector import (
+    HARD_MIN_QUOTE_VOLUME_USDT as COIN_SELECTOR_HARD_MIN_QUOTE_VOLUME_USDT,
     build_base_candidate as build_coin_selector_base_candidate,
     build_selection_report as build_coin_selector_report,
     default_coin_selector_config,
@@ -3675,6 +3676,24 @@ class TradingConfig:
             if coin_selector_cfg.get(key) != value:
                 coin_selector_cfg[key] = value
                 changed = True
+        hard_min_quote_volume = max(
+            COIN_SELECTOR_HARD_MIN_QUOTE_VOLUME_USDT,
+            float(
+                coin_selector_cfg.get(
+                    'min_quote_volume_usdt',
+                    COIN_SELECTOR_HARD_MIN_QUOTE_VOLUME_USDT,
+                )
+                or COIN_SELECTOR_HARD_MIN_QUOTE_VOLUME_USDT
+            ),
+        )
+        if (
+            float(coin_selector_cfg.get('min_quote_volume_usdt', 0) or 0)
+            != hard_min_quote_volume
+        ):
+            coin_selector_cfg['min_quote_volume_usdt'] = (
+                hard_min_quote_volume
+            )
+            changed = True
         if float(coin_selector_cfg.get('ideal_quote_volume_usdt', 0) or 0) < float(coin_selector_cfg.get('min_quote_volume_usdt', 0) or 0):
             coin_selector_cfg['ideal_quote_volume_usdt'] = max(
                 float(coin_selector_cfg.get('min_quote_volume_usdt', 100_000_000.0) or 100_000_000.0) * 5.0,
@@ -29004,6 +29023,23 @@ class SignalEngine(BaseEngine):
                 cfg[key] = max(0.0, float(cfg.get(key, default)))
             except (TypeError, ValueError):
                 cfg[key] = float(default)
+        cfg['min_quote_volume_usdt'] = max(
+            COIN_SELECTOR_HARD_MIN_QUOTE_VOLUME_USDT,
+            float(
+                cfg.get(
+                    'min_quote_volume_usdt',
+                    COIN_SELECTOR_HARD_MIN_QUOTE_VOLUME_USDT,
+                )
+                or COIN_SELECTOR_HARD_MIN_QUOTE_VOLUME_USDT
+            ),
+        )
+        cfg['ideal_quote_volume_usdt'] = max(
+            cfg['min_quote_volume_usdt'],
+            float(
+                cfg.get('ideal_quote_volume_usdt', 1_000_000_000.0)
+                or 1_000_000_000.0
+            ),
+        )
         for key, default in {
             'min_trade_count': 20_000,
             'ideal_trade_count': 500_000,
@@ -29020,6 +29056,100 @@ class SignalEngine(BaseEngine):
             except (TypeError, ValueError):
                 cfg[key] = int(default)
         return cfg
+
+    async def _validate_mainnet_entry_quote_volume(self, symbol):
+        ctrl = getattr(self, 'ctrl', None)
+        exchange_mode = None
+        if ctrl is not None and hasattr(ctrl, 'get_exchange_mode'):
+            try:
+                exchange_mode = ctrl.get_exchange_mode()
+            except Exception:
+                exchange_mode = None
+        if exchange_mode != BINANCE_MAINNET:
+            return {
+                'allowed': True,
+                'status': 'SKIPPED_NON_MAINNET',
+                'symbol': symbol,
+            }
+
+        selector_cfg = self._get_coin_selector_config()
+        min_quote_volume = max(
+            COIN_SELECTOR_HARD_MIN_QUOTE_VOLUME_USDT,
+            float(
+                selector_cfg.get(
+                    'min_quote_volume_usdt',
+                    COIN_SELECTOR_HARD_MIN_QUOTE_VOLUME_USDT,
+                )
+                or COIN_SELECTOR_HARD_MIN_QUOTE_VOLUME_USDT
+            ),
+        )
+        market_exchange = (
+            getattr(self, 'market_data_exchange', None)
+            or getattr(self, 'exchange', None)
+        )
+        if market_exchange is None or not hasattr(
+            market_exchange,
+            'fetch_ticker',
+        ):
+            return {
+                'allowed': False,
+                'status': 'REJECTED_QUOTE_VOLUME_UNAVAILABLE',
+                'symbol': symbol,
+                'quote_volume': None,
+                'min_quote_volume': min_quote_volume,
+                'reason': '24h quoteVolume endpoint unavailable',
+            }
+        try:
+            ticker = await asyncio.to_thread(
+                market_exchange.fetch_ticker,
+                symbol,
+            )
+        except Exception as exc:
+            return {
+                'allowed': False,
+                'status': 'REJECTED_QUOTE_VOLUME_UNAVAILABLE',
+                'symbol': symbol,
+                'quote_volume': None,
+                'min_quote_volume': min_quote_volume,
+                'reason': (
+                    '24h quoteVolume lookup failed: '
+                    f'{type(exc).__name__}: {exc}'
+                ),
+            }
+        ticker = ticker if isinstance(ticker, dict) else {}
+        info = ticker.get('info') if isinstance(ticker.get('info'), dict) else {}
+        quote_volume = _safe_float_or_none(
+            ticker.get('quoteVolume')
+            or info.get('quoteVolume')
+        )
+        if quote_volume is None or quote_volume <= 0:
+            return {
+                'allowed': False,
+                'status': 'REJECTED_QUOTE_VOLUME_UNAVAILABLE',
+                'symbol': symbol,
+                'quote_volume': quote_volume,
+                'min_quote_volume': min_quote_volume,
+                'reason': '24h quoteVolume is missing or zero',
+            }
+        allowed = float(quote_volume) >= min_quote_volume
+        return {
+            'allowed': allowed,
+            'status': (
+                'PASS'
+                if allowed
+                else 'REJECTED_LOW_QUOTE_VOLUME'
+            ),
+            'symbol': symbol,
+            'quote_volume': float(quote_volume),
+            'min_quote_volume': min_quote_volume,
+            'reason': (
+                f'24h quoteVolume {float(quote_volume):.2f} '
+                f'>= {min_quote_volume:.2f} USDT'
+                if allowed
+                else f'24h quoteVolume {float(quote_volume):.2f} '
+                f'< {min_quote_volume:.2f} USDT'
+            ),
+        }
 
     @staticmethod
     def _is_exchange_rate_limit_error(value):
@@ -30317,6 +30447,18 @@ class SignalEngine(BaseEngine):
             if (
                 cached_custom == custom_enabled
                 and (not custom_enabled or cached_symbols == custom_symbols)
+                and float(
+                    cached_cfg.get('min_quote_volume_usdt', 0.0)
+                    or 0.0
+                ) == float(cfg.get('min_quote_volume_usdt', 0.0) or 0.0)
+                and int(
+                    cached_cfg.get('min_trade_count', 0)
+                    or 0
+                ) == int(cfg.get('min_trade_count', 0) or 0)
+                and float(
+                    cached_cfg.get('max_spread_pct', 0.0)
+                    or 0.0
+                ) == float(cfg.get('max_spread_pct', 0.0) or 0.0)
                 and cached_tradifi_open is not None
                 and bool(cached_tradifi_open) == tradifi_session_open
             ):
@@ -30468,7 +30610,6 @@ class SignalEngine(BaseEngine):
             candidate_cfg = cfg
             if custom_enabled and bool(cfg.get('custom_relax_discovery', True)):
                 candidate_cfg = dict(cfg)
-                candidate_cfg['min_quote_volume_usdt'] = 0.0
                 candidate_cfg['min_trade_count'] = 0
             candidate = build_coin_selector_base_candidate(symbol, ticker, market, candidate_cfg, tags)
             if self._coin_selector_is_tradifi_market(symbol, market):
@@ -30731,6 +30872,50 @@ class SignalEngine(BaseEngine):
                     item['exchange_symbol'] = canonical_symbol
                 allowed_candidates.append(item)
             candidates = allowed_candidates
+        min_quote_volume = max(
+            COIN_SELECTOR_HARD_MIN_QUOTE_VOLUME_USDT,
+            float(
+                cfg.get(
+                    'min_quote_volume_usdt',
+                    COIN_SELECTOR_HARD_MIN_QUOTE_VOLUME_USDT,
+                )
+                or COIN_SELECTOR_HARD_MIN_QUOTE_VOLUME_USDT
+            ),
+        )
+        volume_eligible_candidates = []
+        for item in candidates:
+            quote_volume = _safe_float_or_none(item.get('quote_volume'))
+            if quote_volume is not None and quote_volume >= min_quote_volume:
+                volume_eligible_candidates.append(item)
+                continue
+            candidate_symbol = (
+                item.get('exchange_symbol')
+                or item.get('normalized_symbol')
+                or item.get('symbol')
+                or 'UNKNOWN'
+            )
+            reason = (
+                f"REJECTED_LOW_QUOTE_VOLUME: 24h quoteVolume "
+                f"{float(quote_volume or 0.0):.2f} < "
+                f"{min_quote_volume:.2f} USDT"
+            )
+            self._record_coin_selector_candidate_outcome(
+                candidate_symbol,
+                reason=reason,
+                cfg=cfg,
+                decision_key=(
+                    f"low_quote_volume:{int(scan_started_at // 60)}"
+                ),
+            )
+            self._utbreakout_trace_event(
+                candidate_symbol,
+                'COIN_SELECTED',
+                'REJECTED_LOW_QUOTE_VOLUME',
+                reason=reason,
+                quote_volume=quote_volume,
+                min_quote_volume=min_quote_volume,
+            )
+        candidates = volume_eligible_candidates
         candidates = self._rotating_coin_selector_batch(
             candidates,
             cfg.get('max_strategy_evaluations_per_cycle', 3),
@@ -34780,6 +34965,51 @@ class SignalEngine(BaseEngine):
                     f"{raw_symbol} / {symbol_err}"
                 )
                 return
+
+            if trace_utbreakout:
+                liquidity_gate = (
+                    await self._validate_mainnet_entry_quote_volume(symbol)
+                )
+                if not liquidity_gate.get('allowed'):
+                    gate_code = str(
+                        liquidity_gate.get('status')
+                        or 'REJECTED_LOW_QUOTE_VOLUME'
+                    )
+                    gate_reason = str(
+                        liquidity_gate.get('reason')
+                        or '24h quoteVolume liquidity gate failed'
+                    )
+                    self.last_entry_reason[symbol] = (
+                        f'{gate_code}: {gate_reason}'
+                    )
+                    if raw_symbol != symbol:
+                        self.last_entry_reason[raw_symbol] = (
+                            self.last_entry_reason[symbol]
+                        )
+                    self._utbreakout_trace_event(
+                        symbol,
+                        'ENTRY_BLOCKED',
+                        gate_code,
+                        side=side,
+                        reason=gate_reason,
+                        quote_volume=liquidity_gate.get('quote_volume'),
+                        min_quote_volume=liquidity_gate.get(
+                            'min_quote_volume'
+                        ),
+                    )
+                    self._clear_utbot_filtered_breakout_entry_plan(symbol)
+                    try:
+                        await self.ctrl.notify(
+                            f"🚫 UTBreakout 진입 차단: {symbol} "
+                            f"{str(side or '').upper()}\n"
+                            f"{gate_reason}"
+                        )
+                    except Exception:
+                        logger.debug(
+                            "quote-volume entry block notify skipped",
+                            exc_info=True,
+                        )
+                    return
 
             pause_state = load_critical_pause_state()
             pause_decision = evaluate_critical_pause_block(state=pause_state, requested_symbol=symbol)
@@ -50272,9 +50502,13 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 except (TypeError, ValueError):
                     await u.message.reply_text("❌ 거래대금은 숫자로 입력하세요. 예: `/coinscan minvol 100`", parse_mode=ParseMode.MARKDOWN)
                     return
-                value = max(1.0, value_m) * 1_000_000.0
+                value = max(100.0, value_m) * 1_000_000.0
                 await self.cfg.update_value(['signal_engine', 'coin_selector', 'min_quote_volume_usdt'], value)
-                await u.message.reply_text(f"✅ CoinSelector 최소 거래대금: {_format_volume_usdt(value)} USDT")
+                await u.message.reply_text(
+                    f"✅ CoinSelector 최소 거래대금: "
+                    f"{_format_volume_usdt(value)} USDT "
+                    "(메인넷 하한 100M)"
+                )
                 return
             if action in {'blacklist', 'ban'}:
                 if len(args) < 2:

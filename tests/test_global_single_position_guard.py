@@ -54,6 +54,8 @@ def test_opportunity_tuning_persists_changed_runtime_config():
     assert signal["common_settings"]["scanner_enabled"] is True
     assert selector["analysis_limit"] == 80
     assert selector["selection_max_rebound_pct"] == 22.0
+    assert selector["min_quote_volume_usdt"] == 100_000_000.0
+    assert selector["ideal_quote_volume_usdt"] == 1_000_000_000.0
     assert "meme" not in selector["excluded_sectors"]
     assert ut_cfg["ev_min_entry_score"] == 62.0
     assert ut_cfg["entry_quality_gate_min_ev_score"] == 66.0
@@ -89,8 +91,8 @@ def test_opportunity_tuning_does_not_rewrite_when_already_current():
                 "top_n": 20,
                 "max_strategy_evaluations_per_cycle": 3,
                 "min_final_score": 45.0,
-                "min_quote_volume_usdt": 25_000_000.0,
-                "ideal_quote_volume_usdt": 250_000_000.0,
+                "min_quote_volume_usdt": 100_000_000.0,
+                "ideal_quote_volume_usdt": 1_000_000_000.0,
                 "min_trade_count": 5_000,
                 "ideal_trade_count": 120_000,
                 "max_spread_pct": 0.12,

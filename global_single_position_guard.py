@@ -449,7 +449,8 @@ def apply_opportunity_tuning(engine):
     changed |= _set_if_different(common, "scanner_min_rise_pct", 0.20)
     changed |= _set_if_different(common, "scanner_max_rise_pct", 15.0)
 
-    # CoinSelector: lower the discovery threshold and refresh more often.
+    # CoinSelector: refresh more often while keeping the user's 100M USDT
+    # liquidity floor as a non-negotiable live-entry safeguard.
     selector_updates = {
         "enabled": True,
         "analysis_limit": 80,
@@ -457,8 +458,8 @@ def apply_opportunity_tuning(engine):
         "top_n": 20,
         "max_strategy_evaluations_per_cycle": 3,
         "min_final_score": 45.0,
-        "min_quote_volume_usdt": 25_000_000.0,
-        "ideal_quote_volume_usdt": 250_000_000.0,
+        "min_quote_volume_usdt": 100_000_000.0,
+        "ideal_quote_volume_usdt": 1_000_000_000.0,
         "min_trade_count": 5_000,
         "ideal_trade_count": 120_000,
         "max_spread_pct": 0.12,

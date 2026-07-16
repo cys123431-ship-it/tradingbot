@@ -746,6 +746,81 @@ class _FakeMarketExchange:
         }
 
 
+def test_runtime_coin_selector_config_clamps_quote_volume_to_100m():
+    signal_engine = _signal_engine_cls()
+    engine = signal_engine.__new__(signal_engine)
+    engine.get_runtime_trade_config = lambda: {
+        "coin_selector": {
+            "enabled": True,
+            "min_quote_volume_usdt": 25_000_000.0,
+            "ideal_quote_volume_usdt": 250_000_000.0,
+        }
+    }
+
+    cfg = engine._get_coin_selector_config()
+
+    assert cfg["min_quote_volume_usdt"] == 100_000_000.0
+    assert cfg["ideal_quote_volume_usdt"] == 250_000_000.0
+
+
+def test_mainnet_utbreakout_entry_blocks_fresh_quote_volume_below_100m():
+    emas = _emas_module()
+    signal_engine = _signal_engine_cls()
+    notifications = []
+
+    class Controller:
+        def get_exchange_mode(self):
+            return emas.BINANCE_MAINNET
+
+        async def _assert_symbol_tradeable_in_current_exchange_mode(
+            self,
+            symbol,
+        ):
+            return symbol
+
+        async def notify(self, text):
+            notifications.append(text)
+
+    class LowVolumeMarketData:
+        def fetch_ticker(self, symbol):
+            return {
+                "symbol": symbol,
+                "quoteVolume": 99_999_999.0,
+            }
+
+    engine = signal_engine.__new__(signal_engine)
+    engine.ctrl = Controller()
+    engine.market_data_exchange = LowVolumeMarketData()
+    engine.last_entry_reason = {}
+    engine.utbot_filtered_breakout_entry_plans = {}
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": emas.QUAD_ALPHA_STRATEGY,
+    }
+    engine._get_coin_selector_config = lambda: {
+        "enabled": True,
+        "min_quote_volume_usdt": 100_000_000.0,
+    }
+
+    asyncio.run(
+        engine.entry(
+            "SOL/USDT:USDT",
+            "long",
+            100.0,
+        )
+    )
+
+    reason = engine.last_entry_reason["SOL/USDT:USDT"]
+    assert reason.startswith("REJECTED_LOW_QUOTE_VOLUME:")
+    assert "99999999.00 < 100000000.00" in reason
+    assert any("진입 차단" in text for text in notifications)
+    events = engine._utbreakout_recent_trace_events("SOL/USDT:USDT")
+    assert any(
+        event["stage"] == "ENTRY_BLOCKED"
+        and event["status"] == "REJECTED_LOW_QUOTE_VOLUME"
+        for event in events
+    )
+
+
 class _FakeSignalRuntime:
     def __init__(self):
         self.active_symbols = set()

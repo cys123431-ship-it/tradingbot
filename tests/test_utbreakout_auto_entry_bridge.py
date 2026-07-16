@@ -560,7 +560,7 @@ def test_coin_selector_scanner_invokes_bridge_after_scanner_seen(tmp_path):
                 "normalized_symbol": "SOL/USDT",
                 "selection_state": "SELECTED",
                 "score": 90.0,
-                "quote_volume": 1_000_000.0,
+                "quote_volume": 1_000_000_000.0,
                 "auto_set_id": 22,
                 "adaptive_tf": "15m",
             }]
@@ -619,6 +619,63 @@ def test_coin_selector_scanner_invokes_bridge_after_scanner_seen(tmp_path):
     assert "POSITION_CONFIRMED" in stages
 
 
+def test_coin_selector_scanner_rejects_cached_candidate_below_100m(
+    tmp_path,
+):
+    bridge_calls = []
+
+    class Controller:
+        is_paused = False
+
+    engine = _build_engine()
+    engine.runtime_dir = str(tmp_path)
+    engine.ctrl = Controller()
+    engine.coin_selector_candidate_cooldowns = {}
+    engine.last_entry_reason = {}
+    engine.scanner_active_symbol = None
+    engine._get_coin_selector_config = lambda: {
+        "top_n": 10,
+        "candidate_cooldown_enabled": False,
+        "min_quote_volume_usdt": 100_000_000.0,
+    }
+    engine._micro_auto_enabled = lambda: False
+
+    async def evaluate_coin_selector(force=False):
+        return {
+            "selected": [{
+                "exchange_symbol": "SOL/USDT:USDT",
+                "normalized_symbol": "SOL/USDT",
+                "selection_state": "SELECTED",
+                "scanner_accepted": True,
+                "score": 90.0,
+                "quote_volume": 99_999_999.0,
+                "auto_set_id": 64,
+                "adaptive_tf": "15m",
+            }]
+        }
+
+    async def bridge(symbol, source="scanner"):
+        bridge_calls.append((symbol, source))
+        return True
+
+    engine.evaluate_coin_selector = evaluate_coin_selector
+    engine._maybe_run_utbreakout_auto_entry_bridge = bridge
+
+    asyncio.run(engine._scan_and_trade_coin_selector())
+
+    assert bridge_calls == []
+    assert engine.scanner_active_symbol is None
+    events = engine._utbreakout_recent_trace_events(
+        "SOL/USDT:USDT",
+        limit=20,
+    )
+    assert any(
+        event["stage"] == "COIN_SELECTED"
+        and event["status"] == "REJECTED_LOW_QUOTE_VOLUME"
+        for event in events
+    )
+
+
 def test_coin_selector_scanner_does_not_direct_entry_when_bridge_blocks(tmp_path):
     bridge_calls = []
     entry_calls = []
@@ -659,7 +716,7 @@ def test_coin_selector_scanner_does_not_direct_entry_when_bridge_blocks(tmp_path
                 "normalized_symbol": "SOL/USDT",
                 "selection_state": "SELECTED",
                 "score": 90.0,
-                "quote_volume": 1_000_000.0,
+                "quote_volume": 1_000_000_000.0,
                 "auto_set_id": 64,
                 "adaptive_tf": "15m",
             }]

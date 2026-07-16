@@ -18,13 +18,15 @@ DEFAULT_EXCLUDED_SECTORS = {
     "leveraged-token",
 }
 
+HARD_MIN_QUOTE_VOLUME_USDT = 100_000_000.0
+
 DEFAULT_COIN_SELECTOR_CONFIG = {
     "enabled": True,
     "auto_apply_watchlist": False,
     "custom_universe_enabled": False,
     "custom_symbols": [],
     "custom_relax_discovery": True,
-    "min_quote_volume_usdt": 100_000_000.0,
+    "min_quote_volume_usdt": HARD_MIN_QUOTE_VOLUME_USDT,
     "ideal_quote_volume_usdt": 1_000_000_000.0,
     "min_trade_count": 20_000,
     "ideal_trade_count": 500_000,
@@ -266,7 +268,13 @@ def _scanner_hard_reject_reason(candidate: dict, cfg: dict) -> str | None:
     if not market_is_usdt_perpetual(symbol, market):
         return "INVALID_MARKET"
     # B. Low 24h quote volume:
-    min_vol = finite_float(cfg.get("min_quote_volume_usdt"), 100_000_000.0)
+    min_vol = max(
+        HARD_MIN_QUOTE_VOLUME_USDT,
+        finite_float(
+            cfg.get("min_quote_volume_usdt"),
+            HARD_MIN_QUOTE_VOLUME_USDT,
+        ),
+    )
     if finite_float(candidate.get("quote_volume"), 0.0) < min_vol:
         return "LOW_QUOTE_VOLUME"
     # C. Low 24h trade count:

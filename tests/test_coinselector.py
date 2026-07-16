@@ -121,7 +121,7 @@ def test_custom_symbols_normalize_and_dedupe_to_usdt_pairs():
     assert symbols == ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 
 
-def test_custom_discovery_relax_only_volume_and_trade_count():
+def test_custom_discovery_never_relaxes_hard_quote_volume_floor():
     strict_cfg = default_coin_selector_config()
     relaxed_cfg = dict(strict_cfg)
     relaxed_cfg["min_quote_volume_usdt"] = 0.0
@@ -129,18 +129,31 @@ def test_custom_discovery_relax_only_volume_and_trade_count():
 
     strict = build_base_candidate("ABC/USDT:USDT", _ticker(quoteVolume=1_000, count=5), _market(), strict_cfg)
     relaxed = build_base_candidate("ABC/USDT:USDT", _ticker(quoteVolume=1_000, count=5), _market(), relaxed_cfg)
+    relaxed_trade_count = build_base_candidate(
+        "ABC/USDT:USDT",
+        _ticker(quoteVolume=250_000_000, count=5),
+        _market(),
+        relaxed_cfg,
+    )
     non_usdt = build_base_candidate("ABC/USDC:USDC", _ticker(quoteVolume=1_000, count=5), _market(quote="USDC", settle="USDC"), relaxed_cfg)
     blacklisted = build_base_candidate(
         "ABC/USDT:USDT",
-        _ticker(quoteVolume=1_000, count=5),
+        _ticker(quoteVolume=250_000_000, count=5),
         _market(),
         {**relaxed_cfg, "blacklist": ["ABC/USDT"]},
     )
-    wide_spread = build_base_candidate("ABC/USDT:USDT", _ticker(quoteVolume=1_000, count=5, ask=101.0), _market(), relaxed_cfg)
+    wide_spread = build_base_candidate(
+        "ABC/USDT:USDT",
+        _ticker(quoteVolume=250_000_000, count=5, ask=101.0),
+        _market(),
+        relaxed_cfg,
+    )
 
     assert strict["accepted"] is False
     assert "LOW_QUOTE_VOLUME" in strict["reject_reasons"]
-    assert relaxed["accepted"] is True
+    assert relaxed["accepted"] is False
+    assert "LOW_QUOTE_VOLUME" in relaxed["reject_reasons"]
+    assert relaxed_trade_count["accepted"] is True
     assert non_usdt["accepted"] is False
     assert "INVALID_MARKET" in non_usdt["reject_reasons"]
     assert blacklisted["accepted"] is True  # Blacklist no longer a hard reject
