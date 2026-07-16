@@ -550,6 +550,11 @@ async def reconcile_exchange_state(
         normalized = _normalize_symbol(record.symbol)
         position_present = normalized in position_symbols
         lookup_order: dict[str, Any] | None = None
+        synthetic_position_record = (
+            record.strategy == "EXTERNAL_OR_PRE_RECONCILIATION"
+            and record.metadata.get("source")
+            == "startup_exchange_reconciliation"
+        )
         lookup_required_states = {
             OrderState.PLANNED.value,
             OrderState.SUBMITTING.value,
@@ -559,7 +564,9 @@ async def reconcile_exchange_state(
             OrderState.CLOSING.value,
             OrderState.PARTIALLY_CLOSED.value,
         }
-        if strict_individual_lookup:
+        if strict_individual_lookup and not (
+            synthetic_position_record and position_present
+        ):
             lookup_required_states.update(ACTIVE_ORDER_STATES)
         if (
             record.order_state in lookup_required_states

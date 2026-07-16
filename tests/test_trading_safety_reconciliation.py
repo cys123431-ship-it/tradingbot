@@ -31,6 +31,83 @@ def test_exchange_position_without_local_record_blocks_startup(tmp_path):
     asyncio.run(scenario())
 
 
+def test_binance_adopted_external_position_unlocks_after_verified_stop(tmp_path):
+    class BinanceExternalPositionExchange:
+        id = "binance"
+
+        def __init__(self):
+            self.entry_lookups = []
+
+        def fetch_positions(self):
+            return [{
+                "symbol": "KORU/USDT:USDT",
+                "side": "short",
+                "contracts": 20.81,
+                "entryPrice": 20.3444,
+                "markPrice": 20.3310,
+                "liquidationPrice": 24.0,
+            }]
+
+        def fetch_open_orders(self):
+            return []
+
+        def fapiPrivateGetOpenAlgoOrders(self, params):
+            return [{
+                "algoId": "4000001772804400",
+                "clientAlgoId": "manual-stop",
+                "symbol": "KORUUSDT",
+                "orderType": "STOP_MARKET",
+                "side": "BUY",
+                "closePosition": "true",
+                "quantity": "0",
+                "triggerPrice": "21.36",
+                "reduceOnly": "true",
+                "workingType": "MARK_PRICE",
+                "algoStatus": "NEW",
+            }]
+
+        def fapiPrivateGetOrder(self, params):
+            self.entry_lookups.append(dict(params))
+            raise RuntimeError("-2013 Order does not exist")
+
+        def market(self, symbol):
+            return {
+                "precision": {"price": 0.01},
+                "info": {
+                    "filters": [{
+                        "filterType": "PRICE_FILTER",
+                        "tickSize": "0.01",
+                    }]
+                },
+            }
+
+    async def scenario():
+        exchange = BinanceExternalPositionExchange()
+        store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+
+        adopted = await reconcile_exchange_state(exchange, store)
+        verified = await reconcile_exchange_state(exchange, store)
+
+        assert adopted.safe_to_trade is False
+        assert any(
+            "exchange_position_without_local_record" in issue
+            for issue in adopted.issues
+        )
+        assert verified.safe_to_trade is True
+        assert verified.unresolved_records == []
+        assert exchange.entry_lookups == []
+        records = store.records_for_symbol("KORU/USDT:USDT")
+        synthetic = next(
+            record
+            for record in records
+            if record.strategy == "EXTERNAL_OR_PRE_RECONCILIATION"
+        )
+        assert synthetic.order_state == OrderState.PROTECTED.value
+        assert synthetic.stop_order_id == "4000001772804400"
+
+    asyncio.run(scenario())
+
+
 def test_unprotected_position_blocks_and_verified_stop_recovers(tmp_path):
     async def scenario():
         store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")

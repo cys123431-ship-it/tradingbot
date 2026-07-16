@@ -6056,11 +6056,13 @@ class SignalEngine(BaseEngine):
         else:
             self._set_crypto_entry_lock(None)
         logger.warning(
-            "CRYPTO_RECONCILIATION safe=%s positions=%d open_orders=%d issues=%s",
+            "CRYPTO_RECONCILIATION safe=%s positions=%d open_orders=%d "
+            "issues=%s unresolved=%s",
             result.safe_to_trade,
             len(result.positions),
             len(result.open_orders),
             result.issues,
+            result.unresolved_records,
         )
         return result
 
@@ -6087,9 +6089,11 @@ class SignalEngine(BaseEngine):
                 self._set_crypto_entry_lock('USER_STREAM_CONNECTING')
             if not final.safe_to_trade:
                 if getattr(self, 'ctrl', None) is not None:
+                    reconciliation_details = list(final.issues)
+                    reconciliation_details.extend(final.unresolved_records)
                     await self.ctrl.notify(
                         "CRITICAL: exchange reconciliation required. New entries are locked. "
-                        + '; '.join(final.issues[:5])
+                        + '; '.join(reconciliation_details[:5])
                     )
                 return
             if stream_required:
