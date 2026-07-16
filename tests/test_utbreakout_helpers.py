@@ -473,13 +473,57 @@ def test_trading_config_syncs_quad_live_flags_to_selected_branches(tmp_path):
         emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
         emas.QH_FLOW_STRATEGY,
         emas.CROWDING_UNWIND_STRATEGY,
+        emas.LXR_STRATEGY,
     ]
     assert ut["relative_strength_pullback_trend_live_enabled"] is True
     assert ut["qh_flow_live_enabled"] is True
     assert ut["crowding_unwind_live_enabled"] is True
+    assert ut["liquidation_exhaustion_reversal_live_enabled"] is True
+    assert ut["liquidation_exhaustion_reversal"]["enabled"] is True
+    assert ut["liquidation_exhaustion_reversal"]["live_enabled"] is True
+    assert ut["lxr_migration_v1_complete"] is True
     assert ut["multi_timeframe_trend_live_enabled"] is False
     assert ut["multi_timeframe_trend"]["enabled"] is False
     assert ut["multi_timeframe_trend"]["live_enabled"] is False
+
+
+def test_lxr_first_migration_enables_once_but_preserves_later_user_off(tmp_path):
+    emas = _emas_module()
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        (
+            '{"api":{"exchange_mode":"binance_mainnet"},'
+            '"signal_engine":{"strategy_params":{'
+            '"active_strategy":"quad_alpha_v1",'
+            '"UTBotFilteredBreakoutV1":{'
+            '"quad_alpha_enabled_strategies":["ut_breakout"]'
+            '}}}}'
+        ),
+        encoding="utf-8",
+    )
+
+    first = emas.TradingConfig(str(config_path))
+    first_ut = first.config["signal_engine"]["strategy_params"]["UTBotFilteredBreakoutV1"]
+    assert first_ut["quad_alpha_enabled_strategies"] == [
+        emas.ENTRY_STRATEGY_UT_BREAKOUT,
+        emas.LXR_STRATEGY,
+    ]
+    assert first_ut["liquidation_exhaustion_reversal_live_enabled"] is True
+    assert first_ut["lxr_migration_v1_complete"] is True
+
+    first_ut["quad_alpha_enabled_strategies"] = [emas.ENTRY_STRATEGY_UT_BREAKOUT]
+    first_ut["liquidation_exhaustion_reversal_live_enabled"] = False
+    first_ut["liquidation_exhaustion_reversal"]["enabled"] = False
+    first_ut["liquidation_exhaustion_reversal"]["live_enabled"] = False
+    first.save_config_sync()
+
+    restarted = emas.TradingConfig(str(config_path))
+    restarted_ut = restarted.config["signal_engine"]["strategy_params"]["UTBotFilteredBreakoutV1"]
+    assert restarted_ut["quad_alpha_enabled_strategies"] == [
+        emas.ENTRY_STRATEGY_UT_BREAKOUT,
+    ]
+    assert restarted_ut["liquidation_exhaustion_reversal_live_enabled"] is False
+    assert restarted_ut["liquidation_exhaustion_reversal"]["live_enabled"] is False
 
 
 def test_utbreakout_runtime_blocks_unsafe_live_and_emergency_sets():

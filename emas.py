@@ -177,10 +177,10 @@ from utbreakout.crowding_unwind import (
     default_crowding_unwind_config,
     evaluate_crowding_unwind,
 )
-from utbreakout.multi_timeframe_trend import (
-    M_TREND_STRATEGY,
-    default_multi_timeframe_trend_config,
-    evaluate_multi_timeframe_trend,
+from utbreakout.liquidation_exhaustion_reversal import (
+    LXR_STRATEGY,
+    default_liquidation_exhaustion_reversal_config,
+    evaluate_liquidation_exhaustion_reversal,
 )
 from utbreakout.strategy_allocator import (
     default_strategy_allocator_config,
@@ -277,9 +277,9 @@ UTBREAKOUT_CALLBACK_ACTIONS = UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS | frozenset({
     "crowd",
     "crowding",
     "crowding_status",
-    "mtrend",
-    "m_trend",
-    "mtrend_status",
+    "lxr",
+    "liquidation_reversal",
+    "lxr_status",
     "dual",
     "dualt",
     "dual_status",
@@ -567,7 +567,7 @@ UTBREAKOUT_STRATEGIES = {
     ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
     QH_FLOW_STRATEGY,
     CROWDING_UNWIND_STRATEGY,
-    M_TREND_STRATEGY,
+    LXR_STRATEGY,
     DUAL_ALPHA_STRATEGY,
     TRIPLE_ALPHA_STRATEGY,
     QUAD_ALPHA_STRATEGY,
@@ -604,7 +604,7 @@ STRATEGY_DISPLAY_NAMES = {
     ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND: 'RELATIVE_STRENGTH_PULLBACK_TREND',
     QH_FLOW_STRATEGY: 'QH_FLOW',
     CROWDING_UNWIND_STRATEGY: 'FUNDING_OI_CROWDING_UNWIND',
-    M_TREND_STRATEGY: 'M_TREND',
+    LXR_STRATEGY: 'LXR',
     DUAL_ALPHA_STRATEGY: 'DUAL_ALPHA',
     TRIPLE_ALPHA_STRATEGY: 'TRIPLE_ALPHA',
     QUAD_ALPHA_STRATEGY: 'QUAD_ALPHA',
@@ -615,21 +615,21 @@ QUAD_ALPHA_BRANCH_ORDER = (
     ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
     QH_FLOW_STRATEGY,
     CROWDING_UNWIND_STRATEGY,
-    M_TREND_STRATEGY,
+    LXR_STRATEGY,
 )
 QUAD_ALPHA_BRANCH_LABELS = {
     ENTRY_STRATEGY_UT_BREAKOUT: 'UTBreak',
     ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND: 'RSPT-v3',
     QH_FLOW_STRATEGY: 'QH-Flow v2',
     CROWDING_UNWIND_STRATEGY: 'Crowding Unwind',
-    M_TREND_STRATEGY: 'M-TREND',
+    LXR_STRATEGY: 'LXR Reversal',
 }
 QUAD_ALPHA_SELECTOR_KEYS = {
     'ut': ENTRY_STRATEGY_UT_BREAKOUT,
     'rsp': ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
     'qh': QH_FLOW_STRATEGY,
     'crowd': CROWDING_UNWIND_STRATEGY,
-    'mtrend': M_TREND_STRATEGY,
+    'lxr': LXR_STRATEGY,
 }
 
 
@@ -649,7 +649,8 @@ def normalize_quad_alpha_enabled_strategies(value):
         'rspt': ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
         'qhflow': QH_FLOW_STRATEGY,
         'crowding': CROWDING_UNWIND_STRATEGY,
-        'm-trend': M_TREND_STRATEGY,
+        'liquidation_reversal': LXR_STRATEGY,
+        'liquidation-exhaustion-reversal': LXR_STRATEGY,
     }
     requested = set()
     for raw_key in value:
@@ -2507,8 +2508,9 @@ def build_default_utbot_filtered_breakout_config():
         'l2_gate_enabled': True,
         'crowding_unwind': default_crowding_unwind_config(),
         'crowding_unwind_live_enabled': False,
-        'multi_timeframe_trend': default_multi_timeframe_trend_config(),
-        'multi_timeframe_trend_live_enabled': False,
+        'liquidation_exhaustion_reversal': default_liquidation_exhaustion_reversal_config(),
+        'liquidation_exhaustion_reversal_live_enabled': False,
+        'lxr_migration_v1_complete': False,
         'strategy_allocator': default_strategy_allocator_config(),
         'strategy_allocator_enabled': True,
         'entry_strategy': ENTRY_STRATEGY_UT_BREAKOUT,
@@ -3382,13 +3384,40 @@ class TradingConfig:
             if key not in utsmc_candidate_filter_cfg:
                 utsmc_candidate_filter_cfg[key] = value
                 changed = True
+        quad_cfg = strategy_params.setdefault('UTBotFilteredBreakoutV1', {})
+        if not bool(quad_cfg.get('lxr_migration_v1_complete', False)):
+            migrated_selection = normalize_quad_alpha_enabled_strategies(
+                quad_cfg.get('quad_alpha_enabled_strategies')
+            )
+            if LXR_STRATEGY not in migrated_selection:
+                migrated_selection.append(LXR_STRATEGY)
+            migrated_selection = [
+                key for key in QUAD_ALPHA_BRANCH_ORDER if key in set(migrated_selection)
+            ]
+            quad_cfg['quad_alpha_enabled_strategies'] = migrated_selection
+            lxr_cfg = default_liquidation_exhaustion_reversal_config()
+            if isinstance(quad_cfg.get('liquidation_exhaustion_reversal'), dict):
+                lxr_cfg.update(quad_cfg.get('liquidation_exhaustion_reversal'))
+            lxr_cfg['enabled'] = True
+            lxr_cfg['live_enabled'] = True
+            quad_cfg['liquidation_exhaustion_reversal'] = lxr_cfg
+            quad_cfg['liquidation_exhaustion_reversal_live_enabled'] = True
+            # The retired M-TREND branch is always fail-closed after migration.
+            quad_cfg['multi_timeframe_trend_live_enabled'] = False
+            if isinstance(quad_cfg.get('multi_timeframe_trend'), dict):
+                quad_cfg['multi_timeframe_trend']['enabled'] = False
+                quad_cfg['multi_timeframe_trend']['live_enabled'] = False
+            if str(strategy_params.get('active_strategy') or '').lower() == 'multi_timeframe_trend_v1':
+                strategy_params['active_strategy'] = LXR_STRATEGY
+            quad_cfg['lxr_migration_v1_complete'] = True
+            changed = True
+
         active_strategy = str(strategy_params.get('active_strategy', 'utbot')).lower()
         if active_strategy not in CORE_STRATEGIES:
             strategy_params['active_strategy'] = 'utbot'
             active_strategy = 'utbot'
             changed = True
         if active_strategy == QUAD_ALPHA_STRATEGY:
-            quad_cfg = strategy_params.setdefault('UTBotFilteredBreakoutV1', {})
             selected = normalize_quad_alpha_enabled_strategies(
                 quad_cfg.get('quad_alpha_enabled_strategies')
             )
@@ -3402,7 +3431,7 @@ class TradingConfig:
                 ],
                 'qh_flow_live_enabled': live_flags[QH_FLOW_STRATEGY],
                 'crowding_unwind_live_enabled': live_flags[CROWDING_UNWIND_STRATEGY],
-                'multi_timeframe_trend_live_enabled': live_flags[M_TREND_STRATEGY],
+                'liquidation_exhaustion_reversal_live_enabled': live_flags[LXR_STRATEGY],
             }
             for key, value in top_level_live_flags.items():
                 if quad_cfg.get(key) is not value:
@@ -3422,9 +3451,9 @@ class TradingConfig:
                     'enabled': live_flags[CROWDING_UNWIND_STRATEGY],
                     'live_enabled': live_flags[CROWDING_UNWIND_STRATEGY],
                 },
-                'multi_timeframe_trend': {
-                    'enabled': live_flags[M_TREND_STRATEGY],
-                    'live_enabled': live_flags[M_TREND_STRATEGY],
+                'liquidation_exhaustion_reversal': {
+                    'enabled': live_flags[LXR_STRATEGY],
+                    'live_enabled': live_flags[LXR_STRATEGY],
                 },
             }
             for section, values in nested_live_flags.items():
@@ -5753,7 +5782,7 @@ class SignalEngine(BaseEngine):
         self.l2_gate_cache = {}  # symbol -> short-lived shared L2 state
         self.l2_gate_history = {}  # symbol -> dynamic L2 replenishment/depletion samples
         self.crowding_unwind_last_status = {}  # symbol -> latest funding/OI unwind status
-        self.multi_timeframe_trend_last_status = {}  # symbol -> latest M-TREND status
+        self.liquidation_exhaustion_reversal_last_status = {}  # symbol -> latest LXR status
         self.strategy_allocator_last_status = {}  # strategy -> adaptive risk summary
         self.strategy_allocator_cache = {}  # short-lived finalized trade summaries
         self.triple_alpha_last_status = {}  # symbol -> latest triple strategy summary
@@ -5994,7 +6023,7 @@ class SignalEngine(BaseEngine):
         self.l2_gate_cache = {}
         self.l2_gate_history = {}
         self.crowding_unwind_last_status = {}
-        self.multi_timeframe_trend_last_status = {}
+        self.liquidation_exhaustion_reversal_last_status = {}
         self.strategy_allocator_last_status = {}
         self.strategy_allocator_cache = {}
         self.triple_alpha_last_status = {}
@@ -17001,17 +17030,17 @@ class SignalEngine(BaseEngine):
             lines.append(f"Missing fields: {', '.join(str(value) for value in missing)}")
         return '\n'.join(lines)
 
-    def _multi_timeframe_trend_runtime_config(self, cfg=None):
+    def _liquidation_exhaustion_reversal_runtime_config(self, cfg=None):
         source = dict(cfg or {})
-        base = default_multi_timeframe_trend_config()
-        nested = source.get('multi_timeframe_trend')
+        base = default_liquidation_exhaustion_reversal_config()
+        nested = source.get('liquidation_exhaustion_reversal')
         if isinstance(nested, dict):
             base.update(nested)
-        if 'multi_timeframe_trend_live_enabled' in source:
-            base['live_enabled'] = bool(source.get('multi_timeframe_trend_live_enabled'))
+        if 'liquidation_exhaustion_reversal_live_enabled' in source:
+            base['live_enabled'] = bool(source.get('liquidation_exhaustion_reversal_live_enabled'))
         return base
 
-    async def _calculate_multi_timeframe_trend_signal(
+    async def _calculate_liquidation_exhaustion_reversal_signal(
         self,
         symbol,
         df,
@@ -17020,12 +17049,12 @@ class SignalEngine(BaseEngine):
         force_reprocess=False,
     ):
         cfg = self._get_utbot_filtered_breakout_config(strategy_params)
-        trend_cfg = self._multi_timeframe_trend_runtime_config(cfg)
+        lxr_cfg = self._liquidation_exhaustion_reversal_runtime_config(cfg)
         canonical = self._canonical_futures_symbol(symbol)
         self._clear_utbot_filtered_breakout_entry_plan(canonical)
         status = {
-            'strategy': STRATEGY_DISPLAY_NAMES.get(M_TREND_STRATEGY, 'M_TREND'),
-            'entry_strategy': M_TREND_STRATEGY,
+            'strategy': STRATEGY_DISPLAY_NAMES.get(LXR_STRATEGY, 'LXR'),
+            'entry_strategy': LXR_STRATEGY,
             'symbol': canonical,
             'stage': 'waiting',
         }
@@ -17038,48 +17067,57 @@ class SignalEngine(BaseEngine):
             if sig:
                 status['accepted_code'] = 'ACCEPTED_ENTRY'
                 status['stage'] = 'entry_ready'
-            if not isinstance(getattr(self, 'multi_timeframe_trend_last_status', None), dict):
-                self.multi_timeframe_trend_last_status = {}
-            self.multi_timeframe_trend_last_status[canonical] = dict(status)
+            if not isinstance(getattr(self, 'liquidation_exhaustion_reversal_last_status', None), dict):
+                self.liquidation_exhaustion_reversal_last_status = {}
+            self.liquidation_exhaustion_reversal_last_status[canonical] = dict(status)
             self._store_utbot_filtered_breakout_status(canonical, status)
             self.last_entry_reason[canonical] = reason
             return sig, reason, status
 
         if self.is_upbit_mode():
-            return _finish(None, 'M-TREND unsupported in Upbit mode', 'REJECTED_UNSUPPORTED_MODE')
-        if not bool(trend_cfg.get('enabled', True)) or not bool(trend_cfg.get('live_enabled', False)):
-            return _finish(None, 'M-TREND live disabled', 'REJECTED_M_TREND_LIVE_DISABLED')
+            return _finish(None, 'LXR unsupported in Upbit mode', 'REJECTED_UNSUPPORTED_MODE')
+        if not bool(lxr_cfg.get('enabled', True)) or not bool(lxr_cfg.get('live_enabled', False)):
+            return _finish(None, 'LXR live disabled', 'REJECTED_LXR_LIVE_DISABLED')
 
-        timeframes = ('15m', '1h', '4h')
         try:
-            results = await asyncio.gather(*(
-                asyncio.to_thread(
-                    self.market_data_exchange.fetch_ohlcv,
-                    canonical,
-                    timeframe,
-                    limit=220,
-                )
-                for timeframe in timeframes
-            ))
-            frames = {}
-            for timeframe, ohlcv in zip(timeframes, results):
-                rows = self._relative_strength_pullback_rows_from_ohlcv(ohlcv)
-                frames[timeframe] = completed_candle_rows(
-                    rows,
-                    timeframe,
-                    {'exclude_incomplete_live_candle': True},
-                )
+            ohlcv = await asyncio.to_thread(
+                self.market_data_exchange.fetch_ohlcv,
+                canonical,
+                str(lxr_cfg.get('timeframe', '15m') or '15m'),
+                limit=220,
+            )
+            rows = self._relative_strength_pullback_rows_from_ohlcv(ohlcv)
+            rows = completed_candle_rows(
+                rows,
+                str(lxr_cfg.get('timeframe', '15m') or '15m'),
+                {'exclude_incomplete_live_candle': True},
+            )
         except Exception as exc:
-            return _finish(None, f'M-TREND OHLCV unavailable: {exc}', 'REJECTED_M_TREND_DATA')
+            return _finish(None, f'LXR OHLCV unavailable: {exc}', 'REJECTED_LXR_DATA')
 
-        decision = evaluate_multi_timeframe_trend(frames, trend_cfg)
+        derivatives = await self._fetch_utbreakout_futures_context(canonical)
+        base_l2 = await self._evaluate_shared_l2_gate(
+            canonical,
+            cfg,
+            force_refresh=force_reprocess,
+        )
+        preliminary = evaluate_liquidation_exhaustion_reversal(rows, derivatives, base_l2, lxr_cfg)
+        candidate_side = preliminary.side
+        l2_gate = await self._evaluate_shared_l2_gate(
+            canonical,
+            cfg,
+            force_refresh=True,
+            side=candidate_side,
+        ) if candidate_side in {'long', 'short'} else base_l2
+        decision = evaluate_liquidation_exhaustion_reversal(rows, derivatives, l2_gate, lxr_cfg)
         status.update({
             'allowed': bool(decision.allowed),
             'side': decision.side,
             'score': float(decision.score),
             'risk_multiplier': float(decision.risk_multiplier),
-            'confirmations': list(decision.confirmations),
             'metrics': dict(decision.metrics),
+            'l2_gate': dict(l2_gate or {}),
+            'futures_context': dict(derivatives or {}),
         })
         if not decision.allowed or decision.side not in {'long', 'short'}:
             return _finish(None, decision.reason)
@@ -17096,13 +17134,12 @@ class SignalEngine(BaseEngine):
         if int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
             return _finish(None, f'risk_limit_blocked: daily trade count {daily_entries}', 'REJECTED_DAILY_TRADE_LIMIT')
 
-        latest_15m = (frames.get('15m') or [])[-1] if frames.get('15m') else {}
+        latest_15m = rows[-1] if rows else {}
         entry_price = _safe_float_or_none(latest_15m.get('close'))
         metrics = dict(decision.metrics or {})
-        tf_metrics = metrics.get('timeframes') if isinstance(metrics.get('timeframes'), dict) else {}
-        atr_value = _safe_float_or_none((tf_metrics.get('15m') or {}).get('atr'))
+        atr_value = _safe_float_or_none(metrics.get('atr'))
         if entry_price is None or entry_price <= 0 or atr_value is None or atr_value <= 0:
-            return _finish(None, 'M-TREND entry price/ATR unavailable', 'REJECTED_M_TREND_DATA')
+            return _finish(None, 'LXR entry price/ATR unavailable', 'REJECTED_LXR_DATA')
 
         filter_values = {
             'entry_price': entry_price,
@@ -17114,12 +17151,6 @@ class SignalEngine(BaseEngine):
         status['market_quality'] = market_quality
         if market_quality.get('hard_block') or market_quality.get('state') is False:
             return _finish(None, f"market_quality_rejected: {market_quality.get('summary')}", 'REJECTED_MARKET_QUALITY')
-        l2_gate = await self._evaluate_shared_l2_gate(
-            canonical,
-            cfg,
-            force_refresh=force_reprocess,
-            side=side,
-        )
         status['l2_gate'] = dict(l2_gate or {})
         if not l2_gate.get('allowed', False):
             return _finish(None, f"L2 stressed: {l2_gate.get('reason')}", 'REJECTED_L2_STRESSED')
@@ -17144,14 +17175,14 @@ class SignalEngine(BaseEngine):
                 side=side,
                 entry_price=entry_price,
                 atr_value=atr_value,
-                stop_atr_multiplier=float(trend_cfg.get('stop_atr_multiplier', 1.50) or 1.50),
+                stop_atr_multiplier=float(lxr_cfg.get('stop_atr_multiplier', 1.10) or 1.10),
                 ut_stop=None,
-                structure_stop=None,
-                structure_buffer_atr=0.0,
-                take_profit_r_multiple=float(trend_cfg.get('take_profit_r_multiple', 3.0) or 3.0),
+                structure_stop=_safe_float_or_none(metrics.get('structure_stop')),
+                structure_buffer_atr=float(lxr_cfg.get('structure_buffer_atr', 0.15) or 0.15),
+                take_profit_r_multiple=float(lxr_cfg.get('take_profit_r_multiple', 2.60) or 2.60),
                 take_profit_front_run_atr=0.0,
                 take_profit_front_run_pct=0.0,
-                min_risk_reward=min(2.0, float(trend_cfg.get('take_profit_r_multiple', 3.0) or 3.0)),
+                min_risk_reward=min(2.0, float(lxr_cfg.get('take_profit_r_multiple', 2.60) or 2.60)),
                 balance_usdt=balance_for_risk,
                 risk_per_trade_percent=risk_budget['risk_per_trade_percent'],
                 max_risk_per_trade_usdt=risk_budget['max_risk_per_trade_usdt'],
@@ -17164,21 +17195,20 @@ class SignalEngine(BaseEngine):
                 entry_price=entry_price,
             )
         except ValueError as exc:
-            return _finish(None, f'M-TREND risk plan rejected: {exc}', 'REJECTED_M_TREND_RISK_PLAN')
+            return _finish(None, f'LXR risk plan rejected: {exc}', 'REJECTED_LXR_RISK_PLAN')
 
         plan.update({
-            'strategy': M_TREND_STRATEGY,
+            'strategy': LXR_STRATEGY,
             'plan_symbol': canonical,
             'signal_candle_ts': latest_15m.get('timestamp'),
             'entry_timeframe': '15m',
             'timeframe': '15m',
             'exit_timeframe': '15m',
-            'htf_timeframe': '4h',
+            'htf_timeframe': '1h',
             'entry_execution': 'market',
-            'mtrend_score': float(decision.score),
-            'mtrend_risk_multiplier': risk_multiplier,
-            'mtrend_confirmations': list(decision.confirmations),
-            'mtrend_metrics': metrics,
+            'lxr_score': float(decision.score),
+            'lxr_risk_multiplier': risk_multiplier,
+            'lxr_metrics': metrics,
             'l2_gate': dict(l2_gate or {}),
             'l2_state': l2_gate.get('state'),
             'l2_risk_multiplier': l2_gate.get('risk_multiplier'),
@@ -17189,53 +17219,48 @@ class SignalEngine(BaseEngine):
             'partial_take_profit_r_multiple': 1.0,
             'partial_take_profit_ratio': 0.25,
             'second_take_profit_enabled': True,
-            'second_take_profit_r_multiple': float(trend_cfg.get('take_profit_r_multiple', 3.0) or 3.0),
+            'second_take_profit_r_multiple': float(lxr_cfg.get('take_profit_r_multiple', 2.60) or 2.60),
             'second_take_profit_ratio': 0.35,
             'runner_pct': 0.40,
             'atr_trailing_enabled': True,
-            'atr_trailing_activation_r': 1.0,
-            'atr_trailing_multiplier': float(trend_cfg.get('trailing_atr_multiplier', 3.0) or 3.0),
+            'atr_trailing_activation_r': 1.20,
+            'atr_trailing_multiplier': 2.0,
             'runner_exit_enabled': True,
             'runner_chandelier_enabled': True,
             'tp1_breakeven_enabled': True,
             'tp1_breakeven_wait_for_partial': True,
             'ev_time_stop_enabled': True,
-            'ev_time_stop_bars': int(trend_cfg.get('time_stop_bars', 48) or 48),
-            'ev_time_stop_min_mfe_r': 0.50,
+            'ev_time_stop_bars': int(lxr_cfg.get('time_stop_bars', 8) or 8),
+            'ev_time_stop_min_mfe_r': 0.35,
         })
         self._set_utbot_filtered_breakout_entry_plan(canonical, plan)
         status['entry_plan'] = dict(plan)
         return _finish(side, f'ACCEPTED_ENTRY: {decision.reason}')
 
-    async def build_multi_timeframe_trend_status_text(self, symbol=None):
+    async def build_liquidation_exhaustion_reversal_status_text(self, symbol=None):
         target = self._canonical_futures_symbol(
             symbol or self.current_utbreakout_candidate_symbol or 'BTC/USDT'
         )
-        status = dict((getattr(self, 'multi_timeframe_trend_last_status', {}) or {}).get(target) or {})
+        status = dict((getattr(self, 'liquidation_exhaustion_reversal_last_status', {}) or {}).get(target) or {})
         if not status:
             return '\n'.join([
-                'M-TREND strategy status',
+                'LXR liquidation-exhaustion reversal status',
                 f'Symbol: {target}',
-                'No completed M-TREND evaluation is available yet.',
+                'No completed LXR evaluation is available yet.',
             ])
         metrics = status.get('metrics') if isinstance(status.get('metrics'), dict) else {}
         l2 = status.get('l2_gate') if isinstance(status.get('l2_gate'), dict) else {}
         rows = [
-            'M-TREND strategy status',
+            'LXR liquidation-exhaustion reversal status',
             f'Symbol: {target}',
             f"Signal: {str(status.get('side') or 'NONE').upper()} / allowed={bool(status.get('allowed'))}",
             f"Score: {float(status.get('score', 0.0) or 0.0):.1f} / risk x{float(status.get('risk_multiplier', 0.0) or 0.0):.2f}",
-            f"4h bias: {str(metrics.get('bias') or 'NEUTRAL').upper()}",
-            f"Breakout confirmations: {', '.join(status.get('confirmations') or []) or 'NONE'}",
+            f"Shock: {str(metrics.get('direction') or 'NONE').upper()} / {float(metrics.get('shock_atr', 0.0) or 0.0):.2f} ATR / volume x{float(metrics.get('shock_volume_ratio', 0.0) or 0.0):.2f}",
+            f"OI 1h: {float(metrics.get('open_interest_change_1h', 0.0) or 0.0):+.2f}% / z {float(metrics.get('open_interest_delta_z', 0.0) or 0.0):+.2f}",
+            f"Reclaim: {float(metrics.get('reclaim_atr', 0.0) or 0.0):.2f} ATR / structure={bool(metrics.get('structure_reclaimed'))}",
             f"L2: {str(l2.get('state') or 'unknown').upper()} / {l2.get('reason') or '-'}",
             f"Reason: {status.get('reason') or '-'}",
         ]
-        for timeframe in ('15m', '1h', '4h'):
-            item = (metrics.get('timeframes') or {}).get(timeframe) or {}
-            rows.append(
-                f"{timeframe}: {str(item.get('side') or 'WAIT').upper()} / "
-                f"breakout ATR={float(item.get('breakout_atr', 0.0) or 0.0):.2f}"
-            )
         return '\n'.join(rows)
 
     def _dual_alpha_strategy_params(self, strategy_params, branch):
@@ -18043,21 +18068,21 @@ class SignalEngine(BaseEngine):
 
     def _quad_alpha_strategy_params(self, strategy_params, branch):
         branch = str(branch or '').lower()
-        if branch not in {CROWDING_UNWIND_STRATEGY, M_TREND_STRATEGY}:
+        if branch not in {CROWDING_UNWIND_STRATEGY, LXR_STRATEGY}:
             return self._triple_alpha_strategy_params(strategy_params, branch)
         params = copy.deepcopy(strategy_params if isinstance(strategy_params, dict) else {})
         cfg = dict(params.get('UTBotFilteredBreakoutV1') or {})
-        if branch == M_TREND_STRATEGY:
-            trend_cfg = self._multi_timeframe_trend_runtime_config(cfg)
-            trend_cfg['enabled'] = True
-            trend_cfg['live_enabled'] = True
-            cfg['multi_timeframe_trend'] = trend_cfg
-            cfg['multi_timeframe_trend_live_enabled'] = True
+        if branch == LXR_STRATEGY:
+            lxr_cfg = self._liquidation_exhaustion_reversal_runtime_config(cfg)
+            lxr_cfg['enabled'] = True
+            lxr_cfg['live_enabled'] = True
+            cfg['liquidation_exhaustion_reversal'] = lxr_cfg
+            cfg['liquidation_exhaustion_reversal_live_enabled'] = True
             cfg['qh_flow_confirmation_enabled'] = False
             cfg['relative_strength_pullback_trend_live_enabled'] = False
             cfg['adaptive_timeframe_enabled'] = False
             cfg['entry_strategy'] = ENTRY_STRATEGY_UT_BREAKOUT
-            params['active_strategy'] = M_TREND_STRATEGY
+            params['active_strategy'] = LXR_STRATEGY
             params['UTBotFilteredBreakoutV1'] = cfg
             return params
         crowd_cfg = self._crowding_unwind_runtime_config(cfg)
@@ -18220,21 +18245,21 @@ class SignalEngine(BaseEngine):
         else:
             branch_results.append(_disabled_branch(CROWDING_UNWIND_STRATEGY, 'Crowding Unwind', 3))
 
-        if M_TREND_STRATEGY in enabled_set:
-            trend_params = self._quad_alpha_strategy_params(strategy_params, M_TREND_STRATEGY)
+        if LXR_STRATEGY in enabled_set:
+            lxr_params = self._quad_alpha_strategy_params(strategy_params, LXR_STRATEGY)
             branch_results.append(await _run_branch(
-                M_TREND_STRATEGY,
-                'M-TREND',
+                LXR_STRATEGY,
+                'LXR Reversal',
                 4,
-                lambda: self._calculate_multi_timeframe_trend_signal(
+                lambda: self._calculate_liquidation_exhaustion_reversal_signal(
                     base_symbol,
                     df,
-                    trend_params,
+                    lxr_params,
                     force_reprocess=force_reprocess,
                 ),
             ))
         else:
-            branch_results.append(_disabled_branch(M_TREND_STRATEGY, 'M-TREND', 4))
+            branch_results.append(_disabled_branch(LXR_STRATEGY, 'LXR Reversal', 4))
 
         choices = []
         for key, label, side, reason, status, plan, priority in branch_results:
@@ -18315,6 +18340,16 @@ class SignalEngine(BaseEngine):
             else None
         )
         crowding_light['metrics'] = dict(crowding_status_metrics or {})
+        lxr_light = self._dual_alpha_light(
+            statuses.get(LXR_STRATEGY),
+            'LXR Reversal',
+        )
+        lxr_status_metrics = (
+            statuses.get(LXR_STRATEGY, {}).get('metrics')
+            if isinstance(statuses.get(LXR_STRATEGY), dict)
+            else None
+        )
+        lxr_light['metrics'] = dict(lxr_status_metrics or {})
         summary = {
             'enabled': True,
             'enabled_strategies': list(enabled_strategies),
@@ -18326,7 +18361,7 @@ class SignalEngine(BaseEngine):
             'rspt': self._dual_alpha_light(statuses.get(ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND), 'RSPT-v3'),
             'qh_flow': self._dual_alpha_light(statuses.get(QH_FLOW_STRATEGY), 'QH-Flow v2'),
             'crowding_unwind': crowding_light,
-            'mtrend': self._dual_alpha_light(statuses.get(M_TREND_STRATEGY), 'M-TREND'),
+            'lxr': lxr_light,
             'agreement_state': agreement_state,
             'agreement_risk_multiplier': agreement_multiplier,
             'confirmation_count': len(choices),
@@ -18364,7 +18399,7 @@ class SignalEngine(BaseEngine):
                 f"RSPT={reasons.get(ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND)}; "
                 f"QH={reasons.get(QH_FLOW_STRATEGY)}; "
                 f"CROWD={reasons.get(CROWDING_UNWIND_STRATEGY)}; "
-                f"M-TREND={reasons.get(M_TREND_STRATEGY)}"
+                f"LXR={reasons.get(LXR_STRATEGY)}"
             )
 
         canonical = self._canonical_futures_symbol(final_status.get('plan_symbol') or base_symbol)
@@ -18415,7 +18450,7 @@ class SignalEngine(BaseEngine):
                 'rspt': _empty_light(ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND),
                 'qh_flow': _empty_light(QH_FLOW_STRATEGY),
                 'crowding_unwind': _empty_light(CROWDING_UNWIND_STRATEGY),
-                'mtrend': _empty_light(M_TREND_STRATEGY),
+                'lxr': _empty_light(LXR_STRATEGY),
             }
             status['reason'] = 'No evaluation has completed since the latest strategy selection.'
 
@@ -18466,7 +18501,7 @@ class SignalEngine(BaseEngine):
             ('rspt', 'RSPT-v3'),
             ('qh_flow', 'QH-Flow v2'),
             ('crowding_unwind', 'Crowding Unwind'),
-            ('mtrend', 'M-TREND'),
+            ('lxr', 'LXR Reversal'),
         )
         traffic = {
             key: _traffic_view(summary.get(key))
@@ -18524,6 +18559,16 @@ class SignalEngine(BaseEngine):
                 missing = list(metrics.get('missing_derivatives_fields') or [])
                 if missing:
                     lines.append(f"  누락 필드: {', '.join(str(value) for value in missing)}")
+            elif key == 'lxr':
+                metrics = item.get('metrics') if isinstance(item.get('metrics'), dict) else {}
+                lines.append(
+                    '  LXR 데이터: '
+                    f"shock={str(metrics.get('direction') or 'N/A').upper()} "
+                    f"{_metric_text(metrics.get('shock_atr'), digits=2)}ATR | "
+                    f"volume x{_metric_text(metrics.get('shock_volume_ratio'), digits=2)} | "
+                    f"OI 1h={_metric_text(metrics.get('open_interest_change_1h'), digits=2, signed=True)}% | "
+                    f"reclaim={_metric_text(metrics.get('reclaim_atr'), digits=2)}ATR"
+                )
         lines.extend([
             '',
             f"최종 사유: {status.get('reason') or '-'}",
@@ -33670,9 +33715,9 @@ class SignalEngine(BaseEngine):
             )
             is_bullish = sig == 'long'
             is_bearish = sig == 'short'
-        elif active_strategy == M_TREND_STRATEGY:
+        elif active_strategy == LXR_STRATEGY:
             entry_mode = active_strategy
-            sig, entry_reason, _ = await self._calculate_multi_timeframe_trend_signal(
+            sig, entry_reason, _ = await self._calculate_liquidation_exhaustion_reversal_signal(
                 symbol,
                 df,
                 strategy_params,
@@ -45982,18 +46027,18 @@ class MainController:
                 engine.qh_flow_signal_cache = {}
             return f'TRIPLE Alpha OFF. {notice}'
 
-        async def _activate_multi_timeframe_trend_strategy():
+        async def _activate_liquidation_exhaustion_reversal_strategy():
             await _ensure_signal_engine_active()
             self.is_paused = False
             current = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
-            trend_cfg = default_multi_timeframe_trend_config()
-            if isinstance(current, dict) and isinstance(current.get('multi_timeframe_trend'), dict):
-                trend_cfg.update(current.get('multi_timeframe_trend'))
-            trend_cfg['enabled'] = True
-            trend_cfg['live_enabled'] = True
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], M_TREND_STRATEGY)
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'multi_timeframe_trend'], trend_cfg)
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'multi_timeframe_trend_live_enabled'], True)
+            lxr_cfg = default_liquidation_exhaustion_reversal_config()
+            if isinstance(current, dict) and isinstance(current.get('liquidation_exhaustion_reversal'), dict):
+                lxr_cfg.update(current.get('liquidation_exhaustion_reversal'))
+            lxr_cfg['enabled'] = True
+            lxr_cfg['live_enabled'] = True
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], LXR_STRATEGY)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'liquidation_exhaustion_reversal'], lxr_cfg)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'liquidation_exhaustion_reversal_live_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'l2_gate_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend_live_enabled'], False)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], False)
@@ -46009,26 +46054,26 @@ class MainController:
                 reset_stateful_strategy=True,
             )
             if engine:
-                engine.multi_timeframe_trend_last_status = {}
+                engine.liquidation_exhaustion_reversal_last_status = {}
                 engine.l2_gate_cache = {}
                 engine.l2_gate_history = {}
                 if not engine.running:
                     engine.start()
             return (
-                'M-TREND ON. A fresh 15m, 1h, or 4h Donchian breakout aligned with the '
-                '4h EMA trend can enter through the existing live order and protection path.'
+                'LXR ON. A completed high-volume price shock with falling open interest must '
+                'reclaim structure before it can enter through the existing live order and protection path.'
             )
 
-        async def _deactivate_multi_timeframe_trend_strategy():
+        async def _deactivate_liquidation_exhaustion_reversal_strategy():
             notice = await _activate_utbreak_strategy()
             await self.cfg.update_value(
-                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'multi_timeframe_trend_live_enabled'],
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'liquidation_exhaustion_reversal_live_enabled'],
                 False,
             )
             engine = self.engines.get('signal')
             if engine:
-                engine.multi_timeframe_trend_last_status = {}
-            return f'M-TREND OFF. {notice}'
+                engine.liquidation_exhaustion_reversal_last_status = {}
+            return f'LXR OFF. {notice}'
 
 
 
@@ -46075,11 +46120,11 @@ class MainController:
                 crowd_cfg.update(current.get('crowding_unwind'))
             crowd_cfg['enabled'] = branch_live[CROWDING_UNWIND_STRATEGY]
             crowd_cfg['live_enabled'] = branch_live[CROWDING_UNWIND_STRATEGY]
-            trend_cfg = default_multi_timeframe_trend_config()
-            if isinstance(current, dict) and isinstance(current.get('multi_timeframe_trend'), dict):
-                trend_cfg.update(current.get('multi_timeframe_trend'))
-            trend_cfg['enabled'] = branch_live[M_TREND_STRATEGY]
-            trend_cfg['live_enabled'] = branch_live[M_TREND_STRATEGY]
+            lxr_cfg = default_liquidation_exhaustion_reversal_config()
+            if isinstance(current, dict) and isinstance(current.get('liquidation_exhaustion_reversal'), dict):
+                lxr_cfg.update(current.get('liquidation_exhaustion_reversal'))
+            lxr_cfg['enabled'] = branch_live[LXR_STRATEGY]
+            lxr_cfg['live_enabled'] = branch_live[LXR_STRATEGY]
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], QUAD_ALPHA_STRATEGY)
             await self.cfg.update_value(
                 ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'quad_alpha_enabled_strategies'],
@@ -46101,10 +46146,10 @@ class MainController:
                 ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'crowding_unwind_live_enabled'],
                 branch_live[CROWDING_UNWIND_STRATEGY],
             )
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'multi_timeframe_trend'], trend_cfg)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'liquidation_exhaustion_reversal'], lxr_cfg)
             await self.cfg.update_value(
-                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'multi_timeframe_trend_live_enabled'],
-                branch_live[M_TREND_STRATEGY],
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'liquidation_exhaustion_reversal_live_enabled'],
+                branch_live[LXR_STRATEGY],
             )
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'l2_gate_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], True)
@@ -46125,7 +46170,7 @@ class MainController:
                 engine.qh_flow_signal_cache = {}
                 engine.qh_flow_last_status = {}
                 engine.crowding_unwind_last_status = {}
-                engine.multi_timeframe_trend_last_status = {}
+                engine.liquidation_exhaustion_reversal_last_status = {}
                 engine.quad_alpha_last_status = {}
                 engine.relative_strength_pullback_eval_cache = {}
                 engine.l2_gate_cache = {}
@@ -46160,7 +46205,7 @@ class MainController:
                 'relative_strength_pullback_trend_live_enabled',
                 'qh_flow_live_enabled',
                 'crowding_unwind_live_enabled',
-                'multi_timeframe_trend_live_enabled',
+                'liquidation_exhaustion_reversal_live_enabled',
             ):
                 await self.cfg.update_value(
                     ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', key],
@@ -46171,7 +46216,7 @@ class MainController:
                 engine.quad_alpha_last_status = {}
                 engine.qh_flow_signal_cache = {}
                 engine.crowding_unwind_last_status = {}
-                engine.multi_timeframe_trend_last_status = {}
+                engine.liquidation_exhaustion_reversal_last_status = {}
             return f'5-Strategy Alpha ALL OFF. {notice}'
 
         async def _activate_crowding_unwind_strategy():
@@ -47435,38 +47480,38 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
             await _show_utbreakout_callback_progress(query, 'Crowding Unwind status 조회 중입니다.')
             await _send_crowding_unwind_status(getattr(query, 'message', None))
 
-        async def _get_multi_timeframe_trend_status_text():
+        async def _get_liquidation_exhaustion_reversal_status_text():
             engine = self.engines.get('signal')
             if not engine:
-                return 'M-TREND status\n\nSignal engine not found.'
+                return 'LXR status\n\nSignal engine not found.'
             symbol = await _get_utbreakout_status_symbol_async()
-            return await engine.build_multi_timeframe_trend_status_text(symbol)
+            return await engine.build_liquidation_exhaustion_reversal_status_text(symbol)
 
-        async def _send_multi_timeframe_trend_status(message):
+        async def _send_liquidation_exhaustion_reversal_status(message):
             if message is None:
                 return False
             try:
-                text = await _get_multi_timeframe_trend_status_text()
+                text = await _get_liquidation_exhaustion_reversal_status_text()
                 await self._reply_long_text_with_document(
                     message,
                     text,
                     reply_markup=_build_utbreakout_keyboard(),
-                    filename='mtrend_status.txt',
-                    caption='M-TREND strategy status',
-                    preview_suffix='M-TREND status was sent as a file.',
+                    filename='lxr_status.txt',
+                    caption='LXR strategy status',
+                    preview_suffix='LXR status was sent as a file.',
                 )
                 return True
             except Exception as exc:
-                logger.exception('M-TREND status send failed')
+                logger.exception('LXR status send failed')
                 await message.reply_text(
-                    f'M-TREND status failed: {type(exc).__name__}: {exc}',
+                    f'LXR status failed: {type(exc).__name__}: {exc}',
                     reply_markup=_build_utbreakout_keyboard(),
                 )
                 return False
 
-        async def _send_multi_timeframe_trend_status_from_callback(query):
-            await _show_utbreakout_callback_progress(query, 'M-TREND status 조회 중입니다.')
-            await _send_multi_timeframe_trend_status(getattr(query, 'message', None))
+        async def _send_liquidation_exhaustion_reversal_status_from_callback(query):
+            await _show_utbreakout_callback_progress(query, 'LXR status 조회 중입니다.')
+            await _send_liquidation_exhaustion_reversal_status(getattr(query, 'message', None))
 
         async def _edit_utbreakout_condition_status(query):
             text = await _get_utbreakout_condition_status_text()
@@ -48037,25 +48082,25 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                         parse_mode=ParseMode.MARKDOWN,
                     )
                     return
-            elif action in {'mtrend', 'm_trend', 'trend5'}:
+            elif action in {'lxr', 'liquidation_reversal'}:
                 mode = str(args[1]).strip().lower() if len(args) > 1 else 'status'
                 if mode in {'on', 'enable', 'start', 'live'}:
                     await u.message.reply_text(
-                        await _activate_multi_timeframe_trend_strategy(),
+                        await _activate_liquidation_exhaustion_reversal_strategy(),
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=_build_utbreakout_keyboard(),
                     )
                 elif mode in {'off', 'disable', 'stop'}:
                     await u.message.reply_text(
-                        await _deactivate_multi_timeframe_trend_strategy(),
+                        await _deactivate_liquidation_exhaustion_reversal_strategy(),
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=_build_utbreakout_keyboard(),
                     )
                 elif mode in {'status', 'stat', 'menu', ''}:
-                    await _send_multi_timeframe_trend_status(u.message)
+                    await _send_liquidation_exhaustion_reversal_status(u.message)
                 else:
                     await u.message.reply_text(
-                        'Usage: `/utbreak mtrend on`, `/utbreak mtrend off`, `/utbreak mtrend status`',
+                        'Usage: `/utbreak lxr on`, `/utbreak lxr off`, `/utbreak lxr status`',
                         parse_mode=ParseMode.MARKDOWN,
                     )
                     return
@@ -48665,20 +48710,20 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     await _send_crowding_unwind_status_from_callback(query)
                 return
 
-            if action in {'mtrend', 'm_trend'}:
+            if action in {'lxr', 'liquidation_reversal'}:
                 mode = str(value or '').lower()
                 if mode in {'on', 'enable', '1', 'true', 'live'}:
                     await _edit_utbreakout_menu(
                         query,
-                        await _set_quad_alpha_branch_enabled(M_TREND_STRATEGY, True),
+                        await _set_quad_alpha_branch_enabled(LXR_STRATEGY, True),
                     )
                 elif mode in {'off', 'disable', '0', 'false', 'stop'}:
                     await _edit_utbreakout_menu(
                         query,
-                        await _set_quad_alpha_branch_enabled(M_TREND_STRATEGY, False),
+                        await _set_quad_alpha_branch_enabled(LXR_STRATEGY, False),
                     )
                 else:
-                    await _send_multi_timeframe_trend_status_from_callback(query)
+                    await _send_liquidation_exhaustion_reversal_status_from_callback(query)
                 return
 
             if action in {'qh', 'qhflow'}:
@@ -48739,8 +48784,8 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 await _send_crowding_unwind_status_from_callback(query)
                 return
 
-            if action == 'mtrend_status':
-                await _send_multi_timeframe_trend_status_from_callback(query)
+            if action == 'lxr_status':
+                await _send_liquidation_exhaustion_reversal_status_from_callback(query)
                 return
 
             if action == 'dual_status':

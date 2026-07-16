@@ -40,3 +40,23 @@ def test_zero_trade_month_still_produces_report():
     report = build_monthly_trade_report([], 2026, 6)
     assert "No real positions were closed" in report
     assert "Open positions at month end" in report
+
+
+def test_report_tracks_lxr_as_a_primary_live_strategy():
+    report = build_monthly_trade_report([{
+        "trade_id": "lxr-one",
+        "primary_strategy": "liquidation_exhaustion_reversal_v1",
+        "confirmation_strategies": ["liquidation_exhaustion_reversal_v1"],
+        "symbol": "ETH/USDT:USDT",
+        "side": "short",
+        "entry_time": "2026-06-10T00:00:00+00:00",
+        "exit_time": "2026-06-10T01:00:00+00:00",
+        "entry_price": 100,
+        "exit_price": 98,
+        "filled_qty": 1,
+        "gross_pnl_usdt": 2,
+        "net_pnl_usdt": 1.8,
+        "realized_r": 1.2,
+    }], 2026, 6)
+    assert "liquidation_exhaustion_reversal" in report
+    assert "ALL REAL TRADES                     1" in report
