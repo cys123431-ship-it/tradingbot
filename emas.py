@@ -4569,6 +4569,17 @@ class BaseEngine:
             logger.info(f"{symbol} Settings: UPBIT KRW spot / leverage fixed at 1x")
             return
 
+        # CCXT's symbol-scoped Binance setting methods require market metadata.
+        # Startup reaches this method before the scanner has loaded markets, so
+        # preload them once instead of producing a false settings failure.
+        if not getattr(self.exchange, 'markets', None):
+            load_markets = getattr(self.exchange, 'load_markets', None)
+            if callable(load_markets):
+                try:
+                    await asyncio.to_thread(load_markets)
+                except Exception as e:
+                    logger.warning("Market metadata preload failed for %s: %s", symbol, e)
+
         # 1. Position Mode: One-way (Hedge Mode OFF)
         try:
             await asyncio.to_thread(self.exchange.set_position_mode, hedged=False, symbol=symbol)
@@ -10506,7 +10517,15 @@ class SignalEngine(BaseEngine):
     def _canonicalize_utbreakout_symbol_for_use(self, symbol, source='unknown'):
         canonical = self._canonical_futures_symbol(symbol)
         if str(symbol or '') != str(canonical):
-            logger.warning(
+            # Position snapshots can legitimately use the shorter CCXT alias
+            # (for example RAVE/USDT). Normalizing that alias on every poll is
+            # expected runtime behavior, not an operator warning.
+            log_normalization = (
+                logger.debug
+                if str(source or '').startswith('poll_tick_')
+                else logger.warning
+            )
+            log_normalization(
                 "[UTBREAK_SYMBOL_NORMALIZED] source=%s raw=%s canonical=%s",
                 source,
                 symbol,
