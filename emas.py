@@ -660,6 +660,11 @@ def normalize_quad_alpha_enabled_strategies(value):
     return [key for key in QUAD_ALPHA_BRANCH_ORDER if key in requested]
 
 
+def quad_alpha_branch_live_flags(enabled_strategies):
+    enabled = set(normalize_quad_alpha_enabled_strategies(enabled_strategies))
+    return {key: key in enabled for key in QUAD_ALPHA_BRANCH_ORDER}
+
+
 def quad_alpha_selection_text(enabled_strategies):
     enabled = set(normalize_quad_alpha_enabled_strategies(enabled_strategies))
     lines = [
@@ -3380,7 +3385,58 @@ class TradingConfig:
         active_strategy = str(strategy_params.get('active_strategy', 'utbot')).lower()
         if active_strategy not in CORE_STRATEGIES:
             strategy_params['active_strategy'] = 'utbot'
+            active_strategy = 'utbot'
             changed = True
+        if active_strategy == QUAD_ALPHA_STRATEGY:
+            quad_cfg = strategy_params.setdefault('UTBotFilteredBreakoutV1', {})
+            selected = normalize_quad_alpha_enabled_strategies(
+                quad_cfg.get('quad_alpha_enabled_strategies')
+            )
+            if quad_cfg.get('quad_alpha_enabled_strategies') != selected:
+                quad_cfg['quad_alpha_enabled_strategies'] = list(selected)
+                changed = True
+            live_flags = quad_alpha_branch_live_flags(selected)
+            top_level_live_flags = {
+                'relative_strength_pullback_trend_live_enabled': live_flags[
+                    ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
+                ],
+                'qh_flow_live_enabled': live_flags[QH_FLOW_STRATEGY],
+                'crowding_unwind_live_enabled': live_flags[CROWDING_UNWIND_STRATEGY],
+                'multi_timeframe_trend_live_enabled': live_flags[M_TREND_STRATEGY],
+            }
+            for key, value in top_level_live_flags.items():
+                if quad_cfg.get(key) is not value:
+                    quad_cfg[key] = value
+                    changed = True
+            nested_live_flags = {
+                'relative_strength_pullback_trend': {
+                    'relative_strength_pullback_trend_live_enabled': live_flags[
+                        ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
+                    ],
+                },
+                'qh_flow': {
+                    'qh_flow_enabled': live_flags[QH_FLOW_STRATEGY],
+                    'qh_flow_live_enabled': live_flags[QH_FLOW_STRATEGY],
+                },
+                'crowding_unwind': {
+                    'enabled': live_flags[CROWDING_UNWIND_STRATEGY],
+                    'live_enabled': live_flags[CROWDING_UNWIND_STRATEGY],
+                },
+                'multi_timeframe_trend': {
+                    'enabled': live_flags[M_TREND_STRATEGY],
+                    'live_enabled': live_flags[M_TREND_STRATEGY],
+                },
+            }
+            for section, values in nested_live_flags.items():
+                nested_cfg = quad_cfg.setdefault(section, {})
+                if not isinstance(nested_cfg, dict):
+                    nested_cfg = {}
+                    quad_cfg[section] = nested_cfg
+                    changed = True
+                for key, value in values.items():
+                    if nested_cfg.get(key) is not value:
+                        nested_cfg[key] = value
+                        changed = True
 
         entry_mode = str(strategy_params.get('entry_mode', 'cross')).lower()
         if entry_mode not in {'cross', 'position'}:
@@ -5886,6 +5942,20 @@ class SignalEngine(BaseEngine):
         self.last_candle_time = {}
         self.last_candle_success = {}
         self.last_processed_candle_ts = {}
+        self.utbreakout_entry_trace = {}
+        self.utbreakout_last_ready_ts = {}
+        self.utbreakout_last_ready_side = {}
+        self.utbreakout_last_order_attempt_ts = {}
+        self.utbreakout_last_watchdog_report_ts = {}
+        self.utbreakout_auto_entry_bridge_last_attempt_ts = {}
+        self.utbreakout_last_status_symbol = None
+        self.utbreakout_last_ready_symbol = None
+        self.current_utbreakout_candidate_symbol = None
+        self.utbreakout_status_symbol_source = None
+        self.utbreakout_status_symbol_detail = None
+        self.utbot_filtered_breakout_entry_plans = {}
+        self.last_utbot_filtered_breakout_status = {}
+        self.last_entry_reason = {}
 
     def reset_exit_runtime_state(self):
         self.last_processed_exit_candle_ts = {}
@@ -45604,7 +45674,7 @@ class MainController:
 
         async def _activate_utbreak_strategy():
             await _ensure_signal_engine_active()
-            self.is_paused = False
+            self.is_paused = True
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'entry_strategy'], ENTRY_STRATEGY_UT_BREAKOUT)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend_live_enabled'], False)
@@ -45643,6 +45713,7 @@ class MainController:
                 engine.active_symbols.clear()
                 if not engine.running:
                     engine.start()
+            self.is_paused = False
             return "✅ UTBreak ON. CoinSelector + scanner + Set AUTO + Adaptive TF 자동 운용을 한 번에 켰습니다."
 
         async def _activate_relative_strength_pullback_strategy():
@@ -45970,12 +46041,13 @@ class MainController:
 
         async def _activate_quad_alpha_strategy(enabled_strategies=None):
             await _ensure_signal_engine_active()
-            self.is_paused = False
+            self.is_paused = True
             enabled_strategies = normalize_quad_alpha_enabled_strategies(
                 list(QUAD_ALPHA_BRANCH_ORDER) if enabled_strategies is None else enabled_strategies
             )
             if not enabled_strategies:
                 raise ValueError('At least one strategy must remain selected.')
+            branch_live = quad_alpha_branch_live_flags(enabled_strategies)
             current = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
             rsp_cfg = default_relative_strength_pullback_config()
             if isinstance(current, dict) and isinstance(current.get('relative_strength_pullback_trend'), dict):
@@ -45983,7 +46055,9 @@ class MainController:
             rsp_cfg.update({
                 'entry_strategy': ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
                 'relative_strength_pullback_trend_shadow_enabled': True,
-                'relative_strength_pullback_trend_live_enabled': True,
+                'relative_strength_pullback_trend_live_enabled': branch_live[
+                    ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
+                ],
                 'relative_strength_pullback_trend_paper_enabled': False,
                 'rspt_v2_enabled': True,
                 'rspt_v3_enabled': True,
@@ -45994,18 +46068,18 @@ class MainController:
             qh_cfg = default_qh_flow_config()
             if isinstance(current, dict) and isinstance(current.get('qh_flow'), dict):
                 qh_cfg.update(current.get('qh_flow'))
-            qh_cfg['qh_flow_enabled'] = True
-            qh_cfg['qh_flow_live_enabled'] = True
+            qh_cfg['qh_flow_enabled'] = branch_live[QH_FLOW_STRATEGY]
+            qh_cfg['qh_flow_live_enabled'] = branch_live[QH_FLOW_STRATEGY]
             crowd_cfg = default_crowding_unwind_config()
             if isinstance(current, dict) and isinstance(current.get('crowding_unwind'), dict):
                 crowd_cfg.update(current.get('crowding_unwind'))
-            crowd_cfg['enabled'] = True
-            crowd_cfg['live_enabled'] = True
+            crowd_cfg['enabled'] = branch_live[CROWDING_UNWIND_STRATEGY]
+            crowd_cfg['live_enabled'] = branch_live[CROWDING_UNWIND_STRATEGY]
             trend_cfg = default_multi_timeframe_trend_config()
             if isinstance(current, dict) and isinstance(current.get('multi_timeframe_trend'), dict):
                 trend_cfg.update(current.get('multi_timeframe_trend'))
-            trend_cfg['enabled'] = True
-            trend_cfg['live_enabled'] = True
+            trend_cfg['enabled'] = branch_live[M_TREND_STRATEGY]
+            trend_cfg['live_enabled'] = branch_live[M_TREND_STRATEGY]
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], QUAD_ALPHA_STRATEGY)
             await self.cfg.update_value(
                 ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'quad_alpha_enabled_strategies'],
@@ -46013,13 +46087,25 @@ class MainController:
             )
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'entry_strategy'], ENTRY_STRATEGY_UT_BREAKOUT)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend'], rsp_cfg)
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend_live_enabled'], True)
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend_live_enabled'],
+                branch_live[ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND],
+            )
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow'], qh_cfg)
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow_live_enabled'], True)
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow_live_enabled'],
+                branch_live[QH_FLOW_STRATEGY],
+            )
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'crowding_unwind'], crowd_cfg)
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'crowding_unwind_live_enabled'], True)
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'crowding_unwind_live_enabled'],
+                branch_live[CROWDING_UNWIND_STRATEGY],
+            )
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'multi_timeframe_trend'], trend_cfg)
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'multi_timeframe_trend_live_enabled'], True)
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'multi_timeframe_trend_live_enabled'],
+                branch_live[M_TREND_STRATEGY],
+            )
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'l2_gate_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'], 'auto')
@@ -46046,6 +46132,7 @@ class MainController:
                 engine.l2_gate_history = {}
                 if not engine.running:
                     engine.start()
+            self.is_paused = False
             enabled_labels = ', '.join(
                 QUAD_ALPHA_BRANCH_LABELS[key] for key in enabled_strategies
             )

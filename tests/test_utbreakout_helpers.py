@@ -27,6 +27,46 @@ def _emas_module():
     return pytest.importorskip("emas", reason="emas runtime dependencies are optional in CI")
 
 
+def test_reset_entry_runtime_state_clears_stale_ready_and_plan_artifacts():
+    engine_cls = _signal_engine_cls()
+    engine = engine_cls.__new__(engine_cls)
+    engine.utbreakout_entry_trace = {"BTCUSDT": [{"stage": "STATUS_READY"}]}
+    engine.utbreakout_last_ready_ts = {"BTCUSDT": 123.0}
+    engine.utbreakout_last_ready_side = {"BTCUSDT": "long"}
+    engine.utbreakout_last_order_attempt_ts = {"BTCUSDT": 124.0}
+    engine.utbreakout_last_watchdog_report_ts = {"BTCUSDT": 125.0}
+    engine.utbreakout_auto_entry_bridge_last_attempt_ts = {"BTCUSDT": 126.0}
+    engine.utbreakout_last_status_symbol = "BTC/USDT:USDT"
+    engine.utbreakout_last_ready_symbol = "BTC/USDT:USDT"
+    engine.current_utbreakout_candidate_symbol = "BTC/USDT:USDT"
+    engine.utbreakout_status_symbol_source = "scanner"
+    engine.utbreakout_status_symbol_detail = {"source": "scanner"}
+    engine.utbot_filtered_breakout_entry_plans = {"BTC/USDT:USDT": {"side": "long"}}
+    engine.last_utbot_filtered_breakout_status = {"BTC/USDT:USDT": {"accepted_side": "long"}}
+    engine.last_entry_reason = {"BTC/USDT:USDT": "old M-TREND ready"}
+    engine.utbreakout_daily_sl_symbol_lockouts = {"ETH/USDT:USDT": {"reason": "safety"}}
+
+    engine.reset_entry_runtime_state()
+
+    assert engine.utbreakout_entry_trace == {}
+    assert engine.utbreakout_last_ready_ts == {}
+    assert engine.utbreakout_last_ready_side == {}
+    assert engine.utbreakout_last_order_attempt_ts == {}
+    assert engine.utbreakout_last_watchdog_report_ts == {}
+    assert engine.utbreakout_auto_entry_bridge_last_attempt_ts == {}
+    assert engine.utbreakout_last_status_symbol is None
+    assert engine.utbreakout_last_ready_symbol is None
+    assert engine.current_utbreakout_candidate_symbol is None
+    assert engine.utbreakout_status_symbol_source is None
+    assert engine.utbreakout_status_symbol_detail is None
+    assert engine.utbot_filtered_breakout_entry_plans == {}
+    assert engine.last_utbot_filtered_breakout_status == {}
+    assert engine.last_entry_reason == {}
+    assert engine.utbreakout_daily_sl_symbol_lockouts == {
+        "ETH/USDT:USDT": {"reason": "safety"}
+    }
+
+
 def test_previous_donchian_excludes_current_candle():
     highs = [10, 11, 12, 13, 14, 999]
     lows = [9, 8, 7, 6, 5, -999]
@@ -404,6 +444,42 @@ def test_trading_config_clamps_signal_futures_risk_defaults(tmp_path):
     assert legacy_cfg.config["dual_thrust_engine"]["max_risk_per_trade_pct"] == 1.0
     assert legacy_cfg.config["dual_mode_engine"]["risk_per_trade_pct"] == 1.0
     assert legacy_cfg.config["dual_mode_engine"]["max_risk_per_trade_pct"] == 1.0
+
+
+def test_trading_config_syncs_quad_live_flags_to_selected_branches(tmp_path):
+    emas = _emas_module()
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        (
+            '{"api":{"exchange_mode":"binance_mainnet"},'
+            '"signal_engine":{"strategy_params":{'
+            '"active_strategy":"quad_alpha_v1",'
+            '"UTBotFilteredBreakoutV1":{'
+            '"quad_alpha_enabled_strategies":['
+            '"ut_breakout","relative_strength_pullback_trend",'
+            '"qh_flow_v1","funding_oi_crowding_unwind_v1"],'
+            '"multi_timeframe_trend_live_enabled":true,'
+            '"multi_timeframe_trend":{"enabled":true,"live_enabled":true}'
+            '}}}}'
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = emas.TradingConfig(str(config_path))
+    ut = cfg.config["signal_engine"]["strategy_params"]["UTBotFilteredBreakoutV1"]
+
+    assert ut["quad_alpha_enabled_strategies"] == [
+        emas.ENTRY_STRATEGY_UT_BREAKOUT,
+        emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
+        emas.QH_FLOW_STRATEGY,
+        emas.CROWDING_UNWIND_STRATEGY,
+    ]
+    assert ut["relative_strength_pullback_trend_live_enabled"] is True
+    assert ut["qh_flow_live_enabled"] is True
+    assert ut["crowding_unwind_live_enabled"] is True
+    assert ut["multi_timeframe_trend_live_enabled"] is False
+    assert ut["multi_timeframe_trend"]["enabled"] is False
+    assert ut["multi_timeframe_trend"]["live_enabled"] is False
 
 
 def test_utbreakout_runtime_blocks_unsafe_live_and_emergency_sets():

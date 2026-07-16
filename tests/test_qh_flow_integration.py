@@ -279,6 +279,12 @@ def test_quad_strategy_selector_supports_multi_select_and_stable_order():
         emas.QUAD_ALPHA_BRANCH_ORDER
     )
     assert emas.normalize_quad_alpha_enabled_strategies([]) == []
+    live_flags = emas.quad_alpha_branch_live_flags(selected)
+    assert live_flags[emas.ENTRY_STRATEGY_UT_BREAKOUT] is True
+    assert live_flags[emas.M_TREND_STRATEGY] is True
+    assert live_flags[emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND] is False
+    assert live_flags[emas.QH_FLOW_STRATEGY] is False
+    assert live_flags[emas.CROWDING_UNWIND_STRATEGY] is False
 
     keyboard = emas.build_quad_alpha_selection_keyboard(selected)
     buttons = [button for row in keyboard.inline_keyboard for button in row]
