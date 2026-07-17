@@ -67,6 +67,87 @@ def test_reset_entry_runtime_state_clears_stale_ready_and_plan_artifacts():
     }
 
 
+def test_crypto_signal_timestamp_prefers_plan_decision_candle():
+    emas = _emas_module()
+    engine = _protection_engine([])
+    engine.last_processed_candle_ts = {"BTC/USDT:USDT": 111}
+
+    resolved = emas._resolve_crypto_signal_timestamp(
+        engine,
+        "BTC/USDT:USDT",
+        {
+            "decision_candle_ts": 1_784_246_400_000,
+            "signal_timestamp": 222,
+        },
+    )
+
+    assert resolved == 1_784_246_400_000
+
+
+def test_closed_entry_consumes_decision_and_clears_stale_ready_plan():
+    emas = _emas_module()
+    engine = _protection_engine([])
+    engine.trading_state_store = SQLiteTradingStateStore(":memory:")
+    decision_ts = 1_784_246_400_000
+    engine.trading_state_store.upsert(
+        OrderRecord(
+            client_order_id="utb-btc-entry",
+            exchange_order_id="123",
+            symbol="BTC/USDT:USDT",
+            side="LONG",
+            strategy="quad_alpha_v1",
+            signal_timestamp=str(decision_ts),
+            requested_qty=1.0,
+            filled_qty=1.0,
+            average_fill_price=100.0,
+            order_state=OrderState.PROTECTED.value,
+            order_intent="ENTRY",
+        )
+    )
+    engine.utbot_filtered_breakout_entry_plans = {
+        "BTC/USDT:USDT": {"side": "long", "decision_candle_ts": decision_ts}
+    }
+    engine.utbreakout_last_ready_signal = {"BTCUSDT": "long"}
+    engine.utbreakout_last_ready_reason = {"BTCUSDT": "ready"}
+    engine.utbreakout_last_ready_ts = {"BTCUSDT": decision_ts}
+
+    closed = emas._mark_crypto_symbol_closed(engine, "BTC/USDT:USDT", "test close")
+
+    assert closed == 1
+    assert engine._utbreakout_decision_already_consumed(
+        "BTC/USDT:USDT",
+        decision_ts,
+    ) is True
+    assert engine.utbot_filtered_breakout_entry_plans == {}
+    assert engine.utbreakout_last_ready_signal == {}
+    assert engine.utbreakout_last_ready_reason == {}
+    assert engine.utbreakout_last_ready_ts == {}
+
+
+def test_failed_entry_record_does_not_consume_decision():
+    engine_cls = _signal_engine_cls()
+    engine = engine_cls.__new__(engine_cls)
+    engine.trading_state_store = SQLiteTradingStateStore(":memory:")
+    decision_ts = 1_784_246_400_000
+    engine.trading_state_store.upsert(
+        OrderRecord(
+            client_order_id="utb-btc-failed",
+            symbol="BTC/USDT:USDT",
+            side="LONG",
+            strategy="quad_alpha_v1",
+            signal_timestamp=str(decision_ts),
+            requested_qty=1.0,
+            order_state=OrderState.FAILED.value,
+            order_intent="ENTRY",
+        )
+    )
+
+    assert engine._utbreakout_decision_already_consumed(
+        "BTC/USDT:USDT",
+        decision_ts,
+    ) is False
+
+
 def test_previous_donchian_excludes_current_candle():
     highs = [10, 11, 12, 13, 14, 999]
     lows = [9, 8, 7, 6, 5, -999]
@@ -3862,6 +3943,73 @@ def test_live_ladder_first_poll_only_establishes_closed_bar_baseline():
     assert state["last_bar_ts"] == 23
 
 
+def test_live_ladder_waits_for_full_post_entry_candle_before_exit_policy():
+    pos = {
+        "symbol": "HYPE/USDT:USDT",
+        "side": "short",
+        "contracts": "1",
+        "entryPrice": "60.301",
+    }
+    engine = _protection_engine([], positions=[pos])
+    start_ts = 1_784_230_200_000
+    rows = [
+        {
+            "timestamp": start_ts + idx * 900_000,
+            "open": 60.30,
+            "high": 60.45,
+            "low": 60.15,
+            "close": 60.30,
+            "volume": 1000.0,
+        }
+        for idx in range(25)
+    ]
+    rows[-2]["high"] = 61.45
+    state = {
+        "advanced_live_ladder_state": True,
+        "side": "short",
+        "entry_price": 60.301,
+        "initial_qty": 1.0,
+        "risk_distance": 1.5,
+        "last_stop_price": 61.80,
+        "planned_tp_orders": [],
+        "bars_seen": 0,
+        "last_bar_ts": None,
+        "entry_timestamp_ms": rows[-1]["timestamp"] + 60_000,
+        "entry_timeframe": "15m",
+        "tp1_filled": False,
+    }
+    engine.utbreakout_trailing_states = {"HYPE/USDT": state}
+
+    async def refresh(_symbol, _pos, current_state, _cfg):
+        return current_state
+
+    async def audit(*args, **kwargs):
+        return {"status": "OK"}
+
+    async def fallback(*args, **kwargs):
+        return {"status": "NOT_REACHED"}
+
+    engine._refresh_ladder_fill_state = refresh
+    engine._audit_and_repair_live_ladder_protection = audit
+    engine._maybe_tp2_fallback_close = fallback
+
+    result = asyncio.run(
+        engine._manage_live_ladder_exit_policy(
+            "HYPE/USDT",
+            pos,
+            pd.DataFrame(rows),
+            {"timeframe": "15m", "time_stop_enabled": True},
+        )
+    )
+
+    assert result is state
+    assert state["bars_seen"] == 0
+    assert state["last_bar_ts"] is None
+    assert state["last_exit_policy_reason"] == (
+        "waiting for first full post-entry closed bar"
+    )
+
+
 def test_advanced_live_ladder_is_not_managed_by_legacy_exit_engine():
     pos = {
         "symbol": "BTC/USDT:USDT",
@@ -5818,6 +5966,157 @@ def test_utbreakout_ev_time_stop_closes_only_after_no_follow_through():
     assert result["reason"] == "EV_TIME_STOP"
     assert len(close_calls) == 1
     assert cleared[0][0] == "BTC/USDT"
+
+
+def test_utbreakout_trailing_ignores_completed_candle_from_before_entry():
+    pos = {
+        "symbol": "HYPE/USDT:USDT",
+        "side": "short",
+        "contracts": "1",
+        "entryPrice": "60.301",
+    }
+    engine = _protection_engine([], positions=[pos])
+    start_ts = 1_784_230_200_000
+    rows = []
+    for idx in range(25):
+        rows.append({
+            "timestamp": start_ts + idx * 900_000,
+            "open": 60.30,
+            "high": 60.45,
+            "low": 60.15,
+            "close": 60.30,
+            "volume": 1000.0,
+        })
+    # The latest completed candle was entirely before the entry, but its high
+    # would look like a 0.76R adverse move if attributed to the position.
+    rows[-2]["high"] = 61.45
+    rows[-2]["low"] = 60.15
+    entry_ts = rows[-1]["timestamp"] + 60_000
+    state = {
+        "side": "short",
+        "entry_price": 60.301,
+        "initial_qty": 1.0,
+        "remaining_ratio": 1.0,
+        "risk_distance": (61.45 - 60.301) / 0.76,
+        "activation_r": 1.0,
+        "atr_trailing_enabled": True,
+        "tp1_breakeven_enabled": False,
+        "last_stop_price": 61.81,
+        "highest_price": 60.301,
+        "lowest_price": 60.301,
+        "mfe_r": 0.0,
+        "mae_r": 0.0,
+        "bars_seen": 0,
+        "entry_timestamp_ms": entry_ts,
+        "entry_timeframe": "15m",
+        "profit_alpha_enabled": True,
+        "profit_alpha_follow_through_enabled": True,
+        "profit_alpha_follow_through_bars": 3,
+        "profit_alpha_follow_through_min_mfe_r": 0.35,
+        "profit_alpha_early_exit_max_mae_r": 0.75,
+    }
+    engine.utbreakout_trailing_states = {"HYPE/USDT": state}
+    close_calls = []
+
+    async def close_position(*args, **kwargs):
+        close_calls.append((args, kwargs))
+        return {"_flat_confirmed": True, "_cleanup_confirmed": True}
+
+    engine._close_position_reduce_only_market = close_position
+    result = asyncio.run(
+        engine._manage_utbreakout_partial_trailing(
+            "HYPE/USDT",
+            pos,
+            pd.DataFrame(rows),
+            {
+                "timeframe": "15m",
+                "atr_length": 14,
+                "atr_trailing_enabled": True,
+            },
+        )
+    )
+
+    assert result is state
+    assert result["bars_seen"] == 0
+    assert result["mae_r"] == 0.0
+    assert result["mfe_r"] == 0.0
+    assert result["profit_alpha_follow_through_reason"] == (
+        "waiting for first full post-entry closed bar"
+    )
+    assert close_calls == []
+
+
+def test_utbreakout_trailing_uses_only_full_post_entry_bars_for_mae_mfe():
+    pos = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "short",
+        "contracts": "1",
+        "entryPrice": "100",
+    }
+    engine = _protection_engine([], positions=[pos])
+    start_ts = 1_784_230_200_000
+    rows = [
+        {
+            "timestamp": start_ts + idx * 900_000,
+            "open": 100.0,
+            "high": 100.5,
+            "low": 99.5,
+            "close": 100.0,
+            "volume": 1000.0,
+        }
+        for idx in range(26)
+    ]
+    rows[-3]["high"] = 120.0
+    rows[-3]["low"] = 80.0
+    state = {
+        "side": "short",
+        "entry_price": 100.0,
+        "initial_qty": 1.0,
+        "remaining_ratio": 1.0,
+        "risk_distance": 10.0,
+        "activation_r": 3.0,
+        "atr_trailing_enabled": True,
+        "last_stop_price": 110.0,
+        "highest_price": 100.0,
+        "lowest_price": 100.0,
+        "mfe_r": 0.0,
+        "mae_r": 0.0,
+        "bars_seen": 0,
+        "entry_timestamp_ms": rows[-3]["timestamp"] + 60_000,
+        "entry_timeframe": "15m",
+        "profit_alpha_enabled": True,
+        "profit_alpha_follow_through_enabled": True,
+        "profit_alpha_follow_through_bars": 3,
+        "profit_alpha_follow_through_min_mfe_r": 0.35,
+        "profit_alpha_early_exit_max_mae_r": 0.75,
+    }
+    engine.utbreakout_trailing_states = {"BTC/USDT": state}
+    close_calls = []
+
+    async def close_position(*args, **kwargs):
+        close_calls.append((args, kwargs))
+        return {"_flat_confirmed": True, "_cleanup_confirmed": True}
+
+    engine._close_position_reduce_only_market = close_position
+    result = asyncio.run(
+        engine._manage_utbreakout_partial_trailing(
+            "BTC/USDT",
+            pos,
+            pd.DataFrame(rows),
+            {
+                "timeframe": "15m",
+                "atr_length": 14,
+                "atr_trailing_enabled": True,
+            },
+        )
+    )
+
+    tracked = engine._get_utbreakout_trailing_state("BTC/USDT")
+    assert result is None
+    assert tracked["bars_seen"] == 1
+    assert tracked["mae_r"] == pytest.approx(0.05)
+    assert tracked["mfe_r"] == pytest.approx(0.05)
+    assert close_calls == []
 
 
 def test_near_miss_profit_lock_requires_close_approach_and_rejection():

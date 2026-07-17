@@ -74,6 +74,57 @@ def test_accounting_finalizer_uses_fees_and_funding(tmp_path):
     asyncio.run(scenario())
 
 
+def test_accounting_finalizer_includes_entry_fill_just_before_db_entry_time(tmp_path):
+    class DelayedEntryTimestampExchange:
+        def __init__(self):
+            self.requested_since = None
+
+        def fetch_my_trades(self, _symbol, since):
+            self.requested_since = since
+            return [
+                # A previous close inside the lookup buffer must not be charged
+                # to the new trade.
+                {
+                    "timestamp": 1_767_225_595_000,
+                    "side": "sell",
+                    "fee": {"cost": 9.0},
+                },
+                {
+                    "timestamp": 1_767_225_599_500,
+                    "side": "buy",
+                    "order": "entry-order",
+                    "fee": {"cost": 1.25},
+                },
+                {
+                    "timestamp": 1_767_229_200_000,
+                    "side": "sell",
+                    "order": "exit-order",
+                    "fee": {"cost": 2.0},
+                },
+            ]
+
+        def fapiPrivateGetIncome(self, _params):
+            return []
+
+    async def scenario():
+        store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+        store.upsert_trade_result(
+            _trade(
+                entry_order_id="entry-order",
+                exit_legs=[{"order_id": "exit-order"}],
+            )
+        )
+        exchange = DelayedEntryTimestampExchange()
+        final = await TradeAccountingFinalizer(exchange, store).finalize_trade("trade-1")
+
+        assert exchange.requested_since == 1_767_225_570_000
+        assert final["entry_fee_usdt"] == pytest.approx(1.25)
+        assert final["exit_fee_usdt"] == pytest.approx(2.0)
+        assert final["net_pnl_usdt"] == pytest.approx(6.75)
+
+    asyncio.run(scenario())
+
+
 def test_engine_stats_use_final_trades_only_and_include_cost_burdens():
     stats = rebuild_engine_performance_stats(
         [

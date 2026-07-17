@@ -461,6 +461,27 @@ def _safe_float_or_none(value):
         return None
 
 
+def _timestamp_ms_or_none(value):
+    """Normalize numeric, datetime, and ISO timestamps to Unix milliseconds."""
+    if value is None or value == '':
+        return None
+    if isinstance(value, datetime):
+        parsed_dt = value
+    else:
+        numeric = _safe_float_or_none(value)
+        if numeric is not None:
+            if numeric <= 0:
+                return None
+            return float(numeric * 1000.0 if numeric < 10_000_000_000 else numeric)
+        try:
+            parsed_dt = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if parsed_dt.tzinfo is None:
+        parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+    return float(parsed_dt.astimezone(timezone.utc).timestamp() * 1000.0)
+
+
 def get_utbreakout_diagnostic_log_paths():
     paths = []
     for idx in range(UTBREAKOUT_DIAGNOSTIC_BACKUP_COUNT, 0, -1):
@@ -5806,6 +5827,8 @@ class TemaEngine(BaseEngine):
                 live_trade = {
                     'trade_id': hashlib.sha256(trade_key.encode('utf-8')).hexdigest()[:24],
                     'client_order_id': getattr(entry_record, 'client_order_id', None),
+                    'entry_order_id': getattr(entry_record, 'exchange_order_id', None),
+                    'entry_fill_lookup_start': getattr(entry_record, 'created_at', None),
                     'strategy': primary_strategy,
                     'primary_strategy': primary_strategy,
                     'selected_strategy': primary_strategy,
@@ -10961,16 +10984,20 @@ class SignalEngine(BaseEngine):
         )
 
     def _clear_utbot_filtered_breakout_entry_plan(self, symbol):
+        plans = getattr(self, 'utbot_filtered_breakout_entry_plans', None)
+        if not isinstance(plans, dict):
+            self.utbot_filtered_breakout_entry_plans = {}
+            return
         for key in self._utbreakout_plan_symbol_keys(symbol):
-            self.utbot_filtered_breakout_entry_plans.pop(key, None)
+            plans.pop(key, None)
         target_key = self._utbreakout_trace_key(symbol)
-        for stored_key, plan in list(self.utbot_filtered_breakout_entry_plans.items()):
+        for stored_key, plan in list(plans.items()):
             if not isinstance(plan, dict):
                 continue
             plan_symbol = plan.get('plan_symbol') or plan.get('symbol') or stored_key
             plan_key = self._utbreakout_trace_key(plan_symbol)
             if plan_key == target_key:
-                self.utbot_filtered_breakout_entry_plans.pop(stored_key, None)
+                plans.pop(stored_key, None)
 
     def _get_utbot_filtered_breakout_entry_plan(self, symbol, side=None):
         for key in self._utbreakout_plan_symbol_keys(symbol):
@@ -12296,6 +12323,79 @@ class SignalEngine(BaseEngine):
             dict,
         ):
             self.utbreakout_recent_loss_symbol_cooldowns = {}
+        if not isinstance(
+            getattr(self, 'utbreakout_consumed_decision_ts', None),
+            dict,
+        ):
+            self.utbreakout_consumed_decision_ts = {}
+
+    def _utbreakout_decision_timestamp(self, *sources):
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            for key in (
+                'decision_candle_ts',
+                'signal_timestamp',
+                'signal_ts',
+                'signal_candle_ts',
+                'closed_candle_ts',
+            ):
+                parsed = _timestamp_ms_or_none(source.get(key))
+                if parsed is not None:
+                    return int(parsed)
+        return None
+
+    def _record_utbreakout_consumed_decision(self, symbol, decision_ts):
+        parsed = _timestamp_ms_or_none(decision_ts)
+        if parsed is None:
+            return None
+        self._ensure_utbreakout_auto_entry_bridge_state()
+        key = self._utbreakout_trace_key(symbol)
+        current = _timestamp_ms_or_none(
+            self.utbreakout_consumed_decision_ts.get(key)
+        ) or 0.0
+        normalized = int(max(float(parsed), float(current)))
+        self.utbreakout_consumed_decision_ts[key] = normalized
+        return normalized
+
+    def _utbreakout_decision_already_consumed(self, symbol, decision_ts):
+        parsed = _timestamp_ms_or_none(decision_ts)
+        if parsed is None:
+            return False
+        target = int(parsed)
+        self._ensure_utbreakout_auto_entry_bridge_state()
+        key = self._utbreakout_trace_key(symbol)
+        remembered = _timestamp_ms_or_none(
+            self.utbreakout_consumed_decision_ts.get(key)
+        )
+        if remembered is not None and target <= int(remembered):
+            return True
+
+        store = getattr(self, 'trading_state_store', None)
+        if store is None:
+            return False
+        try:
+            records = list(store.records_for_symbol(symbol) or [])
+        except Exception:
+            return False
+        for record in records:
+            intent = str(getattr(record, 'order_intent', 'ENTRY') or 'ENTRY').upper()
+            if intent != 'ENTRY':
+                continue
+            order_state = str(getattr(record, 'order_state', '') or '').upper()
+            if order_state in {
+                OrderState.PLANNED.value,
+                OrderState.CANCELED.value,
+                OrderState.FAILED.value,
+            }:
+                continue
+            record_ts = _timestamp_ms_or_none(
+                getattr(record, 'signal_timestamp', None)
+            )
+            if record_ts is not None and int(record_ts) == target:
+                self._record_utbreakout_consumed_decision(symbol, target)
+                return True
+        return False
 
     async def _build_utbreakout_bridge_execution_eligibility(
         self,
@@ -12577,6 +12677,26 @@ class SignalEngine(BaseEngine):
                     reason='ready entry plan is missing',
                     side=side,
                 )
+                return False
+            decision_ts = self._utbreakout_decision_timestamp(
+                plan,
+                ready_data,
+                ready_diag,
+            )
+            if self._utbreakout_decision_already_consumed(
+                symbol,
+                decision_ts,
+            ):
+                self._utbreakout_trace_event(
+                    symbol,
+                    'AUTO_ENTRY_BRIDGE_BLOCKED',
+                    'DECISION_ALREADY_CONSUMED',
+                    source=source,
+                    reason='this closed-candle decision already entered once',
+                    side=side,
+                    decision_candle_ts=decision_ts,
+                )
+                self._clear_utbot_filtered_breakout_entry_plan(symbol)
                 return False
             daily_sl_locked, daily_sl_reason = self._is_utbreakout_daily_sl_locked(symbol)
             if daily_sl_locked:
@@ -13146,6 +13266,74 @@ class SignalEngine(BaseEngine):
         front_distance = min(front_distance, max(0.0, target_distance - risk * min_rr))
         return max(risk * min_rr, target_distance - front_distance)
 
+    def _resolve_utbreakout_entry_timestamp_ms(self, symbol, plan=None, existing_state=None):
+        plan = plan if isinstance(plan, dict) else {}
+        existing_state = existing_state if isinstance(existing_state, dict) else {}
+        for source in (plan, existing_state):
+            for key in (
+                'entry_timestamp_ms',
+                'entry_time_ms',
+                'entry_timestamp',
+                'entry_time',
+                'filled_at',
+                'created_at',
+            ):
+                parsed = _timestamp_ms_or_none(source.get(key))
+                if parsed is not None:
+                    return int(parsed)
+        try:
+            record = self._utbreakout_entry_record_for_symbol(symbol)
+        except Exception:
+            record = None
+        if record is not None:
+            for value in (
+                getattr(record, 'created_at', None),
+                getattr(record, 'updated_at', None),
+            ):
+                parsed = _timestamp_ms_or_none(value)
+                if parsed is not None:
+                    return int(parsed)
+        return int(time.time() * 1000.0)
+
+    def _utbreakout_post_entry_closed_bars(self, closed, state, cfg):
+        """Return only complete bars that opened after the entry-containing bar."""
+        if closed is None or getattr(closed, 'empty', True):
+            return closed, False
+        if 'timestamp' not in closed.columns:
+            return closed, False
+        state = state if isinstance(state, dict) else {}
+        cfg = cfg if isinstance(cfg, dict) else {}
+        entry_ts = _timestamp_ms_or_none(state.get('entry_timestamp_ms'))
+        if entry_ts is None:
+            entry_ts = _timestamp_ms_or_none(state.get('created_at'))
+        if entry_ts is None:
+            return closed, False
+        timeframe = (
+            state.get('entry_timeframe')
+            or state.get('exit_timeframe')
+            or cfg.get('entry_timeframe')
+            or cfg.get('timeframe')
+            or '15m'
+        )
+        timeframe_ms = self._timeframe_to_ms(timeframe) or (15 * 60 * 1000)
+        entry_bar_open_ms = int(entry_ts // timeframe_ms) * timeframe_ms
+
+        raw_timestamps = pd.to_numeric(closed['timestamp'], errors='coerce')
+        valid = raw_timestamps.dropna()
+        if valid.empty:
+            return closed, False
+        timestamp_ms = raw_timestamps.astype(float)
+        if float(valid.abs().max()) < 10_000_000_000:
+            timestamp_ms = timestamp_ms * 1000.0
+        latest_ms = float(timestamp_ms.dropna().max())
+        # Preserve compatibility with synthetic unit-test indexes while failing
+        # closed for real exchange epoch timestamps.
+        if abs(latest_ms - float(entry_ts)) > (20 * 365 * 24 * 60 * 60 * 1000):
+            return closed, False
+        mask = timestamp_ms > float(entry_bar_open_ms)
+        filtered = closed.loc[mask].copy().reset_index(drop=True)
+        return filtered, True
+
     def _register_utbreakout_trailing_state(self, symbol, side, entry_price, qty, plan, cfg):
         cfg = apply_profit_opportunity_effective_overrides(dict(cfg or {}))
         for key in (
@@ -13311,6 +13499,12 @@ class SignalEngine(BaseEngine):
                 ) or 1.00
             )
         )
+        existing_state = self._get_utbreakout_trailing_state(symbol)
+        entry_timestamp_ms = self._resolve_utbreakout_entry_timestamp_ms(
+            symbol,
+            plan=plan,
+            existing_state=existing_state,
+        )
         state = {
             'side': str(side or '').lower(),
             'entry_price': entry,
@@ -13384,6 +13578,7 @@ class SignalEngine(BaseEngine):
                 'risk_multiplier': plan.get('strategy_quality_risk_multiplier'),
             },
             'entry_timeframe': plan.get('entry_timeframe'),
+            'entry_timestamp_ms': entry_timestamp_ms,
             'htf_timeframe': plan.get('htf_timeframe'),
             'auto_selected_set_id': plan.get('auto_selected_set_id'),
             'auto_selected_set_name': plan.get('auto_selected_set_name'),
@@ -13462,7 +13657,7 @@ class SignalEngine(BaseEngine):
                 or 0.75
             ),
             'bars_seen': 0,
-            'last_bar_ts': plan.get('decision_candle_ts'),
+            'last_bar_ts': None,
             'active': False,
             'tp1_filled': False,
             'tp2_filled': False,
@@ -13821,6 +14016,11 @@ class SignalEngine(BaseEngine):
             'risk_distance': risk_distance,
             'stop_loss': float(initial_stop),
             'recovered_from_exchange': True,
+            'entry_timestamp_ms': (
+                _timestamp_ms_or_none(getattr(entry_record, 'created_at', None))
+                or _timestamp_ms_or_none(pos.get('timestamp'))
+                or _timestamp_ms_or_none(pos.get('datetime'))
+            ),
         })
         state = self._register_utbreakout_trailing_state(
             symbol,
@@ -28891,24 +29091,35 @@ class SignalEngine(BaseEngine):
                 )
                 if now_ts - last_retry >= retry_interval:
                     self.last_utbreakout_no_position_retry_ts[retry_key] = now_ts
-                    self._utbreakout_trace_event(
-                        symbol,
-                        'NO_POSITION_RETRY',
-                        'FORCE_PROCESS_PRIMARY',
-                        primary_tf=primary_tf,
-                        candle_ts=ts_p,
-                        retry_interval=retry_interval,
-                    )
-                    logger.warning(
-                        "[UTBOT_FILTERED_BREAKOUT_V1] no-position entry retry: "
-                        "symbol=%s tf=%s candle=%s",
-                        symbol,
-                        primary_tf,
-                        ts_p,
-                    )
-                    await self.process_primary_candle(symbol, k_p, force=True)
-                    processed_primary_this_tick = True
-                    pos_side = await self.check_status(symbol, current_price)
+                    if self._utbreakout_decision_already_consumed(symbol, ts_p):
+                        self._utbreakout_trace_event(
+                            symbol,
+                            'NO_POSITION_RETRY',
+                            'DECISION_ALREADY_CONSUMED',
+                            primary_tf=primary_tf,
+                            candle_ts=ts_p,
+                            retry_interval=retry_interval,
+                        )
+                        self._clear_utbot_filtered_breakout_entry_plan(symbol)
+                    else:
+                        self._utbreakout_trace_event(
+                            symbol,
+                            'NO_POSITION_RETRY',
+                            'FORCE_PROCESS_PRIMARY',
+                            primary_tf=primary_tf,
+                            candle_ts=ts_p,
+                            retry_interval=retry_interval,
+                        )
+                        logger.warning(
+                            "[UTBOT_FILTERED_BREAKOUT_V1] no-position entry retry: "
+                            "symbol=%s tf=%s candle=%s",
+                            symbol,
+                            primary_tf,
+                            ts_p,
+                        )
+                        await self.process_primary_candle(symbol, k_p, force=True)
+                        processed_primary_this_tick = True
+                        pos_side = await self.check_status(symbol, current_price)
 
             if active_strategy in UTBREAKOUT_STRATEGIES:
                 await self._utbreakout_entry_watchdog_check(
@@ -33681,6 +33892,33 @@ class SignalEngine(BaseEngine):
                         )
                         self._clear_utbot_filtered_breakout_entry_plan(symbol)
                     elif sig:
+                        accepted_plan = (
+                            self._get_utbot_filtered_breakout_entry_plan(symbol, sig)
+                            or {}
+                        )
+                        accepted_decision_ts = self._utbreakout_decision_timestamp(
+                            accepted_plan
+                        )
+                        if self._utbreakout_decision_already_consumed(
+                            symbol,
+                            accepted_decision_ts,
+                        ):
+                            self.last_entry_reason[symbol] = (
+                                "DECISION_ALREADY_CONSUMED: this closed-candle "
+                                "decision already entered once"
+                            )
+                            self._utbreakout_trace_event(
+                                symbol,
+                                'ENTRY_BLOCKED',
+                                'DECISION_ALREADY_CONSUMED',
+                                side=sig,
+                                decision_candle_ts=accepted_decision_ts,
+                                source='process_primary_candle',
+                            )
+                            self._clear_utbot_filtered_breakout_entry_plan(symbol)
+                            self.last_candle_time[symbol] = processing_candle_time
+                            self.last_candle_success[symbol] = True
+                            return
                         self._clear_utbreakout_trailing_state(symbol, finalize=True, reason='position closed before new UTBreak signal')
                         self._clear_aggressive_growth_position(symbol)
                         self.last_entry_reason[symbol] = f"ACCEPTED_ENTRY: {sig.upper()} filtered breakout -> 진입"
@@ -34205,6 +34443,23 @@ class SignalEngine(BaseEngine):
                     closed[col] = pd.to_numeric(closed[col], errors='coerce')
                 closed = closed.dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
                 self._update_utbreakout_shadow_triple_barrier(symbol, closed, fb_cfg)
+                trailing_state = self._get_utbreakout_trailing_state(symbol) or {}
+                exit_gate_state = dict(trailing_state)
+                exit_gate_state['entry_timeframe'] = tf
+                post_entry_closed, post_entry_gate = (
+                    self._utbreakout_post_entry_closed_bars(
+                        closed,
+                        exit_gate_state,
+                        {**fb_cfg, 'timeframe': tf},
+                    )
+                )
+                if post_entry_gate and (
+                    post_entry_closed is None or post_entry_closed.empty
+                ):
+                    self.last_entry_reason[symbol] = (
+                        'EXIT_WAIT: waiting for first full post-entry closed bar'
+                    )
+                    return True
 
                 if bool(fb_cfg.get('opposite_signal_exit_enabled', False)):
                     exit_sig, ut_exit_reason, _ = self._calculate_utbot_signal(
@@ -35213,6 +35468,7 @@ class SignalEngine(BaseEngine):
             strategy_params = trace_strategy_params
             active_strategy = trace_active_strategy
             filtered_breakout_plan = None
+            filtered_breakout_decision_ts = None
             if active_strategy in UTBREAKOUT_STRATEGIES:
                 filtered_breakout_plan = (
                     self._get_utbot_filtered_breakout_entry_plan(symbol, side)
@@ -35375,6 +35631,22 @@ class SignalEngine(BaseEngine):
                         "⚠️ UTBreakout 진입 계획 누락으로 주문 중단: "
                         f"{raw_symbol}->{symbol} {side}. aliases={aliases[:4]}"
                     )
+                    return
+                filtered_breakout_decision_ts = self._utbreakout_decision_timestamp(
+                    filtered_breakout_plan
+                )
+                if self._utbreakout_decision_already_consumed(
+                    symbol,
+                    filtered_breakout_decision_ts,
+                ):
+                    _record_filtered_breakout_entry_block(
+                        'ENTRY_BLOCKED_DECISION_ALREADY_CONSUMED',
+                        'this closed-candle decision already entered once',
+                        {
+                            'decision_candle_ts': filtered_breakout_decision_ts,
+                        },
+                    )
+                    self._clear_utbot_filtered_breakout_entry_plan(symbol)
                     return
                 if filtered_breakout_plan.get('micro_auto'):
                     try:
@@ -36013,6 +36285,10 @@ class SignalEngine(BaseEngine):
                 return
 
             if active_strategy in UTBREAKOUT_STRATEGIES:
+                self._record_utbreakout_consumed_decision(
+                    symbol,
+                    filtered_breakout_decision_ts,
+                )
                 self._utbreakout_trace_event(
                     symbol,
                     'ORDER_SUCCESS',
@@ -39258,15 +39534,37 @@ class SignalEngine(BaseEngine):
         closed = closed.dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
         if closed.empty:
             return None
-        current_close = float(closed.iloc[-1]['close'])
+        metric_closed, post_entry_gate = self._utbreakout_post_entry_closed_bars(
+            closed,
+            state,
+            cfg,
+        )
+        if post_entry_gate and (
+            metric_closed is None or metric_closed.empty
+        ):
+            state['profit_alpha_follow_through_reason'] = (
+                'waiting for first full post-entry closed bar'
+            )
+            self._set_utbreakout_trailing_state(symbol, state)
+            return state
+        if metric_closed is None or metric_closed.empty:
+            metric_closed = closed
+
+        current_close = float(metric_closed.iloc[-1]['close'])
         atr_series = self._calculate_wilder_atr_series(closed, int(cfg.get('atr_length', 14) or 14))
         atr_value = float(atr_series.iloc[-1]) if self._is_valid_number(atr_series.iloc[-1]) else 0.0
         if atr_value <= 0:
             return None
-        current_high = float(closed.iloc[-1]['high'])
-        current_low = float(closed.iloc[-1]['low'])
-        highest_price = max(float(state.get('highest_price') or entry_price), current_high)
-        lowest_price = min(float(state.get('lowest_price') or entry_price), current_low)
+        current_high = float(metric_closed.iloc[-1]['high'])
+        current_low = float(metric_closed.iloc[-1]['low'])
+        highest_price = max(
+            float(state.get('highest_price') or entry_price),
+            float(metric_closed['high'].max()),
+        )
+        lowest_price = min(
+            float(state.get('lowest_price') or entry_price),
+            float(metric_closed['low'].min()),
+        )
         mfe_r = (
             max(float(state.get('mfe_r') or 0.0), (highest_price - entry_price) / risk_distance)
             if side == 'long' else
@@ -39300,15 +39598,23 @@ class SignalEngine(BaseEngine):
             )
         )
         raw_bar_ts = (
-            closed.iloc[-1].get('timestamp')
-            if 'timestamp' in closed.columns
-            else closed.index[-1]
+            metric_closed.iloc[-1].get('timestamp')
+            if 'timestamp' in metric_closed.columns
+            else metric_closed.index[-1]
         )
         try:
             current_bar_ts = int(raw_bar_ts)
         except (TypeError, ValueError, OverflowError):
             current_bar_ts = str(raw_bar_ts)
-        if current_bar_ts != state.get('last_bar_ts'):
+        if post_entry_gate:
+            state['bars_seen'] = max(
+                int(state.get('bars_seen', 0) or 0),
+                int(metric_closed['timestamp'].nunique())
+                if 'timestamp' in metric_closed.columns
+                else len(metric_closed),
+            )
+            state['last_bar_ts'] = current_bar_ts
+        elif current_bar_ts != state.get('last_bar_ts'):
             state['bars_seen'] = int(state.get('bars_seen', 0) or 0) + 1
             state['last_bar_ts'] = current_bar_ts
         state.update({
@@ -39672,8 +39978,8 @@ class SignalEngine(BaseEngine):
             recent = closed.tail(max(lookback, structure_lookback))
             recent_swing_low = float(recent.tail(structure_lookback)['low'].min())
             recent_swing_high = float(recent.tail(structure_lookback)['high'].max())
-            highest_price = max(highest_price, float(recent['high'].max()))
-            lowest_price = min(lowest_price, float(recent['low'].min()))
+            highest_price = max(highest_price, float(metric_closed['high'].max()))
+            lowest_price = min(lowest_price, float(metric_closed['low'].min()))
             mfe_r = (
                 max(float(state.get('mfe_r') or 0.0), (highest_price - entry_price) / risk_distance)
                 if side == 'long' else
@@ -56631,7 +56937,7 @@ async def _verify_actual_liquidation_safety(
 def _resolve_crypto_signal_timestamp(self, symbol, payload=None):
     payload = payload if isinstance(payload, dict) else {}
     for key in (
-        "signal_timestamp", "signal_ts", "signal_candle_ts",
+        "decision_candle_ts", "signal_timestamp", "signal_ts", "signal_candle_ts",
         "candle_timestamp", "closed_candle_ts", "last_closed_candle_ts",
     ):
         value = payload.get(key)
@@ -57009,7 +57315,8 @@ def _mark_crypto_entry_state(self, client_order_id, state, **changes):
 def _mark_crypto_symbol_closed(self, symbol, reason):
     _ensure_trading_safety_runtime(self)
     closed_count = 0
-    for record in self.trading_state_store.active_for_symbol(symbol):
+    active_records = list(self.trading_state_store.active_for_symbol(symbol))
+    for record in active_records:
         if record.order_state in {
             OrderState.PROTECTED.value,
             OrderState.FILLED_UNVERIFIED_LIQUIDATION.value,
@@ -57029,7 +57336,37 @@ def _mark_crypto_symbol_closed(self, symbol, reason):
                 record.client_order_id,
                 OrderState.CLOSED,
             )
+            if str(getattr(record, "order_intent", "ENTRY") or "ENTRY").upper() == "ENTRY":
+                remember_decision = getattr(
+                    self,
+                    "_record_utbreakout_consumed_decision",
+                    None,
+                )
+                if callable(remember_decision):
+                    remember_decision(
+                        symbol,
+                        getattr(record, "signal_timestamp", None),
+                    )
             closed_count += 1
+    if closed_count:
+        clear_plan = getattr(
+            self,
+            "_clear_utbot_filtered_breakout_entry_plan",
+            None,
+        )
+        if callable(clear_plan):
+            clear_plan(symbol)
+        trace_key_fn = getattr(self, "_utbreakout_trace_key", None)
+        trace_key = trace_key_fn(symbol) if callable(trace_key_fn) else str(symbol)
+        for mapping_name in (
+            "utbreakout_last_ready_signal",
+            "utbreakout_last_ready_reason",
+            "utbreakout_last_ready_ts",
+        ):
+            mapping = getattr(self, mapping_name, None)
+            if isinstance(mapping, dict):
+                mapping.pop(trace_key, None)
+                mapping.pop(symbol, None)
     return closed_count
 
 async def execute_live_order_plan(self, plan, cfg):
@@ -57992,7 +58329,21 @@ async def _manage_live_ladder_exit_policy(self, symbol, pos, df, cfg):
 
     try:
         closed_df = df.iloc[:-1].copy().reset_index(drop=True)
-        closed_bar = closed_df.iloc[-1]
+        metric_closed_df, post_entry_gate = self._utbreakout_post_entry_closed_bars(
+            closed_df,
+            state,
+            cfg,
+        )
+        waiting_for_post_entry_bar = bool(
+            post_entry_gate
+            and (
+                metric_closed_df is None
+                or metric_closed_df.empty
+            )
+        )
+        if metric_closed_df is None or metric_closed_df.empty:
+            metric_closed_df = closed_df
+        closed_bar = metric_closed_df.iloc[-1]
         current_bar = {
             "index": int(state.get("bars_seen", 0)),
             "open": float(closed_bar["open"]),
@@ -58001,13 +58352,28 @@ async def _manage_live_ladder_exit_policy(self, symbol, pos, df, cfg):
             "close": float(closed_bar["close"]),
             "volume": float(closed_bar.get("volume", 0.0)),
         }
-        raw_bar_ts = closed_bar.get("timestamp", len(closed_df) - 1)
+        raw_bar_ts = closed_bar.get("timestamp", len(metric_closed_df) - 1)
         try:
             closed_bar_ts = int(raw_bar_ts)
         except (TypeError, ValueError, OverflowError):
             closed_bar_ts = str(raw_bar_ts)
         previous_bar_ts = state.get("last_bar_ts")
-        if previous_bar_ts is None:
+        if post_entry_gate:
+            new_closed_bar = (
+                not waiting_for_post_entry_bar
+                and closed_bar_ts != previous_bar_ts
+            )
+            if not waiting_for_post_entry_bar:
+                state["bars_seen"] = max(
+                    int(state.get("bars_seen", 0) or 0),
+                    int(metric_closed_df["timestamp"].nunique())
+                    if "timestamp" in metric_closed_df.columns
+                    else len(metric_closed_df),
+                )
+                state["last_bar_ts"] = closed_bar_ts
+                current_bar["index"] = int(state["bars_seen"])
+                self._set_utbreakout_trailing_state(symbol, state)
+        elif previous_bar_ts is None:
             state["last_bar_ts"] = closed_bar_ts
             new_closed_bar = False
             self._set_utbreakout_trailing_state(symbol, state)
@@ -58035,6 +58401,12 @@ async def _manage_live_ladder_exit_policy(self, symbol, pos, df, cfg):
     if fallback_status.get("status") == "TP2_FALLBACK_CLOSED":
         self._clear_utbreakout_trailing_state(symbol, finalize=True, reason="TP2 fallback close")
         return {"status": "EXITED", "reason": "TP2_FALLBACK_CLOSE", "fallback": fallback_status}
+
+    if waiting_for_post_entry_bar:
+        state["last_exit_policy_reason"] = (
+            "waiting for first full post-entry closed bar"
+        )
+        return self._set_utbreakout_trailing_state(symbol, state)
 
     if not new_closed_bar:
         return state
@@ -58227,6 +58599,16 @@ def _register_live_ladder_position_state(self, plan, pos, sl_order, tp_orders, c
             "client_order_id": client_order_id,
             "filled": False,
         })
+    created_at = datetime.now(timezone.utc).isoformat()
+    entry_timestamp_ms = self._resolve_utbreakout_entry_timestamp_ms(
+        plan.symbol,
+        plan={
+            "entry_timestamp_ms": getattr(plan, "entry_timestamp_ms", None),
+            "entry_timestamp": getattr(plan, "entry_timestamp", None),
+            "entry_time": getattr(plan, "entry_time", None),
+            "created_at": created_at,
+        },
+    )
     state = {
         "advanced_live_ladder_state": True,
         "side": side,
@@ -58248,6 +58630,9 @@ def _register_live_ladder_position_state(self, plan, pos, sl_order, tp_orders, c
         "sl_moved_to_tp1_area": False,
         "entry_bar_index": 0,
         "bars_seen": 0,
+        "last_bar_ts": None,
+        "entry_timestamp_ms": entry_timestamp_ms,
+        "entry_timeframe": cfg.get("timeframe", "15m"),
         "engine": plan.engine,
         "regime": plan.regime,
         "confidence": plan.confidence,
@@ -58255,7 +58640,7 @@ def _register_live_ladder_position_state(self, plan, pos, sl_order, tp_orders, c
         "runner_exit_enabled": False,
         "runner_chandelier_enabled": False,
         "tp2_fallback_reached_loops": 0,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": created_at,
         "sl_order_id": sl_order.get("id") if isinstance(sl_order, dict) else None,
     }
     return self._set_utbreakout_trailing_state(plan.symbol, state)

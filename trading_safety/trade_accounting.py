@@ -31,7 +31,7 @@ class TradeAccountingFinalizer:
         symbol = str(trade.get("symbol") or "")
         since = None
         until = None
-        entry_time = trade.get("entry_time")
+        entry_time = trade.get("entry_fill_lookup_start") or trade.get("entry_time")
         if entry_time:
             try:
                 since = int(datetime.fromisoformat(str(entry_time).replace("Z", "+00:00")).timestamp() * 1000)
@@ -47,9 +47,14 @@ class TradeAccountingFinalizer:
         if not callable(fetch_trades):
             return self._persist_pending(trade, "fetch_my_trades unavailable")
         try:
-            fills = await asyncio.to_thread(fetch_trades, symbol, since)
+            # The DB entry timestamp is written after exchange confirmation and
+            # protection setup. Fetch slightly before it so the entry fill (and
+            # therefore its fee) is not silently omitted.
+            fetch_since = max(0, since - 30_000) if since is not None else None
+            fills = await asyncio.to_thread(fetch_trades, symbol, fetch_since)
         except Exception as exc:
             return self._persist_pending(trade, f"trade fill lookup failed: {type(exc).__name__}:{exc}")
+        entry_side = "buy" if str(trade.get("side") or "").lower() == "long" else "sell"
         related = []
         for item in fills or []:
             if not isinstance(item, dict):
@@ -57,7 +62,10 @@ class TradeAccountingFinalizer:
             raw_item_info = item.get("info")
             item_info = raw_item_info if isinstance(raw_item_info, dict) else {}
             timestamp = int(_number(item.get("timestamp") or item_info.get("time")))
-            if since is not None and timestamp and timestamp < since:
+            if fetch_since is not None and timestamp and timestamp < fetch_since:
+                continue
+            item_side = str(item.get("side") or item_info.get("side") or "").lower()
+            if since is not None and timestamp and timestamp < since and item_side != entry_side:
                 continue
             if until is not None and timestamp and timestamp > until + 60_000:
                 continue
@@ -65,16 +73,32 @@ class TradeAccountingFinalizer:
         if not related:
             return self._persist_pending(trade, "no exchange fills found")
 
-        entry_side = "buy" if str(trade.get("side") or "").lower() == "long" else "sell"
         entry_fees = 0.0
         exit_fees = 0.0
+        entry_order_id = str(trade.get("entry_order_id") or "")
+        exit_order_ids = {
+            str(item.get("order_id") or "")
+            for item in trade.get("exit_legs") or []
+            if isinstance(item, dict) and item.get("order_id") not in (None, "")
+        }
         for fill in related:
             raw_fee = fill.get("fee")
             raw_info = fill.get("info")
             fee = raw_fee if isinstance(raw_fee, dict) else {}
             info = raw_info if isinstance(raw_info, dict) else {}
             commission = abs(_number(fee.get("cost") or info.get("commission")))
-            if str(fill.get("side") or info.get("side") or "").lower() == entry_side:
+            order_id = str(
+                fill.get("order")
+                or info.get("orderId")
+                or info.get("order")
+                or ""
+            )
+            fill_side = str(fill.get("side") or info.get("side") or "").lower()
+            if entry_order_id and order_id == entry_order_id:
+                entry_fees += commission
+            elif order_id and order_id in exit_order_ids:
+                exit_fees += commission
+            elif fill_side == entry_side:
                 entry_fees += commission
             else:
                 exit_fees += commission
