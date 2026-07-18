@@ -434,6 +434,11 @@ UTBREAKOUT_CALLBACK_ACTIONS = UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS | frozenset({
     "menu",
 })
 
+# ConversationHandler state IDs were process-wide globals in the original
+# monolith.  Keep them in the composition root so every extracted Telegram
+# mixin receives the same values through runtime namespace binding.
+SELECT, INPUT, SYMBOL_INPUT, DIRECTION_SELECT, ENGINE_SELECT = range(5)
+
 # ---------------------------------------------------------
 # 0. 濡쒓퉭 諛??좏떥由ы떚
 # ---------------------------------------------------------
