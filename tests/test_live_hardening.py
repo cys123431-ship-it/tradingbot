@@ -8,6 +8,7 @@ from pathlib import Path
 
 # Module Imports
 from emas import (
+    BaseEngine,
     LiveOrderPlan,
     TakeProfitOrderPlan,
     InvalidOrderPlan,
@@ -64,6 +65,49 @@ def test_market_context_does_not_invent_htf_trend_from_side():
     )
     assert ctx.htf_trend == "FLAT"
     assert "MISSING_HTF_TREND" in ctx.quality.reasons
+
+
+def test_futures_balance_zero_retry_uses_controller_exchange_factory():
+    class ExchangeStub:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def fetch_balance(self, *_args, **_kwargs):
+            return self.payload
+
+    empty_exchange = ExchangeStub({"USDT": {"total": 0, "free": 0}})
+    replacement_exchange = ExchangeStub({"USDT": {"total": 125, "free": 100}})
+
+    class ControllerStub:
+        cfg = {}
+        db = object()
+        exchange = empty_exchange
+        market_data_exchange = empty_exchange
+
+        def is_upbit_mode(self):
+            return False
+
+        def get_exchange_mode(self):
+            return "binance_mainnet"
+
+        def _get_exchange_credentials(self, mode):
+            assert mode == "binance_mainnet"
+            return {"api_key": "key", "secret_key": "secret"}
+
+        def _build_exchange(self, creds, mode):
+            assert creds == {"api_key": "key", "secret_key": "secret"}
+            assert mode == "binance_mainnet"
+            return replacement_exchange
+
+        def _configure_exchange_network(self, exchange, mode):
+            assert exchange is replacement_exchange
+            assert mode == "binance_mainnet"
+
+    engine = BaseEngine(ControllerStub())
+    total, free, mmr = asyncio.run(engine.get_balance_info())
+
+    assert (total, free, mmr) == (125.0, 100.0, 0.0)
+    assert engine.exchange is replacement_exchange
 
 # 2. Real account equity requirements in order plans
 def test_build_order_plan_requires_real_equity():

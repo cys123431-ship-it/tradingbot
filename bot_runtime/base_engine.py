@@ -751,11 +751,12 @@ class BaseEngine:
             total, free, mmr = parse_futures_balance_payload(bal)
             if total <= 0 and free <= 0:
                 try:
-                    mode = self.get_exchange_mode()
-                    creds = self._get_exchange_credentials(mode)
+                    controller = self.ctrl
+                    mode = controller.get_exchange_mode()
+                    creds = controller._get_exchange_credentials(mode)
                     logger.warning("Futures balance parsed as zero; rebuilding exchange and retrying balance fetch")
-                    self.exchange = self._build_exchange(creds, mode)
-                    self._configure_exchange_network(self.exchange, mode)
+                    self.exchange = controller._build_exchange(creds, mode)
+                    controller._configure_exchange_network(self.exchange, mode)
                     bal = await fetch_futures_balance_payload()
                     total, free, mmr = parse_futures_balance_payload(bal)
                 except Exception as retry_e:
