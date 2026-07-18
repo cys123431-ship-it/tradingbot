@@ -2,6 +2,7 @@ import inspect
 from pathlib import Path
 
 import emas
+from bot_runtime.controller import REPOSITORY_ROOT
 
 
 def test_emas_is_a_small_composition_root():
@@ -9,6 +10,14 @@ def test_emas_is_a_small_composition_root():
     assert len(source.splitlines()) < 1_000
     assert "class SignalEngine" not in source
     assert "class MainController" not in source
+
+
+def test_controller_runtime_paths_stay_anchored_to_repository_root():
+    repository_root = Path(__file__).resolve().parent.parent
+    assert REPOSITORY_ROOT == repository_root
+    assert "self.base_dir = str(REPOSITORY_ROOT)" in inspect.getsource(
+        emas.MainController.__init__
+    )
 
 
 def test_major_runtime_responsibilities_live_in_component_modules():

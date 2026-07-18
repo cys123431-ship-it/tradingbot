@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from .controller_emergency import ControllerEmergencyMixin
 from .controller_exchange import ControllerExchangeMixin
 from .controller_reporting import ControllerReportingMixin
 from .controller_telegram import ControllerTelegramMixin
 from .controller_telegram_setup import TelegramSetupMixin
+
+REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+
 
 class MainController(
     ControllerExchangeMixin,
@@ -16,7 +21,8 @@ class MainController(
     ControllerEmergencyMixin,
 ):
     def __init__(self):
-        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        # Keep paths compatible with the original repository-root ``emas.py``.
+        self.base_dir = str(REPOSITORY_ROOT)
         self.runtime_dir = os.path.join(self.base_dir, 'runtime')
         os.makedirs(self.runtime_dir, exist_ok=True)
         config_path = os.path.join(self.base_dir, 'config.json')
