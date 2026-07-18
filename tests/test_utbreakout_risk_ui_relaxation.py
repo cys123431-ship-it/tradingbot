@@ -1,4 +1,5 @@
 from datetime import datetime
+import inspect
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -115,7 +116,7 @@ def test_button_risk_change_uses_same_limit_state_and_history_as_risk_command():
 
 
 def test_main_reply_keyboard_does_not_add_risk_button():
-    source = Path("emas.py").read_text(encoding="utf-8")
+    source = inspect.getsource(emas.MainController._build_main_keyboard)
     main_menu_start = source.index("[KeyboardButton(\"🚨 STOP\")")
     main_menu_end = source.index("return ReplyKeyboardMarkup(kb, resize_keyboard=True)", main_menu_start)
     main_menu_source = source[main_menu_start:main_menu_end]
@@ -125,7 +126,7 @@ def test_main_reply_keyboard_does_not_add_risk_button():
 
 
 def test_utbreakout_menu_uses_integrated_five_strategy_selector():
-    source = Path("emas.py").read_text(encoding="utf-8")
+    source = inspect.getsource(emas.MainController._setup_telegram)
     menu_start = source.index("def _build_utbreakout_keyboard():")
     menu_end = source.index("async def _edit_utbreakout_menu", menu_start)
     menu_source = source[menu_start:menu_end]

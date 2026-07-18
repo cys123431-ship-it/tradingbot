@@ -548,7 +548,9 @@ def test_utbreakout_margin_cap_reduces_plan_instead_of_rejecting_signal():
 
 
 def test_signal_engine_has_one_dual_alpha_status_builder():
-    source = inspect.getsource(_signal_engine_cls())
+    source = inspect.getsource(
+        _signal_engine_cls().build_dual_alpha_status_text
+    )
     assert source.count("async def build_dual_alpha_status_text") == 1
 
 

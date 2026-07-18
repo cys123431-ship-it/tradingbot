@@ -480,7 +480,13 @@ def test_prediction_research_report_includes_core_metrics():
 
 
 def test_futures_prediction_sets_are_live_selectable_with_required_filters():
-    text = Path("emas.py").read_text(encoding="utf-8")
+    text = "\n".join(
+        Path(path).read_text(encoding="utf-8")
+        for path in (
+            "bot_runtime/runtime_profile.py",
+            "bot_runtime/signal_breakout_analysis.py",
+        )
+    )
 
     assert "UTBREAKOUT_ACTIVE_SET_MAX = 64" in text
     for set_id in range(51, 61):

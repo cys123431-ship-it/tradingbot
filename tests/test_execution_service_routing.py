@@ -68,20 +68,28 @@ def test_execution_service_routes_protection_to_shared_manager():
 
 
 def _direct_exchange_order_methods(target):
-    tree = ast.parse(textwrap.dedent(inspect.getsource(target)))
     found = set()
-    for function in (node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))):
-        for node in ast.walk(function):
-            if not isinstance(node, ast.Attribute) or node.attr != "create_order":
-                continue
-            value = node.value
-            if (
-                isinstance(value, ast.Attribute)
-                and value.attr == "exchange"
-                and isinstance(value.value, ast.Name)
-                and value.value.id == "self"
-            ):
-                found.add(function.name)
+    sources = target.__mro__ if inspect.isclass(target) else (target,)
+    for source_target in sources:
+        if source_target is object:
+            continue
+        tree = ast.parse(textwrap.dedent(inspect.getsource(source_target)))
+        for function in (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ):
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Attribute) or node.attr != "create_order":
+                    continue
+                value = node.value
+                if (
+                    isinstance(value, ast.Attribute)
+                    and value.attr == "exchange"
+                    and isinstance(value.value, ast.Name)
+                    and value.value.id == "self"
+                ):
+                    found.add(function.name)
     return found
 
 

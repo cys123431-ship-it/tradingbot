@@ -1,6 +1,7 @@
 import asyncio
 import ast
-from pathlib import Path
+import inspect
+import textwrap
 
 import emas
 
@@ -53,7 +54,10 @@ def test_utbreakout_trace_report_detects_ready_without_entry():
 
 
 def test_no_duplicate_utbreakout_status_builder_definition():
-    tree = ast.parse(Path("emas.py").read_text(encoding="utf-8"))
+    source = textwrap.dedent(
+        inspect.getsource(emas.SignalEngine.build_utbreakout_condition_status_text)
+    )
+    tree = ast.parse(source)
     names = [
         node.name
         for node in ast.walk(tree)
@@ -64,7 +68,10 @@ def test_no_duplicate_utbreakout_status_builder_definition():
 
 
 def test_manual_status_uses_diagnostic_ready_not_status_ready():
-    tree = ast.parse(Path("emas.py").read_text(encoding="utf-8"))
+    source = textwrap.dedent(
+        inspect.getsource(emas.SignalEngine.build_utbreakout_condition_status_text)
+    )
+    tree = ast.parse(source)
     status_fn = next(
         node
         for node in ast.walk(tree)
@@ -88,7 +95,9 @@ def test_manual_status_uses_diagnostic_ready_not_status_ready():
 
 
 def test_utbreakout_condition_status_builder_does_not_write_missing_status_local():
-    source = Path("emas.py").read_text(encoding="utf-8")
+    source = textwrap.dedent(
+        inspect.getsource(emas.SignalEngine.build_utbreakout_condition_status_text)
+    )
     tree = ast.parse(source)
     status_fn = next(
         node
