@@ -1,0 +1,82 @@
+name: Apply TradFi 24h mainnet
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .agent/apply_tradfi_24h_mainnet.py
+      - .github/workflows/apply-tradfi-24h-mainnet.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-test-commit:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'agent/tradfi-24h-mainnet'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/tradfi-24h-mainnet
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+
+      - name: Validate and apply patch
+        run: |
+          python -m py_compile .agent/apply_tradfi_24h_mainnet.py
+          python .agent/apply_tradfi_24h_mainnet.py
+
+      - name: Compile changed files
+        run: |
+          python -m py_compile \
+            bot_runtime/signal_scanner.py \
+            tests/test_utbreakout_helpers.py
+
+      - name: Run TradFi session tests
+        run: |
+          python -m pytest -q tests/test_utbreakout_helpers.py -k 'tradifi or regular_session'
+
+      - name: Run focused scanner tests
+        run: |
+          python -m pytest -q \
+            tests/test_coinselector.py \
+            tests/test_utbreakout_helpers.py \
+            tests/test_runtime_modularization.py
+
+      - name: Run full regression suite
+        run: python -m pytest -q
+
+      - name: Normalize and validate diff
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          for name in ('bot_runtime/signal_scanner.py', 'tests/test_utbreakout_helpers.py'):
+              path = Path(name)
+              lines = path.read_text(encoding='utf-8').splitlines()
+              path.write_text('\n'.join(line.rstrip() for line in lines).rstrip() + '\n', encoding='utf-8')
+          PY
+          git diff --check
+
+      - name: Commit validated implementation
+        run: |
+          rm -f .agent/apply_tradfi_24h_mainnet.py
+          rm -f .github/workflows/apply-tradfi-24h-mainnet.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'feat: allow mainnet TradFi perpetuals 24h'
+          git push origin HEAD:agent/tradfi-24h-mainnet
