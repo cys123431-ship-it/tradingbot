@@ -1653,9 +1653,10 @@ class SignalScannerMixin:
         ctrl = getattr(self, 'ctrl', None)
         if ctrl is None or not hasattr(ctrl, 'get_exchange_mode'):
             return False
-        if ctrl.get_exchange_mode() != BINANCE_MAINNET:
-            return False
-        return bool(self._coin_selector_tradifi_regular_session_status().get('open'))
+        # Binance TradFi perpetuals are exchange-traded futures contracts. On
+        # mainnet they remain eligible whenever Binance reports the market as
+        # tradable; the underlying US cash-equity session is informational only.
+        return ctrl.get_exchange_mode() == BINANCE_MAINNET
 
     def _coin_selector_tradifi_regular_session_status(self):
         return us_equity_regular_session_status()
@@ -2083,15 +2084,8 @@ class SignalScannerMixin:
             if self._coin_selector_is_tradifi_market(symbol, market):
                 candidate['tradifi_perpetual'] = True
                 candidate['tradifi_regular_session'] = dict(tradifi_session_status)
-                if not tradifi_session_open:
-                    candidate['accepted'] = False
-                    candidate['selection_state'] = 'REJECTED'
-                    candidate.setdefault('reject_reasons', []).append(
-                        'REJECTED_TRADFI_REGULAR_SESSION_CLOSED'
-                    )
-                    candidate['analysis_error'] = self._coin_selector_tradifi_closed_reject_reason(
-                        tradifi_session_status
-                    )
+                candidate['tradifi_24h_trading_enabled'] = True
+                candidate['tradifi_session_restriction_applied'] = False
             if custom_enabled:
                 candidate['custom_universe'] = True
                 candidate['custom_discovery_relaxed'] = bool(cfg.get('custom_relax_discovery', True))
@@ -2192,6 +2186,8 @@ class SignalScannerMixin:
             'custom_universe_enabled': custom_enabled,
             'custom_symbols': custom_symbols if custom_enabled else [],
             'tradifi_universe_included': include_tradifi_universe,
+            'tradifi_24h_trading_enabled': True,
+            'tradifi_session_restriction_applied': False,
             'tradifi_regular_session_open': tradifi_session_open,
             'tradifi_regular_session': dict(tradifi_session_status),
             'tradifi_candidates_considered': tradifi_candidates_considered,
