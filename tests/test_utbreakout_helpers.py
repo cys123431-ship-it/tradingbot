@@ -1208,7 +1208,7 @@ def test_coin_selector_tradifi_universe_only_auto_on_binance_mainnet():
         "open": False,
         "reason": "outside_regular_session",
     }
-    assert engine._coin_selector_should_include_tradifi_universe(cfg, custom_enabled=False) is False
+    assert engine._coin_selector_should_include_tradifi_universe(cfg, custom_enabled=False) is True
 
     engine._coin_selector_tradifi_regular_session_status = lambda: {"open": True}
     engine.ctrl = TestnetCtrl()
@@ -1245,7 +1245,7 @@ def test_us_equity_regular_session_status_uses_core_hours_and_holidays():
     assert early_close_closed["regular_close"].endswith("13:00:00-04:00")
 
 
-def test_coin_selector_rejects_tradifi_custom_symbol_when_regular_session_closed():
+def test_coin_selector_allows_tradifi_custom_symbol_when_regular_session_closed():
     emas = _emas_module()
     signal_engine = _signal_engine_cls()
     controller = emas.MainController.__new__(emas.MainController)
@@ -1293,10 +1293,16 @@ def test_coin_selector_rejects_tradifi_custom_symbol_when_regular_session_closed
 
     report = asyncio.run(engine.evaluate_coin_selector(force=True))
 
-    selected_symbols = [item.get("normalized_symbol") for item in report["selected"]]
-    assert selected_symbols == ["BTC/USDT"]
+    selected_symbols = {item.get("normalized_symbol") for item in report["selected"]}
+    assert selected_symbols == {"BTC/USDT", "QQQ/USDT"}
+    qqq = next(item for item in report["selected"] if item.get("normalized_symbol") == "QQQ/USDT")
+    assert qqq["tradifi_perpetual"] is True
+    assert qqq["tradifi_24h_trading_enabled"] is True
+    assert qqq["tradifi_session_restriction_applied"] is False
     assert report["tradifi_regular_session_open"] is False
-    assert report["reject_counts"]["REJECTED_TRADFI_REGULAR_SESSION_CLOSED"] == 1
+    assert report["tradifi_24h_trading_enabled"] is True
+    assert report["tradifi_session_restriction_applied"] is False
+    assert report["reject_counts"].get("REJECTED_TRADFI_REGULAR_SESSION_CLOSED", 0) == 0
 
 
 def test_coin_selector_custom_universe_blocks_testnet_tradifi_symbols():
