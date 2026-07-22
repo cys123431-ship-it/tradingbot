@@ -7,6 +7,7 @@ from .signal_alpha import SignalAlphaMixin
 from .signal_breakout_analysis import SignalBreakoutAnalysisMixin
 from .signal_breakout_status import SignalBreakoutStatusMixin
 from .signal_candles import SignalCandleMixin
+from .signal_custom_entry import SignalCustomEntryMixin
 from .signal_entry import SignalEntryMixin
 from .signal_exit import SignalExitMixin
 from .signal_filters import SignalFilterMixin
@@ -30,6 +31,7 @@ class SignalEngine(
     SignalSecondaryStrategiesMixin,
     SignalScannerMixin,
     SignalCandleMixin,
+    SignalCustomEntryMixin,
     SignalEntryMixin,
     SignalProtectionMixin,
     SignalExitMixin,
@@ -81,6 +83,7 @@ class SignalEngine(
         self.consecutive_errors = 0
         self.last_activity = time.time()
         self.last_volume_scan = 0
+        self.user_custom_entry_lock = asyncio.Lock()
 
         # Scanner State
         self.scanner_active_symbol = None # ?꾩옱 ?ㅼ틦?덇? ?↔퀬 ?덈뒗 肄붿씤 (Serial Hunter Mode)

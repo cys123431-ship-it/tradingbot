@@ -81,6 +81,10 @@ def test_major_runtime_responsibilities_live_in_component_modules():
     assert emas.MainController.__module__ == "bot_runtime.controller"
     assert emas.SignalEngine.entry.__module__ == "bot_runtime.signal_entry"
     assert (
+        emas.SignalEngine.prepare_user_custom_entry.__module__
+        == "bot_runtime.signal_custom_entry"
+    )
+    assert (
         emas.SignalEngine._place_tp_sl_orders.__module__
         == "bot_runtime.signal_exit"
     )
@@ -91,6 +95,10 @@ def test_major_runtime_responsibilities_live_in_component_modules():
     assert (
         emas.MainController._setup_telegram.__module__
         == "bot_runtime.controller_telegram_setup"
+    )
+    assert (
+        emas.MainController._register_user_custom_entry_handlers.__module__
+        == "bot_runtime.controller_custom_entry"
     )
 
 

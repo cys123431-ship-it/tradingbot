@@ -41,7 +41,14 @@ async def execute_live_order_plan(self, plan, cfg):
     assert_trading_allowed(plan.symbol, cfg, include_critical_pause=False)
     plan = self._normalize_live_order_plan_for_exchange(plan, cfg)
     cfg["last_price"] = plan.entry_price or cfg.get("last_price") or 0.0
-    cfg["last_context_atr"] = abs(float(cfg["last_price"]) - plan.initial_sl_price) / 2.0
+    stop_atr_distance = max(
+        0.1,
+        float(cfg.get("initial_stop_atr_distance", 2.0) or 2.0),
+    )
+    cfg["last_context_atr"] = (
+        abs(float(cfg["last_price"]) - plan.initial_sl_price)
+        / stop_atr_distance
+    )
     self._validate_live_order_plan_for_exchange(plan, cfg)
 
     if _normalize_live_real_stage(cfg.get("live_activation_stage")) == "LIVE_REAL_SMALL_CAP":

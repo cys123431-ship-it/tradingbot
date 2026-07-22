@@ -2131,6 +2131,7 @@ class ControllerTelegramMixin:
             [KeyboardButton("🚨 STOP"), KeyboardButton("⏸ PAUSE"), KeyboardButton("▶ RESUME")],
             [KeyboardButton("/utbreak")],
             [KeyboardButton("/setup"), KeyboardButton("/prediction")],
+            [KeyboardButton("/customentry")],
             [KeyboardButton("/status"), KeyboardButton("/history"), KeyboardButton("/stats")],
             [KeyboardButton("/log"), KeyboardButton("/help")]
         ]

@@ -5534,6 +5534,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 /utbreak - UTBreak 전략 메뉴
 /utbreakout - /utbreak alias
 /setup - 거래소/네트워크 전환
+/customentry - 사용자 지정 종목·방향 진입 모드
 /prediction - Prediction Micro Auto / Binance Wallet Prediction(Predict.fun) 메뉴
 /log - 최근 로그
 /close - 긴급 청산
@@ -5568,6 +5569,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
         self.tg_app.add_handler(CommandHandler("prediction", owner_only(prediction_cmd)))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(prediction_callback), pattern=r"^pr:"))
         self.tg_app.add_handler(CommandHandler("help", owner_only(help_cmd)))
+        self._register_user_custom_entry_handlers(owner_only, text_filter)
 
         setup_command_handler = CommandHandler('setup', owner_only(self.setup_entry))
         setup_text_handler = MessageHandler(filters.Regex(setup_trigger_pattern), owner_only(self.setup_entry))

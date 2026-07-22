@@ -6,6 +6,23 @@ from __future__ import annotations
 class SignalEntryMixin:
     async def entry(self, symbol, side, price):
         try:
+            if (
+                hasattr(self, 'is_user_custom_entry_mode_enabled')
+                and self.is_user_custom_entry_mode_enabled()
+            ):
+                reason = (
+                    'USER_CUSTOM_MODE_ACTIVE: automatic strategy entry is suspended'
+                )
+                if not isinstance(getattr(self, 'last_entry_reason', None), dict):
+                    self.last_entry_reason = {}
+                self.last_entry_reason[str(symbol)] = reason
+                logger.info(
+                    'Automatic strategy entry skipped while USER_CUSTOM mode is active: '
+                    'symbol=%s side=%s',
+                    symbol,
+                    side,
+                )
+                return
             trace_strategy_params = self.get_runtime_strategy_params()
             trace_active_strategy = str(
                 trace_strategy_params.get('active_strategy', '') or ''

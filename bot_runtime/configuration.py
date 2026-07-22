@@ -98,6 +98,12 @@ class TradingConfig:
                     'cc_threshold': 0.70,
                     'cc_length': 14
                 },
+                'user_custom_entry': {
+                    'enabled': False,
+                    'max_spread_pct': 0.08,
+                    'require_quote_volume_gate': True,
+                    'require_orderbook_gate': True
+                },
                 'coin_selector': default_coin_selector_config(),
                 'micro_auto': default_micro_auto_config(),
                 'strategy_params': {
@@ -485,6 +491,44 @@ class TradingConfig:
         common_cfg = signal_cfg.setdefault('common_settings', {})
         _normalize_percent_risk_cfg(common_cfg)
 
+        custom_entry_defaults = {
+            'enabled': False,
+            'max_spread_pct': 0.08,
+            'require_quote_volume_gate': True,
+            'require_orderbook_gate': True,
+        }
+        custom_entry_cfg = signal_cfg.setdefault('user_custom_entry', {})
+        if not isinstance(custom_entry_cfg, dict):
+            custom_entry_cfg = dict(custom_entry_defaults)
+            signal_cfg['user_custom_entry'] = custom_entry_cfg
+            changed = True
+        for key, value in custom_entry_defaults.items():
+            if key not in custom_entry_cfg:
+                custom_entry_cfg[key] = value
+                changed = True
+        for key in ('enabled', 'require_quote_volume_gate', 'require_orderbook_gate'):
+            value = custom_entry_cfg.get(key, custom_entry_defaults[key])
+            if isinstance(value, bool):
+                normalized = value
+            else:
+                normalized = str(value).strip().lower() in {
+                    '1', 'true', 'yes', 'on', 'enable', 'enabled'
+                }
+            if custom_entry_cfg.get(key) != normalized:
+                custom_entry_cfg[key] = normalized
+                changed = True
+        for key, default, minimum, maximum in (
+            ('max_spread_pct', 0.08, 0.001, 2.0),
+        ):
+            try:
+                value = float(custom_entry_cfg.get(key, default))
+            except (TypeError, ValueError):
+                value = float(default)
+            value = max(float(minimum), min(float(maximum), value))
+            if custom_entry_cfg.get(key) != value:
+                custom_entry_cfg[key] = value
+                changed = True
+
         tp_sl_master = bool(common_cfg.get('tp_sl_enabled', True))
         tp_enabled = bool(common_cfg.get('take_profit_enabled', True))
         sl_enabled = bool(common_cfg.get('stop_loss_enabled', True))
@@ -840,6 +884,12 @@ class TradingConfig:
                     "r2_exit_enabled": True,
                     "chop_entry_enabled": True,
                     "chop_exit_enabled": True
+                },
+                "user_custom_entry": {
+                    "enabled": False,
+                    "max_spread_pct": 0.08,
+                    "require_quote_volume_gate": True,
+                    "require_orderbook_gate": True
                 },
                 "coin_selector": default_coin_selector_config(),
                 "strategy_params": {

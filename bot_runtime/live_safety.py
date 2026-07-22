@@ -716,6 +716,18 @@ async def _handle_noncritical_entry_block(
     logger.info("Entry blocked before exchange submission: symbol=%s reason=%s phase=%s", symbol, reason, phase)
 
 async def _submit_idempotent_crypto_entry(self, symbol, side, qty, strategy, payload=None):
+    custom_mode_enabled = False
+    custom_mode_reader = getattr(self, 'is_user_custom_entry_mode_enabled', None)
+    if callable(custom_mode_reader):
+        try:
+            custom_mode_enabled = bool(custom_mode_reader())
+        except Exception:
+            custom_mode_enabled = False
+    if custom_mode_enabled and str(strategy or '').strip().upper() != 'USER_CUSTOM':
+        return EntrySubmitOutcome.entry_block(
+            'USER_CUSTOM_MODE_ACTIVE: automatic strategy entry is suspended'
+        )
+
     pause_state = load_critical_pause_state()
     pause_decision = evaluate_critical_pause_block(state=pause_state, requested_symbol=symbol)
     if pause_decision.blocked:

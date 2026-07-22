@@ -38,6 +38,7 @@ from zoneinfo import ZoneInfo
 from bot_runtime import controller_emergency as _controller_emergency_module
 from bot_runtime.assembly import bind_runtime_methods
 from bot_runtime import controller as _controller_module
+from bot_runtime import controller_custom_entry as _controller_custom_entry_module
 from bot_runtime import controller_exchange as _controller_exchange_module
 from bot_runtime import controller_reporting as _controller_reporting_module
 from bot_runtime import controller_telegram as _controller_telegram_module
@@ -56,6 +57,7 @@ from bot_runtime import signal_engine as _signal_engine_module
 from bot_runtime import signal_breakout_analysis as _signal_breakout_analysis_module
 from bot_runtime import signal_breakout_status as _signal_breakout_status_module
 from bot_runtime import signal_candles as _signal_candles_module
+from bot_runtime import signal_custom_entry as _signal_custom_entry_module
 from bot_runtime import signal_entry as _signal_entry_module
 from bot_runtime import signal_exit as _signal_exit_module
 from bot_runtime import signal_filters as _signal_filters_module
@@ -73,6 +75,7 @@ from bot_runtime import legacy_engines as _legacy_engines_module
 from bot_runtime.base_engine import BaseEngine
 from bot_runtime.configuration import TradingConfig
 from bot_runtime.controller import MainController
+from bot_runtime.controller_custom_entry import ControllerCustomEntryMixin
 from bot_runtime.controller_emergency import ControllerEmergencyMixin
 from bot_runtime.controller_exchange import ControllerExchangeMixin
 from bot_runtime.controller_reporting import ControllerReportingMixin
@@ -98,6 +101,7 @@ from bot_runtime.signal_alpha import SignalAlphaMixin
 from bot_runtime.signal_breakout_analysis import SignalBreakoutAnalysisMixin
 from bot_runtime.signal_breakout_status import SignalBreakoutStatusMixin
 from bot_runtime.signal_candles import SignalCandleMixin
+from bot_runtime.signal_custom_entry import SignalCustomEntryMixin
 from bot_runtime.signal_entry import SignalEntryMixin
 from bot_runtime.signal_exit import SignalExitMixin
 from bot_runtime.signal_filters import SignalFilterMixin
@@ -356,7 +360,7 @@ TELEGRAM_EMERGENCY_PATTERN = (
 )
 TELEGRAM_MENU_COMMAND_PATTERN = (
     r"^/(status|history|log|help|stats|close|utbreak|utbreakout|utbot|setup|"
-    r"coinscan|customcoins|microauto|prediction)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
+    r"coinscan|customcoins|microauto|prediction|customentry|custom)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
 )
 TELEGRAM_UTBREAK_INTEGRATED_COMMANDS = frozenset({
     "/utbot",
@@ -515,11 +519,13 @@ _CLASS_RUNTIME_MODULES = (
     _signal_secondary_strategies_module,
     _signal_scanner_module,
     _signal_candles_module,
+    _signal_custom_entry_module,
     _signal_entry_module,
     _signal_protection_module,
     _signal_exit_module,
     _controller_exchange_module,
     _controller_telegram_module,
+    _controller_custom_entry_module,
     _controller_telegram_setup_module,
     _controller_reporting_module,
     _controller_emergency_module,
@@ -547,11 +553,13 @@ for _runtime_module in (
     _signal_secondary_strategies_module,
     _signal_scanner_module,
     _signal_candles_module,
+    _signal_custom_entry_module,
     _signal_entry_module,
     _signal_protection_module,
     _signal_exit_module,
     _controller_exchange_module,
     _controller_telegram_module,
+    _controller_custom_entry_module,
     _controller_telegram_setup_module,
     _controller_reporting_module,
     _controller_emergency_module,
