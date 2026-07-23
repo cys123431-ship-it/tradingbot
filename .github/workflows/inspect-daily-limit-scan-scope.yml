@@ -1,0 +1,27 @@
+name: Inspect daily limit and scan scope
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .agent/inspect_daily_limit_scan_scope.py
+      - .github/workflows/inspect-daily-limit-scan-scope.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'agent/daily-limit-scan-scope'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/daily-limit-scan-scope
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Inspect hooks
+        run: python .agent/inspect_daily_limit_scan_scope.py
