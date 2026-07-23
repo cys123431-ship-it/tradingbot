@@ -2017,13 +2017,19 @@ class SignalScannerMixin:
                 except Exception as exc:
                     normalized = normalize_coin_selector_custom_symbols([requested_symbol])
                     normalized = normalized[0] if normalized else str(requested_symbol or '').strip().upper()
+                    error_text = str(exc)
+                    reject_code = (
+                        'REJECTED_TRADIFI_COMMODITY'
+                        if error_text.startswith('REJECTED_TRADIFI_COMMODITY:')
+                        else 'REJECTED_EXCHANGE_MODE_SYMBOL'
+                    )
                     custom_resolution_rejected.append({
                         'symbol': normalized,
                         'exchange_symbol': normalized,
                         'normalized_symbol': normalized,
                         'accepted': False,
-                        'reject_reasons': ['REJECTED_EXCHANGE_MODE_SYMBOL'],
-                        'analysis_error': str(exc),
+                        'reject_reasons': [reject_code],
+                        'analysis_error': error_text,
                         'selection_state': 'REJECTED',
                         'custom_universe': True,
                     })

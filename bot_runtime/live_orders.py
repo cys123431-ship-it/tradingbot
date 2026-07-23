@@ -3,6 +3,15 @@
 from __future__ import annotations
 
 async def execute_live_order_plan(self, plan, cfg):
+    # Final new-entry gate. This protects automatic strategies and the user
+    # custom-entry path even if a stale watchlist or cached selector result
+    # somehow contains a blocked TradFi commodity. Existing-position exit and
+    # protection flows do not call this entry function and remain unaffected.
+    ctrl = getattr(self, "ctrl", None)
+    if ctrl is not None and hasattr(ctrl, "_assert_symbol_tradeable_in_current_exchange_mode"):
+        validated_symbol = await ctrl._assert_symbol_tradeable_in_current_exchange_mode(plan.symbol)
+        if validated_symbol:
+            plan.symbol = validated_symbol
     cfg = enforce_activation_stage(cfg if isinstance(cfg, dict) else {})
     if _normalize_live_real_stage(cfg.get("live_activation_stage")) == "LIVE_REAL_SMALL_CAP":
         if bool(cfg.get("testnet", False)):

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from utbreakout.coinselector import market_is_blocked_tradifi_commodity
+
 
 class ControllerExchangeMixin:
     def _telegram_reporting_cfg(self):
@@ -371,6 +373,10 @@ class ControllerExchangeMixin:
             raise ValueError(f"유효하지 않은 Binance Futures USDT perpetual 심볼입니다: {normalized}")
         market_symbol = market.get('symbol') or normalized
         is_tradifi = coin_selector_market_is_tradifi_perpetual(market_symbol, market)
+        if is_tradifi and market_is_blocked_tradifi_commodity(market_symbol, market):
+            raise ValueError(
+                f"REJECTED_TRADIFI_COMMODITY: 에너지·귀금속·광물 원자재 TradFi 신규 진입은 차단됩니다: {normalized}"
+            )
         if is_tradifi and mode != BINANCE_MAINNET:
             raise ValueError(f"TradFi perpetual은 Binance Futures 메인넷에서만 직접 감시합니다: {normalized}")
         return market_symbol if is_tradifi else normalized
@@ -385,6 +391,8 @@ class ControllerExchangeMixin:
                 continue
             symbol = market.get('symbol') or key
             if not coin_selector_market_is_tradifi_perpetual(symbol, market):
+                continue
+            if market_is_blocked_tradifi_commodity(symbol, market):
                 continue
             normalized = normalize_coin_selector_custom_symbols([symbol])
             normalized = normalized[0] if normalized else str(symbol or '').replace(':USDT', '')
@@ -634,7 +642,12 @@ class ControllerExchangeMixin:
         market = self._futures_market_for_symbol(resolved, markets)
         if not isinstance(market, dict):
             raise ValueError(f"현재 Binance Futures market에서 찾을 수 없는 심볼입니다: {symbol}")
-        is_tradifi = coin_selector_market_is_tradifi_perpetual(market.get('symbol') or resolved, market)
+        market_symbol = market.get('symbol') or resolved
+        is_tradifi = coin_selector_market_is_tradifi_perpetual(market_symbol, market)
+        if is_tradifi and market_is_blocked_tradifi_commodity(market_symbol, market):
+            raise ValueError(
+                f"REJECTED_TRADIFI_COMMODITY: 에너지·귀금속·광물 원자재 TradFi 신규 진입은 차단됩니다: {symbol}"
+            )
         if is_tradifi and mode == BINANCE_TESTNET:
             raise ValueError(f"Binance Testnet에서는 TradeFi/tokenized stock 심볼을 주문할 수 없습니다: {symbol}")
         if is_tradifi and mode != BINANCE_MAINNET:
@@ -665,7 +678,7 @@ class ControllerExchangeMixin:
         if mode == BINANCE_TESTNET:
             lines.append("TradeFi/tokenized stock 심볼은 테스트넷에서 차단됩니다.")
         elif mode == BINANCE_MAINNET:
-            lines.append("TradeFi 심볼은 메인넷에서만 허용되며 실제 TRADING market에 있을 때만 사용할 수 있습니다.")
+            lines.append("TradeFi 주식·ETF·지수 심볼은 메인넷에서 허용되며, 에너지·귀금속·광물 원자재는 신규 진입이 차단됩니다.")
         elif mode == UPBIT_MODE:
             lines.append("Upbit 모드는 KRW 현물 마켓만 감시합니다.")
         return "\n".join(lines)
