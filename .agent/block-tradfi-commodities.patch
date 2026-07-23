@@ -1,0 +1,442 @@
+diff --git a/bot_runtime/controller_exchange.py b/bot_runtime/controller_exchange.py
+index 7376d7c..7f53ddc 100644
+--- a/bot_runtime/controller_exchange.py
++++ b/bot_runtime/controller_exchange.py
+@@ -371,6 +371,10 @@ class ControllerExchangeMixin:
+             raise ValueError(f"유효하지 않은 Binance Futures USDT perpetual 심볼입니다: {normalized}")
+         market_symbol = market.get('symbol') or normalized
+         is_tradifi = coin_selector_market_is_tradifi_perpetual(market_symbol, market)
++        if is_tradifi and coin_selector_market_is_blocked_tradifi_commodity(market_symbol, market):
++            raise ValueError(
++                f"REJECTED_TRADIFI_COMMODITY: 에너지·귀금속·광물 원자재 TradFi 신규 진입은 차단됩니다: {normalized}"
++            )
+         if is_tradifi and mode != BINANCE_MAINNET:
+             raise ValueError(f"TradFi perpetual은 Binance Futures 메인넷에서만 직접 감시합니다: {normalized}")
+         return market_symbol if is_tradifi else normalized
+@@ -386,6 +390,8 @@ class ControllerExchangeMixin:
+             symbol = market.get('symbol') or key
+             if not coin_selector_market_is_tradifi_perpetual(symbol, market):
+                 continue
++            if coin_selector_market_is_blocked_tradifi_commodity(symbol, market):
++                continue
+             normalized = normalize_coin_selector_custom_symbols([symbol])
+             normalized = normalized[0] if normalized else str(symbol or '').replace(':USDT', '')
+             if normalized not in seen:
+@@ -634,7 +640,12 @@ class ControllerExchangeMixin:
+         market = self._futures_market_for_symbol(resolved, markets)
+         if not isinstance(market, dict):
+             raise ValueError(f"현재 Binance Futures market에서 찾을 수 없는 심볼입니다: {symbol}")
+-        is_tradifi = coin_selector_market_is_tradifi_perpetual(market.get('symbol') or resolved, market)
++        market_symbol = market.get('symbol') or resolved
++        is_tradifi = coin_selector_market_is_tradifi_perpetual(market_symbol, market)
++        if is_tradifi and coin_selector_market_is_blocked_tradifi_commodity(market_symbol, market):
++            raise ValueError(
++                f"REJECTED_TRADIFI_COMMODITY: 에너지·귀금속·광물 원자재 TradFi 신규 진입은 차단됩니다: {symbol}"
++            )
+         if is_tradifi and mode == BINANCE_TESTNET:
+             raise ValueError(f"Binance Testnet에서는 TradeFi/tokenized stock 심볼을 주문할 수 없습니다: {symbol}")
+         if is_tradifi and mode != BINANCE_MAINNET:
+@@ -665,7 +676,7 @@ class ControllerExchangeMixin:
+         if mode == BINANCE_TESTNET:
+             lines.append("TradeFi/tokenized stock 심볼은 테스트넷에서 차단됩니다.")
+         elif mode == BINANCE_MAINNET:
+-            lines.append("TradeFi 심볼은 메인넷에서만 허용되며 실제 TRADING market에 있을 때만 사용할 수 있습니다.")
++            lines.append("TradeFi 주식·ETF·지수 심볼은 메인넷에서 허용되며, 에너지·귀금속·광물 원자재는 신규 진입이 차단됩니다.")
+         elif mode == UPBIT_MODE:
+             lines.append("Upbit 모드는 KRW 현물 마켓만 감시합니다.")
+         return "\n".join(lines)
+diff --git a/bot_runtime/signal_scanner.py b/bot_runtime/signal_scanner.py
+index e8b92a1..33d68b8 100644
+--- a/bot_runtime/signal_scanner.py
++++ b/bot_runtime/signal_scanner.py
+@@ -2017,13 +2017,19 @@ class SignalScannerMixin:
+                 except Exception as exc:
+                     normalized = normalize_coin_selector_custom_symbols([requested_symbol])
+                     normalized = normalized[0] if normalized else str(requested_symbol or '').strip().upper()
++                    error_text = str(exc)
++                    reject_code = (
++                        'REJECTED_TRADIFI_COMMODITY'
++                        if error_text.startswith('REJECTED_TRADIFI_COMMODITY:')
++                        else 'REJECTED_EXCHANGE_MODE_SYMBOL'
++                    )
+                     custom_resolution_rejected.append({
+                         'symbol': normalized,
+                         'exchange_symbol': normalized,
+                         'normalized_symbol': normalized,
+                         'accepted': False,
+-                        'reject_reasons': ['REJECTED_EXCHANGE_MODE_SYMBOL'],
+-                        'analysis_error': str(exc),
++                        'reject_reasons': [reject_code],
++                        'analysis_error': error_text,
+                         'selection_state': 'REJECTED',
+                         'custom_universe': True,
+                     })
+diff --git a/emas.py b/emas.py
+index b21438c..6ac4de3 100644
+--- a/emas.py
++++ b/emas.py
+@@ -198,6 +198,7 @@ from utbreakout.coinselector import (
+     build_selection_report as build_coin_selector_report,
+     default_coin_selector_config,
+     finalize_candidate as finalize_coin_selector_candidate,
++    market_is_blocked_tradifi_commodity as coin_selector_market_is_blocked_tradifi_commodity,
+     market_is_tradifi_perpetual as coin_selector_market_is_tradifi_perpetual,
+     market_is_usdt_perpetual as coin_selector_market_is_usdt_perpetual,
+     normalize_custom_symbols as normalize_coin_selector_custom_symbols,
+diff --git a/tests/test_coinselector.py b/tests/test_coinselector.py
+index 78cb84e..9109496 100644
+--- a/tests/test_coinselector.py
++++ b/tests/test_coinselector.py
+@@ -3,6 +3,7 @@ from utbreakout.coinselector import (
+     build_selection_report,
+     default_coin_selector_config,
+     finalize_candidate,
++    market_is_blocked_tradifi_commodity,
+     market_is_tradifi_perpetual,
+     normalize_custom_symbols,
+     rank_candidates,
+@@ -115,6 +116,82 @@ def test_coinselector_accepts_skhy_tradifi_perpetual():
+     assert "INVALID_MARKET" not in candidate["reject_reasons"]
+ 
+ 
++def test_coinselector_blocks_tradifi_energy_and_mineral_contracts():
++    cfg = default_coin_selector_config()
++    blocked_bases = ("NATGAS", "CL", "XAU", "XAG", "XPT", "XPD", "COPPER")
++
++    for base in blocked_bases:
++        market = _market(
++            symbol=f"{base}/USDT:USDT",
++            base=base,
++            info={
++                "symbol": f"{base}USDT",
++                "contractType": "TRADIFI_PERPETUAL",
++                "status": "TRADING",
++                "underlyingType": "COMMODITY",
++            },
++        )
++        candidate = build_base_candidate(
++            f"{base}/USDT:USDT",
++            _ticker(quoteVolume=500_000_000),
++            market,
++            cfg,
++        )
++
++        assert market_is_blocked_tradifi_commodity(f"{base}/USDT:USDT", market) is True
++        assert candidate["accepted"] is False
++        assert candidate["tradifi_commodity_blocked"] is True
++        assert "REJECTED_TRADIFI_COMMODITY" in candidate["reject_reasons"]
++
++
++def test_coinselector_blocks_unknown_tradifi_market_tagged_as_metal():
++    cfg = default_coin_selector_config()
++    market = _market(
++        symbol="NEWMINERAL/USDT:USDT",
++        base="NEWMINERAL",
++        info={
++            "symbol": "NEWMINERALUSDT",
++            "contractType": "TRADIFI_PERPETUAL",
++            "status": "TRADING",
++            "underlyingSubType": ["Industrial Metals"],
++        },
++    )
++    candidate = build_base_candidate(
++        "NEWMINERAL/USDT:USDT",
++        _ticker(quoteVolume=500_000_000),
++        market,
++        cfg,
++    )
++
++    assert candidate["accepted"] is False
++    assert "REJECTED_TRADIFI_COMMODITY" in candidate["reject_reasons"]
++
++
++def test_coinselector_keeps_equity_etf_and_index_tradifi_contracts_allowed():
++    cfg = default_coin_selector_config()
++    for base, underlying_type in (("QQQ", "ETF"), ("EWY", "INDEX"), ("CL", "EQUITY")):
++        market = _market(
++            symbol=f"{base}/USDT:USDT",
++            base=base,
++            info={
++                "symbol": f"{base}USDT",
++                "contractType": "TRADIFI_PERPETUAL",
++                "status": "TRADING",
++                "underlyingType": underlying_type,
++            },
++        )
++        candidate = build_base_candidate(
++            f"{base}/USDT:USDT",
++            _ticker(quoteVolume=500_000_000),
++            market,
++            cfg,
++        )
++
++        assert market_is_blocked_tradifi_commodity(f"{base}/USDT:USDT", market) is False
++        assert candidate["accepted"] is True
++        assert candidate["tradifi_commodity_blocked"] is False
++
++
+ def test_custom_symbols_normalize_and_dedupe_to_usdt_pairs():
+     symbols = normalize_custom_symbols("BTC BTCUSDT BTC/USDT BTC/USDT:USDT eth, SOL")
+ 
+diff --git a/tests/test_utbreakout_helpers.py b/tests/test_utbreakout_helpers.py
+index 02225c8..f028f57 100644
+--- a/tests/test_utbreakout_helpers.py
++++ b/tests/test_utbreakout_helpers.py
+@@ -1147,6 +1147,40 @@ def test_order_preflight_blocks_testnet_tradifi():
+         asyncio.run(controller._assert_symbol_tradeable_in_current_exchange_mode("QQQ/USDT"))
+ 
+ 
++def test_order_preflight_blocks_mainnet_tradifi_commodity_but_allows_equity():
++    emas = _emas_module()
++    controller = emas.MainController.__new__(emas.MainController)
++    controller.cfg = {"api": {"exchange_mode": emas.BINANCE_MAINNET, "use_testnet": False}}
++    controller.exchange = _FakeMarketExchange({
++        "XAU/USDT:USDT": _market(
++            symbol="XAU/USDT:USDT",
++            base="XAU",
++            info={
++                "symbol": "XAUUSDT",
++                "contractType": "TRADIFI_PERPETUAL",
++                "status": "TRADING",
++                "underlyingType": "COMMODITY",
++            },
++        ),
++        "QQQ/USDT:USDT": _market(
++            symbol="QQQ/USDT:USDT",
++            base="QQQ",
++            info={
++                "symbol": "QQQUSDT",
++                "contractType": "TRADIFI_PERPETUAL",
++                "status": "TRADING",
++                "underlyingType": "ETF",
++            },
++        ),
++    })
++
++    with pytest.raises(ValueError, match="REJECTED_TRADIFI_COMMODITY"):
++        asyncio.run(controller._assert_symbol_tradeable_in_current_exchange_mode("XAU/USDT"))
++    assert asyncio.run(
++        controller._assert_symbol_tradeable_in_current_exchange_mode("QQQ/USDT")
++    ) == "QQQ/USDT:USDT"
++
++
+ def test_coinscan_apply_filters_symbols_by_exchange_mode():
+     emas = _emas_module()
+     controller = emas.MainController.__new__(emas.MainController)
+@@ -1245,7 +1279,7 @@ def test_us_equity_regular_session_status_uses_core_hours_and_holidays():
+     assert early_close_closed["regular_close"].endswith("13:00:00-04:00")
+ 
+ 
+-def test_coin_selector_allows_tradifi_custom_symbol_when_regular_session_closed():
++def test_coin_selector_allows_equity_tradifi_and_blocks_commodity_when_session_closed():
+     emas = _emas_module()
+     signal_engine = _signal_engine_cls()
+     controller = emas.MainController.__new__(emas.MainController)
+@@ -1254,7 +1288,23 @@ def test_coin_selector_allows_tradifi_custom_symbol_when_regular_session_closed(
+         "BTC/USDT:USDT": _market(symbol="BTC/USDT:USDT"),
+         "QQQ/USDT:USDT": _market(
+             symbol="QQQ/USDT:USDT",
+-            info={"contractType": "TRADIFI_PERPETUAL", "status": "TRADING"},
++            base="QQQ",
++            info={
++                "symbol": "QQQUSDT",
++                "contractType": "TRADIFI_PERPETUAL",
++                "status": "TRADING",
++                "underlyingType": "ETF",
++            },
++        ),
++        "XAU/USDT:USDT": _market(
++            symbol="XAU/USDT:USDT",
++            base="XAU",
++            info={
++                "symbol": "XAUUSDT",
++                "contractType": "TRADIFI_PERPETUAL",
++                "status": "TRADING",
++                "underlyingType": "COMMODITY",
++            },
+         ),
+     }
+ 
+@@ -1275,7 +1325,7 @@ def test_coin_selector_allows_tradifi_custom_symbol_when_regular_session_closed(
+         "coin_selector": {
+             "enabled": True,
+             "custom_universe_enabled": True,
+-            "custom_symbols": ["BTC/USDT", "QQQ/USDT"],
++            "custom_symbols": ["BTC/USDT", "QQQ/USDT", "XAU/USDT"],
+             "custom_relax_discovery": True,
+             "top_n": 5,
+         }
+@@ -1302,7 +1352,13 @@ def test_coin_selector_allows_tradifi_custom_symbol_when_regular_session_closed(
+     assert report["tradifi_regular_session_open"] is False
+     assert report["tradifi_24h_trading_enabled"] is True
+     assert report["tradifi_session_restriction_applied"] is False
+-    assert report["reject_counts"].get("REJECTED_TRADIFI_REGULAR_SESSION_CLOSED", 0) == 0
++    assert report["reject_counts"].get("REJECTED_TRADIFI_REGULAR_SESSION_CLOSED", 0) == 0
++    assert report["reject_counts"]["REJECTED_TRADIFI_COMMODITY"] == 1
++    assert any(
++        item.get("normalized_symbol") == "XAU/USDT"
++        and "REJECTED_TRADIFI_COMMODITY" in item.get("reject_reasons", [])
++        for item in report["reject_samples"]
++    )
+ 
+ 
+ def test_coin_selector_custom_universe_blocks_testnet_tradifi_symbols():
+diff --git a/utbreakout/coinselector.py b/utbreakout/coinselector.py
+index eb3d394..958dfbd 100644
+--- a/utbreakout/coinselector.py
++++ b/utbreakout/coinselector.py
+@@ -20,6 +20,64 @@ DEFAULT_EXCLUDED_SECTORS = {
+ 
+ HARD_MIN_QUOTE_VOLUME_USDT = 100_000_000.0
+ 
++# TradFi contracts that track physical commodities are deliberately excluded
++# from new positions. Equity, ETF and index TradFi perpetuals remain eligible.
++BLOCKED_TRADIFI_COMMODITY_BASES = {
++    "NATGAS",
++    "NGAS",
++    "NATURALGAS",
++    "CL",
++    "WTI",
++    "BRENT",
++    "USOIL",
++    "UKOIL",
++    "CRUDEOIL",
++    "XAU",
++    "GOLD",
++    "XAG",
++    "SILVER",
++    "XPT",
++    "PLATINUM",
++    "XPD",
++    "PALLADIUM",
++    "COPPER",
++    "ALUMINUM",
++    "ALUMINIUM",
++    "ZINC",
++    "NICKEL",
++    "LEAD",
++    "TIN",
++    "IRON",
++    "IRONORE",
++    "LITHIUM",
++    "COBALT",
++    "URANIUM",
++}
++
++BLOCKED_TRADIFI_COMMODITY_MARKERS = {
++    "COMMODITY",
++    "COMMODITIES",
++    "ENERGY",
++    "METAL",
++    "METALS",
++    "MINERAL",
++    "MINERALS",
++    "PRECIOUSMETAL",
++    "PRECIOUSMETALS",
++    "INDUSTRIALMETAL",
++    "INDUSTRIALMETALS",
++}
++
++TRADIFI_NON_COMMODITY_MARKERS = {
++    "EQUITY",
++    "EQUITIES",
++    "STOCK",
++    "STOCKS",
++    "ETF",
++    "INDEX",
++    "INDICES",
++}
++
+ DEFAULT_COIN_SELECTOR_CONFIG = {
+     "enabled": True,
+     "auto_apply_watchlist": False,
+@@ -228,6 +286,72 @@ def market_is_tradifi_perpetual(symbol, market):
+     return contract_type == "TRADIFI_PERPETUAL"
+ 
+ 
++def _flatten_market_metadata(value):
++    if value is None:
++        return []
++    if isinstance(value, dict):
++        items = []
++        for nested in value.values():
++            items.extend(_flatten_market_metadata(nested))
++        return items
++    if isinstance(value, (list, tuple, set)):
++        items = []
++        for nested in value:
++            items.extend(_flatten_market_metadata(nested))
++        return items
++    return [str(value)]
++
++
++def market_is_blocked_tradifi_commodity(symbol, market):
++    """Return True for TradFi energy, metal, mineral and commodity contracts."""
++    if not market_is_tradifi_perpetual(symbol, market):
++        return False
++
++    market = market if isinstance(market, dict) else {}
++    info = market.get("info") if isinstance(market.get("info"), dict) else {}
++    metadata_keys = (
++        "underlyingType",
++        "underlyingSubType",
++        "assetType",
++        "category",
++        "sector",
++        "subType",
++        "productType",
++        "name",
++        "displayName",
++        "description",
++    )
++    metadata_values = []
++    for source in (market, info):
++        for key in metadata_keys:
++            metadata_values.extend(_flatten_market_metadata(source.get(key)))
++    normalized_metadata = {
++        "".join(ch for ch in value.upper() if ch.isalnum())
++        for value in metadata_values
++        if str(value).strip()
++    }
++
++    # Explicit equity/ETF/index metadata wins for ambiguous ticker symbols such
++    # as CL, which can also be an ordinary stock ticker.
++    if normalized_metadata & TRADIFI_NON_COMMODITY_MARKERS:
++        return False
++    if normalized_metadata & BLOCKED_TRADIFI_COMMODITY_MARKERS:
++        return True
++
++    base_candidates = {
++        symbol_base(symbol),
++        str(market.get("base") or "").upper(),
++        str(info.get("baseAsset") or "").upper(),
++        str(info.get("underlying") or "").upper(),
++    }
++    normalized_bases = {
++        "".join(ch for ch in value.upper() if ch.isalnum())
++        for value in base_candidates
++        if str(value).strip()
++    }
++    return bool(normalized_bases & BLOCKED_TRADIFI_COMMODITY_BASES)
++
++
+ def extract_ticker_metrics(symbol, ticker):
+     ticker = ticker or {}
+     quote_volume = finite_float(
+@@ -267,6 +391,8 @@ def _scanner_hard_reject_reason(candidate: dict, cfg: dict) -> str | None:
+     symbol = candidate.get("symbol") or candidate.get("exchange_symbol")
+     if not market_is_usdt_perpetual(symbol, market):
+         return "INVALID_MARKET"
++    if market_is_blocked_tradifi_commodity(symbol, market):
++        return "REJECTED_TRADIFI_COMMODITY"
+     # B. Low 24h quote volume:
+     min_vol = max(
+         HARD_MIN_QUOTE_VOLUME_USDT,
+@@ -308,6 +434,7 @@ def build_base_candidate(symbol, ticker, market=None, cfg=None, sector_tags=None
+     metrics.update({
+         "exchange_symbol": symbol,
+         "tradifi_perpetual": market_is_tradifi_perpetual(symbol, market),
++        "tradifi_commodity_blocked": market_is_blocked_tradifi_commodity(symbol, market),
+         "sector_tags": sector_tags,
+         "accepted": not reject_reasons,
+         "reject_reasons": reject_reasons,
