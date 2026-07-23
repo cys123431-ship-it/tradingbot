@@ -23,6 +23,15 @@ jobs:
           ref: agent/fix-daily-limit-display
           fetch-depth: 0
 
+      - name: Capture source snapshot
+        run: tar --exclude=.git -czf /tmp/hotfix-source.tgz .
+
+      - name: Upload source snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: hotfix-source-snapshot
+          path: /tmp/hotfix-source.tgz
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -38,7 +47,15 @@ jobs:
       - name: Apply hotfix
         run: |
           python -m py_compile .agent/apply_fix_daily_limit_display.py
-          python .agent/apply_fix_daily_limit_display.py
+          python .agent/apply_fix_daily_limit_display.py 2>&1 | tee /tmp/hotfix-apply.log
+
+      - name: Upload apply log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hotfix-apply-log
+          path: /tmp/hotfix-apply.log
+          if-no-files-found: ignore
 
       - name: Compile changed runtime
         run: |
