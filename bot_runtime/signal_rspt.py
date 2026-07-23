@@ -590,7 +590,7 @@ class SignalRsptMixin:
             )
 
         daily_count, daily_pnl = self.db.get_daily_stats()
-        daily_entries = self.db.get_daily_entry_count()
+        daily_entries = self.get_automatic_daily_entry_count()
         status['daily_pnl'] = daily_pnl
         status['daily_entries'] = daily_entries
         if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):

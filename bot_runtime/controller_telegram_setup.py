@@ -1316,9 +1316,16 @@ UTBot:
             elif coin_cfg.get('custom_universe_enabled') and custom_symbols:
                 coin_mode = f"후보 `{', '.join(custom_symbols[:6])}`"
             elif coin_auto_on:
-                coin_mode = f"AUTO Binance Futures Top {int(float(coin_cfg.get('top_n', 10) or 10))}"
-                if self.get_exchange_mode() == BINANCE_MAINNET and bool(coin_cfg.get('include_tradifi_universe', True)):
-                    coin_mode += f" + TradFi {int(float(coin_cfg.get('tradifi_universe_max_candidates', 20) or 20))}"
+                scan_scope = str(coin_cfg.get('scan_scope', 'all_allowed') or 'all_allowed').lower()
+                scope_label = {
+                    'tradfi_only': 'TradFi ONLY',
+                    'crypto_only': '순수 코인 ONLY',
+                    'all_allowed': '전체 허용',
+                }.get(scan_scope, '전체 허용')
+                coin_mode = (
+                    f"AUTO {scope_label} Top "
+                    f"{int(float(coin_cfg.get('top_n', 10) or 10))}"
+                )
             else:
                 coin_mode = f"Watchlist `{', '.join(watchlist[:6]) if watchlist else '없음'}`"
             partial_enabled = bool(cfg.get('partial_take_profit_enabled', True))
@@ -1422,7 +1429,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 명령:
 `/utbreak on`, `/utbreak watch BTC ETH AAPL`, `/utbreak coin EWY`, `/utbreak autoscan on BTC ETH`
 `/utbreak auto on` / `auto off` - 코인선택 포함 AUTO 묶음 ON/OFF
-`/utbreak set 57`, `/utbreak risk 5`, `/utbreak dailytrades 3`
+`/utbreak set 57`, `/utbreak risk 5`, `/utbreak dailytrades 10`
 `/utbreak sets`, `/utbreak why`, `/utbreak status`, `/utbreak forceentry`, `/utbreak analyze [EWY]`, `/utbreak research`, `/utbreak config`, `/utbreak configdiff`, `/utbreak log`
 `/utbreak trace [SYMBOL]` - 최근 진입 경로 요약 진단 보고서
 `/utbreak tracefull [SYMBOL]` - 최근 진입 경로 전체 진단 보고서
@@ -1543,6 +1550,9 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 ],
                 [
                     InlineKeyboardButton("코인 감시 목록", callback_data="utb:watchlist")
+                ],
+                [
+                    InlineKeyboardButton("⚙️ 자동매매 설정", callback_data="atc:status")
                 ]
             ]
             return InlineKeyboardMarkup(append_live_real_risk_buttons_to_utbreakout_rows(rows))
@@ -2855,20 +2865,24 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
                 await u.message.reply_text(f"✅ 하루 최대 손실 설정: ${value:.2f}")
             elif action in {'dailytrades', 'daily_trades', 'daytrades', 'day_trades', 'maxtrades', 'max_trades'}:
-                try:
-                    raw_value = _parse_float_arg('일일 거래횟수 제한', minimum=1.0, maximum=1000.0)
-                    if raw_value != int(raw_value):
-                        raise ValueError("일일 거래횟수 제한은 정수로 입력하세요.")
-                    value = int(raw_value)
-                except ValueError as e:
-                    await u.message.reply_text(f"❌ {e}\n예: `/utbreak dailytrades 3`", parse_mode=ParseMode.MARKDOWN)
+                requested = str(args[1]).strip().lower() if len(args) > 1 else 'status'
+                if requested in {'status', 'stat', 'menu', ''}:
+                    await self._send_automatic_trading_controls(u.message)
                     return
-                await self.cfg.update_value(
-                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'max_daily_trades'],
-                    value
+                if requested != '10':
+                    await u.message.reply_text(
+                        "❌ 자동매매 기본 한도는 5회입니다. 하루 한 번만 "
+                        "`/utbreak dailytrades 10`으로 당일 한도를 확장할 수 있습니다.",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                    return
+                changed, _ = await self.extend_automatic_daily_trade_limit_for_today()
+                notice = (
+                    "✅ 오늘 자동매매 한도를 10회로 확장했습니다."
+                    if changed
+                    else "⛔ 오늘은 이미 10회 확장을 사용했습니다."
                 )
-                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
-                await u.message.reply_text(f"✅ 일일 거래횟수 제한: {value}회")
+                await self._send_automatic_trading_controls(u.message, notice)
             elif action in {'toggle_opposite_set', 'opposite_set', 'setexit', 'set_exit'}:
                 raw = _current_utbreakout_cfg()
                 current = bool(raw.get('opposite_set_exit_enabled', False))
@@ -3452,21 +3466,21 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 return
 
             if action == 'dailytrades':
-                try:
-                    numeric_value = float(str(value or '').replace(',', '').strip())
-                except (TypeError, ValueError):
-                    await _edit_utbreakout_menu(query, "❌ 버튼 값 처리 실패")
+                if str(value or '').strip() != '10':
+                    await _edit_utbreakout_menu(
+                        query,
+                        "❌ 자동매매 기본 한도는 5회이며 당일 10회 확장만 허용됩니다.",
+                    )
                     return
-                if numeric_value < 1 or numeric_value != int(numeric_value):
-                    await _edit_utbreakout_menu(query, "❌ 일일 거래횟수 제한은 1 이상의 정수여야 합니다.")
-                    return
-                trade_limit = int(numeric_value)
-                await self.cfg.update_value(
-                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'max_daily_trades'],
-                    trade_limit
+                changed, _ = await self.extend_automatic_daily_trade_limit_for_today()
+                await _edit_utbreakout_menu(
+                    query,
+                    (
+                        "✅ 오늘 자동매매 한도를 10회로 확장했습니다."
+                        if changed
+                        else "⛔ 오늘은 이미 10회 확장을 사용했습니다."
+                    ),
                 )
-                self._reset_signal_engine_runtime_state(reset_stateful_strategy=True)
-                await _edit_utbreakout_menu(query, f"✅ 일일 거래횟수 제한: {trade_limit}회")
                 return
 
             if action in {'risk', 'riskpct', 'dailyloss'}:
@@ -5535,6 +5549,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 /utbreakout - /utbreak alias
 /setup - 거래소/네트워크 전환
 /customentry - 사용자 지정 종목·방향 진입 모드
+/autotrade - 자동매매 거래횟수·스캔범위 설정
 /prediction - Prediction Micro Auto / Binance Wallet Prediction(Predict.fun) 메뉴
 /log - 최근 로그
 /close - 긴급 청산
@@ -5569,6 +5584,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
         self.tg_app.add_handler(CommandHandler("prediction", owner_only(prediction_cmd)))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(prediction_callback), pattern=r"^pr:"))
         self.tg_app.add_handler(CommandHandler("help", owner_only(help_cmd)))
+        self._register_automatic_trading_control_handlers(owner_only)
         self._register_user_custom_entry_handlers(owner_only, text_filter)
 
         setup_command_handler = CommandHandler('setup', owner_only(self.setup_entry))

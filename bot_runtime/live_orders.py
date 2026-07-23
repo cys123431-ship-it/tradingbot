@@ -12,6 +12,39 @@ async def execute_live_order_plan(self, plan, cfg):
         validated_symbol = await ctrl._assert_symbol_tradeable_in_current_exchange_mode(plan.symbol)
         if validated_symbol:
             plan.symbol = validated_symbol
+
+    plan_engine = str(getattr(plan, "engine", "") or "").strip().lower()
+    user_custom_plan = plan_engine in {"user_custom", "custom_entry"}
+    if not user_custom_plan:
+        automatic_owner = self
+        if not hasattr(automatic_owner, "_assert_automatic_entry_scan_scope"):
+            automatic_owner = (
+                (getattr(ctrl, "engines", {}) or {}).get("signal")
+                if ctrl is not None
+                else None
+            )
+        if automatic_owner is not None and hasattr(
+            automatic_owner, "_assert_automatic_entry_scan_scope"
+        ):
+            plan.symbol = await automatic_owner._assert_automatic_entry_scan_scope(
+                plan.symbol
+            )
+        if automatic_owner is not None and hasattr(
+            automatic_owner, "get_effective_automatic_daily_trade_limit"
+        ):
+            daily_limit = int(
+                automatic_owner.get_effective_automatic_daily_trade_limit()
+            )
+            daily_entries = int(
+                automatic_owner.get_automatic_daily_entry_count()
+                if hasattr(automatic_owner, "get_automatic_daily_entry_count")
+                else 0
+            )
+            if daily_limit > 0 and daily_entries >= daily_limit:
+                raise TradingSafetyError(
+                    "REJECTED_DAILY_TRADE_LIMIT: automatic daily trade count "
+                    f"{daily_entries} >= {daily_limit}"
+                )
     cfg = enforce_activation_stage(cfg if isinstance(cfg, dict) else {})
     if _normalize_live_real_stage(cfg.get("live_activation_stage")) == "LIVE_REAL_SMALL_CAP":
         if bool(cfg.get("testnet", False)):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .controller_automatic_controls import ControllerAutomaticTradingControlsMixin
 from .controller_custom_entry import ControllerCustomEntryMixin
 from .controller_emergency import ControllerEmergencyMixin
 from .controller_exchange import ControllerExchangeMixin
@@ -17,6 +18,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 class MainController(
     ControllerExchangeMixin,
     ControllerTelegramMixin,
+    ControllerAutomaticTradingControlsMixin,
     ControllerCustomEntryMixin,
     TelegramSetupMixin,
     ControllerReportingMixin,

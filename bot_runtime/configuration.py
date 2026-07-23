@@ -104,6 +104,11 @@ class TradingConfig:
                     'require_quote_volume_gate': True,
                     'require_orderbook_gate': True
                 },
+                'automatic_trading_controls': {
+                    'daily_trade_limit_base': 5,
+                    'daily_trade_limit_extended': 10,
+                    'daily_trade_limit_extension_utc_date': ''
+                },
                 'coin_selector': default_coin_selector_config(),
                 'micro_auto': default_micro_auto_config(),
                 'strategy_params': {
@@ -529,6 +534,36 @@ class TradingConfig:
                 custom_entry_cfg[key] = value
                 changed = True
 
+        automatic_controls_defaults = {
+            'daily_trade_limit_base': 5,
+            'daily_trade_limit_extended': 10,
+            'daily_trade_limit_extension_utc_date': '',
+        }
+        automatic_controls_cfg = signal_cfg.setdefault('automatic_trading_controls', {})
+        if not isinstance(automatic_controls_cfg, dict):
+            automatic_controls_cfg = dict(automatic_controls_defaults)
+            signal_cfg['automatic_trading_controls'] = automatic_controls_cfg
+            changed = True
+        for key, value in automatic_controls_defaults.items():
+            if key not in automatic_controls_cfg:
+                automatic_controls_cfg[key] = value
+                changed = True
+        # These limits are a fixed policy: five automatic entries by default,
+        # with a once-per-UTC-day extension to ten.
+        for key, value in (
+            ('daily_trade_limit_base', 5),
+            ('daily_trade_limit_extended', 10),
+        ):
+            if automatic_controls_cfg.get(key) != value:
+                automatic_controls_cfg[key] = value
+                changed = True
+        extension_date = str(
+            automatic_controls_cfg.get('daily_trade_limit_extension_utc_date', '') or ''
+        ).strip()
+        if automatic_controls_cfg.get('daily_trade_limit_extension_utc_date') != extension_date:
+            automatic_controls_cfg['daily_trade_limit_extension_utc_date'] = extension_date
+            changed = True
+
         tp_sl_master = bool(common_cfg.get('tp_sl_enabled', True))
         tp_enabled = bool(common_cfg.get('take_profit_enabled', True))
         sl_enabled = bool(common_cfg.get('stop_loss_enabled', True))
@@ -607,6 +642,14 @@ class TradingConfig:
             if coin_selector_cfg.get(bool_key) != normalized_bool:
                 coin_selector_cfg[bool_key] = normalized_bool
                 changed = True
+        scan_scope = str(
+            coin_selector_cfg.get('scan_scope', 'all_allowed') or 'all_allowed'
+        ).strip().lower()
+        if scan_scope not in {'all_allowed', 'tradfi_only', 'crypto_only'}:
+            scan_scope = 'all_allowed'
+        if coin_selector_cfg.get('scan_scope') != scan_scope:
+            coin_selector_cfg['scan_scope'] = scan_scope
+            changed = True
         if not isinstance(coin_selector_cfg.get('sector_overrides'), dict):
             coin_selector_cfg['sector_overrides'] = {}
             changed = True
@@ -890,6 +933,11 @@ class TradingConfig:
                     "max_spread_pct": 0.08,
                     "require_quote_volume_gate": True,
                     "require_orderbook_gate": True
+                },
+                "automatic_trading_controls": {
+                    "daily_trade_limit_base": 5,
+                    "daily_trade_limit_extended": 10,
+                    "daily_trade_limit_extension_utc_date": ""
                 },
                 "coin_selector": default_coin_selector_config(),
                 "strategy_params": {

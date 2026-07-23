@@ -267,6 +267,7 @@ scripts/bot_ctl.sh stop
 | `/strat` | 전략 선택 메뉴 |
 | `/utbreak` | UTBreak/Set64/RSPT/QH-Flow v2/Crowding/LXR/Dual/Triple/5-Strategy 메뉴 |
 | `/customentry` | 사용자 지정 종목·방향 시장가 진입 모드 |
+| `/autotrade` | 자동전략 일일 거래한도·CoinSelector 스캔범위 버튼 메뉴 |
 | `/prediction` | Prediction Micro Auto / Predict.fun 메뉴 |
 | `/setup` | 거래소·네트워크 전환만 지원 |
 | `/log` | 최근 로그 |
@@ -295,6 +296,8 @@ UTBreak 진단에서 자주 사용하는 하위 명령:
 ```
 
 사용자 커스텀 진입은 `/customentry on`으로 켭니다. ON 상태에서는 자동전략의 신규 진입만 일시 차단되고 기존 포지션 관리는 계속됩니다. `KORUUSDT 숏 시장가로 진입`은 현재 가격의 주문 계획을 먼저 보여주며, `KORUUSDT 숏 시장가로 바로 진입` 또는 `/customentry KORUUSDT short now`는 즉시 안전검사를 거쳐 주문합니다. 전략 신호와 일일 거래횟수 한도는 적용하지 않지만 일일손실, 전역 단일 포지션, 거래량·스프레드·호가, 실제 잔고 기반 수량, 청산가, 최소주문, 중복주문, SL·TP1·TP2 보호는 유지합니다. `/customentry off`로 자동전략 진입을 다시 허용합니다.
+
+`/autotrade`는 자동매매전략에만 적용되는 운영 메뉴입니다. 자동 진입은 UTC 하루 기준 기본 5회이며 버튼을 눌러 하루 한 번만 당일 10회로 확장할 수 있습니다. 스캔 범위는 `TradFi ONLY`, `순수 코인 ONLY`, `전체 허용` 중 선택하며, 천연가스·원유·금·은·금속·광물 원자재 TradFi는 모든 범위에서 계속 제외됩니다. 사용자 커스텀 진입의 스캔 범위 동작은 변경하지 않습니다.
 
 모든 실전 포지션의 주전략·동의전략·수수료·펀딩·R·TP1/TP2/runner/SL 체결 기여를 한 포지션당 한 번만 기록합니다. 매월 1일 오전 9시(KST)에 전월 리포트를 UTF-8 TXT 파일로 같은 텔레그램 채팅에 보내며, 거래가 0건이어도 발송하고 재시작 후 중복 발송을 막습니다.
 

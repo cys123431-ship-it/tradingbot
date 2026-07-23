@@ -559,6 +559,10 @@ class SignalBreakoutAnalysisMixin:
             cfg['exit_timeframe'] = direction_tf
             cfg['htf_timeframe'] = direction_htf
             cfg['adaptive_timeframe_enabled'] = False
+        if hasattr(self, 'get_effective_automatic_daily_trade_limit'):
+            cfg['max_daily_trades'] = int(
+                self.get_effective_automatic_daily_trade_limit()
+            )
         return cfg
 
     def _get_utbot_filtered_breakout_ut_params(self, cfg):
@@ -4185,7 +4189,7 @@ class SignalBreakoutAnalysisMixin:
         if db is not None:
             try:
                 _, daily_pnl = db.get_daily_stats()
-                daily_entries = db.get_daily_entry_count()
+                daily_entries = self.get_automatic_daily_entry_count()
                 daily_limit = float(cfg.get('daily_max_loss_usdt', 0) or 0)
                 trade_limit = int(cfg.get('max_daily_trades', 0) or 0)
                 if daily_limit > 0 and float(daily_pnl or 0) <= -daily_limit:

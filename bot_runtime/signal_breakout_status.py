@@ -216,11 +216,15 @@ class SignalBreakoutStatusMixin:
             micro_cfg = self._get_micro_auto_config()
             cfg['daily_max_loss_usdt'] = micro_cfg.get('daily_loss_limit_usdt', cfg.get('daily_max_loss_usdt'))
             cfg['max_daily_trades'] = micro_cfg.get('max_daily_trades', cfg.get('max_daily_trades'))
+            if hasattr(self, 'get_effective_automatic_daily_trade_limit'):
+                cfg['max_daily_trades'] = int(
+                    self.get_effective_automatic_daily_trade_limit()
+                )
             cfg['max_consecutive_losses'] = micro_cfg.get('max_consecutive_losses', cfg.get('max_consecutive_losses'))
             cfg['risk_per_trade_percent'] = micro_cfg.get('risk_per_trade_pct', cfg.get('risk_per_trade_percent'))
             cfg['max_risk_per_trade_usdt'] = micro_cfg.get('max_risk_usdt', cfg.get('max_risk_per_trade_usdt'))
         daily_count, daily_pnl = self.db.get_daily_stats()
-        daily_entries = self.db.get_daily_entry_count()
+        daily_entries = self.get_automatic_daily_entry_count()
         status['daily_pnl'] = daily_pnl
         status['daily_entries'] = daily_entries
         if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
@@ -3249,7 +3253,7 @@ class SignalBreakoutStatusMixin:
         db = getattr(self, 'db', None)
         if db and hasattr(db, 'get_daily_stats'):
             daily_count, daily_pnl = db.get_daily_stats()
-            daily_entries = db.get_daily_entry_count()
+            daily_entries = self.get_automatic_daily_entry_count()
             max_losses = int(cfg.get('max_consecutive_losses', 3) or 3)
             recent_pnls = self._get_recent_strategy_closed_trade_pnls(
                 {
@@ -4589,7 +4593,7 @@ class SignalBreakoutStatusMixin:
             return self._enrich_utbreakout_strategy_quality_values(values, closed, cfg)
 
         daily_count, daily_pnl = self.db.get_daily_stats()
-        daily_entries = self.db.get_daily_entry_count()
+        daily_entries = self.get_automatic_daily_entry_count()
         max_losses = int(cfg.get('max_consecutive_losses', 3) or 3)
         recent_pnls = self._get_recent_strategy_closed_trade_pnls(
             {
@@ -5911,7 +5915,7 @@ class SignalBreakoutStatusMixin:
         except Exception as exc:
             market_regime_context = {'error': str(exc)}
 
-        daily_entries = self.db.get_daily_entry_count()
+        daily_entries = self.get_automatic_daily_entry_count()
         _, daily_pnl = self.db.get_daily_stats()
         max_losses = int(cfg.get('max_consecutive_losses', 3) or 3)
         recent_pnls = self._get_recent_strategy_closed_trade_pnls(
