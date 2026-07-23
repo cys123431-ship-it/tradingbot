@@ -25,3 +25,8 @@ jobs:
           python-version: '3.12'
       - name: Inspect hooks
         run: python .agent/inspect_daily_limit_scan_scope.py
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-limit-scan-scope-inspection
+          path: .agent/inspection.txt
