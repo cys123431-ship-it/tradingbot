@@ -1295,7 +1295,14 @@ UTBot:
                 if active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY
                 else 'UTBreak 전략 메뉴'
             )
-            daily_trade_limit = int(float(cfg.get('max_daily_trades', 5) if cfg.get('max_daily_trades', 5) is not None else 5))
+            if hasattr(self, 'get_effective_automatic_daily_trade_limit'):
+                daily_trade_limit = int(self.get_effective_automatic_daily_trade_limit())
+            else:
+                daily_trade_limit = int(float(
+                    cfg.get('max_daily_trades', 5)
+                    if cfg.get('max_daily_trades', 5) is not None
+                    else 5
+                ))
             daily_trade_limit_text = "OFF" if daily_trade_limit <= 0 else f"{daily_trade_limit}회"
             adaptive_on = bool(cfg.get('adaptive_timeframe_enabled')) or active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY
             auto_set_on = bool(cfg.get('auto_select_enabled', False)) or str(cfg.get('selection_mode', '')).lower() == 'auto'

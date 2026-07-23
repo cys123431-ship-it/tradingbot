@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 class TradingConfig:
     def __init__(self, config_file='config.json'):
         self.config_file = config_file
@@ -563,6 +565,30 @@ class TradingConfig:
         if automatic_controls_cfg.get('daily_trade_limit_extension_utc_date') != extension_date:
             automatic_controls_cfg['daily_trade_limit_extension_utc_date'] = extension_date
             changed = True
+
+        # Migrate the legacy `/utbreak dailytrades 10` setting into today's
+        # one-time extension. The raw strategy-profile field is reset to the
+        # fixed base value so it cannot silently grant 10 entries every day.
+        strategy_params_cfg = signal_cfg.setdefault('strategy_params', {})
+        utbreak_cfg = (
+            strategy_params_cfg.setdefault('UTBotFilteredBreakoutV1', {})
+            if isinstance(strategy_params_cfg, dict)
+            else {}
+        )
+        if isinstance(utbreak_cfg, dict):
+            try:
+                legacy_daily_limit = int(float(utbreak_cfg.get('max_daily_trades', 5) or 5))
+            except (TypeError, ValueError):
+                legacy_daily_limit = 5
+            if legacy_daily_limit >= 10:
+                today_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+                if extension_date != today_utc:
+                    automatic_controls_cfg['daily_trade_limit_extension_utc_date'] = today_utc
+                    extension_date = today_utc
+                    changed = True
+            if utbreak_cfg.get('max_daily_trades') != 5:
+                utbreak_cfg['max_daily_trades'] = 5
+                changed = True
 
         tp_sl_master = bool(common_cfg.get('tp_sl_enabled', True))
         tp_enabled = bool(common_cfg.get('take_profit_enabled', True))
