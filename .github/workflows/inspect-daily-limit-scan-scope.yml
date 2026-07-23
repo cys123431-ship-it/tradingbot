@@ -30,3 +30,10 @@ jobs:
         with:
           name: daily-limit-scan-scope-inspection
           path: .agent/inspection.txt
+      - name: Build source snapshot
+        run: tar --exclude=.git --exclude=.agent/inspection.txt -czf /tmp/tradingbot-source.tgz .
+      - name: Upload source snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: tradingbot-source-snapshot
+          path: /tmp/tradingbot-source.tgz
