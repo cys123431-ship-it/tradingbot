@@ -130,6 +130,8 @@ class SignalEntryMixin:
 
             try:
                 symbol = await self.ctrl._assert_symbol_tradeable_in_current_exchange_mode(symbol)
+                if hasattr(self, '_assert_automatic_entry_scan_scope'):
+                    symbol = await self._assert_automatic_entry_scan_scope(symbol)
                 if trace_utbreakout:
                     symbol = self._canonicalize_utbreakout_symbol_for_use(
                         symbol,
@@ -149,6 +151,54 @@ class SignalEntryMixin:
                 await self.ctrl.notify(
                     f"⛔ 주문 차단: 현재 거래소 모드에서 사용할 수 없는 심볼입니다. "
                     f"{raw_symbol} / {symbol_err}"
+                )
+                return
+
+            automatic_daily_limit = (
+                int(self.get_effective_automatic_daily_trade_limit())
+                if hasattr(self, 'get_effective_automatic_daily_trade_limit')
+                else 5
+            )
+            try:
+                automatic_daily_entries = int(
+                    self.get_automatic_daily_entry_count()
+                    if hasattr(self, 'get_automatic_daily_entry_count')
+                    else 0
+                )
+            except Exception as daily_count_error:
+                logger.error(
+                    "Automatic daily entry count check failed: %s",
+                    daily_count_error,
+                )
+                self.last_entry_reason[symbol] = (
+                    "AUTOMATIC_DAILY_TRADE_COUNT_UNAVAILABLE: "
+                    f"{daily_count_error}"
+                )
+                return
+            if (
+                automatic_daily_limit > 0
+                and automatic_daily_entries >= automatic_daily_limit
+            ):
+                reason = (
+                    "REJECTED_DAILY_TRADE_LIMIT: automatic daily trade count "
+                    f"{automatic_daily_entries} >= {automatic_daily_limit}"
+                )
+                self.last_entry_reason[symbol] = reason
+                if raw_symbol != symbol:
+                    self.last_entry_reason[raw_symbol] = reason
+                if trace_utbreakout:
+                    self._utbreakout_trace_event(
+                        symbol,
+                        'ENTRY_BLOCKED',
+                        'REJECTED_DAILY_TRADE_LIMIT',
+                        side=side,
+                        reason=reason,
+                        daily_entries=automatic_daily_entries,
+                        daily_limit=automatic_daily_limit,
+                    )
+                await self.ctrl.notify(
+                    f"⛔ 자동매매 일일 진입 한도: "
+                    f"{automatic_daily_entries}/{automatic_daily_limit}회"
                 )
                 return
 

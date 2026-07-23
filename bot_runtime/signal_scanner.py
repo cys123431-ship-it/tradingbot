@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from .controller_automatic_controls import (
+    AUTOMATIC_SCAN_SCOPE_ALL,
+    AUTOMATIC_SCAN_SCOPE_CRYPTO,
+    AUTOMATIC_SCAN_SCOPE_TRADIFI,
+    AUTOMATIC_SCAN_SCOPES,
+)
+
 
 class SignalScannerMixin:
     def _get_primary_poll_timeframe(self, symbol=None, trade_cfg=None):
@@ -462,6 +469,15 @@ class SignalScannerMixin:
             return default
         for key in ('enabled', 'auto_apply_watchlist', 'custom_universe_enabled', 'custom_relax_discovery', 'candidate_cooldown_enabled', 'selection_quality_enabled', 'include_tradifi_universe'):
             cfg[key] = _bool_value(cfg.get(key), bool(default_coin_selector_config().get(key, False)))
+        scan_scope = str(
+            cfg.get('scan_scope', AUTOMATIC_SCAN_SCOPE_ALL)
+            or AUTOMATIC_SCAN_SCOPE_ALL
+        ).strip().lower()
+        cfg['scan_scope'] = (
+            scan_scope
+            if scan_scope in AUTOMATIC_SCAN_SCOPES
+            else AUTOMATIC_SCAN_SCOPE_ALL
+        )
         for key in ('excluded_sectors', 'blacklist'):
             value = cfg.get(key, [])
             if isinstance(value, str):
@@ -1648,7 +1664,16 @@ class SignalScannerMixin:
     def _coin_selector_should_include_tradifi_universe(self, cfg, custom_enabled):
         if custom_enabled or self.is_upbit_mode():
             return False
-        if not bool(cfg.get('include_tradifi_universe', True)):
+        scope = str(
+            (cfg or {}).get('scan_scope', AUTOMATIC_SCAN_SCOPE_ALL)
+            or AUTOMATIC_SCAN_SCOPE_ALL
+        ).strip().lower()
+        if scope == AUTOMATIC_SCAN_SCOPE_CRYPTO:
+            return False
+        if (
+            scope != AUTOMATIC_SCAN_SCOPE_TRADIFI
+            and not bool((cfg or {}).get('include_tradifi_universe', True))
+        ):
             return False
         ctrl = getattr(self, 'ctrl', None)
         if ctrl is None or not hasattr(ctrl, 'get_exchange_mode'):
@@ -1657,6 +1682,17 @@ class SignalScannerMixin:
         # mainnet they remain eligible whenever Binance reports the market as
         # tradable; the underlying US cash-equity session is informational only.
         return ctrl.get_exchange_mode() == BINANCE_MAINNET
+
+    def _coin_selector_scope_reject_code(self, cfg, is_tradifi):
+        scope = str(
+            (cfg or {}).get('scan_scope', AUTOMATIC_SCAN_SCOPE_ALL)
+            or AUTOMATIC_SCAN_SCOPE_ALL
+        ).strip().lower()
+        if scope == AUTOMATIC_SCAN_SCOPE_TRADIFI and not is_tradifi:
+            return 'REJECTED_SCAN_SCOPE_CRYPTO'
+        if scope == AUTOMATIC_SCAN_SCOPE_CRYPTO and is_tradifi:
+            return 'REJECTED_SCAN_SCOPE_TRADIFI'
+        return None
 
     def _coin_selector_tradifi_regular_session_status(self):
         return us_equity_regular_session_status()
@@ -2087,11 +2123,24 @@ class SignalScannerMixin:
                 candidate_cfg = dict(cfg)
                 candidate_cfg['min_trade_count'] = 0
             candidate = build_coin_selector_base_candidate(symbol, ticker, market, candidate_cfg, tags)
-            if self._coin_selector_is_tradifi_market(symbol, market):
+            is_tradifi = self._coin_selector_is_tradifi_market(symbol, market)
+            if is_tradifi:
                 candidate['tradifi_perpetual'] = True
                 candidate['tradifi_regular_session'] = dict(tradifi_session_status)
                 candidate['tradifi_24h_trading_enabled'] = True
                 candidate['tradifi_session_restriction_applied'] = False
+            scope_reject = self._coin_selector_scope_reject_code(
+                candidate_cfg,
+                is_tradifi,
+            )
+            if scope_reject:
+                candidate['accepted'] = False
+                candidate['selection_state'] = 'REJECTED'
+                candidate.setdefault('reject_reasons', []).append(scope_reject)
+                candidate['analysis_error'] = (
+                    f"{scope_reject}: automatic scan scope "
+                    f"{candidate_cfg.get('scan_scope')} excludes {symbol}"
+                )
             if custom_enabled:
                 candidate['custom_universe'] = True
                 candidate['custom_discovery_relaxed'] = bool(cfg.get('custom_relax_discovery', True))
@@ -2191,6 +2240,7 @@ class SignalScannerMixin:
             'rate_limited': rate_limited,
             'custom_universe_enabled': custom_enabled,
             'custom_symbols': custom_symbols if custom_enabled else [],
+            'scan_scope': cfg.get('scan_scope', AUTOMATIC_SCAN_SCOPE_ALL),
             'tradifi_universe_included': include_tradifi_universe,
             'tradifi_24h_trading_enabled': True,
             'tradifi_session_restriction_applied': False,

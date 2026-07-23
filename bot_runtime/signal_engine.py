@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .base_engine import BaseEngine
 from .signal_alpha import SignalAlphaMixin
+from .signal_automatic_controls import SignalAutomaticControlsMixin
 from .signal_breakout_analysis import SignalBreakoutAnalysisMixin
 from .signal_breakout_status import SignalBreakoutStatusMixin
 from .signal_candles import SignalCandleMixin
@@ -21,6 +22,7 @@ from .signal_ut_entry import SignalUtEntryMixin
 
 class SignalEngine(
     SignalRuntimeMixin,
+    SignalAutomaticControlsMixin,
     SignalFilterMixin,
     SignalUtEntryMixin,
     SignalBreakoutAnalysisMixin,

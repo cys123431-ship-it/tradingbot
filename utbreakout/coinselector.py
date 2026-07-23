@@ -73,6 +73,7 @@ DEFAULT_COIN_SELECTOR_CONFIG = {
     "candidate_cooldown_seconds": 1800,
     "selection_quality_enabled": True,
     "include_tradifi_universe": True,
+    "scan_scope": "all_allowed",
     "tradifi_universe_max_candidates": 20,
     "selection_return_lookback_bars": 96,
     "selection_target_realized_vol_pct": 0.65,

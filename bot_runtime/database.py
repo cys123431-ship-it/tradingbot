@@ -103,6 +103,20 @@ class DBManager:
             res = cur.fetchone()
             return res[0] if res and res[0] else 0
 
+    def get_daily_automatic_entry_count(self):
+        """Count UTC-day entries owned by automatic strategies only."""
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """SELECT COUNT(*) FROM trades
+                WHERE entry_time LIKE ?
+                  AND LOWER(COALESCE(strategy, '')) NOT IN ('user_custom', 'custom_entry')""",
+                (f"{today}%",),
+            )
+            res = cur.fetchone()
+            return res[0] if res and res[0] else 0
+
     def get_recent_closed_trade_pnls(
         self,
         limit=10,
