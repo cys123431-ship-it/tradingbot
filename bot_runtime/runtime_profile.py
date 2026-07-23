@@ -686,7 +686,14 @@ def _apply_ev_exit_profile(cfg, profile):
 
 def build_utbreakout_effective_status_contract(cfg, daily_entries=None):
     """Build the authoritative profile lines shown in every UTBreak status."""
-    effective = apply_profit_opportunity_effective_overrides(dict(cfg or {}))
+    source_cfg = dict(cfg or {})
+    try:
+        requested_daily_limit = int(float(source_cfg.get('max_daily_trades', 5) or 5))
+    except (TypeError, ValueError):
+        requested_daily_limit = 5
+    effective = apply_profit_opportunity_effective_overrides(source_cfg)
+    if requested_daily_limit in {5, 10}:
+        effective['max_daily_trades'] = requested_daily_limit
     lines = [
         f"Effective Profile: {effective.get('effective_profile_version', 'UNKNOWN')}",
         "Strategy Router: Entry Edge (UT trigger + EV/Alpha integrated)",
@@ -717,7 +724,14 @@ def build_utbreakout_effective_status_contract(cfg, daily_entries=None):
 
 def enforce_utbreakout_effective_status_contract(text, cfg, daily_entries=None):
     """Replace stale profile summary lines at the final Telegram render boundary."""
-    effective = apply_profit_opportunity_effective_overrides(dict(cfg or {}))
+    source_cfg = dict(cfg or {})
+    try:
+        requested_daily_limit = int(float(source_cfg.get('max_daily_trades', 5) or 5))
+    except (TypeError, ValueError):
+        requested_daily_limit = 5
+    effective = apply_profit_opportunity_effective_overrides(source_cfg)
+    if requested_daily_limit in {5, 10}:
+        effective['max_daily_trades'] = requested_daily_limit
     raw_lines = str(text or "").splitlines()
     stale_prefixes = (
         "Effective Profile:",
