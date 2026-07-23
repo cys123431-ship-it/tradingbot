@@ -26,6 +26,7 @@ TARGET_FILES = {
     "utbreakout/coinselector.py",
 }
 
+output = []
 for path in sorted(Path('.').rglob('*.py')):
     if any(part in {'.git', '.venv', 'venv', '__pycache__'} for part in path.parts):
         continue
@@ -41,20 +42,25 @@ for path in sorted(Path('.').rglob('*.py')):
     ]
     if not matches:
         continue
+    joined = "\n".join(lines).lower()
     if rel not in TARGET_FILES and not any(
-        term.lower() in "\n".join(lines).lower()
+        term.lower() in joined
         for term in ("get_daily_entry_count", "max_trade_count", "daily_entry_count")
     ):
         continue
-    print(f'===== {rel} =====')
-    printed = set()
+    output.append(f'===== {rel} =====')
+    ranges = []
     for index in matches:
-        start = max(1, index - 3)
-        end = min(len(lines), index + 5)
-        key = (start, end)
-        if key in printed:
-            continue
-        printed.add(key)
-        print(f'--- lines {start}-{end} ---')
+        start = max(1, index - 5)
+        end = min(len(lines), index + 8)
+        if ranges and start <= ranges[-1][1] + 1:
+            ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
+        else:
+            ranges.append((start, end))
+    for start, end in ranges:
+        output.append(f'--- lines {start}-{end} ---')
         for lineno in range(start, end + 1):
-            print(f'{lineno:05d}: {lines[lineno - 1]}')
+            output.append(f'{lineno:05d}: {lines[lineno - 1]}')
+
+Path('.agent/inspection.txt').write_text('\n'.join(output) + '\n', encoding='utf-8')
+print(f'wrote {len(output)} inspection lines')
