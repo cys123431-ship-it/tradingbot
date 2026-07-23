@@ -20,6 +20,35 @@ DEFAULT_EXCLUDED_SECTORS = {
 
 HARD_MIN_QUOTE_VOLUME_USDT = 100_000_000.0
 
+# Physical-commodity TradFi contracts are excluded from NEW positions.
+# Equity, ETF and index contracts remain eligible unless the ETF itself is a
+# known commodity tracker. Explicit market metadata is preferred over ticker
+# aliases so ordinary stocks with ambiguous tickers such as CL, NG, GC or SI
+# are not blocked when Binance identifies them as equities.
+BLOCKED_TRADIFI_COMMODITY_BASES = {
+    "NATGAS", "NGAS", "NATURALGAS", "NG", "UNG",
+    "CL", "WTI", "BRENT", "USOIL", "UKOIL", "CRUDEOIL", "USO", "BNO",
+    "XAU", "GOLD", "GC", "GLD", "IAU",
+    "XAG", "SILVER", "SI", "SLV",
+    "XPT", "PLATINUM", "PL", "PPLT",
+    "XPD", "PALLADIUM", "PA", "PALL",
+    "COPPER", "HG", "CPER",
+    "ALUMINUM", "ALUMINIUM", "ALI",
+    "ZINC", "NICKEL", "LEAD", "TIN",
+    "IRON", "IRONORE", "LITHIUM", "COBALT", "URANIUM",
+}
+
+BLOCKED_TRADIFI_COMMODITY_MARKERS = {
+    "COMMODITY", "COMMODITIES", "ENERGY",
+    "METAL", "METALS", "MINERAL", "MINERALS",
+    "PRECIOUSMETAL", "PRECIOUSMETALS",
+    "INDUSTRIALMETAL", "INDUSTRIALMETALS",
+}
+
+TRADIFI_DIRECT_NON_COMMODITY_MARKERS = {
+    "EQUITY", "EQUITIES", "STOCK", "STOCKS", "INDEX", "INDICES",
+}
+
 DEFAULT_COIN_SELECTOR_CONFIG = {
     "enabled": True,
     "auto_apply_watchlist": False,
@@ -228,6 +257,77 @@ def market_is_tradifi_perpetual(symbol, market):
     return contract_type == "TRADIFI_PERPETUAL"
 
 
+def _flatten_market_metadata(value):
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        items = []
+        for nested in value.values():
+            items.extend(_flatten_market_metadata(nested))
+        return items
+    if isinstance(value, (list, tuple, set)):
+        items = []
+        for nested in value:
+            items.extend(_flatten_market_metadata(nested))
+        return items
+    return [str(value)]
+
+
+def _normalize_market_metadata_token(value):
+    return "".join(ch for ch in str(value or "").upper() if ch.isalnum())
+
+
+def market_is_blocked_tradifi_commodity(symbol, market):
+    """Return True for TradFi energy, precious-metal and mineral contracts."""
+    if not market_is_tradifi_perpetual(symbol, market):
+        return False
+
+    market = market if isinstance(market, dict) else {}
+    info = market.get("info") if isinstance(market.get("info"), dict) else {}
+    metadata_keys = (
+        "underlyingType",
+        "underlyingSubType",
+        "assetType",
+        "category",
+        "sector",
+        "subType",
+        "productType",
+        "name",
+        "displayName",
+        "description",
+    )
+    metadata_values = []
+    for source in (market, info):
+        for key in metadata_keys:
+            metadata_values.extend(_flatten_market_metadata(source.get(key)))
+    normalized_metadata = {
+        _normalize_market_metadata_token(value)
+        for value in metadata_values
+        if str(value).strip()
+    }
+
+    # Explicit stock/equity/index classification prevents ticker-name false
+    # positives. ETF is intentionally not in this override because commodity
+    # tracker ETFs (GLD, SLV, USO, UNG, etc.) must also remain blocked.
+    if normalized_metadata & TRADIFI_DIRECT_NON_COMMODITY_MARKERS:
+        return False
+    if normalized_metadata & BLOCKED_TRADIFI_COMMODITY_MARKERS:
+        return True
+
+    base_candidates = {
+        symbol_base(symbol),
+        str(market.get("base") or "").upper(),
+        str(info.get("baseAsset") or "").upper(),
+        str(info.get("underlying") or "").upper(),
+    }
+    normalized_bases = {
+        _normalize_market_metadata_token(value)
+        for value in base_candidates
+        if str(value).strip()
+    }
+    return bool(normalized_bases & BLOCKED_TRADIFI_COMMODITY_BASES)
+
+
 def extract_ticker_metrics(symbol, ticker):
     ticker = ticker or {}
     quote_volume = finite_float(
@@ -267,6 +367,8 @@ def _scanner_hard_reject_reason(candidate: dict, cfg: dict) -> str | None:
     symbol = candidate.get("symbol") or candidate.get("exchange_symbol")
     if not market_is_usdt_perpetual(symbol, market):
         return "INVALID_MARKET"
+    if market_is_blocked_tradifi_commodity(symbol, market):
+        return "REJECTED_TRADIFI_COMMODITY"
     # B. Low 24h quote volume:
     min_vol = max(
         HARD_MIN_QUOTE_VOLUME_USDT,
@@ -308,6 +410,7 @@ def build_base_candidate(symbol, ticker, market=None, cfg=None, sector_tags=None
     metrics.update({
         "exchange_symbol": symbol,
         "tradifi_perpetual": market_is_tradifi_perpetual(symbol, market),
+        "tradifi_commodity_blocked": market_is_blocked_tradifi_commodity(symbol, market),
         "sector_tags": sector_tags,
         "accepted": not reject_reasons,
         "reject_reasons": reject_reasons,
