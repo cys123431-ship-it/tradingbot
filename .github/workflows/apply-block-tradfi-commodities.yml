@@ -1,0 +1,82 @@
+name: Apply TradFi commodity entry block
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .agent/block-tradfi-commodities.patch
+      - .github/workflows/apply-block-tradfi-commodities.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-test-commit:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'agent/block-tradfi-commodities'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/block-tradfi-commodities
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+
+      - name: Validate and apply patch
+        run: |
+          git apply --check .agent/block-tradfi-commodities.patch
+          git apply .agent/block-tradfi-commodities.patch
+
+      - name: Compile changed runtime
+        run: |
+          python -m py_compile \
+            utbreakout/coinselector.py \
+            emas.py \
+            bot_runtime/controller_exchange.py \
+            bot_runtime/signal_scanner.py \
+            tests/test_coinselector.py \
+            tests/test_utbreakout_helpers.py
+
+      - name: Run commodity focused tests
+        run: |
+          python -m pytest -q \
+            tests/test_coinselector.py \
+            tests/test_utbreakout_helpers.py \
+            -k 'tradifi or commodity or mineral or order_preflight'
+
+      - name: Run scanner and entry regression tests
+        run: |
+          python -m pytest -q \
+            tests/test_runtime_modularization.py \
+            tests/test_coinselector.py \
+            tests/test_utbreakout_helpers.py \
+            tests/test_user_custom_entry.py
+
+      - name: Run full regression suite
+        run: python -m pytest -q
+
+      - name: Validate diff
+        run: git diff --check
+
+      - name: Commit validated implementation
+        run: |
+          rm -f .agent/block-tradfi-commodities.patch
+          rm -f .github/workflows/apply-block-tradfi-commodities.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'feat: block TradFi commodity entries'
+          git push origin HEAD:agent/block-tradfi-commodities
