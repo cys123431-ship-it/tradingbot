@@ -37,8 +37,8 @@ jobs:
 
       - name: Validate and apply patch
         run: |
-          git apply --check .agent/block-tradfi-commodities.patch
-          git apply .agent/block-tradfi-commodities.patch
+          git apply --recount --check .agent/block-tradfi-commodities.patch
+          git apply --recount .agent/block-tradfi-commodities.patch
 
       - name: Compile changed runtime
         run: |
