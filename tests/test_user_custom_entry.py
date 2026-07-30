@@ -144,6 +144,36 @@ class _CustomEngineStub(SignalCustomEntryMixin):
         return -abs(amount) if str((position or {}).get("side")).lower() == "short" else abs(amount)
 
 
+class _CustomConfigBuildStub(SignalCustomEntryMixin):
+    def __init__(self):
+        self.ctrl = SimpleNamespace(
+            cfg=SimpleNamespace(
+                get=lambda key, default=None: (
+                    {"user_custom_entry": {"enabled": True}}
+                    if key == "signal_engine"
+                    else default
+                )
+            )
+        )
+
+    @staticmethod
+    def get_runtime_common_settings():
+        return {
+            "timeframe": "4h",
+            "entry_timeframe": "4h",
+            "exit_timeframe": "4h",
+            "live_activation_stage": "PAPER_ONLY",
+        }
+
+    @staticmethod
+    def get_runtime_strategy_params():
+        return {}
+
+    @staticmethod
+    def _get_utbot_filtered_breakout_config(_strategy_params):
+        return {"timeframe": "4h", "entry_timeframe": "4h"}
+
+
 def test_user_custom_parser_requires_an_explicit_entry_phrase():
     parsed = parse_user_custom_entry_text("KORUUSDT 숏 시장가로 바로 진입")
     assert parsed == {
@@ -171,6 +201,8 @@ def test_custom_plan_uses_risk_sizing_sl_tp_and_ignores_trade_count_cap():
     assert len(plan.tp_orders) == 2
     assert plan.tp_orders[0].price == pytest.approx(97.0)
     assert plan.tp_orders[1].price == pytest.approx(89.5)
+    assert plan.entry_timeframe == "15m"
+    assert plan.strategy_exit_policy_enabled is False
     assert plan.max_trade_count_bypassed is True
     assert plan.signal_timestamp.startswith("user:")
     engine.db.get_daily_entry_count.assert_not_called()
@@ -312,5 +344,14 @@ def test_custom_mode_default_is_persisted_off(tmp_path):
     cfg = emas.TradingConfig(str(tmp_path / "config.json"))
     custom = cfg.get("signal_engine", {})["user_custom_entry"]
     assert custom["enabled"] is False
+    assert custom["timeframe"] == "15m"
     assert custom["require_quote_volume_gate"] is True
     assert custom["require_orderbook_gate"] is True
+
+
+def test_custom_config_does_not_inherit_automatic_strategy_timeframe():
+    cfg = _CustomConfigBuildStub()._build_user_custom_live_config()
+
+    assert cfg["timeframe"] == "15m"
+    assert cfg["entry_timeframe"] == "15m"
+    assert cfg["exit_timeframe"] == "15m"

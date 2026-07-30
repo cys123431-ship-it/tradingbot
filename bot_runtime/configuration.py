@@ -102,6 +102,7 @@ class TradingConfig:
                 },
                 'user_custom_entry': {
                     'enabled': False,
+                    'timeframe': '15m',
                     'max_spread_pct': 0.08,
                     'require_quote_volume_gate': True,
                     'require_orderbook_gate': True
@@ -500,6 +501,7 @@ class TradingConfig:
 
         custom_entry_defaults = {
             'enabled': False,
+            'timeframe': '15m',
             'max_spread_pct': 0.08,
             'require_quote_volume_gate': True,
             'require_orderbook_gate': True,
@@ -956,6 +958,7 @@ class TradingConfig:
                 },
                 "user_custom_entry": {
                     "enabled": False,
+                    "timeframe": "15m",
                     "max_spread_pct": 0.08,
                     "require_quote_volume_gate": True,
                     "require_orderbook_gate": True

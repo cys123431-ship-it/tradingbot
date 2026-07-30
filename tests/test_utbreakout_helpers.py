@@ -4018,6 +4018,70 @@ def test_live_ladder_waits_for_full_post_entry_candle_before_exit_policy():
     )
 
 
+def test_user_custom_ladder_keeps_protection_but_skips_strategy_time_stop():
+    pos = {
+        "symbol": "EWY/USDT:USDT",
+        "side": "short",
+        "contracts": "0.08",
+        "entryPrice": "143.30",
+    }
+    engine = _protection_engine([], positions=[pos])
+    state = {
+        "advanced_live_ladder_state": True,
+        "engine": "USER_CUSTOM",
+        "side": "short",
+        "entry_price": 143.30,
+        "initial_qty": 0.08,
+        "risk_distance": 11.89,
+        "last_stop_price": 155.19,
+        "planned_tp_orders": [],
+        "bars_seen": 8,
+        "last_bar_ts": 22,
+        "tp1_filled": False,
+    }
+    engine.utbreakout_trailing_states = {"EWY/USDT": state}
+    engine._refresh_ladder_fill_state = AsyncMock(side_effect=lambda _s, _p, current, _c: current)
+    engine._audit_and_repair_live_ladder_protection = AsyncMock(
+        return_value={"status": "OK"}
+    )
+    engine._maybe_tp2_fallback_close = AsyncMock(
+        return_value={"status": "NOT_REACHED"}
+    )
+    engine._close_position_reduce_only_market = AsyncMock()
+    df = pd.DataFrame([
+        {
+            "timestamp": idx,
+            "open": 143.30,
+            "high": 144.0,
+            "low": 142.0,
+            "close": 144.0,
+            "volume": 1000.0,
+        }
+        for idx in range(25)
+    ])
+
+    result = asyncio.run(
+        engine._manage_live_ladder_exit_policy(
+            "EWY/USDT",
+            pos,
+            df,
+            {
+                "timeframe": "15m",
+                "time_stop_enabled": True,
+                "max_bars_to_tp1": 8,
+                "signal_invalid_exit_enabled": True,
+            },
+        )
+    )
+
+    assert result is state
+    assert state["strategy_exit_policy_enabled"] is False
+    assert state["last_exit_policy_reason"] == "USER_CUSTOM_PROTECTIVE_ORDERS_ONLY"
+    engine._refresh_ladder_fill_state.assert_awaited_once()
+    engine._audit_and_repair_live_ladder_protection.assert_awaited_once()
+    engine._close_position_reduce_only_market.assert_not_awaited()
+
+
 def test_advanced_live_ladder_is_not_managed_by_legacy_exit_engine():
     pos = {
         "symbol": "BTC/USDT:USDT",

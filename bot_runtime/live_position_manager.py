@@ -109,6 +109,18 @@ async def _manage_live_ladder_exit_policy(self, symbol, pos, df, cfg):
         self._clear_utbreakout_trailing_state(symbol, finalize=True, reason="TP2 fallback close")
         return {"status": "EXITED", "reason": "TP2_FALLBACK_CLOSE", "fallback": fallback_status}
 
+    state_engine = str(state.get("engine") or "").strip().upper()
+    is_user_custom_position = state_engine in {"USER_CUSTOM", "CUSTOM_ENTRY"}
+    strategy_exit_policy_enabled = state.get("strategy_exit_policy_enabled")
+    if strategy_exit_policy_enabled is None:
+        # Backward-compatible recovery for USER_CUSTOM states created before
+        # this flag existed.  Automatic strategy states keep their old policy.
+        strategy_exit_policy_enabled = not is_user_custom_position
+    if not bool(strategy_exit_policy_enabled):
+        state["strategy_exit_policy_enabled"] = False
+        state["last_exit_policy_reason"] = "USER_CUSTOM_PROTECTIVE_ORDERS_ONLY"
+        return self._set_utbreakout_trailing_state(symbol, state)
+
     if waiting_for_post_entry_bar:
         state["last_exit_policy_reason"] = (
             "waiting for first full post-entry closed bar"
@@ -339,8 +351,21 @@ def _register_live_ladder_position_state(self, plan, pos, sl_order, tp_orders, c
         "bars_seen": 0,
         "last_bar_ts": None,
         "entry_timestamp_ms": entry_timestamp_ms,
-        "entry_timeframe": cfg.get("timeframe", "15m"),
+        "entry_timeframe": (
+            getattr(plan, "entry_timeframe", None)
+            or cfg.get("entry_timeframe")
+            or cfg.get("timeframe")
+            or "15m"
+        ),
         "engine": plan.engine,
+        "strategy_exit_policy_enabled": bool(
+            getattr(
+                plan,
+                "strategy_exit_policy_enabled",
+                str(plan.engine or "").strip().upper()
+                not in {"USER_CUSTOM", "CUSTOM_ENTRY"},
+            )
+        ),
         "regime": plan.regime,
         "confidence": plan.confidence,
         "expected_r": plan.expected_r,

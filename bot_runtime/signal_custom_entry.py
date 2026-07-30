@@ -48,14 +48,16 @@ class SignalCustomEntryMixin:
 
         cfg = dict(filtered)
         cfg.update(common)
+        custom_timeframe = str(custom.get("timeframe") or "15m").strip() or "15m"
         cfg.update(
             {
-                "timeframe": str(
-                    custom.get("timeframe")
-                    or common.get("entry_timeframe")
-                    or common.get("timeframe")
-                    or "15m"
-                ),
+                # A user-directed entry is sized from its own ATR context.  Do
+                # not inherit an automatic strategy's 4h/8h signal timeframe:
+                # the live position monitor receives scanner candles and would
+                # otherwise over-count elapsed bars from the wider bucket.
+                "timeframe": custom_timeframe,
+                "entry_timeframe": custom_timeframe,
+                "exit_timeframe": custom_timeframe,
                 "adx_length": max(
                     2,
                     int(
@@ -361,6 +363,11 @@ class SignalCustomEntryMixin:
             )
 
         plan.user_custom_entry = True
+        plan.entry_timeframe = cfg.get("entry_timeframe", cfg.get("timeframe", "15m"))
+        # USER_CUSTOM chooses symbol and direction explicitly.  Its exchange
+        # SL/TP and protection repair remain automated, but strategy-specific
+        # time-stop/reversal exits must not override that user decision.
+        plan.strategy_exit_policy_enabled = False
         plan.max_trade_count_bypassed = True
         plan.l2_risk_multiplier = l2_risk_multiplier
         plan.signal_timestamp = f"user:{time.time_ns()}:{uuid.uuid4().hex[:12]}"
