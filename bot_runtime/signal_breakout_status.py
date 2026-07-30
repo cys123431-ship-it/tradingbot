@@ -428,7 +428,10 @@ class SignalBreakoutStatusMixin:
             )
         market_regime_context = {}
         try:
-            market_regime_context = await self._fetch_utbreakout_market_regime_context(cfg)
+            market_regime_context = await self._fetch_utbreakout_market_regime_context(
+                cfg,
+                symbol=symbol,
+            )
             if isinstance(market_regime_context, dict) and market_regime_context:
                 status['market_regime_context'] = market_regime_context
                 status['market_regime_summary'] = market_regime_context.get('summary')
@@ -992,14 +995,26 @@ class SignalBreakoutStatusMixin:
                     )
                 return None, None
 
-            btc_candidates = (
-                ["BTC/USDT:USDT", "BTC/USDT"]
-                if ":USDT" in str(symbol)
-                else ["BTC/USDT", "BTC/USDT:USDT"]
-            )
-
-            btc_4h_raw, btc_4h_symbol = await _fetch_direction_ohlcv_with_fallback(btc_candidates, "4h", limit=60)
-            btc_1d_raw, btc_1d_symbol = await _fetch_direction_ohlcv_with_fallback(btc_candidates, "1d", limit=60)
+            is_tradifi = await self._is_tradifi_perpetual_symbol(symbol)
+            if is_tradifi:
+                btc_4h_raw, btc_4h_symbol = None, None
+                btc_1d_raw, btc_1d_symbol = None, None
+            else:
+                btc_candidates = (
+                    ["BTC/USDT:USDT", "BTC/USDT"]
+                    if ":USDT" in str(symbol)
+                    else ["BTC/USDT", "BTC/USDT:USDT"]
+                )
+                btc_4h_raw, btc_4h_symbol = await _fetch_direction_ohlcv_with_fallback(
+                    btc_candidates,
+                    "4h",
+                    limit=60,
+                )
+                btc_1d_raw, btc_1d_symbol = await _fetch_direction_ohlcv_with_fallback(
+                    btc_candidates,
+                    "1d",
+                    limit=60,
+                )
             sym_1h_raw, sym_1h_symbol = await _fetch_direction_ohlcv_with_fallback([symbol], "1h", limit=60)
 
             status["direction_btc_4h_symbol"] = btc_4h_symbol
@@ -1016,6 +1031,7 @@ class SignalBreakoutStatusMixin:
                 symbol_1h=sym_1h,
                 entry_15m=filter_values or {},
                 side_hint=side,
+                broad_market_regime_enabled=not is_tradifi,
             )
 
             allowed_by_direction = (
@@ -2379,31 +2395,32 @@ class SignalBreakoutStatusMixin:
         try:
             from utbreakout.direction_filter import decide_direction
 
-            btc_candidates = (
-                ["BTC/USDT:USDT", "BTC/USDT"]
-                if ":USDT" in str(symbol)
-                else ["BTC/USDT", "BTC/USDT:USDT"]
-            )
-
             btc_4h_raw = None
             btc_1d_raw = None
             sym_1h_raw = None
+            is_tradifi = await self._is_tradifi_perpetual_symbol(symbol)
 
-            for btc_symbol in btc_candidates:
-                try:
-                    btc_4h_raw = await self.fetch_ohlcv_async(btc_symbol, "4h", limit=60)
-                    if btc_4h_raw is not None and len(btc_4h_raw) > 0:
-                        break
-                except Exception:
-                    pass
+            if not is_tradifi:
+                btc_candidates = (
+                    ["BTC/USDT:USDT", "BTC/USDT"]
+                    if ":USDT" in str(symbol)
+                    else ["BTC/USDT", "BTC/USDT:USDT"]
+                )
+                for btc_symbol in btc_candidates:
+                    try:
+                        btc_4h_raw = await self.fetch_ohlcv_async(btc_symbol, "4h", limit=60)
+                        if btc_4h_raw is not None and len(btc_4h_raw) > 0:
+                            break
+                    except Exception:
+                        pass
 
-            for btc_symbol in btc_candidates:
-                try:
-                    btc_1d_raw = await self.fetch_ohlcv_async(btc_symbol, "1d", limit=60)
-                    if btc_1d_raw is not None and len(btc_1d_raw) > 0:
-                        break
-                except Exception:
-                    pass
+                for btc_symbol in btc_candidates:
+                    try:
+                        btc_1d_raw = await self.fetch_ohlcv_async(btc_symbol, "1d", limit=60)
+                        if btc_1d_raw is not None and len(btc_1d_raw) > 0:
+                            break
+                    except Exception:
+                        pass
 
             try:
                 sym_1h_raw = await self.fetch_ohlcv_async(symbol, "1h", limit=60)
@@ -2420,6 +2437,7 @@ class SignalBreakoutStatusMixin:
                 symbol_1h=sym_1h,
                 entry_15m=filter_values or {},
                 side_hint=side,
+                broad_market_regime_enabled=not is_tradifi,
             )
 
             allowed = decision.long_allowed if side == "long" else decision.short_allowed
@@ -3127,7 +3145,10 @@ class SignalBreakoutStatusMixin:
             futures_context = {'futures_context_error': str(e)}
         market_regime_context = {}
         try:
-            market_regime_context = await self._fetch_utbreakout_market_regime_context(cfg)
+            market_regime_context = await self._fetch_utbreakout_market_regime_context(
+                cfg,
+                symbol=symbol,
+            )
             market_regime_context = dict(market_regime_context or {})
         except Exception as e:
             market_regime_context = {'error': str(e)}
@@ -4469,7 +4490,10 @@ class SignalBreakoutStatusMixin:
             futures_context = {'futures_context_error': str(e)}
         market_regime_context = {}
         try:
-            market_regime_context = await self._fetch_utbreakout_market_regime_context(cfg)
+            market_regime_context = await self._fetch_utbreakout_market_regime_context(
+                cfg,
+                symbol=symbol,
+            )
             market_regime_context = dict(market_regime_context or {})
         except Exception as e:
             market_regime_context = {'error': str(e)}
@@ -5910,7 +5934,10 @@ class SignalBreakoutStatusMixin:
             futures_context = {'futures_context_error': str(exc)}
         market_regime_context = {}
         try:
-            market_regime_context = await self._fetch_utbreakout_market_regime_context(cfg)
+            market_regime_context = await self._fetch_utbreakout_market_regime_context(
+                cfg,
+                symbol=symbol,
+            )
             market_regime_context = dict(market_regime_context or {})
         except Exception as exc:
             market_regime_context = {'error': str(exc)}
@@ -6542,7 +6569,10 @@ class SignalBreakoutStatusMixin:
             futures_context = {}
         market_regime_context = {}
         try:
-            market_regime_context = await self._fetch_utbreakout_market_regime_context(fb_cfg)
+            market_regime_context = await self._fetch_utbreakout_market_regime_context(
+                fb_cfg,
+                symbol=symbol,
+            )
             market_regime_context = dict(market_regime_context or {})
         except Exception:
             market_regime_context = {}

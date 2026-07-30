@@ -5679,6 +5679,18 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 
         async def manual_symbol_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             raw_text = u.message.text.strip()
+            if (
+                c
+                and c.user_data is not None
+                and c.user_data.get('user_custom_entry_waiting_symbol', False)
+            ):
+                handled = await self._handle_user_custom_symbol_input(
+                    u,
+                    c,
+                    raw_text,
+                )
+                if handled:
+                    return
             if c and c.user_data is not None and c.user_data.pop('utbot_coin_waiting_for_symbol', False):
                 try:
                     symbol = await _set_strategy_coin(raw_text)

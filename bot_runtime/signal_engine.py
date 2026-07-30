@@ -153,6 +153,7 @@ class SignalEngine(
         self.coin_selector_analysis_cursor = 0
         self.coin_selector_strategy_cursor = 0
         self.coin_selector_rate_limit_backoff_until = 0.0
+        self.tradifi_symbol_classification_cache = {}  # Binance market metadata classification
         self._load_utbreakout_daily_sl_lockouts()
         self._load_utbreakout_profit_alpha_meta_stats()
         self.micro_auto_last_plan = {}  # symbol -> latest accepted Micro Auto plan

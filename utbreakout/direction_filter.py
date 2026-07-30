@@ -122,6 +122,7 @@ def decide_direction(
     symbol_1h: Mapping[str, Any] | None = None,
     entry_15m: Mapping[str, Any] | None = None,
     side_hint: str | None = None,
+    broad_market_regime_enabled: bool = True,
 ) -> DirectionDecision:
     btc_4h = btc_4h or {}
     btc_1d = btc_1d or {}
@@ -132,18 +133,24 @@ def decide_direction(
     btc_1d_bias = _close_ema_bias(btc_1d)
     symbol_bias = _close_ema_bias(symbol_1h)
 
-    if btc_4h_bias == "bullish" and btc_1d_bias != "bearish":
+    if not broad_market_regime_enabled:
+        regime = "independent"
+    elif btc_4h_bias == "bullish" and btc_1d_bias != "bearish":
         regime = "bullish"
     elif btc_4h_bias == "bearish" and btc_1d_bias != "bullish":
         regime = "bearish"
     else:
         regime = "neutral"
 
-    long_allowed = regime in {"bullish", "neutral"} and symbol_bias in {"bullish", "neutral"}
-    short_allowed = regime == "bearish" and symbol_bias in {"bearish", "neutral"}
+    if broad_market_regime_enabled:
+        long_allowed = regime in {"bullish", "neutral"} and symbol_bias in {"bullish", "neutral"}
+        short_allowed = regime == "bearish" and symbol_bias in {"bearish", "neutral"}
+    else:
+        long_allowed = symbol_bias in {"bullish", "neutral"}
+        short_allowed = symbol_bias in {"bearish", "neutral"}
 
     # Prevent countertrend shorting in bullish BTC regime.
-    if regime == "bullish":
+    if broad_market_regime_enabled and regime == "bullish":
         short_allowed = False
 
     side = str(side_hint or "").lower()
@@ -160,10 +167,14 @@ def decide_direction(
         long_allowed = False
         short_allowed = False
 
+    broad_market_reason = (
+        f"btc4h={btc_4h_bias}, btc1d={btc_1d_bias}"
+        if broad_market_regime_enabled
+        else "broad_market=skipped"
+    )
     reason = (
-        f"regime={regime}, btc4h={btc_4h_bias}, btc1d={btc_1d_bias}, "
-        f"symbol1h={symbol_bias}, {volume_reason}, {quality_reason}, "
-        f"size_mult={size_multiplier:.2f}"
+        f"regime={regime}, {broad_market_reason}, symbol1h={symbol_bias}, "
+        f"{volume_reason}, {quality_reason}, size_mult={size_multiplier:.2f}"
     )
 
     return DirectionDecision(

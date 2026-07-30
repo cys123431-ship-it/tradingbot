@@ -130,6 +130,46 @@ class SignalCustomEntryMixin:
                 "open futures orders already exist; reconcile or cancel them before a custom entry"
             )
 
+    async def resolve_user_custom_entry_symbol(self, symbol):
+        """Resolve and validate a symbol before the owner chooses a direction."""
+
+        if not self.is_user_custom_entry_mode_enabled():
+            raise TradingSafetyError("USER_CUSTOM_MODE_OFF")
+        if self.is_upbit_mode():
+            raise TradingSafetyError("user custom entry currently supports Binance Futures only")
+        return await self.ctrl._assert_symbol_tradeable_in_current_exchange_mode(symbol)
+
+    async def get_user_custom_position_status(self, symbol=None):
+        """Return current non-zero positions from a fresh exchange query."""
+
+        if not hasattr(self.exchange, "fetch_positions"):
+            return {
+                "fetch_ok": False,
+                "error": "exchange position query is unavailable",
+                "positions": [],
+                "requested_symbol": symbol,
+            }
+        try:
+            positions = await asyncio.to_thread(self.exchange.fetch_positions)
+        except Exception as exc:
+            return {
+                "fetch_ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "positions": [],
+                "requested_symbol": symbol,
+            }
+
+        active = []
+        for position in positions or []:
+            normalized = self._normalize_server_position(position)
+            if normalized:
+                active.append(normalized)
+        return {
+            "fetch_ok": True,
+            "positions": active,
+            "requested_symbol": symbol,
+        }
+
     async def prepare_user_custom_entry(self, symbol, side):
         """Return a fresh, non-submitted market order plan for user confirmation."""
 
@@ -355,12 +395,59 @@ class SignalCustomEntryMixin:
             )
             if result.get("status") == "LIVE_ORDER_PLAN_EXECUTED":
                 actual_plan = result.get("plan") or prepared["plan"]
+                self.position_cache = None
+                self.position_cache_time = 0
+                fetch_ok, confirmed_position = await self._fetch_server_position_checked(
+                    actual_plan.symbol
+                )
+                expected_side = str(actual_plan.side or "").lower()
+                confirmed_side = str(
+                    (confirmed_position or {}).get("side") or ""
+                ).lower()
+                confirmed_qty = abs(
+                    float(
+                        (
+                            confirmed_position.get("contracts")
+                            or self._position_signed_contracts(confirmed_position)
+                        )
+                        if confirmed_position
+                        else 0.0
+                    )
+                )
+                if (
+                    not fetch_ok
+                    or not confirmed_position
+                    or confirmed_side != expected_side
+                    or confirmed_qty <= 0
+                ):
+                    result = dict(result)
+                    result["execution_status"] = "LIVE_ORDER_PLAN_EXECUTED"
+                    result["status"] = (
+                        "POSITION_VERIFICATION_FAILED"
+                        if not fetch_ok
+                        else "POSITION_NOT_OPEN_AFTER_EXECUTION"
+                    )
+                    result["reason"] = (
+                        "거래소 실포지션 재조회에 실패해 진입 완료로 표시하지 않습니다."
+                        if not fetch_ok
+                        else "거래소 재조회 결과 해당 방향의 실포지션이 없습니다."
+                    )
+                    result["confirmed_position"] = None
+                    return result
+
+                result = dict(result)
+                result["status"] = "USER_CUSTOM_POSITION_CONFIRMED"
+                result["confirmed_position"] = confirmed_position
                 try:
                     self.db.log_trade_entry(
                         actual_plan.symbol,
                         str(actual_plan.side).lower(),
-                        float(actual_plan.entry_price or prepared["price"]),
-                        float(actual_plan.qty),
+                        float(
+                            confirmed_position.get("entryPrice")
+                            or actual_plan.entry_price
+                            or prepared["price"]
+                        ),
+                        confirmed_qty,
                         strategy="user_custom",
                     )
                 except Exception:
@@ -376,8 +463,12 @@ class SignalCustomEntryMixin:
                     "symbol": actual_plan.symbol,
                     "side": str(actual_plan.side).lower(),
                     "strategy": "USER_CUSTOM",
-                    "entry_price": float(actual_plan.entry_price or prepared["price"]),
-                    "qty": float(actual_plan.qty),
+                    "entry_price": float(
+                        confirmed_position.get("entryPrice")
+                        or actual_plan.entry_price
+                        or prepared["price"]
+                    ),
+                    "qty": confirmed_qty,
                     "stop_loss": float(actual_plan.initial_sl_price),
                     "tp_orders": [
                         {

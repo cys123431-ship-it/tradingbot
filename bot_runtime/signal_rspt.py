@@ -695,7 +695,10 @@ class SignalRsptMixin:
         except Exception as exc:
             status['futures_context_error'] = str(exc)
         try:
-            market_regime_context = await self._fetch_utbreakout_market_regime_context(cfg)
+            market_regime_context = await self._fetch_utbreakout_market_regime_context(
+                cfg,
+                symbol=symbol,
+            )
             if isinstance(market_regime_context, dict):
                 filter_values['market_regime_context'] = market_regime_context
                 status['market_regime_summary'] = market_regime_context.get('summary')

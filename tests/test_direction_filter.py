@@ -102,3 +102,28 @@ def test_quality_score_zero_handling():
     # volume_ratio 0.8 is volume ok (1.0). quality unknown is 0.85. 1.0 * 0.85 = 0.85
     assert decision_none.long_allowed is True
     assert decision_none.size_multiplier == 0.85
+
+
+def test_independent_mode_ignores_btc_regime_and_uses_symbol_direction():
+    long_decision = decide_direction(
+        btc_4h={"close": 90, "ema_fast": 95, "ema_slow": 100, "ema_slope": -0.1},
+        btc_1d={"close": 90, "ema_fast": 95, "ema_slow": 100, "ema_slope": -0.1},
+        symbol_1h={"close": 110, "ema_fast": 105, "ema_slow": 100, "ema_slope": 0.1},
+        entry_15m={"volume_ratio": 0.8, "quality_score": 60},
+        side_hint="long",
+        broad_market_regime_enabled=False,
+    )
+    short_decision = decide_direction(
+        btc_4h={"close": 110, "ema_fast": 105, "ema_slow": 100, "ema_slope": 0.1},
+        btc_1d={"close": 110, "ema_fast": 105, "ema_slow": 100, "ema_slope": 0.1},
+        symbol_1h={"close": 90, "ema_fast": 95, "ema_slow": 100, "ema_slope": -0.1},
+        entry_15m={"volume_ratio": 0.8, "quality_score": 60},
+        side_hint="short",
+        broad_market_regime_enabled=False,
+    )
+
+    assert long_decision.regime == "independent"
+    assert long_decision.long_allowed is True
+    assert "broad_market=skipped" in long_decision.reason
+    assert short_decision.regime == "independent"
+    assert short_decision.short_allowed is True

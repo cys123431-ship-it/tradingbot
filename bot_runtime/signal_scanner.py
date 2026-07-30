@@ -1518,9 +1518,84 @@ class SignalScannerMixin:
         }
         return clean_context
 
-    async def _fetch_utbreakout_market_regime_context(self, cfg):
+    async def _is_tradifi_perpetual_symbol(self, symbol):
+        """Classify a symbol from Binance market metadata without using price proxies."""
+
+        if self.is_upbit_mode():
+            return False
+
+        cache = getattr(self, 'tradifi_symbol_classification_cache', None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self.tradifi_symbol_classification_cache = cache
+        cache_key = str(symbol or '').strip().upper()
+        if cache_key in cache:
+            return bool(cache[cache_key])
+
+        selector_scores = getattr(self, 'coin_selector_symbol_scores', {})
+        if isinstance(selector_scores, dict):
+            normalized = normalize_coin_selector_custom_symbols([symbol])
+            normalized = normalized[0] if normalized else str(symbol or '').replace(':USDT', '').upper()
+            for key in (symbol, cache_key, normalized, f"{normalized}:USDT"):
+                candidate = selector_scores.get(key)
+                if isinstance(candidate, dict) and candidate.get('tradifi_perpetual') is True:
+                    cache[cache_key] = True
+                    return True
+
+        exchanges = []
+        for exchange in (
+            getattr(self, 'market_data_exchange', None),
+            getattr(self, 'exchange', None),
+        ):
+            if exchange is not None and exchange not in exchanges:
+                exchanges.append(exchange)
+
+        for exchange in exchanges:
+            markets = getattr(exchange, 'markets', None)
+            if not isinstance(markets, dict) or not markets:
+                load_markets = getattr(exchange, 'load_markets', None)
+                if callable(load_markets):
+                    try:
+                        markets = await asyncio.to_thread(load_markets)
+                    except Exception as exc:
+                        logger.warning(
+                            "TradFi classification market load failed for %s: %s",
+                            symbol,
+                            exc,
+                        )
+                        continue
+            market = self._coin_selector_market_for_symbol(symbol, markets)
+            if not isinstance(market, dict):
+                continue
+            market_symbol = market.get('symbol') or symbol
+            is_tradifi = coin_selector_market_is_tradifi_perpetual(
+                market_symbol,
+                market,
+            )
+            cache[cache_key] = bool(is_tradifi)
+            return bool(is_tradifi)
+
+        # Do not cache an unclassified symbol. A later market metadata refresh may
+        # identify a newly listed Binance TradFi perpetual correctly.
+        return False
+
+    @staticmethod
+    def _tradifi_market_regime_bypass_context(cfg):
+        return {
+            'items': {},
+            'summary': 'TradFi independent: BTC/ETH regime skipped',
+            'timeframe': str(
+                (cfg or {}).get('market_quality_regime_timeframe', '4h') or '4h'
+            ),
+            'bypassed': True,
+            'bypass_reason': 'TRADIFI_BTC_ETH_REGIME_BYPASS',
+        }
+
+    async def _fetch_utbreakout_market_regime_context(self, cfg, symbol=None):
         if self.is_upbit_mode() or not bool(cfg.get('market_quality_regime_enabled', True)):
             return {}
+        if symbol and await self._is_tradifi_perpetual_symbol(symbol):
+            return self._tradifi_market_regime_bypass_context(cfg)
         raw_symbols = cfg.get('market_quality_regime_symbols') or ['BTC/USDT', 'ETH/USDT']
         if isinstance(raw_symbols, str):
             symbols = [part.strip() for part in raw_symbols.split(',') if part.strip()]

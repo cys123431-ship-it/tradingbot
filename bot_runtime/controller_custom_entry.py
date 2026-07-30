@@ -98,9 +98,52 @@ class ControllerCustomEntryMixin:
                         callback_data="uce:off",
                     ),
                 ],
+                [
+                    InlineKeyboardButton("🎯 코인 선택", callback_data="uce:choose"),
+                    InlineKeyboardButton("📊 실포지션 상태", callback_data="uce:position"),
+                ],
                 [InlineKeyboardButton("상태 새로고침", callback_data="uce:status")],
             ]
         )
+
+    @staticmethod
+    def _build_user_custom_direction_keyboard(symbol):
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("📈 LONG", callback_data="uce:side:long"),
+                    InlineKeyboardButton("📉 SHORT", callback_data="uce:side:short"),
+                ],
+                [
+                    InlineKeyboardButton("다른 코인 입력", callback_data="uce:choose"),
+                    InlineKeyboardButton("취소", callback_data="uce:cancel_input"),
+                ],
+            ]
+        )
+
+    @staticmethod
+    def _build_user_custom_result_keyboard():
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("📊 실포지션 상태", callback_data="uce:position"),
+                    InlineKeyboardButton("🎯 새 진입 설정", callback_data="uce:choose"),
+                ],
+                [InlineKeyboardButton("커스텀 메뉴", callback_data="uce:status")],
+            ]
+        )
+
+    @staticmethod
+    def _clear_user_custom_entry_context(context):
+        user_data = getattr(context, "user_data", None)
+        if user_data is None:
+            return
+        for key in (
+            "user_custom_entry_pending",
+            "user_custom_entry_waiting_symbol",
+            "user_custom_entry_symbol",
+        ):
+            user_data.pop(key, None)
 
     def _format_user_custom_entry_status(self, notice=None):
         enabled = self._is_user_custom_entry_enabled()
@@ -116,10 +159,9 @@ class ControllerCustomEntryMixin:
             "진입 방식: 시장가",
             "유지 보호: 일일손실·단일 포지션·유동성·실잔고 리스크·청산가·SL·TP1·TP2",
             "",
-            "사용 예:",
-            "KORUUSDT 숏 시장가로 진입  → 주문 전 확인",
-            "KORUUSDT 숏 시장가로 바로 진입  → 즉시 안전검사 후 주문",
-            "/customentry KORUUSDT short now",
+            "버튼 사용 순서:",
+            "모드 ON → 코인 선택 → 코인명 입력 → LONG/SHORT → 주문 확인",
+            "실포지션 상태는 거래소를 직접 조회합니다.",
         ]
         if notice:
             lines.extend(["", str(notice)])
@@ -158,15 +200,16 @@ class ControllerCustomEntryMixin:
     @staticmethod
     def _format_user_custom_execution_result(result):
         status = str((result or {}).get("status") or "UNKNOWN")
-        if status == "LIVE_ORDER_PLAN_EXECUTED":
+        if status == "USER_CUSTOM_POSITION_CONFIRMED":
             plan = result.get("plan")
+            position = result.get("confirmed_position") or {}
             return "\n".join(
                 [
-                    "✅ 사용자 커스텀 진입 완료",
+                    "✅ 사용자 커스텀 실포지션 확인 완료",
                     f"Symbol: {plan.symbol}",
                     f"Direction: {str(plan.side).upper()}",
-                    f"Entry: {float(plan.entry_price):.10g}",
-                    f"Qty: {float(plan.qty):.10g}",
+                    f"Entry: {float(position.get('entryPrice') or plan.entry_price):.10g}",
+                    f"Qty: {abs(float(position.get('contracts') or plan.qty)):.10g}",
                     f"SL: {float(plan.initial_sl_price):.10g}",
                     f"TP 보호주문: {len(result.get('tp_orders') or [])}/{len(plan.tp_orders or [])}",
                 ]
@@ -177,6 +220,84 @@ class ControllerCustomEntryMixin:
             f"reason={result.get('error') or result.get('reason') or '-'}"
         )
 
+    @staticmethod
+    def _format_user_custom_position_status(result):
+        if not isinstance(result, dict) or not result.get("fetch_ok"):
+            return (
+                "⛔ 거래소 실포지션 조회 실패\n"
+                f"reason={(result or {}).get('error') or 'unknown'}"
+            )
+        positions = list(result.get("positions") or [])
+        lines = ["📊 거래소 실포지션 상태"]
+        if not positions:
+            lines.append("⚪ 현재 열린 포지션 없음")
+            return "\n".join(lines)
+        for position in positions:
+            symbol = str(position.get("symbol") or "unknown")
+            side = str(position.get("side") or "unknown").upper()
+            qty = abs(float(position.get("contracts") or 0.0))
+            entry = float(position.get("entryPrice") or 0.0)
+            mark = float(position.get("markPrice") or 0.0)
+            pnl = float(position.get("unrealizedPnl") or 0.0)
+            lines.extend(
+                [
+                    f"✅ {symbol} {side}",
+                    f"수량: {qty:.10g}",
+                    f"진입가: {entry:.10g} | 현재가: {mark:.10g}",
+                    f"미실현손익: {pnl:+.4f} USDT",
+                ]
+            )
+        return "\n".join(lines)
+
+    async def _handle_user_custom_symbol_input(self, update, context, raw_text):
+        """Consume a symbol after the owner presses the custom-entry choose button."""
+
+        user_data = getattr(context, "user_data", None)
+        message = getattr(update, "message", None)
+        if user_data is None or message is None:
+            return False
+        if not user_data.pop("user_custom_entry_waiting_symbol", False):
+            return False
+
+        symbol = str(raw_text or "").strip().upper()
+        if not re.fullmatch(
+            r"[A-Z0-9]{2,24}(?:[/_-][A-Z0-9]{2,12})?(?::[A-Z0-9]{2,12})?",
+            symbol,
+        ):
+            user_data["user_custom_entry_waiting_symbol"] = True
+            await message.reply_text(
+                "⛔ 코인명을 인식하지 못했습니다. 예: KORUUSDT, BTCUSDT, QQQUSDT"
+            )
+            return True
+        if not self._is_user_custom_entry_enabled():
+            await message.reply_text(
+                self._format_user_custom_entry_status(
+                    "먼저 사용자 커스텀 모드를 ON으로 켜세요."
+                ),
+                reply_markup=self._build_user_custom_entry_keyboard(),
+            )
+            return True
+        try:
+            resolved = await self._user_custom_entry_engine().resolve_user_custom_entry_symbol(
+                symbol
+            )
+        except Exception as exc:
+            user_data["user_custom_entry_waiting_symbol"] = True
+            await message.reply_text(
+                "⛔ 거래 가능한 코인으로 확인되지 않았습니다.\n"
+                f"{type(exc).__name__}: {exc}\n"
+                "코인명을 다시 입력하세요."
+            )
+            return True
+
+        user_data["user_custom_entry_symbol"] = resolved
+        user_data.pop("user_custom_entry_pending", None)
+        await message.reply_text(
+            f"🎯 선택 코인: {resolved}\n진입 방향을 선택하세요.",
+            reply_markup=self._build_user_custom_direction_keyboard(resolved),
+        )
+        return True
+
     def _register_user_custom_entry_handlers(self, owner_only, text_filter):
         async def _reply_menu(message, notice=None):
             await message.reply_text(
@@ -184,7 +305,7 @@ class ControllerCustomEntryMixin:
                 reply_markup=self._build_user_custom_entry_keyboard(),
             )
 
-        async def _execute(message, parsed):
+        async def _execute(message, context, parsed):
             engine = self._user_custom_entry_engine()
             try:
                 result = await engine.execute_user_custom_entry(
@@ -197,7 +318,11 @@ class ControllerCustomEntryMixin:
                     f"{type(exc).__name__}: {exc}"
                 )
                 return
-            await message.reply_text(self._format_user_custom_execution_result(result))
+            context.user_data["user_custom_entry_symbol"] = parsed["symbol"]
+            await message.reply_text(
+                self._format_user_custom_execution_result(result),
+                reply_markup=self._build_user_custom_result_keyboard(),
+            )
 
         async def _preview(message, context, parsed):
             engine = self._user_custom_entry_engine()
@@ -218,6 +343,7 @@ class ControllerCustomEntryMixin:
                 "symbol": prepared["symbol"],
                 "side": prepared["side"],
             }
+            context.user_data["user_custom_entry_symbol"] = prepared["symbol"]
             keyboard = InlineKeyboardMarkup(
                 [
                     [
@@ -229,7 +355,13 @@ class ControllerCustomEntryMixin:
                             "취소",
                             callback_data=f"uce:cancel:{request_id}",
                         ),
-                    ]
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "방향 다시 선택",
+                            callback_data="uce:direction",
+                        )
+                    ],
                 ]
             )
             await message.reply_text(
@@ -242,7 +374,7 @@ class ControllerCustomEntryMixin:
                 await _reply_menu(message, "먼저 사용자 커스텀 모드를 ON으로 켜세요.")
                 return
             if parsed["immediate"]:
-                await _execute(message, parsed)
+                await _execute(message, context, parsed)
             else:
                 await _preview(message, context, parsed)
 
@@ -261,7 +393,7 @@ class ControllerCustomEntryMixin:
                 return
             if action in {"off", "stop", "disable"}:
                 await self._set_user_custom_entry_mode(False)
-                context.user_data.pop("user_custom_entry_pending", None)
+                self._clear_user_custom_entry_context(context)
                 await _reply_menu(
                     update.message,
                     "커스텀 모드가 꺼졌습니다. 자동전략 신규 진입이 다시 허용됩니다.",
@@ -299,12 +431,93 @@ class ControllerCustomEntryMixin:
                 return
             if action == "off":
                 await self._set_user_custom_entry_mode(False)
-                context.user_data.pop("user_custom_entry_pending", None)
+                self._clear_user_custom_entry_context(context)
                 await query.edit_message_text(
                     self._format_user_custom_entry_status(
                         "커스텀 모드 OFF: 자동전략 신규 진입을 다시 허용했습니다."
                     ),
                     reply_markup=self._build_user_custom_entry_keyboard(),
+                )
+                return
+            if action == "choose":
+                if not self._is_user_custom_entry_enabled():
+                    await query.edit_message_text(
+                        self._format_user_custom_entry_status(
+                            "먼저 사용자 커스텀 모드를 ON으로 켜세요."
+                        ),
+                        reply_markup=self._build_user_custom_entry_keyboard(),
+                    )
+                    return
+                context.user_data.pop("user_custom_entry_pending", None)
+                context.user_data.pop("user_custom_entry_symbol", None)
+                context.user_data["user_custom_entry_waiting_symbol"] = True
+                await query.edit_message_text(
+                    "🎯 진입할 코인 이름만 입력하세요.\n"
+                    "예: KORUUSDT, BTCUSDT, QQQUSDT",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[
+                            InlineKeyboardButton(
+                                "취소",
+                                callback_data="uce:cancel_input",
+                            )
+                        ]]
+                    ),
+                )
+                return
+            if action == "cancel_input":
+                self._clear_user_custom_entry_context(context)
+                await query.edit_message_text(
+                    self._format_user_custom_entry_status(
+                        "코인 선택을 취소했습니다."
+                    ),
+                    reply_markup=self._build_user_custom_entry_keyboard(),
+                )
+                return
+            if action == "position":
+                symbol = context.user_data.get("user_custom_entry_symbol")
+                result = await self._user_custom_entry_engine().get_user_custom_position_status(
+                    symbol
+                )
+                await query.edit_message_text(
+                    self._format_user_custom_position_status(result),
+                    reply_markup=self._build_user_custom_result_keyboard(),
+                )
+                return
+            if action == "direction":
+                symbol = context.user_data.get("user_custom_entry_symbol")
+                if not symbol:
+                    context.user_data["user_custom_entry_waiting_symbol"] = True
+                    await query.edit_message_text(
+                        "🎯 코인 이름을 먼저 입력하세요.",
+                        reply_markup=InlineKeyboardMarkup(
+                            [[InlineKeyboardButton("취소", callback_data="uce:cancel_input")]]
+                        ),
+                    )
+                    return
+                context.user_data.pop("user_custom_entry_pending", None)
+                await query.edit_message_text(
+                    f"🎯 선택 코인: {symbol}\n진입 방향을 선택하세요.",
+                    reply_markup=self._build_user_custom_direction_keyboard(symbol),
+                )
+                return
+            if action == "side":
+                symbol = context.user_data.get("user_custom_entry_symbol")
+                side = parts[2] if len(parts) > 2 else ""
+                if not symbol or side not in {"long", "short"}:
+                    await query.edit_message_text(
+                        "⛔ 코인 또는 방향 선택이 만료됐습니다.",
+                        reply_markup=self._build_user_custom_entry_keyboard(),
+                    )
+                    return
+                await _preview(
+                    query.message,
+                    context,
+                    {
+                        "symbol": symbol,
+                        "side": side,
+                        "immediate": False,
+                        "order_type": "market",
+                    },
                 )
                 return
             if action == "status":
@@ -321,7 +534,10 @@ class ControllerCustomEntryMixin:
                 return
             if action == "cancel":
                 context.user_data.pop("user_custom_entry_pending", None)
-                await query.edit_message_text("사용자 커스텀 진입 요청을 취소했습니다.")
+                await query.edit_message_text(
+                    "사용자 커스텀 진입 요청을 취소했습니다.",
+                    reply_markup=self._build_user_custom_result_keyboard(),
+                )
                 return
             if action != "confirm":
                 return
@@ -333,7 +549,8 @@ class ControllerCustomEntryMixin:
                     pending["side"],
                 )
                 await query.edit_message_text(
-                    self._format_user_custom_execution_result(result)
+                    self._format_user_custom_execution_result(result),
+                    reply_markup=self._build_user_custom_result_keyboard(),
                 )
             except Exception as exc:
                 await query.edit_message_text(

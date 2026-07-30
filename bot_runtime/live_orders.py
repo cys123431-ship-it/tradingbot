@@ -223,7 +223,10 @@ async def execute_live_order_plan(self, plan, cfg):
         plan.entry_price,
         plan.qty,
     )
-    pos = submission.position or confirmation.get("position")
+    # Only the fresh exchange/order confirmation may prove that the position
+    # exists. ``submission.position`` can be a pre-submit or zero-sized snapshot
+    # and previously allowed a false successful-entry notification.
+    pos = confirmation.get("position")
     if not pos:
         _mark_crypto_entry_state(
             self,
@@ -242,7 +245,13 @@ async def execute_live_order_plan(self, plan, cfg):
         }
 
     actual_entry = float(pos.get("entryPrice") or plan.entry_price or 0.0)
-    actual_qty = abs(float(self._position_signed_contracts(pos) or pos.get("contracts", 0) or plan.qty))
+    actual_qty = abs(
+        float(
+            self._position_signed_contracts(pos)
+            or pos.get("contracts", 0)
+            or 0.0
+        )
+    )
 
     if actual_entry <= 0 or actual_qty <= 0:
         _mark_crypto_entry_state(
@@ -369,10 +378,11 @@ async def execute_live_order_plan(self, plan, cfg):
             "New entries are locked while protection recovery continues."
         )
 
-    await self.ctrl.notify(
-        f"✅ LiveOrderPlan 진입 완료: {plan.symbol} {plan.side} qty={plan.qty} "
-        f"SL={plan.initial_sl_price} TP={len(tp_orders)}/{len(plan.tp_orders)} engine={plan.engine}"
-    )
+    if not user_custom_plan:
+        await self.ctrl.notify(
+            f"✅ LiveOrderPlan 진입 완료: {plan.symbol} {plan.side} qty={plan.qty} "
+            f"SL={plan.initial_sl_price} TP={len(tp_orders)}/{len(plan.tp_orders)} engine={plan.engine}"
+        )
 
     return {
         "status": "LIVE_ORDER_PLAN_EXECUTED",
@@ -380,6 +390,7 @@ async def execute_live_order_plan(self, plan, cfg):
         "sl_order": sl_order,
         "tp_orders": tp_orders,
         "plan": plan,
+        "confirmed_position": pos,
         "protection_audit": audit_status,
         "client_order_id": client_order_id,
     }

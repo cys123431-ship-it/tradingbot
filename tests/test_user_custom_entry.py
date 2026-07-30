@@ -54,12 +54,25 @@ class _CustomEngineStub(SignalCustomEntryMixin):
         self.last_entry_reason = {}
         self.last_live_entry_snapshot = {}
         self.active_symbols = set()
+        self.position_cache = None
+        self.position_cache_time = 0
         self.db = MagicMock()
         self.db.get_daily_entry_count.side_effect = AssertionError(
             "custom entries must not consult the strategy trade-count cap"
         )
         self._daily_loss = daily_loss
         self._flat_check = AsyncMock()
+        self._fetch_server_position_checked = AsyncMock(
+            return_value=(
+                True,
+                {
+                    "symbol": "KORU/USDT:USDT",
+                    "side": "long",
+                    "contracts": 0.1,
+                    "entryPrice": 100.0,
+                },
+            )
+        )
         self._validate_mainnet_entry_quote_volume = AsyncMock(
             return_value={
                 "allowed": True,
@@ -124,6 +137,11 @@ class _CustomEngineStub(SignalCustomEntryMixin):
 
     def _get_min_notional_for_symbol(self, symbol, cfg):
         return 5.0
+
+    @staticmethod
+    def _position_signed_contracts(position):
+        amount = float((position or {}).get("contracts") or 0.0)
+        return -abs(amount) if str((position or {}).get("side")).lower() == "short" else abs(amount)
 
 
 def test_user_custom_parser_requires_an_explicit_entry_phrase():
@@ -217,16 +235,48 @@ def test_custom_execution_records_strategy_for_monthly_report():
 
     result = asyncio.run(engine.execute_user_custom_entry("KORUUSDT", "long"))
 
-    assert result["status"] == "LIVE_ORDER_PLAN_EXECUTED"
+    assert result["status"] == "USER_CUSTOM_POSITION_CONFIRMED"
     engine.db.log_trade_entry.assert_called_once()
     assert engine.db.log_trade_entry.call_args.kwargs["strategy"] == "user_custom"
     assert "KORU/USDT:USDT" in engine.active_symbols
+
+
+def test_custom_execution_never_reports_success_without_a_live_position():
+    engine = _CustomEngineStub()
+    prepared = asyncio.run(engine.prepare_user_custom_entry("KORUUSDT", "long"))
+    engine.prepare_user_custom_entry = AsyncMock(return_value=prepared)
+    engine.execute_live_order_plan = AsyncMock(
+        return_value={
+            "status": "LIVE_ORDER_PLAN_EXECUTED",
+            "plan": prepared["plan"],
+            "tp_orders": [{"id": "tp1"}, {"id": "tp2"}],
+        }
+    )
+    engine._fetch_server_position_checked = AsyncMock(return_value=(True, None))
+
+    result = asyncio.run(engine.execute_user_custom_entry("KORUUSDT", "long"))
+
+    assert result["status"] == "POSITION_NOT_OPEN_AFTER_EXECUTION"
+    assert result["confirmed_position"] is None
+    engine.db.log_trade_entry.assert_not_called()
+    assert engine.last_live_entry_snapshot == {}
 
 
 def test_live_plan_preserves_configured_stop_atr_distance_before_fill():
     source = __import__("inspect").getsource(live_orders.execute_live_order_plan)
     assert 'cfg.get("initial_stop_atr_distance", 2.0)' in source
     assert "/ stop_atr_distance" in source
+    assert 'pos = confirmation.get("position")' in source
+    assert "or plan.qty" not in source
+
+
+def test_custom_main_menu_replaces_prediction_button():
+    controller = emas.MainController.__new__(emas.MainController)
+    keyboard = controller._build_main_keyboard()
+    labels = [button.text for row in keyboard.keyboard for button in row]
+
+    assert "/customentry" in labels
+    assert "/prediction" not in labels
 
 
 def test_automatic_entry_returns_before_strategy_work_when_custom_mode_is_on():
