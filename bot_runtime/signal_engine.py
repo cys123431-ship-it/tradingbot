@@ -127,6 +127,7 @@ class SignalEngine(
         self.dual_alpha_last_status = {}  # symbol -> latest dual alpha selection summary
         self.qh_flow_signal_cache = {}  # symbol:boundary -> live quarter-hour evaluation
         self.qh_flow_last_status = {}  # symbol -> latest QH-Flow status
+        self.volatility_managed_trend_last_status = {}  # symbol -> latest VMT status
         self.l2_gate_cache = {}  # symbol -> short-lived shared L2 state
         self.l2_gate_history = {}  # symbol -> dynamic L2 replenishment/depletion samples
         self.crowding_unwind_last_status = {}  # symbol -> latest funding/OI unwind status

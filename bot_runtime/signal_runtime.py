@@ -185,6 +185,7 @@ class SignalRuntimeMixin:
         self.dual_alpha_last_status = {}
         self.qh_flow_signal_cache = {}
         self.qh_flow_last_status = {}
+        self.volatility_managed_trend_last_status = {}
         self.l2_gate_cache = {}
         self.l2_gate_history = {}
         self.crowding_unwind_last_status = {}

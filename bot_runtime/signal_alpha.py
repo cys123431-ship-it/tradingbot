@@ -1,4 +1,4 @@
-"""QH flow, crowding, liquidation reversal, and aggregate alpha suite."""
+"""VMT trend, crowding, liquidation reversal, and aggregate alpha suite."""
 
 from __future__ import annotations
 
@@ -40,75 +40,13 @@ class SignalAlphaMixin:
 
 
     async def _qh_flow_confirmation(self, symbol, side, cfg=None, *, force_reprocess=False):
-        qh_cfg = self._qh_flow_runtime_config(cfg)
-        if not bool(qh_cfg.get('qh_confirmation_enabled', True)):
-            return {
-                'state': 'disabled',
-                'allowed': True,
-                'risk_multiplier': 1.0,
-                'reason': 'QH confirmation disabled',
-            }
-        now_ms = int(time.time() * 1000)
-        phase = qh_boundary_phase(now_ms, qh_cfg)
-        pre_boundary = max(
-            0.0,
-            float(qh_cfg.get('qh_confirmation_pre_boundary_seconds', 180) or 180),
-        )
-        if phase['phase'] == 'stale' and 0.0 < phase['seconds_to_next_boundary'] <= pre_boundary:
-            return {
-                'state': 'pending',
-                'allowed': False,
-                'risk_multiplier': 0.0,
-                'reason': (
-                    f"QH boundary in {phase['seconds_to_next_boundary']:.0f}s; "
-                    'wait for first 10-second flow'
-                ),
-                'reject_code': 'REJECTED_QH_CONFIRMATION_PENDING',
-            }
-        if phase['phase'] != 'ready':
-            return {
-                'state': 'not_applicable',
-                'allowed': True,
-                'risk_multiplier': 1.0,
-                'reason': f"QH confirmation not active ({phase['phase']})",
-            }
-        qh_status = await self._fetch_qh_flow_evaluation(
-            symbol,
-            cfg,
-            force_refresh=force_reprocess,
-            now_ms=now_ms,
-        )
-        if qh_status.get('allowed') and qh_status.get('side') == side:
-            return {
-                'state': 'confirmed',
-                'allowed': True,
-                'risk_multiplier': 1.0,
-                'reason': qh_status.get('reason'),
-                'qh_flow': qh_status,
-            }
-        if qh_status.get('allowed') and qh_status.get('side') in {'long', 'short'}:
-            if bool(qh_cfg.get('qh_confirmation_opposite_blocks', True)):
-                return {
-                    'state': 'conflict',
-                    'allowed': False,
-                    'risk_multiplier': 0.0,
-                    'reason': (
-                        f"QH {str(qh_status.get('side')).upper()} conflicts with "
-                        f"{str(side).upper()}"
-                    ),
-                    'reject_code': 'REJECTED_QH_DIRECTION_CONFLICT',
-                    'qh_flow': qh_status,
-                }
-        multiplier = max(
-            0.0,
-            min(1.0, float(qh_cfg.get('qh_confirmation_no_signal_multiplier', 0.60) or 0.60)),
-        )
+        # QH was retired as an entry strategy.  Keep this compatibility hook
+        # neutral so persisted configs cannot silently shrink or block UT/RSPT.
         return {
-            'state': 'no_signal',
+            'state': 'retired',
             'allowed': True,
-            'risk_multiplier': multiplier,
-            'reason': f"QH has no accepted signal: {qh_status.get('reason')}",
-            'qh_flow': qh_status,
+            'risk_multiplier': 1.0,
+            'reason': 'QH confirmation retired; shared L2 safety remains active',
         }
 
     async def _calculate_qh_flow_signal(
@@ -598,6 +536,267 @@ class SignalAlphaMixin:
         self.qh_flow_last_status[canonical] = dict(status)
         return status
 
+    def _volatility_managed_trend_runtime_config(self, cfg=None):
+        source = dict(cfg or {})
+        base = default_volatility_managed_trend_config()
+        nested = source.get('volatility_managed_trend')
+        if isinstance(nested, dict):
+            base.update(nested)
+        if 'volatility_managed_trend_live_enabled' in source:
+            base['live_enabled'] = bool(source.get('volatility_managed_trend_live_enabled'))
+        return base
+
+    async def _calculate_volatility_managed_trend_signal(
+        self,
+        symbol,
+        df,
+        strategy_params,
+        *,
+        force_reprocess=False,
+    ):
+        cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+        vmt_cfg = self._volatility_managed_trend_runtime_config(cfg)
+        canonical = self._canonical_futures_symbol(symbol)
+        self._clear_utbot_filtered_breakout_entry_plan(canonical)
+        status = {
+            'strategy': STRATEGY_DISPLAY_NAMES.get(
+                VOLATILITY_MANAGED_TREND_STRATEGY,
+                'VOLATILITY_MANAGED_TREND',
+            ),
+            'entry_strategy': VOLATILITY_MANAGED_TREND_STRATEGY,
+            'symbol': canonical,
+            'stage': 'waiting',
+        }
+
+        def _finish(sig, reason, code=None):
+            status['reason'] = reason
+            status['accepted_side'] = sig
+            if code:
+                status['reject_code'] = code
+            if sig:
+                status['accepted_code'] = 'ACCEPTED_ENTRY'
+                status['stage'] = 'entry_ready'
+            if not isinstance(getattr(self, 'volatility_managed_trend_last_status', None), dict):
+                self.volatility_managed_trend_last_status = {}
+            self.volatility_managed_trend_last_status[canonical] = dict(status)
+            self._store_utbot_filtered_breakout_status(canonical, status)
+            self.last_entry_reason[canonical] = reason
+            return sig, reason, status
+
+        if self.is_upbit_mode():
+            return _finish(None, 'VMT unsupported in Upbit mode', 'REJECTED_UNSUPPORTED_MODE')
+        if not bool(vmt_cfg.get('enabled', True)) or not bool(vmt_cfg.get('live_enabled', False)):
+            return _finish(None, 'VMT live disabled', 'REJECTED_VMT_LIVE_DISABLED')
+
+        timeframe = str(vmt_cfg.get('timeframe', '1h') or '1h')
+        try:
+            ohlcv = await asyncio.to_thread(
+                self.market_data_exchange.fetch_ohlcv,
+                canonical,
+                timeframe,
+                limit=240,
+            )
+            rows = self._relative_strength_pullback_rows_from_ohlcv(ohlcv)
+            rows = completed_candle_rows(
+                rows,
+                timeframe,
+                {'exclude_incomplete_live_candle': True},
+            )
+        except Exception as exc:
+            return _finish(None, f'VMT OHLCV unavailable: {exc}', 'REJECTED_VMT_DATA')
+
+        base_l2 = await self._evaluate_shared_l2_gate(
+            canonical,
+            cfg,
+            force_refresh=force_reprocess,
+        )
+        preliminary = evaluate_volatility_managed_trend(rows, base_l2, vmt_cfg)
+        candidate_side = preliminary.side
+        l2_gate = await self._evaluate_shared_l2_gate(
+            canonical,
+            cfg,
+            force_refresh=True,
+            side=candidate_side,
+        ) if candidate_side in {'long', 'short'} else base_l2
+        decision = evaluate_volatility_managed_trend(rows, l2_gate, vmt_cfg)
+        metrics = dict(decision.metrics or {})
+        status.update({
+            'allowed': bool(decision.allowed),
+            'side': decision.side,
+            'score': float(decision.score),
+            'risk_multiplier': float(decision.risk_multiplier),
+            'metrics': metrics,
+            'l2_gate': dict(l2_gate or {}),
+        })
+        if not decision.allowed or decision.side not in {'long', 'short'}:
+            return _finish(None, f'VMT waiting: {decision.reason}')
+        side = decision.side
+        if not self.is_trade_direction_allowed(side):
+            return _finish(None, self.format_trade_direction_block_reason(side), 'REJECTED_DIRECTION_FILTER')
+
+        daily_count, daily_pnl = self.db.get_daily_stats()
+        daily_entries = self.get_automatic_daily_entry_count()
+        status['daily_pnl'] = daily_pnl
+        status['daily_entries'] = daily_entries
+        if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
+            return _finish(None, f'risk_limit_blocked: daily pnl {daily_pnl:.2f}', 'REJECTED_DAILY_LOSS_LIMIT')
+        if int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
+            return _finish(None, f'risk_limit_blocked: daily trade count {daily_entries}', 'REJECTED_DAILY_TRADE_LIMIT')
+
+        reference_price = _safe_float_or_none(metrics.get('reference_price'))
+        atr_value = _safe_float_or_none(metrics.get('atr'))
+        structure_stop = _safe_float_or_none(metrics.get('structure_stop'))
+        if reference_price is None or reference_price <= 0 or atr_value is None or atr_value <= 0:
+            return _finish(None, 'VMT reference price/ATR unavailable', 'REJECTED_VMT_DATA')
+        try:
+            ticker = await asyncio.to_thread(self.market_data_exchange.fetch_ticker, canonical)
+            entry_price = _safe_float_or_none((ticker or {}).get('last') or (ticker or {}).get('close'))
+        except Exception as exc:
+            return _finish(None, f'VMT live price unavailable: {exc}', 'REJECTED_VMT_DATA')
+        if entry_price is None or entry_price <= 0:
+            return _finish(None, 'VMT live price unavailable', 'REJECTED_VMT_DATA')
+
+        chase_atr = (
+            (entry_price - reference_price) / atr_value
+            if side == 'long'
+            else (reference_price - entry_price) / atr_value
+        )
+        status['entry_chase_atr'] = chase_atr
+        if chase_atr > float(vmt_cfg.get('entry_chase_max_atr', 0.50) or 0.50):
+            return _finish(
+                None,
+                f'VMT entry moved {chase_atr:.2f} ATR beyond completed-candle signal',
+                'REJECTED_VMT_STALE_CHASE',
+            )
+        if structure_stop is not None and (
+            (side == 'long' and entry_price <= structure_stop)
+            or (side == 'short' and entry_price >= structure_stop)
+        ):
+            return _finish(None, 'VMT structure invalidated before order', 'REJECTED_VMT_INVALIDATED')
+
+        filter_values = {
+            'entry_price': entry_price,
+            'entry_timeframe': timeframe,
+            'atr': atr_value,
+            'atr_pct': atr_value / entry_price * 100.0,
+        }
+        market_quality = self._evaluate_utbreakout_market_quality(side, cfg, filter_values)
+        status['market_quality'] = market_quality
+        if market_quality.get('hard_block') or market_quality.get('state') is False:
+            return _finish(None, f"market_quality_rejected: {market_quality.get('summary')}", 'REJECTED_MARKET_QUALITY')
+        if not l2_gate.get('allowed', False):
+            return _finish(None, f"L2 stressed: {l2_gate.get('reason')}", 'REJECTED_L2_STRESSED')
+
+        total_balance, free_balance, _ = await self.get_balance_info()
+        balance_for_risk = total_balance if total_balance > 0 else free_balance
+        common_cfg = self.get_runtime_common_settings()
+        leverage = int(max(1.0, float(common_cfg.get('leverage', 5) or 5)))
+        risk_multiplier = min(
+            1.0,
+            max(0.0, float(decision.risk_multiplier or 0.0)),
+            max(0.0, float(market_quality.get('risk_multiplier', 1.0) or 1.0)),
+            max(0.0, float(l2_gate.get('risk_multiplier', 0.0) or 0.0)),
+        )
+        risk_budget = resolve_utbreakout_risk_budget(
+            balance_for_risk,
+            cfg,
+            multiplier=risk_multiplier,
+            daily_pnl_usdt=daily_pnl,
+        )
+        try:
+            plan = calculate_risk_plan(
+                side=side,
+                entry_price=entry_price,
+                atr_value=atr_value,
+                stop_atr_multiplier=float(vmt_cfg.get('stop_atr_multiplier', 1.60) or 1.60),
+                ut_stop=None,
+                structure_stop=structure_stop,
+                structure_buffer_atr=float(vmt_cfg.get('structure_buffer_atr', 0.10) or 0.10),
+                take_profit_r_multiple=float(vmt_cfg.get('take_profit_r_multiple', 3.00) or 3.00),
+                take_profit_front_run_atr=0.0,
+                take_profit_front_run_pct=0.0,
+                min_risk_reward=2.0,
+                balance_usdt=balance_for_risk,
+                risk_per_trade_percent=risk_budget['risk_per_trade_percent'],
+                max_risk_per_trade_usdt=risk_budget['max_risk_per_trade_usdt'],
+                leverage=leverage,
+            )
+            plan = cap_utbreakout_risk_plan_to_margin(
+                plan,
+                free_balance=free_balance,
+                leverage=leverage,
+                entry_price=entry_price,
+            )
+        except ValueError as exc:
+            return _finish(None, f'VMT risk plan rejected: {exc}', 'REJECTED_VMT_RISK_PLAN')
+
+        plan.update({
+            'strategy': VOLATILITY_MANAGED_TREND_STRATEGY,
+            'plan_symbol': canonical,
+            'signal_candle_ts': metrics.get('signal_candle_ts'),
+            'entry_timeframe': timeframe,
+            'timeframe': timeframe,
+            'exit_timeframe': '15m',
+            'htf_timeframe': '4h',
+            'entry_execution': 'market',
+            'vmt_score': float(decision.score),
+            'vmt_risk_multiplier': risk_multiplier,
+            'vmt_metrics': metrics,
+            'l2_gate': dict(l2_gate or {}),
+            'l2_state': l2_gate.get('state'),
+            'l2_risk_multiplier': l2_gate.get('risk_multiplier'),
+            'market_quality_summary': market_quality.get('summary'),
+            'atr': atr_value,
+            'atr_pct': atr_value / entry_price * 100.0,
+            'partial_take_profit_enabled': True,
+            'partial_take_profit_r_multiple': 1.25,
+            'partial_take_profit_ratio': 0.30,
+            'second_take_profit_enabled': True,
+            'second_take_profit_r_multiple': float(vmt_cfg.get('take_profit_r_multiple', 3.00) or 3.00),
+            'second_take_profit_ratio': 0.35,
+            'runner_pct': 0.35,
+            'atr_trailing_enabled': True,
+            'atr_trailing_activation_r': 1.50,
+            'atr_trailing_multiplier': 2.25,
+            'runner_exit_enabled': True,
+            'runner_chandelier_enabled': True,
+            'tp1_breakeven_enabled': True,
+            'tp1_breakeven_wait_for_partial': True,
+            'ev_time_stop_enabled': True,
+            # Exit monitoring runs on 15m bars; preserve the configured VMT
+            # holding period expressed in completed 1h signal bars.
+            'ev_time_stop_bars': int(vmt_cfg.get('time_stop_bars', 24) or 24) * 4,
+            'ev_time_stop_min_mfe_r': 0.50,
+        })
+        self._set_utbot_filtered_breakout_entry_plan(canonical, plan)
+        status['entry_plan'] = dict(plan)
+        return _finish(side, f'ACCEPTED_ENTRY: {decision.reason}')
+
+    async def build_volatility_managed_trend_status_text(self, symbol=None):
+        target = self._canonical_futures_symbol(
+            symbol or self.current_utbreakout_candidate_symbol or 'BTC/USDT'
+        )
+        status = dict((getattr(self, 'volatility_managed_trend_last_status', {}) or {}).get(target) or {})
+        if not status:
+            return '\n'.join([
+                '📈 VMT 변동성 관리 추세 상태',
+                f'Symbol: {target}',
+                '아직 완료된 1시간봉 평가 기록이 없습니다.',
+            ])
+        metrics = status.get('metrics') if isinstance(status.get('metrics'), dict) else {}
+        votes = metrics.get('horizon_votes') if isinstance(metrics.get('horizon_votes'), dict) else {}
+        vote_text = ', '.join(f'{key}h={str(value or "NONE").upper()}' for key, value in votes.items())
+        return '\n'.join([
+            '📈 VMT 변동성 관리 추세 상태',
+            f'Symbol: {target}',
+            f"Signal: {str(status.get('side') or 'NONE').upper()} / allowed={bool(status.get('allowed'))}",
+            f"Score: {float(status.get('score', 0.0) or 0.0):.1f} / risk x{float(status.get('risk_multiplier', 0.0) or 0.0):.2f}",
+            f'Horizons: {vote_text or "N/A"}',
+            f"Efficiency: {float(metrics.get('efficiency_ratio', 0.0) or 0.0):.2f} / vol ratio {float(metrics.get('volatility_ratio', 0.0) or 0.0):.2f}",
+            f"Extension: {float(metrics.get('extension_atr', 0.0) or 0.0):.2f} ATR",
+            f"Reason: {status.get('reason') or '-'}",
+        ])
+
     def _crowding_unwind_runtime_config(self, cfg=None):
         source = dict(cfg or {})
         base = default_crowding_unwind_config()
@@ -703,10 +902,45 @@ class SignalAlphaMixin:
                 'REJECTED_DAILY_TRADE_LIMIT',
             )
         latest = rows[-1]
-        entry_price = _safe_float_or_none(latest.get('close'))
+        reference_price = _safe_float_or_none(latest.get('close'))
         atr_value = _safe_float_or_none(decision.metrics.get('atr'))
-        if entry_price is None or entry_price <= 0 or atr_value is None or atr_value <= 0:
+        if reference_price is None or reference_price <= 0 or atr_value is None or atr_value <= 0:
             return _finish(None, 'Crowding entry price/ATR unavailable', 'REJECTED_CROWDING_DATA')
+        try:
+            ticker = await asyncio.to_thread(self.market_data_exchange.fetch_ticker, canonical)
+            entry_price = _safe_float_or_none((ticker or {}).get('last') or (ticker or {}).get('close'))
+        except Exception as exc:
+            return _finish(None, f'Crowding live price unavailable: {exc}', 'REJECTED_CROWDING_DATA')
+        if entry_price is None or entry_price <= 0:
+            return _finish(None, 'Crowding live price unavailable', 'REJECTED_CROWDING_DATA')
+        chase_atr = (
+            (entry_price - reference_price) / atr_value
+            if side == 'long'
+            else (reference_price - entry_price) / atr_value
+        )
+        status['entry_chase_atr'] = chase_atr
+        if chase_atr > float(crowd_cfg.get('entry_chase_max_atr', 0.50) or 0.50):
+            return _finish(
+                None,
+                f'Crowding entry moved {chase_atr:.2f} ATR beyond completed-candle signal',
+                'REJECTED_CROWDING_STALE_CHASE',
+            )
+        structure_level = _safe_float_or_none(decision.metrics.get('structure_level'))
+        if structure_level is not None and (
+            (side == 'long' and entry_price <= structure_level)
+            or (side == 'short' and entry_price >= structure_level)
+        ):
+            return _finish(None, 'Crowding structure invalidated before order', 'REJECTED_CROWDING_INVALIDATED')
+        filter_values = {
+            'entry_price': entry_price,
+            'entry_timeframe': '15m',
+            'atr': atr_value,
+            'atr_pct': atr_value / entry_price * 100.0,
+        }
+        market_quality = self._evaluate_utbreakout_market_quality(side, cfg, filter_values)
+        status['market_quality'] = market_quality
+        if market_quality.get('hard_block') or market_quality.get('state') is False:
+            return _finish(None, f"market_quality_rejected: {market_quality.get('summary')}", 'REJECTED_MARKET_QUALITY')
         total_balance, free_balance, _ = await self.get_balance_info()
         balance_for_risk = total_balance if total_balance > 0 else free_balance
         common_cfg = self.get_runtime_common_settings()
@@ -714,6 +948,7 @@ class SignalAlphaMixin:
         risk_multiplier = min(
             1.0,
             max(0.0, float(decision.risk_multiplier or 0.0)),
+            max(0.0, float(market_quality.get('risk_multiplier', 1.0) or 1.0)),
             max(0.0, float(l2_gate.get('risk_multiplier', 0.0) or 0.0)),
         )
         risk_budget = resolve_utbreakout_risk_budget(
@@ -761,6 +996,7 @@ class SignalAlphaMixin:
             'l2_gate': dict(l2_gate or {}),
             'l2_state': l2_gate.get('state'),
             'l2_risk_multiplier': l2_gate.get('risk_multiplier'),
+            'market_quality_summary': market_quality.get('summary'),
             'atr': atr_value,
             'partial_take_profit_enabled': True,
             'partial_take_profit_r_multiple': 1.25,
@@ -923,11 +1159,36 @@ class SignalAlphaMixin:
             return _finish(None, f'risk_limit_blocked: daily trade count {daily_entries}', 'REJECTED_DAILY_TRADE_LIMIT')
 
         latest_15m = rows[-1] if rows else {}
-        entry_price = _safe_float_or_none(latest_15m.get('close'))
+        reference_price = _safe_float_or_none(latest_15m.get('close'))
         metrics = dict(decision.metrics or {})
         atr_value = _safe_float_or_none(metrics.get('atr'))
-        if entry_price is None or entry_price <= 0 or atr_value is None or atr_value <= 0:
+        if reference_price is None or reference_price <= 0 or atr_value is None or atr_value <= 0:
             return _finish(None, 'LXR entry price/ATR unavailable', 'REJECTED_LXR_DATA')
+        try:
+            ticker = await asyncio.to_thread(self.market_data_exchange.fetch_ticker, canonical)
+            entry_price = _safe_float_or_none((ticker or {}).get('last') or (ticker or {}).get('close'))
+        except Exception as exc:
+            return _finish(None, f'LXR live price unavailable: {exc}', 'REJECTED_LXR_DATA')
+        if entry_price is None or entry_price <= 0:
+            return _finish(None, 'LXR live price unavailable', 'REJECTED_LXR_DATA')
+        chase_atr = (
+            (entry_price - reference_price) / atr_value
+            if side == 'long'
+            else (reference_price - entry_price) / atr_value
+        )
+        status['entry_chase_atr'] = chase_atr
+        if chase_atr > float(lxr_cfg.get('entry_chase_max_atr', 0.50) or 0.50):
+            return _finish(
+                None,
+                f'LXR entry moved {chase_atr:.2f} ATR beyond completed-candle signal',
+                'REJECTED_LXR_STALE_CHASE',
+            )
+        structure_stop = _safe_float_or_none(metrics.get('structure_stop'))
+        if structure_stop is not None and (
+            (side == 'long' and entry_price <= structure_stop)
+            or (side == 'short' and entry_price >= structure_stop)
+        ):
+            return _finish(None, 'LXR structure invalidated before order', 'REJECTED_LXR_INVALIDATED')
 
         filter_values = {
             'entry_price': entry_price,
@@ -1623,16 +1884,16 @@ class SignalAlphaMixin:
             return params
         params = copy.deepcopy(strategy_params if isinstance(strategy_params, dict) else {})
         cfg = dict(params.get('UTBotFilteredBreakoutV1') or {})
-        qh_cfg = self._qh_flow_runtime_config(cfg)
-        qh_cfg['qh_flow_enabled'] = True
-        qh_cfg['qh_flow_live_enabled'] = True
-        qh_cfg['qh_confirmation_enabled'] = False
-        cfg['qh_flow'] = qh_cfg
-        cfg['qh_flow_live_enabled'] = True
+        vmt_cfg = self._volatility_managed_trend_runtime_config(cfg)
+        vmt_cfg['enabled'] = True
+        vmt_cfg['live_enabled'] = True
+        cfg['volatility_managed_trend'] = vmt_cfg
+        cfg['volatility_managed_trend_live_enabled'] = True
+        cfg['qh_flow_live_enabled'] = False
         cfg['qh_flow_confirmation_enabled'] = False
         cfg['relative_strength_pullback_trend_live_enabled'] = False
         cfg['entry_strategy'] = ENTRY_STRATEGY_UT_BREAKOUT
-        params['active_strategy'] = QH_FLOW_STRATEGY
+        params['active_strategy'] = VOLATILITY_MANAGED_TREND_STRATEGY
         params['UTBotFilteredBreakoutV1'] = cfg
         return params
 
@@ -1705,24 +1966,24 @@ class SignalAlphaMixin:
         ))
         self._clear_utbot_filtered_breakout_entry_plan(rsp_symbol)
 
-        qh_params = self._triple_alpha_strategy_params(strategy_params, QH_FLOW_STRATEGY)
-        qh_sig, qh_reason, qh_status = await self._calculate_qh_flow_signal(
+        vmt_params = self._triple_alpha_strategy_params(strategy_params, VOLATILITY_MANAGED_TREND_STRATEGY)
+        vmt_sig, vmt_reason, vmt_status = await self._calculate_volatility_managed_trend_signal(
             base_symbol,
             df,
-            qh_params,
+            vmt_params,
             force_reprocess=force_reprocess,
         )
-        qh_status = dict(qh_status or {})
-        qh_symbol = self._canonical_futures_symbol(
-            qh_status.get('plan_symbol') or qh_status.get('symbol') or base_symbol
+        vmt_status = dict(vmt_status or {})
+        vmt_symbol = self._canonical_futures_symbol(
+            vmt_status.get('plan_symbol') or vmt_status.get('symbol') or base_symbol
         )
-        qh_plan = (
-            dict(self._get_utbot_filtered_breakout_entry_plan(qh_symbol, qh_sig) or {})
-            if qh_sig in {'long', 'short'}
+        vmt_plan = (
+            dict(self._get_utbot_filtered_breakout_entry_plan(vmt_symbol, vmt_sig) or {})
+            if vmt_sig in {'long', 'short'}
             else None
         )
-        branch_results.append((QH_FLOW_STRATEGY, 'QH-Flow', qh_sig, qh_reason, qh_status, qh_plan, 2))
-        self._clear_utbot_filtered_breakout_entry_plan(qh_symbol)
+        branch_results.append((VOLATILITY_MANAGED_TREND_STRATEGY, 'VMT Trend', vmt_sig, vmt_reason, vmt_status, vmt_plan, 2))
+        self._clear_utbot_filtered_breakout_entry_plan(vmt_symbol)
 
         choices = []
         for key, label, side, reason, status, plan, priority in branch_results:
@@ -1756,7 +2017,7 @@ class SignalAlphaMixin:
 
         statuses = {key: status for key, _, _, _, status, _, _ in branch_results}
         reasons = {key: reason for key, _, _, reason, _, _, _ in branch_results}
-        final_status = dict((selected or {}).get('status') or qh_status or rsp_status or ut_status or {})
+        final_status = dict((selected or {}).get('status') or vmt_status or rsp_status or ut_status or {})
         if selected:
             selected_plan = self._dual_alpha_scale_plan(selected['plan'], agreement_multiplier)
             selected_plan.pop('dual_alpha_risk_multiplier', None)
@@ -1780,7 +2041,7 @@ class SignalAlphaMixin:
             'enabled': True,
             'utbreak': self._dual_alpha_light(statuses.get(ENTRY_STRATEGY_UT_BREAKOUT), 'UTBreakout'),
             'rspt': self._dual_alpha_light(statuses.get(ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND), 'RSPT-v3'),
-            'qh_flow': self._dual_alpha_light(statuses.get(QH_FLOW_STRATEGY), 'QH-Flow'),
+            'vmt': self._dual_alpha_light(statuses.get(VOLATILITY_MANAGED_TREND_STRATEGY), 'VMT Trend'),
             'agreement_state': agreement_state,
             'agreement_risk_multiplier': agreement_multiplier,
             'confirmation_count': len(choices),
@@ -1816,7 +2077,7 @@ class SignalAlphaMixin:
                 f"TRIPLE_ALPHA waiting ({agreement_state}): "
                 f"UT={reasons.get(ENTRY_STRATEGY_UT_BREAKOUT)}; "
                 f"RSPT={reasons.get(ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND)}; "
-                f"QH={reasons.get(QH_FLOW_STRATEGY)}"
+                f"VMT={reasons.get(VOLATILITY_MANAGED_TREND_STRATEGY)}"
             )
 
         canonical = self._canonical_futures_symbol(final_status.get('plan_symbol') or base_symbol)
@@ -1845,7 +2106,7 @@ class SignalAlphaMixin:
             f"Agreement: {str(summary.get('agreement_state') or 'none').upper()} / confirmations={int(summary.get('confirmation_count') or 0)} / risk x{float(summary.get('agreement_risk_multiplier', 0.0) or 0.0):.2f}",
             f"Selected: {summary.get('selected_label') or 'NONE'} {str(summary.get('selected_side') or '').upper()}",
         ]
-        for key, label in (('utbreak', 'UTBreak'), ('rspt', 'RSPT-v3'), ('qh_flow', 'QH-Flow')):
+        for key, label in (('utbreak', 'UTBreak'), ('rspt', 'RSPT-v3'), ('vmt', 'VMT Trend')):
             item = summary.get(key) if isinstance(summary.get(key), dict) else {}
             lines.append(
                 f"{label}: {str(item.get('light') or 'gray').upper()} {str(item.get('side') or 'NONE').upper()} - {item.get('reason') or '-'}"
@@ -2000,21 +2261,21 @@ class SignalAlphaMixin:
                 1,
             ))
 
-        if QH_FLOW_STRATEGY in enabled_set:
-            qh_params = self._quad_alpha_strategy_params(strategy_params, QH_FLOW_STRATEGY)
+        if VOLATILITY_MANAGED_TREND_STRATEGY in enabled_set:
+            vmt_params = self._quad_alpha_strategy_params(strategy_params, VOLATILITY_MANAGED_TREND_STRATEGY)
             branch_results.append(await _run_branch(
-                QH_FLOW_STRATEGY,
-                'QH-Flow v2',
+                VOLATILITY_MANAGED_TREND_STRATEGY,
+                'VMT Trend',
                 2,
-                lambda: self._calculate_qh_flow_signal(
+                lambda: self._calculate_volatility_managed_trend_signal(
                     base_symbol,
                     df,
-                    qh_params,
+                    vmt_params,
                     force_reprocess=force_reprocess,
                 ),
             ))
         else:
-            branch_results.append(_disabled_branch(QH_FLOW_STRATEGY, 'QH-Flow v2', 2))
+            branch_results.append(_disabled_branch(VOLATILITY_MANAGED_TREND_STRATEGY, 'VMT Trend', 2))
 
         if CROWDING_UNWIND_STRATEGY in enabled_set:
             crowd_params = self._quad_alpha_strategy_params(strategy_params, CROWDING_UNWIND_STRATEGY)
@@ -2146,7 +2407,7 @@ class SignalAlphaMixin:
             ],
             'utbreak': self._dual_alpha_light(statuses.get(ENTRY_STRATEGY_UT_BREAKOUT), 'UTBreakout'),
             'rspt': self._dual_alpha_light(statuses.get(ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND), 'RSPT-v3'),
-            'qh_flow': self._dual_alpha_light(statuses.get(QH_FLOW_STRATEGY), 'QH-Flow v2'),
+            'vmt': self._dual_alpha_light(statuses.get(VOLATILITY_MANAGED_TREND_STRATEGY), 'VMT Trend'),
             'crowding_unwind': crowding_light,
             'lxr': lxr_light,
             'agreement_state': agreement_state,
@@ -2184,7 +2445,7 @@ class SignalAlphaMixin:
                 f"QUAD_ALPHA waiting ({agreement_state}): "
                 f"UT={reasons.get(ENTRY_STRATEGY_UT_BREAKOUT)}; "
                 f"RSPT={reasons.get(ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND)}; "
-                f"QH={reasons.get(QH_FLOW_STRATEGY)}; "
+                f"VMT={reasons.get(VOLATILITY_MANAGED_TREND_STRATEGY)}; "
                 f"CROWD={reasons.get(CROWDING_UNWIND_STRATEGY)}; "
                 f"LXR={reasons.get(LXR_STRATEGY)}"
             )
@@ -2235,7 +2496,7 @@ class SignalAlphaMixin:
                 'agreement_risk_multiplier': 0.0,
                 'utbreak': _empty_light(ENTRY_STRATEGY_UT_BREAKOUT),
                 'rspt': _empty_light(ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND),
-                'qh_flow': _empty_light(QH_FLOW_STRATEGY),
+                'vmt': _empty_light(VOLATILITY_MANAGED_TREND_STRATEGY),
                 'crowding_unwind': _empty_light(CROWDING_UNWIND_STRATEGY),
                 'lxr': _empty_light(LXR_STRATEGY),
             }
@@ -2286,7 +2547,7 @@ class SignalAlphaMixin:
         strategy_rows = (
             ('utbreak', 'UTBreak'),
             ('rspt', 'RSPT-v3'),
-            ('qh_flow', 'QH-Flow v2'),
+            ('vmt', 'VMT Trend'),
             ('crowding_unwind', 'Crowding Unwind'),
             ('lxr', 'LXR Reversal'),
         )

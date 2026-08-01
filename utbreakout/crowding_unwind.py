@@ -38,6 +38,7 @@ def default_crowding_unwind_config() -> dict[str, Any]:
         "take_profit_r_multiple": 2.25,
         "time_stop_bars": 24,
         "l2_direction_required": True,
+        "entry_chase_max_atr": 0.50,
     }
 
 

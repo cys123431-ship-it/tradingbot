@@ -409,6 +409,35 @@ class TradingConfig:
             quad_cfg['lxr_migration_v1_complete'] = True
             changed = True
 
+        if not bool(quad_cfg.get('vmt_migration_v1_complete', False)):
+            migrated_selection = normalize_quad_alpha_enabled_strategies(
+                quad_cfg.get('quad_alpha_enabled_strategies')
+            )
+            if VOLATILITY_MANAGED_TREND_STRATEGY not in migrated_selection:
+                migrated_selection.append(VOLATILITY_MANAGED_TREND_STRATEGY)
+            quad_cfg['quad_alpha_enabled_strategies'] = [
+                key for key in QUAD_ALPHA_BRANCH_ORDER if key in set(migrated_selection)
+            ]
+            vmt_cfg = default_volatility_managed_trend_config()
+            if isinstance(quad_cfg.get('volatility_managed_trend'), dict):
+                vmt_cfg.update(quad_cfg.get('volatility_managed_trend'))
+            vmt_cfg['enabled'] = True
+            vmt_cfg['live_enabled'] = True
+            quad_cfg['volatility_managed_trend'] = vmt_cfg
+            quad_cfg['volatility_managed_trend_live_enabled'] = True
+            # QH remains available only as a shared L2 utility; it can no
+            # longer gate or originate entries.
+            quad_cfg['qh_flow_live_enabled'] = False
+            quad_cfg['qh_flow_confirmation_enabled'] = False
+            if isinstance(quad_cfg.get('qh_flow'), dict):
+                quad_cfg['qh_flow']['qh_flow_enabled'] = False
+                quad_cfg['qh_flow']['qh_flow_live_enabled'] = False
+                quad_cfg['qh_flow']['qh_confirmation_enabled'] = False
+            if str(strategy_params.get('active_strategy') or '').lower() == QH_FLOW_STRATEGY:
+                strategy_params['active_strategy'] = VOLATILITY_MANAGED_TREND_STRATEGY
+            quad_cfg['vmt_migration_v1_complete'] = True
+            changed = True
+
         active_strategy = str(strategy_params.get('active_strategy', 'utbot')).lower()
         if active_strategy not in CORE_STRATEGIES:
             strategy_params['active_strategy'] = 'utbot'
@@ -426,7 +455,8 @@ class TradingConfig:
                 'relative_strength_pullback_trend_live_enabled': live_flags[
                     ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
                 ],
-                'qh_flow_live_enabled': live_flags[QH_FLOW_STRATEGY],
+                'volatility_managed_trend_live_enabled': live_flags[VOLATILITY_MANAGED_TREND_STRATEGY],
+                'qh_flow_live_enabled': False,
                 'crowding_unwind_live_enabled': live_flags[CROWDING_UNWIND_STRATEGY],
                 'liquidation_exhaustion_reversal_live_enabled': live_flags[LXR_STRATEGY],
             }
@@ -440,9 +470,14 @@ class TradingConfig:
                         ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
                     ],
                 },
+                'volatility_managed_trend': {
+                    'enabled': live_flags[VOLATILITY_MANAGED_TREND_STRATEGY],
+                    'live_enabled': live_flags[VOLATILITY_MANAGED_TREND_STRATEGY],
+                },
                 'qh_flow': {
-                    'qh_flow_enabled': live_flags[QH_FLOW_STRATEGY],
-                    'qh_flow_live_enabled': live_flags[QH_FLOW_STRATEGY],
+                    'qh_flow_enabled': False,
+                    'qh_flow_live_enabled': False,
+                    'qh_confirmation_enabled': False,
                 },
                 'crowding_unwind': {
                     'enabled': live_flags[CROWDING_UNWIND_STRATEGY],

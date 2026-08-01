@@ -44,6 +44,7 @@ def default_liquidation_exhaustion_reversal_config() -> dict[str, Any]:
         "stop_atr_multiplier": 1.10,
         "take_profit_r_multiple": 2.60,
         "time_stop_bars": 8,
+        "entry_chase_max_atr": 0.50,
     }
 
 

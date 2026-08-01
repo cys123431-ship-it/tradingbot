@@ -301,6 +301,11 @@ from utbreakout.liquidation_exhaustion_reversal import (
     default_liquidation_exhaustion_reversal_config,
     evaluate_liquidation_exhaustion_reversal,
 )
+from utbreakout.volatility_managed_trend import (
+    VOLATILITY_MANAGED_TREND_STRATEGY,
+    default_volatility_managed_trend_config,
+    evaluate_volatility_managed_trend,
+)
 from utbreakout.strategy_allocator import (
     default_strategy_allocator_config,
     evaluate_strategy_allocation,
@@ -402,6 +407,9 @@ UTBREAKOUT_CALLBACK_ACTIONS = UTBREAKOUT_VISIBLE_CALLBACK_ACTIONS | frozenset({
     "dual",
     "dualt",
     "dual_status",
+    "vmt",
+    "vmttrend",
+    "vmt_status",
     "qh",
     "qhflow",
     "qh_status",

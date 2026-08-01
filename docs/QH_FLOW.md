@@ -1,22 +1,28 @@
-# QH-Flow, L2 Gate and Triple
+# VMT, Shared L2 Gate and Triple
 
-## QH-Flow
+## QH retirement
 
-`qh_flow_v1` evaluates Binance USDT perpetual markets at each quarter-hour boundary.
-It fetches aggregate trades for the first 10 seconds of the current boundary and
-compares them with the same 10-second window from the previous eight boundaries.
-No persistent collector or historical database is required.
+`qh_flow_v1` no longer originates live entries and no longer confirms, reduces,
+or blocks UTBreak/RSPT entries. Persisted QH selections and old Telegram `qh`
+callbacks are migrated to `volatility_managed_trend_v1`. The QH module remains
+only because its tested order-book helpers implement the shared L2 safety gate.
+
+## Volatility-Managed Trend (VMT)
+
+`volatility_managed_trend_v1` evaluates completed Binance USDT perpetual 1h
+candles. It combines 8h, 24h and 72h time-series momentum after normalizing each
+horizon by realized volatility.
 
 The live decision requires:
 
-- sufficient Taker notional and trade count;
-- directional Taker imbalance;
-- imbalance z-score above the configured threshold;
-- abnormal notional and trade-count ratios;
-- price retention in the same direction;
-- a non-stressed L2 order book;
-- no severe funding, basis, or long/short crowding.
+- at least two same-direction horizons and no opposite slow-horizon vote;
+- aligned 12/36 EMA trend and slope;
+- sufficient path efficiency and volume participation;
+- no short-term volatility shock or excessive EMA extension;
+- a non-stressed shared L2 order book;
+- a fresh live price that has not chased more than 0.5 ATR beyond the signal.
 
+Risk is volatility scaled and capped at 60 percent for a standalone VMT signal.
 Accepted entries use the existing risk plan, margin cap, single-position guard,
 order gateway, TP/SL protection, reconciliation and Telegram reporting paths.
 
@@ -28,20 +34,12 @@ The shared L2 gate evaluates the top 20 bid and ask levels.
 - `MIXED`: reduced risk, default 65 percent.
 - `STRESSED`: new entries blocked.
 
-The gate is applied to UTBreak, RSPT-v2 and QH-Flow. Dual inherits it through its
-two branches. Triple inherits it through all three independent branches.
-
-## QH confirmation for UTBreak and RSPT-v2
-
-When a UTBreak or RSPT entry appears within three minutes before a quarter-hour
-boundary, the entry waits for the first 10-second QH window. A same-direction QH
-signal confirms normal risk, an opposite signal blocks the entry, and no accepted
-QH signal reduces risk to 60 percent. Outside the confirmation window the original
-strategy proceeds normally.
+The gate is applied independently to UTBreak, RSPT-v3, VMT, Crowding and LXR.
+Aggregate strategies inherit it through every active branch.
 
 ## Triple
 
-`triple_alpha_v1` evaluates UTBreak, RSPT-v2 and QH-Flow independently.
+`triple_alpha_v1` evaluates UTBreak, RSPT-v3 and VMT independently.
 
 - three same-direction signals: 100 percent risk;
 - two same-direction signals: 85 percent risk;
@@ -54,9 +52,9 @@ scales quantity, notional, margin and risk fields.
 ## Telegram
 
 ```text
-/utbreak qh on
-/utbreak qh off
-/utbreak qh status
+/utbreak vmt on
+/utbreak vmt off
+/utbreak vmt status
 /utbreak triple on
 /utbreak triple off
 /utbreak triple status

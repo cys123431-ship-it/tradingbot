@@ -620,12 +620,15 @@ def test_trading_config_syncs_quad_live_flags_to_selected_branches(tmp_path):
     assert ut["quad_alpha_enabled_strategies"] == [
         emas.ENTRY_STRATEGY_UT_BREAKOUT,
         emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
-        emas.QH_FLOW_STRATEGY,
+        emas.VOLATILITY_MANAGED_TREND_STRATEGY,
         emas.CROWDING_UNWIND_STRATEGY,
         emas.LXR_STRATEGY,
     ]
     assert ut["relative_strength_pullback_trend_live_enabled"] is True
-    assert ut["qh_flow_live_enabled"] is True
+    assert ut["volatility_managed_trend_live_enabled"] is True
+    assert ut["volatility_managed_trend"]["live_enabled"] is True
+    assert ut["qh_flow_live_enabled"] is False
+    assert ut["qh_flow_confirmation_enabled"] is False
     assert ut["crowding_unwind_live_enabled"] is True
     assert ut["liquidation_exhaustion_reversal_live_enabled"] is True
     assert ut["liquidation_exhaustion_reversal"]["enabled"] is True
@@ -655,10 +658,12 @@ def test_lxr_first_migration_enables_once_but_preserves_later_user_off(tmp_path)
     first_ut = first.config["signal_engine"]["strategy_params"]["UTBotFilteredBreakoutV1"]
     assert first_ut["quad_alpha_enabled_strategies"] == [
         emas.ENTRY_STRATEGY_UT_BREAKOUT,
+        emas.VOLATILITY_MANAGED_TREND_STRATEGY,
         emas.LXR_STRATEGY,
     ]
     assert first_ut["liquidation_exhaustion_reversal_live_enabled"] is True
     assert first_ut["lxr_migration_v1_complete"] is True
+    assert first_ut["vmt_migration_v1_complete"] is True
 
     first_ut["quad_alpha_enabled_strategies"] = [emas.ENTRY_STRATEGY_UT_BREAKOUT]
     first_ut["liquidation_exhaustion_reversal_live_enabled"] = False

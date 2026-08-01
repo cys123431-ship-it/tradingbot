@@ -442,7 +442,7 @@ class TelegramSetupMixin:
                     engine.start()
             return (
                 "RSPT-v2 ON. BTC/ETH residual strength, independent LONG/SHORT direction, "
-                "prior impulse + pullback + reclaim, shared L2 gate and QH confirmation are enabled."
+                "prior impulse + pullback + reclaim and the shared L2 safety gate are enabled."
             )
 
         async def _deactivate_relative_strength_pullback_strategy():
@@ -548,18 +548,20 @@ class TelegramSetupMixin:
                 engine.dual_alpha_last_status = {}
             return f"DUAL Alpha OFF. {notice}"
 
-        async def _activate_qh_flow_strategy():
+        async def _activate_volatility_managed_trend_strategy():
             await _ensure_signal_engine_active()
             self.is_paused = False
             current = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
-            qh_cfg = default_qh_flow_config()
-            if isinstance(current, dict) and isinstance(current.get('qh_flow'), dict):
-                qh_cfg.update(current.get('qh_flow'))
-            qh_cfg['qh_flow_enabled'] = True
-            qh_cfg['qh_flow_live_enabled'] = True
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], QH_FLOW_STRATEGY)
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow'], qh_cfg)
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow_live_enabled'], True)
+            vmt_cfg = default_volatility_managed_trend_config()
+            if isinstance(current, dict) and isinstance(current.get('volatility_managed_trend'), dict):
+                vmt_cfg.update(current.get('volatility_managed_trend'))
+            vmt_cfg['enabled'] = True
+            vmt_cfg['live_enabled'] = True
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], VOLATILITY_MANAGED_TREND_STRATEGY)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'volatility_managed_trend'], vmt_cfg)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'volatility_managed_trend_live_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow_live_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow_confirmation_enabled'], False)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'l2_gate_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend_live_enabled'], False)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], False)
@@ -571,21 +573,19 @@ class TelegramSetupMixin:
             await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
             engine = self._reset_signal_engine_runtime_state(reset_entry_cache=True, reset_exit_cache=True, reset_stateful_strategy=True)
             if engine:
-                engine.qh_flow_signal_cache = {}
-                engine.qh_flow_last_status = {}
+                engine.volatility_managed_trend_last_status = {}
                 engine.l2_gate_cache = {}
                 if not engine.running:
                     engine.start()
-            return 'QH-Flow ON. Quarter-hour first-10-second taker flow, L2 gate, funding/basis crowding and live order path are enabled.'
+            return 'VMT Trend ON. Completed 1h multi-horizon trend, volatility targeting, anti-chase and the shared live protection path are enabled.'
 
-        async def _deactivate_qh_flow_strategy():
+        async def _deactivate_volatility_managed_trend_strategy():
             notice = await _activate_utbreak_strategy()
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow_live_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'volatility_managed_trend_live_enabled'], False)
             engine = self.engines.get('signal')
             if engine:
-                engine.qh_flow_signal_cache = {}
-                engine.qh_flow_last_status = {}
-            return f'QH-Flow OFF. {notice}'
+                engine.volatility_managed_trend_last_status = {}
+            return f'VMT Trend OFF. {notice}'
 
         async def _activate_triple_alpha_strategy():
             await _ensure_signal_engine_active()
@@ -601,15 +601,17 @@ class TelegramSetupMixin:
                 'direction_source': 'RSPT-v3 BTC/ETH/alt/vol residual strength',
                 'forced_direction': None,
             })
-            qh_cfg = default_qh_flow_config()
-            qh_cfg['qh_flow_enabled'] = True
-            qh_cfg['qh_flow_live_enabled'] = True
+            vmt_cfg = default_volatility_managed_trend_config()
+            vmt_cfg['enabled'] = True
+            vmt_cfg['live_enabled'] = True
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], TRIPLE_ALPHA_STRATEGY)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'entry_strategy'], ENTRY_STRATEGY_UT_BREAKOUT)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend'], rsp_cfg)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend_live_enabled'], True)
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow'], qh_cfg)
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow_live_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'volatility_managed_trend'], vmt_cfg)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'volatility_managed_trend_live_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow_live_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow_confirmation_enabled'], False)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'l2_gate_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'], True)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'], 'auto')
@@ -622,20 +624,19 @@ class TelegramSetupMixin:
             await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
             engine = self._reset_signal_engine_runtime_state(reset_entry_cache=True, reset_exit_cache=True, reset_stateful_strategy=True)
             if engine:
-                engine.qh_flow_signal_cache = {}
-                engine.qh_flow_last_status = {}
+                engine.volatility_managed_trend_last_status = {}
                 engine.triple_alpha_last_status = {}
                 engine.relative_strength_pullback_eval_cache = {}
                 if not engine.running:
                     engine.start()
-            return 'TRIPLE Alpha ON. UTBreak + RSPT-v3 + QH-Flow v2 are evaluated independently; conflicts block and 1/2/3 confirmations scale risk.'
+            return 'TRIPLE Alpha ON. UTBreak + RSPT-v3 + VMT Trend are evaluated independently; conflicts block and 1/2/3 confirmations scale risk.'
 
         async def _deactivate_triple_alpha_strategy():
             notice = await _activate_utbreak_strategy()
             engine = self.engines.get('signal')
             if engine:
                 engine.triple_alpha_last_status = {}
-                engine.qh_flow_signal_cache = {}
+                engine.volatility_managed_trend_last_status = {}
             return f'TRIPLE Alpha OFF. {notice}'
 
         async def _activate_liquidation_exhaustion_reversal_strategy():
@@ -721,11 +722,11 @@ class TelegramSetupMixin:
                 'direction_source': 'RSPT-v3 BTC/ETH/alt/vol residual strength',
                 'forced_direction': None,
             })
-            qh_cfg = default_qh_flow_config()
-            if isinstance(current, dict) and isinstance(current.get('qh_flow'), dict):
-                qh_cfg.update(current.get('qh_flow'))
-            qh_cfg['qh_flow_enabled'] = branch_live[QH_FLOW_STRATEGY]
-            qh_cfg['qh_flow_live_enabled'] = branch_live[QH_FLOW_STRATEGY]
+            vmt_cfg = default_volatility_managed_trend_config()
+            if isinstance(current, dict) and isinstance(current.get('volatility_managed_trend'), dict):
+                vmt_cfg.update(current.get('volatility_managed_trend'))
+            vmt_cfg['enabled'] = branch_live[VOLATILITY_MANAGED_TREND_STRATEGY]
+            vmt_cfg['live_enabled'] = branch_live[VOLATILITY_MANAGED_TREND_STRATEGY]
             crowd_cfg = default_crowding_unwind_config()
             if isinstance(current, dict) and isinstance(current.get('crowding_unwind'), dict):
                 crowd_cfg.update(current.get('crowding_unwind'))
@@ -747,11 +748,13 @@ class TelegramSetupMixin:
                 ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'relative_strength_pullback_trend_live_enabled'],
                 branch_live[ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND],
             )
-            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow'], qh_cfg)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'volatility_managed_trend'], vmt_cfg)
             await self.cfg.update_value(
-                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow_live_enabled'],
-                branch_live[QH_FLOW_STRATEGY],
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'volatility_managed_trend_live_enabled'],
+                branch_live[VOLATILITY_MANAGED_TREND_STRATEGY],
             )
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow_live_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'qh_flow_confirmation_enabled'], False)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'crowding_unwind'], crowd_cfg)
             await self.cfg.update_value(
                 ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'crowding_unwind_live_enabled'],
@@ -778,8 +781,7 @@ class TelegramSetupMixin:
                 reset_stateful_strategy=False,
             )
             if engine:
-                engine.qh_flow_signal_cache = {}
-                engine.qh_flow_last_status = {}
+                engine.volatility_managed_trend_last_status = {}
                 engine.crowding_unwind_last_status = {}
                 engine.liquidation_exhaustion_reversal_last_status = {}
                 engine.quad_alpha_last_status = {}
@@ -814,6 +816,7 @@ class TelegramSetupMixin:
             notice = await _stop_utbreak_trading()
             for key in (
                 'relative_strength_pullback_trend_live_enabled',
+                'volatility_managed_trend_live_enabled',
                 'qh_flow_live_enabled',
                 'crowding_unwind_live_enabled',
                 'liquidation_exhaustion_reversal_live_enabled',
@@ -825,7 +828,7 @@ class TelegramSetupMixin:
             engine = self.engines.get('signal')
             if engine:
                 engine.quad_alpha_last_status = {}
-                engine.qh_flow_signal_cache = {}
+                engine.volatility_managed_trend_last_status = {}
                 engine.crowding_unwind_last_status = {}
                 engine.liquidation_exhaustion_reversal_last_status = {}
             return f'5-Strategy Alpha ALL OFF. {notice}'
@@ -1260,8 +1263,8 @@ UTBot:
             active_label = "ON" if active_strategy in UTBREAKOUT_STRATEGIES else f"OFF ({active_strategy.upper()})"
             if active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY:
                 active_label = "ON (ADAPTIVE TF)"
-            elif active_strategy == QH_FLOW_STRATEGY:
-                active_label = "ON (QH FLOW V2)"
+            elif active_strategy == VOLATILITY_MANAGED_TREND_STRATEGY:
+                active_label = "ON (VMT TREND)"
             elif active_strategy == CROWDING_UNWIND_STRATEGY:
                 active_label = "ON (CROWDING UNWIND)"
             elif active_strategy == DUAL_ALPHA_STRATEGY:
@@ -1287,8 +1290,8 @@ UTBot:
                 if active_strategy == TRIPLE_ALPHA_STRATEGY
                 else 'UTBreak 전략 메뉴 (Crowding Unwind)'
                 if active_strategy == CROWDING_UNWIND_STRATEGY
-                else 'UTBreak 전략 메뉴 (QH-Flow v2)'
-                if active_strategy == QH_FLOW_STRATEGY
+                else 'UTBreak 전략 메뉴 (VMT Trend)'
+                if active_strategy == VOLATILITY_MANAGED_TREND_STRATEGY
                 else 'UTBreak 전략 메뉴 (Dual Alpha)'
                 if active_strategy == DUAL_ALPHA_STRATEGY
                 else 'UTBreak 전략 메뉴 (Adaptive TF)'
@@ -1974,38 +1977,38 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 except Exception:
                     logger.debug("DUAL Alpha callback failure alert failed", exc_info=True)
 
-        async def _get_qh_flow_status_text():
+        async def _get_volatility_managed_trend_status_text():
             engine = self.engines.get('signal')
             if not engine:
-                return "QH-Flow status\n\nSignal engine not found."
+                return "VMT Trend status\n\nSignal engine not found."
             symbol = await _get_utbreakout_status_symbol_async()
-            return await engine.build_qh_flow_status_text(symbol)
+            return await engine.build_volatility_managed_trend_status_text(symbol)
 
-        async def _send_qh_flow_status(message):
+        async def _send_volatility_managed_trend_status(message):
             if message is None:
                 return False
             try:
-                text = await _get_qh_flow_status_text()
+                text = await _get_volatility_managed_trend_status_text()
                 await self._reply_long_text_with_document(
                     message,
                     text,
                     reply_markup=_build_utbreakout_keyboard(),
-                    filename='qh_flow_status.txt',
-                    caption='QH-Flow status',
-                    preview_suffix='QH-Flow status was sent as a file.',
+                    filename='vmt_trend_status.txt',
+                    caption='VMT Trend status',
+                    preview_suffix='VMT Trend status was sent as a file.',
                 )
                 return True
             except Exception as exc:
-                logger.exception('QH-Flow status send failed')
+                logger.exception('VMT Trend status send failed')
                 await message.reply_text(
-                    f"QH-Flow status failed: {type(exc).__name__}: {exc}",
+                    f"VMT Trend status failed: {type(exc).__name__}: {exc}",
                     reply_markup=_build_utbreakout_keyboard(),
                 )
                 return False
 
-        async def _send_qh_flow_status_from_callback(query):
-            await _show_utbreakout_callback_progress(query, 'QH-Flow status 조회 중입니다.')
-            await _send_qh_flow_status(getattr(query, 'message', None))
+        async def _send_volatility_managed_trend_status_from_callback(query):
+            await _show_utbreakout_callback_progress(query, 'VMT Trend status 조회 중입니다.')
+            await _send_volatility_managed_trend_status(getattr(query, 'message', None))
 
         async def _get_triple_alpha_status_text():
             engine = self.engines.get('signal')
@@ -2732,24 +2735,24 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                         parse_mode=ParseMode.MARKDOWN,
                     )
                     return
-            elif action in {'qh', 'qhflow', 'qh_flow'}:
+            elif action in {'vmt', 'vmttrend', 'volatility_managed_trend', 'qh', 'qhflow', 'qh_flow'}:
                 mode = str(args[1]).strip().lower() if len(args) > 1 else 'status'
                 if mode in {'on', 'enable', 'start', 'live'}:
                     await u.message.reply_text(
-                        await _activate_qh_flow_strategy(),
+                        await _activate_volatility_managed_trend_strategy(),
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=_build_utbreakout_keyboard(),
                     )
                 elif mode in {'off', 'disable', 'stop'}:
                     await u.message.reply_text(
-                        await _deactivate_qh_flow_strategy(),
+                        await _deactivate_volatility_managed_trend_strategy(),
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=_build_utbreakout_keyboard(),
                     )
                 elif mode in {'status', 'stat', 'menu', ''}:
-                    await _send_qh_flow_status(u.message)
+                    await _send_volatility_managed_trend_status(u.message)
                 else:
-                    await u.message.reply_text('Usage: `/utbreak qh on`, `/utbreak qh off`, `/utbreak qh status`', parse_mode=ParseMode.MARKDOWN)
+                    await u.message.reply_text('Usage: `/utbreak vmt on`, `/utbreak vmt off`, `/utbreak vmt status`', parse_mode=ParseMode.MARKDOWN)
                     return
             elif action in {'triple', 'triplealpha', 'triple_alpha'}:
                 mode = str(args[1]).strip().lower() if len(args) > 1 else 'status'
@@ -3358,20 +3361,20 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     await _send_liquidation_exhaustion_reversal_status_from_callback(query)
                 return
 
-            if action in {'qh', 'qhflow'}:
+            if action in {'vmt', 'vmttrend', 'qh', 'qhflow'}:
                 mode = str(value or '').lower()
                 if mode in {'on', 'enable', '1', 'true', 'live'}:
                     await _edit_utbreakout_menu(
                         query,
-                        await _set_quad_alpha_branch_enabled(QH_FLOW_STRATEGY, True),
+                        await _set_quad_alpha_branch_enabled(VOLATILITY_MANAGED_TREND_STRATEGY, True),
                     )
                 elif mode in {'off', 'disable', '0', 'false', 'stop'}:
                     await _edit_utbreakout_menu(
                         query,
-                        await _set_quad_alpha_branch_enabled(QH_FLOW_STRATEGY, False),
+                        await _set_quad_alpha_branch_enabled(VOLATILITY_MANAGED_TREND_STRATEGY, False),
                     )
                 else:
-                    await _send_qh_flow_status_from_callback(query)
+                    await _send_volatility_managed_trend_status_from_callback(query)
                 return
 
             if action in {'triple', 'triplet'}:
@@ -3408,8 +3411,8 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 await _send_relative_strength_pullback_status_from_callback(query)
                 return
 
-            if action == 'qh_status':
-                await _send_qh_flow_status_from_callback(query)
+            if action in {'vmt_status', 'qh_status'}:
+                await _send_volatility_managed_trend_status_from_callback(query)
                 return
 
             if action == 'crowding_status':

@@ -5,6 +5,7 @@ import pytest
 
 from utbreakout.crowding_unwind import CrowdingUnwindDecision
 from utbreakout.liquidation_exhaustion_reversal import LiquidationExhaustionDecision
+from utbreakout.volatility_managed_trend import VolatilityManagedTrendDecision
 
 
 def _emas_module():
@@ -18,12 +19,13 @@ def _async_value(value):
     return _call
 
 
-def test_qh_and_triple_are_selectable_live_strategies():
+def test_vmt_and_triple_are_selectable_live_strategies():
     emas = _emas_module()
-    assert emas.QH_FLOW_STRATEGY in emas.UTBREAKOUT_STRATEGIES
+    assert emas.VOLATILITY_MANAGED_TREND_STRATEGY in emas.UTBREAKOUT_STRATEGIES
+    assert emas.QH_FLOW_STRATEGY not in emas.UTBREAKOUT_STRATEGIES
     assert emas.TRIPLE_ALPHA_STRATEGY in emas.UTBREAKOUT_STRATEGIES
     assert emas.QUAD_ALPHA_STRATEGY in emas.UTBREAKOUT_STRATEGIES
-    assert emas.STRATEGY_DISPLAY_NAMES[emas.QH_FLOW_STRATEGY] == "QH_FLOW"
+    assert emas.STRATEGY_DISPLAY_NAMES[emas.VOLATILITY_MANAGED_TREND_STRATEGY] == "VOLATILITY_MANAGED_TREND"
     assert emas.STRATEGY_DISPLAY_NAMES[emas.TRIPLE_ALPHA_STRATEGY] == "TRIPLE_ALPHA"
     assert emas.STRATEGY_DISPLAY_NAMES[emas.QUAD_ALPHA_STRATEGY] == "QUAD_ALPHA"
 
@@ -44,13 +46,13 @@ def test_triple_branch_params_keep_three_engines_independent():
         params,
         emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
     )
-    qh = engine._triple_alpha_strategy_params(params, emas.QH_FLOW_STRATEGY)
+    vmt = engine._triple_alpha_strategy_params(params, emas.VOLATILITY_MANAGED_TREND_STRATEGY)
 
     assert ut["UTBotFilteredBreakoutV1"]["qh_flow_confirmation_enabled"] is False
     assert rsp["UTBotFilteredBreakoutV1"]["qh_flow_confirmation_enabled"] is False
     assert rsp["active_strategy"] == emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
-    assert qh["active_strategy"] == emas.QH_FLOW_STRATEGY
-    assert qh["UTBotFilteredBreakoutV1"]["qh_flow"]["qh_flow_live_enabled"] is True
+    assert vmt["active_strategy"] == emas.VOLATILITY_MANAGED_TREND_STRATEGY
+    assert vmt["UTBotFilteredBreakoutV1"]["volatility_managed_trend"]["live_enabled"] is True
 
 
 def test_l2_gate_fails_open_only_when_runtime_fetcher_does_not_exist():
@@ -68,7 +70,7 @@ def test_l2_gate_fails_open_only_when_runtime_fetcher_does_not_exist():
     assert result["risk_multiplier"] == 1.0
 
 
-def test_qh_confirmation_can_be_disabled_for_independent_triple_branches():
+def test_retired_qh_confirmation_is_always_neutral_for_live_branches():
     emas = _emas_module()
     engine = object.__new__(emas.SignalEngine)
     result = asyncio.run(
@@ -78,7 +80,7 @@ def test_qh_confirmation_can_be_disabled_for_independent_triple_branches():
             {"qh_flow": {"qh_confirmation_enabled": False}},
         )
     )
-    assert result["state"] == "disabled"
+    assert result["state"] == "retired"
     assert result["allowed"] is True
     assert result["risk_multiplier"] == 1.0
 
@@ -104,12 +106,12 @@ def test_triple_plan_scaling_preserves_prices_and_scales_risk_fields():
     assert scaled["take_profit"] == 55.0
 
 
-def test_qh_and_triple_callback_actions_are_registered():
+def test_vmt_and_triple_callback_actions_are_registered():
     emas = _emas_module()
     assert {
-        "qh",
-        "qhflow",
-        "qh_status",
+        "vmt",
+        "vmttrend",
+        "vmt_status",
         "triple",
         "triplet",
         "triple_status",
@@ -159,6 +161,9 @@ def test_lxr_live_signal_builds_structure_anchored_plan(monkeypatch):
         def fetch_ohlcv(self, symbol, timeframe, limit=220):
             assert timeframe == "15m"
             return ohlcv
+
+        def fetch_ticker(self, symbol):
+            return {"last": 100.0}
 
     class DailyStats:
         def get_daily_stats(self):
@@ -232,6 +237,92 @@ def test_lxr_live_signal_builds_structure_anchored_plan(monkeypatch):
     assert captured["hard_stop_loss"] < 96.0
     assert captured["ev_time_stop_bars"] == 8
     assert captured["second_take_profit_r_multiple"] == pytest.approx(2.6)
+
+
+def test_vmt_live_signal_builds_volatility_managed_runner_plan(monkeypatch):
+    emas = _emas_module()
+    engine = object.__new__(emas.SignalEngine)
+    now_ms = int(time.time() * 1000)
+    ohlcv = [
+        [now_ms - (130 - index) * 3_600_000, 100.0, 101.0, 99.0, 100.0, 100.0]
+        for index in range(125)
+    ]
+
+    class MarketData:
+        def fetch_ohlcv(self, symbol, timeframe, limit=240):
+            assert timeframe == "1h"
+            return ohlcv
+
+        def fetch_ticker(self, symbol):
+            return {"last": 100.2}
+
+    class DailyStats:
+        def get_daily_stats(self):
+            return 0, 0.0
+
+    decision = VolatilityManagedTrendDecision(
+        side="long",
+        allowed=True,
+        score=78.0,
+        risk_multiplier=0.50,
+        reason="VMT long confirmed",
+        metrics={
+            "atr": 1.0,
+            "reference_price": 100.0,
+            "structure_stop": 97.0,
+            "signal_candle_ts": now_ms - 3_600_000,
+            "horizon_votes": {8: "long", 24: "long", 72: "long"},
+        },
+    )
+    monkeypatch.setattr(emas, "evaluate_volatility_managed_trend", lambda *args, **kwargs: decision)
+    engine.market_data_exchange = MarketData()
+    engine.db = DailyStats()
+    engine.last_entry_reason = {}
+    engine.volatility_managed_trend_last_status = {}
+    engine._get_utbot_filtered_breakout_config = lambda params=None: {
+        "volatility_managed_trend_live_enabled": True,
+        "volatility_managed_trend": {"enabled": True, "live_enabled": True},
+        "risk_per_trade_percent": 1.0,
+        "max_risk_per_trade_percent": 1.0,
+    }
+    engine._canonical_futures_symbol = lambda symbol: "BTC/USDT:USDT"
+    engine._clear_utbot_filtered_breakout_entry_plan = lambda symbol: None
+    engine._store_utbot_filtered_breakout_status = lambda symbol, status: None
+    engine.is_upbit_mode = lambda: False
+    engine.is_trade_direction_allowed = lambda side: True
+    engine._evaluate_shared_l2_gate = _async_value({
+        "allowed": True,
+        "state": "bid_support",
+        "direction_support": "long",
+        "risk_multiplier": 0.80,
+    })
+    engine._evaluate_utbreakout_market_quality = lambda side, cfg, values: {
+        "state": True,
+        "hard_block": False,
+        "risk_multiplier": 1.0,
+        "summary": "PASS",
+    }
+    engine.get_balance_info = _async_value((100.0, 100.0, 0.0))
+    engine.get_runtime_common_settings = lambda: {"leverage": 5}
+    captured = {}
+    engine._set_utbot_filtered_breakout_entry_plan = lambda symbol, plan: captured.update(plan)
+
+    side, reason, status = asyncio.run(
+        engine._calculate_volatility_managed_trend_signal(
+            "BTC/USDT:USDT",
+            None,
+            {"active_strategy": emas.VOLATILITY_MANAGED_TREND_STRATEGY},
+        )
+    )
+
+    assert side == "long"
+    assert reason.startswith("ACCEPTED_ENTRY: VMT long")
+    assert status["accepted_code"] == "ACCEPTED_ENTRY"
+    assert captured["strategy"] == emas.VOLATILITY_MANAGED_TREND_STRATEGY
+    assert captured["structure_stop"] == pytest.approx(97.0)
+    assert captured["runner_pct"] == pytest.approx(0.35)
+    assert captured["second_take_profit_r_multiple"] == pytest.approx(3.0)
+    assert captured["ev_time_stop_bars"] == 96
 
 
 def test_crowding_signal_cannot_bypass_daily_loss_limit(monkeypatch):
@@ -388,7 +479,7 @@ def test_quad_five_way_agreement_selects_full_risk_plan():
     plans = {
         emas.ENTRY_STRATEGY_UT_BREAKOUT: {"strategy": emas.ENTRY_STRATEGY_UT_BREAKOUT, "plan_symbol": "BTC/USDT:USDT", "qty": 1.0, "risk_usdt": 1.0},
         emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND: {"strategy": emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND, "plan_symbol": "BTC/USDT:USDT", "qty": 1.0, "risk_usdt": 1.0},
-        emas.QH_FLOW_STRATEGY: {"strategy": emas.QH_FLOW_STRATEGY, "plan_symbol": "BTC/USDT:USDT", "qty": 1.0, "risk_usdt": 1.0},
+        emas.VOLATILITY_MANAGED_TREND_STRATEGY: {"strategy": emas.VOLATILITY_MANAGED_TREND_STRATEGY, "plan_symbol": "BTC/USDT:USDT", "qty": 1.0, "risk_usdt": 1.0},
         emas.CROWDING_UNWIND_STRATEGY: {"strategy": emas.CROWDING_UNWIND_STRATEGY, "plan_symbol": "BTC/USDT:USDT", "qty": 1.0, "risk_usdt": 1.0},
         emas.LXR_STRATEGY: {"strategy": emas.LXR_STRATEGY, "plan_symbol": "BTC/USDT:USDT", "qty": 1.0, "risk_usdt": 1.0},
     }
@@ -404,7 +495,7 @@ def test_quad_five_way_agreement_selects_full_risk_plan():
     engine._dual_alpha_score = lambda key, side, status, plan: {
         emas.ENTRY_STRATEGY_UT_BREAKOUT: 90,
         emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND: 80,
-        emas.QH_FLOW_STRATEGY: 70,
+        emas.VOLATILITY_MANAGED_TREND_STRATEGY: 70,
         emas.CROWDING_UNWIND_STRATEGY: 60,
         emas.LXR_STRATEGY: 50,
     }[key]
@@ -429,9 +520,9 @@ def test_quad_five_way_agreement_selects_full_risk_plan():
         current["key"] = emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
         return "long", "rsp long", {"accepted_side": "long", "reason": "rsp long"}
 
-    async def qh(*args, **kwargs):
-        current["key"] = emas.QH_FLOW_STRATEGY
-        return "long", "qh long", {"accepted_side": "long", "reason": "qh long"}
+    async def vmt(*args, **kwargs):
+        current["key"] = emas.VOLATILITY_MANAGED_TREND_STRATEGY
+        return "long", "vmt long", {"accepted_side": "long", "reason": "vmt long"}
 
     async def crowd(*args, **kwargs):
         current["key"] = emas.CROWDING_UNWIND_STRATEGY
@@ -443,7 +534,7 @@ def test_quad_five_way_agreement_selects_full_risk_plan():
 
     engine._calculate_utbot_filtered_breakout_signal = ut
     engine._calculate_relative_strength_pullback_signal = rsp
-    engine._calculate_qh_flow_signal = qh
+    engine._calculate_volatility_managed_trend_signal = vmt
     engine._calculate_crowding_unwind_signal = crowd
     engine._calculate_liquidation_exhaustion_reversal_signal = lxr
 
@@ -485,7 +576,7 @@ def test_quad_strategy_selector_supports_multi_select_and_stable_order():
     assert live_flags[emas.ENTRY_STRATEGY_UT_BREAKOUT] is True
     assert live_flags[emas.LXR_STRATEGY] is True
     assert live_flags[emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND] is False
-    assert live_flags[emas.QH_FLOW_STRATEGY] is False
+    assert live_flags[emas.VOLATILITY_MANAGED_TREND_STRATEGY] is False
     assert live_flags[emas.CROWDING_UNWIND_STRATEGY] is False
 
     keyboard = emas.build_quad_alpha_selection_keyboard(selected)
@@ -547,7 +638,7 @@ def test_quad_disabled_branches_are_not_evaluated_or_counted():
 
     engine._calculate_utbot_filtered_breakout_signal = disabled_branch_called
     engine._calculate_relative_strength_pullback_signal = disabled_branch_called
-    engine._calculate_qh_flow_signal = disabled_branch_called
+    engine._calculate_volatility_managed_trend_signal = disabled_branch_called
     engine._calculate_crowding_unwind_signal = disabled_branch_called
     engine._calculate_liquidation_exhaustion_reversal_signal = lxr
 
@@ -567,7 +658,7 @@ def test_quad_disabled_branches_are_not_evaluated_or_counted():
     assert summary["agreement_risk_multiplier"] == pytest.approx(0.45)
     assert summary["utbreak"]["light"] == "off"
     assert summary["rspt"]["light"] == "off"
-    assert summary["qh_flow"]["light"] == "off"
+    assert summary["vmt"]["light"] == "off"
     assert summary["crowding_unwind"]["light"] == "off"
     assert summary["lxr"]["light"] == "green"
     assert selected_plans[-1]["qty"] == pytest.approx(0.9)
@@ -630,7 +721,7 @@ def test_quad_accepts_lxr_as_the_only_signal_at_single_signal_risk():
 
     engine._calculate_utbot_filtered_breakout_signal = waiting
     engine._calculate_relative_strength_pullback_signal = waiting
-    engine._calculate_qh_flow_signal = waiting
+    engine._calculate_volatility_managed_trend_signal = waiting
     engine._calculate_crowding_unwind_signal = waiting
     engine._calculate_liquidation_exhaustion_reversal_signal = lxr
 
@@ -692,7 +783,7 @@ def test_quad_keeps_valid_branch_when_another_branch_crashes():
     async def waiting(*args, **kwargs):
         return None, "waiting", {"stage": "waiting", "reason": "waiting"}
 
-    async def broken_qh(*args, **kwargs):
+    async def broken_vmt(*args, **kwargs):
         raise RuntimeError("temporary data failure")
 
     async def lxr(*args, **kwargs):
@@ -705,7 +796,7 @@ def test_quad_keeps_valid_branch_when_another_branch_crashes():
 
     engine._calculate_utbot_filtered_breakout_signal = waiting
     engine._calculate_relative_strength_pullback_signal = waiting
-    engine._calculate_qh_flow_signal = broken_qh
+    engine._calculate_volatility_managed_trend_signal = broken_vmt
     engine._calculate_crowding_unwind_signal = waiting
     engine._calculate_liquidation_exhaustion_reversal_signal = lxr
 
@@ -720,7 +811,7 @@ def test_quad_keeps_valid_branch_when_another_branch_crashes():
     assert side == "long"
     assert status["quad_alpha"]["confirmation_count"] == 1
     assert status["quad_alpha"]["agreement_state"] == "single"
-    assert "QH-Flow v2 unavailable: RuntimeError" in status["quad_alpha"]["qh_flow"]["reason"]
+    assert "VMT Trend unavailable: RuntimeError" in status["quad_alpha"]["vmt"]["reason"]
     assert selected_plans[-1]["strategy"] == emas.LXR_STRATEGY
     assert selected_plans[-1]["qty"] == pytest.approx(0.9)
 
@@ -751,10 +842,10 @@ def test_quad_status_text_shows_five_traffic_lights_and_details():
                     "side": None,
                     "reason": "trend_filter_failed",
                 },
-                "qh_flow": {
+                "vmt": {
                     "light": "yellow",
                     "side": None,
-                    "reason": "QH signal window expired",
+                    "reason": "multi_horizon_trend_not_aligned",
                 },
                 "crowding_unwind": {
                     "light": "yellow",
@@ -775,7 +866,7 @@ def test_quad_status_text_shows_five_traffic_lights_and_details():
     assert "🚦 전략 신호등" in text
     assert "UTBreak" in text and "🔴 SHORT 후보 거절" in text
     assert "RSPT-v3" in text and "🟡 조건 대기" in text
-    assert "QH-Flow v2" in text
+    assert "VMT Trend" in text
     assert "Crowding Unwind" in text
     assert "LXR" in text
     assert "🟢 유효 신호: 0/5" in text
@@ -801,7 +892,7 @@ def test_quad_status_distinguishes_crowding_data_missing_from_not_extreme():
                 "selected_side": None,
                 "utbreak": {"light": "yellow", "side": None, "reason": "waiting"},
                 "rspt": {"light": "yellow", "side": None, "reason": "waiting"},
-                "qh_flow": {"light": "yellow", "side": None, "reason": "waiting"},
+                "vmt": {"light": "yellow", "side": None, "reason": "waiting"},
                 "crowding_unwind": {
                     "light": "yellow",
                     "side": None,

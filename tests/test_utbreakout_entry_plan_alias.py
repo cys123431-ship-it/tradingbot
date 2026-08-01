@@ -41,7 +41,7 @@ def test_all_five_strategy_modes_use_stateful_position_reconciliation():
     expected = {
         emas.UTBOT_FILTERED_BREAKOUT_STRATEGY,
         emas.ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND,
-        emas.QH_FLOW_STRATEGY,
+        emas.VOLATILITY_MANAGED_TREND_STRATEGY,
         emas.CROWDING_UNWIND_STRATEGY,
         emas.LXR_STRATEGY,
         emas.QUAD_ALPHA_STRATEGY,

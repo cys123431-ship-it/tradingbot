@@ -1,7 +1,7 @@
 # Trading Bot
 
 바이낸스 USDT 무기한 선물을 중심으로 동작하는 Python 자동매매 봇입니다.
-현재 실운영 핵심은 **UTBreak Set64(EV Adaptive)**, **RSPT-v3**, **QH-Flow v2**, **Funding-OI Crowding Unwind**, **LXR 청산 과잉반전**, 두 전략을 묶는 **Dual**, 세 전략을 결합하는 **Triple**, 다섯 전략을 결합하는 **5-Strategy Alpha**입니다.
+현재 실운영 핵심은 **UTBreak Set64(EV Adaptive)**, **RSPT-v3**, **VMT 변동성 관리 추세**, **Funding-OI Crowding Unwind**, **LXR 청산 과잉반전**, 두 전략을 묶는 **Dual**, 세 전략을 결합하는 **Triple**, 다섯 전략을 결합하는 **5-Strategy Alpha**입니다.
 
 > **주의**
 > 이 저장소는 실주문·레버리지·TP/SL·자동 배포 코드를 포함합니다. 메인넷 사용 전 반드시 테스트넷과 paper/forward test로 주문 수량, 최소 주문금액, 포지션 모드, 보호 주문, 텔레그램 제어를 확인하세요. API Key, Secret, Telegram Token, SSH Key는 절대 저장소에 커밋하지 마세요.
@@ -18,7 +18,7 @@
 | 기존 Set1~63 | 연구·진단용 레거시 Set |
 | UTBreak 시간프레임 | AUTO `15m / 30m / 1h`, 진입·청산 `15m`, HTF `1h` |
 | RSPT-v3 시간프레임 | 신호 `4h`, 장기 추세 `1d` |
-| QH-Flow v2 시간구조 | 매시각 `00/15/30/45분` 첫 10초, 신호 유효 120초 |
+| VMT 시간프레임 | 완료된 `1h` 봉의 `8h / 24h / 72h` 변동성 정규화 추세 |
 | LXR 시간프레임 | 완료된 `15m` 가격 충격·거래량·OI 감소 + 후속 구조 회복 |
 | 공통 유동성 보호 | 상위 20호가 기반 L2 `CALM/MIXED/STRESSED` Gate |
 | 포지션 제한 | 전체 봇 기준 동시 포지션 1개 |
@@ -86,32 +86,31 @@ BTC·ETH 공통 움직임 제거
 - 구조적 손절거리가 `0.6~2.0 ATR` 범위를 벗어나면 거래하지 않습니다.
 - 세부 내용은 [`docs/RSPT_V2.md`](docs/RSPT_V2.md)를 참고하세요.
 
-### 3. QH-Flow v2 — Quarter-Hour Order Flow
+### 3. VMT — Volatility-Managed Multi-Horizon Trend
 
-QH-Flow v2는 매시각 `00분`, `15분`, `30분`, `45분` 직후 첫 10초의 Binance Futures aggregate trades와 상위 20호가를 실시간으로 분석하는 독립 전략입니다.
+VMT는 완료된 1시간봉에서 서로 다른 속도의 시계열 모멘텀을 결합하는 저회전 독립 전략입니다.
 
 ```text
-15분 경계 도착
+8h / 24h / 72h 수익률을 실현변동성으로 정규화
     ↓
-첫 10초 Taker 매수·매도 체결 집계
+세 구간 중 최소 두 구간의 방향 일치
     ↓
-최근 8개 경계 구간 대비 imbalance·거래대금·거래 건수 이상치 계산
+12/36 EMA 방향·기울기와 추세 효율 확인
     ↓
-가격 움직임 유지 여부 + 펀딩·베이시스·롱숏 과열 확인
+변동성 급증·낮은 거래량·과도한 가격 확장 차단
     ↓
 L2 CALM/MIXED/STRESSED Gate
     ↓
-15분 ATR 기반 손절·익절·시간청산 계획
+현재가 재확인·추격 차단 후 ATR/구조 손절·분할익절·runner 계획
 ```
 
 현재 기본 설계:
 
-- Taker imbalance 절대값, z-score, 거래대금 배율, 거래 건수 배율을 모두 확인합니다.
-- 첫 10초 방향과 가격 변화가 반대이면 신호를 거부합니다.
-- `CALM`은 정상 위험, `MIXED`는 축소 위험, `STRESSED`는 신규 진입 차단입니다.
-- 양의 펀딩·베이시스·롱 과밀은 롱 위험을 줄이고, 음의 과밀은 숏 위험을 줄입니다.
-- 별도 장기 데이터 수집기나 백테스트 DB 없이 실행 시점에 최근 경계 구간을 REST로 비교합니다.
-- 단독 전략 선택은 `/utbreak qh on`입니다.
+- 장기 구간이 반대 방향이면 단기 두 구간이 일치해도 진입하지 않습니다.
+- 추세 효율이 낮은 횡보, 단기 변동성 급증, EMA 대비 `1.8 ATR` 이상 확장된 추격 구간을 차단합니다.
+- 위험 배율은 점수와 실현변동성 목표에 따라 25~60% 범위에서 정합니다.
+- 신호 종가보다 현재가가 불리하게 `0.5 ATR` 이상 진행했거나 구조가 무너지면 주문하지 않습니다.
+- 단독 전략 선택은 `/utbreak vmt on`입니다. 예전 `qh` 명령은 설정 마이그레이션을 위해 VMT로 연결됩니다.
 
 ### 4. Dual — 독립 전략 합의 라우팅
 
@@ -127,7 +126,7 @@ Dual은 UTBreak와 RSPT-v3를 각각 계산한 뒤 결과만 결합합니다.
 
 따라서 Dual은 같은 UT 방향을 두 번 확인하는 구조가 아니라, **돌파 기반 전략과 잔차 상대강도 눌림목 전략의 합의 여부**를 확인합니다.
 
-### 5. Triple — UTBreak + RSPT-v3 + QH-Flow v2
+### 5. Triple — UTBreak + RSPT-v3 + VMT
 
 Triple은 세 전략을 각각 독립적으로 계산하고, 방향이 충돌하면 거래하지 않습니다.
 
@@ -138,7 +137,7 @@ Triple은 세 전략을 각각 독립적으로 계산하고, 방향이 충돌하
 | 1개 | 55% |
 | LONG·SHORT 혼재 | 거래 차단 |
 
-Triple 내부에서는 UTBreak와 RSPT의 QH 확인을 잠시 끄고 QH-Flow v2를 별도 세 번째 투표로 계산하므로, 같은 정보를 중복 계산하지 않습니다. 최종 주문은 점수가 가장 높은 전략의 기존 TP/SL 계획을 선택한 뒤 합의 개수에 따라 수량과 위험금액만 축소합니다.
+QH 확인은 폐기되어 UTBreak와 RSPT를 더 이상 시간창으로 축소하거나 차단하지 않습니다. VMT가 독립적인 세 번째 투표를 담당하며, 최종 주문은 점수가 가장 높은 전략의 기존 TP/SL 계획을 선택한 뒤 합의 개수에 따라 수량과 위험금액만 축소합니다.
 
 ### 6. LXR — Liquidation Exhaustion Reversal
 
@@ -146,7 +145,7 @@ LXR은 완료된 `15m` 봉에서 2.2ATR 이상의 단기 가격 충격, 평시 �
 
 단독 선택은 `/utbreak lxr on`, 상태 확인은 `/utbreak lxr status`입니다. 기존 M-TREND는 실전 평가와 제어 경로에서 제거되었습니다.
 
-### 7. 5-Strategy Alpha — UTBreak + RSPT-v3 + QH-Flow v2 + Crowding + LXR
+### 7. 5-Strategy Alpha — UTBreak + RSPT-v3 + VMT + Crowding + LXR
 
 기존 `QUAD_ALPHA` 호환 키를 유지하면서 다섯 전략을 각각 독립적으로 계산합니다. 한 전략만 유효해도 진입 후보가 되며, 다른 전략이 같은 방향이면 위험과 신뢰도를 올립니다. 반대 방향 신호가 섞이면 **방향 충돌로 신규 진입을 차단**합니다.
 
@@ -176,8 +175,8 @@ LXR은 완료된 `15m` 봉에서 2.2ATR 이상의 단기 가격 충격, 평시 �
 - **멱등 보호 주문**: TP/SL 중복 생성과 재시작 후 중복 주문을 방지합니다.
 - **시작·재접속 조정**: 포지션, 일반 주문, Algo 주문을 다시 조회하고 불완전하면 신규 진입을 막습니다.
 - **User Data Stream**: 체결·부분체결·취소 이벤트를 추적하고 연결 복구 시 REST 조정을 수행합니다.
-- **공통 L2 Gate**: UTBreak, RSPT-v3, QH-Flow v2, Crowding, LXR와 합산 전략 모두 상위 20호가의 스프레드·깊이·불균형을 확인합니다.
-- **QH 확인**: UTBreak와 RSPT-v3는 15분 경계가 가까우면 첫 10초 주문흐름을 기다리고, 반대 QH 신호면 진입을 취소합니다.
+- **공통 L2 Gate**: UTBreak, RSPT-v3, VMT, Crowding, LXR와 합산 전략 모두 상위 20호가의 스프레드·깊이·불균형을 확인합니다.
+- **완료봉 재검증**: VMT, Crowding, LXR은 신호 뒤 현재가를 다시 확인하여 추격 또는 구조 무효화 상태면 주문을 취소합니다.
 - **청산가 보호**: 손절가가 청산가 안전 버퍼 안쪽에 들어가면 레버리지·주문 계획을 재검사합니다.
 - **Critical Pause**: 주문·상태 불일치 등 위험 상황에서는 자동 진입을 잠그고 수동 재개 절차를 요구합니다.
 - **최종 손익 정산**: 거래소 체결 수수료와 펀딩을 포함해 종료된 거래 통계를 확정합니다.
@@ -265,7 +264,7 @@ scripts/bot_ctl.sh stop
 | `/stats` | 거래 통계 |
 | `/risk` | 위험 설정 메뉴 |
 | `/strat` | 전략 선택 메뉴 |
-| `/utbreak` | UTBreak/Set64/RSPT/QH-Flow v2/Crowding/LXR/Dual/Triple/5-Strategy 메뉴 |
+| `/utbreak` | UTBreak/Set64/RSPT/VMT/Crowding/LXR/Dual/Triple/5-Strategy 메뉴 |
 | `/customentry` | 사용자 지정 종목·방향 시장가 진입 모드 |
 | `/autotrade` | 자동전략 일일 거래한도·CoinSelector 스캔범위 버튼 메뉴 |
 | `/prediction` | Prediction Micro Auto / Predict.fun 메뉴 |

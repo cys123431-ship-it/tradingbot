@@ -3071,9 +3071,9 @@ class SignalCandleMixin:
             )
             is_bullish = sig == 'long'
             is_bearish = sig == 'short'
-        elif active_strategy == QH_FLOW_STRATEGY:
+        elif active_strategy == VOLATILITY_MANAGED_TREND_STRATEGY:
             entry_mode = active_strategy
-            sig, entry_reason, _ = await self._calculate_qh_flow_signal(
+            sig, entry_reason, _ = await self._calculate_volatility_managed_trend_signal(
                 symbol,
                 df,
                 strategy_params,
