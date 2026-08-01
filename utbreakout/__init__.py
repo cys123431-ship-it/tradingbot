@@ -19,6 +19,13 @@ from .coinselector import (
 )
 from .research import format_research_summary, summarize_diagnostic_events
 from .risk import calculate_risk_plan
+from .dynamic_leverage import (
+    DynamicLeverageDecision,
+    apply_dynamic_leverage_to_plan,
+    default_dynamic_leverage_config,
+    normalize_dynamic_leverage_config,
+    select_dynamic_leverage,
+)
 from .timeframe import HTF_MAP, select_adaptive_timeframe
 from .micro_auto import (
     MICRO_AUTO_STRATEGY_KEY,
@@ -172,6 +179,11 @@ __all__ = [
     "build_base_candidate",
     "build_selection_report",
     "calculate_risk_plan",
+    "DynamicLeverageDecision",
+    "apply_dynamic_leverage_to_plan",
+    "default_dynamic_leverage_config",
+    "normalize_dynamic_leverage_config",
+    "select_dynamic_leverage",
     "default_coin_selector_config",
     "finalize_candidate",
     "market_is_tradifi_perpetual",

@@ -456,7 +456,8 @@ class SignalPositionLifecycleMixin:
         state = state if isinstance(state, dict) else {}
         cfg = cfg if isinstance(cfg, dict) else {}
         timeframe = (
-            state.get('entry_timeframe')
+            state.get('dynamic_leverage_monitor_timeframe')
+            or state.get('entry_timeframe')
             or state.get('exit_timeframe')
             or cfg.get('entry_timeframe')
             or cfg.get('timeframe')
@@ -646,6 +647,10 @@ class SignalPositionLifecycleMixin:
         state = {
             'side': str(side or '').lower(),
             'entry_price': entry,
+            'leverage': int(max(1.0, float(plan.get('leverage', 1) or 1))),
+            'dynamic_leverage_tier': plan.get('dynamic_leverage_tier'),
+            'dynamic_leverage_reason': plan.get('dynamic_leverage_reason'),
+            'dynamic_leverage_monitor_timeframe': plan.get('dynamic_leverage_monitor_timeframe'),
             'initial_qty': initial_qty,
             'remaining_ratio': runner_ratio if preserve_runner_qty else max(0.0, 1.0 - ratio),
             'tp1_expected_remaining_ratio': max(0.0, 1.0 - partial_ratio),
@@ -716,6 +721,7 @@ class SignalPositionLifecycleMixin:
                 'risk_multiplier': plan.get('strategy_quality_risk_multiplier'),
             },
             'entry_timeframe': plan.get('entry_timeframe'),
+            'exit_timeframe': plan.get('exit_timeframe'),
             'entry_timestamp_ms': entry_timestamp_ms,
             'htf_timeframe': plan.get('htf_timeframe'),
             'auto_selected_set_id': plan.get('auto_selected_set_id'),

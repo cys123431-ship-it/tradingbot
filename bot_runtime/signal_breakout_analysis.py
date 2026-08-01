@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from utbreakout.dynamic_leverage import apply_dynamic_leverage_to_plan
+
 
 class SignalBreakoutAnalysisMixin:
     def _calculate_utbot_signal(self, df, strategy_params):
@@ -2761,6 +2763,18 @@ class SignalBreakoutAnalysisMixin:
         stored = dict(plan)
         if not bool(stored.get('strategy_allocator_applied')):
             stored = self._apply_strategy_allocator_to_plan(stored)
+        try:
+            common_cfg = self.get_runtime_common_settings()
+        except Exception:
+            common_cfg = {}
+        stored.setdefault(
+            'leverage',
+            int(max(1.0, float((common_cfg or {}).get('leverage', 5) or 5))),
+        )
+        stored = apply_dynamic_leverage_to_plan(
+            stored,
+            (common_cfg or {}).get('dynamic_leverage'),
+        )
         canonical = self._canonical_futures_symbol(
             stored.get('plan_symbol') or symbol
         )

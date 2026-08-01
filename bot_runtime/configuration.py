@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from utbreakout.dynamic_leverage import (
+    default_dynamic_leverage_config,
+    normalize_dynamic_leverage_config,
+)
+
 class TradingConfig:
     def __init__(self, config_file='config.json'):
         self.config_file = config_file
@@ -71,6 +76,7 @@ class TradingConfig:
             'signal_engine': {
                 'common_settings': {
                     'leverage': 10,
+                    'dynamic_leverage': default_dynamic_leverage_config(),
                     'timeframe': '15m',
                     'entry_timeframe': '8h',
                     'exit_timeframe': '4h',
@@ -533,6 +539,21 @@ class TradingConfig:
 
         common_cfg = signal_cfg.setdefault('common_settings', {})
         _normalize_percent_risk_cfg(common_cfg)
+        dynamic_leverage_cfg = common_cfg.setdefault(
+            'dynamic_leverage',
+            default_dynamic_leverage_config(),
+        )
+        if not isinstance(dynamic_leverage_cfg, dict):
+            dynamic_leverage_cfg = default_dynamic_leverage_config()
+            common_cfg['dynamic_leverage'] = dynamic_leverage_cfg
+            changed = True
+        normalized_dynamic_leverage = normalize_dynamic_leverage_config(
+            dynamic_leverage_cfg
+        )
+        for key, value in normalized_dynamic_leverage.items():
+            if dynamic_leverage_cfg.get(key) != value:
+                dynamic_leverage_cfg[key] = value
+                changed = True
 
         custom_entry_defaults = {
             'enabled': False,

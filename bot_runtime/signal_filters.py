@@ -77,6 +77,16 @@ class SignalFilterMixin:
         strategy_params = self.get_runtime_strategy_params()
         active_strategy = str(strategy_params.get('active_strategy', 'utbot') or 'utbot').lower()
         if active_strategy in UTBREAKOUT_STRATEGIES:
+            if symbol:
+                try:
+                    state = self._get_utbreakout_trailing_state(symbol) or {}
+                except Exception:
+                    state = {}
+                dynamic_tf = str(
+                    state.get('dynamic_leverage_monitor_timeframe') or ''
+                ).strip().lower()
+                if dynamic_tf in {'1m', '3m', '5m', '15m', '30m', '1h'}:
+                    return dynamic_tf
             fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
             if bool(fb_cfg.get('adaptive_timeframe_enabled', False)) and symbol:
                 selected_tf = (self.utbreakout_adaptive_tf_state.get(symbol, {}) or {}).get('selected_tf')

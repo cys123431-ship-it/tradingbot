@@ -842,6 +842,7 @@ class SignalRsptMixin:
             'market_quality_risk_multiplier': market_quality_multiplier,
             'rspt_size_multiplier': rspt_size_multiplier,
             'rspt_risk_multiplier': risk_multiplier,
+            'rspt_entry_chase_atr': status.get('rspt_entry_chase_atr'),
             'l2_gate': l2_gate,
             'l2_state': l2_gate.get('state'),
             'l2_risk_multiplier': l2_multiplier,

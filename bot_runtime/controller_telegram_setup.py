@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from utbreakout.dynamic_leverage import normalize_dynamic_leverage_config
+
 
 class TelegramSetupMixin:
     async def _setup_telegram(self):
@@ -305,12 +307,22 @@ class TelegramSetupMixin:
                 coin_mode = 'scanner'
             else:
                 coin_mode = '직접감시'
+            dynamic_lev = normalize_dynamic_leverage_config(
+                common_cfg.get('dynamic_leverage')
+                if isinstance(common_cfg.get('dynamic_leverage'), dict)
+                else {}
+            )
             return "\n".join([
                 f"전략: `{active_strategy.upper()}`",
                 f"매매: `{'PAUSE' if self.is_paused else 'RUNNING'}` | 방향 `{self.get_effective_trade_direction().upper()}`",
                 f"코인: `{', '.join(watchlist) if watchlist else '없음'}`",
                 f"코인선택: `{coin_mode}`",
-                f"레버리지: `{int(float(common_cfg.get('leverage', 10) or 10))}x`",
+                (
+                    f"레버리지: `자동 {dynamic_lev['min_leverage']}~"
+                    f"{dynamic_lev['max_leverage']}x`"
+                    if dynamic_lev.get('enabled')
+                    else f"레버리지: `고정 {int(float(common_cfg.get('leverage', 10) or 10))}x`"
+                ),
                 f"TF: 진입 `{common_cfg.get('entry_timeframe', common_cfg.get('timeframe', '15m'))}` / 청산 `{common_cfg.get('exit_timeframe', '4h')}`",
                 f"TP/SL: TP `{'ON' if common_cfg.get('take_profit_enabled', True) else 'OFF'} {float(common_cfg.get('target_roe_pct', 20) or 20):.1f}%` / SL `{'ON' if common_cfg.get('stop_loss_enabled', True) else 'OFF'} {float(common_cfg.get('stop_loss_pct', 10) or 10):.1f}%`",
                 f"Scanner/CoinSelector: `{'ON' if scanner_on else 'OFF'}` / `{'ON' if selector_on else 'OFF'}`",
@@ -942,11 +954,13 @@ class TelegramSetupMixin:
 
         async def _set_common_leverage(value):
             lev = int(float(value))
-            if lev < 1 or lev > 20:
-                raise ValueError("레버리지는 1~20 사이 값만 가능합니다.")
+            if lev < 2 or lev > 10:
+                raise ValueError("자동 레버리지 상한은 2~10 사이 값만 가능합니다.")
             await self.cfg.update_value(['signal_engine', 'common_settings', 'leverage'], lev)
-            if self.active_engine:
-                await self.active_engine.ensure_market_settings(self._get_current_symbol())
+            await self.cfg.update_value(
+                ['signal_engine', 'common_settings', 'dynamic_leverage', 'max_leverage'],
+                lev,
+            )
             return lev
 
         async def _set_common_entry_tf(value):
@@ -1073,8 +1087,8 @@ UTBot:
                 ],
                 [
                     InlineKeyboardButton("코인 선택", callback_data="utbot:coin"),
-                    InlineKeyboardButton("Lev 5x", callback_data="utbot:lev:5"),
-                    InlineKeyboardButton("Lev 10x", callback_data="utbot:lev:10")
+                    InlineKeyboardButton("Max 5x", callback_data="utbot:lev:5"),
+                    InlineKeyboardButton("Max 10x", callback_data="utbot:lev:10")
                 ],
                 [
                     InlineKeyboardButton("진입 15m", callback_data="utbot:tf:15m"),
@@ -1137,7 +1151,7 @@ UTBot:
                     return
                 if action in {'lev', 'leverage'} and len(args) > 1:
                     lev = await _set_common_leverage(args[1])
-                    await _send_utbot_menu(u.message, f"✅ 레버리지: {lev}x")
+                    await _send_utbot_menu(u.message, f"✅ 자동 레버리지 상한: {lev}x")
                     return
                 if action in {'tf', 'entry_tf', 'timeframe'} and len(args) > 1:
                     tf = await _set_common_entry_tf(args[1])
@@ -1193,7 +1207,7 @@ UTBot:
                     await query.edit_message_text("UTBot에서 거래할 코인 1개를 입력하세요. 예: `EWY`", parse_mode=ParseMode.MARKDOWN)
                     return
                 if action == 'lev':
-                    await _edit_utbot_menu(query, f"✅ 레버리지: {await _set_common_leverage(value)}x")
+                    await _edit_utbot_menu(query, f"✅ 자동 레버리지 상한: {await _set_common_leverage(value)}x")
                     return
                 if action == 'tf':
                     await _edit_utbot_menu(query, f"✅ 진입 TF: {await _set_common_entry_tf(value)}")
@@ -2587,7 +2601,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
             elif action in {'lev', 'leverage'}:
                 try:
                     value = args[1]
-                    await u.message.reply_text(f"✅ 레버리지: {await _set_common_leverage(value)}x")
+                    await u.message.reply_text(f"✅ 자동 레버리지 상한: {await _set_common_leverage(value)}x")
                 except (IndexError, ValueError) as e:
                     await u.message.reply_text(f"❌ {e}\n예: `/utbreak lev 10`", parse_mode=ParseMode.MARKDOWN)
                     return
@@ -3227,7 +3241,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 
             if action == 'lev':
                 try:
-                    await _edit_utbreakout_menu(query, f"✅ 레버리지: {await _set_common_leverage(value)}x")
+                    await _edit_utbreakout_menu(query, f"✅ 자동 레버리지 상한: {await _set_common_leverage(value)}x")
                 except Exception as e:
                     await _edit_utbreakout_menu(query, f"❌ {e}")
                 return

@@ -742,6 +742,7 @@ class SignalAlphaMixin:
             'vmt_score': float(decision.score),
             'vmt_risk_multiplier': risk_multiplier,
             'vmt_metrics': metrics,
+            'entry_chase_atr': chase_atr,
             'l2_gate': dict(l2_gate or {}),
             'l2_state': l2_gate.get('state'),
             'l2_risk_multiplier': l2_gate.get('risk_multiplier'),
@@ -993,6 +994,7 @@ class SignalAlphaMixin:
             'crowding_score': float(decision.score),
             'crowding_risk_multiplier': risk_multiplier,
             'crowding_metrics': dict(decision.metrics),
+            'entry_chase_atr': chase_atr,
             'l2_gate': dict(l2_gate or {}),
             'l2_state': l2_gate.get('state'),
             'l2_risk_multiplier': l2_gate.get('risk_multiplier'),
@@ -1259,6 +1261,7 @@ class SignalAlphaMixin:
             'lxr_score': float(decision.score),
             'lxr_risk_multiplier': risk_multiplier,
             'lxr_metrics': metrics,
+            'entry_chase_atr': chase_atr,
             'l2_gate': dict(l2_gate or {}),
             'l2_state': l2_gate.get('state'),
             'l2_risk_multiplier': l2_gate.get('risk_multiplier'),
@@ -1632,6 +1635,9 @@ class SignalAlphaMixin:
             'planned_margin',
             'expected_profit_usdt',
             'position_notional',
+            'position_cap_original_notional',
+            'position_cap_original_risk_usdt',
+            'position_cap_max_notional',
         ):
             value = _safe_float_or_none(scaled.get(key))
             if value is not None:
@@ -2018,6 +2024,7 @@ class SignalAlphaMixin:
         statuses = {key: status for key, _, _, _, status, _, _ in branch_results}
         reasons = {key: reason for key, _, _, reason, _, _, _ in branch_results}
         final_status = dict((selected or {}).get('status') or vmt_status or rsp_status or ut_status or {})
+        selected_plan_for_status = None
         if selected:
             selected_plan = self._dual_alpha_scale_plan(selected['plan'], agreement_multiplier)
             selected_plan.pop('dual_alpha_risk_multiplier', None)
@@ -2036,6 +2043,13 @@ class SignalAlphaMixin:
                 selected_plan.get('plan_symbol') or base_symbol,
                 selected_plan,
             )
+            selected_plan_for_status = (
+                self._get_utbot_filtered_breakout_entry_plan(
+                    selected_plan.get('plan_symbol') or base_symbol,
+                    selected.get('side'),
+                )
+                or selected_plan
+            )
 
         summary = {
             'enabled': True,
@@ -2050,6 +2064,21 @@ class SignalAlphaMixin:
             'selected_side': selected.get('side') if selected else None,
             'selection_score': selected.get('score') if selected else None,
             'scores': {choice['key']: choice['score'] for choice in choices},
+            'dynamic_leverage': (
+                selected_plan_for_status.get('leverage')
+                if isinstance(selected_plan_for_status, dict)
+                else None
+            ),
+            'dynamic_leverage_tier': (
+                selected_plan_for_status.get('dynamic_leverage_tier')
+                if isinstance(selected_plan_for_status, dict)
+                else None
+            ),
+            'dynamic_leverage_reason': (
+                selected_plan_for_status.get('dynamic_leverage_reason')
+                if isinstance(selected_plan_for_status, dict)
+                else None
+            ),
         }
         final_status.update({
             'strategy': STRATEGY_DISPLAY_NAMES.get(TRIPLE_ALPHA_STRATEGY, 'TRIPLE_ALPHA'),
@@ -2357,6 +2386,7 @@ class SignalAlphaMixin:
             or fallback_status
             or {}
         )
+        selected_plan_for_status = None
         if selected:
             selected_plan = self._dual_alpha_scale_plan(selected['plan'], agreement_multiplier)
             selected_plan.pop('dual_alpha_risk_multiplier', None)
@@ -2376,6 +2406,13 @@ class SignalAlphaMixin:
             self._set_utbot_filtered_breakout_entry_plan(
                 selected_plan.get('plan_symbol') or base_symbol,
                 selected_plan,
+            )
+            selected_plan_for_status = (
+                self._get_utbot_filtered_breakout_entry_plan(
+                    selected_plan.get('plan_symbol') or base_symbol,
+                    selected.get('side'),
+                )
+                or selected_plan
             )
 
         crowding_light = self._dual_alpha_light(
@@ -2418,6 +2455,21 @@ class SignalAlphaMixin:
             'selected_side': selected.get('side') if selected else None,
             'selection_score': selected.get('score') if selected else None,
             'scores': {choice['key']: choice['score'] for choice in choices},
+            'dynamic_leverage': (
+                selected_plan_for_status.get('leverage')
+                if isinstance(selected_plan_for_status, dict)
+                else None
+            ),
+            'dynamic_leverage_tier': (
+                selected_plan_for_status.get('dynamic_leverage_tier')
+                if isinstance(selected_plan_for_status, dict)
+                else None
+            ),
+            'dynamic_leverage_reason': (
+                selected_plan_for_status.get('dynamic_leverage_reason')
+                if isinstance(selected_plan_for_status, dict)
+                else None
+            ),
         }
         final_status.update({
             'strategy': STRATEGY_DISPLAY_NAMES.get(QUAD_ALPHA_STRATEGY, 'QUAD_ALPHA'),
@@ -2576,6 +2628,12 @@ class SignalAlphaMixin:
             '',
             f"Agreement: {str(summary.get('agreement_state') or 'none').upper()} / confirmations={int(summary.get('confirmation_count') or 0)} / risk x{float(summary.get('agreement_risk_multiplier', 0.0) or 0.0):.2f}",
             f"Selected: {summary.get('selected_label') or 'NONE'} {str(summary.get('selected_side') or '').upper()}",
+            (
+                f"Leverage: {int(summary.get('dynamic_leverage') or 0)}x "
+                f"({summary.get('dynamic_leverage_tier') or 'waiting'})"
+                if summary.get('dynamic_leverage')
+                else "Leverage: waiting for a valid entry plan"
+            ),
             '',
             '📋 전략별 상세 설명',
         ])

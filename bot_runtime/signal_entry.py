@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from utbreakout.dynamic_leverage import apply_dynamic_leverage_to_plan
+
 
 class SignalEntryMixin:
     async def entry(self, symbol, side, price):
@@ -634,6 +636,35 @@ class SignalEntryMixin:
                         lev = int(max(1.0, float(filtered_breakout_plan.get('leverage', lev) or lev)))
                     except (TypeError, ValueError):
                         pass
+                else:
+                    filtered_breakout_plan = apply_dynamic_leverage_to_plan(
+                        filtered_breakout_plan,
+                        (cfg or {}).get('dynamic_leverage'),
+                        free_balance=free,
+                        safety_buffer=safety_buffer,
+                    )
+                    lev = int(max(
+                        1.0,
+                        float(filtered_breakout_plan.get('leverage', lev) or lev),
+                    ))
+                    self._utbreakout_trace_event(
+                        symbol,
+                        'DYNAMIC_LEVERAGE',
+                        str(filtered_breakout_plan.get('dynamic_leverage_tier') or 'standard').upper(),
+                        side=side,
+                        leverage=lev,
+                        opportunity_score=filtered_breakout_plan.get('dynamic_leverage_score'),
+                        reason=filtered_breakout_plan.get('dynamic_leverage_reason'),
+                        restored_notional=filtered_breakout_plan.get('dynamic_leverage_restored_notional'),
+                    )
+                    logger.info(
+                        '[DYNAMIC_LEVERAGE] symbol=%s side=%s leverage=%sx tier=%s reason=%s',
+                        symbol,
+                        side,
+                        lev,
+                        filtered_breakout_plan.get('dynamic_leverage_tier'),
+                        filtered_breakout_plan.get('dynamic_leverage_reason'),
+                    )
                 planned_qty = float(filtered_breakout_plan.get('qty', 0.0) or 0.0)
                 target_notional = planned_qty * float(price)
                 margin_to_use = target_notional / max(float(lev), 1e-9)
@@ -1389,6 +1420,10 @@ class SignalEntryMixin:
                         'stop_loss',
                         'risk_distance',
                         'rr_multiple',
+                        'leverage',
+                        'dynamic_leverage_tier',
+                        'dynamic_leverage_score',
+                        'dynamic_leverage_reason',
                         'entry_timeframe',
                         'exit_timeframe',
                         'htf_timeframe',

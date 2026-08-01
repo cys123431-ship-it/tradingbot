@@ -215,6 +215,9 @@ def scale_plan_risk(plan: Mapping[str, Any], multiplier: float) -> dict[str, Any
         "planned_margin",
         "expected_profit_usdt",
         "position_notional",
+        "position_cap_original_notional",
+        "position_cap_original_risk_usdt",
+        "position_cap_max_notional",
     ):
         value = _finite(scaled.get(key))
         if value is not None:
