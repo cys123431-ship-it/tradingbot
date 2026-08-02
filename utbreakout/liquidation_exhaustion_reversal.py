@@ -35,6 +35,11 @@ def default_liquidation_exhaustion_reversal_config() -> dict[str, Any]:
         "reclaim_min_atr": 0.35,
         "reclaim_max_fraction": 0.78,
         "reversal_body_min_atr": 0.18,
+        "reversal_close_location_min": 0.65,
+        "liquidity_recovery_required": True,
+        "liquidity_recovery_min_samples": 2,
+        "liquidity_recovery_max_spread_widening_ratio": 0.35,
+        "liquidity_recovery_max_support_depth_depletion": 0.30,
         "taker_support_long_min": 1.02,
         "taker_support_short_max": 0.98,
         "score_min": 68.0,
@@ -243,12 +248,19 @@ def evaluate_liquidation_exhaustion_reversal(
     reclaim_atr = reclaim_distance / atr_value
     reclaim_fraction = reclaim_distance / shock_size
     body_atr = reversal_body / atr_value
+    latest_range = max(_row_value(latest, "high") - _row_value(latest, "low"), 1e-9)
+    close_location = (
+        (latest_close - _row_value(latest, "low")) / latest_range
+        if side == "long"
+        else (_row_value(latest, "high") - latest_close) / latest_range
+    )
     metrics.update({
         "entry_price": latest_close,
         "reclaim_atr": reclaim_atr,
         "reclaim_fraction": reclaim_fraction,
         "structure_reclaimed": structure_reclaimed,
         "reversal_body_atr": body_atr,
+        "reversal_close_location": close_location,
         "structure_stop": structure_stop,
         "signal_candle_ts": latest.get("timestamp"),
     })
@@ -260,6 +272,8 @@ def evaluate_liquidation_exhaustion_reversal(
         return LiquidationExhaustionDecision(side=side, reason="reversal_structure_not_reclaimed", metrics=metrics)
     if body_atr < float(cfg["reversal_body_min_atr"]):
         return LiquidationExhaustionDecision(side=side, reason="reversal_body_too_weak", metrics=metrics)
+    if close_location < float(cfg["reversal_close_location_min"]):
+        return LiquidationExhaustionDecision(side=side, reason="reversal_close_location_weak", metrics=metrics)
 
     l2 = dict(l2_gate or {})
     metrics["l2_state"] = l2.get("state")
@@ -268,6 +282,30 @@ def evaluate_liquidation_exhaustion_reversal(
         return LiquidationExhaustionDecision(side=side, reason="l2_stressed", metrics=metrics)
     if l2.get("direction_support") in {"long", "short"} and l2.get("direction_support") != side:
         return LiquidationExhaustionDecision(side=side, reason="l2_direction_conflict", metrics=metrics)
+
+    l2_samples = _finite(l2.get("samples"))
+    spread_change = _finite(l2.get("spread_change_ratio"), 0.0) or 0.0
+    support_depth_change = _finite(
+        l2.get("bid_change_ratio") if side == "long" else l2.get("ask_change_ratio"),
+        0.0,
+    ) or 0.0
+    dynamic_l2_available = l2_samples is not None
+    liquidity_recovered = bool(
+        not dynamic_l2_available
+        or (
+            l2_samples >= max(1, int(cfg["liquidity_recovery_min_samples"]))
+            and spread_change <= float(cfg["liquidity_recovery_max_spread_widening_ratio"])
+            and support_depth_change >= -abs(float(cfg["liquidity_recovery_max_support_depth_depletion"]))
+        )
+    )
+    metrics.update({
+        "l2_samples": l2_samples,
+        "l2_spread_change_ratio": spread_change,
+        "l2_support_depth_change_ratio": support_depth_change,
+        "liquidity_recovered": liquidity_recovered,
+    })
+    if bool(cfg.get("liquidity_recovery_required", True)) and not liquidity_recovered:
+        return LiquidationExhaustionDecision(side=side, reason="liquidity_recovery_unconfirmed", metrics=metrics)
 
     taker_ratio = _finite(context.get("taker_buy_sell_ratio"))
     taker_support = bool(
@@ -289,9 +327,10 @@ def evaluate_liquidation_exhaustion_reversal(
     volume_strength = min(1.0, float(shock["shock_volume_ratio"]) / max(float(cfg["shock_volume_ratio_min"]) * 1.75, 1e-9))
     oi_strength = min(1.0, max(0.0, -float(effective_oi or 0.0)) / max(float(cfg["oi_drop_1h_min_pct"]) * 2.5, 1e-9))
     score = 35.0 + 15.0 * shock_strength + 12.0 * volume_strength + 16.0 * oi_strength
-    score += 10.0 if structure_reclaimed else 0.0
+    score += 8.0 if structure_reclaimed else 0.0
+    score += min(8.0, max(0.0, close_location - 0.50) * 20.0)
     score += 6.0 if taker_support else 0.0
-    score += 6.0 if l2_support else 0.0
+    score += 6.0 if liquidity_recovered else 0.0
     score = min(100.0, score)
     metrics["score"] = score
     if score < float(cfg["score_min"]):
@@ -305,8 +344,21 @@ def evaluate_liquidation_exhaustion_reversal(
     floor = max(0.0, float(cfg["risk_multiplier_floor"]))
     cap = max(floor, min(1.0, float(cfg["risk_multiplier_cap"])))
     quality = max(0.0, min(1.0, (score - float(cfg["score_min"])) / max(100.0 - float(cfg["score_min"]), 1e-9)))
-    risk = floor + (cap - floor) * quality
-    risk = min(risk, max(0.0, float(l2.get("risk_multiplier", 0.0) or 0.0)))
+    quality_budget = floor + (cap - floor) * quality
+    recovery_scale = min(
+        1.0,
+        max(0.0, 1.0 - max(0.0, spread_change) * 0.50)
+        * max(0.0, 1.0 + min(0.0, support_depth_change)),
+    )
+    risk = min(
+        cap,
+        quality_budget * recovery_scale,
+        max(0.0, float(l2.get("risk_multiplier", 0.0) or 0.0)),
+    )
+    metrics.update({
+        "quality_risk_budget": quality_budget,
+        "liquidity_recovery_scale": recovery_scale,
+    })
     return LiquidationExhaustionDecision(
         side=side,
         allowed=True,

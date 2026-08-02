@@ -114,6 +114,7 @@ def test_funding_oi_crowding_unwind_short_and_long():
             "funding_rate": 0.0012,
             "funding_percentile_30d": 99,
             "open_interest_delta_z": 2.5,
+            "open_interest_change_1h": -0.8,
             "open_interest_change_4h": 7.0,
             "long_short_ratio": 2.0,
             "taker_buy_sell_ratio": 1.3,
@@ -130,6 +131,7 @@ def test_funding_oi_crowding_unwind_short_and_long():
             "funding_rate": -0.0012,
             "funding_percentile_30d": 99,
             "open_interest_delta_z": 2.5,
+            "open_interest_change_1h": -0.8,
             "open_interest_change_4h": 7.0,
             "long_short_ratio": 0.5,
             "taker_buy_sell_ratio": 0.7,
@@ -139,6 +141,26 @@ def test_funding_oi_crowding_unwind_short_and_long():
     )
     assert long.allowed is True
     assert long.side == "long"
+
+
+def test_crowding_waits_for_open_interest_to_start_unwinding():
+    decision = evaluate_crowding_unwind(
+        _crowding_rows("short"),
+        {
+            "funding_rate": 0.0012,
+            "funding_percentile_30d": 99,
+            "open_interest_delta_z": 2.5,
+            "open_interest_change_1h": 0.4,
+            "open_interest_change_4h": 7.0,
+            "long_short_ratio": 2.0,
+            "taker_buy_sell_ratio": 1.3,
+            "rolling_ofi_score": 20,
+        },
+        {"allowed": True, "state": "ask_pressure", "direction_support": "short", "risk_multiplier": 1.0},
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "open_interest_unwind_missing"
 
 
 def test_strategy_allocator_is_neutral_for_small_sample_and_reduces_bad_strategy():

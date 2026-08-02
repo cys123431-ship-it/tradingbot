@@ -422,6 +422,15 @@ def volatility_risk_multiplier(atr, close, config):
     atr_pct = atr / close * 100.0
     high = max(0.0, _finite(config.get("volatility_high_atr_pct"), 3.5))
     extreme = max(high, _finite(config.get("volatility_extreme_atr_pct"), 5.5))
+    if bool(config.get("volatility_targeting_enabled", True)) and atr_pct > high > 0:
+        power = max(0.25, _finite(config.get("volatility_targeting_power"), 1.0))
+        multiplier = max(0.0, min(1.0, (high / max(atr_pct, 1e-9)) ** power))
+        state = (
+            "volatility_extreme_continuous_size_reduced"
+            if atr_pct >= extreme
+            else "volatility_high_continuous_size_reduced"
+        )
+        return multiplier, state, atr_pct
     if atr_pct >= extreme:
         return (
             max(0.0, min(1.0, _finite(config.get("volatility_extreme_multiplier"), 0.35))),

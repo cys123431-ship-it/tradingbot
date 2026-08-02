@@ -98,6 +98,25 @@ def test_opposite_l2_pressure_blocks_an_otherwise_valid_reversal():
     assert decision.reason == "l2_direction_conflict"
 
 
+def test_dynamic_l2_requires_recovery_across_more_than_one_snapshot():
+    decision = evaluate_liquidation_exhaustion_reversal(
+        _long_setup(),
+        {"open_interest_change_1h": -1.20, "open_interest_delta_z": -1.4, "taker_buy_sell_ratio": 1.08},
+        {
+            "allowed": True,
+            "state": "deep_balanced",
+            "direction_support": None,
+            "risk_multiplier": 0.80,
+            "samples": 1,
+            "spread_change_ratio": 0.0,
+            "bid_change_ratio": 0.0,
+        },
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "liquidity_recovery_unconfirmed"
+
+
 def test_does_not_enter_on_the_shock_without_a_later_structure_reclaim():
     rows = _long_setup()[:-1]
     decision = evaluate_liquidation_exhaustion_reversal(

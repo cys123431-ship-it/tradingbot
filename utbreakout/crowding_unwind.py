@@ -31,6 +31,8 @@ def default_crowding_unwind_config() -> dict[str, Any]:
         "taker_absorption_ratio": 1.08,
         "ofi_absorption_min": 10.0,
         "minimum_confirmations": 2,
+        "oi_unwind_confirmation_enabled": True,
+        "oi_unwind_min_pct": 0.05,
         "score_min": 62.0,
         "risk_multiplier_floor": 0.30,
         "risk_multiplier_cap": 0.65,
@@ -38,6 +40,9 @@ def default_crowding_unwind_config() -> dict[str, Any]:
         "take_profit_r_multiple": 2.25,
         "time_stop_bars": 24,
         "l2_direction_required": True,
+        # L2 remains a liquidity/execution gate.  Directional alpha must come
+        # from funding, OI and completed price structure, not one book image.
+        "microstructure_role": "execution_only",
         "entry_chase_max_atr": 0.50,
     }
 
@@ -184,6 +189,7 @@ def evaluate_crowding_unwind(
 
     taker_ratio = float(_finite(context.get("taker_buy_sell_ratio"), 1.0) or 1.0)
     rolling_ofi = float(_finite(context.get("rolling_ofi_score"), 0.0) or 0.0)
+    oi_change_1h = _finite(context.get("open_interest_change_1h"))
     if side == "short":
         absorption = taker_ratio >= float(cfg["taker_absorption_ratio"]) and progression_failed
         absorption = absorption or rolling_ofi >= float(cfg["ofi_absorption_min"]) and end_close <= start_close
@@ -193,7 +199,16 @@ def evaluate_crowding_unwind(
         absorption = absorption or rolling_ofi <= -float(cfg["ofi_absorption_min"]) and end_close >= start_close
         l2_support = str((l2_gate or {}).get("state")) == "bid_support" or str((l2_gate or {}).get("direction_support")) == "long"
 
-    confirmations = int(progression_failed) + int(absorption) + int(structure_break) + int(l2_support)
+    oi_unwind_confirmed = bool(
+        oi_change_1h is not None
+        and oi_change_1h <= -abs(float(cfg["oi_unwind_min_pct"]))
+    )
+    confirmations = (
+        int(progression_failed)
+        + int(absorption)
+        + int(structure_break)
+        + int(oi_unwind_confirmed)
+    )
     metrics.update({
         "side": side,
         "atr": atr,
@@ -205,31 +220,57 @@ def evaluate_crowding_unwind(
         "l2_support": l2_support,
         "taker_buy_sell_ratio": taker_ratio,
         "rolling_ofi_score": rolling_ofi,
+        "open_interest_change_1h": oi_change_1h,
+        "oi_unwind_confirmed": oi_unwind_confirmed,
         "confirmations": confirmations,
     })
     required = max(2, int(cfg["minimum_confirmations"]))
     if not structure_break:
         return CrowdingUnwindDecision(side=side, reason="structure_break_missing", metrics=metrics)
-    if bool(cfg["l2_direction_required"]) and not l2_support:
+    if bool(cfg.get("oi_unwind_confirmation_enabled", True)) and not oi_unwind_confirmed:
+        return CrowdingUnwindDecision(side=side, reason="open_interest_unwind_missing", metrics=metrics)
+    if (
+        str(cfg.get("microstructure_role", "execution_only")) == "alpha_confirmation"
+        and bool(cfg["l2_direction_required"])
+        and not l2_support
+    ):
         return CrowdingUnwindDecision(side=side, reason="l2_reversal_support_missing", metrics=metrics)
     if confirmations < required:
         return CrowdingUnwindDecision(side=side, reason="insufficient_reversal_confirmations", metrics=metrics)
 
-    score = 35.0
-    score += min(20.0, max(0.0, metrics["funding_percentile"] - 80.0))
-    score += min(15.0, max(0.0, metrics["oi_z"]) * 5.0)
+    funding_percentile = float(metrics.get("funding_percentile") or 0.0)
+    funding_rate = abs(float(metrics.get("funding_rate") or 0.0))
+    funding_strength = max(
+        max(0.0, funding_percentile - 80.0) / 20.0,
+        funding_rate / max(abs(float(cfg["funding_abs_min"])), 1e-9),
+    )
+    oi_z = float(metrics.get("oi_z") or 0.0)
+    oi_4h = float(metrics.get("oi_change_4h_pct") or 0.0)
+    oi_strength = max(
+        max(0.0, oi_z) / max(float(cfg["oi_z_min"]), 1e-9),
+        max(0.0, oi_4h) / max(float(cfg["oi_change_4h_min_pct"]), 1e-9),
+    )
+    score = 25.0
+    score += min(20.0, funding_strength * 15.0)
+    score += min(15.0, oi_strength * 10.0)
     score += 10.0 if progression_failed else 0.0
     score += 10.0 if absorption else 0.0
-    score += 10.0 if l2_support else 0.0
+    score += 10.0 if structure_break else 0.0
+    score += 10.0 if oi_unwind_confirmed else 0.0
     score = min(100.0, score)
     if score < float(cfg["score_min"]):
         return CrowdingUnwindDecision(side=side, score=score, reason="score_below_threshold", metrics=metrics)
     l2_multiplier = float((l2_gate or {}).get("risk_multiplier", 0.0) or 0.0)
-    risk = min(
-        float(cfg["risk_multiplier_cap"]),
-        max(float(cfg["risk_multiplier_floor"]), score / 100.0),
-        max(0.0, l2_multiplier),
-    )
+    floor = max(0.0, float(cfg["risk_multiplier_floor"]))
+    cap = max(floor, min(1.0, float(cfg["risk_multiplier_cap"])))
+    quality = max(0.0, min(1.0, (score - float(cfg["score_min"])) / max(100.0 - float(cfg["score_min"]), 1e-9)))
+    quality_budget = floor + (cap - floor) * quality
+    risk = min(cap, quality_budget, max(0.0, l2_multiplier))
+    metrics.update({
+        "funding_strength": funding_strength,
+        "oi_build_strength": oi_strength,
+        "quality_risk_budget": quality_budget,
+    })
     return CrowdingUnwindDecision(
         side=side,
         allowed=True,
@@ -237,7 +278,9 @@ def evaluate_crowding_unwind(
         risk_multiplier=risk,
         reason=(
             f"Crowding unwind {side} score={score:.1f} funding={metrics['funding_rate']:+.6f} "
-            f"OI-z={metrics['oi_z']:+.2f} confirmations={confirmations} L2={l2_gate.get('state')}"
+            f"OI-z={float(metrics.get('oi_z') or 0.0):+.2f} "
+            f"OI-1h={float(oi_change_1h or 0.0):+.2f}% confirmations={confirmations} "
+            f"L2={l2_gate.get('state')}"
         ),
         metrics=metrics,
     )

@@ -103,6 +103,10 @@ def default_relative_strength_pullback_config():
         "volatility_extreme_atr_pct": 5.5,
         "volatility_high_multiplier": 0.70,
         "volatility_extreme_multiplier": 0.35,
+        "volatility_targeting_enabled": True,
+        "volatility_targeting_power": 1.0,
+        "relative_strength_min_risk_multiplier": 0.65,
+        "residual_horizon_conflict_multiplier": 0.50,
         "stop_distance_min_atr": 0.60,
         "stop_distance_max_atr": 2.00,
         "structure_stop_buffer_atr": 0.20,
@@ -472,11 +476,37 @@ def _relative_strength_gate(side, rs, cfg):
         passed = (side == "long" and pct >= 1.0 - long_top) or (
             side == "short" and pct <= short_bottom and bool(cfg.get("short_enabled", True))
         )
+        minimum_risk = max(
+            0.0,
+            min(1.0, _finite_float(cfg.get("relative_strength_min_risk_multiplier"), 0.65)),
+        )
+        if side == "long":
+            threshold = max(0.0, 1.0 - long_top)
+            conviction = max(0.0, min(1.0, (float(pct) - threshold) / max(1.0 - threshold, 1e-9)))
+        else:
+            threshold = max(short_bottom, 1e-9)
+            conviction = max(0.0, min(1.0, (threshold - float(pct)) / threshold))
+        risk_multiplier = minimum_risk + (1.0 - minimum_risk) * conviction
+        horizon_agreement = rs.get("residual_horizon_agreement")
+        horizon_conflict = horizon_agreement is False
+        if horizon_conflict:
+            risk_multiplier = min(
+                risk_multiplier,
+                max(0.0, min(1.0, _finite_float(cfg.get("residual_horizon_conflict_multiplier"), 0.50))),
+            )
         return {
             "passed": bool(passed),
-            "reason": "residual_strength_passed" if passed else "residual_strength_rank_block",
-            "risk_multiplier": 1.0 if passed else 0.0,
+            "reason": (
+                "residual_strength_horizon_conflict_size_reduced"
+                if passed and horizon_conflict
+                else "residual_strength_passed"
+                if passed
+                else "residual_strength_rank_block"
+            ),
+            "risk_multiplier": risk_multiplier if passed else 0.0,
             "hard_filter_applied": True,
+            "conviction": conviction,
+            "horizon_agreement": horizon_agreement,
         }
 
     hard_min = max(2, int(cfg.get("rs_hard_filter_min_candidates", 10) or 10))
@@ -776,6 +806,8 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
             "relative_strength_hard_filter_applied": rs_gate["hard_filter_applied"],
             "relative_strength_size_multiplier": rs_gate["risk_multiplier"],
             "relative_strength_passed": rs_gate["passed"],
+            "relative_strength_conviction": rs_gate.get("conviction"),
+            "residual_horizon_agreement": rs_gate.get("horizon_agreement"),
         }
         if not rs_gate["passed"]:
             rejection_details.append({"side": side, "reason": rs_gate["reason"]})
@@ -805,8 +837,11 @@ def _evaluate_symbol(symbol, signal_rows, htf_rows, rs, state, cfg, now_ms=None)
             if reason in {
                 "adx_weak_size_reduced",
                 "relative_strength_size_reduced",
+                "residual_strength_horizon_conflict_size_reduced",
                 "volatility_high_size_reduced",
                 "volatility_extreme_size_reduced",
+                "volatility_high_continuous_size_reduced",
+                "volatility_extreme_continuous_size_reduced",
             }
         ]
         setup_logs = {

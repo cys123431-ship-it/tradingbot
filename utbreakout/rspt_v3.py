@@ -198,7 +198,17 @@ def residual_momentum_score(symbol, rows_by_symbol, config):
     factor_volatility = max((_std([factor_map[ts] for ts in timestamps]) for factor_map in factor_maps), default=0.0)
     scoring_volatility = max(volatility, factor_volatility * _finite(config.get("residual_strength_volatility_floor_ratio"), 0.50), 1e-12)
     long_component, short_component = sum(long_window), sum(short_window)
-    score = (0.65 * long_component + 0.35 * short_component) / (scoring_volatility * sqrt(max(len(long_window), 1)))
+    long_score = long_component / (scoring_volatility * sqrt(max(len(long_window), 1)))
+    short_score = short_component / (scoring_volatility * sqrt(max(len(short_window), 1)))
+    epsilon = 1e-9
+    long_sign = 1 if long_score > epsilon else -1 if long_score < -epsilon else 0
+    short_sign = 1 if short_score > epsilon else -1 if short_score < -epsilon else 0
+    horizon_agreement = not (long_sign and short_sign and long_sign != short_sign)
+    # The two horizons are normalized separately so the shorter window is not
+    # mechanically underweighted.  Conflicting horizons remain rankable, but
+    # are shrunk and later receive reduced live risk instead of a hard block.
+    consistency_scale = 1.0 if horizon_agreement else 0.55
+    score = (0.65 * long_score + 0.35 * short_score) * consistency_scale
     return score, {
         "reason": "ok",
         "method": "btc_eth_alt_vol_residual_momentum",
@@ -211,6 +221,10 @@ def residual_momentum_score(symbol, rows_by_symbol, config):
         "factor_volatility": factor_volatility,
         "residual_long_return": long_component,
         "residual_short_return": short_component,
+        "residual_long_score": long_score,
+        "residual_short_score": short_score,
+        "residual_horizon_agreement": horizon_agreement,
+        "residual_consistency_scale": consistency_scale,
         "regression_coefficients": coefficients,
     }
 

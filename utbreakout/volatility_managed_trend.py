@@ -37,6 +37,10 @@ def default_volatility_managed_trend_config() -> dict[str, Any]:
         "long_volatility_period": 48,
         "volatility_shock_ratio_max": 1.75,
         "target_hourly_volatility": 0.012,
+        "volatility_targeting_power": 1.0,
+        "directional_energy_period": 24,
+        "adverse_energy_soft_ratio": 0.80,
+        "latest_adverse_return_sigma_max": 1.35,
         "extension_max_atr": 1.80,
         "latest_range_max_atr": 2.20,
         "volume_lookback_bars": 48,
@@ -115,6 +119,12 @@ def _atr(rows: Sequence[Mapping[str, Any]], period: int) -> float | None:
 
 def _log_returns(closes: Sequence[float]) -> list[float]:
     return [log(closes[index] / closes[index - 1]) for index in range(1, len(closes))]
+
+
+def _root_mean_square(values: Sequence[float]) -> float:
+    if not values:
+        return 0.0
+    return sqrt(sum(float(value) ** 2 for value in values) / len(values))
 
 
 def evaluate_volatility_managed_trend(
@@ -202,6 +212,28 @@ def evaluate_volatility_managed_trend(
     if not trend_aligned:
         return VolatilityManagedTrendDecision(side=side, reason="ema_trend_not_aligned", metrics=metrics)
 
+    direction = 1.0 if side == "long" else -1.0
+    energy_period = max(6, int(cfg["directional_energy_period"]))
+    signed_returns = [direction * value for value in returns[-energy_period:]]
+    favorable_energy = _root_mean_square([max(value, 0.0) for value in signed_returns])
+    adverse_energy = _root_mean_square([min(value, 0.0) for value in signed_returns])
+    adverse_energy_ratio = adverse_energy / max(favorable_energy, 1e-9)
+    latest_signed_return = signed_returns[-1] if signed_returns else 0.0
+    latest_adverse_sigma = max(0.0, -latest_signed_return) / max(short_vol, 1e-9)
+    metrics.update({
+        "favorable_return_energy": favorable_energy,
+        "adverse_return_energy": adverse_energy,
+        "adverse_energy_ratio": adverse_energy_ratio,
+        "latest_signed_return": latest_signed_return,
+        "latest_adverse_return_sigma": latest_adverse_sigma,
+    })
+    if latest_adverse_sigma > float(cfg["latest_adverse_return_sigma_max"]):
+        return VolatilityManagedTrendDecision(
+            side=side,
+            reason="latest_bar_reversal_shock",
+            metrics=metrics,
+        )
+
     efficiency_period = max(4, int(cfg["efficiency_period"]))
     efficiency_window = closes[-efficiency_period - 1:]
     path = sum(abs(efficiency_window[index] - efficiency_window[index - 1]) for index in range(1, len(efficiency_window)))
@@ -209,8 +241,9 @@ def evaluate_volatility_managed_trend(
     extension_atr = abs(closes[-1] - fast_ema[-1]) / atr_value
     latest_range_atr = (float(candles[-1]["high"]) - float(candles[-1]["low"])) / atr_value
     volume_period = max(8, int(cfg["volume_lookback_bars"]))
-    volume_baseline = median([float(row["volume"]) for row in candles[-volume_period - 1:-1]])
-    volume_ratio = float(candles[-1]["volume"]) / volume_baseline if volume_baseline > 0 else 1.0
+    volume_baseline = median([float(row["volume"]) for row in candles[-volume_period - 3:-3]])
+    recent_volume = median([float(row["volume"]) for row in candles[-3:]])
+    volume_ratio = recent_volume / volume_baseline if volume_baseline > 0 else 1.0
     structure_window = candles[-max(3, int(cfg["structure_lookback_bars"])) - 1:-1]
     structure_stop = (
         min(float(row["low"]) for row in structure_window)
@@ -222,6 +255,7 @@ def evaluate_volatility_managed_trend(
         "extension_atr": extension_atr,
         "latest_range_atr": latest_range_atr,
         "volume_ratio": volume_ratio,
+        "recent_volume_median": recent_volume,
         "structure_stop": structure_stop,
     })
     if efficiency < float(cfg["efficiency_min"]):
@@ -241,20 +275,36 @@ def evaluate_volatility_managed_trend(
     score += min(15.0, efficiency * 30.0)
     score += min(10.0, median_strength * 4.0)
     score += min(5.0, max(0.0, volume_ratio - 0.5) * 5.0)
+    if slow_vote == side:
+        score += 4.0
+    score -= min(10.0, max(0.0, adverse_energy_ratio - 0.50) * 8.0)
     score = min(100.0, score)
     metrics["score"] = score
     if score < float(cfg["score_min"]):
         return VolatilityManagedTrendDecision(side=side, score=score, reason="score_below_threshold", metrics=metrics)
 
     target_vol = max(1e-6, float(cfg["target_hourly_volatility"]))
-    volatility_scale = min(1.0, target_vol / max(short_vol, long_vol, 1e-9))
-    l2_multiplier = float((l2_gate or {}).get("risk_multiplier", 1.0) or 0.0)
-    risk = min(
-        float(cfg["risk_multiplier_cap"]),
-        max(float(cfg["risk_multiplier_floor"]), score / 100.0 * volatility_scale),
-        max(0.0, l2_multiplier),
+    targeting_power = max(0.25, float(cfg.get("volatility_targeting_power", 1.0) or 1.0))
+    volatility_scale = min(
+        1.0,
+        (target_vol / max(short_vol, long_vol, 1e-9)) ** targeting_power,
     )
-    metrics["volatility_scale"] = volatility_scale
+    adverse_soft = max(0.05, float(cfg["adverse_energy_soft_ratio"]))
+    adverse_scale = min(1.0, adverse_soft / max(adverse_energy_ratio, adverse_soft))
+    l2_multiplier = float((l2_gate or {}).get("risk_multiplier", 1.0) or 0.0)
+    floor = max(0.0, float(cfg["risk_multiplier_floor"]))
+    cap = max(floor, min(1.0, float(cfg["risk_multiplier_cap"])))
+    quality = max(
+        0.0,
+        min(1.0, (score - float(cfg["score_min"])) / max(100.0 - float(cfg["score_min"]), 1e-9)),
+    )
+    quality_budget = floor + (cap - floor) * quality
+    risk = min(cap, quality_budget * volatility_scale * adverse_scale, max(0.0, l2_multiplier))
+    metrics.update({
+        "volatility_scale": volatility_scale,
+        "adverse_energy_scale": adverse_scale,
+        "quality_risk_budget": quality_budget,
+    })
     return VolatilityManagedTrendDecision(
         side=side,
         allowed=True,
@@ -262,7 +312,8 @@ def evaluate_volatility_managed_trend(
         risk_multiplier=max(0.0, risk),
         reason=(
             f"VMT {side} score={score:.1f} horizons={max(long_votes, short_votes)}/{len(horizons)} "
-            f"efficiency={efficiency:.2f} vol-scale={volatility_scale:.2f}"
+            f"efficiency={efficiency:.2f} vol-scale={volatility_scale:.2f} "
+            f"adverse-scale={adverse_scale:.2f}"
         ),
         metrics=metrics,
     )

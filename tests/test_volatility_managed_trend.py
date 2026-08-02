@@ -82,5 +82,35 @@ def test_vmt_fails_closed_when_shared_l2_is_stressed():
     assert decision.reason == "l2_stressed"
 
 
+def test_vmt_rejects_immediate_adverse_return_shock_inside_old_trend():
+    rows = [dict(row) for row in _trend_rows(1)]
+    previous = rows[-2]["close"]
+    rows[-1].update({
+        "open": previous,
+        "high": previous + 0.10,
+        "low": previous - 0.30,
+        "close": previous - 0.20,
+        "volume": 110.0,
+    })
+
+    decision = evaluate_volatility_managed_trend(rows, _healthy_l2("long"))
+
+    assert decision.allowed is False
+    assert decision.reason == "latest_bar_reversal_shock"
+    assert decision.metrics["latest_adverse_return_sigma"] > 1.35
+
+
+def test_vmt_volatility_targeting_can_scale_below_quality_floor():
+    decision = evaluate_volatility_managed_trend(
+        _trend_rows(1),
+        _healthy_l2("long"),
+        {"target_hourly_volatility": 0.0001},
+    )
+
+    assert decision.allowed is True
+    assert 0.0 < decision.risk_multiplier < default_volatility_managed_trend_config()["risk_multiplier_floor"]
+    assert decision.metrics["volatility_scale"] < 1.0
+
+
 def test_vmt_identifier_is_stable():
     assert VOLATILITY_MANAGED_TREND_STRATEGY == "volatility_managed_trend_v1"

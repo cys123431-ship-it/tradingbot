@@ -87,6 +87,11 @@ def default_ev_adaptive_config():
         "max_spread_pct": 0.08,
         "high_vol_atr_pct": 1.5,
         "extreme_atr_pct": 2.5,
+        # Scale exposure continuously once ATR rises above the target instead
+        # of applying a discontinuous fixed haircut.  This preserves more
+        # exposure near the target and cuts it progressively into a shock.
+        "volatility_targeting_enabled": True,
+        "volatility_targeting_power": 1.0,
         "atr_threshold_reference_timeframe": "15m",
         "atr_threshold_timeframe_scaling_enabled": True,
         "atr_threshold_max_scale": 5.0,
@@ -1083,10 +1088,21 @@ def evaluate_ev_adaptive_entry(*, side, candidate_type, values=None, config=None
             risk_multiplier *= 0.75
         elif leadership < 55.0:
             risk_multiplier *= 0.90
-    if atr_pct is not None and atr_pct >= high_vol_atr_pct:
-        risk_multiplier *= 0.60
+    if (
+        bool(cfg.get("volatility_targeting_enabled", True))
+        and atr_pct is not None
+        and atr_pct > high_vol_atr_pct
+    ):
+        power = max(0.25, float(cfg.get("volatility_targeting_power", 1.0) or 1.0))
+        volatility_scale = _clamp(
+            (high_vol_atr_pct / max(atr_pct, 1e-9)) ** power,
+            0.0,
+            1.0,
+        )
+        risk_multiplier *= volatility_scale
         reasons.append(
-            f"high volatility risk reduction ({atr_pct:.3f}%>={high_vol_atr_pct:.3f}% {entry_timeframe})"
+            f"continuous volatility targeting x{volatility_scale:.2f} "
+            f"({atr_pct:.3f}%>{high_vol_atr_pct:.3f}% {entry_timeframe})"
         )
     if side == "short":
         risk_multiplier *= 0.60

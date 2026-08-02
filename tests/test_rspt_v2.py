@@ -1,8 +1,11 @@
+import pytest
+
 from utbreakout.rspt_v2 import (
     evaluate_pullback_setup,
     residual_strength_percentiles,
     volatility_risk_multiplier,
 )
+from utbreakout.rspt_v3 import residual_momentum_score as residual_momentum_score_v3
 
 
 def _rows_from_returns(returns, *, start=100.0, step_ms=14_400_000):
@@ -65,6 +68,37 @@ def test_residual_strength_removes_common_btc_eth_move():
     assert result[symbols[1]]["percentile"] == 0.5
     assert result[symbols[2]]["percentile"] == 0.0
     assert result[symbols[0]]["method"] == "btc_eth_residual_momentum"
+
+
+def test_rspt_v3_marks_fast_slow_residual_momentum_conflict():
+    count = 130
+    btc = [0.0002 * ((idx % 5) - 2) for idx in range(count)]
+    eth = [0.00015 * ((idx % 7) - 3) for idx in range(count)]
+    candidate = [
+        0.5 * btc_ret + 0.3 * eth_ret + (0.0015 if idx < count - 28 else -0.003)
+        for idx, (btc_ret, eth_ret) in enumerate(zip(btc, eth))
+    ]
+    rows = {
+        "BTC/USDT:USDT": _rows_from_returns(btc),
+        "ETH/USDT:USDT": _rows_from_returns(eth),
+        "REVERSING/USDT:USDT": _rows_from_returns(candidate),
+    }
+
+    _, detail = residual_momentum_score_v3(
+        "REVERSING/USDT:USDT",
+        rows,
+        {
+            "relative_strength_reference_symbols": ["BTC/USDT:USDT", "ETH/USDT:USDT"],
+            "relative_strength_long_lookback_bars": 100,
+            "relative_strength_short_lookback_bars": 28,
+            "residual_strength_min_aligned_returns": 40,
+        },
+    )
+
+    assert detail["residual_horizon_agreement"] is False
+    assert detail["residual_long_score"] > 0
+    assert detail["residual_short_score"] < 0
+    assert detail["residual_consistency_scale"] < 1.0
 
 
 def _pullback_rows(include_impulse=True):
@@ -178,5 +212,6 @@ def test_volatility_multiplier_only_reduces_risk():
     extreme = volatility_risk_multiplier(6.0, 100.0, {})
 
     assert normal[0] == 1.0
-    assert high[0] == 0.70
-    assert extreme[0] == 0.35
+    assert high[0] == 0.875
+    assert extreme[0] == pytest.approx(3.5 / 6.0)
+    assert normal[0] > high[0] > extreme[0] > 0.0

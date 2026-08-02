@@ -1,3 +1,5 @@
+import pytest
+
 from utbreakout.ev_adaptive import (
     adapt_exit_for_quantity,
     evaluate_ev_time_stop,
@@ -85,6 +87,46 @@ def test_strong_trend_uses_convex_exit_without_increasing_initial_risk():
     assert decision.exit_profile.tp1_r == 1.0
     assert decision.exit_profile.tp2_r == 4.2
     assert decision.exit_profile.runner_ratio == 0.55
+
+
+def test_high_volatility_risk_scales_continuously_from_target():
+    values = {
+        "entry_price": 100.0,
+        "open": 99.4,
+        "ema50": 98.5,
+        "ema50_prev": 98.0,
+        "htf_ready": True,
+        "htf_close": 105.0,
+        "htf_ema_fast": 102.0,
+        "htf_ema_slow": 100.0,
+        "htf_supertrend_direction": "long",
+        "adx": 31.0,
+        "plus_di": 30.0,
+        "minus_di": 14.0,
+        "chop": 39.0,
+        "volume_ratio": 1.45,
+        "directional_efficiency": 0.42,
+        "momentum_12_pct": 2.4,
+        "atr_pct": 0.8,
+        "futures_spread_pct": 0.02,
+    }
+    baseline = evaluate_ev_adaptive_entry(
+        side="long",
+        candidate_type="fresh_signal",
+        values=values,
+        config={"high_vol_atr_pct": 1.0, "extreme_atr_pct": 5.0},
+    )
+    scaled = evaluate_ev_adaptive_entry(
+        side="long",
+        candidate_type="fresh_signal",
+        values=values,
+        config={"high_vol_atr_pct": 0.5, "extreme_atr_pct": 5.0},
+    )
+
+    assert baseline.allowed is True
+    assert scaled.allowed is True
+    assert scaled.risk_multiplier == pytest.approx(baseline.risk_multiplier * 0.625)
+    assert any("continuous volatility targeting" in reason for reason in scaled.reasons)
 
 
 def test_short_momentum_is_blocked_during_panic_rebound():
