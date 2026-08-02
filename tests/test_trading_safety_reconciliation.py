@@ -185,12 +185,186 @@ def test_binance_terminal_entry_record_closes_when_exchange_position_is_flat(tmp
             )
         )
 
-        result = await reconcile_exchange_state(BinanceFlatExchange(), store)
+        result = await reconcile_exchange_state(
+            BinanceFlatExchange(),
+            store,
+            position_visibility_grace_seconds=0,
+        )
 
         assert result.safe_to_trade is True
         record = store.get("cid-usdc")
         assert record.order_state == OrderState.CLOSED.value
         assert record.metadata["reconciled_terminal_order_status"] == "FILLED"
+
+    asyncio.run(scenario())
+
+
+def test_recent_fill_waits_for_position_visibility_instead_of_closing(tmp_path):
+    class EventuallyVisibleBinanceExchange:
+        id = "binance"
+
+        def __init__(self):
+            self.positions = []
+
+        def fetch_positions(self):
+            return list(self.positions)
+
+        def fetch_open_orders(self):
+            return []
+
+        def fapiPrivateGetOpenAlgoOrders(self, params):
+            return [{
+                "algoId": "sl-1",
+                "clientAlgoId": "sl-client",
+                "symbol": "BTCUSDT",
+                "orderType": "STOP_MARKET",
+                "side": "SELL",
+                "quantity": "1",
+                "triggerPrice": "90",
+                "reduceOnly": "true",
+                "workingType": "MARK_PRICE",
+                "algoStatus": "NEW",
+            }]
+
+        def fapiPrivateGetOrder(self, params):
+            return {
+                "symbol": "BTCUSDT",
+                "clientOrderId": params["origClientOrderId"],
+                "status": "FILLED",
+            }
+
+        def market(self, symbol):
+            return {
+                "precision": {"price": 0.01},
+                "info": {
+                    "filters": [{"filterType": "PRICE_FILTER", "tickSize": "0.01"}]
+                },
+            }
+
+    async def scenario():
+        exchange = EventuallyVisibleBinanceExchange()
+        store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+        store.upsert(
+            OrderRecord(
+                "entry-race",
+                "BTC/USDT:USDT",
+                "LONG",
+                "UTB",
+                "1",
+                1.0,
+                filled_qty=1.0,
+                average_fill_price=100.0,
+                order_state=OrderState.FILLED_UNPROTECTED.value,
+            )
+        )
+
+        pending = await reconcile_exchange_state(exchange, store)
+
+        assert pending.safe_to_trade is False
+        assert "position_visibility_pending:BTC/USDT:USDT" in pending.issues
+        assert store.get("entry-race").order_state == OrderState.FILLED_UNPROTECTED.value
+
+        exchange.positions = [{
+            "symbol": "BTC/USDT:USDT",
+            "side": "long",
+            "contracts": 1,
+            "entryPrice": 100,
+            "liquidationPrice": 50,
+        }]
+        recovered = await reconcile_exchange_state(exchange, store)
+
+        assert recovered.safe_to_trade is True
+        assert store.get("entry-race").order_state == OrderState.PROTECTED.value
+        assert not any(
+            record.strategy == "EXTERNAL_OR_PRE_RECONCILIATION"
+            for record in store.records_for_symbol("BTC/USDT:USDT")
+        )
+
+    asyncio.run(scenario())
+
+
+def test_tracked_entry_closes_duplicate_synthetic_reconciliation_record(tmp_path):
+    class BinancePositionExchange:
+        id = "binance"
+
+        def fetch_positions(self):
+            return [{
+                "symbol": "BTC/USDT:USDT",
+                "side": "long",
+                "contracts": 1,
+                "entryPrice": 100,
+                "liquidationPrice": 50,
+            }]
+
+        def fetch_open_orders(self):
+            return []
+
+        def fapiPrivateGetOpenAlgoOrders(self, params):
+            return [{
+                "algoId": "sl-1",
+                "clientAlgoId": "sl-client",
+                "symbol": "BTCUSDT",
+                "orderType": "STOP_MARKET",
+                "side": "SELL",
+                "quantity": "1",
+                "triggerPrice": "90",
+                "reduceOnly": "true",
+                "workingType": "MARK_PRICE",
+                "algoStatus": "NEW",
+            }]
+
+        def fapiPrivateGetOrder(self, params):
+            return {
+                "symbol": "BTCUSDT",
+                "clientOrderId": params["origClientOrderId"],
+                "status": "FILLED",
+            }
+
+        def market(self, symbol):
+            return {
+                "precision": {"price": 0.01},
+                "info": {
+                    "filters": [{"filterType": "PRICE_FILTER", "tickSize": "0.01"}]
+                },
+            }
+
+    async def scenario():
+        store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+        store.upsert(
+            OrderRecord(
+                "entry-primary",
+                "BTC/USDT:USDT",
+                "LONG",
+                "UTB",
+                "1",
+                1.0,
+                filled_qty=1.0,
+                order_state=OrderState.PROTECTED.value,
+                stop_order_id="sl-1",
+            )
+        )
+        store.upsert(
+            OrderRecord(
+                "entry-synthetic",
+                "BTC/USDT:USDT",
+                "LONG",
+                "EXTERNAL_OR_PRE_RECONCILIATION",
+                "2",
+                1.0,
+                filled_qty=1.0,
+                order_state=OrderState.PROTECTED.value,
+                stop_order_id="sl-1",
+                metadata={"source": "startup_exchange_reconciliation"},
+            )
+        )
+
+        result = await reconcile_exchange_state(BinancePositionExchange(), store)
+
+        assert result.safe_to_trade is True
+        duplicate = store.get("entry-synthetic")
+        assert duplicate.order_state == OrderState.CLOSED.value
+        assert duplicate.metadata["duplicate_of_client_order_id"] == "entry-primary"
+        assert store.get("entry-primary").order_state == OrderState.PROTECTED.value
 
     asyncio.run(scenario())
 

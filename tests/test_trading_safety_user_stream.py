@@ -1,3 +1,5 @@
+import asyncio
+
 from trading_safety.order_state import OrderRecord, OrderState, SQLiteTradingStateStore
 from trading_safety.user_data_stream import BinanceUserDataStream
 
@@ -108,3 +110,61 @@ def test_account_update_matches_ccxt_usdc_symbol_to_binance_market_id(tmp_path):
 
     assert locks == []
     assert store.get_runtime_state("entry_lock_reason") is None
+
+
+def test_transient_reconciliation_failure_retries_without_false_disconnect(tmp_path):
+    async def scenario():
+        store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+        outcomes = iter((False, False, True))
+        locks = []
+
+        async def reconcile():
+            return next(outcomes)
+
+        stream = BinanceUserDataStream(
+            object(),
+            store,
+            reconcile_callback=reconcile,
+            lock_callback=locks.append,
+            reconciliation_retry_delays=(0.0, 0.0, 0.0),
+        )
+        stream.connected = True
+
+        assert await stream._run_scheduled_reconciliation("ALGO_UPDATE", 0.0) is True
+        status = store.get_runtime_state("user_data_stream")
+        assert status == {
+            "connected": True,
+            "reason": "connected_and_reconciled:ALGO_UPDATE",
+        }
+        assert "USER_STREAM_DISCONNECTED" not in locks
+
+    asyncio.run(scenario())
+
+
+def test_persistent_reconciliation_failure_keeps_transport_state_and_does_not_raise(tmp_path):
+    async def scenario():
+        store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+        locks = []
+
+        async def reconcile():
+            return False
+
+        stream = BinanceUserDataStream(
+            object(),
+            store,
+            reconcile_callback=reconcile,
+            lock_callback=locks.append,
+            reconciliation_retry_delays=(0.0, 0.0),
+        )
+        stream.connected = True
+
+        assert await stream._run_scheduled_reconciliation("ORDER_TRADE_UPDATE", 0.0) is False
+        status = store.get_runtime_state("user_data_stream")
+        assert status == {
+            "connected": True,
+            "reason": "reconciliation_failed:ORDER_TRADE_UPDATE",
+        }
+        assert locks[-1] == "RECONCILIATION_REQUIRED:ORDER_TRADE_UPDATE"
+        assert "USER_STREAM_DISCONNECTED" not in locks
+
+    asyncio.run(scenario())

@@ -20,6 +20,20 @@ from .order_state import (
 
 logger = logging.getLogger(__name__)
 
+_ENTRY_PROGRESS_RANK = {
+    OrderState.PLANNED.value: 0,
+    OrderState.SUBMITTING.value: 1,
+    OrderState.SUBMITTED_UNKNOWN.value: 1,
+    OrderState.ACKNOWLEDGED.value: 2,
+    OrderState.PARTIALLY_FILLED.value: 3,
+    OrderState.FILLED_UNVERIFIED_LIQUIDATION.value: 4,
+    OrderState.FILLED_LIQUIDATION_CONFLICT.value: 5,
+    OrderState.FILLED_UNPROTECTED.value: 5,
+    OrderState.PROTECTED.value: 6,
+    OrderState.CLOSING.value: 7,
+    OrderState.PARTIALLY_CLOSED.value: 8,
+}
+
 
 def _as_dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
@@ -250,6 +264,25 @@ class IdempotentOrderGateway:
         intent = OrderIntent(record.order_intent if record else OrderIntent.ENTRY.value)
         state = _classify_order(order, intent=intent)
         filled, average = _order_fill(order)
+        if record is not None and intent in {
+            OrderIntent.ENTRY,
+            OrderIntent.POSITION_ADD,
+            OrderIntent.GRID_ENTRY,
+        }:
+            current_rank = _ENTRY_PROGRESS_RANK.get(record.order_state, -1)
+            incoming_rank = _ENTRY_PROGRESS_RANK.get(state, -1)
+            exchange_terminal_after_fill = (
+                state in {OrderState.CANCELED.value, OrderState.FAILED.value}
+                and float(record.filled_qty or 0.0) > 0
+            )
+            if (
+                incoming_rank >= 0
+                and current_rank > incoming_rank
+            ) or exchange_terminal_after_fill:
+                state = record.order_state
+            filled = max(float(record.filled_qty or 0.0), float(filled or 0.0))
+            if float(average or 0.0) <= 0:
+                average = float(record.average_fill_price or 0.0)
         return self.store.transition(
             client_order_id,
             state,

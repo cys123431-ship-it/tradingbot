@@ -45,12 +45,17 @@ class BinanceUserDataStream:
         testnet: bool = False,
         reconcile_callback: Callable[[], Awaitable[bool]] | None = None,
         lock_callback: Callable[[str], None] | None = None,
+        reconciliation_retry_delays: tuple[float, ...] = (0.0, 1.0, 2.0, 4.0, 8.0, 16.0),
     ) -> None:
         self.exchange = exchange
         self.store = store
         self.testnet = bool(testnet)
         self.reconcile_callback = reconcile_callback
         self.lock_callback = lock_callback
+        self.reconciliation_retry_delays = tuple(
+            max(0.0, float(delay))
+            for delay in (reconciliation_retry_delays or (0.0,))
+        )
         self.connected = False
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
@@ -366,14 +371,56 @@ class BinanceUserDataStream:
             name="binance-user-stream-reconciliation",
         )
 
-    async def _run_scheduled_reconciliation(self, reason: str, delay: float) -> None:
+    async def _run_scheduled_reconciliation(self, reason: str, delay: float) -> bool:
         if delay:
             await asyncio.sleep(delay)
         if self.lock_callback:
             self.lock_callback(f"RECONCILIATION_REQUIRED:{reason}")
-        if self.reconcile_callback and not await self.reconcile_callback():
-            self._set_connected(False, f"reconciliation_failed:{reason}")
-            raise RuntimeError(f"REST reconciliation failed after {reason}")
+        if self.reconcile_callback is None:
+            return True
+
+        last_error: BaseException | None = None
+        for retry_delay in self.reconciliation_retry_delays:
+            if retry_delay:
+                await asyncio.sleep(retry_delay)
+            try:
+                if await self.reconcile_callback():
+                    # A REST reconciliation failure does not close the websocket.
+                    # Keep transport health separate from reconciliation health and
+                    # repair any stale status left by an earlier transient race.
+                    self.store.set_runtime_state(
+                        "user_data_stream",
+                        {
+                            "connected": bool(self.connected),
+                            "reason": f"connected_and_reconciled:{reason}",
+                        },
+                    )
+                    return True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "User data stream reconciliation attempt failed after %s: %s",
+                    reason,
+                    exc,
+                )
+
+        self.store.set_runtime_state(
+            "user_data_stream",
+            {
+                "connected": bool(self.connected),
+                "reason": f"reconciliation_failed:{reason}",
+            },
+        )
+        if self.lock_callback:
+            self.lock_callback(f"RECONCILIATION_REQUIRED:{reason}")
+        logger.error(
+            "REST reconciliation remained unsafe after %s%s",
+            reason,
+            f": {last_error}" if last_error is not None else "",
+        )
+        return False
 
     async def _consume_messages(self, websocket: Any) -> None:
         async for message in websocket:

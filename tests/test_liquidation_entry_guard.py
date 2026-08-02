@@ -90,6 +90,35 @@ def test_optional_auto_reduce_never_increases_leverage_and_selects_highest_safe_
     asyncio.run(scenario())
 
 
+def test_preflight_retries_until_new_margin_and_leverage_settings_are_visible():
+    async def scenario():
+        engine = make_preflight_engine()
+        responses = iter(
+            (
+                [{"symbol": "HMSTRUSDT", "marginType": "CROSSED", "leverage": "5"}],
+                [{"symbol": "HMSTRUSDT", "marginType": "ISOLATED", "leverage": "3"}],
+            )
+        )
+        engine.exchange.fapiPrivateGetSymbolConfig = lambda params: next(responses)
+
+        result = await emas._preflight_liquidation_safety(
+            engine,
+            "HMSTR/USDT:USDT",
+            "long",
+            0.0002339,
+            0.00018,
+            3,
+            1000,
+            {"liquidation_settings_verify_retry_delays_seconds": [0, 0]},
+        )
+
+        assert result["valid"] is True
+        assert result["selected_leverage"] == 3
+        assert result["margin_type"] == "ISOLATED"
+
+    asyncio.run(scenario())
+
+
 def test_post_fill_conflict_locks_closes_reduce_only_and_pauses(monkeypatch):
     async def scenario():
         store = SQLiteTradingStateStore(":memory:")

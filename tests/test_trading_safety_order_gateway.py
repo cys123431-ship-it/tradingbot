@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 from trading_safety.order_gateway import IdempotentOrderGateway
-from trading_safety.order_state import OrderState, SQLiteTradingStateStore
+from trading_safety.order_state import OrderRecord, OrderState, SQLiteTradingStateStore
 
 
 class MockExchange:
@@ -224,3 +224,36 @@ def test_authentication_error_persists_global_entry_lock(tmp_path):
         assert gateway.store.get_runtime_state("entry_lock_reason").startswith("AUTHENTICATION_ERROR")
 
     asyncio.run(scenario())
+
+
+def test_exchange_ack_cannot_regress_concurrent_fill_state(tmp_path):
+    exchange = MockExchange()
+    gateway = _gateway(tmp_path, exchange)
+    record = gateway.store.upsert(
+        OrderRecord(
+            "cid-race",
+            "BTC/USDT:USDT",
+            "LONG",
+            "UTB",
+            "1",
+            1.0,
+            order_state=OrderState.FILLED_UNVERIFIED_LIQUIDATION.value,
+            filled_qty=1.0,
+            average_fill_price=100.0,
+        )
+    )
+
+    updated = gateway._transition_from_exchange_order(
+        record.client_order_id,
+        {
+            "id": "123",
+            "status": "NEW",
+            "amount": 1.0,
+            "filled": 0.0,
+            "average": 0.0,
+        },
+    )
+
+    assert updated.order_state == OrderState.FILLED_UNVERIFIED_LIQUIDATION.value
+    assert updated.filled_qty == pytest.approx(1.0)
+    assert updated.average_fill_price == pytest.approx(100.0)

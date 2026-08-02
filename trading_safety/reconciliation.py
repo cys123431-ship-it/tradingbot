@@ -81,6 +81,18 @@ def _normalize_symbol(value: Any) -> str:
     return normalize_futures_market_id(value)
 
 
+def _record_age_seconds(record: OrderRecord) -> float:
+    for value in (record.updated_at, record.created_at):
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+        except (TypeError, ValueError):
+            continue
+    return float("inf")
+
+
 def _exchange_order_status(order: dict[str, Any] | None) -> str:
     payload = _as_dict(order)
     info = _as_dict(payload.get("info"))
@@ -397,6 +409,7 @@ async def reconcile_exchange_state(
     liquidation_config: dict[str, Any] | None = None,
     user_stream_ready: bool = True,
     require_user_stream: bool = False,
+    position_visibility_grace_seconds: float = 30.0,
 ) -> ReconciliationResult:
     """Reconcile without placing or canceling orders.
 
@@ -437,6 +450,38 @@ async def reconcile_exchange_state(
         symbol = _position_symbol(position)
         normalized = _normalize_symbol(symbol)
         records = active_by_symbol.get(normalized, [])
+        tracked_entries = [
+            record
+            for record in records
+            if record.strategy != "EXTERNAL_OR_PRE_RECONCILIATION"
+            and str(record.order_intent or "").upper() == OrderIntent.ENTRY.value
+        ]
+        if tracked_entries:
+            canonical_record = max(
+                tracked_entries,
+                key=lambda item: str(item.updated_at or item.created_at or ""),
+            )
+            duplicate_synthetic_records = [
+                record
+                for record in records
+                if record.strategy == "EXTERNAL_OR_PRE_RECONCILIATION"
+                and record.metadata.get("source") == "startup_exchange_reconciliation"
+            ]
+            for duplicate in duplicate_synthetic_records:
+                store.transition(
+                    duplicate.client_order_id,
+                    OrderState.CLOSED,
+                    last_error=None,
+                    duplicate_of_client_order_id=canonical_record.client_order_id,
+                    close_reason="duplicate synthetic reconciliation record",
+                )
+            if duplicate_synthetic_records:
+                records = [
+                    record
+                    for record in records
+                    if record not in duplicate_synthetic_records
+                ]
+                active_by_symbol[normalized] = records
         if not records:
             side = str(position.get("side") or ("long" if _position_qty(position) > 0 else "short"))
             signature = position.get("timestamp") or position.get("datetime") or "startup"
@@ -550,6 +595,11 @@ async def reconcile_exchange_state(
         normalized = _normalize_symbol(record.symbol)
         position_present = normalized in position_symbols
         lookup_order: dict[str, Any] | None = None
+        try:
+            intent = OrderIntent(record.order_intent)
+        except ValueError:
+            unresolved_records.append(f"invalid_intent:{record.client_order_id}")
+            intent = OrderIntent.ENTRY
         synthetic_position_record = (
             record.strategy == "EXTERNAL_OR_PRE_RECONCILIATION"
             and record.metadata.get("source")
@@ -572,11 +622,6 @@ async def reconcile_exchange_state(
             record.order_state in lookup_required_states
             and record.client_order_id not in open_by_client_id
         ):
-            try:
-                intent = OrderIntent(record.order_intent)
-            except ValueError:
-                unresolved_records.append(f"invalid_intent:{record.client_order_id}")
-                intent = OrderIntent.ENTRY
             if open_orders_fetcher is not None:
                 lookup_status, lookup_error = "NOT_FOUND", None
             elif intent in {OrderIntent.PROTECTION_SL, OrderIntent.PROTECTION_TP}:
@@ -620,6 +665,21 @@ async def reconcile_exchange_state(
             and _exchange_order_status(lookup_order)
             in {"FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
         ):
+            recently_filled_entry = (
+                intent in {
+                    OrderIntent.ENTRY,
+                    OrderIntent.POSITION_ADD,
+                    OrderIntent.GRID_ENTRY,
+                }
+                and _exchange_order_status(lookup_order) == "FILLED"
+                and _record_age_seconds(record)
+                < max(0.0, float(position_visibility_grace_seconds or 0.0))
+            )
+            if recently_filled_entry:
+                issues.append(
+                    f"position_visibility_pending:{record.symbol}"
+                )
+                continue
             store.transition(
                 record.client_order_id,
                 OrderState.CLOSED,

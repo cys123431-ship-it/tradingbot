@@ -111,23 +111,66 @@ async def _preflight_liquidation_safety(self, symbol, side, entry_price, stop_pr
     bracket_method = getattr(self.exchange, 'fapiPrivateGetLeverageBracket', None)
     if not callable(symbol_config_method) or not callable(bracket_method):
         return {'valid': False, 'status': 'LIQUIDATION_SAFETY_UNKNOWN', 'reason': 'BINANCE_RISK_ENDPOINT_UNAVAILABLE'}
-    try:
-        symbol_config_raw = await asyncio.to_thread(symbol_config_method, {'symbol': symbol_id})
-        bracket_raw = await asyncio.to_thread(bracket_method, {'symbol': symbol_id})
-    except Exception as exc:
-        logger.exception("Liquidation safety preflight exchange lookup failed for %s", symbol)
-        return {
-            'valid': False,
-            'status': 'LIQUIDATION_SAFETY_UNKNOWN',
-            'reason': f'BINANCE_RISK_LOOKUP_FAILED:{type(exc).__name__}',
-        }
-
-    symbol_rows = symbol_config_raw if isinstance(symbol_config_raw, list) else [symbol_config_raw]
-    symbol_config = next(
-        (row for row in symbol_rows if isinstance(row, dict) and str(row.get('symbol') or symbol_id) == symbol_id),
-        None,
+    raw_retry_delays = (
+        cfg.get('liquidation_settings_verify_retry_delays_seconds')
+        if isinstance(cfg, dict)
+        else None
     )
+    if not isinstance(raw_retry_delays, (list, tuple)):
+        raw_retry_delays = (0.0, 0.25, 0.5, 1.0, 2.0)
+    try:
+        retry_delays = tuple(max(0.0, float(value)) for value in raw_retry_delays)
+    except (TypeError, ValueError):
+        retry_delays = (0.0, 0.25, 0.5, 1.0, 2.0)
+    if not retry_delays:
+        retry_delays = (0.0,)
+
+    symbol_config = None
+    symbol_lookup_error = None
+    for retry_delay in retry_delays:
+        if retry_delay:
+            await asyncio.sleep(retry_delay)
+        try:
+            symbol_config_raw = await asyncio.to_thread(
+                symbol_config_method,
+                {'symbol': symbol_id},
+            )
+        except Exception as exc:
+            symbol_lookup_error = exc
+            continue
+        symbol_rows = (
+            symbol_config_raw
+            if isinstance(symbol_config_raw, list)
+            else [symbol_config_raw]
+        )
+        symbol_config = next(
+            (
+                row
+                for row in symbol_rows
+                if isinstance(row, dict)
+                and str(row.get('symbol') or symbol_id) == symbol_id
+            ),
+            None,
+        )
+        if not isinstance(symbol_config, dict):
+            continue
+        observed_margin = str(symbol_config.get('marginType') or '').upper()
+        observed_leverage = int(float(symbol_config.get('leverage') or 0))
+        if observed_margin == 'ISOLATED' and observed_leverage == int(leverage):
+            break
+
     if not isinstance(symbol_config, dict):
+        if symbol_lookup_error is not None:
+            logger.warning(
+                "Liquidation safety symbol-config lookup failed for %s: %s",
+                symbol,
+                symbol_lookup_error,
+            )
+            return {
+                'valid': False,
+                'status': 'LIQUIDATION_SAFETY_UNKNOWN',
+                'reason': f'BINANCE_RISK_LOOKUP_FAILED:{type(symbol_lookup_error).__name__}',
+            }
         return {'valid': False, 'status': 'LIQUIDATION_SAFETY_UNKNOWN', 'reason': 'SYMBOL_CONFIG_UNAVAILABLE'}
     margin_type = str(symbol_config.get('marginType') or '').upper()
     configured_leverage = int(float(symbol_config.get('leverage') or 0))
@@ -142,6 +185,23 @@ async def _preflight_liquidation_safety(self, symbol, side, entry_price, stop_pr
             'valid': False,
             'status': 'LIQUIDATION_SAFETY_UNKNOWN',
             'reason': f'LEVERAGE_NOT_CONFIRMED:{configured_leverage}!={int(leverage)}',
+        }
+
+    try:
+        bracket_raw = await asyncio.to_thread(
+            bracket_method,
+            {'symbol': symbol_id},
+        )
+    except Exception as exc:
+        logger.warning(
+            "Liquidation safety leverage-bracket lookup failed for %s: %s",
+            symbol,
+            exc,
+        )
+        return {
+            'valid': False,
+            'status': 'LIQUIDATION_SAFETY_UNKNOWN',
+            'reason': f'BINANCE_RISK_LOOKUP_FAILED:{type(exc).__name__}',
         }
 
     bracket_rows = bracket_raw if isinstance(bracket_raw, list) else [bracket_raw]
