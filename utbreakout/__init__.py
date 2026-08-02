@@ -26,6 +26,13 @@ from .dynamic_leverage import (
     normalize_dynamic_leverage_config,
     select_dynamic_leverage,
 )
+from .opportunity_risk import (
+    OpportunityRiskDecision,
+    apply_opportunity_risk_to_plan,
+    default_opportunity_risk_config,
+    normalize_opportunity_risk_config,
+    select_opportunity_risk,
+)
 from .timeframe import HTF_MAP, select_adaptive_timeframe
 from .micro_auto import (
     MICRO_AUTO_STRATEGY_KEY,
@@ -184,6 +191,11 @@ __all__ = [
     "default_dynamic_leverage_config",
     "normalize_dynamic_leverage_config",
     "select_dynamic_leverage",
+    "OpportunityRiskDecision",
+    "apply_opportunity_risk_to_plan",
+    "default_opportunity_risk_config",
+    "normalize_opportunity_risk_config",
+    "select_opportunity_risk",
     "default_coin_selector_config",
     "finalize_candidate",
     "market_is_tradifi_perpetual",

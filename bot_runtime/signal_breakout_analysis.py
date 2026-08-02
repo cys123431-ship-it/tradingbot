@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from utbreakout.dynamic_leverage import apply_dynamic_leverage_to_plan
+from utbreakout.opportunity_risk import apply_opportunity_risk_to_plan
 
 
 class SignalBreakoutAnalysisMixin:
@@ -2771,6 +2772,17 @@ class SignalBreakoutAnalysisMixin:
             'leverage',
             int(max(1.0, float((common_cfg or {}).get('leverage', 5) or 5))),
         )
+        if stored.get('quad_alpha_agreement_state'):
+            daily_pnl = None
+            try:
+                _, daily_pnl = self.db.get_daily_stats()
+            except Exception:
+                logger.debug('opportunity risk daily pnl lookup failed', exc_info=True)
+            stored = apply_opportunity_risk_to_plan(
+                stored,
+                (common_cfg or {}).get('opportunity_risk'),
+                daily_pnl_usdt=daily_pnl,
+            )
         stored = apply_dynamic_leverage_to_plan(
             stored,
             (common_cfg or {}).get('dynamic_leverage'),
@@ -2791,6 +2803,8 @@ class SignalBreakoutAnalysisMixin:
             margin=stored.get('planned_margin', stored.get('margin_to_use')),
             notional=stored.get('planned_notional', stored.get('target_notional')),
             risk=stored.get('risk_usdt', stored.get('risk_amount')),
+            opportunity_risk_multiplier=stored.get('opportunity_risk_multiplier'),
+            opportunity_risk_tier=stored.get('opportunity_risk_tier'),
             plan_symbol=stored.get('plan_symbol'),
         )
 

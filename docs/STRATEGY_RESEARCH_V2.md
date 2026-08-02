@@ -86,3 +86,20 @@ Thresholds remain deliberately broad and require forward validation.
   rejects widening spread or continued support-side depth depletion.
 - Scales risk by both setup quality and liquidity recovery instead of preserving
   a fixed minimum through stressed conditions.
+
+### Selective opportunity allocation
+
+- Entry thresholds and shared safety gates remain unchanged. A single strategy
+  never receives additional risk from this overlay.
+- Two aligned strategies can increase the already-filtered plan by 12%; three
+  high-conviction strategies by 25%; and four or five elite aligned strategies
+  by at most 35%.
+- Expansion additionally requires a strong aggregate score, normal ATR,
+  controlled stop distance, a fresh entry, healthy directional L2, non-negative
+  daily PnL, and a neutral performance allocator.
+- The final stop-loss budget is capped at 1% of account equity by default. If
+  the existing plan is already above that level, the overlay leaves it alone
+  rather than reducing it unexpectedly.
+- This implements volatility-managed exposure and cross-signal diversification
+  as a bounded sizing overlay; it does not turn weaker signals into entries and
+  does not imply guaranteed profit.

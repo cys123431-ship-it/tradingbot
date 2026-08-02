@@ -8,6 +8,10 @@ from utbreakout.dynamic_leverage import (
     default_dynamic_leverage_config,
     normalize_dynamic_leverage_config,
 )
+from utbreakout.opportunity_risk import (
+    default_opportunity_risk_config,
+    normalize_opportunity_risk_config,
+)
 
 class TradingConfig:
     def __init__(self, config_file='config.json'):
@@ -77,6 +81,7 @@ class TradingConfig:
                 'common_settings': {
                     'leverage': 10,
                     'dynamic_leverage': default_dynamic_leverage_config(),
+                    'opportunity_risk': default_opportunity_risk_config(),
                     'timeframe': '15m',
                     'entry_timeframe': '8h',
                     'exit_timeframe': '4h',
@@ -553,6 +558,22 @@ class TradingConfig:
         for key, value in normalized_dynamic_leverage.items():
             if dynamic_leverage_cfg.get(key) != value:
                 dynamic_leverage_cfg[key] = value
+                changed = True
+
+        opportunity_risk_cfg = common_cfg.setdefault(
+            'opportunity_risk',
+            default_opportunity_risk_config(),
+        )
+        if not isinstance(opportunity_risk_cfg, dict):
+            opportunity_risk_cfg = default_opportunity_risk_config()
+            common_cfg['opportunity_risk'] = opportunity_risk_cfg
+            changed = True
+        normalized_opportunity_risk = normalize_opportunity_risk_config(
+            opportunity_risk_cfg
+        )
+        for key, value in normalized_opportunity_risk.items():
+            if opportunity_risk_cfg.get(key) != value:
+                opportunity_risk_cfg[key] = value
                 changed = True
 
         custom_entry_defaults = {

@@ -2470,6 +2470,21 @@ class SignalAlphaMixin:
                 if isinstance(selected_plan_for_status, dict)
                 else None
             ),
+            'opportunity_risk_multiplier': (
+                selected_plan_for_status.get('opportunity_risk_multiplier')
+                if isinstance(selected_plan_for_status, dict)
+                else None
+            ),
+            'opportunity_risk_tier': (
+                selected_plan_for_status.get('opportunity_risk_tier')
+                if isinstance(selected_plan_for_status, dict)
+                else None
+            ),
+            'opportunity_risk_reason': (
+                selected_plan_for_status.get('opportunity_risk_reason')
+                if isinstance(selected_plan_for_status, dict)
+                else None
+            ),
         }
         final_status.update({
             'strategy': STRATEGY_DISPLAY_NAMES.get(QUAD_ALPHA_STRATEGY, 'QUAD_ALPHA'),
@@ -2485,7 +2500,8 @@ class SignalAlphaMixin:
                 'stage': 'entry_ready',
                 'reason': (
                     f"QUAD_ALPHA {agreement_state} selected {selected['label']} "
-                    f"{selected['side'].upper()} at {agreement_multiplier:.0%} risk: "
+                    f"{selected['side'].upper()} at {agreement_multiplier:.0%} base risk "
+                    f"with opportunity x{float(summary.get('opportunity_risk_multiplier') or 1.0):.2f}: "
                     f"{selected['reason']}"
                 ),
             })
@@ -2627,6 +2643,12 @@ class SignalAlphaMixin:
             f'🟢 유효 신호: {green_count}/{enabled_count} — 초록불만 confirmations에 포함',
             '',
             f"Agreement: {str(summary.get('agreement_state') or 'none').upper()} / confirmations={int(summary.get('confirmation_count') or 0)} / risk x{float(summary.get('agreement_risk_multiplier', 0.0) or 0.0):.2f}",
+            (
+                f"Opportunity risk: x{float(summary.get('opportunity_risk_multiplier') or 1.0):.2f} "
+                f"({summary.get('opportunity_risk_tier') or 'baseline'})"
+                if summary.get('selected')
+                else "Opportunity risk: waiting for multi-strategy alignment"
+            ),
             f"Selected: {summary.get('selected_label') or 'NONE'} {str(summary.get('selected_side') or '').upper()}",
             (
                 f"Leverage: {int(summary.get('dynamic_leverage') or 0)}x "
