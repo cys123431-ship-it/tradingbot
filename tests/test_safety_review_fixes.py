@@ -66,3 +66,41 @@ def test_scanner_keeps_symbol_and_protection_when_position_lookup_fails():
     assert engine.scanner_active_symbol == symbol
     engine._cancel_protection_orders.assert_not_awaited()
     engine._reconcile_closed_position_protection.assert_not_awaited()
+
+
+def test_scanner_adopts_restart_position_before_volume_scan():
+    emas = _emas_module()
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = "UNI/USDT:USDT"
+    engine.running = True
+    engine.scanner_active_symbol = None
+    engine.active_symbols = set()
+    engine.last_volume_scan = 0.0
+    engine.consecutive_errors = 0
+    engine.ctrl = SimpleNamespace(is_paused=True, status_data={})
+    engine.db = SimpleNamespace(get_daily_stats=lambda: (0, 0.0))
+    engine.get_runtime_trade_config = lambda: {
+        "common_settings": {"scanner_enabled": True, "entry_timeframe": "15m"},
+        "strategy_params": {"active_strategy": "rspt"},
+    }
+    engine.get_runtime_common_settings = lambda: {
+        "scanner_enabled": True,
+        "entry_timeframe": "15m",
+        "exit_timeframe": "4h",
+        "leverage": 5,
+    }
+    engine.get_active_position_symbols = AsyncMock(return_value={symbol})
+    engine._cleanup_orphan_protection_orders = AsyncMock(
+        return_value={"cancelled": 0, "symbols": {}}
+    )
+    engine._fetch_server_position_checked = AsyncMock(
+        return_value=(True, {"symbol": symbol, "side": "short"})
+    )
+    engine.scan_and_trade_high_volume = AsyncMock()
+    engine.get_balance_info = AsyncMock(return_value=(5_000.0, 5_000.0, 0.0))
+    engine.is_upbit_mode = lambda: False
+
+    asyncio.run(engine.poll_tick())
+
+    assert engine.scanner_active_symbol == symbol
+    engine.scan_and_trade_high_volume.assert_not_awaited()

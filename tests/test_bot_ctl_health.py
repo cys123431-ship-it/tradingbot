@@ -40,7 +40,7 @@ def _bot_ctl_env(tmp_path, marker, heartbeat_file, max_age="30"):
     return env
 
 
-@pytest.mark.skipif(shutil.which("pgrep") is None, reason="pgrep is required by bot_ctl.sh")
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required by bot_ctl.sh")
 def test_bot_ctl_status_reports_fresh_heartbeat(tmp_path):
     marker = tmp_path / "fake_emas_entry.py"
     heartbeat_file = tmp_path / "heartbeat.json"
@@ -64,7 +64,7 @@ def test_bot_ctl_status_reports_fresh_heartbeat(tmp_path):
     assert "heartbeat healthy" in result.stdout
 
 
-@pytest.mark.skipif(shutil.which("pgrep") is None, reason="pgrep is required by bot_ctl.sh")
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required by bot_ctl.sh")
 def test_bot_ctl_status_fails_on_stale_heartbeat(tmp_path):
     marker = tmp_path / "fake_emas_entry.py"
     heartbeat_file = tmp_path / "heartbeat.json"
@@ -90,7 +90,7 @@ def test_bot_ctl_status_fails_on_stale_heartbeat(tmp_path):
     assert "heartbeat stale" in result.stdout
 
 
-@pytest.mark.skipif(shutil.which("pgrep") is None, reason="pgrep is required by bot_ctl.sh")
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required by bot_ctl.sh")
 def test_bot_ctl_status_rejects_legacy_direct_emas_process(tmp_path):
     marker = tmp_path / "fake_launcher.py"
     legacy_marker = tmp_path / "emas.py"
@@ -118,7 +118,7 @@ def test_bot_ctl_status_rejects_legacy_direct_emas_process(tmp_path):
     assert "legacy direct emas.py process detected" in result.stdout
 
 
-@pytest.mark.skipif(shutil.which("pgrep") is None, reason="pgrep is required by bot_ctl.sh")
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required by bot_ctl.sh")
 def test_bot_ctl_does_not_treat_shell_script_text_as_legacy_python_process(tmp_path):
     marker = tmp_path / "fake_launcher.py"
     heartbeat_file = tmp_path / "heartbeat.json"
@@ -145,7 +145,7 @@ def test_bot_ctl_does_not_treat_shell_script_text_as_legacy_python_process(tmp_p
     assert "heartbeat healthy" in result.stdout
 
 
-@pytest.mark.skipif(shutil.which("pgrep") is None, reason="pgrep is required by bot_ctl.sh")
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required by bot_ctl.sh")
 def test_bot_ctl_ensure_compacts_oversized_log_without_restart(tmp_path):
     marker = tmp_path / "fake_emas_entry.py"
     heartbeat_file = tmp_path / "heartbeat.json"

@@ -121,12 +121,30 @@ heartbeat_health_status() {
   return 0
 }
 
+bot_process_rows() {
+  ps -eo pid=,comm=,args= | awk -v launcher="$BOT_ENTRY" '
+    $2 ~ /^python([0-9.]+)?$/ && index($0, launcher) > 0 {
+      print
+    }
+  '
+}
+
+bot_process_pids() {
+  bot_process_rows | awk '{print $1}'
+}
+
 bot_process_running() {
-  pgrep -f "$BOT_ENTRY" >/dev/null 2>&1
+  [[ -n "$(bot_process_pids)" ]]
 }
 
 bot_process_count() {
-  pgrep -fc "$BOT_ENTRY" 2>/dev/null || true
+  local pids
+  pids="$(bot_process_pids)"
+  if [[ -z "$pids" ]]; then
+    echo 0
+    return 0
+  fi
+  echo "$pids" | wc -l | tr -d ' '
 }
 
 legacy_bot_pids() {
@@ -291,7 +309,11 @@ stop_bot() {
   fi
 
   if bot_process_running; then
-    pkill -f "$BOT_ENTRY" || true
+    local launcher_pid
+    while read -r launcher_pid; do
+      [[ -z "$launcher_pid" ]] && continue
+      kill "$launcher_pid" 2>/dev/null || true
+    done <<< "$(bot_process_pids)"
     for _ in {1..10}; do
       if ! bot_process_running; then
         break
@@ -300,7 +322,10 @@ stop_bot() {
     done
     if bot_process_running; then
       echo "launcher process still present after SIGTERM; sending SIGKILL" >&2
-      pkill -9 -f "$BOT_ENTRY" || true
+      while read -r launcher_pid; do
+        [[ -z "$launcher_pid" ]] && continue
+        kill -9 "$launcher_pid" 2>/dev/null || true
+      done <<< "$(bot_process_pids)"
       sleep 1
     fi
   fi
@@ -309,7 +334,7 @@ stop_bot() {
 
   if bot_process_running; then
     echo "failed to stop launcher process: $BOT_ENTRY" >&2
-    pgrep -af "$BOT_ENTRY" >&2 || true
+    bot_process_rows >&2 || true
     return 1
   fi
 
@@ -330,10 +355,10 @@ status_bot() {
     running_count="$(bot_process_count)"
     if [[ "$running_count" -ne 1 ]]; then
       echo "bot unhealthy: launcher process count=$running_count"
-      pgrep -af "$BOT_ENTRY" || true
+      bot_process_rows || true
       return 1
     fi
-    pgrep -af "$BOT_ENTRY"
+    bot_process_rows
     local hb_status
     if hb_status="$(heartbeat_health_status)"; then
       echo "heartbeat healthy: age=${hb_status#ok:}s max=${HEARTBEAT_MAX_AGE_SEC}s"

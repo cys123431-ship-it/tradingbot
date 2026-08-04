@@ -80,6 +80,18 @@ class SignalScannerMixin:
                 for sym in active_position_symbols:
                     target_symbols.add(sym)
 
+                # A deployment/restart loses the in-memory scanner owner while
+                # the exchange position remains open. Adopt that position
+                # before considering a fresh volume scan; otherwise startup
+                # analyzes the whole universe even though the global position
+                # gate makes every new entry unusable.
+                if not self.scanner_active_symbol and active_position_symbols:
+                    self.scanner_active_symbol = sorted(active_position_symbols)[0]
+                    logger.info(
+                        "Scanner adopted existing exchange position after startup: %s",
+                        self.scanner_active_symbol,
+                    )
+
                 # 1. 留뚯빟 ?대? ?↔퀬 ?덈뒗 ?ㅼ틦??肄붿씤???덈떎硫? -> 洹멸쾬留?愿由?
                 if self.scanner_active_symbol:
                     # ?ъ??섏씠 ?꾩쭅 ?댁븘?덈뒗吏 ?뺤씤
