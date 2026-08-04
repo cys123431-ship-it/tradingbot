@@ -4299,6 +4299,47 @@ def test_global_orphan_sweep_requires_confirmation_before_cancelling():
     assert [order["id"] for order in engine.exchange.orders] == ["sl-pending"]
 
 
+def test_global_orphan_sweep_keeps_orders_when_symbol_recheck_fails():
+    class _RecheckFailExchange(_FakeExchange):
+        def __init__(self, orders):
+            super().__init__(orders, positions=[])
+            self.position_fetch_calls = 0
+
+        def fetch_positions(self, symbols=None):
+            self.position_fetch_calls += 1
+            if self.position_fetch_calls == 1:
+                return []
+            raise RuntimeError("position recheck unavailable")
+
+    orders = [{
+        "id": "sl-unverified",
+        "side": "sell",
+        "type": "market",
+        "info": {
+            "origType": "STOP_MARKET",
+            "stopPrice": "95",
+            "reduceOnly": "true",
+            "symbol": "BTCUSDT",
+        },
+    }]
+    engine = _protection_engine(orders, positions=[])
+    engine.exchange = _RecheckFailExchange(orders)
+
+    status = asyncio.run(
+        engine._cleanup_orphan_protection_orders(
+            reason="test failed recheck",
+            alert=False,
+            min_interval=0,
+            confirm_delay_sec=0,
+        )
+    )
+
+    assert status["status"] == "PENDING_CONFIRMATION"
+    assert status["symbols"]["BTC/USDT"]["status"] == "POSITION_RECHECK_FAILED"
+    assert engine.exchange.cancelled == []
+    assert [order["id"] for order in engine.exchange.orders] == ["sl-unverified"]
+
+
 def test_cancel_protection_order_tries_raw_binance_symbol_variant():
     class _RawOnlyExchange(_FakeExchange):
         def cancel_order(self, order_id, symbol):

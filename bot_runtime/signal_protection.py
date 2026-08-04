@@ -815,7 +815,20 @@ class SignalProtectionMixin:
                 }
                 continue
 
-            pos = await self.get_server_position(symbol, use_cache=False)
+            position_fetch_ok, pos = await self._fetch_server_position_checked(symbol)
+            if not position_fetch_ok:
+                status['pending'] += len(orders)
+                status['symbols'][symbol] = {
+                    'pending': len(orders),
+                    'cancelled': 0,
+                    'status': 'POSITION_RECHECK_FAILED',
+                }
+                logger.warning(
+                    "Protection orphan recheck failed for %s; retaining %s order(s)",
+                    symbol,
+                    len(orders),
+                )
+                continue
             if pos:
                 candidates.pop(symbol_key, None)
                 continue

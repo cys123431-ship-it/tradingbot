@@ -47,7 +47,21 @@ def test_market_settings_load_markets_before_symbol_scoped_calls():
 
     assert exchange.calls == [
         ("load_markets",),
-        ("set_position_mode", False, "BTC/USDT:USDT"),
+        ("set_position_mode", False, None),
+        ("set_margin_mode", "ISOLATED", "BTC/USDT:USDT"),
+        ("set_leverage", 5, "BTC/USDT:USDT"),
+    ]
+
+
+def test_market_settings_do_not_repost_already_confirmed_one_way_mode():
+    exchange = _SettingsExchange()
+    exchange.fetch_position_mode = lambda: {"hedged": False}
+    engine = _engine(exchange)
+
+    asyncio.run(engine.ensure_market_settings("BTC/USDT:USDT", leverage=5))
+
+    assert exchange.calls == [
+        ("load_markets",),
         ("set_margin_mode", "ISOLATED", "BTC/USDT:USDT"),
         ("set_leverage", 5, "BTC/USDT:USDT"),
     ]

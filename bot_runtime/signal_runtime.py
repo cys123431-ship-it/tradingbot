@@ -105,6 +105,15 @@ class SignalRuntimeMixin:
             for record in records:
                 if str(getattr(record, 'order_intent', '') or '').upper() != 'ENTRY':
                     continue
+                if str(getattr(record, 'order_state', '') or '').upper() in {
+                    'CLOSED',
+                    'CANCELED',
+                    'FAILED',
+                }:
+                    # Terminal order state with no reconciled close metadata can
+                    # no longer be finalized automatically. It must not keep a
+                    # legacy trades row live forever.
+                    continue
                 record_ts = _timestamp(getattr(record, 'created_at', None))
                 if record_ts is None or abs(record_ts - trade_ts) > 300.0:
                     continue

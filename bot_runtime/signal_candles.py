@@ -8,7 +8,12 @@ class SignalCandleMixin:
         try:
             total, free, mmr = await self.get_balance_info()
             count, daily_pnl = self.db.get_daily_stats()
-            pos = await self.get_server_position(symbol, use_cache=False)
+            position_fetch_ok, pos = await self._fetch_server_position_checked(symbol)
+            if not position_fetch_ok:
+                cache = getattr(self, 'position_cache', None)
+                cached = cache.get(symbol) if isinstance(cache, dict) else None
+                if cached:
+                    pos = cached[0]
 
             # ?꾨왂 ?곹깭 媛?몄삤湲?
             strategy_params = self.get_runtime_strategy_params()
@@ -24,7 +29,11 @@ class SignalCandleMixin:
             fisher_state = self.fisher_states.get(symbol, {})
 
             # [Fix] Multi-symbol Status Data
-            pos_side = pos['side'].upper() if pos else 'NONE'
+            pos_side = (
+                pos['side'].upper()
+                if pos
+                else ('UNKNOWN' if not position_fetch_ok else 'NONE')
+            )
             symbol_status = {
                 'engine': 'Signal', 'symbol': symbol, 'price': price,
                 'total_equity': total, 'free_usdt': free, 'mmr': mmr,
@@ -83,7 +92,18 @@ class SignalCandleMixin:
                     pos,
                     strategy_params,
                 )
-            if (
+            if not position_fetch_ok:
+                protection_audit = dict(
+                    self.last_protection_order_status.get(symbol, {}) or {}
+                )
+                protection_audit.update({
+                    'fetch_ok': False,
+                    'missing_tp': False,
+                    'missing_sl': False,
+                    'status': 'POSITION_FETCH_FAILED',
+                })
+                self.last_protection_order_status[symbol] = protection_audit
+            elif (
                 active_strategy in UTBREAKOUT_STRATEGIES
                 and pos
                 and isinstance(runner_state, dict)

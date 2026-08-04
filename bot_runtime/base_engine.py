@@ -425,11 +425,28 @@ class BaseEngine:
                 except Exception as e:
                     logger.warning("Market metadata preload failed for %s: %s", symbol, e)
 
-        # 1. Position Mode: One-way (Hedge Mode OFF)
+        # 1. Position mode is account-wide on Binance Futures. Read it first:
+        # repeatedly POSTing the same mode is rejected whenever any open order
+        # or position exists, even when the account is already in one-way mode.
+        one_way_confirmed = False
         try:
-            await asyncio.to_thread(self.exchange.set_position_mode, hedged=False, symbol=symbol)
+            fetch_position_mode = getattr(self.exchange, 'fetch_position_mode', None)
+            if callable(fetch_position_mode):
+                mode = await asyncio.to_thread(fetch_position_mode)
+                hedged = mode.get('hedged') if isinstance(mode, dict) else None
+                if isinstance(hedged, str):
+                    hedged = hedged.strip().lower() in {'true', '1', 'yes', 'on'}
+                elif isinstance(hedged, (int, float)) and not isinstance(hedged, bool):
+                    hedged = bool(hedged)
+                one_way_confirmed = hedged is False
         except Exception as e:
-            logger.warning("Position mode verification/setup failed for %s: %s", symbol, e)
+            logger.warning("Position mode lookup failed for %s: %s", symbol, e)
+
+        if not one_way_confirmed:
+            try:
+                await asyncio.to_thread(self.exchange.set_position_mode, hedged=False)
+            except Exception as e:
+                logger.warning("Position mode verification/setup failed for %s: %s", symbol, e)
 
         # 2. Margin Mode: ISOLATED (媛뺤젣)
         try:
@@ -598,13 +615,9 @@ class BaseEngine:
                 return cache_entry[0]
             return None
 
-    async def get_active_position_symbols(self, use_cache=True):
+    async def _fetch_active_position_symbols_checked(self):
+        """Return a complete active-symbol snapshot without stale-cache ambiguity."""
         now = time.time()
-
-        if use_cache and isinstance(self.all_positions_cache, set):
-            if (now - self.all_positions_cache_time) < self.ALL_POSITIONS_CACHE_TTL:
-                return set(self.all_positions_cache)
-
         try:
             if self.is_upbit_mode():
                 bal = await asyncio.to_thread(self.exchange.fetch_balance)
@@ -623,7 +636,7 @@ class BaseEngine:
                     active_symbols.add(f"{code}/KRW")
                 self.all_positions_cache = set(active_symbols)
                 self.all_positions_cache_time = now
-                return active_symbols
+                return True, active_symbols
 
             positions = await asyncio.to_thread(self.exchange.fetch_positions)
             active_symbols = set()
@@ -635,12 +648,25 @@ class BaseEngine:
                         active_symbols.add(sym)
             self.all_positions_cache = set(active_symbols)
             self.all_positions_cache_time = now
-            return active_symbols
+            return True, active_symbols
         except Exception as e:
             logger.warning(f"Active positions fetch error: {e}")
-            if isinstance(self.all_positions_cache, set):
-                return set(self.all_positions_cache)
-            return set()
+            return False, set()
+
+    async def get_active_position_symbols(self, use_cache=True):
+        now = time.time()
+        cached = getattr(self, 'all_positions_cache', None)
+        cache_time = float(getattr(self, 'all_positions_cache_time', 0.0) or 0.0)
+        cache_ttl = float(getattr(self, 'ALL_POSITIONS_CACHE_TTL', 15.0) or 15.0)
+        if use_cache and isinstance(cached, set) and (now - cache_time) < cache_ttl:
+            return set(cached)
+
+        fetch_ok, active_symbols = await self._fetch_active_position_symbols_checked()
+        if fetch_ok:
+            return active_symbols
+        if isinstance(cached, set):
+            return set(cached)
+        return set()
 
     async def get_balance_info(self):
         try:
@@ -784,18 +810,23 @@ class BaseEngine:
         else:
             status_rows = [v for v in status_data.values() if isinstance(v, dict)]
 
-        active_symbols_on_exchange = set()
-        try:
-            active_symbols_on_exchange = await self.get_active_position_symbols(use_cache=True)
-        except Exception as e:
-            logger.warning(f"Daily loss check: fetch_positions failed, using status cache only ({e})")
+        active_positions_fetch_ok, active_symbols_on_exchange = (
+            await self._fetch_active_position_symbols_checked()
+        )
+        if not active_positions_fetch_ok:
+            logger.warning(
+                "Daily loss check: fetch_positions failed, using status cache only"
+            )
 
         for row in status_rows:
             pos_side = str(row.get('pos_side', 'NONE')).upper()
             symbol = row.get('symbol')
-            if symbol and pos_side != 'NONE':
+            if symbol and pos_side in {'LONG', 'SHORT'}:
                 norm_symbol = str(symbol).split(':', 1)[0]
-                if active_symbols_on_exchange and norm_symbol not in active_symbols_on_exchange:
+                if (
+                    active_positions_fetch_ok
+                    and norm_symbol not in active_symbols_on_exchange
+                ):
                     continue
                 unrealized_pnl += float(row.get('pnl_usdt', 0) or 0)
                 open_symbols.append(symbol)
