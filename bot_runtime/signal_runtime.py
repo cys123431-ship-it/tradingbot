@@ -40,59 +40,92 @@ class SignalRuntimeMixin:
             if symbol:
                 position_keys.add(_symbol_key(symbol))
 
-        candidates = list(getattr(result, 'closed_position_symbols', None) or [])
         store = getattr(self, 'trading_state_store', None)
+        candidates = []
+
+        def _timestamp(value):
+            try:
+                parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.timestamp()
+            except (TypeError, ValueError):
+                return None
+
+        def _matching_closed_entry(trade, records):
+            trade_ts = _timestamp(trade.get('entry_time'))
+            if trade_ts is None:
+                return None
+            trade_side = str(trade.get('side') or '').strip().upper()
+            try:
+                trade_qty = abs(float(trade.get('quantity') or 0.0))
+            except (TypeError, ValueError):
+                trade_qty = 0.0
+            matches = []
+            for record in records:
+                metadata = dict(getattr(record, 'metadata', {}) or {})
+                if not (
+                    str(getattr(record, 'order_intent', '') or '').upper() == 'ENTRY'
+                    and str(getattr(record, 'order_state', '') or '').upper() == 'CLOSED'
+                    and bool(metadata.get('reconciled_without_exchange_position'))
+                ):
+                    continue
+                record_ts = _timestamp(getattr(record, 'created_at', None))
+                if record_ts is None or abs(record_ts - trade_ts) > 300.0:
+                    continue
+                record_side = str(getattr(record, 'side', '') or '').strip().upper()
+                if trade_side and record_side and trade_side != record_side:
+                    continue
+                try:
+                    record_qty = abs(float(
+                        getattr(record, 'filled_qty', None)
+                        or getattr(record, 'requested_qty', None)
+                        or 0.0
+                    ))
+                except (TypeError, ValueError):
+                    record_qty = 0.0
+                if trade_qty > 0 and record_qty > 0:
+                    qty_gap = abs(record_qty - trade_qty) / max(trade_qty, record_qty)
+                    if qty_gap > 0.10:
+                        continue
+                matches.append((abs(record_ts - trade_ts), record))
+            return min(matches, default=(None, None), key=lambda item: item[0])[1]
+
         try:
-            # Backfill only when the durable order audit already proves that
-            # this exact position disappeared on the same exchange runtime.
-            # This avoids closing unrelated DB rows after a mainnet/testnet
-            # mode switch merely because the current account is flat.
             if store is not None:
                 for trade in list(loader() or []):
                     if not isinstance(trade, dict) or not trade.get('symbol'):
                         continue
                     records = list(store.records_for_symbol(trade['symbol']) or [])
-                    if any(
-                        str(getattr(record, 'order_intent', '') or '').upper() == 'ENTRY'
-                        and str(getattr(record, 'order_state', '') or '').upper() == 'CLOSED'
-                        and bool(
-                            dict(getattr(record, 'metadata', {}) or {}).get(
-                                'reconciled_without_exchange_position'
-                            )
-                        )
-                        for record in records
-                    ):
-                        candidates.append(trade['symbol'])
+                    entry_record = _matching_closed_entry(trade, records)
+                    if entry_record is not None:
+                        candidates.append((trade, entry_record))
         except Exception:
             logger.exception('Open trade lookup failed during exchange reconciliation')
             return []
 
         outcomes = []
-        for symbol in dict.fromkeys(str(item) for item in candidates if item):
+        seen_trade_keys = set()
+        for trade, entry_record in candidates:
+            symbol = str(trade.get('symbol') or '')
+            trade_key = (symbol, str(trade.get('entry_time') or ''))
+            if not symbol or trade_key in seen_trade_keys:
+                continue
+            seen_trade_keys.add(trade_key)
             if _symbol_key(symbol) in position_keys:
                 continue
             state = {}
             try:
-                records = list(store.records_for_symbol(symbol) or []) if store is not None else []
-                entries = [
-                    record for record in records
-                    if str(getattr(record, 'order_intent', '') or '').upper() == 'ENTRY'
-                ]
-                entry_record = max(
-                    entries,
-                    key=lambda record: str(
-                        getattr(record, 'updated_at', None)
-                        or getattr(record, 'created_at', None)
-                        or ''
-                    ),
-                    default=None,
-                )
                 metadata = dict(getattr(entry_record, 'metadata', {}) or {})
                 state.update(dict(metadata.get('entry_plan_summary') or {}))
                 state.setdefault(
                     'strategy',
                     metadata.get('primary_strategy')
                     or getattr(entry_record, 'strategy', None),
+                )
+                state['_reconciled_closed_at'] = (
+                    getattr(entry_record, 'updated_at', None)
+                    or getattr(entry_record, 'created_at', None)
                 )
             except Exception:
                 logger.debug(

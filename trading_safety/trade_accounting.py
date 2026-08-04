@@ -367,6 +367,7 @@ async def record_closed_trade_accounting(
             symbol,
         )
         return {"status": "UNRESOLVED"}
+    state_data = state if isinstance(state, dict) else {}
     close_reason = str(reason or "automatic close")
     if result.get("estimated"):
         close_reason = f"{close_reason} [estimated-price]"
@@ -406,19 +407,67 @@ async def record_closed_trade_accounting(
         elif generic_flat_reason:
             leg["label"] = "EXTERNAL_EXIT"
     result["exit_legs"] = exit_legs
-    updated = db.log_trade_close(
-        accounting_symbol,
-        result["pnl"],
-        result["pnl_pct"],
-        result["exit_price"],
-        close_reason,
+    exit_timestamp_ms = max(
+        (
+            int(float(item.get("timestamp") or 0))
+            for item in exit_legs
+            if item.get("timestamp") not in (None, "")
+        ),
+        default=0,
     )
+    reconciled_closed_at = state_data.get("_reconciled_closed_at")
+    if result.get("estimated") and reconciled_closed_at:
+        try:
+            resolved_exit_time = datetime.fromisoformat(
+                str(reconciled_closed_at).replace("Z", "+00:00")
+            )
+            if resolved_exit_time.tzinfo is None:
+                resolved_exit_time = resolved_exit_time.replace(tzinfo=timezone.utc)
+            resolved_exit_time = resolved_exit_time.isoformat()
+        except ValueError:
+            resolved_exit_time = datetime.now(timezone.utc).isoformat()
+    elif exit_timestamp_ms > 0:
+        resolved_exit_time = datetime.fromtimestamp(
+            exit_timestamp_ms / 1000.0,
+            tz=timezone.utc,
+        ).isoformat()
+    else:
+        resolved_exit_time = datetime.now(timezone.utc).isoformat()
+    try:
+        updated = db.log_trade_close(
+            accounting_symbol,
+            result["pnl"],
+            result["pnl_pct"],
+            result["exit_price"],
+            close_reason,
+            exit_time=resolved_exit_time,
+        )
+    except TypeError:
+        # Compatibility for lightweight test/legacy DB adapters.
+        updated = db.log_trade_close(
+            accounting_symbol,
+            result["pnl"],
+            result["pnl_pct"],
+            result["exit_price"],
+            close_reason,
+        )
     result["status"] = (
         "RECORDED" if updated is not False else "NO_OPEN_TRADE"
     )
     if updated is False:
         return result
-    if callable(record_realized_pnl):
+    exit_age_seconds = max(
+        0.0,
+        (
+            datetime.now(timezone.utc)
+            - datetime.fromisoformat(resolved_exit_time.replace("Z", "+00:00"))
+        ).total_seconds(),
+    )
+    historical_backfill = bool(state_data.get("_reconciled_closed_at")) and (
+        exit_age_seconds > 3600.0
+    )
+    result["historical_backfill"] = historical_backfill
+    if callable(record_realized_pnl) and not historical_backfill:
         try:
             record_realized_pnl(result.get("pnl", 0.0))
         except Exception:
@@ -426,21 +475,21 @@ async def record_closed_trade_accounting(
                 "Bot realized PnL state update failed for %s",
                 symbol,
             )
+    if not historical_backfill:
+        try:
+            engine._record_utbreakout_recent_loss_cooldown(
+                accounting_symbol,
+                side=(open_trade or {}).get("side"),
+                pnl_usdt=result.get("pnl"),
+                reason=close_reason,
+            )
+        except Exception:
+            logger.debug(
+                "UTBreakout recent loss cooldown record failed for %s",
+                accounting_symbol,
+                exc_info=True,
+            )
     try:
-        engine._record_utbreakout_recent_loss_cooldown(
-            accounting_symbol,
-            side=(open_trade or {}).get("side"),
-            pnl_usdt=result.get("pnl"),
-            reason=close_reason,
-        )
-    except Exception:
-        logger.debug(
-            "UTBreakout recent loss cooldown record failed for %s",
-            accounting_symbol,
-            exc_info=True,
-        )
-    try:
-        state_data = state if isinstance(state, dict) else {}
         risk_distance = float(state_data.get("risk_distance") or 0.0)
         filled_qty = float((open_trade or {}).get("quantity") or 0.0)
         risk_usdt = risk_distance * filled_qty
@@ -493,22 +542,6 @@ async def record_closed_trade_accounting(
             )
         )
         aggregate_strategy = entry_metadata.get("aggregate_strategy")
-        exit_timestamp_ms = max(
-            (
-                int(float(item.get("timestamp") or 0))
-                for item in exit_legs
-                if item.get("timestamp") not in (None, "")
-            ),
-            default=0,
-        )
-        resolved_exit_time = (
-            datetime.fromtimestamp(
-                exit_timestamp_ms / 1000.0,
-                tz=timezone.utc,
-            ).isoformat()
-            if exit_timestamp_ms > 0
-            else datetime.now(timezone.utc).isoformat()
-        )
         trade_key = "|".join(
             (
                 accounting_symbol,

@@ -65,7 +65,21 @@ class DBManager:
             )
             self.conn.commit()
 
-    def log_trade_close(self, symbol, pnl, pnl_pct, exit_price, reason):
+    def log_trade_close(
+        self,
+        symbol,
+        pnl,
+        pnl_pct,
+        exit_price,
+        reason,
+        *,
+        exit_time=None,
+    ):
+        resolved_exit_time = (
+            str(exit_time).strip()
+            if exit_time not in (None, '')
+            else datetime.now(timezone.utc).isoformat()
+        )
         with self.lock:
             cur = self.conn.execute(
                 """UPDATE trades SET exit_time=?, exit_price=?, pnl_usdt=?, pnl_pct=?, exit_reason=?
@@ -74,7 +88,7 @@ class DBManager:
                     WHERE symbol=? AND exit_time IS NULL
                     ORDER BY id DESC LIMIT 1
                 )""",
-                (datetime.now(timezone.utc).isoformat(), exit_price, pnl, pnl_pct, reason, symbol)
+                (resolved_exit_time, exit_price, pnl, pnl_pct, reason, symbol)
             )
             self.conn.commit()
             return bool(cur.rowcount)
@@ -179,7 +193,7 @@ class DBManager:
             cur.execute(
                 """SELECT symbol, side, entry_price, quantity, entry_time, strategy
                 FROM trades WHERE exit_time IS NULL
-                ORDER BY id ASC"""
+                ORDER BY id DESC"""
             )
             return [
                 {
