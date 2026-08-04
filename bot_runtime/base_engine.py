@@ -817,13 +817,16 @@ class BaseEngine:
             limit_abs = float(sig_cfg.get('daily_loss_limit', 5000) or 5000)
             limit_pct = float(sig_cfg.get('daily_loss_limit_pct', 0) or 0)
 
-        # Telegram setup currently exposes absolute daily limit, so prioritize absolute limit.
+        # Both configured limits are safety ceilings.  Using the absolute value
+        # as an override made a large legacy value silently disable the equity
+        # percentage breaker on smaller accounts.  Enforce the tighter positive
+        # limit while still allowing either setting to be used on its own.
+        configured_limits = []
         if limit_abs > 0:
-            effective_limit = limit_abs
-        elif limit_pct > 0 and total_equity > 0:
-            effective_limit = total_equity * (limit_pct / 100.0)
-        else:
-            effective_limit = 5000.0
+            configured_limits.append(limit_abs)
+        if limit_pct > 0 and total_equity > 0:
+            configured_limits.append(total_equity * (limit_pct / 100.0))
+        effective_limit = min(configured_limits) if configured_limits else 5000.0
 
         if total_daily_pnl < -effective_limit:
             logger.warning(

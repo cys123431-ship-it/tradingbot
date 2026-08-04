@@ -166,6 +166,13 @@ def test_five_strategy_position_reconciles_on_processed_candle():
 
     engine.check_status = check_status
     engine.process_primary_candle = process_primary_candle
+    position_calls = []
+
+    async def process_open_utbreakout_position_tick(requested_symbol, candle):
+        position_calls.append((requested_symbol, candle["t"]))
+        return True
+
+    engine.process_open_utbreakout_position_tick = process_open_utbreakout_position_tick
 
     asyncio.run(
         engine.poll_symbol(
@@ -180,7 +187,8 @@ def test_five_strategy_position_reconciles_on_processed_candle():
         )
     )
 
-    assert calls == [(symbol, closed_ts, True)]
+    assert position_calls == [(symbol, closed_ts)]
+    assert calls == []
 
 
 def test_utbreakout_force_reprocess_bypasses_adaptive_duplicate_guard():

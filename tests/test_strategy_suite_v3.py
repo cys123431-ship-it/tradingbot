@@ -185,6 +185,38 @@ def test_strategy_allocator_is_neutral_for_small_sample_and_reduces_bad_strategy
     assert scaled["qty"] < 10
     assert scaled["entry_price"] == 100
 
+
+def test_strategy_allocator_de_risks_early_repeated_losses_but_never_boosts_small_sample():
+    losses = summarize_strategy_trades(
+        [
+            {
+                "strategy": "volatility_managed_trend_v1",
+                "net_r": -1.0,
+                "net_pnl": -10.0,
+                "mfe_r": 0.1,
+            }
+            for _ in range(3)
+        ],
+        "volatility_managed_trend_v1",
+    )
+    weak = evaluate_strategy_allocation(losses)
+    assert 0.30 <= weak.multiplier < 1.0
+    assert weak.reason.startswith("early_evidence:")
+
+    wins = summarize_strategy_trades(
+        [
+            {
+                "strategy": "liquidation_exhaustion_reversal_v1",
+                "net_r": 1.0,
+                "net_pnl": 10.0,
+                "mfe_r": 1.2,
+            }
+            for _ in range(3)
+        ],
+        "liquidation_exhaustion_reversal_v1",
+    )
+    assert evaluate_strategy_allocation(wins).multiplier == pytest.approx(1.0)
+
 from utbreakout.rspt_v3 import residual_strength_percentiles
 
 

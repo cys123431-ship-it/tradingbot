@@ -17,7 +17,9 @@ def default_strategy_allocator_config() -> dict[str, Any]:
         "enabled": True,
         "lookback_trades": 30,
         "minimum_samples": 8,
+        "early_de_risk_samples": 3,
         "full_confidence_samples": 20,
+        "confidence_power": 0.50,
         "risk_floor": 0.30,
         "risk_cap": 1.00,
         "negative_expectancy_multiplier": 0.60,
@@ -161,8 +163,17 @@ def evaluate_strategy_allocation(
     minimum = max(1, int(cfg["minimum_samples"]))
     if not cfg.get("enabled", True):
         return StrategyAllocation(strategy, 1.0, "allocator_disabled", values)
-    if samples < minimum:
-        return StrategyAllocation(strategy, 1.0, f"insufficient_samples:{samples}/{minimum}", values)
+    early_minimum = max(
+        1,
+        min(minimum, int(cfg.get("early_de_risk_samples", 3) or 3)),
+    )
+    if samples < early_minimum:
+        return StrategyAllocation(
+            strategy,
+            1.0,
+            f"insufficient_samples:{samples}/{early_minimum}",
+            values,
+        )
 
     multiplier = 1.0
     reasons: list[str] = []
@@ -191,15 +202,31 @@ def evaluate_strategy_allocation(
         multiplier *= float(cfg["poor_capture_multiplier"])
         reasons.append("poor_mfe_capture")
 
+    # Small samples must never increase allocation, but repeated poor outcomes
+    # should begin reducing risk before eight trades have accumulated.  Apply a
+    # smooth, reversible confidence shrinkage instead of an abrupt all-neutral
+    # window followed by a nearly inert linear ramp.
+    if samples < minimum and multiplier >= 1.0:
+        values["confidence"] = 0.0
+        return StrategyAllocation(
+            strategy,
+            1.0,
+            f"insufficient_negative_evidence:{samples}/{minimum}",
+            values,
+        )
     full_samples = max(minimum, int(cfg["full_confidence_samples"]))
-    confidence = min(1.0, max(0.0, (samples - minimum + 1) / max(full_samples - minimum + 1, 1)))
+    confidence_power = max(0.10, min(1.0, float(cfg.get("confidence_power", 0.50) or 0.50)))
+    confidence = min(1.0, max(0.0, (samples / max(full_samples, 1)) ** confidence_power))
     multiplier = 1.0 - (1.0 - multiplier) * confidence
     multiplier = max(float(cfg["risk_floor"]), min(float(cfg["risk_cap"]), multiplier))
     values["confidence"] = confidence
     return StrategyAllocation(
         strategy=strategy,
         multiplier=multiplier,
-        reason=",".join(reasons) if reasons else "neutral_performance",
+        reason=(
+            ("early_evidence:" if samples < minimum else "")
+            + (",".join(reasons) if reasons else "neutral_performance")
+        ),
         metrics=values,
     )
 

@@ -833,6 +833,9 @@ class _FakeMarketExchange:
             "ask": 100.01,
         }
 
+    def fetch_tickers(self):
+        return {symbol: self.fetch_ticker(symbol) for symbol in self.markets}
+
 
 def test_runtime_coin_selector_config_clamps_quote_volume_to_100m():
     signal_engine = _signal_engine_cls()
@@ -1356,6 +1359,64 @@ def test_coin_selector_custom_universe_blocks_testnet_tradifi_symbols():
     selected_symbols = [item.get("normalized_symbol") for item in report["selected"]]
     assert selected_symbols == ["BTC/USDT"]
     assert report["reject_counts"]["REJECTED_EXCHANGE_MODE_SYMBOL"] == 1
+
+
+def test_coin_selector_does_not_score_automatic_tradifi_when_disabled():
+    emas = _emas_module()
+    signal_engine = _signal_engine_cls()
+    controller = emas.MainController.__new__(emas.MainController)
+    controller.cfg = {
+        "api": {"exchange_mode": emas.BINANCE_MAINNET, "use_testnet": False}
+    }
+    markets = {
+        "BTC/USDT:USDT": _market(symbol="BTC/USDT:USDT"),
+        "QQQ/USDT:USDT": _market(
+            symbol="QQQ/USDT:USDT",
+            info={"contractType": "TRADIFI_PERPETUAL", "status": "TRADING"},
+        ),
+    }
+
+    engine = signal_engine.__new__(signal_engine)
+    engine.ctrl = controller
+    engine.exchange = _FakeMarketExchange(markets)
+    engine.market_data_exchange = _FakeMarketExchange(markets)
+    engine.coin_selector_last_result = {}
+    engine.coin_selector_symbol_scores = {}
+    engine.coin_selector_last_run_ts = 0
+    engine.coin_selector_analysis_cursor = 0
+    engine.coin_selector_rate_limit_backoff_until = 0.0
+    engine.is_upbit_mode = lambda: False
+    engine._coin_selector_tradifi_regular_session_status = lambda: {"open": True}
+    engine.get_runtime_trade_config = lambda: {
+        "coin_selector": {
+            "enabled": True,
+            "custom_universe_enabled": False,
+            "include_tradifi_universe": False,
+            "scan_scope": "all_allowed",
+            "analysis_limit": 10,
+            "analysis_batch_size": 10,
+            "top_n": 5,
+        }
+    }
+    engine.get_runtime_strategy_params = lambda: {"active_strategy": "rspt"}
+    scored_symbols = []
+
+    async def _score_candidate(base_candidate, cfg, strategy_params, selector_context=None):
+        scored_symbols.append(base_candidate["normalized_symbol"])
+        scored = dict(base_candidate)
+        scored["accepted"] = True
+        scored["score"] = 80.0
+        scored["selection_state"] = "SELECTED"
+        return scored
+
+    engine._score_coin_selector_candidate = _score_candidate
+
+    report = asyncio.run(engine.evaluate_coin_selector(force=True))
+
+    assert scored_symbols == ["BTC/USDT"]
+    assert [item["normalized_symbol"] for item in report["selected"]] == ["BTC/USDT"]
+    assert report["reject_counts"]["REJECTED_TRADIFI_UNIVERSE_DISABLED"] == 1
+
 
 
 def test_coin_selector_stops_deep_fanout_and_backs_off_on_rate_limit():

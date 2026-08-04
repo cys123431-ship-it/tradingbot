@@ -1640,6 +1640,102 @@ class SignalCandleMixin:
             self._clear_utbb_special_short_state(symbol)
             return
 
+    async def process_open_utbreakout_position_tick(self, symbol, k):
+        """Refresh open-position exits without recalculating all entry branches.
+
+        The scanner retries stateful position management between closed candles.
+        Re-running the five-strategy entry suite every minute retained large
+        cross-sectional data frames and repeatedly fetched unrelated markets,
+        although a global position already made new entry signals unusable.
+        """
+        strategy_params = self.get_runtime_strategy_params()
+        active_strategy = str(
+            strategy_params.get('active_strategy', 'utbot') or 'utbot'
+        ).lower()
+        if active_strategy not in UTBREAKOUT_STRATEGIES:
+            return False
+
+        symbol = self._canonicalize_utbreakout_symbol_for_use(
+            symbol,
+            source='process_open_position_tick',
+        )
+        if not isinstance(getattr(self, 'last_candle_success', None), dict):
+            self.last_candle_success = {}
+        if not isinstance(getattr(self, 'last_candle_time', None), dict):
+            self.last_candle_time = {}
+        self.last_signal_check = time.time()
+        self.last_candle_success[symbol] = False
+        try:
+            position_fetch_ok, pos = await self._fetch_server_position_checked(symbol)
+            if not position_fetch_ok:
+                logger.warning(
+                    'Open-position tick deferred for %s: position lookup failed',
+                    symbol,
+                )
+                self.last_candle_success[symbol] = True
+                return True
+            if not pos:
+                return False
+            if await self.check_daily_loss_limit():
+                self.last_entry_reason[symbol] = 'REJECTED_DAILY_LOSS_LIMIT'
+                self.last_candle_success[symbol] = True
+                return True
+
+            filtered_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+            timeframe = str(filtered_cfg.get('entry_timeframe', '15m') or '15m')
+            ohlcv = await asyncio.to_thread(
+                self.market_data_exchange.fetch_ohlcv,
+                symbol,
+                timeframe,
+                limit=300,
+            )
+            df = pd.DataFrame(
+                ohlcv,
+                columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'],
+            )
+            for column in ['open', 'high', 'low', 'close', 'volume']:
+                df[column] = pd.to_numeric(df[column], errors='coerce')
+
+            trailing_state = self._get_utbreakout_trailing_state(symbol)
+            advanced_ladder = bool(
+                isinstance(trailing_state, dict)
+                and trailing_state.get('advanced_live_ladder_state')
+            )
+            if not advanced_ladder:
+                await self._manage_utbreakout_partial_trailing(
+                    symbol,
+                    pos,
+                    df,
+                    filtered_cfg,
+                )
+            pyramid_status = await self._maybe_apply_aggressive_growth_pyramiding(
+                symbol,
+                pos,
+                df,
+                filtered_cfg,
+            )
+            if isinstance(pyramid_status, dict) and pyramid_status.get('status') == 'ADDED':
+                refreshed_ok, refreshed_pos = await self._fetch_server_position_checked(symbol)
+                if refreshed_ok and refreshed_pos:
+                    pos = refreshed_pos
+            if advanced_ladder:
+                await self._manage_live_ladder_exit_policy(
+                    symbol,
+                    pos,
+                    df,
+                    filtered_cfg,
+                )
+            self.last_entry_reason[symbol] = (
+                f"Position open ({str(pos.get('side') or '').upper()}), entry scan skipped"
+            )
+            self._clear_utbot_filtered_breakout_entry_plan(symbol)
+            self.last_candle_time[symbol] = k.get('t')
+            self.last_candle_success[symbol] = True
+            return True
+        except Exception as exc:
+            logger.error('Open-position tick failed for %s: %s', symbol, exc, exc_info=True)
+            return True
+
     async def process_primary_candle(self, symbol, k, force=False):
         strategy_params = self.get_runtime_strategy_params()
         active_strategy = strategy_params.get('active_strategy', 'utbot').lower()

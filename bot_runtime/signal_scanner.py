@@ -83,8 +83,20 @@ class SignalScannerMixin:
                 # 1. 留뚯빟 ?대? ?↔퀬 ?덈뒗 ?ㅼ틦??肄붿씤???덈떎硫? -> 洹멸쾬留?愿由?
                 if self.scanner_active_symbol:
                     # ?ъ??섏씠 ?꾩쭅 ?댁븘?덈뒗吏 ?뺤씤
-                    pos = await self.get_server_position(self.scanner_active_symbol, use_cache=False)
-                    if pos:
+                    # A failed exchange lookup is unknown, not flat. Cancelling
+                    # protection before a confirmed flat snapshot can leave a
+                    # live position temporarily naked during an API outage.
+                    position_fetch_ok, pos = await self._fetch_server_position_checked(
+                        self.scanner_active_symbol
+                    )
+                    if not position_fetch_ok:
+                        logger.warning(
+                            "Scanner position lookup failed for %s; retaining the active "
+                            "symbol and all protection orders until flat is confirmed",
+                            self.scanner_active_symbol,
+                        )
+                        target_symbols.add(self.scanner_active_symbol)
+                    elif pos:
                         # ?ъ????좎? 以?-> ?대냸留?吏묒쨷 耳??(?ㅼ틪 以묒?)
                         target_symbols.add(self.scanner_active_symbol)
                     else:
@@ -334,7 +346,16 @@ class SignalScannerMixin:
                         f"candle={ts_p} pos={pos_side} close={last_closed_p[4]}"
                     )
                     self.last_stateful_retry_ts[symbol] = now_ts
-                    await self.process_primary_candle(symbol, k_p, force=True)
+                    position_tick = getattr(
+                        self,
+                        'process_open_utbreakout_position_tick',
+                        None,
+                    )
+                    handled = False
+                    if callable(position_tick) and active_strategy in UTBREAKOUT_STRATEGIES:
+                        handled = bool(await position_tick(symbol, k_p))
+                    if not handled:
+                        await self.process_primary_candle(symbol, k_p, force=True)
                     if self.last_candle_success.get(symbol, False):
                         self.last_state_sync_candle_ts[symbol] = ts_p
                     pos_side = await self.check_status(symbol, current_price)
@@ -2224,6 +2245,16 @@ class SignalScannerMixin:
                 candidate['tradifi_regular_session'] = dict(tradifi_session_status)
                 candidate['tradifi_24h_trading_enabled'] = True
                 candidate['tradifi_session_restriction_applied'] = False
+                if not custom_enabled and not include_tradifi_universe:
+                    candidate['accepted'] = False
+                    candidate['selection_state'] = 'REJECTED'
+                    candidate.setdefault('reject_reasons', []).append(
+                        'REJECTED_TRADIFI_UNIVERSE_DISABLED'
+                    )
+                    candidate['analysis_error'] = (
+                        'REJECTED_TRADIFI_UNIVERSE_DISABLED: automatic TradFi '
+                        'candidates are disabled for this exchange mode or scan scope'
+                    )
             scope_reject = self._coin_selector_scope_reject_code(
                 candidate_cfg,
                 is_tradifi,

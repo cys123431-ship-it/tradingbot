@@ -48,6 +48,32 @@ def test_db_manager_preserves_resolved_exchange_exit_time(tmp_path):
         db.conn.close()
 
 
+def test_db_manager_archives_legacy_open_trade_without_inventing_exit(tmp_path):
+    db = DBManager(str(tmp_path / "trades.db"))
+    try:
+        db.log_trade_entry("OLD/USDT:USDT", "long", 1.0, 2.0, strategy="legacy")
+        entry_time = db.get_latest_open_trade("OLD/USDT:USDT")["entry_time"]
+
+        assert db.archive_open_trade(
+            "OLD/USDT:USDT",
+            entry_time,
+            "exchange flat; identity unavailable",
+        ) is True
+        assert db.get_latest_open_trade("OLD/USDT:USDT") is None
+        assert db.get_open_trades() == []
+        row = db.conn.execute(
+            """SELECT exit_time, pnl_usdt, reconciliation_archived_at,
+            reconciliation_archive_reason FROM trades WHERE symbol=?""",
+            ("OLD/USDT:USDT",),
+        ).fetchone()
+        assert row[0] is None
+        assert row[1] is None
+        assert row[2]
+        assert "exchange flat" in row[3]
+    finally:
+        db.conn.close()
+
+
 def test_reconciliation_accounts_flat_trade_but_skips_live_position():
     class _DB:
         def get_open_trades(self):
@@ -150,6 +176,56 @@ def test_unrelated_historical_order_for_same_symbol_is_not_backfilled():
     )
 
     assert asyncio.run(_Engine()._account_for_reconciled_flat_trades(result)) == []
+
+
+def test_exchange_flat_legacy_row_without_durable_identity_is_archived():
+    class _DB:
+        def __init__(self):
+            self.archived = []
+
+        def get_open_trades(self):
+            return [{
+                "symbol": "OLD/USDT:USDT",
+                "side": "long",
+                "quantity": 1.0,
+                "entry_time": "2026-05-01T13:54:13+00:00",
+            }]
+
+        def archive_open_trade(self, symbol, entry_time, reason):
+            self.archived.append((symbol, entry_time, reason))
+            return True
+
+    class _Store:
+        def records_for_symbol(self, _symbol):
+            return []
+
+    class _Engine(SignalRuntimeMixin):
+        def __init__(self):
+            self.db = _DB()
+            self.trading_state_store = _Store()
+
+        def _futures_symbol_key(self, symbol):
+            return str(symbol).replace("/", "").replace(":USDT", "")
+
+        async def _record_closed_trade_accounting(self, *_args, **_kwargs):
+            raise AssertionError("unverified legacy PnL must not be synthesized")
+
+    engine = _Engine()
+    result = SimpleNamespace(
+        snapshot_complete=True,
+        positions_ok=True,
+        positions=[],
+        closed_position_symbols=["OLD/USDT:USDT"],
+    )
+
+    outcomes = asyncio.run(engine._account_for_reconciled_flat_trades(result))
+
+    assert engine.db.archived
+    assert outcomes == [{
+        "symbol": "OLD/USDT:USDT",
+        "status": "ARCHIVED_UNVERIFIED_LEGACY",
+        "entry_time": "2026-05-01T13:54:13+00:00",
+    }]
 
 
 def test_incomplete_snapshot_never_closes_local_trade_accounting():

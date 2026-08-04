@@ -11,6 +11,8 @@ HEARTBEAT_FILE="${HEARTBEAT_FILE:-$STATE_DIR/bot_heartbeat.json}"
 HEARTBEAT_MAX_AGE_SEC="${HEARTBEAT_MAX_AGE_SEC:-180}"
 ACTION="${1:-}"
 TRUNCATE_LOG="${TRUNCATE_LOG:-0}"
+LOG_MAX_BYTES="${LOG_MAX_BYTES:-52428800}"
+LOG_RETAIN_BYTES="${LOG_RETAIN_BYTES:-10485760}"
 
 heartbeat_age_seconds() {
   if [[ ! -f "$HEARTBEAT_FILE" ]]; then
@@ -43,6 +45,34 @@ last_log_excerpt() {
     | tr '\r\n' '  ' \
     | sed 's/[[:space:]]\+/ /g' \
     | cut -c1-220
+}
+
+compact_log_if_needed() {
+  if [[ ! -f "$LOG_FILE" ]]; then
+    return 0
+  fi
+
+  local size
+  size="$(stat -c %s "$LOG_FILE" 2>/dev/null || true)"
+  if [[ -z "$size" || "$size" -le "$LOG_MAX_BYTES" ]]; then
+    return 0
+  fi
+
+  python3 - "$LOG_FILE" "$LOG_RETAIN_BYTES" <<'PY'
+import os
+import sys
+
+path = sys.argv[1]
+retain = max(1024, int(sys.argv[2]))
+with open(path, 'r+b', buffering=0) as handle:
+    size = os.fstat(handle.fileno()).st_size
+    handle.seek(max(0, size - retain))
+    tail = handle.read()
+    handle.seek(0)
+    handle.write(tail)
+    handle.truncate()
+PY
+  echo "compacted bot log to the latest $LOG_RETAIN_BYTES bytes"
 }
 
 heartbeat_paused_state() {
@@ -199,6 +229,7 @@ start_bot() {
   fi
 
   mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")" "$STATE_DIR"
+  compact_log_if_needed
   if [[ -f "$APP_DIR/runtime/prediction_live.env" ]]; then
     set -a
     # shellcheck disable=SC1091
@@ -334,6 +365,7 @@ status_bot() {
 
 ensure_bot() {
   stop_legacy_bot_processes
+  compact_log_if_needed
 
   if bot_process_running; then
     local hb_status

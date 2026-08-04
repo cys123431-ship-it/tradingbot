@@ -143,3 +143,33 @@ def test_bot_ctl_does_not_treat_shell_script_text_as_legacy_python_process(tmp_p
 
     assert result.returncode == 0
     assert "heartbeat healthy" in result.stdout
+
+
+@pytest.mark.skipif(shutil.which("pgrep") is None, reason="pgrep is required by bot_ctl.sh")
+def test_bot_ctl_ensure_compacts_oversized_log_without_restart(tmp_path):
+    marker = tmp_path / "fake_emas_entry.py"
+    heartbeat_file = tmp_path / "heartbeat.json"
+    heartbeat_file.write_text('{"epoch": 1}', encoding="utf-8")
+    env = _bot_ctl_env(tmp_path, marker, heartbeat_file)
+    env.update({"LOG_MAX_BYTES": "2048", "LOG_RETAIN_BYTES": "1024"})
+    log_file = Path(env["LOG_FILE"])
+    log_file.write_bytes(b"A" * 5000 + b"TAIL_MARKER")
+    proc = _start_marker_process(marker)
+    try:
+        time.sleep(0.2)
+        result = subprocess.run(
+            ["bash", "scripts/bot_ctl.sh", "ensure"],
+            cwd=ROOT_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+    assert result.returncode == 0
+    assert "compacted bot log" in result.stdout
+    assert log_file.stat().st_size <= 1024
+    assert log_file.read_bytes().endswith(b"TAIL_MARKER")

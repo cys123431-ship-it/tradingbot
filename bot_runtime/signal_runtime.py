@@ -91,9 +91,46 @@ class SignalRuntimeMixin:
                 matches.append((abs(record_ts - trade_ts), record))
             return min(matches, default=(None, None), key=lambda item: item[0])[1]
 
+        def _matching_entry_identity(trade, records):
+            """Return any durable entry record matching the legacy DB row."""
+            trade_ts = _timestamp(trade.get('entry_time'))
+            if trade_ts is None:
+                return None
+            trade_side = str(trade.get('side') or '').strip().upper()
+            try:
+                trade_qty = abs(float(trade.get('quantity') or 0.0))
+            except (TypeError, ValueError):
+                trade_qty = 0.0
+            matches = []
+            for record in records:
+                if str(getattr(record, 'order_intent', '') or '').upper() != 'ENTRY':
+                    continue
+                record_ts = _timestamp(getattr(record, 'created_at', None))
+                if record_ts is None or abs(record_ts - trade_ts) > 300.0:
+                    continue
+                record_side = str(getattr(record, 'side', '') or '').strip().upper()
+                if trade_side and record_side and trade_side != record_side:
+                    continue
+                try:
+                    record_qty = abs(float(
+                        getattr(record, 'filled_qty', None)
+                        or getattr(record, 'requested_qty', None)
+                        or 0.0
+                    ))
+                except (TypeError, ValueError):
+                    record_qty = 0.0
+                if trade_qty > 0 and record_qty > 0:
+                    qty_gap = abs(record_qty - trade_qty) / max(trade_qty, record_qty)
+                    if qty_gap > 0.10:
+                        continue
+                matches.append((abs(record_ts - trade_ts), record))
+            return min(matches, default=(None, None), key=lambda item: item[0])[1]
+
+        open_trades = []
         try:
             if store is not None:
-                for trade in list(loader() or []):
+                open_trades = list(loader() or [])
+                for trade in open_trades:
                     if not isinstance(trade, dict) or not trade.get('symbol'):
                         continue
                     records = list(store.records_for_symbol(trade['symbol']) or [])
@@ -147,6 +184,50 @@ class SignalRuntimeMixin:
                     'status': 'ERROR',
                     'error': f'{type(exc).__name__}:{exc}',
                 })
+
+        # Preserve unverifiable legacy rows for audit, but stop treating them as
+        # live positions after a complete exchange-flat snapshot.  We never
+        # synthesize an exit price or PnL.  Rows with matching durable order
+        # identity remain under the normal accounting finalizer above.
+        archiver = getattr(db, 'archive_open_trade', None)
+        if callable(archiver) and store is not None:
+            now_ts = datetime.now(timezone.utc).timestamp()
+            for trade in open_trades:
+                if not isinstance(trade, dict) or not trade.get('symbol'):
+                    continue
+                symbol = str(trade.get('symbol') or '')
+                trade_key = (symbol, str(trade.get('entry_time') or ''))
+                if trade_key in seen_trade_keys or _symbol_key(symbol) in position_keys:
+                    continue
+                trade_ts = _timestamp(trade.get('entry_time'))
+                if trade_ts is None or now_ts - trade_ts < 86400.0:
+                    continue
+                records = list(store.records_for_symbol(symbol) or [])
+                if _matching_entry_identity(trade, records) is not None:
+                    continue
+                reason = (
+                    'exchange-flat complete snapshot; no durable matching entry '
+                    'identity; historical PnL left unverified'
+                )
+                try:
+                    if archiver(symbol, trade.get('entry_time'), reason):
+                        logger.warning(
+                            'Archived exchange-flat legacy trade row without PnL: %s %s',
+                            symbol,
+                            trade.get('entry_time'),
+                        )
+                        outcomes.append({
+                            'symbol': symbol,
+                            'status': 'ARCHIVED_UNVERIFIED_LEGACY',
+                            'entry_time': trade.get('entry_time'),
+                        })
+                except Exception as exc:
+                    logger.exception('Legacy trade archive failed for %s', symbol)
+                    outcomes.append({
+                        'symbol': symbol,
+                        'status': 'ARCHIVE_ERROR',
+                        'error': f'{type(exc).__name__}:{exc}',
+                    })
         return outcomes
 
     async def _shutdown_crypto_safety_runtime(self):

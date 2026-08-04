@@ -24,6 +24,14 @@ class DBManager:
             }
             if 'strategy' not in trade_columns:
                 self.conn.execute("ALTER TABLE trades ADD COLUMN strategy TEXT")
+            if 'reconciliation_archived_at' not in trade_columns:
+                self.conn.execute(
+                    "ALTER TABLE trades ADD COLUMN reconciliation_archived_at TEXT"
+                )
+            if 'reconciliation_archive_reason' not in trade_columns:
+                self.conn.execute(
+                    "ALTER TABLE trades ADD COLUMN reconciliation_archive_reason TEXT"
+                )
             self.conn.execute("""CREATE TABLE IF NOT EXISTS shannon_log (
                 id INTEGER PRIMARY KEY, timestamp TEXT,
                 total_equity REAL, action TEXT,
@@ -86,6 +94,7 @@ class DBManager:
                 WHERE id=(
                     SELECT id FROM trades
                     WHERE symbol=? AND exit_time IS NULL
+                      AND reconciliation_archived_at IS NULL
                     ORDER BY id DESC LIMIT 1
                 )""",
                 (resolved_exit_time, exit_price, pnl, pnl_pct, reason, symbol)
@@ -172,6 +181,7 @@ class DBManager:
             cur.execute(
                 """SELECT symbol, side, entry_price, quantity, entry_time
                 FROM trades WHERE symbol=? AND exit_time IS NULL
+                  AND reconciliation_archived_at IS NULL
                 ORDER BY id DESC LIMIT 1""",
                 (symbol,)
             )
@@ -193,6 +203,7 @@ class DBManager:
             cur.execute(
                 """SELECT symbol, side, entry_price, quantity, entry_time, strategy
                 FROM trades WHERE exit_time IS NULL
+                  AND reconciliation_archived_at IS NULL
                 ORDER BY id DESC"""
             )
             return [
@@ -206,6 +217,30 @@ class DBManager:
                 }
                 for row in cur.fetchall()
             ]
+
+    def archive_open_trade(self, symbol, entry_time, reason):
+        """Archive an exchange-flat legacy row without inventing exit PnL.
+
+        Old databases can contain entries that predate durable order identity
+        tracking.  Once a complete exchange snapshot confirms the symbol is
+        flat and no matching durable entry record exists, the row must stop
+        behaving like a live trade while remaining available for audit.
+        """
+        archived_at = datetime.now(timezone.utc).isoformat()
+        with self.lock:
+            cur = self.conn.execute(
+                """UPDATE trades
+                SET reconciliation_archived_at=?, reconciliation_archive_reason=?
+                WHERE id=(
+                    SELECT id FROM trades
+                    WHERE symbol=? AND entry_time=? AND exit_time IS NULL
+                      AND reconciliation_archived_at IS NULL
+                    ORDER BY id DESC LIMIT 1
+                )""",
+                (archived_at, str(reason or ''), symbol, entry_time),
+            )
+            self.conn.commit()
+            return bool(cur.rowcount)
 
     def log_status_snapshot(self, snapshot_key, snapshot_text, keep_rows=200):
         with self.lock:
