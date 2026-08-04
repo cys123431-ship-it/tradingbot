@@ -172,6 +172,27 @@ class DBManager:
                 'entry_time': row[4],
             }
 
+    def get_open_trades(self):
+        """Return every locally open trade for exchange-flat reconciliation."""
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """SELECT symbol, side, entry_price, quantity, entry_time, strategy
+                FROM trades WHERE exit_time IS NULL
+                ORDER BY id ASC"""
+            )
+            return [
+                {
+                    'symbol': row[0],
+                    'side': row[1],
+                    'entry_price': float(row[2] or 0.0),
+                    'quantity': float(row[3] or 0.0),
+                    'entry_time': row[4],
+                    'strategy': row[5],
+                }
+                for row in cur.fetchall()
+            ]
+
     def log_status_snapshot(self, snapshot_key, snapshot_text, keep_rows=200):
         with self.lock:
             cur = self.conn.cursor()

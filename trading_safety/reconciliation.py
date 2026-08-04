@@ -42,6 +42,7 @@ class ReconciliationResult:
     regular_orders: list[dict[str, Any]] = field(default_factory=list)
     algo_orders: list[dict[str, Any]] = field(default_factory=list)
     open_orders: list[dict[str, Any]] = field(default_factory=list)
+    closed_position_symbols: list[str] = field(default_factory=list)
     unresolved_records: list[str] = field(default_factory=list)
     issues: list[str] = field(default_factory=list)
     reconciled_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -429,6 +430,7 @@ async def reconcile_exchange_state(
     algo_orders = list(snapshot.algo_orders)
     open_orders = regular_orders + algo_orders
     unresolved_records: list[str] = []
+    closed_position_symbols: list[str] = []
     if require_user_stream and not user_stream_ready:
         issues.append("user_stream_not_ready")
 
@@ -687,6 +689,12 @@ async def reconcile_exchange_state(
                 reconciled_without_exchange_position=True,
                 reconciled_terminal_order_status=_exchange_order_status(lookup_order),
             )
+            if intent in {
+                OrderIntent.ENTRY,
+                OrderIntent.POSITION_ADD,
+                OrderIntent.GRID_ENTRY,
+            }:
+                closed_position_symbols.append(record.symbol)
             continue
         if record.order_state == OrderState.SUBMITTED_UNKNOWN.value:
             if record.client_order_id in open_by_client_id:
@@ -747,6 +755,7 @@ async def reconcile_exchange_state(
         regular_orders=regular_orders,
         algo_orders=algo_orders,
         open_orders=open_orders,
+        closed_position_symbols=list(dict.fromkeys(closed_position_symbols)),
         unresolved_records=unresolved_records,
         issues=issues,
     )

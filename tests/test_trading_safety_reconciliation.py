@@ -195,6 +195,7 @@ def test_binance_terminal_entry_record_closes_when_exchange_position_is_flat(tmp
         record = store.get("cid-usdc")
         assert record.order_state == OrderState.CLOSED.value
         assert record.metadata["reconciled_terminal_order_status"] == "FILLED"
+        assert result.closed_position_symbols == ["LTC/USDC:USDC"]
 
     asyncio.run(scenario())
 

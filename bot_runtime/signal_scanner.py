@@ -306,10 +306,30 @@ class SignalScannerMixin:
                     self.last_state_sync_candle_ts[symbol] = ts_p
                     pos_side = await self.check_status(symbol, current_price)
             elif uses_stateful_primary_sync and pos_side != 'NONE':
-                retry_interval = 15.0
+                retry_cfg = (
+                    self._get_utbot_filtered_breakout_config(strategy_params)
+                    if active_strategy in UTBREAKOUT_STRATEGIES
+                    else strategy_params
+                )
+                try:
+                    retry_interval = max(
+                        30.0,
+                        min(
+                            300.0,
+                            float(
+                                retry_cfg.get(
+                                    'stateful_position_retry_interval_sec',
+                                    60.0,
+                                )
+                                or 60.0
+                            ),
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    retry_interval = 60.0
                 now_ts = time.time()
                 if (not processed_primary_this_tick) and (now_ts - float(self.last_stateful_retry_ts.get(symbol, 0.0) or 0.0) >= retry_interval):
-                    logger.info(
+                    logger.debug(
                         f"?봽 [Primary {primary_tf}] {symbol} Stateful reconcile retry: "
                         f"candle={ts_p} pos={pos_side} close={last_closed_p[4]}"
                     )

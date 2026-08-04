@@ -200,6 +200,15 @@ def _nested_metric(plan: Mapping[str, Any], *keys: str) -> float | None:
 
 
 def _risk_quality_multiplier(plan: Mapping[str, Any]) -> float:
+    """Return execution/confidence quality without reusing sizing overlays.
+
+    Strategy-native risk multipliers (VMT, crowding, LXR and RSPT) already
+    scale the stop-budget position size.  Treating those same values as a
+    leverage-quality veto made high leverage structurally unreachable for
+    strategies whose sizing cap is below the selector's 0.80/0.90 quality
+    thresholds.  The leverage selector still observes market, volatility,
+    allocator, trend, feature and execution quality independently.
+    """
     values: list[float] = []
     for key in (
         "strategy_allocator_multiplier",
@@ -211,10 +220,6 @@ def _risk_quality_multiplier(plan: Mapping[str, Any]) -> float:
         "trend_health_risk_multiplier",
         "selector_quality_risk_multiplier",
         "feature_score_risk_multiplier",
-        "vmt_risk_multiplier",
-        "crowding_risk_multiplier",
-        "lxr_risk_multiplier",
-        "rspt_risk_multiplier",
     ):
         value = _finite(plan.get(key))
         if value is not None:
@@ -411,7 +416,10 @@ def select_dynamic_leverage(
         cap = min(cfg["max_leverage"], 8)
         tier = "opportunity"
     elif strong_single:
-        cap = min(cfg["max_leverage"], 6)
+        # Exceptional single-strategy signals are intentionally allowed to use
+        # the short-horizon 8x profile.  Their stop-risk size remains governed
+        # by the aggregate single-signal multiplier and strategy sizing overlay.
+        cap = min(cfg["max_leverage"], 8)
         tier = "strong_single"
     elif confirmations >= 2 and quality >= cfg["opportunity_score_min"]:
         cap = min(cfg["max_leverage"], 6)

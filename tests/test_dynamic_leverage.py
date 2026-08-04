@@ -53,10 +53,38 @@ def test_dynamic_leverage_moves_both_below_and_above_old_five_x():
     )
 
     assert ordinary.leverage == 5
-    assert strong_single.leverage == 6
+    assert strong_single.leverage == 8
     assert confirmed.leverage == 8
     assert high_conviction.leverage == 10
     assert volatile.leverage == 4
+
+
+def test_strategy_sizing_overlay_does_not_veto_leverage_quality():
+    decision = select_dynamic_leverage(
+        _plan(
+            quad_alpha_score=92.0,
+            quad_alpha_confirmation_count=1,
+            vmt_risk_multiplier=0.25,
+        )
+    )
+
+    assert decision.leverage == 8
+    assert decision.tier == "strong_single"
+    assert decision.risk_quality_multiplier == 1.0
+
+
+def test_performance_allocator_still_blocks_aggressive_leverage():
+    decision = select_dynamic_leverage(
+        _plan(
+            quad_alpha_score=92.0,
+            quad_alpha_confirmation_count=1,
+            vmt_risk_multiplier=0.60,
+            strategy_allocator_multiplier=0.50,
+        )
+    )
+
+    assert decision.leverage == 3
+    assert decision.tier == "defensive_quality"
 
 
 def test_stressed_order_book_forces_defensive_minimum():

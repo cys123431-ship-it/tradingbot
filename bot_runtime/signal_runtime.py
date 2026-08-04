@@ -4,6 +4,118 @@ from __future__ import annotations
 
 
 class SignalRuntimeMixin:
+    async def _account_for_reconciled_flat_trades(self, result):
+        """Persist exchange-confirmed flat positions that bypassed exit hooks.
+
+        Protective TP/SL fills and manual exchange closes can make a position
+        disappear before an explicit bot exit callback runs.  Reconciliation
+        remains read-only at the exchange, but it must close the local trade and
+        persist its outcome so performance allocation and monthly reports use
+        complete data.
+        """
+        if not bool(getattr(result, 'snapshot_complete', False)) or not bool(
+            getattr(result, 'positions_ok', False)
+        ):
+            return []
+        db = getattr(self, 'db', None)
+        loader = getattr(db, 'get_open_trades', None)
+        recorder = getattr(self, '_record_closed_trade_accounting', None)
+        if not callable(loader) or not callable(recorder):
+            return []
+
+        def _symbol_key(value):
+            try:
+                return self._futures_symbol_key(value)
+            except Exception:
+                return ''.join(
+                    ch for ch in str(value or '').upper() if ch.isalnum()
+                ).replace('USDTUSDT', 'USDT').replace('USDCUSDC', 'USDC')
+
+        position_keys = set()
+        for position in list(getattr(result, 'positions', None) or []):
+            if not isinstance(position, dict):
+                continue
+            info = position.get('info') if isinstance(position.get('info'), dict) else {}
+            symbol = position.get('symbol') or info.get('symbol')
+            if symbol:
+                position_keys.add(_symbol_key(symbol))
+
+        candidates = list(getattr(result, 'closed_position_symbols', None) or [])
+        store = getattr(self, 'trading_state_store', None)
+        try:
+            # Backfill only when the durable order audit already proves that
+            # this exact position disappeared on the same exchange runtime.
+            # This avoids closing unrelated DB rows after a mainnet/testnet
+            # mode switch merely because the current account is flat.
+            if store is not None:
+                for trade in list(loader() or []):
+                    if not isinstance(trade, dict) or not trade.get('symbol'):
+                        continue
+                    records = list(store.records_for_symbol(trade['symbol']) or [])
+                    if any(
+                        str(getattr(record, 'order_intent', '') or '').upper() == 'ENTRY'
+                        and str(getattr(record, 'order_state', '') or '').upper() == 'CLOSED'
+                        and bool(
+                            dict(getattr(record, 'metadata', {}) or {}).get(
+                                'reconciled_without_exchange_position'
+                            )
+                        )
+                        for record in records
+                    ):
+                        candidates.append(trade['symbol'])
+        except Exception:
+            logger.exception('Open trade lookup failed during exchange reconciliation')
+            return []
+
+        outcomes = []
+        for symbol in dict.fromkeys(str(item) for item in candidates if item):
+            if _symbol_key(symbol) in position_keys:
+                continue
+            state = {}
+            try:
+                records = list(store.records_for_symbol(symbol) or []) if store is not None else []
+                entries = [
+                    record for record in records
+                    if str(getattr(record, 'order_intent', '') or '').upper() == 'ENTRY'
+                ]
+                entry_record = max(
+                    entries,
+                    key=lambda record: str(
+                        getattr(record, 'updated_at', None)
+                        or getattr(record, 'created_at', None)
+                        or ''
+                    ),
+                    default=None,
+                )
+                metadata = dict(getattr(entry_record, 'metadata', {}) or {})
+                state.update(dict(metadata.get('entry_plan_summary') or {}))
+                state.setdefault(
+                    'strategy',
+                    metadata.get('primary_strategy')
+                    or getattr(entry_record, 'strategy', None),
+                )
+            except Exception:
+                logger.debug(
+                    'Reconciled trade metadata lookup failed for %s',
+                    symbol,
+                    exc_info=True,
+                )
+            try:
+                accounting = await recorder(
+                    symbol,
+                    'Take profit/stop loss closed position (exchange reconciliation)',
+                    state=state,
+                )
+                outcomes.append({'symbol': symbol, **dict(accounting or {})})
+            except Exception as exc:
+                logger.exception('Reconciled close accounting failed for %s', symbol)
+                outcomes.append({
+                    'symbol': symbol,
+                    'status': 'ERROR',
+                    'error': f'{type(exc).__name__}:{exc}',
+                })
+        return outcomes
+
     async def _shutdown_crypto_safety_runtime(self):
         startup_task = getattr(self, 'crypto_safety_startup_task', None)
         self.crypto_safety_startup_task = None
@@ -41,7 +153,11 @@ class SignalRuntimeMixin:
             user_stream_ready=bool(user_stream_ready),
             require_user_stream=bool(require_user_stream),
         )
-        self.last_crypto_reconciliation = result.__dict__
+        accounting_results = await self._account_for_reconciled_flat_trades(result)
+        self.last_crypto_reconciliation = {
+            **result.__dict__,
+            'accounting_results': accounting_results,
+        }
         critical_pause = load_critical_pause_state()
         if not result.safe_to_trade:
             self._set_crypto_entry_lock(
