@@ -40,7 +40,7 @@ CORE_SET_FILTER_HARD_CODES = {
 # Runtime mirror of the single live EV Adaptive router in emas.py.  This module
 # loads before emas.py, so it must not restore the retired many-Set profile.
 PROFIT_MAX_OVERRIDES = {
-    "effective_profile_version": "ev_adaptive_v4_profit_capture",
+    "effective_profile_version": "ev_adaptive_v3_profit_engine",
     "ev_adaptive_enabled": True,
     "legacy_sets_research_only": True,
 

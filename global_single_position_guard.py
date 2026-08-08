@@ -13,10 +13,10 @@ import time
 log = logging.getLogger("one_position_guard")
 
 
-OPPORTUNITY_PROFILE_NAME = "ev_adaptive_v4_profit_capture"
+OPPORTUNITY_PROFILE_NAME = "ev_adaptive_v3_profit_engine"
 
 OPPORTUNITY_OVERRIDES = {
-    "effective_profile_version": "ev_adaptive_v4_profit_capture",
+    "effective_profile_version": "ev_adaptive_v3_profit_engine",
     "ev_adaptive_enabled": True,
     "legacy_sets_research_only": True,
 

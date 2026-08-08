@@ -84,9 +84,9 @@ def test_strong_trend_uses_convex_exit_without_increasing_initial_risk():
     assert decision.allowed is True
     assert decision.mode == "STRONG_TREND"
     assert decision.risk_multiplier <= 1.0
-    assert decision.exit_profile.tp1_r == 1.0
-    assert decision.exit_profile.tp2_r == 4.2
-    assert decision.exit_profile.runner_ratio == 0.55
+    assert decision.exit_profile.tp1_r == 1.25
+    assert decision.exit_profile.tp2_r == 4.5
+    assert decision.exit_profile.runner_ratio == 0.60
 
 
 def test_high_volatility_risk_scales_continuously_from_target():
@@ -259,7 +259,7 @@ def test_squeeze_release_gets_its_own_exit_profile():
     assert decision.allowed is True
     assert decision.mode == "SQUEEZE_BREAKOUT"
     assert decision.exit_profile.tp1_r == 1.2
-    assert decision.exit_profile.tp2_r == 3.2
+    assert decision.exit_profile.tp2_r == 3.5
 
 
 def test_cost_gate_rejects_positive_gross_edge_when_fees_consume_it():
@@ -394,7 +394,7 @@ def test_live_auto_selection_reason_says_ev_adaptive_v3_profit_engine():
     selected, reason = engine._select_utbreakout_auto_set({"scores": {}}, cfg)
 
     assert selected == 64
-    assert "EV Adaptive V4_PROFIT_CAPTURE" in reason
+    assert "EV Adaptive V3_PROFIT_ENGINE" in reason
     assert "EV Adaptive V2" not in reason
 
 

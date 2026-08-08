@@ -319,7 +319,8 @@ def test_vmt_live_signal_builds_volatility_managed_runner_plan(monkeypatch):
     assert reason.startswith("ACCEPTED_ENTRY: VMT long")
     assert status["accepted_code"] == "ACCEPTED_ENTRY"
     assert captured["strategy"] == emas.VOLATILITY_MANAGED_TREND_STRATEGY
-    assert captured["structure_stop"] == pytest.approx(97.0)
+    assert captured["structure_stop"] is None
+    assert captured["structure_reference_stop"] == pytest.approx(97.0)
     assert captured["runner_pct"] == pytest.approx(0.55)
     assert captured["second_take_profit_r_multiple"] == pytest.approx(4.0)
     assert captured["ev_time_stop_bars"] == 192

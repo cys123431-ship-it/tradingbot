@@ -691,7 +691,7 @@ def test_existing_alpha_profit_migration_preserves_user_strategy_selection(tmp_p
             '"UTBotFilteredBreakoutV1":{'
             '"lxr_migration_v1_complete":true,'
             '"vmt_migration_v1_complete":true,'
-            '"quad_alpha_enabled_strategies":["ut_breakout","crowding_unwind"],'
+            '"quad_alpha_enabled_strategies":["ut_breakout","funding_oi_crowding_unwind_v1"],'
             '"volatility_managed_trend_live_enabled":false,'
             '"volatility_managed_trend":{"enabled":false,"live_enabled":false}'
             '}}}}'
@@ -4456,14 +4456,15 @@ def test_utbreakout_defaults_enable_profit_opportunity_tp_ladder_and_runner():
 
     assert cfg["fixed_take_profit_enabled"] is True
     assert cfg["partial_take_profit_enabled"] is True
-    assert cfg["partial_take_profit_r_multiple"] == 1.0
+    assert cfg["partial_take_profit_r_multiple"] == 1.25
     assert cfg["partial_take_profit_ratio"] == 0.2
     assert cfg["second_take_profit_enabled"] is True
-    assert cfg["second_take_profit_r_multiple"] == 3.5
-    assert cfg["second_take_profit_ratio"] == 0.4
+    assert cfg["second_take_profit_r_multiple"] == 3.2
+    assert cfg["second_take_profit_ratio"] == 0.3
+    assert cfg["runner_pct"] == 0.5
     assert cfg["atr_trailing_enabled"] is True
-    assert cfg["atr_trailing_multiplier"] == 3.5
-    assert cfg["atr_trailing_activation_r"] == 1.6
+    assert cfg["atr_trailing_multiplier"] == 3.25
+    assert cfg["atr_trailing_activation_r"] == 1.5
     assert cfg["short_conservative_enabled"] is True
     assert cfg["short_risk_multiplier"] == 0.5
     assert cfg["short_adx_threshold"] == 25.0
@@ -5343,7 +5344,7 @@ def test_restart_recovery_rebuilds_small_position_tp_from_bot_algo_stops():
     assert [item["tp_label"] for item in state["planned_tp_orders"]] == ["TP2"]
     created_tp = [order for order in engine.exchange.created if order["type"] == "limit"][-1]
     assert float(created_tp["amount"]) == pytest.approx(0.01)
-    assert float(created_tp["price"]) == pytest.approx(121.6)
+    assert float(created_tp["price"]) == pytest.approx(128.8)
     assert engine.exchange.algo_cancelled == ["4000001", "4000002"]
     assert [order["algoId"] for order in engine.exchange.algo_orders] == ["4000003"]
 
@@ -7674,7 +7675,7 @@ def test_place_tp_sl_orders_live_small_qty_places_single_tp2_warning():
     assert len(tp_orders) == 1
     assert "tp2" in str(tp_orders[0]["clientOrderId"]).lower()
     assert float(tp_orders[0]["amount"]) == pytest.approx(0.1)
-    assert float(tp_orders[0]["price"]) == pytest.approx(106.52)
+    assert float(tp_orders[0]["price"]) == pytest.approx(111.33)
     assert float(stop_order["params"]["stopPrice"]) == pytest.approx(86.09)
     status = engine.last_protection_order_status["AAVE/USDT:USDT"]
     assert status["status"] == "OK_WITH_WARNING"
