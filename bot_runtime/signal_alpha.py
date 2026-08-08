@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from utbreakout.adaptive_breakout_trend import (
+    normalize_adaptive_breakout_trend_config,
+)
 from utbreakout.profit_capture import (
     QUAD_CONFIRMATION_RISK_MULTIPLIERS,
     bounded_structure_anchor,
@@ -815,13 +818,13 @@ class SignalAlphaMixin:
 
     def _adaptive_breakout_trend_runtime_config(self, cfg=None):
         source = dict(cfg or {})
-        base = default_adaptive_breakout_trend_config()
+        base = normalize_adaptive_breakout_trend_config()
         nested = source.get('adaptive_breakout_trend')
         if isinstance(nested, dict):
             base.update(nested)
         if 'adaptive_breakout_trend_live_enabled' in source:
             base['live_enabled'] = bool(source.get('adaptive_breakout_trend_live_enabled'))
-        return base
+        return normalize_adaptive_breakout_trend_config(base)
 
     async def _calculate_adaptive_breakout_trend_signal(
         self,
@@ -1122,8 +1125,31 @@ class SignalAlphaMixin:
         return _finish(side, f'ACCEPTED_ENTRY: {decision.reason}')
 
     async def build_adaptive_breakout_trend_status_text(self, symbol=None):
+        strategy_getter = getattr(self, 'get_runtime_strategy_params', None)
+        strategy_params = strategy_getter() if callable(strategy_getter) else {}
+        filtered_cfg = (
+            strategy_params.get('UTBotFilteredBreakoutV1', {})
+            if isinstance(strategy_params, dict)
+            else {}
+        )
+        trend_cfg = normalize_adaptive_breakout_trend_config(
+            filtered_cfg.get('adaptive_breakout_trend')
+            if isinstance(filtered_cfg, dict)
+            else None
+        )
+        universe_mode = str(trend_cfg.get('universe_mode', 'auto') or 'auto')
+        single_symbol = str(trend_cfg.get('single_symbol', '') or '').strip()
+        configured_target = single_symbol if universe_mode == 'single' else None
         target = self._canonical_futures_symbol(
-            symbol or self.current_utbreakout_candidate_symbol or 'BTC/USDT'
+            symbol
+            or configured_target
+            or self.current_utbreakout_candidate_symbol
+            or 'BTC/USDT'
+        )
+        universe_text = (
+            f'single / {single_symbol or "not configured"}'
+            if universe_mode == 'single'
+            else 'automatic scanner'
         )
         status = dict(
             (getattr(self, 'adaptive_breakout_trend_last_status', {}) or {}).get(target)
@@ -1138,7 +1164,9 @@ class SignalAlphaMixin:
                 if callable(exchange_mode_getter)
                 else ''
             )
-            if scan_scope == 'tradfi_only' and exchange_mode != 'binance_mainnet':
+            if universe_mode == 'single':
+                detail = '지정한 단일 코인의 완료된 1시간봉 평가를 기다리는 중입니다.'
+            elif scan_scope == 'tradfi_only' and exchange_mode != 'binance_mainnet':
                 detail = (
                     '스캐너 차단: 테스트넷에서는 TradFi ONLY 상품을 주문할 수 없습니다. '
                     '스캔 범위를 순수 코인 ONLY 또는 전체 허용으로 변경하세요.'
@@ -1162,6 +1190,7 @@ class SignalAlphaMixin:
             return '\n'.join([
                 '📈 Adaptive Breakout Trend 상태',
                 f'Symbol: {target}',
+                f'Universe: {universe_text}',
                 detail,
             ])
         metrics = status.get('metrics') if isinstance(status.get('metrics'), dict) else {}
@@ -1179,6 +1208,7 @@ class SignalAlphaMixin:
         return '\n'.join([
             '📈 Adaptive Breakout Trend 상태',
             f'Symbol: {target}',
+            f'Universe: {universe_text}',
             f"Signal: {str(status.get('side') or 'NONE').upper()} / allowed={bool(status.get('allowed'))}",
             f"Score: {float(status.get('score', 0.0) or 0.0):.1f}",
             f"Risk: x{float(status.get('risk_multiplier', 0.0) or 0.0):.2f} / tier={status.get('risk_tier') or 'waiting'}",

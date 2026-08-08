@@ -11,9 +11,11 @@ from utbreakout.adaptive_breakout_trend import (
     _normalized_momentum_horizons,
     default_adaptive_breakout_trend_config,
     evaluate_adaptive_breakout_trend,
+    normalize_adaptive_breakout_trend_config,
 )
 from bot_runtime.signal_alpha import SignalAlphaMixin
 from bot_runtime.signal_entry import build_durable_entry_plan_summary
+from bot_runtime.signal_scanner import SignalScannerMixin
 from utbreakout.dynamic_leverage import select_dynamic_leverage
 
 
@@ -103,6 +105,61 @@ def test_empty_horizon_config_falls_back_without_crashing():
     assert decision.side == "long"
 
 
+def test_trend_universe_config_normalizes_and_preserves_fail_closed_single_mode():
+    single = normalize_adaptive_breakout_trend_config(
+        {"universe_mode": " SINGLE ", "single_symbol": " btc/usdt:usdt "}
+    )
+    invalid = normalize_adaptive_breakout_trend_config(
+        {"universe_mode": "unexpected", "single_symbol": "ETH/USDT:USDT"}
+    )
+    empty_single = normalize_adaptive_breakout_trend_config(
+        {"universe_mode": "single", "single_symbol": ""}
+    )
+
+    assert single["universe_mode"] == "single"
+    assert single["single_symbol"] == "BTC/USDT:USDT"
+    assert invalid["universe_mode"] == "auto"
+    assert empty_single["universe_mode"] == "single"
+
+
+def test_trend_single_universe_resolves_one_symbol_and_invalid_symbol_fails_closed():
+    scanner = SignalScannerMixin()
+    scanner._get_utbot_filtered_breakout_config = (
+        lambda params: params["UTBotFilteredBreakoutV1"]
+    )
+    trade_cfg = {
+        "strategy_params": {
+            "active_strategy": ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+            "UTBotFilteredBreakoutV1": {
+                "adaptive_breakout_trend": {
+                    "universe_mode": "single",
+                    "single_symbol": "ETH/USDT:USDT",
+                }
+            },
+        }
+    }
+    scanner._ensure_valid_utbreakout_market_symbol = (
+        lambda symbol, source: (True, symbol, None)
+    )
+
+    resolved = scanner._resolve_adaptive_trend_scan_universe(trade_cfg)
+
+    assert resolved == {
+        "single_mode": True,
+        "symbol": "ETH/USDT:USDT",
+        "reason": None,
+    }
+
+    scanner._ensure_valid_utbreakout_market_symbol = (
+        lambda symbol, source: (False, symbol, "REJECTED_INVALID_MARKET_SYMBOL")
+    )
+    rejected = scanner._resolve_adaptive_trend_scan_universe(trade_cfg)
+
+    assert rejected["single_mode"] is True
+    assert rejected["symbol"] is None
+    assert rejected["reason"] == "REJECTED_INVALID_MARKET_SYMBOL"
+
+
 def test_strong_standalone_signal_can_reach_high_dynamic_leverage():
     plan = {
         "strategy": ADAPTIVE_BREAKOUT_TREND_STRATEGY,
@@ -136,6 +193,9 @@ def test_dedicated_telegram_mode_is_separate_and_mutually_exclusive():
     assert "callback_data='trend:on'" in setup_source
     assert "callback_data='trend:off'" in setup_source
     assert "callback_data='trend:status'" in setup_source
+    assert "callback_data='trend:single'" in setup_source
+    assert "callback_data='trend:auto'" in setup_source
+    assert "adaptive_trend_waiting_for_symbol" in setup_source
     assert "'quad_alpha_enabled_strategies'],\n                []," in setup_source
     assert "reset_exit_cache=False" in setup_source
     assert "reply_markup=self._build_main_keyboard()" in setup_source
@@ -173,6 +233,29 @@ def test_status_reports_empty_selector_rejections():
 
     assert "스캐너 후보 없음" in text
     assert "REJECTED_MIN_VOLUME=12" in text
+
+
+def test_status_uses_configured_trend_single_symbol_before_scanner_candidate():
+    engine = SignalAlphaMixin()
+    engine.current_utbreakout_candidate_symbol = "BTC/USDT:USDT"
+    engine.adaptive_breakout_trend_last_status = {}
+    engine.coin_selector_last_result = {}
+    engine._canonical_futures_symbol = lambda symbol: symbol
+    engine.get_runtime_strategy_params = lambda: {
+        "UTBotFilteredBreakoutV1": {
+            "adaptive_breakout_trend": {
+                "universe_mode": "single",
+                "single_symbol": "ETH/USDT:USDT",
+            }
+        }
+    }
+    engine.get_automatic_scan_scope = lambda: "crypto_only"
+    engine.ctrl = SimpleNamespace(get_exchange_mode=lambda: "binance_testnet")
+
+    text = asyncio.run(engine.build_adaptive_breakout_trend_status_text())
+
+    assert "Symbol: ETH/USDT:USDT" in text
+    assert "Universe: single / ETH/USDT:USDT" in text
 
 
 def test_durable_entry_summary_keeps_restart_exit_policy():

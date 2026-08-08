@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from utbreakout.adaptive_breakout_trend import (
+    ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+    normalize_adaptive_breakout_trend_config,
+)
+
 from .controller_automatic_controls import (
     AUTOMATIC_SCAN_SCOPE_ALL,
     AUTOMATIC_SCAN_SCOPE_CRYPTO,
@@ -11,6 +16,47 @@ from .controller_automatic_controls import (
 
 
 class SignalScannerMixin:
+    def _resolve_adaptive_trend_scan_universe(self, trade_cfg=None):
+        """Resolve standalone-trend single-symbol mode without auto fallback."""
+
+        cfg = trade_cfg if isinstance(trade_cfg, dict) else self.get_runtime_trade_config()
+        strategy_params = (
+            cfg.get('strategy_params', {})
+            if isinstance(cfg.get('strategy_params', {}), dict)
+            else {}
+        )
+        active_strategy = str(
+            strategy_params.get('active_strategy', '') or ''
+        ).strip().lower()
+        if active_strategy != ADAPTIVE_BREAKOUT_TREND_STRATEGY:
+            return {'single_mode': False, 'symbol': None, 'reason': None}
+
+        filtered_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+        trend_cfg = normalize_adaptive_breakout_trend_config(
+            filtered_cfg.get('adaptive_breakout_trend')
+            if isinstance(filtered_cfg, dict)
+            else None
+        )
+        if trend_cfg.get('universe_mode') != 'single':
+            return {'single_mode': False, 'symbol': None, 'reason': None}
+
+        configured_symbol = str(trend_cfg.get('single_symbol', '') or '').strip()
+        if not configured_symbol:
+            return {
+                'single_mode': True,
+                'symbol': None,
+                'reason': 'REJECTED_TREND_SINGLE_SYMBOL_EMPTY',
+            }
+        valid, canonical, reason = self._ensure_valid_utbreakout_market_symbol(
+            configured_symbol,
+            source='adaptive_trend_single_universe',
+        )
+        return {
+            'single_mode': True,
+            'symbol': canonical if valid else None,
+            'reason': None if valid else reason,
+        }
+
     def _get_primary_poll_timeframe(self, symbol=None, trade_cfg=None):
         cfg = trade_cfg if isinstance(trade_cfg, dict) else self.get_runtime_trade_config()
         common_cfg = cfg.get('common_settings', {}) if isinstance(cfg.get('common_settings', {}), dict) else {}
@@ -45,6 +91,11 @@ class SignalScannerMixin:
             cfg = self.get_runtime_trade_config()
             common_cfg = self.get_runtime_common_settings()
             entry_tf = self._get_primary_poll_timeframe(trade_cfg=cfg)
+            adaptive_trend_universe = self._resolve_adaptive_trend_scan_universe(cfg)
+            adaptive_trend_single_mode = bool(
+                adaptive_trend_universe.get('single_mode')
+            )
+            adaptive_trend_single_symbol = adaptive_trend_universe.get('symbol')
 
             active_position_symbols = set()
             # Common: Fetch current positions (best effort).
@@ -70,7 +121,14 @@ class SignalScannerMixin:
                 logger.warning(f"Protection orphan sweep failed: {cleanup_error}")
 
             # Check Scanner Setting
-            scanner_enabled = common_cfg.get('scanner_enabled', True)
+            scanner_enabled = bool(common_cfg.get('scanner_enabled', True))
+            if adaptive_trend_single_mode:
+                scanner_enabled = False
+                if not adaptive_trend_single_symbol:
+                    logger.warning(
+                        "Adaptive trend single-symbol mode is fail-closed: %s",
+                        adaptive_trend_universe.get('reason') or 'invalid symbol',
+                    )
 
             target_symbols = set()
 
@@ -142,11 +200,18 @@ class SignalScannerMixin:
                         target_symbols.add(self.scanner_active_symbol)
             else:
                 # === [Mode 2: Manual / Watchlist] ===
-                # Config Watchlist
-                config_symbols = set(self.get_runtime_watchlist())
+                if adaptive_trend_single_mode:
+                    # The selected trend symbol is the only new-entry target.
+                    # Existing exchange positions remain included for protection.
+                    target_symbols = set(active_position_symbols)
+                    if adaptive_trend_single_symbol:
+                        target_symbols.add(adaptive_trend_single_symbol)
+                else:
+                    # Config Watchlist
+                    config_symbols = set(self.get_runtime_watchlist())
 
-                # Merge: Config + Chat Manual + Positions
-                target_symbols = self.active_symbols | config_symbols | active_position_symbols
+                    # Merge: Config + Chat Manual + Positions
+                    target_symbols = self.active_symbols | config_symbols | active_position_symbols
 
             strategy_params = cfg.get('strategy_params', {})
             active_strategy = str(

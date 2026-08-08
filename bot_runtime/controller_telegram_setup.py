@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from utbreakout.adaptive_breakout_trend import (
     ADAPTIVE_BREAKOUT_TREND_STRATEGY,
-    default_adaptive_breakout_trend_config,
+    normalize_adaptive_breakout_trend_config,
 )
 from utbreakout.dynamic_leverage import normalize_dynamic_leverage_config
 
@@ -343,9 +343,11 @@ class TelegramSetupMixin:
             current = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get(
                 'UTBotFilteredBreakoutV1', {}
             )
-            trend_cfg = default_adaptive_breakout_trend_config()
-            if isinstance(current, dict) and isinstance(current.get('adaptive_breakout_trend'), dict):
-                trend_cfg.update(current.get('adaptive_breakout_trend'))
+            trend_cfg = normalize_adaptive_breakout_trend_config(
+                current.get('adaptive_breakout_trend')
+                if isinstance(current, dict)
+                else None
+            )
             trend_cfg['enabled'] = False
             trend_cfg['live_enabled'] = False
             await self.cfg.update_value(
@@ -934,9 +936,11 @@ class TelegramSetupMixin:
             current = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get(
                 'UTBotFilteredBreakoutV1', {}
             )
-            trend_cfg = default_adaptive_breakout_trend_config()
-            if isinstance(current, dict) and isinstance(current.get('adaptive_breakout_trend'), dict):
-                trend_cfg.update(current.get('adaptive_breakout_trend'))
+            trend_cfg = normalize_adaptive_breakout_trend_config(
+                current.get('adaptive_breakout_trend')
+                if isinstance(current, dict)
+                else None
+            )
             trend_cfg['enabled'] = True
             trend_cfg['live_enabled'] = True
 
@@ -1778,19 +1782,34 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 strategy_params.get('active_strategy', 'utbot') or 'utbot'
             ).lower()
             raw_cfg = strategy_params.get('UTBotFilteredBreakoutV1', {})
-            trend_cfg = default_adaptive_breakout_trend_config()
-            if isinstance(raw_cfg, dict) and isinstance(raw_cfg.get('adaptive_breakout_trend'), dict):
-                trend_cfg.update(raw_cfg.get('adaptive_breakout_trend'))
+            trend_cfg = normalize_adaptive_breakout_trend_config(
+                raw_cfg.get('adaptive_breakout_trend')
+                if isinstance(raw_cfg, dict)
+                else None
+            )
             selected = active_strategy == ADAPTIVE_BREAKOUT_TREND_STRATEGY
             live = selected and bool(trend_cfg.get('live_enabled', False))
             mode = 'PAUSED' if selected and self.is_paused else 'ON' if live else 'OFF'
             common_cfg = sig_cfg.get('common_settings', {})
-            scanner_on = bool(common_cfg.get('scanner_enabled', False)) and not self.is_paused
+            universe_mode = str(trend_cfg.get('universe_mode', 'auto') or 'auto')
+            single_symbol = str(trend_cfg.get('single_symbol', '') or '').strip()
+            scanner_on = (
+                selected
+                and universe_mode == 'auto'
+                and bool(common_cfg.get('scanner_enabled', False))
+                and not self.is_paused
+            )
+            universe_text = (
+                f'단일 코인 `{single_symbol}`'
+                if universe_mode == 'single' and single_symbol
+                else '자동 스캔'
+            )
             lines = [
                 '📈 추세추종 전용 메뉴',
                 '',
                 f'상태: `{mode}`',
-                f'신규 진입 스캐너: `{"ON" if scanner_on else "OFF"}`',
+                f'코인 선택: {universe_text}',
+                f'자동 스캔: `{"ON" if scanner_on else "OFF"}`',
                 f'신호 주기: `{trend_cfg.get("timeframe", "1h")}` 완료봉',
                 '기존 5개 전략: `모드 ON 시 전부 OFF`',
                 '',
@@ -1810,6 +1829,10 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 [
                     InlineKeyboardButton('추세추종 ON', callback_data='trend:on'),
                     InlineKeyboardButton('추세추종 OFF', callback_data='trend:off'),
+                ],
+                [
+                    InlineKeyboardButton('단일 코인', callback_data='trend:single'),
+                    InlineKeyboardButton('자동 스캔', callback_data='trend:auto'),
                 ],
                 [InlineKeyboardButton('추세추종 STATUS', callback_data='trend:status')],
                 [InlineKeyboardButton('기존 5전략 메뉴', callback_data='trend:five')],
@@ -2742,6 +2765,88 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 "AUTO 후보 스캔에 사용할 코인을 입력하세요. 예: `BTC ETH SOL`"
             )
 
+        async def _prompt_adaptive_trend_single_coin_input(message_or_query, context):
+            if context and context.user_data is not None:
+                context.user_data['adaptive_trend_waiting_for_symbol'] = True
+            await _reply_utbreakout_interaction(
+                message_or_query,
+                "추세추종으로 감시할 코인 1개를 입력하세요. 예: `BTC` 또는 `BTCUSDT`",
+            )
+
+        async def _set_adaptive_trend_universe(mode, raw_symbol=None):
+            requested_mode = str(mode or 'auto').strip().lower()
+            if requested_mode not in {'auto', 'single'}:
+                raise ValueError('추세추종 코인 선택 모드가 올바르지 않습니다.')
+
+            sig_cfg = self.cfg.get('signal_engine', {})
+            strategy_params = sig_cfg.get('strategy_params', {}) or {}
+            raw_cfg = strategy_params.get('UTBotFilteredBreakoutV1', {}) or {}
+            trend_cfg = normalize_adaptive_breakout_trend_config(
+                raw_cfg.get('adaptive_breakout_trend')
+                if isinstance(raw_cfg, dict)
+                else None
+            )
+
+            resolved_symbol = ''
+            if requested_mode == 'single':
+                normalized = normalize_coin_selector_custom_symbols([raw_symbol])
+                if len(normalized) != 1:
+                    raise ValueError('코인 1개만 입력해 주세요. 예: BTC')
+                if self.get_exchange_mode() == UPBIT_MODE:
+                    raise ValueError('추세추종 단일 코인은 Binance Futures 모드에서만 사용할 수 있습니다.')
+                markets = await asyncio.to_thread(self.exchange.load_markets)
+                resolved_symbol = self._resolve_futures_watch_symbol_from_markets(
+                    normalized[0],
+                    markets,
+                    exchange_mode=self.get_exchange_mode(),
+                )
+
+            active_strategy = str(
+                strategy_params.get('active_strategy', '') or ''
+            ).strip().lower()
+            trend_selected = active_strategy == ADAPTIVE_BREAKOUT_TREND_STRATEGY
+            was_paused = bool(self.is_paused)
+            if trend_selected:
+                self.is_paused = True
+            try:
+                trend_cfg['universe_mode'] = requested_mode
+                trend_cfg['single_symbol'] = resolved_symbol
+                trend_cfg = normalize_adaptive_breakout_trend_config(trend_cfg)
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_breakout_trend'],
+                    trend_cfg,
+                )
+                if trend_selected and requested_mode == 'auto':
+                    await self.cfg.update_value(
+                        ['signal_engine', 'coin_selector', 'enabled'],
+                        True,
+                    )
+                    await self.cfg.update_value(
+                        ['signal_engine', 'common_settings', 'scanner_enabled'],
+                        True,
+                    )
+
+                if trend_selected:
+                    engine = self._reset_signal_engine_runtime_state(
+                        reset_entry_cache=True,
+                        reset_exit_cache=False,
+                        reset_stateful_strategy=False,
+                    )
+                    if engine:
+                        engine.scanner_active_symbol = None
+                        engine.adaptive_breakout_trend_last_status = {}
+                        engine.coin_selector_last_result = {}
+                        engine.coin_selector_symbol_scores = {}
+                        engine.coin_selector_last_run_ts = 0.0
+            finally:
+                if trend_selected:
+                    self.is_paused = was_paused
+
+            active_note = '현재 즉시 적용됩니다.' if trend_selected else '추세추종 ON을 누르면 적용됩니다.'
+            if requested_mode == 'single':
+                return f'✅ 추세추종 단일 코인: `{resolved_symbol}`\n{active_note}'
+            return f'✅ 추세추종 자동 스캔으로 복귀했습니다.\n{active_note}'
+
         async def _adaptive_trend_status_text():
             engine = self.engines.get('signal')
             if engine is None:
@@ -2761,6 +2866,9 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
             if not args and u and u.message and u.message.text:
                 args = u.message.text.strip().split()[1:]
             action = str(args[0]).strip().lower() if args else ''
+            awaiting_single_input = action in {'single', 'coin'} and len(args) < 2
+            if c and c.user_data is not None and not awaiting_single_input:
+                c.user_data.pop('adaptive_trend_waiting_for_symbol', None)
             if action in {'on', 'enable', 'start'}:
                 notice = await _activate_adaptive_breakout_trend_strategy()
                 await self._reply_markdown_safe(
@@ -2785,6 +2893,29 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     reply_markup=_build_adaptive_trend_keyboard(),
                 )
                 return
+            if action in {'single', 'coin'}:
+                if len(args) < 2:
+                    await _prompt_adaptive_trend_single_coin_input(u.message, c)
+                    return
+                try:
+                    notice = await _set_adaptive_trend_universe('single', args[1])
+                except Exception as exc:
+                    await u.message.reply_text(f'❌ {exc}')
+                    return
+                await self._reply_markdown_safe(
+                    u.message,
+                    _format_adaptive_trend_menu_text(notice),
+                    reply_markup=_build_adaptive_trend_keyboard(),
+                )
+                return
+            if action in {'auto', 'autoscan', 'scan'}:
+                notice = await _set_adaptive_trend_universe('auto')
+                await self._reply_markdown_safe(
+                    u.message,
+                    _format_adaptive_trend_menu_text(notice),
+                    reply_markup=_build_adaptive_trend_keyboard(),
+                )
+                return
             await self._reply_markdown_safe(
                 u.message,
                 _format_adaptive_trend_menu_text(),
@@ -2798,6 +2929,8 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
             await query.answer('처리 중입니다.')
             data = str(query.data or '')
             action = data.split(':', 1)[1] if ':' in data else 'menu'
+            if c and c.user_data is not None and action != 'single':
+                c.user_data.pop('adaptive_trend_waiting_for_symbol', None)
             if action == 'on':
                 await _edit_adaptive_trend_menu(
                     query,
@@ -2817,6 +2950,15 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                     reply_markup=_build_adaptive_trend_keyboard(),
                     filename='adaptive_trend_status.txt',
                     caption='추세추종 상태 전체 내용입니다.',
+                )
+                return
+            if action == 'single':
+                await _prompt_adaptive_trend_single_coin_input(query, c)
+                return
+            if action == 'auto':
+                await _edit_adaptive_trend_menu(
+                    query,
+                    await _set_adaptive_trend_universe('auto'),
                 )
                 return
             if action == 'five':
@@ -6033,6 +6175,21 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 )
                 if handled:
                     return
+            if c and c.user_data is not None and c.user_data.pop('adaptive_trend_waiting_for_symbol', False):
+                try:
+                    notice = await _set_adaptive_trend_universe('single', raw_text)
+                except Exception as exc:
+                    c.user_data['adaptive_trend_waiting_for_symbol'] = True
+                    await u.message.reply_text(
+                        f'❌ {exc}\n다시 입력해 주세요. 예: BTC'
+                    )
+                    return
+                await self._reply_markdown_safe(
+                    u.message,
+                    _format_adaptive_trend_menu_text(notice),
+                    reply_markup=_build_adaptive_trend_keyboard(),
+                )
+                return
             if c and c.user_data is not None and c.user_data.pop('utbot_coin_waiting_for_symbol', False):
                 try:
                     symbol = await _set_strategy_coin(raw_text)

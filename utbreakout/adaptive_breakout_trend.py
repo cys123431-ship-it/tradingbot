@@ -24,6 +24,8 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
     return {
         "enabled": True,
         "live_enabled": False,
+        "universe_mode": "auto",
+        "single_symbol": "",
         "timeframe": "1h",
         "fetch_limit": 360,
         "momentum_horizons": (24, 72, 168),
@@ -60,6 +62,26 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         "elite_score": 88.0,
         "time_stop_hours": 168,
     }
+
+
+def normalize_adaptive_breakout_trend_config(
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a stable trend configuration, including its scan universe."""
+
+    normalized = default_adaptive_breakout_trend_config()
+    if isinstance(config, Mapping):
+        normalized.update(dict(config))
+
+    universe_mode = str(
+        normalized.get("universe_mode", "auto") or "auto"
+    ).strip().lower()
+    if universe_mode not in {"auto", "single"}:
+        universe_mode = "auto"
+    single_symbol = str(normalized.get("single_symbol", "") or "").strip().upper()
+    normalized["universe_mode"] = universe_mode
+    normalized["single_symbol"] = single_symbol
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -412,4 +434,5 @@ __all__ = (
     "AdaptiveBreakoutTrendDecision",
     "default_adaptive_breakout_trend_config",
     "evaluate_adaptive_breakout_trend",
+    "normalize_adaptive_breakout_trend_config",
 )

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from utbreakout.adaptive_breakout_trend import (
     ADAPTIVE_BREAKOUT_TREND_STRATEGY,
-    default_adaptive_breakout_trend_config,
+    normalize_adaptive_breakout_trend_config,
 )
 from utbreakout.dynamic_leverage import (
     default_dynamic_leverage_config,
@@ -521,9 +521,9 @@ class TradingConfig:
             strategy_params['active_strategy'] = 'utbot'
             active_strategy = 'utbot'
             changed = True
-        adaptive_trend_cfg = default_adaptive_breakout_trend_config()
-        if isinstance(quad_cfg.get('adaptive_breakout_trend'), dict):
-            adaptive_trend_cfg.update(quad_cfg.get('adaptive_breakout_trend'))
+        adaptive_trend_cfg = normalize_adaptive_breakout_trend_config(
+            quad_cfg.get('adaptive_breakout_trend')
+        )
         adaptive_trend_active = active_strategy == ADAPTIVE_BREAKOUT_TREND_STRATEGY
         adaptive_trend_cfg['enabled'] = adaptive_trend_active
         adaptive_trend_cfg['live_enabled'] = adaptive_trend_active
