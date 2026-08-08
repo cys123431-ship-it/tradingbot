@@ -108,6 +108,20 @@ class ControllerAutomaticTradingControlsMixin:
         normalized = str(scope or "").strip().lower()
         if normalized not in AUTOMATIC_SCAN_SCOPES:
             raise ValueError(f"unsupported automatic scan scope: {scope}")
+        mode_getter = getattr(self, "get_exchange_mode", None)
+        exchange_mode = (
+            str(mode_getter() or "").strip().lower()
+            if callable(mode_getter)
+            else "binance_mainnet"
+        )
+        if (
+            normalized == AUTOMATIC_SCAN_SCOPE_TRADIFI
+            and exchange_mode != "binance_mainnet"
+        ):
+            raise ValueError(
+                "TradFi ONLY는 바이낸스 메인넷에서만 사용할 수 있습니다. "
+                "테스트넷에서는 순수 코인 ONLY 또는 전체 허용을 선택하세요."
+            )
         await self._update_config_value(
             ["signal_engine", "coin_selector", "scan_scope"],
             normalized,
@@ -229,11 +243,15 @@ class ControllerAutomaticTradingControlsMixin:
                 )
             elif data.startswith("atc:scope:"):
                 scope = data.split(":", 2)[2]
-                normalized = await self.set_automatic_scan_scope(scope)
-                notice = (
-                    "✅ 자동매매 스캔 범위를 "
-                    f"{AUTOMATIC_SCAN_SCOPE_LABELS[normalized]}로 변경했습니다."
-                )
+                try:
+                    normalized = await self.set_automatic_scan_scope(scope)
+                except ValueError as exc:
+                    notice = f"⛔ {exc}"
+                else:
+                    notice = (
+                        "✅ 자동매매 스캔 범위를 "
+                        f"{AUTOMATIC_SCAN_SCOPE_LABELS[normalized]}로 변경했습니다."
+                    )
             elif data != "atc:status":
                 return
             await self._send_automatic_trading_controls(

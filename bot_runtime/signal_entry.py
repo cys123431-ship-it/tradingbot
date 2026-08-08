@@ -5,6 +5,120 @@ from __future__ import annotations
 from utbreakout.dynamic_leverage import apply_dynamic_leverage_to_plan
 
 
+_DURABLE_ENTRY_PLAN_KEYS = (
+    'strategy',
+    'plan_symbol',
+    'side',
+    'signal_timestamp',
+    'signal_candle_ts',
+    'decision_candle_ts',
+    'entry_price',
+    'stop_loss',
+    'hard_stop_loss',
+    'soft_stop_loss',
+    'structure_stop',
+    'structure_stop_with_buffer',
+    'structure_stop_buffer_atr',
+    'risk_distance',
+    'rr_multiple',
+    'atr',
+    'leverage',
+    'dynamic_leverage_tier',
+    'dynamic_leverage_score',
+    'dynamic_leverage_reason',
+    'dynamic_leverage_monitor_timeframe',
+    'opportunity_risk_multiplier',
+    'opportunity_risk_tier',
+    'opportunity_risk_reason',
+    'entry_timeframe',
+    'exit_timeframe',
+    'htf_timeframe',
+    'fixed_take_profit_enabled',
+    'partial_take_profit_enabled',
+    'partial_take_profit_r_multiple',
+    'partial_take_profit_ratio',
+    'second_take_profit_enabled',
+    'second_take_profit_r_multiple',
+    'second_take_profit_ratio',
+    'runner_pct',
+    'preserve_runner_qty',
+    'atr_trailing_enabled',
+    'atr_trailing_breakeven_enabled',
+    'atr_trailing_multiplier',
+    'atr_trailing_activation_r',
+    'runner_exit_enabled',
+    'runner_chandelier_enabled',
+    'runner_chandelier_lookback',
+    'runner_structure_lookback',
+    'tp1_breakeven_enabled',
+    'tp1_breakeven_trigger_r',
+    'tp1_breakeven_offset_r',
+    'tp1_breakeven_wait_for_partial',
+    'tp1_breakeven_qty_tolerance',
+    'ev_exit_profile_name',
+    'ev_exit_mode',
+    'ev_time_stop_enabled',
+    'ev_time_stop_bars',
+    'ev_time_stop_min_mfe_r',
+    'ev_time_stop_max_current_r',
+    'time_stop_max_current_r',
+    'ev_mfe_profit_lock_enabled',
+    'ev_mfe_lock_trigger_1_r',
+    'ev_mfe_lock_trigger_2_r',
+    'ev_mfe_lock_trigger_3_r',
+    'profit_alpha_follow_through_enabled',
+    'profit_alpha_follow_through_bars',
+    'profit_alpha_follow_through_min_mfe_r',
+    'profit_alpha_early_exit_max_mae_r',
+    'profit_alpha_stall_exit_max_current_r',
+    'take_profit_front_run_atr',
+    'take_profit_front_run_pct',
+    'tp_front_run_min_r_multiple',
+    'soft_stop_enabled',
+    'soft_stop_confirm_bars',
+    'near_miss_tp_enabled',
+    'near_miss_tp_arm_ratio',
+    'near_miss_tp_lock_r',
+    'near_miss_tp_rejection_atr',
+    'aggressive_growth_overlay',
+    'pyramid_add_count',
+    'trend_health_score',
+    'trend_health_summary',
+    'trend_health_risk_multiplier',
+    'strategy_quality_score',
+    'strategy_quality_summary',
+    'strategy_quality_risk_multiplier',
+    'ev_adaptive_enabled',
+    'ev_adaptive_mode',
+    'ev_net_edge_r',
+    'profit_alpha_enabled',
+    'profit_alpha_engine',
+    'profit_alpha_entry_type',
+    'profit_alpha_direction_score',
+    'profit_alpha_exit_policy',
+    'profit_alpha_score',
+    'profit_alpha_probability',
+    'profit_alpha_risk_multiplier',
+    'profit_alpha_meta_key',
+    'entry_edge_entry_type',
+    'entry_edge_direction_score',
+    'entry_edge_exit_policy',
+    'auto_selected_set_id',
+    'auto_selected_set_name',
+)
+
+
+def build_durable_entry_plan_summary(plan):
+    """Keep every exit-policy input needed to reconstruct protection after restart."""
+
+    source = plan if isinstance(plan, dict) else {}
+    return {
+        key: source.get(key)
+        for key in _DURABLE_ENTRY_PLAN_KEYS
+        if source.get(key) is not None
+    }
+
+
 class SignalEntryMixin:
     async def entry(self, symbol, side, price):
         try:
@@ -1412,42 +1526,9 @@ class SignalEntryMixin:
                     else None
                 ),
                 leverage=lev,
-                entry_plan_summary={
-                    key: entry_plan_attribution.get(key)
-                    for key in (
-                        'strategy',
-                        'plan_symbol',
-                        'stop_loss',
-                        'risk_distance',
-                        'rr_multiple',
-                        'leverage',
-                        'dynamic_leverage_tier',
-                        'dynamic_leverage_score',
-                        'dynamic_leverage_reason',
-                        'opportunity_risk_multiplier',
-                        'opportunity_risk_tier',
-                        'opportunity_risk_reason',
-                        'entry_timeframe',
-                        'exit_timeframe',
-                        'htf_timeframe',
-                        'partial_take_profit_r_multiple',
-                        'partial_take_profit_ratio',
-                        'second_take_profit_r_multiple',
-                        'second_take_profit_ratio',
-                        'runner_pct',
-                        'atr_trailing_enabled',
-                        'atr_trailing_multiplier',
-                        'atr_trailing_activation_r',
-                        'runner_exit_enabled',
-                        'runner_chandelier_enabled',
-                        'tp1_breakeven_enabled',
-                        'tp1_breakeven_trigger_r',
-                        'tp1_breakeven_offset_r',
-                        'tp1_breakeven_wait_for_partial',
-                        'tp1_breakeven_qty_tolerance',
-                    )
-                    if entry_plan_attribution.get(key) is not None
-                },
+                entry_plan_summary=build_durable_entry_plan_summary(
+                    entry_plan_attribution
+                ),
             )
             actual_liquidation_payload = dict(cfg or {})
             if isinstance(filtered_breakout_plan, dict):

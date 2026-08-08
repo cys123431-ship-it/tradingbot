@@ -139,6 +139,50 @@ def _bounded(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, float(value)))
 
 
+def _normalized_momentum_horizons(
+    horizons_value: Any,
+    weights_value: Any,
+) -> tuple[tuple[int, ...], tuple[float, ...]]:
+    """Normalize horizon/weight pairs without changing their configured mapping."""
+
+    default_cfg = default_adaptive_breakout_trend_config()
+    try:
+        raw_horizons = tuple(horizons_value)
+    except TypeError:
+        raw_horizons = ()
+    try:
+        parsed_horizons = tuple(max(4, int(value)) for value in raw_horizons)
+    except (TypeError, ValueError):
+        parsed_horizons = ()
+    if not parsed_horizons:
+        parsed_horizons = tuple(
+            max(4, int(value)) for value in default_cfg['momentum_horizons']
+        )
+
+    try:
+        raw_weights = tuple(float(value) for value in weights_value)
+    except (TypeError, ValueError):
+        raw_weights = ()
+    if (
+        len(raw_weights) != len(parsed_horizons)
+        or sum(max(0.0, value) for value in raw_weights) <= 0
+    ):
+        raw_weights = tuple(1.0 for _ in parsed_horizons)
+
+    combined: dict[int, float] = {}
+    for horizon, weight in zip(parsed_horizons, raw_weights):
+        combined[horizon] = combined.get(horizon, 0.0) + max(0.0, weight)
+    ordered = tuple(sorted(combined.items()))
+    weight_sum = sum(weight for _, weight in ordered)
+    if weight_sum <= 0:
+        ordered = tuple((horizon, 1.0) for horizon, _ in ordered)
+        weight_sum = float(len(ordered))
+    return (
+        tuple(horizon for horizon, _ in ordered),
+        tuple(weight / weight_sum for _, weight in ordered),
+    )
+
+
 def evaluate_adaptive_breakout_trend(
     rows: Sequence[Mapping[str, Any]] | None,
     l2_gate: Mapping[str, Any] | None = None,
@@ -148,12 +192,10 @@ def evaluate_adaptive_breakout_trend(
 
     cfg = {**default_adaptive_breakout_trend_config(), **dict(config or {})}
     candles = _clean_rows(rows)
-    horizons = tuple(sorted({max(4, int(value)) for value in cfg["momentum_horizons"]}))
-    weights_raw = tuple(float(value) for value in cfg.get("momentum_weights", ()))
-    if len(weights_raw) != len(horizons) or sum(max(0.0, value) for value in weights_raw) <= 0:
-        weights_raw = tuple(1.0 for _ in horizons)
-    weight_sum = sum(max(0.0, value) for value in weights_raw)
-    weights = tuple(max(0.0, value) / weight_sum for value in weights_raw)
+    horizons, weights = _normalized_momentum_horizons(
+        cfg.get("momentum_horizons"),
+        cfg.get("momentum_weights"),
+    )
     required = max(
         max(horizons) + 2,
         int(cfg["slow_ema_period"]) + int(cfg["ema_slope_bars"]) + 2,

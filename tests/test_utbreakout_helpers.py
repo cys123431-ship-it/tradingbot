@@ -1032,6 +1032,7 @@ def test_reinit_to_testnet_sanitizes_tradifi_watchlist():
             "coin_selector": {
                 "custom_symbols": ["QQQ/USDT", "BTC/USDT"],
                 "include_tradifi_universe": True,
+                "scan_scope": "tradfi_only",
             },
         },
         "upbit": {"watchlist": ["BTC/KRW"]},
@@ -1064,6 +1065,7 @@ def test_reinit_to_testnet_sanitizes_tradifi_watchlist():
     assert "BTC/USDT" in result["watchlist"]
     assert all("QQQ" not in s and "SPY" not in s for s in result["watchlist"])
     assert cfg.values["signal_engine"]["coin_selector"]["include_tradifi_universe"] is False
+    assert cfg.values["signal_engine"]["coin_selector"]["scan_scope"] == "crypto_only"
     assert cfg.values["signal_engine"]["coin_selector"]["custom_symbols"] == ["BTC/USDT"]
     assert cfg.values["exchange_watchlists"][emas.BINANCE_TESTNET] == result["watchlist"]
     assert engine.active_symbols == set(result["watchlist"])

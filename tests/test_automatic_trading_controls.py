@@ -50,9 +50,10 @@ class _DBStub:
 
 
 class _ControllerStub(ControllerAutomaticTradingControlsMixin):
-    def __init__(self, count=0):
+    def __init__(self, count=0, exchange_mode="binance_mainnet"):
         self.cfg = _ConfigStub()
         self.db = _DBStub(count)
+        self.exchange_mode = exchange_mode
         self.engines = {"signal": SimpleNamespace(
             coin_selector_last_result={"old": True},
             coin_selector_symbol_scores={"old": True},
@@ -63,6 +64,9 @@ class _ControllerStub(ControllerAutomaticTradingControlsMixin):
 
     async def _update_config_value(self, path, value):
         await self.cfg.update_value(path, value)
+
+    def get_exchange_mode(self):
+        return self.exchange_mode
 
 
 def test_daily_limit_is_five_then_extends_once_to_ten_for_utc_day():
@@ -111,6 +115,17 @@ def test_scan_scope_persists_and_resets_automatic_selector_cache_only():
     asyncio.run(ctrl.set_automatic_scan_scope(AUTOMATIC_SCAN_SCOPE_CRYPTO))
     assert coin_cfg["scan_scope"] == AUTOMATIC_SCAN_SCOPE_CRYPTO
     assert coin_cfg["include_tradifi_universe"] is False
+
+
+def test_testnet_rejects_tradfi_only_without_mutating_existing_scope():
+    ctrl = _ControllerStub(exchange_mode="binance_testnet")
+
+    with pytest.raises(ValueError, match="메인넷"):
+        asyncio.run(ctrl.set_automatic_scan_scope(AUTOMATIC_SCAN_SCOPE_TRADIFI))
+
+    coin_cfg = ctrl.cfg.config["signal_engine"]["coin_selector"]
+    assert coin_cfg["scan_scope"] == AUTOMATIC_SCAN_SCOPE_ALL
+    assert coin_cfg["include_tradifi_universe"] is True
 
 
 def test_telegram_keyboard_contains_daily_limit_and_all_scan_scope_buttons():

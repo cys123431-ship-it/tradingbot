@@ -1130,10 +1130,39 @@ class SignalAlphaMixin:
             or {}
         )
         if not status:
+            scan_scope = str(self.get_automatic_scan_scope() or '').strip().lower()
+            ctrl = getattr(self, 'ctrl', None)
+            exchange_mode_getter = getattr(ctrl, 'get_exchange_mode', None)
+            exchange_mode = (
+                str(exchange_mode_getter() or '').strip().lower()
+                if callable(exchange_mode_getter)
+                else ''
+            )
+            if scan_scope == 'tradfi_only' and exchange_mode != 'binance_mainnet':
+                detail = (
+                    '스캐너 차단: 테스트넷에서는 TradFi ONLY 상품을 주문할 수 없습니다. '
+                    '스캔 범위를 순수 코인 ONLY 또는 전체 허용으로 변경하세요.'
+                )
+            else:
+                selector_report = getattr(self, 'coin_selector_last_result', None)
+                selector_report = selector_report if isinstance(selector_report, dict) else {}
+                selected = selector_report.get('selected') or []
+                watch_only = selector_report.get('watch_only') or []
+                if selector_report and not selected and not watch_only:
+                    reject_counts = selector_report.get('reject_counts') or {}
+                    reject_text = ', '.join(
+                        f'{key}={value}' for key, value in reject_counts.items()
+                    )
+                    detail = (
+                        f'스캐너 후보 없음: scan_scope={scan_scope or "unknown"}'
+                        + (f' / {reject_text}' if reject_text else '')
+                    )
+                else:
+                    detail = '아직 완료된 1시간봉 평가 기록이 없습니다.'
             return '\n'.join([
                 '📈 Adaptive Breakout Trend 상태',
                 f'Symbol: {target}',
-                '아직 완료된 1시간봉 평가 기록이 없습니다.',
+                detail,
             ])
         metrics = status.get('metrics') if isinstance(status.get('metrics'), dict) else {}
         votes = metrics.get('horizon_votes') if isinstance(metrics.get('horizon_votes'), dict) else {}

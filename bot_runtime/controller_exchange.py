@@ -510,6 +510,14 @@ class ControllerExchangeMixin:
             await self._update_config_value(['signal_engine', 'coin_selector', 'custom_symbols'], valid)
             if mode != BINANCE_MAINNET:
                 await self._update_config_value(['signal_engine', 'coin_selector', 'include_tradifi_universe'], False)
+                if (
+                    mode == BINANCE_TESTNET
+                    and str(coin_cfg.get('scan_scope', '') or '').strip().lower() == 'tradfi_only'
+                ):
+                    await self._update_config_value(
+                        ['signal_engine', 'coin_selector', 'scan_scope'],
+                        'crypto_only',
+                    )
             elif 'include_tradifi_universe' not in coin_cfg:
                 await self._update_config_value(['signal_engine', 'coin_selector', 'include_tradifi_universe'], True)
 

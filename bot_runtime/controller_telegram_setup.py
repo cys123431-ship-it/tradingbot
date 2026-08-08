@@ -2752,6 +2752,11 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
             return await builder()
 
         async def trend_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            if u and u.message:
+                await u.message.reply_text(
+                    '📱 메인 메뉴 버튼을 최신 상태로 갱신했습니다.',
+                    reply_markup=self._build_main_keyboard(),
+                )
             args = list(getattr(c, 'args', []) or [])
             if not args and u and u.message and u.message.text:
                 args = u.message.text.strip().split()[1:]
