@@ -21,7 +21,7 @@ def test_ev_adaptive_final_overrides_are_authoritative():
         "selected_set_core_filter_hard_block_enabled": False,
     })
 
-    assert cfg["effective_profile_version"] == "ev_adaptive_v4_profit_capture"
+    assert cfg["effective_profile_version"] == "ev_adaptive_v3_profit_engine"
     assert cfg["live_auto_set_whitelist"] == [64]
     assert cfg["active_set_id"] == 64
     assert cfg["selected_set_core_filter_hard_block_enabled"] is False

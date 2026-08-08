@@ -357,7 +357,7 @@ def test_candidate_ranking_prefers_net_edge_over_legacy_indicator_score():
 def test_live_effective_profile_retires_legacy_set_selection_and_risk_floor():
     cfg = apply_profit_opportunity_effective_overrides({})
 
-    assert cfg["effective_profile_version"] == "ev_adaptive_v4_profit_capture"
+    assert cfg["effective_profile_version"] == "ev_adaptive_v3_profit_engine"
     assert cfg["live_auto_set_whitelist"] == [64]
     assert cfg["active_set_id"] == 64
     assert cfg["final_risk_multiplier_floor"] == 0.0
@@ -386,7 +386,7 @@ def test_live_auto_selection_uses_only_ev_adaptive_set():
     assert analysis["scores"]["auto_final_set_id"] == 64
 
 
-def test_live_auto_selection_reason_says_ev_adaptive_v4_profit_capture():
+def test_live_auto_selection_reason_says_ev_adaptive_v3_profit_engine():
     engine = object.__new__(SignalEngine)
     cfg = apply_profit_opportunity_effective_overrides(
         {"live_trading": True, "mode": "live"}

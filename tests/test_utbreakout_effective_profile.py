@@ -23,7 +23,7 @@ def test_profit_opportunity_effective_profile_overrides_old_values():
 
     out = emas.apply_profit_opportunity_effective_overrides(cfg)
 
-    assert out["effective_profile_version"] == "ev_adaptive_v4_profit_capture"
+    assert out["effective_profile_version"] == "ev_adaptive_v3_profit_engine"
     assert out["selection_mode"] == "auto"
     assert out["auto_select_enabled"] is True
     assert out["active_set_id"] == 64
@@ -136,7 +136,7 @@ def test_status_render_contract_replaces_stale_telegram_summary_values():
         daily_entries=0,
     )
 
-    assert "Effective Profile: ev_adaptive_v4_profit_capture" in rendered
+    assert "Effective Profile: ev_adaptive_v3_profit_engine" in rendered
     assert "Strategy Router: Entry Edge (UT trigger + EV/Alpha integrated)" in rendered
     assert "Effective TP2: 3.20R" in rendered
     assert "Effective volume: base 0.40 / 15m 0.45" in rendered

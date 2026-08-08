@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from math import isfinite, sqrt
 
 
-EV_ADAPTIVE_PROFILE_VERSION = "ev_adaptive_v4_profit_capture"
+EV_ADAPTIVE_PROFILE_VERSION = "ev_adaptive_v3_profit_engine"
 
 
 @dataclass(frozen=True)

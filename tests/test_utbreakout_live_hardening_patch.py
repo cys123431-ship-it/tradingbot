@@ -12,7 +12,7 @@ def test_ev_router_keeps_legacy_set_hardening_disabled():
 def test_profit_patch_matches_opportunity_profile_values():
     cfg = patch.tune_effective_config({})
 
-    assert cfg["effective_profile_version"] == "ev_adaptive_v4_profit_capture"
+    assert cfg["effective_profile_version"] == "ev_adaptive_v3_profit_engine"
     assert cfg["live_auto_set_whitelist"] == [64]
     assert cfg["active_set_id"] == 64
     assert cfg["partial_take_profit_r_multiple"] == 1.25

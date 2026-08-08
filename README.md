@@ -13,7 +13,7 @@
 | 공식 실행 진입점 | `scripts/launch_emas.py` |
 | 기본 거래소 모드 | `binance_testnet` |
 | 지원 모드 | Binance Testnet, Binance Mainnet, Upbit |
-| 핵심 런타임 프로필 | `ev_adaptive_v4_profit_capture` |
+| 핵심 런타임 프로필 | `ev_adaptive_v3_profit_engine` |
 | UTBreak 실거래 Set | **Set64만 허용** |
 | 기존 Set1~63 | 연구·진단용 레거시 Set |
 | UTBreak 시간프레임 | AUTO `15m / 30m / 1h`, 진입·청산 `15m`, HTF `1h` |
