@@ -1691,6 +1691,7 @@ def build_default_utbot_filtered_breakout_config():
         'second_take_profit_enabled': True,
         'second_take_profit_r_multiple': 3.20,
         'second_take_profit_ratio': 0.30,
+        'runner_pct': 0.50,
         'enable_tp2_fallback_close': False,
         'tp2_fallback_confirm_loops': 2,
         'tp2_fallback_use_market': True,
