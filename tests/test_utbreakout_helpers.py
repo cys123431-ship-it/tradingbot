@@ -1072,6 +1072,45 @@ def test_reinit_to_testnet_sanitizes_tradifi_watchlist():
     assert engine.scanner_active_symbol is None
 
 
+def test_startup_scope_repair_does_not_require_market_loading():
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+    cfg = _MemoryConfig()
+    cfg.values.update({
+        "api": {"exchange_mode": emas.BINANCE_TESTNET, "use_testnet": True},
+        "signal_engine": {
+            "coin_selector": {
+                "scan_scope": "tradfi_only",
+                "include_tradifi_universe": True,
+            },
+        },
+    })
+    controller.cfg = cfg
+    engine = _FakeSignalRuntime()
+    engine.coin_selector_last_result = {"old": True}
+    engine.coin_selector_symbol_scores = {"old": True}
+    engine.coin_selector_last_run_ts = 123.0
+    engine.coin_selector_analysis_cursor = 4
+    engine.coin_selector_strategy_cursor = 3
+    controller.engines = {"signal": engine}
+
+    result = asyncio.run(
+        controller._repair_unsupported_coin_selector_scope(
+            emas.BINANCE_TESTNET,
+            persist=True,
+        )
+    )
+
+    assert result["changed"] is True
+    assert result["scan_scope"] == "crypto_only"
+    coin_cfg = cfg.values["signal_engine"]["coin_selector"]
+    assert coin_cfg["scan_scope"] == "crypto_only"
+    assert coin_cfg["include_tradifi_universe"] is False
+    assert engine.coin_selector_last_result == {}
+    assert engine.coin_selector_symbol_scores == {}
+    assert engine.coin_selector_last_run_ts == 0.0
+
+
 def test_mainnet_allows_tradifi_if_market_exists():
     emas = _emas_module()
     controller = emas.MainController.__new__(emas.MainController)

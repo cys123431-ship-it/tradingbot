@@ -468,8 +468,59 @@ class ControllerExchangeMixin:
                 engine.scanner_active_symbol = None
         return synced
 
+    async def _repair_unsupported_coin_selector_scope(self, exchange_mode=None, *, persist=True):
+        """Repair scan scopes that the selected order venue cannot execute."""
+
+        mode = exchange_mode or self.get_exchange_mode()
+        signal_cfg = self.cfg.get('signal_engine', {}) or {}
+        coin_cfg = signal_cfg.get('coin_selector', {}) if isinstance(signal_cfg.get('coin_selector', {}), dict) else {}
+        scope = str(coin_cfg.get('scan_scope', '') or '').strip().lower()
+        repaired_scope = scope
+        changed = False
+
+        if mode == BINANCE_TESTNET and scope == 'tradfi_only':
+            repaired_scope = 'crypto_only'
+            changed = True
+            if persist:
+                await self._update_config_value(
+                    ['signal_engine', 'coin_selector', 'scan_scope'],
+                    repaired_scope,
+                )
+        if mode != BINANCE_MAINNET and bool(coin_cfg.get('include_tradifi_universe', False)):
+            changed = True
+            if persist:
+                await self._update_config_value(
+                    ['signal_engine', 'coin_selector', 'include_tradifi_universe'],
+                    False,
+                )
+
+        if changed and persist:
+            engine = (getattr(self, 'engines', {}) or {}).get('signal')
+            if engine is not None:
+                engine.coin_selector_last_result = {}
+                engine.coin_selector_symbol_scores = {}
+                engine.coin_selector_last_run_ts = 0.0
+                engine.coin_selector_analysis_cursor = 0
+                engine.coin_selector_strategy_cursor = 0
+            logger.warning(
+                'CoinSelector scope repaired for %s: %s -> %s',
+                mode,
+                scope or 'unset',
+                repaired_scope or 'unset',
+            )
+        return {
+            'mode': mode,
+            'changed': changed,
+            'previous_scope': scope,
+            'scan_scope': repaired_scope,
+        }
+
     async def _sanitize_coin_selector_universe_for_exchange_mode(self, exchange_mode=None, markets=None, *, persist=True):
         mode = exchange_mode or self.get_exchange_mode()
+        scope_repair = await self._repair_unsupported_coin_selector_scope(
+            mode,
+            persist=persist,
+        )
         signal_cfg = self.cfg.get('signal_engine', {}) or {}
         coin_cfg = signal_cfg.get('coin_selector', {}) if isinstance(signal_cfg.get('coin_selector', {}), dict) else {}
         custom_symbols = normalize_coin_selector_custom_symbols(coin_cfg.get('custom_symbols'))
@@ -510,18 +561,15 @@ class ControllerExchangeMixin:
             await self._update_config_value(['signal_engine', 'coin_selector', 'custom_symbols'], valid)
             if mode != BINANCE_MAINNET:
                 await self._update_config_value(['signal_engine', 'coin_selector', 'include_tradifi_universe'], False)
-                if (
-                    mode == BINANCE_TESTNET
-                    and str(coin_cfg.get('scan_scope', '') or '').strip().lower() == 'tradfi_only'
-                ):
-                    await self._update_config_value(
-                        ['signal_engine', 'coin_selector', 'scan_scope'],
-                        'crypto_only',
-                    )
             elif 'include_tradifi_universe' not in coin_cfg:
                 await self._update_config_value(['signal_engine', 'coin_selector', 'include_tradifi_universe'], True)
 
-        return {'mode': mode, 'valid': valid, 'removed': removed}
+        return {
+            'mode': mode,
+            'valid': valid,
+            'removed': removed,
+            'scope_repair': scope_repair,
+        }
 
     async def _sanitize_watchlist_for_exchange_mode(
         self,
@@ -1821,6 +1869,11 @@ class ControllerExchangeMixin:
         if not token:
             logger.error("??Telegram token is missing!")
             return
+
+        await self._repair_unsupported_coin_selector_scope(
+            self.exchange_mode,
+            persist=True,
+        )
 
         self.tg_app = ApplicationBuilder().token(token).build()
         await self._setup_telegram()
