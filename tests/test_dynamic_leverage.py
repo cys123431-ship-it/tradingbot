@@ -203,3 +203,139 @@ def test_disabled_mode_preserves_configured_plan_leverage_and_exit_profile():
     assert updated["leverage"] == 5
     assert updated["ev_time_stop_bars"] == 96
     assert updated["atr_trailing_activation_r"] == 1.6
+
+
+def test_adaptive_trend_uses_ten_x_only_for_elite_tight_stop_setup():
+    decision = select_dynamic_leverage(
+        _plan(
+            strategy="adaptive_breakout_trend_v1",
+            adaptive_breakout_trend_score=96.0,
+            atr_pct=1.4,
+            risk_distance_pct=2.5,
+            market_quality_risk_multiplier=0.90,
+            l2_risk_multiplier=0.90,
+            l2_gate={
+                "allowed": True,
+                "state": "deep_balanced",
+                "risk_multiplier": 0.90,
+            },
+        )
+    )
+
+    assert decision.leverage == 10
+    assert decision.tier == "adaptive_trend_elite"
+    assert decision.stop_distance_pct == 2.5
+
+
+def test_adaptive_trend_uses_eight_x_for_strong_normal_volatility_setup():
+    decision = select_dynamic_leverage(
+        _plan(
+            strategy="adaptive_breakout_trend_v1",
+            adaptive_breakout_trend_score=92.0,
+            atr_pct=2.1,
+            risk_distance_pct=4.0,
+            market_quality_risk_multiplier=0.75,
+            l2_risk_multiplier=0.80,
+            l2_gate={
+                "allowed": True,
+                "state": "deep_balanced",
+                "risk_multiplier": 0.80,
+            },
+        )
+    )
+
+    assert decision.leverage == 8
+    assert decision.tier == "adaptive_trend_strong"
+
+
+def test_adaptive_trend_uses_six_x_for_healthy_opportunity_setup():
+    decision = select_dynamic_leverage(
+        _plan(
+            strategy="adaptive_breakout_trend_v1",
+            adaptive_breakout_trend_score=86.0,
+            atr_pct=3.0,
+            risk_distance_pct=5.5,
+            market_quality_risk_multiplier=0.65,
+            l2_risk_multiplier=0.70,
+            l2_gate={
+                "allowed": True,
+                "state": "deep_balanced",
+                "risk_multiplier": 0.70,
+            },
+        )
+    )
+
+    assert decision.leverage == 6
+    assert decision.tier == "adaptive_trend_opportunity"
+
+
+def test_adaptive_trend_keeps_cys_like_wide_stop_at_two_x():
+    decision = select_dynamic_leverage(
+        _plan(
+            strategy="adaptive_breakout_trend_v1",
+            adaptive_breakout_trend_score=95.4,
+            atr_pct=6.060762544108787,
+            risk_distance_pct=12.121525088217574,
+            market_quality_risk_multiplier=0.50,
+            l2_risk_multiplier=0.50,
+            l2_gate={
+                "allowed": True,
+                "state": "deep_balanced",
+                "risk_multiplier": 0.50,
+            },
+        )
+    )
+
+    assert decision.leverage == 2
+    assert decision.tier == "adaptive_trend_extreme_volatility"
+    assert decision.risk_quality_multiplier == 0.50
+
+
+def test_adaptive_trend_high_leverage_applies_short_exit_profile():
+    updated = apply_dynamic_leverage_to_plan(
+        _plan(
+            strategy="adaptive_breakout_trend_v1",
+            adaptive_breakout_trend_score=96.0,
+            atr_pct=1.4,
+            risk_distance_pct=2.5,
+            market_quality_risk_multiplier=0.90,
+            l2_risk_multiplier=0.90,
+            l2_gate={
+                "allowed": True,
+                "state": "deep_balanced",
+                "risk_multiplier": 0.90,
+            },
+        )
+    )
+
+    assert updated["leverage"] == 10
+    assert updated["ev_time_stop_bars"] == 8
+    assert updated["ev_time_stop_min_mfe_r"] == 0.70
+    assert updated["atr_trailing_activation_r"] == 1.00
+    assert updated["dynamic_leverage_monitor_timeframe"] == "15m"
+
+
+def test_adaptive_trend_stop_buffer_caps_even_an_elite_override():
+    decision = select_dynamic_leverage(
+        _plan(
+            strategy="adaptive_breakout_trend_v1",
+            adaptive_breakout_trend_score=97.0,
+            atr_pct=1.5,
+            risk_distance_pct=5.0,
+            market_quality_risk_multiplier=0.90,
+            l2_risk_multiplier=0.90,
+            l2_gate={
+                "allowed": True,
+                "state": "deep_balanced",
+                "risk_multiplier": 0.90,
+            },
+        ),
+        {
+            "adaptive_trend_elite_stop_pct_max": 6.0,
+            "adaptive_trend_stop_buffer_multiple": 2.5,
+        },
+    )
+
+    assert decision.tier == "adaptive_trend_elite"
+    assert decision.leverage == 8
+    assert "stopBufferCap=8x" in decision.reason

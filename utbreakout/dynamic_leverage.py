@@ -8,7 +8,7 @@ restored when an earlier fixed-leverage margin cap had reduced that plan.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from math import isfinite
+from math import floor, isfinite
 from typing import Any, Mapping
 
 
@@ -42,6 +42,27 @@ def default_dynamic_leverage_config() -> dict[str, Any]:
         "high_leverage_time_stop_min_mfe_r": 0.70,
         "opportunity_trailing_activation_r": 1.25,
         "high_leverage_trailing_activation_r": 1.00,
+        "adaptive_trend_enabled": True,
+        "adaptive_trend_elite_score_min": 94.0,
+        "adaptive_trend_strong_score_min": 90.0,
+        "adaptive_trend_opportunity_score_min": 84.0,
+        "adaptive_trend_elite_atr_pct_max": 1.75,
+        "adaptive_trend_strong_atr_pct_max": 2.75,
+        "adaptive_trend_opportunity_atr_pct_max": 3.50,
+        "adaptive_trend_elite_stop_pct_max": 3.00,
+        "adaptive_trend_strong_stop_pct_max": 4.50,
+        "adaptive_trend_opportunity_stop_pct_max": 6.00,
+        "adaptive_trend_wide_stop_pct": 8.00,
+        "adaptive_trend_extreme_stop_pct": 12.00,
+        "adaptive_trend_high_volatility_atr_pct": 4.50,
+        "adaptive_trend_extreme_volatility_atr_pct": 6.00,
+        "adaptive_trend_elite_l2_multiplier_min": 0.85,
+        "adaptive_trend_strong_l2_multiplier_min": 0.75,
+        "adaptive_trend_opportunity_l2_multiplier_min": 0.65,
+        "adaptive_trend_elite_risk_quality_min": 0.80,
+        "adaptive_trend_strong_risk_quality_min": 0.70,
+        "adaptive_trend_opportunity_risk_quality_min": 0.60,
+        "adaptive_trend_stop_buffer_multiple": 2.50,
     }
 
 
@@ -67,6 +88,13 @@ def normalize_dynamic_leverage_config(
         enabled
         if isinstance(enabled, bool)
         else str(enabled).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    )
+    adaptive_enabled = cfg.get("adaptive_trend_enabled", True)
+    cfg["adaptive_trend_enabled"] = (
+        adaptive_enabled
+        if isinstance(adaptive_enabled, bool)
+        else str(adaptive_enabled).strip().lower()
+        in {"1", "true", "yes", "on", "enabled"}
     )
     cfg["min_leverage"] = int(_bounded(cfg.get("min_leverage"), 1, 10, 2))
     cfg["max_leverage"] = int(
@@ -95,6 +123,26 @@ def normalize_dynamic_leverage_config(
         ("high_leverage_time_stop_min_mfe_r", 0.0, 5.0),
         ("opportunity_trailing_activation_r", 0.1, 10.0),
         ("high_leverage_trailing_activation_r", 0.1, 10.0),
+        ("adaptive_trend_elite_score_min", 0.0, 100.0),
+        ("adaptive_trend_strong_score_min", 0.0, 100.0),
+        ("adaptive_trend_opportunity_score_min", 0.0, 100.0),
+        ("adaptive_trend_elite_atr_pct_max", 0.1, 20.0),
+        ("adaptive_trend_strong_atr_pct_max", 0.1, 20.0),
+        ("adaptive_trend_opportunity_atr_pct_max", 0.1, 20.0),
+        ("adaptive_trend_elite_stop_pct_max", 0.1, 30.0),
+        ("adaptive_trend_strong_stop_pct_max", 0.1, 30.0),
+        ("adaptive_trend_opportunity_stop_pct_max", 0.1, 30.0),
+        ("adaptive_trend_wide_stop_pct", 0.1, 50.0),
+        ("adaptive_trend_extreme_stop_pct", 0.1, 50.0),
+        ("adaptive_trend_high_volatility_atr_pct", 0.1, 30.0),
+        ("adaptive_trend_extreme_volatility_atr_pct", 0.1, 30.0),
+        ("adaptive_trend_elite_l2_multiplier_min", 0.0, 1.0),
+        ("adaptive_trend_strong_l2_multiplier_min", 0.0, 1.0),
+        ("adaptive_trend_opportunity_l2_multiplier_min", 0.0, 1.0),
+        ("adaptive_trend_elite_risk_quality_min", 0.0, 1.0),
+        ("adaptive_trend_strong_risk_quality_min", 0.0, 1.0),
+        ("adaptive_trend_opportunity_risk_quality_min", 0.0, 1.0),
+        ("adaptive_trend_stop_buffer_multiple", 1.5, 6.0),
     ):
         default = float(default_dynamic_leverage_config()[key])
         cfg[key] = _bounded(cfg.get(key), lower, upper, default)
@@ -112,6 +160,62 @@ def normalize_dynamic_leverage_config(
     )
     cfg["strong_single_score_min"] = max(
         cfg["high_conviction_score_min"], cfg["strong_single_score_min"]
+    )
+    cfg["adaptive_trend_strong_score_min"] = max(
+        cfg["adaptive_trend_opportunity_score_min"],
+        cfg["adaptive_trend_strong_score_min"],
+    )
+    cfg["adaptive_trend_elite_score_min"] = max(
+        cfg["adaptive_trend_strong_score_min"],
+        cfg["adaptive_trend_elite_score_min"],
+    )
+    cfg["adaptive_trend_strong_atr_pct_max"] = max(
+        cfg["adaptive_trend_elite_atr_pct_max"],
+        cfg["adaptive_trend_strong_atr_pct_max"],
+    )
+    cfg["adaptive_trend_opportunity_atr_pct_max"] = max(
+        cfg["adaptive_trend_strong_atr_pct_max"],
+        cfg["adaptive_trend_opportunity_atr_pct_max"],
+    )
+    cfg["adaptive_trend_strong_stop_pct_max"] = max(
+        cfg["adaptive_trend_elite_stop_pct_max"],
+        cfg["adaptive_trend_strong_stop_pct_max"],
+    )
+    cfg["adaptive_trend_opportunity_stop_pct_max"] = max(
+        cfg["adaptive_trend_strong_stop_pct_max"],
+        cfg["adaptive_trend_opportunity_stop_pct_max"],
+    )
+    cfg["adaptive_trend_wide_stop_pct"] = max(
+        cfg["adaptive_trend_opportunity_stop_pct_max"],
+        cfg["adaptive_trend_wide_stop_pct"],
+    )
+    cfg["adaptive_trend_extreme_stop_pct"] = max(
+        cfg["adaptive_trend_wide_stop_pct"],
+        cfg["adaptive_trend_extreme_stop_pct"],
+    )
+    cfg["adaptive_trend_high_volatility_atr_pct"] = max(
+        cfg["adaptive_trend_opportunity_atr_pct_max"],
+        cfg["adaptive_trend_high_volatility_atr_pct"],
+    )
+    cfg["adaptive_trend_extreme_volatility_atr_pct"] = max(
+        cfg["adaptive_trend_high_volatility_atr_pct"],
+        cfg["adaptive_trend_extreme_volatility_atr_pct"],
+    )
+    cfg["adaptive_trend_strong_l2_multiplier_min"] = max(
+        cfg["adaptive_trend_opportunity_l2_multiplier_min"],
+        cfg["adaptive_trend_strong_l2_multiplier_min"],
+    )
+    cfg["adaptive_trend_elite_l2_multiplier_min"] = max(
+        cfg["adaptive_trend_strong_l2_multiplier_min"],
+        cfg["adaptive_trend_elite_l2_multiplier_min"],
+    )
+    cfg["adaptive_trend_strong_risk_quality_min"] = max(
+        cfg["adaptive_trend_opportunity_risk_quality_min"],
+        cfg["adaptive_trend_strong_risk_quality_min"],
+    )
+    cfg["adaptive_trend_elite_risk_quality_min"] = max(
+        cfg["adaptive_trend_strong_risk_quality_min"],
+        cfg["adaptive_trend_elite_risk_quality_min"],
     )
     for key in ("opportunity_confirmations_min", "high_conviction_confirmations_min"):
         cfg[key] = int(
@@ -268,6 +372,135 @@ class DynamicLeverageDecision:
         return asdict(self)
 
 
+def _select_adaptive_trend_leverage(
+    *,
+    cfg: Mapping[str, Any],
+    quality: float,
+    quality_source: str,
+    confirmations: int,
+    atr_pct: float | None,
+    stop_pct: float | None,
+    fresh: bool,
+    l2_state: str,
+    l2_multiplier: float,
+    l2_high_quality: bool,
+    l2_observable: bool,
+    risk_quality: float,
+) -> DynamicLeverageDecision:
+    """Select trend leverage from signal quality and stop-to-liquidation room."""
+
+    minimum = int(cfg["min_leverage"])
+    maximum = int(cfg["max_leverage"])
+    base = int(cfg["base_leverage"])
+    stop_buffer_cap = maximum
+    if stop_pct is not None and stop_pct > 0:
+        stop_buffer_cap = int(
+            max(
+                minimum,
+                min(
+                    maximum,
+                    floor(
+                        100.0
+                        / (
+                            stop_pct
+                            * float(cfg["adaptive_trend_stop_buffer_multiple"])
+                        )
+                    ),
+                ),
+            )
+        )
+
+    extreme = bool(
+        (atr_pct is not None and atr_pct >= cfg["adaptive_trend_extreme_volatility_atr_pct"])
+        or (stop_pct is not None and stop_pct >= cfg["adaptive_trend_extreme_stop_pct"])
+    )
+    wide = bool(
+        (atr_pct is not None and atr_pct >= cfg["adaptive_trend_high_volatility_atr_pct"])
+        or (stop_pct is not None and stop_pct >= cfg["adaptive_trend_wide_stop_pct"])
+    )
+    data_complete = atr_pct is not None and stop_pct is not None and l2_observable
+
+    tier = "adaptive_trend_standard"
+    leverage = min(base, 5)
+    if l2_state in {"stressed", "stressed_thin"}:
+        tier = "adaptive_trend_defensive_l2"
+        leverage = minimum
+    elif extreme:
+        tier = "adaptive_trend_extreme_volatility"
+        leverage = minimum
+    elif wide:
+        tier = "adaptive_trend_wide_stop"
+        leverage = min(3, maximum)
+    elif data_complete and all(
+        (
+            quality >= cfg["adaptive_trend_elite_score_min"],
+            atr_pct <= cfg["adaptive_trend_elite_atr_pct_max"],
+            stop_pct <= cfg["adaptive_trend_elite_stop_pct_max"],
+            fresh,
+            l2_high_quality,
+            l2_multiplier >= cfg["adaptive_trend_elite_l2_multiplier_min"],
+            risk_quality >= cfg["adaptive_trend_elite_risk_quality_min"],
+        )
+    ):
+        tier = "adaptive_trend_elite"
+        leverage = maximum
+    elif data_complete and all(
+        (
+            quality >= cfg["adaptive_trend_strong_score_min"],
+            atr_pct <= cfg["adaptive_trend_strong_atr_pct_max"],
+            stop_pct <= cfg["adaptive_trend_strong_stop_pct_max"],
+            fresh,
+            l2_high_quality,
+            l2_multiplier >= cfg["adaptive_trend_strong_l2_multiplier_min"],
+            risk_quality >= cfg["adaptive_trend_strong_risk_quality_min"],
+        )
+    ):
+        tier = "adaptive_trend_strong"
+        leverage = min(maximum, 8)
+    elif data_complete and all(
+        (
+            quality >= cfg["adaptive_trend_opportunity_score_min"],
+            atr_pct <= cfg["adaptive_trend_opportunity_atr_pct_max"],
+            stop_pct <= cfg["adaptive_trend_opportunity_stop_pct_max"],
+            fresh,
+            l2_high_quality,
+            l2_multiplier >= cfg["adaptive_trend_opportunity_l2_multiplier_min"],
+            risk_quality >= cfg["adaptive_trend_opportunity_risk_quality_min"],
+        )
+    ):
+        tier = "adaptive_trend_opportunity"
+        leverage = min(maximum, 6)
+    elif not data_complete:
+        tier = "adaptive_trend_data_fallback"
+        leverage = min(leverage, 4)
+    elif risk_quality < 0.60 or l2_multiplier < 0.60:
+        tier = "adaptive_trend_defensive_quality"
+        leverage = min(leverage, 3)
+
+    leverage = max(minimum, min(maximum, stop_buffer_cap, leverage))
+    reason = (
+        f"{tier}: quality={quality:.1f}({quality_source}) confirmations={confirmations} "
+        f"ATR%={atr_pct if atr_pct is not None else 'n/a'} "
+        f"stop%={stop_pct if stop_pct is not None else 'n/a'} "
+        f"L2={l2_state}/{l2_multiplier:.2f} riskQuality={risk_quality:.2f} "
+        f"stopBufferCap={stop_buffer_cap}x"
+    )
+    return DynamicLeverageDecision(
+        leverage=leverage,
+        tier=tier,
+        opportunity_score=float(leverage),
+        quality_score=quality,
+        quality_source=quality_source,
+        confirmation_count=confirmations,
+        atr_pct=atr_pct,
+        stop_distance_pct=stop_pct,
+        l2_state=l2_state,
+        l2_multiplier=l2_multiplier,
+        risk_quality_multiplier=risk_quality,
+        reason=reason,
+    )
+
+
 def select_dynamic_leverage(
     plan: Mapping[str, Any] | None,
     config: Mapping[str, Any] | None = None,
@@ -342,6 +575,25 @@ def select_dynamic_leverage(
     fresh = (chase is None or chase <= cfg["max_fresh_chase_atr"]) and (
         extension is None or extension <= cfg["max_fresh_extension_atr"]
     )
+    if (
+        cfg["adaptive_trend_enabled"]
+        and str(plan.get("strategy") or "").strip().lower()
+        == "adaptive_breakout_trend_v1"
+    ):
+        return _select_adaptive_trend_leverage(
+            cfg=cfg,
+            quality=quality,
+            quality_source=quality_source,
+            confirmations=confirmations,
+            atr_pct=atr_pct,
+            stop_pct=stop_pct,
+            fresh=fresh,
+            l2_state=l2_state,
+            l2_multiplier=l2_multiplier,
+            l2_high_quality=l2_high_quality,
+            l2_observable=l2_observable,
+            risk_quality=risk_quality,
+        )
     l2_opportunity = (
         l2_high_quality and l2_multiplier >= cfg["high_quality_l2_multiplier_min"]
     )

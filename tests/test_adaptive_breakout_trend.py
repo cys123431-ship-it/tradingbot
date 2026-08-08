@@ -120,8 +120,8 @@ def test_strong_standalone_signal_can_reach_high_dynamic_leverage():
     decision = select_dynamic_leverage(plan)
 
     assert decision.quality_source == "adaptive_breakout_trend_score"
-    assert decision.tier == "strong_single"
-    assert decision.leverage == 8
+    assert decision.tier == "adaptive_trend_elite"
+    assert decision.leverage == 10
 
 
 def test_dedicated_telegram_mode_is_separate_and_mutually_exclusive():
