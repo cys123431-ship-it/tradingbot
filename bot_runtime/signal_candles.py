@@ -3197,6 +3197,16 @@ class SignalCandleMixin:
             )
             is_bullish = sig == 'long'
             is_bearish = sig == 'short'
+        elif active_strategy == ADAPTIVE_BREAKOUT_TREND_STRATEGY:
+            entry_mode = active_strategy
+            sig, entry_reason, _ = await self._calculate_adaptive_breakout_trend_signal(
+                symbol,
+                df,
+                strategy_params,
+                force_reprocess=force_utbreakout_reprocess,
+            )
+            is_bullish = sig == 'long'
+            is_bearish = sig == 'short'
         elif active_strategy == DUAL_ALPHA_STRATEGY:
             entry_mode = active_strategy
             sig, entry_reason, _ = await self._calculate_dual_alpha_signal(

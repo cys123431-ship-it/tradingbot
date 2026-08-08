@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from utbreakout.adaptive_breakout_trend import (
+    ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+    default_adaptive_breakout_trend_config,
+)
 from utbreakout.dynamic_leverage import normalize_dynamic_leverage_config
 
 
@@ -335,13 +339,36 @@ class TelegramSetupMixin:
                 await self.cfg.update_value(['system_settings', 'active_engine'], CORE_ENGINE)
                 await self._switch_engine(CORE_ENGINE)
 
+        async def _disable_adaptive_breakout_trend_mode():
+            current = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get(
+                'UTBotFilteredBreakoutV1', {}
+            )
+            trend_cfg = default_adaptive_breakout_trend_config()
+            if isinstance(current, dict) and isinstance(current.get('adaptive_breakout_trend'), dict):
+                trend_cfg.update(current.get('adaptive_breakout_trend'))
+            trend_cfg['enabled'] = False
+            trend_cfg['live_enabled'] = False
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_breakout_trend'],
+                trend_cfg,
+            )
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_breakout_trend_live_enabled'],
+                False,
+            )
+            engine = self.engines.get('signal')
+            if engine:
+                engine.adaptive_breakout_trend_last_status = {}
+
         async def _activate_utbot_strategy():
             await _ensure_signal_engine_active()
+            await _disable_adaptive_breakout_trend_mode()
             await self._return_signal_engine_to_utbot()
             return "✅ UTBot 전략 ON. UTBreak/scanner/CoinSelector/Micro Auto를 OFF로 정리했습니다."
 
         async def _activate_utbreak_strategy():
             await _ensure_signal_engine_active()
+            await _disable_adaptive_breakout_trend_mode()
             self.is_paused = True
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'entry_strategy'], ENTRY_STRATEGY_UT_BREAKOUT)
@@ -386,6 +413,7 @@ class TelegramSetupMixin:
 
         async def _activate_relative_strength_pullback_strategy():
             await _ensure_signal_engine_active()
+            await _disable_adaptive_breakout_trend_mode()
             self.is_paused = False
             rsp_cfg = default_relative_strength_pullback_config()
             rsp_cfg['entry_strategy'] = ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
@@ -484,6 +512,7 @@ class TelegramSetupMixin:
 
         async def _activate_dual_alpha_strategy():
             await _ensure_signal_engine_active()
+            await _disable_adaptive_breakout_trend_mode()
             self.is_paused = False
             rsp_cfg = default_relative_strength_pullback_config()
             rsp_cfg['entry_strategy'] = ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
@@ -562,6 +591,7 @@ class TelegramSetupMixin:
 
         async def _activate_volatility_managed_trend_strategy():
             await _ensure_signal_engine_active()
+            await _disable_adaptive_breakout_trend_mode()
             self.is_paused = False
             current = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
             vmt_cfg = default_volatility_managed_trend_config()
@@ -601,6 +631,7 @@ class TelegramSetupMixin:
 
         async def _activate_triple_alpha_strategy():
             await _ensure_signal_engine_active()
+            await _disable_adaptive_breakout_trend_mode()
             self.is_paused = False
             rsp_cfg = default_relative_strength_pullback_config()
             rsp_cfg.update({
@@ -653,6 +684,7 @@ class TelegramSetupMixin:
 
         async def _activate_liquidation_exhaustion_reversal_strategy():
             await _ensure_signal_engine_active()
+            await _disable_adaptive_breakout_trend_mode()
             self.is_paused = False
             current = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
             lxr_cfg = default_liquidation_exhaustion_reversal_config()
@@ -710,6 +742,7 @@ class TelegramSetupMixin:
 
         async def _activate_quad_alpha_strategy(enabled_strategies=None):
             await _ensure_signal_engine_active()
+            await _disable_adaptive_breakout_trend_mode()
             self.is_paused = True
             enabled_strategies = normalize_quad_alpha_enabled_strategies(
                 list(QUAD_ALPHA_BRANCH_ORDER) if enabled_strategies is None else enabled_strategies
@@ -847,6 +880,7 @@ class TelegramSetupMixin:
 
         async def _activate_crowding_unwind_strategy():
             await _ensure_signal_engine_active()
+            await _disable_adaptive_breakout_trend_mode()
             self.is_paused = False
             current = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
             crowd_cfg = default_crowding_unwind_config()
@@ -893,8 +927,155 @@ class TelegramSetupMixin:
                 engine.crowding_unwind_last_status = {}
             return f'Funding-OI Crowding Unwind OFF. {notice}'
 
+        async def _activate_adaptive_breakout_trend_strategy():
+            """Activate the standalone trend mode without touching open-position exits."""
+            await _ensure_signal_engine_active()
+            self.is_paused = True
+            current = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get(
+                'UTBotFilteredBreakoutV1', {}
+            )
+            trend_cfg = default_adaptive_breakout_trend_config()
+            if isinstance(current, dict) and isinstance(current.get('adaptive_breakout_trend'), dict):
+                trend_cfg.update(current.get('adaptive_breakout_trend'))
+            trend_cfg['enabled'] = True
+            trend_cfg['live_enabled'] = True
+
+            # The standalone trend mode and the existing five-strategy group
+            # are mutually exclusive for new entries.
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'quad_alpha_enabled_strategies'],
+                [],
+            )
+            for key in (
+                'relative_strength_pullback_trend_live_enabled',
+                'volatility_managed_trend_live_enabled',
+                'qh_flow_live_enabled',
+                'qh_flow_confirmation_enabled',
+                'crowding_unwind_live_enabled',
+                'liquidation_exhaustion_reversal_live_enabled',
+            ):
+                await self.cfg.update_value(
+                    ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', key],
+                    False,
+                )
+            for section, values in {
+                'relative_strength_pullback_trend': {
+                    'relative_strength_pullback_trend_live_enabled': False,
+                },
+                'volatility_managed_trend': {
+                    'enabled': False,
+                    'live_enabled': False,
+                },
+                'qh_flow': {
+                    'qh_flow_enabled': False,
+                    'qh_flow_live_enabled': False,
+                    'qh_confirmation_enabled': False,
+                },
+                'crowding_unwind': {
+                    'enabled': False,
+                    'live_enabled': False,
+                },
+                'liquidation_exhaustion_reversal': {
+                    'enabled': False,
+                    'live_enabled': False,
+                },
+            }.items():
+                for key, value in values.items():
+                    await self.cfg.update_value(
+                        ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', section, key],
+                        value,
+                    )
+
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'active_strategy'],
+                ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+            )
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_breakout_trend'],
+                trend_cfg,
+            )
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_breakout_trend_live_enabled'],
+                True,
+            )
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'l2_gate_enabled'],
+                True,
+            )
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'],
+                'manual',
+            )
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'auto_select_enabled'],
+                False,
+            )
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'adaptive_timeframe_enabled'],
+                False,
+            )
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol'], '')
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], True)
+            await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
+
+            engine = self._reset_signal_engine_runtime_state(
+                reset_entry_cache=True,
+                reset_exit_cache=False,
+                reset_stateful_strategy=False,
+            )
+            if engine:
+                engine.scanner_active_symbol = None
+                engine.adaptive_breakout_trend_last_status = {}
+                engine.quad_alpha_last_status = {}
+                engine.volatility_managed_trend_last_status = {}
+                engine.crowding_unwind_last_status = {}
+                engine.liquidation_exhaustion_reversal_last_status = {}
+                engine.relative_strength_pullback_eval_cache = {}
+                engine.l2_gate_cache = {}
+                engine.l2_gate_history = {}
+                if not engine.running:
+                    engine.start()
+            self.is_paused = False
+            return (
+                '추세추종 전용 모드 ON. 기존 5개 전략은 모두 OFF이며, 완료된 1시간봉의 '
+                '다중기간 모멘텀과 채널 돌파·재가속이 일치할 때만 신규 진입합니다. '
+                '기존 보유 포지션의 청산·보호 주문은 그대로 유지됩니다.'
+            )
+
+        async def _deactivate_adaptive_breakout_trend_strategy():
+            """Stop standalone-trend entries while preserving position protection."""
+            await _ensure_signal_engine_active()
+            self.is_paused = True
+            await _disable_adaptive_breakout_trend_mode()
+            await self.cfg.update_value(
+                ['signal_engine', 'strategy_params', 'active_strategy'],
+                UTBOT_FILTERED_BREAKOUT_STRATEGY,
+            )
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'custom_universe_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol'], '')
+            await self.cfg.update_value(['signal_engine', 'common_settings', 'scanner_enabled'], False)
+            await self.cfg.update_value(['signal_engine', 'micro_auto', 'enabled'], False)
+            engine = self._reset_signal_engine_runtime_state(
+                reset_entry_cache=True,
+                reset_exit_cache=False,
+                reset_stateful_strategy=False,
+            )
+            if engine:
+                engine.scanner_active_symbol = None
+                engine.adaptive_breakout_trend_last_status = {}
+            return (
+                '추세추종 전용 모드 OFF. 신규 진입과 코인 스캐너를 중지했습니다. '
+                '기존 보유 포지션의 청산·보호 주문은 계속 관리됩니다.'
+            )
+
         async def _stop_utbreak_trading():
             await _ensure_signal_engine_active()
+            await _disable_adaptive_breakout_trend_mode()
             self.is_paused = True
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_FILTERED_BREAKOUT_STRATEGY)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'entry_strategy'], ENTRY_STRATEGY_UT_BREAKOUT)
@@ -1275,7 +1456,9 @@ UTBot:
             if engine:
                 diag = engine.last_utbot_filtered_breakout_status.get(first_symbol, {}) or {}
             active_label = "ON" if active_strategy in UTBREAKOUT_STRATEGIES else f"OFF ({active_strategy.upper()})"
-            if active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY:
+            if active_strategy == ADAPTIVE_BREAKOUT_TREND_STRATEGY:
+                active_label = "OFF (추세추종 전용 모드 ON)"
+            elif active_strategy == UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY:
                 active_label = "ON (ADAPTIVE TF)"
             elif active_strategy == VOLATILITY_MANAGED_TREND_STRATEGY:
                 active_label = "ON (VMT TREND)"
@@ -1592,6 +1775,60 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 filename='utbreakout_menu.txt',
                 caption='UT Breakout 메뉴 전체 내용입니다.',
                 preview_suffix='상세 UTBreak 메뉴는 파일로 보냈습니다.',
+            )
+
+        def _format_adaptive_trend_menu_text(notice=None):
+            sig_cfg = self.cfg.get('signal_engine', {})
+            strategy_params = sig_cfg.get('strategy_params', {})
+            active_strategy = str(
+                strategy_params.get('active_strategy', 'utbot') or 'utbot'
+            ).lower()
+            raw_cfg = strategy_params.get('UTBotFilteredBreakoutV1', {})
+            trend_cfg = default_adaptive_breakout_trend_config()
+            if isinstance(raw_cfg, dict) and isinstance(raw_cfg.get('adaptive_breakout_trend'), dict):
+                trend_cfg.update(raw_cfg.get('adaptive_breakout_trend'))
+            selected = active_strategy == ADAPTIVE_BREAKOUT_TREND_STRATEGY
+            live = selected and bool(trend_cfg.get('live_enabled', False))
+            mode = 'PAUSED' if selected and self.is_paused else 'ON' if live else 'OFF'
+            common_cfg = sig_cfg.get('common_settings', {})
+            scanner_on = bool(common_cfg.get('scanner_enabled', False)) and not self.is_paused
+            lines = [
+                '📈 추세추종 전용 메뉴',
+                '',
+                f'상태: `{mode}`',
+                f'신규 진입 스캐너: `{"ON" if scanner_on else "OFF"}`',
+                f'신호 주기: `{trend_cfg.get("timeframe", "1h")}` 완료봉',
+                '기존 5개 전략: `모드 ON 시 전부 OFF`',
+                '',
+                '방향은 24h·72h·168h 변동성 정규화 모멘텀으로 정하고,',
+                '48시간 채널 돌파 또는 같은 방향 재가속에서 진입합니다.',
+                '포지션 크기는 변동성과 신호 품질에 따라 조절하며,',
+                'TP1 20% + TP2 20% + 추세 러너 60%로 큰 추세를 노립니다.',
+                '',
+                'ON/OFF는 신규 진입에만 적용되고 기존 포지션 보호는 유지됩니다.',
+            ]
+            if notice:
+                lines = [str(notice), ''] + lines
+            return '\n'.join(lines)
+
+        def _build_adaptive_trend_keyboard():
+            return InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton('추세추종 ON', callback_data='trend:on'),
+                    InlineKeyboardButton('추세추종 OFF', callback_data='trend:off'),
+                ],
+                [InlineKeyboardButton('추세추종 STATUS', callback_data='trend:status')],
+                [InlineKeyboardButton('기존 5전략 메뉴', callback_data='trend:five')],
+            ])
+
+        async def _edit_adaptive_trend_menu(query, notice=None):
+            await self._edit_markdown_safe(
+                query,
+                _format_adaptive_trend_menu_text(notice),
+                reply_markup=_build_adaptive_trend_keyboard(),
+                filename='adaptive_trend_menu.txt',
+                caption='추세추종 전용 메뉴 전체 내용입니다.',
+                preview_suffix='상세 추세추종 메뉴는 파일로 보냈습니다.',
             )
 
         async def risk_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -2510,6 +2747,89 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 message_or_query,
                 "AUTO 후보 스캔에 사용할 코인을 입력하세요. 예: `BTC ETH SOL`"
             )
+
+        async def _adaptive_trend_status_text():
+            engine = self.engines.get('signal')
+            if engine is None:
+                return '📈 추세추종 상태\nSignal engine is not running.'
+            builder = getattr(engine, 'build_adaptive_breakout_trend_status_text', None)
+            if not callable(builder):
+                return '📈 추세추종 상태\nStatus builder is unavailable.'
+            return await builder()
+
+        async def trend_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            args = list(getattr(c, 'args', []) or [])
+            if not args and u and u.message and u.message.text:
+                args = u.message.text.strip().split()[1:]
+            action = str(args[0]).strip().lower() if args else ''
+            if action in {'on', 'enable', 'start'}:
+                notice = await _activate_adaptive_breakout_trend_strategy()
+                await self._reply_markdown_safe(
+                    u.message,
+                    _format_adaptive_trend_menu_text(notice),
+                    reply_markup=_build_adaptive_trend_keyboard(),
+                )
+                return
+            if action in {'off', 'disable', 'stop'}:
+                notice = await _deactivate_adaptive_breakout_trend_strategy()
+                await self._reply_markdown_safe(
+                    u.message,
+                    _format_adaptive_trend_menu_text(notice),
+                    reply_markup=_build_adaptive_trend_keyboard(),
+                )
+                return
+            if action in {'status', 'state'}:
+                status_text = await _adaptive_trend_status_text()
+                await self._reply_markdown_safe(
+                    u.message,
+                    f'{_format_adaptive_trend_menu_text()}\n\n{status_text}',
+                    reply_markup=_build_adaptive_trend_keyboard(),
+                )
+                return
+            await self._reply_markdown_safe(
+                u.message,
+                _format_adaptive_trend_menu_text(),
+                reply_markup=_build_adaptive_trend_keyboard(),
+            )
+
+        async def trend_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            query = u.callback_query
+            if not query:
+                return
+            await query.answer('처리 중입니다.')
+            data = str(query.data or '')
+            action = data.split(':', 1)[1] if ':' in data else 'menu'
+            if action == 'on':
+                await _edit_adaptive_trend_menu(
+                    query,
+                    await _activate_adaptive_breakout_trend_strategy(),
+                )
+                return
+            if action == 'off':
+                await _edit_adaptive_trend_menu(
+                    query,
+                    await _deactivate_adaptive_breakout_trend_strategy(),
+                )
+                return
+            if action == 'status':
+                await self._edit_markdown_safe(
+                    query,
+                    f'{_format_adaptive_trend_menu_text()}\n\n{await _adaptive_trend_status_text()}',
+                    reply_markup=_build_adaptive_trend_keyboard(),
+                    filename='adaptive_trend_status.txt',
+                    caption='추세추종 상태 전체 내용입니다.',
+                )
+                return
+            if action == 'five':
+                await self._edit_markdown_safe(
+                    query,
+                    _format_utbreakout_menu_text(),
+                    reply_markup=_build_utbreakout_keyboard(),
+                    filename='utbreakout_menu.txt',
+                    caption='기존 5전략 메뉴입니다.',
+                )
+                return
+            await _edit_adaptive_trend_menu(query)
 
         async def utbreakout_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             args = list(getattr(c, 'args', []) or [])
@@ -5571,6 +5891,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 /stats - 통계
 /utbreak - UTBreak 전략 메뉴
 /utbreakout - /utbreak alias
+/trend - standalone adaptive trend menu
 /setup - 거래소/네트워크 전환
 /customentry - 사용자 지정 종목·방향 진입 모드
 /autotrade - 자동매매 거래횟수·스캔범위 설정
@@ -5599,8 +5920,10 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
         self.tg_app.add_handler(CommandHandler("risk", owner_only(risk_cmd)))
         self.tg_app.add_handler(CommandHandler("utbreak", owner_only(utbreakout_cmd)))
         self.tg_app.add_handler(CommandHandler("utbreakout", owner_only(utbreakout_cmd)))
+        self.tg_app.add_handler(CommandHandler("trend", owner_only(trend_cmd)))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(legacy_utbot_callback), pattern=r"^utbot:"))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(utbreakout_callback), pattern=r"^utb:"))
+        self.tg_app.add_handler(CallbackQueryHandler(owner_only(trend_callback), pattern=r"^trend:"))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(risk_callback), pattern=r"^risk:"))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(coinscan_callback), pattern=r"^cs:"))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(customcoins_callback), pattern=r"^cc:"))
@@ -5661,6 +5984,8 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 return await close_cmd(u, c)
             if command in {"/utbreak", "/utbreakout"}:
                 return await utbreakout_cmd(u, c)
+            if command == "/trend":
+                return await trend_cmd(u, c)
             if command in TELEGRAM_UTBREAK_INTEGRATED_COMMANDS:
                 await self._reply_markdown_safe(
                     u.message,

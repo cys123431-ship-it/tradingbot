@@ -134,6 +134,7 @@ def _score_value(value: Any) -> float | None:
 def _quality_score(plan: Mapping[str, Any]) -> tuple[float, str]:
     for key in (
         "quad_alpha_score",
+        "adaptive_breakout_trend_score",
         "profit_alpha_score",
         "entry_edge_score",
         "strategy_quality_score",
@@ -154,7 +155,13 @@ def _metric(plan: Mapping[str, Any], *keys: str) -> float | None:
         value = _finite(plan.get(key))
         if value is not None:
             return value
-    for container_key in ("vmt_metrics", "crowding_metrics", "lxr_metrics", "rspt_logs"):
+    for container_key in (
+        "adaptive_breakout_trend_metrics",
+        "vmt_metrics",
+        "crowding_metrics",
+        "lxr_metrics",
+        "rspt_logs",
+    ):
         container = plan.get(container_key)
         if not isinstance(container, Mapping):
             continue

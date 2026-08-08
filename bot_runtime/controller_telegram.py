@@ -2130,6 +2130,7 @@ class ControllerTelegramMixin:
         kb = [
             [KeyboardButton("🚨 STOP"), KeyboardButton("⏸ PAUSE"), KeyboardButton("▶ RESUME")],
             [KeyboardButton("/utbreak")],
+            [KeyboardButton("/trend")],
             [KeyboardButton("/setup"), KeyboardButton("/customentry")],
             [KeyboardButton("/status"), KeyboardButton("/history"), KeyboardButton("/stats")],
             [KeyboardButton("/log"), KeyboardButton("/help")]

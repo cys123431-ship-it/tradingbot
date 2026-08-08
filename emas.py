@@ -306,6 +306,11 @@ from utbreakout.volatility_managed_trend import (
     default_volatility_managed_trend_config,
     evaluate_volatility_managed_trend,
 )
+from utbreakout.adaptive_breakout_trend import (
+    ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+    default_adaptive_breakout_trend_config,
+    evaluate_adaptive_breakout_trend,
+)
 from utbreakout.strategy_allocator import (
     default_strategy_allocator_config,
     evaluate_strategy_allocation,
@@ -364,7 +369,7 @@ TELEGRAM_EMERGENCY_PATTERN = (
     r"(?:/(?:stop|pause|resume)(?:@[A-Za-z0-9_]+)?|STOP|PAUSE|RESUME)\s*$"
 )
 TELEGRAM_MENU_COMMAND_PATTERN = (
-    r"^/(status|history|log|help|stats|close|utbreak|utbreakout|utbot|setup|"
+    r"^/(status|history|log|help|stats|close|utbreak|utbreakout|trend|utbot|setup|"
     r"coinscan|customcoins|microauto|prediction|customentry|custom)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
 )
 TELEGRAM_UTBREAK_INTEGRATED_COMMANDS = frozenset({

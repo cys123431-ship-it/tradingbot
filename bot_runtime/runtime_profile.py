@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from utbreakout.adaptive_breakout_trend import default_adaptive_breakout_trend_config
 from utbreakout.ev_adaptive import EV_ADAPTIVE_PROFILE_VERSION
 
 BINANCE_FAPI_PUBLIC_BASE_URL = 'https://fapi.binance.com'
@@ -1638,6 +1639,8 @@ def build_default_utbot_filtered_breakout_config():
         'l2_gate_enabled': True,
         'volatility_managed_trend': default_volatility_managed_trend_config(),
         'volatility_managed_trend_live_enabled': True,
+        'adaptive_breakout_trend': default_adaptive_breakout_trend_config(),
+        'adaptive_breakout_trend_live_enabled': False,
         'vmt_migration_v1_complete': False,
         'crowding_unwind': default_crowding_unwind_config(),
         'crowding_unwind_live_enabled': False,

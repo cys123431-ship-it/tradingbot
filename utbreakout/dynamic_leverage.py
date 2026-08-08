@@ -148,6 +148,7 @@ def _quality_score(plan: Mapping[str, Any]) -> tuple[float, str]:
         "quad_alpha_score",
         "triple_alpha_score",
         "dual_alpha_score",
+        "adaptive_breakout_trend_score",
         "vmt_score",
         "crowding_score",
         "lxr_score",
@@ -184,6 +185,7 @@ def _nested_metric(plan: Mapping[str, Any], *keys: str) -> float | None:
         if value is not None:
             return value
     for container_key in (
+        "adaptive_breakout_trend_metrics",
         "vmt_metrics",
         "crowding_metrics",
         "lxr_metrics",

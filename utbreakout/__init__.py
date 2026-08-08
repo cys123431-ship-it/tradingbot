@@ -26,6 +26,12 @@ from .dynamic_leverage import (
     normalize_dynamic_leverage_config,
     select_dynamic_leverage,
 )
+from .adaptive_breakout_trend import (
+    ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+    AdaptiveBreakoutTrendDecision,
+    default_adaptive_breakout_trend_config,
+    evaluate_adaptive_breakout_trend,
+)
 from .opportunity_risk import (
     OpportunityRiskDecision,
     apply_opportunity_risk_to_plan,
@@ -191,6 +197,10 @@ __all__ = [
     "default_dynamic_leverage_config",
     "normalize_dynamic_leverage_config",
     "select_dynamic_leverage",
+    "ADAPTIVE_BREAKOUT_TREND_STRATEGY",
+    "AdaptiveBreakoutTrendDecision",
+    "default_adaptive_breakout_trend_config",
+    "evaluate_adaptive_breakout_trend",
     "OpportunityRiskDecision",
     "apply_opportunity_risk_to_plan",
     "default_opportunity_risk_config",

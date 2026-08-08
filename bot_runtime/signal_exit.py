@@ -13,10 +13,13 @@ class SignalExitMixin:
         if not pos:
             self._clear_utbreakout_trailing_state(symbol, finalize=True, reason='position closed before runner update')
             return None
-        atr_trailing_enabled = bool(cfg.get('atr_trailing_enabled', state.get('atr_trailing_enabled', False)))
-        tp1_breakeven_enabled = bool(cfg.get('tp1_breakeven_enabled', state.get('tp1_breakeven_enabled', False)))
-        soft_stop_enabled = bool(cfg.get('soft_stop_enabled', state.get('soft_stop_enabled', False)))
-        near_miss_tp_enabled = bool(cfg.get('near_miss_tp_enabled', state.get('near_miss_tp_enabled', False)))
+        # Position-exit policy is fixed when the order is opened.  Prefer the
+        # persisted entry state so a later global config change cannot tighten
+        # or disable an existing strategy's runner unexpectedly.
+        atr_trailing_enabled = bool(state.get('atr_trailing_enabled', cfg.get('atr_trailing_enabled', False)))
+        tp1_breakeven_enabled = bool(state.get('tp1_breakeven_enabled', cfg.get('tp1_breakeven_enabled', False)))
+        soft_stop_enabled = bool(state.get('soft_stop_enabled', cfg.get('soft_stop_enabled', False)))
+        near_miss_tp_enabled = bool(state.get('near_miss_tp_enabled', cfg.get('near_miss_tp_enabled', False)))
         if not atr_trailing_enabled and not tp1_breakeven_enabled and not soft_stop_enabled and not near_miss_tp_enabled:
             return None
         side = str(pos.get('side', '') or '').lower()
@@ -29,7 +32,7 @@ class SignalExitMixin:
             initial_qty = float(state.get('initial_qty') or 0.0)
             risk_distance = float(state.get('risk_distance') or 0.0)
             activation_r = float(state.get('activation_r') or 1.5)
-            trailing_mult = float(cfg.get('atr_trailing_multiplier', state.get('trailing_atr_multiplier', 2.0)) or 2.0)
+            trailing_mult = float(state.get('trailing_atr_multiplier', cfg.get('atr_trailing_multiplier', 2.0)) or 2.0)
         except (TypeError, ValueError):
             return None
         if current_qty <= 0 or entry_price <= 0 or initial_qty <= 0 or risk_distance <= 0:
@@ -121,7 +124,7 @@ class SignalExitMixin:
         tp1_expected_remaining_ratio = float(tp1_remaining_value)
         qty_tolerance = min(
             0.5,
-            max(0.0, float(cfg.get('tp1_breakeven_qty_tolerance', state.get('tp1_breakeven_qty_tolerance', 0.08)) or 0.08))
+            max(0.0, float(state.get('tp1_breakeven_qty_tolerance', cfg.get('tp1_breakeven_qty_tolerance', 0.08)) or 0.08))
         )
         partial_qty_seen = bool(state.get('tp1_filled')) or (
             current_qty <= initial_qty * min(
@@ -168,7 +171,7 @@ class SignalExitMixin:
                 self._set_utbreakout_trailing_state(symbol, state)
                 confirm_bars = max(
                     1,
-                    int(cfg.get('soft_stop_confirm_bars', state.get('soft_stop_confirm_bars', 2)) or 2),
+                    int(state.get('soft_stop_confirm_bars', cfg.get('soft_stop_confirm_bars', 2)) or 2),
                 )
                 if int(state.get('soft_stop_breach_count', 0) or 0) >= confirm_bars:
                     reason = (
@@ -208,19 +211,19 @@ class SignalExitMixin:
                     0.50,
                     min(
                         0.99,
-                        float(cfg.get('near_miss_tp_arm_ratio', state.get('near_miss_tp_arm_ratio', 0.86)) or 0.86),
+                        float(state.get('near_miss_tp_arm_ratio', cfg.get('near_miss_tp_arm_ratio', 0.86)) or 0.86),
                     ),
                 )
                 base_lock_r = max(
                     0.0,
-                    float(cfg.get('near_miss_tp_lock_r', state.get('near_miss_tp_lock_r', 0.28)) or 0.28),
+                    float(state.get('near_miss_tp_lock_r', cfg.get('near_miss_tp_lock_r', 0.28)) or 0.28),
                 )
                 rejection_atr = max(
                     0.0,
                     float(
-                        cfg.get(
+                        state.get(
                             'near_miss_tp_rejection_atr',
-                            state.get('near_miss_tp_rejection_atr', 0.12),
+                            cfg.get('near_miss_tp_rejection_atr', 0.12),
                         )
                         or 0.12
                     ),
@@ -423,16 +426,16 @@ class SignalExitMixin:
 
         tp1_trigger_r = max(
             0.1,
-            float(cfg.get('tp1_breakeven_trigger_r', state.get('tp1_breakeven_trigger_r', activation_r)) or activation_r)
+            float(state.get('tp1_breakeven_trigger_r', cfg.get('tp1_breakeven_trigger_r', activation_r)) or activation_r)
         )
         price_reached_tp1 = favorable_move >= tp1_trigger_r * risk_distance
-        wait_for_partial = bool(cfg.get('tp1_breakeven_wait_for_partial', state.get('tp1_breakeven_wait_for_partial', True)))
+        wait_for_partial = bool(state.get('tp1_breakeven_wait_for_partial', cfg.get('tp1_breakeven_wait_for_partial', True)))
         if (
             tp1_breakeven_enabled
             and not bool(state.get('breakeven_armed'))
             and (partial_qty_seen if wait_for_partial else (partial_qty_seen or price_reached_tp1))
         ):
-            offset_r = max(0.0, float(cfg.get('tp1_breakeven_offset_r', state.get('tp1_breakeven_offset_r', 0.03)) or 0.03))
+            offset_r = max(0.0, float(state.get('tp1_breakeven_offset_r', cfg.get('tp1_breakeven_offset_r', 0.03)) or 0.03))
             breakeven_stop = (
                 entry_price + risk_distance * offset_r
                 if side == 'long' else
@@ -499,14 +502,14 @@ class SignalExitMixin:
         state_cfg = dict(cfg or {})
         state_cfg.update({
             'atr_trailing_multiplier': trailing_mult,
-            'atr_trailing_breakeven_enabled': bool(cfg.get('atr_trailing_breakeven_enabled', state.get('breakeven_enabled', True))),
+            'atr_trailing_breakeven_enabled': bool(state.get('breakeven_enabled', cfg.get('atr_trailing_breakeven_enabled', True))),
         })
-        if bool(cfg.get('runner_exit_enabled', state.get('runner_exit_enabled', False))) and bool(cfg.get('runner_chandelier_enabled', state.get('runner_chandelier_enabled', False))):
+        if bool(state.get('runner_exit_enabled', cfg.get('runner_exit_enabled', False))) and bool(state.get('runner_chandelier_enabled', cfg.get('runner_chandelier_enabled', False))):
             lookback = max(
-                int(cfg.get('runner_chandelier_lookback', state.get('runner_chandelier_lookback', 22)) or 22),
-                int(cfg.get('runner_structure_lookback', state.get('runner_structure_lookback', 5)) or 5),
+                int(state.get('runner_chandelier_lookback', cfg.get('runner_chandelier_lookback', 22)) or 22),
+                int(state.get('runner_structure_lookback', cfg.get('runner_structure_lookback', 5)) or 5),
             )
-            structure_lookback = max(2, int(cfg.get('runner_structure_lookback', state.get('runner_structure_lookback', 5)) or 5))
+            structure_lookback = max(2, int(state.get('runner_structure_lookback', cfg.get('runner_structure_lookback', 5)) or 5))
             recent = closed.tail(max(lookback, structure_lookback))
             recent_swing_low = float(recent.tail(structure_lookback)['low'].min())
             recent_swing_high = float(recent.tail(structure_lookback)['high'].max())
@@ -548,7 +551,7 @@ class SignalExitMixin:
                 if side == 'long'
                 else current_close + (atr_value * trailing_mult)
             )
-            if bool(cfg.get('atr_trailing_breakeven_enabled', state.get('breakeven_enabled', True))):
+            if bool(state.get('breakeven_enabled', cfg.get('atr_trailing_breakeven_enabled', True))):
                 raw_trail = max(entry_price, raw_trail) if side == 'long' else min(entry_price, raw_trail)
             runner_mode = 'atr_close'
             runner_multiplier = trailing_mult

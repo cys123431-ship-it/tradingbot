@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from utbreakout.adaptive_breakout_trend import (
+    ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+    default_adaptive_breakout_trend_config,
+)
 from utbreakout.dynamic_leverage import (
     default_dynamic_leverage_config,
     normalize_dynamic_leverage_config,
@@ -454,6 +458,49 @@ class TradingConfig:
             strategy_params['active_strategy'] = 'utbot'
             active_strategy = 'utbot'
             changed = True
+        adaptive_trend_cfg = default_adaptive_breakout_trend_config()
+        if isinstance(quad_cfg.get('adaptive_breakout_trend'), dict):
+            adaptive_trend_cfg.update(quad_cfg.get('adaptive_breakout_trend'))
+        adaptive_trend_active = active_strategy == ADAPTIVE_BREAKOUT_TREND_STRATEGY
+        adaptive_trend_cfg['enabled'] = adaptive_trend_active
+        adaptive_trend_cfg['live_enabled'] = adaptive_trend_active
+        if quad_cfg.get('adaptive_breakout_trend') != adaptive_trend_cfg:
+            quad_cfg['adaptive_breakout_trend'] = adaptive_trend_cfg
+            changed = True
+        if quad_cfg.get('adaptive_breakout_trend_live_enabled') is not adaptive_trend_active:
+            quad_cfg['adaptive_breakout_trend_live_enabled'] = adaptive_trend_active
+            changed = True
+        if adaptive_trend_active:
+            if quad_cfg.get('quad_alpha_enabled_strategies') != []:
+                quad_cfg['quad_alpha_enabled_strategies'] = []
+                changed = True
+            for key in (
+                'relative_strength_pullback_trend_live_enabled',
+                'volatility_managed_trend_live_enabled',
+                'qh_flow_live_enabled',
+                'qh_flow_confirmation_enabled',
+                'crowding_unwind_live_enabled',
+                'liquidation_exhaustion_reversal_live_enabled',
+            ):
+                if quad_cfg.get(key) is not False:
+                    quad_cfg[key] = False
+                    changed = True
+            for section, live_keys in {
+                'relative_strength_pullback_trend': ('relative_strength_pullback_trend_live_enabled',),
+                'volatility_managed_trend': ('enabled', 'live_enabled'),
+                'qh_flow': ('qh_flow_enabled', 'qh_flow_live_enabled', 'qh_confirmation_enabled'),
+                'crowding_unwind': ('enabled', 'live_enabled'),
+                'liquidation_exhaustion_reversal': ('enabled', 'live_enabled'),
+            }.items():
+                nested_cfg = quad_cfg.setdefault(section, {})
+                if not isinstance(nested_cfg, dict):
+                    nested_cfg = {}
+                    quad_cfg[section] = nested_cfg
+                    changed = True
+                for key in live_keys:
+                    if nested_cfg.get(key) is not False:
+                        nested_cfg[key] = False
+                        changed = True
         if active_strategy == QUAD_ALPHA_STRATEGY:
             selected = normalize_quad_alpha_enabled_strategies(
                 quad_cfg.get('quad_alpha_enabled_strategies')

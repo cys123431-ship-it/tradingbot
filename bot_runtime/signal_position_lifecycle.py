@@ -489,6 +489,8 @@ class SignalPositionLifecycleMixin:
             'atr_trailing_activation_r',
             'runner_exit_enabled',
             'runner_chandelier_enabled',
+            'runner_chandelier_lookback',
+            'runner_structure_lookback',
             'tp1_breakeven_enabled',
             'tp1_breakeven_trigger_r',
             'ev_exit_profile_name',

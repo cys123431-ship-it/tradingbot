@@ -798,6 +798,355 @@ class SignalAlphaMixin:
             f"Reason: {status.get('reason') or '-'}",
         ])
 
+    def _adaptive_breakout_trend_runtime_config(self, cfg=None):
+        source = dict(cfg or {})
+        base = default_adaptive_breakout_trend_config()
+        nested = source.get('adaptive_breakout_trend')
+        if isinstance(nested, dict):
+            base.update(nested)
+        if 'adaptive_breakout_trend_live_enabled' in source:
+            base['live_enabled'] = bool(source.get('adaptive_breakout_trend_live_enabled'))
+        return base
+
+    async def _calculate_adaptive_breakout_trend_signal(
+        self,
+        symbol,
+        df,
+        strategy_params,
+        *,
+        force_reprocess=False,
+    ):
+        cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+        trend_cfg = self._adaptive_breakout_trend_runtime_config(cfg)
+        canonical = self._canonical_futures_symbol(symbol)
+        self._clear_utbot_filtered_breakout_entry_plan(canonical)
+        status = {
+            'strategy': STRATEGY_DISPLAY_NAMES.get(
+                ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+                'ADAPTIVE_BREAKOUT_TREND',
+            ),
+            'entry_strategy': ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+            'symbol': canonical,
+            'stage': 'waiting',
+        }
+
+        def _finish(sig, reason, code=None):
+            status['reason'] = reason
+            status['accepted_side'] = sig
+            if code:
+                status['reject_code'] = code
+            if sig:
+                status['accepted_code'] = 'ACCEPTED_ENTRY'
+                status['stage'] = 'entry_ready'
+            if not isinstance(getattr(self, 'adaptive_breakout_trend_last_status', None), dict):
+                self.adaptive_breakout_trend_last_status = {}
+            self.adaptive_breakout_trend_last_status[canonical] = dict(status)
+            self._store_utbot_filtered_breakout_status(canonical, status)
+            self.last_entry_reason[canonical] = reason
+            return sig, reason, status
+
+        if self.is_upbit_mode():
+            return _finish(
+                None,
+                'Adaptive Breakout Trend is unavailable in Upbit mode',
+                'REJECTED_UNSUPPORTED_MODE',
+            )
+        if not bool(trend_cfg.get('enabled', True)) or not bool(trend_cfg.get('live_enabled', False)):
+            return _finish(
+                None,
+                'Adaptive Breakout Trend live mode is OFF',
+                'REJECTED_ADAPTIVE_TREND_LIVE_DISABLED',
+            )
+
+        timeframe = str(trend_cfg.get('timeframe', '1h') or '1h')
+        try:
+            ohlcv = await asyncio.to_thread(
+                self.market_data_exchange.fetch_ohlcv,
+                canonical,
+                timeframe,
+                limit=max(220, int(trend_cfg.get('fetch_limit', 360) or 360)),
+            )
+            rows = self._relative_strength_pullback_rows_from_ohlcv(ohlcv)
+            rows = completed_candle_rows(
+                rows,
+                timeframe,
+                {'exclude_incomplete_live_candle': True},
+            )
+        except Exception as exc:
+            return _finish(
+                None,
+                f'Adaptive Breakout Trend OHLCV unavailable: {exc}',
+                'REJECTED_ADAPTIVE_TREND_DATA',
+            )
+
+        base_l2 = await self._evaluate_shared_l2_gate(
+            canonical,
+            cfg,
+            force_refresh=force_reprocess,
+        )
+        preliminary = evaluate_adaptive_breakout_trend(rows, base_l2, trend_cfg)
+        candidate_side = preliminary.side
+        l2_gate = (
+            await self._evaluate_shared_l2_gate(
+                canonical,
+                cfg,
+                force_refresh=True,
+                side=candidate_side,
+            )
+            if candidate_side in {'long', 'short'}
+            else base_l2
+        )
+        decision = evaluate_adaptive_breakout_trend(rows, l2_gate, trend_cfg)
+        metrics = dict(decision.metrics or {})
+        status.update({
+            'allowed': bool(decision.allowed),
+            'side': decision.side,
+            'score': float(decision.score),
+            'risk_multiplier': float(decision.risk_multiplier),
+            'risk_tier': metrics.get('risk_tier'),
+            'metrics': metrics,
+            'l2_gate': dict(l2_gate or {}),
+        })
+        if not decision.allowed or decision.side not in {'long', 'short'}:
+            return _finish(None, f'Adaptive Breakout Trend waiting: {decision.reason}')
+        side = decision.side
+        if not self.is_trade_direction_allowed(side):
+            return _finish(
+                None,
+                self.format_trade_direction_block_reason(side),
+                'REJECTED_DIRECTION_FILTER',
+            )
+
+        _, daily_pnl = self.db.get_daily_stats()
+        daily_entries = self.get_automatic_daily_entry_count()
+        status['daily_pnl'] = daily_pnl
+        status['daily_entries'] = daily_entries
+        if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
+            return _finish(
+                None,
+                f'risk_limit_blocked: daily pnl {daily_pnl:.2f}',
+                'REJECTED_DAILY_LOSS_LIMIT',
+            )
+        if int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
+            return _finish(
+                None,
+                f'risk_limit_blocked: daily trade count {daily_entries}',
+                'REJECTED_DAILY_TRADE_LIMIT',
+            )
+
+        reference_price = _safe_float_or_none(metrics.get('reference_price'))
+        atr_value = _safe_float_or_none(metrics.get('atr'))
+        structure_stop = _safe_float_or_none(metrics.get('structure_stop'))
+        if reference_price is None or reference_price <= 0 or atr_value is None or atr_value <= 0:
+            return _finish(
+                None,
+                'Adaptive Breakout Trend reference price/ATR unavailable',
+                'REJECTED_ADAPTIVE_TREND_DATA',
+            )
+        try:
+            ticker = await asyncio.to_thread(self.market_data_exchange.fetch_ticker, canonical)
+            entry_price = _safe_float_or_none((ticker or {}).get('last') or (ticker or {}).get('close'))
+        except Exception as exc:
+            return _finish(
+                None,
+                f'Adaptive Breakout Trend live price unavailable: {exc}',
+                'REJECTED_ADAPTIVE_TREND_DATA',
+            )
+        if entry_price is None or entry_price <= 0:
+            return _finish(
+                None,
+                'Adaptive Breakout Trend live price unavailable',
+                'REJECTED_ADAPTIVE_TREND_DATA',
+            )
+
+        chase_atr = (
+            (entry_price - reference_price) / atr_value
+            if side == 'long'
+            else (reference_price - entry_price) / atr_value
+        )
+        status['entry_chase_atr'] = chase_atr
+        if chase_atr > float(trend_cfg.get('entry_chase_max_atr', 0.80) or 0.80):
+            return _finish(
+                None,
+                f'Adaptive Breakout Trend entry moved {chase_atr:.2f} ATR beyond its signal',
+                'REJECTED_ADAPTIVE_TREND_STALE_CHASE',
+            )
+        if structure_stop is not None and (
+            (side == 'long' and entry_price <= structure_stop)
+            or (side == 'short' and entry_price >= structure_stop)
+        ):
+            return _finish(
+                None,
+                'Adaptive Breakout Trend structure invalidated before order',
+                'REJECTED_ADAPTIVE_TREND_INVALIDATED',
+            )
+
+        filter_values = {
+            'entry_price': entry_price,
+            'entry_timeframe': timeframe,
+            'atr': atr_value,
+            'atr_pct': atr_value / entry_price * 100.0,
+        }
+        market_quality = self._evaluate_utbreakout_market_quality(side, cfg, filter_values)
+        status['market_quality'] = market_quality
+        if market_quality.get('hard_block') or market_quality.get('state') is False:
+            return _finish(
+                None,
+                f"market_quality_rejected: {market_quality.get('summary')}",
+                'REJECTED_MARKET_QUALITY',
+            )
+        if not l2_gate.get('allowed', False):
+            return _finish(
+                None,
+                f"L2 stressed: {l2_gate.get('reason')}",
+                'REJECTED_L2_STRESSED',
+            )
+
+        total_balance, free_balance, _ = await self.get_balance_info()
+        balance_for_risk = total_balance if total_balance > 0 else free_balance
+        common_cfg = self.get_runtime_common_settings()
+        leverage = int(max(1.0, float(common_cfg.get('leverage', 5) or 5)))
+        risk_multiplier = min(
+            1.0,
+            max(0.0, float(decision.risk_multiplier or 0.0)),
+            max(0.0, float(market_quality.get('risk_multiplier', 1.0) or 1.0)),
+            max(0.0, float(l2_gate.get('risk_multiplier', 0.0) or 0.0)),
+        )
+        risk_budget = resolve_utbreakout_risk_budget(
+            balance_for_risk,
+            cfg,
+            multiplier=risk_multiplier,
+            daily_pnl_usdt=daily_pnl,
+        )
+        # A 20-bar structure point can be many ATR away in a healthy trend.
+        # Using that distant point as the hard-stop anchor would shrink an
+        # otherwise excellent entry to a token position. Keep the 2 ATR hard
+        # risk budget and only use structure as a soft anchor when it is nearby.
+        structure_for_risk = structure_stop
+        if structure_stop is not None:
+            structure_distance_atr = abs(entry_price - structure_stop) / atr_value
+            status['structure_distance_atr'] = structure_distance_atr
+            if structure_distance_atr > float(trend_cfg.get('stop_atr_multiplier', 2.00) or 2.00):
+                structure_for_risk = None
+        try:
+            plan = calculate_risk_plan(
+                side=side,
+                entry_price=entry_price,
+                atr_value=atr_value,
+                stop_atr_multiplier=float(trend_cfg.get('stop_atr_multiplier', 2.00) or 2.00),
+                ut_stop=None,
+                structure_stop=structure_for_risk,
+                structure_buffer_atr=float(trend_cfg.get('structure_buffer_atr', 0.15) or 0.15),
+                take_profit_r_multiple=float(trend_cfg.get('take_profit_r_multiple', 4.00) or 4.00),
+                take_profit_front_run_atr=0.0,
+                take_profit_front_run_pct=0.0,
+                min_risk_reward=2.5,
+                balance_usdt=balance_for_risk,
+                risk_per_trade_percent=risk_budget['risk_per_trade_percent'],
+                max_risk_per_trade_usdt=risk_budget['max_risk_per_trade_usdt'],
+                leverage=leverage,
+            )
+            plan = cap_utbreakout_risk_plan_to_margin(
+                plan,
+                free_balance=free_balance,
+                leverage=leverage,
+                entry_price=entry_price,
+            )
+        except ValueError as exc:
+            return _finish(
+                None,
+                f'Adaptive Breakout Trend risk plan rejected: {exc}',
+                'REJECTED_ADAPTIVE_TREND_RISK_PLAN',
+            )
+
+        plan.update({
+            'strategy': ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+            'plan_symbol': canonical,
+            'signal_candle_ts': metrics.get('signal_candle_ts'),
+            'entry_timeframe': timeframe,
+            'timeframe': timeframe,
+            'exit_timeframe': '15m',
+            'htf_timeframe': '4h',
+            'entry_execution': 'market',
+            'adaptive_breakout_trend_score': float(decision.score),
+            'adaptive_breakout_trend_risk_multiplier': risk_multiplier,
+            'adaptive_breakout_trend_metrics': metrics,
+            'structure_reference_stop': structure_stop,
+            'entry_chase_atr': chase_atr,
+            'l2_gate': dict(l2_gate or {}),
+            'l2_state': l2_gate.get('state'),
+            'l2_risk_multiplier': l2_gate.get('risk_multiplier'),
+            'market_quality_summary': market_quality.get('summary'),
+            'market_quality_risk_multiplier': market_quality.get('risk_multiplier'),
+            'atr': atr_value,
+            'atr_pct': atr_value / entry_price * 100.0,
+            'partial_take_profit_enabled': True,
+            'partial_take_profit_r_multiple': 1.50,
+            'partial_take_profit_ratio': 0.20,
+            'second_take_profit_enabled': True,
+            'second_take_profit_r_multiple': float(trend_cfg.get('take_profit_r_multiple', 4.00) or 4.00),
+            'second_take_profit_ratio': 0.20,
+            'runner_pct': 0.60,
+            'preserve_runner_qty': True,
+            'atr_trailing_enabled': True,
+            'atr_trailing_activation_r': 2.00,
+            'atr_trailing_multiplier': 3.25,
+            'runner_exit_enabled': True,
+            'runner_chandelier_enabled': True,
+            'runner_chandelier_lookback': 48,
+            'runner_structure_lookback': 12,
+            'tp1_breakeven_enabled': True,
+            'tp1_breakeven_wait_for_partial': True,
+            'ev_time_stop_enabled': True,
+            'ev_time_stop_bars': int(trend_cfg.get('time_stop_hours', 168) or 168) * 4,
+            'ev_time_stop_min_mfe_r': 0.35,
+            'ev_time_stop_max_current_r': 0.0,
+        })
+        self._set_utbot_filtered_breakout_entry_plan(canonical, plan)
+        status['entry_plan'] = dict(plan)
+        return _finish(side, f'ACCEPTED_ENTRY: {decision.reason}')
+
+    async def build_adaptive_breakout_trend_status_text(self, symbol=None):
+        target = self._canonical_futures_symbol(
+            symbol or self.current_utbreakout_candidate_symbol or 'BTC/USDT'
+        )
+        status = dict(
+            (getattr(self, 'adaptive_breakout_trend_last_status', {}) or {}).get(target)
+            or {}
+        )
+        if not status:
+            return '\n'.join([
+                '📈 Adaptive Breakout Trend 상태',
+                f'Symbol: {target}',
+                '아직 완료된 1시간봉 평가 기록이 없습니다.',
+            ])
+        metrics = status.get('metrics') if isinstance(status.get('metrics'), dict) else {}
+        votes = metrics.get('horizon_votes') if isinstance(metrics.get('horizon_votes'), dict) else {}
+        vote_text = ', '.join(
+            f'{key}h={str(value or "NONE").upper()}' for key, value in votes.items()
+        )
+        breakout_mode = (
+            'fresh breakout'
+            if metrics.get('fresh_breakout')
+            else 're-acceleration'
+            if metrics.get('reacceleration')
+            else 'waiting'
+        )
+        return '\n'.join([
+            '📈 Adaptive Breakout Trend 상태',
+            f'Symbol: {target}',
+            f"Signal: {str(status.get('side') or 'NONE').upper()} / allowed={bool(status.get('allowed'))}",
+            f"Score: {float(status.get('score', 0.0) or 0.0):.1f}",
+            f"Risk: x{float(status.get('risk_multiplier', 0.0) or 0.0):.2f} / tier={status.get('risk_tier') or 'waiting'}",
+            f'Horizons: {vote_text or "N/A"}',
+            f"Momentum: {float(metrics.get('weighted_momentum', 0.0) or 0.0):+.2f}",
+            f"Entry mode: {breakout_mode}",
+            f"Trend efficiency: {float(metrics.get('trend_efficiency', 0.0) or 0.0):.2f}",
+            f"Volatility scale: {float(metrics.get('volatility_scale', 0.0) or 0.0):.2f}",
+            f"L2: {(status.get('l2_gate') or {}).get('state') or 'N/A'}",
+            f"Reason: {status.get('reason') or '-'}",
+        ])
+
     def _crowding_unwind_runtime_config(self, cfg=None):
         source = dict(cfg or {})
         base = default_crowding_unwind_config()
