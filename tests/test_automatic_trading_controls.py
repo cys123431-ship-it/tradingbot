@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -125,6 +126,14 @@ def test_telegram_keyboard_contains_daily_limit_and_all_scan_scope_buttons():
     assert "atc:scope:tradfi_only" in callback_data
     assert "atc:scope:crypto_only" in callback_data
     assert "atc:scope:all_allowed" in callback_data
+
+
+def test_scanner_command_is_registered_as_scope_menu_alias():
+    source = inspect.getsource(
+        ControllerAutomaticTradingControlsMixin._register_automatic_trading_control_handlers
+    )
+
+    assert 'CommandHandler("scanner", owner_only(automatic_controls_cmd))' in source
 
 
 def _market(base, contract_type):

@@ -1754,12 +1754,6 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 ],
                 [
                     InlineKeyboardButton("SELECT 전략", callback_data="utb:qselect")
-                ],
-                [
-                    InlineKeyboardButton("코인 감시 목록", callback_data="utb:watchlist")
-                ],
-                [
-                    InlineKeyboardButton("⚙️ 자동매매 설정", callback_data="atc:status")
                 ]
             ]
             return InlineKeyboardMarkup(append_live_real_risk_buttons_to_utbreakout_rows(rows))
@@ -5892,6 +5886,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 /utbreak - UTBreak 전략 메뉴
 /utbreakout - /utbreak alias
 /trend - standalone adaptive trend menu
+/scanner - 자동 스캔 범위(TradFi/순수 코인/전체) 설정
 /setup - 거래소/네트워크 전환
 /customentry - 사용자 지정 종목·방향 진입 모드
 /autotrade - 자동매매 거래횟수·스캔범위 설정

@@ -2129,8 +2129,11 @@ class ControllerTelegramMixin:
     def _build_main_keyboard(self):
         kb = [
             [KeyboardButton("🚨 STOP"), KeyboardButton("⏸ PAUSE"), KeyboardButton("▶ RESUME")],
-            [KeyboardButton("/utbreak")],
-            [KeyboardButton("/trend")],
+            [
+                KeyboardButton("/utbreak"),
+                KeyboardButton("/trend"),
+                KeyboardButton("/scanner"),
+            ],
             [KeyboardButton("/setup"), KeyboardButton("/customentry")],
             [KeyboardButton("/status"), KeyboardButton("/history"), KeyboardButton("/stats")],
             [KeyboardButton("/log"), KeyboardButton("/help")]

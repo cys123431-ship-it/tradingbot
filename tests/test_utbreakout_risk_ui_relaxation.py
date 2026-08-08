@@ -122,6 +122,8 @@ def test_main_reply_keyboard_does_not_add_risk_button():
     main_menu_source = source[main_menu_start:main_menu_end]
 
     assert 'KeyboardButton("/utbreak")' in main_menu_source
+    assert 'KeyboardButton("/trend")' in main_menu_source
+    assert 'KeyboardButton("/scanner")' in main_menu_source
     assert 'KeyboardButton("/risk")' not in main_menu_source
 
 
@@ -135,6 +137,8 @@ def test_utbreakout_menu_uses_integrated_five_strategy_selector():
     assert 'callback_data="utb:quad:off"' in menu_source
     assert 'callback_data="utb:quad_status"' in menu_source
     assert 'callback_data="utb:qselect"' in menu_source
+    assert 'callback_data="utb:watchlist"' not in menu_source
+    assert 'callback_data="atc:status"' not in menu_source
     assert 'callback_data="utb:rsp:on"' not in menu_source
     assert 'callback_data="utb:qh:on"' not in menu_source
     assert 'callback_data="utb:crowding:on"' not in menu_source

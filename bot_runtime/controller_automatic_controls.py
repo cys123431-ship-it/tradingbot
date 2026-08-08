@@ -131,7 +131,7 @@ class ControllerAutomaticTradingControlsMixin:
         status = self.get_automatic_trading_control_status()
         scope = status["scan_scope"]
         lines = [
-            "⚙️ 자동매매 운영 설정",
+            "🔎 Scanner / 자동매매 운영 설정",
             "",
             f"UTC 기준일: {status['utc_date']}",
             f"오늘 자동매매 진입: {status['entries']}회",
@@ -247,6 +247,9 @@ class ControllerAutomaticTradingControlsMixin:
         )
         self.tg_app.add_handler(
             CommandHandler("autocontrol", owner_only(automatic_controls_cmd))
+        )
+        self.tg_app.add_handler(
+            CommandHandler("scanner", owner_only(automatic_controls_cmd))
         )
         self.tg_app.add_handler(
             CallbackQueryHandler(
