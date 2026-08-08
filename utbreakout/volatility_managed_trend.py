@@ -26,6 +26,7 @@ def default_volatility_managed_trend_config() -> dict[str, Any]:
         "timeframe": "1h",
         "lookback_bars": (8, 24, 72),
         "minimum_horizon_agreement": 2,
+        "require_slow_horizon_alignment": True,
         "normalized_return_min": 0.30,
         "fast_ema_period": 12,
         "slow_ema_period": 36,
@@ -36,8 +37,8 @@ def default_volatility_managed_trend_config() -> dict[str, Any]:
         "short_volatility_period": 12,
         "long_volatility_period": 48,
         "volatility_shock_ratio_max": 1.75,
-        "target_hourly_volatility": 0.012,
-        "volatility_targeting_power": 1.0,
+        "target_hourly_volatility": 0.015,
+        "volatility_targeting_power": 0.50,
         "directional_energy_period": 24,
         "adverse_energy_soft_ratio": 0.80,
         "latest_adverse_return_sigma_max": 1.35,
@@ -46,14 +47,14 @@ def default_volatility_managed_trend_config() -> dict[str, Any]:
         "volume_lookback_bars": 48,
         "volume_ratio_min": 0.50,
         "score_min": 66.0,
-        "risk_multiplier_floor": 0.25,
-        "risk_multiplier_cap": 0.60,
+        "risk_multiplier_floor": 0.40,
+        "risk_multiplier_cap": 0.85,
         "structure_lookback_bars": 12,
         "structure_buffer_atr": 0.10,
         "stop_atr_multiplier": 1.60,
-        "take_profit_r_multiple": 3.00,
-        "time_stop_bars": 24,
-        "entry_chase_max_atr": 0.50,
+        "take_profit_r_multiple": 4.00,
+        "time_stop_bars": 48,
+        "entry_chase_max_atr": 0.40,
     }
 
 
@@ -191,6 +192,8 @@ def evaluate_volatility_managed_trend(
     slow_vote = votes[max(horizons)]
     if slow_vote not in {None, side}:
         return VolatilityManagedTrendDecision(side=side, reason="slow_horizon_conflict", metrics=metrics)
+    if bool(cfg.get("require_slow_horizon_alignment", True)) and slow_vote != side:
+        return VolatilityManagedTrendDecision(side=side, reason="slow_horizon_not_confirmed", metrics=metrics)
     if volatility_ratio > float(cfg["volatility_shock_ratio_max"]):
         return VolatilityManagedTrendDecision(side=side, reason="volatility_shock", metrics=metrics)
 
@@ -299,7 +302,10 @@ def evaluate_volatility_managed_trend(
         min(1.0, (score - float(cfg["score_min"])) / max(100.0 - float(cfg["score_min"]), 1e-9)),
     )
     quality_budget = floor + (cap - floor) * quality
-    risk = min(cap, quality_budget * volatility_scale * adverse_scale, max(0.0, l2_multiplier))
+    # These values are alternative final risk budgets, not independent event
+    # probabilities.  Taking the weakest link remains conservative without
+    # counting the same volatility weakness multiple times.
+    risk = min(cap, quality_budget, volatility_scale, adverse_scale, max(0.0, l2_multiplier))
     metrics.update({
         "volatility_scale": volatility_scale,
         "adverse_energy_scale": adverse_scale,

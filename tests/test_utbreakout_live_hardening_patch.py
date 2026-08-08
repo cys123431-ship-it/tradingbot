@@ -12,15 +12,15 @@ def test_ev_router_keeps_legacy_set_hardening_disabled():
 def test_profit_patch_matches_opportunity_profile_values():
     cfg = patch.tune_effective_config({})
 
-    assert cfg["effective_profile_version"] == "ev_adaptive_v3_profit_engine"
+    assert cfg["effective_profile_version"] == "ev_adaptive_v4_profit_capture"
     assert cfg["live_auto_set_whitelist"] == [64]
     assert cfg["active_set_id"] == 64
-    assert cfg["partial_take_profit_r_multiple"] == 1.0
-    assert cfg["partial_take_profit_ratio"] == 0.25
-    assert cfg["second_take_profit_r_multiple"] == 2.4
-    assert cfg["second_take_profit_ratio"] == 0.35
+    assert cfg["partial_take_profit_r_multiple"] == 1.25
+    assert cfg["partial_take_profit_ratio"] == 0.20
+    assert cfg["second_take_profit_r_multiple"] == 3.2
+    assert cfg["second_take_profit_ratio"] == 0.30
     assert cfg["dynamic_take_profit_enabled"] is False
-    assert cfg["atr_trailing_multiplier"] == 3.0
+    assert cfg["atr_trailing_multiplier"] == 3.25
     assert cfg["market_quality_min_risk_multiplier"] == 0.0
     assert cfg["max_daily_trades"] == 5
     assert cfg["profit_alpha_enabled"] is True

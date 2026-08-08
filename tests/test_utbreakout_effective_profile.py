@@ -23,17 +23,17 @@ def test_profit_opportunity_effective_profile_overrides_old_values():
 
     out = emas.apply_profit_opportunity_effective_overrides(cfg)
 
-    assert out["effective_profile_version"] == "ev_adaptive_v3_profit_engine"
+    assert out["effective_profile_version"] == "ev_adaptive_v4_profit_capture"
     assert out["selection_mode"] == "auto"
     assert out["auto_select_enabled"] is True
     assert out["active_set_id"] == 64
     assert out["profile"] == "set64"
     assert out["live_auto_set_whitelist"] == [64]
-    assert out["partial_take_profit_r_multiple"] == 1.00
-    assert out["partial_take_profit_ratio"] == 0.25
-    assert out["second_take_profit_r_multiple"] == 2.40
-    assert out["second_take_profit_ratio"] == 0.35
-    assert out["take_profit_r_multiple"] == 2.40
+    assert out["partial_take_profit_r_multiple"] == 1.25
+    assert out["partial_take_profit_ratio"] == 0.20
+    assert out["second_take_profit_r_multiple"] == 3.20
+    assert out["second_take_profit_ratio"] == 0.30
+    assert out["take_profit_r_multiple"] == 3.20
     assert out["max_daily_trades"] == 5
     assert out["bias_continuation_min_volume_ratio"] == 0.40
     assert out["bias_continuation_15m_min_volume_ratio"] == 0.45
@@ -93,10 +93,10 @@ def test_runtime_config_path_reapplies_effective_profile_after_persisted_values(
     assert cfg["active_set_id"] == 64
     assert cfg["profile"] == "set64"
     assert cfg["live_auto_set_whitelist"] == [64]
-    assert cfg["partial_take_profit_r_multiple"] == 1.00
-    assert cfg["partial_take_profit_ratio"] == 0.25
-    assert cfg["second_take_profit_r_multiple"] == 2.40
-    assert cfg["take_profit_r_multiple"] == 2.40
+    assert cfg["partial_take_profit_r_multiple"] == 1.25
+    assert cfg["partial_take_profit_ratio"] == 0.20
+    assert cfg["second_take_profit_r_multiple"] == 3.20
+    assert cfg["take_profit_r_multiple"] == 3.20
     assert cfg["max_daily_trades"] == 5
     assert cfg["bias_continuation_min_volume_ratio"] == 0.40
     assert cfg["bias_continuation_15m_min_volume_ratio"] == 0.45
@@ -136,11 +136,11 @@ def test_status_render_contract_replaces_stale_telegram_summary_values():
         daily_entries=0,
     )
 
-    assert "Effective Profile: ev_adaptive_v3_profit_engine" in rendered
+    assert "Effective Profile: ev_adaptive_v4_profit_capture" in rendered
     assert "Strategy Router: Entry Edge (UT trigger + EV/Alpha integrated)" in rendered
-    assert "Effective TP2: 2.40R" in rendered
+    assert "Effective TP2: 3.20R" in rendered
     assert "Effective volume: base 0.40 / 15m 0.45" in rendered
-    assert "익절 계획: TP1 1.00R(25%) / TP2 2.40R(35%)" in rendered
+    assert "익절 계획: TP1 1.25R(20%) / TP2 3.20R(30%)" in rendered
     assert "일일 리스크: trades 0/5" in rendered
     assert "익절 계획: 2.0R" not in rendered
     assert "trades 0/10" not in rendered

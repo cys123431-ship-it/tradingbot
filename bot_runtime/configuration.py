@@ -16,6 +16,10 @@ from utbreakout.opportunity_risk import (
     default_opportunity_risk_config,
     normalize_opportunity_risk_config,
 )
+from utbreakout.profit_capture import (
+    EXISTING_ALPHA_PROFIT_PROFILE_VERSION,
+    QUAD_CONFIRMATION_RISK_MULTIPLIERS,
+)
 
 class TradingConfig:
     def __init__(self, config_file='config.json'):
@@ -451,6 +455,65 @@ class TradingConfig:
             if str(strategy_params.get('active_strategy') or '').lower() == QH_FLOW_STRATEGY:
                 strategy_params['active_strategy'] = VOLATILITY_MANAGED_TREND_STRATEGY
             quad_cfg['vmt_migration_v1_complete'] = True
+            changed = True
+
+        if (
+            str(quad_cfg.get('existing_alpha_profit_profile_version') or '')
+            != EXISTING_ALPHA_PROFIT_PROFILE_VERSION
+        ):
+            quad_cfg.update({
+                'quad_alpha_single_signal_risk_multiplier': QUAD_CONFIRMATION_RISK_MULTIPLIERS[1],
+                'quad_alpha_two_signal_risk_multiplier': QUAD_CONFIRMATION_RISK_MULTIPLIERS[2],
+                'quad_alpha_three_signal_risk_multiplier': QUAD_CONFIRMATION_RISK_MULTIPLIERS[3],
+                'quad_alpha_four_signal_risk_multiplier': QUAD_CONFIRMATION_RISK_MULTIPLIERS[4],
+                'quad_alpha_five_signal_risk_multiplier': QUAD_CONFIRMATION_RISK_MULTIPLIERS[5],
+            })
+            strategy_profit_overrides = {
+                'relative_strength_pullback_trend': {
+                    'volatility_targeting_power': 0.50,
+                    'relative_strength_min_risk_multiplier': 0.75,
+                    'residual_horizon_conflict_multiplier': 0.65,
+                    'partial_take_profit_r_multiple': 1.50,
+                    'partial_take_profit_ratio': 0.20,
+                    'second_take_profit_r_multiple': 4.00,
+                    'second_take_profit_ratio': 0.25,
+                    'runner_pct': 0.55,
+                    'atr_trailing_activation_r': 2.00,
+                    'atr_trailing_multiplier': 3.25,
+                    'ev_time_stop_bars': 8,
+                },
+                'volatility_managed_trend': {
+                    'require_slow_horizon_alignment': True,
+                    'target_hourly_volatility': 0.015,
+                    'volatility_targeting_power': 0.50,
+                    'risk_multiplier_floor': 0.40,
+                    'risk_multiplier_cap': 0.85,
+                    'take_profit_r_multiple': 4.00,
+                    'time_stop_bars': 48,
+                    'entry_chase_max_atr': 0.40,
+                },
+                'crowding_unwind': {
+                    'risk_multiplier_floor': 0.40,
+                    'risk_multiplier_cap': 0.75,
+                    'take_profit_r_multiple': 3.00,
+                    'time_stop_bars': 32,
+                },
+                'liquidation_exhaustion_reversal': {
+                    'risk_multiplier_floor': 0.35,
+                    'risk_multiplier_cap': 0.65,
+                    'take_profit_r_multiple': 3.20,
+                    'time_stop_bars': 12,
+                },
+            }
+            for section, overrides in strategy_profit_overrides.items():
+                nested = quad_cfg.setdefault(section, {})
+                if not isinstance(nested, dict):
+                    nested = {}
+                    quad_cfg[section] = nested
+                nested.update(overrides)
+            quad_cfg['existing_alpha_profit_profile_version'] = (
+                EXISTING_ALPHA_PROFIT_PROFILE_VERSION
+            )
             changed = True
 
         active_strategy = str(strategy_params.get('active_strategy', 'utbot')).lower()

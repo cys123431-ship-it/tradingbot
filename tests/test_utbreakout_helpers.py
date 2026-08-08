@@ -680,6 +680,41 @@ def test_lxr_first_migration_enables_once_but_preserves_later_user_off(tmp_path)
     assert restarted_ut["liquidation_exhaustion_reversal"]["live_enabled"] is False
 
 
+def test_existing_alpha_profit_migration_preserves_user_strategy_selection(tmp_path):
+    emas = _emas_module()
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        (
+            '{"api":{"exchange_mode":"binance_testnet"},'
+            '"signal_engine":{"strategy_params":{'
+            '"active_strategy":"quad_alpha_v1",'
+            '"UTBotFilteredBreakoutV1":{'
+            '"lxr_migration_v1_complete":true,'
+            '"vmt_migration_v1_complete":true,'
+            '"quad_alpha_enabled_strategies":["ut_breakout","crowding_unwind"],'
+            '"volatility_managed_trend_live_enabled":false,'
+            '"volatility_managed_trend":{"enabled":false,"live_enabled":false}'
+            '}}}}'
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = emas.TradingConfig(str(config_path))
+    strategy_params = cfg.config["signal_engine"]["strategy_params"]
+    migrated = strategy_params["UTBotFilteredBreakoutV1"]
+
+    assert cfg.config["api"]["exchange_mode"] == "binance_testnet"
+    assert migrated["quad_alpha_enabled_strategies"] == [
+        emas.ENTRY_STRATEGY_UT_BREAKOUT,
+        emas.CROWDING_UNWIND_STRATEGY,
+    ]
+    assert migrated["volatility_managed_trend_live_enabled"] is False
+    assert migrated["volatility_managed_trend"]["enabled"] is False
+    assert migrated["quad_alpha_single_signal_risk_multiplier"] == pytest.approx(0.65)
+    assert migrated["relative_strength_pullback_trend"]["runner_pct"] == pytest.approx(0.55)
+    assert migrated["volatility_managed_trend"]["take_profit_r_multiple"] == pytest.approx(4.0)
+
+
 def test_utbreakout_runtime_blocks_unsafe_live_and_emergency_sets():
     emas = _emas_module()
     engine_cls = _signal_engine_cls()

@@ -357,12 +357,12 @@ def test_candidate_ranking_prefers_net_edge_over_legacy_indicator_score():
 def test_live_effective_profile_retires_legacy_set_selection_and_risk_floor():
     cfg = apply_profit_opportunity_effective_overrides({})
 
-    assert cfg["effective_profile_version"] == "ev_adaptive_v3_profit_engine"
+    assert cfg["effective_profile_version"] == "ev_adaptive_v4_profit_capture"
     assert cfg["live_auto_set_whitelist"] == [64]
     assert cfg["active_set_id"] == 64
     assert cfg["final_risk_multiplier_floor"] == 0.0
-    assert cfg["partial_take_profit_ratio"] == 0.25
-    assert cfg["second_take_profit_r_multiple"] == 2.4
+    assert cfg["partial_take_profit_ratio"] == 0.20
+    assert cfg["second_take_profit_r_multiple"] == 3.2
 
 
 def test_live_auto_selection_uses_only_ev_adaptive_set():
@@ -386,7 +386,7 @@ def test_live_auto_selection_uses_only_ev_adaptive_set():
     assert analysis["scores"]["auto_final_set_id"] == 64
 
 
-def test_live_auto_selection_reason_says_ev_adaptive_v3_profit_engine():
+def test_live_auto_selection_reason_says_ev_adaptive_v4_profit_capture():
     engine = object.__new__(SignalEngine)
     cfg = apply_profit_opportunity_effective_overrides(
         {"live_trading": True, "mode": "live"}
@@ -394,7 +394,7 @@ def test_live_auto_selection_reason_says_ev_adaptive_v3_profit_engine():
     selected, reason = engine._select_utbreakout_auto_set({"scores": {}}, cfg)
 
     assert selected == 64
-    assert "EV Adaptive V3_PROFIT_ENGINE" in reason
+    assert "EV Adaptive V4_PROFIT_CAPTURE" in reason
     assert "EV Adaptive V2" not in reason
 
 

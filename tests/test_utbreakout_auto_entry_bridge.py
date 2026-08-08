@@ -775,7 +775,7 @@ def test_live_scanner_records_status_ready_from_accepted_diag_and_plan():
             "candidate_type": "fresh_signal",
             "decision_candle_ts": int((time.time() - 60) * 1000),
             "entry_timeframe": "15m",
-            "effective_profile_version": "ev_adaptive_v3_profit_engine",
+            "effective_profile_version": "ev_adaptive_v4_profit_capture",
             "auto_selected_set_id": 64,
         }
     }

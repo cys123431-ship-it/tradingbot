@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from utbreakout.profit_capture import (
+    exit_bars_for_signal_holding_period,
+    weakest_link_risk_multiplier,
+)
+
 
 class SignalRsptMixin:
     def _relative_strength_pullback_runtime_config(self, cfg=None):
@@ -765,7 +770,12 @@ class SignalRsptMixin:
         rspt_size_multiplier = max(0.0, min(1.0, float(decision_logs.get('size_multiplier', decision_logs.get('risk_multiplier', 1.0)) or 1.0)))
         l2_multiplier = max(0.0, min(1.0, float(l2_gate.get('risk_multiplier', 1.0) or 0.0)))
         qh_multiplier = max(0.0, min(1.0, float(qh_confirmation.get('risk_multiplier', 1.0) or 0.0)))
-        risk_multiplier = market_quality_multiplier * rspt_size_multiplier * l2_multiplier * qh_multiplier
+        risk_multiplier = weakest_link_risk_multiplier((
+            market_quality_multiplier,
+            rspt_size_multiplier,
+            l2_multiplier,
+            qh_multiplier,
+        ))
         risk_budget = resolve_utbreakout_risk_budget(
             balance_for_risk,
             cfg,
@@ -853,20 +863,29 @@ class SignalRsptMixin:
             'fixed_take_profit_enabled': bool(cfg.get('fixed_take_profit_enabled', True)),
             'partial_take_profit_enabled': bool(cfg.get('partial_take_profit_enabled', True)),
             'partial_take_profit_r_multiple': float(rsp_cfg.get('partial_take_profit_r_multiple', 1.50) or 1.50),
-            'partial_take_profit_ratio': float(rsp_cfg.get('partial_take_profit_ratio', 0.25) or 0.25),
+            'partial_take_profit_ratio': float(rsp_cfg.get('partial_take_profit_ratio', 0.20) or 0.20),
             'second_take_profit_enabled': bool(cfg.get('second_take_profit_enabled', True)),
-            'second_take_profit_r_multiple': float(cfg.get('second_take_profit_r_multiple', cfg.get('take_profit_r_multiple', 3.50)) or 3.50),
-            'second_take_profit_ratio': float(cfg.get('second_take_profit_ratio', 0.40) or 0.40),
+            'second_take_profit_r_multiple': float(rsp_cfg.get('second_take_profit_r_multiple', 4.00) or 4.00),
+            'second_take_profit_ratio': float(rsp_cfg.get('second_take_profit_ratio', 0.25) or 0.25),
+            'runner_pct': float(rsp_cfg.get('runner_pct', 0.55) or 0.55),
+            'preserve_runner_qty': True,
             'atr_trailing_enabled': bool(cfg.get('atr_trailing_enabled', True)),
-            'atr_trailing_multiplier': float(rsp_cfg.get('atr_trailing_multiplier', 2.75) or 2.75),
+            'atr_trailing_multiplier': float(rsp_cfg.get('atr_trailing_multiplier', 3.25) or 3.25),
             'atr_trailing_activation_r': float(rsp_cfg.get('atr_trailing_activation_r', 2.00) or 2.00),
+            'runner_exit_enabled': True,
+            'runner_chandelier_enabled': True,
+            'runner_chandelier_lookback': 32,
             'tp1_breakeven_enabled': bool(rsp_cfg.get('tp1_breakeven_enabled', False)),
             'tp1_breakeven_trigger_r': float(cfg.get('tp1_breakeven_trigger_r', cfg.get('partial_take_profit_r_multiple', 1.00)) or 1.00),
             'tp1_breakeven_offset_r': float(cfg.get('tp1_breakeven_offset_r', 0.03) or 0.03),
             'tp1_breakeven_wait_for_partial': bool(cfg.get('tp1_breakeven_wait_for_partial', True)),
             'tp1_breakeven_qty_tolerance': float(cfg.get('tp1_breakeven_qty_tolerance', 0.08) or 0.08),
             'ev_time_stop_enabled': bool(rsp_cfg.get('ev_time_stop_enabled', True)),
-            'ev_time_stop_bars': int(rsp_cfg.get('ev_time_stop_bars', 8) or 8),
+            'ev_time_stop_bars': exit_bars_for_signal_holding_period(
+                rsp_cfg.get('ev_time_stop_bars', 8),
+                signal_timeframe=rsp_cfg.get('signal_tf', '4h'),
+                exit_timeframe=cfg.get('exit_timeframe', cfg.get('entry_timeframe', '15m')),
+            ),
             'ev_time_stop_min_mfe_r': float(rsp_cfg.get('ev_time_stop_min_mfe_r', 0.50) or 0.50),
             'rspt_stop_distance_atr': stop_distance_atr,
             'rspt_structure_stop': structure_stop,

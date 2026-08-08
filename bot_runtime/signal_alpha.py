@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from utbreakout.profit_capture import (
+    QUAD_CONFIRMATION_RISK_MULTIPLIERS,
+    bounded_structure_anchor,
+)
+
 
 class SignalAlphaMixin:
     def _qh_flow_runtime_config(self, cfg=None):
@@ -703,6 +708,13 @@ class SignalAlphaMixin:
             multiplier=risk_multiplier,
             daily_pnl_usdt=daily_pnl,
         )
+        structure_for_risk, structure_distance_atr = bounded_structure_anchor(
+            entry_price=entry_price,
+            atr_value=atr_value,
+            structure_stop=structure_stop,
+            max_distance_atr=vmt_cfg.get('stop_atr_multiplier', 1.60),
+        )
+        status['structure_distance_atr'] = structure_distance_atr
         try:
             plan = calculate_risk_plan(
                 side=side,
@@ -710,9 +722,9 @@ class SignalAlphaMixin:
                 atr_value=atr_value,
                 stop_atr_multiplier=float(vmt_cfg.get('stop_atr_multiplier', 1.60) or 1.60),
                 ut_stop=None,
-                structure_stop=structure_stop,
+                structure_stop=structure_for_risk,
                 structure_buffer_atr=float(vmt_cfg.get('structure_buffer_atr', 0.10) or 0.10),
-                take_profit_r_multiple=float(vmt_cfg.get('take_profit_r_multiple', 3.00) or 3.00),
+                take_profit_r_multiple=float(vmt_cfg.get('take_profit_r_multiple', 4.00) or 4.00),
                 take_profit_front_run_atr=0.0,
                 take_profit_front_run_pct=0.0,
                 min_risk_reward=2.0,
@@ -742,6 +754,7 @@ class SignalAlphaMixin:
             'vmt_score': float(decision.score),
             'vmt_risk_multiplier': risk_multiplier,
             'vmt_metrics': metrics,
+            'structure_reference_stop': structure_stop,
             'entry_chase_atr': chase_atr,
             'l2_gate': dict(l2_gate or {}),
             'l2_state': l2_gate.get('state'),
@@ -750,24 +763,26 @@ class SignalAlphaMixin:
             'atr': atr_value,
             'atr_pct': atr_value / entry_price * 100.0,
             'partial_take_profit_enabled': True,
-            'partial_take_profit_r_multiple': 1.25,
-            'partial_take_profit_ratio': 0.30,
+            'partial_take_profit_r_multiple': 1.50,
+            'partial_take_profit_ratio': 0.20,
             'second_take_profit_enabled': True,
-            'second_take_profit_r_multiple': float(vmt_cfg.get('take_profit_r_multiple', 3.00) or 3.00),
-            'second_take_profit_ratio': 0.35,
-            'runner_pct': 0.35,
+            'second_take_profit_r_multiple': float(vmt_cfg.get('take_profit_r_multiple', 4.00) or 4.00),
+            'second_take_profit_ratio': 0.25,
+            'runner_pct': 0.55,
+            'preserve_runner_qty': True,
             'atr_trailing_enabled': True,
-            'atr_trailing_activation_r': 1.50,
-            'atr_trailing_multiplier': 2.25,
+            'atr_trailing_activation_r': 2.00,
+            'atr_trailing_multiplier': 3.25,
             'runner_exit_enabled': True,
             'runner_chandelier_enabled': True,
+            'runner_chandelier_lookback': 32,
             'tp1_breakeven_enabled': True,
             'tp1_breakeven_wait_for_partial': True,
             'ev_time_stop_enabled': True,
             # Exit monitoring runs on 15m bars; preserve the configured VMT
             # holding period expressed in completed 1h signal bars.
-            'ev_time_stop_bars': int(vmt_cfg.get('time_stop_bars', 24) or 24) * 4,
-            'ev_time_stop_min_mfe_r': 0.50,
+            'ev_time_stop_bars': int(vmt_cfg.get('time_stop_bars', 48) or 48) * 4,
+            'ev_time_stop_min_mfe_r': 0.35,
         })
         self._set_utbot_filtered_breakout_entry_plan(canonical, plan)
         status['entry_plan'] = dict(plan)
@@ -1316,10 +1331,10 @@ class SignalAlphaMixin:
                 ut_stop=None,
                 structure_stop=None,
                 structure_buffer_atr=0.0,
-                take_profit_r_multiple=float(crowd_cfg.get('take_profit_r_multiple', 2.25) or 2.25),
+                take_profit_r_multiple=float(crowd_cfg.get('take_profit_r_multiple', 3.00) or 3.00),
                 take_profit_front_run_atr=0.0,
                 take_profit_front_run_pct=0.0,
-                min_risk_reward=min(2.0, float(crowd_cfg.get('take_profit_r_multiple', 2.25) or 2.25)),
+                min_risk_reward=min(2.0, float(crowd_cfg.get('take_profit_r_multiple', 3.00) or 3.00)),
                 balance_usdt=balance_for_risk,
                 risk_per_trade_percent=risk_budget['risk_per_trade_percent'],
                 max_risk_per_trade_usdt=risk_budget['max_risk_per_trade_usdt'],
@@ -1351,16 +1366,20 @@ class SignalAlphaMixin:
             'atr': atr_value,
             'partial_take_profit_enabled': True,
             'partial_take_profit_r_multiple': 1.25,
-            'partial_take_profit_ratio': 0.30,
+            'partial_take_profit_ratio': 0.20,
             'second_take_profit_enabled': True,
-            'second_take_profit_r_multiple': float(crowd_cfg.get('take_profit_r_multiple', 2.25) or 2.25),
-            'second_take_profit_ratio': 0.50,
+            'second_take_profit_r_multiple': float(crowd_cfg.get('take_profit_r_multiple', 3.00) or 3.00),
+            'second_take_profit_ratio': 0.35,
+            'runner_pct': 0.45,
+            'preserve_runner_qty': True,
             'atr_trailing_enabled': True,
             'atr_trailing_activation_r': 1.50,
-            'atr_trailing_multiplier': 2.25,
+            'atr_trailing_multiplier': 2.75,
+            'runner_exit_enabled': True,
+            'runner_chandelier_enabled': True,
             'ev_time_stop_enabled': True,
-            'ev_time_stop_bars': int(crowd_cfg.get('time_stop_bars', 24) or 24),
-            'ev_time_stop_min_mfe_r': 0.50,
+            'ev_time_stop_bars': int(crowd_cfg.get('time_stop_bars', 32) or 32),
+            'ev_time_stop_min_mfe_r': 0.35,
         })
         self._set_utbot_filtered_breakout_entry_plan(canonical, plan)
         status['entry_plan'] = dict(plan)
@@ -1580,10 +1599,10 @@ class SignalAlphaMixin:
                 ut_stop=None,
                 structure_stop=_safe_float_or_none(metrics.get('structure_stop')),
                 structure_buffer_atr=float(lxr_cfg.get('structure_buffer_atr', 0.15) or 0.15),
-                take_profit_r_multiple=float(lxr_cfg.get('take_profit_r_multiple', 2.60) or 2.60),
+                take_profit_r_multiple=float(lxr_cfg.get('take_profit_r_multiple', 3.20) or 3.20),
                 take_profit_front_run_atr=0.0,
                 take_profit_front_run_pct=0.0,
-                min_risk_reward=min(2.0, float(lxr_cfg.get('take_profit_r_multiple', 2.60) or 2.60)),
+                min_risk_reward=min(2.0, float(lxr_cfg.get('take_profit_r_multiple', 3.20) or 3.20)),
                 balance_usdt=balance_for_risk,
                 risk_per_trade_percent=risk_budget['risk_per_trade_percent'],
                 max_risk_per_trade_usdt=risk_budget['max_risk_per_trade_usdt'],
@@ -1619,21 +1638,22 @@ class SignalAlphaMixin:
             'atr_pct': atr_value / entry_price * 100.0,
             'partial_take_profit_enabled': True,
             'partial_take_profit_r_multiple': 1.0,
-            'partial_take_profit_ratio': 0.25,
+            'partial_take_profit_ratio': 0.20,
             'second_take_profit_enabled': True,
-            'second_take_profit_r_multiple': float(lxr_cfg.get('take_profit_r_multiple', 2.60) or 2.60),
+            'second_take_profit_r_multiple': float(lxr_cfg.get('take_profit_r_multiple', 3.20) or 3.20),
             'second_take_profit_ratio': 0.35,
-            'runner_pct': 0.40,
+            'runner_pct': 0.45,
+            'preserve_runner_qty': True,
             'atr_trailing_enabled': True,
-            'atr_trailing_activation_r': 1.20,
-            'atr_trailing_multiplier': 2.0,
+            'atr_trailing_activation_r': 1.40,
+            'atr_trailing_multiplier': 2.50,
             'runner_exit_enabled': True,
             'runner_chandelier_enabled': True,
             'tp1_breakeven_enabled': True,
             'tp1_breakeven_wait_for_partial': True,
             'ev_time_stop_enabled': True,
-            'ev_time_stop_bars': int(lxr_cfg.get('time_stop_bars', 8) or 8),
-            'ev_time_stop_min_mfe_r': 0.35,
+            'ev_time_stop_bars': int(lxr_cfg.get('time_stop_bars', 12) or 12),
+            'ev_time_stop_min_mfe_r': 0.30,
         })
         self._set_utbot_filtered_breakout_entry_plan(canonical, plan)
         status['entry_plan'] = dict(plan)
@@ -2541,11 +2561,11 @@ class SignalAlphaMixin:
         enabled_set = set(enabled_strategies)
         qh_cfg = self._qh_flow_runtime_config(base_cfg)
         multipliers = {
-            5: max(0.0, min(1.0, float(base_cfg.get('quad_alpha_five_signal_risk_multiplier', 1.0) or 1.0))),
-            4: max(0.0, min(1.0, float(base_cfg.get('quad_alpha_four_signal_risk_multiplier', qh_cfg.get('quad_four_signal_multiplier', 1.0)) or 1.0))),
-            3: max(0.0, min(1.0, float(base_cfg.get('quad_alpha_three_signal_risk_multiplier', qh_cfg.get('quad_three_signal_multiplier', 0.90)) or 0.90))),
-            2: max(0.0, min(1.0, float(base_cfg.get('quad_alpha_two_signal_risk_multiplier', qh_cfg.get('quad_two_signal_multiplier', 0.75)) or 0.75))),
-            1: max(0.0, min(1.0, float(base_cfg.get('quad_alpha_single_signal_risk_multiplier', qh_cfg.get('quad_single_signal_multiplier', 0.45)) or 0.45))),
+            5: max(0.0, min(1.0, float(base_cfg.get('quad_alpha_five_signal_risk_multiplier', QUAD_CONFIRMATION_RISK_MULTIPLIERS[5]) or QUAD_CONFIRMATION_RISK_MULTIPLIERS[5]))),
+            4: max(0.0, min(1.0, float(base_cfg.get('quad_alpha_four_signal_risk_multiplier', qh_cfg.get('quad_four_signal_multiplier', QUAD_CONFIRMATION_RISK_MULTIPLIERS[4])) or QUAD_CONFIRMATION_RISK_MULTIPLIERS[4]))),
+            3: max(0.0, min(1.0, float(base_cfg.get('quad_alpha_three_signal_risk_multiplier', qh_cfg.get('quad_three_signal_multiplier', QUAD_CONFIRMATION_RISK_MULTIPLIERS[3])) or QUAD_CONFIRMATION_RISK_MULTIPLIERS[3]))),
+            2: max(0.0, min(1.0, float(base_cfg.get('quad_alpha_two_signal_risk_multiplier', qh_cfg.get('quad_two_signal_multiplier', QUAD_CONFIRMATION_RISK_MULTIPLIERS[2])) or QUAD_CONFIRMATION_RISK_MULTIPLIERS[2]))),
+            1: max(0.0, min(1.0, float(base_cfg.get('quad_alpha_single_signal_risk_multiplier', qh_cfg.get('quad_single_signal_multiplier', QUAD_CONFIRMATION_RISK_MULTIPLIERS[1])) or QUAD_CONFIRMATION_RISK_MULTIPLIERS[1]))),
         }
         branch_results = []
 

@@ -1,5 +1,3 @@
-import pytest
-
 from emas import (
     SignalEngine,
     _apply_utbreakout_risk_multiplier_floor,
@@ -23,14 +21,14 @@ def test_ev_adaptive_final_overrides_are_authoritative():
         "selected_set_core_filter_hard_block_enabled": False,
     })
 
-    assert cfg["effective_profile_version"] == "ev_adaptive_v3_profit_engine"
+    assert cfg["effective_profile_version"] == "ev_adaptive_v4_profit_capture"
     assert cfg["live_auto_set_whitelist"] == [64]
     assert cfg["active_set_id"] == 64
     assert cfg["selected_set_core_filter_hard_block_enabled"] is False
-    assert cfg["partial_take_profit_r_multiple"] == 1.0
-    assert cfg["partial_take_profit_ratio"] == 0.25
-    assert cfg["second_take_profit_r_multiple"] == 2.4
-    assert cfg["second_take_profit_ratio"] == 0.35
+    assert cfg["partial_take_profit_r_multiple"] == 1.25
+    assert cfg["partial_take_profit_ratio"] == 0.20
+    assert cfg["second_take_profit_r_multiple"] == 3.2
+    assert cfg["second_take_profit_ratio"] == 0.30
     assert cfg["bias_continuation_min_volume_ratio"] == 0.40
     assert cfg["bias_continuation_15m_min_volume_ratio"] == 0.45
     assert cfg["max_daily_trades"] == 5

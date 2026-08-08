@@ -43,7 +43,7 @@ def test_vmt_accepts_persistent_multi_horizon_trend(direction, side):
     assert decision.allowed is True
     assert decision.side == side
     assert decision.score >= default_volatility_managed_trend_config()["score_min"]
-    assert 0.0 < decision.risk_multiplier <= 0.60
+    assert 0.0 < decision.risk_multiplier <= 0.85
     assert decision.metrics["required_votes"] == 2
     assert sum(value == side for value in decision.metrics["horizon_votes"].values()) >= 2
 
@@ -100,15 +100,16 @@ def test_vmt_rejects_immediate_adverse_return_shock_inside_old_trend():
     assert decision.metrics["latest_adverse_return_sigma"] > 1.35
 
 
-def test_vmt_volatility_targeting_can_scale_below_quality_floor():
+def test_vmt_volatility_targeting_remains_the_weakest_risk_budget():
     decision = evaluate_volatility_managed_trend(
         _trend_rows(1),
         _healthy_l2("long"),
-        {"target_hourly_volatility": 0.0001},
+        {"target_hourly_volatility": 0.000001},
     )
 
     assert decision.allowed is True
     assert 0.0 < decision.risk_multiplier < default_volatility_managed_trend_config()["risk_multiplier_floor"]
+    assert decision.risk_multiplier == pytest.approx(decision.metrics["volatility_scale"])
     assert decision.metrics["volatility_scale"] < 1.0
 
 

@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from math import isfinite, sqrt
 
 
-EV_ADAPTIVE_PROFILE_VERSION = "ev_adaptive_v3_profit_engine"
+EV_ADAPTIVE_PROFILE_VERSION = "ev_adaptive_v4_profit_capture"
 
 
 @dataclass(frozen=True)
@@ -560,40 +560,40 @@ def _profile(mode):
     if mode == "STRONG_TREND":
         return EvExitProfile(
             name=mode,
-            tp1_r=1.0,
+            tp1_r=1.25,
             tp1_ratio=0.15,
-            tp2_r=4.20,
-            tp2_ratio=0.30,
-            runner_ratio=0.55,
-            trailing_activation_r=1.50,
-            trailing_atr_multiplier=3.60,
-            single_target_r=2.80,
-            time_stop_bars=12,
+            tp2_r=4.50,
+            tp2_ratio=0.25,
+            runner_ratio=0.60,
+            trailing_activation_r=1.75,
+            trailing_atr_multiplier=3.75,
+            single_target_r=3.00,
+            time_stop_bars=16,
         )
     if mode == "SQUEEZE_BREAKOUT":
         return EvExitProfile(
             name=mode,
             tp1_r=1.20,
             tp1_ratio=0.20,
-            tp2_r=3.20,
-            tp2_ratio=0.35,
-            runner_ratio=0.45,
-            trailing_activation_r=1.40,
-            trailing_atr_multiplier=3.30,
-            single_target_r=2.30,
-            time_stop_bars=9,
+            tp2_r=3.50,
+            tp2_ratio=0.30,
+            runner_ratio=0.50,
+            trailing_activation_r=1.60,
+            trailing_atr_multiplier=3.50,
+            single_target_r=2.50,
+            time_stop_bars=12,
         )
     return EvExitProfile(
         name="TREND",
-        tp1_r=1.0,
-        tp1_ratio=0.25,
-        tp2_r=2.40,
-        tp2_ratio=0.35,
-        runner_ratio=0.40,
-        trailing_activation_r=1.10,
-        trailing_atr_multiplier=3.00,
-        single_target_r=1.90,
-        time_stop_bars=9,
+        tp1_r=1.25,
+        tp1_ratio=0.20,
+        tp2_r=3.20,
+        tp2_ratio=0.30,
+        runner_ratio=0.50,
+        trailing_activation_r=1.50,
+        trailing_atr_multiplier=3.25,
+        single_target_r=2.20,
+        time_stop_bars=12,
     )
 
 

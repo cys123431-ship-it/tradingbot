@@ -51,7 +51,7 @@ def test_defaults_identify_live_lxr_strategy_without_enabling_persisted_runtime(
     assert LXR_STRATEGY == "liquidation_exhaustion_reversal_v1"
     assert cfg["enabled"] is True
     assert cfg["live_enabled"] is False
-    assert cfg["risk_multiplier_cap"] <= 0.45
+    assert cfg["risk_multiplier_cap"] == 0.65
 
 
 def test_accepts_confirmed_long_after_down_shock_and_open_interest_drop():
@@ -62,7 +62,7 @@ def test_accepts_confirmed_long_after_down_shock_and_open_interest_drop():
     )
     assert decision.allowed is True
     assert decision.side == "long"
-    assert 0.25 <= decision.risk_multiplier <= 0.45
+    assert 0.35 <= decision.risk_multiplier <= 0.65
     assert decision.metrics["structure_stop"] == 95.5
     assert "structure reclaimed" in decision.reason
 

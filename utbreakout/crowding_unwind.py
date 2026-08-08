@@ -34,11 +34,11 @@ def default_crowding_unwind_config() -> dict[str, Any]:
         "oi_unwind_confirmation_enabled": True,
         "oi_unwind_min_pct": 0.05,
         "score_min": 62.0,
-        "risk_multiplier_floor": 0.30,
-        "risk_multiplier_cap": 0.65,
+        "risk_multiplier_floor": 0.40,
+        "risk_multiplier_cap": 0.75,
         "stop_atr_multiplier": 1.35,
-        "take_profit_r_multiple": 2.25,
-        "time_stop_bars": 24,
+        "take_profit_r_multiple": 3.00,
+        "time_stop_bars": 32,
         "l2_direction_required": True,
         # L2 remains a liquidity/execution gate.  Directional alpha must come
         # from funding, OI and completed price structure, not one book image.

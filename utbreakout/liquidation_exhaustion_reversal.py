@@ -43,12 +43,12 @@ def default_liquidation_exhaustion_reversal_config() -> dict[str, Any]:
         "taker_support_long_min": 1.02,
         "taker_support_short_max": 0.98,
         "score_min": 68.0,
-        "risk_multiplier_floor": 0.25,
-        "risk_multiplier_cap": 0.45,
+        "risk_multiplier_floor": 0.35,
+        "risk_multiplier_cap": 0.65,
         "structure_buffer_atr": 0.15,
         "stop_atr_multiplier": 1.10,
-        "take_profit_r_multiple": 2.60,
-        "time_stop_bars": 8,
+        "take_profit_r_multiple": 3.20,
+        "time_stop_bars": 12,
         "entry_chase_max_atr": 0.50,
     }
 

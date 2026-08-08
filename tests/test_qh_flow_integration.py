@@ -235,8 +235,8 @@ def test_lxr_live_signal_builds_structure_anchored_plan(monkeypatch):
     assert captured["strategy"] == emas.LXR_STRATEGY
     assert captured["structure_stop"] == pytest.approx(96.0)
     assert captured["hard_stop_loss"] < 96.0
-    assert captured["ev_time_stop_bars"] == 8
-    assert captured["second_take_profit_r_multiple"] == pytest.approx(2.6)
+    assert captured["ev_time_stop_bars"] == 12
+    assert captured["second_take_profit_r_multiple"] == pytest.approx(3.2)
 
 
 def test_vmt_live_signal_builds_volatility_managed_runner_plan(monkeypatch):
@@ -320,9 +320,9 @@ def test_vmt_live_signal_builds_volatility_managed_runner_plan(monkeypatch):
     assert status["accepted_code"] == "ACCEPTED_ENTRY"
     assert captured["strategy"] == emas.VOLATILITY_MANAGED_TREND_STRATEGY
     assert captured["structure_stop"] == pytest.approx(97.0)
-    assert captured["runner_pct"] == pytest.approx(0.35)
-    assert captured["second_take_profit_r_multiple"] == pytest.approx(3.0)
-    assert captured["ev_time_stop_bars"] == 96
+    assert captured["runner_pct"] == pytest.approx(0.55)
+    assert captured["second_take_profit_r_multiple"] == pytest.approx(4.0)
+    assert captured["ev_time_stop_bars"] == 192
 
 
 def test_crowding_signal_cannot_bypass_daily_loss_limit(monkeypatch):
