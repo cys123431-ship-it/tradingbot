@@ -1354,6 +1354,11 @@ def enforce_live_real_order_caps(plan, context, cfg):
     cfg = cfg if isinstance(cfg, dict) else {}
     if _normalize_live_real_stage(cfg.get("live_activation_stage")) != "LIVE_REAL_SMALL_CAP":
         return plan
+    if bool(cfg.get("small_account_full_margin_applied", False)):
+        # The operator explicitly requested all available USDT as isolated
+        # margin for accounts at or below the configured threshold.  Daily and
+        # weekly loss gates are enforced separately and remain active.
+        return plan
     limits = apply_live_small_cap_limits_to_config(cfg, cfg.get("account_reference_equity_usdt"))
     entry_ref = float(getattr(plan, "entry_price", None) or getattr(context, "close", 0.0) or cfg.get("last_price") or 0.0)
     if entry_ref <= 0:
@@ -1385,6 +1390,8 @@ def enforce_live_real_order_caps(plan, context, cfg):
 def validate_live_real_order_caps_after_rounding(plan, cfg):
     cfg = cfg if isinstance(cfg, dict) else {}
     if _normalize_live_real_stage(cfg.get("live_activation_stage")) != "LIVE_REAL_SMALL_CAP":
+        return True
+    if bool(cfg.get("small_account_full_margin_applied", False)):
         return True
     limits = apply_live_small_cap_limits_to_config(cfg, cfg.get("account_reference_equity_usdt"))
     entry_ref = _live_real_entry_reference(plan, cfg)

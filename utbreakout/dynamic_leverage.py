@@ -18,6 +18,9 @@ def default_dynamic_leverage_config() -> dict[str, Any]:
         "min_leverage": 2,
         "base_leverage": 4,
         "max_leverage": 10,
+        "small_account_full_margin_enabled": True,
+        "small_account_equity_threshold_usdt": 1_000.0,
+        "small_account_min_leverage": 5,
         "normal_atr_pct_min": 0.25,
         "normal_atr_pct_max": 3.50,
         "high_volatility_atr_pct": 4.50,
@@ -96,7 +99,17 @@ def normalize_dynamic_leverage_config(
         else str(adaptive_enabled).strip().lower()
         in {"1", "true", "yes", "on", "enabled"}
     )
+    full_margin_enabled = cfg.get("small_account_full_margin_enabled", True)
+    cfg["small_account_full_margin_enabled"] = (
+        full_margin_enabled
+        if isinstance(full_margin_enabled, bool)
+        else str(full_margin_enabled).strip().lower()
+        in {"1", "true", "yes", "on", "enabled"}
+    )
     cfg["min_leverage"] = int(_bounded(cfg.get("min_leverage"), 1, 10, 2))
+    cfg["small_account_min_leverage"] = int(
+        _bounded(cfg.get("small_account_min_leverage"), 1, 10, 5)
+    )
     cfg["max_leverage"] = int(
         _bounded(cfg.get("max_leverage"), cfg["min_leverage"], 10, 10)
     )
@@ -143,6 +156,7 @@ def normalize_dynamic_leverage_config(
         ("adaptive_trend_strong_risk_quality_min", 0.0, 1.0),
         ("adaptive_trend_opportunity_risk_quality_min", 0.0, 1.0),
         ("adaptive_trend_stop_buffer_multiple", 1.5, 6.0),
+        ("small_account_equity_threshold_usdt", 0.0, 1_000_000.0),
     ):
         default = float(default_dynamic_leverage_config()[key])
         cfg[key] = _bounded(cfg.get(key), lower, upper, default)
@@ -236,6 +250,37 @@ def normalize_dynamic_leverage_config(
         monitor_timeframe = "15m"
     cfg["opportunity_monitor_timeframe"] = monitor_timeframe
     return cfg
+
+
+def resolve_small_account_full_margin(
+    config: Mapping[str, Any] | None = None,
+    *,
+    account_equity: float | None,
+    free_balance: float | None,
+) -> dict[str, Any]:
+    """Resolve the explicit <=$1,000 full-margin futures sizing rule."""
+
+    cfg = normalize_dynamic_leverage_config(config)
+    equity = max(0.0, float(_finite(account_equity, 0.0)))
+    free = max(0.0, float(_finite(free_balance, 0.0)))
+    threshold = max(
+        0.0,
+        float(cfg["small_account_equity_threshold_usdt"]),
+    )
+    active = bool(
+        cfg["small_account_full_margin_enabled"]
+        and equity > 0
+        and equity <= threshold
+        and free > 0
+    )
+    return {
+        "active": active,
+        "account_equity": equity,
+        "free_balance": free,
+        "equity_threshold_usdt": threshold,
+        "minimum_leverage": int(cfg["small_account_min_leverage"]),
+        "margin_utilization": 1.0 if active else 0.0,
+    }
 
 
 def _score_value(value: Any) -> float | None:
@@ -721,6 +766,7 @@ def apply_dynamic_leverage_to_plan(
     config: Mapping[str, Any] | None = None,
     *,
     free_balance: float | None = None,
+    account_equity: float | None = None,
     safety_buffer: float = 0.98,
 ) -> dict[str, Any]:
     updated = dict(plan or {})
@@ -738,18 +784,66 @@ def apply_dynamic_leverage_to_plan(
             updated[field] = updated.get(original_field)
     decision = select_dynamic_leverage(updated, cfg)
     leverage = int(decision.leverage)
+    small_account_policy = resolve_small_account_full_margin(
+        cfg,
+        account_equity=account_equity,
+        free_balance=free_balance,
+    )
+    if small_account_policy["active"]:
+        leverage = max(
+            leverage,
+            int(small_account_policy["minimum_leverage"]),
+        )
+        leverage = min(
+            leverage,
+            max(
+                int(cfg["max_leverage"]),
+                int(small_account_policy["minimum_leverage"]),
+            ),
+        )
+    decision_tier = decision.tier
+    decision_reason = decision.reason
+    if small_account_policy["active"]:
+        decision_tier = f"{decision_tier}+small_account_full_margin"
+        decision_reason = (
+            f"{decision_reason}; small account full margin: "
+            f"equity={small_account_policy['account_equity']:.2f} "
+            f"<= {small_account_policy['equity_threshold_usdt']:.2f}, "
+            f"free={small_account_policy['free_balance']:.2f}, "
+            f"minimum={small_account_policy['minimum_leverage']}x"
+        )
+    decision_payload = decision.as_dict()
+    decision_payload.update(
+        {
+            "leverage": leverage,
+            "tier": decision_tier,
+            "reason": decision_reason,
+        }
+    )
     updated.update(
         {
             "leverage": leverage,
             "dynamic_leverage_applied": bool(cfg["enabled"]),
-            "dynamic_leverage_tier": decision.tier,
+            "dynamic_leverage_tier": decision_tier,
             "dynamic_leverage_score": float(decision.opportunity_score),
-            "dynamic_leverage_reason": decision.reason,
-            "dynamic_leverage_decision": decision.as_dict(),
+            "dynamic_leverage_reason": decision_reason,
+            "dynamic_leverage_decision": decision_payload,
+            "small_account_full_margin_applied": bool(
+                small_account_policy["active"]
+            ),
+            "small_account_equity_usdt": float(
+                small_account_policy["account_equity"]
+            ),
+            "small_account_equity_threshold_usdt": float(
+                small_account_policy["equity_threshold_usdt"]
+            ),
+            "small_account_min_leverage": int(
+                small_account_policy["minimum_leverage"]
+            ),
         }
     )
 
-    if not cfg["enabled"]:
+    if not cfg["enabled"] and not small_account_policy["active"]:
         current_notional = max(
             0.0, float(_finite(updated.get("planned_notional"), 0.0))
         )
@@ -773,10 +867,19 @@ def apply_dynamic_leverage_to_plan(
     )
     free = _finite(free_balance)
     if free is not None:
-        margin_cap_notional = (
-            max(0.0, free) * leverage * max(0.0, min(1.0, safety_buffer))
+        effective_safety_buffer = (
+            1.0
+            if small_account_policy["active"]
+            else max(0.0, min(1.0, safety_buffer))
         )
-        target_notional = min(desired_notional, margin_cap_notional)
+        margin_cap_notional = (
+            max(0.0, free) * leverage * effective_safety_buffer
+        )
+        target_notional = (
+            margin_cap_notional
+            if small_account_policy["active"]
+            else min(desired_notional, margin_cap_notional)
+        )
         entry = max(0.0, float(_finite(updated.get("entry_price"), 0.0)))
         risk_distance = max(0.0, float(_finite(updated.get("risk_distance"), 0.0)))
         rr = max(
@@ -807,6 +910,14 @@ def apply_dynamic_leverage_to_plan(
                     "position_cap_max_notional": margin_cap_notional,
                     "dynamic_leverage_restored_notional": max(
                         0.0, target_notional - current_notional
+                    ),
+                    "small_account_target_margin_usdt": (
+                        max(0.0, free)
+                        if small_account_policy["active"]
+                        else 0.0
+                    ),
+                    "small_account_margin_utilization": (
+                        1.0 if small_account_policy["active"] else 0.0
                     ),
                 }
             )

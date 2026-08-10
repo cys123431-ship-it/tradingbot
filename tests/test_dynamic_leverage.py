@@ -1,6 +1,9 @@
+import pytest
+
 from utbreakout.dynamic_leverage import (
     apply_dynamic_leverage_to_plan,
     normalize_dynamic_leverage_config,
+    resolve_small_account_full_margin,
     select_dynamic_leverage,
 )
 
@@ -177,6 +180,68 @@ def test_exchange_margin_cap_still_limits_high_leverage_plan():
     assert updated["planned_notional"] == 1_470.0
     assert updated["position_cap_applied"] is True
     assert updated["risk_usdt"] == 14.70
+
+
+def test_small_account_uses_all_available_margin_and_at_least_five_x():
+    updated = apply_dynamic_leverage_to_plan(
+        _plan(
+            atr_pct=6.0,
+            qty=1.0,
+            planned_notional=100.0,
+            planned_margin=50.0,
+            risk_usdt=1.0,
+        ),
+        free_balance=800.0,
+        account_equity=900.0,
+    )
+
+    assert updated["small_account_full_margin_applied"] is True
+    assert updated["leverage"] >= 5
+    assert updated["planned_margin"] == 800.0
+    assert updated["planned_notional"] == pytest.approx(
+        800.0 * updated["leverage"]
+    )
+    assert updated["qty"] == pytest.approx(
+        updated["planned_notional"] / updated["entry_price"]
+    )
+
+
+def test_small_account_threshold_is_inclusive_but_larger_accounts_are_unchanged():
+    at_threshold = resolve_small_account_full_margin(
+        account_equity=1_000.0,
+        free_balance=990.0,
+    )
+    above_threshold = apply_dynamic_leverage_to_plan(
+        _plan(atr_pct=6.0),
+        free_balance=990.0,
+        account_equity=1_000.01,
+    )
+
+    assert at_threshold["active"] is True
+    assert at_threshold["minimum_leverage"] == 5
+    assert above_threshold["small_account_full_margin_applied"] is False
+    assert above_threshold["leverage"] == 4
+    assert above_threshold["planned_notional"] == 1_000.0
+
+
+def test_small_account_policy_can_be_disabled_without_changing_operator_maximum():
+    cfg = normalize_dynamic_leverage_config(
+        {
+            "small_account_full_margin_enabled": False,
+            "small_account_min_leverage": 5,
+            "max_leverage": 3,
+        }
+    )
+    updated = apply_dynamic_leverage_to_plan(
+        _plan(atr_pct=6.0),
+        cfg,
+        free_balance=100.0,
+        account_equity=100.0,
+    )
+
+    assert cfg["max_leverage"] == 3
+    assert updated["small_account_full_margin_applied"] is False
+    assert updated["leverage"] <= 3
 
 
 def test_operator_maximum_caps_opportunity_without_making_it_fixed():

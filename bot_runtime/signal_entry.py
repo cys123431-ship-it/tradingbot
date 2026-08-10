@@ -27,6 +27,12 @@ _DURABLE_ENTRY_PLAN_KEYS = (
     'dynamic_leverage_score',
     'dynamic_leverage_reason',
     'dynamic_leverage_monitor_timeframe',
+    'small_account_full_margin_applied',
+    'small_account_equity_usdt',
+    'small_account_equity_threshold_usdt',
+    'small_account_min_leverage',
+    'small_account_target_margin_usdt',
+    'small_account_margin_utilization',
     'opportunity_risk_multiplier',
     'opportunity_risk_tier',
     'opportunity_risk_reason',
@@ -635,7 +641,7 @@ class SignalEntryMixin:
             bounded_risk_pct = normalize_risk_percent(cfg)
             risk_pct = bounded_risk_pct / 100.0
 
-            _, free, _ = await self.get_balance_info()
+            account_equity, free, _ = await self.get_balance_info()
             if active_strategy in UTBREAKOUT_STRATEGIES:
                 self._utbreakout_trace_event(
                     symbol,
@@ -755,8 +761,11 @@ class SignalEntryMixin:
                         filtered_breakout_plan,
                         (cfg or {}).get('dynamic_leverage'),
                         free_balance=free,
+                        account_equity=account_equity,
                         safety_buffer=safety_buffer,
                     )
+                    if filtered_breakout_plan.get('small_account_full_margin_applied'):
+                        safety_buffer = 1.0
                     lev = int(max(
                         1.0,
                         float(filtered_breakout_plan.get('leverage', lev) or lev),
@@ -1129,6 +1138,33 @@ class SignalEntryMixin:
                 )
                 return
             selected_leverage = int(liquidation_preflight.get('selected_leverage') or lev)
+            minimum_required_leverage = int(
+                filtered_breakout_plan.get('small_account_min_leverage', 1)
+                if isinstance(filtered_breakout_plan, dict)
+                and filtered_breakout_plan.get('small_account_full_margin_applied')
+                else 1
+            )
+            if selected_leverage < minimum_required_leverage:
+                reason = (
+                    f'liquidation-safe leverage {selected_leverage}x is below '
+                    f'required minimum {minimum_required_leverage}x'
+                )
+                _record_filtered_breakout_entry_block(
+                    'ENTRY_BLOCKED_SMALL_ACCOUNT_MIN_LEVERAGE',
+                    reason,
+                    {
+                        'selected_leverage': selected_leverage,
+                        'minimum_required_leverage': minimum_required_leverage,
+                        'account_equity': account_equity,
+                        'free_balance': free,
+                    },
+                )
+                self._clear_utbot_filtered_breakout_entry_plan(symbol)
+                await self.ctrl.notify(
+                    f'[진입 거부] 소액계좌 최소 {minimum_required_leverage}배와 '
+                    f'청산 안전 조건이 충돌합니다: {symbol} / {reason}'
+                )
+                return
             if selected_leverage < lev:
                 lev = selected_leverage
                 max_notional = free * lev * safety_buffer

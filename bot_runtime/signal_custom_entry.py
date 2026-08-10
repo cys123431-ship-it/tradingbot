@@ -9,6 +9,7 @@ import uuid
 from types import SimpleNamespace
 
 from utbreakout.engine_router import LadderTP, TradeDecision
+from utbreakout.dynamic_leverage import resolve_small_account_full_margin
 
 from .live_context import _closed_live_ohlcv_rows
 from .live_risk import (
@@ -95,6 +96,20 @@ class SignalCustomEntryMixin:
             raise InvalidOrderPlan("custom entry quantity is unavailable")
         ratio = min(1.0, new_qty / old_qty)
         plan.qty = old_qty * ratio
+        for tp in list(getattr(plan, "tp_orders", []) or []):
+            tp.qty = float(tp.qty) * ratio
+        return plan
+
+    @staticmethod
+    def _resize_user_custom_plan_qty(plan, new_qty):
+        """Resize a custom plan in either direction while preserving TP ratios."""
+
+        old_qty = float(getattr(plan, "qty", 0.0) or 0.0)
+        new_qty = float(new_qty or 0.0)
+        if old_qty <= 0 or new_qty <= 0:
+            raise InvalidOrderPlan("custom entry quantity is unavailable")
+        ratio = new_qty / old_qty
+        plan.qty = new_qty
         for tp in list(getattr(plan, "tp_orders", []) or []):
             tp.qty = float(tp.qty) * ratio
         return plan
@@ -209,6 +224,28 @@ class SignalCustomEntryMixin:
             account_equity = float(total_balance or 0.0)
         if account_equity <= 0 or float(free_balance or 0.0) <= 0:
             raise TradingSafetyError("real futures balance or available margin is zero")
+
+        small_account_policy = resolve_small_account_full_margin(
+            cfg.get("dynamic_leverage"),
+            account_equity=account_equity,
+            free_balance=free_balance,
+        )
+        if small_account_policy["active"]:
+            # USER_CUSTOM has no strategy-quality score for choosing a higher
+            # tier, so use the requested minimum and let liquidation safety
+            # either approve 5x or block the entry.
+            leverage = int(small_account_policy["minimum_leverage"])
+            cfg["leverage"] = leverage
+            cfg["max_leverage"] = max(
+                leverage,
+                int(float(cfg.get("max_leverage", leverage) or leverage)),
+            )
+            cfg["small_account_full_margin_applied"] = True
+            cfg["small_account_equity_usdt"] = float(account_equity)
+            cfg["small_account_equity_threshold_usdt"] = float(
+                small_account_policy["equity_threshold_usdt"]
+            )
+            cfg["small_account_min_leverage"] = leverage
 
         settings = self.get_user_custom_entry_settings()
         if bool(settings.get("require_quote_volume_gate", True)):
@@ -338,19 +375,26 @@ class SignalCustomEntryMixin:
         )
         if l2_risk_multiplier <= 0:
             raise TradingSafetyError("orderbook risk multiplier blocks entry")
-        if l2_risk_multiplier < 1.0:
+        if l2_risk_multiplier < 1.0 and not small_account_policy["active"]:
             plan = self._scale_user_custom_plan_qty(
                 plan,
                 float(plan.qty) * l2_risk_multiplier,
             )
 
         leverage = max(1.0, float(cfg.get("leverage", 1.0) or 1.0))
-        margin_notional_cap = float(free_balance) * leverage * 0.98
+        margin_notional_cap = float(free_balance) * leverage * (
+            1.0 if small_account_policy["active"] else 0.98
+        )
         configured_notional_cap = float(cfg.get("max_real_position_notional_usdt", 0.0) or 0.0)
-        if configured_notional_cap > 0:
+        if configured_notional_cap > 0 and not small_account_policy["active"]:
             margin_notional_cap = min(margin_notional_cap, configured_notional_cap)
         planned_notional = float(plan.qty) * price
-        if margin_notional_cap > 0 and planned_notional > margin_notional_cap:
+        if small_account_policy["active"]:
+            plan = self._resize_user_custom_plan_qty(
+                plan,
+                margin_notional_cap / price,
+            )
+        elif margin_notional_cap > 0 and planned_notional > margin_notional_cap:
             plan = self._scale_user_custom_plan_qty(plan, margin_notional_cap / price)
 
         cfg["last_price"] = price
@@ -374,6 +418,15 @@ class SignalCustomEntryMixin:
         plan.account_equity_usdt = account_equity
         plan.available_margin_usdt = float(free_balance)
         plan.mmr_pct = float(mmr or 0.0)
+        plan.small_account_full_margin_applied = bool(
+            small_account_policy["active"]
+        )
+        plan.small_account_min_leverage = int(
+            small_account_policy["minimum_leverage"]
+        )
+        plan.small_account_target_margin_usdt = (
+            float(free_balance) if small_account_policy["active"] else 0.0
+        )
         return {
             "symbol": symbol,
             "side": normalized_side,

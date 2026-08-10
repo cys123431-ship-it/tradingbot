@@ -188,7 +188,7 @@ def test_user_custom_parser_requires_an_explicit_entry_phrase():
     assert parse_user_custom_entry_text("ETHUSDT short limit 진입") is None
 
 
-def test_custom_plan_uses_risk_sizing_sl_tp_and_ignores_trade_count_cap():
+def test_small_account_custom_plan_uses_all_free_margin_at_five_x():
     engine = _CustomEngineStub()
     prepared = asyncio.run(engine.prepare_user_custom_entry("KORUUSDT", "short"))
 
@@ -197,7 +197,11 @@ def test_custom_plan_uses_risk_sizing_sl_tp_and_ignores_trade_count_cap():
     assert plan.entry_type == "MARKET"
     assert plan.entry_price == pytest.approx(100.0)
     assert plan.initial_sl_price == pytest.approx(103.0)
-    assert plan.qty == pytest.approx((100.0 * 0.005) / 3.0)
+    assert prepared["cfg"]["leverage"] == 5
+    assert plan.qty == pytest.approx(5.0)
+    assert plan.qty * plan.entry_price == pytest.approx(100.0 * 5.0)
+    assert plan.small_account_full_margin_applied is True
+    assert plan.small_account_target_margin_usdt == pytest.approx(100.0)
     assert len(plan.tp_orders) == 2
     assert plan.tp_orders[0].price == pytest.approx(97.0)
     assert plan.tp_orders[1].price == pytest.approx(89.5)
@@ -243,14 +247,27 @@ def test_custom_flat_guard_rejects_any_existing_global_position():
         asyncio.run(SignalCustomEntryMixin._assert_user_custom_flat_state(engine))
 
 
-def test_custom_plan_reduces_size_when_orderbook_risk_is_mixed():
+def test_small_account_custom_plan_keeps_full_margin_when_orderbook_is_acceptable():
     engine = _CustomEngineStub()
     engine._evaluate_shared_l2_gate.return_value.update(
         {"state": "deep_balanced", "risk_multiplier": 0.5}
     )
     prepared = asyncio.run(engine.prepare_user_custom_entry("KORUUSDT", "long"))
-    assert prepared["plan"].qty == pytest.approx(((100.0 * 0.005) / 3.0) * 0.5)
+    assert prepared["plan"].qty == pytest.approx(5.0)
     assert prepared["plan"].l2_risk_multiplier == pytest.approx(0.5)
+
+
+def test_large_account_custom_plan_still_reduces_size_for_orderbook_risk():
+    engine = _CustomEngineStub()
+    engine.get_balance_info = AsyncMock(return_value=(2_000.0, 2_000.0, 0.0))
+    engine._evaluate_shared_l2_gate.return_value.update(
+        {"state": "deep_balanced", "risk_multiplier": 0.5}
+    )
+
+    prepared = asyncio.run(engine.prepare_user_custom_entry("KORUUSDT", "long"))
+
+    assert prepared["plan"].small_account_full_margin_applied is False
+    assert prepared["plan"].qty == pytest.approx(((2_000.0 * 0.005) / 3.0) * 0.5)
 
 
 def test_custom_execution_records_strategy_for_monthly_report():

@@ -93,7 +93,21 @@ async def execute_live_order_plan(self, plan, cfg):
     )
     self._validate_live_order_plan_for_exchange(plan, cfg)
 
-    if _normalize_live_real_stage(cfg.get("live_activation_stage")) == "LIVE_REAL_SMALL_CAP":
+    small_account_full_margin = bool(
+        cfg.get("small_account_full_margin_applied", False)
+    )
+    small_account_min_leverage = int(
+        max(1.0, float(cfg.get("small_account_min_leverage", 5) or 5))
+    )
+    if small_account_full_margin:
+        lev = int(
+            max(
+                small_account_min_leverage,
+                float(cfg.get("leverage", small_account_min_leverage)
+                      or small_account_min_leverage),
+            )
+        )
+    elif _normalize_live_real_stage(cfg.get("live_activation_stage")) == "LIVE_REAL_SMALL_CAP":
         lev = int(max(1.0, min(float(cfg.get("leverage", 5) or 5), float(cfg.get("max_leverage", 5) or 5), 5.0)))
     else:
         lev = int(max(1.0, float(cfg.get("leverage", 5))))
@@ -117,6 +131,19 @@ async def execute_live_order_plan(self, plan, cfg):
         )
         return {'status': 'ENTRY_REJECTED_LIQUIDATION_CONFLICT', 'error': reason}
     selected_leverage = int(liquidation_preflight.get('selected_leverage') or lev)
+    if small_account_full_margin and selected_leverage < small_account_min_leverage:
+        reason = (
+            f"liquidation-safe leverage {selected_leverage}x is below required "
+            f"minimum {small_account_min_leverage}x"
+        )
+        await self.ctrl.notify(
+            f"[진입 거부] 소액계좌 최소 {small_account_min_leverage}배와 "
+            f"청산 안전 조건이 충돌합니다: {plan.symbol} / {reason}"
+        )
+        return {
+            'status': 'ENTRY_REJECTED_SMALL_ACCOUNT_MIN_LEVERAGE',
+            'error': reason,
+        }
     if selected_leverage < lev:
         lev = selected_leverage
         cfg['leverage'] = lev

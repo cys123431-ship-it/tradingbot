@@ -238,6 +238,18 @@ def test_live_real_order_caps_scale_qty_and_tp_quantities():
     assert emas.validate_live_real_order_caps_after_rounding(capped, cfg) is True
 
 
+def test_explicit_small_account_full_margin_rule_bypasses_per_trade_small_cap():
+    cfg = emas.enforce_activation_stage(live_cfg())
+    cfg["small_account_full_margin_applied"] = True
+    plan = make_plan(qty=3.1, entry=100.0, sl=95.0)
+    context = SimpleNamespace(close=100.0)
+
+    unchanged = emas.enforce_live_real_order_caps(plan, context, cfg)
+
+    assert unchanged.qty == pytest.approx(3.1)
+    assert emas.validate_live_real_order_caps_after_rounding(unchanged, cfg) is True
+
+
 def test_live_real_validation_rejects_rounding_and_min_notional_over_cap():
     cfg = emas.enforce_activation_stage(live_cfg())
     with pytest.raises(emas.InvalidOrderPlan):
