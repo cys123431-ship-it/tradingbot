@@ -246,6 +246,7 @@ class SignalCustomEntryMixin:
                 small_account_policy["equity_threshold_usdt"]
             )
             cfg["small_account_min_leverage"] = leverage
+            cfg["small_account_target_margin_usdt"] = float(free_balance)
 
         settings = self.get_user_custom_entry_settings()
         if bool(settings.get("require_quote_volume_gate", True)):

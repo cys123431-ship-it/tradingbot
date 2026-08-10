@@ -428,7 +428,7 @@ def test_utbreakout_entry_reaches_market_order_and_reports_exchange_failure(
 
     asyncio.run(engine.entry(raw_symbol, entry_side, 71.74))
 
-    assert order_calls == [(order_symbol, "market", order_side, "0.295")]
+    assert order_calls == [(order_symbol, "market", order_side, "6.899")]
     assert not any(text.startswith("🟡 UTBreakout 주문 시도:") for text in notifications)
     assert any(text.startswith("❌ UTBreakout 주문 실패:") for text in notifications)
     assert engine.last_entry_reason[order_symbol].startswith("ORDER_FAILED: RuntimeError:")

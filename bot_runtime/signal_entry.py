@@ -917,7 +917,20 @@ class SignalEntryMixin:
                     f"가능 {target_notional:.2f} USDT (증거금/레버리지 상한)"
                 )
 
-            qty = self.safe_amount(symbol, target_notional / price)
+            amount_capper = getattr(
+                self,
+                'safe_amount_not_exceeding_notional',
+                None,
+            )
+            if callable(amount_capper):
+                qty = amount_capper(
+                    symbol,
+                    target_notional / price,
+                    price,
+                    target_notional,
+                )
+            else:
+                qty = self.safe_amount(symbol, target_notional / price)
             try:
                 qty_notional = float(qty) * float(price)
             except (TypeError, ValueError):

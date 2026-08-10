@@ -243,6 +243,44 @@ class BaseEngine:
             logger.error(f"Amount precision error: {e}")
             return str(round(amount, 6))
 
+    def safe_amount_not_exceeding_notional(
+        self,
+        symbol,
+        amount,
+        price,
+        max_notional,
+    ):
+        """Apply exchange precision without ever rounding above a notional cap."""
+
+        price = float(price or 0.0)
+        max_notional = float(max_notional or 0.0)
+        if price <= 0 or max_notional <= 0:
+            return self.safe_amount(symbol, amount)
+
+        raw_limit = min(float(amount or 0.0), max_notional / price)
+        candidate = self.safe_amount(symbol, raw_limit)
+        tolerance = max(1e-12, max_notional * 1e-12)
+        try:
+            if float(candidate) * price <= max_notional + tolerance:
+                return candidate
+        except (TypeError, ValueError):
+            return candidate
+
+        # A few exchange adapters (and lightweight test doubles) round to the
+        # nearest step instead of truncating.  Walk down until the normalized
+        # quantity is guaranteed not to require more margin than is available.
+        decrement = max(abs(raw_limit) * 1e-12, 1e-12)
+        for _ in range(16):
+            requested = max(0.0, raw_limit - decrement)
+            candidate = self.safe_amount(symbol, requested)
+            try:
+                if float(candidate) * price <= max_notional + tolerance:
+                    return candidate
+            except (TypeError, ValueError):
+                return candidate
+            decrement *= 10.0
+        return "0"
+
     def safe_price(self, symbol, price):
         try:
             return self.exchange.price_to_precision(symbol, price)

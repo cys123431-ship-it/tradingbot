@@ -399,6 +399,34 @@ def _collapse_state_tp_plan_for_exchange(self, symbol, pos, state):
 
 def _normalize_live_order_plan_for_exchange(self, plan, cfg):
     plan.qty = float(self.safe_amount(plan.symbol, plan.qty))
+    if bool(getattr(plan, "small_account_full_margin_applied", False)):
+        entry_ref = float(
+            getattr(plan, "entry_price", None)
+            or (cfg or {}).get("last_price")
+            or 0.0
+        )
+        leverage = max(1.0, float((cfg or {}).get("leverage", 1.0) or 1.0))
+        target_margin = max(
+            0.0,
+            float(
+                getattr(plan, "small_account_target_margin_usdt", 0.0)
+                or (cfg or {}).get("small_account_target_margin_usdt", 0.0)
+                or 0.0
+            ),
+        )
+        if entry_ref > 0 and target_margin > 0:
+            amount_capper = getattr(
+                self,
+                "safe_amount_not_exceeding_notional",
+                None,
+            )
+            if callable(amount_capper):
+                plan.qty = float(amount_capper(
+                    plan.symbol,
+                    plan.qty,
+                    entry_ref,
+                    target_margin * leverage,
+                ))
     plan.initial_sl_price = float(self.safe_price(plan.symbol, plan.initial_sl_price))
 
     normalized_tps = []
