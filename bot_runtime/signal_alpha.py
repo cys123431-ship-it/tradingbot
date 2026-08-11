@@ -877,44 +877,78 @@ class SignalAlphaMixin:
             )
 
         timeframe = str(trend_cfg.get('timeframe', '1h') or '1h')
-        try:
-            ohlcv = await asyncio.to_thread(
-                self.market_data_exchange.fetch_ohlcv,
-                canonical,
-                timeframe,
-                limit=max(220, int(trend_cfg.get('fetch_limit', 360) or 360)),
-            )
-            rows = self._relative_strength_pullback_rows_from_ohlcv(ohlcv)
-            rows = completed_candle_rows(
-                rows,
-                timeframe,
-                {'exclude_incomplete_live_candle': True},
-            )
-        except Exception as exc:
-            return _finish(
-                None,
-                f'Adaptive Breakout Trend OHLCV unavailable: {exc}',
-                'REJECTED_ADAPTIVE_TREND_DATA',
-            )
-
-        base_l2 = await self._evaluate_shared_l2_gate(
-            canonical,
-            cfg,
-            force_refresh=force_reprocess,
+        status['entry_timeframe'] = timeframe
+        timeframe_ms = self._timeframe_to_ms(timeframe) or (60 * 60 * 1000)
+        candle_bucket = int(time.time() * 1000.0) // int(timeframe_ms)
+        config_signature = tuple(
+            sorted((str(key), repr(value)) for key, value in trend_cfg.items())
         )
-        preliminary = evaluate_adaptive_breakout_trend(rows, base_l2, trend_cfg)
+        if not isinstance(
+            getattr(self, 'adaptive_breakout_trend_candle_cache', None),
+            dict,
+        ):
+            self.adaptive_breakout_trend_candle_cache = {}
+        if (
+            canonical not in self.adaptive_breakout_trend_candle_cache
+            and len(self.adaptive_breakout_trend_candle_cache) >= 96
+        ):
+            oldest_symbol = next(iter(self.adaptive_breakout_trend_candle_cache), None)
+            if oldest_symbol is not None:
+                self.adaptive_breakout_trend_candle_cache.pop(oldest_symbol, None)
+        cached_candle = self.adaptive_breakout_trend_candle_cache.get(canonical)
+        cache_hit = bool(
+            isinstance(cached_candle, dict)
+            and cached_candle.get('timeframe') == timeframe
+            and cached_candle.get('candle_bucket') == candle_bucket
+            and cached_candle.get('config_signature') == config_signature
+            and isinstance(cached_candle.get('rows'), list)
+            and cached_candle.get('preliminary') is not None
+        )
+        if cache_hit:
+            rows = list(cached_candle['rows'])
+            preliminary = cached_candle['preliminary']
+        else:
+            try:
+                ohlcv = await asyncio.to_thread(
+                    self.market_data_exchange.fetch_ohlcv,
+                    canonical,
+                    timeframe,
+                    limit=max(220, int(trend_cfg.get('fetch_limit', 360) or 360)),
+                )
+                rows = self._relative_strength_pullback_rows_from_ohlcv(ohlcv)
+                rows = completed_candle_rows(
+                    rows,
+                    timeframe,
+                    {'exclude_incomplete_live_candle': True},
+                )
+            except Exception as exc:
+                return _finish(
+                    None,
+                    f'Adaptive Breakout Trend OHLCV unavailable: {exc}',
+                    'REJECTED_ADAPTIVE_TREND_DATA',
+                )
+            preliminary = evaluate_adaptive_breakout_trend(rows, None, trend_cfg)
+            self.adaptive_breakout_trend_candle_cache[canonical] = {
+                'timeframe': timeframe,
+                'candle_bucket': candle_bucket,
+                'config_signature': config_signature,
+                'rows': list(rows),
+                'preliminary': preliminary,
+            }
+
+        status['candle_cache_hit'] = cache_hit
         candidate_side = preliminary.side
-        l2_gate = (
-            await self._evaluate_shared_l2_gate(
+        if preliminary.allowed and candidate_side in {'long', 'short'}:
+            l2_gate = await self._evaluate_shared_l2_gate(
                 canonical,
                 cfg,
                 force_refresh=True,
                 side=candidate_side,
             )
-            if candidate_side in {'long', 'short'}
-            else base_l2
-        )
-        decision = evaluate_adaptive_breakout_trend(rows, l2_gate, trend_cfg)
+            decision = evaluate_adaptive_breakout_trend(rows, l2_gate, trend_cfg)
+        else:
+            l2_gate = {}
+            decision = preliminary
         metrics = dict(decision.metrics or {})
         status.update({
             'allowed': bool(decision.allowed),
@@ -924,6 +958,7 @@ class SignalAlphaMixin:
             'risk_tier': metrics.get('risk_tier'),
             'metrics': metrics,
             'l2_gate': dict(l2_gate or {}),
+            'decision_candle_ts': metrics.get('signal_candle_ts'),
         })
         if not decision.allowed or decision.side not in {'long', 'short'}:
             return _finish(None, f'Adaptive Breakout Trend waiting: {decision.reason}')
@@ -1202,9 +1237,9 @@ class SignalAlphaMixin:
             f"EMA crossover ({int(metrics.get('ema_crossover_age_bars', 0) or 0)}h ago)"
             if metrics.get('ema_crossover')
             else 'fresh breakout'
-            if metrics.get('fresh_breakout')
+            if metrics.get('breakout_entry_enabled') and metrics.get('fresh_breakout')
             else 're-acceleration'
-            if metrics.get('reacceleration')
+            if metrics.get('breakout_entry_enabled') and metrics.get('reacceleration')
             else 'waiting'
         )
         return '\n'.join([

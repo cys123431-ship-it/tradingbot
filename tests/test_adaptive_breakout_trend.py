@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import bot_runtime.signal_alpha as signal_alpha_module
+from bot_runtime.diagnostics import _safe_float_or_none
 from utbreakout.adaptive_breakout_trend import (
     ADAPTIVE_BREAKOUT_TREND_STRATEGY,
     _normalized_momentum_horizons,
@@ -17,6 +19,12 @@ from bot_runtime.signal_alpha import SignalAlphaMixin
 from bot_runtime.signal_entry import build_durable_entry_plan_summary
 from bot_runtime.signal_scanner import SignalScannerMixin
 from utbreakout.dynamic_leverage import select_dynamic_leverage
+from utbreakout.relative_strength_pullback import completed_candle_rows
+from utbreakout.risk import calculate_risk_plan
+from utbreakout.risk_budget import (
+    cap_utbreakout_risk_plan_to_margin,
+    resolve_utbreakout_risk_budget,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -114,6 +122,24 @@ def test_old_trend_without_recent_crossover_does_not_chase_channel_by_default():
     assert decision.allowed is False
     assert decision.side == "long"
     assert decision.reason == "waiting_for_ema_crossover"
+    assert decision.metrics["breakout_entry_enabled"] is False
+    assert decision.metrics["fresh_breakout"] is False
+    assert decision.metrics["reacceleration"] is False
+
+
+def test_crossover_uses_its_own_early_momentum_floor():
+    decision = evaluate_adaptive_breakout_trend(
+        _ema_crossover_rows(1),
+        CALM_L2,
+        {
+            "minimum_momentum_strength": 0.99,
+            "ema_crossover_minimum_momentum_strength": 0.0,
+        },
+    )
+
+    assert decision.allowed is True
+    assert decision.metrics["ema_crossover"] is True
+    assert decision.metrics["minimum_momentum_strength_required"] == pytest.approx(0.0)
 
 
 def test_crossover_window_keeps_one_stable_signal_timestamp():
@@ -133,6 +159,161 @@ def test_status_labels_the_ema_crossover_entry_mode():
 
     assert "EMA crossover (" in status_source
     assert "metrics.get('ema_crossover_age_bars'" in status_source
+
+
+def test_live_crossover_reuses_completed_candle_and_keeps_decision_metadata(monkeypatch):
+    rows = _ema_crossover_rows(1)
+    ohlcv = [
+        [
+            row["timestamp"],
+            row["open"],
+            row["high"],
+            row["low"],
+            row["close"],
+            row["volume"],
+        ]
+        for row in rows
+    ]
+    fetch_count = 0
+
+    class MarketData:
+        def fetch_ohlcv(self, symbol, timeframe, limit):
+            nonlocal fetch_count
+            fetch_count += 1
+            return ohlcv
+
+        def fetch_ticker(self, symbol):
+            return {"last": rows[-1]["close"]}
+
+    engine = SignalAlphaMixin()
+    engine.market_data_exchange = MarketData()
+    engine.last_entry_reason = {}
+    engine.adaptive_breakout_trend_last_status = {}
+    engine._canonical_futures_symbol = lambda symbol: symbol
+    engine._clear_utbot_filtered_breakout_entry_plan = lambda symbol: None
+    engine._timeframe_to_ms = lambda timeframe: 3_600_000
+    engine._relative_strength_pullback_rows_from_ohlcv = lambda values: [
+        {
+            "timestamp": value[0],
+            "open": value[1],
+            "high": value[2],
+            "low": value[3],
+            "close": value[4],
+            "volume": value[5],
+        }
+        for value in values
+    ]
+    engine._get_utbot_filtered_breakout_config = lambda params: {
+        "adaptive_breakout_trend": {
+            "enabled": True,
+            "live_enabled": True,
+            "ema_crossover_minimum_momentum_strength": 0.0,
+            "entry_chase_max_atr": 2.0,
+        },
+        "daily_max_loss_usdt": 100.0,
+        "max_daily_trades": 5,
+    }
+    engine.is_upbit_mode = lambda: False
+    engine.is_trade_direction_allowed = lambda side: True
+    engine.db = SimpleNamespace(get_daily_stats=lambda: (0, 0.0))
+    engine.get_automatic_daily_entry_count = lambda: 0
+    engine.get_balance_info = lambda: asyncio.sleep(0, result=(100.0, 100.0, 0.0))
+    engine.get_runtime_common_settings = lambda: {"leverage": 5}
+    engine._evaluate_utbreakout_market_quality = lambda side, cfg, values: {
+        "hard_block": False,
+        "state": True,
+        "risk_multiplier": 1.0,
+        "summary": "ok",
+    }
+    engine._evaluate_shared_l2_gate = lambda *args, **kwargs: asyncio.sleep(
+        0,
+        result=dict(CALM_L2),
+    )
+    stored_plans = {}
+    stored_statuses = {}
+    engine._set_utbot_filtered_breakout_entry_plan = (
+        lambda symbol, plan: stored_plans.__setitem__(symbol, dict(plan))
+    )
+    engine._store_utbot_filtered_breakout_status = (
+        lambda symbol, status: stored_statuses.__setitem__(symbol, dict(status))
+    )
+
+    monkeypatch.setattr(signal_alpha_module, "asyncio", asyncio, raising=False)
+    monkeypatch.setattr(signal_alpha_module, "time", __import__("time"), raising=False)
+    monkeypatch.setattr(
+        signal_alpha_module,
+        "ADAPTIVE_BREAKOUT_TREND_STRATEGY",
+        ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        signal_alpha_module,
+        "STRATEGY_DISPLAY_NAMES",
+        {ADAPTIVE_BREAKOUT_TREND_STRATEGY: "Adaptive Breakout Trend"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        signal_alpha_module,
+        "evaluate_adaptive_breakout_trend",
+        evaluate_adaptive_breakout_trend,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        signal_alpha_module,
+        "completed_candle_rows",
+        completed_candle_rows,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        signal_alpha_module,
+        "_safe_float_or_none",
+        _safe_float_or_none,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        signal_alpha_module,
+        "resolve_utbreakout_risk_budget",
+        resolve_utbreakout_risk_budget,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        signal_alpha_module,
+        "calculate_risk_plan",
+        calculate_risk_plan,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        signal_alpha_module,
+        "cap_utbreakout_risk_plan_to_margin",
+        cap_utbreakout_risk_plan_to_margin,
+        raising=False,
+    )
+
+    first = asyncio.run(
+        engine._calculate_adaptive_breakout_trend_signal(
+            "TEST/USDT:USDT",
+            None,
+            {},
+            force_reprocess=True,
+        )
+    )
+    second = asyncio.run(
+        engine._calculate_adaptive_breakout_trend_signal(
+            "TEST/USDT:USDT",
+            None,
+            {},
+            force_reprocess=True,
+        )
+    )
+
+    assert first[0] == "long", first
+    assert second[0] == "long", second
+    plan = stored_plans["TEST/USDT:USDT"]
+    status = stored_statuses["TEST/USDT:USDT"]
+    assert fetch_count == 1
+    assert status["candle_cache_hit"] is True
+    assert status["entry_timeframe"] == "1h"
+    assert status["decision_candle_ts"] == plan["signal_candle_ts"]
 
 
 def test_l2_stress_is_a_hard_safety_gate():

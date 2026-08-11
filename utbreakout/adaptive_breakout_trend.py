@@ -39,6 +39,7 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         "ema_slope_bars": 6,
         "ema_crossover_entry_enabled": True,
         "ema_crossover_window_bars": 3,
+        "ema_crossover_minimum_momentum_strength": 0.08,
         "ema_crossover_minimum_trend_efficiency": 0.0,
         "breakout_entry_enabled": False,
         "channel_lookback_bars": 48,
@@ -223,12 +224,15 @@ def evaluate_adaptive_breakout_trend(
         cfg.get("momentum_horizons"),
         cfg.get("momentum_weights"),
     )
-    required = max(
+    breakout_entry_enabled = bool(cfg.get("breakout_entry_enabled", False))
+    required_values = [
         max(horizons) + 2,
         int(cfg["slow_ema_period"]) + int(cfg["ema_slope_bars"]) + 2,
         int(cfg["volatility_long_bars"]) + 2,
-        int(cfg["channel_lookback_bars"]) + 2,
-    )
+    ]
+    if breakout_entry_enabled:
+        required_values.append(int(cfg["channel_lookback_bars"]) + 2)
+    required = max(required_values)
     if len(candles) < required:
         return AdaptiveBreakoutTrendDecision(reason="insufficient_completed_candles")
 
@@ -302,28 +306,33 @@ def evaluate_adaptive_breakout_trend(
         )
     )
 
-    channel_period = max(8, int(cfg["channel_lookback_bars"]))
-    reacceleration_period = max(4, int(cfg["reacceleration_lookback_bars"]))
-    previous_channel = candles[-channel_period - 1:-1]
-    previous_reacceleration = candles[-reacceleration_period - 1:-1]
-    channel_high = max(float(row["high"]) for row in previous_channel)
-    channel_low = min(float(row["low"]) for row in previous_channel)
-    reacceleration_high = max(float(row["high"]) for row in previous_reacceleration)
-    reacceleration_low = min(float(row["low"]) for row in previous_reacceleration)
-    fresh_breakout = bool(
-        side == "long" and closes[-1] > channel_high
-    ) or bool(
-        side == "short" and closes[-1] < channel_low
-    )
-    reacceleration = bool(
-        side == "long"
-        and closes[-1] > reacceleration_high
-        and fast_ema[-1] > medium_ema[-1]
-    ) or bool(
-        side == "short"
-        and closes[-1] < reacceleration_low
-        and fast_ema[-1] < medium_ema[-1]
-    )
+    channel_high: float | None = None
+    channel_low: float | None = None
+    fresh_breakout = False
+    reacceleration = False
+    if breakout_entry_enabled:
+        channel_period = max(8, int(cfg["channel_lookback_bars"]))
+        reacceleration_period = max(4, int(cfg["reacceleration_lookback_bars"]))
+        previous_channel = candles[-channel_period - 1:-1]
+        previous_reacceleration = candles[-reacceleration_period - 1:-1]
+        channel_high = max(float(row["high"]) for row in previous_channel)
+        channel_low = min(float(row["low"]) for row in previous_channel)
+        reacceleration_high = max(float(row["high"]) for row in previous_reacceleration)
+        reacceleration_low = min(float(row["low"]) for row in previous_reacceleration)
+        fresh_breakout = bool(
+            side == "long" and closes[-1] > channel_high
+        ) or bool(
+            side == "short" and closes[-1] < channel_low
+        )
+        reacceleration = bool(
+            side == "long"
+            and closes[-1] > reacceleration_high
+            and fast_ema[-1] > medium_ema[-1]
+        ) or bool(
+            side == "short"
+            and closes[-1] < reacceleration_low
+            and fast_ema[-1] < medium_ema[-1]
+        )
 
     efficiency_period = max(8, int(cfg["efficiency_lookback_bars"]))
     efficiency_closes = closes[-efficiency_period - 1:]
@@ -339,7 +348,7 @@ def evaluate_adaptive_breakout_trend(
         side in {"long", "short"}
         and slow_vote == side
         and fast_vote not in {None, side}
-        and not fresh_breakout
+        and not (breakout_entry_enabled and fresh_breakout)
     )
 
     volumes = [float(row.get("volume") or 0.0) for row in candles]
@@ -374,6 +383,7 @@ def evaluate_adaptive_breakout_trend(
         "ema_crossover": ema_crossover,
         "ema_crossover_side": ema_crossover_side,
         "ema_crossover_age_bars": ema_crossover_age_bars,
+        "breakout_entry_enabled": breakout_entry_enabled,
         "channel_high": channel_high,
         "channel_low": channel_low,
         "fresh_breakout": fresh_breakout,
@@ -387,7 +397,13 @@ def evaluate_adaptive_breakout_trend(
 
     if side is None or dominant_votes < minimum_votes:
         return AdaptiveBreakoutTrendDecision(side=side, reason="multi_horizon_direction_not_aligned", metrics=metrics)
-    if abs(weighted_momentum) < float(cfg["minimum_momentum_strength"]):
+    minimum_momentum_strength = (
+        float(cfg.get("ema_crossover_minimum_momentum_strength", 0.08) or 0.0)
+        if ema_crossover
+        else float(cfg["minimum_momentum_strength"])
+    )
+    metrics["minimum_momentum_strength_required"] = minimum_momentum_strength
+    if abs(weighted_momentum) < minimum_momentum_strength:
         return AdaptiveBreakoutTrendDecision(side=side, reason="momentum_strength_too_low", metrics=metrics)
     if slow_vote not in {None, side}:
         return AdaptiveBreakoutTrendDecision(side=side, reason="slow_horizon_conflict", metrics=metrics)
@@ -396,8 +412,7 @@ def evaluate_adaptive_breakout_trend(
     if turning_conflict:
         return AdaptiveBreakoutTrendDecision(side=side, reason="fast_slow_turning_conflict", metrics=metrics)
     breakout_entry = bool(
-        cfg.get("breakout_entry_enabled", False)
-        and (fresh_breakout or reacceleration)
+        breakout_entry_enabled and (fresh_breakout or reacceleration)
     )
     if not ema_crossover and not breakout_entry:
         return AdaptiveBreakoutTrendDecision(side=side, reason="waiting_for_ema_crossover", metrics=metrics)

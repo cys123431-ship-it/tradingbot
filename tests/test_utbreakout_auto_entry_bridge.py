@@ -69,6 +69,47 @@ def test_live_ready_synthesis_rejects_stale_diagnostic():
     )
 
 
+def test_adaptive_live_ready_uses_plan_timeframe_and_crossover_window():
+    engine = _build_engine()
+    symbol = "EWY/USDT:USDT"
+    decision_ts = int((time.time() - (3.5 * 60 * 60)) * 1000)
+    engine.last_utbot_filtered_breakout_status[symbol] = {
+        "accepted_side": "long",
+    }
+    base_config = engine._get_utbot_filtered_breakout_config({})
+    engine._get_utbot_filtered_breakout_config = lambda params: {
+        **base_config,
+        "utbreakout_status_ready_max_decision_age_bars": 2.0,
+        "adaptive_breakout_trend": {
+            "ema_crossover_window_bars": 3,
+        },
+    }
+    engine._set_utbot_filtered_breakout_entry_plan(
+        symbol,
+        {
+            "strategy": emas.ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+            "side": "long",
+            "entry_price": 101.25,
+            "entry_timeframe": "1h",
+            "signal_candle_ts": decision_ts,
+            "qty": 0.5,
+            "risk_usdt": 1.0,
+        },
+    )
+
+    result = engine._record_utbreakout_live_ready_from_diag(
+        symbol,
+        source="scanner_seen",
+        scan_tf="15m",
+    )
+
+    events = engine._utbreakout_recent_trace_events(symbol)
+    ready = [event for event in events if event["stage"] == "STATUS_READY"][-1]
+    assert result == "long"
+    assert ready["data"]["entry_tf"] == "1h"
+    assert ready["data"]["decision_candle_ts"] == decision_ts
+
+
 def test_auto_entry_bridge_calls_entry_for_recent_ready_plan():
     notifications = []
     entry_calls = []

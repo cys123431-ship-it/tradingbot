@@ -4065,16 +4065,25 @@ class SignalBreakoutAnalysisMixin:
                 )
                 return None
 
+            entry_tf = str(
+                plan.get('entry_timeframe')
+                or diag.get('entry_timeframe')
+                or scan_tf
+                or '15m'
+            ).lower()
+            decision_ts = _safe_float_or_none(
+                self._utbreakout_decision_timestamp(plan, diag)
+            )
             try:
                 strategy_params = self.get_runtime_strategy_params()
                 cfg = self._get_utbot_filtered_breakout_config(strategy_params)
                 entry_tf = str(
-                    diag.get('entry_timeframe')
+                    plan.get('entry_timeframe')
+                    or diag.get('entry_timeframe')
                     or scan_tf
                     or cfg.get('entry_timeframe', '15m')
                     or '15m'
                 ).lower()
-                decision_ts = _safe_float_or_none(diag.get('decision_candle_ts'))
                 if decision_ts is not None and decision_ts > 0:
                     decision_ms = decision_ts * 1000.0 if decision_ts < 10_000_000_000 else decision_ts
                     tf_ms = self._timeframe_to_ms(entry_tf) or (15 * 60 * 1000)
@@ -4082,6 +4091,17 @@ class SignalBreakoutAnalysisMixin:
                         cfg.get('utbreakout_status_ready_max_decision_age_bars', 2.0)
                         or 2.0
                     )
+                    if str(plan.get('strategy') or '').lower() == ADAPTIVE_BREAKOUT_TREND_STRATEGY:
+                        trend_cfg = cfg.get('adaptive_breakout_trend')
+                        trend_cfg = trend_cfg if isinstance(trend_cfg, dict) else {}
+                        crossover_window = max(
+                            1,
+                            int(trend_cfg.get('ema_crossover_window_bars', 3) or 3),
+                        )
+                        # Candle timestamps identify the candle open.  A signal
+                        # on the latest completed candle is therefore already
+                        # between one and two bars old in wall-clock time.
+                        max_age_bars = max(max_age_bars, crossover_window + 1.0)
                     max_age_ms = max(tf_ms, tf_ms * max_age_bars) + 60_000
                     decision_age_ms = (time.time() * 1000.0) - decision_ms
                     if decision_age_ms > max_age_ms:
@@ -4091,7 +4111,7 @@ class SignalBreakoutAnalysisMixin:
                             'STALE_DIAGNOSTIC',
                             source=source,
                             side=side,
-                            decision_candle_ts=diag.get('decision_candle_ts'),
+                            decision_candle_ts=decision_ts,
                             entry_tf=entry_tf,
                             decision_age_sec=round(decision_age_ms / 1000.0, 1),
                             max_age_sec=round(max_age_ms / 1000.0, 1),
@@ -4112,8 +4132,8 @@ class SignalBreakoutAnalysisMixin:
                 source=source,
                 side=side,
                 candidate_type=diag.get('candidate_type'),
-                decision_candle_ts=diag.get('decision_candle_ts'),
-                entry_tf=diag.get('entry_timeframe') or scan_tf,
+                decision_candle_ts=decision_ts,
+                entry_tf=entry_tf,
                 effective_profile=diag.get('effective_profile_version'),
                 selected_set=(
                     diag.get('auto_selected_set_name')
