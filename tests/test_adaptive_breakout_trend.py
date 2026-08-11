@@ -163,7 +163,8 @@ def test_status_labels_the_ema_crossover_entry_mode():
 
 def test_live_crossover_reuses_completed_candle_and_keeps_decision_metadata(monkeypatch):
     rows = _ema_crossover_rows(1)
-    evaluation_now_ms = 1_800_000_000_000
+    current_time_module = __import__("time")
+    evaluation_now_ms = int(current_time_module.time() * 1000.0)
     current_candle_open_ms = evaluation_now_ms - (evaluation_now_ms % 3_600_000)
     timestamp_shift = current_candle_open_ms - rows[-1]["timestamp"]
     for row in rows:
@@ -247,7 +248,7 @@ def test_live_crossover_reuses_completed_candle_and_keeps_decision_metadata(monk
     monkeypatch.setattr(
         signal_alpha_module,
         "time",
-        SimpleNamespace(time=lambda: evaluation_now_ms / 1000.0),
+        current_time_module,
         raising=False,
     )
     monkeypatch.setattr(
