@@ -125,7 +125,12 @@ class SignalAlphaMixin:
         except Exception as exc:
             return _finish(None, f'QH 15m OHLCV unavailable: {exc}', 'REJECTED_QH_DATA')
         rows = self._relative_strength_pullback_rows_from_ohlcv(ohlcv)
-        closed_rows = completed_candle_rows(rows, '15m', {'exclude_incomplete_live_candle': True})
+        closed_rows = completed_candle_rows(
+            rows,
+            '15m',
+            {'exclude_incomplete_live_candle': True},
+            now_ms=int(time.time() * 1000.0),
+        )
         closed = pd.DataFrame(closed_rows)
         for column in ['open', 'high', 'low', 'close', 'volume']:
             if column in closed.columns:
@@ -609,6 +614,7 @@ class SignalAlphaMixin:
                 rows,
                 timeframe,
                 {'exclude_incomplete_live_candle': True},
+                now_ms=int(time.time() * 1000.0),
             )
         except Exception as exc:
             return _finish(None, f'VMT OHLCV unavailable: {exc}', 'REJECTED_VMT_DATA')
@@ -878,11 +884,50 @@ class SignalAlphaMixin:
 
         timeframe = str(trend_cfg.get('timeframe', '1h') or '1h')
         status['entry_timeframe'] = timeframe
-        timeframe_ms = self._timeframe_to_ms(timeframe) or (60 * 60 * 1000)
-        candle_bucket = int(time.time() * 1000.0) // int(timeframe_ms)
+        evaluation_now_ms = int(time.time() * 1000.0)
         config_signature = tuple(
             sorted((str(key), repr(value)) for key, value in trend_cfg.items())
         )
+        try:
+            ohlcv = await asyncio.to_thread(
+                self.market_data_exchange.fetch_ohlcv,
+                canonical,
+                timeframe,
+                limit=max(220, int(trend_cfg.get('fetch_limit', 360) or 360)),
+            )
+            rows = self._relative_strength_pullback_rows_from_ohlcv(ohlcv)
+            rows = completed_candle_rows(
+                rows,
+                timeframe,
+                {'exclude_incomplete_live_candle': True},
+                now_ms=evaluation_now_ms,
+            )
+        except Exception as exc:
+            return _finish(
+                None,
+                f'Adaptive Breakout Trend OHLCV unavailable: {exc}',
+                'REJECTED_ADAPTIVE_TREND_DATA',
+            )
+
+        # Always refresh the public OHLCV snapshot.  The exchange can publish
+        # or correct the just-closed candle shortly after a time boundary, so a
+        # wall-clock bucket is not a valid immutable-candle cache key.
+        completed_candle_ts = (
+            _safe_float_or_none(rows[-1].get('timestamp'))
+            if rows
+            else None
+        )
+        candle_fingerprint = (
+            len(rows),
+            tuple(
+                tuple(
+                    repr(row.get(key))
+                    for key in ('timestamp', 'open', 'high', 'low', 'close', 'volume')
+                )
+                for row in rows[-2:]
+            ),
+        )
+        status['completed_candle_ts'] = completed_candle_ts
         if not isinstance(
             getattr(self, 'adaptive_breakout_trend_candle_cache', None),
             dict,
@@ -899,40 +944,20 @@ class SignalAlphaMixin:
         cache_hit = bool(
             isinstance(cached_candle, dict)
             and cached_candle.get('timeframe') == timeframe
-            and cached_candle.get('candle_bucket') == candle_bucket
+            and cached_candle.get('completed_candle_ts') == completed_candle_ts
+            and cached_candle.get('candle_fingerprint') == candle_fingerprint
             and cached_candle.get('config_signature') == config_signature
-            and isinstance(cached_candle.get('rows'), list)
             and cached_candle.get('preliminary') is not None
         )
         if cache_hit:
-            rows = list(cached_candle['rows'])
             preliminary = cached_candle['preliminary']
         else:
-            try:
-                ohlcv = await asyncio.to_thread(
-                    self.market_data_exchange.fetch_ohlcv,
-                    canonical,
-                    timeframe,
-                    limit=max(220, int(trend_cfg.get('fetch_limit', 360) or 360)),
-                )
-                rows = self._relative_strength_pullback_rows_from_ohlcv(ohlcv)
-                rows = completed_candle_rows(
-                    rows,
-                    timeframe,
-                    {'exclude_incomplete_live_candle': True},
-                )
-            except Exception as exc:
-                return _finish(
-                    None,
-                    f'Adaptive Breakout Trend OHLCV unavailable: {exc}',
-                    'REJECTED_ADAPTIVE_TREND_DATA',
-                )
             preliminary = evaluate_adaptive_breakout_trend(rows, None, trend_cfg)
             self.adaptive_breakout_trend_candle_cache[canonical] = {
                 'timeframe': timeframe,
-                'candle_bucket': candle_bucket,
+                'completed_candle_ts': completed_candle_ts,
+                'candle_fingerprint': candle_fingerprint,
                 'config_signature': config_signature,
-                'rows': list(rows),
                 'preliminary': preliminary,
             }
 
@@ -1314,7 +1339,12 @@ class SignalAlphaMixin:
                 limit=220,
             )
             rows = self._relative_strength_pullback_rows_from_ohlcv(ohlcv)
-            rows = completed_candle_rows(rows, '15m', {'exclude_incomplete_live_candle': True})
+            rows = completed_candle_rows(
+                rows,
+                '15m',
+                {'exclude_incomplete_live_candle': True},
+                now_ms=int(time.time() * 1000.0),
+            )
         except Exception as exc:
             return _finish(None, f'Crowding 15m data unavailable: {exc}', 'REJECTED_CROWDING_DATA')
         derivatives = await self._fetch_utbreakout_futures_context(canonical)
@@ -1581,6 +1611,7 @@ class SignalAlphaMixin:
                 rows,
                 str(lxr_cfg.get('timeframe', '15m') or '15m'),
                 {'exclude_incomplete_live_candle': True},
+                now_ms=int(time.time() * 1000.0),
             )
         except Exception as exc:
             return _finish(None, f'LXR OHLCV unavailable: {exc}', 'REJECTED_LXR_DATA')

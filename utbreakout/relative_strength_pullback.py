@@ -6,6 +6,7 @@ candidates and OHLCV rows that already passed the bot's universe/liquidity
 filters.
 """
 
+import time
 from dataclasses import dataclass, field
 from math import isfinite
 
@@ -198,14 +199,45 @@ def _closed_rows(rows, timeframe, config=None, now_ms=None):
     if not clean or not bool(cfg.get("exclude_incomplete_live_candle", True)):
         return clean
     tf_ms = _timeframe_to_ms(timeframe)
-    last_ts = _timestamp_ms(clean[-1].get("timestamp"))
-    if tf_ms <= 0 or last_ts <= 0:
+    if tf_ms <= 0:
         return clean
-    current_ms = _timestamp_ms(now_ms) if now_ms is not None else 0.0
+    # Small synthetic/history timestamps can be numerically ambiguous with
+    # Unix seconds. Infer millisecond rows from their candle spacing, while
+    # production Binance timestamps are already unambiguous 13-digit values.
+    timestamp_values_are_ms = False
+    if len(clean) >= 2:
+        raw_last = _finite_float(clean[-1].get("timestamp"), 0.0)
+        raw_previous = _finite_float(clean[-2].get("timestamp"), 0.0)
+        raw_delta = raw_last - raw_previous
+        timestamp_values_are_ms = bool(
+            raw_delta > 0
+            and raw_delta >= max(1.0, tf_ms * 0.25)
+        )
+
+    def _row_timestamp_ms(value):
+        parsed = _finite_float(value, 0.0)
+        if parsed <= 0:
+            return 0.0
+        return parsed if timestamp_values_are_ms else _timestamp_ms(parsed)
+
+    if now_ms is None:
+        current_ms = time.time() * 1000.0
+    else:
+        current_ms = _row_timestamp_ms(now_ms)
     if current_ms <= 0:
-        return clean
-    if last_ts + tf_ms > current_ms:
-        return clean[:-1]
+        return []
+    # Binance includes the currently forming candle in fetch_ohlcv.  Treat a
+    # missing clock as "now" rather than silently accepting that candle, and
+    # remove every trailing future/incomplete row so malformed duplicate data
+    # also fails closed.
+    while clean:
+        last_ts = _row_timestamp_ms(clean[-1].get("timestamp"))
+        if last_ts <= 0:
+            clean.pop()
+            continue
+        if last_ts + tf_ms <= current_ms:
+            break
+        clean.pop()
     return clean
 
 

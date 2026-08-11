@@ -39,7 +39,12 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         "ema_slope_bars": 6,
         "ema_crossover_entry_enabled": True,
         "ema_crossover_window_bars": 3,
-        "ema_crossover_minimum_momentum_strength": 0.08,
+        "ema_crossover_minimum_momentum_strength": 0.0,
+        # An early crossover may use a lower momentum floor than a mature
+        # continuation, but never less than half of the broad momentum floor.
+        # This ties the relaxation to the strategy profile instead of a single
+        # hand-tuned absolute observation.
+        "ema_crossover_momentum_floor_ratio": 0.50,
         "ema_crossover_minimum_trend_efficiency": 0.0,
         "breakout_entry_enabled": False,
         "channel_lookback_bars": 48,
@@ -75,7 +80,8 @@ def normalize_adaptive_breakout_trend_config(
 ) -> dict[str, Any]:
     """Return a stable trend configuration, including its scan universe."""
 
-    normalized = default_adaptive_breakout_trend_config()
+    defaults = default_adaptive_breakout_trend_config()
+    normalized = dict(defaults)
     if isinstance(config, Mapping):
         normalized.update(dict(config))
 
@@ -87,6 +93,36 @@ def normalize_adaptive_breakout_trend_config(
     single_symbol = str(normalized.get("single_symbol", "") or "").strip().upper()
     normalized["universe_mode"] = universe_mode
     normalized["single_symbol"] = single_symbol
+    broad_momentum_floor = _bounded(
+        _finite(
+            normalized.get("minimum_momentum_strength"),
+            defaults["minimum_momentum_strength"],
+        ),
+        0.0,
+        1.0,
+    )
+    crossover_floor_ratio = _bounded(
+        _finite(
+            normalized.get("ema_crossover_momentum_floor_ratio"),
+            defaults["ema_crossover_momentum_floor_ratio"],
+        ),
+        0.50,
+        1.0,
+    )
+    configured_crossover_floor = _bounded(
+        _finite(
+            normalized.get("ema_crossover_minimum_momentum_strength"),
+            defaults["ema_crossover_minimum_momentum_strength"],
+        ),
+        0.0,
+        1.0,
+    )
+    normalized["minimum_momentum_strength"] = broad_momentum_floor
+    normalized["ema_crossover_momentum_floor_ratio"] = crossover_floor_ratio
+    normalized["ema_crossover_minimum_momentum_strength"] = max(
+        configured_crossover_floor,
+        broad_momentum_floor * crossover_floor_ratio,
+    )
     return normalized
 
 
@@ -218,7 +254,7 @@ def evaluate_adaptive_breakout_trend(
 ) -> AdaptiveBreakoutTrendDecision:
     """Evaluate completed candles without placing or modifying an order."""
 
-    cfg = {**default_adaptive_breakout_trend_config(), **dict(config or {})}
+    cfg = normalize_adaptive_breakout_trend_config(config)
     candles = _clean_rows(rows)
     horizons, weights = _normalized_momentum_horizons(
         cfg.get("momentum_horizons"),
@@ -398,7 +434,7 @@ def evaluate_adaptive_breakout_trend(
     if side is None or dominant_votes < minimum_votes:
         return AdaptiveBreakoutTrendDecision(side=side, reason="multi_horizon_direction_not_aligned", metrics=metrics)
     minimum_momentum_strength = (
-        float(cfg.get("ema_crossover_minimum_momentum_strength", 0.08) or 0.0)
+        float(cfg["ema_crossover_minimum_momentum_strength"])
         if ema_crossover
         else float(cfg["minimum_momentum_strength"])
     )

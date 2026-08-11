@@ -127,7 +127,7 @@ def test_old_trend_without_recent_crossover_does_not_chase_channel_by_default():
     assert decision.metrics["reacceleration"] is False
 
 
-def test_crossover_uses_its_own_early_momentum_floor():
+def test_crossover_floor_cannot_drop_below_half_the_broad_momentum_floor():
     decision = evaluate_adaptive_breakout_trend(
         _ema_crossover_rows(1),
         CALM_L2,
@@ -139,7 +139,7 @@ def test_crossover_uses_its_own_early_momentum_floor():
 
     assert decision.allowed is True
     assert decision.metrics["ema_crossover"] is True
-    assert decision.metrics["minimum_momentum_strength_required"] == pytest.approx(0.0)
+    assert decision.metrics["minimum_momentum_strength_required"] == pytest.approx(0.495)
 
 
 def test_crossover_window_keeps_one_stable_signal_timestamp():
@@ -163,6 +163,11 @@ def test_status_labels_the_ema_crossover_entry_mode():
 
 def test_live_crossover_reuses_completed_candle_and_keeps_decision_metadata(monkeypatch):
     rows = _ema_crossover_rows(1)
+    evaluation_now_ms = 1_800_000_000_000
+    current_candle_open_ms = evaluation_now_ms - (evaluation_now_ms % 3_600_000)
+    timestamp_shift = current_candle_open_ms - rows[-1]["timestamp"]
+    for row in rows:
+        row["timestamp"] += timestamp_shift
     ohlcv = [
         [
             row["timestamp"],
@@ -239,7 +244,12 @@ def test_live_crossover_reuses_completed_candle_and_keeps_decision_metadata(monk
     )
 
     monkeypatch.setattr(signal_alpha_module, "asyncio", asyncio, raising=False)
-    monkeypatch.setattr(signal_alpha_module, "time", __import__("time"), raising=False)
+    monkeypatch.setattr(
+        signal_alpha_module,
+        "time",
+        SimpleNamespace(time=lambda: evaluation_now_ms / 1000.0),
+        raising=False,
+    )
     monkeypatch.setattr(
         signal_alpha_module,
         "ADAPTIVE_BREAKOUT_TREND_STRATEGY",
@@ -310,10 +320,27 @@ def test_live_crossover_reuses_completed_candle_and_keeps_decision_metadata(monk
     assert second[0] == "long", second
     plan = stored_plans["TEST/USDT:USDT"]
     status = stored_statuses["TEST/USDT:USDT"]
-    assert fetch_count == 1
+    assert fetch_count == 2
     assert status["candle_cache_hit"] is True
     assert status["entry_timeframe"] == "1h"
+    assert status["completed_candle_ts"] == rows[-2]["timestamp"]
     assert status["decision_candle_ts"] == plan["signal_candle_ts"]
+    assert status["decision_candle_ts"] < current_candle_open_ms
+
+    # A same-timestamp exchange correction must invalidate the preliminary
+    # cache instead of freezing the first snapshot for the rest of the hour.
+    ohlcv[-2][5] += 1.0
+    third = asyncio.run(
+        engine._calculate_adaptive_breakout_trend_signal(
+            "TEST/USDT:USDT",
+            None,
+            {},
+            force_reprocess=True,
+        )
+    )
+    assert third[0] == "long", third
+    assert fetch_count == 3
+    assert stored_statuses["TEST/USDT:USDT"]["candle_cache_hit"] is False
 
 
 def test_l2_stress_is_a_hard_safety_gate():
@@ -376,6 +403,28 @@ def test_trend_universe_config_normalizes_and_preserves_fail_closed_single_mode(
     assert single["single_symbol"] == "BTC/USDT:USDT"
     assert invalid["universe_mode"] == "auto"
     assert empty_single["universe_mode"] == "single"
+
+
+def test_crossover_momentum_floor_is_relative_and_malformed_values_fall_back():
+    guarded = normalize_adaptive_breakout_trend_config(
+        {
+            "minimum_momentum_strength": 0.18,
+            "ema_crossover_minimum_momentum_strength": 0.01,
+            "ema_crossover_momentum_floor_ratio": 0.10,
+        }
+    )
+    malformed = normalize_adaptive_breakout_trend_config(
+        {
+            "minimum_momentum_strength": None,
+            "ema_crossover_minimum_momentum_strength": "invalid",
+            "ema_crossover_momentum_floor_ratio": None,
+        }
+    )
+
+    assert guarded["ema_crossover_momentum_floor_ratio"] == pytest.approx(0.50)
+    assert guarded["ema_crossover_minimum_momentum_strength"] == pytest.approx(0.09)
+    assert malformed["minimum_momentum_strength"] == pytest.approx(0.18)
+    assert malformed["ema_crossover_minimum_momentum_strength"] == pytest.approx(0.09)
 
 
 def test_trend_single_universe_resolves_one_symbol_and_invalid_symbol_fails_closed():
