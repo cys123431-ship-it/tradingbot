@@ -1199,7 +1199,9 @@ class SignalAlphaMixin:
             f'{key}h={str(value or "NONE").upper()}' for key, value in votes.items()
         )
         breakout_mode = (
-            'fresh breakout'
+            f"EMA crossover ({int(metrics.get('ema_crossover_age_bars', 0) or 0)}h ago)"
+            if metrics.get('ema_crossover')
+            else 'fresh breakout'
             if metrics.get('fresh_breakout')
             else 're-acceleration'
             if metrics.get('reacceleration')

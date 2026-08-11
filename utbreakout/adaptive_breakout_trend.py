@@ -1,10 +1,11 @@
-"""Adaptive multi-horizon breakout trend signal.
+"""Adaptive multi-horizon trend signal.
 
 The model deliberately keeps forecasting simple and interpretable.  Direction
 comes from volatility-normalised time-series momentum across several horizons;
-entries require either a fresh channel breakout or a shorter re-acceleration in
-the same established trend.  Moving averages are alignment aids, not the
-primary signal.
+entries use a recent fast/medium EMA crossover inside the same established
+trend.  The former channel-breakout trigger remains available as an explicit
+legacy option, but is disabled by default because it tends to enter after the
+move is already extended in the live TradFi perpetual universe.
 """
 
 from __future__ import annotations
@@ -36,6 +37,10 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         "medium_ema_period": 48,
         "slow_ema_period": 144,
         "ema_slope_bars": 6,
+        "ema_crossover_entry_enabled": True,
+        "ema_crossover_window_bars": 3,
+        "ema_crossover_minimum_trend_efficiency": 0.0,
+        "breakout_entry_enabled": False,
         "channel_lookback_bars": 48,
         "reacceleration_lookback_bars": 12,
         "atr_period": 20,
@@ -272,6 +277,31 @@ def evaluate_adaptive_breakout_trend(
         and medium_slope_atr < 0
     )
 
+    crossover_window = max(1, int(cfg.get("ema_crossover_window_bars", 3)))
+    crossover_window = min(crossover_window, len(closes) - 1)
+    ema_crossover_side: str | None = None
+    ema_crossover_age_bars: int | None = None
+    ema_crossover_index: int | None = None
+    for age in range(crossover_window):
+        index = len(closes) - 1 - age
+        if fast_ema[index] > medium_ema[index] and fast_ema[index - 1] <= medium_ema[index - 1]:
+            ema_crossover_side = "long"
+        elif fast_ema[index] < medium_ema[index] and fast_ema[index - 1] >= medium_ema[index - 1]:
+            ema_crossover_side = "short"
+        else:
+            continue
+        ema_crossover_age_bars = age
+        ema_crossover_index = index
+        break
+    ema_crossover = bool(
+        cfg.get("ema_crossover_entry_enabled", True)
+        and ema_crossover_side == side
+        and (
+            (side == "long" and fast_ema[-1] > medium_ema[-1])
+            or (side == "short" and fast_ema[-1] < medium_ema[-1])
+        )
+    )
+
     channel_period = max(8, int(cfg["channel_lookback_bars"]))
     reacceleration_period = max(4, int(cfg["reacceleration_lookback_bars"]))
     previous_channel = candles[-channel_period - 1:-1]
@@ -341,6 +371,9 @@ def evaluate_adaptive_breakout_trend(
         "slow_ema": slow_ema[-1],
         "medium_ema_slope_atr": medium_slope_atr,
         "ema_aligned": ema_aligned,
+        "ema_crossover": ema_crossover,
+        "ema_crossover_side": ema_crossover_side,
+        "ema_crossover_age_bars": ema_crossover_age_bars,
         "channel_high": channel_high,
         "channel_low": channel_low,
         "fresh_breakout": fresh_breakout,
@@ -362,9 +395,18 @@ def evaluate_adaptive_breakout_trend(
         return AdaptiveBreakoutTrendDecision(side=side, reason="trend_structure_not_aligned", metrics=metrics)
     if turning_conflict:
         return AdaptiveBreakoutTrendDecision(side=side, reason="fast_slow_turning_conflict", metrics=metrics)
-    if not fresh_breakout and not reacceleration:
-        return AdaptiveBreakoutTrendDecision(side=side, reason="waiting_for_channel_breakout", metrics=metrics)
-    if efficiency < float(cfg["minimum_trend_efficiency"]):
+    breakout_entry = bool(
+        cfg.get("breakout_entry_enabled", False)
+        and (fresh_breakout or reacceleration)
+    )
+    if not ema_crossover and not breakout_entry:
+        return AdaptiveBreakoutTrendDecision(side=side, reason="waiting_for_ema_crossover", metrics=metrics)
+    minimum_efficiency = (
+        float(cfg.get("ema_crossover_minimum_trend_efficiency", 0.0) or 0.0)
+        if ema_crossover
+        else float(cfg["minimum_trend_efficiency"])
+    )
+    if efficiency < minimum_efficiency:
         return AdaptiveBreakoutTrendDecision(side=side, reason="trend_efficiency_too_low", metrics=metrics)
     if volatility_ratio > float(cfg["volatility_shock_ratio"]):
         return AdaptiveBreakoutTrendDecision(side=side, reason="volatility_shock", metrics=metrics)
@@ -376,7 +418,7 @@ def evaluate_adaptive_breakout_trend(
     score = 44.0
     score += min(18.0, abs(weighted_momentum) * 24.0)
     score += min(12.0, dominant_votes * 4.0)
-    score += 8.0 if fresh_breakout else 5.0
+    score += 7.0 if ema_crossover else 8.0 if fresh_breakout else 5.0
     score += min(10.0, efficiency * 22.0)
     score += min(4.0, max(0.0, volume_ratio - 0.70) * 3.0)
     if slow_vote == side:
@@ -414,7 +456,16 @@ def evaluate_adaptive_breakout_trend(
         "risk_tier": risk_tier,
         "risk_multiplier": risk_multiplier,
     })
-    mode = "fresh breakout" if fresh_breakout else "trend re-acceleration"
+    if ema_crossover and ema_crossover_index is not None:
+        metrics["reference_price"] = closes[ema_crossover_index]
+        metrics["signal_candle_ts"] = candles[ema_crossover_index].get("timestamp")
+    mode = (
+        "EMA crossover"
+        if ema_crossover
+        else "fresh breakout"
+        if fresh_breakout
+        else "trend re-acceleration"
+    )
     return AdaptiveBreakoutTrendDecision(
         allowed=True,
         side=side,

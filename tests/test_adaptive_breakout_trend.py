@@ -55,7 +55,11 @@ def _trend_rows(direction: int, count: int = 220) -> list[dict]:
 
 @pytest.mark.parametrize(("direction", "side"), ((1, "long"), (-1, "short")))
 def test_multi_horizon_breakout_accepts_both_directions(direction, side):
-    decision = evaluate_adaptive_breakout_trend(_trend_rows(direction), CALM_L2)
+    decision = evaluate_adaptive_breakout_trend(
+        _trend_rows(direction),
+        CALM_L2,
+        {"breakout_entry_enabled": True},
+    )
 
     assert decision.allowed is True
     assert decision.side == side
@@ -65,10 +69,77 @@ def test_multi_horizon_breakout_accepts_both_directions(direction, side):
     assert sum(value == side for value in decision.metrics["horizon_votes"].values()) >= 2
 
 
+def _ema_crossover_rows(direction: int, count: int = 240) -> list[dict]:
+    rows = []
+    price = 100.0
+    for index in range(count):
+        if index < count - 32:
+            step = 0.12 * direction
+        elif index < count - 8:
+            step = -0.18 * direction
+        else:
+            step = 0.50 * direction
+        open_price = price
+        price = max(5.0, price + step)
+        rows.append(
+            {
+                "timestamp": index * 3_600_000,
+                "open": open_price,
+                "high": max(open_price, price) + 0.10,
+                "low": min(open_price, price) - 0.10,
+                "close": price,
+                "volume": 1_000.0 + index,
+            }
+        )
+    return rows
+
+
+@pytest.mark.parametrize(("direction", "side"), ((1, "long"), (-1, "short")))
+def test_recent_ema_crossover_is_the_default_entry_trigger(direction, side):
+    rows = _ema_crossover_rows(direction)
+    decision = evaluate_adaptive_breakout_trend(rows, CALM_L2)
+
+    assert decision.allowed is True
+    assert decision.side == side
+    assert decision.metrics["ema_crossover"] is True
+    assert decision.metrics["ema_crossover_age_bars"] in {0, 1, 2}
+    assert decision.metrics["signal_candle_ts"] != rows[-1]["timestamp"] or (
+        decision.metrics["ema_crossover_age_bars"] == 0
+    )
+
+
+def test_old_trend_without_recent_crossover_does_not_chase_channel_by_default():
+    decision = evaluate_adaptive_breakout_trend(_trend_rows(1), CALM_L2)
+
+    assert decision.allowed is False
+    assert decision.side == "long"
+    assert decision.reason == "waiting_for_ema_crossover"
+
+
+def test_crossover_window_keeps_one_stable_signal_timestamp():
+    rows = _ema_crossover_rows(1)
+    current = evaluate_adaptive_breakout_trend(rows[:-1], CALM_L2)
+    following = evaluate_adaptive_breakout_trend(rows, CALM_L2)
+
+    assert current.allowed is True
+    assert following.allowed is True
+    assert current.metrics["signal_candle_ts"] == following.metrics["signal_candle_ts"]
+
+
+def test_status_labels_the_ema_crossover_entry_mode():
+    status_source = (ROOT / "bot_runtime" / "signal_alpha.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "EMA crossover (" in status_source
+    assert "metrics.get('ema_crossover_age_bars'" in status_source
+
+
 def test_l2_stress_is_a_hard_safety_gate():
     decision = evaluate_adaptive_breakout_trend(
         _trend_rows(1),
         {"allowed": False, "risk_multiplier": 0.0, "state": "stressed_thin"},
+        {"breakout_entry_enabled": True},
     )
 
     assert decision.allowed is False
@@ -77,7 +148,7 @@ def test_l2_stress_is_a_hard_safety_gate():
 
 
 def test_volatility_shock_is_rejected_before_sizing():
-    cfg = {"volatility_shock_ratio": 1.01}
+    cfg = {"volatility_shock_ratio": 1.01, "breakout_entry_enabled": True}
     decision = evaluate_adaptive_breakout_trend(_trend_rows(1), CALM_L2, cfg)
 
     assert decision.allowed is False
@@ -98,7 +169,11 @@ def test_empty_horizon_config_falls_back_without_crashing():
     decision = evaluate_adaptive_breakout_trend(
         _trend_rows(1),
         CALM_L2,
-        {"momentum_horizons": (), "momentum_weights": ()},
+        {
+            "momentum_horizons": (),
+            "momentum_weights": (),
+            "breakout_entry_enabled": True,
+        },
     )
 
     assert decision.allowed is True
