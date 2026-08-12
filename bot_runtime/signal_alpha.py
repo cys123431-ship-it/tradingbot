@@ -1076,13 +1076,38 @@ class SignalAlphaMixin:
 
         total_balance, free_balance, _ = await self.get_balance_info()
         balance_for_risk = total_balance if total_balance > 0 else free_balance
+        small_account_threshold = max(
+            0.0,
+            float(
+                trend_cfg.get('small_account_equity_threshold_usdt', 1_000.0)
+                or 1_000.0
+            ),
+        )
+        small_account_aggressive_candidate = bool(
+            trend_cfg.get('small_account_aggressive_enabled', True)
+            and balance_for_risk > 0
+            and balance_for_risk < small_account_threshold
+            and free_balance > 0
+        )
+        effective_daily_loss_percent = float(
+            trend_cfg.get(
+                'small_account_daily_loss_limit_percent',
+                35.0,
+            )
+            if small_account_aggressive_candidate
+            else trend_cfg.get('daily_loss_limit_percent', 10.0)
+            or 0.0
+        )
         adaptive_daily_loss_cap = max(
             0.0,
             balance_for_risk
-            * float(trend_cfg.get('daily_loss_limit_percent', 10.0) or 10.0)
+            * effective_daily_loss_percent
             / 100.0,
         )
         status['adaptive_daily_loss_cap_usdt'] = adaptive_daily_loss_cap
+        status['small_account_aggressive_candidate'] = small_account_aggressive_candidate
+        status['small_account_equity_usdt'] = balance_for_risk
+        status['effective_daily_loss_percent'] = effective_daily_loss_percent
         if (
             adaptive_daily_loss_cap > 0
             and float(daily_pnl or 0) <= -adaptive_daily_loss_cap
@@ -1204,8 +1229,58 @@ class SignalAlphaMixin:
             'adaptive_breakout_trend_score': float(decision.score),
             'adaptive_breakout_trend_risk_multiplier': risk_multiplier,
             'adaptive_breakout_trend_target_risk_percent': target_risk_percent,
-            'risk_budget_mode': 'adaptive_trend_unified',
+            'risk_budget_mode': (
+                'adaptive_trend_small_account_aggressive_pending'
+                if small_account_aggressive_candidate
+                else 'adaptive_trend_unified'
+            ),
+            'adaptive_trend_risk_tier': metrics.get('risk_tier') or 'base',
             'adaptive_breakout_trend_metrics': metrics,
+            'small_account_aggressive_enabled': bool(
+                trend_cfg.get('small_account_aggressive_enabled', True)
+            ),
+            'small_account_equity_threshold_usdt': small_account_threshold,
+            'small_account_margin_budget_fraction': float(
+                trend_cfg.get('small_account_margin_budget_fraction', 0.95) or 0.95
+            ),
+            'small_account_initial_margin_fraction': float(
+                trend_cfg.get('small_account_initial_margin_fraction', 0.65) or 0.65
+            ),
+            'small_account_base_max_loss_percent': float(
+                trend_cfg.get('small_account_base_max_loss_percent', 20.0) or 20.0
+            ),
+            'small_account_strong_max_loss_percent': float(
+                trend_cfg.get('small_account_strong_max_loss_percent', 30.0) or 30.0
+            ),
+            'small_account_elite_max_loss_percent': float(
+                trend_cfg.get('small_account_elite_max_loss_percent', 35.0) or 35.0
+            ),
+            'small_account_daily_loss_limit_percent': float(
+                trend_cfg.get('small_account_daily_loss_limit_percent', 35.0) or 35.0
+            ),
+            'small_account_cost_buffer_percent': float(
+                trend_cfg.get('small_account_cost_buffer_percent', 0.20) or 0.20
+            ),
+            'small_account_liquidation_stop_buffer_multiple': float(
+                trend_cfg.get(
+                    'small_account_liquidation_stop_buffer_multiple',
+                    1.50,
+                )
+                or 1.50
+            ),
+            'small_account_min_leverage': int(
+                trend_cfg.get('small_account_min_leverage', 5) or 5
+            ),
+            'small_account_strong_leverage': int(
+                trend_cfg.get('small_account_strong_leverage', 8) or 8
+            ),
+            'small_account_elite_leverage': int(
+                trend_cfg.get('small_account_elite_leverage', 15) or 15
+            ),
+            'small_account_leverage_steps': tuple(
+                trend_cfg.get('small_account_leverage_steps', (5, 8, 10, 15))
+            ),
+            'small_account_aggressive_daily_pnl_usdt': float(daily_pnl or 0.0),
             'structure_reference_stop': structure_stop,
             'entry_chase_atr': chase_atr,
             'l2_gate': dict(l2_gate or {}),
@@ -1233,7 +1308,7 @@ class SignalAlphaMixin:
             'tp1_breakeven_enabled': True,
             'tp1_breakeven_wait_for_partial': True,
             'adaptive_trend_pyramid_enabled': bool(trend_cfg.get('pyramiding_enabled', True)),
-            'adaptive_trend_pyramid_trigger_r': tuple(trend_cfg.get('pyramid_trigger_r', (0.50, 1.00, 1.75))),
+            'adaptive_trend_pyramid_trigger_r': tuple(trend_cfg.get('pyramid_trigger_r', (0.50, 1.00, 1.50))),
             'adaptive_trend_pyramid_target_fractions': tuple(trend_cfg.get('pyramid_target_fractions', (0.80, 0.90, 1.00))),
             'adaptive_trend_pyramid_add_count': 0,
             'ev_time_stop_enabled': True,
@@ -1330,13 +1405,33 @@ class SignalAlphaMixin:
             if metrics.get('weighted_continuation')
             else 'waiting'
         )
+        risk_tier = str(status.get('risk_tier') or 'base').lower()
+        small_account_active = bool(status.get('small_account_aggressive_candidate'))
+        if small_account_active:
+            max_loss_percent = float(
+                trend_cfg.get(
+                    f'small_account_{risk_tier}_max_loss_percent',
+                    {'base': 20.0, 'strong': 30.0, 'elite': 35.0}.get(risk_tier, 20.0),
+                )
+                or 0.0
+            )
+            risk_status_text = (
+                f"Small-account aggressive: ON / equity "
+                f"{float(status.get('small_account_equity_usdt', 0.0) or 0.0):.2f} USDT / "
+                f"tier loss cap {max_loss_percent:.1f}%"
+            )
+        else:
+            risk_status_text = (
+                f"Risk target: {float(metrics.get('target_risk_percent', 0.0) or 0.0):.2f}% "
+                f"/ tier={status.get('risk_tier') or 'waiting'}"
+            )
         return '\n'.join([
             '📈 Adaptive Breakout Trend 상태',
             f'Symbol: {target}',
             f'Universe: {universe_text}',
             f"Signal: {str(status.get('side') or 'NONE').upper()} / allowed={bool(status.get('allowed'))}",
             f"Score: {float(status.get('score', 0.0) or 0.0):.1f}",
-            f"Risk target: {float(metrics.get('target_risk_percent', 0.0) or 0.0):.2f}% / tier={status.get('risk_tier') or 'waiting'}",
+            risk_status_text,
             f'Horizons: {vote_text or "N/A"}',
             f"Momentum: {float(metrics.get('weighted_momentum', 0.0) or 0.0):+.2f}",
             f"Entry mode: {breakout_mode}",

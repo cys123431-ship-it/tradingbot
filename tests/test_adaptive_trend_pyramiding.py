@@ -243,3 +243,71 @@ def test_adaptive_trend_does_not_add_before_profit_trigger(monkeypatch):
 
     assert result["status"] == "WAITING"
     assert result["pnl_r"] == pytest.approx(0.25)
+
+
+def test_small_account_adaptive_trend_add_respects_persisted_loss_cap(monkeypatch):
+    engine = SignalExitMixin()
+    state = {
+        "strategy": ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+        "side": "long",
+        "entry_price": 100.0,
+        "risk_distance": 2.0,
+        "leverage": 5,
+        "adaptive_trend_pyramid_enabled": True,
+        "adaptive_trend_pyramid_trigger_r": (0.50,),
+        "adaptive_trend_pyramid_target_fractions": (0.80,),
+        "adaptive_trend_pyramid_add_count": 0,
+        "adaptive_trend_target_qty": 10.0,
+        "adaptive_trend_initial_entry_price": 100.0,
+        "adaptive_trend_initial_risk_distance": 2.0,
+        "small_account_aggressive_active": True,
+        "small_account_aggressive_max_loss_usdt": 1.0,
+        "small_account_aggressive_daily_loss_limit_usdt": 35.0,
+        "small_account_aggressive_cost_buffer_percent": 0.20,
+    }
+    engine.is_upbit_mode = lambda: False
+    engine._get_utbreakout_trailing_state = lambda symbol: state
+    engine._position_signed_contracts = lambda pos: pos.get("contracts", 0.0)
+    engine.get_balance_info = lambda: asyncio.sleep(0, result=(100.0, 100.0, 0.0))
+    engine.safe_amount = lambda symbol, qty: qty
+    engine._current_stop_loss_price = lambda symbol, current: asyncio.sleep(
+        0,
+        result=100.0,
+    )
+    engine.db = SimpleNamespace(get_daily_stats=lambda: (0, 0.0))
+
+    monkeypatch.setattr(
+        signal_exit_module,
+        "ADAPTIVE_BREAKOUT_TREND_STRATEGY",
+        ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        signal_exit_module,
+        "_safe_float_or_none",
+        lambda value: float(value) if value not in (None, "") else None,
+        raising=False,
+    )
+
+    bound_method = engine._maybe_apply_adaptive_trend_pyramiding
+    pyramid_method = getattr(bound_method, "__runtime_original__", None)
+    call_args = (engine,) if pyramid_method is not None else ()
+    pyramid_method = pyramid_method or bound_method
+    result = asyncio.run(
+        pyramid_method(
+            *call_args,
+            "TEST/USDT:USDT",
+            {
+                "side": "long",
+                "contracts": 6.5,
+                "entryPrice": 100.0,
+                "markPrice": 101.0,
+            },
+            None,
+            {},
+        )
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert "exceeds remaining cap" in result["reason"]
+    assert result["projected_loss_usdt"] > 1.0

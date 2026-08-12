@@ -33,6 +33,17 @@ _DURABLE_ENTRY_PLAN_KEYS = (
     'small_account_min_leverage',
     'small_account_target_margin_usdt',
     'small_account_margin_utilization',
+    'small_account_aggressive_active',
+    'small_account_aggressive_reason',
+    'small_account_aggressive_initial_margin_usdt',
+    'small_account_aggressive_max_loss_percent',
+    'small_account_aggressive_max_loss_usdt',
+    'small_account_aggressive_daily_loss_limit_percent',
+    'small_account_aggressive_daily_loss_limit_usdt',
+    'small_account_aggressive_projected_loss_usdt',
+    'small_account_aggressive_projected_loss_percent',
+    'small_account_aggressive_cost_buffer_percent',
+    'small_account_aggressive_risk_tier',
     'opportunity_risk_multiplier',
     'opportunity_risk_tier',
     'opportunity_risk_reason',
@@ -656,6 +667,7 @@ class SignalEntryMixin:
             risk_pct = bounded_risk_pct / 100.0
 
             account_equity, free, _ = await self.get_balance_info()
+            sizing_equity = account_equity if account_equity > 0 else free
             if active_strategy in UTBREAKOUT_STRATEGIES:
                 self._utbreakout_trace_event(
                     symbol,
@@ -771,13 +783,53 @@ class SignalEntryMixin:
                     except (TypeError, ValueError):
                         pass
                 else:
+                    try:
+                        _, latest_daily_pnl = self.db.get_daily_stats()
+                    except Exception:
+                        latest_daily_pnl = filtered_breakout_plan.get(
+                            'small_account_aggressive_daily_pnl_usdt',
+                            0.0,
+                        )
+                    filtered_breakout_plan[
+                        'small_account_aggressive_daily_pnl_usdt'
+                    ] = float(latest_daily_pnl or 0.0)
                     filtered_breakout_plan = apply_dynamic_leverage_to_plan(
                         filtered_breakout_plan,
                         (cfg or {}).get('dynamic_leverage'),
                         free_balance=free,
-                        account_equity=account_equity,
+                        account_equity=sizing_equity,
                         safety_buffer=safety_buffer,
                     )
+                    if filtered_breakout_plan.get('small_account_aggressive_blocked'):
+                        code = str(
+                            filtered_breakout_plan.get(
+                                'small_account_aggressive_block_code'
+                            )
+                            or 'ENTRY_BLOCKED_SMALL_ACCOUNT_AGGRESSIVE_RISK'
+                        )
+                        reason = str(
+                            filtered_breakout_plan.get(
+                                'small_account_aggressive_reason'
+                            )
+                            or 'small-account aggressive risk limit'
+                        )
+                        _record_filtered_breakout_entry_block(
+                            code,
+                            reason,
+                            {
+                                'account_equity': sizing_equity,
+                                'free_balance': free,
+                                'minimum_leverage': filtered_breakout_plan.get(
+                                    'small_account_min_leverage'
+                                ),
+                            },
+                        )
+                        self._clear_utbot_filtered_breakout_entry_plan(symbol)
+                        await self.ctrl.notify(
+                            f'Adaptive Trend 소액 공격형 진입 보류: {symbol} '
+                            f'{side.upper()} / {reason}'
+                        )
+                        return
                     if filtered_breakout_plan.get('small_account_full_margin_applied'):
                         safety_buffer = 1.0
                     lev = int(max(
@@ -1168,7 +1220,10 @@ class SignalEntryMixin:
             minimum_required_leverage = int(
                 filtered_breakout_plan.get('small_account_min_leverage', 1)
                 if isinstance(filtered_breakout_plan, dict)
-                and filtered_breakout_plan.get('small_account_full_margin_applied')
+                and (
+                    filtered_breakout_plan.get('small_account_full_margin_applied')
+                    or filtered_breakout_plan.get('small_account_aggressive_active')
+                )
                 else 1
             )
             if selected_leverage < minimum_required_leverage:
@@ -1182,7 +1237,7 @@ class SignalEntryMixin:
                     {
                         'selected_leverage': selected_leverage,
                         'minimum_required_leverage': minimum_required_leverage,
-                        'account_equity': account_equity,
+                        'account_equity': sizing_equity,
                         'free_balance': free,
                     },
                 )
@@ -1193,7 +1248,46 @@ class SignalEntryMixin:
                 )
                 return
             if selected_leverage < lev:
-                lev = selected_leverage
+                if (
+                    isinstance(filtered_breakout_plan, dict)
+                    and filtered_breakout_plan.get('small_account_aggressive_active')
+                ):
+                    filtered_breakout_plan[
+                        'small_account_aggressive_leverage_ceiling'
+                    ] = selected_leverage
+                    filtered_breakout_plan = apply_dynamic_leverage_to_plan(
+                        filtered_breakout_plan,
+                        (cfg or {}).get('dynamic_leverage'),
+                        free_balance=free,
+                        account_equity=sizing_equity,
+                        safety_buffer=safety_buffer,
+                    )
+                    if filtered_breakout_plan.get('small_account_aggressive_blocked'):
+                        reason = str(
+                            filtered_breakout_plan.get('small_account_aggressive_reason')
+                            or 'safe leverage no longer fits the loss limit'
+                        )
+                        _record_filtered_breakout_entry_block(
+                            'ENTRY_BLOCKED_SMALL_ACCOUNT_SAFE_LEVERAGE',
+                            reason,
+                            {
+                                'selected_leverage': selected_leverage,
+                                'account_equity': sizing_equity,
+                                'free_balance': free,
+                            },
+                        )
+                        self._clear_utbot_filtered_breakout_entry_plan(symbol)
+                        return
+                    lev = int(filtered_breakout_plan.get('leverage') or selected_leverage)
+                    qty = self.safe_amount(
+                        symbol,
+                        float(filtered_breakout_plan.get('qty', 0.0) or 0.0),
+                    )
+                    target_notional = float(qty) * float(price)
+                    margin_to_use = target_notional / max(float(lev), 1e-9)
+                    liquidation_payload.update(filtered_breakout_plan)
+                else:
+                    lev = selected_leverage
                 max_notional = free * lev * safety_buffer
                 leverage_qty_reduced = False
                 if target_notional > max_notional:

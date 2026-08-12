@@ -26,7 +26,7 @@ class SignalExitMixin:
             float(value)
             for value in (
                 state.get('adaptive_trend_pyramid_trigger_r')
-                or (0.50, 1.00, 1.75)
+                or (0.50, 1.00, 1.50)
             )
         )
         targets = tuple(
@@ -98,6 +98,70 @@ class SignalExitMixin:
 
         breakeven_stop = initial_entry
         current_stop = await self._current_stop_loss_price(symbol, state)
+        if bool(state.get('small_account_aggressive_active', False)):
+            average_entry = (
+                _safe_float_or_none(pos.get('entryPrice'))
+                or _safe_float_or_none(state.get('entry_price'))
+                or initial_entry
+            )
+            existing_stop_risk = (
+                max(0.0, average_entry - breakeven_stop) * current_qty
+                if side == 'long'
+                else max(0.0, breakeven_stop - average_entry) * current_qty
+            )
+            added_stop_risk = (
+                max(0.0, current_price - breakeven_stop) * add_qty
+                if side == 'long'
+                else max(0.0, breakeven_stop - current_price) * add_qty
+            )
+            cost_buffer_percent = max(
+                0.0,
+                float(
+                    state.get('small_account_aggressive_cost_buffer_percent', 0.20)
+                    or 0.20
+                ),
+            )
+            projected_notional = (
+                current_qty * average_entry + add_qty * current_price
+            )
+            projected_loss = (
+                existing_stop_risk
+                + added_stop_risk
+                + projected_notional * cost_buffer_percent / 100.0
+            )
+            max_loss_usdt = max(
+                0.0,
+                float(state.get('small_account_aggressive_max_loss_usdt', 0.0) or 0.0),
+            )
+            daily_limit_usdt = max(
+                0.0,
+                float(
+                    state.get(
+                        'small_account_aggressive_daily_loss_limit_usdt',
+                        max_loss_usdt,
+                    )
+                    or max_loss_usdt
+                ),
+            )
+            try:
+                _, live_daily_pnl = self.db.get_daily_stats()
+            except Exception:
+                live_daily_pnl = 0.0
+            remaining_daily_loss = max(
+                0.0,
+                daily_limit_usdt - max(0.0, -float(live_daily_pnl or 0.0)),
+            )
+            effective_loss_cap = min(max_loss_usdt, remaining_daily_loss)
+            if effective_loss_cap <= 0.0 or projected_loss > effective_loss_cap + 1e-9:
+                return {
+                    'status': 'BLOCKED',
+                    'reason': (
+                        f'adaptive trend small-account add risk {projected_loss:.2f} '
+                        f'exceeds remaining cap {effective_loss_cap:.2f}'
+                    ),
+                    'projected_loss_usdt': projected_loss,
+                    'effective_loss_cap_usdt': effective_loss_cap,
+                }
         stop_needs_tightening = bool(
             current_stop is None
             or (side == 'long' and current_stop < breakeven_stop)

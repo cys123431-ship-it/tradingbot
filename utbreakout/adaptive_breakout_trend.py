@@ -18,7 +18,7 @@ from typing import Any, Mapping, Sequence
 
 
 ADAPTIVE_BREAKOUT_TREND_STRATEGY = "adaptive_breakout_trend_v1"
-ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v2"
+ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v3_small_account_aggressive"
 
 
 def default_adaptive_breakout_trend_config() -> dict[str, Any]:
@@ -95,8 +95,26 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         "daily_loss_limit_percent": 10.00,
         "initial_entry_fraction": 0.65,
         "pyramiding_enabled": True,
-        "pyramid_trigger_r": (0.50, 1.00, 1.75),
+        "pyramid_trigger_r": (0.50, 1.00, 1.50),
         "pyramid_target_fractions": (0.80, 0.90, 1.00),
+        # A separate sizing profile is selected only for a new standalone
+        # trend entry when futures equity is strictly below $1,000.  The
+        # normal 1.75/3/5% stop-budget model is replaced, not multiplied, so
+        # the small-account allocation cannot be shrunk twice.
+        "small_account_aggressive_enabled": True,
+        "small_account_equity_threshold_usdt": 1_000.0,
+        "small_account_margin_budget_fraction": 0.95,
+        "small_account_initial_margin_fraction": 0.65,
+        "small_account_base_max_loss_percent": 20.0,
+        "small_account_strong_max_loss_percent": 30.0,
+        "small_account_elite_max_loss_percent": 35.0,
+        "small_account_daily_loss_limit_percent": 35.0,
+        "small_account_cost_buffer_percent": 0.20,
+        "small_account_liquidation_stop_buffer_multiple": 1.50,
+        "small_account_min_leverage": 5,
+        "small_account_strong_leverage": 8,
+        "small_account_elite_leverage": 15,
+        "small_account_leverage_steps": (5, 8, 10, 15),
         "partial_take_profit_r_multiple": 2.00,
         "partial_take_profit_ratio": 0.15,
         "runner_pct": 0.85,
@@ -120,7 +138,7 @@ def normalize_adaptive_breakout_trend_config(
         # such as universe and symbol are preserved; the requested strategy,
         # sizing and exit policy move together so an old server config cannot
         # silently keep the former 0.8x risk and 60% runner.
-        v2_keys = (
+        profile_keys = (
             "continuation_entry_enabled",
             "continuation_minimum_momentum_strength",
             "continuation_minimum_trend_efficiency",
@@ -146,13 +164,27 @@ def normalize_adaptive_breakout_trend_config(
             "pyramiding_enabled",
             "pyramid_trigger_r",
             "pyramid_target_fractions",
+            "small_account_aggressive_enabled",
+            "small_account_equity_threshold_usdt",
+            "small_account_margin_budget_fraction",
+            "small_account_initial_margin_fraction",
+            "small_account_base_max_loss_percent",
+            "small_account_strong_max_loss_percent",
+            "small_account_elite_max_loss_percent",
+            "small_account_daily_loss_limit_percent",
+            "small_account_cost_buffer_percent",
+            "small_account_liquidation_stop_buffer_multiple",
+            "small_account_min_leverage",
+            "small_account_strong_leverage",
+            "small_account_elite_leverage",
+            "small_account_leverage_steps",
             "partial_take_profit_r_multiple",
             "partial_take_profit_ratio",
             "runner_pct",
             "atr_trailing_activation_r",
             "atr_trailing_multiplier",
         )
-        for key in v2_keys:
+        for key in profile_keys:
             normalized[key] = defaults[key]
     normalized["profile_version"] = ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION
 
@@ -221,6 +253,114 @@ def normalize_adaptive_breakout_trend_config(
         monotonic_targets.append(target_floor)
     normalized["pyramid_trigger_r"] = tuple(stage[0] for stage in ordered_stages)
     normalized["pyramid_target_fractions"] = tuple(monotonic_targets)
+    small_enabled = normalized.get("small_account_aggressive_enabled", True)
+    normalized["small_account_aggressive_enabled"] = (
+        small_enabled
+        if isinstance(small_enabled, bool)
+        else str(small_enabled).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    )
+    normalized["small_account_equity_threshold_usdt"] = max(
+        0.0,
+        float(
+            _finite(
+                normalized.get("small_account_equity_threshold_usdt"),
+                defaults["small_account_equity_threshold_usdt"],
+            )
+        ),
+    )
+    normalized["small_account_margin_budget_fraction"] = _bounded(
+        _finite(
+            normalized.get("small_account_margin_budget_fraction"),
+            defaults["small_account_margin_budget_fraction"],
+        ),
+        0.50,
+        0.98,
+    )
+    normalized["small_account_initial_margin_fraction"] = _bounded(
+        _finite(
+            normalized.get("small_account_initial_margin_fraction"),
+            defaults["small_account_initial_margin_fraction"],
+        ),
+        0.40,
+        1.00,
+    )
+    previous_loss_cap = 0.0
+    for tier in ("base", "strong", "elite"):
+        key = f"small_account_{tier}_max_loss_percent"
+        value = _bounded(
+            _finite(normalized.get(key), defaults[key]),
+            previous_loss_cap,
+            50.0,
+        )
+        normalized[key] = value
+        previous_loss_cap = value
+    normalized["small_account_daily_loss_limit_percent"] = _bounded(
+        _finite(
+            normalized.get("small_account_daily_loss_limit_percent"),
+            defaults["small_account_daily_loss_limit_percent"],
+        ),
+        normalized["small_account_elite_max_loss_percent"],
+        50.0,
+    )
+    normalized["small_account_cost_buffer_percent"] = _bounded(
+        _finite(
+            normalized.get("small_account_cost_buffer_percent"),
+            defaults["small_account_cost_buffer_percent"],
+        ),
+        0.0,
+        2.0,
+    )
+    normalized["small_account_liquidation_stop_buffer_multiple"] = _bounded(
+        _finite(
+            normalized.get("small_account_liquidation_stop_buffer_multiple"),
+            defaults["small_account_liquidation_stop_buffer_multiple"],
+        ),
+        1.0,
+        3.0,
+    )
+    minimum_leverage = int(
+        _bounded(
+            _finite(
+                normalized.get("small_account_min_leverage"),
+                defaults["small_account_min_leverage"],
+            ),
+            1.0,
+            20.0,
+        )
+    )
+    strong_leverage = int(
+        _bounded(
+            _finite(
+                normalized.get("small_account_strong_leverage"),
+                defaults["small_account_strong_leverage"],
+            ),
+            float(minimum_leverage),
+            20.0,
+        )
+    )
+    elite_leverage = int(
+        _bounded(
+            _finite(
+                normalized.get("small_account_elite_leverage"),
+                defaults["small_account_elite_leverage"],
+            ),
+            float(strong_leverage),
+            20.0,
+        )
+    )
+    normalized["small_account_min_leverage"] = minimum_leverage
+    normalized["small_account_strong_leverage"] = strong_leverage
+    normalized["small_account_elite_leverage"] = elite_leverage
+    try:
+        configured_steps = {
+            int(float(value))
+            for value in normalized.get("small_account_leverage_steps", ())
+            if minimum_leverage <= int(float(value)) <= elite_leverage
+        }
+    except (TypeError, ValueError):
+        configured_steps = set()
+    configured_steps.update({minimum_leverage, strong_leverage, elite_leverage})
+    normalized["small_account_leverage_steps"] = tuple(sorted(configured_steps))
     for tier in ("base", "strong", "elite"):
         floor_key = f"{tier}_risk_percent_min"
         cap_key = f"{tier}_risk_percent_max"

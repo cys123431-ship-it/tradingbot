@@ -133,7 +133,7 @@ def test_weighted_continuation_enters_without_requiring_a_new_crossover(directio
         _trend_rows(direction),
         CALM_L2,
         {
-            "profile_version": "adaptive_trend_portfolio_v2",
+            "profile_version": "adaptive_trend_portfolio_v3_small_account_aggressive",
             "continuation_max_fast_ema_distance_atr": 4.0,
         },
     )
@@ -345,7 +345,7 @@ def test_live_crossover_reuses_completed_candle_and_keeps_decision_metadata(monk
     assert status["completed_candle_ts"] == rows[-2]["timestamp"]
     assert status["decision_candle_ts"] == plan["signal_candle_ts"]
     assert status["decision_candle_ts"] < current_candle_open_ms
-    assert plan["risk_budget_mode"] == "adaptive_trend_unified"
+    assert plan["risk_budget_mode"] == "adaptive_trend_small_account_aggressive_pending"
     assert plan["adaptive_breakout_trend_target_risk_percent"] >= 1.5
     assert plan["adaptive_trend_initial_fraction"] == pytest.approx(0.65)
     assert plan["adaptive_trend_target_qty"] > plan["qty"]
@@ -453,7 +453,7 @@ def test_crossover_momentum_floor_is_relative_and_malformed_values_fall_back():
     assert malformed["ema_crossover_minimum_momentum_strength"] == pytest.approx(0.09)
 
 
-def test_persisted_conservative_profile_migrates_to_portfolio_v2():
+def test_persisted_conservative_profile_migrates_to_small_account_aggressive_v3():
     migrated = normalize_adaptive_breakout_trend_config(
         {
             "universe_mode": "single",
@@ -464,12 +464,18 @@ def test_persisted_conservative_profile_migrates_to_portfolio_v2():
         }
     )
 
-    assert migrated["profile_version"] == "adaptive_trend_portfolio_v2"
+    assert migrated["profile_version"] == "adaptive_trend_portfolio_v3_small_account_aggressive"
     assert migrated["universe_mode"] == "single"
     assert migrated["single_symbol"] == "BTC/USDT:USDT"
     assert migrated["take_profit_r_multiple"] == pytest.approx(10.0)
     assert migrated["base_risk_percent"] == pytest.approx(1.75)
     assert migrated["runner_pct"] == pytest.approx(0.85)
+    assert migrated["small_account_margin_budget_fraction"] == pytest.approx(0.95)
+    assert migrated["small_account_initial_margin_fraction"] == pytest.approx(0.65)
+    assert migrated["small_account_base_max_loss_percent"] == pytest.approx(20.0)
+    assert migrated["small_account_strong_max_loss_percent"] == pytest.approx(30.0)
+    assert migrated["small_account_elite_max_loss_percent"] == pytest.approx(35.0)
+    assert migrated["small_account_daily_loss_limit_percent"] == pytest.approx(35.0)
 
 
 def test_trend_single_universe_resolves_one_symbol_and_invalid_symbol_fails_closed():
