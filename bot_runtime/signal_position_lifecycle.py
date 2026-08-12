@@ -663,6 +663,33 @@ class SignalPositionLifecycleMixin:
             'preserve_runner_qty': preserve_runner_qty,
             'aggressive_growth_overlay': bool(plan.get('aggressive_growth_overlay', False)),
             'pyramid_add_count': int(plan.get('pyramid_add_count', 0) or 0),
+            'strategy': plan.get('strategy'),
+            'adaptive_trend_pyramid_enabled': bool(plan.get('adaptive_trend_pyramid_enabled', False)),
+            'adaptive_trend_pyramid_trigger_r': tuple(plan.get('adaptive_trend_pyramid_trigger_r') or (0.50, 1.00, 1.75)),
+            'adaptive_trend_pyramid_target_fractions': tuple(plan.get('adaptive_trend_pyramid_target_fractions') or (0.80, 0.90, 1.00)),
+            'adaptive_trend_pyramid_add_count': int(plan.get('adaptive_trend_pyramid_add_count', 0) or 0),
+            'adaptive_trend_target_qty': _safe_float_or_none(plan.get('adaptive_trend_target_qty')),
+            'adaptive_trend_target_risk_usdt': _safe_float_or_none(plan.get('adaptive_trend_target_risk_usdt')),
+            'adaptive_trend_target_notional': _safe_float_or_none(plan.get('adaptive_trend_target_notional')),
+            'adaptive_trend_initial_fraction': _safe_float_or_none(plan.get('adaptive_trend_initial_fraction')),
+            'adaptive_trend_initial_entry_price': (
+                _safe_float_or_none(plan.get('adaptive_trend_initial_entry_price'))
+                or _safe_float_or_none((existing_state or {}).get('adaptive_trend_initial_entry_price'))
+                or entry
+            ),
+            'adaptive_trend_initial_risk_distance': (
+                _safe_float_or_none(plan.get('adaptive_trend_initial_risk_distance'))
+                or _safe_float_or_none((existing_state or {}).get('adaptive_trend_initial_risk_distance'))
+                or risk_distance
+            ),
+            'adaptive_trend_partial_r_multiple': _safe_float_or_none(
+                plan.get('adaptive_trend_partial_r_multiple', cfg.get('partial_take_profit_r_multiple', 2.0))
+            ),
+            'adaptive_trend_partial_ratio': _safe_float_or_none(
+                plan.get('adaptive_trend_partial_ratio', cfg.get('partial_take_profit_ratio', 0.15))
+            ),
+            'adaptive_breakout_trend_target_risk_percent': _safe_float_or_none(plan.get('adaptive_breakout_trend_target_risk_percent')),
+            'risk_budget_mode': plan.get('risk_budget_mode'),
             'planned_tp_orders': planned_tp_orders,
             'tp_orders': list(planned_tp_orders),
             'expected_tp_count': len(planned_tp_orders),

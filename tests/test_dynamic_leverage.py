@@ -259,6 +259,17 @@ def test_operator_maximum_caps_opportunity_without_making_it_fixed():
     assert defensive.leverage < high.leverage
 
 
+def test_persisted_v1_dynamic_config_migrates_adaptive_trend_to_fifteen_x_ceiling():
+    cfg = normalize_dynamic_leverage_config(
+        {"max_leverage": 10, "adaptive_trend_elite_leverage": 10}
+    )
+
+    assert cfg["max_leverage"] == 10
+    assert cfg["adaptive_trend_profile_version"] == "adaptive_trend_leverage_v2"
+    assert cfg["adaptive_trend_elite_leverage"] == 15
+    assert cfg["adaptive_trend_max_leverage"] == 15
+
+
 def test_disabled_mode_preserves_configured_plan_leverage_and_exit_profile():
     updated = apply_dynamic_leverage_to_plan(
         _plan(leverage=5, ev_time_stop_bars=96, atr_trailing_activation_r=1.6),
@@ -270,7 +281,7 @@ def test_disabled_mode_preserves_configured_plan_leverage_and_exit_profile():
     assert updated["atr_trailing_activation_r"] == 1.6
 
 
-def test_adaptive_trend_uses_ten_x_only_for_elite_tight_stop_setup():
+def test_adaptive_trend_uses_fifteen_x_only_for_elite_tight_stop_setup():
     decision = select_dynamic_leverage(
         _plan(
             strategy="adaptive_breakout_trend_v1",
@@ -287,12 +298,12 @@ def test_adaptive_trend_uses_ten_x_only_for_elite_tight_stop_setup():
         )
     )
 
-    assert decision.leverage == 10
+    assert decision.leverage == 15
     assert decision.tier == "adaptive_trend_elite"
     assert decision.stop_distance_pct == 2.5
 
 
-def test_adaptive_trend_uses_eight_x_for_strong_normal_volatility_setup():
+def test_adaptive_trend_uses_ten_x_for_strong_normal_volatility_setup():
     decision = select_dynamic_leverage(
         _plan(
             strategy="adaptive_breakout_trend_v1",
@@ -309,11 +320,11 @@ def test_adaptive_trend_uses_eight_x_for_strong_normal_volatility_setup():
         )
     )
 
-    assert decision.leverage == 8
+    assert decision.leverage == 10
     assert decision.tier == "adaptive_trend_strong"
 
 
-def test_adaptive_trend_uses_six_x_for_healthy_opportunity_setup():
+def test_adaptive_trend_stop_buffer_limits_healthy_opportunity_setup():
     decision = select_dynamic_leverage(
         _plan(
             strategy="adaptive_breakout_trend_v1",
@@ -330,7 +341,7 @@ def test_adaptive_trend_uses_six_x_for_healthy_opportunity_setup():
         )
     )
 
-    assert decision.leverage == 6
+    assert decision.leverage == 7
     assert decision.tier == "adaptive_trend_opportunity"
 
 
@@ -356,7 +367,7 @@ def test_adaptive_trend_keeps_cys_like_wide_stop_at_two_x():
     assert decision.risk_quality_multiplier == 0.50
 
 
-def test_adaptive_trend_high_leverage_applies_short_exit_profile():
+def test_adaptive_trend_high_leverage_preserves_long_horizon_exit_profile():
     updated = apply_dynamic_leverage_to_plan(
         _plan(
             strategy="adaptive_breakout_trend_v1",
@@ -373,11 +384,45 @@ def test_adaptive_trend_high_leverage_applies_short_exit_profile():
         )
     )
 
-    assert updated["leverage"] == 10
-    assert updated["ev_time_stop_bars"] == 8
-    assert updated["ev_time_stop_min_mfe_r"] == 0.70
-    assert updated["atr_trailing_activation_r"] == 1.00
+    assert updated["leverage"] == 15
+    assert updated["ev_time_stop_bars"] == 96
+    assert updated["ev_time_stop_min_mfe_r"] == 0.45
+    assert updated["atr_trailing_activation_r"] == 1.60
     assert updated["dynamic_leverage_monitor_timeframe"] == "15m"
+
+
+def test_adaptive_trend_dynamic_leverage_does_not_expand_staged_initial_order():
+    updated = apply_dynamic_leverage_to_plan(
+        _plan(
+            strategy="adaptive_breakout_trend_v1",
+            adaptive_breakout_trend_score=96.0,
+            adaptive_trend_target_notional=2_000.0,
+            position_cap_original_notional=1_000.0,
+        ),
+        free_balance=1_000.0,
+        account_equity=5_000.0,
+    )
+
+    assert updated["leverage"] == 15
+    assert updated["planned_notional"] == pytest.approx(1_000.0)
+    assert updated["dynamic_leverage_restored_notional"] == pytest.approx(0.0)
+
+
+def test_adaptive_trend_small_account_keeps_minimum_leverage_without_forcing_full_margin():
+    updated = apply_dynamic_leverage_to_plan(
+        _plan(
+            strategy="adaptive_breakout_trend_v1",
+            adaptive_breakout_trend_score=70.0,
+            planned_notional=300.0,
+            qty=3.0,
+        ),
+        free_balance=800.0,
+        account_equity=800.0,
+    )
+
+    assert updated["leverage"] >= 5
+    assert updated["planned_notional"] == pytest.approx(300.0)
+    assert updated["small_account_full_margin_applied"] is False
 
 
 def test_adaptive_trend_stop_buffer_caps_even_an_elite_override():

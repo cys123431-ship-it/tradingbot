@@ -999,12 +999,6 @@ class SignalAlphaMixin:
         daily_entries = self.get_automatic_daily_entry_count()
         status['daily_pnl'] = daily_pnl
         status['daily_entries'] = daily_entries
-        if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
-            return _finish(
-                None,
-                f'risk_limit_blocked: daily pnl {daily_pnl:.2f}',
-                'REJECTED_DAILY_LOSS_LIMIT',
-            )
         if int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
             return _finish(
                 None,
@@ -1082,6 +1076,23 @@ class SignalAlphaMixin:
 
         total_balance, free_balance, _ = await self.get_balance_info()
         balance_for_risk = total_balance if total_balance > 0 else free_balance
+        adaptive_daily_loss_cap = max(
+            0.0,
+            balance_for_risk
+            * float(trend_cfg.get('daily_loss_limit_percent', 10.0) or 10.0)
+            / 100.0,
+        )
+        status['adaptive_daily_loss_cap_usdt'] = adaptive_daily_loss_cap
+        if (
+            adaptive_daily_loss_cap > 0
+            and float(daily_pnl or 0) <= -adaptive_daily_loss_cap
+        ):
+            return _finish(
+                None,
+                f'risk_limit_blocked: adaptive trend daily pnl {daily_pnl:.2f} '
+                f'<= -{adaptive_daily_loss_cap:.2f}',
+                'REJECTED_DAILY_LOSS_LIMIT',
+            )
         common_cfg = self.get_runtime_common_settings()
         leverage = int(max(1.0, float(common_cfg.get('leverage', 5) or 5)))
         risk_multiplier = min(
@@ -1090,10 +1101,30 @@ class SignalAlphaMixin:
             max(0.0, float(market_quality.get('risk_multiplier', 1.0) or 1.0)),
             max(0.0, float(l2_gate.get('risk_multiplier', 0.0) or 0.0)),
         )
+        target_risk_percent = max(
+            0.0,
+            float(
+                metrics.get(
+                    'target_risk_percent',
+                    trend_cfg.get('base_risk_percent', 1.75),
+                )
+                or 0.0
+            ),
+        )
+        # Adaptive Trend owns one absolute stop-loss budget. Shared market and
+        # L2 quality remain hard safety gates above, but their correlated soft
+        # reductions do not shrink the same stop budget a second time.
+        trend_risk_cfg = dict(cfg)
+        trend_risk_cfg.update({
+            'risk_per_trade_percent': target_risk_percent,
+            'min_risk_per_trade_percent': target_risk_percent,
+            'max_risk_per_trade_percent': target_risk_percent,
+            'daily_max_loss_usdt': adaptive_daily_loss_cap,
+        })
         risk_budget = resolve_utbreakout_risk_budget(
             balance_for_risk,
-            cfg,
-            multiplier=risk_multiplier,
+            trend_risk_cfg,
+            multiplier=1.0,
             daily_pnl_usdt=daily_pnl,
         )
         # A 20-bar structure point can be many ATR away in a healthy trend.
@@ -1124,6 +1155,30 @@ class SignalAlphaMixin:
                 max_risk_per_trade_usdt=risk_budget['max_risk_per_trade_usdt'],
                 leverage=leverage,
             )
+            full_target_qty = float(plan.get('qty', 0.0) or 0.0)
+            full_target_risk = float(plan.get('risk_usdt', 0.0) or 0.0)
+            full_target_notional = float(plan.get('planned_notional', 0.0) or 0.0)
+            initial_fraction = min(
+                1.0,
+                max(
+                    0.40,
+                    float(trend_cfg.get('initial_entry_fraction', 0.65) or 0.65),
+                ),
+            )
+            plan.update({
+                'qty': full_target_qty * initial_fraction,
+                'risk_usdt': full_target_risk * initial_fraction,
+                'planned_notional': full_target_notional * initial_fraction,
+                'planned_margin': full_target_notional * initial_fraction / max(float(leverage), 1.0),
+                'expected_profit_usdt': float(plan.get('expected_profit_usdt', 0.0) or 0.0) * initial_fraction,
+                'adaptive_trend_target_qty': full_target_qty,
+                'adaptive_trend_target_risk_usdt': full_target_risk,
+                'adaptive_trend_target_notional': full_target_notional,
+                'adaptive_trend_initial_fraction': initial_fraction,
+                # Dynamic leverage may restore only a margin-capped initial
+                # order; winner-only additions remain staged.
+                'position_cap_original_notional': full_target_notional * initial_fraction,
+            })
             plan = cap_utbreakout_risk_plan_to_margin(
                 plan,
                 free_balance=free_balance,
@@ -1148,6 +1203,8 @@ class SignalAlphaMixin:
             'entry_execution': 'market',
             'adaptive_breakout_trend_score': float(decision.score),
             'adaptive_breakout_trend_risk_multiplier': risk_multiplier,
+            'adaptive_breakout_trend_target_risk_percent': target_risk_percent,
+            'risk_budget_mode': 'adaptive_trend_unified',
             'adaptive_breakout_trend_metrics': metrics,
             'structure_reference_stop': structure_stop,
             'entry_chase_atr': chase_atr,
@@ -1159,22 +1216,26 @@ class SignalAlphaMixin:
             'atr': atr_value,
             'atr_pct': atr_value / entry_price * 100.0,
             'partial_take_profit_enabled': True,
-            'partial_take_profit_r_multiple': 1.50,
-            'partial_take_profit_ratio': 0.20,
-            'second_take_profit_enabled': True,
-            'second_take_profit_r_multiple': float(trend_cfg.get('take_profit_r_multiple', 4.00) or 4.00),
-            'second_take_profit_ratio': 0.20,
-            'runner_pct': 0.60,
+            'partial_take_profit_r_multiple': float(trend_cfg.get('partial_take_profit_r_multiple', 2.00) or 2.00),
+            'partial_take_profit_ratio': float(trend_cfg.get('partial_take_profit_ratio', 0.15) or 0.15),
+            'second_take_profit_enabled': False,
+            'second_take_profit_r_multiple': float(trend_cfg.get('take_profit_r_multiple', 10.00) or 10.00),
+            'second_take_profit_ratio': 0.0,
+            'runner_pct': float(trend_cfg.get('runner_pct', 0.85) or 0.85),
             'preserve_runner_qty': True,
             'atr_trailing_enabled': True,
-            'atr_trailing_activation_r': 2.00,
-            'atr_trailing_multiplier': 3.25,
+            'atr_trailing_activation_r': float(trend_cfg.get('atr_trailing_activation_r', 2.00) or 2.00),
+            'atr_trailing_multiplier': float(trend_cfg.get('atr_trailing_multiplier', 3.80) or 3.80),
             'runner_exit_enabled': True,
             'runner_chandelier_enabled': True,
             'runner_chandelier_lookback': 48,
             'runner_structure_lookback': 12,
             'tp1_breakeven_enabled': True,
             'tp1_breakeven_wait_for_partial': True,
+            'adaptive_trend_pyramid_enabled': bool(trend_cfg.get('pyramiding_enabled', True)),
+            'adaptive_trend_pyramid_trigger_r': tuple(trend_cfg.get('pyramid_trigger_r', (0.50, 1.00, 1.75))),
+            'adaptive_trend_pyramid_target_fractions': tuple(trend_cfg.get('pyramid_target_fractions', (0.80, 0.90, 1.00))),
+            'adaptive_trend_pyramid_add_count': 0,
             'ev_time_stop_enabled': True,
             'ev_time_stop_bars': int(trend_cfg.get('time_stop_hours', 168) or 168) * 4,
             'ev_time_stop_min_mfe_r': 0.35,
@@ -1265,6 +1326,8 @@ class SignalAlphaMixin:
             if metrics.get('breakout_entry_enabled') and metrics.get('fresh_breakout')
             else 're-acceleration'
             if metrics.get('breakout_entry_enabled') and metrics.get('reacceleration')
+            else 'weighted continuation'
+            if metrics.get('weighted_continuation')
             else 'waiting'
         )
         return '\n'.join([
@@ -1273,7 +1336,7 @@ class SignalAlphaMixin:
             f'Universe: {universe_text}',
             f"Signal: {str(status.get('side') or 'NONE').upper()} / allowed={bool(status.get('allowed'))}",
             f"Score: {float(status.get('score', 0.0) or 0.0):.1f}",
-            f"Risk: x{float(status.get('risk_multiplier', 0.0) or 0.0):.2f} / tier={status.get('risk_tier') or 'waiting'}",
+            f"Risk target: {float(metrics.get('target_risk_percent', 0.0) or 0.0):.2f}% / tier={status.get('risk_tier') or 'waiting'}",
             f'Horizons: {vote_text or "N/A"}',
             f"Momentum: {float(metrics.get('weighted_momentum', 0.0) or 0.0):+.2f}",
             f"Entry mode: {breakout_mode}",

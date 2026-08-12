@@ -698,12 +698,27 @@ def rank_candidates(candidates, top_n=10):
         item for item in candidates
         if item.get("scanner_accepted", item.get("accepted", False))
     ]
-    use_ev_edge = any(item.get("ev_net_edge_r") is not None for item in eligible)
+    use_adaptive_trend = any(
+        item.get("adaptive_breakout_trend_score") is not None
+        for item in eligible
+    )
+    use_ev_edge = (
+        not use_adaptive_trend
+        and any(item.get("ev_net_edge_r") is not None for item in eligible)
+    )
     eligible.sort(
         key=lambda item: (
-            finite_float(item.get("ev_net_edge_r"), float("-inf"))
+            1.0 if item.get("adaptive_breakout_trend_allowed") else 0.0
+            if use_adaptive_trend
+            else finite_float(item.get("ev_net_edge_r"), float("-inf"))
             if use_ev_edge
             else finite_float(item.get("score"), 0.0),
+            finite_float(item.get("adaptive_breakout_trend_score"), 0.0)
+            if use_adaptive_trend
+            else finite_float(item.get("score"), 0.0),
+            abs(finite_float(item.get("adaptive_breakout_trend_weighted_momentum"), 0.0))
+            if use_adaptive_trend
+            else 0.0,
             finite_float(item.get("score"), 0.0),
             finite_float(item.get("rolling_sharpe"), 0.0),
             finite_float(item.get("quote_volume"), 0.0),

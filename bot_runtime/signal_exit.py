@@ -4,6 +4,337 @@ from __future__ import annotations
 
 
 class SignalExitMixin:
+    async def _maybe_apply_adaptive_trend_pyramiding(self, symbol, pos, df, cfg):
+        """Add only to a profitable standalone trend while preserving stop risk."""
+
+        if self.is_upbit_mode() or not pos:
+            return None
+        side = str(pos.get('side', '') or '').lower()
+        if side not in {'long', 'short'}:
+            return None
+        state = self._get_utbreakout_trailing_state(symbol)
+        if not isinstance(state, dict):
+            return None
+        if (
+            str(state.get('strategy') or '').lower()
+            != ADAPTIVE_BREAKOUT_TREND_STRATEGY
+            or not bool(state.get('adaptive_trend_pyramid_enabled', False))
+        ):
+            return None
+
+        triggers = tuple(
+            float(value)
+            for value in (
+                state.get('adaptive_trend_pyramid_trigger_r')
+                or (0.50, 1.00, 1.75)
+            )
+        )
+        targets = tuple(
+            float(value)
+            for value in (
+                state.get('adaptive_trend_pyramid_target_fractions')
+                or (0.80, 0.90, 1.00)
+            )
+        )
+        add_count = max(
+            0,
+            int(state.get('adaptive_trend_pyramid_add_count', 0) or 0),
+        )
+        if add_count >= min(len(triggers), len(targets)):
+            return {'status': 'COMPLETE', 'reason': 'adaptive trend pyramid complete'}
+
+        current_qty = abs(
+            float(self._position_signed_contracts(pos) or pos.get('contracts', 0) or 0)
+        )
+        current_price = _safe_float_or_none(pos.get('markPrice'))
+        if current_price is None and df is not None and len(df) >= 2:
+            current_price = _safe_float_or_none(df.iloc[-2].get('close'))
+        initial_entry = (
+            _safe_float_or_none(state.get('adaptive_trend_initial_entry_price'))
+            or _safe_float_or_none(state.get('entry_price'))
+            or _safe_float_or_none(pos.get('entryPrice'))
+        )
+        initial_risk = (
+            _safe_float_or_none(state.get('adaptive_trend_initial_risk_distance'))
+            or _safe_float_or_none(state.get('risk_distance'))
+        )
+        target_qty = _safe_float_or_none(state.get('adaptive_trend_target_qty'))
+        if (
+            current_qty <= 0
+            or current_price is None
+            or current_price <= 0
+            or initial_entry is None
+            or initial_entry <= 0
+            or initial_risk is None
+            or initial_risk <= 0
+            or target_qty is None
+            or target_qty <= current_qty
+        ):
+            return None
+
+        direction = 1.0 if side == 'long' else -1.0
+        pnl_r = direction * (current_price - initial_entry) / initial_risk
+        trigger_r = triggers[add_count]
+        if pnl_r < trigger_r:
+            return {
+                'status': 'WAITING',
+                'reason': f'adaptive trend {pnl_r:.2f}R below {trigger_r:.2f}R',
+                'pnl_r': pnl_r,
+            }
+
+        desired_total_qty = target_qty * max(0.0, min(1.0, targets[add_count]))
+        add_qty = max(0.0, desired_total_qty - current_qty)
+        try:
+            total_equity, free_balance, _ = await self.get_balance_info()
+        except Exception:
+            total_equity, free_balance = 0.0, 0.0
+        leverage = max(1, int(float(state.get('leverage', 5) or 5)))
+        if free_balance and free_balance > 0:
+            margin_qty_cap = float(free_balance) * leverage * 0.98 / current_price
+            add_qty = min(add_qty, margin_qty_cap)
+        add_qty = float(self.safe_amount(symbol, add_qty))
+        if add_qty <= 0:
+            return {'status': 'BLOCKED', 'reason': 'adaptive trend add quantity rounded to zero'}
+
+        breakeven_stop = initial_entry
+        current_stop = await self._current_stop_loss_price(symbol, state)
+        stop_needs_tightening = bool(
+            current_stop is None
+            or (side == 'long' and current_stop < breakeven_stop)
+            or (side == 'short' and current_stop > breakeven_stop)
+        )
+        if stop_needs_tightening:
+            replacement = await self._replace_stop_loss_order(
+                symbol,
+                pos,
+                breakeven_stop,
+                reason='Adaptive Trend pyramid breakeven',
+            )
+            if not replacement:
+                return {'status': 'BLOCKED', 'reason': 'adaptive trend breakeven SL replacement failed'}
+            state.update({
+                'active': True,
+                'breakeven_armed': True,
+                'last_stop_price': breakeven_stop,
+                'last_update_ts': datetime.now(timezone.utc).isoformat(),
+            })
+            self._set_utbreakout_trailing_state(symbol, state)
+
+        pre_add_audit = await self._audit_protection_orders(
+            symbol,
+            pos=pos,
+            expected_tp=bool(self._planned_tp_orders_from_state(symbol, state)),
+            expected_sl=True,
+            planned_tp_orders=self._planned_tp_orders_from_state(symbol, state),
+            alert=True,
+        )
+        if not pre_add_audit.get('sl_present'):
+            return {
+                'status': 'BLOCKED',
+                'reason': 'adaptive trend breakeven SL audit failed',
+                'audit': pre_add_audit,
+            }
+
+        entry_blocker = _crypto_entry_block_reason(self, symbol)
+        if entry_blocker and str(entry_blocker).startswith('PROTECTED:'):
+            # A protected same-symbol entry is the required parent of a
+            # position add. The execution gateway rechecks all other blocking
+            # states with for_position_add=True under its global lock.
+            entry_blocker = None
+        if entry_blocker:
+            return {'status': 'BLOCKED', 'reason': entry_blocker}
+        await self.ensure_market_settings(symbol, leverage=leverage)
+        liquidation_preflight = await self._preflight_liquidation_safety(
+            symbol,
+            side,
+            current_price,
+            breakeven_stop,
+            leverage,
+            current_qty + add_qty,
+            cfg,
+        )
+        if not liquidation_preflight.get('valid'):
+            return {
+                'status': 'BLOCKED',
+                'reason': liquidation_preflight.get('reason') or liquidation_preflight.get('status'),
+            }
+
+        _ensure_trading_safety_runtime(self)
+        stage = add_count + 1
+        add_submission = await self.crypto_execution.submit_position_add(
+            strategy='ADAPTIVE_TREND_PYRAMID',
+            symbol=symbol,
+            side=side,
+            signal_timestamp=state.get('last_bar_ts') or int(time.time()),
+            qty=add_qty,
+            stage=str(stage),
+        )
+        if not add_submission.accepted:
+            return {
+                'status': add_submission.state,
+                'reason': add_submission.error or 'adaptive trend add order not accepted',
+                'client_order_id': add_submission.client_order_id,
+            }
+
+        self.position_cache = None
+        self.position_cache_time = 0
+        _, new_pos = await self._fetch_position_with_liquidation(
+            symbol,
+            add_submission.position,
+        )
+        if not new_pos or str(new_pos.get('side', '') or '').lower() != side:
+            self._set_crypto_entry_lock(f'SUBMITTED_UNKNOWN:{add_submission.client_order_id}')
+            return {'status': 'ORDER_SENT_POSITION_MISSING', 'order': add_submission.order or {}}
+        total_qty = abs(
+            float(self._position_signed_contracts(new_pos) or new_pos.get('contracts', 0) or 0)
+        )
+        avg_entry = _safe_float_or_none(new_pos.get('entryPrice')) or current_price
+        valid_be_geometry = bool(
+            total_qty > 0
+            and (
+                (side == 'long' and avg_entry > breakeven_stop)
+                or (side == 'short' and avg_entry < breakeven_stop)
+            )
+        )
+        if not valid_be_geometry:
+            return {'status': 'BLOCKED', 'reason': 'adaptive trend average entry/SL geometry invalid'}
+
+        actual_liquidation = await self._verify_actual_liquidation_safety(
+            symbol,
+            side,
+            breakeven_stop,
+            new_pos,
+            cfg,
+            add_submission.client_order_id,
+        )
+        if not actual_liquidation.get('valid'):
+            return {
+                'status': actual_liquidation.get('status'),
+                'reason': 'adaptive trend post-fill liquidation safety failed',
+                'close_status': actual_liquidation.get('close_status'),
+            }
+        new_pos = actual_liquidation.get('position') or new_pos
+        new_risk_distance = abs(avg_entry - breakeven_stop)
+        partial_r_original = max(
+            0.1,
+            float(state.get('adaptive_trend_partial_r_multiple', 2.0) or 2.0),
+        )
+        target_price = initial_entry + direction * initial_risk * partial_r_original
+        target_distance = direction * (target_price - avg_entry)
+        partial_ratio = max(
+            0.0,
+            min(0.20, float(state.get('adaptive_trend_partial_ratio', 0.15) or 0.15)),
+        )
+        tp_targets = []
+        if target_distance > 0 and partial_ratio > 0:
+            tp_targets.append({
+                'label': 'TP1',
+                'kind': 'tp1',
+                'distance': target_distance,
+                'qty_ratio': partial_ratio,
+                'target_r': target_distance / max(new_risk_distance, 1e-9),
+            })
+        await self._place_tp_sl_orders(
+            symbol,
+            side,
+            avg_entry,
+            total_qty,
+            sl_distance=new_risk_distance,
+            tp_targets=tp_targets,
+            preserve_runner_qty=True,
+        )
+        post_add_audit = await self._audit_protection_orders(
+            symbol,
+            pos=new_pos,
+            expected_tp=bool(tp_targets),
+            expected_sl=True,
+            alert=True,
+        )
+        if not (
+            post_add_audit.get('fetch_ok')
+            and post_add_audit.get('sl_present')
+            and not post_add_audit.get('sl_qty_mismatch')
+        ):
+            self._set_crypto_entry_lock(f'FILLED_UNPROTECTED:{add_submission.client_order_id}')
+            return {
+                'status': 'FILLED_UNPROTECTED',
+                'reason': 'adaptive trend add protection audit failed',
+                'audit': post_add_audit,
+            }
+        _mark_crypto_entry_state(self, add_submission.client_order_id, OrderState.PROTECTED)
+        if str(getattr(self, 'crypto_entry_lock_reason', '') or '').startswith('FILLED_'):
+            self._set_crypto_entry_lock(None)
+
+        effective_cfg = dict(cfg or {})
+        effective_cfg.update({
+            'partial_take_profit_enabled': bool(tp_targets),
+            'partial_take_profit_r_multiple': (
+                target_distance / max(new_risk_distance, 1e-9)
+                if tp_targets
+                else 2.0
+            ),
+            'partial_take_profit_ratio': partial_ratio if tp_targets else 0.0,
+            'second_take_profit_enabled': False,
+            'second_take_profit_ratio': 0.0,
+            'runner_pct': 1.0 - (partial_ratio if tp_targets else 0.0),
+            'atr_trailing_enabled': True,
+            'atr_trailing_activation_r': (
+                target_distance / max(new_risk_distance, 1e-9)
+                if target_distance > 0
+                else 1.0
+            ),
+            'atr_trailing_multiplier': float(state.get('trailing_atr_multiplier', 3.8) or 3.8),
+            'runner_exit_enabled': True,
+            'runner_chandelier_enabled': True,
+            'tp1_breakeven_enabled': True,
+        })
+        state_plan = dict(state)
+        state_plan.update({
+            'strategy': ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+            'side': side,
+            'entry_price': avg_entry,
+            'risk_distance': new_risk_distance,
+            'stop_loss': breakeven_stop,
+            'hard_stop_loss': breakeven_stop,
+            'adaptive_trend_pyramid_enabled': True,
+            'adaptive_trend_pyramid_add_count': stage,
+            'adaptive_trend_initial_entry_price': initial_entry,
+            'adaptive_trend_initial_risk_distance': initial_risk,
+            'adaptive_trend_partial_r_multiple': partial_r_original,
+            'adaptive_trend_partial_ratio': partial_ratio,
+        })
+        self._register_utbreakout_trailing_state(
+            symbol,
+            side,
+            avg_entry,
+            total_qty,
+            state_plan,
+            effective_cfg,
+        )
+        runner_state = self._get_utbreakout_trailing_state(symbol)
+        audit_status = await self._audit_protection_orders(
+            symbol,
+            pos=new_pos,
+            expected_tp=bool(tp_targets),
+            expected_sl=True,
+            planned_tp_orders=self._planned_tp_orders_from_state(symbol, runner_state),
+            alert=True,
+        )
+        await self.ctrl.notify(
+            f"📈 Adaptive Trend 승자 증액: {self.ctrl.format_symbol_for_display(symbol)} "
+            f"{side.upper()} +`{add_qty:.6f}` / stage `{stage}/{len(triggers)}` / "
+            f"PnL `{pnl_r:.2f}R` / SL `BE {breakeven_stop:.4f}`"
+        )
+        return {
+            'status': 'ADDED',
+            'order': add_submission.order or {},
+            'stage': stage,
+            'pnl_r': pnl_r,
+            'add_qty': add_qty,
+            'audit': audit_status,
+            'equity': total_equity,
+        }
+
     async def _manage_utbreakout_partial_trailing(self, symbol, pos, df, cfg):
         state = self._get_utbreakout_trailing_state(symbol)
         if not isinstance(state, dict):
@@ -705,14 +1036,23 @@ class SignalExitMixin:
         return targets, split
 
     async def _maybe_apply_aggressive_growth_pyramiding(self, symbol, pos, df, cfg):
-        if self.is_upbit_mode() or not bool(cfg.get('aggressive_growth_enabled', False)):
-            return None
-        if not bool(cfg.get('aggressive_growth_pyramiding_enabled', True)):
+        if self.is_upbit_mode():
             return None
         try:
             active_strategy = str(self.get_runtime_strategy_params().get('active_strategy', '') or '').lower()
         except Exception:
             active_strategy = ''
+        if active_strategy == ADAPTIVE_BREAKOUT_TREND_STRATEGY:
+            return await self._maybe_apply_adaptive_trend_pyramiding(
+                symbol,
+                pos,
+                df,
+                cfg,
+            )
+        if not bool(cfg.get('aggressive_growth_enabled', False)):
+            return None
+        if not bool(cfg.get('aggressive_growth_pyramiding_enabled', True)):
+            return None
         if active_strategy not in UTBREAKOUT_STRATEGIES:
             return None
         if not pos or str(pos.get('side', '') or '').lower() != 'long':
@@ -981,6 +1321,8 @@ class SignalExitMixin:
         if float(add_qty) <= 0:
             return {'status': 'BLOCKED', 'reason': 'pyramid quantity rounded to zero'}
         entry_blocker = _crypto_entry_block_reason(self, symbol)
+        if entry_blocker and str(entry_blocker).startswith('PROTECTED:'):
+            entry_blocker = None
         if entry_blocker:
             return {'status': 'BLOCKED', 'reason': entry_blocker}
         await self.ensure_market_settings(symbol, leverage=int(max(1, float(leverage or 1))))
@@ -1294,6 +1636,7 @@ class SignalExitMixin:
                 and str(combined_ladder_cfg.get("live_tp_ladder_mode", "tp1_tp2_full_exit") or "").lower()
                 == "tp1_tp2_full_exit"
                 and sl_price is not None
+                and not preserve_runner_qty
             )
             if use_live_ladder:
                 tp_ladder_status = self._build_tp_ladder_orders(

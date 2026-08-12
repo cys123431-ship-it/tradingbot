@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from utbreakout.adaptive_breakout_trend import (
     ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+    evaluate_adaptive_breakout_trend,
     normalize_adaptive_breakout_trend_config,
 )
 
@@ -2047,6 +2048,47 @@ class SignalScannerMixin:
                 cfg=cfg,
             )
             result['auto_selection_reason'] = auto_reason
+            active_strategy = str(
+                (strategy_params or {}).get('active_strategy', '') or ''
+            ).strip().lower()
+            if active_strategy == ADAPTIVE_BREAKOUT_TREND_STRATEGY:
+                trend_cfg = normalize_adaptive_breakout_trend_config(
+                    ut_cfg.get('adaptive_breakout_trend')
+                    if isinstance(ut_cfg, dict)
+                    else None
+                )
+                trend_tf = str(trend_cfg.get('timeframe', '1h') or '1h')
+                trend_ohlcv = ohlcv
+                if trend_tf != entry_tf:
+                    trend_ohlcv = await asyncio.to_thread(
+                        self.market_data_exchange.fetch_ohlcv,
+                        symbol,
+                        trend_tf,
+                        limit=max(220, int(trend_cfg.get('fetch_limit', 360) or 360)),
+                    )
+                trend_rows = self._relative_strength_pullback_rows_from_ohlcv(
+                    trend_ohlcv
+                )
+                trend_rows = completed_candle_rows(
+                    trend_rows,
+                    trend_tf,
+                    {'exclude_incomplete_live_candle': True},
+                    now_ms=int(time.time() * 1000.0),
+                )
+                trend_decision = evaluate_adaptive_breakout_trend(
+                    trend_rows,
+                    None,
+                    trend_cfg,
+                )
+                trend_metrics = dict(trend_decision.metrics or {})
+                result.update({
+                    'adaptive_breakout_trend_allowed': bool(trend_decision.allowed),
+                    'adaptive_breakout_trend_side': trend_decision.side,
+                    'adaptive_breakout_trend_score': float(trend_decision.score),
+                    'adaptive_breakout_trend_reason': trend_decision.reason,
+                    'adaptive_breakout_trend_weighted_momentum': trend_metrics.get('weighted_momentum'),
+                    'adaptive_breakout_trend_risk_percent': trend_metrics.get('target_risk_percent'),
+                })
             if bool(ut_cfg.get('ev_adaptive_enabled', False)):
                 scores = analysis.get('scores') if isinstance(analysis.get('scores'), dict) else {}
                 selected_tf = str(

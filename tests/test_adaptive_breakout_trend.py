@@ -116,15 +116,33 @@ def test_recent_ema_crossover_is_the_default_entry_trigger(direction, side):
     )
 
 
-def test_old_trend_without_recent_crossover_does_not_chase_channel_by_default():
+def test_old_extended_trend_waits_for_weighted_reacceleration_by_default():
     decision = evaluate_adaptive_breakout_trend(_trend_rows(1), CALM_L2)
 
     assert decision.allowed is False
     assert decision.side == "long"
-    assert decision.reason == "waiting_for_ema_crossover"
+    assert decision.reason == "waiting_for_weighted_trend_entry"
     assert decision.metrics["breakout_entry_enabled"] is False
     assert decision.metrics["fresh_breakout"] is False
     assert decision.metrics["reacceleration"] is False
+
+
+@pytest.mark.parametrize(("direction", "side"), ((1, "long"), (-1, "short")))
+def test_weighted_continuation_enters_without_requiring_a_new_crossover(direction, side):
+    decision = evaluate_adaptive_breakout_trend(
+        _trend_rows(direction),
+        CALM_L2,
+        {
+            "profile_version": "adaptive_trend_portfolio_v2",
+            "continuation_max_fast_ema_distance_atr": 4.0,
+        },
+    )
+
+    assert decision.allowed is True
+    assert decision.side == side
+    assert decision.metrics["ema_crossover"] is False
+    assert decision.metrics["weighted_continuation"] is True
+    assert "weighted continuation" in decision.reason
 
 
 def test_crossover_floor_cannot_drop_below_half_the_broad_momentum_floor():
@@ -327,6 +345,13 @@ def test_live_crossover_reuses_completed_candle_and_keeps_decision_metadata(monk
     assert status["completed_candle_ts"] == rows[-2]["timestamp"]
     assert status["decision_candle_ts"] == plan["signal_candle_ts"]
     assert status["decision_candle_ts"] < current_candle_open_ms
+    assert plan["risk_budget_mode"] == "adaptive_trend_unified"
+    assert plan["adaptive_breakout_trend_target_risk_percent"] >= 1.5
+    assert plan["adaptive_trend_initial_fraction"] == pytest.approx(0.65)
+    assert plan["adaptive_trend_target_qty"] > plan["qty"]
+    assert plan["partial_take_profit_ratio"] == pytest.approx(0.15)
+    assert plan["second_take_profit_enabled"] is False
+    assert plan["runner_pct"] == pytest.approx(0.85)
 
     # A same-timestamp exchange correction must invalidate the preliminary
     # cache instead of freezing the first snapshot for the rest of the hour.
@@ -428,6 +453,25 @@ def test_crossover_momentum_floor_is_relative_and_malformed_values_fall_back():
     assert malformed["ema_crossover_minimum_momentum_strength"] == pytest.approx(0.09)
 
 
+def test_persisted_conservative_profile_migrates_to_portfolio_v2():
+    migrated = normalize_adaptive_breakout_trend_config(
+        {
+            "universe_mode": "single",
+            "single_symbol": "BTC/USDT:USDT",
+            "take_profit_r_multiple": 4.0,
+            "base_risk_multiplier": 0.8,
+            "runner_pct": 0.60,
+        }
+    )
+
+    assert migrated["profile_version"] == "adaptive_trend_portfolio_v2"
+    assert migrated["universe_mode"] == "single"
+    assert migrated["single_symbol"] == "BTC/USDT:USDT"
+    assert migrated["take_profit_r_multiple"] == pytest.approx(10.0)
+    assert migrated["base_risk_percent"] == pytest.approx(1.75)
+    assert migrated["runner_pct"] == pytest.approx(0.85)
+
+
 def test_trend_single_universe_resolves_one_symbol_and_invalid_symbol_fails_closed():
     scanner = SignalScannerMixin()
     scanner._get_utbot_filtered_breakout_config = (
@@ -484,7 +528,7 @@ def test_strong_standalone_signal_can_reach_high_dynamic_leverage():
 
     assert decision.quality_source == "adaptive_breakout_trend_score"
     assert decision.tier == "adaptive_trend_elite"
-    assert decision.leverage == 10
+    assert decision.leverage == 15
 
 
 def test_dedicated_telegram_mode_is_separate_and_mutually_exclusive():

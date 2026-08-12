@@ -2,10 +2,11 @@
 
 The model deliberately keeps forecasting simple and interpretable.  Direction
 comes from volatility-normalised time-series momentum across several horizons;
-entries use a recent fast/medium EMA crossover inside the same established
-trend.  The former channel-breakout trigger remains available as an explicit
-legacy option, but is disabled by default because it tends to enter after the
-move is already extended in the live TradFi perpetual universe.
+entries use either a recent fast/medium EMA crossover or a volatility-normalised
+continuation inside the same established trend.  The continuation path keeps
+the signal weighted (rather than requiring every horizon to agree), which lets
+the portfolio participate after the first crossover without chasing a move
+that is already far from its fast average.
 """
 
 from __future__ import annotations
@@ -17,12 +18,14 @@ from typing import Any, Mapping, Sequence
 
 
 ADAPTIVE_BREAKOUT_TREND_STRATEGY = "adaptive_breakout_trend_v1"
+ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v2"
 
 
 def default_adaptive_breakout_trend_config() -> dict[str, Any]:
     """Broad defaults intended to remain stable across liquid crypto futures."""
 
     return {
+        "profile_version": ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION,
         "enabled": True,
         "live_enabled": False,
         "universe_mode": "auto",
@@ -46,6 +49,11 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         # hand-tuned absolute observation.
         "ema_crossover_momentum_floor_ratio": 0.50,
         "ema_crossover_minimum_trend_efficiency": 0.0,
+        "continuation_entry_enabled": True,
+        "continuation_minimum_momentum_strength": 0.26,
+        "continuation_minimum_trend_efficiency": 0.18,
+        "continuation_max_fast_ema_distance_atr": 1.10,
+        "continuation_reacceleration_bars": 2,
         "breakout_entry_enabled": False,
         "channel_lookback_bars": 48,
         "reacceleration_lookback_bars": 12,
@@ -54,7 +62,7 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         "volatility_long_bars": 96,
         "target_hourly_volatility": 0.012,
         "volatility_targeting_power": 0.50,
-        "volatility_risk_floor": 0.75,
+        "volatility_risk_floor": 0.90,
         "volatility_risk_cap": 1.10,
         "volatility_shock_ratio": 3.00,
         "efficiency_lookback_bars": 48,
@@ -64,13 +72,36 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         "structure_lookback_bars": 20,
         "structure_buffer_atr": 0.15,
         "stop_atr_multiplier": 2.00,
-        "take_profit_r_multiple": 4.00,
+        "take_profit_r_multiple": 10.00,
         "score_min": 62.0,
-        "base_risk_multiplier": 0.80,
-        "strong_risk_multiplier": 0.95,
+        "base_risk_multiplier": 1.00,
+        "strong_risk_multiplier": 1.00,
         "elite_risk_multiplier": 1.00,
         "strong_score": 76.0,
         "elite_score": 88.0,
+        # Absolute account-risk targets for the standalone trend portfolio.
+        # They are intentionally independent from the legacy aggregate 10%
+        # setting so several soft sizing overlays cannot shrink the same edge
+        # repeatedly.  Margin availability can still cap the submitted size.
+        "base_risk_percent": 1.75,
+        "base_risk_percent_min": 1.50,
+        "base_risk_percent_max": 2.00,
+        "strong_risk_percent": 3.00,
+        "strong_risk_percent_min": 2.50,
+        "strong_risk_percent_max": 3.50,
+        "elite_risk_percent": 5.00,
+        "elite_risk_percent_min": 4.00,
+        "elite_risk_percent_max": 5.00,
+        "daily_loss_limit_percent": 10.00,
+        "initial_entry_fraction": 0.65,
+        "pyramiding_enabled": True,
+        "pyramid_trigger_r": (0.50, 1.00, 1.75),
+        "pyramid_target_fractions": (0.80, 0.90, 1.00),
+        "partial_take_profit_r_multiple": 2.00,
+        "partial_take_profit_ratio": 0.15,
+        "runner_pct": 0.85,
+        "atr_trailing_activation_r": 2.00,
+        "atr_trailing_multiplier": 3.80,
         "time_stop_hours": 168,
     }
 
@@ -82,8 +113,48 @@ def normalize_adaptive_breakout_trend_config(
 
     defaults = default_adaptive_breakout_trend_config()
     normalized = dict(defaults)
-    if isinstance(config, Mapping):
-        normalized.update(dict(config))
+    supplied = dict(config) if isinstance(config, Mapping) else {}
+    normalized.update(supplied)
+    if supplied and supplied.get("profile_version") != ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION:
+        # Migrate the persisted conservative v1 profile. Operational choices
+        # such as universe and symbol are preserved; the requested strategy,
+        # sizing and exit policy move together so an old server config cannot
+        # silently keep the former 0.8x risk and 60% runner.
+        v2_keys = (
+            "continuation_entry_enabled",
+            "continuation_minimum_momentum_strength",
+            "continuation_minimum_trend_efficiency",
+            "continuation_max_fast_ema_distance_atr",
+            "continuation_reacceleration_bars",
+            "volatility_risk_floor",
+            "volatility_risk_cap",
+            "take_profit_r_multiple",
+            "base_risk_multiplier",
+            "strong_risk_multiplier",
+            "elite_risk_multiplier",
+            "base_risk_percent",
+            "base_risk_percent_min",
+            "base_risk_percent_max",
+            "strong_risk_percent",
+            "strong_risk_percent_min",
+            "strong_risk_percent_max",
+            "elite_risk_percent",
+            "elite_risk_percent_min",
+            "elite_risk_percent_max",
+            "daily_loss_limit_percent",
+            "initial_entry_fraction",
+            "pyramiding_enabled",
+            "pyramid_trigger_r",
+            "pyramid_target_fractions",
+            "partial_take_profit_r_multiple",
+            "partial_take_profit_ratio",
+            "runner_pct",
+            "atr_trailing_activation_r",
+            "atr_trailing_multiplier",
+        )
+        for key in v2_keys:
+            normalized[key] = defaults[key]
+    normalized["profile_version"] = ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION
 
     universe_mode = str(
         normalized.get("universe_mode", "auto") or "auto"
@@ -123,6 +194,46 @@ def normalize_adaptive_breakout_trend_config(
         configured_crossover_floor,
         broad_momentum_floor * crossover_floor_ratio,
     )
+    normalized["initial_entry_fraction"] = _bounded(
+        _finite(normalized.get("initial_entry_fraction"), defaults["initial_entry_fraction"]),
+        0.40,
+        1.00,
+    )
+    try:
+        triggers = tuple(float(value) for value in normalized.get("pyramid_trigger_r", ()))
+        targets = tuple(float(value) for value in normalized.get("pyramid_target_fractions", ()))
+    except (TypeError, ValueError):
+        triggers, targets = (), ()
+    if not triggers or len(triggers) != len(targets):
+        triggers = tuple(defaults["pyramid_trigger_r"])
+        targets = tuple(defaults["pyramid_target_fractions"])
+    ordered_stages = sorted(
+        (
+            max(0.10, trigger),
+            _bounded(target, normalized["initial_entry_fraction"], 1.00),
+        )
+        for trigger, target in zip(triggers, targets)
+    )
+    monotonic_targets: list[float] = []
+    target_floor = normalized["initial_entry_fraction"]
+    for _, target in ordered_stages:
+        target_floor = max(target_floor, target)
+        monotonic_targets.append(target_floor)
+    normalized["pyramid_trigger_r"] = tuple(stage[0] for stage in ordered_stages)
+    normalized["pyramid_target_fractions"] = tuple(monotonic_targets)
+    for tier in ("base", "strong", "elite"):
+        floor_key = f"{tier}_risk_percent_min"
+        cap_key = f"{tier}_risk_percent_max"
+        target_key = f"{tier}_risk_percent"
+        floor_value = max(0.0, float(_finite(normalized.get(floor_key), defaults[floor_key])))
+        cap_value = max(floor_value, float(_finite(normalized.get(cap_key), defaults[cap_key])))
+        normalized[floor_key] = floor_value
+        normalized[cap_key] = cap_value
+        normalized[target_key] = _bounded(
+            _finite(normalized.get(target_key), defaults[target_key]),
+            floor_value,
+            cap_value,
+        )
     return normalized
 
 
@@ -386,6 +497,41 @@ def evaluate_adaptive_breakout_trend(
         and fast_vote not in {None, side}
         and not (breakout_entry_enabled and fresh_breakout)
     )
+    continuation_bars = max(
+        1,
+        min(
+            len(closes) - 1,
+            int(cfg.get("continuation_reacceleration_bars", 2) or 2),
+        ),
+    )
+    signed_fast_ema_distance_atr = (
+        (closes[-1] - fast_ema[-1]) / atr_value
+        if side == "long"
+        else (fast_ema[-1] - closes[-1]) / atr_value
+        if side == "short"
+        else 0.0
+    )
+    continuation_reacceleration = bool(
+        side == "long"
+        and closes[-1] > closes[-1 - continuation_bars]
+        and fast_ema[-1] > fast_ema[-1 - continuation_bars]
+    ) or bool(
+        side == "short"
+        and closes[-1] < closes[-1 - continuation_bars]
+        and fast_ema[-1] < fast_ema[-1 - continuation_bars]
+    )
+    weighted_continuation = bool(
+        cfg.get("continuation_entry_enabled", True)
+        and ema_aligned
+        and dominant_votes >= minimum_votes
+        and abs(weighted_momentum)
+        >= float(cfg.get("continuation_minimum_momentum_strength", 0.26) or 0.26)
+        and efficiency
+        >= float(cfg.get("continuation_minimum_trend_efficiency", 0.18) or 0.18)
+        and 0.0 <= signed_fast_ema_distance_atr
+        <= float(cfg.get("continuation_max_fast_ema_distance_atr", 1.10) or 1.10)
+        and continuation_reacceleration
+    )
 
     volumes = [float(row.get("volume") or 0.0) for row in candles]
     baseline_volume = median(volumes[-49:-1]) if len(volumes) >= 49 else median(volumes[:-1])
@@ -425,6 +571,9 @@ def evaluate_adaptive_breakout_trend(
         "fresh_breakout": fresh_breakout,
         "reacceleration": reacceleration,
         "turning_conflict": turning_conflict,
+        "weighted_continuation": weighted_continuation,
+        "continuation_reacceleration": continuation_reacceleration,
+        "signed_fast_ema_distance_atr": signed_fast_ema_distance_atr,
         "trend_efficiency": efficiency,
         "latest_range_atr": latest_range_atr,
         "volume_ratio": volume_ratio,
@@ -436,6 +585,8 @@ def evaluate_adaptive_breakout_trend(
     minimum_momentum_strength = (
         float(cfg["ema_crossover_minimum_momentum_strength"])
         if ema_crossover
+        else float(cfg.get("continuation_minimum_momentum_strength", 0.26))
+        if weighted_continuation
         else float(cfg["minimum_momentum_strength"])
     )
     metrics["minimum_momentum_strength_required"] = minimum_momentum_strength
@@ -450,11 +601,13 @@ def evaluate_adaptive_breakout_trend(
     breakout_entry = bool(
         breakout_entry_enabled and (fresh_breakout or reacceleration)
     )
-    if not ema_crossover and not breakout_entry:
-        return AdaptiveBreakoutTrendDecision(side=side, reason="waiting_for_ema_crossover", metrics=metrics)
+    if not ema_crossover and not breakout_entry and not weighted_continuation:
+        return AdaptiveBreakoutTrendDecision(side=side, reason="waiting_for_weighted_trend_entry", metrics=metrics)
     minimum_efficiency = (
         float(cfg.get("ema_crossover_minimum_trend_efficiency", 0.0) or 0.0)
         if ema_crossover
+        else float(cfg.get("continuation_minimum_trend_efficiency", 0.18) or 0.18)
+        if weighted_continuation
         else float(cfg["minimum_trend_efficiency"])
     )
     if efficiency < minimum_efficiency:
@@ -469,7 +622,7 @@ def evaluate_adaptive_breakout_trend(
     score = 44.0
     score += min(18.0, abs(weighted_momentum) * 24.0)
     score += min(12.0, dominant_votes * 4.0)
-    score += 7.0 if ema_crossover else 8.0 if fresh_breakout else 5.0
+    score += 7.0 if ema_crossover else 8.0 if fresh_breakout else 6.0 if weighted_continuation else 5.0
     score += min(10.0, efficiency * 22.0)
     score += min(4.0, max(0.0, volume_ratio - 0.70) * 3.0)
     if slow_vote == side:
@@ -500,12 +653,18 @@ def evaluate_adaptive_breakout_trend(
     risk_multiplier = _bounded(quality_risk * volatility_scale, 0.0, 1.0)
     if l2_gate is not None:
         risk_multiplier = min(risk_multiplier, max(0.0, l2_multiplier))
+    target_risk_percent = _bounded(
+        float(cfg[f"{risk_tier}_risk_percent"]) * volatility_scale,
+        float(cfg[f"{risk_tier}_risk_percent_min"]),
+        float(cfg[f"{risk_tier}_risk_percent_max"]),
+    )
     metrics.update({
         "raw_volatility_scale": raw_volatility_scale,
         "volatility_scale": volatility_scale,
         "quality_risk_multiplier": quality_risk,
         "risk_tier": risk_tier,
         "risk_multiplier": risk_multiplier,
+        "target_risk_percent": target_risk_percent,
     })
     if ema_crossover and ema_crossover_index is not None:
         metrics["reference_price"] = closes[ema_crossover_index]
@@ -515,6 +674,8 @@ def evaluate_adaptive_breakout_trend(
         if ema_crossover
         else "fresh breakout"
         if fresh_breakout
+        else "weighted continuation"
+        if weighted_continuation
         else "trend re-acceleration"
     )
     return AdaptiveBreakoutTrendDecision(
@@ -525,7 +686,7 @@ def evaluate_adaptive_breakout_trend(
         reason=(
             f"Adaptive Breakout Trend {side} {mode}: score={score:.1f} "
             f"momentum={weighted_momentum:+.2f} votes={dominant_votes}/{len(horizons)} "
-            f"risk={risk_multiplier:.2f}"
+            f"risk={target_risk_percent:.2f}% ({risk_tier})"
         ),
         metrics=metrics,
     )
@@ -533,6 +694,7 @@ def evaluate_adaptive_breakout_trend(
 
 __all__ = (
     "ADAPTIVE_BREAKOUT_TREND_STRATEGY",
+    "ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION",
     "AdaptiveBreakoutTrendDecision",
     "default_adaptive_breakout_trend_config",
     "evaluate_adaptive_breakout_trend",

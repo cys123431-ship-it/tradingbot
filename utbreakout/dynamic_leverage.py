@@ -46,6 +46,12 @@ def default_dynamic_leverage_config() -> dict[str, Any]:
         "opportunity_trailing_activation_r": 1.25,
         "high_leverage_trailing_activation_r": 1.00,
         "adaptive_trend_enabled": True,
+        "adaptive_trend_profile_version": "adaptive_trend_leverage_v2",
+        "adaptive_trend_base_leverage": 5,
+        "adaptive_trend_opportunity_leverage": 8,
+        "adaptive_trend_strong_leverage": 10,
+        "adaptive_trend_elite_leverage": 15,
+        "adaptive_trend_max_leverage": 15,
         "adaptive_trend_elite_score_min": 94.0,
         "adaptive_trend_strong_score_min": 90.0,
         "adaptive_trend_opportunity_score_min": 84.0,
@@ -85,7 +91,25 @@ def _bounded(value: Any, lower: float, upper: float, default: float) -> float:
 def normalize_dynamic_leverage_config(
     config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    cfg = {**default_dynamic_leverage_config(), **dict(config or {})}
+    supplied = dict(config or {})
+    cfg = {**default_dynamic_leverage_config(), **supplied}
+    migrating_adaptive_trend = bool(
+        supplied
+        and supplied.get("adaptive_trend_profile_version")
+        != "adaptive_trend_leverage_v2"
+    )
+    if migrating_adaptive_trend:
+        for key in (
+            "adaptive_trend_base_leverage",
+            "adaptive_trend_opportunity_leverage",
+            "adaptive_trend_strong_leverage",
+            "adaptive_trend_elite_leverage",
+            "adaptive_trend_max_leverage",
+        ):
+            cfg[key] = default_dynamic_leverage_config()[key]
+    elif "adaptive_trend_max_leverage" not in supplied and "max_leverage" in supplied:
+        cfg["adaptive_trend_max_leverage"] = supplied["max_leverage"]
+    cfg["adaptive_trend_profile_version"] = "adaptive_trend_leverage_v2"
     enabled = cfg.get("enabled", True)
     cfg["enabled"] = (
         enabled
@@ -115,6 +139,35 @@ def normalize_dynamic_leverage_config(
     )
     cfg["base_leverage"] = int(
         _bounded(cfg.get("base_leverage"), cfg["min_leverage"], cfg["max_leverage"], 4)
+    )
+    cfg["adaptive_trend_max_leverage"] = int(
+        _bounded(cfg.get("adaptive_trend_max_leverage"), 1, 15, 15)
+    )
+    for key, default in (
+        ("adaptive_trend_base_leverage", 5),
+        ("adaptive_trend_opportunity_leverage", 8),
+        ("adaptive_trend_strong_leverage", 10),
+        ("adaptive_trend_elite_leverage", 15),
+    ):
+        cfg[key] = int(
+            _bounded(
+                cfg.get(key),
+                1,
+                cfg["adaptive_trend_max_leverage"],
+                min(default, cfg["adaptive_trend_max_leverage"]),
+            )
+        )
+    cfg["adaptive_trend_opportunity_leverage"] = max(
+        cfg["adaptive_trend_base_leverage"],
+        cfg["adaptive_trend_opportunity_leverage"],
+    )
+    cfg["adaptive_trend_strong_leverage"] = max(
+        cfg["adaptive_trend_opportunity_leverage"],
+        cfg["adaptive_trend_strong_leverage"],
+    )
+    cfg["adaptive_trend_elite_leverage"] = max(
+        cfg["adaptive_trend_strong_leverage"],
+        cfg["adaptive_trend_elite_leverage"],
     )
     for key, lower, upper in (
         ("normal_atr_pct_min", 0.0, 10.0),
@@ -435,8 +488,8 @@ def _select_adaptive_trend_leverage(
     """Select trend leverage from signal quality and stop-to-liquidation room."""
 
     minimum = int(cfg["min_leverage"])
-    maximum = int(cfg["max_leverage"])
-    base = int(cfg["base_leverage"])
+    maximum = int(cfg["adaptive_trend_max_leverage"])
+    base = int(cfg["adaptive_trend_base_leverage"])
     stop_buffer_cap = maximum
     if stop_pct is not None and stop_pct > 0:
         stop_buffer_cap = int(
@@ -466,7 +519,7 @@ def _select_adaptive_trend_leverage(
     data_complete = atr_pct is not None and stop_pct is not None and l2_observable
 
     tier = "adaptive_trend_standard"
-    leverage = min(base, 5)
+    leverage = min(base, maximum)
     if l2_state in {"stressed", "stressed_thin"}:
         tier = "adaptive_trend_defensive_l2"
         leverage = minimum
@@ -488,7 +541,7 @@ def _select_adaptive_trend_leverage(
         )
     ):
         tier = "adaptive_trend_elite"
-        leverage = maximum
+        leverage = min(maximum, int(cfg["adaptive_trend_elite_leverage"]))
     elif data_complete and all(
         (
             quality >= cfg["adaptive_trend_strong_score_min"],
@@ -501,7 +554,7 @@ def _select_adaptive_trend_leverage(
         )
     ):
         tier = "adaptive_trend_strong"
-        leverage = min(maximum, 8)
+        leverage = min(maximum, int(cfg["adaptive_trend_strong_leverage"]))
     elif data_complete and all(
         (
             quality >= cfg["adaptive_trend_opportunity_score_min"],
@@ -514,7 +567,7 @@ def _select_adaptive_trend_leverage(
         )
     ):
         tier = "adaptive_trend_opportunity"
-        leverage = min(maximum, 6)
+        leverage = min(maximum, int(cfg["adaptive_trend_opportunity_leverage"]))
     elif not data_complete:
         tier = "adaptive_trend_data_fallback"
         leverage = min(leverage, 4)
@@ -784,6 +837,10 @@ def apply_dynamic_leverage_to_plan(
             updated[field] = updated.get(original_field)
     decision = select_dynamic_leverage(updated, cfg)
     leverage = int(decision.leverage)
+    is_adaptive_trend = (
+        str(updated.get("strategy") or "").strip().lower()
+        == "adaptive_breakout_trend_v1"
+    )
     small_account_policy = resolve_small_account_full_margin(
         cfg,
         account_equity=account_equity,
@@ -804,9 +861,14 @@ def apply_dynamic_leverage_to_plan(
     decision_tier = decision.tier
     decision_reason = decision.reason
     if small_account_policy["active"]:
-        decision_tier = f"{decision_tier}+small_account_full_margin"
+        small_account_label = (
+            "small_account_min_leverage"
+            if is_adaptive_trend
+            else "small_account_full_margin"
+        )
+        decision_tier = f"{decision_tier}+{small_account_label}"
         decision_reason = (
-            f"{decision_reason}; small account full margin: "
+            f"{decision_reason}; small account {small_account_label}: "
             f"equity={small_account_policy['account_equity']:.2f} "
             f"<= {small_account_policy['equity_threshold_usdt']:.2f}, "
             f"free={small_account_policy['free_balance']:.2f}, "
@@ -829,7 +891,7 @@ def apply_dynamic_leverage_to_plan(
             "dynamic_leverage_reason": decision_reason,
             "dynamic_leverage_decision": decision_payload,
             "small_account_full_margin_applied": bool(
-                small_account_policy["active"]
+                small_account_policy["active"] and not is_adaptive_trend
             ),
             "small_account_equity_usdt": float(
                 small_account_policy["account_equity"]
@@ -843,7 +905,9 @@ def apply_dynamic_leverage_to_plan(
         }
     )
 
-    if not cfg["enabled"] and not small_account_policy["active"]:
+    if not cfg["enabled"] and not (
+        small_account_policy["active"] and not is_adaptive_trend
+    ):
         current_notional = max(
             0.0, float(_finite(updated.get("planned_notional"), 0.0))
         )
@@ -867,9 +931,12 @@ def apply_dynamic_leverage_to_plan(
     )
     free = _finite(free_balance)
     if free is not None:
+        full_margin_active = bool(
+            small_account_policy["active"] and not is_adaptive_trend
+        )
         effective_safety_buffer = (
             1.0
-            if small_account_policy["active"]
+            if full_margin_active
             else max(0.0, min(1.0, safety_buffer))
         )
         margin_cap_notional = (
@@ -877,7 +944,7 @@ def apply_dynamic_leverage_to_plan(
         )
         target_notional = (
             margin_cap_notional
-            if small_account_policy["active"]
+            if full_margin_active
             else min(desired_notional, margin_cap_notional)
         )
         entry = max(0.0, float(_finite(updated.get("entry_price"), 0.0)))
@@ -913,18 +980,26 @@ def apply_dynamic_leverage_to_plan(
                     ),
                     "small_account_target_margin_usdt": (
                         max(0.0, free)
-                        if small_account_policy["active"]
+                        if full_margin_active
                         else 0.0
                     ),
                     "small_account_margin_utilization": (
-                        1.0 if small_account_policy["active"] else 0.0
+                        1.0 if full_margin_active else 0.0
                     ),
                 }
             )
     elif current_notional > 0:
         updated["planned_margin"] = current_notional / max(float(leverage), 1.0)
 
-    if leverage >= 8:
+    if is_adaptive_trend and leverage >= 6:
+        # High leverage changes margin efficiency, not the trend's economic
+        # horizon.  The previous generic shortcut forced an elite 1h trend
+        # into an 8-bar time stop and 1R trail, cutting the large winners the
+        # strategy is designed to capture.
+        updated["dynamic_leverage_monitor_timeframe"] = cfg[
+            "opportunity_monitor_timeframe"
+        ]
+    elif leverage >= 8:
         updated["dynamic_leverage_monitor_timeframe"] = cfg[
             "opportunity_monitor_timeframe"
         ]

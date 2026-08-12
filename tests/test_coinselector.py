@@ -121,6 +121,31 @@ def test_custom_symbols_normalize_and_dedupe_to_usdt_pairs():
     assert symbols == ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 
 
+def test_adaptive_trend_ranking_prefers_actionable_relative_strength():
+    weak_generic = {
+        "symbol": "WEAK/USDT:USDT",
+        "scanner_accepted": True,
+        "score": 99.0,
+        "quote_volume": 1_000_000_000.0,
+        "adaptive_breakout_trend_allowed": False,
+        "adaptive_breakout_trend_score": 0.0,
+        "adaptive_breakout_trend_weighted_momentum": 0.0,
+    }
+    strong_trend = {
+        "symbol": "TREND/USDT:USDT",
+        "scanner_accepted": True,
+        "score": 70.0,
+        "quote_volume": 250_000_000.0,
+        "adaptive_breakout_trend_allowed": True,
+        "adaptive_breakout_trend_score": 91.0,
+        "adaptive_breakout_trend_weighted_momentum": 0.82,
+    }
+
+    ranked = rank_candidates([weak_generic, strong_trend], top_n=2)
+
+    assert ranked[0]["symbol"] == "TREND/USDT:USDT"
+
+
 def test_custom_discovery_never_relaxes_hard_quote_volume_floor():
     strict_cfg = default_coin_selector_config()
     relaxed_cfg = dict(strict_cfg)
