@@ -10,12 +10,13 @@ struct PriceLine {
     width: f32,
 }
 
-pub fn show(ui: &mut egui::Ui, state: &MonitorState) {
+pub fn show(ui: &mut egui::Ui, state: &MonitorState, light_mode: bool) {
+    let palette = Palette::new(light_mode);
     let available = ui.available_size();
     let desired = Vec2::new(available.x.max(420.0), available.y.max(330.0));
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 8.0, Color32::from_rgb(13, 18, 27));
+    painter.rect_filled(rect, 8.0, palette.background);
 
     if state.candles.len() < 2 {
         painter.text(
@@ -23,7 +24,7 @@ pub fn show(ui: &mut egui::Ui, state: &MonitorState) {
             Align2::CENTER_CENTER,
             "차트 데이터를 기다리는 중…",
             FontId::proportional(18.0),
-            Color32::from_gray(150),
+            palette.secondary_text,
         );
         return;
     }
@@ -35,16 +36,21 @@ pub fn show(ui: &mut egui::Ui, state: &MonitorState) {
     let max_visible = ((chart.width() / 7.0).floor() as usize).clamp(40, 220);
     let first = state.candles.len().saturating_sub(max_visible);
     let candles = &state.candles[first..];
-    let lines = price_lines(state);
+    let lines = price_lines(state, light_mode);
     let (low, high) = price_bounds(candles, &lines);
     let span = (high - low).max(f64::EPSILON);
 
     painter.text(
         Pos2::new(chart.left(), rect.top() + 7.0),
         Align2::LEFT_TOP,
-        format!("{} · {} · {}봉", state.symbol, state.timeframe, candles.len()),
+        format!(
+            "{} · {} · {}봉",
+            state.symbol,
+            state.timeframe,
+            candles.len()
+        ),
         FontId::proportional(16.0),
-        Color32::from_rgb(220, 225, 235),
+        palette.primary_text,
     );
 
     for index in 0..=5 {
@@ -52,7 +58,7 @@ pub fn show(ui: &mut egui::Ui, state: &MonitorState) {
         let y = egui::lerp(chart.top()..=chart.bottom(), ratio);
         painter.line_segment(
             [Pos2::new(chart.left(), y), Pos2::new(chart.right(), y)],
-            Stroke::new(1.0, Color32::from_rgb(34, 42, 55)),
+            Stroke::new(1.0, palette.grid),
         );
         let price = high - span * ratio as f64;
         painter.text(
@@ -60,7 +66,7 @@ pub fn show(ui: &mut egui::Ui, state: &MonitorState) {
             Align2::LEFT_CENTER,
             format_price(price),
             FontId::monospace(11.0),
-            Color32::from_gray(125),
+            palette.secondary_text,
         );
     }
 
@@ -73,9 +79,9 @@ pub fn show(ui: &mut egui::Ui, state: &MonitorState) {
         let close_y = y_for(candle.close, chart, low, span);
         let up = candle.close >= candle.open;
         let color = if up {
-            Color32::from_rgb(38, 198, 139)
+            palette.up_candle
         } else {
-            Color32::from_rgb(239, 83, 80)
+            palette.down_candle
         };
         painter.line_segment(
             [Pos2::new(x, high_y), Pos2::new(x, low_y)],
@@ -83,7 +89,10 @@ pub fn show(ui: &mut egui::Ui, state: &MonitorState) {
         );
         let body = Rect::from_min_max(
             Pos2::new(x - candle_width * 0.32, open_y.min(close_y)),
-            Pos2::new(x + candle_width * 0.32, open_y.max(close_y).max(open_y.min(close_y) + 1.0)),
+            Pos2::new(
+                x + candle_width * 0.32,
+                open_y.max(close_y).max(open_y.min(close_y) + 1.0),
+            ),
         );
         if up {
             painter.rect_stroke(body, 0.0, Stroke::new(1.2, color), StrokeKind::Inside);
@@ -133,14 +142,15 @@ fn price_bounds(candles: &[Candle], lines: &[PriceLine]) -> (f64, f64) {
     (low - padding, high + padding)
 }
 
-fn price_lines(state: &MonitorState) -> Vec<PriceLine> {
+fn price_lines(state: &MonitorState, light_mode: bool) -> Vec<PriceLine> {
+    let palette = Palette::new(light_mode);
     let mut lines = Vec::new();
     if let Some(position) = &state.position {
         if position.entry_price > 0.0 {
             lines.push(PriceLine {
                 price: position.entry_price,
                 label: "진입".into(),
-                color: Color32::from_rgb(76, 139, 245),
+                color: palette.entry,
                 width: 1.5,
             });
         }
@@ -148,13 +158,20 @@ fn price_lines(state: &MonitorState) -> Vec<PriceLine> {
             lines.push(PriceLine {
                 price: position.mark_price,
                 label: "현재".into(),
-                color: Color32::from_rgb(255, 193, 7),
+                color: palette.current,
                 width: 1.0,
             });
         }
     }
-    let position_side = state.position.as_ref().map(|position| position.side.as_str());
-    let entry = state.position.as_ref().map(|position| position.entry_price).unwrap_or(0.0);
+    let position_side = state
+        .position
+        .as_ref()
+        .map(|position| position.side.as_str());
+    let entry = state
+        .position
+        .as_ref()
+        .map(|position| position.entry_price)
+        .unwrap_or(0.0);
     let mut tp_index = 0;
     for order in &state.orders {
         let Some(price) = order.price.filter(|price| *price > 0.0) else {
@@ -174,26 +191,75 @@ fn price_lines(state: &MonitorState) -> Vec<PriceLine> {
             lines.push(PriceLine {
                 price,
                 label: format!("TP{tp_index}"),
-                color: Color32::from_rgb(56, 201, 126),
+                color: palette.take_profit,
                 width: 1.3,
             });
         } else if kind.contains("STOP") {
             lines.push(PriceLine {
                 price,
                 label: "SL".into(),
-                color: Color32::from_rgb(255, 82, 82),
+                color: palette.stop_loss,
                 width: 1.5,
             });
         } else {
             lines.push(PriceLine {
                 price,
                 label: "주문".into(),
-                color: Color32::from_rgb(186, 104, 200),
+                color: palette.order,
                 width: 1.0,
             });
         }
     }
     lines
+}
+
+#[derive(Clone, Copy)]
+struct Palette {
+    background: Color32,
+    grid: Color32,
+    primary_text: Color32,
+    secondary_text: Color32,
+    up_candle: Color32,
+    down_candle: Color32,
+    entry: Color32,
+    current: Color32,
+    take_profit: Color32,
+    stop_loss: Color32,
+    order: Color32,
+}
+
+impl Palette {
+    fn new(light_mode: bool) -> Self {
+        if light_mode {
+            Self {
+                background: Color32::from_rgb(248, 250, 253),
+                grid: Color32::from_rgb(218, 224, 232),
+                primary_text: Color32::from_rgb(34, 41, 51),
+                secondary_text: Color32::from_rgb(100, 110, 125),
+                up_candle: Color32::from_rgb(0, 145, 105),
+                down_candle: Color32::from_rgb(215, 58, 65),
+                entry: Color32::from_rgb(35, 105, 220),
+                current: Color32::from_rgb(205, 125, 0),
+                take_profit: Color32::from_rgb(0, 140, 80),
+                stop_loss: Color32::from_rgb(215, 45, 55),
+                order: Color32::from_rgb(145, 70, 170),
+            }
+        } else {
+            Self {
+                background: Color32::from_rgb(13, 18, 27),
+                grid: Color32::from_rgb(34, 42, 55),
+                primary_text: Color32::from_rgb(220, 225, 235),
+                secondary_text: Color32::from_gray(125),
+                up_candle: Color32::from_rgb(38, 198, 139),
+                down_candle: Color32::from_rgb(239, 83, 80),
+                entry: Color32::from_rgb(76, 139, 245),
+                current: Color32::from_rgb(255, 193, 7),
+                take_profit: Color32::from_rgb(56, 201, 126),
+                stop_loss: Color32::from_rgb(255, 82, 82),
+                order: Color32::from_rgb(186, 104, 200),
+            }
+        }
+    }
 }
 
 pub fn format_price(value: f64) -> String {

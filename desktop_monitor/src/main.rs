@@ -19,18 +19,67 @@ enum Connection {
     Disconnected,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Theme {
+    Dark,
+    Light,
+}
+
+impl Theme {
+    fn load() -> Self {
+        let Some(path) = theme_path() else {
+            return Self::Dark;
+        };
+        match std::fs::read_to_string(path) {
+            Ok(value) if value.trim().eq_ignore_ascii_case("light") => Self::Light,
+            _ => Self::Dark,
+        }
+    }
+
+    fn save(self) {
+        let Some(path) = theme_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let value = if self == Self::Light { "light" } else { "dark" };
+        let _ = std::fs::write(path, value);
+    }
+
+    fn apply(self, ctx: &egui::Context) {
+        ctx.set_visuals(if self == Self::Light {
+            egui::Visuals::light()
+        } else {
+            egui::Visuals::dark()
+        });
+    }
+
+    fn toggle(&mut self, ctx: &egui::Context) {
+        *self = if *self == Self::Dark {
+            Self::Light
+        } else {
+            Self::Dark
+        };
+        self.apply(ctx);
+        self.save();
+    }
+}
+
 struct MonitorApp {
     rx: Receiver<StreamEvent>,
     stop: Arc<AtomicBool>,
     state: MonitorState,
     connection: Connection,
     last_received: Option<Instant>,
+    theme: Theme,
 }
 
 impl MonitorApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_korean_font(&cc.egui_ctx);
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        let theme = Theme::load();
+        theme.apply(&cc.egui_ctx);
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         stream::spawn(tx, stop.clone());
@@ -40,6 +89,7 @@ impl MonitorApp {
             state: MonitorState::default(),
             connection: Connection::Connecting,
             last_received: None,
+            theme,
         }
     }
 
@@ -67,7 +117,7 @@ impl MonitorApp {
         }
     }
 
-    fn header(&self, ui: &mut egui::Ui) {
+    fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading(RichText::new("TradingBot Monitor").size(22.0));
             ui.separator();
@@ -86,6 +136,15 @@ impl MonitorApp {
             if self.state.runtime.bot.paused {
                 ui.separator();
                 ui.colored_label(Color32::from_rgb(255, 193, 7), "봇 PAUSED");
+            }
+            ui.separator();
+            let theme_label = if self.theme == Theme::Dark {
+                "☀ Light"
+            } else {
+                "☾ Dark"
+            };
+            if ui.button(theme_label).clicked() {
+                self.theme.toggle(ui.ctx());
             }
         });
     }
@@ -112,13 +171,20 @@ impl MonitorApp {
                     row(
                         ui,
                         "전략",
-                        position.strategy.as_deref().unwrap_or("수동 또는 식별 불가"),
+                        position
+                            .strategy
+                            .as_deref()
+                            .unwrap_or("수동 또는 식별 불가"),
                     );
                     row(ui, "진입가", &chart::format_price(position.entry_price));
                     row(ui, "현재가", &chart::format_price(position.mark_price));
                     row(ui, "증거금", &format!("{:.2} USDT", position.margin_usdt));
                     row(ui, "포지션", &format!("{:.2} USDT", position.notional_usdt));
-                    row(ui, "미실현 PnL", &format!("{:+.2} USDT", position.unrealized_pnl));
+                    row(
+                        ui,
+                        "미실현 PnL",
+                        &format!("{:+.2} USDT", position.unrealized_pnl),
+                    );
                     row(
                         ui,
                         "ROE",
@@ -188,7 +254,11 @@ impl MonitorApp {
                     ui.label(side);
                 }
             });
-            ui.label(RichText::new(&strategy.reason).small().color(Color32::from_gray(155)));
+            ui.label(
+                RichText::new(&strategy.reason)
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
             ui.add_space(5.0);
         }
     }
@@ -251,7 +321,7 @@ impl eframe::App for MonitorApp {
             ui.allocate_ui_with_layout(
                 egui::vec2(chart_width, available.y),
                 egui::Layout::top_down(egui::Align::Min),
-                |ui| chart::show(ui, &self.state),
+                |ui| chart::show(ui, &self.state, self.theme == Theme::Light),
             );
             ui.separator();
             ui.allocate_ui_with_layout(
@@ -279,21 +349,28 @@ impl eframe::App for MonitorApp {
                                 }
                             ))
                             .small()
-                            .color(Color32::from_gray(120)),
+                            .color(ui.visuals().weak_text_color()),
                         );
                     });
                 },
             );
         });
-        ui.ctx()
-            .request_repaint_after(Duration::from_millis(250));
+        ui.ctx().request_repaint_after(Duration::from_millis(250));
     }
 }
 
 fn row(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.label(RichText::new(label).color(Color32::from_gray(145)));
+    ui.label(RichText::new(label).color(ui.visuals().weak_text_color()));
     ui.label(value);
     ui.end_row();
+}
+
+fn theme_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|root| {
+        std::path::PathBuf::from(root)
+            .join("TradingBotMonitor")
+            .join("theme.txt")
+    })
 }
 
 fn install_korean_font(ctx: &egui::Context) {
