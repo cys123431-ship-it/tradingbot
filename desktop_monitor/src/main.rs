@@ -186,7 +186,7 @@ impl MonitorApp {
                             .unwrap_or("수동 또는 식별 불가"),
                     );
                     row(ui, "진입가", &chart::format_price(position.entry_price));
-                    row(ui, "현재가", &chart::format_price(position.mark_price));
+                    row(ui, "마크가", &chart::format_price(position.mark_price));
                     row(ui, "증거금", &format!("{:.2} USDT", position.margin_usdt));
                     row(ui, "포지션", &format!("{:.2} USDT", position.notional_usdt));
                     row(

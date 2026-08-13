@@ -8,6 +8,7 @@ struct PriceLine {
     label: String,
     color: Color32,
     width: f32,
+    directional_percent: Option<f64>,
 }
 
 pub fn show(ui: &mut egui::Ui, state: &MonitorState, light_mode: bool) {
@@ -31,13 +32,16 @@ pub fn show(ui: &mut egui::Ui, state: &MonitorState, light_mode: bool) {
 
     let chart = Rect::from_min_max(
         Pos2::new(rect.left() + 10.0, rect.top() + 28.0),
-        Pos2::new(rect.right() - 104.0, rect.bottom() - 22.0),
+        Pos2::new(rect.right() - 172.0, rect.bottom() - 22.0),
     );
     let max_visible = ((chart.width() / 7.0).floor() as usize).clamp(40, 220);
     let first = state.candles.len().saturating_sub(max_visible);
     let candles = &state.candles[first..];
-    let lines = price_lines(state, light_mode);
-    let (low, high) = price_bounds(candles, &lines);
+    let latest_trade_price = candles.last().map(|candle| candle.close).unwrap_or(0.0);
+    let lines = price_lines(state, light_mode, latest_trade_price);
+    // Keep the viewport focused on price action. Distant SL/TP levels are
+    // projected to an edge marker instead of shrinking every candle.
+    let (low, high) = price_bounds(candles);
     let span = (high - low).max(f64::EPSILON);
 
     painter.text(
@@ -101,19 +105,47 @@ pub fn show(ui: &mut egui::Ui, state: &MonitorState, light_mode: bool) {
         }
     }
 
+    let mut above_lane = 0usize;
+    let mut below_lane = 0usize;
     for line in lines {
-        if !(low..=high).contains(&line.price) {
-            continue;
-        }
-        let y = y_for(line.price, chart, low, span);
+        let placement = line_placement(line.price, low, high);
+        let (y, prefix, line_start) = match placement {
+            LinePlacement::Visible => (y_for(line.price, chart, low, span), "", chart.left()),
+            LinePlacement::Above => {
+                let lane = above_lane;
+                above_lane += 1;
+                (
+                    chart.top() + 17.0 + lane as f32 * 15.0,
+                    "↑ ",
+                    chart.right() - 64.0,
+                )
+            }
+            LinePlacement::Below => {
+                let lane = below_lane;
+                below_lane += 1;
+                (
+                    chart.bottom() - 17.0 - lane as f32 * 15.0,
+                    "↓ ",
+                    chart.right() - 64.0,
+                )
+            }
+        };
         painter.line_segment(
-            [Pos2::new(chart.left(), y), Pos2::new(chart.right(), y)],
+            [Pos2::new(line_start, y), Pos2::new(chart.right(), y)],
             Stroke::new(line.width, line.color),
         );
+        let distance = line
+            .directional_percent
+            .map(|percent| format!(" ({percent:+.2}%)"))
+            .unwrap_or_default();
         painter.text(
             Pos2::new(chart.right() + 8.0, y),
             Align2::LEFT_CENTER,
-            format!("{} {}", line.label, format_price(line.price)),
+            format!(
+                "{prefix}{} {}{distance}",
+                line.label,
+                format_price(line.price)
+            ),
             FontId::monospace(11.0),
             line.color,
         );
@@ -124,25 +156,40 @@ fn y_for(price: f64, chart: Rect, low: f64, span: f64) -> f32 {
     chart.bottom() - ((price - low) / span) as f32 * chart.height()
 }
 
-fn price_bounds(candles: &[Candle], lines: &[PriceLine]) -> (f64, f64) {
+fn price_bounds(candles: &[Candle]) -> (f64, f64) {
     let mut low = f64::INFINITY;
     let mut high = f64::NEG_INFINITY;
     for candle in candles {
         low = low.min(candle.low);
         high = high.max(candle.high);
     }
-    for line in lines {
-        low = low.min(line.price);
-        high = high.max(line.price);
-    }
     if !low.is_finite() || !high.is_finite() || high <= low {
         return (0.0, 1.0);
     }
-    let padding = (high - low) * 0.08;
+    let center = (high + low) * 0.5;
+    let visible_range = (high - low).max(center.abs() * 0.002);
+    let padding = visible_range * 0.10;
     (low - padding, high + padding)
 }
 
-fn price_lines(state: &MonitorState, light_mode: bool) -> Vec<PriceLine> {
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LinePlacement {
+    Above,
+    Visible,
+    Below,
+}
+
+fn line_placement(price: f64, low: f64, high: f64) -> LinePlacement {
+    if price > high {
+        LinePlacement::Above
+    } else if price < low {
+        LinePlacement::Below
+    } else {
+        LinePlacement::Visible
+    }
+}
+
+fn price_lines(state: &MonitorState, light_mode: bool, latest_trade_price: f64) -> Vec<PriceLine> {
     let palette = Palette::new(light_mode);
     let mut lines = Vec::new();
     if let Some(position) = &state.position {
@@ -152,14 +199,20 @@ fn price_lines(state: &MonitorState, light_mode: bool) -> Vec<PriceLine> {
                 label: "진입".into(),
                 color: palette.entry,
                 width: 1.5,
+                directional_percent: None,
             });
         }
-        if position.mark_price > 0.0 {
+        if latest_trade_price > 0.0 {
             lines.push(PriceLine {
-                price: position.mark_price,
+                price: latest_trade_price,
                 label: "현재".into(),
                 color: palette.current,
                 width: 1.0,
+                directional_percent: directional_percent(
+                    latest_trade_price,
+                    position.entry_price,
+                    &position.side,
+                ),
             });
         }
     }
@@ -188,18 +241,33 @@ fn price_lines(state: &MonitorState, light_mode: bool) -> Vec<PriceLine> {
                 });
         if is_take_profit {
             tp_index += 1;
-            lines.push(PriceLine {
-                price,
-                label: format!("TP{tp_index}"),
-                color: palette.take_profit,
-                width: 1.3,
-            });
+            let label = format!("TP{tp_index}");
+            if let Some(existing) = lines.iter_mut().find(|line| {
+                line.label.starts_with("TP")
+                    && (line.price - price).abs() <= price.abs().max(1.0) * 1e-8
+            }) {
+                existing.label.push('/');
+                existing.label.push_str(&label);
+            } else {
+                lines.push(PriceLine {
+                    price,
+                    label,
+                    color: palette.take_profit,
+                    width: 1.3,
+                    directional_percent: directional_percent(
+                        price,
+                        entry,
+                        position_side.unwrap_or(""),
+                    ),
+                });
+            }
         } else if kind.contains("STOP") {
             lines.push(PriceLine {
                 price,
                 label: "SL".into(),
                 color: palette.stop_loss,
                 width: 1.5,
+                directional_percent: directional_percent(price, entry, position_side.unwrap_or("")),
             });
         } else {
             lines.push(PriceLine {
@@ -207,10 +275,23 @@ fn price_lines(state: &MonitorState, light_mode: bool) -> Vec<PriceLine> {
                 label: "주문".into(),
                 color: palette.order,
                 width: 1.0,
+                directional_percent: directional_percent(price, entry, position_side.unwrap_or("")),
             });
         }
     }
     lines
+}
+
+fn directional_percent(price: f64, entry: f64, side: &str) -> Option<f64> {
+    if price <= 0.0 || entry <= 0.0 {
+        return None;
+    }
+    let price_change = (price / entry - 1.0) * 100.0;
+    match side {
+        "LONG" => Some(price_change),
+        "SHORT" => Some(-price_change),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -275,4 +356,57 @@ pub fn format_price(value: f64) -> String {
         8
     };
     format!("{value:.decimals$}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewport_uses_candles_instead_of_distant_protection_prices() {
+        let candles = vec![
+            Candle {
+                low: 99.0,
+                high: 101.0,
+                ..Default::default()
+            },
+            Candle {
+                low: 99.5,
+                high: 100.5,
+                ..Default::default()
+            },
+        ];
+
+        let (low, high) = price_bounds(&candles);
+
+        assert!(low > 98.0);
+        assert!(high < 102.0);
+        assert_eq!(line_placement(120.0, low, high), LinePlacement::Above);
+        assert_eq!(line_placement(80.0, low, high), LinePlacement::Below);
+        assert_eq!(line_placement(100.0, low, high), LinePlacement::Visible);
+    }
+
+    #[test]
+    fn flat_market_keeps_a_small_readable_minimum_range() {
+        let candles = vec![Candle {
+            low: 100.0,
+            high: 100.01,
+            ..Default::default()
+        }];
+
+        let (low, high) = price_bounds(&candles);
+
+        assert!(high - low >= 0.049);
+    }
+
+    #[test]
+    fn current_and_targets_use_direction_aware_entry_return() {
+        let long_gain = directional_percent(105.0, 100.0, "LONG").unwrap();
+        let short_gain = directional_percent(95.0, 100.0, "SHORT").unwrap();
+        let short_loss = directional_percent(105.0, 100.0, "SHORT").unwrap();
+        assert!((long_gain - 5.0).abs() < 1e-9);
+        assert!((short_gain - 5.0).abs() < 1e-9);
+        assert!((short_loss + 5.0).abs() < 1e-9);
+        assert_eq!(directional_percent(105.0, 0.0, "LONG"), None);
+    }
 }
