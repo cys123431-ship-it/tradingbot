@@ -18,7 +18,7 @@ from typing import Any, Mapping, Sequence
 
 
 ADAPTIVE_BREAKOUT_TREND_STRATEGY = "adaptive_breakout_trend_v1"
-ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v3_small_account_aggressive"
+ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v4_small_account_no_daily_loss"
 
 
 def default_adaptive_breakout_trend_config() -> dict[str, Any]:
@@ -108,7 +108,7 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         "small_account_base_max_loss_percent": 20.0,
         "small_account_strong_max_loss_percent": 30.0,
         "small_account_elite_max_loss_percent": 35.0,
-        "small_account_daily_loss_limit_percent": 35.0,
+        "small_account_daily_loss_limit_percent": 0.0,
         "small_account_cost_buffer_percent": 0.20,
         "small_account_liquidation_stop_buffer_multiple": 1.50,
         "small_account_min_leverage": 5,
@@ -299,7 +299,7 @@ def normalize_adaptive_breakout_trend_config(
             normalized.get("small_account_daily_loss_limit_percent"),
             defaults["small_account_daily_loss_limit_percent"],
         ),
-        normalized["small_account_elite_max_loss_percent"],
+        0.0,
         50.0,
     )
     normalized["small_account_cost_buffer_percent"] = _bounded(

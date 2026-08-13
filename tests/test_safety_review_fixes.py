@@ -25,6 +25,9 @@ def test_daily_loss_breaker_uses_tighter_percentage_limit():
     engine._fetch_active_position_symbols_checked = AsyncMock(
         return_value=(True, set())
     )
+    engine._small_account_adaptive_trend_daily_loss_exempt = AsyncMock(
+        return_value=False
+    )
     engine.get_balance_info = AsyncMock(return_value=(5_000.0, 5_000.0, 0.0))
 
     assert asyncio.run(engine.check_daily_loss_limit()) is True
@@ -57,6 +60,9 @@ def test_daily_loss_ignores_stale_unrealized_pnl_after_confirmed_flat_snapshot()
     engine._fetch_active_position_symbols_checked = AsyncMock(
         return_value=(True, set())
     )
+    engine._small_account_adaptive_trend_daily_loss_exempt = AsyncMock(
+        return_value=False
+    )
     engine.get_balance_info = AsyncMock(return_value=(5_000.0, 5_000.0, 0.0))
 
     assert asyncio.run(engine.check_daily_loss_limit()) is False
@@ -84,6 +90,9 @@ def test_daily_loss_keeps_status_fallback_when_position_snapshot_fails():
     }
     engine._fetch_active_position_symbols_checked = AsyncMock(
         return_value=(False, set())
+    )
+    engine._small_account_adaptive_trend_daily_loss_exempt = AsyncMock(
+        return_value=False
     )
     engine.get_balance_info = AsyncMock(return_value=(5_000.0, 5_000.0, 0.0))
     engine.exit_position = AsyncMock()
@@ -132,12 +141,54 @@ def test_daily_loss_leaves_small_account_adaptive_trend_to_exchange_sl():
         )
     )
 
-    assert asyncio.run(engine.check_daily_loss_limit()) is True
+    assert asyncio.run(engine.check_daily_loss_limit()) is False
 
     engine.exit_position.assert_not_awaited()
     engine._persist_daily_loss_entry_lock.assert_not_awaited()
-    engine.ctrl.notify.assert_awaited_once()
-    assert "거래소 SL" in engine.ctrl.notify.await_args.args[0]
+    engine.ctrl.notify.assert_not_awaited()
+
+
+def test_small_account_adaptive_trend_mode_can_enter_after_daily_loss():
+    emas = _emas_module()
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.cfg = {"system_settings": {"active_engine": "signal"}}
+    engine.ctrl = SimpleNamespace(status_data={}, notify=AsyncMock())
+    engine.db = SimpleNamespace(get_daily_stats=lambda: (8, -70.0))
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": "adaptive_breakout_trend_v1"
+    }
+    engine._get_utbot_filtered_breakout_config = lambda _params: {}
+    engine._adaptive_breakout_trend_runtime_config = lambda _cfg: {
+        "small_account_aggressive_enabled": True,
+        "small_account_equity_threshold_usdt": 1_000.0,
+    }
+    engine.get_balance_info = AsyncMock(return_value=(80.0, 80.0, 0.0))
+    engine._fetch_active_position_symbols_checked = AsyncMock(
+        return_value=(True, set())
+    )
+
+    assert asyncio.run(engine.check_daily_loss_limit()) is False
+
+
+def test_flat_small_account_does_not_bypass_when_position_snapshot_fails():
+    emas = _emas_module()
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.cfg = {"system_settings": {"active_engine": "signal"}}
+    engine.ctrl = SimpleNamespace(status_data={}, notify=AsyncMock())
+    engine.db = SimpleNamespace(get_daily_stats=lambda: (8, -70.0))
+    engine._fetch_active_position_symbols_checked = AsyncMock(
+        return_value=(False, set())
+    )
+    engine._small_account_adaptive_trend_daily_loss_exempt = AsyncMock(
+        return_value=True
+    )
+    engine.get_runtime_common_settings = lambda: {
+        "daily_loss_limit": 100_000.0,
+        "daily_loss_limit_pct": 5.0,
+    }
+    engine.get_balance_info = AsyncMock(return_value=(80.0, 80.0, 0.0))
+
+    assert asyncio.run(engine.check_daily_loss_limit()) is True
 
 
 def test_daily_loss_still_forces_other_strategy_positions_closed():
@@ -169,6 +220,9 @@ def test_daily_loss_still_forces_other_strategy_positions_closed():
         "strategy": "utbot_filtered_breakout_v1",
         "small_account_aggressive_active": False,
     }
+    engine._small_account_adaptive_trend_daily_loss_exempt = AsyncMock(
+        return_value=False
+    )
     engine.exit_position = AsyncMock()
     persisted = []
     engine._persist_daily_loss_entry_lock = AsyncMock(
@@ -196,6 +250,9 @@ def test_daily_loss_forces_exchange_position_missing_from_status_cache():
     )
     engine.get_balance_info = AsyncMock(return_value=(5_000.0, 5_000.0, 0.0))
     engine._get_utbreakout_trailing_state = lambda _symbol: None
+    engine._small_account_adaptive_trend_daily_loss_exempt = AsyncMock(
+        return_value=False
+    )
     engine.exit_position = AsyncMock()
     persisted = []
     engine._persist_daily_loss_entry_lock = AsyncMock(

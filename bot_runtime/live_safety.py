@@ -493,7 +493,13 @@ def _resolve_crypto_signal_timestamp(self, symbol, payload=None):
     return now - (now % timeframe_seconds)
 
 
-def _crypto_entry_block_reason(self, symbol=None, *, include_critical_pause=True):
+def _crypto_entry_block_reason(
+    self,
+    symbol=None,
+    *,
+    include_critical_pause=True,
+    ignore_daily_loss_lock=False,
+):
     _ensure_trading_safety_runtime(self)
     uninitialized_test_engine = (
         self.__class__.__name__ == 'SignalEngine'
@@ -512,7 +518,11 @@ def _crypto_entry_block_reason(self, symbol=None, *, include_critical_pause=True
     runtime_reason = getattr(self, "crypto_entry_lock_reason", None)
     if runtime_reason:
         return str(runtime_reason)
-    daily_loss_fallback = getattr(self, '_daily_loss_entry_lock_fallback', None)
+    daily_loss_fallback = (
+        None
+        if ignore_daily_loss_lock
+        else getattr(self, '_daily_loss_entry_lock_fallback', None)
+    )
     if daily_loss_fallback:
         if isinstance(daily_loss_fallback, dict):
             fallback_date = str(daily_loss_fallback.get('date') or '').strip()
@@ -532,7 +542,10 @@ def _crypto_entry_block_reason(self, symbol=None, *, include_critical_pause=True
     persisted = self.trading_state_store.get_runtime_state("entry_lock_reason")
     if persisted:
         return str(persisted)
-    return self.trading_state_store.entry_block_reason(symbol)
+    return self.trading_state_store.entry_block_reason(
+        symbol,
+        ignore_daily_loss_lock=bool(ignore_daily_loss_lock),
+    )
 
 
 def _crypto_safety_status_lines(self):
@@ -808,7 +821,23 @@ async def _submit_idempotent_crypto_entry(self, symbol, side, qty, strategy, pay
     if pause_decision.blocked:
         return EntrySubmitOutcome.critical_block(pause_decision)
 
-    blocker = _crypto_entry_block_reason(self, symbol, include_critical_pause=False)
+    payload_map = payload if isinstance(payload, dict) else {}
+    daily_loss_exempt = bool(
+        str(strategy or '').strip().lower() == 'adaptive_breakout_trend_v1'
+        and payload_map.get('small_account_aggressive_active') is True
+        and 0.0
+        < float(payload_map.get('small_account_equity_usdt', 0.0) or 0.0)
+        < float(
+            payload_map.get('small_account_equity_threshold_usdt', 1_000.0)
+            or 1_000.0
+        )
+    )
+    blocker = _crypto_entry_block_reason(
+        self,
+        symbol,
+        include_critical_pause=False,
+        ignore_daily_loss_lock=daily_loss_exempt,
+    )
     if blocker:
         return EntrySubmitOutcome.entry_block(str(blocker))
 
@@ -820,6 +849,7 @@ async def _submit_idempotent_crypto_entry(self, symbol, side, qty, strategy, pay
         side=side,
         signal_timestamp=_resolve_crypto_signal_timestamp(self, symbol, payload),
         qty=qty,
+        daily_loss_exempt=daily_loss_exempt,
     )
 
     if result is None:

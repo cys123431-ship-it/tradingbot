@@ -85,3 +85,43 @@ def test_gateway_result_mapping(tmp_path, monkeypatch):
     result = asyncio.run(emas._submit_idempotent_crypto_entry(engine, "BTC/USDT:USDT", "buy", 1.0, "UT"))
     assert result.submission is unknown
     assert result.submission_error == "unknown"
+
+
+def test_small_account_adaptive_entry_marks_daily_loss_exemption(tmp_path, monkeypatch):
+    monkeypatch.setattr(emas, "PAUSE_STATE_FILE", str(tmp_path / "missing.json"))
+
+    class Service:
+        exchange = None
+        kwargs = None
+
+        async def submit_entry(self, **kwargs):
+            self.kwargs = kwargs
+            return SimpleNamespace(
+                state=OrderState.ACKNOWLEDGED,
+                accepted=True,
+                recovered=False,
+                error=None,
+                client_order_id="small-account",
+            )
+
+    service = Service()
+    engine = _engine(tmp_path, service)
+    payload = {
+        "small_account_aggressive_active": True,
+        "small_account_equity_usdt": 80.0,
+        "small_account_equity_threshold_usdt": 1_000.0,
+    }
+
+    result = asyncio.run(
+        emas._submit_idempotent_crypto_entry(
+            engine,
+            "BTC/USDT:USDT",
+            "buy",
+            1.0,
+            "adaptive_breakout_trend_v1",
+            payload,
+        )
+    )
+
+    assert result.submission is not None
+    assert service.kwargs["daily_loss_exempt"] is True

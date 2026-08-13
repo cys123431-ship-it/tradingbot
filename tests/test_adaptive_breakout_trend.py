@@ -133,7 +133,7 @@ def test_weighted_continuation_enters_without_requiring_a_new_crossover(directio
         _trend_rows(direction),
         CALM_L2,
         {
-            "profile_version": "adaptive_trend_portfolio_v3_small_account_aggressive",
+            "profile_version": "adaptive_trend_portfolio_v4_small_account_no_daily_loss",
             "continuation_max_fast_ema_distance_atr": 4.0,
         },
     )
@@ -464,7 +464,7 @@ def test_persisted_conservative_profile_migrates_to_small_account_aggressive_v3(
         }
     )
 
-    assert migrated["profile_version"] == "adaptive_trend_portfolio_v3_small_account_aggressive"
+    assert migrated["profile_version"] == "adaptive_trend_portfolio_v4_small_account_no_daily_loss"
     assert migrated["universe_mode"] == "single"
     assert migrated["single_symbol"] == "BTC/USDT:USDT"
     assert migrated["take_profit_r_multiple"] == pytest.approx(10.0)
@@ -475,7 +475,7 @@ def test_persisted_conservative_profile_migrates_to_small_account_aggressive_v3(
     assert migrated["small_account_base_max_loss_percent"] == pytest.approx(20.0)
     assert migrated["small_account_strong_max_loss_percent"] == pytest.approx(30.0)
     assert migrated["small_account_elite_max_loss_percent"] == pytest.approx(35.0)
-    assert migrated["small_account_daily_loss_limit_percent"] == pytest.approx(35.0)
+    assert migrated["small_account_daily_loss_limit_percent"] == pytest.approx(0.0)
 
 
 def test_trend_single_universe_resolves_one_symbol_and_invalid_symbol_fails_closed():

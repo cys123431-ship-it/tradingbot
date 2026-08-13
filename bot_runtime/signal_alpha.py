@@ -1089,14 +1089,10 @@ class SignalAlphaMixin:
             and balance_for_risk < small_account_threshold
             and free_balance > 0
         )
-        effective_daily_loss_percent = float(
-            trend_cfg.get(
-                'small_account_daily_loss_limit_percent',
-                35.0,
-            )
+        effective_daily_loss_percent = (
+            0.0
             if small_account_aggressive_candidate
-            else trend_cfg.get('daily_loss_limit_percent', 10.0)
-            or 0.0
+            else float(trend_cfg.get('daily_loss_limit_percent', 10.0) or 0.0)
         )
         adaptive_daily_loss_cap = max(
             0.0,
@@ -1109,6 +1105,8 @@ class SignalAlphaMixin:
         status['small_account_equity_usdt'] = balance_for_risk
         status['effective_daily_loss_percent'] = effective_daily_loss_percent
         if (
+            not small_account_aggressive_candidate
+            and
             adaptive_daily_loss_cap > 0
             and float(daily_pnl or 0) <= -adaptive_daily_loss_cap
         ):
@@ -1144,13 +1142,19 @@ class SignalAlphaMixin:
             'risk_per_trade_percent': target_risk_percent,
             'min_risk_per_trade_percent': target_risk_percent,
             'max_risk_per_trade_percent': target_risk_percent,
-            'daily_max_loss_usdt': adaptive_daily_loss_cap,
+            'daily_max_loss_usdt': (
+                0.0
+                if small_account_aggressive_candidate
+                else adaptive_daily_loss_cap
+            ),
         })
         risk_budget = resolve_utbreakout_risk_budget(
             balance_for_risk,
             trend_risk_cfg,
             multiplier=1.0,
-            daily_pnl_usdt=daily_pnl,
+            daily_pnl_usdt=(
+                None if small_account_aggressive_candidate else daily_pnl
+            ),
         )
         # A 20-bar structure point can be many ATR away in a healthy trend.
         # Using that distant point as the hard-stop anchor would shrink an
@@ -1255,9 +1259,7 @@ class SignalAlphaMixin:
             'small_account_elite_max_loss_percent': float(
                 trend_cfg.get('small_account_elite_max_loss_percent', 35.0) or 35.0
             ),
-            'small_account_daily_loss_limit_percent': float(
-                trend_cfg.get('small_account_daily_loss_limit_percent', 35.0) or 35.0
-            ),
+            'small_account_daily_loss_limit_percent': 0.0,
             'small_account_cost_buffer_percent': float(
                 trend_cfg.get('small_account_cost_buffer_percent', 0.20) or 0.20
             ),

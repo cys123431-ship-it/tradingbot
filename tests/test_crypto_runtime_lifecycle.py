@@ -130,3 +130,24 @@ def test_daily_loss_fallback_lock_expires_at_next_utc_day(tmp_path):
         include_critical_pause=False,
     ) is None
     assert engine._daily_loss_entry_lock_fallback is None
+
+
+def test_daily_loss_exemption_does_not_bypass_other_entry_locks(tmp_path):
+    engine = object.__new__(emas.SignalEngine)
+    store = SQLiteTradingStateStore(tmp_path / "daily-loss-only.sqlite3")
+    engine.crypto_entry_lock_reason = None
+    engine.exchange = SimpleNamespace(id="test")
+    engine.ctrl = SimpleNamespace(
+        is_paused=False,
+        trading_state_store=store,
+        _engine_performance_stats_restored=True,
+    )
+    engine.trading_state_store = store
+    engine._engine_performance_stats_restored = True
+    store.set_runtime_state("entry_lock_reason", "RECONCILIATION_REQUIRED")
+
+    assert emas._crypto_entry_block_reason(
+        engine,
+        include_critical_pause=False,
+        ignore_daily_loss_lock=True,
+    ) == "RECONCILIATION_REQUIRED"

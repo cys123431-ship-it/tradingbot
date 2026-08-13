@@ -116,6 +116,10 @@ def test_daily_loss_entry_lock_is_global_durable_and_expires_next_utc_day(tmp_pa
         "ETH/USDT:USDT",
         for_position_add=True,
     ).startswith(f"DAILY_LOSS_LOCKED:{today_text}")
+    assert second.entry_block_reason(
+        "ETH/USDT:USDT",
+        ignore_daily_loss_lock=True,
+    ) is None
 
     # Startup reconciliation clears only its own lock and must never erase
     # the independent daily-loss circuit breaker.

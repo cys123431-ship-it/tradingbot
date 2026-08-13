@@ -492,7 +492,7 @@ def test_adaptive_trend_small_account_blocks_when_even_five_x_exceeds_loss_cap()
     assert updated["qty"] == pytest.approx(0.0)
 
 
-def test_adaptive_trend_small_account_daily_loss_limit_blocks_new_risk():
+def test_adaptive_trend_small_account_ignores_daily_loss_for_new_risk():
     updated = apply_dynamic_leverage_to_plan(
         _plan(
             strategy="adaptive_breakout_trend_v1",
@@ -509,8 +509,9 @@ def test_adaptive_trend_small_account_daily_loss_limit_blocks_new_risk():
         account_equity=100.0,
     )
 
-    assert updated["small_account_aggressive_blocked"] is True
-    assert updated["small_account_aggressive_daily_loss_limit_usdt"] == pytest.approx(35.0)
+    assert updated["small_account_aggressive_blocked"] is False
+    assert updated["small_account_aggressive_daily_loss_limit_usdt"] == pytest.approx(0.0)
+    assert updated["qty"] > 0.0
 
 
 def test_adaptive_trend_at_exact_threshold_keeps_normal_risk_sizing():

@@ -270,6 +270,64 @@ def test_persisted_daily_loss_lock_blocks_new_and_additional_orders(tmp_path):
     asyncio.run(scenario())
 
 
+def test_small_account_trend_can_bypass_only_daily_loss_lock(tmp_path):
+    async def scenario():
+        exchange = MockExchange()
+        gateway = _gateway(tmp_path, exchange)
+        gateway.store.set_runtime_state(
+            "daily_loss_entry_lock",
+            {
+                "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                "reason": "DAILY_LOSS_LIMIT",
+            },
+        )
+
+        entry = await gateway.submit_entry(
+            strategy="adaptive_breakout_trend_v1",
+            symbol="BTC/USDT:USDT",
+            side="LONG",
+            signal_timestamp=2000,
+            qty=0.1,
+            daily_loss_exempt=True,
+        )
+
+        assert entry.state != "BLOCKED"
+        assert exchange.create_count == 1
+        assert gateway.store.get(entry.client_order_id).metadata[
+            "daily_loss_exempt"
+        ] is True
+
+    asyncio.run(scenario())
+
+
+def test_other_strategy_cannot_request_daily_loss_exemption(tmp_path):
+    async def scenario():
+        exchange = MockExchange()
+        gateway = _gateway(tmp_path, exchange)
+        gateway.store.set_runtime_state(
+            "daily_loss_entry_lock",
+            {
+                "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                "reason": "DAILY_LOSS_LIMIT",
+            },
+        )
+
+        entry = await gateway.submit_entry(
+            strategy="UTB",
+            symbol="BTC/USDT:USDT",
+            side="LONG",
+            signal_timestamp=3000,
+            qty=0.1,
+            daily_loss_exempt=True,
+        )
+
+        assert entry.state == "BLOCKED"
+        assert entry.error.startswith("DAILY_LOSS_LOCKED:")
+        assert exchange.create_count == 0
+
+    asyncio.run(scenario())
+
+
 def test_exchange_ack_cannot_regress_concurrent_fill_state(tmp_path):
     exchange = MockExchange()
     gateway = _gateway(tmp_path, exchange)

@@ -245,7 +245,7 @@ def test_adaptive_trend_does_not_add_before_profit_trigger(monkeypatch):
     assert result["pnl_r"] == pytest.approx(0.25)
 
 
-def test_small_account_adaptive_trend_add_respects_persisted_loss_cap(monkeypatch):
+def test_small_account_adaptive_trend_add_ignores_daily_pnl_but_keeps_trade_cap(monkeypatch):
     engine = SignalExitMixin()
     state = {
         "strategy": ADAPTIVE_BREAKOUT_TREND_STRATEGY,
@@ -274,7 +274,7 @@ def test_small_account_adaptive_trend_add_respects_persisted_loss_cap(monkeypatc
         0,
         result=100.0,
     )
-    engine.db = SimpleNamespace(get_daily_stats=lambda: (0, 0.0))
+    engine.db = SimpleNamespace(get_daily_stats=lambda: (12, -500.0))
 
     monkeypatch.setattr(
         signal_exit_module,

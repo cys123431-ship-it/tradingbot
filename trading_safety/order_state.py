@@ -603,10 +603,12 @@ class SQLiteTradingStateStore:
         symbol: str | None = None,
         *,
         for_position_add: bool = False,
+        ignore_daily_loss_lock: bool = False,
     ) -> str | None:
-        daily_loss_lock = self.daily_loss_entry_lock_reason()
-        if daily_loss_lock:
-            return daily_loss_lock
+        if not ignore_daily_loss_lock:
+            daily_loss_lock = self.daily_loss_entry_lock_reason()
+            if daily_loss_lock:
+                return daily_loss_lock
         records = self.list_by_states(ENTRY_BLOCKING_STATES)
         if for_position_add and symbol:
             normalized = _normalize_order_symbol(symbol)

@@ -832,7 +832,7 @@ class BaseEngine:
             return 0.0, 0.0, 0.0
 
     def _uses_small_account_trend_sl_exit(self, symbol):
-        """Whether daily loss must leave this position to its exchange SL."""
+        """Whether this position is fully exempt from the daily-loss breaker."""
         state_getter = getattr(self, '_get_utbreakout_trailing_state', None)
         if not callable(state_getter):
             return False
@@ -846,12 +846,63 @@ class BaseEngine:
             )
             return False
         if not isinstance(state, dict):
-            return False
-        return bool(
+            state = {}
+        if bool(
             state.get('small_account_aggressive_active', False)
             and str(state.get('strategy') or '').strip().lower()
             == 'adaptive_breakout_trend_v1'
-        )
+        ):
+            return True
+
+        # The order gateway records the exemption before submitting to the
+        # exchange. This closes the brief race before lifecycle/trailing state
+        # is persisted for a newly filled position.
+        try:
+            store = getattr(self, 'trading_state_store', None)
+            if store is None:
+                store = self.crypto_execution.state_store
+            return any(
+                str(record.strategy or '').strip().lower()
+                == 'adaptive_breakout_trend_v1'
+                and bool((record.metadata or {}).get('daily_loss_exempt'))
+                for record in store.active_for_symbol(symbol)
+            )
+        except Exception:
+            return False
+
+    async def _small_account_adaptive_trend_daily_loss_exempt(self):
+        """Identify the standalone sub-$1,000 profile from live account state."""
+        try:
+            strategy_params = self.get_runtime_strategy_params()
+            active_strategy = str(
+                (strategy_params or {}).get('active_strategy') or ''
+            ).strip().lower()
+            if active_strategy != 'adaptive_breakout_trend_v1':
+                return False
+            filtered_cfg = self._get_utbot_filtered_breakout_config(
+                strategy_params
+            )
+            trend_cfg = self._adaptive_breakout_trend_runtime_config(filtered_cfg)
+            if not bool(trend_cfg.get('small_account_aggressive_enabled', True)):
+                return False
+            threshold = max(
+                0.0,
+                float(
+                    trend_cfg.get('small_account_equity_threshold_usdt', 1_000.0)
+                    or 1_000.0
+                ),
+            )
+            total_equity, free_balance, _ = await self.get_balance_info()
+            equity = total_equity if total_equity > 0 else free_balance
+            return bool(0.0 < float(equity or 0.0) < threshold)
+        except Exception as exc:
+            # Fail closed: inability to prove the exact strategy/account
+            # exemption keeps the normal daily-loss breaker in force.
+            logger.warning(
+                'Small-account daily-loss exemption lookup failed: %s',
+                exc,
+            )
+            return False
 
     async def _persist_daily_loss_entry_lock(
         self,
@@ -898,8 +949,21 @@ class BaseEngine:
             }
             return None
 
-    async def check_daily_loss_limit(self):
+    async def check_daily_loss_limit(self, *, allow_small_account_exemption=True):
         """?쇱씪 ?먯떎 ?쒕룄 泥댄겕 (誘몄떎???먯씡 ?ы븿)"""
+        active_positions_fetch_ok, active_symbols_on_exchange = (
+            await self._fetch_active_position_symbols_checked()
+        )
+        if allow_small_account_exemption:
+            if active_positions_fetch_ok:
+                if active_symbols_on_exchange:
+                    if all(
+                        self._uses_small_account_trend_sl_exit(symbol)
+                        for symbol in active_symbols_on_exchange
+                    ):
+                        return False
+                elif await self._small_account_adaptive_trend_daily_loss_exempt():
+                    return False
         _, daily_pnl = self.db.get_daily_stats()
         eng = self.cfg.get('system_settings', {}).get('active_engine', CORE_ENGINE)
 
@@ -915,9 +979,6 @@ class BaseEngine:
         else:
             status_rows = [v for v in status_data.values() if isinstance(v, dict)]
 
-        active_positions_fetch_ok, active_symbols_on_exchange = (
-            await self._fetch_active_position_symbols_checked()
-        )
         if not active_positions_fetch_ok:
             logger.warning(
                 "Daily loss check: fetch_positions failed, using status cache only"
@@ -986,32 +1047,16 @@ class BaseEngine:
                 f"(realized: {daily_pnl:.2f}, unrealized: {unrealized_pnl:.2f}) / "
                 f"Limit: -{effective_limit:.2f} (abs={limit_abs:.2f}, pct={limit_pct:.2f}%)"
             )
-            # The sub-$1,000 Adaptive Trend profile deliberately accepts a
-            # wider stop budget and already owns an exchange STOP_MARKET order.
-            # Daily loss still blocks new/additional risk, but must not
-            # front-run that SL with a market emergency close.
+            # A position already opened by the sub-$1,000 Adaptive Trend
+            # profile is fully exempt from the daily-loss breaker. This state
+            # check also protects it if the user changes mode while it remains
+            # open: it is not force-closed by a later generic loss check.
             sl_managed_symbols = {
                 symbol
                 for symbol in open_symbols
                 if self._uses_small_account_trend_sl_exit(symbol)
             }
             if sl_managed_symbols:
-                notified = getattr(
-                    self,
-                    '_daily_loss_sl_managed_notified_symbols',
-                    set(),
-                )
-                if not isinstance(notified, set):
-                    notified = set()
-                new_symbols = sl_managed_symbols - notified
-                if new_symbols:
-                    await self.ctrl.notify(
-                        "⚠️ 일일 손실 한도 도달: 1,000 USDT 이하 전용 추세 포지션은 "
-                        "긴급종료하지 않고 거래소 SL에서 종료합니다. "
-                        "신규 진입과 추가 진입은 차단합니다."
-                    )
-                    notified.update(new_symbols)
-                    self._daily_loss_sl_managed_notified_symbols = notified
                 open_symbols = [
                     symbol for symbol in open_symbols if symbol not in sl_managed_symbols
                 ]
@@ -1055,7 +1100,6 @@ class BaseEngine:
                     except Exception as e:
                         logger.error(f"Daily loss limit forced exit failed for {symbol}: {e}")
             return True
-        self._daily_loss_sl_managed_notified_symbols = set()
         return False
 
     async def check_mmr_alert(self, mmr):

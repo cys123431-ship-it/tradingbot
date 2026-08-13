@@ -35,6 +35,15 @@ _ENTRY_PROGRESS_RANK = {
 }
 
 
+def _daily_loss_exemption_allowed(strategy: str, requested: bool) -> bool:
+    """Keep the bypass private to the sub-$1,000 Adaptive Trend path."""
+    return bool(
+        requested
+        and str(strategy or '').strip().lower()
+        in {'adaptive_breakout_trend_v1', 'adaptive_trend_pyramid'}
+    )
+
+
 def _as_dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
@@ -514,7 +523,12 @@ class IdempotentOrderGateway:
         signal_timestamp: Any,
         qty: float,
         params: dict[str, Any] | None = None,
+        daily_loss_exempt: bool = False,
     ) -> OrderSubmissionResult:
+        daily_loss_exempt = _daily_loss_exemption_allowed(
+            strategy,
+            daily_loss_exempt,
+        )
         client_order_id = build_client_order_id(strategy, symbol, side, signal_timestamp, "entry")
         async with self._global_entry_lock, self._lock(symbol):
             existing = self.store.get(client_order_id)
@@ -547,7 +561,10 @@ class IdempotentOrderGateway:
                     error=existing.last_error,
                 )
 
-            blocker = self.store.entry_block_reason(symbol)
+            blocker = self.store.entry_block_reason(
+                symbol,
+                ignore_daily_loss_lock=bool(daily_loss_exempt),
+            )
             if blocker:
                 return OrderSubmissionResult(client_order_id, "BLOCKED", error=blocker)
 
@@ -588,6 +605,7 @@ class IdempotentOrderGateway:
                 order_intent=OrderIntent.ENTRY.value,
                 order_purpose="entry",
                 position_qty_before=0.0,
+                metadata={"daily_loss_exempt": bool(daily_loss_exempt)},
             )
             self.store.upsert(record)
 
@@ -716,8 +734,14 @@ class IdempotentOrderGateway:
         qty: float,
         stage: str,
         params: dict[str, Any] | None = None,
+        daily_loss_exempt: bool = False,
     ) -> OrderSubmissionResult:
         """Idempotently add to an existing same-side position."""
+
+        daily_loss_exempt = _daily_loss_exemption_allowed(
+            strategy,
+            daily_loss_exempt,
+        )
 
         client_order_id = build_client_order_id(
             strategy,
@@ -738,7 +762,11 @@ class IdempotentOrderGateway:
                     error="position-add signal already handled",
                 )
 
-            blocker = self.store.entry_block_reason(symbol, for_position_add=True)
+            blocker = self.store.entry_block_reason(
+                symbol,
+                for_position_add=True,
+                ignore_daily_loss_lock=bool(daily_loss_exempt),
+            )
             if blocker:
                 return OrderSubmissionResult(client_order_id, "BLOCKED", error=blocker)
             try:
@@ -787,6 +815,7 @@ class IdempotentOrderGateway:
                 ),
                 metadata={"position_add_stage": str(stage)},
             )
+            record.metadata["daily_loss_exempt"] = bool(daily_loss_exempt)
             self.store.upsert(record)
             try:
                 exchange_existing = await self._fetch_order_by_client_id(symbol, client_order_id)
@@ -884,7 +913,12 @@ class IdempotentOrderGateway:
         price: float,
         params: dict[str, Any] | None = None,
         position_add: bool = False,
+        daily_loss_exempt: bool = False,
     ) -> OrderSubmissionResult:
+        daily_loss_exempt = _daily_loss_exemption_allowed(
+            strategy,
+            daily_loss_exempt,
+        )
         intent = OrderIntent.POSITION_ADD if position_add else OrderIntent.GRID_ENTRY
         client_order_id = build_client_order_id(
             strategy,
@@ -922,6 +956,7 @@ class IdempotentOrderGateway:
             blocker = self.store.entry_block_reason(
                 symbol,
                 for_position_add=position_add,
+                ignore_daily_loss_lock=bool(daily_loss_exempt),
             )
             if blocker:
                 return OrderSubmissionResult(client_order_id, "BLOCKED", error=blocker)
@@ -952,6 +987,7 @@ class IdempotentOrderGateway:
                     or (before or {}).get("entryPrice")
                     or f"{side}:{before_qty}"
                 ),
+                metadata={"daily_loss_exempt": bool(daily_loss_exempt)},
             )
             self.store.upsert(record)
             self.store.transition(client_order_id, OrderState.SUBMITTING)

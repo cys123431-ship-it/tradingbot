@@ -133,25 +133,7 @@ class SignalExitMixin:
                 0.0,
                 float(state.get('small_account_aggressive_max_loss_usdt', 0.0) or 0.0),
             )
-            daily_limit_usdt = max(
-                0.0,
-                float(
-                    state.get(
-                        'small_account_aggressive_daily_loss_limit_usdt',
-                        max_loss_usdt,
-                    )
-                    or max_loss_usdt
-                ),
-            )
-            try:
-                _, live_daily_pnl = self.db.get_daily_stats()
-            except Exception:
-                live_daily_pnl = 0.0
-            remaining_daily_loss = max(
-                0.0,
-                daily_limit_usdt - max(0.0, -float(live_daily_pnl or 0.0)),
-            )
-            effective_loss_cap = min(max_loss_usdt, remaining_daily_loss)
+            effective_loss_cap = max_loss_usdt
             if effective_loss_cap <= 0.0 or projected_loss > effective_loss_cap + 1e-9:
                 return {
                     'status': 'BLOCKED',
@@ -199,7 +181,12 @@ class SignalExitMixin:
                 'audit': pre_add_audit,
             }
 
-        entry_blocker = _crypto_entry_block_reason(self, symbol)
+        daily_loss_exempt = bool(state.get('small_account_aggressive_active', False))
+        entry_blocker = _crypto_entry_block_reason(
+            self,
+            symbol,
+            ignore_daily_loss_lock=daily_loss_exempt,
+        )
         if entry_blocker and str(entry_blocker).startswith('PROTECTED:'):
             # A protected same-symbol entry is the required parent of a
             # position add. The execution gateway rechecks all other blocking
@@ -232,6 +219,7 @@ class SignalExitMixin:
             signal_timestamp=state.get('last_bar_ts') or int(time.time()),
             qty=add_qty,
             stage=str(stage),
+            daily_loss_exempt=daily_loss_exempt,
         )
         if not add_submission.accepted:
             return {

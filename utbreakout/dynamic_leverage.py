@@ -407,12 +407,9 @@ def resolve_adaptive_trend_small_account_profile(
         50.0,
         {"base": 20.0, "strong": 30.0, "elite": 35.0}[risk_tier],
     )
-    daily_limit_percent = _bounded(
-        source.get("small_account_daily_loss_limit_percent"),
-        max_loss_percent,
-        50.0,
-        35.0,
-    )
+    # Retain the legacy config field for backward-compatible config loading,
+    # but it is deliberately disabled for this dedicated profile.
+    daily_limit_percent = 0.0
     cost_buffer_percent = _bounded(
         source.get("small_account_cost_buffer_percent"),
         0.0,
@@ -507,13 +504,14 @@ def resolve_adaptive_trend_small_account_profile(
         ),
         reverse=True,
     )
+    # This profile intentionally has no daily-loss stop. Per-position stop
+    # risk, liquidation distance and available margin remain enforced.
     daily_pnl = float(
         _finite(source.get("small_account_aggressive_daily_pnl_usdt"), 0.0)
     )
-    realized_loss = max(0.0, -daily_pnl)
     max_loss_usdt = equity * max_loss_percent / 100.0
-    daily_loss_limit_usdt = equity * daily_limit_percent / 100.0
-    remaining_daily_loss_usdt = max(0.0, daily_loss_limit_usdt - realized_loss)
+    daily_loss_limit_usdt = 0.0
+    remaining_daily_loss_usdt = 0.0
 
     selected = None
     selected_payload: dict[str, float] = {}
@@ -522,10 +520,7 @@ def resolve_adaptive_trend_small_account_profile(
         price_risk_usdt = initial_notional * float(stop_percent) / 100.0
         estimated_cost_usdt = initial_notional * cost_buffer_percent / 100.0
         projected_loss_usdt = price_risk_usdt + estimated_cost_usdt
-        if (
-            projected_loss_usdt <= max_loss_usdt + 1e-9
-            and projected_loss_usdt <= remaining_daily_loss_usdt + 1e-9
-        ):
+        if projected_loss_usdt <= max_loss_usdt + 1e-9:
             selected = candidate
             selected_payload = {
                 "initial_notional": initial_notional,
@@ -559,7 +554,7 @@ def resolve_adaptive_trend_small_account_profile(
         reason = (
             f"no leverage >= {minimum_leverage}x fits loss limits: "
             f"stop={float(stop_percent):.2f}% tierCap={max_loss_percent:.1f}% "
-            f"dailyRemaining={remaining_daily_loss_usdt:.2f}"
+            "dailyLoss=exempt"
         )
         result.update({
             "blocked": True,
