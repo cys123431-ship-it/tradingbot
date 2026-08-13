@@ -831,6 +831,28 @@ class BaseEngine:
             logger.error(f"Balance fetch error: {e}")
             return 0.0, 0.0, 0.0
 
+    def _uses_small_account_trend_sl_exit(self, symbol):
+        """Whether daily loss must leave this position to its exchange SL."""
+        state_getter = getattr(self, '_get_utbreakout_trailing_state', None)
+        if not callable(state_getter):
+            return False
+        try:
+            state = state_getter(symbol)
+        except Exception as exc:
+            logger.warning(
+                "Daily loss SL policy state lookup failed for %s: %s",
+                symbol,
+                exc,
+            )
+            return False
+        if not isinstance(state, dict):
+            return False
+        return bool(
+            state.get('small_account_aggressive_active', False)
+            and str(state.get('strategy') or '').strip().lower()
+            == 'adaptive_breakout_trend_v1'
+        )
+
     async def check_daily_loss_limit(self):
         """?쇱씪 ?먯떎 ?쒕룄 泥댄겕 (誘몄떎???먯씡 ?ы븿)"""
         _, daily_pnl = self.db.get_daily_stats()
@@ -903,6 +925,35 @@ class BaseEngine:
                 f"(realized: {daily_pnl:.2f}, unrealized: {unrealized_pnl:.2f}) / "
                 f"Limit: -{effective_limit:.2f} (abs={limit_abs:.2f}, pct={limit_pct:.2f}%)"
             )
+            # The sub-$1,000 Adaptive Trend profile deliberately accepts a
+            # wider stop budget and already owns an exchange STOP_MARKET order.
+            # Daily loss still blocks new/additional risk, but must not
+            # front-run that SL with a market emergency close.
+            sl_managed_symbols = {
+                symbol
+                for symbol in open_symbols
+                if self._uses_small_account_trend_sl_exit(symbol)
+            }
+            if sl_managed_symbols:
+                notified = getattr(
+                    self,
+                    '_daily_loss_sl_managed_notified_symbols',
+                    set(),
+                )
+                if not isinstance(notified, set):
+                    notified = set()
+                new_symbols = sl_managed_symbols - notified
+                if new_symbols:
+                    await self.ctrl.notify(
+                        "⚠️ 일일 손실 한도 도달: 1,000 USDT 이하 전용 추세 포지션은 "
+                        "긴급종료하지 않고 거래소 SL에서 종료합니다. "
+                        "신규 진입과 추가 진입은 차단합니다."
+                    )
+                    notified.update(new_symbols)
+                    self._daily_loss_sl_managed_notified_symbols = notified
+                open_symbols = [
+                    symbol for symbol in open_symbols if symbol not in sl_managed_symbols
+                ]
             # ?ъ??섏씠 ?덉쑝硫?泥?궛
             if open_symbols and hasattr(self, 'exit_position'):
                 await self.ctrl.notify("⚠️ 일일 손실 한도 도달! 보유 포지션 정리를 시작합니다.")
@@ -912,6 +963,7 @@ class BaseEngine:
                     except Exception as e:
                         logger.error(f"Daily loss limit forced exit failed for {symbol}: {e}")
             return True
+        self._daily_loss_sl_managed_notified_symbols = set()
         return False
 
     async def check_mmr_alert(self, mmr):

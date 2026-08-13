@@ -93,6 +93,80 @@ def test_daily_loss_keeps_status_fallback_when_position_snapshot_fails():
     )
 
 
+def test_daily_loss_leaves_small_account_adaptive_trend_to_exchange_sl():
+    emas = _emas_module()
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = "SPCX/USDT:USDT"
+    engine.cfg = {"system_settings": {"active_engine": "signal"}}
+    engine.ctrl = SimpleNamespace(
+        status_data={
+            symbol: {
+                "symbol": symbol,
+                "pos_side": "LONG",
+                "pnl_usdt": -5.0,
+                "total_equity": 80.0,
+            }
+        },
+        notify=AsyncMock(),
+    )
+    engine.db = SimpleNamespace(get_daily_stats=lambda: (1, 0.0))
+    engine.get_runtime_common_settings = lambda: {
+        "daily_loss_limit": 100_000.0,
+        "daily_loss_limit_pct": 5.0,
+    }
+    engine._fetch_active_position_symbols_checked = AsyncMock(
+        return_value=(True, {"SPCX/USDT"})
+    )
+    engine.get_balance_info = AsyncMock(return_value=(80.0, 20.0, 0.0))
+    engine._get_utbreakout_trailing_state = lambda _symbol: {
+        "strategy": "adaptive_breakout_trend_v1",
+        "small_account_aggressive_active": True,
+        "last_stop_price": 143.27,
+    }
+    engine.exit_position = AsyncMock()
+
+    assert asyncio.run(engine.check_daily_loss_limit()) is True
+
+    engine.exit_position.assert_not_awaited()
+    engine.ctrl.notify.assert_awaited_once()
+    assert "거래소 SL" in engine.ctrl.notify.await_args.args[0]
+
+
+def test_daily_loss_still_forces_other_strategy_positions_closed():
+    emas = _emas_module()
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = "BTC/USDT:USDT"
+    engine.cfg = {"system_settings": {"active_engine": "signal"}}
+    engine.ctrl = SimpleNamespace(
+        status_data={
+            symbol: {
+                "symbol": symbol,
+                "pos_side": "SHORT",
+                "pnl_usdt": -300.0,
+                "total_equity": 5_000.0,
+            }
+        },
+        notify=AsyncMock(),
+    )
+    engine.db = SimpleNamespace(get_daily_stats=lambda: (0, 0.0))
+    engine.get_runtime_common_settings = lambda: {
+        "daily_loss_limit": 100_000.0,
+        "daily_loss_limit_pct": 5.0,
+    }
+    engine._fetch_active_position_symbols_checked = AsyncMock(
+        return_value=(True, {"BTC/USDT"})
+    )
+    engine.get_balance_info = AsyncMock(return_value=(5_000.0, 5_000.0, 0.0))
+    engine._get_utbreakout_trailing_state = lambda _symbol: {
+        "strategy": "utbot_filtered_breakout_v1",
+        "small_account_aggressive_active": False,
+    }
+    engine.exit_position = AsyncMock()
+
+    assert asyncio.run(engine.check_daily_loss_limit()) is True
+    engine.exit_position.assert_awaited_once_with(symbol, "DailyLossLimit")
+
+
 def test_scanner_keeps_symbol_and_protection_when_position_lookup_fails():
     emas = _emas_module()
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
