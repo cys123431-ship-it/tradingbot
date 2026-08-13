@@ -1,7 +1,9 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import emas
+from trading_safety.order_state import SQLiteTradingStateStore
 
 
 def test_startup_user_stream_network_follows_controller_exchange_mode(monkeypatch):
@@ -96,3 +98,35 @@ def test_main_controller_order_symbol_handles_usdc_settlement():
     controller = object.__new__(emas.MainController)
 
     assert controller._futures_symbol_for_order("LTC/USDC:USDC") == "LTC/USDC"
+
+
+def test_daily_loss_fallback_lock_expires_at_next_utc_day(tmp_path):
+    engine = object.__new__(emas.SignalEngine)
+    store = SQLiteTradingStateStore(tmp_path / "daily-loss-fallback.sqlite3")
+    engine.crypto_entry_lock_reason = None
+    engine.exchange = SimpleNamespace(id="test")
+    engine.ctrl = SimpleNamespace(
+        is_paused=False,
+        trading_state_store=store,
+        _engine_performance_stats_restored=True,
+    )
+    engine.trading_state_store = store
+    engine._engine_performance_stats_restored = True
+    engine._daily_loss_entry_lock_fallback = {
+        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "reason": "PERSISTENCE_FAILED:OSError",
+    }
+
+    assert emas._crypto_entry_block_reason(
+        engine,
+        include_critical_pause=False,
+    ).startswith("DAILY_LOSS_LOCKED:")
+
+    engine._daily_loss_entry_lock_fallback["date"] = (
+        datetime.now(timezone.utc).date() - timedelta(days=1)
+    ).isoformat()
+    assert emas._crypto_entry_block_reason(
+        engine,
+        include_critical_pause=False,
+    ) is None
+    assert engine._daily_loss_entry_lock_fallback is None

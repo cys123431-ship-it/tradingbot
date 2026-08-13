@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 
 import pytest
 
@@ -222,6 +223,49 @@ def test_authentication_error_persists_global_entry_lock(tmp_path):
         )
         assert result.state == OrderState.FAILED.value
         assert gateway.store.get_runtime_state("entry_lock_reason").startswith("AUTHENTICATION_ERROR")
+
+    asyncio.run(scenario())
+
+
+def test_persisted_daily_loss_lock_blocks_new_and_additional_orders(tmp_path):
+    async def scenario():
+        exchange = MockExchange()
+        gateway = _gateway(tmp_path, exchange)
+        gateway.store.set_runtime_state(
+            "daily_loss_entry_lock",
+            {
+                "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                "reason": "DAILY_LOSS_LIMIT",
+            },
+        )
+
+        entry = await gateway.submit_entry(
+            strategy="UTB",
+            symbol="BTC/USDT:USDT",
+            side="LONG",
+            signal_timestamp=1000,
+            qty=0.1,
+        )
+        exchange.position = {
+            "symbol": "BTC/USDT:USDT",
+            "side": "long",
+            "contracts": 0.1,
+            "entryPrice": 100.0,
+        }
+        position_add = await gateway.submit_position_add(
+            strategy="UTB",
+            symbol="BTC/USDT:USDT",
+            side="LONG",
+            signal_timestamp=1001,
+            qty=0.1,
+            stage="add-1",
+        )
+
+        assert entry.state == "BLOCKED"
+        assert position_add.state == "BLOCKED"
+        assert entry.error.startswith("DAILY_LOSS_LOCKED:")
+        assert position_add.error.startswith("DAILY_LOSS_LOCKED:")
+        assert exchange.create_count == 0
 
     asyncio.run(scenario())
 

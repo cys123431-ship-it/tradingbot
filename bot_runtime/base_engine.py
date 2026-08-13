@@ -853,6 +853,41 @@ class BaseEngine:
             == 'adaptive_breakout_trend_v1'
         )
 
+    def _persist_daily_loss_entry_lock(
+        self,
+        *,
+        total_daily_pnl,
+        effective_limit,
+        forced_exit_symbols,
+    ):
+        """Persist the global UTC-day entry lock across restart and resume."""
+        try:
+            store = getattr(self, 'trading_state_store', None)
+            if store is None:
+                store = self.crypto_execution.state_store
+            today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            payload = {
+                'date': today,
+                'reason': 'DAILY_LOSS_LIMIT',
+                'triggered_at': datetime.now(timezone.utc).isoformat(),
+                'daily_pnl_usdt': float(total_daily_pnl),
+                'effective_limit_usdt': float(effective_limit),
+                'forced_exit_symbols': sorted(set(forced_exit_symbols)),
+            }
+            store.set_runtime_state('daily_loss_entry_lock', payload)
+            self._daily_loss_entry_lock_fallback = None
+            return payload
+        except Exception as exc:
+            # The in-memory lock is a fail-closed fallback if persistence is
+            # temporarily unavailable. It is intentionally not stored in the
+            # generic reconciliation lock, which startup may clear.
+            logger.exception("Failed to persist daily loss entry lock")
+            self._daily_loss_entry_lock_fallback = {
+                'date': datetime.now(timezone.utc).strftime('%Y-%m-%d'),
+                'reason': f'PERSISTENCE_FAILED:{type(exc).__name__}',
+            }
+            return None
+
     async def check_daily_loss_limit(self):
         """?쇱씪 ?먯떎 ?쒕룄 泥댄겕 (誘몄떎???먯씡 ?ы븿)"""
         _, daily_pnl = self.db.get_daily_stats()
@@ -891,6 +926,22 @@ class BaseEngine:
                 unrealized_pnl += float(row.get('pnl_usdt', 0) or 0)
                 open_symbols.append(symbol)
 
+        # The exchange snapshot is authoritative.  A position can exist while
+        # Telegram/status state is stale (for example immediately after a
+        # manual entry or a restart).  Such positions must still be closed and
+        # must activate the durable loss lock.  Strategy state lookup below
+        # still preserves the small-account Adaptive Trend SL exception when
+        # its persisted lifecycle state is available.
+        if active_positions_fetch_ok:
+            status_symbol_keys = {
+                str(symbol).split(':', 1)[0]
+                for symbol in open_symbols
+                if symbol
+            }
+            for symbol in sorted(active_symbols_on_exchange):
+                if symbol not in status_symbol_keys:
+                    open_symbols.append(symbol)
+
         total_daily_pnl = daily_pnl + unrealized_pnl
         total_equity = 0.0
         if status_rows:
@@ -919,7 +970,7 @@ class BaseEngine:
             configured_limits.append(total_equity * (limit_pct / 100.0))
         effective_limit = min(configured_limits) if configured_limits else 5000.0
 
-        if total_daily_pnl < -effective_limit:
+        if total_daily_pnl <= -effective_limit:
             logger.warning(
                 f"?좑툘 Daily loss limit reached: {total_daily_pnl:.2f} "
                 f"(realized: {daily_pnl:.2f}, unrealized: {unrealized_pnl:.2f}) / "
@@ -954,9 +1005,19 @@ class BaseEngine:
                 open_symbols = [
                     symbol for symbol in open_symbols if symbol not in sl_managed_symbols
                 ]
+            forced_exit_symbols = sorted(set(open_symbols))
+            if forced_exit_symbols:
+                self._persist_daily_loss_entry_lock(
+                    total_daily_pnl=total_daily_pnl,
+                    effective_limit=effective_limit,
+                    forced_exit_symbols=forced_exit_symbols,
+                )
             # ?ъ??섏씠 ?덉쑝硫?泥?궛
             if open_symbols and hasattr(self, 'exit_position'):
-                await self.ctrl.notify("⚠️ 일일 손실 한도 도달! 보유 포지션 정리를 시작합니다.")
+                await self.ctrl.notify(
+                    "⚠️ 일일 손실 한도 도달! 보유 포지션을 강제 정리하고 "
+                    "UTC 날짜가 바뀔 때까지 모든 신규·추가 진입을 차단합니다."
+                )
                 for symbol in sorted(set(open_symbols)):
                     try:
                         await self.exit_position(symbol, "DailyLossLimit")

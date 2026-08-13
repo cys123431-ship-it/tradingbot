@@ -512,6 +512,21 @@ def _crypto_entry_block_reason(self, symbol=None, *, include_critical_pause=True
     runtime_reason = getattr(self, "crypto_entry_lock_reason", None)
     if runtime_reason:
         return str(runtime_reason)
+    daily_loss_fallback = getattr(self, '_daily_loss_entry_lock_fallback', None)
+    if daily_loss_fallback:
+        if isinstance(daily_loss_fallback, dict):
+            fallback_date = str(daily_loss_fallback.get('date') or '').strip()
+            today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            if fallback_date == today:
+                reason = str(
+                    daily_loss_fallback.get('reason') or 'PERSISTENCE_FAILED'
+                ).strip()
+                return f'DAILY_LOSS_LOCKED:{fallback_date}:{reason}'
+            self._daily_loss_entry_lock_fallback = None
+        else:
+            # Backward-compatible fail-closed handling for any in-process
+            # fallback created by an older hot-reloaded runtime.
+            return str(daily_loss_fallback)
     if getattr(getattr(self, "ctrl", None), "is_paused", False):
         return "CRITICAL_PAUSE_OR_BOT_PAUSED"
     persisted = self.trading_state_store.get_runtime_state("entry_lock_reason")

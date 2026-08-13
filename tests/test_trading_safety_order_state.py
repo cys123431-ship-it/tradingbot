@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from trading_safety.order_state import (
@@ -86,3 +87,42 @@ def test_atomic_json_write_replaces_complete_document(tmp_path):
     assert path.read_text(encoding="utf-8").strip().startswith("{")
     assert '"version": 2' in path.read_text(encoding="utf-8")
     assert not list(Path(tmp_path).glob("*.tmp"))
+
+
+def test_daily_loss_entry_lock_is_global_durable_and_expires_next_utc_day(tmp_path):
+    today = datetime.now(timezone.utc).date()
+    today_text = today.isoformat()
+    tomorrow_text = (today + timedelta(days=1)).isoformat()
+    path = tmp_path / "state.sqlite3"
+    first = SQLiteTradingStateStore(path)
+    first.set_runtime_state(
+        "daily_loss_entry_lock",
+        {
+            "date": today_text,
+            "reason": "DAILY_LOSS_LIMIT",
+            "forced_exit_symbols": ["BTC/USDT:USDT"],
+        },
+    )
+    first.close()
+
+    second = SQLiteTradingStateStore(path)
+    assert second.daily_loss_entry_lock_reason(current_date=today_text) == (
+        f"DAILY_LOSS_LOCKED:{today_text}:DAILY_LOSS_LIMIT"
+    )
+    assert second.entry_block_reason("ETH/USDT:USDT").startswith(
+        f"DAILY_LOSS_LOCKED:{today_text}"
+    )
+    assert second.entry_block_reason(
+        "ETH/USDT:USDT",
+        for_position_add=True,
+    ).startswith(f"DAILY_LOSS_LOCKED:{today_text}")
+
+    # Startup reconciliation clears only its own lock and must never erase
+    # the independent daily-loss circuit breaker.
+    second.set_runtime_state("entry_lock_reason", None)
+    assert second.entry_block_reason("SOL/USDT:USDT").startswith(
+        f"DAILY_LOSS_LOCKED:{today_text}"
+    )
+
+    assert second.daily_loss_entry_lock_reason(current_date=tomorrow_text) is None
+    assert second.get_runtime_state("daily_loss_entry_lock") is None

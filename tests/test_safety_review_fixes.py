@@ -28,6 +28,8 @@ def test_daily_loss_breaker_uses_tighter_percentage_limit():
     engine.get_balance_info = AsyncMock(return_value=(5_000.0, 5_000.0, 0.0))
 
     assert asyncio.run(engine.check_daily_loss_limit()) is True
+    engine.db.get_daily_stats = lambda: (1, -250.0)
+    assert asyncio.run(engine.check_daily_loss_limit()) is True
     engine.db.get_daily_stats = lambda: (1, -200.0)
     assert asyncio.run(engine.check_daily_loss_limit()) is False
 
@@ -124,6 +126,9 @@ def test_daily_loss_leaves_small_account_adaptive_trend_to_exchange_sl():
         "last_stop_price": 143.27,
     }
     engine.exit_position = AsyncMock()
+    engine._persist_daily_loss_entry_lock = lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("small-account SL-managed position must not create forced-exit lock")
+    )
 
     assert asyncio.run(engine.check_daily_loss_limit()) is True
 
@@ -162,9 +167,37 @@ def test_daily_loss_still_forces_other_strategy_positions_closed():
         "small_account_aggressive_active": False,
     }
     engine.exit_position = AsyncMock()
+    persisted = []
+    engine._persist_daily_loss_entry_lock = lambda **kwargs: persisted.append(kwargs)
 
     assert asyncio.run(engine.check_daily_loss_limit()) is True
     engine.exit_position.assert_awaited_once_with(symbol, "DailyLossLimit")
+    assert persisted[0]["forced_exit_symbols"] == [symbol]
+
+
+def test_daily_loss_forces_exchange_position_missing_from_status_cache():
+    emas = _emas_module()
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = "ETH/USDT"
+    engine.cfg = {"system_settings": {"active_engine": "signal"}}
+    engine.ctrl = SimpleNamespace(status_data={}, notify=AsyncMock())
+    engine.db = SimpleNamespace(get_daily_stats=lambda: (1, -300.0))
+    engine.get_runtime_common_settings = lambda: {
+        "daily_loss_limit": 100_000.0,
+        "daily_loss_limit_pct": 5.0,
+    }
+    engine._fetch_active_position_symbols_checked = AsyncMock(
+        return_value=(True, {symbol})
+    )
+    engine.get_balance_info = AsyncMock(return_value=(5_000.0, 5_000.0, 0.0))
+    engine._get_utbreakout_trailing_state = lambda _symbol: None
+    engine.exit_position = AsyncMock()
+    persisted = []
+    engine._persist_daily_loss_entry_lock = lambda **kwargs: persisted.append(kwargs)
+
+    assert asyncio.run(engine.check_daily_loss_limit()) is True
+    engine.exit_position.assert_awaited_once_with(symbol, "DailyLossLimit")
+    assert persisted[0]["forced_exit_symbols"] == [symbol]
 
 
 def test_scanner_keeps_symbol_and_protection_when_position_lookup_fails():

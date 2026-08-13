@@ -24,6 +24,9 @@ from typing import Any, Iterable
 logger = logging.getLogger(__name__)
 
 
+DAILY_LOSS_ENTRY_LOCK_KEY = "daily_loss_entry_lock"
+
+
 class OrderState(str, Enum):
     PLANNED = "PLANNED"
     SUBMITTING = "SUBMITTING"
@@ -601,6 +604,9 @@ class SQLiteTradingStateStore:
         *,
         for_position_add: bool = False,
     ) -> str | None:
+        daily_loss_lock = self.daily_loss_entry_lock_reason()
+        if daily_loss_lock:
+            return daily_loss_lock
         records = self.list_by_states(ENTRY_BLOCKING_STATES)
         if for_position_add and symbol:
             normalized = _normalize_order_symbol(symbol)
@@ -621,6 +627,29 @@ class SQLiteTradingStateStore:
         ]
         selected = same_symbol[0] if same_symbol else records[0]
         return f"{selected.order_state}:{selected.symbol}:{selected.client_order_id}"
+
+    def daily_loss_entry_lock_reason(
+        self,
+        *,
+        current_date: str | None = None,
+    ) -> str | None:
+        """Return the active UTC-day loss lock, expiring stale locks lazily."""
+        payload = self.get_runtime_state(DAILY_LOSS_ENTRY_LOCK_KEY)
+        if payload is None:
+            return None
+        if not isinstance(payload, dict):
+            # A corrupt safety lock must fail closed instead of silently
+            # allowing another order.
+            return "DAILY_LOSS_LOCKED:INVALID_PERSISTED_STATE"
+
+        today = str(current_date or datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+        lock_date = str(payload.get("date") or "").strip()
+        if lock_date != today:
+            self.delete_runtime_state(DAILY_LOSS_ENTRY_LOCK_KEY)
+            return None
+
+        reason = str(payload.get("reason") or "DAILY_LOSS_LIMIT").strip()
+        return f"DAILY_LOSS_LOCKED:{lock_date}:{reason}"
 
     def set_runtime_state(self, key: str, value: Any) -> None:
         now = utc_now_iso()
