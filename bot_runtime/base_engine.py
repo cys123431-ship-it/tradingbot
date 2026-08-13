@@ -853,7 +853,7 @@ class BaseEngine:
             == 'adaptive_breakout_trend_v1'
         )
 
-    def _persist_daily_loss_entry_lock(
+    async def _persist_daily_loss_entry_lock(
         self,
         *,
         total_daily_pnl,
@@ -862,9 +862,8 @@ class BaseEngine:
     ):
         """Persist the global UTC-day entry lock across restart and resume."""
         try:
-            store = getattr(self, 'trading_state_store', None)
-            if store is None:
-                store = self.crypto_execution.state_store
+            execution = self.crypto_execution
+            store = getattr(self, 'trading_state_store', None) or execution.state_store
             today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
             payload = {
                 'date': today,
@@ -874,7 +873,18 @@ class BaseEngine:
                 'effective_limit_usdt': float(effective_limit),
                 'forced_exit_symbols': sorted(set(forced_exit_symbols)),
             }
-            store.set_runtime_state('daily_loss_entry_lock', payload)
+            # Entry and position-add submissions hold this same lock through
+            # exchange acknowledgement.  Waiting for it here establishes a
+            # strict boundary: all earlier submissions finish first, the
+            # durable breaker is then stored, and every later submission sees
+            # the breaker before reaching the exchange.
+            gateway = getattr(execution, 'order_gateway', None)
+            entry_lock = getattr(gateway, '_global_entry_lock', None)
+            if entry_lock is None:
+                store.set_runtime_state('daily_loss_entry_lock', payload)
+            else:
+                async with entry_lock:
+                    store.set_runtime_state('daily_loss_entry_lock', payload)
             self._daily_loss_entry_lock_fallback = None
             return payload
         except Exception as exc:
@@ -1007,11 +1017,32 @@ class BaseEngine:
                 ]
             forced_exit_symbols = sorted(set(open_symbols))
             if forced_exit_symbols:
-                self._persist_daily_loss_entry_lock(
+                await self._persist_daily_loss_entry_lock(
                     total_daily_pnl=total_daily_pnl,
                     effective_limit=effective_limit,
                     forced_exit_symbols=forced_exit_symbols,
                 )
+                # An entry that was already in flight when the loss breaker
+                # started is allowed to finish before the atomic lock above.
+                # Refresh once after locking so that position is also included
+                # in the forced exit set.  No later entry can pass the gateway.
+                refresh_ok, refreshed_symbols = (
+                    await self._fetch_active_position_symbols_checked()
+                )
+                if refresh_ok:
+                    forced_by_key = {
+                        str(symbol).split(':', 1)[0]: symbol
+                        for symbol in forced_exit_symbols
+                    }
+                    for symbol in refreshed_symbols:
+                        if self._uses_small_account_trend_sl_exit(symbol):
+                            continue
+                        forced_by_key.setdefault(
+                            str(symbol).split(':', 1)[0],
+                            symbol,
+                        )
+                    forced_exit_symbols = sorted(forced_by_key.values())
+                    open_symbols = list(forced_exit_symbols)
             # ?ъ??섏씠 ?덉쑝硫?泥?궛
             if open_symbols and hasattr(self, 'exit_position'):
                 await self.ctrl.notify(

@@ -126,13 +126,16 @@ def test_daily_loss_leaves_small_account_adaptive_trend_to_exchange_sl():
         "last_stop_price": 143.27,
     }
     engine.exit_position = AsyncMock()
-    engine._persist_daily_loss_entry_lock = lambda **_kwargs: (_ for _ in ()).throw(
-        AssertionError("small-account SL-managed position must not create forced-exit lock")
+    engine._persist_daily_loss_entry_lock = AsyncMock(
+        side_effect=AssertionError(
+            "small-account SL-managed position must not create forced-exit lock"
+        )
     )
 
     assert asyncio.run(engine.check_daily_loss_limit()) is True
 
     engine.exit_position.assert_not_awaited()
+    engine._persist_daily_loss_entry_lock.assert_not_awaited()
     engine.ctrl.notify.assert_awaited_once()
     assert "거래소 SL" in engine.ctrl.notify.await_args.args[0]
 
@@ -168,7 +171,9 @@ def test_daily_loss_still_forces_other_strategy_positions_closed():
     }
     engine.exit_position = AsyncMock()
     persisted = []
-    engine._persist_daily_loss_entry_lock = lambda **kwargs: persisted.append(kwargs)
+    engine._persist_daily_loss_entry_lock = AsyncMock(
+        side_effect=lambda **kwargs: persisted.append(kwargs)
+    )
 
     assert asyncio.run(engine.check_daily_loss_limit()) is True
     engine.exit_position.assert_awaited_once_with(symbol, "DailyLossLimit")
@@ -193,11 +198,51 @@ def test_daily_loss_forces_exchange_position_missing_from_status_cache():
     engine._get_utbreakout_trailing_state = lambda _symbol: None
     engine.exit_position = AsyncMock()
     persisted = []
-    engine._persist_daily_loss_entry_lock = lambda **kwargs: persisted.append(kwargs)
+    engine._persist_daily_loss_entry_lock = AsyncMock(
+        side_effect=lambda **kwargs: persisted.append(kwargs)
+    )
 
     assert asyncio.run(engine.check_daily_loss_limit()) is True
     engine.exit_position.assert_awaited_once_with(symbol, "DailyLossLimit")
     assert persisted[0]["forced_exit_symbols"] == [symbol]
+
+
+def test_daily_loss_lock_waits_for_inflight_entry_gateway(tmp_path):
+    emas = _emas_module()
+    from trading_safety.order_state import SQLiteTradingStateStore
+
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    store = SQLiteTradingStateStore(tmp_path / "daily-loss-race.sqlite3")
+    gateway_lock = asyncio.Lock()
+    engine.trading_state_store = store
+    engine.ctrl = SimpleNamespace(
+        crypto_execution_service=SimpleNamespace(
+            state_store=store,
+            order_gateway=SimpleNamespace(_global_entry_lock=gateway_lock),
+        )
+    )
+
+    async def scenario():
+        await gateway_lock.acquire()
+        persist_task = asyncio.create_task(
+            engine._persist_daily_loss_entry_lock(
+                total_daily_pnl=-300.0,
+                effective_limit=250.0,
+                forced_exit_symbols=["BTC/USDT:USDT"],
+            )
+        )
+        await asyncio.sleep(0)
+        assert persist_task.done() is False
+        assert store.get_runtime_state("daily_loss_entry_lock") is None
+
+        gateway_lock.release()
+        payload = await persist_task
+        assert payload["forced_exit_symbols"] == ["BTC/USDT:USDT"]
+        assert store.entry_block_reason("ETH/USDT:USDT").startswith(
+            "DAILY_LOSS_LOCKED:"
+        )
+
+    asyncio.run(scenario())
 
 
 def test_scanner_keeps_symbol_and_protection_when_position_lookup_fails():
