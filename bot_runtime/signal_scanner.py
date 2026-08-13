@@ -14,6 +14,7 @@ from .controller_automatic_controls import (
     AUTOMATIC_SCAN_SCOPE_TRADIFI,
     AUTOMATIC_SCAN_SCOPES,
 )
+from .desktop_monitor import write_desktop_monitor_snapshot
 
 
 class SignalScannerMixin:
@@ -309,6 +310,11 @@ class SignalScannerMixin:
             logger.error(f"Signal poll_tick error ({self.consecutive_errors}x): {e}")
             if self.consecutive_errors > 10:
                 self.consecutive_errors = 0
+        finally:
+            try:
+                write_desktop_monitor_snapshot(self.ctrl)
+            except Exception as snapshot_error:
+                logger.debug("Desktop monitor snapshot write error: %s", snapshot_error)
 
     async def poll_symbol(self, symbol, primary_tf, cfg):
         """媛쒕퀎 ?щ낵 ?대쭅 濡쒖쭅"""

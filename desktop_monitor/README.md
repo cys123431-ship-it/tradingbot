@@ -1,0 +1,30 @@
+# TradingBot Monitor (Rust)
+
+오래된 Windows 11 노트북에서도 가볍게 실행하도록 만든 네이티브 모니터입니다.
+WebView/Electron과 별도 브라우저를 사용하지 않으며, 최근 300개 캔들만 메모리에 보관합니다.
+
+## 제공 화면
+
+- 바이낸스 선물 1분봉 실시간 차트
+- 실제 거래소 포지션(봇 진입 및 수동 진입 모두)
+- 진입가, 현재가, SL, TP 주문 라인
+- 증거금, 레버리지, 미실현 PnL, ROE, 청산가
+- 텔레그램과 같은 전략 신호 상태 및 봇 계좌 요약
+
+## 보안 및 동작
+
+- 거래소 API 키는 Windows 앱으로 복사하지 않습니다.
+- 기존 `azure-trading-bot` SSH 별칭으로 서버의 읽기 전용 스트림만 받습니다.
+- 앱에는 주문 생성, 취소, 청산, 설정 변경 기능이 없습니다.
+- SSH가 끊기면 3초 후 자동으로 다시 연결합니다.
+
+## 빌드 및 실행
+
+PowerShell에서 다음을 실행합니다.
+
+```powershell
+.\desktop_monitor\build_windows.ps1
+.\desktop_monitor\target\release\tradingbot-monitor.exe
+```
+
+다른 SSH 별칭을 써야 할 때만 실행 전에 `TRADINGBOT_SSH_HOST` 환경 변수를 설정합니다.

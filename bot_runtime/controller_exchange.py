@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from utbreakout.coinselector import market_is_blocked_tradifi_commodity
 
+from .desktop_monitor import write_desktop_monitor_snapshot
+
 
 class ControllerExchangeMixin:
     def _telegram_reporting_cfg(self):
@@ -1052,6 +1054,10 @@ class ControllerExchangeMixin:
             atomic_write_json(self.heartbeat_file, payload, ensure_ascii=False, indent=None)
         except Exception as e:
             logger.error(f"Heartbeat write error: {e}")
+        try:
+            write_desktop_monitor_snapshot(self)
+        except Exception as e:
+            logger.debug(f"Desktop monitor snapshot write error: {e}")
 
     def record_exit_marker(self, reason, detail=""):
         if self._exit_recorded:
