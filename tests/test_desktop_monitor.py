@@ -95,3 +95,19 @@ def test_position_without_runtime_hint_is_not_mislabeled_as_bot():
 
     assert classified["side"] == "SHORT"
     assert classified["source"] == "MANUAL / UNKNOWN"
+
+
+def test_missing_exchange_leverage_uses_notional_to_margin_ratio():
+    position = normalize_position(
+        {
+            "symbol": "KORU/USDT:USDT",
+            "contracts": 22.54,
+            "entryPrice": 20.44,
+            "markPrice": 20.31,
+            "notional": 457.86,
+            "leverage": None,
+            "initialMargin": 76.31,
+        }
+    )
+
+    assert position["leverage"] == 6.0

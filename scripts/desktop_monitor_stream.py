@@ -122,6 +122,14 @@ def normalize_position(raw):
     margin = _float(raw.get("initialMargin"), _float(info.get("initialMargin")))
     if not margin:
         margin = notional / max(1.0, leverage)
+    effective_leverage = notional / margin if margin else leverage
+    if leverage <= 1.0 and effective_leverage > 1.05:
+        rounded = round(effective_leverage)
+        leverage = (
+            float(rounded)
+            if abs(effective_leverage - rounded) <= 0.15
+            else effective_leverage
+        )
     pnl = _float(raw.get("unrealizedPnl"), _float(info.get("unRealizedProfit"), 0.0)) or 0.0
     return {
         "symbol": _canonical_symbol(raw.get("symbol") or info.get("symbol")),
@@ -264,7 +272,10 @@ def _fallback_symbol(runtime):
 
 
 def _emit(payload):
-    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
+    try:
+        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
+    except BrokenPipeError:
+        os._exit(0)
 
 
 def stream(root, interval, timeframe, candle_limit):
