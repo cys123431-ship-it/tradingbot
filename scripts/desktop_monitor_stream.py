@@ -263,6 +263,12 @@ def normalize_candles(rows):
 
 def _fallback_symbol(runtime):
     if isinstance(runtime, dict):
+        for row in runtime.get("status_rows", []):
+            if not isinstance(row, dict):
+                continue
+            symbol = _canonical_symbol(row.get("symbol") or row.get("key"))
+            if symbol and "SCANN" not in symbol.upper() and symbol.upper() != "PAUSED":
+                return symbol
         bot = runtime.get("bot") if isinstance(runtime.get("bot"), dict) else {}
         for value in (bot.get("current_symbol"), bot.get("scanner_active_symbol")):
             symbol = _canonical_symbol(value)

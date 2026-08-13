@@ -111,3 +111,32 @@ def test_missing_exchange_leverage_uses_notional_to_margin_ratio():
     )
 
     assert position["leverage"] == 6.0
+
+
+def test_live_status_symbol_wins_over_stale_internal_candidate():
+    engine = SimpleNamespace(
+        scanner_active_symbol=None,
+        current_utbreakout_candidate_symbol=None,
+        adaptive_breakout_trend_last_status={},
+        utbreakout_trailing_states={},
+    )
+    controller = SimpleNamespace(
+        engines={"signal": engine},
+        status_data={
+            "KORU/USDT:USDT": {
+                "symbol": "KORU/USDT:USDT",
+                "pos_side": "NONE",
+                "price": 20.2,
+            }
+        },
+        is_paused=False,
+        get_active_strategy_params=lambda: {
+            "active_strategy": "adaptive_breakout_trend_v1"
+        },
+        get_exchange_mode=lambda: "binance_mainnet",
+        _get_current_symbol=lambda: "INTC/USDT:USDT",
+    )
+
+    snapshot = build_desktop_monitor_snapshot(controller)
+
+    assert snapshot["bot"]["current_symbol"] == "KORU/USDT"

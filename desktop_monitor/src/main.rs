@@ -55,6 +55,15 @@ impl Theme {
         });
     }
 
+    fn paint_background(self, ui: &egui::Ui) {
+        let color = if self == Self::Light {
+            Color32::from_rgb(244, 247, 251)
+        } else {
+            Color32::from_rgb(9, 11, 15)
+        };
+        ui.painter().rect_filled(ui.max_rect(), 0.0, color);
+    }
+
     fn toggle(&mut self, ctx: &egui::Context) {
         *self = if *self == Self::Dark {
             Self::Light
@@ -310,6 +319,8 @@ impl Drop for MonitorApp {
 impl eframe::App for MonitorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.receive();
+        self.theme.apply(ui.ctx());
+        self.theme.paint_background(ui);
         ui.add_space(5.0);
         self.header(ui);
         ui.separator();

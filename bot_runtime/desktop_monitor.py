@@ -49,23 +49,19 @@ def _canonical_symbol(value):
 
 def _get_symbol(controller, engine):
     candidates = []
+    candidates.append(getattr(engine, "scanner_active_symbol", None))
+    status_data = getattr(controller, "status_data", {})
+    if isinstance(status_data, dict):
+        for key, value in status_data.items():
+            if key not in {"PAUSED", "SCANNER"}:
+                candidates.append(value.get("symbol") if isinstance(value, dict) else key)
+    candidates.append(getattr(engine, "current_utbreakout_candidate_symbol", None))
     current_symbol = getattr(controller, "_get_current_symbol", None)
     if callable(current_symbol):
         try:
             candidates.append(current_symbol())
         except Exception:
             pass
-    candidates.extend(
-        (
-            getattr(engine, "scanner_active_symbol", None),
-            getattr(engine, "current_utbreakout_candidate_symbol", None),
-        )
-    )
-    status_data = getattr(controller, "status_data", {})
-    if isinstance(status_data, dict):
-        for key, value in status_data.items():
-            if key not in {"PAUSED", "SCANNER"}:
-                candidates.append(value.get("symbol") if isinstance(value, dict) else key)
     for value in candidates:
         symbol = _canonical_symbol(value)
         if symbol and "SCANN" not in symbol.upper() and symbol.upper() != "PAUSED":
