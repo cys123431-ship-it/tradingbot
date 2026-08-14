@@ -1,5 +1,6 @@
 import asyncio
 import time
+from types import SimpleNamespace
 
 import emas
 
@@ -32,6 +33,40 @@ def test_auto_entry_bridge_state_helpers_exist():
 
     assert engine.utbreakout_auto_entry_bridge_last_attempt_ts == {}
     assert engine.utbreakout_auto_entry_bridge_enabled is True
+
+
+def test_bridge_execution_gate_honors_extended_automatic_daily_limit():
+    engine = _build_engine()
+    engine.ctrl = SimpleNamespace(
+        is_paused=False,
+        get_effective_automatic_daily_trade_limit=lambda: 10,
+    )
+    engine.db = SimpleNamespace(
+        get_daily_stats=lambda: (5, 10.0),
+        get_daily_automatic_entry_count=lambda: 5,
+    )
+    engine.utbreakout_auto_entry_bridge_enabled = True
+
+    async def active_positions(*, use_cache=False):
+        return []
+
+    engine.get_active_position_symbols = active_positions
+    eligibility = asyncio.run(
+        engine._build_utbreakout_bridge_execution_eligibility(
+            symbol="SNXX/USDT:USDT",
+            side="long",
+            plan={"qty": 1.0, "risk_usdt": 0.5},
+            cfg={
+                "max_daily_trades": 5,
+                "daily_max_loss_usdt": 100.0,
+                "utbreakout_require_scanner_candidate_for_auto_entry": True,
+            },
+            source="scanner_seen",
+        )
+    )
+
+    assert eligibility["can_attempt"] is True
+    assert "daily risk limit reached" not in eligibility["blockers"]
 
 
 def test_live_ready_synthesis_rejects_stale_diagnostic():

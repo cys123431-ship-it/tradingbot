@@ -4239,10 +4239,20 @@ class SignalBreakoutAnalysisMixin:
                 _, daily_pnl = db.get_daily_stats()
                 daily_entries = self.get_automatic_daily_entry_count()
                 daily_limit = float(cfg.get('daily_max_loss_usdt', 0) or 0)
-                trade_limit = int(cfg.get('max_daily_trades', 0) or 0)
+                # Telegram's daily-limit extension is the authoritative
+                # automatic-entry limit.  The accepted-plan bridge can receive
+                # a stale/base strategy cfg (commonly 5), so re-reading only
+                # that value incorrectly blocks entries 6-10 after the user
+                # has explicitly enabled today's 10-trade allowance.
+                if hasattr(self, 'get_effective_automatic_daily_trade_limit'):
+                    trade_limit = int(
+                        self.get_effective_automatic_daily_trade_limit()
+                    )
+                else:
+                    trade_limit = int(cfg.get('max_daily_trades', 0) or 0)
                 if daily_limit > 0 and float(daily_pnl or 0) <= -daily_limit:
                     daily_risk_ok = False
-                if trade_limit > 0 and int(daily_entries or 0) >= trade_limit:
+                if trade_limit > 0 and int(daily_entries) >= trade_limit:
                     daily_risk_ok = False
             except Exception as exc:
                 extra_blockers.append(f"daily risk check failed: {exc}")
