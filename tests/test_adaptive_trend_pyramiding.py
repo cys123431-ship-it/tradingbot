@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -243,6 +244,66 @@ def test_adaptive_trend_does_not_add_before_profit_trigger(monkeypatch):
 
     assert result["status"] == "WAITING"
     assert result["pnl_r"] == pytest.approx(0.25)
+
+
+def test_adaptive_trend_marks_subminimum_target_remainder_complete(monkeypatch):
+    engine = SignalExitMixin()
+    state = {
+        "strategy": ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+        "side": "long",
+        "entry_price": 100.0,
+        "risk_distance": 2.0,
+        "adaptive_trend_pyramid_enabled": True,
+        "adaptive_trend_pyramid_trigger_r": (0.50,),
+        "adaptive_trend_pyramid_target_fractions": (1.00,),
+        "adaptive_trend_pyramid_add_count": 0,
+        "adaptive_trend_target_qty": 10.005,
+    }
+    safe_amount_calls = []
+    engine.is_upbit_mode = lambda: False
+    engine._get_utbreakout_trailing_state = lambda symbol: state
+    engine._position_signed_contracts = lambda pos: pos.get("contracts", 0.0)
+    engine._get_min_amount_for_symbol = lambda symbol: 0.01
+    engine.safe_amount = lambda symbol, qty: safe_amount_calls.append(qty) or qty
+    engine._set_utbreakout_trailing_state = lambda symbol, value: None
+    monkeypatch.setattr(signal_exit_module, "datetime", datetime, raising=False)
+    monkeypatch.setattr(signal_exit_module, "timezone", timezone, raising=False)
+    monkeypatch.setattr(
+        signal_exit_module,
+        "ADAPTIVE_BREAKOUT_TREND_STRATEGY",
+        ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        signal_exit_module,
+        "_safe_float_or_none",
+        lambda value: float(value) if value not in (None, "") else None,
+        raising=False,
+    )
+
+    bound_method = engine._maybe_apply_adaptive_trend_pyramiding
+    pyramid_method = getattr(bound_method, "__runtime_original__", None)
+    call_args = (engine,) if pyramid_method is not None else ()
+    pyramid_method = pyramid_method or bound_method
+    result = asyncio.run(
+        pyramid_method(
+            *call_args,
+            "TEST/USDT:USDT",
+            {
+                "side": "long",
+                "contracts": 10.0,
+                "entryPrice": 100.0,
+                "markPrice": 101.0,
+            },
+            None,
+            {},
+        )
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert result["residual_qty"] == pytest.approx(0.005)
+    assert state["adaptive_trend_pyramid_add_count"] == 1
+    assert safe_amount_calls == []
 
 
 def test_small_account_adaptive_trend_add_ignores_daily_pnl_but_keeps_trade_cap(monkeypatch):

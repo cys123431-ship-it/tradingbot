@@ -84,6 +84,37 @@ class SignalExitMixin:
 
         desired_total_qty = target_qty * max(0.0, min(1.0, targets[add_count]))
         add_qty = max(0.0, desired_total_qty - current_qty)
+        min_amount_resolver = getattr(self, '_get_min_amount_for_symbol', None)
+        try:
+            min_amount = (
+                max(0.0, float(min_amount_resolver(symbol) or 0.0))
+                if callable(min_amount_resolver)
+                else 0.0
+            )
+        except Exception:
+            min_amount = 0.0
+
+        # A filled position can differ from its fractional pyramid target by a
+        # sub-step remainder after exchange precision is applied. Treat that
+        # remainder as the stage target being reached; otherwise every candle
+        # retries an order Binance can never accept.
+        if min_amount > 0 and 0 < add_qty + 1e-12 < min_amount:
+            next_add_count = add_count + 1
+            state.update({
+                'adaptive_trend_pyramid_add_count': next_add_count,
+                'last_update_ts': datetime.now(timezone.utc).isoformat(),
+            })
+            self._set_utbreakout_trailing_state(symbol, state)
+            complete = next_add_count >= min(len(triggers), len(targets))
+            return {
+                'status': 'COMPLETE' if complete else 'STAGE_COMPLETE',
+                'reason': (
+                    'adaptive trend pyramid target reached within exchange '
+                    f'minimum amount: residual={add_qty:.12f} min={min_amount:.12f}'
+                ),
+                'residual_qty': add_qty,
+                'min_amount': min_amount,
+            }
         try:
             total_equity, free_balance, _ = await self.get_balance_info()
         except Exception:
@@ -92,8 +123,18 @@ class SignalExitMixin:
         if free_balance and free_balance > 0:
             margin_qty_cap = float(free_balance) * leverage * 0.98 / current_price
             add_qty = min(add_qty, margin_qty_cap)
+        if min_amount > 0 and 0 < add_qty + 1e-12 < min_amount:
+            return {
+                'status': 'BLOCKED',
+                'reason': (
+                    'adaptive trend free-margin add quantity below exchange '
+                    f'minimum: qty={add_qty:.12f} min={min_amount:.12f}'
+                ),
+                'add_qty': add_qty,
+                'min_amount': min_amount,
+            }
         add_qty = float(self.safe_amount(symbol, add_qty))
-        if add_qty <= 0:
+        if add_qty <= 0 or (min_amount > 0 and add_qty + 1e-12 < min_amount):
             return {'status': 'BLOCKED', 'reason': 'adaptive trend add quantity rounded to zero'}
 
         breakeven_stop = initial_entry
