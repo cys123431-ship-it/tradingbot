@@ -42,6 +42,32 @@ def _position_qty(item: Any) -> float:
         return 0.0
 
 
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_protection_order(item: Any) -> bool:
+    data = _payload(item)
+    info = _payload(data.get("info"))
+    order_type = str(
+        data.get("type")
+        or data.get("orderType")
+        or info.get("type")
+        or info.get("orderType")
+        or ""
+    ).upper()
+    return bool(
+        _truthy(data.get("reduceOnly"))
+        or _truthy(info.get("reduceOnly"))
+        or _truthy(data.get("closePosition"))
+        or _truthy(info.get("closePosition"))
+        or "STOP" in order_type
+        or "TAKE_PROFIT" in order_type
+    )
+
+
 def _complete_snapshot(result: Any) -> bool:
     return bool(
         getattr(result, "snapshot_complete", False)
@@ -91,23 +117,27 @@ def update_tradfi_profile_rollout(store: Any, result: Any) -> dict[str, Any]:
                 "state": "awaiting_complete_snapshot",
                 "active": False,
             }
-        position_symbols = sorted(
-            {
-                symbol
-                for item in list(getattr(result, "positions", None) or [])
-                if _position_qty(item) > 0 and (symbol := _item_symbol(item))
-            }
-        )
+        position_symbols = {
+            symbol
+            for item in list(getattr(result, "positions", None) or [])
+            if _position_qty(item) > 0 and (symbol := _item_symbol(item))
+        }
+        protection_symbols = {
+            symbol
+            for item in list(getattr(result, "open_orders", None) or [])
+            if _is_protection_order(item) and (symbol := _item_symbol(item))
+        }
+        pending_symbols = sorted(position_symbols | protection_symbols)
         initial = {
             "version": TRADFI_PROFILE_ROLLOUT_VERSION,
-            "state": "pending_existing_position" if position_symbols else "active",
-            "active": not bool(position_symbols),
-            "pending_symbols": position_symbols,
+            "state": "pending_existing_position" if pending_symbols else "active",
+            "active": not bool(pending_symbols),
+            "pending_symbols": pending_symbols,
             "initialized_at": _now_iso(),
-            "activated_at": None if position_symbols else _now_iso(),
+            "activated_at": None if pending_symbols else _now_iso(),
             "reason": (
-                "deployment observed open position; preserve legacy entry profile until flat"
-                if position_symbols
+                "deployment observed open position/protection; preserve legacy profile until clear"
+                if pending_symbols
                 else "deployment exchange snapshot was flat"
             ),
         }

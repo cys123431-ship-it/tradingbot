@@ -158,3 +158,19 @@ def test_rollout_activates_immediately_when_deployment_snapshot_is_flat(tmp_path
 
     assert state["active"] is True
     assert state["state"] == "active"
+
+
+def test_rollout_waits_when_only_residual_protection_exists_at_deployment(tmp_path):
+    store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+    stop = {
+        "symbol": "SNDK/USDT:USDT",
+        "type": "STOP_MARKET",
+        "reduceOnly": True,
+    }
+
+    pending = update_tradfi_profile_rollout(store, _snapshot(orders=[stop]))
+    active = update_tradfi_profile_rollout(store, _snapshot())
+
+    assert pending["active"] is False
+    assert pending["pending_symbols"] == ["SNDKUSDT"]
+    assert active["active"] is True
