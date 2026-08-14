@@ -4244,7 +4244,16 @@ class SignalBreakoutAnalysisMixin:
                 # a stale/base strategy cfg (commonly 5), so re-reading only
                 # that value incorrectly blocks entries 6-10 after the user
                 # has explicitly enabled today's 10-trade allowance.
-                if hasattr(self, 'get_effective_automatic_daily_trade_limit'):
+                if hasattr(
+                    self,
+                    'get_effective_automatic_daily_trade_limit_for_entry',
+                ):
+                    trade_limit = int(
+                        await self.get_effective_automatic_daily_trade_limit_for_entry(
+                            plan=plan,
+                        )
+                    )
+                elif hasattr(self, 'get_effective_automatic_daily_trade_limit'):
                     trade_limit = int(
                         self.get_effective_automatic_daily_trade_limit()
                     )

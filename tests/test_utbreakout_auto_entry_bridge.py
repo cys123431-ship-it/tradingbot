@@ -69,6 +69,44 @@ def test_bridge_execution_gate_honors_extended_automatic_daily_limit():
     assert "daily risk limit reached" not in eligibility["blockers"]
 
 
+def test_bridge_execution_gate_has_no_trade_count_limit_below_thousand_usdt():
+    engine = _build_engine()
+    engine.ctrl = SimpleNamespace(
+        is_paused=False,
+        get_effective_automatic_daily_trade_limit=lambda: 5,
+    )
+    engine.db = SimpleNamespace(
+        get_daily_stats=lambda: (25, 10.0),
+        get_daily_automatic_entry_count=lambda: 25,
+    )
+    engine.utbreakout_auto_entry_bridge_enabled = True
+
+    async def balance_info():
+        return 42.0, 42.0, 0.0
+
+    async def active_positions(*, use_cache=False):
+        return []
+
+    engine.get_balance_info = balance_info
+    engine.get_active_position_symbols = active_positions
+    eligibility = asyncio.run(
+        engine._build_utbreakout_bridge_execution_eligibility(
+            symbol="SNXX/USDT:USDT",
+            side="long",
+            plan={"qty": 1.0, "risk_usdt": 0.5},
+            cfg={
+                "max_daily_trades": 5,
+                "daily_max_loss_usdt": 100.0,
+                "utbreakout_require_scanner_candidate_for_auto_entry": True,
+            },
+            source="scanner_seen",
+        )
+    )
+
+    assert eligibility["can_attempt"] is True
+    assert "daily risk limit reached" not in eligibility["blockers"]
+
+
 def test_live_ready_synthesis_rejects_stale_diagnostic():
     engine = _build_engine()
     symbol = "SOL/USDT:USDT"

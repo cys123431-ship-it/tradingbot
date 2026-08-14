@@ -84,3 +84,34 @@ def test_default_limit_still_blocks_at_five():
     assert signal is None
     assert reason == "REJECTED_DAILY_TRADE_LIMIT: daily trade count 5 >= 5"
     assert status["reject_code"] == "REJECTED_DAILY_TRADE_LIMIT"
+
+
+def test_sub_thousand_account_has_no_automatic_daily_entry_count_limit():
+    engine = _Engine(count=25, effective_limit=10)
+
+    async def balance_info():
+        return 999.99, 999.99, 0.0
+
+    engine.get_balance_info = balance_info
+    effective_limit = asyncio.run(
+        engine.get_effective_automatic_daily_trade_limit_for_entry()
+    )
+    daily_entries = engine.get_automatic_daily_entry_count()
+
+    assert effective_limit == 0
+    assert engine.get_effective_automatic_daily_trade_limit() == 0
+    assert not (daily_entries >= 5)
+    assert int(daily_entries) == 25
+
+
+def test_thousand_or_more_keeps_the_configured_daily_entry_limit():
+    engine = _Engine(count=10, effective_limit=10)
+
+    async def balance_info():
+        return 1_000.0, 1_000.0, 0.0
+
+    engine.get_balance_info = balance_info
+
+    assert asyncio.run(
+        engine.get_effective_automatic_daily_trade_limit_for_entry()
+    ) == 10

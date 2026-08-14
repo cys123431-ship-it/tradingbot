@@ -605,7 +605,12 @@ class SignalRsptMixin:
                 'REJECTED_DAILY_LOSS_LIMIT',
                 side=side,
             )
-        if int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
+        daily_trade_limit = int(
+            await self.get_effective_automatic_daily_trade_limit_for_entry()
+            if hasattr(self, 'get_effective_automatic_daily_trade_limit_for_entry')
+            else cfg.get('max_daily_trades', 0) or 0
+        )
+        if daily_trade_limit > 0 and daily_entries >= daily_trade_limit:
             return _finish(
                 None,
                 f"risk_limit_blocked: daily trade count {daily_entries}",

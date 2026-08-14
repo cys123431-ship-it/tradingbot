@@ -301,11 +301,19 @@ class SignalEntryMixin:
                 )
                 return
 
-            automatic_daily_limit = (
-                int(self.get_effective_automatic_daily_trade_limit())
-                if hasattr(self, 'get_effective_automatic_daily_trade_limit')
-                else 5
-            )
+            if hasattr(
+                self,
+                'get_effective_automatic_daily_trade_limit_for_entry',
+            ):
+                automatic_daily_limit = int(
+                    await self.get_effective_automatic_daily_trade_limit_for_entry()
+                )
+            else:
+                automatic_daily_limit = (
+                    int(self.get_effective_automatic_daily_trade_limit())
+                    if hasattr(self, 'get_effective_automatic_daily_trade_limit')
+                    else 5
+                )
             try:
                 automatic_daily_entries = int(
                     self.get_automatic_daily_entry_count()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from utbreakout.coinselector import market_is_tradifi_perpetual
 
@@ -26,9 +27,11 @@ class _AutomaticDailyEntryCount(int):
 
     def __new__(cls, value, *, effective_limit):
         obj = super().__new__(cls, max(0, int(value or 0)))
-        obj.effective_limit = max(
-            AUTOMATIC_DAILY_TRADE_LIMIT_BASE,
-            int(effective_limit or AUTOMATIC_DAILY_TRADE_LIMIT_BASE),
+        parsed_limit = int(effective_limit or 0)
+        obj.effective_limit = (
+            0
+            if parsed_limit <= 0
+            else max(AUTOMATIC_DAILY_TRADE_LIMIT_BASE, parsed_limit)
         )
         return obj
 
@@ -37,6 +40,8 @@ class _AutomaticDailyEntryCount(int):
             comparison_limit = int(other)
         except (TypeError, ValueError):
             return NotImplemented
+        if self.effective_limit == 0:
+            return False
         if (
             comparison_limit == AUTOMATIC_DAILY_TRADE_LIMIT_BASE
             and self.effective_limit > AUTOMATIC_DAILY_TRADE_LIMIT_BASE
@@ -49,6 +54,8 @@ class _AutomaticDailyEntryCount(int):
             comparison_limit = int(other)
         except (TypeError, ValueError):
             return NotImplemented
+        if self.effective_limit == 0:
+            return False
         if (
             comparison_limit == AUTOMATIC_DAILY_TRADE_LIMIT_BASE
             and self.effective_limit > AUTOMATIC_DAILY_TRADE_LIMIT_BASE
@@ -60,7 +67,89 @@ class _AutomaticDailyEntryCount(int):
 class SignalAutomaticControlsMixin:
     """Enforce daily and universe controls only for automatic entries."""
 
+    _SMALL_ACCOUNT_UNLIMITED_ENTRY_THRESHOLD_USDT = 1_000.0
+    _AUTOMATIC_ENTRY_EQUITY_CACHE_TTL_SEC = 15.0
+
+    def _automatic_entry_limit_cached_equity(self):
+        cached = getattr(self, '_automatic_entry_limit_equity_cache', None)
+        if not isinstance(cached, tuple) or len(cached) != 2:
+            return None
+        cached_at, equity = cached
+        try:
+            fresh = (
+                time.monotonic() - float(cached_at)
+                <= self._AUTOMATIC_ENTRY_EQUITY_CACHE_TTL_SEC
+            )
+            return float(equity) if fresh and float(equity) > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    def _small_account_unlimited_entry_cache(self):
+        equity = self._automatic_entry_limit_cached_equity()
+        try:
+            return bool(
+                equity is not None
+                and 0.0 < float(equity)
+                < self._SMALL_ACCOUNT_UNLIMITED_ENTRY_THRESHOLD_USDT
+            )
+        except (TypeError, ValueError):
+            return False
+
     def get_effective_automatic_daily_trade_limit(self):
+        if self._small_account_unlimited_entry_cache():
+            return 0
+        ctrl = getattr(self, "ctrl", None)
+        if ctrl is not None and hasattr(
+            ctrl, "get_effective_automatic_daily_trade_limit"
+        ):
+            return int(ctrl.get_effective_automatic_daily_trade_limit())
+        return AUTOMATIC_DAILY_TRADE_LIMIT_BASE
+
+    async def get_effective_automatic_daily_trade_limit_for_entry(self, plan=None):
+        """Return 0 (unlimited) only for a confirmed sub-$1,000 account.
+
+        Zero or unavailable balances fail closed to the normal 5/10 limit.
+        The short cache prevents every scanner candidate from fetching the
+        futures balance independently.
+        """
+
+        plan = plan if isinstance(plan, dict) else {}
+        plan_equity = plan.get('small_account_equity_usdt')
+        plan_threshold = plan.get(
+            'small_account_equity_threshold_usdt',
+            self._SMALL_ACCOUNT_UNLIMITED_ENTRY_THRESHOLD_USDT,
+        )
+        try:
+            if (
+                bool(plan.get('small_account_aggressive_active', False))
+                and 0.0 < float(plan_equity or 0.0) < float(plan_threshold or 0.0)
+            ):
+                self._automatic_entry_limit_equity_cache = (
+                    time.monotonic(),
+                    float(plan_equity),
+                )
+                return 0
+        except (TypeError, ValueError):
+            pass
+
+        if self._automatic_entry_limit_cached_equity() is None:
+            balance_reader = getattr(self, 'get_balance_info', None)
+            if callable(balance_reader):
+                try:
+                    total, free, _ = await balance_reader()
+                    equity = float(total or free or 0.0)
+                    if equity > 0:
+                        self._automatic_entry_limit_equity_cache = (
+                            time.monotonic(),
+                            equity,
+                        )
+                except Exception:
+                    # Balance uncertainty must not silently disable a limit.
+                    pass
+
+        if self._small_account_unlimited_entry_cache():
+            return 0
+
         ctrl = getattr(self, "ctrl", None)
         if ctrl is not None and hasattr(
             ctrl, "get_effective_automatic_daily_trade_limit"

@@ -32,9 +32,17 @@ async def execute_live_order_plan(self, plan, cfg):
         if automatic_owner is not None and hasattr(
             automatic_owner, "get_effective_automatic_daily_trade_limit"
         ):
-            daily_limit = int(
-                automatic_owner.get_effective_automatic_daily_trade_limit()
-            )
+            if hasattr(
+                automatic_owner,
+                "get_effective_automatic_daily_trade_limit_for_entry",
+            ):
+                daily_limit = int(
+                    await automatic_owner.get_effective_automatic_daily_trade_limit_for_entry()
+                )
+            else:
+                daily_limit = int(
+                    automatic_owner.get_effective_automatic_daily_trade_limit()
+                )
             daily_entries = int(
                 automatic_owner.get_automatic_daily_entry_count()
                 if hasattr(automatic_owner, "get_automatic_daily_entry_count")

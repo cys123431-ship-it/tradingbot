@@ -123,7 +123,12 @@ class SignalAlphaMixin:
         status['daily_entries'] = daily_entries
         if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
             return _finish(None, f"risk_limit_blocked: daily pnl {daily_pnl:.2f}", 'REJECTED_DAILY_LOSS_LIMIT')
-        if int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
+        daily_trade_limit = int(
+            await self.get_effective_automatic_daily_trade_limit_for_entry()
+            if hasattr(self, 'get_effective_automatic_daily_trade_limit_for_entry')
+            else cfg.get('max_daily_trades', 0) or 0
+        )
+        if daily_trade_limit > 0 and daily_entries >= daily_trade_limit:
             return _finish(None, f"risk_limit_blocked: daily trade count {daily_entries}", 'REJECTED_DAILY_TRADE_LIMIT')
 
         try:
@@ -665,7 +670,12 @@ class SignalAlphaMixin:
         status['daily_entries'] = daily_entries
         if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
             return _finish(None, f'risk_limit_blocked: daily pnl {daily_pnl:.2f}', 'REJECTED_DAILY_LOSS_LIMIT')
-        if int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
+        daily_trade_limit = int(
+            await self.get_effective_automatic_daily_trade_limit_for_entry()
+            if hasattr(self, 'get_effective_automatic_daily_trade_limit_for_entry')
+            else cfg.get('max_daily_trades', 0) or 0
+        )
+        if daily_trade_limit > 0 and daily_entries >= daily_trade_limit:
             return _finish(None, f'risk_limit_blocked: daily trade count {daily_entries}', 'REJECTED_DAILY_TRADE_LIMIT')
 
         reference_price = _safe_float_or_none(metrics.get('reference_price'))
@@ -1177,7 +1187,12 @@ class SignalAlphaMixin:
         daily_entries = self.get_automatic_daily_entry_count()
         status['daily_pnl'] = daily_pnl
         status['daily_entries'] = daily_entries
-        if int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
+        daily_trade_limit = int(
+            await self.get_effective_automatic_daily_trade_limit_for_entry()
+            if hasattr(self, 'get_effective_automatic_daily_trade_limit_for_entry')
+            else cfg.get('max_daily_trades', 0) or 0
+        )
+        if daily_trade_limit > 0 and daily_entries >= daily_trade_limit:
             return _finish(
                 None,
                 f'risk_limit_blocked: daily trade count {daily_entries}',
@@ -1762,7 +1777,12 @@ class SignalAlphaMixin:
                 f'risk_limit_blocked: daily pnl {daily_pnl:.2f}',
                 'REJECTED_DAILY_LOSS_LIMIT',
             )
-        if int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
+        daily_trade_limit = int(
+            await self.get_effective_automatic_daily_trade_limit_for_entry()
+            if hasattr(self, 'get_effective_automatic_daily_trade_limit_for_entry')
+            else cfg.get('max_daily_trades', 0) or 0
+        )
+        if daily_trade_limit > 0 and daily_entries >= daily_trade_limit:
             return _finish(
                 None,
                 f'risk_limit_blocked: daily trade count {daily_entries}',
@@ -2028,7 +2048,12 @@ class SignalAlphaMixin:
         status['daily_entries'] = daily_entries
         if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
             return _finish(None, f'risk_limit_blocked: daily pnl {daily_pnl:.2f}', 'REJECTED_DAILY_LOSS_LIMIT')
-        if int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
+        daily_trade_limit = int(
+            await self.get_effective_automatic_daily_trade_limit_for_entry()
+            if hasattr(self, 'get_effective_automatic_daily_trade_limit_for_entry')
+            else cfg.get('max_daily_trades', 0) or 0
+        )
+        if daily_trade_limit > 0 and daily_entries >= daily_trade_limit:
             return _finish(None, f'risk_limit_blocked: daily trade count {daily_entries}', 'REJECTED_DAILY_TRADE_LIMIT')
 
         latest_15m = rows[-1] if rows else {}

@@ -332,6 +332,36 @@ def test_final_live_gateway_rechecks_automatic_daily_limit():
         asyncio.run(live_orders.execute_live_order_plan(owner, plan, {}))
 
 
+def test_final_live_gateway_skips_trade_count_limit_for_sub_thousand_account(monkeypatch):
+    from bot_runtime import live_orders
+
+    async def tradeable(symbol):
+        return symbol
+
+    async def scope_allowed(symbol):
+        return symbol
+
+    async def unlimited_for_small_account():
+        return 0
+
+    owner = SimpleNamespace(
+        ctrl=SimpleNamespace(_assert_symbol_tradeable_in_current_exchange_mode=tradeable),
+        _assert_automatic_entry_scan_scope=scope_allowed,
+        get_effective_automatic_daily_trade_limit=lambda: 5,
+        get_effective_automatic_daily_trade_limit_for_entry=unlimited_for_small_account,
+        get_automatic_daily_entry_count=lambda: 25,
+    )
+    plan = SimpleNamespace(symbol="BTC/USDT:USDT", side="long", engine="UTBREAK")
+    monkeypatch.setattr(
+        live_orders,
+        "enforce_activation_stage",
+        lambda cfg: (_ for _ in ()).throw(RuntimeError("AFTER_DAILY_LIMIT_GATE")),
+    )
+
+    with pytest.raises(RuntimeError, match="AFTER_DAILY_LIMIT_GATE"):
+        asyncio.run(live_orders.execute_live_order_plan(owner, plan, {}))
+
+
 def test_effective_strategy_config_uses_todays_extended_limit():
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
     engine.ctrl = SimpleNamespace(

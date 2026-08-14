@@ -235,10 +235,15 @@ class SignalBreakoutStatusMixin:
                 record_failure=False,
                 side=side
             )
-        if int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
+        daily_trade_limit = int(
+            await self.get_effective_automatic_daily_trade_limit_for_entry()
+            if hasattr(self, 'get_effective_automatic_daily_trade_limit_for_entry')
+            else cfg.get('max_daily_trades', 0) or 0
+        )
+        if daily_trade_limit > 0 and daily_entries >= daily_trade_limit:
             return _finish(
                 None,
-                f"REJECTED_DAILY_LOSS_LIMIT: daily trade count {daily_entries} >= {int(cfg['max_daily_trades'])}",
+                f"REJECTED_DAILY_LOSS_LIMIT: daily trade count {daily_entries} >= {daily_trade_limit}",
                 'REJECTED_DAILY_LOSS_LIMIT',
                 record_failure=False,
                 side=side
@@ -3290,14 +3295,20 @@ class SignalBreakoutStatusMixin:
             daily_entries = 0
             max_losses = int(cfg.get('max_consecutive_losses', 3) or 3)
             recent_pnls = []
+        daily_trade_limit = int(
+            await self.get_effective_automatic_daily_trade_limit_for_entry()
+            if hasattr(self, 'get_effective_automatic_daily_trade_limit_for_entry')
+            else cfg.get('max_daily_trades', 0) or 0
+        )
         daily_ok = True
-        daily_detail = f"PnL {_fmt(daily_pnl, 2)} / trades {daily_entries}/{int(cfg['max_daily_trades'])}"
+        daily_limit_label = str(daily_trade_limit) if daily_trade_limit > 0 else 'unlimited(<1000 USDT)'
+        daily_detail = f"PnL {_fmt(daily_pnl, 2)} / trades {daily_entries}/{daily_limit_label}"
         if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
             daily_ok = False
             daily_detail = f"일손실 한도 도달 PnL {_fmt(daily_pnl, 2)}"
-        elif int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
+        elif daily_trade_limit > 0 and daily_entries >= daily_trade_limit:
             daily_ok = False
-            daily_detail = f"일일 거래수 한도 {daily_entries}/{int(cfg['max_daily_trades'])}"
+            daily_detail = f"일일 거래수 한도 {daily_entries}/{daily_trade_limit}"
         elif bool(cfg.get('daily_profit_target_enabled', False)) and float(daily_pnl or 0) >= float(cfg.get('daily_profit_target_usdt', 0) or 0):
             daily_ok = False
             daily_detail = f"일 목표수익 도달 {_fmt(daily_pnl, 2)}"
@@ -4628,14 +4639,20 @@ class SignalBreakoutStatusMixin:
             max_losses,
             today_only=True,
         )
+        daily_trade_limit = int(
+            await self.get_effective_automatic_daily_trade_limit_for_entry()
+            if hasattr(self, 'get_effective_automatic_daily_trade_limit_for_entry')
+            else cfg.get('max_daily_trades', 0) or 0
+        )
         daily_ok = True
-        daily_detail = f"PnL {_fmt(daily_pnl, 2)} / trades {daily_entries}/{int(cfg['max_daily_trades'])}"
+        daily_limit_label = str(daily_trade_limit) if daily_trade_limit > 0 else 'unlimited(<1000 USDT)'
+        daily_detail = f"PnL {_fmt(daily_pnl, 2)} / trades {daily_entries}/{daily_limit_label}"
         if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
             daily_ok = False
             daily_detail = f"일손실 한도 도달 PnL {_fmt(daily_pnl, 2)}"
-        elif int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
+        elif daily_trade_limit > 0 and daily_entries >= daily_trade_limit:
             daily_ok = False
-            daily_detail = f"일일 거래수 한도 {daily_entries}/{int(cfg['max_daily_trades'])}"
+            daily_detail = f"일일 거래수 한도 {daily_entries}/{daily_trade_limit}"
         elif bool(cfg.get('daily_profit_target_enabled', False)) and float(daily_pnl or 0) >= float(cfg.get('daily_profit_target_usdt', 0) or 0):
             daily_ok = False
             daily_detail = f"일 목표수익 도달 {_fmt(daily_pnl, 2)}"
@@ -5954,14 +5971,20 @@ class SignalBreakoutStatusMixin:
             max_losses,
             today_only=True,
         )
+        daily_trade_limit = int(
+            await self.get_effective_automatic_daily_trade_limit_for_entry()
+            if hasattr(self, 'get_effective_automatic_daily_trade_limit_for_entry')
+            else cfg.get('max_daily_trades', 0) or 0
+        )
         daily_ok = True
-        daily_detail = f"PnL {_fmt(daily_pnl, 2)} / trades {daily_entries}/{int(cfg.get('max_daily_trades', 0) or 0)}"
+        daily_limit_label = str(daily_trade_limit) if daily_trade_limit > 0 else 'unlimited(<1000 USDT)'
+        daily_detail = f"PnL {_fmt(daily_pnl, 2)} / trades {daily_entries}/{daily_limit_label}"
         if float(cfg.get('daily_max_loss_usdt', 0) or 0) > 0 and float(daily_pnl or 0) <= -float(cfg['daily_max_loss_usdt']):
             daily_ok = False
             daily_detail = f"일손실 한도 도달 PnL {_fmt(daily_pnl, 2)}"
-        elif int(cfg.get('max_daily_trades', 0) or 0) > 0 and daily_entries >= int(cfg['max_daily_trades']):
+        elif daily_trade_limit > 0 and daily_entries >= daily_trade_limit:
             daily_ok = False
-            daily_detail = f"일일 거래수 한도 {daily_entries}/{int(cfg['max_daily_trades'])}"
+            daily_detail = f"일일 거래수 한도 {daily_entries}/{daily_trade_limit}"
         elif bool(cfg.get('daily_profit_target_enabled', False)) and float(daily_pnl or 0) >= float(cfg.get('daily_profit_target_usdt', 0) or 0):
             daily_ok = False
             daily_detail = f"일 목표수익 도달 {_fmt(daily_pnl, 2)}"
