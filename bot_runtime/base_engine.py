@@ -446,7 +446,7 @@ class BaseEngine:
             params['positionSide'] = position_side
         return params
 
-    async def ensure_market_settings(self, symbol, leverage=None):
+    async def ensure_market_settings(self, symbol, leverage=None, position=None):
         """留덉폆 ?ㅼ젙 媛뺤젣 ?곸슜 (寃⑸━ 紐⑤뱶 + ?덈쾭由ъ?)"""
         if self.is_upbit_mode():
             logger.info(f"{symbol} Settings: UPBIT KRW spot / leverage fixed at 1x")
@@ -463,22 +463,41 @@ class BaseEngine:
                 except Exception as e:
                     logger.warning("Market metadata preload failed for %s: %s", symbol, e)
 
+        position = position if isinstance(position, dict) else {}
+        raw_position = (
+            position.get('raw_position')
+            if isinstance(position.get('raw_position'), dict)
+            else position
+        )
+        position_info = (
+            raw_position.get('info', {})
+            if isinstance(raw_position.get('info'), dict)
+            else {}
+        )
+        position_side = str(
+            position.get('positionSide')
+            or raw_position.get('positionSide')
+            or position_info.get('positionSide')
+            or ''
+        ).strip().upper()
+
         # 1. Position mode is account-wide on Binance Futures. Read it first:
         # repeatedly POSTing the same mode is rejected whenever any open order
         # or position exists, even when the account is already in one-way mode.
-        one_way_confirmed = False
-        try:
-            fetch_position_mode = getattr(self.exchange, 'fetch_position_mode', None)
-            if callable(fetch_position_mode):
-                mode = await asyncio.to_thread(fetch_position_mode)
-                hedged = mode.get('hedged') if isinstance(mode, dict) else None
-                if isinstance(hedged, str):
-                    hedged = hedged.strip().lower() in {'true', '1', 'yes', 'on'}
-                elif isinstance(hedged, (int, float)) and not isinstance(hedged, bool):
-                    hedged = bool(hedged)
-                one_way_confirmed = hedged is False
-        except Exception as e:
-            logger.warning("Position mode lookup failed for %s: %s", symbol, e)
+        one_way_confirmed = position_side == 'BOTH'
+        if not one_way_confirmed:
+            try:
+                fetch_position_mode = getattr(self.exchange, 'fetch_position_mode', None)
+                if callable(fetch_position_mode):
+                    mode = await asyncio.to_thread(fetch_position_mode)
+                    hedged = mode.get('hedged') if isinstance(mode, dict) else None
+                    if isinstance(hedged, str):
+                        hedged = hedged.strip().lower() in {'true', '1', 'yes', 'on'}
+                    elif isinstance(hedged, (int, float)) and not isinstance(hedged, bool):
+                        hedged = bool(hedged)
+                    one_way_confirmed = hedged is False
+            except Exception as e:
+                logger.warning("Position mode lookup failed for %s: %s", symbol, e)
 
         if not one_way_confirmed:
             try:
@@ -487,10 +506,20 @@ class BaseEngine:
                 logger.warning("Position mode verification/setup failed for %s: %s", symbol, e)
 
         # 2. Margin Mode: ISOLATED (媛뺤젣)
-        try:
-            await asyncio.to_thread(self.exchange.set_margin_mode, 'ISOLATED', symbol)
-        except Exception as e:
-            logger.warning("Isolated margin setup failed for %s: %s", symbol, e)
+        current_margin_mode = str(
+            position.get('marginType')
+            or position.get('marginMode')
+            or raw_position.get('marginType')
+            or raw_position.get('marginMode')
+            or position_info.get('marginType')
+            or position_info.get('marginMode')
+            or ''
+        ).strip().lower()
+        if current_margin_mode not in {'isolated', 'isolated_margin'}:
+            try:
+                await asyncio.to_thread(self.exchange.set_margin_mode, 'ISOLATED', symbol)
+            except Exception as e:
+                logger.warning("Isolated margin setup failed for %s: %s", symbol, e)
 
             # 3. Leverage Setting
         try:
@@ -506,7 +535,13 @@ class BaseEngine:
                 else:
                     leverage = self.get_runtime_common_settings().get('leverage', 20)
 
-            await asyncio.to_thread(self.exchange.set_leverage, leverage, symbol)
+            current_leverage = self._position_numeric_value(position, ('leverage',))
+            leverage_already_confirmed = (
+                current_leverage is not None
+                and int(round(float(current_leverage))) == int(leverage)
+            )
+            if not leverage_already_confirmed:
+                await asyncio.to_thread(self.exchange.set_leverage, leverage, symbol)
             logger.info(f"??{symbol} Settings: ISOLATED / {leverage}x")
         except Exception as e:
             logger.error(f"Leverage setting error: {e}")

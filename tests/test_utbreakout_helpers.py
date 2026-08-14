@@ -3457,7 +3457,7 @@ def test_aggressive_growth_pyramiding_adds_after_breakeven_and_rebuilds_protecti
             "taker_buy_sell_ratio": 1.08,
         }
 
-    async def ensure_market_settings(symbol, leverage=1):
+    async def ensure_market_settings(symbol, leverage=1, position=None):
         return None
 
     class Stats:

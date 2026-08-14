@@ -1,7 +1,12 @@
 import asyncio
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from emas import DBManager, SignalRuntimeMixin
+from trading_safety.trade_accounting import (
+    record_closed_trade_accounting,
+    resolve_closed_trade_accounting,
+)
 
 
 def test_db_manager_lists_all_open_trades(tmp_path):
@@ -280,6 +285,145 @@ def test_terminal_order_identity_does_not_keep_legacy_trade_open_forever():
 
     assert engine.db.archived
     assert outcomes[0]["status"] == "ARCHIVED_UNVERIFIED_LEGACY"
+
+
+def test_recent_scanner_close_is_backfilled_from_durable_order_identity():
+    now = datetime.now(timezone.utc).isoformat()
+
+    class _DB:
+        def get_open_trades(self):
+            return [{
+                "symbol": "SNDK/USDT:USDT",
+                "side": "long",
+                "quantity": 0.13,
+                "entry_time": now,
+            }]
+
+    class _Store:
+        def records_for_symbol(self, _symbol):
+            return [SimpleNamespace(
+                order_intent="ENTRY",
+                order_state="CLOSED",
+                metadata={"close_reason": "scanner position completed"},
+                filled_qty=0.13,
+                requested_qty=0.13,
+                side="LONG",
+                created_at=now,
+                updated_at=now,
+                strategy="adaptive_breakout_trend_v1",
+            )]
+
+    class _Engine(SignalRuntimeMixin):
+        def __init__(self):
+            self.db = _DB()
+            self.trading_state_store = _Store()
+            self.states = []
+
+        def _futures_symbol_key(self, symbol):
+            return str(symbol).replace("/", "").replace(":USDT", "")
+
+        async def _record_closed_trade_accounting(self, _symbol, _reason, *, state=None):
+            self.states.append(state)
+            return {"status": "RECORDED"}
+
+    engine = _Engine()
+    result = SimpleNamespace(
+        snapshot_complete=True,
+        positions_ok=True,
+        positions=[],
+        closed_position_symbols=[],
+    )
+
+    outcomes = asyncio.run(engine._account_for_reconciled_flat_trades(result))
+
+    assert outcomes == [{"symbol": "SNDK/USDT:USDT", "status": "RECORDED"}]
+    assert engine.states[0]["_require_exchange_fills"] is True
+
+
+def test_exchange_fill_required_accounting_rejects_estimated_ticker_fallback():
+    class _DB:
+        def __init__(self):
+            self.closed = False
+
+        def get_latest_open_trade(self, _symbol):
+            return {
+                "symbol": "SNDK/USDT:USDT",
+                "side": "long",
+                "entry_price": 100.0,
+                "quantity": 1.0,
+                "entry_time": "2026-08-14T00:00:00+00:00",
+            }
+
+        def log_trade_close(self, *_args, **_kwargs):
+            self.closed = True
+            return True
+
+    class _Exchange:
+        def fetch_my_trades(self, *_args, **_kwargs):
+            return []
+
+        def fetch_ticker(self, _symbol):
+            return {"last": 120.0}
+
+    engine = SimpleNamespace(db=_DB(), exchange=_Exchange())
+    engine._utbreakout_plan_symbol_keys = lambda symbol: [symbol]
+
+    outcome = asyncio.run(record_closed_trade_accounting(
+        engine,
+        "SNDK/USDT:USDT",
+        "scanner position completed",
+        state={"_require_exchange_fills": True},
+    ))
+
+    assert outcome["status"] == "UNRESOLVED"
+    assert engine.db.closed is False
+
+
+def test_reconciled_close_time_excludes_later_same_symbol_trade_cycle():
+    class _Exchange:
+        def fetch_my_trades(self, *_args, **_kwargs):
+            return [
+                {
+                    "timestamp": 1_767_229_195_000,
+                    "side": "sell",
+                    "amount": 1.0,
+                    "price": 105.0,
+                    "realizedPnl": 5.0,
+                    "order": "first-close",
+                },
+                {
+                    "timestamp": 1_767_232_800_000,
+                    "side": "sell",
+                    "amount": 1.0,
+                    "price": 120.0,
+                    "realizedPnl": 20.0,
+                    "order": "later-close",
+                },
+            ]
+
+    engine = SimpleNamespace(exchange=_Exchange())
+    engine._utbreakout_entry_record_for_symbol = lambda *_args, **_kwargs: SimpleNamespace(
+        metadata={},
+        take_profit_order_ids=[],
+        stop_order_id=None,
+    )
+    open_trade = {
+        "side": "long",
+        "entry_price": 100.0,
+        "quantity": 1.0,
+        "entry_time": "2026-01-01T00:00:00+00:00",
+    }
+
+    result = asyncio.run(resolve_closed_trade_accounting(
+        engine,
+        "SNDK/USDT:USDT",
+        open_trade,
+        state={"_reconciled_closed_at": "2026-01-01T01:00:00+00:00"},
+    ))
+
+    assert result["pnl"] == 5.0
+    assert result["exit_price"] == 105.0
+    assert len(result["exit_legs"]) == 1
 
 
 def test_incomplete_snapshot_never_closes_local_trade_accounting():

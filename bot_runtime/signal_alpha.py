@@ -1475,6 +1475,11 @@ class SignalAlphaMixin:
                 if tradfi_profile_applied
                 else None
             ),
+            'strategy_leverage_ceiling': (
+                int(profile_cfg.get('maximum_leverage', 10))
+                if tradfi_profile_applied
+                else None
+            ),
             'small_account_aggressive_daily_pnl_usdt': float(daily_pnl or 0.0),
             'structure_reference_stop': structure_stop,
             'entry_chase_atr': chase_atr,

@@ -67,6 +67,26 @@ def test_market_settings_do_not_repost_already_confirmed_one_way_mode():
     ]
 
 
+def test_market_settings_reuse_verified_open_position_settings():
+    exchange = _SettingsExchange()
+    engine = _engine(exchange)
+    position = {
+        "positionSide": "BOTH",
+        "marginType": "isolated",
+        "leverage": 5,
+    }
+
+    asyncio.run(
+        engine.ensure_market_settings(
+            "BTC/USDT:USDT",
+            leverage=5,
+            position=position,
+        )
+    )
+
+    assert exchange.calls == [("load_markets",)]
+
+
 def test_poll_position_alias_normalization_is_not_a_warning(caplog):
     engine = _signal_engine()
 

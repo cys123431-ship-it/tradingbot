@@ -69,10 +69,24 @@ class SignalRuntimeMixin:
             matches = []
             for record in records:
                 metadata = dict(getattr(record, 'metadata', {}) or {})
+                record_closed_at = _timestamp(
+                    getattr(record, 'updated_at', None)
+                    or getattr(record, 'created_at', None)
+                )
+                recent_scanner_close = bool(
+                    str(metadata.get('close_reason') or '').strip().lower()
+                    == 'scanner position completed'
+                    and record_closed_at is not None
+                    and datetime.now(timezone.utc).timestamp() - record_closed_at
+                    <= 86400.0
+                )
                 if not (
                     str(getattr(record, 'order_intent', '') or '').upper() == 'ENTRY'
                     and str(getattr(record, 'order_state', '') or '').upper() == 'CLOSED'
-                    and bool(metadata.get('reconciled_without_exchange_position'))
+                    and (
+                        bool(metadata.get('reconciled_without_exchange_position'))
+                        or recent_scanner_close
+                    )
                 ):
                     continue
                 record_ts = _timestamp(getattr(record, 'created_at', None))
@@ -178,6 +192,10 @@ class SignalRuntimeMixin:
                     getattr(entry_record, 'updated_at', None)
                     or getattr(entry_record, 'created_at', None)
                 )
+                if str(metadata.get('close_reason') or '').strip().lower() == (
+                    'scanner position completed'
+                ):
+                    state['_require_exchange_fills'] = True
             except Exception:
                 logger.debug(
                     'Reconciled trade metadata lookup failed for %s',

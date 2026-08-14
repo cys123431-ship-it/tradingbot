@@ -22,6 +22,72 @@ from .desktop_monitor import write_desktop_monitor_snapshot
 
 
 class SignalScannerMixin:
+    async def _finalize_scanner_flat_position(self, symbol):
+        """Finish a scanner-owned position only after cleanup and accounting."""
+
+        state = self._get_utbreakout_trailing_state(symbol)
+        await self._cancel_protection_orders(
+            symbol,
+            reason='scanner position completed',
+        )
+        cleanup_status = await self._reconcile_closed_position_protection(
+            symbol,
+            reason='scanner position completed',
+            alert=True,
+            attempts=2,
+        )
+        if not (
+            isinstance(cleanup_status, dict)
+            and cleanup_status.get('cleanup_confirmed')
+        ):
+            logger.warning(
+                "Scanner flat cleanup remains pending for %s: %s",
+                symbol,
+                cleanup_status,
+            )
+            return False
+
+        accounting_state = dict(state or {})
+        accounting_state['_require_exchange_fills'] = True
+        try:
+            accounting = await self._record_closed_trade_accounting(
+                symbol,
+                'scanner position completed',
+                state=accounting_state,
+            )
+        except Exception:
+            logger.exception("Scanner close accounting failed for %s", symbol)
+            return False
+        accounting_status = str(
+            (accounting or {}).get('status') or ''
+        ).strip().upper()
+        if accounting_status not in {'RECORDED', 'NO_OPEN_TRADE'}:
+            logger.warning(
+                "Scanner close accounting remains pending for %s: %s",
+                symbol,
+                accounting,
+            )
+            return False
+
+        self._clear_utbreakout_trailing_state(
+            symbol,
+            finalize=True,
+            reason='scanner position completed',
+        )
+        clear_growth = getattr(self, '_clear_aggressive_growth_position', None)
+        if callable(clear_growth):
+            clear_growth(symbol)
+        return True
+
+    @staticmethod
+    def _coin_selector_is_dated_futures_symbol(symbol):
+        return bool(
+            re.search(
+                r':[A-Z0-9]{3,10}-?\d{6}$',
+                str(symbol or '').strip().upper(),
+            )
+        )
+
     def _resolve_adaptive_trend_scan_universe(self, trade_cfg=None):
         """Resolve standalone-trend single-symbol mode without auto fallback."""
 
@@ -178,17 +244,9 @@ class SignalScannerMixin:
                     else:
                         # ?ъ????놁쓬 (泥?궛?? -> ?ㅼ틦??蹂??珥덇린??& ?ㅼ떆 ?ㅼ틪 紐⑤뱶 吏꾩엯
                         logger.info(f"?삼툘 Scanner trade completed for {self.scanner_active_symbol}. Resuming scan.")
-                        await self._cancel_protection_orders(
-                            self.scanner_active_symbol,
-                            reason='scanner position completed'
-                        )
-                        await self._reconcile_closed_position_protection(
-                            self.scanner_active_symbol,
-                            reason='scanner position completed',
-                            alert=True,
-                            attempts=2
-                        )
-                        self.scanner_active_symbol = None
+                        scanner_symbol = self.scanner_active_symbol
+                        if await self._finalize_scanner_flat_position(scanner_symbol):
+                            self.scanner_active_symbol = None
                         # 諛붾줈 ?ㅼ틪 濡쒖쭅?쇰줈 ?섏뼱媛?
 
                 # 2. ?↔퀬 ?덈뒗寃??녿떎硫? -> ?ㅼ틪 ?ㅽ뻾
@@ -2376,6 +2434,8 @@ class SignalScannerMixin:
         rejected = list(custom_resolution_rejected)
         include_tradifi_universe = self._coin_selector_should_include_tradifi_universe(cfg, custom_enabled)
         for symbol, ticker in ticker_items:
+            if self._coin_selector_is_dated_futures_symbol(symbol):
+                continue
             if active_strategy in UTBREAKOUT_STRATEGIES:
                 ok_market, canonical, invalid_reason = (
                     self._ensure_valid_utbreakout_market_symbol(

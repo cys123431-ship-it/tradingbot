@@ -259,6 +259,22 @@ def test_operator_maximum_caps_opportunity_without_making_it_fixed():
     assert defensive.leverage < high.leverage
 
 
+def test_strategy_ceiling_caps_adaptive_trend_above_small_account_threshold():
+    updated = apply_dynamic_leverage_to_plan(
+        _plan(
+            strategy="adaptive_breakout_trend_v1",
+            adaptive_breakout_trend_score=99.0,
+            strategy_leverage_ceiling=10,
+        ),
+        free_balance=2_000.0,
+        account_equity=2_000.0,
+    )
+
+    assert updated["small_account_aggressive_active"] is False
+    assert updated["leverage"] == 10
+    assert updated["dynamic_leverage_tier"].endswith("+strategy_cap")
+
+
 def test_persisted_v1_dynamic_config_migrates_adaptive_trend_to_fifteen_x_ceiling():
     cfg = normalize_dynamic_leverage_config(
         {"max_leverage": 10, "adaptive_trend_elite_leverage": 10}

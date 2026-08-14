@@ -194,7 +194,7 @@ class SignalExitMixin:
             entry_blocker = None
         if entry_blocker:
             return {'status': 'BLOCKED', 'reason': entry_blocker}
-        await self.ensure_market_settings(symbol, leverage=leverage)
+        await self.ensure_market_settings(symbol, leverage=leverage, position=pos)
         liquidation_preflight = await self._preflight_liquidation_safety(
             symbol,
             side,
@@ -1377,7 +1377,11 @@ class SignalExitMixin:
             entry_blocker = None
         if entry_blocker:
             return {'status': 'BLOCKED', 'reason': entry_blocker}
-        await self.ensure_market_settings(symbol, leverage=int(max(1, float(leverage or 1))))
+        await self.ensure_market_settings(
+            symbol,
+            leverage=int(max(1, float(leverage or 1))),
+            position=pos,
+        )
         liquidation_preflight = await self._preflight_liquidation_safety(
             symbol,
             'long',

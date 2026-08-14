@@ -1138,6 +1138,16 @@ def apply_dynamic_leverage_to_plan(
             f"free={small_account_policy['free_balance']:.2f}, "
             f"minimum={small_account_policy['minimum_leverage']}x"
         )
+    strategy_ceiling = _finite(updated.get("strategy_leverage_ceiling"))
+    if strategy_ceiling is not None and strategy_ceiling > 0:
+        capped_leverage = min(leverage, max(1, int(strategy_ceiling)))
+        if capped_leverage < leverage:
+            decision_tier = f"{decision_tier}+strategy_cap"
+            decision_reason = (
+                f"{decision_reason}; strategy leverage ceiling "
+                f"{int(strategy_ceiling)}x"
+            )
+            leverage = capped_leverage
     decision_payload = decision.as_dict()
     decision_payload.update(
         {

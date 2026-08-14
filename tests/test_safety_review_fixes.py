@@ -1,6 +1,6 @@
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -338,6 +338,69 @@ def test_scanner_keeps_symbol_and_protection_when_position_lookup_fails():
     assert engine.scanner_active_symbol == symbol
     engine._cancel_protection_orders.assert_not_awaited()
     engine._reconcile_closed_position_protection.assert_not_awaited()
+
+
+def test_scanner_flat_completion_accounts_before_clearing_runtime_state():
+    emas = _emas_module()
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = "DRAM/USDT:USDT"
+    state = {"strategy": "adaptive_breakout_trend_v1", "entry_price": 57.23}
+    engine._get_utbreakout_trailing_state = lambda _symbol: state
+    engine._cancel_protection_orders = AsyncMock(return_value=2)
+    engine._reconcile_closed_position_protection = AsyncMock(
+        return_value={"cleanup_confirmed": True, "position_active": False}
+    )
+    engine._record_closed_trade_accounting = AsyncMock(
+        return_value={"status": "RECORDED"}
+    )
+    engine._clear_utbreakout_trailing_state = MagicMock()
+    engine._clear_aggressive_growth_position = MagicMock()
+
+    completed = asyncio.run(engine._finalize_scanner_flat_position(symbol))
+
+    assert completed is True
+    accounting_state = engine._record_closed_trade_accounting.call_args.kwargs["state"]
+    assert accounting_state["_require_exchange_fills"] is True
+    engine._clear_utbreakout_trailing_state.assert_called_once_with(
+        symbol,
+        finalize=True,
+        reason="scanner position completed",
+    )
+
+
+def test_scanner_flat_completion_retries_unresolved_accounting_without_clearing():
+    emas = _emas_module()
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = "DRAM/USDT:USDT"
+    engine._get_utbreakout_trailing_state = lambda _symbol: {"entry_price": 57.23}
+    engine._cancel_protection_orders = AsyncMock(return_value=0)
+    engine._reconcile_closed_position_protection = AsyncMock(
+        return_value={"cleanup_confirmed": True, "position_active": False}
+    )
+    engine._record_closed_trade_accounting = AsyncMock(
+        return_value={"status": "UNRESOLVED"}
+    )
+    engine._clear_utbreakout_trailing_state = MagicMock()
+
+    completed = asyncio.run(engine._finalize_scanner_flat_position(symbol))
+
+    assert completed is False
+    engine._clear_utbreakout_trailing_state.assert_not_called()
+
+
+def test_coin_selector_quietly_skips_dated_futures_contracts():
+    emas = _emas_module()
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+
+    assert engine._coin_selector_is_dated_futures_symbol(
+        "BTC/USDT:USDT260925"
+    ) is True
+    assert engine._coin_selector_is_dated_futures_symbol(
+        "ETH/USDT:USDT-261225"
+    ) is True
+    assert engine._coin_selector_is_dated_futures_symbol(
+        "SNXX/USDT:USDT"
+    ) is False
 
 
 def test_scanner_adopts_restart_position_before_volume_scan():

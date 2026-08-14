@@ -59,6 +59,19 @@ async def resolve_closed_trade_accounting(
         )
     except (TypeError, ValueError):
         pass
+    state_data = state if isinstance(state, dict) else {}
+    until_ms = None
+    reconciled_closed_at = state_data.get("_reconciled_closed_at")
+    if reconciled_closed_at:
+        try:
+            until_ms = int(
+                datetime.fromisoformat(
+                    str(reconciled_closed_at).replace("Z", "+00:00")
+                ).timestamp()
+                * 1000
+            )
+        except (TypeError, ValueError):
+            until_ms = None
 
     fetch_my_trades = getattr(engine.exchange, "fetch_my_trades", None)
     if callable(fetch_my_trades):
@@ -74,7 +87,6 @@ async def resolve_closed_trade_accounting(
             weighted_exit = 0.0
             closing_qty = 0.0
             exit_legs = []
-            state_data = state if isinstance(state, dict) else {}
             planned_targets = list(
                 state_data.get("planned_tp_orders")
                 or state_data.get("tp_orders")
@@ -198,6 +210,12 @@ async def resolve_closed_trade_accounting(
                         since_ms is not None
                         and trade_ts is not None
                         and int(trade_ts) < since_ms
+                    ):
+                        continue
+                    if (
+                        until_ms is not None
+                        and trade_ts is not None
+                        and int(trade_ts) > until_ms + 5_000
                     ):
                         continue
                 except (TypeError, ValueError):
@@ -368,6 +386,13 @@ async def record_closed_trade_accounting(
         )
         return {"status": "UNRESOLVED"}
     state_data = state if isinstance(state, dict) else {}
+    if result.get("estimated") and bool(state_data.get("_require_exchange_fills")):
+        logger.warning(
+            "Automatic close accounting for %s requires exchange fills; "
+            "estimated fallback was rejected and will be retried",
+            symbol,
+        )
+        return {**result, "status": "UNRESOLVED"}
     close_reason = str(reason or "automatic close")
     if result.get("estimated"):
         close_reason = f"{close_reason} [estimated-price]"
