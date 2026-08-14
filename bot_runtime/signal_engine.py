@@ -130,6 +130,8 @@ class SignalEngine(
         self.volatility_managed_trend_last_status = {}  # symbol -> latest VMT status
         self.adaptive_breakout_trend_last_status = {}  # symbol -> standalone adaptive trend status
         self.adaptive_breakout_trend_candle_cache = {}  # symbol -> immutable completed-candle evaluation
+        self.tradfi_pattern_context_cache = {}  # symbol -> completed 4h/1d + benchmark context
+        self.tradfi_profile_rollout_state = {}  # durable deployment activation boundary
         self.l2_gate_cache = {}  # symbol -> short-lived shared L2 state
         self.l2_gate_history = {}  # symbol -> dynamic L2 replenishment/depletion samples
         self.crowding_unwind_last_status = {}  # symbol -> latest funding/OI unwind status

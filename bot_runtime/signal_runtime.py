@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from trading_safety.profile_rollout import (
+    get_tradfi_profile_rollout_state,
+    update_tradfi_profile_rollout,
+)
+
 
 class SignalRuntimeMixin:
     async def _account_for_reconciled_flat_trades(self, result):
@@ -277,9 +282,15 @@ class SignalRuntimeMixin:
             require_user_stream=bool(require_user_stream),
         )
         accounting_results = await self._account_for_reconciled_flat_trades(result)
+        rollout_state = update_tradfi_profile_rollout(
+            self.trading_state_store,
+            result,
+        )
+        self.tradfi_profile_rollout_state = dict(rollout_state or {})
         self.last_crypto_reconciliation = {
             **result.__dict__,
             'accounting_results': accounting_results,
+            'tradfi_profile_rollout': dict(rollout_state or {}),
         }
         critical_pause = load_critical_pause_state()
         if not result.safe_to_trade:
@@ -303,6 +314,37 @@ class SignalRuntimeMixin:
             result.unresolved_records,
         )
         return result
+
+    def get_tradfi_profile_rollout_status(self):
+        state = get_tradfi_profile_rollout_state(
+            getattr(self, 'trading_state_store', None)
+        )
+        if isinstance(getattr(self, 'tradfi_profile_rollout_state', None), dict):
+            cached = dict(self.tradfi_profile_rollout_state)
+            if cached.get('version') == state.get('version'):
+                state = cached
+        return dict(state or {})
+
+    async def ensure_tradfi_profile_rollout_active(self):
+        """Refresh a pending rollout before allowing its first new entry."""
+
+        state = self.get_tradfi_profile_rollout_status()
+        if state.get('active'):
+            return state
+        try:
+            await self._reconcile_crypto_exchange_state(
+                user_stream_ready=bool(getattr(self, 'user_data_stream', None)),
+                require_user_stream=False,
+            )
+        except Exception as exc:
+            logger.exception('TradFi profile rollout refresh failed')
+            return {
+                **state,
+                'active': False,
+                'state': 'refresh_failed',
+                'reason': f'{type(exc).__name__}: {exc}',
+            }
+        return self.get_tradfi_profile_rollout_status()
 
     async def _startup_crypto_safety_reconciliation(self):
         self._set_crypto_entry_lock('RECONCILIATION_REQUIRED')
@@ -413,6 +455,7 @@ class SignalRuntimeMixin:
         self.utbreakout_futures_context_cache = {}
         self.utbreakout_orderflow_snapshots = {}
         self.utbreakout_market_regime_cache = {}
+        self.tradfi_pattern_context_cache = {}
         self.utbreakout_shadow_pending = {}
         self.utbreakout_shadow_resolved_keys = set()
         self.utbreakout_shadow_stats_cache = {}

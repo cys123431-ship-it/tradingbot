@@ -115,6 +115,9 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         "small_account_strong_leverage": 8,
         "small_account_elite_leverage": 15,
         "small_account_leverage_steps": (5, 8, 10, 15),
+        # TradFi perpetuals keep the shared trend model, but add a separate
+        # completed-candle pattern overlay and an exchange-compatible 10x cap.
+        "tradfi_pattern_profile": {"enabled": True},
         "partial_take_profit_r_multiple": 2.00,
         "partial_take_profit_ratio": 0.15,
         "runner_pct": 0.85,

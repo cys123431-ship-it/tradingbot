@@ -32,6 +32,13 @@ from .adaptive_breakout_trend import (
     default_adaptive_breakout_trend_config,
     evaluate_adaptive_breakout_trend,
 )
+from .tradfi_pattern_profile import (
+    TRADFI_PATTERN_PROFILE_VERSION,
+    default_tradfi_pattern_profile_config,
+    evaluate_tradfi_pattern_profile,
+    normalize_tradfi_pattern_profile_config,
+    tradfi_trend_direction,
+)
 from .opportunity_risk import (
     OpportunityRiskDecision,
     apply_opportunity_risk_to_plan,
@@ -201,6 +208,11 @@ __all__ = [
     "AdaptiveBreakoutTrendDecision",
     "default_adaptive_breakout_trend_config",
     "evaluate_adaptive_breakout_trend",
+    "TRADFI_PATTERN_PROFILE_VERSION",
+    "default_tradfi_pattern_profile_config",
+    "evaluate_tradfi_pattern_profile",
+    "normalize_tradfi_pattern_profile_config",
+    "tradfi_trend_direction",
     "OpportunityRiskDecision",
     "apply_opportunity_risk_to_plan",
     "default_opportunity_risk_config",

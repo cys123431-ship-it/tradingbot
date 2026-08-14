@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+
+from trading_safety.market_session import us_equity_regular_session_status
 from utbreakout.adaptive_breakout_trend import (
     normalize_adaptive_breakout_trend_config,
 )
 from utbreakout.profit_capture import (
     QUAD_CONFIRMATION_RISK_MULTIPLIERS,
     bounded_structure_anchor,
+)
+from utbreakout.relative_strength_pullback import completed_candle_rows
+from utbreakout.tradfi_pattern_profile import (
+    TRADFI_PATTERN_PROFILE_VERSION,
+    evaluate_tradfi_pattern_profile,
+    normalize_tradfi_pattern_profile_config,
+    tradfi_trend_direction,
 )
 
 
@@ -832,6 +843,116 @@ class SignalAlphaMixin:
             base['live_enabled'] = bool(source.get('adaptive_breakout_trend_live_enabled'))
         return normalize_adaptive_breakout_trend_config(base)
 
+    @staticmethod
+    def _tradfi_pattern_profile_runtime_config(trend_cfg=None):
+        source = trend_cfg if isinstance(trend_cfg, dict) else {}
+        nested = source.get('tradfi_pattern_profile')
+        return normalize_tradfi_pattern_profile_config(
+            nested if isinstance(nested, dict) else None
+        )
+
+    async def _fetch_tradfi_profile_completed_rows(
+        self,
+        symbol,
+        timeframe,
+        limit,
+        *,
+        now_ms,
+    ):
+        ohlcv = await asyncio.to_thread(
+            self.market_data_exchange.fetch_ohlcv,
+            symbol,
+            timeframe,
+            limit=int(limit),
+        )
+        rows = self._relative_strength_pullback_rows_from_ohlcv(ohlcv)
+        return completed_candle_rows(
+            rows,
+            timeframe,
+            {'exclude_incomplete_live_candle': True},
+            now_ms=int(now_ms),
+        )
+
+    async def _fetch_tradfi_pattern_context(self, symbol, trend_cfg, *, now_ms=None):
+        """Fetch slow TradFi context once per cache window.
+
+        Benchmark data is corroborating evidence only. A newly listed contract
+        must not be disabled solely because SPY or QQQ history is unavailable.
+        """
+
+        canonical = self._canonical_futures_symbol(symbol)
+        current_ms = int(now_ms or time.time() * 1000.0)
+        cache = getattr(self, 'tradfi_pattern_context_cache', None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self.tradfi_pattern_context_cache = cache
+        cached = cache.get(canonical)
+        cache_ttl_ms = 300_000
+        if (
+            isinstance(cached, dict)
+            and current_ms - int(cached.get('cached_at_ms', 0) or 0) < cache_ttl_ms
+        ):
+            return dict(cached.get('context') or {})
+
+        profile_cfg = self._tradfi_pattern_profile_runtime_config(trend_cfg)
+        higher_tf = str(profile_cfg.get('higher_timeframe', '4h') or '4h')
+        daily_tf = str(profile_cfg.get('daily_timeframe', '1d') or '1d')
+        requests = {
+            'higher_timeframe_rows': (canonical, higher_tf, 240),
+            'daily_rows': (canonical, daily_tf, 180),
+            'SPY': ('SPY/USDT:USDT', higher_tf, 240),
+            'QQQ': ('QQQ/USDT:USDT', higher_tf, 240),
+        }
+
+        async def _fetch(payload):
+            return await self._fetch_tradfi_profile_completed_rows(
+                *payload,
+                now_ms=current_ms,
+            )
+
+        results = await asyncio.gather(
+            *(_fetch(payload) for payload in requests.values()),
+            return_exceptions=True,
+        )
+        resolved = dict(zip(requests, results))
+        errors = {
+            key: str(value)
+            for key, value in resolved.items()
+            if isinstance(value, Exception)
+        }
+        benchmark_directions = {
+            key: tradfi_trend_direction(value)
+            for key, value in resolved.items()
+            if key in {'SPY', 'QQQ'} and not isinstance(value, Exception)
+        }
+        context = {
+            'higher_timeframe_rows': (
+                []
+                if isinstance(resolved['higher_timeframe_rows'], Exception)
+                else resolved['higher_timeframe_rows']
+            ),
+            'daily_rows': (
+                []
+                if isinstance(resolved['daily_rows'], Exception)
+                else resolved['daily_rows']
+            ),
+            'benchmark_directions': benchmark_directions,
+            'session_status': us_equity_regular_session_status(),
+            'errors': errors,
+        }
+        cache[canonical] = {
+            'cached_at_ms': current_ms,
+            'context': context,
+        }
+        if len(cache) > 96:
+            oldest_key = min(
+                cache,
+                key=lambda key: int((cache.get(key) or {}).get('cached_at_ms', 0) or 0),
+            )
+            if oldest_key != canonical:
+                cache.pop(oldest_key, None)
+        return dict(context)
+
     async def _calculate_adaptive_breakout_trend_signal(
         self,
         symbol,
@@ -962,6 +1083,53 @@ class SignalAlphaMixin:
             }
 
         status['candle_cache_hit'] = cache_hit
+        profile_cfg = self._tradfi_pattern_profile_runtime_config(trend_cfg)
+        tradfi_profile_applied = False
+        tradfi_context = {}
+        classifier = getattr(self, '_is_tradifi_perpetual_symbol', None)
+        try:
+            is_tradfi = bool(await classifier(canonical)) if callable(classifier) else False
+        except Exception as exc:
+            status['tradfi_classification_error'] = str(exc)
+            is_tradfi = False
+        status['tradfi_perpetual'] = is_tradfi
+        if is_tradfi and bool(profile_cfg.get('enabled', True)):
+            rollout_checker = getattr(self, 'ensure_tradfi_profile_rollout_active', None)
+            if not callable(rollout_checker):
+                return _finish(
+                    None,
+                    'TradFi profile rollout safety boundary unavailable',
+                    'REJECTED_TRADFI_PROFILE_ROLLOUT_UNAVAILABLE',
+                )
+            rollout_state = await rollout_checker()
+            status['tradfi_profile_rollout'] = dict(rollout_state or {})
+            if not bool((rollout_state or {}).get('active')):
+                rollout_reason = (rollout_state or {}).get('reason') or 'transition pending'
+                return _finish(
+                    None,
+                    f'TradFi profile transition pending: {rollout_reason}',
+                    'REJECTED_TRADFI_PROFILE_TRANSITION_PENDING',
+                )
+            tradfi_context = await self._fetch_tradfi_pattern_context(
+                canonical,
+                trend_cfg,
+                now_ms=evaluation_now_ms,
+            )
+            preliminary = evaluate_tradfi_pattern_profile(
+                rows,
+                preliminary,
+                higher_timeframe_rows=tradfi_context.get('higher_timeframe_rows'),
+                daily_rows=tradfi_context.get('daily_rows'),
+                benchmark_directions=tradfi_context.get('benchmark_directions'),
+                session_status=tradfi_context.get('session_status'),
+                config=profile_cfg,
+            )
+            tradfi_profile_applied = True
+            status.update({
+                'tradfi_profile_version': TRADFI_PATTERN_PROFILE_VERSION,
+                'tradfi_pattern_profile_applied': True,
+                'tradfi_pattern_context_errors': dict(tradfi_context.get('errors') or {}),
+            })
         candidate_side = preliminary.side
         if preliminary.allowed and candidate_side in {'long', 'short'}:
             l2_gate = await self._evaluate_shared_l2_gate(
@@ -971,6 +1139,16 @@ class SignalAlphaMixin:
                 side=candidate_side,
             )
             decision = evaluate_adaptive_breakout_trend(rows, l2_gate, trend_cfg)
+            if tradfi_profile_applied:
+                decision = evaluate_tradfi_pattern_profile(
+                    rows,
+                    decision,
+                    higher_timeframe_rows=tradfi_context.get('higher_timeframe_rows'),
+                    daily_rows=tradfi_context.get('daily_rows'),
+                    benchmark_directions=tradfi_context.get('benchmark_directions'),
+                    session_status=tradfi_context.get('session_status'),
+                    config=profile_cfg,
+                )
         else:
             l2_gate = {}
             decision = preliminary
@@ -1233,6 +1411,12 @@ class SignalAlphaMixin:
             'adaptive_breakout_trend_score': float(decision.score),
             'adaptive_breakout_trend_risk_multiplier': risk_multiplier,
             'adaptive_breakout_trend_target_risk_percent': target_risk_percent,
+            'entry_profile_version': (
+                TRADFI_PATTERN_PROFILE_VERSION
+                if tradfi_profile_applied
+                else 'adaptive_breakout_trend_v1'
+            ),
+            'tradfi_pattern_profile_applied': tradfi_profile_applied,
             'risk_budget_mode': (
                 'adaptive_trend_small_account_aggressive_pending'
                 if small_account_aggressive_candidate
@@ -1277,10 +1461,19 @@ class SignalAlphaMixin:
                 trend_cfg.get('small_account_strong_leverage', 8) or 8
             ),
             'small_account_elite_leverage': int(
-                trend_cfg.get('small_account_elite_leverage', 15) or 15
+                profile_cfg.get('maximum_leverage', 10)
+                if tradfi_profile_applied
+                else trend_cfg.get('small_account_elite_leverage', 15) or 15
             ),
             'small_account_leverage_steps': tuple(
-                trend_cfg.get('small_account_leverage_steps', (5, 8, 10, 15))
+                profile_cfg.get('leverage_steps', (5, 8, 10))
+                if tradfi_profile_applied
+                else trend_cfg.get('small_account_leverage_steps', (5, 8, 10, 15))
+            ),
+            'small_account_aggressive_leverage_ceiling': (
+                int(profile_cfg.get('maximum_leverage', 10))
+                if tradfi_profile_applied
+                else None
             ),
             'small_account_aggressive_daily_pnl_usdt': float(daily_pnl or 0.0),
             'structure_reference_stop': structure_stop,
@@ -1397,7 +1590,9 @@ class SignalAlphaMixin:
             f'{key}h={str(value or "NONE").upper()}' for key, value in votes.items()
         )
         breakout_mode = (
-            f"EMA crossover ({int(metrics.get('ema_crossover_age_bars', 0) or 0)}h ago)"
+            'TradFi pattern OR'
+            if metrics.get('tradfi_entry_mode') == 'pattern_or_entry'
+            else f"EMA crossover ({int(metrics.get('ema_crossover_age_bars', 0) or 0)}h ago)"
             if metrics.get('ema_crossover')
             else 'fresh breakout'
             if metrics.get('breakout_entry_enabled') and metrics.get('fresh_breakout')
@@ -1427,7 +1622,7 @@ class SignalAlphaMixin:
                 f"Risk target: {float(metrics.get('target_risk_percent', 0.0) or 0.0):.2f}% "
                 f"/ tier={status.get('risk_tier') or 'waiting'}"
             )
-        return '\n'.join([
+        lines = [
             '📈 Adaptive Breakout Trend 상태',
             f'Symbol: {target}',
             f'Universe: {universe_text}',
@@ -1441,7 +1636,23 @@ class SignalAlphaMixin:
             f"Volatility scale: {float(metrics.get('volatility_scale', 0.0) or 0.0):.2f}",
             f"L2: {(status.get('l2_gate') or {}).get('state') or 'N/A'}",
             f"Reason: {status.get('reason') or '-'}",
-        ])
+        ]
+        if status.get('tradfi_perpetual'):
+            chart_patterns = metrics.get('tradfi_chart_patterns') or {}
+            side = str(status.get('side') or '').lower()
+            pattern_names = chart_patterns.get(side) if isinstance(chart_patterns, dict) else []
+            rollout = status.get('tradfi_profile_rollout') or {}
+            lines.insert(4, (
+                f"TradFi profile: {status.get('tradfi_profile_version') or TRADFI_PATTERN_PROFILE_VERSION} "
+                f"/ rollout={rollout.get('state') or 'unknown'}"
+            ))
+            lines.insert(5, f"Patterns: {', '.join(pattern_names or []) or 'none'}")
+            lines.insert(6, (
+                f"US regular session: "
+                f"{'OPEN' if metrics.get('tradfi_regular_session_open') else 'CLOSED'} "
+                f"({metrics.get('tradfi_session_reason') or 'unknown'})"
+            ))
+        return '\n'.join(lines)
 
     def _crowding_unwind_runtime_config(self, cfg=None):
         source = dict(cfg or {})

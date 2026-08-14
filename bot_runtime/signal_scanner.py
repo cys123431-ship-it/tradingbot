@@ -7,6 +7,10 @@ from utbreakout.adaptive_breakout_trend import (
     evaluate_adaptive_breakout_trend,
     normalize_adaptive_breakout_trend_config,
 )
+from utbreakout.tradfi_pattern_profile import (
+    evaluate_tradfi_pattern_profile,
+    normalize_tradfi_pattern_profile_config,
+)
 
 from .controller_automatic_controls import (
     AUTOMATIC_SCAN_SCOPE_ALL,
@@ -2086,6 +2090,38 @@ class SignalScannerMixin:
                     None,
                     trend_cfg,
                 )
+                if bool(base_candidate.get('tradifi_perpetual')):
+                    profile_cfg = normalize_tradfi_pattern_profile_config(
+                        trend_cfg.get('tradfi_pattern_profile')
+                        if isinstance(trend_cfg.get('tradfi_pattern_profile'), dict)
+                        else None
+                    )
+                    context_fetcher = getattr(
+                        self,
+                        '_fetch_tradfi_pattern_context',
+                        None,
+                    )
+                    profile_context = (
+                        await context_fetcher(
+                            symbol,
+                            trend_cfg,
+                            now_ms=int(time.time() * 1000.0),
+                        )
+                        if callable(context_fetcher)
+                        else {}
+                    )
+                    trend_decision = evaluate_tradfi_pattern_profile(
+                        trend_rows,
+                        trend_decision,
+                        higher_timeframe_rows=profile_context.get('higher_timeframe_rows'),
+                        daily_rows=profile_context.get('daily_rows'),
+                        benchmark_directions=profile_context.get('benchmark_directions'),
+                        session_status=(
+                            profile_context.get('session_status')
+                            or self._coin_selector_tradifi_regular_session_status()
+                        ),
+                        config=profile_cfg,
+                    )
                 trend_metrics = dict(trend_decision.metrics or {})
                 result.update({
                     'adaptive_breakout_trend_allowed': bool(trend_decision.allowed),
@@ -2094,6 +2130,14 @@ class SignalScannerMixin:
                     'adaptive_breakout_trend_reason': trend_decision.reason,
                     'adaptive_breakout_trend_weighted_momentum': trend_metrics.get('weighted_momentum'),
                     'adaptive_breakout_trend_risk_percent': trend_metrics.get('target_risk_percent'),
+                    'tradfi_pattern_profile_applied': bool(
+                        trend_metrics.get('tradfi_pattern_profile_applied')
+                    ),
+                    'tradfi_pattern_entry_allowed': bool(
+                        trend_metrics.get('tradfi_pattern_entry_allowed')
+                    ),
+                    'tradfi_pattern_score': trend_metrics.get('tradfi_pattern_score'),
+                    'tradfi_entry_mode': trend_metrics.get('tradfi_entry_mode'),
                 })
             if bool(ut_cfg.get('ev_adaptive_enabled', False)):
                 scores = analysis.get('scores') if isinstance(analysis.get('scores'), dict) else {}
