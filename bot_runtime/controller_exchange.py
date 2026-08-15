@@ -1914,6 +1914,7 @@ class ControllerExchangeMixin:
             self._hourly_report_loop(),
             self._monthly_trade_report_loop(),
             self._alt_trend_alert_loop(),
+            self._options_trading_loop(),
             self._heartbeat_loop()
         )
 

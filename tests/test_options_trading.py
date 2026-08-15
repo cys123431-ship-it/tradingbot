@@ -315,3 +315,18 @@ def test_main_keyboard_exposes_options_menu():
         encoding="utf-8"
     )
     assert 'KeyboardButton("/options")' in source
+
+
+def test_main_runtime_runs_options_loop_without_optional_telegram_job_queue():
+    from pathlib import Path
+
+    root = Path(__file__).parents[1]
+    runtime_source = (root / "bot_runtime" / "controller_exchange.py").read_text(
+        encoding="utf-8"
+    )
+    options_source = (root / "bot_runtime" / "controller_options.py").read_text(
+        encoding="utf-8"
+    )
+    assert "self._options_trading_loop()," in runtime_source
+    assert "async def _options_trading_loop(self):" in options_source
+    assert "job_queue.run_repeating" not in options_source

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -9,7 +10,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.ext import CallbackQueryHandler, CommandHandler
 
-from options_trading import OptionsTradingService, normalize_options_config
+from options_trading import OptionsTradingService
 
 
 logger = logging.getLogger(__name__)
@@ -231,30 +232,25 @@ class ControllerOptionsMixin:
                 query, await self._format_options_status(refresh=True)
             )
 
-        async def options_job(context):
-            try:
-                await self._options_service().run_cycle()
-            except Exception:
-                logger.exception("Options scheduler cycle failed")
-
         self.tg_app.add_handler(CommandHandler("options", owner_only(options_cmd)))
         self.tg_app.add_handler(
             CallbackQueryHandler(owner_only(options_callback), pattern=r"^op:")
         )
-        try:
-            job_queue = getattr(self.tg_app, "job_queue", None)
-            if job_queue:
-                for job in job_queue.get_jobs_by_name("options_trading_cycle"):
-                    job.schedule_removal()
-                cfg = normalize_options_config(self.cfg.get("options_trading", {}) or {})
-                job_queue.run_repeating(
-                    options_job,
-                    interval=max(15, int(cfg.get("manage_interval_seconds", 30))),
-                    first=20,
-                    name="options_trading_cycle",
-                )
-        except Exception:
-            logger.exception("Options scheduler setup failed")
+
+    async def _options_trading_loop(self):
+        """Run independently of PTB's optional JobQueue dependency."""
+        await asyncio.sleep(20)
+        while True:
+            try:
+                await self._options_service().run_cycle()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Options scheduler cycle failed")
+            interval = self._options_service().config().get(
+                "manage_interval_seconds", 30
+            )
+            await asyncio.sleep(max(15, int(interval)))
 
 
 def _safe_number(value):
