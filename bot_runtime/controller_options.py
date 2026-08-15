@@ -109,10 +109,37 @@ class ControllerOptionsMixin:
                 [
                     "",
                     "최근 후보:",
-                    f"{candidate.get('symbol')} · 추세점수 {_safe_number(candidate.get('signal_score')):+.2f}",
-                    f"델타 {_safe_number(candidate.get('delta')):.2f} · 스프레드 {_safe_number(candidate.get('spread_pct')) * 100:.1f}%",
+                    f"{candidate.get('symbol')} · {candidate.get('strategy') or 'ADAPTIVE_TREND'} · 신호 {_safe_number(candidate.get('signal_score')):+.2f}",
+                    f"Delta {_safe_number(candidate.get('delta')):.2f}/{_safe_number(candidate.get('target_delta')):.2f} · DTE {_safe_number(candidate.get('dte_days')):.1f}/{_safe_number(candidate.get('target_dte_days')):.1f}일",
+                    f"Spread {_safe_number(candidate.get('spread_pct')) * 100:.1f}% · IV/RV {_safe_number(candidate.get('iv_to_realized')):.2f} · 계획비용 {_safe_number(candidate.get('planned_cost_usdt')):.2f} USDT",
                 ]
             )
+
+        stats = status.get("scan_rejection_stats") or {}
+        labels = status.get("scan_outcome_labels") or {}
+        window = int(status.get("scan_outcomes_window") or 0)
+        if window:
+            lines.extend(["", f"최근 {window}회 옵션 스캔 결과:"])
+            order = [
+                "DIRECTION_SIGNAL",
+                "DTE",
+                "DELTA",
+                "IV",
+                "SPREAD",
+                "LIQUIDITY",
+                "BUDGET",
+                "EXISTING_POSITION",
+                "OPEN_ORDER",
+                "CAN_TRADE",
+                "API",
+                "OTHER",
+                "ORDERABLE_CANDIDATE",
+            ]
+            for code in order:
+                count = int(stats.get(code) or 0)
+                if count:
+                    lines.append(f"- {labels.get(code) or code}: {count}")
+
         lines.extend(["", f"최근 판단: {status.get('last_reason') or '없음'}"])
         if status.get("api_error"):
             lines.append(f"API 오류: {status.get('api_error')}")
@@ -179,9 +206,7 @@ class ControllerOptionsMixin:
                 )
                 return
             if action == "status":
-                await self._edit_options_message(
-                    query, await self._format_options_status(refresh=True)
-                )
+                await self._edit_options_message(query, await self._format_options_status(refresh=True))
                 return
             if action == "scan":
                 result = await self._options_service().run_cycle(force_scan=True)
@@ -195,10 +220,11 @@ class ControllerOptionsMixin:
                 await self._edit_options_message(
                     query,
                     "📈 옵션 전략\n"
-                    "1시간·4시간 다중 속도 추세를 가중점수로 평가합니다.\n"
-                    "상승은 콜, 하락은 풋을 매수하며 IV/실현변동성·델타·스프레드·거래량·호가를 함께 비교합니다.\n"
-                    "수익 +80%, 손실 -45%, 이익 추적청산, 만기·시간 제한을 적용합니다.\n"
-                    "옵션 매수만 허용하므로 최대손실은 지불한 프리미엄과 수수료로 제한됩니다.",
+                    "Adaptive Trend는 기존 1시간·4시간 추세 구조를 유지하면서 신호강도에 따라 DTE·Delta 목표를 바꿉니다.\n"
+                    "Low-IV Squeeze는 ATR/실현변동성 압축 뒤 거래량·모멘텀을 동반한 상·하방 돌파만 CALL/PUT 후보로 봅니다.\n"
+                    "20 USDT·최소수량·수수료를 먼저 통과한 계약만 Delta·DTE·IV/RV·skew·Spread·유동성·Greeks 점수로 비교합니다.\n"
+                    "기존 +80% TP, -45% SL, 추적청산, 만기·시간 제한은 유지하고 추세붕괴·IV 급락·Theta/DTE 부담을 보조 청산에 사용합니다.\n"
+                    "옵션 매수만 허용하므로 신규 진입용 SELL/네이키드 매도는 만들지 않습니다.",
                 )
                 return
             if action == "budget":
@@ -228,9 +254,7 @@ class ControllerOptionsMixin:
                     + await self._format_options_status(refresh=True),
                 )
                 return
-            await self._edit_options_message(
-                query, await self._format_options_status(refresh=True)
-            )
+            await self._edit_options_message(query, await self._format_options_status(refresh=True))
 
         self.tg_app.add_handler(CommandHandler("options", owner_only(options_cmd)))
         self.tg_app.add_handler(
@@ -247,9 +271,7 @@ class ControllerOptionsMixin:
                 raise
             except Exception:
                 logger.exception("Options scheduler cycle failed")
-            interval = self._options_service().config().get(
-                "manage_interval_seconds", 30
-            )
+            interval = self._options_service().config().get("manage_interval_seconds", 30)
             await asyncio.sleep(max(15, int(interval)))
 
 
