@@ -19,6 +19,7 @@ from .controller_automatic_controls import (
     AUTOMATIC_SCAN_SCOPES,
 )
 from .desktop_monitor import write_desktop_monitor_snapshot
+from .diagnostics import _safe_float_or_none
 
 
 class SignalScannerMixin:
@@ -1564,6 +1565,8 @@ class SignalScannerMixin:
         selection_metrics,
         futures_context,
         candidate=None,
+        *,
+        tradfi=False,
     ):
         """Rank an actionable trend across symbols without adding a hard gate."""
 
@@ -1651,18 +1654,43 @@ class SignalScannerMixin:
             'positioning': round(positioning, 2),
             'liquidity': round(liquidity, 2),
         }
-        score = (
-            trend * 0.40
-            + price_volume * 0.20
-            + orderflow * 0.20
-            + positioning * 0.10
-            + liquidity * 0.10
-        )
+        if tradfi:
+            # TradFi selection remains trend-first.  Perpetual OI/funding can
+            # still break a close tie, but it must not overpower the price
+            # trend that granted entry permission in the first place.
+            weights = {
+                'trend': 0.60,
+                'price_volume': 0.20,
+                'orderflow': 0.10,
+                'positioning': 0.05,
+                'liquidity': 0.05,
+            }
+            profile = 'tradfi_trend_first'
+        else:
+            weights = {
+                'trend': 0.40,
+                'price_volume': 0.20,
+                'orderflow': 0.20,
+                'positioning': 0.10,
+                'liquidity': 0.10,
+            }
+            profile = 'crypto_balanced'
+        raw_components = {
+            'trend': trend,
+            'price_volume': price_volume,
+            'orderflow': orderflow,
+            'positioning': positioning,
+            'liquidity': liquidity,
+        }
+        score = sum(raw_components[key] * weight for key, weight in weights.items())
         return {
             'score': round(max(0.0, min(100.0, score)), 2),
             'components': components,
+            'profile': profile,
+            'weights': dict(weights),
             'reason': (
-                f"trend {components['trend']:.1f}, price-volume {components['price_volume']:.1f}, "
+                f"{profile}: trend {components['trend']:.1f}, "
+                f"price-volume {components['price_volume']:.1f}, "
                 f"flow {components['orderflow']:.1f}, positioning {components['positioning']:.1f}, "
                 f"liquidity {components['liquidity']:.1f}"
             ),
@@ -2298,6 +2326,7 @@ class SignalScannerMixin:
                     selection_metrics,
                     futures_context,
                     base_candidate,
+                    tradfi=bool(base_candidate.get('tradifi_perpetual')),
                 )
                 result.update({
                     'adaptive_breakout_trend_allowed': bool(trend_decision.allowed),
@@ -2314,6 +2343,8 @@ class SignalScannerMixin:
                     ),
                     'convex_rotation_score': rotation_score['score'],
                     'convex_rotation_components': rotation_score['components'],
+                    'convex_rotation_profile': rotation_score['profile'],
+                    'convex_rotation_weights': rotation_score['weights'],
                     'convex_rotation_reason': rotation_score['reason'],
                     'tradfi_pattern_profile_applied': bool(
                         trend_metrics.get('tradfi_pattern_profile_applied')

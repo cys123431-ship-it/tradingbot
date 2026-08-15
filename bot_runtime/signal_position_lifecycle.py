@@ -695,6 +695,16 @@ class SignalPositionLifecycleMixin:
             'convex_rotation_rank': plan.get('convex_rotation_rank'),
             'convex_rotation_universe_size': plan.get('convex_rotation_universe_size'),
             'convex_rotation_tier': plan.get('convex_rotation_tier'),
+            'convex_rotation_profile': plan.get('convex_rotation_profile'),
+            'adaptive_trend_absolute_risk_tier': plan.get(
+                'adaptive_trend_absolute_risk_tier'
+            ),
+            'tradfi_relative_rank_upgrade_only': bool(
+                plan.get('tradfi_relative_rank_upgrade_only', False)
+            ),
+            'tradfi_absolute_tier_floor_applied': bool(
+                plan.get('tradfi_absolute_tier_floor_applied', False)
+            ),
             'convex_rotation_entry_reacceleration': bool(plan.get('convex_rotation_entry_reacceleration', False)),
             'convex_rotation_exit_enabled': bool(plan.get('convex_rotation_exit_enabled', False)),
             'convex_rotation_min_holding_bars': int(plan.get('convex_rotation_min_holding_bars', 32) or 32),

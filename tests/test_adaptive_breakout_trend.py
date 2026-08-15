@@ -16,7 +16,10 @@ from utbreakout.adaptive_breakout_trend import (
     evaluate_adaptive_breakout_trend,
     normalize_adaptive_breakout_trend_config,
 )
-from bot_runtime.signal_alpha import SignalAlphaMixin
+from bot_runtime.signal_alpha import (
+    SignalAlphaMixin,
+    _resolve_adaptive_trend_risk_tier,
+)
 from bot_runtime.signal_entry import build_durable_entry_plan_summary
 from bot_runtime.signal_scanner import SignalScannerMixin
 from utbreakout.dynamic_leverage import select_dynamic_leverage
@@ -35,6 +38,63 @@ CALM_L2 = {
     "state": "calm",
     "direction_support": "",
 }
+
+
+def test_tradfi_relative_rank_can_upgrade_but_never_downgrade_absolute_trend():
+    assert _resolve_adaptive_trend_risk_tier(
+        'elite',
+        'base',
+        relative_valid=True,
+        tradfi=True,
+    ) == 'elite'
+    assert _resolve_adaptive_trend_risk_tier(
+        'base',
+        'elite',
+        relative_valid=True,
+        tradfi=True,
+    ) == 'elite'
+    assert _resolve_adaptive_trend_risk_tier(
+        'elite',
+        'base',
+        relative_valid=True,
+        tradfi=False,
+    ) == 'base'
+
+
+def test_tradfi_rotation_score_is_trend_first_and_reduces_derivative_positioning():
+    scanner = SignalScannerMixin()
+    args = (
+        'long',
+        {'score': 92.0, 'weighted_momentum': 0.80, 'long_votes': 3, 'volume_ratio': 1.25},
+        {
+            'momentum_consistency': 0.62,
+            'directional_efficiency': 0.42,
+            'return_lookback_pct': 8.0,
+        },
+        {
+            'rolling_orderbook_imbalance_pct': -3.0,
+            'taker_buy_sell_ratio': 0.96,
+            'open_interest_delta_z': -0.4,
+            'open_interest_acceleration': -0.2,
+            'funding_rate': 0.0010,
+            'basis_pct': 0.35,
+            'futures_spread_pct': 0.03,
+            'bid_depth_usdt': 120_000.0,
+            'ask_depth_usdt': 120_000.0,
+        },
+        {'quote_volume': 800_000_000.0},
+    )
+
+    crypto = scanner._calculate_convex_rotation_score(*args)
+    tradfi = scanner._calculate_convex_rotation_score(*args, tradfi=True)
+
+    assert crypto['profile'] == 'crypto_balanced'
+    assert crypto['weights']['trend'] == pytest.approx(0.40)
+    assert crypto['weights']['positioning'] == pytest.approx(0.10)
+    assert tradfi['profile'] == 'tradfi_trend_first'
+    assert tradfi['weights']['trend'] == pytest.approx(0.60)
+    assert tradfi['weights']['positioning'] == pytest.approx(0.05)
+    assert tradfi['score'] > crypto['score']
 
 
 def _trend_rows(direction: int, count: int = 220) -> list[dict]:

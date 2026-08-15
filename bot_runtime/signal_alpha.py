@@ -23,6 +23,32 @@ from utbreakout.tradfi_pattern_profile import (
 )
 
 
+_ADAPTIVE_RISK_TIER_ORDER = {'base': 0, 'strong': 1, 'elite': 2}
+
+
+def _resolve_adaptive_trend_risk_tier(
+    absolute_tier,
+    relative_tier,
+    *,
+    relative_valid,
+    tradfi,
+):
+    """Let TradFi relative rank upgrade, but never downgrade, trend quality."""
+
+    absolute = str(absolute_tier or 'base').strip().lower()
+    if absolute not in _ADAPTIVE_RISK_TIER_ORDER:
+        absolute = 'base'
+    relative = str(relative_tier or '').strip().lower()
+    if not relative_valid or relative not in _ADAPTIVE_RISK_TIER_ORDER:
+        return absolute
+    if tradfi:
+        return max(
+            (absolute, relative),
+            key=lambda tier: _ADAPTIVE_RISK_TIER_ORDER[tier],
+        )
+    return relative
+
+
 class SignalAlphaMixin:
     def _qh_flow_runtime_config(self, cfg=None):
         source = dict(cfg or {})
@@ -1217,19 +1243,35 @@ class SignalAlphaMixin:
             and selector_candidate.get('adaptive_breakout_trend_allowed')
             and selector_side == side
         )
-        effective_risk_tier = (
-            rotation_tier
-            if selector_tier_valid
-            else str(metrics.get('risk_tier') or 'base').strip().lower()
+        absolute_risk_tier = str(
+            metrics.get('risk_tier') or 'base'
+        ).strip().lower()
+        if absolute_risk_tier not in _ADAPTIVE_RISK_TIER_ORDER:
+            absolute_risk_tier = 'base'
+        effective_risk_tier = _resolve_adaptive_trend_risk_tier(
+            absolute_risk_tier,
+            rotation_tier,
+            relative_valid=selector_tier_valid,
+            tradfi=is_tradfi,
         )
-        if effective_risk_tier not in {'base', 'strong', 'elite'}:
-            effective_risk_tier = 'base'
+        tradfi_tier_floor_applied = bool(
+            is_tradfi
+            and selector_tier_valid
+            and _ADAPTIVE_RISK_TIER_ORDER[absolute_risk_tier]
+            > _ADAPTIVE_RISK_TIER_ORDER[rotation_tier]
+        )
         status.update({
             'convex_rotation_score': rotation_score,
             'convex_rotation_percentile': rotation_percentile,
             'convex_rotation_rank': selector_candidate.get('convex_rotation_rank'),
             'convex_rotation_tier': effective_risk_tier,
             'convex_rotation_relative_tier_applied': selector_tier_valid,
+            'convex_rotation_profile': selector_candidate.get(
+                'convex_rotation_profile'
+            ),
+            'adaptive_trend_absolute_risk_tier': absolute_risk_tier,
+            'tradfi_relative_rank_upgrade_only': bool(is_tradfi),
+            'tradfi_absolute_tier_floor_applied': tradfi_tier_floor_applied,
             'risk_tier': effective_risk_tier,
         })
 
@@ -1500,6 +1542,12 @@ class SignalAlphaMixin:
                 'convex_rotation_universe_size'
             ),
             'convex_rotation_tier': effective_risk_tier,
+            'convex_rotation_profile': selector_candidate.get(
+                'convex_rotation_profile'
+            ),
+            'adaptive_trend_absolute_risk_tier': absolute_risk_tier,
+            'tradfi_relative_rank_upgrade_only': bool(is_tradfi),
+            'tradfi_absolute_tier_floor_applied': tradfi_tier_floor_applied,
             'convex_rotation_entry_reacceleration': bool(
                 metrics.get('continuation_reacceleration')
                 or metrics.get('compression_breakout')
@@ -1782,6 +1830,11 @@ class SignalAlphaMixin:
                 f"US regular session: "
                 f"{'OPEN' if metrics.get('tradfi_regular_session_open') else 'CLOSED'} "
                 f"({metrics.get('tradfi_session_reason') or 'unknown'})"
+            ))
+            lines.insert(7, (
+                "TradFi ranking: trend-first / upgrade-only "
+                f"(absolute={status.get('adaptive_trend_absolute_risk_tier') or 'N/A'}, "
+                f"effective={status.get('risk_tier') or 'N/A'})"
             ))
         return '\n'.join(lines)
 
