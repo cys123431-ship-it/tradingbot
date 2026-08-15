@@ -6038,6 +6038,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 /customentry - 사용자 지정 종목·방향 진입 모드
 /autotrade - 자동매매 거래횟수·스캔범위 설정
 /prediction - Prediction Micro Auto / Binance Wallet Prediction(Predict.fun) 메뉴
+/options - Binance European Options 전용 메뉴
 /log - 최근 로그
 /close - 긴급 청산
 /stop - 긴급 정지 및 포지션 청산
@@ -6075,6 +6076,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
         self.tg_app.add_handler(CommandHandler("help", owner_only(help_cmd)))
         self._register_automatic_trading_control_handlers(owner_only)
         self._register_user_custom_entry_handlers(owner_only, text_filter)
+        self._register_options_trading_handlers(owner_only)
 
         setup_command_handler = CommandHandler('setup', owner_only(self.setup_entry))
         setup_text_handler = MessageHandler(filters.Regex(setup_trigger_pattern), owner_only(self.setup_entry))
@@ -6137,6 +6139,8 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
                 return
             if command == "/prediction":
                 return await prediction_cmd(u, c)
+            if command == "/options":
+                return None
             return None
 
         self.tg_app.add_handler(

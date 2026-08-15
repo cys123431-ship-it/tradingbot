@@ -40,6 +40,7 @@ from bot_runtime.assembly import bind_runtime_methods
 from bot_runtime import controller as _controller_module
 from bot_runtime import controller_custom_entry as _controller_custom_entry_module
 from bot_runtime import controller_exchange as _controller_exchange_module
+from bot_runtime import controller_options as _controller_options_module
 from bot_runtime import controller_reporting as _controller_reporting_module
 from bot_runtime import controller_telegram as _controller_telegram_module
 from bot_runtime import controller_telegram_setup as _controller_telegram_setup_module
@@ -78,6 +79,7 @@ from bot_runtime.controller import MainController
 from bot_runtime.controller_custom_entry import ControllerCustomEntryMixin
 from bot_runtime.controller_emergency import ControllerEmergencyMixin
 from bot_runtime.controller_exchange import ControllerExchangeMixin
+from bot_runtime.controller_options import ControllerOptionsMixin
 from bot_runtime.controller_reporting import ControllerReportingMixin
 from bot_runtime.controller_telegram import ControllerTelegramMixin
 from bot_runtime.controller_telegram_setup import TelegramSetupMixin
@@ -370,7 +372,7 @@ TELEGRAM_EMERGENCY_PATTERN = (
 )
 TELEGRAM_MENU_COMMAND_PATTERN = (
     r"^/(status|history|log|help|stats|close|utbreak|utbreakout|trend|utbot|setup|"
-    r"coinscan|customcoins|microauto|prediction|customentry|custom)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
+    r"coinscan|customcoins|microauto|prediction|options|customentry|custom)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
 )
 TELEGRAM_UTBREAK_INTEGRATED_COMMANDS = frozenset({
     "/utbot",
@@ -537,6 +539,7 @@ _CLASS_RUNTIME_MODULES = (
     _signal_protection_module,
     _signal_exit_module,
     _controller_exchange_module,
+    _controller_options_module,
     _controller_telegram_module,
     _controller_custom_entry_module,
     _controller_telegram_setup_module,
@@ -571,6 +574,7 @@ for _runtime_module in (
     _signal_protection_module,
     _signal_exit_module,
     _controller_exchange_module,
+    _controller_options_module,
     _controller_telegram_module,
     _controller_custom_entry_module,
     _controller_telegram_setup_module,

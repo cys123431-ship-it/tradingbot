@@ -194,6 +194,7 @@ LXR은 완료된 `15m` 봉에서 2.2ATR 이상의 단기 가격 충격, 평시 �
 ├── utbreakout/                     # UTBreak, EV, 장세, 방향, RSPT 등 전략 모듈
 ├── trading_safety/                 # 주문 게이트웨이, 상태 저장, 조정, 보호 주문
 ├── prediction/                     # Prediction/Predict.fun 보조 모듈
+├── options_trading/                # Binance European Options 전용 전략·20 USDT 원장·API 실행
 ├── scripts/                        # 운영, 백테스트, 리서치 도구
 ├── tests/                          # 전략·주문·안전·배포 회귀 테스트
 ├── tradingview/                    # TradingView 참고 스크립트
@@ -269,6 +270,7 @@ scripts/bot_ctl.sh stop
 | `/customentry` | 사용자 지정 종목·방향 시장가 진입 모드 |
 | `/autotrade` | 자동전략 일일 거래한도·CoinSelector 스캔범위 버튼 메뉴 |
 | `/prediction` | Prediction Micro Auto / Predict.fun 메뉴 |
+| `/options` | Binance European Options 전용 ON/OFF·상태·스캔·청산 메뉴 |
 | `/setup` | 거래소·네트워크 전환만 지원 |
 | `/log` | 최근 로그 |
 | `/close` | 현재 포지션 긴급 청산 |

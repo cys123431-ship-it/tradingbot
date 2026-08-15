@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from options_trading.config import default_options_config, normalize_options_config
+
 from utbreakout.adaptive_breakout_trend import (
     ADAPTIVE_BREAKOUT_TREND_STRATEGY,
     normalize_adaptive_breakout_trend_config,
@@ -75,6 +77,7 @@ class TradingConfig:
                 'show_dashboard': True,
                 'monitoring_interval_seconds': 3
             },
+            'options_trading': default_options_config(),
             'shannon_engine': {
                 'leverage': 5,
                 'daily_loss_limit': 5000,
@@ -935,6 +938,12 @@ class TradingConfig:
                 micro_auto_cfg[key] = value
                 changed = True
 
+        options_cfg = self.config.setdefault('options_trading', {})
+        normalized_options = normalize_options_config(options_cfg)
+        if options_cfg != normalized_options:
+            self.config['options_trading'] = normalized_options
+            changed = True
+
         upbit_cfg = self.config.setdefault('upbit', {})
         upbit_watchlist = upbit_cfg.get('watchlist')
         if not isinstance(upbit_watchlist, list) or not upbit_watchlist:
@@ -1112,6 +1121,7 @@ class TradingConfig:
                 "show_dashboard": True,
                 "monitoring_interval_seconds": 3
             },
+            "options_trading": default_options_config(),
             "exchange_watchlists": {
                 BINANCE_TESTNET: list(EXCHANGE_MODE_DEFAULT_WATCHLISTS[BINANCE_TESTNET]),
                 BINANCE_MAINNET: list(EXCHANGE_MODE_DEFAULT_WATCHLISTS[BINANCE_MAINNET]),

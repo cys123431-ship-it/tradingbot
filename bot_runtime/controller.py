@@ -8,6 +8,7 @@ from .controller_automatic_controls import ControllerAutomaticTradingControlsMix
 from .controller_custom_entry import ControllerCustomEntryMixin
 from .controller_emergency import ControllerEmergencyMixin
 from .controller_exchange import ControllerExchangeMixin
+from .controller_options import ControllerOptionsMixin
 from .controller_reporting import ControllerReportingMixin
 from .controller_telegram import ControllerTelegramMixin
 from .controller_telegram_setup import TelegramSetupMixin
@@ -20,6 +21,7 @@ class MainController(
     ControllerTelegramMixin,
     ControllerAutomaticTradingControlsMixin,
     ControllerCustomEntryMixin,
+    ControllerOptionsMixin,
     TelegramSetupMixin,
     ControllerReportingMixin,
     ControllerEmergencyMixin,
@@ -102,6 +104,7 @@ class MainController(
         logger.info("Core mode enabled: Signal(SMA/HMA/CAMERON) + risk controls only. Legacy engines archived.")
         self.active_engine = None
         self.tg_app = None
+        self.options_trading_service = None
         self.status_data = {}
         self.is_paused = bool(self.prev_paused_state) if self.prev_paused_state is not None else False
         if self.prev_paused_state is not None:
