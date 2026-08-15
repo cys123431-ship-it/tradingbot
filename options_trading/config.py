@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 
-OPTIONS_CAPITAL_LIMIT_USDT = 20.0
+OPTIONS_CAPITAL_LIMIT_USDT = 100.0
 
 
 def default_options_config() -> dict:
@@ -78,8 +78,8 @@ def normalize_options_config(raw=None) -> dict:
     cfg["enabled"] = bool(cfg.get("enabled", False))
     # This sleeve is deliberately fixed to the user's hard capital ceiling.
     cfg["capital_limit_usdt"] = OPTIONS_CAPITAL_LIMIT_USDT
-    # Use the whole fixed sleeve when a contract fits. The fee is still included
-    # inside the absolute 20 USDT ceiling by build_long_option_entry_plan().
+    # Use the whole fixed sleeve when a contract fits. Entry fees remain inside
+    # the absolute sleeve ceiling enforced by build_long_option_entry_plan().
     cfg["entry_fraction"] = 1.00
     cfg["scan_interval_seconds"] = _int(cfg.get("scan_interval_seconds"), 300, 60, 3600)
     cfg["manage_interval_seconds"] = _int(cfg.get("manage_interval_seconds"), 30, 15, 300)

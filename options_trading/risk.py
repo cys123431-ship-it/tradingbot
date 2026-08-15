@@ -65,8 +65,8 @@ def build_long_option_entry_plan(
     if ask <= 0 or unit_d <= 0 or min_qty_d <= 0 or step_d <= 0 or spend_cap <= 0:
         return {"accepted": False, "reason": "INVALID_OPTION_ORDER_INPUT"}
 
-    # Iterate once after fee estimation so premium + entry fee remains below
-    # both the configured fraction and the absolute $20 ceiling.
+    # Iterate after fee estimation so premium + entry fee remains below both
+    # the configured fraction and the absolute options-sleeve ceiling.
     qty = floor_to_step(spend_cap / (ask * unit_d), step_d)
     if qty < min_qty_d:
         return {

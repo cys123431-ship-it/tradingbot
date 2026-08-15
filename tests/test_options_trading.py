@@ -3,9 +3,9 @@ import time
 
 import pytest
 
+from options_trading import OptionsTradingService
 from options_trading.config import OPTIONS_CAPITAL_LIMIT_USDT, normalize_options_config
 from options_trading.risk import build_long_option_entry_plan
-from options_trading.runtime import OptionsTradingService
 from options_trading.strategy import (
     evaluate_underlying_trend,
     score_option_contract,
@@ -30,10 +30,11 @@ def _trend_rows(count, *, start=100.0, slope=0.35, interval_ms=3_600_000):
     return rows
 
 
-def test_options_config_forces_fixed_twenty_usdt_cap_and_defaults_off():
+def test_options_config_forces_fixed_hundred_usdt_cap_and_defaults_off():
     cfg = normalize_options_config({"enabled": True, "capital_limit_usdt": 999})
     assert cfg["enabled"] is True
     assert cfg["capital_limit_usdt"] == OPTIONS_CAPITAL_LIMIT_USDT
+    assert cfg["capital_limit_usdt"] == 100.0
     assert normalize_options_config({})["enabled"] is False
 
 
@@ -139,7 +140,7 @@ class _FakeOptionsClient:
     def margin_account(self):
         return {
             "canTrade": True,
-            "asset": [{"asset": "USDT", "available": "24", "equity": "24"}],
+            "asset": [{"asset": "USDT", "available": "21", "equity": "21"}],
         }
 
     def positions(self, symbol=None):
@@ -231,7 +232,7 @@ def test_options_runtime_defaults_to_no_order_when_disabled(tmp_path):
     assert clients == []
 
 
-def test_options_runtime_enters_buy_only_inside_twenty_usdt_ledger(tmp_path):
+def test_options_runtime_enters_buy_only_with_live_balance_below_hundred_cap(tmp_path):
     service, clients = _service(tmp_path, enabled=True)
     result = asyncio.run(service.run_cycle(force_scan=True))
     assert result["action"] == "entered"
@@ -241,8 +242,9 @@ def test_options_runtime_enters_buy_only_inside_twenty_usdt_ledger(tmp_path):
     assert order["reduce_only"] is False
     assert order["time_in_force"] == "IOC"
     position = service.state["active_position"]
-    assert position["entry_total_usdt"] <= 20.0
-    assert 0 <= service.state["cash_bankroll_usdt"] < 20.0
+    assert position["entry_total_usdt"] <= 21.0
+    assert position["entry_total_usdt"] <= OPTIONS_CAPITAL_LIMIT_USDT
+    assert 0 <= service.state["cash_bankroll_usdt"] < OPTIONS_CAPITAL_LIMIT_USDT
 
 
 def test_options_runtime_blocks_entry_when_any_manual_option_position_exists(tmp_path):

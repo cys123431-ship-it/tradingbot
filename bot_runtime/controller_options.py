@@ -11,6 +11,7 @@ from telegram.error import BadRequest
 from telegram.ext import CallbackQueryHandler, CommandHandler
 
 from options_trading import OptionsTradingService
+from options_trading.config import OPTIONS_CAPITAL_LIMIT_USDT
 
 
 logger = logging.getLogger(__name__)
@@ -53,7 +54,10 @@ class ControllerOptionsMixin:
             ],
             [
                 InlineKeyboardButton("📈 전략 설명", callback_data="op:strategy"),
-                InlineKeyboardButton("💰 20달러 예산", callback_data="op:budget"),
+                InlineKeyboardButton(
+                    f"💰 {OPTIONS_CAPITAL_LIMIT_USDT:.0f}달러 예산",
+                    callback_data="op:budget",
+                ),
             ],
             [InlineKeyboardButton("🔻 봇 옵션 포지션 청산", callback_data="op:close")],
         ]
@@ -87,7 +91,10 @@ class ControllerOptionsMixin:
             f"API 연결: {'정상' if status.get('api_ok') else '실패'}",
             f"옵션 주문 권한: {('허용' if status.get('can_trade') else '차단') if status.get('can_trade') is not None else '확인 불가'}",
             "운용 방식: 옵션 매수 전용 · 네이키드 매도 금지",
-            f"고정 한도: 수수료 포함 동시 위험 최대 {status.get('capital_limit_usdt', 20):.2f} USDT",
+            (
+                "고정 한도: 수수료 포함 동시 위험 최대 "
+                f"{status.get('capital_limit_usdt', OPTIONS_CAPITAL_LIMIT_USDT):.2f} USDT"
+            ),
             f"전략 잔여예산: {status.get('cash_bankroll_usdt', 0):.4f} USDT",
             f"옵션 계좌: 가용 {_safe_number(balance.get('available')):.4f} / 평가 {_safe_number(balance.get('equity')):.4f} USDT",
             f"거래소 포지션/주문: {status.get('exchange_positions', 0)} / {status.get('exchange_orders', 0)}",
@@ -182,7 +189,8 @@ class ControllerOptionsMixin:
                 await self._edit_options_message(
                     query,
                     "⚠️ 옵션 실주문을 시작하시겠습니까?\n"
-                    "매수 프리미엄·예상 수수료 합계는 20 USDT를 넘지 않으며 네이키드 매도는 하지 않습니다.",
+                    f"매수 프리미엄·예상 수수료 합계는 {OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT를 넘지 않으며 "
+                    "네이키드 매도는 하지 않습니다.",
                     keyboard=self._build_options_keyboard(confirming_on=True),
                 )
                 return
@@ -222,7 +230,8 @@ class ControllerOptionsMixin:
                     "📈 옵션 전략\n"
                     "Adaptive Trend는 기존 1시간·4시간 추세 구조를 유지하면서 신호강도에 따라 DTE·Delta 목표를 바꿉니다.\n"
                     "Low-IV Squeeze는 ATR/실현변동성 압축 뒤 거래량·모멘텀을 동반한 상·하방 돌파만 CALL/PUT 후보로 봅니다.\n"
-                    "20 USDT·최소수량·수수료를 먼저 통과한 계약만 Delta·DTE·IV/RV·skew·Spread·유동성·Greeks 점수로 비교합니다.\n"
+                    f"{OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT·최소수량·수수료를 먼저 통과한 계약만 "
+                    "Delta·DTE·IV/RV·skew·Spread·유동성·Greeks 점수로 비교합니다.\n"
                     "기존 +80% TP, -45% SL, 추적청산, 만기·시간 제한은 유지하고 추세붕괴·IV 급락·Theta/DTE 부담을 보조 청산에 사용합니다.\n"
                     "옵션 매수만 허용하므로 신규 진입용 SELL/네이키드 매도는 만들지 않습니다.",
                 )
@@ -231,10 +240,11 @@ class ControllerOptionsMixin:
                 status = await self._options_service().status_snapshot(refresh=True)
                 await self._edit_options_message(
                     query,
-                    "💰 옵션 전용 20 USDT 원장\n"
+                    f"💰 옵션 전용 {OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT 원장\n"
                     f"남은 전략예산: {status.get('cash_bankroll_usdt', 0):.4f} USDT\n"
-                    "한 번의 진입은 남은 예산의 최대 90%이며, 프리미엄과 예상 진입 수수료를 합쳐 계산합니다.\n"
-                    "수익은 원장으로 돌아오지만 동시 위험 한도는 계속 20 USDT입니다.\n"
+                    "한 번의 진입은 남은 전략예산·실제 옵션 가용잔고·고정 한도 중 가장 작은 금액 안에서 계산하며, "
+                    "프리미엄과 예상 진입 수수료를 합쳐 제한합니다.\n"
+                    f"수익은 원장으로 돌아오지만 동시 위험 한도는 계속 {OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT입니다.\n"
                     "선물 잔고·선물 리스크·일일손실 한도와는 완전히 별개입니다.",
                 )
                 return
@@ -280,6 +290,3 @@ def _safe_number(value):
         return float(value or 0.0)
     except (TypeError, ValueError):
         return 0.0
-
-
-__all__ = ("ControllerOptionsMixin",)

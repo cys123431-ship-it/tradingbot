@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from options_trading.adaptive_runtime import OptionsTradingService
-from options_trading.config import normalize_options_config
+from options_trading import OptionsTradingService
+from options_trading.config import OPTIONS_CAPITAL_LIMIT_USDT, normalize_options_config
 from options_trading.strategy import (
     derive_dynamic_contract_targets,
     evaluate_low_iv_squeeze,
@@ -152,16 +152,16 @@ class _Client:
         ]}
 
     def mark_price(self, symbol):
-        return [{"symbol": symbol, "markPrice": "1990" if "EXP" in symbol else "9.9", "markIV": "0.04", "delta": "-0.45" if symbol.endswith("-P") else "0.45", "gamma": "0.01", "theta": "-0.05", "vega": "0.2"}]
+        return [{"symbol": symbol, "markPrice": "19990" if "EXP" in symbol else "9.9", "markIV": "0.04", "delta": "-0.45" if symbol.endswith("-P") else "0.45", "gamma": "0.01", "theta": "-0.05", "vega": "0.2"}]
 
     def ticker(self, symbol):
         if "EXP" in symbol:
-            return [{"amount": "1000", "bidPrice": "1980", "askPrice": "2000"}]
+            return [{"amount": "1000", "bidPrice": "19980", "askPrice": "20000"}]
         return [{"amount": "1000", "bidPrice": "9.8", "askPrice": "10.0"}]
 
     def depth(self, symbol, limit=20):
         if "EXP" in symbol:
-            return {"bids": [["1980", "10"]], "asks": [["2000", "10"]]}
+            return {"bids": [["19980", "10"]], "asks": [["20000", "10"]]}
         return {"bids": [["9.8", "10"]], "asks": [["10.0", "10"]]}
 
     def new_order(self, symbol, side, order_type, quantity, **kwargs):
@@ -212,7 +212,7 @@ def test_budget_filter_skips_unaffordable_contract_before_selection(tmp_path):
     order = clients[0].orders[0]
     assert order["symbol"] == "ETH-AFF-C"
     assert order["side"] == "BUY" and order["reduce_only"] is False
-    assert service.state["active_position"]["entry_total_usdt"] <= 20.0
+    assert service.state["active_position"]["entry_total_usdt"] <= min(24.0, OPTIONS_CAPITAL_LIMIT_USDT)
     assert service.state["last_scan_diagnostics"]["contract_rejections"].get("MINIMUM_OPTION_CONTRACT_EXCEEDS_AVAILABLE_BANKROLL", 0) >= 1
     assert service.state["recent_scan_outcomes"][-1] == "ORDERABLE_CANDIDATE"
 
