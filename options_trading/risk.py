@@ -47,7 +47,7 @@ def build_long_option_entry_plan(
     min_qty,
     step_size,
     cash_bankroll_usdt,
-    entry_fraction=0.90,
+    entry_fraction=1.00,
     capital_limit_usdt=OPTIONS_CAPITAL_LIMIT_USDT,
 ):
     ask = _d(ask_price)
@@ -60,7 +60,7 @@ def build_long_option_entry_plan(
         max(Decimal("0"), _d(capital_limit_usdt)),
         bankroll,
     )
-    fraction = min(Decimal("0.95"), max(Decimal("0.10"), _d(entry_fraction, "0.90")))
+    fraction = min(Decimal("1.00"), max(Decimal("0.10"), _d(entry_fraction, "1.00")))
     spend_cap = hard_cap * fraction
     if ask <= 0 or unit_d <= 0 or min_qty_d <= 0 or step_d <= 0 or spend_cap <= 0:
         return {"accepted": False, "reason": "INVALID_OPTION_ORDER_INPUT"}
