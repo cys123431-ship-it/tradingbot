@@ -1184,6 +1184,55 @@ class SignalAlphaMixin:
                 'REJECTED_DIRECTION_FILTER',
             )
 
+        selector_quality_builder = getattr(
+            self,
+            '_build_utbreakout_selector_quality',
+            None,
+        )
+        selector_quality = (
+            selector_quality_builder(canonical)
+            if callable(selector_quality_builder)
+            else {}
+        )
+        selector_candidate = (
+            selector_quality.get('candidate')
+            if isinstance(selector_quality, dict)
+            and isinstance(selector_quality.get('candidate'), dict)
+            else {}
+        )
+        rotation_score = _safe_float_or_none(
+            selector_candidate.get('convex_rotation_score')
+        )
+        rotation_percentile = _safe_float_or_none(
+            selector_candidate.get('convex_rotation_percentile')
+        )
+        rotation_tier = str(
+            selector_candidate.get('convex_rotation_tier') or ''
+        ).strip().lower()
+        selector_side = str(
+            selector_candidate.get('adaptive_breakout_trend_side') or ''
+        ).strip().lower()
+        selector_tier_valid = bool(
+            rotation_tier in {'base', 'strong', 'elite'}
+            and selector_candidate.get('adaptive_breakout_trend_allowed')
+            and selector_side == side
+        )
+        effective_risk_tier = (
+            rotation_tier
+            if selector_tier_valid
+            else str(metrics.get('risk_tier') or 'base').strip().lower()
+        )
+        if effective_risk_tier not in {'base', 'strong', 'elite'}:
+            effective_risk_tier = 'base'
+        status.update({
+            'convex_rotation_score': rotation_score,
+            'convex_rotation_percentile': rotation_percentile,
+            'convex_rotation_rank': selector_candidate.get('convex_rotation_rank'),
+            'convex_rotation_tier': effective_risk_tier,
+            'convex_rotation_relative_tier_applied': selector_tier_valid,
+            'risk_tier': effective_risk_tier,
+        })
+
         _, daily_pnl = self.db.get_daily_stats()
         daily_entries = self.get_automatic_daily_entry_count()
         status['daily_pnl'] = daily_pnl
@@ -1318,16 +1367,33 @@ class SignalAlphaMixin:
             max(0.0, float(market_quality.get('risk_multiplier', 1.0) or 1.0)),
             max(0.0, float(l2_gate.get('risk_multiplier', 0.0) or 0.0)),
         )
-        target_risk_percent = max(
+        volatility_scale = max(
             0.0,
+            float(metrics.get('volatility_scale', 1.0) or 1.0),
+        )
+        target_risk_percent = float(
+            trend_cfg.get(f'{effective_risk_tier}_risk_percent', 1.75) or 1.75
+        ) * volatility_scale
+        target_risk_percent = max(
             float(
-                metrics.get(
-                    'target_risk_percent',
-                    trend_cfg.get('base_risk_percent', 1.75),
+                trend_cfg.get(
+                    f'{effective_risk_tier}_risk_percent_min',
+                    target_risk_percent,
                 )
-                or 0.0
+                or target_risk_percent
+            ),
+            min(
+                float(
+                    trend_cfg.get(
+                        f'{effective_risk_tier}_risk_percent_max',
+                        target_risk_percent,
+                    )
+                    or target_risk_percent
+                ),
+                target_risk_percent,
             ),
         )
+        status['target_risk_percent'] = target_risk_percent
         # Adaptive Trend owns one absolute stop-loss budget. Shared market and
         # L2 quality remain hard safety gates above, but their correlated soft
         # reductions do not shrink the same stop budget a second time.
@@ -1427,6 +1493,17 @@ class SignalAlphaMixin:
             'adaptive_breakout_trend_score': float(decision.score),
             'adaptive_breakout_trend_risk_multiplier': risk_multiplier,
             'adaptive_breakout_trend_target_risk_percent': target_risk_percent,
+            'convex_rotation_score': rotation_score,
+            'convex_rotation_percentile': rotation_percentile,
+            'convex_rotation_rank': selector_candidate.get('convex_rotation_rank'),
+            'convex_rotation_universe_size': selector_candidate.get(
+                'convex_rotation_universe_size'
+            ),
+            'convex_rotation_tier': effective_risk_tier,
+            'convex_rotation_entry_reacceleration': bool(
+                metrics.get('continuation_reacceleration')
+                or metrics.get('compression_breakout')
+            ),
             'entry_profile_version': (
                 TRADFI_PATTERN_PROFILE_VERSION
                 if tradfi_profile_applied
@@ -1438,7 +1515,7 @@ class SignalAlphaMixin:
                 if small_account_aggressive_candidate
                 else 'adaptive_trend_unified'
             ),
-            'adaptive_trend_risk_tier': metrics.get('risk_tier') or 'base',
+            'adaptive_trend_risk_tier': effective_risk_tier,
             'adaptive_breakout_trend_metrics': metrics,
             'small_account_aggressive_enabled': bool(
                 trend_cfg.get('small_account_aggressive_enabled', True)
@@ -1531,6 +1608,27 @@ class SignalAlphaMixin:
             'ev_time_stop_bars': int(trend_cfg.get('time_stop_hours', 168) or 168) * 4,
             'ev_time_stop_min_mfe_r': 0.35,
             'ev_time_stop_max_current_r': 0.0,
+            'convex_rotation_exit_enabled': bool(
+                trend_cfg.get('rotation_exit_enabled', True)
+            ),
+            'convex_rotation_min_holding_bars': int(
+                trend_cfg.get('rotation_min_holding_hours', 8) or 8
+            ) * 4,
+            'convex_rotation_max_holding_bars': int(
+                trend_cfg.get('rotation_max_holding_hours', 12) or 12
+            ) * 4,
+            'convex_rotation_max_mfe_r': float(
+                trend_cfg.get('rotation_max_mfe_r', 0.35) or 0.35
+            ),
+            'convex_rotation_max_current_r': float(
+                trend_cfg.get('rotation_max_current_r', 0.25) or 0.25
+            ),
+            'convex_rotation_rank_percentile_floor': float(
+                trend_cfg.get('rotation_rank_percentile_floor', 35.0) or 35.0
+            ),
+            'convex_rotation_rank_confirmations': int(
+                trend_cfg.get('rotation_rank_confirmations', 2) or 2
+            ),
         })
         self._set_utbot_filtered_breakout_entry_plan(canonical, plan)
         status['entry_plan'] = dict(plan)
@@ -1615,8 +1713,8 @@ class SignalAlphaMixin:
             if metrics.get('tradfi_entry_mode') == 'pattern_or_entry'
             else f"EMA crossover ({int(metrics.get('ema_crossover_age_bars', 0) or 0)}h ago)"
             if metrics.get('ema_crossover')
-            else 'fresh breakout'
-            if metrics.get('breakout_entry_enabled') and metrics.get('fresh_breakout')
+            else 'compression breakout'
+            if metrics.get('compression_breakout')
             else 're-acceleration'
             if metrics.get('breakout_entry_enabled') and metrics.get('reacceleration')
             else 'weighted continuation'
@@ -1646,7 +1744,7 @@ class SignalAlphaMixin:
             )
         else:
             risk_status_text = (
-                f"Risk target: {float(metrics.get('target_risk_percent', 0.0) or 0.0):.2f}% "
+                f"Risk target: {float(status.get('target_risk_percent', metrics.get('target_risk_percent', 0.0)) or 0.0):.2f}% "
                 f"/ tier={status.get('risk_tier') or 'waiting'}"
             )
         lines = [
@@ -1655,6 +1753,11 @@ class SignalAlphaMixin:
             f'Universe: {universe_text}',
             f"Signal: {str(status.get('side') or 'NONE').upper()} / allowed={bool(status.get('allowed'))}",
             f"Score: {float(status.get('score', 0.0) or 0.0):.1f}",
+            (
+                f"Rotation: {float(status.get('convex_rotation_score', 0.0) or 0.0):.1f} "
+                f"/ percentile {float(status.get('convex_rotation_percentile', 0.0) or 0.0):.1f} "
+                f"/ tier {status.get('convex_rotation_tier') or 'N/A'}"
+            ),
             risk_status_text,
             f'Horizons: {vote_text or "N/A"}',
             f"Momentum: {float(metrics.get('weighted_momentum', 0.0) or 0.0):+.2f}",

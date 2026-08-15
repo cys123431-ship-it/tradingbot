@@ -10,6 +10,7 @@ import bot_runtime.signal_alpha as signal_alpha_module
 from bot_runtime.diagnostics import _safe_float_or_none
 from utbreakout.adaptive_breakout_trend import (
     ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+    ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION,
     _normalized_momentum_horizons,
     default_adaptive_breakout_trend_config,
     evaluate_adaptive_breakout_trend,
@@ -61,10 +62,39 @@ def _trend_rows(direction: int, count: int = 220) -> list[dict]:
     return rows
 
 
+def _compression_breakout_rows(direction: int, count: int = 260) -> list[dict]:
+    rows = []
+    price = 100.0
+    for index in range(count):
+        if index < count - 16:
+            step = 0.16 * direction
+            wick = 0.12
+            volume = 1_000.0
+        elif index < count - 1:
+            step = 0.008 * direction
+            wick = 0.025
+            volume = 700.0
+        else:
+            step = 0.10 * direction
+            wick = 0.025
+            volume = 2_500.0
+        open_price = price
+        price = max(5.0, price + step)
+        rows.append({
+            "timestamp": index * 3_600_000,
+            "open": open_price,
+            "high": max(open_price, price) + wick,
+            "low": min(open_price, price) - wick,
+            "close": price,
+            "volume": volume,
+        })
+    return rows
+
+
 @pytest.mark.parametrize(("direction", "side"), ((1, "long"), (-1, "short")))
 def test_multi_horizon_breakout_accepts_both_directions(direction, side):
     decision = evaluate_adaptive_breakout_trend(
-        _trend_rows(direction),
+        _compression_breakout_rows(direction),
         CALM_L2,
         {"breakout_entry_enabled": True},
     )
@@ -74,6 +104,7 @@ def test_multi_horizon_breakout_accepts_both_directions(direction, side):
     assert decision.score >= default_adaptive_breakout_trend_config()["score_min"]
     assert 0.60 <= decision.risk_multiplier <= 1.0
     assert decision.metrics["fresh_breakout"] is True
+    assert decision.metrics["compression_breakout"] is True
     assert sum(value == side for value in decision.metrics["horizon_votes"].values()) >= 2
 
 
@@ -122,9 +153,8 @@ def test_old_extended_trend_waits_for_weighted_reacceleration_by_default():
     assert decision.allowed is False
     assert decision.side == "long"
     assert decision.reason == "waiting_for_weighted_trend_entry"
-    assert decision.metrics["breakout_entry_enabled"] is False
-    assert decision.metrics["fresh_breakout"] is False
-    assert decision.metrics["reacceleration"] is False
+    assert decision.metrics["breakout_entry_enabled"] is True
+    assert decision.metrics["compression_breakout"] is False
 
 
 @pytest.mark.parametrize(("direction", "side"), ((1, "long"), (-1, "short")))
@@ -133,7 +163,7 @@ def test_weighted_continuation_enters_without_requiring_a_new_crossover(directio
         _trend_rows(direction),
         CALM_L2,
         {
-            "profile_version": "adaptive_trend_portfolio_v4_small_account_no_daily_loss",
+            "profile_version": ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION,
             "continuation_max_fast_ema_distance_atr": 4.0,
         },
     )
@@ -253,6 +283,17 @@ def test_live_crossover_reuses_completed_candle_and_keeps_decision_metadata(monk
         0,
         result=dict(CALM_L2),
     )
+    engine._build_utbreakout_selector_quality = lambda symbol: {
+        "candidate": {
+            "adaptive_breakout_trend_allowed": True,
+            "adaptive_breakout_trend_side": "long",
+            "convex_rotation_score": 74.0,
+            "convex_rotation_percentile": 80.0,
+            "convex_rotation_rank": 2,
+            "convex_rotation_universe_size": 10,
+            "convex_rotation_tier": "strong",
+        }
+    }
     stored_plans = {}
     stored_statuses = {}
     engine._set_utbot_filtered_breakout_entry_plan = (
@@ -348,6 +389,8 @@ def test_live_crossover_reuses_completed_candle_and_keeps_decision_metadata(monk
     assert plan["risk_budget_mode"] == "adaptive_trend_small_account_aggressive_pending"
     assert plan["adaptive_breakout_trend_target_risk_percent"] >= 1.5
     assert plan["adaptive_trend_initial_fraction"] == pytest.approx(0.65)
+    assert plan["adaptive_trend_risk_tier"] == "strong"
+    assert plan["convex_rotation_percentile"] == pytest.approx(80.0)
     assert plan["adaptive_trend_target_qty"] > plan["qty"]
     assert plan["partial_take_profit_ratio"] == pytest.approx(0.15)
     assert plan["second_take_profit_enabled"] is False
@@ -371,7 +414,7 @@ def test_live_crossover_reuses_completed_candle_and_keeps_decision_metadata(monk
 
 def test_l2_stress_is_a_hard_safety_gate():
     decision = evaluate_adaptive_breakout_trend(
-        _trend_rows(1),
+        _compression_breakout_rows(1),
         {"allowed": False, "risk_multiplier": 0.0, "state": "stressed_thin"},
         {"breakout_entry_enabled": True},
     )
@@ -382,8 +425,10 @@ def test_l2_stress_is_a_hard_safety_gate():
 
 
 def test_volatility_shock_is_rejected_before_sizing():
-    cfg = {"volatility_shock_ratio": 1.01, "breakout_entry_enabled": True}
-    decision = evaluate_adaptive_breakout_trend(_trend_rows(1), CALM_L2, cfg)
+    cfg = {"volatility_shock_ratio": 0.01, "breakout_entry_enabled": True}
+    decision = evaluate_adaptive_breakout_trend(
+        _compression_breakout_rows(1), CALM_L2, cfg
+    )
 
     assert decision.allowed is False
     assert decision.reason == "volatility_shock"
@@ -401,7 +446,7 @@ def test_horizon_normalization_preserves_unsorted_weight_mapping():
 
 def test_empty_horizon_config_falls_back_without_crashing():
     decision = evaluate_adaptive_breakout_trend(
-        _trend_rows(1),
+        _compression_breakout_rows(1),
         CALM_L2,
         {
             "momentum_horizons": (),
@@ -464,7 +509,9 @@ def test_persisted_conservative_profile_migrates_to_small_account_aggressive_v3(
         }
     )
 
-    assert migrated["profile_version"] == "adaptive_trend_portfolio_v4_small_account_no_daily_loss"
+    assert migrated["profile_version"] == ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION
+    assert migrated["breakout_entry_enabled"] is True
+    assert migrated["compression_breakout_enabled"] is True
     assert migrated["universe_mode"] == "single"
     assert migrated["single_symbol"] == "BTC/USDT:USDT"
     assert migrated["take_profit_r_multiple"] == pytest.approx(10.0)

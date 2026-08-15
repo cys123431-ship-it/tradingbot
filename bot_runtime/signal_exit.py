@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from utbreakout.convex_rotation import evaluate_convex_rotation_exit
+
 
 class SignalExitMixin:
     async def _maybe_apply_adaptive_trend_pyramiding(self, symbol, pos, df, cfg):
@@ -583,6 +585,136 @@ class SignalExitMixin:
             'mae_r': float(mae_r),
         })
         self._set_utbreakout_trailing_state(symbol, state)
+
+        if bool(state.get('convex_rotation_exit_enabled', False)):
+            bars_held = int(state.get('bars_seen', 0) or 0)
+            min_bars = max(
+                1,
+                int(state.get('convex_rotation_min_holding_bars', 32) or 32),
+            )
+            if bars_held >= min_bars:
+                try:
+                    numeric_bar_ts = int(current_bar_ts)
+                    divisor = 3_600_000 if numeric_bar_ts > 10_000_000_000 else 3_600
+                    rank_hour = numeric_bar_ts // divisor
+                except (TypeError, ValueError, OverflowError):
+                    rank_hour = bars_held // 4
+                if rank_hour != state.get('convex_rotation_last_rank_hour'):
+                    state['convex_rotation_last_rank_hour'] = rank_hour
+                    quality_builder = getattr(
+                        self,
+                        '_build_utbreakout_selector_quality',
+                        None,
+                    )
+                    quality = quality_builder(symbol) if callable(quality_builder) else {}
+                    candidate = (
+                        quality.get('candidate')
+                        if isinstance(quality, dict)
+                        and isinstance(quality.get('candidate'), dict)
+                        else {}
+                    )
+                    current_percentile = _safe_float_or_none(
+                        candidate.get('convex_rotation_percentile')
+                    )
+                    entry_percentile = _safe_float_or_none(
+                        state.get('convex_rotation_entry_percentile')
+                    )
+                    percentile_floor = float(
+                        state.get('convex_rotation_rank_percentile_floor', 35.0)
+                        or 35.0
+                    )
+                    reaccelerating = bool(
+                        candidate.get(
+                            'adaptive_breakout_trend_continuation_reacceleration'
+                        )
+                        or candidate.get(
+                            'adaptive_breakout_trend_compression_breakout'
+                        )
+                    )
+                    no_progress = bool(
+                        float(mfe_r)
+                        < float(state.get('convex_rotation_max_mfe_r', 0.35) or 0.35)
+                        and float(current_r)
+                        <= float(
+                            state.get('convex_rotation_max_current_r', 0.25)
+                            or 0.25
+                        )
+                    )
+                    rotation_decision = evaluate_convex_rotation_exit(
+                        enabled=True,
+                        bars_held=bars_held,
+                        min_bars=min_bars,
+                        max_bars=int(
+                            state.get('convex_rotation_max_holding_bars', 48)
+                            or 48
+                        ),
+                        mfe_r=float(mfe_r),
+                        max_mfe_r=float(
+                            state.get('convex_rotation_max_mfe_r', 0.35)
+                            or 0.35
+                        ),
+                        current_r=float(current_r),
+                        max_current_r=float(
+                            state.get('convex_rotation_max_current_r', 0.25)
+                            or 0.25
+                        ),
+                        entry_percentile=entry_percentile,
+                        current_percentile=current_percentile,
+                        percentile_floor=percentile_floor,
+                        reaccelerating=reaccelerating,
+                        prior_bad_count=int(
+                            state.get('convex_rotation_bad_rank_count', 0) or 0
+                        ),
+                        required_confirmations=int(
+                            state.get('convex_rotation_rank_confirmations', 2)
+                            or 2
+                        ),
+                    )
+                    state.update({
+                        'convex_rotation_current_percentile': current_percentile,
+                        'convex_rotation_current_rank': candidate.get(
+                            'convex_rotation_rank'
+                        ),
+                        'convex_rotation_current_score': _safe_float_or_none(
+                            candidate.get('convex_rotation_score')
+                        ),
+                        'convex_rotation_bad_rank_count': rotation_decision.bad_count,
+                        'convex_rotation_no_progress': no_progress,
+                        'convex_rotation_reaccelerating': reaccelerating,
+                        'convex_rotation_exit_reason': rotation_decision.reason,
+                    })
+                    self._set_utbreakout_trailing_state(symbol, state)
+                    if rotation_decision.should_exit:
+                        reason = (
+                            'Convex rotation stale trend: '
+                            f'{rotation_decision.reason}'
+                        )
+                        close_result = await self._close_position_reduce_only_market(
+                            symbol,
+                            pos,
+                            reason=reason,
+                            cfg=cfg,
+                        )
+                        if (
+                            bool((close_result or {}).get('_flat_confirmed'))
+                            and bool((close_result or {}).get('_cleanup_confirmed'))
+                        ):
+                            self._clear_utbreakout_trailing_state(
+                                symbol,
+                                finalize=True,
+                                reason=reason,
+                            )
+                            return {
+                                'status': 'EXITED',
+                                'reason': 'CONVEX_ROTATION_STALE',
+                                'detail': reason,
+                            }
+                        return {
+                            'status': 'EXIT_PENDING',
+                            'reason': 'CONVEX_ROTATION_STALE',
+                            'detail': reason,
+                            'order': close_result,
+                        }
 
         if soft_stop_enabled:
             soft_stop = _safe_float_or_none(state.get('soft_stop_price'))

@@ -146,6 +146,29 @@ def test_adaptive_trend_ranking_prefers_actionable_relative_strength():
     assert ranked[0]["symbol"] == "TREND/USDT:USDT"
 
 
+def test_convex_rotation_assigns_relative_rank_and_requires_absolute_quality():
+    candidates = []
+    for index, score in enumerate((84.0, 76.0, 72.0, 69.0, 66.0, 63.0, 60.0, 57.0, 54.0, 51.0)):
+        candidates.append({
+            "symbol": f"R{index}/USDT:USDT",
+            "scanner_accepted": True,
+            "score": 70.0,
+            "quote_volume": 250_000_000.0,
+            "adaptive_breakout_trend_allowed": True,
+            "adaptive_breakout_trend_score": 75.0,
+            "adaptive_breakout_trend_weighted_momentum": 0.50,
+            "convex_rotation_score": score,
+        })
+
+    ranked = rank_candidates(candidates, top_n=10)
+
+    assert ranked[0]["convex_rotation_rank"] == 1
+    assert ranked[0]["convex_rotation_percentile"] == 100.0
+    assert ranked[0]["convex_rotation_tier"] == "elite"
+    assert ranked[1]["convex_rotation_tier"] == "strong"
+    assert ranked[-1]["convex_rotation_tier"] == "base"
+
+
 def test_custom_discovery_never_relaxes_hard_quote_volume_floor():
     strict_cfg = default_coin_selector_config()
     relaxed_cfg = dict(strict_cfg)

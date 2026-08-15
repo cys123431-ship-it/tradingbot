@@ -1557,6 +1557,117 @@ class SignalScannerMixin:
             ),
         }
 
+    def _calculate_convex_rotation_score(
+        self,
+        side,
+        trend_metrics,
+        selection_metrics,
+        futures_context,
+        candidate=None,
+    ):
+        """Rank an actionable trend across symbols without adding a hard gate."""
+
+        side = str(side or '').lower()
+        trend_metrics = dict(trend_metrics or {})
+        selection_metrics = dict(selection_metrics or {})
+        futures_context = dict(futures_context or {})
+        candidate = dict(candidate or {})
+
+        def _f(source, key):
+            return _safe_float_or_none(source.get(key))
+
+        def _linear(value, low, high, default=50.0):
+            if value is None or high <= low:
+                return default
+            return max(0.0, min(100.0, (float(value) - low) / (high - low) * 100.0))
+
+        direction = 1.0 if side == 'long' else -1.0
+        decision_score = _f(trend_metrics, 'score')
+        momentum = _f(trend_metrics, 'weighted_momentum')
+        votes = _f(trend_metrics, 'long_votes' if side == 'long' else 'short_votes')
+        trend_parts = [decision_score if decision_score is not None else 50.0]
+        if momentum is not None:
+            trend_parts.append(_linear(abs(momentum), 0.12, 0.85))
+        if votes is not None:
+            trend_parts.append(_linear(votes, 1.0, 3.0))
+        trend = sum(trend_parts) / len(trend_parts)
+
+        volume_ratio = _f(trend_metrics, 'volume_ratio')
+        consistency = _f(selection_metrics, 'momentum_consistency')
+        efficiency = _f(selection_metrics, 'directional_efficiency')
+        lookback_return = _f(selection_metrics, 'return_lookback_pct')
+        price_volume_parts = []
+        if volume_ratio is not None:
+            price_volume_parts.append(_linear(volume_ratio, 0.80, 1.80))
+        if consistency is not None:
+            price_volume_parts.append(_linear(consistency, 0.45, 0.72))
+        if efficiency is not None:
+            price_volume_parts.append(_linear(efficiency, 0.08, 0.60))
+        if lookback_return is not None:
+            price_volume_parts.append(_linear(direction * lookback_return, -3.0, 12.0))
+        price_volume = sum(price_volume_parts) / len(price_volume_parts) if price_volume_parts else 50.0
+
+        rolling_ofi = _f(futures_context, 'rolling_orderbook_imbalance_pct')
+        taker_ratio = _f(futures_context, 'taker_buy_sell_ratio')
+        orderflow_parts = []
+        if rolling_ofi is not None:
+            orderflow_parts.append(_linear(direction * rolling_ofi, -4.0, 10.0))
+        if taker_ratio is not None:
+            orderflow_parts.append(_linear(direction * (taker_ratio - 1.0), -0.06, 0.12))
+        orderflow = sum(orderflow_parts) / len(orderflow_parts) if orderflow_parts else 50.0
+
+        oi_z = _f(futures_context, 'open_interest_delta_z')
+        oi_acceleration = _f(futures_context, 'open_interest_acceleration')
+        funding = _f(futures_context, 'funding_rate')
+        basis = _f(futures_context, 'basis_pct')
+        positioning_parts = []
+        if oi_z is not None:
+            positioning_parts.append(_linear(oi_z, -0.5, 2.0))
+        if oi_acceleration is not None:
+            positioning_parts.append(_linear(oi_acceleration, -0.3, 0.6))
+        if funding is not None:
+            positioning_parts.append(100.0 - _linear(direction * funding, 0.0002, 0.0012))
+        if basis is not None:
+            positioning_parts.append(100.0 - _linear(direction * basis, 0.05, 0.40))
+        positioning = sum(positioning_parts) / len(positioning_parts) if positioning_parts else 50.0
+
+        spread = _f(futures_context, 'futures_spread_pct')
+        bid_depth = _f(futures_context, 'bid_depth_usdt')
+        ask_depth = _f(futures_context, 'ask_depth_usdt')
+        quote_volume = _f(candidate, 'quote_volume')
+        liquidity_parts = []
+        if spread is not None:
+            liquidity_parts.append(100.0 - _linear(spread, 0.02, 0.12))
+        if bid_depth is not None and ask_depth is not None:
+            liquidity_parts.append(_linear(min(bid_depth, ask_depth), 10_000.0, 150_000.0))
+        if quote_volume is not None:
+            liquidity_parts.append(_linear(quote_volume, 100_000_000.0, 1_000_000_000.0))
+        liquidity = sum(liquidity_parts) / len(liquidity_parts) if liquidity_parts else 50.0
+
+        components = {
+            'trend': round(trend, 2),
+            'price_volume': round(price_volume, 2),
+            'orderflow': round(orderflow, 2),
+            'positioning': round(positioning, 2),
+            'liquidity': round(liquidity, 2),
+        }
+        score = (
+            trend * 0.40
+            + price_volume * 0.20
+            + orderflow * 0.20
+            + positioning * 0.10
+            + liquidity * 0.10
+        )
+        return {
+            'score': round(max(0.0, min(100.0, score)), 2),
+            'components': components,
+            'reason': (
+                f"trend {components['trend']:.1f}, price-volume {components['price_volume']:.1f}, "
+                f"flow {components['orderflow']:.1f}, positioning {components['positioning']:.1f}, "
+                f"liquidity {components['liquidity']:.1f}"
+            ),
+        }
+
     async def _fetch_utbreakout_futures_context(self, symbol):
         if self.is_upbit_mode():
             return {}
@@ -2181,6 +2292,13 @@ class SignalScannerMixin:
                         config=profile_cfg,
                     )
                 trend_metrics = dict(trend_decision.metrics or {})
+                rotation_score = self._calculate_convex_rotation_score(
+                    trend_decision.side,
+                    trend_metrics,
+                    selection_metrics,
+                    futures_context,
+                    base_candidate,
+                )
                 result.update({
                     'adaptive_breakout_trend_allowed': bool(trend_decision.allowed),
                     'adaptive_breakout_trend_side': trend_decision.side,
@@ -2188,6 +2306,15 @@ class SignalScannerMixin:
                     'adaptive_breakout_trend_reason': trend_decision.reason,
                     'adaptive_breakout_trend_weighted_momentum': trend_metrics.get('weighted_momentum'),
                     'adaptive_breakout_trend_risk_percent': trend_metrics.get('target_risk_percent'),
+                    'adaptive_breakout_trend_continuation_reacceleration': bool(
+                        trend_metrics.get('continuation_reacceleration')
+                    ),
+                    'adaptive_breakout_trend_compression_breakout': bool(
+                        trend_metrics.get('compression_breakout')
+                    ),
+                    'convex_rotation_score': rotation_score['score'],
+                    'convex_rotation_components': rotation_score['components'],
+                    'convex_rotation_reason': rotation_score['reason'],
                     'tradfi_pattern_profile_applied': bool(
                         trend_metrics.get('tradfi_pattern_profile_applied')
                     ),

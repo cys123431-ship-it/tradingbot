@@ -18,7 +18,7 @@ from typing import Any, Mapping, Sequence
 
 
 ADAPTIVE_BREAKOUT_TREND_STRATEGY = "adaptive_breakout_trend_v1"
-ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v4_small_account_no_daily_loss"
+ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v5_convex_rotation"
 
 
 def default_adaptive_breakout_trend_config() -> dict[str, Any]:
@@ -54,9 +54,17 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         "continuation_minimum_trend_efficiency": 0.18,
         "continuation_max_fast_ema_distance_atr": 1.10,
         "continuation_reacceleration_bars": 2,
-        "breakout_entry_enabled": False,
+        "breakout_entry_enabled": True,
         "channel_lookback_bars": 48,
         "reacceleration_lookback_bars": 12,
+        # A Donchian break is actionable only when it expands out of a quiet
+        # base with participation.  This opens a second entry path without
+        # turning every mature-trend high into a chase entry.
+        "compression_breakout_enabled": True,
+        "compression_window_bars": 12,
+        "compression_lookback_bars": 96,
+        "compression_max_range_ratio": 0.72,
+        "compression_min_volume_ratio": 1.10,
         "atr_period": 20,
         "volatility_short_bars": 24,
         "volatility_long_bars": 96,
@@ -115,6 +123,15 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         "small_account_strong_leverage": 8,
         "small_account_elite_leverage": 15,
         "small_account_leverage_steps": (5, 8, 10, 15),
+        # Cross-sectional ranks supplement (and never bypass) the stop,
+        # liquidation, liquidity and L2 safety gates.
+        "rotation_exit_enabled": True,
+        "rotation_min_holding_hours": 8,
+        "rotation_max_holding_hours": 12,
+        "rotation_max_mfe_r": 0.35,
+        "rotation_max_current_r": 0.25,
+        "rotation_rank_percentile_floor": 35.0,
+        "rotation_rank_confirmations": 2,
         # TradFi perpetuals keep the shared trend model, but add a separate
         # completed-candle pattern overlay and an exchange-compatible 10x cap.
         "tradfi_pattern_profile": {"enabled": True},
@@ -147,6 +164,12 @@ def normalize_adaptive_breakout_trend_config(
             "continuation_minimum_trend_efficiency",
             "continuation_max_fast_ema_distance_atr",
             "continuation_reacceleration_bars",
+            "breakout_entry_enabled",
+            "compression_breakout_enabled",
+            "compression_window_bars",
+            "compression_lookback_bars",
+            "compression_max_range_ratio",
+            "compression_min_volume_ratio",
             "volatility_risk_floor",
             "volatility_risk_cap",
             "take_profit_r_multiple",
@@ -181,6 +204,13 @@ def normalize_adaptive_breakout_trend_config(
             "small_account_strong_leverage",
             "small_account_elite_leverage",
             "small_account_leverage_steps",
+            "rotation_exit_enabled",
+            "rotation_min_holding_hours",
+            "rotation_max_holding_hours",
+            "rotation_max_mfe_r",
+            "rotation_max_current_r",
+            "rotation_rank_percentile_floor",
+            "rotation_rank_confirmations",
             "partial_take_profit_r_multiple",
             "partial_take_profit_ratio",
             "runner_pct",
@@ -228,6 +258,110 @@ def normalize_adaptive_breakout_trend_config(
     normalized["ema_crossover_minimum_momentum_strength"] = max(
         configured_crossover_floor,
         broad_momentum_floor * crossover_floor_ratio,
+    )
+    for key in (
+        "breakout_entry_enabled",
+        "compression_breakout_enabled",
+        "rotation_exit_enabled",
+    ):
+        raw = normalized.get(key, defaults[key])
+        normalized[key] = (
+            raw
+            if isinstance(raw, bool)
+            else str(raw).strip().lower()
+            in {"1", "true", "yes", "on", "enabled"}
+        )
+    compression_window = int(
+        _bounded(
+            _finite(
+                normalized.get("compression_window_bars"),
+                defaults["compression_window_bars"],
+            ),
+            4.0,
+            48.0,
+        )
+    )
+    normalized["compression_window_bars"] = compression_window
+    normalized["compression_lookback_bars"] = int(
+        _bounded(
+            _finite(
+                normalized.get("compression_lookback_bars"),
+                defaults["compression_lookback_bars"],
+            ),
+            float(compression_window + 1),
+            336.0,
+        )
+    )
+    normalized["compression_max_range_ratio"] = _bounded(
+        _finite(
+            normalized.get("compression_max_range_ratio"),
+            defaults["compression_max_range_ratio"],
+        ),
+        0.10,
+        1.00,
+    )
+    normalized["compression_min_volume_ratio"] = _bounded(
+        _finite(
+            normalized.get("compression_min_volume_ratio"),
+            defaults["compression_min_volume_ratio"],
+        ),
+        0.50,
+        5.00,
+    )
+    rotation_min_hours = int(
+        _bounded(
+            _finite(
+                normalized.get("rotation_min_holding_hours"),
+                defaults["rotation_min_holding_hours"],
+            ),
+            1.0,
+            72.0,
+        )
+    )
+    normalized["rotation_min_holding_hours"] = rotation_min_hours
+    normalized["rotation_max_holding_hours"] = int(
+        _bounded(
+            _finite(
+                normalized.get("rotation_max_holding_hours"),
+                defaults["rotation_max_holding_hours"],
+            ),
+            float(rotation_min_hours),
+            336.0,
+        )
+    )
+    normalized["rotation_max_mfe_r"] = _bounded(
+        _finite(
+            normalized.get("rotation_max_mfe_r"),
+            defaults["rotation_max_mfe_r"],
+        ),
+        0.0,
+        3.0,
+    )
+    normalized["rotation_max_current_r"] = _bounded(
+        _finite(
+            normalized.get("rotation_max_current_r"),
+            defaults["rotation_max_current_r"],
+        ),
+        -1.0,
+        3.0,
+    )
+    normalized["rotation_rank_percentile_floor"] = _bounded(
+        _finite(
+            normalized.get("rotation_rank_percentile_floor"),
+            defaults["rotation_rank_percentile_floor"],
+        ),
+        5.0,
+        75.0,
+    )
+    normalized["rotation_rank_confirmations"] = int(
+        _bounded(
+            _finite(
+                normalized.get("rotation_rank_confirmations"),
+                defaults["rotation_rank_confirmations"],
+            ),
+            1.0,
+            6.0,
+        )
     )
     normalized["initial_entry_fraction"] = _bounded(
         _finite(normalized.get("initial_entry_fraction"), defaults["initial_entry_fraction"]),
@@ -522,6 +656,8 @@ def evaluate_adaptive_breakout_trend(
     ]
     if breakout_entry_enabled:
         required_values.append(int(cfg["channel_lookback_bars"]) + 2)
+        if bool(cfg.get("compression_breakout_enabled", True)):
+            required_values.append(int(cfg.get("compression_lookback_bars", 96)) + 2)
     required = max(required_values)
     if len(candles) < required:
         return AdaptiveBreakoutTrendDecision(reason="insufficient_completed_candles")
@@ -624,6 +760,34 @@ def evaluate_adaptive_breakout_trend(
             and fast_ema[-1] < medium_ema[-1]
         )
 
+    volumes = [float(row.get("volume") or 0.0) for row in candles]
+    baseline_volume = median(volumes[-49:-1]) if len(volumes) >= 49 else median(volumes[:-1])
+    volume_ratio = volumes[-1] / max(baseline_volume, 1e-9) if baseline_volume > 0 else 1.0
+    compression_ratio: float | None = None
+    compression_breakout = False
+    if breakout_entry_enabled and bool(cfg.get("compression_breakout_enabled", True)):
+        compression_window = max(4, int(cfg.get("compression_window_bars", 12) or 12))
+        compression_lookback = max(
+            compression_window + 1,
+            int(cfg.get("compression_lookback_bars", 96) or 96),
+        )
+        prior_rows = candles[-compression_lookback - 1:-1]
+        prior_ranges = [
+            max(0.0, float(row["high"]) - float(row["low"]))
+            for row in prior_rows
+        ]
+        long_range = median(prior_ranges) if prior_ranges else 0.0
+        short_range = median(prior_ranges[-compression_window:]) if prior_ranges else 0.0
+        if long_range > 0.0:
+            compression_ratio = short_range / long_range
+            compression_breakout = bool(
+                fresh_breakout
+                and compression_ratio
+                <= float(cfg.get("compression_max_range_ratio", 0.72) or 0.72)
+                and volume_ratio
+                >= float(cfg.get("compression_min_volume_ratio", 1.10) or 1.10)
+            )
+
     efficiency_period = max(8, int(cfg["efficiency_lookback_bars"]))
     efficiency_closes = closes[-efficiency_period - 1:]
     path = sum(abs(efficiency_closes[i] - efficiency_closes[i - 1]) for i in range(1, len(efficiency_closes)))
@@ -638,7 +802,7 @@ def evaluate_adaptive_breakout_trend(
         side in {"long", "short"}
         and slow_vote == side
         and fast_vote not in {None, side}
-        and not (breakout_entry_enabled and fresh_breakout)
+        and not compression_breakout
     )
     continuation_bars = max(
         1,
@@ -676,9 +840,6 @@ def evaluate_adaptive_breakout_trend(
         and continuation_reacceleration
     )
 
-    volumes = [float(row.get("volume") or 0.0) for row in candles]
-    baseline_volume = median(volumes[-49:-1]) if len(volumes) >= 49 else median(volumes[:-1])
-    volume_ratio = volumes[-1] / max(baseline_volume, 1e-9) if baseline_volume > 0 else 1.0
     structure_window = candles[-max(4, int(cfg["structure_lookback_bars"])) - 1:-1]
     structure_stop = (
         min(float(row["low"]) for row in structure_window)
@@ -713,6 +874,8 @@ def evaluate_adaptive_breakout_trend(
         "channel_low": channel_low,
         "fresh_breakout": fresh_breakout,
         "reacceleration": reacceleration,
+        "compression_ratio": compression_ratio,
+        "compression_breakout": compression_breakout,
         "turning_conflict": turning_conflict,
         "weighted_continuation": weighted_continuation,
         "continuation_reacceleration": continuation_reacceleration,
@@ -741,9 +904,8 @@ def evaluate_adaptive_breakout_trend(
         return AdaptiveBreakoutTrendDecision(side=side, reason="trend_structure_not_aligned", metrics=metrics)
     if turning_conflict:
         return AdaptiveBreakoutTrendDecision(side=side, reason="fast_slow_turning_conflict", metrics=metrics)
-    breakout_entry = bool(
-        breakout_entry_enabled and (fresh_breakout or reacceleration)
-    )
+    breakout_entry = bool(compression_breakout)
+    metrics["breakout_entry"] = breakout_entry
     if not ema_crossover and not breakout_entry and not weighted_continuation:
         return AdaptiveBreakoutTrendDecision(side=side, reason="waiting_for_weighted_trend_entry", metrics=metrics)
     minimum_efficiency = (
@@ -765,7 +927,7 @@ def evaluate_adaptive_breakout_trend(
     score = 44.0
     score += min(18.0, abs(weighted_momentum) * 24.0)
     score += min(12.0, dominant_votes * 4.0)
-    score += 7.0 if ema_crossover else 8.0 if fresh_breakout else 6.0 if weighted_continuation else 5.0
+    score += 9.0 if compression_breakout else 7.0 if ema_crossover else 6.0 if weighted_continuation else 5.0
     score += min(10.0, efficiency * 22.0)
     score += min(4.0, max(0.0, volume_ratio - 0.70) * 3.0)
     if slow_vote == side:
@@ -815,8 +977,8 @@ def evaluate_adaptive_breakout_trend(
     mode = (
         "EMA crossover"
         if ema_crossover
-        else "fresh breakout"
-        if fresh_breakout
+        else "compression breakout"
+        if compression_breakout
         else "weighted continuation"
         if weighted_continuation
         else "trend re-acceleration"

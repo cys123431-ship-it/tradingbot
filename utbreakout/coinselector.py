@@ -702,6 +702,38 @@ def rank_candidates(candidates, top_n=10):
         item.get("adaptive_breakout_trend_score") is not None
         for item in eligible
     )
+    use_convex_rotation = use_adaptive_trend and any(
+        item.get("convex_rotation_score") is not None
+        for item in eligible
+    )
+    if use_convex_rotation:
+        rotation_universe = sorted(
+            eligible,
+            key=lambda item: finite_float(item.get("convex_rotation_score"), 0.0),
+            reverse=True,
+        )
+        rotation_count = len(rotation_universe)
+        for index, item in enumerate(rotation_universe, start=1):
+            percentile = (
+                (rotation_count - index + 1) / rotation_count * 100.0
+                if rotation_count else 0.0
+            )
+            score = finite_float(item.get("convex_rotation_score"), 0.0)
+            tier = (
+                "elite"
+                if item.get("adaptive_breakout_trend_allowed")
+                and score >= 80.0 and percentile >= 90.0
+                else "strong"
+                if item.get("adaptive_breakout_trend_allowed")
+                and score >= 68.0 and percentile >= 70.0
+                else "base"
+            )
+            item.update({
+                "convex_rotation_rank": index,
+                "convex_rotation_universe_size": rotation_count,
+                "convex_rotation_percentile": round(percentile, 2),
+                "convex_rotation_tier": tier,
+            })
     use_ev_edge = (
         not use_adaptive_trend
         and any(item.get("ev_net_edge_r") is not None for item in eligible)
@@ -713,7 +745,12 @@ def rank_candidates(candidates, top_n=10):
             else finite_float(item.get("ev_net_edge_r"), float("-inf"))
             if use_ev_edge
             else finite_float(item.get("score"), 0.0),
-            finite_float(item.get("adaptive_breakout_trend_score"), 0.0)
+            finite_float(
+                item.get("convex_rotation_score")
+                if use_convex_rotation
+                else item.get("adaptive_breakout_trend_score"),
+                0.0,
+            )
             if use_adaptive_trend
             else finite_float(item.get("score"), 0.0),
             abs(finite_float(item.get("adaptive_breakout_trend_weighted_momentum"), 0.0))
