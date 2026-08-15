@@ -11,6 +11,8 @@ import os
 import time
 from datetime import datetime
 
+from .entry_reason_ko import build_entry_diagnostic, explain_entry_reason_ko
+
 
 _BRANCHES = (
     ("utbreak", "UTBreak"),
@@ -104,7 +106,9 @@ def _row_from_light(key, fallback_label, light):
         "name": _safe_text(light.get("label") or fallback_label, 64),
         "state": state or "unknown",
         "side": _safe_text(light.get("side"), 10).upper() or None,
-        "reason": _safe_text(light.get("reason") or "최근 평가 없음"),
+        "reason": _safe_text(
+            explain_entry_reason_ko(light.get("reason") or "전략 신호 대기")
+        ),
     }
 
 
@@ -132,7 +136,13 @@ def _row_from_status(key, name, status, enabled=True):
         "name": name,
         "state": state,
         "side": side,
-        "reason": _safe_text(status.get("reason") or status.get("reject_code") or "최근 평가 없음"),
+        "reason": _safe_text(
+            explain_entry_reason_ko(
+                status.get("reason") or status.get("reject_code") or "전략 신호 대기",
+                code=status.get("reject_code") or status.get("accepted_code"),
+                data=status,
+            )
+        ),
     }
 
 
@@ -226,6 +236,28 @@ def build_desktop_monitor_snapshot(controller):
     active_strategy = _safe_text(strategy_params.get("active_strategy") or "unknown", 80).lower()
     symbol = _get_symbol(controller, engine) if engine is not None else None
 
+    active_status = {}
+    if engine is not None:
+        store_name = _ACTIVE_STATUS_STORES.get(
+            active_strategy,
+            "last_utbot_filtered_breakout_status",
+        )
+        active_status = _status_for_symbol(getattr(engine, store_name, {}), symbol)
+    entry_diagnostic = (
+        build_entry_diagnostic(
+            engine,
+            symbol,
+            fallback_reason=(
+                (getattr(engine, "last_entry_reason", {}) or {}).get(symbol)
+                if isinstance(getattr(engine, "last_entry_reason", None), dict)
+                else None
+            ),
+            status=active_status,
+        )
+        if engine is not None
+        else {}
+    )
+
     mode = "unknown"
     get_mode = getattr(controller, "get_exchange_mode", None)
     if callable(get_mode):
@@ -247,6 +279,9 @@ def build_desktop_monitor_snapshot(controller):
                     "side": _safe_text(value.get("pos_side"), 12).upper() or "NONE",
                     "price": _safe_number(value.get("price")),
                     "entry_reason": _safe_text(value.get("entry_reason")),
+                    "entry_reason_ko": _safe_text(
+                        explain_entry_reason_ko(value.get("entry_reason"))
+                    ),
                     "equity": _safe_number(value.get("total_equity")),
                     "free_usdt": _safe_number(value.get("free_usdt")),
                     "daily_pnl": _safe_number(value.get("daily_pnl")),
@@ -272,6 +307,7 @@ def build_desktop_monitor_snapshot(controller):
             else []
         ),
         "position_hints": _position_hints(engine) if engine is not None else [],
+        "entry_diagnostic": entry_diagnostic,
         "status_rows": status_rows,
     }
 

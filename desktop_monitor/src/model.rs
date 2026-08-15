@@ -71,9 +71,21 @@ pub struct StatusRow {
     pub side: String,
     pub price: Option<f64>,
     pub entry_reason: String,
+    pub entry_reason_ko: String,
     pub equity: Option<f64>,
     pub free_usdt: Option<f64>,
     pub daily_pnl: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct EntryDiagnostic {
+    pub symbol: String,
+    pub message: String,
+    pub code: String,
+    pub raw_reason: String,
+    pub stage: String,
+    pub epoch: i64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -84,6 +96,7 @@ pub struct RuntimeSnapshot {
     pub epoch: i64,
     pub bot: BotState,
     pub strategies: Vec<StrategyRow>,
+    pub entry_diagnostic: EntryDiagnostic,
     pub status_rows: Vec<StatusRow>,
 }
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 
+from .entry_reason_ko import build_entry_diagnostic
 from trading_safety.market_session import us_equity_regular_session_status
 from utbreakout.adaptive_breakout_trend import (
     normalize_adaptive_breakout_trend_config,
@@ -1602,7 +1603,7 @@ class SignalAlphaMixin:
                 '📈 Adaptive Breakout Trend 상태',
                 f'Symbol: {target}',
                 f'Universe: {universe_text}',
-                detail,
+                f'진입하지 않은 이유: {detail}',
             ])
         metrics = status.get('metrics') if isinstance(status.get('metrics'), dict) else {}
         votes = metrics.get('horizon_votes') if isinstance(metrics.get('horizon_votes'), dict) else {}
@@ -1624,6 +1625,12 @@ class SignalAlphaMixin:
         )
         risk_tier = str(status.get('risk_tier') or 'base').lower()
         small_account_active = bool(status.get('small_account_aggressive_candidate'))
+        entry_diagnostic = build_entry_diagnostic(
+            self,
+            target,
+            fallback_reason=status.get('reason'),
+            status=status,
+        )
         if small_account_active:
             max_loss_percent = float(
                 trend_cfg.get(
@@ -1655,6 +1662,7 @@ class SignalAlphaMixin:
             f"Trend efficiency: {float(metrics.get('trend_efficiency', 0.0) or 0.0):.2f}",
             f"Volatility scale: {float(metrics.get('volatility_scale', 0.0) or 0.0):.2f}",
             f"L2: {(status.get('l2_gate') or {}).get('state') or 'N/A'}",
+            f"진입하지 않은 이유: {entry_diagnostic.get('message')}",
             f"Reason: {status.get('reason') or '-'}",
         ]
         if status.get('tradfi_perpetual'):

@@ -273,6 +273,19 @@ impl MonitorApp {
     }
 
     fn account_panel(&self, ui: &mut egui::Ui) {
+        if self.state.position.is_none() && !self.state.runtime.entry_diagnostic.message.is_empty()
+        {
+            ui.heading("진입 대기 이유");
+            if !self.state.runtime.entry_diagnostic.symbol.is_empty() {
+                ui.label(
+                    RichText::new(&self.state.runtime.entry_diagnostic.symbol)
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
+            }
+            ui.label(&self.state.runtime.entry_diagnostic.message);
+            ui.add_space(8.0);
+        }
         if let Some(status) = self.state.runtime.status_rows.first() {
             ui.heading("봇 상태 요약");
             egui::Grid::new("account_grid")
@@ -281,6 +294,9 @@ impl MonitorApp {
                 .show(ui, |ui| {
                     row(ui, "감시 종목", &status.symbol);
                     row(ui, "봇 판단", &status.side);
+                    if !status.entry_reason_ko.is_empty() {
+                        row(ui, "최근 판단", &status.entry_reason_ko);
+                    }
                     row(
                         ui,
                         "계좌",

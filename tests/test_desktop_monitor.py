@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from bot_runtime.desktop_monitor import build_desktop_monitor_snapshot
+from bot_runtime.entry_reason_ko import explain_entry_reason_ko
 from scripts.desktop_monitor_stream import classify_position, normalize_order, normalize_position
 
 
@@ -140,3 +141,58 @@ def test_live_status_symbol_wins_over_stale_internal_candidate():
     snapshot = build_desktop_monitor_snapshot(controller)
 
     assert snapshot["bot"]["current_symbol"] == "KORU/USDT"
+
+
+def test_monitor_exposes_latest_entry_block_in_korean():
+    event = {
+        "ts": 100.0,
+        "symbol": "CYS/USDT:USDT",
+        "stage": "AUTO_ENTRY_BRIDGE_BLOCKED",
+        "status": "READY_TOO_OLD",
+        "data": {
+            "reason": "STATUS_READY event is too old",
+            "ready_age_sec": 1800,
+            "max_ready_age_sec": 1200,
+        },
+    }
+    engine = SimpleNamespace(
+        scanner_active_symbol=None,
+        current_utbreakout_candidate_symbol="CYS/USDT:USDT",
+        adaptive_breakout_trend_last_status={
+            "CYS/USDT:USDT": {
+                "strategy": "ADAPTIVE_BREAKOUT_TREND",
+                "symbol": "CYS/USDT:USDT",
+                "stage": "entry_ready",
+                "accepted_code": "ACCEPTED_ENTRY",
+                "accepted_side": "long",
+                "reason": "ACCEPTED_ENTRY: trend",
+            }
+        },
+        last_entry_reason={"CYS/USDT:USDT": "ACCEPTED_ENTRY: trend"},
+        utbreakout_trailing_states={},
+        _utbreakout_recent_trace_events=lambda symbol, limit=80: [event],
+    )
+    controller = SimpleNamespace(
+        engines={"signal": engine},
+        status_data={},
+        is_paused=False,
+        get_active_strategy_params=lambda: {
+            "active_strategy": "adaptive_breakout_trend_v1"
+        },
+        get_exchange_mode=lambda: "binance_mainnet",
+        _get_current_symbol=lambda: "CYS/USDT:USDT",
+    )
+
+    snapshot = build_desktop_monitor_snapshot(controller)
+
+    diagnostic = snapshot["entry_diagnostic"]
+    assert diagnostic["symbol"] == "CYS/USDT:USDT"
+    assert "신호가 오래되어" in diagnostic["message"]
+    assert "30.0분" in diagnostic["message"]
+
+
+def test_entry_reason_translation_covers_core_trend_waits():
+    assert "단기·중기·장기" in explain_entry_reason_ko(
+        "Adaptive Breakout Trend waiting: multi_horizon_direction_not_aligned"
+    )
+    assert "모멘텀이 약해" in explain_entry_reason_ko("momentum_strength_too_low")

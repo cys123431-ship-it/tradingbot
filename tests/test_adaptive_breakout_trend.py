@@ -614,6 +614,30 @@ def test_status_uses_configured_trend_single_symbol_before_scanner_candidate():
     assert "Universe: single / ETH/USDT:USDT" in text
 
 
+def test_status_explains_no_entry_reason_in_korean():
+    engine = SignalAlphaMixin()
+    engine.current_utbreakout_candidate_symbol = "PROM/USDT:USDT"
+    engine.adaptive_breakout_trend_last_status = {
+        "PROM/USDT:USDT": {
+            "strategy": "ADAPTIVE_BREAKOUT_TREND",
+            "symbol": "PROM/USDT:USDT",
+            "stage": "waiting",
+            "allowed": False,
+            "side": "long",
+            "score": 0.0,
+            "reason": "Adaptive Breakout Trend waiting: momentum_strength_too_low",
+            "metrics": {},
+        }
+    }
+    engine._canonical_futures_symbol = lambda symbol: symbol
+    engine.get_automatic_scan_scope = lambda: "crypto_only"
+
+    text = asyncio.run(engine.build_adaptive_breakout_trend_status_text())
+
+    assert "진입하지 않은 이유:" in text
+    assert "모멘텀이 약해" in text
+
+
 def test_durable_entry_summary_keeps_restart_exit_policy():
     plan = {
         "strategy": ADAPTIVE_BREAKOUT_TREND_STRATEGY,
