@@ -631,6 +631,30 @@ def test_status_explains_no_entry_reason_in_korean():
     }
     engine._canonical_futures_symbol = lambda symbol: symbol
     engine.get_automatic_scan_scope = lambda: "crypto_only"
+    engine._utbreakout_recent_trace_events = lambda symbol, limit=80: [
+        {
+            "ts": 100.0,
+            "symbol": "PROM/USDT:USDT",
+            "stage": "SIGNAL_CALCULATED",
+            "status": "RESULT",
+            "data": {
+                "reason": (
+                    "Adaptive Breakout Trend waiting: momentum_strength_too_low"
+                )
+            },
+        },
+        {
+            "ts": 101.0,
+            "symbol": "PROM/USDT:USDT",
+            "stage": "AUTO_ENTRY_BRIDGE_BLOCKED",
+            "status": "NO_STATUS_READY",
+            "data": {
+                "reason": (
+                    "no live STATUS_READY and no accepted diagnostic/plan"
+                )
+            },
+        },
+    ]
 
     text = asyncio.run(engine.build_adaptive_breakout_trend_status_text())
 

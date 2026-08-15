@@ -191,6 +191,68 @@ def test_monitor_exposes_latest_entry_block_in_korean():
     assert "30.0분" in diagnostic["message"]
 
 
+def test_monitor_prefers_strategy_root_cause_over_no_status_ready_consequence():
+    events = [
+        {
+            "ts": 100.0,
+            "symbol": "BNB/USDT:USDT",
+            "stage": "SIGNAL_CALCULATED",
+            "status": "RESULT",
+            "data": {
+                "reason": (
+                    "Adaptive Breakout Trend waiting: "
+                    "multi_horizon_direction_not_aligned"
+                )
+            },
+        },
+        {
+            "ts": 101.0,
+            "symbol": "BNB/USDT:USDT",
+            "stage": "AUTO_ENTRY_BRIDGE_BLOCKED",
+            "status": "NO_STATUS_READY",
+            "data": {
+                "reason": (
+                    "no live STATUS_READY and no accepted diagnostic/plan"
+                )
+            },
+        },
+    ]
+    engine = SimpleNamespace(
+        scanner_active_symbol=None,
+        current_utbreakout_candidate_symbol="BNB/USDT:USDT",
+        adaptive_breakout_trend_last_status={
+            "BNB/USDT:USDT": {
+                "strategy": "ADAPTIVE_BREAKOUT_TREND",
+                "symbol": "BNB/USDT:USDT",
+                "stage": "waiting",
+                "reason": (
+                    "Adaptive Breakout Trend waiting: "
+                    "multi_horizon_direction_not_aligned"
+                ),
+            }
+        },
+        last_entry_reason={},
+        utbreakout_trailing_states={},
+        _utbreakout_recent_trace_events=lambda symbol, limit=80: events,
+    )
+    controller = SimpleNamespace(
+        engines={"signal": engine},
+        status_data={},
+        is_paused=False,
+        get_active_strategy_params=lambda: {
+            "active_strategy": "adaptive_breakout_trend_v1"
+        },
+        get_exchange_mode=lambda: "binance_mainnet",
+        _get_current_symbol=lambda: "BNB/USDT:USDT",
+    )
+
+    diagnostic = build_desktop_monitor_snapshot(controller)["entry_diagnostic"]
+
+    assert "단기·중기·장기 추세 방향" in diagnostic["message"]
+    assert diagnostic["stage"] == "SIGNAL_CALCULATED"
+    assert diagnostic["code"] == "RESULT"
+
+
 def test_entry_reason_translation_covers_core_trend_waits():
     assert "단기·중기·장기" in explain_entry_reason_ko(
         "Adaptive Breakout Trend waiting: multi_horizon_direction_not_aligned"

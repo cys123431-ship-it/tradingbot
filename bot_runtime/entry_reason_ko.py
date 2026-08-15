@@ -146,7 +146,9 @@ _DIAGNOSTIC_STAGES = {
 def build_entry_diagnostic(engine, symbol=None, *, fallback_reason=None, status=None):
     """Build a read-only diagnostic from the latest signal/entry breadcrumb."""
 
+    status = status if isinstance(status, dict) else {}
     selected_event = None
+    events = []
     recent = getattr(engine, "_utbreakout_recent_trace_events", None)
     if callable(recent):
         try:
@@ -165,6 +167,44 @@ def build_entry_diagnostic(engine, symbol=None, *, fallback_reason=None, status=
             selected_event = event
             break
 
+    # NO_STATUS_READY is normally a downstream consequence of a strategy
+    # decision that produced no signal. In that case the immediately preceding
+    # strategy reason is the useful answer to "why no entry?". Keep genuine
+    # execution blockers (stale signal, risk, balance, order failure, etc.) at
+    # their existing higher priority.
+    if (
+        selected_event
+        and str(selected_event.get("stage") or "").upper()
+        == "AUTO_ENTRY_BRIDGE_BLOCKED"
+        and str(selected_event.get("status") or "").upper()
+        == "NO_STATUS_READY"
+    ):
+        blocked_ts = float(selected_event.get("ts") or 0.0)
+        for event in reversed(events or []):
+            if not isinstance(event, dict) or event is selected_event:
+                continue
+            event_ts = float(event.get("ts") or 0.0)
+            if blocked_ts > 0 and not 0.0 <= blocked_ts - event_ts <= 120.0:
+                continue
+            stage = str(event.get("stage") or "").upper()
+            if stage not in {
+                "SIGNAL_CALCULATED",
+                "STATUS_NOT_READY",
+                "STATUS_EVALUATED",
+            }:
+                continue
+            data = event.get("data")
+            data = data if isinstance(data, dict) else {}
+            reason = str(data.get("reason") or "").strip()
+            if reason and "ACCEPTED_ENTRY" not in reason.upper():
+                selected_event = event
+                break
+        else:
+            status_reason = str(status.get("reason") or "").strip()
+            if status_reason and "ACCEPTED_ENTRY" not in status_reason.upper():
+                selected_event = None
+                fallback_reason = status_reason
+
     if selected_event:
         data = selected_event.get("data")
         data = data if isinstance(data, dict) else {}
@@ -179,7 +219,6 @@ def build_entry_diagnostic(engine, symbol=None, *, fallback_reason=None, status=
             "epoch": int(float(selected_event.get("ts") or 0.0)),
         }
 
-    status = status if isinstance(status, dict) else {}
     raw_reason = str(
         fallback_reason
         or status.get("reason")
