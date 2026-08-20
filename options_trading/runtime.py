@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -123,7 +124,12 @@ def _default_state():
         "cash_bankroll_usdt": OPTIONS_CAPITAL_LIMIT_USDT,
         "active_position": None,
         "last_scan_ts": 0.0,
+        "last_manual_scan_ts": 0.0,
         "last_manage_ts": 0.0,
+        "last_manage_success_ts": 0.0,
+        "manage_error_streak": 0,
+        "pending_entry": None,
+        "pending_exit": None,
         "last_reason": "옵션 전략이 아직 실행되지 않았습니다.",
         "last_error": "",
         "last_candidate": None,
@@ -185,6 +191,11 @@ class OptionsTradingService:
             state.setdefault("last_error", "")
             state.setdefault("last_candidate", None)
             state.setdefault("consumed_signal_keys", [])
+            state.setdefault("last_manual_scan_ts", 0.0)
+            state.setdefault("last_manage_success_ts", 0.0)
+            state.setdefault("manage_error_streak", 0)
+            state.setdefault("pending_entry", None)
+            state.setdefault("pending_exit", None)
             return state
         except Exception as exc:
             self._state_unreadable = True
@@ -215,7 +226,9 @@ class OptionsTradingService:
         creds = self.credentials_getter() or {}
         api_key = str(creds.get("api_key") or "").strip()
         secret_key = str(creds.get("secret_key") or "").strip()
-        identity = (api_key[-8:] if api_key else "", bool(secret_key))
+        identity = hashlib.sha256(
+            f"{api_key}\0{secret_key}".encode("utf-8")
+        ).hexdigest()
         if self._client_instance is None or identity != self._credential_identity:
             self._client_instance = self.client_factory(
                 api_key=api_key,
@@ -291,7 +304,34 @@ class OptionsTradingService:
             "last_reason": self.state.get("last_reason", ""),
             "last_error": self.state.get("last_error", ""),
             "last_candidate": self.state.get("last_candidate"),
+            "last_manage_success_ts": _f(self.state.get("last_manage_success_ts")),
+            "manage_error_streak": int(self.state.get("manage_error_streak") or 0),
+            "pending_order": bool(
+                self.state.get("pending_entry") or self.state.get("pending_exit")
+            ),
         }
+
+    async def _recover_runtime_ownership(self):
+        """Production subclass hook for crash-safe order/position adoption."""
+
+        return None
+
+    async def _record_manage_health(self, result):
+        failed = result.get("action") == "blocked"
+        if failed:
+            streak = int(self.state.get("manage_error_streak") or 0) + 1
+            self.state["manage_error_streak"] = streak
+            if streak in {3, 10}:
+                await self._notify(
+                    "🚨 옵션 포지션 관리 API 오류가 "
+                    f"{streak}회 연속 발생했습니다. 신규 진입은 차단되고 기존 포지션 재확인을 계속합니다."
+                )
+        else:
+            self.state["manage_error_streak"] = 0
+            self.state["last_manage_success_ts"] = time.time()
+            self.state["last_error"] = ""
+        self._save_state()
+        return result
 
     async def run_cycle(self, *, force_scan=False, force_exit=False):
         if self._lock.locked():
@@ -302,18 +342,34 @@ class OptionsTradingService:
             if self._state_unreadable:
                 return self._record_reason("OPTIONS_STATE_UNREADABLE_FAIL_CLOSED", error=True)
             active = self.state.get("active_position")
+            if not active:
+                recovered = await self._recover_runtime_ownership()
+                if recovered is not None:
+                    active = self.state.get("active_position")
+                    if not active:
+                        return recovered
             if active:
-                interval = cfg.get("manage_interval_seconds", 30)
+                interval = cfg.get("manage_interval_seconds", 10)
                 if force_exit or force_scan or now - _f(self.state.get("last_manage_ts")) >= interval:
                     self.state["last_manage_ts"] = now
                     self._save_state()
-                    return await self._manage_active_position(force_exit=force_exit)
+                    result = await self._manage_active_position(force_exit=force_exit)
+                    return await self._record_manage_health(result)
                 return {"action": "waiting", "reason": "OPTIONS_MANAGE_INTERVAL"}
             if force_exit:
                 return self._record_reason("청산할 봇 옵션 포지션이 없습니다.")
             if not cfg.get("enabled"):
                 return self._record_reason("옵션 자동매매 OFF — 신규 진입하지 않습니다.")
-            if not force_scan and now - _f(self.state.get("last_scan_ts")) < cfg.get("scan_interval_seconds", 300):
+            if force_scan:
+                cooldown = cfg.get("manual_scan_cooldown_seconds", 60)
+                elapsed = now - _f(self.state.get("last_manual_scan_ts"))
+                if elapsed < cooldown:
+                    return {
+                        "action": "waiting",
+                        "reason": f"OPTIONS_MANUAL_SCAN_COOLDOWN ({cooldown - elapsed:.0f}s)",
+                    }
+                self.state["last_manual_scan_ts"] = now
+            elif now - _f(self.state.get("last_scan_ts")) < cfg.get("scan_interval_seconds", 300):
                 return {"action": "waiting", "reason": "OPTIONS_SCAN_INTERVAL"}
             self.state["last_scan_ts"] = now
             self._save_state()
@@ -516,7 +572,7 @@ class OptionsTradingService:
         )
         if not plan.get("accepted"):
             return self._record_reason(
-                f"20 USDT 한도에서 주문 수량을 만들 수 없습니다: {plan.get('reason')}",
+                f"{OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT 한도에서 주문 수량을 만들 수 없습니다: {plan.get('reason')}",
                 candidate=self.state.get("last_candidate"),
             )
         if plan["total_entry_cost_usdt"] > _f(snapshot["balance"].get("available")):
@@ -576,7 +632,8 @@ class OptionsTradingService:
             self.state["last_error"] = "OPTIONS_FILLED_COST_EXCEEDED_HARD_CAP"
             self._save_state()
             await self._notify(
-                "🚨 옵션 체결 비용이 20 USDT 한도를 넘었습니다. 추가 진입을 차단하고 현재 포지션만 관리합니다."
+                f"🚨 옵션 체결 비용이 {OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT 한도를 넘었습니다. "
+                "추가 진입을 차단하고 현재 포지션만 관리합니다."
             )
         self.state["cash_bankroll_usdt"] = max(
             0.0, _f(self.state.get("cash_bankroll_usdt")) - total_cost
@@ -613,20 +670,65 @@ class OptionsTradingService:
                     f"종목: {symbol}",
                     f"방향: {selected.get('side')} | 수량 {filled_qty:g}",
                     f"프리미엄: {premium:.4f} USDT | 예상 수수료 {entry_fee:.4f}",
-                    f"전략 잔여예산: {self.state['cash_bankroll_usdt']:.4f} / 20.0000 USDT",
+                    f"전략 잔여예산: {self.state['cash_bankroll_usdt']:.4f} / "
+                    f"{OPTIONS_CAPITAL_LIMIT_USDT:.4f} USDT",
                     "네이키드 매도 없이 매수 프리미엄만 위험에 노출됩니다.",
                 ]
             )
         )
         return {"action": "entered", "position": position}
 
-    async def _manage_active_position(self, *, force_exit=False):
+    async def _resolve_pending_exit(self, position):
+        pending = self.state.get("pending_exit") or None
+        if not pending:
+            return None
+        symbol = str(pending.get("symbol") or "")
+        client_order_id = str(pending.get("client_order_id") or "")
+        if not symbol or not client_order_id.startswith(BOT_CLIENT_PREFIX):
+            return self._record_reason("OPTIONS_PENDING_EXIT_INVALID", error=True)
+        try:
+            order = await self._call(
+                self._client().query_order,
+                symbol,
+                client_order_id=client_order_id,
+            )
+        except Exception as exc:
+            return self._record_reason(
+                f"옵션 미확정 청산 주문 확인 실패: {exc}", error=True
+            )
+        status = str((order or {}).get("status") or "").upper()
+        filled = _order_executed_quantity(order)
+        if filled > 0:
+            return await self._book_exit_order(
+                position,
+                order,
+                _f(pending.get("limit_price")),
+                pending.get("reason") or "OPTION_RECOVERED_EXIT",
+            )
+        if status in {"CANCELED", "REJECTED", "EXPIRED", "FILLED"}:
+            self.state["pending_exit"] = None
+            self._save_state()
+            return None
+        return {
+            "action": "waiting",
+            "reason": "옵션 청산 주문 상태 확인 중 — 중복 청산을 차단했습니다.",
+        }
+
+    async def _manage_active_position(self, *, force_exit=False, prefetched=None):
         position = self.state.get("active_position") or {}
         symbol = position.get("symbol")
         if not symbol:
             return self._record_reason("OPTIONS_ACTIVE_POSITION_INVALID", error=True)
+        pending_result = await self._resolve_pending_exit(position)
+        if pending_result is not None:
+            return pending_result
         try:
-            exchange_positions = _rows(await self._call(self._client().positions, symbol))
+            prefetched = prefetched or {}
+            exchange_positions = prefetched.get("exchange_positions")
+            if exchange_positions is None:
+                exchange_positions = _rows(
+                    await self._call(self._client().positions, symbol)
+                )
             exchange_qty = 0.0
             for row in exchange_positions:
                 if str(row.get("symbol") or "") == symbol:
@@ -645,10 +747,13 @@ class OptionsTradingService:
                     exit_fee=0.0,
                     reason="EXTERNAL_CLOSE_OR_EXPIRY",
                 )
-            mark_payload, depth = await asyncio.gather(
-                self._call(self._client().mark_price, symbol),
-                self._call(self._client().depth, symbol, 20),
-            )
+            mark_payload = prefetched.get("mark_payload")
+            depth = prefetched.get("depth")
+            if mark_payload is None or depth is None:
+                mark_payload, depth = await asyncio.gather(
+                    self._call(self._client().mark_price, symbol),
+                    self._call(self._client().depth, symbol, 20),
+                )
             mark = _first(mark_payload)
             mark_price = _f(mark.get("markPrice"), position.get("entry_price"))
             bids = list((depth or {}).get("bids") or [])
@@ -702,6 +807,15 @@ class OptionsTradingService:
         limit_price = max(tick, best_bid - (tick if tick > 0 else 0.0))
         client_order_id = self._client_order_id("s")
         price_text = self._format_price(limit_price, tick)
+        self.state["pending_exit"] = {
+            "symbol": symbol,
+            "quantity": _f(quantity),
+            "limit_price": limit_price,
+            "client_order_id": client_order_id,
+            "reason": reason,
+            "created_at_ms": int(time.time() * 1000),
+        }
+        self._save_state()
         try:
             response = await self._call(
                 self._client().new_order,
@@ -728,16 +842,27 @@ class OptionsTradingService:
                         error=True,
                     )
             else:
+                self.state["pending_exit"] = None
+                self._save_state()
                 return self._record_reason(f"옵션 청산 주문 거절: {exc}", error=True)
         order = await self._resolve_submitted_order(symbol, client_order_id, response, limit_price)
+        return await self._book_exit_order(
+            position, order, limit_price, reason
+        )
+
+    async def _book_exit_order(self, position, order, limit_price, reason):
         filled = _order_executed_quantity(order)
         if filled <= 0:
+            status = str((order or {}).get("status") or "").upper()
+            if status in {"CANCELED", "REJECTED", "EXPIRED", "FILLED"}:
+                self.state["pending_exit"] = None
+                self._save_state()
             return self._record_reason("옵션 청산 IOC가 미체결되어 다음 관리 주기에 재시도합니다.")
         exit_price = _order_average_price(order, limit_price)
         unit = _f(position.get("unit"), 1.0)
         proceeds = exit_price * filled * unit
         # With no underlying quote in this branch, use the 10%-of-premium fee
-        # cap. It over-reserves rather than silently consuming the $20 sleeve.
+        # cap. It over-reserves rather than silently consuming the fixed sleeve.
         exit_fee = estimate_option_fee(exit_price, 0.0, filled, unit)
         remaining = max(0.0, _f(position.get("quantity")) - filled)
         order_id = order.get("orderId")
@@ -750,6 +875,7 @@ class OptionsTradingService:
         self.state["cash_bankroll_usdt"] = max(
             0.0, _f(self.state.get("cash_bankroll_usdt")) + proceeds - exit_fee
         )
+        self.state["pending_exit"] = None
         if remaining > 1e-12:
             position["quantity"] = remaining
             position["partial_exit_proceeds_usdt"] = _f(
@@ -804,7 +930,8 @@ class OptionsTradingService:
                     f"종목: {position.get('symbol')}",
                     f"사유: {reason}",
                     f"실현손익(추정 수수료 포함): {pnl:+.4f} USDT",
-                    f"전략 잔여예산: {self.state['cash_bankroll_usdt']:.4f} / 20.0000 USDT",
+                    f"전략 잔여예산: {self.state['cash_bankroll_usdt']:.4f} / "
+                    f"{OPTIONS_CAPITAL_LIMIT_USDT:.4f} USDT",
                 ]
             )
         )

@@ -140,6 +140,9 @@ class _FakeOptionsClient:
         self.orders = []
         self.manual_positions = []
         self.trades = []
+        self.query_orders = {}
+        self.mark_calls = []
+        self.ticker_calls = []
 
     def ping(self):
         return {}
@@ -182,12 +185,16 @@ class _FakeOptionsClient:
             ]
         }
 
-    def mark_price(self, symbol):
+    def mark_price(self, symbol=None):
+        self.mark_calls.append(symbol)
         mark_price = "9.9" if self.manual_positions else "0.49"
-        return [{"symbol": symbol, "markPrice": mark_price, "markIV": "0.02", "delta": "0.45"}]
+        rows = [{"symbol": "ETH-TEST-185-C", "markPrice": mark_price, "markIV": "0.02", "delta": "0.45"}]
+        return rows if symbol is None else [dict(rows[0], symbol=symbol)]
 
-    def ticker(self, symbol):
-        return [{"symbol": symbol, "amount": "1000", "bidPrice": "0.48", "askPrice": "0.50"}]
+    def ticker(self, symbol=None):
+        self.ticker_calls.append(symbol)
+        rows = [{"symbol": "ETH-TEST-185-C", "amount": "1000", "bidPrice": "0.48", "askPrice": "0.50"}]
+        return rows if symbol is None else [dict(rows[0], symbol=symbol)]
 
     def depth(self, symbol, limit=20):
         return {"bids": [["0.48", "10"]], "asks": [["0.50", "10"]]}
@@ -204,7 +211,15 @@ class _FakeOptionsClient:
         }
 
     def query_order(self, symbol, **kwargs):
+        client_order_id = kwargs.get("client_order_id")
+        order_id = kwargs.get("order_id")
+        key = client_order_id if client_order_id is not None else order_id
+        if key in self.query_orders:
+            return dict(self.query_orders[key])
         raise AssertionError("filled fake orders should not require a query")
+
+    def cancel_order(self, symbol, **kwargs):
+        return {"symbol": symbol, "status": "CANCELED", **kwargs}
 
     def user_trades(self, symbol, **kwargs):
         return list(self.trades)
@@ -257,6 +272,105 @@ def test_options_runtime_enters_buy_only_with_live_balance_below_hundred_cap(tmp
     assert position["entry_total_usdt"] <= 21.0
     assert position["entry_total_usdt"] <= OPTIONS_CAPITAL_LIMIT_USDT
     assert 0 <= service.state["cash_bankroll_usdt"] < OPTIONS_CAPITAL_LIMIT_USDT
+    assert None in clients[0].mark_calls
+    assert None in clients[0].ticker_calls
+    assert clients[0].mark_calls.count("ETH-TEST-185-C") == 0
+    assert clients[0].ticker_calls.count("ETH-TEST-185-C") == 0
+
+
+def test_manual_force_scan_has_cooldown_to_prevent_api_bursts(tmp_path):
+    service, _ = _service(tmp_path, enabled=True)
+    first = asyncio.run(service.run_cycle(force_scan=True))
+    assert first["action"] == "entered"
+    service.state["active_position"] = None
+    service._save_state()
+
+    second = asyncio.run(service.run_cycle(force_scan=True))
+
+    assert second["action"] == "waiting"
+    assert "MANUAL_SCAN_COOLDOWN" in second["reason"]
+
+
+def test_pending_bot_entry_is_recovered_by_client_order_id(tmp_path):
+    service, _ = _service(tmp_path, enabled=True)
+    client = service._client()
+    symbol = "ETH-TEST-185-C"
+    client.manual_positions = [{"symbol": symbol, "quantity": "1"}]
+    pending = service._pending_entry(
+        {
+            "symbol": symbol,
+            "underlying": "ETHUSDT",
+            "side": "CALL",
+            "unit": 1,
+            "tick_size": 0.1,
+            "expiryDate": int(time.time() * 1000) + 5 * 86_400_000,
+            "signal": {"strategy": "ADAPTIVE_TREND", "spot_price": 100},
+        },
+        1,
+        10,
+        "tboptb-recovery",
+        "IOC",
+    )
+    service.state["pending_entry"] = pending
+    service._save_state()
+    client.query_orders["tboptb-recovery"] = {
+        "symbol": symbol,
+        "status": "FILLED",
+        "executedQty": "1",
+        "avgPrice": "10",
+        "orderId": 555,
+        "clientOrderId": "tboptb-recovery",
+    }
+
+    result = asyncio.run(service._recover_runtime_ownership())
+
+    assert result["action"] == "recovered"
+    assert service.state["pending_entry"] is None
+    assert service.state["active_position"]["symbol"] == symbol
+    assert service.state["active_position"]["recovered_after_restart"] is True
+
+
+def test_pending_exit_is_booked_without_submitting_duplicate_sell(tmp_path):
+    service, _ = _service(tmp_path, enabled=False)
+    client = service._client()
+    symbol = "ETH-TEST-185-C"
+    service.state["cash_bankroll_usdt"] = 0.0
+    service.state["active_position"] = {
+        "symbol": symbol,
+        "side": "CALL",
+        "quantity": 1.0,
+        "original_quantity": 1.0,
+        "entry_price": 10.0,
+        "entry_total_usdt": 10.0,
+        "entry_time_ms": int(time.time() * 1000),
+        "expiry_date_ms": int(time.time() * 1000) + 5 * 86_400_000,
+        "unit": 1.0,
+        "tick_size": 0.1,
+        "peak_mark": 10.0,
+    }
+    service.state["pending_exit"] = {
+        "symbol": symbol,
+        "quantity": 1.0,
+        "limit_price": 12.0,
+        "client_order_id": "tbopts-recovery",
+        "reason": "OPTION_PREMIUM_TARGET",
+    }
+    service._save_state()
+    client.query_orders["tbopts-recovery"] = {
+        "symbol": symbol,
+        "status": "FILLED",
+        "executedQty": "1",
+        "avgPrice": "12",
+        "orderId": 777,
+        "clientOrderId": "tbopts-recovery",
+    }
+
+    result = asyncio.run(service.run_cycle())
+
+    assert result["action"] == "exited"
+    assert service.state["pending_exit"] is None
+    assert service.state["active_position"] is None
+    assert client.orders == []
 
 
 def test_options_runtime_blocks_entry_when_any_manual_option_position_exists(tmp_path):

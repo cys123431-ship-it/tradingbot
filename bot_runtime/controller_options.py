@@ -98,6 +98,7 @@ class ControllerOptionsMixin:
             f"전략 잔여예산: {status.get('cash_bankroll_usdt', 0):.4f} USDT",
             f"옵션 계좌: 가용 {_safe_number(balance.get('available')):.4f} / 평가 {_safe_number(balance.get('equity')):.4f} USDT",
             f"거래소 포지션/주문: {status.get('exchange_positions', 0)} / {status.get('exchange_orders', 0)}",
+            f"관리 API 연속 오류: {int(status.get('manage_error_streak') or 0)}회",
         ]
         if active:
             lines.extend(
@@ -284,8 +285,8 @@ class ControllerOptionsMixin:
                 raise
             except Exception:
                 logger.exception("Options scheduler cycle failed")
-            interval = self._options_service().config().get("manage_interval_seconds", 30)
-            await asyncio.sleep(max(15, int(interval)))
+            interval = self._options_service().config().get("manage_interval_seconds", 10)
+            await asyncio.sleep(max(5, int(interval)))
 
 
 def _safe_number(value):

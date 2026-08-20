@@ -17,14 +17,23 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up Rust monitor toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
       - name: Static smoke tests
         run: |
           set -euo pipefail
           python -m py_compile emas.py scripts/utbreakout_backtest.py scripts/utbreakout_research_report.py scripts/validate_telegram_token.py
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pytest
+          python -m pip check
           python -c "import emas; print('runtime import ok')"
           python -m pytest -q
+          cargo fmt --manifest-path desktop_monitor/Cargo.toml --check
+          cargo test --manifest-path desktop_monitor/Cargo.toml --locked
+          cargo clippy --manifest-path desktop_monitor/Cargo.toml --locked -- -D warnings
 
       - name: Deploy to Azure server
         uses: appleboy/ssh-action@v1.0.3
@@ -78,6 +87,7 @@ jobs:
             echo "=== Restore config ==="
             if [ -f "$CONFIG_BACKUP" ]; then
               cp "$CONFIG_BACKUP" config.json
+              chmod 600 config.json
               echo "config.json restored"
             else
               echo "no config backup to restore"
@@ -102,6 +112,7 @@ jobs:
 
             ./venv/bin/python -m pip install --upgrade pip
             ./venv/bin/python -m pip install -r requirements.txt
+            ./venv/bin/python -m pip check
             echo "=== Apply Prediction live env if provided ==="
             mkdir -p runtime
             if [ -n "${PREDICTION_API_KEY:-}" ] || [ -n "${PREDICTION_JWT:-}" ] || [ -n "${PREDICTION_PRIVATE_KEY:-}" ]; then
@@ -125,6 +136,9 @@ jobs:
               ./venv/bin/python -c 'import json, os, pathlib; p=pathlib.Path("config.json"); cfg=json.loads(p.read_text(encoding="utf-8")); cfg.setdefault("telegram", {})["token"]=os.environ["TELEGRAM_BOT_TOKEN"]; p.write_text(json.dumps(cfg, ensure_ascii=False, indent=4) + "\n", encoding="utf-8")'
             else
               echo "TELEGRAM_BOT_TOKEN secret is empty; preserving restored config token"
+            fi
+            if [ -f config.json ]; then
+              chmod 600 config.json
             fi
             ./venv/bin/python -m py_compile emas.py scripts/launch_emas.py scripts/utbreakout_backtest.py scripts/utbreakout_research_report.py scripts/validate_telegram_token.py
             echo "=== Verify Telegram token ==="

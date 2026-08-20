@@ -108,7 +108,7 @@ impl MonitorApp {
                 StreamEvent::Connecting => self.connection = Connection::Connecting,
                 StreamEvent::Connected => self.connection = Connection::Connected,
                 StreamEvent::Data(snapshot) => {
-                    self.state.apply(snapshot);
+                    self.state.apply(*snapshot);
                     self.connection = Connection::Connected;
                     self.last_received = Some(Instant::now());
                 }

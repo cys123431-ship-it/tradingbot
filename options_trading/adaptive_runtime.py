@@ -139,12 +139,49 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
             cache[symbol] = await self._call(self._client().mark_price, symbol)
         return cache[symbol]
 
+    async def _cached_ticker(self, symbol):
+        cache = getattr(self, "_adaptive_ticker_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._adaptive_ticker_cache = cache
+        if symbol not in cache:
+            cache[symbol] = await self._call(self._client().ticker, symbol)
+        return cache[symbol]
+
+    async def _prime_market_caches(self):
+        """Fetch exchange-wide mark/ticker snapshots once per scan.
+
+        The EAPI endpoints accept an omitted symbol.  Indexing those two batch
+        responses removes dozens of duplicate requests from a multi-contract
+        scan.  Lightweight test/legacy clients that require a symbol simply
+        fall back to the per-symbol methods.
+        """
+
+        try:
+            marks, tickers = await asyncio.gather(
+                self._call(self._client().mark_price),
+                self._call(self._client().ticker),
+            )
+        except TypeError:
+            return
+        except Exception as exc:
+            logger.info("Options batch quote preload unavailable: %s", exc)
+            return
+        for row in base_runtime._rows(marks):
+            symbol = str((row or {}).get("symbol") or "")
+            if symbol:
+                self._adaptive_mark_cache[symbol] = [row]
+        for row in base_runtime._rows(tickers):
+            symbol = str((row or {}).get("symbol") or "")
+            if symbol:
+                self._adaptive_ticker_cache[symbol] = [row]
+
     async def _scan_contract_adaptive(self, contract, signal, cfg, snapshot, exchange_info):
         symbol = contract.get("symbol")
         recent_trades_fn = getattr(self._client(), "recent_trades", None)
         mark, ticker, depth = await asyncio.gather(
             self._cached_mark(symbol),
-            self._call(self._client().ticker, symbol),
+            self._cached_ticker(symbol),
             self._call(self._client().depth, symbol, 20),
         )
         recent_trades = []
@@ -234,6 +271,7 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
     async def _scan_and_maybe_enter(self):
         cfg = self.config()
         self._adaptive_mark_cache = {}
+        self._adaptive_ticker_cache = {}
         diagnostics = {"signal_rejections": {}, "contract_rejections": {}, "orderable_candidates": 0}
         try:
             snapshot = await self._private_snapshot()
@@ -275,6 +313,8 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
                     diagnostics["signal_rejections"]["UNDERLYING_DATA_ERROR"] = diagnostics["signal_rejections"].get("UNDERLYING_DATA_ERROR", 0) + 1
 
             signals.sort(key=lambda row: abs(base_runtime._f(row.get("score"))), reverse=True)
+            if signals:
+                await self._prime_market_caches()
             candidates = []
             consumed = set(str(value) for value in self.state.get("consumed_signal_keys") or [])
             for signal in signals[:3]:
@@ -449,7 +489,10 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
                     break
             tracked_qty = max(0.0, base_runtime._f(position.get("quantity")))
             if exchange_qty <= 1e-12 or exchange_qty + 1e-12 < tracked_qty:
-                return await super()._manage_active_position(force_exit=False)
+                return await super()._manage_active_position(
+                    force_exit=False,
+                    prefetched={"exchange_positions": exchange_positions},
+                )
 
             mark_payload, depth = await asyncio.gather(
                 self._call(self._client().mark_price, symbol),
@@ -488,7 +531,14 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
                 or expiry_hours <= base_runtime._f(cfg.get("expiry_exit_hours"), 8.0)
             )
             if legacy_triggered:
-                return await super()._manage_active_position(force_exit=False)
+                return await super()._manage_active_position(
+                    force_exit=False,
+                    prefetched={
+                        "exchange_positions": exchange_positions,
+                        "mark_payload": mark_payload,
+                        "depth": depth,
+                    },
+                )
 
             await self._refresh_exit_signal(position, cfg, now_ms)
             position = self.state.get("active_position") or position
@@ -542,12 +592,23 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
                 managed_qty = min(exchange_qty, tracked_qty)
                 if managed_qty > 1e-12 and bid > 0:
                     return await self._exit_position(position, managed_qty, bid, reason)
-            return await super()._manage_active_position(force_exit=False)
-        except base_runtime.BinanceOptionsApiError:
-            return await super()._manage_active_position(force_exit=False)
-        except Exception:
-            logger.exception("Adaptive option exit pre-check failed; falling back to legacy manager")
-            return await super()._manage_active_position(force_exit=False)
+            return await super()._manage_active_position(
+                force_exit=False,
+                prefetched={
+                    "exchange_positions": exchange_positions,
+                    "mark_payload": mark_payload,
+                    "depth": depth,
+                },
+            )
+        except base_runtime.BinanceOptionsApiError as exc:
+            return self._record_reason(
+                f"옵션 포지션 관리 API 오류: {exc}", error=True
+            )
+        except Exception as exc:
+            logger.exception("Adaptive option exit pre-check failed")
+            return self._record_reason(
+                f"옵션 포지션 관리 오류: {exc}", error=True
+            )
 
 
 __all__ = ("OptionsTradingService", "SCAN_OUTCOME_LABELS")

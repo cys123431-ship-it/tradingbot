@@ -184,7 +184,10 @@ try:
     DUAL_MODE_AVAILABLE = True
 except ImportError:
     DUAL_MODE_AVAILABLE = False
-    logging.warning("?좑툘 dual_mode_fractal_strategy.py ?뚯씪???놁뒿?덈떎. ?대떦 ?꾨왂???ъ슜?섎젮硫??뚯씪??蹂듦뎄?섏꽭??")
+    logging.info(
+        "Optional dual_mode_fractal_strategy.py is unavailable; "
+        "the active strategy engine is unaffected."
+    )
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from telegram.constants import ParseMode

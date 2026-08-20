@@ -146,7 +146,6 @@ def build_prediction_micro_plan(
     shares = stake / price
     return {
         "accepted": True,
-        "paper_only": True,
         "market_id": market.get("id"),
         "market_title": market.get("title"),
         "market_type": market.get("market_type"),

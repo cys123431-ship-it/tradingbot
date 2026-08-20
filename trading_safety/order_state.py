@@ -131,6 +131,7 @@ def atomic_write_json(
             os.fsync(handle.fileno())
         os.replace(temporary, target)
         if os.name != "nt":
+            os.chmod(target, 0o600)
             directory_fd = os.open(str(target.parent), os.O_RDONLY)
             try:
                 os.fsync(directory_fd)

@@ -21,6 +21,10 @@ adaptive_runtime.SCAN_OUTCOME_LABELS["BUDGET"] = (
 class OptionsTradingService(adaptive_runtime.OptionsTradingService):
     """Production options service with cap migration and balance-aware sizing."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._ownership_recovery_done = False
+
     @staticmethod
     def _rewrite_cap_text(text):
         return (
@@ -73,6 +77,62 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
         return await super()._notify(self._rewrite_cap_text(text))
 
     @staticmethod
+    def _pending_entry(selected, quantity, price, client_order_id, execution_mode):
+        signal = selected.get("signal") or {}
+        return {
+            "symbol": selected.get("symbol"),
+            "underlying": selected.get("underlying") or signal.get("underlying"),
+            "side": selected.get("side"),
+            "quantity": base_runtime._f(quantity),
+            "submitted_price": base_runtime._f(price),
+            "unit": base_runtime._f(selected.get("unit"), 1.0),
+            "tick_size": base_runtime._f(selected.get("tick_size")),
+            "expiry_date_ms": int(base_runtime._f(selected.get("expiryDate"))),
+            "client_order_id": client_order_id,
+            "execution_mode": execution_mode,
+            "created_at_ms": int(base_runtime.time.time() * 1000),
+            "signal_key": str(signal.get("signal_key") or ""),
+            "signal_score": base_runtime._f(signal.get("score")),
+            "signal_strategy": signal.get("strategy") or "ADAPTIVE_TREND",
+            "spot_price": base_runtime._f(signal.get("spot_price")),
+            "option_score": base_runtime._f(selected.get("score")),
+            "entry_mark_iv": base_runtime._f(selected.get("mark_iv")),
+            "entry_delta": base_runtime._f(selected.get("delta")),
+            "entry_gamma": base_runtime._f(selected.get("gamma")),
+            "entry_theta": base_runtime._f(selected.get("theta")),
+            "entry_vega": base_runtime._f(selected.get("vega")),
+            "target_delta": base_runtime._f(selected.get("target_delta")),
+            "target_dte_days": base_runtime._f(selected.get("target_dte_days")),
+            "entry_iv_to_realized": base_runtime._f(selected.get("iv_to_realized")),
+            "entry_skew_ratio": base_runtime._f(selected.get("skew_ratio")),
+            "entry_surface_iv_premium_pct": base_runtime._f(
+                selected.get("surface_iv_premium_pct")
+            ),
+            "entry_net_expected_edge_pct": base_runtime._f(
+                selected.get("net_expected_edge_pct")
+            ),
+            "entry_ioc_net_expected_edge_pct": base_runtime._f(
+                selected.get("ioc_net_expected_edge_pct")
+            ),
+            "entry_flow_score": base_runtime._f(selected.get("flow_score")),
+        }
+
+    def _set_pending_entry(
+        self, selected, quantity, price, client_order_id, execution_mode
+    ):
+        self.state["pending_entry"] = self._pending_entry(
+            selected, quantity, price, client_order_id, execution_mode
+        )
+        self._save_state()
+
+    def _clear_pending_entry(self, client_order_id=None):
+        pending = self.state.get("pending_entry") or {}
+        if client_order_id and pending.get("client_order_id") != client_order_id:
+            return
+        self.state["pending_entry"] = None
+        self._save_state()
+
+    @staticmethod
     def _order_is_terminal(order):
         return str((order or {}).get("status") or "").upper() in {
             "FILLED",
@@ -85,6 +145,9 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
         symbol = selected.get("symbol")
         client_order_id = self._client_order_id("b")
         price_text = self._format_price(limit_price, tick)
+        self._set_pending_entry(
+            selected, quantity, limit_price, client_order_id, "IOC"
+        )
         try:
             response = await self._call(
                 self._client().new_order,
@@ -99,12 +162,18 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
             )
         except base_runtime.BinanceOptionsApiError as exc:
             if not exc.uncertain:
+                self._clear_pending_entry(client_order_id)
                 raise
-            response = await self._call(
-                self._client().query_order,
-                symbol,
-                client_order_id=client_order_id,
-            )
+            try:
+                response = await self._call(
+                    self._client().query_order,
+                    symbol,
+                    client_order_id=client_order_id,
+                )
+            except Exception as query_exc:
+                raise base_runtime.BinanceOptionsApiError(
+                    "OPTIONS_IOC_ORDER_STATUS_UNKNOWN", uncertain=True
+                ) from query_exc
         order = await self._resolve_submitted_order(
             symbol,
             client_order_id,
@@ -131,6 +200,9 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
         maker_price = bid + tick if tick > 0 and bid + tick < ask else bid
         maker_price = max(tick or 1e-12, maker_price)
         maker_client_id = self._client_order_id("m")
+        self._set_pending_entry(
+            selected, quantity, maker_price, maker_client_id, "MAKER"
+        )
         try:
             response = await self._call(
                 self._client().new_order,
@@ -158,6 +230,7 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
                         uncertain=True,
                     ) from query_exc
             elif bool(selected.get("ioc_eligible")):
+                self._clear_pending_entry(maker_client_id)
                 return await self._submit_ioc_entry(
                     selected,
                     quantity,
@@ -165,6 +238,7 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
                     tick,
                 )
             else:
+                self._clear_pending_entry(maker_client_id)
                 raise
 
         order = response if isinstance(response, dict) else {}
@@ -226,7 +300,9 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
         if base_runtime._order_executed_quantity(order) > 0:
             return order, maker_client_id, maker_price, "MAKER"
         if not bool(selected.get("ioc_eligible")):
+            self._clear_pending_entry(maker_client_id)
             return {}, maker_client_id, maker_price, "MAKER_ONLY"
+        self._clear_pending_entry(maker_client_id)
         return await self._submit_ioc_entry(
             selected,
             quantity,
@@ -297,6 +373,7 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
 
         filled_qty = base_runtime._order_executed_quantity(order)
         if filled_qty <= 0:
+            self._clear_pending_entry(client_order_id)
             return self._record_reason(
                 "옵션 메이커 주문이 미체결됐고 IOC 기준 순기대수익도 부족해 추격 진입하지 않았습니다."
             )
@@ -374,6 +451,7 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
         )
 
         self.state["active_position"] = position
+        self.state["pending_entry"] = None
         self.state["last_reason"] = f"{symbol} 옵션 매수 체결"
         self.state["last_error"] = ""
         self._save_state()
@@ -393,6 +471,278 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
             )
         )
         return {"action": "entered", "position": position}
+
+    @staticmethod
+    def _order_client_id(order):
+        return str(
+            (order or {}).get("clientOrderId")
+            or (order or {}).get("client_order_id")
+            or ""
+        )
+
+    @staticmethod
+    def _contract_metadata(exchange_info, symbol):
+        rows = (
+            (exchange_info or {}).get("optionSymbols", [])
+            if isinstance(exchange_info, dict)
+            else base_runtime._rows(exchange_info)
+        )
+        for row in rows:
+            if str((row or {}).get("symbol") or "") != symbol:
+                continue
+            filters = {
+                str(item.get("filterType") or ""): item
+                for item in (row.get("filters") or [])
+                if isinstance(item, dict)
+            }
+            lot = filters.get("LOT_SIZE", {})
+            price_filter = filters.get("PRICE_FILTER", {})
+            return {
+                "symbol": symbol,
+                "underlying": row.get("underlying"),
+                "side": row.get("side")
+                or ("CALL" if str(symbol).endswith("-C") else "PUT"),
+                "unit": base_runtime._f(row.get("unit"), 1.0),
+                "tick_size": base_runtime._f(
+                    row.get("tickSize") or price_filter.get("tickSize")
+                ),
+                "min_qty": base_runtime._f(
+                    row.get("minQty") or lot.get("minQty")
+                ),
+                "expiry_date_ms": int(base_runtime._f(row.get("expiryDate"))),
+            }
+        return None
+
+    async def _activate_recovered_entry(self, pending, order, exchange_quantity):
+        filled_qty = base_runtime._order_executed_quantity(order)
+        managed_qty = min(max(0.0, exchange_quantity), max(0.0, filled_qty))
+        if managed_qty <= 1e-12:
+            self._clear_pending_entry(pending.get("client_order_id"))
+            return None
+        fill_price = base_runtime._order_average_price(
+            order, pending.get("submitted_price")
+        )
+        unit = max(1e-12, base_runtime._f(pending.get("unit"), 1.0))
+        premium = fill_price * managed_qty * unit
+        fee = estimate_option_fee(
+            fill_price,
+            pending.get("spot_price"),
+            managed_qty,
+            unit,
+        )
+        total_cost = premium + fee
+        position = {
+            "symbol": pending.get("symbol"),
+            "underlying": pending.get("underlying"),
+            "side": pending.get("side"),
+            "quantity": managed_qty,
+            "original_quantity": managed_qty,
+            "entry_price": fill_price,
+            "entry_premium_usdt": premium,
+            "entry_fee_usdt": fee,
+            "entry_total_usdt": total_cost,
+            "entry_time_ms": int(
+                order.get("updateTime")
+                or order.get("time")
+                or pending.get("created_at_ms")
+                or base_runtime.time.time() * 1000
+            ),
+            "expiry_date_ms": int(pending.get("expiry_date_ms") or 0),
+            "unit": unit,
+            "tick_size": base_runtime._f(pending.get("tick_size")),
+            "peak_mark": fill_price,
+            "client_order_id": pending.get("client_order_id"),
+            "order_id": order.get("orderId"),
+            "entry_execution_mode": pending.get("execution_mode") or "RECOVERED",
+            "signal_score": base_runtime._f(pending.get("signal_score")),
+            "option_score": base_runtime._f(pending.get("option_score")),
+            "signal_strategy": pending.get("signal_strategy") or "RECOVERED_BOT_ORDER",
+            "entry_mark_iv": base_runtime._f(pending.get("entry_mark_iv")),
+            "entry_delta": base_runtime._f(pending.get("entry_delta")),
+            "entry_gamma": base_runtime._f(pending.get("entry_gamma")),
+            "entry_theta": base_runtime._f(pending.get("entry_theta")),
+            "entry_vega": base_runtime._f(pending.get("entry_vega")),
+            "target_delta": base_runtime._f(pending.get("target_delta")),
+            "target_dte_days": base_runtime._f(pending.get("target_dte_days")),
+            "entry_iv_to_realized": base_runtime._f(
+                pending.get("entry_iv_to_realized")
+            ),
+            "entry_skew_ratio": base_runtime._f(pending.get("entry_skew_ratio")),
+            "entry_surface_iv_premium_pct": base_runtime._f(
+                pending.get("entry_surface_iv_premium_pct")
+            ),
+            "entry_net_expected_edge_pct": base_runtime._f(
+                pending.get("entry_net_expected_edge_pct")
+            ),
+            "entry_ioc_net_expected_edge_pct": base_runtime._f(
+                pending.get("entry_ioc_net_expected_edge_pct")
+            ),
+            "entry_flow_score": base_runtime._f(pending.get("entry_flow_score")),
+            "status": "OPEN",
+            "recovered_after_restart": True,
+        }
+        self.state["cash_bankroll_usdt"] = max(
+            0.0,
+            base_runtime._f(self.state.get("cash_bankroll_usdt")) - total_cost,
+        )
+        self.state["active_position"] = position
+        self.state["pending_entry"] = None
+        signal_key = str(pending.get("signal_key") or "")
+        if signal_key:
+            consumed = list(self.state.get("consumed_signal_keys") or [])
+            if signal_key not in consumed:
+                consumed.append(signal_key)
+            self.state["consumed_signal_keys"] = consumed[-200:]
+        self.state["last_reason"] = f"{pending.get('symbol')} 봇 옵션 포지션 재연결"
+        self.state["last_error"] = ""
+        self._save_state()
+        await self._notify(
+            "♻️ 재시작 후 봇 옵션 포지션을 주문 ID로 확인해 자동 관리에 다시 연결했습니다.\n"
+            f"종목: {pending.get('symbol')} | 관리 수량 {managed_qty:g}"
+        )
+        return {"action": "recovered", "position": position}
+
+    async def _resolve_pending_entry(self, pending, snapshot):
+        symbol = str(pending.get("symbol") or "")
+        client_order_id = str(pending.get("client_order_id") or "")
+        if not symbol or not client_order_id.startswith(base_runtime.BOT_CLIENT_PREFIX):
+            return self._record_reason("OPTIONS_PENDING_ENTRY_INVALID", error=True)
+        try:
+            order = await self._call(
+                self._client().query_order,
+                symbol,
+                client_order_id=client_order_id,
+            )
+            if not self._order_is_terminal(order):
+                await self._call(
+                    self._client().cancel_order,
+                    symbol,
+                    client_order_id=client_order_id,
+                )
+                order = await self._call(
+                    self._client().query_order,
+                    symbol,
+                    client_order_id=client_order_id,
+                )
+        except Exception as exc:
+            return self._record_reason(
+                f"옵션 재시작 주문 확인 실패: {exc}", error=True
+            )
+        exchange_quantity = 0.0
+        for row in snapshot.get("positions") or []:
+            if str(row.get("symbol") or "") == symbol:
+                exchange_quantity = abs(base_runtime._position_quantity(row))
+                break
+        if base_runtime._order_executed_quantity(order) <= 1e-12:
+            if self._order_is_terminal(order):
+                self._clear_pending_entry(client_order_id)
+                return None
+            return self._record_reason(
+                "봇 옵션 진입 주문이 아직 미확정 상태라 신규 주문을 차단했습니다."
+            )
+        return await self._activate_recovered_entry(
+            pending, order, exchange_quantity
+        )
+
+    async def _recover_legacy_bot_position(self, snapshot):
+        exchange_info = None
+        for row in snapshot.get("positions") or []:
+            symbol = str(row.get("symbol") or "")
+            exchange_quantity = abs(base_runtime._position_quantity(row))
+            if not symbol or exchange_quantity <= 1e-12:
+                continue
+            try:
+                trades = base_runtime._rows(
+                    await self._call(self._client().user_trades, symbol, limit=100)
+                )
+                order_cache = {}
+                bot_buys = []
+                bot_sell_qty = 0.0
+                for trade in trades:
+                    order_id = trade.get("orderId")
+                    if order_id not in order_cache:
+                        order_cache[order_id] = await self._call(
+                            self._client().query_order, symbol, order_id=order_id
+                        )
+                    order = order_cache[order_id] or {}
+                    if not self._order_client_id(order).startswith(
+                        base_runtime.BOT_CLIENT_PREFIX
+                    ):
+                        continue
+                    qty = abs(
+                        base_runtime._f(trade.get("quantity") or trade.get("qty"))
+                    )
+                    if str(trade.get("side") or "").upper() == "BUY":
+                        bot_buys.append((trade, order, qty))
+                    elif str(trade.get("side") or "").upper() == "SELL":
+                        bot_sell_qty += qty
+                owned_qty = max(0.0, sum(item[2] for item in bot_buys) - bot_sell_qty)
+                if owned_qty <= 1e-12:
+                    continue
+                if exchange_info is None:
+                    exchange_info = await self._get_exchange_info()
+                metadata = self._contract_metadata(exchange_info, symbol)
+                if not metadata or not metadata.get("expiry_date_ms"):
+                    continue
+                managed_qty = min(exchange_quantity, owned_qty)
+                weighted = sum(
+                    base_runtime._f(trade.get("price")) * qty
+                    for trade, _, qty in bot_buys
+                )
+                entry_price = weighted / max(sum(item[2] for item in bot_buys), 1e-12)
+                first_trade, first_order, _ = bot_buys[0]
+                pending = {
+                    **metadata,
+                    "quantity": managed_qty,
+                    "submitted_price": entry_price,
+                    "client_order_id": self._order_client_id(first_order),
+                    "execution_mode": "LEGACY_RECOVERY",
+                    "created_at_ms": int(
+                        first_trade.get("time")
+                        or first_order.get("updateTime")
+                        or base_runtime.time.time() * 1000
+                    ),
+                    "spot_price": 0.0,
+                    "signal_strategy": "RECOVERED_BOT_ORDER",
+                }
+                synthetic_order = {
+                    "status": "FILLED",
+                    "executedQty": managed_qty,
+                    "avgPrice": entry_price,
+                    "orderId": first_order.get("orderId"),
+                    "updateTime": pending["created_at_ms"],
+                }
+                return await self._activate_recovered_entry(
+                    pending, synthetic_order, exchange_quantity
+                )
+            except Exception as exc:
+                base_runtime.logger.info(
+                    "Options ownership check skipped for %s: %s", symbol, exc
+                )
+        return None
+
+    async def _recover_runtime_ownership(self):
+        if self._ownership_recovery_done:
+            return None
+        if not self.config().get("enabled") and not self.state.get("pending_entry"):
+            self._ownership_recovery_done = True
+            return None
+        try:
+            snapshot = await self._private_snapshot()
+        except Exception as exc:
+            return self._record_reason(
+                f"옵션 재시작 소유권 확인 실패: {exc}", error=True
+            )
+        pending = self.state.get("pending_entry") or None
+        if pending:
+            result = await self._resolve_pending_entry(pending, snapshot)
+            if result is not None:
+                if self.state.get("active_position"):
+                    self._ownership_recovery_done = True
+                return result
+        recovered = await self._recover_legacy_bot_position(snapshot)
+        self._ownership_recovery_done = True
+        return recovered
 
 
 __all__ = ("OptionsTradingService",)

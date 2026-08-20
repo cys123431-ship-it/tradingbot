@@ -2782,7 +2782,7 @@ class SignalScannerMixin:
         self.coin_selector_last_run_ts = now
         warning = report.get('concentration_warning')
         if warning:
-            logger.warning(
+            logger.info(
                 f"CoinSelector concentration warning: {warning.get('key')}={warning.get('value')} "
                 f"{warning.get('share_pct')}%"
             )

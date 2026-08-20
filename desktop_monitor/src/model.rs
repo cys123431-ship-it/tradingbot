@@ -120,7 +120,7 @@ pub struct WireSnapshot {
 pub enum StreamEvent {
     Connecting,
     Connected,
-    Data(WireSnapshot),
+    Data(Box<WireSnapshot>),
     Error(String),
 }
 

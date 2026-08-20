@@ -5,29 +5,61 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import threading
 import time
+from collections import deque
+from email.utils import parsedate_to_datetime
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
 class BinanceOptionsApiError(RuntimeError):
-    def __init__(self, message, *, code=None, status=None, uncertain=False):
+    def __init__(
+        self,
+        message,
+        *,
+        code=None,
+        status=None,
+        uncertain=False,
+        rate_limited=False,
+        retry_after=0.0,
+    ):
         super().__init__(str(message))
         self.code = code
         self.status = status
         self.uncertain = bool(uncertain)
+        self.rate_limited = bool(rate_limited)
+        self.retry_after = max(0.0, float(retry_after or 0.0))
 
 
 class BinanceOptionsClient:
     BASE_URL = "https://eapi.binance.com"
 
-    def __init__(self, api_key="", secret_key="", *, timeout=10, base_url=None):
+    def __init__(
+        self,
+        api_key="",
+        secret_key="",
+        *,
+        timeout=10,
+        base_url=None,
+        request_limit_per_minute=300,
+    ):
         self.api_key = str(api_key or "").strip()
         self.secret_key = str(secret_key or "").strip()
         self.timeout = max(3, int(timeout or 10))
         self.base_url = str(base_url or self.BASE_URL).rstrip("/")
         self._server_offset_ms = 0
+        # Binance currently advertises 400 request-weight/minute for EAPI.
+        # Keep a 25% reserve for status/position protection calls and for any
+        # process sharing the same public IP.  This limiter is process-wide for
+        # this client and protects concurrent asyncio.to_thread() calls too.
+        self._request_limit_per_minute = max(
+            60, min(300, int(request_limit_per_minute or 300))
+        )
+        self._request_times = deque()
+        self._rate_lock = threading.Lock()
+        self._cooldown_until = 0.0
 
     @property
     def authenticated(self):
@@ -42,8 +74,48 @@ class BinanceOptionsClient:
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise BinanceOptionsApiError("OPTIONS_API_INVALID_JSON") from exc
 
+    @staticmethod
+    def _retry_after_seconds(headers):
+        value = headers.get("Retry-After") if headers else None
+        if not value:
+            return 0.0
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            try:
+                target = parsedate_to_datetime(str(value)).timestamp()
+                return max(0.0, target - time.time())
+            except (TypeError, ValueError, OverflowError):
+                return 0.0
+
+    def _acquire_request_slot(self):
+        while True:
+            with self._rate_lock:
+                now = time.monotonic()
+                while self._request_times and now - self._request_times[0] >= 60.0:
+                    self._request_times.popleft()
+                wait_for = max(0.0, self._cooldown_until - now)
+                if len(self._request_times) >= self._request_limit_per_minute:
+                    wait_for = max(
+                        wait_for,
+                        60.0 - (now - self._request_times[0]) + 0.01,
+                    )
+                if wait_for <= 0:
+                    self._request_times.append(now)
+                    return
+            time.sleep(min(wait_for, 1.0))
+
+    def _apply_rate_backoff(self, seconds):
+        duration = max(1.0, float(seconds or 60.0))
+        with self._rate_lock:
+            self._cooldown_until = max(
+                self._cooldown_until,
+                time.monotonic() + duration,
+            )
+
     def _request(self, method, path, params=None, *, signed=False):
         method = str(method or "GET").upper()
+        self._acquire_request_slot()
         query = dict(params or {})
         if signed:
             if not self.authenticated:
@@ -80,11 +152,29 @@ class BinanceOptionsClient:
                 parsed = {}
             message = parsed.get("msg") if isinstance(parsed, dict) else None
             code = parsed.get("code") if isinstance(parsed, dict) else None
+            error_text = str(message or "").lower()
+            rate_limited = (
+                exc.code in {418, 429}
+                or code == -1003
+                or "too many request" in error_text
+            )
+            retry_after = self._retry_after_seconds(getattr(exc, "headers", None))
+            if rate_limited:
+                retry_after = retry_after or 60.0
+                self._apply_rate_backoff(retry_after)
+            # A 5XX/timeout response to a write does not prove that Binance
+            # rejected it.  Callers must query by the stable clientOrderId and
+            # must never blindly submit a replacement.
+            uncertain = method in {"POST", "PUT", "DELETE"} and (
+                int(exc.code or 0) >= 500 or int(exc.code or 0) in {408, 409, 425}
+            )
             raise BinanceOptionsApiError(
                 message or f"OPTIONS_API_HTTP_{exc.code}",
                 code=code,
                 status=exc.code,
-                uncertain=False,
+                uncertain=uncertain,
+                rate_limited=rate_limited,
+                retry_after=retry_after,
             ) from exc
         except (TimeoutError, URLError, OSError) as exc:
             uncertain = method in {"POST", "PUT", "DELETE"}

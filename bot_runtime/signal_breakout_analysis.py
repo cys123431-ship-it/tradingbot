@@ -2665,7 +2665,7 @@ class SignalBreakoutAnalysisMixin:
             )
         except Exception:
             logger.debug("restricted symbol trace skipped", exc_info=True)
-        logger.warning(
+        logger.info(
             "[UTBREAK_RESTRICTED_SYMBOL] source=%s raw=%s canonical=%s reason=%s",
             source,
             symbol,

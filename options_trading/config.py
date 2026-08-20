@@ -15,7 +15,8 @@ def default_options_config() -> dict:
         "capital_limit_usdt": OPTIONS_CAPITAL_LIMIT_USDT,
         "entry_fraction": 1.00,
         "scan_interval_seconds": 300,
-        "manage_interval_seconds": 30,
+        "manage_interval_seconds": 10,
+        "manual_scan_cooldown_seconds": 60,
         "underlyings": [
             "BTCUSDT",
             "ETHUSDT",
@@ -124,7 +125,14 @@ def normalize_options_config(raw=None) -> dict:
     # the absolute sleeve ceiling enforced by build_long_option_entry_plan().
     cfg["entry_fraction"] = 1.00
     cfg["scan_interval_seconds"] = _int(cfg.get("scan_interval_seconds"), 300, 60, 3600)
-    cfg["manage_interval_seconds"] = _int(cfg.get("manage_interval_seconds"), 30, 15, 300)
+    # Long-option protection is software-managed.  Bound the interval so a
+    # stale persisted 30-second value cannot leave a stop unattended for long.
+    cfg["manage_interval_seconds"] = _int(
+        cfg.get("manage_interval_seconds"), 10, 5, 10
+    )
+    cfg["manual_scan_cooldown_seconds"] = _int(
+        cfg.get("manual_scan_cooldown_seconds"), 60, 15, 300
+    )
     underlyings = cfg.get("underlyings")
     if migrating_v2 and list(underlyings or []) == [
         "BTCUSDT",

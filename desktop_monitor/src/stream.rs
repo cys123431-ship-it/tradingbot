@@ -82,7 +82,7 @@ pub fn spawn(tx: Sender<StreamEvent>, stop: Arc<AtomicBool>) {
                     Ok(line) if !line.trim().is_empty() => {
                         match serde_json::from_str::<WireSnapshot>(&line) {
                             Ok(snapshot) => {
-                                if tx.send(StreamEvent::Data(snapshot)).is_err() {
+                                if tx.send(StreamEvent::Data(Box::new(snapshot))).is_err() {
                                     let _ = child.kill();
                                     return;
                                 }
