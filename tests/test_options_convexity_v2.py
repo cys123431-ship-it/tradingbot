@@ -70,6 +70,7 @@ def test_net_edge_includes_premium_fees_and_exit_friction():
 def test_v1_defaults_migrate_to_v2_but_operator_override_is_preserved():
     migrated = normalize_options_config(
         {
+            "strategy_profile_version": "adaptive_convexity_trend_v2",
             "take_profit_pct": 0.80,
             "stop_loss_pct": 0.45,
             "trail_activation_pct": 0.35,
@@ -81,9 +82,19 @@ def test_v1_defaults_migrate_to_v2_but_operator_override_is_preserved():
     assert migrated["take_profit_pct"] == pytest.approx(3.0)
     assert migrated["stop_loss_pct"] == pytest.approx(0.55)
     assert "XRPUSDT" in migrated["underlyings"]
+    assert migrated["adaptive_convexity_v2_migration_complete"] is True
 
     custom = normalize_options_config({"stop_loss_pct": 0.35})
     assert custom["stop_loss_pct"] == pytest.approx(0.35)
+    customized_after_migration = normalize_options_config(
+        {
+            **migrated,
+            "stop_loss_pct": 0.45,
+            "underlyings": ["BTCUSDT"],
+        }
+    )
+    assert customized_after_migration["stop_loss_pct"] == pytest.approx(0.45)
+    assert customized_after_migration["underlyings"] == ["BTCUSDT"]
 
 
 def test_surface_outlier_and_strong_sell_flow_are_hard_rejections():

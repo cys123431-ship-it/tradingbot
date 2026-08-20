@@ -92,11 +92,11 @@ def normalize_options_config(raw=None) -> dict:
     if supplied:
         cfg.update(supplied)
 
-    migrating_v2 = bool(
-        supplied
-        and supplied.get("strategy_profile_version")
-        != "adaptive_convexity_trend_v2"
-    )
+    # Configuration startup deep-merges new defaults before normalization.
+    # Therefore profile_version alone cannot prove that the persisted v1
+    # values were migrated. This marker is intentionally not part of the
+    # defaults, so it is written only after the one-time migration completes.
+    migrating_v2 = supplied.get("adaptive_convexity_v2_migration_complete") is not True
     cfg["strategy_profile_version"] = "adaptive_convexity_trend_v2"
     if migrating_v2:
         legacy_exit_defaults = {
@@ -115,6 +115,7 @@ def normalize_options_config(raw=None) -> dict:
                 unchanged_legacy_default = False
             if unchanged_legacy_default:
                 cfg[key] = current_defaults[key]
+    cfg["adaptive_convexity_v2_migration_complete"] = True
 
     cfg["enabled"] = bool(cfg.get("enabled", False))
     # This sleeve is deliberately fixed to the user's hard capital ceiling.
