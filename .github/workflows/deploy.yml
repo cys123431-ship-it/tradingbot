@@ -5,7 +5,27 @@ on:
     branches: [ main ]
 
 jobs:
+  monitor-check:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust monitor toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Validate Windows desktop monitor
+        shell: pwsh
+        run: |
+          cargo fmt --manifest-path desktop_monitor/Cargo.toml --check
+          cargo test --manifest-path desktop_monitor/Cargo.toml --locked
+          cargo clippy --manifest-path desktop_monitor/Cargo.toml --locked -- -D warnings
+
   deploy:
+    needs: monitor-check
     runs-on: ubuntu-latest
 
     steps:
@@ -17,11 +37,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Set up Rust monitor toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
       - name: Static smoke tests
         run: |
           set -euo pipefail
@@ -31,10 +46,6 @@ jobs:
           python -m pip check
           python -c "import emas; print('runtime import ok')"
           python -m pytest -q
-          cargo fmt --manifest-path desktop_monitor/Cargo.toml --check
-          cargo test --manifest-path desktop_monitor/Cargo.toml --locked
-          cargo clippy --manifest-path desktop_monitor/Cargo.toml --locked -- -D warnings
-
       - name: Deploy to Azure server
         uses: appleboy/ssh-action@v1.0.3
         env:
