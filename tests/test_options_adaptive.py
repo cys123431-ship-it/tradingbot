@@ -3,8 +3,6 @@ import math
 import time
 from pathlib import Path
 
-import pytest
-
 from options_trading import OptionsTradingService
 from options_trading.config import OPTIONS_CAPITAL_LIMIT_USDT, normalize_options_config
 from options_trading.strategy import (
@@ -37,13 +35,13 @@ def _squeeze_rows(count=100):
     return rows
 
 
-def _score(*, delta=0.45, iv=0.60, peer_iv=0.60, amount=1000, bid=9.8, ask=10.0, signal=None):
+def _score(*, delta=0.45, iv=0.60, peer_iv=0.60, amount=1000, bid=4.8, ask=5.0, signal=None):
     return score_option_contract(
-        {"symbol": "ETH-X-C", "dte_days": 7.0, "target_dte_days": 7.0, "target_delta": 0.45, "min_qty": 0.01},
+        {"symbol": "ETH-X-C", "side": "CALL", "strikePrice": "100", "dte_days": 7.0, "target_dte_days": 7.0, "target_delta": 0.45, "min_qty": 0.01},
         [{"delta": str(delta), "markIV": str(iv), "gamma": "0.02", "theta": "-0.1", "vega": "0.4"}],
         [{"amount": str(amount), "bidPrice": str(bid), "askPrice": str(ask)}],
         {"bids": [[str(bid), "10"]], "asks": [[str(ask), "10"]]},
-        signal or {"score": 0.70, "realized_volatility": 0.50, "strategy": "ADAPTIVE_TREND"},
+        signal or {"score": 0.70, "spot_price": 100.0, "realized_volatility": 0.50, "forecast_volatility": 0.50, "strategy": "ADAPTIVE_TREND"},
         normalize_options_config({"min_quote_volume_usdt": 50}),
         skew_mark_payload=[{"markIV": str(peer_iv)}],
     )
@@ -152,17 +150,17 @@ class _Client:
         ]}
 
     def mark_price(self, symbol):
-        return [{"symbol": symbol, "markPrice": "19990" if "EXP" in symbol else "9.9", "markIV": "0.04", "delta": "-0.45" if symbol.endswith("-P") else "0.45", "gamma": "0.01", "theta": "-0.05", "vega": "0.2"}]
+        return [{"symbol": symbol, "markPrice": "19990" if "EXP" in symbol else "0.49", "markIV": "0.04", "delta": "-0.45" if symbol.endswith("-P") else "0.45", "gamma": "0.01", "theta": "-0.05", "vega": "0.2"}]
 
     def ticker(self, symbol):
         if "EXP" in symbol:
             return [{"amount": "1000", "bidPrice": "19980", "askPrice": "20000"}]
-        return [{"amount": "1000", "bidPrice": "9.8", "askPrice": "10.0"}]
+        return [{"amount": "1000", "bidPrice": "0.48", "askPrice": "0.50"}]
 
     def depth(self, symbol, limit=20):
         if "EXP" in symbol:
             return {"bids": [["19980", "10"]], "asks": [["20000", "10"]]}
-        return {"bids": [["9.8", "10"]], "asks": [["10.0", "10"]]}
+        return {"bids": [["0.48", "10"]], "asks": [["0.50", "10"]]}
 
     def new_order(self, symbol, side, order_type, quantity, **kwargs):
         self.orders.append({"symbol": symbol, "side": side, "quantity": quantity, **kwargs})
@@ -213,7 +211,7 @@ def test_budget_filter_skips_unaffordable_contract_before_selection(tmp_path):
     assert order["symbol"] == "ETH-AFF-C"
     assert order["side"] == "BUY" and order["reduce_only"] is False
     assert service.state["active_position"]["entry_total_usdt"] <= min(24.0, OPTIONS_CAPITAL_LIMIT_USDT)
-    assert service.state["last_scan_diagnostics"]["contract_rejections"].get("MINIMUM_OPTION_CONTRACT_EXCEEDS_AVAILABLE_BANKROLL", 0) >= 1
+    assert service.state["last_scan_diagnostics"]["contract_rejections"].get("OPTION_NET_EXPECTED_EDGE_TOO_LOW", 0) >= 1
     assert service.state["recent_scan_outcomes"][-1] == "ORDERABLE_CANDIDATE"
 
 
@@ -232,7 +230,7 @@ def test_options_telegram_status_displays_rejection_stats_and_adaptive_strategy(
     source = (Path(__file__).parents[1] / "bot_runtime" / "controller_options.py").read_text(encoding="utf-8")
     assert "최근 {window}회 옵션 스캔 결과" in source
     assert "scan_rejection_stats" in source
-    assert "Adaptive Trend" in source and "Low-IV Squeeze" in source
+    assert "Adaptive Convexity Trend v2" in source and "Low-IV Squeeze" in source
 
 
 def test_adaptive_exit_is_additive_to_legacy_tp_sl_and_sell_exit_remains_reduce_only():

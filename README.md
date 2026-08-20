@@ -194,7 +194,7 @@ LXR은 완료된 `15m` 봉에서 2.2ATR 이상의 단기 가격 충격, 평시 �
 ├── utbreakout/                     # UTBreak, EV, 장세, 방향, RSPT 등 전략 모듈
 ├── trading_safety/                 # 주문 게이트웨이, 상태 저장, 조정, 보호 주문
 ├── prediction/                     # Prediction/Predict.fun 보조 모듈
-├── options_trading/                # Binance European Options 전용 전략·20 USDT 원장·API 실행
+├── options_trading/                # Binance European Options 전용 Adaptive Convexity v2·100 USDT 원장·API 실행
 ├── scripts/                        # 운영, 백테스트, 리서치 도구
 ├── tests/                          # 전략·주문·안전·배포 회귀 테스트
 ├── tradingview/                    # TradingView 참고 스크립트

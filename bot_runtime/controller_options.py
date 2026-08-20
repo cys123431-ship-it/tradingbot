@@ -118,7 +118,8 @@ class ControllerOptionsMixin:
                     "최근 후보:",
                     f"{candidate.get('symbol')} · {candidate.get('strategy') or 'ADAPTIVE_TREND'} · 신호 {_safe_number(candidate.get('signal_score')):+.2f}",
                     f"Delta {_safe_number(candidate.get('delta')):.2f}/{_safe_number(candidate.get('target_delta')):.2f} · DTE {_safe_number(candidate.get('dte_days')):.1f}/{_safe_number(candidate.get('target_dte_days')):.1f}일",
-                    f"Spread {_safe_number(candidate.get('spread_pct')) * 100:.1f}% · IV/RV {_safe_number(candidate.get('iv_to_realized')):.2f} · 계획비용 {_safe_number(candidate.get('planned_cost_usdt')):.2f} USDT",
+                    f"Spread {_safe_number(candidate.get('spread_pct')) * 100:.1f}% · IV/RV {_safe_number(candidate.get('iv_to_realized')):.2f} · 순기대수익 {_safe_number(candidate.get('net_expected_edge_pct')) * 100:+.1f}%",
+                    f"IV표면 프리미엄 {_safe_number(candidate.get('surface_iv_premium_pct')) * 100:+.1f}% · 흐름 {_safe_number(candidate.get('flow_score')):+.2f} · 투입 {_safe_number(candidate.get('entry_fraction')) * 100:.0f}%/{_safe_number(candidate.get('planned_cost_usdt')):.2f} USDT",
                 ]
             )
 
@@ -132,6 +133,8 @@ class ControllerOptionsMixin:
                 "DTE",
                 "DELTA",
                 "IV",
+                "EDGE",
+                "FLOW",
                 "SPREAD",
                 "LIQUIDITY",
                 "BUDGET",
@@ -227,12 +230,12 @@ class ControllerOptionsMixin:
             if action == "strategy":
                 await self._edit_options_message(
                     query,
-                    "📈 옵션 전략\n"
-                    "Adaptive Trend는 기존 1시간·4시간 추세 구조를 유지하면서 신호강도에 따라 DTE·Delta 목표를 바꿉니다.\n"
+                    "📈 Adaptive Convexity Trend v2\n"
+                    "1시간·4시간 다중속도 추세와 Low-IV Squeeze를 결합하고, HAR식 다중기간 실현변동성으로 신호강도에 맞는 DTE·Delta를 고릅니다.\n"
                     "Low-IV Squeeze는 ATR/실현변동성 압축 뒤 거래량·모멘텀을 동반한 상·하방 돌파만 CALL/PUT 후보로 봅니다.\n"
                     f"{OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT·최소수량·수수료를 먼저 통과한 계약만 "
-                    "Delta·DTE·IV/RV·skew·Spread·유동성·Greeks 점수로 비교합니다.\n"
-                    "기존 +80% TP, -45% SL, 추적청산, 만기·시간 제한은 유지하고 추세붕괴·IV 급락·Theta/DTE 부담을 보조 청산에 사용합니다.\n"
+                    "순기대수익·Delta·DTE·IV/RV·IV표면·skew·Spread·최근 체결흐름·유동성·Greeks로 비교합니다.\n"
+                    "메이커 우선 체결 뒤 순기대수익이 남을 때만 IOC로 전환합니다. 고정 +80% 익절 대신 단계형 추적청산으로 큰 수익을 열어 두며 -55% 프리미엄 손절과 만기·시간 제한은 유지합니다.\n"
                     "옵션 매수만 허용하므로 신규 진입용 SELL/네이키드 매도는 만들지 않습니다.",
                 )
                 return

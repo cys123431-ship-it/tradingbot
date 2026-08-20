@@ -1,7 +1,7 @@
 """Adaptive option runtime layered on the existing fail-closed execution service.
 
-The base runtime continues to own order submission, reconciliation, the $20 hard
-cap, long-only entry semantics and reduce-only exits.  This subclass changes
+The base runtime continues to own reconciliation, the fixed sleeve cap,
+long-only entry semantics and reduce-only exits. This subclass changes
 only signal/candidate selection, scan diagnostics and optional early exits.
 """
 
@@ -17,6 +17,7 @@ from .config import OPTIONS_CAPITAL_LIMIT_USDT
 from .risk import build_long_option_entry_plan
 from .strategy import (
     choose_underlying_signal,
+    find_surface_peers,
     find_skew_peer,
     score_option_contract,
     shortlist_option_contracts_with_diagnostics,
@@ -29,10 +30,12 @@ SCAN_OUTCOME_LABELS = {
     "DIRECTION_SIGNAL": "방향 신호 부족",
     "DTE": "DTE 부적합",
     "DELTA": "Delta 부적합",
-    "IV": "IV/IV-RV 과열",
+    "IV": "IV/IV-RV·표면 과열",
+    "EDGE": "비용 차감 후 기대수익 부족",
+    "FLOW": "옵션 매수 흐름 반대",
     "SPREAD": "Spread 초과",
     "LIQUIDITY": "유동성 부족",
-    "BUDGET": "20 USDT 예산/최소수량 문제",
+    "BUDGET": f"{OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT 예산/최소수량 문제",
     "EXISTING_POSITION": "기존 옵션 포지션",
     "OPEN_ORDER": "기존 미체결 옵션 주문",
     "CAN_TRADE": "옵션 거래 권한/API 상태",
@@ -48,6 +51,10 @@ def _scan_category(reason):
         return "DELTA"
     if "IV" in text:
         return "IV"
+    if "EXPECTED_EDGE" in text:
+        return "EDGE"
+    if "FLOW" in text:
+        return "FLOW"
     if "SPREAD" in text or "ORDERBOOK" in text:
         return "SPREAD"
     if "VOLUME" in text or "DEPTH" in text or "LIQUID" in text:
@@ -123,20 +130,49 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
         )
         return result
 
+    async def _cached_mark(self, symbol):
+        cache = getattr(self, "_adaptive_mark_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._adaptive_mark_cache = cache
+        if symbol not in cache:
+            cache[symbol] = await self._call(self._client().mark_price, symbol)
+        return cache[symbol]
+
     async def _scan_contract_adaptive(self, contract, signal, cfg, snapshot, exchange_info):
         symbol = contract.get("symbol")
+        recent_trades_fn = getattr(self._client(), "recent_trades", None)
         mark, ticker, depth = await asyncio.gather(
-            self._call(self._client().mark_price, symbol),
+            self._cached_mark(symbol),
             self._call(self._client().ticker, symbol),
             self._call(self._client().depth, symbol, 20),
         )
+        recent_trades = []
+        if callable(recent_trades_fn):
+            try:
+                recent_trades = await self._call(recent_trades_fn, symbol, 100)
+            except Exception as exc:
+                logger.debug("Option recent trades unavailable for %s: %s", symbol, exc)
         peer = find_skew_peer(exchange_info, contract)
         peer_mark = None
         if peer and peer.get("symbol"):
             try:
-                peer_mark = await self._call(self._client().mark_price, peer.get("symbol"))
+                peer_mark = await self._cached_mark(peer.get("symbol"))
             except Exception as exc:
                 logger.debug("Option skew peer mark unavailable for %s: %s", symbol, exc)
+
+        surface_marks = []
+        surface_peers = find_surface_peers(exchange_info, contract, max_peers=4)
+        if surface_peers:
+            peer_results = await asyncio.gather(
+                *(self._cached_mark(row.get("symbol")) for row in surface_peers),
+                return_exceptions=True,
+            )
+            surface_marks = [
+                payload
+                for payload in peer_results
+                if not isinstance(payload, Exception)
+            ]
 
         scored = score_option_contract(
             contract,
@@ -146,6 +182,8 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
             signal,
             cfg,
             skew_mark_payload=peer_mark,
+            surface_mark_payloads=surface_marks,
+            recent_trades=recent_trades,
         )
         if not scored.get("accepted"):
             return None, _scan_category(scored.get("reason")), scored.get("reason")
@@ -166,7 +204,10 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
             min_qty=contract.get("min_qty") or contract.get("minQty"),
             step_size=contract.get("step_size") or contract.get("minQty"),
             cash_bankroll_usdt=bankroll,
-            entry_fraction=cfg.get("entry_fraction", 0.90),
+            entry_fraction=min(
+                base_runtime._f(cfg.get("entry_fraction"), 1.00),
+                base_runtime._f(scored.get("entry_fraction"), 1.00),
+            ),
             capital_limit_usdt=OPTIONS_CAPITAL_LIMIT_USDT,
         )
         if not plan.get("accepted"):
@@ -182,7 +223,7 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
         if not rejections:
             return "OTHER"
         counts = Counter(rejections)
-        priority = ["BUDGET", "LIQUIDITY", "SPREAD", "IV", "DELTA", "DTE", "DIRECTION_SIGNAL", "API", "OTHER"]
+        priority = ["BUDGET", "LIQUIDITY", "SPREAD", "EDGE", "FLOW", "IV", "DELTA", "DTE", "DIRECTION_SIGNAL", "API", "OTHER"]
         best_count = max(counts.values())
         tied = {key for key, value in counts.items() if value == best_count}
         for key in priority:
@@ -192,6 +233,7 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
 
     async def _scan_and_maybe_enter(self):
         cfg = self.config()
+        self._adaptive_mark_cache = {}
         diagnostics = {"signal_rejections": {}, "contract_rejections": {}, "orderable_candidates": 0}
         try:
             snapshot = await self._private_snapshot()
@@ -275,7 +317,7 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
                 outcome = self._dominant_rejection(scan_rejections)
                 self._record_scan_outcome(outcome, diagnostics=diagnostics)
                 return self._record_reason(
-                    "Adaptive Trend/Squeeze 후보 중 20 USDT 예산·DTE·Delta·IV·Spread·유동성 안전조건을 모두 만족한 계약이 없습니다.",
+                    f"Adaptive Convexity Trend 후보 중 {OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT 예산·순기대수익·DTE·Delta·IV표면·Spread·흐름·유동성 조건을 모두 만족한 계약이 없습니다.",
                     candidate=None,
                 )
 
@@ -298,6 +340,11 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
                 "target_dte_days": base_runtime._f(selected.get("target_dte_days")),
                 "iv_to_realized": base_runtime._f(selected.get("iv_to_realized")),
                 "skew_ratio": base_runtime._f(selected.get("skew_ratio")),
+                "surface_iv_premium_pct": base_runtime._f(selected.get("surface_iv_premium_pct")),
+                "net_expected_edge_pct": base_runtime._f(selected.get("net_expected_edge_pct")),
+                "ioc_net_expected_edge_pct": base_runtime._f(selected.get("ioc_net_expected_edge_pct")),
+                "flow_score": base_runtime._f(selected.get("flow_score")),
+                "entry_fraction": base_runtime._f(selected.get("entry_fraction"), 1.0),
                 "planned_cost_usdt": base_runtime._f(plan.get("total_entry_cost_usdt")),
             }
             self.state["last_candidate"] = candidate_summary
@@ -330,6 +377,10 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
                 "target_dte_days": base_runtime._f(selected.get("target_dte_days")),
                 "entry_iv_to_realized": base_runtime._f(selected.get("iv_to_realized")),
                 "entry_skew_ratio": base_runtime._f(selected.get("skew_ratio")),
+                "entry_surface_iv_premium_pct": base_runtime._f(selected.get("surface_iv_premium_pct")),
+                "entry_net_expected_edge_pct": base_runtime._f(selected.get("net_expected_edge_pct")),
+                "entry_ioc_net_expected_edge_pct": base_runtime._f(selected.get("ioc_net_expected_edge_pct")),
+                "entry_flow_score": base_runtime._f(selected.get("flow_score")),
             }
         )
         self.state["active_position"] = position
@@ -356,6 +407,29 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
             self._save_state()
         except Exception as exc:
             logger.debug("Adaptive option exit signal refresh failed for %s: %s", underlying, exc)
+
+    @staticmethod
+    def _adaptive_trailing_exit(entry_price, peak_price, mark_price):
+        """Let convex winners run while progressively locking open profit."""
+
+        if entry_price <= 0 or peak_price <= entry_price:
+            return False
+        peak_return = peak_price / entry_price - 1.0
+        tiers = (
+            # activation return, maximum peak drawdown, minimum locked return
+            (2.00, 0.30, 0.80),
+            (1.00, 0.35, 0.35),
+            (0.50, 0.40, 0.10),
+        )
+        for activation, drawdown, locked_return in tiers:
+            if peak_return < activation:
+                continue
+            trailing_floor = max(
+                peak_price * (1.0 - drawdown),
+                entry_price * (1.0 + locked_return),
+            )
+            return mark_price <= trailing_floor
+        return False
 
     async def _manage_active_position(self, *, force_exit=False):
         if force_exit:
@@ -393,6 +467,15 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
             expiry_hours = (expiry_ms - now_ms) / 3_600_000.0 if expiry_ms else 9999.0
 
             peak = max(base_runtime._f(position.get("peak_mark"), entry_price), mark_price)
+            if self._adaptive_trailing_exit(entry_price, peak, mark_price):
+                managed_qty = min(exchange_qty, tracked_qty)
+                if managed_qty > 1e-12 and bid > 0:
+                    return await self._exit_position(
+                        position,
+                        managed_qty,
+                        bid,
+                        "OPTION_ADAPTIVE_CONVEX_TRAIL",
+                    )
             legacy_triggered = (
                 pnl_pct <= -base_runtime._f(cfg.get("stop_loss_pct"), 0.45)
                 or pnl_pct >= base_runtime._f(cfg.get("take_profit_pct"), 0.80)

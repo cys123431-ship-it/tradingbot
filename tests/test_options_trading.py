@@ -106,15 +106,25 @@ def test_shortlist_excludes_tradfi_and_wrong_side():
 
 def test_contract_score_requires_tradeable_spread_delta_and_volume():
     result = score_option_contract(
-        {"symbol": "ETH-X-C"},
+        {
+            "symbol": "ETH-X-C",
+            "side": "CALL",
+            "strikePrice": "100",
+            "dte_days": 7.0,
+        },
         [{"delta": "0.45", "markIV": "0.50"}],
-        [{"amount": "1000", "bidPrice": "9.8", "askPrice": "10.0"}],
-        {"bids": [["9.8", "5"]], "asks": [["10.0", "5"]]},
-        {"score": 0.8, "realized_volatility": 0.6},
+        [{"amount": "1000", "bidPrice": "4.8", "askPrice": "5.0"}],
+        {"bids": [["4.8", "5"]], "asks": [["5.0", "5"]]},
+        {
+            "score": 0.8,
+            "spot_price": 100.0,
+            "realized_volatility": 0.6,
+            "forecast_volatility": 0.6,
+        },
         {},
     )
     assert result["accepted"] is True
-    assert result["ask"] == 10.0
+    assert result["ask"] == 5.0
 
 
 class _FakeMarket:
@@ -173,13 +183,14 @@ class _FakeOptionsClient:
         }
 
     def mark_price(self, symbol):
-        return [{"symbol": symbol, "markPrice": "9.9", "markIV": "0.02", "delta": "0.45"}]
+        mark_price = "9.9" if self.manual_positions else "0.49"
+        return [{"symbol": symbol, "markPrice": mark_price, "markIV": "0.02", "delta": "0.45"}]
 
     def ticker(self, symbol):
-        return [{"symbol": symbol, "amount": "1000", "bidPrice": "9.8", "askPrice": "10.0"}]
+        return [{"symbol": symbol, "amount": "1000", "bidPrice": "0.48", "askPrice": "0.50"}]
 
     def depth(self, symbol, limit=20):
-        return {"bids": [["9.8", "10"]], "asks": [["10.0", "10"]]}
+        return {"bids": [["0.48", "10"]], "asks": [["0.50", "10"]]}
 
     def new_order(self, symbol, side, order_type, quantity, **kwargs):
         self.orders.append({"symbol": symbol, "side": side, "quantity": quantity, **kwargs})
@@ -240,7 +251,8 @@ def test_options_runtime_enters_buy_only_with_live_balance_below_hundred_cap(tmp
     order = clients[0].orders[0]
     assert order["side"] == "BUY"
     assert order["reduce_only"] is False
-    assert order["time_in_force"] == "IOC"
+    assert order["time_in_force"] == "GTC"
+    assert order["post_only"] is True
     position = service.state["active_position"]
     assert position["entry_total_usdt"] <= 21.0
     assert position["entry_total_usdt"] <= OPTIONS_CAPITAL_LIMIT_USDT

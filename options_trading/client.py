@@ -108,15 +108,24 @@ class BinanceOptionsClient:
     def index_price(self, underlying):
         return self._request("GET", "/eapi/v1/index", {"underlying": underlying})
 
-    def mark_price(self, symbol):
-        return self._request("GET", "/eapi/v1/mark", {"symbol": symbol})
+    def mark_price(self, symbol=None):
+        params = {"symbol": symbol} if symbol else None
+        return self._request("GET", "/eapi/v1/mark", params)
 
-    def ticker(self, symbol):
-        return self._request("GET", "/eapi/v1/ticker", {"symbol": symbol})
+    def ticker(self, symbol=None):
+        params = {"symbol": symbol} if symbol else None
+        return self._request("GET", "/eapi/v1/ticker", params)
 
     def depth(self, symbol, limit=20):
         return self._request(
             "GET", "/eapi/v1/depth", {"symbol": symbol, "limit": int(limit)}
+        )
+
+    def recent_trades(self, symbol, limit=100):
+        return self._request(
+            "GET",
+            "/eapi/v1/trades",
+            {"symbol": symbol, "limit": min(100, max(1, int(limit)))},
         )
 
     def margin_account(self):
@@ -149,6 +158,7 @@ class BinanceOptionsClient:
         *,
         price=None,
         time_in_force=None,
+        post_only=False,
         reduce_only=False,
         client_order_id=None,
     ):
@@ -165,6 +175,8 @@ class BinanceOptionsClient:
             params["price"] = str(price)
         if time_in_force:
             params["timeInForce"] = str(time_in_force).upper()
+        if post_only:
+            params["postOnly"] = "true"
         if client_order_id:
             params["clientOrderId"] = str(client_order_id)
         return self._request("POST", "/eapi/v1/order", params, signed=True)

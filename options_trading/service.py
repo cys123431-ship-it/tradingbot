@@ -72,6 +72,168 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
     async def _notify(self, text):
         return await super()._notify(self._rewrite_cap_text(text))
 
+    @staticmethod
+    def _order_is_terminal(order):
+        return str((order or {}).get("status") or "").upper() in {
+            "FILLED",
+            "CANCELED",
+            "REJECTED",
+            "EXPIRED",
+        }
+
+    async def _submit_ioc_entry(self, selected, quantity, limit_price, tick):
+        symbol = selected.get("symbol")
+        client_order_id = self._client_order_id("b")
+        price_text = self._format_price(limit_price, tick)
+        try:
+            response = await self._call(
+                self._client().new_order,
+                symbol,
+                "BUY",
+                "LIMIT",
+                quantity,
+                price=price_text,
+                time_in_force="IOC",
+                reduce_only=False,
+                client_order_id=client_order_id,
+            )
+        except base_runtime.BinanceOptionsApiError as exc:
+            if not exc.uncertain:
+                raise
+            response = await self._call(
+                self._client().query_order,
+                symbol,
+                client_order_id=client_order_id,
+            )
+        order = await self._resolve_submitted_order(
+            symbol,
+            client_order_id,
+            response,
+            limit_price,
+        )
+        return order, client_order_id, limit_price, "IOC"
+
+    async def _submit_entry_order(self, selected, quantity, ioc_price, tick, cfg):
+        """Try post-only first, then cross only when the net edge survives."""
+
+        symbol = selected.get("symbol")
+        bid = max(0.0, base_runtime._f(selected.get("bid")))
+        ask = max(0.0, base_runtime._f(selected.get("ask")))
+        maker_enabled = bool(cfg.get("maker_first_enabled", True)) and bid > 0
+        if not maker_enabled:
+            return await self._submit_ioc_entry(
+                selected,
+                quantity,
+                ioc_price,
+                tick,
+            )
+
+        maker_price = bid + tick if tick > 0 and bid + tick < ask else bid
+        maker_price = max(tick or 1e-12, maker_price)
+        maker_client_id = self._client_order_id("m")
+        try:
+            response = await self._call(
+                self._client().new_order,
+                symbol,
+                "BUY",
+                "LIMIT",
+                quantity,
+                price=self._format_price(maker_price, tick),
+                time_in_force="GTC",
+                post_only=True,
+                reduce_only=False,
+                client_order_id=maker_client_id,
+            )
+        except base_runtime.BinanceOptionsApiError as exc:
+            if exc.uncertain:
+                try:
+                    response = await self._call(
+                        self._client().query_order,
+                        symbol,
+                        client_order_id=maker_client_id,
+                    )
+                except Exception as query_exc:
+                    raise base_runtime.BinanceOptionsApiError(
+                        "OPTIONS_MAKER_ORDER_STATUS_UNKNOWN",
+                        uncertain=True,
+                    ) from query_exc
+            elif bool(selected.get("ioc_eligible")):
+                return await self._submit_ioc_entry(
+                    selected,
+                    quantity,
+                    ioc_price,
+                    tick,
+                )
+            else:
+                raise
+
+        order = response if isinstance(response, dict) else {}
+        if self._order_is_terminal(order):
+            if base_runtime._order_executed_quantity(order) > 0:
+                return order, maker_client_id, maker_price, "MAKER"
+        else:
+            await base_runtime.asyncio.sleep(
+                base_runtime._f(cfg.get("maker_wait_seconds"), 2.0)
+            )
+            try:
+                queried = await self._call(
+                    self._client().query_order,
+                    symbol,
+                    client_order_id=maker_client_id,
+                )
+                if isinstance(queried, dict):
+                    order = queried
+            except Exception as exc:
+                base_runtime.logger.warning(
+                    "Options maker order query failed before cancel %s: %s",
+                    maker_client_id,
+                    exc,
+                )
+
+        if not self._order_is_terminal(order):
+            try:
+                canceled = await self._call(
+                    self._client().cancel_order,
+                    symbol,
+                    client_order_id=maker_client_id,
+                )
+                if isinstance(canceled, dict):
+                    order = canceled
+            except Exception as exc:
+                raise base_runtime.BinanceOptionsApiError(
+                    "OPTIONS_MAKER_CANCEL_FAILED",
+                    uncertain=True,
+                ) from exc
+            try:
+                queried = await self._call(
+                    self._client().query_order,
+                    symbol,
+                    client_order_id=maker_client_id,
+                )
+                if (
+                    isinstance(queried, dict)
+                    and base_runtime._order_executed_quantity(queried)
+                    >= base_runtime._order_executed_quantity(order)
+                ):
+                    order = queried
+            except Exception as exc:
+                base_runtime.logger.warning(
+                    "Options maker reconciliation query failed after confirmed cancel %s: %s",
+                    maker_client_id,
+                    exc,
+                )
+
+        if base_runtime._order_executed_quantity(order) > 0:
+            return order, maker_client_id, maker_price, "MAKER"
+        if not bool(selected.get("ioc_eligible")):
+            return {}, maker_client_id, maker_price, "MAKER_ONLY"
+        return await self._submit_ioc_entry(
+            selected,
+            quantity,
+            ioc_price,
+            tick,
+        )
+
     async def _enter(self, selected, snapshot):
         """Enter using the smaller of strategy ledger, live balance and hard cap.
 
@@ -100,7 +262,10 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
             min_qty=selected.get("min_qty") or selected.get("minQty"),
             step_size=selected.get("step_size") or selected.get("minQty"),
             cash_bankroll_usdt=planning_bankroll,
-            entry_fraction=cfg.get("entry_fraction", 1.00),
+            entry_fraction=min(
+                base_runtime._f(cfg.get("entry_fraction"), 1.00),
+                base_runtime._f(selected.get("entry_fraction"), 1.00),
+            ),
             capital_limit_usdt=OPTIONS_CAPITAL_LIMIT_USDT,
         )
         if not plan.get("accepted"):
@@ -112,6 +277,31 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
             return self._record_reason("옵션 계좌 사용 가능 잔고가 계획 금액보다 적습니다.")
 
         symbol = selected.get("symbol")
+        try:
+            order, client_order_id, submitted_price, execution_mode = (
+                await self._submit_entry_order(
+                    selected,
+                    plan["quantity"],
+                    limit_price,
+                    tick,
+                    cfg,
+                )
+            )
+        except base_runtime.BinanceOptionsApiError as exc:
+            if exc.uncertain:
+                return self._record_reason(
+                    "옵션 주문 상태 또는 메이커 취소 상태가 불확실해 신규 주문을 중단했습니다. 거래소 주문을 확인하세요.",
+                    error=True,
+                )
+            return self._record_reason(f"옵션 진입 주문 거절: {exc}", error=True)
+
+        filled_qty = base_runtime._order_executed_quantity(order)
+        if filled_qty <= 0:
+            return self._record_reason(
+                "옵션 메이커 주문이 미체결됐고 IOC 기준 순기대수익도 부족해 추격 진입하지 않았습니다."
+            )
+
+        fill_price = base_runtime._order_average_price(order, submitted_price)
         signal_key = str((selected.get("signal") or {}).get("signal_key") or "")
         if signal_key:
             consumed = list(self.state.get("consumed_signal_keys") or [])
@@ -119,48 +309,6 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
                 consumed.append(signal_key)
             self.state["consumed_signal_keys"] = consumed[-200:]
             self._save_state()
-
-        client_order_id = self._client_order_id("b")
-        price_text = self._format_price(limit_price, tick)
-        try:
-            response = await self._call(
-                self._client().new_order,
-                symbol,
-                "BUY",
-                "LIMIT",
-                plan["quantity"],
-                price=price_text,
-                time_in_force="IOC",
-                reduce_only=False,
-                client_order_id=client_order_id,
-            )
-        except base_runtime.BinanceOptionsApiError as exc:
-            if exc.uncertain:
-                try:
-                    response = await self._call(
-                        self._client().query_order,
-                        symbol,
-                        client_order_id=client_order_id,
-                    )
-                except Exception:
-                    return self._record_reason(
-                        "옵션 주문 응답이 불확실해 신규 주문을 중단했습니다. 거래소 주문을 확인하세요.",
-                        error=True,
-                    )
-            else:
-                return self._record_reason(f"옵션 진입 주문 거절: {exc}", error=True)
-
-        order = await self._resolve_submitted_order(
-            symbol,
-            client_order_id,
-            response,
-            limit_price,
-        )
-        filled_qty = base_runtime._order_executed_quantity(order)
-        if filled_qty <= 0:
-            return self._record_reason("옵션 IOC 주문이 체결되지 않아 포지션을 만들지 않았습니다.")
-
-        fill_price = base_runtime._order_average_price(order, limit_price)
         unit = base_runtime._f(selected.get("unit"), 1.0)
         premium = fill_price * filled_qty * unit
         entry_fee = estimate_option_fee(
@@ -199,6 +347,7 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
             "peak_mark": fill_price,
             "client_order_id": client_order_id,
             "order_id": order.get("orderId"),
+            "entry_execution_mode": execution_mode,
             "signal_score": base_runtime._f((selected.get("signal") or {}).get("score")),
             "option_score": base_runtime._f(selected.get("score")),
             "status": "OPEN",
@@ -217,6 +366,10 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
                 "target_dte_days": base_runtime._f(selected.get("target_dte_days")),
                 "entry_iv_to_realized": base_runtime._f(selected.get("iv_to_realized")),
                 "entry_skew_ratio": base_runtime._f(selected.get("skew_ratio")),
+                "entry_surface_iv_premium_pct": base_runtime._f(selected.get("surface_iv_premium_pct")),
+                "entry_net_expected_edge_pct": base_runtime._f(selected.get("net_expected_edge_pct")),
+                "entry_ioc_net_expected_edge_pct": base_runtime._f(selected.get("ioc_net_expected_edge_pct")),
+                "entry_flow_score": base_runtime._f(selected.get("flow_score")),
             }
         )
 
