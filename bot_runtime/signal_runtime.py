@@ -322,7 +322,8 @@ class SignalRuntimeMixin:
             )
         else:
             self._set_crypto_entry_lock(None)
-        logger.warning(
+        reconciliation_logger = logger.info if result.safe_to_trade else logger.warning
+        reconciliation_logger(
             "CRYPTO_RECONCILIATION safe=%s positions=%d open_orders=%d "
             "issues=%s unresolved=%s",
             result.safe_to_trade,

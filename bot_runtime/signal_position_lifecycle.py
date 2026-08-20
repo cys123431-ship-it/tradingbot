@@ -1346,7 +1346,7 @@ class SignalPositionLifecycleMixin:
                     self._protection_position_symbol(raw_pos),
                     exc,
                 )
-        logger.warning(
+        logger.info(
             "[Protection Recovery] startup sweep complete: recovered=%s audited=%s",
             recovered,
             audited,
