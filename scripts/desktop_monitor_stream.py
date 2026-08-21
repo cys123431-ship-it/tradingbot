@@ -12,13 +12,18 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import signal
+import sys
 import time
 from pathlib import Path
 
 import ccxt
 
-from options_trading.client import BinanceOptionsClient
-from options_trading.config import normalize_options_config
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from options_trading.client import BinanceOptionsClient  # noqa: E402
+from options_trading.config import normalize_options_config  # noqa: E402
 
 
 RUNNING = True
