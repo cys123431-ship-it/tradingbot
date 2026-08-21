@@ -206,6 +206,17 @@ class BinanceOptionsClient:
         params = {"symbol": symbol} if symbol else None
         return self._request("GET", "/eapi/v1/ticker", params)
 
+    def klines(self, symbol, interval="1m", limit=240):
+        return self._request(
+            "GET",
+            "/eapi/v1/klines",
+            {
+                "symbol": str(symbol),
+                "interval": str(interval),
+                "limit": min(1000, max(1, int(limit))),
+            },
+        )
+
     def depth(self, symbol, limit=20):
         return self._request(
             "GET", "/eapi/v1/depth", {"symbol": symbol, "limit": int(limit)}

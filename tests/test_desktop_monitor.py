@@ -1,8 +1,16 @@
+import json
 from types import SimpleNamespace
 
 from bot_runtime.desktop_monitor import build_desktop_monitor_snapshot
 from bot_runtime.entry_reason_ko import explain_entry_reason_ko
-from scripts.desktop_monitor_stream import classify_position, normalize_order, normalize_position
+from scripts.desktop_monitor_stream import (
+    _apply_option_mark_candle,
+    OptionsMonitorSource,
+    classify_position,
+    normalize_option_position,
+    normalize_order,
+    normalize_position,
+)
 
 
 def test_runtime_snapshot_is_bounded_and_marks_bot_position():
@@ -112,6 +120,142 @@ def test_missing_exchange_leverage_uses_notional_to_margin_ratio():
     )
 
     assert position["leverage"] == 6.0
+
+
+def test_bot_option_position_exposes_live_premium_and_software_protection():
+    position = normalize_option_position(
+        {
+            "symbol": "SOL-260828-88-C",
+            "side": "LONG",
+            "quantity": "10",
+            "entryPrice": "2.00",
+            "markPrice": "2.50",
+        },
+        tracked={
+            "symbol": "SOL-260828-88-C",
+            "underlying": "SOLUSDT",
+            "side": "CALL",
+            "quantity": 10,
+            "entry_price": 2.0,
+            "entry_total_usdt": 20.2,
+            "peak_mark": 4.2,
+            "signal_strategy": "ADAPTIVE_TREND",
+        },
+        mark={"markPrice": "2.60", "markIV": "0.60", "delta": "0.55"},
+        options_config={"stop_loss_pct": 0.55, "take_profit_pct": 3.0},
+    )
+
+    assert position["source"] == "BOT"
+    assert position["option_type"] == "CALL"
+    assert position["mark_price"] == 2.6
+    assert round(position["unrealized_pnl"], 8) == 6.0
+    assert round(position["return_percent"], 8) == 30.0
+    assert round(position["hard_stop_price"], 8) == 0.9
+    assert position["hard_target_price"] == 8.0
+    assert round(position["trailing_floor"], 8) == 2.73
+    assert position["delta"] == 0.55
+
+
+def test_manual_option_position_does_not_claim_bot_protection():
+    position = normalize_option_position(
+        {
+            "symbol": "ETH-260828-5000-P",
+            "side": "LONG",
+            "quantity": "1",
+            "entryPrice": "10",
+            "markPrice": "12",
+        },
+        options_config={"stop_loss_pct": 0.55, "take_profit_pct": 3.0},
+    )
+
+    assert position["source"] == "MANUAL / UNKNOWN"
+    assert position["option_type"] == "PUT"
+    assert position["hard_stop_price"] is None
+    assert position["hard_target_price"] is None
+
+
+def test_option_live_mark_updates_current_candle_instead_of_drifting_line():
+    candles = [
+        {
+            "ts": 120_000,
+            "open": 2.0,
+            "high": 2.1,
+            "low": 1.9,
+            "close": 2.0,
+            "volume": 1.0,
+        }
+    ]
+
+    updated = _apply_option_mark_candle(candles, 2.5, now_ms=125_000)
+
+    assert updated[-1]["ts"] == 120_000
+    assert updated[-1]["close"] == 2.5
+    assert updated[-1]["high"] == 2.5
+
+
+def test_options_monitor_source_combines_exchange_state_and_public_chart(tmp_path):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    (tmp_path / "config.json").write_text(
+        json.dumps({"options_trading": {"enabled": True}}),
+        encoding="utf-8",
+    )
+    (runtime / "options_trading_state.json").write_text(
+        json.dumps(
+            {
+                "active_position": {
+                    "symbol": "SOL-TEST-C",
+                    "underlying": "SOLUSDT",
+                    "side": "CALL",
+                    "quantity": 2,
+                    "entry_price": 2.0,
+                    "entry_total_usdt": 4.1,
+                    "peak_mark": 2.5,
+                    "signal_strategy": "ADAPTIVE_TREND",
+                },
+                "cash_bankroll_usdt": 95.9,
+                "capital_limit_usdt": 100.0,
+                "last_reason": "보유 관리 중",
+                "last_manage_success_ts": 100.0,
+                "manage_error_streak": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    source = OptionsMonitorSource(
+        tmp_path,
+        {"options_trading": {"enabled": True}},
+        "1m",
+        60,
+    )
+    source.client = SimpleNamespace(
+        positions=lambda: [
+            {
+                "symbol": "SOL-TEST-C",
+                "side": "LONG",
+                "quantity": "2",
+                "entryPrice": "2.0",
+                "markPrice": "2.4",
+            }
+        ],
+        mark_price=lambda symbol: [
+            {"symbol": symbol, "markPrice": "2.4", "delta": "0.5"}
+        ],
+        klines=lambda symbol, interval, limit: [
+            [60_000, "2.0", "2.1", "1.9", "2.0", "10"],
+            [120_000, "2.0", "2.2", "2.0", "2.1", "8"],
+        ],
+    )
+
+    snapshot = source.snapshot()
+
+    assert snapshot["enabled"] is True
+    assert snapshot["selected_symbol"] == "SOL-TEST-C"
+    assert snapshot["positions"][0]["exchange_verified"] is True
+    assert snapshot["positions"][0]["mark_price"] == 2.4
+    assert snapshot["positions"][0]["source"] == "BOT"
+    assert snapshot["candles"][-1]["close"] == 2.4
+    assert snapshot["error"] is None
 
 
 def test_live_status_symbol_wins_over_stale_internal_candidate():

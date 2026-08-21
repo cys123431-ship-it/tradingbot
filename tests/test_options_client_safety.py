@@ -50,3 +50,28 @@ def test_binance_400_too_many_requests_sets_rate_backoff(monkeypatch):
     assert caught.value.retry_after == pytest.approx(7.0)
     assert caught.value.uncertain is False
     assert client._cooldown_until > 0
+
+
+def test_option_klines_uses_public_eapi_route_and_bounded_limit(monkeypatch):
+    captured = {}
+    client = BinanceOptionsClient()
+
+    def request(method, path, params=None, *, signed=False):
+        captured.update(
+            method=method,
+            path=path,
+            params=params,
+            signed=signed,
+        )
+        return []
+
+    monkeypatch.setattr(client, "_request", request)
+
+    client.klines("BTC-TEST-C", interval="1m", limit=5000)
+
+    assert captured == {
+        "method": "GET",
+        "path": "/eapi/v1/klines",
+        "params": {"symbol": "BTC-TEST-C", "interval": "1m", "limit": 1000},
+        "signed": False,
+    }

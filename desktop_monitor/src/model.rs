@@ -102,6 +102,55 @@ pub struct RuntimeSnapshot {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
+pub struct OptionPosition {
+    pub symbol: String,
+    pub underlying: String,
+    pub option_type: String,
+    pub position_side: String,
+    pub quantity: f64,
+    pub entry_price: f64,
+    pub mark_price: f64,
+    pub entry_cost_usdt: f64,
+    pub premium_value_usdt: f64,
+    pub unrealized_pnl: f64,
+    pub return_percent: Option<f64>,
+    pub source: String,
+    pub strategy: Option<String>,
+    pub expiry_date_ms: i64,
+    pub dte_days: Option<f64>,
+    pub peak_mark: Option<f64>,
+    pub mark_iv: Option<f64>,
+    pub delta: Option<f64>,
+    pub gamma: Option<f64>,
+    pub theta: Option<f64>,
+    pub vega: Option<f64>,
+    pub hard_stop_price: Option<f64>,
+    pub hard_target_price: Option<f64>,
+    pub trailing_floor: Option<f64>,
+    pub exchange_verified: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct OptionsWireSnapshot {
+    pub enabled: bool,
+    pub exchange_mode: String,
+    pub selected_symbol: Option<String>,
+    pub timeframe: String,
+    pub positions: Vec<OptionPosition>,
+    pub candles: Vec<Candle>,
+    pub candle: Option<Candle>,
+    pub cash_bankroll_usdt: Option<f64>,
+    pub capital_limit_usdt: Option<f64>,
+    pub last_reason: String,
+    pub state_updated_at: String,
+    pub last_manage_success_ts: f64,
+    pub manage_error_streak: u32,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
 pub struct WireSnapshot {
     pub kind: String,
     pub ts: f64,
@@ -113,6 +162,7 @@ pub struct WireSnapshot {
     pub runtime: Option<RuntimeSnapshot>,
     pub candles: Vec<Candle>,
     pub candle: Option<Candle>,
+    pub options: Option<OptionsWireSnapshot>,
     pub error: Option<String>,
 }
 
@@ -135,6 +185,24 @@ pub struct MonitorState {
     pub candles: Vec<Candle>,
     pub last_server_ts: f64,
     pub last_error: Option<String>,
+    pub options: OptionsMonitorState,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct OptionsMonitorState {
+    pub enabled: bool,
+    pub exchange_mode: String,
+    pub selected_symbol: String,
+    pub timeframe: String,
+    pub positions: Vec<OptionPosition>,
+    pub candles: Vec<Candle>,
+    pub cash_bankroll_usdt: Option<f64>,
+    pub capital_limit_usdt: Option<f64>,
+    pub last_reason: String,
+    pub state_updated_at: String,
+    pub last_manage_success_ts: f64,
+    pub manage_error_streak: u32,
+    pub last_error: Option<String>,
 }
 
 impl MonitorState {
@@ -153,8 +221,11 @@ impl MonitorState {
         if !snapshot.exchange_mode.is_empty() {
             self.exchange_mode = snapshot.exchange_mode;
         }
-        self.position = snapshot.position;
-        self.orders = snapshot.orders;
+        let successful = snapshot.error.is_none();
+        if successful {
+            self.position = snapshot.position;
+            self.orders = snapshot.orders;
+        }
         if let Some(runtime) = snapshot.runtime {
             self.runtime = runtime;
         }
@@ -168,8 +239,64 @@ impl MonitorState {
             self.candles
                 .drain(0..self.candles.len().saturating_sub(Self::MAX_CANDLES));
         }
+        if let Some(options) = snapshot.options {
+            self.options.apply(options);
+        }
         self.last_server_ts = snapshot.ts;
         self.last_error = snapshot.error.filter(|value| !value.is_empty());
+    }
+
+    fn upsert_candle(&mut self, candle: Candle) {
+        match self.candles.last_mut() {
+            Some(last) if last.ts == candle.ts => *last = candle,
+            Some(last) if last.ts < candle.ts => self.candles.push(candle),
+            None => self.candles.push(candle),
+            _ => {}
+        }
+    }
+}
+
+impl OptionsMonitorState {
+    const MAX_CANDLES: usize = 300;
+
+    fn apply(&mut self, snapshot: OptionsWireSnapshot) {
+        let symbol = snapshot.selected_symbol.unwrap_or_default();
+        if self.selected_symbol != symbol {
+            self.candles.clear();
+        }
+        self.selected_symbol = symbol;
+        self.enabled = snapshot.enabled;
+        if !snapshot.exchange_mode.is_empty() {
+            self.exchange_mode = snapshot.exchange_mode;
+        }
+        if !snapshot.timeframe.is_empty() {
+            self.timeframe = snapshot.timeframe;
+        }
+        self.positions = snapshot.positions;
+        if !snapshot.candles.is_empty() {
+            self.candles = snapshot.candles;
+        }
+        if let Some(candle) = snapshot.candle {
+            self.upsert_candle(candle);
+        }
+        if self.candles.len() > Self::MAX_CANDLES {
+            self.candles
+                .drain(0..self.candles.len().saturating_sub(Self::MAX_CANDLES));
+        }
+        self.cash_bankroll_usdt = snapshot.cash_bankroll_usdt;
+        self.capital_limit_usdt = snapshot.capital_limit_usdt;
+        self.last_reason = snapshot.last_reason;
+        self.state_updated_at = snapshot.state_updated_at;
+        self.last_manage_success_ts = snapshot.last_manage_success_ts;
+        self.manage_error_streak = snapshot.manage_error_streak;
+        self.last_error = snapshot.error.filter(|value| !value.is_empty());
+    }
+
+    pub fn selected_position(&self) -> Option<&OptionPosition> {
+        self.positions
+            .iter()
+            .find(|position| position.symbol == self.selected_symbol)
+            .or_else(|| self.positions.first())
     }
 
     fn upsert_candle(&mut self, candle: Candle) {
@@ -227,5 +354,39 @@ mod tests {
         });
         assert_eq!(state.candles.len(), 1);
         assert_eq!(state.candles[0].ts, 2);
+    }
+
+    #[test]
+    fn options_update_independently_from_futures_chart() {
+        let mut state = MonitorState {
+            symbol: "BTC/USDT".into(),
+            candles: vec![Candle {
+                ts: 1,
+                close: 10.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        state.apply(WireSnapshot {
+            options: Some(OptionsWireSnapshot {
+                selected_symbol: Some("BTC-TEST-C".into()),
+                candles: vec![Candle {
+                    ts: 2,
+                    close: 1.5,
+                    ..Default::default()
+                }],
+                positions: vec![OptionPosition {
+                    symbol: "BTC-TEST-C".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(state.symbol, "BTC/USDT");
+        assert_eq!(state.candles[0].close, 10.0);
+        assert_eq!(state.options.selected_symbol, "BTC-TEST-C");
+        assert_eq!(state.options.candles[0].close, 1.5);
     }
 }

@@ -1,6 +1,6 @@
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Stroke, StrokeKind, Vec2};
 
-use crate::model::{Candle, MonitorState};
+use crate::model::{Candle, MonitorState, OptionPosition, OptionsMonitorState};
 
 #[derive(Clone)]
 struct PriceLine {
@@ -12,18 +12,75 @@ struct PriceLine {
 }
 
 pub fn show(ui: &mut egui::Ui, state: &MonitorState, light_mode: bool) {
+    let latest_trade_price = state
+        .candles
+        .last()
+        .map(|candle| candle.close)
+        .unwrap_or(0.0);
+    let lines = futures_price_lines(state, light_mode, latest_trade_price);
+    render_chart(
+        ui,
+        "선물",
+        &state.symbol,
+        &state.timeframe,
+        &state.candles,
+        lines,
+        "선물 차트 데이터를 기다리는 중…",
+        light_mode,
+    );
+}
+
+pub fn show_options(ui: &mut egui::Ui, state: &OptionsMonitorState, light_mode: bool) {
+    let position = state.selected_position();
+    let latest_price = state
+        .candles
+        .last()
+        .map(|candle| candle.close)
+        .or_else(|| position.map(|position| position.mark_price))
+        .unwrap_or(0.0);
+    let lines = position
+        .map(|position| option_price_lines(position, light_mode, latest_price))
+        .unwrap_or_default();
+    let empty_message = if position.is_some() {
+        "옵션 프리미엄 차트 데이터를 기다리는 중…"
+    } else {
+        "열린 옵션 포지션 없음"
+    };
+    render_chart(
+        ui,
+        "옵션 프리미엄",
+        &state.selected_symbol,
+        &state.timeframe,
+        &state.candles,
+        lines,
+        empty_message,
+        light_mode,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_chart(
+    ui: &mut egui::Ui,
+    market_label: &str,
+    symbol: &str,
+    timeframe: &str,
+    candles: &[Candle],
+    lines: Vec<PriceLine>,
+    empty_message: &str,
+    light_mode: bool,
+) {
     let palette = Palette::new(light_mode);
     let available = ui.available_size();
-    let desired = Vec2::new(available.x.max(420.0), available.y.max(330.0));
+    let desired = Vec2::new(available.x.max(420.0), available.y.max(250.0));
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 8.0, palette.background);
 
-    if state.candles.len() < 2 {
+    if candles.len() < 2 {
         painter.text(
             rect.center(),
             Align2::CENTER_CENTER,
-            "차트 데이터를 기다리는 중…",
+            empty_message,
             FontId::proportional(18.0),
             palette.secondary_text,
         );
@@ -35,10 +92,8 @@ pub fn show(ui: &mut egui::Ui, state: &MonitorState, light_mode: bool) {
         Pos2::new(rect.right() - 172.0, rect.bottom() - 22.0),
     );
     let max_visible = ((chart.width() / 7.0).floor() as usize).clamp(40, 220);
-    let first = state.candles.len().saturating_sub(max_visible);
-    let candles = &state.candles[first..];
-    let latest_trade_price = candles.last().map(|candle| candle.close).unwrap_or(0.0);
-    let lines = price_lines(state, light_mode, latest_trade_price);
+    let first = candles.len().saturating_sub(max_visible);
+    let candles = &candles[first..];
     // Keep the viewport focused on price action. Distant SL/TP levels are
     // projected to an edge marker instead of shrinking every candle.
     let (low, high) = price_bounds(candles);
@@ -48,9 +103,7 @@ pub fn show(ui: &mut egui::Ui, state: &MonitorState, light_mode: bool) {
         Pos2::new(chart.left(), rect.top() + 7.0),
         Align2::LEFT_TOP,
         format!(
-            "{} · {} · {}봉",
-            state.symbol,
-            state.timeframe,
+            "{market_label} · {symbol} · {timeframe} · {}봉",
             candles.len()
         ),
         FontId::proportional(16.0),
@@ -189,7 +242,11 @@ fn line_placement(price: f64, low: f64, high: f64) -> LinePlacement {
     }
 }
 
-fn price_lines(state: &MonitorState, light_mode: bool, latest_trade_price: f64) -> Vec<PriceLine> {
+fn futures_price_lines(
+    state: &MonitorState,
+    light_mode: bool,
+    latest_trade_price: f64,
+) -> Vec<PriceLine> {
     let palette = Palette::new(light_mode);
     let mut lines = Vec::new();
     if let Some(position) = &state.position {
@@ -282,13 +339,84 @@ fn price_lines(state: &MonitorState, light_mode: bool, latest_trade_price: f64) 
     lines
 }
 
+fn option_price_lines(
+    position: &OptionPosition,
+    light_mode: bool,
+    latest_price: f64,
+) -> Vec<PriceLine> {
+    let palette = Palette::new(light_mode);
+    let mut lines = Vec::new();
+    if position.entry_price > 0.0 {
+        lines.push(PriceLine {
+            price: position.entry_price,
+            label: "진입".into(),
+            color: palette.entry,
+            width: 1.5,
+            directional_percent: None,
+        });
+    }
+    if latest_price > 0.0 {
+        lines.push(PriceLine {
+            price: latest_price,
+            label: "현재".into(),
+            color: palette.current,
+            width: 1.0,
+            directional_percent: directional_percent(
+                latest_price,
+                position.entry_price,
+                &position.position_side,
+            ),
+        });
+    }
+    if let Some(price) = position.hard_stop_price.filter(|price| *price > 0.0) {
+        lines.push(PriceLine {
+            price,
+            label: "SL(봇)".into(),
+            color: palette.stop_loss,
+            width: 1.5,
+            directional_percent: directional_percent(
+                price,
+                position.entry_price,
+                &position.position_side,
+            ),
+        });
+    }
+    if let Some(price) = position.hard_target_price.filter(|price| *price > 0.0) {
+        lines.push(PriceLine {
+            price,
+            label: "목표(봇)".into(),
+            color: palette.take_profit,
+            width: 1.3,
+            directional_percent: directional_percent(
+                price,
+                position.entry_price,
+                &position.position_side,
+            ),
+        });
+    }
+    if let Some(price) = position.trailing_floor.filter(|price| *price > 0.0) {
+        lines.push(PriceLine {
+            price,
+            label: "추적청산(봇)".into(),
+            color: palette.order,
+            width: 1.3,
+            directional_percent: directional_percent(
+                price,
+                position.entry_price,
+                &position.position_side,
+            ),
+        });
+    }
+    lines
+}
+
 fn directional_percent(price: f64, entry: f64, side: &str) -> Option<f64> {
     if price <= 0.0 || entry <= 0.0 {
         return None;
     }
     let price_change = (price / entry - 1.0) * 100.0;
     match side {
-        "LONG" => Some(price_change),
+        "LONG" | "CALL" | "PUT" => Some(price_change),
         "SHORT" => Some(-price_change),
         _ => None,
     }
