@@ -105,6 +105,8 @@ def explain_entry_reason_ko(reason=None, *, code=None, data=None):
         return "최근 가격 체제 전환이나 지속적인 주문 흐름 우위가 아직 뚜렷하지 않습니다."
     if "CHANGE_POINT_FLOW_SIDE" in uppered:
         return "체제 전환·주문 흐름 평가에 필요한 진입 방향이 확정되지 않았습니다."
+    if "TREND_EVENT_CANDIDATE" in uppered or "INDEPENDENT_DIRECTION_AMBIGUOUS" in uppered:
+        return "기존 추세와 새 체제·주문 흐름 후보가 충돌하거나 어느 방향도 충분히 강하지 않습니다."
     if "REGION_RESTRICTED" in uppered or "RESTRICTED_SYMBOL" in uppered:
         return "현재 계정에서 제한된 종목이라 진입하지 않았습니다."
     if "INVALID_MARKET" in uppered or "SYMBOL_PREFLIGHT" in uppered:

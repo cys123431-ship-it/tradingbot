@@ -10,11 +10,16 @@ from trading_safety.market_session import us_equity_regular_session_status
 from utbreakout.adaptive_breakout_trend import (
     ADAPTIVE_BREAKOUT_TREND_STRATEGY,
     ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION,
+    AdaptiveBreakoutTrendDecision,
     evaluate_adaptive_breakout_trend,
     evaluate_small_account_entry_refinement,
     normalize_adaptive_breakout_trend_config,
 )
-from utbreakout.change_point_flow import evaluate_change_point_flow_entry
+from utbreakout.change_point_flow import (
+    evaluate_change_point_flow_entry,
+    resolve_trend_event_candidate,
+    select_independent_change_point_flow_candidate,
+)
 from utbreakout.profit_capture import (
     QUAD_CONFIRMATION_RISK_MULTIPLIERS,
     bounded_structure_anchor,
@@ -885,6 +890,90 @@ class SignalAlphaMixin:
             base['live_enabled'] = bool(source.get('adaptive_breakout_trend_live_enabled'))
         return normalize_adaptive_breakout_trend_config(base)
 
+    async def _adaptive_trend_balance_snapshot(self, *, ttl_seconds=15.0):
+        """Share one balance read across rapid scanner candidate evaluations."""
+
+        now_ts = time.time()
+        cached = getattr(self, '_adaptive_trend_balance_cache', None)
+        if (
+            isinstance(cached, dict)
+            and now_ts - float(cached.get('cached_at', 0.0) or 0.0)
+            < max(1.0, float(ttl_seconds))
+        ):
+            values = cached.get('values')
+            if isinstance(values, (list, tuple)) and len(values) == 3:
+                return tuple(float(value or 0.0) for value in values)
+        values = await self.get_balance_info()
+        normalized = tuple(float(value or 0.0) for value in values)
+        self._adaptive_trend_balance_cache = {
+            'cached_at': now_ts,
+            'values': normalized,
+        }
+        return normalized
+
+    @staticmethod
+    def _adaptive_trend_event_decision(event_candidate):
+        """Convert an independent event candidate into the shared plan contract."""
+
+        candidate = dict(event_candidate or {})
+        event = dict(candidate.get('decision') or {})
+        side = str(candidate.get('side') or '').strip().lower()
+        reference_price = _safe_float_or_none(event.get('event_reference_price'))
+        atr_value = _safe_float_or_none(event.get('event_atr'))
+        if (
+            not candidate.get('allowed')
+            or side not in {'long', 'short'}
+            or reference_price is None
+            or reference_price <= 0
+            or atr_value is None
+            or atr_value <= 0
+        ):
+            return AdaptiveBreakoutTrendDecision(
+                reason='independent_change_point_flow_data_unavailable'
+            )
+        direction = 1.0 if side == 'long' else -1.0
+        drift_strength = min(
+            1.5,
+            abs(float(event.get('directional_drift_z', 0.0) or 0.0)) / 2.5,
+        )
+        state = str(event.get('state') or 'event_only')
+        metrics = {
+            'reference_price': reference_price,
+            'atr': atr_value,
+            'structure_stop': event.get('event_structure_stop'),
+            'signal_candle_ts': event.get('event_signal_candle_ts'),
+            'risk_tier': event.get('risk_tier') or 'base',
+            'weighted_momentum': direction * drift_strength,
+            'fast_momentum_retention': 1.0,
+            'trend_clarity': min(
+                1.0,
+                float(event.get('regime_change_score', 0.0) or 0.0) / 100.0,
+            ),
+            'trend_efficiency': float(
+                event.get('directional_persistence', 0.5) or 0.5
+            ),
+            'volatility_scale': 1.0,
+            'entry_opportunity_score': float(
+                event.get('total_score', 0.0) or 0.0
+            ),
+            'change_point_flow_entry': True,
+            'change_point_flow_state': state,
+            'ema_crossover': False,
+            'compression_breakout': state == 'new_regime',
+            'pullback_resumption': False,
+            'impulse_breakout': state in {'new_regime', 'persistent_flow'},
+            'weighted_continuation': False,
+            'signed_fast_ema_distance_atr': 0.0,
+        }
+        return AdaptiveBreakoutTrendDecision(
+            allowed=True,
+            side=side,
+            score=float(event.get('total_score', 0.0) or 0.0),
+            risk_multiplier=1.0,
+            reason=f"Independent Change-Point Flow {side} {state}",
+            metrics=metrics,
+        )
+
     @staticmethod
     def _tradfi_pattern_profile_runtime_config(trend_cfg=None):
         source = trend_cfg if isinstance(trend_cfg, dict) else {}
@@ -1172,14 +1261,121 @@ class SignalAlphaMixin:
                 'tradfi_pattern_profile_applied': True,
                 'tradfi_pattern_context_errors': dict(tradfi_context.get('errors') or {}),
             })
-        candidate_side = preliminary.side
-        if preliminary.allowed and candidate_side in {'long', 'short'}:
-            l2_gate = await self._evaluate_shared_l2_gate(
-                canonical,
-                cfg,
-                force_refresh=True,
-                side=candidate_side,
+        total_balance, free_balance, _ = await self._adaptive_trend_balance_snapshot()
+        balance_for_risk = total_balance if total_balance > 0 else free_balance
+        small_account_threshold = max(
+            0.0,
+            float(
+                trend_cfg.get('small_account_equity_threshold_usdt', 1_000.0)
+                or 1_000.0
+            ),
+        )
+        small_account_aggressive_candidate = bool(
+            trend_cfg.get('small_account_aggressive_enabled', True)
+            and balance_for_risk > 0
+            and balance_for_risk < small_account_threshold
+            and free_balance > 0
+        )
+
+        event_timeframe = str(cfg.get('entry_timeframe', '15m') or '15m')
+        event_rows = []
+        if df is not None and callable(getattr(df, 'to_dict', None)):
+            try:
+                event_rows = completed_candle_rows(
+                    df.to_dict(orient='records'),
+                    event_timeframe,
+                    {'exclude_incomplete_live_candle': True},
+                    now_ms=evaluation_now_ms,
+                )
+            except (TypeError, ValueError):
+                event_rows = []
+        if not event_rows:
+            event_rows = rows
+            event_timeframe = timeframe
+
+        futures_context = {}
+        event_candidate = {
+            'allowed': False,
+            'side': None,
+            'score': 0.0,
+            'reason': 'independent event path not applicable',
+            'source': 'change_point_flow',
+            'evaluations': {},
+        }
+        if small_account_aggressive_candidate:
+            context_fetcher = getattr(
+                self,
+                '_fetch_utbreakout_futures_context',
+                None,
             )
+            if callable(context_fetcher):
+                try:
+                    fresh_context = await context_fetcher(canonical)
+                    if isinstance(fresh_context, dict):
+                        futures_context.update(fresh_context)
+                except Exception as exc:
+                    status['change_point_flow_context_error'] = str(exc)
+            event_candidate = select_independent_change_point_flow_candidate(
+                event_rows,
+                futures_context=futures_context,
+                config=trend_cfg.get('change_point_flow'),
+                tradfi=is_tradfi,
+            )
+
+        trend_candidate = {
+            'allowed': bool(
+                preliminary.allowed
+                and preliminary.side in {'long', 'short'}
+            ),
+            'side': preliminary.side,
+            'score': float(preliminary.score or 0.0),
+            'reason': preliminary.reason,
+        }
+        conflict_margin = float(
+            (trend_cfg.get('change_point_flow') or {}).get(
+                'candidate_conflict_margin',
+                12.0,
+            )
+            or 12.0
+        )
+        candidate_resolution = resolve_trend_event_candidate(
+            trend_candidate,
+            event_candidate,
+            conflict_margin=conflict_margin,
+        )
+        status.update({
+            'small_account_aggressive_candidate': small_account_aggressive_candidate,
+            'small_account_equity_usdt': balance_for_risk,
+            'trend_event_resolution': dict(candidate_resolution),
+            'independent_event_candidate': {
+                key: event_candidate.get(key)
+                for key in ('allowed', 'side', 'score', 'reason', 'code')
+            },
+        })
+        if not candidate_resolution.get('allowed'):
+            return _finish(
+                None,
+                'Adaptive Trend/Event waiting: '
+                f"{candidate_resolution.get('reason')}; "
+                f"trend={preliminary.reason}; "
+                f"event={event_candidate.get('reason')}",
+                'REJECTED_TREND_EVENT_CANDIDATE',
+            )
+
+        candidate_side = str(candidate_resolution.get('side') or '').lower()
+        l2_gate = await self._evaluate_shared_l2_gate(
+            canonical,
+            cfg,
+            force_refresh=True,
+            side=candidate_side,
+        )
+        candidate_source = str(
+            candidate_resolution.get('source') or 'trend_only'
+        )
+        if candidate_source in {'event_only', 'event_conflict_winner'}:
+            decision = self._adaptive_trend_event_decision(event_candidate)
+            decision_entry_timeframe = event_timeframe
+        else:
             decision = evaluate_adaptive_breakout_trend(rows, l2_gate, trend_cfg)
             if tradfi_profile_applied:
                 decision = evaluate_tradfi_pattern_profile(
@@ -1191,9 +1387,7 @@ class SignalAlphaMixin:
                     session_status=tradfi_context.get('session_status'),
                     config=profile_cfg,
                 )
-        else:
-            l2_gate = {}
-            decision = preliminary
+            decision_entry_timeframe = timeframe
         metrics = dict(decision.metrics or {})
         status.update({
             'allowed': bool(decision.allowed),
@@ -1204,6 +1398,8 @@ class SignalAlphaMixin:
             'metrics': metrics,
             'l2_gate': dict(l2_gate or {}),
             'decision_candle_ts': metrics.get('signal_candle_ts'),
+            'candidate_source': candidate_source,
+            'candidate_agreement': candidate_resolution.get('agreement'),
         })
         if not decision.allowed or decision.side not in {'long', 'short'}:
             return _finish(None, f'Adaptive Breakout Trend waiting: {decision.reason}')
@@ -1345,7 +1541,7 @@ class SignalAlphaMixin:
 
         filter_values = {
             'entry_price': entry_price,
-            'entry_timeframe': timeframe,
+            'entry_timeframe': decision_entry_timeframe,
             'atr': atr_value,
             'atr_pct': atr_value / entry_price * 100.0,
         }
@@ -1364,21 +1560,6 @@ class SignalAlphaMixin:
                 'REJECTED_L2_STRESSED',
             )
 
-        total_balance, free_balance, _ = await self.get_balance_info()
-        balance_for_risk = total_balance if total_balance > 0 else free_balance
-        small_account_threshold = max(
-            0.0,
-            float(
-                trend_cfg.get('small_account_equity_threshold_usdt', 1_000.0)
-                or 1_000.0
-            ),
-        )
-        small_account_aggressive_candidate = bool(
-            trend_cfg.get('small_account_aggressive_enabled', True)
-            and balance_for_risk > 0
-            and balance_for_risk < small_account_threshold
-            and free_balance > 0
-        )
         effective_daily_loss_percent = (
             0.0
             if small_account_aggressive_candidate
@@ -1414,47 +1595,39 @@ class SignalAlphaMixin:
             ),
         }
         if small_account_aggressive_candidate:
-            event_timeframe = str(cfg.get('entry_timeframe', '15m') or '15m')
-            event_rows = []
-            if df is not None and callable(getattr(df, 'to_dict', None)):
-                try:
-                    event_rows = df.to_dict(orient='records')
-                    event_rows = completed_candle_rows(
-                        event_rows,
-                        event_timeframe,
-                        {'exclude_incomplete_live_candle': True},
-                        now_ms=evaluation_now_ms,
-                    )
-                except (TypeError, ValueError):
-                    event_rows = []
-            if not event_rows:
-                event_rows = rows
-                event_timeframe = timeframe
-
-            futures_context = dict(selector_candidate)
-            context_fetcher = getattr(
-                self,
-                '_fetch_utbreakout_futures_context',
-                None,
+            event_evaluations = (
+                event_candidate.get('evaluations')
+                if isinstance(event_candidate.get('evaluations'), dict)
+                else {}
             )
-            if callable(context_fetcher):
-                try:
-                    fresh_context = await context_fetcher(canonical)
-                    if isinstance(fresh_context, dict):
-                        futures_context.update(fresh_context)
-                except Exception as exc:
-                    status['change_point_flow_context_error'] = str(exc)
-            change_point_flow = evaluate_change_point_flow_entry(
-                side,
-                event_rows,
-                futures_context=futures_context,
-                trend_metrics=metrics,
-                config=trend_cfg.get('change_point_flow'),
-                tradfi=is_tradfi,
-            )
+            selected_event_evaluation = event_evaluations.get(side)
+            if (
+                candidate_source in {'event_only', 'event_conflict_winner', 'aligned'}
+                and isinstance(selected_event_evaluation, dict)
+            ):
+                change_point_flow = dict(selected_event_evaluation)
+            else:
+                combined_futures_context = dict(selector_candidate)
+                combined_futures_context.update(futures_context)
+                change_point_flow = evaluate_change_point_flow_entry(
+                    side,
+                    event_rows,
+                    futures_context=combined_futures_context,
+                    trend_metrics=metrics,
+                    config=trend_cfg.get('change_point_flow'),
+                    tradfi=is_tradfi,
+                )
             change_point_flow['event_timeframe'] = event_timeframe
             status['change_point_flow'] = dict(change_point_flow)
-            if not bool(change_point_flow.get('allowed')):
+            event_path_required = candidate_source in {
+                'event_only',
+                'event_conflict_winner',
+                'aligned',
+            }
+            if (
+                event_path_required
+                and not bool(change_point_flow.get('allowed'))
+            ):
                 return _finish(
                     None,
                     'Change-point flow waiting: '
@@ -1478,13 +1651,24 @@ class SignalAlphaMixin:
                     'REJECTED_SMALL_ACCOUNT_FAST_TREND_DECAY',
                     'REJECTED_SMALL_ACCOUNT_WEAK_MATURE_CONTINUATION',
                 }
+                event_driven_entry = candidate_source in {
+                    'event_only',
+                    'event_conflict_winner',
+                }
+                if event_driven_entry:
+                    soft_veto_codes.add(
+                        'REJECTED_SMALL_ACCOUNT_LOWER_TIMEFRAME_CONFLICT'
+                    )
                 refinement_code = str(
                     small_account_entry_refinement.get('code') or ''
                 )
                 if (
                     refinement_code in soft_veto_codes
-                    and bool(
-                        change_point_flow.get('override_soft_mature_veto')
+                    and (
+                        event_driven_entry
+                        or bool(
+                            change_point_flow.get('override_soft_mature_veto')
+                        )
                     )
                 ):
                     small_account_entry_refinement.update({
@@ -1512,7 +1696,8 @@ class SignalAlphaMixin:
                 change_point_flow.get('risk_tier') or 'base'
             ).strip().lower()
             if (
-                flow_risk_tier in _ADAPTIVE_RISK_TIER_ORDER
+                bool(change_point_flow.get('allowed'))
+                and flow_risk_tier in _ADAPTIVE_RISK_TIER_ORDER
                 and _ADAPTIVE_RISK_TIER_ORDER[flow_risk_tier]
                 > _ADAPTIVE_RISK_TIER_ORDER[effective_risk_tier]
             ):
@@ -1686,8 +1871,8 @@ class SignalAlphaMixin:
             'strategy': ADAPTIVE_BREAKOUT_TREND_STRATEGY,
             'plan_symbol': canonical,
             'signal_candle_ts': metrics.get('signal_candle_ts'),
-            'entry_timeframe': timeframe,
-            'timeframe': timeframe,
+            'entry_timeframe': decision_entry_timeframe,
+            'timeframe': decision_entry_timeframe,
             'exit_timeframe': '15m',
             'htf_timeframe': '4h',
             'entry_execution': 'market',
@@ -1726,6 +1911,13 @@ class SignalAlphaMixin:
             ),
             'adaptive_trend_risk_tier': effective_risk_tier,
             'adaptive_breakout_trend_metrics': metrics,
+            'trend_event_candidate_source': candidate_source,
+            'trend_event_candidate_agreement': candidate_resolution.get(
+                'agreement'
+            ),
+            'trend_event_candidate_score': candidate_resolution.get('score'),
+            'trend_event_trend_score': candidate_resolution.get('trend_score'),
+            'trend_event_event_score': candidate_resolution.get('event_score'),
             'small_account_aggressive_enabled': bool(
                 trend_cfg.get('small_account_aggressive_enabled', True)
             ),
@@ -2037,6 +2229,16 @@ class SignalAlphaMixin:
             f"진입하지 않은 이유: {entry_diagnostic.get('message')}",
             f"Reason: {status.get('reason') or '-'}",
         ]
+        candidate_resolution = status.get('trend_event_resolution')
+        if isinstance(candidate_resolution, dict):
+            lines.insert(
+                7,
+                "후보 통합: "
+                f"{candidate_resolution.get('source') or 'none'} / "
+                f"{str(candidate_resolution.get('side') or 'NONE').upper()} / "
+                f"trend {float(candidate_resolution.get('trend_score', 0.0) or 0.0):.1f} / "
+                f"event {float(candidate_resolution.get('event_score', 0.0) or 0.0):.1f}",
+            )
         refinement = status.get('small_account_entry_refinement')
         if small_account_active and isinstance(refinement, dict):
             lines.insert(

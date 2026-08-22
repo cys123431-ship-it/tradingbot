@@ -1,10 +1,10 @@
-"""Robust event-regime and order-flow overlay for small trend accounts.
+"""Robust event-regime and order-flow engine for small trend accounts.
 
-The overlay is deliberately lightweight: it looks for a recent distribution
-shift in completed entry-timeframe candles, then grades whether order flow and
-open-interest participation support the already-established higher-timeframe
-trend.  It does not forecast price, bypass shared safety gates, or require all
-inputs to be present.
+The engine is deliberately lightweight: it looks for a recent distribution
+shift in completed entry-timeframe candles, then grades order flow and
+open-interest participation.  It can create an independent directional
+candidate or reinforce an established higher-timeframe trend.  It does not
+forecast price, bypass shared safety gates, or require all inputs to be present.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from statistics import median
 from typing import Any, Mapping, Sequence
 
 
-CHANGE_POINT_FLOW_PROFILE_VERSION = "change_point_flow_v1"
+CHANGE_POINT_FLOW_PROFILE_VERSION = "change_point_flow_v2_independent"
 
 
 def default_change_point_flow_config() -> dict[str, Any]:
@@ -37,6 +37,8 @@ def default_change_point_flow_config() -> dict[str, Any]:
         "established_trend_stop_atr_multiplier": 1.75,
         "fallback_stop_atr_multiplier": 2.00,
         "tradfi_opening_range_enabled": True,
+        "independent_candidate_minimum_score": 60.0,
+        "candidate_conflict_margin": 12.0,
     }
 
 
@@ -71,6 +73,8 @@ def normalize_change_point_flow_config(
         ("persistent_flow_stop_atr_multiplier", 1.0, 2.5),
         ("established_trend_stop_atr_multiplier", 1.0, 3.0),
         ("fallback_stop_atr_multiplier", 1.25, 3.0),
+        ("independent_candidate_minimum_score", 50.0, 85.0),
+        ("candidate_conflict_margin", 5.0, 30.0),
     ):
         normalized[key] = _bounded(
             normalized.get(key), lower, upper, float(defaults[key])
@@ -100,6 +104,7 @@ def evaluate_change_point_flow_entry(
     trend_metrics: Mapping[str, Any] | None = None,
     config: Mapping[str, Any] | None = None,
     tradfi: bool = False,
+    allow_legacy_fallback: bool = True,
 ) -> dict[str, Any]:
     """Classify a small-account entry without creating an AND gate.
 
@@ -150,6 +155,7 @@ def evaluate_change_point_flow_entry(
     volatility_expansion = 1.0
     persistence = 0.5
     atr = _finite(metrics.get("atr"), None)
+    event_atr = None
     if price_evidence_available:
         window = rows[-minimum_rows:]
         closes = [row["close"] for row in window]
@@ -281,7 +287,11 @@ def evaluate_change_point_flow_entry(
         and flow_nonopposing
     )
     established_trend = bool(strong_trend and flow_nonopposing)
-    legacy_fallback = bool(not price_evidence_available and not flow_sources)
+    legacy_fallback = bool(
+        allow_legacy_fallback
+        and not price_evidence_available
+        and not flow_sources
+    )
     allowed_paths = {
         "new_regime": new_regime,
         "persistent_flow": persistent_flow,
@@ -386,8 +396,186 @@ def evaluate_change_point_flow_entry(
         "flow_components": flow_components,
         "paths": allowed_paths,
         "tradfi": bool(tradfi),
+        "event_atr": event_atr,
+        "event_reference_price": rows[-1]["close"] if rows else None,
+        "event_signal_candle_ts": rows[-1].get("timestamp") if rows else None,
     })
     return result
+
+
+def select_independent_change_point_flow_candidate(
+    event_rows: Sequence[Mapping[str, Any]] | None,
+    *,
+    futures_context: Mapping[str, Any] | None = None,
+    config: Mapping[str, Any] | None = None,
+    tradfi: bool = False,
+) -> dict[str, Any]:
+    """Create a direction candidate without requiring the 1h trend engine."""
+
+    cfg = normalize_change_point_flow_config(config)
+    evaluations = {
+        side: evaluate_change_point_flow_entry(
+            side,
+            event_rows,
+            futures_context=futures_context,
+            trend_metrics={},
+            config=cfg,
+            tradfi=tradfi,
+            allow_legacy_fallback=False,
+        )
+        for side in ("long", "short")
+    }
+    minimum_score = float(cfg["independent_candidate_minimum_score"])
+    actionable = {
+        side: result
+        for side, result in evaluations.items()
+        if bool(result.get("allowed"))
+        and float(_finite(result.get("total_score"), 0.0) or 0.0)
+        >= minimum_score
+        and str(result.get("state") or "") != "legacy_data_fallback"
+    }
+    base = {
+        "allowed": False,
+        "side": None,
+        "score": 0.0,
+        "reason": "no independent change-point flow candidate",
+        "code": "NO_INDEPENDENT_CHANGE_POINT_FLOW_CANDIDATE",
+        "source": "change_point_flow",
+        "evaluations": evaluations,
+    }
+    if not actionable:
+        return base
+
+    ranked = sorted(
+        actionable.items(),
+        key=lambda item: float(item[1].get("total_score", 0.0) or 0.0),
+        reverse=True,
+    )
+    selected_side, selected = ranked[0]
+    selected_score = float(selected.get("total_score", 0.0) or 0.0)
+    if len(ranked) > 1:
+        runner_up_score = float(ranked[1][1].get("total_score", 0.0) or 0.0)
+        if selected_score - runner_up_score < float(cfg["candidate_conflict_margin"]):
+            base.update({
+                "code": "REJECTED_INDEPENDENT_DIRECTION_AMBIGUOUS",
+                "reason": (
+                    f"independent long/short scores are ambiguous: "
+                    f"{selected_score:.1f} vs {runner_up_score:.1f}"
+                ),
+            })
+            return base
+
+    return {
+        **base,
+        "allowed": True,
+        "side": selected_side,
+        "score": selected_score,
+        "reason": str(selected.get("reason") or "independent event candidate"),
+        "code": str(selected.get("code") or "CHANGE_POINT_FLOW_CANDIDATE"),
+        "decision": selected,
+    }
+
+
+def resolve_trend_event_candidate(
+    trend_candidate: Mapping[str, Any] | None,
+    event_candidate: Mapping[str, Any] | None,
+    *,
+    conflict_margin: float = 12.0,
+) -> dict[str, Any]:
+    """Combine independent trend and event candidates as weighted OR paths."""
+
+    trend = dict(trend_candidate or {})
+    event = dict(event_candidate or {})
+    trend_allowed = bool(
+        trend.get("allowed") and str(trend.get("side") or "") in {"long", "short"}
+    )
+    event_allowed = bool(
+        event.get("allowed") and str(event.get("side") or "") in {"long", "short"}
+    )
+    trend_score = _clamp(float(_finite(trend.get("score"), 0.0) or 0.0), 0.0, 100.0)
+    event_score = _clamp(float(_finite(event.get("score"), 0.0) or 0.0), 0.0, 100.0)
+    waiting = {
+        "allowed": False,
+        "side": None,
+        "source": "none",
+        "agreement": "none",
+        "score": 0.0,
+        "reason": "neither trend nor event engine produced a candidate",
+        "trend_score": trend_score,
+        "event_score": event_score,
+    }
+    if not trend_allowed and not event_allowed:
+        return waiting
+    if trend_allowed and not event_allowed:
+        return {
+            **waiting,
+            "allowed": True,
+            "side": str(trend["side"]),
+            "source": "trend_only",
+            "agreement": "trend_only",
+            "score": trend_score,
+            "reason": "1h trend candidate; event engine neutral",
+        }
+    if event_allowed and not trend_allowed:
+        return {
+            **waiting,
+            "allowed": True,
+            "side": str(event["side"]),
+            "source": "event_only",
+            "agreement": "event_only",
+            "score": event_score,
+            "reason": "independent regime/order-flow candidate",
+        }
+
+    trend_side = str(trend["side"])
+    event_side = str(event["side"])
+    if trend_side == event_side:
+        combined_score = _clamp(
+            0.45 * trend_score + 0.55 * event_score + 8.0,
+            0.0,
+            100.0,
+        )
+        return {
+            **waiting,
+            "allowed": True,
+            "side": trend_side,
+            "source": "aligned",
+            "agreement": "aligned",
+            "score": combined_score,
+            "reason": "1h trend and independent event engine aligned",
+        }
+
+    margin = _clamp(conflict_margin, 5.0, 30.0)
+    score_gap = event_score - trend_score
+    if score_gap >= margin:
+        return {
+            **waiting,
+            "allowed": True,
+            "side": event_side,
+            "source": "event_conflict_winner",
+            "agreement": "conflict_resolved",
+            "score": event_score,
+            "reason": f"event candidate won conflict by {score_gap:.1f} points",
+        }
+    if score_gap <= -margin:
+        return {
+            **waiting,
+            "allowed": True,
+            "side": trend_side,
+            "source": "trend_conflict_winner",
+            "agreement": "conflict_resolved",
+            "score": trend_score,
+            "reason": f"trend candidate won conflict by {abs(score_gap):.1f} points",
+        }
+    return {
+        **waiting,
+        "source": "conflict_wait",
+        "agreement": "conflict",
+        "reason": (
+            f"trend {trend_side} {trend_score:.1f} vs event "
+            f"{event_side} {event_score:.1f}; gap below {margin:.1f}"
+        ),
+    }
 
 
 def _clean_rows(
@@ -572,4 +760,6 @@ __all__ = (
     "default_change_point_flow_config",
     "evaluate_change_point_flow_entry",
     "normalize_change_point_flow_config",
+    "resolve_trend_event_candidate",
+    "select_independent_change_point_flow_candidate",
 )

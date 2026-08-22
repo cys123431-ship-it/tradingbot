@@ -6,6 +6,8 @@ from utbreakout.change_point_flow import (
     CHANGE_POINT_FLOW_PROFILE_VERSION,
     evaluate_change_point_flow_entry,
     normalize_change_point_flow_config,
+    resolve_trend_event_candidate,
+    select_independent_change_point_flow_candidate,
 )
 from bot_runtime.signal_entry import build_durable_entry_plan_summary
 
@@ -171,10 +173,81 @@ def test_change_point_flow_audit_fields_survive_entry_plan_persistence():
         "change_point_flow_state": "new_regime",
         "change_point_flow_total_score": 87.5,
         "change_point_flow_stop_atr_multiplier": 1.35,
+        "trend_event_candidate_source": "event_only",
+        "trend_event_candidate_agreement": "event_only",
+        "trend_event_candidate_score": 87.5,
         "temporary_debug_value": "drop-me",
     })
 
     assert summary["change_point_flow_profile"] == CHANGE_POINT_FLOW_PROFILE_VERSION
     assert summary["change_point_flow_state"] == "new_regime"
     assert summary["change_point_flow_total_score"] == pytest.approx(87.5)
+    assert summary["trend_event_candidate_source"] == "event_only"
+    assert summary["trend_event_candidate_agreement"] == "event_only"
+    assert summary["trend_event_candidate_score"] == pytest.approx(87.5)
     assert "temporary_debug_value" not in summary
+
+
+@pytest.mark.parametrize(("side", "direction"), (("long", 1), ("short", -1)))
+def test_independent_event_engine_creates_direction_without_trend_gate(side, direction):
+    context = {
+        "rolling_orderbook_imbalance_pct": 18.0 * direction,
+        "rolling_orderbook_imbalance_delta": 9.0 * direction,
+        "taker_buy_sell_ratio": 1.25 if direction > 0 else 0.78,
+        "open_interest_delta_z": 1.4,
+        "open_interest_acceleration": 0.9,
+    }
+    result = select_independent_change_point_flow_candidate(
+        _event_rows(direction),
+        futures_context=context,
+    )
+
+    assert result["allowed"] is True
+    assert result["side"] == side
+    assert result["decision"]["state"] in {"new_regime", "persistent_flow"}
+
+
+def test_independent_event_engine_does_not_use_legacy_missing_data_fallback():
+    result = select_independent_change_point_flow_candidate([], futures_context={})
+
+    assert result["allowed"] is False
+    assert result["side"] is None
+
+
+def test_candidate_resolver_keeps_trend_and_event_as_or_paths():
+    trend_only = resolve_trend_event_candidate(
+        {"allowed": True, "side": "long", "score": 72.0},
+        {"allowed": False},
+    )
+    event_only = resolve_trend_event_candidate(
+        {"allowed": False},
+        {"allowed": True, "side": "short", "score": 78.0},
+    )
+    aligned = resolve_trend_event_candidate(
+        {"allowed": True, "side": "long", "score": 72.0},
+        {"allowed": True, "side": "long", "score": 80.0},
+    )
+
+    assert trend_only["source"] == "trend_only"
+    assert event_only["source"] == "event_only"
+    assert aligned["source"] == "aligned"
+    assert aligned["score"] > max(72.0, 80.0)
+
+
+def test_candidate_resolver_waits_on_close_conflict_and_accepts_clear_winner():
+    waiting = resolve_trend_event_candidate(
+        {"allowed": True, "side": "long", "score": 76.0},
+        {"allowed": True, "side": "short", "score": 70.0},
+        conflict_margin=12.0,
+    )
+    event_winner = resolve_trend_event_candidate(
+        {"allowed": True, "side": "long", "score": 65.0},
+        {"allowed": True, "side": "short", "score": 82.0},
+        conflict_margin=12.0,
+    )
+
+    assert waiting["allowed"] is False
+    assert waiting["source"] == "conflict_wait"
+    assert event_winner["allowed"] is True
+    assert event_winner["side"] == "short"
+    assert event_winner["source"] == "event_conflict_winner"

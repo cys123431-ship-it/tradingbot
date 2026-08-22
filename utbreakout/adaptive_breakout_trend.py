@@ -23,7 +23,7 @@ from .change_point_flow import (
 
 
 ADAPTIVE_BREAKOUT_TREND_STRATEGY = "adaptive_breakout_trend_v1"
-ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v8_change_point_flow"
+ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v9_independent_event"
 
 
 def default_adaptive_breakout_trend_config() -> dict[str, Any]:
@@ -207,6 +207,7 @@ def normalize_adaptive_breakout_trend_config(
             (
                 "adaptive_trend_portfolio_v6_",
                 "adaptive_trend_portfolio_v7_",
+                "adaptive_trend_portfolio_v8_",
             )
         )
     ):
@@ -304,7 +305,7 @@ def normalize_adaptive_breakout_trend_config(
         )
         for key in profile_keys:
             normalized[key] = defaults[key]
-    # v6/v7 already carry the requested aggressive sizing and runner policy.
+    # v6-v8 already carry the requested aggressive sizing and runner policy.
     # Preserve operator-tuned risk/exit values while defaults above add the
     # new entry fields.  This also prevents an open position's
     # runtime policy from changing merely because the entry profile advanced.

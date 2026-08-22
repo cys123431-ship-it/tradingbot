@@ -7,6 +7,10 @@ from utbreakout.adaptive_breakout_trend import (
     evaluate_adaptive_breakout_trend,
     normalize_adaptive_breakout_trend_config,
 )
+from utbreakout.change_point_flow import (
+    resolve_trend_event_candidate,
+    select_independent_change_point_flow_candidate,
+)
 from utbreakout.tradfi_pattern_profile import (
     evaluate_tradfi_pattern_profile,
     normalize_tradfi_pattern_profile_config,
@@ -2333,20 +2337,154 @@ class SignalScannerMixin:
                         config=profile_cfg,
                     )
                 trend_metrics = dict(trend_decision.metrics or {})
+                event_candidate = {
+                    'allowed': False,
+                    'side': None,
+                    'score': 0.0,
+                    'reason': 'independent event path not applicable',
+                    'source': 'change_point_flow',
+                    'evaluations': {},
+                }
+                small_account_candidate = False
+                balance_reader = getattr(
+                    self,
+                    '_adaptive_trend_balance_snapshot',
+                    None,
+                )
+                if callable(balance_reader):
+                    try:
+                        total_balance, free_balance, _ = await balance_reader()
+                        balance_for_risk = (
+                            total_balance if total_balance > 0 else free_balance
+                        )
+                        small_account_candidate = bool(
+                            trend_cfg.get('small_account_aggressive_enabled', True)
+                            and balance_for_risk > 0
+                            and balance_for_risk
+                            < float(
+                                trend_cfg.get(
+                                    'small_account_equity_threshold_usdt',
+                                    1_000.0,
+                                )
+                                or 1_000.0
+                            )
+                            and free_balance > 0
+                        )
+                    except Exception as exc:
+                        result['adaptive_trend_balance_error'] = str(exc)
+                if small_account_candidate:
+                    event_rows = self._relative_strength_pullback_rows_from_ohlcv(
+                        ohlcv
+                    )
+                    event_rows = completed_candle_rows(
+                        event_rows,
+                        entry_tf,
+                        {'exclude_incomplete_live_candle': True},
+                        now_ms=int(time.time() * 1000.0),
+                    )
+                    event_candidate = (
+                        select_independent_change_point_flow_candidate(
+                            event_rows,
+                            futures_context=futures_context,
+                            config=trend_cfg.get('change_point_flow'),
+                            tradfi=bool(base_candidate.get('tradifi_perpetual')),
+                        )
+                    )
+                trend_candidate = {
+                    'allowed': bool(
+                        trend_decision.allowed
+                        and trend_decision.side in {'long', 'short'}
+                    ),
+                    'side': trend_decision.side,
+                    'score': float(trend_decision.score),
+                    'reason': trend_decision.reason,
+                }
+                candidate_resolution = resolve_trend_event_candidate(
+                    trend_candidate,
+                    event_candidate,
+                    conflict_margin=float(
+                        (trend_cfg.get('change_point_flow') or {}).get(
+                            'candidate_conflict_margin',
+                            12.0,
+                        )
+                        or 12.0
+                    ),
+                )
+                candidate_side = candidate_resolution.get('side')
+                candidate_metrics = dict(trend_metrics)
+                if candidate_resolution.get('source') in {
+                    'event_only',
+                    'event_conflict_winner',
+                }:
+                    event_decision = dict(event_candidate.get('decision') or {})
+                    event_direction = 1.0 if candidate_side == 'long' else -1.0
+                    candidate_metrics.update({
+                        'weighted_momentum': event_direction * min(
+                            1.5,
+                            abs(
+                                float(
+                                    event_decision.get(
+                                        'directional_drift_z',
+                                        0.0,
+                                    )
+                                    or 0.0
+                                )
+                            )
+                            / 2.5,
+                        ),
+                        'entry_opportunity_score': event_decision.get(
+                            'total_score'
+                        ),
+                        'trend_clarity': min(
+                            1.0,
+                            float(
+                                event_decision.get('regime_change_score', 0.0)
+                                or 0.0
+                            )
+                            / 100.0,
+                        ),
+                        'fast_momentum_retention': event_decision.get(
+                            'directional_persistence'
+                        ),
+                    })
                 rotation_score = self._calculate_convex_rotation_score(
-                    trend_decision.side,
-                    trend_metrics,
+                    candidate_side,
+                    candidate_metrics,
                     selection_metrics,
                     futures_context,
                     base_candidate,
                     tradfi=bool(base_candidate.get('tradifi_perpetual')),
                 )
                 result.update({
-                    'adaptive_breakout_trend_allowed': bool(trend_decision.allowed),
-                    'adaptive_breakout_trend_side': trend_decision.side,
-                    'adaptive_breakout_trend_score': float(trend_decision.score),
-                    'adaptive_breakout_trend_reason': trend_decision.reason,
-                    'adaptive_breakout_trend_weighted_momentum': trend_metrics.get('weighted_momentum'),
+                    'adaptive_breakout_trend_allowed': bool(
+                        candidate_resolution.get('allowed')
+                    ),
+                    'adaptive_breakout_trend_side': candidate_side,
+                    'adaptive_breakout_trend_score': float(
+                        candidate_resolution.get('score', 0.0) or 0.0
+                    ),
+                    'adaptive_breakout_trend_reason': candidate_resolution.get(
+                        'reason'
+                    ),
+                    'adaptive_breakout_trend_weighted_momentum': (
+                        candidate_metrics.get('weighted_momentum')
+                    ),
+                    'adaptive_trend_candidate_source': candidate_resolution.get(
+                        'source'
+                    ),
+                    'adaptive_trend_candidate_agreement': (
+                        candidate_resolution.get('agreement')
+                    ),
+                    'adaptive_trend_raw_allowed': bool(trend_decision.allowed),
+                    'adaptive_trend_raw_side': trend_decision.side,
+                    'adaptive_trend_raw_score': float(trend_decision.score),
+                    'independent_event_allowed': bool(
+                        event_candidate.get('allowed')
+                    ),
+                    'independent_event_side': event_candidate.get('side'),
+                    'independent_event_score': float(
+                        event_candidate.get('score', 0.0) or 0.0
+                    ),
                     'adaptive_breakout_trend_risk_percent': trend_metrics.get('target_risk_percent'),
                     'adaptive_breakout_trend_continuation_reacceleration': bool(
                         trend_metrics.get('continuation_reacceleration')

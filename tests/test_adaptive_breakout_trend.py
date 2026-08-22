@@ -567,7 +567,7 @@ def test_live_crossover_reuses_completed_candle_and_keeps_decision_metadata(monk
     assert plan["adaptive_trend_initial_fraction"] == pytest.approx(
         plan["small_account_initial_margin_fraction"]
     )
-    assert plan["change_point_flow_profile"] == "change_point_flow_v1"
+    assert plan["change_point_flow_profile"] == "change_point_flow_v2_independent"
     assert plan["adaptive_trend_risk_tier"] == "strong"
     assert plan["convex_rotation_percentile"] == pytest.approx(80.0)
     assert plan["adaptive_trend_target_qty"] > plan["qty"]
@@ -744,6 +744,24 @@ def test_v7_profile_upgrade_preserves_open_position_risk_and_exit_policy():
     assert migrated["base_risk_percent"] == pytest.approx(6.50)
     assert migrated["runner_pct"] == pytest.approx(0.77)
     assert migrated["atr_trailing_multiplier"] == pytest.approx(3.25)
+    assert migrated["change_point_flow"]["enabled"] is True
+
+
+def test_v8_profile_upgrade_preserves_live_position_risk_and_exit_policy():
+    migrated = normalize_adaptive_breakout_trend_config(
+        {
+            "profile_version": "adaptive_trend_portfolio_v8_change_point_flow",
+            "base_risk_percent": 6.25,
+            "base_risk_percent_max": 7.0,
+            "runner_pct": 0.79,
+            "atr_trailing_multiplier": 3.15,
+        }
+    )
+
+    assert migrated["profile_version"] == ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION
+    assert migrated["base_risk_percent"] == pytest.approx(6.25)
+    assert migrated["runner_pct"] == pytest.approx(0.79)
+    assert migrated["atr_trailing_multiplier"] == pytest.approx(3.15)
     assert migrated["change_point_flow"]["enabled"] is True
 
 
