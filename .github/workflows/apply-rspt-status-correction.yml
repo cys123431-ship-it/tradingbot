@@ -1,0 +1,42 @@
+name: Apply RSPT status correction
+
+on:
+  push:
+    branches:
+      - fix-rspt-market-status-label
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix-rspt-market-status-label
+          fetch-depth: 0
+      - name: Patch status text
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -c "from pathlib import Path; p=Path('emas.py'); s=p.read_text(encoding='utf-8'); s=s.replace(\"rsp_cfg.get('entry_execution', 'market') or 'next_open'\", \"rsp_cfg.get('entry_execution', 'market') or 'market'\", 1); s=s.replace(\"                  'market': '완성봉 확인 직후 시장가',\\n            'market': '시장가',\", \"            'market': '완성봉 확인 직후 시장가',\", 1); p.write_text(s, encoding='utf-8')"
+          grep -F "execution = str(rsp_cfg.get('entry_execution', 'market') or 'market')" emas.py
+          grep -F "'market': '완성봉 확인 직후 시장가'" emas.py
+          git diff --check
+      - name: Verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile emas.py
+          python -m pytest -q tests/test_rspt_closed_candle_market_entry.py tests/test_rspt_status_traffic_lights.py
+      - name: Commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add emas.py
+          git commit -m "fix: correct RSPT market execution status"
+          git push origin HEAD:fix-rspt-market-status-label
