@@ -16,7 +16,7 @@ async def _manage_live_ladder_exit_policy(self, symbol, pos, df, cfg):
         if isinstance(cleanup_status, dict) and cleanup_status.get("position_active"):
             return {"status": "POSITION_ACTIVE", "audit": cleanup_status}
         if isinstance(cleanup_status, dict) and cleanup_status.get("cleanup_confirmed"):
-            await self._record_closed_trade_accounting(
+            accounting = await self._record_closed_trade_accounting(
                 symbol,
                 "take profit/stop loss closed position",
                 state=state,
@@ -25,6 +25,7 @@ async def _manage_live_ladder_exit_policy(self, symbol, pos, df, cfg):
                 symbol,
                 finalize=True,
                 reason="take profit closed position",
+                exit_price=(accounting or {}).get("exit_price"),
             )
             self._clear_aggressive_growth_position(symbol)
             return {"status": "FLAT_CLEANED", "audit": cleanup_status}
@@ -106,7 +107,14 @@ async def _manage_live_ladder_exit_policy(self, symbol, pos, df, cfg):
         )
     fallback_status = await self._maybe_tp2_fallback_close(symbol, pos, state, cfg, audit_status=audit_status)
     if fallback_status.get("status") == "TP2_FALLBACK_CLOSED":
-        self._clear_utbreakout_trailing_state(symbol, finalize=True, reason="TP2 fallback close")
+        self._clear_utbreakout_trailing_state(
+            symbol,
+            finalize=True,
+            reason="TP2 fallback close",
+            exit_price=(
+                ((fallback_status.get("order") or {}).get("_accounting") or {}).get("exit_price")
+            ),
+        )
         return {"status": "EXITED", "reason": "TP2_FALLBACK_CLOSE", "fallback": fallback_status}
 
     state_engine = str(state.get("engine") or "").strip().upper()
@@ -158,7 +166,12 @@ async def _manage_live_ladder_exit_policy(self, symbol, pos, df, cfg):
             and bool((close_result or {}).get("_cleanup_confirmed"))
         ):
             return {"status": "EXIT_PENDING", "reason": time_stop.reason, "order": close_result}
-        self._clear_utbreakout_trailing_state(symbol, finalize=True, reason=time_stop.reason)
+        self._clear_utbreakout_trailing_state(
+            symbol,
+            finalize=True,
+            reason=time_stop.reason,
+            exit_price=((close_result or {}).get("_accounting") or {}).get("exit_price"),
+        )
         return {"status": "EXITED", "reason": time_stop.reason}
 
     rows = []
@@ -193,7 +206,12 @@ async def _manage_live_ladder_exit_policy(self, symbol, pos, df, cfg):
             and bool((close_result or {}).get("_cleanup_confirmed"))
         ):
             return {"status": "EXIT_PENDING", "reason": invalid_exit.reason, "order": close_result}
-        self._clear_utbreakout_trailing_state(symbol, finalize=True, reason=invalid_exit.reason)
+        self._clear_utbreakout_trailing_state(
+            symbol,
+            finalize=True,
+            reason=invalid_exit.reason,
+            exit_price=((close_result or {}).get("_accounting") or {}).get("exit_price"),
+        )
         return {"status": "EXITED", "reason": invalid_exit.reason}
     return None
 

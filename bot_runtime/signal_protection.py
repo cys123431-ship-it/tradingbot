@@ -1596,6 +1596,18 @@ class SignalProtectionMixin:
         status['actual_tp_count'] = len(valid_tp)
         status['tp_present'] = len(valid_tp) > 0
         status['sl_present'] = len(valid_sl) > 0
+        status['tp_orders'] = [
+            {
+                'tp_label': self._protection_tp_label(order, planned_tp_orders),
+                'price': (
+                    _safe_float_or_none(order.get('price'))
+                    or self._protection_trigger_price(order)
+                ),
+                'qty': self._protection_order_amount(order),
+                'order_id': self._protection_order_id(order),
+            }
+            for order in valid_tp
+        ]
         if expected_tp_labels:
             status['missing_tp1'] = 'TP1' in expected_tp_labels and not status['tp1_present']
             status['missing_tp2'] = 'TP2' in expected_tp_labels and not status['tp2_present']
@@ -1603,6 +1615,71 @@ class SignalProtectionMixin:
         else:
             status['missing_tp'] = bool(expected_tp) and not status['tp_present']
         status['missing_sl'] = bool(expected_sl) and not status['sl_present']
+
+        # Binance can remove a filled TP order from the open-order snapshot a
+        # few moments before the position endpoint reflects the reduced size.
+        # Re-read the position before classifying a planned TP as missing so a
+        # normal partial fill cannot be mistaken for lost protection.
+        if (
+            planned_by_label
+            and status['missing_tp']
+            and isinstance(runner_state, dict)
+        ):
+            position_fetch_ok, fresh_pos = await self._fetch_server_position_checked(symbol)
+            status['position_refresh_after_missing_tp'] = bool(position_fetch_ok)
+            if position_fetch_ok and not fresh_pos:
+                self._clear_protection_missing_candidates(symbol)
+                status.update({
+                    'missing_tp': False,
+                    'missing_tp1': False,
+                    'missing_tp2': False,
+                    'missing_sl': False,
+                    'status': 'POSITION_CLOSED_DURING_AUDIT',
+                })
+                self.last_protection_order_status[symbol] = status
+                return status
+            if position_fetch_ok and fresh_pos:
+                pos = fresh_pos
+                current_qty = abs(float(
+                    self._position_signed_contracts(fresh_pos)
+                    or fresh_pos.get('contracts', 0)
+                    or 0
+                ))
+                status['refreshed_position_qty'] = current_qty
+                runner_state = self._update_utbreakout_fill_flags_from_position_qty(
+                    symbol,
+                    runner_state,
+                    current_qty,
+                )
+                expected_tp_labels = [
+                    label
+                    for label, plan in planned_by_label.items()
+                    if not bool(runner_state.get(f"{label.lower()}_filled", False))
+                    and not bool(plan.get('filled', False))
+                ]
+                for label in planned_by_label:
+                    filled = bool(runner_state.get(f"{label.lower()}_filled", False))
+                    planned_by_label[label]['filled'] = filled
+                status['expected_tp_count'] = len(expected_tp_labels)
+                status['planned_tp_orders'] = [
+                    {
+                        'tp_label': label,
+                        'price': planned_by_label[label].get('price'),
+                        'qty': planned_by_label[label].get('qty'),
+                        'side': planned_by_label[label].get('side'),
+                    }
+                    for label in expected_tp_labels
+                ]
+                status['missing_tp1'] = (
+                    'TP1' in expected_tp_labels and not status['tp1_present']
+                )
+                status['missing_tp2'] = (
+                    'TP2' in expected_tp_labels and not status['tp2_present']
+                )
+                status['missing_tp'] = (
+                    status['missing_tp1'] or status['missing_tp2']
+                )
+                self._set_utbreakout_trailing_state(symbol, runner_state)
         tp_qty_mismatches = []
         tp_price_mismatches = []
         for label in expected_tp_labels:
@@ -1739,17 +1816,17 @@ class SignalProtectionMixin:
                 )
             protection_lockout_reason = None
             protection_label = None
-            if confirmed and active_strategy in UTBREAKOUT_STRATEGIES:
-                if status.get('missing_sl'):
-                    protection_lockout_reason = "STOP_LOSS_PROTECTION_FAILED_FORCE_CLOSED"
-                    protection_label = "SL"
-                elif (
-                    status.get('missing_tp')
-                    or status.get('missing_tp1')
-                    or status.get('missing_tp2')
-                ):
-                    protection_lockout_reason = "TAKE_PROFIT_PROTECTION_FAILED_FORCE_CLOSED"
-                    protection_label = "TP"
+            if (
+                confirmed
+                and active_strategy in UTBREAKOUT_STRATEGIES
+                and status.get('missing_sl')
+            ):
+                # Missing SL leaves the position without a bounded loss and is
+                # therefore fail-closed. Missing TP still has an active SL and
+                # is repaired by the ladder manager; force-closing it would
+                # destroy a valid runner after a normal partial take-profit.
+                protection_lockout_reason = "STOP_LOSS_PROTECTION_FAILED_FORCE_CLOSED"
+                protection_label = "SL"
             if protection_lockout_reason:
                 close_status = await self._emergency_close_position_without_stop_loss(
                     symbol,

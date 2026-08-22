@@ -26,6 +26,10 @@ def _ensure_trading_safety_runtime(self):
         store = SQLiteTradingStateStore(state_path)
     owner.trading_state_store = store
     self.trading_state_store = store
+    for runtime_owner in (owner, self):
+        db = getattr(runtime_owner, 'db', None)
+        if db is not None:
+            db.trade_result_store = store
     if not getattr(owner, "_engine_performance_stats_restored", False):
         _restore_engine_performance_stats(store)
         owner._engine_performance_stats_restored = True

@@ -125,6 +125,44 @@ def test_accounting_finalizer_includes_entry_fill_just_before_db_entry_time(tmp_
     asyncio.run(scenario())
 
 
+def test_accounting_finalizer_reports_slippage_without_double_counting_it(tmp_path):
+    async def scenario():
+        store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+        store.upsert_trade_result(
+            _trade(
+                entry_price=101.0,
+                planned_entry_price=100.0,
+                filled_qty=2.0,
+                exit_price=89.0,
+                exit_legs=[
+                    {
+                        "order_id": "sl-order",
+                        "label": "SL",
+                        "qty": 2.0,
+                        "price": 89.0,
+                        "reference_price": 90.0,
+                    }
+                ],
+            )
+        )
+
+        class SlippageExchange:
+            def fetch_my_trades(self, _symbol, _since):
+                return [
+                    {"side": "buy", "order": "entry", "fee": {"cost": 0.5}},
+                    {"side": "sell", "order": "sl-order", "fee": {"cost": 0.5}},
+                ]
+
+        final = await TradeAccountingFinalizer(
+            SlippageExchange(), store
+        ).finalize_trade("trade-1")
+
+        assert final["slippage_usdt"] == pytest.approx(4.0)
+        assert final["net_pnl_usdt"] == pytest.approx(9.0)
+
+    asyncio.run(scenario())
+
+
 def test_engine_stats_use_final_trades_only_and_include_cost_burdens():
     stats = rebuild_engine_performance_stats(
         [

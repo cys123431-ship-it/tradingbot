@@ -71,7 +71,7 @@ fn render_chart(
 ) {
     let palette = Palette::new(light_mode);
     let available = ui.available_size();
-    let desired = Vec2::new(available.x.max(420.0), available.y.max(250.0));
+    let desired = Vec2::new(available.x.max(420.0), available.y.max(160.0));
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 8.0, palette.background);
@@ -160,6 +160,7 @@ fn render_chart(
 
     let mut above_lane = 0usize;
     let mut below_lane = 0usize;
+    let mut label_lanes = Vec::new();
     for line in lines {
         let placement = line_placement(line.price, low, high);
         let (y, prefix, line_start) = match placement {
@@ -183,16 +184,27 @@ fn render_chart(
                 )
             }
         };
+        let label_y = non_overlapping_label_y(y, chart, &label_lanes);
+        label_lanes.push(label_y);
         painter.line_segment(
             [Pos2::new(line_start, y), Pos2::new(chart.right(), y)],
             Stroke::new(line.width, line.color),
         );
+        if (label_y - y).abs() > 1.0 {
+            painter.line_segment(
+                [
+                    Pos2::new(chart.right(), y),
+                    Pos2::new(chart.right() + 5.0, label_y),
+                ],
+                Stroke::new(1.0, line.color),
+            );
+        }
         let distance = line
             .directional_percent
             .map(|percent| format!(" ({percent:+.2}%)"))
             .unwrap_or_default();
         painter.text(
-            Pos2::new(chart.right() + 8.0, y),
+            Pos2::new(chart.right() + 8.0, label_y),
             Align2::LEFT_CENTER,
             format!(
                 "{prefix}{} {}{distance}",
@@ -203,6 +215,29 @@ fn render_chart(
             line.color,
         );
     }
+}
+
+fn non_overlapping_label_y(base: f32, chart: Rect, used: &[f32]) -> f32 {
+    const GAP: f32 = 15.0;
+    let top = chart.top() + 7.0;
+    let bottom = chart.bottom() - 7.0;
+    for step in 0..=12 {
+        let offset = step as f32 * GAP;
+        let candidates = if step == 0 {
+            [base, base]
+        } else {
+            [base + offset, base - offset]
+        };
+        for candidate in candidates {
+            if candidate < top || candidate > bottom {
+                continue;
+            }
+            if used.iter().all(|other| (candidate - other).abs() >= GAP) {
+                return candidate;
+            }
+        }
+    }
+    base.clamp(top, bottom)
 }
 
 fn y_for(price: f64, chart: Rect, low: f64, span: f64) -> f32 {
@@ -536,5 +571,17 @@ mod tests {
         assert!((short_gain - 5.0).abs() < 1e-9);
         assert!((short_loss + 5.0).abs() < 1e-9);
         assert_eq!(directional_percent(105.0, 0.0, "LONG"), None);
+    }
+
+    #[test]
+    fn chart_labels_move_without_moving_their_price_lines() {
+        let chart = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(100.0, 100.0));
+        let used = vec![17.0];
+
+        let adjusted = non_overlapping_label_y(18.0, chart, &used);
+
+        assert!((adjusted - 18.0).abs() >= 15.0);
+        assert!(adjusted >= chart.top() + 7.0);
+        assert!(adjusted <= chart.bottom() - 7.0);
     }
 }

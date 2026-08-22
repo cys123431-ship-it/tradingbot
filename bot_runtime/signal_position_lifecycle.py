@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+
+_KST = ZoneInfo('Asia/Seoul')
+
 
 class SignalPositionLifecycleMixin:
     def _utbreakout_trailing_state_aliases(self, symbol):
@@ -289,7 +295,14 @@ class SignalPositionLifecycleMixin:
         load_results = getattr(store, 'load_trade_results', None)
         if callable(load_results):
             try:
-                today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+                local_now = datetime.now(timezone.utc).astimezone(_KST)
+                local_start = local_now.replace(
+                    hour=0,
+                    minute=0,
+                    second=0,
+                    microsecond=0,
+                )
+                local_end = local_start + timedelta(days=1)
                 matches = []
                 for trade in load_results() or []:
                     if not isinstance(trade, dict):
@@ -302,8 +315,22 @@ class SignalPositionLifecycleMixin:
                     if not attributed.intersection(strategy_values):
                         continue
                     exit_time = str(trade.get('exit_time') or '').strip()
-                    if not exit_time or (today_only and not exit_time.startswith(today)):
+                    if not exit_time:
                         continue
+                    if today_only:
+                        try:
+                            parsed_exit = datetime.fromisoformat(
+                                exit_time.replace('Z', '+00:00')
+                            )
+                            if parsed_exit.tzinfo is None:
+                                parsed_exit = parsed_exit.replace(
+                                    tzinfo=timezone.utc
+                                )
+                            parsed_exit = parsed_exit.astimezone(_KST)
+                        except ValueError:
+                            continue
+                        if not local_start <= parsed_exit < local_end:
+                            continue
                     pnl = _safe_float_or_none(
                         trade.get('net_pnl_usdt')
                         if trade.get('net_pnl_usdt') is not None

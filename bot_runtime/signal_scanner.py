@@ -70,11 +70,13 @@ class SignalScannerMixin:
             )
             return False
 
-        self._clear_utbreakout_trailing_state(
-            symbol,
-            finalize=True,
-            reason='scanner position completed',
-        )
+        clear_kwargs = {
+            'finalize': True,
+            'reason': 'scanner position completed',
+        }
+        if (accounting or {}).get('exit_price') is not None:
+            clear_kwargs['exit_price'] = accounting.get('exit_price')
+        self._clear_utbreakout_trailing_state(symbol, **clear_kwargs)
         clear_growth = getattr(self, '_clear_aggressive_growth_position', None)
         if callable(clear_growth):
             clear_growth(symbol)
@@ -233,7 +235,7 @@ class SignalScannerMixin:
                         self.scanner_active_symbol
                     )
                     if not position_fetch_ok:
-                        logger.warning(
+                        logger.debug(
                             "Scanner position lookup failed for %s; retaining the active "
                             "symbol and all protection orders until flat is confirmed",
                             self.scanner_active_symbol,

@@ -33,6 +33,15 @@ def test_runtime_snapshot_is_bounded_and_marks_bot_position():
                 "planned_tp_orders": [{"price": 12}, {"price": 14}],
             }
         },
+        last_protection_order_status={
+            "PROM/USDT:USDT": {
+                "status": "OK",
+                "fetch_ok": True,
+                "sl_present": True,
+                "stop_price": 9.5,
+                "tp_orders": [{"price": 12.5}],
+            }
+        },
     )
     controller = SimpleNamespace(
         engines={"signal": engine},
@@ -52,6 +61,8 @@ def test_runtime_snapshot_is_bounded_and_marks_bot_position():
     assert snapshot["strategies"][0]["state"] == "valid"
     assert snapshot["strategies"][1]["state"] == "waiting"
     assert snapshot["position_hints"][0]["strategy"] == "ADAPTIVE_BREAKOUT_TREND"
+    assert snapshot["position_hints"][0]["stop_price"] == 9.5
+    assert snapshot["position_hints"][0]["tp_prices"] == [12.5]
 
 
 def test_exchange_position_and_orders_are_read_only_normalized():

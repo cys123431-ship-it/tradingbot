@@ -1,7 +1,8 @@
 import asyncio
 import inspect
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -275,6 +276,48 @@ def test_daily_automatic_count_excludes_user_custom_entries(tmp_path):
 
     assert db.get_daily_entry_count() == 2
     assert db.get_daily_automatic_entry_count() == 1
+
+
+def test_daily_stats_use_korea_calendar_day_boundary(tmp_path):
+    db = emas.DBManager(str(tmp_path / "trades.db"))
+    kst_now = datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Seoul"))
+    kst_start = kst_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    before = (kst_start - timedelta(seconds=1)).astimezone(timezone.utc)
+    inside = (kst_start + timedelta(seconds=1)).astimezone(timezone.utc)
+    with db.lock:
+        db.conn.executemany(
+            """INSERT INTO trades (
+                symbol, side, entry_price, exit_price, quantity,
+                pnl_usdt, pnl_pct, entry_time, exit_time, exit_reason
+            ) VALUES (?, 'long', 1, 1, 1, ?, 0, ?, ?, 'test')""",
+            [
+                ("OLD/USDT:USDT", 99.0, before.isoformat(), before.isoformat()),
+                ("TODAY/USDT:USDT", 3.5, inside.isoformat(), inside.isoformat()),
+            ],
+        )
+        db.conn.commit()
+
+    assert db.get_daily_stats() == pytest.approx((1, 3.5))
+
+
+def test_daily_stats_prefer_fee_aware_live_result_when_coverage_matches(tmp_path):
+    db = emas.DBManager(str(tmp_path / "trades.db"))
+    db.log_trade_entry("BTC/USDT:USDT", "long", 100.0, 1.0)
+    db.log_trade_close("BTC/USDT:USDT", 10.0, 10.0, 110.0, "test")
+    exit_time = datetime.now(timezone.utc).isoformat()
+    db.trade_result_store = SimpleNamespace(
+        load_trade_results=lambda: [
+            {
+                "trade_id": "btc-today",
+                "exit_time": exit_time,
+                "gross_pnl_usdt": 10.0,
+                "net_pnl_usdt": 8.75,
+                "provisional": False,
+            }
+        ]
+    )
+
+    assert db.get_daily_stats() == pytest.approx((1, 8.75))
 
 
 def test_final_live_gateway_applies_scope_to_automatic_but_not_user_custom(monkeypatch):

@@ -2,6 +2,38 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+import sqlite3
+import threading
+from zoneinfo import ZoneInfo
+
+
+KST = ZoneInfo('Asia/Seoul')
+
+
+def _kst_day_bounds_utc(now=None):
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    local_now = reference.astimezone(KST)
+    local_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    local_end = local_start + timedelta(days=1)
+    return (
+        local_start.astimezone(timezone.utc),
+        local_end.astimezone(timezone.utc),
+    )
+
+
+def _timestamp_in_range(value, start, end):
+    try:
+        parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    parsed = parsed.astimezone(timezone.utc)
+    return start <= parsed < end
+
 class DBManager:
     def __init__(self, db_path='bot_database.db'):
         self.db_path = db_path
@@ -103,39 +135,83 @@ class DBManager:
             return bool(cur.rowcount)
 
     def get_daily_stats(self):
-        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        start, end = _kst_day_bounds_utc()
         with self.lock:
             cur = self.conn.cursor()
-            cur.execute("SELECT COUNT(*), SUM(pnl_usdt) FROM trades WHERE exit_time LIKE ?", (f"{today}%",))
+            cur.execute(
+                """SELECT COUNT(*), SUM(pnl_usdt) FROM trades
+                WHERE julianday(exit_time) >= julianday(?)
+                  AND julianday(exit_time) < julianday(?)""",
+                (start.isoformat(), end.isoformat()),
+            )
             res = cur.fetchone()
-            return (res[0] if res and res[0] else 0), (res[1] if res and res[1] else 0.0)
+            legacy_count = res[0] if res and res[0] else 0
+            legacy_pnl = res[1] if res and res[1] else 0.0
+        store = getattr(self, 'trade_result_store', None)
+        loader = getattr(store, 'load_trade_results', None)
+        if callable(loader):
+            try:
+                results = [
+                    item
+                    for item in loader() or []
+                    if isinstance(item, dict)
+                    and _timestamp_in_range(item.get('exit_time'), start, end)
+                ]
+                # Use fee/funding-aware results only when they cover the full
+                # legacy daily ledger. A partial accounting outage must not
+                # silently omit trades from the risk limit.
+                if results and len(results) >= legacy_count:
+                    return len(results), sum(
+                        float(
+                            item.get('net_pnl_usdt')
+                            if item.get('net_pnl_usdt') is not None
+                            else item.get('gross_pnl_usdt')
+                            or 0.0
+                        )
+                        for item in results
+                    )
+            except Exception:
+                pass
+        return legacy_count, legacy_pnl
 
     def get_weekly_stats(self):
-        week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).strftime('%Y-%m-%d')
+        _, today_end = _kst_day_bounds_utc()
+        week_ago = today_end - timedelta(days=7)
         with self.lock:
             cur = self.conn.cursor()
-            cur.execute("SELECT COUNT(*), SUM(pnl_usdt) FROM trades WHERE exit_time >= ?", (week_ago,))
+            cur.execute(
+                """SELECT COUNT(*), SUM(pnl_usdt) FROM trades
+                WHERE julianday(exit_time) >= julianday(?)
+                  AND julianday(exit_time) < julianday(?)""",
+                (week_ago.isoformat(), today_end.isoformat()),
+            )
             res = cur.fetchone()
             return (res[0] if res and res[0] else 0), (res[1] if res and res[1] else 0.0)
 
     def get_daily_entry_count(self):
-        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-        with self.lock:
-            cur = self.conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM trades WHERE entry_time LIKE ?", (f"{today}%",))
-            res = cur.fetchone()
-            return res[0] if res and res[0] else 0
-
-    def get_daily_automatic_entry_count(self):
-        """Count UTC-day entries owned by automatic strategies only."""
-        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        start, end = _kst_day_bounds_utc()
         with self.lock:
             cur = self.conn.cursor()
             cur.execute(
                 """SELECT COUNT(*) FROM trades
-                WHERE entry_time LIKE ?
+                WHERE julianday(entry_time) >= julianday(?)
+                  AND julianday(entry_time) < julianday(?)""",
+                (start.isoformat(), end.isoformat()),
+            )
+            res = cur.fetchone()
+            return res[0] if res and res[0] else 0
+
+    def get_daily_automatic_entry_count(self):
+        """Count Korea-calendar-day entries owned by automatic strategies."""
+        start, end = _kst_day_bounds_utc()
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """SELECT COUNT(*) FROM trades
+                WHERE julianday(entry_time) >= julianday(?)
+                  AND julianday(entry_time) < julianday(?)
                   AND LOWER(COALESCE(strategy, '')) NOT IN ('user_custom', 'custom_entry')""",
-                (f"{today}%",),
+                (start.isoformat(), end.isoformat()),
             )
             res = cur.fetchone()
             return res[0] if res and res[0] else 0
@@ -157,9 +233,12 @@ class DBManager:
         where = ["exit_time IS NOT NULL"]
         params = []
         if today_only:
-            today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-            where.append("exit_time LIKE ?")
-            params.append(f"{today}%")
+            start, end = _kst_day_bounds_utc()
+            where.extend((
+                "julianday(exit_time) >= julianday(?)",
+                "julianday(exit_time) < julianday(?)",
+            ))
+            params.extend((start.isoformat(), end.isoformat()))
         if strategy_values:
             placeholders = ','.join('?' for _ in strategy_values)
             where.append(f"LOWER(COALESCE(strategy, '')) IN ({placeholders})")

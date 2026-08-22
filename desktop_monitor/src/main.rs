@@ -82,6 +82,7 @@ struct MonitorApp {
     connection: Connection,
     last_received: Option<Instant>,
     theme: Theme,
+    chart_split_ratio: f32,
 }
 
 impl MonitorApp {
@@ -99,6 +100,7 @@ impl MonitorApp {
             connection: Connection::Connecting,
             last_received: None,
             theme,
+            chart_split_ratio: load_chart_split_ratio(),
         }
     }
 
@@ -512,6 +514,7 @@ impl MonitorApp {
 
 impl Drop for MonitorApp {
     fn drop(&mut self) {
+        save_chart_split_ratio(self.chart_split_ratio);
         self.stop.store(true, Ordering::Relaxed);
     }
 }
@@ -528,20 +531,72 @@ impl eframe::App for MonitorApp {
         let available = ui.available_size();
         let status_width = available.x.clamp(330.0, 390.0);
         let chart_width = (available.x - status_width - 12.0).max(420.0);
-        let chart_height = ((available.y - 8.0) * 0.5).max(250.0);
+        const SPLITTER_HEIGHT: f32 = 12.0;
+        const MIN_CHART_HEIGHT: f32 = 160.0;
+        let charts_height = (available.y - SPLITTER_HEIGHT).max(1.0);
+        let effective_min_height = MIN_CHART_HEIGHT.min(charts_height * 0.5);
+        let min_ratio = effective_min_height / charts_height;
+        self.chart_split_ratio = self.chart_split_ratio.clamp(min_ratio, 1.0 - min_ratio);
+        let futures_chart_height = charts_height * self.chart_split_ratio;
+        let options_chart_height = charts_height - futures_chart_height;
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(
                 egui::vec2(chart_width, available.y),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     ui.allocate_ui_with_layout(
-                        egui::vec2(chart_width, chart_height),
+                        egui::vec2(chart_width, futures_chart_height),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| chart::show(ui, &self.state, self.theme == Theme::Light),
                     );
-                    ui.separator();
+                    let (splitter_rect, splitter_response) = ui.allocate_exact_size(
+                        egui::vec2(chart_width, SPLITTER_HEIGHT),
+                        egui::Sense::click_and_drag(),
+                    );
+                    let splitter_response = splitter_response
+                        .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+                        .on_hover_text("드래그: 차트 높이 조절 · 더블클릭: 50:50 초기화");
+                    let splitter_color =
+                        if splitter_response.dragged() || splitter_response.hovered() {
+                            ui.visuals().selection.bg_fill
+                        } else {
+                            ui.visuals().widgets.inactive.bg_stroke.color
+                        };
+                    let center_y = splitter_rect.center().y;
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(splitter_rect.left(), center_y),
+                            egui::pos2(splitter_rect.right(), center_y),
+                        ],
+                        egui::Stroke::new(1.0, splitter_color),
+                    );
+                    for offset in [-2.0_f32, 0.0, 2.0] {
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(splitter_rect.center().x - 18.0, center_y + offset),
+                                egui::pos2(splitter_rect.center().x + 18.0, center_y + offset),
+                            ],
+                            egui::Stroke::new(1.0, splitter_color),
+                        );
+                    }
+                    if splitter_response.double_clicked() {
+                        self.chart_split_ratio = 0.5;
+                        save_chart_split_ratio(self.chart_split_ratio);
+                        ui.ctx().request_repaint();
+                    } else if splitter_response.dragged() {
+                        let pointer_delta_y = ui.input(|input| input.pointer.delta().y);
+                        if pointer_delta_y != 0.0 {
+                            let next_height = (futures_chart_height + pointer_delta_y)
+                                .clamp(effective_min_height, charts_height - effective_min_height);
+                            self.chart_split_ratio = next_height / charts_height;
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                    if splitter_response.drag_stopped() {
+                        save_chart_split_ratio(self.chart_split_ratio);
+                    }
                     ui.allocate_ui_with_layout(
-                        egui::vec2(chart_width, chart_height),
+                        egui::vec2(chart_width, options_chart_height),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             chart::show_options(ui, &self.state.options, self.theme == Theme::Light)
@@ -621,6 +676,33 @@ fn theme_path() -> Option<std::path::PathBuf> {
             .join("TradingBotMonitor")
             .join("theme.txt")
     })
+}
+
+fn chart_split_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|root| {
+        std::path::PathBuf::from(root)
+            .join("TradingBotMonitor")
+            .join("chart_split.txt")
+    })
+}
+
+fn load_chart_split_ratio() -> f32 {
+    chart_split_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.5)
+        .clamp(0.1, 0.9)
+}
+
+fn save_chart_split_ratio(ratio: f32) {
+    let Some(path) = chart_split_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, format!("{:.6}", ratio.clamp(0.1, 0.9)));
 }
 
 fn install_korean_font(ctx: &egui::Context) {

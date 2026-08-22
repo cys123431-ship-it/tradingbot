@@ -437,8 +437,36 @@ class SignalExitMixin:
         if bool(state.get('advanced_live_ladder_state', False)):
             return None
         if not pos:
-            self._clear_utbreakout_trailing_state(symbol, finalize=True, reason='position closed before runner update')
-            return None
+            cleanup = await self._reconcile_closed_position_protection(
+                symbol,
+                reason='position closed before runner update',
+                alert=True,
+                attempts=2,
+            )
+            if not (
+                isinstance(cleanup, dict)
+                and cleanup.get('cleanup_confirmed')
+            ):
+                return {'status': 'FLAT_CLEANUP_PENDING', 'audit': cleanup}
+            accounting_state = dict(state)
+            accounting_state['_require_exchange_fills'] = True
+            accounting = await self._record_closed_trade_accounting(
+                symbol,
+                'position closed before runner update',
+                state=accounting_state,
+            )
+            if str((accounting or {}).get('status') or '').upper() not in {
+                'RECORDED',
+                'NO_OPEN_TRADE',
+            }:
+                return {'status': 'FLAT_ACCOUNTING_PENDING', 'accounting': accounting}
+            self._clear_utbreakout_trailing_state(
+                symbol,
+                finalize=True,
+                reason='position closed before runner update',
+                exit_price=(accounting or {}).get('exit_price'),
+            )
+            return {'status': 'FLAT_CLEANED', 'accounting': accounting}
         # Position-exit policy is fixed when the order is opened.  Prefer the
         # persisted entry state so a later global config change cannot tighten
         # or disable an existing strategy's runner unexpectedly.
@@ -484,7 +512,14 @@ class SignalExitMixin:
             )
             fallback_status = await self._maybe_tp2_fallback_close(symbol, pos, state, cfg, audit_status=audit_status)
             if fallback_status.get('status') == 'TP2_FALLBACK_CLOSED':
-                self._clear_utbreakout_trailing_state(symbol, finalize=True, reason='TP2 fallback close')
+                self._clear_utbreakout_trailing_state(
+                    symbol,
+                    finalize=True,
+                    reason='TP2 fallback close',
+                    exit_price=(
+                        ((fallback_status.get('order') or {}).get('_accounting') or {}).get('exit_price')
+                    ),
+                )
                 return {'status': 'EXITED', 'reason': 'TP2_FALLBACK_CLOSE', 'fallback': fallback_status}
 
         closed = df.iloc[:-1].copy().reset_index(drop=True) if df is not None and len(df) >= 3 else None
@@ -703,6 +738,7 @@ class SignalExitMixin:
                                 symbol,
                                 finalize=True,
                                 reason=reason,
+                                exit_price=((close_result or {}).get('_accounting') or {}).get('exit_price'),
                             )
                             return {
                                 'status': 'EXITED',
@@ -748,6 +784,7 @@ class SignalExitMixin:
                             symbol,
                             finalize=True,
                             reason=reason,
+                            exit_price=((close_result or {}).get('_accounting') or {}).get('exit_price'),
                         )
                         return {
                             'status': 'EXITED',
@@ -922,6 +959,7 @@ class SignalExitMixin:
                     symbol,
                     finalize=True,
                     reason=alpha_follow_exit.reason,
+                    exit_price=((close_result or {}).get('_accounting') or {}).get('exit_price'),
                 )
                 return {
                     'status': 'EXITED',
@@ -967,6 +1005,7 @@ class SignalExitMixin:
                         symbol,
                         finalize=True,
                         reason=time_stop.reason,
+                        exit_price=((close_result or {}).get('_accounting') or {}).get('exit_price'),
                     )
                     return {
                         'status': 'EXITED',
@@ -2087,6 +2126,8 @@ class SignalExitMixin:
 
             # Take Profit is allowed to be split; SL always covers the full current size.
             valid_tp_targets = []
+            tp_order_ids = []
+            tp_order_labels = {}
             for target in normalized_tp_targets:
                 target_label = target.get('label') or 'TP'
                 target_price = target.get('price')
@@ -2133,7 +2174,7 @@ class SignalExitMixin:
                     if order_type == 'take_profit_market':
                         order_params['stopPrice'] = target_price
                         order_params['closePosition'] = False
-                    await self._create_protection_order_with_retries(
+                    tp_order = await self._create_protection_order_with_retries(
                         symbol,
                         order_type,
                         tp_side,
@@ -2143,6 +2184,14 @@ class SignalExitMixin:
                         target_label,
                         max_attempts=2
                     )
+                    order_id = self._protection_order_id(tp_order)
+                    client_order_id = self._protection_client_order_id(tp_order)
+                    if order_id not in (None, ''):
+                        target['order_id'] = str(order_id)
+                        tp_order_ids.append(str(order_id))
+                        tp_order_labels[str(order_id)] = str(target_label).upper()
+                    if client_order_id:
+                        target['client_order_id'] = str(client_order_id)
                     valid_tp_targets.append(target)
                     logger.info(
                         f"{target_label} order placed: {tp_side.upper()} @ {target_price} "
@@ -2156,6 +2205,41 @@ class SignalExitMixin:
                         f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} {target_label} 주문 생성 실패. SL은 유지됩니다: {tp_e}",
                         cooldown_sec=60
                     )
+
+            self._persist_active_entry_protection_refs(
+                symbol,
+                stop_order_id=(
+                    self._protection_order_id(sl_order) if sl_order else None
+                ),
+                take_profit_order_ids=tp_order_ids,
+                take_profit_order_labels=tp_order_labels,
+            )
+            runner_state = self._get_utbreakout_trailing_state(symbol)
+            if isinstance(runner_state, dict) and normalized_tp_targets:
+                state_targets = self._planned_tp_orders_from_state(
+                    symbol,
+                    runner_state,
+                )
+                created_by_label = {
+                    _normalize_tp_plan_label(item.get('tp_label') or item.get('label')): item
+                    for item in normalized_tp_targets
+                    if isinstance(item, dict)
+                }
+                for item in state_targets:
+                    label = _normalize_tp_plan_label(
+                        item.get('tp_label') or item.get('tp_name')
+                    )
+                    created = created_by_label.get(label)
+                    if created:
+                        if created.get('order_id'):
+                            item['order_id'] = created['order_id']
+                        if created.get('client_order_id'):
+                            item['client_order_id'] = created['client_order_id']
+                runner_state['planned_tp_orders'] = state_targets
+                runner_state['tp_orders'] = list(state_targets)
+                if sl_order:
+                    runner_state['sl_order_id'] = self._protection_order_id(sl_order)
+                self._set_utbreakout_trailing_state(symbol, runner_state)
 
             notice_parts = []
             if isinstance(tp_ladder_status, dict):

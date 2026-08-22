@@ -1700,6 +1700,34 @@ def test_utbreakout_status_symbol_prefers_live_position_over_watchlist():
     )
 
 
+def test_scanner_flat_finalization_uses_actual_accounting_exit_price():
+    engine_cls = _signal_engine_cls()
+    engine = engine_cls.__new__(engine_cls)
+    engine._get_utbreakout_trailing_state = lambda symbol: {
+        "entry_price": 100.0,
+        "last_stop_price": 90.0,
+    }
+    engine._cancel_protection_orders = AsyncMock(return_value=0)
+    engine._reconcile_closed_position_protection = AsyncMock(
+        return_value={"cleanup_confirmed": True}
+    )
+    engine._record_closed_trade_accounting = AsyncMock(
+        return_value={"status": "RECORDED", "exit_price": 107.25}
+    )
+    clear_calls = []
+    engine._clear_utbreakout_trailing_state = (
+        lambda symbol, **kwargs: clear_calls.append((symbol, kwargs))
+    )
+    engine._clear_aggressive_growth_position = lambda symbol: None
+
+    completed = asyncio.run(
+        engine._finalize_scanner_flat_position("BTC/USDT:USDT")
+    )
+
+    assert completed is True
+    assert clear_calls[0][1]["exit_price"] == pytest.approx(107.25)
+
+
 def test_utbreakout_status_symbol_uses_scanner_when_no_position():
     emas = _emas_module()
 
@@ -5897,7 +5925,7 @@ def test_place_tp_sl_orders_fail_closes_when_rounded_stop_is_invalid():
     assert status["emergency_close_status"] == "EMERGENCY_CLOSED"
 
 
-def test_missing_take_profit_audit_emergency_closes_and_locks_symbol(tmp_path):
+def test_missing_take_profit_audit_warns_without_force_closing_or_locking(tmp_path):
     emas = _emas_module()
     pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "2", "entryPrice": "100"}
     engine = _protection_engine(
@@ -5963,17 +5991,81 @@ def test_missing_take_profit_audit_emergency_closes_and_locks_symbol(tmp_path):
     assert first["missing_confirmed"] is False
     assert status["status"] == "MISSING_TP2"
     assert status["missing_confirmed"] is True
-    assert status["emergency_close_status"] == "EMERGENCY_CLOSED"
-    assert status["emergency_close_closed"] is True
-    assert status["daily_lockout_reason"] == "TAKE_PROFIT_PROTECTION_FAILED_FORCE_CLOSED"
     market_orders = [order for order in engine.exchange.created if order["type"] == "market"]
-    assert len(market_orders) == 1
-    assert market_orders[0]["side"] == "sell"
-    assert market_orders[0]["params"]["reduceOnly"] is True
-    assert float(engine.exchange.positions[0]["contracts"]) == 0.0
+    assert market_orders == []
+    assert float(engine.exchange.positions[0]["contracts"]) == 2.0
     locked, reason = engine._is_utbreakout_daily_sl_locked("BTCUSDT")
-    assert locked is True
-    assert "TAKE_PROFIT_PROTECTION_FAILED_FORCE_CLOSED" in reason
+    assert locked is False
+    assert "lockout" not in reason.lower()
+
+
+def test_protection_audit_refreshes_stale_position_after_tp1_fill():
+    stale_pos = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": "2",
+        "entryPrice": "100",
+    }
+    fresh_pos = dict(stale_pos, contracts="1")
+    engine = _protection_engine(
+        [
+            {
+                "id": "tp2-existing",
+                "side": "sell",
+                "type": "limit",
+                "price": "120",
+                "amount": "1",
+                "clientOrderId": "utbtp2BTCUSDTopen",
+                "reduceOnly": True,
+                "info": {"symbol": "BTCUSDT", "reduceOnly": "true"},
+            },
+            {
+                "id": "sl-existing",
+                "side": "sell",
+                "type": "stop_market",
+                "amount": "1",
+                "reduceOnly": True,
+                "info": {
+                    "symbol": "BTCUSDT",
+                    "origType": "STOP_MARKET",
+                    "stopPrice": "90",
+                    "reduceOnly": "true",
+                },
+            },
+        ],
+        positions=[fresh_pos],
+    )
+    state = {
+        "side": "long",
+        "entry_price": 100.0,
+        "initial_qty": 2.0,
+        "last_stop_price": 90.0,
+        "planned_tp_orders": [
+            {"tp_index": 1, "tp_label": "TP1", "price": 110.0, "qty": 1.0},
+            {"tp_index": 2, "tp_label": "TP2", "price": 120.0, "qty": 1.0},
+        ],
+        "tp1_filled": False,
+        "tp2_filled": False,
+    }
+    engine.utbreakout_trailing_states = {"BTC/USDT": state}
+
+    status = asyncio.run(
+        engine._audit_protection_orders(
+            "BTC/USDT",
+            pos=stale_pos,
+            expected_tp=True,
+            expected_sl=True,
+            planned_tp_orders=state["planned_tp_orders"],
+            alert=True,
+        )
+    )
+
+    assert status["status"] == "OK"
+    assert status["position_refresh_after_missing_tp"] is True
+    assert status["refreshed_position_qty"] == pytest.approx(1.0)
+    assert state["tp1_filled"] is True
+    assert status["missing_tp1"] is False
+    assert not [order for order in engine.exchange.created if order["type"] == "market"]
 
 
 def test_emergency_close_failure_sets_critical_paused_state():

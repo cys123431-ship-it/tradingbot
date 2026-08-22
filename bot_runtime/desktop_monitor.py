@@ -200,6 +200,31 @@ def _position_hints(engine):
         if not symbol or symbol in seen:
             continue
         seen.add(symbol)
+        audit = _status_for_symbol(
+            getattr(engine, "last_protection_order_status", {}),
+            symbol,
+        )
+        audit_is_current = bool(
+            isinstance(audit, dict)
+            and audit.get("fetch_ok", True)
+            and str(audit.get("status") or "").upper() != "NO_POSITION"
+        )
+        audited_stop = (
+            _safe_number(audit.get("stop_price"))
+            if audit_is_current and audit.get("sl_present")
+            else None
+        )
+        audited_tps = []
+        if audit_is_current:
+            audited_tps = [
+                value
+                for value in (
+                    _safe_number(item.get("price"))
+                    for item in (audit.get("tp_orders") or [])[:4]
+                    if isinstance(item, dict)
+                )
+                if value is not None
+            ]
         hints.append(
             {
                 "symbol": symbol,
@@ -207,9 +232,11 @@ def _position_hints(engine):
                 "strategy": _safe_text(state.get("strategy") or "BOT", 80),
                 "entry_price": _safe_number(state.get("entry_price")),
                 "stop_price": _safe_number(
-                    state.get("last_stop_price") or state.get("initial_stop_price")
+                    audited_stop
+                    or state.get("last_stop_price")
+                    or state.get("initial_stop_price")
                 ),
-                "tp_prices": [
+                "tp_prices": audited_tps or [
                     value
                     for value in (
                         _safe_number(item.get("price"))

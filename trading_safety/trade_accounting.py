@@ -176,6 +176,28 @@ async def resolve_closed_trade_accounting(
                     return "SL"
                 return "EXIT"
 
+            def _exit_reference_price(label):
+                normalized = str(label or "").upper()
+                if normalized == "SL":
+                    return _number_or_none(
+                        state_data.get("last_stop_price")
+                        or state_data.get("hard_stop_price")
+                        or state_data.get("initial_stop_price")
+                    )
+                if normalized.startswith("TP"):
+                    for target in planned_targets:
+                        if not isinstance(target, dict):
+                            continue
+                        target_label = str(
+                            target.get("tp_label")
+                            or target.get("tp_name")
+                            or target.get("label")
+                            or ""
+                        ).upper()
+                        if target_label == normalized:
+                            return _number_or_none(target.get("price"))
+                return None
+
             for trade in trades or []:
                 info = (
                     trade.get("info")
@@ -239,22 +261,24 @@ async def resolve_closed_trade_accounting(
                     fill_qty = 0.0
                     fill_price = 0.0
                 if fill_qty > 0 and fill_price > 0:
+                    fill_label = _fill_label(
+                        trade.get("order")
+                        or info.get("orderId")
+                        or info.get("order"),
+                        fill_price,
+                    )
                     closing_qty += fill_qty
                     weighted_exit += fill_qty * fill_price
                     exit_legs.append(
                         {
-                            "label": _fill_label(
-                                trade.get("order")
-                                or info.get("orderId")
-                                or info.get("order"),
-                                fill_price,
-                            ),
+                            "label": fill_label,
                             "timestamp": trade_ts,
                             "order_id": trade.get("order")
                             or info.get("orderId")
                             or info.get("order"),
                             "qty": fill_qty,
                             "price": fill_price,
+                            "reference_price": _exit_reference_price(fill_label),
                             "realized_pnl_usdt": float(pnl_value or 0.0),
                         }
                     )
@@ -492,28 +516,7 @@ async def record_closed_trade_accounting(
         exit_age_seconds > 3600.0
     )
     result["historical_backfill"] = historical_backfill
-    if callable(record_realized_pnl) and not historical_backfill:
-        try:
-            record_realized_pnl(result.get("pnl", 0.0))
-        except Exception:
-            logger.exception(
-                "Bot realized PnL state update failed for %s",
-                symbol,
-            )
-    if not historical_backfill:
-        try:
-            engine._record_utbreakout_recent_loss_cooldown(
-                accounting_symbol,
-                side=(open_trade or {}).get("side"),
-                pnl_usdt=result.get("pnl"),
-                reason=close_reason,
-            )
-        except Exception:
-            logger.debug(
-                "UTBreakout recent loss cooldown record failed for %s",
-                accounting_symbol,
-                exc_info=True,
-            )
+    realized_state_pnl = float(result.get("pnl") or 0.0)
     try:
         risk_distance = float(state_data.get("risk_distance") or 0.0)
         filled_qty = float((open_trade or {}).get("quantity") or 0.0)
@@ -548,6 +551,9 @@ async def record_closed_trade_accounting(
         entry_record = active_records[0] if active_records else None
         entry_metadata = dict(
             getattr(entry_record, "metadata", {}) or {}
+        )
+        entry_plan_summary = dict(
+            entry_metadata.get("entry_plan_summary") or {}
         )
         primary_strategy = str(
             entry_metadata.get("primary_strategy")
@@ -627,13 +633,33 @@ async def record_closed_trade_accounting(
             "mae_r": state_data.get("mae_r"),
             "exit_reason": close_reason,
             "exit_legs": exit_legs,
-            "entry_plan_summary": entry_metadata.get("entry_plan_summary")
-            or {},
+            "entry_plan_summary": entry_plan_summary,
+            "planned_entry_price": (
+                _number_or_none(entry_plan_summary.get("entry_price"))
+                or _number_or_none(
+                    entry_plan_summary.get(
+                        "adaptive_trend_initial_entry_price"
+                    )
+                )
+            ),
             "accounting_source": result.get("source"),
             "provisional": True,
         }
         if store is not None and callable(persist_live_trade):
             persist_live_trade(live_trade, store=store)
+            finalized = await TradeAccountingFinalizer(
+                engine.exchange,
+                store,
+            ).finalize_trade(live_trade["trade_id"])
+            if not bool(finalized.get("provisional", True)):
+                realized_state_pnl = float(
+                    finalized.get("net_pnl_usdt")
+                    if finalized.get("net_pnl_usdt") is not None
+                    else realized_state_pnl
+                )
+                result["net_pnl_usdt"] = realized_state_pnl
+                result["slippage_usdt"] = finalized.get("slippage_usdt")
+                result["accounting_finalized"] = True
         elif store is None:
             logger.warning(
                 "Live trade persistence unavailable for %s outside initialized runtime",
@@ -644,6 +670,28 @@ async def record_closed_trade_accounting(
             "Persistent live trade result recording failed for %s",
             accounting_symbol,
         )
+    if callable(record_realized_pnl) and not historical_backfill:
+        try:
+            record_realized_pnl(realized_state_pnl)
+        except Exception:
+            logger.exception(
+                "Bot realized PnL state update failed for %s",
+                symbol,
+            )
+    if not historical_backfill:
+        try:
+            engine._record_utbreakout_recent_loss_cooldown(
+                accounting_symbol,
+                side=(open_trade or {}).get("side"),
+                pnl_usdt=realized_state_pnl,
+                reason=close_reason,
+            )
+        except Exception:
+            logger.debug(
+                "UTBreakout recent loss cooldown record failed for %s",
+                accounting_symbol,
+                exc_info=True,
+            )
     return result
 
 
@@ -754,18 +802,37 @@ class TradeAccountingFinalizer:
             side = str(trade.get("side") or "").lower()
             planned_entry = _number(trade.get("planned_entry_price"))
             actual_entry = _number(trade.get("entry_price"))
-            exit_reference = _number(trade.get("exit_reference_price"))
-            actual_exit = _number(trade.get("exit_price"))
             if qty > 0 and planned_entry > 0 and actual_entry > 0:
                 slippage += qty * max(
                     0.0,
                     actual_entry - planned_entry if side == "long" else planned_entry - actual_entry,
                 )
-            if qty > 0 and exit_reference > 0 and actual_exit > 0:
-                slippage += qty * max(
+            referenced_exit_qty = 0.0
+            for leg in trade.get("exit_legs") or []:
+                if not isinstance(leg, dict):
+                    continue
+                leg_qty = abs(_number(leg.get("qty")))
+                reference = _number(leg.get("reference_price"))
+                actual = _number(leg.get("price"))
+                if leg_qty <= 0 or reference <= 0 or actual <= 0:
+                    continue
+                referenced_exit_qty += leg_qty
+                slippage += leg_qty * max(
                     0.0,
-                    exit_reference - actual_exit if side == "long" else actual_exit - exit_reference,
+                    reference - actual
+                    if side == "long"
+                    else actual - reference,
                 )
+            if referenced_exit_qty <= 0:
+                exit_reference = _number(trade.get("exit_reference_price"))
+                actual_exit = _number(trade.get("exit_price"))
+                if qty > 0 and exit_reference > 0 and actual_exit > 0:
+                    slippage += qty * max(
+                        0.0,
+                        exit_reference - actual_exit
+                        if side == "long"
+                        else actual_exit - exit_reference,
+                    )
         finalized = dict(trade)
         finalized.update(
             {
@@ -773,7 +840,10 @@ class TradeAccountingFinalizer:
                 "exit_fee_usdt": exit_fees,
                 "funding_usdt": funding,
                 "slippage_usdt": slippage,
-                "net_pnl_usdt": gross - entry_fees - exit_fees + funding - slippage,
+                # Gross realized PnL already uses actual execution prices, so
+                # slippage is attribution only. Subtracting it again would
+                # double-count the same execution loss.
+                "net_pnl_usdt": gross - entry_fees - exit_fees + funding,
                 "provisional": False,
                 "accounting_revision": int(trade.get("accounting_revision") or 0) + 1,
                 "last_accounting_error": None,
