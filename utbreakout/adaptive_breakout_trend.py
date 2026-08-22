@@ -16,9 +16,14 @@ from math import isfinite, log, sqrt
 from statistics import median
 from typing import Any, Mapping, Sequence
 
+from .change_point_flow import (
+    default_change_point_flow_config,
+    normalize_change_point_flow_config,
+)
+
 
 ADAPTIVE_BREAKOUT_TREND_STRATEGY = "adaptive_breakout_trend_v1"
-ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v7_entry_convexity"
+ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v8_change_point_flow"
 
 
 def default_adaptive_breakout_trend_config() -> dict[str, Any]:
@@ -145,6 +150,9 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         "small_account_crowded_extension_min_fast_ema_atr": 0.80,
         "small_account_crowded_funding_rate": 0.0012,
         "small_account_crowded_basis_pct": 0.40,
+        # An event-timeframe regime/flow overlay chooses among alternative
+        # entry paths. It is active only for a new sub-$1,000 trend entry.
+        "change_point_flow": default_change_point_flow_config(),
         # Entry-shape classifiers. They remain OR-style labels on top of the
         # broad multi-speed trend, not mandatory confirmations.
         "entry_clarity_lookback_bars": 48,
@@ -195,7 +203,12 @@ def normalize_adaptive_breakout_trend_config(
     if (
         supplied
         and supplied_profile != ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION
-        and not supplied_profile.startswith("adaptive_trend_portfolio_v6_")
+        and not supplied_profile.startswith(
+            (
+                "adaptive_trend_portfolio_v6_",
+                "adaptive_trend_portfolio_v7_",
+            )
+        )
     ):
         # Migrate the persisted conservative v1 profile. Operational choices
         # such as universe and symbol are preserved; the requested strategy,
@@ -291,9 +304,9 @@ def normalize_adaptive_breakout_trend_config(
         )
         for key in profile_keys:
             normalized[key] = defaults[key]
-    # v6 already carries the requested aggressive sizing and runner policy.
-    # Preserve its operator-tuned risk/exit values while defaults above add
-    # the new v7 entry-shape fields.  This also prevents an open position's
+    # v6/v7 already carry the requested aggressive sizing and runner policy.
+    # Preserve operator-tuned risk/exit values while defaults above add the
+    # new entry fields.  This also prevents an open position's
     # runtime policy from changing merely because the entry profile advanced.
     normalized["profile_version"] = ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION
 
@@ -695,6 +708,11 @@ def normalize_adaptive_breakout_trend_config(
             floor_value,
             cap_value,
         )
+    normalized["change_point_flow"] = normalize_change_point_flow_config(
+        normalized.get("change_point_flow")
+        if isinstance(normalized.get("change_point_flow"), Mapping)
+        else None
+    )
     return normalized
 
 

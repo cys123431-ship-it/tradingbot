@@ -99,6 +99,12 @@ def explain_entry_reason_ko(reason=None, *, code=None, data=None):
         return "성숙한 추세의 추진력이 약해 눌림 후 재개 또는 거래량 동반 돌파를 기다립니다."
     if "SMALL_ACCOUNT_CROWDED_EXTENSION" in uppered:
         return "가격이 평균선에서 벌어진 상태에서 펀딩·베이시스 과열까지 겹쳐 추격 진입하지 않습니다."
+    if "CHANGE_POINT_FLOW_CONFLICT" in uppered:
+        return "가격 방향과 실제 호가·시장가 주문 흐름이 강하게 충돌해 신규 진입을 기다립니다."
+    if "CHANGE_POINT_FLOW_NO_EDGE" in uppered:
+        return "최근 가격 체제 전환이나 지속적인 주문 흐름 우위가 아직 뚜렷하지 않습니다."
+    if "CHANGE_POINT_FLOW_SIDE" in uppered:
+        return "체제 전환·주문 흐름 평가에 필요한 진입 방향이 확정되지 않았습니다."
     if "REGION_RESTRICTED" in uppered or "RESTRICTED_SYMBOL" in uppered:
         return "현재 계정에서 제한된 종목이라 진입하지 않았습니다."
     if "INVALID_MARKET" in uppered or "SYMBOL_PREFLIGHT" in uppered:

@@ -8,10 +8,13 @@ import time
 from .entry_reason_ko import build_entry_diagnostic
 from trading_safety.market_session import us_equity_regular_session_status
 from utbreakout.adaptive_breakout_trend import (
+    ADAPTIVE_BREAKOUT_TREND_STRATEGY,
     ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION,
+    evaluate_adaptive_breakout_trend,
     evaluate_small_account_entry_refinement,
     normalize_adaptive_breakout_trend_config,
 )
+from utbreakout.change_point_flow import evaluate_change_point_flow_entry
 from utbreakout.profit_capture import (
     QUAD_CONFIRMATION_RISK_MULTIPLIERS,
     bounded_structure_anchor,
@@ -1396,7 +1399,70 @@ class SignalAlphaMixin:
             'code': 'SMALL_ACCOUNT_ENTRY_REFINEMENT_NOT_APPLICABLE',
             'reason': 'small-account entry refinement not applicable',
         }
+        change_point_flow = {
+            'allowed': True,
+            'code': 'CHANGE_POINT_FLOW_NOT_APPLICABLE',
+            'reason': 'change-point flow overlay not applicable',
+            'state': 'not_applicable',
+            'risk_tier': effective_risk_tier,
+            'initial_margin_fraction': float(
+                trend_cfg.get('small_account_initial_margin_fraction', 0.65)
+                or 0.65
+            ),
+            'stop_atr_multiplier': float(
+                trend_cfg.get('stop_atr_multiplier', 2.00) or 2.00
+            ),
+        }
         if small_account_aggressive_candidate:
+            event_timeframe = str(cfg.get('entry_timeframe', '15m') or '15m')
+            event_rows = []
+            if df is not None and callable(getattr(df, 'to_dict', None)):
+                try:
+                    event_rows = df.to_dict(orient='records')
+                    event_rows = completed_candle_rows(
+                        event_rows,
+                        event_timeframe,
+                        {'exclude_incomplete_live_candle': True},
+                        now_ms=evaluation_now_ms,
+                    )
+                except (TypeError, ValueError):
+                    event_rows = []
+            if not event_rows:
+                event_rows = rows
+                event_timeframe = timeframe
+
+            futures_context = dict(selector_candidate)
+            context_fetcher = getattr(
+                self,
+                '_fetch_utbreakout_futures_context',
+                None,
+            )
+            if callable(context_fetcher):
+                try:
+                    fresh_context = await context_fetcher(canonical)
+                    if isinstance(fresh_context, dict):
+                        futures_context.update(fresh_context)
+                except Exception as exc:
+                    status['change_point_flow_context_error'] = str(exc)
+            change_point_flow = evaluate_change_point_flow_entry(
+                side,
+                event_rows,
+                futures_context=futures_context,
+                trend_metrics=metrics,
+                config=trend_cfg.get('change_point_flow'),
+                tradfi=is_tradfi,
+            )
+            change_point_flow['event_timeframe'] = event_timeframe
+            status['change_point_flow'] = dict(change_point_flow)
+            if not bool(change_point_flow.get('allowed')):
+                return _finish(
+                    None,
+                    'Change-point flow waiting: '
+                    f"{change_point_flow.get('reason')}",
+                    change_point_flow.get('code')
+                    or 'REJECTED_CHANGE_POINT_FLOW',
+                )
+
             small_account_entry_refinement = evaluate_small_account_entry_refinement(
                 side,
                 metrics,
@@ -1408,13 +1474,51 @@ class SignalAlphaMixin:
                 small_account_entry_refinement
             )
             if not bool(small_account_entry_refinement.get('allowed')):
-                return _finish(
-                    None,
-                    'Small-account entry refinement waiting: '
-                    f"{small_account_entry_refinement.get('reason')}",
-                    small_account_entry_refinement.get('code')
-                    or 'REJECTED_SMALL_ACCOUNT_ENTRY_REFINEMENT',
+                soft_veto_codes = {
+                    'REJECTED_SMALL_ACCOUNT_FAST_TREND_DECAY',
+                    'REJECTED_SMALL_ACCOUNT_WEAK_MATURE_CONTINUATION',
+                }
+                refinement_code = str(
+                    small_account_entry_refinement.get('code') or ''
                 )
+                if (
+                    refinement_code in soft_veto_codes
+                    and bool(
+                        change_point_flow.get('override_soft_mature_veto')
+                    )
+                ):
+                    small_account_entry_refinement.update({
+                        'allowed': True,
+                        'overridden': True,
+                        'override_code': change_point_flow.get('code'),
+                        'reason': (
+                            f"{small_account_entry_refinement.get('reason')}; "
+                            'overridden by a fresh high-conviction regime/flow event'
+                        ),
+                    })
+                    status['small_account_entry_refinement'] = dict(
+                        small_account_entry_refinement
+                    )
+                else:
+                    return _finish(
+                        None,
+                        'Small-account entry refinement waiting: '
+                        f"{small_account_entry_refinement.get('reason')}",
+                        refinement_code
+                        or 'REJECTED_SMALL_ACCOUNT_ENTRY_REFINEMENT',
+                    )
+
+            flow_risk_tier = str(
+                change_point_flow.get('risk_tier') or 'base'
+            ).strip().lower()
+            if (
+                flow_risk_tier in _ADAPTIVE_RISK_TIER_ORDER
+                and _ADAPTIVE_RISK_TIER_ORDER[flow_risk_tier]
+                > _ADAPTIVE_RISK_TIER_ORDER[effective_risk_tier]
+            ):
+                effective_risk_tier = flow_risk_tier
+            status['risk_tier'] = effective_risk_tier
+            status['convex_rotation_tier'] = effective_risk_tier
         if (
             not small_account_aggressive_candidate
             and
@@ -1488,18 +1592,42 @@ class SignalAlphaMixin:
         # Using that distant point as the hard-stop anchor would shrink an
         # otherwise excellent entry to a token position. Keep the 2 ATR hard
         # risk budget and only use structure as a soft anchor when it is nearby.
+        stop_atr_multiplier = float(
+            change_point_flow.get('stop_atr_multiplier')
+            if small_account_aggressive_candidate
+            else trend_cfg.get('stop_atr_multiplier', 2.00)
+            or 2.00
+        )
+        event_structure_stop = _safe_float_or_none(
+            change_point_flow.get('event_structure_stop')
+        )
         structure_for_risk = structure_stop
+        if event_structure_stop is not None and (
+            (side == 'long' and event_structure_stop < entry_price)
+            or (side == 'short' and event_structure_stop > entry_price)
+        ):
+            event_structure_distance_atr = (
+                abs(entry_price - event_structure_stop) / atr_value
+            )
+            status['change_point_flow_structure_distance_atr'] = (
+                event_structure_distance_atr
+            )
+            if event_structure_distance_atr <= stop_atr_multiplier:
+                structure_for_risk = event_structure_stop
         if structure_stop is not None:
             structure_distance_atr = abs(entry_price - structure_stop) / atr_value
             status['structure_distance_atr'] = structure_distance_atr
-            if structure_distance_atr > float(trend_cfg.get('stop_atr_multiplier', 2.00) or 2.00):
+            if (
+                structure_for_risk == structure_stop
+                and structure_distance_atr > stop_atr_multiplier
+            ):
                 structure_for_risk = None
         try:
             plan = calculate_risk_plan(
                 side=side,
                 entry_price=entry_price,
                 atr_value=atr_value,
-                stop_atr_multiplier=float(trend_cfg.get('stop_atr_multiplier', 2.00) or 2.00),
+                stop_atr_multiplier=stop_atr_multiplier,
                 ut_stop=None,
                 structure_stop=structure_for_risk,
                 structure_buffer_atr=float(trend_cfg.get('structure_buffer_atr', 0.15) or 0.15),
@@ -1515,11 +1643,16 @@ class SignalAlphaMixin:
             full_target_qty = float(plan.get('qty', 0.0) or 0.0)
             full_target_risk = float(plan.get('risk_usdt', 0.0) or 0.0)
             full_target_notional = float(plan.get('planned_notional', 0.0) or 0.0)
+            initial_fraction_source = (
+                change_point_flow.get('initial_margin_fraction')
+                if small_account_aggressive_candidate
+                else trend_cfg.get('initial_entry_fraction', 0.65)
+            )
             initial_fraction = min(
                 1.0,
                 max(
                     0.40,
-                    float(trend_cfg.get('initial_entry_fraction', 0.65) or 0.65),
+                    float(initial_fraction_source or 0.65),
                 ),
             )
             plan.update({
@@ -1601,7 +1734,10 @@ class SignalAlphaMixin:
                 trend_cfg.get('small_account_margin_budget_fraction', 0.95) or 0.95
             ),
             'small_account_initial_margin_fraction': float(
-                trend_cfg.get('small_account_initial_margin_fraction', 0.65) or 0.65
+                change_point_flow.get('initial_margin_fraction')
+                if small_account_aggressive_candidate
+                else trend_cfg.get('small_account_initial_margin_fraction', 0.65)
+                or 0.65
             ),
             'small_account_base_max_loss_percent': float(
                 trend_cfg.get('small_account_base_max_loss_percent', 20.0) or 20.0
@@ -1675,6 +1811,26 @@ class SignalAlphaMixin:
             ),
             'small_account_impulse_breakout': bool(
                 small_account_entry_refinement.get('impulse_breakout')
+            ),
+            'change_point_flow_profile': change_point_flow.get('profile'),
+            'change_point_flow_state': change_point_flow.get('state'),
+            'change_point_flow_code': change_point_flow.get('code'),
+            'change_point_flow_total_score': change_point_flow.get('total_score'),
+            'change_point_flow_price_score': change_point_flow.get('price_score'),
+            'change_point_flow_flow_score': change_point_flow.get('flow_score'),
+            'change_point_flow_open_interest_score': change_point_flow.get(
+                'open_interest_score'
+            ),
+            'change_point_flow_regime_score': change_point_flow.get(
+                'regime_change_score'
+            ),
+            'change_point_flow_event_timeframe': change_point_flow.get(
+                'event_timeframe'
+            ),
+            'change_point_flow_stop_atr_multiplier': stop_atr_multiplier,
+            'change_point_flow_event_structure_stop': event_structure_stop,
+            'change_point_flow_soft_veto_override': bool(
+                small_account_entry_refinement.get('overridden')
             ),
             'structure_reference_stop': structure_stop,
             'entry_chase_atr': chase_atr,
@@ -1888,6 +2044,16 @@ class SignalAlphaMixin:
                 "Small-account entry refinement: "
                 f"{'PASS' if refinement.get('allowed') else 'WAIT'} / "
                 f"{refinement.get('reason') or '-'}",
+            )
+        flow_overlay = status.get('change_point_flow')
+        if small_account_active and isinstance(flow_overlay, dict):
+            lines.insert(
+                8,
+                "체제·주문흐름: "
+                f"{str(flow_overlay.get('state') or 'waiting')} / "
+                f"종합 {float(flow_overlay.get('total_score', 0.0) or 0.0):.1f} / "
+                f"가격 {float(flow_overlay.get('price_score', 0.0) or 0.0):.1f} / "
+                f"흐름 {float(flow_overlay.get('flow_score', 0.0) or 0.0):.1f}",
             )
         if status.get('tradfi_perpetual'):
             chart_patterns = metrics.get('tradfi_chart_patterns') or {}
