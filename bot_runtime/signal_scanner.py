@@ -1595,7 +1595,18 @@ class SignalScannerMixin:
             trend_parts.append(_linear(abs(momentum), 0.12, 0.85))
         if votes is not None:
             trend_parts.append(_linear(votes, 1.0, 3.0))
-        trend = sum(trend_parts) / len(trend_parts)
+        core_trend = sum(trend_parts) / len(trend_parts)
+        entry_opportunity = _f(trend_metrics, 'entry_opportunity_score')
+        trend_clarity = _f(trend_metrics, 'trend_clarity')
+        trend = core_trend * 0.65
+        trend += (
+            entry_opportunity if entry_opportunity is not None else 50.0
+        ) * 0.25
+        trend += (
+            _linear(trend_clarity, 0.20, 0.85)
+            if trend_clarity is not None
+            else 50.0
+        ) * 0.10
 
         volume_ratio = _f(trend_metrics, 'volume_ratio')
         consistency = _f(selection_metrics, 'momentum_consistency')
@@ -2342,6 +2353,21 @@ class SignalScannerMixin:
                     ),
                     'adaptive_breakout_trend_compression_breakout': bool(
                         trend_metrics.get('compression_breakout')
+                    ),
+                    'adaptive_breakout_trend_pullback_resumption': bool(
+                        trend_metrics.get('pullback_resumption')
+                    ),
+                    'adaptive_breakout_trend_impulse_breakout': bool(
+                        trend_metrics.get('impulse_breakout')
+                    ),
+                    'adaptive_breakout_trend_entry_opportunity_score': (
+                        trend_metrics.get('entry_opportunity_score')
+                    ),
+                    'adaptive_breakout_trend_trend_clarity': (
+                        trend_metrics.get('trend_clarity')
+                    ),
+                    'adaptive_breakout_trend_fast_momentum_retention': (
+                        trend_metrics.get('fast_momentum_retention')
                     ),
                     'convex_rotation_score': rotation_score['score'],
                     'convex_rotation_components': rotation_score['components'],

@@ -95,6 +95,10 @@ def explain_entry_reason_ko(reason=None, *, code=None, data=None):
         return "이동평균 교차 직후 가격이 이미 과도하게 벌어져 눌림 또는 새 신호를 기다립니다."
     if "SMALL_ACCOUNT_LOWER_TIMEFRAME_CONFLICT" in uppered:
         return "상위 추세와 실제 진입 시간대 방향이 충돌해 방향이 다시 맞을 때까지 기다립니다."
+    if "SMALL_ACCOUNT_WEAK_MATURE_CONTINUATION" in uppered:
+        return "성숙한 추세의 추진력이 약해 눌림 후 재개 또는 거래량 동반 돌파를 기다립니다."
+    if "SMALL_ACCOUNT_CROWDED_EXTENSION" in uppered:
+        return "가격이 평균선에서 벌어진 상태에서 펀딩·베이시스 과열까지 겹쳐 추격 진입하지 않습니다."
     if "REGION_RESTRICTED" in uppered or "RESTRICTED_SYMBOL" in uppered:
         return "현재 계정에서 제한된 종목이라 진입하지 않았습니다."
     if "INVALID_MARKET" in uppered or "SYMBOL_PREFLIGHT" in uppered:

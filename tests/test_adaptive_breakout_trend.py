@@ -98,6 +98,37 @@ def test_tradfi_rotation_score_is_trend_first_and_reduces_derivative_positioning
     assert tradfi['score'] > crypto['score']
 
 
+def test_rotation_score_prefers_clear_high_opportunity_entry_shape():
+    scanner = SignalScannerMixin()
+    common = {
+        'score': 80.0,
+        'weighted_momentum': 0.62,
+        'long_votes': 3,
+        'volume_ratio': 1.20,
+    }
+    selection = {
+        'momentum_consistency': 0.60,
+        'directional_efficiency': 0.40,
+        'return_lookback_pct': 6.0,
+    }
+
+    clear = scanner._calculate_convex_rotation_score(
+        'long',
+        dict(common, entry_opportunity_score=88.0, trend_clarity=0.82),
+        selection,
+        {},
+    )
+    noisy = scanner._calculate_convex_rotation_score(
+        'long',
+        dict(common, entry_opportunity_score=35.0, trend_clarity=0.25),
+        selection,
+        {},
+    )
+
+    assert clear['components']['trend'] > noisy['components']['trend']
+    assert clear['score'] > noisy['score']
+
+
 def _trend_rows(direction: int, count: int = 220) -> list[dict]:
     rows = []
     price = 100.0
@@ -148,6 +179,25 @@ def _compression_breakout_rows(direction: int, count: int = 260) -> list[dict]:
             "low": min(open_price, price) - wick,
             "close": price,
             "volume": volume,
+        })
+    return rows
+
+
+def _pullback_resumption_rows(direction: int) -> list[dict]:
+    rows = _trend_rows(direction)
+    price = rows[-5]["close"]
+    for index, step in zip(
+        range(len(rows) - 4, len(rows)),
+        (-0.30, -0.20, -0.05, 0.85),
+    ):
+        open_price = price
+        price = max(5.0, price + step * direction)
+        rows[index].update({
+            "open": open_price,
+            "high": max(open_price, price) + 0.10,
+            "low": min(open_price, price) - 0.10,
+            "close": price,
+            "volume": 1_800.0 if index == len(rows) - 1 else 900.0,
         })
     return rows
 
@@ -236,6 +286,65 @@ def test_weighted_continuation_enters_without_requiring_a_new_crossover(directio
     assert decision.metrics["fast_momentum_retention"] is not None
     assert decision.metrics["fast_momentum_retention"] > 0.0
     assert "weighted continuation" in decision.reason
+
+
+@pytest.mark.parametrize(("direction", "side"), ((1, "long"), (-1, "short")))
+def test_volume_backed_pullback_resumption_is_classified_for_both_sides(
+    direction,
+    side,
+):
+    decision = evaluate_adaptive_breakout_trend(
+        _pullback_resumption_rows(direction),
+        CALM_L2,
+        {
+            "profile_version": ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION,
+            "continuation_max_fast_ema_distance_atr": 4.0,
+        },
+    )
+    refinement = evaluate_small_account_entry_refinement(
+        side,
+        decision.metrics,
+        entry_chase_atr=0.0,
+    )
+
+    assert decision.allowed is True
+    assert decision.side == side
+    assert decision.metrics["pullback_resumption"] is True
+    assert decision.metrics["entry_opportunity_score"] > 70.0
+    assert refinement["allowed"] is True
+    assert refinement["pullback_recovery_confirmed"] is True
+
+
+def test_smooth_trend_has_more_clarity_than_alternating_path():
+    smooth = _trend_rows(1)
+    noisy = _trend_rows(1)
+    anchor = noisy[-60]["close"]
+    for offset, row in enumerate(noisy[-59:], start=1):
+        close = anchor + 0.08 * offset + (0.90 if offset % 2 else -0.90)
+        row.update({
+            "open": close - (0.25 if offset % 2 else -0.25),
+            "high": close + 0.30,
+            "low": close - 0.30,
+            "close": close,
+        })
+
+    smooth_decision = evaluate_adaptive_breakout_trend(
+        smooth,
+        None,
+        {"continuation_max_fast_ema_distance_atr": 4.0},
+    )
+    noisy_decision = evaluate_adaptive_breakout_trend(
+        noisy,
+        None,
+        {"continuation_max_fast_ema_distance_atr": 4.0},
+    )
+
+    assert smooth_decision.metrics["trend_clarity"] > noisy_decision.metrics[
+        "trend_clarity"
+    ]
+    assert smooth_decision.metrics["entry_opportunity_score"] > noisy_decision.metrics[
+        "entry_opportunity_score"
+    ]
 
 
 def test_crossover_floor_cannot_drop_below_half_the_broad_momentum_floor():
@@ -591,6 +700,29 @@ def test_persisted_conservative_profile_migrates_to_small_account_aggressive_v3(
     assert migrated["small_account_daily_loss_limit_percent"] == pytest.approx(0.0)
     assert migrated["small_account_entry_refinement_enabled"] is True
     assert migrated["small_account_min_fast_momentum_retention"] == pytest.approx(0.55)
+    assert migrated[
+        "small_account_continuation_minimum_momentum_strength"
+    ] == pytest.approx(0.50)
+    assert migrated["pullback_resumption_enabled"] is True
+    assert migrated["impulse_breakout_enabled"] is True
+
+
+def test_v6_profile_upgrade_preserves_existing_risk_and_exit_policy():
+    migrated = normalize_adaptive_breakout_trend_config(
+        {
+            "profile_version": "adaptive_trend_portfolio_v6_fast_sleeve",
+            "base_risk_percent": 7.25,
+            "base_risk_percent_max": 8.0,
+            "runner_pct": 0.73,
+            "atr_trailing_multiplier": 3.10,
+        }
+    )
+
+    assert migrated["profile_version"] == ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION
+    assert migrated["base_risk_percent"] == pytest.approx(7.25)
+    assert migrated["runner_pct"] == pytest.approx(0.73)
+    assert migrated["atr_trailing_multiplier"] == pytest.approx(3.10)
+    assert migrated["pullback_resumption_enabled"] is True
 
 
 def test_small_account_refinement_rejects_slow_only_continuation_decay():
@@ -614,6 +746,7 @@ def test_small_account_refinement_keeps_fast_sleeve_continuation_actionable():
         "short",
         {
             "weighted_continuation": True,
+            "weighted_momentum": -0.72,
             "fast_momentum_retention": 0.72,
             "signed_fast_ema_distance_atr": 0.90,
         },
@@ -673,6 +806,57 @@ def test_small_account_refinement_does_not_turn_weak_ltf_vote_into_and_gate():
     )
 
     assert result["allowed"] is True
+
+
+def test_small_account_refinement_rejects_weak_mature_drift_but_not_fresh_modes():
+    weak_drift = evaluate_small_account_entry_refinement(
+        "long",
+        {
+            "weighted_continuation": True,
+            "weighted_momentum": 0.49,
+            "fast_momentum_retention": 0.80,
+            "signed_fast_ema_distance_atr": 0.60,
+        },
+        entry_chase_atr=0.0,
+    )
+    fresh_impulse = evaluate_small_account_entry_refinement(
+        "long",
+        {
+            "weighted_continuation": True,
+            "weighted_momentum": 0.40,
+            "fast_momentum_retention": 0.80,
+            "signed_fast_ema_distance_atr": 0.60,
+            "impulse_breakout": True,
+        },
+        entry_chase_atr=0.0,
+    )
+
+    assert weak_drift["code"] == "REJECTED_SMALL_ACCOUNT_WEAK_MATURE_CONTINUATION"
+    assert fresh_impulse["allowed"] is True
+
+
+def test_small_account_refinement_rejects_only_extended_crowded_entry():
+    metrics = {
+        "weighted_continuation": True,
+        "weighted_momentum": 0.75,
+        "fast_momentum_retention": 0.80,
+        "signed_fast_ema_distance_atr": 0.90,
+    }
+    crowded = evaluate_small_account_entry_refinement(
+        "long",
+        metrics,
+        entry_chase_atr=0.0,
+        selector_candidate={"funding_rate": 0.0013, "basis_pct": 0.20},
+    )
+    not_extended = evaluate_small_account_entry_refinement(
+        "long",
+        dict(metrics, signed_fast_ema_distance_atr=0.40),
+        entry_chase_atr=0.0,
+        selector_candidate={"funding_rate": 0.0013, "basis_pct": 0.20},
+    )
+
+    assert crowded["code"] == "REJECTED_SMALL_ACCOUNT_CROWDED_EXTENSION"
+    assert not_extended["allowed"] is True
 
 
 def test_trend_single_universe_resolves_one_symbol_and_invalid_symbol_fails_closed():

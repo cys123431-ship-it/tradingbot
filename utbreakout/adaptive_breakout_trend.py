@@ -18,7 +18,7 @@ from typing import Any, Mapping, Sequence
 
 
 ADAPTIVE_BREAKOUT_TREND_STRATEGY = "adaptive_breakout_trend_v1"
-ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v6_fast_sleeve"
+ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v7_entry_convexity"
 
 
 def default_adaptive_breakout_trend_config() -> dict[str, Any]:
@@ -134,6 +134,33 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         "small_account_lower_timeframe_conflict_veto_enabled": True,
         "small_account_lower_timeframe_conflict_min_alignment": 60.0,
         "small_account_lower_timeframe_conflict_min_ready_timeframes": 2,
+        # A mature drift needs more absolute impulse than a fresh pullback
+        # resumption or volume-backed breakout.  This separates entry types
+        # instead of raising one global threshold for every opportunity.
+        "small_account_continuation_minimum_momentum_strength": 0.50,
+        "small_account_pullback_min_fast_momentum_retention": 0.30,
+        "small_account_pullback_recovery_min_volume_ratio": 1.20,
+        "small_account_pullback_recovery_min_close_location": 0.75,
+        "small_account_crowded_extension_veto_enabled": True,
+        "small_account_crowded_extension_min_fast_ema_atr": 0.80,
+        "small_account_crowded_funding_rate": 0.0012,
+        "small_account_crowded_basis_pct": 0.40,
+        # Entry-shape classifiers. They remain OR-style labels on top of the
+        # broad multi-speed trend, not mandatory confirmations.
+        "entry_clarity_lookback_bars": 48,
+        "pullback_resumption_enabled": True,
+        "pullback_touch_lookback_bars": 3,
+        "pullback_fast_ema_touch_atr": 0.35,
+        "pullback_medium_ema_break_atr": 0.50,
+        "pullback_min_close_location": 0.60,
+        "impulse_breakout_enabled": True,
+        "impulse_breakout_lookback_bars": 12,
+        "impulse_breakout_min_volume_ratio": 1.15,
+        "impulse_breakout_min_close_location": 0.65,
+        "impulse_breakout_min_momentum_strength": 0.35,
+        "impulse_breakout_min_fast_retention": 0.55,
+        "impulse_breakout_max_fast_ema_distance_atr": 1.50,
+        "impulse_breakout_max_range_atr": 2.20,
         # Cross-sectional ranks supplement (and never bypass) the stop,
         # liquidation, liquidity and L2 safety gates.
         "rotation_exit_enabled": True,
@@ -164,7 +191,12 @@ def normalize_adaptive_breakout_trend_config(
     normalized = dict(defaults)
     supplied = dict(config) if isinstance(config, Mapping) else {}
     normalized.update(supplied)
-    if supplied and supplied.get("profile_version") != ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION:
+    supplied_profile = str(supplied.get("profile_version") or "").strip()
+    if (
+        supplied
+        and supplied_profile != ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION
+        and not supplied_profile.startswith("adaptive_trend_portfolio_v6_")
+    ):
         # Migrate the persisted conservative v1 profile. Operational choices
         # such as universe and symbol are preserved; the requested strategy,
         # sizing and exit policy move together so an old server config cannot
@@ -222,6 +254,28 @@ def normalize_adaptive_breakout_trend_config(
             "small_account_lower_timeframe_conflict_veto_enabled",
             "small_account_lower_timeframe_conflict_min_alignment",
             "small_account_lower_timeframe_conflict_min_ready_timeframes",
+            "small_account_continuation_minimum_momentum_strength",
+            "small_account_pullback_min_fast_momentum_retention",
+            "small_account_pullback_recovery_min_volume_ratio",
+            "small_account_pullback_recovery_min_close_location",
+            "small_account_crowded_extension_veto_enabled",
+            "small_account_crowded_extension_min_fast_ema_atr",
+            "small_account_crowded_funding_rate",
+            "small_account_crowded_basis_pct",
+            "entry_clarity_lookback_bars",
+            "pullback_resumption_enabled",
+            "pullback_touch_lookback_bars",
+            "pullback_fast_ema_touch_atr",
+            "pullback_medium_ema_break_atr",
+            "pullback_min_close_location",
+            "impulse_breakout_enabled",
+            "impulse_breakout_lookback_bars",
+            "impulse_breakout_min_volume_ratio",
+            "impulse_breakout_min_close_location",
+            "impulse_breakout_min_momentum_strength",
+            "impulse_breakout_min_fast_retention",
+            "impulse_breakout_max_fast_ema_distance_atr",
+            "impulse_breakout_max_range_atr",
             "rotation_exit_enabled",
             "rotation_min_holding_hours",
             "rotation_max_holding_hours",
@@ -237,6 +291,10 @@ def normalize_adaptive_breakout_trend_config(
         )
         for key in profile_keys:
             normalized[key] = defaults[key]
+    # v6 already carries the requested aggressive sizing and runner policy.
+    # Preserve its operator-tuned risk/exit values while defaults above add
+    # the new v7 entry-shape fields.  This also prevents an open position's
+    # runtime policy from changing merely because the entry profile advanced.
     normalized["profile_version"] = ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION
 
     universe_mode = str(
@@ -412,6 +470,9 @@ def normalize_adaptive_breakout_trend_config(
         "small_account_aggressive_enabled",
         "small_account_entry_refinement_enabled",
         "small_account_lower_timeframe_conflict_veto_enabled",
+        "small_account_crowded_extension_veto_enabled",
+        "pullback_resumption_enabled",
+        "impulse_breakout_enabled",
     ):
         raw = normalized.get(key, defaults[key])
         normalized[key] = (
@@ -568,6 +629,59 @@ def normalize_adaptive_breakout_trend_config(
             8.0,
         )
     )
+    normalized["small_account_continuation_minimum_momentum_strength"] = _bounded(
+        _finite(
+            normalized.get(
+                "small_account_continuation_minimum_momentum_strength"
+            ),
+            defaults["small_account_continuation_minimum_momentum_strength"],
+        ),
+        0.20,
+        1.0,
+    )
+    normalized["small_account_pullback_min_fast_momentum_retention"] = _bounded(
+        _finite(
+            normalized.get(
+                "small_account_pullback_min_fast_momentum_retention"
+            ),
+            defaults["small_account_pullback_min_fast_momentum_retention"],
+        ),
+        0.0,
+        1.0,
+    )
+    for key, lower, upper in (
+        ("small_account_crowded_extension_min_fast_ema_atr", 0.25, 3.0),
+        ("small_account_crowded_funding_rate", 0.0001, 0.01),
+        ("small_account_crowded_basis_pct", 0.05, 5.0),
+        ("small_account_pullback_recovery_min_volume_ratio", 0.75, 5.0),
+        ("small_account_pullback_recovery_min_close_location", 0.50, 0.95),
+        ("pullback_fast_ema_touch_atr", 0.05, 1.50),
+        ("pullback_medium_ema_break_atr", 0.05, 2.00),
+        ("pullback_min_close_location", 0.50, 0.95),
+        ("impulse_breakout_min_volume_ratio", 0.75, 5.0),
+        ("impulse_breakout_min_close_location", 0.50, 0.95),
+        ("impulse_breakout_min_momentum_strength", 0.10, 1.0),
+        ("impulse_breakout_min_fast_retention", 0.0, 1.50),
+        ("impulse_breakout_max_fast_ema_distance_atr", 0.50, 4.0),
+        ("impulse_breakout_max_range_atr", 0.75, 5.0),
+    ):
+        normalized[key] = _bounded(
+            _finite(normalized.get(key), defaults[key]),
+            lower,
+            upper,
+        )
+    for key, lower, upper in (
+        ("entry_clarity_lookback_bars", 12, 168),
+        ("pullback_touch_lookback_bars", 2, 8),
+        ("impulse_breakout_lookback_bars", 6, 48),
+    ):
+        normalized[key] = int(
+            _bounded(
+                _finite(normalized.get(key), defaults[key]),
+                float(lower),
+                float(upper),
+            )
+        )
     for tier in ("base", "strong", "elite"):
         floor_key = f"{tier}_risk_percent_min"
         cap_key = f"{tier}_risk_percent_max"
@@ -624,6 +738,15 @@ def evaluate_small_account_entry_refinement(
         "lower_timeframe_ready_count": int(
             _finite(candidate.get("auto_ready_timeframes"), 0.0) or 0
         ),
+        "entry_opportunity_score": _finite(
+            values.get("entry_opportunity_score"),
+            None,
+        ),
+        "trend_clarity": _finite(values.get("trend_clarity"), None),
+        "pullback_resumption": bool(values.get("pullback_resumption")),
+        "impulse_breakout": bool(values.get("impulse_breakout")),
+        "funding_rate": _finite(candidate.get("funding_rate"), None),
+        "basis_pct": _finite(candidate.get("basis_pct"), None),
     }
     if not bool(cfg.get("small_account_entry_refinement_enabled", True)):
         result.update({
@@ -665,7 +788,21 @@ def evaluate_small_account_entry_refinement(
         return result
 
     retention = result["fast_momentum_retention"]
-    retention_floor = float(cfg["small_account_min_fast_momentum_retention"])
+    pullback_recovery_confirmed = bool(
+        result["pullback_resumption"]
+        and float(_finite(values.get("volume_ratio"), 0.0) or 0.0)
+        >= float(cfg["small_account_pullback_recovery_min_volume_ratio"])
+        and float(
+            _finite(values.get("directional_close_location"), 0.0) or 0.0
+        )
+        >= float(cfg["small_account_pullback_recovery_min_close_location"])
+    )
+    result["pullback_recovery_confirmed"] = pullback_recovery_confirmed
+    retention_floor = float(
+        cfg["small_account_pullback_min_fast_momentum_retention"]
+        if pullback_recovery_confirmed
+        else cfg["small_account_min_fast_momentum_retention"]
+    )
     if (
         bool(values.get("weighted_continuation"))
         and retention is not None
@@ -677,6 +814,64 @@ def evaluate_small_account_entry_refinement(
             "reason": (
                 f"fast trend retained only {retention:.2f} of the stronger "
                 f"medium/slow sleeve (minimum {retention_floor:.2f})"
+            ),
+        })
+        return result
+
+    continuation_momentum = abs(
+        float(_finite(values.get("weighted_momentum"), 0.0) or 0.0)
+    )
+    continuation_floor = float(
+        cfg["small_account_continuation_minimum_momentum_strength"]
+    )
+    if (
+        bool(values.get("weighted_continuation"))
+        and not result["pullback_resumption"]
+        and not result["impulse_breakout"]
+        and continuation_momentum < continuation_floor
+    ):
+        result.update({
+            "allowed": False,
+            "code": "REJECTED_SMALL_ACCOUNT_WEAK_MATURE_CONTINUATION",
+            "reason": (
+                f"mature continuation momentum {continuation_momentum:.2f} "
+                f"is below {continuation_floor:.2f} without a fresh pullback "
+                "resumption or volume-backed impulse"
+            ),
+        })
+        return result
+
+    fast_distance = float(
+        _finite(values.get("signed_fast_ema_distance_atr"), 0.0) or 0.0
+    )
+    direction = 1.0 if normalized_side == "long" else -1.0
+    funding_rate = result["funding_rate"]
+    basis_pct = result["basis_pct"]
+    adverse_funding = (
+        direction * funding_rate if funding_rate is not None else None
+    )
+    adverse_basis = direction * basis_pct if basis_pct is not None else None
+    crowded_funding = bool(
+        adverse_funding is not None
+        and adverse_funding >= float(cfg["small_account_crowded_funding_rate"])
+    )
+    crowded_basis = bool(
+        adverse_basis is not None
+        and adverse_basis >= float(cfg["small_account_crowded_basis_pct"])
+    )
+    if (
+        bool(cfg.get("small_account_crowded_extension_veto_enabled", True))
+        and not result["pullback_resumption"]
+        and fast_distance
+        >= float(cfg["small_account_crowded_extension_min_fast_ema_atr"])
+        and (crowded_funding or crowded_basis)
+    ):
+        result.update({
+            "allowed": False,
+            "code": "REJECTED_SMALL_ACCOUNT_CROWDED_EXTENSION",
+            "reason": (
+                f"extended {fast_distance:.2f} ATR entry is crowded "
+                f"(funding={funding_rate}, basis={basis_pct})"
             ),
         })
         return result
@@ -791,6 +986,42 @@ def _rms(values: Sequence[float]) -> float:
 
 def _bounded(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, float(value)))
+
+
+def _linear_trend_clarity(
+    closes: Sequence[float],
+    *,
+    side: str | None,
+    lookback: int,
+) -> tuple[float, float]:
+    """Return direction-aware log-price R² and directional-bar ratio."""
+
+    count = max(4, min(len(closes), int(lookback)))
+    values = [log(max(float(value), 1e-12)) for value in closes[-count:]]
+    center_x = (count - 1) / 2.0
+    center_y = sum(values) / count
+    covariance = sum(
+        (index - center_x) * (value - center_y)
+        for index, value in enumerate(values)
+    )
+    variance_x = sum((index - center_x) ** 2 for index in range(count))
+    variance_y = sum((value - center_y) ** 2 for value in values)
+    r_squared = (
+        covariance * covariance / max(variance_x * variance_y, 1e-18)
+        if variance_y > 0.0
+        else 0.0
+    )
+    slope = covariance / max(variance_x, 1e-18)
+    direction = 1.0 if side == "long" else -1.0 if side == "short" else 0.0
+    if direction and direction * slope <= 0.0:
+        r_squared = 0.0
+    returns = [values[index] - values[index - 1] for index in range(1, count)]
+    directional_ratio = (
+        sum(1 for value in returns if direction * value > 0.0) / len(returns)
+        if direction and returns
+        else 0.0
+    )
+    return _bounded(r_squared, 0.0, 1.0), _bounded(directional_ratio, 0.0, 1.0)
 
 
 def _normalized_momentum_horizons(
@@ -1010,9 +1241,31 @@ def evaluate_adaptive_breakout_trend(
     efficiency_closes = closes[-efficiency_period - 1:]
     path = sum(abs(efficiency_closes[i] - efficiency_closes[i - 1]) for i in range(1, len(efficiency_closes)))
     efficiency = abs(efficiency_closes[-1] - efficiency_closes[0]) / max(path, 1e-9)
+    trend_r_squared, directional_bar_ratio = _linear_trend_clarity(
+        closes,
+        side=side,
+        lookback=int(cfg.get("entry_clarity_lookback_bars", 48) or 48),
+    )
+    trend_clarity = _bounded(
+        trend_r_squared * 0.70 + directional_bar_ratio * 0.30,
+        0.0,
+        1.0,
+    )
     latest_range_atr = (
         float(candles[-1]["high"]) - float(candles[-1]["low"])
     ) / atr_value
+    latest_range = max(
+        float(candles[-1]["high"]) - float(candles[-1]["low"]),
+        1e-12,
+    )
+    directional_close_location = (
+        (closes[-1] - float(candles[-1]["low"])) / latest_range
+        if side == "long"
+        else (float(candles[-1]["high"]) - closes[-1]) / latest_range
+        if side == "short"
+        else 0.0
+    )
+    directional_close_location = _bounded(directional_close_location, 0.0, 1.0)
     volatility_ratio = short_vol / max(long_vol, 1e-9)
     fast_vote = horizon_votes[min(horizons)]
     slow_vote = horizon_votes[max(horizons)]
@@ -1045,6 +1298,102 @@ def evaluate_adaptive_breakout_trend(
         and closes[-1] < closes[-1 - continuation_bars]
         and fast_ema[-1] < fast_ema[-1 - continuation_bars]
     )
+    pullback_lookback = max(
+        2,
+        min(
+            len(candles) - 1,
+            int(cfg.get("pullback_touch_lookback_bars", 3) or 3),
+        ),
+    )
+    pullback_fast_touch_atr = float(
+        cfg.get("pullback_fast_ema_touch_atr", 0.35) or 0.35
+    )
+    pullback_medium_break_atr = float(
+        cfg.get("pullback_medium_ema_break_atr", 0.50) or 0.50
+    )
+    controlled_pullback_touch = False
+    if side in {"long", "short"}:
+        for index in range(len(candles) - pullback_lookback - 1, len(candles) - 1):
+            if side == "long":
+                touched_fast = (
+                    float(candles[index]["low"])
+                    <= fast_ema[index] + pullback_fast_touch_atr * atr_value
+                )
+                preserved_medium = (
+                    float(candles[index]["low"])
+                    >= medium_ema[index] - pullback_medium_break_atr * atr_value
+                )
+            else:
+                touched_fast = (
+                    float(candles[index]["high"])
+                    >= fast_ema[index] - pullback_fast_touch_atr * atr_value
+                )
+                preserved_medium = (
+                    float(candles[index]["high"])
+                    <= medium_ema[index] + pullback_medium_break_atr * atr_value
+                )
+            if touched_fast and preserved_medium:
+                controlled_pullback_touch = True
+                break
+    directional_body = (
+        closes[-1] > max(float(candles[-1]["open"]), closes[-2])
+        if side == "long"
+        else closes[-1] < min(float(candles[-1]["open"]), closes[-2])
+        if side == "short"
+        else False
+    )
+    pullback_resumption = bool(
+        cfg.get("pullback_resumption_enabled", True)
+        and ema_aligned
+        and controlled_pullback_touch
+        and directional_body
+        and continuation_reacceleration
+        and directional_close_location
+        >= float(cfg.get("pullback_min_close_location", 0.60) or 0.60)
+        and signed_fast_ema_distance_atr >= 0.0
+    )
+
+    impulse_lookback = max(
+        6,
+        min(
+            len(candles) - 1,
+            int(cfg.get("impulse_breakout_lookback_bars", 12) or 12),
+        ),
+    )
+    impulse_rows = candles[-impulse_lookback - 1:-1]
+    impulse_level = (
+        max(float(row["high"]) for row in impulse_rows)
+        if side == "long"
+        else min(float(row["low"]) for row in impulse_rows)
+        if side == "short"
+        else None
+    )
+    impulse_level_broken = bool(
+        side == "long" and impulse_level is not None and closes[-1] > impulse_level
+    ) or bool(
+        side == "short" and impulse_level is not None and closes[-1] < impulse_level
+    )
+    impulse_breakout = bool(
+        cfg.get("impulse_breakout_enabled", True)
+        and ema_aligned
+        and impulse_level_broken
+        and abs(weighted_momentum)
+        >= float(cfg.get("impulse_breakout_min_momentum_strength", 0.35) or 0.35)
+        and fast_momentum_retention is not None
+        and fast_momentum_retention
+        >= float(cfg.get("impulse_breakout_min_fast_retention", 0.55) or 0.55)
+        and volume_ratio
+        >= float(cfg.get("impulse_breakout_min_volume_ratio", 1.15) or 1.15)
+        and directional_close_location
+        >= float(cfg.get("impulse_breakout_min_close_location", 0.65) or 0.65)
+        and 0.0 <= signed_fast_ema_distance_atr
+        <= float(
+            cfg.get("impulse_breakout_max_fast_ema_distance_atr", 1.50)
+            or 1.50
+        )
+        and latest_range_atr
+        <= float(cfg.get("impulse_breakout_max_range_atr", 2.20) or 2.20)
+    )
     weighted_continuation = bool(
         cfg.get("continuation_entry_enabled", True)
         and ema_aligned
@@ -1057,6 +1406,40 @@ def evaluate_adaptive_breakout_trend(
         <= float(cfg.get("continuation_max_fast_ema_distance_atr", 1.10) or 1.10)
         and continuation_reacceleration
     )
+
+    momentum_quality = _bounded(abs(weighted_momentum) / 0.90, 0.0, 1.0)
+    retention_quality = _bounded(
+        (fast_momentum_retention or 0.0) / 1.00,
+        0.0,
+        1.0,
+    )
+    if 0.10 <= signed_fast_ema_distance_atr <= 1.00:
+        entry_geometry_quality = 1.0
+    elif signed_fast_ema_distance_atr < 0.10:
+        entry_geometry_quality = _bounded(
+            (signed_fast_ema_distance_atr + 0.40) / 0.50,
+            0.0,
+            1.0,
+        )
+    else:
+        entry_geometry_quality = _bounded(
+            1.0 - (signed_fast_ema_distance_atr - 1.00) / 1.50,
+            0.0,
+            1.0,
+        )
+    participation_quality = _bounded((volume_ratio - 0.60) / 1.00, 0.0, 1.0)
+    entry_opportunity_score = 100.0 * (
+        momentum_quality * 0.30
+        + retention_quality * 0.20
+        + trend_clarity * 0.20
+        + entry_geometry_quality * 0.15
+        + participation_quality * 0.15
+    )
+    if pullback_resumption:
+        entry_opportunity_score += 6.0
+    if impulse_breakout:
+        entry_opportunity_score += 8.0
+    entry_opportunity_score = _bounded(entry_opportunity_score, 0.0, 100.0)
 
     structure_window = candles[-max(4, int(cfg["structure_lookback_bars"])) - 1:-1]
     structure_stop = (
@@ -1100,8 +1483,17 @@ def evaluate_adaptive_breakout_trend(
         "continuation_reacceleration": continuation_reacceleration,
         "signed_fast_ema_distance_atr": signed_fast_ema_distance_atr,
         "trend_efficiency": efficiency,
+        "trend_r_squared": trend_r_squared,
+        "directional_bar_ratio": directional_bar_ratio,
+        "trend_clarity": trend_clarity,
+        "directional_close_location": directional_close_location,
         "latest_range_atr": latest_range_atr,
         "volume_ratio": volume_ratio,
+        "controlled_pullback_touch": controlled_pullback_touch,
+        "pullback_resumption": pullback_resumption,
+        "impulse_breakout": impulse_breakout,
+        "impulse_breakout_level": impulse_level,
+        "entry_opportunity_score": entry_opportunity_score,
         "structure_stop": structure_stop,
     }
 
@@ -1146,7 +1538,19 @@ def evaluate_adaptive_breakout_trend(
     score = 44.0
     score += min(18.0, abs(weighted_momentum) * 24.0)
     score += min(12.0, dominant_votes * 4.0)
-    score += 9.0 if compression_breakout else 7.0 if ema_crossover else 6.0 if weighted_continuation else 5.0
+    score += (
+        9.0
+        if compression_breakout
+        else 8.0
+        if impulse_breakout
+        else 8.0
+        if pullback_resumption
+        else 7.0
+        if ema_crossover
+        else 6.0
+        if weighted_continuation
+        else 5.0
+    )
     score += min(10.0, efficiency * 22.0)
     score += min(4.0, max(0.0, volume_ratio - 0.70) * 3.0)
     if slow_vote == side:
@@ -1198,6 +1602,10 @@ def evaluate_adaptive_breakout_trend(
         if ema_crossover
         else "compression breakout"
         if compression_breakout
+        else "impulse breakout"
+        if impulse_breakout
+        else "pullback resumption"
+        if pullback_resumption
         else "weighted continuation"
         if weighted_continuation
         else "trend re-acceleration"

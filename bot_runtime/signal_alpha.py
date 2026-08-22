@@ -8,6 +8,7 @@ import time
 from .entry_reason_ko import build_entry_diagnostic
 from trading_safety.market_session import us_equity_regular_session_status
 from utbreakout.adaptive_breakout_trend import (
+    ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION,
     evaluate_small_account_entry_refinement,
     normalize_adaptive_breakout_trend_config,
 )
@@ -1576,11 +1577,13 @@ class SignalAlphaMixin:
             'convex_rotation_entry_reacceleration': bool(
                 metrics.get('continuation_reacceleration')
                 or metrics.get('compression_breakout')
+                or metrics.get('pullback_resumption')
+                or metrics.get('impulse_breakout')
             ),
             'entry_profile_version': (
                 TRADFI_PATTERN_PROFILE_VERSION
                 if tradfi_profile_applied
-                else 'adaptive_breakout_trend_v1'
+                else ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION
             ),
             'tradfi_pattern_profile_applied': tradfi_profile_applied,
             'risk_budget_mode': (
@@ -1655,6 +1658,23 @@ class SignalAlphaMixin:
             ),
             'small_account_lower_timeframe_side': (
                 small_account_entry_refinement.get('lower_timeframe_side')
+            ),
+            'small_account_entry_opportunity_score': (
+                small_account_entry_refinement.get('entry_opportunity_score')
+            ),
+            'small_account_trend_clarity': (
+                small_account_entry_refinement.get('trend_clarity')
+            ),
+            'small_account_pullback_resumption': bool(
+                small_account_entry_refinement.get('pullback_resumption')
+            ),
+            'small_account_pullback_recovery_confirmed': bool(
+                small_account_entry_refinement.get(
+                    'pullback_recovery_confirmed'
+                )
+            ),
+            'small_account_impulse_breakout': bool(
+                small_account_entry_refinement.get('impulse_breakout')
             ),
             'structure_reference_stop': structure_stop,
             'entry_chase_atr': chase_atr,
@@ -1797,6 +1817,10 @@ class SignalAlphaMixin:
             if metrics.get('ema_crossover')
             else 'compression breakout'
             if metrics.get('compression_breakout')
+            else 'impulse breakout'
+            if metrics.get('impulse_breakout')
+            else 'pullback resumption'
+            if metrics.get('pullback_resumption')
             else 're-acceleration'
             if metrics.get('breakout_entry_enabled') and metrics.get('reacceleration')
             else 'weighted continuation'
@@ -1849,6 +1873,8 @@ class SignalAlphaMixin:
             f"Momentum: {float(metrics.get('weighted_momentum', 0.0) or 0.0):+.2f}",
             f"Fast trend retention: {fast_retention_text}",
             f"Entry mode: {breakout_mode}",
+            f"Entry opportunity: {float(metrics.get('entry_opportunity_score', 0.0) or 0.0):.1f}",
+            f"Trend clarity: {float(metrics.get('trend_clarity', 0.0) or 0.0):.2f}",
             f"Trend efficiency: {float(metrics.get('trend_efficiency', 0.0) or 0.0):.2f}",
             f"Volatility scale: {float(metrics.get('volatility_scale', 0.0) or 0.0):.2f}",
             f"L2: {(status.get('l2_gate') or {}).get('state') or 'N/A'}",

@@ -1,3 +1,5 @@
+import pytest
+
 from utbreakout.coinselector import (
     build_base_candidate,
     build_selection_report,
@@ -7,7 +9,6 @@ from utbreakout.coinselector import (
     normalize_custom_symbols,
     rank_candidates,
     score_selection_quality,
-    _scanner_hard_reject_reason,
 )
 
 
@@ -222,7 +223,15 @@ def test_coinselector_scores_utbreakout_set_and_adaptive_tf():
         selected_set_id=22,
         selected_set_info={"name": "UT + Donchian 20", "family": "Breakout"},
         adaptive_decision={"selected_tf": "30m", "selected_score": 76.0, "decision": "SELECTED"},
-        futures_context={"funding_rate": 0.0001, "open_interest_usdt": 1_200_000_000},
+        futures_context={
+            "funding_rate": 0.0001,
+            "open_interest_usdt": 1_200_000_000,
+            "basis_pct": 0.08,
+            "open_interest_delta_z": 0.75,
+            "open_interest_acceleration": 0.20,
+            "taker_buy_sell_ratio": 1.08,
+            "rolling_orderbook_imbalance_pct": 4.5,
+        },
         cfg=cfg,
     )
 
@@ -232,6 +241,11 @@ def test_coinselector_scores_utbreakout_set_and_adaptive_tf():
     assert result["auto_dominant_side"] == "long"
     assert result["auto_alignment_score"] == 75.0
     assert result["auto_ready_timeframes"] == 3
+    assert result["basis_pct"] == pytest.approx(0.08)
+    assert result["open_interest_delta_z"] == pytest.approx(0.75)
+    assert result["open_interest_acceleration"] == pytest.approx(0.20)
+    assert result["taker_buy_sell_ratio"] == pytest.approx(1.08)
+    assert result["rolling_orderbook_imbalance_pct"] == pytest.approx(4.5)
     assert result["component_scores"]["utbreakout_regime"] > 15
     assert "selection_quality" in result["component_scores"]
 

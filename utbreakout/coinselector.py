@@ -675,6 +675,19 @@ def finalize_candidate(
         "adaptive_reason": adaptive_decision.get("reason") or "",
         "funding_rate": (futures_context or {}).get("funding_rate", (futures_context or {}).get("lastFundingRate")),
         "open_interest_usdt": (futures_context or {}).get("open_interest_usdt", (futures_context or {}).get("open_interest")),
+        "basis_pct": (futures_context or {}).get("basis_pct"),
+        "open_interest_delta_z": (futures_context or {}).get(
+            "open_interest_delta_z"
+        ),
+        "open_interest_acceleration": (futures_context or {}).get(
+            "open_interest_acceleration"
+        ),
+        "taker_buy_sell_ratio": (futures_context or {}).get(
+            "taker_buy_sell_ratio"
+        ),
+        "rolling_orderbook_imbalance_pct": (futures_context or {}).get(
+            "rolling_orderbook_imbalance_pct"
+        ),
     })
     metrics = result.get("selection_metrics") if isinstance(result.get("selection_metrics"), dict) else {}
     result.update({
