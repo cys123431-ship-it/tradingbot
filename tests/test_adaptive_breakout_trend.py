@@ -14,6 +14,7 @@ from utbreakout.adaptive_breakout_trend import (
     _normalized_momentum_horizons,
     default_adaptive_breakout_trend_config,
     evaluate_adaptive_breakout_trend,
+    evaluate_small_account_entry_refinement,
     normalize_adaptive_breakout_trend_config,
 )
 from bot_runtime.signal_alpha import (
@@ -232,6 +233,8 @@ def test_weighted_continuation_enters_without_requiring_a_new_crossover(directio
     assert decision.side == side
     assert decision.metrics["ema_crossover"] is False
     assert decision.metrics["weighted_continuation"] is True
+    assert decision.metrics["fast_momentum_retention"] is not None
+    assert decision.metrics["fast_momentum_retention"] > 0.0
     assert "weighted continuation" in decision.reason
 
 
@@ -323,6 +326,9 @@ def test_live_crossover_reuses_completed_candle_and_keeps_decision_metadata(monk
             "live_enabled": True,
             "ema_crossover_minimum_momentum_strength": 0.0,
             "entry_chase_max_atr": 2.0,
+            # This test exercises cache/metadata propagation rather than
+            # the dedicated small-account crossover-extension veto.
+            "small_account_crossover_max_fast_ema_distance_atr": 4.0,
         },
         "daily_max_loss_usdt": 100.0,
         "max_daily_trades": 5,
@@ -583,6 +589,90 @@ def test_persisted_conservative_profile_migrates_to_small_account_aggressive_v3(
     assert migrated["small_account_strong_max_loss_percent"] == pytest.approx(30.0)
     assert migrated["small_account_elite_max_loss_percent"] == pytest.approx(35.0)
     assert migrated["small_account_daily_loss_limit_percent"] == pytest.approx(0.0)
+    assert migrated["small_account_entry_refinement_enabled"] is True
+    assert migrated["small_account_min_fast_momentum_retention"] == pytest.approx(0.55)
+
+
+def test_small_account_refinement_rejects_slow_only_continuation_decay():
+    result = evaluate_small_account_entry_refinement(
+        "long",
+        {
+            "weighted_continuation": True,
+            "fast_momentum_retention": 0.49,
+            "signed_fast_ema_distance_atr": 0.80,
+        },
+        entry_chase_atr=0.10,
+        selector_candidate={"auto_dominant_side": "long"},
+    )
+
+    assert result["allowed"] is False
+    assert result["code"] == "REJECTED_SMALL_ACCOUNT_FAST_TREND_DECAY"
+
+
+def test_small_account_refinement_keeps_fast_sleeve_continuation_actionable():
+    result = evaluate_small_account_entry_refinement(
+        "short",
+        {
+            "weighted_continuation": True,
+            "fast_momentum_retention": 0.72,
+            "signed_fast_ema_distance_atr": 0.90,
+        },
+        entry_chase_atr=-0.15,
+        selector_candidate={"auto_dominant_side": "neutral"},
+    )
+
+    assert result["allowed"] is True
+    assert result["code"] == "SMALL_ACCOUNT_ENTRY_REFINED_OK"
+
+
+def test_small_account_refinement_rejects_adverse_signal_move_symmetrically():
+    result = evaluate_small_account_entry_refinement(
+        "long",
+        {"weighted_continuation": False},
+        entry_chase_atr=-0.81,
+    )
+
+    assert result["allowed"] is False
+    assert result["code"] == "REJECTED_SMALL_ACCOUNT_SIGNAL_INVALIDATED"
+
+
+def test_small_account_refinement_rejects_extended_crossover_and_ltf_conflict():
+    extended = evaluate_small_account_entry_refinement(
+        "long",
+        {
+            "ema_crossover": True,
+            "signed_fast_ema_distance_atr": 2.01,
+        },
+        entry_chase_atr=0.0,
+    )
+    conflict = evaluate_small_account_entry_refinement(
+        "short",
+        {"weighted_continuation": False},
+        entry_chase_atr=0.0,
+        selector_candidate={
+            "auto_dominant_side": "long",
+            "auto_alignment_score": 75.0,
+            "auto_ready_timeframes": 3,
+        },
+    )
+
+    assert extended["code"] == "REJECTED_SMALL_ACCOUNT_CROSSOVER_EXTENSION"
+    assert conflict["code"] == "REJECTED_SMALL_ACCOUNT_LOWER_TIMEFRAME_CONFLICT"
+
+
+def test_small_account_refinement_does_not_turn_weak_ltf_vote_into_and_gate():
+    result = evaluate_small_account_entry_refinement(
+        "long",
+        {"weighted_continuation": False},
+        entry_chase_atr=0.0,
+        selector_candidate={
+            "auto_dominant_side": "short",
+            "auto_alignment_score": 20.0,
+            "auto_ready_timeframes": 3,
+        },
+    )
+
+    assert result["allowed"] is True
 
 
 def test_trend_single_universe_resolves_one_symbol_and_invalid_symbol_fails_closed():

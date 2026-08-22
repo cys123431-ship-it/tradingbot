@@ -413,3 +413,9 @@ def test_entry_reason_translation_covers_core_trend_waits():
         "Adaptive Breakout Trend waiting: multi_horizon_direction_not_aligned"
     )
     assert "모멘텀이 약해" in explain_entry_reason_ko("momentum_strength_too_low")
+    assert "단기 추세 힘" in explain_entry_reason_ko(
+        code="REJECTED_SMALL_ACCOUNT_FAST_TREND_DECAY"
+    )
+    assert "반대 방향" in explain_entry_reason_ko(
+        code="REJECTED_SMALL_ACCOUNT_SIGNAL_INVALIDATED"
+    )

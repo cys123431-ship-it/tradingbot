@@ -659,6 +659,17 @@ def finalize_candidate(
         "auto_set_family": set_info.get("family"),
         "auto_confidence": auto_scores.get("auto_confidence", "n/a"),
         "auto_score_margin": finite_float(auto_scores.get("auto_score_margin"), 0.0),
+        "auto_dominant_side": str(
+            auto_scores.get("dominant_side") or "neutral"
+        ).strip().lower(),
+        "auto_alignment_score": finite_float(
+            auto_scores.get("alignment_score"),
+            None,
+        ),
+        "auto_ready_timeframes": finite_int(
+            auto_scores.get("ready_timeframes"),
+            0,
+        ),
         "adaptive_tf": adaptive_decision.get("selected_tf") or "NO_TRADE",
         "adaptive_decision": adaptive_decision.get("decision") or "WAIT",
         "adaptive_reason": adaptive_decision.get("reason") or "",

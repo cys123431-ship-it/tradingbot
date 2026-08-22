@@ -87,6 +87,14 @@ def explain_entry_reason_ko(reason=None, *, code=None, data=None):
         return "봇이 일시정지 상태라 신규 진입하지 않았습니다."
     if "DIRECTION_FILTER" in uppered or "TRADE DIRECTION" in uppered:
         return "현재 허용된 매매 방향과 신호 방향이 달라 진입하지 않았습니다."
+    if "SMALL_ACCOUNT_FAST_TREND_DECAY" in uppered:
+        return "장기 추세는 남아 있지만 단기 추세 힘이 빠르게 약해져 재가속을 기다립니다."
+    if "SMALL_ACCOUNT_SIGNAL_INVALIDATED" in uppered:
+        return "완료봉 신호 뒤 가격이 반대 방향으로 크게 움직여 해당 진입 신호를 무효화했습니다."
+    if "SMALL_ACCOUNT_CROSSOVER_EXTENSION" in uppered:
+        return "이동평균 교차 직후 가격이 이미 과도하게 벌어져 눌림 또는 새 신호를 기다립니다."
+    if "SMALL_ACCOUNT_LOWER_TIMEFRAME_CONFLICT" in uppered:
+        return "상위 추세와 실제 진입 시간대 방향이 충돌해 방향이 다시 맞을 때까지 기다립니다."
     if "REGION_RESTRICTED" in uppered or "RESTRICTED_SYMBOL" in uppered:
         return "현재 계정에서 제한된 종목이라 진입하지 않았습니다."
     if "INVALID_MARKET" in uppered or "SYMBOL_PREFLIGHT" in uppered:

@@ -18,7 +18,7 @@ from typing import Any, Mapping, Sequence
 
 
 ADAPTIVE_BREAKOUT_TREND_STRATEGY = "adaptive_breakout_trend_v1"
-ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v5_convex_rotation"
+ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v6_fast_sleeve"
 
 
 def default_adaptive_breakout_trend_config() -> dict[str, Any]:
@@ -123,6 +123,17 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         "small_account_strong_leverage": 8,
         "small_account_elite_leverage": 15,
         "small_account_leverage_steps": (5, 8, 10, 15),
+        # The small-account profile keeps its aggressive capital allocation,
+        # but refuses a stale continuation when the fast trend sleeve has
+        # already decayed relative to the medium/slow sleeves.  This is a
+        # failure veto, not another all-signals-must-agree entry rule.
+        "small_account_entry_refinement_enabled": True,
+        "small_account_min_fast_momentum_retention": 0.55,
+        "small_account_max_adverse_signal_move_atr": 0.80,
+        "small_account_crossover_max_fast_ema_distance_atr": 2.00,
+        "small_account_lower_timeframe_conflict_veto_enabled": True,
+        "small_account_lower_timeframe_conflict_min_alignment": 60.0,
+        "small_account_lower_timeframe_conflict_min_ready_timeframes": 2,
         # Cross-sectional ranks supplement (and never bypass) the stop,
         # liquidation, liquidity and L2 safety gates.
         "rotation_exit_enabled": True,
@@ -204,6 +215,13 @@ def normalize_adaptive_breakout_trend_config(
             "small_account_strong_leverage",
             "small_account_elite_leverage",
             "small_account_leverage_steps",
+            "small_account_entry_refinement_enabled",
+            "small_account_min_fast_momentum_retention",
+            "small_account_max_adverse_signal_move_atr",
+            "small_account_crossover_max_fast_ema_distance_atr",
+            "small_account_lower_timeframe_conflict_veto_enabled",
+            "small_account_lower_timeframe_conflict_min_alignment",
+            "small_account_lower_timeframe_conflict_min_ready_timeframes",
             "rotation_exit_enabled",
             "rotation_min_holding_hours",
             "rotation_max_holding_hours",
@@ -390,12 +408,18 @@ def normalize_adaptive_breakout_trend_config(
         monotonic_targets.append(target_floor)
     normalized["pyramid_trigger_r"] = tuple(stage[0] for stage in ordered_stages)
     normalized["pyramid_target_fractions"] = tuple(monotonic_targets)
-    small_enabled = normalized.get("small_account_aggressive_enabled", True)
-    normalized["small_account_aggressive_enabled"] = (
-        small_enabled
-        if isinstance(small_enabled, bool)
-        else str(small_enabled).strip().lower() in {"1", "true", "yes", "on", "enabled"}
-    )
+    for key in (
+        "small_account_aggressive_enabled",
+        "small_account_entry_refinement_enabled",
+        "small_account_lower_timeframe_conflict_veto_enabled",
+    ):
+        raw = normalized.get(key, defaults[key])
+        normalized[key] = (
+            raw
+            if isinstance(raw, bool)
+            else str(raw).strip().lower()
+            in {"1", "true", "yes", "on", "enabled"}
+        )
     normalized["small_account_equity_threshold_usdt"] = max(
         0.0,
         float(
@@ -498,6 +522,52 @@ def normalize_adaptive_breakout_trend_config(
         configured_steps = set()
     configured_steps.update({minimum_leverage, strong_leverage, elite_leverage})
     normalized["small_account_leverage_steps"] = tuple(sorted(configured_steps))
+    normalized["small_account_min_fast_momentum_retention"] = _bounded(
+        _finite(
+            normalized.get("small_account_min_fast_momentum_retention"),
+            defaults["small_account_min_fast_momentum_retention"],
+        ),
+        0.0,
+        1.0,
+    )
+    normalized["small_account_max_adverse_signal_move_atr"] = _bounded(
+        _finite(
+            normalized.get("small_account_max_adverse_signal_move_atr"),
+            defaults["small_account_max_adverse_signal_move_atr"],
+        ),
+        0.10,
+        3.0,
+    )
+    normalized["small_account_crossover_max_fast_ema_distance_atr"] = _bounded(
+        _finite(
+            normalized.get("small_account_crossover_max_fast_ema_distance_atr"),
+            defaults["small_account_crossover_max_fast_ema_distance_atr"],
+        ),
+        0.50,
+        6.0,
+    )
+    normalized["small_account_lower_timeframe_conflict_min_alignment"] = _bounded(
+        _finite(
+            normalized.get("small_account_lower_timeframe_conflict_min_alignment"),
+            defaults["small_account_lower_timeframe_conflict_min_alignment"],
+        ),
+        0.0,
+        100.0,
+    )
+    normalized["small_account_lower_timeframe_conflict_min_ready_timeframes"] = int(
+        _bounded(
+            _finite(
+                normalized.get(
+                    "small_account_lower_timeframe_conflict_min_ready_timeframes"
+                ),
+                defaults[
+                    "small_account_lower_timeframe_conflict_min_ready_timeframes"
+                ],
+            ),
+            1.0,
+            8.0,
+        )
+    )
     for tier in ("base", "strong", "elite"):
         floor_key = f"{tier}_risk_percent_min"
         cap_key = f"{tier}_risk_percent_max"
@@ -512,6 +582,138 @@ def normalize_adaptive_breakout_trend_config(
             cap_value,
         )
     return normalized
+
+
+def evaluate_small_account_entry_refinement(
+    side: str | None,
+    metrics: Mapping[str, Any] | None,
+    *,
+    entry_chase_atr: float | None,
+    selector_candidate: Mapping[str, Any] | None = None,
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Veto only decayed or invalidated entries in the aggressive profile.
+
+    The broad multi-speed trend signal remains an OR-style weighted model.  A
+    continuation is rejected only when its fast sleeve has materially faded,
+    the live price has already moved against the completed-candle signal, or
+    the fresh execution-timeframe analysis explicitly points the other way.
+    """
+
+    cfg = normalize_adaptive_breakout_trend_config(config)
+    values = dict(metrics or {})
+    candidate = dict(selector_candidate or {})
+    normalized_side = str(side or "").strip().lower()
+    result = {
+        "allowed": True,
+        "code": "SMALL_ACCOUNT_ENTRY_REFINED_OK",
+        "reason": "small-account entry refinement passed",
+        "profile": ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION,
+        "fast_momentum_retention": _finite(
+            values.get("fast_momentum_retention"),
+            None,
+        ),
+        "entry_chase_atr": _finite(entry_chase_atr, None),
+        "lower_timeframe_side": str(
+            candidate.get("auto_dominant_side") or ""
+        ).strip().lower(),
+        "lower_timeframe_alignment": _finite(
+            candidate.get("auto_alignment_score"),
+            None,
+        ),
+        "lower_timeframe_ready_count": int(
+            _finite(candidate.get("auto_ready_timeframes"), 0.0) or 0
+        ),
+    }
+    if not bool(cfg.get("small_account_entry_refinement_enabled", True)):
+        result.update({
+            "code": "SMALL_ACCOUNT_ENTRY_REFINEMENT_DISABLED",
+            "reason": "small-account entry refinement disabled",
+        })
+        return result
+
+    chase_atr = result["entry_chase_atr"]
+    adverse_limit = float(cfg["small_account_max_adverse_signal_move_atr"])
+    if chase_atr is not None and chase_atr < -adverse_limit:
+        result.update({
+            "allowed": False,
+            "code": "REJECTED_SMALL_ACCOUNT_SIGNAL_INVALIDATED",
+            "reason": (
+                f"live price moved {abs(chase_atr):.2f} ATR against the "
+                f"completed-candle signal (limit {adverse_limit:.2f})"
+            ),
+        })
+        return result
+
+    fast_distance = _finite(values.get("signed_fast_ema_distance_atr"), None)
+    crossover_limit = float(
+        cfg["small_account_crossover_max_fast_ema_distance_atr"]
+    )
+    if (
+        bool(values.get("ema_crossover"))
+        and fast_distance is not None
+        and fast_distance > crossover_limit
+    ):
+        result.update({
+            "allowed": False,
+            "code": "REJECTED_SMALL_ACCOUNT_CROSSOVER_EXTENSION",
+            "reason": (
+                f"EMA crossover is already {fast_distance:.2f} ATR from the "
+                f"fast EMA (limit {crossover_limit:.2f})"
+            ),
+        })
+        return result
+
+    retention = result["fast_momentum_retention"]
+    retention_floor = float(cfg["small_account_min_fast_momentum_retention"])
+    if (
+        bool(values.get("weighted_continuation"))
+        and retention is not None
+        and retention < retention_floor
+    ):
+        result.update({
+            "allowed": False,
+            "code": "REJECTED_SMALL_ACCOUNT_FAST_TREND_DECAY",
+            "reason": (
+                f"fast trend retained only {retention:.2f} of the stronger "
+                f"medium/slow sleeve (minimum {retention_floor:.2f})"
+            ),
+        })
+        return result
+
+    lower_side = result["lower_timeframe_side"]
+    lower_alignment = result["lower_timeframe_alignment"]
+    lower_ready_count = result["lower_timeframe_ready_count"]
+    minimum_lower_alignment = float(
+        cfg["small_account_lower_timeframe_conflict_min_alignment"]
+    )
+    minimum_lower_ready_count = int(
+        cfg["small_account_lower_timeframe_conflict_min_ready_timeframes"]
+    )
+    if (
+        bool(
+            cfg.get(
+                "small_account_lower_timeframe_conflict_veto_enabled",
+                True,
+            )
+        )
+        and normalized_side in {"long", "short"}
+        and lower_side in {"long", "short"}
+        and lower_side != normalized_side
+        and lower_alignment is not None
+        and lower_alignment >= minimum_lower_alignment
+        and lower_ready_count >= minimum_lower_ready_count
+    ):
+        result.update({
+            "allowed": False,
+            "code": "REJECTED_SMALL_ACCOUNT_LOWER_TIMEFRAME_CONFLICT",
+            "reason": (
+                f"lower timeframes strongly favor {lower_side} "
+                f"(alignment {lower_alignment:.1f}, ready {lower_ready_count}) "
+                f"against the {normalized_side} trend signal"
+            ),
+        })
+    return result
 
 
 @dataclass(frozen=True)
@@ -691,6 +893,22 @@ def evaluate_adaptive_breakout_trend(
     minimum_votes = max(2, min(len(horizons), int(cfg["minimum_horizon_agreement"])))
     side = "long" if weighted_momentum > 0 else "short" if weighted_momentum < 0 else None
     dominant_votes = long_votes if side == "long" else short_votes if side == "short" else 0
+    fast_momentum_retention: float | None = None
+    if side in {"long", "short"} and len(horizons) >= 2:
+        direction = 1.0 if side == "long" else -1.0
+        fast_directional = direction * float(horizon_scores[min(horizons)])
+        slower_directional = [
+            direction * float(horizon_scores[horizon])
+            for horizon in horizons
+            if horizon != min(horizons)
+        ]
+        stronger_slow_sleeve = max(slower_directional, default=0.0)
+        if stronger_slow_sleeve > 0.0:
+            fast_momentum_retention = _bounded(
+                fast_directional / stronger_slow_sleeve,
+                -2.0,
+                2.0,
+            )
 
     fast_ema = _ema(closes, int(cfg["fast_ema_period"]))
     medium_ema = _ema(closes, int(cfg["medium_ema_period"]))
@@ -857,6 +1075,7 @@ def evaluate_adaptive_breakout_trend(
         "long_volatility": long_vol,
         "volatility_ratio": volatility_ratio,
         "weighted_momentum": weighted_momentum,
+        "fast_momentum_retention": fast_momentum_retention,
         "horizon_scores": horizon_scores,
         "horizon_votes": horizon_votes,
         "long_votes": long_votes,
@@ -1003,5 +1222,6 @@ __all__ = (
     "AdaptiveBreakoutTrendDecision",
     "default_adaptive_breakout_trend_config",
     "evaluate_adaptive_breakout_trend",
+    "evaluate_small_account_entry_refinement",
     "normalize_adaptive_breakout_trend_config",
 )

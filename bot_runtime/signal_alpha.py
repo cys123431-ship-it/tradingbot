@@ -8,6 +8,7 @@ import time
 from .entry_reason_ko import build_entry_diagnostic
 from trading_safety.market_session import us_equity_regular_session_status
 from utbreakout.adaptive_breakout_trend import (
+    evaluate_small_account_entry_refinement,
     normalize_adaptive_breakout_trend_config,
 )
 from utbreakout.profit_capture import (
@@ -1389,6 +1390,30 @@ class SignalAlphaMixin:
         status['small_account_aggressive_candidate'] = small_account_aggressive_candidate
         status['small_account_equity_usdt'] = balance_for_risk
         status['effective_daily_loss_percent'] = effective_daily_loss_percent
+        small_account_entry_refinement = {
+            'allowed': True,
+            'code': 'SMALL_ACCOUNT_ENTRY_REFINEMENT_NOT_APPLICABLE',
+            'reason': 'small-account entry refinement not applicable',
+        }
+        if small_account_aggressive_candidate:
+            small_account_entry_refinement = evaluate_small_account_entry_refinement(
+                side,
+                metrics,
+                entry_chase_atr=chase_atr,
+                selector_candidate=selector_candidate,
+                config=trend_cfg,
+            )
+            status['small_account_entry_refinement'] = dict(
+                small_account_entry_refinement
+            )
+            if not bool(small_account_entry_refinement.get('allowed')):
+                return _finish(
+                    None,
+                    'Small-account entry refinement waiting: '
+                    f"{small_account_entry_refinement.get('reason')}",
+                    small_account_entry_refinement.get('code')
+                    or 'REJECTED_SMALL_ACCOUNT_ENTRY_REFINEMENT',
+                )
         if (
             not small_account_aggressive_candidate
             and
@@ -1622,6 +1647,15 @@ class SignalAlphaMixin:
                 else None
             ),
             'small_account_aggressive_daily_pnl_usdt': float(daily_pnl or 0.0),
+            'small_account_entry_refinement_profile': (
+                small_account_entry_refinement.get('profile')
+            ),
+            'small_account_fast_momentum_retention': (
+                small_account_entry_refinement.get('fast_momentum_retention')
+            ),
+            'small_account_lower_timeframe_side': (
+                small_account_entry_refinement.get('lower_timeframe_side')
+            ),
             'structure_reference_stop': structure_stop,
             'entry_chase_atr': chase_atr,
             'l2_gate': dict(l2_gate or {}),
@@ -1795,6 +1829,10 @@ class SignalAlphaMixin:
                 f"Risk target: {float(status.get('target_risk_percent', metrics.get('target_risk_percent', 0.0)) or 0.0):.2f}% "
                 f"/ tier={status.get('risk_tier') or 'waiting'}"
             )
+        try:
+            fast_retention_text = f"{float(metrics.get('fast_momentum_retention')):.2f}"
+        except (TypeError, ValueError):
+            fast_retention_text = "N/A"
         lines = [
             '📈 Adaptive Breakout Trend 상태',
             f'Symbol: {target}',
@@ -1809,6 +1847,7 @@ class SignalAlphaMixin:
             risk_status_text,
             f'Horizons: {vote_text or "N/A"}',
             f"Momentum: {float(metrics.get('weighted_momentum', 0.0) or 0.0):+.2f}",
+            f"Fast trend retention: {fast_retention_text}",
             f"Entry mode: {breakout_mode}",
             f"Trend efficiency: {float(metrics.get('trend_efficiency', 0.0) or 0.0):.2f}",
             f"Volatility scale: {float(metrics.get('volatility_scale', 0.0) or 0.0):.2f}",
@@ -1816,6 +1855,14 @@ class SignalAlphaMixin:
             f"진입하지 않은 이유: {entry_diagnostic.get('message')}",
             f"Reason: {status.get('reason') or '-'}",
         ]
+        refinement = status.get('small_account_entry_refinement')
+        if small_account_active and isinstance(refinement, dict):
+            lines.insert(
+                7,
+                "Small-account entry refinement: "
+                f"{'PASS' if refinement.get('allowed') else 'WAIT'} / "
+                f"{refinement.get('reason') or '-'}",
+            )
         if status.get('tradfi_perpetual'):
             chart_patterns = metrics.get('tradfi_chart_patterns') or {}
             side = str(status.get('side') or '').lower()

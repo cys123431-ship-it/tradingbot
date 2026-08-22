@@ -214,7 +214,11 @@ def test_coinselector_scores_utbreakout_set_and_adaptive_tf():
     candidate = build_base_candidate("BTC/USDT:USDT", _ticker(quoteVolume=900_000_000), _market(), cfg)
     result = finalize_candidate(
         candidate,
-        auto_analysis=_auto_scores(),
+        auto_analysis=_auto_scores(
+            dominant_side="long",
+            alignment_score=75.0,
+            ready_timeframes=3,
+        ),
         selected_set_id=22,
         selected_set_info={"name": "UT + Donchian 20", "family": "Breakout"},
         adaptive_decision={"selected_tf": "30m", "selected_score": 76.0, "decision": "SELECTED"},
@@ -225,6 +229,9 @@ def test_coinselector_scores_utbreakout_set_and_adaptive_tf():
     assert result["score"] >= 0.0
     assert result["auto_set_id"] == 22
     assert result["adaptive_tf"] == "30m"
+    assert result["auto_dominant_side"] == "long"
+    assert result["auto_alignment_score"] == 75.0
+    assert result["auto_ready_timeframes"] == 3
     assert result["component_scores"]["utbreakout_regime"] > 15
     assert "selection_quality" in result["component_scores"]
 
