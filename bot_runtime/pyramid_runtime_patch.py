@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from .pyramid_protection import enforce_adaptive_pyramid_stop_postcondition
+from .pyramid_protection_live import (
+    best_live_exchange_stop,
+    enforce_adaptive_pyramid_live_sl_guard,
+    read_exchange_sl_snapshot,
+)
 from utbreakout.adaptive_breakout_trend import ADAPTIVE_BREAKOUT_TREND_STRATEGY
 
 
@@ -45,13 +49,22 @@ def install_adaptive_pyramid_stop_guard() -> None:
                 and str(state.get("strategy") or "").lower()
                 == ADAPTIVE_BREAKOUT_TREND_STRATEGY
             ):
+                side = str((pos or {}).get("side") or state.get("side") or "").lower()
+                mark = None
                 try:
-                    before_stop = await self._current_stop_loss_price(symbol, state)
-                except Exception:
-                    before_stop = None
+                    mark = float((pos or {}).get("markPrice") or 0.0) or None
+                except (TypeError, ValueError):
+                    mark = None
+                if side in {"long", "short"}:
+                    try:
+                        snapshot = await read_exchange_sl_snapshot(self, symbol, side)
+                        if snapshot.get("fetch_ok"):
+                            before_stop = best_live_exchange_stop(snapshot, side, mark)
+                    except Exception:
+                        before_stop = None
 
         result = await original(self, symbol, pos, df, cfg)
-        return await enforce_adaptive_pyramid_stop_postcondition(
+        return await enforce_adaptive_pyramid_live_sl_guard(
             self,
             symbol,
             before_qty=before_qty,
