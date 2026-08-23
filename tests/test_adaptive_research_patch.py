@@ -103,6 +103,7 @@ def test_runtime_wrapper_scales_accepted_plan_without_touching_protection(monkey
             "score": 80.0,
             "risk_multiplier": 0.9,
             "metrics": {"score": 80.0},
+            "small_account_aggressive_candidate": True,
             "entry_plan": plan,
         }
 
@@ -151,12 +152,51 @@ def test_runtime_wrapper_scales_accepted_plan_without_touching_protection(monkey
     assert stored["plan"] == plan
 
 
+def test_runtime_wrapper_leaves_non_small_account_unchanged(monkeypatch):
+    original_plan = _fake_plan()
+
+    async def original(self, symbol, df, strategy_params, *, force_reprocess=False):
+        return "long", "ACCEPTED_ENTRY", {
+            "allowed": True,
+            "score": 80.0,
+            "risk_multiplier": 0.9,
+            "metrics": {"score": 80.0},
+            "small_account_aggressive_candidate": False,
+            "entry_plan": dict(original_plan),
+        }
+
+    monkeypatch.setattr(
+        SignalAlphaMixin,
+        "_calculate_adaptive_breakout_trend_signal",
+        original,
+    )
+    calls = []
+    monkeypatch.setattr(
+        patch_module,
+        "evaluate_adaptive_research_overlay",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    patch_module.install_adaptive_research_overlay()
+
+    engine = SignalAlphaMixin()
+    side, reason, status = asyncio.run(
+        engine._calculate_adaptive_breakout_trend_signal("TEST", None, {})
+    )
+
+    assert side == "long"
+    assert reason == "ACCEPTED_ENTRY"
+    assert status["entry_plan"] == original_plan
+    assert calls == []
+    assert "adaptive_research_overlay" not in status
+
+
 def test_runtime_wrapper_clears_rejected_plan(monkeypatch):
     async def original(self, symbol, df, strategy_params, *, force_reprocess=False):
         return "long", "ACCEPTED_ENTRY", {
             "allowed": True,
             "score": 80.0,
             "metrics": {"score": 80.0},
+            "small_account_aggressive_candidate": True,
             "entry_plan": _fake_plan(),
         }
 
