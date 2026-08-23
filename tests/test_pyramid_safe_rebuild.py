@@ -1,7 +1,5 @@
 import asyncio
 
-import pytest
-
 from bot_runtime.pyramid_runtime_patch import _position_increased_after_exception
 from bot_runtime.pyramid_safe_rebuild import (
     activate_adaptive_pyramid_rebuild,
@@ -36,15 +34,7 @@ class FakeEngine:
 
     async def _replace_stop_loss_order(self, symbol, pos, stop, reason=""):
         self.replacements.append((symbol, pos["contracts"], stop, reason))
-        self.orders = [order for order in self.orders if order.get("kind") != "sl"]
-        order = {
-            "id": "sl-full",
-            "kind": "sl",
-            "stopPrice": stop,
-            "amount": pos["contracts"],
-        }
-        self.orders.append(order)
-        return order
+        return {"id": "unexpected-replacement"}
 
     def _position_signed_contracts(self, pos):
         return pos.get("contracts", 0.0)
@@ -104,7 +94,7 @@ def test_non_pyramid_cleanup_keeps_normal_all_order_behavior():
     assert set(seen) == {"sl-old", "tp-old"}
 
 
-def test_pyramid_place_rebuilds_full_qty_sl_then_runs_tp_only():
+def test_pyramid_place_keeps_live_sl_and_runs_normal_builder_tp_only():
     engine = FakeEngine()
     calls = []
 
@@ -152,17 +142,10 @@ def test_pyramid_place_rebuilds_full_qty_sl_then_runs_tp_only():
         reset_adaptive_pyramid_rebuild(token)
 
     assert result == {"ok": True}
-    assert engine.replacements
-    assert engine.replacements[-1][1] == pytest.approx(8.0)
-    assert engine.replacements[-1][2] == pytest.approx(100.0)
+    assert engine.replacements == []
     assert calls[-1]["sl_distance"] is None
     assert calls[-1]["preserve_runner_qty"] is True
-    assert any(
-        order.get("kind") == "sl"
-        and order.get("amount") == pytest.approx(8.0)
-        and order.get("stopPrice") == pytest.approx(100.0)
-        for order in engine.orders
-    )
+    assert any(order.get("id") == "sl-old" for order in engine.orders)
 
 
 def test_post_fill_exception_detection_uses_exchange_position_growth():
