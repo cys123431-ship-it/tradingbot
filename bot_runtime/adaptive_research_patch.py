@@ -186,6 +186,7 @@ def install_adaptive_research_overlay() -> None:
             status["accepted_side"] = None
             status["stage"] = "waiting"
             status["reject_code"] = overlay.get("code")
+            status.pop("entry_plan", None)
             rejected_reason = (
                 "Adaptive Trend research overlay waiting: "
                 f"{overlay.get('reason') or 'no research edge'}"
@@ -202,9 +203,8 @@ def install_adaptive_research_overlay() -> None:
         )
         status["score_raw"] = base_score
         status["score"] = adjusted_plan["adaptive_breakout_trend_score"]
-        status["risk_multiplier"] = min(
-            _bounded_multiplier(status.get("risk_multiplier", 1.0)),
-            factor,
+        status["risk_multiplier"] = _bounded_multiplier(
+            adjusted_plan.get("adaptive_breakout_trend_risk_multiplier", factor)
         )
         status["entry_plan"] = adjusted_plan
 
