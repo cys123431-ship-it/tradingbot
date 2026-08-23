@@ -223,6 +223,68 @@ def test_rolling_orderflow_snapshot_ignores_non_finite_values():
     assert context["rolling_ofi_score"] > 0
 
 
+def test_rolling_orderflow_snapshot_expires_stale_microstructure_data():
+    engine_cls = _signal_engine_cls()
+    engine = engine_cls.__new__(engine_cls)
+    engine.utbreakout_orderflow_snapshots = {}
+    engine._update_utbreakout_orderflow_snapshots(
+        "BTC/USDT",
+        {
+            "timestamp": 100.0,
+            "orderbook_imbalance_pct": 12.0,
+            "bid_depth_usdt": 20_000.0,
+            "ask_depth_usdt": 10_000.0,
+            "futures_spread_pct": 0.01,
+            "best_bid": 99.0,
+            "best_ask": 100.0,
+        },
+    )
+
+    context = engine._update_utbreakout_orderflow_snapshots(
+        "BTC/USDT",
+        None,
+        max_age_seconds=90.0,
+        now=200.0,
+    )
+
+    assert context["orderflow_stale"] is True
+    assert context["rolling_ofi_samples"] == 0
+    assert context["rolling_orderbook_imbalance_pct"] is None
+    assert engine.utbreakout_orderflow_snapshots["BTC/USDT"] == []
+
+
+def test_binance_public_json_retries_transient_timeout(monkeypatch):
+    emas = _emas_module()
+    controller = emas.MainController.__new__(emas.MainController)
+    attempts = []
+    waits = []
+
+    def flaky_fetch(path, params):
+        attempts.append((path, dict(params)))
+        if len(attempts) < 3:
+            raise TimeoutError("temporary timeout")
+        return {"ok": True}
+
+    async def fake_sleep(delay):
+        waits.append(delay)
+
+    controller._fetch_binance_public_json_sync = flaky_fetch
+    import bot_runtime.controller_exchange as controller_exchange_module
+
+    monkeypatch.setattr(controller_exchange_module.asyncio, "sleep", fake_sleep)
+
+    result = asyncio.run(
+        controller._fetch_binance_public_json(
+            "/fapi/v1/test",
+            {"symbol": "BTCUSDT"},
+        )
+    )
+
+    assert result == {"ok": True}
+    assert len(attempts) == 3
+    assert waits == [0.5, 1.0]
+
+
 def test_open_interest_stats_are_safe_for_short_and_flat_history():
     engine_cls = _signal_engine_cls()
     engine = engine_cls.__new__(engine_cls)

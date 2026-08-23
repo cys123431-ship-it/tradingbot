@@ -1225,7 +1225,41 @@ class ControllerExchangeMixin:
         return json.loads(payload)
 
     async def _fetch_binance_public_json(self, path, params):
-        return await asyncio.to_thread(self._fetch_binance_public_json_sync, path, params)
+        delay_seconds = 0.5
+        for attempt in range(3):
+            try:
+                return await asyncio.to_thread(
+                    self._fetch_binance_public_json_sync,
+                    path,
+                    params,
+                )
+            except Exception as exc:
+                status_code = getattr(exc, 'code', None)
+                if status_code is not None:
+                    transient = int(status_code) in {418, 429} or 500 <= int(status_code) < 600
+                else:
+                    transient = isinstance(exc, (TimeoutError, OSError))
+                if not transient or attempt >= 2:
+                    raise
+                retry_after = None
+                headers = getattr(exc, 'headers', None)
+                if headers is not None:
+                    try:
+                        retry_after = float(headers.get('Retry-After'))
+                    except (TypeError, ValueError):
+                        retry_after = None
+                wait_seconds = min(
+                    30.0,
+                    max(delay_seconds, retry_after or 0.0),
+                )
+                logger.warning(
+                    "Binance public API transient failure %s attempt %s/3; retrying in %.1fs",
+                    path,
+                    attempt + 1,
+                    wait_seconds,
+                )
+                await asyncio.sleep(wait_seconds)
+                delay_seconds = min(delay_seconds * 2.0, 4.0)
 
     async def _fetch_utbreakout_futures_context(self, symbol):
         """Fetch lightweight futures context for controller-side reports.

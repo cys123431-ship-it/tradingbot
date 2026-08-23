@@ -11,10 +11,11 @@ from __future__ import annotations
 
 from math import exp, isfinite, log, sqrt
 from statistics import median
+from time import time
 from typing import Any, Mapping, Sequence
 
 
-CHANGE_POINT_FLOW_PROFILE_VERSION = "change_point_flow_v2_independent"
+CHANGE_POINT_FLOW_PROFILE_VERSION = "change_point_flow_v3_freshness"
 
 
 def default_change_point_flow_config() -> dict[str, Any]:
@@ -39,6 +40,7 @@ def default_change_point_flow_config() -> dict[str, Any]:
         "tradfi_opening_range_enabled": True,
         "independent_candidate_minimum_score": 60.0,
         "candidate_conflict_margin": 12.0,
+        "orderflow_max_age_seconds": 90.0,
     }
 
 
@@ -75,6 +77,7 @@ def normalize_change_point_flow_config(
         ("fallback_stop_atr_multiplier", 1.25, 3.0),
         ("independent_candidate_minimum_score", 50.0, 85.0),
         ("candidate_conflict_margin", 5.0, 30.0),
+        ("orderflow_max_age_seconds", 15.0, 300.0),
     ):
         normalized[key] = _bounded(
             normalized.get(key), lower, upper, float(defaults[key])
@@ -231,8 +234,12 @@ def evaluate_change_point_flow_entry(
             else max(row["high"] for row in structure_rows)
         )
 
-    flow_score, flow_sources, flow_components = _directional_flow_score(
-        direction, context
+    flow_score, flow_sources, flow_components, flow_freshness = (
+        _directional_flow_score(
+            direction,
+            context,
+            max_age_seconds=float(cfg["orderflow_max_age_seconds"]),
+        )
     )
     oi_score, oi_sources = _open_interest_score(context)
     derivatives_sources = flow_sources + oi_sources
@@ -394,6 +401,9 @@ def evaluate_change_point_flow_entry(
         "open_interest_source_count": oi_sources,
         "derivatives_source_count": derivatives_sources,
         "flow_components": flow_components,
+        "orderflow_snapshot_ts": flow_freshness["snapshot_ts"],
+        "orderflow_age_seconds": flow_freshness["age_seconds"],
+        "orderflow_stale": flow_freshness["stale"],
         "paths": allowed_paths,
         "tradfi": bool(tradfi),
         "event_atr": event_atr,
@@ -601,29 +611,61 @@ def _clean_rows(
 def _directional_flow_score(
     direction: float,
     context: Mapping[str, Any],
-) -> tuple[float, int, dict[str, float]]:
+    *,
+    max_age_seconds: float = 90.0,
+) -> tuple[float, int, dict[str, float], dict[str, Any]]:
+    snapshot_ts = _finite(context.get("orderflow_snapshot_ts"), None)
+    if snapshot_ts is not None and snapshot_ts > 10_000_000_000:
+        snapshot_ts /= 1000.0
+    age_seconds = (
+        max(0.0, time() - snapshot_ts)
+        if snapshot_ts is not None and snapshot_ts > 0
+        else None
+    )
+    stale = bool(
+        age_seconds is not None
+        and age_seconds > max(1.0, float(max_age_seconds))
+    )
+    freshness = {
+        "snapshot_ts": snapshot_ts,
+        "age_seconds": round(age_seconds, 3) if age_seconds is not None else None,
+        "stale": stale,
+    }
     components: dict[str, float] = {}
-    imbalance = _finite(context.get("rolling_orderbook_imbalance_pct"), None)
+    imbalance = (
+        None
+        if stale
+        else _finite(context.get("rolling_orderbook_imbalance_pct"), None)
+    )
     if imbalance is not None:
         components["orderbook_imbalance"] = _clamp(direction * imbalance / 18.0, -1.0, 1.0)
-    imbalance_delta = _finite(
-        context.get("rolling_orderbook_imbalance_delta"), None
+    imbalance_delta = (
+        None
+        if stale
+        else _finite(context.get("rolling_orderbook_imbalance_delta"), None)
     )
     if imbalance_delta is not None:
         components["orderbook_delta"] = _clamp(
             direction * imbalance_delta / 10.0, -1.0, 1.0
         )
-    taker_ratio = _finite(context.get("taker_buy_sell_ratio"), None)
+    taker_ratio = (
+        None
+        if stale
+        else _finite(context.get("taker_buy_sell_ratio"), None)
+    )
     if taker_ratio is not None and taker_ratio > 0:
         components["taker_ratio"] = _clamp(
             direction * log(taker_ratio) / log(1.18), -1.0, 1.0
         )
     if not components:
-        return 50.0, 0, {}
+        return 50.0, 0, {}, freshness
     value = sum(components.values()) / len(components)
-    return 50.0 + 50.0 * value, len(components), {
-        key: round(component, 4) for key, component in components.items()
-    }
+    return (
+        50.0 + 50.0 * value,
+        len(components),
+        {key: round(component, 4) for key, component in components.items()},
+        freshness,
+    )
 
 
 def _open_interest_score(context: Mapping[str, Any]) -> tuple[float, int]:

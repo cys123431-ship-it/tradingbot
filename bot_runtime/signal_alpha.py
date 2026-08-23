@@ -2016,6 +2016,12 @@ class SignalAlphaMixin:
             'change_point_flow_regime_score': change_point_flow.get(
                 'regime_change_score'
             ),
+            'change_point_flow_orderflow_age_seconds': change_point_flow.get(
+                'orderflow_age_seconds'
+            ),
+            'change_point_flow_orderflow_stale': bool(
+                change_point_flow.get('orderflow_stale')
+            ),
             'change_point_flow_event_timeframe': change_point_flow.get(
                 'event_timeframe'
             ),
@@ -2255,7 +2261,8 @@ class SignalAlphaMixin:
                 f"{str(flow_overlay.get('state') or 'waiting')} / "
                 f"종합 {float(flow_overlay.get('total_score', 0.0) or 0.0):.1f} / "
                 f"가격 {float(flow_overlay.get('price_score', 0.0) or 0.0):.1f} / "
-                f"흐름 {float(flow_overlay.get('flow_score', 0.0) or 0.0):.1f}",
+                f"흐름 {float(flow_overlay.get('flow_score', 0.0) or 0.0):.1f} / "
+                f"데이터 {'STALE 제외' if flow_overlay.get('orderflow_stale') else 'FRESH'}",
             )
         if status.get('tradfi_perpetual'):
             chart_patterns = metrics.get('tradfi_chart_patterns') or {}

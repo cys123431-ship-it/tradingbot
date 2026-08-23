@@ -116,6 +116,24 @@ def test_change_point_flow_rejects_measured_multi_source_opposition():
     assert result["flow_source_count"] == 3
 
 
+def test_stale_orderflow_is_excluded_instead_of_vetoing_fresh_price_regime():
+    result = evaluate_change_point_flow_entry(
+        "long",
+        _event_rows(1),
+        futures_context={
+            "orderflow_snapshot_ts": 1.0,
+            "rolling_orderbook_imbalance_pct": -25.0,
+            "rolling_orderbook_imbalance_delta": -15.0,
+            "taker_buy_sell_ratio": 0.70,
+        },
+    )
+
+    assert result["allowed"] is True
+    assert result["orderflow_stale"] is True
+    assert result["flow_source_count"] == 0
+    assert result["flow_score"] == pytest.approx(50.0)
+
+
 def test_missing_derivatives_data_degrades_to_fresh_price_shape():
     result = evaluate_change_point_flow_entry(
         "long",
@@ -173,6 +191,8 @@ def test_change_point_flow_audit_fields_survive_entry_plan_persistence():
         "change_point_flow_state": "new_regime",
         "change_point_flow_total_score": 87.5,
         "change_point_flow_stop_atr_multiplier": 1.35,
+        "change_point_flow_orderflow_age_seconds": 12.5,
+        "change_point_flow_orderflow_stale": False,
         "trend_event_candidate_source": "event_only",
         "trend_event_candidate_agreement": "event_only",
         "trend_event_candidate_score": 87.5,
@@ -185,6 +205,8 @@ def test_change_point_flow_audit_fields_survive_entry_plan_persistence():
     assert summary["trend_event_candidate_source"] == "event_only"
     assert summary["trend_event_candidate_agreement"] == "event_only"
     assert summary["trend_event_candidate_score"] == pytest.approx(87.5)
+    assert summary["change_point_flow_orderflow_age_seconds"] == pytest.approx(12.5)
+    assert summary["change_point_flow_orderflow_stale"] is False
     assert "temporary_debug_value" not in summary
 
 

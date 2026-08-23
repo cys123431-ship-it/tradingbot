@@ -567,7 +567,7 @@ def test_live_crossover_reuses_completed_candle_and_keeps_decision_metadata(monk
     assert plan["adaptive_trend_initial_fraction"] == pytest.approx(
         plan["small_account_initial_margin_fraction"]
     )
-    assert plan["change_point_flow_profile"] == "change_point_flow_v2_independent"
+    assert plan["change_point_flow_profile"] == "change_point_flow_v3_freshness"
     assert plan["adaptive_trend_risk_tier"] == "strong"
     assert plan["convex_rotation_percentile"] == pytest.approx(80.0)
     assert plan["adaptive_trend_target_qty"] > plan["qty"]

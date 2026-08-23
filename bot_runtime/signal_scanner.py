@@ -1276,10 +1276,20 @@ class SignalScannerMixin:
             'best_ask': float(best_ask),
         }
 
-    def _update_utbreakout_orderflow_snapshots(self, symbol, snapshot=None, *, window=5, max_samples=20):
+    def _update_utbreakout_orderflow_snapshots(
+        self,
+        symbol,
+        snapshot=None,
+        *,
+        window=5,
+        max_samples=20,
+        max_age_seconds=None,
+        now=None,
+    ):
         snapshots = self._ensure_runtime_state_container('utbreakout_orderflow_snapshots')
         symbol_key = str(symbol or '')
         rows = list(snapshots.get(symbol_key) or [])
+        had_rows = bool(rows)
         if isinstance(snapshot, dict) and snapshot:
             clean = {}
             for key in (
@@ -1297,6 +1307,19 @@ class SignalScannerMixin:
             if clean.get('timestamp') is not None:
                 rows.append(clean)
         rows = rows[-max(1, int(max_samples or 20)):]
+        reference_now = float(now if now is not None else time.time())
+        if max_age_seconds is not None:
+            cutoff = reference_now - max(1.0, float(max_age_seconds))
+
+            def _snapshot_is_fresh(row):
+                timestamp = _safe_float_or_none((row or {}).get('timestamp'))
+                if timestamp is None:
+                    return False
+                if timestamp > 10_000_000_000:
+                    timestamp /= 1000.0
+                return timestamp >= cutoff
+
+            rows = [row for row in rows if _snapshot_is_fresh(row)]
         snapshots[symbol_key] = rows
 
         try:
@@ -1308,8 +1331,23 @@ class SignalScannerMixin:
             if _safe_float_or_none((row or {}).get('orderbook_imbalance_pct')) is not None
         ]
         latest = rows[-1] if rows else {}
-        context = {}
+        context = {
+            'futures_best_bid': None,
+            'futures_best_ask': None,
+            'best_bid': None,
+            'best_ask': None,
+            'futures_spread_pct': None,
+            'bid_depth_usdt': None,
+            'ask_depth_usdt': None,
+            'orderbook_imbalance_pct': None,
+            'orderflow_snapshot_ts': None,
+            'orderflow_snapshot_age_seconds': None,
+            'orderflow_stale': bool(had_rows and not rows),
+        }
         if latest:
+            latest_timestamp = _safe_float_or_none(latest.get('timestamp'))
+            if latest_timestamp is not None and latest_timestamp > 10_000_000_000:
+                latest_timestamp /= 1000.0
             context.update({
                 'futures_best_bid': latest.get('best_bid'),
                 'futures_best_ask': latest.get('best_ask'),
@@ -1320,6 +1358,12 @@ class SignalScannerMixin:
                 'ask_depth_usdt': latest.get('ask_depth_usdt'),
                 'orderbook_imbalance_pct': latest.get('orderbook_imbalance_pct'),
                 'orderflow_snapshot_ts': latest.get('timestamp'),
+                'orderflow_snapshot_age_seconds': (
+                    max(0.0, reference_now - latest_timestamp)
+                    if latest_timestamp is not None
+                    else None
+                ),
+                'orderflow_stale': False,
             })
         if recent:
             imbalances = [float(row.get('orderbook_imbalance_pct')) for row in recent]
@@ -1338,7 +1382,7 @@ class SignalScannerMixin:
                 'rolling_ofi_score': None,
                 'rolling_ofi_samples': 0,
             })
-        return {key: value for key, value in context.items() if value is not None}
+        return context
 
     def _calculate_utbreakout_open_interest_stats(self, oi_hist):
         if not isinstance(oi_hist, list) or len(oi_hist) < 2:
@@ -1805,6 +1849,7 @@ class SignalScannerMixin:
             context.update(self._prediction_context_for_futures_symbol(symbol))
 
         orderflow_cache_ttl = 30.0
+        orderflow_max_age_seconds = 90.0
         snapshots = getattr(self, 'utbreakout_orderflow_snapshots', {})
         latest_snapshot = None
         if isinstance(snapshots, dict):
@@ -1821,6 +1866,8 @@ class SignalScannerMixin:
                         symbol,
                         snapshot,
                         window=int(context.get('rolling_ofi_window') or 5),
+                        max_age_seconds=orderflow_max_age_seconds,
+                        now=now,
                     )
                 )
             else:
@@ -1829,6 +1876,8 @@ class SignalScannerMixin:
                         symbol,
                         None,
                         window=int(context.get('rolling_ofi_window') or 5),
+                        max_age_seconds=orderflow_max_age_seconds,
+                        now=now,
                     )
                 )
         except Exception as exc:
@@ -1838,6 +1887,8 @@ class SignalScannerMixin:
                     symbol,
                     None,
                     window=int(context.get('rolling_ofi_window') or 5),
+                    max_age_seconds=orderflow_max_age_seconds,
+                    now=now,
                 )
             )
 

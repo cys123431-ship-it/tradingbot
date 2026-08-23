@@ -60,6 +60,8 @@ _DURABLE_ENTRY_PLAN_KEYS = (
     'change_point_flow_flow_score',
     'change_point_flow_open_interest_score',
     'change_point_flow_regime_score',
+    'change_point_flow_orderflow_age_seconds',
+    'change_point_flow_orderflow_stale',
     'change_point_flow_event_timeframe',
     'change_point_flow_stop_atr_multiplier',
     'change_point_flow_event_structure_stop',
