@@ -10,6 +10,21 @@ from .pyramid_protection_live import (
 from utbreakout.adaptive_breakout_trend import ADAPTIVE_BREAKOUT_TREND_STRATEGY
 
 
+_POST_FILL_REPAIR_STATUSES = {"FILLED_UNPROTECTED", "ORDER_SENT_POSITION_MISSING"}
+
+
+def _prepare_post_fill_guard_input(result):
+    if not isinstance(result, dict):
+        return result, None
+    original_status = str(result.get("status") or "")
+    if original_status not in _POST_FILL_REPAIR_STATUSES:
+        return result, None
+    guard_input = dict(result)
+    guard_input["status"] = "ADDED"
+    guard_input["pre_guard_status"] = original_status
+    return guard_input, original_status
+
+
 def install_adaptive_pyramid_stop_guard() -> None:
     """Wrap SignalEngine's pyramid add path without altering strategy selection logic."""
 
@@ -64,15 +79,36 @@ def install_adaptive_pyramid_stop_guard() -> None:
                         before_stop = None
 
         result = await original(self, symbol, pos, df, cfg)
-        return await enforce_adaptive_pyramid_live_sl_guard(
+        guard_input, repair_status = _prepare_post_fill_guard_input(result)
+        guarded_result = await enforce_adaptive_pyramid_live_sl_guard(
             self,
             symbol,
             before_qty=before_qty,
             before_stop=before_stop,
             before_add_count=before_add_count,
-            result=result,
+            result=guard_input,
             cfg=cfg,
         )
+        if repair_status is not None:
+            if guarded_result is guard_input:
+                return result
+            if (
+                isinstance(guarded_result, dict)
+                and guarded_result.get("post_add_stop_guard") == "OK"
+            ):
+                guarded_result = dict(guarded_result)
+                guarded_result.update(
+                    {
+                        "status": "ADDED_PROTECTION_REPAIRED",
+                        "reason": (
+                            "adaptive trend pyramid exchange SL repaired after "
+                            f"{repair_status.lower()}"
+                        ),
+                        "pre_guard_status": repair_status,
+                    }
+                )
+            return guarded_result
+        return guarded_result
 
     guarded.__name__ = original.__name__
     guarded.__qualname__ = f"SignalEngine.{original.__name__}"
@@ -82,4 +118,4 @@ def install_adaptive_pyramid_stop_guard() -> None:
     SignalEngine._adaptive_pyramid_stop_guard_installed = True
 
 
-__all__ = ("install_adaptive_pyramid_stop_guard",)
+__all__ = ("_prepare_post_fill_guard_input", "install_adaptive_pyramid_stop_guard")
