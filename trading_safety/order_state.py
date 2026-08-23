@@ -619,7 +619,11 @@ class SQLiteTradingStateStore:
                 if not (
                     _normalize_order_symbol(record.symbol) == normalized
                     and record.order_state == OrderState.PROTECTED.value
-                    and record.order_intent == OrderIntent.ENTRY.value
+                    and record.order_intent
+                    in {
+                        OrderIntent.ENTRY.value,
+                        OrderIntent.POSITION_ADD.value,
+                    }
                 )
             ]
         if not records:

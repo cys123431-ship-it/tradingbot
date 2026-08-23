@@ -2,12 +2,54 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from trading_safety.order_state import (
+    OrderIntent,
     OrderRecord,
     OrderState,
     SQLiteTradingStateStore,
     atomic_write_json,
     build_client_order_id,
 )
+
+
+def test_position_add_ignores_protected_same_symbol_entry_and_prior_adds(tmp_path):
+    store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+    for client_order_id, intent in (
+        ("entry-parent", OrderIntent.ENTRY.value),
+        ("pyramid-stage-1", OrderIntent.POSITION_ADD.value),
+    ):
+        store.upsert(
+            OrderRecord(
+                client_order_id=client_order_id,
+                symbol="ZEC/USDT:USDT",
+                side="LONG",
+                strategy="ADAPTIVE_TREND",
+                signal_timestamp="1",
+                requested_qty=1.0,
+                order_intent=intent,
+                order_state=OrderState.PROTECTED.value,
+            )
+        )
+
+    assert store.entry_block_reason(
+        "ZEC/USDT:USDT",
+        for_position_add=True,
+    ) is None
+
+    store.upsert(
+        OrderRecord(
+            client_order_id="other-symbol-pending",
+            symbol="BTC/USDT:USDT",
+            side="LONG",
+            strategy="ADAPTIVE_TREND",
+            signal_timestamp="2",
+            requested_qty=1.0,
+            order_state=OrderState.SUBMITTING.value,
+        )
+    )
+    assert store.entry_block_reason(
+        "ZEC/USDT:USDT",
+        for_position_add=True,
+    ).startswith("SUBMITTING:BTC/USDT:USDT")
 
 
 def test_client_order_id_is_deterministic_and_signal_specific():

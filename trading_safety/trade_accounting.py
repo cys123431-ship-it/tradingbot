@@ -144,6 +144,12 @@ async def resolve_closed_trade_accounting(
                             or target.get("tp_name")
                             or f"TP{target.get('tp_index') or ''}"
                         ).upper()
+                # When Binance supplies an order id, identity is stronger
+                # evidence than price proximity.  An unmatched id is a
+                # separate/manual order even if it happened to fill near a
+                # planned TP or SL price.
+                if order_id_text:
+                    return "EXIT"
                 priced_targets = []
                 for target in planned_targets:
                     if not isinstance(target, dict):
@@ -294,6 +300,7 @@ async def resolve_closed_trade_accounting(
                     "pnl": float(realized_pnl),
                     "pnl_pct": float(pnl_pct),
                     "exit_price": float(resolved_exit),
+                    "closed_qty": float(closing_qty),
                     "estimated": False,
                     "source": "exchange_trades",
                     "exit_legs": exit_legs,
@@ -345,6 +352,7 @@ async def resolve_closed_trade_accounting(
         "pnl": float(pnl),
         "pnl_pct": float(pnl_pct),
         "exit_price": float(fallback_exit),
+        "closed_qty": float(entry_qty),
         "estimated": True,
         "source": "fallback_price",
         "exit_legs": [
@@ -421,6 +429,7 @@ async def record_closed_trade_accounting(
     if result.get("estimated"):
         close_reason = f"{close_reason} [estimated-price]"
     reason_upper = close_reason.upper()
+    scanner_flat_reason = "SCANNER POSITION COMPLETED" in reason_upper
     generic_flat_reason = (
         "TAKE PROFIT/STOP LOSS CLOSED POSITION" in reason_upper
         or "AUTOMATIC PROTECTION FILL" in reason_upper
@@ -453,9 +462,24 @@ async def record_closed_trade_accounting(
             leg["label"] = "SL"
         elif "TIME" in reason_upper:
             leg["label"] = "TIME_STOP"
-        elif generic_flat_reason:
+        elif generic_flat_reason or scanner_flat_reason:
             leg["label"] = "EXTERNAL_EXIT"
+    if scanner_flat_reason and any(
+        str(leg.get("label") or "").upper() == "EXTERNAL_EXIT"
+        for leg in exit_legs
+    ):
+        protected_leg_present = any(
+            str(leg.get("label") or "").upper().startswith("TP")
+            or str(leg.get("label") or "").upper() == "SL"
+            for leg in exit_legs
+        )
+        close_reason = (
+            "manual/external exchange close detected after protection fill"
+            if protected_leg_present
+            else "manual/external exchange close detected"
+        )
     result["exit_legs"] = exit_legs
+    result["close_reason"] = close_reason
     exit_timestamp_ms = max(
         (
             int(float(item.get("timestamp") or 0))
@@ -482,6 +506,12 @@ async def record_closed_trade_accounting(
         ).isoformat()
     else:
         resolved_exit_time = datetime.now(timezone.utc).isoformat()
+    resolved_filled_qty = abs(
+        _number(
+            result.get("closed_qty"),
+            _number((open_trade or {}).get("quantity")),
+        )
+    )
     try:
         updated = db.log_trade_close(
             accounting_symbol,
@@ -490,16 +520,29 @@ async def record_closed_trade_accounting(
             result["exit_price"],
             close_reason,
             exit_time=resolved_exit_time,
+            quantity=resolved_filled_qty,
         )
     except TypeError:
-        # Compatibility for lightweight test/legacy DB adapters.
-        updated = db.log_trade_close(
-            accounting_symbol,
-            result["pnl"],
-            result["pnl_pct"],
-            result["exit_price"],
-            close_reason,
-        )
+        try:
+            # Compatibility for adapters that support the resolved timestamp
+            # but have not yet added the reconciled quantity keyword.
+            updated = db.log_trade_close(
+                accounting_symbol,
+                result["pnl"],
+                result["pnl_pct"],
+                result["exit_price"],
+                close_reason,
+                exit_time=resolved_exit_time,
+            )
+        except TypeError:
+            # Compatibility for lightweight legacy test adapters.
+            updated = db.log_trade_close(
+                accounting_symbol,
+                result["pnl"],
+                result["pnl_pct"],
+                result["exit_price"],
+                close_reason,
+            )
     result["status"] = (
         "RECORDED" if updated is not False else "NO_OPEN_TRADE"
     )
@@ -518,14 +561,6 @@ async def record_closed_trade_accounting(
     result["historical_backfill"] = historical_backfill
     realized_state_pnl = float(result.get("pnl") or 0.0)
     try:
-        risk_distance = float(state_data.get("risk_distance") or 0.0)
-        filled_qty = float((open_trade or {}).get("quantity") or 0.0)
-        risk_usdt = risk_distance * filled_qty
-        realized_r = (
-            float(result.get("pnl") or 0.0) / risk_usdt
-            if risk_usdt > 0
-            else 0.0
-        )
         active_records = []
         store = getattr(engine, "trading_state_store", None)
         if (
@@ -555,6 +590,45 @@ async def record_closed_trade_accounting(
         entry_plan_summary = dict(
             entry_metadata.get("entry_plan_summary") or {}
         )
+        initial_risk_distance = next(
+            (
+                value
+                for value in (
+                    _number_or_none(
+                        entry_plan_summary.get(
+                            "adaptive_trend_initial_risk_distance"
+                        )
+                    ),
+                    _number_or_none(entry_plan_summary.get("risk_distance")),
+                    _number_or_none(
+                        state_data.get("adaptive_trend_initial_risk_distance")
+                    ),
+                    _number_or_none(state_data.get("initial_risk_distance")),
+                    _number_or_none(state_data.get("risk_distance")),
+                )
+                if value is not None and value > 0
+            ),
+            0.0,
+        )
+        initial_risk_qty = next(
+            (
+                abs(value)
+                for value in (
+                    _number_or_none(getattr(entry_record, "filled_qty", None)),
+                    _number_or_none(getattr(entry_record, "requested_qty", None)),
+                    _number_or_none((open_trade or {}).get("quantity")),
+                )
+                if value is not None and abs(value) > 0
+            ),
+            0.0,
+        )
+        risk_usdt = initial_risk_distance * initial_risk_qty
+        realized_r = (
+            float(result.get("pnl") or 0.0) / risk_usdt
+            if risk_usdt > 0
+            else 0.0
+        )
+        filled_qty = resolved_filled_qty
         primary_strategy = str(
             entry_metadata.get("primary_strategy")
             or getattr(entry_record, "strategy", None)
@@ -629,6 +703,9 @@ async def record_closed_trade_accounting(
             "net_pnl_usdt": result.get("pnl"),
             "r_multiple": realized_r,
             "realized_r": realized_r,
+            "risk_budget_usdt": risk_usdt,
+            "initial_risk_distance": initial_risk_distance,
+            "initial_risk_qty": initial_risk_qty,
             "mfe_r": state_data.get("mfe_r"),
             "mae_r": state_data.get("mae_r"),
             "exit_reason": close_reason,
@@ -833,6 +910,13 @@ class TradeAccountingFinalizer:
                         if side == "long"
                         else actual_exit - exit_reference,
                     )
+        net_pnl = gross - entry_fees - exit_fees + funding
+        risk_budget_usdt = abs(_number(trade.get("risk_budget_usdt")))
+        net_realized_r = (
+            net_pnl / risk_budget_usdt
+            if risk_budget_usdt > 0
+            else _number(trade.get("realized_r", trade.get("r_multiple")))
+        )
         finalized = dict(trade)
         finalized.update(
             {
@@ -843,7 +927,9 @@ class TradeAccountingFinalizer:
                 # Gross realized PnL already uses actual execution prices, so
                 # slippage is attribution only. Subtracting it again would
                 # double-count the same execution loss.
-                "net_pnl_usdt": gross - entry_fees - exit_fees + funding,
+                "net_pnl_usdt": net_pnl,
+                "r_multiple": net_realized_r,
+                "realized_r": net_realized_r,
                 "provisional": False,
                 "accounting_revision": int(trade.get("accounting_revision") or 0) + 1,
                 "last_accounting_error": None,

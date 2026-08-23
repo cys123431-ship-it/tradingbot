@@ -114,6 +114,7 @@ class DBManager:
         reason,
         *,
         exit_time=None,
+        quantity=None,
     ):
         resolved_exit_time = (
             str(exit_time).strip()
@@ -122,14 +123,23 @@ class DBManager:
         )
         with self.lock:
             cur = self.conn.execute(
-                """UPDATE trades SET exit_time=?, exit_price=?, pnl_usdt=?, pnl_pct=?, exit_reason=?
+                """UPDATE trades SET exit_time=?, exit_price=?, pnl_usdt=?, pnl_pct=?, exit_reason=?,
+                quantity=COALESCE(?, quantity)
                 WHERE id=(
                     SELECT id FROM trades
                     WHERE symbol=? AND exit_time IS NULL
                       AND reconciliation_archived_at IS NULL
                     ORDER BY id DESC LIMIT 1
                 )""",
-                (resolved_exit_time, exit_price, pnl, pnl_pct, reason, symbol)
+                (
+                    resolved_exit_time,
+                    exit_price,
+                    pnl,
+                    pnl_pct,
+                    reason,
+                    quantity,
+                    symbol,
+                )
             )
             self.conn.commit()
             return bool(cur.rowcount)

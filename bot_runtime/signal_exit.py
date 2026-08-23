@@ -139,8 +139,20 @@ class SignalExitMixin:
         if add_qty <= 0 or (min_amount > 0 and add_qty + 1e-12 < min_amount):
             return {'status': 'BLOCKED', 'reason': 'adaptive trend add quantity rounded to zero'}
 
-        breakeven_stop = initial_entry
+        # Keep the original entry stop in place while the add order is being
+        # filled.  The combined, fee-aware break-even can only be calculated
+        # from the exchange's post-fill average entry.
+        pre_add_stop = initial_entry
         current_stop = await self._current_stop_loss_price(symbol, state)
+        if current_stop is not None:
+            current_stop = float(current_stop)
+            tighter_stop_is_live = (
+                initial_entry <= current_stop < current_price
+                if side == 'long'
+                else initial_entry >= current_stop > current_price
+            )
+            if tighter_stop_is_live:
+                pre_add_stop = current_stop
         if bool(state.get('small_account_aggressive_active', False)):
             average_entry = (
                 _safe_float_or_none(pos.get('entryPrice'))
@@ -148,14 +160,14 @@ class SignalExitMixin:
                 or initial_entry
             )
             existing_stop_risk = (
-                max(0.0, average_entry - breakeven_stop) * current_qty
+                max(0.0, average_entry - pre_add_stop) * current_qty
                 if side == 'long'
-                else max(0.0, breakeven_stop - average_entry) * current_qty
+                else max(0.0, pre_add_stop - average_entry) * current_qty
             )
             added_stop_risk = (
-                max(0.0, current_price - breakeven_stop) * add_qty
+                max(0.0, current_price - pre_add_stop) * add_qty
                 if side == 'long'
-                else max(0.0, breakeven_stop - current_price) * add_qty
+                else max(0.0, pre_add_stop - current_price) * add_qty
             )
             cost_buffer_percent = max(
                 0.0,
@@ -189,14 +201,14 @@ class SignalExitMixin:
                 }
         stop_needs_tightening = bool(
             current_stop is None
-            or (side == 'long' and current_stop < breakeven_stop)
-            or (side == 'short' and current_stop > breakeven_stop)
+            or (side == 'long' and current_stop < pre_add_stop)
+            or (side == 'short' and current_stop > pre_add_stop)
         )
         if stop_needs_tightening:
             replacement = await self._replace_stop_loss_order(
                 symbol,
                 pos,
-                breakeven_stop,
+                pre_add_stop,
                 reason='Adaptive Trend pyramid breakeven',
             )
             if not replacement:
@@ -204,7 +216,7 @@ class SignalExitMixin:
             state.update({
                 'active': True,
                 'breakeven_armed': True,
-                'last_stop_price': breakeven_stop,
+                'last_stop_price': pre_add_stop,
                 'last_update_ts': datetime.now(timezone.utc).isoformat(),
             })
             self._set_utbreakout_trailing_state(symbol, state)
@@ -242,7 +254,7 @@ class SignalExitMixin:
             symbol,
             side,
             current_price,
-            breakeven_stop,
+            pre_add_stop,
             leverage,
             current_qty + add_qty,
             cfg,
@@ -287,8 +299,8 @@ class SignalExitMixin:
         valid_be_geometry = bool(
             total_qty > 0
             and (
-                (side == 'long' and avg_entry > breakeven_stop)
-                or (side == 'short' and avg_entry < breakeven_stop)
+                (side == 'long' and avg_entry > pre_add_stop)
+                or (side == 'short' and avg_entry < pre_add_stop)
             )
         )
         if not valid_be_geometry:
@@ -297,7 +309,7 @@ class SignalExitMixin:
         actual_liquidation = await self._verify_actual_liquidation_safety(
             symbol,
             side,
-            breakeven_stop,
+            pre_add_stop,
             new_pos,
             cfg,
             add_submission.client_order_id,
@@ -309,7 +321,7 @@ class SignalExitMixin:
                 'close_status': actual_liquidation.get('close_status'),
             }
         new_pos = actual_liquidation.get('position') or new_pos
-        new_risk_distance = abs(avg_entry - breakeven_stop)
+        pre_add_risk_distance = abs(avg_entry - pre_add_stop)
         partial_r_original = max(
             0.1,
             float(state.get('adaptive_trend_partial_r_multiple', 2.0) or 2.0),
@@ -327,17 +339,58 @@ class SignalExitMixin:
                 'kind': 'tp1',
                 'distance': target_distance,
                 'qty_ratio': partial_ratio,
-                'target_r': target_distance / max(new_risk_distance, 1e-9),
+                'target_r': target_distance / max(pre_add_risk_distance, 1e-9),
             })
         await self._place_tp_sl_orders(
             symbol,
             side,
             avg_entry,
             total_qty,
-            sl_distance=new_risk_distance,
+            sl_distance=pre_add_risk_distance,
             tp_targets=tp_targets,
             preserve_runner_qty=True,
         )
+
+        # The pre-add stop protects the order while it fills, but it is not
+        # break-even for the enlarged position.  Move only the SL (leaving the
+        # new TP orders intact) to the actual combined average plus a bounded
+        # round-trip cost allowance.
+        default_cost_buffer = (
+            state.get('small_account_aggressive_cost_buffer_percent', 0.20)
+            if bool(state.get('small_account_aggressive_active', False))
+            else (cfg or {}).get('adaptive_trend_breakeven_cost_buffer_percent', 0.12)
+        )
+        cost_buffer_percent = max(
+            0.0,
+            min(0.50, float(default_cost_buffer or 0.0)),
+        )
+        cost_multiplier = cost_buffer_percent / 100.0
+        desired_post_add_stop = avg_entry * (
+            1.0 + cost_multiplier if side == 'long' else 1.0 - cost_multiplier
+        )
+        post_fill_mark = (
+            _safe_float_or_none(new_pos.get('markPrice'))
+            or _safe_float_or_none(new_pos.get('mark_price'))
+            or current_price
+        )
+        desired_stop_is_live = bool(
+            post_fill_mark
+            and (
+                (side == 'long' and desired_post_add_stop < post_fill_mark)
+                or (side == 'short' and desired_post_add_stop > post_fill_mark)
+            )
+        )
+        applied_post_add_stop = pre_add_stop
+        if desired_stop_is_live:
+            replacement = await self._replace_stop_loss_order(
+                symbol,
+                new_pos,
+                desired_post_add_stop,
+                reason='Adaptive Trend pyramid combined fee-aware breakeven',
+            )
+            if replacement:
+                applied_post_add_stop = desired_post_add_stop
+
         post_add_audit = await self._audit_protection_orders(
             symbol,
             pos=new_pos,
@@ -356,6 +409,7 @@ class SignalExitMixin:
                 'reason': 'adaptive trend add protection audit failed',
                 'audit': post_add_audit,
             }
+        new_risk_distance = abs(avg_entry - applied_post_add_stop)
         _mark_crypto_entry_state(self, add_submission.client_order_id, OrderState.PROTECTED)
         if str(getattr(self, 'crypto_entry_lock_reason', '') or '').startswith('FILLED_'):
             self._set_crypto_entry_lock(None)
@@ -389,8 +443,10 @@ class SignalExitMixin:
             'side': side,
             'entry_price': avg_entry,
             'risk_distance': new_risk_distance,
-            'stop_loss': breakeven_stop,
-            'hard_stop_loss': breakeven_stop,
+            'stop_loss': applied_post_add_stop,
+            'hard_stop_loss': applied_post_add_stop,
+            'last_stop_price': applied_post_add_stop,
+            'adaptive_trend_breakeven_cost_buffer_percent': cost_buffer_percent,
             'adaptive_trend_pyramid_enabled': True,
             'adaptive_trend_pyramid_add_count': stage,
             'adaptive_trend_initial_entry_price': initial_entry,
@@ -418,7 +474,9 @@ class SignalExitMixin:
         await self.ctrl.notify(
             f"📈 Adaptive Trend 승자 증액: {self.ctrl.format_symbol_for_display(symbol)} "
             f"{side.upper()} +`{add_qty:.6f}` / stage `{stage}/{len(triggers)}` / "
-            f"PnL `{pnl_r:.2f}R` / SL `BE {breakeven_stop:.4f}`"
+            f"PnL `{pnl_r:.2f}R` / SL `"
+            f"{'비용포함 합산 BE' if applied_post_add_stop != pre_add_stop else '기존 BE 유지'} "
+            f"{applied_post_add_stop:.4f}`"
         )
         return {
             'status': 'ADDED',

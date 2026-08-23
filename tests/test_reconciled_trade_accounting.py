@@ -2,7 +2,15 @@ import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from emas import DBManager, SignalRuntimeMixin
+from trading_safety.order_state import (
+    OrderIntent,
+    OrderRecord,
+    OrderState,
+    SQLiteTradingStateStore,
+)
 from trading_safety.trade_accounting import (
     record_closed_trade_accounting,
     resolve_closed_trade_accounting,
@@ -50,6 +58,131 @@ def test_db_manager_preserves_resolved_exchange_exit_time(tmp_path):
         ).fetchone()
         assert row[0] == resolved
     finally:
+        db.conn.close()
+
+
+def test_manual_pyramided_close_records_total_qty_reason_and_net_r(tmp_path):
+    db = DBManager(str(tmp_path / "trades.db"))
+    store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+    symbol = "ZEC/USDT:USDT"
+    db.log_trade_entry(
+        symbol,
+        "long",
+        800.0,
+        0.695,
+        strategy="adaptive_breakout_trend_v1",
+    )
+    entry_time = datetime.fromisoformat(
+        db.get_latest_open_trade(symbol)["entry_time"]
+    )
+    base_ms = int(entry_time.timestamp() * 1000)
+    store.upsert(
+        OrderRecord(
+            client_order_id="zec-entry",
+            exchange_order_id="entry-order",
+            symbol=symbol,
+            side="LONG",
+            strategy="adaptive_breakout_trend_v1",
+            signal_timestamp="1",
+            requested_qty=0.695,
+            filled_qty=0.695,
+            average_fill_price=800.0,
+            order_state=OrderState.PROTECTED.value,
+            metadata={
+                "entry_plan_summary": {
+                    "adaptive_trend_initial_risk_distance": 15.0,
+                }
+            },
+        )
+    )
+    store.upsert(
+        OrderRecord(
+            client_order_id="zec-add-1",
+            exchange_order_id="add-order",
+            symbol=symbol,
+            side="LONG",
+            strategy="adaptive_breakout_trend_v1",
+            signal_timestamp="2",
+            requested_qty=0.161,
+            filled_qty=0.161,
+            average_fill_price=810.0,
+            order_intent=OrderIntent.POSITION_ADD.value,
+            order_state=OrderState.PROTECTED.value,
+        )
+    )
+
+    class _Exchange:
+        def fetch_my_trades(self, *_args, **_kwargs):
+            return [
+                {
+                    "timestamp": base_ms - 100,
+                    "side": "buy",
+                    "amount": 0.695,
+                    "price": 800.0,
+                    "order": "entry-order",
+                    "fee": {"cost": 0.278},
+                },
+                {
+                    "timestamp": base_ms + 1_000,
+                    "side": "buy",
+                    "amount": 0.161,
+                    "price": 810.0,
+                    "order": "add-order",
+                    "fee": {"cost": 0.130},
+                },
+                {
+                    "timestamp": base_ms + 2_000,
+                    "side": "sell",
+                    "amount": 0.856,
+                    "price": 812.0,
+                    "order": "manual-exchange-order",
+                    "realizedPnl": 10.0,
+                    "fee": {"cost": 0.350},
+                },
+            ]
+
+    engine = SimpleNamespace(
+        db=db,
+        exchange=_Exchange(),
+        trading_state_store=store,
+    )
+    engine._utbreakout_plan_symbol_keys = lambda value: [value]
+    engine._utbreakout_entry_record_for_symbol = (
+        lambda *_args, **_kwargs: store.get("zec-entry")
+    )
+
+    try:
+        outcome = asyncio.run(record_closed_trade_accounting(
+            engine,
+            symbol,
+            "scanner position completed",
+            state={
+                "_require_exchange_fills": True,
+                "adaptive_trend_initial_risk_distance": 15.0,
+                # Price proximity must not relabel a different exchange order
+                # as the bot's stop-loss fill.
+                "last_stop_price": 812.0,
+            },
+            persist_live_trade=lambda trade, store: store.upsert_trade_result(trade),
+        ))
+
+        row = db.conn.execute(
+            "SELECT quantity, exit_reason FROM trades WHERE symbol=?",
+            (symbol,),
+        ).fetchone()
+        trade_result = store.load_trade_results()[0]
+        assert outcome["status"] == "RECORDED"
+        assert outcome["closed_qty"] == pytest.approx(0.856)
+        assert row[0] == pytest.approx(0.856)
+        assert row[1] == "manual/external exchange close detected"
+        assert trade_result["filled_qty"] == pytest.approx(0.856)
+        assert trade_result["exit_legs"][0]["label"] == "EXTERNAL_EXIT"
+        assert trade_result["risk_budget_usdt"] == pytest.approx(0.695 * 15.0)
+        assert trade_result["realized_r"] == pytest.approx(
+            (10.0 - 0.278 - 0.130 - 0.350) / (0.695 * 15.0)
+        )
+    finally:
+        store.close()
         db.conn.close()
 
 

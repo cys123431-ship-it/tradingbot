@@ -846,7 +846,20 @@ def build_selection_report(candidates, rejects=None, *, top_n=10):
     for item in rejects or []:
         for reason in item.get("reject_reasons", []) or ["UNKNOWN"]:
             reject_counts[reason] += 1
-    concentration = detect_concentration(selected)
+    # Set 64 is the single production router; the old Sets are retained only
+    # for research.  A 100% Set-64 share is therefore expected architecture,
+    # not portfolio concentration, and warning on every scan hides useful
+    # operational alerts.
+    single_live_router = bool(selected) and all(
+        finite_int(item.get("auto_set_id"), 0) == 64
+        and "single live router" in str(
+            item.get("auto_selection_reason") or ""
+        ).lower()
+        for item in selected
+    )
+    concentration = (
+        None if single_live_router else detect_concentration(selected)
+    )
     return {
         "selected": selected,
         "watch_only": watch_only[:max(1, int(top_n or 10))],

@@ -44,7 +44,12 @@ def test_adaptive_trend_adds_only_at_profitable_stage_and_reprotects(
         "trailing_atr_multiplier": 3.8,
         "planned_tp_orders": [{"qty": 1.0}],
     }
-    calls = {"add_qty": None, "protection": None, "notices": []}
+    calls = {
+        "add_qty": None,
+        "protection": None,
+        "notices": [],
+        "stop_replacements": [],
+    }
 
     class Execution:
         async def submit_position_add(self, **kwargs):
@@ -90,6 +95,13 @@ def test_adaptive_trend_adds_only_at_profitable_stage_and_reprotects(
     engine._current_stop_loss_price = lambda symbol, current: asyncio.sleep(
         0,
         result=100.0,
+    )
+    engine._replace_stop_loss_order = lambda symbol, pos, stop, **kwargs: asyncio.sleep(
+        0,
+        result=(
+            calls["stop_replacements"].append(stop)
+            or {"id": "combined-be-stop"}
+        ),
     )
     engine._planned_tp_orders_from_state = lambda symbol, current: list(
         current.get("planned_tp_orders") or []
@@ -190,6 +202,17 @@ def test_adaptive_trend_adds_only_at_profitable_stage_and_reprotects(
     assert calls["add_qty"] == pytest.approx(1.5)
     assert calls["protection"] is not None
     assert calls["protection"]["kwargs"]["preserve_runner_qty"] is True
+    assert calls["protection"]["kwargs"]["sl_distance"] == pytest.approx(0.2)
+    expected_combined_stop = average_entry * (
+        1.0012 if side == "long" else 0.9988
+    )
+    assert calls["stop_replacements"] == [pytest.approx(expected_combined_stop)]
+    assert state["last_stop_price"] == pytest.approx(expected_combined_stop)
+    assert (
+        state["last_stop_price"] > average_entry
+        if side == "long"
+        else state["last_stop_price"] < average_entry
+    )
     assert state["adaptive_trend_pyramid_add_count"] == 1
     assert state["adaptive_trend_initial_entry_price"] == pytest.approx(100.0)
     assert calls["notices"]

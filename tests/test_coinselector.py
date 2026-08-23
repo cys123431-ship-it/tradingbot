@@ -298,6 +298,27 @@ def test_coinselector_report_detects_set_concentration():
     assert report["concentration_warning"]["share_pct"] == 100.0
 
 
+def test_coinselector_report_does_not_warn_for_expected_single_live_router():
+    candidates = [
+        {
+            "symbol": symbol,
+            "accepted": True,
+            "scanner_accepted": True,
+            "score": score,
+            "auto_set_id": 64,
+            "auto_selection_reason": (
+                "EV Adaptive V3 single live router "
+                "(legacy Sets research-only)"
+            ),
+        }
+        for symbol, score in (("BTC/USDT", 80.0), ("ETH/USDT", 75.0))
+    ]
+
+    report = build_selection_report(candidates, [], top_n=2)
+
+    assert report["concentration_warning"] is None
+
+
 def test_coinselector_ranking_uses_ev_edge_and_does_not_exclude_candidates():
     candidates = [
         {
