@@ -13,14 +13,19 @@ from utbreakout.adaptive_breakout_trend import ADAPTIVE_BREAKOUT_TREND_STRATEGY
 
 
 @pytest.mark.parametrize(
-    ("side", "mark_price", "average_entry"),
-    (("long", 101.0, 100.2), ("short", 99.0, 99.8)),
+    ("side", "mark_price", "average_entry", "expected_stop"),
+    (
+        ("long", 101.0, 100.2, 100.2 * 1.0012),
+        ("short", 99.0, 99.8, 99.8 * 0.9988),
+        ("long", 101.0, 100.8, 100.0),
+    ),
 )
 def test_adaptive_trend_adds_only_at_profitable_stage_and_reprotects(
     monkeypatch,
     side,
     mark_price,
     average_entry,
+    expected_stop,
 ):
     engine = SignalExitMixin()
     state = {
@@ -202,17 +207,21 @@ def test_adaptive_trend_adds_only_at_profitable_stage_and_reprotects(
     assert calls["add_qty"] == pytest.approx(1.5)
     assert calls["protection"] is not None
     assert calls["protection"]["kwargs"]["preserve_runner_qty"] is True
-    assert calls["protection"]["kwargs"]["sl_distance"] == pytest.approx(0.2)
-    expected_combined_stop = average_entry * (
-        1.0012 if side == "long" else 0.9988
+    assert calls["protection"]["kwargs"]["sl_distance"] == pytest.approx(
+        abs(average_entry - 100.0)
     )
-    assert calls["stop_replacements"] == [pytest.approx(expected_combined_stop)]
-    assert state["last_stop_price"] == pytest.approx(expected_combined_stop)
-    assert (
-        state["last_stop_price"] > average_entry
-        if side == "long"
-        else state["last_stop_price"] < average_entry
-    )
+    if expected_stop == 100.0:
+        assert calls["stop_replacements"] == []
+    else:
+        assert calls["stop_replacements"] == [pytest.approx(expected_stop)]
+    assert state["last_stop_price"] == pytest.approx(expected_stop)
+    assert state["risk_distance"] == pytest.approx(2.0)
+    if expected_stop != 100.0:
+        assert (
+            state["last_stop_price"] > average_entry
+            if side == "long"
+            else state["last_stop_price"] < average_entry
+        )
     assert state["adaptive_trend_pyramid_add_count"] == 1
     assert state["adaptive_trend_initial_entry_price"] == pytest.approx(100.0)
     assert calls["notices"]

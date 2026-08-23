@@ -365,7 +365,7 @@ class SignalExitMixin:
             min(0.50, float(default_cost_buffer or 0.0)),
         )
         cost_multiplier = cost_buffer_percent / 100.0
-        desired_post_add_stop = avg_entry * (
+        raw_cost_break_even = avg_entry * (
             1.0 + cost_multiplier if side == 'long' else 1.0 - cost_multiplier
         )
         post_fill_mark = (
@@ -373,11 +373,37 @@ class SignalExitMixin:
             or _safe_float_or_none(new_pos.get('mark_price'))
             or current_price
         )
+        minimum_live_gap_percent = max(
+            0.10,
+            min(
+                1.00,
+                float(
+                    (cfg or {}).get(
+                        'adaptive_trend_breakeven_min_live_gap_percent',
+                        0.30,
+                    )
+                    or 0.30
+                ),
+            ),
+        )
+        live_gap_multiplier = minimum_live_gap_percent / 100.0
+        if side == 'long':
+            live_safe_boundary = post_fill_mark * (1.0 - live_gap_multiplier)
+            desired_post_add_stop = min(raw_cost_break_even, live_safe_boundary)
+        else:
+            live_safe_boundary = post_fill_mark * (1.0 + live_gap_multiplier)
+            desired_post_add_stop = max(raw_cost_break_even, live_safe_boundary)
         desired_stop_is_live = bool(
             post_fill_mark
             and (
-                (side == 'long' and desired_post_add_stop < post_fill_mark)
-                or (side == 'short' and desired_post_add_stop > post_fill_mark)
+                (
+                    side == 'long'
+                    and avg_entry <= desired_post_add_stop < post_fill_mark
+                )
+                or (
+                    side == 'short'
+                    and avg_entry >= desired_post_add_stop > post_fill_mark
+                )
             )
         )
         applied_post_add_stop = pre_add_stop
@@ -390,6 +416,19 @@ class SignalExitMixin:
             )
             if replacement:
                 applied_post_add_stop = desired_post_add_stop
+            else:
+                # A fast move can cross the tighter target between the mark
+                # snapshot and Binance acknowledgement.  Immediately restore
+                # the still-valid pre-add stop instead of waiting for a later
+                # audit with the enlarged position unprotected.
+                fallback_replacement = await self._replace_stop_loss_order(
+                    symbol,
+                    new_pos,
+                    pre_add_stop,
+                    reason='Adaptive Trend pyramid restore pre-add stop',
+                )
+                if fallback_replacement:
+                    applied_post_add_stop = pre_add_stop
 
         post_add_audit = await self._audit_protection_orders(
             symbol,
@@ -409,7 +448,10 @@ class SignalExitMixin:
                 'reason': 'adaptive trend add protection audit failed',
                 'audit': post_add_audit,
             }
-        new_risk_distance = abs(avg_entry - applied_post_add_stop)
+        # R remains anchored to the original trade risk.  A profitable stop
+        # can sit only a few ticks from the combined entry and must not inflate
+        # all later R-based targets/trailing metrics.
+        new_risk_distance = initial_risk
         _mark_crypto_entry_state(self, add_submission.client_order_id, OrderState.PROTECTED)
         if str(getattr(self, 'crypto_entry_lock_reason', '') or '').startswith('FILLED_'):
             self._set_crypto_entry_lock(None)
@@ -438,6 +480,10 @@ class SignalExitMixin:
             'tp1_breakeven_enabled': True,
         })
         state_plan = dict(state)
+        applied_cost_buffer_percent = max(
+            0.0,
+            direction * (applied_post_add_stop - avg_entry) / avg_entry * 100.0,
+        )
         state_plan.update({
             'strategy': ADAPTIVE_BREAKOUT_TREND_STRATEGY,
             'side': side,
@@ -447,6 +493,8 @@ class SignalExitMixin:
             'hard_stop_loss': applied_post_add_stop,
             'last_stop_price': applied_post_add_stop,
             'adaptive_trend_breakeven_cost_buffer_percent': cost_buffer_percent,
+            'adaptive_trend_breakeven_applied_cost_buffer_percent': applied_cost_buffer_percent,
+            'adaptive_trend_breakeven_min_live_gap_percent': minimum_live_gap_percent,
             'adaptive_trend_pyramid_enabled': True,
             'adaptive_trend_pyramid_add_count': stage,
             'adaptive_trend_initial_entry_price': initial_entry,
@@ -471,11 +519,21 @@ class SignalExitMixin:
             planned_tp_orders=self._planned_tp_orders_from_state(symbol, runner_state),
             alert=True,
         )
+        fee_buffer_fully_applied = abs(
+            applied_post_add_stop - raw_cost_break_even
+        ) <= max(abs(raw_cost_break_even) * 1e-9, 1e-12)
+        stop_label = (
+            '비용포함 합산 BE'
+            if applied_post_add_stop != pre_add_stop and fee_buffer_fully_applied
+            else '합산 BE'
+            if applied_post_add_stop != pre_add_stop
+            else '기존 BE 유지'
+        )
         await self.ctrl.notify(
             f"📈 Adaptive Trend 승자 증액: {self.ctrl.format_symbol_for_display(symbol)} "
             f"{side.upper()} +`{add_qty:.6f}` / stage `{stage}/{len(triggers)}` / "
             f"PnL `{pnl_r:.2f}R` / SL `"
-            f"{'비용포함 합산 BE' if applied_post_add_stop != pre_add_stop else '기존 BE 유지'} "
+            f"{stop_label} "
             f"{applied_post_add_stop:.4f}`"
         )
         return {
@@ -2147,6 +2205,7 @@ class SignalExitMixin:
                                         or pos.get('timestamp')
                                         or self._protection_position_signature(pos)
                                     ),
+                                    revision=f"place-{time.time_ns()}",
                                 )
                             },
                             'SL',

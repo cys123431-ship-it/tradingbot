@@ -39,3 +39,31 @@ def test_protection_identity_changes_for_material_order_changes():
         _protection_id(engine, identity="entry-2"),
     }
     assert len(values) == 6
+
+
+def test_protection_identity_revision_avoids_reusing_cancelled_order_id():
+    engine = _engine()
+    first = engine._build_protection_client_order_id(
+        "BTC/USDT:USDT",
+        "long",
+        "sl",
+        {"entryPrice": 100.0, "contracts": 1.0},
+        trigger_price=90.0,
+        quantity=1.0,
+        leg="SL",
+        position_identity="entry-1",
+        revision="replace-1",
+    )
+    second = engine._build_protection_client_order_id(
+        "BTC/USDT:USDT",
+        "long",
+        "sl",
+        {"entryPrice": 100.0, "contracts": 1.0},
+        trigger_price=90.0,
+        quantity=1.0,
+        leg="SL",
+        position_identity="entry-1",
+        revision="replace-2",
+    )
+
+    assert first != second

@@ -406,6 +406,7 @@ class SignalProtectionMixin:
         quantity=None,
         leg=None,
         position_identity=None,
+        revision=None,
     ):
         kind_full = re.sub(r'[^a-zA-Z0-9]', '', str(kind or '').lower()) or 'unknown'
         leg_full = re.sub(r'[^a-zA-Z0-9]', '', str(leg or kind_full).lower()) or kind_full
@@ -437,6 +438,7 @@ class SignalProtectionMixin:
             stable_position_identity or self._protection_position_signature(pos),
             str(normalized_trigger),
             str(normalized_qty),
+            str(revision or ''),
         ])
         digest = hashlib.sha256(raw.encode('utf-8')).hexdigest()[:12]
         symbol_part = self._normalize_protection_symbol(symbol)[-8:] or 'SYMBOL'
@@ -1906,7 +1908,35 @@ class SignalProtectionMixin:
             if algo_gateway is not None:
                 lookup = await algo_gateway.fetch_by_client_id(client_order_id)
                 if lookup.status == AlgoLookupStatus.FOUND:
-                    return lookup.order
+                    lookup_order = lookup.order or {}
+                    lookup_info = (
+                        lookup_order.get('info')
+                        if isinstance(lookup_order.get('info'), dict)
+                        else {}
+                    )
+                    lookup_state = str(
+                        lookup_order.get('status')
+                        or lookup_info.get('algoStatus')
+                        or lookup_info.get('status')
+                        or ''
+                    ).strip().upper()
+                    if lookup_state not in {
+                        'CANCELED',
+                        'CANCELLED',
+                        'EXPIRED',
+                        'FINISHED',
+                        'FILLED',
+                        'REJECTED',
+                    }:
+                        return lookup_order
+                    logger.info(
+                        "%s terminal protection order ignored before resubmit: "
+                        "%s clientOrderId=%s status=%s",
+                        label,
+                        symbol,
+                        client_order_id,
+                        lookup_state,
+                    )
                 if lookup.status == AlgoLookupStatus.UNKNOWN:
                     reason = f"ALGO_ORDER_LOOKUP_UNKNOWN:{symbol}:{lookup.error}"
                     self._set_crypto_entry_lock(reason)
@@ -2435,6 +2465,7 @@ class SignalProtectionMixin:
                         or pos.get('timestamp')
                         or self._protection_position_signature(pos)
                     ),
+                    revision=f"replace-{time.time_ns()}",
                 )
             },
             'SL',
