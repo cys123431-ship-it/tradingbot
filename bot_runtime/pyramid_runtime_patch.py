@@ -7,6 +7,12 @@ from .pyramid_protection_live import (
     enforce_adaptive_pyramid_live_sl_guard,
     read_exchange_sl_snapshot,
 )
+from .pyramid_safe_rebuild import (
+    activate_adaptive_pyramid_rebuild,
+    cancel_preserving_pyramid_sl,
+    place_pyramid_protection_preserving_sl,
+    reset_adaptive_pyramid_rebuild,
+)
 from utbreakout.adaptive_breakout_trend import ADAPTIVE_BREAKOUT_TREND_STRATEGY
 
 
@@ -25,16 +31,88 @@ def _prepare_post_fill_guard_input(result):
     return guard_input, original_status
 
 
+async def _position_increased_after_exception(engine, symbol, before_qty):
+    fetcher = getattr(engine, "_fetch_server_position_checked", None)
+    if not callable(fetcher):
+        return False
+    try:
+        fetch_ok, live_pos = await fetcher(symbol)
+    except Exception:
+        return False
+    if not fetch_ok or not isinstance(live_pos, dict):
+        return False
+    try:
+        live_qty = abs(
+            float(
+                engine._position_signed_contracts(live_pos)
+                or live_pos.get("contracts", 0.0)
+                or 0.0
+            )
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return live_qty > float(before_qty or 0.0) + 1e-12
+
+
 def install_adaptive_pyramid_stop_guard() -> None:
-    """Wrap SignalEngine's pyramid add path without altering strategy selection logic."""
+    """Install the Adaptive Trend post-fill guard and safe protection rebuild."""
 
     from .signal_engine import SignalEngine
     from .signal_exit import SignalExitMixin
+    from .signal_protection import SignalProtectionMixin
 
     if bool(getattr(SignalEngine, "_adaptive_pyramid_stop_guard_installed", False)):
         return
 
     original = SignalExitMixin._maybe_apply_adaptive_trend_pyramiding
+    original_place = SignalExitMixin._place_tp_sl_orders
+    original_cancel = SignalProtectionMixin._cancel_protection_orders
+
+    async def guarded_cancel(self, symbol, reason="protection cleanup", orders=None):
+        return await cancel_preserving_pyramid_sl(
+            self,
+            original_cancel,
+            symbol,
+            reason=reason,
+            orders=orders,
+        )
+
+    async def guarded_place(
+        self,
+        symbol,
+        side,
+        entry_price,
+        qty,
+        tp_distance=None,
+        sl_distance=None,
+        tp_qty_ratio=1.0,
+        tp_targets=None,
+        preserve_runner_qty=False,
+    ):
+        return await place_pyramid_protection_preserving_sl(
+            self,
+            original_place,
+            symbol,
+            side,
+            entry_price,
+            qty,
+            tp_distance=tp_distance,
+            sl_distance=sl_distance,
+            tp_qty_ratio=tp_qty_ratio,
+            tp_targets=tp_targets,
+            preserve_runner_qty=preserve_runner_qty,
+        )
+
+    guarded_cancel.__name__ = original_cancel.__name__
+    guarded_cancel.__qualname__ = f"SignalEngine.{original_cancel.__name__}"
+    guarded_cancel.__doc__ = original_cancel.__doc__
+    guarded_cancel.__runtime_original__ = original_cancel
+    guarded_place.__name__ = original_place.__name__
+    guarded_place.__qualname__ = f"SignalEngine.{original_place.__name__}"
+    guarded_place.__doc__ = original_place.__doc__
+    guarded_place.__runtime_original__ = original_place
+    SignalEngine._cancel_protection_orders = guarded_cancel
+    SignalEngine._place_tp_sl_orders = guarded_place
 
     async def guarded(self, symbol, pos, df, cfg):
         before_qty = 0.0
@@ -78,7 +156,47 @@ def install_adaptive_pyramid_stop_guard() -> None:
                     except Exception:
                         before_stop = None
 
-        result = await original(self, symbol, pos, df, cfg)
+        token = activate_adaptive_pyramid_rebuild()
+        original_error = None
+        try:
+            result = await original(self, symbol, pos, df, cfg)
+        except Exception as exc:
+            original_error = exc
+            result = None
+        finally:
+            reset_adaptive_pyramid_rebuild(token)
+
+        if original_error is not None:
+            if not await _position_increased_after_exception(self, symbol, before_qty):
+                raise original_error
+            guarded_result = await enforce_adaptive_pyramid_live_sl_guard(
+                self,
+                symbol,
+                before_qty=before_qty,
+                before_stop=before_stop,
+                before_add_count=before_add_count,
+                result={
+                    "status": "ADDED",
+                    "reason": "adaptive trend post-fill exception routed through protection guard",
+                    "post_fill_exception": (
+                        f"{type(original_error).__name__}: {original_error}"
+                    ),
+                },
+                cfg=cfg,
+            )
+            if (
+                isinstance(guarded_result, dict)
+                and guarded_result.get("post_add_stop_guard") == "OK"
+            ):
+                guarded_result = dict(guarded_result)
+                guarded_result.update(
+                    {
+                        "status": "ADDED_PROTECTION_REPAIRED",
+                        "reason": "adaptive trend pyramid SL recovered after post-fill exception",
+                    }
+                )
+            return guarded_result
+
         guard_input, repair_status = _prepare_post_fill_guard_input(result)
         guarded_result = await enforce_adaptive_pyramid_live_sl_guard(
             self,
@@ -116,6 +234,11 @@ def install_adaptive_pyramid_stop_guard() -> None:
     guarded.__runtime_original__ = original
     SignalEngine._maybe_apply_adaptive_trend_pyramiding = guarded
     SignalEngine._adaptive_pyramid_stop_guard_installed = True
+    SignalEngine._adaptive_pyramid_safe_rebuild_installed = True
 
 
-__all__ = ("_prepare_post_fill_guard_input", "install_adaptive_pyramid_stop_guard")
+__all__ = (
+    "_position_increased_after_exception",
+    "_prepare_post_fill_guard_input",
+    "install_adaptive_pyramid_stop_guard",
+)
