@@ -35,6 +35,8 @@ class FakeEngine:
             "small_account_aggressive_active": True,
             "small_account_aggressive_cost_buffer_percent": 0.20,
             "adaptive_trend_pyramid_add_count": 0,
+            "adaptive_trend_initial_risk_distance": 2.0,
+            "risk_distance": 2.0,
             "last_stop_price": stop,
         }
         self.live_pos = {
@@ -127,6 +129,7 @@ def test_profit_side_pre_add_stop_repairs_geometry_failure_without_loosening():
     assert engine.cancelled
     assert engine.state["last_stop_price"] == pytest.approx(100.5)
     assert engine.state["adaptive_trend_pyramid_add_count"] == 1
+    assert engine.state["risk_distance"] == pytest.approx(2.0)
     assert engine.trading_state_store.transitions[-1][1] == "PROTECTED"
     assert engine.lock is None
 
@@ -187,6 +190,29 @@ def test_required_profit_lock_already_crossed_emergency_closes():
 
     assert result["status"] == "EMERGENCY_CLOSED"
     assert engine.closed
+
+
+def test_live_gap_policy_falls_back_to_existing_stop_instead_of_forced_close():
+    engine = FakeEngine(stop=100.0)
+    engine.live_pos["entryPrice"] = 100.8
+    engine.live_pos["markPrice"] = 101.0
+
+    result = asyncio.run(
+        enforce_adaptive_pyramid_stop_postcondition(
+            engine,
+            "BTC/USDT:USDT",
+            before_qty=6.5,
+            before_stop=100.0,
+            before_add_count=0,
+            result={"status": "ADDED"},
+            cfg={"adaptive_trend_breakeven_min_live_gap_percent": 0.30},
+        )
+    )
+
+    assert result["status"] == "ADDED"
+    assert result["required_stop"] == pytest.approx(100.0)
+    assert not engine.closed
+    assert engine.state["risk_distance"] == pytest.approx(2.0)
 
 
 def test_signal_engine_runtime_guard_is_installed():

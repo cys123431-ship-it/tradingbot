@@ -31,16 +31,36 @@ def _required_stop(
     cost_buffer_percent: float,
     previous_stop: float | None,
     state_stop: float | None,
-) -> float:
+    mark_price: float | None,
+    minimum_live_gap_percent: float,
+) -> float | None:
     multiplier = max(0.0, min(0.50, float(cost_buffer_percent))) / 100.0
-    fee_break_even = average_entry * (
+    raw_fee_break_even = average_entry * (
         1.0 + multiplier if side == "long" else 1.0 - multiplier
     )
-    candidates = [fee_break_even]
+    candidates = []
     for value in (previous_stop, state_stop):
         stop = _as_float(value)
         if stop is not None and stop > 0:
             candidates.append(stop)
+
+    if mark_price is not None and mark_price > 0:
+        gap = max(0.10, min(1.00, float(minimum_live_gap_percent))) / 100.0
+        if side == "long":
+            live_boundary = mark_price * (1.0 - gap)
+            desired = min(raw_fee_break_even, live_boundary)
+            if average_entry <= desired < mark_price:
+                candidates.append(desired)
+        else:
+            live_boundary = mark_price * (1.0 + gap)
+            desired = max(raw_fee_break_even, live_boundary)
+            if average_entry >= desired > mark_price:
+                candidates.append(desired)
+    else:
+        candidates.append(raw_fee_break_even)
+
+    if not candidates:
+        return None
     return max(candidates) if side == "long" else min(candidates)
 
 
@@ -203,19 +223,44 @@ async def enforce_adaptive_pyramid_stop_postcondition(
     except (TypeError, ValueError):
         cost_buffer_percent = 0.20 if aggressive else 0.12
 
-    required_stop = _required_stop(
-        side,
-        average_entry,
-        cost_buffer_percent,
-        _as_float(before_stop),
-        _as_float(state.get("last_stop_price") or state.get("stop_loss")),
-    )
     mark_price = _as_float(
         live_pos.get("markPrice")
         or live_pos.get("mark_price")
         or live_pos.get("lastPrice")
         or live_pos.get("last")
     )
+    try:
+        minimum_live_gap_percent = max(
+            0.10,
+            min(
+                1.00,
+                float(
+                    state.get("adaptive_trend_breakeven_min_live_gap_percent")
+                    or (cfg or {}).get(
+                        "adaptive_trend_breakeven_min_live_gap_percent",
+                        0.30,
+                    )
+                    or 0.30
+                ),
+            ),
+        )
+    except (TypeError, ValueError):
+        minimum_live_gap_percent = 0.30
+    required_stop = _required_stop(
+        side,
+        average_entry,
+        cost_buffer_percent,
+        _as_float(before_stop),
+        _as_float(state.get("last_stop_price") or state.get("stop_loss")),
+        mark_price,
+        minimum_live_gap_percent,
+    )
+    if required_stop is None:
+        return await _emergency_close(
+            engine,
+            symbol,
+            "adaptive trend pyramid no valid post-fill profit-lock SL",
+        )
     target_is_live = bool(
         mark_price is None
         or (side == "long" and required_stop < mark_price)
@@ -304,17 +349,32 @@ async def enforce_adaptive_pyramid_stop_postcondition(
             "adaptive trend pyramid SL price/quantity postcondition failed",
         )
 
+    risk_anchor = (
+        _as_float(state.get("adaptive_trend_initial_risk_distance"))
+        or _as_float(state.get("risk_distance"))
+        or abs(average_entry - actual_stop)
+    )
+    applied_cost_buffer_percent = max(
+        0.0,
+        (
+            (actual_stop - average_entry) / average_entry * 100.0
+            if side == "long"
+            else (average_entry - actual_stop) / average_entry * 100.0
+        ),
+    )
     state.update(
         {
             "active": True,
             "breakeven_armed": True,
             "entry_price": average_entry,
             "initial_qty": live_qty,
-            "risk_distance": abs(average_entry - actual_stop),
+            "risk_distance": risk_anchor,
             "stop_loss": actual_stop,
             "hard_stop_loss": actual_stop,
             "last_stop_price": actual_stop,
             "adaptive_trend_breakeven_cost_buffer_percent": cost_buffer_percent,
+            "adaptive_trend_breakeven_applied_cost_buffer_percent": applied_cost_buffer_percent,
+            "adaptive_trend_breakeven_min_live_gap_percent": minimum_live_gap_percent,
             "adaptive_trend_pyramid_add_count": max(
                 int(state.get("adaptive_trend_pyramid_add_count", 0) or 0),
                 int(before_add_count or 0) + 1,
