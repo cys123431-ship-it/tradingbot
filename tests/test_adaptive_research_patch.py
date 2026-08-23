@@ -147,6 +147,7 @@ def test_runtime_wrapper_scales_accepted_plan_without_touching_protection(monkey
     assert plan["risk_distance"] == 2.0
     assert plan["partial_take_profit_r_multiple"] == 2.0
     assert plan["adaptive_trend_pyramid_trigger_r"] == (0.5, 1.0, 1.5)
+    assert status["risk_multiplier"] == 0.45
     assert stored["plan"] == plan
 
 
@@ -193,6 +194,6 @@ def test_runtime_wrapper_clears_rejected_plan(monkeypatch):
     assert side is None
     assert cleared == ["TEST"]
     assert status["allowed"] is False
-    assert status["entry_plan"]["qty"] == 6.0
+    assert "entry_plan" not in status
     assert status["reject_code"] == "REJECTED_RESEARCH_OVERLAY_TEST"
     assert "research overlay waiting" in reason.lower()
