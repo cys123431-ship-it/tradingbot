@@ -86,15 +86,16 @@ async def place_pyramid_protection_preserving_sl(
     tp_targets=None,
     preserve_runner_qty=False,
 ):
-    """Refresh pyramid TP while keeping/rebuilding an exchange SL first.
+    """Refresh pyramid TP without touching the currently live exchange SL.
 
-    ``_place_tp_sl_orders`` normally starts by cancelling every protection
-    order. That is appropriate for an initial build but unsafe immediately
-    after a pyramid fill because a transient new-SL failure can turn a healthy
-    winner into an emergency market close. For Adaptive Trend pyramid adds we
-    first attempt to cover the enlarged quantity at the still-live pre-add
-    stop, then run the normal TP builder with ``sl_distance=None``. The
-    context-aware cancellation wrapper keeps SL orders out of blanket cleanup.
+    ``_place_tp_sl_orders`` normally begins by cancelling every protection
+    order and then recreates SL/TP. During a winner add this creates a dangerous
+    gap: a transient replacement failure can remove a healthy stop and trigger
+    an unnecessary emergency market close. In the Adaptive Trend pyramid
+    context the normal builder is therefore used only for TP placement. The
+    existing SL stays live until the immediately following fee-aware SL
+    replacement/fallback and the final exchange-verified postcondition decide
+    whether a full-quantity replacement is valid.
     """
 
     if not adaptive_pyramid_rebuild_active():
@@ -110,48 +111,6 @@ async def place_pyramid_protection_preserving_sl(
             tp_targets=tp_targets,
             preserve_runner_qty=preserve_runner_qty,
         )
-
-    side = str(side or "").lower()
-    try:
-        entry_value = float(entry_price or 0.0)
-        distance_value = float(sl_distance or 0.0)
-    except (TypeError, ValueError):
-        entry_value = 0.0
-        distance_value = 0.0
-
-    pre_add_stop = None
-    if side == "long" and entry_value > 0 and distance_value > 0:
-        pre_add_stop = entry_value - distance_value
-    elif side == "short" and entry_value > 0 and distance_value > 0:
-        pre_add_stop = entry_value + distance_value
-
-    # Best effort only. If this replacement cannot be confirmed, the normal
-    # post-fill exchange guard performs additional retries and decides whether
-    # fail-closed liquidation is truly necessary.
-    if pre_add_stop is not None:
-        fetcher = getattr(engine, "_fetch_server_position_checked", None)
-        replacer = getattr(engine, "_replace_stop_loss_order", None)
-        try:
-            fetch_ok, live_pos = await fetcher(symbol) if callable(fetcher) else (False, None)
-        except Exception:
-            fetch_ok, live_pos = False, None
-        if (
-            fetch_ok
-            and isinstance(live_pos, dict)
-            and str(live_pos.get("side") or "").lower() == side
-            and callable(replacer)
-        ):
-            try:
-                await replacer(
-                    symbol,
-                    live_pos,
-                    pre_add_stop,
-                    reason="Adaptive Trend pyramid cover enlarged quantity before TP refresh",
-                )
-            except Exception:
-                # Do not force-close here. The exchange-verified postcondition
-                # gets the final say after retries/fallbacks.
-                pass
 
     return await original_place(
         engine,
