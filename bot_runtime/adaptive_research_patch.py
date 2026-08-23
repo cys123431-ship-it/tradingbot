@@ -4,6 +4,10 @@ The underlying strategy remains the source of trade direction, stop/TP geometry,
 and pyramiding rules.  This wrapper acts only after the parent signal has
 already built a valid entry plan.  It may reject that plan or scale its size
 down; it never increases size and never edits price/protection geometry.
+
+The overlay is deliberately scoped to the existing small-account aggressive
+profile only. Accounts that do not satisfy the runtime's sub-$1,000 candidate
+gate pass through completely unchanged.
 """
 
 from __future__ import annotations
@@ -71,7 +75,7 @@ def scale_adaptive_trend_plan(
 
 
 def install_adaptive_research_overlay() -> None:
-    """Install the conservative post-signal overlay once per interpreter."""
+    """Install the conservative small-account post-signal overlay once."""
 
     from .signal_alpha import SignalAlphaMixin
 
@@ -114,6 +118,13 @@ def install_adaptive_research_overlay() -> None:
         if not isinstance(plan, dict):
             return result
         if str(plan.get("strategy") or "") != "adaptive_breakout_trend_v1":
+            return result
+
+        # Critical scope boundary: use the parent strategy's own live balance
+        # classification.  This is true only when aggressive mode is enabled,
+        # equity is below the configured threshold (default $1,000), and free
+        # balance is available.  Every other Adaptive Trend entry is untouched.
+        if not bool(status.get("small_account_aggressive_candidate", False)):
             return result
 
         canonicalizer = getattr(self, "_canonical_futures_symbol", None)
