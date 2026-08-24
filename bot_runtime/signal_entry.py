@@ -52,6 +52,7 @@ _DURABLE_ENTRY_PLAN_KEYS = (
     'small_account_roe_profit_lock_min_gap_percent',
     'small_account_roe_profit_lock_max_gap_percent',
     'small_account_roe_profit_lock_min_floor_percent',
+    'tradfi_small_account_roe_profit_lock_applied',
     'small_account_entry_refinement_profile',
     'small_account_fast_momentum_retention',
     'small_account_lower_timeframe_side',

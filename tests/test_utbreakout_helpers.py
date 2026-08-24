@@ -6325,6 +6325,93 @@ def test_small_account_mark_roe_step_replaces_stop_before_bar_close():
     assert ("sl-old", "BTC/USDT") in engine.exchange.cancelled
 
 
+def test_tradfi_small_account_uses_same_mark_roe_staircase():
+    symbol = "SNDK/USDT:USDT"
+    pos = {
+        "symbol": symbol,
+        "side": "long",
+        "contracts": "1",
+        "entryPrice": "100",
+        "markPrice": "101",
+    }
+    engine = _protection_engine(
+        [
+            {
+                "id": "sl-old",
+                "side": "sell",
+                "type": "market",
+                "clientOrderId": "utbslSNDKUSDTold",
+                "info": {
+                    "origType": "STOP_MARKET",
+                    "stopPrice": "90",
+                    "reduceOnly": "true",
+                    "symbol": "SNDKUSDT",
+                },
+            },
+        ],
+        positions=[pos],
+    )
+    plan = {
+        "strategy": "adaptive_breakout_trend_v1",
+        "risk_distance": 10.0,
+        "stop_loss": 90.0,
+        "atr": 0.4,
+        "leverage": 7,
+        "runner_pct": 1.0,
+        "partial_take_profit_enabled": False,
+        "atr_trailing_enabled": False,
+        "tp1_breakeven_enabled": False,
+        "soft_stop_enabled": False,
+        "near_miss_tp_enabled": False,
+        "small_account_aggressive_active": True,
+        "tradfi_small_account_roe_profit_lock_applied": True,
+        "small_account_roe_profit_lock_enabled": True,
+        "small_account_roe_profit_lock_first_trigger_percent": 5.0,
+        "small_account_roe_profit_lock_second_trigger_percent": 10.0,
+        "small_account_roe_profit_lock_step_percent": 10.0,
+        "small_account_roe_profit_lock_atr_multiplier": 0.5,
+        "small_account_roe_profit_lock_min_gap_percent": 1.0,
+        "small_account_roe_profit_lock_max_gap_percent": 3.0,
+        "small_account_roe_profit_lock_min_floor_percent": 1.0,
+    }
+    state = engine._register_utbreakout_trailing_state(
+        symbol,
+        "long",
+        100.0,
+        1.0,
+        plan,
+        {
+            "atr_trailing_enabled": False,
+            "tp1_breakeven_enabled": False,
+            "soft_stop_enabled": False,
+            "near_miss_tp_enabled": False,
+        },
+    )
+
+    assert state["tradfi_small_account_roe_profit_lock_applied"] is True
+    assert state["small_account_roe_profit_lock_enabled"] is True
+
+    managed = asyncio.run(
+        engine._manage_utbreakout_partial_trailing(
+            symbol,
+            pos,
+            pd.DataFrame(),
+            {
+                "atr_trailing_enabled": False,
+                "tp1_breakeven_enabled": False,
+                "soft_stop_enabled": False,
+                "near_miss_tp_enabled": False,
+            },
+        )
+    )
+
+    assert managed["small_account_roe_profit_lock_stage"] == 1
+    assert managed["small_account_roe_profit_lock_floor_percent"] == pytest.approx(3.6)
+    assert managed["last_stop_price"] == pytest.approx(100.0 * (1.0 + 3.6 / 700.0))
+    assert managed["runner_mode"] == "small_account_roe_lock_stage_1"
+    assert ("sl-old", symbol) in engine.exchange.cancelled
+
+
 def test_small_account_mark_roe_floor_closes_if_price_gaps_through_exchange_stop():
     pos = {
         "symbol": "BTC/USDT:USDT",

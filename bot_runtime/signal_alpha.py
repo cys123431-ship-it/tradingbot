@@ -2042,6 +2042,15 @@ class SignalAlphaMixin:
                 else ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION
             ),
             'tradfi_pattern_profile_applied': tradfi_profile_applied,
+            # The ROE staircase is shared with crypto small accounts. Keep an
+            # explicit marker on TradFi plans so restart/recovery tests can
+            # prove that this exit policy was selected without changing any
+            # TradFi entry, leverage, sizing, session, or basis rule.
+            'tradfi_small_account_roe_profit_lock_applied': bool(
+                tradfi_profile_applied
+                and small_account_aggressive_candidate
+                and trend_cfg.get('small_account_roe_profit_lock_enabled', True)
+            ),
             'risk_budget_mode': (
                 'adaptive_trend_small_account_aggressive_pending'
                 if small_account_aggressive_candidate

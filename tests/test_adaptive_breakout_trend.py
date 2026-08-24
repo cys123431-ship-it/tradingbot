@@ -1176,6 +1176,7 @@ def test_durable_entry_summary_keeps_restart_exit_policy():
         "ev_time_stop_bars": 16,
         "ev_time_stop_min_mfe_r": 0.35,
         "ev_time_stop_max_current_r": 0.0,
+        "tradfi_small_account_roe_profit_lock_applied": True,
         "ignored_runtime_object": object(),
     }
 
@@ -1188,6 +1189,7 @@ def test_durable_entry_summary_keeps_restart_exit_policy():
     assert summary["ev_time_stop_bars"] == 16
     assert summary["ev_time_stop_min_mfe_r"] == pytest.approx(0.35)
     assert summary["ev_time_stop_max_current_r"] == pytest.approx(0.0)
+    assert summary["tradfi_small_account_roe_profit_lock_applied"] is True
     assert "ignored_runtime_object" not in summary
 
 
