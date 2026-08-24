@@ -110,7 +110,12 @@ def update_tradfi_profile_rollout(store: Any, result: Any) -> dict[str, Any]:
     if store is None or not hasattr(store, "get_runtime_state"):
         return get_tradfi_profile_rollout_state(store)
     existing = store.get_runtime_state(TRADFI_PROFILE_ROLLOUT_STATE_KEY)
-    if not isinstance(existing, dict) or existing.get("version") != TRADFI_PROFILE_ROLLOUT_VERSION:
+    existing_missing = not isinstance(existing, dict)
+    version_changed = bool(
+        isinstance(existing, dict)
+        and existing.get("version") != TRADFI_PROFILE_ROLLOUT_VERSION
+    )
+    if existing_missing or version_changed:
         if not _complete_snapshot(result):
             return {
                 "version": TRADFI_PROFILE_ROLLOUT_VERSION,
@@ -142,7 +147,13 @@ def update_tradfi_profile_rollout(store: Any, result: Any) -> dict[str, Any]:
             ),
         }
         create = getattr(store, "create_runtime_state_if_absent", None)
-        if callable(create):
+        if version_changed:
+            # Versioned entry profiles share one durable state key. An
+            # insert-if-absent call cannot replace the previous version and
+            # would leave every later rollout permanently inactive.
+            store.set_runtime_state(TRADFI_PROFILE_ROLLOUT_STATE_KEY, initial)
+            existing = initial
+        elif callable(create):
             inserted = bool(create(TRADFI_PROFILE_ROLLOUT_STATE_KEY, initial))
             if not inserted:
                 existing = store.get_runtime_state(TRADFI_PROFILE_ROLLOUT_STATE_KEY)

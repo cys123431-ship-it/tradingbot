@@ -219,3 +219,48 @@ def test_rollout_waits_when_only_residual_protection_exists_at_deployment(tmp_pa
     assert pending["active"] is False
     assert pending["pending_symbols"] == ["SNDKUSDT"]
     assert active["active"] is True
+
+
+def test_rollout_replaces_prior_profile_version_after_flat_snapshot(tmp_path):
+    store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+    store.set_runtime_state(
+        "tradfi_pattern_profile_rollout",
+        {
+            "version": "tradfi_pattern_profile_v1",
+            "state": "active",
+            "active": True,
+        },
+    )
+
+    state = update_tradfi_profile_rollout(store, _snapshot())
+
+    assert state["version"] == TRADFI_PATTERN_PROFILE_VERSION
+    assert state["state"] == "active"
+    assert state["active"] is True
+    assert store.get_runtime_state(
+        "tradfi_pattern_profile_rollout"
+    )["version"] == TRADFI_PATTERN_PROFILE_VERSION
+
+
+def test_rollout_version_change_preserves_current_position(tmp_path):
+    store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+    store.set_runtime_state(
+        "tradfi_pattern_profile_rollout",
+        {
+            "version": "tradfi_pattern_profile_v1",
+            "state": "active",
+            "active": True,
+        },
+    )
+    position = {"symbol": "SOXL/USDT:USDT", "contracts": 1.0}
+
+    pending = update_tradfi_profile_rollout(
+        store,
+        _snapshot(positions=[position]),
+    )
+    active = update_tradfi_profile_rollout(store, _snapshot())
+
+    assert pending["version"] == TRADFI_PATTERN_PROFILE_VERSION
+    assert pending["active"] is False
+    assert pending["pending_symbols"] == ["SOXLUSDT"]
+    assert active["active"] is True
