@@ -6,7 +6,7 @@ import asyncio
 import time
 
 from .entry_reason_ko import build_entry_diagnostic
-from trading_safety.market_session import us_equity_regular_session_status
+from trading_safety.market_session import tradfi_primary_session_status
 from utbreakout.adaptive_breakout_trend import (
     ADAPTIVE_BREAKOUT_TREND_STRATEGY,
     ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION,
@@ -22,6 +22,7 @@ from utbreakout.change_point_flow import (
     resolve_trend_event_candidate,
     select_independent_change_point_flow_candidate,
 )
+from utbreakout.coinselector import market_tradifi_underlying_type
 from utbreakout.profit_capture import (
     QUAD_CONFIRMATION_RISK_MULTIPLIERS,
     bounded_structure_anchor,
@@ -32,6 +33,12 @@ from utbreakout.tradfi_pattern_profile import (
     evaluate_tradfi_pattern_profile,
     normalize_tradfi_pattern_profile_config,
     tradfi_trend_direction,
+)
+from utbreakout.tradfi_small_account import (
+    TRADFI_SMALL_ACCOUNT_PROFILE_VERSION,
+    cap_tradfi_risk_tier,
+    classify_tradfi_instrument,
+    evaluate_tradfi_small_account_guardrails,
 )
 
 
@@ -1028,6 +1035,22 @@ class SignalAlphaMixin:
             return dict(cached.get('context') or {})
 
         profile_cfg = self._tradfi_pattern_profile_runtime_config(trend_cfg)
+        underlying_type = "EQUITY"
+        for exchange in (
+            getattr(self, 'market_data_exchange', None),
+            getattr(self, 'exchange', None),
+        ):
+            markets = getattr(exchange, 'markets', None) if exchange is not None else None
+            if not isinstance(markets, dict) or not markets:
+                continue
+            market = self._coin_selector_market_for_symbol(canonical, markets)
+            if isinstance(market, dict):
+                underlying_type = market_tradifi_underlying_type(market) or "EQUITY"
+                break
+        instrument_profile = classify_tradfi_instrument(
+            canonical,
+            underlying_type,
+        )
         higher_tf = str(profile_cfg.get('higher_timeframe', '4h') or '4h')
         daily_tf = str(profile_cfg.get('daily_timeframe', '1d') or '1d')
         requests = {
@@ -1070,7 +1093,9 @@ class SignalAlphaMixin:
                 else resolved['daily_rows']
             ),
             'benchmark_directions': benchmark_directions,
-            'session_status': us_equity_regular_session_status(),
+            'session_status': tradfi_primary_session_status(underlying_type),
+            'underlying_type': underlying_type,
+            'instrument_profile': instrument_profile,
             'errors': errors,
         }
         cache[canonical] = {
@@ -1251,6 +1276,8 @@ class SignalAlphaMixin:
             preliminary = evaluate_tradfi_pattern_profile(
                 rows,
                 preliminary,
+                symbol=canonical,
+                underlying_type=tradfi_context.get('underlying_type'),
                 higher_timeframe_rows=tradfi_context.get('higher_timeframe_rows'),
                 daily_rows=tradfi_context.get('daily_rows'),
                 benchmark_directions=tradfi_context.get('benchmark_directions'),
@@ -1370,6 +1397,38 @@ class SignalAlphaMixin:
                 'REJECTED_TREND_EVENT_CANDIDATE',
             )
 
+        tradfi_small_account_guardrail = {
+            'profile': TRADFI_SMALL_ACCOUNT_PROFILE_VERSION,
+            'allowed': True,
+            'code': 'TRADFI_SMALL_ACCOUNT_CONTEXT_NOT_APPLICABLE',
+            'reason': 'TradFi small-account context not applicable',
+            'risk_tier_ceiling': None,
+            'leverage_ceiling': int(
+                trend_cfg.get('small_account_elite_leverage', 7) or 7
+            ),
+        }
+        if is_tradfi and small_account_aggressive_candidate:
+            tradfi_small_account_guardrail = evaluate_tradfi_small_account_guardrails(
+                symbol=canonical,
+                side=candidate_resolution.get('side'),
+                candidate_source=candidate_resolution.get('source'),
+                session_status=tradfi_context.get('session_status'),
+                futures_context=futures_context,
+                underlying_type=tradfi_context.get('underlying_type'),
+                instrument_profile=tradfi_context.get('instrument_profile'),
+            )
+            status['tradfi_small_account_guardrail'] = dict(
+                tradfi_small_account_guardrail
+            )
+            if not bool(tradfi_small_account_guardrail.get('allowed')):
+                return _finish(
+                    None,
+                    'TradFi small-account waiting: '
+                    f"{tradfi_small_account_guardrail.get('reason')}",
+                    tradfi_small_account_guardrail.get('code')
+                    or 'REJECTED_TRADFI_SMALL_ACCOUNT_CONTEXT',
+                )
+
         candidate_side = str(candidate_resolution.get('side') or '').lower()
         l2_gate = await self._evaluate_shared_l2_gate(
             canonical,
@@ -1408,6 +1467,8 @@ class SignalAlphaMixin:
                 decision = evaluate_tradfi_pattern_profile(
                     rows,
                     decision,
+                    symbol=canonical,
+                    underlying_type=tradfi_context.get('underlying_type'),
                     higher_timeframe_rows=tradfi_context.get('higher_timeframe_rows'),
                     daily_rows=tradfi_context.get('daily_rows'),
                     benchmark_directions=tradfi_context.get('benchmark_directions'),
@@ -1482,6 +1543,12 @@ class SignalAlphaMixin:
             relative_valid=selector_tier_valid,
             tradfi=is_tradfi,
         )
+        pre_tradfi_guardrail_risk_tier = effective_risk_tier
+        if is_tradfi and small_account_aggressive_candidate:
+            effective_risk_tier = cap_tradfi_risk_tier(
+                effective_risk_tier,
+                tradfi_small_account_guardrail.get('risk_tier_ceiling'),
+            )
         tradfi_tier_floor_applied = bool(
             is_tradfi
             and selector_tier_valid
@@ -1501,6 +1568,15 @@ class SignalAlphaMixin:
             'tradfi_relative_rank_upgrade_only': bool(is_tradfi),
             'tradfi_absolute_tier_floor_applied': tradfi_tier_floor_applied,
             'risk_tier': effective_risk_tier,
+            'tradfi_small_account_profile': (
+                TRADFI_SMALL_ACCOUNT_PROFILE_VERSION
+                if is_tradfi and small_account_aggressive_candidate
+                else None
+            ),
+            'tradfi_pre_guardrail_risk_tier': pre_tradfi_guardrail_risk_tier,
+            'tradfi_risk_tier_cap_applied': bool(
+                effective_risk_tier != pre_tradfi_guardrail_risk_tier
+            ),
         })
 
         _, daily_pnl = self.db.get_daily_stats()
@@ -1746,6 +1822,22 @@ class SignalAlphaMixin:
                         or 1.0
                     ),
                     float(event_allocation['initial_margin_fraction']),
+                )
+            # Flow conviction may upgrade the tier after the first TradFi cap.
+            # Reapply the product/session/basis ceiling so an aligned event
+            # cannot silently restore elite sizing outside the cash session or
+            # through an adverse mark/index dislocation.
+            if is_tradfi:
+                pre_reapplied_tier = effective_risk_tier
+                effective_risk_tier = cap_tradfi_risk_tier(
+                    effective_risk_tier,
+                    tradfi_small_account_guardrail.get('risk_tier_ceiling'),
+                )
+                change_point_flow['tradfi_guardrail_tier_before_reapply'] = (
+                    pre_reapplied_tier
+                )
+                change_point_flow['tradfi_guardrail_tier_cap_reapplied'] = bool(
+                    effective_risk_tier != pre_reapplied_tier
                 )
             status['independent_event_allocation'] = dict(event_allocation)
             status['risk_tier'] = effective_risk_tier
@@ -2018,14 +2110,32 @@ class SignalAlphaMixin:
                 min(
                     int(profile_cfg.get('maximum_leverage', 10)),
                     int(trend_cfg.get('small_account_elite_leverage', 7) or 7),
+                    int(tradfi_small_account_guardrail.get('leverage_ceiling', 7) or 7),
+                )
+                if tradfi_profile_applied and small_account_aggressive_candidate
+                else min(
+                    int(profile_cfg.get('maximum_leverage', 10)),
+                    int(trend_cfg.get('small_account_elite_leverage', 7) or 7),
                 )
                 if tradfi_profile_applied
                 else int(trend_cfg.get('small_account_elite_leverage', 7) or 7)
             ),
             'strategy_leverage_ceiling': (
-                int(profile_cfg.get('maximum_leverage', 10))
+                min(
+                    int(profile_cfg.get('maximum_leverage', 10)),
+                    int(tradfi_small_account_guardrail.get('leverage_ceiling', 7) or 7),
+                )
+                if tradfi_profile_applied and small_account_aggressive_candidate
+                else int(profile_cfg.get('maximum_leverage', 10))
                 if tradfi_profile_applied
                 else None
+            ),
+            'tradfi_underlying_type': tradfi_context.get('underlying_type'),
+            'tradfi_instrument_profile': dict(
+                tradfi_context.get('instrument_profile') or {}
+            ),
+            'tradfi_small_account_guardrail': dict(
+                tradfi_small_account_guardrail
             ),
             'small_account_roe_profit_lock_enabled': bool(
                 trend_cfg.get('small_account_roe_profit_lock_enabled', True)

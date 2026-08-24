@@ -15,6 +15,10 @@ from utbreakout.tradfi_pattern_profile import (
     evaluate_tradfi_pattern_profile,
     normalize_tradfi_pattern_profile_config,
 )
+from utbreakout.tradfi_small_account import (
+    TRADFI_SMALL_ACCOUNT_PROFILE_VERSION,
+    evaluate_tradfi_small_account_guardrails,
+)
 
 from .controller_automatic_controls import (
     AUTOMATIC_SCAN_SCOPE_ALL,
@@ -2355,6 +2359,7 @@ class SignalScannerMixin:
                     None,
                     trend_cfg,
                 )
+                profile_context = {}
                 if bool(base_candidate.get('tradifi_perpetual')):
                     profile_cfg = normalize_tradfi_pattern_profile_config(
                         trend_cfg.get('tradfi_pattern_profile')
@@ -2378,6 +2383,11 @@ class SignalScannerMixin:
                     trend_decision = evaluate_tradfi_pattern_profile(
                         trend_rows,
                         trend_decision,
+                        symbol=symbol,
+                        underlying_type=(
+                            profile_context.get('underlying_type')
+                            or base_candidate.get('tradifi_underlying_type')
+                        ),
                         higher_timeframe_rows=profile_context.get('higher_timeframe_rows'),
                         daily_rows=profile_context.get('daily_rows'),
                         benchmark_directions=profile_context.get('benchmark_directions'),
@@ -2461,6 +2471,44 @@ class SignalScannerMixin:
                         or 12.0
                     ),
                 )
+                tradfi_small_account_guardrail = {
+                    'profile': TRADFI_SMALL_ACCOUNT_PROFILE_VERSION,
+                    'allowed': True,
+                    'code': 'TRADFI_SMALL_ACCOUNT_CONTEXT_NOT_APPLICABLE',
+                    'reason': 'TradFi small-account context not applicable',
+                }
+                if (
+                    small_account_candidate
+                    and bool(base_candidate.get('tradifi_perpetual'))
+                    and candidate_resolution.get('allowed')
+                ):
+                    tradfi_small_account_guardrail = (
+                        evaluate_tradfi_small_account_guardrails(
+                            symbol=symbol,
+                            side=candidate_resolution.get('side'),
+                            candidate_source=candidate_resolution.get('source'),
+                            session_status=(
+                                profile_context.get('session_status')
+                                or self._coin_selector_tradifi_regular_session_status()
+                            ),
+                            futures_context=futures_context,
+                            underlying_type=(
+                                profile_context.get('underlying_type')
+                                or base_candidate.get('tradifi_underlying_type')
+                            ),
+                            instrument_profile=profile_context.get(
+                                'instrument_profile'
+                            ),
+                        )
+                    )
+                    if not bool(tradfi_small_account_guardrail.get('allowed')):
+                        candidate_resolution = {
+                            **candidate_resolution,
+                            'allowed': False,
+                            'score': 0.0,
+                            'reason': tradfi_small_account_guardrail.get('reason'),
+                            'code': tradfi_small_account_guardrail.get('code'),
+                        }
                 candidate_side = candidate_resolution.get('side')
                 candidate_metrics = dict(trend_metrics)
                 if candidate_resolution.get('source') in {
@@ -2571,6 +2619,16 @@ class SignalScannerMixin:
                     ),
                     'tradfi_pattern_score': trend_metrics.get('tradfi_pattern_score'),
                     'tradfi_entry_mode': trend_metrics.get('tradfi_entry_mode'),
+                    'tradfi_underlying_type': (
+                        profile_context.get('underlying_type')
+                        or base_candidate.get('tradifi_underlying_type')
+                    ),
+                    'tradfi_small_account_guardrail': dict(
+                        tradfi_small_account_guardrail
+                    ),
+                    'tradfi_small_account_guardrail_code': (
+                        tradfi_small_account_guardrail.get('code')
+                    ),
                 })
             if bool(ut_cfg.get('ev_adaptive_enabled', False)):
                 scores = analysis.get('scores') if isinstance(analysis.get('scores'), dict) else {}

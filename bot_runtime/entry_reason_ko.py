@@ -113,6 +113,14 @@ def explain_entry_reason_ko(reason=None, *, code=None, data=None):
         return "빠른 이벤트 발생 전후의 1시간 봉 변동폭이 과도해 진입하지 않습니다."
     if "INDEPENDENT_EVENT_VOLATILITY_SHOCK" in uppered:
         return "빠른 이벤트와 함께 변동성 충격이 발생해 가격이 안정될 때까지 기다립니다."
+    if "TRADFI_PREMARKET_CONTRACT" in uppered:
+        return "아직 상장 전 기초자산을 추적하는 TradFi 종목이라 신규 진입하지 않습니다."
+    if "TRADFI_UNDERLYING_CLOSED" in uppered:
+        return "기초 주식시장이 쉬어 기준가격 발견이 멈춘 시간이라 신규 진입하지 않습니다."
+    if "TRADFI_EXTENDED_EVENT_ONLY" in uppered:
+        return "주식 정규장 밖에서 나온 단기 주문흐름 신호만으로는 진입하지 않고 추세 확인을 기다립니다."
+    if "TRADFI_BASIS_DISLOCATION" in uppered:
+        return "TradFi 선물 가격이 기초자산 기준가격보다 불리하게 과도하게 벌어져 진입하지 않습니다."
     if "TREND_EVENT_CANDIDATE" in uppered or "INDEPENDENT_DIRECTION_AMBIGUOUS" in uppered:
         return "기존 추세와 새 체제·주문 흐름 후보가 충돌하거나 어느 방향도 충분히 강하지 않습니다."
     if "REGION_RESTRICTED" in uppered or "RESTRICTED_SYMBOL" in uppered:

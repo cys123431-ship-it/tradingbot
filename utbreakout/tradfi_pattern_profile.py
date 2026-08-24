@@ -9,15 +9,18 @@ Candlestick formations are supporting evidence only.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from dataclasses import replace
 from math import isfinite
 from statistics import median
 from typing import Any, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 from .adaptive_breakout_trend import AdaptiveBreakoutTrendDecision
+from .tradfi_small_account import classify_tradfi_instrument
 
 
-TRADFI_PATTERN_PROFILE_VERSION = "tradfi_pattern_profile_v1"
+TRADFI_PATTERN_PROFILE_VERSION = "tradfi_pattern_profile_v2_session_anchor"
 
 
 def default_tradfi_pattern_profile_config() -> dict[str, Any]:
@@ -422,17 +425,94 @@ def _merge_patterns(*groups: Mapping[str, Sequence[str]]) -> dict[str, list[str]
     return merged
 
 
+def _timestamp_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, (int, float)):
+        raw = float(value)
+        if not isfinite(raw):
+            return None
+        if abs(raw) > 100_000_000_000:
+            raw /= 1000.0
+        try:
+            parsed = datetime.fromtimestamp(raw, timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+    elif value not in (None, ""):
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _session_adjusted_volume_ratio(
+    candles: Sequence[Mapping[str, Any]],
+    session_status: Mapping[str, Any] | None,
+) -> tuple[float, str, int]:
+    volumes = [float(row.get("volume") or 0.0) for row in candles]
+    fallback = volumes[-49:-1] if len(volumes) >= 49 else volumes[:-1]
+    baseline = median(fallback) if fallback else 0.0
+    method = "rolling_median"
+    samples = len(fallback)
+
+    timezone_name = str((session_status or {}).get("timezone") or "UTC")
+    latest_dt = _timestamp_datetime(candles[-1].get("timestamp")) if candles else None
+    if latest_dt is not None:
+        try:
+            tz = ZoneInfo(timezone_name)
+        except Exception:
+            tz = timezone.utc
+        latest_local = latest_dt.astimezone(tz)
+        latest_bucket = (latest_local.hour, latest_local.minute)
+        comparable = []
+        for row in candles[:-1]:
+            row_dt = _timestamp_datetime(row.get("timestamp"))
+            if row_dt is None:
+                continue
+            local = row_dt.astimezone(tz)
+            if (local.hour, local.minute) == latest_bucket:
+                comparable.append(float(row.get("volume") or 0.0))
+        if len(comparable) >= 3:
+            baseline = median(comparable[-20:])
+            samples = min(20, len(comparable))
+            method = "same_session_time_bucket"
+
+    latest_volume = volumes[-1] if volumes else 0.0
+    ratio = latest_volume / max(baseline, 1e-9) if baseline > 0 else 1.0
+    return ratio, method, samples
+
+
 def _gap_shock(candles: Sequence[Mapping[str, Any]], atr_value: float, threshold: float) -> bool:
     if len(candles) < 2 or atr_value <= 0:
         return False
-    gap = abs(float(candles[-1]["open"]) - float(candles[-2]["close"]))
-    return gap / atr_value > threshold
+    latest = candles[-1]
+    previous_close = float(candles[-2]["close"])
+    gap = abs(float(latest["open"]) - previous_close)
+    true_range = max(
+        float(latest["high"]) - float(latest["low"]),
+        abs(float(latest["high"]) - previous_close),
+        abs(float(latest["low"]) - previous_close),
+    )
+    # A large opening discontinuity is suspicious at the configured threshold.
+    # Intrabar range gets more room because a genuine trend breakout is itself
+    # expected to be wider than an ordinary candle.
+    return (
+        gap / atr_value > threshold
+        or true_range / atr_value > threshold * 2.5
+    )
 
 
 def evaluate_tradfi_pattern_profile(
     rows: Sequence[Mapping[str, Any]] | None,
     base_decision: AdaptiveBreakoutTrendDecision,
     *,
+    symbol: str | None = None,
+    underlying_type: str | None = None,
     higher_timeframe_rows: Sequence[Mapping[str, Any]] | None = None,
     daily_rows: Sequence[Mapping[str, Any]] | None = None,
     benchmark_directions: Mapping[str, str | None] | None = None,
@@ -463,9 +543,9 @@ def evaluate_tradfi_pattern_profile(
         _continuation_chart_patterns(candles, atr_value, cfg),
         _reversal_chart_patterns(candles, atr_value),
     )
-    volumes = [float(row.get("volume") or 0.0) for row in candles]
-    baseline_volume = median(volumes[-49:-1]) if len(volumes) >= 49 else median(volumes[:-1])
-    volume_ratio = volumes[-1] / max(baseline_volume, 1e-9) if baseline_volume > 0 else 1.0
+    volume_ratio, volume_baseline_method, volume_baseline_samples = (
+        _session_adjusted_volume_ratio(candles, session_status)
+    )
     htf_direction = _trend_direction(higher_timeframe_rows)
     daily_direction = _trend_direction(daily_rows)
     benchmark_directions = dict(benchmark_directions or {})
@@ -517,6 +597,12 @@ def evaluate_tradfi_pattern_profile(
     session_allows_pattern = bool(
         session_open or not cfg["regular_session_required_for_pattern_entry"]
     )
+    pattern_evidence_trusted = bool(
+        session_allows_pattern
+        and volume_ratio >= float(cfg["minimum_volume_ratio"])
+        and not opposing_chart
+        and not gap_shock
+    )
     pattern_entry_allowed = bool(
         base_side in {"long", "short"}
         and chart_patterns[base_side]
@@ -524,7 +610,6 @@ def evaluate_tradfi_pattern_profile(
         and volume_ratio >= float(cfg["minimum_volume_ratio"])
         and higher_trend_aligned
         and session_allows_pattern
-        and not benchmark_conflict
         and not opposing_chart
         and not gap_shock
         and bool(metrics.get("ema_aligned"))
@@ -539,6 +624,7 @@ def evaluate_tradfi_pattern_profile(
             "tradfi_pattern_side_scores": side_scores,
             "tradfi_pattern_score": chart_side_score,
             "tradfi_pattern_entry_allowed": pattern_entry_allowed,
+            "tradfi_pattern_evidence_trusted": pattern_evidence_trusted,
             "tradfi_higher_timeframe_direction": htf_direction,
             "tradfi_daily_direction": daily_direction,
             "tradfi_benchmark_directions": benchmark_directions,
@@ -547,15 +633,22 @@ def evaluate_tradfi_pattern_profile(
             "tradfi_session_reason": (session_status or {}).get("reason"),
             "tradfi_gap_shock": gap_shock,
             "tradfi_volume_ratio": volume_ratio,
+            "tradfi_volume_baseline_method": volume_baseline_method,
+            "tradfi_volume_baseline_samples": volume_baseline_samples,
             "tradfi_opposing_chart": opposing_chart,
+            "tradfi_benchmark_corroborating_only": True,
+            "tradfi_instrument_profile": classify_tradfi_instrument(
+                symbol,
+                underlying_type,
+            ),
         }
     )
 
     if base_decision.allowed:
         bonus = 0.0
-        if chart_patterns.get(base_side) and not opposing_chart:
+        if chart_patterns.get(base_side) and pattern_evidence_trusted:
             bonus += min(5.0, len(chart_patterns[base_side]) * 2.0)
-        if candle_patterns.get(base_side) and not opposing_chart:
+        if candle_patterns.get(base_side) and pattern_evidence_trusted:
             bonus += min(2.0, len(candle_patterns[base_side]))
         if higher_trend_aligned:
             bonus += 1.0
@@ -567,7 +660,7 @@ def evaluate_tradfi_pattern_profile(
             metrics["tradfi_entry_mode"] = "base_plus_pattern_confirmation"
         else:
             metrics["tradfi_entry_mode"] = "base_adaptive_trend"
-        names = chart_patterns.get(base_side) or []
+        names = chart_patterns.get(base_side) if pattern_evidence_trusted else []
         suffix = f"; TradFi patterns={','.join(names)}" if names else "; TradFi pattern neutral"
         return AdaptiveBreakoutTrendDecision(
             allowed=True,

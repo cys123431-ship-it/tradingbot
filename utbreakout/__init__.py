@@ -12,6 +12,7 @@ from .coinselector import (
     default_coin_selector_config,
     finalize_candidate,
     market_is_tradifi_perpetual,
+    market_tradifi_underlying_type,
     normalize_custom_symbol,
     normalize_custom_symbols,
     rank_candidates,
@@ -38,6 +39,12 @@ from .tradfi_pattern_profile import (
     evaluate_tradfi_pattern_profile,
     normalize_tradfi_pattern_profile_config,
     tradfi_trend_direction,
+)
+from .tradfi_small_account import (
+    TRADFI_SMALL_ACCOUNT_PROFILE_VERSION,
+    cap_tradfi_risk_tier,
+    classify_tradfi_instrument,
+    evaluate_tradfi_small_account_guardrails,
 )
 from .opportunity_risk import (
     OpportunityRiskDecision,
@@ -215,6 +222,10 @@ __all__ = [
     "evaluate_tradfi_pattern_profile",
     "normalize_tradfi_pattern_profile_config",
     "tradfi_trend_direction",
+    "TRADFI_SMALL_ACCOUNT_PROFILE_VERSION",
+    "cap_tradfi_risk_tier",
+    "classify_tradfi_instrument",
+    "evaluate_tradfi_small_account_guardrails",
     "OpportunityRiskDecision",
     "apply_opportunity_risk_to_plan",
     "default_opportunity_risk_config",
@@ -223,6 +234,7 @@ __all__ = [
     "default_coin_selector_config",
     "finalize_candidate",
     "market_is_tradifi_perpetual",
+    "market_tradifi_underlying_type",
     "format_research_summary",
     "HTF_MAP",
     "normalize_custom_symbol",

@@ -258,6 +258,12 @@ def market_is_tradifi_perpetual(symbol, market):
     return contract_type == "TRADIFI_PERPETUAL"
 
 
+def market_tradifi_underlying_type(market):
+    if not isinstance(market, dict):
+        return ""
+    return str(_info_value(market, "underlyingType", "") or "").strip().upper()
+
+
 def _flatten_market_metadata(value):
     if value is None:
         return []
@@ -370,6 +376,11 @@ def _scanner_hard_reject_reason(candidate: dict, cfg: dict) -> str | None:
         return "INVALID_MARKET"
     if market_is_blocked_tradifi_commodity(symbol, market):
         return "REJECTED_TRADIFI_COMMODITY"
+    if (
+        market_is_tradifi_perpetual(symbol, market)
+        and market_tradifi_underlying_type(market) == "PREMARKET"
+    ):
+        return "REJECTED_TRADIFI_PREMARKET_CONTRACT"
     # B. Low 24h quote volume:
     min_vol = max(
         HARD_MIN_QUOTE_VOLUME_USDT,
@@ -411,6 +422,7 @@ def build_base_candidate(symbol, ticker, market=None, cfg=None, sector_tags=None
     metrics.update({
         "exchange_symbol": symbol,
         "tradifi_perpetual": market_is_tradifi_perpetual(symbol, market),
+        "tradifi_underlying_type": market_tradifi_underlying_type(market),
         "tradifi_commodity_blocked": market_is_blocked_tradifi_commodity(symbol, market),
         "sector_tags": sector_tags,
         "accepted": not reject_reasons,
@@ -871,6 +883,7 @@ def build_selection_report(candidates, rejects=None, *, top_n=10):
         "total_rejected": len(rejects or []),
         "scanner_rules": [
             "valid_usdt_perp",
+            "no_unanchored_tradfi_premarket",
             "min_quote_volume",
             "min_trade_count",
             "max_spread",

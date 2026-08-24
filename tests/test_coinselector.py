@@ -91,6 +91,23 @@ def test_coinselector_accepts_tradifi_usdt_perpetual():
     assert "INVALID_MARKET" not in candidate["reject_reasons"]
 
 
+def test_coinselector_rejects_unanchored_tradfi_premarket_contract():
+    candidate = build_base_candidate(
+        "OPENAI/USDT:USDT",
+        _ticker(quoteVolume=500_000_000),
+        _market(info={
+            "contractType": "TRADIFI_PERPETUAL",
+            "underlyingType": "PREMARKET",
+            "status": "TRADING",
+        }),
+        default_coin_selector_config(),
+    )
+
+    assert candidate["accepted"] is False
+    assert candidate["tradifi_underlying_type"] == "PREMARKET"
+    assert "REJECTED_TRADIFI_PREMARKET_CONTRACT" in candidate["reject_reasons"]
+
+
 def test_coinselector_accepts_skhy_tradifi_perpetual():
     cfg = default_coin_selector_config()
     market = _market(

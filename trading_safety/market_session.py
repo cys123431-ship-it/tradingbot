@@ -1,4 +1,4 @@
-"""US equity regular-session and holiday calendar helpers."""
+"""Primary-market regular-session and holiday calendar helpers."""
 
 from __future__ import annotations
 
@@ -142,6 +142,102 @@ def us_equity_regular_session_status(now=None):
 def is_us_equity_regular_session_open(now=None):
     return bool(us_equity_regular_session_status(now).get("open"))
 
+
+def _regional_equity_session_status(
+    now,
+    *,
+    timezone_name,
+    sessions,
+    market_region,
+    underlying_type,
+):
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    local = current.astimezone(ZoneInfo(timezone_name))
+    local_date = local.date()
+    windows = []
+    for (open_hour, open_minute), (close_hour, close_minute) in sessions:
+        windows.append((
+            local.replace(
+                hour=open_hour,
+                minute=open_minute,
+                second=0,
+                microsecond=0,
+            ),
+            local.replace(
+                hour=close_hour,
+                minute=close_minute,
+                second=0,
+                microsecond=0,
+            ),
+        ))
+    if local.weekday() >= 5:
+        reason = "weekend"
+        is_open = False
+    elif any(open_dt <= local < close_dt for open_dt, close_dt in windows):
+        reason = "regular_session_open"
+        is_open = True
+    else:
+        reason = "outside_regular_session"
+        is_open = False
+    return {
+        "open": is_open,
+        "reason": reason,
+        "timezone": timezone_name,
+        "local_time": local.isoformat(),
+        "regular_open": windows[0][0].isoformat(),
+        "regular_close": windows[-1][1].isoformat(),
+        "regular_sessions": [
+            {"open": open_dt.isoformat(), "close": close_dt.isoformat()}
+            for open_dt, close_dt in windows
+        ],
+        "early_close": False,
+        "market_region": market_region,
+        "underlying_type": underlying_type,
+        # Regional holiday calendars are not guessed. Weekend closure is
+        # certain; weekday holiday dislocation is caught by the basis guard.
+        "calendar_precision": "weekday_session_only",
+        "local_date": local_date.isoformat(),
+    }
+
+
+def tradfi_primary_session_status(underlying_type=None, now=None):
+    """Return a session clock matched to Binance TradFi market metadata."""
+
+    kind = str(underlying_type or "EQUITY").strip().upper() or "EQUITY"
+    if kind == "KR_EQUITY":
+        return _regional_equity_session_status(
+            now,
+            timezone_name="Asia/Seoul",
+            sessions=(((9, 0), (15, 30)),),
+            market_region="KR",
+            underlying_type=kind,
+        )
+    if kind == "HK_EQUITY":
+        return _regional_equity_session_status(
+            now,
+            timezone_name="Asia/Hong_Kong",
+            sessions=(((9, 30), (12, 0)), ((13, 0), (16, 0))),
+            market_region="HK",
+            underlying_type=kind,
+        )
+    if kind == "CN_EQUITY":
+        return _regional_equity_session_status(
+            now,
+            timezone_name="Asia/Shanghai",
+            sessions=(((9, 30), (11, 30)), ((13, 0), (15, 0))),
+            market_region="CN",
+            underlying_type=kind,
+        )
+    status = us_equity_regular_session_status(now)
+    status.update({
+        "market_region": "US",
+        "underlying_type": kind,
+        "calendar_precision": "holiday_aware",
+    })
+    return status
+
 __all__ = (
     'US_EQUITY_MARKET_TZ',
     'US_EQUITY_REGULAR_OPEN',
@@ -156,4 +252,5 @@ __all__ = (
     '_us_equity_market_early_close_dates',
     'us_equity_regular_session_status',
     'is_us_equity_regular_session_open',
+    'tradfi_primary_session_status',
 )

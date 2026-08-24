@@ -103,6 +103,51 @@ def test_pattern_or_entry_requires_regular_session_but_base_entry_does_not():
     assert pattern_only.allowed is False
     assert retained.allowed is True
     assert retained.metrics["tradfi_entry_mode"] == "base_adaptive_trend"
+    # Only the independently measured higher-timeframe alignment adds one
+    # point; off-session chart/candle formations add no bonus.
+    assert retained.score == 73.0
+    assert retained.metrics["tradfi_pattern_evidence_trusted"] is False
+
+
+def test_broad_benchmark_is_corroborating_not_a_hard_veto():
+    decision = evaluate_tradfi_pattern_profile(
+        _trend_rows(breakout=True),
+        _soft_long_wait(),
+        symbol="SNDK/USDT:USDT",
+        higher_timeframe_rows=_trend_rows(100, 0.25),
+        daily_rows=_trend_rows(100, 0.35),
+        benchmark_directions={"SPY": "short", "QQQ": "short"},
+        session_status={
+            "open": True,
+            "reason": "regular_session_open",
+            "timezone": "America/New_York",
+        },
+    )
+
+    assert decision.allowed is True
+    assert decision.metrics["tradfi_benchmark_conflict"] is True
+    assert decision.metrics["tradfi_benchmark_corroborating_only"] is True
+
+
+def test_volume_confirmation_uses_same_time_of_day_baseline():
+    rows = _trend_rows(count=120, breakout=True)
+    decision = evaluate_tradfi_pattern_profile(
+        rows,
+        _soft_long_wait(),
+        symbol="SNDK/USDT:USDT",
+        higher_timeframe_rows=_trend_rows(100, 0.25),
+        daily_rows=_trend_rows(100, 0.35),
+        session_status={
+            "open": True,
+            "reason": "regular_session_open",
+            "timezone": "America/New_York",
+        },
+    )
+
+    assert decision.metrics["tradfi_volume_baseline_method"] == (
+        "same_session_time_bucket"
+    )
+    assert decision.metrics["tradfi_volume_baseline_samples"] >= 3
 
 
 def test_tradfi_profile_never_exceeds_exchange_ten_x_cap():

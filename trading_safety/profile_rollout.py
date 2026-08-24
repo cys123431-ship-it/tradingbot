@@ -8,7 +8,7 @@ from typing import Any
 from .binance_algo_gateway import normalize_futures_market_id
 
 
-TRADFI_PROFILE_ROLLOUT_VERSION = "tradfi_pattern_profile_v1"
+TRADFI_PROFILE_ROLLOUT_VERSION = "tradfi_pattern_profile_v2_session_anchor"
 TRADFI_PROFILE_ROLLOUT_STATE_KEY = "tradfi_pattern_profile_rollout"
 
 
