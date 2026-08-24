@@ -6241,6 +6241,151 @@ def test_utbreakout_trailing_replaces_sl_and_keeps_partial_tp_order():
     assert engine.last_protection_order_status["BTC/USDT"]["sl_count"] == 1
 
 
+def test_small_account_mark_roe_step_replaces_stop_before_bar_close():
+    pos = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": "1",
+        "entryPrice": "100",
+        "markPrice": "101",
+    }
+    engine = _protection_engine(
+        [
+            {
+                "id": "sl-old",
+                "side": "sell",
+                "type": "market",
+                "clientOrderId": "utbslBTCUSDTold",
+                "info": {
+                    "origType": "STOP_MARKET",
+                    "stopPrice": "90",
+                    "reduceOnly": "true",
+                    "symbol": "BTCUSDT",
+                },
+            },
+        ],
+        positions=[pos],
+    )
+    engine.utbreakout_trailing_states = {
+        "BTC/USDT": {
+            "side": "long",
+            "entry_price": 100.0,
+            "leverage": 7,
+            "initial_qty": 1.0,
+            "remaining_ratio": 1.0,
+            "risk_distance": 10.0,
+            "entry_atr": 0.4,
+            "activation_r": 2.0,
+            "atr_trailing_enabled": False,
+            "tp1_breakeven_enabled": False,
+            "small_account_aggressive_active": True,
+            "small_account_roe_profit_lock_enabled": True,
+            "small_account_roe_profit_lock_first_trigger_percent": 5.0,
+            "small_account_roe_profit_lock_second_trigger_percent": 10.0,
+            "small_account_roe_profit_lock_step_percent": 10.0,
+            "small_account_roe_profit_lock_atr_multiplier": 0.5,
+            "small_account_roe_profit_lock_min_gap_percent": 1.0,
+            "small_account_roe_profit_lock_max_gap_percent": 3.0,
+            "small_account_roe_profit_lock_min_floor_percent": 1.0,
+            "last_stop_price": 90.0,
+            "initial_stop_price": 90.0,
+            "active": False,
+        }
+    }
+    df = pd.DataFrame(
+        [
+            {
+                "open": 100.0,
+                "high": 100.2,
+                "low": 99.8,
+                "close": 100.0,
+            }
+            for _ in range(25)
+        ]
+    )
+
+    state = asyncio.run(
+        engine._manage_utbreakout_partial_trailing(
+            "BTC/USDT",
+            pos,
+            df,
+            {
+                "atr_length": 14,
+                "atr_trailing_enabled": False,
+                "tp1_breakeven_enabled": False,
+            },
+        )
+    )
+
+    assert state["small_account_roe_profit_lock_peak_percent"] == pytest.approx(7.0)
+    assert state["small_account_roe_profit_lock_stage"] == 1
+    assert state["small_account_roe_profit_lock_floor_percent"] == pytest.approx(3.6)
+    assert state["last_stop_price"] == pytest.approx(100.0 * (1.0 + 3.6 / 700.0))
+    assert state["runner_mode"] == "small_account_roe_lock_stage_1"
+    assert ("sl-old", "BTC/USDT") in engine.exchange.cancelled
+
+
+def test_small_account_mark_roe_floor_closes_if_price_gaps_through_exchange_stop():
+    pos = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": "1",
+        "entryPrice": "100",
+        "markPrice": "100.4",
+    }
+    engine = _protection_engine([], positions=[pos])
+    engine.utbreakout_trailing_states = {
+        "BTC/USDT": {
+            "side": "long",
+            "entry_price": 100.0,
+            "leverage": 7,
+            "initial_qty": 1.0,
+            "remaining_ratio": 1.0,
+            "risk_distance": 10.0,
+            "entry_atr": 0.4,
+            "atr_trailing_enabled": False,
+            "tp1_breakeven_enabled": False,
+            "small_account_aggressive_active": True,
+            "small_account_roe_profit_lock_enabled": True,
+            "small_account_roe_profit_lock_peak_percent": 7.0,
+            "last_stop_price": 100.0 * (1.0 + 3.6 / 700.0),
+            "initial_stop_price": 90.0,
+            "active": True,
+        }
+    }
+    captured = {}
+
+    async def close_position(symbol, current_pos, *, reason, cfg):
+        captured["symbol"] = symbol
+        captured["reason"] = reason
+        return {
+            "_flat_confirmed": True,
+            "_cleanup_confirmed": True,
+            "_accounting": {"exit_price": 100.4},
+        }
+
+    def clear_state(symbol, **kwargs):
+        captured["cleared"] = (symbol, kwargs)
+
+    engine._close_position_reduce_only_market = close_position
+    engine._clear_utbreakout_trailing_state = clear_state
+
+    result = asyncio.run(
+        engine._manage_utbreakout_partial_trailing(
+            "BTC/USDT",
+            pos,
+            pd.DataFrame(),
+            {"atr_trailing_enabled": False, "tp1_breakeven_enabled": False},
+        )
+    )
+
+    assert result["status"] == "EXITED"
+    assert result["reason"] == "SMALL_ACCOUNT_ROE_PROFIT_FLOOR"
+    assert captured["symbol"] == "BTC/USDT"
+    assert "floor=3.60%" in captured["reason"]
+    assert captured["cleared"][1]["finalize"] is True
+
+
 def test_utbreakout_tp1_breakeven_replaces_sl_even_when_runner_is_off():
     pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "1", "entryPrice": "100"}
     engine = _protection_engine(

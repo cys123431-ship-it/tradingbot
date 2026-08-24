@@ -6,7 +6,7 @@ survives trading costs.  It never places orders or mutates runtime state.
 """
 
 from dataclasses import dataclass, replace
-from math import isfinite, sqrt
+from math import floor, isfinite, sqrt
 
 
 EV_ADAPTIVE_PROFILE_VERSION = "ev_adaptive_v3_profit_engine"
@@ -76,6 +76,16 @@ class MfeProfitLockDecision:
     active: bool
     stage: int
     lock_r: float
+    reason: str
+
+
+@dataclass(frozen=True)
+class SmallAccountRoeProfitLockDecision:
+    active: bool
+    stage: int
+    trigger_roe_percent: float
+    lock_roe_percent: float
+    giveback_roe_percent: float
     reason: str
 
 
@@ -1185,6 +1195,100 @@ def evaluate_mfe_profit_lock(*, mfe_r, mode="TREND", config=None):
         round(active_lock, 6),
         f"MFE {progress:.2f}R locks {active_lock:.2f}R at stage {active_stage} "
         f"(trigger {active_trigger:.2f}R)",
+    )
+
+
+def evaluate_small_account_roe_profit_lock(
+    *,
+    peak_roe_percent,
+    leverage,
+    atr_percent,
+    config=None,
+):
+    """Return an ATR-aware step floor for a sub-$1,000 trend position.
+
+    Thresholds use return on initial margin (ROE), matching the leveraged
+    percentage shown by futures venues. A literal one percentage-point
+    giveback is smaller than ordinary price noise at 4-7x, so half an ATR is
+    used and bounded to 1-3 ROE percentage points.
+    """
+
+    cfg = dict(config or {})
+    if not bool(cfg.get("small_account_roe_profit_lock_enabled", True)):
+        return SmallAccountRoeProfitLockDecision(
+            False, 0, 0.0, 0.0, 0.0, "small-account ROE profit lock disabled"
+        )
+    peak = max(0.0, _finite(peak_roe_percent, 0.0))
+    first_trigger = max(
+        0.1,
+        _finite(
+            cfg.get("small_account_roe_profit_lock_first_trigger_percent"),
+            5.0,
+        ),
+    )
+    second_trigger = max(
+        first_trigger,
+        _finite(
+            cfg.get("small_account_roe_profit_lock_second_trigger_percent"),
+            10.0,
+        ),
+    )
+    later_step = max(
+        0.1,
+        _finite(cfg.get("small_account_roe_profit_lock_step_percent"), 10.0),
+    )
+    if peak + 1e-12 < first_trigger:
+        return SmallAccountRoeProfitLockDecision(
+            False,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            f"peak ROE {peak:.2f}% < first trigger {first_trigger:.2f}%",
+        )
+
+    if peak + 1e-12 < second_trigger:
+        stage = 1
+        trigger = first_trigger
+    else:
+        completed_steps = int(
+            floor((peak - second_trigger) / later_step + 1e-12)
+        )
+        stage = 2 + completed_steps
+        trigger = second_trigger + completed_steps * later_step
+
+    lev = max(1.0, _finite(leverage, 1.0))
+    atr = max(0.0, _finite(atr_percent, 0.0))
+    atr_multiplier = max(
+        0.0,
+        _finite(cfg.get("small_account_roe_profit_lock_atr_multiplier"), 0.50),
+    )
+    minimum_gap = max(
+        0.1,
+        _finite(cfg.get("small_account_roe_profit_lock_min_gap_percent"), 1.0),
+    )
+    maximum_gap = max(
+        minimum_gap,
+        _finite(cfg.get("small_account_roe_profit_lock_max_gap_percent"), 3.0),
+    )
+    raw_gap = atr * lev * atr_multiplier if atr > 0.0 else minimum_gap
+    giveback = max(minimum_gap, min(maximum_gap, raw_gap))
+    minimum_lock = max(
+        0.0,
+        _finite(cfg.get("small_account_roe_profit_lock_min_floor_percent"), 1.0),
+    )
+    lock = max(minimum_lock, trigger - giveback)
+    lock = min(lock, max(0.0, trigger - 0.01))
+    return SmallAccountRoeProfitLockDecision(
+        True,
+        stage,
+        round(trigger, 6),
+        round(lock, 6),
+        round(giveback, 6),
+        (
+            f"peak ROE {peak:.2f}% >= {trigger:.2f}%; "
+            f"lock {lock:.2f}% with {giveback:.2f}%p ATR-aware giveback"
+        ),
     )
 
 

@@ -590,7 +590,11 @@ class SignalExitMixin:
         tp1_breakeven_enabled = bool(state.get('tp1_breakeven_enabled', cfg.get('tp1_breakeven_enabled', False)))
         soft_stop_enabled = bool(state.get('soft_stop_enabled', cfg.get('soft_stop_enabled', False)))
         near_miss_tp_enabled = bool(state.get('near_miss_tp_enabled', cfg.get('near_miss_tp_enabled', False)))
-        if not atr_trailing_enabled and not tp1_breakeven_enabled and not soft_stop_enabled and not near_miss_tp_enabled:
+        small_account_roe_lock_enabled = bool(
+            state.get('small_account_aggressive_active', False)
+            and state.get('small_account_roe_profit_lock_enabled', False)
+        )
+        if not atr_trailing_enabled and not tp1_breakeven_enabled and not soft_stop_enabled and not near_miss_tp_enabled and not small_account_roe_lock_enabled:
             return None
         side = str(pos.get('side', '') or '').lower()
         if side != str(state.get('side', '')).lower():
@@ -608,6 +612,154 @@ class SignalExitMixin:
         if current_qty <= 0 or entry_price <= 0 or initial_qty <= 0 or risk_distance <= 0:
             self._clear_utbreakout_trailing_state(symbol)
             return None
+
+        # The mark-ROE staircase must not wait for the first completed candle
+        # after entry. Use the entry ATR persisted in the plan (or the most
+        # recent live ATR) to arm and place the exchange stop immediately.
+        if small_account_roe_lock_enabled:
+            position_info = pos.get('info') if isinstance(pos.get('info'), dict) else {}
+            early_mark = (
+                _safe_float_or_none(pos.get('markPrice'))
+                or _safe_float_or_none(position_info.get('markPrice'))
+                or _safe_float_or_none(pos.get('lastPrice'))
+                or _safe_float_or_none(position_info.get('lastPrice'))
+            )
+            if early_mark is not None and early_mark > 0:
+                leverage = max(
+                    1,
+                    int(
+                        float(
+                            pos.get('leverage')
+                            or position_info.get('leverage')
+                            or state.get('leverage', 1)
+                            or 1
+                        )
+                    ),
+                )
+                current_roe = (
+                    (early_mark - entry_price) / entry_price * leverage * 100.0
+                    if side == 'long'
+                    else (entry_price - early_mark) / entry_price * leverage * 100.0
+                )
+                peak_roe = max(
+                    float(state.get('small_account_roe_profit_lock_peak_percent', 0.0) or 0.0),
+                    float(current_roe),
+                )
+                early_atr = (
+                    _safe_float_or_none(state.get('last_atr'))
+                    or _safe_float_or_none(state.get('entry_atr'))
+                    or 0.0
+                )
+                lock_cfg = dict(cfg or {})
+                for key in (
+                    'small_account_roe_profit_lock_enabled',
+                    'small_account_roe_profit_lock_first_trigger_percent',
+                    'small_account_roe_profit_lock_second_trigger_percent',
+                    'small_account_roe_profit_lock_step_percent',
+                    'small_account_roe_profit_lock_atr_multiplier',
+                    'small_account_roe_profit_lock_min_gap_percent',
+                    'small_account_roe_profit_lock_max_gap_percent',
+                    'small_account_roe_profit_lock_min_floor_percent',
+                ):
+                    if state.get(key) is not None:
+                        lock_cfg[key] = state.get(key)
+                early_lock = evaluate_small_account_roe_profit_lock(
+                    peak_roe_percent=peak_roe,
+                    leverage=leverage,
+                    atr_percent=early_atr / entry_price * 100.0,
+                    config=lock_cfg,
+                )
+                state.update({
+                    'small_account_roe_profit_lock_peak_percent': float(peak_roe),
+                    'small_account_roe_profit_lock_current_percent': float(current_roe),
+                    'small_account_roe_profit_lock_stage': int(early_lock.stage),
+                    'small_account_roe_profit_lock_floor_percent': float(early_lock.lock_roe_percent),
+                    'small_account_roe_profit_lock_gap_percent': float(early_lock.giveback_roe_percent),
+                    'small_account_roe_profit_lock_reason': early_lock.reason,
+                })
+                self._set_utbreakout_trailing_state(symbol, state)
+                if early_lock.active:
+                    price_return = early_lock.lock_roe_percent / (leverage * 100.0)
+                    early_stop = (
+                        entry_price * (1.0 + price_return)
+                        if side == 'long'
+                        else entry_price * (1.0 - price_return)
+                    )
+                    floor_breached = (
+                        early_mark <= early_stop
+                        if side == 'long'
+                        else early_mark >= early_stop
+                    )
+                    if floor_breached:
+                        reason = (
+                            f"Small-account ROE profit floor breached: current={current_roe:.2f}% "
+                            f"floor={early_lock.lock_roe_percent:.2f}% peak={peak_roe:.2f}%"
+                        )
+                        close_result = await self._close_position_reduce_only_market(
+                            symbol,
+                            pos,
+                            reason=reason,
+                            cfg=cfg,
+                        )
+                        if (
+                            bool((close_result or {}).get('_flat_confirmed'))
+                            and bool((close_result or {}).get('_cleanup_confirmed'))
+                        ):
+                            self._clear_utbreakout_trailing_state(
+                                symbol,
+                                finalize=True,
+                                reason=reason,
+                                exit_price=((close_result or {}).get('_accounting') or {}).get('exit_price'),
+                            )
+                            return {
+                                'status': 'EXITED',
+                                'reason': 'SMALL_ACCOUNT_ROE_PROFIT_FLOOR',
+                                'detail': reason,
+                            }
+                        return {
+                            'status': 'EXIT_PENDING',
+                            'reason': 'SMALL_ACCOUNT_ROE_PROFIT_FLOOR',
+                            'detail': reason,
+                            'order': close_result,
+                        }
+                    last_stop = float(state.get('last_stop_price') or 0.0)
+                    tighter = (
+                        early_stop > last_stop
+                        if side == 'long'
+                        else last_stop <= 0 or early_stop < last_stop
+                    )
+                    valid = early_stop < early_mark if side == 'long' else early_stop > early_mark
+                    min_improve = max(abs(early_mark) * 0.0002, early_atr * 0.05)
+                    improved = (
+                        early_stop > last_stop + min_improve
+                        if side == 'long'
+                        else last_stop <= 0 or early_stop < last_stop - min_improve
+                    )
+                    if tighter and valid and improved:
+                        replacement_order = await self._replace_stop_loss_order(
+                            symbol,
+                            pos,
+                            early_stop,
+                            reason='Small-account mark ROE profit lock update',
+                        )
+                        if replacement_order:
+                            state.update({
+                                'active': True,
+                                'last_stop_price': float(early_stop),
+                                'last_close': float(early_mark),
+                                'runner_mode': f'small_account_roe_lock_stage_{early_lock.stage}',
+                                'runner_multiplier': None,
+                                'runner_updates': int(state.get('runner_updates') or 0) + 1,
+                                'last_update_ts': datetime.now(timezone.utc).isoformat(),
+                            })
+                            self._set_utbreakout_trailing_state(symbol, state)
+                            await self.ctrl.notify(
+                                f"🔒 소액계좌 수익보호 SL: {self.ctrl.format_symbol_for_display(symbol)} "
+                                f"{side.upper()} ROE 최고 `{peak_roe:.2f}%` → "
+                                f"SL 수익 `{early_lock.lock_roe_percent:.2f}%` "
+                                f"(`{float(early_stop):.4f}`)"
+                            )
+                            return state
 
         if state.get('planned_tp_orders') or state.get('tp_orders'):
             # Record quantity reductions as filled TP legs before auditing.
@@ -667,6 +819,13 @@ class SignalExitMixin:
         atr_value = float(atr_series.iloc[-1]) if self._is_valid_number(atr_series.iloc[-1]) else 0.0
         if atr_value <= 0:
             return None
+        position_info = pos.get('info') if isinstance(pos.get('info'), dict) else {}
+        current_mark = (
+            _safe_float_or_none(pos.get('markPrice'))
+            or _safe_float_or_none(position_info.get('markPrice'))
+            or _safe_float_or_none(pos.get('lastPrice'))
+            or _safe_float_or_none(position_info.get('lastPrice'))
+        )
         current_high = float(metric_closed.iloc[-1]['high'])
         current_low = float(metric_closed.iloc[-1]['low'])
         highest_price = max(
@@ -1206,7 +1365,11 @@ class SignalExitMixin:
                     return state
         if not atr_trailing_enabled:
             return None
-        active = bool(state.get('active')) or favorable_move >= activation_r * risk_distance or partial_qty_seen
+        active = (
+            bool(state.get('active'))
+            or favorable_move >= activation_r * risk_distance
+            or partial_qty_seen
+        )
         if not active:
             return None
 
@@ -1308,12 +1471,13 @@ class SignalExitMixin:
 
         last_stop = float(state.get('last_stop_price') or 0.0)
         new_stop = max(last_stop, raw_trail) if side == 'long' else (min(last_stop, raw_trail) if last_stop > 0 else raw_trail)
-        if side == 'long' and new_stop >= current_close:
+        stop_reference_price = current_mark or current_close
+        if side == 'long' and new_stop >= stop_reference_price:
             return None
-        if side == 'short' and new_stop <= current_close:
+        if side == 'short' and new_stop <= stop_reference_price:
             return None
 
-        min_improve = max(abs(current_close) * 0.0002, atr_value * 0.05)
+        min_improve = max(abs(stop_reference_price) * 0.0002, atr_value * 0.05)
         improved = (
             new_stop > last_stop + min_improve
             if side == 'long'

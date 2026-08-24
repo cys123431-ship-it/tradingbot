@@ -196,6 +196,10 @@ def test_change_point_flow_audit_fields_survive_entry_plan_persistence():
         "trend_event_candidate_source": "event_only",
         "trend_event_candidate_agreement": "event_only",
         "trend_event_candidate_score": 87.5,
+        "independent_event_context_fast_ema_distance_atr": 0.8,
+        "independent_event_context_max_fast_ema_distance_atr": 1.5,
+        "independent_event_risk_tier_cap": "base",
+        "independent_event_risk_tier_capped": True,
         "temporary_debug_value": "drop-me",
     })
 
@@ -207,6 +211,9 @@ def test_change_point_flow_audit_fields_survive_entry_plan_persistence():
     assert summary["trend_event_candidate_score"] == pytest.approx(87.5)
     assert summary["change_point_flow_orderflow_age_seconds"] == pytest.approx(12.5)
     assert summary["change_point_flow_orderflow_stale"] is False
+    assert summary["independent_event_context_fast_ema_distance_atr"] == pytest.approx(0.8)
+    assert summary["independent_event_risk_tier_cap"] == "base"
+    assert summary["independent_event_risk_tier_capped"] is True
     assert "temporary_debug_value" not in summary
 
 
@@ -256,7 +263,7 @@ def test_candidate_resolver_keeps_trend_and_event_as_or_paths():
     assert aligned["score"] > max(72.0, 80.0)
 
 
-def test_candidate_resolver_waits_on_close_conflict_and_accepts_clear_winner():
+def test_candidate_resolver_waits_when_event_opposes_actionable_trend():
     waiting = resolve_trend_event_candidate(
         {"allowed": True, "side": "long", "score": 76.0},
         {"allowed": True, "side": "short", "score": 70.0},
@@ -270,6 +277,19 @@ def test_candidate_resolver_waits_on_close_conflict_and_accepts_clear_winner():
 
     assert waiting["allowed"] is False
     assert waiting["source"] == "conflict_wait"
+    assert event_winner["allowed"] is False
+    assert event_winner["side"] is None
+    assert event_winner["source"] == "conflict_wait"
+
+
+def test_candidate_resolver_requires_explicit_opt_in_for_event_conflict_override():
+    event_winner = resolve_trend_event_candidate(
+        {"allowed": True, "side": "long", "score": 65.0},
+        {"allowed": True, "side": "short", "score": 82.0},
+        conflict_margin=12.0,
+        allow_event_conflict_override=True,
+    )
+
     assert event_winner["allowed"] is True
     assert event_winner["side"] == "short"
     assert event_winner["source"] == "event_conflict_winner"

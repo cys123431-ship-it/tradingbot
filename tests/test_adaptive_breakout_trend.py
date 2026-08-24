@@ -14,8 +14,10 @@ from utbreakout.adaptive_breakout_trend import (
     _normalized_momentum_horizons,
     default_adaptive_breakout_trend_config,
     evaluate_adaptive_breakout_trend,
+    evaluate_independent_event_context,
     evaluate_small_account_entry_refinement,
     normalize_adaptive_breakout_trend_config,
+    resolve_independent_event_allocation,
 )
 from bot_runtime.signal_alpha import (
     SignalAlphaMixin,
@@ -39,6 +41,60 @@ CALM_L2 = {
     "state": "calm",
     "direction_support": "",
 }
+
+
+def _event_context_metrics(*, price=100.0, fast_ema=100.0, momentum=0.5):
+    side = "long" if momentum > 0 else "short"
+    return {
+        "reference_price": price,
+        "fast_ema": fast_ema,
+        "atr": 1.0,
+        "weighted_momentum": momentum,
+        "horizon_votes": {24: side, 72: side, 168: side},
+        "latest_range_atr": 1.2,
+        "volatility_ratio": 1.1,
+    }
+
+
+def test_independent_event_context_rejects_existing_htf_extension():
+    result = evaluate_independent_event_context(
+        "long",
+        _event_context_metrics(price=102.3, fast_ema=100.0),
+    )
+
+    assert result["allowed"] is False
+    assert result["code"] == "REJECTED_INDEPENDENT_EVENT_HTF_EXTENSION"
+    assert result["fast_ema_distance_atr"] == pytest.approx(2.3)
+
+
+def test_independent_event_context_keeps_fresh_early_reversal_path():
+    metrics = _event_context_metrics(price=99.2, fast_ema=100.0)
+    metrics.update({"ema_aligned": False, "turning_conflict": True})
+
+    result = evaluate_independent_event_context("long", metrics)
+
+    assert result["allowed"] is True
+    assert result["fast_ema_distance_atr"] == pytest.approx(-0.8)
+
+
+def test_independent_event_context_rejects_opposite_multi_horizon_direction():
+    result = evaluate_independent_event_context(
+        "long",
+        _event_context_metrics(momentum=-0.5),
+    )
+
+    assert result["allowed"] is False
+    assert result["code"] == "REJECTED_INDEPENDENT_EVENT_BROAD_TREND_CONFLICT"
+
+
+def test_event_only_allocation_starts_at_base_and_preserves_winner_scaling():
+    allocation = resolve_independent_event_allocation("elite")
+    cfg = default_adaptive_breakout_trend_config()
+
+    assert allocation["applied_risk_tier"] == "base"
+    assert allocation["risk_tier_capped"] is True
+    assert allocation["initial_margin_fraction"] == pytest.approx(0.65)
+    assert cfg["pyramid_target_fractions"] == (0.80, 0.90, 1.00)
 
 
 def test_tradfi_relative_rank_can_upgrade_but_never_downgrade_absolute_trend():
@@ -702,6 +758,11 @@ def test_persisted_conservative_profile_migrates_to_small_account_aggressive_v3(
     assert migrated["small_account_strong_max_loss_percent"] == pytest.approx(30.0)
     assert migrated["small_account_elite_max_loss_percent"] == pytest.approx(35.0)
     assert migrated["small_account_daily_loss_limit_percent"] == pytest.approx(0.0)
+    assert migrated["small_account_min_leverage"] == 4
+    assert migrated["small_account_strong_leverage"] == 6
+    assert migrated["small_account_elite_leverage"] == 7
+    assert migrated["small_account_leverage_steps"] == (4, 5, 6, 7)
+    assert migrated["small_account_roe_profit_lock_enabled"] is True
     assert migrated["small_account_entry_refinement_enabled"] is True
     assert migrated["small_account_min_fast_momentum_retention"] == pytest.approx(0.55)
     assert migrated[
@@ -763,6 +824,28 @@ def test_v8_profile_upgrade_preserves_live_position_risk_and_exit_policy():
     assert migrated["runner_pct"] == pytest.approx(0.79)
     assert migrated["atr_trailing_multiplier"] == pytest.approx(3.15)
     assert migrated["change_point_flow"]["enabled"] is True
+
+
+def test_v9_profile_upgrade_migrates_only_requested_small_account_leverage_policy():
+    migrated = normalize_adaptive_breakout_trend_config(
+        {
+            "profile_version": "adaptive_trend_portfolio_v9_independent_event",
+            "base_risk_percent": 6.0,
+            "base_risk_percent_max": 6.5,
+            "runner_pct": 0.80,
+            "small_account_min_leverage": 5,
+            "small_account_strong_leverage": 8,
+            "small_account_elite_leverage": 15,
+            "small_account_leverage_steps": (5, 8, 10, 15),
+        }
+    )
+
+    assert migrated["base_risk_percent"] == pytest.approx(6.0)
+    assert migrated["runner_pct"] == pytest.approx(0.80)
+    assert migrated["small_account_min_leverage"] == 4
+    assert migrated["small_account_strong_leverage"] == 6
+    assert migrated["small_account_elite_leverage"] == 7
+    assert migrated["small_account_leverage_steps"] == (4, 5, 6, 7)
 
 
 def test_small_account_refinement_rejects_slow_only_continuation_decay():

@@ -421,7 +421,7 @@ def resolve_adaptive_trend_small_account_profile(
             source.get("small_account_min_leverage"),
             1.0,
             20.0,
-            5.0,
+            4.0,
         )
     )
     strong_leverage = int(
@@ -429,7 +429,7 @@ def resolve_adaptive_trend_small_account_profile(
             source.get("small_account_strong_leverage"),
             float(minimum_leverage),
             20.0,
-            8.0,
+            6.0,
         )
     )
     elite_leverage = int(
@@ -437,7 +437,7 @@ def resolve_adaptive_trend_small_account_profile(
             source.get("small_account_elite_leverage"),
             float(strong_leverage),
             20.0,
-            15.0,
+            7.0,
         )
     )
     desired_by_tier = {
@@ -445,10 +445,10 @@ def resolve_adaptive_trend_small_account_profile(
         "strong": strong_leverage,
         "elite": elite_leverage,
     }
-    desired_leverage = max(
-        desired_by_tier[risk_tier],
-        int(max(1.0, float(_finite(selected_leverage, minimum_leverage)))),
-    )
+    # The dedicated small-account tier is the source of truth. Reusing the
+    # regular selector's 5/8/10/15x answer here would let a nominal base setup
+    # escape the requested 4x base and silently reintroduce the old ladder.
+    desired_leverage = desired_by_tier[risk_tier]
     desired_leverage = min(
         desired_leverage,
         int(cfg["adaptive_trend_max_leverage"]),
@@ -490,7 +490,7 @@ def resolve_adaptive_trend_small_account_profile(
     try:
         leverage_steps = {
             int(float(value))
-            for value in source.get("small_account_leverage_steps", (5, 8, 10, 15))
+            for value in source.get("small_account_leverage_steps", (4, 5, 6, 7))
             if minimum_leverage <= int(float(value)) <= elite_leverage
         }
     except (TypeError, ValueError):
@@ -1200,7 +1200,7 @@ def apply_dynamic_leverage_to_plan(
                 aggressive_trend_policy.get("equity_threshold_usdt", 1_000.0)
             ),
             "small_account_min_leverage": int(
-                aggressive_trend_policy.get("minimum_leverage", 5)
+                aggressive_trend_policy.get("minimum_leverage", 4)
             ),
             "small_account_target_margin_usdt": float(
                 aggressive_trend_policy.get("margin_budget_usdt", 0.0)

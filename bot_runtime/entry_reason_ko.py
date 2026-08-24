@@ -105,6 +105,14 @@ def explain_entry_reason_ko(reason=None, *, code=None, data=None):
         return "최근 가격 체제 전환이나 지속적인 주문 흐름 우위가 아직 뚜렷하지 않습니다."
     if "CHANGE_POINT_FLOW_SIDE" in uppered:
         return "체제 전환·주문 흐름 평가에 필요한 진입 방향이 확정되지 않았습니다."
+    if "INDEPENDENT_EVENT_HTF_EXTENSION" in uppered:
+        return "빠른 이벤트 신호는 생겼지만 1시간 평균선에서 이미 너무 멀어 추격 진입하지 않습니다."
+    if "INDEPENDENT_EVENT_BROAD_TREND_CONFLICT" in uppered:
+        return "빠른 이벤트 방향이 중기·장기 추세 방향과 반대라 신규 진입을 기다립니다."
+    if "INDEPENDENT_EVENT_EXTREME_RANGE" in uppered:
+        return "빠른 이벤트 발생 전후의 1시간 봉 변동폭이 과도해 진입하지 않습니다."
+    if "INDEPENDENT_EVENT_VOLATILITY_SHOCK" in uppered:
+        return "빠른 이벤트와 함께 변동성 충격이 발생해 가격이 안정될 때까지 기다립니다."
     if "TREND_EVENT_CANDIDATE" in uppered or "INDEPENDENT_DIRECTION_AMBIGUOUS" in uppered:
         return "기존 추세와 새 체제·주문 흐름 후보가 충돌하거나 어느 방향도 충분히 강하지 않습니다."
     if "REGION_RESTRICTED" in uppered or "RESTRICTED_SYMBOL" in uppered:

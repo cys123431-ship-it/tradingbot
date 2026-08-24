@@ -12,8 +12,10 @@ from utbreakout.adaptive_breakout_trend import (
     ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION,
     AdaptiveBreakoutTrendDecision,
     evaluate_adaptive_breakout_trend,
+    evaluate_independent_event_context,
     evaluate_small_account_entry_refinement,
     normalize_adaptive_breakout_trend_config,
+    resolve_independent_event_allocation,
 )
 from utbreakout.change_point_flow import (
     evaluate_change_point_flow_entry,
@@ -1342,6 +1344,12 @@ class SignalAlphaMixin:
             trend_candidate,
             event_candidate,
             conflict_margin=conflict_margin,
+            allow_event_conflict_override=bool(
+                (trend_cfg.get('change_point_flow') or {}).get(
+                    'allow_event_conflict_override',
+                    False,
+                )
+            ),
         )
         status.update({
             'small_account_aggressive_candidate': small_account_aggressive_candidate,
@@ -1372,6 +1380,25 @@ class SignalAlphaMixin:
         candidate_source = str(
             candidate_resolution.get('source') or 'trend_only'
         )
+        event_context = {
+            'allowed': True,
+            'code': 'INDEPENDENT_EVENT_CONTEXT_NOT_APPLICABLE',
+            'reason': 'independent event context not applicable',
+        }
+        if candidate_source in {'event_only', 'event_conflict_winner'}:
+            event_context = evaluate_independent_event_context(
+                candidate_side,
+                getattr(preliminary, 'metrics', None),
+                config=trend_cfg,
+            )
+            status['independent_event_context'] = dict(event_context)
+            if not bool(event_context.get('allowed')):
+                return _finish(
+                    None,
+                    f"Independent event waiting: {event_context.get('reason')}",
+                    event_context.get('code')
+                    or 'REJECTED_INDEPENDENT_EVENT_CONTEXT',
+                )
         if candidate_source in {'event_only', 'event_conflict_winner'}:
             decision = self._adaptive_trend_event_decision(event_candidate)
             decision_entry_timeframe = event_timeframe
@@ -1594,6 +1621,15 @@ class SignalAlphaMixin:
                 trend_cfg.get('stop_atr_multiplier', 2.00) or 2.00
             ),
         }
+        event_allocation = {
+            'requested_risk_tier': effective_risk_tier,
+            'risk_tier_cap': effective_risk_tier,
+            'applied_risk_tier': effective_risk_tier,
+            'risk_tier_capped': False,
+            'initial_margin_fraction': change_point_flow.get(
+                'initial_margin_fraction'
+            ),
+        }
         if small_account_aggressive_candidate:
             event_evaluations = (
                 event_candidate.get('evaluations')
@@ -1636,9 +1672,14 @@ class SignalAlphaMixin:
                     or 'REJECTED_CHANGE_POINT_FLOW',
                 )
 
+            refinement_metrics = metrics
+            if candidate_source in {'event_only', 'event_conflict_winner'}:
+                preliminary_metrics = getattr(preliminary, 'metrics', None)
+                if isinstance(preliminary_metrics, dict) and preliminary_metrics:
+                    refinement_metrics = preliminary_metrics
             small_account_entry_refinement = evaluate_small_account_entry_refinement(
                 side,
-                metrics,
+                refinement_metrics,
                 entry_chase_atr=chase_atr,
                 selector_candidate=selector_candidate,
                 config=trend_cfg,
@@ -1651,24 +1692,13 @@ class SignalAlphaMixin:
                     'REJECTED_SMALL_ACCOUNT_FAST_TREND_DECAY',
                     'REJECTED_SMALL_ACCOUNT_WEAK_MATURE_CONTINUATION',
                 }
-                event_driven_entry = candidate_source in {
-                    'event_only',
-                    'event_conflict_winner',
-                }
-                if event_driven_entry:
-                    soft_veto_codes.add(
-                        'REJECTED_SMALL_ACCOUNT_LOWER_TIMEFRAME_CONFLICT'
-                    )
                 refinement_code = str(
                     small_account_entry_refinement.get('code') or ''
                 )
                 if (
                     refinement_code in soft_veto_codes
-                    and (
-                        event_driven_entry
-                        or bool(
-                            change_point_flow.get('override_soft_mature_veto')
-                        )
+                    and bool(
+                        change_point_flow.get('override_soft_mature_veto')
                     )
                 ):
                     small_account_entry_refinement.update({
@@ -1702,6 +1732,22 @@ class SignalAlphaMixin:
                 > _ADAPTIVE_RISK_TIER_ORDER[effective_risk_tier]
             ):
                 effective_risk_tier = flow_risk_tier
+            if candidate_source in {'event_only', 'event_conflict_winner'}:
+                event_allocation = resolve_independent_event_allocation(
+                    effective_risk_tier,
+                    config=trend_cfg,
+                )
+                effective_risk_tier = str(
+                    event_allocation['applied_risk_tier']
+                )
+                change_point_flow['initial_margin_fraction'] = min(
+                    float(
+                        change_point_flow.get('initial_margin_fraction', 1.0)
+                        or 1.0
+                    ),
+                    float(event_allocation['initial_margin_fraction']),
+                )
+            status['independent_event_allocation'] = dict(event_allocation)
             status['risk_tier'] = effective_risk_tier
             status['convex_rotation_tier'] = effective_risk_tier
         if (
@@ -1952,30 +1998,67 @@ class SignalAlphaMixin:
                 or 1.50
             ),
             'small_account_min_leverage': int(
-                trend_cfg.get('small_account_min_leverage', 5) or 5
+                trend_cfg.get('small_account_min_leverage', 4) or 4
             ),
             'small_account_strong_leverage': int(
-                trend_cfg.get('small_account_strong_leverage', 8) or 8
+                trend_cfg.get('small_account_strong_leverage', 6) or 6
             ),
             'small_account_elite_leverage': int(
-                profile_cfg.get('maximum_leverage', 10)
+                min(
+                    profile_cfg.get('maximum_leverage', 10),
+                    trend_cfg.get('small_account_elite_leverage', 7) or 7,
+                )
                 if tradfi_profile_applied
-                else trend_cfg.get('small_account_elite_leverage', 15) or 15
+                else trend_cfg.get('small_account_elite_leverage', 7) or 7
             ),
             'small_account_leverage_steps': tuple(
-                profile_cfg.get('leverage_steps', (5, 8, 10))
-                if tradfi_profile_applied
-                else trend_cfg.get('small_account_leverage_steps', (5, 8, 10, 15))
+                trend_cfg.get('small_account_leverage_steps', (4, 5, 6, 7))
             ),
             'small_account_aggressive_leverage_ceiling': (
-                int(profile_cfg.get('maximum_leverage', 10))
+                min(
+                    int(profile_cfg.get('maximum_leverage', 10)),
+                    int(trend_cfg.get('small_account_elite_leverage', 7) or 7),
+                )
                 if tradfi_profile_applied
-                else None
+                else int(trend_cfg.get('small_account_elite_leverage', 7) or 7)
             ),
             'strategy_leverage_ceiling': (
                 int(profile_cfg.get('maximum_leverage', 10))
                 if tradfi_profile_applied
                 else None
+            ),
+            'small_account_roe_profit_lock_enabled': bool(
+                trend_cfg.get('small_account_roe_profit_lock_enabled', True)
+            ),
+            'small_account_roe_profit_lock_first_trigger_percent': float(
+                trend_cfg.get(
+                    'small_account_roe_profit_lock_first_trigger_percent', 5.0
+                ) or 5.0
+            ),
+            'small_account_roe_profit_lock_second_trigger_percent': float(
+                trend_cfg.get(
+                    'small_account_roe_profit_lock_second_trigger_percent', 10.0
+                ) or 10.0
+            ),
+            'small_account_roe_profit_lock_step_percent': float(
+                trend_cfg.get('small_account_roe_profit_lock_step_percent', 10.0)
+                or 10.0
+            ),
+            'small_account_roe_profit_lock_atr_multiplier': float(
+                trend_cfg.get('small_account_roe_profit_lock_atr_multiplier', 0.50)
+                or 0.50
+            ),
+            'small_account_roe_profit_lock_min_gap_percent': float(
+                trend_cfg.get('small_account_roe_profit_lock_min_gap_percent', 1.0)
+                or 1.0
+            ),
+            'small_account_roe_profit_lock_max_gap_percent': float(
+                trend_cfg.get('small_account_roe_profit_lock_max_gap_percent', 3.0)
+                or 3.0
+            ),
+            'small_account_roe_profit_lock_min_floor_percent': float(
+                trend_cfg.get('small_account_roe_profit_lock_min_floor_percent', 1.0)
+                or 1.0
             ),
             'small_account_aggressive_daily_pnl_usdt': float(daily_pnl or 0.0),
             'small_account_entry_refinement_profile': (
@@ -2029,6 +2112,22 @@ class SignalAlphaMixin:
             'change_point_flow_event_structure_stop': event_structure_stop,
             'change_point_flow_soft_veto_override': bool(
                 small_account_entry_refinement.get('overridden')
+            ),
+            'independent_event_context_profile': event_context.get('profile'),
+            'independent_event_context_broad_side': event_context.get(
+                'broad_side'
+            ),
+            'independent_event_context_fast_ema_distance_atr': event_context.get(
+                'fast_ema_distance_atr'
+            ),
+            'independent_event_context_max_fast_ema_distance_atr': event_context.get(
+                'max_fast_ema_distance_atr'
+            ),
+            'independent_event_risk_tier_cap': event_allocation.get(
+                'risk_tier_cap'
+            ),
+            'independent_event_risk_tier_capped': bool(
+                event_allocation.get('risk_tier_capped')
             ),
             'structure_reference_stop': structure_stop,
             'entry_chase_atr': chase_atr,

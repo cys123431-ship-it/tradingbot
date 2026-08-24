@@ -329,6 +329,7 @@ from utbreakout.ev_adaptive import (
     adapt_exit_for_quantity,
     evaluate_ev_adaptive_entry,
     evaluate_mfe_profit_lock,
+    evaluate_small_account_roe_profit_lock,
     evaluate_ev_time_stop,
     evaluate_net_edge,
     profile_gross_win_r,

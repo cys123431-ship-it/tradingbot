@@ -40,6 +40,9 @@ def default_change_point_flow_config() -> dict[str, Any]:
         "tradfi_opening_range_enabled": True,
         "independent_candidate_minimum_score": 60.0,
         "candidate_conflict_margin": 12.0,
+        # A fast event can lead a neutral trend, but it must not overrule an
+        # already actionable trend in the opposite direction by default.
+        "allow_event_conflict_override": False,
         "orderflow_max_age_seconds": 90.0,
     }
 
@@ -95,6 +98,13 @@ def normalize_change_point_flow_config(
     )
     normalized["tradfi_opening_range_enabled"] = bool(
         normalized.get("tradfi_opening_range_enabled", True)
+    )
+    event_override = normalized.get("allow_event_conflict_override", False)
+    normalized["allow_event_conflict_override"] = (
+        event_override
+        if isinstance(event_override, bool)
+        else str(event_override).strip().lower()
+        in {"1", "true", "yes", "on", "enabled"}
     )
     return normalized
 
@@ -491,6 +501,7 @@ def resolve_trend_event_candidate(
     event_candidate: Mapping[str, Any] | None,
     *,
     conflict_margin: float = 12.0,
+    allow_event_conflict_override: bool = False,
 ) -> dict[str, Any]:
     """Combine independent trend and event candidates as weighted OR paths."""
 
@@ -557,7 +568,7 @@ def resolve_trend_event_candidate(
 
     margin = _clamp(conflict_margin, 5.0, 30.0)
     score_gap = event_score - trend_score
-    if score_gap >= margin:
+    if score_gap >= margin and allow_event_conflict_override:
         return {
             **waiting,
             "allowed": True,
@@ -566,6 +577,16 @@ def resolve_trend_event_candidate(
             "agreement": "conflict_resolved",
             "score": event_score,
             "reason": f"event candidate won conflict by {score_gap:.1f} points",
+        }
+    if score_gap >= margin:
+        return {
+            **waiting,
+            "source": "conflict_wait",
+            "agreement": "conflict",
+            "reason": (
+                f"event {event_side} leads by {score_gap:.1f} points but "
+                f"cannot override actionable {trend_side} trend"
+            ),
         }
     if score_gap <= -margin:
         return {

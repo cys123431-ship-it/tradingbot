@@ -436,11 +436,11 @@ def test_adaptive_trend_small_account_uses_95_percent_budget_and_65_percent_init
         account_equity=800.0,
     )
 
-    assert updated["leverage"] >= 5
-    assert updated["leverage"] == 5
+    assert updated["leverage"] >= 4
+    assert updated["leverage"] == 4
     assert updated["planned_margin"] == pytest.approx(800.0 * 0.95 * 0.65)
-    assert updated["planned_notional"] == pytest.approx(800.0 * 0.95 * 0.65 * 5)
-    assert updated["adaptive_trend_target_notional"] == pytest.approx(800.0 * 0.95 * 5)
+    assert updated["planned_notional"] == pytest.approx(800.0 * 0.95 * 0.65 * 4)
+    assert updated["adaptive_trend_target_notional"] == pytest.approx(800.0 * 0.95 * 4)
     assert updated["small_account_full_margin_applied"] is False
     assert updated["small_account_aggressive_active"] is True
     assert updated["small_account_aggressive_blocked"] is False
@@ -450,9 +450,9 @@ def test_adaptive_trend_small_account_uses_95_percent_budget_and_65_percent_init
 @pytest.mark.parametrize(
     ("risk_tier", "score", "stop_pct", "expected_leverage", "loss_cap"),
     (
-        ("base", 70.0, 6.0, 5, 20.0),
-        ("strong", 82.0, 3.5, 8, 30.0),
-        ("elite", 96.0, 3.5, 15, 35.0),
+        ("base", 70.0, 6.0, 4, 20.0),
+        ("strong", 82.0, 3.5, 6, 30.0),
+        ("elite", 96.0, 3.5, 7, 35.0),
     ),
 )
 def test_adaptive_trend_small_account_selects_highest_allowed_tier_leverage(
@@ -484,15 +484,15 @@ def test_adaptive_trend_small_account_selects_highest_allowed_tier_leverage(
     assert updated["small_account_aggressive_projected_loss_usdt"] <= loss_cap
 
 
-def test_adaptive_trend_small_account_blocks_when_even_five_x_exceeds_loss_cap():
+def test_adaptive_trend_small_account_blocks_when_even_four_x_exceeds_loss_cap():
     updated = apply_dynamic_leverage_to_plan(
         _plan(
             strategy="adaptive_breakout_trend_v1",
             adaptive_breakout_trend_score=70.0,
             adaptive_trend_risk_tier="base",
             adaptive_breakout_trend_metrics={"risk_tier": "base"},
-            risk_distance=7.0,
-            risk_distance_pct=7.0,
+            risk_distance=9.0,
+            risk_distance_pct=9.0,
             planned_notional=100.0,
             qty=1.0,
         ),

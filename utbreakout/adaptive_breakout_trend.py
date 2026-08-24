@@ -23,7 +23,7 @@ from .change_point_flow import (
 
 
 ADAPTIVE_BREAKOUT_TREND_STRATEGY = "adaptive_breakout_trend_v1"
-ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v9_independent_event"
+ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v10_event_risk_profit_lock"
 
 
 def default_adaptive_breakout_trend_config() -> dict[str, Any]:
@@ -124,10 +124,25 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         "small_account_daily_loss_limit_percent": 0.0,
         "small_account_cost_buffer_percent": 0.20,
         "small_account_liquidation_stop_buffer_multiple": 1.50,
-        "small_account_min_leverage": 5,
-        "small_account_strong_leverage": 8,
-        "small_account_elite_leverage": 15,
-        "small_account_leverage_steps": (5, 8, 10, 15),
+        # New sub-$1,000 positions remain opportunity-scaled, but the live
+        # loss sample no longer justifies 8-15x initial leverage. Event-only,
+        # aligned and elite setups now map to a bounded 4-7x ladder.
+        "small_account_min_leverage": 4,
+        "small_account_strong_leverage": 6,
+        "small_account_elite_leverage": 7,
+        "small_account_leverage_steps": (4, 5, 6, 7),
+        # Protect observed mark-price ROE in rising steps. The requested
+        # 5/10/20/30... staircase is retained, while half an ATR determines a
+        # 1-3 percentage-point giveback so normal crypto noise is not treated
+        # as a new trend reversal.
+        "small_account_roe_profit_lock_enabled": True,
+        "small_account_roe_profit_lock_first_trigger_percent": 5.0,
+        "small_account_roe_profit_lock_second_trigger_percent": 10.0,
+        "small_account_roe_profit_lock_step_percent": 10.0,
+        "small_account_roe_profit_lock_atr_multiplier": 0.50,
+        "small_account_roe_profit_lock_min_gap_percent": 1.0,
+        "small_account_roe_profit_lock_max_gap_percent": 3.0,
+        "small_account_roe_profit_lock_min_floor_percent": 1.0,
         # The small-account profile keeps its aggressive capital allocation,
         # but refuses a stale continuation when the fast trend sleeve has
         # already decayed relative to the medium/slow sleeves.  This is a
@@ -136,6 +151,16 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         "small_account_min_fast_momentum_retention": 0.55,
         "small_account_max_adverse_signal_move_atr": 0.80,
         "small_account_crossover_max_fast_ema_distance_atr": 2.00,
+        # A fast event may lead the slower trend sleeve, but it must not use
+        # that privilege to chase a move already extended from the 1h fast
+        # EMA.  The limit intentionally matches the existing impulse-entry
+        # geometry instead of being fitted to a handful of live outcomes.
+        "small_account_event_only_max_fast_ema_distance_atr": 1.50,
+        # Event strength is an entry-timing input, not a calibrated capital
+        # confidence score.  Higher initial tiers require alignment with the
+        # independent multi-horizon trend; event-only positions can still
+        # reach full target size through winner-only pyramiding.
+        "small_account_event_only_risk_tier_cap": "base",
         "small_account_lower_timeframe_conflict_veto_enabled": True,
         "small_account_lower_timeframe_conflict_min_alignment": 60.0,
         "small_account_lower_timeframe_conflict_min_ready_timeframes": 2,
@@ -208,6 +233,7 @@ def normalize_adaptive_breakout_trend_config(
                 "adaptive_trend_portfolio_v6_",
                 "adaptive_trend_portfolio_v7_",
                 "adaptive_trend_portfolio_v8_",
+                "adaptive_trend_portfolio_v9_",
             )
         )
     ):
@@ -261,10 +287,20 @@ def normalize_adaptive_breakout_trend_config(
             "small_account_strong_leverage",
             "small_account_elite_leverage",
             "small_account_leverage_steps",
+            "small_account_roe_profit_lock_enabled",
+            "small_account_roe_profit_lock_first_trigger_percent",
+            "small_account_roe_profit_lock_second_trigger_percent",
+            "small_account_roe_profit_lock_step_percent",
+            "small_account_roe_profit_lock_atr_multiplier",
+            "small_account_roe_profit_lock_min_gap_percent",
+            "small_account_roe_profit_lock_max_gap_percent",
+            "small_account_roe_profit_lock_min_floor_percent",
             "small_account_entry_refinement_enabled",
             "small_account_min_fast_momentum_retention",
             "small_account_max_adverse_signal_move_atr",
             "small_account_crossover_max_fast_ema_distance_atr",
+            "small_account_event_only_max_fast_ema_distance_atr",
+            "small_account_event_only_risk_tier_cap",
             "small_account_lower_timeframe_conflict_veto_enabled",
             "small_account_lower_timeframe_conflict_min_alignment",
             "small_account_lower_timeframe_conflict_min_ready_timeframes",
@@ -305,9 +341,35 @@ def normalize_adaptive_breakout_trend_config(
         )
         for key in profile_keys:
             normalized[key] = defaults[key]
-    # v6-v8 already carry the requested aggressive sizing and runner policy.
-    # Preserve operator-tuned risk/exit values while defaults above add the
-    # new entry fields.  This also prevents an open position's
+    if supplied_profile.startswith(
+        (
+            "adaptive_trend_portfolio_v6_",
+            "adaptive_trend_portfolio_v7_",
+            "adaptive_trend_portfolio_v8_",
+            "adaptive_trend_portfolio_v9_",
+        )
+    ):
+        # Preserve the operator's other live risk/exit choices, but migrate
+        # the explicitly requested small-account leverage and new-profit-lock
+        # policy together. Otherwise a persisted v9 15x ceiling would silently
+        # defeat the new 4-7x rule after deployment.
+        for key in (
+            "small_account_min_leverage",
+            "small_account_strong_leverage",
+            "small_account_elite_leverage",
+            "small_account_leverage_steps",
+            "small_account_roe_profit_lock_enabled",
+            "small_account_roe_profit_lock_first_trigger_percent",
+            "small_account_roe_profit_lock_second_trigger_percent",
+            "small_account_roe_profit_lock_step_percent",
+            "small_account_roe_profit_lock_atr_multiplier",
+            "small_account_roe_profit_lock_min_gap_percent",
+            "small_account_roe_profit_lock_max_gap_percent",
+            "small_account_roe_profit_lock_min_floor_percent",
+        ):
+            normalized[key] = defaults[key]
+    # Preserve all other operator-tuned risk/exit values while defaults above
+    # add the new entry fields.  This also prevents an open position's
     # runtime policy from changing merely because the entry profile advanced.
     normalized["profile_version"] = ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION
 
@@ -482,6 +544,7 @@ def normalize_adaptive_breakout_trend_config(
     normalized["pyramid_target_fractions"] = tuple(monotonic_targets)
     for key in (
         "small_account_aggressive_enabled",
+        "small_account_roe_profit_lock_enabled",
         "small_account_entry_refinement_enabled",
         "small_account_lower_timeframe_conflict_veto_enabled",
         "small_account_crowded_extension_veto_enabled",
@@ -597,6 +660,68 @@ def normalize_adaptive_breakout_trend_config(
         configured_steps = set()
     configured_steps.update({minimum_leverage, strong_leverage, elite_leverage})
     normalized["small_account_leverage_steps"] = tuple(sorted(configured_steps))
+    normalized["small_account_roe_profit_lock_first_trigger_percent"] = _bounded(
+        _finite(
+            normalized.get("small_account_roe_profit_lock_first_trigger_percent"),
+            defaults["small_account_roe_profit_lock_first_trigger_percent"],
+        ),
+        0.5,
+        100.0,
+    )
+    normalized["small_account_roe_profit_lock_second_trigger_percent"] = max(
+        normalized["small_account_roe_profit_lock_first_trigger_percent"],
+        _bounded(
+            _finite(
+                normalized.get("small_account_roe_profit_lock_second_trigger_percent"),
+                defaults["small_account_roe_profit_lock_second_trigger_percent"],
+            ),
+            0.5,
+            200.0,
+        ),
+    )
+    normalized["small_account_roe_profit_lock_step_percent"] = _bounded(
+        _finite(
+            normalized.get("small_account_roe_profit_lock_step_percent"),
+            defaults["small_account_roe_profit_lock_step_percent"],
+        ),
+        0.5,
+        100.0,
+    )
+    normalized["small_account_roe_profit_lock_atr_multiplier"] = _bounded(
+        _finite(
+            normalized.get("small_account_roe_profit_lock_atr_multiplier"),
+            defaults["small_account_roe_profit_lock_atr_multiplier"],
+        ),
+        0.0,
+        3.0,
+    )
+    normalized["small_account_roe_profit_lock_min_gap_percent"] = _bounded(
+        _finite(
+            normalized.get("small_account_roe_profit_lock_min_gap_percent"),
+            defaults["small_account_roe_profit_lock_min_gap_percent"],
+        ),
+        0.1,
+        20.0,
+    )
+    normalized["small_account_roe_profit_lock_max_gap_percent"] = max(
+        normalized["small_account_roe_profit_lock_min_gap_percent"],
+        _bounded(
+            _finite(
+                normalized.get("small_account_roe_profit_lock_max_gap_percent"),
+                defaults["small_account_roe_profit_lock_max_gap_percent"],
+            ),
+            0.1,
+            30.0,
+        ),
+    )
+    normalized["small_account_roe_profit_lock_min_floor_percent"] = _bounded(
+        _finite(
+            normalized.get("small_account_roe_profit_lock_min_floor_percent"),
+            defaults["small_account_roe_profit_lock_min_floor_percent"],
+        ),
+        0.0,
+        normalized["small_account_roe_profit_lock_first_trigger_percent"],
+    )
     normalized["small_account_min_fast_momentum_retention"] = _bounded(
         _finite(
             normalized.get("small_account_min_fast_momentum_retention"),
@@ -621,6 +746,21 @@ def normalize_adaptive_breakout_trend_config(
         0.50,
         6.0,
     )
+    normalized["small_account_event_only_max_fast_ema_distance_atr"] = _bounded(
+        _finite(
+            normalized.get("small_account_event_only_max_fast_ema_distance_atr"),
+            defaults["small_account_event_only_max_fast_ema_distance_atr"],
+        ),
+        0.50,
+        4.0,
+    )
+    event_only_tier_cap = str(
+        normalized.get("small_account_event_only_risk_tier_cap", "base")
+        or "base"
+    ).strip().lower()
+    if event_only_tier_cap not in {"base", "strong", "elite"}:
+        event_only_tier_cap = "base"
+    normalized["small_account_event_only_risk_tier_cap"] = event_only_tier_cap
     normalized["small_account_lower_timeframe_conflict_min_alignment"] = _bounded(
         _finite(
             normalized.get("small_account_lower_timeframe_conflict_min_alignment"),
@@ -928,6 +1068,167 @@ def evaluate_small_account_entry_refinement(
             ),
         })
     return result
+
+
+def evaluate_independent_event_context(
+    side: str | None,
+    trend_metrics: Mapping[str, Any] | None,
+    *,
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Guard a fast event with independent 1h context, without requiring entry alignment.
+
+    An event is still an OR-style early entry: EMA alignment, a crossover, and
+    fast-sleeve agreement are not required.  The context is used only to stop
+    an established opposite multi-horizon direction, a volatility shock, or a
+    late extension that the event's own synthetic metrics cannot measure.
+    """
+
+    cfg = normalize_adaptive_breakout_trend_config(config)
+    metrics = dict(trend_metrics or {})
+    normalized_side = str(side or "").strip().lower()
+    weighted_momentum = float(
+        _finite(metrics.get("weighted_momentum"), 0.0) or 0.0
+    )
+    broad_side = (
+        "long" if weighted_momentum > 0.0 else
+        "short" if weighted_momentum < 0.0 else
+        None
+    )
+    horizon_votes = metrics.get("horizon_votes")
+    if not isinstance(horizon_votes, Mapping):
+        horizon_votes = {}
+    dominant_votes = sum(
+        1 for vote in horizon_votes.values() if vote == broad_side
+    )
+    minimum_votes = max(
+        2,
+        min(
+            max(2, len(horizon_votes)),
+            int(cfg.get("minimum_horizon_agreement", 2) or 2),
+        ),
+    )
+    reference_price = _finite(metrics.get("reference_price"), None)
+    fast_ema = _finite(metrics.get("fast_ema"), None)
+    atr_value = _finite(metrics.get("atr"), None)
+    fast_ema_distance_atr = None
+    if (
+        normalized_side in {"long", "short"}
+        and reference_price is not None
+        and fast_ema is not None
+        and atr_value is not None
+        and atr_value > 0.0
+    ):
+        fast_ema_distance_atr = (
+            (reference_price - fast_ema) / atr_value
+            if normalized_side == "long"
+            else (fast_ema - reference_price) / atr_value
+        )
+    extension_limit = float(
+        cfg["small_account_event_only_max_fast_ema_distance_atr"]
+    )
+    latest_range_atr = _finite(metrics.get("latest_range_atr"), None)
+    volatility_ratio = _finite(metrics.get("volatility_ratio"), None)
+    result = {
+        "allowed": True,
+        "code": "INDEPENDENT_EVENT_CONTEXT_OK",
+        "reason": "independent event passed 1h context guard",
+        "profile": ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION,
+        "broad_side": broad_side,
+        "dominant_votes": dominant_votes,
+        "minimum_votes": minimum_votes,
+        "fast_ema_distance_atr": fast_ema_distance_atr,
+        "max_fast_ema_distance_atr": extension_limit,
+        "latest_range_atr": latest_range_atr,
+        "volatility_ratio": volatility_ratio,
+    }
+    if normalized_side not in {"long", "short"}:
+        result.update({
+            "allowed": False,
+            "code": "REJECTED_INDEPENDENT_EVENT_SIDE",
+            "reason": "independent event direction is unavailable",
+        })
+        return result
+    if (
+        broad_side in {"long", "short"}
+        and broad_side != normalized_side
+        and dominant_votes >= minimum_votes
+    ):
+        result.update({
+            "allowed": False,
+            "code": "REJECTED_INDEPENDENT_EVENT_BROAD_TREND_CONFLICT",
+            "reason": (
+                f"independent event {normalized_side} conflicts with "
+                f"{broad_side} multi-horizon direction "
+                f"({dominant_votes}/{len(horizon_votes)} votes)"
+            ),
+        })
+        return result
+    if (
+        fast_ema_distance_atr is not None
+        and fast_ema_distance_atr > extension_limit
+    ):
+        result.update({
+            "allowed": False,
+            "code": "REJECTED_INDEPENDENT_EVENT_HTF_EXTENSION",
+            "reason": (
+                f"independent event is {fast_ema_distance_atr:.2f} ATR "
+                f"beyond the 1h fast EMA (limit {extension_limit:.2f})"
+            ),
+        })
+        return result
+    if (
+        latest_range_atr is not None
+        and latest_range_atr > float(cfg["latest_range_max_atr"])
+    ):
+        result.update({
+            "allowed": False,
+            "code": "REJECTED_INDEPENDENT_EVENT_EXTREME_RANGE",
+            "reason": (
+                f"1h range {latest_range_atr:.2f} ATR exceeds "
+                f"{float(cfg['latest_range_max_atr']):.2f}"
+            ),
+        })
+        return result
+    if (
+        volatility_ratio is not None
+        and volatility_ratio > float(cfg["volatility_shock_ratio"])
+    ):
+        result.update({
+            "allowed": False,
+            "code": "REJECTED_INDEPENDENT_EVENT_VOLATILITY_SHOCK",
+            "reason": (
+                f"1h volatility ratio {volatility_ratio:.2f} exceeds "
+                f"{float(cfg['volatility_shock_ratio']):.2f}"
+            ),
+        })
+    return result
+
+
+def resolve_independent_event_allocation(
+    risk_tier: str | None,
+    *,
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Separate event detection strength from unconfirmed initial capital."""
+
+    cfg = normalize_adaptive_breakout_trend_config(config)
+    order = {"base": 0, "strong": 1, "elite": 2}
+    requested = str(risk_tier or "base").strip().lower()
+    if requested not in order:
+        requested = "base"
+    cap = str(cfg["small_account_event_only_risk_tier_cap"])
+    applied = min((requested, cap), key=lambda tier: order[tier])
+    flow_cfg = cfg["change_point_flow"]
+    return {
+        "requested_risk_tier": requested,
+        "risk_tier_cap": cap,
+        "applied_risk_tier": applied,
+        "risk_tier_capped": applied != requested,
+        "initial_margin_fraction": float(
+            flow_cfg[f"{applied}_initial_margin_fraction"]
+        ),
+    }
 
 
 @dataclass(frozen=True)
@@ -1649,6 +1950,8 @@ __all__ = (
     "AdaptiveBreakoutTrendDecision",
     "default_adaptive_breakout_trend_config",
     "evaluate_adaptive_breakout_trend",
+    "evaluate_independent_event_context",
+    "resolve_independent_event_allocation",
     "evaluate_small_account_entry_refinement",
     "normalize_adaptive_breakout_trend_config",
 )

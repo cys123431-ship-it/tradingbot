@@ -6,6 +6,7 @@ from utbreakout.ev_adaptive import (
     evaluate_ev_adaptive_entry,
     evaluate_mfe_profit_lock,
     evaluate_net_edge,
+    evaluate_small_account_roe_profit_lock,
     rank_ev_candidates,
     scale_atr_percent_threshold,
 )
@@ -763,6 +764,52 @@ def test_mfe_profit_lock_raises_locked_profit_in_stages():
     assert (first.stage, first.lock_r) == (1, 0.40)
     assert (second.stage, second.lock_r) == (2, 1.00)
     assert (third.stage, third.lock_r) == (3, 1.80)
+
+
+def test_small_account_roe_profit_lock_keeps_requested_staircase_with_atr_gap():
+    inactive = evaluate_small_account_roe_profit_lock(
+        peak_roe_percent=4.99,
+        leverage=7,
+        atr_percent=1.0,
+    )
+    first = evaluate_small_account_roe_profit_lock(
+        peak_roe_percent=5.0,
+        leverage=7,
+        atr_percent=0.20,
+    )
+    second = evaluate_small_account_roe_profit_lock(
+        peak_roe_percent=10.0,
+        leverage=7,
+        atr_percent=1.0,
+    )
+    fourth = evaluate_small_account_roe_profit_lock(
+        peak_roe_percent=30.1,
+        leverage=7,
+        atr_percent=2.0,
+    )
+
+    assert inactive.active is False
+    assert (first.stage, first.trigger_roe_percent) == (1, 5.0)
+    assert first.giveback_roe_percent == pytest.approx(1.0)
+    assert first.lock_roe_percent == pytest.approx(4.0)
+    assert (second.stage, second.trigger_roe_percent) == (2, 10.0)
+    assert second.giveback_roe_percent == pytest.approx(3.0)
+    assert second.lock_roe_percent == pytest.approx(7.0)
+    assert (fourth.stage, fourth.trigger_roe_percent) == (4, 30.0)
+    assert fourth.lock_roe_percent == pytest.approx(27.0)
+
+
+def test_small_account_roe_profit_lock_falls_back_to_one_point_without_atr():
+    decision = evaluate_small_account_roe_profit_lock(
+        peak_roe_percent=20.0,
+        leverage=4,
+        atr_percent=None,
+    )
+
+    assert decision.active is True
+    assert decision.trigger_roe_percent == pytest.approx(20.0)
+    assert decision.giveback_roe_percent == pytest.approx(1.0)
+    assert decision.lock_roe_percent == pytest.approx(19.0)
 
 
 def test_derivatives_crowding_blocks_late_long_chase():

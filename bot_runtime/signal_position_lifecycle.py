@@ -528,6 +528,14 @@ class SignalPositionLifecycleMixin:
             'ev_mfe_lock_trigger_1_r',
             'ev_mfe_lock_trigger_2_r',
             'ev_mfe_lock_trigger_3_r',
+            'small_account_roe_profit_lock_enabled',
+            'small_account_roe_profit_lock_first_trigger_percent',
+            'small_account_roe_profit_lock_second_trigger_percent',
+            'small_account_roe_profit_lock_step_percent',
+            'small_account_roe_profit_lock_atr_multiplier',
+            'small_account_roe_profit_lock_min_gap_percent',
+            'small_account_roe_profit_lock_max_gap_percent',
+            'small_account_roe_profit_lock_min_floor_percent',
             'profit_alpha_follow_through_enabled',
             'profit_alpha_follow_through_bars',
             'profit_alpha_follow_through_min_mfe_r',
@@ -551,6 +559,10 @@ class SignalPositionLifecycleMixin:
         if (
             not bool(cfg.get('atr_trailing_enabled', False))
             and not bool(cfg.get('tp1_breakeven_enabled', True))
+            and not bool(
+                plan.get('small_account_aggressive_active', False)
+                and cfg.get('small_account_roe_profit_lock_enabled', False)
+            )
         ):
             self._clear_utbreakout_trailing_state(symbol)
             return None
@@ -755,10 +767,73 @@ class SignalPositionLifecycleMixin:
             'small_account_aggressive_projected_loss_percent': _safe_float_or_none(plan.get('small_account_aggressive_projected_loss_percent')),
             'small_account_aggressive_cost_buffer_percent': _safe_float_or_none(plan.get('small_account_aggressive_cost_buffer_percent')),
             'small_account_aggressive_risk_tier': plan.get('small_account_aggressive_risk_tier'),
+            'small_account_roe_profit_lock_enabled': bool(
+                plan.get(
+                    'small_account_roe_profit_lock_enabled',
+                    cfg.get('small_account_roe_profit_lock_enabled', True),
+                )
+            ),
+            'small_account_roe_profit_lock_first_trigger_percent': float(
+                plan.get(
+                    'small_account_roe_profit_lock_first_trigger_percent',
+                    cfg.get('small_account_roe_profit_lock_first_trigger_percent', 5.0),
+                )
+                or 5.0
+            ),
+            'small_account_roe_profit_lock_second_trigger_percent': float(
+                plan.get(
+                    'small_account_roe_profit_lock_second_trigger_percent',
+                    cfg.get('small_account_roe_profit_lock_second_trigger_percent', 10.0),
+                )
+                or 10.0
+            ),
+            'small_account_roe_profit_lock_step_percent': float(
+                plan.get(
+                    'small_account_roe_profit_lock_step_percent',
+                    cfg.get('small_account_roe_profit_lock_step_percent', 10.0),
+                )
+                or 10.0
+            ),
+            'small_account_roe_profit_lock_atr_multiplier': float(
+                plan.get(
+                    'small_account_roe_profit_lock_atr_multiplier',
+                    cfg.get('small_account_roe_profit_lock_atr_multiplier', 0.50),
+                )
+                or 0.50
+            ),
+            'small_account_roe_profit_lock_min_gap_percent': float(
+                plan.get(
+                    'small_account_roe_profit_lock_min_gap_percent',
+                    cfg.get('small_account_roe_profit_lock_min_gap_percent', 1.0),
+                )
+                or 1.0
+            ),
+            'small_account_roe_profit_lock_max_gap_percent': float(
+                plan.get(
+                    'small_account_roe_profit_lock_max_gap_percent',
+                    cfg.get('small_account_roe_profit_lock_max_gap_percent', 3.0),
+                )
+                or 3.0
+            ),
+            'small_account_roe_profit_lock_min_floor_percent': float(
+                plan.get(
+                    'small_account_roe_profit_lock_min_floor_percent',
+                    cfg.get('small_account_roe_profit_lock_min_floor_percent', 1.0),
+                )
+                or 1.0
+            ),
+            # Re-registration after a winner-only add uses a new average
+            # entry, so ROE stages restart against that new basis. The actual
+            # exchange stop is preserved separately as last_stop_price.
+            'small_account_roe_profit_lock_stage': 0,
+            'small_account_roe_profit_lock_peak_percent': 0.0,
+            'small_account_roe_profit_lock_floor_percent': 0.0,
+            'small_account_roe_profit_lock_gap_percent': 0.0,
             'planned_tp_orders': planned_tp_orders,
             'tp_orders': list(planned_tp_orders),
             'expected_tp_count': len(planned_tp_orders),
             'risk_distance': risk_distance,
+            'entry_atr': _safe_float_or_none(plan.get('atr')),
             'activation_r': activation_r,
             'trailing_atr_multiplier': max(0.1, float(cfg.get('atr_trailing_multiplier', 3.50) or 3.50)),
             'breakeven_enabled': bool(cfg.get('atr_trailing_breakeven_enabled', True)),
