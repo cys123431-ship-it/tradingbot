@@ -703,6 +703,11 @@ class SignalPositionLifecycleMixin:
             'aggressive_growth_overlay': bool(plan.get('aggressive_growth_overlay', False)),
             'pyramid_add_count': int(plan.get('pyramid_add_count', 0) or 0),
             'strategy': plan.get('strategy'),
+            'adaptive_regime_engine': plan.get('adaptive_regime_engine'),
+            'adaptive_regime_profile': plan.get('adaptive_regime_profile'),
+            'reversal_mean_target_price': _safe_float_or_none(
+                plan.get('reversal_mean_target_price')
+            ),
             'adaptive_trend_pyramid_enabled': bool(plan.get('adaptive_trend_pyramid_enabled', False)),
             'adaptive_trend_pyramid_trigger_r': tuple(plan.get('adaptive_trend_pyramid_trigger_r') or (0.50, 1.00, 1.50)),
             'adaptive_trend_pyramid_target_fractions': tuple(plan.get('adaptive_trend_pyramid_target_fractions') or (0.80, 0.90, 1.00)),

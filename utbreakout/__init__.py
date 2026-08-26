@@ -46,6 +46,14 @@ from .tradfi_small_account import (
     classify_tradfi_instrument,
     evaluate_tradfi_small_account_guardrails,
 )
+from .small_account_regime import (
+    SMALL_ACCOUNT_REGIME_PROFILE_VERSION,
+    default_small_account_regime_config,
+    evaluate_small_account_exhaustion_reversal,
+    normalize_small_account_regime_config,
+    resolve_regime_ensemble_candidate,
+    reversal_exit_plan_overrides,
+)
 from .opportunity_risk import (
     OpportunityRiskDecision,
     apply_opportunity_risk_to_plan,
@@ -226,6 +234,12 @@ __all__ = [
     "cap_tradfi_risk_tier",
     "classify_tradfi_instrument",
     "evaluate_tradfi_small_account_guardrails",
+    "SMALL_ACCOUNT_REGIME_PROFILE_VERSION",
+    "default_small_account_regime_config",
+    "evaluate_small_account_exhaustion_reversal",
+    "normalize_small_account_regime_config",
+    "resolve_regime_ensemble_candidate",
+    "reversal_exit_plan_overrides",
     "OpportunityRiskDecision",
     "apply_opportunity_risk_to_plan",
     "default_opportunity_risk_config",

@@ -11,6 +11,10 @@ from utbreakout.change_point_flow import (
     resolve_trend_event_candidate,
     select_independent_change_point_flow_candidate,
 )
+from utbreakout.small_account_regime import (
+    evaluate_small_account_exhaustion_reversal,
+    resolve_regime_ensemble_candidate,
+)
 from utbreakout.tradfi_pattern_profile import (
     evaluate_tradfi_pattern_profile,
     normalize_tradfi_pattern_profile_config,
@@ -2406,6 +2410,14 @@ class SignalScannerMixin:
                     'source': 'change_point_flow',
                     'evaluations': {},
                 }
+                event_rows = []
+                reversal_candidate = {
+                    'allowed': False,
+                    'side': None,
+                    'score': 0.0,
+                    'reason': 'exhaustion reversal path not applicable',
+                    'source': 'exhaustion_reversal',
+                }
                 small_account_candidate = False
                 balance_reader = getattr(
                     self,
@@ -2451,6 +2463,25 @@ class SignalScannerMixin:
                             tradfi=bool(base_candidate.get('tradifi_perpetual')),
                         )
                     )
+                    if not bool(base_candidate.get('tradifi_perpetual')):
+                        try:
+                            market_regime_context = await self._fetch_utbreakout_market_regime_context(
+                                cfg,
+                                symbol,
+                            )
+                        except Exception as exc:
+                            market_regime_context = {}
+                            result['small_account_regime_context_error'] = str(exc)
+                        reversal_candidate = evaluate_small_account_exhaustion_reversal(
+                            event_rows,
+                            trend_metrics=trend_metrics,
+                            futures_context=futures_context,
+                            market_regime_context=market_regime_context,
+                            config=trend_cfg.get(
+                                'small_account_regime_ensemble'
+                            ),
+                            tradfi=False,
+                        )
                 trend_candidate = {
                     'allowed': bool(
                         trend_decision.allowed
@@ -2470,6 +2501,10 @@ class SignalScannerMixin:
                         )
                         or 12.0
                     ),
+                )
+                candidate_resolution = resolve_regime_ensemble_candidate(
+                    candidate_resolution,
+                    reversal_candidate,
                 )
                 tradfi_small_account_guardrail = {
                     'profile': TRADFI_SMALL_ACCOUNT_PROFILE_VERSION,
@@ -2546,6 +2581,21 @@ class SignalScannerMixin:
                             'directional_persistence'
                         ),
                     })
+                elif candidate_resolution.get('source') == 'exhaustion_reversal':
+                    candidate_metrics.update({
+                        'score': reversal_candidate.get('score'),
+                        'weighted_momentum': reversal_candidate.get(
+                            'weighted_momentum'
+                        ),
+                        'entry_opportunity_score': reversal_candidate.get(
+                            'score'
+                        ),
+                        'trend_clarity': reversal_candidate.get(
+                            'trend_clarity'
+                        ),
+                        'fast_momentum_retention': 1.0,
+                        'volume_ratio': reversal_candidate.get('volume_ratio'),
+                    })
                 rotation_score = self._calculate_convex_rotation_score(
                     candidate_side,
                     candidate_metrics,
@@ -2574,6 +2624,20 @@ class SignalScannerMixin:
                     'adaptive_trend_candidate_agreement': (
                         candidate_resolution.get('agreement')
                     ),
+                    'adaptive_regime_engine': candidate_resolution.get(
+                        'regime_engine'
+                    ),
+                    'exhaustion_reversal_allowed': bool(
+                        reversal_candidate.get('allowed')
+                    ),
+                    'exhaustion_reversal_side': reversal_candidate.get('side'),
+                    'exhaustion_reversal_score': float(
+                        reversal_candidate.get('score', 0.0) or 0.0
+                    ),
+                    'exhaustion_reversal_reason': reversal_candidate.get(
+                        'reason'
+                    ),
+                    'exhaustion_reversal_code': reversal_candidate.get('code'),
                     'adaptive_trend_raw_allowed': bool(trend_decision.allowed),
                     'adaptive_trend_raw_side': trend_decision.side,
                     'adaptive_trend_raw_score': float(trend_decision.score),

@@ -6,6 +6,7 @@ Live trading decisions remain owned by the strategy engine.
 
 from collections import Counter
 from math import isfinite, log10
+from statistics import median
 
 
 DEFAULT_EXCLUDED_SECTORS = {
@@ -729,11 +730,83 @@ def finalize_candidate(
     return result
 
 
+def _apply_residual_cross_sectional_strength(candidates):
+    """Blend market-neutral relative strength into crypto rotation ranking.
+
+    A broad market rally can make every raw return look strong.  Subtracting
+    the universe median rewards the coin that actually outperforms in the
+    selected direction.  This is ranking-only: it never creates an entry and
+    it intentionally leaves TradFi candidates unchanged.
+    """
+
+    observations = []
+    for item in candidates:
+        if item.get("tradifi_perpetual"):
+            continue
+        value = item.get("return_lookback_pct")
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if isfinite(parsed):
+            observations.append((item, parsed))
+    if len(observations) < 3:
+        return
+    market_return = median(value for _, value in observations)
+    absolute_deviations = [
+        abs(value - market_return) for _, value in observations
+    ]
+    dispersion = median(absolute_deviations)
+    if not isfinite(dispersion) or dispersion <= 1e-9:
+        return
+    robust_scale = 1.4826 * dispersion
+    for item, value in observations:
+        side = str(
+            item.get("adaptive_breakout_trend_side") or ""
+        ).strip().lower()
+        if side not in {"long", "short"}:
+            continue
+        raw_score = finite_float(
+            item.get(
+                "convex_rotation_raw_score",
+                item.get("convex_rotation_score"),
+            ),
+            0.0,
+        )
+        residual = value - market_return
+        directional_residual = residual if side == "long" else -residual
+        robust_z = max(-2.0, min(2.0, directional_residual / robust_scale))
+        residual_score = max(0.0, min(100.0, 50.0 + 25.0 * robust_z))
+        prior_profile = str(item.get("convex_rotation_profile") or "crypto_balanced")
+        prior_reason = str(item.get("convex_rotation_reason") or "").strip()
+        item.update({
+            "convex_rotation_raw_score": round(raw_score, 2),
+            "residual_strength_market_return_pct": round(market_return, 6),
+            "residual_strength_return_pct": round(value, 6),
+            "residual_strength_value_pct": round(residual, 6),
+            "residual_strength_robust_z": round(robust_z, 6),
+            "residual_strength_score": round(residual_score, 2),
+            "residual_strength_weight": 0.25,
+            "convex_rotation_profile": f"{prior_profile}_residual_v1",
+            "convex_rotation_reason": (
+                f"{prior_reason}; " if prior_reason else ""
+            ) + (
+                f"directional residual {residual:+.2f}% "
+                f"(z={robust_z:+.2f}, score={residual_score:.1f})"
+            ),
+            "convex_rotation_score": round(
+                raw_score * 0.75 + residual_score * 0.25,
+                2,
+            ),
+        })
+
+
 def rank_candidates(candidates, top_n=10):
     eligible = [
         item for item in candidates
         if item.get("scanner_accepted", item.get("accepted", False))
     ]
+    _apply_residual_cross_sectional_strength(eligible)
     use_adaptive_trend = any(
         item.get("adaptive_breakout_trend_score") is not None
         for item in eligible

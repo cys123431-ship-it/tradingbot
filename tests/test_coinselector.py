@@ -578,3 +578,58 @@ def test_resolve_next_scan_candidate_ignores_diagnostic_warnings():
 
     import asyncio
     asyncio.run(run_test())
+
+
+def test_crypto_rotation_blends_directional_residual_strength():
+    candidates = []
+    for symbol, lookback_return in (
+        ("WEAK/USDT:USDT", -5.0),
+        ("MARKET/USDT:USDT", 0.0),
+        ("STRONG/USDT:USDT", 5.0),
+    ):
+        candidates.append({
+            "symbol": symbol,
+            "scanner_accepted": True,
+            "adaptive_breakout_trend_allowed": True,
+            "adaptive_breakout_trend_side": "long",
+            "adaptive_breakout_trend_score": 75.0,
+            "adaptive_breakout_trend_weighted_momentum": 0.40,
+            "convex_rotation_score": 70.0,
+            "return_lookback_pct": lookback_return,
+            "quote_volume": 500_000_000.0,
+            "score": 70.0,
+        })
+
+    ranked = rank_candidates(candidates, top_n=3)
+
+    assert ranked[0]["symbol"] == "STRONG/USDT:USDT"
+    assert ranked[0]["convex_rotation_raw_score"] == 70.0
+    assert ranked[0]["residual_strength_score"] > 50.0
+    assert ranked[-1]["residual_strength_score"] < 50.0
+
+
+def test_residual_strength_leaves_tradfi_rotation_score_unchanged():
+    candidates = [
+        {
+            "symbol": f"EQ{index}/USDT:USDT",
+            "scanner_accepted": True,
+            "tradifi_perpetual": True,
+            "adaptive_breakout_trend_allowed": True,
+            "adaptive_breakout_trend_side": "long",
+            "adaptive_breakout_trend_score": 75.0,
+            "convex_rotation_score": 70.0 + index,
+            "return_lookback_pct": float(index),
+            "quote_volume": 500_000_000.0,
+            "score": 70.0,
+        }
+        for index in range(3)
+    ]
+
+    rank_candidates(candidates, top_n=3)
+
+    assert [item["convex_rotation_score"] for item in candidates] == [
+        70.0,
+        71.0,
+        72.0,
+    ]
+    assert all("residual_strength_score" not in item for item in candidates)

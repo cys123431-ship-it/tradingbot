@@ -848,6 +848,24 @@ def test_v8_profile_upgrade_preserves_live_position_risk_and_exit_policy():
     assert migrated["change_point_flow"]["enabled"] is True
 
 
+def test_v11_profile_upgrade_adds_regime_router_without_resetting_live_exits():
+    migrated = normalize_adaptive_breakout_trend_config(
+        {
+            "profile_version": "adaptive_trend_portfolio_v11_event_regime_consistency",
+            "base_risk_percent": 6.75,
+            "base_risk_percent_max": 7.0,
+            "runner_pct": 0.78,
+            "atr_trailing_multiplier": 3.20,
+        }
+    )
+
+    assert migrated["profile_version"] == ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION
+    assert migrated["base_risk_percent"] == pytest.approx(6.75)
+    assert migrated["runner_pct"] == pytest.approx(0.78)
+    assert migrated["atr_trailing_multiplier"] == pytest.approx(3.20)
+    assert migrated["small_account_regime_ensemble"]["enabled"] is True
+
+
 def test_v9_profile_upgrade_migrates_only_requested_small_account_leverage_policy():
     migrated = normalize_adaptive_breakout_trend_config(
         {

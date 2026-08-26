@@ -20,10 +20,14 @@ from .change_point_flow import (
     default_change_point_flow_config,
     normalize_change_point_flow_config,
 )
+from .small_account_regime import (
+    default_small_account_regime_config,
+    normalize_small_account_regime_config,
+)
 
 
 ADAPTIVE_BREAKOUT_TREND_STRATEGY = "adaptive_breakout_trend_v1"
-ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v11_event_regime_consistency"
+ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v12_regime_ensemble"
 
 
 def default_adaptive_breakout_trend_config() -> dict[str, Any]:
@@ -183,6 +187,10 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         # An event-timeframe regime/flow overlay chooses among alternative
         # entry paths. It is active only for a new sub-$1,000 trend entry.
         "change_point_flow": default_change_point_flow_config(),
+        # A separate range/exhaustion challenger is considered only when the
+        # primary trend/event router has no valid candidate. It is crypto-only
+        # and uses its own finite-target exit profile (no trend runner/pyramid).
+        "small_account_regime_ensemble": default_small_account_regime_config(),
         # Entry-shape classifiers. They remain OR-style labels on top of the
         # broad multi-speed trend, not mandatory confirmations.
         "entry_clarity_lookback_bars": 48,
@@ -240,6 +248,7 @@ def normalize_adaptive_breakout_trend_config(
                 "adaptive_trend_portfolio_v8_",
                 "adaptive_trend_portfolio_v9_",
                 "adaptive_trend_portfolio_v10_",
+                "adaptive_trend_portfolio_v11_",
             )
         )
     ):
@@ -355,6 +364,7 @@ def normalize_adaptive_breakout_trend_config(
             "adaptive_trend_portfolio_v8_",
             "adaptive_trend_portfolio_v9_",
             "adaptive_trend_portfolio_v10_",
+            "adaptive_trend_portfolio_v11_",
         )
     ):
         # Preserve the operator's other live risk/exit choices, but migrate
@@ -876,6 +886,13 @@ def normalize_adaptive_breakout_trend_config(
         normalized.get("change_point_flow")
         if isinstance(normalized.get("change_point_flow"), Mapping)
         else None
+    )
+    normalized["small_account_regime_ensemble"] = (
+        normalize_small_account_regime_config(
+            normalized.get("small_account_regime_ensemble")
+            if isinstance(normalized.get("small_account_regime_ensemble"), Mapping)
+            else None
+        )
     )
     return normalized
 

@@ -28,6 +28,11 @@ from utbreakout.profit_capture import (
     bounded_structure_anchor,
 )
 from utbreakout.relative_strength_pullback import completed_candle_rows
+from utbreakout.small_account_regime import (
+    evaluate_small_account_exhaustion_reversal,
+    resolve_regime_ensemble_candidate,
+    reversal_exit_plan_overrides,
+)
 from utbreakout.tradfi_pattern_profile import (
     TRADFI_PATTERN_PROFILE_VERSION,
     evaluate_tradfi_pattern_profile,
@@ -984,6 +989,65 @@ class SignalAlphaMixin:
         )
 
     @staticmethod
+    def _adaptive_trend_reversal_decision(reversal_candidate):
+        """Convert the regime challenger into the shared risk-plan contract."""
+
+        candidate = dict(reversal_candidate or {})
+        side = str(candidate.get('side') or '').strip().lower()
+        reference_price = _safe_float_or_none(candidate.get('reference_price'))
+        atr_value = _safe_float_or_none(candidate.get('atr'))
+        if (
+            not candidate.get('allowed')
+            or side not in {'long', 'short'}
+            or reference_price is None
+            or reference_price <= 0
+            or atr_value is None
+            or atr_value <= 0
+        ):
+            return AdaptiveBreakoutTrendDecision(
+                reason='small_account_exhaustion_reversal_data_unavailable'
+            )
+        direction = 1.0 if side == 'long' else -1.0
+        metrics = {
+            'reference_price': reference_price,
+            'atr': atr_value,
+            'structure_stop': candidate.get('structure_stop'),
+            'signal_candle_ts': candidate.get('signal_candle_ts'),
+            'risk_tier': 'base',
+            'weighted_momentum': float(
+                candidate.get('weighted_momentum', 0.0) or 0.0
+            ),
+            'fast_momentum_retention': 1.0,
+            'trend_clarity': float(
+                candidate.get('trend_clarity', 0.0) or 0.0
+            ),
+            'trend_efficiency': 0.5,
+            'volatility_scale': 1.0,
+            'entry_opportunity_score': float(
+                candidate.get('score', 0.0) or 0.0
+            ),
+            'exhaustion_reversal': True,
+            'exhaustion_reversal_profile': candidate.get('profile'),
+            'reversal_mean_target_price': candidate.get(
+                'reversal_mean_target_price'
+            ),
+            'ema_crossover': False,
+            'compression_breakout': False,
+            'pullback_resumption': False,
+            'impulse_breakout': False,
+            'weighted_continuation': False,
+            'signed_fast_ema_distance_atr': direction * 0.0,
+        }
+        return AdaptiveBreakoutTrendDecision(
+            allowed=True,
+            side=side,
+            score=float(candidate.get('score', 0.0) or 0.0),
+            risk_multiplier=1.0,
+            reason=str(candidate.get('reason') or 'confirmed exhaustion reversal'),
+            metrics=metrics,
+        )
+
+    @staticmethod
     def _tradfi_pattern_profile_runtime_config(trend_cfg=None):
         source = trend_cfg if isinstance(trend_cfg, dict) else {}
         nested = source.get('tradfi_pattern_profile')
@@ -1331,6 +1395,14 @@ class SignalAlphaMixin:
             'source': 'change_point_flow',
             'evaluations': {},
         }
+        market_regime_context = {}
+        reversal_candidate = {
+            'allowed': False,
+            'side': None,
+            'score': 0.0,
+            'reason': 'exhaustion reversal path not applicable',
+            'source': 'exhaustion_reversal',
+        }
         if small_account_aggressive_candidate:
             context_fetcher = getattr(
                 self,
@@ -1350,6 +1422,27 @@ class SignalAlphaMixin:
                 config=trend_cfg.get('change_point_flow'),
                 tradfi=is_tradfi,
             )
+            if not is_tradfi:
+                regime_fetcher = getattr(
+                    self,
+                    '_fetch_utbreakout_market_regime_context',
+                    None,
+                )
+                if callable(regime_fetcher):
+                    try:
+                        fresh_regime = await regime_fetcher(cfg, canonical)
+                        if isinstance(fresh_regime, dict):
+                            market_regime_context.update(fresh_regime)
+                    except Exception as exc:
+                        status['small_account_regime_context_error'] = str(exc)
+                reversal_candidate = evaluate_small_account_exhaustion_reversal(
+                    event_rows,
+                    trend_metrics=getattr(preliminary, 'metrics', None),
+                    futures_context=futures_context,
+                    market_regime_context=market_regime_context,
+                    config=trend_cfg.get('small_account_regime_ensemble'),
+                    tradfi=False,
+                )
 
         trend_candidate = {
             'allowed': bool(
@@ -1378,10 +1471,21 @@ class SignalAlphaMixin:
                 )
             ),
         )
+        candidate_resolution = resolve_regime_ensemble_candidate(
+            candidate_resolution,
+            reversal_candidate,
+        )
         status.update({
             'small_account_aggressive_candidate': small_account_aggressive_candidate,
             'small_account_equity_usdt': balance_for_risk,
             'trend_event_resolution': dict(candidate_resolution),
+            'small_account_regime_engine': candidate_resolution.get(
+                'regime_engine'
+            ),
+            'exhaustion_reversal_candidate': {
+                key: reversal_candidate.get(key)
+                for key in ('allowed', 'side', 'score', 'reason', 'code', 'profile')
+            },
             'independent_event_candidate': {
                 key: event_candidate.get(key)
                 for key in ('allowed', 'side', 'score', 'reason', 'code')
@@ -1390,11 +1494,12 @@ class SignalAlphaMixin:
         if not candidate_resolution.get('allowed'):
             return _finish(
                 None,
-                'Adaptive Trend/Event waiting: '
+                'Adaptive regime ensemble waiting: '
                 f"{candidate_resolution.get('reason')}; "
                 f"trend={preliminary.reason}; "
-                f"event={event_candidate.get('reason')}",
-                'REJECTED_TREND_EVENT_CANDIDATE',
+                f"event={event_candidate.get('reason')}; "
+                f"reversal={reversal_candidate.get('reason')}",
+                'REJECTED_ADAPTIVE_REGIME_ENSEMBLE',
             )
 
         tradfi_small_account_guardrail = {
@@ -1460,6 +1565,11 @@ class SignalAlphaMixin:
                 )
         if candidate_source in {'event_only', 'event_conflict_winner'}:
             decision = self._adaptive_trend_event_decision(event_candidate)
+            decision_entry_timeframe = event_timeframe
+        elif candidate_source == 'exhaustion_reversal':
+            decision = self._adaptive_trend_reversal_decision(
+                reversal_candidate
+            )
             decision_entry_timeframe = event_timeframe
         else:
             decision = evaluate_adaptive_breakout_trend(rows, l2_gate, trend_cfg)
@@ -1543,6 +1653,11 @@ class SignalAlphaMixin:
             relative_valid=selector_tier_valid,
             tradfi=is_tradfi,
         )
+        # The reversal challenger is intentionally a base-sized, finite-target
+        # trade. Cross-sectional rank must not promote it into a trend-sized
+        # strong/elite allocation.
+        if candidate_source == 'exhaustion_reversal':
+            effective_risk_tier = 'base'
         pre_tradfi_guardrail_risk_tier = effective_risk_tier
         if is_tradfi and small_account_aggressive_candidate:
             effective_risk_tier = cap_tradfi_risk_tier(
@@ -1729,6 +1844,30 @@ class SignalAlphaMixin:
                     config=trend_cfg.get('change_point_flow'),
                     tradfi=is_tradfi,
                 )
+            if candidate_source == 'exhaustion_reversal':
+                # The challenger already performed its own participation and
+                # broad-regime confirmation. Keep it out of the continuation
+                # flow scorer so that neither a contradictory trend veto nor a
+                # conviction upgrade changes its intentionally base risk.
+                change_point_flow = {
+                    'allowed': True,
+                    'code': reversal_candidate.get('code'),
+                    'reason': reversal_candidate.get('reason'),
+                    'profile': reversal_candidate.get('profile'),
+                    'state': 'exhaustion_reversal',
+                    'risk_tier': 'base',
+                    'initial_margin_fraction': reversal_candidate.get(
+                        'initial_margin_fraction',
+                        0.65,
+                    ),
+                    'stop_atr_multiplier': reversal_candidate.get(
+                        'stop_atr_multiplier',
+                        trend_cfg.get('stop_atr_multiplier', 2.00),
+                    ),
+                    'event_structure_stop': reversal_candidate.get(
+                        'event_structure_stop'
+                    ),
+                }
             change_point_flow['event_timeframe'] = event_timeframe
             status['change_point_flow'] = dict(change_point_flow)
             event_path_required = candidate_source in {
@@ -1753,13 +1892,29 @@ class SignalAlphaMixin:
                 preliminary_metrics = getattr(preliminary, 'metrics', None)
                 if isinstance(preliminary_metrics, dict) and preliminary_metrics:
                     refinement_metrics = preliminary_metrics
-            small_account_entry_refinement = evaluate_small_account_entry_refinement(
-                side,
-                refinement_metrics,
-                entry_chase_atr=chase_atr,
-                selector_candidate=selector_candidate,
-                config=trend_cfg,
-            )
+            if candidate_source == 'exhaustion_reversal':
+                small_account_entry_refinement = {
+                    'allowed': True,
+                    'code': 'SMALL_ACCOUNT_REVERSAL_REFINEMENT_COMPLETE',
+                    'reason': (
+                        'reversal-specific sweep, participation, and regime '
+                        'checks already passed'
+                    ),
+                    'profile': reversal_candidate.get('profile'),
+                    'entry_opportunity_score': reversal_candidate.get('score'),
+                    'trend_clarity': reversal_candidate.get('trend_clarity'),
+                    'pullback_resumption': False,
+                    'pullback_recovery_confirmed': False,
+                    'impulse_breakout': False,
+                }
+            else:
+                small_account_entry_refinement = evaluate_small_account_entry_refinement(
+                    side,
+                    refinement_metrics,
+                    entry_chase_atr=chase_atr,
+                    selector_candidate=selector_candidate,
+                    config=trend_cfg,
+                )
             status['small_account_entry_refinement'] = dict(
                 small_account_entry_refinement
             )
@@ -1808,6 +1963,8 @@ class SignalAlphaMixin:
                 > _ADAPTIVE_RISK_TIER_ORDER[effective_risk_tier]
             ):
                 effective_risk_tier = flow_risk_tier
+            if candidate_source == 'exhaustion_reversal':
+                effective_risk_tier = 'base'
             if candidate_source in {'event_only', 'event_conflict_winner'}:
                 event_allocation = resolve_independent_event_allocation(
                     effective_risk_tier,
@@ -2065,6 +2222,15 @@ class SignalAlphaMixin:
             'trend_event_candidate_score': candidate_resolution.get('score'),
             'trend_event_trend_score': candidate_resolution.get('trend_score'),
             'trend_event_event_score': candidate_resolution.get('event_score'),
+            'adaptive_regime_engine': candidate_resolution.get('regime_engine'),
+            'adaptive_regime_profile': (
+                reversal_candidate.get('profile')
+                if candidate_source == 'exhaustion_reversal'
+                else None
+            ),
+            'adaptive_regime_reversal_score': candidate_resolution.get(
+                'reversal_score'
+            ),
             'small_account_aggressive_enabled': bool(
                 trend_cfg.get('small_account_aggressive_enabled', True)
             ),
@@ -2316,6 +2482,13 @@ class SignalAlphaMixin:
                 trend_cfg.get('rotation_rank_confirmations', 2) or 2
             ),
         })
+        plan.update(
+            reversal_exit_plan_overrides(
+                candidate_source,
+                reversal_candidate,
+                trend_cfg.get('small_account_regime_ensemble'),
+            )
+        )
         self._set_utbot_filtered_breakout_entry_plan(canonical, plan)
         status['entry_plan'] = dict(plan)
         return _finish(side, f'ACCEPTED_ENTRY: {decision.reason}')
