@@ -1022,9 +1022,35 @@ class SignalRuntimeMixin:
                     is_sl_hit = True
 
         if is_sl_hit:
+            entry_price = state.get("entry_price")
+            try:
+                entry_price = float(entry_price or 0.0)
+                checked_exit_price = float(exit_price or 0.0)
+            except (TypeError, ValueError):
+                entry_price = 0.0
+                checked_exit_price = 0.0
+            side = str(state.get("side") or "").strip().lower()
+            profitable_stop = bool(
+                entry_price > 0.0
+                and checked_exit_price > 0.0
+                and (
+                    (side == "long" and checked_exit_price > entry_price)
+                    or (side == "short" and checked_exit_price < entry_price)
+                )
+            )
+            if profitable_stop:
+                self._utbreakout_trace_event(
+                    symbol,
+                    "DAILY_SL_LOCKOUT",
+                    "SKIPPED_PROFITABLE_STOP",
+                    side=side,
+                    entry_price=entry_price,
+                    exit_price=checked_exit_price,
+                )
+                return
             self._record_utbreakout_daily_sl_lockout(
                 symbol,
-                side=state.get("side"),
+                side=side,
                 reason="STOP_LOSS_FILLED",
                 detail=f"position closed by stop loss at {exit_price:.4f}" if exit_price else "position closed by stop loss",
             )

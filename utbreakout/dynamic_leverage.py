@@ -1068,6 +1068,9 @@ def apply_dynamic_leverage_to_plan(
     safety_buffer: float = 0.98,
 ) -> dict[str, Any]:
     updated = dict(plan or {})
+    strategy_owned_small_account_min_leverage = _finite(
+        updated.get("small_account_min_leverage")
+    )
     cfg = normalize_dynamic_leverage_config(config)
     original_exit_fields = {
         "ev_time_stop_enabled": "dynamic_leverage_original_ev_time_stop_enabled",
@@ -1174,7 +1177,12 @@ def apply_dynamic_leverage_to_plan(
                 small_account_policy["equity_threshold_usdt"]
             ),
             "small_account_min_leverage": int(
-                small_account_policy["minimum_leverage"]
+                strategy_owned_small_account_min_leverage
+                if (
+                    is_adaptive_trend
+                    and strategy_owned_small_account_min_leverage is not None
+                )
+                else small_account_policy["minimum_leverage"]
             ),
             "small_account_aggressive_active": bool(
                 aggressive_trend_policy.get("active")

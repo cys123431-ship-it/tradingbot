@@ -447,6 +447,34 @@ def test_adaptive_trend_small_account_uses_95_percent_budget_and_65_percent_init
     assert updated["risk_budget_mode"] == "adaptive_trend_small_account_aggressive"
 
 
+def test_adaptive_trend_small_account_preserves_four_x_floor_across_two_phase_sizing():
+    plan = _plan(
+        strategy="adaptive_breakout_trend_v1",
+        adaptive_breakout_trend_score=70.0,
+        adaptive_trend_risk_tier="base",
+        adaptive_breakout_trend_metrics={"risk_tier": "base"},
+        risk_distance=2.0,
+        risk_distance_pct=2.0,
+        planned_notional=100.0,
+        qty=1.0,
+        small_account_min_leverage=4,
+        small_account_strong_leverage=6,
+        small_account_elite_leverage=7,
+        small_account_leverage_steps=(4, 5, 6, 7),
+    )
+
+    staged = apply_dynamic_leverage_to_plan(plan)
+    sized = apply_dynamic_leverage_to_plan(
+        staged,
+        free_balance=100.0,
+        account_equity=100.0,
+    )
+
+    assert staged["small_account_min_leverage"] == 4
+    assert sized["small_account_min_leverage"] == 4
+    assert sized["leverage"] == 4
+
+
 @pytest.mark.parametrize(
     ("risk_tier", "score", "stop_pct", "expected_leverage", "loss_cap"),
     (

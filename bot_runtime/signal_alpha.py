@@ -2236,6 +2236,18 @@ class SignalAlphaMixin:
             'independent_event_context_broad_side': event_context.get(
                 'broad_side'
             ),
+            'independent_event_context_weighted_momentum': event_context.get(
+                'weighted_momentum'
+            ),
+            'independent_event_context_dominant_votes': event_context.get(
+                'dominant_votes'
+            ),
+            'independent_event_context_minimum_votes': event_context.get(
+                'minimum_votes'
+            ),
+            'independent_event_context_broad_conflict_min_momentum': event_context.get(
+                'broad_conflict_min_momentum'
+            ),
             'independent_event_context_fast_ema_distance_atr': event_context.get(
                 'fast_ema_distance_atr'
             ),

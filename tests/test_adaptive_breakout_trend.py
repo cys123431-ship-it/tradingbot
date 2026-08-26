@@ -87,6 +87,28 @@ def test_independent_event_context_rejects_opposite_multi_horizon_direction():
     assert result["code"] == "REJECTED_INDEPENDENT_EVENT_BROAD_TREND_CONFLICT"
 
 
+def test_independent_event_context_rejects_meaningful_opposite_weighted_drift():
+    metrics = _event_context_metrics(momentum=-0.28)
+    metrics["horizon_votes"] = {24: "long", 72: None, 168: "short"}
+
+    result = evaluate_independent_event_context("long", metrics)
+
+    assert result["allowed"] is False
+    assert result["dominant_votes"] == 1
+    assert result["weighted_momentum"] == pytest.approx(-0.28)
+    assert result["code"] == "REJECTED_INDEPENDENT_EVENT_BROAD_TREND_CONFLICT"
+
+
+def test_independent_event_context_keeps_weak_opposite_drift_as_early_reversal():
+    metrics = _event_context_metrics(momentum=-0.12)
+    metrics["horizon_votes"] = {24: "long", 72: None, 168: "short"}
+
+    result = evaluate_independent_event_context("long", metrics)
+
+    assert result["allowed"] is True
+    assert result["broad_conflict_min_momentum"] == pytest.approx(0.20)
+
+
 def test_event_only_allocation_starts_at_base_and_preserves_winner_scaling():
     allocation = resolve_independent_event_allocation("elite")
     cfg = default_adaptive_breakout_trend_config()

@@ -210,3 +210,36 @@ def test_stop_price_fill_fallback_records_lockout_without_order_id(tmp_path):
     locked, reason = engine._is_utbreakout_daily_sl_locked("XRPUSDT")
     assert locked is True
     assert "STOP_LOSS_FILLED" in reason
+
+
+def test_profitable_trailing_stop_does_not_create_daily_loss_lockout(tmp_path):
+    engine = _build_engine(tmp_path)
+
+    class Exchange:
+        def fetch_order(self, order_id, symbol):
+            return {"id": order_id, "status": "closed"}
+
+    engine.exchange = Exchange()
+    state = {
+        "side": "long",
+        "entry_price": 100.0,
+        "sl_order_id": "profit-lock-stop",
+        "last_stop_price": 105.0,
+    }
+
+    asyncio.run(
+        engine._check_and_record_sl_lockout_async(
+            "HYPE/USDT:USDT",
+            state,
+            exit_price=105.0,
+        )
+    )
+
+    locked, _ = engine._is_utbreakout_daily_sl_locked("HYPEUSDT")
+    assert locked is False
+    events = engine._utbreakout_recent_trace_events("HYPEUSDT", limit=20)
+    assert any(
+        event["stage"] == "DAILY_SL_LOCKOUT"
+        and event["status"] == "SKIPPED_PROFITABLE_STOP"
+        for event in events
+    )

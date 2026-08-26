@@ -23,7 +23,7 @@ from .change_point_flow import (
 
 
 ADAPTIVE_BREAKOUT_TREND_STRATEGY = "adaptive_breakout_trend_v1"
-ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v10_event_risk_profit_lock"
+ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v11_event_regime_consistency"
 
 
 def default_adaptive_breakout_trend_config() -> dict[str, Any]:
@@ -156,6 +156,11 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         # EMA.  The limit intentionally matches the existing impulse-entry
         # geometry instead of being fitted to a handful of live outcomes.
         "small_account_event_only_max_fast_ema_distance_atr": 1.50,
+        # Fast order-flow/regime entries remain an independent OR path, but a
+        # moderate established multi-speed drift in the opposite direction is
+        # a genuine regime conflict rather than a missing confirmation.  Weak
+        # (<0.20) broad momentum still permits an early reversal.
+        "small_account_event_only_broad_conflict_min_momentum": 0.20,
         # Event strength is an entry-timing input, not a calibrated capital
         # confidence score.  Higher initial tiers require alignment with the
         # independent multi-horizon trend; event-only positions can still
@@ -234,6 +239,7 @@ def normalize_adaptive_breakout_trend_config(
                 "adaptive_trend_portfolio_v7_",
                 "adaptive_trend_portfolio_v8_",
                 "adaptive_trend_portfolio_v9_",
+                "adaptive_trend_portfolio_v10_",
             )
         )
     ):
@@ -300,6 +306,7 @@ def normalize_adaptive_breakout_trend_config(
             "small_account_max_adverse_signal_move_atr",
             "small_account_crossover_max_fast_ema_distance_atr",
             "small_account_event_only_max_fast_ema_distance_atr",
+            "small_account_event_only_broad_conflict_min_momentum",
             "small_account_event_only_risk_tier_cap",
             "small_account_lower_timeframe_conflict_veto_enabled",
             "small_account_lower_timeframe_conflict_min_alignment",
@@ -347,6 +354,7 @@ def normalize_adaptive_breakout_trend_config(
             "adaptive_trend_portfolio_v7_",
             "adaptive_trend_portfolio_v8_",
             "adaptive_trend_portfolio_v9_",
+            "adaptive_trend_portfolio_v10_",
         )
     ):
         # Preserve the operator's other live risk/exit choices, but migrate
@@ -366,6 +374,7 @@ def normalize_adaptive_breakout_trend_config(
             "small_account_roe_profit_lock_min_gap_percent",
             "small_account_roe_profit_lock_max_gap_percent",
             "small_account_roe_profit_lock_min_floor_percent",
+            "small_account_event_only_broad_conflict_min_momentum",
         ):
             normalized[key] = defaults[key]
     # Preserve all other operator-tuned risk/exit values while defaults above
@@ -754,6 +763,20 @@ def normalize_adaptive_breakout_trend_config(
         0.50,
         4.0,
     )
+    normalized[
+        "small_account_event_only_broad_conflict_min_momentum"
+    ] = _bounded(
+        _finite(
+            normalized.get(
+                "small_account_event_only_broad_conflict_min_momentum"
+            ),
+            defaults[
+                "small_account_event_only_broad_conflict_min_momentum"
+            ],
+        ),
+        0.05,
+        0.75,
+    )
     event_only_tier_cap = str(
         normalized.get("small_account_event_only_risk_tier_cap", "base")
         or "base"
@@ -1129,12 +1152,17 @@ def evaluate_independent_event_context(
     )
     latest_range_atr = _finite(metrics.get("latest_range_atr"), None)
     volatility_ratio = _finite(metrics.get("volatility_ratio"), None)
+    broad_conflict_min_momentum = float(
+        cfg["small_account_event_only_broad_conflict_min_momentum"]
+    )
     result = {
         "allowed": True,
         "code": "INDEPENDENT_EVENT_CONTEXT_OK",
         "reason": "independent event passed 1h context guard",
         "profile": ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION,
         "broad_side": broad_side,
+        "weighted_momentum": weighted_momentum,
+        "broad_conflict_min_momentum": broad_conflict_min_momentum,
         "dominant_votes": dominant_votes,
         "minimum_votes": minimum_votes,
         "fast_ema_distance_atr": fast_ema_distance_atr,
@@ -1152,7 +1180,10 @@ def evaluate_independent_event_context(
     if (
         broad_side in {"long", "short"}
         and broad_side != normalized_side
-        and dominant_votes >= minimum_votes
+        and (
+            dominant_votes >= minimum_votes
+            or abs(weighted_momentum) >= broad_conflict_min_momentum
+        )
     ):
         result.update({
             "allowed": False,
@@ -1160,7 +1191,8 @@ def evaluate_independent_event_context(
             "reason": (
                 f"independent event {normalized_side} conflicts with "
                 f"{broad_side} multi-horizon direction "
-                f"({dominant_votes}/{len(horizon_votes)} votes)"
+                f"(momentum={weighted_momentum:+.2f}, "
+                f"{dominant_votes}/{len(horizon_votes)} votes)"
             ),
         })
         return result
