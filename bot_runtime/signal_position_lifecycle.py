@@ -2,8 +2,19 @@
 
 from __future__ import annotations
 
+import json
+import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+
+from .diagnostics import (
+    read_small_account_challenger_events,
+    small_account_challenger_logger,
+)
+from utbreakout.small_account_regime import (
+    evaluate_regime_challenger_promotion,
+    normalize_small_account_regime_config,
+)
 
 
 _KST = ZoneInfo('Asia/Seoul')
@@ -987,6 +998,14 @@ class SignalPositionLifecycleMixin:
             'tp2_filled': False,
             'tp2_fallback_reached_loops': 0,
             'created_at': datetime.now(timezone.utc).isoformat(),
+            'shadow_engine': plan.get('shadow_engine'),
+            'shadow_profile': plan.get('shadow_profile'),
+            'shadow_regime': plan.get('shadow_regime'),
+            'estimated_cost_r': plan.get('estimated_cost_r'),
+            'engine_score': plan.get('engine_score'),
+            'multi_timeframe_direction_score': plan.get(
+                'multi_timeframe_direction_score'
+            ),
         }
         return self._set_utbreakout_trailing_state(symbol, state)
 
@@ -2664,10 +2683,42 @@ class SignalPositionLifecycleMixin:
                         'bars_elapsed': result.get('bars_elapsed'),
                         'observation_window_bars': result.get('observation_window_bars'),
                         'shadow_exit_ts': result.get('exit_ts'),
+                        'shadow_engine': item.get('shadow_engine'),
+                        'shadow_profile': item.get('shadow_profile'),
+                        'shadow_regime': item.get('shadow_regime'),
+                        'estimated_cost_r': item.get('estimated_cost_r'),
+                        'net_pnl_r': (
+                            float(result.get('pnl_r') or 0.0)
+                            - float(item.get('estimated_cost_r') or 0.0)
+                        ),
+                        'engine_score': item.get('engine_score'),
+                        'multi_timeframe_direction_score': item.get(
+                            'multi_timeframe_direction_score'
+                        ),
                     }
                     self._record_utbreakout_diagnostic_event(symbol, status, event='shadow_outcome', extra=extra)
+                    if item.get('shadow_engine') == 'exhaustion_reversal':
+                        challenger_payload = {
+                            'ts': datetime.now(timezone.utc).isoformat(),
+                            'event': 'shadow_outcome',
+                            'symbol': symbol,
+                            'side': item.get('side'),
+                            **extra,
+                        }
+                        small_account_challenger_logger.info(
+                            json.dumps(
+                                challenger_payload,
+                                ensure_ascii=False,
+                                separators=(',', ':'),
+                            )
+                        )
                     if isinstance(getattr(self, 'utbreakout_shadow_stats_cache', None), dict):
                         self.utbreakout_shadow_stats_cache.clear()
+                    if isinstance(
+                        getattr(self, 'small_account_regime_promotion_cache', None),
+                        dict,
+                    ):
+                        self.small_account_regime_promotion_cache.clear()
                     item['shadow_triple_logged'] = True
                     resolved.append(extra)
 
@@ -2716,6 +2767,122 @@ class SignalPositionLifecycleMixin:
                     self.utbreakout_shadow_resolved_keys = resolved_keys
                 resolved_keys.add(key)
         return resolved
+
+    def _register_small_account_regime_challenger(
+        self,
+        symbol,
+        candidate,
+        regime_config,
+        multi_timeframe_context=None,
+        cost_context=None,
+    ):
+        candidate = dict(candidate or {})
+        if not candidate.get('allowed') or candidate.get('side') not in {'long', 'short'}:
+            return None
+        cfg = normalize_small_account_regime_config(regime_config)
+        entry_price = _safe_float_or_none(candidate.get('reference_price'))
+        atr_value = _safe_float_or_none(candidate.get('atr'))
+        stop_atr = _safe_float_or_none(candidate.get('stop_atr_multiplier'))
+        if not entry_price or not atr_value or not stop_atr:
+            return None
+        risk_distance = atr_value * stop_atr
+        side = str(candidate.get('side')).lower()
+        stop_loss = (
+            entry_price - risk_distance if side == 'long' else entry_price + risk_distance
+        )
+        weighted_target_r = (
+            float(cfg['tp1_ratio'])
+            * float(candidate.get('reversal_tp1_r', cfg['tp1_r_floor']) or cfg['tp1_r_floor'])
+            + float(cfg['tp2_ratio'])
+            * float(candidate.get('reversal_tp2_r', cfg['tp2_r_floor']) or cfg['tp2_r_floor'])
+        )
+        take_profit = (
+            entry_price + risk_distance * weighted_target_r
+            if side == 'long'
+            else entry_price - risk_distance * weighted_target_r
+        )
+        spread_pct = max(
+            0.0,
+            float(_safe_float_or_none((cost_context or {}).get('futures_spread_pct')) or 0.0),
+        )
+        funding = float(
+            _safe_float_or_none((cost_context or {}).get('funding_rate')) or 0.0
+        )
+        side_sign = 1.0 if side == 'long' else -1.0
+        estimated_cost_r = (
+            float(cfg['estimated_round_trip_fee_r'])
+            + float(cfg['estimated_slippage_r'])
+            + float(cfg['estimated_missed_fill_r'])
+            + min(0.20, spread_pct / 2.0)
+            + min(0.12, max(0.0, side_sign * funding) * 40.0)
+        )
+        decision_ts = int(candidate.get('signal_candle_ts') or 0)
+        status = {
+            'candidate_side': side,
+            'decision_candle_ts': decision_ts,
+            'entry_price': entry_price,
+            'reason': candidate.get('reason'),
+            'entry_timeframe': '15m',
+            'htf_timeframe': '4h',
+        }
+        plan = {
+            'decision_candle_ts': decision_ts,
+            'entry_price': entry_price,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'risk_distance': risk_distance,
+            'rr_multiple': weighted_target_r,
+            'entry_timeframe': '15m',
+            'htf_timeframe': '4h',
+            'shadow_engine': 'exhaustion_reversal',
+            'shadow_profile': candidate.get('profile'),
+            'shadow_regime': (multi_timeframe_context or {}).get('regime', 'unknown'),
+            'estimated_cost_r': estimated_cost_r,
+            'engine_score': candidate.get('score'),
+            'multi_timeframe_direction_score': (
+                multi_timeframe_context or {}
+            ).get('weighted_direction_score'),
+        }
+        shadow_cfg = {
+            'shadow_triple_barrier_enabled': True,
+            'shadow_triple_barrier_max_bars': int(cfg['time_stop_bars']),
+            'shadow_runner_exit_enabled': False,
+            'take_profit_r_multiple': weighted_target_r,
+        }
+        selected_set = {
+            'id': 'small_account_regime_challenger_v2',
+            'name': 'Small-account regime challenger v2',
+        }
+        return self._register_utbreakout_shadow_candidate(
+            symbol,
+            side,
+            status,
+            plan,
+            shadow_cfg,
+            selected_set,
+        )
+
+    def _get_small_account_regime_promotion_status(self, regime_config=None):
+        cfg = normalize_small_account_regime_config(regime_config)
+        cache = getattr(self, 'small_account_regime_promotion_cache', None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self.small_account_regime_promotion_cache = cache
+        cache_key = (
+            int(cfg['promotion_lookback_days']),
+            int(cfg['promotion_min_trades']),
+            int(cfg['promotion_multiple_testing_trials']),
+        )
+        now = time.time()
+        cached = cache.get(cache_key)
+        if isinstance(cached, dict) and now - float(cached.get('cached_at', 0) or 0) < 60:
+            return dict(cached.get('status') or {})
+        events = read_small_account_challenger_events(
+            days=int(cfg['promotion_lookback_days'])
+        )
+        status = evaluate_regime_challenger_promotion(events, config=cfg)
+        cache[cache_key] = {'cached_at': now, 'status': status}
+        return dict(status)
 
     def _get_utbreakout_shadow_stats(self, symbol, side, cfg, selected_set=None):
         days = int(cfg.get('adaptive_exit_lookback_days', 14) or 14)

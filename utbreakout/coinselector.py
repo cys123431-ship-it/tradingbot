@@ -877,6 +877,85 @@ def rank_candidates(candidates, top_n=10):
     return selected
 
 
+def apply_adaptive_top_candidate_gate(
+    report,
+    *,
+    enabled=True,
+    minimum_score_gap=2.5,
+):
+    """Concentrate the adaptive profile in one clear cross-sectional winner."""
+
+    result = dict(report or {})
+    selected = list(result.get("selected") or [])
+    watch_only = list(result.get("watch_only") or [])
+    if not enabled:
+        return result
+    pool = []
+    seen = set()
+    for item in selected + watch_only:
+        if not isinstance(item, dict):
+            continue
+        identity = id(item)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        pool.append(item)
+    actionable = [
+        item for item in pool if item.get("adaptive_breakout_trend_allowed")
+    ]
+    actionable.sort(
+        key=lambda item: finite_float(
+            item.get("convex_rotation_score"),
+            finite_float(item.get("adaptive_breakout_trend_score"), 0.0),
+        ),
+        reverse=True,
+    )
+    if not actionable:
+        result.update({
+            "selected": [],
+            "watch_only": pool,
+            "adaptive_top_candidate_gate": "no_actionable_candidate",
+        })
+        return result
+    top = actionable[0]
+    top_score = finite_float(
+        top.get("convex_rotation_score"),
+        finite_float(top.get("adaptive_breakout_trend_score"), 0.0),
+    )
+    runner_up_score = None
+    if len(actionable) > 1:
+        runner_up_score = finite_float(
+            actionable[1].get("convex_rotation_score"),
+            finite_float(actionable[1].get("adaptive_breakout_trend_score"), 0.0),
+        )
+    score_gap = (
+        top_score - runner_up_score if runner_up_score is not None else None
+    )
+    if score_gap is not None and score_gap < max(0.0, float(minimum_score_gap)):
+        for item in pool:
+            item["selection_state"] = "WATCH_ONLY"
+        result.update({
+            "selected": [],
+            "watch_only": pool,
+            "adaptive_top_candidate_gate": "ambiguous",
+            "adaptive_top_candidate_score_gap": round(score_gap, 4),
+            "adaptive_top_candidate_minimum_gap": float(minimum_score_gap),
+        })
+        return result
+    for item in pool:
+        item["selection_state"] = "SELECTED" if item is top else "WATCH_ONLY"
+    result.update({
+        "selected": [top],
+        "watch_only": [item for item in pool if item is not top],
+        "adaptive_top_candidate_gate": "selected",
+        "adaptive_top_candidate_score_gap": (
+            round(score_gap, 4) if score_gap is not None else None
+        ),
+        "adaptive_top_candidate_minimum_gap": float(minimum_score_gap),
+    })
+    return result
+
+
 def detect_concentration(candidates, key="auto_set_id", threshold_pct=50.0):
     values = [item.get(key) for item in candidates if item.get(key) not in (None, "", 0)]
     if not values:

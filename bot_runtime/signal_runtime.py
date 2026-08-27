@@ -474,6 +474,8 @@ class SignalRuntimeMixin:
         self.utbreakout_futures_context_cache = {}
         self.utbreakout_orderflow_snapshots = {}
         self.utbreakout_market_regime_cache = {}
+        self.small_account_multitimeframe_cache = {}
+        self.small_account_regime_promotion_cache = {}
         self.tradfi_pattern_context_cache = {}
         self.utbreakout_shadow_pending = {}
         self.utbreakout_shadow_resolved_keys = set()

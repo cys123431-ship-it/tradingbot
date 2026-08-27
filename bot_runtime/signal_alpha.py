@@ -1396,6 +1396,8 @@ class SignalAlphaMixin:
             'evaluations': {},
         }
         market_regime_context = {}
+        multi_timeframe_context = {}
+        regime_promotion_status = {}
         reversal_candidate = {
             'allowed': False,
             'side': None,
@@ -1416,6 +1418,28 @@ class SignalAlphaMixin:
                         futures_context.update(fresh_context)
                 except Exception as exc:
                     status['change_point_flow_context_error'] = str(exc)
+            mtf_seed = {
+                event_timeframe: event_rows,
+                timeframe: rows,
+            }
+            if is_tradfi and tradfi_context:
+                mtf_seed['4h'] = tradfi_context.get('higher_timeframe_rows') or []
+                mtf_seed['1d'] = tradfi_context.get('daily_rows') or []
+            mtf_fetcher = getattr(
+                self,
+                '_fetch_small_account_multitimeframe_context',
+                None,
+            )
+            if callable(mtf_fetcher):
+                try:
+                    multi_timeframe_context = await mtf_fetcher(
+                        canonical,
+                        seed_rows=mtf_seed,
+                        config=trend_cfg.get('small_account_regime_ensemble'),
+                        now_ms=evaluation_now_ms,
+                    )
+                except Exception as exc:
+                    status['small_account_multitimeframe_error'] = str(exc)
             event_candidate = select_independent_change_point_flow_candidate(
                 event_rows,
                 futures_context=futures_context,
@@ -1440,9 +1464,32 @@ class SignalAlphaMixin:
                     trend_metrics=getattr(preliminary, 'metrics', None),
                     futures_context=futures_context,
                     market_regime_context=market_regime_context,
+                    multi_timeframe_context=multi_timeframe_context,
                     config=trend_cfg.get('small_account_regime_ensemble'),
                     tradfi=False,
                 )
+                promotion_getter = getattr(
+                    self,
+                    '_get_small_account_regime_promotion_status',
+                    None,
+                )
+                if callable(promotion_getter):
+                    regime_promotion_status = promotion_getter(
+                        trend_cfg.get('small_account_regime_ensemble')
+                    )
+                register_challenger = getattr(
+                    self,
+                    '_register_small_account_regime_challenger',
+                    None,
+                )
+                if callable(register_challenger):
+                    register_challenger(
+                        canonical,
+                        reversal_candidate,
+                        trend_cfg.get('small_account_regime_ensemble'),
+                        multi_timeframe_context,
+                        futures_context,
+                    )
 
         trend_candidate = {
             'allowed': bool(
@@ -1452,6 +1499,20 @@ class SignalAlphaMixin:
             'side': preliminary.side,
             'score': float(preliminary.score or 0.0),
             'reason': preliminary.reason,
+            'fresh_continuation': bool(
+                (getattr(preliminary, 'metrics', None) or {}).get(
+                    'continuation_reacceleration'
+                )
+                or (getattr(preliminary, 'metrics', None) or {}).get(
+                    'compression_breakout'
+                )
+                or (getattr(preliminary, 'metrics', None) or {}).get(
+                    'pullback_resumption'
+                )
+                or (getattr(preliminary, 'metrics', None) or {}).get(
+                    'impulse_breakout'
+                )
+            ),
         }
         conflict_margin = float(
             (trend_cfg.get('change_point_flow') or {}).get(
@@ -1474,6 +1535,10 @@ class SignalAlphaMixin:
         candidate_resolution = resolve_regime_ensemble_candidate(
             candidate_resolution,
             reversal_candidate,
+            multi_timeframe_context=multi_timeframe_context,
+            cost_context=futures_context,
+            promotion_status=regime_promotion_status,
+            config=trend_cfg.get('small_account_regime_ensemble'),
         )
         status.update({
             'small_account_aggressive_candidate': small_account_aggressive_candidate,
@@ -1482,6 +1547,8 @@ class SignalAlphaMixin:
             'small_account_regime_engine': candidate_resolution.get(
                 'regime_engine'
             ),
+            'small_account_multitimeframe': dict(multi_timeframe_context),
+            'small_account_regime_promotion': dict(regime_promotion_status),
             'exhaustion_reversal_candidate': {
                 key: reversal_candidate.get(key)
                 for key in ('allowed', 'side', 'score', 'reason', 'code', 'profile')
@@ -2231,6 +2298,19 @@ class SignalAlphaMixin:
             'adaptive_regime_reversal_score': candidate_resolution.get(
                 'reversal_score'
             ),
+            'adaptive_regime_selected_net_edge': candidate_resolution.get(
+                'selected_net_edge'
+            ),
+            'adaptive_regime_primary_net_edge': candidate_resolution.get(
+                'primary_net_edge'
+            ),
+            'adaptive_regime_reversal_net_edge': candidate_resolution.get(
+                'reversal_net_edge'
+            ),
+            'adaptive_regime_multitimeframe': dict(
+                multi_timeframe_context
+            ),
+            'adaptive_regime_promotion': dict(regime_promotion_status),
             'small_account_aggressive_enabled': bool(
                 trend_cfg.get('small_account_aggressive_enabled', True)
             ),

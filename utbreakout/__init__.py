@@ -7,6 +7,7 @@ from .indicators import (
     rolling_percentile_rank,
 )
 from .coinselector import (
+    apply_adaptive_top_candidate_gate,
     build_base_candidate,
     build_selection_report,
     default_coin_selector_config,
@@ -49,6 +50,8 @@ from .tradfi_small_account import (
 from .small_account_regime import (
     SMALL_ACCOUNT_REGIME_PROFILE_VERSION,
     default_small_account_regime_config,
+    evaluate_multi_timeframe_regime,
+    evaluate_regime_challenger_promotion,
     evaluate_small_account_exhaustion_reversal,
     normalize_small_account_regime_config,
     resolve_regime_ensemble_candidate,
@@ -236,6 +239,8 @@ __all__ = [
     "evaluate_tradfi_small_account_guardrails",
     "SMALL_ACCOUNT_REGIME_PROFILE_VERSION",
     "default_small_account_regime_config",
+    "evaluate_multi_timeframe_regime",
+    "evaluate_regime_challenger_promotion",
     "evaluate_small_account_exhaustion_reversal",
     "normalize_small_account_regime_config",
     "resolve_regime_ensemble_candidate",
@@ -246,6 +251,7 @@ __all__ = [
     "normalize_opportunity_risk_config",
     "select_opportunity_risk",
     "default_coin_selector_config",
+    "apply_adaptive_top_candidate_gate",
     "finalize_candidate",
     "market_is_tradifi_perpetual",
     "market_tradifi_underlying_type",

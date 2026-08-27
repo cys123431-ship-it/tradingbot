@@ -21,6 +21,14 @@ UTBREAKOUT_DIAGNOSTIC_LOG_FILE = os.path.abspath(
 )
 UTBREAKOUT_DIAGNOSTIC_MAX_BYTES = 5 * 1024 * 1024
 UTBREAKOUT_DIAGNOSTIC_BACKUP_COUNT = 2
+SMALL_ACCOUNT_CHALLENGER_LEDGER_FILE = os.path.abspath(
+    os.environ.get(
+        'SMALL_ACCOUNT_CHALLENGER_LEDGER_FILE',
+        os.path.join(RUNTIME_DIR, 'small_account_challenger.jsonl'),
+    )
+)
+SMALL_ACCOUNT_CHALLENGER_MAX_BYTES = 5 * 1024 * 1024
+SMALL_ACCOUNT_CHALLENGER_BACKUP_COUNT = 4
 PREDICTION_PAPER_LEDGER_FILE = os.path.abspath(
     os.environ.get(
         'PREDICTION_PAPER_LEDGER_FILE',
@@ -55,6 +63,26 @@ def _build_utbreakout_diagnostic_logger():
 
 
 utbreakout_diag_logger = _build_utbreakout_diagnostic_logger()
+
+
+def _build_small_account_challenger_logger():
+    ledger_logger = logging.getLogger('small_account_challenger')
+    ledger_logger.setLevel(logging.INFO)
+    ledger_logger.propagate = False
+    if not any(isinstance(handler, RotatingFileHandler) for handler in ledger_logger.handlers):
+        os.makedirs(os.path.dirname(SMALL_ACCOUNT_CHALLENGER_LEDGER_FILE), exist_ok=True)
+        handler = RotatingFileHandler(
+            SMALL_ACCOUNT_CHALLENGER_LEDGER_FILE,
+            maxBytes=SMALL_ACCOUNT_CHALLENGER_MAX_BYTES,
+            backupCount=SMALL_ACCOUNT_CHALLENGER_BACKUP_COUNT,
+            encoding='utf-8',
+        )
+        handler.setFormatter(logging.Formatter('%(message)s'))
+        ledger_logger.addHandler(handler)
+    return ledger_logger
+
+
+small_account_challenger_logger = _build_small_account_challenger_logger()
 
 
 def _build_prediction_diagnostic_logger():
@@ -172,6 +200,36 @@ def read_utbreakout_diagnostic_events(days=7):
     return events
 
 
+def read_small_account_challenger_events(days=365):
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(days or 365)))
+    paths = []
+    for index in range(SMALL_ACCOUNT_CHALLENGER_BACKUP_COUNT, 0, -1):
+        rotated = f"{SMALL_ACCOUNT_CHALLENGER_LEDGER_FILE}.{index}"
+        if os.path.exists(rotated):
+            paths.append(rotated)
+    if os.path.exists(SMALL_ACCOUNT_CHALLENGER_LEDGER_FILE):
+        paths.append(SMALL_ACCOUNT_CHALLENGER_LEDGER_FILE)
+    events = []
+    for path in paths:
+        try:
+            with open(path, 'r', encoding='utf-8') as stream:
+                for line in stream:
+                    try:
+                        event = json.loads(line)
+                        event_ts = datetime.fromisoformat(
+                            str(event.get('ts') or '').replace('Z', '+00:00')
+                        )
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        continue
+                    if event_ts.tzinfo is None:
+                        event_ts = event_ts.replace(tzinfo=timezone.utc)
+                    if event_ts.astimezone(timezone.utc) >= cutoff:
+                        events.append(event)
+        except OSError:
+            continue
+    return events
+
+
 def format_utbreakout_diagnostic_summary():
     events = read_utbreakout_diagnostic_events(days=7)
     if not events:
@@ -232,12 +290,17 @@ __all__ = (
     'UTBREAKOUT_DIAGNOSTIC_LOG_FILE',
     'UTBREAKOUT_DIAGNOSTIC_MAX_BYTES',
     'UTBREAKOUT_DIAGNOSTIC_BACKUP_COUNT',
+    'SMALL_ACCOUNT_CHALLENGER_LEDGER_FILE',
+    'SMALL_ACCOUNT_CHALLENGER_MAX_BYTES',
+    'SMALL_ACCOUNT_CHALLENGER_BACKUP_COUNT',
     'PREDICTION_PAPER_LEDGER_FILE',
     'PREDICTION_DIAGNOSTIC_LOG_FILE',
     'PREDICTION_DIAGNOSTIC_MAX_BYTES',
     'PREDICTION_DIAGNOSTIC_BACKUP_COUNT',
     '_build_utbreakout_diagnostic_logger',
     'utbreakout_diag_logger',
+    '_build_small_account_challenger_logger',
+    'small_account_challenger_logger',
     '_build_prediction_diagnostic_logger',
     'prediction_diag_logger',
     'log_prediction_diagnostic_event',
@@ -245,6 +308,7 @@ __all__ = (
     '_safe_float_or_none',
     'get_utbreakout_diagnostic_log_paths',
     'read_utbreakout_diagnostic_events',
+    'read_small_account_challenger_events',
     'format_utbreakout_diagnostic_summary',
     'format_utbreakout_research_summary',
 )

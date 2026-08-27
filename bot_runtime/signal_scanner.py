@@ -11,7 +11,9 @@ from utbreakout.change_point_flow import (
     resolve_trend_event_candidate,
     select_independent_change_point_flow_candidate,
 )
+from utbreakout.coinselector import apply_adaptive_top_candidate_gate
 from utbreakout.small_account_regime import (
+    evaluate_multi_timeframe_regime,
     evaluate_small_account_exhaustion_reversal,
     resolve_regime_ensemble_candidate,
 )
@@ -2099,6 +2101,70 @@ class SignalScannerMixin:
         self.utbreakout_market_regime_cache[cache_key] = {'cached_at': now, 'data': data}
         return data
 
+    async def _fetch_small_account_multitimeframe_context(
+        self,
+        symbol,
+        *,
+        seed_rows=None,
+        config=None,
+        now_ms=None,
+    ):
+        """Fetch only missing completed timeframes and return the pure MTF blend."""
+
+        canonical = self._canonical_futures_symbol(symbol)
+        now = time.time()
+        evaluation_now_ms = int(now_ms or now * 1000.0)
+        supplied = seed_rows if isinstance(seed_rows, dict) else {}
+        cache = getattr(self, 'small_account_multitimeframe_cache', None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self.small_account_multitimeframe_cache = cache
+        rows_by_timeframe = {}
+        errors = {}
+        for timeframe in ('15m', '1h', '4h', '1d'):
+            supplied_rows = supplied.get(timeframe)
+            if supplied_rows:
+                rows_by_timeframe[timeframe] = list(supplied_rows)
+                continue
+            key = f'{canonical}:{timeframe}'
+            ttl = 120.0 if timeframe in {'15m', '1h'} else 600.0
+            cached = cache.get(key)
+            if isinstance(cached, dict) and now - float(cached.get('cached_at', 0) or 0) < ttl:
+                rows_by_timeframe[timeframe] = list(cached.get('rows') or [])
+                continue
+            try:
+                ohlcv = await asyncio.to_thread(
+                    self.market_data_exchange.fetch_ohlcv,
+                    canonical,
+                    timeframe,
+                    limit=140,
+                )
+                rows = self._relative_strength_pullback_rows_from_ohlcv(ohlcv)
+                rows = completed_candle_rows(
+                    rows,
+                    timeframe,
+                    {'exclude_incomplete_live_candle': True},
+                    now_ms=evaluation_now_ms,
+                )
+                rows_by_timeframe[timeframe] = rows
+                cache[key] = {'cached_at': now, 'rows': rows}
+            except Exception as exc:
+                rows_by_timeframe[timeframe] = []
+                errors[timeframe] = str(exc)
+        while len(cache) > 384:
+            oldest = min(
+                cache,
+                key=lambda key: float((cache.get(key) or {}).get('cached_at', 0) or 0),
+            )
+            cache.pop(oldest, None)
+        context = evaluate_multi_timeframe_regime(
+            rows_by_timeframe,
+            config=config,
+        )
+        context['errors'] = errors
+        context['timeframes'] = tuple(rows_by_timeframe)
+        return context
+
     async def _load_coin_selector_markets(self):
         try:
             markets = await asyncio.to_thread(self.market_data_exchange.load_markets)
@@ -2418,6 +2484,8 @@ class SignalScannerMixin:
                     'reason': 'exhaustion reversal path not applicable',
                     'source': 'exhaustion_reversal',
                 }
+                multi_timeframe_context = {}
+                regime_promotion_status = {}
                 small_account_candidate = False
                 balance_reader = getattr(
                     self,
@@ -2463,6 +2531,28 @@ class SignalScannerMixin:
                             tradfi=bool(base_candidate.get('tradifi_perpetual')),
                         )
                     )
+                    mtf_seed = {
+                        entry_tf: event_rows,
+                        trend_tf: trend_rows,
+                    }
+                    if bool(base_candidate.get('tradifi_perpetual')):
+                        mtf_seed['4h'] = (
+                            profile_context.get('higher_timeframe_rows') or []
+                        )
+                        mtf_seed['1d'] = profile_context.get('daily_rows') or []
+                    try:
+                        multi_timeframe_context = (
+                            await self._fetch_small_account_multitimeframe_context(
+                                symbol,
+                                seed_rows=mtf_seed,
+                                config=trend_cfg.get(
+                                    'small_account_regime_ensemble'
+                                ),
+                                now_ms=int(time.time() * 1000.0),
+                            )
+                        )
+                    except Exception as exc:
+                        result['small_account_multitimeframe_error'] = str(exc)
                     if not bool(base_candidate.get('tradifi_perpetual')):
                         try:
                             market_regime_context = await self._fetch_utbreakout_market_regime_context(
@@ -2477,11 +2567,41 @@ class SignalScannerMixin:
                             trend_metrics=trend_metrics,
                             futures_context=futures_context,
                             market_regime_context=market_regime_context,
+                            multi_timeframe_context=multi_timeframe_context,
                             config=trend_cfg.get(
                                 'small_account_regime_ensemble'
                             ),
                             tradfi=False,
                         )
+                        promotion_getter = getattr(
+                            self,
+                            '_get_small_account_regime_promotion_status',
+                            None,
+                        )
+                        if callable(promotion_getter):
+                            regime_promotion_status = promotion_getter(
+                                trend_cfg.get('small_account_regime_ensemble')
+                            )
+                        updater = getattr(
+                            self,
+                            '_update_utbreakout_shadow_triple_barrier',
+                            None,
+                        )
+                        if callable(updater) and event_rows:
+                            updater(symbol, pd.DataFrame(event_rows), ut_cfg)
+                        register_challenger = getattr(
+                            self,
+                            '_register_small_account_regime_challenger',
+                            None,
+                        )
+                        if callable(register_challenger):
+                            register_challenger(
+                                symbol,
+                                reversal_candidate,
+                                trend_cfg.get('small_account_regime_ensemble'),
+                                multi_timeframe_context,
+                                futures_context,
+                            )
                 trend_candidate = {
                     'allowed': bool(
                         trend_decision.allowed
@@ -2490,6 +2610,12 @@ class SignalScannerMixin:
                     'side': trend_decision.side,
                     'score': float(trend_decision.score),
                     'reason': trend_decision.reason,
+                    'fresh_continuation': bool(
+                        trend_metrics.get('continuation_reacceleration')
+                        or trend_metrics.get('compression_breakout')
+                        or trend_metrics.get('pullback_resumption')
+                        or trend_metrics.get('impulse_breakout')
+                    ),
                 }
                 candidate_resolution = resolve_trend_event_candidate(
                     trend_candidate,
@@ -2505,6 +2631,10 @@ class SignalScannerMixin:
                 candidate_resolution = resolve_regime_ensemble_candidate(
                     candidate_resolution,
                     reversal_candidate,
+                    multi_timeframe_context=multi_timeframe_context,
+                    cost_context=futures_context,
+                    promotion_status=regime_promotion_status,
+                    config=trend_cfg.get('small_account_regime_ensemble'),
                 )
                 tradfi_small_account_guardrail = {
                     'profile': TRADFI_SMALL_ACCOUNT_PROFILE_VERSION,
@@ -2626,6 +2756,15 @@ class SignalScannerMixin:
                     ),
                     'adaptive_regime_engine': candidate_resolution.get(
                         'regime_engine'
+                    ),
+                    'small_account_aggressive_candidate': bool(
+                        small_account_candidate
+                    ),
+                    'small_account_multitimeframe': dict(
+                        multi_timeframe_context
+                    ),
+                    'small_account_regime_promotion': dict(
+                        regime_promotion_status
                     ),
                     'exhaustion_reversal_allowed': bool(
                         reversal_candidate.get('allowed')
@@ -3078,6 +3217,32 @@ class SignalScannerMixin:
 
         top_n = int(cfg.get('top_n', 10) or 10)
         report = build_coin_selector_report(scored, rejected + analysis_errors, top_n=top_n)
+        active_strategy = str(
+            (strategy_params or {}).get('active_strategy', '') or ''
+        ).strip().lower()
+        if active_strategy == ADAPTIVE_BREAKOUT_TREND_STRATEGY and any(
+            bool(item.get('small_account_aggressive_candidate'))
+            for item in (
+                list(report.get('selected') or [])
+                + list(report.get('watch_only') or [])
+            )
+            if isinstance(item, dict)
+        ):
+            ut_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
+            trend_cfg = normalize_adaptive_breakout_trend_config(
+                ut_cfg.get('adaptive_breakout_trend')
+                if isinstance(ut_cfg, dict)
+                else None
+            )
+            regime_cfg = trend_cfg.get('small_account_regime_ensemble') or {}
+            report = apply_adaptive_top_candidate_gate(
+                report,
+                enabled=bool(regime_cfg.get('cross_sectional_top_only', True)),
+                minimum_score_gap=float(
+                    regime_cfg.get('cross_sectional_minimum_score_gap', 2.50)
+                    or 2.50
+                ),
+            )
         reject_samples = list((rejected + analysis_errors)[:10])
         report.update({
             'generated_at_ts': now,

@@ -99,6 +99,7 @@ def default_intelligence_config() -> dict[str, Any]:
         "overfit_walk_forward_train_size": 20,
         "overfit_walk_forward_test_size": 10,
         "overfit_walk_forward_purge_size": 1,
+        "overfit_walk_forward_embargo_size": 1,
         "overfit_min_oos_windows": 2,
     }
 
@@ -585,6 +586,7 @@ def run_overfit_backtest(trades=None, config=None, *, number_of_trials=None) -> 
         train_size=int(cfg.get("overfit_walk_forward_train_size", 20) or 20),
         test_size=int(cfg.get("overfit_walk_forward_test_size", 10) or 10),
         purge_size=int(cfg.get("overfit_walk_forward_purge_size", 1) or 0),
+        embargo_size=int(cfg.get("overfit_walk_forward_embargo_size", 1) or 0),
     )
     oos_passes = [
         (split.get("test") or {}).get("avg_r", 0.0) > 0

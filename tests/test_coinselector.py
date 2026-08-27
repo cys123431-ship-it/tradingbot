@@ -1,6 +1,7 @@
 import pytest
 
 from utbreakout.coinselector import (
+    apply_adaptive_top_candidate_gate,
     build_base_candidate,
     build_selection_report,
     default_coin_selector_config,
@@ -10,6 +11,52 @@ from utbreakout.coinselector import (
     rank_candidates,
     score_selection_quality,
 )
+
+
+def test_adaptive_top_candidate_gate_selects_one_clear_winner():
+    candidates = [
+        {
+            "symbol": "A/USDT",
+            "adaptive_breakout_trend_allowed": True,
+            "convex_rotation_score": 82.0,
+        },
+        {
+            "symbol": "B/USDT",
+            "adaptive_breakout_trend_allowed": True,
+            "convex_rotation_score": 76.0,
+        },
+    ]
+
+    gated = apply_adaptive_top_candidate_gate(
+        {"selected": candidates, "watch_only": []},
+        minimum_score_gap=2.5,
+    )
+
+    assert [item["symbol"] for item in gated["selected"]] == ["A/USDT"]
+    assert gated["adaptive_top_candidate_gate"] == "selected"
+
+
+def test_adaptive_top_candidate_gate_waits_when_rank_gap_is_too_small():
+    candidates = [
+        {
+            "symbol": "A/USDT",
+            "adaptive_breakout_trend_allowed": True,
+            "convex_rotation_score": 82.0,
+        },
+        {
+            "symbol": "B/USDT",
+            "adaptive_breakout_trend_allowed": True,
+            "convex_rotation_score": 80.5,
+        },
+    ]
+
+    gated = apply_adaptive_top_candidate_gate(
+        {"selected": candidates, "watch_only": []},
+        minimum_score_gap=2.5,
+    )
+
+    assert gated["selected"] == []
+    assert gated["adaptive_top_candidate_gate"] == "ambiguous"
 
 
 def _market(**overrides):

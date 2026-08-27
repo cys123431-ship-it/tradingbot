@@ -27,7 +27,7 @@ from .small_account_regime import (
 
 
 ADAPTIVE_BREAKOUT_TREND_STRATEGY = "adaptive_breakout_trend_v1"
-ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v12_regime_ensemble"
+ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v13_validated_regime_router"
 
 
 def default_adaptive_breakout_trend_config() -> dict[str, Any]:
