@@ -217,6 +217,36 @@ def test_strategy_allocator_de_risks_early_repeated_losses_but_never_boosts_smal
     )
     assert evaluate_strategy_allocation(wins).multiplier == pytest.approx(1.0)
 
+
+def test_strategy_allocator_excludes_manual_external_and_emergency_outcomes():
+    rows = [
+        {
+            "strategy": "volatility_managed_trend_v1",
+            "net_r": 1.0,
+            "net_pnl": 10.0,
+            "exit_reason": "scanner position completed",
+        },
+        {
+            "strategy": "volatility_managed_trend_v1",
+            "net_r": -4.0,
+            "net_pnl": -40.0,
+            "exit_reason": "manual/external exchange close detected",
+            "exit_legs": [{"label": "EXTERNAL_EXIT"}],
+        },
+        {
+            "strategy": "volatility_managed_trend_v1",
+            "net_r": -3.0,
+            "net_pnl": -30.0,
+            "close_reason": "EmergencyStop",
+        },
+    ]
+
+    metrics = summarize_strategy_trades(rows, "volatility_managed_trend_v1")
+
+    assert metrics["trade_count"] == 1
+    assert metrics["net_pnl"] == pytest.approx(10.0)
+    assert metrics["excluded_external_outcomes"] == 2
+
 from utbreakout.rspt_v3 import residual_strength_percentiles
 
 

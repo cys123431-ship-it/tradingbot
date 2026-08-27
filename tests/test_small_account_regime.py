@@ -1,4 +1,5 @@
 from utbreakout.small_account_regime import (
+    SMALL_ACCOUNT_REGIME_PROFILE_VERSION,
     evaluate_multi_timeframe_regime,
     evaluate_regime_challenger_promotion,
     evaluate_small_account_exhaustion_reversal,
@@ -187,14 +188,19 @@ def test_reversal_profile_survives_durable_entry_plan_summary():
     summary = build_durable_entry_plan_summary({
         "strategy": "adaptive_breakout_trend_v1",
         "adaptive_regime_engine": "exhaustion_reversal",
-        "adaptive_regime_profile": "small_account_regime_ensemble_v2",
+        "adaptive_regime_profile": SMALL_ACCOUNT_REGIME_PROFILE_VERSION,
+        "small_account_regime_transition": "persistent_up",
+        "small_account_multi_speed_agreement": 0.91,
+        "small_account_regime_persistence_score": 0.82,
         "reversal_mean_target_price": 101.25,
         "partial_take_profit_r_multiple": 0.75,
         "second_take_profit_r_multiple": 1.40,
     })
 
     assert summary["adaptive_regime_engine"] == "exhaustion_reversal"
-    assert summary["adaptive_regime_profile"] == "small_account_regime_ensemble_v2"
+    assert summary["adaptive_regime_profile"] == SMALL_ACCOUNT_REGIME_PROFILE_VERSION
+    assert summary["small_account_regime_transition"] == "persistent_up"
+    assert summary["small_account_multi_speed_agreement"] == 0.91
     assert summary["reversal_mean_target_price"] == 101.25
 
 
@@ -224,6 +230,92 @@ def test_multi_timeframe_regime_is_weighted_not_all_timeframe_and():
     assert context["direction"] == "long"
     assert context["regime"] == "up"
     assert context["disagreements"] == 1
+    assert 0.0 <= context["multi_speed_agreement"] <= 1.0
+    assert set(context["snapshots"]["1h"]["speed_scores"]) == {
+        "fast",
+        "medium",
+        "slow",
+    }
+
+
+def _router_context(*, persistent=True):
+    return {
+        "available": True,
+        "ambiguous": False,
+        "weighted_direction_score": 0.45,
+        "direction": "long",
+        "multi_speed_agreement": 0.92 if persistent else 0.52,
+        "persistence_score": 0.88 if persistent else 0.10,
+        "transition": "persistent_up" if persistent else "transition_or_mixed",
+        "mature": False,
+    }
+
+
+def _primary_long_candidate():
+    return {
+        "allowed": True,
+        "side": "long",
+        "score": 72.0,
+        "source": "trend_only",
+        "fresh_continuation": True,
+    }
+
+
+def test_regime_router_rewards_persistent_multi_speed_trend_without_an_and_gate():
+    persistent = resolve_regime_ensemble_candidate(
+        _primary_long_candidate(),
+        {"allowed": False},
+        multi_timeframe_context=_router_context(persistent=True),
+    )
+    transitional = resolve_regime_ensemble_candidate(
+        _primary_long_candidate(),
+        {"allowed": False},
+        multi_timeframe_context=_router_context(persistent=False),
+    )
+
+    assert persistent["allowed"] is True
+    assert transitional["allowed"] is True
+    assert (
+        persistent["selected_net_edge"]["win_probability"]
+        > transitional["selected_net_edge"]["win_probability"]
+    )
+    assert persistent["regime_profile"] == SMALL_ACCOUNT_REGIME_PROFILE_VERSION
+
+
+def test_regime_router_uses_only_fresh_orderflow_and_direction_aware_basis():
+    supportive = resolve_regime_ensemble_candidate(
+        _primary_long_candidate(),
+        {"allowed": False},
+        multi_timeframe_context=_router_context(),
+        cost_context={
+            "basis_pct": -0.30,
+            "orderflow_age_seconds": 30.0,
+            "rolling_orderbook_imbalance_pct": 12.0,
+            "taker_buy_sell_ratio": 1.12,
+        },
+    )
+    stale_adverse = resolve_regime_ensemble_candidate(
+        _primary_long_candidate(),
+        {"allowed": False},
+        multi_timeframe_context=_router_context(),
+        cost_context={
+            "basis_pct": 0.30,
+            "orderflow_age_seconds": 180.0,
+            "rolling_orderbook_imbalance_pct": 12.0,
+            "taker_buy_sell_ratio": 1.12,
+        },
+    )
+
+    assert (
+        supportive["selected_net_edge"]["win_probability"]
+        > stale_adverse["selected_net_edge"]["win_probability"]
+    )
+    assert (
+        stale_adverse["selected_net_edge"]["probability_adjustments"][
+            "fresh_orderflow"
+        ]
+        == 0.0
+    )
 
 
 def test_challenger_promotion_requires_independent_regime_diversified_net_results():

@@ -2850,8 +2850,8 @@ class SignalPositionLifecycleMixin:
             'take_profit_r_multiple': weighted_target_r,
         }
         selected_set = {
-            'id': 'small_account_regime_challenger_v2',
-            'name': 'Small-account regime challenger v2',
+            'id': 'small_account_regime_challenger_v3',
+            'name': 'Small-account regime challenger v3',
         }
         return self._register_utbreakout_shadow_candidate(
             symbol,

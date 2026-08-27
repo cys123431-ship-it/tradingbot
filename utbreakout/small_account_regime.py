@@ -17,7 +17,7 @@ from statistics import median
 from typing import Any, Mapping, Sequence
 
 
-SMALL_ACCOUNT_REGIME_PROFILE_VERSION = "small_account_regime_ensemble_v2"
+SMALL_ACCOUNT_REGIME_PROFILE_VERSION = "small_account_regime_ensemble_v3_evidence_router"
 
 
 def default_small_account_regime_config() -> dict[str, Any]:
@@ -63,6 +63,15 @@ def default_small_account_regime_config() -> dict[str, Any]:
             "4h": 0.35,
             "1d": 0.20,
         },
+        # Blend complementary trend speeds inside every timeframe.  This is a
+        # weighted ensemble, not an all-speeds-must-agree entry gate.
+        "multi_speed_weights": {
+            "fast": 0.40,
+            "medium": 0.35,
+            "slow": 0.25,
+        },
+        "state_persistence_lag_bars": 4,
+        "orderflow_freshness_seconds": 90.0,
         "multi_timeframe_minimum_direction_score": 0.18,
         "multi_timeframe_strong_direction_score": 0.42,
         "multi_timeframe_max_disagreements": 2,
@@ -129,6 +138,7 @@ def normalize_small_account_regime_config(
         ("minimum_nonprice_confirmations", 1, 4),
         ("time_stop_bars", 4, 48),
         ("multi_timeframe_max_disagreements", 0, 4),
+        ("state_persistence_lag_bars", 2, 12),
         ("trend_maturity_run_bars", 4, 96),
         ("promotion_lookback_days", 30, 730),
         ("promotion_min_trades", 100, 200),
@@ -167,6 +177,7 @@ def normalize_small_account_regime_config(
         ("tp2_r_cap", 0.75, 3.00),
         ("multi_timeframe_minimum_direction_score", 0.05, 0.60),
         ("multi_timeframe_strong_direction_score", 0.15, 0.90),
+        ("orderflow_freshness_seconds", 15.0, 300.0),
         ("trend_maturity_extension_atr", 0.75, 6.0),
         ("router_minimum_net_ev_r", -0.25, 0.50),
         ("router_conflict_net_ev_gap_r", 0.02, 0.75),
@@ -209,6 +220,23 @@ def normalize_small_account_regime_config(
     weight_sum = sum(weights.values()) or 1.0
     normalized["multi_timeframe_weights"] = {
         timeframe: value / weight_sum for timeframe, value in weights.items()
+    }
+    raw_speed_weights = normalized.get("multi_speed_weights")
+    raw_speed_weights = (
+        raw_speed_weights
+        if isinstance(raw_speed_weights, Mapping)
+        else defaults["multi_speed_weights"]
+    )
+    speed_weights = {
+        speed: max(
+            0.0,
+            float(_finite(raw_speed_weights.get(speed), weight) or weight),
+        )
+        for speed, weight in defaults["multi_speed_weights"].items()
+    }
+    speed_weight_sum = sum(speed_weights.values()) or 1.0
+    normalized["multi_speed_weights"] = {
+        speed: value / speed_weight_sum for speed, value in speed_weights.items()
     }
     normalized["profile_version"] = SMALL_ACCOUNT_REGIME_PROFILE_VERSION
     return normalized
@@ -282,19 +310,103 @@ def _ema(values: Sequence[float], period: int) -> float:
     return current
 
 
+def _clamp_unit(value: float) -> float:
+    return max(-1.0, min(1.0, float(value)))
+
+
+def _trend_speed_score(
+    closes: Sequence[float],
+    atr_value: float,
+    *,
+    fast_period: int,
+    slow_period: int,
+    momentum_lookback: int,
+    slope_lag: int,
+) -> float:
+    """Score one trend speed using price, cross, slope and momentum evidence."""
+
+    close = float(closes[-1])
+    atr_floor = max(float(atr_value), close * 1e-6)
+    fast = _ema(closes, fast_period)
+    slow = _ema(closes, slow_period)
+    previous = closes[:-max(1, int(slope_lag))]
+    previous_slow = _ema(previous, slow_period) if previous else slow
+    lookback = min(max(1, int(momentum_lookback)), len(closes) - 1)
+    momentum_scale = max(2.0, min(6.0, lookback / 4.0))
+    return (
+        _clamp_unit((close - slow) / (2.0 * atr_floor)) * 0.25
+        + _clamp_unit((fast - slow) / atr_floor) * 0.35
+        + _clamp_unit((slow - previous_slow) / atr_floor) * 0.20
+        + _clamp_unit(
+            (close - float(closes[-1 - lookback]))
+            / (momentum_scale * atr_floor)
+        )
+        * 0.20
+    )
+
+
+def _multi_speed_snapshot(
+    closes: Sequence[float],
+    atr_value: float,
+    speed_weights: Mapping[str, float],
+) -> dict[str, Any]:
+    definitions = {
+        "fast": (8, 21, 4, 2),
+        "medium": (20, 50, 12, 3),
+        "slow": (50, 100, 24, 5),
+    }
+    scores = {
+        speed: _trend_speed_score(
+            closes,
+            atr_value,
+            fast_period=definition[0],
+            slow_period=definition[1],
+            momentum_lookback=definition[2],
+            slope_lag=definition[3],
+        )
+        for speed, definition in definitions.items()
+    }
+    directions = {
+        speed: (
+            "long" if score > 0.12 else "short" if score < -0.12 else "neutral"
+        )
+        for speed, score in scores.items()
+    }
+    blended = sum(float(speed_weights[speed]) * score for speed, score in scores.items())
+    direction = "long" if blended > 0.12 else "short" if blended < -0.12 else "neutral"
+    agreement = (
+        sum(
+            float(speed_weights[speed])
+            for speed, value in directions.items()
+            if value == direction
+        )
+        if direction in {"long", "short"}
+        else 0.0
+    )
+    return {
+        "score": blended,
+        "direction": direction,
+        "agreement": agreement,
+        "scores": scores,
+        "directions": directions,
+    }
+
+
 def _timeframe_trend_snapshot(
     rows: Sequence[Mapping[str, Any]] | None,
     *,
     maturity_extension_atr: float,
     maturity_run_bars: int,
+    speed_weights: Mapping[str, float],
+    persistence_lag_bars: int,
 ) -> dict[str, Any]:
     candles = _clean_rows(rows)
-    if len(candles) < 55:
+    if len(candles) < 70:
         return {
             "available": False,
             "direction": "unknown",
             "direction_score": 0.0,
-            "reason": f"data {len(candles)}/55",
+            "reason": f"data {len(candles)}/70",
         }
     closes = [row["close"] for row in candles]
     atr_value = _atr(candles, 14)
@@ -308,23 +420,27 @@ def _timeframe_trend_snapshot(
     close = closes[-1]
     ema20 = _ema(closes, 20)
     ema50 = _ema(closes, 50)
-    previous_ema50 = _ema(closes[:-3], 50)
     atr_floor = max(atr_value, close * 1e-6)
-    price_component = max(-1.0, min(1.0, (close - ema50) / (2.0 * atr_floor)))
-    cross_component = max(-1.0, min(1.0, (ema20 - ema50) / atr_floor))
-    slope_component = max(-1.0, min(1.0, (ema50 - previous_ema50) / atr_floor))
-    momentum_lookback = min(12, len(closes) - 1)
-    momentum_component = max(
-        -1.0,
-        min(1.0, (close - closes[-1 - momentum_lookback]) / (4.0 * atr_floor)),
-    )
-    direction_score = (
-        price_component * 0.30
-        + cross_component * 0.30
-        + slope_component * 0.20
-        + momentum_component * 0.20
-    )
-    direction = "long" if direction_score > 0.12 else "short" if direction_score < -0.12 else "neutral"
+    current = _multi_speed_snapshot(closes, atr_value, speed_weights)
+    lag = max(2, min(int(persistence_lag_bars), len(closes) - 60))
+    previous_closes = closes[:-lag]
+    previous_rows = candles[:-lag]
+    previous_atr = _atr(previous_rows, 14) or atr_value
+    previous = _multi_speed_snapshot(previous_closes, previous_atr, speed_weights)
+    direction_score = float(current["score"])
+    direction = str(current["direction"])
+    previous_direction = str(previous["direction"])
+    if direction in {"long", "short"} and previous_direction == direction:
+        persistence_score = min(
+            1.0,
+            0.35
+            + 0.35 * float(current["agreement"])
+            + 0.30 * min(1.0, abs(float(previous["score"]))),
+        )
+    elif direction in {"long", "short"} and previous_direction == "neutral":
+        persistence_score = 0.30
+    else:
+        persistence_score = 0.0
     run_bars = 0
     if direction in {"long", "short"}:
         sign = 1.0 if direction == "long" else -1.0
@@ -342,6 +458,19 @@ def _timeframe_trend_snapshot(
         "available": True,
         "direction": direction,
         "direction_score": round(direction_score, 6),
+        "previous_direction": previous_direction,
+        "previous_direction_score": round(float(previous["score"]), 6),
+        "transition": f"{previous_direction}_to_{direction}",
+        "state_persistent": bool(
+            direction in {"long", "short"} and previous_direction == direction
+        ),
+        "persistence_score": round(persistence_score, 6),
+        "multi_speed_agreement": round(float(current["agreement"]), 6),
+        "speed_scores": {
+            key: round(float(value), 6)
+            for key, value in current["scores"].items()
+        },
+        "speed_directions": dict(current["directions"]),
         "close": close,
         "ema20": ema20,
         "ema50": ema50,
@@ -370,6 +499,8 @@ def evaluate_multi_timeframe_regime(
             (timeframe_rows or {}).get(timeframe),
             maturity_extension_atr=cfg["trend_maturity_extension_atr"],
             maturity_run_bars=int(cfg["trend_maturity_run_bars"]),
+            speed_weights=cfg["multi_speed_weights"],
+            persistence_lag_bars=int(cfg["state_persistence_lag_bars"]),
         )
         snapshots[timeframe] = snapshot
         if not snapshot.get("available"):
@@ -387,11 +518,57 @@ def evaluate_multi_timeframe_regime(
     mature_timeframes = [
         timeframe for timeframe, snapshot in snapshots.items() if snapshot.get("mature")
     ]
+    speed_agreement = (
+        sum(
+            float(weights[timeframe])
+            * float(snapshot.get("multi_speed_agreement", 0.0) or 0.0)
+            for timeframe, snapshot in snapshots.items()
+            if snapshot.get("available")
+        )
+        / available_weight
+        if available_weight > 0
+        else 0.0
+    )
+    overall_direction = (
+        "long" if score >= minimum else "short" if score <= -minimum else "neutral"
+    )
+    directional_weight = sum(
+        float(weights[timeframe])
+        for timeframe, snapshot in snapshots.items()
+        if snapshot.get("available")
+        and snapshot.get("direction") == overall_direction
+    )
+    persistence_score = (
+        sum(
+            float(weights[timeframe])
+            * float(snapshot.get("persistence_score", 0.0) or 0.0)
+            for timeframe, snapshot in snapshots.items()
+            if snapshot.get("available")
+            and snapshot.get("direction") == overall_direction
+        )
+        / directional_weight
+        if directional_weight > 0
+        else 0.0
+    )
+    persistent_weight = sum(
+        float(weights[timeframe])
+        for timeframe, snapshot in snapshots.items()
+        if snapshot.get("available")
+        and snapshot.get("state_persistent")
+        and snapshot.get("direction") == overall_direction
+    )
+    transition = (
+        "persistent_up"
+        if score >= minimum and persistent_weight >= 0.50
+        else "persistent_down"
+        if score <= -minimum and persistent_weight >= 0.50
+        else "transition_or_mixed"
+    )
     return {
         "profile": SMALL_ACCOUNT_REGIME_PROFILE_VERSION,
         "available": available_weight >= 0.50,
         "weighted_direction_score": round(score, 6),
-        "direction": "long" if score >= minimum else "short" if score <= -minimum else "neutral",
+        "direction": overall_direction,
         "regime": regime,
         "disagreements": disagreements,
         "ambiguous": bool(
@@ -400,6 +577,10 @@ def evaluate_multi_timeframe_regime(
         ),
         "mature": bool(mature_timeframes),
         "mature_timeframes": mature_timeframes,
+        "multi_speed_agreement": round(speed_agreement, 6),
+        "persistence_score": round(persistence_score, 6),
+        "persistent_weight": round(persistent_weight, 6),
+        "transition": transition,
         "snapshots": snapshots,
     }
 
@@ -719,7 +900,7 @@ def _candidate_net_ev(
     multi_timeframe_context: Mapping[str, Any] | None,
     cost_context: Mapping[str, Any] | None,
     config: Mapping[str, Any],
-) -> dict[str, float]:
+) -> dict[str, Any]:
     score = max(0.0, min(100.0, float(_finite(candidate.get("score"), 0.0) or 0.0)))
     probability = max(0.44, min(0.70, 0.42 + score * 0.0027))
     if engine == "exhaustion_reversal":
@@ -731,7 +912,86 @@ def _candidate_net_ev(
     else:
         reward_r = 2.60
     fitness = _multi_timeframe_fitness(candidate.get("side"), multi_timeframe_context)
-    probability = max(0.42, min(0.74, probability + (fitness - 50.0) / 500.0))
+    timeframe_adjustment = (fitness - 50.0) / 500.0
+    probability += timeframe_adjustment
+    side_sign = 1.0 if str(candidate.get("side") or "").lower() == "long" else -1.0
+    mtf_direction = str((multi_timeframe_context or {}).get("direction") or "neutral")
+    mtf_available = bool((multi_timeframe_context or {}).get("available"))
+    aligned_with_mtf = mtf_direction == str(candidate.get("side") or "").lower()
+    speed_agreement = float(
+        _finite((multi_timeframe_context or {}).get("multi_speed_agreement"), 0.0)
+        or 0.0
+    )
+    persistence = float(
+        _finite((multi_timeframe_context or {}).get("persistence_score"), 0.0)
+        or 0.0
+    )
+    transition = str(
+        (multi_timeframe_context or {}).get("transition") or "transition_or_mixed"
+    )
+    speed_adjustment = 0.0 if not mtf_available else (
+        max(-0.018, min(0.018, (speed_agreement - 0.50) * 0.045))
+        if aligned_with_mtf
+        else -min(0.020, speed_agreement * 0.025)
+        if mtf_direction in {"long", "short"}
+        else 0.0
+    )
+    persistence_adjustment = 0.0
+    if (
+        mtf_available
+        and aligned_with_mtf
+        and str(candidate.get("side") or "").lower() == "long"
+        and transition == "persistent_up"
+    ):
+        persistence_adjustment = min(0.025, persistence * 0.030)
+    elif (
+        mtf_available
+        and engine == "trend_continuation"
+        and transition != "persistent_up"
+    ):
+        persistence_adjustment = -0.015
+
+    context = cost_context or {}
+    # The futures/spot basis is defined as (mark-index)/index by this bot.
+    # Therefore a negative signed basis is the paper's favorable spot premium
+    # for the entry direction. Keep the adjustment deliberately small because
+    # basis and crowding are also used by downstream safety filters.
+    basis = _finite(context.get("basis_pct"))
+    basis_adjustment = (
+        max(-0.012, min(0.012, -(side_sign * float(basis)) / 0.40 * 0.012))
+        if basis is not None
+        else 0.0
+    )
+    orderflow_adjustment = 0.0
+    orderflow_age = _finite(context.get("orderflow_age_seconds"))
+    if (
+        orderflow_age is not None
+        and orderflow_age <= float(config["orderflow_freshness_seconds"])
+    ):
+        imbalance = _finite(context.get("rolling_orderbook_imbalance_pct"))
+        taker_ratio = _finite(context.get("taker_buy_sell_ratio"))
+        if imbalance is not None:
+            orderflow_adjustment += max(
+                -0.012,
+                min(0.012, side_sign * float(imbalance) / 20.0 * 0.012),
+            )
+        if taker_ratio is not None and taker_ratio > 0:
+            orderflow_adjustment += max(
+                -0.008,
+                min(0.008, side_sign * (float(taker_ratio) - 1.0) / 0.20 * 0.008),
+            )
+        orderflow_adjustment = max(-0.020, min(0.020, orderflow_adjustment))
+    probability = max(
+        0.42,
+        min(
+            0.74,
+            probability
+            + speed_adjustment
+            + persistence_adjustment
+            + basis_adjustment
+            + orderflow_adjustment,
+        ),
+    )
     costs = (
         float(config["estimated_round_trip_fee_r"])
         + float(config["estimated_slippage_r"])
@@ -740,7 +1000,6 @@ def _candidate_net_ev(
     spread_pct = float(_finite((cost_context or {}).get("futures_spread_pct"), 0.0) or 0.0)
     costs += min(0.20, max(0.0, spread_pct) / 2.0)
     funding = float(_finite((cost_context or {}).get("funding_rate"), 0.0) or 0.0)
-    side_sign = 1.0 if str(candidate.get("side") or "").lower() == "long" else -1.0
     costs += min(0.12, max(0.0, side_sign * funding) * 40.0)
     net_ev = probability * reward_r - (1.0 - probability) - costs
     return {
@@ -748,6 +1007,18 @@ def _candidate_net_ev(
         "gross_reward_r": round(reward_r, 6),
         "estimated_cost_r": round(costs, 6),
         "multi_timeframe_fitness": round(fitness, 4),
+        "probability_basis": "bounded_score_plus_evidence_not_calibrated_forecast",
+        "probability_adjustments": {
+            "timeframe": round(timeframe_adjustment, 6),
+            "multi_speed": round(speed_adjustment, 6),
+            "state_persistence": round(persistence_adjustment, 6),
+            "basis": round(basis_adjustment, 6),
+            "fresh_orderflow": round(orderflow_adjustment, 6),
+        },
+        "regime_transition": transition,
+        "multi_speed_agreement": round(speed_agreement, 6),
+        "persistence_score": round(persistence, 6),
+        "orderflow_age_seconds": orderflow_age,
         "net_ev_r": round(net_ev, 6),
     }
 
@@ -962,6 +1233,7 @@ def resolve_regime_ensemble_candidate(
         else None
     )
     metadata = {
+        "regime_profile": SMALL_ACCOUNT_REGIME_PROFILE_VERSION,
         "reversal_candidate": {
             key: reversal.get(key) for key in ("allowed", "side", "score", "code", "reason")
         },

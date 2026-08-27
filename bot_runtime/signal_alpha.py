@@ -29,6 +29,7 @@ from utbreakout.profit_capture import (
 )
 from utbreakout.relative_strength_pullback import completed_candle_rows
 from utbreakout.small_account_regime import (
+    SMALL_ACCOUNT_REGIME_PROFILE_VERSION,
     evaluate_small_account_exhaustion_reversal,
     resolve_regime_ensemble_candidate,
     reversal_exit_plan_overrides,
@@ -2291,8 +2292,11 @@ class SignalAlphaMixin:
             'trend_event_event_score': candidate_resolution.get('event_score'),
             'adaptive_regime_engine': candidate_resolution.get('regime_engine'),
             'adaptive_regime_profile': (
-                reversal_candidate.get('profile')
-                if candidate_source == 'exhaustion_reversal'
+                (
+                    candidate_resolution.get('regime_profile')
+                    or SMALL_ACCOUNT_REGIME_PROFILE_VERSION
+                )
+                if small_account_aggressive_candidate
                 else None
             ),
             'adaptive_regime_reversal_score': candidate_resolution.get(
@@ -2309,6 +2313,15 @@ class SignalAlphaMixin:
             ),
             'adaptive_regime_multitimeframe': dict(
                 multi_timeframe_context
+            ),
+            'small_account_regime_transition': (
+                multi_timeframe_context.get('transition')
+            ),
+            'small_account_multi_speed_agreement': (
+                multi_timeframe_context.get('multi_speed_agreement')
+            ),
+            'small_account_regime_persistence_score': (
+                multi_timeframe_context.get('persistence_score')
             ),
             'adaptive_regime_promotion': dict(regime_promotion_status),
             'small_account_aggressive_enabled': bool(

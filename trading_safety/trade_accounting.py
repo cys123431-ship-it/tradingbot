@@ -957,9 +957,39 @@ class TradeAccountingFinalizer:
 def rebuild_engine_performance_stats(
     finalized_trades: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
+    def strategy_managed(trade: dict[str, Any]) -> bool:
+        if any(
+            bool(trade.get(key))
+            for key in ("manual", "is_manual", "external", "is_external")
+        ):
+            return False
+        texts = [
+            trade.get("exit_reason"),
+            trade.get("close_reason"),
+            trade.get("reason"),
+        ]
+        for leg in trade.get("exit_legs") or ():
+            if isinstance(leg, dict):
+                texts.extend((leg.get("label"), leg.get("reason")))
+        normalized = " | ".join(
+            str(value or "").strip().lower() for value in texts
+        )
+        return not any(
+            marker in normalized
+            for marker in (
+                "manual/external",
+                "manual close",
+                "user close",
+                "external_exit",
+                "external exit",
+                "emergencystop",
+                "emergency stop",
+            )
+        )
+
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for trade in finalized_trades:
-        if trade.get("provisional"):
+        if trade.get("provisional") or not strategy_managed(trade):
             continue
         engine = str(trade.get("engine") or "")
         if engine and engine != "NONE":

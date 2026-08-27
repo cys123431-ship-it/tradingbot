@@ -195,3 +195,35 @@ def test_engine_stats_use_final_trades_only_and_include_cost_burdens():
     assert stats["fee_burden"] == pytest.approx(0.3)
     assert stats["funding_burden"] == pytest.approx(0.1)
     assert stats["max_drawdown_pct"] > 0
+
+
+def test_engine_stats_exclude_manual_external_and_emergency_closes():
+    stats = rebuild_engine_performance_stats(
+        [
+            _trade(
+                trade_id="managed",
+                net_pnl_usdt=5,
+                gross_pnl_usdt=5,
+                realized_r=0.5,
+                provisional=False,
+            ),
+            _trade(
+                trade_id="manual",
+                net_pnl_usdt=-30,
+                realized_r=-3.0,
+                exit_reason="manual/external exchange close detected",
+                exit_legs=[{"label": "EXTERNAL_EXIT"}],
+                provisional=False,
+            ),
+            _trade(
+                trade_id="emergency",
+                net_pnl_usdt=-20,
+                realized_r=-2.0,
+                close_reason="EmergencyStop",
+                provisional=False,
+            ),
+        ]
+    )["UTB"]
+
+    assert stats["trade_count"] == 1
+    assert stats["net_profit_usdt"] == pytest.approx(5.0)

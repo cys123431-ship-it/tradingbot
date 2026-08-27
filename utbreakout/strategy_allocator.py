@@ -32,6 +32,9 @@ def default_strategy_allocator_config() -> dict[str, Any]:
         "mfe_capture_min": 0.35,
         "good_expectancy_r": 0.12,
         "good_profit_factor": 1.20,
+        # User/emergency closes do not measure the strategy's own exit policy
+        # and must not train the adaptive risk allocator.
+        "exclude_external_outcomes": True,
     }
 
 
@@ -98,6 +101,36 @@ def _mfe_r(row: Mapping[str, Any]) -> float | None:
     return mfe_usdt / risk if mfe_usdt is not None and risk and risk > 0 else None
 
 
+def _is_strategy_managed_outcome(row: Mapping[str, Any]) -> bool:
+    payload = _payload(row)
+    if any(
+        bool(payload.get(key, row.get(key)))
+        for key in ("manual", "is_manual", "external", "is_external")
+    ):
+        return False
+    texts = [
+        payload.get("exit_reason", row.get("exit_reason")),
+        payload.get("close_reason", row.get("close_reason")),
+        payload.get("reason", row.get("reason")),
+    ]
+    exit_legs = payload.get("exit_legs", row.get("exit_legs"))
+    if isinstance(exit_legs, Iterable) and not isinstance(exit_legs, (str, bytes, Mapping)):
+        for leg in exit_legs:
+            if isinstance(leg, Mapping):
+                texts.extend((leg.get("label"), leg.get("reason")))
+    normalized = " | ".join(str(value or "").strip().lower() for value in texts)
+    external_markers = (
+        "manual/external",
+        "manual close",
+        "user close",
+        "external_exit",
+        "external exit",
+        "emergencystop",
+        "emergency stop",
+    )
+    return not any(marker in normalized for marker in external_markers)
+
+
 def summarize_strategy_trades(
     trades: Iterable[Mapping[str, Any]] | None,
     strategy: str,
@@ -105,7 +138,17 @@ def summarize_strategy_trades(
 ) -> dict[str, Any]:
     cfg = {**default_strategy_allocator_config(), **dict(config or {})}
     wanted = str(strategy or "").strip().lower()
-    rows = [dict(row) for row in trades or [] if isinstance(row, Mapping) and _strategy(row) == wanted]
+    candidates = [
+        dict(row)
+        for row in trades or []
+        if isinstance(row, Mapping) and _strategy(row) == wanted
+    ]
+    rows = (
+        [row for row in candidates if _is_strategy_managed_outcome(row)]
+        if bool(cfg.get("exclude_external_outcomes", True))
+        else candidates
+    )
+    excluded_outcomes = len(candidates) - len(rows)
     rows = rows[-max(1, int(cfg["lookback_trades"])):]
     values = [value for value in (_r_multiple(row) for row in rows) if value is not None]
     pnl_values = [_net_pnl(row) for row in rows]
@@ -141,6 +184,7 @@ def summarize_strategy_trades(
         "current_consecutive_losses": loss_streak,
         "mfe_capture_ratio": capture,
         "net_pnl": sum(pnl_values),
+        "excluded_external_outcomes": excluded_outcomes,
     }
 
 
