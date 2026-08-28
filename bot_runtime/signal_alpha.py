@@ -32,6 +32,7 @@ from utbreakout.small_account_regime import (
     SMALL_ACCOUNT_REGIME_PROFILE_VERSION,
     evaluate_small_account_exhaustion_reversal,
     resolve_regime_ensemble_candidate,
+    resolve_small_account_evidence_allocation,
     reversal_exit_plan_overrides,
 )
 from utbreakout.tradfi_pattern_profile import (
@@ -1889,6 +1890,20 @@ class SignalAlphaMixin:
                 'initial_margin_fraction'
             ),
         }
+        evidence_allocation = {
+            'profile': SMALL_ACCOUNT_REGIME_PROFILE_VERSION,
+            'applied': False,
+            'evidence_tier': 'base',
+            'margin_multiplier': 1.0,
+            'base_initial_margin_fraction': change_point_flow.get(
+                'initial_margin_fraction'
+            ),
+            'initial_margin_fraction': change_point_flow.get(
+                'initial_margin_fraction'
+            ),
+            'reason': 'small-account evidence allocation not applicable',
+            'evidence': {},
+        }
         if small_account_aggressive_candidate:
             event_evaluations = (
                 event_candidate.get('evaluations')
@@ -2064,6 +2079,24 @@ class SignalAlphaMixin:
                 change_point_flow['tradfi_guardrail_tier_cap_reapplied'] = bool(
                     effective_risk_tier != pre_reapplied_tier
                 )
+            evidence_allocation = resolve_small_account_evidence_allocation(
+                candidate_resolution,
+                multi_timeframe_context,
+                selector_candidate,
+                risk_tier=effective_risk_tier,
+                initial_margin_fraction=change_point_flow.get(
+                    'initial_margin_fraction',
+                    trend_cfg.get('small_account_initial_margin_fraction', 0.65),
+                ),
+                tradfi=is_tradfi,
+                config=trend_cfg.get('small_account_regime_ensemble'),
+            )
+            change_point_flow['initial_margin_fraction'] = float(
+                evidence_allocation['initial_margin_fraction']
+            )
+            status['small_account_evidence_allocation'] = dict(
+                evidence_allocation
+            )
             status['independent_event_allocation'] = dict(event_allocation)
             status['risk_tier'] = effective_risk_tier
             status['convex_rotation_tier'] = effective_risk_tier
@@ -2322,6 +2355,25 @@ class SignalAlphaMixin:
             ),
             'small_account_regime_persistence_score': (
                 multi_timeframe_context.get('persistence_score')
+            ),
+            'small_account_evidence_allocation_profile': (
+                evidence_allocation.get('profile')
+            ),
+            'small_account_evidence_allocation_applied': bool(
+                evidence_allocation.get('applied')
+            ),
+            'small_account_evidence_allocation_tier': (
+                evidence_allocation.get('evidence_tier')
+            ),
+            'small_account_evidence_margin_multiplier': (
+                evidence_allocation.get('margin_multiplier')
+            ),
+            'small_account_evidence_base_margin_fraction': (
+                evidence_allocation.get('base_initial_margin_fraction')
+            ),
+            'small_account_evidence_reason': evidence_allocation.get('reason'),
+            'small_account_evidence': dict(
+                evidence_allocation.get('evidence') or {}
             ),
             'adaptive_regime_promotion': dict(regime_promotion_status),
             'small_account_aggressive_enabled': bool(

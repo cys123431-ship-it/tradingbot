@@ -17,7 +17,7 @@ from statistics import median
 from typing import Any, Mapping, Sequence
 
 
-SMALL_ACCOUNT_REGIME_PROFILE_VERSION = "small_account_regime_ensemble_v3_evidence_router"
+SMALL_ACCOUNT_REGIME_PROFILE_VERSION = "small_account_regime_ensemble_v4_risk_managed_momentum"
 
 
 def default_small_account_regime_config() -> dict[str, Any]:
@@ -84,6 +84,23 @@ def default_small_account_regime_config() -> dict[str, Any]:
         "estimated_round_trip_fee_r": 0.035,
         "estimated_slippage_r": 0.025,
         "estimated_missed_fill_r": 0.015,
+        # This overlay never reduces or blocks an entry. It only increases the
+        # first-stage margin for unusually strong crypto long momentum where
+        # relative rank, persistent state, complementary speeds and fresh
+        # signed flow all corroborate.
+        "evidence_allocation_enabled": True,
+        "evidence_strong_score": 70.0,
+        "evidence_elite_score": 82.0,
+        "evidence_strong_percentile": 75.0,
+        "evidence_elite_percentile": 90.0,
+        "evidence_strong_speed_agreement": 0.65,
+        "evidence_elite_speed_agreement": 0.80,
+        "evidence_strong_persistence": 0.60,
+        "evidence_elite_persistence": 0.75,
+        "evidence_strong_margin_multiplier": 1.15,
+        "evidence_elite_margin_multiplier": 1.25,
+        "evidence_max_initial_margin_fraction": 0.90,
+        "evidence_minimum_universe_size": 5,
         "promotion_required": True,
         "auto_promote_when_qualified": True,
         "promotion_lookback_days": 365,
@@ -124,6 +141,7 @@ def normalize_small_account_regime_config(
         "promotion_required",
         "auto_promote_when_qualified",
         "cross_sectional_top_only",
+        "evidence_allocation_enabled",
     ):
         raw = normalized.get(key, defaults[key])
         normalized[key] = (
@@ -144,6 +162,7 @@ def normalize_small_account_regime_config(
         ("promotion_min_trades", 100, 200),
         ("promotion_min_regime_trades", 5, 60),
         ("promotion_multiple_testing_trials", 1, 500),
+        ("evidence_minimum_universe_size", 2, 200),
     ):
         normalized[key] = int(
             _bounded(normalized.get(key), float(lower), float(upper), float(defaults[key]))
@@ -185,6 +204,17 @@ def normalize_small_account_regime_config(
         ("estimated_round_trip_fee_r", 0.0, 0.50),
         ("estimated_slippage_r", 0.0, 0.50),
         ("estimated_missed_fill_r", 0.0, 0.50),
+        ("evidence_strong_score", 50.0, 95.0),
+        ("evidence_elite_score", 50.0, 99.0),
+        ("evidence_strong_percentile", 50.0, 99.0),
+        ("evidence_elite_percentile", 50.0, 100.0),
+        ("evidence_strong_speed_agreement", 0.0, 1.0),
+        ("evidence_elite_speed_agreement", 0.0, 1.0),
+        ("evidence_strong_persistence", 0.0, 1.0),
+        ("evidence_elite_persistence", 0.0, 1.0),
+        ("evidence_strong_margin_multiplier", 1.0, 1.50),
+        ("evidence_elite_margin_multiplier", 1.0, 1.75),
+        ("evidence_max_initial_margin_fraction", 0.40, 0.95),
         ("promotion_min_expectancy_r", -0.10, 1.00),
         ("promotion_min_profit_factor", 0.80, 3.00),
         ("promotion_min_calmar", 0.0, 5.00),
@@ -206,6 +236,25 @@ def normalize_small_account_regime_config(
     )
     normalized["tp2_r_cap"] = max(
         normalized["tp2_r_floor"], normalized["tp2_r_cap"]
+    )
+    normalized["evidence_elite_score"] = max(
+        normalized["evidence_strong_score"], normalized["evidence_elite_score"]
+    )
+    normalized["evidence_elite_percentile"] = max(
+        normalized["evidence_strong_percentile"],
+        normalized["evidence_elite_percentile"],
+    )
+    normalized["evidence_elite_speed_agreement"] = max(
+        normalized["evidence_strong_speed_agreement"],
+        normalized["evidence_elite_speed_agreement"],
+    )
+    normalized["evidence_elite_persistence"] = max(
+        normalized["evidence_strong_persistence"],
+        normalized["evidence_elite_persistence"],
+    )
+    normalized["evidence_elite_margin_multiplier"] = max(
+        normalized["evidence_strong_margin_multiplier"],
+        normalized["evidence_elite_margin_multiplier"],
     )
     ratio_sum = normalized["tp1_ratio"] + normalized["tp2_ratio"]
     normalized["tp1_ratio"] /= ratio_sum
@@ -1023,6 +1072,155 @@ def _candidate_net_ev(
     }
 
 
+def resolve_small_account_evidence_allocation(
+    candidate_resolution: Mapping[str, Any] | None,
+    multi_timeframe_context: Mapping[str, Any] | None,
+    selector_candidate: Mapping[str, Any] | None,
+    *,
+    risk_tier: Any,
+    initial_margin_fraction: Any,
+    tradfi: bool = False,
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Scale first-stage margin once for corroborated crypto momentum.
+
+    This is deliberately an upside-only allocator: an ordinary signal keeps
+    the configured aggressive fraction, while a research-aligned persistent
+    crypto long may use more of the already-budgeted margin.  Volatility,
+    stop-distance, liquidation and per-position loss limits remain downstream
+    authorities and are not multiplied here.
+    """
+
+    cfg = normalize_small_account_regime_config(config)
+    candidate = dict(candidate_resolution or {})
+    mtf = dict(multi_timeframe_context or {})
+    selector = dict(selector_candidate or {})
+    base_fraction = _bounded(initial_margin_fraction, 0.40, 1.00, 0.65)
+    tier = str(risk_tier or "base").strip().lower()
+    if tier not in {"base", "strong", "elite"}:
+        tier = "base"
+    side = str(candidate.get("side") or "").strip().lower()
+    source = str(candidate.get("source") or "").strip().lower()
+    engine = str(candidate.get("regime_engine") or "").strip().lower()
+    score = float(
+        _finite(
+            selector.get("convex_rotation_score"),
+            _finite(candidate.get("score"), 0.0),
+        )
+        or 0.0
+    )
+    percentile = float(
+        _finite(selector.get("convex_rotation_percentile"), 0.0) or 0.0
+    )
+    universe_size = int(
+        max(0.0, float(_finite(selector.get("convex_rotation_universe_size"), 0.0) or 0.0))
+    )
+    speed_agreement = float(
+        _finite(mtf.get("multi_speed_agreement"), 0.0) or 0.0
+    )
+    persistence = float(_finite(mtf.get("persistence_score"), 0.0) or 0.0)
+    transition = str(mtf.get("transition") or "transition_or_mixed")
+    mtf_side = str(mtf.get("direction") or "neutral").strip().lower()
+    selected_edge = (
+        candidate.get("selected_net_edge")
+        if isinstance(candidate.get("selected_net_edge"), Mapping)
+        else {}
+    )
+    adjustments = (
+        selected_edge.get("probability_adjustments")
+        if isinstance(selected_edge.get("probability_adjustments"), Mapping)
+        else {}
+    )
+    orderflow_adjustment = float(
+        _finite(adjustments.get("fresh_orderflow"), 0.0) or 0.0
+    )
+    basis_adjustment = float(_finite(adjustments.get("basis"), 0.0) or 0.0)
+    orderflow_age = _finite(selected_edge.get("orderflow_age_seconds"))
+    fresh_supportive_flow = bool(
+        orderflow_age is not None
+        and orderflow_age <= float(cfg["orderflow_freshness_seconds"])
+        and orderflow_adjustment > 0.0
+    )
+    common_conditions = {
+        "enabled": bool(cfg["evidence_allocation_enabled"]),
+        "crypto": not bool(tradfi),
+        "trend_path": source in {"trend_only", "aligned"}
+        and engine in {"", "trend_continuation"},
+        "long": side == "long",
+        "fresh_continuation": bool(candidate.get("fresh_continuation")),
+        "persistent_up": transition == "persistent_up"
+        and mtf_side == "long"
+        and bool(mtf.get("available")),
+        "cross_section_available": universe_size
+        >= int(cfg["evidence_minimum_universe_size"]),
+        "fresh_supportive_orderflow": fresh_supportive_flow,
+        "basis_not_adverse": basis_adjustment >= -0.003,
+    }
+    evidence_tier = "base"
+    multiplier = 1.0
+    strong_conditions = {
+        "risk_tier": tier in {"strong", "elite"},
+        "score": score >= float(cfg["evidence_strong_score"]),
+        "percentile": percentile >= float(cfg["evidence_strong_percentile"]),
+        "multi_speed": speed_agreement
+        >= float(cfg["evidence_strong_speed_agreement"]),
+        "persistence": persistence >= float(cfg["evidence_strong_persistence"]),
+    }
+    elite_conditions = {
+        "risk_tier": tier == "elite",
+        "score": score >= float(cfg["evidence_elite_score"]),
+        "percentile": percentile >= float(cfg["evidence_elite_percentile"]),
+        "multi_speed": speed_agreement
+        >= float(cfg["evidence_elite_speed_agreement"]),
+        "persistence": persistence >= float(cfg["evidence_elite_persistence"]),
+    }
+    if all(common_conditions.values()) and all(strong_conditions.values()):
+        evidence_tier = "strong"
+        multiplier = float(cfg["evidence_strong_margin_multiplier"])
+        if all(elite_conditions.values()):
+            evidence_tier = "elite"
+            multiplier = float(cfg["evidence_elite_margin_multiplier"])
+    max_fraction = float(cfg["evidence_max_initial_margin_fraction"])
+    adjusted_fraction = min(max_fraction, base_fraction * multiplier)
+    applied = adjusted_fraction > base_fraction + 1e-12
+    unmet = [
+        name
+        for name, passed in {**common_conditions, **strong_conditions}.items()
+        if not passed
+    ]
+    reason = (
+        f"{evidence_tier} crypto risk-managed momentum allocation: "
+        f"margin {base_fraction:.3f}->{adjusted_fraction:.3f}"
+        if applied
+        else "base aggressive allocation retained"
+        + (f"; unmet={','.join(unmet)}" if unmet else "")
+    )
+    return {
+        "profile": SMALL_ACCOUNT_REGIME_PROFILE_VERSION,
+        "applied": applied,
+        "evidence_tier": evidence_tier,
+        "margin_multiplier": round(multiplier, 6),
+        "base_initial_margin_fraction": round(base_fraction, 6),
+        "initial_margin_fraction": round(adjusted_fraction, 6),
+        "reason": reason,
+        "evidence": {
+            "side": side,
+            "source": source,
+            "risk_tier": tier,
+            "score": round(score, 6),
+            "percentile": round(percentile, 6),
+            "universe_size": universe_size,
+            "transition": transition,
+            "multi_speed_agreement": round(speed_agreement, 6),
+            "persistence_score": round(persistence, 6),
+            "orderflow_age_seconds": orderflow_age,
+            "fresh_orderflow_adjustment": round(orderflow_adjustment, 6),
+            "basis_adjustment": round(basis_adjustment, 6),
+            "conditions": {**common_conditions, **strong_conditions},
+        },
+    }
+
+
 def evaluate_regime_challenger_promotion(
     events: Sequence[Mapping[str, Any]] | None,
     *,
@@ -1364,5 +1562,6 @@ __all__ = (
     "evaluate_small_account_exhaustion_reversal",
     "normalize_small_account_regime_config",
     "resolve_regime_ensemble_candidate",
+    "resolve_small_account_evidence_allocation",
     "reversal_exit_plan_overrides",
 )

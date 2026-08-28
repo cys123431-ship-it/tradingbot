@@ -447,6 +447,30 @@ def test_adaptive_trend_small_account_uses_95_percent_budget_and_65_percent_init
     assert updated["risk_budget_mode"] == "adaptive_trend_small_account_aggressive"
 
 
+def test_adaptive_trend_small_account_applies_evidence_margin_once_at_final_sizing():
+    updated = apply_dynamic_leverage_to_plan(
+        _plan(
+            strategy="adaptive_breakout_trend_v1",
+            adaptive_breakout_trend_score=96.0,
+            adaptive_trend_risk_tier="elite",
+            adaptive_breakout_trend_metrics={"risk_tier": "elite"},
+            small_account_initial_margin_fraction=0.8125,
+            risk_distance=2.0,
+            risk_distance_pct=2.0,
+            planned_notional=100.0,
+            qty=1.0,
+        ),
+        free_balance=100.0,
+        account_equity=100.0,
+    )
+
+    expected_margin = 100.0 * 0.95 * 0.8125
+    assert updated["leverage"] == 7
+    assert updated["planned_margin"] == pytest.approx(expected_margin)
+    assert updated["planned_notional"] == pytest.approx(expected_margin * 7)
+    assert updated["small_account_margin_utilization"] == pytest.approx(0.8125)
+
+
 def test_adaptive_trend_small_account_preserves_four_x_floor_across_two_phase_sizing():
     plan = _plan(
         strategy="adaptive_breakout_trend_v1",

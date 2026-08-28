@@ -55,6 +55,7 @@ from .small_account_regime import (
     evaluate_small_account_exhaustion_reversal,
     normalize_small_account_regime_config,
     resolve_regime_ensemble_candidate,
+    resolve_small_account_evidence_allocation,
     reversal_exit_plan_overrides,
 )
 from .opportunity_risk import (
@@ -244,6 +245,7 @@ __all__ = [
     "evaluate_small_account_exhaustion_reversal",
     "normalize_small_account_regime_config",
     "resolve_regime_ensemble_candidate",
+    "resolve_small_account_evidence_allocation",
     "reversal_exit_plan_overrides",
     "OpportunityRiskDecision",
     "apply_opportunity_risk_to_plan",

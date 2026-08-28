@@ -535,6 +535,7 @@ def resolve_trend_event_candidate(
             "source": "trend_only",
             "agreement": "trend_only",
             "score": trend_score,
+            "fresh_continuation": bool(trend.get("fresh_continuation")),
             "reason": "1h trend candidate; event engine neutral",
         }
     if event_allowed and not trend_allowed:
@@ -563,6 +564,7 @@ def resolve_trend_event_candidate(
             "source": "aligned",
             "agreement": "aligned",
             "score": combined_score,
+            "fresh_continuation": bool(trend.get("fresh_continuation")),
             "reason": "1h trend and independent event engine aligned",
         }
 
@@ -596,6 +598,7 @@ def resolve_trend_event_candidate(
             "source": "trend_conflict_winner",
             "agreement": "conflict_resolved",
             "score": trend_score,
+            "fresh_continuation": bool(trend.get("fresh_continuation")),
             "reason": f"trend candidate won conflict by {abs(score_gap):.1f} points",
         }
     return {

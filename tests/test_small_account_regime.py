@@ -4,6 +4,7 @@ from utbreakout.small_account_regime import (
     evaluate_regime_challenger_promotion,
     evaluate_small_account_exhaustion_reversal,
     resolve_regime_ensemble_candidate,
+    resolve_small_account_evidence_allocation,
     reversal_exit_plan_overrides,
 )
 from bot_runtime.signal_entry import build_durable_entry_plan_summary
@@ -316,6 +317,94 @@ def test_regime_router_uses_only_fresh_orderflow_and_direction_aware_basis():
         ]
         == 0.0
     )
+
+
+def _momentum_allocation_candidate(*, side="long", source="trend_only"):
+    return {
+        "allowed": True,
+        "side": side,
+        "source": source,
+        "score": 88.0,
+        "fresh_continuation": True,
+        "regime_engine": "trend_continuation",
+        "selected_net_edge": {
+            "orderflow_age_seconds": 20.0,
+            "probability_adjustments": {
+                "fresh_orderflow": 0.012,
+                "basis": 0.004,
+            },
+        },
+    }
+
+
+def _momentum_selector():
+    return {
+        "convex_rotation_score": 88.0,
+        "convex_rotation_percentile": 94.0,
+        "convex_rotation_universe_size": 40,
+    }
+
+
+def test_evidence_allocation_expands_only_corroborated_persistent_crypto_long():
+    allocation = resolve_small_account_evidence_allocation(
+        _momentum_allocation_candidate(),
+        _router_context(persistent=True),
+        _momentum_selector(),
+        risk_tier="elite",
+        initial_margin_fraction=0.65,
+    )
+
+    assert allocation["applied"] is True
+    assert allocation["evidence_tier"] == "elite"
+    assert allocation["margin_multiplier"] == 1.25
+    assert allocation["initial_margin_fraction"] == 0.8125
+
+    summary = build_durable_entry_plan_summary({
+        "small_account_evidence_allocation_profile": allocation["profile"],
+        "small_account_evidence_allocation_applied": allocation["applied"],
+        "small_account_evidence_allocation_tier": allocation["evidence_tier"],
+        "small_account_evidence_margin_multiplier": allocation["margin_multiplier"],
+        "small_account_evidence_base_margin_fraction": allocation[
+            "base_initial_margin_fraction"
+        ],
+        "small_account_evidence_reason": allocation["reason"],
+        "small_account_evidence": allocation["evidence"],
+    })
+    assert summary["small_account_evidence_allocation_applied"] is True
+    assert summary["small_account_evidence_allocation_tier"] == "elite"
+    assert summary["small_account_evidence_margin_multiplier"] == 1.25
+
+
+def test_evidence_allocation_never_reduces_short_event_tradfi_or_stale_flow():
+    cases = (
+        (_momentum_allocation_candidate(side="short"), False),
+        (_momentum_allocation_candidate(source="event_only"), False),
+        (_momentum_allocation_candidate(), True),
+    )
+    for candidate, tradfi in cases:
+        allocation = resolve_small_account_evidence_allocation(
+            candidate,
+            _router_context(persistent=True),
+            _momentum_selector(),
+            risk_tier="elite",
+            initial_margin_fraction=0.65,
+            tradfi=tradfi,
+        )
+        assert allocation["applied"] is False
+        assert allocation["initial_margin_fraction"] == 0.65
+
+    stale = _momentum_allocation_candidate()
+    stale["selected_net_edge"]["orderflow_age_seconds"] = 180.0
+    stale["selected_net_edge"]["probability_adjustments"]["fresh_orderflow"] = 0.0
+    allocation = resolve_small_account_evidence_allocation(
+        stale,
+        _router_context(persistent=True),
+        _momentum_selector(),
+        risk_tier="elite",
+        initial_margin_fraction=0.65,
+    )
+    assert allocation["applied"] is False
+    assert allocation["initial_margin_fraction"] == 0.65
 
 
 def test_challenger_promotion_requires_independent_regime_diversified_net_results():

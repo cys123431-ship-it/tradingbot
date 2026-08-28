@@ -245,7 +245,12 @@ def test_independent_event_engine_does_not_use_legacy_missing_data_fallback():
 
 def test_candidate_resolver_keeps_trend_and_event_as_or_paths():
     trend_only = resolve_trend_event_candidate(
-        {"allowed": True, "side": "long", "score": 72.0},
+        {
+            "allowed": True,
+            "side": "long",
+            "score": 72.0,
+            "fresh_continuation": True,
+        },
         {"allowed": False},
     )
     event_only = resolve_trend_event_candidate(
@@ -253,7 +258,12 @@ def test_candidate_resolver_keeps_trend_and_event_as_or_paths():
         {"allowed": True, "side": "short", "score": 78.0},
     )
     aligned = resolve_trend_event_candidate(
-        {"allowed": True, "side": "long", "score": 72.0},
+        {
+            "allowed": True,
+            "side": "long",
+            "score": 72.0,
+            "fresh_continuation": True,
+        },
         {"allowed": True, "side": "long", "score": 80.0},
     )
 
@@ -261,6 +271,8 @@ def test_candidate_resolver_keeps_trend_and_event_as_or_paths():
     assert event_only["source"] == "event_only"
     assert aligned["source"] == "aligned"
     assert aligned["score"] > max(72.0, 80.0)
+    assert trend_only["fresh_continuation"] is True
+    assert aligned["fresh_continuation"] is True
 
 
 def test_candidate_resolver_waits_when_event_opposes_actionable_trend():
