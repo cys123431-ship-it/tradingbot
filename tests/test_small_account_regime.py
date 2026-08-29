@@ -1,8 +1,17 @@
+import asyncio
+import time
+
+import bot_runtime.signal_scanner as signal_scanner_module
+from bot_runtime.signal_scanner import SignalScannerMixin
 from utbreakout.small_account_regime import (
+    SMALL_ACCOUNT_REGIME_GROUPS,
     SMALL_ACCOUNT_REGIME_PROFILE_VERSION,
+    SMALL_ACCOUNT_REGIME_TIMEFRAMES,
+    default_small_account_regime_config,
     evaluate_multi_timeframe_regime,
     evaluate_regime_challenger_promotion,
     evaluate_small_account_exhaustion_reversal,
+    normalize_small_account_regime_config,
     resolve_regime_ensemble_candidate,
     resolve_small_account_evidence_allocation,
     reversal_exit_plan_overrides,
@@ -220,17 +229,20 @@ def _trend_rows(direction=1.0):
 
 
 def test_multi_timeframe_regime_is_weighted_not_all_timeframe_and():
-    context = evaluate_multi_timeframe_regime({
-        "15m": _trend_rows(-1.0),
-        "1h": _trend_rows(1.0),
-        "4h": _trend_rows(1.0),
-        "1d": _trend_rows(1.0),
-    })
+    rows = {
+        timeframe: _trend_rows(1.0)
+        for timeframe in SMALL_ACCOUNT_REGIME_TIMEFRAMES
+    }
+    rows["1h"] = _trend_rows(-1.0)
+    context = evaluate_multi_timeframe_regime(rows)
 
     assert context["available"] is True
     assert context["direction"] == "long"
     assert context["regime"] == "up"
     assert context["disagreements"] == 1
+    assert context["groups_available"] is True
+    assert tuple(context["snapshots"]) == SMALL_ACCOUNT_REGIME_TIMEFRAMES
+    assert set(context["group_scores"]) == set(SMALL_ACCOUNT_REGIME_GROUPS)
     assert 0.0 <= context["multi_speed_agreement"] <= 1.0
     assert set(context["snapshots"]["1h"]["speed_scores"]) == {
         "fast",
@@ -239,7 +251,84 @@ def test_multi_timeframe_regime_is_weighted_not_all_timeframe_and():
     }
 
 
-def _router_context(*, persistent=True):
+def test_multi_timeframe_regime_requires_coverage_from_every_horizon_group():
+    context = evaluate_multi_timeframe_regime({
+        timeframe: _trend_rows(1.0)
+        for timeframe in SMALL_ACCOUNT_REGIME_GROUPS["execution"]
+    })
+
+    assert context["available"] is False
+    assert context["groups_available"] is False
+    assert context["group_scores"]["execution"]["available"] is True
+    assert context["group_scores"]["core"]["available"] is False
+    assert context["group_scores"]["regime"]["available"] is False
+
+
+def test_default_router_weights_cover_the_exact_requested_horizons():
+    weights = default_small_account_regime_config()["multi_timeframe_weights"]
+
+    assert tuple(weights) == SMALL_ACCOUNT_REGIME_TIMEFRAMES
+    assert sum(weights.values()) == 1.0
+
+    migrated = normalize_small_account_regime_config({
+        "multi_timeframe_weights": {
+            "15m": 0.15,
+            "1h": 0.30,
+            "4h": 0.35,
+            "1d": 0.20,
+        }
+    })["multi_timeframe_weights"]
+    assert migrated == weights
+
+
+def test_live_collector_fetches_and_caches_every_requested_timeframe(monkeypatch):
+    calls = []
+
+    class MarketData:
+        def fetch_ohlcv(self, symbol, timeframe, limit):
+            calls.append((symbol, timeframe, limit))
+            return [timeframe]
+
+    scanner = SignalScannerMixin()
+    scanner.market_data_exchange = MarketData()
+    scanner.small_account_multitimeframe_cache = {}
+    scanner._canonical_futures_symbol = lambda symbol: symbol
+    scanner._relative_strength_pullback_rows_from_ohlcv = (
+        lambda _values: _trend_rows(1.0)
+    )
+    monkeypatch.setattr(signal_scanner_module, "asyncio", asyncio, raising=False)
+    monkeypatch.setattr(signal_scanner_module, "time", time, raising=False)
+    monkeypatch.setattr(
+        signal_scanner_module,
+        "completed_candle_rows",
+        lambda rows, _timeframe, _config, now_ms=None: rows,
+        raising=False,
+    )
+
+    async def _exercise():
+        first = await scanner._fetch_small_account_multitimeframe_context(
+            "TEST/USDT:USDT",
+            now_ms=int(time.time() * 1_000),
+        )
+        first_call_count = len(calls)
+        second = await scanner._fetch_small_account_multitimeframe_context(
+            "TEST/USDT:USDT",
+            now_ms=int(time.time() * 1_000),
+        )
+        return first, first_call_count, second
+
+    first, first_call_count, second = asyncio.run(_exercise())
+
+    assert first_call_count == len(SMALL_ACCOUNT_REGIME_TIMEFRAMES)
+    assert {item[1] for item in calls} == set(SMALL_ACCOUNT_REGIME_TIMEFRAMES)
+    assert all(item[2] == 140 for item in calls)
+    assert tuple(first["snapshots"]) == SMALL_ACCOUNT_REGIME_TIMEFRAMES
+    assert set(first["source_by_timeframe"].values()) == {"fetched"}
+    assert len(calls) == first_call_count
+    assert set(second["source_by_timeframe"].values()) == {"cached"}
+
+
+def _router_context(*, persistent=True, one_hour_direction="long"):
     return {
         "available": True,
         "ambiguous": False,
@@ -249,10 +338,17 @@ def _router_context(*, persistent=True):
         "persistence_score": 0.88 if persistent else 0.10,
         "transition": "persistent_up" if persistent else "transition_or_mixed",
         "mature": False,
+        "groups_available": True,
+        "group_scores": {
+            "execution": {"available": True, "direction_score": 0.38},
+            "core": {"available": True, "direction_score": 0.52},
+            "regime": {"available": True, "direction_score": 0.44},
+        },
+        "strong_opposing_groups": {"long": (), "short": ("core", "regime")},
         "snapshots": {
             "1h": {
                 "available": True,
-                "direction": "long",
+                "direction": one_hour_direction,
             },
         },
     }
@@ -268,6 +364,13 @@ def _short_router_context():
         "persistence_score": 0.84,
         "transition": "persistent_down",
         "mature": False,
+        "groups_available": True,
+        "group_scores": {
+            "execution": {"available": True, "direction_score": -0.38},
+            "core": {"available": True, "direction_score": -0.52},
+            "regime": {"available": True, "direction_score": -0.44},
+        },
+        "strong_opposing_groups": {"long": ("core", "regime"), "short": ()},
         "snapshots": {
             "1h": {
                 "available": True,
@@ -327,7 +430,19 @@ def test_live_crypto_router_blocks_transition_but_keeps_persistent_long():
     assert transitional["code"] == "REGIME_ROUTER_LIVE_TREND_NOT_PERSISTENT"
 
 
-def test_live_crypto_short_requires_fresh_completed_1h_aligned_sell_flow():
+def test_live_router_uses_full_curve_instead_of_single_1h_veto():
+    resolved = resolve_regime_ensemble_candidate(
+        _primary_long_candidate(),
+        {"allowed": False},
+        multi_timeframe_context=_router_context(one_hour_direction="short"),
+        small_account_live=True,
+    )
+
+    assert resolved["allowed"] is True
+    assert resolved["side"] == "long"
+
+
+def test_live_crypto_short_requires_full_router_alignment_and_fresh_sell_flow():
     primary = {
         "allowed": True,
         "side": "short",
@@ -363,7 +478,7 @@ def test_live_crypto_short_requires_fresh_completed_1h_aligned_sell_flow():
     assert confirmed["allowed"] is True
 
 
-def test_live_crypto_event_requires_strong_new_regime_fresh_flow_and_1h():
+def test_live_crypto_event_requires_strong_new_regime_fresh_flow_and_full_router():
     def candidate(*, tier, state, age=20.0, sources=2):
         return {
             "allowed": True,

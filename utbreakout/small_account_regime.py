@@ -2,8 +2,9 @@
 
 The existing adaptive trend and change-point engines remain the primary entry
 paths.  This module adds one deliberately narrow alternative: a confirmed
-liquidity sweep/reclaim while the broad 1h trend is weak or already agrees
-with the reversal direction.  It never overrides a valid trend/event entry.
+liquidity sweep/reclaim while the weighted full-horizon trend is weak or
+already agrees with the reversal direction.  It never overrides a valid
+trend/event entry.
 
 All helpers are pure.  They evaluate completed candles and return plan
 metadata; they never place, cancel, or modify an exchange order.
@@ -17,7 +18,32 @@ from statistics import median
 from typing import Any, Mapping, Sequence
 
 
-SMALL_ACCOUNT_REGIME_PROFILE_VERSION = "small_account_regime_ensemble_v5_live_quality_router"
+SMALL_ACCOUNT_REGIME_PROFILE_VERSION = "small_account_regime_ensemble_v6_full_horizon_router"
+
+# One canonical horizon set is shared by collection, evaluation, routing, and
+# diagnostics.  Keeping it here prevents the live scanner from silently
+# falling back to a smaller subset than the strategy evaluator expects.
+SMALL_ACCOUNT_REGIME_TIMEFRAMES = (
+    "1m",
+    "3m",
+    "5m",
+    "15m",
+    "30m",
+    "1h",
+    "2h",
+    "4h",
+    "6h",
+    "8h",
+    "12h",
+    "1d",
+    "1w",
+)
+
+SMALL_ACCOUNT_REGIME_GROUPS = {
+    "execution": ("1m", "3m", "5m", "15m", "30m"),
+    "core": ("1h", "2h", "4h", "6h", "8h", "12h"),
+    "regime": ("1d", "1w"),
+}
 
 
 def default_small_account_regime_config() -> dict[str, Any]:
@@ -58,10 +84,23 @@ def default_small_account_regime_config() -> dict[str, Any]:
         "tp2_r_cap": 1.80,
         "time_stop_bars": 12,
         "multi_timeframe_weights": {
-            "15m": 0.15,
-            "1h": 0.30,
-            "4h": 0.35,
-            "1d": 0.20,
+            # Execution timing: 25%.  Very short candles help timing but are
+            # deliberately unable to overrule the structural trend alone.
+            "1m": 0.025,
+            "3m": 0.0375,
+            "5m": 0.050,
+            "15m": 0.075,
+            "30m": 0.0625,
+            # Core trend: 50%.
+            "1h": 0.100,
+            "2h": 0.100,
+            "4h": 0.110,
+            "6h": 0.075,
+            "8h": 0.065,
+            "12h": 0.050,
+            # Broad regime: 25%.
+            "1d": 0.150,
+            "1w": 0.100,
         },
         # Blend complementary trend speeds inside every timeframe.  This is a
         # weighted ensemble, not an all-speeds-must-agree entry gate.
@@ -74,7 +113,10 @@ def default_small_account_regime_config() -> dict[str, Any]:
         "orderflow_freshness_seconds": 90.0,
         "multi_timeframe_minimum_direction_score": 0.18,
         "multi_timeframe_strong_direction_score": 0.42,
-        "multi_timeframe_max_disagreements": 2,
+        "multi_timeframe_minimum_available_weight": 0.65,
+        "multi_timeframe_group_minimum_coverage": 0.50,
+        "multi_timeframe_max_opposing_weight": 0.38,
+        "multi_timeframe_persistence_weight": 0.45,
         "trend_maturity_extension_atr": 2.40,
         "trend_maturity_run_bars": 18,
         "router_minimum_net_ev_r": 0.02,
@@ -88,7 +130,8 @@ def default_small_account_regime_config() -> dict[str, Any]:
         # TradFi retains its existing session/pattern/basis entry rules.
         "live_crypto_regime_filters_enabled": True,
         "live_crypto_event_require_fresh_orderflow": True,
-        "live_crypto_event_require_1h_alignment": True,
+        "live_crypto_event_require_router_alignment": True,
+        "live_crypto_trend_require_router_alignment": True,
         "live_crypto_short_require_fresh_sell_flow": True,
         # Evidence never expands an unconfirmed first fill.  It raises only the
         # first winner-pyramid target after positive R confirms the trade.
@@ -158,7 +201,8 @@ def normalize_small_account_regime_config(
         "evidence_allocation_enabled",
         "live_crypto_regime_filters_enabled",
         "live_crypto_event_require_fresh_orderflow",
-        "live_crypto_event_require_1h_alignment",
+        "live_crypto_event_require_router_alignment",
+        "live_crypto_trend_require_router_alignment",
         "live_crypto_short_require_fresh_sell_flow",
     ):
         raw = normalized.get(key, defaults[key])
@@ -173,7 +217,6 @@ def normalize_small_account_regime_config(
         ("strong_opposite_vote_block", 1, 4),
         ("minimum_nonprice_confirmations", 1, 4),
         ("time_stop_bars", 4, 48),
-        ("multi_timeframe_max_disagreements", 0, 4),
         ("state_persistence_lag_bars", 2, 12),
         ("trend_maturity_run_bars", 4, 96),
         ("promotion_lookback_days", 30, 730),
@@ -214,6 +257,10 @@ def normalize_small_account_regime_config(
         ("tp2_r_cap", 0.75, 3.00),
         ("multi_timeframe_minimum_direction_score", 0.05, 0.60),
         ("multi_timeframe_strong_direction_score", 0.15, 0.90),
+        ("multi_timeframe_minimum_available_weight", 0.40, 1.00),
+        ("multi_timeframe_group_minimum_coverage", 0.20, 1.00),
+        ("multi_timeframe_max_opposing_weight", 0.10, 0.49),
+        ("multi_timeframe_persistence_weight", 0.20, 0.80),
         ("orderflow_freshness_seconds", 15.0, 300.0),
         ("trend_maturity_extension_atr", 0.75, 6.0),
         ("router_minimum_net_ev_r", -0.25, 0.50),
@@ -279,7 +326,12 @@ def normalize_small_account_regime_config(
     normalized["tp2_ratio"] = 1.0 - normalized["tp1_ratio"]
     normalized["risk_tier"] = "base"
     raw_weights = normalized.get("multi_timeframe_weights")
-    raw_weights = raw_weights if isinstance(raw_weights, Mapping) else defaults["multi_timeframe_weights"]
+    raw_weights = (
+        raw_weights
+        if isinstance(raw_weights, Mapping)
+        and set(SMALL_ACCOUNT_REGIME_TIMEFRAMES).issubset(raw_weights)
+        else defaults["multi_timeframe_weights"]
+    )
     weights = {
         timeframe: max(0.0, float(_finite(raw_weights.get(timeframe), weight) or weight))
         for timeframe, weight in defaults["multi_timeframe_weights"].items()
@@ -553,7 +605,13 @@ def evaluate_multi_timeframe_regime(
     *,
     config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Blend 15m/1h/4h/1d trend state without an all-timeframe AND gate."""
+    """Blend all configured horizons without an all-timeframes-must-agree gate.
+
+    The execution, core-trend, and broad-regime groups must each have enough
+    completed-candle coverage.  Inside those groups every timeframe remains a
+    weighted vote, so one noisy candle (including 1h) cannot veto the rest of
+    the curve by itself.
+    """
 
     cfg = normalize_small_account_regime_config(config)
     weights = cfg["multi_timeframe_weights"]
@@ -561,6 +619,8 @@ def evaluate_multi_timeframe_regime(
     weighted_sum = 0.0
     available_weight = 0.0
     directions: list[str] = []
+    long_weight = 0.0
+    short_weight = 0.0
     for timeframe, weight in weights.items():
         snapshot = _timeframe_trend_snapshot(
             (timeframe_rows or {}).get(timeframe),
@@ -576,10 +636,19 @@ def evaluate_multi_timeframe_regime(
         available_weight += float(weight)
         if snapshot.get("direction") in {"long", "short"}:
             directions.append(str(snapshot["direction"]))
+            if snapshot.get("direction") == "long":
+                long_weight += float(weight)
+            else:
+                short_weight += float(weight)
     score = weighted_sum / available_weight if available_weight > 0 else 0.0
     long_votes = sum(value == "long" for value in directions)
     short_votes = sum(value == "short" for value in directions)
     disagreements = min(long_votes, short_votes)
+    opposing_weight_ratio = (
+        min(long_weight, short_weight) / available_weight
+        if available_weight > 0
+        else 0.0
+    )
     minimum = float(cfg["multi_timeframe_minimum_direction_score"])
     regime = "up" if score >= minimum else "down" if score <= -minimum else "range"
     mature_timeframes = [
@@ -624,30 +693,112 @@ def evaluate_multi_timeframe_regime(
         and snapshot.get("state_persistent")
         and snapshot.get("direction") == overall_direction
     )
+    persistent_weight_ratio = (
+        persistent_weight / available_weight if available_weight > 0 else 0.0
+    )
+    group_scores: dict[str, dict[str, Any]] = {}
+    for group_name, timeframes in SMALL_ACCOUNT_REGIME_GROUPS.items():
+        configured_group_weight = sum(float(weights[item]) for item in timeframes)
+        available_group_weight = sum(
+            float(weights[item])
+            for item in timeframes
+            if snapshots[item].get("available")
+        )
+        group_weighted_sum = sum(
+            float(weights[item])
+            * float(snapshots[item].get("direction_score", 0.0) or 0.0)
+            for item in timeframes
+            if snapshots[item].get("available")
+        )
+        group_score = (
+            group_weighted_sum / available_group_weight
+            if available_group_weight > 0
+            else 0.0
+        )
+        group_coverage = (
+            available_group_weight / configured_group_weight
+            if configured_group_weight > 0
+            else 0.0
+        )
+        group_available = bool(
+            group_coverage >= float(cfg["multi_timeframe_group_minimum_coverage"])
+        )
+        group_direction = (
+            "long"
+            if group_score >= minimum
+            else "short"
+            if group_score <= -minimum
+            else "neutral"
+        )
+        group_scores[group_name] = {
+            "available": group_available,
+            "coverage": round(group_coverage, 6),
+            "configured_weight": round(configured_group_weight, 6),
+            "available_weight": round(available_group_weight, 6),
+            "direction_score": round(group_score, 6),
+            "direction": group_direction,
+            "timeframes": tuple(timeframes),
+        }
+    groups_available = all(
+        group.get("available") for group in group_scores.values()
+    )
+    strong_direction = float(cfg["multi_timeframe_strong_direction_score"])
+    strong_opposing_groups = {
+        "long": tuple(
+            name
+            for name, group in group_scores.items()
+            if float(group.get("direction_score", 0.0) or 0.0) <= -strong_direction
+        ),
+        "short": tuple(
+            name
+            for name, group in group_scores.items()
+            if float(group.get("direction_score", 0.0) or 0.0) >= strong_direction
+        ),
+    }
     transition = (
         "persistent_up"
-        if score >= minimum and persistent_weight >= 0.50
+        if score >= minimum
+        and persistent_weight_ratio >= float(cfg["multi_timeframe_persistence_weight"])
         else "persistent_down"
-        if score <= -minimum and persistent_weight >= 0.50
+        if score <= -minimum
+        and persistent_weight_ratio >= float(cfg["multi_timeframe_persistence_weight"])
         else "transition_or_mixed"
+    )
+    available = bool(
+        available_weight >= float(cfg["multi_timeframe_minimum_available_weight"])
+        and groups_available
     )
     return {
         "profile": SMALL_ACCOUNT_REGIME_PROFILE_VERSION,
-        "available": available_weight >= 0.50,
+        "available": available,
+        "available_weight": round(available_weight, 6),
+        "minimum_available_weight": round(
+            float(cfg["multi_timeframe_minimum_available_weight"]), 6
+        ),
         "weighted_direction_score": round(score, 6),
         "direction": overall_direction,
         "regime": regime,
         "disagreements": disagreements,
         "ambiguous": bool(
             abs(score) < minimum
-            or disagreements > int(cfg["multi_timeframe_max_disagreements"])
+            or opposing_weight_ratio
+            > float(cfg["multi_timeframe_max_opposing_weight"])
+        ),
+        "opposing_weight_ratio": round(opposing_weight_ratio, 6),
+        "maximum_opposing_weight": round(
+            float(cfg["multi_timeframe_max_opposing_weight"]), 6
         ),
         "mature": bool(mature_timeframes),
         "mature_timeframes": mature_timeframes,
         "multi_speed_agreement": round(speed_agreement, 6),
         "persistence_score": round(persistence_score, 6),
         "persistent_weight": round(persistent_weight, 6),
+        "persistent_weight_ratio": round(persistent_weight_ratio, 6),
         "transition": transition,
+        "groups_available": groups_available,
+        "group_scores": group_scores,
+        "strong_opposing_groups": strong_opposing_groups,
+        "timeframes": SMALL_ACCOUNT_REGIME_TIMEFRAMES,
         "snapshots": snapshots,
     }
 
@@ -1401,24 +1552,42 @@ def resolve_regime_ensemble_candidate(
         and primary.get("side") in {"long", "short"}
     ):
         side = str(primary.get("side"))
+        side_sign = 1.0 if side == "long" else -1.0
+        horizon_context = dict(multi_timeframe_context or {})
         transition = str(
-            (multi_timeframe_context or {}).get("transition")
+            horizon_context.get("transition")
             or "transition_or_mixed"
         )
-        snapshots = (
-            (multi_timeframe_context or {}).get("snapshots")
-            if isinstance((multi_timeframe_context or {}).get("snapshots"), Mapping)
+        horizon_score = float(
+            _finite(horizon_context.get("weighted_direction_score"), 0.0) or 0.0
+        )
+        opposing_groups_by_side = (
+            horizon_context.get("strong_opposing_groups")
+            if isinstance(horizon_context.get("strong_opposing_groups"), Mapping)
             else {}
         )
-        one_hour = snapshots.get("1h") if isinstance(snapshots, Mapping) else {}
-        one_hour_aligned = bool(
-            isinstance(one_hour, Mapping)
-            and one_hour.get("available")
-            and str(one_hour.get("direction") or "") == side
+        opposing_groups = tuple(opposing_groups_by_side.get(side) or ())
+        router_aligned = bool(
+            horizon_context.get("available")
+            and not horizon_context.get("ambiguous")
+            and side_sign * horizon_score
+            >= float(cfg["multi_timeframe_minimum_direction_score"])
+            and not opposing_groups
         )
         if primary_engine == "trend_continuation":
             required_transition = "persistent_up" if side == "long" else "persistent_down"
-            if transition != required_transition:
+            if bool(cfg["live_crypto_trend_require_router_alignment"]) and not router_aligned:
+                primary = {
+                    **primary,
+                    "allowed": False,
+                    "code": "REGIME_ROUTER_LIVE_TREND_HORIZON_CONFLICT",
+                    "reason": (
+                        f"live crypto {side} continuation requires the full "
+                        f"13-timeframe router; score={horizon_score:+.3f}, "
+                        f"opposing_groups={','.join(opposing_groups) or 'none'}"
+                    ),
+                }
+            elif transition != required_transition:
                 primary = {
                     **primary,
                     "allowed": False,
@@ -1434,13 +1603,6 @@ def resolve_regime_ensemble_candidate(
                     "allowed": False,
                     "code": "REGIME_ROUTER_LIVE_SHORT_NOT_FRESH",
                     "reason": "live crypto short requires fresh continuation/reacceleration",
-                }
-            elif side == "short" and not one_hour_aligned:
-                primary = {
-                    **primary,
-                    "allowed": False,
-                    "code": "REGIME_ROUTER_LIVE_SHORT_1H_NOT_ALIGNED",
-                    "reason": "live crypto short requires completed 1h downtrend alignment",
                 }
             elif side == "short" and bool(cfg["live_crypto_short_require_fresh_sell_flow"]):
                 orderflow_age = _orderflow_age_seconds(cost_context)
@@ -1510,12 +1672,16 @@ def resolve_regime_ensemble_candidate(
                     "code": "REGIME_ROUTER_LIVE_EVENT_FLOW_STALE",
                     "reason": "live crypto event requires measured fresh order flow",
                 }
-            elif bool(cfg["live_crypto_event_require_1h_alignment"]) and not one_hour_aligned:
+            elif bool(cfg["live_crypto_event_require_router_alignment"]) and not router_aligned:
                 primary = {
                     **primary,
                     "allowed": False,
-                    "code": "REGIME_ROUTER_LIVE_EVENT_1H_NOT_ALIGNED",
-                    "reason": "live crypto event requires completed 1h directional alignment",
+                    "code": "REGIME_ROUTER_LIVE_EVENT_HORIZON_CONFLICT",
+                    "reason": (
+                        f"live crypto event requires the full 13-timeframe "
+                        f"router; score={horizon_score:+.3f}, "
+                        f"opposing_groups={','.join(opposing_groups) or 'none'}"
+                    ),
                 }
     primary_side_sign = 1.0 if str(primary.get("side") or "").lower() == "long" else -1.0
     mtf_score = float(
@@ -1705,7 +1871,9 @@ def reversal_exit_plan_overrides(
 
 
 __all__ = (
+    "SMALL_ACCOUNT_REGIME_GROUPS",
     "SMALL_ACCOUNT_REGIME_PROFILE_VERSION",
+    "SMALL_ACCOUNT_REGIME_TIMEFRAMES",
     "default_small_account_regime_config",
     "evaluate_multi_timeframe_regime",
     "evaluate_regime_challenger_promotion",

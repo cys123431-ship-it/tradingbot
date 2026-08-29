@@ -1625,6 +1625,7 @@ class SignalAlphaMixin:
                 candidate_side,
                 getattr(preliminary, 'metrics', None),
                 config=trend_cfg,
+                multi_timeframe_context=multi_timeframe_context,
             )
             status['independent_event_context'] = dict(event_context)
             if not bool(event_context.get('allowed')):

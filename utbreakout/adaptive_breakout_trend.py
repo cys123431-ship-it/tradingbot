@@ -1115,26 +1115,49 @@ def evaluate_independent_event_context(
     trend_metrics: Mapping[str, Any] | None,
     *,
     config: Mapping[str, Any] | None = None,
+    multi_timeframe_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Guard a fast event with independent 1h context, without requiring entry alignment.
+    """Guard a fast event with the full live horizon router when available.
 
     An event is still an OR-style early entry: EMA alignment, a crossover, and
-    fast-sleeve agreement are not required.  The context is used only to stop
-    an established opposite multi-horizon direction, a volatility shock, or a
-    late extension that the event's own synthetic metrics cannot measure.
+    fast-sleeve agreement are not required.  Live execution uses the canonical
+    multi-timeframe result so a single 1h metric cannot silently veto the
+    13-timeframe router.  The legacy 1h-only guard remains only for callers
+    that do not yet supply the router context.
     """
 
     cfg = normalize_adaptive_breakout_trend_config(config)
     metrics = dict(trend_metrics or {})
     normalized_side = str(side or "").strip().lower()
-    weighted_momentum = float(
-        _finite(metrics.get("weighted_momentum"), 0.0) or 0.0
+    full_context_supplied = bool(
+        isinstance(multi_timeframe_context, Mapping)
+        and multi_timeframe_context
     )
-    broad_side = (
-        "long" if weighted_momentum > 0.0 else
-        "short" if weighted_momentum < 0.0 else
-        None
+    full_context_available = bool(
+        full_context_supplied and multi_timeframe_context.get("available")
     )
+    if full_context_supplied:
+        weighted_momentum = float(
+            _finite(
+                multi_timeframe_context.get("weighted_direction_score"),
+                0.0,
+            )
+            or 0.0
+        )
+        broad_side = str(
+            multi_timeframe_context.get("direction") or ""
+        ).strip().lower()
+        if broad_side not in {"long", "short"}:
+            broad_side = None
+    else:
+        weighted_momentum = float(
+            _finite(metrics.get("weighted_momentum"), 0.0) or 0.0
+        )
+        broad_side = (
+            "long" if weighted_momentum > 0.0 else
+            "short" if weighted_momentum < 0.0 else
+            None
+        )
     horizon_votes = metrics.get("horizon_votes")
     if not isinstance(horizon_votes, Mapping):
         horizon_votes = {}
@@ -1175,8 +1198,17 @@ def evaluate_independent_event_context(
     result = {
         "allowed": True,
         "code": "INDEPENDENT_EVENT_CONTEXT_OK",
-        "reason": "independent event passed 1h context guard",
+        "reason": (
+            "independent event passed full 13-timeframe context guard"
+            if full_context_supplied
+            else "independent event passed legacy 1h context guard"
+        ),
         "profile": ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION,
+        "context_source": (
+            "full_multi_timeframe_router"
+            if full_context_supplied
+            else "legacy_1h_metrics"
+        ),
         "broad_side": broad_side,
         "weighted_momentum": weighted_momentum,
         "broad_conflict_min_momentum": broad_conflict_min_momentum,
@@ -1193,6 +1225,38 @@ def evaluate_independent_event_context(
             "code": "REJECTED_INDEPENDENT_EVENT_SIDE",
             "reason": "independent event direction is unavailable",
         })
+        return result
+    if full_context_supplied:
+        if not full_context_available:
+            result.update({
+                "allowed": False,
+                "code": "REJECTED_INDEPENDENT_EVENT_HORIZON_DATA",
+                "reason": "full 13-timeframe router does not have sufficient completed-candle coverage",
+            })
+            return result
+        opposing_by_side = multi_timeframe_context.get("strong_opposing_groups")
+        opposing_by_side = (
+            opposing_by_side if isinstance(opposing_by_side, Mapping) else {}
+        )
+        opposing_groups = tuple(opposing_by_side.get(normalized_side) or ())
+        result["strong_opposing_groups"] = opposing_groups
+        if (
+            opposing_groups
+            or (
+                broad_side in {"long", "short"}
+                and broad_side != normalized_side
+                and abs(weighted_momentum) >= broad_conflict_min_momentum
+            )
+        ):
+            result.update({
+                "allowed": False,
+                "code": "REJECTED_INDEPENDENT_EVENT_FULL_HORIZON_CONFLICT",
+                "reason": (
+                    f"independent event {normalized_side} conflicts with the "
+                    f"full 13-timeframe router (score={weighted_momentum:+.3f}, "
+                    f"opposing_groups={','.join(opposing_groups) or 'none'})"
+                ),
+            })
         return result
     if (
         broad_side in {"long", "short"}

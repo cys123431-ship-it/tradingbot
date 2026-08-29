@@ -13,6 +13,7 @@ from utbreakout.change_point_flow import (
 )
 from utbreakout.coinselector import apply_adaptive_top_candidate_gate
 from utbreakout.small_account_regime import (
+    SMALL_ACCOUNT_REGIME_TIMEFRAMES,
     evaluate_multi_timeframe_regime,
     evaluate_small_account_exhaustion_reversal,
     resolve_regime_ensemble_candidate,
@@ -2109,7 +2110,7 @@ class SignalScannerMixin:
         config=None,
         now_ms=None,
     ):
-        """Fetch only missing completed timeframes and return the pure MTF blend."""
+        """Collect the canonical 13 completed-candle horizons for the router."""
 
         canonical = self._canonical_futures_symbol(symbol)
         now = time.time()
@@ -2121,24 +2122,49 @@ class SignalScannerMixin:
             self.small_account_multitimeframe_cache = cache
         rows_by_timeframe = {}
         errors = {}
-        for timeframe in ('15m', '1h', '4h', '1d'):
+        sources = {}
+        cache_ttl_seconds = {
+            '1m': 20.0,
+            '3m': 45.0,
+            '5m': 60.0,
+            '15m': 120.0,
+            '30m': 180.0,
+            '1h': 300.0,
+            '2h': 420.0,
+            '4h': 600.0,
+            '6h': 900.0,
+            '8h': 1_200.0,
+            '12h': 1_800.0,
+            '1d': 3_600.0,
+            '1w': 21_600.0,
+        }
+        missing = []
+        for timeframe in SMALL_ACCOUNT_REGIME_TIMEFRAMES:
             supplied_rows = supplied.get(timeframe)
             if supplied_rows:
                 rows_by_timeframe[timeframe] = list(supplied_rows)
+                sources[timeframe] = 'supplied'
                 continue
             key = f'{canonical}:{timeframe}'
-            ttl = 120.0 if timeframe in {'15m', '1h'} else 600.0
+            ttl = float(cache_ttl_seconds[timeframe])
             cached = cache.get(key)
             if isinstance(cached, dict) and now - float(cached.get('cached_at', 0) or 0) < ttl:
                 rows_by_timeframe[timeframe] = list(cached.get('rows') or [])
+                sources[timeframe] = 'cached'
                 continue
+            missing.append(timeframe)
+
+        semaphore = asyncio.Semaphore(4)
+
+        async def _fetch_completed_rows(timeframe):
             try:
-                ohlcv = await asyncio.to_thread(
-                    self.market_data_exchange.fetch_ohlcv,
-                    canonical,
-                    timeframe,
-                    limit=140,
-                )
+                async with semaphore:
+                    ohlcv = await asyncio.to_thread(
+                        self.market_data_exchange.fetch_ohlcv,
+                        canonical,
+                        timeframe,
+                        limit=140,
+                    )
                 rows = self._relative_strength_pullback_rows_from_ohlcv(ohlcv)
                 rows = completed_candle_rows(
                     rows,
@@ -2146,12 +2172,27 @@ class SignalScannerMixin:
                     {'exclude_incomplete_live_candle': True},
                     now_ms=evaluation_now_ms,
                 )
-                rows_by_timeframe[timeframe] = rows
-                cache[key] = {'cached_at': now, 'rows': rows}
+                return timeframe, rows, None
             except Exception as exc:
-                rows_by_timeframe[timeframe] = []
-                errors[timeframe] = str(exc)
-        while len(cache) > 384:
+                return timeframe, [], str(exc)
+
+        if missing:
+            fetched = await asyncio.gather(
+                *(_fetch_completed_rows(timeframe) for timeframe in missing)
+            )
+            fetched_at = time.time()
+            for timeframe, rows, error in fetched:
+                rows_by_timeframe[timeframe] = rows
+                if error is None:
+                    cache[f'{canonical}:{timeframe}'] = {
+                        'cached_at': fetched_at,
+                        'rows': rows,
+                    }
+                    sources[timeframe] = 'fetched'
+                else:
+                    errors[timeframe] = error
+                    sources[timeframe] = 'error'
+        while len(cache) > 512:
             oldest = min(
                 cache,
                 key=lambda key: float((cache.get(key) or {}).get('cached_at', 0) or 0),
@@ -2162,7 +2203,8 @@ class SignalScannerMixin:
             config=config,
         )
         context['errors'] = errors
-        context['timeframes'] = tuple(rows_by_timeframe)
+        context['timeframes'] = SMALL_ACCOUNT_REGIME_TIMEFRAMES
+        context['source_by_timeframe'] = sources
         return context
 
     async def _load_coin_selector_markets(self):
@@ -2635,6 +2677,8 @@ class SignalScannerMixin:
                     cost_context=futures_context,
                     promotion_status=regime_promotion_status,
                     config=trend_cfg.get('small_account_regime_ensemble'),
+                    small_account_live=small_account_candidate,
+                    tradfi=bool(base_candidate.get('tradifi_perpetual')),
                 )
                 tradfi_small_account_guardrail = {
                     'profile': TRADFI_SMALL_ACCOUNT_PROFILE_VERSION,
