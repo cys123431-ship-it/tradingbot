@@ -125,12 +125,32 @@ async def resolve_closed_trade_accounting(
                 if value not in (None, "")
             }
 
-            def _fill_label(order_id, fill_price):
+            def _client_order_label(client_order_id):
+                compact = re.sub(
+                    r"[^a-z0-9]",
+                    "",
+                    str(client_order_id or "").strip().lower(),
+                )
+                if not compact:
+                    return None
+                if compact.startswith(("utbsl", "utbsto")):
+                    return "SL"
+                if compact.startswith(("utbtp", "utbtak")):
+                    for label in ("tp1", "tp2", "tp3"):
+                        if label in compact:
+                            return label.upper()
+                    return "TP"
+                return None
+
+            def _fill_label(order_id, fill_price, client_order_id=None):
                 order_id_text = str(order_id or "")
                 if order_id_text in persisted_tp_labels:
                     return persisted_tp_labels[order_id_text]
                 if order_id_text in persisted_stop_ids:
                     return "SL"
+                client_label = _client_order_label(client_order_id)
+                if client_label:
+                    return client_label
                 for target in planned_targets:
                     if not isinstance(target, dict):
                         continue
@@ -204,6 +224,9 @@ async def resolve_closed_trade_accounting(
                             return _number_or_none(target.get("price"))
                 return None
 
+            fetched_order_cache = {}
+            fetch_order = getattr(engine.exchange, "fetch_order", None)
+
             for trade in trades or []:
                 info = (
                     trade.get("info")
@@ -267,21 +290,75 @@ async def resolve_closed_trade_accounting(
                     fill_qty = 0.0
                     fill_price = 0.0
                 if fill_qty > 0 and fill_price > 0:
-                    fill_label = _fill_label(
+                    order_id = (
                         trade.get("order")
                         or info.get("orderId")
-                        or info.get("order"),
-                        fill_price,
+                        or info.get("order")
                     )
+                    client_order_id = (
+                        trade.get("clientOrderId")
+                        or trade.get("client_order_id")
+                        or info.get("clientOrderId")
+                        or info.get("origClientOrderId")
+                    )
+                    fill_label = _fill_label(
+                        order_id,
+                        fill_price,
+                        client_order_id,
+                    )
+                    # Binance Algo orders spawn a regular execution order with
+                    # a different order id.  Resolve that order's client id
+                    # before declaring the fill external/manual.
+                    if (
+                        fill_label == "EXIT"
+                        and order_id not in (None, "")
+                        and callable(fetch_order)
+                    ):
+                        order_key = str(order_id)
+                        if order_key not in fetched_order_cache:
+                            try:
+                                fetched_order_cache[order_key] = (
+                                    await asyncio.to_thread(
+                                        fetch_order,
+                                        order_id,
+                                        symbol,
+                                    )
+                                ) or {}
+                            except Exception as exc:
+                                logger.debug(
+                                    "Exit order identity lookup failed for %s %s: %s",
+                                    symbol,
+                                    order_id,
+                                    exc,
+                                )
+                                fetched_order_cache[order_key] = {}
+                        resolved_order = fetched_order_cache[order_key]
+                        resolved_info = (
+                            resolved_order.get("info")
+                            if isinstance(resolved_order, dict)
+                            and isinstance(resolved_order.get("info"), dict)
+                            else {}
+                        )
+                        client_order_id = (
+                            (resolved_order or {}).get("clientOrderId")
+                            or (resolved_order or {}).get("client_order_id")
+                            or resolved_info.get("clientOrderId")
+                            or resolved_info.get("origClientOrderId")
+                            or client_order_id
+                        )
+                        fill_label = _fill_label(
+                            order_id,
+                            fill_price,
+                            client_order_id,
+                        )
                     closing_qty += fill_qty
                     weighted_exit += fill_qty * fill_price
                     exit_legs.append(
                         {
                             "label": fill_label,
                             "timestamp": trade_ts,
-                            "order_id": trade.get("order")
-                            or info.get("orderId")
-                            or info.get("order"),
+                            "order_id": order_id,
+                            "client_order_id": client_order_id,
                             "qty": fill_qty,
                             "price": fill_price,
                             "reference_price": _exit_reference_price(fill_label),

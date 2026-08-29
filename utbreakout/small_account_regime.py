@@ -17,7 +17,7 @@ from statistics import median
 from typing import Any, Mapping, Sequence
 
 
-SMALL_ACCOUNT_REGIME_PROFILE_VERSION = "small_account_regime_ensemble_v4_risk_managed_momentum"
+SMALL_ACCOUNT_REGIME_PROFILE_VERSION = "small_account_regime_ensemble_v5_live_quality_router"
 
 
 def default_small_account_regime_config() -> dict[str, Any]:
@@ -84,10 +84,14 @@ def default_small_account_regime_config() -> dict[str, Any]:
         "estimated_round_trip_fee_r": 0.035,
         "estimated_slippage_r": 0.025,
         "estimated_missed_fill_r": 0.015,
-        # This overlay never reduces or blocks an entry. It only increases the
-        # first-stage margin for unusually strong crypto long momentum where
-        # relative rank, persistent state, complementary speeds and fresh
-        # signed flow all corroborate.
+        # The stricter live gate applies only to the aggressive crypto profile.
+        # TradFi retains its existing session/pattern/basis entry rules.
+        "live_crypto_regime_filters_enabled": True,
+        "live_crypto_event_require_fresh_orderflow": True,
+        "live_crypto_event_require_1h_alignment": True,
+        "live_crypto_short_require_fresh_sell_flow": True,
+        # Evidence never expands an unconfirmed first fill.  It raises only the
+        # first winner-pyramid target after positive R confirms the trade.
         "evidence_allocation_enabled": True,
         "evidence_strong_score": 70.0,
         "evidence_elite_score": 82.0,
@@ -128,6 +132,16 @@ def _bounded(value: Any, lower: float, upper: float, default: float) -> float:
     return max(lower, min(upper, float(parsed if parsed is not None else default)))
 
 
+def _orderflow_age_seconds(context: Mapping[str, Any] | None) -> float | None:
+    """Read the canonical runtime age while retaining the research-test alias."""
+
+    source = context or {}
+    direct = _finite(source.get("orderflow_age_seconds"))
+    if direct is not None:
+        return direct
+    return _finite(source.get("orderflow_snapshot_age_seconds"))
+
+
 def normalize_small_account_regime_config(
     config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -142,6 +156,10 @@ def normalize_small_account_regime_config(
         "auto_promote_when_qualified",
         "cross_sectional_top_only",
         "evidence_allocation_enabled",
+        "live_crypto_regime_filters_enabled",
+        "live_crypto_event_require_fresh_orderflow",
+        "live_crypto_event_require_1h_alignment",
+        "live_crypto_short_require_fresh_sell_flow",
     ):
         raw = normalized.get(key, defaults[key])
         normalized[key] = (
@@ -807,8 +825,11 @@ def evaluate_small_account_exhaustion_reversal(
         )
         long_short = _finite(context.get("long_short_ratio"))
         oi_z = _finite(context.get("open_interest_delta_z"))
-        orderflow_age = _finite(context.get("orderflow_age_seconds"))
-        orderflow_fresh = orderflow_age is None or orderflow_age <= 90.0
+        orderflow_age = _orderflow_age_seconds(context)
+        orderflow_fresh = bool(
+            orderflow_age is not None
+            and orderflow_age <= float(cfg["orderflow_freshness_seconds"])
+        )
 
         orderflow_confirmed = bool(
             orderflow_fresh
@@ -1012,7 +1033,7 @@ def _candidate_net_ev(
         else 0.0
     )
     orderflow_adjustment = 0.0
-    orderflow_age = _finite(context.get("orderflow_age_seconds"))
+    orderflow_age = _orderflow_age_seconds(context)
     if (
         orderflow_age is not None
         and orderflow_age <= float(config["orderflow_freshness_seconds"])
@@ -1082,13 +1103,13 @@ def resolve_small_account_evidence_allocation(
     tradfi: bool = False,
     config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Scale first-stage margin once for corroborated crypto momentum.
+    """Reserve winner-only pyramid budget for corroborated crypto momentum.
 
-    This is deliberately an upside-only allocator: an ordinary signal keeps
-    the configured aggressive fraction, while a research-aligned persistent
-    crypto long may use more of the already-budgeted margin.  Volatility,
-    stop-distance, liquidation and per-position loss limits remain downstream
-    authorities and are not multiplied here.
+    Every signal keeps the configured first-fill fraction.  A research-aligned
+    persistent crypto long may lift the first positive-R pyramid target, so
+    additional exposure is committed only after the position becomes a winner.
+    Volatility, stop-distance, liquidation and per-position loss limits remain
+    downstream authorities and are not multiplied here.
     """
 
     cfg = normalize_small_account_regime_config(config)
@@ -1181,16 +1202,17 @@ def resolve_small_account_evidence_allocation(
             evidence_tier = "elite"
             multiplier = float(cfg["evidence_elite_margin_multiplier"])
     max_fraction = float(cfg["evidence_max_initial_margin_fraction"])
-    adjusted_fraction = min(max_fraction, base_fraction * multiplier)
-    applied = adjusted_fraction > base_fraction + 1e-12
+    winner_target_fraction = min(max_fraction, base_fraction * multiplier)
+    winner_budget_fraction = max(0.0, winner_target_fraction - base_fraction)
+    applied = winner_budget_fraction > 1e-12
     unmet = [
         name
         for name, passed in {**common_conditions, **strong_conditions}.items()
         if not passed
     ]
     reason = (
-        f"{evidence_tier} crypto risk-managed momentum allocation: "
-        f"margin {base_fraction:.3f}->{adjusted_fraction:.3f}"
+        f"{evidence_tier} crypto winner-only pyramid allocation: "
+        f"initial {base_fraction:.3f}, confirmed target {winner_target_fraction:.3f}"
         if applied
         else "base aggressive allocation retained"
         + (f"; unmet={','.join(unmet)}" if unmet else "")
@@ -1201,7 +1223,9 @@ def resolve_small_account_evidence_allocation(
         "evidence_tier": evidence_tier,
         "margin_multiplier": round(multiplier, 6),
         "base_initial_margin_fraction": round(base_fraction, 6),
-        "initial_margin_fraction": round(adjusted_fraction, 6),
+        "initial_margin_fraction": round(base_fraction, 6),
+        "winner_pyramid_target_fraction": round(winner_target_fraction, 6),
+        "winner_pyramid_budget_fraction": round(winner_budget_fraction, 6),
         "reason": reason,
         "evidence": {
             "side": side,
@@ -1347,6 +1371,8 @@ def resolve_regime_ensemble_candidate(
     cost_context: Mapping[str, Any] | None = None,
     promotion_status: Mapping[str, Any] | None = None,
     config: Mapping[str, Any] | None = None,
+    small_account_live: bool = False,
+    tradfi: bool = False,
 ) -> dict[str, Any]:
     """Route by cost-adjusted EV while keeping an unvalidated challenger shadow-only."""
 
@@ -1367,6 +1393,130 @@ def resolve_regime_ensemble_candidate(
         if str(primary.get("source") or "") in {"event_only", "event_conflict_winner"}
         else "trend_continuation"
     )
+    if (
+        bool(small_account_live)
+        and not bool(tradfi)
+        and bool(cfg["live_crypto_regime_filters_enabled"])
+        and primary.get("allowed")
+        and primary.get("side") in {"long", "short"}
+    ):
+        side = str(primary.get("side"))
+        transition = str(
+            (multi_timeframe_context or {}).get("transition")
+            or "transition_or_mixed"
+        )
+        snapshots = (
+            (multi_timeframe_context or {}).get("snapshots")
+            if isinstance((multi_timeframe_context or {}).get("snapshots"), Mapping)
+            else {}
+        )
+        one_hour = snapshots.get("1h") if isinstance(snapshots, Mapping) else {}
+        one_hour_aligned = bool(
+            isinstance(one_hour, Mapping)
+            and one_hour.get("available")
+            and str(one_hour.get("direction") or "") == side
+        )
+        if primary_engine == "trend_continuation":
+            required_transition = "persistent_up" if side == "long" else "persistent_down"
+            if transition != required_transition:
+                primary = {
+                    **primary,
+                    "allowed": False,
+                    "code": "REGIME_ROUTER_LIVE_TREND_NOT_PERSISTENT",
+                    "reason": (
+                        f"live crypto {side} continuation requires "
+                        f"{required_transition}; observed {transition}"
+                    ),
+                }
+            elif side == "short" and not bool(primary.get("fresh_continuation")):
+                primary = {
+                    **primary,
+                    "allowed": False,
+                    "code": "REGIME_ROUTER_LIVE_SHORT_NOT_FRESH",
+                    "reason": "live crypto short requires fresh continuation/reacceleration",
+                }
+            elif side == "short" and not one_hour_aligned:
+                primary = {
+                    **primary,
+                    "allowed": False,
+                    "code": "REGIME_ROUTER_LIVE_SHORT_1H_NOT_ALIGNED",
+                    "reason": "live crypto short requires completed 1h downtrend alignment",
+                }
+            elif side == "short" and bool(cfg["live_crypto_short_require_fresh_sell_flow"]):
+                orderflow_age = _orderflow_age_seconds(cost_context)
+                imbalance = float(
+                    _finite(
+                        (cost_context or {}).get("rolling_orderbook_imbalance_pct"),
+                        0.0,
+                    )
+                    or 0.0
+                )
+                taker_ratio = float(
+                    _finite((cost_context or {}).get("taker_buy_sell_ratio"), 1.0)
+                    or 1.0
+                )
+                fresh_sell_flow = bool(
+                    orderflow_age is not None
+                    and orderflow_age <= float(cfg["orderflow_freshness_seconds"])
+                    and (
+                        imbalance <= -float(cfg["orderflow_imbalance_confirm_pct"])
+                        or taker_ratio <= 1.0 - float(cfg["taker_ratio_confirm_delta"])
+                    )
+                )
+                if not fresh_sell_flow:
+                    primary = {
+                        **primary,
+                        "allowed": False,
+                        "code": "REGIME_ROUTER_LIVE_SHORT_SELL_FLOW_MISSING",
+                        "reason": "live crypto short requires fresh directional sell flow",
+                    }
+        else:
+            event_decision = (
+                primary.get("event_decision")
+                if isinstance(primary.get("event_decision"), Mapping)
+                else {}
+            )
+            event_state = str(event_decision.get("state") or primary.get("event_state") or "")
+            event_tier = str(
+                event_decision.get("risk_tier") or primary.get("event_risk_tier") or "base"
+            )
+            event_age = _orderflow_age_seconds(event_decision)
+            flow_sources = int(
+                max(0.0, float(_finite(event_decision.get("flow_source_count"), 0.0) or 0.0))
+            )
+            event_flow_fresh = bool(
+                flow_sources > 0
+                and event_age is not None
+                and event_age <= float(cfg["orderflow_freshness_seconds"])
+            )
+            if event_tier not in {"strong", "elite"}:
+                primary = {
+                    **primary,
+                    "allowed": False,
+                    "code": "REGIME_ROUTER_LIVE_EVENT_TIER_LOW",
+                    "reason": f"live crypto event requires strong/elite tier; observed {event_tier}",
+                }
+            elif event_state not in {"new_regime", "persistent_flow"}:
+                primary = {
+                    **primary,
+                    "allowed": False,
+                    "code": "REGIME_ROUTER_LIVE_EVENT_STATE_WEAK",
+                    "reason": f"live crypto event state {event_state or 'unknown'} is not actionable",
+                }
+            elif bool(cfg["live_crypto_event_require_fresh_orderflow"]) and not event_flow_fresh:
+                primary = {
+                    **primary,
+                    "allowed": False,
+                    "code": "REGIME_ROUTER_LIVE_EVENT_FLOW_STALE",
+                    "reason": "live crypto event requires measured fresh order flow",
+                }
+            elif bool(cfg["live_crypto_event_require_1h_alignment"]) and not one_hour_aligned:
+                primary = {
+                    **primary,
+                    "allowed": False,
+                    "code": "REGIME_ROUTER_LIVE_EVENT_1H_NOT_ALIGNED",
+                    "reason": "live crypto event requires completed 1h directional alignment",
+                }
     primary_side_sign = 1.0 if str(primary.get("side") or "").lower() == "long" else -1.0
     mtf_score = float(
         _finite((multi_timeframe_context or {}).get("weighted_direction_score"), 0.0)

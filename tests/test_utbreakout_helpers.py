@@ -148,6 +148,36 @@ def test_failed_entry_record_does_not_consume_decision():
     ) is False
 
 
+def test_exit_decision_lock_blocks_same_candle_but_releases_next_candle():
+    engine = _protection_engine([])
+    engine.trading_state_store = SQLiteTradingStateStore(":memory:")
+    decision_ts = 1_784_246_400_000
+    next_candle_ts = decision_ts + 900_000
+    engine.last_processed_candle_ts = {
+        "BTC/USDT:USDT": decision_ts,
+    }
+
+    recorded = engine._record_utbreakout_exit_decision_lock(
+        "BTC/USDT:USDT",
+        {
+            "side": "long",
+            "decision_candle_ts": decision_ts,
+        },
+        reason="bot stop-loss filled",
+    )
+
+    assert recorded == decision_ts
+    assert engine._utbreakout_decision_already_consumed(
+        "BTC/USDT:USDT",
+        decision_ts,
+    ) is True
+    assert engine._utbreakout_decision_already_consumed(
+        "BTC/USDT:USDT",
+        next_candle_ts,
+    ) is False
+    assert engine.utbreakout_exit_decision_locks == {}
+
+
 def test_previous_donchian_excludes_current_candle():
     highs = [10, 11, 12, 13, 14, 999]
     lows = [9, 8, 7, 6, 5, -999]
@@ -7370,6 +7400,65 @@ def test_stop_replacement_emergency_closes_crossed_target_without_existing_sl():
     assert (
         engine.last_protection_order_status["BTC/USDT:USDT"]["status"]
         == "SL_REPLACE_TARGET_CROSSED_UNPROTECTED"
+    )
+
+
+def test_stop_replacement_emergency_closes_if_mark_crosses_after_cancel():
+    class _CrossAfterCancelExchange(_FakeExchange):
+        def cancel_order(self, order_id, symbol):
+            result = super().cancel_order(order_id, symbol)
+            self.positions[0]["markPrice"] = "99"
+            return result
+
+    pos = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": "1",
+        "entryPrice": "100",
+        "markPrice": "101",
+    }
+    old_sl = {
+        "id": "sl-old",
+        "side": "sell",
+        "type": "stop_market",
+        "amount": "1",
+        "reduceOnly": True,
+        "clientOrderId": "utbslBTCUSDTold",
+        "info": {
+            "symbol": "BTCUSDT",
+            "origType": "STOP_MARKET",
+            "stopPrice": "90",
+            "reduceOnly": "true",
+        },
+    }
+    engine = _protection_engine([old_sl], positions=[pos])
+    engine.exchange = _CrossAfterCancelExchange([old_sl], positions=[pos])
+    engine.PROTECTION_REPLACE_CONFIRM_ATTEMPTS = 1
+    engine.PROTECTION_REPLACE_CONFIRM_DELAY = 0
+    emergency_calls = []
+
+    async def emergency_close(symbol, **kwargs):
+        emergency_calls.append((symbol, kwargs))
+        return {"status": "EMERGENCY_CLOSED", "closed": True}
+
+    engine._emergency_close_position_without_stop_loss = emergency_close
+
+    replacement = asyncio.run(
+        engine._replace_stop_loss_order(
+            "BTC/USDT:USDT",
+            pos,
+            100.3,
+            reason="mark crossed during replacement",
+        )
+    )
+
+    assert replacement is None
+    assert ("sl-old", "BTC/USDT:USDT") in engine.exchange.cancelled
+    assert engine.exchange.created == []
+    assert emergency_calls
+    assert (
+        engine.last_protection_order_status["BTC/USDT:USDT"]["status"]
+        == "SL_REPLACE_TARGET_CROSSED_AFTER_CANCEL"
     )
 
 

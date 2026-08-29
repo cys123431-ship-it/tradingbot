@@ -310,10 +310,13 @@ class ControllerEmergencyMixin:
             })
             return result
 
-    async def notify(self, text):
+    async def notify(self, text, event_type=None):
         """?뚮┝ ?꾩넚"""
         try:
-            if self._should_suppress_telegram_notice(text):
+            if self._should_suppress_telegram_notice(
+                text,
+                event_type=event_type,
+            ):
                 first_line = str(text or '').strip().splitlines()[0][:120] if str(text or '').strip() else ''
                 logger.info(f"Telegram notice suppressed by event-only alert mode: {first_line}")
                 return
@@ -336,10 +339,13 @@ class ControllerEmergencyMixin:
         except Exception as e:
             logger.error(f"Notify error: {e}")
 
-    async def notify_plain(self, text):
+    async def notify_plain(self, text, event_type=None):
         """Send diagnostics without Telegram Markdown consuming underscores."""
         try:
-            if self._should_suppress_telegram_notice(text):
+            if self._should_suppress_telegram_notice(
+                text,
+                event_type=event_type,
+            ):
                 first_line = str(text or '').strip().splitlines()[0][:120] if str(text or '').strip() else ''
                 logger.info(f"Telegram plain notice suppressed by event-only alert mode: {first_line}")
                 return

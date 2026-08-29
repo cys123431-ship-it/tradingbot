@@ -2442,6 +2442,93 @@ class SignalProtectionMixin:
             )
             return None
 
+        # The mark can cross the requested stop after the pre-cancel check but
+        # before the replacement is submitted. Reconcile again while the old
+        # stop is gone so Binance -2021 cannot leave a live position naked.
+        post_cancel_fetch_ok, post_cancel_pos = (
+            await self._fetch_server_position_checked(symbol)
+        )
+        if not post_cancel_fetch_ok:
+            await self._notify_protection_issue(
+                symbol,
+                f"sl_replace_post_cancel_fetch_failed:{self._protection_position_signature(pos)}",
+                f"🚨 {self.ctrl.format_symbol_for_display(symbol)} SL 교체 중 "
+                "기존 SL 취소 후 포지션 재조회에 실패했습니다. 보호 공백 방지를 위해 비상청산을 시도합니다.",
+                cooldown_sec=60,
+            )
+            await self._fail_closed_unprotected_position(
+                symbol,
+                reason=(
+                    "SL replacement post-cancel position fetch failed: "
+                    f"{reason}"
+                ),
+                status_code="SL_REPLACE_POST_CANCEL_FETCH_FAILED",
+                expected_tp=False,
+                emergency_close=True,
+            )
+            return None
+        if not post_cancel_pos:
+            logger.info(
+                "SL replacement stopped for %s: position became flat after cancel (%s)",
+                symbol,
+                reason,
+            )
+            return None
+        pos = post_cancel_pos
+        post_cancel_qty = self.safe_amount(
+            symbol,
+            abs(
+                float(
+                    self._position_signed_contracts(pos)
+                    or pos.get('contracts', 0)
+                    or 0
+                )
+            ),
+        )
+        if float(post_cancel_qty) <= 0:
+            return None
+        qty = post_cancel_qty
+        post_cancel_info = (
+            pos.get('info')
+            if isinstance(pos.get('info'), dict)
+            else {}
+        )
+        post_cancel_mark = _safe_float_or_none(
+            pos.get('markPrice')
+            or pos.get('mark_price')
+            or post_cancel_info.get('markPrice')
+            or pos.get('last')
+            or pos.get('currentPrice')
+        )
+        post_cancel_crossed = bool(
+            post_cancel_mark is not None
+            and (
+                float(safe_stop) >= float(post_cancel_mark)
+                if side == 'long'
+                else float(safe_stop) <= float(post_cancel_mark)
+            )
+        )
+        if post_cancel_crossed:
+            await self._notify_protection_issue(
+                symbol,
+                f"sl_replace_crossed_after_cancel:{self._protection_position_signature(pos)}",
+                f"🚨 {self.ctrl.format_symbol_for_display(symbol)} SL 교체 중 가격이 목표선 "
+                f"{float(safe_stop):.8f}을 통과했습니다(현재 {float(post_cancel_mark):.8f}). "
+                "거부되는 SL을 반복하지 않고 즉시 비상청산합니다.",
+                cooldown_sec=60,
+            )
+            await self._fail_closed_unprotected_position(
+                symbol,
+                reason=(
+                    "SL replacement target crossed after existing stop was "
+                    f"cancelled: {reason}"
+                ),
+                status_code="SL_REPLACE_TARGET_CROSSED_AFTER_CANCEL",
+                expected_tp=False,
+                emergency_close=True,
+            )
+            return None
+
         replacement = await self._create_protection_order_with_retries(
             symbol,
             'stop_market',

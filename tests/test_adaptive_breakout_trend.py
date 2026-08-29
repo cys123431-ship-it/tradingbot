@@ -513,10 +513,13 @@ def test_live_crossover_reuses_completed_candle_and_keeps_decision_metadata(monk
             "live_enabled": True,
             "ema_crossover_minimum_momentum_strength": 0.0,
             "entry_chase_max_atr": 2.0,
-            # This test exercises cache/metadata propagation rather than
-            # the dedicated small-account crossover-extension veto.
-            "small_account_crossover_max_fast_ema_distance_atr": 4.0,
-        },
+                # This test exercises cache/metadata propagation rather than
+                # the dedicated small-account crossover-extension veto.
+                "small_account_crossover_max_fast_ema_distance_atr": 4.0,
+                "small_account_regime_ensemble": {
+                    "live_crypto_regime_filters_enabled": False,
+                },
+            },
         "daily_max_loss_usdt": 100.0,
         "max_daily_trades": 5,
     }

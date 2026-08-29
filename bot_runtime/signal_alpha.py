@@ -1541,6 +1541,8 @@ class SignalAlphaMixin:
             cost_context=futures_context,
             promotion_status=regime_promotion_status,
             config=trend_cfg.get('small_account_regime_ensemble'),
+            small_account_live=small_account_aggressive_candidate,
+            tradfi=is_tradfi,
         )
         status.update({
             'small_account_aggressive_candidate': small_account_aggressive_candidate,
@@ -1901,6 +1903,10 @@ class SignalAlphaMixin:
             'initial_margin_fraction': change_point_flow.get(
                 'initial_margin_fraction'
             ),
+            'winner_pyramid_target_fraction': change_point_flow.get(
+                'initial_margin_fraction'
+            ),
+            'winner_pyramid_budget_fraction': 0.0,
             'reason': 'small-account evidence allocation not applicable',
             'evidence': {},
         }
@@ -2263,6 +2269,30 @@ class SignalAlphaMixin:
                 'REJECTED_ADAPTIVE_TREND_RISK_PLAN',
             )
 
+        pyramid_target_fractions = list(
+            trend_cfg.get('pyramid_target_fractions', (0.80, 0.90, 1.00))
+            or (0.80, 0.90, 1.00)
+        )
+        if not pyramid_target_fractions:
+            pyramid_target_fractions = [0.80, 0.90, 1.00]
+        evidence_winner_target = _safe_float_or_none(
+            evidence_allocation.get('winner_pyramid_target_fraction')
+        )
+        if small_account_aggressive_candidate and evidence_winner_target is not None:
+            pyramid_target_fractions[0] = max(
+                float(pyramid_target_fractions[0]),
+                min(1.0, evidence_winner_target),
+            )
+        pyramid_target_fractions = [
+            min(1.0, max(initial_fraction, float(value)))
+            for value in pyramid_target_fractions
+        ]
+        for index in range(1, len(pyramid_target_fractions)):
+            pyramid_target_fractions[index] = max(
+                pyramid_target_fractions[index - 1],
+                pyramid_target_fractions[index],
+            )
+
         plan.update({
             'strategy': ADAPTIVE_BREAKOUT_TREND_STRATEGY,
             'plan_symbol': canonical,
@@ -2370,6 +2400,12 @@ class SignalAlphaMixin:
             ),
             'small_account_evidence_base_margin_fraction': (
                 evidence_allocation.get('base_initial_margin_fraction')
+            ),
+            'small_account_evidence_pyramid_target_fraction': (
+                evidence_allocation.get('winner_pyramid_target_fraction')
+            ),
+            'small_account_evidence_pyramid_budget_fraction': (
+                evidence_allocation.get('winner_pyramid_budget_fraction')
             ),
             'small_account_evidence_reason': evidence_allocation.get('reason'),
             'small_account_evidence': dict(
@@ -2599,7 +2635,7 @@ class SignalAlphaMixin:
             'tp1_breakeven_wait_for_partial': True,
             'adaptive_trend_pyramid_enabled': bool(trend_cfg.get('pyramiding_enabled', True)),
             'adaptive_trend_pyramid_trigger_r': tuple(trend_cfg.get('pyramid_trigger_r', (0.50, 1.00, 1.50))),
-            'adaptive_trend_pyramid_target_fractions': tuple(trend_cfg.get('pyramid_target_fractions', (0.80, 0.90, 1.00))),
+            'adaptive_trend_pyramid_target_fractions': tuple(pyramid_target_fractions),
             'adaptive_trend_pyramid_add_count': 0,
             'ev_time_stop_enabled': True,
             'ev_time_stop_bars': int(trend_cfg.get('time_stop_hours', 168) or 168) * 4,

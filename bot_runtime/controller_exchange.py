@@ -22,8 +22,64 @@ class ControllerExchangeMixin:
         reporting = self._telegram_reporting_cfg()
         return (not self._telegram_event_alerts_only()) and bool(reporting.get('startup_keyboard_enabled', False))
 
-    def _should_suppress_telegram_notice(self, text):
+    def _classify_telegram_event(self, text):
+        body = str(text or '').strip().lower()
+        if not body:
+            return None
+        if any(token in body for token in (
+            'reduceonly 시장가 청산 실행',
+            'soft structure stop',
+            '[signal exit]',
+            '청산 완료',
+            '청산 성공',
+        )):
+            return 'EXIT_FILLED'
+        if any(token in body for token in (
+            'runner sl 갱신',
+            '수익보호 sl',
+            'sl 교체',
+            'sl 주문',
+        )):
+            return 'SL_PROTECTION'
+        if any(token in body for token in (
+            'tp1 재생성',
+            'tp2 재생성',
+            'tp3 재생성',
+            'tp 주문',
+        )):
+            return 'TP_PROTECTION'
+        if any(token in body for token in (
+            '보호 sl이 없',
+            '보호주문 누락',
+            'unprotected',
+            'protection missing',
+        )):
+            return 'PROTECTION_MISSING'
+        if any(token in body for token in (
+            '긴급 정지',
+            '비상청산',
+            'emergency close',
+        )):
+            return 'EMERGENCY'
+        return None
+
+    def _should_suppress_telegram_notice(self, text, event_type=None):
         if not self._telegram_event_alerts_only():
+            return False
+
+        normalized_event = str(
+            event_type or self._classify_telegram_event(text) or ''
+        ).strip().upper()
+        if normalized_event in {
+            'ENTRY_FILLED',
+            'EXIT_FILLED',
+            'SL_PROTECTION',
+            'TP_PROTECTION',
+            'PROTECTION_MISSING',
+            'EMERGENCY',
+            'RISK_LIMIT',
+            'ERROR',
+        }:
             return False
 
         body = str(text or '').strip()

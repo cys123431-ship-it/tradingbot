@@ -2,7 +2,37 @@
 
 from __future__ import annotations
 
+import math
+
 from utbreakout.convex_rotation import evaluate_convex_rotation_exit
+
+
+def _mark_aware_excursion_bounds(
+    state,
+    *,
+    entry_price,
+    closed_high,
+    closed_low,
+    current_mark=None,
+):
+    """Blend completed-candle extrema with the latest polled exchange mark."""
+
+    highest = max(
+        float((state or {}).get('highest_price') or entry_price),
+        float(closed_high),
+    )
+    lowest = min(
+        float((state or {}).get('lowest_price') or entry_price),
+        float(closed_low),
+    )
+    try:
+        mark = float(current_mark)
+    except (TypeError, ValueError):
+        mark = None
+    if mark is not None and math.isfinite(mark) and mark > 0:
+        highest = max(highest, mark)
+        lowest = min(lowest, mark)
+    return highest, lowest
 
 
 class SignalExitMixin:
@@ -100,7 +130,9 @@ class SignalExitMixin:
         # sub-step remainder after exchange precision is applied. Treat that
         # remainder as the stage target being reached; otherwise every candle
         # retries an order Binance can never accept.
-        if min_amount > 0 and 0 < add_qty + 1e-12 < min_amount:
+        if add_qty <= 1e-12 or (
+            min_amount > 0 and add_qty + 1e-12 < min_amount
+        ):
             next_add_count = add_count + 1
             state.update({
                 'adaptive_trend_pyramid_add_count': next_add_count,
@@ -111,8 +143,9 @@ class SignalExitMixin:
             return {
                 'status': 'COMPLETE' if complete else 'STAGE_COMPLETE',
                 'reason': (
-                    'adaptive trend pyramid target reached within exchange '
-                    f'minimum amount: residual={add_qty:.12f} min={min_amount:.12f}'
+                    'adaptive trend pyramid target already reached or within '
+                    f'exchange minimum amount: residual={add_qty:.12f} '
+                    f'min={min_amount:.12f}'
                 ),
                 'residual_qty': add_qty,
                 'min_amount': min_amount,
@@ -826,15 +859,12 @@ class SignalExitMixin:
             or _safe_float_or_none(pos.get('lastPrice'))
             or _safe_float_or_none(position_info.get('lastPrice'))
         )
-        current_high = float(metric_closed.iloc[-1]['high'])
-        current_low = float(metric_closed.iloc[-1]['low'])
-        highest_price = max(
-            float(state.get('highest_price') or entry_price),
-            float(metric_closed['high'].max()),
-        )
-        lowest_price = min(
-            float(state.get('lowest_price') or entry_price),
-            float(metric_closed['low'].min()),
+        highest_price, lowest_price = _mark_aware_excursion_bounds(
+            state,
+            entry_price=entry_price,
+            closed_high=float(metric_closed['high'].max()),
+            closed_low=float(metric_closed['low'].min()),
+            current_mark=current_mark,
         )
         mfe_r = (
             max(float(state.get('mfe_r') or 0.0), (highest_price - entry_price) / risk_distance)
@@ -893,6 +923,7 @@ class SignalExitMixin:
             'lowest_price': float(lowest_price),
             'mfe_r': float(mfe_r),
             'mae_r': float(mae_r),
+            'excursion_source': 'closed_bar_plus_polled_mark',
         })
         self._set_utbreakout_trailing_state(symbol, state)
 

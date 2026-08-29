@@ -546,6 +546,9 @@ def resolve_trend_event_candidate(
             "source": "event_only",
             "agreement": "event_only",
             "score": event_score,
+            "event_decision": dict(event.get("decision") or {}),
+            "event_state": (event.get("decision") or {}).get("state"),
+            "event_risk_tier": (event.get("decision") or {}).get("risk_tier"),
             "reason": "independent regime/order-flow candidate",
         }
 
@@ -565,6 +568,9 @@ def resolve_trend_event_candidate(
             "agreement": "aligned",
             "score": combined_score,
             "fresh_continuation": bool(trend.get("fresh_continuation")),
+            "event_decision": dict(event.get("decision") or {}),
+            "event_state": (event.get("decision") or {}).get("state"),
+            "event_risk_tier": (event.get("decision") or {}).get("risk_tier"),
             "reason": "1h trend and independent event engine aligned",
         }
 
@@ -578,6 +584,9 @@ def resolve_trend_event_candidate(
             "source": "event_conflict_winner",
             "agreement": "conflict_resolved",
             "score": event_score,
+            "event_decision": dict(event.get("decision") or {}),
+            "event_state": (event.get("decision") or {}).get("state"),
+            "event_risk_tier": (event.get("decision") or {}).get("risk_tier"),
             "reason": f"event candidate won conflict by {score_gap:.1f} points",
         }
     if score_gap >= margin:

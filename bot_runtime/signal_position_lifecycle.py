@@ -80,6 +80,24 @@ class SignalPositionLifecycleMixin:
             canonical = aliases[0] if aliases else str(symbol or '').strip()
             state = self._get_utbreakout_trailing_state(symbol)
             if state and finalize:
+                remember_exit_decision = getattr(
+                    self,
+                    '_record_utbreakout_exit_decision_lock',
+                    None,
+                )
+                if callable(remember_exit_decision):
+                    try:
+                        remember_exit_decision(
+                            canonical,
+                            state,
+                            reason=reason,
+                        )
+                    except Exception:
+                        logger.debug(
+                            'Failed to persist closed-candle replay lock for %s',
+                            canonical,
+                            exc_info=True,
+                        )
                 try:
                     price_val = None
                     if exit_price is not None:
@@ -727,6 +745,33 @@ class SignalPositionLifecycleMixin:
             'adaptive_trend_target_risk_usdt': _safe_float_or_none(plan.get('adaptive_trend_target_risk_usdt')),
             'adaptive_trend_target_notional': _safe_float_or_none(plan.get('adaptive_trend_target_notional')),
             'adaptive_trend_initial_fraction': _safe_float_or_none(plan.get('adaptive_trend_initial_fraction')),
+            'small_account_evidence_allocation_profile': plan.get(
+                'small_account_evidence_allocation_profile'
+            ),
+            'small_account_evidence_allocation_applied': bool(
+                plan.get('small_account_evidence_allocation_applied', False)
+            ),
+            'small_account_evidence_allocation_tier': plan.get(
+                'small_account_evidence_allocation_tier'
+            ),
+            'small_account_evidence_margin_multiplier': _safe_float_or_none(
+                plan.get('small_account_evidence_margin_multiplier')
+            ),
+            'small_account_evidence_base_margin_fraction': _safe_float_or_none(
+                plan.get('small_account_evidence_base_margin_fraction')
+            ),
+            'small_account_evidence_pyramid_target_fraction': _safe_float_or_none(
+                plan.get('small_account_evidence_pyramid_target_fraction')
+            ),
+            'small_account_evidence_pyramid_budget_fraction': _safe_float_or_none(
+                plan.get('small_account_evidence_pyramid_budget_fraction')
+            ),
+            'small_account_evidence_reason': plan.get(
+                'small_account_evidence_reason'
+            ),
+            'small_account_evidence': dict(
+                plan.get('small_account_evidence') or {}
+            ),
             'adaptive_trend_initial_entry_price': (
                 _safe_float_or_none(plan.get('adaptive_trend_initial_entry_price'))
                 or _safe_float_or_none((existing_state or {}).get('adaptive_trend_initial_entry_price'))

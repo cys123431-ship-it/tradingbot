@@ -901,6 +901,35 @@ def _mark_crypto_entry_state(self, client_order_id, state, **changes):
 
 def _mark_crypto_symbol_closed(self, symbol, reason):
     _ensure_trading_safety_runtime(self)
+    remember_exit_decision = getattr(
+        self,
+        "_record_utbreakout_exit_decision_lock",
+        None,
+    )
+    if callable(remember_exit_decision):
+        trailing_state = None
+        trailing_state_getter = getattr(
+            self,
+            "_get_utbreakout_trailing_state",
+            None,
+        )
+        if callable(trailing_state_getter):
+            try:
+                trailing_state = trailing_state_getter(symbol)
+            except Exception:
+                trailing_state = None
+        try:
+            remember_exit_decision(
+                symbol,
+                trailing_state,
+                reason=reason,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to persist closed-candle replay lock for %s",
+                symbol,
+                exc_info=True,
+            )
     closed_count = 0
     active_records = list(self.trading_state_store.active_for_symbol(symbol))
     for record in active_records:

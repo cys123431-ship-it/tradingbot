@@ -262,6 +262,7 @@ def build_desktop_monitor_snapshot(controller):
             strategy_params = {}
     active_strategy = _safe_text(strategy_params.get("active_strategy") or "unknown", 80).lower()
     symbol = _get_symbol(controller, engine) if engine is not None else None
+    paused = bool(getattr(controller, "is_paused", False))
 
     active_status = {}
     if engine is not None:
@@ -315,25 +316,55 @@ def build_desktop_monitor_snapshot(controller):
                 }
             )
 
+    position_hints = _position_hints(engine) if engine is not None else []
+    strategy_rows = (
+        _strategy_rows(engine, active_strategy, strategy_params, symbol)
+        if engine is not None
+        else []
+    )
+    scanner_active_symbol = _canonical_symbol(
+        getattr(engine, "scanner_active_symbol", None)
+    ) or None
+    if paused:
+        strategy_rows = [{
+            "key": active_strategy or "unknown",
+            "name": _safe_text(active_strategy or "Strategy", 64),
+            "state": "off",
+            "side": None,
+            "reason": "봇이 일시정지되어 신규 진입을 평가하지 않습니다.",
+        }]
+        entry_diagnostic = {
+            "symbol": symbol,
+            "message": "봇이 일시정지되어 신규 진입을 평가하지 않습니다.",
+            "code": "BOT_PAUSED",
+            "raw_reason": "bot paused",
+            "stage": "PAUSED",
+            "epoch": int(time.time()),
+        }
+        scanner_active_symbol = None
+        live_hint_symbols = {
+            _canonical_symbol(item.get("symbol"))
+            for item in position_hints
+            if isinstance(item, dict) and item.get("symbol")
+        }
+        status_rows = [
+            row for row in status_rows
+            if _canonical_symbol(row.get("symbol")) in live_hint_symbols
+        ]
+
     return {
         "schema_version": 1,
         "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "epoch": int(time.time()),
         "bot": {
-            "paused": bool(getattr(controller, "is_paused", False)),
+            "paused": paused,
             "exchange_mode": mode,
             "active_strategy": active_strategy,
             "current_symbol": symbol,
-            "scanner_active_symbol": _canonical_symbol(
-                getattr(engine, "scanner_active_symbol", None)
-            ) or None,
+            "scanner_active_symbol": scanner_active_symbol,
         },
-        "strategies": (
-            _strategy_rows(engine, active_strategy, strategy_params, symbol)
-            if engine is not None
-            else []
-        ),
-        "position_hints": _position_hints(engine) if engine is not None else [],
+        "strategies": strategy_rows,
+        "position_hints": position_hints,
         "entry_diagnostic": entry_diagnostic,
         "status_rows": status_rows,
     }

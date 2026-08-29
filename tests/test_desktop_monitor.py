@@ -298,6 +298,45 @@ def test_live_status_symbol_wins_over_stale_internal_candidate():
     assert snapshot["bot"]["current_symbol"] == "KORU/USDT"
 
 
+def test_paused_monitor_does_not_present_stale_scanner_position_as_live():
+    engine = SimpleNamespace(
+        scanner_active_symbol="MRVL/USDT:USDT",
+        current_utbreakout_candidate_symbol="MRVL/USDT:USDT",
+        adaptive_breakout_trend_last_status={
+            "MRVL/USDT:USDT": {
+                "strategy": "ADAPTIVE_BREAKOUT_TREND",
+                "accepted_side": "SHORT",
+                "accepted_code": "ACCEPTED_ENTRY",
+            }
+        },
+        utbreakout_trailing_states={},
+    )
+    controller = SimpleNamespace(
+        engines={"signal": engine},
+        status_data={
+            "MRVL/USDT:USDT": {
+                "symbol": "MRVL/USDT:USDT",
+                "pos_side": "SHORT",
+                "entry_reason": "Position open (SHORT), entry scan skipped",
+            }
+        },
+        is_paused=True,
+        get_active_strategy_params=lambda: {
+            "active_strategy": "adaptive_breakout_trend_v1"
+        },
+        get_exchange_mode=lambda: "binance_mainnet",
+        _get_current_symbol=lambda: "MRVL/USDT:USDT",
+    )
+
+    snapshot = build_desktop_monitor_snapshot(controller)
+
+    assert snapshot["bot"]["paused"] is True
+    assert snapshot["bot"]["scanner_active_symbol"] is None
+    assert snapshot["strategies"][0]["state"] == "off"
+    assert snapshot["entry_diagnostic"]["code"] == "BOT_PAUSED"
+    assert snapshot["status_rows"] == []
+
+
 def test_monitor_exposes_latest_entry_block_in_korean():
     event = {
         "ts": 100.0,

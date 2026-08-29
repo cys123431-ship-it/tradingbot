@@ -559,6 +559,52 @@ def test_reconciled_close_time_excludes_later_same_symbol_trade_cycle():
     assert len(result["exit_legs"]) == 1
 
 
+def test_binance_spawned_algo_stop_fill_is_classified_by_client_order_id():
+    class _Exchange:
+        def fetch_my_trades(self, *_args, **_kwargs):
+            return [{
+                "timestamp": 1_767_229_195_000,
+                "side": "sell",
+                "amount": 1.0,
+                "price": 95.0,
+                "realizedPnl": -5.0,
+                "order": "regular-order-created-by-algo",
+                "info": {"positionSide": "LONG"},
+            }]
+
+        def fetch_order(self, order_id, symbol):
+            assert order_id == "regular-order-created-by-algo"
+            assert symbol == "BTC/USDT:USDT"
+            return {
+                "id": order_id,
+                "clientOrderId": "utbslslBTCUSDTabc123",
+                "reduceOnly": True,
+            }
+
+    engine = SimpleNamespace(exchange=_Exchange())
+    engine._utbreakout_entry_record_for_symbol = lambda *_args, **_kwargs: SimpleNamespace(
+        metadata={},
+        take_profit_order_ids=[],
+        stop_order_id="4000000000000001",
+    )
+    open_trade = {
+        "side": "long",
+        "entry_price": 100.0,
+        "quantity": 1.0,
+        "entry_time": "2026-01-01T00:00:00+00:00",
+    }
+
+    result = asyncio.run(resolve_closed_trade_accounting(
+        engine,
+        "BTC/USDT:USDT",
+        open_trade,
+    ))
+
+    assert result["pnl"] == -5.0
+    assert result["exit_legs"][0]["label"] == "SL"
+    assert result["exit_legs"][0]["client_order_id"].startswith("utbslsl")
+
+
 def test_incomplete_snapshot_never_closes_local_trade_accounting():
     class _Engine(SignalRuntimeMixin):
         db = object()

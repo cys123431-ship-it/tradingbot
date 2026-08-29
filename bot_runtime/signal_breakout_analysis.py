@@ -4173,6 +4173,30 @@ class SignalBreakoutAnalysisMixin:
             dict,
         ):
             self.utbreakout_consumed_decision_ts = {}
+        if not bool(
+            getattr(self, '_utbreakout_exit_decision_locks_loaded', False)
+        ):
+            stored_locks = {}
+            store = getattr(self, 'trading_state_store', None)
+            if store is not None:
+                try:
+                    value = store.get_runtime_state(
+                        'utbreakout_exit_decision_locks'
+                    )
+                    if isinstance(value, dict):
+                        stored_locks = value
+                except Exception:
+                    stored_locks = {}
+            current_locks = getattr(
+                self,
+                'utbreakout_exit_decision_locks',
+                None,
+            )
+            merged_locks = dict(stored_locks)
+            if isinstance(current_locks, dict):
+                merged_locks.update(current_locks)
+            self.utbreakout_exit_decision_locks = merged_locks
+            self._utbreakout_exit_decision_locks_loaded = True
 
     def _utbreakout_decision_timestamp(self, *sources):
         return resolve_signal_decision_timestamp(*sources)
@@ -4190,6 +4214,81 @@ class SignalBreakoutAnalysisMixin:
         self.utbreakout_consumed_decision_ts[key] = normalized
         return normalized
 
+    def _persist_utbreakout_exit_decision_locks(self):
+        store = getattr(self, 'trading_state_store', None)
+        if store is None:
+            return
+        try:
+            store.set_runtime_state(
+                'utbreakout_exit_decision_locks',
+                dict(getattr(self, 'utbreakout_exit_decision_locks', {}) or {}),
+            )
+        except Exception:
+            logger.debug(
+                'Failed to persist UTBreakout exit decision locks',
+                exc_info=True,
+            )
+
+    def _record_utbreakout_exit_decision_lock(
+        self,
+        symbol,
+        state=None,
+        *,
+        reason='position closed',
+    ):
+        """Prevent a closed signal from being replayed on the same candle."""
+
+        self._ensure_utbreakout_auto_entry_bridge_state()
+        state = state if isinstance(state, dict) else {}
+        timestamps = []
+        for source in (state,):
+            parsed = self._utbreakout_decision_timestamp(source)
+            if parsed is not None:
+                timestamps.append(int(parsed))
+        last_processed = getattr(self, 'last_processed_candle_ts', None)
+        if isinstance(last_processed, dict):
+            aliases_getter = getattr(
+                self,
+                '_utbreakout_trailing_state_aliases',
+                None,
+            )
+            aliases = aliases_getter(symbol) if callable(aliases_getter) else (symbol,)
+            for alias in aliases:
+                parsed = _timestamp_ms_or_none(last_processed.get(alias))
+                if parsed is not None:
+                    timestamps.append(int(parsed))
+        entry_record = None
+        try:
+            entry_record = self._utbreakout_entry_record_for_symbol(
+                symbol,
+                include_historic=True,
+            )
+        except Exception:
+            entry_record = None
+        parsed_record_ts = _timestamp_ms_or_none(
+            getattr(entry_record, 'signal_timestamp', None)
+        )
+        if parsed_record_ts is not None:
+            timestamps.append(int(parsed_record_ts))
+        if not timestamps:
+            return None
+        decision_ts = max(timestamps)
+        key = self._utbreakout_trace_key(symbol)
+        existing = dict(
+            self.utbreakout_exit_decision_locks.get(key) or {}
+        )
+        previous_ts = _timestamp_ms_or_none(existing.get('decision_ts')) or 0
+        if decision_ts < int(previous_ts):
+            decision_ts = int(previous_ts)
+        self.utbreakout_exit_decision_locks[key] = {
+            'decision_ts': int(decision_ts),
+            'side': str(state.get('side') or '').lower() or None,
+            'reason': str(reason or 'position closed')[:240],
+        }
+        self._record_utbreakout_consumed_decision(symbol, decision_ts)
+        self._persist_utbreakout_exit_decision_locks()
+        return int(decision_ts)
+
     def _utbreakout_decision_already_consumed(self, symbol, decision_ts):
         parsed = _timestamp_ms_or_none(decision_ts)
         if parsed is None:
@@ -4197,6 +4296,15 @@ class SignalBreakoutAnalysisMixin:
         target = int(parsed)
         self._ensure_utbreakout_auto_entry_bridge_state()
         key = self._utbreakout_trace_key(symbol)
+        exit_lock = dict(
+            self.utbreakout_exit_decision_locks.get(key) or {}
+        )
+        exit_lock_ts = _timestamp_ms_or_none(exit_lock.get('decision_ts'))
+        if exit_lock_ts is not None:
+            if target <= int(exit_lock_ts):
+                return True
+            self.utbreakout_exit_decision_locks.pop(key, None)
+            self._persist_utbreakout_exit_decision_locks()
         remembered = _timestamp_ms_or_none(
             self.utbreakout_consumed_decision_ts.get(key)
         )

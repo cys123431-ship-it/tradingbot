@@ -171,6 +171,8 @@ _DURABLE_ENTRY_PLAN_KEYS = (
     'small_account_evidence_allocation_tier',
     'small_account_evidence_margin_multiplier',
     'small_account_evidence_base_margin_fraction',
+    'small_account_evidence_pyramid_target_fraction',
+    'small_account_evidence_pyramid_budget_fraction',
     'small_account_evidence_reason',
     'small_account_evidence',
     'reversal_mean_target_price',

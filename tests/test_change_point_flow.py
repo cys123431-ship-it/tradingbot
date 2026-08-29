@@ -255,7 +255,15 @@ def test_candidate_resolver_keeps_trend_and_event_as_or_paths():
     )
     event_only = resolve_trend_event_candidate(
         {"allowed": False},
-        {"allowed": True, "side": "short", "score": 78.0},
+        {
+            "allowed": True,
+            "side": "short",
+            "score": 78.0,
+            "decision": {
+                "state": "new_regime",
+                "risk_tier": "strong",
+            },
+        },
     )
     aligned = resolve_trend_event_candidate(
         {
@@ -269,6 +277,8 @@ def test_candidate_resolver_keeps_trend_and_event_as_or_paths():
 
     assert trend_only["source"] == "trend_only"
     assert event_only["source"] == "event_only"
+    assert event_only["event_state"] == "new_regime"
+    assert event_only["event_risk_tier"] == "strong"
     assert aligned["source"] == "aligned"
     assert aligned["score"] > max(72.0, 80.0)
     assert trend_only["fresh_continuation"] is True

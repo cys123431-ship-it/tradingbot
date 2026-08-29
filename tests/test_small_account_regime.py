@@ -249,6 +249,31 @@ def _router_context(*, persistent=True):
         "persistence_score": 0.88 if persistent else 0.10,
         "transition": "persistent_up" if persistent else "transition_or_mixed",
         "mature": False,
+        "snapshots": {
+            "1h": {
+                "available": True,
+                "direction": "long",
+            },
+        },
+    }
+
+
+def _short_router_context():
+    return {
+        "available": True,
+        "ambiguous": False,
+        "weighted_direction_score": -0.45,
+        "direction": "short",
+        "multi_speed_agreement": 0.90,
+        "persistence_score": 0.84,
+        "transition": "persistent_down",
+        "mature": False,
+        "snapshots": {
+            "1h": {
+                "available": True,
+                "direction": "short",
+            },
+        },
     }
 
 
@@ -283,6 +308,106 @@ def test_regime_router_rewards_persistent_multi_speed_trend_without_an_and_gate(
     assert persistent["regime_profile"] == SMALL_ACCOUNT_REGIME_PROFILE_VERSION
 
 
+def test_live_crypto_router_blocks_transition_but_keeps_persistent_long():
+    persistent = resolve_regime_ensemble_candidate(
+        _primary_long_candidate(),
+        {"allowed": False},
+        multi_timeframe_context=_router_context(persistent=True),
+        small_account_live=True,
+    )
+    transitional = resolve_regime_ensemble_candidate(
+        _primary_long_candidate(),
+        {"allowed": False},
+        multi_timeframe_context=_router_context(persistent=False),
+        small_account_live=True,
+    )
+
+    assert persistent["allowed"] is True
+    assert transitional["allowed"] is False
+    assert transitional["code"] == "REGIME_ROUTER_LIVE_TREND_NOT_PERSISTENT"
+
+
+def test_live_crypto_short_requires_fresh_completed_1h_aligned_sell_flow():
+    primary = {
+        "allowed": True,
+        "side": "short",
+        "score": 80.0,
+        "source": "trend_only",
+        "fresh_continuation": True,
+    }
+    missing_flow = resolve_regime_ensemble_candidate(
+        primary,
+        {"allowed": False},
+        multi_timeframe_context=_short_router_context(),
+        cost_context={
+            "orderflow_age_seconds": 20.0,
+            "rolling_orderbook_imbalance_pct": 5.0,
+            "taker_buy_sell_ratio": 1.05,
+        },
+        small_account_live=True,
+    )
+    confirmed = resolve_regime_ensemble_candidate(
+        primary,
+        {"allowed": False},
+        multi_timeframe_context=_short_router_context(),
+        cost_context={
+            "orderflow_age_seconds": 20.0,
+            "rolling_orderbook_imbalance_pct": -5.0,
+            "taker_buy_sell_ratio": 0.95,
+        },
+        small_account_live=True,
+    )
+
+    assert missing_flow["allowed"] is False
+    assert missing_flow["code"] == "REGIME_ROUTER_LIVE_SHORT_SELL_FLOW_MISSING"
+    assert confirmed["allowed"] is True
+
+
+def test_live_crypto_event_requires_strong_new_regime_fresh_flow_and_1h():
+    def candidate(*, tier, state, age=20.0, sources=2):
+        return {
+            "allowed": True,
+            "side": "long",
+            "score": 86.0,
+            "source": "event_only",
+            "event_decision": {
+                "risk_tier": tier,
+                "state": state,
+                "orderflow_age_seconds": age,
+                "flow_source_count": sources,
+            },
+        }
+
+    base = resolve_regime_ensemble_candidate(
+        candidate(tier="base", state="price_regime"),
+        {"allowed": False},
+        multi_timeframe_context=_router_context(),
+        small_account_live=True,
+    )
+    strong = resolve_regime_ensemble_candidate(
+        candidate(tier="strong", state="new_regime"),
+        {"allowed": False},
+        multi_timeframe_context=_router_context(),
+        small_account_live=True,
+    )
+
+    assert base["allowed"] is False
+    assert base["code"] == "REGIME_ROUTER_LIVE_EVENT_TIER_LOW"
+    assert strong["allowed"] is True
+
+
+def test_live_crypto_filters_do_not_change_tradfi_router():
+    result = resolve_regime_ensemble_candidate(
+        _primary_long_candidate(),
+        {"allowed": False},
+        multi_timeframe_context=_router_context(persistent=False),
+        small_account_live=True,
+        tradfi=True,
+    )
+
+    assert result["allowed"] is True
+
+
 def test_regime_router_uses_only_fresh_orderflow_and_direction_aware_basis():
     supportive = resolve_regime_ensemble_candidate(
         _primary_long_candidate(),
@@ -290,7 +415,7 @@ def test_regime_router_uses_only_fresh_orderflow_and_direction_aware_basis():
         multi_timeframe_context=_router_context(),
         cost_context={
             "basis_pct": -0.30,
-            "orderflow_age_seconds": 30.0,
+            "orderflow_snapshot_age_seconds": 30.0,
             "rolling_orderbook_imbalance_pct": 12.0,
             "taker_buy_sell_ratio": 1.12,
         },
@@ -301,7 +426,7 @@ def test_regime_router_uses_only_fresh_orderflow_and_direction_aware_basis():
         multi_timeframe_context=_router_context(),
         cost_context={
             "basis_pct": 0.30,
-            "orderflow_age_seconds": 180.0,
+            "orderflow_snapshot_age_seconds": 180.0,
             "rolling_orderbook_imbalance_pct": 12.0,
             "taker_buy_sell_ratio": 1.12,
         },
@@ -317,6 +442,8 @@ def test_regime_router_uses_only_fresh_orderflow_and_direction_aware_basis():
         ]
         == 0.0
     )
+    assert supportive["selected_net_edge"]["orderflow_age_seconds"] == 30.0
+    assert stale_adverse["selected_net_edge"]["orderflow_age_seconds"] == 180.0
 
 
 def _momentum_allocation_candidate(*, side="long", source="trend_only"):
@@ -357,7 +484,9 @@ def test_evidence_allocation_expands_only_corroborated_persistent_crypto_long():
     assert allocation["applied"] is True
     assert allocation["evidence_tier"] == "elite"
     assert allocation["margin_multiplier"] == 1.25
-    assert allocation["initial_margin_fraction"] == 0.8125
+    assert allocation["initial_margin_fraction"] == 0.65
+    assert allocation["winner_pyramid_target_fraction"] == 0.8125
+    assert allocation["winner_pyramid_budget_fraction"] == 0.1625
 
     summary = build_durable_entry_plan_summary({
         "small_account_evidence_allocation_profile": allocation["profile"],
@@ -367,12 +496,20 @@ def test_evidence_allocation_expands_only_corroborated_persistent_crypto_long():
         "small_account_evidence_base_margin_fraction": allocation[
             "base_initial_margin_fraction"
         ],
+        "small_account_evidence_pyramid_target_fraction": allocation[
+            "winner_pyramid_target_fraction"
+        ],
+        "small_account_evidence_pyramid_budget_fraction": allocation[
+            "winner_pyramid_budget_fraction"
+        ],
         "small_account_evidence_reason": allocation["reason"],
         "small_account_evidence": allocation["evidence"],
     })
     assert summary["small_account_evidence_allocation_applied"] is True
     assert summary["small_account_evidence_allocation_tier"] == "elite"
     assert summary["small_account_evidence_margin_multiplier"] == 1.25
+    assert summary["small_account_evidence_pyramid_target_fraction"] == 0.8125
+    assert summary["small_account_evidence_pyramid_budget_fraction"] == 0.1625
 
 
 def test_evidence_allocation_never_reduces_short_event_tradfi_or_stale_flow():

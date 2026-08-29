@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import bot_runtime.signal_exit as signal_exit_module
-from bot_runtime.signal_exit import SignalExitMixin
+from bot_runtime.signal_exit import SignalExitMixin, _mark_aware_excursion_bounds
 from utbreakout.adaptive_breakout_trend import ADAPTIVE_BREAKOUT_TREND_STRATEGY
 
 
@@ -336,6 +336,76 @@ def test_adaptive_trend_marks_subminimum_target_remainder_complete(monkeypatch):
     assert result["residual_qty"] == pytest.approx(0.005)
     assert state["adaptive_trend_pyramid_add_count"] == 1
     assert safe_amount_calls == []
+
+
+def test_adaptive_trend_skips_target_already_exceeded_by_evidence_entry(monkeypatch):
+    engine = SignalExitMixin()
+    state = {
+        "strategy": ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+        "side": "long",
+        "entry_price": 100.0,
+        "risk_distance": 2.0,
+        "adaptive_trend_pyramid_enabled": True,
+        "adaptive_trend_pyramid_trigger_r": (0.50, 1.00, 1.50),
+        "adaptive_trend_pyramid_target_fractions": (0.80, 0.90, 1.00),
+        "adaptive_trend_pyramid_add_count": 0,
+        "adaptive_trend_target_qty": 10.0,
+        "adaptive_trend_initial_fraction": 0.8125,
+    }
+    engine.is_upbit_mode = lambda: False
+    engine._get_utbreakout_trailing_state = lambda symbol: state
+    engine._position_signed_contracts = lambda pos: pos.get("contracts", 0.0)
+    engine._set_utbreakout_trailing_state = lambda symbol, value: None
+    monkeypatch.setattr(signal_exit_module, "datetime", datetime, raising=False)
+    monkeypatch.setattr(signal_exit_module, "timezone", timezone, raising=False)
+    monkeypatch.setattr(
+        signal_exit_module,
+        "ADAPTIVE_BREAKOUT_TREND_STRATEGY",
+        ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        signal_exit_module,
+        "_safe_float_or_none",
+        lambda value: float(value) if value not in (None, "") else None,
+        raising=False,
+    )
+
+    bound_method = engine._maybe_apply_adaptive_trend_pyramiding
+    pyramid_method = getattr(bound_method, "__runtime_original__", None)
+    call_args = (engine,) if pyramid_method is not None else ()
+    pyramid_method = pyramid_method or bound_method
+    result = asyncio.run(
+        pyramid_method(
+            *call_args,
+            "TEST/USDT:USDT",
+            {
+                "side": "long",
+                "contracts": 8.125,
+                "entryPrice": 100.0,
+                "markPrice": 101.0,
+            },
+            None,
+            {},
+        )
+    )
+
+    assert result["status"] == "STAGE_COMPLETE"
+    assert state["adaptive_trend_pyramid_add_count"] == 1
+    assert "already reached" in result["reason"]
+
+
+def test_excursion_bounds_include_live_mark_between_completed_candles():
+    highest, lowest = _mark_aware_excursion_bounds(
+        {"highest_price": 103.0, "lowest_price": 98.0},
+        entry_price=100.0,
+        closed_high=104.0,
+        closed_low=99.0,
+        current_mark=106.5,
+    )
+
+    assert highest == 106.5
+    assert lowest == 98.0
 
 
 def test_small_account_adaptive_trend_add_ignores_daily_pnl_but_keeps_trade_cap(monkeypatch):
