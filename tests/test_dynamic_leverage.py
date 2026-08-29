@@ -502,9 +502,9 @@ def test_adaptive_trend_small_account_preserves_four_x_floor_across_two_phase_si
 @pytest.mark.parametrize(
     ("risk_tier", "score", "stop_pct", "expected_leverage", "loss_cap"),
     (
-        ("base", 70.0, 6.0, 4, 20.0),
-        ("strong", 82.0, 3.5, 6, 30.0),
-        ("elite", 96.0, 3.5, 7, 35.0),
+        ("base", 70.0, 6.0, 4, 8.0),
+        ("strong", 82.0, 3.5, 6, 12.0),
+        ("elite", 96.0, 3.5, 7, 16.0),
     ),
 )
 def test_adaptive_trend_small_account_selects_highest_allowed_tier_leverage(
@@ -530,13 +530,28 @@ def test_adaptive_trend_small_account_selects_highest_allowed_tier_leverage(
         account_equity=100.0,
     )
 
+    full_loss_rate = (stop_pct + 0.20) / 100.0
+    expected_full_notional = min(
+        100.0 * 0.95 * expected_leverage,
+        loss_cap / full_loss_rate,
+    )
+    expected_initial_notional = expected_full_notional * 0.65
     assert updated["leverage"] == expected_leverage
-    assert updated["planned_margin"] == pytest.approx(61.75)
+    assert updated["planned_notional"] == pytest.approx(expected_initial_notional)
+    assert updated["planned_margin"] == pytest.approx(
+        expected_initial_notional / expected_leverage
+    )
+    assert updated["adaptive_trend_target_notional"] == pytest.approx(
+        expected_full_notional
+    )
     assert updated["small_account_aggressive_max_loss_percent"] == pytest.approx(loss_cap)
-    assert updated["small_account_aggressive_projected_loss_usdt"] <= loss_cap
+    assert updated["small_account_aggressive_full_target_loss_usdt"] <= loss_cap + 1e-9
+    assert updated["small_account_aggressive_full_target_loss_percent"] <= loss_cap + 1e-9
+    assert updated["small_account_aggressive_projected_loss_usdt"] <= loss_cap * 0.65 + 1e-9
+    assert updated["small_account_stop_distance_risk_sizing_applied"] is True
 
 
-def test_adaptive_trend_small_account_blocks_when_even_four_x_exceeds_loss_cap():
+def test_adaptive_trend_small_account_wide_stop_shrinks_quantity_instead_of_blocking():
     updated = apply_dynamic_leverage_to_plan(
         _plan(
             strategy="adaptive_breakout_trend_v1",
@@ -553,11 +568,63 @@ def test_adaptive_trend_small_account_blocks_when_even_four_x_exceeds_loss_cap()
     )
 
     assert updated["small_account_aggressive_active"] is True
+    assert updated["small_account_aggressive_blocked"] is False
+    assert updated["leverage"] == 4
+    assert updated["planned_margin"] < 61.75
+    assert updated["qty"] > 0.0
+    assert updated["small_account_aggressive_full_target_loss_percent"] <= 8.0 + 1e-9
+    assert updated["small_account_stop_distance_risk_sizing_applied"] is True
+
+
+def test_adaptive_trend_small_account_blocks_only_when_stop_breaks_liquidation_buffer():
+    updated = apply_dynamic_leverage_to_plan(
+        _plan(
+            strategy="adaptive_breakout_trend_v1",
+            adaptive_breakout_trend_score=70.0,
+            adaptive_trend_risk_tier="base",
+            adaptive_breakout_trend_metrics={"risk_tier": "base"},
+            risk_distance=20.0,
+            risk_distance_pct=20.0,
+            planned_notional=100.0,
+            qty=1.0,
+        ),
+        free_balance=100.0,
+        account_equity=100.0,
+    )
+
+    assert updated["small_account_aggressive_active"] is True
     assert updated["small_account_aggressive_blocked"] is True
     assert updated["small_account_aggressive_block_code"] == (
         "ENTRY_BLOCKED_SMALL_ACCOUNT_AGGRESSIVE_RISK"
     )
     assert updated["qty"] == pytest.approx(0.0)
+
+
+def test_adaptive_trend_small_account_notional_is_inverse_to_stop_distance():
+    def size_for_stop(stop_pct):
+        return apply_dynamic_leverage_to_plan(
+            _plan(
+                strategy="adaptive_breakout_trend_v1",
+                adaptive_breakout_trend_score=70.0,
+                adaptive_trend_risk_tier="base",
+                adaptive_breakout_trend_metrics={"risk_tier": "base"},
+                risk_distance=stop_pct,
+                risk_distance_pct=stop_pct,
+                planned_notional=100.0,
+                qty=1.0,
+            ),
+            free_balance=100.0,
+            account_equity=100.0,
+        )
+
+    tight = size_for_stop(2.0)
+    wide = size_for_stop(6.0)
+
+    assert tight["small_account_stop_distance_risk_sizing_applied"] is True
+    assert wide["small_account_stop_distance_risk_sizing_applied"] is True
+    assert wide["adaptive_trend_target_notional"] < tight["adaptive_trend_target_notional"]
+    assert tight["adaptive_trend_target_notional"] * 0.022 == pytest.approx(8.0)
+    assert wide["adaptive_trend_target_notional"] * 0.062 == pytest.approx(8.0)
 
 
 def test_adaptive_trend_small_account_ignores_daily_loss_for_new_risk():

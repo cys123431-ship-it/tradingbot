@@ -27,7 +27,7 @@ from .small_account_regime import (
 
 
 ADAPTIVE_BREAKOUT_TREND_STRATEGY = "adaptive_breakout_trend_v1"
-ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v13_validated_regime_router"
+ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v14_stop_distance_sizing"
 
 
 def default_adaptive_breakout_trend_config() -> dict[str, Any]:
@@ -116,15 +116,17 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         "pyramid_target_fractions": (0.80, 0.90, 1.00),
         # A separate sizing profile is selected only for a new standalone
         # trend entry when futures equity is strictly below $1,000.  The
-        # normal 1.75/3/5% stop-budget model is replaced, not multiplied, so
-        # the small-account allocation cannot be shrunk twice.
+        # normal 1.75/3/5% stop-budget model is replaced, not multiplied.
+        # These campaign caps remain aggressive, while quantity now shrinks
+        # as the selected ATR/structure stop gets wider.  At the cap, the
+        # first 65% stage exposes about 5.2/7.8/10.4%, respectively.
         "small_account_aggressive_enabled": True,
         "small_account_equity_threshold_usdt": 1_000.0,
         "small_account_margin_budget_fraction": 0.95,
         "small_account_initial_margin_fraction": 0.65,
-        "small_account_base_max_loss_percent": 20.0,
-        "small_account_strong_max_loss_percent": 30.0,
-        "small_account_elite_max_loss_percent": 35.0,
+        "small_account_base_max_loss_percent": 8.0,
+        "small_account_strong_max_loss_percent": 12.0,
+        "small_account_elite_max_loss_percent": 16.0,
         "small_account_daily_loss_limit_percent": 0.0,
         "small_account_cost_buffer_percent": 0.20,
         "small_account_liquidation_stop_buffer_multiple": 1.50,
@@ -249,6 +251,8 @@ def normalize_adaptive_breakout_trend_config(
                 "adaptive_trend_portfolio_v9_",
                 "adaptive_trend_portfolio_v10_",
                 "adaptive_trend_portfolio_v11_",
+                "adaptive_trend_portfolio_v12_",
+                "adaptive_trend_portfolio_v13_",
             )
         )
     ):
@@ -365,6 +369,7 @@ def normalize_adaptive_breakout_trend_config(
             "adaptive_trend_portfolio_v9_",
             "adaptive_trend_portfolio_v10_",
             "adaptive_trend_portfolio_v11_",
+            "adaptive_trend_portfolio_v12_",
         )
     ):
         # Preserve the operator's other live risk/exit choices, but migrate
@@ -385,6 +390,17 @@ def normalize_adaptive_breakout_trend_config(
             "small_account_roe_profit_lock_max_gap_percent",
             "small_account_roe_profit_lock_min_floor_percent",
             "small_account_event_only_broad_conflict_min_momentum",
+        ):
+            normalized[key] = defaults[key]
+    if supplied_profile.startswith("adaptive_trend_portfolio_v13_"):
+        # v13 combined an ATR-wide hard stop with an almost fixed full-margin
+        # quantity and 20/30/35% loss ceilings.  Migrate only the sizing caps;
+        # operator-selected exits, including the deliberate ROE staircase,
+        # remain unchanged.
+        for key in (
+            "small_account_base_max_loss_percent",
+            "small_account_strong_max_loss_percent",
+            "small_account_elite_max_loss_percent",
         ):
             normalized[key] = defaults[key]
     # Preserve all other operator-tuned risk/exit values while defaults above

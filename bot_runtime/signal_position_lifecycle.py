@@ -826,6 +826,9 @@ class SignalPositionLifecycleMixin:
             'small_account_aggressive_daily_loss_limit_usdt': _safe_float_or_none(plan.get('small_account_aggressive_daily_loss_limit_usdt')),
             'small_account_aggressive_projected_loss_usdt': _safe_float_or_none(plan.get('small_account_aggressive_projected_loss_usdt')),
             'small_account_aggressive_projected_loss_percent': _safe_float_or_none(plan.get('small_account_aggressive_projected_loss_percent')),
+            'small_account_aggressive_full_target_loss_usdt': _safe_float_or_none(plan.get('small_account_aggressive_full_target_loss_usdt')),
+            'small_account_aggressive_full_target_loss_percent': _safe_float_or_none(plan.get('small_account_aggressive_full_target_loss_percent')),
+            'small_account_stop_distance_risk_sizing_applied': bool(plan.get('small_account_stop_distance_risk_sizing_applied', False)),
             'small_account_aggressive_cost_buffer_percent': _safe_float_or_none(plan.get('small_account_aggressive_cost_buffer_percent')),
             'small_account_aggressive_risk_tier': plan.get('small_account_aggressive_risk_tier'),
             'tradfi_small_account_roe_profit_lock_applied': bool(

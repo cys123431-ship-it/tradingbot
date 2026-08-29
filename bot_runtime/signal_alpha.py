@@ -2427,13 +2427,13 @@ class SignalAlphaMixin:
                 or 0.65
             ),
             'small_account_base_max_loss_percent': float(
-                trend_cfg.get('small_account_base_max_loss_percent', 20.0) or 20.0
+                trend_cfg.get('small_account_base_max_loss_percent', 8.0) or 8.0
             ),
             'small_account_strong_max_loss_percent': float(
-                trend_cfg.get('small_account_strong_max_loss_percent', 30.0) or 30.0
+                trend_cfg.get('small_account_strong_max_loss_percent', 12.0) or 12.0
             ),
             'small_account_elite_max_loss_percent': float(
-                trend_cfg.get('small_account_elite_max_loss_percent', 35.0) or 35.0
+                trend_cfg.get('small_account_elite_max_loss_percent', 16.0) or 16.0
             ),
             'small_account_daily_loss_limit_percent': 0.0,
             'small_account_cost_buffer_percent': float(
@@ -2778,7 +2778,7 @@ class SignalAlphaMixin:
             max_loss_percent = float(
                 trend_cfg.get(
                     f'small_account_{risk_tier}_max_loss_percent',
-                    {'base': 20.0, 'strong': 30.0, 'elite': 35.0}.get(risk_tier, 20.0),
+                    {'base': 8.0, 'strong': 12.0, 'elite': 16.0}.get(risk_tier, 8.0),
                 )
                 or 0.0
             )

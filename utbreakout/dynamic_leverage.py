@@ -393,7 +393,7 @@ def resolve_adaptive_trend_small_account_profile(
     )
     capital_basis = min(equity, free)
     margin_budget = capital_basis * margin_budget_fraction
-    initial_margin = margin_budget * initial_margin_fraction
+    initial_margin_capacity = margin_budget * initial_margin_fraction
     risk_tier = str(
         source.get("adaptive_trend_risk_tier")
         or (source.get("adaptive_breakout_trend_metrics") or {}).get("risk_tier")
@@ -405,7 +405,7 @@ def resolve_adaptive_trend_small_account_profile(
         source.get(f"small_account_{risk_tier}_max_loss_percent"),
         0.0,
         50.0,
-        {"base": 20.0, "strong": 30.0, "elite": 35.0}[risk_tier],
+        {"base": 8.0, "strong": 12.0, "elite": 16.0}[risk_tier],
     )
     # Retain the legacy config field for backward-compatible config loading,
     # but it is deliberately disabled for this dedicated profile.
@@ -516,17 +516,39 @@ def resolve_adaptive_trend_small_account_profile(
     selected = None
     selected_payload: dict[str, float] = {}
     for candidate in candidates:
-        initial_notional = initial_margin * float(candidate)
+        full_margin_notional = margin_budget * float(candidate)
+        loss_rate = (float(stop_percent) + cost_buffer_percent) / 100.0
+        if loss_rate <= 0.0:
+            continue
+        # Stop distance controls quantity.  A wider ATR/structure stop keeps
+        # its market-valid price but receives proportionally fewer contracts;
+        # a tighter stop may use more of the 95% campaign margin budget.
+        risk_capped_notional = max_loss_usdt / loss_rate
+        full_target_notional = min(full_margin_notional, risk_capped_notional)
+        initial_notional = full_target_notional * initial_margin_fraction
+        initial_margin = initial_notional / float(candidate)
         price_risk_usdt = initial_notional * float(stop_percent) / 100.0
         estimated_cost_usdt = initial_notional * cost_buffer_percent / 100.0
         projected_loss_usdt = price_risk_usdt + estimated_cost_usdt
-        if projected_loss_usdt <= max_loss_usdt + 1e-9:
+        full_target_projected_loss_usdt = full_target_notional * loss_rate
+        if (
+            full_target_notional > 0.0
+            and full_target_projected_loss_usdt <= max_loss_usdt + 1e-9
+        ):
             selected = candidate
             selected_payload = {
+                "initial_margin": initial_margin,
                 "initial_notional": initial_notional,
                 "price_risk_usdt": price_risk_usdt,
                 "estimated_cost_usdt": estimated_cost_usdt,
                 "projected_loss_usdt": projected_loss_usdt,
+                "full_margin_notional": full_margin_notional,
+                "risk_capped_notional": risk_capped_notional,
+                "full_target_notional": full_target_notional,
+                "full_target_margin": full_target_notional / float(candidate),
+                "full_target_projected_loss_usdt": (
+                    full_target_projected_loss_usdt
+                ),
             }
             break
 
@@ -536,7 +558,7 @@ def resolve_adaptive_trend_small_account_profile(
         "initial_margin_fraction": initial_margin_fraction,
         "capital_basis_usdt": capital_basis,
         "margin_budget_usdt": margin_budget,
-        "initial_margin_usdt": initial_margin,
+        "initial_margin_capacity_usdt": initial_margin_capacity,
         "minimum_leverage": minimum_leverage,
         "desired_leverage": desired_by_tier[risk_tier],
         "liquidation_leverage_cap": liquidation_leverage_cap,
@@ -552,7 +574,7 @@ def resolve_adaptive_trend_small_account_profile(
     })
     if selected is None:
         reason = (
-            f"no leverage >= {minimum_leverage}x fits loss limits: "
+            f"no leverage >= {minimum_leverage}x fits liquidation buffer: "
             f"stop={float(stop_percent):.2f}% tierCap={max_loss_percent:.1f}% "
             "dailyLoss=exempt"
         )
@@ -563,17 +585,28 @@ def resolve_adaptive_trend_small_account_profile(
         })
         return result
 
-    full_target_notional = margin_budget * float(selected)
+    full_target_notional = selected_payload["full_target_notional"]
     result.update(selected_payload)
     result.update({
         "leverage": int(selected),
+        "initial_margin_usdt": selected_payload["initial_margin"],
         "full_target_notional": full_target_notional,
+        "full_target_margin_usdt": selected_payload["full_target_margin"],
+        "full_target_projected_loss_percent": (
+            selected_payload["full_target_projected_loss_usdt"] / equity * 100.0
+        ),
+        "stop_distance_risk_sizing_applied": bool(
+            selected_payload["risk_capped_notional"]
+            + 1e-9
+            < selected_payload["full_margin_notional"]
+        ),
         "actual_projected_loss_percent": (
             selected_payload["projected_loss_usdt"] / equity * 100.0
         ),
         "reason": (
             f"small-account aggressive {risk_tier}: {int(selected)}x, "
-            f"margin={initial_margin:.2f}/{margin_budget:.2f}, "
+            f"margin={selected_payload['initial_margin']:.2f}/{margin_budget:.2f}, "
+            f"stop={float(stop_percent):.2f}%, "
             f"projectedLoss={selected_payload['projected_loss_usdt']:.2f} "
             f"({selected_payload['projected_loss_usdt'] / equity * 100.0:.2f}%)"
         ),
@@ -1211,10 +1244,14 @@ def apply_dynamic_leverage_to_plan(
                 aggressive_trend_policy.get("minimum_leverage", 4)
             ),
             "small_account_target_margin_usdt": float(
-                aggressive_trend_policy.get("margin_budget_usdt", 0.0)
+                aggressive_trend_policy.get("full_target_margin_usdt", 0.0)
             ),
             "small_account_margin_utilization": float(
-                aggressive_trend_policy.get("initial_margin_fraction", 0.65)
+                aggressive_trend_policy.get("initial_margin_usdt", 0.0)
+                / max(
+                    float(aggressive_trend_policy.get("margin_budget_usdt", 0.0)),
+                    1e-12,
+                )
             ),
             "small_account_aggressive_initial_margin_usdt": float(
                 aggressive_trend_policy.get("initial_margin_usdt", 0.0)
@@ -1236,6 +1273,21 @@ def apply_dynamic_leverage_to_plan(
             ),
             "small_account_aggressive_projected_loss_percent": float(
                 aggressive_trend_policy.get("actual_projected_loss_percent", 0.0)
+            ),
+            "small_account_aggressive_full_target_loss_usdt": float(
+                aggressive_trend_policy.get(
+                    "full_target_projected_loss_usdt", 0.0
+                )
+            ),
+            "small_account_aggressive_full_target_loss_percent": float(
+                aggressive_trend_policy.get(
+                    "full_target_projected_loss_percent", 0.0
+                )
+            ),
+            "small_account_stop_distance_risk_sizing_applied": bool(
+                aggressive_trend_policy.get(
+                    "stop_distance_risk_sizing_applied", False
+                )
             ),
             "small_account_aggressive_cost_buffer_percent": float(
                 aggressive_trend_policy.get("cost_buffer_percent", 0.0)
@@ -1377,9 +1429,15 @@ def apply_dynamic_leverage_to_plan(
                         else "small_account_aggressive_initial_stage"
                     ),
                     "small_account_target_margin_usdt": float(
-                        aggressive_trend_policy["margin_budget_usdt"]
+                        aggressive_trend_policy["full_target_margin_usdt"]
                     ),
-                    "small_account_margin_utilization": initial_fraction,
+                    "small_account_margin_utilization": (
+                        float(aggressive_trend_policy["initial_margin_usdt"])
+                        / max(
+                            float(aggressive_trend_policy["margin_budget_usdt"]),
+                            1e-12,
+                        )
+                    ),
                     "dynamic_leverage_restored_notional": 0.0,
                     "adaptive_breakout_trend_target_risk_percent": float(
                         aggressive_trend_policy["actual_projected_loss_percent"]

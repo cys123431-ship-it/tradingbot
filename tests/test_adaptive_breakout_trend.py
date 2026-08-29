@@ -796,9 +796,9 @@ def test_persisted_conservative_profile_migrates_to_small_account_aggressive_v3(
     assert migrated["runner_pct"] == pytest.approx(0.85)
     assert migrated["small_account_margin_budget_fraction"] == pytest.approx(0.95)
     assert migrated["small_account_initial_margin_fraction"] == pytest.approx(0.65)
-    assert migrated["small_account_base_max_loss_percent"] == pytest.approx(20.0)
-    assert migrated["small_account_strong_max_loss_percent"] == pytest.approx(30.0)
-    assert migrated["small_account_elite_max_loss_percent"] == pytest.approx(35.0)
+    assert migrated["small_account_base_max_loss_percent"] == pytest.approx(8.0)
+    assert migrated["small_account_strong_max_loss_percent"] == pytest.approx(12.0)
+    assert migrated["small_account_elite_max_loss_percent"] == pytest.approx(16.0)
     assert migrated["small_account_daily_loss_limit_percent"] == pytest.approx(0.0)
     assert migrated["small_account_min_leverage"] == 4
     assert migrated["small_account_strong_leverage"] == 6
@@ -884,6 +884,28 @@ def test_v11_profile_upgrade_adds_regime_router_without_resetting_live_exits():
     assert migrated["runner_pct"] == pytest.approx(0.78)
     assert migrated["atr_trailing_multiplier"] == pytest.approx(3.20)
     assert migrated["small_account_regime_ensemble"]["enabled"] is True
+
+
+def test_v13_profile_upgrade_changes_only_stop_distance_sizing_caps():
+    migrated = normalize_adaptive_breakout_trend_config(
+        {
+            "profile_version": "adaptive_trend_portfolio_v13_validated_regime_router",
+            "small_account_base_max_loss_percent": 20.0,
+            "small_account_strong_max_loss_percent": 30.0,
+            "small_account_elite_max_loss_percent": 35.0,
+            "small_account_roe_profit_lock_first_trigger_percent": 6.0,
+            "runner_pct": 0.90,
+            "take_profit_r_multiple": 11.0,
+        }
+    )
+
+    assert migrated["profile_version"] == ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION
+    assert migrated["small_account_base_max_loss_percent"] == pytest.approx(8.0)
+    assert migrated["small_account_strong_max_loss_percent"] == pytest.approx(12.0)
+    assert migrated["small_account_elite_max_loss_percent"] == pytest.approx(16.0)
+    assert migrated["small_account_roe_profit_lock_first_trigger_percent"] == pytest.approx(6.0)
+    assert migrated["runner_pct"] == pytest.approx(0.90)
+    assert migrated["take_profit_r_multiple"] == pytest.approx(11.0)
 
 
 def test_v9_profile_upgrade_migrates_only_requested_small_account_leverage_policy():
