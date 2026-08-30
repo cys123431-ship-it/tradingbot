@@ -13,11 +13,25 @@ from utbreakout.adaptive_breakout_trend import ADAPTIVE_BREAKOUT_TREND_STRATEGY
 
 
 @pytest.mark.parametrize(
-    ("side", "mark_price", "average_entry", "expected_stop"),
     (
-        ("long", 101.0, 100.2, 100.2 * 1.0012),
-        ("short", 99.0, 99.8, 99.8 * 0.9988),
-        ("long", 101.0, 100.8, 100.0),
+        "side",
+        "mark_price",
+        "average_entry",
+        "current_stop",
+        "expected_stop",
+        "tp1_already_filled",
+    ),
+    (
+        ("long", 101.0, 100.2, 100.0, 100.2 * 1.0012, False),
+        ("short", 99.0, 99.8, 100.0, 99.8 * 0.9988, False),
+        ("long", 101.0, 100.8, 100.0, 100.0, False),
+        # Regression: a winner SL above the combined entry is valid while it
+        # remains below the live mark. It must neither abort post-fill state
+        # registration nor be loosened back below average entry.
+        ("long", 107.0, 106.128, 106.63, 106.63, False),
+        # A TP already consumed before a fast pyramid add must not be rebuilt
+        # as another marketable partial exit.
+        ("long", 103.0, 101.0, 100.0, 101.0 * 1.0012, True),
     ),
 )
 def test_adaptive_trend_adds_only_at_profitable_stage_and_reprotects(
@@ -25,7 +39,9 @@ def test_adaptive_trend_adds_only_at_profitable_stage_and_reprotects(
     side,
     mark_price,
     average_entry,
+    current_stop,
     expected_stop,
+    tp1_already_filled,
 ):
     engine = SignalExitMixin()
     state = {
@@ -47,6 +63,7 @@ def test_adaptive_trend_adds_only_at_profitable_stage_and_reprotects(
         "adaptive_trend_partial_r_multiple": 2.0,
         "adaptive_trend_partial_ratio": 0.15,
         "trailing_atr_multiplier": 3.8,
+        "tp1_filled": tp1_already_filled,
         "planned_tp_orders": [{"qty": 1.0}],
     }
     calls = {
@@ -91,6 +108,7 @@ def test_adaptive_trend_adds_only_at_profitable_stage_and_reprotects(
 
     engine.is_upbit_mode = lambda: False
     engine._get_utbreakout_trailing_state = lambda symbol: state
+    engine._set_utbreakout_trailing_state = lambda symbol, value: value
     engine._position_signed_contracts = lambda pos: pos.get("contracts", 0.0)
     engine.get_balance_info = lambda: asyncio.sleep(
         0,
@@ -99,7 +117,7 @@ def test_adaptive_trend_adds_only_at_profitable_stage_and_reprotects(
     engine.safe_amount = lambda symbol, qty: qty
     engine._current_stop_loss_price = lambda symbol, current: asyncio.sleep(
         0,
-        result=100.0,
+        result=current_stop,
     )
     engine._replace_stop_loss_order = lambda symbol, pos, stop, **kwargs: asyncio.sleep(
         0,
@@ -208,9 +226,15 @@ def test_adaptive_trend_adds_only_at_profitable_stage_and_reprotects(
     assert calls["protection"] is not None
     assert calls["protection"]["kwargs"]["preserve_runner_qty"] is True
     assert calls["protection"]["kwargs"]["sl_distance"] == pytest.approx(
-        abs(average_entry - 100.0)
+        abs(average_entry - current_stop)
     )
-    if expected_stop == 100.0:
+    assert calls["protection"]["kwargs"]["sl_price_override"] == pytest.approx(
+        current_stop
+    )
+    if tp1_already_filled:
+        assert calls["protection"]["kwargs"]["tp_targets"] == []
+        assert state["tp1_filled"] is True
+    if expected_stop == current_stop:
         assert calls["stop_replacements"] == []
     else:
         assert calls["stop_replacements"] == [pytest.approx(expected_stop)]

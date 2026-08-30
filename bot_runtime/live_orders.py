@@ -635,6 +635,141 @@ def _order_id_from_any(self, order):
     return str(order.get("id") or order.get("orderId") or info.get("orderId") or "") or None
 
 
+def _planned_tp_order_ids(self, symbol, state, label):
+    """Return only order ids that are explicitly associated with one TP leg."""
+
+    label = _normalize_tp_plan_label(label)
+    ids = []
+
+    def _append(value, *, prioritize=False):
+        value = str(value or "").strip()
+        if not value:
+            return
+        if value in ids:
+            if not prioritize:
+                return
+            ids.remove(value)
+        ids.append(value)
+
+    store = getattr(self, "trading_state_store", None)
+    if store is not None:
+        try:
+            records = list(store.active_for_symbol(symbol) or [])
+        except Exception:
+            records = []
+        for record in records:
+            metadata = dict(getattr(record, "metadata", {}) or {})
+            labels = dict(metadata.get("take_profit_order_labels", {}) or {})
+            for order_id, order_label in labels.items():
+                if _normalize_tp_plan_label(order_label) == label:
+                    _append(order_id)
+
+    # State references describe the current plan and therefore take priority
+    # over older persisted revisions of the same TP label.
+    for item in (state or {}).get("planned_tp_orders") or (state or {}).get("tp_orders") or []:
+        if not isinstance(item, dict):
+            continue
+        item_label = _normalize_tp_plan_label(
+            item.get("tp_label") or item.get("tp_name") or item.get("label")
+        )
+        if item_label == label:
+            _append(
+                item.get("order_id") or item.get("orderId"),
+                prioritize=True,
+            )
+    _append(
+        (state or {}).get(f"{label.lower()}_order_id"),
+        prioritize=True,
+    )
+    return ids
+
+
+async def _confirm_planned_tp_fill(self, symbol, state, label):
+    """Confirm an absent TP against exchange history before recreating it.
+
+    Open-order snapshots intentionally omit filled orders.  Recreating a leg
+    solely because it disappeared can therefore double the intended partial
+    exit, especially immediately after a pyramid quantity change.
+    """
+
+    label = _normalize_tp_plan_label(label)
+    ids = _planned_tp_order_ids(self, symbol, state, label)
+    fetch_order = getattr(getattr(self, "exchange", None), "fetch_order", None)
+    if not ids or not callable(fetch_order):
+        return {"status": "UNAVAILABLE", "label": label, "order_ids": ids}
+
+    fetch_errors = []
+    for order_id in reversed(ids[-8:]):
+        try:
+            order = await asyncio.to_thread(fetch_order, order_id, symbol)
+        except Exception as exc:
+            fetch_errors.append(type(exc).__name__)
+            continue
+        if not isinstance(order, dict):
+            continue
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        order_status = str(
+            order.get("status")
+            or info.get("status")
+            or info.get("algoStatus")
+            or ""
+        ).strip().upper()
+        filled_qty = _safe_float_value(
+            order.get("filled")
+            or info.get("executedQty")
+            or info.get("cumQty")
+            or info.get("executedQuantity"),
+            0.0,
+        )
+        confirmed = bool(
+            filled_qty > 0
+            or order_status in {"CLOSED", "FILLED"}
+        )
+        if not confirmed:
+            continue
+
+        label_key = label.lower()
+        state[f"{label_key}_filled"] = True
+        state[f"{label_key}_filled_order_id"] = str(order_id)
+        state[f"{label_key}_filled_exchange_status"] = order_status
+        state[f"{label_key}_filled_exchange_qty"] = float(filled_qty)
+        state[f"{label_key}_filled_confirmed_at"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+        for item in (state.get("planned_tp_orders") or state.get("tp_orders") or []):
+            if not isinstance(item, dict):
+                continue
+            item_label = _normalize_tp_plan_label(
+                item.get("tp_label") or item.get("tp_name") or item.get("label")
+            )
+            if item_label == label:
+                item["filled"] = True
+                item["filled_order_id"] = str(order_id)
+        self._set_utbreakout_trailing_state(symbol, state)
+        logger.info(
+            "[%s Repair] skipped recreate for %s: exchange confirms order %s "
+            "status=%s filled=%.12f",
+            label,
+            symbol,
+            order_id,
+            order_status,
+            filled_qty,
+        )
+        return {
+            "status": f"{label}_FILL_CONFIRMED",
+            "label": label,
+            "order_id": str(order_id),
+            "filled_qty": float(filled_qty),
+            "exchange_status": order_status,
+        }
+    return {
+        "status": "NOT_FILLED",
+        "label": label,
+        "checked_order_ids": ids,
+        "fetch_errors": fetch_errors,
+    }
+
+
 async def _cancel_labeled_tp_orders(self, symbol, label, planned_tp_orders=None, reason="TP repair"):
     if not hasattr(self, "_collect_protection_orders") or not hasattr(self, "_cancel_protection_orders"):
         return 0
@@ -687,11 +822,45 @@ async def _repair_missing_tp_order(
         status["status"] = f"NO_{label}_PLAN"
         return status
 
+    fill_confirmation = await _confirm_planned_tp_fill(
+        self,
+        symbol,
+        state,
+        label,
+    )
+    status["fill_confirmation"] = fill_confirmation
+    if str(fill_confirmation.get("status") or "").endswith("_FILL_CONFIRMED"):
+        status.update(fill_confirmation)
+        return status
+
     close_side = "sell" if str(pos.get("side") or state.get("side")).lower() == "long" else "buy"
     target_price = _safe_float_value(tp_plan.get("price"), 0.0)
     if target_price <= 0:
         logger.error("[%s Repair] invalid %s price for %s: %s", label, label, symbol, tp_plan.get("price"))
         status["status"] = f"INVALID_{label}_PRICE"
+        return status
+
+
+    # If price has already crossed the absent TP while exchange history is
+    # inconclusive, submitting a new marketable limit can immediately take a
+    # second partial profit. Keep the protective SL and wait for a later audit
+    # rather than manufacturing an unverified duplicate exit.
+    side = str(pos.get("side") or state.get("side") or "").lower()
+    snapshot = await _fetch_tp2_price_snapshot(self, symbol)
+    if _tp2_target_reached(side, target_price, snapshot):
+        status.update({
+            "status": f"{label}_TARGET_REACHED_UNCONFIRMED",
+            "price": target_price,
+            "snapshot": snapshot,
+        })
+        if hasattr(self, "_notify_protection_issue"):
+            await self._notify_protection_issue(
+                symbol,
+                f"{label_key}_target_reached_unconfirmed",
+                f"⚠️ {symbol} {label} 주문이 열린 주문에서 사라졌지만 "
+                "체결 여부를 확정하지 못해 중복 익절 주문을 만들지 않습니다.",
+                cooldown_sec=300,
+            )
         return status
 
     audit_status = audit_status or {}
@@ -1026,6 +1195,8 @@ __all__ = (
     '_handle_sl_failure_with_persistent_pause',
     '_live_tp_plan_by_label',
     '_order_id_from_any',
+    '_planned_tp_order_ids',
+    '_confirm_planned_tp_fill',
     '_cancel_labeled_tp_orders',
     '_repair_missing_tp_order',
     '_repair_missing_tp2_order',

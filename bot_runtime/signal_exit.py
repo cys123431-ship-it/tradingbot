@@ -344,15 +344,53 @@ class SignalExitMixin:
             float(self._position_signed_contracts(new_pos) or new_pos.get('contracts', 0) or 0)
         )
         avg_entry = _safe_float_or_none(new_pos.get('entryPrice')) or current_price
-        valid_be_geometry = bool(
+        post_fill_mark = (
+            _safe_float_or_none(new_pos.get('markPrice'))
+            or _safe_float_or_none(new_pos.get('mark_price'))
+            or current_price
+        )
+        # A winner add can leave the already-protective stop beyond the new
+        # combined average (profit-locking).  The only unsafe geometry is a
+        # stop that is no longer live relative to the current mark.  Treating
+        # a profitable stop as invalid used to abandon post-fill protection
+        # refresh/state registration and could later recreate an already
+        # filled TP from a stale quantity baseline.
+        valid_live_stop_geometry = bool(
             total_qty > 0
+            and pre_add_stop > 0
+            and post_fill_mark is not None
+            and post_fill_mark > 0
             and (
-                (side == 'long' and avg_entry > pre_add_stop)
-                or (side == 'short' and avg_entry < pre_add_stop)
+                (side == 'long' and pre_add_stop < post_fill_mark)
+                or (side == 'short' and pre_add_stop > post_fill_mark)
             )
         )
-        if not valid_be_geometry:
-            return {'status': 'BLOCKED', 'reason': 'adaptive trend average entry/SL geometry invalid'}
+        if not valid_live_stop_geometry:
+            _mark_crypto_entry_state(
+                self,
+                add_submission.client_order_id,
+                OrderState.FILLED_UNPROTECTED,
+            )
+            self._set_crypto_entry_lock(
+                f'FILLED_UNPROTECTED:{add_submission.client_order_id}'
+            )
+            close_status = await self._fail_closed_unprotected_position(
+                symbol,
+                reason=(
+                    'adaptive trend post-fill stop is not live: '
+                    f'side={side} stop={pre_add_stop} mark={post_fill_mark}'
+                ),
+                status_code='PYRAMID_POST_FILL_STOP_NOT_LIVE',
+                expected_tp=bool(
+                    self._planned_tp_orders_from_state(symbol, state)
+                ),
+                emergency_close=True,
+            )
+            return {
+                'status': 'FILLED_UNPROTECTED',
+                'reason': 'adaptive trend post-fill stop is not live',
+                'close_status': close_status,
+            }
 
         actual_liquidation = await self._verify_actual_liquidation_safety(
             symbol,
@@ -380,8 +418,20 @@ class SignalExitMixin:
             0.0,
             min(0.20, float(state.get('adaptive_trend_partial_ratio', 0.15) or 0.15)),
         )
+        tp1_already_filled = bool(state.get('tp1_filled', False)) or any(
+            bool(item.get('filled', False))
+            and _normalize_tp_plan_label(
+                item.get('tp_label') or item.get('tp_name') or item.get('label')
+            ) == 'TP1'
+            for item in (
+                state.get('planned_tp_orders')
+                or state.get('tp_orders')
+                or []
+            )
+            if isinstance(item, dict)
+        )
         tp_targets = []
-        if target_distance > 0 and partial_ratio > 0:
+        if target_distance > 0 and partial_ratio > 0 and not tp1_already_filled:
             tp_targets.append({
                 'label': 'TP1',
                 'kind': 'tp1',
@@ -397,6 +447,7 @@ class SignalExitMixin:
             sl_distance=pre_add_risk_distance,
             tp_targets=tp_targets,
             preserve_runner_qty=True,
+            sl_price_override=pre_add_stop,
         )
 
         # The pre-add stop protects the order while it fills, but it is not
@@ -416,11 +467,6 @@ class SignalExitMixin:
         raw_cost_break_even = avg_entry * (
             1.0 + cost_multiplier if side == 'long' else 1.0 - cost_multiplier
         )
-        post_fill_mark = (
-            _safe_float_or_none(new_pos.get('markPrice'))
-            or _safe_float_or_none(new_pos.get('mark_price'))
-            or current_price
-        )
         minimum_live_gap_percent = max(
             0.10,
             min(
@@ -437,10 +483,16 @@ class SignalExitMixin:
         live_gap_multiplier = minimum_live_gap_percent / 100.0
         if side == 'long':
             live_safe_boundary = post_fill_mark * (1.0 - live_gap_multiplier)
-            desired_post_add_stop = min(raw_cost_break_even, live_safe_boundary)
+            desired_post_add_stop = max(
+                pre_add_stop,
+                min(raw_cost_break_even, live_safe_boundary),
+            )
         else:
             live_safe_boundary = post_fill_mark * (1.0 + live_gap_multiplier)
-            desired_post_add_stop = max(raw_cost_break_even, live_safe_boundary)
+            desired_post_add_stop = min(
+                pre_add_stop,
+                max(raw_cost_break_even, live_safe_boundary),
+            )
         desired_stop_is_live = bool(
             post_fill_mark
             and (
@@ -455,7 +507,13 @@ class SignalExitMixin:
             )
         )
         applied_post_add_stop = pre_add_stop
-        if desired_stop_is_live:
+        stop_tolerance = max(abs(pre_add_stop) * 1e-9, 1e-12)
+        desired_stop_is_tighter = (
+            desired_post_add_stop > pre_add_stop + stop_tolerance
+            if side == 'long'
+            else desired_post_add_stop < pre_add_stop - stop_tolerance
+        )
+        if desired_stop_is_live and desired_stop_is_tighter:
             replacement = await self._replace_stop_loss_order(
                 symbol,
                 new_pos,
@@ -559,6 +617,10 @@ class SignalExitMixin:
             effective_cfg,
         )
         runner_state = self._get_utbreakout_trailing_state(symbol)
+        if isinstance(runner_state, dict) and tp1_already_filled:
+            runner_state['tp1_filled'] = True
+            runner_state['tp1_filled_preserved_after_add'] = True
+            self._set_utbreakout_trailing_state(symbol, runner_state)
         audit_status = await self._audit_protection_orders(
             symbol,
             pos=new_pos,
@@ -1966,11 +2028,45 @@ class SignalExitMixin:
 
         total_qty = abs(float(self._position_signed_contracts(new_pos) or new_pos.get('contracts', 0) or 0))
         avg_entry = _safe_float_or_none(new_pos.get('entryPrice')) or entry_price
-        if total_qty <= 0 or avg_entry <= breakeven_stop:
+        post_fill_mark = (
+            _safe_float_or_none(new_pos.get('markPrice'))
+            or _safe_float_or_none(new_pos.get('mark_price'))
+            or current_price
+        )
+        valid_live_stop_geometry = bool(
+            total_qty > 0
+            and breakeven_stop > 0
+            and post_fill_mark is not None
+            and post_fill_mark > 0
+            and breakeven_stop < post_fill_mark
+        )
+        if not valid_live_stop_geometry:
             await self.ctrl.notify(
-                f"⚠️ Aggressive Growth 추가진입 후 평균가/SL 검증 실패: {self.ctrl.format_symbol_for_display(symbol)}"
+                f"⚠️ Aggressive Growth 추가진입 후 SL 실효성 검증 실패: {self.ctrl.format_symbol_for_display(symbol)}"
             )
-            return {'status': 'BLOCKED', 'reason': 'average entry not above breakeven stop'}
+            _mark_crypto_entry_state(
+                self,
+                add_submission.client_order_id,
+                OrderState.FILLED_UNPROTECTED,
+            )
+            self._set_crypto_entry_lock(
+                f'FILLED_UNPROTECTED:{add_submission.client_order_id}'
+            )
+            close_status = await self._fail_closed_unprotected_position(
+                symbol,
+                reason=(
+                    'aggressive growth post-fill stop is not live: '
+                    f'stop={breakeven_stop} mark={post_fill_mark}'
+                ),
+                status_code='PYRAMID_POST_FILL_STOP_NOT_LIVE',
+                expected_tp=True,
+                emergency_close=True,
+            )
+            return {
+                'status': 'FILLED_UNPROTECTED',
+                'reason': 'aggressive growth post-fill stop is not live',
+                'close_status': close_status,
+            }
         actual_liquidation = await self._verify_actual_liquidation_safety(
             symbol,
             'long',
@@ -1986,7 +2082,7 @@ class SignalExitMixin:
                 'close_status': actual_liquidation.get('close_status'),
             }
         new_pos = actual_liquidation.get('position') or new_pos
-        new_risk_distance = avg_entry - breakeven_stop
+        new_risk_distance = abs(avg_entry - breakeven_stop)
         growth_score = (
             pyramid_plan.get('growth_score')
             if pyramid_plan.get('growth_score') is not None
@@ -2005,7 +2101,8 @@ class SignalExitMixin:
             total_qty,
             sl_distance=new_risk_distance,
             tp_targets=tp_targets,
-            preserve_runner_qty=True
+            preserve_runner_qty=True,
+            sl_price_override=breakeven_stop,
         )
         post_add_audit = await self._audit_protection_orders(
             symbol,
@@ -2116,7 +2213,8 @@ class SignalExitMixin:
         sl_distance=None,
         tp_qty_ratio=1.0,
         tp_targets=None,
-        preserve_runner_qty=False
+        preserve_runner_qty=False,
+        sl_price_override=None,
     ):
         """Place reduce-only TP/SL protection orders for the current futures position."""
         try:
@@ -2189,12 +2287,16 @@ class SignalExitMixin:
             if side == 'long':
                 tp_side = 'sell'
                 sl_side = 'sell'
-                if sl_distance is not None and sl_distance > 0:
+                if sl_price_override is not None:
+                    sl_price = self.safe_price(symbol, sl_price_override)
+                elif sl_distance is not None and sl_distance > 0:
                     sl_price = self.safe_price(symbol, entry_price - sl_distance)
             else:
                 tp_side = 'buy'
                 sl_side = 'buy'
-                if sl_distance is not None and sl_distance > 0:
+                if sl_price_override is not None:
+                    sl_price = self.safe_price(symbol, sl_price_override)
+                elif sl_distance is not None and sl_distance > 0:
                     sl_price = self.safe_price(symbol, entry_price + sl_distance)
 
             if sl_price is not None and pos:
@@ -2361,7 +2463,24 @@ class SignalExitMixin:
                     return False
                 if direction == 'tp':
                     return price_float > entry_price if side == 'long' else price_float < entry_price
-                return price_float < entry_price if side == 'long' else price_float > entry_price
+                # Managed winner stops may intentionally lock profit beyond
+                # entry. Validate against the live mark, not average entry.
+                reference_price = None
+                if isinstance(pos, dict):
+                    info = pos.get('info') if isinstance(pos.get('info'), dict) else {}
+                    reference_price = _safe_float_or_none(
+                        pos.get('markPrice')
+                        or pos.get('mark_price')
+                        or info.get('markPrice')
+                        or pos.get('last')
+                        or pos.get('currentPrice')
+                    )
+                reference_price = reference_price or entry_price
+                return (
+                    price_float < reference_price
+                    if side == 'long'
+                    else price_float > reference_price
+                )
 
             # Stop Loss is placed first. A position without SL is the riskiest failure mode.
             if sl_price is not None:

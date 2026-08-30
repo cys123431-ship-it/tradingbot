@@ -65,6 +65,50 @@ def test_runtime_snapshot_is_bounded_and_marks_bot_position():
     assert snapshot["position_hints"][0]["tp_prices"] == [12.5]
 
 
+def test_runtime_snapshot_does_not_show_filled_tp_as_active_hint():
+    engine = SimpleNamespace(
+        scanner_active_symbol="SOL/USDT:USDT",
+        current_utbreakout_candidate_symbol=None,
+        last_utbot_filtered_breakout_status={},
+        utbreakout_trailing_states={
+            "SOL/USDT:USDT": {
+                "strategy": "ADAPTIVE_BREAKOUT_TREND",
+                "entry_price": 106.128,
+                "last_stop_price": 106.63,
+                "tp1_filled": True,
+                "planned_tp_orders": [
+                    {"tp_label": "TP1", "price": 106.65, "filled": True}
+                ],
+            }
+        },
+        last_protection_order_status={
+            "SOL/USDT:USDT": {
+                "status": "OK",
+                "fetch_ok": True,
+                "sl_present": True,
+                "stop_price": 106.63,
+                "tp_orders": [],
+            }
+        },
+    )
+    controller = SimpleNamespace(
+        engines={"signal": engine},
+        status_data={},
+        is_paused=False,
+        get_active_strategy_params=lambda: {
+            "active_strategy": "utbot",
+            "UTBotFilteredBreakoutV1": {},
+        },
+        get_exchange_mode=lambda: "binance_mainnet",
+        _get_current_symbol=lambda: "SOL/USDT:USDT",
+    )
+
+    snapshot = build_desktop_monitor_snapshot(controller)
+
+    assert snapshot["position_hints"][0]["stop_price"] == 106.63
+    assert snapshot["position_hints"][0]["tp_prices"] == []
+
+
 def test_exchange_position_and_orders_are_read_only_normalized():
     position = normalize_position(
         {

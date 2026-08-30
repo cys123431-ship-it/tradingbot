@@ -241,7 +241,16 @@ def _position_hints(engine):
                     for value in (
                         _safe_number(item.get("price"))
                         for item in (state.get("planned_tp_orders") or [])[:4]
-                        if isinstance(item, dict)
+                        if (
+                            isinstance(item, dict)
+                            and not bool(item.get("filled", False))
+                            and not bool(
+                                state.get(
+                                    f"{str(item.get('tp_label') or item.get('tp_name') or item.get('label') or '').lower()}_filled",
+                                    False,
+                                )
+                            )
+                        )
                     )
                     if value is not None
                 ],

@@ -5862,6 +5862,191 @@ def test_missing_tp2_repair_preserves_planned_runner_quantity():
     )
 
 
+def test_missing_tp1_repair_checks_exchange_fill_before_recreating_stale_plan():
+    """A filled TP must not be duplicated when pyramid state quantity is stale."""
+
+    class FilledHistoryExchange(_FakeExchange):
+        def __init__(self, orders, positions):
+            super().__init__(orders, positions=positions)
+            self.fetch_order_calls = []
+
+        def fetch_order(self, order_id, symbol):
+            self.fetch_order_calls.append((str(order_id), symbol))
+            if str(order_id) != "tp1-filled-7408613158":
+                raise RuntimeError("order not found")
+            return {
+                "id": str(order_id),
+                "status": "closed",
+                "filled": 1.38,
+                "remaining": 0.0,
+                "side": "sell",
+                "type": "limit",
+                "reduceOnly": True,
+                "info": {"status": "FILLED", "executedQty": "1.38"},
+            }
+
+    pos = {
+        "symbol": "SOL/USDT:USDT",
+        "side": "long",
+        "contracts": "8.88",
+        "entryPrice": "106.128",
+        "markPrice": "106.98",
+    }
+    stop = {
+        "id": "sl-existing",
+        "side": "sell",
+        "type": "stop_market",
+        "amount": "8.88",
+        "reduceOnly": True,
+        "info": {
+            "symbol": "SOLUSDT",
+            "origType": "STOP_MARKET",
+            "stopPrice": "106.63",
+            "reduceOnly": "true",
+        },
+    }
+    engine = _protection_engine([], positions=[pos])
+    engine.exchange = FilledHistoryExchange([stop], [pos])
+    engine.trading_state_store = SQLiteTradingStateStore(":memory:")
+    engine.trading_state_store.upsert(
+        OrderRecord(
+            client_order_id="adaptive-sol-entry",
+            exchange_order_id="entry-order",
+            symbol="SOL/USDT:USDT",
+            side="LONG",
+            strategy="ADAPTIVE_BREAKOUT_TREND",
+            signal_timestamp="2026-08-30T13:09:00+00:00",
+            requested_qty=9.23,
+            filled_qty=9.23,
+            average_fill_price=106.063,
+            order_state=OrderState.PROTECTED.value,
+            order_intent="ENTRY",
+            take_profit_order_ids=["tp1-filled-7408613158"],
+            metadata={
+                "take_profit_order_labels": {
+                    "tp1-filled-7408613158": "TP1"
+                }
+            },
+        )
+    )
+    state = {
+        "side": "long",
+        "active": True,
+        "entry_price": 106.128,
+        # This is intentionally the stale pre-final-add baseline from the
+        # production failure. Quantity inference alone cannot see the fill.
+        "initial_qty": 9.23,
+        "last_stop_price": 106.63,
+        "runner_pct": 0.85,
+        "preserve_runner_qty": True,
+        "planned_tp_orders": [
+            {
+                "tp_index": 1,
+                "tp_label": "TP1",
+                "tp_name": "TP1",
+                "side": "sell",
+                "price": 106.6524706104415,
+                "qty": 1.38,
+                "filled": False,
+            }
+        ],
+        "tp1_filled": False,
+    }
+    engine.utbreakout_trailing_states = {"SOL/USDT:USDT": state}
+
+    result = asyncio.run(
+        engine._audit_and_repair_live_ladder_protection(
+            "SOL/USDT:USDT",
+            pos,
+            state,
+            {"min_notional_usdt": 0.0},
+            reason="post-pyramid stale-state audit",
+        )
+    )
+
+    assert result["tp1_repair"]["status"] == "TP1_FILL_CONFIRMED"
+    assert state["tp1_filled"] is True
+    assert state["planned_tp_orders"][0]["filled"] is True
+    assert engine.exchange.fetch_order_calls == [
+        ("tp1-filled-7408613158", "SOL/USDT:USDT")
+    ]
+    assert not [order for order in engine.exchange.created if order["type"] == "limit"]
+
+
+def test_missing_tp_repair_does_not_submit_marketable_duplicate_when_fill_unknown():
+    class ReachedTargetExchange(_FakeExchange):
+        def fetch_order(self, order_id, symbol):
+            return {
+                "id": str(order_id),
+                "status": "canceled",
+                "filled": 0.0,
+                "info": {"status": "CANCELED", "executedQty": "0"},
+            }
+
+        def fetch_ticker(self, symbol):
+            return {"last": 106.98, "bid": 106.97, "ask": 106.99}
+
+    pos = {
+        "symbol": "SOL/USDT:USDT",
+        "side": "long",
+        "contracts": "8.88",
+        "entryPrice": "106.128",
+        "markPrice": "106.98",
+    }
+    stop = {
+        "id": "sl-existing",
+        "side": "sell",
+        "type": "stop_market",
+        "amount": "8.88",
+        "reduceOnly": True,
+        "info": {
+            "symbol": "SOLUSDT",
+            "origType": "STOP_MARKET",
+            "stopPrice": "106.63",
+            "reduceOnly": "true",
+        },
+    }
+    engine = _protection_engine([], positions=[pos])
+    engine.exchange = ReachedTargetExchange([stop], positions=[pos])
+    state = {
+        "side": "long",
+        "active": True,
+        "entry_price": 106.128,
+        "initial_qty": 9.23,
+        "last_stop_price": 106.63,
+        "runner_pct": 0.85,
+        "preserve_runner_qty": True,
+        "planned_tp_orders": [
+            {
+                "tp_index": 1,
+                "tp_label": "TP1",
+                "tp_name": "TP1",
+                "side": "sell",
+                "price": 106.65,
+                "qty": 1.38,
+                "order_id": "tp1-unknown",
+                "filled": False,
+            }
+        ],
+        "tp1_filled": False,
+    }
+    engine.utbreakout_trailing_states = {"SOL/USDT:USDT": state}
+
+    result = asyncio.run(
+        engine._audit_and_repair_live_ladder_protection(
+            "SOL/USDT:USDT",
+            pos,
+            state,
+            {"min_notional_usdt": 0.0},
+            reason="unknown fill at crossed target",
+        )
+    )
+
+    assert result["tp1_repair"]["status"] == "TP1_TARGET_REACHED_UNCONFIRMED"
+    assert state["tp1_filled"] is False
+    assert not [order for order in engine.exchange.created if order["type"] == "limit"]
+
+
 def test_place_tp_sl_orders_uses_position_amt_for_short_futures_symbol():
     pos = {
         "symbol": "BTC/USDT:USDT",
@@ -5891,6 +6076,47 @@ def test_place_tp_sl_orders_uses_position_amt_for_short_futures_symbol():
     assert tp_order["side"] == "buy"
     assert float(tp_order["amount"]) == 2.0
     assert float(tp_order["price"]) == 90.0
+
+
+@pytest.mark.parametrize(
+    ("side", "mark_price", "stop_price", "expected_order_side"),
+    (
+        ("long", 110.0, 105.0, "sell"),
+        ("short", 90.0, 95.0, "buy"),
+    ),
+)
+def test_place_tp_sl_orders_preserves_live_profit_stop_override(
+    side,
+    mark_price,
+    stop_price,
+    expected_order_side,
+):
+    pos = {
+        "symbol": "BTC/USDT:USDT",
+        "side": side,
+        "contracts": "2",
+        "entryPrice": "100",
+        "markPrice": str(mark_price),
+    }
+    engine = _protection_engine([], positions=[pos])
+
+    asyncio.run(
+        engine._place_tp_sl_orders(
+            "BTC/USDT:USDT",
+            side,
+            100.0,
+            2.0,
+            sl_distance=5.0,
+            sl_price_override=stop_price,
+        )
+    )
+
+    stop_order = next(
+        order for order in engine.exchange.created
+        if str(order["type"]).lower() == "stop_market"
+    )
+    assert stop_order["side"] == expected_order_side
+    assert float(stop_order["params"]["stopPrice"]) == pytest.approx(stop_price)
 
 
 def test_utbreakout_split_tp_short_side_prices_and_labels_audit_ok():
