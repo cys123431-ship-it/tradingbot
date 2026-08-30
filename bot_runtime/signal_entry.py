@@ -47,6 +47,7 @@ _DURABLE_ENTRY_PLAN_KEYS = (
     'small_account_stop_distance_risk_sizing_applied',
     'small_account_aggressive_cost_buffer_percent',
     'small_account_aggressive_risk_tier',
+    'small_account_short_entries_enabled',
     'small_account_roe_profit_lock_enabled',
     'small_account_roe_profit_lock_first_trigger_percent',
     'small_account_roe_profit_lock_second_trigger_percent',

@@ -458,3 +458,6 @@ def test_entry_reason_translation_covers_core_trend_waits():
     assert "반대 방향" in explain_entry_reason_ko(
         code="REJECTED_SMALL_ACCOUNT_SIGNAL_INVALIDATED"
     )
+    assert "롱 전용" in explain_entry_reason_ko(
+        code="REJECTED_SMALL_ACCOUNT_SHORT_DISABLED"
+    )

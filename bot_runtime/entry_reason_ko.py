@@ -87,6 +87,10 @@ def explain_entry_reason_ko(reason=None, *, code=None, data=None):
         return "봇이 일시정지 상태라 신규 진입하지 않았습니다."
     if "DIRECTION_FILTER" in uppered or "TRADE DIRECTION" in uppered:
         return "현재 허용된 매매 방향과 신호 방향이 달라 진입하지 않았습니다."
+    if "SMALL_ACCOUNT_SHORT_DISABLED" in uppered or (
+        "SMALL-ACCOUNT" in uppered and "SHORT ENTRIES DISABLED" in uppered
+    ):
+        return "1,000 USDT 미만 공격형 전략은 롱 전용이라 신규 숏 진입을 차단했습니다."
     if "SMALL_ACCOUNT_FAST_TREND_DECAY" in uppered:
         return "장기 추세는 남아 있지만 단기 추세 힘이 빠르게 약해져 재가속을 기다립니다."
     if "SMALL_ACCOUNT_SIGNAL_INVALIDATED" in uppered:

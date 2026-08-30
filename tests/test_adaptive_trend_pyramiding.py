@@ -278,6 +278,41 @@ def test_adaptive_trend_does_not_add_before_profit_trigger(monkeypatch):
     assert result["pnl_r"] == pytest.approx(0.25)
 
 
+def test_small_account_short_position_keeps_management_but_disables_additions(monkeypatch):
+    engine = SignalExitMixin()
+    state = {
+        "strategy": ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+        "side": "short",
+        "small_account_aggressive_active": True,
+        "adaptive_trend_pyramid_enabled": True,
+    }
+    engine.is_upbit_mode = lambda: False
+    engine._get_utbreakout_trailing_state = lambda symbol: state
+    monkeypatch.setattr(
+        signal_exit_module,
+        "ADAPTIVE_BREAKOUT_TREND_STRATEGY",
+        ADAPTIVE_BREAKOUT_TREND_STRATEGY,
+        raising=False,
+    )
+
+    result = asyncio.run(
+        engine._maybe_apply_adaptive_trend_pyramiding(
+            "TEST/USDT:USDT",
+            {
+                "side": "short",
+                "contracts": 6.5,
+                "entryPrice": 100.0,
+                "markPrice": 99.0,
+            },
+            None,
+            {},
+        )
+    )
+
+    assert result["status"] == "DISABLED"
+    assert "SHORT position additions disabled" in result["reason"]
+
+
 def test_adaptive_trend_marks_subminimum_target_remainder_complete(monkeypatch):
     engine = SignalExitMixin()
     state = {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+from utbreakout.adaptive_breakout_trend import small_account_short_entry_blocked
 from utbreakout.convex_rotation import evaluate_convex_rotation_exit
 
 
@@ -53,6 +54,20 @@ class SignalExitMixin:
             or not bool(state.get('adaptive_trend_pyramid_enabled', False))
         ):
             return None
+        if small_account_short_entry_blocked(
+            side,
+            small_account_active=bool(
+                state.get('small_account_aggressive_active', False)
+            ),
+            config=state,
+        ):
+            return {
+                'status': 'DISABLED',
+                'reason': (
+                    'small-account aggressive profile is long-only; '
+                    'SHORT position additions disabled'
+                ),
+            }
 
         triggers = tuple(
             float(value)

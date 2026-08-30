@@ -27,7 +27,7 @@ from .small_account_regime import (
 
 
 ADAPTIVE_BREAKOUT_TREND_STRATEGY = "adaptive_breakout_trend_v1"
-ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v14_stop_distance_sizing"
+ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v15_small_account_long_only"
 
 
 def default_adaptive_breakout_trend_config() -> dict[str, Any]:
@@ -121,6 +121,10 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         # as the selected ATR/structure stop gets wider.  At the cap, the
         # first 65% stage exposes about 5.2/7.8/10.4%, respectively.
         "small_account_aggressive_enabled": True,
+        # The aggressive sub-$1,000 profile is long-only. This gates both new
+        # SHORT entries and winner-only SHORT additions without changing the
+        # protective management of an already-open position.
+        "small_account_short_entries_enabled": False,
         "small_account_equity_threshold_usdt": 1_000.0,
         "small_account_margin_budget_fraction": 0.95,
         "small_account_initial_margin_fraction": 0.65,
@@ -253,6 +257,7 @@ def normalize_adaptive_breakout_trend_config(
                 "adaptive_trend_portfolio_v11_",
                 "adaptive_trend_portfolio_v12_",
                 "adaptive_trend_portfolio_v13_",
+                "adaptive_trend_portfolio_v14_",
             )
         )
     ):
@@ -579,6 +584,7 @@ def normalize_adaptive_breakout_trend_config(
     normalized["pyramid_target_fractions"] = tuple(monotonic_targets)
     for key in (
         "small_account_aggressive_enabled",
+        "small_account_short_entries_enabled",
         "small_account_roe_profit_lock_enabled",
         "small_account_entry_refinement_enabled",
         "small_account_lower_timeframe_conflict_veto_enabled",
@@ -911,6 +917,29 @@ def normalize_adaptive_breakout_trend_config(
         )
     )
     return normalized
+
+
+def small_account_short_entry_blocked(
+    side: str | None,
+    *,
+    small_account_active: bool,
+    config: Mapping[str, Any] | None = None,
+) -> bool:
+    """Return whether the aggressive small-account long-only rule blocks SHORT."""
+
+    source = config if isinstance(config, Mapping) else {}
+    raw_enabled = source.get("small_account_short_entries_enabled", False)
+    short_enabled = (
+        raw_enabled
+        if isinstance(raw_enabled, bool)
+        else str(raw_enabled).strip().lower()
+        in {"1", "true", "yes", "on", "enabled"}
+    )
+    return bool(
+        small_account_active
+        and str(side or "").strip().lower() == "short"
+        and not short_enabled
+    )
 
 
 def evaluate_small_account_entry_refinement(

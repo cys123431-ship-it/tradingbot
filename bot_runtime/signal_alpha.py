@@ -16,6 +16,7 @@ from utbreakout.adaptive_breakout_trend import (
     evaluate_small_account_entry_refinement,
     normalize_adaptive_breakout_trend_config,
     resolve_independent_event_allocation,
+    small_account_short_entry_blocked,
 )
 from utbreakout.change_point_flow import (
     evaluate_change_point_flow_entry,
@@ -1674,6 +1675,20 @@ class SignalAlphaMixin:
         if not decision.allowed or decision.side not in {'long', 'short'}:
             return _finish(None, f'Adaptive Breakout Trend waiting: {decision.reason}')
         side = decision.side
+        if small_account_short_entry_blocked(
+            side,
+            small_account_active=small_account_aggressive_candidate,
+            config=trend_cfg,
+        ):
+            status.update({
+                'allowed': False,
+                'small_account_short_entries_enabled': False,
+            })
+            return _finish(
+                None,
+                'Small-account aggressive profile is long-only; SHORT entries disabled',
+                'REJECTED_SMALL_ACCOUNT_SHORT_DISABLED',
+            )
         if not self.is_trade_direction_allowed(side):
             return _finish(
                 None,
@@ -2496,6 +2511,9 @@ class SignalAlphaMixin:
             ),
             'small_account_roe_profit_lock_enabled': bool(
                 trend_cfg.get('small_account_roe_profit_lock_enabled', True)
+            ),
+            'small_account_short_entries_enabled': bool(
+                trend_cfg.get('small_account_short_entries_enabled', False)
             ),
             'small_account_roe_profit_lock_first_trigger_percent': float(
                 trend_cfg.get(

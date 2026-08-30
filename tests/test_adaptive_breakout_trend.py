@@ -18,6 +18,7 @@ from utbreakout.adaptive_breakout_trend import (
     evaluate_small_account_entry_refinement,
     normalize_adaptive_breakout_trend_config,
     resolve_independent_event_allocation,
+    small_account_short_entry_blocked,
 )
 from bot_runtime.signal_alpha import (
     SignalAlphaMixin,
@@ -906,6 +907,40 @@ def test_v13_profile_upgrade_changes_only_stop_distance_sizing_caps():
     assert migrated["small_account_roe_profit_lock_first_trigger_percent"] == pytest.approx(6.0)
     assert migrated["runner_pct"] == pytest.approx(0.90)
     assert migrated["take_profit_r_multiple"] == pytest.approx(11.0)
+
+
+def test_v14_profile_upgrade_becomes_small_account_long_only_without_resetting_exits():
+    migrated = normalize_adaptive_breakout_trend_config(
+        {
+            "profile_version": "adaptive_trend_portfolio_v14_stop_distance_sizing",
+            "runner_pct": 0.91,
+            "small_account_roe_profit_lock_first_trigger_percent": 6.0,
+        }
+    )
+
+    assert migrated["profile_version"] == ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION
+    assert migrated["small_account_short_entries_enabled"] is False
+    assert migrated["runner_pct"] == pytest.approx(0.91)
+    assert migrated["small_account_roe_profit_lock_first_trigger_percent"] == pytest.approx(6.0)
+
+
+def test_small_account_short_gate_blocks_only_active_profile_shorts():
+    default_cfg = normalize_adaptive_breakout_trend_config()
+
+    assert small_account_short_entry_blocked(
+        "short", small_account_active=True, config=default_cfg
+    ) is True
+    assert small_account_short_entry_blocked(
+        "long", small_account_active=True, config=default_cfg
+    ) is False
+    assert small_account_short_entry_blocked(
+        "short", small_account_active=False, config=default_cfg
+    ) is False
+    assert small_account_short_entry_blocked(
+        "short",
+        small_account_active=True,
+        config={"small_account_short_entries_enabled": True},
+    ) is False
 
 
 def test_v9_profile_upgrade_migrates_only_requested_small_account_leverage_policy():
