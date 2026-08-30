@@ -1880,19 +1880,20 @@ class SignalEntryMixin:
                         ladder_snapshot_exc,
                     )
                 self._record_last_live_entry_snapshot(execution_snapshot)
-            await self.ctrl.notify(
-                self._build_signal_entry_notice(
-                    symbol,
-                    side,
-                    qty,
-                    price,
-                    actual_entry_price,
-                    entry_plan=filtered_breakout_plan if active_strategy in UTBREAKOUT_STRATEGIES else None,
-                    leverage=lev,
-                    target_notional=target_notional,
-                    margin_to_use=margin_to_use,
-                    execution_snapshot=execution_snapshot,
-                )
+            # Build the user-facing message now, but do not perform Telegram I/O
+            # while the filled position is still unprotected.  The message is
+            # sent only after the final SL audit marks the entry PROTECTED.
+            entry_notice = self._build_signal_entry_notice(
+                symbol,
+                side,
+                qty,
+                price,
+                actual_entry_price,
+                entry_plan=filtered_breakout_plan if active_strategy in UTBREAKOUT_STRATEGIES else None,
+                leverage=lev,
+                target_notional=target_notional,
+                margin_to_use=margin_to_use,
+                execution_snapshot=execution_snapshot,
             )
 
             # ===== ?꾨왂蹂?TP/SL ?ㅼ젙 =====
@@ -1907,7 +1908,8 @@ class SignalEntryMixin:
 
                     await self._place_tp_sl_orders(symbol, side, actual_entry_price, qty,
                                                    self.vbo_entry_atr * tp_mult,
-                                                   self.vbo_entry_atr * sl_mult)
+                                                   self.vbo_entry_atr * sl_mult,
+                                                   position_hint=verify_pos)
                     logger.info(f"?뮶 [MicroVBO] Entry state saved: price={actual_entry_price:.2f}, ATR={self.vbo_entry_atr:.2f}")
 
             elif active_strategy == 'fractalfisher':
@@ -1945,7 +1947,8 @@ class SignalEntryMixin:
                         actual_entry_price,
                         qty,
                         tp_distance=tp_distance,
-                        sl_distance=risk_distance
+                        sl_distance=risk_distance,
+                        position_hint=verify_pos,
                     )
                     rr_applied = True
                     await self.ctrl.notify(
@@ -1976,7 +1979,8 @@ class SignalEntryMixin:
                                 actual_entry_price,
                                 qty,
                                 tp_distance=tp_distance,
-                                sl_distance=sl_distance
+                                sl_distance=sl_distance,
+                                position_hint=verify_pos,
                             )
 
             elif active_strategy in UTBREAKOUT_STRATEGIES:
@@ -2128,6 +2132,7 @@ class SignalEntryMixin:
                             preserve_runner_qty=bool(
                                 float(plan.get('runner_pct', 0.0) or 0.0) > 0
                             ),
+                            position_hint=verify_pos,
                         )
                         if (
                             bool(effective_fb_cfg.get('atr_trailing_enabled', False))
@@ -2275,7 +2280,8 @@ class SignalEntryMixin:
                             actual_entry_price,
                             qty,
                             tp_distance=tp_distance,
-                            sl_distance=sl_distance
+                            sl_distance=sl_distance,
+                            position_hint=verify_pos,
                         )
 
             if verify_pos:
@@ -2343,6 +2349,15 @@ class SignalEntryMixin:
                     )
                     if str(getattr(self, 'crypto_entry_lock_reason', '') or '').startswith('FILLED_'):
                         self._set_crypto_entry_lock(None)
+                    try:
+                        await self.ctrl.notify(entry_notice)
+                    except Exception:
+                        # Notification failure must never turn an already protected
+                        # position into an entry exception or delay its safeguards.
+                        logger.exception(
+                            "Protected entry notification failed for %s",
+                            symbol,
+                        )
                 else:
                     self.crypto_entry_lock_reason = f"FILLED_UNPROTECTED:{entry_client_order_id}"
                     self.trading_state_store.set_runtime_state(

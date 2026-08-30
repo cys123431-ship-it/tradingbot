@@ -5279,6 +5279,92 @@ def test_place_tp_sl_orders_uses_partial_tp_quantity_and_full_sl_quantity():
     assert float(tp_order["price"]) == 115.0
 
 
+def test_place_tp_sl_orders_reuses_verified_position_and_skips_redundant_recheck():
+    events = []
+
+    class CountingExchange(_FakeExchange):
+        def fetch_open_orders(self, symbol=None):
+            events.append(("fetch_open_orders", symbol))
+            return super().fetch_open_orders(symbol)
+
+        def create_order(self, symbol, order_type, side, amount, price=None, params=None):
+            events.append(("create_order", order_type))
+            return super().create_order(symbol, order_type, side, amount, price, params)
+
+    pos = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": "2",
+        "entryPrice": "100",
+    }
+    engine = _protection_engine([], positions=[pos])
+    engine.exchange = CountingExchange([], positions=[pos])
+
+    async def unexpected_position_fetch(*_args, **_kwargs):
+        raise AssertionError("verified position hint should avoid another position fetch")
+
+    engine.get_server_position = unexpected_position_fetch
+
+    asyncio.run(
+        engine._place_tp_sl_orders(
+            "BTC/USDT",
+            "long",
+            100,
+            "2",
+            tp_distance=15,
+            sl_distance=10,
+            tp_qty_ratio=0.5,
+            position_hint=pos,
+        )
+    )
+
+    first_create = next(index for index, event in enumerate(events) if event[0] == "create_order")
+    lookups_before_stop = [event for event in events[:first_create] if event[0] == "fetch_open_orders"]
+    assert lookups_before_stop == [
+        ("fetch_open_orders", "BTC/USDT"),
+        ("fetch_open_orders", None),
+    ]
+
+
+def test_binance_protection_snapshot_uses_symbol_scope_without_global_fallback():
+    class CountingBinanceExchange(_BinanceAlgoExchange):
+        def __init__(self):
+            super().__init__([], algo_orders=[])
+            self.regular_fetches = []
+            self.algo_fetches = 0
+
+        def fetch_open_orders(self, symbol=None):
+            self.regular_fetches.append(symbol)
+            return super().fetch_open_orders(symbol)
+
+        def fapiPrivateGetOpenAlgoOrders(self, params=None):
+            self.algo_fetches += 1
+            return super().fapiPrivateGetOpenAlgoOrders(params)
+
+    engine = _protection_engine([])
+    engine.exchange = CountingBinanceExchange()
+
+    fetch_ok, orders = asyncio.run(
+        engine._collect_protection_orders_checked("BTC/USDT:USDT")
+    )
+
+    assert fetch_ok is True
+    assert orders == []
+    assert engine.exchange.regular_fetches == ["BTC/USDT:USDT"]
+    assert engine.exchange.algo_fetches == 1
+
+
+def test_entry_notice_is_sent_only_after_protection_submission():
+    import inspect
+
+    source = inspect.getsource(_signal_engine_cls().entry)
+    notice_build = source.index("entry_notice = self._build_signal_entry_notice")
+    protection_submit = source.index("await self._place_tp_sl_orders", notice_build)
+    notice_send = source.index("await self.ctrl.notify(entry_notice)", protection_submit)
+
+    assert notice_build < protection_submit < notice_send
+
+
 def test_place_tp_sl_orders_can_place_utbreakout_split_tp_ladder():
     emas = _emas_module()
     pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": "2", "entryPrice": "100"}

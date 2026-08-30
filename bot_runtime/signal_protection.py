@@ -460,6 +460,7 @@ class SignalProtectionMixin:
         seen = set()
         regular_fetch_ok = False
         errors = []
+        is_binance = str(getattr(self.exchange, 'id', '') or '').lower() in {'binance', 'binanceusdm'}
         for scope in (symbol, None):
             open_orders = await self._fetch_open_orders_safe(scope)
             if open_orders is None:
@@ -479,10 +480,12 @@ class SignalProtectionMixin:
                     continue
                 seen.add(key)
                 merged.append(order)
-            if open_orders or scope is None:
+            # Binance's symbol-scoped regular-order endpoint is authoritative.
+            # Conditional/algo orders are queried separately below, so an empty
+            # result does not require the expensive all-symbol fallback.
+            if open_orders or scope is None or (is_binance and scope is not None):
                 break
 
-        is_binance = str(getattr(self.exchange, 'id', '') or '').lower() in {'binance', 'binanceusdm'}
         algo_fetch_ok = not is_binance
         if is_binance:
             algo_snapshot = await BinanceAlgoOrderGateway(self.exchange).fetch_open_orders()
@@ -1867,7 +1870,8 @@ class SignalProtectionMixin:
         params,
         label,
         max_attempts=3,
-        retry_delay_sec=0.7
+        retry_delay_sec=0.7,
+        skip_initial_recovery=False,
     ):
         last_error = None
         total_attempts = max(1, int(max_attempts or 1))
@@ -1952,7 +1956,14 @@ class SignalProtectionMixin:
             return None
 
         for attempt in range(1, total_attempts + 1):
-            existing = await _recover_existing_protection_order()
+            # A pre-entry complete empty snapshot plus a new unique client ID
+            # proves the first submission cannot be a duplicate.  Submit the SL
+            # immediately; retain exchange reconciliation on every retry/error.
+            existing = (
+                None
+                if skip_initial_recovery and attempt == 1
+                else await _recover_existing_protection_order()
+            )
             if existing is not None:
                 logger.info(
                     "%s protection order recovered before submit: %s clientOrderId=%s",

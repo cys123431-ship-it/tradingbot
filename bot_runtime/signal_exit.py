@@ -2215,6 +2215,7 @@ class SignalExitMixin:
         tp_targets=None,
         preserve_runner_qty=False,
         sl_price_override=None,
+        position_hint=None,
     ):
         """Place reduce-only TP/SL protection orders for the current futures position."""
         try:
@@ -2253,7 +2254,21 @@ class SignalExitMixin:
                     )
                 return
 
-            pos = await self.get_server_position(symbol, use_cache=False)
+            # A newly filled entry has already been confirmed and liquidation-
+            # checked by the entry path.  Reuse that exact exchange snapshot so
+            # the stop can be submitted without another position API round trip.
+            # Other callers keep the fresh-fetch behaviour by omitting the hint.
+            if isinstance(position_hint, dict):
+                hinted_side = str(position_hint.get('side') or '').lower()
+                hinted_qty = abs(float(
+                    self._position_signed_contracts(position_hint)
+                    or position_hint.get('contracts', 0)
+                    or 0
+                ))
+                if hinted_side == side and hinted_qty > 0:
+                    pos = position_hint
+            if pos is None:
+                pos = await self.get_server_position(symbol, use_cache=False)
             if pos and str(pos.get('side', '')).lower() == side:
                 pos_contracts = abs(float(pos.get('contracts', 0) or 0))
                 if pos_contracts > 0:
@@ -2274,15 +2289,29 @@ class SignalExitMixin:
                         emergency_close=emergency_close_on_sl_fail,
                     )
                 return
-            await self._cancel_protection_orders(symbol, reason='before new protection placement')
-            await asyncio.sleep(0.25)
-            remaining_before_place = await self._collect_protection_orders(symbol)
-            if remaining_before_place:
+            protection_snapshot_clean = False
+            existing_before_place = await self._collect_protection_orders(symbol)
+            if existing_before_place:
                 await self._cancel_protection_orders(
                     symbol,
-                    reason='stale protection still open before placement',
-                    orders=remaining_before_place
+                    reason='before new protection placement',
+                    orders=existing_before_place,
                 )
+                # Recheck only when something was actually cancelled.  A complete
+                # empty snapshot is already authoritative; querying both regular
+                # and Binance algo order APIs a second time delayed the first SL.
+                await asyncio.sleep(0.25)
+                remaining_before_place = await self._collect_protection_orders(symbol)
+                if remaining_before_place:
+                    await self._cancel_protection_orders(
+                        symbol,
+                        reason='stale protection still open before placement',
+                        orders=remaining_before_place
+                    )
+                else:
+                    protection_snapshot_clean = True
+            else:
+                protection_snapshot_clean = True
 
             if side == 'long':
                 tp_side = 'sell'
@@ -2539,7 +2568,8 @@ class SignalExitMixin:
                             },
                             'SL',
                             max_attempts=sl_max_attempts,
-                            retry_delay_sec=sl_retry_delay
+                            retry_delay_sec=sl_retry_delay,
+                            skip_initial_recovery=protection_snapshot_clean,
                         )
                         logger.info(f"SL order placed: {sl_side.upper()} @ {sl_price} (stop)")
                     except Exception as sl_e:
@@ -2628,7 +2658,8 @@ class SignalExitMixin:
                         order_price,
                         order_params,
                         target_label,
-                        max_attempts=2
+                        max_attempts=2,
+                        skip_initial_recovery=protection_snapshot_clean,
                     )
                     order_id = self._protection_order_id(tp_order)
                     client_order_id = self._protection_client_order_id(tp_order)
