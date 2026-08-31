@@ -336,6 +336,137 @@ def resolve_small_account_full_margin(
     }
 
 
+def _small_account_stability_risk_overlay(
+    plan: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return one bounded risk scale for a future small-account entry.
+
+    The 13-timeframe router remains the entry authority. This overlay does
+    not add an AND gate or move the stop; it only scales the final campaign
+    quantity when the accepted trend is transitional/mixed or volatility has
+    jumped relative to its recent baseline.
+    """
+
+    source = dict(plan or {})
+    enabled_raw = source.get("small_account_stability_risk_enabled", True)
+    enabled = (
+        enabled_raw
+        if isinstance(enabled_raw, bool)
+        else str(enabled_raw).strip().lower()
+        in {"1", "true", "yes", "on", "enabled"}
+    )
+    floor_scale = _bounded(
+        source.get("small_account_stability_risk_floor"),
+        0.50,
+        1.00,
+        0.80,
+    )
+    result: dict[str, Any] = {
+        "profile": "small_account_stability_risk_v1",
+        "enabled": enabled,
+        "scale": 1.0,
+        "floor": floor_scale,
+        "multi_timeframe_scale": 1.0,
+        "volatility_scale": 1.0,
+        "reason": (
+            "stability risk overlay disabled"
+            if not enabled
+            else "no stability reduction"
+        ),
+    }
+    if not enabled:
+        return result
+
+    mtf = source.get("adaptive_regime_multitimeframe")
+    if not isinstance(mtf, Mapping):
+        mtf = {}
+    metrics = source.get("adaptive_breakout_trend_metrics")
+    if not isinstance(metrics, Mapping):
+        metrics = {}
+
+    side = str(source.get("side") or "").strip().lower()
+    mtf_available = bool(mtf.get("available"))
+    mtf_direction = str(mtf.get("direction") or "unknown").strip().lower()
+    agreement = _bounded(mtf.get("multi_speed_agreement"), 0.0, 1.0, 0.0)
+    persistence = _bounded(mtf.get("persistence_score"), 0.0, 1.0, 0.0)
+    opposing = _bounded(mtf.get("opposing_weight_ratio"), 0.0, 1.0, 0.0)
+
+    mtf_scale = 1.0
+    if mtf_available:
+        if side in {"long", "short"} and mtf_direction not in {side, "unknown"}:
+            mtf_scale = floor_scale
+        else:
+            # Full-size levels match the existing evidence router's
+            # persistent multi-speed criteria. Intermediate values are
+            # interpolated instead of becoming another entry veto.
+            agreement_scale = floor_scale + (1.0 - floor_scale) * _bounded(
+                (agreement - 0.45) / 0.20,
+                0.0,
+                1.0,
+                0.0,
+            )
+            persistence_scale = floor_scale + (1.0 - floor_scale) * _bounded(
+                (persistence - 0.30) / 0.30,
+                0.0,
+                1.0,
+                0.0,
+            )
+            opposing_scale = 1.0 - (1.0 - floor_scale) * _bounded(
+                (opposing - 0.20) / 0.18,
+                0.0,
+                1.0,
+                0.0,
+            )
+            mtf_scale = min(
+                agreement_scale,
+                persistence_scale,
+                opposing_scale,
+            )
+
+    volatility_ratio = _finite(metrics.get("volatility_ratio"))
+    volatility_scale = 1.0
+    if volatility_ratio is not None and volatility_ratio > 1.25:
+        shock_progress = _bounded(
+            (volatility_ratio - 1.25) / (3.00 - 1.25),
+            0.0,
+            1.0,
+            0.0,
+        )
+        volatility_scale = 1.0 - (1.0 - floor_scale) * shock_progress
+
+    scale = _bounded(
+        min(mtf_scale, volatility_scale),
+        floor_scale,
+        1.0,
+        1.0,
+    )
+    reasons: list[str] = []
+    if mtf_available and mtf_scale < 1.0 - 1e-9:
+        reasons.append(
+            f"MTF agreement={agreement:.2f} persistence={persistence:.2f} "
+            f"opposing={opposing:.2f}"
+        )
+    if volatility_scale < 1.0 - 1e-9:
+        reasons.append(f"volatility ratio={float(volatility_ratio):.2f}")
+    result.update({
+        "scale": round(scale, 6),
+        "multi_timeframe_scale": round(mtf_scale, 6),
+        "volatility_scale": round(volatility_scale, 6),
+        "multi_timeframe_available": mtf_available,
+        "multi_timeframe_direction": mtf_direction,
+        "multi_speed_agreement": agreement if mtf_available else None,
+        "persistence_score": persistence if mtf_available else None,
+        "opposing_weight_ratio": opposing if mtf_available else None,
+        "volatility_ratio": volatility_ratio,
+        "reason": (
+            "; ".join(reasons)
+            if reasons
+            else "stable trend evidence; full risk retained"
+        ),
+    })
+    return result
+
+
 def resolve_adaptive_trend_small_account_profile(
     plan: Mapping[str, Any] | None = None,
     config: Mapping[str, Any] | None = None,
@@ -406,6 +537,12 @@ def resolve_adaptive_trend_small_account_profile(
         0.0,
         50.0,
         {"base": 8.0, "strong": 12.0, "elite": 16.0}[risk_tier],
+    )
+    stability_overlay = _small_account_stability_risk_overlay(source)
+    stability_scale = float(stability_overlay["scale"])
+    stability_margin_budget = margin_budget * stability_scale
+    initial_margin_capacity = (
+        stability_margin_budget * initial_margin_fraction
     )
     # Retain the legacy config field for backward-compatible config loading,
     # but it is deliberately disabled for this dedicated profile.
@@ -510,20 +647,21 @@ def resolve_adaptive_trend_small_account_profile(
         _finite(source.get("small_account_aggressive_daily_pnl_usdt"), 0.0)
     )
     max_loss_usdt = equity * max_loss_percent / 100.0
+    stability_max_loss_usdt = max_loss_usdt * stability_scale
     daily_loss_limit_usdt = 0.0
     remaining_daily_loss_usdt = 0.0
 
     selected = None
     selected_payload: dict[str, float] = {}
     for candidate in candidates:
-        full_margin_notional = margin_budget * float(candidate)
+        full_margin_notional = stability_margin_budget * float(candidate)
         loss_rate = (float(stop_percent) + cost_buffer_percent) / 100.0
         if loss_rate <= 0.0:
             continue
         # Stop distance controls quantity.  A wider ATR/structure stop keeps
         # its market-valid price but receives proportionally fewer contracts;
         # a tighter stop may use more of the 95% campaign margin budget.
-        risk_capped_notional = max_loss_usdt / loss_rate
+        risk_capped_notional = stability_max_loss_usdt / loss_rate
         full_target_notional = min(full_margin_notional, risk_capped_notional)
         initial_notional = full_target_notional * initial_margin_fraction
         initial_margin = initial_notional / float(candidate)
@@ -533,7 +671,8 @@ def resolve_adaptive_trend_small_account_profile(
         full_target_projected_loss_usdt = full_target_notional * loss_rate
         if (
             full_target_notional > 0.0
-            and full_target_projected_loss_usdt <= max_loss_usdt + 1e-9
+            and full_target_projected_loss_usdt
+            <= stability_max_loss_usdt + 1e-9
         ):
             selected = candidate
             selected_payload = {
@@ -558,6 +697,7 @@ def resolve_adaptive_trend_small_account_profile(
         "initial_margin_fraction": initial_margin_fraction,
         "capital_basis_usdt": capital_basis,
         "margin_budget_usdt": margin_budget,
+        "stability_margin_budget_usdt": stability_margin_budget,
         "initial_margin_capacity_usdt": initial_margin_capacity,
         "minimum_leverage": minimum_leverage,
         "desired_leverage": desired_by_tier[risk_tier],
@@ -567,6 +707,14 @@ def resolve_adaptive_trend_small_account_profile(
         "cost_buffer_percent": cost_buffer_percent,
         "max_loss_percent": max_loss_percent,
         "max_loss_usdt": max_loss_usdt,
+        "stability_risk_profile": stability_overlay["profile"],
+        "stability_risk_scale": stability_scale,
+        "stability_risk_reason": stability_overlay["reason"],
+        "stability_risk_components": stability_overlay,
+        "stability_effective_max_loss_percent": (
+            max_loss_percent * stability_scale
+        ),
+        "stability_effective_max_loss_usdt": stability_max_loss_usdt,
         "daily_loss_limit_percent": daily_limit_percent,
         "daily_loss_limit_usdt": daily_loss_limit_usdt,
         "daily_pnl_usdt": daily_pnl,
@@ -607,6 +755,7 @@ def resolve_adaptive_trend_small_account_profile(
             f"small-account aggressive {risk_tier}: {int(selected)}x, "
             f"margin={selected_payload['initial_margin']:.2f}/{margin_budget:.2f}, "
             f"stop={float(stop_percent):.2f}%, "
+            f"stabilityRisk=x{stability_scale:.2f}, "
             f"projectedLoss={selected_payload['projected_loss_usdt']:.2f} "
             f"({selected_payload['projected_loss_usdt'] / equity * 100.0:.2f}%)"
         ),
@@ -1261,6 +1410,28 @@ def apply_dynamic_leverage_to_plan(
             ),
             "small_account_aggressive_max_loss_usdt": float(
                 aggressive_trend_policy.get("max_loss_usdt", 0.0)
+            ),
+            "small_account_stability_risk_profile": (
+                aggressive_trend_policy.get("stability_risk_profile")
+            ),
+            "small_account_stability_risk_scale": float(
+                aggressive_trend_policy.get("stability_risk_scale", 1.0)
+            ),
+            "small_account_stability_risk_reason": (
+                aggressive_trend_policy.get("stability_risk_reason")
+            ),
+            "small_account_stability_risk_components": dict(
+                aggressive_trend_policy.get("stability_risk_components") or {}
+            ),
+            "small_account_stability_effective_max_loss_percent": float(
+                aggressive_trend_policy.get(
+                    "stability_effective_max_loss_percent", 0.0
+                )
+            ),
+            "small_account_stability_effective_max_loss_usdt": float(
+                aggressive_trend_policy.get(
+                    "stability_effective_max_loss_usdt", 0.0
+                )
             ),
             "small_account_aggressive_daily_loss_limit_percent": float(
                 aggressive_trend_policy.get("daily_loss_limit_percent", 0.0)

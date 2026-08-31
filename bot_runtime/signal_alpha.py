@@ -2450,6 +2450,12 @@ class SignalAlphaMixin:
             'small_account_elite_max_loss_percent': float(
                 trend_cfg.get('small_account_elite_max_loss_percent', 16.0) or 16.0
             ),
+            'small_account_stability_risk_enabled': bool(
+                trend_cfg.get('small_account_stability_risk_enabled', True)
+            ),
+            'small_account_stability_risk_floor': float(
+                trend_cfg.get('small_account_stability_risk_floor', 0.80) or 0.80
+            ),
             'small_account_daily_loss_limit_percent': 0.0,
             'small_account_cost_buffer_percent': float(
                 trend_cfg.get('small_account_cost_buffer_percent', 0.20) or 0.20

@@ -27,7 +27,7 @@ from .small_account_regime import (
 
 
 ADAPTIVE_BREAKOUT_TREND_STRATEGY = "adaptive_breakout_trend_v1"
-ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v15_small_account_long_only"
+ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v16_stability_risk"
 
 
 def default_adaptive_breakout_trend_config() -> dict[str, Any]:
@@ -131,6 +131,12 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         "small_account_base_max_loss_percent": 8.0,
         "small_account_strong_max_loss_percent": 12.0,
         "small_account_elite_max_loss_percent": 16.0,
+        # Keep the operator-selected 8/12/16% campaign ceilings. For a new
+        # position only, unstable multi-timeframe evidence or a volatility
+        # shock may scale both available margin and the loss budget down once.
+        # This changes quantity, never the ATR/structure stop price.
+        "small_account_stability_risk_enabled": True,
+        "small_account_stability_risk_floor": 0.80,
         "small_account_daily_loss_limit_percent": 0.0,
         "small_account_cost_buffer_percent": 0.20,
         "small_account_liquidation_stop_buffer_multiple": 1.50,
@@ -258,6 +264,7 @@ def normalize_adaptive_breakout_trend_config(
                 "adaptive_trend_portfolio_v12_",
                 "adaptive_trend_portfolio_v13_",
                 "adaptive_trend_portfolio_v14_",
+                "adaptive_trend_portfolio_v15_",
             )
         )
     ):
@@ -304,6 +311,8 @@ def normalize_adaptive_breakout_trend_config(
             "small_account_base_max_loss_percent",
             "small_account_strong_max_loss_percent",
             "small_account_elite_max_loss_percent",
+            "small_account_stability_risk_enabled",
+            "small_account_stability_risk_floor",
             "small_account_daily_loss_limit_percent",
             "small_account_cost_buffer_percent",
             "small_account_liquidation_stop_buffer_multiple",

@@ -627,6 +627,93 @@ def test_adaptive_trend_small_account_notional_is_inverse_to_stop_distance():
     assert wide["adaptive_trend_target_notional"] * 0.062 == pytest.approx(8.0)
 
 
+def test_small_account_stability_overlay_reduces_quantity_without_moving_stop():
+    common = dict(
+        strategy="adaptive_breakout_trend_v1",
+        adaptive_breakout_trend_score=70.0,
+        adaptive_trend_risk_tier="base",
+        risk_distance=2.0,
+        risk_distance_pct=2.0,
+        stop_loss=98.0,
+        adaptive_regime_multitimeframe={
+            "available": True,
+            "direction": "long",
+            "multi_speed_agreement": 0.45,
+            "persistence_score": 0.30,
+            "opposing_weight_ratio": 0.38,
+        },
+        adaptive_breakout_trend_metrics={
+            "risk_tier": "base",
+            "volatility_ratio": 3.0,
+        },
+    )
+    reduced = apply_dynamic_leverage_to_plan(
+        _plan(**common),
+        free_balance=100.0,
+        account_equity=100.0,
+    )
+    baseline = apply_dynamic_leverage_to_plan(
+        _plan(
+            **{
+                **common,
+                "adaptive_regime_multitimeframe": {
+                    "available": True,
+                    "direction": "long",
+                    "multi_speed_agreement": 0.80,
+                    "persistence_score": 0.75,
+                    "opposing_weight_ratio": 0.05,
+                },
+                "adaptive_breakout_trend_metrics": {
+                    "risk_tier": "base",
+                    "volatility_ratio": 1.0,
+                },
+            }
+        ),
+        free_balance=100.0,
+        account_equity=100.0,
+    )
+
+    assert reduced["small_account_aggressive_max_loss_percent"] == pytest.approx(8.0)
+    assert reduced["small_account_stability_risk_scale"] == pytest.approx(0.80)
+    assert reduced["small_account_stability_effective_max_loss_percent"] == pytest.approx(6.4)
+    assert reduced["adaptive_trend_target_notional"] == pytest.approx(
+        baseline["adaptive_trend_target_notional"] * 0.80
+    )
+    assert reduced["qty"] == pytest.approx(baseline["qty"] * 0.80)
+    assert reduced["stop_loss"] == pytest.approx(98.0)
+    assert baseline["small_account_stability_risk_scale"] == pytest.approx(1.0)
+
+
+def test_small_account_stability_overlay_interpolates_volatility_only_once():
+    updated = apply_dynamic_leverage_to_plan(
+        _plan(
+            strategy="adaptive_breakout_trend_v1",
+            adaptive_breakout_trend_score=82.0,
+            adaptive_trend_risk_tier="strong",
+            risk_distance=3.5,
+            risk_distance_pct=3.5,
+            adaptive_regime_multitimeframe={
+                "available": True,
+                "direction": "long",
+                "multi_speed_agreement": 0.80,
+                "persistence_score": 0.75,
+                "opposing_weight_ratio": 0.05,
+            },
+            adaptive_breakout_trend_metrics={
+                "risk_tier": "strong",
+                "volatility_ratio": 2.125,
+            },
+        ),
+        free_balance=100.0,
+        account_equity=100.0,
+    )
+
+    assert updated["small_account_aggressive_max_loss_percent"] == pytest.approx(12.0)
+    assert updated["small_account_stability_risk_scale"] == pytest.approx(0.90)
+    assert updated["small_account_stability_effective_max_loss_percent"] == pytest.approx(10.8)
+    assert updated["small_account_aggressive_full_target_loss_percent"] <= 10.8 + 1e-9
+
+
 def test_adaptive_trend_small_account_ignores_daily_loss_for_new_risk():
     updated = apply_dynamic_leverage_to_plan(
         _plan(
