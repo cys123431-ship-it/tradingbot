@@ -15,6 +15,7 @@ from utbreakout.small_account_regime import (
     evaluate_regime_challenger_promotion,
     normalize_small_account_regime_config,
 )
+from utbreakout.small_account.state import apply_protection_state_contract
 
 
 _KST = ZoneInfo('Asia/Seoul')
@@ -1058,6 +1059,11 @@ class SignalPositionLifecycleMixin:
                 'multi_timeframe_direction_score'
             ),
         }
+        apply_protection_state_contract(
+            state,
+            existing_state=existing_state,
+            stop_price=state.get('last_stop_price'),
+        )
         return self._set_utbreakout_trailing_state(symbol, state)
 
     def _utbreakout_entry_record_for_symbol(self, symbol, *, include_historic=False):

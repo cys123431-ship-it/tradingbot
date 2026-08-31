@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from trading_safety.protection_coordinator import (
+    manage_open_position_protection,
+)
+
 
 class SignalCandleMixin:
     async def check_status(self, symbol, price):
@@ -1716,35 +1720,22 @@ class SignalCandleMixin:
             for column in ['open', 'high', 'low', 'close', 'volume']:
                 df[column] = pd.to_numeric(df[column], errors='coerce')
 
-            trailing_state = self._get_utbreakout_trailing_state(symbol)
-            advanced_ladder = bool(
-                isinstance(trailing_state, dict)
-                and trailing_state.get('advanced_live_ladder_state')
-            )
-            if not advanced_ladder:
-                await self._manage_utbreakout_partial_trailing(
-                    symbol,
-                    pos,
-                    df,
-                    filtered_cfg,
-                )
-            pyramid_status = await self._maybe_apply_aggressive_growth_pyramiding(
+            management = await manage_open_position_protection(
+                self,
                 symbol,
                 pos,
                 df,
                 filtered_cfg,
             )
-            if isinstance(pyramid_status, dict) and pyramid_status.get('status') == 'ADDED':
-                refreshed_ok, refreshed_pos = await self._fetch_server_position_checked(symbol)
-                if refreshed_ok and refreshed_pos:
-                    pos = refreshed_pos
-            if advanced_ladder:
-                await self._manage_live_ladder_exit_policy(
-                    symbol,
-                    pos,
-                    df,
-                    filtered_cfg,
+            if management.get('terminal'):
+                self.last_entry_reason[symbol] = (
+                    f"Position protection lifecycle: {management.get('status')}"
                 )
+                self._clear_utbot_filtered_breakout_entry_plan(symbol)
+                self.last_candle_time[symbol] = k.get('t')
+                self.last_candle_success[symbol] = True
+                return True
+            pos = management.get('position') or pos
             self.last_entry_reason[symbol] = (
                 f"Position open ({str(pos.get('side') or '').upper()}), entry scan skipped"
             )
@@ -2184,22 +2175,25 @@ class SignalCandleMixin:
             elif active_strategy in UTBREAKOUT_STRATEGIES:
                 filtered_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
                 if pos:
-                    trailing_state = self._get_utbreakout_trailing_state(symbol)
-                    advanced_ladder = bool(
-                        isinstance(trailing_state, dict)
-                        and trailing_state.get('advanced_live_ladder_state')
+                    management = await manage_open_position_protection(
+                        self,
+                        symbol,
+                        pos,
+                        df,
+                        filtered_cfg,
                     )
-                    if not advanced_ladder:
-                        await self._manage_utbreakout_partial_trailing(symbol, pos, df, filtered_cfg)
-                    pyramid_status = await self._maybe_apply_aggressive_growth_pyramiding(symbol, pos, df, filtered_cfg)
-                    if isinstance(pyramid_status, dict) and pyramid_status.get('status') == 'ADDED':
-                        self.position_cache = None
-                        pos = await self.get_server_position(symbol, use_cache=False) or pos
-                    if advanced_ladder:
-                        await self._manage_live_ladder_exit_policy(symbol, pos, df, filtered_cfg)
-                    self.last_entry_reason[symbol] = (
-                        f"포지션 보유 중 ({pos['side'].upper()}), UTBOT_FILTERED_BREAKOUT_V1 신규 진입 대기"
-                    )
+                    managed_pos = management.get('position')
+                    if management.get('terminal'):
+                        self.last_entry_reason[symbol] = (
+                            "포지션 보호 처리 중: "
+                            f"{management.get('status')}"
+                        )
+                    else:
+                        pos = managed_pos or pos
+                        self.last_entry_reason[symbol] = (
+                            f"포지션 보유 중 ({pos['side'].upper()}), "
+                            "UTBOT_FILTERED_BREAKOUT_V1 신규 진입 대기"
+                        )
                     self._clear_utbot_filtered_breakout_entry_plan(symbol)
                 else:
                     flat_cleanup = await self._manage_live_ladder_exit_policy(

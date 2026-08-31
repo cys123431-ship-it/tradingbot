@@ -605,6 +605,89 @@ def test_binance_spawned_algo_stop_fill_is_classified_by_client_order_id():
     assert result["exit_legs"][0]["client_order_id"].startswith("utbslsl")
 
 
+def test_bot_emergency_protection_fill_is_not_reported_as_manual(tmp_path):
+    db = DBManager(str(tmp_path / "trades.db"))
+    store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+    symbol = "ZKP/USDT:USDT"
+    db.log_trade_entry(
+        symbol,
+        "long",
+        0.0567635953,
+        7240.0,
+        strategy="adaptive_breakout_trend_v1",
+    )
+    entry = db.get_latest_open_trade(symbol)
+    entry_ms = int(
+        datetime.fromisoformat(entry["entry_time"]).timestamp() * 1000
+    )
+    store.upsert(
+        OrderRecord(
+            client_order_id="zkp-entry",
+            exchange_order_id="entry-order",
+            symbol=symbol,
+            side="LONG",
+            strategy="adaptive_breakout_trend_v1",
+            signal_timestamp="1",
+            requested_qty=7240.0,
+            filled_qty=7240.0,
+            average_fill_price=0.0567635953,
+            order_state=OrderState.PROTECTED.value,
+            metadata={"entry_plan_summary": {"risk_distance": 0.002}},
+        )
+    )
+
+    class _Exchange:
+        def fetch_my_trades(self, *_args, **_kwargs):
+            return [{
+                "timestamp": entry_ms + 1_000,
+                "side": "sell",
+                "amount": 7240.0,
+                "price": 0.0568934,
+                "realizedPnl": 0.94,
+                "order": "969381522",
+                "info": {"positionSide": "LONG"},
+            }]
+
+        def fetch_order(self, order_id, requested_symbol):
+            assert order_id == "969381522"
+            assert requested_symbol == symbol
+            return {
+                "id": order_id,
+                "clientOrderId": "emerg-zkpusdt-l-close-d8a84de4b2a1",
+                "reduceOnly": True,
+            }
+
+    engine = SimpleNamespace(
+        db=db,
+        exchange=_Exchange(),
+        trading_state_store=store,
+    )
+    engine._utbreakout_plan_symbol_keys = lambda value: [value]
+    engine._utbreakout_entry_record_for_symbol = (
+        lambda *_args, **_kwargs: store.get("zkp-entry")
+    )
+
+    try:
+        result = asyncio.run(record_closed_trade_accounting(
+            engine,
+            symbol,
+            "scanner position completed",
+            state={"_require_exchange_fills": True, "last_stop_price": 0.05746},
+            persist_live_trade=lambda trade, target: target.upsert_trade_result(trade),
+        ))
+        row = db.conn.execute(
+            "SELECT exit_reason FROM trades WHERE symbol=?",
+            (symbol,),
+        ).fetchone()
+
+        assert result["status"] == "RECORDED"
+        assert result["exit_legs"][0]["label"] == "EMERGENCY_PROTECTION"
+        assert row[0] == "automatic emergency protection close"
+    finally:
+        store.close()
+        db.conn.close()
+
+
 def test_incomplete_snapshot_never_closes_local_trade_accounting():
     class _Engine(SignalRuntimeMixin):
         db = object()

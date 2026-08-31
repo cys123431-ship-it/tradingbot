@@ -6,6 +6,7 @@ import math
 
 from utbreakout.adaptive_breakout_trend import small_account_short_entry_blocked
 from utbreakout.convex_rotation import evaluate_convex_rotation_exit
+from utbreakout.small_account.strategy import small_account_profit_lock_enabled
 
 
 def _mark_aware_excursion_bounds(
@@ -700,10 +701,7 @@ class SignalExitMixin:
         tp1_breakeven_enabled = bool(state.get('tp1_breakeven_enabled', cfg.get('tp1_breakeven_enabled', False)))
         soft_stop_enabled = bool(state.get('soft_stop_enabled', cfg.get('soft_stop_enabled', False)))
         near_miss_tp_enabled = bool(state.get('near_miss_tp_enabled', cfg.get('near_miss_tp_enabled', False)))
-        small_account_roe_lock_enabled = bool(
-            state.get('small_account_aggressive_active', False)
-            and state.get('small_account_roe_profit_lock_enabled', False)
-        )
+        small_account_roe_lock_enabled = small_account_profit_lock_enabled(state)
         if not atr_trailing_enabled and not tp1_breakeven_enabled and not soft_stop_enabled and not near_miss_tp_enabled and not small_account_roe_lock_enabled:
             return None
         side = str(pos.get('side', '') or '').lower()

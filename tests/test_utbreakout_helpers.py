@@ -6403,6 +6403,68 @@ def test_missing_take_profit_audit_warns_without_force_closing_or_locking(tmp_pa
     assert "lockout" not in reason.lower()
 
 
+@pytest.mark.parametrize(
+    ("mark_price", "expected_status", "trigger_pending"),
+    (
+        (0.05800, "OK", False),
+        (0.05740, "MANAGED_STOP_TRIGGER_PENDING", True),
+    ),
+)
+def test_protection_audit_preserves_managed_winner_stop_after_state_rebuild(
+    mark_price,
+    expected_status,
+    trigger_pending,
+):
+    pos = {
+        "symbol": "ZKP/USDT:USDT",
+        "side": "long",
+        "contracts": "7240",
+        "entryPrice": "0.0567635953",
+        "markPrice": str(mark_price),
+    }
+    winner_stop = {
+        "id": "4000001868265017",
+        "side": "sell",
+        "type": "stop_market",
+        "amount": "7240",
+        "clientOrderId": "utbslZKPUSDTwinner",
+        "reduceOnly": True,
+        "info": {
+            "symbol": "ZKPUSDT",
+            "origType": "STOP_MARKET",
+            "stopPrice": "0.05746",
+            "reduceOnly": "true",
+        },
+    }
+    engine = _protection_engine([winner_stop], positions=[pos])
+    state = {
+        "side": "long",
+        "entry_price": 0.0567635953,
+        "initial_qty": 7240.0,
+        "last_stop_price": 0.05746,
+        "managed_position": True,
+        # A post-pyramid rebuild resets trailing activation.  Protection
+        # ownership must remain independent of this flag.
+        "active": False,
+    }
+    engine.utbreakout_trailing_states = {"ZKP/USDT:USDT": state}
+
+    status = asyncio.run(
+        engine._audit_protection_orders(
+            "ZKP/USDT:USDT",
+            pos=pos,
+            expected_tp=False,
+            expected_sl=True,
+            alert=False,
+        )
+    )
+
+    assert status["status"] == expected_status
+    assert status["sl_present"] is True
+    assert status["managed_stop_trigger_pending"] is trigger_pending
+    assert engine.exchange.cancelled == []
+
+
 def test_protection_audit_refreshes_stale_position_after_tp1_fill():
     stale_pos = {
         "symbol": "BTC/USDT:USDT",

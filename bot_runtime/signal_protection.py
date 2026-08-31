@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from utbreakout.small_account.risk import (
+    classify_stop_geometry,
+    position_mark_price,
+)
+from utbreakout.small_account.state import is_managed_position_state
+
 
 class SignalProtectionMixin:
     def _protection_order_info(self, order):
@@ -1305,6 +1311,8 @@ class SignalProtectionMixin:
             'mismatch_cancelled': 0,
             'duplicate_cancelled': 0,
             'invalid_price_cancelled': 0,
+            'managed_stop_trigger_pending': False,
+            'managed_stop_trigger_prices': [],
             'liquidation_safety': 'UNKNOWN',
             'liquidation_safety_reason': None,
             'liquidation_price': None,
@@ -1376,11 +1384,11 @@ class SignalProtectionMixin:
         if external_position:
             expected_tp = False
             status['tp_expected'] = False
-        managed_sl_active = (
-            isinstance(runner_state, dict)
-            and bool(runner_state.get('active'))
-            and str(runner_state.get('side', '')).lower() == pos_side
+        managed_position_state = is_managed_position_state(
+            runner_state,
+            side=pos_side,
         )
+        current_mark_price = position_mark_price(pos)
         if planned_tp_orders is None:
             planned_tp_orders = self._planned_tp_orders_from_state(symbol, runner_state)
         planned_tp_orders = list(planned_tp_orders or [])
@@ -1501,11 +1509,27 @@ class SignalProtectionMixin:
                                 else 'SAFE'
                             )
                             status['liquidation_safety_reason'] = liquidation_result.reason
-                    invalid_sl = False if managed_sl_active else (
-                        (pos_side == 'long' and float(order_price) >= pos_entry_price)
-                        or (pos_side == 'short' and float(order_price) <= pos_entry_price)
+                    bot_managed_stop = bool(
+                        managed_position_state
+                        and self._is_bot_managed_protection_order(order)
                     )
-                    if invalid_sl:
+                    stop_geometry = classify_stop_geometry(
+                        side=pos_side,
+                        stop_price=order_price,
+                        entry_price=pos_entry_price,
+                        mark_price=current_mark_price,
+                        bot_managed=bot_managed_stop,
+                    )
+                    if stop_geometry.crossed_live_mark:
+                        # Never cancel an accepted managed stop at the exact
+                        # moment its trigger is being crossed.  Binance may be
+                        # transitioning the Algo order to its execution order;
+                        # cancellation here creates a naked position window.
+                        status['managed_stop_trigger_pending'] = True
+                        status['managed_stop_trigger_prices'].append(
+                            float(order_price)
+                        )
+                    if not stop_geometry.valid:
                         invalid_price_orders.append(order)
                         continue
                 elif kind == 'tp':
@@ -1601,6 +1625,20 @@ class SignalProtectionMixin:
         status['actual_tp_count'] = len(valid_tp)
         status['tp_present'] = len(valid_tp) > 0
         status['sl_present'] = len(valid_sl) > 0
+        if status['managed_stop_trigger_pending'] and isinstance(runner_state, dict):
+            runner_state['protection_status'] = 'TRIGGER_PENDING'
+            runner_state['managed_stop_trigger_prices'] = list(
+                status['managed_stop_trigger_prices']
+            )
+            self._set_utbreakout_trailing_state(symbol, runner_state)
+        elif (
+            status['sl_present']
+            and isinstance(runner_state, dict)
+            and managed_position_state
+        ):
+            runner_state['protection_status'] = 'PROTECTED'
+            runner_state.pop('managed_stop_trigger_prices', None)
+            self._set_utbreakout_trailing_state(symbol, runner_state)
         status['tp_orders'] = [
             {
                 'tp_label': self._protection_tp_label(order, planned_tp_orders),
@@ -1780,6 +1818,8 @@ class SignalProtectionMixin:
                 f"⚠️ {self.ctrl.format_symbol_for_display(symbol)} 보호주문 누락 확인: "
                 "TP 없음. 같은 포지션에서 2회 연속 확인됨."
             )
+        elif status['managed_stop_trigger_pending']:
+            status['status'] = 'MANAGED_STOP_TRIGGER_PENDING'
         elif status['mismatch_cancelled']:
             status['status'] = 'MISMATCH_CANCELLED'
         elif status['invalid_price_cancelled']:

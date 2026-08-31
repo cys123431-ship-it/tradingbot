@@ -140,6 +140,8 @@ async def resolve_closed_trade_accounting(
                         if label in compact:
                             return label.upper()
                     return "TP"
+                if compact.startswith("emerg") and "close" in compact:
+                    return "EMERGENCY_PROTECTION"
                 return None
 
             def _fill_label(order_id, fill_price, client_order_id=None):
@@ -204,7 +206,7 @@ async def resolve_closed_trade_accounting(
 
             def _exit_reference_price(label):
                 normalized = str(label or "").upper()
-                if normalized == "SL":
+                if normalized in {"SL", "EMERGENCY_PROTECTION"}:
                     return _number_or_none(
                         state_data.get("last_stop_price")
                         or state_data.get("hard_stop_price")
@@ -541,7 +543,13 @@ async def record_closed_trade_accounting(
             leg["label"] = "TIME_STOP"
         elif generic_flat_reason or scanner_flat_reason:
             leg["label"] = "EXTERNAL_EXIT"
-    if scanner_flat_reason and any(
+    emergency_protection_present = any(
+        str(leg.get("label") or "").upper() == "EMERGENCY_PROTECTION"
+        for leg in exit_legs
+    )
+    if emergency_protection_present:
+        close_reason = "automatic emergency protection close"
+    elif scanner_flat_reason and any(
         str(leg.get("label") or "").upper() == "EXTERNAL_EXIT"
         for leg in exit_legs
     ):
@@ -1061,6 +1069,8 @@ def rebuild_engine_performance_stats(
                 "external exit",
                 "emergencystop",
                 "emergency stop",
+                "emergency_protection",
+                "emergency protection",
             )
         )
 

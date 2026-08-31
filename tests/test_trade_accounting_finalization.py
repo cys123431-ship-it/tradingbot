@@ -222,6 +222,14 @@ def test_engine_stats_exclude_manual_external_and_emergency_closes():
                 close_reason="EmergencyStop",
                 provisional=False,
             ),
+            _trade(
+                trade_id="automatic-protection-emergency",
+                net_pnl_usdt=-10,
+                realized_r=-1.0,
+                close_reason="automatic emergency protection close",
+                exit_legs=[{"label": "EMERGENCY_PROTECTION"}],
+                provisional=False,
+            ),
         ]
     )["UTB"]
 
