@@ -226,6 +226,57 @@ class DBManager:
             res = cur.fetchone()
             return res[0] if res and res[0] else 0
 
+    def get_daily_automatic_symbol_entry(self, symbol, *, now=None):
+        """Return today's latest automatic entry for a symbol, if any.
+
+        The calendar boundary is Korea time and the comparison accepts the
+        Binance symbol spellings used by CCXT, exchange payloads, and legacy
+        database rows (for example ``BTCUSDT`` and ``BTC/USDT:USDT``).
+        User-custom entries are deliberately excluded.
+        """
+        normalized_symbol = (
+            str(symbol or "")
+            .strip()
+            .upper()
+            .replace(":USDT", "")
+            .replace("/", "")
+            .replace("-", "")
+        )
+        if not normalized_symbol:
+            return None
+
+        start, end = _kst_day_bounds_utc(now)
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """SELECT symbol, side, entry_time, strategy
+                FROM trades
+                WHERE julianday(entry_time) >= julianday(?)
+                  AND julianday(entry_time) < julianday(?)
+                  AND LOWER(COALESCE(strategy, '')) NOT IN ('user_custom', 'custom_entry')
+                  AND REPLACE(
+                        REPLACE(
+                            REPLACE(UPPER(symbol), ':USDT', ''),
+                            '/',
+                            ''
+                        ),
+                        '-',
+                        ''
+                      ) = ?
+                ORDER BY entry_time DESC, id DESC
+                LIMIT 1""",
+                (start.isoformat(), end.isoformat(), normalized_symbol),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "symbol": row[0],
+            "side": row[1],
+            "entry_time": row[2],
+            "strategy": row[3],
+        }
+
     def get_recent_closed_trade_pnls(
         self,
         limit=10,

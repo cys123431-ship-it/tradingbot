@@ -75,8 +75,13 @@ def explain_entry_reason_ko(reason=None, *, code=None, data=None):
         return "동일 신호의 중복 주문을 막기 위한 짧은 재시도 대기 중입니다."
     if "RECENT_LOSS_COOLDOWN" in uppered or "RECENT LOSS" in uppered:
         return "최근 손실 뒤 재진입 대기 시간이 남아 있어 진입하지 않았습니다."
-    if "DAILY_SL_LOCKOUT" in uppered or "DAILY SL LOCKOUT" in uppered:
-        return "당일 손절 후 재진입 잠금이 적용되어 진입하지 않았습니다."
+    if (
+        "DAILY_SYMBOL_ENTRY_LOCKOUT" in uppered
+        or "DAILY SYMBOL ENTRY LOCKOUT" in uppered
+        or "DAILY_SL_LOCKOUT" in uppered
+        or "DAILY SL LOCKOUT" in uppered
+    ):
+        return "오늘 이미 자동매매로 진입했던 종목이라 한국시간 자정까지 다시 진입하지 않습니다."
     if "DAILY_TRADE_LIMIT" in uppered or "DAILY TRADE COUNT" in uppered:
         return "자동매매 일일 진입 횟수 한도에 도달했습니다."
     if "DAILY_LOSS" in uppered or "DAILY PNL" in uppered:

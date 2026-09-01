@@ -278,6 +278,46 @@ def test_daily_automatic_count_excludes_user_custom_entries(tmp_path):
     assert db.get_daily_automatic_entry_count() == 1
 
 
+def test_daily_automatic_symbol_entry_uses_aliases_and_excludes_custom(tmp_path):
+    db = emas.DBManager(str(tmp_path / "trades.db"))
+    db.log_trade_entry(
+        "BTC/USDT:USDT", "long", 100.0, 0.1, strategy="ut_breakout"
+    )
+    db.log_trade_entry(
+        "ETH/USDT:USDT", "short", 100.0, 0.1, strategy="user_custom"
+    )
+
+    btc_entry = db.get_daily_automatic_symbol_entry("BTCUSDT")
+    assert btc_entry is not None
+    assert btc_entry["side"] == "long"
+    assert db.get_daily_automatic_symbol_entry("BTC/USDT") == btc_entry
+    assert db.get_daily_automatic_symbol_entry("ETHUSDT") is None
+
+
+def test_daily_automatic_symbol_entry_resets_at_korea_midnight(tmp_path):
+    db = emas.DBManager(str(tmp_path / "trades.db"))
+    kst = ZoneInfo("Asia/Seoul")
+    first_day = datetime(2026, 9, 1, 23, 59, 59, tzinfo=kst)
+    next_day = datetime(2026, 9, 2, 0, 0, 1, tzinfo=kst)
+    with db.lock:
+        db.conn.execute(
+            """INSERT INTO trades (
+                symbol, side, entry_price, quantity, entry_time, strategy
+            ) VALUES (?, 'long', 1, 1, ?, 'adaptive_breakout_trend_v1')""",
+            ("HEMI/USDT:USDT", first_day.astimezone(timezone.utc).isoformat()),
+        )
+        db.conn.commit()
+
+    assert db.get_daily_automatic_symbol_entry(
+        "HEMIUSDT",
+        now=first_day,
+    ) is not None
+    assert db.get_daily_automatic_symbol_entry(
+        "HEMIUSDT",
+        now=next_day,
+    ) is None
+
+
 def test_daily_stats_use_korea_calendar_day_boundary(tmp_path):
     db = emas.DBManager(str(tmp_path / "trades.db"))
     kst_now = datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Seoul"))

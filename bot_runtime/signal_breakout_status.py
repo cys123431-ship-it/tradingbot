@@ -3937,14 +3937,18 @@ class SignalBreakoutStatusMixin:
         long_ok, long_lines = await _side_conditions('long')
         short_ok, short_lines = await _side_conditions('short')
 
-        sl_lockout_active, sl_lockout_reason = self._is_utbreakout_daily_sl_locked(symbol)
-        if sl_lockout_active:
+        daily_symbol_lockout_active, daily_symbol_lockout_reason = (
+            self._is_automatic_daily_symbol_entry_locked(symbol)
+        )
+        if daily_symbol_lockout_active:
             long_ok = False
             short_ok = False
-            sl_lockout_reason = sl_lockout_reason or "daily SL lockout active"
-            lockout_msg = "🔴 [Lockout] Stop Loss 일일 거래 제한 활성화 중 (24시간 차단)"
+            daily_symbol_lockout_reason = (
+                daily_symbol_lockout_reason
+                or "daily symbol entry lockout active"
+            )
             lockout_msg = (
-                f"당일 재진입 차단: {symbol} - {sl_lockout_reason}; "
+                f"당일 재진입 차단: {symbol} - {daily_symbol_lockout_reason}; "
                 "same-day symbol re-entry blocked for both LONG and SHORT"
             )
             long_lines.append(lockout_msg)

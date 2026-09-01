@@ -3857,17 +3857,24 @@ class SignalBreakoutAnalysisMixin:
         if active_strategy not in UTBREAKOUT_STRATEGIES:
             blockers.append("active strategy not UTBreakout")
         try:
-            daily_sl_locked, daily_sl_reason = self._is_utbreakout_daily_sl_locked(symbol)
+            daily_symbol_locked, daily_symbol_reason = (
+                self._is_automatic_daily_symbol_entry_locked(symbol)
+            )
         except Exception as exc:
-            daily_sl_locked = False
-            daily_sl_reason = ""
+            daily_symbol_locked = True
+            daily_symbol_reason = (
+                "당일 종목 거래 이력을 확인할 수 없어 안전상 신규 진입을 "
+                "차단했습니다. (daily symbol history unavailable)"
+            )
             logger.warning(
-                "UTBreakout daily SL lockout check failed for %s: %s",
+                "UTBreakout daily symbol entry lockout check failed for %s: %s",
                 symbol,
                 exc,
             )
-        if daily_sl_locked:
-            blockers.append(daily_sl_reason or "daily SL lockout active")
+        if daily_symbol_locked:
+            blockers.append(
+                daily_symbol_reason or "daily symbol entry lockout active"
+            )
         try:
             recent_loss_locked, recent_loss_reason = (
                 self._is_utbreakout_recent_loss_cooldown_active(symbol, cfg)
@@ -4643,14 +4650,16 @@ class SignalBreakoutAnalysisMixin:
                 )
                 self._clear_utbot_filtered_breakout_entry_plan(symbol)
                 return False
-            daily_sl_locked, daily_sl_reason = self._is_utbreakout_daily_sl_locked(symbol)
-            if daily_sl_locked:
+            daily_symbol_locked, daily_symbol_reason = (
+                self._is_automatic_daily_symbol_entry_locked(symbol)
+            )
+            if daily_symbol_locked:
                 self._utbreakout_trace_event(
                     symbol,
                     'AUTO_ENTRY_BRIDGE_BLOCKED',
-                    'DAILY_SL_LOCKOUT',
+                    'DAILY_SYMBOL_ENTRY_LOCKOUT',
                     source=source,
-                    reason=daily_sl_reason,
+                    reason=daily_symbol_reason,
                     side=side,
                 )
                 return False

@@ -309,30 +309,33 @@ class SignalEntryMixin:
                         exc_info=True,
                     )
                 return
-            if trace_utbreakout:
-                daily_sl_locked, daily_sl_reason = self._is_utbreakout_daily_sl_locked(symbol)
-                if daily_sl_locked:
+            daily_symbol_locked, daily_symbol_reason = (
+                self._is_automatic_daily_symbol_entry_locked(symbol)
+            )
+            if daily_symbol_locked:
+                if trace_utbreakout:
                     self._utbreakout_trace_event(
                         symbol,
                         'ENTRY_BLOCKED',
-                        'DAILY_SL_LOCKOUT',
+                        'DAILY_SYMBOL_ENTRY_LOCKOUT',
                         side=side,
-                        reason=daily_sl_reason,
+                        reason=daily_symbol_reason,
                     )
-                    self.last_entry_reason[symbol] = (
-                        daily_sl_reason or "daily SL lockout active"
-                    )
-                    try:
+                self.last_entry_reason[symbol] = (
+                    daily_symbol_reason or "daily symbol entry lockout active"
+                )
+                try:
+                    if trace_utbreakout:
                         await self.ctrl.notify(
                             f"UTBreakout entry blocked: {symbol} {side.upper()} "
-                            f"/ {daily_sl_reason}"
+                            f"/ {daily_symbol_reason}"
                         )
-                    except Exception:
-                        logger.debug(
-                            "daily SL lockout entry notify skipped",
-                            exc_info=True,
-                        )
-                    return
+                except Exception:
+                    logger.debug(
+                        "daily symbol entry lockout notify skipped",
+                        exc_info=True,
+                    )
+                return
             raw_symbol = symbol
             if trace_utbreakout:
                 self._utbreakout_trace_event(
@@ -1781,6 +1784,25 @@ class SignalEntryMixin:
                     entry_plan_attribution
                 ),
             )
+            # The position is now confirmed at the exchange.  Lock the symbol
+            # immediately, before liquidation/protection work and before the
+            # trade DB insert, so a crash in that narrow window cannot allow a
+            # second automatic entry on the same Korea calendar day.
+            try:
+                self._record_automatic_daily_symbol_entry_lock(
+                    symbol,
+                    side=side,
+                    strategy=primary_strategy,
+                    detail=(
+                        f"confirmed_qty={actual_qty}; "
+                        f"entry_price={actual_entry_price}"
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to persist daily automatic symbol entry lock: %s",
+                    symbol,
+                )
             actual_liquidation_payload = dict(cfg or {})
             if isinstance(filtered_breakout_plan, dict):
                 actual_liquidation_payload.update(filtered_breakout_plan)

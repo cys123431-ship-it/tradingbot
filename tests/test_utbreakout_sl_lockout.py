@@ -78,7 +78,10 @@ def test_daily_sl_lockout_blocks_long_and_short_for_same_symbol_only(tmp_path):
             **_eligible_kwargs("DOGE/USDT:USDT", side)
         )
         assert eligibility["can_attempt"] is False
-        assert any("daily SL lockout" in blocker for blocker in eligibility["blockers"])
+        assert any(
+            "daily symbol entry lockout" in blocker
+            for blocker in eligibility["blockers"]
+        )
 
     other = engine._build_utbreakout_execution_eligibility(
         **_eligible_kwargs("ETH/USDT:USDT", "short")
@@ -103,8 +106,8 @@ def test_daily_sl_lockout_status_blocker_keeps_reason_for_display(tmp_path):
         eligibility,
     )
 
-    assert any("daily SL lockout" in item for item in display)
-    assert any("당일 SL lockout" in item for item in display)
+    assert any("daily symbol entry lockout" in item for item in display)
+    assert any("당일 종목 재진입 금지" in item for item in display)
     assert any("STOP_LOSS_FILLED" in item for item in display)
 
 
@@ -121,7 +124,7 @@ def test_daily_sl_lockout_blocks_direct_entry_before_order_attempt(tmp_path):
     events = engine._utbreakout_recent_trace_events("SOLUSDT", limit=20)
     assert any(
         event["stage"] == "ENTRY_BLOCKED"
-        and event["status"] == "DAILY_SL_LOCKOUT"
+        and event["status"] == "DAILY_SYMBOL_ENTRY_LOCKOUT"
         for event in events
     )
     assert not any(event["stage"] == "ORDER_ATTEMPT" for event in events)
@@ -150,6 +153,60 @@ def test_daily_sl_lockout_persists_and_expires_by_day(tmp_path):
     locked, _ = reloaded._is_utbreakout_daily_sl_locked("BTCUSDT")
     assert locked is False
     assert json.loads(path.read_text(encoding="utf-8")) == {}
+
+
+def test_confirmed_automatic_entry_locks_both_sides_until_next_kst_day(tmp_path):
+    engine = _build_engine(tmp_path)
+    engine._utbreakout_today_key = lambda: "2026-09-01"
+
+    engine._record_automatic_daily_symbol_entry_lock(
+        "HEMI/USDT:USDT",
+        side="long",
+        strategy="adaptive_breakout_trend_v1",
+        detail="confirmed_qty=100",
+    )
+
+    for side in ("long", "short"):
+        locked, reason = engine._is_automatic_daily_symbol_entry_locked(
+            "HEMIUSDT"
+        )
+        assert locked is True
+        assert "오늘 이미 자동매매로 진입" in reason
+        eligibility = engine._build_utbreakout_execution_eligibility(
+            **_eligible_kwargs("HEMI/USDT:USDT", side)
+        )
+        assert eligibility["can_attempt"] is False
+
+    engine._utbreakout_today_key = lambda: "2026-09-02"
+    locked, _ = engine._is_automatic_daily_symbol_entry_locked("HEMIUSDT")
+    assert locked is False
+
+
+def test_daily_symbol_lock_restores_from_automatic_trade_db_only(tmp_path):
+    engine = _build_engine(tmp_path)
+
+    class DB:
+        def __init__(self):
+            self.calls = []
+
+        def get_daily_automatic_symbol_entry(self, symbol):
+            self.calls.append(symbol)
+            return {
+                "symbol": "SOL/USDT:USDT",
+                "side": "long",
+                "entry_time": "2026-09-01T00:00:00+00:00",
+                "strategy": "adaptive_breakout_trend_v1",
+            }
+
+    engine.db = DB()
+    locked, reason = engine._is_automatic_daily_symbol_entry_locked("SOLUSDT")
+
+    assert locked is True
+    assert "AUTOMATIC_ENTRY_RESTORED_FROM_DB" in reason
+    assert engine.db.calls == ["SOL/USDT:USDT"]
+    assert engine.utbreakout_daily_sl_symbol_lockouts["SOL/USDT:USDT"][
+        "lock_type"
+    ] == "DAILY_AUTOMATIC_SYMBOL_ENTRY"
 
 
 def test_sl_fill_lockout_uses_exchange_order_status_or_stop_price(tmp_path):

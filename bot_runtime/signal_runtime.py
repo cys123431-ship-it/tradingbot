@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
 from trading_safety.profile_rollout import (
     get_tradfi_profile_rollout_state,
     update_tradfi_profile_rollout,
 )
+
+
+_KST = ZoneInfo("Asia/Seoul")
 
 
 class SignalRuntimeMixin:
@@ -555,7 +561,10 @@ class SignalRuntimeMixin:
             self._ensure_runtime_state_container(attr_name)
 
     def _utbreakout_today_key(self) -> str:
-        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # Daily entry/lockout policy follows the user's Korea calendar day,
+        # not UTC.  Keep the legacy method name because old runtime files and
+        # tests call it directly.
+        return datetime.now(timezone.utc).astimezone(_KST).strftime("%Y-%m-%d")
 
     def _normalize_market_symbol(self, symbol: str) -> str:
         try:
@@ -753,24 +762,122 @@ class SignalRuntimeMixin:
         except Exception as e:
             logger.warning(f"Failed to send lockout Telegram notification: {e}")
 
-    def _is_utbreakout_daily_sl_locked(self, symbol: str) -> tuple[bool, str]:
+    def _record_automatic_daily_symbol_entry_lock(
+        self,
+        symbol: str,
+        *,
+        side: str | None = None,
+        strategy: str | None = None,
+        detail: str = "",
+    ) -> None:
+        """Persist a same-KST-day re-entry lock after a confirmed bot fill."""
+        normalized_symbol = self._normalize_market_symbol(symbol)
+        if not normalized_symbol:
+            return
+
+        lockouts = self._ensure_runtime_state_container(
+            'utbreakout_daily_sl_symbol_lockouts'
+        )
+        today_key = self._utbreakout_today_key()
+        lockouts[normalized_symbol] = {
+            "date": today_key,
+            "reason": "AUTOMATIC_ENTRY_FILLED",
+            "side": str(side or "").strip().lower() or None,
+            "strategy": str(strategy or "").strip().lower() or None,
+            "ts": int(time.time() * 1000),
+            "detail": str(detail or "")[:240],
+            "lock_type": "DAILY_AUTOMATIC_SYMBOL_ENTRY",
+        }
+        self._save_utbreakout_daily_sl_lockouts()
+        try:
+            self._utbreakout_trace_event(
+                normalized_symbol,
+                "DAILY_SYMBOL_ENTRY_LOCK",
+                "RECORDED",
+                side=side,
+                strategy=strategy,
+                date=today_key,
+                detail=str(detail or "")[:240],
+            )
+        except Exception:
+            logger.debug(
+                "Daily automatic symbol entry trace skipped for %s",
+                normalized_symbol,
+                exc_info=True,
+            )
+
+    def _daily_automatic_symbol_entry_from_db(self, symbol: str):
+        db = getattr(self, 'db', None)
+        loader = getattr(db, 'get_daily_automatic_symbol_entry', None)
+        if not callable(loader):
+            return None
+        return loader(symbol)
+
+    def _is_automatic_daily_symbol_entry_locked(
+        self,
+        symbol: str,
+    ) -> tuple[bool, str]:
+        """Block automatic long or short re-entry after today's first fill."""
         normalized_symbol = self._normalize_market_symbol(symbol)
         if not normalized_symbol:
             return False, ""
 
-        lockouts = self._ensure_runtime_state_container('utbreakout_daily_sl_symbol_lockouts')
-        record = lockouts.get(normalized_symbol)
-        if not record:
-            return False, ""
-
+        lockouts = self._ensure_runtime_state_container(
+            'utbreakout_daily_sl_symbol_lockouts'
+        )
         today_key = self._utbreakout_today_key()
-        if record.get("date") != today_key:
+        record = lockouts.get(normalized_symbol)
+        if isinstance(record, dict) and record.get("date") != today_key:
             lockouts.pop(normalized_symbol, None)
             self._save_utbreakout_daily_sl_lockouts()
+            record = None
+
+        if not isinstance(record, dict):
+            try:
+                db_entry = self._daily_automatic_symbol_entry_from_db(
+                    normalized_symbol
+                )
+            except Exception as exc:
+                # A database that exists but cannot answer the query must not
+                # silently disable this order-safety rule.
+                if getattr(self, 'db', None) is not None:
+                    logger.error(
+                        "Daily automatic symbol history lookup failed for %s: %s",
+                        normalized_symbol,
+                        exc,
+                    )
+                    return True, (
+                        "당일 종목 거래 이력을 확인할 수 없어 안전상 신규 진입을 "
+                        "차단했습니다. (daily symbol history unavailable)"
+                    )
+                db_entry = None
+            if isinstance(db_entry, dict):
+                record = {
+                    "date": today_key,
+                    "reason": "AUTOMATIC_ENTRY_RESTORED_FROM_DB",
+                    "side": db_entry.get("side"),
+                    "strategy": db_entry.get("strategy"),
+                    "entry_time": db_entry.get("entry_time"),
+                    "ts": int(time.time() * 1000),
+                    "lock_type": "DAILY_AUTOMATIC_SYMBOL_ENTRY",
+                }
+                lockouts[normalized_symbol] = record
+                self._save_utbreakout_daily_sl_lockouts()
+
+        if not isinstance(record, dict):
             return False, ""
 
-        reason = record.get("reason", "UNKNOWN")
-        return True, f"당일 SL lockout / protection lockout: {reason} today (daily SL lockout)"
+        reason = str(record.get("reason") or "AUTOMATIC_ENTRY_FILLED")
+        return True, (
+            "당일 종목 재진입 금지: 오늘 이미 자동매매로 진입한 종목입니다. "
+            f"한국시간 자정 이후 새 조건에서 다시 허용됩니다. ({reason}; "
+            "daily symbol entry lockout)"
+        )
+
+    def _is_utbreakout_daily_sl_locked(self, symbol: str) -> tuple[bool, str]:
+        # Backward-compatible alias used by the status and bridge code.  The
+        # old loss-only lock is now a universal same-symbol daily entry lock.
+        return self._is_automatic_daily_symbol_entry_locked(symbol)
 
     def _utbreakout_recent_loss_cooldown_config(self, cfg=None):
         if not isinstance(cfg, dict):

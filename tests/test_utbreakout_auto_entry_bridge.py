@@ -364,7 +364,7 @@ def test_auto_entry_bridge_daily_sl_lockout_blocks_before_entry_call(tmp_path):
     events = engine._utbreakout_recent_trace_events(symbol, limit=30)
     assert any(
         event["stage"] == "AUTO_ENTRY_BRIDGE_BLOCKED"
-        and event["status"] == "DAILY_SL_LOCKOUT"
+        and event["status"] == "DAILY_SYMBOL_ENTRY_LOCKOUT"
         for event in events
     )
     assert not any(event["stage"] == "ENTRY_CALL" for event in events)
