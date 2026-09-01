@@ -6,6 +6,7 @@ import math
 
 from utbreakout.adaptive_breakout_trend import small_account_short_entry_blocked
 from utbreakout.convex_rotation import evaluate_convex_rotation_exit
+from utbreakout.small_account.exit import evaluate_progress_failure_exit
 from utbreakout.small_account.strategy import small_account_profit_lock_enabled
 
 
@@ -35,6 +36,53 @@ def _mark_aware_excursion_bounds(
         highest = max(highest, mark)
         lowest = min(lowest, mark)
     return highest, lowest
+
+
+def _polled_mark_excursion(
+    state,
+    *,
+    side,
+    entry_price,
+    risk_distance,
+    current_mark,
+):
+    """Update mark-only excursion without borrowing contract-price wicks."""
+
+    highest = float((state or {}).get('mark_highest_price') or entry_price)
+    lowest = float((state or {}).get('mark_lowest_price') or entry_price)
+    prior_mfe = float((state or {}).get('mark_mfe_r') or 0.0)
+    prior_mae = float((state or {}).get('mark_mae_r') or 0.0)
+    try:
+        mark = float(current_mark)
+    except (TypeError, ValueError):
+        mark = None
+    if mark is None or not math.isfinite(mark) or mark <= 0:
+        return {
+            'mark_highest_price': highest,
+            'mark_lowest_price': lowest,
+            'mark_mfe_r': prior_mfe,
+            'mark_mae_r': prior_mae,
+            'mark_current_r': None,
+            'mark_excursion_source': 'exchange_mark_unavailable',
+        }
+    highest = max(highest, mark)
+    lowest = min(lowest, mark)
+    if str(side or '').lower() == 'long':
+        mfe = max(prior_mfe, (highest - entry_price) / risk_distance)
+        mae = max(prior_mae, (entry_price - lowest) / risk_distance)
+        current_r = (mark - entry_price) / risk_distance
+    else:
+        mfe = max(prior_mfe, (entry_price - lowest) / risk_distance)
+        mae = max(prior_mae, (highest - entry_price) / risk_distance)
+        current_r = (entry_price - mark) / risk_distance
+    return {
+        'mark_highest_price': float(highest),
+        'mark_lowest_price': float(lowest),
+        'mark_mfe_r': float(mfe),
+        'mark_mae_r': float(mae),
+        'mark_current_r': float(current_r),
+        'mark_excursion_source': 'polled_exchange_mark',
+    }
 
 
 class SignalExitMixin:
@@ -702,7 +750,10 @@ class SignalExitMixin:
         soft_stop_enabled = bool(state.get('soft_stop_enabled', cfg.get('soft_stop_enabled', False)))
         near_miss_tp_enabled = bool(state.get('near_miss_tp_enabled', cfg.get('near_miss_tp_enabled', False)))
         small_account_roe_lock_enabled = small_account_profit_lock_enabled(state)
-        if not atr_trailing_enabled and not tp1_breakeven_enabled and not soft_stop_enabled and not near_miss_tp_enabled and not small_account_roe_lock_enabled:
+        small_account_progress_failure_enabled = bool(
+            state.get('small_account_progress_failure_exit_enabled', False)
+        )
+        if not atr_trailing_enabled and not tp1_breakeven_enabled and not soft_stop_enabled and not near_miss_tp_enabled and not small_account_roe_lock_enabled and not small_account_progress_failure_enabled:
             return None
         side = str(pos.get('side', '') or '').lower()
         if side != str(state.get('side', '')).lower():
@@ -721,11 +772,26 @@ class SignalExitMixin:
             self._clear_utbreakout_trailing_state(symbol)
             return None
 
+        position_info = pos.get('info') if isinstance(pos.get('info'), dict) else {}
+        entry_cycle_mark = (
+            _safe_float_or_none(pos.get('markPrice'))
+            or _safe_float_or_none(position_info.get('markPrice'))
+        )
+        state.update(
+            _polled_mark_excursion(
+                state,
+                side=side,
+                entry_price=entry_price,
+                risk_distance=risk_distance,
+                current_mark=entry_cycle_mark,
+            )
+        )
+        self._set_utbreakout_trailing_state(symbol, state)
+
         # The mark-ROE staircase must not wait for the first completed candle
         # after entry. Use the entry ATR persisted in the plan (or the most
         # recent live ATR) to arm and place the exchange stop immediately.
         if small_account_roe_lock_enabled:
-            position_info = pos.get('info') if isinstance(pos.get('info'), dict) else {}
             early_mark = (
                 _safe_float_or_none(pos.get('markPrice'))
                 or _safe_float_or_none(position_info.get('markPrice'))
@@ -928,9 +994,12 @@ class SignalExitMixin:
         if atr_value <= 0:
             return None
         position_info = pos.get('info') if isinstance(pos.get('info'), dict) else {}
-        current_mark = (
+        exchange_mark = (
             _safe_float_or_none(pos.get('markPrice'))
             or _safe_float_or_none(position_info.get('markPrice'))
+        )
+        current_mark = (
+            exchange_mark
             or _safe_float_or_none(pos.get('lastPrice'))
             or _safe_float_or_none(position_info.get('lastPrice'))
         )
@@ -950,6 +1019,17 @@ class SignalExitMixin:
             max(float(state.get('mae_r') or 0.0), (entry_price - lowest_price) / risk_distance)
             if side == 'long' else
             max(float(state.get('mae_r') or 0.0), (highest_price - entry_price) / risk_distance)
+        )
+        # The mark-only metrics were updated before any completed-bar early
+        # return, so progress during the first post-entry candle is retained.
+        mark_mfe_r = _safe_float_or_none(state.get('mark_mfe_r')) or 0.0
+        mark_mae_r = _safe_float_or_none(state.get('mark_mae_r')) or 0.0
+        mark_current_r = _safe_float_or_none(state.get('mark_current_r'))
+        mark_highest = (
+            _safe_float_or_none(state.get('mark_highest_price')) or entry_price
+        )
+        mark_lowest = (
+            _safe_float_or_none(state.get('mark_lowest_price')) or entry_price
         )
 
         favorable_move = (
@@ -999,6 +1079,16 @@ class SignalExitMixin:
             'mfe_r': float(mfe_r),
             'mae_r': float(mae_r),
             'excursion_source': 'closed_bar_plus_polled_mark',
+            'mark_highest_price': float(mark_highest),
+            'mark_lowest_price': float(mark_lowest),
+            'mark_mfe_r': float(mark_mfe_r),
+            'mark_mae_r': float(mark_mae_r),
+            'mark_current_r': (
+                float(mark_current_r) if mark_current_r is not None else None
+            ),
+            'mark_excursion_source': state.get(
+                'mark_excursion_source', 'exchange_mark_unavailable'
+            ),
         })
         self._set_utbreakout_trailing_state(symbol, state)
 
@@ -1285,6 +1375,121 @@ class SignalExitMixin:
                         f"{side.upper()} SL `{float(near_stop):.4f}` ({lock_r:.2f}R lock)"
                     )
                     return state
+
+        if small_account_progress_failure_enabled:
+            completed_closes = [
+                float(value) for value in metric_closed['close'].tolist()
+            ]
+            fast_span = max(2, min(9, len(completed_closes)))
+            fast_ema = float(
+                pd.Series(completed_closes, dtype='float64')
+                .ewm(span=fast_span, adjust=False)
+                .mean()
+                .iloc[-1]
+            )
+            fast_support_lost = (
+                current_close < fast_ema
+                if side == 'long'
+                else current_close > fast_ema
+            )
+            consecutive_entry_closes_lost = bool(
+                len(completed_closes) >= 2
+                and (
+                    all(value < entry_price for value in completed_closes[-2:])
+                    if side == 'long'
+                    else all(value > entry_price for value in completed_closes[-2:])
+                )
+            )
+            impulse_lost = bool(
+                len(completed_closes) >= 3
+                and (
+                    completed_closes[-1]
+                    <= completed_closes[-2]
+                    <= completed_closes[-3]
+                    if side == 'long'
+                    else completed_closes[-1]
+                    >= completed_closes[-2]
+                    >= completed_closes[-3]
+                )
+            )
+            progress_failure = evaluate_progress_failure_exit(
+                enabled=True,
+                small_account_active=bool(
+                    state.get('small_account_aggressive_active', False)
+                ),
+                tp1_filled=bool(state.get('tp1_filled')) or partial_qty_seen,
+                bars_held=int(state.get('bars_seen', 0) or 0),
+                mark_mfe_r=mark_mfe_r,
+                mark_current_r=mark_current_r,
+                fast_support_lost=fast_support_lost,
+                consecutive_entry_closes_lost=(
+                    consecutive_entry_closes_lost
+                ),
+                impulse_lost=impulse_lost,
+                minimum_mark_mfe_r=state.get(
+                    'small_account_progress_failure_min_mark_mfe_r', 0.20
+                ),
+                maximum_mark_mfe_r=state.get(
+                    'small_account_progress_failure_max_mark_mfe_r', 0.75
+                ),
+                maximum_current_r=state.get(
+                    'small_account_progress_failure_max_current_r', -0.10
+                ),
+                minimum_closed_bars=state.get(
+                    'small_account_progress_failure_min_closed_bars', 2
+                ),
+                required_confirmations=state.get(
+                    'small_account_progress_failure_confirmations', 2
+                ),
+            )
+            state.update({
+                'small_account_progress_failure_reason': progress_failure.reason,
+                'small_account_progress_failure_confirmation_count': (
+                    progress_failure.confirmation_count
+                ),
+                'small_account_progress_failure_fast_support_lost': (
+                    fast_support_lost
+                ),
+                'small_account_progress_failure_entry_closes_lost': (
+                    consecutive_entry_closes_lost
+                ),
+                'small_account_progress_failure_impulse_lost': impulse_lost,
+                'small_account_progress_failure_fast_ema': fast_ema,
+            })
+            self._set_utbreakout_trailing_state(symbol, state)
+            if progress_failure.should_exit:
+                reason = f"Small-account progress failure: {progress_failure.reason}"
+                close_result = await self._close_position_reduce_only_market(
+                    symbol,
+                    pos,
+                    reason=reason,
+                    cfg=cfg,
+                )
+                if (
+                    bool((close_result or {}).get('_flat_confirmed'))
+                    and bool((close_result or {}).get('_cleanup_confirmed'))
+                ):
+                    self._clear_utbreakout_trailing_state(
+                        symbol,
+                        finalize=True,
+                        reason=reason,
+                        exit_price=(
+                            ((close_result or {}).get('_accounting') or {}).get(
+                                'exit_price'
+                            )
+                        ),
+                    )
+                    return {
+                        'status': 'EXITED',
+                        'reason': 'SMALL_ACCOUNT_PROGRESS_FAILURE',
+                        'detail': progress_failure.reason,
+                    }
+                return {
+                    'status': 'EXIT_PENDING',
+                    'reason': 'SMALL_ACCOUNT_PROGRESS_FAILURE',
+                    'detail': progress_failure.reason,
+                    'order': close_result,
+                }
 
         alpha_follow_exit = evaluate_alpha_follow_through_exit(
             enabled=bool(state.get('profit_alpha_enabled')) and bool(

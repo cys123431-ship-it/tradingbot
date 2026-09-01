@@ -2456,6 +2456,20 @@ class SignalAlphaMixin:
             'small_account_stability_risk_floor': float(
                 trend_cfg.get('small_account_stability_risk_floor', 0.80) or 0.80
             ),
+            'small_account_profit_bank_enabled': bool(
+                trend_cfg.get('small_account_profit_bank_enabled', True)
+            ),
+            'small_account_profit_bank_activation_multiple': float(
+                trend_cfg.get(
+                    'small_account_profit_bank_activation_multiple', 0.75
+                )
+            ),
+            'small_account_profit_bank_protect_fraction': float(
+                trend_cfg.get('small_account_profit_bank_protect_fraction', 0.50)
+            ),
+            'small_account_profit_bank_min_risk_scale': float(
+                trend_cfg.get('small_account_profit_bank_min_risk_scale', 0.50)
+            ),
             'small_account_daily_loss_limit_percent': 0.0,
             'small_account_cost_buffer_percent': float(
                 trend_cfg.get('small_account_cost_buffer_percent', 0.20) or 0.20
@@ -2550,6 +2564,38 @@ class SignalAlphaMixin:
             'small_account_roe_profit_lock_min_floor_percent': float(
                 trend_cfg.get('small_account_roe_profit_lock_min_floor_percent', 1.0)
                 or 1.0
+            ),
+            'small_account_progress_failure_exit_enabled': bool(
+                trend_cfg.get(
+                    'small_account_progress_failure_exit_enabled', True
+                )
+            ),
+            'small_account_progress_failure_min_mark_mfe_r': float(
+                trend_cfg.get(
+                    'small_account_progress_failure_min_mark_mfe_r', 0.20
+                )
+            ),
+            'small_account_progress_failure_max_mark_mfe_r': float(
+                trend_cfg.get(
+                    'small_account_progress_failure_max_mark_mfe_r', 0.75
+                )
+            ),
+            'small_account_progress_failure_max_current_r': float(
+                trend_cfg.get(
+                    'small_account_progress_failure_max_current_r', -0.10
+                )
+            ),
+            'small_account_progress_failure_min_closed_bars': int(
+                trend_cfg.get(
+                    'small_account_progress_failure_min_closed_bars', 2
+                )
+                or 2
+            ),
+            'small_account_progress_failure_confirmations': int(
+                trend_cfg.get(
+                    'small_account_progress_failure_confirmations', 2
+                )
+                or 2
             ),
             'small_account_aggressive_daily_pnl_usdt': float(daily_pnl or 0.0),
             'small_account_entry_refinement_profile': (

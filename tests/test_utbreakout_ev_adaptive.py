@@ -448,6 +448,47 @@ def test_live_trailing_state_preserves_normal_ev_runner_without_growth_overlay()
     assert state["ev_mfe_profit_lock_enabled"] is True
 
 
+def test_progress_failure_policy_is_snapshotted_only_from_the_entry_plan():
+    class Exchange:
+        @staticmethod
+        def market(_symbol):
+            return {"limits": {"amount": {"min": 0.01}}}
+
+    engine = object.__new__(SignalEngine)
+    engine.exchange = Exchange()
+    engine.safe_amount = lambda _symbol, qty: qty
+    engine.utbreakout_trailing_states = {}
+    common = {
+        "risk_distance": 10.0,
+        "stop_loss": 90.0,
+        "atr_trailing_enabled": True,
+        "small_account_aggressive_active": True,
+    }
+    new_state = engine._register_utbreakout_trailing_state(
+        "BTC/USDT",
+        "long",
+        100.0,
+        1.0,
+        {
+            **common,
+            "small_account_progress_failure_exit_enabled": True,
+            "small_account_progress_failure_min_mark_mfe_r": 0.20,
+        },
+        {"small_account_progress_failure_exit_enabled": True},
+    )
+    old_state = engine._register_utbreakout_trailing_state(
+        "ETH/USDT",
+        "long",
+        100.0,
+        1.0,
+        common,
+        {"small_account_progress_failure_exit_enabled": True},
+    )
+
+    assert new_state["small_account_progress_failure_exit_enabled"] is True
+    assert old_state["small_account_progress_failure_exit_enabled"] is False
+
+
 def test_stale_continuation_requires_real_reacceleration():
     values = {
         "entry_price": 100.0,

@@ -11,6 +11,8 @@ from dataclasses import asdict, dataclass
 from math import floor, isfinite
 from typing import Any, Mapping
 
+from .small_account.risk import resolve_profit_bank_risk_budget
+
 
 def default_dynamic_leverage_config() -> dict[str, Any]:
     return {
@@ -541,9 +543,6 @@ def resolve_adaptive_trend_small_account_profile(
     stability_overlay = _small_account_stability_risk_overlay(source)
     stability_scale = float(stability_overlay["scale"])
     stability_margin_budget = margin_budget * stability_scale
-    initial_margin_capacity = (
-        stability_margin_budget * initial_margin_fraction
-    )
     # Retain the legacy config field for backward-compatible config loading,
     # but it is deliberately disabled for this dedicated profile.
     daily_limit_percent = 0.0
@@ -648,20 +647,47 @@ def resolve_adaptive_trend_small_account_profile(
     )
     max_loss_usdt = equity * max_loss_percent / 100.0
     stability_max_loss_usdt = max_loss_usdt * stability_scale
+    profit_bank_enabled_raw = source.get("small_account_profit_bank_enabled", True)
+    profit_bank_enabled = (
+        profit_bank_enabled_raw
+        if isinstance(profit_bank_enabled_raw, bool)
+        else str(profit_bank_enabled_raw).strip().lower()
+        in {"1", "true", "yes", "on", "enabled"}
+    )
+    profit_bank = resolve_profit_bank_risk_budget(
+        account_equity=equity,
+        daily_realized_pnl_usdt=daily_pnl,
+        normal_full_risk_usdt=stability_max_loss_usdt,
+        initial_fraction=initial_margin_fraction,
+        enabled=profit_bank_enabled,
+        activation_multiple=source.get(
+            "small_account_profit_bank_activation_multiple", 0.75
+        ),
+        protect_fraction=source.get(
+            "small_account_profit_bank_protect_fraction", 0.50
+        ),
+        minimum_risk_scale=source.get(
+            "small_account_profit_bank_min_risk_scale", 0.50
+        ),
+    )
+    profit_bank_scale = float(profit_bank.risk_scale)
+    effective_margin_budget = stability_margin_budget * profit_bank_scale
+    effective_max_loss_usdt = stability_max_loss_usdt * profit_bank_scale
+    initial_margin_capacity = effective_margin_budget * initial_margin_fraction
     daily_loss_limit_usdt = 0.0
     remaining_daily_loss_usdt = 0.0
 
     selected = None
     selected_payload: dict[str, float] = {}
     for candidate in candidates:
-        full_margin_notional = stability_margin_budget * float(candidate)
+        full_margin_notional = effective_margin_budget * float(candidate)
         loss_rate = (float(stop_percent) + cost_buffer_percent) / 100.0
         if loss_rate <= 0.0:
             continue
         # Stop distance controls quantity.  A wider ATR/structure stop keeps
         # its market-valid price but receives proportionally fewer contracts;
         # a tighter stop may use more of the 95% campaign margin budget.
-        risk_capped_notional = stability_max_loss_usdt / loss_rate
+        risk_capped_notional = effective_max_loss_usdt / loss_rate
         full_target_notional = min(full_margin_notional, risk_capped_notional)
         initial_notional = full_target_notional * initial_margin_fraction
         initial_margin = initial_notional / float(candidate)
@@ -672,7 +698,7 @@ def resolve_adaptive_trend_small_account_profile(
         if (
             full_target_notional > 0.0
             and full_target_projected_loss_usdt
-            <= stability_max_loss_usdt + 1e-9
+            <= effective_max_loss_usdt + 1e-9
         ):
             selected = candidate
             selected_payload = {
@@ -715,6 +741,24 @@ def resolve_adaptive_trend_small_account_profile(
             max_loss_percent * stability_scale
         ),
         "stability_effective_max_loss_usdt": stability_max_loss_usdt,
+        "profit_bank_enabled": profit_bank.enabled,
+        "profit_bank_active": profit_bank.active,
+        "profit_bank_risk_scale": profit_bank_scale,
+        "profit_bank_activation_profit_usdt": (
+            profit_bank.activation_profit_usdt
+        ),
+        "profit_bank_protected_profit_usdt": profit_bank.protected_profit_usdt,
+        "profit_bank_available_giveback_usdt": (
+            profit_bank.available_giveback_usdt
+        ),
+        "profit_bank_normal_initial_risk_usdt": (
+            profit_bank.normal_initial_risk_usdt
+        ),
+        "profit_bank_effective_initial_risk_usdt": (
+            profit_bank.effective_initial_risk_usdt
+        ),
+        "profit_bank_effective_max_loss_usdt": effective_max_loss_usdt,
+        "profit_bank_reason": profit_bank.reason,
         "daily_loss_limit_percent": daily_limit_percent,
         "daily_loss_limit_usdt": daily_loss_limit_usdt,
         "daily_pnl_usdt": daily_pnl,
@@ -756,6 +800,7 @@ def resolve_adaptive_trend_small_account_profile(
             f"margin={selected_payload['initial_margin']:.2f}/{margin_budget:.2f}, "
             f"stop={float(stop_percent):.2f}%, "
             f"stabilityRisk=x{stability_scale:.2f}, "
+            f"profitBank=x{profit_bank_scale:.2f}, "
             f"projectedLoss={selected_payload['projected_loss_usdt']:.2f} "
             f"({selected_payload['projected_loss_usdt'] / equity * 100.0:.2f}%)"
         ),
@@ -1432,6 +1477,48 @@ def apply_dynamic_leverage_to_plan(
                 aggressive_trend_policy.get(
                     "stability_effective_max_loss_usdt", 0.0
                 )
+            ),
+            "small_account_profit_bank_enabled": bool(
+                aggressive_trend_policy.get("profit_bank_enabled", False)
+            ),
+            "small_account_profit_bank_active": bool(
+                aggressive_trend_policy.get("profit_bank_active", False)
+            ),
+            "small_account_profit_bank_risk_scale": float(
+                aggressive_trend_policy.get("profit_bank_risk_scale", 1.0)
+            ),
+            "small_account_profit_bank_activation_profit_usdt": float(
+                aggressive_trend_policy.get(
+                    "profit_bank_activation_profit_usdt", 0.0
+                )
+            ),
+            "small_account_profit_bank_protected_profit_usdt": float(
+                aggressive_trend_policy.get(
+                    "profit_bank_protected_profit_usdt", 0.0
+                )
+            ),
+            "small_account_profit_bank_available_giveback_usdt": float(
+                aggressive_trend_policy.get(
+                    "profit_bank_available_giveback_usdt", 0.0
+                )
+            ),
+            "small_account_profit_bank_normal_initial_risk_usdt": float(
+                aggressive_trend_policy.get(
+                    "profit_bank_normal_initial_risk_usdt", 0.0
+                )
+            ),
+            "small_account_profit_bank_effective_initial_risk_usdt": float(
+                aggressive_trend_policy.get(
+                    "profit_bank_effective_initial_risk_usdt", 0.0
+                )
+            ),
+            "small_account_profit_bank_effective_max_loss_usdt": float(
+                aggressive_trend_policy.get(
+                    "profit_bank_effective_max_loss_usdt", 0.0
+                )
+            ),
+            "small_account_profit_bank_reason": aggressive_trend_policy.get(
+                "profit_bank_reason"
             ),
             "small_account_aggressive_daily_loss_limit_percent": float(
                 aggressive_trend_policy.get("daily_loss_limit_percent", 0.0)

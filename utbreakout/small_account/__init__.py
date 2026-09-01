@@ -6,7 +6,14 @@ Keeping those meanings separate prevents strategy flags from being reused as
 order-ownership flags.
 """
 
-from .risk import StopGeometry, classify_stop_geometry, position_mark_price
+from .exit import ProgressFailureExit, evaluate_progress_failure_exit
+from .risk import (
+    ProfitBankRiskBudget,
+    StopGeometry,
+    classify_stop_geometry,
+    position_mark_price,
+    resolve_profit_bank_risk_budget,
+)
 from .state import (
     PROTECTION_PROTECTED,
     PROTECTION_REGISTERED,
@@ -21,11 +28,15 @@ from .strategy import (
 __all__ = [
     "PROTECTION_PROTECTED",
     "PROTECTION_REGISTERED",
+    "ProfitBankRiskBudget",
+    "ProgressFailureExit",
     "StopGeometry",
     "apply_protection_state_contract",
     "classify_stop_geometry",
+    "evaluate_progress_failure_exit",
     "is_managed_position_state",
     "position_mark_price",
+    "resolve_profit_bank_risk_budget",
     "small_account_profit_lock_enabled",
     "small_account_strategy_active",
 ]

@@ -27,7 +27,9 @@ from .small_account_regime import (
 
 
 ADAPTIVE_BREAKOUT_TREND_STRATEGY = "adaptive_breakout_trend_v1"
-ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = "adaptive_trend_portfolio_v16_stability_risk"
+ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION = (
+    "adaptive_trend_portfolio_v17_progress_failure_profit_bank"
+)
 
 
 def default_adaptive_breakout_trend_config() -> dict[str, Any]:
@@ -137,6 +139,13 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         # This changes quantity, never the ATR/structure stop price.
         "small_account_stability_risk_enabled": True,
         "small_account_stability_risk_floor": 0.80,
+        # After a profitable day, keep trading but protect half of the banked
+        # profit by scaling the next campaign's risk budget once. This is not
+        # a daily halt and never changes an existing position.
+        "small_account_profit_bank_enabled": True,
+        "small_account_profit_bank_activation_multiple": 0.75,
+        "small_account_profit_bank_protect_fraction": 0.50,
+        "small_account_profit_bank_min_risk_scale": 0.50,
         "small_account_daily_loss_limit_percent": 0.0,
         "small_account_cost_buffer_percent": 0.20,
         "small_account_liquidation_stop_buffer_multiple": 1.50,
@@ -159,6 +168,16 @@ def default_adaptive_breakout_trend_config() -> dict[str, Any]:
         "small_account_roe_profit_lock_min_gap_percent": 1.0,
         "small_account_roe_profit_lock_max_gap_percent": 3.0,
         "small_account_roe_profit_lock_min_floor_percent": 1.0,
+        # Close a new small-account trade only when exchange mark-price
+        # progress was real, that progress has fully reversed, and at least
+        # two completed-candle failure checks agree. The structural exchange
+        # stop remains live until a reduce-only close is confirmed flat.
+        "small_account_progress_failure_exit_enabled": True,
+        "small_account_progress_failure_min_mark_mfe_r": 0.20,
+        "small_account_progress_failure_max_mark_mfe_r": 0.75,
+        "small_account_progress_failure_max_current_r": -0.10,
+        "small_account_progress_failure_min_closed_bars": 2,
+        "small_account_progress_failure_confirmations": 2,
         # The small-account profile keeps its aggressive capital allocation,
         # but refuses a stale continuation when the fast trend sleeve has
         # already decayed relative to the medium/slow sleeves.  This is a
@@ -265,6 +284,7 @@ def normalize_adaptive_breakout_trend_config(
                 "adaptive_trend_portfolio_v13_",
                 "adaptive_trend_portfolio_v14_",
                 "adaptive_trend_portfolio_v15_",
+                "adaptive_trend_portfolio_v16_",
             )
         )
     ):
@@ -313,6 +333,10 @@ def normalize_adaptive_breakout_trend_config(
             "small_account_elite_max_loss_percent",
             "small_account_stability_risk_enabled",
             "small_account_stability_risk_floor",
+            "small_account_profit_bank_enabled",
+            "small_account_profit_bank_activation_multiple",
+            "small_account_profit_bank_protect_fraction",
+            "small_account_profit_bank_min_risk_scale",
             "small_account_daily_loss_limit_percent",
             "small_account_cost_buffer_percent",
             "small_account_liquidation_stop_buffer_multiple",
@@ -328,6 +352,12 @@ def normalize_adaptive_breakout_trend_config(
             "small_account_roe_profit_lock_min_gap_percent",
             "small_account_roe_profit_lock_max_gap_percent",
             "small_account_roe_profit_lock_min_floor_percent",
+            "small_account_progress_failure_exit_enabled",
+            "small_account_progress_failure_min_mark_mfe_r",
+            "small_account_progress_failure_max_mark_mfe_r",
+            "small_account_progress_failure_max_current_r",
+            "small_account_progress_failure_min_closed_bars",
+            "small_account_progress_failure_confirmations",
             "small_account_entry_refinement_enabled",
             "small_account_min_fast_momentum_retention",
             "small_account_max_adverse_signal_move_atr",
@@ -595,6 +625,8 @@ def normalize_adaptive_breakout_trend_config(
         "small_account_aggressive_enabled",
         "small_account_short_entries_enabled",
         "small_account_roe_profit_lock_enabled",
+        "small_account_profit_bank_enabled",
+        "small_account_progress_failure_exit_enabled",
         "small_account_entry_refinement_enabled",
         "small_account_lower_timeframe_conflict_veto_enabled",
         "small_account_crowded_extension_veto_enabled",
@@ -631,6 +663,30 @@ def normalize_adaptive_breakout_trend_config(
             defaults["small_account_initial_margin_fraction"],
         ),
         0.40,
+        1.00,
+    )
+    normalized["small_account_profit_bank_activation_multiple"] = _bounded(
+        _finite(
+            normalized.get("small_account_profit_bank_activation_multiple"),
+            defaults["small_account_profit_bank_activation_multiple"],
+        ),
+        0.10,
+        3.00,
+    )
+    normalized["small_account_profit_bank_protect_fraction"] = _bounded(
+        _finite(
+            normalized.get("small_account_profit_bank_protect_fraction"),
+            defaults["small_account_profit_bank_protect_fraction"],
+        ),
+        0.0,
+        0.95,
+    )
+    normalized["small_account_profit_bank_min_risk_scale"] = _bounded(
+        _finite(
+            normalized.get("small_account_profit_bank_min_risk_scale"),
+            defaults["small_account_profit_bank_min_risk_scale"],
+        ),
+        0.10,
         1.00,
     )
     previous_loss_cap = 0.0
@@ -771,6 +827,53 @@ def normalize_adaptive_breakout_trend_config(
         ),
         0.0,
         normalized["small_account_roe_profit_lock_first_trigger_percent"],
+    )
+    normalized["small_account_progress_failure_min_mark_mfe_r"] = _bounded(
+        _finite(
+            normalized.get("small_account_progress_failure_min_mark_mfe_r"),
+            defaults["small_account_progress_failure_min_mark_mfe_r"],
+        ),
+        0.0,
+        3.0,
+    )
+    normalized["small_account_progress_failure_max_mark_mfe_r"] = max(
+        normalized["small_account_progress_failure_min_mark_mfe_r"],
+        _bounded(
+            _finite(
+                normalized.get("small_account_progress_failure_max_mark_mfe_r"),
+                defaults["small_account_progress_failure_max_mark_mfe_r"],
+            ),
+            0.0,
+            5.0,
+        ),
+    )
+    normalized["small_account_progress_failure_max_current_r"] = _bounded(
+        _finite(
+            normalized.get("small_account_progress_failure_max_current_r"),
+            defaults["small_account_progress_failure_max_current_r"],
+        ),
+        -1.0,
+        0.0,
+    )
+    normalized["small_account_progress_failure_min_closed_bars"] = int(
+        _bounded(
+            _finite(
+                normalized.get("small_account_progress_failure_min_closed_bars"),
+                defaults["small_account_progress_failure_min_closed_bars"],
+            ),
+            1.0,
+            12.0,
+        )
+    )
+    normalized["small_account_progress_failure_confirmations"] = int(
+        _bounded(
+            _finite(
+                normalized.get("small_account_progress_failure_confirmations"),
+                defaults["small_account_progress_failure_confirmations"],
+            ),
+            1.0,
+            3.0,
+        )
     )
     normalized["small_account_min_fast_momentum_retention"] = _bounded(
         _finite(

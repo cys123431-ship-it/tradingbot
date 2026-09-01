@@ -736,6 +736,49 @@ def test_adaptive_trend_small_account_ignores_daily_loss_for_new_risk():
     assert updated["qty"] > 0.0
 
 
+def test_small_account_profit_bank_scales_the_next_campaign_once():
+    baseline = apply_dynamic_leverage_to_plan(
+        _plan(
+            strategy="adaptive_breakout_trend_v1",
+            adaptive_breakout_trend_score=70.0,
+            adaptive_trend_risk_tier="base",
+            adaptive_breakout_trend_metrics={"risk_tier": "base"},
+            risk_distance=2.0,
+            risk_distance_pct=2.0,
+            small_account_aggressive_daily_pnl_usdt=0.0,
+        ),
+        free_balance=270.0,
+        account_equity=270.0,
+    )
+    banked = apply_dynamic_leverage_to_plan(
+        _plan(
+            strategy="adaptive_breakout_trend_v1",
+            adaptive_breakout_trend_score=70.0,
+            adaptive_trend_risk_tier="base",
+            adaptive_breakout_trend_metrics={"risk_tier": "base"},
+            risk_distance=2.0,
+            risk_distance_pct=2.0,
+            small_account_aggressive_daily_pnl_usdt=13.4041,
+            small_account_profit_bank_enabled=True,
+            small_account_profit_bank_activation_multiple=0.75,
+            small_account_profit_bank_protect_fraction=0.50,
+            small_account_profit_bank_min_risk_scale=0.50,
+        ),
+        free_balance=270.0,
+        account_equity=270.0,
+    )
+
+    assert banked["small_account_profit_bank_active"] is True
+    assert banked["small_account_profit_bank_risk_scale"] == pytest.approx(0.50)
+    assert banked["adaptive_trend_target_notional"] == pytest.approx(
+        baseline["adaptive_trend_target_notional"] * 0.50
+    )
+    assert banked["planned_notional"] == pytest.approx(
+        baseline["planned_notional"] * 0.50
+    )
+    assert banked["small_account_aggressive_blocked"] is False
+
+
 def test_adaptive_trend_at_exact_threshold_keeps_normal_risk_sizing():
     updated = apply_dynamic_leverage_to_plan(
         _plan(

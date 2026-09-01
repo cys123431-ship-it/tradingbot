@@ -7375,6 +7375,144 @@ def test_utbreakout_soft_structure_stop_closes_on_confirmed_breach():
     assert cleared[0][0] == "BTC/USDT"
 
 
+def test_small_account_progress_failure_uses_polled_mark_and_closed_bar_confirmation():
+    pos = {
+        "symbol": "ARB/USDT:USDT",
+        "side": "long",
+        "contracts": "1",
+        "entryPrice": "100",
+        "markPrice": "98.5",
+        "leverage": "4",
+    }
+    engine = _protection_engine([], positions=[pos])
+    state = {
+        "side": "long",
+        "entry_price": 100.0,
+        "initial_qty": 1.0,
+        "remaining_ratio": 1.0,
+        "tp1_expected_remaining_ratio": 1.0,
+        "risk_distance": 10.0,
+        "activation_r": 3.0,
+        "atr_trailing_enabled": False,
+        "tp1_breakeven_enabled": False,
+        "soft_stop_enabled": False,
+        "near_miss_tp_enabled": False,
+        "small_account_roe_profit_lock_enabled": False,
+        "small_account_aggressive_active": True,
+        "small_account_progress_failure_exit_enabled": True,
+        "small_account_progress_failure_min_mark_mfe_r": 0.20,
+        "small_account_progress_failure_max_mark_mfe_r": 0.75,
+        "small_account_progress_failure_max_current_r": -0.10,
+        "small_account_progress_failure_min_closed_bars": 2,
+        "small_account_progress_failure_confirmations": 2,
+        "last_stop_price": 90.0,
+        "highest_price": 102.2,
+        "lowest_price": 100.0,
+        "mfe_r": 0.22,
+        "mae_r": 0.0,
+        "mark_highest_price": 102.2,
+        "mark_lowest_price": 100.0,
+        "mark_mfe_r": 0.22,
+        "mark_mae_r": 0.0,
+        "bars_seen": 2,
+        "last_bar_ts": 22,
+    }
+    engine.utbreakout_trailing_states = {"ARB/USDT": state}
+    close_calls = []
+    cleared = []
+
+    async def close_position(symbol, current_pos, reason, cfg):
+        close_calls.append((symbol, current_pos, reason, cfg))
+        return {"_flat_confirmed": True, "_cleanup_confirmed": True}
+
+    engine._close_position_reduce_only_market = close_position
+    engine._clear_utbreakout_trailing_state = (
+        lambda symbol, **kwargs: cleared.append((symbol, kwargs))
+    )
+    rows = [
+        {
+            "timestamp": idx,
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0,
+        }
+        for idx in range(25)
+    ]
+    rows[-4]["close"] = 99.5
+    rows[-3]["close"] = 99.0
+    rows[-2]["close"] = 98.5
+
+    result = asyncio.run(
+        engine._manage_utbreakout_partial_trailing(
+            "ARB/USDT",
+            pos,
+            pd.DataFrame(rows),
+            {
+                "atr_length": 14,
+                "atr_trailing_enabled": False,
+                "tp1_breakeven_enabled": False,
+            },
+        )
+    )
+
+    assert result["status"] == "EXITED"
+    assert result["reason"] == "SMALL_ACCOUNT_PROGRESS_FAILURE"
+    assert len(close_calls) == 1
+    assert "mark MFE=0.22R" in close_calls[0][2]
+    assert cleared[0][0] == "ARB/USDT"
+
+
+def test_pre_upgrade_position_does_not_inherit_progress_failure_exit():
+    pos = {
+        "symbol": "ARB/USDT:USDT",
+        "side": "long",
+        "contracts": "1",
+        "entryPrice": "100",
+        "markPrice": "98.5",
+    }
+    engine = _protection_engine([], positions=[pos])
+    engine.utbreakout_trailing_states = {
+        "ARB/USDT": {
+            "side": "long",
+            "entry_price": 100.0,
+            "initial_qty": 1.0,
+            "risk_distance": 10.0,
+            "atr_trailing_enabled": False,
+            "tp1_breakeven_enabled": False,
+            "soft_stop_enabled": False,
+            "near_miss_tp_enabled": False,
+            "small_account_roe_profit_lock_enabled": False,
+            "small_account_aggressive_active": True,
+            "mark_mfe_r": 0.22,
+            "bars_seen": 3,
+        }
+    }
+    engine._close_position_reduce_only_market = AsyncMock()
+    rows = [
+        {
+            "timestamp": idx,
+            "open": 100.0,
+            "high": 101.0,
+            "low": 98.0,
+            "close": 98.5,
+        }
+        for idx in range(25)
+    ]
+
+    result = asyncio.run(
+        engine._manage_utbreakout_partial_trailing(
+            "ARB/USDT",
+            pos,
+            pd.DataFrame(rows),
+            {"atr_length": 14},
+        )
+    )
+
+    assert result is None
+    engine._close_position_reduce_only_market.assert_not_awaited()
+
+
 def test_utbreakout_exit_candle_fetches_position_for_opposite_set_evaluation():
     emas = _emas_module()
 

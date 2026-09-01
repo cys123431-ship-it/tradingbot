@@ -806,6 +806,11 @@ def test_persisted_conservative_profile_migrates_to_small_account_aggressive_v3(
     assert migrated["small_account_elite_leverage"] == 7
     assert migrated["small_account_leverage_steps"] == (4, 5, 6, 7)
     assert migrated["small_account_roe_profit_lock_enabled"] is True
+    assert migrated["small_account_profit_bank_enabled"] is True
+    assert migrated["small_account_profit_bank_protect_fraction"] == pytest.approx(0.50)
+    assert migrated["small_account_progress_failure_exit_enabled"] is True
+    assert migrated["small_account_progress_failure_min_mark_mfe_r"] == pytest.approx(0.20)
+    assert migrated["small_account_progress_failure_max_current_r"] == pytest.approx(-0.10)
     assert migrated["small_account_entry_refinement_enabled"] is True
     assert migrated["small_account_min_fast_momentum_retention"] == pytest.approx(0.55)
     assert migrated[
@@ -922,6 +927,22 @@ def test_v14_profile_upgrade_becomes_small_account_long_only_without_resetting_e
     assert migrated["small_account_short_entries_enabled"] is False
     assert migrated["runner_pct"] == pytest.approx(0.91)
     assert migrated["small_account_roe_profit_lock_first_trigger_percent"] == pytest.approx(6.0)
+
+
+def test_v16_profile_adds_failure_exit_without_resetting_operator_exit_values():
+    migrated = normalize_adaptive_breakout_trend_config(
+        {
+            "profile_version": "adaptive_trend_portfolio_v16_stability_risk",
+            "runner_pct": 0.92,
+            "small_account_roe_profit_lock_first_trigger_percent": 6.0,
+        }
+    )
+
+    assert migrated["profile_version"] == ADAPTIVE_TREND_PORTFOLIO_PROFILE_VERSION
+    assert migrated["runner_pct"] == pytest.approx(0.92)
+    assert migrated["small_account_roe_profit_lock_first_trigger_percent"] == pytest.approx(6.0)
+    assert migrated["small_account_profit_bank_enabled"] is True
+    assert migrated["small_account_progress_failure_exit_enabled"] is True
 
 
 def test_small_account_short_gate_blocks_only_active_profile_shorts():

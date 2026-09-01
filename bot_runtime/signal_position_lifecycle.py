@@ -434,6 +434,9 @@ class SignalPositionLifecycleMixin:
             'pnl_r': pnl_r,
             'mfe_r': mfe_r,
             'mae_r': mae_r,
+            'mark_mfe_r': _safe_float_or_none(state.get('mark_mfe_r')),
+            'mark_mae_r': _safe_float_or_none(state.get('mark_mae_r')),
+            'mark_current_r': _safe_float_or_none(state.get('mark_current_r')),
             'mfe_capture_ratio': capture,
             'last_stop_price': state.get('last_stop_price'),
             'runner_mode': state.get('runner_mode'),
@@ -832,6 +835,21 @@ class SignalPositionLifecycleMixin:
             'small_account_stop_distance_risk_sizing_applied': bool(plan.get('small_account_stop_distance_risk_sizing_applied', False)),
             'small_account_aggressive_cost_buffer_percent': _safe_float_or_none(plan.get('small_account_aggressive_cost_buffer_percent')),
             'small_account_aggressive_risk_tier': plan.get('small_account_aggressive_risk_tier'),
+            'small_account_profit_bank_active': bool(
+                plan.get('small_account_profit_bank_active', False)
+            ),
+            'small_account_profit_bank_risk_scale': _safe_float_or_none(
+                plan.get('small_account_profit_bank_risk_scale')
+            ),
+            'small_account_profit_bank_protected_profit_usdt': _safe_float_or_none(
+                plan.get('small_account_profit_bank_protected_profit_usdt')
+            ),
+            'small_account_profit_bank_effective_initial_risk_usdt': _safe_float_or_none(
+                plan.get('small_account_profit_bank_effective_initial_risk_usdt')
+            ),
+            'small_account_profit_bank_reason': plan.get(
+                'small_account_profit_bank_reason'
+            ),
             'small_account_short_entries_enabled': bool(
                 plan.get('small_account_short_entries_enabled', False)
             ),
@@ -900,6 +918,30 @@ class SignalPositionLifecycleMixin:
             'small_account_roe_profit_lock_peak_percent': 0.0,
             'small_account_roe_profit_lock_floor_percent': 0.0,
             'small_account_roe_profit_lock_gap_percent': 0.0,
+            # Deliberately no cfg fallback: positions opened before this
+            # profile version do not acquire a new market-exit rule merely
+            # because the process deploys or restarts.
+            'small_account_progress_failure_exit_enabled': bool(
+                plan.get('small_account_progress_failure_exit_enabled', False)
+            ),
+            'small_account_progress_failure_min_mark_mfe_r': float(
+                plan.get('small_account_progress_failure_min_mark_mfe_r', 0.20)
+            ),
+            'small_account_progress_failure_max_mark_mfe_r': float(
+                plan.get('small_account_progress_failure_max_mark_mfe_r', 0.75)
+            ),
+            'small_account_progress_failure_max_current_r': float(
+                plan.get('small_account_progress_failure_max_current_r', -0.10)
+            ),
+            'small_account_progress_failure_min_closed_bars': int(
+                plan.get('small_account_progress_failure_min_closed_bars', 2)
+                or 2
+            ),
+            'small_account_progress_failure_confirmations': int(
+                plan.get('small_account_progress_failure_confirmations', 2)
+                or 2
+            ),
+            'small_account_progress_failure_reason': 'not evaluated',
             'planned_tp_orders': planned_tp_orders,
             'tp_orders': list(planned_tp_orders),
             'expected_tp_count': len(planned_tp_orders),
@@ -952,6 +994,12 @@ class SignalPositionLifecycleMixin:
             'lowest_price': entry,
             'mfe_r': 0.0,
             'mae_r': 0.0,
+            'mark_highest_price': entry,
+            'mark_lowest_price': entry,
+            'mark_mfe_r': 0.0,
+            'mark_mae_r': 0.0,
+            'mark_current_r': 0.0,
+            'mark_excursion_source': 'polled_exchange_mark',
             'runner_updates': 0,
             'trend_health': {
                 'score': plan.get('trend_health_score'),
