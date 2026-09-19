@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .ema200_utbot_rsi import EMA200_UTBOT_RSI_STRATEGY
+
 from utbreakout.adaptive_breakout_trend import (
     ADAPTIVE_BREAKOUT_TREND_STRATEGY,
     evaluate_adaptive_breakout_trend,
@@ -152,6 +154,8 @@ class SignalScannerMixin:
         common_cfg = cfg.get('common_settings', {}) if isinstance(cfg.get('common_settings', {}), dict) else {}
         strategy_params = cfg.get('strategy_params', {}) if isinstance(cfg.get('strategy_params', {}), dict) else {}
         active_strategy = str(strategy_params.get('active_strategy', 'utbot') or 'utbot').lower()
+        if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+            return '2h'
         if active_strategy in UTBREAKOUT_STRATEGIES:
             fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
             if bool(fb_cfg.get('adaptive_timeframe_enabled', False)):
@@ -623,6 +627,7 @@ class SignalScannerMixin:
                     or active_strategy == 'cameron'
                     or active_strategy == 'utsmc'
                     or active_strategy == 'utbot'
+                    or active_strategy == EMA200_UTBOT_RSI_STRATEGY
                     or active_strategy in UTBREAKOUT_STRATEGIES
                     or active_strategy in UT_HYBRID_STRATEGIES
                 )
