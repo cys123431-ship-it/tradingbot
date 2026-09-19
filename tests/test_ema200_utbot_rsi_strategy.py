@@ -712,6 +712,57 @@ def test_entry_branch_conditionally_places_emergency_stop_after_first_loss():
     assert "STRATEGY_MANAGED_NO_STOP" in finalization_source
 
 
+def test_ema200_entry_notice_receives_fixed_2h_plan_instead_of_common_timeframe():
+    source = inspect.getsource(emas.SignalEngine.entry)
+    notice_start = source.index("# Build the user-facing message")
+    notice_setup = source[
+        notice_start:
+        source.index("# =====", notice_start)
+    ]
+    assert "entry_notice_plan = ema200_entry_plan" in notice_setup
+    assert "active_strategy == EMA200_UTBOT_RSI_STRATEGY" in notice_setup
+    assert "entry_plan=entry_notice_plan" in notice_setup
+
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.ctrl = SimpleNamespace(
+        format_symbol_for_display=lambda symbol: symbol,
+        get_network_status_label=lambda: "테스트넷(데모)",
+        get_exchange_display_name=lambda: "BINANCE FUTURES",
+    )
+    engine.last_stateful_diag = {}
+    engine.last_entry_reason = {"DOGE/USDT:USDT": "EMA200 2h entry"}
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
+    }
+    engine.get_runtime_common_settings = lambda: {"entry_timeframe": "4h"}
+    engine._get_exit_timeframe = lambda symbol=None: "2h"
+
+    notice = engine._build_signal_entry_notice(
+        "DOGE/USDT:USDT",
+        "long",
+        5896,
+        0.09,
+        0.09,
+        entry_plan={"entry_timeframe": "2h", "timeframe": "2h"},
+        leverage=5,
+    )
+
+    assert "TF: 진입 `2h` / 청산 `2h`" in notice
+    assert "진입 `4h`" not in notice
+
+
+def test_ema200_entry_notice_labels_stop_by_actual_risk_mode():
+    source = inspect.getsource(emas.SignalEngine.entry)
+    protection_branch = source.rsplit(
+        "elif active_strategy == EMA200_UTBOT_RSI_STRATEGY:", 1
+    )[1].split("elif active_strategy in UTBREAKOUT_STRATEGIES:", 1)[0]
+
+    assert "소액계좌 연속손실 단계 보호" in protection_branch
+    assert "위험예산 기반 최후 안전선" in protection_branch
+    assert "🛟 비상 손절 가격거리" in protection_branch
+    assert "(연속손실 보호)" not in protection_branch
+
+
 def test_minimum_notional_branch_blocks_instead_of_auto_increasing_strategy_size():
     source = inspect.getsource(emas.SignalEngine.entry)
     start = source.index("if min_notional > 0 and target_notional < min_notional:")

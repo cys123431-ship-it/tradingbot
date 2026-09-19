@@ -2092,13 +2092,19 @@ class SignalEntryMixin:
             # Build the user-facing message now, but do not perform Telegram I/O
             # while the filled position is still unprotected.  The message is
             # sent only after the final SL audit marks the entry PROTECTED.
+            if active_strategy in UTBREAKOUT_STRATEGIES:
+                entry_notice_plan = filtered_breakout_plan
+            elif active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+                entry_notice_plan = ema200_entry_plan
+            else:
+                entry_notice_plan = None
             entry_notice = self._build_signal_entry_notice(
                 symbol,
                 side,
                 qty,
                 price,
                 actual_entry_price,
-                entry_plan=filtered_breakout_plan if active_strategy in UTBREAKOUT_STRATEGIES else None,
+                entry_plan=entry_notice_plan,
                 leverage=lev,
                 target_notional=target_notional,
                 margin_to_use=margin_to_use,
@@ -2197,6 +2203,11 @@ class SignalEntryMixin:
                     emergency_pct = float(
                         ema200_risk_cfg['emergency_exit_percent']
                     )
+                    emergency_label = (
+                        "소액계좌 연속손실 단계 보호"
+                        if ema200_risk_plan.get('small_account_mode')
+                        else "위험예산 기반 최후 안전선"
+                    )
                     emergency_distance = (
                         float(actual_entry_price) * emergency_pct / 100.0
                     )
@@ -2214,8 +2225,8 @@ class SignalEntryMixin:
                     # audit. The notice is sent only after the SL is verified.
                     entry_notice = (
                         f"{entry_notice}\n"
-                        f"🛟 비상탈출: 진입가 대비 {emergency_pct:.2f}% "
-                        "(연속손실 보호)\n"
+                        f"🛟 비상 손절 가격거리: 진입가 대비 {emergency_pct:.2f}% "
+                        f"({emergency_label})\n"
                         "정상 청산: 완료된 2시간봉 UT Bot 반대 신호"
                     )
                 else:
