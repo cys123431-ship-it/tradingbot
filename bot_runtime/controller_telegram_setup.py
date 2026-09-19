@@ -6032,6 +6032,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 /stats - 통계
 /utbreak - UTBreak 전략 메뉴
 /utbreakout - /utbreak alias
+/ema200 - EMA200 + UT Bot + RSI (2H) 전용 전략·리스크·비상탈출 설정
 /trend - standalone adaptive trend menu
 /scanner - 자동 스캔 범위(TradFi/순수 코인/전체) 설정
 /setup - 거래소/네트워크 전환
@@ -6061,6 +6062,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
         self.tg_app.add_handler(CommandHandler("close", owner_only(close_cmd)))
         self.tg_app.add_handler(CommandHandler("stats", owner_only(stats_cmd)))
         self.tg_app.add_handler(CommandHandler("risk", owner_only(risk_cmd)))
+        self._register_ema200_utbot_rsi_handlers(owner_only, text_filter)
         self.tg_app.add_handler(CommandHandler("utbreak", owner_only(utbreakout_cmd)))
         self.tg_app.add_handler(CommandHandler("utbreakout", owner_only(utbreakout_cmd)))
         self.tg_app.add_handler(CommandHandler("trend", owner_only(trend_cmd)))
