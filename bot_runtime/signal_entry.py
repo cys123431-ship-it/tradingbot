@@ -2093,12 +2093,13 @@ class SignalEntryMixin:
                     sl_distance=emergency_distance,
                     position_hint=verify_pos,
                 )
-                await self.ctrl.notify(
-                    '🛟 비상탈출 보호 주문 설정\n'
-                    f'전략: EMA200 + UT Bot + RSI (2H)\n'
-                    f'비상탈출 거리: {emergency_pct:.2f}%\n'
-                    '정상 청산은 여전히 2시간봉 UT Bot 반대 신호이며, '
-                    '이 주문은 극단적인 역방향 움직임을 위한 최후 안전장치입니다.'
+                # Do not perform Telegram I/O before the final protection audit.
+                # Append the emergency-stop explanation to the entry notice, which is
+                # sent only after the SL is verified as live.
+                entry_notice = (
+                    f"{entry_notice}\n"
+                    f"🛟 비상탈출: 진입가 대비 {emergency_pct:.2f}% (최후 안전장치)\n"
+                    "정상 청산: 완료된 2시간봉 UT Bot 반대 신호"
                 )
 
             elif active_strategy in UTBREAKOUT_STRATEGIES:
