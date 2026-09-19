@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .controller_automatic_controls import ControllerAutomaticTradingControlsMixin
 from .controller_custom_entry import ControllerCustomEntryMixin
+from .controller_ema200_utbot_rsi import ControllerEMA200UTBotRSIMixin
 from .controller_emergency import ControllerEmergencyMixin
 from .controller_exchange import ControllerExchangeMixin
 from .controller_options import ControllerOptionsMixin
@@ -19,6 +20,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 class MainController(
     ControllerExchangeMixin,
     ControllerTelegramMixin,
+    ControllerEMA200UTBotRSIMixin,
     ControllerAutomaticTradingControlsMixin,
     ControllerCustomEntryMixin,
     ControllerOptionsMixin,
