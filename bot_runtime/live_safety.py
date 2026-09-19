@@ -396,6 +396,11 @@ async def _verify_actual_liquidation_safety(
 ):
     if self.is_upbit_mode() or str(getattr(self.exchange, 'id', '') or '').lower() != 'binance':
         return {'valid': True, 'status': 'NOT_BINANCE_FUTURES', 'position': pos}
+    # Initialize the durable store before setting the first liquidation lock.
+    # Otherwise a first-use runtime can create the in-memory attribute before
+    # store selection and both lose the initial lock persistence and select an
+    # unintended default database path.
+    _ensure_trading_safety_runtime(self)
     if client_order_id:
         _mark_crypto_entry_state(
             self,
@@ -445,7 +450,6 @@ async def _verify_actual_liquidation_safety(
             'leverage': actual_pos.get('leverage'),
             'estimated': False,
         }
-        _ensure_trading_safety_runtime(self)
         self.trading_state_store.set_runtime_state(f'liquidation_safety:{symbol}', snapshot)
         if client_order_id:
             _mark_crypto_entry_state(self, client_order_id, OrderState.FILLED_UNPROTECTED)

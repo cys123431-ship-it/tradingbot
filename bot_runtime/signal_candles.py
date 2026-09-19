@@ -154,10 +154,12 @@ class SignalCandleMixin:
             symbol_status['leverage'] = comm_cfg.get('leverage', 1 if self.is_upbit_mode() else 20)
             symbol_status['margin_mode'] = 'SPOT' if self.is_upbit_mode() else 'ISOLATED'
             utbreakout_status = self.last_utbot_filtered_breakout_status.get(symbol, {}) or {}
-            if active_strategy == EMA200_UTBOT_RSI_STRATEGY.upper():
+            position_strategy = self._position_entry_strategy(symbol) if pos else None
+            status_strategy = position_strategy or active_strategy.lower()
+            if status_strategy == EMA200_UTBOT_RSI_STRATEGY:
                 symbol_status['entry_tf'] = '2h'
                 symbol_status['exit_tf'] = '2h'
-            elif active_strategy in UTBREAKOUT_STRATEGIES and utbreakout_status.get('entry_timeframe'):
+            elif status_strategy in UTBREAKOUT_STRATEGIES and utbreakout_status.get('entry_timeframe'):
                 symbol_status['entry_tf'] = utbreakout_status.get('entry_timeframe')
                 symbol_status['exit_tf'] = utbreakout_status.get('exit_timeframe') or self._get_exit_timeframe(symbol)
             else:
@@ -1898,6 +1900,22 @@ class SignalCandleMixin:
             pos = await self.get_server_position(symbol, use_cache=False)
 
             current_side = pos['side'] if pos else 'NONE'
+            position_strategy = self._position_entry_strategy(symbol) if pos else None
+            if (
+                pos
+                and position_strategy
+                and position_strategy != active_strategy
+                and EMA200_UTBOT_RSI_STRATEGY
+                in {position_strategy, active_strategy}
+            ):
+                self.last_entry_reason[symbol] = (
+                    f"보유 포지션은 {position_strategy.upper()} 전략 소유입니다. "
+                    f"현재 선택된 {active_strategy.upper()} 진입/보호 로직은 적용하지 않고 "
+                    "원래 전략의 청산 규칙을 유지합니다."
+                )
+                self.last_candle_time[symbol] = processing_candle_time
+                self.last_candle_success[symbol] = True
+                return
             if not sig and not pos and active_strategy in UTBREAKOUT_STRATEGIES:
                 try:
                     decision_ts = int(df.iloc[-2]['timestamp']) if len(df) >= 2 else None
@@ -2432,7 +2450,12 @@ class SignalCandleMixin:
 
             # ===== 1. Calculate Raw Exit Signal =====
             strategy_params = self.get_runtime_strategy_params()
-            active_strategy = strategy_params.get('active_strategy', 'utbot').lower()
+            configured_strategy = strategy_params.get(
+                'active_strategy', 'utbot'
+            ).lower()
+            active_strategy = (
+                self._position_entry_strategy(symbol) or configured_strategy
+            )
             raw_exit_long = False
             raw_exit_short = False
             bypass_exit_filters = False

@@ -1276,7 +1276,9 @@ class SignalProtectionMixin:
             ).lower()
         except Exception:
             active_strategy = ''
-        if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+        position_strategy = self._position_entry_strategy(symbol)
+        strategy_owner = position_strategy or active_strategy
+        if strategy_owner == EMA200_UTBOT_RSI_STRATEGY:
             # The first sub-$1,000 stage is intentionally strategy-managed with
             # no exchange stop.  That exception is durable and narrowly bound
             # to an EMA200 entry record; every later loss stage still requires

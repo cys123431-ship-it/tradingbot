@@ -428,7 +428,7 @@ class SignalScannerMixin:
                         'leverage': common_cfg.get('leverage', 20),
                         'margin_mode': 'SPOT' if self.is_upbit_mode() else 'ISOLATED',
                         'entry_tf': entry_tf,
-                        'exit_tf': common_cfg.get('exit_timeframe', '4h'),
+                        'exit_tf': self._get_exit_timeframe(paused_symbol),
                         'entry_reason': '일시정지(PAUSE) 상태',
                         'protection_config': {'tp_enabled': False, 'sl_enabled': False},
                     }
@@ -454,7 +454,7 @@ class SignalScannerMixin:
                         'leverage': common_cfg.get('leverage', 20),
                         'margin_mode': 'SPOT' if self.is_upbit_mode() else 'ISOLATED',
                         'entry_tf': entry_tf,
-                        'exit_tf': common_cfg.get('exit_timeframe', '4h')
+                        'exit_tf': self._get_exit_timeframe()
                     }
                 return
 
@@ -710,16 +710,22 @@ class SignalScannerMixin:
 
             # 3. Check Exit TF (Exit Logic)
             # Cross/Position 紐⑤뱶?먯꽌留?Secondary TF 泥?궛 濡쒖쭅 ?ъ슜
+            position_strategy = (
+                self._position_entry_strategy(symbol)
+                if pos_side != 'NONE'
+                else None
+            )
+            exit_strategy = position_strategy or active_strategy
             uses_secondary_exit = (
                 pos_side != 'NONE'
                 and (
-                    (active_strategy in MA_STRATEGIES and entry_mode in ['cross', 'position'])
-                    or active_strategy == 'cameron'
-                    or active_strategy == 'utsmc'
-                    or active_strategy == 'utbot'
-                    or active_strategy == EMA200_UTBOT_RSI_STRATEGY
-                    or active_strategy in UTBREAKOUT_STRATEGIES
-                    or active_strategy in UT_HYBRID_STRATEGIES
+                    (exit_strategy in MA_STRATEGIES and entry_mode in ['cross', 'position'])
+                    or exit_strategy == 'cameron'
+                    or exit_strategy == 'utsmc'
+                    or exit_strategy == 'utbot'
+                    or exit_strategy == EMA200_UTBOT_RSI_STRATEGY
+                    or exit_strategy in UTBREAKOUT_STRATEGIES
+                    or exit_strategy in UT_HYBRID_STRATEGIES
                 )
             )
             if uses_secondary_exit:

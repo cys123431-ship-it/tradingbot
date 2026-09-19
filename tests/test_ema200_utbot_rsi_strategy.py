@@ -284,6 +284,7 @@ def test_database_loss_streak_is_strategy_specific_and_restart_durable(tmp_path)
 
     def close_trade(symbol, pnl, strategy):
         db.log_trade_entry(symbol, "long", 100.0, 1.0, strategy=strategy)
+        assert db.get_latest_open_trade(symbol)["strategy"] == strategy
         assert db.log_trade_close(symbol, pnl, pnl, 100.0 + pnl, "test")
 
     close_trade("BTC/USDT", 4.0, EMA200_UTBOT_RSI_STRATEGY)
@@ -455,6 +456,43 @@ def test_primary_and_exit_polling_are_fixed_to_2h():
     assert "'2h'" in fixed_scanner_source
     assert "EMA200_BINANCE_TOP10_SYMBOLS" in fixed_scanner_source
     assert "_scan_and_trade_ema200_binance_top10" in high_volume_source
+
+
+def test_open_ema200_position_keeps_2h_exit_after_active_strategy_changes():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.db = SimpleNamespace(
+        get_latest_open_trade=lambda symbol: {
+            "strategy": EMA200_UTBOT_RSI_STRATEGY,
+        }
+    )
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": "utbot",
+        "EMA200UTBotRSI2H": {},
+    }
+    engine.get_runtime_common_settings = lambda: {
+        "exit_timeframe": "4h",
+    }
+
+    assert engine._position_entry_strategy("DOGE/USDT:USDT") == (
+        EMA200_UTBOT_RSI_STRATEGY
+    )
+    assert engine._get_exit_timeframe("DOGE/USDT:USDT") == "2h"
+
+
+def test_known_non_ema_position_is_not_reassigned_to_new_ema_config():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.db = SimpleNamespace(
+        get_latest_open_trade=lambda symbol: {"strategy": "utbot"}
+    )
+    engine.scanner_active_symbol = None
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
+    }
+    engine.get_runtime_common_settings = lambda: {
+        "exit_timeframe": "4h",
+    }
+
+    assert engine._get_exit_timeframe("DOGE/USDT:USDT") == "4h"
 
 
 def test_fixed_top10_scanner_checks_every_symbol_on_2h_without_volume_selection():
@@ -656,6 +694,52 @@ def test_mechanical_exit_retries_same_candle_when_position_remains_open():
     assert "재시도" in engine.last_entry_reason["BTC/USDT"]
 
 
+def test_ema200_position_owner_keeps_mechanical_exit_after_config_switch():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.market_data_exchange = SimpleNamespace(
+        fetch_ohlcv=lambda *args, **kwargs: [
+            [1, 1, 2, 0.5, 1.5, 10],
+            [2, 1.5, 2, 0.5, 1.4, 10],
+            [3, 1.4, 2, 0.5, 1.3, 10],
+        ]
+    )
+    engine.db = SimpleNamespace(
+        get_latest_open_trade=lambda symbol: {
+            "strategy": EMA200_UTBOT_RSI_STRATEGY,
+        }
+    )
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": "utbot",
+    }
+    engine.get_runtime_common_settings = lambda: (_ for _ in ()).throw(
+        AssertionError("new strategy filters must not manage the EMA200 position")
+    )
+    engine._calculate_utbot_signal = lambda df, params: (
+        "short",
+        "fresh sell",
+        {"bias_side": "short"},
+    )
+    engine._update_stateful_diag = lambda *args, **kwargs: None
+    engine.last_entry_reason = {}
+    exits = []
+
+    async def exit_position(symbol, reason):
+        exits.append((symbol, reason))
+
+    async def fetch_position(symbol):
+        return True, None
+
+    engine.exit_position = exit_position
+    engine._fetch_server_position_checked = fetch_position
+
+    assert asyncio.run(
+        engine.process_exit_candle("DOGE/USDT:USDT", "2h", "long")
+    ) is True
+    assert exits == [
+        ("DOGE/USDT:USDT", "EMA200_UTBOT_RSI_UT_SELL")
+    ]
+
+
 def test_later_loss_stage_requires_stop_and_never_fixed_tp_for_strategy():
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
     engine.is_upbit_mode = lambda: False
@@ -680,10 +764,12 @@ def test_first_small_account_stage_is_durably_recognized_as_strategy_managed():
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
     engine.is_upbit_mode = lambda: False
     engine.get_runtime_strategy_params = lambda: {
-        "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
+        "active_strategy": "utbot",
     }
     record = SimpleNamespace(
         strategy=EMA200_UTBOT_RSI_STRATEGY,
+        order_intent="ENTRY",
+        order_purpose="entry",
         metadata={"strategy_managed_no_stop": True},
     )
     engine.trading_state_store = SimpleNamespace(

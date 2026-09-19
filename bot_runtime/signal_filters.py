@@ -8,6 +8,51 @@ from .ema200_utbot_rsi import EMA200_UTBOT_RSI_STRATEGY
 
 
 class SignalFilterMixin:
+    def _position_entry_strategy(self, symbol):
+        """Return the durable strategy owner of an existing position.
+
+        The configured active strategy can change independently from an open
+        exchange position. Position management must continue to follow the
+        strategy that created the position, especially for an EMA200 first
+        stage that intentionally has no exchange stop.
+        """
+        if not symbol:
+            return None
+
+        store = getattr(self, 'trading_state_store', None)
+        active_reader = getattr(store, 'active_for_symbol', None)
+        if callable(active_reader):
+            try:
+                records = list(active_reader(symbol) or [])
+            except Exception:
+                records = []
+            for record in reversed(records):
+                order_intent = str(
+                    getattr(record, 'order_intent', '') or ''
+                ).strip().upper()
+                order_purpose = str(
+                    getattr(record, 'order_purpose', '') or ''
+                ).strip().lower()
+                if order_intent != 'ENTRY' or order_purpose != 'entry':
+                    continue
+                strategy = str(
+                    getattr(record, 'strategy', '') or ''
+                ).strip().lower()
+                if strategy:
+                    return strategy
+
+        db = getattr(self, 'db', None)
+        open_trade_reader = getattr(db, 'get_latest_open_trade', None)
+        if callable(open_trade_reader):
+            try:
+                trade = open_trade_reader(symbol) or {}
+            except Exception:
+                trade = {}
+            strategy = str(trade.get('strategy') or '').strip().lower()
+            if strategy:
+                return strategy
+        return None
+
     def _collect_primary_strategy_context(self, symbol, df, strategy_params, active_strategy):
         context = {
             'raw_strategy_sig': None,
@@ -94,7 +139,12 @@ class SignalFilterMixin:
         """
         cfg = self.get_runtime_common_settings()
         strategy_params = self.get_runtime_strategy_params()
-        active_strategy = str(strategy_params.get('active_strategy', 'utbot') or 'utbot').lower()
+        configured_strategy = str(
+            strategy_params.get('active_strategy', 'utbot') or 'utbot'
+        ).lower()
+        active_strategy = (
+            self._position_entry_strategy(symbol) if symbol else None
+        ) or configured_strategy
         if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
             return self._get_ema200_utbot_rsi_config(strategy_params).get('timeframe', '2h')
         if active_strategy in UTBREAKOUT_STRATEGIES:

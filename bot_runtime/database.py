@@ -392,7 +392,7 @@ class DBManager:
         with self.lock:
             cur = self.conn.cursor()
             cur.execute(
-                """SELECT symbol, side, entry_price, quantity, entry_time
+                """SELECT symbol, side, entry_price, quantity, entry_time, strategy
                 FROM trades WHERE symbol=? AND exit_time IS NULL
                   AND reconciliation_archived_at IS NULL
                 ORDER BY id DESC LIMIT 1""",
@@ -407,6 +407,7 @@ class DBManager:
                 'entry_price': float(row[2] or 0.0),
                 'quantity': float(row[3] or 0.0),
                 'entry_time': row[4],
+                'strategy': row[5],
             }
 
     def get_open_trades(self):
