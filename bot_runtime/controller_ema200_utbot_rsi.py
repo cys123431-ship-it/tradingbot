@@ -18,6 +18,7 @@ from .ema200_utbot_rsi import (
     EMA200_UTBOT_RSI_CONFIG_KEY,
     EMA200_UTBOT_RSI_DISPLAY_NAME,
     EMA200_UTBOT_RSI_STRATEGY,
+    build_ema200_utbot_rsi_risk_plan,
     ema200_small_account_margin_percent,
     normalize_ema200_utbot_rsi_config,
 )
@@ -68,13 +69,13 @@ class ControllerEMA200UTBotRSIMixin:
                 InlineKeyboardButton("❓ 위험 설명", callback_data="e2h:help:risk"),
             ],
             [
-                InlineKeyboardButton("비상탈출 3%", callback_data="e2h:emergency:3"),
-                InlineKeyboardButton("비상탈출 5%", callback_data="e2h:emergency:5"),
-                InlineKeyboardButton("비상탈출 8%", callback_data="e2h:emergency:8"),
+                InlineKeyboardButton("손절거리 3%", callback_data="e2h:emergency:3"),
+                InlineKeyboardButton("손절거리 5%", callback_data="e2h:emergency:5"),
+                InlineKeyboardButton("손절거리 8%", callback_data="e2h:emergency:8"),
             ],
             [
-                InlineKeyboardButton("✍️ 비상탈출 직접입력", callback_data="e2h:custom:emergency"),
-                InlineKeyboardButton("❓ 비상탈출 설명", callback_data="e2h:help:emergency"),
+                InlineKeyboardButton("✍️ 손절거리 직접입력", callback_data="e2h:custom:emergency"),
+                InlineKeyboardButton("❓ 손절거리 설명", callback_data="e2h:help:emergency"),
             ],
             [
                 InlineKeyboardButton("레버리지 2x", callback_data="e2h:leverage:2"),
@@ -105,6 +106,71 @@ class ControllerEMA200UTBotRSIMixin:
             ],
         ])
 
+    async def _ema200_utbot_rsi_sizing_preview(self, cfg, loss_streak):
+        """Describe the next theoretical entry using the current futures balance."""
+        engine = (getattr(self, "engines", {}) or {}).get("signal")
+        balance_reader = getattr(engine, "get_balance_info", None) if engine else None
+        if not callable(balance_reader):
+            return (
+                "현재 계좌 예상 진입: 잔고 조회 불가\n"
+                "계산 예시(5,000 USDT·위험 0.50%·5x): 손절거리 5%이면 "
+                "명목 500 USDT / 증거금 100 USDT(계좌의 2%), "
+                "손절거리 25%이면 명목 100 USDT / 증거금 20 USDT(계좌의 0.4%)"
+            )
+
+        try:
+            total_equity, free_balance, _ = await balance_reader()
+            equity = float(total_equity or free_balance or 0.0)
+            free = float(free_balance or 0.0)
+            plan = build_ema200_utbot_rsi_risk_plan(
+                account_equity=equity,
+                free_balance=free,
+                entry_price=1.0,
+                config=cfg,
+                consecutive_losses=loss_streak,
+            )
+        except Exception:
+            return (
+                "현재 계좌 예상 진입: 잔고 조회 실패\n"
+                "계산 예시(5,000 USDT·위험 0.50%·5x): 손절거리 5%이면 "
+                "명목 500 USDT / 증거금 100 USDT(계좌의 2%), "
+                "손절거리 25%이면 명목 100 USDT / 증거금 20 USDT(계좌의 0.4%)"
+            )
+
+        notional = float(plan["planned_notional"])
+        margin = float(plan["planned_margin"])
+        notional_pct = notional / equity * 100.0 if equity > 0 else 0.0
+        margin_pct = margin / equity * 100.0 if equity > 0 else 0.0
+        cap_note = " (가용잔고 상한 적용)" if plan.get("margin_cap_applied") else ""
+
+        if plan.get("small_account_mode"):
+            protection = (
+                "비상 손절 없음 / UT 반대 신호로만 청산"
+                if not plan.get("emergency_stop_required")
+                else (
+                    f"진입가 대비 {float(cfg['emergency_exit_percent']):.2f}% 비상 손절 / "
+                    f"도달 시 예상손실 {float(plan['planned_emergency_loss_usdt']):.2f} USDT"
+                )
+            )
+            return (
+                f"현재 계좌: {equity:.2f} USDT → 1,000 이하 소액계좌 규칙\n"
+                f"다음 진입 비율: 증거금 계좌의 {float(plan['margin_percent']):.0f}% / 5x\n"
+                f"예상 명목 포지션: {notional:.2f} USDT (계좌의 {notional_pct:.2f}%)\n"
+                f"예상 사용 증거금: {margin:.2f} USDT (계좌의 {margin_pct:.2f}%){cap_note}\n"
+                f"보호 방식: {protection}"
+            )
+
+        return (
+            f"현재 계좌: {equity:.2f} USDT → 위험예산 방식\n"
+            f"1회 허용손실: {float(plan['risk_budget_usdt']):.2f} USDT "
+            f"(계좌의 {float(cfg['risk_per_trade_percent']):.2f}%)\n"
+            f"비상 손절 가격거리: 진입가 대비 {float(cfg['emergency_exit_percent']):.2f}%\n"
+            f"예상 명목 포지션: {notional:.2f} USDT (계좌의 {notional_pct:.2f}%)\n"
+            f"예상 사용 증거금: {margin:.2f} USDT (계좌의 {margin_pct:.2f}%, "
+            f"{int(plan['leverage'])}x){cap_note}\n"
+            "※ 손절거리를 넓힐수록 같은 손실예산을 지키기 위해 진입금액은 작아집니다."
+        )
+
     async def _ema200_utbot_rsi_status_text(self):
         cfg = self._ema200_utbot_rsi_config()
         section = self.get_active_trade_section()
@@ -130,8 +196,12 @@ class ControllerEMA200UTBotRSIMixin:
         stage_exit = (
             "UT 반대 신호만(Stop 없음)"
             if loss_streak == 0
-            else f"UT 반대 신호 + 비상 Stop {cfg['emergency_exit_percent']:.2f}%"
+            else (
+                "UT 반대 신호 + 비상 Stop "
+                f"(진입가 대비 {cfg['emergency_exit_percent']:.2f}%)"
+            )
         )
+        sizing_preview = await self._ema200_utbot_rsi_sizing_preview(cfg, loss_streak)
 
         latest_symbol = None
         latest_detail = {}
@@ -179,14 +249,15 @@ class ControllerEMA200UTBotRSIMixin:
             "추세: 종가 > EMA200=롱 허용 / 종가 < EMA200=숏 허용\n"
             f"RSI: {cfg['rsi_length']}기간, LONG=50 위 상승 / SHORT=50 아래 하락\n\n"
             "소액계좌 기준: equity 1,000 USDT 이하\n"
-            f"다음 진입: 증거금 {next_margin_percent:.0f}% / 5x / {stage_exit}\n"
+            f"소액계좌 다음 단계(해당 시): 증거금 {next_margin_percent:.0f}% / 5x / {stage_exit}\n"
             f"EMA200 연속손실: {loss_streak}회\n"
             "축소단계: 50% → 35% → 25% → 15% → 10%(하한)\n"
             f"1,000 USDT 초과 시 위험예산: 계좌의 {cfg['risk_per_trade_percent']:.2f}%\n"
             f"초과계좌 레버리지: {cfg['leverage']}x\n"
-            f"연속손실 단계 비상탈출: {cfg['emergency_exit_percent']:.2f}%\n"
+            f"비상 손절 가격거리: 진입가 대비 {cfg['emergency_exit_percent']:.2f}%\n"
             f"일일 손실한도: {cfg['daily_loss_limit_percent']:.2f}%\n"
             f"최근 7일 손실한도: {cfg['weekly_loss_limit_percent']:.2f}%\n\n"
+            f"📐 다음 진입 예상\n{sizing_preview}\n\n"
             f"오늘 실현손익: {float(daily_pnl):+.4f} USDT / {daily_count}건\n"
             f"최근 7일 실현손익: {float(weekly_pnl):+.4f} USDT / {weekly_count}건\n\n"
             f"{condition_text}\n\n"
@@ -203,23 +274,27 @@ class ControllerEMA200UTBotRSIMixin:
                 "이 설정은 계좌 equity가 1,000 USDT를 초과할 때 사용합니다. "
                 "1,000 USDT 이하에서는 고정 소액계좌 단계(증거금 "
                 "50→35→25→15→10%)가 우선합니다.\n\n"
-                "한 번의 거래가 비상탈출 가격까지 불리하게 움직였을 때 "
+                "한 번의 거래가 비상 손절 가격까지 불리하게 움직였을 때 "
                 "계좌에서 최대 얼마 정도를 잃도록 포지션 크기를 잡을지 정하는 값입니다.\n\n"
-                "예시) 계좌 1,000 USDT, 위험 0.5%, 비상탈출 5%\n"
-                "• 허용 손실예산 = 1,000 × 0.5% = 약 5 USDT\n"
-                "• 가격이 5% 불리하게 움직일 때 약 5 USDT 손실이 되도록 "
-                "포지션 명목금액을 약 100 USDT로 계산합니다.\n"
-                "• 따라서 단순히 '레버리지 5배니까 크게 산다'가 아닙니다. "
+                "예시) 계좌 5,000 USDT, 위험 0.5%, 손절거리 5%, 레버리지 5x\n"
+                "• 허용 손실예산 = 5,000 × 0.5% = 약 25 USDT\n"
+                "• 가격이 5% 불리하게 움직일 때 약 25 USDT 손실이 되도록 "
+                "포지션 명목금액을 약 500 USDT로 계산합니다.\n"
+                "• 필요한 증거금은 약 100 USDT, 즉 계좌의 약 2%입니다.\n"
+                "• 따라서 단순히 '레버리지 5배니까 계좌의 5배를 산다'가 아닙니다. "
                 "먼저 손실예산을 정하고 수량을 역산합니다.\n\n"
                 "권장 시작값은 0.50%입니다. 1%를 넘기면 연속 손실 시 "
                 "계좌 감소가 빨라지므로 경고는 표시하지만, 허용 범위 안에서는 직접 설정할 수 있습니다.\n\n"
-                "허용 범위는 0.10~5.00%입니다. 값이 클수록 한 번의 비상탈출 손실과 "
+                "허용 범위는 0.10~5.00%입니다. 값이 클수록 한 번의 비상 손절 손실과 "
                 "포지션 크기가 커집니다. 이 값은 UT 반대 신호라는 정상 청산 시점을 바꾸지 않습니다.\n\n"
                 "아래 '위험 직접입력'을 누른 뒤 숫자만 보내세요. 예: 0.5"
             )
         if kind == "emergency":
             return (
-                "🛟 비상탈출이란?\n\n"
+                "🛟 비상 손절 가격거리란?\n\n"
+                "이 퍼센트는 포지션에 넣는 비율이 아니라, 진입가격에서 거래소 Stop까지의 "
+                "가격 변동 거리입니다. LONG 100 진입·5%라면 약 95, SHORT 100 진입·5%라면 "
+                "약 105가 최후 안전선입니다.\n\n"
                 "정상 청산 규칙은 그대로입니다.\n"
                 "• LONG: 2시간봉 UT Bot Sell 신호에서 정상 청산\n"
                 "• SHORT: 2시간봉 UT Bot Buy 신호에서 정상 청산\n\n"
@@ -227,15 +302,25 @@ class ControllerEMA200UTBotRSIMixin:
                 "사용자 선택에 따라 거래소 Stop을 설치하지 않고 UT 반대 신호만 기다립니다. "
                 "첫 손실 뒤 다음 진입부터 이 비상탈출 Stop이 적용됩니다. "
                 "1,000 USDT 초과 계좌에는 기존처럼 첫 진입부터 적용됩니다.\n\n"
-                "예시) 100에 LONG 진입, 비상탈출 5%라면 약 95 부근이 최후 안전선입니다.\n"
-                "100에 SHORT 진입이라면 약 105 부근이 최후 안전선입니다.\n\n"
-                "이 값은 일반 손절 타이밍을 최적화하려는 것이 아니라 연속손실 단계의 "
-                "최대 손실을 제한하는 안전선입니다. 메뉴에서 거리만 조정할 수 있습니다.\n\n"
+                "진입금액에도 미치는 영향(1,000 USDT 초과 계좌)\n"
+                "예시: 계좌 5,000 USDT, 1회 위험 0.50%, 레버리지 5x\n"
+                "• 손절거리 5% → 허용손실 25 USDT / 명목 포지션 약 500 USDT / "
+                "증거금 약 100 USDT(계좌의 2%)\n"
+                "• 손절거리 25% → 허용손실 25 USDT / 명목 포지션 약 100 USDT / "
+                "증거금 약 20 USDT(계좌의 0.4%)\n"
+                "즉 손절거리를 넓힐수록 같은 손실예산을 유지하기 위해 진입금액은 작아집니다. "
+                "5x에서 25%처럼 너무 먼 Stop은 청산가보다 늦어질 수 있어 진입 자체가 차단됩니다.\n\n"
+                "1,000 USDT 이하에서는 손절거리가 아니라 연속손실 단계가 다음 증거금 비율"
+                "(50→35→25→15→10%)을 결정합니다. 첫 단계는 Stop 없이 UT 반대 신호로만 "
+                "청산하고, 첫 손실 뒤부터 설정한 비상 손절 가격거리가 적용됩니다.\n\n"
+                "이 값은 일반 손절 타이밍을 최적화하려는 것이 아니라 극단적인 역방향 움직임의 "
+                "최대 손실을 제한하는 최후 안전선입니다. 메뉴에서 거리만 조정할 수 있습니다.\n\n"
                 "설정 변경은 새로 진입하는 포지션부터 적용합니다. 이미 보유 중인 포지션의 "
                 "보호 주문을 텔레그램 설정 변경만으로 몰래 교체하지 않습니다.\n\n"
                 "허용 범위는 0.5~30%입니다. 너무 가까우면 평범한 가격 흔들림에도 Stop이 "
-                "체결될 수 있고, 너무 멀면 한 번의 비상 손실이 커집니다. 정상 UT 청산과는 별개입니다.\n\n"
-                "아래 '비상탈출 직접입력'을 누른 뒤 가격 변동률 숫자만 보내세요. 예: 5"
+                "체결될 수 있고, 너무 멀면 진입금액이 지나치게 작아지거나 청산가 안전검사에서 "
+                "진입이 거부될 수 있습니다. 정상 UT 청산과는 별개입니다.\n\n"
+                "아래 '손절거리 직접입력'을 누른 뒤 가격 변동률 숫자만 보내세요. 예: 5"
             )
         if kind == "leverage":
             return (
@@ -398,6 +483,13 @@ class ControllerEMA200UTBotRSIMixin:
                 "weekly": "weekly_loss_limit_percent",
                 "leverage": "leverage",
             }
+            field_labels = {
+                "risk": "1회 위험예산",
+                "emergency": "비상 손절 가격거리(진입가 대비)",
+                "daily": "일일 손실한도",
+                "weekly": "최근 7일 손실한도",
+                "leverage": "레버리지",
+            }
             if action in field_map and len(parts) > 2:
                 raw = parts[2]
                 value = int(raw) if action == "leverage" else float(raw)
@@ -421,8 +513,10 @@ class ControllerEMA200UTBotRSIMixin:
                         f"{float(value):.2f}%로 함께 조정했습니다."
                     )
                 await query.edit_message_text(
-                    f"✅ 설정 변경: {action} = {value}{'x' if action == 'leverage' else '%'}\n\n"
-                    "설정은 새로 진입하는 포지션부터 적용됩니다."
+                    f"✅ 설정 변경: {field_labels[action]} = "
+                    f"{value}{'x' if action == 'leverage' else '%'}\n\n"
+                    "설정은 새로 진입하는 포지션부터 적용됩니다.\n"
+                    "📊 상태 버튼에서 현재 계좌 기준 예상 포지션·증거금·진입 비율을 확인할 수 있습니다."
                     + adjustment,
                     reply_markup=self._build_ema200_utbot_rsi_keyboard(),
                 )
@@ -524,9 +618,17 @@ class ControllerEMA200UTBotRSIMixin:
                     "빠르게 커질 수 있으니 의도한 값인지 확인하세요."
                 )
             suffix = "x" if kind == "leverage" else "%"
+            field_labels = {
+                "risk": "1회 위험예산",
+                "emergency": "비상 손절 가격거리(진입가 대비)",
+                "daily": "일일 손실한도",
+                "weekly": "최근 7일 손실한도",
+                "leverage": "레버리지",
+            }
             await update.message.reply_text(
-                f"✅ 직접설정 완료: {kind} = {value}{suffix}\n"
-                "새 포지션부터 적용됩니다."
+                f"✅ 직접설정 완료: {field_labels[kind]} = {value}{suffix}\n"
+                "새 포지션부터 적용됩니다.\n"
+                "📊 상태 버튼에서 현재 계좌 기준 예상 포지션·증거금·진입 비율을 확인할 수 있습니다."
                 + extra,
                 reply_markup=self._build_ema200_utbot_rsi_keyboard(),
             )

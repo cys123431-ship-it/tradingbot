@@ -820,8 +820,90 @@ def test_telegram_status_uses_real_evaluation_order_when_2h_timestamps_tie():
     assert "최근 조건 (ETH/USDT)" in status
     assert "최근 평가 종목(2개 기록): ETH/USDT, BTC/USDT" in status
     assert "스캔 종목: BTC, ETH, BNB, XRP, SOL, TRX, ZEC, HYPE, DOGE, XMR" in status
-    assert "다음 진입: 증거금 35% / 5x" in status
+    assert "소액계좌 다음 단계(해당 시): 증거금 35% / 5x" in status
     assert "UT 반대 신호 + 비상 Stop" in status
+
+
+def test_telegram_status_shows_actual_large_account_entry_amounts_and_ratios():
+    controller = _registered_telegram_controller()
+    controller.db = SimpleNamespace(
+        get_daily_stats=lambda: (0, 0.0),
+        get_weekly_stats=lambda: (0, 0.0),
+        get_consecutive_strategy_losses=lambda strategy: 0,
+    )
+
+    async def get_balance_info():
+        return 5000.0, 5000.0, 0.0
+
+    controller.engines = {
+        "signal": SimpleNamespace(
+            get_balance_info=get_balance_info,
+            last_ema200_utbot_rsi_status={},
+            last_entry_reason={},
+        )
+    }
+
+    status = asyncio.run(controller._ema200_utbot_rsi_status_text())
+
+    assert "현재 계좌: 5000.00 USDT → 위험예산 방식" in status
+    assert "1회 허용손실: 25.00 USDT (계좌의 0.50%)" in status
+    assert "비상 손절 가격거리: 진입가 대비 5.00%" in status
+    assert "예상 명목 포지션: 500.00 USDT (계좌의 10.00%)" in status
+    assert "예상 사용 증거금: 100.00 USDT (계좌의 2.00%, 5x)" in status
+
+
+def test_telegram_sizing_preview_recalculates_entry_ratio_for_wider_stop():
+    controller = _registered_telegram_controller()
+
+    async def get_balance_info():
+        return 5000.0, 5000.0, 0.0
+
+    controller.engines = {
+        "signal": SimpleNamespace(get_balance_info=get_balance_info)
+    }
+    cfg = normalize_ema200_utbot_rsi_config(
+        {
+            "risk_per_trade_percent": 0.5,
+            "emergency_exit_percent": 25.0,
+            "leverage": 5,
+        }
+    )
+
+    preview = asyncio.run(
+        controller._ema200_utbot_rsi_sizing_preview(cfg, loss_streak=0)
+    )
+
+    assert "비상 손절 가격거리: 진입가 대비 25.00%" in preview
+    assert "예상 명목 포지션: 100.00 USDT (계좌의 2.00%)" in preview
+    assert "예상 사용 증거금: 20.00 USDT (계좌의 0.40%, 5x)" in preview
+
+
+def test_telegram_emergency_help_explains_distance_and_inverse_position_sizing():
+    help_text = ControllerEMA200UTBotRSIMixin._ema200_utbot_rsi_help_text(
+        "emergency"
+    )
+
+    assert "포지션에 넣는 비율이 아니라" in help_text
+    assert "손절거리 5%" in help_text
+    assert "명목 포지션 약 500 USDT" in help_text
+    assert "증거금 약 100 USDT(계좌의 2%)" in help_text
+    assert "손절거리 25%" in help_text
+    assert "명목 포지션 약 100 USDT" in help_text
+    assert "진입금액은 작아집니다" in help_text
+    assert "청산가보다 늦어질 수 있어 진입 자체가 차단" in help_text
+
+
+def test_telegram_keyboard_labels_emergency_percent_as_stop_distance():
+    controller = _registered_telegram_controller()
+    labels = [
+        button.text
+        for row in controller._build_ema200_utbot_rsi_keyboard().inline_keyboard
+        for button in row
+    ]
+
+    assert "손절거리 5%" in labels
+    assert "✍️ 손절거리 직접입력" in labels
+    assert all("비상탈출" not in label for label in labels)
 
 
 @pytest.mark.parametrize("raw_value", ["9", "nan", "inf"])
