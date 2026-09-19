@@ -15,6 +15,8 @@ import emas
 from bot_runtime.controller_ema200_utbot_rsi import ControllerEMA200UTBotRSIMixin
 from bot_runtime.database import DBManager
 from bot_runtime.ema200_utbot_rsi import (
+    EMA200_BINANCE_TOP10_BASES,
+    EMA200_BINANCE_TOP10_SYMBOLS,
     EMA200_UTBOT_RSI_STRATEGY,
     build_ema200_utbot_rsi_risk_plan,
     calculate_ema200_utbot_rsi_emergency_stop_price,
@@ -22,6 +24,7 @@ from bot_runtime.ema200_utbot_rsi import (
     ema200_small_account_margin_percent,
     evaluate_ema200_utbot_rsi_entry,
     evaluate_ema200_utbot_rsi_loss_gate,
+    is_ema200_utbot_rsi_symbol_allowed,
     normalize_ema200_utbot_rsi_config,
 )
 from bot_runtime.strategy_registry import CORE_STRATEGIES
@@ -31,7 +34,7 @@ def test_strategy_registered_in_core_strategies():
     assert EMA200_UTBOT_RSI_STRATEGY in CORE_STRATEGIES
 
 
-def test_long_requires_ordered_ut_then_fresh_rsi_cross_above_ema200():
+def test_long_requires_ordered_ut_then_rsi_above_50_and_rising():
     signal, _, detail = evaluate_ema200_utbot_rsi_entry(
         close_price=110.0,
         ema200=100.0,
@@ -44,10 +47,10 @@ def test_long_requires_ordered_ut_then_fresh_rsi_cross_above_ema200():
     )
     assert signal == "long"
     assert detail["ut_precedes_rsi"] is True
-    assert detail["rsi_cross_up"] is True
+    assert detail["rsi_above_and_rising"] is True
 
 
-def test_long_rejects_rsi_cross_that_happened_before_ut_buy():
+def test_long_rejects_current_rsi_condition_when_ut_buy_did_not_happen_first():
     signal, reason, detail = evaluate_ema200_utbot_rsi_entry(
         close_price=110.0,
         ema200=100.0,
@@ -63,7 +66,7 @@ def test_long_rejects_rsi_cross_that_happened_before_ut_buy():
     assert "먼저 확정되지 않음" in reason
 
 
-def test_same_completed_candle_ut_and_rsi_is_rejected_because_order_is_unknown():
+def test_same_completed_candle_ut_and_rsi_condition_is_rejected_as_unknown_order():
     signal, reason, detail = evaluate_ema200_utbot_rsi_entry(
         close_price=110.0,
         ema200=100.0,
@@ -79,7 +82,7 @@ def test_same_completed_candle_ut_and_rsi_is_rejected_because_order_is_unknown()
     assert "먼저 확정되지 않음" in reason
 
 
-def test_long_requires_fresh_cross_not_merely_rsi_above_50():
+def test_long_accepts_rsi_already_above_50_when_it_is_still_rising():
     signal, _, detail = evaluate_ema200_utbot_rsi_entry(
         close_price=110.0,
         ema200=100.0,
@@ -90,15 +93,23 @@ def test_long_requires_fresh_cross_not_merely_rsi_above_50():
         curr_rsi=57.0,
         rsi_signal_ts=2_000,
     )
-    assert signal is None
+    assert signal == "long"
     assert detail["rsi_cross_up"] is False
+    assert detail["rsi_above_and_rising"] is True
 
 
 @pytest.mark.parametrize(
     ("ut_state", "previous", "current"),
-    [("long", 50.0, 51.0), ("short", 50.0, 49.0)],
+    [
+        ("long", 55.0, 54.0),
+        ("long", 55.0, 55.0),
+        ("long", 49.0, 50.0),
+        ("short", 45.0, 46.0),
+        ("short", 45.0, 45.0),
+        ("short", 51.0, 50.0),
+    ],
 )
-def test_rsi_must_cross_from_strictly_below_or_above_threshold(
+def test_rsi_must_be_strictly_on_correct_side_and_move_in_entry_direction(
     ut_state,
     previous,
     current,
@@ -123,13 +134,49 @@ def test_short_is_exact_inverse():
         ut_state="short",
         ut_last_signal_side="short",
         ut_last_signal_ts=1_000,
-        prev_rsi=51.0,
-        curr_rsi=49.0,
+        prev_rsi=48.0,
+        curr_rsi=47.0,
         rsi_signal_ts=2_000,
     )
     assert signal == "short"
     assert detail["ema_short_ok"] is True
-    assert detail["rsi_cross_down"] is True
+    assert detail["rsi_cross_down"] is False
+    assert detail["rsi_below_and_falling"] is True
+
+
+def test_fixed_universe_is_exactly_ten_non_stable_binance_perpetual_assets():
+    assert EMA200_BINANCE_TOP10_BASES == (
+        "BTC",
+        "ETH",
+        "BNB",
+        "XRP",
+        "SOL",
+        "TRX",
+        "ZEC",
+        "HYPE",
+        "DOGE",
+        "XMR",
+    )
+    assert len(EMA200_BINANCE_TOP10_SYMBOLS) == 10
+    assert not {"USDT", "USDC", "DAI"} & set(EMA200_BINANCE_TOP10_BASES)
+    assert all(symbol.endswith("/USDT:USDT") for symbol in EMA200_BINANCE_TOP10_SYMBOLS)
+
+
+@pytest.mark.parametrize(
+    ("symbol", "expected"),
+    [
+        ("BTC/USDT:USDT", True),
+        ("btcusdt", True),
+        ("HYPE/USDT", True),
+        ("ADA/USDT:USDT", False),
+        ("BTC/USDC:USDC", False),
+        ("BTC", False),
+        ("USDT/USDT:USDT", False),
+        (None, False),
+    ],
+)
+def test_fixed_universe_guard_normalizes_common_symbol_forms(symbol, expected):
+    assert is_ema200_utbot_rsi_symbol_allowed(symbol) is expected
 
 
 def test_wrong_ema_side_blocks_signal():
@@ -401,16 +448,95 @@ def test_primary_and_exit_polling_are_fixed_to_2h():
     assert engine._get_primary_poll_timeframe() == "2h"
     assert engine._get_exit_timeframe("BTC/USDT") == "2h"
 
-    scanner_source = inspect.getsource(emas.SignalEngine._scan_and_trade_coin_selector)
+    fixed_scanner_source = inspect.getsource(
+        emas.SignalEngine._scan_and_trade_ema200_binance_top10
+    )
     high_volume_source = inspect.getsource(emas.SignalEngine.scan_and_trade_high_volume)
-    for source in (scanner_source, high_volume_source):
-        strategy_branch = source.index(
-            "if active_strategy == EMA200_UTBOT_RSI_STRATEGY:"
-        )
-        following_branch = source.index(
-            "elif active_strategy in UTBREAKOUT_STRATEGIES:", strategy_branch
-        )
-        assert "scan_tf = '2h'" in source[strategy_branch:following_branch]
+    assert "'2h'" in fixed_scanner_source
+    assert "EMA200_BINANCE_TOP10_SYMBOLS" in fixed_scanner_source
+    assert "_scan_and_trade_ema200_binance_top10" in high_volume_source
+
+
+def test_fixed_top10_scanner_checks_every_symbol_on_2h_without_volume_selection():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    calls = []
+
+    def fetch_ohlcv(symbol, timeframe, limit):
+        calls.append((symbol, timeframe, limit))
+        return [
+            [1, 1.0, 2.0, 0.5, 1.5, 10.0],
+            [2, 1.5, 2.0, 0.5, 1.4, 10.0],
+            [3, 1.4, 2.0, 0.5, 1.3, 10.0],
+        ]
+
+    engine.market_data_exchange = SimpleNamespace(fetch_ohlcv=fetch_ohlcv)
+    engine.ctrl = SimpleNamespace(is_paused=False)
+    engine.scanner_active_symbol = None
+    engine.ema200_top10_scan_cursor = 0
+    engine.last_entry_reason = {}
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
+    }
+    engine._collect_primary_strategy_context = lambda *args, **kwargs: {
+        "precomputed": {},
+    }
+
+    async def no_signal(*args, **kwargs):
+        return None, None, None, None, None, None
+
+    engine._calculate_strategy_signal = no_signal
+
+    asyncio.run(engine._scan_and_trade_ema200_binance_top10())
+
+    assert calls == [
+        (symbol, "2h", 300) for symbol in EMA200_BINANCE_TOP10_SYMBOLS
+    ]
+
+    calls.clear()
+    asyncio.run(engine._scan_and_trade_ema200_binance_top10())
+    rotated = EMA200_BINANCE_TOP10_SYMBOLS[1:] + EMA200_BINANCE_TOP10_SYMBOLS[:1]
+    assert calls == [(symbol, "2h", 300) for symbol in rotated]
+
+
+def test_high_volume_scanner_bypasses_coin_selector_for_ema200_strategy():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    calls = []
+    engine.is_upbit_mode = lambda: False
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
+    }
+
+    async def fixed_scan():
+        calls.append("fixed")
+
+    engine._scan_and_trade_ema200_binance_top10 = fixed_scan
+    engine._get_coin_selector_config = lambda: (_ for _ in ()).throw(
+        AssertionError("CoinSelector must not run for the fixed EMA200 universe")
+    )
+
+    asyncio.run(engine.scan_and_trade_high_volume())
+
+    assert calls == ["fixed"]
+
+
+def test_ema200_entry_guard_blocks_every_symbol_outside_fixed_top10():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    notices = []
+
+    async def notify(message):
+        notices.append(message)
+
+    engine.ctrl = SimpleNamespace(notify=notify)
+    engine.last_entry_reason = {}
+    engine.is_user_custom_entry_mode_enabled = lambda: False
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
+    }
+
+    asyncio.run(engine.entry("ADA/USDT:USDT", "long", 1.0))
+
+    assert "EMA200_FIXED_TOP10_ONLY" in engine.last_entry_reason["ADA/USDT:USDT"]
+    assert notices and "진입 차단" in notices[0]
 
 
 def test_latest_strategy_evaluation_is_saved_for_telegram_status():
@@ -693,6 +819,7 @@ def test_telegram_status_uses_real_evaluation_order_when_2h_timestamps_tie():
 
     assert "최근 조건 (ETH/USDT)" in status
     assert "최근 평가 종목(2개 기록): ETH/USDT, BTC/USDT" in status
+    assert "스캔 종목: BTC, ETH, BNB, XRP, SOL, TRX, ZEC, HYPE, DOGE, XMR" in status
     assert "다음 진입: 증거금 35% / 5x" in status
     assert "UT 반대 신호 + 비상 Stop" in status
 

@@ -12,6 +12,39 @@ EMA200_SMALL_ACCOUNT_THRESHOLD_USDT = 1000.0
 EMA200_SMALL_ACCOUNT_LEVERAGE = 5
 EMA200_SMALL_ACCOUNT_MARGIN_LADDER_PERCENT = (50.0, 35.0, 25.0, 15.0, 10.0)
 
+# Binance does not publish a circulating-supply/market-cap ranking API.  This
+# fixed 2026-09-19 snapshot therefore contains the ten highest-market-cap,
+# non-stable assets that had an active Binance USDT perpetual market when the
+# strategy universe was defined.  It is deliberately static: a third-party
+# ranking outage must never broaden the live trading universe.
+EMA200_BINANCE_TOP10_BASES = (
+    "BTC",
+    "ETH",
+    "BNB",
+    "XRP",
+    "SOL",
+    "TRX",
+    "ZEC",
+    "HYPE",
+    "DOGE",
+    "XMR",
+)
+EMA200_BINANCE_TOP10_SYMBOLS = tuple(
+    f"{base}/USDT:USDT" for base in EMA200_BINANCE_TOP10_BASES
+)
+
+
+def is_ema200_utbot_rsi_symbol_allowed(symbol):
+    """Fail closed unless *symbol* is a fixed-universe USDT market."""
+    text = str(symbol or "").strip().upper().split(":", 1)[0]
+    if "/" in text:
+        base, quote = text.split("/", 1)
+        return quote == "USDT" and base in EMA200_BINANCE_TOP10_BASES
+    return (
+        text.endswith("USDT")
+        and text[:-4] in EMA200_BINANCE_TOP10_BASES
+    )
+
 
 def default_ema200_utbot_rsi_config():
     return {
@@ -200,11 +233,11 @@ def evaluate_ema200_utbot_rsi_entry(
     rsi_signal_ts,
     threshold=50.0,
 ):
-    """Evaluate the exact ordered entry rule.
+    """Evaluate the ordered UT-first entry rule on one completed candle.
 
-    A previously-seen RSI cross is never remembered. The RSI cross must occur on
-    the current completed candle, while the latest UT signal is already the same
-    direction and its state is still active.
+    The latest UT signal must predate the current candle and its bias must still
+    be active.  RSI is not latched: LONG requires RSI above 50 and rising now;
+    SHORT requires RSI below 50 and falling now.
     """
     close_price = _finite(close_price, 0.0)
     ema200 = _finite(ema200, 0.0)
@@ -224,7 +257,9 @@ def evaluate_ema200_utbot_rsi_entry(
 
     rsi_cross_up = prev_rsi < threshold and curr_rsi > threshold
     rsi_cross_down = prev_rsi > threshold and curr_rsi < threshold
-    # A UT state must already exist before the RSI-cross candle.  Signals on the
+    rsi_above_and_rising = curr_rsi > threshold and curr_rsi > prev_rsi
+    rsi_below_and_falling = curr_rsi < threshold and curr_rsi < prev_rsi
+    # A UT state must already exist before the current RSI candle. Signals on the
     # same completed candle are deliberately rejected because their intrabar
     # order cannot be proven from OHLCV data.
     ut_precedes_rsi = bool(ut_ts and rsi_ts and ut_ts < rsi_ts)
@@ -242,6 +277,8 @@ def evaluate_ema200_utbot_rsi_entry(
         "curr_rsi": curr_rsi,
         "rsi_cross_up": rsi_cross_up,
         "rsi_cross_down": rsi_cross_down,
+        "rsi_above_and_rising": rsi_above_and_rising,
+        "rsi_below_and_falling": rsi_below_and_falling,
         "ut_precedes_rsi": ut_precedes_rsi,
     }
 
@@ -250,20 +287,20 @@ def evaluate_ema200_utbot_rsi_entry(
         and ut_state == "long"
         and ut_last_signal_side == "long"
         and ut_precedes_rsi
-        and rsi_cross_up
+        and rsi_above_and_rising
     )
     short_ok = (
         close_price < ema200
         and ut_state == "short"
         and ut_last_signal_side == "short"
         and ut_precedes_rsi
-        and rsi_cross_down
+        and rsi_below_and_falling
     )
 
     if long_ok:
-        return "long", "EMA200 위 + UT Buy 상태 유지 중 RSI 50 상향돌파", detail
+        return "long", "EMA200 위 + 선행 UT Buy 유지 + RSI 50 위에서 상승", detail
     if short_ok:
-        return "short", "EMA200 아래 + UT Sell 상태 유지 중 RSI 50 하향돌파", detail
+        return "short", "EMA200 아래 + 선행 UT Sell 유지 + RSI 50 아래에서 하락", detail
 
     reasons = []
     if close_price > ema200:
@@ -274,13 +311,13 @@ def evaluate_ema200_utbot_rsi_entry(
         reasons.append("EMA200 동일")
     reasons.append(f"UT {ut_state.upper() if ut_state else 'NONE'}")
     if not ut_precedes_rsi:
-        reasons.append("UT 신호가 RSI 돌파보다 먼저 확정되지 않음")
-    elif rsi_cross_up:
-        reasons.append("RSI50 상향돌파")
-    elif rsi_cross_down:
-        reasons.append("RSI50 하향돌파")
+        reasons.append("UT 신호가 현재 RSI 평가봉보다 먼저 확정되지 않음")
+    elif rsi_above_and_rising:
+        reasons.append("RSI50 위 상승")
+    elif rsi_below_and_falling:
+        reasons.append("RSI50 아래 하락")
     else:
-        reasons.append("RSI50 신규 돌파 없음")
+        reasons.append("RSI 방향 조건 불충족")
     return None, " / ".join(reasons), detail
 
 

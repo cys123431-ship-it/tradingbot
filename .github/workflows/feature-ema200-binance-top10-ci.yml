@@ -1,0 +1,52 @@
+name: Feature EMA200 Binance Top10 CI
+
+on:
+  push:
+    branches: [ "feature/ema200-rsi-trend-binance-top10" ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      CRYPTO_TRADING_STATE_DB: ":memory:"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+
+      - name: Compile changed runtime
+        run: |
+          python -m py_compile \
+            emas.py \
+            bot_runtime/ema200_utbot_rsi.py \
+            bot_runtime/signal_ema200_utbot_rsi.py \
+            bot_runtime/controller_ema200_utbot_rsi.py \
+            bot_runtime/base_engine.py \
+            bot_runtime/configuration.py \
+            bot_runtime/controller.py \
+            bot_runtime/controller_telegram.py \
+            bot_runtime/controller_telegram_setup.py \
+            bot_runtime/signal_candles.py \
+            bot_runtime/signal_engine.py \
+            bot_runtime/signal_entry.py \
+            bot_runtime/signal_exit.py \
+            bot_runtime/signal_protection.py \
+            bot_runtime/signal_filters.py \
+            bot_runtime/signal_scanner.py \
+            bot_runtime/strategy_registry.py
+
+      - name: Targeted strategy tests
+        run: python -m pytest -q tests/test_ema200_utbot_rsi_strategy.py
+
+      - name: Full Python test suite
+        run: python -m pytest -q

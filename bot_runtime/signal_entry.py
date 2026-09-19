@@ -9,6 +9,7 @@ from .ema200_utbot_rsi import (
     build_ema200_utbot_rsi_risk_plan,
     calculate_ema200_utbot_rsi_emergency_stop_price,
     evaluate_ema200_utbot_rsi_loss_gate,
+    is_ema200_utbot_rsi_symbol_allowed,
 )
 
 
@@ -272,6 +273,23 @@ class SignalEntryMixin:
             trace_active_strategy = str(
                 trace_strategy_params.get('active_strategy', '') or ''
             ).lower()
+            if (
+                trace_active_strategy == EMA200_UTBOT_RSI_STRATEGY
+                and not is_ema200_utbot_rsi_symbol_allowed(symbol)
+            ):
+                reason = (
+                    "EMA200_FIXED_TOP10_ONLY: 고정 바이낸스 시총 상위 10개 "
+                    f"외 종목 진입 차단 ({symbol})"
+                )
+                if not isinstance(getattr(self, 'last_entry_reason', None), dict):
+                    self.last_entry_reason = {}
+                self.last_entry_reason[str(symbol)] = reason
+                logger.warning(reason)
+                try:
+                    await self.ctrl.notify(f"⛔ EMA200 전략 진입 차단\n{reason}")
+                except Exception:
+                    logger.debug("EMA200 universe guard notify skipped", exc_info=True)
+                return
             trace_utbreakout = trace_active_strategy in UTBREAKOUT_STRATEGIES
             if trace_utbreakout:
                 symbol = self._canonicalize_utbreakout_symbol_for_use(

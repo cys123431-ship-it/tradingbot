@@ -220,7 +220,7 @@ class SignalEMA200UTBotRSIMixin:
 
         side_label = "LONG" if sig == "long" else "SHORT"
         self.last_entry_reason[symbol] = (
-            f"{strategy_name} 3조건 순서 충족 -> {side_label} 진입"
+            f"{strategy_name} UT 선행 + 현재 RSI 방향 조건 충족 -> {side_label} 진입"
         )
         await self.entry(symbol, sig, float(k["c"]))
 

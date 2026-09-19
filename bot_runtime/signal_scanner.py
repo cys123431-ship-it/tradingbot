@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from .ema200_utbot_rsi import EMA200_UTBOT_RSI_STRATEGY
+from .ema200_utbot_rsi import (
+    EMA200_BINANCE_TOP10_SYMBOLS,
+    EMA200_UTBOT_RSI_STRATEGY,
+)
 
 from utbreakout.adaptive_breakout_trend import (
     ADAPTIVE_BREAKOUT_TREND_STRATEGY,
@@ -40,6 +43,93 @@ from .diagnostics import _safe_float_or_none
 
 
 class SignalScannerMixin:
+    async def _scan_and_trade_ema200_binance_top10(self):
+        """Evaluate only the fixed Binance-tradable market-cap top ten."""
+
+        strategy_params = self.get_runtime_strategy_params()
+        if str(strategy_params.get('active_strategy', '') or '').lower() != (
+            EMA200_UTBOT_RSI_STRATEGY
+        ):
+            return
+
+        universe_size = len(EMA200_BINANCE_TOP10_SYMBOLS)
+        start = int(getattr(self, 'ema200_top10_scan_cursor', 0) or 0) % universe_size
+        symbols = (
+            EMA200_BINANCE_TOP10_SYMBOLS[start:]
+            + EMA200_BINANCE_TOP10_SYMBOLS[:start]
+        )
+        # Scan all ten each cycle, but rotate the finishing symbol so Telegram's
+        # latest-condition view does not look permanently pinned to one coin.
+        self.ema200_top10_scan_cursor = (start + 1) % universe_size
+        logger.info(
+            "[EMA200_UTBOT_RSI_2H] fixed-universe scan: %s",
+            ", ".join(symbols),
+        )
+        for symbol in symbols:
+            if self.ctrl.is_paused or self.scanner_active_symbol:
+                return
+            try:
+                ohlcv = await asyncio.to_thread(
+                    self.market_data_exchange.fetch_ohlcv,
+                    symbol,
+                    '2h',
+                    limit=300,
+                )
+                if not ohlcv:
+                    self.last_entry_reason[symbol] = (
+                        "EMA200 고정 Top10 스캔: 2시간봉 데이터 없음"
+                    )
+                    continue
+                df = pd.DataFrame(
+                    ohlcv,
+                    columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'],
+                )
+                context = self._collect_primary_strategy_context(
+                    symbol,
+                    df,
+                    strategy_params,
+                    EMA200_UTBOT_RSI_STRATEGY,
+                )
+                sig, _, _, _, _, _ = await self._calculate_strategy_signal(
+                    symbol,
+                    df,
+                    strategy_params,
+                    EMA200_UTBOT_RSI_STRATEGY,
+                    allow_utbot_stateful=False,
+                    precomputed=context.get('precomputed'),
+                )
+                if sig not in {'long', 'short'}:
+                    continue
+
+                if await self.get_server_position(symbol, use_cache=False):
+                    self.scanner_active_symbol = symbol
+                    return
+
+                logger.info(
+                    "[EMA200_UTBOT_RSI_2H] fixed-universe entry candidate: %s %s",
+                    symbol,
+                    sig.upper(),
+                )
+                await self.entry(symbol, sig, float(ohlcv[-1][4]))
+                position = await self.get_server_position(symbol, use_cache=False)
+                if position:
+                    self.scanner_active_symbol = symbol
+                    current_ts = int(ohlcv[-1][0])
+                    self.last_processed_candle_ts[symbol] = current_ts
+                    self.last_candle_time[symbol] = current_ts
+                    self.last_candle_success[symbol] = True
+                    return
+            except Exception as exc:
+                self.last_entry_reason[symbol] = (
+                    "EMA200 고정 Top10 스캔 오류: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                logger.warning(
+                    "EMA200 fixed-universe scan failed for %s: %s",
+                    symbol,
+                    exc,
+                )
+
     async def _finalize_scanner_flat_position(self, symbol):
         """Finish a scanner-owned position only after cleanup and accounting."""
 
@@ -3903,6 +3993,14 @@ class SignalScannerMixin:
         try:
             if self.is_upbit_mode():
                 logger.info("Scanner skipped: Upbit mode uses dedicated KRW UTBOT watchlist only.")
+                return
+
+            strategy_params = self.get_runtime_strategy_params()
+            active_strategy = str(
+                strategy_params.get('active_strategy', 'utbot') or 'utbot'
+            ).lower()
+            if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+                await self._scan_and_trade_ema200_binance_top10()
                 return
 
             scan_started_at = time.time()

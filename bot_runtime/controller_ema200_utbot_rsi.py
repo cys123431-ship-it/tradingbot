@@ -14,6 +14,7 @@ from telegram.ext import (
 )
 
 from .ema200_utbot_rsi import (
+    EMA200_BINANCE_TOP10_BASES,
     EMA200_UTBOT_RSI_CONFIG_KEY,
     EMA200_UTBOT_RSI_DISPLAY_NAME,
     EMA200_UTBOT_RSI_STRATEGY,
@@ -148,7 +149,7 @@ class ControllerEMA200UTBotRSIMixin:
                 reverse=True,
             )
             latest_symbol, latest_detail = recent_items[0]
-            recent_symbols = [str(symbol) for symbol, _ in recent_items[:5]]
+            recent_symbols = [str(symbol) for symbol, _ in recent_items[:10]]
             latest_reason = (getattr(engine, "last_entry_reason", {}) or {}).get(latest_symbol)
 
         condition_text = "최근 조건: 아직 2시간 완료봉 평가 기록 없음"
@@ -174,8 +175,9 @@ class ControllerEMA200UTBotRSIMixin:
             f"전략 선택: {'✅ ACTIVE' if active else '⬜ 미선택'}\n"
             f"신규 진입: {'ON' if cfg['enabled'] else 'OFF'}\n"
             "시간봉: 2시간 완료봉 고정\n"
+            f"스캔 종목: {', '.join(EMA200_BINANCE_TOP10_BASES)} (고정 10개)\n"
             "추세: 종가 > EMA200=롱 허용 / 종가 < EMA200=숏 허용\n"
-            f"RSI: {cfg['rsi_length']}기간, 50선 돌파\n\n"
+            f"RSI: {cfg['rsi_length']}기간, LONG=50 위 상승 / SHORT=50 아래 하락\n\n"
             "소액계좌 기준: equity 1,000 USDT 이하\n"
             f"다음 진입: 증거금 {next_margin_percent:.0f}% / 5x / {stage_exit}\n"
             f"EMA200 연속손실: {loss_streak}회\n"
@@ -275,11 +277,13 @@ class ControllerEMA200UTBotRSIMixin:
         return (
             "📘 전략 동작 순서\n\n"
             "LONG: 2시간 완료봉 종가가 EMA200 위 → UT Bot Buy 발생 → 그 LONG 상태가 유지되는 동안 "
-            "RSI가 50을 아래에서 위로 돌파 → 진입. 이후 UT Bot Sell이 발생하면 정상 청산합니다.\n\n"
-            "SHORT: 정확히 반대입니다. EMA200 아래 → UT Bot Sell → SHORT 상태 유지 중 RSI 50 하향돌파 "
+            "현재 RSI가 50보다 높고 직전 완료봉보다 상승 → 진입. 이후 UT Bot Sell이 발생하면 정상 청산합니다.\n\n"
+            "SHORT: 정확히 반대입니다. EMA200 아래 → UT Bot Sell → SHORT 상태 유지 중 RSI가 50보다 낮고 하락 "
             "→ 진입. 이후 UT Bot Buy에서 정상 청산합니다.\n\n"
-            "RSI가 먼저 50을 통과한 뒤 나중에 UT 신호가 나온 경우는 인정하지 않습니다. "
+            "UT 신호는 현재 RSI 평가봉보다 먼저 확정되어야 하며, 같은 봉 신호는 인정하지 않습니다. "
             "완료된 2시간봉만 사용해 진행 중 봉의 흔들림으로 인한 가짜 돌파를 피합니다.\n\n"
+            f"스캔 대상은 {', '.join(EMA200_BINANCE_TOP10_BASES)} 고정 10개이며, "
+            "그 밖의 종목은 다른 경로에서 신호가 들어와도 진입 단계에서 차단합니다.\n\n"
             "소액계좌(1,000 USDT 이하)는 첫 단계에서 equity의 50%를 증거금으로 5x 진입하고 "
             "UT 반대 신호로만 청산합니다. 손실 후 다음 진입은 증거금 비율을 "
             "35%→25%→15%→10%로 줄이고 비상 Stop을 적용합니다. 수익 또는 본전 청산 시 "
