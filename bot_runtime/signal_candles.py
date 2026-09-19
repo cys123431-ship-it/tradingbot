@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from .ema200_utbot_rsi import (
+    EMA200_UTBOT_RSI_DISPLAY_NAME,
+    EMA200_UTBOT_RSI_STRATEGY,
+)
+
 from trading_safety.protection_coordinator import (
     manage_open_position_protection,
 )
@@ -24,7 +29,7 @@ class SignalCandleMixin:
             comm_cfg = self.get_runtime_common_settings()
             active_strategy = strategy_params.get('active_strategy', 'utbot').upper()
             entry_mode = strategy_params.get('entry_mode', 'cross').upper()
-            if active_strategy in {'UTBOT', 'UTSMC', 'RSIBB', 'UTRSIBB', 'UTRSI', 'UTBB', 'UTBOT_FILTERED_BREAKOUT_V1'}:
+            if active_strategy in {'UTBOT', 'UTSMC', 'RSIBB', 'UTRSIBB', 'UTRSI', 'UTBB', 'UTBOT_FILTERED_BREAKOUT_V1', EMA200_UTBOT_RSI_STRATEGY.upper()}:
                 entry_mode = active_strategy
 
             # MicroVBO State
@@ -149,7 +154,10 @@ class SignalCandleMixin:
             symbol_status['leverage'] = comm_cfg.get('leverage', 1 if self.is_upbit_mode() else 20)
             symbol_status['margin_mode'] = 'SPOT' if self.is_upbit_mode() else 'ISOLATED'
             utbreakout_status = self.last_utbot_filtered_breakout_status.get(symbol, {}) or {}
-            if active_strategy in UTBREAKOUT_STRATEGIES and utbreakout_status.get('entry_timeframe'):
+            if active_strategy == EMA200_UTBOT_RSI_STRATEGY.upper():
+                symbol_status['entry_tf'] = '2h'
+                symbol_status['exit_tf'] = '2h'
+            elif active_strategy in UTBREAKOUT_STRATEGIES and utbreakout_status.get('entry_timeframe'):
                 symbol_status['entry_tf'] = utbreakout_status.get('entry_timeframe')
                 symbol_status['exit_tf'] = utbreakout_status.get('exit_timeframe') or self._get_exit_timeframe(symbol)
             else:
@@ -1796,7 +1804,9 @@ class SignalCandleMixin:
 
             # [MODIFIED] Prioritize entry_timeframe for fetching entry OHLCV
             common_cfg = self.get_runtime_common_settings()
-            if active_strategy in UTBREAKOUT_STRATEGIES:
+            if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+                tf = self._get_ema200_utbot_rsi_config(strategy_params).get('timeframe', '2h')
+            elif active_strategy in UTBREAKOUT_STRATEGIES:
                 filtered_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
                 tf = filtered_cfg.get('entry_timeframe', '15m')
             else:
@@ -1917,7 +1927,39 @@ class SignalCandleMixin:
                 feed_last_ts = int(df.iloc[-1]['timestamp']) if len(df) >= 1 else None
                 closed_row = df.iloc[-2] if len(df) >= 2 else None
                 live_row = df.iloc[-1] if len(df) >= 1 else None
-                if active_strategy == 'utsmc':
+                if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+                strategy_name = f"{EMA200_UTBOT_RSI_DISPLAY_NAME}(Exit)"
+                ut_sig, ut_exit_reason, ut_detail = self._calculate_utbot_signal(
+                    df,
+                    strategy_params,
+                )
+                should_exit_long = current_side.lower() == 'long' and ut_sig == 'short'
+                should_exit_short = current_side.lower() == 'short' and ut_sig == 'long'
+                if should_exit_long or should_exit_short:
+                    opposite_label = 'SELL' if should_exit_long else 'BUY'
+                    self._update_stateful_diag(
+                        symbol,
+                        stage='mechanical_exit',
+                        strategy=EMA200_UTBOT_RSI_DISPLAY_NAME,
+                        raw_state=(ut_detail.get('bias_side') or 'none'),
+                        raw_signal=(ut_sig or 'none'),
+                        pos_side=current_side.upper(),
+                        exit_reason_text=f'UT Bot {opposite_label} fresh signal on completed 2h candle',
+                        exit_trigger_kind='ut_opposite_fresh_signal',
+                        exit_tf='2h',
+                    )
+                    await self.exit_position(
+                        symbol,
+                        f"EMA200_UTBOT_RSI_UT_{opposite_label}",
+                    )
+                else:
+                    self.last_entry_reason[symbol] = (
+                        f"{EMA200_UTBOT_RSI_DISPLAY_NAME}: 포지션 유지, "
+                        f"UT 반대 fresh 신호 대기 ({ut_exit_reason})"
+                    )
+                return True
+
+            if active_strategy == 'utsmc':
                     ut_pending = self._get_utsmc_pending_entry(symbol)
                     ut_pending_source = None
                     ut_pending_state = 'armed' if ut_pending else None
@@ -2160,6 +2202,16 @@ class SignalCandleMixin:
                     raw_state_sig,
                     raw_hybrid_detail,
                     sig
+                )
+
+            elif active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+                await self._handle_ema200_utbot_rsi_primary_strategy(
+                    symbol,
+                    k,
+                    pos,
+                    strategy_name,
+                    raw_hybrid_detail,
+                    sig,
                 )
 
             elif active_strategy == 'rsibb':
@@ -3141,6 +3193,15 @@ class SignalCandleMixin:
             ut_state = hybrid_detail.get('ut_state')
             is_bullish = ut_state == 'long'
             is_bearish = ut_state == 'short'
+        elif active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+            entry_mode = EMA200_UTBOT_RSI_STRATEGY
+            sig, entry_reason, strategy_detail = (
+                precomputed.get(active_strategy)
+                or self._calculate_ema200_utbot_rsi_signal(df, strategy_params)
+            )
+            is_bullish = sig == 'long'
+            is_bearish = sig == 'short'
+
         elif active_strategy == 'rsibb':
             entry_mode = 'rsibb'
             guard_ok, guard_reason = self._rsibb_runtime_guard(strategy_params)
