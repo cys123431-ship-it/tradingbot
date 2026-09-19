@@ -6,6 +6,12 @@ from datetime import datetime, timezone
 
 from options_trading.config import default_options_config, normalize_options_config
 
+from .ema200_utbot_rsi import (
+    EMA200_UTBOT_RSI_CONFIG_KEY,
+    default_ema200_utbot_rsi_config,
+    normalize_ema200_utbot_rsi_config,
+)
+
 from utbreakout.adaptive_breakout_trend import (
     ADAPTIVE_BREAKOUT_TREND_STRATEGY,
     normalize_adaptive_breakout_trend_config,
@@ -162,6 +168,7 @@ class TradingConfig:
                             'c2_breakout_window': 2
                         }
                     },
+                    EMA200_UTBOT_RSI_CONFIG_KEY: default_ema200_utbot_rsi_config(),
                     'RSIBB': {
                         'rsi_length': 6,
                         'bb_length': 200,
@@ -330,6 +337,7 @@ class TradingConfig:
                 }
             },
             'ut_entry_timing_mode': 'next_candle',
+            EMA200_UTBOT_RSI_CONFIG_KEY: default_ema200_utbot_rsi_config(),
             'RSIBB': {
                 'rsi_length': 6,
                 'bb_length': 200,
@@ -380,6 +388,16 @@ class TradingConfig:
                 if sub_key not in current_val:
                     current_val[sub_key] = sub_val
                     changed = True
+        ema200_ut_rsi_cfg = strategy_params.setdefault(
+            EMA200_UTBOT_RSI_CONFIG_KEY,
+            default_ema200_utbot_rsi_config(),
+        )
+        normalized_ema200_ut_rsi_cfg = normalize_ema200_utbot_rsi_config(
+            ema200_ut_rsi_cfg
+        )
+        if ema200_ut_rsi_cfg != normalized_ema200_ut_rsi_cfg:
+            strategy_params[EMA200_UTBOT_RSI_CONFIG_KEY] = normalized_ema200_ut_rsi_cfg
+            changed = True
         utbot_cfg = strategy_params.setdefault('UTBot', {})
         normalized_utbot_filter_pack = normalize_utbot_filter_pack_config(utbot_cfg.get('filter_pack', {}))
         if utbot_cfg.get('filter_pack') != normalized_utbot_filter_pack:
