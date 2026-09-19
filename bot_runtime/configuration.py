@@ -1210,6 +1210,7 @@ class TradingConfig:
                             "c2_breakout_window": 2
                         }
                     },
+                    EMA200_UTBOT_RSI_CONFIG_KEY: default_ema200_utbot_rsi_config(),
                     "RSIBB": {
                         "rsi_length": 6,
                         "bb_length": 200,
