@@ -46,34 +46,38 @@ def _bounded(value, default, low, high):
     return max(float(low), min(float(high), _finite(value, default)))
 
 
+def _enabled_value(value):
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"0", "false", "no", "off", "disabled"}:
+        return False
+    if text in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    return True
+
+
 def normalize_ema200_utbot_rsi_config(raw=None):
     defaults = default_ema200_utbot_rsi_config()
     cfg = dict(defaults)
     if isinstance(raw, dict):
         cfg.update(raw)
 
-    cfg["enabled"] = bool(cfg.get("enabled", True))
+    cfg["enabled"] = _enabled_value(cfg.get("enabled", True))
     # The strategy definition is intentionally fixed to 2h / EMA200 / RSI50.
     cfg["timeframe"] = "2h"
     cfg["ema_period"] = 200
     cfg["rsi_threshold"] = 50.0
     try:
         cfg["rsi_length"] = max(2, min(100, int(cfg.get("rsi_length", 14) or 14)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         cfg["rsi_length"] = 14
 
-    min_risk = _bounded(
-        cfg.get("min_risk_per_trade_percent"),
-        defaults["min_risk_per_trade_percent"],
-        0.01,
-        defaults["max_risk_per_trade_percent"],
-    )
-    max_risk = _bounded(
-        cfg.get("max_risk_per_trade_percent"),
-        defaults["max_risk_per_trade_percent"],
-        min_risk,
-        20.0,
-    )
+    # These are product safety boundaries, not user-tunable settings.  Keeping
+    # them immutable also prevents an older or hand-edited config from silently
+    # widening the Telegram validation range.
+    min_risk = float(defaults["min_risk_per_trade_percent"])
+    max_risk = float(defaults["max_risk_per_trade_percent"])
     cfg["min_risk_per_trade_percent"] = min_risk
     cfg["max_risk_per_trade_percent"] = max_risk
     cfg["risk_per_trade_percent"] = _bounded(
@@ -83,34 +87,18 @@ def normalize_ema200_utbot_rsi_config(raw=None):
         max_risk,
     )
 
-    try:
-        min_leverage = max(1, min(50, int(cfg.get("min_leverage", 1) or 1)))
-    except (TypeError, ValueError):
-        min_leverage = 1
-    try:
-        max_leverage = max(min_leverage, min(50, int(cfg.get("max_leverage", 10) or 10)))
-    except (TypeError, ValueError):
-        max_leverage = 10
+    min_leverage = int(defaults["min_leverage"])
+    max_leverage = int(defaults["max_leverage"])
     try:
         leverage = int(cfg.get("leverage", defaults["leverage"]) or defaults["leverage"])
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         leverage = defaults["leverage"]
     cfg["min_leverage"] = min_leverage
     cfg["max_leverage"] = max_leverage
     cfg["leverage"] = max(min_leverage, min(max_leverage, leverage))
 
-    min_emergency = _bounded(
-        cfg.get("min_emergency_exit_percent"),
-        defaults["min_emergency_exit_percent"],
-        0.1,
-        defaults["max_emergency_exit_percent"],
-    )
-    max_emergency = _bounded(
-        cfg.get("max_emergency_exit_percent"),
-        defaults["max_emergency_exit_percent"],
-        min_emergency,
-        80.0,
-    )
+    min_emergency = float(defaults["min_emergency_exit_percent"])
+    max_emergency = float(defaults["max_emergency_exit_percent"])
     cfg["min_emergency_exit_percent"] = min_emergency
     cfg["max_emergency_exit_percent"] = max_emergency
     cfg["emergency_exit_percent"] = _bounded(
@@ -120,18 +108,8 @@ def normalize_ema200_utbot_rsi_config(raw=None):
         max_emergency,
     )
 
-    min_daily = _bounded(
-        cfg.get("min_daily_loss_limit_percent"),
-        defaults["min_daily_loss_limit_percent"],
-        0.1,
-        defaults["max_daily_loss_limit_percent"],
-    )
-    max_daily = _bounded(
-        cfg.get("max_daily_loss_limit_percent"),
-        defaults["max_daily_loss_limit_percent"],
-        min_daily,
-        100.0,
-    )
+    min_daily = float(defaults["min_daily_loss_limit_percent"])
+    max_daily = float(defaults["max_daily_loss_limit_percent"])
     daily = _bounded(
         cfg.get("daily_loss_limit_percent"),
         defaults["daily_loss_limit_percent"],
@@ -142,18 +120,8 @@ def normalize_ema200_utbot_rsi_config(raw=None):
     cfg["max_daily_loss_limit_percent"] = max_daily
     cfg["daily_loss_limit_percent"] = daily
 
-    min_weekly = _bounded(
-        cfg.get("min_weekly_loss_limit_percent"),
-        defaults["min_weekly_loss_limit_percent"],
-        0.1,
-        defaults["max_weekly_loss_limit_percent"],
-    )
-    max_weekly = _bounded(
-        cfg.get("max_weekly_loss_limit_percent"),
-        defaults["max_weekly_loss_limit_percent"],
-        min_weekly,
-        100.0,
-    )
+    min_weekly = float(defaults["min_weekly_loss_limit_percent"])
+    max_weekly = float(defaults["max_weekly_loss_limit_percent"])
     weekly = _bounded(
         cfg.get("weekly_loss_limit_percent"),
         defaults["weekly_loss_limit_percent"],
@@ -200,9 +168,12 @@ def evaluate_ema200_utbot_rsi_entry(
     except (TypeError, ValueError):
         rsi_ts = 0
 
-    rsi_cross_up = prev_rsi <= threshold and curr_rsi > threshold
-    rsi_cross_down = prev_rsi >= threshold and curr_rsi < threshold
-    ut_precedes_rsi = bool(ut_ts and rsi_ts and ut_ts <= rsi_ts)
+    rsi_cross_up = prev_rsi < threshold and curr_rsi > threshold
+    rsi_cross_down = prev_rsi > threshold and curr_rsi < threshold
+    # A UT state must already exist before the RSI-cross candle.  Signals on the
+    # same completed candle are deliberately rejected because their intrabar
+    # order cannot be proven from OHLCV data.
+    ut_precedes_rsi = bool(ut_ts and rsi_ts and ut_ts < rsi_ts)
 
     detail = {
         "close": close_price,
@@ -307,6 +278,26 @@ def build_ema200_utbot_rsi_risk_plan(
     }
 
 
+def calculate_ema200_utbot_rsi_emergency_stop_price(
+    *,
+    side,
+    entry_price,
+    config=None,
+):
+    """Return the strategy's immutable emergency-stop anchor for a fill."""
+    cfg = normalize_ema200_utbot_rsi_config(config)
+    entry = _finite(entry_price, 0.0)
+    if entry <= 0:
+        raise ValueError("entry_price must be positive")
+    fraction = float(cfg["emergency_exit_percent"]) / 100.0
+    side_key = str(side or "").strip().lower()
+    if side_key == "long":
+        return entry * (1.0 - fraction)
+    if side_key == "short":
+        return entry * (1.0 + fraction)
+    raise ValueError("side must be long or short")
+
+
 def evaluate_ema200_utbot_rsi_loss_gate(
     *,
     account_equity,
@@ -351,5 +342,6 @@ __all__ = (
     "normalize_ema200_utbot_rsi_config",
     "evaluate_ema200_utbot_rsi_entry",
     "build_ema200_utbot_rsi_risk_plan",
+    "calculate_ema200_utbot_rsi_emergency_stop_price",
     "evaluate_ema200_utbot_rsi_loss_gate",
 )

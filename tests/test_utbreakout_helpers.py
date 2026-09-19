@@ -1981,7 +1981,7 @@ def test_main_keyboard_removes_utbot_button():
     assert "/utbot" not in labels
 
     strategy_row = [button.text for button in keyboard.keyboard[1]]
-    assert strategy_row == ["/utbreak", "/trend", "/scanner"]
+    assert strategy_row == ["/utbreak", "/ema200", "/trend", "/scanner"]
 
 
 def test_legacy_utbot_command_routes_to_integrated_menu_handler():

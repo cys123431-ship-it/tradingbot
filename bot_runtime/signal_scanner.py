@@ -3590,7 +3590,9 @@ class SignalScannerMixin:
                 active_strategy = scan_params.get('active_strategy', 'utbot').lower()
                 if active_strategy not in CORE_STRATEGIES:
                     active_strategy = 'utbot'
-                if active_strategy in UTBREAKOUT_STRATEGIES:
+                if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+                    scan_tf = '2h'
+                elif active_strategy in UTBREAKOUT_STRATEGIES:
                     scan_tf = self._get_utbot_filtered_breakout_config(scan_params).get('entry_timeframe', '15m')
                     if (
                         active_strategy != ENTRY_STRATEGY_RELATIVE_STRENGTH_PULLBACK_TREND
@@ -3997,7 +3999,9 @@ class SignalScannerMixin:
                     active_strategy = scan_params.get('active_strategy', 'utbot').lower()
                     if active_strategy not in CORE_STRATEGIES:
                         active_strategy = 'utbot'
-                    if active_strategy in UTBREAKOUT_STRATEGIES:
+                    if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+                        scan_tf = '2h'
+                    elif active_strategy in UTBREAKOUT_STRATEGIES:
                         scan_tf = self._get_utbot_filtered_breakout_config(scan_params).get('entry_timeframe', '15m')
 
                     # Use scanner_timeframe if set, but ensure we are thinking about consistency

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from math import isfinite
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -74,9 +75,9 @@ class ControllerEMA200UTBotRSIMixin:
                 InlineKeyboardButton("❓ 비상탈출 설명", callback_data="e2h:help:emergency"),
             ],
             [
-                InlineKeyboardButton("레버리지 2x", callback_data="e2h:lev:2"),
-                InlineKeyboardButton("3x", callback_data="e2h:lev:3"),
-                InlineKeyboardButton("5x", callback_data="e2h:lev:5"),
+                InlineKeyboardButton("레버리지 2x", callback_data="e2h:leverage:2"),
+                InlineKeyboardButton("3x", callback_data="e2h:leverage:3"),
+                InlineKeyboardButton("5x", callback_data="e2h:leverage:5"),
             ],
             [
                 InlineKeyboardButton("✍️ 레버리지 직접입력", callback_data="e2h:custom:leverage"),
@@ -183,6 +184,8 @@ class ControllerEMA200UTBotRSIMixin:
                 "먼저 손실예산을 정하고 수량을 역산합니다.\n\n"
                 "권장 시작값은 0.50%입니다. 1%를 넘기면 연속 손실 시 "
                 "계좌 감소가 빨라지므로 경고는 표시하지만, 허용 범위 안에서는 직접 설정할 수 있습니다.\n\n"
+                "허용 범위는 0.10~5.00%입니다. 값이 클수록 한 번의 비상탈출 손실과 "
+                "포지션 크기가 커집니다. 이 값은 UT 반대 신호라는 정상 청산 시점을 바꾸지 않습니다.\n\n"
                 "아래 '위험 직접입력'을 누른 뒤 숫자만 보내세요. 예: 0.5"
             )
         if kind == "emergency":
@@ -199,6 +202,8 @@ class ControllerEMA200UTBotRSIMixin:
                 "그래서 완전히 OFF할 수 없고 거리만 조정할 수 있습니다.\n\n"
                 "설정 변경은 새로 진입하는 포지션부터 적용합니다. 이미 보유 중인 포지션의 "
                 "보호 주문을 텔레그램 설정 변경만으로 몰래 교체하지 않습니다.\n\n"
+                "허용 범위는 0.5~30%입니다. 너무 가까우면 평범한 가격 흔들림에도 Stop이 "
+                "체결될 수 있고, 너무 멀면 한 번의 비상 손실이 커집니다. 정상 UT 청산과는 별개입니다.\n\n"
                 "아래 '비상탈출 직접입력'을 누른 뒤 가격 변동률 숫자만 보내세요. 예: 5"
             )
         if kind == "leverage":
@@ -210,7 +215,8 @@ class ControllerEMA200UTBotRSIMixin:
                 "예시) 명목 포지션 100 USDT라면 5x에서 필요한 초기 증거금은 대략 20 USDT입니다.\n"
                 "레버리지가 높을수록 청산가가 가까워질 수 있으므로 기존 청산가 안전검사가 "
                 "비상탈출보다 청산 위험이 앞서는 설정을 차단하거나 더 안전한 값으로 제한합니다.\n\n"
-                "초기 기본값은 5x이며 1~10x 범위에서 이 전략 전용으로 조정합니다."
+                "초기 기본값은 5x이며 허용 범위는 1~10x입니다. 높은 값은 청산 여유를 줄일 수 있지만 "
+                "UT 반대 신호라는 정상 청산 규칙은 바꾸지 않습니다. 직접입력 예: 5"
             )
         if kind == "daily":
             return (
@@ -220,6 +226,8 @@ class ControllerEMA200UTBotRSIMixin:
                 "보유 포지션은 원래 UT 반대 신호 또는 비상탈출로 종료됩니다.\n\n"
                 "예시) 계좌 1,000 USDT, 일일 한도 2%라면 오늘 실현손익이 약 -20 USDT 이하가 된 뒤 "
                 "추가 신규진입을 멈춥니다.\n\n"
+                "허용 범위는 0.5~20%입니다. 너무 높으면 하루 누적 손실을 크게 허용하고, 너무 낮으면 "
+                "새 기회를 일찍 차단합니다. 정상 UT 청산과 비상 Stop에는 영향을 주지 않습니다.\n\n"
                 "직접입력 예: 2"
             )
         if kind == "weekly":
@@ -229,6 +237,8 @@ class ControllerEMA200UTBotRSIMixin:
                 "일일 한도와 마찬가지로 이미 보유한 포지션을 강제청산하지 않습니다.\n\n"
                 "예시) 계좌 1,000 USDT, 7일 한도 5%라면 최근 7일 실현손익이 약 -50 USDT 이하일 때 "
                 "새 거래를 중지합니다.\n\n"
+                "허용 범위는 1~40%입니다. 너무 높으면 연속 손실 누적을 크게 허용하고, 너무 낮으면 "
+                "회복 거래 기회를 일찍 차단합니다. 정상 UT 청산과 비상 Stop에는 영향을 주지 않습니다.\n\n"
                 "7일 한도는 일일 한도보다 작게 설정할 수 없습니다. 직접입력 예: 5"
             )
         return (
@@ -415,6 +425,12 @@ class ControllerEMA200UTBotRSIMixin:
                 await update.message.reply_text(
                     "숫자로 입력해야 합니다. 예: 0.5 또는 5\n"
                     "다시 /ema200 메뉴에서 직접입력 버튼을 눌러 주세요."
+                )
+                raise ApplicationHandlerStop
+            if not isfinite(number):
+                await update.message.reply_text(
+                    "NaN 또는 무한대는 사용할 수 없습니다. 유한한 숫자를 입력하세요.\n"
+                    "설정은 변경하지 않았습니다. /ema200에서 다시 시도하세요."
                 )
                 raise ApplicationHandlerStop
 

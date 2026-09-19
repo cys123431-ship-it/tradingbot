@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .ema200_utbot_rsi import EMA200_UTBOT_RSI_STRATEGY
+
 from utbreakout.small_account.risk import (
     classify_stop_geometry,
     position_mark_price,
@@ -1268,6 +1270,16 @@ class SignalProtectionMixin:
             qty = 0.0
         if qty <= 0:
             return False, False
+        try:
+            active_strategy = str(
+                self.get_runtime_strategy_params().get('active_strategy', '') or ''
+            ).lower()
+        except Exception:
+            active_strategy = ''
+        if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+            # This strategy never uses a fixed TP, while its emergency exchange
+            # stop is mandatory even if generic TP/SL switches are disabled.
+            return False, True
         try:
             cfg = self.get_runtime_common_settings()
         except Exception:

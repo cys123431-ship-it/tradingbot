@@ -27,12 +27,29 @@ class SignalEMA200UTBotRSIMixin:
 
     @staticmethod
     def _calculate_wilder_rsi_for_ema200_strategy(close_series, length):
-        close = pd.Series(close_series, dtype=float)
+        close = pd.Series(close_series, dtype=float).reset_index(drop=True)
+        length = max(2, int(length))
         delta = close.diff()
         gains = delta.clip(lower=0.0)
         losses = (-delta.clip(upper=0.0))
-        avg_gain = gains.ewm(alpha=1.0 / float(length), adjust=False, min_periods=length).mean()
-        avg_loss = losses.ewm(alpha=1.0 / float(length), adjust=False, min_periods=length).mean()
+        avg_gain = pd.Series(float("nan"), index=close.index, dtype=float)
+        avg_loss = pd.Series(float("nan"), index=close.index, dtype=float)
+        if len(close) <= length:
+            return avg_gain
+
+        # Wilder's RMA starts with a simple average of the first `length`
+        # changes, then applies (previous * (length - 1) + current) / length.
+        # pandas ewm(adjust=False) seeds from the first observation instead and
+        # produces materially different early RSI values.
+        avg_gain.iloc[length] = float(gains.iloc[1:length + 1].mean())
+        avg_loss.iloc[length] = float(losses.iloc[1:length + 1].mean())
+        for index in range(length + 1, len(close)):
+            avg_gain.iloc[index] = (
+                avg_gain.iloc[index - 1] * (length - 1) + gains.iloc[index]
+            ) / length
+            avg_loss.iloc[index] = (
+                avg_loss.iloc[index - 1] * (length - 1) + losses.iloc[index]
+            ) / length
         rs = avg_gain / avg_loss.replace(0.0, float("nan"))
         rsi = 100.0 - (100.0 / (1.0 + rs))
         only_gain = (avg_loss == 0.0) & (avg_gain > 0.0)

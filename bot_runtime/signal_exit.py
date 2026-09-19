@@ -2419,6 +2419,7 @@ class SignalExitMixin:
         preserve_runner_qty=False,
         sl_price_override=None,
         position_hint=None,
+        notify_after_place=True,
     ):
         """Place reduce-only TP/SL protection orders for the current futures position."""
         try:
@@ -2938,7 +2939,7 @@ class SignalExitMixin:
                 )
             if sl_order and sl_price is not None:
                 notice_parts.append(f"🛑 SL: `{float(sl_price):.2f}` x `{float(sl_qty):.6f}`")
-            if notice_parts:
+            if notice_parts and notify_after_place:
                 await self.ctrl.notify(" | ".join(notice_parts))
 
             audit_delay = max(

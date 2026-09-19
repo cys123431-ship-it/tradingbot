@@ -1,6 +1,22 @@
+import asyncio
+import inspect
+from types import SimpleNamespace
+
+import pandas as pd
+import pytest
+from telegram.ext import (
+    ApplicationHandlerStop,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+)
+
+import emas
+from bot_runtime.controller_ema200_utbot_rsi import ControllerEMA200UTBotRSIMixin
 from bot_runtime.ema200_utbot_rsi import (
     EMA200_UTBOT_RSI_STRATEGY,
     build_ema200_utbot_rsi_risk_plan,
+    calculate_ema200_utbot_rsi_emergency_stop_price,
     evaluate_ema200_utbot_rsi_entry,
     evaluate_ema200_utbot_rsi_loss_gate,
     normalize_ema200_utbot_rsi_config,
@@ -44,6 +60,22 @@ def test_long_rejects_rsi_cross_that_happened_before_ut_buy():
     assert "먼저 확정되지 않음" in reason
 
 
+def test_same_completed_candle_ut_and_rsi_is_rejected_because_order_is_unknown():
+    signal, reason, detail = evaluate_ema200_utbot_rsi_entry(
+        close_price=110.0,
+        ema200=100.0,
+        ut_state="long",
+        ut_last_signal_side="long",
+        ut_last_signal_ts=2_000,
+        prev_rsi=49.0,
+        curr_rsi=51.0,
+        rsi_signal_ts=2_000,
+    )
+    assert signal is None
+    assert detail["ut_precedes_rsi"] is False
+    assert "먼저 확정되지 않음" in reason
+
+
 def test_long_requires_fresh_cross_not_merely_rsi_above_50():
     signal, _, detail = evaluate_ema200_utbot_rsi_entry(
         close_price=110.0,
@@ -57,6 +89,28 @@ def test_long_requires_fresh_cross_not_merely_rsi_above_50():
     )
     assert signal is None
     assert detail["rsi_cross_up"] is False
+
+
+@pytest.mark.parametrize(
+    ("ut_state", "previous", "current"),
+    [("long", 50.0, 51.0), ("short", 50.0, 49.0)],
+)
+def test_rsi_must_cross_from_strictly_below_or_above_threshold(
+    ut_state,
+    previous,
+    current,
+):
+    signal, _, _ = evaluate_ema200_utbot_rsi_entry(
+        close_price=110.0 if ut_state == "long" else 90.0,
+        ema200=100.0,
+        ut_state=ut_state,
+        ut_last_signal_side=ut_state,
+        ut_last_signal_ts=1_000,
+        prev_rsi=previous,
+        curr_rsi=current,
+        rsi_signal_ts=2_000,
+    )
+    assert signal is None
 
 
 def test_short_is_exact_inverse():
@@ -146,3 +200,495 @@ def test_weekly_limit_is_never_normalized_below_daily_limit():
         }
     )
     assert cfg["weekly_loss_limit_percent"] >= cfg["daily_loss_limit_percent"]
+
+
+def test_config_normalization_keeps_fixed_safety_ranges_and_rejects_nonfinite_values():
+    cfg = normalize_ema200_utbot_rsi_config(
+        {
+            "min_risk_per_trade_percent": 0.001,
+            "max_risk_per_trade_percent": 99.0,
+            "enabled": "false",
+            "risk_per_trade_percent": float("nan"),
+            "rsi_length": float("inf"),
+            "min_leverage": 0,
+            "max_leverage": 99,
+            "leverage": float("inf"),
+            "max_emergency_exit_percent": 99.0,
+            "emergency_exit_percent": float("inf"),
+            "max_daily_loss_limit_percent": 99.0,
+            "daily_loss_limit_percent": 99.0,
+            "max_weekly_loss_limit_percent": 99.0,
+            "weekly_loss_limit_percent": 99.0,
+        }
+    )
+    assert cfg["min_risk_per_trade_percent"] == 0.10
+    assert cfg["enabled"] is False
+    assert cfg["max_risk_per_trade_percent"] == 5.00
+    assert cfg["risk_per_trade_percent"] == 0.50
+    assert cfg["min_leverage"] == 1
+    assert cfg["max_leverage"] == 10
+    assert cfg["rsi_length"] == 14
+    assert cfg["leverage"] == 5
+    assert cfg["emergency_exit_percent"] == 5.0
+    assert cfg["max_emergency_exit_percent"] == 30.0
+    assert cfg["daily_loss_limit_percent"] == 20.0
+    assert cfg["weekly_loss_limit_percent"] == 40.0
+
+
+def test_emergency_stop_price_is_long_short_symmetric():
+    config = {"emergency_exit_percent": 5.0}
+    assert calculate_ema200_utbot_rsi_emergency_stop_price(
+        side="long", entry_price=100.0, config=config
+    ) == pytest.approx(95.0)
+    assert calculate_ema200_utbot_rsi_emergency_stop_price(
+        side="short", entry_price=100.0, config=config
+    ) == pytest.approx(105.0)
+
+
+def test_signal_uses_last_completed_candle_and_ignores_current_candle():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    rows = []
+    for index in range(205):
+        close = 100.0 + index
+        rows.append([index, close - 1.0, close + 1.0, close - 2.0, close, 10.0])
+    rows[-1][4] = 10_000.0
+    frame = pd.DataFrame(
+        rows,
+        columns=["timestamp", "open", "high", "low", "close", "volume"],
+    )
+    engine._calculate_utbot_signal = lambda df, params: (
+        None,
+        "no fresh signal",
+        {"bias_side": "long", "signal_side": "long", "signal_ts": 100},
+    )
+
+    _, _, detail = engine._calculate_ema200_utbot_rsi_signal(
+        frame,
+        {"EMA200UTBotRSI2H": {"enabled": True}},
+    )
+
+    assert detail["closed_candle_ts"] == rows[-2][0]
+    assert detail["closed_candle_close"] == rows[-2][4]
+    assert detail["closed_candle_close"] != rows[-1][4]
+
+
+def test_rsi_uses_wilder_sma_seed_then_recursive_smoothing():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    rsi = engine._calculate_wilder_rsi_for_ema200_strategy(
+        [10.0, 11.0, 10.0, 12.0, 11.0],
+        3,
+    )
+
+    assert rsi.iloc[:3].isna().all()
+    assert rsi.iloc[3] == pytest.approx(75.0)
+    assert rsi.iloc[4] == pytest.approx(54.5454545455)
+
+
+def test_primary_and_exit_polling_are_fixed_to_2h():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    params = {
+        "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
+        "EMA200UTBotRSI2H": {"timeframe": "4h"},
+    }
+    engine.get_runtime_trade_config = lambda: {
+        "common_settings": {"entry_timeframe": "15m", "exit_timeframe": "4h"},
+        "strategy_params": params,
+    }
+    engine.get_runtime_common_settings = lambda: {
+        "entry_timeframe": "15m",
+        "exit_timeframe": "4h",
+    }
+    engine.get_runtime_strategy_params = lambda: params
+
+    assert engine._get_primary_poll_timeframe() == "2h"
+    assert engine._get_exit_timeframe("BTC/USDT") == "2h"
+
+    scanner_source = inspect.getsource(emas.SignalEngine._scan_and_trade_coin_selector)
+    high_volume_source = inspect.getsource(emas.SignalEngine.scan_and_trade_high_volume)
+    for source in (scanner_source, high_volume_source):
+        strategy_branch = source.index(
+            "if active_strategy == EMA200_UTBOT_RSI_STRATEGY:"
+        )
+        following_branch = source.index(
+            "elif active_strategy in UTBREAKOUT_STRATEGIES:", strategy_branch
+        )
+        assert "scan_tf = '2h'" in source[strategy_branch:following_branch]
+
+
+def test_latest_strategy_evaluation_is_saved_for_telegram_status():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.last_ema200_utbot_rsi_status = {}
+    expected_detail = {
+        "closed_candle_ts": 123,
+        "closed_candle_close": 101.0,
+        "ema200": 100.0,
+        "ut_state": "long",
+        "prev_rsi": 49.0,
+        "curr_rsi": 51.0,
+    }
+    engine._calculate_ema200_utbot_rsi_signal = lambda df, params: (
+        "long",
+        "ready",
+        dict(expected_detail),
+    )
+
+    context = engine._collect_primary_strategy_context(
+        "BTC/USDT",
+        pd.DataFrame(),
+        {"active_strategy": EMA200_UTBOT_RSI_STRATEGY},
+        EMA200_UTBOT_RSI_STRATEGY,
+    )
+
+    assert context["precomputed"][EMA200_UTBOT_RSI_STRATEGY][0] == "long"
+    assert engine.last_ema200_utbot_rsi_status["BTC/USDT"] == expected_detail
+
+
+@pytest.mark.parametrize(
+    ("current_side", "ut_signal", "exit_label", "enabled"),
+    [
+        ("long", "short", "EMA200_UTBOT_RSI_UT_SELL", False),
+        ("short", "long", "EMA200_UTBOT_RSI_UT_BUY", True),
+    ],
+)
+def test_fresh_opposite_ut_signal_mechanically_exits_before_optional_filters(
+    current_side,
+    ut_signal,
+    exit_label,
+    enabled,
+):
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.market_data_exchange = SimpleNamespace(
+        fetch_ohlcv=lambda *args, **kwargs: [
+            [1, 1, 2, 0.5, 1.5, 10],
+            [2, 1.5, 2, 0.5, 1.4, 10],
+            [3, 1.4, 2, 0.5, 1.3, 10],
+        ]
+    )
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
+        "EMA200UTBotRSI2H": {"enabled": enabled},
+    }
+    engine.get_runtime_common_settings = lambda: (_ for _ in ()).throw(
+        AssertionError("optional exit filters must not run")
+    )
+    engine._calculate_utbot_signal = lambda df, params: (
+        ut_signal,
+        "fresh opposite",
+        {"bias_side": ut_signal},
+    )
+    engine._update_stateful_diag = lambda *args, **kwargs: None
+    engine.last_entry_reason = {}
+    exit_calls = []
+
+    async def exit_position(symbol, reason):
+        exit_calls.append((symbol, reason))
+
+    async def fetch_position(symbol):
+        return True, None
+
+    engine.exit_position = exit_position
+    engine._fetch_server_position_checked = fetch_position
+
+    processed = asyncio.run(
+        engine.process_exit_candle("BTC/USDT", "2h", current_side)
+    )
+
+    assert processed is True
+    assert exit_calls == [("BTC/USDT", exit_label)]
+
+
+def test_mechanical_exit_retries_same_candle_when_position_remains_open():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.market_data_exchange = SimpleNamespace(
+        fetch_ohlcv=lambda *args, **kwargs: [
+            [1, 1, 2, 0.5, 1.5, 10],
+            [2, 1.5, 2, 0.5, 1.4, 10],
+            [3, 1.4, 2, 0.5, 1.3, 10],
+        ]
+    )
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
+    }
+    engine._calculate_utbot_signal = lambda df, params: (
+        "short",
+        "fresh sell",
+        {"bias_side": "short"},
+    )
+    engine._update_stateful_diag = lambda *args, **kwargs: None
+    engine.last_entry_reason = {}
+
+    async def exit_position(symbol, reason):
+        return None
+
+    async def fetch_position(symbol):
+        return True, {"side": "long", "contracts": 1.0}
+
+    engine.exit_position = exit_position
+    engine._fetch_server_position_checked = fetch_position
+
+    assert asyncio.run(engine.process_exit_candle("BTC/USDT", "2h", "long")) is False
+    assert "재시도" in engine.last_entry_reason["BTC/USDT"]
+
+
+def test_protection_audit_always_requires_stop_and_never_fixed_tp_for_strategy():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.is_upbit_mode = lambda: False
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
+    }
+    engine.get_runtime_common_settings = lambda: {
+        "tp_sl_enabled": False,
+        "take_profit_enabled": True,
+        "stop_loss_enabled": False,
+    }
+
+    expected = engine._protection_expected_from_config(
+        "BTC/USDT",
+        {"side": "long", "contracts": 1.0},
+    )
+
+    assert expected == (False, True)
+
+
+def test_entry_branch_places_emergency_stop_only_and_defers_notification():
+    source = inspect.getsource(emas.SignalEngine.entry)
+    protection_branch = source.rsplit(
+        "elif active_strategy == EMA200_UTBOT_RSI_STRATEGY:", 1
+    )[1].split("elif active_strategy in UTBREAKOUT_STRATEGIES:", 1)[0]
+    assert "tp_distance=None" in protection_branch
+    assert "sl_distance=emergency_distance" in protection_branch
+    assert "notify_after_place=False" in protection_branch
+
+
+def test_minimum_notional_branch_blocks_instead_of_auto_increasing_strategy_size():
+    source = inspect.getsource(emas.SignalEngine.entry)
+    start = source.index("if min_notional > 0 and target_notional < min_notional:")
+    auto_bump = source.index("# If balance/leverage can support exchange minimum", start)
+    strategy_block = source[start:auto_bump]
+    assert "active_strategy == EMA200_UTBOT_RSI_STRATEGY" in strategy_block
+    assert "return" in strategy_block
+    assert "target_notional = min_notional" not in strategy_block
+
+
+def test_common_daily_breaker_is_bypassed_without_touching_mandatory_safety_paths():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
+    }
+    engine._fetch_active_position_symbols_checked = lambda: (_ for _ in ()).throw(
+        AssertionError("common forced-close path must not run")
+    )
+
+    assert asyncio.run(engine.check_daily_loss_limit()) is False
+    entry_source = inspect.getsource(emas.SignalEngine.entry)
+    assert "_submit_idempotent_crypto_entry" in entry_source
+    assert "_preflight_liquidation_safety" in entry_source
+    assert "_verify_actual_liquidation_safety" in entry_source
+
+
+class _TelegramConfig(dict):
+    def __init__(self):
+        super().__init__({"binance_futures": {"strategy_params": {}}})
+        self.updates = []
+
+    async def update_value(self, path, value):
+        self.updates.append((list(path), value))
+
+
+class _TelegramApp:
+    def __init__(self):
+        self.handlers = []
+
+    def add_handler(self, handler, group=0):
+        self.handlers.append((handler, group))
+
+
+class _TelegramMessage:
+    def __init__(self, text):
+        self.text = text
+        self.replies = []
+
+    async def reply_text(self, text, **kwargs):
+        self.replies.append(text)
+
+
+class _TelegramQuery:
+    def __init__(self, data):
+        self.data = data
+        self.edits = []
+
+    async def answer(self):
+        return None
+
+    async def edit_message_text(self, text, **kwargs):
+        self.edits.append(text)
+
+
+def _registered_telegram_controller():
+    controller = ControllerEMA200UTBotRSIMixin()
+    controller.tg_app = _TelegramApp()
+    controller.cfg = _TelegramConfig()
+    controller.get_active_trade_section = lambda: "binance_futures"
+    controller.is_upbit_mode = lambda: False
+    controller._register_ema200_utbot_rsi_handlers(
+        lambda callback: callback,
+        filters.TEXT & ~filters.COMMAND,
+    )
+    return controller
+
+
+@pytest.mark.parametrize("raw_value", ["9", "nan", "inf"])
+def test_telegram_direct_risk_input_rejects_out_of_range_and_nonfinite(raw_value):
+    controller = _registered_telegram_controller()
+    handler, group = next(
+        (handler, group)
+        for handler, group in controller.tg_app.handlers
+        if isinstance(handler, MessageHandler)
+    )
+    message = _TelegramMessage(raw_value)
+    context = SimpleNamespace(user_data={"ema200_utbot_rsi_custom": "risk"})
+
+    with pytest.raises(ApplicationHandlerStop):
+        asyncio.run(handler.callback(SimpleNamespace(message=message), context))
+
+    assert group == -2
+    assert controller.cfg.updates == []
+    assert message.replies
+
+
+def test_telegram_custom_handler_without_state_returns_without_stopping_other_groups():
+    controller = _registered_telegram_controller()
+    handler, group = next(
+        (handler, group)
+        for handler, group in controller.tg_app.handlers
+        if isinstance(handler, MessageHandler)
+    )
+    message = _TelegramMessage("ordinary text")
+
+    result = asyncio.run(
+        handler.callback(
+            SimpleNamespace(message=message),
+            SimpleNamespace(user_data={}),
+        )
+    )
+
+    assert group == -2
+    assert result is None
+    assert message.replies == []
+
+
+def test_telegram_activation_is_blocked_when_position_is_open():
+    controller = _registered_telegram_controller()
+
+    async def has_open_position():
+        return True, "BTC/USDT"
+
+    controller._ema200_utbot_rsi_has_open_position = has_open_position
+    handler = next(
+        handler
+        for handler, _ in controller.tg_app.handlers
+        if isinstance(handler, CallbackQueryHandler)
+    )
+    query = _TelegramQuery("e2h:activate")
+
+    asyncio.run(
+        handler.callback(
+            SimpleNamespace(callback_query=query),
+            SimpleNamespace(user_data={}),
+        )
+    )
+
+    assert controller.cfg.updates == []
+    assert query.edits
+    assert "열린 포지션" in query.edits[-1]
+
+
+def test_telegram_activation_fails_closed_when_position_lookup_fails():
+    controller = _registered_telegram_controller()
+
+    async def position_lookup_failed():
+        return None, "포지션 조회 실패: timeout"
+
+    controller._ema200_utbot_rsi_has_open_position = position_lookup_failed
+    handler = next(
+        handler
+        for handler, _ in controller.tg_app.handlers
+        if isinstance(handler, CallbackQueryHandler)
+    )
+    query = _TelegramQuery("e2h:activate")
+
+    asyncio.run(
+        handler.callback(
+            SimpleNamespace(callback_query=query),
+            SimpleNamespace(user_data={}),
+        )
+    )
+
+    assert controller.cfg.updates == []
+    assert query.edits
+    assert "전략 변경을 중단" in query.edits[-1]
+
+
+def test_telegram_quick_leverage_button_updates_strategy_leverage():
+    controller = _registered_telegram_controller()
+    handler = next(
+        handler
+        for handler, _ in controller.tg_app.handlers
+        if isinstance(handler, CallbackQueryHandler)
+    )
+    query = _TelegramQuery("e2h:leverage:5")
+
+    asyncio.run(
+        handler.callback(
+            SimpleNamespace(callback_query=query),
+            SimpleNamespace(user_data={}),
+        )
+    )
+
+    assert controller.cfg.updates == [
+        (
+            [
+                "binance_futures",
+                "strategy_params",
+                "EMA200UTBotRSI2H",
+                "leverage",
+            ],
+            5,
+        )
+    ]
+    assert query.edits
+
+
+def test_telegram_daily_input_raises_weekly_limit_to_preserve_valid_ordering():
+    controller = _registered_telegram_controller()
+    handler, _ = next(
+        (handler, group)
+        for handler, group in controller.tg_app.handlers
+        if isinstance(handler, MessageHandler)
+    )
+    message = _TelegramMessage("6")
+    context = SimpleNamespace(user_data={"ema200_utbot_rsi_custom": "daily"})
+
+    with pytest.raises(ApplicationHandlerStop):
+        asyncio.run(handler.callback(SimpleNamespace(message=message), context))
+
+    assert controller.cfg.updates == [
+        (
+            [
+                "binance_futures",
+                "strategy_params",
+                "EMA200UTBotRSI2H",
+                "daily_loss_limit_percent",
+            ],
+            6.0,
+        ),
+        (
+            [
+                "binance_futures",
+                "strategy_params",
+                "EMA200UTBotRSI2H",
+                "weekly_loss_limit_percent",
+            ],
+            6.0,
+        ),
+    ]

@@ -7,6 +7,7 @@ from utbreakout.dynamic_leverage import apply_dynamic_leverage_to_plan
 from .ema200_utbot_rsi import (
     EMA200_UTBOT_RSI_STRATEGY,
     build_ema200_utbot_rsi_risk_plan,
+    calculate_ema200_utbot_rsi_emergency_stop_price,
     evaluate_ema200_utbot_rsi_loss_gate,
 )
 
@@ -1345,11 +1346,10 @@ class SignalEntryMixin:
             if isinstance(filtered_breakout_plan, dict):
                 liquidation_payload.update(filtered_breakout_plan)
             if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
-                emergency_fraction = float(ema200_risk_cfg['emergency_exit_percent']) / 100.0
-                liquidation_stop = (
-                    float(price) * (1.0 - emergency_fraction)
-                    if str(side).lower() == 'long'
-                    else float(price) * (1.0 + emergency_fraction)
+                liquidation_stop = calculate_ema200_utbot_rsi_emergency_stop_price(
+                    side=side,
+                    entry_price=price,
+                    config=ema200_risk_cfg,
                 )
             else:
                 liquidation_stop = self._extract_liquidation_stop_price(
@@ -1882,12 +1882,19 @@ class SignalEntryMixin:
             actual_liquidation_payload = dict(cfg or {})
             if isinstance(filtered_breakout_plan, dict):
                 actual_liquidation_payload.update(filtered_breakout_plan)
-            actual_stop_price = self._extract_liquidation_stop_price(
-                side,
-                actual_entry_price,
-                actual_liquidation_payload,
-                lev,
-            )
+            if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+                actual_stop_price = calculate_ema200_utbot_rsi_emergency_stop_price(
+                    side=side,
+                    entry_price=actual_entry_price,
+                    config=ema200_risk_cfg,
+                )
+            else:
+                actual_stop_price = self._extract_liquidation_stop_price(
+                    side,
+                    actual_entry_price,
+                    actual_liquidation_payload,
+                    lev,
+                )
             actual_liquidation_check = await self._verify_actual_liquidation_safety(
                 symbol,
                 side,
@@ -2092,6 +2099,7 @@ class SignalEntryMixin:
                     tp_distance=None,
                     sl_distance=emergency_distance,
                     position_hint=verify_pos,
+                    notify_after_place=False,
                 )
                 # Do not perform Telegram I/O before the final protection audit.
                 # Append the emergency-stop explanation to the entry notice, which is

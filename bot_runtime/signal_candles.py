@@ -2463,6 +2463,21 @@ class SignalCandleMixin:
                         symbol,
                         f"EMA200_UTBOT_RSI_UT_{opposite_label}",
                     )
+                    position_fetch_ok, remaining_pos = (
+                        await self._fetch_server_position_checked(symbol)
+                    )
+                    if not position_fetch_ok:
+                        self.last_entry_reason[symbol] = (
+                            f"{EMA200_UTBOT_RSI_DISPLAY_NAME}: UT {opposite_label} 청산 후 "
+                            "포지션 재확인 실패 — 같은 완료봉에서 재시도"
+                        )
+                        return False
+                    if remaining_pos:
+                        self.last_entry_reason[symbol] = (
+                            f"{EMA200_UTBOT_RSI_DISPLAY_NAME}: UT {opposite_label} 청산 미완료 — "
+                            "같은 완료봉에서 재시도"
+                        )
+                        return False
                 else:
                     self.last_entry_reason[symbol] = (
                         f"{EMA200_UTBOT_RSI_DISPLAY_NAME}: 포지션 유지, "
