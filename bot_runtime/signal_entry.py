@@ -7,6 +7,7 @@ from utbreakout.dynamic_leverage import apply_dynamic_leverage_to_plan
 from .ema200_utbot_rsi import (
     EMA200_UTBOT_RSI_STRATEGY,
     build_ema200_utbot_rsi_risk_plan,
+    evaluate_ema200_utbot_rsi_loss_gate,
 )
 
 
@@ -793,6 +794,31 @@ class SignalEntryMixin:
                 logger.warning(f"Insufficient balance: {free}")
                 await self.ctrl.notify(f"⚠️ 잔고 부족: ${free:.2f}")
                 return
+
+            if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+                try:
+                    _, ema200_daily_pnl = self.db.get_daily_stats()
+                    _, ema200_weekly_pnl = self.db.get_weekly_stats()
+                    ema200_loss_gate = evaluate_ema200_utbot_rsi_loss_gate(
+                        account_equity=sizing_equity,
+                        daily_realized_pnl=ema200_daily_pnl,
+                        weekly_realized_pnl=ema200_weekly_pnl,
+                        config=ema200_risk_cfg,
+                    )
+                except Exception as gate_exc:
+                    logger.exception('EMA200 strategy realized-loss gate failed')
+                    await self.ctrl.notify(
+                        '⚠️ EMA200 + UT Bot + RSI (2H) 진입 차단: '
+                        f'손실한도 확인 실패 ({type(gate_exc).__name__}: {gate_exc})'
+                    )
+                    return
+                if not ema200_loss_gate.get('allowed'):
+                    await self.ctrl.notify(
+                        '🛑 EMA200 + UT Bot + RSI (2H) 신규 진입 차단\n'
+                        f"{ema200_loss_gate.get('reason')}\n"
+                        '보유 포지션 강제청산 규칙이 아니라 새 진입만 막는 보호장치입니다.'
+                    )
+                    return
 
             def _safe_float(v):
                 try:
