@@ -71,6 +71,8 @@ class SignalFilterMixin:
             context['raw_ut_detail'] = detail.get('ut_detail') or {}
             context['raw_hybrid_detail'] = detail or {}
             context['precomputed'][active_strategy] = strategy_result
+            self._ensure_runtime_state_containers(('last_ema200_utbot_rsi_status',))
+            self.last_ema200_utbot_rsi_status[symbol] = dict(detail or {})
         elif active_strategy == 'rsibb':
             rsibb_result = self._calculate_rsibb_signal(df, strategy_params)
             context['raw_strategy_sig'] = rsibb_result[0]
