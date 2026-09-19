@@ -375,7 +375,7 @@ TELEGRAM_EMERGENCY_PATTERN = (
     r"(?:/(?:stop|pause|resume)(?:@[A-Za-z0-9_]+)?|STOP|PAUSE|RESUME)\s*$"
 )
 TELEGRAM_MENU_COMMAND_PATTERN = (
-    r"^/(status|history|log|help|stats|close|utbreak|utbreakout|trend|utbot|setup|"
+    r"^/(status|history|log|help|stats|close|utbreak|utbreakout|ema200|trend|utbot|setup|"
     r"coinscan|customcoins|microauto|prediction|options|customentry|custom)(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"
 )
 TELEGRAM_UTBREAK_INTEGRATED_COMMANDS = frozenset({
