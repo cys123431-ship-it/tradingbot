@@ -1566,11 +1566,14 @@ class SignalPositionLifecycleMixin:
                         reason='UTBreak startup protection recovery',
                     )
                 else:
+                    expected_tp, expected_sl = (
+                        self._protection_expected_from_config(symbol, pos)
+                    )
                     await self._audit_protection_orders(
                         symbol,
                         pos=pos,
-                        expected_tp=False,
-                        expected_sl=True,
+                        expected_tp=expected_tp,
+                        expected_sl=expected_sl,
                         alert=True,
                     )
                 audited += 1

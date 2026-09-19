@@ -575,10 +575,19 @@ async def reconcile_exchange_state(
             valid_stops.append(stop)
         if enforce_liquidation_safety and liquidation_price <= 0:
             issues.append(f"liquidation_price_unavailable:{symbol}")
-        if not valid_stops:
+        intentional_strategy_managed_no_stop = any(
+            str(record.strategy or '').strip().lower()
+            == 'ema200_utbot_rsi_2h'
+            and str(record.order_intent or '').upper() == OrderIntent.ENTRY.value
+            and bool(
+                (record.metadata or {}).get('strategy_managed_no_stop')
+            )
+            for record in records
+        )
+        if not valid_stops and not intentional_strategy_managed_no_stop:
             issues.append(f"position_without_verified_stop:{symbol}")
             issues.extend(f"unsafe_stop:{symbol}:{reason}" for reason in sorted(set(stop_failures)))
-        else:
+        elif valid_stops:
             for record in records:
                 if record.order_state in {
                     OrderState.FILLED_UNPROTECTED.value,

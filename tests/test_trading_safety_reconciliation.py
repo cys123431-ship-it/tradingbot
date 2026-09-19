@@ -133,6 +133,43 @@ def test_unprotected_position_blocks_and_verified_stop_recovers(tmp_path):
     asyncio.run(scenario())
 
 
+def test_intentional_ema200_first_stage_without_stop_reconciles_safely(tmp_path):
+    async def scenario():
+        store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+        store.upsert(
+            OrderRecord(
+                "ema-entry-1",
+                "BTC/USDT:USDT",
+                "LONG",
+                "ema200_utbot_rsi_2h",
+                "1",
+                1.0,
+                order_state=OrderState.PROTECTED.value,
+                metadata={"strategy_managed_no_stop": True},
+            )
+        )
+        position = {
+            "symbol": "BTC/USDT:USDT",
+            "side": "long",
+            "contracts": 1,
+            "entryPrice": 100,
+        }
+
+        result = await reconcile_exchange_state(
+            ReconcileExchange([position], []),
+            store,
+        )
+
+        assert result.safe_to_trade is True
+        assert not any(
+            "position_without_verified_stop" in issue
+            for issue in result.issues
+        )
+        assert store.get("ema-entry-1").order_state == OrderState.PROTECTED.value
+
+    asyncio.run(scenario())
+
+
 def test_local_active_without_exchange_position_requires_reconciliation(tmp_path):
     async def scenario():
         store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")

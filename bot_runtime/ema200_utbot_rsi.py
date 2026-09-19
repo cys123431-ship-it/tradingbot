@@ -8,6 +8,10 @@ EMA200_UTBOT_RSI_STRATEGY = "ema200_utbot_rsi_2h"
 EMA200_UTBOT_RSI_CONFIG_KEY = "EMA200UTBotRSI2H"
 EMA200_UTBOT_RSI_DISPLAY_NAME = "EMA200 + UT Bot + RSI (2H)"
 
+EMA200_SMALL_ACCOUNT_THRESHOLD_USDT = 1000.0
+EMA200_SMALL_ACCOUNT_LEVERAGE = 5
+EMA200_SMALL_ACCOUNT_MARGIN_LADDER_PERCENT = (50.0, 35.0, 25.0, 15.0, 10.0)
+
 
 def default_ema200_utbot_rsi_config():
     return {
@@ -31,6 +35,14 @@ def default_ema200_utbot_rsi_config():
         "weekly_loss_limit_percent": 5.0,
         "min_weekly_loss_limit_percent": 1.0,
         "max_weekly_loss_limit_percent": 40.0,
+        # The sub-$1,000 plan is deliberately fixed rather than exposed as a
+        # free-form Telegram setting.  It starts aggressively, then reduces
+        # the next position after each consecutive losing EMA200 trade.
+        "small_account_threshold_usdt": EMA200_SMALL_ACCOUNT_THRESHOLD_USDT,
+        "small_account_leverage": EMA200_SMALL_ACCOUNT_LEVERAGE,
+        "small_account_margin_ladder_percent": list(
+            EMA200_SMALL_ACCOUNT_MARGIN_LADDER_PERCENT
+        ),
     }
 
 
@@ -131,7 +143,49 @@ def normalize_ema200_utbot_rsi_config(raw=None):
     cfg["min_weekly_loss_limit_percent"] = min_weekly
     cfg["max_weekly_loss_limit_percent"] = max_weekly
     cfg["weekly_loss_limit_percent"] = max(daily, weekly)
+
+    # Product-defined values: old or hand-edited config must not silently
+    # change the live small-account contract.
+    cfg["small_account_threshold_usdt"] = EMA200_SMALL_ACCOUNT_THRESHOLD_USDT
+    cfg["small_account_leverage"] = EMA200_SMALL_ACCOUNT_LEVERAGE
+    cfg["small_account_margin_ladder_percent"] = list(
+        EMA200_SMALL_ACCOUNT_MARGIN_LADDER_PERCENT
+    )
     return cfg
+
+
+def count_ema200_consecutive_losses(recent_pnls):
+    """Count newest-first consecutive EMA200 losses.
+
+    A profitable or break-even close resets the sequence. Invalid persisted
+    values are rejected instead of being interpreted as a safe zero-loss
+    history, because streak zero intentionally permits the no-stop first stage.
+    """
+    count = 0
+    for raw_pnl in recent_pnls or []:
+        try:
+            pnl = float(raw_pnl)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid realized PnL in EMA200 trade history") from exc
+        if not isfinite(pnl):
+            raise ValueError("non-finite realized PnL in EMA200 trade history")
+        if pnl < 0:
+            count += 1
+            continue
+        break
+    return count
+
+
+def ema200_small_account_margin_percent(consecutive_losses):
+    """Return the fixed margin step for a non-negative loss streak."""
+    try:
+        streak = int(consecutive_losses or 0)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("consecutive_losses must be a non-negative integer") from exc
+    if streak < 0:
+        raise ValueError("consecutive_losses must be a non-negative integer")
+    ladder = EMA200_SMALL_ACCOUNT_MARGIN_LADDER_PERCENT
+    return float(ladder[min(streak, len(ladder) - 1)])
 
 
 def evaluate_ema200_utbot_rsi_entry(
@@ -237,6 +291,7 @@ def build_ema200_utbot_rsi_risk_plan(
     entry_price,
     config=None,
     safety_buffer=0.98,
+    consecutive_losses=0,
 ):
     cfg = normalize_ema200_utbot_rsi_config(config)
     equity = max(0.0, _finite(account_equity, 0.0))
@@ -249,8 +304,47 @@ def build_ema200_utbot_rsi_risk_plan(
     if equity <= 0 or free <= 0:
         raise ValueError("account equity/free balance unavailable")
 
-    risk_pct = float(cfg["risk_per_trade_percent"])
     emergency_pct = float(cfg["emergency_exit_percent"])
+    margin_percent = ema200_small_account_margin_percent(consecutive_losses)
+    loss_streak = int(consecutive_losses or 0)
+    small_account = equity <= float(cfg["small_account_threshold_usdt"])
+    if small_account:
+        leverage = int(cfg["small_account_leverage"])
+        target_margin = equity * margin_percent / 100.0
+        available_margin_cap = free * max(
+            0.0,
+            min(1.0, _finite(safety_buffer, 0.98)),
+        )
+        planned_margin = min(target_margin, available_margin_cap)
+        planned_notional = planned_margin * leverage
+        stop_required = loss_streak > 0
+        stop_fraction = emergency_pct / 100.0
+        planned_loss = (
+            planned_notional * stop_fraction if stop_required else None
+        )
+        return {
+            "sizing_mode": "small_account_loss_ladder",
+            "small_account_mode": True,
+            "small_account_threshold_usdt": float(
+                cfg["small_account_threshold_usdt"]
+            ),
+            "consecutive_losses": loss_streak,
+            "margin_percent": margin_percent,
+            "leverage": leverage,
+            "emergency_exit_percent": emergency_pct,
+            "emergency_stop_required": stop_required,
+            "strategy_exit_only": not stop_required,
+            "risk_per_trade_percent": None,
+            "risk_budget_usdt": planned_loss,
+            "uncapped_notional": target_margin * leverage,
+            "planned_notional": planned_notional,
+            "planned_margin": planned_margin,
+            "planned_qty": planned_notional / entry,
+            "planned_emergency_loss_usdt": planned_loss,
+            "margin_cap_applied": planned_margin + 1e-12 < target_margin,
+        }
+
+    risk_pct = float(cfg["risk_per_trade_percent"])
     leverage = int(cfg["leverage"])
     risk_budget = equity * risk_pct / 100.0
     stop_fraction = emergency_pct / 100.0
@@ -265,6 +359,12 @@ def build_ema200_utbot_rsi_risk_plan(
     planned_loss = planned_notional * stop_fraction
 
     return {
+        "sizing_mode": "risk_budget",
+        "small_account_mode": False,
+        "consecutive_losses": loss_streak,
+        "margin_percent": None,
+        "emergency_stop_required": True,
+        "strategy_exit_only": False,
         "risk_per_trade_percent": risk_pct,
         "emergency_exit_percent": emergency_pct,
         "leverage": leverage,

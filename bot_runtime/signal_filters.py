@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from .ema200_utbot_rsi import EMA200_UTBOT_RSI_STRATEGY
 
 
@@ -72,7 +74,12 @@ class SignalFilterMixin:
             context['raw_hybrid_detail'] = detail or {}
             context['precomputed'][active_strategy] = strategy_result
             self._ensure_runtime_state_containers(('last_ema200_utbot_rsi_status',))
-            self.last_ema200_utbot_rsi_status[symbol] = dict(detail or {})
+            status_detail = dict(detail or {})
+            # Every symbol on the same 2h candle has the same candle timestamp.
+            # Preserve the actual evaluation order so Telegram status rotates
+            # with the scanner instead of repeatedly selecting the first coin.
+            status_detail['evaluated_at_ns'] = time.time_ns()
+            self.last_ema200_utbot_rsi_status[symbol] = status_detail
         elif active_strategy == 'rsibb':
             rsibb_result = self._calculate_rsibb_signal(df, strategy_params)
             context['raw_strategy_sig'] = rsibb_result[0]

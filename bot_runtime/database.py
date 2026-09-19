@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from math import isfinite
 import sqlite3
 import threading
 from zoneinfo import ZoneInfo
@@ -314,6 +315,78 @@ class DBManager:
                 tuple(params),
             )
             return [float(row[0] or 0.0) for row in cur.fetchall()]
+
+    def get_consecutive_strategy_losses(self, strategy, limit=100):
+        """Return the newest-first realized-loss streak for one strategy.
+
+        This query is intentionally strategy-attributed and durable so a bot
+        restart cannot reset the EMA200 small-account risk stage. Break-even
+        and profitable closes reset the streak.
+        """
+        strategy_value = str(strategy or '').strip().lower()
+        if not strategy_value:
+            raise ValueError('strategy is required')
+        limit = max(1, min(1000, int(limit or 100)))
+        with self.lock:
+            rows = self.conn.execute(
+                """SELECT pnl_usdt, exit_time FROM trades
+                WHERE exit_time IS NOT NULL
+                  AND pnl_usdt IS NOT NULL
+                  AND LOWER(COALESCE(strategy, '')) = ?
+                ORDER BY exit_time DESC, id DESC LIMIT ?""",
+                (strategy_value, limit),
+            ).fetchall()
+
+        pnl_values = [float(row[0]) for row in rows]
+        store = getattr(self, 'trade_result_store', None)
+        loader = getattr(store, 'load_trade_results', None)
+        if callable(loader):
+            try:
+                results = []
+                for item in loader() or []:
+                    if not isinstance(item, dict) or not item.get('exit_time'):
+                        continue
+                    attributed = {
+                        str(item.get(key) or '').strip().lower()
+                        for key in (
+                            'primary_strategy',
+                            'selected_strategy',
+                            'strategy',
+                        )
+                        if str(item.get(key) or '').strip()
+                    }
+                    if strategy_value not in attributed:
+                        continue
+                    raw_pnl = (
+                        item.get('net_pnl_usdt')
+                        if item.get('net_pnl_usdt') is not None
+                        else item.get('gross_pnl_usdt')
+                    )
+                    pnl = float(raw_pnl)
+                    if not isfinite(pnl):
+                        raise ValueError(
+                            'non-finite realized PnL in trade result store'
+                        )
+                    results.append((str(item['exit_time']), pnl))
+                results.sort(key=lambda item: item[0], reverse=True)
+                # Only prefer fee/funding-aware accounting when it covers the
+                # full queried ledger. A partial accounting outage must not
+                # silently reset an existing loss streak.
+                if results and len(results) >= len(rows):
+                    pnl_values = [pnl for _, pnl in results[:limit]]
+            except Exception:
+                if not rows:
+                    raise
+
+        streak = 0
+        for pnl in pnl_values:
+            if not isfinite(pnl):
+                raise ValueError('non-finite realized PnL in trade history')
+            if pnl < 0:
+                streak += 1
+                continue
+            break
+        return streak
 
     def get_latest_open_trade(self, symbol):
         with self.lock:

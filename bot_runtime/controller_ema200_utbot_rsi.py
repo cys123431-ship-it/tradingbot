@@ -17,6 +17,7 @@ from .ema200_utbot_rsi import (
     EMA200_UTBOT_RSI_CONFIG_KEY,
     EMA200_UTBOT_RSI_DISPLAY_NAME,
     EMA200_UTBOT_RSI_STRATEGY,
+    ema200_small_account_margin_percent,
     normalize_ema200_utbot_rsi_config,
 )
 
@@ -115,22 +116,39 @@ class ControllerEMA200UTBotRSIMixin:
 
         daily_count = weekly_count = 0
         daily_pnl = weekly_pnl = 0.0
+        loss_streak = 0
         try:
             daily_count, daily_pnl = self.db.get_daily_stats()
             weekly_count, weekly_pnl = self.db.get_weekly_stats()
+            loss_streak = self.db.get_consecutive_strategy_losses(
+                EMA200_UTBOT_RSI_STRATEGY
+            )
         except Exception:
             pass
+        next_margin_percent = ema200_small_account_margin_percent(loss_streak)
+        stage_exit = (
+            "UT 반대 신호만(Stop 없음)"
+            if loss_streak == 0
+            else f"UT 반대 신호 + 비상 Stop {cfg['emergency_exit_percent']:.2f}%"
+        )
 
         latest_symbol = None
         latest_detail = {}
         latest_reason = None
         engine = (getattr(self, "engines", {}) or {}).get("signal")
         status_map = getattr(engine, "last_ema200_utbot_rsi_status", {}) if engine else {}
+        recent_symbols = []
         if isinstance(status_map, dict) and status_map:
-            latest_symbol, latest_detail = max(
+            recent_items = sorted(
                 status_map.items(),
-                key=lambda item: int((item[1] or {}).get("closed_candle_ts") or 0),
+                key=lambda item: (
+                    int((item[1] or {}).get("evaluated_at_ns") or 0),
+                    int((item[1] or {}).get("closed_candle_ts") or 0),
+                ),
+                reverse=True,
             )
+            latest_symbol, latest_detail = recent_items[0]
+            recent_symbols = [str(symbol) for symbol, _ in recent_items[:5]]
             latest_reason = (getattr(engine, "last_entry_reason", {}) or {}).get(latest_symbol)
 
         condition_text = "최근 조건: 아직 2시간 완료봉 평가 기록 없음"
@@ -146,7 +164,9 @@ class ControllerEMA200UTBotRSIMixin:
                 f"• 종가 / EMA200: {float(close_value or 0):.4f} / {float(ema_value or 0):.4f}\n"
                 f"• UT 현재상태: {ut_state} / 최근 UT 신호: {ut_last}\n"
                 f"• RSI: {float(prev_rsi or 0):.2f} → {float(curr_rsi or 0):.2f}\n"
-                f"• 판단: {latest_reason or '대기'}"
+                f"• 판단: {latest_reason or '대기'}\n"
+                f"• 최근 평가 종목({len(status_map)}개 기록): "
+                f"{', '.join(recent_symbols)}"
             )
 
         return (
@@ -156,17 +176,21 @@ class ControllerEMA200UTBotRSIMixin:
             "시간봉: 2시간 완료봉 고정\n"
             "추세: 종가 > EMA200=롱 허용 / 종가 < EMA200=숏 허용\n"
             f"RSI: {cfg['rsi_length']}기간, 50선 돌파\n\n"
-            f"1회 위험예산: 계좌의 {cfg['risk_per_trade_percent']:.2f}%\n"
-            f"레버리지: {cfg['leverage']}x\n"
-            f"비상탈출: 진입가에서 불리하게 {cfg['emergency_exit_percent']:.2f}%\n"
+            "소액계좌 기준: equity 1,000 USDT 이하\n"
+            f"다음 진입: 증거금 {next_margin_percent:.0f}% / 5x / {stage_exit}\n"
+            f"EMA200 연속손실: {loss_streak}회\n"
+            "축소단계: 50% → 35% → 25% → 15% → 10%(하한)\n"
+            f"1,000 USDT 초과 시 위험예산: 계좌의 {cfg['risk_per_trade_percent']:.2f}%\n"
+            f"초과계좌 레버리지: {cfg['leverage']}x\n"
+            f"연속손실 단계 비상탈출: {cfg['emergency_exit_percent']:.2f}%\n"
             f"일일 손실한도: {cfg['daily_loss_limit_percent']:.2f}%\n"
             f"최근 7일 손실한도: {cfg['weekly_loss_limit_percent']:.2f}%\n\n"
             f"오늘 실현손익: {float(daily_pnl):+.4f} USDT / {daily_count}건\n"
             f"최근 7일 실현손익: {float(weekly_pnl):+.4f} USDT / {weekly_count}건\n\n"
             f"{condition_text}\n\n"
-            "중요: 정상 청산은 UT Bot 반대 신호입니다. "
-            "비상탈출은 정상 청산을 대신하는 TP/SL 전략이 아니라 "
-            "극단적인 불리한 움직임에서 계좌를 보호하는 최후 안전장치입니다."
+            "중요: 소액계좌의 연속손실 0회 단계는 비상 Stop 없이 "
+            "UT Bot 반대 신호로만 청산됩니다. 첫 손실 뒤 다음 진입부터 "
+            "포지션이 축소되고 비상 Stop이 적용됩니다."
         )
 
     @staticmethod
@@ -174,6 +198,9 @@ class ControllerEMA200UTBotRSIMixin:
         if kind == "risk":
             return (
                 "📘 1회 위험예산이란?\n\n"
+                "이 설정은 계좌 equity가 1,000 USDT를 초과할 때 사용합니다. "
+                "1,000 USDT 이하에서는 고정 소액계좌 단계(증거금 "
+                "50→35→25→15→10%)가 우선합니다.\n\n"
                 "한 번의 거래가 비상탈출 가격까지 불리하게 움직였을 때 "
                 "계좌에서 최대 얼마 정도를 잃도록 포지션 크기를 잡을지 정하는 값입니다.\n\n"
                 "예시) 계좌 1,000 USDT, 위험 0.5%, 비상탈출 5%\n"
@@ -194,12 +221,14 @@ class ControllerEMA200UTBotRSIMixin:
                 "정상 청산 규칙은 그대로입니다.\n"
                 "• LONG: 2시간봉 UT Bot Sell 신호에서 정상 청산\n"
                 "• SHORT: 2시간봉 UT Bot Buy 신호에서 정상 청산\n\n"
-                "비상탈출은 그 신호를 기다리기 위험할 정도의 급격한 역방향 움직임에 대비한 "
-                "거래소 측 보호용 Stop입니다.\n\n"
+                "계좌 equity 1,000 USDT 이하이고 EMA200 연속손실이 0회인 첫 단계에는 "
+                "사용자 선택에 따라 거래소 Stop을 설치하지 않고 UT 반대 신호만 기다립니다. "
+                "첫 손실 뒤 다음 진입부터 이 비상탈출 Stop이 적용됩니다. "
+                "1,000 USDT 초과 계좌에는 기존처럼 첫 진입부터 적용됩니다.\n\n"
                 "예시) 100에 LONG 진입, 비상탈출 5%라면 약 95 부근이 최후 안전선입니다.\n"
                 "100에 SHORT 진입이라면 약 105 부근이 최후 안전선입니다.\n\n"
-                "이 값은 일반 손절 타이밍을 최적화하려는 것이 아니라 '안전벨트'입니다. "
-                "그래서 완전히 OFF할 수 없고 거리만 조정할 수 있습니다.\n\n"
+                "이 값은 일반 손절 타이밍을 최적화하려는 것이 아니라 연속손실 단계의 "
+                "최대 손실을 제한하는 안전선입니다. 메뉴에서 거리만 조정할 수 있습니다.\n\n"
                 "설정 변경은 새로 진입하는 포지션부터 적용합니다. 이미 보유 중인 포지션의 "
                 "보호 주문을 텔레그램 설정 변경만으로 몰래 교체하지 않습니다.\n\n"
                 "허용 범위는 0.5~30%입니다. 너무 가까우면 평범한 가격 흔들림에도 Stop이 "
@@ -209,6 +238,8 @@ class ControllerEMA200UTBotRSIMixin:
         if kind == "leverage":
             return (
                 "⚙️ 레버리지란?\n\n"
+                "계좌 equity 1,000 USDT 이하에서는 이번 소액계좌 규칙에 따라 5x로 고정됩니다. "
+                "이 메뉴의 레버리지 설정은 1,000 USDT 초과 계좌에 적용됩니다.\n\n"
                 "이 전략에서는 레버리지를 먼저 정해서 손실을 키우는 방식이 아닙니다. "
                 "1회 위험예산과 비상탈출 거리를 먼저 계산하고, 그 포지션을 유지하는 데 "
                 "필요한 증거금 크기에 레버리지가 영향을 줍니다.\n\n"
@@ -249,8 +280,10 @@ class ControllerEMA200UTBotRSIMixin:
             "→ 진입. 이후 UT Bot Buy에서 정상 청산합니다.\n\n"
             "RSI가 먼저 50을 통과한 뒤 나중에 UT 신호가 나온 경우는 인정하지 않습니다. "
             "완료된 2시간봉만 사용해 진행 중 봉의 흔들림으로 인한 가짜 돌파를 피합니다.\n\n"
-            "리스크 기능은 전략의 정상 청산을 바꾸지 않습니다. 포지션 수량, 신규진입 손실한도, "
-            "최후 비상탈출만 담당합니다."
+            "소액계좌(1,000 USDT 이하)는 첫 단계에서 equity의 50%를 증거금으로 5x 진입하고 "
+            "UT 반대 신호로만 청산합니다. 손실 후 다음 진입은 증거금 비율을 "
+            "35%→25%→15%→10%로 줄이고 비상 Stop을 적용합니다. 수익 또는 본전 청산 시 "
+            "연속손실 단계가 초기화됩니다. 일·주 손실한도는 별도의 신규진입 차단 장치입니다."
         )
 
     async def _ema200_utbot_rsi_has_open_position(self):

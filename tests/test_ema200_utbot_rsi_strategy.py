@@ -13,10 +13,13 @@ from telegram.ext import (
 
 import emas
 from bot_runtime.controller_ema200_utbot_rsi import ControllerEMA200UTBotRSIMixin
+from bot_runtime.database import DBManager
 from bot_runtime.ema200_utbot_rsi import (
     EMA200_UTBOT_RSI_STRATEGY,
     build_ema200_utbot_rsi_risk_plan,
     calculate_ema200_utbot_rsi_emergency_stop_price,
+    count_ema200_consecutive_losses,
+    ema200_small_account_margin_percent,
     evaluate_ema200_utbot_rsi_entry,
     evaluate_ema200_utbot_rsi_loss_gate,
     normalize_ema200_utbot_rsi_config,
@@ -143,10 +146,10 @@ def test_wrong_ema_side_blocks_signal():
     assert signal is None
 
 
-def test_risk_plan_sizes_from_loss_budget_and_emergency_distance():
+def test_above_1000_risk_plan_sizes_from_loss_budget_and_emergency_distance():
     plan = build_ema200_utbot_rsi_risk_plan(
-        account_equity=1000.0,
-        free_balance=1000.0,
+        account_equity=2000.0,
+        free_balance=2000.0,
         entry_price=100.0,
         config={
             "risk_per_trade_percent": 0.5,
@@ -154,16 +157,111 @@ def test_risk_plan_sizes_from_loss_budget_and_emergency_distance():
             "leverage": 5,
         },
     )
-    assert plan["risk_budget_usdt"] == 5.0
-    assert plan["planned_notional"] == 100.0
-    assert plan["planned_margin"] == 20.0
-    assert plan["planned_emergency_loss_usdt"] == 5.0
-    assert plan["planned_qty"] == 1.0
+    assert plan["small_account_mode"] is False
+    assert plan["risk_budget_usdt"] == 10.0
+    assert plan["planned_notional"] == 200.0
+    assert plan["planned_margin"] == 40.0
+    assert plan["planned_emergency_loss_usdt"] == 10.0
+    assert plan["planned_qty"] == 2.0
+
+
+def test_small_account_first_stage_uses_half_equity_at_5x_without_stop():
+    plan = build_ema200_utbot_rsi_risk_plan(
+        account_equity=200.0,
+        free_balance=200.0,
+        entry_price=100.0,
+        config={"emergency_exit_percent": 5.0, "leverage": 9},
+        consecutive_losses=0,
+    )
+
+    assert plan["small_account_mode"] is True
+    assert plan["margin_percent"] == 50.0
+    assert plan["planned_margin"] == 100.0
+    assert plan["leverage"] == 5
+    assert plan["planned_notional"] == 500.0
+    assert plan["planned_qty"] == 5.0
+    assert plan["strategy_exit_only"] is True
+    assert plan["emergency_stop_required"] is False
+    assert plan["planned_emergency_loss_usdt"] is None
+
+
+@pytest.mark.parametrize(
+    ("loss_streak", "expected_margin_percent"),
+    [(1, 35.0), (2, 25.0), (3, 15.0), (4, 10.0), (12, 10.0)],
+)
+def test_small_account_loss_ladder_reduces_next_position_and_enables_stop(
+    loss_streak,
+    expected_margin_percent,
+):
+    plan = build_ema200_utbot_rsi_risk_plan(
+        account_equity=200.0,
+        free_balance=200.0,
+        entry_price=100.0,
+        config={"emergency_exit_percent": 5.0},
+        consecutive_losses=loss_streak,
+    )
+
+    expected_margin = 200.0 * expected_margin_percent / 100.0
+    assert plan["margin_percent"] == expected_margin_percent
+    assert plan["planned_margin"] == expected_margin
+    assert plan["planned_notional"] == expected_margin * 5
+    assert plan["emergency_stop_required"] is True
+    assert plan["strategy_exit_only"] is False
+    assert plan["planned_emergency_loss_usdt"] == pytest.approx(
+        expected_margin * 5 * 0.05
+    )
+
+
+def test_small_account_boundary_includes_exactly_1000_usdt():
+    plan = build_ema200_utbot_rsi_risk_plan(
+        account_equity=1000.0,
+        free_balance=1000.0,
+        entry_price=100.0,
+        consecutive_losses=0,
+    )
+    assert plan["small_account_mode"] is True
+    assert plan["planned_margin"] == 500.0
+    assert plan["planned_notional"] == 2500.0
+
+
+def test_consecutive_loss_helpers_reset_on_profit_or_break_even():
+    assert count_ema200_consecutive_losses([-1.0, -2.0, 3.0, -4.0]) == 2
+    assert count_ema200_consecutive_losses([0.0, -2.0]) == 0
+    assert ema200_small_account_margin_percent(0) == 50.0
+    assert ema200_small_account_margin_percent(99) == 10.0
+
+
+def test_database_loss_streak_is_strategy_specific_and_restart_durable(tmp_path):
+    db_path = tmp_path / "trades.sqlite3"
+    db = DBManager(db_path)
+
+    def close_trade(symbol, pnl, strategy):
+        db.log_trade_entry(symbol, "long", 100.0, 1.0, strategy=strategy)
+        assert db.log_trade_close(symbol, pnl, pnl, 100.0 + pnl, "test")
+
+    close_trade("BTC/USDT", 4.0, EMA200_UTBOT_RSI_STRATEGY)
+    close_trade("ETH/USDT", -8.0, "utbot")
+    close_trade("SOL/USDT", -3.0, EMA200_UTBOT_RSI_STRATEGY)
+    close_trade("XRP/USDT", -2.0, EMA200_UTBOT_RSI_STRATEGY)
+    assert db.get_consecutive_strategy_losses(EMA200_UTBOT_RSI_STRATEGY) == 2
+    db.conn.close()
+
+    reopened = DBManager(db_path)
+    assert reopened.get_consecutive_strategy_losses(EMA200_UTBOT_RSI_STRATEGY) == 2
+    close_trade_db = reopened
+    close_trade_db.log_trade_entry(
+        "ADA/USDT", "long", 100.0, 1.0, strategy=EMA200_UTBOT_RSI_STRATEGY
+    )
+    assert close_trade_db.log_trade_close(
+        "ADA/USDT", 1.0, 1.0, 101.0, "profit reset"
+    )
+    assert reopened.get_consecutive_strategy_losses(EMA200_UTBOT_RSI_STRATEGY) == 0
+    reopened.conn.close()
 
 
 def test_risk_plan_caps_position_to_available_margin_without_increasing_risk():
     plan = build_ema200_utbot_rsi_risk_plan(
-        account_equity=1000.0,
+        account_equity=2000.0,
         free_balance=5.0,
         entry_price=100.0,
         config={
@@ -173,7 +271,7 @@ def test_risk_plan_caps_position_to_available_margin_without_increasing_risk():
         },
     )
     assert plan["margin_cap_applied"] is True
-    assert plan["planned_notional"] < 100.0
+    assert plan["planned_notional"] < 200.0
     assert plan["planned_emergency_loss_usdt"] < plan["risk_budget_usdt"]
 
 
@@ -340,7 +438,9 @@ def test_latest_strategy_evaluation_is_saved_for_telegram_status():
     )
 
     assert context["precomputed"][EMA200_UTBOT_RSI_STRATEGY][0] == "long"
-    assert engine.last_ema200_utbot_rsi_status["BTC/USDT"] == expected_detail
+    saved = engine.last_ema200_utbot_rsi_status["BTC/USDT"]
+    assert all(saved[key] == value for key, value in expected_detail.items())
+    assert int(saved["evaluated_at_ns"]) > 0
 
 
 @pytest.mark.parametrize(
@@ -430,7 +530,7 @@ def test_mechanical_exit_retries_same_candle_when_position_remains_open():
     assert "재시도" in engine.last_entry_reason["BTC/USDT"]
 
 
-def test_protection_audit_always_requires_stop_and_never_fixed_tp_for_strategy():
+def test_later_loss_stage_requires_stop_and_never_fixed_tp_for_strategy():
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
     engine.is_upbit_mode = lambda: False
     engine.get_runtime_strategy_params = lambda: {
@@ -450,14 +550,40 @@ def test_protection_audit_always_requires_stop_and_never_fixed_tp_for_strategy()
     assert expected == (False, True)
 
 
-def test_entry_branch_places_emergency_stop_only_and_defers_notification():
+def test_first_small_account_stage_is_durably_recognized_as_strategy_managed():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.is_upbit_mode = lambda: False
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
+    }
+    record = SimpleNamespace(
+        strategy=EMA200_UTBOT_RSI_STRATEGY,
+        metadata={"strategy_managed_no_stop": True},
+    )
+    engine.trading_state_store = SimpleNamespace(
+        active_for_symbol=lambda symbol: [record]
+    )
+
+    assert engine._protection_expected_from_config(
+        "BTC/USDT",
+        {"side": "long", "contracts": 1.0},
+    ) == (False, False)
+
+
+def test_entry_branch_conditionally_places_emergency_stop_after_first_loss():
     source = inspect.getsource(emas.SignalEngine.entry)
     protection_branch = source.rsplit(
         "elif active_strategy == EMA200_UTBOT_RSI_STRATEGY:", 1
     )[1].split("elif active_strategy in UTBREAKOUT_STRATEGIES:", 1)[0]
+    assert "emergency_stop_required" in protection_branch
     assert "tp_distance=None" in protection_branch
     assert "sl_distance=emergency_distance" in protection_branch
     assert "notify_after_place=False" in protection_branch
+    assert "거래소 Stop 없음" in protection_branch
+
+    finalization_source = source[source.index("ema200_strategy_only_no_stop = bool("):]
+    assert "strategy_managed_no_stop=True" in finalization_source
+    assert "STRATEGY_MANAGED_NO_STOP" in finalization_source
 
 
 def test_minimum_notional_branch_blocks_instead_of_auto_increasing_strategy_size():
@@ -535,6 +661,40 @@ def _registered_telegram_controller():
         filters.TEXT & ~filters.COMMAND,
     )
     return controller
+
+
+def test_telegram_status_uses_real_evaluation_order_when_2h_timestamps_tie():
+    controller = _registered_telegram_controller()
+    controller.db = SimpleNamespace(
+        get_daily_stats=lambda: (0, 0.0),
+        get_weekly_stats=lambda: (0, 0.0),
+        get_consecutive_strategy_losses=lambda strategy: 1,
+    )
+    base_detail = {
+        "closed_candle_ts": 1_000,
+        "closed_candle_close": 100.0,
+        "ema200": 99.0,
+        "ut_state": "long",
+        "ut_last_signal_side": "long",
+        "prev_rsi": 49.0,
+        "curr_rsi": 49.5,
+    }
+    controller.engines = {
+        "signal": SimpleNamespace(
+            last_ema200_utbot_rsi_status={
+                "BTC/USDT": {**base_detail, "evaluated_at_ns": 10},
+                "ETH/USDT": {**base_detail, "evaluated_at_ns": 20},
+            },
+            last_entry_reason={"ETH/USDT": "latest evaluation"},
+        )
+    }
+
+    status = asyncio.run(controller._ema200_utbot_rsi_status_text())
+
+    assert "최근 조건 (ETH/USDT)" in status
+    assert "최근 평가 종목(2개 기록): ETH/USDT, BTC/USDT" in status
+    assert "다음 진입: 증거금 35% / 5x" in status
+    assert "UT 반대 신호 + 비상 Stop" in status
 
 
 @pytest.mark.parametrize("raw_value", ["9", "nan", "inf"])

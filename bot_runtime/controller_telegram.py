@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .ema200_utbot_rsi import EMA200_UTBOT_RSI_STRATEGY
+
 
 class ControllerTelegramMixin:
     async def global_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -421,6 +423,25 @@ class ControllerTelegramMixin:
                     refreshed += 1
                     logger.info(
                         f"Protection sync audited UTBreak position without overwriting partial TP/trailing SL: {symbol}"
+                    )
+                    continue
+
+                if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+                    expected_tp, expected_sl = (
+                        self._protection_expected_from_config(symbol, p)
+                    )
+                    await self._audit_protection_orders(
+                        symbol,
+                        pos=p,
+                        expected_tp=expected_tp,
+                        expected_sl=expected_sl,
+                        alert=True,
+                    )
+                    refreshed += 1
+                    logger.info(
+                        "Protection sync audited EMA200 position without "
+                        "overwriting its entry-stage exit contract: %s",
+                        symbol,
                     )
                     continue
 

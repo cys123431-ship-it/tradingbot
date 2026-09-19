@@ -1277,8 +1277,21 @@ class SignalProtectionMixin:
         except Exception:
             active_strategy = ''
         if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
-            # This strategy never uses a fixed TP, while its emergency exchange
-            # stop is mandatory even if generic TP/SL switches are disabled.
+            # The first sub-$1,000 stage is intentionally strategy-managed with
+            # no exchange stop.  That exception is durable and narrowly bound
+            # to an EMA200 entry record; every later loss stage still requires
+            # the emergency stop.
+            try:
+                records = self.trading_state_store.active_for_symbol(symbol)
+            except Exception:
+                records = []
+            if any(
+                str(record.strategy or '').strip().lower()
+                == EMA200_UTBOT_RSI_STRATEGY
+                and bool((record.metadata or {}).get('strategy_managed_no_stop'))
+                for record in records
+            ):
+                return False, False
             return False, True
         try:
             cfg = self.get_runtime_common_settings()

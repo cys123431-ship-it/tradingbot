@@ -229,6 +229,11 @@ _DURABLE_ENTRY_PLAN_KEYS = (
     'entry_edge_exit_policy',
     'auto_selected_set_id',
     'auto_selected_set_name',
+    'ema200_small_account_mode',
+    'ema200_consecutive_losses',
+    'ema200_margin_percent',
+    'ema200_strategy_exit_only',
+    'ema200_emergency_stop_required',
 )
 
 
@@ -992,20 +997,79 @@ class SignalEntryMixin:
                 target_notional = planned_qty * float(price)
                 margin_to_use = target_notional / max(float(lev), 1e-9)
             elif active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+                streak_getter = getattr(
+                    self.db,
+                    'get_consecutive_strategy_losses',
+                    None,
+                )
+                if not callable(streak_getter):
+                    await self.ctrl.notify(
+                        '⚠️ EMA200 + UT Bot + RSI (2H) 진입 차단: '
+                        '연속 손실 이력을 안전하게 확인할 수 없습니다.'
+                    )
+                    return
+                try:
+                    ema200_loss_streak = int(
+                        streak_getter(EMA200_UTBOT_RSI_STRATEGY)
+                    )
+                except Exception as streak_exc:
+                    logger.exception('EMA200 consecutive-loss lookup failed')
+                    await self.ctrl.notify(
+                        '⚠️ EMA200 + UT Bot + RSI (2H) 진입 차단: '
+                        f'연속 손실 이력 확인 실패 '
+                        f'({type(streak_exc).__name__}: {streak_exc})'
+                    )
+                    return
                 ema200_risk_plan = build_ema200_utbot_rsi_risk_plan(
                     account_equity=sizing_equity,
                     free_balance=free,
                     entry_price=price,
                     config=ema200_risk_cfg,
                     safety_buffer=safety_buffer,
+                    consecutive_losses=ema200_loss_streak,
                 )
                 lev = int(ema200_risk_plan['leverage'])
                 target_notional = float(ema200_risk_plan['planned_notional'])
                 margin_to_use = float(ema200_risk_plan['planned_margin'])
+                ema200_entry_plan = {
+                    'strategy': EMA200_UTBOT_RSI_STRATEGY,
+                    'timeframe': '2h',
+                    'entry_timeframe': '2h',
+                    'leverage': lev,
+                    'ema200_small_account_mode': bool(
+                        ema200_risk_plan['small_account_mode']
+                    ),
+                    'ema200_consecutive_losses': int(
+                        ema200_risk_plan['consecutive_losses']
+                    ),
+                    'ema200_margin_percent': ema200_risk_plan['margin_percent'],
+                    'ema200_strategy_exit_only': bool(
+                        ema200_risk_plan['strategy_exit_only']
+                    ),
+                    'ema200_emergency_stop_required': bool(
+                        ema200_risk_plan['emergency_stop_required']
+                    ),
+                }
+                ema200_status = (
+                    getattr(self, 'last_ema200_utbot_rsi_status', {}) or {}
+                ).get(symbol, {})
+                ema200_signal_ts = (
+                    ema200_status.get('closed_candle_ts')
+                    if isinstance(ema200_status, dict)
+                    else None
+                )
+                if ema200_signal_ts not in (None, ''):
+                    ema200_entry_plan['signal_timestamp'] = int(
+                        ema200_signal_ts
+                    )
                 logger.info(
-                    '[EMA200_UTBOT_RSI_2H] risk sizing: budget=%.4f USDT, '
-                    'emergency=%.2f%%, notional=%.4f, margin=%.4f, lev=%sx',
-                    float(ema200_risk_plan['risk_budget_usdt']),
+                    '[EMA200_UTBOT_RSI_2H] sizing mode=%s streak=%s '
+                    'margin_pct=%s emergency_stop=%s emergency=%.2f%%, '
+                    'notional=%.4f, margin=%.4f, lev=%sx',
+                    ema200_risk_plan['sizing_mode'],
+                    ema200_risk_plan['consecutive_losses'],
+                    ema200_risk_plan['margin_percent'],
+                    ema200_risk_plan['emergency_stop_required'],
                     float(ema200_risk_plan['emergency_exit_percent']),
                     target_notional,
                     margin_to_use,
@@ -1390,15 +1454,23 @@ class SignalEntryMixin:
                 )
                 return
             selected_leverage = int(liquidation_preflight.get('selected_leverage') or lev)
-            minimum_required_leverage = int(
-                filtered_breakout_plan.get('small_account_min_leverage', 1)
-                if isinstance(filtered_breakout_plan, dict)
-                and (
-                    filtered_breakout_plan.get('small_account_full_margin_applied')
-                    or filtered_breakout_plan.get('small_account_aggressive_active')
+            if (
+                active_strategy == EMA200_UTBOT_RSI_STRATEGY
+                and ema200_risk_plan.get('small_account_mode')
+            ):
+                minimum_required_leverage = int(
+                    ema200_risk_plan['leverage']
                 )
-                else 1
-            )
+            else:
+                minimum_required_leverage = int(
+                    filtered_breakout_plan.get('small_account_min_leverage', 1)
+                    if isinstance(filtered_breakout_plan, dict)
+                    and (
+                        filtered_breakout_plan.get('small_account_full_margin_applied')
+                        or filtered_breakout_plan.get('small_account_aggressive_active')
+                    )
+                    else 1
+                )
             if selected_leverage < minimum_required_leverage:
                 reason = (
                     f'liquidation-safe leverage {selected_leverage}x is below '
@@ -1637,7 +1709,14 @@ class SignalEntryMixin:
                     side,
                     qty,
                     active_strategy or 'SIGNAL_ENGINE',
-                    filtered_breakout_plan or cfg,
+                    (
+                        filtered_breakout_plan
+                        or (
+                            ema200_entry_plan
+                            if active_strategy == EMA200_UTBOT_RSI_STRATEGY
+                            else cfg
+                        )
+                    ),
                 )
                 if outcome.critical_pause_block is not None:
                     await _handle_critical_pause_entry_block(
@@ -1826,7 +1905,14 @@ class SignalEntryMixin:
                 self.crypto_entry_lock_reason = f"SUBMITTED_UNKNOWN:{entry_client_order_id}"
                 return
             qty = self.safe_amount(symbol, actual_qty)
-            entry_plan_attribution = dict(filtered_breakout_plan or {})
+            entry_plan_attribution = dict(
+                filtered_breakout_plan
+                or (
+                    ema200_entry_plan
+                    if active_strategy == EMA200_UTBOT_RSI_STRATEGY
+                    else {}
+                )
+            )
             primary_strategy = str(
                 entry_plan_attribution.get('strategy')
                 or active_strategy
@@ -2089,26 +2175,38 @@ class SignalEntryMixin:
                             )
 
             elif active_strategy == EMA200_UTBOT_RSI_STRATEGY:
-                emergency_pct = float(ema200_risk_cfg['emergency_exit_percent'])
-                emergency_distance = float(actual_entry_price) * emergency_pct / 100.0
-                await self._place_tp_sl_orders(
-                    symbol,
-                    side,
-                    actual_entry_price,
-                    qty,
-                    tp_distance=None,
-                    sl_distance=emergency_distance,
-                    position_hint=verify_pos,
-                    notify_after_place=False,
-                )
-                # Do not perform Telegram I/O before the final protection audit.
-                # Append the emergency-stop explanation to the entry notice, which is
-                # sent only after the SL is verified as live.
-                entry_notice = (
-                    f"{entry_notice}\n"
-                    f"🛟 비상탈출: 진입가 대비 {emergency_pct:.2f}% (최후 안전장치)\n"
-                    "정상 청산: 완료된 2시간봉 UT Bot 반대 신호"
-                )
+                if ema200_risk_plan.get('emergency_stop_required'):
+                    emergency_pct = float(
+                        ema200_risk_cfg['emergency_exit_percent']
+                    )
+                    emergency_distance = (
+                        float(actual_entry_price) * emergency_pct / 100.0
+                    )
+                    await self._place_tp_sl_orders(
+                        symbol,
+                        side,
+                        actual_entry_price,
+                        qty,
+                        tp_distance=None,
+                        sl_distance=emergency_distance,
+                        position_hint=verify_pos,
+                        notify_after_place=False,
+                    )
+                    # Do not perform Telegram I/O before the final protection
+                    # audit. The notice is sent only after the SL is verified.
+                    entry_notice = (
+                        f"{entry_notice}\n"
+                        f"🛟 비상탈출: 진입가 대비 {emergency_pct:.2f}% "
+                        "(연속손실 보호)\n"
+                        "정상 청산: 완료된 2시간봉 UT Bot 반대 신호"
+                    )
+                else:
+                    entry_notice = (
+                        f"{entry_notice}\n"
+                        "⚠️ 첫 단계: 거래소 Stop 없음 / "
+                        "완료된 2시간봉 UT Bot 반대 신호로만 청산\n"
+                        "청산가 도달 전 별도 손절이 없는 고위험 단계"
+                    )
 
             elif active_strategy in UTBREAKOUT_STRATEGIES:
                 plan = filtered_breakout_plan or self._get_utbot_filtered_breakout_entry_plan(symbol, side)
@@ -2411,7 +2509,61 @@ class SignalEntryMixin:
                             position_hint=verify_pos,
                         )
 
-            if verify_pos:
+            ema200_strategy_only_no_stop = bool(
+                active_strategy == EMA200_UTBOT_RSI_STRATEGY
+                and ema200_risk_plan.get('strategy_exit_only')
+            )
+            if verify_pos and ema200_strategy_only_no_stop:
+                # The user explicitly selected a strategy-only first stage for
+                # accounts at or below $1,000.  Actual liquidation data has
+                # already been verified above. Persist the intentional no-stop
+                # contract so restart reconciliation and periodic audits do not
+                # misclassify it as an accidental protection failure.
+                _mark_crypto_entry_state(
+                    self,
+                    entry_client_order_id,
+                    OrderState.PROTECTED,
+                    stop_order_id=None,
+                    strategy_managed_no_stop=True,
+                    ema200_consecutive_losses=int(
+                        ema200_risk_plan['consecutive_losses']
+                    ),
+                    ema200_margin_percent=float(
+                        ema200_risk_plan['margin_percent']
+                    ),
+                    last_error=None,
+                )
+                if str(
+                    getattr(self, 'crypto_entry_lock_reason', '') or ''
+                ).startswith('FILLED_'):
+                    self._set_crypto_entry_lock(None)
+                self.last_protection_order_status[symbol] = {
+                    'tp_expected': False,
+                    'sl_expected': False,
+                    'tp_present': False,
+                    'sl_present': False,
+                    'missing_tp': False,
+                    'missing_sl': False,
+                    'strategy_managed_no_stop': True,
+                    'status': 'STRATEGY_MANAGED_NO_STOP',
+                    'fetch_ok': True,
+                }
+                try:
+                    await self.ctrl.notify(entry_notice)
+                except Exception:
+                    logger.exception(
+                        "Strategy-managed entry notification failed for %s",
+                        symbol,
+                    )
+                logger.warning(
+                    '[EMA200_UTBOT_RSI_2H] intentional strategy-only '
+                    'position without exchange stop: symbol=%s streak=%s '
+                    'margin_pct=%s',
+                    symbol,
+                    ema200_risk_plan['consecutive_losses'],
+                    ema200_risk_plan['margin_percent'],
+                )
+            elif verify_pos:
                 protection_audit = await self._audit_protection_orders(
                     symbol,
                     pos=verify_pos,
