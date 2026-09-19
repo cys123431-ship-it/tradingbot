@@ -120,6 +120,34 @@ class ControllerEMA200UTBotRSIMixin:
         except Exception:
             pass
 
+        latest_symbol = None
+        latest_detail = {}
+        latest_reason = None
+        engine = (getattr(self, "engines", {}) or {}).get("signal")
+        status_map = getattr(engine, "last_ema200_utbot_rsi_status", {}) if engine else {}
+        if isinstance(status_map, dict) and status_map:
+            latest_symbol, latest_detail = max(
+                status_map.items(),
+                key=lambda item: int((item[1] or {}).get("closed_candle_ts") or 0),
+            )
+            latest_reason = (getattr(engine, "last_entry_reason", {}) or {}).get(latest_symbol)
+
+        condition_text = "최근 조건: 아직 2시간 완료봉 평가 기록 없음"
+        if latest_detail:
+            close_value = latest_detail.get("closed_candle_close")
+            ema_value = latest_detail.get("ema200")
+            prev_rsi = latest_detail.get("prev_rsi")
+            curr_rsi = latest_detail.get("curr_rsi")
+            ut_state = str(latest_detail.get("ut_state") or "NONE").upper()
+            ut_last = str(latest_detail.get("ut_last_signal_side") or "NONE").upper()
+            condition_text = (
+                f"최근 조건 ({latest_symbol})\n"
+                f"• 종가 / EMA200: {float(close_value or 0):.4f} / {float(ema_value or 0):.4f}\n"
+                f"• UT 현재상태: {ut_state} / 최근 UT 신호: {ut_last}\n"
+                f"• RSI: {float(prev_rsi or 0):.2f} → {float(curr_rsi or 0):.2f}\n"
+                f"• 판단: {latest_reason or '대기'}"
+            )
+
         return (
             f"🎛 {EMA200_UTBOT_RSI_DISPLAY_NAME}\n\n"
             f"전략 선택: {'✅ ACTIVE' if active else '⬜ 미선택'}\n"
@@ -134,6 +162,7 @@ class ControllerEMA200UTBotRSIMixin:
             f"최근 7일 손실한도: {cfg['weekly_loss_limit_percent']:.2f}%\n\n"
             f"오늘 실현손익: {float(daily_pnl):+.4f} USDT / {daily_count}건\n"
             f"최근 7일 실현손익: {float(weekly_pnl):+.4f} USDT / {weekly_count}건\n\n"
+            f"{condition_text}\n\n"
             "중요: 정상 청산은 UT Bot 반대 신호입니다. "
             "비상탈출은 정상 청산을 대신하는 TP/SL 전략이 아니라 "
             "극단적인 불리한 움직임에서 계좌를 보호하는 최후 안전장치입니다."
@@ -325,10 +354,29 @@ class ControllerEMA200UTBotRSIMixin:
             if action in field_map and len(parts) > 2:
                 raw = parts[2]
                 value = int(raw) if action == "leverage" else float(raw)
+                current_cfg = self._ema200_utbot_rsi_config()
+                if action == "weekly" and value < float(current_cfg["daily_loss_limit_percent"]):
+                    await query.edit_message_text(
+                        f"⚠️ 최근 7일 손실한도는 일일 손실한도 "
+                        f"({current_cfg['daily_loss_limit_percent']:.2f}%)보다 작게 설정할 수 없습니다.",
+                        reply_markup=self._build_ema200_utbot_rsi_keyboard(),
+                    )
+                    return
                 await self._update_ema200_utbot_rsi_value(field_map[action], value)
+                adjustment = ""
+                if action == "daily" and value > float(current_cfg["weekly_loss_limit_percent"]):
+                    await self._update_ema200_utbot_rsi_value(
+                        "weekly_loss_limit_percent",
+                        float(value),
+                    )
+                    adjustment = (
+                        f"\n최근 7일 한도도 일일 한도보다 작아지지 않도록 "
+                        f"{float(value):.2f}%로 함께 조정했습니다."
+                    )
                 await query.edit_message_text(
                     f"✅ 설정 변경: {action} = {value}{'x' if action == 'leverage' else '%'}\n\n"
-                    "설정은 새로 진입하는 포지션부터 적용됩니다.",
+                    "설정은 새로 진입하는 포지션부터 적용됩니다."
+                    + adjustment,
                     reply_markup=self._build_ema200_utbot_rsi_keyboard(),
                 )
                 return
