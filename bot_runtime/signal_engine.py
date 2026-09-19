@@ -9,6 +9,7 @@ from .signal_breakout_analysis import SignalBreakoutAnalysisMixin
 from .signal_breakout_status import SignalBreakoutStatusMixin
 from .signal_candles import SignalCandleMixin
 from .signal_custom_entry import SignalCustomEntryMixin
+from .signal_ema200_utbot_rsi import SignalEMA200UTBotRSIMixin
 from .signal_entry import SignalEntryMixin
 from .signal_exit import SignalExitMixin
 from .signal_filters import SignalFilterMixin
@@ -31,6 +32,7 @@ class SignalEngine(
     SignalAlphaMixin,
     SignalBreakoutStatusMixin,
     SignalSecondaryStrategiesMixin,
+    SignalEMA200UTBotRSIMixin,
     SignalScannerMixin,
     SignalCandleMixin,
     SignalCustomEntryMixin,
