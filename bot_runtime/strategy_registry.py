@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .ema200_utbot_rsi import EMA200_UTBOT_RSI_STRATEGY
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from utbreakout.adaptive_breakout_trend import ADAPTIVE_BREAKOUT_TREND_STRATEGY
 from utbreakout.crowding_unwind import CROWDING_UNWIND_STRATEGY
@@ -11,7 +13,6 @@ from utbreakout.relative_strength_pullback import ENTRY_STRATEGY_RELATIVE_STRENG
 from utbreakout.volatility_managed_trend import VOLATILITY_MANAGED_TREND_STRATEGY
 
 CORE_ENGINE = 'signal'
-EMA200_UTBOT_RSI_STRATEGY = 'ema200_utbot_rsi_2h'
 UTBOT_FILTERED_BREAKOUT_STRATEGY = 'utbot_filtered_breakout_v1'
 UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY = 'utbot_adaptive_timeframe_v1'
 DUAL_ALPHA_STRATEGY = 'dual_alpha_v1'
