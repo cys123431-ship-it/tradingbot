@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .ema200_utbot_rsi import EMA200_UTBOT_RSI_STRATEGY
+
 
 class SignalFilterMixin:
     def _collect_primary_strategy_context(self, symbol, df, strategy_params, active_strategy):
@@ -61,6 +63,14 @@ class SignalFilterMixin:
             context['raw_ut_detail'] = hybrid_detail.get('ut_detail') or {}
             context['raw_hybrid_detail'] = hybrid_detail or {}
             context['precomputed'][active_strategy] = hybrid_result
+        elif active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+            strategy_result = self._calculate_ema200_utbot_rsi_signal(df, strategy_params)
+            _, _, detail = strategy_result
+            context['raw_strategy_sig'] = detail.get('ut_signal')
+            context['raw_state_sig'] = detail.get('ut_state')
+            context['raw_ut_detail'] = detail.get('ut_detail') or {}
+            context['raw_hybrid_detail'] = detail or {}
+            context['precomputed'][active_strategy] = strategy_result
         elif active_strategy == 'rsibb':
             rsibb_result = self._calculate_rsibb_signal(df, strategy_params)
             context['raw_strategy_sig'] = rsibb_result[0]
@@ -76,6 +86,8 @@ class SignalFilterMixin:
         cfg = self.get_runtime_common_settings()
         strategy_params = self.get_runtime_strategy_params()
         active_strategy = str(strategy_params.get('active_strategy', 'utbot') or 'utbot').lower()
+        if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+            return self._get_ema200_utbot_rsi_config(strategy_params).get('timeframe', '2h')
         if active_strategy in UTBREAKOUT_STRATEGIES:
             if symbol:
                 try:
