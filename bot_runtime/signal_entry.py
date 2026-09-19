@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from utbreakout.dynamic_leverage import apply_dynamic_leverage_to_plan
 
+from .ema200_utbot_rsi import (
+    EMA200_UTBOT_RSI_STRATEGY,
+    build_ema200_utbot_rsi_risk_plan,
+)
+
 
 _DURABLE_ENTRY_PLAN_KEYS = (
     'strategy',
@@ -752,8 +757,13 @@ class SignalEntryMixin:
                     **trace_payload,
                 )
 
-            lev_default = 5 if active_strategy in UTBREAKOUT_STRATEGIES else 10
-            lev = int(max(1.0, float(cfg.get('leverage', lev_default) or lev_default)))
+            if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+                ema200_risk_cfg = self._get_ema200_utbot_rsi_config(strategy_params)
+                lev = int(ema200_risk_cfg.get('leverage', 5) or 5)
+            else:
+                ema200_risk_cfg = None
+                lev_default = 5 if active_strategy in UTBREAKOUT_STRATEGIES else 10
+                lev = int(max(1.0, float(cfg.get('leverage', lev_default) or lev_default)))
             if active_strategy in UTBREAKOUT_STRATEGIES and filtered_breakout_plan and filtered_breakout_plan.get('micro_auto'):
                 try:
                     lev = int(max(1.0, float(filtered_breakout_plan.get('leverage', lev) or lev)))
@@ -954,6 +964,26 @@ class SignalEntryMixin:
                 planned_qty = float(filtered_breakout_plan.get('qty', 0.0) or 0.0)
                 target_notional = planned_qty * float(price)
                 margin_to_use = target_notional / max(float(lev), 1e-9)
+            elif active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+                ema200_risk_plan = build_ema200_utbot_rsi_risk_plan(
+                    account_equity=sizing_equity,
+                    free_balance=free,
+                    entry_price=price,
+                    config=ema200_risk_cfg,
+                    safety_buffer=safety_buffer,
+                )
+                lev = int(ema200_risk_plan['leverage'])
+                target_notional = float(ema200_risk_plan['planned_notional'])
+                margin_to_use = float(ema200_risk_plan['planned_margin'])
+                logger.info(
+                    '[EMA200_UTBOT_RSI_2H] risk sizing: budget=%.4f USDT, '
+                    'emergency=%.2f%%, notional=%.4f, margin=%.4f, lev=%sx',
+                    float(ema200_risk_plan['risk_budget_usdt']),
+                    float(ema200_risk_plan['emergency_exit_percent']),
+                    target_notional,
+                    margin_to_use,
+                    lev,
+                )
             else:
                 # Position sizing (user-friendly):
                 # 1) Use configured % of current free USDT as margin.
@@ -1002,6 +1032,14 @@ class SignalEntryMixin:
 
             max_notional = free * lev * safety_buffer
             if min_notional > 0 and target_notional < min_notional:
+                if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+                    await self.ctrl.notify(
+                        '⚠️ EMA200 + UT Bot + RSI (2H) 진입 차단: '
+                        f'리스크 기준 포지션 {target_notional:.2f} USDT가 '
+                        f'거래소 최소 주문금액 {min_notional:.2f} USDT보다 작습니다. '
+                        '설정한 손실예산을 초과하도록 수량을 억지로 늘리지 않습니다.'
+                    )
+                    return
                 if active_strategy in UTBREAKOUT_STRATEGIES:
                     logger.warning(
                         f"[UTBOT_FILTERED_BREAKOUT_V1] Entry blocked by min notional: "
@@ -1149,7 +1187,11 @@ class SignalEntryMixin:
                 await self.ctrl.notify(f"⚠️ 주문 수량 계산 오류: {qty} (잔고: {free:.2f})")
                 return
 
-            if active_strategy not in UTBREAKOUT_STRATEGIES and bounded_risk_pct != req_risk_pct:
+            if (
+                active_strategy not in UTBREAKOUT_STRATEGIES
+                and active_strategy != EMA200_UTBOT_RSI_STRATEGY
+                and bounded_risk_pct != req_risk_pct
+            ):
                 await self.ctrl.notify(f"⚠️ 리스크 상한 적용: {req_risk_pct:.2f}% -> {bounded_risk_pct:.2f}%")
             if active_strategy in UTBREAKOUT_STRATEGIES:
                 self._utbreakout_trace_event(
@@ -1276,12 +1318,20 @@ class SignalEntryMixin:
             liquidation_payload = dict(cfg or {})
             if isinstance(filtered_breakout_plan, dict):
                 liquidation_payload.update(filtered_breakout_plan)
-            liquidation_stop = self._extract_liquidation_stop_price(
-                side,
-                price,
-                liquidation_payload,
-                lev,
-            )
+            if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+                emergency_fraction = float(ema200_risk_cfg['emergency_exit_percent']) / 100.0
+                liquidation_stop = (
+                    float(price) * (1.0 - emergency_fraction)
+                    if str(side).lower() == 'long'
+                    else float(price) * (1.0 + emergency_fraction)
+                )
+            else:
+                liquidation_stop = self._extract_liquidation_stop_price(
+                    side,
+                    price,
+                    liquidation_payload,
+                    lev,
+                )
             liquidation_preflight = await self._preflight_liquidation_safety(
                 symbol,
                 side,
@@ -2004,6 +2054,26 @@ class SignalEntryMixin:
                                 sl_distance=sl_distance,
                                 position_hint=verify_pos,
                             )
+
+            elif active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+                emergency_pct = float(ema200_risk_cfg['emergency_exit_percent'])
+                emergency_distance = float(actual_entry_price) * emergency_pct / 100.0
+                await self._place_tp_sl_orders(
+                    symbol,
+                    side,
+                    actual_entry_price,
+                    qty,
+                    tp_distance=None,
+                    sl_distance=emergency_distance,
+                    position_hint=verify_pos,
+                )
+                await self.ctrl.notify(
+                    '🛟 비상탈출 보호 주문 설정\n'
+                    f'전략: EMA200 + UT Bot + RSI (2H)\n'
+                    f'비상탈출 거리: {emergency_pct:.2f}%\n'
+                    '정상 청산은 여전히 2시간봉 UT Bot 반대 신호이며, '
+                    '이 주문은 극단적인 역방향 움직임을 위한 최후 안전장치입니다.'
+                )
 
             elif active_strategy in UTBREAKOUT_STRATEGIES:
                 plan = filtered_breakout_plan or self._get_utbot_filtered_breakout_entry_plan(symbol, side)
