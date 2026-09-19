@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from .ema200_utbot_rsi import EMA200_UTBOT_RSI_STRATEGY
+
+
 class BaseEngine:
     def __init__(self, controller):
         self.ctrl = controller
@@ -986,6 +989,17 @@ class BaseEngine:
 
     async def check_daily_loss_limit(self, *, allow_small_account_exemption=True):
         """?쇱씪 ?먯떎 ?쒕룄 泥댄겕 (誘몄떎???먯씡 ?ы븿)"""
+        # This strategy owns a separate realized-PnL entry gate.  Its daily/weekly
+        # limits intentionally stop NEW entries only and must not force-close an
+        # otherwise valid UT-managed position.
+        try:
+            active_strategy = str(
+                self.get_runtime_strategy_params().get('active_strategy', '') or ''
+            ).lower()
+        except Exception:
+            active_strategy = ''
+        if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+            return False
         active_positions_fetch_ok, active_symbols_on_exchange = (
             await self._fetch_active_position_symbols_checked()
         )
