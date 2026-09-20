@@ -225,9 +225,6 @@ jobs:
               exit 1
             fi
 
-            echo "=== Apply requested one-time EMA200 consecutive-loss reset ==="
-            ./venv/bin/python scripts/reset_ema200_consecutive_losses.py --quiet
-
             echo "=== Deploy complete ==="
             echo "running emas.py process:"
             PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" STATE_DIR="$STATE_DIR" BOT_ENTRY="$BOT_ENTRY" "$BOT_CTL" status || echo "no process"
