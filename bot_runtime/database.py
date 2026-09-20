@@ -316,7 +316,7 @@ class DBManager:
             )
             return [float(row[0] or 0.0) for row in cur.fetchall()]
 
-    def get_consecutive_strategy_losses(self, strategy, limit=100):
+    def get_consecutive_strategy_losses(self, strategy, limit=100, *, since=None):
         """Return the newest-first realized-loss streak for one strategy.
 
         This query is intentionally strategy-attributed and durable so a bot
@@ -327,14 +327,34 @@ class DBManager:
         if not strategy_value:
             raise ValueError('strategy is required')
         limit = max(1, min(1000, int(limit or 100)))
+        since_utc = None
+        if since not in (None, ''):
+            try:
+                since_utc = datetime.fromisoformat(
+                    str(since).replace('Z', '+00:00')
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError('invalid consecutive-loss cutoff') from exc
+            if since_utc.tzinfo is None:
+                raise ValueError('consecutive-loss cutoff must be timezone-aware')
+            since_utc = since_utc.astimezone(timezone.utc)
+
+        where = [
+            "exit_time IS NOT NULL",
+            "pnl_usdt IS NOT NULL",
+            "LOWER(COALESCE(strategy, '')) = ?",
+        ]
+        params = [strategy_value]
+        if since_utc is not None:
+            where.append("julianday(exit_time) > julianday(?)")
+            params.append(since_utc.isoformat())
+        params.append(limit)
         with self.lock:
             rows = self.conn.execute(
-                """SELECT pnl_usdt, exit_time FROM trades
-                WHERE exit_time IS NOT NULL
-                  AND pnl_usdt IS NOT NULL
-                  AND LOWER(COALESCE(strategy, '')) = ?
-                ORDER BY exit_time DESC, id DESC LIMIT ?""",
-                (strategy_value, limit),
+                "SELECT pnl_usdt, exit_time FROM trades WHERE "
+                + " AND ".join(where)
+                + " ORDER BY exit_time DESC, id DESC LIMIT ?",
+                tuple(params),
             ).fetchall()
 
         pnl_values = [float(row[0]) for row in rows]
@@ -346,6 +366,19 @@ class DBManager:
                 for item in loader() or []:
                     if not isinstance(item, dict) or not item.get('exit_time'):
                         continue
+                    if since_utc is not None:
+                        try:
+                            result_exit = datetime.fromisoformat(
+                                str(item['exit_time']).replace('Z', '+00:00')
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise ValueError(
+                                'invalid exit timestamp in trade result store'
+                            ) from exc
+                        if result_exit.tzinfo is None:
+                            result_exit = result_exit.replace(tzinfo=timezone.utc)
+                        if result_exit.astimezone(timezone.utc) <= since_utc:
+                            continue
                     attributed = {
                         str(item.get(key) or '').strip().lower()
                         for key in (

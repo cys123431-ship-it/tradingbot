@@ -5,10 +5,12 @@ from __future__ import annotations
 from utbreakout.dynamic_leverage import apply_dynamic_leverage_to_plan
 
 from .ema200_utbot_rsi import (
+    EMA200_CONSECUTIVE_LOSS_RESET_STATE_KEY,
     EMA200_UTBOT_RSI_STRATEGY,
     build_ema200_utbot_rsi_risk_plan,
     calculate_ema200_utbot_rsi_emergency_stop_price,
     evaluate_ema200_utbot_rsi_loss_gate,
+    get_ema200_consecutive_losses,
     is_ema200_utbot_rsi_symbol_allowed,
 )
 
@@ -1015,20 +1017,24 @@ class SignalEntryMixin:
                 target_notional = planned_qty * float(price)
                 margin_to_use = target_notional / max(float(lev), 1e-9)
             elif active_strategy == EMA200_UTBOT_RSI_STRATEGY:
-                streak_getter = getattr(
-                    self.db,
-                    'get_consecutive_strategy_losses',
-                    None,
-                )
-                if not callable(streak_getter):
-                    await self.ctrl.notify(
-                        '⚠️ EMA200 + UT Bot + RSI (2H) 진입 차단: '
-                        '연속 손실 이력을 안전하게 확인할 수 없습니다.'
-                    )
-                    return
                 try:
-                    ema200_loss_streak = int(
-                        streak_getter(EMA200_UTBOT_RSI_STRATEGY)
+                    streak_store = getattr(
+                        self, 'trading_state_store', None
+                    ) or getattr(
+                        getattr(self, 'ctrl', None),
+                        'trading_state_store',
+                        None,
+                    )
+                    streak_reset_payload = (
+                        streak_store.get_runtime_state(
+                            EMA200_CONSECUTIVE_LOSS_RESET_STATE_KEY
+                        )
+                        if streak_store is not None
+                        else None
+                    )
+                    ema200_loss_streak, _ = get_ema200_consecutive_losses(
+                        self.db,
+                        streak_reset_payload,
                     )
                 except Exception as streak_exc:
                     logger.exception('EMA200 consecutive-loss lookup failed')

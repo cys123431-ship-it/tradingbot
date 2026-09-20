@@ -14,6 +14,7 @@ from telegram.ext import (
 )
 
 from .ema200_utbot_rsi import (
+    EMA200_CONSECUTIVE_LOSS_RESET_STATE_KEY,
     EMA200_DAILY_LOSS_RESET_STATE_KEY,
     EMA200_BINANCE_TOP10_BASES,
     EMA200_UTBOT_RSI_CONFIG_KEY,
@@ -22,6 +23,7 @@ from .ema200_utbot_rsi import (
     apply_ema200_daily_loss_reset,
     build_ema200_utbot_rsi_risk_plan,
     ema200_small_account_margin_percent,
+    get_ema200_consecutive_losses,
     normalize_ema200_utbot_rsi_config,
 )
 
@@ -188,22 +190,33 @@ class ControllerEMA200UTBotRSIMixin:
         effective_daily_pnl = 0.0
         daily_reset_active = False
         loss_streak = 0
+        loss_streak_reset_active = False
+        engine = (getattr(self, "engines", {}) or {}).get("signal")
+        store = (
+            getattr(engine, "trading_state_store", None)
+            if engine
+            else None
+        ) or getattr(self, "trading_state_store", None)
         try:
             daily_count, daily_pnl = self.db.get_daily_stats()
             weekly_count, weekly_pnl = self.db.get_weekly_stats()
-            loss_streak = self.db.get_consecutive_strategy_losses(
-                EMA200_UTBOT_RSI_STRATEGY
+            streak_reset_payload = (
+                store.get_runtime_state(
+                    EMA200_CONSECUTIVE_LOSS_RESET_STATE_KEY
+                )
+                if store is not None
+                else None
+            )
+            loss_streak, loss_streak_reset_active = (
+                get_ema200_consecutive_losses(
+                    self.db,
+                    streak_reset_payload,
+                )
             )
         except Exception:
             pass
-        engine = (getattr(self, "engines", {}) or {}).get("signal")
         effective_daily_pnl = float(daily_pnl)
         try:
-            store = (
-                getattr(engine, "trading_state_store", None)
-                if engine
-                else None
-            ) or getattr(self, "trading_state_store", None)
             payload = (
                 store.get_runtime_state(EMA200_DAILY_LOSS_RESET_STATE_KEY)
                 if store is not None
@@ -281,7 +294,8 @@ class ControllerEMA200UTBotRSIMixin:
             "(공용 /utbot 설정과 분리)\n\n"
             "소액계좌 기준: equity 1,000 USDT 이하\n"
             f"소액계좌 다음 단계(해당 시): 증거금 {next_margin_percent:.0f}% / 5x / {stage_exit}\n"
-            f"EMA200 연속손실: {loss_streak}회\n"
+            f"EMA200 연속손실: {loss_streak}회"
+            f"{' (초기화 후)' if loss_streak_reset_active else ''}\n"
             "축소단계: 50% → 35% → 25% → 15% → 10%(하한)\n"
             f"1,000 USDT 초과 시 위험예산: 계좌의 {cfg['risk_per_trade_percent']:.2f}%\n"
             f"초과계좌 레버리지: {cfg['leverage']}x\n"

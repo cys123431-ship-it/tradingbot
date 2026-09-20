@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 import inspect
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ import emas
 from bot_runtime.controller_ema200_utbot_rsi import ControllerEMA200UTBotRSIMixin
 from bot_runtime.database import DBManager
 from bot_runtime.ema200_utbot_rsi import (
+    EMA200_CONSECUTIVE_LOSS_RESET_STATE_KEY,
     EMA200_DAILY_LOSS_RESET_STATE_KEY,
     EMA200_BINANCE_TOP10_BASES,
     EMA200_BINANCE_TOP10_SYMBOLS,
@@ -27,10 +29,14 @@ from bot_runtime.ema200_utbot_rsi import (
     ema200_kst_date,
     evaluate_ema200_utbot_rsi_entry,
     evaluate_ema200_utbot_rsi_loss_gate,
+    get_ema200_consecutive_losses,
     is_ema200_utbot_rsi_symbol_allowed,
     normalize_ema200_utbot_rsi_config,
 )
 from scripts.reset_ema200_daily_loss import reset_ema200_daily_loss
+from scripts.reset_ema200_consecutive_losses import (
+    reset_ema200_consecutive_losses,
+)
 from trading_safety.order_state import (
     DAILY_LOSS_ENTRY_LOCK_KEY,
     SQLiteTradingStateStore,
@@ -313,6 +319,49 @@ def test_database_loss_streak_is_strategy_specific_and_restart_durable(tmp_path)
     )
     assert reopened.get_consecutive_strategy_losses(EMA200_UTBOT_RSI_STRATEGY) == 0
     reopened.conn.close()
+
+
+def test_consecutive_loss_reset_preserves_history_and_counts_new_closes(tmp_path):
+    db = DBManager(tmp_path / "trades.sqlite3")
+    store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+    old_exit = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    def close_trade(symbol, pnl, exit_time):
+        db.log_trade_entry(
+            symbol,
+            "long",
+            100.0,
+            1.0,
+            strategy=EMA200_UTBOT_RSI_STRATEGY,
+        )
+        assert db.log_trade_close(
+            symbol,
+            pnl,
+            pnl,
+            100.0 + pnl,
+            "test",
+            exit_time=exit_time.isoformat(),
+        )
+
+    close_trade("BTC/USDT", -2.0, old_exit)
+    close_trade("ETH/USDT", -3.0, old_exit + timedelta(seconds=1))
+    payload = reset_ema200_consecutive_losses(db, store, reason="test")
+
+    assert payload["raw_consecutive_losses_at_reset"] == 2
+    assert store.get_runtime_state(
+        EMA200_CONSECUTIVE_LOSS_RESET_STATE_KEY
+    ) == payload
+    assert get_ema200_consecutive_losses(db, payload) == (0, True)
+    assert db.conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 2
+
+    reset_at = datetime.fromisoformat(payload["reset_at"].replace("Z", "+00:00"))
+    close_trade("SOL/USDT", -1.0, reset_at + timedelta(seconds=1))
+    assert get_ema200_consecutive_losses(db, payload) == (1, True)
+    close_trade("XRP/USDT", 1.0, reset_at + timedelta(seconds=2))
+    assert get_ema200_consecutive_losses(db, payload) == (0, True)
+
+    db.conn.close()
+    store.close()
 
 
 def test_risk_plan_caps_position_to_available_margin_without_increasing_risk():

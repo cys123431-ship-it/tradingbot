@@ -17,6 +17,9 @@ EMA200_UTBOT_KEY_VALUE = 1.0
 EMA200_UTBOT_ATR_PERIOD = 10
 EMA200_UTBOT_USE_HEIKIN_ASHI = False
 EMA200_DAILY_LOSS_RESET_STATE_KEY = "ema200_utbot_rsi_daily_loss_reset"
+EMA200_CONSECUTIVE_LOSS_RESET_STATE_KEY = (
+    "ema200_utbot_rsi_consecutive_loss_reset"
+)
 EMA200_KST = ZoneInfo("Asia/Seoul")
 
 EMA200_SMALL_ACCOUNT_THRESHOLD_USDT = 1000.0
@@ -518,6 +521,45 @@ def apply_ema200_daily_loss_reset(
     return raw_pnl - baseline, baseline, True
 
 
+def ema200_consecutive_loss_reset_after(reset_payload=None):
+    """Return the validated UTC cutoff for an operator loss-streak reset."""
+    if reset_payload is None:
+        return None
+    if not isinstance(reset_payload, dict):
+        raise ValueError("invalid EMA200 consecutive-loss reset state")
+    raw = str(reset_payload.get("reset_at") or "").strip()
+    if not raw:
+        raise ValueError("EMA200 consecutive-loss reset timestamp is missing")
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            "invalid EMA200 consecutive-loss reset timestamp"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise ValueError("EMA200 consecutive-loss reset timestamp must be UTC-aware")
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def get_ema200_consecutive_losses(db, reset_payload=None):
+    """Read the effective streak, ignoring closes before a manual reset."""
+    getter = getattr(db, "get_consecutive_strategy_losses", None)
+    if not callable(getter):
+        raise RuntimeError("EMA200 consecutive-loss history is unavailable")
+    cutoff = ema200_consecutive_loss_reset_after(reset_payload)
+    if cutoff is None:
+        streak = getter(EMA200_UTBOT_RSI_STRATEGY)
+    else:
+        streak = getter(EMA200_UTBOT_RSI_STRATEGY, since=cutoff)
+    try:
+        streak = int(streak)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("invalid EMA200 consecutive-loss count") from exc
+    if streak < 0:
+        raise ValueError("invalid EMA200 consecutive-loss count")
+    return streak, cutoff is not None
+
+
 __all__ = (
     "EMA200_UTBOT_RSI_STRATEGY",
     "EMA200_UTBOT_RSI_CONFIG_KEY",
@@ -526,6 +568,7 @@ __all__ = (
     "EMA200_UTBOT_ATR_PERIOD",
     "EMA200_UTBOT_USE_HEIKIN_ASHI",
     "EMA200_DAILY_LOSS_RESET_STATE_KEY",
+    "EMA200_CONSECUTIVE_LOSS_RESET_STATE_KEY",
     "default_ema200_utbot_rsi_config",
     "normalize_ema200_utbot_rsi_config",
     "evaluate_ema200_utbot_rsi_entry",
@@ -534,4 +577,6 @@ __all__ = (
     "evaluate_ema200_utbot_rsi_loss_gate",
     "ema200_kst_date",
     "apply_ema200_daily_loss_reset",
+    "ema200_consecutive_loss_reset_after",
+    "get_ema200_consecutive_losses",
 )

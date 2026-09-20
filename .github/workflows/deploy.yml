@@ -40,7 +40,7 @@ jobs:
       - name: Static smoke tests
         run: |
           set -euo pipefail
-          python -m py_compile emas.py scripts/utbreakout_backtest.py scripts/utbreakout_research_report.py scripts/validate_telegram_token.py
+          python -m py_compile emas.py scripts/reset_ema200_consecutive_losses.py scripts/utbreakout_backtest.py scripts/utbreakout_research_report.py scripts/validate_telegram_token.py
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pytest
           python -m pip check
@@ -151,7 +151,7 @@ jobs:
             if [ -f config.json ]; then
               chmod 600 config.json
             fi
-            ./venv/bin/python -m py_compile emas.py scripts/launch_emas.py scripts/reset_ema200_daily_loss.py scripts/utbreakout_backtest.py scripts/utbreakout_research_report.py scripts/validate_telegram_token.py
+            ./venv/bin/python -m py_compile emas.py scripts/launch_emas.py scripts/reset_ema200_daily_loss.py scripts/reset_ema200_consecutive_losses.py scripts/utbreakout_backtest.py scripts/utbreakout_research_report.py scripts/validate_telegram_token.py
             echo "=== Verify Telegram token ==="
             TELEGRAM_EXPECTED_USERNAME=YosebiBot ./venv/bin/python scripts/validate_telegram_token.py
             chmod +x "$BOT_CTL"
@@ -224,6 +224,9 @@ jobs:
               tail -n 80 "$LOG_FILE" || true
               exit 1
             fi
+
+            echo "=== Apply requested one-time EMA200 consecutive-loss reset ==="
+            ./venv/bin/python scripts/reset_ema200_consecutive_losses.py --quiet
 
             echo "=== Deploy complete ==="
             echo "running emas.py process:"
