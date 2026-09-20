@@ -15,17 +15,25 @@ import emas
 from bot_runtime.controller_ema200_utbot_rsi import ControllerEMA200UTBotRSIMixin
 from bot_runtime.database import DBManager
 from bot_runtime.ema200_utbot_rsi import (
+    EMA200_DAILY_LOSS_RESET_STATE_KEY,
     EMA200_BINANCE_TOP10_BASES,
     EMA200_BINANCE_TOP10_SYMBOLS,
     EMA200_UTBOT_RSI_STRATEGY,
+    apply_ema200_daily_loss_reset,
     build_ema200_utbot_rsi_risk_plan,
     calculate_ema200_utbot_rsi_emergency_stop_price,
     count_ema200_consecutive_losses,
     ema200_small_account_margin_percent,
+    ema200_kst_date,
     evaluate_ema200_utbot_rsi_entry,
     evaluate_ema200_utbot_rsi_loss_gate,
     is_ema200_utbot_rsi_symbol_allowed,
     normalize_ema200_utbot_rsi_config,
+)
+from scripts.reset_ema200_daily_loss import reset_ema200_daily_loss
+from trading_safety.order_state import (
+    DAILY_LOSS_ENTRY_LOCK_KEY,
+    SQLiteTradingStateStore,
 )
 from bot_runtime.strategy_registry import CORE_STRATEGIES
 
@@ -365,6 +373,9 @@ def test_config_normalization_keeps_fixed_safety_ranges_and_rejects_nonfinite_va
             "daily_loss_limit_percent": 99.0,
             "max_weekly_loss_limit_percent": 99.0,
             "weekly_loss_limit_percent": 99.0,
+            "utbot_key_value": 9.0,
+            "utbot_atr_period": 99,
+            "utbot_use_heikin_ashi": True,
         }
     )
     assert cfg["min_risk_per_trade_percent"] == 0.10
@@ -379,6 +390,129 @@ def test_config_normalization_keeps_fixed_safety_ranges_and_rejects_nonfinite_va
     assert cfg["max_emergency_exit_percent"] == 30.0
     assert cfg["daily_loss_limit_percent"] == 20.0
     assert cfg["weekly_loss_limit_percent"] == 40.0
+    assert cfg["utbot_key_value"] == 1.0
+    assert cfg["utbot_atr_period"] == 10
+    assert cfg["utbot_use_heikin_ashi"] is False
+
+
+def test_ema200_signal_uses_dedicated_ut_settings_not_shared_utbot_config():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    rows = []
+    for index in range(205):
+        close = 100.0 + index
+        rows.append([index, close - 1.0, close + 1.0, close - 2.0, close, 10.0])
+    frame = pd.DataFrame(
+        rows,
+        columns=["timestamp", "open", "high", "low", "close", "volume"],
+    )
+    observed = {}
+
+    def calculate_utbot(df, params):
+        observed.update(params["UTBot"])
+        return None, "state", {
+            "bias_side": "long",
+            "signal_side": "long",
+            "signal_ts": 100,
+        }
+
+    engine._calculate_utbot_signal = calculate_utbot
+    engine._calculate_ema200_utbot_rsi_signal(
+        frame,
+        {
+            "UTBot": {
+                "key_value": 5.0,
+                "atr_period": 50,
+                "use_heikin_ashi": True,
+            },
+            "EMA200UTBotRSI2H": {
+                "utbot_key_value": 8.0,
+                "utbot_atr_period": 80,
+                "utbot_use_heikin_ashi": True,
+            },
+        },
+    )
+
+    assert observed == {
+        "key_value": 1.0,
+        "atr_period": 10,
+        "use_heikin_ashi": False,
+    }
+
+
+def test_daily_loss_reset_preserves_history_and_resets_only_same_day_baseline(tmp_path):
+    db = DBManager(str(tmp_path / "trades.db"))
+    store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+    db.get_daily_stats = lambda: (2, -7.5)
+    store.set_runtime_state(
+        DAILY_LOSS_ENTRY_LOCK_KEY,
+        {"date": "2099-01-01", "reason": "DAILY_LOSS_LIMIT"},
+    )
+
+    payload = reset_ema200_daily_loss(db, store, reason="test")
+    effective, baseline, active = apply_ema200_daily_loss_reset(
+        -7.5,
+        store.get_runtime_state(EMA200_DAILY_LOSS_RESET_STATE_KEY),
+        current_date=payload["date"],
+    )
+
+    assert effective == pytest.approx(0.0)
+    assert baseline == pytest.approx(-7.5)
+    assert active is True
+    assert payload["trade_count_at_reset"] == 2
+    assert payload["already_reset"] is False
+    assert store.get_runtime_state(DAILY_LOSS_ENTRY_LOCK_KEY) is None
+    db.get_daily_stats = lambda: (3, -9.0)
+    repeated = reset_ema200_daily_loss(db, store, reason="repeat")
+    assert repeated["already_reset"] is True
+    assert repeated["baseline_realized_pnl"] == pytest.approx(-7.5)
+    assert apply_ema200_daily_loss_reset(
+        -7.5,
+        payload,
+        current_date="2099-01-02",
+    ) == (-7.5, 0.0, False)
+    db.conn.close()
+    store.close()
+
+
+def test_entry_gate_uses_reset_daily_baseline_but_keeps_weekly_pnl(tmp_path):
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.db = SimpleNamespace(
+        get_daily_stats=lambda: (2, -30.0),
+        get_weekly_stats=lambda: (4, -30.0),
+    )
+    engine.trading_state_store = SQLiteTradingStateStore(
+        tmp_path / "state.sqlite3"
+    )
+    engine.trading_state_store.set_runtime_state(
+        EMA200_DAILY_LOSS_RESET_STATE_KEY,
+        {
+            "date": ema200_kst_date(),
+            "baseline_realized_pnl": -25.0,
+        },
+    )
+
+    async def balance_info():
+        return 1000.0, 1000.0, {}
+
+    engine.get_balance_info = balance_info
+    gate = asyncio.run(
+        engine._ema200_utbot_rsi_new_entry_gate(
+            "BTC/USDT:USDT",
+            {
+                "EMA200UTBotRSI2H": {
+                    "daily_loss_limit_percent": 2.0,
+                    "weekly_loss_limit_percent": 5.0,
+                }
+            },
+        )
+    )
+
+    assert gate["allowed"] is True
+    assert gate["daily_realized_pnl_raw"] == pytest.approx(-30.0)
+    assert gate["daily_realized_pnl"] == pytest.approx(-5.0)
+    assert gate["weekly_realized_pnl"] == pytest.approx(-30.0)
+    assert gate["daily_reset_active"] is True
+    engine.trading_state_store.close()
 
 
 def test_emergency_stop_price_is_long_short_symmetric():
@@ -631,15 +765,22 @@ def test_fresh_opposite_ut_signal_mechanically_exits_before_optional_filters(
     engine.get_runtime_strategy_params = lambda: {
         "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
         "EMA200UTBotRSI2H": {"enabled": enabled},
+        "UTBot": {
+            "key_value": 5.0,
+            "atr_period": 50,
+            "use_heikin_ashi": True,
+        },
     }
     engine.get_runtime_common_settings = lambda: (_ for _ in ()).throw(
         AssertionError("optional exit filters must not run")
     )
-    engine._calculate_utbot_signal = lambda df, params: (
-        ut_signal,
-        "fresh opposite",
-        {"bias_side": ut_signal},
-    )
+    observed_ut = {}
+
+    def calculate_utbot(df, params):
+        observed_ut.update(params["UTBot"])
+        return ut_signal, "fresh opposite", {"bias_side": ut_signal}
+
+    engine._calculate_utbot_signal = calculate_utbot
     engine._update_stateful_diag = lambda *args, **kwargs: None
     engine.last_entry_reason = {}
     exit_calls = []
@@ -659,6 +800,11 @@ def test_fresh_opposite_ut_signal_mechanically_exits_before_optional_filters(
 
     assert processed is True
     assert exit_calls == [("BTC/USDT", exit_label)]
+    assert observed_ut == {
+        "key_value": 1.0,
+        "atr_period": 10,
+        "use_heikin_ashi": False,
+    }
 
 
 def test_mechanical_exit_retries_same_candle_when_position_remains_open():

@@ -2465,7 +2465,7 @@ class SignalCandleMixin:
                 strategy_name = f"{EMA200_UTBOT_RSI_DISPLAY_NAME}(Exit)"
                 ut_sig, ut_exit_reason, ut_detail = self._calculate_utbot_signal(
                     df,
-                    strategy_params,
+                    self._get_ema200_utbot_signal_params(strategy_params),
                 )
                 should_exit_long = current_side.lower() == 'long' and ut_sig == 'short'
                 should_exit_short = current_side.lower() == 'short' and ut_sig == 'long'

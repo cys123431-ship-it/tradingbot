@@ -5,8 +5,11 @@ from __future__ import annotations
 import pandas as pd
 
 from .ema200_utbot_rsi import (
+    EMA200_DAILY_LOSS_RESET_STATE_KEY,
     EMA200_UTBOT_RSI_CONFIG_KEY,
     EMA200_UTBOT_RSI_DISPLAY_NAME,
+    apply_ema200_daily_loss_reset,
+    ema200_kst_date,
     evaluate_ema200_utbot_rsi_entry,
     evaluate_ema200_utbot_rsi_loss_gate,
     normalize_ema200_utbot_rsi_config,
@@ -22,6 +25,17 @@ class SignalEMA200UTBotRSIMixin:
         )
         raw = params.get(EMA200_UTBOT_RSI_CONFIG_KEY, {}) if isinstance(params, dict) else {}
         return normalize_ema200_utbot_rsi_config(raw)
+
+    def _get_ema200_utbot_signal_params(self, strategy_params=None):
+        """Build UT parameters owned exclusively by the EMA200 strategy."""
+        params = dict(strategy_params) if isinstance(strategy_params, dict) else {}
+        cfg = self._get_ema200_utbot_rsi_config(strategy_params)
+        params["UTBot"] = {
+            "key_value": float(cfg["utbot_key_value"]),
+            "atr_period": int(cfg["utbot_atr_period"]),
+            "use_heikin_ashi": bool(cfg["utbot_use_heikin_ashi"]),
+        }
+        return params
 
     @staticmethod
     def _calculate_wilder_rsi_for_ema200_strategy(close_series, length):
@@ -96,7 +110,7 @@ class SignalEMA200UTBotRSIMixin:
 
         ut_sig, ut_reason, ut_detail = self._calculate_utbot_signal(
             df,
-            strategy_params,
+            self._get_ema200_utbot_signal_params(strategy_params),
         )
         curr_rsi_row = valid_rsi.iloc[-1]
         prev_rsi_row = valid_rsi.iloc[-2]
@@ -162,12 +176,50 @@ class SignalEMA200UTBotRSIMixin:
                 "reason": f"손익 기록 확인 실패: {type(exc).__name__}: {exc}",
             }
 
+        raw_daily_pnl = float(daily_pnl or 0.0)
+        reset_payload = None
+        reset_store = getattr(self, "trading_state_store", None) or getattr(
+            getattr(self, "ctrl", None),
+            "trading_state_store",
+            None,
+        )
+        if reset_store is not None:
+            try:
+                reset_payload = reset_store.get_runtime_state(
+                    EMA200_DAILY_LOSS_RESET_STATE_KEY
+                )
+                if (
+                    isinstance(reset_payload, dict)
+                    and str(reset_payload.get("date") or "") != ema200_kst_date()
+                ):
+                    reset_store.delete_runtime_state(
+                        EMA200_DAILY_LOSS_RESET_STATE_KEY
+                    )
+                    reset_payload = None
+            except Exception as exc:
+                return {
+                    "allowed": False,
+                    "reason": (
+                        "일일 손실 초기화 상태 확인 실패: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                }
+        effective_daily_pnl, reset_baseline, reset_active = (
+            apply_ema200_daily_loss_reset(
+                raw_daily_pnl,
+                reset_payload,
+            )
+        )
+
         gate = evaluate_ema200_utbot_rsi_loss_gate(
             account_equity=equity,
-            daily_realized_pnl=daily_pnl,
+            daily_realized_pnl=effective_daily_pnl,
             weekly_realized_pnl=weekly_pnl,
             config=cfg,
         )
+        gate["daily_realized_pnl_raw"] = raw_daily_pnl
+        gate["daily_reset_baseline"] = reset_baseline
+        gate["daily_reset_active"] = reset_active
         gate["account_equity"] = equity
         gate["free_balance"] = float(free or 0.0)
         gate["symbol"] = symbol

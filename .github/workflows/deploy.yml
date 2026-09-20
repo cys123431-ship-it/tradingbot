@@ -124,6 +124,8 @@ jobs:
             ./venv/bin/python -m pip install --upgrade pip
             ./venv/bin/python -m pip install -r requirements.txt
             ./venv/bin/python -m pip check
+            echo "=== Diagnose preserved shared UTBot settings ==="
+            ./venv/bin/python -c 'import json, pathlib; d=json.loads(pathlib.Path("config.json").read_text(encoding="utf-8")); u=d.get("signal_engine", {}).get("strategy_params", {}).get("UTBot", {}); print(f"shared UTBot key={float(u.get('"'"'key_value'"'"', 1.0) or 1.0):.2f} ATR={int(u.get('"'"'atr_period'"'"', 10) or 10)} HA={'"'"'ON'"'"' if u.get('"'"'use_heikin_ashi'"'"', False) else '"'"'OFF'"'"'}")'
             echo "=== Apply Prediction live env if provided ==="
             mkdir -p runtime
             if [ -n "${PREDICTION_API_KEY:-}" ] || [ -n "${PREDICTION_JWT:-}" ] || [ -n "${PREDICTION_PRIVATE_KEY:-}" ]; then
@@ -151,7 +153,7 @@ jobs:
             if [ -f config.json ]; then
               chmod 600 config.json
             fi
-            ./venv/bin/python -m py_compile emas.py scripts/launch_emas.py scripts/utbreakout_backtest.py scripts/utbreakout_research_report.py scripts/validate_telegram_token.py
+            ./venv/bin/python -m py_compile emas.py scripts/launch_emas.py scripts/reset_ema200_daily_loss.py scripts/utbreakout_backtest.py scripts/utbreakout_research_report.py scripts/validate_telegram_token.py
             echo "=== Verify Telegram token ==="
             TELEGRAM_EXPECTED_USERNAME=YosebiBot ./venv/bin/python scripts/validate_telegram_token.py
             chmod +x "$BOT_CTL"
@@ -224,6 +226,9 @@ jobs:
               tail -n 80 "$LOG_FILE" || true
               exit 1
             fi
+
+            echo "=== Apply requested one-time EMA200 daily loss reset ==="
+            ./venv/bin/python scripts/reset_ema200_daily_loss.py --quiet
 
             echo "=== Deploy complete ==="
             echo "running emas.py process:"

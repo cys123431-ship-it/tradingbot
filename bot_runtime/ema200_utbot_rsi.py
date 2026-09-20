@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from math import isfinite
+from zoneinfo import ZoneInfo
 
 EMA200_UTBOT_RSI_STRATEGY = "ema200_utbot_rsi_2h"
 EMA200_UTBOT_RSI_CONFIG_KEY = "EMA200UTBotRSI2H"
 EMA200_UTBOT_RSI_DISPLAY_NAME = "EMA200 + UT Bot + RSI (2H)"
+
+# This strategy owns its UT Bot definition.  It must never inherit the mutable
+# settings used by the standalone /utbot strategy: doing so can turn the same
+# completed candle from SHORT into LONG after an unrelated menu change.
+EMA200_UTBOT_KEY_VALUE = 1.0
+EMA200_UTBOT_ATR_PERIOD = 10
+EMA200_UTBOT_USE_HEIKIN_ASHI = False
+EMA200_DAILY_LOSS_RESET_STATE_KEY = "ema200_utbot_rsi_daily_loss_reset"
+EMA200_KST = ZoneInfo("Asia/Seoul")
 
 EMA200_SMALL_ACCOUNT_THRESHOLD_USDT = 1000.0
 EMA200_SMALL_ACCOUNT_LEVERAGE = 5
@@ -53,6 +64,9 @@ def default_ema200_utbot_rsi_config():
         "ema_period": 200,
         "rsi_length": 14,
         "rsi_threshold": 50.0,
+        "utbot_key_value": EMA200_UTBOT_KEY_VALUE,
+        "utbot_atr_period": EMA200_UTBOT_ATR_PERIOD,
+        "utbot_use_heikin_ashi": EMA200_UTBOT_USE_HEIKIN_ASHI,
         "risk_per_trade_percent": 0.50,
         "min_risk_per_trade_percent": 0.10,
         "max_risk_per_trade_percent": 5.00,
@@ -109,10 +123,15 @@ def normalize_ema200_utbot_rsi_config(raw=None):
         cfg.update(raw)
 
     cfg["enabled"] = _enabled_value(cfg.get("enabled", True))
-    # The strategy definition is intentionally fixed to 2h / EMA200 / RSI50.
+    # The strategy definition is intentionally fixed to 2h / EMA200 / RSI50
+    # and its own UT Bot defaults.  In particular, do not let the standalone
+    # UTBot menu mutate this independent strategy's signal direction.
     cfg["timeframe"] = "2h"
     cfg["ema_period"] = 200
     cfg["rsi_threshold"] = 50.0
+    cfg["utbot_key_value"] = EMA200_UTBOT_KEY_VALUE
+    cfg["utbot_atr_period"] = EMA200_UTBOT_ATR_PERIOD
+    cfg["utbot_use_heikin_ashi"] = EMA200_UTBOT_USE_HEIKIN_ASHI
     try:
         cfg["rsi_length"] = max(2, min(100, int(cfg.get("rsi_length", 14) or 14)))
     except (TypeError, ValueError, OverflowError):
@@ -471,14 +490,48 @@ def evaluate_ema200_utbot_rsi_loss_gate(
     }
 
 
+def ema200_kst_date(now=None):
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    return reference.astimezone(EMA200_KST).date().isoformat()
+
+
+def apply_ema200_daily_loss_reset(
+    daily_realized_pnl,
+    reset_payload=None,
+    *,
+    current_date=None,
+):
+    """Return today's PnL measured from an explicit manual reset baseline.
+
+    Trade history remains intact.  A reset only changes the daily entry-gate
+    baseline for the same Korea calendar day; weekly loss accounting is never
+    altered.
+    """
+    raw_pnl = _finite(daily_realized_pnl, 0.0)
+    today = str(current_date or ema200_kst_date())
+    payload = reset_payload if isinstance(reset_payload, dict) else {}
+    if str(payload.get("date") or "") != today:
+        return raw_pnl, 0.0, False
+    baseline = _finite(payload.get("baseline_realized_pnl"), 0.0)
+    return raw_pnl - baseline, baseline, True
+
+
 __all__ = (
     "EMA200_UTBOT_RSI_STRATEGY",
     "EMA200_UTBOT_RSI_CONFIG_KEY",
     "EMA200_UTBOT_RSI_DISPLAY_NAME",
+    "EMA200_UTBOT_KEY_VALUE",
+    "EMA200_UTBOT_ATR_PERIOD",
+    "EMA200_UTBOT_USE_HEIKIN_ASHI",
+    "EMA200_DAILY_LOSS_RESET_STATE_KEY",
     "default_ema200_utbot_rsi_config",
     "normalize_ema200_utbot_rsi_config",
     "evaluate_ema200_utbot_rsi_entry",
     "build_ema200_utbot_rsi_risk_plan",
     "calculate_ema200_utbot_rsi_emergency_stop_price",
     "evaluate_ema200_utbot_rsi_loss_gate",
+    "ema200_kst_date",
+    "apply_ema200_daily_loss_reset",
 )

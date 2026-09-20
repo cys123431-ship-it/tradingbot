@@ -1067,6 +1067,15 @@ class SignalEntryMixin:
                     'ema200_emergency_stop_required': bool(
                         ema200_risk_plan['emergency_stop_required']
                     ),
+                    'ema200_utbot_key_value': float(
+                        ema200_risk_cfg['utbot_key_value']
+                    ),
+                    'ema200_utbot_atr_period': int(
+                        ema200_risk_cfg['utbot_atr_period']
+                    ),
+                    'ema200_utbot_use_heikin_ashi': bool(
+                        ema200_risk_cfg['utbot_use_heikin_ashi']
+                    ),
                 }
                 ema200_status = (
                     getattr(self, 'last_ema200_utbot_rsi_status', {}) or {}
@@ -2225,6 +2234,9 @@ class SignalEntryMixin:
                     # audit. The notice is sent only after the SL is verified.
                     entry_notice = (
                         f"{entry_notice}\n"
+                        f"UT Bot 전용값: Key {float(ema200_risk_cfg['utbot_key_value']):.2f} / "
+                        f"ATR {int(ema200_risk_cfg['utbot_atr_period'])} / "
+                        f"HA {'ON' if ema200_risk_cfg['utbot_use_heikin_ashi'] else 'OFF'}\n"
                         f"🛟 비상 손절 가격거리: 진입가 대비 {emergency_pct:.2f}% "
                         f"({emergency_label})\n"
                         "정상 청산: 완료된 2시간봉 UT Bot 반대 신호"
@@ -2232,6 +2244,9 @@ class SignalEntryMixin:
                 else:
                     entry_notice = (
                         f"{entry_notice}\n"
+                        f"UT Bot 전용값: Key {float(ema200_risk_cfg['utbot_key_value']):.2f} / "
+                        f"ATR {int(ema200_risk_cfg['utbot_atr_period'])} / "
+                        f"HA {'ON' if ema200_risk_cfg['utbot_use_heikin_ashi'] else 'OFF'}\n"
                         "⚠️ 첫 단계: 거래소 Stop 없음 / "
                         "완료된 2시간봉 UT Bot 반대 신호로만 청산\n"
                         "청산가 도달 전 별도 손절이 없는 고위험 단계"

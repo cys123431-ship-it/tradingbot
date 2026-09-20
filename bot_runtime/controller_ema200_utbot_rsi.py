@@ -14,10 +14,12 @@ from telegram.ext import (
 )
 
 from .ema200_utbot_rsi import (
+    EMA200_DAILY_LOSS_RESET_STATE_KEY,
     EMA200_BINANCE_TOP10_BASES,
     EMA200_UTBOT_RSI_CONFIG_KEY,
     EMA200_UTBOT_RSI_DISPLAY_NAME,
     EMA200_UTBOT_RSI_STRATEGY,
+    apply_ema200_daily_loss_reset,
     build_ema200_utbot_rsi_risk_plan,
     ema200_small_account_margin_percent,
     normalize_ema200_utbot_rsi_config,
@@ -183,6 +185,8 @@ class ControllerEMA200UTBotRSIMixin:
 
         daily_count = weekly_count = 0
         daily_pnl = weekly_pnl = 0.0
+        effective_daily_pnl = 0.0
+        daily_reset_active = False
         loss_streak = 0
         try:
             daily_count, daily_pnl = self.db.get_daily_stats()
@@ -192,6 +196,30 @@ class ControllerEMA200UTBotRSIMixin:
             )
         except Exception:
             pass
+        engine = (getattr(self, "engines", {}) or {}).get("signal")
+        effective_daily_pnl = float(daily_pnl)
+        try:
+            store = (
+                getattr(engine, "trading_state_store", None)
+                if engine
+                else None
+            ) or getattr(self, "trading_state_store", None)
+            payload = (
+                store.get_runtime_state(EMA200_DAILY_LOSS_RESET_STATE_KEY)
+                if store is not None
+                else None
+            )
+            effective_daily_pnl, _, daily_reset_active = (
+                apply_ema200_daily_loss_reset(daily_pnl, payload)
+            )
+        except Exception:
+            daily_reset_active = False
+        daily_reset_line = (
+            "오늘 손실한도 기준손익(초기화 후): "
+            f"{float(effective_daily_pnl):+.4f} USDT\n"
+            if daily_reset_active
+            else ""
+        )
         next_margin_percent = ema200_small_account_margin_percent(loss_streak)
         stage_exit = (
             "UT 반대 신호만(Stop 없음)"
@@ -206,7 +234,6 @@ class ControllerEMA200UTBotRSIMixin:
         latest_symbol = None
         latest_detail = {}
         latest_reason = None
-        engine = (getattr(self, "engines", {}) or {}).get("signal")
         status_map = getattr(engine, "last_ema200_utbot_rsi_status", {}) if engine else {}
         recent_symbols = []
         if isinstance(status_map, dict) and status_map:
@@ -248,6 +275,10 @@ class ControllerEMA200UTBotRSIMixin:
             f"스캔 종목: {', '.join(EMA200_BINANCE_TOP10_BASES)} (고정 10개)\n"
             "추세: 종가 > EMA200=롱 허용 / 종가 < EMA200=숏 허용\n"
             f"RSI: {cfg['rsi_length']}기간, LONG=50 위 상승 / SHORT=50 아래 하락\n\n"
+            f"UT Bot 전용값: Key {cfg['utbot_key_value']:.2f} / "
+            f"ATR {cfg['utbot_atr_period']} / "
+            f"HA {'ON' if cfg['utbot_use_heikin_ashi'] else 'OFF'} "
+            "(공용 /utbot 설정과 분리)\n\n"
             "소액계좌 기준: equity 1,000 USDT 이하\n"
             f"소액계좌 다음 단계(해당 시): 증거금 {next_margin_percent:.0f}% / 5x / {stage_exit}\n"
             f"EMA200 연속손실: {loss_streak}회\n"
@@ -259,6 +290,7 @@ class ControllerEMA200UTBotRSIMixin:
             f"최근 7일 손실한도: {cfg['weekly_loss_limit_percent']:.2f}%\n\n"
             f"📐 다음 진입 예상\n{sizing_preview}\n\n"
             f"오늘 실현손익: {float(daily_pnl):+.4f} USDT / {daily_count}건\n"
+            f"{daily_reset_line}"
             f"최근 7일 실현손익: {float(weekly_pnl):+.4f} USDT / {weekly_count}건\n\n"
             f"{condition_text}\n\n"
             "중요: 소액계좌의 연속손실 0회 단계는 비상 Stop 없이 "
@@ -367,6 +399,8 @@ class ControllerEMA200UTBotRSIMixin:
             "→ 진입. 이후 UT Bot Buy에서 정상 청산합니다.\n\n"
             "UT 신호는 현재 RSI 평가봉보다 먼저 확정되어야 하며, 같은 봉 신호는 인정하지 않습니다. "
             "완료된 2시간봉만 사용해 진행 중 봉의 흔들림으로 인한 가짜 돌파를 피합니다.\n\n"
+            "이 전략의 UT Bot은 Key 1.0 / ATR 10 / 일반 캔들(HA OFF)로 고정되며, "
+            "다른 /utbot 전략의 설정을 변경해도 영향을 받지 않습니다.\n\n"
             f"스캔 대상은 {', '.join(EMA200_BINANCE_TOP10_BASES)} 고정 10개이며, "
             "그 밖의 종목은 다른 경로에서 신호가 들어와도 진입 단계에서 차단합니다.\n\n"
             "소액계좌(1,000 USDT 이하)는 첫 단계에서 equity의 50%를 증거금으로 5x 진입하고 "
