@@ -15,6 +15,10 @@ from telegram.ext import (
 import emas
 from bot_runtime.controller_ema200_utbot_rsi import ControllerEMA200UTBotRSIMixin
 from bot_runtime.database import DBManager
+from bot_runtime.ema200_candidate_selector import (
+    build_ema200_candidate,
+    rank_ema200_candidates,
+)
 from bot_runtime.ema200_utbot_rsi import (
     EMA200_CONSECUTIVE_LOSS_RESET_STATE_KEY,
     EMA200_DAILY_LOSS_RESET_STATE_KEY,
@@ -425,6 +429,7 @@ def test_config_normalization_keeps_fixed_safety_ranges_and_rejects_nonfinite_va
             "utbot_key_value": 9.0,
             "utbot_atr_period": 99,
             "utbot_use_heikin_ashi": True,
+            "best_candidate_selection_enabled": "off",
         }
     )
     assert cfg["min_risk_per_trade_percent"] == 0.10
@@ -442,6 +447,16 @@ def test_config_normalization_keeps_fixed_safety_ranges_and_rejects_nonfinite_va
     assert cfg["utbot_key_value"] == 1.0
     assert cfg["utbot_atr_period"] == 10
     assert cfg["utbot_use_heikin_ashi"] is False
+    assert cfg["best_candidate_selection_enabled"] is False
+
+
+def test_best_candidate_selection_defaults_on_for_fresh_and_migrated_config():
+    assert normalize_ema200_utbot_rsi_config()[
+        "best_candidate_selection_enabled"
+    ] is True
+    assert normalize_ema200_utbot_rsi_config({
+        "best_candidate_selection_enabled": "true",
+    })["best_candidate_selection_enabled"] is True
 
 
 def test_ema200_signal_uses_dedicated_ut_settings_not_shared_utbot_config():
@@ -636,9 +651,12 @@ def test_primary_and_exit_polling_are_fixed_to_2h():
         emas.SignalEngine._scan_and_trade_ema200_binance_top10
     )
     high_volume_source = inspect.getsource(emas.SignalEngine.scan_and_trade_high_volume)
+    poll_tick_source = inspect.getsource(emas.SignalEngine.poll_tick)
     assert "'2h'" in fixed_scanner_source
     assert "EMA200_BINANCE_TOP10_SYMBOLS" in fixed_scanner_source
     assert "_scan_and_trade_ema200_binance_top10" in high_volume_source
+    assert "configured_active_strategy == EMA200_UTBOT_RSI_STRATEGY" in poll_tick_source
+    assert "scanner_enabled = True" in poll_tick_source
 
 
 def test_open_ema200_position_keeps_2h_exit_after_active_strategy_changes():
@@ -717,6 +735,299 @@ def test_fixed_top10_scanner_checks_every_symbol_on_2h_without_volume_selection(
     asyncio.run(engine._scan_and_trade_ema200_binance_top10())
     rotated = EMA200_BINANCE_TOP10_SYMBOLS[1:] + EMA200_BINANCE_TOP10_SYMBOLS[:1]
     assert calls == [(symbol, "2h", 300) for symbol in rotated]
+
+
+def _ema200_ranking_ohlcv(*, close=100.0, volume=100.0, candle_ts=None):
+    step = 2 * 60 * 60 * 1000
+    final_closed_ts = candle_ts or (220 * step)
+    first_ts = final_closed_ts - (219 * step)
+    rows = []
+    for index in range(220):
+        price = close - 2.0 + (index / 220.0) * 2.0
+        rows.append([
+            first_ts + index * step,
+            price - 0.2,
+            price + 0.5,
+            price - 0.5,
+            price,
+            volume,
+        ])
+    rows.append([
+        final_closed_ts + step,
+        close,
+        close + 0.3,
+        close - 0.3,
+        close,
+        volume,
+    ])
+    return rows
+
+
+def test_candidate_ranker_prefers_fresher_stronger_signal_over_scan_order():
+    step = 2 * 60 * 60 * 1000
+    candle_ts = 220 * step
+    btc = build_ema200_candidate(
+        symbol="BTC/USDT:USDT",
+        side="long",
+        detail={
+            "closed_candle_ts": candle_ts,
+            "closed_candle_close": 100.0,
+            "ema200": 99.0,
+            "ema200_previous": 99.1,
+            "prev_rsi": 55.0,
+            "curr_rsi": 55.1,
+            "ut_last_signal_ts": candle_ts - 10 * step,
+        },
+        ohlcv=_ema200_ranking_ohlcv(
+            close=100.0,
+            volume=10_000.0,
+            candle_ts=candle_ts,
+        ),
+    )
+    eth = build_ema200_candidate(
+        symbol="ETH/USDT:USDT",
+        side="long",
+        detail={
+            "closed_candle_ts": candle_ts,
+            "closed_candle_close": 100.0,
+            "ema200": 99.0,
+            "ema200_previous": 98.8,
+            "prev_rsi": 52.0,
+            "curr_rsi": 55.0,
+            "ut_last_signal_ts": candle_ts - step,
+        },
+        ohlcv=_ema200_ranking_ohlcv(
+            close=100.0,
+            volume=100.0,
+            candle_ts=candle_ts,
+        ),
+    )
+
+    ranked = rank_ema200_candidates([btc, eth])
+
+    assert [item["symbol"] for item in ranked] == [
+        "ETH/USDT:USDT",
+        "BTC/USDT:USDT",
+    ]
+    assert ranked[0]["score"] > ranked[1]["score"]
+    assert ranked[0]["score_breakdown"]["ut_recency"] == 40.0
+    assert ranked[1]["score_breakdown"]["liquidity"] == 15.0
+
+
+def test_best_candidate_scanner_evaluates_all_ten_then_enters_highest_rank():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    step = 2 * 60 * 60 * 1000
+    candle_ts = 220 * step
+    events = []
+    opened = set()
+    details = {
+        symbol: {
+            "closed_candle_ts": candle_ts,
+            "closed_candle_close": 100.0,
+            "ema200": 99.0,
+            "ema200_previous": 99.0,
+            "prev_rsi": 49.0,
+            "curr_rsi": 49.0,
+            "ut_last_signal_ts": candle_ts - step,
+        }
+        for symbol in EMA200_BINANCE_TOP10_SYMBOLS
+    }
+    details["BTC/USDT:USDT"].update({
+        "prev_rsi": 55.0,
+        "curr_rsi": 55.1,
+        "ema200_previous": 99.1,
+        "ut_last_signal_ts": candle_ts - 10 * step,
+    })
+    details["ETH/USDT:USDT"].update({
+        "prev_rsi": 52.0,
+        "curr_rsi": 55.0,
+        "ema200_previous": 98.8,
+        "ut_last_signal_ts": candle_ts - step,
+    })
+
+    def fetch_ohlcv(symbol, timeframe, limit):
+        events.append(("fetch", symbol))
+        volume = 10_000.0 if symbol == "BTC/USDT:USDT" else 100.0
+        return _ema200_ranking_ohlcv(
+            close=100.0,
+            volume=volume,
+            candle_ts=candle_ts,
+        )
+
+    engine.market_data_exchange = SimpleNamespace(fetch_ohlcv=fetch_ohlcv)
+    engine.ctrl = SimpleNamespace(is_paused=False)
+    engine.scanner_active_symbol = None
+    engine.ema200_top10_scan_cursor = 0
+    engine.last_entry_reason = {}
+    engine.last_processed_candle_ts = {}
+    engine.last_candle_time = {}
+    engine.last_candle_success = {}
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
+        "EMA200UTBotRSI2H": {"best_candidate_selection_enabled": True},
+    }
+
+    def collect_context(symbol, *args, **kwargs):
+        return {
+            "precomputed": {"symbol": symbol},
+            "raw_hybrid_detail": dict(details[symbol]),
+        }
+
+    async def calculate_signal(*args, precomputed=None, **kwargs):
+        symbol = precomputed["symbol"]
+        signal = "long" if symbol in {"BTC/USDT:USDT", "ETH/USDT:USDT"} else None
+        return signal, None, None, None, None, None
+
+    async def get_position(symbol, use_cache=False):
+        if symbol in opened:
+            return {"symbol": symbol, "side": "long", "contracts": 1.0}
+        return None
+
+    async def entry(symbol, side, price):
+        events.append(("entry", symbol))
+        opened.add(symbol)
+
+    engine._collect_primary_strategy_context = collect_context
+    engine._calculate_strategy_signal = calculate_signal
+    engine.get_server_position = get_position
+    engine.entry = entry
+
+    asyncio.run(engine._scan_and_trade_ema200_binance_top10())
+
+    assert [event for event in events if event[0] == "fetch"] == [
+        ("fetch", symbol) for symbol in EMA200_BINANCE_TOP10_SYMBOLS
+    ]
+    assert [event for event in events if event[0] == "entry"] == [
+        ("entry", "ETH/USDT:USDT")
+    ]
+    assert engine.scanner_active_symbol == "ETH/USDT:USDT"
+    assert engine.last_ema200_candidate_selection["selected"]["symbol"] == (
+        "ETH/USDT:USDT"
+    )
+    assert engine.last_processed_candle_ts["ETH/USDT:USDT"] == candle_ts
+
+
+def test_best_candidate_off_preserves_first_valid_signal_behavior():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    step = 2 * 60 * 60 * 1000
+    candle_ts = 220 * step
+    fetched = []
+    opened = set()
+
+    def fetch_ohlcv(symbol, timeframe, limit):
+        fetched.append(symbol)
+        return _ema200_ranking_ohlcv(candle_ts=candle_ts)
+
+    engine.market_data_exchange = SimpleNamespace(fetch_ohlcv=fetch_ohlcv)
+    engine.ctrl = SimpleNamespace(is_paused=False)
+    engine.scanner_active_symbol = None
+    engine.ema200_top10_scan_cursor = 0
+    engine.last_entry_reason = {}
+    engine.last_processed_candle_ts = {}
+    engine.last_candle_time = {}
+    engine.last_candle_success = {}
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
+        "EMA200UTBotRSI2H": {"best_candidate_selection_enabled": False},
+    }
+    engine._collect_primary_strategy_context = lambda symbol, *args, **kwargs: {
+        "precomputed": {"symbol": symbol},
+        "raw_hybrid_detail": {
+            "closed_candle_ts": candle_ts,
+            "closed_candle_close": 100.0,
+            "ema200": 99.0,
+            "ema200_previous": 98.9,
+            "prev_rsi": 52.0,
+            "curr_rsi": 53.0,
+            "ut_last_signal_ts": candle_ts - step,
+        },
+    }
+
+    async def signal(*args, **kwargs):
+        return "long", None, None, None, None, None
+
+    async def get_position(symbol, use_cache=False):
+        return (
+            {"symbol": symbol, "side": "long", "contracts": 1.0}
+            if symbol in opened
+            else None
+        )
+
+    async def entry(symbol, side, price):
+        opened.add(symbol)
+
+    engine._calculate_strategy_signal = signal
+    engine.get_server_position = get_position
+    engine.entry = entry
+
+    asyncio.run(engine._scan_and_trade_ema200_binance_top10())
+
+    assert fetched == [EMA200_BINANCE_TOP10_SYMBOLS[0]]
+    assert engine.scanner_active_symbol == EMA200_BINANCE_TOP10_SYMBOLS[0]
+    assert engine.last_ema200_candidate_selection["enabled"] is False
+
+
+def test_best_candidate_scan_fails_closed_when_one_of_ten_cannot_be_evaluated():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    step = 2 * 60 * 60 * 1000
+    candle_ts = 220 * step
+    entries = []
+
+    def fetch_ohlcv(symbol, timeframe, limit):
+        if symbol == EMA200_BINANCE_TOP10_SYMBOLS[-1]:
+            raise TimeoutError("simulated market-data timeout")
+        return _ema200_ranking_ohlcv(candle_ts=candle_ts)
+
+    engine.market_data_exchange = SimpleNamespace(fetch_ohlcv=fetch_ohlcv)
+    engine.ctrl = SimpleNamespace(is_paused=False)
+    engine.scanner_active_symbol = None
+    engine.ema200_top10_scan_cursor = 0
+    engine.last_entry_reason = {}
+    engine.last_processed_candle_ts = {}
+    engine.last_candle_time = {}
+    engine.last_candle_success = {}
+    engine.get_runtime_strategy_params = lambda: {
+        "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
+        "EMA200UTBotRSI2H": {"best_candidate_selection_enabled": True},
+    }
+    engine._collect_primary_strategy_context = lambda symbol, *args, **kwargs: {
+        "precomputed": {"symbol": symbol},
+        "raw_hybrid_detail": {
+            "closed_candle_ts": candle_ts,
+            "closed_candle_close": 100.0,
+            "ema200": 99.0,
+            "ema200_previous": 98.9,
+            "prev_rsi": 52.0,
+            "curr_rsi": 53.0,
+            "ut_last_signal_ts": candle_ts - step,
+        },
+    }
+
+    async def signal(*args, precomputed=None, **kwargs):
+        return (
+            "long" if precomputed["symbol"] == EMA200_BINANCE_TOP10_SYMBOLS[0] else None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+    async def entry(symbol, side, price):
+        entries.append((symbol, side, price))
+
+    async def no_position(symbol, use_cache=False):
+        return None
+
+    engine._calculate_strategy_signal = signal
+    engine.entry = entry
+    engine.get_server_position = no_position
+
+    asyncio.run(engine._scan_and_trade_ema200_binance_top10())
+
+    assert entries == []
+    assert "10개 중 9개 평가" in engine.last_ema200_candidate_selection["reason"]
+    assert "TimeoutError" in engine.last_ema200_candidate_selection["reason"]
 
 
 def test_high_volume_scanner_bypasses_coin_selector_for_ema200_strategy():
@@ -1144,6 +1455,22 @@ def test_telegram_status_uses_real_evaluation_order_when_2h_timestamps_tie():
                 "ETH/USDT": {**base_detail, "evaluated_at_ns": 20},
             },
             last_entry_reason={"ETH/USDT": "latest evaluation"},
+            last_ema200_candidate_selection={
+                "reason": "전체 유효 후보 중 최고 순위 진입 완료",
+                "selected": {
+                    "symbol": "ETH/USDT:USDT",
+                    "side": "long",
+                    "score": 88.5,
+                },
+                "candidates": [{
+                    "rank": 1,
+                    "symbol": "ETH/USDT:USDT",
+                    "side": "long",
+                    "score": 88.5,
+                    "ut_age_bars": 1.0,
+                    "rsi_momentum": 2.5,
+                }],
+            },
         )
     }
 
@@ -1154,6 +1481,8 @@ def test_telegram_status_uses_real_evaluation_order_when_2h_timestamps_tie():
     assert "스캔 종목: BTC, ETH, BNB, XRP, SOL, TRX, ZEC, HYPE, DOGE, XMR" in status
     assert "소액계좌 다음 단계(해당 시): 증거금 35% / 5x" in status
     assert "UT 반대 신호 + 비상 Stop" in status
+    assert "최적 후보 선택: ON" in status
+    assert "선택: ETH/USDT:USDT LONG / 점수 88.50" in status
 
 
 def test_telegram_status_shows_actual_large_account_entry_amounts_and_ratios():
@@ -1236,6 +1565,55 @@ def test_telegram_keyboard_labels_emergency_percent_as_stop_distance():
     assert "손절거리 5%" in labels
     assert "✍️ 손절거리 직접입력" in labels
     assert all("비상탈출" not in label for label in labels)
+
+
+def test_telegram_keyboard_exposes_best_candidate_toggle_and_help():
+    controller = _registered_telegram_controller()
+    buttons = [
+        button
+        for row in controller._build_ema200_utbot_rsi_keyboard().inline_keyboard
+        for button in row
+    ]
+
+    assert any(
+        button.text == "🏆 최적후보: ON"
+        and button.callback_data == "e2h:candidate_toggle"
+        for button in buttons
+    )
+    help_text = controller._ema200_utbot_rsi_help_text("candidate")
+    assert "10개 종목을 동일한 완료 2시간봉" in help_text
+    assert "점수는 후보의 순서만 정하며" in help_text
+    assert "기존 포지션" in help_text
+
+
+def test_telegram_best_candidate_toggle_updates_only_strategy_selector_flag():
+    controller = _registered_telegram_controller()
+    handler = next(
+        handler
+        for handler, _ in controller.tg_app.handlers
+        if isinstance(handler, CallbackQueryHandler)
+    )
+    query = _TelegramQuery("e2h:candidate_toggle")
+
+    asyncio.run(
+        handler.callback(
+            SimpleNamespace(callback_query=query),
+            SimpleNamespace(user_data={}),
+        )
+    )
+
+    assert controller.cfg.updates == [
+        (
+            [
+                "binance_futures",
+                "strategy_params",
+                "EMA200UTBotRSI2H",
+                "best_candidate_selection_enabled",
+            ],
+            False,
+        )
+    ]
+    assert query.edits and "최적 후보 선택 OFF" in query.edits[-1]
 
 
 @pytest.mark.parametrize("raw_value", ["9", "nan", "inf"])

@@ -70,6 +70,10 @@ def default_ema200_utbot_rsi_config():
         "utbot_key_value": EMA200_UTBOT_KEY_VALUE,
         "utbot_atr_period": EMA200_UTBOT_ATR_PERIOD,
         "utbot_use_heikin_ashi": EMA200_UTBOT_USE_HEIKIN_ASHI,
+        # When enabled, all valid signals from the fixed ten-symbol universe
+        # are ranked on the same completed 2h candle before one entry is sent.
+        # It remains independently switchable from the strategy entry toggle.
+        "best_candidate_selection_enabled": True,
         "risk_per_trade_percent": 0.50,
         "min_risk_per_trade_percent": 0.10,
         "max_risk_per_trade_percent": 5.00,
@@ -135,6 +139,9 @@ def normalize_ema200_utbot_rsi_config(raw=None):
     cfg["utbot_key_value"] = EMA200_UTBOT_KEY_VALUE
     cfg["utbot_atr_period"] = EMA200_UTBOT_ATR_PERIOD
     cfg["utbot_use_heikin_ashi"] = EMA200_UTBOT_USE_HEIKIN_ASHI
+    cfg["best_candidate_selection_enabled"] = _enabled_value(
+        cfg.get("best_candidate_selection_enabled", True)
+    )
     try:
         cfg["rsi_length"] = max(2, min(100, int(cfg.get("rsi_length", 14) or 14)))
     except (TypeError, ValueError, OverflowError):

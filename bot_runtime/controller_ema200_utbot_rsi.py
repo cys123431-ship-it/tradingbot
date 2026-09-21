@@ -48,6 +48,9 @@ class ControllerEMA200UTBotRSIMixin:
     def _build_ema200_utbot_rsi_keyboard(self):
         cfg = self._ema200_utbot_rsi_config()
         enabled = bool(cfg.get("enabled", True))
+        candidate_enabled = bool(
+            cfg.get("best_candidate_selection_enabled", True)
+        )
         return InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
@@ -62,6 +65,16 @@ class ControllerEMA200UTBotRSIMixin:
             [
                 InlineKeyboardButton("📊 상태", callback_data="e2h:status"),
                 InlineKeyboardButton("📘 전략 설명", callback_data="e2h:guide"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🏆 최적후보: ON" if candidate_enabled else "🏆 최적후보: OFF",
+                    callback_data="e2h:candidate_toggle",
+                ),
+                InlineKeyboardButton(
+                    "❓ 후보선택 설명",
+                    callback_data="e2h:help:candidate",
+                ),
             ],
             [
                 InlineKeyboardButton("위험 0.25%", callback_data="e2h:risk:0.25"),
@@ -280,10 +293,49 @@ class ControllerEMA200UTBotRSIMixin:
                 f"{', '.join(recent_symbols)}"
             )
 
+        candidate_enabled = bool(
+            cfg.get("best_candidate_selection_enabled", True)
+        )
+        candidate_status = (
+            "ON — 10개 전부 평가 후 최고 점수 후보부터 주문"
+            if candidate_enabled
+            else "OFF — 회전 스캔 순서상 첫 유효 신호부터 주문"
+        )
+        selection_text = "최근 후보선택: 아직 평가 기록 없음"
+        selection_state = (
+            getattr(engine, "last_ema200_candidate_selection", {})
+            if engine
+            else {}
+        )
+        if isinstance(selection_state, dict) and selection_state:
+            selection_lines = [
+                "최근 후보선택: "
+                + (selection_state.get("reason") or "평가 완료")
+            ]
+            selected = selection_state.get("selected") or {}
+            if selected:
+                selection_lines.append(
+                    "• 선택: "
+                    f"{selected.get('symbol')} "
+                    f"{str(selected.get('side') or '').upper()} "
+                    f"/ 점수 {float(selected.get('score') or 0):.2f}"
+                )
+            for candidate in (selection_state.get("candidates") or [])[:3]:
+                selection_lines.append(
+                    f"• {int(candidate.get('rank') or 0)}위 "
+                    f"{candidate.get('symbol')} "
+                    f"{str(candidate.get('side') or '').upper()} "
+                    f"{float(candidate.get('score') or 0):.2f}점 "
+                    f"(UT {float(candidate.get('ut_age_bars') or 0):.1f}봉 전, "
+                    f"RSIΔ {float(candidate.get('rsi_momentum') or 0):.2f})"
+                )
+            selection_text = "\n".join(selection_lines)
+
         return (
             f"🎛 {EMA200_UTBOT_RSI_DISPLAY_NAME}\n\n"
             f"전략 선택: {'✅ ACTIVE' if active else '⬜ 미선택'}\n"
             f"신규 진입: {'ON' if cfg['enabled'] else 'OFF'}\n"
+            f"최적 후보 선택: {candidate_status}\n"
             "시간봉: 2시간 완료봉 고정\n"
             f"스캔 종목: {', '.join(EMA200_BINANCE_TOP10_BASES)} (고정 10개)\n"
             "추세: 종가 > EMA200=롱 허용 / 종가 < EMA200=숏 허용\n"
@@ -307,6 +359,7 @@ class ControllerEMA200UTBotRSIMixin:
             f"{daily_reset_line}"
             f"최근 7일 실현손익: {float(weekly_pnl):+.4f} USDT / {weekly_count}건\n\n"
             f"{condition_text}\n\n"
+            f"{selection_text}\n\n"
             "중요: 소액계좌의 연속손실 0회 단계는 비상 Stop 없이 "
             "UT Bot 반대 신호로만 청산됩니다. 첫 손실 뒤 다음 진입부터 "
             "포지션이 축소되고 비상 Stop이 적용됩니다."
@@ -314,6 +367,23 @@ class ControllerEMA200UTBotRSIMixin:
 
     @staticmethod
     def _ema200_utbot_rsi_help_text(kind):
+        if kind == "candidate":
+            return (
+                "📘 최적 후보 선택이란?\n\n"
+                "ON이면 고정 10개 종목을 동일한 완료 2시간봉 기준으로 모두 평가한 뒤, "
+                "EMA200·UT Bot·RSI 진입 조건을 이미 통과한 후보들만 서로 비교합니다.\n\n"
+                "점수는 최근 UT 신호, RSI 진행 강도, 진입 방향의 EMA200 기울기, "
+                "최근 24시간 거래대금에 가점을 주고 EMA200에서 3ATR보다 지나치게 "
+                "멀어진 후보에는 추격진입 감점을 줍니다. 점수는 후보의 순서만 정하며 "
+                "원래 진입 조건을 새로 만들거나 우회하지 않습니다.\n\n"
+                "예시) BTC와 DOGE가 같은 2시간봉에서 모두 LONG 조건을 충족했을 때, "
+                "BTC가 먼저 스캔됐다는 이유로 즉시 진입하지 않습니다. 10개 평가가 "
+                "끝난 후 점수가 높은 종목부터 한 종목만 주문합니다. 최고 후보의 주문이 "
+                "최소수량·안전장치 등으로 열리지 않으면 다음 순위 후보를 확인합니다.\n\n"
+                "OFF이면 기존 방식대로 매 주기 회전되는 스캔 순서에서 처음 발견한 "
+                "유효 신호부터 주문합니다. 변경은 새 진입에만 영향을 주며, 기존 포지션의 "
+                "UT 반대 신호 청산·보호주문·리스크 관리는 바뀌지 않습니다."
+            )
         if kind == "risk":
             return (
                 "📘 1회 위험예산이란?\n\n"
@@ -499,6 +569,30 @@ class ControllerEMA200UTBotRSIMixin:
                         "▶ 신규진입 ON" if not cfg["enabled"]
                         else "⏸ 신규진입 OFF — 이미 보유한 포지션의 정상청산/비상보호는 유지됩니다."
                     ),
+                    reply_markup=self._build_ema200_utbot_rsi_keyboard(),
+                )
+                return
+
+            if action == "candidate_toggle":
+                cfg = self._ema200_utbot_rsi_config()
+                current = bool(
+                    cfg.get("best_candidate_selection_enabled", True)
+                )
+                await self._update_ema200_utbot_rsi_value(
+                    "best_candidate_selection_enabled",
+                    not current,
+                )
+                await query.edit_message_text(
+                    (
+                        "🏆 최적 후보 선택 ON — 고정 10개를 모두 평가한 뒤 "
+                        "점수순으로 한 종목만 진입합니다."
+                        if current is False
+                        else (
+                            "↩️ 최적 후보 선택 OFF — 회전 스캔 순서에서 "
+                            "첫 유효 신호부터 진입합니다."
+                        )
+                    )
+                    + "\n이미 열린 포지션의 청산·보호 방식은 변경되지 않습니다.",
                     reply_markup=self._build_ema200_utbot_rsi_keyboard(),
                 )
                 return

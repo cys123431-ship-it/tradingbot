@@ -6,6 +6,10 @@ from .ema200_utbot_rsi import (
     EMA200_BINANCE_TOP10_SYMBOLS,
     EMA200_UTBOT_RSI_STRATEGY,
 )
+from .ema200_candidate_selector import (
+    build_ema200_candidate,
+    rank_ema200_candidates,
+)
 
 from utbreakout.adaptive_breakout_trend import (
     ADAPTIVE_BREAKOUT_TREND_STRATEGY,
@@ -43,14 +47,111 @@ from .diagnostics import _safe_float_or_none
 
 
 class SignalScannerMixin:
+    @staticmethod
+    def _ema200_candidate_status_item(candidate):
+        """Return the bounded, Telegram-safe part of a ranking candidate."""
+
+        return {
+            key: candidate.get(key)
+            for key in (
+                'symbol',
+                'side',
+                'closed_candle_ts',
+                'ut_age_bars',
+                'rsi_momentum',
+                'ema_slope_percent',
+                'quote_volume_24h',
+                'extension_atr',
+                'score',
+                'score_breakdown',
+                'rank',
+                'candidate_count',
+            )
+        }
+
+    def _store_ema200_candidate_selection(
+        self,
+        *,
+        enabled,
+        candidates,
+        selected=None,
+        reason=None,
+        closed_candle_ts=None,
+    ):
+        self.last_ema200_candidate_selection = {
+            'enabled': bool(enabled),
+            'evaluated_at_ns': time.time_ns(),
+            'closed_candle_ts': int(closed_candle_ts or 0),
+            'candidate_count': len(candidates or []),
+            'candidates': [
+                self._ema200_candidate_status_item(candidate)
+                for candidate in (candidates or [])[:10]
+            ],
+            'selected': (
+                self._ema200_candidate_status_item(selected)
+                if isinstance(selected, dict)
+                else None
+            ),
+            'reason': str(reason or ''),
+        }
+
+    async def _try_ema200_scanner_candidate(self, candidate):
+        """Attempt one ranked candidate while preserving all entry safeguards."""
+
+        symbol = str(candidate.get('symbol') or '')
+        side = str(candidate.get('side') or '').lower()
+        if not symbol or side not in {'long', 'short'}:
+            return False
+        if self.ctrl.is_paused or self.scanner_active_symbol:
+            return False
+
+        if await self.get_server_position(symbol, use_cache=False):
+            self.scanner_active_symbol = symbol
+            return True
+
+        rank = int(candidate.get('rank') or 1)
+        candidate_count = int(candidate.get('candidate_count') or 1)
+        score = float(candidate.get('score') or 0.0)
+        side_label = side.upper()
+        self.last_entry_reason[symbol] = (
+            "EMA200 + UT Bot + RSI (2H): EMA200/UT/RSI 조건 충족 + "
+            f"최적 후보 {rank}/{candidate_count} (점수 {score:.2f}) -> "
+            f"{side_label} 진입"
+        )
+        logger.info(
+            "[EMA200_UTBOT_RSI_2H] ranked entry candidate: "
+            "%s %s rank=%s/%s score=%.2f",
+            symbol,
+            side_label,
+            rank,
+            candidate_count,
+            score,
+        )
+        await self.entry(symbol, side, float(candidate.get('market_price') or 0.0))
+        position = await self.get_server_position(symbol, use_cache=False)
+        if not position:
+            return False
+
+        self.scanner_active_symbol = symbol
+        closed_candle_ts = int(candidate.get('closed_candle_ts') or 0)
+        if closed_candle_ts > 0:
+            self.last_processed_candle_ts[symbol] = closed_candle_ts
+            self.last_candle_time[symbol] = closed_candle_ts
+        self.last_candle_success[symbol] = True
+        return True
+
     async def _scan_and_trade_ema200_binance_top10(self):
-        """Evaluate only the fixed Binance-tradable market-cap top ten."""
+        """Evaluate the fixed universe, optionally ranking all valid signals."""
 
         strategy_params = self.get_runtime_strategy_params()
         if str(strategy_params.get('active_strategy', '') or '').lower() != (
             EMA200_UTBOT_RSI_STRATEGY
         ):
             return
+        strategy_cfg = self._get_ema200_utbot_rsi_config(strategy_params)
+        selection_enabled = bool(
+            strategy_cfg.get('best_candidate_selection_enabled', True)
+        )
 
         universe_size = len(EMA200_BINANCE_TOP10_SYMBOLS)
         start = int(getattr(self, 'ema200_top10_scan_cursor', 0) or 0) % universe_size
@@ -62,9 +163,14 @@ class SignalScannerMixin:
         # latest-condition view does not look permanently pinned to one coin.
         self.ema200_top10_scan_cursor = (start + 1) % universe_size
         logger.info(
-            "[EMA200_UTBOT_RSI_2H] fixed-universe scan: %s",
+            "[EMA200_UTBOT_RSI_2H] fixed-universe scan (best=%s): %s",
+            'ON' if selection_enabled else 'OFF',
             ", ".join(symbols),
         )
+        candidates = []
+        newest_evaluated_candle_ts = 0
+        evaluated_candle_ts = {}
+        scan_failures = []
         for symbol in symbols:
             if self.ctrl.is_paused or self.scanner_active_symbol:
                 return
@@ -79,6 +185,7 @@ class SignalScannerMixin:
                     self.last_entry_reason[symbol] = (
                         "EMA200 고정 Top10 스캔: 2시간봉 데이터 없음"
                     )
+                    scan_failures.append(f"{symbol}: 2시간봉 데이터 없음")
                     continue
                 df = pd.DataFrame(
                     ohlcv,
@@ -98,28 +205,50 @@ class SignalScannerMixin:
                     allow_utbot_stateful=False,
                     precomputed=context.get('precomputed'),
                 )
+                strategy_detail = dict(context.get('raw_hybrid_detail') or {})
+                newest_evaluated_candle_ts = max(
+                    newest_evaluated_candle_ts,
+                    int(strategy_detail.get('closed_candle_ts') or 0),
+                )
+                evaluated_candle_ts[symbol] = int(
+                    strategy_detail.get('closed_candle_ts') or 0
+                )
                 if sig not in {'long', 'short'}:
                     continue
-
-                if await self.get_server_position(symbol, use_cache=False):
-                    self.scanner_active_symbol = symbol
-                    return
-
-                logger.info(
-                    "[EMA200_UTBOT_RSI_2H] fixed-universe entry candidate: %s %s",
-                    symbol,
-                    sig.upper(),
+                candidate = build_ema200_candidate(
+                    symbol=symbol,
+                    side=sig,
+                    detail=strategy_detail,
+                    ohlcv=ohlcv,
+                    market_price=float(ohlcv[-1][4]),
                 )
-                await self.entry(symbol, sig, float(ohlcv[-1][4]))
-                position = await self.get_server_position(symbol, use_cache=False)
-                if position:
-                    self.scanner_active_symbol = symbol
-                    current_ts = int(ohlcv[-1][0])
-                    self.last_processed_candle_ts[symbol] = current_ts
-                    self.last_candle_time[symbol] = current_ts
-                    self.last_candle_success[symbol] = True
-                    return
+                candidates.append(candidate)
+
+                # OFF intentionally preserves the legacy behavior: the first
+                # valid signal in the rotating scan order is attempted at once.
+                if not selection_enabled:
+                    legacy_ranked = rank_ema200_candidates([candidate])
+                    legacy_candidate = legacy_ranked[0]
+                    opened = await self._try_ema200_scanner_candidate(
+                        legacy_candidate
+                    )
+                    self._store_ema200_candidate_selection(
+                        enabled=False,
+                        candidates=legacy_ranked,
+                        selected=legacy_candidate if opened else None,
+                        reason=(
+                            '스캔 순서상 첫 유효 신호 진입'
+                            if opened
+                            else '첫 유효 신호 주문 미체결; 다음 종목 계속 평가'
+                        ),
+                        closed_candle_ts=legacy_candidate.get('closed_candle_ts'),
+                    )
+                    if opened:
+                        return
             except Exception as exc:
+                scan_failures.append(
+                    f"{symbol}: {type(exc).__name__}"
+                )
                 self.last_entry_reason[symbol] = (
                     "EMA200 고정 Top10 스캔 오류: "
                     f"{type(exc).__name__}: {exc}"
@@ -129,6 +258,86 @@ class SignalScannerMixin:
                     symbol,
                     exc,
                 )
+
+        if not selection_enabled:
+            if not candidates:
+                self._store_ema200_candidate_selection(
+                    enabled=False,
+                    candidates=[],
+                    reason='진입 조건 충족 후보 없음',
+                    closed_candle_ts=newest_evaluated_candle_ts,
+                )
+            return
+
+        # "Best of ten" is meaningful only when all ten symbols were evaluated
+        # successfully on the exact same completed candle.  Partial or stale
+        # data is an unknown comparison, so fail closed and retry next cycle.
+        completed_timestamps = set(evaluated_candle_ts.values())
+        complete_same_candle = (
+            len(evaluated_candle_ts) == universe_size
+            and len(completed_timestamps) == 1
+            and 0 not in completed_timestamps
+        )
+        if not complete_same_candle:
+            reason = (
+                "최적 후보 선택 보류: "
+                f"10개 중 {len(evaluated_candle_ts)}개 평가, "
+                f"완료봉 시각 {len(completed_timestamps)}종류"
+            )
+            if scan_failures:
+                reason += f" / 오류 {', '.join(scan_failures[:3])}"
+            self._store_ema200_candidate_selection(
+                enabled=True,
+                candidates=[],
+                reason=reason,
+                closed_candle_ts=newest_evaluated_candle_ts,
+            )
+            return
+
+        ranked = rank_ema200_candidates(candidates)
+        if not ranked:
+            self._store_ema200_candidate_selection(
+                enabled=True,
+                candidates=[],
+                reason='10개 전부 평가 완료: 진입 조건 충족 후보 없음',
+                closed_candle_ts=newest_evaluated_candle_ts,
+            )
+            return
+
+        for candidate in ranked:
+            self.last_entry_reason[candidate['symbol']] = (
+                "EMA200/UT/RSI 진입 조건 충족, 최적 후보 비교 "
+                f"{candidate['rank']}/{candidate['candidate_count']} "
+                f"(점수 {float(candidate['score']):.2f})"
+            )
+        self._store_ema200_candidate_selection(
+            enabled=True,
+            candidates=ranked,
+            reason='10개 전부 평가 완료; 점수순 주문 대기',
+            closed_candle_ts=newest_evaluated_candle_ts,
+        )
+
+        for candidate in ranked:
+            if self.ctrl.is_paused or self.scanner_active_symbol:
+                return
+            opened = await self._try_ema200_scanner_candidate(candidate)
+            if not opened:
+                continue
+            self._store_ema200_candidate_selection(
+                enabled=True,
+                candidates=ranked,
+                selected=candidate,
+                reason='전체 유효 후보 중 최고 순위 진입 완료',
+                closed_candle_ts=newest_evaluated_candle_ts,
+            )
+            return
+
+        self._store_ema200_candidate_selection(
+            enabled=True,
+            candidates=ranked,
+            reason='점수순 주문을 시도했지만 포지션이 열리지 않음',
+            closed_candle_ts=newest_evaluated_candle_ts,
+        )
 
     async def _finalize_scanner_flat_position(self, symbol):
         """Finish a scanner-owned position only after cleanup and accounting."""
@@ -306,6 +515,21 @@ class SignalScannerMixin:
 
             # Check Scanner Setting
             scanner_enabled = bool(common_cfg.get('scanner_enabled', True))
+            configured_strategy_params = (
+                cfg.get('strategy_params', {})
+                if isinstance(cfg.get('strategy_params', {}), dict)
+                else {}
+            )
+            configured_active_strategy = str(
+                configured_strategy_params.get('active_strategy', 'utbot')
+                or 'utbot'
+            ).lower()
+            # The EMA200 strategy contract is a fixed ten-symbol universe.
+            # Its own `enabled` flag controls new entries, while the generic
+            # volume-scanner switch must not silently downgrade it to a
+            # watchlist-only strategy and bypass all-candidate comparison.
+            if configured_active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+                scanner_enabled = True
             if adaptive_trend_single_mode:
                 scanner_enabled = False
                 if not adaptive_trend_single_symbol:

@@ -117,6 +117,7 @@ class SignalEMA200UTBotRSIMixin:
         curr_closed = closed.iloc[-1]
         curr_close = float(curr_closed["close"])
         curr_ema = float(ema_series.iloc[-1])
+        previous_ema = float(ema_series.iloc[-2])
         rsi_ts = int(curr_rsi_row["timestamp"])
         signal, reason, entry_detail = evaluate_ema200_utbot_rsi_entry(
             close_price=curr_close,
@@ -135,6 +136,7 @@ class SignalEMA200UTBotRSIMixin:
             "enabled": True,
             "timeframe": "2h",
             "ema_period": ema_period,
+            "ema200_previous": previous_ema,
             "rsi_length": rsi_length,
             "rsi_threshold": float(cfg["rsi_threshold"]),
             "ut_signal": ut_sig,
