@@ -289,6 +289,39 @@ class SignalRuntimeMixin:
         if store is not None:
             store.set_runtime_state('entry_lock_reason', self.crypto_entry_lock_reason)
 
+    @staticmethod
+    def _reconciliation_owned_crypto_entry_lock(
+        reason,
+        *,
+        user_stream_ready=False,
+    ):
+        text = str(reason or '').strip()
+        if not text:
+            return True
+        if text.startswith('RECONCILIATION_REQUIRED'):
+            return True
+        if user_stream_ready and text.startswith('USER_STREAM_'):
+            return True
+        return False
+
+    def _stronger_crypto_entry_lock(self, *, user_stream_ready=False):
+        store = getattr(self, 'trading_state_store', None)
+        persisted = (
+            store.get_runtime_state('entry_lock_reason')
+            if store is not None
+            else None
+        )
+        for reason in (
+            getattr(self, 'crypto_entry_lock_reason', None),
+            persisted,
+        ):
+            if not self._reconciliation_owned_crypto_entry_lock(
+                reason,
+                user_stream_ready=user_stream_ready,
+            ):
+                return str(reason)
+        return None
+
     async def _reconcile_crypto_exchange_state(
         self,
         *,
@@ -317,14 +350,23 @@ class SignalRuntimeMixin:
             'tradfi_profile_rollout': dict(rollout_state or {}),
         }
         critical_pause = load_critical_pause_state()
-        if not result.safe_to_trade:
-            self._set_crypto_entry_lock(
-                'RECONCILIATION_REQUIRED: ' + ', '.join(result.issues[:5])
-            )
-        elif critical_pause:
+        stronger_lock = self._stronger_crypto_entry_lock(
+            user_stream_ready=bool(user_stream_ready),
+        )
+        if critical_pause:
             self._set_crypto_entry_lock(
                 'CRITICAL_PAUSE:'
                 + str(critical_pause.get('reason') or 'manual reconciliation required')
+            )
+        elif stronger_lock:
+            # A successful generic exchange snapshot cannot prove that a
+            # protection-specific uncertainty has been resolved.  Preserve the
+            # subsystem-owned lock until that subsystem reconciles its state.
+            self._set_crypto_entry_lock(stronger_lock)
+        elif not result.safe_to_trade:
+            details = list(result.issues) + list(result.unresolved_records)
+            self._set_crypto_entry_lock(
+                'RECONCILIATION_REQUIRED: ' + ', '.join(details[:5])
             )
         else:
             self._set_crypto_entry_lock(None)
