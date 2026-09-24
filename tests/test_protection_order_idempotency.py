@@ -60,6 +60,9 @@ def test_terminal_binance_algo_order_is_not_recovered_as_open_protection():
         def market(self, _symbol):
             return {"id": "BTCUSDT"}
 
+        def fetch_position_mode(self, _symbol=None):
+            return {"hedged": False}
+
         def fapiPrivateGetAlgoOrder(self, params):
             return {
                 "algoId": "cancelled-sl",

@@ -662,6 +662,36 @@ class SignalEntryMixin:
                 await self._entry_upbit_spot(symbol, side, price)
                 return
 
+            position_mode = await self._require_binance_one_way_mode(
+                symbol,
+                operation='crypto futures entry',
+                record_ema_status=False,
+            )
+            if not position_mode.get('ok'):
+                status_code = str(
+                    position_mode.get('status')
+                    or 'POSITION_MODE_UNAVAILABLE'
+                )
+                reason = str(position_mode.get('reason') or status_code)
+                block_reason = f'{status_code}: {reason}'
+                self.last_entry_reason[symbol] = block_reason
+                logger.warning(
+                    'Crypto futures entry blocked for %s: %s',
+                    symbol,
+                    block_reason,
+                )
+                try:
+                    await self.ctrl.notify(
+                        f'⛔ {self.ctrl.format_symbol_for_display(symbol)} '
+                        f'신규 진입 차단: {reason}'
+                    )
+                except Exception:
+                    logger.debug(
+                        'Position-mode entry block notification skipped',
+                        exc_info=True,
+                    )
+                return
+
             # === [Single Position Enforcement] ===
             # ?대? ?ㅻⅨ ?ъ??섏씠 ?덈뒗吏 ?뺤씤 (?꾩껜 ?щ낵 ?ㅼ틪)
             # Volume Scanner ???대뼡 湲곕뒫???곕뜑?쇰룄 ?대? ?ъ??섏씠 ?덉쑝硫?異붽? 吏꾩엯 李⑤떒

@@ -64,24 +64,375 @@ class SignalProtectionMixin:
             return 'short'
         return ''
 
-    def _is_ema200_managed_profit_stop_order(
+    @staticmethod
+    def _binance_bool(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value or '').strip().lower()
+        if text in {'true', '1', 'yes', 'y', 'on'}:
+            return True
+        if text in {'false', '0', 'no', 'n', 'off'}:
+            return False
+        return None
+
+    async def _binance_position_mode_status(self, symbol=None):
+        exchange_id = str(getattr(self.exchange, 'id', '') or '').strip().lower()
+        if exchange_id not in {'binance', 'binanceusdm'}:
+            return {
+                'ok': True,
+                'status': 'NOT_BINANCE',
+                'hedged': False,
+            }
+        try:
+            fetch_mode = getattr(self.exchange, 'fetch_position_mode', None)
+            if callable(fetch_mode):
+                response = await asyncio.to_thread(fetch_mode, symbol)
+            else:
+                endpoint = (
+                    getattr(self.exchange, 'fapiPrivateGetPositionSideDual', None)
+                    or getattr(
+                        self.exchange,
+                        'fapi_private_get_position_side_dual',
+                        None,
+                    )
+                )
+                if not callable(endpoint):
+                    raise RuntimeError(
+                        'Binance position mode endpoint is unavailable'
+                    )
+                response = await asyncio.to_thread(endpoint)
+        except Exception as exc:
+            return {
+                'ok': False,
+                'status': 'POSITION_MODE_UNAVAILABLE',
+                'hedged': None,
+                'reason': f'{type(exc).__name__}: {exc}',
+            }
+
+        raw = None
+        if isinstance(response, dict):
+            raw = response.get('hedged')
+            if raw is None:
+                raw = response.get('dualSidePosition')
+            if raw is None and isinstance(response.get('info'), dict):
+                raw = response['info'].get('dualSidePosition')
+        hedged = self._binance_bool(raw)
+        if hedged is None:
+            return {
+                'ok': False,
+                'status': 'POSITION_MODE_UNAVAILABLE',
+                'hedged': None,
+                'reason': f'unrecognized Binance position mode response: {response}',
+            }
+        if hedged:
+            return {
+                'ok': False,
+                'status': 'UNSUPPORTED_HEDGE_MODE',
+                'hedged': True,
+                'reason': (
+                    'Binance Hedge Mode is not supported for managed crypto '
+                    'futures protection'
+                ),
+            }
+        return {
+            'ok': True,
+            'status': 'ONE_WAY',
+            'hedged': False,
+        }
+
+    async def _require_binance_one_way_mode(
+        self,
+        symbol,
+        *,
+        operation='crypto futures operation',
+        record_ema_status=False,
+    ):
+        result = await self._binance_position_mode_status(symbol)
+        if result.get('ok'):
+            return result
+
+        status_code = str(result.get('status') or 'POSITION_MODE_UNAVAILABLE')
+        reason = str(result.get('reason') or status_code)
+        lock_reason = f'{status_code}:{symbol}'
+        try:
+            self._set_crypto_entry_lock(lock_reason)
+        except Exception:
+            logger.exception(
+                'Failed to persist crypto entry lock for %s position-mode failure',
+                symbol,
+            )
+        if record_ema_status:
+            setter = getattr(self, '_set_ema200_profit_stop_status', None)
+            if callable(setter):
+                setter(symbol, status_code, reason=reason)
+            else:
+                states = getattr(self, 'last_ema200_profit_stop_status', None)
+                if not isinstance(states, dict):
+                    states = {}
+                    self.last_ema200_profit_stop_status = states
+                states[symbol] = {
+                    'status': status_code,
+                    'reason': reason,
+                }
+        logger.warning(
+            '%s blocked for %s: %s',
+            operation,
+            symbol,
+            reason,
+        )
+        return result
+
+    def _protection_replace_lock(self, symbol):
+        locks = getattr(self, '_protection_replace_locks', None)
+        if not isinstance(locks, dict):
+            locks = {}
+            self._protection_replace_locks = locks
+        key = self._normalize_protection_symbol(symbol) or str(symbol)
+        lock = locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[key] = lock
+        return lock
+
+    def _compatible_stop_orders_for_position(self, pos, orders):
+        pos_side = self._managed_position_side((pos or {}).get('side'))
+        if pos_side not in {'long', 'short'}:
+            return []
+        close_side = 'sell' if pos_side == 'long' else 'buy'
+        try:
+            current_qty = abs(float(
+                self._position_signed_contracts(pos)
+                or (pos or {}).get('contracts', 0)
+                or 0
+            ))
+        except (TypeError, ValueError):
+            current_qty = 0.0
+        compatible = []
+        for order in orders or []:
+            if self._classify_protection_order(order) != 'sl':
+                continue
+            order_side = self._protection_order_side(order)
+            if order_side and order_side != close_side:
+                continue
+            order_qty = self._protection_order_amount(order)
+            if (
+                current_qty > 0
+                and order_qty is not None
+                and not self._qty_matches_plan(current_qty, order_qty)
+            ):
+                continue
+            trigger = self._protection_trigger_price(order)
+            if trigger is None:
+                continue
+            compatible.append(order)
+        return compatible
+
+    def _best_stop_order_for_position(self, pos, orders):
+        side = self._managed_position_side((pos or {}).get('side'))
+        compatible = self._compatible_stop_orders_for_position(pos, orders)
+        if not compatible:
+            return None
+        key = lambda order: float(self._protection_trigger_price(order))
+        return (
+            max(compatible, key=key)
+            if side == 'long'
+            else min(compatible, key=key)
+        )
+
+    def _stop_is_at_least_as_protective(self, side, existing_stop, target_stop):
+        existing = _safe_float_or_none(existing_stop)
+        target = _safe_float_or_none(target_stop)
+        if existing is None or target is None:
+            return False
+        tolerance = max(abs(float(target)) * 1e-9, 1e-12)
+        if str(side).lower() == 'long':
+            return float(existing) + tolerance >= float(target)
+        if str(side).lower() == 'short':
+            return float(existing) - tolerance <= float(target)
+        return False
+
+    def _ema200_matching_position_records(self, symbol, pos, records=None):
+        if records is None:
+            store = getattr(self, 'trading_state_store', None)
+            if store is None:
+                return []
+            try:
+                records = store.active_for_symbol(symbol) or []
+            except Exception:
+                logger.exception(
+                    'EMA200 position-state lookup failed for %s',
+                    symbol,
+                )
+                return []
+        side = self._managed_position_side((pos or {}).get('side'))
+        try:
+            current_qty = abs(float(
+                self._position_signed_contracts(pos)
+                or (pos or {}).get('contracts', 0)
+                or 0
+            ))
+        except (TypeError, ValueError):
+            current_qty = 0.0
+        matched = []
+        for record in records or []:
+            if (
+                str(getattr(record, 'strategy', '') or '').strip().lower()
+                != EMA200_UTBOT_RSI_STRATEGY
+            ):
+                continue
+            record_side = self._managed_position_side(
+                getattr(record, 'side', '')
+                or (getattr(record, 'metadata', {}) or {}).get('position_side')
+            )
+            if side and record_side != side:
+                continue
+            record_qty = None
+            for value in (
+                getattr(record, 'filled_qty', None),
+                getattr(record, 'requested_qty', None),
+            ):
+                parsed = _safe_float_or_none(value)
+                if parsed is not None and parsed > 0:
+                    record_qty = float(parsed)
+                    break
+            if (
+                current_qty > 0
+                and record_qty is not None
+                and not self._qty_matches_plan(current_qty, record_qty)
+            ):
+                continue
+            matched.append(record)
+        matched.sort(
+            key=lambda record: str(
+                getattr(record, 'updated_at', '')
+                or getattr(record, 'created_at', '')
+                or ''
+            ),
+            reverse=True,
+        )
+        return matched
+
+    def _ema200_primary_position_record(self, symbol, pos, records=None):
+        matched = self._ema200_matching_position_records(
+            symbol,
+            pos,
+            records=records,
+        )
+        if len(matched) > 1:
+            logger.warning(
+                'Multiple EMA200 active records match %s; using newest record %s',
+                symbol,
+                getattr(matched[0], 'client_order_id', None),
+            )
+        return matched[0] if matched else None
+
+    @staticmethod
+    def _ema200_pending_metadata_keys():
+        return (
+            'ema200_profit_stop_pending_client_order_id',
+            'ema200_profit_stop_pending_side',
+            'ema200_profit_stop_pending_qty',
+            'ema200_profit_stop_pending_trigger_price',
+            'ema200_profit_stop_pending_created_at_ns',
+            'ema200_profit_stop_pending_position_signature',
+        )
+
+    def _update_ema200_record_metadata(
+        self,
+        record,
+        *,
+        updates=None,
+        remove_keys=(),
+        stop_order_id=None,
+        update_stop_order_id=False,
+    ):
+        store = getattr(self, 'trading_state_store', None)
+        if store is None or record is None:
+            return None
+        metadata = dict(getattr(record, 'metadata', {}) or {})
+        for key in remove_keys or ():
+            metadata.pop(key, None)
+        if isinstance(updates, dict):
+            metadata.update(updates)
+        changes = {'metadata': metadata}
+        if update_stop_order_id:
+            changes['stop_order_id'] = stop_order_id
+        return store.transition(
+            record.client_order_id,
+            record.order_state,
+            **changes,
+        )
+
+    def _persist_ema200_profit_stop_pending_identity(
         self,
         symbol,
         pos,
-        order,
-        tracked_records=None,
+        *,
+        client_order_id,
+        side,
+        qty,
+        trigger_price,
     ):
-        """Verify EMA200 stop ownership from durable order state, side and qty."""
+        record = self._ema200_primary_position_record(symbol, pos)
+        if record is None:
+            logger.warning(
+                'EMA200 profit stop write-ahead skipped: no matching active record for %s',
+                symbol,
+            )
+            return None
+        return self._update_ema200_record_metadata(
+            record,
+            updates={
+                'ema200_profit_stop_pending_client_order_id': str(
+                    client_order_id or ''
+                ),
+                'ema200_profit_stop_pending_side': self._managed_position_side(
+                    side
+                ),
+                'ema200_profit_stop_pending_qty': float(qty),
+                'ema200_profit_stop_pending_trigger_price': float(trigger_price),
+                'ema200_profit_stop_pending_created_at_ns': time.time_ns(),
+                'ema200_profit_stop_pending_position_signature': (
+                    self._protection_position_signature(pos)
+                ),
+            },
+        )
+
+    def _clear_ema200_profit_stop_pending_identity(self, record):
+        if record is None:
+            return None
+        return self._update_ema200_record_metadata(
+            record,
+            remove_keys=self._ema200_pending_metadata_keys(),
+        )
+
+    def _ema200_record_matches_profit_stop_order(self, record, pos, order):
+        if record is None or not isinstance(order, dict):
+            return False
+        if (
+            str(getattr(record, 'strategy', '') or '').strip().lower()
+            != EMA200_UTBOT_RSI_STRATEGY
+        ):
+            return False
         if self._classify_protection_order(order) != 'sl':
             return False
         pos_side = self._managed_position_side((pos or {}).get('side'))
         if pos_side not in {'long', 'short'}:
             return False
+        record_side = self._managed_position_side(
+            getattr(record, 'side', '')
+            or (getattr(record, 'metadata', {}) or {}).get('position_side')
+        )
+        if record_side != pos_side:
+            return False
         close_side = 'sell' if pos_side == 'long' else 'buy'
         order_side = self._protection_order_side(order)
         if order_side and order_side != close_side:
             return False
-
+        if not self._protection_order_matches_symbol(order, getattr(record, 'symbol', '') or ''):
+            return False
         try:
             current_qty = abs(float(
                 self._position_signed_contracts(pos)
@@ -98,119 +449,244 @@ class SignalProtectionMixin:
         ):
             return False
 
-        if tracked_records is None:
-            try:
-                tracked_records = self.trading_state_store.active_for_symbol(symbol)
-            except Exception:
-                tracked_records = []
+        record_qty = None
+        for value in (
+            getattr(record, 'filled_qty', None),
+            getattr(record, 'requested_qty', None),
+        ):
+            parsed = _safe_float_or_none(value)
+            if parsed is not None and parsed > 0:
+                record_qty = float(parsed)
+                break
+        if (
+            record_qty is not None
+            and not self._qty_matches_plan(current_qty, record_qty)
+        ):
+            return False
+
+        metadata = dict(getattr(record, 'metadata', {}) or {})
         order_id = str(self._protection_order_id(order) or '').strip()
         client_id = str(self._protection_client_order_id(order) or '').strip()
-        for record in tracked_records or []:
-            if (
-                str(getattr(record, 'strategy', '') or '').strip().lower()
-                != EMA200_UTBOT_RSI_STRATEGY
-            ):
-                continue
-            record_side = self._managed_position_side(
-                getattr(record, 'side', '')
-                or (getattr(record, 'metadata', {}) or {}).get('position_side')
-            )
-            if record_side != pos_side:
-                continue
-
-            record_qty = None
+        confirmed_order_ids = {
+            str(value).strip()
             for value in (
-                getattr(record, 'filled_qty', None),
-                getattr(record, 'requested_qty', None),
-            ):
-                parsed = _safe_float_or_none(value)
-                if parsed is not None and parsed > 0:
-                    record_qty = float(parsed)
-                    break
-            if (
-                record_qty is not None
-                and not self._qty_matches_plan(current_qty, record_qty)
-            ):
-                continue
-
-            metadata = (
-                dict(getattr(record, 'metadata', {}) or {})
-                if isinstance(getattr(record, 'metadata', {}) or {}, dict)
-                else {}
+                getattr(record, 'stop_order_id', None),
+                metadata.get('ema200_profit_stop_order_id'),
             )
-            persisted_order_ids = {
-                str(value).strip()
-                for value in (
-                    getattr(record, 'stop_order_id', None),
-                    metadata.get('ema200_profit_stop_order_id'),
-                )
-                if value not in (None, '')
-            }
-            persisted_client_ids = {
-                str(value).strip()
-                for value in (
-                    metadata.get('ema200_profit_stop_client_order_id'),
-                    metadata.get('stop_client_order_id'),
-                )
-                if value not in (None, '')
-            }
-            id_match = bool(order_id and order_id in persisted_order_ids)
-            client_match = bool(client_id and client_id in persisted_client_ids)
-            if id_match or client_match:
-                return True
-        return False
+            if value not in (None, '')
+        }
+        confirmed_client_ids = {
+            str(value).strip()
+            for value in (
+                metadata.get('ema200_profit_stop_client_order_id'),
+                metadata.get('stop_client_order_id'),
+            )
+            if value not in (None, '')
+        }
+        if (
+            (order_id and order_id in confirmed_order_ids)
+            or (client_id and client_id in confirmed_client_ids)
+        ):
+            return True
+
+        pending_client = str(
+            metadata.get('ema200_profit_stop_pending_client_order_id') or ''
+        ).strip()
+        if not pending_client or not client_id or client_id != pending_client:
+            return False
+        pending_side = self._managed_position_side(
+            metadata.get('ema200_profit_stop_pending_side')
+        )
+        if pending_side != pos_side:
+            return False
+        pending_qty = _safe_float_or_none(
+            metadata.get('ema200_profit_stop_pending_qty')
+        )
+        if (
+            pending_qty is None
+            or not self._qty_matches_plan(current_qty, pending_qty)
+            or not self._qty_matches_plan(order_qty, pending_qty)
+        ):
+            return False
+        pending_trigger = _safe_float_or_none(
+            metadata.get('ema200_profit_stop_pending_trigger_price')
+        )
+        order_trigger = self._protection_trigger_price(order)
+        if pending_trigger is not None and order_trigger is not None:
+            tolerance = max(abs(float(pending_trigger)) * 1e-9, 1e-12)
+            if abs(float(order_trigger) - float(pending_trigger)) > tolerance:
+                return False
+        return True
+
+    def _is_ema200_managed_profit_stop_order(
+        self,
+        symbol,
+        pos,
+        order,
+        tracked_records=None,
+    ):
+        """Verify EMA200 stop ownership from durable order state, side and qty."""
+        records = self._ema200_matching_position_records(
+            symbol,
+            pos,
+            records=tracked_records,
+        )
+        return any(
+            self._ema200_record_matches_profit_stop_order(record, pos, order)
+            for record in records
+        )
 
     def _persist_ema200_profit_stop_identity(self, symbol, pos, order):
-        """Persist enough identity to restore EMA200 stop ownership after restart."""
+        """Confirm EMA200 stop identity and clear its write-ahead marker."""
         store = getattr(self, 'trading_state_store', None)
         if store is None or not order:
             return 0
-        try:
-            records = store.active_for_symbol(symbol) or []
-        except Exception:
-            logger.exception(
-                "EMA200 profit stop state lookup failed for %s",
+        record = self._ema200_primary_position_record(symbol, pos)
+        if record is None:
+            logger.warning(
+                'EMA200 profit stop confirmation skipped: no matching record for %s',
                 symbol,
             )
             return 0
-
         order_id = str(self._protection_order_id(order) or '').strip() or None
         client_id = str(self._protection_client_order_id(order) or '').strip() or None
         side = self._managed_position_side((pos or {}).get('side'))
         qty = self._protection_order_amount(order)
-        updated = 0
-        for record in records:
-            if (
-                str(getattr(record, 'strategy', '') or '').strip().lower()
-                != EMA200_UTBOT_RSI_STRATEGY
-            ):
-                continue
-            record_side = self._managed_position_side(getattr(record, 'side', ''))
-            if side and record_side and side != record_side:
-                continue
-            metadata = dict(getattr(record, 'metadata', {}) or {})
-            metadata.update({
+        self._update_ema200_record_metadata(
+            record,
+            updates={
                 'ema200_profit_stop_order_id': order_id,
                 'ema200_profit_stop_client_order_id': client_id,
                 'ema200_profit_stop_side': side,
                 'ema200_profit_stop_qty': float(qty) if qty is not None else None,
                 'ema200_profit_stop_updated_at_ns': time.time_ns(),
-            })
-            try:
-                store.transition(
-                    record.client_order_id,
-                    record.order_state,
-                    stop_order_id=order_id,
-                    metadata=metadata,
-                )
-                updated += 1
-            except Exception:
-                logger.exception(
-                    "EMA200 profit stop identity persistence failed for %s record=%s",
-                    symbol,
-                    getattr(record, 'client_order_id', None),
-                )
-        return updated
+                'ema200_profit_stop_position_signature': (
+                    self._protection_position_signature(pos)
+                ),
+            },
+            remove_keys=self._ema200_pending_metadata_keys(),
+            stop_order_id=order_id,
+            update_stop_order_id=True,
+        )
+        return 1
+
+    async def _reconcile_ema200_profit_stop_pending_identity(
+        self,
+        symbol,
+        *,
+        pos=None,
+        protection_orders=None,
+    ):
+        store = getattr(self, 'trading_state_store', None)
+        if store is None:
+            return {'status': 'NO_STORE'}
+        try:
+            records = store.active_for_symbol(symbol) or []
+        except Exception as exc:
+            return {
+                'status': 'STATE_LOOKUP_FAILED',
+                'error': f'{type(exc).__name__}: {exc}',
+            }
+        pending_records = [
+            record for record in records
+            if (
+                str(getattr(record, 'strategy', '') or '').strip().lower()
+                == EMA200_UTBOT_RSI_STRATEGY
+                and str(
+                    (getattr(record, 'metadata', {}) or {}).get(
+                        'ema200_profit_stop_pending_client_order_id'
+                    )
+                    or ''
+                ).strip()
+            )
+        ]
+        if not pending_records:
+            return {'status': 'NO_PENDING'}
+
+        open_orders = list(protection_orders or [])
+        outcomes = []
+        gateway = (
+            BinanceAlgoOrderGateway(self.exchange)
+            if str(getattr(self.exchange, 'id', '') or '').lower() == 'binance'
+            else None
+        )
+        for record in pending_records:
+            metadata = dict(getattr(record, 'metadata', {}) or {})
+            client_id = str(
+                metadata.get('ema200_profit_stop_pending_client_order_id') or ''
+            ).strip()
+            order = next(
+                (
+                    item for item in open_orders
+                    if self._protection_client_order_id(item) == client_id
+                ),
+                None,
+            )
+            lookup_status = None
+            if order is None and gateway is not None:
+                lookup = await gateway.fetch_by_client_id(client_id)
+                lookup_status = lookup.status
+                if lookup.status == AlgoLookupStatus.FOUND:
+                    order = lookup.order
+                elif lookup.status == AlgoLookupStatus.UNKNOWN:
+                    reason = (
+                        f'PENDING_PROTECTION_LOOKUP_UNKNOWN:{symbol}:'
+                        f'{lookup.error}'
+                    )
+                    self._set_crypto_entry_lock(reason)
+                    outcomes.append({
+                        'status': 'UNKNOWN',
+                        'client_order_id': client_id,
+                        'error': lookup.error,
+                    })
+                    continue
+                elif lookup.status == AlgoLookupStatus.NOT_FOUND and not pos:
+                    self._clear_ema200_profit_stop_pending_identity(record)
+                    outcomes.append({
+                        'status': 'NOT_FOUND_CLEANED',
+                        'client_order_id': client_id,
+                    })
+                    continue
+
+            if order is not None and pos is not None:
+                if self._ema200_record_matches_profit_stop_order(
+                    record,
+                    pos,
+                    order,
+                ):
+                    self._persist_ema200_profit_stop_identity(
+                        symbol,
+                        pos,
+                        order,
+                    )
+                    outcomes.append({
+                        'status': 'FOUND_CONFIRMED',
+                        'client_order_id': client_id,
+                    })
+                else:
+                    outcomes.append({
+                        'status': 'FOUND_MISMATCH',
+                        'client_order_id': client_id,
+                    })
+                continue
+
+            if lookup_status == AlgoLookupStatus.NOT_FOUND:
+                outcomes.append({
+                    'status': 'NOT_FOUND_PRESERVED',
+                    'client_order_id': client_id,
+                })
+            else:
+                outcomes.append({
+                    'status': 'PENDING_PRESERVED',
+                    'client_order_id': client_id,
+                })
+
+        if len(outcomes) == 1:
+            return outcomes[0]
+        return {
+            'status': 'MULTI',
+            'outcomes': outcomes,
+        }
 
     def _liquidation_safety_config(self, extra=None):
         values = {}
@@ -1293,7 +1769,13 @@ class SignalProtectionMixin:
                 final_status['remaining_orders'] = None
                 return final_status
             if not remaining:
+                pending_status = await self._reconcile_ema200_profit_stop_pending_identity(
+                    symbol,
+                    pos=None,
+                    protection_orders=[],
+                )
                 closed_records = _mark_crypto_symbol_closed(self, symbol, reason)
+                final_status['ema200_pending_reconciliation'] = pending_status
                 final_status['position_fetch_ok'] = True
                 final_status['position_active'] = False
                 final_status['cleanup_confirmed'] = True
@@ -1320,6 +1802,13 @@ class SignalProtectionMixin:
         elif not fetch_ok:
             final_status['status'] = 'OPEN_ORDERS_FETCH_FAILED'
         else:
+            final_status['ema200_pending_reconciliation'] = (
+                await self._reconcile_ema200_profit_stop_pending_identity(
+                    symbol,
+                    pos=None,
+                    protection_orders=[],
+                )
+            )
             final_status['closed_records'] = _mark_crypto_symbol_closed(self, symbol, reason)
         return final_status
 
@@ -1567,6 +2056,23 @@ class SignalProtectionMixin:
                 tracked_records = self.trading_state_store.active_for_symbol(symbol) or []
         except Exception:
             tracked_records = []
+        try:
+            pending_reconcile = await self._reconcile_ema200_profit_stop_pending_identity(
+                symbol,
+                pos=pos,
+                protection_orders=protection_orders,
+            )
+            status['ema200_pending_reconciliation'] = pending_reconcile
+            if hasattr(self, 'trading_state_store'):
+                tracked_records = self.trading_state_store.active_for_symbol(symbol) or []
+        except Exception:
+            logger.exception(
+                'EMA200 pending profit-stop reconciliation failed for %s',
+                symbol,
+            )
+            status['ema200_pending_reconciliation'] = {
+                'status': 'ERROR',
+            }
         external_position = not isinstance(runner_state, dict) and not bool(tracked_records)
         status['external_position'] = bool(external_position)
         if external_position:
@@ -2113,6 +2619,7 @@ class SignalProtectionMixin:
         max_attempts=3,
         retry_delay_sec=0.7,
         skip_initial_recovery=False,
+        position_mode_verified=False,
     ):
         last_error = None
         total_attempts = max(1, int(max_attempts or 1))
@@ -2128,6 +2635,16 @@ class SignalProtectionMixin:
             and canonical_type in CONDITIONAL_TYPES
         )
         algo_gateway = BinanceAlgoOrderGateway(self.exchange) if is_binance_algo else None
+        if is_binance_algo and not position_mode_verified:
+            mode = await self._require_binance_one_way_mode(
+                symbol,
+                operation=f'{label} protection submit',
+                record_ema_status=False,
+            )
+            if not mode.get('ok'):
+                raise ProtectionOrderLookupUnavailable(
+                    f"{mode.get('status')}:{symbol}:{mode.get('reason') or ''}"
+                )
         submit_params = dict(params or {})
         if canonical_type == 'STOP_MARKET':
             submit_params['workingType'] = 'MARK_PRICE'
@@ -2471,6 +2988,16 @@ class SignalProtectionMixin:
         return await self._cancel_protection_orders(symbol, reason=reason, orders=selected)
 
     async def _replace_stop_loss_order(self, symbol, pos, stop_price, reason='stop replacement'):
+        lock = self._protection_replace_lock(symbol)
+        async with lock:
+            return await self._replace_stop_loss_order_locked(
+                symbol,
+                pos,
+                stop_price,
+                reason=reason,
+            )
+
+    async def _replace_stop_loss_order_locked(self, symbol, pos, stop_price, reason='stop replacement'):
         if not pos:
             return None
         side = str(pos.get('side', '') or '').lower()
@@ -2481,7 +3008,18 @@ class SignalProtectionMixin:
             return None
         sl_side = 'sell' if side == 'long' else 'buy'
         safe_stop = self.safe_price(symbol, float(stop_price))
-        if str(getattr(self.exchange, 'id', '') or '').lower() == 'binance':
+        is_binance = str(getattr(self.exchange, 'id', '') or '').lower() == 'binance'
+        if is_binance:
+            mode = await self._require_binance_one_way_mode(
+                symbol,
+                operation='EMA200 profit stop replacement'
+                if str(reason or '').startswith('EMA200 margin ROI ')
+                else 'stop replacement',
+                record_ema_status=str(reason or '').startswith('EMA200 margin ROI '),
+            )
+            if not mode.get('ok'):
+                return None
+        if is_binance:
             position_fetch_ok, fresh_pos = await self._fetch_position_with_liquidation(symbol, pos)
             liquidation_result = (
                 self._validate_position_stop_liquidation(
@@ -2530,12 +3068,29 @@ class SignalProtectionMixin:
             order for order in (initial_orders or [])
             if self._classify_protection_order(order) == 'sl'
         ]
-        newest_existing_sl = self._newest_protection_order(existing_sl)
-        existing_stop = (
-            self._protection_trigger_price(newest_existing_sl)
-            if newest_existing_sl
+        best_existing_sl = self._best_stop_order_for_position(pos, existing_sl)
+        best_existing_stop = (
+            self._protection_trigger_price(best_existing_sl)
+            if best_existing_sl
             else None
         )
+        if (
+            best_existing_sl is not None
+            and self._stop_is_at_least_as_protective(
+                side,
+                best_existing_stop,
+                safe_stop,
+            )
+        ):
+            logger.info(
+                'SL replacement skipped for %s: existing winner %.12f is '
+                'already at least as protective as target %.12f (%s)',
+                symbol,
+                float(best_existing_stop),
+                float(safe_stop),
+                reason,
+            )
+            return best_existing_sl
         reference_price = _safe_float_or_none(
             pos.get('markPrice')
             or pos.get('mark_price')
@@ -2596,16 +3151,6 @@ class SignalProtectionMixin:
                     max_attempts=5,
                 )
                 return None
-        if existing_stop is not None:
-            stop_tolerance = max(abs(float(safe_stop)) * 1e-9, 1e-12)
-            if abs(float(existing_stop) - float(safe_stop)) <= stop_tolerance:
-                logger.debug(
-                    "SL replacement skipped for %s: existing stop already matches %s (%s)",
-                    symbol,
-                    safe_stop,
-                    reason,
-                )
-                return newest_existing_sl
         cancelled_count = await self._cancel_protection_orders(
             symbol,
             reason=reason,
@@ -2660,6 +3205,40 @@ class SignalProtectionMixin:
             ]
             if not remaining_sl:
                 break
+            winner = self._best_stop_order_for_position(pos, remaining_sl)
+            winner_stop = (
+                self._protection_trigger_price(winner)
+                if winner is not None
+                else None
+            )
+            if (
+                winner is not None
+                and self._stop_is_at_least_as_protective(
+                    side,
+                    winner_stop,
+                    safe_stop,
+                )
+            ):
+                redundant = [
+                    order for order in remaining_sl
+                    if order != winner
+                ]
+                if redundant:
+                    await self._cancel_protection_orders(
+                        symbol,
+                        reason=f'{reason} preserve better winner',
+                        orders=redundant,
+                    )
+                logger.info(
+                    'SL replacement aborted for %s: a better/equal winner '
+                    'appeared during cancellation confirmation target=%.12f '
+                    'winner=%.12f (%s)',
+                    symbol,
+                    float(safe_stop),
+                    float(winner_stop),
+                    reason,
+                )
+                return winner
             if attempt < confirm_attempts - 1:
                 await self._cancel_protection_orders(
                     symbol,
@@ -2781,35 +3360,65 @@ class SignalProtectionMixin:
             )
             return None
 
-        replacement = await self._create_protection_order_with_retries(
+        replacement_client_id = self._build_protection_client_order_id(
             symbol,
-            'stop_market',
-            sl_side,
-            qty,
-            None,
-            {
-                'stopPrice': safe_stop,
-                'reduceOnly': True,
-                'newClientOrderId': self._build_protection_client_order_id(
-                    symbol,
-                    side,
-                    'sl',
-                    pos,
-                    trigger_price=safe_stop,
-                    quantity=qty,
-                    leg='sl',
-                    position_identity=(
-                        pos.get('entry_client_order_id')
-                        or pos.get('clientOrderId')
-                        or pos.get('timestamp')
-                        or self._protection_position_signature(pos)
-                    ),
-                    revision=f"replace-{time.time_ns()}",
-                )
-            },
-            'SL',
-            max_attempts=3
+            side,
+            'sl',
+            pos,
+            trigger_price=safe_stop,
+            quantity=qty,
+            leg='sl',
+            position_identity=(
+                pos.get('entry_client_order_id')
+                or pos.get('clientOrderId')
+                or pos.get('timestamp')
+                or self._protection_position_signature(pos)
+            ),
+            revision=f"replace-{time.time_ns()}",
         )
+        ema200_profit_replacement = str(reason or '').startswith('EMA200 margin ROI ')
+        pending_record = None
+        if ema200_profit_replacement:
+            pending_record = self._persist_ema200_profit_stop_pending_identity(
+                symbol,
+                pos,
+                client_order_id=replacement_client_id,
+                side=side,
+                qty=qty,
+                trigger_price=safe_stop,
+            )
+        try:
+            replacement = await self._create_protection_order_with_retries(
+                symbol,
+                'stop_market',
+                sl_side,
+                qty,
+                None,
+                {
+                    'stopPrice': safe_stop,
+                    'reduceOnly': True,
+                    'newClientOrderId': replacement_client_id,
+                },
+                'SL',
+                max_attempts=3,
+                position_mode_verified=is_binance,
+            )
+        except Exception as exc:
+            if ema200_profit_replacement and pending_record is not None:
+                text = f'{type(exc).__name__}: {exc}'.lower()
+                ambiguous = (
+                    'submitted_unknown' in text
+                    or 'lookup_unknown' in text
+                    or 'timeout' in text
+                    or 'network' in text
+                    or 'connection' in text
+                    or 'unavailable' in text
+                )
+                if not ambiguous:
+                    self._clear_ema200_profit_stop_pending_identity(
+                        pending_record
+                    )
+            raise
         if replacement and confirmation_unverified:
             self.last_protection_order_status[symbol] = {
                 'tp_expected': False,
@@ -2828,7 +3437,7 @@ class SignalProtectionMixin:
                 symbol,
                 stop_order_id=self._protection_order_id(replacement),
             )
-            if str(reason or '').startswith('EMA200 margin ROI '):
+            if ema200_profit_replacement:
                 self._persist_ema200_profit_stop_identity(
                     symbol,
                     pos,
