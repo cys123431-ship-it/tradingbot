@@ -258,15 +258,29 @@ class SignalScannerMixin:
                 reason=f'EMA200 margin ROI {roi:.2f}% locks {locked_roi:.0f}%',
             )
             if not order:
-                self._set_ema200_profit_stop_status(
-                    symbol,
-                    'INSTALL_NOT_CONFIRMED',
-                    leverage=leverage,
-                    leverage_source=leverage_source,
-                    roi=roi,
-                    locked_roi=locked_roi,
-                    stop_price=safe_stop,
+                current_status = dict(
+                    (
+                        getattr(self, 'last_ema200_profit_stop_status', {})
+                        or {}
+                    ).get(symbol, {})
+                    or {}
                 )
+                preserved_statuses = {
+                    'UNSUPPORTED_HEDGE_MODE',
+                    'POSITION_MODE_UNAVAILABLE',
+                    'PENDING_PROTECTION_RECONCILIATION',
+                    'EMA200_POSITION_STATE_MISMATCH',
+                }
+                if current_status.get('status') not in preserved_statuses:
+                    self._set_ema200_profit_stop_status(
+                        symbol,
+                        'INSTALL_NOT_CONFIRMED',
+                        leverage=leverage,
+                        leverage_source=leverage_source,
+                        roi=roi,
+                        locked_roi=locked_roi,
+                        stop_price=safe_stop,
+                    )
                 logger.warning(
                     "EMA200 profit stop install not confirmed for %s "
                     "ROI=%.2f%% lock=%.0f%% stop=%.12f",

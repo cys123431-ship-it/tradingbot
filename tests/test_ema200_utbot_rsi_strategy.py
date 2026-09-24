@@ -1220,6 +1220,128 @@ def test_partial_position_reduction_never_keeps_oversized_profit_stop_as_managed
     assert status['sl_present'] is False
 
 
+
+def test_profit_stop_apply_preserves_hedge_mode_failure_status():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = 'BTC/USDT:USDT'
+    pos = {
+        'symbol': symbol,
+        'side': 'long',
+        'entryPrice': 100.0,
+        'markPrice': 101.2,
+        'leverage': 5,
+        'contracts': 1.0,
+        'liquidationPrice': 50.0,
+    }
+    locks = []
+    engine.exchange = SimpleNamespace(
+        id='binance',
+        fetch_position_mode=lambda _symbol=None: {'hedged': True},
+    )
+    engine.last_ema200_profit_stop_status = {}
+    engine._position_entry_strategy = lambda _: EMA200_UTBOT_RSI_STRATEGY
+    engine._fetch_server_position_checked = lambda _symbol: asyncio.sleep(
+        0, result=(True, dict(pos))
+    )
+    engine._collect_protection_orders_checked = lambda _symbol: asyncio.sleep(
+        0, result=(True, [])
+    )
+    engine.safe_price = lambda _symbol, price: float(price)
+    engine.safe_amount = lambda _symbol, amount: float(amount)
+    engine._set_crypto_entry_lock = lambda reason: locks.append(reason)
+
+    asyncio.run(engine._ema200_apply_margin_profit_stop(symbol))
+
+    assert engine.last_ema200_profit_stop_status[symbol]['status'] == (
+        'UNSUPPORTED_HEDGE_MODE'
+    )
+    assert any('UNSUPPORTED_HEDGE_MODE' in value for value in locks)
+
+
+def test_pending_unknown_blocks_new_profit_stop_client_id_and_submit(tmp_path):
+    symbol = 'BTC/USDT:USDT'
+    store = SQLiteTradingStateStore(tmp_path / 'state.sqlite3')
+    store.upsert(OrderRecord(
+        client_order_id='entry-pending-submit-block',
+        symbol=symbol,
+        side='long',
+        strategy=EMA200_UTBOT_RSI_STRATEGY,
+        signal_timestamp='1700000000',
+        requested_qty=1.0,
+        filled_qty=1.0,
+        average_fill_price=100.0,
+        order_state=OrderState.PROTECTED.value,
+        metadata={
+            'ema200_profit_stop_pending_client_order_id': 'pending-old-client',
+            'ema200_profit_stop_pending_side': 'long',
+            'ema200_profit_stop_pending_qty': 1.0,
+            'ema200_profit_stop_pending_trigger_price': 101.0,
+        },
+    ))
+
+    submissions = []
+
+    class Exchange:
+        id = 'binance'
+
+        def fetch_position_mode(self, _symbol=None):
+            return {'hedged': False}
+
+        def market(self, _symbol):
+            return {'id': 'BTCUSDT'}
+
+        def fapiPrivateGetAlgoOrder(self, params):
+            raise TimeoutError('pending lookup timeout')
+
+        def fapiPrivatePostAlgoOrder(self, params):
+            submissions.append(dict(params))
+            raise AssertionError('pending UNKNOWN must block a new submission')
+
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.exchange = Exchange()
+    engine.trading_state_store = store
+    engine.last_protection_order_status = {}
+    engine.last_ema200_profit_stop_status = {}
+    engine.last_protection_alert_ts = {}
+    engine.safe_amount = lambda _symbol, amount: float(amount)
+    engine.safe_price = lambda _symbol, price: float(price)
+    engine._fetch_position_with_liquidation = lambda _symbol, pos: asyncio.sleep(
+        0, result=(True, dict(pos))
+    )
+    engine._validate_position_stop_liquidation = lambda *args, **kwargs: SimpleNamespace(
+        valid=True, reason='SAFE'
+    )
+    engine._collect_protection_orders_checked = lambda _symbol: asyncio.sleep(
+        0, result=(True, [])
+    )
+    locks = []
+    engine._set_crypto_entry_lock = lambda reason: locks.append(reason)
+
+    pos = {
+        'symbol': symbol,
+        'side': 'long',
+        'entryPrice': 100.0,
+        'markPrice': 103.0,
+        'contracts': 1.0,
+        'liquidationPrice': 50.0,
+    }
+    result = asyncio.run(engine._replace_stop_loss_order(
+        symbol,
+        pos,
+        102.0,
+        reason='EMA200 margin ROI 11.00% locks 10%',
+    ))
+
+    assert result is None
+    assert submissions == []
+    record = store.get('entry-pending-submit-block')
+    assert record.metadata['ema200_profit_stop_pending_client_order_id'] == (
+        'pending-old-client'
+    )
+    assert any('PENDING_PROTECTION' in value for value in locks)
+    store.close()
+
+
 def test_first_stage_expects_exchange_stop_after_profit_stop_was_installed():
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
     engine.is_upbit_mode = lambda: False

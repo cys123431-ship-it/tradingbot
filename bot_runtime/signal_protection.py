@@ -3051,6 +3051,9 @@ class SignalProtectionMixin:
                 return None
             pos = fresh_pos
         initial_fetch_ok, initial_orders = await self._collect_protection_orders_checked(symbol)
+        ema200_profit_replacement = str(reason or '').startswith(
+            'EMA200 margin ROI '
+        )
         if not initial_fetch_ok:
             self.last_protection_order_status[symbol] = {
                 'tp_expected': False,
@@ -3068,6 +3071,74 @@ class SignalProtectionMixin:
                 f"SL replacement skipped for {symbol}: existing SL status could not be fetched ({reason})"
             )
             return None
+
+        if ema200_profit_replacement:
+            pending_result = await self._reconcile_ema200_profit_stop_pending_identity(
+                symbol,
+                pos=pos,
+                protection_orders=initial_orders,
+            )
+            pending_status = str(pending_result.get('status') or '')
+            if pending_status == 'FOUND_CONFIRMED':
+                refresh_ok, refreshed_orders = (
+                    await self._collect_protection_orders_checked(symbol)
+                )
+                if not refresh_ok:
+                    self._set_crypto_entry_lock(
+                        f'PENDING_PROTECTION_RECONCILIATION:{symbol}'
+                    )
+                    setter = getattr(
+                        self,
+                        '_set_ema200_profit_stop_status',
+                        None,
+                    )
+                    if callable(setter):
+                        setter(
+                            symbol,
+                            'PENDING_PROTECTION_RECONCILIATION',
+                            reason='confirmed pending order snapshot refresh failed',
+                        )
+                    return None
+                initial_orders = list(refreshed_orders or [])
+                if not any(
+                    self._protection_client_order_id(order)
+                    == str(pending_result.get('client_order_id') or '')
+                    for order in initial_orders
+                ):
+                    self._set_crypto_entry_lock(
+                        f'PENDING_PROTECTION_RECONCILIATION:{symbol}'
+                    )
+                    setter = getattr(
+                        self,
+                        '_set_ema200_profit_stop_status',
+                        None,
+                    )
+                    if callable(setter):
+                        setter(
+                            symbol,
+                            'PENDING_PROTECTION_RECONCILIATION',
+                            reason=(
+                                'pending stop was found by client ID but is not '
+                                'yet visible in the complete open-order snapshot'
+                            ),
+                        )
+                    return None
+            elif pending_status not in {'NO_PENDING', 'NO_STORE'}:
+                self._set_crypto_entry_lock(
+                    f'PENDING_PROTECTION_RECONCILIATION:{symbol}'
+                )
+                setter = getattr(self, '_set_ema200_profit_stop_status', None)
+                if callable(setter):
+                    setter(
+                        symbol,
+                        'PENDING_PROTECTION_RECONCILIATION',
+                        reason=(
+                            'existing EMA200 pending protection identity must be '
+                            f'reconciled before replacement: {pending_status}'
+                        ),
+                    )
+                return None
+
         existing_sl = [
             order for order in (initial_orders or [])
             if self._classify_protection_order(order) == 'sl'
@@ -3380,7 +3451,6 @@ class SignalProtectionMixin:
             ),
             revision=f"replace-{time.time_ns()}",
         )
-        ema200_profit_replacement = str(reason or '').startswith('EMA200 margin ROI ')
         pending_record = None
         if ema200_profit_replacement:
             pending_record = self._persist_ema200_profit_stop_pending_identity(
@@ -3391,6 +3461,24 @@ class SignalProtectionMixin:
                 qty=qty,
                 trigger_price=safe_stop,
             )
+            if (
+                getattr(self, 'trading_state_store', None) is not None
+                and pending_record is None
+            ):
+                self._set_crypto_entry_lock(
+                    f'EMA200_POSITION_STATE_MISMATCH:{symbol}'
+                )
+                setter = getattr(self, '_set_ema200_profit_stop_status', None)
+                if callable(setter):
+                    setter(
+                        symbol,
+                        'EMA200_POSITION_STATE_MISMATCH',
+                        reason=(
+                            'no durable EMA200 record matches current position '
+                            'side and quantity; profit stop submission blocked'
+                        ),
+                    )
+                return None
         try:
             replacement = await self._create_protection_order_with_retries(
                 symbol,
