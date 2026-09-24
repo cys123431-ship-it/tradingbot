@@ -23,7 +23,7 @@ jobs:
           python -m pip check
       - name: Compile
         run: |
-          python -m py_compile bot_runtime/base_engine.py bot_runtime/signal_entry.py bot_runtime/signal_scanner.py bot_runtime/signal_protection.py bot_runtime/ema200_profit_stop.py trading_safety/binance_algo_gateway.py trading_safety/order_state.py trading_safety/reconciliation.py
+          python -m py_compile bot_runtime/base_engine.py bot_runtime/signal_entry.py bot_runtime/signal_scanner.py bot_runtime/signal_protection.py bot_runtime/signal_runtime.py bot_runtime/signal_position_lifecycle.py bot_runtime/ema200_profit_stop.py trading_safety/binance_algo_gateway.py trading_safety/order_state.py trading_safety/reconciliation.py trading_safety/user_data_stream.py
       - name: EMA200 targeted regression
         run: python -m pytest -q tests/test_ema200_utbot_rsi_strategy.py
       - name: Protection and Binance targeted regression
