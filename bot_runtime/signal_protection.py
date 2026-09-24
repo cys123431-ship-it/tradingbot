@@ -431,7 +431,11 @@ class SignalProtectionMixin:
         order_side = self._protection_order_side(order)
         if order_side and order_side != close_side:
             return False
-        if not self._protection_order_matches_symbol(order, getattr(record, 'symbol', '') or ''):
+        record_symbol = str(getattr(record, 'symbol', '') or '').strip()
+        if (
+            record_symbol
+            and not self._protection_order_matches_symbol(order, record_symbol)
+        ):
             return False
         try:
             current_qty = abs(float(
