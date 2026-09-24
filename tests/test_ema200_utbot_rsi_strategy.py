@@ -275,6 +275,7 @@ async def _run_ema_profit_stop_audit(engine, symbol, pos, order, records):
 
     engine.is_upbit_mode = lambda: False
     engine.exchange = SimpleNamespace(id='fixture')
+    engine.ctrl = SimpleNamespace(format_symbol_for_display=lambda value: value)
     engine.last_protection_order_status = {}
     engine.protection_missing_candidates = {}
     engine.last_protection_alert_ts = {}
@@ -408,6 +409,7 @@ def test_ema_profit_stop_ownership_survives_sqlite_restart(tmp_path):
     cancelled = []
     engine.is_upbit_mode = lambda: False
     engine.exchange = SimpleNamespace(id='fixture')
+    engine.ctrl = SimpleNamespace(format_symbol_for_display=lambda value: value)
     engine.last_protection_order_status = {}
     engine.protection_missing_candidates = {}
     engine.last_protection_alert_ts = {}
