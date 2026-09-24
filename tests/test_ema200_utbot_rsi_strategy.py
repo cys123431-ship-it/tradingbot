@@ -1089,7 +1089,7 @@ def test_pending_profit_stop_identity_survives_crash_and_restart_audit(tmp_path)
     reopened.close()
 
 
-def test_flat_not_found_pending_profit_stop_identity_is_cleaned(tmp_path):
+def test_flat_not_found_active_pending_profit_stop_identity_is_preserved(tmp_path):
     symbol = 'BTC/USDT:USDT'
     store = SQLiteTradingStateStore(tmp_path / 'state.sqlite3')
     store.upsert(OrderRecord(
@@ -1128,9 +1128,11 @@ def test_flat_not_found_pending_profit_stop_identity_is_cleaned(tmp_path):
         protection_orders=[],
     ))
 
-    assert result['status'] == 'NOT_FOUND_CLEANED'
+    assert result['status'] == 'NOT_FOUND_PRESERVED'
     record = store.get('entry-pending-not-found')
-    assert 'ema200_profit_stop_pending_client_order_id' not in record.metadata
+    assert record.metadata['ema200_profit_stop_pending_client_order_id'] == (
+        'pending-not-found'
+    )
     store.close()
 
 

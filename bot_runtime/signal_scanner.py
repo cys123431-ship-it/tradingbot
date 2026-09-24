@@ -233,15 +233,32 @@ class SignalScannerMixin:
                 order for order in orders
                 if self._classify_protection_order(order) == 'sl'
             ]
+            compatible_stops = self._compatible_stop_orders_for_position(
+                pos,
+                stops,
+            )
             previous_stop = [
                 float(value)
-                for order in stops
+                for order in compatible_stops
                 if (value := self._protection_trigger_price(order)) is not None
             ]
             side = str(pos.get('side') or '').lower()
-            if previous_stop and (
-                max(previous_stop) >= safe_stop if side == 'long'
-                else min(previous_stop) <= safe_stop
+            best_existing = self._best_stop_order_for_position(
+                pos,
+                compatible_stops,
+            )
+            best_existing_price = (
+                self._protection_trigger_price(best_existing)
+                if best_existing is not None
+                else None
+            )
+            if (
+                best_existing is not None
+                and self._stop_is_at_least_as_protective(
+                    side,
+                    best_existing_price,
+                    safe_stop,
+                )
             ):
                 self._set_ema200_profit_stop_status(
                     symbol,

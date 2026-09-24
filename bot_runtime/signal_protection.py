@@ -253,6 +253,60 @@ class SignalProtectionMixin:
             return float(existing) - tolerance <= float(target)
         return False
 
+    def _ema200_record_allows_current_position(self, record, pos):
+        """Allow partial reductions without losing EMA entry attribution."""
+        if record is None or not isinstance(pos, dict):
+            return False
+        current_side = self._managed_position_side(pos.get('side'))
+        record_side = self._managed_position_side(
+            getattr(record, 'side', '')
+            or (getattr(record, 'metadata', {}) or {}).get('position_side')
+        )
+        if current_side not in {'long', 'short'} or record_side != current_side:
+            return False
+        try:
+            current_qty = abs(float(
+                self._position_signed_contracts(pos)
+                or pos.get('contracts', 0)
+                or 0
+            ))
+        except (TypeError, ValueError):
+            return False
+        if current_qty <= 0:
+            return False
+
+        record_qty = None
+        for value in (
+            getattr(record, 'filled_qty', None),
+            getattr(record, 'requested_qty', None),
+        ):
+            parsed = _safe_float_or_none(value)
+            if parsed is not None and parsed > 0:
+                record_qty = float(parsed)
+                break
+        if record_qty is not None:
+            tolerance = max(1e-9, abs(record_qty) * 0.001)
+            # A manual/strategy partial close may reduce quantity, but a larger
+            # live quantity can represent an external add or a different
+            # lifecycle and must not be silently attributed to this entry.
+            if current_qty > record_qty + tolerance:
+                return False
+
+        record_entry = _safe_float_or_none(
+            getattr(record, 'average_fill_price', None)
+        )
+        current_entry = _safe_float_or_none(
+            pos.get('entryPrice') or pos.get('entry_price')
+        )
+        if record_entry is not None and current_entry is not None:
+            if not self._price_matches_plan(
+                record_entry,
+                current_entry,
+                tolerance_pct=0.1,
+            ):
+                return False
+        return True
+
     def _ema200_matching_position_records(self, symbol, pos, records=None):
         if records is None:
             store = getattr(self, 'trading_state_store', None)
@@ -288,20 +342,7 @@ class SignalProtectionMixin:
             )
             if side and record_side != side:
                 continue
-            record_qty = None
-            for value in (
-                getattr(record, 'filled_qty', None),
-                getattr(record, 'requested_qty', None),
-            ):
-                parsed = _safe_float_or_none(value)
-                if parsed is not None and parsed > 0:
-                    record_qty = float(parsed)
-                    break
-            if (
-                current_qty > 0
-                and record_qty is not None
-                and not self._qty_matches_plan(current_qty, record_qty)
-            ):
+            if not self._ema200_record_allows_current_position(record, pos):
                 continue
             matched.append(record)
         matched.sort(
@@ -453,19 +494,7 @@ class SignalProtectionMixin:
         ):
             return False
 
-        record_qty = None
-        for value in (
-            getattr(record, 'filled_qty', None),
-            getattr(record, 'requested_qty', None),
-        ):
-            parsed = _safe_float_or_none(value)
-            if parsed is not None and parsed > 0:
-                record_qty = float(parsed)
-                break
-        if (
-            record_qty is not None
-            and not self._qty_matches_plan(current_qty, record_qty)
-        ):
+        if not self._ema200_record_allows_current_position(record, pos):
             return False
 
         metadata = dict(getattr(record, 'metadata', {}) or {})
@@ -574,6 +603,79 @@ class SignalProtectionMixin:
         )
         return 1
 
+    @staticmethod
+    def _protection_order_terminal_status(order):
+        if not isinstance(order, dict):
+            return ''
+        info = order.get('info') if isinstance(order.get('info'), dict) else {}
+        return str(
+            order.get('status')
+            or order.get('algoStatus')
+            or info.get('algoStatus')
+            or info.get('status')
+            or ''
+        ).strip().upper()
+
+    async def _confirm_cancelled_stop_orders_absent(self, symbol, orders):
+        """Fail closed unless every cancelled Binance Algo stop is terminal/absent."""
+        selected = [
+            order for order in (orders or [])
+            if self._classify_protection_order(order) == 'sl'
+        ]
+        if not selected:
+            return {'status': 'CONFIRMED_ABSENT', 'orders': []}
+
+        exchange_id = str(getattr(self.exchange, 'id', '') or '').lower()
+        if exchange_id not in {'binance', 'binanceusdm'}:
+            return {
+                'status': 'UNKNOWN',
+                'reason': 'no authoritative post-cancel lookup for exchange',
+            }
+
+        gateway = BinanceAlgoOrderGateway(self.exchange)
+        terminal = {'CANCELED', 'CANCELLED', 'EXPIRED', 'FILLED', 'REJECTED'}
+        outcomes = []
+        for order in selected:
+            client_id = str(
+                self._protection_client_order_id(order) or ''
+            ).strip()
+            if not client_id:
+                return {
+                    'status': 'UNKNOWN',
+                    'reason': 'cancelled stop has no client order id',
+                }
+            lookup = await gateway.fetch_by_client_id(client_id)
+            if lookup.status == AlgoLookupStatus.UNKNOWN:
+                return {
+                    'status': 'UNKNOWN',
+                    'client_order_id': client_id,
+                    'reason': lookup.error,
+                }
+            if lookup.status == AlgoLookupStatus.NOT_FOUND:
+                outcomes.append({
+                    'client_order_id': client_id,
+                    'status': 'NOT_FOUND',
+                })
+                continue
+            found = lookup.order or {}
+            found_status = self._protection_order_terminal_status(found)
+            if found_status in terminal:
+                outcomes.append({
+                    'client_order_id': client_id,
+                    'status': found_status,
+                })
+                continue
+            return {
+                'status': 'FOUND_OPEN',
+                'client_order_id': client_id,
+                'order': found,
+                'order_status': found_status or 'UNKNOWN_OPEN',
+            }
+        return {
+            'status': 'CONFIRMED_ABSENT',
+            'orders': outcomes,
+        }
+
     async def _reconcile_ema200_profit_stop_pending_identity(
         self,
         symbol,
@@ -585,7 +687,10 @@ class SignalProtectionMixin:
         if store is None:
             return {'status': 'NO_STORE'}
         try:
-            records = store.active_for_symbol(symbol) or []
+            if hasattr(store, 'records_for_symbol'):
+                records = store.records_for_symbol(symbol) or []
+            else:
+                records = store.active_for_symbol(symbol) or []
         except Exception as exc:
             return {
                 'status': 'STATE_LOOKUP_FAILED',
@@ -645,11 +750,33 @@ class SignalProtectionMixin:
                     })
                     continue
                 elif lookup.status == AlgoLookupStatus.NOT_FOUND and not pos:
-                    self._clear_ema200_profit_stop_pending_identity(record)
-                    outcomes.append({
-                        'status': 'NOT_FOUND_CLEANED',
-                        'client_order_id': client_id,
-                    })
+                    record_state = str(
+                        getattr(record, 'order_state', '') or ''
+                    ).upper()
+                    terminal_lifecycle = record_state in {
+                        'CLOSED',
+                        'FAILED',
+                        'CANCELED',
+                        'CANCELLED',
+                    }
+                    if terminal_lifecycle:
+                        self._clear_ema200_profit_stop_pending_identity(record)
+                        outcomes.append({
+                            'status': 'NOT_FOUND_CLEANED',
+                            'client_order_id': client_id,
+                            'record_state': record_state,
+                        })
+                    else:
+                        reason = (
+                            f'PENDING_PROTECTION_RECONCILIATION:{symbol}:'
+                            f'NOT_FOUND_ACTIVE:{record_state or "UNKNOWN"}'
+                        )
+                        self._set_crypto_entry_lock(reason)
+                        outcomes.append({
+                            'status': 'NOT_FOUND_PRESERVED',
+                            'client_order_id': client_id,
+                            'record_state': record_state,
+                        })
                     continue
 
             if order is not None and pos is not None:
@@ -2027,6 +2154,41 @@ class SignalProtectionMixin:
             )
             return status
 
+        exchange_id = str(getattr(self.exchange, 'id', '') or '').lower()
+        if exchange_id in {'binance', 'binanceusdm'}:
+            mode = await self._require_binance_one_way_mode(
+                symbol,
+                operation='protection audit',
+                record_ema_status=False,
+            )
+            if not mode.get('ok'):
+                status_code = str(
+                    mode.get('status') or 'POSITION_MODE_UNAVAILABLE'
+                )
+                status['status'] = status_code
+                status['position_mode_status'] = status_code
+                status['position_mode_reason'] = mode.get('reason')
+                status['tp_count'] = sum(
+                    1 for order in protection_orders
+                    if self._classify_protection_order(order) == 'tp'
+                )
+                status['sl_count'] = sum(
+                    1 for order in protection_orders
+                    if self._classify_protection_order(order) == 'sl'
+                )
+                status['tp_present'] = status['tp_count'] > 0
+                status['sl_present'] = status['sl_count'] > 0
+                status['missing_tp'] = False
+                status['missing_sl'] = False
+                self._clear_protection_missing_candidates(symbol)
+                self.last_protection_order_status[symbol] = status
+                logger.warning(
+                    'Protection audit mutation blocked for %s: %s',
+                    symbol,
+                    mode.get('reason') or status_code,
+                )
+                return status
+
         if not pos:
             self._clear_protection_missing_candidates(symbol)
             status['status'] = 'NO_POSITION'
@@ -2306,7 +2468,13 @@ class SignalProtectionMixin:
                 continue
             if kind == 'tp' and allow_split_tp:
                 continue
-            keep = self._newest_protection_order(valid_orders)
+            keep = (
+                self._best_stop_order_for_position(pos, valid_orders)
+                if kind == 'sl'
+                else self._newest_protection_order(valid_orders)
+            )
+            if keep is None:
+                continue
             duplicates = [
                 order for order in valid_orders
                 if (self._protection_order_id(order) or id(order)) != (self._protection_order_id(keep) or id(keep))
@@ -3242,12 +3410,62 @@ class SignalProtectionMixin:
             fetch_ok, protection_orders = await self._collect_protection_orders_checked(symbol)
             if not fetch_ok:
                 if existing_sl and cancelled_count > 0:
-                    confirmation_unverified = True
-                    logger.warning(
-                        f"SL cancellation confirmation unavailable for {symbol}; creating the replacement "
-                        f"to avoid leaving the position unprotected ({reason})"
+                    resolution = await self._confirm_cancelled_stop_orders_absent(
+                        symbol,
+                        existing_sl,
                     )
-                    break
+                    if resolution.get('status') == 'CONFIRMED_ABSENT':
+                        logger.info(
+                            'SL cancellation confirmed through direct lookup '
+                            'for %s after snapshot failure (%s)',
+                            symbol,
+                            reason,
+                        )
+                        remaining_sl = []
+                        break
+                    self._set_crypto_entry_lock(
+                        f'PENDING_PROTECTION_RECONCILIATION:{symbol}'
+                    )
+                    setter = getattr(
+                        self,
+                        '_set_ema200_profit_stop_status',
+                        None,
+                    )
+                    if callable(setter) and ema200_profit_replacement:
+                        setter(
+                            symbol,
+                            'PENDING_PROTECTION_RECONCILIATION',
+                            reason=(
+                                'SL cancellation state is uncertain: '
+                                f"{resolution.get('status')} "
+                                f"{resolution.get('reason') or ''}"
+                            ).strip(),
+                        )
+                    self.last_protection_order_status[symbol] = {
+                        'tp_expected': False,
+                        'sl_expected': True,
+                        'tp_present': False,
+                        'sl_present': (
+                            resolution.get('status') == 'FOUND_OPEN'
+                        ),
+                        'tp_count': 0,
+                        'sl_count': (
+                            1 if resolution.get('status') == 'FOUND_OPEN' else 0
+                        ),
+                        'missing_tp': False,
+                        'missing_sl': False,
+                        'duplicate_cancelled': 0,
+                        'status': 'PENDING_PROTECTION_RECONCILIATION',
+                        'cancel_reconciliation': resolution,
+                    }
+                    logger.warning(
+                        'SL replacement blocked for %s because cancellation '
+                        'could not be proven terminal/absent: %s (%s)',
+                        symbol,
+                        resolution,
+                        reason,
+                    )
+                    return None
                 status = {
                     'tp_expected': False,
                     'sl_expected': True,
