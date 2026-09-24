@@ -137,6 +137,51 @@ def _is_reduce_only(order: dict[str, Any]) -> bool:
     return False
 
 
+def _ema200_profit_stop_lifecycle_started(record: OrderRecord) -> bool:
+    """Return True once a first-stage EMA trade has entered profit-stop lifecycle."""
+    metadata = dict(record.metadata or {})
+    return bool(
+        record.stop_order_id
+        or metadata.get("ema200_profit_stop_order_id")
+        or metadata.get("ema200_profit_stop_client_order_id")
+        or metadata.get("ema200_profit_stop_pending_client_order_id")
+    )
+
+
+def _reconciliation_owns_entry_lock(
+    reason: Any,
+    *,
+    user_stream_ready: bool = False,
+) -> bool:
+    """Generic reconciliation may only clear/replace locks that it owns."""
+    text = str(reason or "").strip()
+    if not text:
+        return True
+    if text.startswith("RECONCILIATION_REQUIRED"):
+        return True
+    if user_stream_ready and text.startswith("USER_STREAM_"):
+        return True
+    return False
+
+
+def _persist_reconciliation_entry_lock(
+    store: SQLiteTradingStateStore,
+    result: "ReconciliationResult",
+    *,
+    user_stream_ready: bool,
+) -> None:
+    current = store.get_runtime_state("entry_lock_reason")
+    if not _reconciliation_owns_entry_lock(
+        current,
+        user_stream_ready=user_stream_ready,
+    ):
+        return
+    store.set_runtime_state(
+        "entry_lock_reason",
+        None if result.safe_to_trade else "RECONCILIATION_REQUIRED",
+    )
+
+
 def _is_stop_order(order: dict[str, Any]) -> bool:
     info = _as_dict(order.get("info"))
     order_type = str(
@@ -439,6 +484,21 @@ async def reconcile_exchange_state(
 
     open_by_client_id = {_order_client_id(order): order for order in open_orders if _order_client_id(order)}
     active_records = store.list_by_states(ACTIVE_ORDER_STATES)
+    for record in active_records:
+        if (
+            str(record.strategy or "").strip().lower()
+            == "ema200_utbot_rsi_2h"
+            and str(
+                (record.metadata or {}).get(
+                    "ema200_profit_stop_pending_client_order_id"
+                )
+                or ""
+            ).strip()
+        ):
+            unresolved_records.append(
+                "ema200_profit_stop_pending_unresolved:"
+                f"{record.symbol}:{record.client_order_id}"
+            )
     strict_individual_lookup = (
         open_orders_fetcher is None
         and str(getattr(exchange, "id", "") or "").lower() in {"binance", "binanceusdm"}
@@ -531,7 +591,8 @@ async def reconcile_exchange_state(
         tick_size = _tick_size(exchange, symbol)
         safety_cfg = resolve_liquidation_safety_config(liquidation_config)
         enforce_liquidation_safety = (
-            str(getattr(exchange, "id", "") or "").lower() == "binance"
+            str(getattr(exchange, "id", "") or "").lower()
+            in {"binance", "binanceusdm"}
             or liquidation_price > 0
         )
         valid_stops: list[dict[str, Any]] = []
@@ -576,12 +637,13 @@ async def reconcile_exchange_state(
         if enforce_liquidation_safety and liquidation_price <= 0:
             issues.append(f"liquidation_price_unavailable:{symbol}")
         intentional_strategy_managed_no_stop = any(
-            str(record.strategy or '').strip().lower()
-            == 'ema200_utbot_rsi_2h'
-            and str(record.order_intent or '').upper() == OrderIntent.ENTRY.value
+            str(record.strategy or "").strip().lower()
+            == "ema200_utbot_rsi_2h"
+            and str(record.order_intent or "").upper() == OrderIntent.ENTRY.value
             and bool(
-                (record.metadata or {}).get('strategy_managed_no_stop')
+                (record.metadata or {}).get("strategy_managed_no_stop")
             )
+            and not _ema200_profit_stop_lifecycle_started(record)
             for record in records
         )
         if not valid_stops and not intentional_strategy_managed_no_stop:
@@ -769,5 +831,9 @@ async def reconcile_exchange_state(
         issues=issues,
     )
     store.set_runtime_state("last_reconciliation", result.__dict__)
-    store.set_runtime_state("entry_lock_reason", None if result.safe_to_trade else "RECONCILIATION_REQUIRED")
+    _persist_reconciliation_entry_lock(
+        store,
+        result,
+        user_stream_ready=bool(user_stream_ready),
+    )
     return result
