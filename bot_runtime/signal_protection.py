@@ -38,6 +38,20 @@ class SignalProtectionMixin:
             )
         )
 
+    def _is_close_position_order(self, order):
+        if not isinstance(order, dict):
+            return False
+        info = self._protection_order_info(order)
+        return any(
+            self._protection_bool(value)
+            for value in (
+                order.get('closePosition'),
+                order.get('close_position'),
+                info.get('closePosition'),
+                info.get('close_position'),
+            )
+        )
+
     def _protection_working_type(self, order):
         if not isinstance(order, dict):
             return ''
@@ -233,24 +247,29 @@ class SignalProtectionMixin:
                 continue
             if not self._is_reduce_only_order(order):
                 continue
+            order_symbol = str(self._protection_order_symbol(order) or '').strip()
             if (
                 position_symbol
-                and not self._protection_order_matches_symbol(
-                    order,
-                    position_symbol,
+                and (
+                    not order_symbol
+                    or not self._protection_order_matches_symbol(
+                        order,
+                        position_symbol,
+                    )
                 )
             ):
                 continue
             order_side = self._protection_order_side(order)
-            if order_side and order_side != close_side:
+            if order_side != close_side:
                 continue
+            close_position = self._is_close_position_order(order)
             order_qty = self._protection_order_amount(order)
-            if (
-                current_qty > 0
-                and order_qty is not None
-                and not self._qty_matches_plan(current_qty, order_qty)
-            ):
-                continue
+            if current_qty > 0 and not close_position:
+                if (
+                    order_qty is None
+                    or not self._qty_matches_plan(current_qty, order_qty)
+                ):
+                    continue
             trigger = self._protection_trigger_price(order)
             if trigger is None:
                 continue
