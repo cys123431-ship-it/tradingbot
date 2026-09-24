@@ -665,6 +665,561 @@ def test_profit_stop_exchange_price_rounding_keeps_protective_direction(side, ma
         assert mark < rounded < entry
 
 
+
+def _ema_replacement_race_fixture(initial_stop=None):
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = 'BTC/USDT:USDT'
+    pos = {
+        'symbol': symbol,
+        'side': 'long',
+        'entryPrice': 100.0,
+        'markPrice': 103.0,
+        'contracts': 1.0,
+    }
+    orders = []
+    submissions = []
+    cancellations = []
+    if initial_stop is not None:
+        orders.append({
+            'id': 'initial-stop',
+            'clientOrderId': 'utbsl-initial',
+            'symbol': symbol,
+            'type': 'STOP_MARKET',
+            'side': 'sell',
+            'amount': 1.0,
+            'stopPrice': float(initial_stop),
+            'reduceOnly': True,
+            'timestamp': 1,
+        })
+
+    class Exchange:
+        id = 'fixture'
+
+        def create_order(self, _symbol, order_type, side, qty, price, params):
+            order = {
+                'id': f'created-{len(submissions) + 1}',
+                'clientOrderId': params['newClientOrderId'],
+                'symbol': _symbol,
+                'type': str(order_type).upper(),
+                'side': side,
+                'amount': float(qty),
+                'stopPrice': float(params['stopPrice']),
+                'reduceOnly': bool(params.get('reduceOnly')),
+                'timestamp': 100 + len(submissions),
+            }
+            submissions.append(order)
+            orders.append(order)
+            return order
+
+    engine.exchange = Exchange()
+    engine.is_upbit_mode = lambda: False
+    engine.ctrl = SimpleNamespace(
+        format_symbol_for_display=lambda value: value,
+        notify=lambda *args, **kwargs: asyncio.sleep(0),
+    )
+    engine.safe_amount = lambda _symbol, amount: float(amount)
+    engine.safe_price = lambda _symbol, price: float(price)
+    engine.PROTECTION_REPLACE_CONFIRM_DELAY = 0
+    engine.last_protection_order_status = {}
+    engine.last_protection_alert_ts = {}
+    engine._persist_active_entry_protection_refs = lambda *args, **kwargs: None
+
+    async def collect(_symbol):
+        return True, list(orders)
+
+    async def cancel(_symbol, reason='test', orders=None):
+        selected = list(orders or [])
+        cancellations.extend(selected)
+        for order in selected:
+            if order in globals().get('_never_used', []):
+                pass
+        for order in selected:
+            try:
+                # list.remove is intentionally used here so the fake exchange
+                # mirrors a confirmed cancel before the next snapshot.
+                locals_orders.remove(order)
+            except ValueError:
+                pass
+        return len(selected)
+
+    # Keep the mutable list under a non-shadowed name for the cancellation fake.
+    locals_orders = orders
+
+    async def fetch_position(_symbol):
+        return True, dict(pos)
+
+    engine._collect_protection_orders_checked = collect
+    engine._cancel_protection_orders = cancel
+    engine._fetch_server_position_checked = fetch_position
+    return engine, symbol, pos, orders, submissions, cancellations
+
+
+def test_ema200_profit_stop_fails_closed_in_binance_hedge_mode():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = 'BTC/USDT:USDT'
+    pos = {
+        'symbol': symbol,
+        'side': 'long',
+        'entryPrice': 100.0,
+        'markPrice': 103.0,
+        'contracts': 1.0,
+        'liquidationPrice': 50.0,
+    }
+    locks = []
+    mutations = []
+    engine.exchange = SimpleNamespace(
+        id='binance',
+        fetch_position_mode=lambda _symbol=None: {'hedged': True},
+    )
+    engine.safe_amount = lambda _symbol, amount: float(amount)
+    engine.safe_price = lambda _symbol, price: float(price)
+    engine.last_protection_order_status = {}
+    engine.last_ema200_profit_stop_status = {}
+    engine._set_crypto_entry_lock = lambda reason: locks.append(reason)
+    engine._fetch_position_with_liquidation = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError('hedge mode must fail before liquidation/order mutation')
+    )
+    engine._cancel_protection_orders = lambda *args, **kwargs: (
+        mutations.append('cancel') or asyncio.sleep(0, result=1)
+    )
+
+    result = asyncio.run(engine._replace_stop_loss_order(
+        symbol,
+        pos,
+        101.0,
+        reason='EMA200 margin ROI 6.00% locks 5%',
+    ))
+
+    assert result is None
+    assert mutations == []
+    assert any('UNSUPPORTED_HEDGE_MODE' in value for value in locks)
+    assert engine.last_ema200_profit_stop_status[symbol]['status'] == (
+        'UNSUPPORTED_HEDGE_MODE'
+    )
+
+
+def test_ema200_profit_stop_fails_closed_when_position_mode_lookup_fails():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = 'BTC/USDT:USDT'
+    pos = {
+        'symbol': symbol,
+        'side': 'long',
+        'entryPrice': 100.0,
+        'markPrice': 103.0,
+        'contracts': 1.0,
+        'liquidationPrice': 50.0,
+    }
+    locks = []
+    engine.exchange = SimpleNamespace(
+        id='binance',
+        fetch_position_mode=lambda _symbol=None: (_ for _ in ()).throw(
+            TimeoutError('position mode timeout')
+        ),
+    )
+    engine.safe_amount = lambda _symbol, amount: float(amount)
+    engine.safe_price = lambda _symbol, price: float(price)
+    engine.last_protection_order_status = {}
+    engine.last_ema200_profit_stop_status = {}
+    engine._set_crypto_entry_lock = lambda reason: locks.append(reason)
+    engine._fetch_position_with_liquidation = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError('unknown position mode must fail before order mutation')
+    )
+
+    result = asyncio.run(engine._replace_stop_loss_order(
+        symbol,
+        pos,
+        101.0,
+        reason='EMA200 margin ROI 6.00% locks 5%',
+    ))
+
+    assert result is None
+    assert any('POSITION_MODE_UNAVAILABLE' in value for value in locks)
+    assert engine.last_ema200_profit_stop_status[symbol]['status'] == (
+        'POSITION_MODE_UNAVAILABLE'
+    )
+
+
+def test_binance_one_way_mode_allows_ema200_profit_stop_replacement_path():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = 'BTC/USDT:USDT'
+    pos = {
+        'symbol': symbol,
+        'side': 'long',
+        'entryPrice': 100.0,
+        'markPrice': 103.0,
+        'contracts': 1.0,
+        'liquidationPrice': 50.0,
+    }
+    created = []
+    engine.exchange = SimpleNamespace(
+        id='binance',
+        fetch_position_mode=lambda _symbol=None: {'hedged': False},
+    )
+    engine.safe_amount = lambda _symbol, amount: float(amount)
+    engine.safe_price = lambda _symbol, price: float(price)
+    engine.last_protection_order_status = {}
+    engine.last_ema200_profit_stop_status = {}
+    engine.last_protection_alert_ts = {}
+    engine._set_crypto_entry_lock = lambda reason: None
+
+    async def fetch_liquidation(_symbol, _pos):
+        return True, dict(pos)
+
+    engine._fetch_position_with_liquidation = fetch_liquidation
+    engine._validate_position_stop_liquidation = lambda *args, **kwargs: SimpleNamespace(
+        valid=True, reason='SAFE'
+    )
+    engine._collect_protection_orders_checked = lambda _symbol: asyncio.sleep(
+        0, result=(True, [])
+    )
+    engine._fetch_server_position_checked = lambda _symbol: asyncio.sleep(
+        0, result=(True, dict(pos))
+    )
+    engine._cancel_protection_orders = lambda *args, **kwargs: asyncio.sleep(
+        0, result=0
+    )
+
+    async def create(*args, **kwargs):
+        order = {
+            'id': 'one-way-stop',
+            'clientOrderId': 'utbsl-one-way',
+            'symbol': symbol,
+            'type': 'STOP_MARKET',
+            'side': 'sell',
+            'amount': 1.0,
+            'stopPrice': 101.0,
+            'reduceOnly': True,
+        }
+        created.append(order)
+        return order
+
+    engine._create_protection_order_with_retries = create
+    engine._persist_active_entry_protection_refs = lambda *args, **kwargs: None
+    engine._persist_ema200_profit_stop_identity = lambda *args, **kwargs: None
+
+    result = asyncio.run(engine._replace_stop_loss_order(
+        symbol,
+        pos,
+        101.0,
+        reason='EMA200 margin ROI 6.00% locks 5%',
+    ))
+
+    assert result['id'] == 'one-way-stop'
+    assert len(created) == 1
+
+
+def test_ema200_entry_source_checks_one_way_mode_before_position_lookup():
+    source = inspect.getsource(emas.SignalEngine.entry)
+    mode_guard = source.index('_require_binance_one_way_mode')
+    position_lookup = source.index('self.exchange.fetch_positions')
+    assert mode_guard < position_lookup
+
+
+def test_concurrent_profit_stop_replacements_keep_best_stop():
+    engine, symbol, pos, orders, submissions, cancellations = (
+        _ema_replacement_race_fixture(initial_stop=100.5)
+    )
+
+    async def scenario():
+        return await asyncio.gather(
+            engine._replace_stop_loss_order(
+                symbol, pos, 101.0,
+                reason='EMA200 margin ROI 6.00% locks 5%',
+            ),
+            engine._replace_stop_loss_order(
+                symbol, pos, 102.0,
+                reason='EMA200 margin ROI 11.00% locks 10%',
+            ),
+        )
+
+    asyncio.run(scenario())
+
+    open_stops = [
+        float(order['stopPrice'])
+        for order in orders
+        if engine._classify_protection_order(order) == 'sl'
+    ]
+    assert open_stops == [pytest.approx(102.0)]
+    assert max(float(order['stopPrice']) for order in cancellations) < 102.0
+    assert len([o for o in submissions if float(o['stopPrice']) == 102.0]) == 1
+
+
+def test_same_target_concurrent_profit_stop_replacement_submits_once():
+    engine, symbol, pos, orders, submissions, _ = (
+        _ema_replacement_race_fixture(initial_stop=100.5)
+    )
+
+    async def scenario():
+        return await asyncio.gather(
+            engine._replace_stop_loss_order(
+                symbol, pos, 101.0,
+                reason='EMA200 margin ROI 6.00% locks 5%',
+            ),
+            engine._replace_stop_loss_order(
+                symbol, pos, 101.0,
+                reason='EMA200 margin ROI 6.10% locks 5%',
+            ),
+        )
+
+    asyncio.run(scenario())
+
+    assert [float(order['stopPrice']) for order in orders] == [
+        pytest.approx(101.0)
+    ]
+    assert len(submissions) == 1
+
+
+def test_better_stop_appearing_during_cancel_confirmation_is_preserved():
+    engine, symbol, pos, orders, submissions, cancellations = (
+        _ema_replacement_race_fixture(initial_stop=100.5)
+    )
+    snapshots = 0
+    original_collect = engine._collect_protection_orders_checked
+
+    async def collect_with_external_winner(_symbol):
+        nonlocal snapshots
+        snapshots += 1
+        if snapshots == 2:
+            orders.append({
+                'id': 'external-better-stop',
+                'clientOrderId': 'utbsl-external-better',
+                'symbol': symbol,
+                'type': 'STOP_MARKET',
+                'side': 'sell',
+                'amount': 1.0,
+                'stopPrice': 102.0,
+                'reduceOnly': True,
+                'timestamp': 999,
+            })
+        return await original_collect(_symbol)
+
+    engine._collect_protection_orders_checked = collect_with_external_winner
+
+    result = asyncio.run(engine._replace_stop_loss_order(
+        symbol,
+        pos,
+        101.0,
+        reason='EMA200 margin ROI 6.00% locks 5%',
+    ))
+
+    assert result['id'] == 'external-better-stop'
+    assert any(order['id'] == 'external-better-stop' for order in orders)
+    assert not any(
+        order['id'] == 'external-better-stop' for order in cancellations
+    )
+    assert submissions == []
+
+
+def test_pending_profit_stop_identity_survives_crash_and_restart_audit(tmp_path):
+    symbol = 'BTC/USDT:USDT'
+    path = tmp_path / 'state.sqlite3'
+    store = SQLiteTradingStateStore(path)
+    store.upsert(OrderRecord(
+        client_order_id='entry-crash-window',
+        symbol=symbol,
+        side='long',
+        strategy=EMA200_UTBOT_RSI_STRATEGY,
+        signal_timestamp='1700000000',
+        requested_qty=1.0,
+        filled_qty=1.0,
+        average_fill_price=100.0,
+        order_state=OrderState.PROTECTED.value,
+    ))
+
+    engine, _, pos, orders, _, _ = _ema_replacement_race_fixture()
+    engine.trading_state_store = store
+
+    def crash_before_confirmed_persist(*args, **kwargs):
+        raise RuntimeError('simulated process death after exchange accept')
+
+    engine._persist_active_entry_protection_refs = crash_before_confirmed_persist
+
+    with pytest.raises(RuntimeError, match='simulated process death'):
+        asyncio.run(engine._replace_stop_loss_order(
+            symbol,
+            pos,
+            101.0,
+            reason='EMA200 margin ROI 6.00% locks 5%',
+        ))
+
+    persisted = store.get('entry-crash-window')
+    pending_client_id = persisted.metadata[
+        'ema200_profit_stop_pending_client_order_id'
+    ]
+    assert pending_client_id
+    assert any(
+        order['clientOrderId'] == pending_client_id
+        for order in orders
+    )
+    store.close()
+
+    reopened = SQLiteTradingStateStore(path)
+    restarted = emas.SignalEngine.__new__(emas.SignalEngine)
+    restarted.is_upbit_mode = lambda: False
+    restarted.exchange = SimpleNamespace(id='fixture')
+    restarted.ctrl = SimpleNamespace(format_symbol_for_display=lambda value: value)
+    restarted.last_protection_order_status = {}
+    restarted.protection_missing_candidates = {}
+    restarted.last_protection_alert_ts = {}
+    restarted._get_utbreakout_trailing_state = lambda _: None
+    restarted.get_runtime_strategy_params = lambda: {'active_strategy': 'utbot'}
+    restarted.trading_state_store = reopened
+    cancelled = []
+
+    async def collect(_symbol):
+        return True, list(orders)
+
+    async def cancel(_symbol, reason='test', orders=None):
+        cancelled.extend(orders or [])
+        return len(orders or [])
+
+    restarted._collect_protection_orders_checked = collect
+    restarted._cancel_protection_orders = cancel
+
+    status = asyncio.run(restarted._audit_protection_orders(
+        symbol,
+        pos=pos,
+        expected_tp=False,
+        expected_sl=True,
+        alert=False,
+    ))
+
+    assert cancelled == []
+    assert status['sl_present'] is True
+    reopened.close()
+
+
+def test_flat_not_found_pending_profit_stop_identity_is_cleaned(tmp_path):
+    symbol = 'BTC/USDT:USDT'
+    store = SQLiteTradingStateStore(tmp_path / 'state.sqlite3')
+    store.upsert(OrderRecord(
+        client_order_id='entry-pending-not-found',
+        symbol=symbol,
+        side='long',
+        strategy=EMA200_UTBOT_RSI_STRATEGY,
+        signal_timestamp='1700000000',
+        requested_qty=1.0,
+        filled_qty=1.0,
+        average_fill_price=100.0,
+        order_state=OrderState.PROTECTED.value,
+        metadata={
+            'ema200_profit_stop_pending_client_order_id': 'pending-not-found',
+            'ema200_profit_stop_pending_side': 'long',
+            'ema200_profit_stop_pending_qty': 1.0,
+            'ema200_profit_stop_pending_trigger_price': 101.0,
+        },
+    ))
+
+    class Exchange:
+        id = 'binance'
+        def market(self, _symbol):
+            return {'id': 'BTCUSDT'}
+        def fapiPrivateGetAlgoOrder(self, params):
+            raise RuntimeError('-2013 Order does not exist.')
+
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.exchange = Exchange()
+    engine.trading_state_store = store
+    engine._set_crypto_entry_lock = lambda reason: None
+
+    result = asyncio.run(engine._reconcile_ema200_profit_stop_pending_identity(
+        symbol,
+        pos=None,
+        protection_orders=[],
+    ))
+
+    assert result['status'] == 'NOT_FOUND_CLEANED'
+    record = store.get('entry-pending-not-found')
+    assert 'ema200_profit_stop_pending_client_order_id' not in record.metadata
+    store.close()
+
+
+def test_unknown_pending_profit_stop_lookup_is_preserved_and_locks_entries(tmp_path):
+    symbol = 'BTC/USDT:USDT'
+    store = SQLiteTradingStateStore(tmp_path / 'state.sqlite3')
+    store.upsert(OrderRecord(
+        client_order_id='entry-pending-unknown',
+        symbol=symbol,
+        side='long',
+        strategy=EMA200_UTBOT_RSI_STRATEGY,
+        signal_timestamp='1700000000',
+        requested_qty=1.0,
+        filled_qty=1.0,
+        average_fill_price=100.0,
+        order_state=OrderState.PROTECTED.value,
+        metadata={
+            'ema200_profit_stop_pending_client_order_id': 'pending-unknown',
+            'ema200_profit_stop_pending_side': 'long',
+            'ema200_profit_stop_pending_qty': 1.0,
+            'ema200_profit_stop_pending_trigger_price': 101.0,
+        },
+    ))
+
+    class Exchange:
+        id = 'binance'
+        def market(self, _symbol):
+            return {'id': 'BTCUSDT'}
+        def fapiPrivateGetAlgoOrder(self, params):
+            raise TimeoutError('lookup timeout')
+
+    locks = []
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.exchange = Exchange()
+    engine.trading_state_store = store
+    engine._set_crypto_entry_lock = lambda reason: locks.append(reason)
+
+    result = asyncio.run(engine._reconcile_ema200_profit_stop_pending_identity(
+        symbol,
+        pos=None,
+        protection_orders=[],
+    ))
+
+    assert result['status'] == 'UNKNOWN'
+    record = store.get('entry-pending-unknown')
+    assert record.metadata['ema200_profit_stop_pending_client_order_id'] == (
+        'pending-unknown'
+    )
+    assert any('PENDING_PROTECTION_LOOKUP_UNKNOWN' in value for value in locks)
+    store.close()
+
+
+def test_partial_position_reduction_never_keeps_oversized_profit_stop_as_managed():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = 'BTC/USDT:USDT'
+    pos = {
+        'symbol': symbol,
+        'side': 'long',
+        'entryPrice': 100.0,
+        'markPrice': 101.2,
+        'contracts': 1.0,
+    }
+    order = {
+        'id': 'oversized-profit-stop',
+        'clientOrderId': 'utbsl-oversized',
+        'symbol': symbol,
+        'type': 'STOP_MARKET',
+        'side': 'sell',
+        'amount': 2.0,
+        'stopPrice': 101.0,
+        'reduceOnly': True,
+    }
+    record = SimpleNamespace(
+        strategy=EMA200_UTBOT_RSI_STRATEGY,
+        side='long',
+        filled_qty=2.0,
+        requested_qty=2.0,
+        stop_order_id='oversized-profit-stop',
+        metadata={},
+    )
+
+    status, cancelled = asyncio.run(
+        _run_ema_profit_stop_audit(engine, symbol, pos, order, [record])
+    )
+
+    assert cancelled == [order]
+    assert status['sl_present'] is False
+
+
 def test_first_stage_expects_exchange_stop_after_profit_stop_was_installed():
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
     engine.is_upbit_mode = lambda: False
