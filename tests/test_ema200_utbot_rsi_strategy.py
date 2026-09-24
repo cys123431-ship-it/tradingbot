@@ -436,6 +436,235 @@ def test_ema_profit_stop_ownership_survives_sqlite_restart(tmp_path):
     reopened.close()
 
 
+@pytest.mark.parametrize(
+    ('record_stop_id', 'record_side', 'order_amount'),
+    [
+        ('different-stop', 'long', 1.0),
+        ('profit-stop-1', 'short', 1.0),
+        ('profit-stop-1', 'long', 0.5),
+    ],
+)
+def test_ema_profit_stop_exception_requires_matching_order_side_and_quantity(
+    record_stop_id,
+    record_side,
+    order_amount,
+):
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = 'BTC/USDT:USDT'
+    pos = {
+        'symbol': symbol, 'side': 'long', 'entryPrice': 100.0,
+        'markPrice': 101.2, 'contracts': 1.0,
+    }
+    order = {
+        'id': 'profit-stop-1',
+        'clientOrderId': 'utbslsbtcprofit1',
+        'symbol': symbol,
+        'type': 'STOP_MARKET',
+        'side': 'sell',
+        'amount': order_amount,
+        'stopPrice': 101.0,
+        'reduceOnly': True,
+    }
+    record = SimpleNamespace(
+        strategy=EMA200_UTBOT_RSI_STRATEGY,
+        side=record_side,
+        filled_qty=1.0,
+        requested_qty=1.0,
+        stop_order_id=record_stop_id,
+        metadata={},
+    )
+
+    status, cancelled = asyncio.run(
+        _run_ema_profit_stop_audit(engine, symbol, pos, order, [record])
+    )
+
+    assert cancelled == [order]
+    assert status['invalid_price_cancelled'] == 1
+
+
+def test_ema_profit_stop_verified_client_id_restores_ownership_when_order_id_changes():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = 'BTC/USDT:USDT'
+    pos = {
+        'symbol': symbol, 'side': 'short', 'entryPrice': 100.0,
+        'markPrice': 98.8, 'contracts': 2.0,
+    }
+    order = {
+        'id': 'new-algo-order-id',
+        'clientOrderId': 'utbslsbtcstableclient',
+        'symbol': symbol,
+        'type': 'STOP_MARKET',
+        'side': 'buy',
+        'amount': 2.0,
+        'stopPrice': 99.0,
+        'reduceOnly': True,
+    }
+    record = SimpleNamespace(
+        strategy=EMA200_UTBOT_RSI_STRATEGY,
+        side='short',
+        filled_qty=2.0,
+        requested_qty=2.0,
+        stop_order_id='old-algo-order-id',
+        metadata={
+            'ema200_profit_stop_client_order_id': 'utbslsbtcstableclient',
+        },
+    )
+
+    status, cancelled = asyncio.run(
+        _run_ema_profit_stop_audit(engine, symbol, pos, order, [record])
+    )
+
+    assert cancelled == []
+    assert status['sl_present'] is True
+
+
+def test_profit_stop_install_path_persists_identity_then_real_audit_keeps_it(tmp_path):
+    symbol = 'BTC/USDT:USDT'
+    path = tmp_path / 'state.sqlite3'
+    store = SQLiteTradingStateStore(path)
+    store.upsert(OrderRecord(
+        client_order_id='entry-integrated',
+        symbol=symbol,
+        side='long',
+        strategy=EMA200_UTBOT_RSI_STRATEGY,
+        signal_timestamp='1700000000',
+        requested_qty=1.0,
+        filled_qty=1.0,
+        average_fill_price=100.0,
+        order_state=OrderState.PROTECTED.value,
+    ))
+
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.trading_state_store = store
+    engine.is_upbit_mode = lambda: False
+    engine.ctrl = SimpleNamespace(format_symbol_for_display=lambda value: value)
+    engine.last_protection_order_status = {}
+    engine.protection_missing_candidates = {}
+    engine.last_protection_alert_ts = {}
+    engine._get_utbreakout_trailing_state = lambda _: None
+    engine.get_runtime_strategy_params = lambda: {
+        'active_strategy': EMA200_UTBOT_RSI_STRATEGY,
+        'EMA200UTBotRSI2H': {'enabled': False},
+    }
+    engine.safe_amount = lambda _symbol, amount: float(amount)
+    engine.safe_price = lambda _symbol, price: float(price)
+    engine.PROTECTION_REPLACE_CONFIRM_DELAY = 0
+    engine._persist_active_entry_protection_refs = lambda *args, **kwargs: None
+
+    pos = {
+        'symbol': symbol,
+        'side': 'long',
+        'entryPrice': 100.0,
+        'markPrice': 101.2,
+        'contracts': 1.0,
+    }
+    orders = []
+
+    def create_order(_symbol, order_type, side, qty, price, params):
+        order = {
+            'id': 'profit-stop-integrated',
+            'clientOrderId': params['newClientOrderId'],
+            'symbol': _symbol,
+            'type': str(order_type).upper(),
+            'side': side,
+            'amount': float(qty),
+            'stopPrice': float(params['stopPrice']),
+            'reduceOnly': bool(params.get('reduceOnly')),
+        }
+        orders.append(order)
+        return order
+
+    engine.exchange = SimpleNamespace(id='fixture', create_order=create_order)
+
+    async def collect(_symbol):
+        return True, list(orders)
+
+    async def fetch_position(_symbol):
+        return True, dict(pos)
+
+    async def cancel(_symbol, reason='test', orders=None):
+        return 0
+
+    engine._collect_protection_orders_checked = collect
+    engine._fetch_server_position_checked = fetch_position
+    engine._cancel_protection_orders = cancel
+
+    replacement = asyncio.run(engine._replace_stop_loss_order(
+        symbol,
+        pos,
+        101.0,
+        reason='EMA200 margin ROI 6.00% locks 5%',
+    ))
+    assert replacement is not None
+
+    persisted = store.get('entry-integrated')
+    assert persisted.stop_order_id == 'profit-stop-integrated'
+    assert persisted.metadata['ema200_profit_stop_client_order_id'] == (
+        replacement['clientOrderId']
+    )
+
+    audit = asyncio.run(engine._audit_protection_orders(
+        symbol,
+        pos=pos,
+        expected_tp=False,
+        expected_sl=True,
+        alert=False,
+    ))
+    assert audit['sl_present'] is True
+    assert audit['invalid_price_cancelled'] == 0
+    store.close()
+
+
+def test_first_profit_stop_install_exception_is_recorded_without_new_forced_close():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = 'BTC/USDT:USDT'
+    pos = {
+        'symbol': symbol, 'side': 'long', 'entryPrice': 100.0,
+        'markPrice': 101.2, 'leverage': 5, 'contracts': 1.0,
+    }
+    engine._position_entry_strategy = lambda _: EMA200_UTBOT_RSI_STRATEGY
+    engine.safe_price = lambda _, price: price
+    engine.last_ema200_profit_stop_status = {}
+
+    async def fetch_position(_):
+        return True, pos
+
+    async def collect(_):
+        return True, []
+
+    async def replace(*args, **kwargs):
+        raise TimeoutError('simulated lost response')
+
+    async def forbidden_fail_close(*args, **kwargs):
+        raise AssertionError('first profit stop failure must not add a new forced-close rule')
+
+    engine._fetch_server_position_checked = fetch_position
+    engine._collect_protection_orders_checked = collect
+    engine._replace_stop_loss_order = replace
+    engine._fail_closed_unprotected_position = forbidden_fail_close
+
+    asyncio.run(engine._ema200_apply_margin_profit_stop(symbol))
+
+    status = engine.last_ema200_profit_stop_status[symbol]
+    assert status['status'] == 'UPDATE_FAILED'
+    assert 'TimeoutError' in status['reason']
+
+
+@pytest.mark.parametrize(
+    ('side', 'mark'),
+    [('long', 101.24), ('short', 98.82)],
+)
+def test_profit_stop_exchange_price_rounding_keeps_protective_direction(side, mark):
+    entry = 100.03
+    target = ema200_profit_stop_target(side, entry, mark, 5)
+    assert target is not None
+    rounded = round(target[2], 1)
+    if side == 'long':
+        assert entry < rounded < mark
+    else:
+        assert mark < rounded < entry
+
+
 def test_first_stage_expects_exchange_stop_after_profit_stop_was_installed():
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
     engine.is_upbit_mode = lambda: False
@@ -523,7 +752,8 @@ def test_auxiliary_ut_reader_uses_completed_bars_and_own_ut_settings():
     assert result == {'15m': 'long', '30m': 'long', '1h': 'long'}
 
 
-def test_short_mechanical_exit_on_selected_15m_completed_ut_buy():
+@pytest.mark.parametrize('exit_timeframe', ['15m', '30m', '1h'])
+def test_short_mechanical_exit_on_selected_completed_ut_buy(exit_timeframe):
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
     timeframe_calls = []
     engine.market_data_exchange = SimpleNamespace(fetch_ohlcv=lambda symbol, tf, limit: (
@@ -536,20 +766,25 @@ def test_short_mechanical_exit_on_selected_15m_completed_ut_buy():
     })
     engine.get_runtime_strategy_params = lambda: {
         'active_strategy': EMA200_UTBOT_RSI_STRATEGY,
-        'EMA200UTBotRSI2H': {'exit_timeframe': '15m', 'enabled': False},
+        'EMA200UTBotRSI2H': {'exit_timeframe': exit_timeframe, 'enabled': False},
     }
     engine._calculate_utbot_signal = lambda df, params: ('long', 'buy', {'bias_side': 'long'})
     engine._update_stateful_diag = lambda *args, **kwargs: None
     engine.last_entry_reason = {}
     exits = []
+
     async def exit_position(symbol, reason):
         exits.append(reason)
+
     async def fetch_position(symbol):
         return True, None
+
     engine.exit_position = exit_position
     engine._fetch_server_position_checked = fetch_position
-    assert asyncio.run(engine.process_exit_candle('BTC/USDT:USDT', '15m', 'short'))
-    assert timeframe_calls == ['15m']
+    assert asyncio.run(
+        engine.process_exit_candle('BTC/USDT:USDT', exit_timeframe, 'short')
+    )
+    assert timeframe_calls == [exit_timeframe]
     assert exits == ['EMA200_UTBOT_RSI_UT_BUY']
 
 
