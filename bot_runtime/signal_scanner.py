@@ -48,21 +48,167 @@ from .diagnostics import _safe_float_or_none
 
 
 class SignalScannerMixin:
+    def _set_ema200_profit_stop_status(self, symbol, status, **details):
+        states = getattr(self, 'last_ema200_profit_stop_status', None)
+        if not isinstance(states, dict):
+            states = {}
+            self.last_ema200_profit_stop_status = states
+        payload = {
+            'status': str(status or 'UNKNOWN'),
+            'updated_at_ns': time.time_ns(),
+        }
+        payload.update(details)
+        states[symbol] = payload
+        return payload
+
+    @staticmethod
+    def _ema200_positive_float(value):
+        parsed = _safe_float_or_none(value)
+        if parsed is None or parsed <= 0:
+            return None
+        return float(parsed)
+
+    @staticmethod
+    def _ema200_margin_mode(value):
+        text = str(value or '').strip().lower()
+        if text in {'cross', 'crossed'}:
+            return 'cross'
+        if text in {'isolated', 'isolated_margin'}:
+            return 'isolated'
+        return ''
+
+    async def _ema200_resolve_position_leverage(self, symbol, pos):
+        """Resolve the live exchange leverage without trusting runtime config."""
+        info = pos.get('info') if isinstance(pos.get('info'), dict) else {}
+        parsed_leverage = self._ema200_positive_float(pos.get('leverage'))
+        raw_leverage = self._ema200_positive_float(info.get('leverage'))
+        if (
+            parsed_leverage is not None
+            and raw_leverage is not None
+            and abs(parsed_leverage - raw_leverage) > 1e-9
+        ):
+            return None, None, 'LEVERAGE_CONFLICT', (
+                f'position leverage conflict: parsed={parsed_leverage} raw={raw_leverage}'
+            )
+        direct = parsed_leverage or raw_leverage
+        if direct is not None:
+            return direct, 'position', None, None
+
+        exchange_id = str(getattr(self.exchange, 'id', '') or '').strip().lower()
+        if exchange_id not in {'binance', 'binanceusdm'}:
+            return None, None, 'LEVERAGE_UNAVAILABLE', (
+                f'position leverage missing and exchange {exchange_id or "unknown"} '
+                'has no EMA200 leverage fallback'
+            )
+
+        endpoint = (
+            getattr(self.exchange, 'fapiPrivateGetSymbolConfig', None)
+            or getattr(self.exchange, 'fapi_private_get_symbol_config', None)
+        )
+        if not callable(endpoint):
+            return None, None, 'LEVERAGE_UNAVAILABLE', (
+                'Binance symbolConfig endpoint unavailable in configured CCXT client'
+            )
+
+        try:
+            market_id = ''
+            try:
+                market = self.exchange.market(symbol)
+                if isinstance(market, dict):
+                    market_id = str(market.get('id') or '').strip()
+            except Exception:
+                market_id = ''
+            if not market_id:
+                market_id = str(self._futures_symbol_key(symbol) or '').strip()
+            response = await asyncio.to_thread(
+                endpoint,
+                {'symbol': market_id} if market_id else {},
+            )
+        except Exception as exc:
+            return None, None, 'LEVERAGE_UNAVAILABLE', (
+                f'Binance symbolConfig lookup failed: {type(exc).__name__}: {exc}'
+            )
+
+        rows = response if isinstance(response, list) else [response]
+        target_key = re.sub(r'[^A-Z0-9]', '', str(market_id or symbol).upper())
+        matches = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_key = re.sub(r'[^A-Z0-9]', '', str(row.get('symbol') or '').upper())
+            if target_key and row_key and row_key != target_key:
+                continue
+            leverage = self._ema200_positive_float(row.get('leverage'))
+            if leverage is not None:
+                matches.append((leverage, row))
+
+        if not matches:
+            return None, None, 'LEVERAGE_UNAVAILABLE', (
+                f'Binance symbolConfig returned no leverage for {market_id or symbol}'
+            )
+
+        distinct = {round(item[0], 12) for item in matches}
+        if len(distinct) != 1:
+            return None, None, 'LEVERAGE_CONFLICT', (
+                f'Binance symbolConfig returned conflicting leverages: {sorted(distinct)}'
+            )
+
+        leverage, config_row = matches[0]
+        position_margin_mode = self._ema200_margin_mode(
+            pos.get('marginMode')
+            or pos.get('marginType')
+            or info.get('marginMode')
+            or info.get('marginType')
+        )
+        config_margin_mode = self._ema200_margin_mode(config_row.get('marginType'))
+        if (
+            position_margin_mode
+            and config_margin_mode
+            and position_margin_mode != config_margin_mode
+        ):
+            return None, None, 'LEVERAGE_CONFLICT', (
+                'Binance position/symbolConfig margin mode conflict: '
+                f'position={position_margin_mode} config={config_margin_mode}'
+            )
+        return leverage, 'binance_symbol_config', None, None
+
     async def _ema200_apply_margin_profit_stop(self, symbol):
-        """Rachet only a bot-owned EMA200 position's exchange stop."""
+        """Ratchet only a bot-owned EMA200 position's exchange stop."""
         if self._position_entry_strategy(symbol) != EMA200_UTBOT_RSI_STRATEGY:
             return
         fetch_ok, pos = await self._fetch_server_position_checked(symbol)
         if not fetch_ok or not pos:
             return
         info = pos.get('info') if isinstance(pos.get('info'), dict) else {}
+        leverage, leverage_source, leverage_error, leverage_reason = (
+            await self._ema200_resolve_position_leverage(symbol, pos)
+        )
+        if leverage is None:
+            self._set_ema200_profit_stop_status(
+                symbol,
+                leverage_error or 'LEVERAGE_UNAVAILABLE',
+                reason=str(leverage_reason or 'live leverage unavailable'),
+            )
+            logger.warning(
+                "EMA200 profit stop skipped for %s: %s",
+                symbol,
+                leverage_reason or 'live leverage unavailable',
+            )
+            return
+
         target = ema200_profit_stop_target(
             str(pos.get('side') or '').lower(),
             pos.get('entryPrice'),
             pos.get('markPrice') or pos.get('mark_price') or info.get('markPrice'),
-            pos.get('leverage') or info.get('leverage'),
+            leverage,
         )
         if target is None:
+            self._set_ema200_profit_stop_status(
+                symbol,
+                'BELOW_TRIGGER',
+                leverage=leverage,
+                leverage_source=leverage_source,
+            )
             return
         roi, locked_roi, stop_price = target
         previous_stop = []
@@ -70,7 +216,18 @@ class SignalScannerMixin:
             safe_stop = float(self.safe_price(symbol, stop_price))
             fetch_ok, orders = await self._collect_protection_orders_checked(symbol)
             if not fetch_ok:
-                logger.warning("EMA200 profit stop delayed: protection snapshot unavailable %s", symbol)
+                self._set_ema200_profit_stop_status(
+                    symbol,
+                    'PROTECTION_SNAPSHOT_UNAVAILABLE',
+                    leverage=leverage,
+                    leverage_source=leverage_source,
+                    roi=roi,
+                    locked_roi=locked_roi,
+                )
+                logger.warning(
+                    "EMA200 profit stop delayed: protection snapshot unavailable %s",
+                    symbol,
+                )
                 return
             stops = [
                 order for order in orders
@@ -86,20 +243,64 @@ class SignalScannerMixin:
                 max(previous_stop) >= safe_stop if side == 'long'
                 else min(previous_stop) <= safe_stop
             ):
+                self._set_ema200_profit_stop_status(
+                    symbol,
+                    'UNCHANGED_BETTER_OR_EQUAL_STOP',
+                    leverage=leverage,
+                    leverage_source=leverage_source,
+                    roi=roi,
+                    locked_roi=locked_roi,
+                    stop_price=safe_stop,
+                )
                 return
             order = await self._replace_stop_loss_order(
                 symbol, pos, safe_stop,
                 reason=f'EMA200 margin ROI {roi:.2f}% locks {locked_roi:.0f}%',
             )
-            if order:
-                logger.info(
-                    "EMA200 profit stop %s ROI=%.2f%% lock=%.0f%% stop=%.12f",
+            if not order:
+                self._set_ema200_profit_stop_status(
+                    symbol,
+                    'INSTALL_NOT_CONFIRMED',
+                    leverage=leverage,
+                    leverage_source=leverage_source,
+                    roi=roi,
+                    locked_roi=locked_roi,
+                    stop_price=safe_stop,
+                )
+                logger.warning(
+                    "EMA200 profit stop install not confirmed for %s "
+                    "ROI=%.2f%% lock=%.0f%% stop=%.12f",
                     symbol, roi, locked_roi, safe_stop,
                 )
-                await self._audit_protection_orders(
-                    symbol, pos=pos, expected_tp=False, expected_sl=True,
-                )
-        except Exception:
+                return
+
+            logger.info(
+                "EMA200 profit stop %s ROI=%.2f%% lock=%.0f%% stop=%.12f leverage=%sx source=%s",
+                symbol, roi, locked_roi, safe_stop, leverage, leverage_source,
+            )
+            audit = await self._audit_protection_orders(
+                symbol, pos=pos, expected_tp=False, expected_sl=True,
+            )
+            self._set_ema200_profit_stop_status(
+                symbol,
+                'PROTECTED' if (audit or {}).get('sl_present') else 'AUDIT_UNCONFIRMED',
+                leverage=leverage,
+                leverage_source=leverage_source,
+                roi=roi,
+                locked_roi=locked_roi,
+                stop_price=safe_stop,
+                audit_status=(audit or {}).get('status'),
+            )
+        except Exception as exc:
+            self._set_ema200_profit_stop_status(
+                symbol,
+                'UPDATE_FAILED',
+                leverage=leverage,
+                leverage_source=leverage_source,
+                roi=roi,
+                locked_roi=locked_roi,
+                reason=f'{type(exc).__name__}: {exc}',
+            )
             logger.exception("EMA200 profit stop update failed for %s", symbol)
             # A replacement can throw after cancelling the previous SL. If so,
             # use the existing fail-closed protection path, never leave an

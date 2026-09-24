@@ -55,6 +55,163 @@ class SignalProtectionMixin:
         )
         return client_id.startswith('utb')
 
+    @staticmethod
+    def _managed_position_side(value):
+        text = str(value or '').strip().lower()
+        if text in {'long', 'buy'}:
+            return 'long'
+        if text in {'short', 'sell'}:
+            return 'short'
+        return ''
+
+    def _is_ema200_managed_profit_stop_order(
+        self,
+        symbol,
+        pos,
+        order,
+        tracked_records=None,
+    ):
+        """Verify EMA200 stop ownership from durable order state, side and qty."""
+        if self._classify_protection_order(order) != 'sl':
+            return False
+        pos_side = self._managed_position_side((pos or {}).get('side'))
+        if pos_side not in {'long', 'short'}:
+            return False
+        close_side = 'sell' if pos_side == 'long' else 'buy'
+        order_side = self._protection_order_side(order)
+        if order_side and order_side != close_side:
+            return False
+
+        try:
+            current_qty = abs(float(
+                self._position_signed_contracts(pos)
+                or (pos or {}).get('contracts', 0)
+                or 0
+            ))
+        except (TypeError, ValueError):
+            return False
+        order_qty = self._protection_order_amount(order)
+        if (
+            current_qty <= 0
+            or order_qty is None
+            or not self._qty_matches_plan(current_qty, order_qty)
+        ):
+            return False
+
+        if tracked_records is None:
+            try:
+                tracked_records = self.trading_state_store.active_for_symbol(symbol)
+            except Exception:
+                tracked_records = []
+        order_id = str(self._protection_order_id(order) or '').strip()
+        client_id = str(self._protection_client_order_id(order) or '').strip()
+        for record in tracked_records or []:
+            if (
+                str(getattr(record, 'strategy', '') or '').strip().lower()
+                != EMA200_UTBOT_RSI_STRATEGY
+            ):
+                continue
+            record_side = self._managed_position_side(
+                getattr(record, 'side', '')
+                or (getattr(record, 'metadata', {}) or {}).get('position_side')
+            )
+            if record_side != pos_side:
+                continue
+
+            record_qty = None
+            for value in (
+                getattr(record, 'filled_qty', None),
+                getattr(record, 'requested_qty', None),
+            ):
+                parsed = _safe_float_or_none(value)
+                if parsed is not None and parsed > 0:
+                    record_qty = float(parsed)
+                    break
+            if (
+                record_qty is not None
+                and not self._qty_matches_plan(current_qty, record_qty)
+            ):
+                continue
+
+            metadata = (
+                dict(getattr(record, 'metadata', {}) or {})
+                if isinstance(getattr(record, 'metadata', {}) or {}, dict)
+                else {}
+            )
+            persisted_order_ids = {
+                str(value).strip()
+                for value in (
+                    getattr(record, 'stop_order_id', None),
+                    metadata.get('ema200_profit_stop_order_id'),
+                )
+                if value not in (None, '')
+            }
+            persisted_client_ids = {
+                str(value).strip()
+                for value in (
+                    metadata.get('ema200_profit_stop_client_order_id'),
+                    metadata.get('stop_client_order_id'),
+                )
+                if value not in (None, '')
+            }
+            id_match = bool(order_id and order_id in persisted_order_ids)
+            client_match = bool(client_id and client_id in persisted_client_ids)
+            if id_match or client_match:
+                return True
+        return False
+
+    def _persist_ema200_profit_stop_identity(self, symbol, pos, order):
+        """Persist enough identity to restore EMA200 stop ownership after restart."""
+        store = getattr(self, 'trading_state_store', None)
+        if store is None or not order:
+            return 0
+        try:
+            records = store.active_for_symbol(symbol) or []
+        except Exception:
+            logger.exception(
+                "EMA200 profit stop state lookup failed for %s",
+                symbol,
+            )
+            return 0
+
+        order_id = str(self._protection_order_id(order) or '').strip() or None
+        client_id = str(self._protection_client_order_id(order) or '').strip() or None
+        side = self._managed_position_side((pos or {}).get('side'))
+        qty = self._protection_order_amount(order)
+        updated = 0
+        for record in records:
+            if (
+                str(getattr(record, 'strategy', '') or '').strip().lower()
+                != EMA200_UTBOT_RSI_STRATEGY
+            ):
+                continue
+            record_side = self._managed_position_side(getattr(record, 'side', ''))
+            if side and record_side and side != record_side:
+                continue
+            metadata = dict(getattr(record, 'metadata', {}) or {})
+            metadata.update({
+                'ema200_profit_stop_order_id': order_id,
+                'ema200_profit_stop_client_order_id': client_id,
+                'ema200_profit_stop_side': side,
+                'ema200_profit_stop_qty': float(qty) if qty is not None else None,
+                'ema200_profit_stop_updated_at_ns': time.time_ns(),
+            })
+            try:
+                store.transition(
+                    record.client_order_id,
+                    record.order_state,
+                    stop_order_id=order_id,
+                    metadata=metadata,
+                )
+                updated += 1
+            except Exception:
+                logger.exception(
+                    "EMA200 profit stop identity persistence failed for %s record=%s",
+                    symbol,
+                    getattr(record, 'client_order_id', None),
+                )
+        return updated
+
     def _liquidation_safety_config(self, extra=None):
         values = {}
         try:
@@ -1540,10 +1697,23 @@ class SignalProtectionMixin:
                                 else 'SAFE'
                             )
                             status['liquidation_safety_reason'] = liquidation_result.reason
-                    bot_managed_stop = bool(
-                        managed_position_state
-                        and self._is_bot_managed_protection_order(order)
+                    ema200_managed_stop = self._is_ema200_managed_profit_stop_order(
+                        symbol,
+                        pos,
+                        order,
+                        tracked_records=tracked_records,
                     )
+                    bot_managed_stop = bool(
+                        (
+                            managed_position_state
+                            and self._is_bot_managed_protection_order(order)
+                        )
+                        or ema200_managed_stop
+                    )
+                    if ema200_managed_stop:
+                        status.setdefault('ema200_managed_stop_order_ids', []).append(
+                            self._protection_order_id(order)
+                        )
                     stop_geometry = classify_stop_geometry(
                         side=pos_side,
                         stop_price=order_price,
@@ -2658,4 +2828,10 @@ class SignalProtectionMixin:
                 symbol,
                 stop_order_id=self._protection_order_id(replacement),
             )
+            if str(reason or '').startswith('EMA200 margin ROI '):
+                self._persist_ema200_profit_stop_identity(
+                    symbol,
+                    pos,
+                    replacement,
+                )
         return replacement
