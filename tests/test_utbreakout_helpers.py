@@ -4585,6 +4585,7 @@ def test_protection_audit_deduplicates_short_stop_loss_orders():
         {
             "id": "sl-old",
             "side": "buy",
+            "amount": 1,
             "type": "market",
             "timestamp": 1000,
             "info": {"origType": "STOP_MARKET", "stopPrice": "105", "reduceOnly": "true", "symbol": "BTCUSDT"},
@@ -4592,6 +4593,7 @@ def test_protection_audit_deduplicates_short_stop_loss_orders():
         {
             "id": "sl-new",
             "side": "buy",
+            "amount": 1,
             "type": "market",
             "timestamp": 2000,
             "info": {"origType": "STOP_MARKET", "stopPrice": "106", "reduceOnly": "true", "symbol": "BTCUSDT"},
@@ -4606,7 +4608,7 @@ def test_protection_audit_deduplicates_short_stop_loss_orders():
         },
     ]
     engine = _protection_engine(orders)
-    pos = {"side": "short", "contracts": 1, "entryPrice": 100}
+    pos = {"symbol": "BTC/USDT:USDT", "side": "short", "contracts": 1, "entryPrice": 100}
 
     status = asyncio.run(
         engine._audit_protection_orders("BTC/USDT", pos=pos, expected_tp=True, expected_sl=True, alert=False)

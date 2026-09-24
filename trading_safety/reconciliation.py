@@ -636,15 +636,20 @@ async def reconcile_exchange_state(
             valid_stops.append(stop)
         if enforce_liquidation_safety and liquidation_price <= 0:
             issues.append(f"liquidation_price_unavailable:{symbol}")
-        intentional_strategy_managed_no_stop = any(
-            str(record.strategy or "").strip().lower()
+        # A stale first-stage entry must never waive the stop required by a
+        # different active entry on the same symbol. Multiple live entry
+        # records make the ownership of the exchange position ambiguous, so
+        # refuse the no-stop exception until reconciliation resolves them.
+        intentional_strategy_managed_no_stop = (
+            len(tracked_entries) == 1
+            and str(tracked_entries[0].strategy or "").strip().lower()
             == "ema200_utbot_rsi_2h"
-            and str(record.order_intent or "").upper() == OrderIntent.ENTRY.value
             and bool(
-                (record.metadata or {}).get("strategy_managed_no_stop")
+                (tracked_entries[0].metadata or {}).get(
+                    "strategy_managed_no_stop"
+                )
             )
-            and not _ema200_profit_stop_lifecycle_started(record)
-            for record in records
+            and not _ema200_profit_stop_lifecycle_started(tracked_entries[0])
         )
         if not valid_stops and not intentional_strategy_managed_no_stop:
             issues.append(f"position_without_verified_stop:{symbol}")

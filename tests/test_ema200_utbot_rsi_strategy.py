@@ -2164,7 +2164,14 @@ def test_profit_stop_raises_exchange_stop_without_lowering_existing_floor():
         return True, pos
 
     async def fetch_orders(_):
-        return True, ([{'type': 'STOP_MARKET', 'stopPrice': stop['price']}]
+        return True, ([{
+            'symbol': symbol,
+            'type': 'STOP_MARKET',
+            'side': 'sell',
+            'amount': 1,
+            'reduceOnly': True,
+            'stopPrice': stop['price'],
+        }]
                       if stop['price'] is not None else [])
 
     async def replace(_symbol, _pos, price, reason):

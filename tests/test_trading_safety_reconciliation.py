@@ -582,7 +582,31 @@ def test_confirmed_profit_stop_disables_no_stop_reconciliation_exception(tmp_pat
     asyncio.run(scenario())
 
 
-def test_stronger_protection_lock_is_not_cleared_by_safe_generic_reconciliation(tmp_path):
+def test_stale_first_stage_record_cannot_exempt_newer_protected_trade(tmp_path):
+    """An old active record must not waive a newer trade's required SL."""
+    async def scenario():
+        store = SQLiteTradingStateStore(tmp_path / 'state.sqlite3')
+        store.upsert(_ema_first_stage_record('old-no-stop'))
+        store.upsert(_ema_first_stage_record(
+            'new-with-profit-stop',
+            stop_order_id='now-missing-stop',
+            metadata={'ema200_profit_stop_order_id': 'now-missing-stop'},
+        ))
+        result = await reconcile_exchange_state(
+            ReconcileExchange([_btc_long_position()], []),
+            store,
+        )
+        assert result.safe_to_trade is False
+        assert any('position_without_verified_stop' in issue for issue in result.issues)
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_stronger_protection_lock_is_not_cleared_by_safe_generic_reconciliation(tmp_path, monkeypatch):
+    # Another test may have persisted a global critical pause.  This case
+    # isolates ownership of the protection lock from that independent guard.
+    monkeypatch.setattr(emas, 'load_critical_pause_state', lambda: None)
     async def scenario():
         store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
         engine = emas.SignalEngine.__new__(emas.SignalEngine)
@@ -617,7 +641,8 @@ def test_stronger_protection_lock_is_not_cleared_by_safe_generic_reconciliation(
     asyncio.run(scenario())
 
 
-def test_startup_reconciliation_does_not_clear_pending_profit_stop_lock(tmp_path):
+def test_startup_reconciliation_does_not_clear_pending_profit_stop_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(emas, 'load_critical_pause_state', lambda: None)
     async def scenario():
         store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
         store.upsert(_ema_first_stage_record(
