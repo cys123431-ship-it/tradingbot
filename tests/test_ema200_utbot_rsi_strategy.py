@@ -4029,6 +4029,8 @@ def _ema_existing_stop_scanner_fixture(
     reduce_only,
     order_side=None,
     order_qty=1.0,
+    close_position=False,
+    include_symbol=True,
 ):
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
     symbol = 'BTC/USDT:USDT'
@@ -4044,13 +4046,15 @@ def _ema_existing_stop_scanner_fixture(
     order = {
         'id': 'existing-manual-stop',
         'clientOrderId': 'manual-stop',
-        'symbol': symbol,
         'type': 'STOP_MARKET',
         'side': order_side or ('sell' if side == 'long' else 'buy'),
         'amount': order_qty,
         'stopPrice': existing_stop,
         'reduceOnly': reduce_only,
+        'closePosition': close_position,
     }
+    if include_symbol:
+        order['symbol'] = symbol
     replacements = []
     statuses = []
 
@@ -4400,3 +4404,35 @@ def test_confirmed_pending_profit_stop_releases_only_owned_protection_lock(tmp_p
     assert store.get_runtime_state('entry_lock_reason') is None
     assert engine.crypto_entry_lock_reason is None
     store.close()
+
+
+def test_close_position_external_better_stop_preserves_floor():
+    engine, symbol, _, _, replacements, statuses = (
+        _ema_existing_stop_scanner_fixture(
+            side='long',
+            existing_stop=102.0,
+            reduce_only=False,
+            order_qty=0.0,
+            close_position=True,
+        )
+    )
+
+    asyncio.run(engine._ema200_apply_margin_profit_stop(symbol))
+
+    assert replacements == []
+    assert 'UNCHANGED_BETTER_OR_EQUAL_STOP' in statuses
+
+
+def test_missing_symbol_external_stop_is_not_protective_winner():
+    engine, symbol, _, _, replacements, _ = (
+        _ema_existing_stop_scanner_fixture(
+            side='long',
+            existing_stop=102.0,
+            reduce_only=True,
+            include_symbol=False,
+        )
+    )
+
+    asyncio.run(engine._ema200_apply_margin_profit_stop(symbol))
+
+    assert len(replacements) == 1
