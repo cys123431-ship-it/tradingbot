@@ -3334,6 +3334,9 @@ class _BinanceAlgoExchange(_FakeExchange):
                 order.setdefault("workingType", "MARK_PRICE")
                 order.setdefault("priceProtect", False)
 
+    def fetch_position_mode(self, _symbol=None):
+        return {"hedged": False}
+
     def market(self, symbol):
         return {
             "id": self._symbol_key(symbol),
