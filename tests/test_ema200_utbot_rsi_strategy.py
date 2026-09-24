@@ -4338,3 +4338,65 @@ def test_confirmed_profit_stop_turns_off_current_no_stop_exception(tmp_path):
     assert record.metadata['strategy_managed_no_stop'] is False
     assert record.metadata['ema200_first_stage_entry'] is True
     store.close()
+
+
+def test_confirmed_pending_profit_stop_releases_only_owned_protection_lock(tmp_path):
+    symbol = 'BTC/USDT:USDT'
+    store = SQLiteTradingStateStore(tmp_path / 'state.sqlite3')
+    store.upsert(OrderRecord(
+        client_order_id='entry-pending-resolved',
+        symbol=symbol,
+        side='long',
+        strategy=EMA200_UTBOT_RSI_STRATEGY,
+        signal_timestamp='1700000000',
+        requested_qty=1.0,
+        filled_qty=1.0,
+        average_fill_price=100.0,
+        order_state=OrderState.PROTECTED.value,
+        metadata={
+            'strategy_managed_no_stop': True,
+            'ema200_profit_stop_pending_client_order_id': 'pending-resolved',
+            'ema200_profit_stop_pending_side': 'long',
+            'ema200_profit_stop_pending_qty': 1.0,
+            'ema200_profit_stop_pending_trigger_price': 101.0,
+        },
+    ))
+    store.set_runtime_state(
+        'entry_lock_reason',
+        f'PENDING_PROTECTION_RECONCILIATION:{symbol}',
+    )
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.exchange = SimpleNamespace(id='fixture')
+    engine.trading_state_store = store
+    engine.crypto_entry_lock_reason = f'PENDING_PROTECTION_RECONCILIATION:{symbol}'
+    engine._position_signed_contracts = lambda pos: float(pos['contracts'])
+    pos = {
+        'symbol': symbol,
+        'side': 'long',
+        'entryPrice': 100.0,
+        'contracts': 1.0,
+    }
+    order = {
+        'id': 'resolved-stop-id',
+        'clientOrderId': 'pending-resolved',
+        'symbol': symbol,
+        'type': 'STOP_MARKET',
+        'side': 'sell',
+        'amount': 1.0,
+        'stopPrice': 101.0,
+        'reduceOnly': True,
+    }
+
+    result = asyncio.run(engine._reconcile_ema200_profit_stop_pending_identity(
+        symbol,
+        pos=pos,
+        protection_orders=[order],
+    ))
+
+    assert result['status'] == 'FOUND_CONFIRMED'
+    record = store.get('entry-pending-resolved')
+    assert 'ema200_profit_stop_pending_client_order_id' not in record.metadata
+    assert record.metadata['strategy_managed_no_stop'] is False
+    assert store.get_runtime_state('entry_lock_reason') is None
+    assert engine.crypto_entry_lock_reason is None
+    store.close()
