@@ -4186,3 +4186,155 @@ def test_filled_cancelled_stop_stale_live_position_does_not_submit_replacement()
         'PENDING_PROTECTION_RECONCILIATION' in str(value)
         for value in locks
     )
+
+
+def test_audit_malformed_position_mode_response_never_mutates_protection():
+    engine, symbol, pos, _, cancelled, locks = _binance_audit_mode_fixture(
+        hedged=None
+    )
+
+    status = asyncio.run(engine._audit_protection_orders(
+        symbol,
+        pos=pos,
+        expected_tp=False,
+        expected_sl=True,
+        alert=False,
+    ))
+
+    assert cancelled == []
+    assert status['status'] == 'POSITION_MODE_UNAVAILABLE'
+    assert any('POSITION_MODE_UNAVAILABLE' in reason for reason in locks)
+
+
+def test_filled_cancelled_stop_flat_position_does_not_submit_replacement():
+    engine, symbol, pos, submissions, locks = _cancel_confirmation_fixture(
+        lookup_behavior='filled'
+    )
+    engine._fetch_server_position_checked = lambda _symbol: asyncio.sleep(
+        0, result=(True, None)
+    )
+
+    result = asyncio.run(engine._replace_stop_loss_order(
+        symbol,
+        pos,
+        101.0,
+        reason='EMA200 margin ROI 6.00% locks 5%',
+    ))
+
+    assert result is None
+    assert submissions == []
+    assert any(
+        'PENDING_PROTECTION_RECONCILIATION' in str(value)
+        for value in locks
+    )
+
+
+def test_binanceusdm_algo_stop_submission_uses_one_way_guard_and_algo_gateway():
+    symbol = 'BTC/USDT:USDT'
+    submitted = []
+
+    class Exchange:
+        id = 'binanceusdm'
+
+        def fetch_position_mode(self, _symbol=None):
+            return {'hedged': False}
+
+        def market(self, _symbol):
+            return {'id': 'BTCUSDT'}
+
+        def fetch_open_orders(self, _symbol=None):
+            return []
+
+        def fapiPrivateGetOpenAlgoOrders(self, params):
+            return []
+
+        def fapiPrivateGetAlgoOrder(self, params):
+            raise RuntimeError('-2013 Order does not exist.')
+
+        def fapiPrivatePostAlgoOrder(self, params):
+            submitted.append(dict(params))
+            return {
+                'algoId': 'algo-usdm-1',
+                'clientAlgoId': params['clientAlgoId'],
+                'symbol': params['symbol'],
+                'orderType': params['type'],
+                'side': params['side'],
+                'quantity': str(params['quantity']),
+                'triggerPrice': str(params['triggerPrice']),
+                'reduceOnly': params['reduceOnly'],
+                'workingType': params['workingType'],
+                'algoStatus': 'NEW',
+            }
+
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.exchange = Exchange()
+    engine.is_upbit_mode = lambda: False
+    engine.last_protection_order_status = {}
+    engine.last_protection_alert_ts = {}
+    engine._set_crypto_entry_lock = lambda reason: None
+
+    order = asyncio.run(engine._create_protection_order_with_retries(
+        symbol,
+        'STOP_MARKET',
+        'sell',
+        1.0,
+        None,
+        {
+            'newClientOrderId': 'ema-usdm-stop',
+            'stopPrice': 101.0,
+            'reduceOnly': True,
+        },
+        'EMA200 SL',
+        max_attempts=1,
+        retry_delay_sec=0,
+    ))
+
+    assert order is not None
+    assert len(submitted) == 1
+    assert submitted[0]['symbol'] == 'BTCUSDT'
+    assert submitted[0]['clientAlgoId'] == 'ema-usdm-stop'
+    assert submitted[0]['reduceOnly'] == 'true'
+
+
+def test_confirmed_profit_stop_turns_off_current_no_stop_exception(tmp_path):
+    symbol = 'BTC/USDT:USDT'
+    store = SQLiteTradingStateStore(tmp_path / 'state.sqlite3')
+    store.upsert(OrderRecord(
+        client_order_id='ema-first-stage-confirm',
+        symbol=symbol,
+        side='long',
+        strategy=EMA200_UTBOT_RSI_STRATEGY,
+        signal_timestamp='1700000000',
+        requested_qty=1.0,
+        filled_qty=1.0,
+        average_fill_price=100.0,
+        order_state=OrderState.PROTECTED.value,
+        metadata={'strategy_managed_no_stop': True},
+    ))
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.trading_state_store = store
+    engine._position_signed_contracts = lambda pos: float(pos['contracts'])
+    pos = {
+        'symbol': symbol,
+        'side': 'long',
+        'entryPrice': 100.0,
+        'contracts': 1.0,
+    }
+    order = {
+        'id': 'profit-stop-confirmed',
+        'clientOrderId': 'profit-stop-client',
+        'symbol': symbol,
+        'type': 'STOP_MARKET',
+        'side': 'sell',
+        'amount': 1.0,
+        'stopPrice': 101.0,
+        'reduceOnly': True,
+    }
+
+    assert engine._persist_ema200_profit_stop_identity(symbol, pos, order) == 1
+
+    record = store.get('ema-first-stage-confirm')
+    assert record.stop_order_id == 'profit-stop-confirmed'
+    assert record.metadata['strategy_managed_no_stop'] is False
+    assert record.metadata['ema200_first_stage_entry'] is True
+    store.close()
