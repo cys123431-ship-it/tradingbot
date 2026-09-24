@@ -315,12 +315,70 @@ class SignalRuntimeMixin:
             getattr(self, 'crypto_entry_lock_reason', None),
             persisted,
         ):
-            if not self._reconciliation_owned_crypto_entry_lock(
+            if self._reconciliation_owned_crypto_entry_lock(
                 reason,
                 user_stream_ready=user_stream_ready,
             ):
-                return str(reason)
+                continue
+            text = str(reason or '').strip()
+            # Generic reconciliation is authoritative for durable entry-order
+            # states.  It may release these locks only after the referenced
+            # state has actually moved out of the unsafe lifecycle.
+            for prefix, unsafe_states in (
+                (
+                    'SUBMITTED_UNKNOWN:',
+                    {'SUBMITTED_UNKNOWN'},
+                ),
+                (
+                    'FILLED_UNPROTECTED:',
+                    {'FILLED_UNPROTECTED'},
+                ),
+                (
+                    'FILLED_UNVERIFIED_LIQUIDATION:',
+                    {'FILLED_UNVERIFIED_LIQUIDATION'},
+                ),
+            ):
+                if not text.startswith(prefix):
+                    continue
+                client_order_id = text[len(prefix):].strip()
+                record = (
+                    store.get(client_order_id)
+                    if store is not None and client_order_id
+                    else None
+                )
+                if (
+                    record is not None
+                    and str(record.order_state or '').upper() in unsafe_states
+                ):
+                    return text
+                break
+            else:
+                return text
         return None
+
+    def _clear_crypto_entry_lock_if_owned(self, *prefixes):
+        store = getattr(self, 'trading_state_store', None)
+        persisted = (
+            store.get_runtime_state('entry_lock_reason')
+            if store is not None
+            else None
+        )
+        reason = str(persisted or getattr(
+            self,
+            'crypto_entry_lock_reason',
+            None,
+        ) or '').strip()
+        normalized = tuple(
+            str(prefix or '').strip()
+            for prefix in prefixes
+            if str(prefix or '').strip()
+        )
+        if not reason or not normalized:
+            return False
+        if not any(reason.startswith(prefix) for prefix in normalized):
+            return False
+        self._set_crypto_entry_lock(None)
+        return True
 
     async def _reconcile_crypto_exchange_state(
         self,
