@@ -1800,7 +1800,7 @@ def _cancel_confirmation_fixture(*, lookup_behavior):
                     'reduceOnly': 'true',
                     'algoStatus': 'NEW',
                 }
-            if lookup_behavior == 'terminal':
+            if lookup_behavior in {'terminal', 'filled'}:
                 return {
                     'algoId': '9001',
                     'clientAlgoId': 'existing-client',
@@ -1810,7 +1810,7 @@ def _cancel_confirmation_fixture(*, lookup_behavior):
                     'quantity': '1',
                     'triggerPrice': '100.5',
                     'reduceOnly': 'true',
-                    'algoStatus': 'CANCELED',
+                    'algoStatus': 'FILLED' if lookup_behavior == 'filled' else 'CANCELED',
                 }
             raise AssertionError(lookup_behavior)
 
@@ -4020,3 +4020,169 @@ def test_telegram_daily_input_raises_weekly_limit_to_preserve_valid_ordering():
             6.0,
         ),
     ]
+
+
+def _ema_existing_stop_scanner_fixture(
+    *,
+    side,
+    existing_stop,
+    reduce_only,
+    order_side=None,
+    order_qty=1.0,
+):
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = 'BTC/USDT:USDT'
+    pos = {
+        'symbol': symbol,
+        'side': side,
+        'entryPrice': 100.0,
+        'markPrice': 101.2 if side == 'long' else 98.8,
+        'contracts': 1.0,
+        'leverage': 5.0,
+        'info': {},
+    }
+    order = {
+        'id': 'existing-manual-stop',
+        'clientOrderId': 'manual-stop',
+        'symbol': symbol,
+        'type': 'STOP_MARKET',
+        'side': order_side or ('sell' if side == 'long' else 'buy'),
+        'amount': order_qty,
+        'stopPrice': existing_stop,
+        'reduceOnly': reduce_only,
+    }
+    replacements = []
+    statuses = []
+
+    engine._position_entry_strategy = lambda _symbol: EMA200_UTBOT_RSI_STRATEGY
+    engine._fetch_server_position_checked = lambda _symbol: asyncio.sleep(
+        0, result=(True, dict(pos))
+    )
+    engine._ema200_resolve_position_leverage = lambda _symbol, _pos: asyncio.sleep(
+        0, result=(5.0, 'fixture', None, None)
+    )
+    engine._collect_protection_orders_checked = lambda _symbol: asyncio.sleep(
+        0, result=(True, [dict(order)])
+    )
+    engine.safe_price = lambda _symbol, price: float(price)
+    engine._set_ema200_profit_stop_status = (
+        lambda _symbol, status, **kwargs: statuses.append(status)
+    )
+
+    async def replace(_symbol, _pos, stop_price, reason=''):
+        replacement = {
+            'id': 'ema-managed-replacement',
+            'clientOrderId': 'ema-managed-replacement-client',
+            'symbol': _symbol,
+            'type': 'STOP_MARKET',
+            'side': 'sell' if side == 'long' else 'buy',
+            'amount': 1.0,
+            'stopPrice': float(stop_price),
+            'reduceOnly': True,
+        }
+        replacements.append(replacement)
+        return replacement
+
+    engine._replace_stop_loss_order = replace
+    engine._audit_protection_orders = lambda *args, **kwargs: asyncio.sleep(
+        0, result={'status': 'OK', 'sl_present': True}
+    )
+    return engine, symbol, pos, order, replacements, statuses
+
+
+def test_non_reduce_only_manual_stop_does_not_block_ema_profit_stop():
+    engine, symbol, _, _, replacements, statuses = (
+        _ema_existing_stop_scanner_fixture(
+            side='long',
+            existing_stop=102.0,
+            reduce_only=False,
+        )
+    )
+
+    asyncio.run(engine._ema200_apply_margin_profit_stop(symbol))
+
+    assert len(replacements) == 1
+    assert 'UNCHANGED_BETTER_OR_EQUAL_STOP' not in statuses
+
+
+def test_non_reduce_only_manual_short_stop_does_not_block_ema_profit_stop():
+    engine, symbol, _, _, replacements, statuses = (
+        _ema_existing_stop_scanner_fixture(
+            side='short',
+            existing_stop=98.0,
+            reduce_only=False,
+        )
+    )
+
+    asyncio.run(engine._ema200_apply_margin_profit_stop(symbol))
+
+    assert len(replacements) == 1
+    assert 'UNCHANGED_BETTER_OR_EQUAL_STOP' not in statuses
+
+
+def test_reduce_only_external_better_stop_preserves_floor():
+    engine, symbol, _, _, replacements, statuses = (
+        _ema_existing_stop_scanner_fixture(
+            side='long',
+            existing_stop=102.0,
+            reduce_only=True,
+        )
+    )
+
+    asyncio.run(engine._ema200_apply_margin_profit_stop(symbol))
+
+    assert replacements == []
+    assert 'UNCHANGED_BETTER_OR_EQUAL_STOP' in statuses
+
+
+def test_wrong_qty_external_stop_is_not_protective_winner():
+    engine, symbol, _, _, replacements, _ = (
+        _ema_existing_stop_scanner_fixture(
+            side='long',
+            existing_stop=102.0,
+            reduce_only=True,
+            order_qty=2.0,
+        )
+    )
+
+    asyncio.run(engine._ema200_apply_margin_profit_stop(symbol))
+
+    assert len(replacements) == 1
+
+
+def test_wrong_side_external_stop_is_not_protective_winner():
+    engine, symbol, _, _, replacements, _ = (
+        _ema_existing_stop_scanner_fixture(
+            side='long',
+            existing_stop=102.0,
+            reduce_only=True,
+            order_side='buy',
+        )
+    )
+
+    asyncio.run(engine._ema200_apply_margin_profit_stop(symbol))
+
+    assert len(replacements) == 1
+
+
+def test_filled_cancelled_stop_stale_live_position_does_not_submit_replacement():
+    engine, symbol, pos, submissions, locks = _cancel_confirmation_fixture(
+        lookup_behavior='filled'
+    )
+    engine._fetch_server_position_checked = lambda _symbol: asyncio.sleep(
+        0, result=(True, dict(pos))
+    )
+
+    result = asyncio.run(engine._replace_stop_loss_order(
+        symbol,
+        pos,
+        101.0,
+        reason='EMA200 margin ROI 6.00% locks 5%',
+    ))
+
+    assert result is None
+    assert submissions == []
+    assert any(
+        'PENDING_PROTECTION_RECONCILIATION' in str(value)
+        for value in locks
+    )
