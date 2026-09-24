@@ -29,9 +29,12 @@ class SignalProtectionMixin:
             for value in (
                 order.get('reduceOnly'),
                 order.get('reduce_only'),
+                order.get('closePosition'),
+                order.get('close_position'),
                 info.get('reduceOnly'),
                 info.get('reduce_only'),
-                info.get('closePosition')
+                info.get('closePosition'),
+                info.get('close_position')
             )
         )
 
@@ -77,9 +80,13 @@ class SignalProtectionMixin:
             return False
         return None
 
+    def _is_binance_usdm_exchange(self):
+        return str(
+            getattr(self.exchange, 'id', '') or ''
+        ).strip().lower() in {'binance', 'binanceusdm'}
+
     async def _binance_position_mode_status(self, symbol=None):
-        exchange_id = str(getattr(self.exchange, 'id', '') or '').strip().lower()
-        if exchange_id not in {'binance', 'binanceusdm'}:
+        if not self._is_binance_usdm_exchange():
             return {
                 'ok': True,
                 'status': 'NOT_BINANCE',
@@ -210,8 +217,19 @@ class SignalProtectionMixin:
         except (TypeError, ValueError):
             current_qty = 0.0
         compatible = []
+        position_symbol = str((pos or {}).get('symbol') or '').strip()
         for order in orders or []:
             if self._classify_protection_order(order) != 'sl':
+                continue
+            if not self._is_reduce_only_order(order):
+                continue
+            if (
+                position_symbol
+                and not self._protection_order_matches_symbol(
+                    order,
+                    position_symbol,
+                )
+            ):
                 continue
             order_side = self._protection_order_side(order)
             if order_side and order_side != close_side:
@@ -585,9 +603,16 @@ class SignalProtectionMixin:
         client_id = str(self._protection_client_order_id(order) or '').strip() or None
         side = self._managed_position_side((pos or {}).get('side'))
         qty = self._protection_order_amount(order)
+        existing_metadata = dict(getattr(record, 'metadata', {}) or {})
+        first_stage_origin = bool(
+            existing_metadata.get('ema200_first_stage_entry')
+            or existing_metadata.get('strategy_managed_no_stop')
+        )
         self._update_ema200_record_metadata(
             record,
             updates={
+                'strategy_managed_no_stop': False,
+                'ema200_first_stage_entry': first_stage_origin,
                 'ema200_profit_stop_order_id': order_id,
                 'ema200_profit_stop_client_order_id': client_id,
                 'ema200_profit_stop_side': side,
@@ -625,15 +650,14 @@ class SignalProtectionMixin:
         if not selected:
             return {'status': 'CONFIRMED_ABSENT', 'orders': []}
 
-        exchange_id = str(getattr(self.exchange, 'id', '') or '').lower()
-        if exchange_id not in {'binance', 'binanceusdm'}:
+        if not self._is_binance_usdm_exchange():
             return {
                 'status': 'UNKNOWN',
                 'reason': 'no authoritative post-cancel lookup for exchange',
             }
 
         gateway = BinanceAlgoOrderGateway(self.exchange)
-        terminal = {'CANCELED', 'CANCELLED', 'EXPIRED', 'FILLED', 'REJECTED'}
+        terminal = {'CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'}
         outcomes = []
         for order in selected:
             client_id = str(
@@ -659,6 +683,17 @@ class SignalProtectionMixin:
                 continue
             found = lookup.order or {}
             found_status = self._protection_order_terminal_status(found)
+            if found_status == 'FILLED':
+                return {
+                    'status': 'FOUND_FILLED',
+                    'client_order_id': client_id,
+                    'order': found,
+                    'order_status': found_status,
+                    'reason': (
+                        'cancelled stop reports FILLED; position close/trigger '
+                        'must be reconciled before replacement'
+                    ),
+                }
             if found_status in terminal:
                 outcomes.append({
                     'client_order_id': client_id,
@@ -716,7 +751,7 @@ class SignalProtectionMixin:
         outcomes = []
         gateway = (
             BinanceAlgoOrderGateway(self.exchange)
-            if str(getattr(self.exchange, 'id', '') or '').lower() == 'binance'
+            if self._is_binance_usdm_exchange()
             else None
         )
         for record in pending_records:
@@ -1232,7 +1267,7 @@ class SignalProtectionMixin:
         seen = set()
         regular_fetch_ok = False
         errors = []
-        is_binance = str(getattr(self.exchange, 'id', '') or '').lower() in {'binance', 'binanceusdm'}
+        is_binance = self._is_binance_usdm_exchange()
         for scope in (symbol, None):
             open_orders = await self._fetch_open_orders_safe(scope)
             if open_orders is None:
@@ -2154,8 +2189,7 @@ class SignalProtectionMixin:
             )
             return status
 
-        exchange_id = str(getattr(self.exchange, 'id', '') or '').lower()
-        if exchange_id in {'binance', 'binanceusdm'}:
+        if self._is_binance_usdm_exchange():
             mode = await self._require_binance_one_way_mode(
                 symbol,
                 operation='protection audit',
@@ -2312,7 +2346,7 @@ class SignalProtectionMixin:
         liquidation_unsafe_orders = []
         liquidation_safety_results = []
         enforce_liquidation_safety = (
-            str(getattr(self.exchange, 'id', '') or '').lower() == 'binance'
+            self._is_binance_usdm_exchange()
             or _safe_float_or_none(pos.get('liquidationPrice') or pos.get('liquidation_price')) is not None
         )
         for order in protection_orders:
@@ -2803,7 +2837,7 @@ class SignalProtectionMixin:
             'TAKE_PROFIT_MARKET': 'TAKE_PROFIT_MARKET',
         }.get(canonical_type, canonical_type)
         is_binance_algo = (
-            str(getattr(self.exchange, 'id', '') or '').lower() == 'binance'
+            self._is_binance_usdm_exchange()
             and canonical_type in CONDITIONAL_TYPES
         )
         algo_gateway = BinanceAlgoOrderGateway(self.exchange) if is_binance_algo else None
@@ -3180,7 +3214,7 @@ class SignalProtectionMixin:
             return None
         sl_side = 'sell' if side == 'long' else 'buy'
         safe_stop = self.safe_price(symbol, float(stop_price))
-        is_binance = str(getattr(self.exchange, 'id', '') or '').lower() == 'binance'
+        is_binance = self._is_binance_usdm_exchange()
         if is_binance:
             mode = await self._require_binance_one_way_mode(
                 symbol,
