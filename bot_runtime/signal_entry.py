@@ -1059,6 +1059,7 @@ class SignalEntryMixin:
                     'strategy': EMA200_UTBOT_RSI_STRATEGY,
                     'timeframe': '2h',
                     'entry_timeframe': '2h',
+                    'exit_timeframe': ema200_risk_cfg['exit_timeframe'],
                     'leverage': lev,
                     'ema200_small_account_mode': bool(
                         ema200_risk_plan['small_account_mode']
@@ -2245,7 +2246,8 @@ class SignalEntryMixin:
                         f"HA {'ON' if ema200_risk_cfg['utbot_use_heikin_ashi'] else 'OFF'}\n"
                         f"🛟 비상 손절 가격거리: 진입가 대비 {emergency_pct:.2f}% "
                         f"({emergency_label})\n"
-                        "정상 청산: 완료된 2시간봉 UT Bot 반대 신호"
+                        f"정상 청산: 완료된 {ema200_risk_cfg['exit_timeframe']}봉 UT Bot 반대 신호\n"
+                        "수익 보호: 증거금 수익률 5% 초과부터 5%p 계단형 Stop"
                     )
                 else:
                     entry_notice = (
@@ -2254,7 +2256,8 @@ class SignalEntryMixin:
                         f"ATR {int(ema200_risk_cfg['utbot_atr_period'])} / "
                         f"HA {'ON' if ema200_risk_cfg['utbot_use_heikin_ashi'] else 'OFF'}\n"
                         "⚠️ 첫 단계: 거래소 Stop 없음 / "
-                        "완료된 2시간봉 UT Bot 반대 신호로만 청산\n"
+                        f"완료된 {ema200_risk_cfg['exit_timeframe']}봉 UT Bot 반대 신호로 청산\n"
+                        "수익 보호: 증거금 수익률 5% 초과부터 5%p 계단형 Stop\n"
                         "청산가 도달 전 별도 손절이 없는 고위험 단계"
                     )
 

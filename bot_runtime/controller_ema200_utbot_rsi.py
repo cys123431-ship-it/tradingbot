@@ -77,6 +77,17 @@ class ControllerEMA200UTBotRSIMixin:
                 ),
             ],
             [
+                InlineKeyboardButton(
+                    f"{'✅ ' if cfg['exit_timeframe'] == tf else ''}청산 {tf}",
+                    callback_data=f"e2h:exit_tf:{tf}",
+                )
+                for tf in ("15m", "30m", "1h")
+            ],
+            [
+                InlineKeyboardButton("📈 수익 스탑 설명", callback_data="e2h:help:profit_stop"),
+                InlineKeyboardButton("❓ 청산봉 설명", callback_data="e2h:help:exit_tf"),
+            ],
+            [
                 InlineKeyboardButton("위험 0.25%", callback_data="e2h:risk:0.25"),
                 InlineKeyboardButton("위험 0.50%", callback_data="e2h:risk:0.50"),
                 InlineKeyboardButton("위험 1.00%", callback_data="e2h:risk:1.00"),
@@ -162,7 +173,7 @@ class ControllerEMA200UTBotRSIMixin:
 
         if plan.get("small_account_mode"):
             protection = (
-                "비상 손절 없음 / UT 반대 신호로만 청산"
+                "초기 비상 손절 없음 / 선택한 UT 청산봉 + 수익 계단 스탑"
                 if not plan.get("emergency_stop_required")
                 else (
                     f"진입가 대비 {float(cfg['emergency_exit_percent']):.2f}% 비상 손절 / "
@@ -248,10 +259,10 @@ class ControllerEMA200UTBotRSIMixin:
         )
         next_margin_percent = ema200_small_account_margin_percent(loss_streak)
         stage_exit = (
-            "UT 반대 신호만(Stop 없음)"
+            "초기 비상 Stop 없음 / 수익 계단 스탑은 수익 발생 후 적용"
             if loss_streak == 0
             else (
-                "UT 반대 신호 + 비상 Stop "
+                "UT 반대 신호 + 비상 Stop + 수익 계단 스탑 "
                 f"(진입가 대비 {cfg['emergency_exit_percent']:.2f}%)"
             )
         )
@@ -321,13 +332,17 @@ class ControllerEMA200UTBotRSIMixin:
                     f"/ 점수 {float(selected.get('score') or 0):.2f}"
                 )
             for candidate in (selection_state.get("candidates") or [])[:3]:
+                ut_biases = candidate.get('auxiliary_ut_biases') or {}
+                bonus = (candidate.get('score_breakdown') or {}).get('auxiliary_ut', 0)
                 selection_lines.append(
                     f"• {int(candidate.get('rank') or 0)}위 "
                     f"{candidate.get('symbol')} "
                     f"{str(candidate.get('side') or '').upper()} "
                     f"{float(candidate.get('score') or 0):.2f}점 "
                     f"(UT {float(candidate.get('ut_age_bars') or 0):.1f}봉 전, "
-                    f"RSIΔ {float(candidate.get('rsi_momentum') or 0):.2f})"
+                    f"RSIΔ {float(candidate.get('rsi_momentum') or 0):.2f}, "
+                    f"보조UT {ut_biases.get('15m', '?')}/{ut_biases.get('30m', '?')}/"
+                    f"{ut_biases.get('1h', '?')} {float(bonus or 0):+g}점)"
                 )
             selection_text = "\n".join(selection_lines)
 
@@ -336,7 +351,8 @@ class ControllerEMA200UTBotRSIMixin:
             f"전략 선택: {'✅ ACTIVE' if active else '⬜ 미선택'}\n"
             f"신규 진입: {'ON' if cfg['enabled'] else 'OFF'}\n"
             f"최적 후보 선택: {candidate_status}\n"
-            "시간봉: 2시간 완료봉 고정\n"
+            f"진입 시간봉: 2시간 완료봉 고정 / UT 정상청산: 완료된 {cfg['exit_timeframe']}봉\n"
+            "수익 보호: 증거금 수익률 5% 초과부터 5%p 계단형 거래소 Stop\n"
             f"스캔 종목: {', '.join(EMA200_BINANCE_TOP10_BASES)} (고정 10개)\n"
             "추세: 종가 > EMA200=롱 허용 / 종가 < EMA200=숏 허용\n"
             f"RSI: {cfg['rsi_length']}기간, LONG=50 위 상승 / SHORT=50 아래 하락\n\n"
@@ -361,19 +377,40 @@ class ControllerEMA200UTBotRSIMixin:
             f"{condition_text}\n\n"
             f"{selection_text}\n\n"
             "중요: 소액계좌의 연속손실 0회 단계는 비상 Stop 없이 "
-            "UT Bot 반대 신호로만 청산됩니다. 첫 손실 뒤 다음 진입부터 "
+            "선택한 UT Bot 반대 신호로 청산하며, 수익률 5% 초과 시에는 수익 보호 Stop을 추가합니다. 첫 손실 뒤 다음 진입부터 "
             "포지션이 축소되고 비상 Stop이 적용됩니다."
         )
 
     @staticmethod
     def _ema200_utbot_rsi_help_text(kind):
+        if kind == "exit_tf":
+            return (
+                "📘 UT 청산 시간봉: 15분·30분·1시간 중 하나를 고릅니다. "
+                "고른 시간봉의 완료봉에서 LONG은 새 UT Sell, SHORT는 새 UT Buy가 발생하면 "
+                "다른 청산 필터와 무관하게 종료합니다. 진입 판단은 계속 완료된 2시간봉입니다. "
+                "설정 변경은 현재 보유 포지션에도 다음 평가부터 적용됩니다."
+            )
+        if kind == "profit_stop":
+            return (
+                "📈 증거금 수익률 수익 보호: 미실현 수익률이 5%를 '초과'하면 "
+                "증거금의 정확히 +5% 수익선에 거래소 Stop을 설치합니다. "
+                "10% 초과 시 +10%, 15% 초과 시 +15%처럼 5%p마다 올리며, "
+                "한 번 올린 Stop은 내리지 않습니다. 예: 계좌 100 USDT, "
+                "증거금 50 USDT, 5x라면 수익률 6%에서 약 +2.5 USDT 손익선 "
+                "(롱 진입가격의 약 +1%)에 Stop을 둡니다. "
+                "수수료·슬리피지 때문에 실제 체결 수익은 더 적을 수 있습니다. "
+                "UT 반대 신호 청산과 별도로 먼저 발생한 것이 포지션을 종료합니다. "
+                "첫 거래의 초기 손실 Stop 유무 및 연속손실 단계는 기존 규칙을 따릅니다."
+            )
         if kind == "candidate":
             return (
                 "📘 최적 후보 선택이란?\n\n"
                 "ON이면 고정 10개 종목을 동일한 완료 2시간봉 기준으로 모두 평가한 뒤, "
                 "EMA200·UT Bot·RSI 진입 조건을 이미 통과한 후보들만 서로 비교합니다.\n\n"
                 "점수는 최근 UT 신호, RSI 진행 강도, 진입 방향의 EMA200 기울기, "
-                "최근 24시간 거래대금에 가점을 주고 EMA200에서 3ATR보다 지나치게 "
+                "최근 24시간 거래대금에 가점을 주고, 완료된 15분·30분·1시간봉의 "
+                "UT 상태가 진입 방향과 일치하면 보조 가점(반대면 감점)을 줍니다. "
+                "EMA200에서 3ATR보다 지나치게 "
                 "멀어진 후보에는 추격진입 감점을 줍니다. 점수는 후보의 순서만 정하며 "
                 "원래 진입 조건을 새로 만들거나 우회하지 않습니다.\n\n"
                 "예시) BTC와 DOGE가 같은 2시간봉에서 모두 LONG 조건을 충족했을 때, "
@@ -412,8 +449,8 @@ class ControllerEMA200UTBotRSIMixin:
                 "가격 변동 거리입니다. LONG 100 진입·5%라면 약 95, SHORT 100 진입·5%라면 "
                 "약 105가 최후 안전선입니다.\n\n"
                 "정상 청산 규칙은 그대로입니다.\n"
-                "• LONG: 2시간봉 UT Bot Sell 신호에서 정상 청산\n"
-                "• SHORT: 2시간봉 UT Bot Buy 신호에서 정상 청산\n\n"
+                "• LONG: 선택한 청산봉의 UT Bot Sell 신호에서 정상 청산\n"
+                "• SHORT: 선택한 청산봉의 UT Bot Buy 신호에서 정상 청산\n\n"
                 "계좌 equity 1,000 USDT 이하이고 EMA200 연속손실이 0회인 첫 단계에는 "
                 "사용자 선택에 따라 거래소 Stop을 설치하지 않고 UT 반대 신호만 기다립니다. "
                 "첫 손실 뒤 다음 진입부터 이 비상탈출 Stop이 적용됩니다. "
@@ -478,17 +515,17 @@ class ControllerEMA200UTBotRSIMixin:
         return (
             "📘 전략 동작 순서\n\n"
             "LONG: 2시간 완료봉 종가가 EMA200 위 → UT Bot Buy 발생 → 그 LONG 상태가 유지되는 동안 "
-            "현재 RSI가 50보다 높고 직전 완료봉보다 상승 → 진입. 이후 UT Bot Sell이 발생하면 정상 청산합니다.\n\n"
+            "현재 RSI가 50보다 높고 직전 완료봉보다 상승 → 진입. 이후 선택한 청산봉에서 UT Bot Sell이 발생하면 정상 청산합니다.\n\n"
             "SHORT: 정확히 반대입니다. EMA200 아래 → UT Bot Sell → SHORT 상태 유지 중 RSI가 50보다 낮고 하락 "
-            "→ 진입. 이후 UT Bot Buy에서 정상 청산합니다.\n\n"
+            "→ 진입. 이후 선택한 청산봉에서 UT Bot Buy가 발생하면 정상 청산합니다.\n\n"
             "UT 신호는 현재 RSI 평가봉보다 먼저 확정되어야 하며, 같은 봉 신호는 인정하지 않습니다. "
-            "완료된 2시간봉만 사용해 진행 중 봉의 흔들림으로 인한 가짜 돌파를 피합니다.\n\n"
+            "진입은 완료된 2시간봉만 사용하고, 청산은 선택한 시간봉의 완료봉만 사용합니다.\n\n"
             "이 전략의 UT Bot은 Key 1.0 / ATR 10 / 일반 캔들(HA OFF)로 고정되며, "
             "다른 /utbot 전략의 설정을 변경해도 영향을 받지 않습니다.\n\n"
             f"스캔 대상은 {', '.join(EMA200_BINANCE_TOP10_BASES)} 고정 10개이며, "
             "그 밖의 종목은 다른 경로에서 신호가 들어와도 진입 단계에서 차단합니다.\n\n"
             "소액계좌(1,000 USDT 이하)는 첫 단계에서 equity의 50%를 증거금으로 5x 진입하고 "
-            "UT 반대 신호로만 청산합니다. 손실 후 다음 진입은 증거금 비율을 "
+            "초기 손실 Stop 없이 선택한 UT 반대 신호로 청산하고, 수익 5% 초과부터 수익 Stop을 추가합니다. 손실 후 다음 진입은 증거금 비율을 "
             "35%→25%→15%→10%로 줄이고 비상 Stop을 적용합니다. 수익 또는 본전 청산 시 "
             "연속손실 단계가 초기화됩니다. 일·주 손실한도는 별도의 신규진입 차단 장치입니다."
         )
@@ -593,6 +630,20 @@ class ControllerEMA200UTBotRSIMixin:
                         )
                     )
                     + "\n이미 열린 포지션의 청산·보호 방식은 변경되지 않습니다.",
+                    reply_markup=self._build_ema200_utbot_rsi_keyboard(),
+                )
+                return
+
+            if action == "exit_tf" and len(parts) > 2:
+                from .ema200_utbot_rsi import EMA200_EXIT_TIMEFRAMES
+                selected_tf = parts[2]
+                if selected_tf not in EMA200_EXIT_TIMEFRAMES:
+                    return
+                await self._update_ema200_utbot_rsi_value("exit_timeframe", selected_tf)
+                await query.edit_message_text(
+                    f"✅ UT 반대 신호 청산: 완료된 {selected_tf}봉. "
+                    "현재 포지션에도 다음 평가부터 적용됩니다. "
+                    "2시간봉 진입 조건과 수익 계단 스탑은 유지됩니다.",
                     reply_markup=self._build_ema200_utbot_rsi_keyboard(),
                 )
                 return

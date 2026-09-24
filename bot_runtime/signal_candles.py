@@ -1,6 +1,7 @@
 """Candle processing, strategy dispatch, and execution confirmation."""
 
 from __future__ import annotations
+from datetime import datetime, timezone
 
 from .ema200_utbot_rsi import (
     EMA200_UTBOT_RSI_DISPLAY_NAME,
@@ -2469,6 +2470,23 @@ class SignalCandleMixin:
                 )
                 should_exit_long = current_side.lower() == 'long' and ut_sig == 'short'
                 should_exit_short = current_side.lower() == 'short' and ut_sig == 'long'
+                # On restart or after switching the exit timeframe, a fresh
+                # signal on the last closed candle may predate this position.
+                # Do not close a newer position for a historical UT flip.
+                if should_exit_long or should_exit_short:
+                    try:
+                        trade = self.db.get_latest_open_trade(symbol) or {}
+                        entry_text = trade.get('entry_time')
+                        if entry_text and tf in {'15m', '30m', '1h'}:
+                            entry_dt = datetime.fromisoformat(str(entry_text))
+                            if entry_dt.tzinfo is None:
+                                entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+                            bar_ms = {'15m': 900000, '30m': 1800000, '1h': 3600000}[tf]
+                            closed_at_ms = int(df.iloc[-2]['timestamp']) + bar_ms
+                            if closed_at_ms <= entry_dt.timestamp() * 1000:
+                                should_exit_long = should_exit_short = False
+                    except (AttributeError, ValueError, TypeError, KeyError):
+                        logger.warning('EMA200 exit entry-time check unavailable for %s', symbol)
                 if should_exit_long or should_exit_short:
                     opposite_label = 'SELL' if should_exit_long else 'BUY'
                     self._update_stateful_diag(
@@ -2478,9 +2496,9 @@ class SignalCandleMixin:
                         raw_state=(ut_detail.get('bias_side') or 'none'),
                         raw_signal=(ut_sig or 'none'),
                         pos_side=current_side.upper(),
-                        exit_reason_text=f'UT Bot {opposite_label} fresh signal on completed 2h candle',
+                        exit_reason_text=f'UT Bot {opposite_label} fresh signal on completed {tf} candle',
                         exit_trigger_kind='ut_opposite_fresh_signal',
-                        exit_tf='2h',
+                        exit_tf=tf,
                     )
                     await self.exit_position(
                         symbol,

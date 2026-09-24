@@ -10,6 +10,7 @@ from .ema200_candidate_selector import (
     build_ema200_candidate,
     rank_ema200_candidates,
 )
+from .ema200_profit_stop import ema200_profit_stop_target
 
 from utbreakout.adaptive_breakout_trend import (
     ADAPTIVE_BREAKOUT_TREND_STRATEGY,
@@ -47,6 +48,77 @@ from .diagnostics import _safe_float_or_none
 
 
 class SignalScannerMixin:
+    async def _ema200_apply_margin_profit_stop(self, symbol):
+        """Rachet only a bot-owned EMA200 position's exchange stop."""
+        if self._position_entry_strategy(symbol) != EMA200_UTBOT_RSI_STRATEGY:
+            return
+        fetch_ok, pos = await self._fetch_server_position_checked(symbol)
+        if not fetch_ok or not pos:
+            return
+        info = pos.get('info') if isinstance(pos.get('info'), dict) else {}
+        target = ema200_profit_stop_target(
+            str(pos.get('side') or '').lower(),
+            pos.get('entryPrice'),
+            pos.get('markPrice') or pos.get('mark_price') or info.get('markPrice'),
+            pos.get('leverage') or info.get('leverage'),
+        )
+        if target is None:
+            return
+        roi, locked_roi, stop_price = target
+        previous_stop = []
+        try:
+            safe_stop = float(self.safe_price(symbol, stop_price))
+            fetch_ok, orders = await self._collect_protection_orders_checked(symbol)
+            if not fetch_ok:
+                logger.warning("EMA200 profit stop delayed: protection snapshot unavailable %s", symbol)
+                return
+            stops = [
+                order for order in orders
+                if self._classify_protection_order(order) == 'sl'
+            ]
+            previous_stop = [
+                float(value)
+                for order in stops
+                if (value := self._protection_trigger_price(order)) is not None
+            ]
+            side = str(pos.get('side') or '').lower()
+            if previous_stop and (
+                max(previous_stop) >= safe_stop if side == 'long'
+                else min(previous_stop) <= safe_stop
+            ):
+                return
+            order = await self._replace_stop_loss_order(
+                symbol, pos, safe_stop,
+                reason=f'EMA200 margin ROI {roi:.2f}% locks {locked_roi:.0f}%',
+            )
+            if order:
+                logger.info(
+                    "EMA200 profit stop %s ROI=%.2f%% lock=%.0f%% stop=%.12f",
+                    symbol, roi, locked_roi, safe_stop,
+                )
+                await self._audit_protection_orders(
+                    symbol, pos=pos, expected_tp=False, expected_sl=True,
+                )
+        except Exception:
+            logger.exception("EMA200 profit stop update failed for %s", symbol)
+            # A replacement can throw after cancelling the previous SL. If so,
+            # use the existing fail-closed protection path, never leave an
+            # originally protected position unprotected after an exception.
+            if previous_stop:
+                try:
+                    ok, remaining = await self._collect_protection_orders_checked(symbol)
+                    if not ok or not any(
+                        self._classify_protection_order(item) == 'sl'
+                        for item in remaining
+                    ):
+                        await self._fail_closed_unprotected_position(
+                            symbol, reason='EMA200 profit stop replacement failed',
+                            status_code='EMA200_PROFIT_STOP_REPLACE_FAILED',
+                            expected_tp=False, emergency_close=True,
+                        )
+                except Exception:
+                    logger.exception("EMA200 profit stop recovery failed for %s", symbol)
+
     @staticmethod
     def _ema200_candidate_status_item(candidate):
         """Return the bounded, Telegram-safe part of a ranking candidate."""
@@ -64,6 +136,7 @@ class SignalScannerMixin:
                 'extension_atr',
                 'score',
                 'score_breakdown',
+                'auxiliary_ut_biases',
                 'rank',
                 'candidate_count',
             )
@@ -139,6 +212,37 @@ class SignalScannerMixin:
             self.last_candle_time[symbol] = closed_candle_ts
         self.last_candle_success[symbol] = True
         return True
+
+    async def _ema200_auxiliary_ut_biases(self, symbol, strategy_params):
+        """Read only closed lower-timeframe candles; failed bonus data is neutral."""
+        biases = {}
+        for timeframe in ('15m', '30m', '1h'):
+            try:
+                rows = await asyncio.to_thread(
+                    self.market_data_exchange.fetch_ohlcv,
+                    symbol,
+                    timeframe,
+                    limit=250,
+                )
+                if not rows or len(rows) < 22:
+                    continue
+                df = pd.DataFrame(
+                    rows,
+                    columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'],
+                )
+                _, _, detail = self._calculate_utbot_signal(
+                    df,
+                    self._get_ema200_utbot_signal_params(strategy_params),
+                )
+                bias = str(detail.get('bias_side') or '').lower()
+                if bias in {'long', 'short'}:
+                    biases[timeframe] = bias
+            except Exception as exc:
+                logger.warning(
+                    "EMA200 %s %s auxiliary UT unavailable: %s",
+                    symbol, timeframe, exc,
+                )
+        return biases
 
     async def _scan_and_trade_ema200_binance_top10(self):
         """Evaluate the fixed universe, optionally ranking all valid signals."""
@@ -222,6 +326,10 @@ class SignalScannerMixin:
                     ohlcv=ohlcv,
                     market_price=float(ohlcv[-1][4]),
                 )
+                if selection_enabled:
+                    candidate['auxiliary_ut_biases'] = (
+                        await self._ema200_auxiliary_ut_biases(symbol, strategy_params)
+                    )
                 candidates.append(candidate)
 
                 # OFF intentionally preserves the legacy behavior: the first
@@ -750,6 +858,8 @@ class SignalScannerMixin:
 
             # [Fix] Update Status and get local pos_side to avoid race condition
             pos_side = await self.check_status(symbol, current_price)
+            if pos_side in {'LONG', 'SHORT'}:
+                await self._ema200_apply_margin_profit_stop(symbol)
 
             # 2. Check Primary TF (Entry Logic)
             last_closed_p = ohlcv_p[-2]

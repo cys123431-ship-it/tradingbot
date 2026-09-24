@@ -25,6 +25,7 @@ EMA200_KST = ZoneInfo("Asia/Seoul")
 EMA200_SMALL_ACCOUNT_THRESHOLD_USDT = 1000.0
 EMA200_SMALL_ACCOUNT_LEVERAGE = 5
 EMA200_SMALL_ACCOUNT_MARGIN_LADDER_PERCENT = (50.0, 35.0, 25.0, 15.0, 10.0)
+EMA200_EXIT_TIMEFRAMES = ("15m", "30m", "1h")
 
 # Binance does not publish a circulating-supply/market-cap ranking API.  This
 # fixed 2026-09-19 snapshot therefore contains the ten highest-market-cap,
@@ -64,6 +65,7 @@ def default_ema200_utbot_rsi_config():
     return {
         "enabled": True,
         "timeframe": "2h",
+        "exit_timeframe": "15m",
         "ema_period": 200,
         "rsi_length": 14,
         "rsi_threshold": 50.0,
@@ -134,6 +136,8 @@ def normalize_ema200_utbot_rsi_config(raw=None):
     # and its own UT Bot defaults.  In particular, do not let the standalone
     # UTBot menu mutate this independent strategy's signal direction.
     cfg["timeframe"] = "2h"
+    exit_tf = str(cfg.get("exit_timeframe") or "").strip().lower()
+    cfg["exit_timeframe"] = exit_tf if exit_tf in EMA200_EXIT_TIMEFRAMES else "15m"
     cfg["ema_period"] = 200
     cfg["rsi_threshold"] = 50.0
     cfg["utbot_key_value"] = EMA200_UTBOT_KEY_VALUE

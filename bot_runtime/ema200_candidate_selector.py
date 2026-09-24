@@ -11,6 +11,18 @@ from math import isfinite
 
 
 EMA200_CANDIDATE_TIMEFRAME_MS = 2 * 60 * 60 * 1000
+EMA200_AUXILIARY_UT_WEIGHTS = {"15m": 4.0, "30m": 6.0, "1h": 8.0}
+
+
+def auxiliary_ut_score(side, biases):
+    """Bounded ranking bonus; unknown data is neutral and never vetoes entry."""
+    breakdown = {}
+    for timeframe, weight in EMA200_AUXILIARY_UT_WEIGHTS.items():
+        bias = str((biases or {}).get(timeframe) or '').lower()
+        breakdown[timeframe] = (
+            weight if bias == side else -weight if bias in {'long', 'short'} else 0.0
+        )
+    return sum(breakdown.values()), breakdown
 
 
 def _finite_float(value, default=0.0):
@@ -157,7 +169,10 @@ def rank_ema200_candidates(candidates):
         # only valid candidate.
         extension = max(0.0, _finite_float(item.get("extension_atr")))
         extension_penalty = min(15.0, max(0.0, extension - 3.0) * 5.0)
-        score = max(0.0, recency + rsi + ema + liquidity - extension_penalty)
+        auxiliary, auxiliary_breakdown = auxiliary_ut_score(
+            item.get('side'), item.get('auxiliary_ut_biases')
+        )
+        score = max(0.0, recency + rsi + ema + liquidity - extension_penalty + auxiliary)
         item["score"] = round(score, 4)
         item["score_breakdown"] = {
             "ut_recency": round(recency, 4),
@@ -165,6 +180,8 @@ def rank_ema200_candidates(candidates):
             "ema_slope": round(ema, 4),
             "liquidity": round(liquidity, 4),
             "extension_penalty": round(extension_penalty, 4),
+            "auxiliary_ut": auxiliary,
+            "auxiliary_ut_by_timeframe": auxiliary_breakdown,
         }
         ranked.append(item)
 

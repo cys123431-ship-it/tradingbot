@@ -16,9 +16,11 @@ import emas
 from bot_runtime.controller_ema200_utbot_rsi import ControllerEMA200UTBotRSIMixin
 from bot_runtime.database import DBManager
 from bot_runtime.ema200_candidate_selector import (
+    auxiliary_ut_score,
     build_ema200_candidate,
     rank_ema200_candidates,
 )
+from bot_runtime.ema200_profit_stop import ema200_profit_stop_target
 from bot_runtime.ema200_utbot_rsi import (
     EMA200_CONSECUTIVE_LOSS_RESET_STATE_KEY,
     EMA200_DAILY_LOSS_RESET_STATE_KEY,
@@ -45,6 +47,193 @@ from trading_safety.order_state import (
     DAILY_LOSS_ENTRY_LOCK_KEY,
     SQLiteTradingStateStore,
 )
+
+
+@pytest.mark.parametrize('raw,expected', [
+    ({'exit_timeframe': '30m'}, '30m'),
+    ({'exit_timeframe': '1h'}, '1h'),
+    ({'exit_timeframe': '2h'}, '15m'),
+    ({'exit_timeframe': None}, '15m'),
+])
+def test_ema200_exit_timeframe_normalizes_to_allowed_completed_bars(raw, expected):
+    cfg = normalize_ema200_utbot_rsi_config(raw)
+    assert cfg['timeframe'] == '2h'
+    assert cfg['exit_timeframe'] == expected
+
+
+def test_auxiliary_ut_scores_only_rank_already_eligible_candidates():
+    assert auxiliary_ut_score('long', {'15m': 'long', '30m': 'short', '1h': 'long'}) == (
+        6.0, {'15m': 4.0, '30m': -6.0, '1h': 8.0}
+    )
+    assert auxiliary_ut_score('short', {})[0] == 0.0
+    base = {
+        'symbol': 'BTC/USDT:USDT', 'side': 'long', 'ut_age_bars': 1.0,
+        'rsi_momentum': 1.0, 'ema_slope_percent': 0.1,
+        'quote_volume_24h': 100.0, 'extension_atr': 1.0,
+    }
+    ranked = rank_ema200_candidates([
+        {**base, 'symbol': 'BTC/USDT:USDT', 'auxiliary_ut_biases': {'15m': 'short', '30m': 'short', '1h': 'short'}},
+        {**base, 'symbol': 'ETH/USDT:USDT', 'auxiliary_ut_biases': {'15m': 'long', '30m': 'long', '1h': 'long'}},
+    ])
+    assert ranked[0]['symbol'] == 'ETH/USDT:USDT'
+    assert ranked[0]['score_breakdown']['auxiliary_ut'] == 18.0
+    assert len(ranked) == 2
+
+
+@pytest.mark.parametrize('side,mark,roi_floor,stop', [
+    ('long', 101.0, None, None),  # exactly +5% margin ROI stays inactive
+    ('long', 101.2, 5.0, 101.0),
+    ('long', 102.0, 5.0, 101.0),
+    ('long', 102.2, 10.0, 102.0),
+    ('short', 98.8, 5.0, 99.0),
+    ('short', 97.8, 10.0, 98.0),
+])
+def test_margin_roi_profit_stop_strict_steps(side, mark, roi_floor, stop):
+    result = ema200_profit_stop_target(side, 100.0, mark, 5)
+    if roi_floor is None:
+        assert result is None
+    else:
+        assert result[1] == roi_floor
+        assert result[2] == pytest.approx(stop)
+
+
+def test_margin_roi_profit_stop_rejects_bad_exchange_position_data():
+    for bad in (None, 0, float('nan'), float('inf')):
+        assert ema200_profit_stop_target('long', 100, 102, bad) is None
+
+
+def test_first_stage_expects_exchange_stop_after_profit_stop_was_installed():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.is_upbit_mode = lambda: False
+    engine.get_runtime_strategy_params = lambda: {
+        'active_strategy': EMA200_UTBOT_RSI_STRATEGY,
+    }
+    record = SimpleNamespace(
+        strategy=EMA200_UTBOT_RSI_STRATEGY,
+        metadata={'strategy_managed_no_stop': True},
+        stop_order_id='profit-stop-on-exchange',
+    )
+    engine.trading_state_store = SimpleNamespace(active_for_symbol=lambda _: [record])
+    assert engine._protection_expected_from_config('BTC/USDT:USDT', {
+        'side': 'long', 'contracts': 1.0,
+    }) == (False, True)
+
+
+def test_profit_stop_raises_exchange_stop_without_lowering_existing_floor():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = 'BTC/USDT:USDT'
+    pos = {'side': 'long', 'entryPrice': 100.0, 'markPrice': 101.2,
+           'leverage': 5, 'contracts': 1}
+    installed = []
+    stop = {'price': None}
+    engine._position_entry_strategy = lambda _: EMA200_UTBOT_RSI_STRATEGY
+
+    async def fetch_position(_):
+        return True, pos
+
+    async def fetch_orders(_):
+        return True, ([{'type': 'STOP_MARKET', 'stopPrice': stop['price']}]
+                      if stop['price'] is not None else [])
+
+    async def replace(_symbol, _pos, price, reason):
+        stop['price'] = price
+        installed.append(price)
+        return {'id': str(len(installed))}
+
+    async def audit(*args, **kwargs):
+        return {'status': 'OK'}
+
+    engine._fetch_server_position_checked = fetch_position
+    engine._collect_protection_orders_checked = fetch_orders
+    engine._classify_protection_order = lambda _: 'sl'
+    engine._protection_trigger_price = lambda order: order['stopPrice']
+    engine.safe_price = lambda _, price: price
+    engine._replace_stop_loss_order = replace
+    engine._audit_protection_orders = audit
+    asyncio.run(engine._ema200_apply_margin_profit_stop(symbol))
+    assert installed == [pytest.approx(101.0)]
+    pos['markPrice'] = 100.8
+    asyncio.run(engine._ema200_apply_margin_profit_stop(symbol))
+    assert len(installed) == 1
+    pos['markPrice'] = 102.2
+    asyncio.run(engine._ema200_apply_margin_profit_stop(symbol))
+    assert installed[-1] == pytest.approx(102.0)
+    pos['markPrice'] = 101.5
+    asyncio.run(engine._ema200_apply_margin_profit_stop(symbol))
+    assert len(installed) == 2
+
+
+def test_profit_stop_never_changes_other_strategy_position():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine._position_entry_strategy = lambda _: 'utbot'
+    engine._fetch_server_position_checked = lambda _: (_ for _ in ()).throw(
+        AssertionError('other strategy position must not be touched')
+    )
+    assert asyncio.run(engine._ema200_apply_margin_profit_stop('BTC/USDT:USDT')) is None
+
+
+def test_auxiliary_ut_reader_uses_completed_bars_and_own_ut_settings():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    seen = []
+    def fetch(symbol, timeframe, limit):
+        seen.append((timeframe, limit))
+        return [[index, 1, 2, 0.5, 1.5, 10] for index in range(30)]
+    engine.market_data_exchange = SimpleNamespace(fetch_ohlcv=fetch)
+    engine._calculate_utbot_signal = lambda frame, params: (
+        None, 'maintained', {'bias_side': 'long' if int(frame.iloc[-2]['timestamp']) == 28 else 'short'}
+    )
+    result = asyncio.run(engine._ema200_auxiliary_ut_biases('BTC/USDT:USDT', {
+        'active_strategy': EMA200_UTBOT_RSI_STRATEGY,
+    }))
+    assert seen == [('15m', 250), ('30m', 250), ('1h', 250)]
+    assert result == {'15m': 'long', '30m': 'long', '1h': 'long'}
+
+
+def test_short_mechanical_exit_on_selected_15m_completed_ut_buy():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    timeframe_calls = []
+    engine.market_data_exchange = SimpleNamespace(fetch_ohlcv=lambda symbol, tf, limit: (
+        timeframe_calls.append(tf) or [[1, 1, 2, 0.5, 1.5, 10],
+        [900001, 1, 2, 0.5, 1.5, 10], [1800001, 1, 2, 0.5, 1.5, 10]]
+    ))
+    engine.db = SimpleNamespace(get_latest_open_trade=lambda _: {
+        'strategy': EMA200_UTBOT_RSI_STRATEGY,
+        'entry_time': '1970-01-01T00:00:01+00:00',
+    })
+    engine.get_runtime_strategy_params = lambda: {
+        'active_strategy': EMA200_UTBOT_RSI_STRATEGY,
+        'EMA200UTBotRSI2H': {'exit_timeframe': '15m', 'enabled': False},
+    }
+    engine._calculate_utbot_signal = lambda df, params: ('long', 'buy', {'bias_side': 'long'})
+    engine._update_stateful_diag = lambda *args, **kwargs: None
+    engine.last_entry_reason = {}
+    exits = []
+    async def exit_position(symbol, reason):
+        exits.append(reason)
+    async def fetch_position(symbol):
+        return True, None
+    engine.exit_position = exit_position
+    engine._fetch_server_position_checked = fetch_position
+    assert asyncio.run(engine.process_exit_candle('BTC/USDT:USDT', '15m', 'short'))
+    assert timeframe_calls == ['15m']
+    assert exits == ['EMA200_UTBOT_RSI_UT_BUY']
+
+
+def test_stale_ut_signal_before_entry_never_closes_new_position():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.market_data_exchange = SimpleNamespace(fetch_ohlcv=lambda *a, **k: [
+        [1, 1, 2, 0.5, 1.5, 10], [900001, 1, 2, 0.5, 1.5, 10],
+        [1800001, 1, 2, 0.5, 1.5, 10],
+    ])
+    engine.db = SimpleNamespace(get_latest_open_trade=lambda _: {
+        'strategy': EMA200_UTBOT_RSI_STRATEGY,
+        'entry_time': '1970-01-01T00:30:01+00:00',
+    })
+    engine.get_runtime_strategy_params = lambda: {'active_strategy': EMA200_UTBOT_RSI_STRATEGY}
+    engine._calculate_utbot_signal = lambda df, params: ('short', 'sell', {'bias_side': 'short'})
+    engine.last_entry_reason = {}
+    engine.exit_position = lambda *args: (_ for _ in ()).throw(AssertionError('stale exit'))
+    assert asyncio.run(engine.process_exit_candle('BTC/USDT:USDT', '15m', 'long'))
 from bot_runtime.strategy_registry import CORE_STRATEGIES
 
 
@@ -628,7 +817,7 @@ def test_rsi_uses_wilder_sma_seed_then_recursive_smoothing():
     assert rsi.iloc[4] == pytest.approx(54.5454545455)
 
 
-def test_primary_and_exit_polling_are_fixed_to_2h():
+def test_primary_polling_is_fixed_to_2h_and_exit_is_user_selectable():
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
     params = {
         "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
@@ -645,7 +834,9 @@ def test_primary_and_exit_polling_are_fixed_to_2h():
     engine.get_runtime_strategy_params = lambda: params
 
     assert engine._get_primary_poll_timeframe() == "2h"
-    assert engine._get_exit_timeframe("BTC/USDT") == "2h"
+    assert engine._get_exit_timeframe("BTC/USDT") == "15m"
+    params["EMA200UTBotRSI2H"]["exit_timeframe"] = "30m"
+    assert engine._get_exit_timeframe("BTC/USDT") == "30m"
 
     fixed_scanner_source = inspect.getsource(
         emas.SignalEngine._scan_and_trade_ema200_binance_top10
@@ -659,7 +850,7 @@ def test_primary_and_exit_polling_are_fixed_to_2h():
     assert "scanner_enabled = True" in poll_tick_source
 
 
-def test_open_ema200_position_keeps_2h_exit_after_active_strategy_changes():
+def test_open_ema200_position_keeps_selected_exit_after_strategy_changes():
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
     engine.db = SimpleNamespace(
         get_latest_open_trade=lambda symbol: {
@@ -677,7 +868,7 @@ def test_open_ema200_position_keeps_2h_exit_after_active_strategy_changes():
     assert engine._position_entry_strategy("DOGE/USDT:USDT") == (
         EMA200_UTBOT_RSI_STRATEGY
     )
-    assert engine._get_exit_timeframe("DOGE/USDT:USDT") == "2h"
+    assert engine._get_exit_timeframe("DOGE/USDT:USDT") == "15m"
 
 
 def test_known_non_ema_position_is_not_reassigned_to_new_ema_config():
@@ -896,6 +1087,7 @@ def test_best_candidate_scanner_evaluates_all_ten_then_enters_highest_rank():
 
     assert [event for event in events if event[0] == "fetch"] == [
         ("fetch", symbol) for symbol in EMA200_BINANCE_TOP10_SYMBOLS
+        for _ in range(1 + (3 if symbol in {"BTC/USDT:USDT", "ETH/USDT:USDT"} else 0))
     ]
     assert [event for event in events if event[0] == "entry"] == [
         ("entry", "ETH/USDT:USDT")
@@ -1584,6 +1776,25 @@ def test_telegram_keyboard_exposes_best_candidate_toggle_and_help():
     assert "10개 종목을 동일한 완료 2시간봉" in help_text
     assert "점수는 후보의 순서만 정하며" in help_text
     assert "기존 포지션" in help_text
+
+
+def test_telegram_exit_timeframe_buttons_update_dedicated_strategy_setting():
+    controller = _registered_telegram_controller()
+    buttons = [
+        button for row in controller._build_ema200_utbot_rsi_keyboard().inline_keyboard
+        for button in row
+    ]
+    assert {button.callback_data for button in buttons if button.callback_data.startswith('e2h:exit_tf:')} == {
+        'e2h:exit_tf:15m', 'e2h:exit_tf:30m', 'e2h:exit_tf:1h',
+    }
+    handler = next(handler for handler, _ in controller.tg_app.handlers
+                   if isinstance(handler, CallbackQueryHandler))
+    query = _TelegramQuery('e2h:exit_tf:1h')
+    asyncio.run(handler.callback(SimpleNamespace(callback_query=query), None))
+    assert controller.cfg.updates[-1] == (
+        ['binance_futures', 'strategy_params', 'EMA200UTBotRSI2H', 'exit_timeframe'], '1h'
+    )
+    assert '현재 포지션' in query.edits[-1]
 
 
 def test_telegram_best_candidate_toggle_updates_only_strategy_selector_flag():

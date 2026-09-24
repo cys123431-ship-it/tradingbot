@@ -146,7 +146,7 @@ class SignalFilterMixin:
             self._position_entry_strategy(symbol) if symbol else None
         ) or configured_strategy
         if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
-            return self._get_ema200_utbot_rsi_config(strategy_params).get('timeframe', '2h')
+            return self._get_ema200_utbot_rsi_config(strategy_params)['exit_timeframe']
         if active_strategy in UTBREAKOUT_STRATEGIES:
             if symbol:
                 try:

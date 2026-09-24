@@ -1287,11 +1287,15 @@ class SignalProtectionMixin:
                 records = self.trading_state_store.active_for_symbol(symbol)
             except Exception:
                 records = []
-            if any(
-                str(record.strategy or '').strip().lower()
+            ema_records = [
+                record for record in records
+                if str(record.strategy or '').strip().lower()
                 == EMA200_UTBOT_RSI_STRATEGY
-                and bool((record.metadata or {}).get('strategy_managed_no_stop'))
-                for record in records
+            ]
+            if ema_records and all(
+                bool((record.metadata or {}).get('strategy_managed_no_stop'))
+                and not getattr(record, 'stop_order_id', None)
+                for record in ema_records
             ):
                 return False, False
             return False, True
