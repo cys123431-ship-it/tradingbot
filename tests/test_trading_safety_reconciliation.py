@@ -1,5 +1,7 @@
 import asyncio
 
+import emas
+
 from trading_safety.order_state import OrderRecord, OrderState, SQLiteTradingStateStore
 from trading_safety.reconciliation import reconcile_exchange_state
 
@@ -460,5 +462,229 @@ def test_oversized_reduce_only_order_blocks_startup(tmp_path):
         result = await reconcile_exchange_state(ReconcileExchange([position], orders), store)
         assert result.safe_to_trade is False
         assert any("reduce_only_qty_exceeds_position" in issue for issue in result.issues)
+
+    asyncio.run(scenario())
+
+
+def _ema_first_stage_record(
+    client_order_id,
+    *,
+    metadata=None,
+    stop_order_id=None,
+    order_state=OrderState.PROTECTED.value,
+):
+    return OrderRecord(
+        client_order_id,
+        "BTC/USDT:USDT",
+        "LONG",
+        "ema200_utbot_rsi_2h",
+        "1",
+        1.0,
+        filled_qty=1.0,
+        average_fill_price=100.0,
+        order_state=order_state,
+        stop_order_id=stop_order_id,
+        metadata={
+            "strategy_managed_no_stop": True,
+            **dict(metadata or {}),
+        },
+    )
+
+
+def _btc_long_position():
+    return {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": 1.0,
+        "entryPrice": 100.0,
+    }
+
+
+def test_generic_reconciliation_rejects_no_stop_exception_when_profit_stop_pending(tmp_path):
+    async def scenario():
+        store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+        store.upsert(_ema_first_stage_record(
+            "ema-pending",
+            metadata={
+                "ema200_profit_stop_pending_client_order_id": "pending-stop-client",
+                "ema200_profit_stop_pending_side": "long",
+                "ema200_profit_stop_pending_qty": 1.0,
+                "ema200_profit_stop_pending_trigger_price": 101.0,
+            },
+        ))
+
+        result = await reconcile_exchange_state(
+            ReconcileExchange([_btc_long_position()], []),
+            store,
+        )
+
+        assert result.safe_to_trade is False
+        combined = list(result.issues) + list(result.unresolved_records)
+        assert any(
+            "ema200_profit_stop_pending_unresolved" in item
+            for item in combined
+        )
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_first_stage_no_stop_exception_still_allowed_before_profit_stop_lifecycle(tmp_path):
+    async def scenario():
+        store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+        store.upsert(_ema_first_stage_record("ema-no-stop-yet"))
+
+        result = await reconcile_exchange_state(
+            ReconcileExchange([_btc_long_position()], []),
+            store,
+        )
+
+        assert result.safe_to_trade is True
+        assert not any(
+            "position_without_verified_stop" in issue
+            for issue in result.issues
+        )
+        assert not any(
+            "ema200_profit_stop_pending_unresolved" in item
+            for item in list(result.issues) + list(result.unresolved_records)
+        )
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_confirmed_profit_stop_disables_no_stop_reconciliation_exception(tmp_path):
+    async def scenario():
+        store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+        store.upsert(_ema_first_stage_record(
+            "ema-confirmed-stop",
+            stop_order_id="profit-stop-1",
+            metadata={
+                "ema200_profit_stop_order_id": "profit-stop-1",
+                "ema200_profit_stop_client_order_id": "profit-stop-client-1",
+                "ema200_profit_stop_side": "long",
+                "ema200_profit_stop_qty": 1.0,
+            },
+        ))
+
+        result = await reconcile_exchange_state(
+            ReconcileExchange([_btc_long_position()], []),
+            store,
+        )
+
+        assert result.safe_to_trade is False
+        assert any(
+            "position_without_verified_stop" in issue
+            for issue in result.issues
+        )
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_stronger_protection_lock_is_not_cleared_by_safe_generic_reconciliation(tmp_path):
+    async def scenario():
+        store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+        engine = emas.SignalEngine.__new__(emas.SignalEngine)
+        engine.exchange = ReconcileExchange([], [])
+        engine.trading_state_store = store
+        engine.get_runtime_common_settings = lambda: {
+            "single_position_mode": True,
+        }
+
+        async def account_for_flat(_result):
+            return []
+
+        engine._account_for_reconciled_flat_trades = account_for_flat
+        engine._set_crypto_entry_lock(
+            "PENDING_PROTECTION_RECONCILIATION:BTC/USDT:USDT"
+        )
+
+        result = await engine._reconcile_crypto_exchange_state(
+            user_stream_ready=True,
+            require_user_stream=False,
+        )
+
+        assert result.safe_to_trade is True
+        assert engine.crypto_entry_lock_reason == (
+            "PENDING_PROTECTION_RECONCILIATION:BTC/USDT:USDT"
+        )
+        assert store.get_runtime_state("entry_lock_reason") == (
+            "PENDING_PROTECTION_RECONCILIATION:BTC/USDT:USDT"
+        )
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_startup_reconciliation_does_not_clear_pending_profit_stop_lock(tmp_path):
+    async def scenario():
+        store = SQLiteTradingStateStore(tmp_path / "state.sqlite3")
+        store.upsert(_ema_first_stage_record(
+            "ema-startup-pending",
+            metadata={
+                "ema200_profit_stop_pending_client_order_id": "pending-startup",
+                "ema200_profit_stop_pending_side": "long",
+                "ema200_profit_stop_pending_qty": 1.0,
+                "ema200_profit_stop_pending_trigger_price": 101.0,
+            },
+        ))
+
+        engine = emas.SignalEngine.__new__(emas.SignalEngine)
+        engine.exchange = ReconcileExchange([_btc_long_position()], [])
+        engine.trading_state_store = store
+        engine.get_runtime_common_settings = lambda: {
+            "single_position_mode": True,
+        }
+
+        async def account_for_flat(_result):
+            return []
+
+        engine._account_for_reconciled_flat_trades = account_for_flat
+        engine._set_crypto_entry_lock(
+            "PENDING_PROTECTION_RECONCILIATION:BTC/USDT:USDT"
+        )
+
+        result = await engine._reconcile_crypto_exchange_state(
+            user_stream_ready=False,
+            require_user_stream=False,
+        )
+
+        assert result.safe_to_trade is False
+        assert engine.crypto_entry_lock_reason == (
+            "PENDING_PROTECTION_RECONCILIATION:BTC/USDT:USDT"
+        )
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_pending_profit_stop_restart_keeps_entry_blocked_until_reconciled(tmp_path):
+    async def scenario():
+        path = tmp_path / "state.sqlite3"
+        store = SQLiteTradingStateStore(path)
+        store.upsert(_ema_first_stage_record(
+            "ema-restart-pending",
+            metadata={
+                "ema200_profit_stop_pending_client_order_id": "pending-restart",
+                "ema200_profit_stop_pending_side": "long",
+                "ema200_profit_stop_pending_qty": 1.0,
+                "ema200_profit_stop_pending_trigger_price": 101.0,
+            },
+        ))
+        store.close()
+
+        reopened = SQLiteTradingStateStore(path)
+        result = await reconcile_exchange_state(
+            ReconcileExchange([_btc_long_position()], []),
+            reopened,
+        )
+
+        assert result.safe_to_trade is False
+        assert any(
+            "ema200_profit_stop_pending_unresolved" in item
+            for item in list(result.issues) + list(result.unresolved_records)
+        )
+        reopened.close()
 
     asyncio.run(scenario())
