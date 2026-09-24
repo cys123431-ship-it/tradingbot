@@ -630,34 +630,57 @@ def test_startup_reconciliation_does_not_clear_pending_profit_stop_lock(tmp_path
             },
         ))
 
+        class StartupExchange(ReconcileExchange):
+            id = "binance"
+
+            def fapiPrivateGetOpenAlgoOrders(self, params):
+                return []
+
+            def fapiPrivateGetAlgoOrder(self, params):
+                raise TimeoutError("pending lookup timeout")
+
+            def fapiPrivateGetOrder(self, params):
+                raise RuntimeError("-2013 Order does not exist.")
+
+        exchange = StartupExchange([_btc_long_position()], [])
         engine = emas.SignalEngine.__new__(emas.SignalEngine)
-        engine.exchange = ReconcileExchange([_btc_long_position()], [])
+        engine.exchange = exchange
         engine.trading_state_store = store
+        engine.ctrl = None
+        engine.crypto_entry_lock_reason = None
+        engine.is_upbit_mode = lambda: False
         engine.get_runtime_common_settings = lambda: {
             "single_position_mode": True,
+            "user_data_stream_enabled": False,
         }
 
         async def account_for_flat(_result):
             return []
 
+        async def recover_pending():
+            result = await engine._reconcile_ema200_profit_stop_pending_identity(
+                "BTC/USDT:USDT",
+                pos=_btc_long_position(),
+                protection_orders=[],
+            )
+            assert result["status"] == "UNKNOWN"
+            return {"status": "PENDING", "recovered": 0}
+
         engine._account_for_reconciled_flat_trades = account_for_flat
-        engine._set_crypto_entry_lock(
-            "PENDING_PROTECTION_RECONCILIATION:BTC/USDT:USDT"
-        )
+        engine._recover_open_utbreakout_positions_on_start = recover_pending
 
-        result = await engine._reconcile_crypto_exchange_state(
-            user_stream_ready=False,
-            require_user_stream=False,
-        )
+        await engine._startup_crypto_safety_reconciliation()
 
-        assert result.safe_to_trade is False
-        assert engine.crypto_entry_lock_reason == (
-            "PENDING_PROTECTION_RECONCILIATION:BTC/USDT:USDT"
+        assert engine.crypto_entry_lock_reason is not None
+        assert "PENDING_PROTECTION" in engine.crypto_entry_lock_reason
+        assert "PENDING_PROTECTION" in str(
+            store.get_runtime_state("entry_lock_reason")
         )
+        final = store.get_runtime_state("last_reconciliation")
+        assert final["safe_to_trade"] is False
         store.close()
 
     asyncio.run(scenario())
-
 
 def test_pending_profit_stop_restart_keeps_entry_blocked_until_reconciled(tmp_path):
     async def scenario():
