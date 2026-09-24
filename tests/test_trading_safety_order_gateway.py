@@ -359,3 +359,27 @@ def test_exchange_ack_cannot_regress_concurrent_fill_state(tmp_path):
     assert updated.order_state == OrderState.FILLED_UNVERIFIED_LIQUIDATION.value
     assert updated.filled_qty == pytest.approx(1.0)
     assert updated.average_fill_price == pytest.approx(100.0)
+
+
+def test_runtime_protection_lock_blocks_actual_exchange_entry_submission(tmp_path):
+    async def scenario():
+        exchange = MockExchange()
+        gateway = _gateway(tmp_path, exchange)
+        gateway.store.set_runtime_state(
+            "entry_lock_reason",
+            "PENDING_PROTECTION_RECONCILIATION:BTC/USDT:USDT",
+        )
+
+        result = await gateway.submit_entry(
+            strategy="UTB",
+            symbol="BTC/USDT:USDT",
+            side="LONG",
+            signal_timestamp=9001,
+            qty=0.1,
+        )
+
+        assert result.state == "BLOCKED"
+        assert "PENDING_PROTECTION_RECONCILIATION" in str(result.error)
+        assert exchange.create_count == 0
+
+    asyncio.run(scenario())
