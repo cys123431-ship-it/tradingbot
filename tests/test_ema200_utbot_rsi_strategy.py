@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import inspect
 from types import SimpleNamespace
 
+import ccxt
 import pandas as pd
 import pytest
 from telegram.ext import (
@@ -45,6 +46,8 @@ from scripts.reset_ema200_consecutive_losses import (
 )
 from trading_safety.order_state import (
     DAILY_LOSS_ENTRY_LOCK_KEY,
+    OrderRecord,
+    OrderState,
     SQLiteTradingStateStore,
 )
 
@@ -85,8 +88,13 @@ def test_auxiliary_ut_scores_only_rank_already_eligible_candidates():
     ('long', 101.2, 5.0, 101.0),
     ('long', 102.0, 5.0, 101.0),
     ('long', 102.2, 10.0, 102.0),
+    ('long', 103.0, 10.0, 102.0),
+    ('long', 103.2, 15.0, 103.0),
     ('short', 98.8, 5.0, 99.0),
+    ('short', 98.0, 5.0, 99.0),
     ('short', 97.8, 10.0, 98.0),
+    ('short', 97.0, 10.0, 98.0),
+    ('short', 96.8, 15.0, 97.0),
 ])
 def test_margin_roi_profit_stop_strict_steps(side, mark, roi_floor, stop):
     result = ema200_profit_stop_target(side, 100.0, mark, 5)
@@ -100,6 +108,330 @@ def test_margin_roi_profit_stop_strict_steps(side, mark, roi_floor, stop):
 def test_margin_roi_profit_stop_rejects_bad_exchange_position_data():
     for bad in (None, 0, float('nan'), float('inf')):
         assert ema200_profit_stop_target('long', 100, 102, bad) is None
+
+
+def _ccxt_binance_v3_position_without_leverage():
+    exchange = ccxt.binance({'options': {'defaultType': 'future'}})
+    market = {
+        'id': 'BTCUSDT',
+        'symbol': 'BTC/USDT:USDT',
+        'base': 'BTC',
+        'quote': 'USDT',
+        'settle': 'USDT',
+        'baseId': 'BTC',
+        'quoteId': 'USDT',
+        'settleId': 'USDT',
+        'type': 'swap',
+        'spot': False,
+        'margin': False,
+        'swap': True,
+        'future': False,
+        'option': False,
+        'active': True,
+        'contract': True,
+        'linear': True,
+        'inverse': False,
+        'contractSize': 1.0,
+        'precision': {'amount': 0.001, 'price': 0.1, 'base': 0.001, 'quote': 0.1},
+        'limits': {},
+        'info': {'symbol': 'BTCUSDT'},
+    }
+    exchange.options.setdefault('leverageBrackets', {})[market['symbol']] = [
+        ['0', '0.004'],
+    ]
+    raw = {
+        'symbol': 'BTCUSDT',
+        'positionSide': 'BOTH',
+        'positionAmt': '1',
+        'entryPrice': '100',
+        'breakEvenPrice': '100',
+        'markPrice': '101.2',
+        'unRealizedProfit': '1.2',
+        'liquidationPrice': '50',
+        'isolatedMargin': '20.24',
+        'notional': '101.2',
+        'marginAsset': 'USDT',
+        'isolatedWallet': '20.24',
+        'initialMargin': '20.24',
+        'maintMargin': '0.4048',
+        'positionInitialMargin': '20.24',
+        'openOrderInitialMargin': '0',
+        'adl': 1,
+        'bidNotional': '0',
+        'askNotional': '0',
+        'updateTime': 1_700_000_000_000,
+    }
+    parsed = exchange.parse_position_risk(raw, market)
+    assert parsed['leverage'] is None
+    assert parsed['entryPrice'] == pytest.approx(100.0)
+    assert parsed['markPrice'] == pytest.approx(101.2)
+    return exchange, parsed
+
+
+def test_binance_v3_missing_leverage_is_resolved_from_symbol_config_before_profit_stop():
+    exchange, parsed = _ccxt_binance_v3_position_without_leverage()
+    exchange.fetch_positions = lambda symbols=None: [parsed]
+    exchange.fapiPrivateGetSymbolConfig = lambda params: [{
+        'symbol': 'BTCUSDT',
+        'marginType': 'ISOLATED',
+        'isAutoAddMargin': False,
+        'leverage': 5,
+        'maxNotionalValue': '1000000',
+    }]
+
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.exchange = exchange
+    engine.position_cache = {}
+    engine.is_upbit_mode = lambda: False
+    engine._position_entry_strategy = lambda _: EMA200_UTBOT_RSI_STRATEGY
+    engine.safe_price = lambda _, price: price
+    installed = []
+
+    async def fetch_orders(_):
+        return True, []
+
+    async def replace(_symbol, _pos, price, reason):
+        installed.append(price)
+        return {'id': 'profit-stop-1'}
+
+    async def audit(*args, **kwargs):
+        return {'status': 'OK'}
+
+    engine._collect_protection_orders_checked = fetch_orders
+    engine._replace_stop_loss_order = replace
+    engine._audit_protection_orders = audit
+
+    asyncio.run(engine._ema200_apply_margin_profit_stop('BTC/USDT:USDT'))
+
+    assert installed == [pytest.approx(101.0)]
+
+
+def test_profit_stop_leverage_lookup_failure_does_not_create_order_and_records_reason():
+    exchange, parsed = _ccxt_binance_v3_position_without_leverage()
+    exchange.fetch_positions = lambda symbols=None: [parsed]
+
+    def fail_symbol_config(params):
+        raise RuntimeError('symbolConfig unavailable')
+
+    exchange.fapiPrivateGetSymbolConfig = fail_symbol_config
+
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.exchange = exchange
+    engine.position_cache = {}
+    engine.is_upbit_mode = lambda: False
+    engine._position_entry_strategy = lambda _: EMA200_UTBOT_RSI_STRATEGY
+    engine.safe_price = lambda _, price: price
+    engine.last_ema200_profit_stop_status = {}
+    installed = []
+
+    async def fetch_orders(_):
+        return True, []
+
+    async def replace(*args, **kwargs):
+        installed.append(args)
+        return {'id': 'must-not-exist'}
+
+    engine._collect_protection_orders_checked = fetch_orders
+    engine._replace_stop_loss_order = replace
+
+    asyncio.run(engine._ema200_apply_margin_profit_stop('BTC/USDT:USDT'))
+
+    assert installed == []
+    status = engine.last_ema200_profit_stop_status['BTC/USDT:USDT']
+    assert status['status'] == 'LEVERAGE_UNAVAILABLE'
+    assert 'symbolConfig' in status['reason']
+
+
+def test_profit_stop_rejects_conflicting_exchange_leverage_fields():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine._position_entry_strategy = lambda _: EMA200_UTBOT_RSI_STRATEGY
+    engine.last_ema200_profit_stop_status = {}
+    pos = {
+        'symbol': 'BTC/USDT:USDT',
+        'side': 'long',
+        'entryPrice': 100.0,
+        'markPrice': 101.2,
+        'leverage': 5,
+        'contracts': 1.0,
+        'info': {'leverage': '10'},
+    }
+
+    async def fetch_position(_):
+        return True, pos
+
+    engine._fetch_server_position_checked = fetch_position
+    engine._replace_stop_loss_order = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError('conflicting leverage must not place a stop')
+    )
+
+    asyncio.run(engine._ema200_apply_margin_profit_stop('BTC/USDT:USDT'))
+
+    status = engine.last_ema200_profit_stop_status['BTC/USDT:USDT']
+    assert status['status'] == 'LEVERAGE_CONFLICT'
+
+
+async def _run_ema_profit_stop_audit(engine, symbol, pos, order, records):
+    cancelled = []
+
+    engine.is_upbit_mode = lambda: False
+    engine.exchange = SimpleNamespace(id='fixture')
+    engine.last_protection_order_status = {}
+    engine.protection_missing_candidates = {}
+    engine.last_protection_alert_ts = {}
+    engine._get_utbreakout_trailing_state = lambda _: None
+    engine.get_runtime_strategy_params = lambda: {'active_strategy': 'utbot'}
+    engine.trading_state_store = SimpleNamespace(active_for_symbol=lambda _: records)
+
+    async def collect(_):
+        return True, [order]
+
+    async def cancel(_symbol, reason='test', orders=None):
+        cancelled.extend(orders or [])
+        return len(orders or [])
+
+    engine._collect_protection_orders_checked = collect
+    engine._cancel_protection_orders = cancel
+
+    status = await engine._audit_protection_orders(
+        symbol,
+        pos=pos,
+        expected_tp=False,
+        expected_sl=True,
+        alert=False,
+    )
+    return status, cancelled
+
+
+def test_ema_profit_stop_without_ut_trailing_state_is_kept_by_real_audit():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = 'BTC/USDT:USDT'
+    pos = {
+        'symbol': symbol, 'side': 'long', 'entryPrice': 100.0,
+        'markPrice': 101.2, 'contracts': 1.0,
+    }
+    order = {
+        'id': 'profit-stop-1',
+        'clientOrderId': 'utbslsbtcprofit1',
+        'symbol': symbol,
+        'type': 'STOP_MARKET',
+        'side': 'sell',
+        'amount': 1.0,
+        'stopPrice': 101.0,
+        'reduceOnly': True,
+    }
+    record = SimpleNamespace(
+        strategy=EMA200_UTBOT_RSI_STRATEGY,
+        side='long',
+        filled_qty=1.0,
+        requested_qty=1.0,
+        stop_order_id='profit-stop-1',
+        metadata={},
+    )
+
+    status, cancelled = asyncio.run(
+        _run_ema_profit_stop_audit(engine, symbol, pos, order, [record])
+    )
+
+    assert cancelled == []
+    assert status['sl_present'] is True
+    assert status['invalid_price_cancelled'] == 0
+
+
+def test_manual_or_other_strategy_profit_side_stop_does_not_get_ema_managed_exception():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = 'BTC/USDT:USDT'
+    pos = {
+        'symbol': symbol, 'side': 'long', 'entryPrice': 100.0,
+        'markPrice': 101.2, 'contracts': 1.0,
+    }
+    order = {
+        'id': 'manual-stop-1',
+        'clientOrderId': 'manual-stop',
+        'symbol': symbol,
+        'type': 'STOP_MARKET',
+        'side': 'sell',
+        'amount': 1.0,
+        'stopPrice': 101.0,
+        'reduceOnly': True,
+    }
+    other = SimpleNamespace(
+        strategy='utbot',
+        side='long',
+        filled_qty=1.0,
+        requested_qty=1.0,
+        stop_order_id='manual-stop-1',
+        metadata={},
+    )
+
+    status, cancelled = asyncio.run(
+        _run_ema_profit_stop_audit(engine, symbol, pos, order, [other])
+    )
+
+    assert cancelled == [order]
+    assert status['invalid_price_cancelled'] == 1
+
+
+def test_ema_profit_stop_ownership_survives_sqlite_restart(tmp_path):
+    path = tmp_path / 'state.sqlite3'
+    store = SQLiteTradingStateStore(path)
+    store.upsert(OrderRecord(
+        client_order_id='entry-1',
+        symbol='BTC/USDT:USDT',
+        side='long',
+        strategy=EMA200_UTBOT_RSI_STRATEGY,
+        signal_timestamp='1700000000',
+        requested_qty=1.0,
+        filled_qty=1.0,
+        average_fill_price=100.0,
+        order_state=OrderState.PROTECTED.value,
+        stop_order_id='profit-stop-1',
+    ))
+    store.close()
+
+    reopened = SQLiteTradingStateStore(path)
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = 'BTC/USDT:USDT'
+    pos = {
+        'symbol': symbol, 'side': 'long', 'entryPrice': 100.0,
+        'markPrice': 101.2, 'contracts': 1.0,
+    }
+    order = {
+        'id': 'profit-stop-1',
+        'clientOrderId': 'utbslsbtcprofit1',
+        'symbol': symbol,
+        'type': 'STOP_MARKET',
+        'side': 'sell',
+        'amount': 1.0,
+        'stopPrice': 101.0,
+        'reduceOnly': True,
+    }
+    cancelled = []
+    engine.is_upbit_mode = lambda: False
+    engine.exchange = SimpleNamespace(id='fixture')
+    engine.last_protection_order_status = {}
+    engine.protection_missing_candidates = {}
+    engine.last_protection_alert_ts = {}
+    engine._get_utbreakout_trailing_state = lambda _: None
+    engine.get_runtime_strategy_params = lambda: {'active_strategy': 'utbot'}
+    engine.trading_state_store = reopened
+
+    async def collect(_):
+        return True, [order]
+
+    async def cancel(_symbol, reason='test', orders=None):
+        cancelled.extend(orders or [])
+        return len(orders or [])
+
+    engine._collect_protection_orders_checked = collect
+    engine._cancel_protection_orders = cancel
+
+    status = asyncio.run(engine._audit_protection_orders(
+        symbol, pos=pos, expected_tp=False, expected_sl=True, alert=False
+    ))
+
+    assert cancelled == []
+    assert status['sl_present'] is True
+    reopened.close()
 
 
 def test_first_stage_expects_exchange_stop_after_profit_stop_was_installed():
