@@ -1999,6 +1999,141 @@ def test_pending_not_found_closed_lifecycle_is_cleaned(tmp_path):
     store.close()
 
 
+
+def test_audit_duplicate_long_stops_keeps_most_protective_not_newest():
+    test_audit_duplicate_stops_keeps_most_protective_not_newest(
+        'long',
+        105.0,
+        103.0,
+        [(102.0, 1), (101.0, 2)],
+        102.0,
+        101.0,
+    )
+
+
+def test_audit_duplicate_short_stops_keeps_most_protective_not_newest():
+    test_audit_duplicate_stops_keeps_most_protective_not_newest(
+        'short',
+        95.0,
+        97.0,
+        [(98.0, 1), (99.0, 2)],
+        98.0,
+        99.0,
+    )
+
+
+def test_cancel_confirmation_snapshot_failure_found_open_blocks_replacement():
+    test_cancel_confirmation_uncertainty_blocks_replacement('open')
+
+
+def test_cancel_confirmation_unknown_blocks_replacement():
+    test_cancel_confirmation_uncertainty_blocks_replacement('unknown')
+
+
+def test_audit_after_replacement_keeps_best_long_stop():
+    test_audit_duplicate_stops_keeps_most_protective_not_newest(
+        'long',
+        105.0,
+        103.0,
+        [(102.0, 1), (101.0, 2)],
+        102.0,
+        101.0,
+    )
+
+
+def test_audit_after_replacement_keeps_best_short_stop():
+    test_audit_duplicate_stops_keeps_most_protective_not_newest(
+        'short',
+        95.0,
+        97.0,
+        [(98.0, 1), (99.0, 2)],
+        98.0,
+        99.0,
+    )
+
+
+def test_terminal_stale_pending_does_not_block_new_live_position(tmp_path):
+    symbol = 'BTC/USDT:USDT'
+    store = SQLiteTradingStateStore(tmp_path / 'state.sqlite3')
+    store.upsert(OrderRecord(
+        client_order_id='old-closed-pending',
+        symbol=symbol,
+        side='long',
+        strategy=EMA200_UTBOT_RSI_STRATEGY,
+        signal_timestamp='1600000000',
+        requested_qty=1.0,
+        filled_qty=1.0,
+        average_fill_price=90.0,
+        order_state=OrderState.CLOSED.value,
+        metadata={
+            'ema200_profit_stop_pending_client_order_id': 'old-pending',
+            'ema200_profit_stop_pending_side': 'long',
+            'ema200_profit_stop_pending_qty': 1.0,
+            'ema200_profit_stop_pending_trigger_price': 91.0,
+        },
+    ))
+
+    class Exchange:
+        id = 'binance'
+        def market(self, _symbol):
+            return {'id': 'BTCUSDT'}
+        def fapiPrivateGetAlgoOrder(self, params):
+            raise RuntimeError('-2013 Order does not exist.')
+
+    locks = []
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.exchange = Exchange()
+    engine.trading_state_store = store
+    engine._set_crypto_entry_lock = lambda reason: locks.append(reason)
+    new_pos = {
+        'symbol': symbol,
+        'side': 'long',
+        'entryPrice': 100.0,
+        'markPrice': 103.0,
+        'contracts': 1.0,
+    }
+
+    result = asyncio.run(engine._reconcile_ema200_profit_stop_pending_identity(
+        symbol,
+        pos=new_pos,
+        protection_orders=[],
+    ))
+
+    assert result['status'] == 'NOT_FOUND_CLEANED'
+    assert 'ema200_profit_stop_pending_client_order_id' not in (
+        store.get('old-closed-pending').metadata
+    )
+    assert locks == []
+    store.close()
+
+
+def test_exit_flat_after_stop_cancel_never_submits_replacement():
+    engine, symbol, pos, orders, submissions, _ = (
+        _ema_replacement_race_fixture(initial_stop=100.5)
+    )
+    fetch_calls = 0
+
+    async def fetch_position(_symbol):
+        nonlocal fetch_calls
+        fetch_calls += 1
+        # The post-cancel reconciliation sees the UT/manual exit already flat.
+        return True, None
+
+    engine._fetch_server_position_checked = fetch_position
+
+    result = asyncio.run(engine._replace_stop_loss_order(
+        symbol,
+        pos,
+        101.0,
+        reason='EMA200 margin ROI 6.00% locks 5%',
+    ))
+
+    assert result is None
+    assert submissions == []
+    assert orders == []
+    assert fetch_calls == 1
+
+
 def test_first_stage_expects_exchange_stop_after_profit_stop_was_installed():
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
     engine.is_upbit_mode = lambda: False

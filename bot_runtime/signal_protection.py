@@ -749,7 +749,7 @@ class SignalProtectionMixin:
                         'error': lookup.error,
                     })
                     continue
-                elif lookup.status == AlgoLookupStatus.NOT_FOUND and not pos:
+                elif lookup.status == AlgoLookupStatus.NOT_FOUND:
                     record_state = str(
                         getattr(record, 'order_state', '') or ''
                     ).upper()

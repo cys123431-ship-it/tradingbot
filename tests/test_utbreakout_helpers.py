@@ -4615,7 +4615,9 @@ def test_protection_audit_deduplicates_short_stop_loss_orders():
     assert status["status"] == "DUPLICATE_CANCELLED"
     assert status["duplicate_cancelled"] == 1
     remaining_ids = {order["id"] for order in engine.exchange.orders}
-    assert remaining_ids == {"sl-new", "tp"}
+    # SHORT protection is monotonic: the lower valid stop (105) is safer
+    # than the newer 106 stop and must win duplicate cleanup.
+    assert remaining_ids == {"sl-old", "tp"}
 
 
 def test_utbreakout_defaults_enable_profit_opportunity_tp_ladder_and_runner():
@@ -8878,6 +8880,7 @@ def test_manual_short_close_position_sl_is_preserved_and_not_force_closed():
         "info": {"filters": [{"filterType": "PRICE_FILTER", "tickSize": "0.01"}]},
     }
     engine.exchange.fapiPrivateGetOpenAlgoOrders = lambda params=None: {"orders": []}
+    engine.exchange.fetch_position_mode = lambda _symbol=None: {"hedged": False}
     engine.get_runtime_common_settings = lambda: {}
     engine._set_crypto_entry_lock = lambda reason: setattr(engine, "crypto_entry_lock_reason", reason)
     engine._handle_liquidation_safety_failure = AsyncMock()
@@ -8935,6 +8938,7 @@ def test_manual_external_sl_is_preserved_when_liquidation_price_is_temporarily_m
         "info": {"filters": [{"filterType": "PRICE_FILTER", "tickSize": "0.01"}]},
     }
     engine.exchange.fapiPrivateGetOpenAlgoOrders = lambda params=None: {"orders": []}
+    engine.exchange.fetch_position_mode = lambda _symbol=None: {"hedged": False}
     engine.get_runtime_common_settings = lambda: {}
     engine._set_crypto_entry_lock = lambda reason: setattr(engine, "crypto_entry_lock_reason", reason)
     engine._handle_liquidation_safety_failure = AsyncMock()
