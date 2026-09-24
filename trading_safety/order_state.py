@@ -606,6 +606,14 @@ class SQLiteTradingStateStore:
         for_position_add: bool = False,
         ignore_daily_loss_lock: bool = False,
     ) -> str | None:
+        runtime_lock = self.get_runtime_state("entry_lock_reason")
+        if runtime_lock not in (None, ""):
+            text = str(runtime_lock).strip()
+            return (
+                f"RUNTIME_ENTRY_LOCK:{text}"
+                if text
+                else "RUNTIME_ENTRY_LOCK:INVALID_PERSISTED_STATE"
+            )
         if not ignore_daily_loss_lock:
             daily_loss_lock = self.daily_loss_entry_lock_reason()
             if daily_loss_lock:
