@@ -158,6 +158,16 @@ class SignalProtectionMixin:
     ):
         result = await self._binance_position_mode_status(symbol)
         if result.get('ok'):
+            clearer = getattr(
+                self,
+                '_clear_crypto_entry_lock_if_owned',
+                None,
+            )
+            if callable(clearer):
+                clearer(
+                    f'POSITION_MODE_UNAVAILABLE:{symbol}',
+                    f'UNSUPPORTED_HEDGE_MODE:{symbol}',
+                )
             return result
 
         status_code = str(result.get('status') or 'POSITION_MODE_UNAVAILABLE')
@@ -608,7 +618,7 @@ class SignalProtectionMixin:
             existing_metadata.get('ema200_first_stage_entry')
             or existing_metadata.get('strategy_managed_no_stop')
         )
-        self._update_ema200_record_metadata(
+        updated = self._update_ema200_record_metadata(
             record,
             updates={
                 'strategy_managed_no_stop': False,
@@ -626,6 +636,18 @@ class SignalProtectionMixin:
             stop_order_id=order_id,
             update_stop_order_id=True,
         )
+        if updated is not None:
+            clearer = getattr(
+                self,
+                '_clear_crypto_entry_lock_if_owned',
+                None,
+            )
+            if callable(clearer):
+                clearer(
+                    f'PENDING_PROTECTION_RECONCILIATION:{symbol}',
+                    f'PENDING_PROTECTION_LOOKUP_UNKNOWN:{symbol}',
+                    f'EMA200_POSITION_STATE_MISMATCH:{symbol}',
+                )
         return 1
 
     @staticmethod
