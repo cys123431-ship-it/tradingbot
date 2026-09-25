@@ -1,5 +1,8 @@
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
+
+from zoneinfo import ZoneInfo
 
 import emas
 
@@ -57,6 +60,129 @@ def _eligible_kwargs(symbol, side):
         "next_scan_symbol": symbol,
         "evaluated_symbol": symbol,
     }
+
+
+def _insert_automatic_trade(db, *, symbol, entry_time, exit_time=None):
+    with db.lock:
+        db.conn.execute(
+            """INSERT INTO trades (symbol, side, entry_price, quantity,
+            entry_time, exit_time, strategy) VALUES (?, 'long', 100, 1, ?, ?, ?)""",
+            (symbol, entry_time.isoformat(),
+             exit_time.isoformat() if exit_time else None,
+             'ema200_utbot_rsi_2h'),
+        )
+        db.conn.commit()
+
+
+def test_automatic_symbol_reentry_waits_one_hour_from_confirmed_close(tmp_path):
+    db = emas.DBManager(str(tmp_path / 'trades.db'))
+    engine = _build_engine(tmp_path)
+    engine.db = db
+    closed_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+    _insert_automatic_trade(
+        db, symbol='BTC/USDT:USDT', entry_time=closed_at - timedelta(hours=2),
+        exit_time=closed_at,
+    )
+
+    locked, reason = engine._is_automatic_daily_symbol_entry_locked('BTCUSDT')
+    assert locked and '1시간' in reason
+    assert engine._build_utbreakout_execution_eligibility(
+        **_eligible_kwargs('BTC/USDT:USDT', 'short')
+    )['can_attempt'] is False
+    assert engine._is_automatic_daily_symbol_entry_locked('ETHUSDT')[0] is False
+
+    # Restart with a separate engine and SQLite connection.  The completed
+    # close timestamp, not the entry date or in-memory lock, is authoritative.
+    db.conn.close()
+    restarted = _build_engine(tmp_path)
+    restarted.db = emas.DBManager(str(tmp_path / 'trades.db'))
+    assert restarted._is_automatic_daily_symbol_entry_locked('BTCUSDT')[0]
+    boundary = closed_at + timedelta(hours=1)
+    assert restarted._is_automatic_daily_symbol_entry_locked(
+        'BTCUSDT', now=boundary - timedelta(microseconds=1)
+    )[0]
+    assert restarted._is_automatic_daily_symbol_entry_locked(
+        'BTCUSDT', now=boundary
+    )[0] is False
+
+
+def test_automatic_symbol_reentry_does_not_expire_before_confirmed_close(tmp_path):
+    engine = _build_engine(tmp_path)
+    engine.db = emas.DBManager(str(tmp_path / 'trades.db'))
+    now = datetime.now(timezone.utc)
+    _insert_automatic_trade(
+        engine.db, symbol='SOL/USDT:USDT', entry_time=now - timedelta(hours=4),
+    )
+    locked, reason = engine._is_automatic_daily_symbol_entry_locked(
+        'SOLUSDT', now=now,
+    )
+    assert locked and '청산' in reason
+
+
+def test_automatic_symbol_reentry_waits_across_korea_midnight(tmp_path):
+    engine = _build_engine(tmp_path)
+    engine.db = emas.DBManager(str(tmp_path / 'trades.db'))
+    kst = ZoneInfo('Asia/Seoul')
+    closed_at = datetime(2026, 9, 24, 23, 45, tzinfo=kst)
+    _insert_automatic_trade(
+        engine.db, symbol='DOGE/USDT:USDT',
+        entry_time=closed_at - timedelta(hours=2), exit_time=closed_at,
+    )
+    assert engine._is_automatic_daily_symbol_entry_locked(
+        'DOGEUSDT', now=closed_at + timedelta(minutes=30),
+    )[0]
+    assert engine._is_automatic_daily_symbol_entry_locked(
+        'DOGEUSDT', now=closed_at + timedelta(hours=1),
+    )[0] is False
+
+
+def test_ema_direct_entry_is_blocked_during_symbol_reentry_wait(tmp_path):
+    engine = _build_engine(tmp_path)
+    engine.get_runtime_strategy_params = lambda: {
+        'active_strategy': emas.EMA200_UTBOT_RSI_STRATEGY,
+    }
+    engine.db = emas.DBManager(str(tmp_path / 'trades.db'))
+    closed_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+    _insert_automatic_trade(
+        engine.db, symbol='BTC/USDT:USDT',
+        entry_time=closed_at - timedelta(hours=2), exit_time=closed_at,
+    )
+
+    asyncio.run(engine.entry('BTC/USDT:USDT', 'long', 100.0))
+
+    assert '1시간 재진입 대기' in engine.last_entry_reason['BTC/USDT:USDT']
+
+
+def test_automatic_symbol_lock_stays_closed_while_fill_is_missing_from_db(tmp_path):
+    engine = _build_engine(tmp_path)
+    engine.db = emas.DBManager(str(tmp_path / 'trades.db'))
+    old_close = datetime.now(timezone.utc) - timedelta(hours=3)
+    _insert_automatic_trade(
+        engine.db, symbol='BTC/USDT:USDT',
+        entry_time=old_close - timedelta(hours=1), exit_time=old_close,
+    )
+    engine._record_automatic_daily_symbol_entry_lock(
+        'BTCUSDT', side='long', strategy='ema200_utbot_rsi_2h'
+    )
+    assert engine._is_automatic_daily_symbol_entry_locked('BTCUSDT')[0]
+
+    restarted = _build_engine(tmp_path)
+    restarted.db = emas.DBManager(str(tmp_path / 'trades.db'))
+    restarted._utbreakout_today_key = lambda: '2026-09-27'
+    restarted._load_utbreakout_daily_sl_lockouts()
+    assert restarted._is_automatic_daily_symbol_entry_locked('BTCUSDT')[0]
+
+
+def test_automatic_symbol_entry_history_lookup_error_blocks_entry(tmp_path):
+    engine = _build_engine(tmp_path)
+
+    class FailingDB:
+        def get_latest_automatic_symbol_trade(self, _symbol):
+            raise RuntimeError('test DB failure')
+
+    engine.db = FailingDB()
+    locked, reason = engine._is_automatic_daily_symbol_entry_locked('BTCUSDT')
+    assert locked and '이력을 확인할 수 없어' in reason
 
 
 def test_daily_sl_lockout_blocks_long_and_short_for_same_symbol_only(tmp_path):
@@ -155,7 +281,7 @@ def test_daily_sl_lockout_persists_and_expires_by_day(tmp_path):
     assert json.loads(path.read_text(encoding="utf-8")) == {}
 
 
-def test_confirmed_automatic_entry_locks_both_sides_until_next_kst_day(tmp_path):
+def test_confirmed_automatic_entry_without_db_stays_locked_across_kst_midnight(tmp_path):
     engine = _build_engine(tmp_path)
     engine._utbreakout_today_key = lambda: "2026-09-01"
 
@@ -171,7 +297,7 @@ def test_confirmed_automatic_entry_locks_both_sides_until_next_kst_day(tmp_path)
             "HEMIUSDT"
         )
         assert locked is True
-        assert "오늘 이미 자동매매로 진입" in reason
+        assert "청산을 확인할 수 없어" in reason
         eligibility = engine._build_utbreakout_execution_eligibility(
             **_eligible_kwargs("HEMI/USDT:USDT", side)
         )
@@ -179,10 +305,15 @@ def test_confirmed_automatic_entry_locks_both_sides_until_next_kst_day(tmp_path)
 
     engine._utbreakout_today_key = lambda: "2026-09-02"
     locked, _ = engine._is_automatic_daily_symbol_entry_locked("HEMIUSDT")
-    assert locked is False
+    assert locked is True
+
+    restarted = _build_engine(tmp_path)
+    restarted._utbreakout_today_key = lambda: "2026-09-02"
+    restarted._load_utbreakout_daily_sl_lockouts()
+    assert restarted._is_automatic_daily_symbol_entry_locked("HEMIUSDT")[0]
 
 
-def test_daily_symbol_lock_restores_from_automatic_trade_db_only(tmp_path):
+def test_automatic_symbol_without_confirmed_close_blocks_from_legacy_db(tmp_path):
     engine = _build_engine(tmp_path)
 
     class DB:
@@ -202,11 +333,9 @@ def test_daily_symbol_lock_restores_from_automatic_trade_db_only(tmp_path):
     locked, reason = engine._is_automatic_daily_symbol_entry_locked("SOLUSDT")
 
     assert locked is True
-    assert "AUTOMATIC_ENTRY_RESTORED_FROM_DB" in reason
+    assert "청산 확인 전" in reason
     assert engine.db.calls == ["SOL/USDT:USDT"]
-    assert engine.utbreakout_daily_sl_symbol_lockouts["SOL/USDT:USDT"][
-        "lock_type"
-    ] == "DAILY_AUTOMATIC_SYMBOL_ENTRY"
+    assert engine.utbreakout_daily_sl_symbol_lockouts == {}
 
 
 def test_sl_fill_lockout_uses_exchange_order_status_or_stop_price(tmp_path):

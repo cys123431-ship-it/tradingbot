@@ -278,6 +278,37 @@ class DBManager:
             "strategy": row[3],
         }
 
+    def get_latest_automatic_symbol_trade(self, symbol):
+        """Return the newest automatic entry and its confirmed close across days.
+
+        A close that is still being reconciled has no ``exit_time``; callers
+        must keep blocking re-entry until that close is recorded.  An archived
+        exchange-flat legacy trade uses its confirmed reconciliation time.
+        """
+        normalized_symbol = (
+            str(symbol or "").strip().upper()
+            .replace(":USDT", "").replace("/", "").replace("-", "")
+        )
+        if not normalized_symbol:
+            return None
+        with self.lock:
+            row = self.conn.execute(
+                """SELECT symbol, side, entry_time, exit_time,
+                          reconciliation_archived_at, strategy
+                FROM trades
+                WHERE LOWER(COALESCE(strategy, '')) NOT IN ('user_custom', 'custom_entry')
+                  AND REPLACE(REPLACE(REPLACE(UPPER(symbol), ':USDT', ''), '/', ''), '-', '') = ?
+                ORDER BY COALESCE(julianday(entry_time), 0) DESC, id DESC LIMIT 1""",
+                (normalized_symbol,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "symbol": row[0], "side": row[1], "entry_time": row[2],
+            "exit_time": row[3], "reconciliation_archived_at": row[4],
+            "strategy": row[5],
+        }
+
     def get_recent_closed_trade_pnls(
         self,
         limit=10,

@@ -870,7 +870,7 @@ class SignalRuntimeMixin:
         strategy: str | None = None,
         detail: str = "",
     ) -> None:
-        """Persist a same-KST-day re-entry lock after a confirmed bot fill."""
+        """Write ahead of the trade DB insert until the fill can be reconciled."""
         normalized_symbol = self._normalize_market_symbol(symbol)
         if not normalized_symbol:
             return
@@ -913,70 +913,111 @@ class SignalRuntimeMixin:
             return None
         return loader(symbol)
 
+    def _latest_automatic_symbol_trade_from_db(self, symbol: str):
+        db = getattr(self, 'db', None)
+        loader = getattr(db, 'get_latest_automatic_symbol_trade', None)
+        if callable(loader):
+            return loader(symbol)
+        # Compatibility for older database adapters.  They cannot prove a
+        # close, so their historical entry must keep blocking re-entry.
+        return self._daily_automatic_symbol_entry_from_db(symbol)
+
     def _is_automatic_daily_symbol_entry_locked(
         self,
         symbol: str,
+        *,
+        now: datetime | None = None,
     ) -> tuple[bool, str]:
-        """Block automatic long or short re-entry after today's first fill."""
+        """Wait one hour after a confirmed close before same-symbol re-entry."""
         normalized_symbol = self._normalize_market_symbol(symbol)
         if not normalized_symbol:
             return False, ""
 
+        reference = now or datetime.now(timezone.utc)
+        if reference.tzinfo is None:
+            reference = reference.replace(tzinfo=timezone.utc)
+        reference = reference.astimezone(timezone.utc)
         lockouts = self._ensure_runtime_state_container(
             'utbreakout_daily_sl_symbol_lockouts'
         )
-        today_key = self._utbreakout_today_key()
+        today_key = (
+            reference.astimezone(_KST).date().isoformat()
+            if now is not None else self._utbreakout_today_key()
+        )
         record = lockouts.get(normalized_symbol)
-        if isinstance(record, dict) and record.get("date") != today_key:
+        automatic_record = (
+            isinstance(record, dict)
+            and record.get('lock_type') == 'DAILY_AUTOMATIC_SYMBOL_ENTRY'
+        )
+        # UTBreakout stop-loss lockouts are an independent daily risk guard.
+        # Their existing deadline is not changed by the entry cooldown.
+        if isinstance(record, dict) and not automatic_record and record.get('date') == today_key:
+            reason = str(record.get('reason') or 'STOP_LOSS_FILLED')
+            return True, (
+                '당일 종목 재진입 금지: 손절 안전 잠금이 유지 중입니다. '
+                f'({reason}; daily symbol entry lockout; daily stop-loss lockout)'
+            )
+        if isinstance(record, dict) and not automatic_record:
             lockouts.pop(normalized_symbol, None)
             self._save_utbreakout_daily_sl_lockouts()
             record = None
 
-        if not isinstance(record, dict):
+        try:
+            db_entry = self._latest_automatic_symbol_trade_from_db(normalized_symbol)
+        except Exception as exc:
+            if getattr(self, 'db', None) is not None:
+                logger.error('Automatic symbol close lookup failed for %s: %s', normalized_symbol, exc)
+                return True, '종목 청산 이력을 확인할 수 없어 신규 진입을 차단했습니다. (symbol close unavailable)'
+            db_entry = None
+
+        if not isinstance(db_entry, dict):
+            if automatic_record and getattr(self, 'db', None) is not None:
+                return True, '체결된 종목의 거래 DB 기록을 확인할 때까지 재진입을 차단합니다.'
+            # A confirmed fill before its DB insert can survive a restart or
+            # a KST midnight.  Without a matching close it must remain locked.
+            if automatic_record:
+                return True, '종목 청산을 확인할 수 없어 재진입을 차단합니다.'
+            return False, ''
+
+        def _parsed_utc(value):
             try:
-                db_entry = self._daily_automatic_symbol_entry_from_db(
-                    normalized_symbol
-                )
-            except Exception as exc:
-                # A database that exists but cannot answer the query must not
-                # silently disable this order-safety rule.
-                if getattr(self, 'db', None) is not None:
-                    logger.error(
-                        "Daily automatic symbol history lookup failed for %s: %s",
-                        normalized_symbol,
-                        exc,
-                    )
-                    return True, (
-                        "당일 종목 거래 이력을 확인할 수 없어 안전상 신규 진입을 "
-                        "차단했습니다. (daily symbol history unavailable)"
-                    )
-                db_entry = None
-            if isinstance(db_entry, dict):
-                record = {
-                    "date": today_key,
-                    "reason": "AUTOMATIC_ENTRY_RESTORED_FROM_DB",
-                    "side": db_entry.get("side"),
-                    "strategy": db_entry.get("strategy"),
-                    "entry_time": db_entry.get("entry_time"),
-                    "ts": int(time.time() * 1000),
-                    "lock_type": "DAILY_AUTOMATIC_SYMBOL_ENTRY",
-                }
-                lockouts[normalized_symbol] = record
-                self._save_utbreakout_daily_sl_lockouts()
+                parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone(timezone.utc)
+            except (TypeError, ValueError, OverflowError):
+                return None
 
-        if not isinstance(record, dict):
-            return False, ""
+        entry_time = _parsed_utc(db_entry.get('entry_time'))
+        if entry_time is None:
+            return True, '최근 자동매매의 진입 시각이 불확실하여 재진입을 차단합니다.'
+        if automatic_record and record.get('reason') == 'AUTOMATIC_ENTRY_FILLED':
+            try:
+                pending_fill_ms = int(record.get('ts') or 0)
+            except (TypeError, ValueError, OverflowError):
+                pending_fill_ms = 0
+            if pending_fill_ms > int(entry_time.timestamp() * 1000):
+                return True, '최근 체결의 거래 DB 반영을 기다리는 동안 재진입을 차단합니다.'
 
-        reason = str(record.get("reason") or "AUTOMATIC_ENTRY_FILLED")
-        return True, (
-            "당일 종목 재진입 금지: 오늘 이미 자동매매로 진입한 종목입니다. "
-            f"한국시간 자정 이후 새 조건에서 다시 허용됩니다. ({reason}; "
-            "daily symbol entry lockout)"
+        close_time = _parsed_utc(
+            db_entry.get('exit_time') or db_entry.get('reconciliation_archived_at')
         )
+        if close_time is None:
+            return True, '종목 청산 확인 전에는 같은 종목에 다시 진입할 수 없습니다.'
+        if close_time < entry_time:
+            return True, '종목 청산 시각이 진입보다 이전이어서 재진입을 차단합니다.'
+        remaining = 3600.0 - (reference - close_time).total_seconds()
+        if remaining > 0:
+            remaining_min = max(1, int((remaining + 59.0) // 60.0))
+            return True, f'종목 청산 후 1시간 재진입 대기: 약 {remaining_min}분 남았습니다.'
+
+        if automatic_record:
+            lockouts.pop(normalized_symbol, None)
+            self._save_utbreakout_daily_sl_lockouts()
+        return False, ''
 
     def _is_utbreakout_daily_sl_locked(self, symbol: str) -> tuple[bool, str]:
-        # Backward-compatible alias used by the status and bridge code.  The
-        # old loss-only lock is now a universal same-symbol daily entry lock.
+        # Backward-compatible alias for the UTBreakout entry status/bridge.
         return self._is_automatic_daily_symbol_entry_locked(symbol)
 
     def _utbreakout_recent_loss_cooldown_config(self, cfg=None):
@@ -1188,7 +1229,10 @@ class SignalRuntimeMixin:
                 today_key = self._utbreakout_today_key()
                 filtered = {}
                 for symbol, record in data.items():
-                    if not isinstance(record, dict) or record.get("date") != today_key:
+                    if not isinstance(record, dict):
+                        continue
+                    if (record.get('lock_type') != 'DAILY_AUTOMATIC_SYMBOL_ENTRY'
+                            and record.get('date') != today_key):
                         continue
                     normalized_symbol = self._normalize_market_symbol(symbol)
                     if normalized_symbol:

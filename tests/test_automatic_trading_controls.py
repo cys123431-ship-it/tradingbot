@@ -318,6 +318,27 @@ def test_daily_automatic_symbol_entry_resets_at_korea_midnight(tmp_path):
     ) is None
 
 
+def test_latest_automatic_symbol_trade_uses_newest_close_and_aliases(tmp_path):
+    db = emas.DBManager(str(tmp_path / 'trades.db'))
+    with db.lock:
+        db.conn.executemany(
+            """INSERT INTO trades (symbol, side, entry_time, exit_time, strategy)
+               VALUES (?, 'long', ?, ?, ?)""",
+            [
+                ('BTC/USDT:USDT', '2026-09-23T10:00:00+00:00',
+                 '2026-09-23T11:00:00+00:00', 'ema200_utbot_rsi_2h'),
+                ('BTCUSDT', '2026-09-24T11:00:00+00:00',
+                 '2026-09-24T12:00:00+00:00', 'ema200_utbot_rsi_2h'),
+                ('BTC/USDT:USDT', '2026-09-25T09:00:00+00:00', None, 'user_custom'),
+            ],
+        )
+        db.conn.commit()
+
+    latest = db.get_latest_automatic_symbol_trade('BTC/USDT')
+    assert latest['entry_time'] == '2026-09-24T11:00:00+00:00'
+    assert latest['exit_time'] == '2026-09-24T12:00:00+00:00'
+
+
 def test_daily_stats_use_korea_calendar_day_boundary(tmp_path):
     db = emas.DBManager(str(tmp_path / "trades.db"))
     kst_now = datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Seoul"))

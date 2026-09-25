@@ -3948,8 +3948,8 @@ class SignalBreakoutStatusMixin:
                 or "daily symbol entry lockout active"
             )
             lockout_msg = (
-                f"당일 재진입 차단: {symbol} - {daily_symbol_lockout_reason}; "
-                "same-day symbol re-entry blocked for both LONG and SHORT"
+                f"종목 재진입 대기: {symbol} - {daily_symbol_lockout_reason}; "
+                "same-symbol re-entry blocked for both LONG and SHORT"
             )
             long_lines.append(lockout_msg)
             short_lines.append(lockout_msg)
