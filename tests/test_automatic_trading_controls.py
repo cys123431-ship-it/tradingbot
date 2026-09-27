@@ -13,7 +13,11 @@ from bot_runtime.controller_automatic_controls import (
     AUTOMATIC_SCAN_SCOPE_TRADIFI,
     ControllerAutomaticTradingControlsMixin,
 )
-from bot_runtime.signal_automatic_controls import SignalAutomaticControlsMixin
+from bot_runtime.signal_automatic_controls import (
+    AUTOMATIC_WEEKEND_ENTRY_BLOCK_EFFECTIVE_DATE,
+    SignalAutomaticControlsMixin,
+    automatic_weekend_entry_block_reason,
+)
 
 
 class _ConfigStub:
@@ -197,6 +201,47 @@ class _ScopeEngine(SignalAutomaticControlsMixin):
 
     def is_upbit_mode(self):
         return False
+
+
+@pytest.mark.parametrize(
+    "now,blocked",
+    [
+        (datetime(2026, 9, 27, 12, 0, tzinfo=timezone.utc), False),
+        (datetime(2026, 10, 2, 14, 59, 59, tzinfo=timezone.utc), False),
+        (datetime(2026, 10, 2, 15, 0, 0, tzinfo=timezone.utc), True),
+        (datetime(2026, 10, 4, 14, 59, 59, tzinfo=timezone.utc), True),
+        (datetime(2026, 10, 4, 15, 0, 0, tzinfo=timezone.utc), False),
+    ],
+)
+def test_automatic_weekend_entry_block_uses_korea_calendar_boundaries(now, blocked):
+    reason = automatic_weekend_entry_block_reason(now=now)
+
+    assert (reason is not None) is blocked
+    if blocked:
+        assert "WEEKEND_ENTRY_BLOCK_KST" in reason
+
+
+def test_automatic_weekend_entry_block_starts_from_requested_date():
+    assert AUTOMATIC_WEEKEND_ENTRY_BLOCK_EFFECTIVE_DATE.isoformat() == "2026-09-28"
+    before_effective_sunday = datetime(
+        2026, 9, 27, 12, 0, tzinfo=ZoneInfo("Asia/Seoul")
+    )
+
+    assert automatic_weekend_entry_block_reason(before_effective_sunday) is None
+
+
+def test_signal_entry_stops_before_strategy_work_on_korea_weekend():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.last_entry_reason = {}
+    engine.is_user_custom_entry_mode_enabled = lambda: False
+    engine._automatic_weekend_entry_block_reason = lambda: (
+        "WEEKEND_ENTRY_BLOCK_KST: test"
+    )
+
+    assert asyncio.run(engine.entry("BTC/USDT:USDT", "long", 100.0)) is None
+    assert engine.last_entry_reason["BTC/USDT:USDT"].startswith(
+        "WEEKEND_ENTRY_BLOCK_KST"
+    )
 
 
 @pytest.mark.parametrize(
@@ -433,6 +478,32 @@ def test_final_live_gateway_rechecks_automatic_daily_limit():
     plan = SimpleNamespace(symbol="BTC/USDT:USDT", side="long", engine="UTBREAK")
 
     with pytest.raises(emas.TradingSafetyError, match="REJECTED_DAILY_TRADE_LIMIT"):
+        asyncio.run(live_orders.execute_live_order_plan(owner, plan, {}))
+
+
+def test_live_order_plan_blocks_korea_weekend_before_exchange_setup():
+    from bot_runtime import live_orders
+
+    async def tradeable(symbol):
+        return symbol
+
+    async def scope_allowed(symbol):
+        return symbol
+
+    owner = SimpleNamespace(
+        ctrl=SimpleNamespace(_assert_symbol_tradeable_in_current_exchange_mode=tradeable),
+        _assert_automatic_entry_scan_scope=scope_allowed,
+        _automatic_weekend_entry_block_reason=lambda: (
+            "WEEKEND_ENTRY_BLOCK_KST: test"
+        ),
+    )
+    plan = SimpleNamespace(
+        symbol="BTC/USDT:USDT",
+        side="long",
+        engine="ema200_utbot_rsi_2h",
+    )
+
+    with pytest.raises(emas.TradingSafetyError, match="WEEKEND_ENTRY_BLOCK_KST"):
         asyncio.run(live_orders.execute_live_order_plan(owner, plan, {}))
 
 

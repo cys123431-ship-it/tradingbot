@@ -271,6 +271,35 @@ class SignalEntryMixin:
                     side,
                 )
                 return
+            weekend_guard = getattr(
+                self,
+                '_automatic_weekend_entry_block_reason',
+                None,
+            )
+            if callable(weekend_guard):
+                try:
+                    weekend_reason = weekend_guard()
+                except Exception as weekend_error:
+                    weekend_reason = (
+                        'WEEKEND_ENTRY_GUARD_UNAVAILABLE: '
+                        f'{type(weekend_error).__name__}'
+                    )
+                    logger.exception(
+                        'Automatic weekend entry guard failed closed: symbol=%s',
+                        symbol,
+                    )
+                if weekend_reason:
+                    if not isinstance(getattr(self, 'last_entry_reason', None), dict):
+                        self.last_entry_reason = {}
+                    self.last_entry_reason[str(symbol)] = str(weekend_reason)
+                    logger.info(
+                        'Automatic strategy entry blocked by Korea weekend policy: '
+                        'symbol=%s side=%s reason=%s',
+                        symbol,
+                        side,
+                        weekend_reason,
+                    )
+                    return
             trace_strategy_params = self.get_runtime_strategy_params()
             trace_active_strategy = str(
                 trace_strategy_params.get('active_strategy', '') or ''

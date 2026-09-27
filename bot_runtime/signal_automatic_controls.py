@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
 from utbreakout.coinselector import market_is_tradifi_perpetual
 
@@ -13,6 +15,28 @@ from .controller_automatic_controls import (
     AUTOMATIC_SCAN_SCOPE_CRYPTO,
     AUTOMATIC_SCAN_SCOPE_TRADIFI,
 )
+
+
+AUTOMATIC_WEEKEND_ENTRY_BLOCK_EFFECTIVE_DATE = date(2026, 9, 28)
+_AUTOMATIC_WEEKEND_ENTRY_TIMEZONE = ZoneInfo("Asia/Seoul")
+
+
+def automatic_weekend_entry_block_reason(now=None):
+    """Return a reason while an automatic entry falls on Saturday/Sunday KST."""
+    current = now if now is not None else datetime.now(timezone.utc)
+    if not isinstance(current, datetime):
+        raise TypeError("now must be a datetime")
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    korea_now = current.astimezone(_AUTOMATIC_WEEKEND_ENTRY_TIMEZONE)
+    if korea_now.date() < AUTOMATIC_WEEKEND_ENTRY_BLOCK_EFFECTIVE_DATE:
+        return None
+    if korea_now.weekday() < 5:
+        return None
+    return (
+        "WEEKEND_ENTRY_BLOCK_KST: 한국시간 토·일요일에는 "
+        "신규 자동진입을 중단합니다"
+    )
 
 
 class _AutomaticDailyEntryCount(int):
@@ -69,6 +93,9 @@ class SignalAutomaticControlsMixin:
 
     _SMALL_ACCOUNT_UNLIMITED_ENTRY_THRESHOLD_USDT = 1_000.0
     _AUTOMATIC_ENTRY_EQUITY_CACHE_TTL_SEC = 15.0
+
+    def _automatic_weekend_entry_block_reason(self, now=None):
+        return automatic_weekend_entry_block_reason(now=now)
 
     def _automatic_entry_limit_cached_equity(self):
         cached = getattr(self, '_automatic_entry_limit_equity_cache', None)
@@ -264,4 +291,8 @@ class SignalAutomaticControlsMixin:
         return market_symbol
 
 
-__all__ = ("SignalAutomaticControlsMixin",)
+__all__ = (
+    "AUTOMATIC_WEEKEND_ENTRY_BLOCK_EFFECTIVE_DATE",
+    "SignalAutomaticControlsMixin",
+    "automatic_weekend_entry_block_reason",
+)

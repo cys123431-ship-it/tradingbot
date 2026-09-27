@@ -94,6 +94,85 @@ def test_gateway_result_mapping(tmp_path, monkeypatch):
     assert result.submission_error == "unknown"
 
 
+def test_final_gateway_blocks_automatic_weekend_entry_before_submission(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(emas, "PAUSE_STATE_FILE", str(tmp_path / "missing.json"))
+
+    class Service:
+        exchange = None
+
+        def __init__(self):
+            self.calls = 0
+
+        async def submit_entry(self, **kwargs):
+            self.calls += 1
+            raise AssertionError("weekend automatic entry reached exchange gateway")
+
+    service = Service()
+    engine = _engine(tmp_path, service)
+    engine._automatic_weekend_entry_block_reason = lambda: (
+        "WEEKEND_ENTRY_BLOCK_KST: test"
+    )
+
+    outcome = asyncio.run(
+        emas._submit_idempotent_crypto_entry(
+            engine,
+            "BTC/USDT:USDT",
+            "buy",
+            1.0,
+            "ema200_utbot_rsi_2h",
+        )
+    )
+
+    assert outcome.entry_block_reason == "WEEKEND_ENTRY_BLOCK_KST: test"
+    assert service.calls == 0
+
+
+def test_final_gateway_allows_user_custom_entry_during_weekend(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(emas, "PAUSE_STATE_FILE", str(tmp_path / "missing.json"))
+
+    class Service:
+        exchange = None
+
+        def __init__(self):
+            self.calls = 0
+
+        async def submit_entry(self, **kwargs):
+            self.calls += 1
+            return SimpleNamespace(
+                state=OrderState.ACKNOWLEDGED,
+                accepted=True,
+                recovered=False,
+                error=None,
+                client_order_id="manual-entry",
+            )
+
+    service = Service()
+    engine = _engine(tmp_path, service)
+    engine._automatic_weekend_entry_block_reason = lambda: (
+        "WEEKEND_ENTRY_BLOCK_KST: test"
+    )
+
+    outcome = asyncio.run(
+        emas._submit_idempotent_crypto_entry(
+            engine,
+            "BTC/USDT:USDT",
+            "buy",
+            1.0,
+            "USER_CUSTOM",
+        )
+    )
+
+    assert outcome.entry_block_reason is None
+    assert outcome.submission is not None
+    assert service.calls == 1
+
+
 def test_closed_signal_replay_is_an_entry_block_not_an_order_failure(
     tmp_path,
     monkeypatch,

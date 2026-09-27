@@ -812,6 +812,8 @@ async def _handle_noncritical_entry_block(
     logger.info("Entry blocked before exchange submission: symbol=%s reason=%s phase=%s", symbol, reason, phase)
 
 async def _submit_idempotent_crypto_entry(self, symbol, side, qty, strategy, payload=None):
+    normalized_strategy = str(strategy or '').strip().lower()
+    user_custom_entry = normalized_strategy in {'user_custom', 'custom_entry'}
     custom_mode_enabled = False
     custom_mode_reader = getattr(self, 'is_user_custom_entry_mode_enabled', None)
     if callable(custom_mode_reader):
@@ -819,7 +821,7 @@ async def _submit_idempotent_crypto_entry(self, symbol, side, qty, strategy, pay
             custom_mode_enabled = bool(custom_mode_reader())
         except Exception:
             custom_mode_enabled = False
-    if custom_mode_enabled and str(strategy or '').strip().upper() != 'USER_CUSTOM':
+    if custom_mode_enabled and not user_custom_entry:
         return EntrySubmitOutcome.entry_block(
             'USER_CUSTOM_MODE_ACTIVE: automatic strategy entry is suspended'
         )
@@ -828,6 +830,28 @@ async def _submit_idempotent_crypto_entry(self, symbol, side, qty, strategy, pay
     pause_decision = evaluate_critical_pause_block(state=pause_state, requested_symbol=symbol)
     if pause_decision.blocked:
         return EntrySubmitOutcome.critical_block(pause_decision)
+
+    if not user_custom_entry:
+        weekend_guard = getattr(
+            self,
+            '_automatic_weekend_entry_block_reason',
+            None,
+        )
+        if callable(weekend_guard):
+            try:
+                weekend_reason = weekend_guard()
+            except Exception as weekend_error:
+                logger.exception(
+                    'Automatic weekend entry guard failed closed at final gateway: '
+                    'symbol=%s',
+                    symbol,
+                )
+                weekend_reason = (
+                    'WEEKEND_ENTRY_GUARD_UNAVAILABLE: '
+                    f'{type(weekend_error).__name__}'
+                )
+            if weekend_reason:
+                return EntrySubmitOutcome.entry_block(str(weekend_reason))
 
     payload_map = payload if isinstance(payload, dict) else {}
     daily_loss_exempt = bool(

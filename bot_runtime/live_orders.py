@@ -53,6 +53,21 @@ async def execute_live_order_plan(self, plan, cfg):
                     "REJECTED_DAILY_TRADE_LIMIT: automatic daily trade count "
                     f"{daily_entries} >= {daily_limit}"
                 )
+        weekend_guard = getattr(
+            automatic_owner,
+            "_automatic_weekend_entry_block_reason",
+            None,
+        )
+        if callable(weekend_guard):
+            try:
+                weekend_reason = weekend_guard()
+            except Exception as weekend_error:
+                raise TradingSafetyError(
+                    "WEEKEND_ENTRY_GUARD_UNAVAILABLE: "
+                    f"{type(weekend_error).__name__}"
+                ) from weekend_error
+            if weekend_reason:
+                raise TradingSafetyError(str(weekend_reason))
     cfg = enforce_activation_stage(cfg if isinstance(cfg, dict) else {})
     if _normalize_live_real_stage(cfg.get("live_activation_stage")) == "LIVE_REAL_SMALL_CAP":
         if bool(cfg.get("testnet", False)):
