@@ -429,6 +429,45 @@ def _set_if_different(container, key_name, value):
     return False
 
 
+def _set_if_missing(container, key_name, value):
+    """Seed a default without overwriting a value the user set via Telegram."""
+    if not isinstance(container, dict):
+        return False
+    if key_name not in container or container.get(key_name) is None:
+        container[key_name] = value
+        return True
+    return False
+
+
+def _set_at_least(container, key_name, floor):
+    if not isinstance(container, dict):
+        return False
+    try:
+        current = float(container.get(key_name))
+    except (TypeError, ValueError):
+        current = None
+    if current is None or current < floor:
+        container[key_name] = floor
+        return True
+    return False
+
+
+# Settings the Telegram menus let the user change directly.  The profile only
+# seeds them when missing so a user's ON/OFF or timeframe choice is not
+# silently reverted on the next entry or config read.
+USER_CONTROLLED_COMMON_DEFAULTS = {
+    "scanner_enabled": True,
+    "scanner_timeframe": "5m",
+    "scanner_exit_timeframe": "15m",
+}
+USER_CONTROLLED_SELECTOR_DEFAULTS = {
+    "enabled": True,
+    "custom_relax_discovery": True,
+    "selection_quality_enabled": True,
+}
+MIN_QUOTE_VOLUME_FLOOR_USDT = 100_000_000.0
+
+
 def apply_opportunity_tuning(engine):
     """Make UTBreakout more opportunity-oriented while keeping one-position safety."""
 
@@ -448,22 +487,19 @@ def apply_opportunity_tuning(engine):
     changed = False
 
     # Scanner: scan faster and do not require a large move before a candidate is considered.
-    changed |= _set_if_different(common, "scanner_enabled", True)
-    changed |= _set_if_different(common, "scanner_timeframe", "5m")
-    changed |= _set_if_different(common, "scanner_exit_timeframe", "15m")
+    for k, v in USER_CONTROLLED_COMMON_DEFAULTS.items():
+        changed |= _set_if_missing(common, k, v)
     changed |= _set_if_different(common, "scanner_min_rise_pct", 0.20)
     changed |= _set_if_different(common, "scanner_max_rise_pct", 15.0)
 
     # CoinSelector: refresh more often while keeping the user's 100M USDT
     # liquidity floor as a non-negotiable live-entry safeguard.
     selector_updates = {
-        "enabled": True,
         "analysis_limit": 80,
         "analysis_batch_size": 12,
         "top_n": 20,
         "max_strategy_evaluations_per_cycle": 3,
         "min_final_score": 45.0,
-        "min_quote_volume_usdt": 100_000_000.0,
         "ideal_quote_volume_usdt": 1_000_000_000.0,
         "min_trade_count": 5_000,
         "ideal_trade_count": 120_000,
@@ -472,12 +508,14 @@ def apply_opportunity_tuning(engine):
         "refresh_interval_seconds": 90,
         "rate_limit_backoff_seconds": 120,
         "candidate_cooldown_enabled": False,
-        "custom_relax_discovery": True,
-        "selection_quality_enabled": True,
         "selection_max_rebound_pct": 22.0,
     }
     for k, v in selector_updates.items():
         changed |= _set_if_different(selector, k, v)
+    for k, v in USER_CONTROLLED_SELECTOR_DEFAULTS.items():
+        changed |= _set_if_missing(selector, k, v)
+    # A higher user floor is allowed; anything below 100M USDT is raised.
+    changed |= _set_at_least(selector, "min_quote_volume_usdt", MIN_QUOTE_VOLUME_FLOOR_USDT)
 
     # DOGE-style high-beta coins should not be silently filtered when the user chose them.
     excluded = selector.get("excluded_sectors")

@@ -51,7 +51,9 @@ def test_opportunity_tuning_persists_changed_runtime_config():
     selector = signal["coin_selector"]
     ut_cfg = signal["strategy_params"]["UTBotFilteredBreakoutV1"]
     assert cfg.save_count == 1
-    assert signal["common_settings"]["scanner_enabled"] is True
+    # Telegram-controlled scanner toggle is preserved, not forced back ON.
+    assert signal["common_settings"]["scanner_enabled"] is False
+    assert signal["common_settings"]["scanner_timeframe"] == "5m"
     assert selector["analysis_limit"] == 80
     assert selector["selection_max_rebound_pct"] == 22.0
     assert selector["min_quote_volume_usdt"] == 100_000_000.0
@@ -115,3 +117,51 @@ def test_opportunity_tuning_does_not_rewrite_when_already_current():
 
     assert guard.apply_opportunity_tuning(engine) is False
     assert cfg.save_count == 0
+
+
+def test_opportunity_tuning_preserves_telegram_controlled_settings():
+    root = {
+        "signal_engine": {
+            "common_settings": {
+                "scanner_enabled": False,
+                "scanner_timeframe": "15m",
+                "scanner_exit_timeframe": "1h",
+            },
+            "coin_selector": {
+                "enabled": True,
+                "custom_relax_discovery": False,
+                "selection_quality_enabled": False,
+                "min_quote_volume_usdt": 250_000_000.0,
+            },
+            "strategy_params": {
+                "active_strategy": "UTBOT_ADAPTIVE",
+                "UTBotFilteredBreakoutV1": dict(guard.OPPORTUNITY_OVERRIDES),
+            },
+        },
+    }
+    engine, _ = _engine(root)
+
+    guard.apply_opportunity_tuning(engine)
+
+    common = root["signal_engine"]["common_settings"]
+    selector = root["signal_engine"]["coin_selector"]
+    assert common["scanner_enabled"] is False
+    assert common["scanner_timeframe"] == "15m"
+    assert common["scanner_exit_timeframe"] == "1h"
+    assert selector["custom_relax_discovery"] is False
+    assert selector["selection_quality_enabled"] is False
+    assert selector["min_quote_volume_usdt"] == 250_000_000.0
+
+
+def test_opportunity_tuning_raises_min_quote_volume_to_floor():
+    root = {
+        "signal_engine": {
+            "coin_selector": {"enabled": True, "min_quote_volume_usdt": 20_000_000.0},
+            "strategy_params": {"active_strategy": "UTBOT_ADAPTIVE"},
+        },
+    }
+    engine, _ = _engine(root)
+
+    guard.apply_opportunity_tuning(engine)
+
+    assert root["signal_engine"]["coin_selector"]["min_quote_volume_usdt"] == 100_000_000.0

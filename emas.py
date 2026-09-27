@@ -480,7 +480,12 @@ logging.basicConfig(
     handlers=[
         logging.StreamHandler(),
         BufferHandler(),
-        logging.FileHandler('trading_bot.log', encoding='utf-8')  # 濡쒓렇 ?뚯씪 ???
+        RotatingFileHandler(
+            'trading_bot.log',
+            maxBytes=50 * 1024 * 1024,
+            backupCount=3,
+            encoding='utf-8',
+        ),
     ]
 )
 logger = logging.getLogger(__name__)
@@ -588,6 +593,30 @@ for _runtime_module in (
     bind_runtime_namespace(_runtime_module, globals())
 bind_runtime_methods(globals(), logger=logger)
 
+# Markers set by the launcher patches (global_single_position_guard,
+# utbreakout_live_hardening_patch).  They are installed from watcher threads,
+# so verify them before trading instead of silently running unpatched.
+RUNTIME_PATCH_MARKERS = (
+    "_global_one_position_guard",
+    "_utbreak_live_hardening_patch",
+)
+
+
+def _require_runtime_patches_installed(timeout_seconds=10.0):
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        missing = [
+            marker
+            for marker in RUNTIME_PATCH_MARKERS
+            if not getattr(SignalEngine, marker, False)
+        ]
+        if not missing:
+            return
+        if time.monotonic() >= deadline:
+            logger.critical("RUNTIME_PATCH_MISSING: %s", missing)
+            raise RuntimeError(f"RUNTIME_PATCH_MISSING: {missing}")
+        time.sleep(0.05)
+
 
 if __name__ == "__main__":
     if os.getenv('TRADINGBOT_OFFICIAL_LAUNCHER') != '1':
@@ -611,6 +640,7 @@ if __name__ == "__main__":
             except ProcessLockError as exc:
                 logger.critical("DUPLICATE_PROCESS_DETECTED: %s", exc)
                 raise SystemExit(73) from exc
+        _require_runtime_patches_installed()
         controller = MainController()
         atexit.register(lambda: controller and controller.record_exit_marker("atexit", "process exiting"))
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):

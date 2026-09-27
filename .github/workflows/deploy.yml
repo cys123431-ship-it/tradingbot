@@ -3,6 +3,20 @@ name: Deploy Trading Bot
 on:
   push:
     branches: [ main ]
+    # Changes that cannot affect the crypto bot must not restart it.
+    paths-ignore:
+      - "kstockbot/**"
+      - "docs/**"
+      - "tradingview/**"
+      - "**/*.md"
+      - ".github/workflows/deploy-kstockbot.yml"
+      - ".github/workflows/feature-ema200-ci.yml"
+  workflow_dispatch:
+
+# Never run two deploys against the live server at the same time.
+concurrency:
+  group: deploy-tradingbot
+  cancel-in-progress: false
 
 jobs:
   monitor-check:

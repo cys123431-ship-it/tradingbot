@@ -255,6 +255,10 @@ start_bot() {
     set +a
   fi
   if [[ "$TRUNCATE_LOG" == "1" ]]; then
+    # Keep the previous run's log for post-deploy investigation.
+    if [[ -s "$LOG_FILE" ]]; then
+      mv -f "$LOG_FILE" "$LOG_FILE.prev"
+    fi
     : > "$LOG_FILE"
   fi
 
