@@ -882,6 +882,21 @@ async def _submit_idempotent_crypto_entry(self, symbol, side, qty, strategy, pay
     if recovered and state_name == "PROTECTED":
         return EntrySubmitOutcome.duplicate(result, client_order_id=client_order_id)
 
+    # Replaying a deterministic signal ID after its prior lifecycle reached a
+    # terminal state is an expected idempotency block.  The gateway did not
+    # submit another exchange order, so do not surface it as an order failure.
+    # A later completed candle receives a different signal timestamp and can
+    # enter normally after the separate same-symbol cooldown has elapsed.
+    if (
+        recovered
+        and state_name in {"CLOSED", "CANCELED", "FAILED"}
+        and str(result_error or "").strip().lower() == "signal already handled"
+    ):
+        return EntrySubmitOutcome.entry_block(
+            f"SIGNAL_ALREADY_HANDLED:{state_name}",
+            client_order_id=client_order_id,
+        )
+
     if accepted:
         return EntrySubmitOutcome.success(result, client_order_id=client_order_id)
     else:

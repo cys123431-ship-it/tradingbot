@@ -6,7 +6,14 @@ import pytest
 
 import emas
 from trading_safety.entry_block import CriticalPauseBlockDecision, EntrySubmitOutcome
-from trading_safety.order_state import OrderState, SQLiteTradingStateStore
+from trading_safety.order_gateway import IdempotentOrderGateway
+from trading_safety.order_state import (
+    OrderIntent,
+    OrderRecord,
+    OrderState,
+    SQLiteTradingStateStore,
+    build_client_order_id,
+)
 
 
 def _engine(tmp_path, service):
@@ -85,6 +92,54 @@ def test_gateway_result_mapping(tmp_path, monkeypatch):
     result = asyncio.run(emas._submit_idempotent_crypto_entry(engine, "BTC/USDT:USDT", "buy", 1.0, "UT"))
     assert result.submission is unknown
     assert result.submission_error == "unknown"
+
+
+def test_closed_signal_replay_is_an_entry_block_not_an_order_failure(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(emas, "PAUSE_STATE_FILE", str(tmp_path / "missing.json"))
+    signal_timestamp = 1_700_000_000_000
+    strategy = "ema200_utbot_rsi_2h"
+    symbol = "SOL/USDT:USDT"
+    client_order_id = build_client_order_id(
+        strategy,
+        symbol,
+        "long",
+        signal_timestamp,
+        "entry",
+    )
+    store = SQLiteTradingStateStore(tmp_path / "state.db")
+    store.upsert(
+        OrderRecord(
+            client_order_id=client_order_id,
+            symbol=symbol,
+            side="LONG",
+            strategy=strategy,
+            signal_timestamp=str(signal_timestamp),
+            requested_qty=2.61,
+            order_intent=OrderIntent.ENTRY.value,
+            order_purpose="entry",
+            order_state=OrderState.CLOSED.value,
+        )
+    )
+    service = IdempotentOrderGateway(SimpleNamespace(id="test"), store)
+    engine = _engine(tmp_path, service)
+    outcome = asyncio.run(
+        emas._submit_idempotent_crypto_entry(
+            engine,
+            symbol,
+            "long",
+            2.61,
+            strategy,
+            {"signal_timestamp": signal_timestamp},
+        )
+    )
+
+    assert outcome.entry_block_reason == "SIGNAL_ALREADY_HANDLED:CLOSED"
+    assert outcome.submission is None
+    assert outcome.submission_error is None
+    assert outcome.client_order_id == client_order_id
 
 
 def test_small_account_adaptive_entry_marks_daily_loss_exemption(tmp_path, monkeypatch):
