@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from .ema200_utbot_rsi import (
-    EMA200_BINANCE_TOP10_SYMBOLS,
     EMA200_UTBOT_RSI_STRATEGY,
+    is_ema200_utbot_rsi_symbol_allowed,
+    select_ema200_volume_symbols,
 )
 from .ema200_candidate_selector import (
     build_ema200_candidate,
@@ -476,8 +477,32 @@ class SignalScannerMixin:
                 )
         return biases
 
-    async def _scan_and_trade_ema200_binance_top10(self):
-        """Evaluate the fixed universe, optionally ranking all valid signals."""
+    async def _ema200_volume_symbols(self):
+        """Load a fresh 24h ticker snapshot and the active perpetual markets."""
+        exchange = self.market_data_exchange
+        markets = await asyncio.to_thread(exchange.load_markets)
+        tickers = await asyncio.to_thread(exchange.fetch_tickers)
+        return select_ema200_volume_symbols(tickers, markets)
+
+    async def _ema200_entry_volume_allowed(self, symbol):
+        """Recheck the actual order symbol against current market and turnover."""
+        try:
+            exchange = self.market_data_exchange
+            markets = await asyncio.to_thread(exchange.load_markets)
+            ticker = await asyncio.to_thread(exchange.fetch_ticker, symbol)
+            allowed = select_ema200_volume_symbols(
+                {symbol: ticker}, markets
+            )
+            eligible = is_ema200_utbot_rsi_symbol_allowed(symbol, allowed)
+            return eligible, (
+                '24시간 USDT 거래대금 2억 미만 또는 거래 불가 선물 시장'
+                if not eligible else ''
+            )
+        except Exception as exc:
+            return False, f'시장·거래대금 확인 실패: {type(exc).__name__}: {exc}'
+
+    async def _scan_and_trade_ema200_volume(self):
+        """Evaluate all liquid perpetuals, optionally ranking valid signals."""
 
         strategy_params = self.get_runtime_strategy_params()
         if str(strategy_params.get('active_strategy', '') or '').lower() != (
@@ -489,24 +514,36 @@ class SignalScannerMixin:
             strategy_cfg.get('best_candidate_selection_enabled', True)
         )
 
-        universe_size = len(EMA200_BINANCE_TOP10_SYMBOLS)
-        start = int(getattr(self, 'ema200_top10_scan_cursor', 0) or 0) % universe_size
-        symbols = (
-            EMA200_BINANCE_TOP10_SYMBOLS[start:]
-            + EMA200_BINANCE_TOP10_SYMBOLS[:start]
-        )
-        # Scan all ten each cycle, but rotate the finishing symbol so Telegram's
-        # latest-condition view does not look permanently pinned to one coin.
-        self.ema200_top10_scan_cursor = (start + 1) % universe_size
+        try:
+            universe = await self._ema200_volume_symbols()
+        except Exception as exc:
+            logger.warning('EMA200 volume universe unavailable: %s', exc)
+            self._store_ema200_candidate_selection(
+                enabled=selection_enabled, candidates=[],
+                reason=f'24시간 거래대금 조회 실패: {type(exc).__name__}: {exc}',
+            )
+            return
+        universe_size = len(universe)
+        if not universe_size:
+            self._store_ema200_candidate_selection(
+                enabled=selection_enabled, candidates=[],
+                reason='24시간 거래대금 2억 USDT 이상인 활성 선물 종목 없음',
+            )
+            return
+        start = int(getattr(self, 'ema200_volume_scan_cursor', 0) or 0) % universe_size
+        symbols = universe[start:] + universe[:start]
+        self.ema200_volume_scan_cursor = (start + 1) % universe_size
         logger.info(
-            "[EMA200_UTBOT_RSI_2H] fixed-universe scan (best=%s): %s",
+            "[EMA200_UTBOT_RSI_2H] 24h volume >=200M scan (best=%s, count=%s): %s",
             'ON' if selection_enabled else 'OFF',
+            universe_size,
             ", ".join(symbols),
         )
         candidates = []
         newest_evaluated_candle_ts = 0
         evaluated_candle_ts = {}
         scan_failures = []
+        insufficient_history = []
         for symbol in symbols:
             if self.ctrl.is_paused or self.scanner_active_symbol:
                 return
@@ -519,9 +556,17 @@ class SignalScannerMixin:
                 )
                 if not ohlcv:
                     self.last_entry_reason[symbol] = (
-                        "EMA200 고정 Top10 스캔: 2시간봉 데이터 없음"
+                        "EMA200 거래대금 스캔: 2시간봉 데이터 없음"
                     )
                     scan_failures.append(f"{symbol}: 2시간봉 데이터 없음")
+                    continue
+                required_rows = int(strategy_cfg['ema_period']) + 3
+                if len(ohlcv) < required_rows:
+                    insufficient_history.append(symbol)
+                    self.last_entry_reason[symbol] = (
+                        f"EMA200 거래대금 스캔: 완료봉 데이터 부족 "
+                        f"({len(ohlcv) - 1}/{required_rows - 1})"
+                    )
                     continue
                 df = pd.DataFrame(
                     ohlcv,
@@ -590,11 +635,11 @@ class SignalScannerMixin:
                     f"{symbol}: {type(exc).__name__}"
                 )
                 self.last_entry_reason[symbol] = (
-                    "EMA200 고정 Top10 스캔 오류: "
+                    "EMA200 거래대금 스캔 오류: "
                     f"{type(exc).__name__}: {exc}"
                 )
                 logger.warning(
-                    "EMA200 fixed-universe scan failed for %s: %s",
+                    "EMA200 volume-universe scan failed for %s: %s",
                     symbol,
                     exc,
                 )
@@ -609,21 +654,25 @@ class SignalScannerMixin:
                 )
             return
 
-        # "Best of ten" is meaningful only when all ten symbols were evaluated
-        # successfully on the exact same completed candle.  Partial or stale
-        # data is an unknown comparison, so fail closed and retry next cycle.
+        # Newly listed symbols without enough 2h history cannot produce EMA200
+        # signals. Compare every evaluable symbol; fail closed on data errors.
         completed_timestamps = set(evaluated_candle_ts.values())
+        evaluable_count = universe_size - len(insufficient_history)
         complete_same_candle = (
-            len(evaluated_candle_ts) == universe_size
+            evaluable_count > 0
+            and len(evaluated_candle_ts) == evaluable_count
             and len(completed_timestamps) == 1
             and 0 not in completed_timestamps
+            and not scan_failures
         )
         if not complete_same_candle:
             reason = (
                 "최적 후보 선택 보류: "
-                f"10개 중 {len(evaluated_candle_ts)}개 평가, "
+                f"평가 가능 {evaluable_count}개 중 {len(evaluated_candle_ts)}개 평가, "
                 f"완료봉 시각 {len(completed_timestamps)}종류"
             )
+            if insufficient_history:
+                reason += f" / 2시간봉 이력 부족 {len(insufficient_history)}개 제외"
             if scan_failures:
                 reason += f" / 오류 {', '.join(scan_failures[:3])}"
             self._store_ema200_candidate_selection(
@@ -639,7 +688,7 @@ class SignalScannerMixin:
             self._store_ema200_candidate_selection(
                 enabled=True,
                 candidates=[],
-                reason='10개 전부 평가 완료: 진입 조건 충족 후보 없음',
+                reason=f'{evaluable_count}개 평가 완료: 진입 조건 충족 후보 없음',
                 closed_candle_ts=newest_evaluated_candle_ts,
             )
             return
@@ -653,7 +702,7 @@ class SignalScannerMixin:
         self._store_ema200_candidate_selection(
             enabled=True,
             candidates=ranked,
-            reason='10개 전부 평가 완료; 점수순 주문 대기',
+            reason=f'{evaluable_count}개 평가 완료; 점수순 주문 대기',
             closed_candle_ts=newest_evaluated_candle_ts,
         )
 
@@ -864,7 +913,7 @@ class SignalScannerMixin:
                 configured_strategy_params.get('active_strategy', 'utbot')
                 or 'utbot'
             ).lower()
-            # The EMA200 strategy contract is a fixed ten-symbol universe.
+            # The EMA200 strategy scans its own dynamic volume universe.
             # Its own `enabled` flag controls new entries, while the generic
             # volume-scanner switch must not silently downgrade it to a
             # watchlist-only strategy and bypass all-candidate comparison.
@@ -4572,7 +4621,7 @@ class SignalScannerMixin:
                 strategy_params.get('active_strategy', 'utbot') or 'utbot'
             ).lower()
             if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
-                await self._scan_and_trade_ema200_binance_top10()
+                await self._scan_and_trade_ema200_volume()
                 return
 
             scan_started_at = time.time()

@@ -27,38 +27,39 @@ EMA200_SMALL_ACCOUNT_LEVERAGE = 5
 EMA200_SMALL_ACCOUNT_MARGIN_LADDER_PERCENT = (50.0, 35.0, 25.0, 15.0, 10.0)
 EMA200_EXIT_TIMEFRAMES = ("15m", "30m", "1h")
 
-# Binance does not publish a circulating-supply/market-cap ranking API.  This
-# fixed 2026-09-19 snapshot therefore contains the ten highest-market-cap,
-# non-stable assets that had an active Binance USDT perpetual market when the
-# strategy universe was defined.  It is deliberately static: a third-party
-# ranking outage must never broaden the live trading universe.
-EMA200_BINANCE_TOP10_BASES = (
-    "BTC",
-    "ETH",
-    "BNB",
-    "XRP",
-    "SOL",
-    "TRX",
-    "ZEC",
-    "HYPE",
-    "DOGE",
-    "XMR",
-)
-EMA200_BINANCE_TOP10_SYMBOLS = tuple(
-    f"{base}/USDT:USDT" for base in EMA200_BINANCE_TOP10_BASES
-)
+EMA200_MIN_QUOTE_VOLUME_USDT = 200_000_000.0
 
 
-def is_ema200_utbot_rsi_symbol_allowed(symbol):
-    """Fail closed unless *symbol* is a fixed-universe USDT market."""
-    text = str(symbol or "").strip().upper().split(":", 1)[0]
-    if "/" in text:
-        base, quote = text.split("/", 1)
-        return quote == "USDT" and base in EMA200_BINANCE_TOP10_BASES
-    return (
-        text.endswith("USDT")
-        and text[:-4] in EMA200_BINANCE_TOP10_BASES
-    )
+def select_ema200_volume_symbols(tickers, markets):
+    """Active linear USDT perpetuals with at least 200M USDT 24h turnover."""
+    if not isinstance(tickers, dict) or not isinstance(markets, dict):
+        return ()
+    eligible = []
+    for symbol, ticker in tickers.items():
+        market = markets.get(symbol)
+        if not isinstance(market, dict) or not isinstance(ticker, dict):
+            continue
+        if not (market.get('active') is True and market.get('swap') is True
+                and market.get('linear') is True and market.get('quote') == 'USDT'
+                and market.get('settle') == 'USDT'):
+            continue
+        info = ticker.get('info') if isinstance(ticker.get('info'), dict) else {}
+        try:
+            raw_volume = ticker.get('quoteVolume')
+            if raw_volume is None:
+                raw_volume = info.get('quoteVolume')
+            quote_volume = float(raw_volume)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if isfinite(quote_volume) and quote_volume >= EMA200_MIN_QUOTE_VOLUME_USDT:
+            eligible.append((symbol, quote_volume))
+    eligible.sort(key=lambda item: (-item[1], item[0]))
+    return tuple(symbol for symbol, _ in eligible)
+
+
+def is_ema200_utbot_rsi_symbol_allowed(symbol, eligible_symbols):
+    """Accept only a symbol present in the current validated volume universe."""
+    return bool(symbol and symbol in (eligible_symbols or ()))
 
 
 def default_ema200_utbot_rsi_config():
@@ -72,7 +73,7 @@ def default_ema200_utbot_rsi_config():
         "utbot_key_value": EMA200_UTBOT_KEY_VALUE,
         "utbot_atr_period": EMA200_UTBOT_ATR_PERIOD,
         "utbot_use_heikin_ashi": EMA200_UTBOT_USE_HEIKIN_ASHI,
-        # When enabled, all valid signals from the fixed ten-symbol universe
+        # When enabled, all valid signals from the current volume universe
         # are ranked on the same completed 2h candle before one entry is sent.
         # It remains independently switchable from the strategy entry toggle.
         "best_candidate_selection_enabled": True,
