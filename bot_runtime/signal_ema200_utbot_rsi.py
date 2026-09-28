@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pandas as pd
 
 from .ema200_utbot_rsi import (
@@ -153,6 +155,54 @@ class SignalEMA200UTBotRSIMixin:
         if signal:
             return signal, f"{EMA200_UTBOT_RSI_DISPLAY_NAME}: {reason}", detail
         return None, f"{EMA200_UTBOT_RSI_DISPLAY_NAME} 대기: {reason}", detail
+
+    async def _ema200_exit_timeframe_aligned(
+        self,
+        symbol,
+        side,
+        strategy_params=None,
+    ):
+        """Require the selected exit-timeframe UT state to agree with the entry.
+
+        Exits wait for a fresh opposite UT signal after entry.  When that UT is
+        already opposite at entry time, no fresh signal can arrive until it
+        flips twice, so such an entry is skipped.  Unknown state fails closed.
+        """
+        params = (
+            strategy_params
+            if isinstance(strategy_params, dict)
+            else self.get_runtime_strategy_params()
+        )
+        exit_tf = self._get_ema200_utbot_rsi_config(params)["exit_timeframe"]
+        side_key = str(side or "").strip().lower()
+        try:
+            rows = await asyncio.to_thread(
+                self.market_data_exchange.fetch_ohlcv,
+                symbol,
+                exit_tf,
+                limit=250,
+            )
+        except Exception as exc:
+            return False, f"{exit_tf} UT 확인 실패: {type(exc).__name__}: {exc}"
+        if not rows or len(rows) < 22:
+            return False, f"{exit_tf} UT 데이터 부족"
+        df = pd.DataFrame(
+            rows,
+            columns=["timestamp", "open", "high", "low", "close", "volume"],
+        )
+        _, _, detail = self._calculate_utbot_signal(
+            df,
+            self._get_ema200_utbot_signal_params(params),
+        )
+        bias = str((detail or {}).get("bias_side") or "").lower()
+        if bias not in {"long", "short"}:
+            return False, f"완료된 {exit_tf}봉 UT 방향 확인 불가"
+        if bias != side_key:
+            return False, (
+                f"완료된 {exit_tf}봉 UT가 {bias.upper()} 상태라 "
+                f"{side_key.upper()} 진입과 반대"
+            )
+        return True, f"완료된 {exit_tf}봉 UT {bias.upper()} 일치"
 
     async def _ema200_utbot_rsi_new_entry_gate(self, symbol, strategy_params=None):
         cfg = self._get_ema200_utbot_rsi_config(strategy_params)

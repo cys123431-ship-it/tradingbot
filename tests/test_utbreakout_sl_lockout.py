@@ -144,6 +144,9 @@ def test_ema_direct_entry_is_blocked_during_symbol_reentry_wait(tmp_path):
     async def volume_allowed(_symbol):
         return True, ''
     engine._ema200_entry_volume_allowed = volume_allowed
+    async def exit_timeframe_aligned(_symbol, _side, _params=None):
+        return True, ''
+    engine._ema200_exit_timeframe_aligned = exit_timeframe_aligned
     engine.db = emas.DBManager(str(tmp_path / 'trades.db'))
     closed_at = datetime.now(timezone.utc) - timedelta(minutes=30)
     _insert_automatic_trade(

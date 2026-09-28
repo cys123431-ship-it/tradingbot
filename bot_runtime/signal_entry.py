@@ -318,6 +318,33 @@ class SignalEntryMixin:
                 except Exception:
                     logger.debug("EMA200 volume guard notify skipped", exc_info=True)
                 return
+            if trace_active_strategy == EMA200_UTBOT_RSI_STRATEGY:
+                aligned, alignment_reason = (
+                    await self._ema200_exit_timeframe_aligned(
+                        symbol,
+                        side,
+                        trace_strategy_params,
+                    )
+                )
+                if not aligned:
+                    reason = (
+                        "EMA200_EXIT_TF_OPPOSITE: 진입 차단 "
+                        f"({symbol} {str(side).upper()}) / {alignment_reason}"
+                    )
+                    if not isinstance(getattr(self, 'last_entry_reason', None), dict):
+                        self.last_entry_reason = {}
+                    self.last_entry_reason[str(symbol)] = reason
+                    logger.info(reason)
+                    try:
+                        await self.ctrl.notify(
+                            f"⛔ EMA200 전략 진입 보류\n{reason}"
+                        )
+                    except Exception:
+                        logger.debug(
+                            "EMA200 exit-timeframe guard notify skipped",
+                            exc_info=True,
+                        )
+                    return
             trace_utbreakout = trace_active_strategy in UTBREAKOUT_STRATEGIES
             if trace_utbreakout:
                 symbol = self._canonicalize_utbreakout_symbol_for_use(
