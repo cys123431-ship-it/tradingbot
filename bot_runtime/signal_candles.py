@@ -159,7 +159,9 @@ class SignalCandleMixin:
             status_strategy = position_strategy or active_strategy.lower()
             if status_strategy == EMA200_UTBOT_RSI_STRATEGY:
                 symbol_status['entry_tf'] = '2h'
-                symbol_status['exit_tf'] = '2h'
+                # Entries use completed 2h bars; exits use the user-selected
+                # 15m/30m/1h UT timeframe, which the status must show.
+                symbol_status['exit_tf'] = self._get_exit_timeframe(symbol)
             elif status_strategy in UTBREAKOUT_STRATEGIES and utbreakout_status.get('entry_timeframe'):
                 symbol_status['entry_tf'] = utbreakout_status.get('entry_timeframe')
                 symbol_status['exit_tf'] = utbreakout_status.get('exit_timeframe') or self._get_exit_timeframe(symbol)

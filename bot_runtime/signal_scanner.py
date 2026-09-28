@@ -1054,6 +1054,117 @@ class SignalScannerMixin:
             except Exception as snapshot_error:
                 logger.debug("Desktop monitor snapshot write error: %s", snapshot_error)
 
+    async def _check_secondary_exit_for_symbol(
+        self,
+        symbol,
+        pos_side,
+        active_strategy,
+        entry_mode,
+    ):
+        """Run the exit-timeframe check for an open position."""
+        # Cross/Position 紐⑤뱶?먯꽌留?Secondary TF 泥?궛 濡쒖쭅 ?ъ슜
+        position_strategy = (
+            self._position_entry_strategy(symbol)
+            if pos_side != 'NONE'
+            else None
+        )
+        exit_strategy = position_strategy or active_strategy
+        uses_secondary_exit = (
+            pos_side != 'NONE'
+            and (
+                (exit_strategy in MA_STRATEGIES and entry_mode in ['cross', 'position'])
+                or exit_strategy == 'cameron'
+                or exit_strategy == 'utsmc'
+                or exit_strategy == 'utbot'
+                or exit_strategy == EMA200_UTBOT_RSI_STRATEGY
+                or exit_strategy in UTBREAKOUT_STRATEGIES
+                or exit_strategy in UT_HYBRID_STRATEGIES
+            )
+        )
+        if uses_secondary_exit:
+            exit_tf = self._get_exit_timeframe(symbol)
+
+            ohlcv_e = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, exit_tf, limit=5)
+            if ohlcv_e and len(ohlcv_e) >= 3:
+                last_closed_e = ohlcv_e[-2]
+                ts_e = last_closed_e[0]
+
+                if symbol not in self.last_processed_exit_candle_ts:
+                    self.last_processed_exit_candle_ts[symbol] = 0
+
+                # [Initial Sync] 留뚯빟 遊??ъ떆???깆쑝濡??꾩쭅 怨꾩궛 湲곕줉???녾퀬 ?ъ??섏씠 ?덈떎硫?利됱떆 1??怨꾩궛
+                is_first_sync = (self.last_processed_exit_candle_ts[symbol] == 0)
+
+                if ts_e > self.last_processed_exit_candle_ts[symbol] or is_first_sync:
+                    if is_first_sync:
+                        logger.info(f"?봽 [Initial Sync] {symbol} Position detected on restart, processing filters...")
+                    else:
+                        logger.info(f"?빉截?[Exit {exit_tf}] {symbol} New Candle: {ts_e} close={last_closed_e[4]}")
+
+                    exit_ok = await self.process_exit_candle(symbol, exit_tf, pos_side)
+                    if exit_ok:
+                        self.last_processed_exit_candle_ts[symbol] = ts_e
+                    else:
+                        logger.warning(f"Exit candle processing failed, will retry: {symbol} {ts_e}")
+
+    async def _poll_symbol_exit_fallback(self, symbol, cfg, reason):
+        """Keep mechanical exit management alive when earlier poll work failed.
+
+        Status, profit-stop and primary-candle work run before the exit check
+        in ``poll_symbol``.  A repeated failure there used to skip every
+        exit-timeframe check, leaving an open position unmanaged while its
+        opposite UT signals passed.
+        """
+        try:
+            fetch_ok, pos = await self._fetch_server_position_checked(symbol)
+            if not fetch_ok or not pos:
+                return
+            pos_side = str(pos.get('side') or '').strip().upper()
+            if pos_side not in {'LONG', 'SHORT'}:
+                return
+            strategy_params = cfg.get('strategy_params', {}) or {}
+            entry_mode = str(
+                strategy_params.get('entry_mode', 'cross') or 'cross'
+            ).lower()
+            active_strategy = str(
+                strategy_params.get('active_strategy', 'utbot') or 'utbot'
+            ).lower()
+            logger.warning(
+                'Poll exit fallback for %s %s after: %s',
+                symbol,
+                pos_side,
+                reason,
+            )
+            await self._check_secondary_exit_for_symbol(
+                symbol,
+                pos_side,
+                active_strategy,
+                entry_mode,
+            )
+        except Exception:
+            logger.exception('Poll exit fallback failed for %s', symbol)
+        await self._notify_poll_management_error(symbol, reason)
+
+    async def _notify_poll_management_error(self, symbol, reason):
+        """Tell the operator (throttled) that position polling is failing."""
+        alerts = getattr(self, '_poll_management_error_alert_ts', None)
+        if not isinstance(alerts, dict):
+            alerts = {}
+            self._poll_management_error_alert_ts = alerts
+        now_ts = time.time()
+        if now_ts - float(alerts.get(symbol, 0.0) or 0.0) < 1800.0:
+            return
+        alerts[symbol] = now_ts
+        try:
+            await self.ctrl.notify(
+                '⚠️ 포지션 관리 루프 오류\n'
+                f'심볼: {symbol}\n'
+                f'원인: {str(reason)[:300]}\n'
+                '청산 시간봉 UT 반대 신호 검사는 별도로 계속 실행합니다.'
+            )
+        except Exception:
+            logger.debug('Poll management error notify failed', exc_info=True)
+
     async def poll_symbol(self, symbol, primary_tf, cfg):
         """媛쒕퀎 ?щ낵 ?대쭅 濡쒖쭅"""
         self._ensure_runtime_state_containers((
@@ -1071,6 +1182,7 @@ class SignalScannerMixin:
             'cameron_states'
         ))
 
+        exit_check_attempted = False
         try:
             strategy_params = cfg.get('strategy_params', {})
             entry_mode = strategy_params.get('entry_mode', 'cross').lower()
@@ -1084,6 +1196,12 @@ class SignalScannerMixin:
             # 1. OHLCV (Primary) - Basic monitoring
             ohlcv_p = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, primary_tf, limit=5)
             if not ohlcv_p or len(ohlcv_p) < 3:
+                exit_check_attempted = True
+                await self._poll_symbol_exit_fallback(
+                    symbol,
+                    cfg,
+                    reason=f'primary {primary_tf} OHLCV unavailable',
+                )
                 return
 
             current_price = float(ohlcv_p[-1][4])
@@ -1091,7 +1209,16 @@ class SignalScannerMixin:
             # [Fix] Update Status and get local pos_side to avoid race condition
             pos_side = await self.check_status(symbol, current_price)
             if pos_side in {'LONG', 'SHORT'}:
-                await self._ema200_apply_margin_profit_stop(symbol)
+                # The profit ratchet is optional protection work.  Its failure
+                # must never skip the mechanical exit check further below.
+                try:
+                    await self._ema200_apply_margin_profit_stop(symbol)
+                except Exception:
+                    logger.exception(
+                        'EMA200 profit stop update failed for %s; '
+                        'exit management continues',
+                        symbol,
+                    )
 
             # 2. Check Primary TF (Entry Logic)
             last_closed_p = ohlcv_p[-2]
@@ -1275,55 +1402,27 @@ class SignalScannerMixin:
                 )
 
             # 3. Check Exit TF (Exit Logic)
-            # Cross/Position 紐⑤뱶?먯꽌留?Secondary TF 泥?궛 濡쒖쭅 ?ъ슜
-            position_strategy = (
-                self._position_entry_strategy(symbol)
-                if pos_side != 'NONE'
-                else None
+            exit_check_attempted = True
+            await self._check_secondary_exit_for_symbol(
+                symbol,
+                pos_side,
+                active_strategy,
+                entry_mode,
             )
-            exit_strategy = position_strategy or active_strategy
-            uses_secondary_exit = (
-                pos_side != 'NONE'
-                and (
-                    (exit_strategy in MA_STRATEGIES and entry_mode in ['cross', 'position'])
-                    or exit_strategy == 'cameron'
-                    or exit_strategy == 'utsmc'
-                    or exit_strategy == 'utbot'
-                    or exit_strategy == EMA200_UTBOT_RSI_STRATEGY
-                    or exit_strategy in UTBREAKOUT_STRATEGIES
-                    or exit_strategy in UT_HYBRID_STRATEGIES
-                )
-            )
-            if uses_secondary_exit:
-                exit_tf = self._get_exit_timeframe(symbol)
-
-                ohlcv_e = await asyncio.to_thread(self.market_data_exchange.fetch_ohlcv, symbol, exit_tf, limit=5)
-                if ohlcv_e and len(ohlcv_e) >= 3:
-                    last_closed_e = ohlcv_e[-2]
-                    ts_e = last_closed_e[0]
-
-                    if symbol not in self.last_processed_exit_candle_ts:
-                        self.last_processed_exit_candle_ts[symbol] = 0
-
-                    # [Initial Sync] 留뚯빟 遊??ъ떆???깆쑝濡??꾩쭅 怨꾩궛 湲곕줉???녾퀬 ?ъ??섏씠 ?덈떎硫?利됱떆 1??怨꾩궛
-                    is_first_sync = (self.last_processed_exit_candle_ts[symbol] == 0)
-
-                    if ts_e > self.last_processed_exit_candle_ts[symbol] or is_first_sync:
-                        if is_first_sync:
-                            logger.info(f"?봽 [Initial Sync] {symbol} Position detected on restart, processing filters...")
-                        else:
-                            logger.info(f"?빉截?[Exit {exit_tf}] {symbol} New Candle: {ts_e} close={last_closed_e[4]}")
-
-                        exit_ok = await self.process_exit_candle(symbol, exit_tf, pos_side)
-                        if exit_ok:
-                            self.last_processed_exit_candle_ts[symbol] = ts_e
-                        else:
-                            logger.warning(f"Exit candle processing failed, will retry: {symbol} {ts_e}")
 
         except Exception as e:
             logger.error(f"Poll symbol {symbol} error: {e}")
             import traceback
             traceback.print_exc()
+            if not exit_check_attempted:
+                # Status, profit-stop or primary-candle work failed before the
+                # exit check.  An open position must still be closed on its
+                # opposite exit-timeframe signal.
+                await self._poll_symbol_exit_fallback(
+                    symbol,
+                    cfg,
+                    reason=f'{type(e).__name__}: {e}',
+                )
 
     def _get_coin_selector_config(self):
         raw = self.get_runtime_trade_config().get('coin_selector', {})

@@ -240,7 +240,8 @@ class SignalEMA200UTBotRSIMixin:
         if pos:
             self.last_entry_reason[symbol] = (
                 f"포지션 보유 중 ({str(pos.get('side') or '').upper()}), "
-                "정상 청산은 2시간봉 UT Bot 반대 신호를 기다립니다."
+                f"정상 청산은 완료된 {self._get_exit_timeframe(symbol)}봉 "
+                "UT Bot 반대 신호를 기다립니다."
             )
             return
 
