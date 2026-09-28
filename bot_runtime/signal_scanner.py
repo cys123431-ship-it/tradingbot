@@ -178,7 +178,13 @@ class SignalScannerMixin:
         if self._position_entry_strategy(symbol) != EMA200_UTBOT_RSI_STRATEGY:
             return
         fetch_ok, pos = await self._fetch_server_position_checked(symbol)
-        if not fetch_ok or not pos:
+        if not fetch_ok:
+            self._set_ema200_profit_stop_status(
+                symbol, 'POSITION_LOOKUP_UNAVAILABLE',
+                reason='거래소 포지션을 확인할 수 없음',
+            )
+            return
+        if not pos:
             return
         info = pos.get('info') if isinstance(pos.get('info'), dict) else {}
         leverage, leverage_source, leverage_error, leverage_reason = (
@@ -197,11 +203,19 @@ class SignalScannerMixin:
             )
             return
 
+        side = str(pos.get('side') or '').lower()
+        entry_price = self._ema200_positive_float(pos.get('entryPrice'))
+        mark_price = self._ema200_positive_float(
+            pos.get('markPrice') or pos.get('mark_price') or info.get('markPrice')
+        )
+        if side not in {'long', 'short'} or entry_price is None or mark_price is None:
+            self._set_ema200_profit_stop_status(
+                symbol, 'POSITION_PRICE_UNAVAILABLE',
+                reason='포지션 방향·진입가·거래소 표시가격 중 하나가 없음',
+            )
+            return
         target = ema200_profit_stop_target(
-            str(pos.get('side') or '').lower(),
-            pos.get('entryPrice'),
-            pos.get('markPrice') or pos.get('mark_price') or info.get('markPrice'),
-            leverage,
+            side, entry_price, mark_price, leverage,
         )
         if target is None:
             self._set_ema200_profit_stop_status(
@@ -902,6 +916,24 @@ class SignalScannerMixin:
             except Exception as cleanup_error:
                 logger.warning(f"Protection orphan sweep failed: {cleanup_error}")
 
+            # Profit protection follows the live exchange position and mark
+            # price. A 2h candle outage, a large scanner universe, or PAUSE
+            # must not prevent an already-open EMA200 stop from ratcheting.
+            protection_symbols = set(active_position_symbols)
+            if self.scanner_active_symbol:
+                protection_symbols.add(self.scanner_active_symbol)
+            for held_symbol in sorted(protection_symbols):
+                owner = self._position_entry_strategy(held_symbol)
+                if owner == EMA200_UTBOT_RSI_STRATEGY:
+                    await self._ema200_apply_margin_profit_stop(held_symbol)
+                elif not owner and str(
+                    (cfg.get('strategy_params') or {}).get('active_strategy') or ''
+                ).lower() == EMA200_UTBOT_RSI_STRATEGY:
+                    self._set_ema200_profit_stop_status(
+                        held_symbol, 'OWNER_UNVERIFIED',
+                        reason='보유 포지션의 EMA200 전략 소유 기록을 확인할 수 없음',
+                    )
+
             # Check Scanner Setting
             scanner_enabled = bool(common_cfg.get('scanner_enabled', True))
             configured_strategy_params = (
@@ -1139,8 +1171,6 @@ class SignalScannerMixin:
 
             # [Fix] Update Status and get local pos_side to avoid race condition
             pos_side = await self.check_status(symbol, current_price)
-            if pos_side in {'LONG', 'SHORT'}:
-                await self._ema200_apply_margin_profit_stop(symbol)
 
             # 2. Check Primary TF (Entry Logic)
             last_closed_p = ohlcv_p[-2]

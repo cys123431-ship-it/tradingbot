@@ -346,6 +346,32 @@ class ControllerEMA200UTBotRSIMixin:
                 )
             selection_text = "\n".join(selection_lines)
 
+        profit_stop_text = "최근 수익 Stop: 평가 기록 없음"
+        profit_states = (
+            getattr(engine, "last_ema200_profit_stop_status", {}) if engine else {}
+        )
+        if isinstance(profit_states, dict) and profit_states:
+            held_symbol = getattr(engine, "scanner_active_symbol", None)
+            if held_symbol not in profit_states:
+                held_symbol = max(
+                    profit_states,
+                    key=lambda item: int(
+                        (profit_states.get(item) or {}).get("updated_at_ns") or 0
+                    ),
+                )
+            profit_state = profit_states[held_symbol] or {}
+            profit_stop_text = (
+                f"최근 수익 Stop ({held_symbol}): "
+                f"{profit_state.get('status') or 'UNKNOWN'}"
+            )
+            if profit_state.get("roi") is not None:
+                profit_stop_text += (
+                    f" / 수익률 {float(profit_state['roi']):.2f}%"
+                    f" / 보호 {float(profit_state.get('locked_roi') or 0):.0f}%"
+                )
+            if profit_state.get("reason"):
+                profit_stop_text += f"\n• 사유: {str(profit_state['reason'])[:140]}"
+
         return (
             f"🎛 {EMA200_UTBOT_RSI_DISPLAY_NAME}\n\n"
             f"전략 선택: {'✅ ACTIVE' if active else '⬜ 미선택'}\n"
@@ -377,6 +403,7 @@ class ControllerEMA200UTBotRSIMixin:
             f"최근 7일 실현손익: {float(weekly_pnl):+.4f} USDT / {weekly_count}건\n\n"
             f"{condition_text}\n\n"
             f"{selection_text}\n\n"
+            f"{profit_stop_text}\n\n"
             "중요: 소액계좌의 연속손실 0회 단계는 비상 Stop 없이 "
             "선택한 UT Bot 반대 신호로 청산하며, 수익률 5% 초과 시에는 수익 보호 Stop을 추가합니다. 첫 손실 뒤 다음 진입부터 "
             "포지션이 축소되고 비상 Stop이 적용됩니다."

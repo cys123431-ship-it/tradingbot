@@ -110,6 +110,66 @@ def test_margin_roi_profit_stop_rejects_bad_exchange_position_data():
         assert ema200_profit_stop_target('long', 100, 102, bad) is None
 
 
+@pytest.mark.parametrize('paused', [False, True])
+def test_profit_stop_ratchets_during_candle_outage_or_pause(paused):
+    symbol = 'BTC/USDT:USDT'
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.running = True
+    engine.scanner_active_symbol = symbol
+    engine.active_symbols = set()
+    engine.consecutive_errors = 0
+    engine.ctrl = SimpleNamespace(is_paused=paused, status_data={})
+    engine.db = SimpleNamespace(get_daily_stats=lambda: (0, 0.0))
+    engine.get_runtime_trade_config = lambda: {
+        'common_settings': {'scanner_enabled': True, 'entry_timeframe': '2h'},
+        'strategy_params': {'active_strategy': EMA200_UTBOT_RSI_STRATEGY},
+    }
+    engine.get_runtime_common_settings = lambda: {
+        'scanner_enabled': True, 'entry_timeframe': '2h', 'leverage': 5,
+    }
+    engine.get_active_position_symbols = lambda use_cache=True: asyncio.sleep(
+        0, result={symbol}
+    )
+    engine._cleanup_orphan_protection_orders = lambda **kwargs: asyncio.sleep(
+        0, result={'cancelled': 0}
+    )
+    pos = {
+        'symbol': symbol, 'side': 'long', 'entryPrice': 100.0,
+        'markPrice': 101.2, 'leverage': 5, 'contracts': 1.0,
+    }
+    engine._position_entry_strategy = lambda _: EMA200_UTBOT_RSI_STRATEGY
+    engine._fetch_server_position_checked = lambda _: asyncio.sleep(
+        0, result=(True, dict(pos))
+    )
+    engine._collect_protection_orders_checked = lambda _: asyncio.sleep(
+        0, result=(True, [])
+    )
+    engine.safe_price = lambda _, price: price
+    installed = []
+
+    async def replace(_symbol, _pos, price, reason):
+        installed.append(price)
+        return {'id': str(len(installed))}
+
+    engine._replace_stop_loss_order = replace
+    engine._audit_protection_orders = lambda *args, **kwargs: asyncio.sleep(
+        0, result={'sl_present': True, 'status': 'OK'}
+    )
+    engine.get_balance_info = lambda: asyncio.sleep(0, result=(500, 400, 0))
+    engine.is_upbit_mode = lambda: False
+
+    def unavailable_candles(*args, **kwargs):
+        raise TimeoutError('2h candles unavailable')
+
+    engine.market_data_exchange = SimpleNamespace(fetch_ohlcv=unavailable_candles)
+    for mark in (101.2, 102.2, 103.2):
+        pos['markPrice'] = mark
+        asyncio.run(engine.poll_tick())
+
+    assert installed == pytest.approx([101.0, 102.0, 103.0])
+    assert engine.last_ema200_profit_stop_status[symbol]['status'] == 'PROTECTED'
+
+
 def _ccxt_binance_v3_position_without_leverage():
     exchange = ccxt.binance({'options': {'defaultType': 'future'}})
     market = {
@@ -240,6 +300,22 @@ def test_profit_stop_leverage_lookup_failure_does_not_create_order_and_records_r
     status = engine.last_ema200_profit_stop_status['BTC/USDT:USDT']
     assert status['status'] == 'LEVERAGE_UNAVAILABLE'
     assert 'symbolConfig' in status['reason']
+
+
+def test_profit_stop_reports_missing_exchange_mark_instead_of_below_trigger():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = 'BTC/USDT:USDT'
+    engine._position_entry_strategy = lambda _: EMA200_UTBOT_RSI_STRATEGY
+    engine._fetch_server_position_checked = lambda _: asyncio.sleep(0, result=(
+        True, {'side': 'long', 'entryPrice': 100.0, 'leverage': 5},
+    ))
+    engine._replace_stop_loss_order = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError('missing mark must not create an order')
+    )
+    asyncio.run(engine._ema200_apply_margin_profit_stop(symbol))
+    assert engine.last_ema200_profit_stop_status[symbol]['status'] == (
+        'POSITION_PRICE_UNAVAILABLE'
+    )
 
 
 def test_profit_stop_rejects_conflicting_exchange_leverage_fields():
@@ -3797,6 +3873,28 @@ def test_telegram_status_shows_actual_large_account_entry_amounts_and_ratios():
     assert "비상 손절 가격거리: 진입가 대비 5.00%" in status
     assert "예상 명목 포지션: 500.00 USDT (계좌의 10.00%)" in status
     assert "예상 사용 증거금: 100.00 USDT (계좌의 2.00%, 5x)" in status
+
+
+def test_telegram_status_shows_actual_profit_stop_failure_reason():
+    controller = _registered_telegram_controller()
+    controller.db = SimpleNamespace(
+        get_daily_stats=lambda: (0, 0.0),
+        get_weekly_stats=lambda: (0, 0.0),
+        get_consecutive_strategy_losses=lambda strategy: 0,
+    )
+    symbol = 'BTC/USDT:USDT'
+    controller.engines = {
+        'signal': SimpleNamespace(
+            scanner_active_symbol=symbol,
+            last_ema200_profit_stop_status={
+                symbol: {'status': 'LEVERAGE_UNAVAILABLE',
+                         'reason': 'live leverage unavailable', 'updated_at_ns': 10},
+            },
+        )
+    }
+    status = asyncio.run(controller._ema200_utbot_rsi_status_text())
+    assert '최근 수익 Stop (BTC/USDT:USDT): LEVERAGE_UNAVAILABLE' in status
+    assert '사유: live leverage unavailable' in status
 
 
 def test_telegram_sizing_preview_recalculates_entry_ratio_for_wider_stop():
