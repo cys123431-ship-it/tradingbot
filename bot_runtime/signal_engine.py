@@ -159,7 +159,7 @@ class SignalEngine(
         self.coin_selector_candidate_cooldowns = {}  # normalized symbol -> no-entry miss / cooldown state
         self.coin_selector_analysis_cursor = 0
         self.coin_selector_strategy_cursor = 0
-        self.ema200_top10_scan_cursor = 0
+        self.ema200_volume_scan_cursor = 0
         self.last_ema200_candidate_selection = {}
         self.coin_selector_rate_limit_backoff_until = 0.0
         self.tradifi_symbol_classification_cache = {}  # Binance market metadata classification

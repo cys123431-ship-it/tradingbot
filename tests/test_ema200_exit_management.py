@@ -1,6 +1,7 @@
 """EMA200 open-position exit management through the real poll loop.
 
-These tests drive ``SignalEngine.poll_symbol`` -> ``process_exit_candle`` ->
+These tests drive ``SignalEngine.poll_tick`` -> ``poll_symbol`` ->
+``process_exit_candle`` ->
 ``_calculate_utbot_signal`` over a synthetic 15m series.  Only exchange I/O and
 order execution are faked, so a failure in status/profit-stop work before the
 exit check is exercised exactly as it happens live.
@@ -101,6 +102,15 @@ def _harness(*, check_status_raises=False, profit_stop_raises=False):
     async def notify(text):
         state["notices"].append(text)
 
+    async def active_position_symbols(use_cache=True):
+        return {SYMBOL} if state["open"] else set()
+
+    async def orphan_cleanup(**kwargs):
+        return {}
+
+    async def finalize_flat(symbol):
+        return True
+
     engine.market_data_exchange = SimpleNamespace(fetch_ohlcv=fetch_ohlcv)
     engine.is_upbit_mode = lambda: False
     engine.get_runtime_strategy_params = lambda: params
@@ -114,7 +124,13 @@ def _harness(*, check_status_raises=False, profit_stop_raises=False):
         {"strategy": EMA200_UTBOT_RSI_STRATEGY, "entry_time": entry_time}
         if state["open"] else None
     ))
-    engine.ctrl = SimpleNamespace(notify=notify)
+    engine.ctrl = SimpleNamespace(notify=notify, is_paused=False, status_data={})
+    engine.running = True
+    engine._resolve_adaptive_trend_scan_universe = lambda cfg: {}
+    engine.get_active_position_symbols = active_position_symbols
+    engine._cleanup_orphan_protection_orders = orphan_cleanup
+    engine._finalize_scanner_flat_position = finalize_flat
+    engine.consecutive_errors = 0
     engine.last_entry_reason = {}
     engine.last_candle_success = {}
     engine.scanner_active_symbol = SYMBOL
@@ -141,9 +157,7 @@ def _harness(*, check_status_raises=False, profit_stop_raises=False):
         for i in range(ENTRY_IDX, until):
             clock["i"] = i
             for _ in range(2):
-                asyncio.run(
-                    engine.poll_symbol(SYMBOL, "2h", {"strategy_params": params})
-                )
+                asyncio.run(engine.poll_tick())
             if not state["open"]:
                 break
 

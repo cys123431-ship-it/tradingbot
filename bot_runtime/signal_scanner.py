@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from .ema200_utbot_rsi import (
-    EMA200_BINANCE_TOP10_SYMBOLS,
     EMA200_UTBOT_RSI_STRATEGY,
+    is_ema200_utbot_rsi_symbol_allowed,
+    select_ema200_volume_symbols,
 )
 from .ema200_candidate_selector import (
     build_ema200_candidate,
@@ -177,7 +178,13 @@ class SignalScannerMixin:
         if self._position_entry_strategy(symbol) != EMA200_UTBOT_RSI_STRATEGY:
             return
         fetch_ok, pos = await self._fetch_server_position_checked(symbol)
-        if not fetch_ok or not pos:
+        if not fetch_ok:
+            self._set_ema200_profit_stop_status(
+                symbol, 'POSITION_LOOKUP_UNAVAILABLE',
+                reason='거래소 포지션을 확인할 수 없음',
+            )
+            return
+        if not pos:
             return
         info = pos.get('info') if isinstance(pos.get('info'), dict) else {}
         leverage, leverage_source, leverage_error, leverage_reason = (
@@ -196,11 +203,19 @@ class SignalScannerMixin:
             )
             return
 
+        side = str(pos.get('side') or '').lower()
+        entry_price = self._ema200_positive_float(pos.get('entryPrice'))
+        mark_price = self._ema200_positive_float(
+            pos.get('markPrice') or pos.get('mark_price') or info.get('markPrice')
+        )
+        if side not in {'long', 'short'} or entry_price is None or mark_price is None:
+            self._set_ema200_profit_stop_status(
+                symbol, 'POSITION_PRICE_UNAVAILABLE',
+                reason='포지션 방향·진입가·거래소 표시가격 중 하나가 없음',
+            )
+            return
         target = ema200_profit_stop_target(
-            str(pos.get('side') or '').lower(),
-            pos.get('entryPrice'),
-            pos.get('markPrice') or pos.get('mark_price') or info.get('markPrice'),
-            leverage,
+            side, entry_price, mark_price, leverage,
         )
         if target is None:
             self._set_ema200_profit_stop_status(
@@ -476,8 +491,32 @@ class SignalScannerMixin:
                 )
         return biases
 
-    async def _scan_and_trade_ema200_binance_top10(self):
-        """Evaluate the fixed universe, optionally ranking all valid signals."""
+    async def _ema200_volume_symbols(self):
+        """Load a fresh 24h ticker snapshot and the active perpetual markets."""
+        exchange = self.market_data_exchange
+        markets = await asyncio.to_thread(exchange.load_markets)
+        tickers = await asyncio.to_thread(exchange.fetch_tickers)
+        return select_ema200_volume_symbols(tickers, markets)
+
+    async def _ema200_entry_volume_allowed(self, symbol):
+        """Recheck the actual order symbol against current market and turnover."""
+        try:
+            exchange = self.market_data_exchange
+            markets = await asyncio.to_thread(exchange.load_markets)
+            ticker = await asyncio.to_thread(exchange.fetch_ticker, symbol)
+            allowed = select_ema200_volume_symbols(
+                {symbol: ticker}, markets
+            )
+            eligible = is_ema200_utbot_rsi_symbol_allowed(symbol, allowed)
+            return eligible, (
+                '24시간 USDT 거래대금 2억 미만 또는 거래 불가 선물 시장'
+                if not eligible else ''
+            )
+        except Exception as exc:
+            return False, f'시장·거래대금 확인 실패: {type(exc).__name__}: {exc}'
+
+    async def _scan_and_trade_ema200_volume(self):
+        """Evaluate all liquid perpetuals, optionally ranking valid signals."""
 
         strategy_params = self.get_runtime_strategy_params()
         if str(strategy_params.get('active_strategy', '') or '').lower() != (
@@ -489,24 +528,36 @@ class SignalScannerMixin:
             strategy_cfg.get('best_candidate_selection_enabled', True)
         )
 
-        universe_size = len(EMA200_BINANCE_TOP10_SYMBOLS)
-        start = int(getattr(self, 'ema200_top10_scan_cursor', 0) or 0) % universe_size
-        symbols = (
-            EMA200_BINANCE_TOP10_SYMBOLS[start:]
-            + EMA200_BINANCE_TOP10_SYMBOLS[:start]
-        )
-        # Scan all ten each cycle, but rotate the finishing symbol so Telegram's
-        # latest-condition view does not look permanently pinned to one coin.
-        self.ema200_top10_scan_cursor = (start + 1) % universe_size
+        try:
+            universe = await self._ema200_volume_symbols()
+        except Exception as exc:
+            logger.warning('EMA200 volume universe unavailable: %s', exc)
+            self._store_ema200_candidate_selection(
+                enabled=selection_enabled, candidates=[],
+                reason=f'24시간 거래대금 조회 실패: {type(exc).__name__}: {exc}',
+            )
+            return
+        universe_size = len(universe)
+        if not universe_size:
+            self._store_ema200_candidate_selection(
+                enabled=selection_enabled, candidates=[],
+                reason='24시간 거래대금 2억 USDT 이상인 활성 선물 종목 없음',
+            )
+            return
+        start = int(getattr(self, 'ema200_volume_scan_cursor', 0) or 0) % universe_size
+        symbols = universe[start:] + universe[:start]
+        self.ema200_volume_scan_cursor = (start + 1) % universe_size
         logger.info(
-            "[EMA200_UTBOT_RSI_2H] fixed-universe scan (best=%s): %s",
+            "[EMA200_UTBOT_RSI_2H] 24h volume >=200M scan (best=%s, count=%s): %s",
             'ON' if selection_enabled else 'OFF',
+            universe_size,
             ", ".join(symbols),
         )
         candidates = []
         newest_evaluated_candle_ts = 0
         evaluated_candle_ts = {}
         scan_failures = []
+        insufficient_history = []
         for symbol in symbols:
             if self.ctrl.is_paused or self.scanner_active_symbol:
                 return
@@ -519,9 +570,17 @@ class SignalScannerMixin:
                 )
                 if not ohlcv:
                     self.last_entry_reason[symbol] = (
-                        "EMA200 고정 Top10 스캔: 2시간봉 데이터 없음"
+                        "EMA200 거래대금 스캔: 2시간봉 데이터 없음"
                     )
                     scan_failures.append(f"{symbol}: 2시간봉 데이터 없음")
+                    continue
+                required_rows = int(strategy_cfg['ema_period']) + 3
+                if len(ohlcv) < required_rows:
+                    insufficient_history.append(symbol)
+                    self.last_entry_reason[symbol] = (
+                        f"EMA200 거래대금 스캔: 완료봉 데이터 부족 "
+                        f"({len(ohlcv) - 1}/{required_rows - 1})"
+                    )
                     continue
                 df = pd.DataFrame(
                     ohlcv,
@@ -590,11 +649,11 @@ class SignalScannerMixin:
                     f"{symbol}: {type(exc).__name__}"
                 )
                 self.last_entry_reason[symbol] = (
-                    "EMA200 고정 Top10 스캔 오류: "
+                    "EMA200 거래대금 스캔 오류: "
                     f"{type(exc).__name__}: {exc}"
                 )
                 logger.warning(
-                    "EMA200 fixed-universe scan failed for %s: %s",
+                    "EMA200 volume-universe scan failed for %s: %s",
                     symbol,
                     exc,
                 )
@@ -609,21 +668,25 @@ class SignalScannerMixin:
                 )
             return
 
-        # "Best of ten" is meaningful only when all ten symbols were evaluated
-        # successfully on the exact same completed candle.  Partial or stale
-        # data is an unknown comparison, so fail closed and retry next cycle.
+        # Newly listed symbols without enough 2h history cannot produce EMA200
+        # signals. Compare every evaluable symbol; fail closed on data errors.
         completed_timestamps = set(evaluated_candle_ts.values())
+        evaluable_count = universe_size - len(insufficient_history)
         complete_same_candle = (
-            len(evaluated_candle_ts) == universe_size
+            evaluable_count > 0
+            and len(evaluated_candle_ts) == evaluable_count
             and len(completed_timestamps) == 1
             and 0 not in completed_timestamps
+            and not scan_failures
         )
         if not complete_same_candle:
             reason = (
                 "최적 후보 선택 보류: "
-                f"10개 중 {len(evaluated_candle_ts)}개 평가, "
+                f"평가 가능 {evaluable_count}개 중 {len(evaluated_candle_ts)}개 평가, "
                 f"완료봉 시각 {len(completed_timestamps)}종류"
             )
+            if insufficient_history:
+                reason += f" / 2시간봉 이력 부족 {len(insufficient_history)}개 제외"
             if scan_failures:
                 reason += f" / 오류 {', '.join(scan_failures[:3])}"
             self._store_ema200_candidate_selection(
@@ -639,7 +702,7 @@ class SignalScannerMixin:
             self._store_ema200_candidate_selection(
                 enabled=True,
                 candidates=[],
-                reason='10개 전부 평가 완료: 진입 조건 충족 후보 없음',
+                reason=f'{evaluable_count}개 평가 완료: 진입 조건 충족 후보 없음',
                 closed_candle_ts=newest_evaluated_candle_ts,
             )
             return
@@ -653,7 +716,7 @@ class SignalScannerMixin:
         self._store_ema200_candidate_selection(
             enabled=True,
             candidates=ranked,
-            reason='10개 전부 평가 완료; 점수순 주문 대기',
+            reason=f'{evaluable_count}개 평가 완료; 점수순 주문 대기',
             closed_candle_ts=newest_evaluated_candle_ts,
         )
 
@@ -853,6 +916,33 @@ class SignalScannerMixin:
             except Exception as cleanup_error:
                 logger.warning(f"Protection orphan sweep failed: {cleanup_error}")
 
+            # Profit protection follows the live exchange position and mark
+            # price. A 2h candle outage, a large scanner universe, or PAUSE
+            # must not prevent an already-open EMA200 stop from ratcheting.
+            protection_symbols = set(active_position_symbols)
+            if self.scanner_active_symbol:
+                protection_symbols.add(self.scanner_active_symbol)
+            for held_symbol in sorted(protection_symbols):
+                owner = self._position_entry_strategy(held_symbol)
+                if owner == EMA200_UTBOT_RSI_STRATEGY:
+                    # One symbol's ratchet failure must not abort this tick;
+                    # every held position still needs its exit check below.
+                    try:
+                        await self._ema200_apply_margin_profit_stop(held_symbol)
+                    except Exception:
+                        logger.exception(
+                            'EMA200 profit stop update failed for %s; '
+                            'exit management continues',
+                            held_symbol,
+                        )
+                elif not owner and str(
+                    (cfg.get('strategy_params') or {}).get('active_strategy') or ''
+                ).lower() == EMA200_UTBOT_RSI_STRATEGY:
+                    self._set_ema200_profit_stop_status(
+                        held_symbol, 'OWNER_UNVERIFIED',
+                        reason='보유 포지션의 EMA200 전략 소유 기록을 확인할 수 없음',
+                    )
+
             # Check Scanner Setting
             scanner_enabled = bool(common_cfg.get('scanner_enabled', True))
             configured_strategy_params = (
@@ -864,7 +954,7 @@ class SignalScannerMixin:
                 configured_strategy_params.get('active_strategy', 'utbot')
                 or 'utbot'
             ).lower()
-            # The EMA200 strategy contract is a fixed ten-symbol universe.
+            # The EMA200 strategy scans its own dynamic volume universe.
             # Its own `enabled` flag controls new entries, while the generic
             # volume-scanner switch must not silently downgrade it to a
             # watchlist-only strategy and bypass all-candidate comparison.
@@ -1208,17 +1298,6 @@ class SignalScannerMixin:
 
             # [Fix] Update Status and get local pos_side to avoid race condition
             pos_side = await self.check_status(symbol, current_price)
-            if pos_side in {'LONG', 'SHORT'}:
-                # The profit ratchet is optional protection work.  Its failure
-                # must never skip the mechanical exit check further below.
-                try:
-                    await self._ema200_apply_margin_profit_stop(symbol)
-                except Exception:
-                    logger.exception(
-                        'EMA200 profit stop update failed for %s; '
-                        'exit management continues',
-                        symbol,
-                    )
 
             # 2. Check Primary TF (Entry Logic)
             last_closed_p = ohlcv_p[-2]
@@ -4671,7 +4750,7 @@ class SignalScannerMixin:
                 strategy_params.get('active_strategy', 'utbot') or 'utbot'
             ).lower()
             if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
-                await self._scan_and_trade_ema200_binance_top10()
+                await self._scan_and_trade_ema200_volume()
                 return
 
             scan_started_at = time.time()

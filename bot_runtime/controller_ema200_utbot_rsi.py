@@ -16,7 +16,7 @@ from telegram.ext import (
 from .ema200_utbot_rsi import (
     EMA200_CONSECUTIVE_LOSS_RESET_STATE_KEY,
     EMA200_DAILY_LOSS_RESET_STATE_KEY,
-    EMA200_BINANCE_TOP10_BASES,
+    EMA200_MIN_QUOTE_VOLUME_USDT,
     EMA200_UTBOT_RSI_CONFIG_KEY,
     EMA200_UTBOT_RSI_DISPLAY_NAME,
     EMA200_UTBOT_RSI_STRATEGY,
@@ -308,7 +308,7 @@ class ControllerEMA200UTBotRSIMixin:
             cfg.get("best_candidate_selection_enabled", True)
         )
         candidate_status = (
-            "ON — 10개 전부 평가 후 최고 점수 후보부터 주문"
+            "ON — 거래대금 기준 대상 전부 평가 후 최고 점수 후보부터 주문"
             if candidate_enabled
             else "OFF — 회전 스캔 순서상 첫 유효 신호부터 주문"
         )
@@ -346,6 +346,32 @@ class ControllerEMA200UTBotRSIMixin:
                 )
             selection_text = "\n".join(selection_lines)
 
+        profit_stop_text = "최근 수익 Stop: 평가 기록 없음"
+        profit_states = (
+            getattr(engine, "last_ema200_profit_stop_status", {}) if engine else {}
+        )
+        if isinstance(profit_states, dict) and profit_states:
+            held_symbol = getattr(engine, "scanner_active_symbol", None)
+            if held_symbol not in profit_states:
+                held_symbol = max(
+                    profit_states,
+                    key=lambda item: int(
+                        (profit_states.get(item) or {}).get("updated_at_ns") or 0
+                    ),
+                )
+            profit_state = profit_states[held_symbol] or {}
+            profit_stop_text = (
+                f"최근 수익 Stop ({held_symbol}): "
+                f"{profit_state.get('status') or 'UNKNOWN'}"
+            )
+            if profit_state.get("roi") is not None:
+                profit_stop_text += (
+                    f" / 수익률 {float(profit_state['roi']):.2f}%"
+                    f" / 보호 {float(profit_state.get('locked_roi') or 0):.0f}%"
+                )
+            if profit_state.get("reason"):
+                profit_stop_text += f"\n• 사유: {str(profit_state['reason'])[:140]}"
+
         return (
             f"🎛 {EMA200_UTBOT_RSI_DISPLAY_NAME}\n\n"
             f"전략 선택: {'✅ ACTIVE' if active else '⬜ 미선택'}\n"
@@ -353,7 +379,8 @@ class ControllerEMA200UTBotRSIMixin:
             f"최적 후보 선택: {candidate_status}\n"
             f"진입 시간봉: 2시간 완료봉 고정 / UT 정상청산: 완료된 {cfg['exit_timeframe']}봉\n"
             "수익 보호: 증거금 수익률 5% 초과부터 5%p 계단형 거래소 Stop\n"
-            f"스캔 종목: {', '.join(EMA200_BINANCE_TOP10_BASES)} (고정 10개)\n"
+            "스캔 종목: 바이낸스 활성 USDT 무기한 선물 중 "
+            f"24시간 거래대금 {EMA200_MIN_QUOTE_VOLUME_USDT / 1_000_000:.0f}M USDT 이상\n"
             "추세: 종가 > EMA200=롱 허용 / 종가 < EMA200=숏 허용\n"
             f"RSI: {cfg['rsi_length']}기간, LONG=50 위 상승 / SHORT=50 아래 하락\n\n"
             f"UT Bot 전용값: Key {cfg['utbot_key_value']:.2f} / "
@@ -376,6 +403,7 @@ class ControllerEMA200UTBotRSIMixin:
             f"최근 7일 실현손익: {float(weekly_pnl):+.4f} USDT / {weekly_count}건\n\n"
             f"{condition_text}\n\n"
             f"{selection_text}\n\n"
+            f"{profit_stop_text}\n\n"
             "중요: 소액계좌의 연속손실 0회 단계는 비상 Stop 없이 "
             "선택한 UT Bot 반대 신호로 청산하며, 수익률 5% 초과 시에는 수익 보호 Stop을 추가합니다. 첫 손실 뒤 다음 진입부터 "
             "포지션이 축소되고 비상 Stop이 적용됩니다."
@@ -405,7 +433,7 @@ class ControllerEMA200UTBotRSIMixin:
         if kind == "candidate":
             return (
                 "📘 최적 후보 선택이란?\n\n"
-                "ON이면 고정 10개 종목을 동일한 완료 2시간봉 기준으로 모두 평가한 뒤, "
+                "ON이면 현재 24시간 거래대금 2억 USDT 이상인 종목을 동일한 완료 2시간봉 기준으로 모두 평가한 뒤, "
                 "EMA200·UT Bot·RSI 진입 조건을 이미 통과한 후보들만 서로 비교합니다.\n\n"
                 "점수는 최근 UT 신호, RSI 진행 강도, 진입 방향의 EMA200 기울기, "
                 "최근 24시간 거래대금에 가점을 주고, 완료된 15분·30분·1시간봉의 "
@@ -414,7 +442,7 @@ class ControllerEMA200UTBotRSIMixin:
                 "멀어진 후보에는 추격진입 감점을 줍니다. 점수는 후보의 순서만 정하며 "
                 "원래 진입 조건을 새로 만들거나 우회하지 않습니다.\n\n"
                 "예시) BTC와 DOGE가 같은 2시간봉에서 모두 LONG 조건을 충족했을 때, "
-                "BTC가 먼저 스캔됐다는 이유로 즉시 진입하지 않습니다. 10개 평가가 "
+                "BTC가 먼저 스캔됐다는 이유로 즉시 진입하지 않습니다. 전체 대상 평가가 "
                 "끝난 후 점수가 높은 종목부터 한 종목만 주문합니다. 최고 후보의 주문이 "
                 "최소수량·안전장치 등으로 열리지 않으면 다음 순위 후보를 확인합니다.\n\n"
                 "OFF이면 기존 방식대로 매 주기 회전되는 스캔 순서에서 처음 발견한 "
@@ -522,8 +550,8 @@ class ControllerEMA200UTBotRSIMixin:
             "진입은 완료된 2시간봉만 사용하고, 청산은 선택한 시간봉의 완료봉만 사용합니다.\n\n"
             "이 전략의 UT Bot은 Key 1.0 / ATR 10 / 일반 캔들(HA OFF)로 고정되며, "
             "다른 /utbot 전략의 설정을 변경해도 영향을 받지 않습니다.\n\n"
-            f"스캔 대상은 {', '.join(EMA200_BINANCE_TOP10_BASES)} 고정 10개이며, "
-            "그 밖의 종목은 다른 경로에서 신호가 들어와도 진입 단계에서 차단합니다.\n\n"
+            "스캔 대상은 바이낸스 USDT 무기한 선물 중 24시간 거래대금 2억 USDT 이상인 활성 종목이며, "
+            "주문 직전에도 거래대금을 다시 확인합니다. 기준 미달이거나 확인할 수 없으면 진입을 차단합니다.\n\n"
             "소액계좌(1,000 USDT 이하)는 첫 단계에서 equity의 50%를 증거금으로 5x 진입하고 "
             "초기 손실 Stop 없이 선택한 UT 반대 신호로 청산하고, 수익 5% 초과부터 수익 Stop을 추가합니다. 손실 후 다음 진입은 증거금 비율을 "
             "35%→25%→15%→10%로 줄이고 비상 Stop을 적용합니다. 수익 또는 본전 청산 시 "
@@ -621,7 +649,7 @@ class ControllerEMA200UTBotRSIMixin:
                 )
                 await query.edit_message_text(
                     (
-                        "🏆 최적 후보 선택 ON — 고정 10개를 모두 평가한 뒤 "
+                        "🏆 최적 후보 선택 ON — 현재 거래대금 기준을 만족하는 종목을 모두 평가한 뒤 "
                         "점수순으로 한 종목만 진입합니다."
                         if current is False
                         else (

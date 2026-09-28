@@ -25,8 +25,7 @@ from bot_runtime.ema200_profit_stop import ema200_profit_stop_target
 from bot_runtime.ema200_utbot_rsi import (
     EMA200_CONSECUTIVE_LOSS_RESET_STATE_KEY,
     EMA200_DAILY_LOSS_RESET_STATE_KEY,
-    EMA200_BINANCE_TOP10_BASES,
-    EMA200_BINANCE_TOP10_SYMBOLS,
+    EMA200_MIN_QUOTE_VOLUME_USDT,
     EMA200_UTBOT_RSI_STRATEGY,
     apply_ema200_daily_loss_reset,
     build_ema200_utbot_rsi_risk_plan,
@@ -39,6 +38,7 @@ from bot_runtime.ema200_utbot_rsi import (
     get_ema200_consecutive_losses,
     is_ema200_utbot_rsi_symbol_allowed,
     normalize_ema200_utbot_rsi_config,
+    select_ema200_volume_symbols,
 )
 from scripts.reset_ema200_daily_loss import reset_ema200_daily_loss
 from scripts.reset_ema200_consecutive_losses import (
@@ -108,6 +108,66 @@ def test_margin_roi_profit_stop_strict_steps(side, mark, roi_floor, stop):
 def test_margin_roi_profit_stop_rejects_bad_exchange_position_data():
     for bad in (None, 0, float('nan'), float('inf')):
         assert ema200_profit_stop_target('long', 100, 102, bad) is None
+
+
+@pytest.mark.parametrize('paused', [False, True])
+def test_profit_stop_ratchets_during_candle_outage_or_pause(paused):
+    symbol = 'BTC/USDT:USDT'
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    engine.running = True
+    engine.scanner_active_symbol = symbol
+    engine.active_symbols = set()
+    engine.consecutive_errors = 0
+    engine.ctrl = SimpleNamespace(is_paused=paused, status_data={})
+    engine.db = SimpleNamespace(get_daily_stats=lambda: (0, 0.0))
+    engine.get_runtime_trade_config = lambda: {
+        'common_settings': {'scanner_enabled': True, 'entry_timeframe': '2h'},
+        'strategy_params': {'active_strategy': EMA200_UTBOT_RSI_STRATEGY},
+    }
+    engine.get_runtime_common_settings = lambda: {
+        'scanner_enabled': True, 'entry_timeframe': '2h', 'leverage': 5,
+    }
+    engine.get_active_position_symbols = lambda use_cache=True: asyncio.sleep(
+        0, result={symbol}
+    )
+    engine._cleanup_orphan_protection_orders = lambda **kwargs: asyncio.sleep(
+        0, result={'cancelled': 0}
+    )
+    pos = {
+        'symbol': symbol, 'side': 'long', 'entryPrice': 100.0,
+        'markPrice': 101.2, 'leverage': 5, 'contracts': 1.0,
+    }
+    engine._position_entry_strategy = lambda _: EMA200_UTBOT_RSI_STRATEGY
+    engine._fetch_server_position_checked = lambda _: asyncio.sleep(
+        0, result=(True, dict(pos))
+    )
+    engine._collect_protection_orders_checked = lambda _: asyncio.sleep(
+        0, result=(True, [])
+    )
+    engine.safe_price = lambda _, price: price
+    installed = []
+
+    async def replace(_symbol, _pos, price, reason):
+        installed.append(price)
+        return {'id': str(len(installed))}
+
+    engine._replace_stop_loss_order = replace
+    engine._audit_protection_orders = lambda *args, **kwargs: asyncio.sleep(
+        0, result={'sl_present': True, 'status': 'OK'}
+    )
+    engine.get_balance_info = lambda: asyncio.sleep(0, result=(500, 400, 0))
+    engine.is_upbit_mode = lambda: False
+
+    def unavailable_candles(*args, **kwargs):
+        raise TimeoutError('2h candles unavailable')
+
+    engine.market_data_exchange = SimpleNamespace(fetch_ohlcv=unavailable_candles)
+    for mark in (101.2, 102.2, 103.2):
+        pos['markPrice'] = mark
+        asyncio.run(engine.poll_tick())
+
+    assert installed == pytest.approx([101.0, 102.0, 103.0])
+    assert engine.last_ema200_profit_stop_status[symbol]['status'] == 'PROTECTED'
 
 
 def _ccxt_binance_v3_position_without_leverage():
@@ -240,6 +300,22 @@ def test_profit_stop_leverage_lookup_failure_does_not_create_order_and_records_r
     status = engine.last_ema200_profit_stop_status['BTC/USDT:USDT']
     assert status['status'] == 'LEVERAGE_UNAVAILABLE'
     assert 'symbolConfig' in status['reason']
+
+
+def test_profit_stop_reports_missing_exchange_mark_instead_of_below_trigger():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    symbol = 'BTC/USDT:USDT'
+    engine._position_entry_strategy = lambda _: EMA200_UTBOT_RSI_STRATEGY
+    engine._fetch_server_position_checked = lambda _: asyncio.sleep(0, result=(
+        True, {'side': 'long', 'entryPrice': 100.0, 'leverage': 5},
+    ))
+    engine._replace_stop_loss_order = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError('missing mark must not create an order')
+    )
+    asyncio.run(engine._ema200_apply_margin_profit_stop(symbol))
+    assert engine.last_ema200_profit_stop_status[symbol]['status'] == (
+        'POSITION_PRICE_UNAVAILABLE'
+    )
 
 
 def test_profit_stop_rejects_conflicting_exchange_leverage_fields():
@@ -2396,39 +2472,84 @@ def test_short_is_exact_inverse():
     assert detail["rsi_below_and_falling"] is True
 
 
-def test_fixed_universe_is_exactly_ten_non_stable_binance_perpetual_assets():
-    assert EMA200_BINANCE_TOP10_BASES == (
-        "BTC",
-        "ETH",
-        "BNB",
-        "XRP",
-        "SOL",
-        "TRX",
-        "ZEC",
-        "HYPE",
-        "DOGE",
-        "XMR",
+EMA200_TEST_SYMBOLS = (
+    'BTC/USDT:USDT', 'ETH/USDT:USDT', 'ADA/USDT:USDT'
+)
+
+
+def _ema200_test_market(active=True):
+    return {'active': active, 'swap': True, 'linear': True,
+            'quote': 'USDT', 'settle': 'USDT'}
+
+
+def _ema200_test_exchange(fetch_ohlcv=None, volumes=None):
+    if volumes is None:
+        volumes = {
+            'BTC/USDT:USDT': 500_000_000,
+            'ETH/USDT:USDT': 400_000_000,
+            'ADA/USDT:USDT': 300_000_000,
+        }
+    tickers = {symbol: {'quoteVolume': volume} for symbol, volume in volumes.items()}
+    markets = {symbol: _ema200_test_market() for symbol in tickers}
+    return SimpleNamespace(
+        load_markets=lambda: markets,
+        fetch_tickers=lambda: tickers,
+        fetch_ticker=lambda symbol: tickers[symbol],
+        fetch_ohlcv=fetch_ohlcv,
     )
-    assert len(EMA200_BINANCE_TOP10_SYMBOLS) == 10
-    assert not {"USDT", "USDC", "DAI"} & set(EMA200_BINANCE_TOP10_BASES)
-    assert all(symbol.endswith("/USDT:USDT") for symbol in EMA200_BINANCE_TOP10_SYMBOLS)
+
+
+def test_ema200_volume_universe_filters_active_linear_usdt_perpetuals():
+    markets = {symbol: _ema200_test_market() for symbol in EMA200_TEST_SYMBOLS}
+    markets['XRP/USDT:USDT'] = _ema200_test_market(active=False)
+    markets['BTC/USDT'] = {**_ema200_test_market(), 'swap': False}
+    markets['SOL/USDC:USDC'] = {**_ema200_test_market(), 'quote': 'USDC'}
+    tickers = {
+        'BTC/USDT:USDT': {'quoteVolume': EMA200_MIN_QUOTE_VOLUME_USDT},
+        'ETH/USDT:USDT': {'quoteVolume': 199_999_999},
+        'ADA/USDT:USDT': {'quoteVolume': 300_000_000},
+        'XRP/USDT:USDT': {'quoteVolume': 400_000_000},
+        'BTC/USDT': {'quoteVolume': 500_000_000},
+        'SOL/USDC:USDC': {'quoteVolume': 600_000_000},
+        'DOGE/USDT:USDT': {'quoteVolume': 800_000_000},
+    }
+    assert select_ema200_volume_symbols(tickers, markets) == (
+        'ADA/USDT:USDT', 'BTC/USDT:USDT'
+    )
+    tickers['ADA/USDT:USDT']['quoteVolume'] = float('nan')
+    assert select_ema200_volume_symbols(tickers, markets) == ('BTC/USDT:USDT',)
 
 
 @pytest.mark.parametrize(
     ("symbol", "expected"),
     [
         ("BTC/USDT:USDT", True),
-        ("btcusdt", True),
-        ("HYPE/USDT", True),
-        ("ADA/USDT:USDT", False),
+        ("ADA/USDT:USDT", True),
+        ("HYPE/USDT:USDT", False),
         ("BTC/USDC:USDC", False),
         ("BTC", False),
         ("USDT/USDT:USDT", False),
         (None, False),
     ],
 )
-def test_fixed_universe_guard_normalizes_common_symbol_forms(symbol, expected):
-    assert is_ema200_utbot_rsi_symbol_allowed(symbol) is expected
+def test_ema200_volume_guard_only_accepts_selected_market(symbol, expected):
+    assert is_ema200_utbot_rsi_symbol_allowed(symbol, (
+        'BTC/USDT:USDT', 'ADA/USDT:USDT'
+    )) is expected
+
+
+def test_ema200_entry_rechecks_current_volume_and_fails_closed_on_lookup_error():
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    volumes = {'ADA/USDT:USDT': 200_000_000}
+    exchange = _ema200_test_exchange(volumes=volumes)
+    engine.market_data_exchange = exchange
+    assert asyncio.run(engine._ema200_entry_volume_allowed('ADA/USDT:USDT'))[0]
+    volumes['ADA/USDT:USDT'] = 199_999_999
+    exchange.fetch_ticker = lambda symbol: {'quoteVolume': volumes[symbol]}
+    assert not asyncio.run(engine._ema200_entry_volume_allowed('ADA/USDT:USDT'))[0]
+    exchange.fetch_ticker = lambda symbol: (_ for _ in ()).throw(TimeoutError())
+    allowed, reason = asyncio.run(engine._ema200_entry_volume_allowed('ADA/USDT:USDT'))
+    assert not allowed and 'TimeoutError' in reason
 
 
 def test_wrong_ema_side_blocks_signal():
@@ -2883,14 +3004,14 @@ def test_primary_polling_is_fixed_to_2h_and_exit_is_user_selectable():
     params["EMA200UTBotRSI2H"]["exit_timeframe"] = "30m"
     assert engine._get_exit_timeframe("BTC/USDT") == "30m"
 
-    fixed_scanner_source = inspect.getsource(
-        emas.SignalEngine._scan_and_trade_ema200_binance_top10
+    volume_scanner_source = inspect.getsource(
+        emas.SignalEngine._scan_and_trade_ema200_volume
     )
     high_volume_source = inspect.getsource(emas.SignalEngine.scan_and_trade_high_volume)
     poll_tick_source = inspect.getsource(emas.SignalEngine.poll_tick)
-    assert "'2h'" in fixed_scanner_source
-    assert "EMA200_BINANCE_TOP10_SYMBOLS" in fixed_scanner_source
-    assert "_scan_and_trade_ema200_binance_top10" in high_volume_source
+    assert "'2h'" in volume_scanner_source
+    assert "_ema200_volume_symbols" in volume_scanner_source
+    assert "_scan_and_trade_ema200_volume" in high_volume_source
     assert "configured_active_strategy == EMA200_UTBOT_RSI_STRATEGY" in poll_tick_source
     assert "scanner_enabled = True" in poll_tick_source
 
@@ -2932,22 +3053,21 @@ def test_known_non_ema_position_is_not_reassigned_to_new_ema_config():
     assert engine._get_exit_timeframe("DOGE/USDT:USDT") == "4h"
 
 
-def test_fixed_top10_scanner_checks_every_symbol_on_2h_without_volume_selection():
+def test_volume_scanner_checks_every_eligible_symbol_on_2h_and_rotates():
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
     calls = []
 
     def fetch_ohlcv(symbol, timeframe, limit):
         calls.append((symbol, timeframe, limit))
         return [
-            [1, 1.0, 2.0, 0.5, 1.5, 10.0],
-            [2, 1.5, 2.0, 0.5, 1.4, 10.0],
-            [3, 1.4, 2.0, 0.5, 1.3, 10.0],
+            [index, 1.0, 2.0, 0.5, 1.5, 10.0]
+            for index in range(203)
         ]
 
-    engine.market_data_exchange = SimpleNamespace(fetch_ohlcv=fetch_ohlcv)
+    engine.market_data_exchange = _ema200_test_exchange(fetch_ohlcv)
     engine.ctrl = SimpleNamespace(is_paused=False)
     engine.scanner_active_symbol = None
-    engine.ema200_top10_scan_cursor = 0
+    engine.ema200_volume_scan_cursor = 0
     engine.last_entry_reason = {}
     engine.get_runtime_strategy_params = lambda: {
         "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
@@ -2961,15 +3081,15 @@ def test_fixed_top10_scanner_checks_every_symbol_on_2h_without_volume_selection(
 
     engine._calculate_strategy_signal = no_signal
 
-    asyncio.run(engine._scan_and_trade_ema200_binance_top10())
+    asyncio.run(engine._scan_and_trade_ema200_volume())
 
     assert calls == [
-        (symbol, "2h", 300) for symbol in EMA200_BINANCE_TOP10_SYMBOLS
+        (symbol, "2h", 300) for symbol in EMA200_TEST_SYMBOLS
     ]
 
     calls.clear()
-    asyncio.run(engine._scan_and_trade_ema200_binance_top10())
-    rotated = EMA200_BINANCE_TOP10_SYMBOLS[1:] + EMA200_BINANCE_TOP10_SYMBOLS[:1]
+    asyncio.run(engine._scan_and_trade_ema200_volume())
+    rotated = EMA200_TEST_SYMBOLS[1:] + EMA200_TEST_SYMBOLS[:1]
     assert calls == [(symbol, "2h", 300) for symbol in rotated]
 
 
@@ -3050,7 +3170,7 @@ def test_candidate_ranker_prefers_fresher_stronger_signal_over_scan_order():
     assert ranked[1]["score_breakdown"]["liquidity"] == 15.0
 
 
-def test_best_candidate_scanner_evaluates_all_ten_then_enters_highest_rank():
+def test_best_candidate_skips_new_listing_without_history_and_enters_highest_rank():
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
     step = 2 * 60 * 60 * 1000
     candle_ts = 220 * step
@@ -3066,7 +3186,7 @@ def test_best_candidate_scanner_evaluates_all_ten_then_enters_highest_rank():
             "curr_rsi": 49.0,
             "ut_last_signal_ts": candle_ts - step,
         }
-        for symbol in EMA200_BINANCE_TOP10_SYMBOLS
+        for symbol in EMA200_TEST_SYMBOLS
     }
     details["BTC/USDT:USDT"].update({
         "prev_rsi": 55.0,
@@ -3084,16 +3204,17 @@ def test_best_candidate_scanner_evaluates_all_ten_then_enters_highest_rank():
     def fetch_ohlcv(symbol, timeframe, limit):
         events.append(("fetch", symbol))
         volume = 10_000.0 if symbol == "BTC/USDT:USDT" else 100.0
-        return _ema200_ranking_ohlcv(
+        rows = _ema200_ranking_ohlcv(
             close=100.0,
             volume=volume,
             candle_ts=candle_ts,
         )
+        return rows[:100] if symbol == 'ADA/USDT:USDT' else rows
 
-    engine.market_data_exchange = SimpleNamespace(fetch_ohlcv=fetch_ohlcv)
+    engine.market_data_exchange = _ema200_test_exchange(fetch_ohlcv)
     engine.ctrl = SimpleNamespace(is_paused=False)
     engine.scanner_active_symbol = None
-    engine.ema200_top10_scan_cursor = 0
+    engine.ema200_volume_scan_cursor = 0
     engine.last_entry_reason = {}
     engine.last_processed_candle_ts = {}
     engine.last_candle_time = {}
@@ -3128,10 +3249,10 @@ def test_best_candidate_scanner_evaluates_all_ten_then_enters_highest_rank():
     engine.get_server_position = get_position
     engine.entry = entry
 
-    asyncio.run(engine._scan_and_trade_ema200_binance_top10())
+    asyncio.run(engine._scan_and_trade_ema200_volume())
 
     assert [event for event in events if event[0] == "fetch"] == [
-        ("fetch", symbol) for symbol in EMA200_BINANCE_TOP10_SYMBOLS
+        ("fetch", symbol) for symbol in EMA200_TEST_SYMBOLS
         for _ in range(1 + (3 if symbol in {"BTC/USDT:USDT", "ETH/USDT:USDT"} else 0))
     ]
     assert [event for event in events if event[0] == "entry"] == [
@@ -3142,6 +3263,7 @@ def test_best_candidate_scanner_evaluates_all_ten_then_enters_highest_rank():
         "ETH/USDT:USDT"
     )
     assert engine.last_processed_candle_ts["ETH/USDT:USDT"] == candle_ts
+    assert '완료봉 데이터 부족' in engine.last_entry_reason['ADA/USDT:USDT']
 
 
 def test_best_candidate_off_preserves_first_valid_signal_behavior():
@@ -3155,10 +3277,10 @@ def test_best_candidate_off_preserves_first_valid_signal_behavior():
         fetched.append(symbol)
         return _ema200_ranking_ohlcv(candle_ts=candle_ts)
 
-    engine.market_data_exchange = SimpleNamespace(fetch_ohlcv=fetch_ohlcv)
+    engine.market_data_exchange = _ema200_test_exchange(fetch_ohlcv)
     engine.ctrl = SimpleNamespace(is_paused=False)
     engine.scanner_active_symbol = None
-    engine.ema200_top10_scan_cursor = 0
+    engine.ema200_volume_scan_cursor = 0
     engine.last_entry_reason = {}
     engine.last_processed_candle_ts = {}
     engine.last_candle_time = {}
@@ -3197,28 +3319,28 @@ def test_best_candidate_off_preserves_first_valid_signal_behavior():
     engine.get_server_position = get_position
     engine.entry = entry
 
-    asyncio.run(engine._scan_and_trade_ema200_binance_top10())
+    asyncio.run(engine._scan_and_trade_ema200_volume())
 
-    assert fetched == [EMA200_BINANCE_TOP10_SYMBOLS[0]]
-    assert engine.scanner_active_symbol == EMA200_BINANCE_TOP10_SYMBOLS[0]
+    assert fetched == [EMA200_TEST_SYMBOLS[0]]
+    assert engine.scanner_active_symbol == EMA200_TEST_SYMBOLS[0]
     assert engine.last_ema200_candidate_selection["enabled"] is False
 
 
-def test_best_candidate_scan_fails_closed_when_one_of_ten_cannot_be_evaluated():
+def test_best_candidate_scan_fails_closed_when_one_eligible_cannot_be_evaluated():
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
     step = 2 * 60 * 60 * 1000
     candle_ts = 220 * step
     entries = []
 
     def fetch_ohlcv(symbol, timeframe, limit):
-        if symbol == EMA200_BINANCE_TOP10_SYMBOLS[-1]:
+        if symbol == EMA200_TEST_SYMBOLS[-1]:
             raise TimeoutError("simulated market-data timeout")
         return _ema200_ranking_ohlcv(candle_ts=candle_ts)
 
-    engine.market_data_exchange = SimpleNamespace(fetch_ohlcv=fetch_ohlcv)
+    engine.market_data_exchange = _ema200_test_exchange(fetch_ohlcv)
     engine.ctrl = SimpleNamespace(is_paused=False)
     engine.scanner_active_symbol = None
-    engine.ema200_top10_scan_cursor = 0
+    engine.ema200_volume_scan_cursor = 0
     engine.last_entry_reason = {}
     engine.last_processed_candle_ts = {}
     engine.last_candle_time = {}
@@ -3242,7 +3364,7 @@ def test_best_candidate_scan_fails_closed_when_one_of_ten_cannot_be_evaluated():
 
     async def signal(*args, precomputed=None, **kwargs):
         return (
-            "long" if precomputed["symbol"] == EMA200_BINANCE_TOP10_SYMBOLS[0] else None,
+            "long" if precomputed["symbol"] == EMA200_TEST_SYMBOLS[0] else None,
             None,
             None,
             None,
@@ -3260,10 +3382,10 @@ def test_best_candidate_scan_fails_closed_when_one_of_ten_cannot_be_evaluated():
     engine.entry = entry
     engine.get_server_position = no_position
 
-    asyncio.run(engine._scan_and_trade_ema200_binance_top10())
+    asyncio.run(engine._scan_and_trade_ema200_volume())
 
     assert entries == []
-    assert "10개 중 9개 평가" in engine.last_ema200_candidate_selection["reason"]
+    assert "평가 가능 3개 중 2개 평가" in engine.last_ema200_candidate_selection["reason"]
     assert "TimeoutError" in engine.last_ema200_candidate_selection["reason"]
 
 
@@ -3275,20 +3397,20 @@ def test_high_volume_scanner_bypasses_coin_selector_for_ema200_strategy():
         "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
     }
 
-    async def fixed_scan():
-        calls.append("fixed")
+    async def volume_scan():
+        calls.append("volume")
 
-    engine._scan_and_trade_ema200_binance_top10 = fixed_scan
+    engine._scan_and_trade_ema200_volume = volume_scan
     engine._get_coin_selector_config = lambda: (_ for _ in ()).throw(
-        AssertionError("CoinSelector must not run for the fixed EMA200 universe")
+        AssertionError("CoinSelector must not run for the EMA200 volume universe")
     )
 
     asyncio.run(engine.scan_and_trade_high_volume())
 
-    assert calls == ["fixed"]
+    assert calls == ["volume"]
 
 
-def test_ema200_entry_guard_blocks_every_symbol_outside_fixed_top10():
+def test_ema200_entry_guard_blocks_symbol_below_volume_threshold():
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
     notices = []
 
@@ -3296,6 +3418,9 @@ def test_ema200_entry_guard_blocks_every_symbol_outside_fixed_top10():
         notices.append(message)
 
     engine.ctrl = SimpleNamespace(notify=notify)
+    engine.market_data_exchange = _ema200_test_exchange(
+        volumes={'ADA/USDT:USDT': 199_999_999}
+    )
     engine.last_entry_reason = {}
     engine.is_user_custom_entry_mode_enabled = lambda: False
     engine.get_runtime_strategy_params = lambda: {
@@ -3304,7 +3429,7 @@ def test_ema200_entry_guard_blocks_every_symbol_outside_fixed_top10():
 
     asyncio.run(engine.entry("ADA/USDT:USDT", "long", 1.0))
 
-    assert "EMA200_FIXED_TOP10_ONLY" in engine.last_entry_reason["ADA/USDT:USDT"]
+    assert "EMA200_VOLUME_UNIVERSE" in engine.last_entry_reason["ADA/USDT:USDT"]
     assert notices and "진입 차단" in notices[0]
 
 
@@ -3715,7 +3840,7 @@ def test_telegram_status_uses_real_evaluation_order_when_2h_timestamps_tie():
 
     assert "최근 조건 (ETH/USDT)" in status
     assert "최근 평가 종목(2개 기록): ETH/USDT, BTC/USDT" in status
-    assert "스캔 종목: BTC, ETH, BNB, XRP, SOL, TRX, ZEC, HYPE, DOGE, XMR" in status
+    assert "24시간 거래대금 200M USDT 이상" in status
     assert "소액계좌 다음 단계(해당 시): 증거금 35% / 5x" in status
     assert "UT 반대 신호 + 비상 Stop" in status
     assert "최적 후보 선택: ON" in status
@@ -3748,6 +3873,28 @@ def test_telegram_status_shows_actual_large_account_entry_amounts_and_ratios():
     assert "비상 손절 가격거리: 진입가 대비 5.00%" in status
     assert "예상 명목 포지션: 500.00 USDT (계좌의 10.00%)" in status
     assert "예상 사용 증거금: 100.00 USDT (계좌의 2.00%, 5x)" in status
+
+
+def test_telegram_status_shows_actual_profit_stop_failure_reason():
+    controller = _registered_telegram_controller()
+    controller.db = SimpleNamespace(
+        get_daily_stats=lambda: (0, 0.0),
+        get_weekly_stats=lambda: (0, 0.0),
+        get_consecutive_strategy_losses=lambda strategy: 0,
+    )
+    symbol = 'BTC/USDT:USDT'
+    controller.engines = {
+        'signal': SimpleNamespace(
+            scanner_active_symbol=symbol,
+            last_ema200_profit_stop_status={
+                symbol: {'status': 'LEVERAGE_UNAVAILABLE',
+                         'reason': 'live leverage unavailable', 'updated_at_ns': 10},
+            },
+        )
+    }
+    status = asyncio.run(controller._ema200_utbot_rsi_status_text())
+    assert '최근 수익 Stop (BTC/USDT:USDT): LEVERAGE_UNAVAILABLE' in status
+    assert '사유: live leverage unavailable' in status
 
 
 def test_telegram_sizing_preview_recalculates_entry_ratio_for_wider_stop():
@@ -3818,7 +3965,7 @@ def test_telegram_keyboard_exposes_best_candidate_toggle_and_help():
         for button in buttons
     )
     help_text = controller._ema200_utbot_rsi_help_text("candidate")
-    assert "10개 종목을 동일한 완료 2시간봉" in help_text
+    assert "거래대금 2억 USDT 이상인 종목을 동일한 완료 2시간봉" in help_text
     assert "점수는 후보의 순서만 정하며" in help_text
     assert "기존 포지션" in help_text
 
