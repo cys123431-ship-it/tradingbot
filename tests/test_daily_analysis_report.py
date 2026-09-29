@@ -247,7 +247,7 @@ def test_report_end_to_end_contains_both_parts_and_is_sent(tmp_path, journal_dir
     assert sent[0]["filename"].endswith("_partial.txt")
     body = sent[0]["document"].getvalue().decode("utf-8")
     assert "PART 2. 자동매매 코드 작동 검증" in body
-    assert "실현손익 -3.1000 USDT" in sent[0]["caption"]
+    assert "순손익 -3.1000 USDT" in sent[0]["caption"]
     db.conn.close()
     store.close()
 
@@ -332,3 +332,65 @@ def test_market_replay_measures_excursions_on_1m_hold_only(tmp_path, journal_dir
     assert replay["excursions"]["mfe_price_pct"] == pytest.approx(2.0)
     db.conn.close()
     store.close()
+
+
+def test_report_counts_fee_eaten_profit_as_a_loss_like_the_streak():
+    entry = datetime(2026, 9, 29, 9, 50, 51, tzinfo=timezone.utc)
+    trade = {
+        "id": 1, "symbol": "BTW/USDT:USDT", "side": "long", "entry_price": 1.251276,
+        "exit_price": 1.251728, "quantity": 191.0, "pnl_usdt": 0.0862, "pnl_pct": 0.04,
+        "entry_time": entry.isoformat(), "exit_time": (entry + timedelta(minutes=9)).isoformat(),
+        "exit_reason": "EMA200_UTBOT_RSI_UT_SELL", "strategy": EMA200_UTBOT_RSI_STRATEGY,
+        "archived_at": None,
+    }
+    result = {"symbol": "BTW/USDT:USDT", "entry_time": entry.isoformat(),
+              "gross_pnl_usdt": 0.0862, "net_pnl_usdt": -0.1528, "provisional": False}
+    text = build_daily_analysis_report({
+        "window_start": (entry - timedelta(hours=1)).isoformat(),
+        "window_end": (entry + timedelta(hours=1)).isoformat(),
+        "trades": [trade], "trade_results": [result],
+    })
+    assert "승 0 패 1 본전 0" in text
+    assert "순손익 -0.1528 USDT (가격손익 +0.0862" in text
+    assert "결과 손실 (순손익 -0.1528 USDT, 수수료·펀딩 포함)" in text
+    assert "부호가 다릅니다" in text
+
+
+def test_poll_tick_ratchets_each_position_once_and_skips_closed_owner_warning():
+    from tests.test_ema200_exit_management import _harness
+
+    harness = _harness()
+    engine = harness.engine
+    calls = []
+    statuses = []
+
+    async def ratchet(symbol):
+        calls.append(symbol)
+
+    async def positions(use_cache=True):
+        return {"HYPE/USDT"}  # exchange format; scanner keeps "HYPE/USDT:USDT"
+
+    engine._ema200_apply_margin_profit_stop = ratchet
+    engine.get_active_position_symbols = positions
+    engine._set_ema200_profit_stop_status = (
+        lambda symbol, status, **details: statuses.append((symbol, status))
+    )
+    asyncio.run(engine.poll_tick())
+    assert calls == ["HYPE/USDT"]
+
+    # Position closed: the scanner still remembers the symbol but it has no
+    # owner any more, which must not be reported as an unverified position.
+    async def flat(use_cache=True):
+        return set()
+
+    engine.get_active_position_symbols = flat
+    engine._position_entry_strategy = lambda symbol: None
+    harness.state["open"] = False
+    asyncio.run(engine.poll_tick())
+    assert ("HYPE/USDT:USDT", "OWNER_UNVERIFIED") not in statuses
+
+    # A real exchange position without an owner record is still flagged.
+    engine.get_active_position_symbols = positions
+    harness.state["open"] = True
+    asyncio.run(engine.poll_tick())
+    assert ("HYPE/USDT", "OWNER_UNVERIFIED") in statuses

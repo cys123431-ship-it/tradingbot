@@ -966,10 +966,24 @@ class SignalScannerMixin:
             # Profit protection follows the live exchange position and mark
             # price. A 2h candle outage, a large scanner universe, or PAUSE
             # must not prevent an already-open EMA200 stop from ratcheting.
-            protection_symbols = set(active_position_symbols)
+            # One entry per exchange position: the scanner remembers
+            # "BTW/USDT:USDT" while positions arrive as "BTW/USDT", and the
+            # same position must not be ratcheted twice per tick.
+            def _protection_key(value):
+                return str(value or '').upper().split(':', 1)[0].replace('/', '')
+
+            position_keys = {
+                _protection_key(sym) for sym in active_position_symbols
+            }
+            protection_by_key = {}
+            for sym in sorted(active_position_symbols):
+                protection_by_key.setdefault(_protection_key(sym), sym)
             if self.scanner_active_symbol:
-                protection_symbols.add(self.scanner_active_symbol)
-            for held_symbol in sorted(protection_symbols):
+                protection_by_key.setdefault(
+                    _protection_key(self.scanner_active_symbol),
+                    self.scanner_active_symbol,
+                )
+            for held_key, held_symbol in sorted(protection_by_key.items()):
                 owner = self._position_entry_strategy(held_symbol)
                 if owner == EMA200_UTBOT_RSI_STRATEGY:
                     # One symbol's ratchet failure must not abort this tick;
@@ -987,9 +1001,11 @@ class SignalScannerMixin:
                             error=f'{type(profit_stop_error).__name__}: {profit_stop_error}',
                             code_ref='signal_scanner.py:poll_tick profit ratchet',
                         )
-                elif not owner and str(
+                elif not owner and held_key in position_keys and str(
                     (cfg.get('strategy_params') or {}).get('active_strategy') or ''
                 ).lower() == EMA200_UTBOT_RSI_STRATEGY:
+                    # Only a live exchange position can lack an owner; a
+                    # just-closed scanner symbol has no owner by design.
                     self._set_ema200_profit_stop_status(
                         held_symbol, 'OWNER_UNVERIFIED',
                         reason='보유 포지션의 EMA200 전략 소유 기록을 확인할 수 없음',

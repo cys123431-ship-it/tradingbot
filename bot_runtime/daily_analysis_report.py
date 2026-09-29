@@ -614,6 +614,30 @@ def consistency_checks(inputs):
 
 
 # ------------------------------------------------------------------ rendering
+def _trade_result(trade, inputs):
+    """Fee/funding-aware accounting row for a DB trade, if recorded."""
+    return next(
+        (
+            r for r in inputs.get("trade_results") or []
+            if r.get("symbol") == trade.get("symbol")
+            and str(r.get("entry_time")) == str(trade.get("entry_time"))
+        ),
+        None,
+    )
+
+
+def _trade_net_pnl(trade, inputs):
+    """Return (pnl, basis): net after fees/funding when known, else gross.
+
+    The loss streak uses the same fee-aware net result, so a small gross
+    profit eaten by fees is a loss here exactly as it is for the bot.
+    """
+    result = _trade_result(trade, inputs)
+    if result and result.get("net_pnl_usdt") is not None:
+        return float(result["net_pnl_usdt"]), "net"
+    return float(trade.get("pnl_usdt") or 0.0), "gross"
+
+
 def _trade_block(index, trade, inputs):
     journal = inputs.get("journal") or []
     symbol = trade.get("symbol")
@@ -680,13 +704,20 @@ def _trade_block(index, trade, inputs):
         for executed in _between(_events(journal, "exit_executed", symbol), entry_at, hold_end + timedelta(minutes=1)):
             lines.append(f"  청산 실행: {_kst(executed.get('ts'))} {executed.get('reason')} (잔여 포지션 {executed.get('remaining_position')})")
     if trade.get("exit_time"):
-        result = next((r for r in inputs.get("trade_results") or []
-                       if r.get("symbol") == symbol and str(r.get("entry_time")) == str(trade.get("entry_time"))), None)
+        result = _trade_result(trade, inputs)
         hold = (exit_at - entry_at) if entry_at and exit_at else None
+        net, basis = _trade_net_pnl(trade, inputs)
+        outcome = "이익" if net > 0 else "손실" if net < 0 else "본전"
         lines.append(
             f"  청산: {_kst(exit_at)} KST @ {_num(trade.get('exit_price'), 6)} / 사유 {trade.get('exit_reason')} / "
-            f"PnL {_num(trade.get('pnl_usdt'))} USDT ({_num(trade.get('pnl_pct'), 2)}%) / 보유 {str(hold).split('.')[0] if hold else '-'}"
+            f"결과 {outcome} (순손익 {_num(net)} USDT, {'수수료·펀딩 포함' if basis == 'net' else '수수료 미확정, 가격손익'}) / "
+            f"가격손익 {_num(trade.get('pnl_usdt'))} USDT ({_num(trade.get('pnl_pct'), 2)}%) / 보유 {str(hold).split('.')[0] if hold else '-'}"
         )
+        if basis == "net" and (float(trade.get("pnl_usdt") or 0.0) > 0) != (net > 0):
+            lines.append(
+                "  ※ 가격손익과 순손익의 부호가 다릅니다. 연속손실 단계는 순손익 기준이라 "
+                f"이 거래는 {'손실' if net < 0 else '이익/본전'}으로 집계됩니다."
+            )
         if result:
             lines.append(
                 f"  정산: net {_num(result.get('net_pnl_usdt'))} / gross {_num(result.get('gross_pnl_usdt'))} / "
@@ -739,14 +770,16 @@ def build_daily_analysis_report(inputs):
     lines.append("PART 1. 매매전략 분석")
     lines.append("#" * 78)
     closed = [t for t in trades if t.get("exit_time") and start <= (_aware(t.get("exit_time")) or start) < end]
-    pnls = [float(t.get("pnl_usdt") or 0.0) for t in closed]
+    pnls = [_trade_net_pnl(t, inputs)[0] for t in closed]
+    gross = [float(t.get("pnl_usdt") or 0.0) for t in closed]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
     entered = [t for t in trades if start <= (_aware(t.get("entry_time")) or start) < end]
-    lines.append("[1-1 요약]")
+    lines.append("[1-1 요약] (승·패와 손익은 수수료·펀딩 포함 순손익 기준 — 봇의 연속손실 판단과 동일)")
     lines.append(f"  기간 내 진입 {len(entered)}건 / 청산 {len(closed)}건 / 승 {len(wins)} 패 {len(losses)} 본전 {len(pnls) - len(wins) - len(losses)}")
     lines.append(
-        f"  실현손익 {sum(pnls):+.4f} USDT / 평균이익 {(sum(wins) / len(wins)) if wins else 0:+.4f} / 평균손실 {(sum(losses) / len(losses)) if losses else 0:+.4f} / "
+        f"  순손익 {sum(pnls):+.4f} USDT (가격손익 {sum(gross):+.4f}, 수수료·펀딩 {sum(pnls) - sum(gross):+.4f}) / "
+        f"평균이익 {(sum(wins) / len(wins)) if wins else 0:+.4f} / 평균손실 {(sum(losses) / len(losses)) if losses else 0:+.4f} / "
         f"Profit Factor {(sum(wins) / abs(sum(losses))) if losses else ('∞' if wins else '-')}"
     )
     by_reason = Counter(str(t.get("exit_reason") or "-") for t in closed)
