@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from utbreakout.dynamic_leverage import apply_dynamic_leverage_to_plan
 
+from .decision_journal import OPERATIONS, STRATEGY, journal_event
 from .ema200_utbot_rsi import (
     EMA200_CONSECUTIVE_LOSS_RESET_STATE_KEY,
+    EMA200_DAILY_LOSS_RESET_STATE_KEY,
+    apply_ema200_daily_loss_reset,
     EMA200_UTBOT_RSI_STRATEGY,
     build_ema200_utbot_rsi_risk_plan,
     calculate_ema200_utbot_rsi_emergency_stop_price,
@@ -309,6 +312,11 @@ class SignalEntryMixin:
                 allowed, volume_reason = True, ''
             if not allowed:
                 reason = f"EMA200_VOLUME_UNIVERSE: 진입 차단 ({symbol}) / {volume_reason}"
+                journal_event(
+                    STRATEGY, 'entry_blocked', symbol=symbol, side=side,
+                    gate='volume_universe', reason=reason,
+                    code_ref='signal_entry.py:SignalEntryMixin.entry',
+                )
                 if not isinstance(getattr(self, 'last_entry_reason', None), dict):
                     self.last_entry_reason = {}
                 self.last_entry_reason[str(symbol)] = reason
@@ -325,6 +333,14 @@ class SignalEntryMixin:
                         side,
                         trace_strategy_params,
                     )
+                )
+                journal_event(
+                    STRATEGY, 'entry_gate_exit_tf', symbol=symbol, side=side,
+                    allowed=bool(aligned), reason=alignment_reason,
+                    code_ref=(
+                        'signal_ema200_utbot_rsi.py:'
+                        '_ema200_exit_timeframe_aligned'
+                    ),
                 )
                 if not aligned:
                     reason = (
@@ -908,6 +924,22 @@ class SignalEntryMixin:
                 try:
                     _, ema200_daily_pnl = self.db.get_daily_stats()
                     _, ema200_weekly_pnl = self.db.get_weekly_stats()
+                    # Honour an operator daily-loss reset (script or morning
+                    # entry reset) exactly like the primary entry gate does.
+                    ema200_daily_store = getattr(
+                        self, 'trading_state_store', None
+                    ) or getattr(
+                        getattr(self, 'ctrl', None),
+                        'trading_state_store',
+                        None,
+                    )
+                    if ema200_daily_store is not None:
+                        ema200_daily_pnl, _, _ = apply_ema200_daily_loss_reset(
+                            ema200_daily_pnl,
+                            ema200_daily_store.get_runtime_state(
+                                EMA200_DAILY_LOSS_RESET_STATE_KEY
+                            ),
+                        )
                     ema200_loss_gate = evaluate_ema200_utbot_rsi_loss_gate(
                         account_equity=sizing_equity,
                         daily_realized_pnl=ema200_daily_pnl,
@@ -922,6 +954,12 @@ class SignalEntryMixin:
                     )
                     return
                 if not ema200_loss_gate.get('allowed'):
+                    journal_event(
+                        STRATEGY, 'entry_blocked', symbol=symbol, side=side,
+                        gate='ema200_loss_limit', reason=ema200_loss_gate.get('reason'),
+                        loss_gate=ema200_loss_gate,
+                        code_ref='ema200_utbot_rsi.py:evaluate_ema200_utbot_rsi_loss_gate',
+                    )
                     await self.ctrl.notify(
                         '🛑 EMA200 + UT Bot + RSI (2H) 신규 진입 차단\n'
                         f"{ema200_loss_gate.get('reason')}\n"
@@ -1121,6 +1159,12 @@ class SignalEntryMixin:
                     )
                 except Exception as streak_exc:
                     logger.exception('EMA200 consecutive-loss lookup failed')
+                    journal_event(
+                        OPERATIONS, 'entry_blocked', symbol=symbol, side=side,
+                        gate='ema200_loss_streak_lookup',
+                        reason=f'{type(streak_exc).__name__}: {streak_exc}',
+                        code_ref='ema200_utbot_rsi.py:get_ema200_consecutive_losses',
+                    )
                     await self.ctrl.notify(
                         '⚠️ EMA200 + UT Bot + RSI (2H) 진입 차단: '
                         f'연속 손실 이력 확인 실패 '
@@ -1179,6 +1223,14 @@ class SignalEntryMixin:
                     ema200_entry_plan['signal_timestamp'] = int(
                         ema200_signal_ts
                     )
+                journal_event(
+                    STRATEGY, 'entry_plan', symbol=symbol, side=side,
+                    requested_price=price, risk_plan=ema200_risk_plan,
+                    entry_plan=ema200_entry_plan,
+                    target_notional=target_notional, margin_to_use=margin_to_use,
+                    leverage=lev, sizing_equity=sizing_equity, free_balance=free,
+                    code_ref='ema200_utbot_rsi.py:build_ema200_utbot_rsi_risk_plan',
+                )
                 logger.info(
                     '[EMA200_UTBOT_RSI_2H] sizing mode=%s streak=%s '
                     'margin_pct=%s emergency_stop=%s emergency=%.2f%%, '
@@ -2123,6 +2175,16 @@ class SignalEntryMixin:
                 f"Entry confirmed: order={order.get('id', 'N/A')} "
                 f"source={confirmation.get('source')} qty={qty} price={actual_entry_price}"
             )
+            journal_event(
+                STRATEGY, 'entry_filled', symbol=symbol, side=side,
+                strategy=primary_strategy, requested_price=price,
+                fill_price=actual_entry_price, qty=float(qty),
+                order_id=(order.get('id') if isinstance(order, dict) else None),
+                client_order_id=entry_client_order_id,
+                confirmation_source=confirmation.get('source'),
+                leverage=lev,
+                code_ref='signal_entry.py:SignalEntryMixin.entry',
+            )
             if active_strategy in UTBREAKOUT_STRATEGIES:
                 self._utbreakout_trace_event(
                     symbol,
@@ -2691,6 +2753,14 @@ class SignalEntryMixin:
                         "Strategy-managed entry notification failed for %s",
                         symbol,
                     )
+                journal_event(
+                    OPERATIONS, 'entry_protection', symbol=symbol, side=side,
+                    outcome='STRATEGY_MANAGED_NO_STOP',
+                    streak=ema200_risk_plan.get('consecutive_losses'),
+                    margin_percent=ema200_risk_plan.get('margin_percent'),
+                    emergency_stop_required=ema200_risk_plan.get('emergency_stop_required'),
+                    code_ref='signal_entry.py:entry (ema200_strategy_only_no_stop)',
+                )
                 logger.warning(
                     '[EMA200_UTBOT_RSI_2H] intentional strategy-only '
                     'position without exchange stop: symbol=%s streak=%s '
@@ -2764,6 +2834,21 @@ class SignalEntryMixin:
                     )
                     if str(getattr(self, 'crypto_entry_lock_reason', '') or '').startswith('FILLED_'):
                         self._set_crypto_entry_lock(None)
+                    journal_event(
+                        OPERATIONS, 'entry_protection', symbol=symbol, side=side,
+                        outcome='PROTECTED',
+                        stop_order_id=(
+                            self._protection_order_id(stop_order)
+                            if stop_order is not None else None
+                        ),
+                        take_profit_order_ids=take_profit_order_ids,
+                        audit=protection_audit,
+                        ema200_risk_plan=(
+                            ema200_risk_plan
+                            if active_strategy == EMA200_UTBOT_RSI_STRATEGY else None
+                        ),
+                        code_ref='signal_entry.py:entry -> _audit_protection_orders',
+                    )
                     try:
                         await self.ctrl.notify(entry_notice)
                     except Exception:
@@ -2778,6 +2863,12 @@ class SignalEntryMixin:
                     self.trading_state_store.set_runtime_state(
                         'entry_lock_reason',
                         self.crypto_entry_lock_reason,
+                    )
+                    journal_event(
+                        OPERATIONS, 'entry_protection', symbol=symbol, side=side,
+                        outcome='FILLED_UNPROTECTED', audit=protection_audit,
+                        entry_lock=self.crypto_entry_lock_reason,
+                        code_ref='signal_entry.py:entry -> _audit_protection_orders',
                     )
                     await self.ctrl.notify(
                         f"CRITICAL: {self.ctrl.format_symbol_for_display(symbol)} is not verified "

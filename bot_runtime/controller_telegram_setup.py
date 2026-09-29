@@ -6030,6 +6030,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 /status - 현재 상태 조회
 /emastatus - EMA200 소액계좌 전용 상태 (초기화 후·오늘 진입/손익)
 /emareset - 오전 진입초기화 (한국시간 오전, 하루 1회)
+/dailyreport - 일일 분석 리포트 txt (오늘 09:00~지금, `/dailyreport yesterday`는 전일 09:00~오늘 09:00)
 /history - 지난 상태 조회
 /stats - 통계
 /utbreak - UTBreak 전략 메뉴
@@ -6063,6 +6064,23 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
         self.tg_app.add_handler(CommandHandler("log", owner_only(log_cmd)))
         self.tg_app.add_handler(CommandHandler("close", owner_only(close_cmd)))
         self.tg_app.add_handler(CommandHandler("stats", owner_only(stats_cmd)))
+
+        async def dailyreport_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+            args = [str(arg).strip().lower() for arg in (getattr(c, 'args', None) or [])]
+            previous = bool(args) and args[0] in {'yesterday', 'prev', 'previous', '어제', '전일'}
+            await u.message.reply_text(
+                '📑 일일 분석 리포트 생성 중… '
+                + ('(전일 09:00~오늘 09:00)' if previous else '(오늘 09:00~지금)')
+            )
+            try:
+                await self._send_daily_analysis_report(previous=previous)
+            except Exception as exc:
+                logger.exception('Daily analysis report command failed')
+                await u.message.reply_text(
+                    f'❌ 리포트 생성 실패: {type(exc).__name__}: {exc}'
+                )
+
+        self.tg_app.add_handler(CommandHandler("dailyreport", owner_only(dailyreport_cmd)))
         self.tg_app.add_handler(CommandHandler("risk", owner_only(risk_cmd)))
         self._register_ema200_utbot_rsi_handlers(owner_only, text_filter)
         self.tg_app.add_handler(CommandHandler("utbreak", owner_only(utbreakout_cmd)))

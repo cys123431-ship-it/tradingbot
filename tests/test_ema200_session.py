@@ -48,6 +48,13 @@ def any_hour(monkeypatch):
     monkeypatch.setattr(ema200_session, "EMA200_MORNING_RESET_CUTOFF_HOUR_KST", 24)
 
 
+def _after_reset(payload):
+    """Wait until the wall clock is past the reset (coarse Windows clocks)."""
+    reset_at = datetime.fromisoformat(payload["reset_at"])
+    while datetime.now(timezone.utc) <= reset_at:
+        pass
+
+
 def _close(db, symbol, pnl, strategy=EMA200_UTBOT_RSI_STRATEGY):
     db.log_trade_entry(symbol, "short", 100.0, 1.0, strategy=strategy)
     assert db.log_trade_close(symbol, pnl, pnl, 100.0 - pnl, "test")
@@ -96,6 +103,7 @@ def test_reset_returns_to_first_entry_state_once_per_day(ledger, any_hour):
         perform_ema200_morning_entry_reset(db, store)
 
     # New activity after the reset counts again from zero.
+    _after_reset(payload)
     _close(db, "XRP/USDT:USDT", -1.0)
     assert db.get_daily_automatic_entry_count(since=since) == 1
     assert get_ema200_consecutive_losses(
@@ -197,7 +205,7 @@ def test_telegram_reset_flow_confirms_then_blocks_second_use(ledger, any_hour):
 def test_session_status_panel_reports_since_reset_and_today(ledger, any_hour):
     db, store = ledger
     _close(db, "BTC/USDT:USDT", -3.0)
-    perform_ema200_morning_entry_reset(db, store)
+    _after_reset(perform_ema200_morning_entry_reset(db, store))
     _close(db, "ETH/USDT:USDT", 6.5)
     controller = _controller(db, store)
 
@@ -221,4 +229,6 @@ def test_main_keyboard_shows_ema_panel_and_hides_history_help():
     assert "/emareset" in labels
     assert "/history" not in labels
     assert "/help" not in labels
-    assert [b.text for b in keyboard.keyboard[2]] == ["/emastatus", "/emareset"]
+    assert [b.text for b in keyboard.keyboard[2]] == [
+        "/emastatus", "/emareset", "/dailyreport",
+    ]

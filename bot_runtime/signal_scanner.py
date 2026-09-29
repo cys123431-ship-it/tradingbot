@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from .decision_journal import (
+    OPERATIONS,
+    STRATEGY,
+    compact_detail,
+    journal_event,
+)
 from .ema200_utbot_rsi import (
     EMA200_UTBOT_RSI_STRATEGY,
     is_ema200_utbot_rsi_symbol_allowed,
@@ -54,6 +60,14 @@ class SignalScannerMixin:
         if not isinstance(states, dict):
             states = {}
             self.last_ema200_profit_stop_status = states
+        previous_status = (states.get(symbol) or {}).get('status')
+        if previous_status != str(status or 'UNKNOWN'):
+            journal_event(
+                OPERATIONS, 'profit_stop_status', symbol=symbol,
+                status=str(status or 'UNKNOWN'), previous_status=previous_status,
+                details=details,
+                code_ref='signal_scanner.py:_ema200_apply_margin_profit_stop',
+            )
         payload = {
             'status': str(status or 'UNKNOWN'),
             'updated_at_ns': time.time_ns(),
@@ -398,6 +412,33 @@ class SignalScannerMixin:
         reason=None,
         closed_candle_ts=None,
     ):
+        evaluations = list(getattr(self, '_ema200_scan_evaluations', []) or [])
+        journal_key = (
+            int(closed_candle_ts or 0),
+            str(reason or ''),
+            tuple(
+                (str(item.get('symbol')), str(item.get('side')))
+                for item in (candidates or [])[:10]
+            ),
+            (selected or {}).get('symbol') if isinstance(selected, dict) else None,
+        )
+        if journal_key != getattr(self, '_ema200_last_scan_journal_key', None):
+            self._ema200_last_scan_journal_key = journal_key
+            journal_event(
+                STRATEGY, 'ema200_scan', closed_candle_ts=int(closed_candle_ts or 0),
+                best_candidate_selection=bool(enabled), reason=str(reason or ''),
+                candidates=[
+                    self._ema200_candidate_status_item(candidate)
+                    for candidate in (candidates or [])[:10]
+                ],
+                selected=(
+                    self._ema200_candidate_status_item(selected)
+                    if isinstance(selected, dict) else None
+                ),
+                evaluated_symbols=len(evaluations),
+                evaluations=evaluations,
+                code_ref='signal_scanner.py:_scan_and_trade_ema200_volume',
+            )
         self.last_ema200_candidate_selection = {
             'enabled': bool(enabled),
             'evaluated_at_ns': time.time_ns(),
@@ -558,6 +599,7 @@ class SignalScannerMixin:
         evaluated_candle_ts = {}
         scan_failures = []
         insufficient_history = []
+        self._ema200_scan_evaluations = []
         for symbol in symbols:
             if self.ctrl.is_paused or self.scanner_active_symbol:
                 return
@@ -608,6 +650,11 @@ class SignalScannerMixin:
                 evaluated_candle_ts[symbol] = int(
                     strategy_detail.get('closed_candle_ts') or 0
                 )
+                self._ema200_scan_evaluations.append({
+                    'symbol': symbol,
+                    'signal': sig,
+                    'detail': compact_detail(strategy_detail, limit=40),
+                })
                 if sig not in {'long', 'short'}:
                     continue
                 candidate = build_ema200_candidate(
@@ -929,11 +976,16 @@ class SignalScannerMixin:
                     # every held position still needs its exit check below.
                     try:
                         await self._ema200_apply_margin_profit_stop(held_symbol)
-                    except Exception:
+                    except Exception as profit_stop_error:
                         logger.exception(
                             'EMA200 profit stop update failed for %s; '
                             'exit management continues',
                             held_symbol,
+                        )
+                        journal_event(
+                            OPERATIONS, 'profit_stop_error', symbol=held_symbol,
+                            error=f'{type(profit_stop_error).__name__}: {profit_stop_error}',
+                            code_ref='signal_scanner.py:poll_tick profit ratchet',
                         )
                 elif not owner and str(
                     (cfg.get('strategy_params') or {}).get('active_strategy') or ''
@@ -1224,6 +1276,11 @@ class SignalScannerMixin:
                 symbol,
                 pos_side,
                 reason,
+            )
+            journal_event(
+                OPERATIONS, 'poll_exit_fallback', symbol=symbol, side=pos_side,
+                reason=reason,
+                code_ref='signal_scanner.py:_poll_symbol_exit_fallback',
             )
             await self._check_secondary_exit_for_symbol(
                 symbol,

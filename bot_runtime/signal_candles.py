@@ -3,6 +3,7 @@
 from __future__ import annotations
 from datetime import datetime, timezone
 
+from .decision_journal import STRATEGY, journal_event
 from .ema200_utbot_rsi import (
     EMA200_UTBOT_RSI_DISPLAY_NAME,
     EMA200_UTBOT_RSI_STRATEGY,
@@ -2472,6 +2473,7 @@ class SignalCandleMixin:
                 )
                 should_exit_long = current_side.lower() == 'long' and ut_sig == 'short'
                 should_exit_short = current_side.lower() == 'short' and ut_sig == 'long'
+                fresh_opposite = bool(should_exit_long or should_exit_short)
                 # On restart or after switching the exit timeframe, a fresh
                 # signal on the last closed candle may predate this position.
                 # Do not close a newer position for a historical UT flip.
@@ -2489,6 +2491,25 @@ class SignalCandleMixin:
                                 should_exit_long = should_exit_short = False
                     except (AttributeError, ValueError, TypeError, KeyError):
                         logger.warning('EMA200 exit entry-time check unavailable for %s', symbol)
+                try:
+                    exit_candle_ts = int(df.iloc[-2]['timestamp'])
+                except (IndexError, KeyError, TypeError, ValueError):
+                    exit_candle_ts = None
+                journal_event(
+                    STRATEGY, 'exit_check', symbol=symbol, side=current_side.lower(),
+                    exit_tf=tf, closed_candle_ts=exit_candle_ts,
+                    ut_fresh_signal=ut_sig, ut_bias=(ut_detail or {}).get('bias_side'),
+                    ut_stop=(ut_detail or {}).get('curr_stop'),
+                    ut_src=(ut_detail or {}).get('curr_src'),
+                    fresh_opposite=fresh_opposite,
+                    pre_entry_signal_ignored=bool(
+                        fresh_opposite and not (should_exit_long or should_exit_short)
+                    ),
+                    decision=(
+                        'EXIT' if (should_exit_long or should_exit_short) else 'HOLD'
+                    ),
+                    code_ref='signal_candles.py:process_exit_candle (EMA200 branch)',
+                )
                 if should_exit_long or should_exit_short:
                     opposite_label = 'SELL' if should_exit_long else 'BUY'
                     self._update_stateful_diag(
@@ -2508,6 +2529,14 @@ class SignalCandleMixin:
                     )
                     position_fetch_ok, remaining_pos = (
                         await self._fetch_server_position_checked(symbol)
+                    )
+                    journal_event(
+                        STRATEGY, 'exit_executed', symbol=symbol,
+                        side=current_side.lower(), exit_tf=tf,
+                        reason=f"EMA200_UTBOT_RSI_UT_{opposite_label}",
+                        position_fetch_ok=bool(position_fetch_ok),
+                        remaining_position=bool(remaining_pos),
+                        code_ref='signal_candles.py:process_exit_candle -> exit_position',
                     )
                     if not position_fetch_ok:
                         self.last_entry_reason[symbol] = (

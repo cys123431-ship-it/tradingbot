@@ -2003,6 +2003,7 @@ class ControllerExchangeMixin:
             self._main_polling_loop(),  # [?대쭅 ?꾩슜] 硫붿씤 ?대쭅 猷⑦봽
             self._hourly_report_loop(),
             self._monthly_trade_report_loop(),
+            self._daily_analysis_report_loop(),
             self._alt_trend_alert_loop(),
             self._options_trading_loop(),
             self._heartbeat_loop()

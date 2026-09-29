@@ -2,6 +2,21 @@
 
 from __future__ import annotations
 
+from .daily_analysis_report import (
+    _git_revision as _daily_report_git_revision,
+    build_daily_analysis_report,
+    collect_daily_report_inputs,
+    consistency_checks as _daily_report_consistency_checks,
+    report_filename as _daily_report_filename,
+    report_window as _daily_report_window,
+)
+from .decision_journal import (
+    KST as _DAILY_REPORT_KST,
+    OPERATIONS as _JOURNAL_OPERATIONS,
+    journal_event as _journal_event,
+    prune_journal as _prune_decision_journal,
+)
+
 
 class ControllerReportingMixin:
     async def setup_r2_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -102,6 +117,110 @@ class ControllerReportingMixin:
                 '손익은 실제 포지션별로 한 번만 집계했습니다.'
             ),
         )
+
+    async def _send_daily_analysis_report(self, *, previous=False, now=None):
+        """Build the 09:00-KST daily analysis report and send it as a .txt."""
+        start, end, complete = _daily_report_window(now, previous=previous)
+        inputs = await collect_daily_report_inputs(self, start, end)
+        text = await asyncio.to_thread(build_daily_analysis_report, inputs)
+        cid = self.cfg.get_chat_id()
+        if not cid or not self.tg_app:
+            raise RuntimeError('Telegram chat/application unavailable for daily report')
+        filename = _daily_report_filename(start, end, complete)
+        closed = [
+            t for t in inputs.get('trades') or []
+            if t.get('exit_time')
+        ]
+        pnl = sum(float(t.get('pnl_usdt') or 0.0) for t in closed)
+        findings = _daily_report_consistency_checks(inputs)
+        critical = sum(1 for f in findings if f[0] == 'CRITICAL')
+        warning = sum(1 for f in findings if f[0] == 'WARNING')
+        bio = io.BytesIO(text.encode('utf-8'))
+        bio.name = filename
+        await self.tg_app.bot.send_document(
+            chat_id=cid,
+            document=bio,
+            filename=filename,
+            caption=(
+                f"📑 일일 분석 리포트 {'(진행 중)' if not complete else ''}\n"
+                f"{start.astimezone(_DAILY_REPORT_KST):%m-%d %H:%M} ~ "
+                f"{end.astimezone(_DAILY_REPORT_KST):%m-%d %H:%M} KST\n"
+                f"거래 {len(inputs.get('trades') or [])}건 / 청산 {len(closed)}건 / "
+                f"실현손익 {pnl:+.4f} USDT\n"
+                f"코드 점검: CRITICAL {critical} / WARNING {warning}"
+            )[:1000],
+        )
+        return {'start': start, 'end': end, 'complete': complete, 'filename': filename}
+
+    async def _daily_analysis_report_loop(self):
+        """Send the previous 09:00->09:00 KST report once, after 09:00 KST."""
+        await asyncio.sleep(20)
+        try:
+            _journal_event(
+                _JOURNAL_OPERATIONS, 'bot_started',
+                revision=await asyncio.to_thread(_daily_report_git_revision),
+                launch_reason=getattr(self, 'launch_reason', None),
+                paused=bool(getattr(self, 'is_paused', False)),
+                code_ref='controller_reporting.py:_daily_analysis_report_loop',
+            )
+        except Exception:
+            logger.debug('bot_started journal event failed', exc_info=True)
+        while True:
+            try:
+                reporting = self._telegram_reporting_cfg()
+                if not bool(reporting.get('daily_analysis_report_enabled', True)):
+                    await asyncio.sleep(60)
+                    continue
+                engine = self.engines.get(CORE_ENGINE) or self.active_engine
+                if engine is None:
+                    await asyncio.sleep(60)
+                    continue
+                _ensure_trading_safety_runtime(engine)
+                store = getattr(engine, 'trading_state_store', None)
+                if store is None:
+                    raise RuntimeError('trading state store unavailable')
+                start, _, _ = _daily_report_window(previous=True)
+                window_key = f'{start.astimezone(_DAILY_REPORT_KST):%Y-%m-%d}'
+                sent_key = f'daily_analysis_report_sent:{window_key}'
+                sent = store.get_runtime_state(sent_key)
+                if isinstance(sent, dict) and (
+                    sent.get('sent_at') or int(sent.get('failures') or 0) >= 3
+                ):
+                    await asyncio.sleep(60)
+                    continue
+                try:
+                    await self._send_daily_analysis_report(previous=True)
+                    store.set_runtime_state(sent_key, {
+                        'sent_at': datetime.now(_DAILY_REPORT_KST).isoformat(),
+                        'window_start_kst': window_key,
+                    })
+                    logger.info('Daily analysis report sent for %s', window_key)
+                    _prune_decision_journal()
+                except Exception as send_error:
+                    failures = int((sent or {}).get('failures') or 0) + 1
+                    store.set_runtime_state(sent_key, {
+                        'failures': failures,
+                        'last_error': f'{type(send_error).__name__}: {send_error}',
+                    })
+                    logger.error(
+                        'Daily analysis report failed (%s/3): %s',
+                        failures, send_error, exc_info=True,
+                    )
+                    if failures >= 3:
+                        try:
+                            await self.notify(
+                                '⚠️ 일일 분석 리포트 자동 전송 실패 (3회). '
+                                '/dailyreport yesterday 로 직접 받을 수 있습니다.\n'
+                                f'원인: {type(send_error).__name__}: {send_error}'
+                            )
+                        except Exception:
+                            pass
+                    await asyncio.sleep(300)
+                    continue
+                await asyncio.sleep(60)
+            except Exception as exc:
+                logger.error('Daily analysis report loop error: %s', exc, exc_info=True)
+                await asyncio.sleep(300)
 
     async def _monthly_trade_report_loop(self):
         await asyncio.sleep(5)

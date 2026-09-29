@@ -591,6 +591,45 @@ class SQLiteTradingStateStore:
             and _normalize_order_symbol(record.symbol) == normalized
         ]
 
+    def records_touched_between(self, start: str, end: str) -> list[OrderRecord]:
+        """Order records created before ``end`` and updated at/after ``start``."""
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM crypto_orders
+                WHERE julianday(updated_at) >= julianday(?)
+                  AND julianday(created_at) < julianday(?)
+                ORDER BY created_at
+                """,
+                (start, end),
+            ).fetchall()
+        return [record for row in rows if (record := self._row_to_record(row)) is not None]
+
+    def audit_between(self, start: str, end: str, limit: int = 5000) -> list[dict[str, Any]]:
+        """Return order-state transitions with start <= timestamp < end."""
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT audit_id, client_order_id, old_state, new_state,
+                       exchange_order_id, symbol, timestamp, detail_json
+                FROM order_state_audit
+                WHERE julianday(timestamp) >= julianday(?)
+                  AND julianday(timestamp) < julianday(?)
+                ORDER BY audit_id
+                LIMIT ?
+                """,
+                (start, end, int(limit)),
+            ).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["detail"] = json.loads(item.pop("detail_json") or "{}")
+            except (TypeError, ValueError):
+                item["detail"] = {}
+            out.append(item)
+        return out
+
     def active_for_symbol(self, symbol: str) -> list[OrderRecord]:
         normalized = _normalize_order_symbol(symbol)
         return [

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from trading_safety.order_state import DAILY_LOSS_ENTRY_LOCK_KEY
 
+from .decision_journal import OPERATIONS, journal_event
 from .ema200_utbot_rsi import (
     EMA200_CONSECUTIVE_LOSS_RESET_STATE_KEY,
     EMA200_DAILY_LOSS_RESET_STATE_KEY,
@@ -97,6 +98,10 @@ def perform_ema200_morning_entry_reset(db, store, *, now=None, reason="telegram"
         "reason": str(reason or "telegram"),
     }
     store.set_runtime_state(EMA200_MORNING_RESET_STATE_KEY, payload)
+    journal_event(
+        OPERATIONS, 'morning_entry_reset', **payload,
+        code_ref='ema200_session.py:perform_ema200_morning_entry_reset',
+    )
     return payload
 
 
