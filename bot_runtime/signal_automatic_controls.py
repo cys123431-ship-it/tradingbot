@@ -15,6 +15,7 @@ from .controller_automatic_controls import (
     AUTOMATIC_SCAN_SCOPE_CRYPTO,
     AUTOMATIC_SCAN_SCOPE_TRADIFI,
 )
+from .ema200_session import ema200_entry_count_since
 
 
 AUTOMATIC_WEEKEND_ENTRY_BLOCK_EFFECTIVE_DATE = date(2026, 9, 28)
@@ -195,7 +196,14 @@ class SignalAutomaticControlsMixin:
         count = 0
         if db is not None:
             if hasattr(db, "get_daily_automatic_entry_count"):
-                count = int(db.get_daily_automatic_entry_count())
+                since = ema200_entry_count_since(
+                    getattr(self, "trading_state_store", None)
+                )
+                count = int(
+                    db.get_daily_automatic_entry_count(since=since)
+                    if since
+                    else db.get_daily_automatic_entry_count()
+                )
             elif hasattr(db, "get_daily_entry_count"):
                 count = int(db.get_daily_entry_count())
         return _AutomaticDailyEntryCount(

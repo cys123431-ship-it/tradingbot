@@ -16,6 +16,7 @@ from telegram.ext import (
 from .ema200_utbot_rsi import (
     EMA200_CONSECUTIVE_LOSS_RESET_STATE_KEY,
     EMA200_DAILY_LOSS_RESET_STATE_KEY,
+    EMA200_KST,
     EMA200_MIN_QUOTE_VOLUME_USDT,
     EMA200_UTBOT_RSI_CONFIG_KEY,
     EMA200_UTBOT_RSI_DISPLAY_NAME,
@@ -25,6 +26,12 @@ from .ema200_utbot_rsi import (
     ema200_small_account_margin_percent,
     get_ema200_consecutive_losses,
     normalize_ema200_utbot_rsi_config,
+)
+from .ema200_session import (
+    EMA200_MORNING_RESET_STATE_KEY,
+    build_ema200_session_status_text,
+    ema200_morning_reset_availability,
+    perform_ema200_morning_entry_reset,
 )
 
 
@@ -558,6 +565,165 @@ class ControllerEMA200UTBotRSIMixin:
             "연속손실 단계가 초기화됩니다. 일·주 손실한도는 별도의 신규진입 차단 장치입니다."
         )
 
+    def _ema200_session_store(self):
+        engine = (getattr(self, "engines", {}) or {}).get("signal")
+        return (
+            getattr(engine, "trading_state_store", None) if engine else None
+        ) or getattr(self, "trading_state_store", None)
+
+    @staticmethod
+    def _build_ema200_session_keyboard():
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🔄 새로고침", callback_data="e2h:session"),
+                InlineKeyboardButton(
+                    "🌅 오전 진입초기화", callback_data="e2h:mreset:ask"
+                ),
+            ],
+        ])
+
+    async def _ema200_session_status_text(self):
+        from datetime import datetime, timezone
+
+        from .database import _kst_day_bounds_utc
+
+        store = self._ema200_session_store()
+        if store is None:
+            return "📊 EMA200 상태: 거래 상태 저장소가 아직 준비되지 않았습니다."
+        cfg = self._ema200_utbot_rsi_config()
+        reset_payload = store.get_runtime_state(EMA200_MORNING_RESET_STATE_KEY)
+        empty = {"entries": 0, "open": 0, "closed": 0, "wins": 0,
+                 "losses": 0, "flat": 0, "pnl_usdt": 0.0}
+        day_start, _ = _kst_day_bounds_utc()
+        try:
+            today = self.db.get_strategy_trade_summary(
+                EMA200_UTBOT_RSI_STRATEGY, day_start.isoformat()
+            )
+            since_reset = (
+                self.db.get_strategy_trade_summary(
+                    EMA200_UTBOT_RSI_STRATEGY, reset_payload["reset_at"]
+                )
+                if isinstance(reset_payload, dict)
+                and reset_payload.get("reset_at")
+                else empty
+            )
+        except Exception as exc:
+            return f"📊 EMA200 상태: 거래 기록 조회 실패 ({type(exc).__name__}: {exc})"
+        try:
+            loss_streak, _ = get_ema200_consecutive_losses(
+                self.db,
+                store.get_runtime_state(EMA200_CONSECUTIVE_LOSS_RESET_STATE_KEY),
+            )
+            streak_text = None
+        except Exception as exc:
+            loss_streak = 0
+            streak_text = f"{type(exc).__name__}: {exc}"
+        equity = None
+        engine = (getattr(self, "engines", {}) or {}).get("signal")
+        balance_reader = getattr(engine, "get_balance_info", None) if engine else None
+        if callable(balance_reader):
+            try:
+                total, free, _ = await balance_reader()
+                equity = float(total or free or 0.0)
+            except Exception:
+                equity = None
+        try:
+            _, daily_pnl = self.db.get_daily_stats()
+            _, weekly_pnl = self.db.get_weekly_stats()
+            effective_daily, _, _ = apply_ema200_daily_loss_reset(
+                daily_pnl,
+                store.get_runtime_state(EMA200_DAILY_LOSS_RESET_STATE_KEY),
+            )
+            daily_limit_text = (
+                f"손실한도: 오늘 {float(effective_daily):+.4f} USDT "
+                f"(한도 {float(cfg['daily_loss_limit_percent']):.2f}%) / "
+                f"7일 {float(weekly_pnl or 0.0):+.4f} USDT "
+                f"(한도 {float(cfg['weekly_loss_limit_percent']):.2f}%)"
+            )
+        except Exception as exc:
+            daily_limit_text = f"손실한도 확인 실패: {type(exc).__name__}"
+        positions = []
+        exchange = getattr(self, "exchange", None)
+        if exchange is not None:
+            try:
+                for pos in await asyncio.to_thread(exchange.fetch_positions) or []:
+                    qty = abs(float(pos.get("contracts", 0.0) or 0.0))
+                    if qty <= 0:
+                        continue
+                    positions.append({
+                        "symbol": str(pos.get("symbol") or "?"),
+                        "side": str(pos.get("side") or "").upper(),
+                        "qty": qty,
+                        "upnl": float(pos.get("unrealizedPnl") or 0.0),
+                    })
+            except Exception:
+                positions = []
+        text = build_ema200_session_status_text(
+            since_reset=since_reset,
+            today=today,
+            reset_payload=reset_payload,
+            availability=ema200_morning_reset_availability(store),
+            loss_streak=loss_streak,
+            next_margin_percent=ema200_small_account_margin_percent(loss_streak),
+            stop_required=loss_streak > 0,
+            equity=equity,
+            small_account_threshold=float(cfg["small_account_threshold_usdt"]),
+            daily_limit_text=daily_limit_text,
+            positions=positions,
+        )
+        if streak_text:
+            text += f"\n⚠️ 연속손실 조회 실패: {streak_text}"
+        text += f"\n(조회 {datetime.now(timezone.utc).astimezone(EMA200_KST):%m-%d %H:%M} KST)"
+        return text
+
+    def _ema200_morning_reset_prompt(self):
+        store = self._ema200_session_store()
+        allowed, reason = (
+            ema200_morning_reset_availability(store)
+            if store is not None
+            else (False, "거래 상태 저장소 준비 안 됨")
+        )
+        text = (
+            "🌅 오전 진입초기화\n\n"
+            "오늘 처음 진입하는 상태로 되돌립니다.\n"
+            "• 오늘 자동진입 횟수 → 0회\n"
+            "• 연속손실 단계 → 0회 (증거금 50% / 5x, 첫 단계)\n"
+            "• 오늘 일일 손실한도 기준 → 지금부터 다시 계산\n\n"
+            "유지: 거래 기록, 7일 손실한도, 보유 포지션과 보호주문\n"
+            "사용 조건: 한국시간 00:00~11:59, 하루 1회\n\n"
+            f"현재: {'사용 가능' if allowed else reason}"
+        )
+        buttons = [[InlineKeyboardButton("취소", callback_data="e2h:session")]]
+        if allowed:
+            buttons.insert(0, [
+                InlineKeyboardButton("✅ 초기화 실행", callback_data="e2h:mreset:do")
+            ])
+        return text, InlineKeyboardMarkup(buttons)
+
+    async def _ema200_run_morning_reset(self):
+        store = self._ema200_session_store()
+        if store is None:
+            return "❌ 초기화 실패: 거래 상태 저장소 준비 안 됨"
+        lock = getattr(self, "_ema200_morning_reset_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._ema200_morning_reset_lock = lock
+        async with lock:
+            try:
+                payload = perform_ema200_morning_entry_reset(self.db, store)
+            except ValueError as exc:
+                return f"⛔ 오전 진입초기화 불가: {exc}"
+            except Exception as exc:
+                return f"❌ 초기화 실패: {type(exc).__name__}: {exc}"
+        return (
+            "✅ 오전 진입초기화 완료\n"
+            f"진입횟수 {payload['automatic_entries_before']}회 → 0회\n"
+            f"연속손실 {payload['consecutive_losses_before']}회 → 0회 "
+            "(다음 진입 증거금 50%)\n"
+            f"오늘 손익 {payload['daily_realized_pnl_before']:+.4f} USDT를 "
+            "일일 손실한도 기준에서 제외"
+        )
+
     async def _ema200_utbot_rsi_has_open_position(self):
         try:
             positions = await asyncio.to_thread(self.exchange.fetch_positions)
@@ -681,6 +847,26 @@ class ControllerEMA200UTBotRSIMixin:
                     await self._ema200_utbot_rsi_status_text(),
                     reply_markup=self._build_ema200_utbot_rsi_keyboard(),
                 )
+                return
+
+            if action == "session":
+                await query.edit_message_text(
+                    await self._ema200_session_status_text(),
+                    reply_markup=self._build_ema200_session_keyboard(),
+                )
+                return
+
+            if action == "mreset":
+                step = parts[2] if len(parts) > 2 else "ask"
+                if step == "do":
+                    result = await self._ema200_run_morning_reset()
+                    await query.edit_message_text(
+                        f"{result}\n\n{await self._ema200_session_status_text()}",
+                        reply_markup=self._build_ema200_session_keyboard(),
+                    )
+                    return
+                text, markup = self._ema200_morning_reset_prompt()
+                await query.edit_message_text(text, reply_markup=markup)
                 return
 
             if action == "guide":
@@ -855,8 +1041,24 @@ class ControllerEMA200UTBotRSIMixin:
             )
             raise ApplicationHandlerStop
 
+        async def session_cmd(update, context):
+            await update.message.reply_text(
+                await self._ema200_session_status_text(),
+                reply_markup=self._build_ema200_session_keyboard(),
+            )
+
+        async def morning_reset_cmd(update, context):
+            text, markup = self._ema200_morning_reset_prompt()
+            await update.message.reply_text(text, reply_markup=markup)
+
         self.tg_app.add_handler(
             CommandHandler("ema200", owner_only(menu_cmd))
+        )
+        self.tg_app.add_handler(
+            CommandHandler("emastatus", owner_only(session_cmd))
+        )
+        self.tg_app.add_handler(
+            CommandHandler("emareset", owner_only(morning_reset_cmd))
         )
         self.tg_app.add_handler(
             CallbackQueryHandler(owner_only(callback), pattern=r"^e2h:")

@@ -25,6 +25,13 @@ def _kst_day_bounds_utc(now=None):
     )
 
 
+def _parse_utc(value):
+    parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _timestamp_in_range(value, start, end):
     try:
         parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
@@ -212,20 +219,90 @@ class DBManager:
             res = cur.fetchone()
             return res[0] if res and res[0] else 0
 
-    def get_daily_automatic_entry_count(self):
-        """Count Korea-calendar-day entries owned by automatic strategies."""
+    def get_daily_automatic_entry_count(self, since=None):
+        """Count Korea-calendar-day entries owned by automatic strategies.
+
+        ``since`` (an aware ISO timestamp) moves the start of today's window
+        forward, e.g. after the operator's morning entry-state reset.
+        """
         start, end = _kst_day_bounds_utc()
+        cutoff = None
+        if since not in (None, ''):
+            cutoff = datetime.fromisoformat(str(since).replace('Z', '+00:00'))
+            if cutoff.tzinfo is None:
+                raise ValueError('entry-count cutoff must be timezone-aware')
+            cutoff = cutoff.astimezone(timezone.utc)
         with self.lock:
             cur = self.conn.cursor()
-            cur.execute(
-                """SELECT COUNT(*) FROM trades
+            if cutoff is None:
+                cur.execute(
+                    """SELECT COUNT(*) FROM trades
+                    WHERE julianday(entry_time) >= julianday(?)
+                      AND julianday(entry_time) < julianday(?)
+                      AND LOWER(COALESCE(strategy, '')) NOT IN ('user_custom', 'custom_entry')""",
+                    (start.isoformat(), end.isoformat()),
+                )
+                res = cur.fetchone()
+                return res[0] if res and res[0] else 0
+            rows = cur.execute(
+                """SELECT entry_time FROM trades
                 WHERE julianday(entry_time) >= julianday(?)
                   AND julianday(entry_time) < julianday(?)
                   AND LOWER(COALESCE(strategy, '')) NOT IN ('user_custom', 'custom_entry')""",
                 (start.isoformat(), end.isoformat()),
-            )
-            res = cur.fetchone()
-            return res[0] if res and res[0] else 0
+            ).fetchall()
+        # Entries stamped at the reset instant belong to the pre-reset session.
+        return sum(
+            1 for (entry_time,) in rows
+            if _timestamp_in_range(entry_time, cutoff, end)
+            and _parse_utc(entry_time) > cutoff
+        )
+
+    def get_strategy_trade_summary(self, strategy, since):
+        """Summarize one strategy's trades entered after ``since``."""
+        strategy_value = str(strategy or '').strip().lower()
+        cutoff = datetime.fromisoformat(str(since).replace('Z', '+00:00'))
+        if cutoff.tzinfo is None:
+            raise ValueError('summary cutoff must be timezone-aware')
+        cutoff = cutoff.astimezone(timezone.utc)
+        with self.lock:
+            candidates = self.conn.execute(
+                """SELECT entry_time, exit_time, pnl_usdt FROM trades
+                WHERE LOWER(COALESCE(strategy, '')) = ?
+                  AND julianday(entry_time) >= julianday(?)
+                  AND reconciliation_archived_at IS NULL""",
+                (strategy_value, cutoff.isoformat()),
+            ).fetchall()
+        rows = []
+        for entry_time, exit_time, pnl in candidates:
+            try:
+                if _parse_utc(entry_time) > cutoff:
+                    rows.append((exit_time, pnl))
+            except (TypeError, ValueError):
+                continue
+        summary = {
+            'entries': len(rows),
+            'open': 0,
+            'closed': 0,
+            'wins': 0,
+            'losses': 0,
+            'flat': 0,
+            'pnl_usdt': 0.0,
+        }
+        for exit_time, pnl in rows:
+            if exit_time is None or pnl is None:
+                summary['open'] += 1
+                continue
+            value = float(pnl)
+            summary['closed'] += 1
+            summary['pnl_usdt'] += value
+            if value > 0:
+                summary['wins'] += 1
+            elif value < 0:
+                summary['losses'] += 1
+            else:
+                summary['flat'] += 1
+        return summary
 
     def get_daily_automatic_symbol_entry(self, symbol, *, now=None):
         """Return today's latest automatic entry for a symbol, if any.

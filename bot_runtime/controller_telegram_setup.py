@@ -6028,6 +6028,8 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 
 /start - 메인 메뉴 표시
 /status - 현재 상태 조회
+/emastatus - EMA200 소액계좌 전용 상태 (초기화 후·오늘 진입/손익)
+/emareset - 오전 진입초기화 (한국시간 오전, 하루 1회)
 /history - 지난 상태 조회
 /stats - 통계
 /utbreak - UTBreak 전략 메뉴

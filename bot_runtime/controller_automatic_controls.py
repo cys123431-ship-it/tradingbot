@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackQueryHandler, CommandHandler
 
+from .ema200_session import ema200_entry_count_since
+
 
 AUTOMATIC_DAILY_TRADE_LIMIT_BASE = 5
 AUTOMATIC_DAILY_TRADE_LIMIT_EXTENDED = 10
@@ -65,7 +67,16 @@ class ControllerAutomaticTradingControlsMixin:
         ).strip() == today
         try:
             if hasattr(self.db, "get_daily_automatic_entry_count"):
-                entries = int(self.db.get_daily_automatic_entry_count())
+                engine = (getattr(self, "engines", {}) or {}).get("signal")
+                since = ema200_entry_count_since(
+                    getattr(engine, "trading_state_store", None)
+                    or getattr(self, "trading_state_store", None)
+                )
+                entries = int(
+                    self.db.get_daily_automatic_entry_count(since=since)
+                    if since
+                    else self.db.get_daily_automatic_entry_count()
+                )
             else:
                 entries = int(self.db.get_daily_entry_count())
         except Exception:

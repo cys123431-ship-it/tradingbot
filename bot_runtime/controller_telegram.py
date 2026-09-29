@@ -2156,9 +2156,9 @@ class ControllerTelegramMixin:
                 KeyboardButton("/trend"),
                 KeyboardButton("/scanner"),
             ],
+            [KeyboardButton("/emastatus"), KeyboardButton("/emareset")],
             [KeyboardButton("/setup"), KeyboardButton("/customentry"), KeyboardButton("/options")],
-            [KeyboardButton("/status"), KeyboardButton("/history"), KeyboardButton("/stats")],
-            [KeyboardButton("/log"), KeyboardButton("/help")]
+            [KeyboardButton("/status"), KeyboardButton("/stats"), KeyboardButton("/log")],
         ]
         return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
