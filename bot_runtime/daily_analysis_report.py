@@ -29,7 +29,7 @@ REPORT_START_HOUR_KST = 9
 EMA200_STRATEGY = "ema200_utbot_rsi_2h"
 MAX_REPORT_BYTES = 20 * 1024 * 1024
 MAX_JOURNAL_APPENDIX_BYTES = 6 * 1024 * 1024
-MAX_MARKET_REPLAY_TRADES = 12
+MAX_MARKET_REPLAY_TRADES = 40
 _ROOT = Path(__file__).resolve().parents[1]
 _SYMBOL_TOKEN = re.compile(r"\b[A-Z0-9]{2,20}/[A-Z]{3,5}(?::[A-Z]{3,5})?")
 _LOG_LINE = re.compile(
@@ -198,19 +198,25 @@ def excursions(side, entry_price, candles, leverage=1.0):
 
 # ------------------------------------------------------------- log scanning
 def default_log_paths():
+    """Prefer the persistent rotating trading_bot.log family.
+
+    ``emas.log`` is moved to ``emas.log.prev`` on every deploy, so after two
+    deploys a day it no longer covers the report window; trading_bot.log keeps
+    rotating across restarts (50MB x 4) and also holds logger.exception
+    tracebacks.  emas.log is only used when trading_bot.log is missing.
+    """
     paths = []
+    for base in (_ROOT / "trading_bot.log", _ROOT / "runtime" / "trading_bot.log"):
+        for suffix in (".3", ".2", ".1", ""):
+            candidate = Path(str(base) + suffix)
+            if candidate.exists():
+                paths.append(candidate)
+        if paths:
+            return paths
     log_file = os.getenv("LOG_FILE") or str(Path.home() / "emas.log")
     for candidate in (log_file + ".prev", log_file):
         if Path(candidate).exists():
             paths.append(Path(candidate))
-    if not paths:
-        for candidate in (
-            _ROOT / "trading_bot.log.1",
-            _ROOT / "trading_bot.log",
-            _ROOT / "runtime" / "trading_bot.log",
-        ):
-            if candidate.exists():
-                paths.append(candidate)
     return paths
 
 
@@ -346,7 +352,22 @@ async def _market_replay(ctrl, trade, exit_tf, ut_params, end):
     rows = [r for r in rows or [] if r and len(r) >= 5]
     entry_ms = int(entry_at.timestamp() * 1000)
     exit_ms = int(exit_at.timestamp() * 1000)
-    held = [r for r in rows if r[0] + tf_ms > entry_ms and r[0] <= exit_ms]
+    # Excursions use 1m candles inside the actual hold; whole exit-tf candles
+    # would include price action from before the entry.
+    minute_since = entry_ms - (entry_ms % 60_000)
+    minutes = int((exit_ms - minute_since) / 60_000) + 2
+    try:
+        minute_rows = await asyncio.to_thread(
+            exchange.fetch_ohlcv, trade["symbol"], "1m",
+            since=minute_since, limit=max(2, min(1500, minutes)),
+        )
+    except Exception:
+        minute_rows = []
+    held = [r for r in minute_rows or [] if r and r[0] + 60_000 > entry_ms and r[0] <= exit_ms]
+    excursion_basis = "1m"
+    if not held:
+        held = [r for r in rows if r[0] + tf_ms > entry_ms and r[0] <= exit_ms]
+        excursion_basis = exit_tf
     states = await asyncio.to_thread(
         ut_state_series, rows,
         ut_params.get("key_value", 1.0), ut_params.get("atr_period", 10),
@@ -367,6 +388,8 @@ async def _market_replay(ctrl, trade, exit_tf, ut_params, end):
         ][-200:],
         "excursions": excursions(trade.get("side"), trade.get("entry_price"), held,
                                  leverage=trade.get("_leverage") or 1.0),
+        "excursion_basis": excursion_basis,
+        "excursion_truncated": bool(minutes > 1500),
     }
 
 
@@ -543,6 +566,25 @@ def consistency_checks(inputs):
         count = len(_events(journal, name))
         if count:
             findings.append(("WARNING", code, f"{name} {count}회 발생 (루프 앞 단계 오류)"))
+    failed = [row for row in inputs.get("audit") or [] if row.get("new_state") == "FAILED"]
+    closed_ids = {
+        row.get("client_order_id") for row in inputs.get("audit") or []
+        if row.get("new_state") == "CLOSED"
+    }
+    duplicate_close = [
+        row for row in failed
+        if "-2022" in str((row.get("detail") or {}).get("last_error"))
+        and row.get("client_order_id") in closed_ids
+    ]
+    if duplicate_close:
+        findings.append(("WARNING", "DUPLICATE_REDUCE_ONLY_CLOSE",
+                         f"청산 체결 후 같은 청산 주문이 다시 제출돼 reduce-only 거절 {len(duplicate_close)}건 "
+                         f"({', '.join(sorted({str(r.get('symbol')) for r in duplicate_close}))}); 최종 CLOSED라 손실 없음, 중복 제출 경로 점검 필요"))
+    for row in failed:
+        if row in duplicate_close:
+            continue
+        findings.append(("WARNING", "ORDER_FAILED",
+                         f"{row.get('symbol')} {row.get('client_order_id')}: {(row.get('detail') or {}).get('last_error')}"))
     for record in inputs.get("order_records") or []:
         if record.get("state") in {"FILLED_UNPROTECTED", "SUBMITTED_UNKNOWN", "EMERGENCY_CLOSE_FAILED", "FILLED_LIQUIDATION_CONFLICT"}:
             findings.append(("CRITICAL", f"ORDER_STATE_{record.get('state')}",
@@ -660,7 +702,8 @@ def _trade_block(index, trade, inputs):
             lines.append(
                 f"  시장 재생({replay.get('exit_tf')} UT 재계산): 진입 시 UT {replay.get('ut_bias_at_entry')} / "
                 f"MFE {_num(exc.get('mfe_price_pct'), 2)}% (ROE {_num(exc.get('mfe_roe_pct'), 2)}%) / "
-                f"MAE {_num(exc.get('mae_price_pct'), 2)}% (ROE {_num(exc.get('mae_roe_pct'), 2)}%)"
+                f"MAE {_num(exc.get('mae_price_pct'), 2)}% (ROE {_num(exc.get('mae_roe_pct'), 2)}%) "
+                f"[{replay.get('excursion_basis')}봉 기준{', 앞 1500분만' if replay.get('excursion_truncated') else ''}]"
             )
             signals = replay.get("ut_signals_during_hold") or []
             lines.append(

@@ -271,3 +271,64 @@ def test_scan_evaluations_are_reset_per_scan_and_journaled(journal_dir):
     ]
     assert len(scans) == 1  # identical scans are de-duplicated
     assert scans[0]["evaluations"][0]["detail"]["rsi"] == 55.0
+
+
+def test_duplicate_reduce_only_close_is_flagged_but_other_failures_too():
+    audit = [
+        {"client_order_id": "close-a", "symbol": "HBAR/USDT", "new_state": "FAILED",
+         "detail": {"last_error": 'binance {"code":-2022,"msg":"ReduceOnly Order is rejected."}'}},
+        {"client_order_id": "close-a", "symbol": "HBAR/USDT", "new_state": "CLOSED", "detail": {}},
+        {"client_order_id": "entry-b", "symbol": "ETH/USDT", "new_state": "FAILED",
+         "detail": {"last_error": "insufficient margin"}},
+    ]
+    findings = consistency_checks({"audit": audit})
+    codes = [code for _, code, _ in findings]
+    assert codes.count("DUPLICATE_REDUCE_ONLY_CLOSE") == 1
+    assert codes.count("ORDER_FAILED") == 1
+
+
+def test_log_paths_prefer_persistent_rotating_bot_log(tmp_path, monkeypatch):
+    from bot_runtime import daily_analysis_report as report
+
+    monkeypatch.setattr(report, "_ROOT", tmp_path)
+    monkeypatch.setenv("LOG_FILE", str(tmp_path / "emas.log"))
+    (tmp_path / "emas.log").write_text("x")
+    assert report.default_log_paths() == [tmp_path / "emas.log"]
+    (tmp_path / "trading_bot.log.1").write_text("x")
+    (tmp_path / "trading_bot.log").write_text("x")
+    assert report.default_log_paths() == [
+        tmp_path / "trading_bot.log.1",
+        tmp_path / "trading_bot.log",
+    ]
+
+
+def test_market_replay_measures_excursions_on_1m_hold_only(tmp_path, journal_dir):
+    now = datetime.now(timezone.utc)
+    entry = now - timedelta(minutes=30)
+    exit_at = now - timedelta(minutes=10)
+    rows15 = _rows(n=500, start_ms=int((now - timedelta(hours=120)).timestamp() * 1000))
+
+    def fetch(symbol, tf, since=None, limit=None):
+        if tf == "1m":
+            base = int(entry.timestamp() * 1000) // 60_000 * 60_000
+            # A deep wick one minute before entry must not count as MAE.
+            pre = [[base - 60_000, 100, 100, 50, 100, 1]]
+            hold = [[base + i * 60_000, 100, 102, 99, 100, 1] for i in range(25)]
+            return pre + hold
+        return [list(r) for r in rows15]
+
+    controller, db, store, _ = _controller(tmp_path, rows15)
+    controller.market_data_exchange = SimpleNamespace(fetch_ohlcv=fetch)
+    db.log_trade_entry("SOL/USDT:USDT", "long", 100.0, 1.0, strategy=EMA200_UTBOT_RSI_STRATEGY)
+    db.conn.execute("UPDATE trades SET entry_time=?", (entry.isoformat(),))
+    db.conn.commit()
+    db.log_trade_close("SOL/USDT:USDT", 0.0, 0.0, 100.0, "test", exit_time=exit_at.isoformat())
+
+    start, end, _ = report_window(now + timedelta(seconds=1))
+    inputs = asyncio.run(collect_daily_report_inputs(controller, start, end, log_paths=[]))
+    replay = next(iter(inputs["market_replay"].values()))
+    assert replay["excursion_basis"] == "1m"
+    assert replay["excursions"]["mae_price_pct"] == pytest.approx(-1.0)
+    assert replay["excursions"]["mfe_price_pct"] == pytest.approx(2.0)
+    db.conn.close()
+    store.close()
