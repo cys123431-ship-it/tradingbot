@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 EMA200_UTBOT_RSI_STRATEGY = "ema200_utbot_rsi_2h"
 EMA200_UTBOT_RSI_CONFIG_KEY = "EMA200UTBotRSI2H"
-EMA200_UTBOT_RSI_DISPLAY_NAME = "EMA200 + UT Bot + RSI (2H)"
+EMA200_UTBOT_RSI_DISPLAY_NAME = "EMA200 + UT Bot + RSI"
 
 # This strategy owns its UT Bot definition.  It must never inherit the mutable
 # settings used by the standalone /utbot strategy: doing so can turn the same
@@ -26,6 +26,9 @@ EMA200_SMALL_ACCOUNT_THRESHOLD_USDT = 1000.0
 EMA200_SMALL_ACCOUNT_LEVERAGE = 5
 EMA200_SMALL_ACCOUNT_MARGIN_LADDER_PERCENT = (50.0, 35.0, 25.0, 15.0, 10.0)
 EMA200_EXIT_TIMEFRAMES = ("15m", "30m", "1h")
+# Completed-candle entry timeframes selectable from Telegram; 2h is default.
+EMA200_ENTRY_TIMEFRAMES = ("1h", "2h", "4h", "6h", "8h", "12h")
+EMA200_DEFAULT_ENTRY_TIMEFRAME = "2h"
 
 EMA200_MIN_QUOTE_VOLUME_USDT = 200_000_000.0
 
@@ -133,10 +136,15 @@ def normalize_ema200_utbot_rsi_config(raw=None):
         cfg.update(raw)
 
     cfg["enabled"] = _enabled_value(cfg.get("enabled", True))
-    # The strategy definition is intentionally fixed to 2h / EMA200 / RSI50
-    # and its own UT Bot defaults.  In particular, do not let the standalone
-    # UTBot menu mutate this independent strategy's signal direction.
-    cfg["timeframe"] = "2h"
+    # EMA200 / RSI50 and the strategy's own UT Bot values stay fixed; only the
+    # completed-candle entry timeframe is operator-selectable.  In particular,
+    # do not let the standalone UTBot menu mutate this strategy's signals.
+    entry_tf = str(cfg.get("timeframe") or "").strip().lower()
+    cfg["timeframe"] = (
+        entry_tf
+        if entry_tf in EMA200_ENTRY_TIMEFRAMES
+        else EMA200_DEFAULT_ENTRY_TIMEFRAME
+    )
     exit_tf = str(cfg.get("exit_timeframe") or "").strip().lower()
     cfg["exit_timeframe"] = exit_tf if exit_tf in EMA200_EXIT_TIMEFRAMES else "15m"
     cfg["ema_period"] = 200
@@ -573,6 +581,8 @@ def get_ema200_consecutive_losses(db, reset_payload=None):
 
 
 __all__ = (
+    "EMA200_DEFAULT_ENTRY_TIMEFRAME",
+    "EMA200_ENTRY_TIMEFRAMES",
     "EMA200_UTBOT_RSI_STRATEGY",
     "EMA200_UTBOT_RSI_CONFIG_KEY",
     "EMA200_UTBOT_RSI_DISPLAY_NAME",

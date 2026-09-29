@@ -6035,7 +6035,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 /stats - 통계
 /utbreak - UTBreak 전략 메뉴
 /utbreakout - /utbreak alias
-/ema200 - EMA200 + UT Bot + RSI (2H) 전용 전략·리스크·비상탈출 설정
+/ema200 - EMA200 + UT Bot + RSI 전용 전략·리스크·비상탈출 설정
 /trend - standalone adaptive trend menu
 /scanner - 자동 스캔 범위(TradFi/순수 코인/전체) 설정
 /setup - 거래소/네트워크 전환

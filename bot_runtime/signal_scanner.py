@@ -475,7 +475,7 @@ class SignalScannerMixin:
         score = float(candidate.get('score') or 0.0)
         side_label = side.upper()
         self.last_entry_reason[symbol] = (
-            "EMA200 + UT Bot + RSI (2H): EMA200/UT/RSI 조건 충족 + "
+            "EMA200 + UT Bot + RSI: EMA200/UT/RSI 조건 충족 + "
             f"최적 후보 {rank}/{candidate_count} (점수 {score:.2f}) -> "
             f"{side_label} 진입"
         )
@@ -607,14 +607,16 @@ class SignalScannerMixin:
                 ohlcv = await asyncio.to_thread(
                     self.market_data_exchange.fetch_ohlcv,
                     symbol,
-                    '2h',
+                    strategy_cfg['timeframe'],
                     limit=300,
                 )
                 if not ohlcv:
                     self.last_entry_reason[symbol] = (
-                        "EMA200 거래대금 스캔: 2시간봉 데이터 없음"
+                        f"EMA200 거래대금 스캔: {strategy_cfg['timeframe']}봉 데이터 없음"
                     )
-                    scan_failures.append(f"{symbol}: 2시간봉 데이터 없음")
+                    scan_failures.append(
+                        f"{symbol}: {strategy_cfg['timeframe']}봉 데이터 없음"
+                    )
                     continue
                 required_rows = int(strategy_cfg['ema_period']) + 3
                 if len(ohlcv) < required_rows:
@@ -733,7 +735,10 @@ class SignalScannerMixin:
                 f"완료봉 시각 {len(completed_timestamps)}종류"
             )
             if insufficient_history:
-                reason += f" / 2시간봉 이력 부족 {len(insufficient_history)}개 제외"
+                reason += (
+                    f" / {strategy_cfg['timeframe']}봉 이력 부족 "
+                    f"{len(insufficient_history)}개 제외"
+                )
             if scan_failures:
                 reason += f" / 오류 {', '.join(scan_failures[:3])}"
             self._store_ema200_candidate_selection(
@@ -904,7 +909,7 @@ class SignalScannerMixin:
         strategy_params = cfg.get('strategy_params', {}) if isinstance(cfg.get('strategy_params', {}), dict) else {}
         active_strategy = str(strategy_params.get('active_strategy', 'utbot') or 'utbot').lower()
         if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
-            return '2h'
+            return self._get_ema200_utbot_rsi_config(strategy_params)['timeframe']
         if active_strategy in UTBREAKOUT_STRATEGIES:
             fb_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
             if bool(fb_cfg.get('adaptive_timeframe_enabled', False)):
@@ -4504,7 +4509,7 @@ class SignalScannerMixin:
                 if active_strategy not in CORE_STRATEGIES:
                     active_strategy = 'utbot'
                 if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
-                    scan_tf = '2h'
+                    scan_tf = self._get_ema200_utbot_rsi_config(scan_params)['timeframe']
                 elif active_strategy in UTBREAKOUT_STRATEGIES:
                     scan_tf = self._get_utbot_filtered_breakout_config(scan_params).get('entry_timeframe', '15m')
                     if (
@@ -4921,7 +4926,7 @@ class SignalScannerMixin:
                     if active_strategy not in CORE_STRATEGIES:
                         active_strategy = 'utbot'
                     if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
-                        scan_tf = '2h'
+                        scan_tf = self._get_ema200_utbot_rsi_config(scan_params)['timeframe']
                     elif active_strategy in UTBREAKOUT_STRATEGIES:
                         scan_tf = self._get_utbot_filtered_breakout_config(scan_params).get('entry_timeframe', '15m')
 

@@ -159,7 +159,9 @@ class SignalCandleMixin:
             position_strategy = self._position_entry_strategy(symbol) if pos else None
             status_strategy = position_strategy or active_strategy.lower()
             if status_strategy == EMA200_UTBOT_RSI_STRATEGY:
-                symbol_status['entry_tf'] = '2h'
+                symbol_status['entry_tf'] = (
+                    self._get_ema200_utbot_rsi_config()['timeframe']
+                )
                 # Entries use completed 2h bars; exits use the user-selected
                 # 15m/30m/1h UT timeframe, which the status must show.
                 symbol_status['exit_tf'] = self._get_exit_timeframe(symbol)
@@ -1811,7 +1813,7 @@ class SignalCandleMixin:
             # [MODIFIED] Prioritize entry_timeframe for fetching entry OHLCV
             common_cfg = self.get_runtime_common_settings()
             if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
-                tf = self._get_ema200_utbot_rsi_config(strategy_params).get('timeframe', '2h')
+                tf = self._get_ema200_utbot_rsi_config(strategy_params)['timeframe']
             elif active_strategy in UTBREAKOUT_STRATEGIES:
                 filtered_cfg = self._get_utbot_filtered_breakout_config(strategy_params)
                 tf = filtered_cfg.get('entry_timeframe', '15m')

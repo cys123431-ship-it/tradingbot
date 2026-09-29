@@ -76,7 +76,7 @@ class SignalEMA200UTBotRSIMixin:
         if not cfg.get("enabled", True):
             return None, f"{EMA200_UTBOT_RSI_DISPLAY_NAME}: 신규 진입 OFF", {
                 "enabled": False,
-                "timeframe": "2h",
+                "timeframe": cfg["timeframe"],
             }
 
         closed = df.iloc[:-1].copy().reset_index(drop=True)
@@ -89,7 +89,7 @@ class SignalEMA200UTBotRSIMixin:
                 f"({len(closed)}/{min_bars} 완료봉)"
             ), {
                 "enabled": True,
-                "timeframe": "2h",
+                "timeframe": cfg["timeframe"],
                 "required_bars": min_bars,
                 "available_bars": len(closed),
             }
@@ -107,7 +107,7 @@ class SignalEMA200UTBotRSIMixin:
         if len(valid_rsi) < 2:
             return None, f"{EMA200_UTBOT_RSI_DISPLAY_NAME}: RSI 계산 대기", {
                 "enabled": True,
-                "timeframe": "2h",
+                "timeframe": cfg["timeframe"],
             }
 
         ut_sig, ut_reason, ut_detail = self._calculate_utbot_signal(
@@ -136,7 +136,7 @@ class SignalEMA200UTBotRSIMixin:
         detail = {
             **entry_detail,
             "enabled": True,
-            "timeframe": "2h",
+            "timeframe": cfg["timeframe"],
             "ema_period": ema_period,
             "ema200_previous": previous_ema,
             "rsi_length": rsi_length,
@@ -311,7 +311,7 @@ class SignalEMA200UTBotRSIMixin:
             )
             try:
                 await self.ctrl.notify(
-                    "🛑 EMA200 + UT Bot + RSI (2H) 신규 진입 차단\n"
+                    "🛑 EMA200 + UT Bot + RSI 신규 진입 차단\n"
                     f"심볼: {symbol}\n"
                     f"이유: {gate.get('reason')}\n"
                     "현재 보유 포지션을 강제청산하는 규칙이 아니라, "

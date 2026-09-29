@@ -949,7 +949,7 @@ class SignalEntryMixin:
                 except Exception as gate_exc:
                     logger.exception('EMA200 strategy realized-loss gate failed')
                     await self.ctrl.notify(
-                        '⚠️ EMA200 + UT Bot + RSI (2H) 진입 차단: '
+                        '⚠️ EMA200 + UT Bot + RSI 진입 차단: '
                         f'손실한도 확인 실패 ({type(gate_exc).__name__}: {gate_exc})'
                     )
                     return
@@ -961,7 +961,7 @@ class SignalEntryMixin:
                         code_ref='ema200_utbot_rsi.py:evaluate_ema200_utbot_rsi_loss_gate',
                     )
                     await self.ctrl.notify(
-                        '🛑 EMA200 + UT Bot + RSI (2H) 신규 진입 차단\n'
+                        '🛑 EMA200 + UT Bot + RSI 신규 진입 차단\n'
                         f"{ema200_loss_gate.get('reason')}\n"
                         '보유 포지션 강제청산 규칙이 아니라 새 진입만 막는 보호장치입니다.'
                     )
@@ -1166,7 +1166,7 @@ class SignalEntryMixin:
                         code_ref='ema200_utbot_rsi.py:get_ema200_consecutive_losses',
                     )
                     await self.ctrl.notify(
-                        '⚠️ EMA200 + UT Bot + RSI (2H) 진입 차단: '
+                        '⚠️ EMA200 + UT Bot + RSI 진입 차단: '
                         f'연속 손실 이력 확인 실패 '
                         f'({type(streak_exc).__name__}: {streak_exc})'
                     )
@@ -1184,8 +1184,8 @@ class SignalEntryMixin:
                 margin_to_use = float(ema200_risk_plan['planned_margin'])
                 ema200_entry_plan = {
                     'strategy': EMA200_UTBOT_RSI_STRATEGY,
-                    'timeframe': '2h',
-                    'entry_timeframe': '2h',
+                    'timeframe': ema200_risk_cfg['timeframe'],
+                    'entry_timeframe': ema200_risk_cfg['timeframe'],
                     'exit_timeframe': ema200_risk_cfg['exit_timeframe'],
                     'leverage': lev,
                     'ema200_small_account_mode': bool(
@@ -1294,7 +1294,7 @@ class SignalEntryMixin:
             if min_notional > 0 and target_notional < min_notional:
                 if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
                     await self.ctrl.notify(
-                        '⚠️ EMA200 + UT Bot + RSI (2H) 진입 차단: '
+                        '⚠️ EMA200 + UT Bot + RSI 진입 차단: '
                         f'리스크 기준 포지션 {target_notional:.2f} USDT가 '
                         f'거래소 최소 주문금액 {min_notional:.2f} USDT보다 작습니다. '
                         '설정한 손실예산을 초과하도록 수량을 억지로 늘리지 않습니다.'

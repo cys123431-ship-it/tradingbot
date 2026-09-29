@@ -2983,7 +2983,7 @@ def test_rsi_uses_wilder_sma_seed_then_recursive_smoothing():
     assert rsi.iloc[4] == pytest.approx(54.5454545455)
 
 
-def test_primary_polling_is_fixed_to_2h_and_exit_is_user_selectable():
+def test_primary_polling_uses_selected_entry_timeframe_and_exit_is_user_selectable():
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
     params = {
         "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
@@ -2999,6 +2999,8 @@ def test_primary_polling_is_fixed_to_2h_and_exit_is_user_selectable():
     }
     engine.get_runtime_strategy_params = lambda: params
 
+    assert engine._get_primary_poll_timeframe() == "4h"
+    params["EMA200UTBotRSI2H"]["timeframe"] = "3h"  # unsupported -> default
     assert engine._get_primary_poll_timeframe() == "2h"
     assert engine._get_exit_timeframe("BTC/USDT") == "15m"
     params["EMA200UTBotRSI2H"]["exit_timeframe"] = "30m"
@@ -3009,7 +3011,7 @@ def test_primary_polling_is_fixed_to_2h_and_exit_is_user_selectable():
     )
     high_volume_source = inspect.getsource(emas.SignalEngine.scan_and_trade_high_volume)
     poll_tick_source = inspect.getsource(emas.SignalEngine.poll_tick)
-    assert "'2h'" in volume_scanner_source
+    assert "strategy_cfg['timeframe']" in volume_scanner_source
     assert "_ema200_volume_symbols" in volume_scanner_source
     assert "_scan_and_trade_ema200_volume" in high_volume_source
     assert "configured_active_strategy == EMA200_UTBOT_RSI_STRATEGY" in poll_tick_source
@@ -3965,7 +3967,7 @@ def test_telegram_keyboard_exposes_best_candidate_toggle_and_help():
         for button in buttons
     )
     help_text = controller._ema200_utbot_rsi_help_text("candidate")
-    assert "거래대금 2억 USDT 이상인 종목을 동일한 완료 2시간봉" in help_text
+    assert "거래대금 2억 USDT 이상인 종목을 동일한 완료 진입봉" in help_text
     assert "점수는 후보의 순서만 정하며" in help_text
     assert "기존 포지션" in help_text
 
@@ -4590,3 +4592,83 @@ def test_missing_symbol_external_stop_is_not_protective_winner():
     asyncio.run(engine._ema200_apply_margin_profit_stop(symbol))
 
     assert len(replacements) == 1
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("1h", "1h"), ("2h", "2h"), ("4h", "4h"), ("6h", "6h"), ("8h", "8h"),
+    ("12h", "12h"), ("3h", "2h"), ("1d", "2h"), (None, "2h"), ("4H", "4h"),
+])
+def test_ema200_entry_timeframe_normalizes_to_allowed_completed_bars(raw, expected):
+    assert normalize_ema200_utbot_rsi_config({"timeframe": raw})["timeframe"] == expected
+
+
+def test_telegram_entry_timeframe_buttons_update_dedicated_strategy_setting():
+    controller = _registered_telegram_controller()
+    buttons = [
+        button for row in controller._build_ema200_utbot_rsi_keyboard().inline_keyboard
+        for button in row
+    ]
+    entry_buttons = {
+        button.callback_data: button.text
+        for button in buttons if button.callback_data.startswith("e2h:entry_tf:")
+    }
+    assert set(entry_buttons) == {
+        f"e2h:entry_tf:{tf}" for tf in ("1h", "2h", "4h", "6h", "8h", "12h")
+    }
+    assert entry_buttons["e2h:entry_tf:2h"].startswith("✅")  # default selection
+
+    handler = next(handler for handler, _ in controller.tg_app.handlers
+                   if isinstance(handler, CallbackQueryHandler))
+    query = _TelegramQuery("e2h:entry_tf:6h")
+    asyncio.run(handler.callback(SimpleNamespace(callback_query=query), None))
+    assert controller.cfg.updates[-1] == (
+        ["binance_futures", "strategy_params", "EMA200UTBotRSI2H", "timeframe"], "6h"
+    )
+    assert "완료된 6h봉" in query.edits[-1]
+
+    ignored = _TelegramQuery("e2h:entry_tf:3h")
+    asyncio.run(handler.callback(SimpleNamespace(callback_query=ignored), None))
+    assert controller.cfg.updates[-1][1] == "6h"
+
+
+@pytest.mark.parametrize("entry_tf", ["1h", "4h", "12h"])
+def test_selected_entry_timeframe_drives_scan_and_entry_plan(entry_tf):
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    params = {
+        "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
+        "EMA200UTBotRSI2H": {"timeframe": entry_tf},
+    }
+    assert engine._get_ema200_utbot_rsi_config(params)["timeframe"] == entry_tf
+    engine.get_runtime_trade_config = lambda: {"strategy_params": params}
+    assert engine._get_primary_poll_timeframe() == entry_tf
+    entry_source = inspect.getsource(emas.SignalEntryMixin.entry)
+    assert "'entry_timeframe': ema200_risk_cfg['timeframe']" in entry_source
+
+
+@pytest.mark.parametrize("entry_tf", ["1h", "8h"])
+def test_volume_scan_fetches_the_selected_entry_timeframe(entry_tf):
+    engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    params = {
+        "active_strategy": EMA200_UTBOT_RSI_STRATEGY,
+        "EMA200UTBotRSI2H": {"timeframe": entry_tf},
+    }
+    requested = []
+
+    def fetch_ohlcv(symbol, timeframe, limit=300):
+        requested.append((symbol, timeframe))
+        return [[i, 1, 1, 1, 1, 1] for i in range(10)]  # too short: skipped
+
+    async def universe():
+        return ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+
+    engine.get_runtime_strategy_params = lambda: params
+    engine.market_data_exchange = SimpleNamespace(fetch_ohlcv=fetch_ohlcv)
+    engine._ema200_volume_symbols = universe
+    engine.ctrl = SimpleNamespace(is_paused=False)
+    engine.scanner_active_symbol = None
+    engine.last_entry_reason = {}
+
+    asyncio.run(engine._scan_and_trade_ema200_volume())
+
+    assert {tf for _, tf in requested} == {entry_tf}
+    assert "완료봉 데이터 부족" in engine.last_entry_reason["BTC/USDT:USDT"]

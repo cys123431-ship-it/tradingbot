@@ -39,7 +39,7 @@ _LOG_LINE = re.compile(
 # Where each behaviour lives, so an AI reviewer can open the right code.
 CODE_REFERENCES = {
     "EMA200 scan / candidate ranking": "bot_runtime/signal_scanner.py:_scan_and_trade_ema200_volume, bot_runtime/ema200_candidate_selector.py",
-    "EMA200 entry signal (EMA200/UT/RSI 2h)": "bot_runtime/signal_ema200_utbot_rsi.py:_calculate_ema200_utbot_rsi_signal, bot_runtime/ema200_utbot_rsi.py:evaluate_ema200_utbot_rsi_entry",
+    "EMA200 entry signal (EMA200/UT/RSI, selectable 1h-12h)": "bot_runtime/signal_ema200_utbot_rsi.py:_calculate_ema200_utbot_rsi_signal, bot_runtime/ema200_utbot_rsi.py:evaluate_ema200_utbot_rsi_entry",
     "Exit-timeframe UT alignment entry gate": "bot_runtime/signal_ema200_utbot_rsi.py:_ema200_exit_timeframe_aligned",
     "24h volume universe gate": "bot_runtime/signal_scanner.py:_ema200_entry_volume_allowed",
     "Loss limits / loss streak / margin ladder": "bot_runtime/ema200_utbot_rsi.py:evaluate_ema200_utbot_rsi_loss_gate, get_ema200_consecutive_losses, build_ema200_utbot_rsi_risk_plan",

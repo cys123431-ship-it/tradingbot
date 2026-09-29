@@ -85,6 +85,20 @@ class ControllerEMA200UTBotRSIMixin:
             ],
             [
                 InlineKeyboardButton(
+                    f"{'✅ ' if cfg['timeframe'] == tf else ''}진입 {tf}",
+                    callback_data=f"e2h:entry_tf:{tf}",
+                )
+                for tf in ("1h", "2h", "4h")
+            ],
+            [
+                InlineKeyboardButton(
+                    f"{'✅ ' if cfg['timeframe'] == tf else ''}진입 {tf}",
+                    callback_data=f"e2h:entry_tf:{tf}",
+                )
+                for tf in ("6h", "8h", "12h")
+            ],
+            [
+                InlineKeyboardButton(
                     f"{'✅ ' if cfg['exit_timeframe'] == tf else ''}청산 {tf}",
                     callback_data=f"e2h:exit_tf:{tf}",
                 )
@@ -293,7 +307,9 @@ class ControllerEMA200UTBotRSIMixin:
             recent_symbols = [str(symbol) for symbol, _ in recent_items[:10]]
             latest_reason = (getattr(engine, "last_entry_reason", {}) or {}).get(latest_symbol)
 
-        condition_text = "최근 조건: 아직 2시간 완료봉 평가 기록 없음"
+        condition_text = (
+            f"최근 조건: 아직 {cfg['timeframe']} 완료봉 평가 기록 없음"
+        )
         if latest_detail:
             close_value = latest_detail.get("closed_candle_close")
             ema_value = latest_detail.get("ema200")
@@ -384,7 +400,8 @@ class ControllerEMA200UTBotRSIMixin:
             f"전략 선택: {'✅ ACTIVE' if active else '⬜ 미선택'}\n"
             f"신규 진입: {'ON' if cfg['enabled'] else 'OFF'}\n"
             f"최적 후보 선택: {candidate_status}\n"
-            f"진입 시간봉: 2시간 완료봉 고정 / UT 정상청산: 완료된 {cfg['exit_timeframe']}봉\n"
+            f"진입 시간봉: 완료된 {cfg['timeframe']}봉 (1h·2h·4h·6h·8h·12h 선택) / "
+            f"UT 정상청산: 완료된 {cfg['exit_timeframe']}봉\n"
             "수익 보호: 증거금 수익률 5% 초과부터 5%p 계단형 거래소 Stop\n"
             "스캔 종목: 바이낸스 활성 USDT 무기한 선물 중 "
             f"24시간 거래대금 {EMA200_MIN_QUOTE_VOLUME_USDT / 1_000_000:.0f}M USDT 이상\n"
@@ -422,7 +439,7 @@ class ControllerEMA200UTBotRSIMixin:
             return (
                 "📘 UT 청산 시간봉: 15분·30분·1시간 중 하나를 고릅니다. "
                 "고른 시간봉의 완료봉에서 LONG은 새 UT Sell, SHORT는 새 UT Buy가 발생하면 "
-                "다른 청산 필터와 무관하게 종료합니다. 진입 판단은 계속 완료된 2시간봉입니다. "
+                "다른 청산 필터와 무관하게 종료합니다. 진입 판단은 계속 선택한 진입 시간봉의 완료봉입니다. "
                 "설정 변경은 현재 보유 포지션에도 다음 평가부터 적용됩니다."
             )
         if kind == "profit_stop":
@@ -440,7 +457,7 @@ class ControllerEMA200UTBotRSIMixin:
         if kind == "candidate":
             return (
                 "📘 최적 후보 선택이란?\n\n"
-                "ON이면 현재 24시간 거래대금 2억 USDT 이상인 종목을 동일한 완료 2시간봉 기준으로 모두 평가한 뒤, "
+                "ON이면 현재 24시간 거래대금 2억 USDT 이상인 종목을 동일한 완료 진입봉 기준으로 모두 평가한 뒤, "
                 "EMA200·UT Bot·RSI 진입 조건을 이미 통과한 후보들만 서로 비교합니다.\n\n"
                 "점수는 최근 UT 신호, RSI 진행 강도, 진입 방향의 EMA200 기울기, "
                 "최근 24시간 거래대금에 가점을 주고, 완료된 15분·30분·1시간봉의 "
@@ -448,7 +465,7 @@ class ControllerEMA200UTBotRSIMixin:
                 "EMA200에서 3ATR보다 지나치게 "
                 "멀어진 후보에는 추격진입 감점을 줍니다. 점수는 후보의 순서만 정하며 "
                 "원래 진입 조건을 새로 만들거나 우회하지 않습니다.\n\n"
-                "예시) BTC와 DOGE가 같은 2시간봉에서 모두 LONG 조건을 충족했을 때, "
+                "예시) BTC와 DOGE가 같은 진입봉에서 모두 LONG 조건을 충족했을 때, "
                 "BTC가 먼저 스캔됐다는 이유로 즉시 진입하지 않습니다. 전체 대상 평가가 "
                 "끝난 후 점수가 높은 종목부터 한 종목만 주문합니다. 최고 후보의 주문이 "
                 "최소수량·안전장치 등으로 열리지 않으면 다음 순위 후보를 확인합니다.\n\n"
@@ -549,12 +566,12 @@ class ControllerEMA200UTBotRSIMixin:
             )
         return (
             "📘 전략 동작 순서\n\n"
-            "LONG: 2시간 완료봉 종가가 EMA200 위 → UT Bot Buy 발생 → 그 LONG 상태가 유지되는 동안 "
+            "LONG: 선택한 진입 시간봉(기본 2시간)의 완료봉 종가가 EMA200 위 → UT Bot Buy 발생 → 그 LONG 상태가 유지되는 동안 "
             "현재 RSI가 50보다 높고 직전 완료봉보다 상승 → 진입. 이후 선택한 청산봉에서 UT Bot Sell이 발생하면 정상 청산합니다.\n\n"
             "SHORT: 정확히 반대입니다. EMA200 아래 → UT Bot Sell → SHORT 상태 유지 중 RSI가 50보다 낮고 하락 "
             "→ 진입. 이후 선택한 청산봉에서 UT Bot Buy가 발생하면 정상 청산합니다.\n\n"
             "UT 신호는 현재 RSI 평가봉보다 먼저 확정되어야 하며, 같은 봉 신호는 인정하지 않습니다. "
-            "진입은 완료된 2시간봉만 사용하고, 청산은 선택한 시간봉의 완료봉만 사용합니다.\n\n"
+            "진입은 선택한 진입 시간봉(1h·2h·4h·6h·8h·12h)의 완료봉만 사용하고, 청산은 선택한 시간봉의 완료봉만 사용합니다.\n\n"
             "이 전략의 UT Bot은 Key 1.0 / ATR 10 / 일반 캔들(HA OFF)로 고정되며, "
             "다른 /utbot 전략의 설정을 변경해도 영향을 받지 않습니다.\n\n"
             "스캔 대상은 바이낸스 USDT 무기한 선물 중 24시간 거래대금 2억 USDT 이상인 활성 종목이며, "
@@ -786,8 +803,9 @@ class ControllerEMA200UTBotRSIMixin:
                     EMA200_UTBOT_RSI_STRATEGY,
                 )
                 await query.edit_message_text(
-                    "✅ EMA200 + UT Bot + RSI (2H)를 활성 전략으로 선택했습니다.\n"
-                    "2시간 완료봉 기준으로만 새 진입을 판단합니다.",
+                    "✅ EMA200 + UT Bot + RSI를 활성 전략으로 선택했습니다.\n"
+                    f"완료된 {self._ema200_utbot_rsi_config()['timeframe']}봉 기준으로만 "
+                    "새 진입을 판단합니다.",
                     reply_markup=self._build_ema200_utbot_rsi_keyboard(),
                 )
                 return
@@ -828,6 +846,29 @@ class ControllerEMA200UTBotRSIMixin:
                 )
                 return
 
+            if action == "entry_tf" and len(parts) > 2:
+                from .ema200_utbot_rsi import EMA200_ENTRY_TIMEFRAMES
+                selected_tf = parts[2]
+                if selected_tf not in EMA200_ENTRY_TIMEFRAMES:
+                    return
+                await self._update_ema200_utbot_rsi_value("timeframe", selected_tf)
+                reset_runtime = getattr(
+                    self, "_reset_signal_engine_runtime_state", None
+                )
+                if callable(reset_runtime):
+                    # Drop candle caches keyed to the previous entry timeframe.
+                    reset_runtime(
+                        reset_entry_cache=True,
+                        reset_stateful_strategy=True,
+                    )
+                await query.edit_message_text(
+                    f"✅ 진입 시간봉: 완료된 {selected_tf}봉\n"
+                    "다음 스캔부터 새 진입 판단(EMA200·UT·RSI)에 적용됩니다. "
+                    "이미 열린 포지션의 청산봉·비상 SL·수익 Stop은 그대로입니다.",
+                    reply_markup=self._build_ema200_utbot_rsi_keyboard(),
+                )
+                return
+
             if action == "exit_tf" and len(parts) > 2:
                 from .ema200_utbot_rsi import EMA200_EXIT_TIMEFRAMES
                 selected_tf = parts[2]
@@ -837,7 +878,8 @@ class ControllerEMA200UTBotRSIMixin:
                 await query.edit_message_text(
                     f"✅ UT 반대 신호 청산: 완료된 {selected_tf}봉. "
                     "현재 포지션에도 다음 평가부터 적용됩니다. "
-                    "2시간봉 진입 조건과 수익 계단 스탑은 유지됩니다.",
+                    f"완료된 {self._ema200_utbot_rsi_config()['timeframe']}봉 진입 조건과 "
+                    "수익 계단 스탑은 유지됩니다.",
                     reply_markup=self._build_ema200_utbot_rsi_keyboard(),
                 )
                 return
