@@ -228,8 +228,15 @@ class SignalScannerMixin:
                 reason='포지션 방향·진입가·거래소 표시가격 중 하나가 없음',
             )
             return
+        profit_cfg = self._get_ema200_utbot_rsi_config()
+        profit_step = float(profit_cfg['profit_stop_step_percent'])
+        profit_start = float(profit_cfg['profit_stop_start_roi_percent'])
         target = ema200_profit_stop_target(
             side, entry_price, mark_price, leverage,
+            step_percent=profit_step,
+            # A start at or below one step is the legacy staircase (lock the
+            # achieved step); a higher start trails one step below.
+            start_percent=profit_start if profit_start > profit_step + 1e-9 else None,
         )
         if target is None:
             self._set_ema200_profit_stop_status(

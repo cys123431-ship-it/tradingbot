@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import time
 
-from .ema200_utbot_rsi import EMA200_UTBOT_RSI_STRATEGY
+from .ema200_utbot_rsi import (
+    EMA200_UTBOT_RSI_STRATEGY,
+    ema200_effective_exit_timeframe,
+)
 
 
 class SignalFilterMixin:
@@ -146,7 +149,9 @@ class SignalFilterMixin:
             self._position_entry_strategy(symbol) if symbol else None
         ) or configured_strategy
         if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
-            return self._get_ema200_utbot_rsi_config(strategy_params)['exit_timeframe']
+            return ema200_effective_exit_timeframe(
+                self._get_ema200_utbot_rsi_config(strategy_params)
+            )
         if active_strategy in UTBREAKOUT_STRATEGIES:
             if symbol:
                 try:

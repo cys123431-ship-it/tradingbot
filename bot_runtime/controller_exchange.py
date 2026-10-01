@@ -1999,6 +1999,13 @@ class ControllerExchangeMixin:
         else:
             logger.info("Telegram startup keyboard suppressed by event-only alert mode.")
 
+        try:
+            await self._apply_ema200_strategy_revision()
+        except Exception as revision_error:
+            logger.error(
+                "EMA200 strategy revision migration failed: %s", revision_error
+            )
+
         await asyncio.gather(
             self._main_polling_loop(),  # [?대쭅 ?꾩슜] 硫붿씤 ?대쭅 猷⑦봽
             self._hourly_report_loop(),

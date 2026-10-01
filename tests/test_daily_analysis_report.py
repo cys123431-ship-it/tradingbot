@@ -237,7 +237,7 @@ def test_report_end_to_end_contains_both_parts_and_is_sent(tmp_path, journal_dir
     assert "[거래 #1] HYPE/USDT:USDT SHORT" in text
     assert "리스크 계획: 연속손실 0회 → 증거금 50.0%" in text
     assert "보호주문 결과: STRATEGY_MANAGED_NO_STOP" in text
-    assert "시장 재생(15m UT 재계산)" in text
+    assert "시장 재생(2h UT 재계산)" in text  # exit = entry timeframe (rev 2)
     assert "manual close" in text
     assert "[2-7 코드 위치]" in text
 

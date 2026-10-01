@@ -6,6 +6,11 @@ from utbreakout.dynamic_leverage import apply_dynamic_leverage_to_plan
 
 from .decision_journal import OPERATIONS, STRATEGY, journal_event
 from .ema200_utbot_rsi import (
+    EMA200_KST,
+    ema200_atr_stop_percent,
+    ema200_effective_exit_timeframe,
+    ema200_exit_timeframe_label,
+    ema200_reentry_allowed_at_ms,
     EMA200_CONSECUTIVE_LOSS_RESET_STATE_KEY,
     EMA200_DAILY_LOSS_RESET_STATE_KEY,
     apply_ema200_daily_loss_reset,
@@ -360,6 +365,45 @@ class SignalEntryMixin:
                             "EMA200 exit-timeframe guard notify skipped",
                             exc_info=True,
                         )
+                    return
+                cooldown_cfg = self._get_ema200_utbot_rsi_config(trace_strategy_params)
+                latest_exit_reader = getattr(
+                    getattr(self, 'db', None), 'get_latest_strategy_exit_time', None
+                )
+                cooldown_reason = None
+                if callable(latest_exit_reader) and cooldown_cfg['reentry_cooldown_candles'] > 0:
+                    try:
+                        allowed_at_ms = ema200_reentry_allowed_at_ms(
+                            latest_exit_reader(EMA200_UTBOT_RSI_STRATEGY),
+                            cooldown_cfg['timeframe'],
+                            cooldown_cfg['reentry_cooldown_candles'],
+                        )
+                    except Exception as cooldown_exc:
+                        allowed_at_ms = None
+                        cooldown_reason = (
+                            'EMA200_REENTRY_COOLDOWN: 직전 청산 시각 확인 실패 '
+                            f'({type(cooldown_exc).__name__}: {cooldown_exc})'
+                        )
+                    if allowed_at_ms and time.time() * 1000 < allowed_at_ms:
+                        allowed_kst = datetime.fromtimestamp(
+                            allowed_at_ms / 1000, tz=timezone.utc
+                        ).astimezone(EMA200_KST)
+                        cooldown_reason = (
+                            'EMA200_REENTRY_COOLDOWN: 직전 청산 후 완료된 '
+                            f"{cooldown_cfg['timeframe']}봉 "
+                            f"{cooldown_cfg['reentry_cooldown_candles']}개 대기 "
+                            f"(진입 허용 {allowed_kst:%m-%d %H:%M} KST)"
+                        )
+                if cooldown_reason:
+                    if not isinstance(getattr(self, 'last_entry_reason', None), dict):
+                        self.last_entry_reason = {}
+                    self.last_entry_reason[str(symbol)] = cooldown_reason
+                    logger.info(cooldown_reason)
+                    journal_event(
+                        STRATEGY, 'entry_blocked', symbol=symbol, side=side,
+                        gate='reentry_cooldown', reason=cooldown_reason,
+                        code_ref='signal_entry.py:entry (reentry cooldown)',
+                    )
                     return
             trace_utbreakout = trace_active_strategy in UTBREAKOUT_STRATEGIES
             if trace_utbreakout:
@@ -1171,6 +1215,42 @@ class SignalEntryMixin:
                         f'({type(streak_exc).__name__}: {streak_exc})'
                     )
                     return
+                ema200_stop_percent = None
+                if (
+                    ema200_risk_cfg['small_account_risk_sizing_enabled']
+                    and 0 < float(sizing_equity or 0.0)
+                    <= float(ema200_risk_cfg['small_account_threshold_usdt'])
+                ):
+                    atr_error = None
+                    try:
+                        atr_rows = await asyncio.to_thread(
+                            self.market_data_exchange.fetch_ohlcv,
+                            symbol,
+                            ema200_risk_cfg['timeframe'],
+                            limit=100,
+                        )
+                        ema200_stop_percent = ema200_atr_stop_percent(
+                            atr_rows,
+                            entry_price=price,
+                            period=ema200_risk_cfg['atr_stop_period'],
+                            multiplier=ema200_risk_cfg['atr_stop_multiplier'],
+                            min_percent=ema200_risk_cfg['atr_stop_min_percent'],
+                            max_percent=ema200_risk_cfg['emergency_exit_percent'],
+                        )
+                    except Exception as exc:
+                        atr_error = f'{type(exc).__name__}: {exc}'
+                    if ema200_stop_percent is None:
+                        reason = (
+                            'EMA200 진입 차단: ATR 손절 거리를 계산할 수 없습니다'
+                            + (f' ({atr_error})' if atr_error else ' (봉 데이터 부족)')
+                        )
+                        journal_event(
+                            OPERATIONS, 'entry_blocked', symbol=symbol, side=side,
+                            gate='atr_stop_unavailable', reason=reason,
+                            code_ref='ema200_utbot_rsi.py:ema200_atr_stop_percent',
+                        )
+                        await self.ctrl.notify(f'⚠️ {reason}')
+                        return
                 ema200_risk_plan = build_ema200_utbot_rsi_risk_plan(
                     account_equity=sizing_equity,
                     free_balance=free,
@@ -1178,6 +1258,7 @@ class SignalEntryMixin:
                     config=ema200_risk_cfg,
                     safety_buffer=safety_buffer,
                     consecutive_losses=ema200_loss_streak,
+                    stop_percent=ema200_stop_percent,
                 )
                 lev = int(ema200_risk_plan['leverage'])
                 target_notional = float(ema200_risk_plan['planned_notional'])
@@ -1186,7 +1267,7 @@ class SignalEntryMixin:
                     'strategy': EMA200_UTBOT_RSI_STRATEGY,
                     'timeframe': ema200_risk_cfg['timeframe'],
                     'entry_timeframe': ema200_risk_cfg['timeframe'],
-                    'exit_timeframe': ema200_risk_cfg['exit_timeframe'],
+                    'exit_timeframe': ema200_effective_exit_timeframe(ema200_risk_cfg),
                     'leverage': lev,
                     'ema200_small_account_mode': bool(
                         ema200_risk_plan['small_account_mode']
@@ -1583,6 +1664,7 @@ class SignalEntryMixin:
                     side=side,
                     entry_price=price,
                     config=ema200_risk_cfg,
+                    stop_percent=ema200_risk_plan.get('emergency_exit_percent'),
                 )
             else:
                 liquidation_stop = self._extract_liquidation_stop_price(
@@ -2142,6 +2224,7 @@ class SignalEntryMixin:
                     side=side,
                     entry_price=actual_entry_price,
                     config=ema200_risk_cfg,
+                    stop_percent=ema200_risk_plan.get('emergency_exit_percent'),
                 )
             else:
                 actual_stop_price = self._extract_liquidation_stop_price(
@@ -2362,13 +2445,19 @@ class SignalEntryMixin:
             elif active_strategy == EMA200_UTBOT_RSI_STRATEGY:
                 if ema200_risk_plan.get('emergency_stop_required'):
                     emergency_pct = float(
-                        ema200_risk_cfg['emergency_exit_percent']
+                        ema200_risk_plan.get('emergency_exit_percent')
+                        or ema200_risk_cfg['emergency_exit_percent']
                     )
-                    emergency_label = (
-                        "소액계좌 연속손실 단계 보호"
-                        if ema200_risk_plan.get('small_account_mode')
-                        else "위험예산 기반 최후 안전선"
-                    )
+                    if ema200_risk_plan.get('sizing_mode') == 'small_account_atr_risk':
+                        emergency_label = (
+                            f"ATR {float(ema200_risk_cfg['atr_stop_multiplier']):.1f}배 손절 / "
+                            f"1회 손실 계좌의 {float(ema200_risk_plan['risk_per_trade_percent']):.2f}% "
+                            f"({float(ema200_risk_plan['planned_emergency_loss_usdt']):.2f} USDT)"
+                        )
+                    elif ema200_risk_plan.get('small_account_mode'):
+                        emergency_label = "소액계좌 연속손실 단계 보호"
+                    else:
+                        emergency_label = "위험예산 기반 최후 안전선"
                     emergency_distance = (
                         float(actual_entry_price) * emergency_pct / 100.0
                     )
@@ -2391,8 +2480,9 @@ class SignalEntryMixin:
                         f"HA {'ON' if ema200_risk_cfg['utbot_use_heikin_ashi'] else 'OFF'}\n"
                         f"🛟 비상 손절 가격거리: 진입가 대비 {emergency_pct:.2f}% "
                         f"({emergency_label})\n"
-                        f"정상 청산: 완료된 {ema200_risk_cfg['exit_timeframe']}봉 UT Bot 반대 신호\n"
-                        "수익 보호: 증거금 수익률 5% 초과부터 5%p 계단형 Stop"
+                        f"정상 청산: 완료된 {ema200_exit_timeframe_label(ema200_risk_cfg)}봉 UT Bot 반대 신호\n"
+                        f"수익 보호: 증거금 수익률 {float(ema200_risk_cfg['profit_stop_start_roi_percent']):.0f}% 초과부터 "
+                        f"{float(ema200_risk_cfg['profit_stop_step_percent']):.0f}%p 계단 (한 계단 아래 잠금)"
                     )
                 else:
                     entry_notice = (
@@ -2401,7 +2491,7 @@ class SignalEntryMixin:
                         f"ATR {int(ema200_risk_cfg['utbot_atr_period'])} / "
                         f"HA {'ON' if ema200_risk_cfg['utbot_use_heikin_ashi'] else 'OFF'}\n"
                         "⚠️ 첫 단계: 거래소 Stop 없음 / "
-                        f"완료된 {ema200_risk_cfg['exit_timeframe']}봉 UT Bot 반대 신호로 청산\n"
+                        f"완료된 {ema200_exit_timeframe_label(ema200_risk_cfg)}봉 UT Bot 반대 신호로 청산\n"
                         "수익 보호: 증거금 수익률 5% 초과부터 5%p 계단형 Stop\n"
                         "청산가 도달 전 별도 손절이 없는 고위험 단계"
                     )

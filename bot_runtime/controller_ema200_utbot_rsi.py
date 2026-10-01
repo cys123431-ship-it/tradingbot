@@ -27,6 +27,12 @@ from .ema200_utbot_rsi import (
     get_ema200_consecutive_losses,
     normalize_ema200_utbot_rsi_config,
 )
+from .ema200_utbot_rsi import (
+    EMA200_EXIT_MODES,
+    EMA200_STRATEGY_REVISION,
+    EMA200_TIMEFRAME_MS,
+    ema200_exit_timeframe_label,
+)
 from .ema200_session import (
     EMA200_MORNING_RESET_STATE_KEY,
     build_ema200_session_status_text,
@@ -95,14 +101,23 @@ class ControllerEMA200UTBotRSIMixin:
                     f"{'✅ ' if cfg['timeframe'] == tf else ''}진입 {tf}",
                     callback_data=f"e2h:entry_tf:{tf}",
                 )
-                for tf in ("6h", "8h", "12h")
+                for tf in ("6h", "8h", "12h", "1d")
             ],
             [
                 InlineKeyboardButton(
-                    f"{'✅ ' if cfg['exit_timeframe'] == tf else ''}청산 {tf}",
+                    f"{'✅ ' if cfg['exit_timeframe'] == tf else ''}"
+                    f"{'청산=진입봉' if tf == 'entry' else '청산 ' + tf}",
                     callback_data=f"e2h:exit_tf:{tf}",
                 )
-                for tf in ("15m", "30m", "1h")
+                for tf in EMA200_EXIT_MODES
+            ],
+            [
+                InlineKeyboardButton(
+                    f"{'✅ ' if abs(float(cfg['small_account_risk_percent']) - pct) < 1e-9 else ''}"
+                    f"소액 손실 {pct:g}%",
+                    callback_data=f"e2h:srisk:{pct:g}",
+                )
+                for pct in (1.0, 1.5, 2.0)
             ],
             [
                 InlineKeyboardButton("📈 수익 스탑 설명", callback_data="e2h:help:profit_stop"),
@@ -171,12 +186,19 @@ class ControllerEMA200UTBotRSIMixin:
             total_equity, free_balance, _ = await balance_reader()
             equity = float(total_equity or free_balance or 0.0)
             free = float(free_balance or 0.0)
+            atr_mode = bool(
+                cfg.get("small_account_risk_sizing_enabled", True)
+                and 0 < equity <= float(cfg["small_account_threshold_usdt"])
+            )
             plan = build_ema200_utbot_rsi_risk_plan(
                 account_equity=equity,
                 free_balance=free,
                 entry_price=1.0,
                 config=cfg,
                 consecutive_losses=loss_streak,
+                # Preview at the maximum ATR stop distance; the live entry
+                # uses the actual ATR, which can only make the stop tighter.
+                stop_percent=(cfg["emergency_exit_percent"] if atr_mode else None),
             )
         except Exception:
             return (
@@ -192,6 +214,18 @@ class ControllerEMA200UTBotRSIMixin:
         margin_pct = margin / equity * 100.0 if equity > 0 else 0.0
         cap_note = " (가용잔고 상한 적용)" if plan.get("margin_cap_applied") else ""
 
+        if plan.get("sizing_mode") == "small_account_atr_risk":
+            return (
+                f"현재 계좌: {equity:.2f} USDT → 1,000 이하 소액계좌 (ATR 리스크 방식)\n"
+                f"1회 손실: 계좌의 {float(plan['risk_per_trade_percent']):g}% = "
+                f"{float(plan['risk_budget_usdt']):.2f} USDT (모든 진입에 거래소 손절)\n"
+                f"손절 거리: 진입봉 ATR({cfg['atr_stop_period']})×{cfg['atr_stop_multiplier']:g}, "
+                f"{float(cfg['atr_stop_min_percent']):g}~{float(cfg['emergency_exit_percent']):g}%\n"
+                f"최대 거리({float(cfg['emergency_exit_percent']):g}%) 기준 예상 명목: {notional:.2f} USDT "
+                f"/ 증거금 {margin:.2f} USDT (5x), ATR이 작으면 더 커집니다\n"
+                f"상한: 연속손실 {int(loss_streak)}회 → 증거금 계좌의 "
+                f"{float(plan['margin_cap_percent']):.0f}%까지{cap_note}"
+            )
         if plan.get("small_account_mode"):
             protection = (
                 "초기 비상 손절 없음 / 선택한 UT 청산봉 + 수익 계단 스탑"
@@ -401,8 +435,12 @@ class ControllerEMA200UTBotRSIMixin:
             f"신규 진입: {'ON' if cfg['enabled'] else 'OFF'}\n"
             f"최적 후보 선택: {candidate_status}\n"
             f"진입 시간봉: 완료된 {cfg['timeframe']}봉 (1h·2h·4h·6h·8h·12h 선택) / "
-            f"UT 정상청산: 완료된 {cfg['exit_timeframe']}봉\n"
-            "수익 보호: 증거금 수익률 5% 초과부터 5%p 계단형 거래소 Stop\n"
+            f"UT 정상청산: 완료된 {ema200_exit_timeframe_label(cfg)}봉\n"
+            f"소액계좌 손절·수량: ATR({cfg['atr_stop_period']})×{cfg['atr_stop_multiplier']:g} 손절 "
+            f"(최대 {cfg['emergency_exit_percent']:g}%), 1회 손실 계좌의 {cfg['small_account_risk_percent']:g}% / "
+            f"재진입 대기 {cfg['reentry_cooldown_candles']}봉\n"
+            f"수익 보호: 증거금 수익률 {cfg['profit_stop_start_roi_percent']:g}% 초과부터 "
+            f"{cfg['profit_stop_step_percent']:g}%p 계단, 한 계단 아래 잠금\n"
             "스캔 종목: 바이낸스 활성 USDT 무기한 선물 중 "
             f"24시간 거래대금 {EMA200_MIN_QUOTE_VOLUME_USDT / 1_000_000:.0f}M USDT 이상\n"
             "추세: 종가 > EMA200=롱 허용 / 종가 < EMA200=숏 허용\n"
@@ -741,6 +779,56 @@ class ControllerEMA200UTBotRSIMixin:
             "일일 손실한도 기준에서 제외"
         )
 
+    async def _apply_ema200_strategy_revision(self):
+        """One-time move of stored settings to strategy revision 2.
+
+        Revision 2 exits on the entry timeframe's UT and needs entries of at
+        least 4h; older stored values (15m exit, 1h/2h entry) are migrated
+        once and the operator is told.  Later Telegram changes are kept.
+        """
+        section = self.get_active_trade_section()
+        raw = (
+            self.cfg.get(section, {})
+            .get("strategy_params", {})
+            .get(EMA200_UTBOT_RSI_CONFIG_KEY, {})
+        ) or {}
+        try:
+            revision = int(raw.get("strategy_revision") or 1)
+        except (TypeError, ValueError):
+            revision = 1
+        if revision >= EMA200_STRATEGY_REVISION:
+            return None
+        current = normalize_ema200_utbot_rsi_config(raw)
+        changes = {}
+        if current["exit_timeframe"] != "entry":
+            changes["exit_timeframe"] = "entry"
+        if EMA200_TIMEFRAME_MS[current["timeframe"]] < EMA200_TIMEFRAME_MS["4h"]:
+            changes["timeframe"] = "4h"
+        for key, value in changes.items():
+            await self._update_ema200_utbot_rsi_value(key, value)
+        await self._update_ema200_utbot_rsi_value(
+            "strategy_revision", EMA200_STRATEGY_REVISION
+        )
+        try:
+            await self.notify(
+                "🔧 EMA200 전략 개선판(revision 2) 적용\n"
+                + (
+                    "".join(
+                        f"• {key}: {current[key]} → {value}\n"
+                        for key, value in changes.items()
+                    )
+                    or "• 기존 설정 유지\n"
+                )
+                + "• 모든 진입에 ATR 손절, 1회 손실 계좌의 "
+                f"{current['small_account_risk_percent']:g}%로 수량 결정\n"
+                f"• 수익 Stop: ROI {current['profit_stop_start_roi_percent']:g}% 초과부터\n"
+                f"• 청산 후 진입봉 {current['reentry_cooldown_candles']}개 재진입 대기\n"
+                "/ema200 메뉴에서 언제든 다시 바꿀 수 있습니다."
+            )
+        except Exception:
+            pass
+        return changes
+
     async def _ema200_utbot_rsi_has_open_position(self):
         try:
             positions = await asyncio.to_thread(self.exchange.fetch_positions)
@@ -869,14 +957,31 @@ class ControllerEMA200UTBotRSIMixin:
                 )
                 return
 
+            if action == "srisk" and len(parts) > 2:
+                try:
+                    value = float(parts[2])
+                except ValueError:
+                    return
+                if value not in (1.0, 1.5, 2.0):
+                    return
+                await self._update_ema200_utbot_rsi_value(
+                    "small_account_risk_percent", value
+                )
+                await query.edit_message_text(
+                    f"✅ 소액계좌 1회 손실: 계좌의 {value:g}%\n"
+                    "새 진입부터 ATR 손절 거리에 맞춰 수량을 정합니다.",
+                    reply_markup=self._build_ema200_utbot_rsi_keyboard(),
+                )
+                return
+
             if action == "exit_tf" and len(parts) > 2:
-                from .ema200_utbot_rsi import EMA200_EXIT_TIMEFRAMES
                 selected_tf = parts[2]
-                if selected_tf not in EMA200_EXIT_TIMEFRAMES:
+                if selected_tf not in EMA200_EXIT_MODES:
                     return
                 await self._update_ema200_utbot_rsi_value("exit_timeframe", selected_tf)
                 await query.edit_message_text(
-                    f"✅ UT 반대 신호 청산: 완료된 {selected_tf}봉. "
+                    f"✅ UT 반대 신호 청산: 완료된 "
+                    f"{ema200_exit_timeframe_label(self._ema200_utbot_rsi_config())}봉. "
                     "현재 포지션에도 다음 평가부터 적용됩니다. "
                     f"완료된 {self._ema200_utbot_rsi_config()['timeframe']}봉 진입 조건과 "
                     "수익 계단 스탑은 유지됩니다.",

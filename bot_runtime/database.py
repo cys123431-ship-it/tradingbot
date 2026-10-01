@@ -258,6 +258,19 @@ class DBManager:
             and _parse_utc(entry_time) > cutoff
         )
 
+    def get_latest_strategy_exit_time(self, strategy):
+        """Latest recorded exit time of one strategy (ISO string) or None."""
+        strategy_value = str(strategy or '').strip().lower()
+        with self.lock:
+            row = self.conn.execute(
+                """SELECT exit_time FROM trades
+                WHERE LOWER(COALESCE(strategy, '')) = ?
+                  AND exit_time IS NOT NULL
+                ORDER BY julianday(exit_time) DESC, id DESC LIMIT 1""",
+                (strategy_value,),
+            ).fetchone()
+        return row[0] if row else None
+
     def get_strategy_trade_summary(self, strategy, since):
         """Summarize one strategy's trades entered after ``since``."""
         strategy_value = str(strategy or '').strip().lower()

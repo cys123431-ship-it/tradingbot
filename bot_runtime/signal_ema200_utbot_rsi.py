@@ -15,6 +15,7 @@ from .ema200_utbot_rsi import (
     evaluate_ema200_utbot_rsi_entry,
     evaluate_ema200_utbot_rsi_loss_gate,
     normalize_ema200_utbot_rsi_config,
+    ema200_effective_exit_timeframe,
 )
 
 
@@ -173,8 +174,13 @@ class SignalEMA200UTBotRSIMixin:
             if isinstance(strategy_params, dict)
             else self.get_runtime_strategy_params()
         )
-        exit_tf = self._get_ema200_utbot_rsi_config(params)["exit_timeframe"]
+        alignment_cfg = self._get_ema200_utbot_rsi_config(params)
+        exit_tf = ema200_effective_exit_timeframe(alignment_cfg)
         side_key = str(side or "").strip().lower()
+        if exit_tf == alignment_cfg["timeframe"]:
+            # Exiting on the entry timeframe's own UT: the entry signal already
+            # requires that UT state to agree with the side.
+            return True, f"청산봉 = 진입봉({exit_tf}), 별도 정렬 검사 불필요"
         try:
             rows = await asyncio.to_thread(
                 self.market_data_exchange.fetch_ohlcv,

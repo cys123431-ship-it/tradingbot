@@ -27,7 +27,23 @@ EMA200_SMALL_ACCOUNT_LEVERAGE = 5
 EMA200_SMALL_ACCOUNT_MARGIN_LADDER_PERCENT = (50.0, 35.0, 25.0, 15.0, 10.0)
 EMA200_EXIT_TIMEFRAMES = ("15m", "30m", "1h")
 # Completed-candle entry timeframes selectable from Telegram; 2h is default.
-EMA200_ENTRY_TIMEFRAMES = ("1h", "2h", "4h", "6h", "8h", "12h")
+EMA200_ENTRY_TIMEFRAMES = ("1h", "2h", "4h", "6h", "8h", "12h", "1d")
+# "entry" exits on the UT Bot of the entry timeframe itself (the default since
+# strategy revision 2); 15m/30m/1h keep the legacy faster exits selectable.
+EMA200_EXIT_ON_ENTRY_TIMEFRAME = "entry"
+EMA200_EXIT_MODES = (EMA200_EXIT_ON_ENTRY_TIMEFRAME,) + EMA200_EXIT_TIMEFRAMES
+EMA200_STRATEGY_REVISION = 2
+EMA200_TIMEFRAME_MS = {
+    "15m": 900_000,
+    "30m": 1_800_000,
+    "1h": 3_600_000,
+    "2h": 7_200_000,
+    "4h": 14_400_000,
+    "6h": 21_600_000,
+    "8h": 28_800_000,
+    "12h": 43_200_000,
+    "1d": 86_400_000,
+}
 EMA200_DEFAULT_ENTRY_TIMEFRAME = "2h"
 
 EMA200_MIN_QUOTE_VOLUME_USDT = 200_000_000.0
@@ -69,7 +85,7 @@ def default_ema200_utbot_rsi_config():
     return {
         "enabled": True,
         "timeframe": "2h",
-        "exit_timeframe": "15m",
+        "exit_timeframe": EMA200_EXIT_ON_ENTRY_TIMEFRAME,
         "ema_period": 200,
         "rsi_length": 14,
         "rsi_threshold": 50.0,
@@ -103,7 +119,87 @@ def default_ema200_utbot_rsi_config():
         "small_account_margin_ladder_percent": list(
             EMA200_SMALL_ACCOUNT_MARGIN_LADDER_PERCENT
         ),
+        # Revision 2 small-account sizing: every entry has an exchange stop
+        # at an ATR distance (capped by emergency_exit_percent) and its size is
+        # chosen so that stop loses this share of equity.  The margin ladder
+        # remains an upper cap that still shrinks after consecutive losses.
+        "small_account_risk_sizing_enabled": True,
+        "small_account_risk_percent": 1.5,
+        "min_small_account_risk_percent": 0.25,
+        "max_small_account_risk_percent": 3.0,
+        "atr_stop_period": 14,
+        "atr_stop_multiplier": 2.0,
+        "atr_stop_min_percent": 1.0,
+        # Profit stops start only above this margin ROI and lock one step
+        # (5%p) below the achieved step, so a winner keeps room to run.
+        "profit_stop_start_roi_percent": 15.0,
+        "profit_stop_step_percent": 5.0,
+        # Completed entry-timeframe candles to wait after an EMA200 exit.
+        "reentry_cooldown_candles": 1,
     }
+
+
+def ema200_effective_exit_timeframe(cfg):
+    """Resolve the exit timeframe ("entry" follows the entry timeframe)."""
+    exit_tf = str((cfg or {}).get("exit_timeframe") or "").strip().lower()
+    if exit_tf == EMA200_EXIT_ON_ENTRY_TIMEFRAME or exit_tf not in EMA200_EXIT_MODES:
+        return str((cfg or {}).get("timeframe") or EMA200_DEFAULT_ENTRY_TIMEFRAME)
+    return exit_tf
+
+
+def ema200_exit_timeframe_label(cfg):
+    exit_tf = ema200_effective_exit_timeframe(cfg)
+    if str((cfg or {}).get("exit_timeframe") or "") == EMA200_EXIT_ON_ENTRY_TIMEFRAME:
+        return f"{exit_tf}(진입봉)"
+    return exit_tf
+
+
+def ema200_atr_stop_percent(rows, *, entry_price, period=14, multiplier=2.0,
+                            min_percent=1.0, max_percent=5.0):
+    """Return the ATR stop distance in % of the entry price, or None.
+
+    Uses Wilder ATR on completed candles only (the last row is forming) and
+    clamps the result to [min_percent, max_percent].
+    """
+    entry = _finite(entry_price, 0.0)
+    closed = [row for row in (rows or [])[:-1] if row and len(row) >= 5]
+    period = max(2, int(period or 14))
+    if entry <= 0 or len(closed) < period + 1:
+        return None
+    true_ranges = []
+    for index in range(1, len(closed)):
+        high = _finite(closed[index][2], 0.0)
+        low = _finite(closed[index][3], 0.0)
+        prev_close = _finite(closed[index - 1][4], 0.0)
+        if high <= 0 or low <= 0 or prev_close <= 0:
+            return None
+        true_ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    if len(true_ranges) < period:
+        return None
+    atr = sum(true_ranges[:period]) / period
+    for value in true_ranges[period:]:
+        atr = (atr * (period - 1) + value) / period
+    if not isfinite(atr) or atr <= 0:
+        return None
+    percent = atr * float(multiplier) / entry * 100.0
+    low_bound = float(min_percent)
+    high_bound = max(low_bound, float(max_percent))
+    return max(low_bound, min(high_bound, percent))
+
+
+def ema200_reentry_allowed_at_ms(exit_time, entry_timeframe, candles=1):
+    """First moment a new entry is allowed after an exit, in epoch ms."""
+    if not exit_time or int(candles or 0) <= 0:
+        return None
+    try:
+        exited = datetime.fromisoformat(str(exit_time).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if exited.tzinfo is None:
+        exited = exited.replace(tzinfo=timezone.utc)
+    tf_ms = EMA200_TIMEFRAME_MS.get(str(entry_timeframe), 7_200_000)
+    exit_ms = int(exited.timestamp() * 1000)
+    return (exit_ms // tf_ms) * tf_ms + int(candles) * tf_ms
 
 
 def _finite(value, default):
@@ -146,7 +242,38 @@ def normalize_ema200_utbot_rsi_config(raw=None):
         else EMA200_DEFAULT_ENTRY_TIMEFRAME
     )
     exit_tf = str(cfg.get("exit_timeframe") or "").strip().lower()
-    cfg["exit_timeframe"] = exit_tf if exit_tf in EMA200_EXIT_TIMEFRAMES else "15m"
+    cfg["exit_timeframe"] = (
+        exit_tf if exit_tf in EMA200_EXIT_MODES else EMA200_EXIT_ON_ENTRY_TIMEFRAME
+    )
+    cfg["small_account_risk_sizing_enabled"] = _enabled_value(
+        cfg.get("small_account_risk_sizing_enabled", True)
+    )
+    cfg["min_small_account_risk_percent"] = float(defaults["min_small_account_risk_percent"])
+    cfg["max_small_account_risk_percent"] = float(defaults["max_small_account_risk_percent"])
+    cfg["small_account_risk_percent"] = _bounded(
+        cfg.get("small_account_risk_percent"),
+        defaults["small_account_risk_percent"],
+        cfg["min_small_account_risk_percent"],
+        cfg["max_small_account_risk_percent"],
+    )
+    try:
+        cfg["atr_stop_period"] = max(5, min(50, int(cfg.get("atr_stop_period") or 14)))
+    except (TypeError, ValueError, OverflowError):
+        cfg["atr_stop_period"] = 14
+    cfg["atr_stop_multiplier"] = _bounded(cfg.get("atr_stop_multiplier"), 2.0, 1.0, 5.0)
+    cfg["atr_stop_min_percent"] = _bounded(cfg.get("atr_stop_min_percent"), 1.0, 0.3, 5.0)
+    cfg["profit_stop_start_roi_percent"] = _bounded(
+        cfg.get("profit_stop_start_roi_percent"), 15.0, 5.0, 50.0
+    )
+    cfg["profit_stop_step_percent"] = _bounded(
+        cfg.get("profit_stop_step_percent"), 5.0, 1.0, 20.0
+    )
+    try:
+        cfg["reentry_cooldown_candles"] = max(
+            0, min(6, int(cfg.get("reentry_cooldown_candles", 1)))
+        )
+    except (TypeError, ValueError, OverflowError):
+        cfg["reentry_cooldown_candles"] = 1
     cfg["ema_period"] = 200
     cfg["rsi_threshold"] = 50.0
     cfg["utbot_key_value"] = EMA200_UTBOT_KEY_VALUE
@@ -371,6 +498,7 @@ def build_ema200_utbot_rsi_risk_plan(
     config=None,
     safety_buffer=0.98,
     consecutive_losses=0,
+    stop_percent=None,
 ):
     cfg = normalize_ema200_utbot_rsi_config(config)
     equity = max(0.0, _finite(account_equity, 0.0))
@@ -387,6 +515,42 @@ def build_ema200_utbot_rsi_risk_plan(
     margin_percent = ema200_small_account_margin_percent(consecutive_losses)
     loss_streak = int(consecutive_losses or 0)
     small_account = equity <= float(cfg["small_account_threshold_usdt"])
+    if (
+        small_account
+        and stop_percent is not None
+        and cfg["small_account_risk_sizing_enabled"]
+    ):
+        stop_pct = _finite(stop_percent, 0.0)
+        if stop_pct <= 0:
+            raise ValueError("ATR stop distance unavailable")
+        leverage = int(cfg["small_account_leverage"])
+        risk_pct = float(cfg["small_account_risk_percent"])
+        risk_budget = equity * risk_pct / 100.0
+        risk_notional = risk_budget / (stop_pct / 100.0)
+        ladder_cap = equity * margin_percent / 100.0 * leverage
+        free_cap = free * leverage * max(0.0, min(1.0, _finite(safety_buffer, 0.98)))
+        planned_notional = min(risk_notional, ladder_cap, free_cap)
+        planned_loss = planned_notional * stop_pct / 100.0
+        return {
+            "sizing_mode": "small_account_atr_risk",
+            "small_account_mode": True,
+            "small_account_threshold_usdt": float(cfg["small_account_threshold_usdt"]),
+            "consecutive_losses": loss_streak,
+            "margin_percent": margin_percent,
+            "margin_cap_percent": margin_percent,
+            "leverage": leverage,
+            "emergency_exit_percent": stop_pct,
+            "emergency_stop_required": True,
+            "strategy_exit_only": False,
+            "risk_per_trade_percent": risk_pct,
+            "risk_budget_usdt": risk_budget,
+            "uncapped_notional": risk_notional,
+            "planned_notional": planned_notional,
+            "planned_margin": planned_notional / max(leverage, 1),
+            "planned_qty": planned_notional / entry,
+            "planned_emergency_loss_usdt": planned_loss,
+            "margin_cap_applied": planned_notional + 1e-12 < risk_notional,
+        }
     if small_account:
         leverage = int(cfg["small_account_leverage"])
         target_margin = equity * margin_percent / 100.0
@@ -462,13 +626,25 @@ def calculate_ema200_utbot_rsi_emergency_stop_price(
     side,
     entry_price,
     config=None,
+    stop_percent=None,
 ):
-    """Return the strategy's immutable emergency-stop anchor for a fill."""
+    """Return the strategy's immutable emergency-stop anchor for a fill.
+
+    ``stop_percent`` is the per-entry ATR distance from the risk plan; without
+    it the configured emergency_exit_percent is used.
+    """
     cfg = normalize_ema200_utbot_rsi_config(config)
     entry = _finite(entry_price, 0.0)
     if entry <= 0:
         raise ValueError("entry_price must be positive")
-    fraction = float(cfg["emergency_exit_percent"]) / 100.0
+    percent = (
+        _finite(stop_percent, 0.0)
+        if stop_percent is not None
+        else float(cfg["emergency_exit_percent"])
+    )
+    if percent <= 0:
+        raise ValueError("stop distance must be positive")
+    fraction = percent / 100.0
     side_key = str(side or "").strip().lower()
     if side_key == "long":
         return entry * (1.0 - fraction)
@@ -581,6 +757,14 @@ def get_ema200_consecutive_losses(db, reset_payload=None):
 
 
 __all__ = (
+    "EMA200_EXIT_MODES",
+    "EMA200_EXIT_ON_ENTRY_TIMEFRAME",
+    "EMA200_STRATEGY_REVISION",
+    "EMA200_TIMEFRAME_MS",
+    "ema200_atr_stop_percent",
+    "ema200_effective_exit_timeframe",
+    "ema200_exit_timeframe_label",
+    "ema200_reentry_allowed_at_ms",
     "EMA200_DEFAULT_ENTRY_TIMEFRAME",
     "EMA200_ENTRY_TIMEFRAMES",
     "EMA200_UTBOT_RSI_STRATEGY",

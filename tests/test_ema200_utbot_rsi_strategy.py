@@ -55,8 +55,9 @@ from trading_safety.order_state import (
 @pytest.mark.parametrize('raw,expected', [
     ({'exit_timeframe': '30m'}, '30m'),
     ({'exit_timeframe': '1h'}, '1h'),
-    ({'exit_timeframe': '2h'}, '15m'),
-    ({'exit_timeframe': None}, '15m'),
+    ({'exit_timeframe': '2h'}, 'entry'),
+    ({'exit_timeframe': None}, 'entry'),
+    ({'exit_timeframe': 'entry'}, 'entry'),
 ])
 def test_ema200_exit_timeframe_normalizes_to_allowed_completed_bars(raw, expected):
     cfg = normalize_ema200_utbot_rsi_config(raw)
@@ -114,6 +115,12 @@ def test_margin_roi_profit_stop_rejects_bad_exchange_position_data():
 def test_profit_stop_ratchets_during_candle_outage_or_pause(paused):
     symbol = 'BTC/USDT:USDT'
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    # Mechanics test: legacy 5% staircase (start <= step).
+    engine._get_ema200_utbot_rsi_config = (
+        lambda *_a, **_k: normalize_ema200_utbot_rsi_config(
+            {"profit_stop_start_roi_percent": 5.0}
+        )
+    )
     engine.running = True
     engine.scanner_active_symbol = symbol
     engine.active_symbols = set()
@@ -240,6 +247,18 @@ def test_binance_v3_missing_leverage_is_resolved_from_symbol_config_before_profi
     }]
 
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
+
+    # Mechanics test: legacy 5% staircase (start <= step).
+
+    engine._get_ema200_utbot_rsi_config = (
+
+        lambda *_a, **_k: normalize_ema200_utbot_rsi_config(
+
+            {"profit_stop_start_roi_percent": 5.0}
+
+        )
+
+    )
     engine.exchange = exchange
     engine.position_cache = {}
     engine.is_upbit_mode = lambda: False
@@ -693,6 +712,12 @@ def test_profit_stop_install_path_persists_identity_then_real_audit_keeps_it(tmp
 
 def test_first_profit_stop_install_exception_is_recorded_without_new_forced_close():
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    # Mechanics test: legacy 5% staircase (start <= step).
+    engine._get_ema200_utbot_rsi_config = (
+        lambda *_a, **_k: normalize_ema200_utbot_rsi_config(
+            {"profit_stop_start_roi_percent": 5.0}
+        )
+    )
     symbol = 'BTC/USDT:USDT'
     pos = {
         'symbol': symbol, 'side': 'long', 'entryPrice': 100.0,
@@ -1301,6 +1326,12 @@ def test_partial_position_reduction_never_keeps_oversized_profit_stop_as_managed
 
 def test_profit_stop_apply_preserves_hedge_mode_failure_status():
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    # Mechanics test: legacy 5% staircase (start <= step).
+    engine._get_ema200_utbot_rsi_config = (
+        lambda *_a, **_k: normalize_ema200_utbot_rsi_config(
+            {"profit_stop_start_roi_percent": 5.0}
+        )
+    )
     symbol = 'BTC/USDT:USDT'
     pos = {
         'symbol': symbol,
@@ -1603,6 +1634,12 @@ def test_audit_duplicate_stops_keeps_most_protective_not_newest(
 
 def test_partial_close_oversized_stop_is_not_accepted_as_better_existing_stop():
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    # Mechanics test: legacy 5% staircase (start <= step).
+    engine._get_ema200_utbot_rsi_config = (
+        lambda *_a, **_k: normalize_ema200_utbot_rsi_config(
+            {"profit_stop_start_roi_percent": 5.0}
+        )
+    )
     symbol = 'BTC/USDT:USDT'
     pos = {
         'symbol': symbol,
@@ -2229,6 +2266,12 @@ def test_first_stage_expects_exchange_stop_after_profit_stop_was_installed():
 
 def test_profit_stop_raises_exchange_stop_without_lowering_existing_floor():
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    # Mechanics test: legacy 5% staircase (start <= step).
+    engine._get_ema200_utbot_rsi_config = (
+        lambda *_a, **_k: normalize_ema200_utbot_rsi_config(
+            {"profit_stop_start_roi_percent": 5.0}
+        )
+    )
     symbol = 'BTC/USDT:USDT'
     pos = {'side': 'long', 'entryPrice': 100.0, 'markPrice': 101.2,
            'leverage': 5, 'contracts': 1}
@@ -3000,9 +3043,11 @@ def test_primary_polling_uses_selected_entry_timeframe_and_exit_is_user_selectab
     engine.get_runtime_strategy_params = lambda: params
 
     assert engine._get_primary_poll_timeframe() == "4h"
+    # Revision 2 default: exit on the entry timeframe's own UT.
+    assert engine._get_exit_timeframe("BTC/USDT") == "4h"
     params["EMA200UTBotRSI2H"]["timeframe"] = "3h"  # unsupported -> default
     assert engine._get_primary_poll_timeframe() == "2h"
-    assert engine._get_exit_timeframe("BTC/USDT") == "15m"
+    assert engine._get_exit_timeframe("BTC/USDT") == "2h"
     params["EMA200UTBotRSI2H"]["exit_timeframe"] = "30m"
     assert engine._get_exit_timeframe("BTC/USDT") == "30m"
 
@@ -3036,7 +3081,8 @@ def test_open_ema200_position_keeps_selected_exit_after_strategy_changes():
     assert engine._position_entry_strategy("DOGE/USDT:USDT") == (
         EMA200_UTBOT_RSI_STRATEGY
     )
-    assert engine._get_exit_timeframe("DOGE/USDT:USDT") == "15m"
+    # EMA200 exit (entry timeframe by default), never the common 4h exit.
+    assert engine._get_exit_timeframe("DOGE/USDT:USDT") == "2h"
 
 
 def test_known_non_ema_position_is_not_reassigned_to_new_ema_config():
@@ -3979,7 +4025,7 @@ def test_telegram_exit_timeframe_buttons_update_dedicated_strategy_setting():
         for button in row
     ]
     assert {button.callback_data for button in buttons if button.callback_data.startswith('e2h:exit_tf:')} == {
-        'e2h:exit_tf:15m', 'e2h:exit_tf:30m', 'e2h:exit_tf:1h',
+        'e2h:exit_tf:entry', 'e2h:exit_tf:15m', 'e2h:exit_tf:30m', 'e2h:exit_tf:1h',
     }
     handler = next(handler for handler, _ in controller.tg_app.handlers
                    if isinstance(handler, CallbackQueryHandler))
@@ -4189,6 +4235,12 @@ def _ema_existing_stop_scanner_fixture(
     include_symbol=True,
 ):
     engine = emas.SignalEngine.__new__(emas.SignalEngine)
+    # Mechanics test: legacy 5% staircase (start <= step).
+    engine._get_ema200_utbot_rsi_config = (
+        lambda *_a, **_k: normalize_ema200_utbot_rsi_config(
+            {"profit_stop_start_roi_percent": 5.0}
+        )
+    )
     symbol = 'BTC/USDT:USDT'
     pos = {
         'symbol': symbol,
@@ -4596,7 +4648,7 @@ def test_missing_symbol_external_stop_is_not_protective_winner():
 
 @pytest.mark.parametrize("raw,expected", [
     ("1h", "1h"), ("2h", "2h"), ("4h", "4h"), ("6h", "6h"), ("8h", "8h"),
-    ("12h", "12h"), ("3h", "2h"), ("1d", "2h"), (None, "2h"), ("4H", "4h"),
+    ("12h", "12h"), ("3h", "2h"), ("1d", "1d"), ("1w", "2h"), (None, "2h"), ("4H", "4h"),
 ])
 def test_ema200_entry_timeframe_normalizes_to_allowed_completed_bars(raw, expected):
     assert normalize_ema200_utbot_rsi_config({"timeframe": raw})["timeframe"] == expected
@@ -4613,7 +4665,7 @@ def test_telegram_entry_timeframe_buttons_update_dedicated_strategy_setting():
         for button in buttons if button.callback_data.startswith("e2h:entry_tf:")
     }
     assert set(entry_buttons) == {
-        f"e2h:entry_tf:{tf}" for tf in ("1h", "2h", "4h", "6h", "8h", "12h")
+        f"e2h:entry_tf:{tf}" for tf in ("1h", "2h", "4h", "6h", "8h", "12h", "1d")
     }
     assert entry_buttons["e2h:entry_tf:2h"].startswith("✅")  # default selection
 

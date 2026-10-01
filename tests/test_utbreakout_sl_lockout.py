@@ -140,6 +140,8 @@ def test_ema_direct_entry_is_blocked_during_symbol_reentry_wait(tmp_path):
     engine = _build_engine(tmp_path)
     engine.get_runtime_strategy_params = lambda: {
         'active_strategy': emas.EMA200_UTBOT_RSI_STRATEGY,
+        # This test targets the per-symbol 1h wait, not the strategy cooldown.
+        'EMA200UTBotRSI2H': {'reentry_cooldown_candles': 0},
     }
     async def volume_allowed(_symbol):
         return True, ''

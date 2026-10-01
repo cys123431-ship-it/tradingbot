@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from .decision_journal import STRATEGY, journal_event
 from .ema200_utbot_rsi import (
+    EMA200_TIMEFRAME_MS,
     EMA200_UTBOT_RSI_DISPLAY_NAME,
     EMA200_UTBOT_RSI_STRATEGY,
 )
@@ -2483,11 +2484,11 @@ class SignalCandleMixin:
                     try:
                         trade = self.db.get_latest_open_trade(symbol) or {}
                         entry_text = trade.get('entry_time')
-                        if entry_text and tf in {'15m', '30m', '1h'}:
+                        if entry_text and tf in EMA200_TIMEFRAME_MS:
                             entry_dt = datetime.fromisoformat(str(entry_text))
                             if entry_dt.tzinfo is None:
                                 entry_dt = entry_dt.replace(tzinfo=timezone.utc)
-                            bar_ms = {'15m': 900000, '30m': 1800000, '1h': 3600000}[tf]
+                            bar_ms = EMA200_TIMEFRAME_MS[tf]
                             closed_at_ms = int(df.iloc[-2]['timestamp']) + bar_ms
                             if closed_at_ms <= entry_dt.timestamp() * 1000:
                                 should_exit_long = should_exit_short = False

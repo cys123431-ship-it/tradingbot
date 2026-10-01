@@ -342,7 +342,11 @@ async def _market_replay(ctrl, trade, exit_tf, ut_params, end):
     if exchange is None or entry_at is None:
         return None
     exit_at = _aware(trade.get("exit_time")) or end
-    tf_ms = {"15m": 900_000, "30m": 1_800_000, "1h": 3_600_000}.get(exit_tf, 900_000)
+    tf_ms = {
+        "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000,
+        "4h": 14_400_000, "6h": 21_600_000, "8h": 28_800_000,
+        "12h": 43_200_000, "1d": 86_400_000,
+    }.get(exit_tf, 900_000)
     since = int(entry_at.timestamp() * 1000) - 320 * tf_ms
     limit = min(1500, int((exit_at - entry_at).total_seconds() * 1000 / tf_ms) + 330)
     try:
@@ -489,7 +493,9 @@ async def collect_daily_report_inputs(ctrl, start, end, *, market_replay=True, l
 
     inputs["market_replay"] = {}
     if market_replay:
-        exit_tf = str(inputs["config"].get("exit_timeframe") or "15m")
+        exit_tf = str(inputs["config"].get("exit_timeframe") or "entry")
+        if exit_tf not in ("15m", "30m", "1h"):
+            exit_tf = str(inputs["config"].get("timeframe") or "2h")
         ut_params = {
             "key_value": float(inputs["config"].get("utbot_key_value", 1.0) or 1.0),
             "atr_period": int(inputs["config"].get("utbot_atr_period", 10) or 10),
