@@ -33,9 +33,11 @@ from .ema200_utbot_rsi import (
     EMA200_TIMEFRAME_MS,
     ema200_exit_timeframe_label,
 )
+from .ema200_utbot_rsi import resolve_ema200_account_mode
 from .ema200_session import (
     EMA200_MORNING_RESET_STATE_KEY,
     build_ema200_session_status_text,
+    current_ema200_account_mode,
     ema200_morning_reset_availability,
     perform_ema200_morning_entry_reset,
 )
@@ -199,6 +201,11 @@ class ControllerEMA200UTBotRSIMixin:
                 # Preview at the maximum ATR stop distance; the live entry
                 # uses the actual ATR, which can only make the stop tighter.
                 stop_percent=(cfg["emergency_exit_percent"] if atr_mode else None),
+                account_mode=resolve_ema200_account_mode(
+                    equity,
+                    current_ema200_account_mode(self._ema200_session_store()),
+                    cfg,
+                ),
             )
         except Exception:
             return (
@@ -214,9 +221,15 @@ class ControllerEMA200UTBotRSIMixin:
         margin_pct = margin / equity * 100.0 if equity > 0 else 0.0
         cap_note = " (가용잔고 상한 적용)" if plan.get("margin_cap_applied") else ""
 
-        if plan.get("sizing_mode") == "small_account_atr_risk":
+        if plan.get("sizing_mode") in ("small_account_atr_risk", "micro_account_atr_risk"):
+            mode_line = (
+                "계좌 모드: 극소액 (100 USDT 미만 진입 → 500 USDT 초과까지, 공격적)\n"
+                if plan.get("account_mode") == "micro"
+                else "계좌 모드: 일반 소액 (revision 2)\n"
+            )
             return (
                 f"현재 계좌: {equity:.2f} USDT → 1,000 이하 소액계좌 (ATR 리스크 방식)\n"
+                f"{mode_line}"
                 f"1회 손실: 계좌의 {float(plan['risk_per_trade_percent']):g}% = "
                 f"{float(plan['risk_budget_usdt']):.2f} USDT (모든 진입에 거래소 손절)\n"
                 f"손절 거리: 진입봉 ATR({cfg['atr_stop_period']})×{cfg['atr_stop_multiplier']:g}, "
@@ -728,6 +741,17 @@ class ControllerEMA200UTBotRSIMixin:
         )
         if streak_text:
             text += f"\n⚠️ 연속손실 조회 실패: {streak_text}"
+        mode = resolve_ema200_account_mode(
+            equity, current_ema200_account_mode(store), cfg
+        ) if equity is not None else current_ema200_account_mode(store)
+        text += (
+            "\n🎯 계좌 모드: "
+            + (
+                f"극소액 (1회 손실 {cfg['micro_risk_percent']:g}%, 500 USDT 초과 시 일반 전환)"
+                if mode == "micro"
+                else f"일반 소액 revision 2 (1회 손실 {cfg['small_account_risk_percent']:g}%, 100 USDT 미만 시 극소액)"
+            )
+        )
         text += f"\n(조회 {datetime.now(timezone.utc).astimezone(EMA200_KST):%m-%d %H:%M} KST)"
         return text
 

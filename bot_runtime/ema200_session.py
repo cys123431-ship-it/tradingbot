@@ -21,6 +21,70 @@ from .ema200_utbot_rsi import (
 )
 
 EMA200_MORNING_RESET_STATE_KEY = "ema200_morning_entry_state_reset"
+
+
+def update_ema200_account_mode(store, equity, config=None, now=None):
+    """Resolve the account mode with hysteresis and persist changes.
+
+    Returns (mode, previous_mode, changed).  Without a store the mode is
+    resolved statelessly (no hysteresis memory).
+    """
+    from .ema200_utbot_rsi import (
+        EMA200_ACCOUNT_MODE_STATE_KEY,
+        resolve_ema200_account_mode,
+    )
+
+    previous_state = None
+    if store is not None:
+        try:
+            previous_state = store.get_runtime_state(EMA200_ACCOUNT_MODE_STATE_KEY)
+        except Exception:
+            previous_state = None
+    previous = previous_state.get("mode") if isinstance(previous_state, dict) else None
+    mode = resolve_ema200_account_mode(equity, previous, config)
+    changed = mode != previous
+    if changed and store is not None:
+        store.set_runtime_state(EMA200_ACCOUNT_MODE_STATE_KEY, {
+            "mode": mode,
+            "previous_mode": previous,
+            "changed_at": _utc_now(now).isoformat(),
+            "equity_usdt": float(equity or 0.0),
+        })
+        journal_event(
+            OPERATIONS, "account_mode_changed", mode=mode,
+            previous_mode=previous, equity_usdt=float(equity or 0.0),
+            code_ref="ema200_session.py:update_ema200_account_mode",
+        )
+    return mode, previous, changed
+
+
+def ema200_account_mode_notice(mode, cfg, equity):
+    """Telegram text for an account-mode switch."""
+    if mode == "micro":
+        return (
+            "🔀 EMA200 계좌 모드: 극소액 모드\n"
+            "선물 잔고 100 USDT 미만 → 500 USDT 초과까지 유지\n"
+            f"1회 손실 계좌의 {float(cfg['micro_risk_percent']):g}% / 레버리지 유지 / 손절 항상\n"
+            f"수익 Stop: ROI {float(cfg['micro_profit_stop_start_roi_percent']):g}% 초과부터\n"
+            f"잔고 {float(equity or 0.0):.2f} USDT"
+        )
+    return (
+        "🔀 EMA200 계좌 모드: 일반 소액 모드 (revision 2)\n"
+        f"1회 손실 계좌의 {float(cfg['small_account_risk_percent']):g}%\n"
+        f"잔고 {float(equity or 0.0):.2f} USDT"
+    )
+
+
+def current_ema200_account_mode(store):
+    from .ema200_utbot_rsi import EMA200_ACCOUNT_MODE_STATE_KEY
+
+    if store is None:
+        return None
+    try:
+        state = store.get_runtime_state(EMA200_ACCOUNT_MODE_STATE_KEY)
+    except Exception:
+        return None
+    return state.get("mode") if isinstance(state, dict) else None
 EMA200_MORNING_RESET_CUTOFF_HOUR_KST = 12
 
 
@@ -197,6 +261,9 @@ def build_ema200_session_status_text(
 
 
 __all__ = (
+    "current_ema200_account_mode",
+    "ema200_account_mode_notice",
+    "update_ema200_account_mode",
     "EMA200_MORNING_RESET_STATE_KEY",
     "EMA200_MORNING_RESET_CUTOFF_HOUR_KST",
     "build_ema200_session_status_text",

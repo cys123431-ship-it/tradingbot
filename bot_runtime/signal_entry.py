@@ -5,8 +5,13 @@ from __future__ import annotations
 from utbreakout.dynamic_leverage import apply_dynamic_leverage_to_plan
 
 from .decision_journal import OPERATIONS, STRATEGY, journal_event
+from .ema200_session import (
+    ema200_account_mode_notice,
+    update_ema200_account_mode,
+)
 from .ema200_utbot_rsi import (
     EMA200_KST,
+    ema200_micro_min_notional_bump,
     ema200_atr_stop_percent,
     ema200_effective_exit_timeframe,
     ema200_exit_timeframe_label,
@@ -1215,6 +1220,20 @@ class SignalEntryMixin:
                         f'({type(streak_exc).__name__}: {streak_exc})'
                     )
                     return
+                ema200_account_mode, ema200_previous_mode, ema200_mode_changed = (
+                    update_ema200_account_mode(
+                        streak_store, sizing_equity, ema200_risk_cfg
+                    )
+                )
+                if ema200_mode_changed:
+                    try:
+                        await self.ctrl.notify(
+                            ema200_account_mode_notice(
+                                ema200_account_mode, ema200_risk_cfg, sizing_equity
+                            )
+                        )
+                    except Exception:
+                        logger.debug("EMA200 account mode notify skipped", exc_info=True)
                 ema200_stop_percent = None
                 if (
                     ema200_risk_cfg['small_account_risk_sizing_enabled']
@@ -1259,6 +1278,7 @@ class SignalEntryMixin:
                     safety_buffer=safety_buffer,
                     consecutive_losses=ema200_loss_streak,
                     stop_percent=ema200_stop_percent,
+                    account_mode=ema200_account_mode,
                 )
                 lev = int(ema200_risk_plan['leverage'])
                 target_notional = float(ema200_risk_plan['planned_notional'])
@@ -1372,6 +1392,34 @@ class SignalEntryMixin:
                     min_notional = 100.0
 
             max_notional = free * lev * safety_buffer
+            if (
+                min_notional > 0
+                and target_notional < min_notional
+                and active_strategy == EMA200_UTBOT_RSI_STRATEGY
+            ):
+                bumped_notional = ema200_micro_min_notional_bump(
+                    ema200_risk_plan,
+                    min_notional,
+                    max_notional,
+                    ema200_risk_cfg['micro_min_notional_max_risk_multiple'],
+                )
+                if bumped_notional is not None:
+                    stop_fraction = float(ema200_risk_plan['emergency_exit_percent']) / 100.0
+                    journal_event(
+                        STRATEGY, 'micro_min_notional_bump', symbol=symbol, side=side,
+                        planned_notional=target_notional, min_notional=min_notional,
+                        bumped_notional=bumped_notional,
+                        planned_loss=float(ema200_risk_plan['planned_emergency_loss_usdt']),
+                        bumped_loss=bumped_notional * stop_fraction,
+                        code_ref='ema200_utbot_rsi.py:ema200_micro_min_notional_bump',
+                    )
+                    target_notional = bumped_notional
+                    margin_to_use = target_notional / max(float(lev), 1e-9)
+                    ema200_risk_plan['planned_notional'] = target_notional
+                    ema200_risk_plan['planned_margin'] = margin_to_use
+                    ema200_risk_plan['planned_qty'] = target_notional / max(float(price), 1e-9)
+                    ema200_risk_plan['planned_emergency_loss_usdt'] = target_notional * stop_fraction
+                    ema200_risk_plan['min_notional_bump_applied'] = True
             if min_notional > 0 and target_notional < min_notional:
                 if active_strategy == EMA200_UTBOT_RSI_STRATEGY:
                     await self.ctrl.notify(
@@ -2448,7 +2496,9 @@ class SignalEntryMixin:
                         ema200_risk_plan.get('emergency_exit_percent')
                         or ema200_risk_cfg['emergency_exit_percent']
                     )
-                    if ema200_risk_plan.get('sizing_mode') == 'small_account_atr_risk':
+                    if ema200_risk_plan.get('sizing_mode') in (
+                        'small_account_atr_risk', 'micro_account_atr_risk'
+                    ):
                         emergency_label = (
                             f"ATR {float(ema200_risk_cfg['atr_stop_multiplier']):.1f}배 손절 / "
                             f"1회 손실 계좌의 {float(ema200_risk_plan['risk_per_trade_percent']):.2f}% "
@@ -2481,7 +2531,9 @@ class SignalEntryMixin:
                         f"🛟 비상 손절 가격거리: 진입가 대비 {emergency_pct:.2f}% "
                         f"({emergency_label})\n"
                         f"정상 청산: 완료된 {ema200_exit_timeframe_label(ema200_risk_cfg)}봉 UT Bot 반대 신호\n"
-                        f"수익 보호: 증거금 수익률 {float(ema200_risk_cfg['profit_stop_start_roi_percent']):.0f}% 초과부터 "
+                        f"{'계좌 모드: 극소액 (공격적)' + chr(10) if ema200_risk_plan.get('account_mode') == 'micro' else ''}"
+                        f"수익 보호: 증거금 수익률 "
+                        f"{float(ema200_risk_cfg['micro_profit_stop_start_roi_percent'] if ema200_risk_plan.get('account_mode') == 'micro' else ema200_risk_cfg['profit_stop_start_roi_percent']):.0f}% 초과부터 "
                         f"{float(ema200_risk_cfg['profit_stop_step_percent']):.0f}%p 계단 (한 계단 아래 잠금)"
                     )
                 else:

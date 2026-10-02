@@ -33,6 +33,15 @@ EMA200_ENTRY_TIMEFRAMES = ("1h", "2h", "4h", "6h", "8h", "12h", "1d")
 EMA200_EXIT_ON_ENTRY_TIMEFRAME = "entry"
 EMA200_EXIT_MODES = (EMA200_EXIT_ON_ENTRY_TIMEFRAME,) + EMA200_EXIT_TIMEFRAMES
 EMA200_STRATEGY_REVISION = 2
+# Micro-account mode: below 100 USDT futures equity the strategy risks more
+# per trade to grow the seed; it stays on until equity exceeds 500 USDT, then
+# the revision-2 small-account rules apply (hysteresis between 100 and 500).
+EMA200_MICRO_ACCOUNT_ENTER_BELOW_USDT = 100.0
+EMA200_MICRO_ACCOUNT_EXIT_ABOVE_USDT = 500.0
+EMA200_MICRO_MARGIN_CAP_LADDER_PERCENT = (100.0, 75.0, 50.0, 40.0, 30.0)
+EMA200_ACCOUNT_MODE_STATE_KEY = "ema200_account_mode"
+EMA200_ACCOUNT_MODE_MICRO = "micro"
+EMA200_ACCOUNT_MODE_STANDARD = "standard"
 EMA200_TIMEFRAME_MS = {
     "15m": 900_000,
     "30m": 1_800_000,
@@ -136,7 +145,67 @@ def default_ema200_utbot_rsi_config():
         "profit_stop_step_percent": 5.0,
         # Completed entry-timeframe candles to wait after an EMA200 exit.
         "reentry_cooldown_candles": 1,
+        # Micro-account mode (< 100 USDT until > 500 USDT): 5% equity risk per
+        # trade, same leverage, always an exchange stop, a milder loss ladder,
+        # later profit stops, and a bounded bump up to the exchange minimum.
+        "micro_account_enabled": True,
+        "micro_risk_percent": 5.0,
+        "micro_profit_stop_start_roi_percent": 25.0,
+        "micro_min_notional_max_risk_multiple": 1.5,
     }
+
+
+def resolve_ema200_account_mode(equity, previous_mode=None, config=None):
+    """Return "micro" or "standard" with 100/500 USDT hysteresis."""
+    cfg = config if isinstance(config, dict) else {}
+    if not _enabled_value(cfg.get("micro_account_enabled", True)):
+        return EMA200_ACCOUNT_MODE_STANDARD
+    value = _finite(equity, 0.0)
+    if 0 < value < EMA200_MICRO_ACCOUNT_ENTER_BELOW_USDT:
+        return EMA200_ACCOUNT_MODE_MICRO
+    if value > EMA200_MICRO_ACCOUNT_EXIT_ABOVE_USDT:
+        return EMA200_ACCOUNT_MODE_STANDARD
+    if previous_mode in (EMA200_ACCOUNT_MODE_MICRO, EMA200_ACCOUNT_MODE_STANDARD):
+        return previous_mode
+    return EMA200_ACCOUNT_MODE_STANDARD
+
+
+def ema200_micro_margin_cap_percent(consecutive_losses):
+    ladder = EMA200_MICRO_MARGIN_CAP_LADDER_PERCENT
+    try:
+        streak = max(0, int(consecutive_losses or 0))
+    except (TypeError, ValueError, OverflowError):
+        streak = 0
+    return float(ladder[min(streak, len(ladder) - 1)])
+
+
+def ema200_profit_stop_start_for_mode(cfg, account_mode):
+    if account_mode == EMA200_ACCOUNT_MODE_MICRO:
+        return float(cfg["micro_profit_stop_start_roi_percent"])
+    return float(cfg["profit_stop_start_roi_percent"])
+
+
+def ema200_micro_min_notional_bump(plan, min_notional, max_notional, max_risk_multiple):
+    """Return a notional raised to the exchange minimum, or None.
+
+    Allowed only in micro mode and only if the stop loss at that size stays
+    within ``max_risk_multiple`` x the planned risk budget and the margin
+    available supports it.
+    """
+    if not isinstance(plan, dict) or plan.get("sizing_mode") != "micro_account_atr_risk":
+        return None
+    minimum = _finite(min_notional, 0.0)
+    ceiling = _finite(max_notional, 0.0)
+    stop_fraction = _finite(plan.get("emergency_exit_percent"), 0.0) / 100.0
+    budget = _finite(plan.get("risk_budget_usdt"), 0.0)
+    if minimum <= 0 or stop_fraction <= 0 or budget <= 0:
+        return None
+    bumped = minimum * 1.01  # survive step-size rounding down
+    if bumped > ceiling:
+        return None
+    if bumped * stop_fraction > budget * float(max_risk_multiple) + 1e-12:
+        return None
+    return bumped
 
 
 def ema200_effective_exit_timeframe(cfg):
@@ -274,6 +343,14 @@ def normalize_ema200_utbot_rsi_config(raw=None):
         )
     except (TypeError, ValueError, OverflowError):
         cfg["reentry_cooldown_candles"] = 1
+    cfg["micro_account_enabled"] = _enabled_value(cfg.get("micro_account_enabled", True))
+    cfg["micro_risk_percent"] = _bounded(cfg.get("micro_risk_percent"), 5.0, 1.0, 5.0)
+    cfg["micro_profit_stop_start_roi_percent"] = _bounded(
+        cfg.get("micro_profit_stop_start_roi_percent"), 25.0, 5.0, 60.0
+    )
+    cfg["micro_min_notional_max_risk_multiple"] = _bounded(
+        cfg.get("micro_min_notional_max_risk_multiple"), 1.5, 1.0, 2.0
+    )
     cfg["ema_period"] = 200
     cfg["rsi_threshold"] = 50.0
     cfg["utbot_key_value"] = EMA200_UTBOT_KEY_VALUE
@@ -499,6 +576,7 @@ def build_ema200_utbot_rsi_risk_plan(
     safety_buffer=0.98,
     consecutive_losses=0,
     stop_percent=None,
+    account_mode=None,
 ):
     cfg = normalize_ema200_utbot_rsi_config(config)
     equity = max(0.0, _finite(account_equity, 0.0))
@@ -524,7 +602,12 @@ def build_ema200_utbot_rsi_risk_plan(
         if stop_pct <= 0:
             raise ValueError("ATR stop distance unavailable")
         leverage = int(cfg["small_account_leverage"])
-        risk_pct = float(cfg["small_account_risk_percent"])
+        micro = account_mode == EMA200_ACCOUNT_MODE_MICRO
+        if micro:
+            risk_pct = float(cfg["micro_risk_percent"])
+            margin_percent = ema200_micro_margin_cap_percent(loss_streak)
+        else:
+            risk_pct = float(cfg["small_account_risk_percent"])
         risk_budget = equity * risk_pct / 100.0
         risk_notional = risk_budget / (stop_pct / 100.0)
         ladder_cap = equity * margin_percent / 100.0 * leverage
@@ -532,7 +615,8 @@ def build_ema200_utbot_rsi_risk_plan(
         planned_notional = min(risk_notional, ladder_cap, free_cap)
         planned_loss = planned_notional * stop_pct / 100.0
         return {
-            "sizing_mode": "small_account_atr_risk",
+            "sizing_mode": "micro_account_atr_risk" if micro else "small_account_atr_risk",
+            "account_mode": EMA200_ACCOUNT_MODE_MICRO if micro else EMA200_ACCOUNT_MODE_STANDARD,
             "small_account_mode": True,
             "small_account_threshold_usdt": float(cfg["small_account_threshold_usdt"]),
             "consecutive_losses": loss_streak,
@@ -757,6 +841,16 @@ def get_ema200_consecutive_losses(db, reset_payload=None):
 
 
 __all__ = (
+    "EMA200_ACCOUNT_MODE_MICRO",
+    "EMA200_ACCOUNT_MODE_STANDARD",
+    "EMA200_ACCOUNT_MODE_STATE_KEY",
+    "EMA200_MICRO_ACCOUNT_ENTER_BELOW_USDT",
+    "EMA200_MICRO_ACCOUNT_EXIT_ABOVE_USDT",
+    "EMA200_MICRO_MARGIN_CAP_LADDER_PERCENT",
+    "ema200_micro_margin_cap_percent",
+    "ema200_micro_min_notional_bump",
+    "ema200_profit_stop_start_for_mode",
+    "resolve_ema200_account_mode",
     "EMA200_EXIT_MODES",
     "EMA200_EXIT_ON_ENTRY_TIMEFRAME",
     "EMA200_STRATEGY_REVISION",

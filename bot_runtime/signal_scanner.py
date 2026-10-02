@@ -18,6 +18,8 @@ from .ema200_candidate_selector import (
     rank_ema200_candidates,
 )
 from .ema200_profit_stop import ema200_profit_stop_target
+from .ema200_session import current_ema200_account_mode
+from .ema200_utbot_rsi import ema200_profit_stop_start_for_mode
 
 from utbreakout.adaptive_breakout_trend import (
     ADAPTIVE_BREAKOUT_TREND_STRATEGY,
@@ -230,7 +232,10 @@ class SignalScannerMixin:
             return
         profit_cfg = self._get_ema200_utbot_rsi_config()
         profit_step = float(profit_cfg['profit_stop_step_percent'])
-        profit_start = float(profit_cfg['profit_stop_start_roi_percent'])
+        profit_start = ema200_profit_stop_start_for_mode(
+            profit_cfg,
+            current_ema200_account_mode(getattr(self, 'trading_state_store', None)),
+        )
         target = ema200_profit_stop_target(
             side, entry_price, mark_price, leverage,
             step_percent=profit_step,
