@@ -16,6 +16,7 @@ from .controller_automatic_controls import (
     AUTOMATIC_SCAN_SCOPE_TRADIFI,
 )
 from .ema200_session import ema200_entry_count_since
+from .weekend_override import active_weekend_override
 
 
 AUTOMATIC_WEEKEND_ENTRY_BLOCK_EFFECTIVE_DATE = date(2026, 9, 28)
@@ -96,7 +97,13 @@ class SignalAutomaticControlsMixin:
     _AUTOMATIC_ENTRY_EQUITY_CACHE_TTL_SEC = 15.0
 
     def _automatic_weekend_entry_block_reason(self, now=None):
-        return automatic_weekend_entry_block_reason(now=now)
+        reason = automatic_weekend_entry_block_reason(now=now)
+        if reason and active_weekend_override(
+            getattr(self, "trading_state_store", None), now
+        ) is not None:
+            # The operator's one-shot Saturday override (24h) is active.
+            return None
+        return reason
 
     def _automatic_entry_limit_cached_equity(self):
         cached = getattr(self, '_automatic_entry_limit_equity_cache', None)

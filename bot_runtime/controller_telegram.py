@@ -2156,7 +2156,7 @@ class ControllerTelegramMixin:
                 KeyboardButton("/trend"),
                 KeyboardButton("/scanner"),
             ],
-            [KeyboardButton("/emastatus"), KeyboardButton("/emareset"), KeyboardButton("/dailyreport")],
+            [KeyboardButton("/emastatus"), KeyboardButton("/emareset"), KeyboardButton("/dailyreport"), KeyboardButton("/weekend")],
             [KeyboardButton("/setup"), KeyboardButton("/customentry"), KeyboardButton("/options")],
             [KeyboardButton("/status"), KeyboardButton("/stats"), KeyboardButton("/log")],
         ]

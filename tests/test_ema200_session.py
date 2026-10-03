@@ -230,5 +230,5 @@ def test_main_keyboard_shows_ema_panel_and_hides_history_help():
     assert "/history" not in labels
     assert "/help" not in labels
     assert [b.text for b in keyboard.keyboard[2]] == [
-        "/emastatus", "/emareset", "/dailyreport",
+        "/emastatus", "/emareset", "/dailyreport", "/weekend",
     ]

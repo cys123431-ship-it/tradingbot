@@ -6030,6 +6030,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 /status - 현재 상태 조회
 /emastatus - EMA200 소액계좌 전용 상태 (초기화 후·오늘 진입/손익)
 /emareset - 오전 진입초기화 (한국시간 오전, 하루 1회)
+/weekend - 주말 자동진입 허용 (한국시간 토요일에만, 누른 시점부터 24시간, 주말 1회)
 /dailyreport - 일일 분석 리포트 txt (오늘 09:00~지금, `/dailyreport yesterday`는 전일 09:00~오늘 09:00)
 /history - 지난 상태 조회
 /stats - 통계

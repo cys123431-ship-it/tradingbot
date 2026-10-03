@@ -9,6 +9,12 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackQueryHandler, CommandHandler
 
 from .ema200_session import ema200_entry_count_since
+from .weekend_override import (
+    WEEKEND_OVERRIDE_HOURS,
+    activate_weekend_override,
+    weekend_override_availability,
+    weekend_override_status_text,
+)
 
 
 AUTOMATIC_DAILY_TRADE_LIMIT_BASE = 5
@@ -230,7 +236,76 @@ class ControllerAutomaticTradingControlsMixin:
         if hasattr(target, "reply_text"):
             await target.reply_text(text, reply_markup=keyboard)
 
+    def _weekend_override_store(self):
+        engine = (getattr(self, "engines", {}) or {}).get("signal")
+        return (
+            getattr(engine, "trading_state_store", None) if engine else None
+        ) or getattr(self, "trading_state_store", None)
+
+    def _weekend_override_prompt(self, notice=None):
+        store = self._weekend_override_store()
+        allowed, reason = weekend_override_availability(store)
+        text = (
+            (f"{notice}\n\n" if notice else "")
+            + "🗓 주말 자동진입 허용\n\n"
+            + f"{weekend_override_status_text(store)}\n\n"
+            + "한국시간 토요일에 누르면 그 시점부터 "
+            + f"{WEEKEND_OVERRIDE_HOURS}시간 동안 신규 자동진입을 허용합니다.\n"
+            + "주말마다 한 번만 사용할 수 있고, 청산·손절 관리는 항상 동작합니다.\n\n"
+            + f"현재: {'사용 가능' if allowed else reason}"
+        )
+        buttons = [[InlineKeyboardButton("🔄 상태", callback_data="wkd:status")]]
+        if allowed:
+            buttons.insert(0, [
+                InlineKeyboardButton("✅ 허용 실행", callback_data="wkd:do"),
+            ])
+        return text, InlineKeyboardMarkup(buttons)
+
+    async def _run_weekend_override(self):
+        lock = getattr(self, "_weekend_override_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._weekend_override_lock = lock
+        async with lock:
+            try:
+                payload = activate_weekend_override(self._weekend_override_store())
+            except ValueError as exc:
+                return f"⛔ 주말 자동진입 허용 불가: {exc}"
+            except Exception as exc:
+                return f"❌ 주말 자동진입 허용 실패: {type(exc).__name__}: {exc}"
+        return (
+            f"✅ 주말 자동진입 허용 ({WEEKEND_OVERRIDE_HOURS}시간)\n"
+            f"{weekend_override_status_text(self._weekend_override_store())}"
+            if payload
+            else "⛔ 주말 자동진입 허용 실패"
+        )
+
     def _register_automatic_trading_control_handlers(self, owner_only):
+        async def weekend_cmd(update, context):
+            if update and update.message:
+                text, markup = self._weekend_override_prompt()
+                await update.message.reply_text(text, reply_markup=markup)
+
+        async def weekend_callback(update, context):
+            query = getattr(update, "callback_query", None)
+            if query is None:
+                return
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            data = str(getattr(query, "data", "") or "")
+            notice = await self._run_weekend_override() if data == "wkd:do" else None
+            text, markup = self._weekend_override_prompt(notice)
+            await query.edit_message_text(text, reply_markup=markup)
+
+        self.tg_app.add_handler(
+            CommandHandler("weekend", owner_only(weekend_cmd))
+        )
+        self.tg_app.add_handler(
+            CallbackQueryHandler(owner_only(weekend_callback), pattern=r"^wkd:")
+        )
+
         async def automatic_controls_cmd(update, context):
             if update and update.message:
                 await self._send_automatic_trading_controls(update.message)

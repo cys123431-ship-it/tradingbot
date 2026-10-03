@@ -445,3 +445,30 @@ if "ccxt" in sys.modules:
     ccxt.InvalidOrder = InvalidOrder
     ccxt.OrderNotFound = OrderNotFound
     ccxt.binanceusdm = binanceusdm
+
+
+# ---------------------------------------------------------------------
+# Wall-clock independence for the KST weekend entry block
+# ---------------------------------------------------------------------
+# Entry-path tests run the real automatic-entry guards with the current
+# clock; on a Korean Saturday/Sunday every one of them would hit the weekend
+# block. Calls without an explicit ``now`` are treated as a weekday here;
+# tests that exercise the weekend rule pass ``now`` (or stub the guard) and
+# keep the real behaviour.
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True)
+def _weekday_wall_clock_for_weekend_guard(monkeypatch):
+    try:
+        from bot_runtime import signal_automatic_controls as _controls
+    except Exception:
+        yield
+        return
+    original = _controls.automatic_weekend_entry_block_reason
+
+    def _guard(now=None):
+        return None if now is None else original(now=now)
+
+    monkeypatch.setattr(_controls, "automatic_weekend_entry_block_reason", _guard)
+    yield
