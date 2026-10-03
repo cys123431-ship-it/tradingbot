@@ -298,3 +298,57 @@ def test_main_keyboard_has_btcoptions_button():
     controller = emas.MainController.__new__(emas.MainController)
     labels = [b.text for row in controller._build_main_keyboard().keyboard for b in row]
     assert "/btcoptions" in labels
+
+
+# ----- stale candidate / scan history after switching universe -----
+
+
+def test_switching_to_btc_only_clears_old_sol_candidate_and_scan_stats(tmp_path):
+    cfg = {"underlyings": ["SOLUSDT"]}
+    service, _ = _service(tmp_path, cfg, mark=10.0, bid=10.0)
+    service.state["active_position"] = None
+    service._sync_scan_universe()
+    service.state["last_candidate"] = {"symbol": "SOL-260828-88-C", "underlying": "SOLUSDT"}
+    service.state["recent_scan_outcomes"] = ["ORDERABLE_CANDIDATE"] * 3
+    service._save_state()
+
+    assert service._sync_scan_universe() is False  # same universe keeps history
+
+    cfg["btc_only"] = True
+    status = asyncio.run(service.status_snapshot(refresh=False))
+    assert status["last_candidate"] is None
+    assert status["scan_outcomes_window"] == 0
+    assert service.state["scan_universe"] == ["BTCUSDT"]
+
+
+def test_status_hides_expired_candidate_and_shows_found_time():
+    from bot_runtime.controller_options import (
+        _candidate_expired,
+        _candidate_found_text,
+    )
+
+    old = {"symbol": "SOL-260828-88-C"}
+    assert _candidate_expired(old) is True
+    fresh = {
+        "symbol": "BTC-991231-60000-C",
+        "expiry_date_ms": 4_102_444_800_000,
+        "found_at_ms": 1_791_000_000_000,
+    }
+    assert _candidate_expired(fresh) is False
+    assert _candidate_found_text(fresh).endswith("KST 발견")
+    assert _candidate_found_text({}) == "발견 시각 미기록"
+
+
+def test_format_status_drops_expired_candidate():
+    controller = _controller({"btc_only": True})
+
+    async def snapshot(refresh=True):
+        return {
+            "enabled": True,
+            "last_candidate": {"symbol": "SOL-260828-88-C", "signal_score": 0.81},
+        }
+
+    controller.options_trading_service.status_snapshot = snapshot
+    text = asyncio.run(controller._format_options_status(refresh=True))
+    assert "SOL-260828-88-C" not in text
+    assert "최근 후보" not in text

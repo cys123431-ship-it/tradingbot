@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
@@ -23,6 +26,7 @@ from options_trading.config import (
 
 
 logger = logging.getLogger(__name__)
+_KST = ZoneInfo("Asia/Seoul")
 
 
 class ControllerOptionsMixin:
@@ -123,11 +127,13 @@ class ControllerOptionsMixin:
                 )
         else:
             lines.extend(["", "보유 중: 없음"])
+        if candidate and _candidate_expired(candidate):
+            candidate = {}
         if candidate:
             lines.extend(
                 [
                     "",
-                    "최근 후보:",
+                    f"최근 후보 ({_candidate_found_text(candidate)}):",
                     f"{candidate.get('symbol')} · {candidate.get('strategy') or 'ADAPTIVE_TREND'} · 신호 {_safe_number(candidate.get('signal_score')):+.2f}",
                     f"Delta {_safe_number(candidate.get('delta')):.2f}/{_safe_number(candidate.get('target_delta')):.2f} · DTE {_safe_number(candidate.get('dte_days')):.1f}/{_safe_number(candidate.get('target_dte_days')):.1f}일",
                     f"Spread {_safe_number(candidate.get('spread_pct')) * 100:.1f}% · IV/RV {_safe_number(candidate.get('iv_to_realized')):.2f} · 순기대수익 {_safe_number(candidate.get('net_expected_edge_pct')) * 100:+.1f}%",
@@ -524,6 +530,36 @@ class ControllerOptionsMixin:
                 logger.exception("Options scheduler cycle failed")
             interval = self._options_service().config().get("manage_interval_seconds", 10)
             await asyncio.sleep(max(5, int(interval)))
+
+
+def _candidate_expiry_ms(candidate):
+    expiry = int(_safe_number(candidate.get("expiry_date_ms")))
+    if expiry > 0:
+        return expiry
+    # Older summaries lack the expiry: parse it from e.g. "SOL-260828-88-C".
+    parts = str(candidate.get("symbol") or "").split("-")
+    if len(parts) >= 2 and len(parts[1]) == 6 and parts[1].isdigit():
+        try:
+            day = datetime.strptime(parts[1], "%y%m%d").replace(
+                hour=8, tzinfo=timezone.utc
+            )
+        except ValueError:
+            return 0
+        return int(day.timestamp() * 1000)
+    return 0
+
+
+def _candidate_expired(candidate, now_ms=None):
+    expiry = _candidate_expiry_ms(candidate)
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    return bool(expiry) and expiry <= now_ms
+
+
+def _candidate_found_text(candidate):
+    found = int(_safe_number(candidate.get("found_at_ms")))
+    if found <= 0:
+        return "발견 시각 미기록"
+    return datetime.fromtimestamp(found / 1000, _KST).strftime("%m-%d %H:%M KST 발견")
 
 
 def _underlyings_text(cfg):

@@ -77,7 +77,24 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
         state.setdefault("last_scan_diagnostics", {})
         return state
 
+    def _sync_scan_universe(self):
+        """Drop scan diagnostics collected for a different underlying set.
+
+        Switching e.g. from multi-coin (SOL...) to BTC-only must not keep
+        showing the old SOL candidate or its rejection counts.
+        """
+        universe = sorted(str(u) for u in (self.config().get("underlyings") or []))
+        if self.state.get("scan_universe") == universe:
+            return False
+        self.state["scan_universe"] = universe
+        self.state["recent_scan_outcomes"] = []
+        self.state["last_scan_diagnostics"] = {}
+        self.state["last_candidate"] = None
+        self._save_state()
+        return True
+
     def _record_scan_outcome(self, category, *, diagnostics=None):
+        self._sync_scan_universe()
         category = category if category in SCAN_OUTCOME_LABELS else "OTHER"
         window = int(self.config().get("rejection_stats_window", 100) or 100)
         history = list(self.state.get("recent_scan_outcomes") or [])
@@ -88,6 +105,7 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
         self._save_state()
 
     async def status_snapshot(self, *, refresh=True):
+        self._sync_scan_universe()
         status = await super().status_snapshot(refresh=refresh)
         history = list(self.state.get("recent_scan_outcomes") or [])
         counts = Counter(history)
@@ -382,7 +400,10 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
                 "flow_score": base_runtime._f(selected.get("flow_score")),
                 "entry_fraction": base_runtime._f(selected.get("entry_fraction"), 1.0),
                 "planned_cost_usdt": base_runtime._f(plan.get("total_entry_cost_usdt")),
+                "expiry_date_ms": int(base_runtime._f(selected.get("expiryDate"))),
+                "found_at_ms": int(time.time() * 1000),
             }
+            self._sync_scan_universe()
             self.state["last_candidate"] = candidate_summary
             self._save_state()
             self._record_scan_outcome("ORDERABLE_CANDIDATE", diagnostics=diagnostics)
