@@ -6044,6 +6044,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 /autotrade - 자동매매 거래횟수·스캔범위 설정
 /prediction - Prediction Micro Auto / Binance Wallet Prediction(Predict.fun) 메뉴
 /options - Binance European Options 전용 메뉴
+/btcoptions - BTC 전용 옵션 메뉴 (만기·스프레드 선택, Bid 기준 익절)
 /log - 최근 로그
 /close - 긴급 청산
 /stop - 긴급 정지 및 포지션 청산

@@ -505,12 +505,14 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
             entry_price = max(1e-12, base_runtime._f(position.get("entry_price")))
             pnl_pct = mark_price / entry_price - 1.0
             cfg = self.config()
+            profit_price = base_runtime._profit_reference_price(cfg, mark_price, bids)
+            profit_pct = profit_price / entry_price - 1.0
             now_ms = int(time.time() * 1000)
             expiry_ms = int(position.get("expiry_date_ms") or 0)
             expiry_hours = (expiry_ms - now_ms) / 3_600_000.0 if expiry_ms else 9999.0
 
-            peak = max(base_runtime._f(position.get("peak_mark"), entry_price), mark_price)
-            if self._adaptive_trailing_exit(entry_price, peak, mark_price):
+            peak = max(base_runtime._f(position.get("peak_mark"), entry_price), profit_price)
+            if self._adaptive_trailing_exit(entry_price, peak, profit_price):
                 managed_qty = min(exchange_qty, tracked_qty)
                 if managed_qty > 1e-12 and bid > 0:
                     return await self._exit_position(
@@ -521,10 +523,10 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
                     )
             legacy_triggered = (
                 pnl_pct <= -base_runtime._f(cfg.get("stop_loss_pct"), 0.45)
-                or pnl_pct >= base_runtime._f(cfg.get("take_profit_pct"), 0.80)
+                or profit_pct >= base_runtime._f(cfg.get("take_profit_pct"), 0.80)
                 or (
                     peak >= entry_price * (1.0 + base_runtime._f(cfg.get("trail_activation_pct"), 0.35))
-                    and mark_price <= peak * (1.0 - base_runtime._f(cfg.get("trail_drawdown_pct"), 0.25))
+                    and profit_price <= peak * (1.0 - base_runtime._f(cfg.get("trail_drawdown_pct"), 0.25))
                 )
                 or now_ms - int(position.get("entry_time_ms") or now_ms)
                 >= base_runtime._f(cfg.get("max_hold_hours"), 72.0) * 3_600_000

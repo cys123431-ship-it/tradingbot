@@ -54,6 +54,23 @@ def _first(payload):
     return payload if isinstance(payload, dict) else {}
 
 
+def _profit_reference_price(cfg, mark_price, bids):
+    """Price used for profit target / trailing decisions.
+
+    With ``profit_trigger_on_bid`` the executable best bid caps the mark, so a
+    target only fires when an IOC sell at the bid can actually realise it.
+    Stops keep using the mark so a wide book cannot trigger a panic exit.
+    """
+    if (cfg or {}).get("profit_trigger_on_bid") and bids:
+        try:
+            bid = _f(bids[0][0])
+        except (IndexError, TypeError):
+            bid = 0.0
+        if bid > 0:
+            return min(mark_price, bid)
+    return mark_price
+
+
 def _position_quantity(position):
     for key in ("quantity", "positionAmt", "position", "qty"):
         if key in (position or {}):
@@ -759,24 +776,28 @@ class OptionsTradingService:
             bids = list((depth or {}).get("bids") or [])
             bid = _f(bids[0][0]) if bids else mark_price
             entry_price = max(1e-12, _f(position.get("entry_price")))
+            cfg = self.config()
             pnl_pct = mark_price / entry_price - 1.0
-            peak = max(_f(position.get("peak_mark"), entry_price), mark_price)
+            profit_price = _profit_reference_price(cfg, mark_price, bids)
+            profit_pct = profit_price / entry_price - 1.0
+            peak = max(_f(position.get("peak_mark"), entry_price), profit_price)
             position["peak_mark"] = peak
             position["last_mark"] = mark_price
+            position["last_bid"] = bid
             position["last_pnl_pct"] = pnl_pct
+            position["last_bid_pnl_pct"] = profit_pct
             self.state["active_position"] = position
             self._save_state()
 
-            cfg = self.config()
             now_ms = int(time.time() * 1000)
             reason = ""
             if force_exit:
                 reason = "TELEGRAM_FORCE_CLOSE"
             elif pnl_pct <= -_f(cfg.get("stop_loss_pct"), 0.45):
                 reason = "OPTION_PREMIUM_STOP"
-            elif pnl_pct >= _f(cfg.get("take_profit_pct"), 0.80):
+            elif profit_pct >= _f(cfg.get("take_profit_pct"), 0.80):
                 reason = "OPTION_PREMIUM_TARGET"
-            elif peak >= entry_price * (1.0 + _f(cfg.get("trail_activation_pct"), 0.35)) and mark_price <= peak * (1.0 - _f(cfg.get("trail_drawdown_pct"), 0.25)):
+            elif peak >= entry_price * (1.0 + _f(cfg.get("trail_activation_pct"), 0.35)) and profit_price <= peak * (1.0 - _f(cfg.get("trail_drawdown_pct"), 0.25)):
                 reason = "OPTION_PREMIUM_TRAIL"
             elif now_ms - int(position.get("entry_time_ms") or now_ms) >= _f(cfg.get("max_hold_hours"), 72.0) * 3_600_000:
                 reason = "OPTION_TIME_STOP"

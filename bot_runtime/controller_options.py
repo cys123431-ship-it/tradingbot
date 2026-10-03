@@ -11,7 +11,15 @@ from telegram.error import BadRequest
 from telegram.ext import CallbackQueryHandler, CommandHandler
 
 from options_trading import OptionsTradingService
-from options_trading.config import OPTIONS_CAPITAL_LIMIT_USDT
+from options_trading.config import (
+    BTC_DTE_PRESET_LABELS,
+    BTC_DTE_PRESETS,
+    BTC_ONLY_UNDERLYING,
+    BTC_SPREAD_CHOICES,
+    OPTIONS_CAPITAL_LIMIT_USDT,
+    multi_underlying_restore_values,
+    normalize_btc_spread_choice,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -91,6 +99,7 @@ class ControllerOptionsMixin:
             f"API 연결: {'정상' if status.get('api_ok') else '실패'}",
             f"옵션 주문 권한: {('허용' if status.get('can_trade') else '차단') if status.get('can_trade') is not None else '확인 불가'}",
             "운용 방식: 옵션 매수 전용 · 네이키드 매도 금지",
+            f"대상 기초자산: {_underlyings_text(self._options_service().config())}",
             (
                 "고정 한도: 수수료 포함 동시 위험 최대 "
                 f"{status.get('capital_limit_usdt', OPTIONS_CAPITAL_LIMIT_USDT):.2f} USDT"
@@ -110,6 +119,11 @@ class ControllerOptionsMixin:
                     f"프리미엄 손익률 {_safe_number(active.get('last_pnl_pct')) * 100:+.1f}%",
                 ]
             )
+            if active.get("last_bid") is not None:
+                lines.append(
+                    f"Bid {_safe_number(active.get('last_bid')):.4f} · "
+                    f"즉시 청산 기준 손익률 {_safe_number(active.get('last_bid_pnl_pct')) * 100:+.1f}%"
+                )
         else:
             lines.extend(["", "보유 중: 없음"])
         if candidate:
@@ -167,7 +181,233 @@ class ControllerOptionsMixin:
             if "message is not modified" not in str(exc).lower():
                 raise
 
+    # ----- BTC-only options menu (/btcoptions, callbacks "bo:") -----
+
+    @staticmethod
+    def _build_btc_options_keyboard(
+        cfg, *, confirming_on=False, confirming_close=False, confirming_multi=False
+    ):
+        preset = cfg.get("btc_dte_preset")
+        spread = _safe_number(cfg.get("btc_max_spread_pct"))
+
+        def mark(selected, label):
+            return f"✅ {label}" if selected else label
+
+        rows = [
+            [
+                InlineKeyboardButton("▶️ BTC 옵션 ON", callback_data="bo:on"),
+                InlineKeyboardButton("⏹ 신규진입 OFF", callback_data="bo:off"),
+            ],
+            [
+                InlineKeyboardButton("📊 상태", callback_data="bo:status"),
+                InlineKeyboardButton("🔎 지금 스캔", callback_data="bo:scan"),
+            ],
+            [
+                InlineKeyboardButton(
+                    mark(preset == key, BTC_DTE_PRESET_LABELS[key].split(" ")[0]),
+                    callback_data=f"bo:dte:{key}",
+                )
+                for key in BTC_DTE_PRESETS
+            ],
+            [
+                InlineKeyboardButton(
+                    mark(abs(spread - choice) < 1e-9, f"스프레드 {choice * 100:.0f}%"),
+                    callback_data=f"bo:spr:{choice:g}",
+                )
+                for choice in BTC_SPREAD_CHOICES
+            ],
+            [
+                InlineKeyboardButton("📘 운용 규칙", callback_data="bo:help"),
+                InlineKeyboardButton("🔁 멀티코인 복귀", callback_data="bo:multi"),
+            ],
+            [InlineKeyboardButton("🔻 봇 옵션 포지션 청산", callback_data="bo:close")],
+        ]
+        confirm = None
+        if confirming_on:
+            confirm = ("✅ BTC 옵션 실주문 시작", "bo:confirm_on")
+        elif confirming_close:
+            confirm = ("✅ 청산 확인", "bo:confirm_close")
+        elif confirming_multi:
+            confirm = ("✅ BTC 전용 해제", "bo:confirm_multi")
+        if confirm:
+            rows.insert(
+                0,
+                [
+                    InlineKeyboardButton(confirm[0], callback_data=confirm[1]),
+                    InlineKeyboardButton("취소", callback_data="bo:status"),
+                ],
+            )
+        return InlineKeyboardMarkup(rows)
+
+    def _btc_options_header_lines(self, cfg):
+        preset = cfg.get("btc_dte_preset")
+        lines = [
+            "₿ BTC 전용 옵션 메뉴",
+            f"BTC 전용 모드: {'ON' if cfg.get('btc_only') else 'OFF (멀티코인 설정 사용 중)'}",
+            f"옵션 자동 신규진입: {'ON' if cfg.get('enabled') else 'OFF'}",
+            (
+                f"만기 범위: {BTC_DTE_PRESET_LABELS.get(preset, preset)} · "
+                f"목표 {_safe_number(BTC_DTE_PRESETS.get(preset, (0, 0, 0))[1]):.0f}일"
+            ),
+            (
+                f"최대 스프레드: {_safe_number(cfg.get('btc_max_spread_pct')) * 100:.0f}% · "
+                f"최소 24h 거래대금: {_safe_number(cfg.get('min_quote_volume_usdt')):.0f} USDT"
+            ),
+            (
+                "익절·추적청산 판단: Bid 기준 (실제로 팔리는 가격)"
+                if cfg.get("profit_trigger_on_bid")
+                else "익절·추적청산 판단: Mark 기준"
+            ),
+        ]
+        active = (self._options_service().state or {}).get("active_position") or {}
+        symbol = str(active.get("symbol") or "")
+        if symbol and not symbol.upper().startswith("BTC-"):
+            lines.append(
+                f"⚠️ 기존 {symbol} 포지션은 청산될 때까지 계속 관리합니다 (신규 진입만 BTC)."
+            )
+        return lines
+
+    async def _format_btc_options_status(self):
+        cfg = self._options_service().config()
+        body = await self._format_options_status(refresh=True)
+        return "\n".join(self._btc_options_header_lines(cfg)) + "\n\n" + body
+
+    def _btc_options_rules_text(self, cfg):
+        return (
+            "📘 BTC 전용 옵션 운용 규칙\n"
+            "• 기초자산: BTC 옵션만 거래합니다. 알트 옵션은 호가가 얇아 익절 체결이 늦기 때문에 제외합니다.\n"
+            "• 진입: 기존 Adaptive Convexity v2 신호(1h·4h 추세, 저IV 압축 돌파)로 CALL/PUT 매수만 합니다.\n"
+            f"• 유동성 필터: 스프레드 {_safe_number(cfg.get('btc_max_spread_pct')) * 100:.0f}% 이하, "
+            f"24h 거래대금 {_safe_number(cfg.get('min_quote_volume_usdt')):.0f} USDT 이상, 양쪽 호가 수량이 있어야 합니다.\n"
+            "• 익절·추적청산: Mark가 아니라 Bid로 판단합니다. 신호가 나면 그 Bid에 IOC 매도가 바로 나갑니다.\n"
+            f"• 손절: 프리미엄 -{_safe_number(cfg.get('stop_loss_pct')) * 100:.0f}% (Mark 기준). "
+            f"만기 {_safe_number(cfg.get('expiry_exit_hours')):.0f}시간 전 정리, 최대 보유 {_safe_number(cfg.get('max_hold_hours')):.0f}시간.\n"
+            f"• 예산: 옵션 전용 {OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT 한도. 네이키드 매도는 하지 않습니다. 선물 계좌·전략과는 별개입니다.\n"
+            "• 만기 버튼: 주간은 회전이 빠르지만 시간가치 감소가 크고, 월간은 느리지만 감소가 완만합니다.\n"
+            "• OFF는 신규 진입만 멈춥니다. 보유 중인 옵션은 손절·익절 관리를 계속합니다."
+        )
+
+    async def _handle_btc_options_action(self, action):
+        """Return (text, keyboard) for one /btcoptions button press."""
+        service = self._options_service()
+        cfg = service.config()
+
+        def keyboard(**flags):
+            return self._build_btc_options_keyboard(service.config(), **flags)
+
+        if action == "on":
+            preflight = await service.preflight()
+            if not preflight.get("ok") or preflight.get("can_trade") is False:
+                return (
+                    "❌ 옵션 API 사전점검 실패\n"
+                    f"{preflight.get('error') or 'European Options 주문 권한이 비활성 상태입니다.'}\n\n"
+                    "Reading·European Options 권한과 서버 IP 제한을 확인하세요.",
+                    keyboard(),
+                )
+            return (
+                "⚠️ BTC 옵션 실주문을 시작하시겠습니까?\n"
+                f"대상: {BTC_ONLY_UNDERLYING} 옵션만 · 매수 프리미엄과 예상 수수료 합계 최대 "
+                f"{OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT · 네이키드 매도 없음.\n"
+                "옵션은 만기까지 시간가치가 줄어 프리미엄 전액을 잃을 수 있습니다.",
+                keyboard(confirming_on=True),
+            )
+        if action == "confirm_on":
+            await self.cfg.update_value(["options_trading", "btc_only"], True)
+            await self.cfg.update_value(["options_trading", "enabled"], True)
+            result = await service.run_cycle(force_scan=True)
+            return (
+                "✅ BTC 옵션 자동매매 ON\n"
+                f"첫 판단: {result.get('reason') or result.get('action')}\n\n"
+                + await self._format_btc_options_status(),
+                keyboard(),
+            )
+        if action == "off":
+            await self.cfg.update_value(["options_trading", "enabled"], False)
+            return (
+                "⏹ 옵션 신규 진입 OFF\n"
+                "보유 중인 봇 옵션은 기존 손절·익절 규칙으로 계속 관리합니다.\n\n"
+                + await self._format_btc_options_status(),
+                keyboard(),
+            )
+        if action == "scan":
+            result = await service.run_cycle(force_scan=True)
+            return (
+                f"🔎 즉시 점검: {result.get('reason') or result.get('action')}\n\n"
+                + await self._format_btc_options_status(),
+                keyboard(),
+            )
+        if action.startswith("dte:"):
+            preset = action.split(":", 1)[1]
+            if preset in BTC_DTE_PRESETS:
+                await self.cfg.update_value(["options_trading", "btc_dte_preset"], preset)
+                prefix = f"🗓 만기 범위: {BTC_DTE_PRESET_LABELS[preset]}"
+            else:
+                prefix = "알 수 없는 만기 설정입니다."
+            return prefix + "\n\n" + await self._format_btc_options_status(), keyboard()
+        if action.startswith("spr:"):
+            choice = normalize_btc_spread_choice(action.split(":", 1)[1])
+            await self.cfg.update_value(["options_trading", "btc_max_spread_pct"], choice)
+            return (
+                f"↔️ 최대 스프레드: {choice * 100:.0f}%\n\n"
+                + await self._format_btc_options_status(),
+                keyboard(),
+            )
+        if action == "help":
+            return self._btc_options_rules_text(cfg), keyboard()
+        if action == "multi":
+            return (
+                "⚠️ BTC 전용 모드를 해제하시겠습니까?\n"
+                "안전을 위해 옵션 신규 진입도 함께 OFF 됩니다. 멀티코인으로 다시 켜려면 /options 메뉴를 쓰세요.",
+                keyboard(confirming_multi=True),
+            )
+        if action == "confirm_multi":
+            await self.cfg.update_value(["options_trading", "enabled"], False)
+            await self.cfg.update_value(["options_trading", "btc_only"], False)
+            for key, value in multi_underlying_restore_values().items():
+                await self.cfg.update_value(["options_trading", key], value)
+            return (
+                "🔁 BTC 전용 해제 · 옵션 신규 진입 OFF\n\n"
+                + await self._format_btc_options_status(),
+                keyboard(),
+            )
+        if action == "close":
+            return (
+                "⚠️ 봇이 보유한 옵션 포지션을 IOC 지정가로 청산하시겠습니까?\n"
+                "수동 옵션 포지션은 건드리지 않습니다.",
+                keyboard(confirming_close=True),
+            )
+        if action == "confirm_close":
+            result = await service.run_cycle(force_exit=True)
+            return (
+                f"🔻 옵션 청산 요청: {result.get('reason') or result.get('action')}\n\n"
+                + await self._format_btc_options_status(),
+                keyboard(),
+            )
+        return await self._format_btc_options_status(), keyboard()
+
     def _register_options_trading_handlers(self, owner_only):
+        async def btc_options_cmd(update, context):
+            await update.message.reply_text(
+                await self._format_btc_options_status(),
+                reply_markup=self._build_btc_options_keyboard(
+                    self._options_service().config()
+                ),
+            )
+
+        async def btc_options_callback(update, context):
+            query = update.callback_query
+            if not query:
+                return
+            await query.answer()
+            action = str(query.data or "").split(":", 1)[-1]
+            text, keyboard = await self._handle_btc_options_action(action)
+            await self._edit_options_message(query, text, keyboard=keyboard)
+
+        self.tg_app.add_handler(CommandHandler("btcoptions", owner_only(btc_options_cmd)))
+        self.tg_app.add_handler(
+            CallbackQueryHandler(owner_only(btc_options_callback), pattern=r"^bo:")
+        )
+
         async def options_cmd(update, context):
             await update.message.reply_text(
                 await self._format_options_status(refresh=True),
@@ -287,6 +527,12 @@ class ControllerOptionsMixin:
                 logger.exception("Options scheduler cycle failed")
             interval = self._options_service().config().get("manage_interval_seconds", 10)
             await asyncio.sleep(max(5, int(interval)))
+
+
+def _underlyings_text(cfg):
+    if cfg.get("btc_only"):
+        return f"{BTC_ONLY_UNDERLYING} 전용 (/btcoptions)"
+    return ", ".join(cfg.get("underlyings") or []) or "-"
 
 
 def _safe_number(value):

@@ -7,24 +7,47 @@ from copy import deepcopy
 
 OPTIONS_CAPITAL_LIMIT_USDT = 100.0
 
+# BTC-only profile.  Small-cap option books (e.g. SOL) were too thin to take
+# profit on time, so this mode trades only the deepest underlying with a
+# tighter spread / volume gate and evaluates profit exits on the bid.
+BTC_ONLY_UNDERLYING = "BTCUSDT"
+BTC_DTE_PRESETS = {
+    # preset: (min_dte_days, target_dte_days, max_dte_days)
+    "weekly": (3.0, 5.0, 10.0),
+    "standard": (3.0, 8.0, 21.0),
+    "monthly": (7.0, 14.0, 35.0),
+}
+BTC_DTE_PRESET_LABELS = {
+    "weekly": "주간 (3~10일)",
+    "standard": "표준 (3~21일)",
+    "monthly": "월간 (7~35일)",
+}
+BTC_SPREAD_CHOICES = (0.04, 0.06, 0.10)
+BTC_MIN_QUOTE_VOLUME_USDT = 500.0
+_MULTI_UNDERLYING_DEFAULTS = (
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+)
+
 
 def default_options_config() -> dict:
     return {
         "enabled": False,
+        "btc_only": False,
+        "btc_dte_preset": "weekly",
+        "btc_max_spread_pct": 0.06,
+        "profit_trigger_on_bid": False,
         "strategy_profile_version": "adaptive_convexity_trend_v2",
         "capital_limit_usdt": OPTIONS_CAPITAL_LIMIT_USDT,
         "entry_fraction": 1.00,
         "scan_interval_seconds": 300,
         "manage_interval_seconds": 10,
         "manual_scan_cooldown_seconds": 60,
-        "underlyings": [
-            "BTCUSDT",
-            "ETHUSDT",
-            "SOLUSDT",
-            "BNBUSDT",
-            "XRPUSDT",
-            "DOGEUSDT",
-        ],
+        "underlyings": list(_MULTI_UNDERLYING_DEFAULTS),
         "signal_timeframe": "1h",
         "slow_timeframe": "4h",
         "min_abs_signal": 0.46,
@@ -211,10 +234,72 @@ def normalize_options_config(raw=None) -> dict:
     cfg["max_candidates_per_underlying"] = _int(cfg.get("max_candidates_per_underlying"), 10, 1, 20)
     cfg["request_timeout_seconds"] = _int(cfg.get("request_timeout_seconds"), 10, 3, 30)
     cfg["rejection_stats_window"] = _int(cfg.get("rejection_stats_window"), 100, 20, 500)
+    _apply_btc_only_profile(cfg)
     return cfg
 
 
+def _bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def normalize_btc_spread_choice(value):
+    try:
+        requested = float(value)
+    except (TypeError, ValueError):
+        requested = 0.06
+    return min(BTC_SPREAD_CHOICES, key=lambda choice: abs(choice - requested))
+
+
+def _apply_btc_only_profile(cfg):
+    cfg["btc_only"] = _bool(cfg.get("btc_only"), False)
+    preset = str(cfg.get("btc_dte_preset") or "weekly").strip().lower()
+    cfg["btc_dte_preset"] = preset if preset in BTC_DTE_PRESETS else "weekly"
+    cfg["btc_max_spread_pct"] = normalize_btc_spread_choice(cfg.get("btc_max_spread_pct"))
+    cfg["profit_trigger_on_bid"] = _bool(cfg.get("profit_trigger_on_bid"), False)
+    if not cfg["btc_only"]:
+        return cfg
+    cfg["underlyings"] = [BTC_ONLY_UNDERLYING]
+    min_dte, target_dte, max_dte = BTC_DTE_PRESETS[cfg["btc_dte_preset"]]
+    cfg["min_dte_days"] = min_dte
+    cfg["target_dte_days"] = target_dte
+    cfg["max_dte_days"] = max_dte
+    cfg["max_spread_pct"] = cfg["btc_max_spread_pct"]
+    cfg["min_quote_volume_usdt"] = max(
+        float(cfg.get("min_quote_volume_usdt") or 0.0), BTC_MIN_QUOTE_VOLUME_USDT
+    )
+    # Profit target / trail fire only when the bid itself pays the target.
+    cfg["profit_trigger_on_bid"] = True
+    return cfg
+
+
+def multi_underlying_restore_values():
+    """Values that undo the BTC-only overrides when the mode is switched off."""
+    defaults = default_options_config()
+    return {
+        key: defaults[key]
+        for key in (
+            "underlyings",
+            "min_dte_days",
+            "target_dte_days",
+            "max_dte_days",
+            "max_spread_pct",
+            "min_quote_volume_usdt",
+            "profit_trigger_on_bid",
+        )
+    }
+
+
 __all__ = (
+    "BTC_DTE_PRESETS",
+    "BTC_DTE_PRESET_LABELS",
+    "BTC_ONLY_UNDERLYING",
+    "BTC_SPREAD_CHOICES",
+    "multi_underlying_restore_values",
+    "normalize_btc_spread_choice",
     "OPTIONS_CAPITAL_LIMIT_USDT",
     "default_options_config",
     "normalize_options_config",
