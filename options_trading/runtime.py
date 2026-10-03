@@ -15,7 +15,12 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 
 from .client import BinanceOptionsApiError, BinanceOptionsClient
-from .config import OPTIONS_CAPITAL_LIMIT_USDT, normalize_options_config
+from .config import (
+    OPTIONS_CAPITAL_LIMIT_USDT,
+    normalize_options_config,
+    options_budget_text,
+    options_spend_limit,
+)
 from .risk import build_long_option_entry_plan, estimate_option_fee
 from .strategy import (
     evaluate_underlying_trend,
@@ -69,6 +74,10 @@ def _profit_reference_price(cfg, mark_price, bids):
         if bid > 0:
             return min(mark_price, bid)
     return mark_price
+
+
+def _realized_pnl(state):
+    return sum(_f(trade.get("pnl_usdt")) for trade in (state or {}).get("trades") or [] if isinstance(trade, dict))
 
 
 def _position_quantity(position):
@@ -316,7 +325,9 @@ class OptionsTradingService:
             "exchange_positions": len((snapshot or {}).get("positions", [])),
             "exchange_orders": len((snapshot or {}).get("orders", [])),
             "cash_bankroll_usdt": _f(self.state.get("cash_bankroll_usdt")),
-            "capital_limit_usdt": OPTIONS_CAPITAL_LIMIT_USDT,
+            "capital_limit_usdt": _f(cfg.get("capital_limit_usdt")),
+            "budget_text": options_budget_text(cfg),
+            "realized_pnl_usdt": _realized_pnl(self.state),
             "active_position": active,
             "last_reason": self.state.get("last_reason", ""),
             "last_error": self.state.get("last_error", ""),
@@ -583,13 +594,13 @@ class OptionsTradingService:
             unit=selected.get("unit", 1),
             min_qty=selected.get("min_qty") or selected.get("minQty"),
             step_size=selected.get("step_size") or selected.get("minQty"),
-            cash_bankroll_usdt=self.state.get("cash_bankroll_usdt"),
+            cash_bankroll_usdt=options_spend_limit(cfg, _f(snapshot["balance"].get("available"))),
             entry_fraction=cfg.get("entry_fraction", 0.90),
-            capital_limit_usdt=OPTIONS_CAPITAL_LIMIT_USDT,
+            capital_limit_usdt=cfg.get("capital_limit_usdt", 0.0),
         )
         if not plan.get("accepted"):
             return self._record_reason(
-                f"{OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT 한도에서 주문 수량을 만들 수 없습니다: {plan.get('reason')}",
+                f"옵션 지갑 잔고로 주문 수량을 만들 수 없습니다: {plan.get('reason')}",
                 candidate=self.state.get("last_candidate"),
             )
         if plan["total_entry_cost_usdt"] > _f(snapshot["balance"].get("available")):
@@ -645,11 +656,12 @@ class OptionsTradingService:
             unit,
         )
         total_cost = premium + entry_fee
-        if total_cost > OPTIONS_CAPITAL_LIMIT_USDT + 1e-8:
+        planned_cap = _f(plan.get("hard_cap_usdt"))
+        if planned_cap > 0 and total_cost > planned_cap * 1.01 + 1e-8:
             self.state["last_error"] = "OPTIONS_FILLED_COST_EXCEEDED_HARD_CAP"
             self._save_state()
             await self._notify(
-                f"🚨 옵션 체결 비용이 {OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT 한도를 넘었습니다. "
+                f"🚨 옵션 체결 비용 {total_cost:.4f} USDT가 계획 한도 {planned_cap:.4f} USDT를 넘었습니다. "
                 "추가 진입을 차단하고 현재 포지션만 관리합니다."
             )
         self.state["cash_bankroll_usdt"] = max(
@@ -687,8 +699,7 @@ class OptionsTradingService:
                     f"종목: {symbol}",
                     f"방향: {selected.get('side')} | 수량 {filled_qty:g}",
                     f"프리미엄: {premium:.4f} USDT | 예상 수수료 {entry_fee:.4f}",
-                    f"전략 잔여예산: {self.state['cash_bankroll_usdt']:.4f} / "
-                    f"{OPTIONS_CAPITAL_LIMIT_USDT:.4f} USDT",
+                    f"사용 예산: {options_budget_text(cfg)}",
                     "네이키드 매도 없이 매수 프리미엄만 위험에 노출됩니다.",
                 ]
             )
@@ -951,8 +962,7 @@ class OptionsTradingService:
                     f"종목: {position.get('symbol')}",
                     f"사유: {reason}",
                     f"실현손익(추정 수수료 포함): {pnl:+.4f} USDT",
-                    f"전략 잔여예산: {self.state['cash_bankroll_usdt']:.4f} / "
-                    f"{OPTIONS_CAPITAL_LIMIT_USDT:.4f} USDT",
+                    f"봇 옵션 누적 손익: {_realized_pnl(self.state):+.4f} USDT",
                 ]
             )
         )

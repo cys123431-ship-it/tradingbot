@@ -5,6 +5,8 @@ from __future__ import annotations
 from copy import deepcopy
 
 
+# Legacy fixed sleeve.  Only used to migrate old ledgers; sizing now uses the
+# live options-wallet balance (optionally capped by ``capital_limit_usdt``).
 OPTIONS_CAPITAL_LIMIT_USDT = 100.0
 
 # BTC-only profile.  Small-cap option books (e.g. SOL) were too thin to take
@@ -42,7 +44,9 @@ def default_options_config() -> dict:
         "btc_max_spread_pct": 0.06,
         "profit_trigger_on_bid": False,
         "strategy_profile_version": "adaptive_convexity_trend_v2",
-        "capital_limit_usdt": OPTIONS_CAPITAL_LIMIT_USDT,
+        # 0 = no fixed budget: each entry may use the whole available
+        # options-wallet balance.  A positive value caps the spend.
+        "capital_limit_usdt": 0.0,
         "entry_fraction": 1.00,
         "scan_interval_seconds": 300,
         "manage_interval_seconds": 10,
@@ -142,8 +146,12 @@ def normalize_options_config(raw=None) -> dict:
     cfg["adaptive_convexity_v2_migration_complete"] = True
 
     cfg["enabled"] = bool(cfg.get("enabled", False))
-    # This sleeve is deliberately fixed to the user's hard capital ceiling.
-    cfg["capital_limit_usdt"] = OPTIONS_CAPITAL_LIMIT_USDT
+    # The fixed 100 USDT sleeve was replaced by the live options-wallet
+    # balance.  Older configs persisted the forced 100, so reset it once.
+    if supplied.get("wallet_budget_migration_complete") is not True:
+        cfg["capital_limit_usdt"] = 0.0
+    cfg["wallet_budget_migration_complete"] = True
+    cfg["capital_limit_usdt"] = _float(cfg.get("capital_limit_usdt"), 0.0, 0.0, 1_000_000.0)
     # Use the whole fixed sleeve when a contract fits. Entry fees remain inside
     # the absolute sleeve ceiling enforced by build_long_option_entry_plan().
     cfg["entry_fraction"] = 1.00
@@ -276,6 +284,29 @@ def _apply_btc_only_profile(cfg):
     return cfg
 
 
+def options_spend_limit(cfg, available_usdt):
+    """USDT one entry may spend: the options-wallet balance, optionally capped."""
+    try:
+        available = max(0.0, float(available_usdt or 0.0))
+    except (TypeError, ValueError):
+        available = 0.0
+    try:
+        cap = max(0.0, float((cfg or {}).get("capital_limit_usdt") or 0.0))
+    except (TypeError, ValueError):
+        cap = 0.0
+    return min(cap, available) if cap > 0 else available
+
+
+def options_budget_text(cfg):
+    try:
+        cap = float((cfg or {}).get("capital_limit_usdt") or 0.0)
+    except (TypeError, ValueError):
+        cap = 0.0
+    if cap > 0:
+        return f"옵션 지갑 잔고 (최대 {cap:.0f} USDT)"
+    return "옵션 지갑 가용 잔고 전부 (고정 한도 없음)"
+
+
 def multi_underlying_restore_values():
     """Values that undo the BTC-only overrides when the mode is switched off."""
     defaults = default_options_config()
@@ -300,6 +331,8 @@ __all__ = (
     "BTC_SPREAD_CHOICES",
     "multi_underlying_restore_values",
     "normalize_btc_spread_choice",
+    "options_budget_text",
+    "options_spend_limit",
     "OPTIONS_CAPITAL_LIMIT_USDT",
     "default_options_config",
     "normalize_options_config",

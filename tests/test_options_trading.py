@@ -30,11 +30,10 @@ def _trend_rows(count, *, start=100.0, slope=0.35, interval_ms=3_600_000):
     return rows
 
 
-def test_options_config_forces_fixed_hundred_usdt_cap_and_defaults_off():
+def test_options_config_has_no_fixed_cap_and_defaults_off():
     cfg = normalize_options_config({"enabled": True, "capital_limit_usdt": 999})
     assert cfg["enabled"] is True
-    assert cfg["capital_limit_usdt"] == OPTIONS_CAPITAL_LIMIT_USDT
-    assert cfg["capital_limit_usdt"] == 100.0
+    assert cfg["capital_limit_usdt"] == 0.0
     assert normalize_options_config({})["enabled"] is False
 
 

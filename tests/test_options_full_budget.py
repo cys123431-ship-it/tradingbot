@@ -7,11 +7,15 @@ from options_trading.config import OPTIONS_CAPITAL_LIMIT_USDT, normalize_options
 from options_trading.risk import build_long_option_entry_plan
 
 
-def test_options_sleeve_uses_full_fixed_hundred_usdt_budget():
-    cfg = normalize_options_config({"entry_fraction": 0.90, "capital_limit_usdt": 999})
+def test_options_budget_defaults_to_whole_wallet_and_migrates_forced_hundred():
+    # Old configs persisted the forced 100 USDT sleeve: migrate it to wallet mode.
+    cfg = normalize_options_config({"entry_fraction": 0.90, "capital_limit_usdt": 100.0})
     assert cfg["entry_fraction"] == 1.0
-    assert cfg["capital_limit_usdt"] == OPTIONS_CAPITAL_LIMIT_USDT
-    assert cfg["capital_limit_usdt"] == 100.0
+    assert cfg["capital_limit_usdt"] == 0.0
+    assert cfg["wallet_budget_migration_complete"] is True
+    # After migration an explicit operator cap is preserved.
+    capped = normalize_options_config({**cfg, "capital_limit_usdt": 40})
+    assert capped["capital_limit_usdt"] == 40.0
 
 
 def test_twenty_one_usdt_account_can_trade_inside_hundred_usdt_cap():

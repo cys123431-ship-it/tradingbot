@@ -16,7 +16,7 @@ from options_trading.config import (
     BTC_DTE_PRESETS,
     BTC_ONLY_UNDERLYING,
     BTC_SPREAD_CHOICES,
-    OPTIONS_CAPITAL_LIMIT_USDT,
+    options_budget_text,
     multi_underlying_restore_values,
     normalize_btc_spread_choice,
 )
@@ -63,7 +63,7 @@ class ControllerOptionsMixin:
             [
                 InlineKeyboardButton("📈 전략 설명", callback_data="op:strategy"),
                 InlineKeyboardButton(
-                    f"💰 {OPTIONS_CAPITAL_LIMIT_USDT:.0f}달러 예산",
+                    "💰 예산",
                     callback_data="op:budget",
                 ),
             ],
@@ -100,11 +100,8 @@ class ControllerOptionsMixin:
             f"옵션 주문 권한: {('허용' if status.get('can_trade') else '차단') if status.get('can_trade') is not None else '확인 불가'}",
             "운용 방식: 옵션 매수 전용 · 네이키드 매도 금지",
             f"대상 기초자산: {_underlyings_text(self._options_service().config())}",
-            (
-                "고정 한도: 수수료 포함 동시 위험 최대 "
-                f"{status.get('capital_limit_usdt', OPTIONS_CAPITAL_LIMIT_USDT):.2f} USDT"
-            ),
-            f"전략 잔여예산: {status.get('cash_bankroll_usdt', 0):.4f} USDT",
+            f"운용 예산: {status.get('budget_text') or options_budget_text(self._options_service().config())}",
+            f"봇 옵션 누적 손익: {_safe_number(status.get('realized_pnl_usdt')):+.4f} USDT",
             f"옵션 계좌: 가용 {_safe_number(balance.get('available')):.4f} / 평가 {_safe_number(balance.get('equity')):.4f} USDT",
             f"거래소 포지션/주문: {status.get('exchange_positions', 0)} / {status.get('exchange_orders', 0)}",
             f"관리 API 연속 오류: {int(status.get('manage_error_streak') or 0)}회",
@@ -282,7 +279,7 @@ class ControllerOptionsMixin:
             "• 익절·추적청산: Mark가 아니라 Bid로 판단합니다. 신호가 나면 그 Bid에 IOC 매도가 바로 나갑니다.\n"
             f"• 손절: 프리미엄 -{_safe_number(cfg.get('stop_loss_pct')) * 100:.0f}% (Mark 기준). "
             f"만기 {_safe_number(cfg.get('expiry_exit_hours')):.0f}시간 전 정리, 최대 보유 {_safe_number(cfg.get('max_hold_hours')):.0f}시간.\n"
-            f"• 예산: 옵션 전용 {OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT 한도. 네이키드 매도는 하지 않습니다. 선물 계좌·전략과는 별개입니다.\n"
+            f"• 예산: {options_budget_text(cfg)}. 바이낸스 옵션 지갑에 있는 USDT만 씁니다(선물 지갑과 별개). 네이키드 매도는 하지 않습니다.\n"
             "• 만기 버튼: 주간은 회전이 빠르지만 시간가치 감소가 크고, 월간은 느리지만 감소가 완만합니다.\n"
             "• OFF는 신규 진입만 멈춥니다. 보유 중인 옵션은 손절·익절 관리를 계속합니다."
         )
@@ -306,8 +303,8 @@ class ControllerOptionsMixin:
                 )
             return (
                 "⚠️ BTC 옵션 실주문을 시작하시겠습니까?\n"
-                f"대상: {BTC_ONLY_UNDERLYING} 옵션만 · 매수 프리미엄과 예상 수수료 합계 최대 "
-                f"{OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT · 네이키드 매도 없음.\n"
+                f"대상: {BTC_ONLY_UNDERLYING} 옵션만 · 예산: {options_budget_text(cfg)} "
+                "(프리미엄+예상 수수료 기준) · 네이키드 매도 없음.\n"
                 "옵션은 만기까지 시간가치가 줄어 프리미엄 전액을 잃을 수 있습니다.",
                 keyboard(confirming_on=True),
             )
@@ -433,7 +430,7 @@ class ControllerOptionsMixin:
                 await self._edit_options_message(
                     query,
                     "⚠️ 옵션 실주문을 시작하시겠습니까?\n"
-                    f"매수 프리미엄·예상 수수료 합계는 {OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT를 넘지 않으며 "
+                    "매수 프리미엄·예상 수수료 합계는 옵션 지갑 가용 잔고 안에서만 쓰며 "
                     "네이키드 매도는 하지 않습니다.",
                     keyboard=self._build_options_keyboard(confirming_on=True),
                 )
@@ -474,7 +471,7 @@ class ControllerOptionsMixin:
                     "📈 Adaptive Convexity Trend v2\n"
                     "1시간·4시간 다중속도 추세와 Low-IV Squeeze를 결합하고, HAR식 다중기간 실현변동성으로 신호강도에 맞는 DTE·Delta를 고릅니다.\n"
                     "Low-IV Squeeze는 ATR/실현변동성 압축 뒤 거래량·모멘텀을 동반한 상·하방 돌파만 CALL/PUT 후보로 봅니다.\n"
-                    f"{OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT·최소수량·수수료를 먼저 통과한 계약만 "
+                    "옵션 지갑 잔고·최소수량·수수료를 먼저 통과한 계약만 "
                     "순기대수익·Delta·DTE·IV/RV·IV표면·skew·Spread·최근 체결흐름·유동성·Greeks로 비교합니다.\n"
                     "메이커 우선 체결 뒤 순기대수익이 남을 때만 IOC로 전환합니다. 고정 +80% 익절 대신 단계형 추적청산으로 큰 수익을 열어 두며 -55% 프리미엄 손절과 만기·시간 제한은 유지합니다.\n"
                     "옵션 매수만 허용하므로 신규 진입용 SELL/네이키드 매도는 만들지 않습니다.",
@@ -484,12 +481,12 @@ class ControllerOptionsMixin:
                 status = await self._options_service().status_snapshot(refresh=True)
                 await self._edit_options_message(
                     query,
-                    f"💰 옵션 전용 {OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT 원장\n"
-                    f"남은 전략예산: {status.get('cash_bankroll_usdt', 0):.4f} USDT\n"
-                    "한 번의 진입은 남은 전략예산·실제 옵션 가용잔고·고정 한도 중 가장 작은 금액 안에서 계산하며, "
-                    "프리미엄과 예상 진입 수수료를 합쳐 제한합니다.\n"
-                    f"수익은 원장으로 돌아오지만 동시 위험 한도는 계속 {OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT입니다.\n"
-                    "선물 잔고·선물 리스크·일일손실 한도와는 완전히 별개입니다.",
+                    f"💰 옵션 예산: {status.get('budget_text') or '-'}\n"
+                    f"옵션 지갑 가용: {_safe_number((status.get('balance') or {}).get('available')):.4f} USDT\n"
+                    f"봇 옵션 누적 손익: {_safe_number(status.get('realized_pnl_usdt')):+.4f} USDT\n"
+                    "한 번의 진입은 진입 시점의 옵션 지갑 가용 잔고 안에서 프리미엄과 예상 수수료를 합쳐 계산합니다.\n"
+                    "입금하면 바로 예산이 늘고, 손실이 나면 줄어든 잔고만큼만 씁니다.\n"
+                    "선물 지갑·선물 리스크·일일손실 한도와는 완전히 별개입니다 (옵션 지갑으로 이체 필요).",
                 )
                 return
             if action == "close":

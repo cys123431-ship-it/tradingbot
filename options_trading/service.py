@@ -5,7 +5,11 @@ from __future__ import annotations
 import os
 
 from . import adaptive_runtime, runtime as base_runtime
-from .config import OPTIONS_CAPITAL_LIMIT_USDT
+from .config import (
+    OPTIONS_CAPITAL_LIMIT_USDT,
+    options_budget_text,
+    options_spend_limit,
+)
 from .risk import build_long_option_entry_plan, estimate_option_fee
 
 
@@ -13,9 +17,7 @@ LEGACY_OPTIONS_CAPITAL_LIMIT_USDT = 20.0
 
 # Keep adaptive scan diagnostics aligned with the current sleeve cap without
 # duplicating a second hard-coded amount in the UI/state contract.
-adaptive_runtime.SCAN_OUTCOME_LABELS["BUDGET"] = (
-    f"{OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT 예산/최소수량 문제"
-)
+adaptive_runtime.SCAN_OUTCOME_LABELS["BUDGET"] = "옵션 지갑 잔고/최소수량 문제"
 
 
 class OptionsTradingService(adaptive_runtime.OptionsTradingService):
@@ -27,11 +29,9 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
 
     @staticmethod
     def _rewrite_cap_text(text):
-        return (
-            str(text)
-            .replace("20.0000 USDT", f"{OPTIONS_CAPITAL_LIMIT_USDT:.4f} USDT")
-            .replace("20 USDT", f"{OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT")
-        )
+        # The old "20 USDT" -> cap rewrite also corrupted amounts such as
+        # "1.20 USDT"; messages no longer mention a fixed sleeve, so pass through.
+        return str(text)
 
     def _load_state(self):
         existed_before_load = os.path.exists(self.state_path)
@@ -311,11 +311,10 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
         )
 
     async def _enter(self, selected, snapshot):
-        """Enter using the smaller of strategy ledger, live balance and hard cap.
+        """Enter using the live options-wallet balance (optionally capped).
 
         Adaptive preselection already applies this rule. Repeating it here keeps
-        the final order plan consistent if the options account holds less than
-        the configured sleeve (for example, 21 USDT with a 100 USDT cap).
+        the final order plan consistent with the balance at order time.
         """
 
         cfg = self.config()
@@ -326,11 +325,7 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
             0.0,
             base_runtime._f((snapshot.get("balance") or {}).get("available")),
         )
-        planning_bankroll = min(
-            max(0.0, base_runtime._f(self.state.get("cash_bankroll_usdt"))),
-            available,
-            OPTIONS_CAPITAL_LIMIT_USDT,
-        )
+        planning_bankroll = options_spend_limit(cfg, available)
         plan = build_long_option_entry_plan(
             ask_price=limit_price,
             index_price=(selected.get("signal") or {}).get("spot_price"),
@@ -342,11 +337,11 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
                 base_runtime._f(cfg.get("entry_fraction"), 1.00),
                 base_runtime._f(selected.get("entry_fraction"), 1.00),
             ),
-            capital_limit_usdt=OPTIONS_CAPITAL_LIMIT_USDT,
+            capital_limit_usdt=cfg.get("capital_limit_usdt", 0.0),
         )
         if not plan.get("accepted"):
             return self._record_reason(
-                f"{OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT 한도에서 주문 수량을 만들 수 없습니다: {plan.get('reason')}",
+                f"옵션 지갑 가용 {planning_bankroll:.2f} USDT로 주문 수량을 만들 수 없습니다: {plan.get('reason')}",
                 candidate=self.state.get("last_candidate"),
             )
         if plan["total_entry_cost_usdt"] > available + 1e-9:
@@ -395,11 +390,12 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
             unit,
         )
         total_cost = premium + entry_fee
-        if total_cost > OPTIONS_CAPITAL_LIMIT_USDT + 1e-8:
+        planned_cap = base_runtime._f(plan.get("hard_cap_usdt"))
+        if planned_cap > 0 and total_cost > planned_cap * 1.01 + 1e-8:
             self.state["last_error"] = "OPTIONS_FILLED_COST_EXCEEDED_HARD_CAP"
             self._save_state()
             await self._notify(
-                f"🚨 옵션 체결 비용이 {OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT 한도를 넘었습니다. "
+                f"🚨 옵션 체결 비용 {total_cost:.4f} USDT가 계획 한도 {planned_cap:.4f} USDT를 넘었습니다. "
                 "추가 진입을 차단하고 현재 포지션만 관리합니다."
             )
 
@@ -462,10 +458,7 @@ class OptionsTradingService(adaptive_runtime.OptionsTradingService):
                     f"종목: {symbol}",
                     f"방향: {selected.get('side')} | 수량 {filled_qty:g}",
                     f"프리미엄: {premium:.4f} USDT | 예상 수수료 {entry_fee:.4f}",
-                    (
-                        f"전략 잔여예산: {self.state['cash_bankroll_usdt']:.4f} / "
-                        f"{OPTIONS_CAPITAL_LIMIT_USDT:.4f} USDT"
-                    ),
+                    f"사용 예산: {options_budget_text(cfg)} · 진입 시 가용 {planning_bankroll:.4f} USDT",
                     "네이키드 매도 없이 매수 프리미엄만 위험에 노출됩니다.",
                 ]
             )

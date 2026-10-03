@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from decimal import Decimal, ROUND_DOWN
 
-from .config import OPTIONS_CAPITAL_LIMIT_USDT
 
 
 def _d(value, default="0"):
@@ -48,18 +47,17 @@ def build_long_option_entry_plan(
     step_size,
     cash_bankroll_usdt,
     entry_fraction=1.00,
-    capital_limit_usdt=OPTIONS_CAPITAL_LIMIT_USDT,
+    capital_limit_usdt=0.0,
 ):
     ask = _d(ask_price)
     unit_d = _d(unit, "1")
     min_qty_d = _d(min_qty)
     step_d = _d(step_size)
     bankroll = max(Decimal("0"), _d(cash_bankroll_usdt))
-    hard_cap = min(
-        Decimal(str(OPTIONS_CAPITAL_LIMIT_USDT)),
-        max(Decimal("0"), _d(capital_limit_usdt)),
-        bankroll,
-    )
+    # ``cash_bankroll_usdt`` is the spendable options-wallet balance; an
+    # optional positive ``capital_limit_usdt`` caps it further.
+    cap = max(Decimal("0"), _d(capital_limit_usdt))
+    hard_cap = min(cap, bankroll) if cap > 0 else bankroll
     fraction = min(Decimal("1.00"), max(Decimal("0.10"), _d(entry_fraction, "1.00")))
     spend_cap = hard_cap * fraction
     if ask <= 0 or unit_d <= 0 or min_qty_d <= 0 or step_d <= 0 or spend_cap <= 0:

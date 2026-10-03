@@ -13,7 +13,7 @@ import time
 from collections import Counter
 
 from . import runtime as base_runtime
-from .config import OPTIONS_CAPITAL_LIMIT_USDT
+from .config import options_spend_limit
 from .risk import build_long_option_entry_plan
 from .strategy import (
     choose_underlying_signal,
@@ -35,7 +35,7 @@ SCAN_OUTCOME_LABELS = {
     "FLOW": "옵션 매수 흐름 반대",
     "SPREAD": "Spread 초과",
     "LIQUIDITY": "유동성 부족",
-    "BUDGET": f"{OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT 예산/최소수량 문제",
+    "BUDGET": "옵션 지갑 잔고/최소수량 문제",
     "EXISTING_POSITION": "기존 옵션 포지션",
     "OPEN_ORDER": "기존 미체결 옵션 주문",
     "CAN_TRADE": "옵션 거래 권한/API 상태",
@@ -229,11 +229,7 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
         tick = base_runtime._f(contract.get("tick_size"))
         limit_price = ask + (tick if tick > 0 else 0.0)
         available = max(0.0, base_runtime._f((snapshot.get("balance") or {}).get("available")))
-        bankroll = min(
-            max(0.0, base_runtime._f(self.state.get("cash_bankroll_usdt"))),
-            available,
-            OPTIONS_CAPITAL_LIMIT_USDT,
-        )
+        bankroll = options_spend_limit(cfg, available)
         plan = build_long_option_entry_plan(
             ask_price=limit_price,
             index_price=signal.get("spot_price"),
@@ -245,7 +241,7 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
                 base_runtime._f(cfg.get("entry_fraction"), 1.00),
                 base_runtime._f(scored.get("entry_fraction"), 1.00),
             ),
-            capital_limit_usdt=OPTIONS_CAPITAL_LIMIT_USDT,
+            capital_limit_usdt=cfg.get("capital_limit_usdt", 0.0),
         )
         if not plan.get("accepted"):
             return None, "BUDGET", plan.get("reason")
@@ -357,7 +353,7 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
                 outcome = self._dominant_rejection(scan_rejections)
                 self._record_scan_outcome(outcome, diagnostics=diagnostics)
                 return self._record_reason(
-                    f"Adaptive Convexity Trend 후보 중 {OPTIONS_CAPITAL_LIMIT_USDT:.0f} USDT 예산·순기대수익·DTE·Delta·IV표면·Spread·흐름·유동성 조건을 모두 만족한 계약이 없습니다.",
+                    f"Adaptive Convexity Trend 후보 중 옵션 지갑 잔고·순기대수익·DTE·Delta·IV표면·Spread·흐름·유동성 조건을 모두 만족한 계약이 없습니다.",
                     candidate=None,
                 )
 
