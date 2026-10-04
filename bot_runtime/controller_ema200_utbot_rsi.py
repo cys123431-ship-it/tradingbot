@@ -914,6 +914,7 @@ class ControllerEMA200UTBotRSIMixin:
                     [section, "strategy_params", "active_strategy"],
                     EMA200_UTBOT_RSI_STRATEGY,
                 )
+                await self._turn_off_options_for_futures_strategy()
                 await query.edit_message_text(
                     "✅ EMA200 + UT Bot + RSI를 활성 전략으로 선택했습니다.\n"
                     f"완료된 {self._ema200_utbot_rsi_config()['timeframe']}봉 기준으로만 "
@@ -925,6 +926,8 @@ class ControllerEMA200UTBotRSIMixin:
             if action == "entry_toggle":
                 cfg = self._ema200_utbot_rsi_config()
                 await self._update_ema200_utbot_rsi_value("enabled", not cfg["enabled"])
+                if not cfg["enabled"]:
+                    await self._turn_off_options_for_futures_strategy()
                 await query.edit_message_text(
                     (
                         "▶ 신규진입 ON" if not cfg["enabled"]

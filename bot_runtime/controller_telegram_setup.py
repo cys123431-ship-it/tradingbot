@@ -78,8 +78,7 @@ class TelegramSetupMixin:
             await u.message.reply_text(self._format_emergency_stop_reply(result))
 
         async def stop_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-            result = await self.emergency_stop()
-            await u.message.reply_text(self._format_emergency_stop_reply(result))
+            await u.message.reply_text(await self._emergency_stop_everything())
 
         async def stats_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             daily_count, daily_pnl = self.db.get_daily_stats()
@@ -364,12 +363,14 @@ class TelegramSetupMixin:
 
         async def _activate_utbot_strategy():
             await _ensure_signal_engine_active()
+            await self._turn_off_options_for_futures_strategy()
             await _disable_adaptive_breakout_trend_mode()
             await self._return_signal_engine_to_utbot()
             return "✅ UTBot 전략 ON. UTBreak/scanner/CoinSelector/Micro Auto를 OFF로 정리했습니다."
 
         async def _activate_utbreak_strategy():
             await _ensure_signal_engine_active()
+            await self._turn_off_options_for_futures_strategy()
             await _disable_adaptive_breakout_trend_mode()
             self.is_paused = True
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY)
@@ -415,6 +416,7 @@ class TelegramSetupMixin:
 
         async def _activate_relative_strength_pullback_strategy():
             await _ensure_signal_engine_active()
+            await self._turn_off_options_for_futures_strategy()
             await _disable_adaptive_breakout_trend_mode()
             self.is_paused = False
             rsp_cfg = default_relative_strength_pullback_config()
@@ -514,6 +516,7 @@ class TelegramSetupMixin:
 
         async def _activate_dual_alpha_strategy():
             await _ensure_signal_engine_active()
+            await self._turn_off_options_for_futures_strategy()
             await _disable_adaptive_breakout_trend_mode()
             self.is_paused = False
             rsp_cfg = default_relative_strength_pullback_config()
@@ -593,6 +596,7 @@ class TelegramSetupMixin:
 
         async def _activate_volatility_managed_trend_strategy():
             await _ensure_signal_engine_active()
+            await self._turn_off_options_for_futures_strategy()
             await _disable_adaptive_breakout_trend_mode()
             self.is_paused = False
             current = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
@@ -633,6 +637,7 @@ class TelegramSetupMixin:
 
         async def _activate_triple_alpha_strategy():
             await _ensure_signal_engine_active()
+            await self._turn_off_options_for_futures_strategy()
             await _disable_adaptive_breakout_trend_mode()
             self.is_paused = False
             rsp_cfg = default_relative_strength_pullback_config()
@@ -686,6 +691,7 @@ class TelegramSetupMixin:
 
         async def _activate_liquidation_exhaustion_reversal_strategy():
             await _ensure_signal_engine_active()
+            await self._turn_off_options_for_futures_strategy()
             await _disable_adaptive_breakout_trend_mode()
             self.is_paused = False
             current = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
@@ -744,6 +750,7 @@ class TelegramSetupMixin:
 
         async def _activate_quad_alpha_strategy(enabled_strategies=None):
             await _ensure_signal_engine_active()
+            await self._turn_off_options_for_futures_strategy()
             await _disable_adaptive_breakout_trend_mode()
             self.is_paused = True
             enabled_strategies = normalize_quad_alpha_enabled_strategies(
@@ -882,6 +889,7 @@ class TelegramSetupMixin:
 
         async def _activate_crowding_unwind_strategy():
             await _ensure_signal_engine_active()
+            await self._turn_off_options_for_futures_strategy()
             await _disable_adaptive_breakout_trend_mode()
             self.is_paused = False
             current = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get('UTBotFilteredBreakoutV1', {})
@@ -932,6 +940,7 @@ class TelegramSetupMixin:
         async def _activate_adaptive_breakout_trend_strategy():
             """Activate the standalone trend mode without touching open-position exits."""
             await _ensure_signal_engine_active()
+            await self._turn_off_options_for_futures_strategy()
             self.is_paused = True
             current = self.cfg.get('signal_engine', {}).get('strategy_params', {}).get(
                 'UTBotFilteredBreakoutV1', {}
@@ -2712,6 +2721,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
         async def _enable_utbreak_direct_watchlist(symbols):
             watch_symbols = await _resolve_utbreak_direct_watchlist(symbols)
             await _ensure_signal_engine_active()
+            await self._turn_off_options_for_futures_strategy()
             await self.cfg.update_value(['signal_engine', 'watchlist'], watch_symbols)
             await self._update_config_value(['exchange_watchlists', self.get_exchange_mode()], watch_symbols)
             await self.cfg.update_value(['signal_engine', 'coin_selector', 'fixed_symbol_mode_enabled'], False)
@@ -4573,6 +4583,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 
         async def _enable_utbreak_auto_bundle():
             await _ensure_signal_engine_active()
+            await self._turn_off_options_for_futures_strategy()
             self.is_paused = False
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'active_strategy'], UTBOT_ADAPTIVE_TIMEFRAME_STRATEGY)
             await self.cfg.update_value(['signal_engine', 'strategy_params', 'UTBotFilteredBreakoutV1', 'selection_mode'], 'auto')
@@ -6047,9 +6058,9 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 /btcoptions - BTC 전용 옵션 메뉴 (만기·스프레드 선택, Bid 기준 익절)
 /log - 최근 로그
 /close - 긴급 청산
-/stop - 긴급 정지 및 포지션 청산
+/stop - 긴급 정지: 선물 포지션 청산 + 옵션 OFF·봇 옵션 청산 + Prediction OFF
 
-🚨 STOP - 긴급 정지
+🚨 STOP - 긴급 정지 (/stop 과 동일, 모든 자동매매 OFF)
 ⏸ PAUSE - 일시정지
 ▶ RESUME - 재개
 """

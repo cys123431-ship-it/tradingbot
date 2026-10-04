@@ -14,8 +14,7 @@ class ControllerTelegramMixin:
         action = self._extract_emergency_action(text)
 
         if action == "STOP":
-            result = await self.emergency_stop()
-            await update.message.reply_text(self._format_emergency_stop_reply(result))
+            await update.message.reply_text(await self._emergency_stop_everything())
             return ConversationHandler.END
         elif action == "PAUSE":
             self.is_paused = True

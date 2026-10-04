@@ -83,6 +83,8 @@ class ControllerCustomEntryMixin:
             ["signal_engine", "user_custom_entry", "enabled"],
             bool(enabled),
         )
+        if enabled:
+            await self._turn_off_options_for_futures_strategy()
 
     def _build_user_custom_entry_keyboard(self):
         enabled = self._is_user_custom_entry_enabled()

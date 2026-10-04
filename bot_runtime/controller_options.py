@@ -184,6 +184,69 @@ class ControllerOptionsMixin:
             if "message is not modified" not in str(exc).lower():
                 raise
 
+    # ----- interplay with futures strategies and the STOP button -----
+
+    async def _turn_off_options_for_futures_strategy(self):
+        """Activating a futures strategy switches option new entries off.
+
+        Held bot options keep their stop/take-profit management.
+        """
+        try:
+            options_cfg = self.cfg.get("options_trading", {}) or {}
+            if not options_cfg.get("enabled"):
+                return False
+            await self.cfg.update_value(["options_trading", "enabled"], False)
+        except Exception:
+            logger.exception("Could not switch options off for a futures strategy")
+            return False
+        try:
+            await self.notify_plain(
+                "⏹ 선물 전략을 켜서 옵션 자동 신규진입을 OFF 했습니다.\n"
+                "보유 중인 봇 옵션은 손절·익절 관리를 계속합니다. 다시 켜려면 /btcoptions"
+            )
+        except Exception:
+            logger.exception("Options-off notification failed")
+        return True
+
+    async def _stop_all_auxiliary_trading(self):
+        """STOP button: options off + close bot options, Prediction auto off."""
+        lines = []
+        try:
+            options_cfg = self.cfg.get("options_trading", {}) or {}
+            was_on = bool(options_cfg.get("enabled"))
+            await self.cfg.update_value(["options_trading", "enabled"], False)
+            service = self._options_service()
+            active = (getattr(service, "state", None) or {}).get("active_position") or {}
+            if active.get("symbol"):
+                result = await service.run_cycle(force_exit=True)
+                lines.append(
+                    f"옵션: 신규진입 OFF · 봇 옵션 {active.get('symbol')} 청산 요청 — "
+                    f"{result.get('reason') or result.get('action')}"
+                )
+            else:
+                lines.append("옵션: 신규진입 OFF" + ("" if was_on else " (이미 꺼져 있었음)"))
+        except Exception as exc:
+            logger.exception("Options emergency stop failed")
+            lines.append(f"⚠️ 옵션 정지 처리 오류: {exc}")
+        try:
+            prediction_cfg = self.cfg.get("prediction_micro_auto", {}) or {}
+            if isinstance(prediction_cfg, dict) and prediction_cfg.get("enabled"):
+                await self.cfg.update_value(["prediction_micro_auto", "enabled"], False)
+                lines.append("Prediction Micro Auto: OFF")
+        except Exception as exc:
+            logger.exception("Prediction emergency stop failed")
+            lines.append(f"⚠️ Prediction 정지 처리 오류: {exc}")
+        return lines
+
+    async def _emergency_stop_everything(self):
+        """Futures emergency stop first, then every other automatic feature."""
+        result = await self.emergency_stop()
+        text = self._format_emergency_stop_reply(result)
+        extra = await self._stop_all_auxiliary_trading()
+        if extra:
+            text += "\n\n" + "\n".join(extra)
+        return text
+
     # ----- BTC-only options menu (/btcoptions, callbacks "bo:") -----
 
     @staticmethod
