@@ -113,14 +113,29 @@ class BinanceOptionsClient:
                 time.monotonic() + duration,
             )
 
+    TIMESTAMP_ERROR_CODE = -1021
+    RECV_WINDOW_MS = 10000
+
     def _request(self, method, path, params=None, *, signed=False):
+        try:
+            return self._request_once(method, path, params, signed=signed)
+        except BinanceOptionsApiError as exc:
+            # -1021 means Binance rejected the request before processing it
+            # (local clock/latency outside recvWindow), so resyncing the clock
+            # and retrying once cannot duplicate an order.
+            if not signed or exc.code != self.TIMESTAMP_ERROR_CODE:
+                raise
+            self.sync_time()
+            return self._request_once(method, path, params, signed=signed)
+
+    def _request_once(self, method, path, params=None, *, signed=False):
         method = str(method or "GET").upper()
         self._acquire_request_slot()
         query = dict(params or {})
         if signed:
             if not self.authenticated:
                 raise BinanceOptionsApiError("OPTIONS_API_CREDENTIALS_MISSING")
-            query.setdefault("recvWindow", 5000)
+            query.setdefault("recvWindow", self.RECV_WINDOW_MS)
             query["timestamp"] = int(time.time() * 1000) + int(self._server_offset_ms)
             unsigned = urlencode(query, doseq=True)
             query["signature"] = hmac.new(
@@ -183,10 +198,15 @@ class BinanceOptionsClient:
             ) from exc
 
     def sync_time(self):
-        payload = self._request("GET", "/eapi/v1/time")
+        started_ms = int(time.time() * 1000)
+        payload = self._request_once("GET", "/eapi/v1/time")
+        finished_ms = int(time.time() * 1000)
         server_time = int((payload or {}).get("serverTime") or 0)
         if server_time > 0:
-            self._server_offset_ms = server_time - int(time.time() * 1000)
+            # The server stamped its time roughly mid-flight; keep a small
+            # safety margin so our timestamps never run ahead of Binance.
+            midpoint_ms = (started_ms + finished_ms) // 2
+            self._server_offset_ms = server_time - midpoint_ms - 250
         return payload
 
     def ping(self):

@@ -66,6 +66,19 @@ def _scan_category(reason):
     return "OTHER"
 
 
+def _direction_wait_text(weak_signals, cfg):
+    parts = []
+    for row in weak_signals[:3]:
+        underlying = str(row.get("underlying") or "").replace("USDT", "")
+        trend = base_runtime._f(row.get("trend_score"), base_runtime._f(row.get("score")))
+        squeeze = abs(base_runtime._f(row.get("squeeze_score")))
+        parts.append(
+            f"{underlying} 추세 {trend:+.2f} (기준 ±{base_runtime._f(cfg.get('min_abs_signal'), 0.46):.2f}) · "
+            f"압축돌파 {squeeze:.2f} (기준 {base_runtime._f(cfg.get('squeeze_min_score'), 0.58):.2f})"
+        )
+    return "방향 신호 대기 — " + " / ".join(parts)
+
+
 class OptionsTradingService(base_runtime.OptionsTradingService):
     """Selection/diagnostics upgrade that deliberately reuses base execution."""
 
@@ -312,6 +325,7 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
             exchange_info = await self._get_exchange_info()
             signals = []
             scan_rejections = []
+            weak_signals = []
             for underlying in cfg.get("underlyings", []):
                 try:
                     result = await self._underlying_signal(underlying, cfg)
@@ -319,6 +333,7 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
                         signals.append(result)
                     else:
                         scan_rejections.append("DIRECTION_SIGNAL")
+                        weak_signals.append(result)
                         reason = str(result.get("reason") or "NO_ADAPTIVE_OPTION_SIGNAL")
                         diagnostics["signal_rejections"][reason] = diagnostics["signal_rejections"].get(reason, 0) + 1
                 except Exception as exc:
@@ -327,6 +342,9 @@ class OptionsTradingService(base_runtime.OptionsTradingService):
                     diagnostics["signal_rejections"]["UNDERLYING_DATA_ERROR"] = diagnostics["signal_rejections"].get("UNDERLYING_DATA_ERROR", 0) + 1
 
             signals.sort(key=lambda row: abs(base_runtime._f(row.get("score"))), reverse=True)
+            if not signals and weak_signals and set(scan_rejections) == {"DIRECTION_SIGNAL"}:
+                self._record_scan_outcome("DIRECTION_SIGNAL", diagnostics=diagnostics)
+                return self._record_reason(_direction_wait_text(weak_signals, cfg))
             if signals:
                 await self._prime_market_caches()
             candidates = []

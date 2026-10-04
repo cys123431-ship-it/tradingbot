@@ -352,3 +352,84 @@ def test_format_status_drops_expired_candidate():
     text = asyncio.run(controller._format_options_status(refresh=True))
     assert "SOL-260828-88-C" not in text
     assert "최근 후보" not in text
+
+
+# ----- responsiveness / clock-skew fixes -----
+
+
+def test_setting_buttons_do_not_touch_the_exchange():
+    controller = _controller({"btc_only": True, "btc_max_spread_pct": 0.1})
+
+    async def boom(refresh=True):
+        raise AssertionError("setting buttons must not call the API")
+
+    controller.options_trading_service.status_snapshot = boom
+    text, markup = _press(controller, "spr:0.06")
+    assert controller.cfg.data["options_trading"]["btc_max_spread_pct"] == pytest.approx(0.06)
+    assert "최대 스프레드: 6%" in text and "저장됨" in text
+    labels = [b.text for row in markup.inline_keyboard for b in row]
+    assert "✅ 스프레드 6%" in labels
+    text, _ = _press(controller, "dte:standard")
+    assert "표준" in text
+
+
+def test_stale_callback_answer_does_not_abort_the_press():
+    from telegram.error import BadRequest
+
+    from bot_runtime.controller_options import _answer_quietly
+
+    class Query:
+        async def answer(self):
+            raise BadRequest("Query is too old and response timeout expired")
+
+    asyncio.run(_answer_quietly(Query()))  # no exception
+
+
+def test_timestamp_error_resyncs_and_retries_signed_requests_once():
+    from options_trading.client import BinanceOptionsApiError, BinanceOptionsClient
+
+    client = BinanceOptionsClient(api_key="k", secret_key="s")
+    calls = []
+
+    def once(method, path, params=None, *, signed=False):
+        calls.append(path)
+        if path == "/eapi/v1/time":
+            return {"serverTime": int(time.time() * 1000)}
+        if calls.count(path) == 1:
+            raise BinanceOptionsApiError("Timestamp outside recvWindow", code=-1021, status=400)
+        return {"ok": True}
+
+    client._request_once = once
+    assert client._request("GET", "/eapi/v1/position", signed=True) == {"ok": True}
+    assert calls == ["/eapi/v1/position", "/eapi/v1/time", "/eapi/v1/position"]
+
+    calls.clear()
+
+    def other_error(method, path, params=None, *, signed=False):
+        calls.append(path)
+        raise BinanceOptionsApiError("bad", code=-2010, status=400)
+
+    client._request_once = other_error
+    with pytest.raises(BinanceOptionsApiError):
+        client._request("GET", "/eapi/v1/position", signed=True)
+    assert calls == ["/eapi/v1/position"]
+
+
+def test_sync_time_keeps_timestamps_behind_the_server():
+    from options_trading.client import BinanceOptionsClient
+
+    client = BinanceOptionsClient()
+    server_now = int(time.time() * 1000) + 3_000  # local clock 3s slow
+    client._request_once = lambda *a, **k: {"serverTime": server_now}
+    client.sync_time()
+    assert 2_000 < client._server_offset_ms < 3_000
+
+
+def test_direction_wait_reason_shows_scores():
+    from options_trading.adaptive_runtime import _direction_wait_text
+
+    text = _direction_wait_text(
+        [{"underlying": "BTCUSDT", "trend_score": 0.052, "squeeze_score": -0.524}],
+        normalize_options_config({"btc_only": True}),
+    )
+    assert text == "방향 신호 대기 — BTC 추세 +0.05 (기준 ±0.46) · 압축돌파 0.52 (기준 0.58)"

@@ -270,6 +270,14 @@ class ControllerOptionsMixin:
             )
         return lines
 
+    def _btc_options_settings_text(self):
+        # Setting buttons confirm from config only: no exchange round-trips,
+        # so a press is never slowed down (or timed out) by the API.
+        return (
+            "\n".join(self._btc_options_header_lines(self._options_service().config()))
+            + "\n\n✅ 저장됨 · 계좌·후보 현황은 📊 상태 버튼으로 확인하세요."
+        )
+
     async def _format_btc_options_status(self):
         cfg = self._options_service().config()
         body = await self._format_options_status(refresh=True)
@@ -346,13 +354,13 @@ class ControllerOptionsMixin:
                 prefix = f"🗓 만기 범위: {BTC_DTE_PRESET_LABELS[preset]}"
             else:
                 prefix = "알 수 없는 만기 설정입니다."
-            return prefix + "\n\n" + await self._format_btc_options_status(), keyboard()
+            return prefix + "\n\n" + self._btc_options_settings_text(), keyboard()
         if action.startswith("spr:"):
             choice = normalize_btc_spread_choice(action.split(":", 1)[1])
             await self.cfg.update_value(["options_trading", "btc_max_spread_pct"], choice)
             return (
                 f"↔️ 최대 스프레드: {choice * 100:.0f}%\n\n"
-                + await self._format_btc_options_status(),
+                + self._btc_options_settings_text(),
                 keyboard(),
             )
         if action == "help":
@@ -401,7 +409,7 @@ class ControllerOptionsMixin:
             query = update.callback_query
             if not query:
                 return
-            await query.answer()
+            await _answer_quietly(query)
             action = str(query.data or "").split(":", 1)[-1]
             text, keyboard = await self._handle_btc_options_action(action)
             await self._edit_options_message(query, text, keyboard=keyboard)
@@ -421,7 +429,7 @@ class ControllerOptionsMixin:
             query = update.callback_query
             if not query:
                 return
-            await query.answer()
+            await _answer_quietly(query)
             action = str(query.data or "").split(":", 1)[-1]
             if action == "on":
                 preflight = await self._options_service().preflight()
@@ -530,6 +538,14 @@ class ControllerOptionsMixin:
                 logger.exception("Options scheduler cycle failed")
             interval = self._options_service().config().get("manage_interval_seconds", 10)
             await asyncio.sleep(max(5, int(interval)))
+
+
+async def _answer_quietly(query):
+    try:
+        await query.answer()
+    except BadRequest as exc:
+        # "Query is too old": the spinner is gone, but the press still counts.
+        logger.info("Options callback answer skipped: %s", exc)
 
 
 def _candidate_expiry_ms(candidate):
