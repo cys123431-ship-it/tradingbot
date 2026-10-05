@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .controller_automatic_controls import ControllerAutomaticTradingControlsMixin
+from .controller_btc_pullback import ControllerBtcPullbackMixin
 from .controller_custom_entry import ControllerCustomEntryMixin
 from .controller_ema200_utbot_rsi import ControllerEMA200UTBotRSIMixin
 from .controller_emergency import ControllerEmergencyMixin
@@ -24,6 +25,7 @@ class MainController(
     ControllerAutomaticTradingControlsMixin,
     ControllerCustomEntryMixin,
     ControllerOptionsMixin,
+    ControllerBtcPullbackMixin,
     TelegramSetupMixin,
     ControllerReportingMixin,
     ControllerEmergencyMixin,

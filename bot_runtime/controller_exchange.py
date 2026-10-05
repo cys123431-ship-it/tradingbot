@@ -2013,6 +2013,7 @@ class ControllerExchangeMixin:
             self._daily_analysis_report_loop(),
             self._alt_trend_alert_loop(),
             self._options_trading_loop(),
+            self._btc_pullback_loop(),
             self._heartbeat_loop()
         )
 

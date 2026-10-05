@@ -243,6 +243,9 @@ class ControllerOptionsMixin:
         result = await self.emergency_stop()
         text = self._format_emergency_stop_reply(result)
         extra = await self._stop_all_auxiliary_trading()
+        stop_pullback = getattr(self, "_stop_btc_pullback_for_emergency", None)
+        if callable(stop_pullback):
+            extra = list(extra) + await stop_pullback()
         if extra:
             text += "\n\n" + "\n".join(extra)
         return text

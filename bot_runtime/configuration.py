@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from options_trading.config import default_options_config, normalize_options_config
+from btc_ema_pullback.config import default_btc_pullback_config, normalize_btc_pullback_config
 
 from .ema200_utbot_rsi import (
     EMA200_UTBOT_RSI_CONFIG_KEY,
@@ -84,6 +85,7 @@ class TradingConfig:
                 'monitoring_interval_seconds': 3
             },
             'options_trading': default_options_config(),
+            'btc_ema_pullback': default_btc_pullback_config(),
             'shannon_engine': {
                 'leverage': 5,
                 'daily_loss_limit': 5000,
@@ -962,6 +964,12 @@ class TradingConfig:
             self.config['options_trading'] = normalized_options
             changed = True
 
+        pullback_cfg = self.config.setdefault('btc_ema_pullback', {})
+        normalized_pullback = normalize_btc_pullback_config(pullback_cfg)
+        if pullback_cfg != normalized_pullback:
+            self.config['btc_ema_pullback'] = normalized_pullback
+            changed = True
+
         upbit_cfg = self.config.setdefault('upbit', {})
         upbit_watchlist = upbit_cfg.get('watchlist')
         if not isinstance(upbit_watchlist, list) or not upbit_watchlist:
@@ -1140,6 +1148,7 @@ class TradingConfig:
                 "monitoring_interval_seconds": 3
             },
             "options_trading": default_options_config(),
+            "btc_ema_pullback": default_btc_pullback_config(),
             "exchange_watchlists": {
                 BINANCE_TESTNET: list(EXCHANGE_MODE_DEFAULT_WATCHLISTS[BINANCE_TESTNET]),
                 BINANCE_MAINNET: list(EXCHANGE_MODE_DEFAULT_WATCHLISTS[BINANCE_MAINNET]),
