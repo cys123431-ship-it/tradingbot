@@ -212,8 +212,11 @@ def test_prohibited_behaviours_cannot_be_enabled_and_dry_run_is_default():
 
 
 # ------------------------------------------------------- service harness
+SAME = object()
+
+
 class Harness:
-    def __init__(self, tmp_path, *, live=True, network="testnet", creds=True, main_network="mainnet", **cfg):
+    def __init__(self, tmp_path, *, live=True, network="testnet", creds=True, main_network=SAME, **cfg):
         self.h1, self.m15 = trend_1h(), long_setup_15m()
         self.now_ms = now_after(self.m15)
         self.fake = FakeBinance(h1=self.h1, m15=self.m15)
@@ -222,7 +225,8 @@ class Harness:
         self.cfg = {"enabled": True, "trading_mode": "LIVE" if live else "DRY_RUN", "network": network, **cfg}
         self.notes = []
         self.creds = creds
-        self.main_network = main_network
+        # The strategy follows the bot's /setup exchange mode.
+        self.main_network = network if main_network is SAME else main_network
         self.tmp_path = tmp_path
         self.service = self.build()
 
@@ -273,7 +277,7 @@ def test_live_entry_places_closeposition_sl_and_tp_from_actual_fill(tmp_path):
 
 
 def test_mainnet_uses_fixed_base_quantity(tmp_path):
-    h = Harness(tmp_path, network="mainnet", main_network="testnet")
+    h = Harness(tmp_path, network="mainnet")
     h.fake.wallet = 300.0
     assert h.run()["action"] == "entered"
     assert h.state()["trade"]["quantity"] == "0.001"
@@ -311,7 +315,16 @@ def test_existing_position_blocks_new_entry(tmp_path):
     h.fake.position = {"side": "long", "contracts": 0.002, "entryPrice": 84_000}
     h.service.load_state("testnet", "LIVE")
     result = asyncio.run(h.service.maybe_enter("testnet", h.service.config(), "LIVE", h.state()))
-    assert result["reason"].startswith("POSITION_EXISTS")
+    assert result["reason"].startswith("ACCOUNT_POSITION_EXISTS")
+    assert h.fake.orders == []
+
+
+def test_any_position_on_the_shared_account_blocks_entry(tmp_path):
+    # /setup account is shared with the main bot: an ETH position held there blocks us.
+    h = Harness(tmp_path)
+    h.fake.other_positions = [{"symbol": "ETH/USDT:USDT", "side": "long", "contracts": 1.0, "entryPrice": 3000}]
+    result = h.run()
+    assert result["reason"].startswith("ACCOUNT_POSITION_EXISTS: ETH/USDT:USDT")
     assert h.fake.orders == []
 
 
@@ -395,15 +408,34 @@ def test_tp_exit_cancels_the_remaining_stop_and_records_net_pnl(tmp_path):
     assert compute_stats(h.service.ledger("testnet").trades(mode="LIVE"))["wins"] == 1
 
 
-def test_restart_adopts_unprotected_position_and_protects_it(tmp_path):
+def test_restart_never_adopts_a_position_it_did_not_open(tmp_path):
+    # A BTCUSDT position from the main bot / manual trade on the shared account.
     h = Harness(tmp_path)
     h.cfg["enabled"] = False
     h.fake.position = {"side": "short", "contracts": 0.01, "entryPrice": 85_000}
     h.run()
+    assert h.state()["trade"] is None and h.state()["phase"] == "IDLE"
+    assert h.fake.algo_attempts == [] and h.fake.orders == []
+    events = [e["event"] for e in h.service.ledger("testnet").recent_events(20)]
+    assert "RECONCILE_FOREIGN_POSITION" in events
+    assert h.service.owned_position_keys() == set()
+
+
+def test_restart_recovers_own_position_from_its_protection_orders(tmp_path):
+    h = Harness(tmp_path)
+    h.run()  # our entry + SL/TP
+    ledger_path = h.service.ledger("testnet")
+    state = h.state()
+    state["trade"] = None  # local state lost
+    state["reconciled"] = False
+    h.service.save_state("testnet", "LIVE", state)
+    h.service = h.build()
+    h.cfg["enabled"] = False
+    h.run()
     trade = h.state()["trade"]
-    assert trade["side"] == "SHORT" and trade["rule_violation"] == "ADOPTED_UNTRACKED_POSITION"
-    stops = [o for o in h.fake.algos.values() if o["orderType"] == "STOP_MARKET"]
-    assert stops and stops[0]["side"] == "BUY" and stops[0]["triggerPrice"] == "85680.0"
+    assert trade and trade["rule_violation"] == "RECOVERED_FROM_OWN_PROTECTION_ORDERS"
+    assert h.service.owned_position_keys() == {"BTCUSDT"}
+    assert ledger_path is not None
 
 
 def test_restart_finalizes_a_trade_closed_while_offline(tmp_path):
@@ -448,11 +480,15 @@ def test_market_data_disconnect_blocks_entry_but_keeps_protection(tmp_path):
     assert h.state()["trade"] is not None  # not finalized on an outage
 
 
-def test_live_on_main_bot_account_is_refused(tmp_path):
-    h = Harness(tmp_path, main_network="testnet")
-    result = h.run()
-    assert result["reason"].startswith("SHARED_ACCOUNT_WITH_MAIN_BOT")
-    assert h.fake.orders == []
+def test_network_follows_the_setup_exchange_mode(tmp_path):
+    h = Harness(tmp_path, network="mainnet")
+    h.fake.wallet = 300.0
+    h.cfg["network"] = "testnet"  # ignored: /setup (mainnet) decides
+    assert h.run()["action"] == "entered"
+    assert h.service.load_state("mainnet", "LIVE")["trade"]["network"] == "mainnet"
+    upbit = Harness(tmp_path / "upbit", main_network=None)
+    assert upbit.run()["reason"] == "EXCHANGE_MODE_UNSUPPORTED"
+    assert upbit.fake.orders == []
 
 
 def test_live_without_api_keys_is_blocked(tmp_path):
@@ -504,9 +540,20 @@ class _Cfg:
 
 def _controller(tmp_path, options=None):
     from bot_runtime.controller_btc_pullback import ControllerBtcPullbackMixin
+    from bot_runtime.controller_options import ControllerOptionsMixin
 
-    controller = ControllerBtcPullbackMixin()
-    controller.cfg = _Cfg({"btc_ema_pullback": dict(options or {})})
+    class Controller(ControllerBtcPullbackMixin, ControllerOptionsMixin):
+        pass
+
+    controller = Controller()
+    controller.cfg = _Cfg({"btc_ema_pullback": dict(options or {}), "options_trading": {"enabled": True}})
+    controller.is_paused = False
+    controller.notes = []
+
+    async def notify_plain(text, event_type=None):
+        controller.notes.append(text)
+
+    controller.notify_plain = notify_plain
     h = Harness(tmp_path, live=False)
     h.cfg = controller.cfg.data["btc_ema_pullback"]
     controller.btc_pullback_service = h.build()
@@ -527,17 +574,53 @@ def test_telegram_menu_confirmations(tmp_path):
     assert controller.cfg.data["btc_ema_pullback"].get("enabled") is not True
     press("confirm_on")
     assert controller.cfg.data["btc_ema_pullback"]["enabled"] is True
+    assert controller.is_paused is True  # main futures entries paused: one strategy at a time
     _, markup = press("mode:live")
     assert "bp:confirm_live" in _callbacks(markup)
     assert controller.cfg.data["btc_ema_pullback"].get("trading_mode") != "LIVE"
     press("confirm_live")
     assert controller.cfg.data["btc_ema_pullback"]["trading_mode"] == "LIVE"
-    _, markup = press("net:mainnet")
-    assert "bp:confirm_mainnet" in _callbacks(markup)
+    # No separate network switch: the bot's /setup exchange decides.
+    assert not any(str(c).startswith("bp:net") for c in _callbacks(markup))
+    assert "/setup" in press("status")[0]
     text, _ = press("rules")
     assert "보장" in text and "guaranteed" not in text.lower()
     text, _ = press("stats")
     assert "기대값" in text
+
+
+def test_other_futures_strategy_turns_pullback_off(tmp_path):
+    controller, _ = _controller(tmp_path, {"enabled": True})
+    asyncio.run(controller._turn_off_options_for_futures_strategy())
+    assert controller.cfg.data["btc_ema_pullback"]["enabled"] is False
+    assert controller.cfg.data["options_trading"]["enabled"] is False
+    assert any("BTC 눌림목 전략 신규 진입을 OFF" in n for n in controller.notes)
+    # When the pullback itself is switched on it only turns options off.
+    controller.cfg.data["btc_ema_pullback"]["enabled"] = True
+    controller.cfg.data["options_trading"]["enabled"] = True
+    asyncio.run(controller._turn_off_options_for_futures_strategy(include_btc_pullback=False))
+    assert controller.cfg.data["btc_ema_pullback"]["enabled"] is True
+
+
+def test_resume_and_scanner_respect_the_pullback_position():
+    from pathlib import Path
+
+    root = Path(__file__).parents[1] / "bot_runtime"
+    telegram = (root / "controller_telegram.py").read_text(encoding="utf-8")
+    resume = telegram[telegram.index('elif action == "RESUME":'):]
+    assert "_turn_off_btc_pullback_for_futures_strategy" in resume[: resume.index("return ConversationHandler.END")]
+    scanner = (root / "signal_scanner.py").read_text(encoding="utf-8")
+    sweep = scanner.index("_btc_pullback_owned_position_keys")
+    assert sweep < scanner.index("# 0. Add Existing Positions to Targets (Safety Net)")
+    assert sweep < scanner.index("Scanner adopted existing exchange position after startup")
+
+
+def test_owned_position_keys_follow_the_live_trade(tmp_path):
+    controller, h = _controller(tmp_path)
+    assert controller._btc_pullback_owned_position_keys() == set()
+    live = Harness(tmp_path / "live")
+    live.run()
+    assert live.service.owned_position_keys() == {"BTCUSDT"}
 
 
 def test_main_keyboard_has_btcpullback_button():

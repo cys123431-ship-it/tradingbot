@@ -26,7 +26,7 @@ from .strategy_registry import BINANCE_MAINNET, BINANCE_TESTNET
 logger = logging.getLogger(__name__)
 _KST = ZoneInfo("Asia/Seoul")
 CONFIG_KEY = "btc_ema_pullback"
-NETWORK_LABELS = {NETWORK_TESTNET: "테스트넷(데모 5,000 USDT)", NETWORK_MAINNET: "메인넷(실계좌)"}
+NETWORK_LABELS = {NETWORK_TESTNET: "테스트넷(데모)", NETWORK_MAINNET: "메인넷(실계좌)"}
 
 
 def _n(value, default=0.0):
@@ -60,8 +60,9 @@ class ControllerBtcPullbackMixin:
             return self.cfg.get(CONFIG_KEY, {}) or {}
 
         def credentials_getter(network):
-            api_cfg = self.cfg.get("api", {}) or {}
-            return api_cfg.get("testnet" if network == NETWORK_TESTNET else "mainnet", {}) or {}
+            # Same keys /setup stores for the bot's own exchange connection.
+            mode = BINANCE_TESTNET if network == NETWORK_TESTNET else BINANCE_MAINNET
+            return self._get_exchange_credentials(mode) or {}
 
         def exchange_factory(network, creds):
             mode = BINANCE_TESTNET if network == NETWORK_TESTNET else BINANCE_MAINNET
@@ -116,10 +117,6 @@ class ControllerBtcPullbackMixin:
                 InlineKeyboardButton(mark(cfg.get("trading_mode") == TRADING_MODE_LIVE, "💥 LIVE"), callback_data="bp:mode:live"),
             ],
             [
-                InlineKeyboardButton(mark(cfg.get("network") == NETWORK_TESTNET, "🧪 테스트넷"), callback_data="bp:net:testnet"),
-                InlineKeyboardButton(mark(cfg.get("network") == NETWORK_MAINNET, "💰 메인넷"), callback_data="bp:net:mainnet"),
-            ],
-            [
                 InlineKeyboardButton("📊 상태", callback_data="bp:status"),
                 InlineKeyboardButton("📈 성과 통계", callback_data="bp:stats"),
             ],
@@ -142,6 +139,11 @@ class ControllerBtcPullbackMixin:
     async def _format_btc_pullback_status(self):
         service = self._btc_pullback_service()
         status = await service.status()
+        if status.get("unsupported"):
+            return (
+                "📐 BTC EMA 눌림목 전략\n"
+                "지금 /setup 거래소가 업비트라 사용할 수 없습니다. /setup에서 바이낸스(테스트넷 데모 또는 메인넷)를 선택하세요."
+            )
         cfg, state = status["config"], status["state"]
         mode, network = status["mode"], status["network"]
         trade = state.get("trade") or {}
@@ -162,7 +164,8 @@ class ControllerBtcPullbackMixin:
             "📐 BTC EMA 눌림목 전략 (1h 추세 + 15m 눌림)",
             f"전략: {'ON' if cfg['enabled'] else 'OFF'} · 모드: {mode}"
             + (" (환경변수로 DRY_RUN 강제)" if cfg["trading_mode"] == TRADING_MODE_LIVE and mode == TRADING_MODE_DRY_RUN else ""),
-            f"네트워크: {NETWORK_LABELS.get(network, network)} · API 키: {'있음' if status['has_credentials'] else '없음'}",
+            f"거래소: {NETWORK_LABELS.get(network, network)} (/setup 선택을 따름) · API 키: {'있음' if status['has_credentials'] else '없음'}",
+            f"메인 선물 자동매매: {'일시정지' if getattr(self, 'is_paused', False) else '동작 중'} (둘 중 하나만 켜짐)",
             f"단계: {state.get('phase')}",
             f"수량: {sizing_text}",
             f"손절 {_n(cfg['stop_loss_pct']) * 100:.1f}% · 익절 {_n(cfg['take_profit_pct']) * 100:.1f}% · "
@@ -170,8 +173,6 @@ class ControllerBtcPullbackMixin:
             f"오늘({status['day']} KST): 거래 {len(today)}/{cfg['max_trades_per_day']} · "
             f"순손익 {sum(_n(t.get('net_pnl')) for t in closed_today):+.4f} USDT · 연속 손실 {streak}/{cfg['max_consecutive_losses']}",
         ]
-        if mode == TRADING_MODE_LIVE and status["main_network"] == network and not cfg["allow_shared_account_with_main_bot"]:
-            lines.append("⚠️ 메인 봇과 같은 계좌라 LIVE 신규 진입이 차단됩니다.")
         if mode == TRADING_MODE_DRY_RUN and not status["has_credentials"]:
             lines.append(f"가상 잔고: {cfg['dry_run_balance_usdt']} USDT + 가상 손익 (API 키 없음)")
         if trade:
@@ -196,6 +197,8 @@ class ControllerBtcPullbackMixin:
 
     async def _format_btc_pullback_stats(self):
         status = await self._btc_pullback_service().status()
+        if status.get("unsupported"):
+            return "/setup 거래소가 업비트라 사용할 수 없습니다."
         s = status["stats"]
         pf = s["profit_factor"]
         return "\n".join([
@@ -209,8 +212,10 @@ class ControllerBtcPullbackMixin:
         ])
 
     def _format_btc_pullback_signals(self):
-        cfg = self._btc_pullback_service().config()
-        events = self._btc_pullback_service().ledger(cfg["network"]).recent_events(8, kinds={"SIGNAL", "SKIP", "ORDER", "EXIT", "FAILSAFE"})
+        network = self._btc_pullback_service().current_network()
+        if not network:
+            return "/setup 거래소가 업비트라 사용할 수 없습니다."
+        events = self._btc_pullback_service().ledger(network).recent_events(8, kinds={"SIGNAL", "SKIP", "ORDER", "EXIT", "FAILSAFE"})
         if not events:
             return "🧾 아직 기록된 신호 판단이 없습니다. (15분봉이 마감될 때마다 기록됩니다)"
         lines = ["🧾 최근 판단 (최신순)"]
@@ -239,7 +244,8 @@ class ControllerBtcPullbackMixin:
             f"• 1회 위험 ≤ 지갑의 {_n(cfg['max_risk_per_trade_pct']) * 100:.1f}% (수수료·슬리피지 포함), 넘으면 SKIP\n"
             f"• 하루 {cfg['max_trades_per_day']}회 · {cfg['max_consecutive_losses']}연속 손실 · 하루 -{_n(cfg['max_daily_loss_pct']) * 100:.1f}% 도달 시 당일 신규 진입 중단 (KST 자정 기준)\n"
             "• 물타기·추가진입·마틴게일·손절 확대 없음, 동시에 BTCUSDT 1포지션만\n"
-            "• 메인넷: 0.001 BTC 고정 / 테스트넷: 위험 기반 수량(소액 한도 해제)\n"
+            "• 거래소는 /setup 선택을 따름 · 메인넷: 0.001 BTC 고정 / 테스트넷(데모): 위험 기반 수량(소액 한도 해제)\n"
+            "• 다른 선물 전략과 동시에 켜지지 않음 (켜면 메인 선물 자동매매 일시정지, 다른 전략·RESUME 누르면 이 전략 OFF)\n"
             "• 수익을 보장하지 않는 전략입니다."
         )
 
@@ -261,28 +267,37 @@ class ControllerBtcPullbackMixin:
             return self._build_btc_pullback_keyboard(service.config(), confirm=confirm)
 
         cfg = service.config()
-        state = service.load_state(cfg["network"], service.mode(cfg))
+
+        network = service.current_network(cfg)
+        if not network:
+            return await self._format_btc_pullback_status(), keyboard()
+        state = service.load_state(network, service.mode(cfg))
         holding = bool(state.get("trade"))
 
         if action == "on":
             return (
                 "⚠️ BTC 눌림목 전략을 켤까요?\n"
-                f"모드 {service.mode(cfg)} · {NETWORK_LABELS[cfg['network']]}\n"
+                f"모드 {service.mode(cfg)} · {NETWORK_LABELS[network]} (/setup)\n"
+                "켜면 메인 선물 자동매매(EMA200 등)의 신규 진입이 일시정지됩니다.\n"
                 + ("실제 주문이 나갑니다." if service.mode(cfg) == TRADING_MODE_LIVE else "DRY_RUN: 실제 주문 없이 가상 체결만 기록합니다."),
                 keyboard(("✅ 전략 시작", "bp:confirm_on")),
             )
         if action == "confirm_on":
             await self._set_btc_pullback_value("enabled", True)
-            if service.mode() == TRADING_MODE_LIVE and service.config()["network"] == NETWORK_MAINNET:
+            # One futures strategy at a time: pause the main engine's entries.
+            was_running = not getattr(self, "is_paused", False)
+            self.is_paused = True
+            if service.mode() == TRADING_MODE_LIVE and network == NETWORK_MAINNET:
                 turn_off = getattr(self, "_turn_off_options_for_futures_strategy", None)
                 if callable(turn_off):
-                    await turn_off()
-            return "✅ BTC 눌림목 전략 ON\n\n" + await self._format_btc_pullback_status(), keyboard()
+                    await turn_off(include_btc_pullback=False)
+            note = "\n메인 선물 자동매매 신규 진입을 일시정지했습니다 (보유 포지션 관리는 계속)." if was_running else ""
+            return "✅ BTC 눌림목 전략 ON" + note + "\n\n" + await self._format_btc_pullback_status(), keyboard()
         if action == "off":
             await self._set_btc_pullback_value("enabled", False)
             return "⏹ 신규 진입 OFF (보유 포지션 보호는 계속)\n\n" + await self._format_btc_pullback_status(), keyboard()
-        if action.startswith(("mode:", "net:")) and holding:
-            return "⚠️ 포지션 보유 중에는 모드/네트워크를 바꿀 수 없습니다. 먼저 정리하세요.", keyboard()
+        if action.startswith("mode:") and holding:
+            return "⚠️ 포지션 보유 중에는 모드를 바꿀 수 없습니다. 먼저 정리하세요.", keyboard()
         if action == "mode:dry":
             await self._set_btc_pullback_value("trading_mode", TRADING_MODE_DRY_RUN)
             service.reset_reconciliation()
@@ -290,7 +305,7 @@ class ControllerBtcPullbackMixin:
         if action == "mode:live":
             return (
                 "⚠️ LIVE로 전환할까요? 실제 주문이 나갑니다.\n"
-                f"네트워크: {NETWORK_LABELS[cfg['network']]}\n"
+                f"거래소: {NETWORK_LABELS[network]} (/setup)\n"
                 f"환경변수 {TRADING_MODE_ENV}=DRY_RUN 이 설정돼 있으면 계속 DRY_RUN으로 동작합니다.",
                 keyboard(("✅ LIVE 전환", "bp:confirm_live")),
             )
@@ -298,19 +313,6 @@ class ControllerBtcPullbackMixin:
             await self._set_btc_pullback_value("trading_mode", TRADING_MODE_LIVE)
             service.reset_reconciliation()
             return "💥 LIVE 전환 완료 (다음 주기에 거래소 상태를 먼저 대조합니다)\n\n" + await self._format_btc_pullback_status(), keyboard()
-        if action == "net:testnet":
-            await self._set_btc_pullback_value("network", NETWORK_TESTNET)
-            service.reset_reconciliation()
-            return "🧪 테스트넷(데모)으로 전환\n\n" + await self._format_btc_pullback_status(), keyboard()
-        if action == "net:mainnet":
-            return (
-                "⚠️ 메인넷(실계좌)으로 바꿀까요?\n수량은 0.001 BTC 고정 규칙이 적용됩니다.",
-                keyboard(("✅ 메인넷 전환", "bp:confirm_mainnet")),
-            )
-        if action == "confirm_mainnet":
-            await self._set_btc_pullback_value("network", NETWORK_MAINNET)
-            service.reset_reconciliation()
-            return "💰 메인넷으로 전환\n\n" + await self._format_btc_pullback_status(), keyboard()
         if action == "stats":
             return await self._format_btc_pullback_stats(), keyboard()
         if action == "signals":
@@ -349,6 +351,31 @@ class ControllerBtcPullbackMixin:
 
         self.tg_app.add_handler(CommandHandler("btcpullback", owner_only(btc_pullback_cmd)))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(btc_pullback_callback), pattern=r"^bp:"))
+
+    def _btc_pullback_owned_position_keys(self):
+        """Positions the main engine must not adopt or manage."""
+        service = getattr(self, "btc_pullback_service", None)
+        if service is None:
+            service = self._btc_pullback_service()
+        return service.owned_position_keys()
+
+    async def _turn_off_btc_pullback_for_futures_strategy(self):
+        """Another futures strategy (or RESUME) took over: switch new entries OFF."""
+        try:
+            if not (self.cfg.get(CONFIG_KEY, {}) or {}).get("enabled"):
+                return False
+            await self._set_btc_pullback_value("enabled", False)
+        except Exception:
+            logger.exception("Could not switch the BTC pullback strategy off")
+            return False
+        try:
+            await self.notify_plain(
+                "⏹ 다른 선물 전략이 켜져서 BTC 눌림목 전략 신규 진입을 OFF 했습니다.\n"
+                "이 전략이 보유한 포지션은 손절·익절 관리를 계속합니다. 다시 켜려면 /btcpullback"
+            )
+        except Exception:
+            logger.exception("BTC pullback off notification failed")
+        return True
 
     async def _stop_btc_pullback_for_emergency(self):
         """STOP button: strategy OFF and its position closed (LIVE reduce-only / paper)."""

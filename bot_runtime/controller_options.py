@@ -186,11 +186,17 @@ class ControllerOptionsMixin:
 
     # ----- interplay with futures strategies and the STOP button -----
 
-    async def _turn_off_options_for_futures_strategy(self):
+    async def _turn_off_options_for_futures_strategy(self, include_btc_pullback=True):
         """Activating a futures strategy switches option new entries off.
 
-        Held bot options keep their stop/take-profit management.
+        Held bot options keep their stop/take-profit management.  The
+        standalone BTC pullback strategy is also switched off (one futures
+        strategy at a time) unless it is the strategy being activated.
         """
+        if include_btc_pullback:
+            pullback_off = getattr(self, "_turn_off_btc_pullback_for_futures_strategy", None)
+            if callable(pullback_off):
+                await pullback_off()
         try:
             options_cfg = self.cfg.get("options_trading", {}) or {}
             if not options_cfg.get("enabled"):

@@ -21,6 +21,10 @@ class ControllerTelegramMixin:
             await update.message.reply_text("⏸ 일시정지 (매매 중단, 모니터링 유지)")
             return ConversationHandler.END
         elif action == "RESUME":
+            # Resuming the main futures engine: one futures strategy at a time.
+            pullback_off = getattr(self, "_turn_off_btc_pullback_for_futures_strategy", None)
+            if callable(pullback_off):
+                await pullback_off()
             critical_pause = load_critical_pause_state()
             if critical_pause:
                 write_manual_resume_request(

@@ -73,6 +73,7 @@ class FakeBinance:
         self.wallet = wallet
         self.info = info or exchange_info()
         self.position = None
+        self.other_positions = []  # positions on other symbols (main bot / manual)
         self.orders = []
         self.algos = {}
         self.algo_attempts = []
@@ -126,9 +127,10 @@ class FakeBinance:
     def fetch_positions(self, symbols=None):
         if self.raise_positions:
             raise TimeoutError("positions timeout")
-        if not self.position:
-            return []
-        return [dict(self.position, symbol="BTC/USDT:USDT")]
+        rows = [dict(self.position, symbol="BTC/USDT:USDT")] if self.position else []
+        if symbols is None:
+            rows += [dict(p) for p in self.other_positions]
+        return rows
 
     # --- regular orders
     def fapiPrivateGetOrder(self, params):

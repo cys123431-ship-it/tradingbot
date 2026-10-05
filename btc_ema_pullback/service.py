@@ -75,6 +75,10 @@ def _iso(ms):
     return datetime.fromtimestamp(int(ms) / 1000, timezone.utc).isoformat()
 
 
+def _market_key(symbol):
+    return str(symbol or "").upper().split(":", 1)[0].replace("/", "")
+
+
 def _position_qty(position):
     if not position:
         return 0.0
@@ -134,6 +138,12 @@ class BtcEmaPullbackService:
 
     def mode(self, cfg=None):
         return effective_trading_mode(cfg or self.config(), self._environ)
+
+    def current_network(self, cfg=None):
+        """The bot's own /setup exchange (demo testnet or mainnet); None for Upbit."""
+        if self.main_network_getter is None:  # tests / offline backtests
+            return (cfg or self.config()).get("network") or NETWORK_TESTNET
+        return self._main_network()
 
     def now_ms(self):
         return int(self._clock() * 1000)
@@ -301,7 +311,9 @@ class BtcEmaPullbackService:
     async def status(self):
         cfg = self.config()
         mode = self.mode(cfg)
-        network = cfg["network"]
+        network = self.current_network(cfg)
+        if not network:
+            return {"config": cfg, "mode": mode, "network": None, "unsupported": True}
         state = self.load_state(network, mode)
         start, end, day_key = trading_day_bounds(datetime.fromtimestamp(self._clock(), timezone.utc), cfg["day_timezone"])
         trades_today = self.ledger(network).trades(mode=mode, network=network, since=start, until=end)
@@ -319,7 +331,6 @@ class BtcEmaPullbackService:
             "last_signal": last_signal,
             "last_skip": last_skip,
             "stats": compute_stats(all_trades),
-            "main_network": self._main_network(),
         }
 
     def _main_network(self):
@@ -335,7 +346,9 @@ class BtcEmaPullbackService:
         async with self._cycle_lock:
             cfg = self.config()
             mode = self.mode(cfg)
-            network = cfg["network"]
+            network = self.current_network(cfg)
+            if not network:
+                return {"action": "blocked", "reason": "EXCHANGE_MODE_UNSUPPORTED"}
             state = self.load_state(network, mode)
             try:
                 if mode == TRADING_MODE_LIVE:
@@ -415,9 +428,6 @@ class BtcEmaPullbackService:
     async def pre_trade_validation(self, network, cfg, mode, signal):
         """Return (decision, skip_reason, log_context)."""
         context = {}
-        main = self._main_network()
-        if mode == TRADING_MODE_LIVE and main == network and not cfg["allow_shared_account_with_main_bot"]:
-            return None, "SHARED_ACCOUNT_WITH_MAIN_BOT: 메인 봇과 같은 계좌에서는 LIVE 금지", context
         try:
             wallet, available, equity, balance_source = await self.balances(network, cfg, mode)
         except Exception as exc:
@@ -432,11 +442,12 @@ class BtcEmaPullbackService:
 
         if mode == TRADING_MODE_LIVE:
             try:
-                position = await self.fetch_position(network)
+                positions = await self.fetch_account_positions(network)
             except Exception as exc:
                 return None, f"POSITION_STATE_UNCERTAIN: {exc}", context
-            if position:
-                return None, f"POSITION_EXISTS: {_position_side(position)} {_position_qty(position)}", context
+            if positions:
+                held = ", ".join(f"{p.get('symbol')} {_position_side(p)} {_position_qty(p)}" for p in positions[:3])
+                return None, f"ACCOUNT_POSITION_EXISTS: {held}", context
             setup_error = await self.ensure_account_setup(network, cfg)
             if setup_error:
                 return None, setup_error, context
@@ -668,13 +679,20 @@ class BtcEmaPullbackService:
         )
 
     # --------------------------------------------------------------- LIVE: io
+    async def fetch_account_positions(self, network):
+        exchange = await self.exchange(network)
+        positions = await self._call(exchange.fetch_positions)
+        if not isinstance(positions, list):
+            raise ValueError("invalid positions response")
+        return [row for row in positions if _position_qty(row) > 0]
+
     async def fetch_position(self, network):
         exchange = await self.exchange(network)
         positions = await self._call(exchange.fetch_positions, [CCXT_SYMBOL])
         if not isinstance(positions, list):
             raise ValueError("invalid positions response")
         for row in positions:
-            if _position_qty(row) > 0:
+            if _market_key(row.get("symbol")) == MARKET_ID and _position_qty(row) > 0:
                 return row
         return None
 
@@ -1074,6 +1092,17 @@ class BtcEmaPullbackService:
                 trade = self._new_trade(network, mode, signal, decision, {}, trade_id=pending["client_order_id"],
                                         entry_price=D(str(entry)), quantity=D(str(qty)), entry_ms=self.now_ms(), rules=rules, cfg=cfg)
                 trade["entry_client_order_id"] = pending["client_order_id"]
+            elif not trade and not any(
+                str(o.get("clientAlgoId") or "").startswith(CLIENT_ID_STRATEGY) for o in orders
+            ):
+                # Shared /setup account: a BTCUSDT position without our own
+                # trade record or our own TP/SL belongs to the main bot or to
+                # a manual trade.  Leave it alone (new entries stay blocked
+                # while any position exists).
+                ledger.event("RECONCILE_FOREIGN_POSITION", network=network, side=side, qty=qty, entry=entry)
+                state["pending_entry"] = None
+                self._set_phase(network, mode, state, IDLE, reconciled=True)
+                return
             elif not trade:
                 rules = await self.trading_rules(network, cfg)
                 bar = self.now_ms()
@@ -1081,8 +1110,8 @@ class BtcEmaPullbackService:
                 decision = {"fee_rate": (await self.taker_fee_rate(network, cfg))[0]}
                 trade = self._new_trade(network, mode, signal, decision, {}, trade_id=f"recovered-{bar}",
                                         entry_price=D(str(entry)), quantity=D(str(qty)), entry_ms=bar, rules=rules, cfg=cfg)
-                trade["rule_violation"] = "ADOPTED_UNTRACKED_POSITION"
-                await self._notify(f"⚠️ BTC 눌림목: 봇 기록에 없는 BTCUSDT {side} {qty} 포지션을 발견해 관리 대상으로 복구합니다.")
+                trade["rule_violation"] = "RECOVERED_FROM_OWN_PROTECTION_ORDERS"
+                await self._notify(f"⚠️ BTC 눌림목: 이 전략의 손절/익절 주문이 걸린 BTCUSDT {side} {qty} 포지션을 기록 없이 발견해 관리 대상으로 복구합니다.")
             else:
                 if side != trade["side"] or abs(qty - _f(trade["quantity"])) > 1e-9 or abs(entry - _f(trade["entry_price"])) > 1e-6:
                     ledger.event("RECONCILE_DIFF", network=network, bot=dict(side=trade["side"], qty=trade["quantity"], entry=trade["entry_price"]),
@@ -1114,7 +1143,9 @@ class BtcEmaPullbackService:
     # ------------------------------------------------------------ operator
     async def close_position(self, reason="manual_telegram"):
         cfg = self.config()
-        mode, network = self.mode(cfg), cfg["network"]
+        mode, network = self.mode(cfg), self.current_network(cfg)
+        if not network:
+            return {"action": "none", "reason": "EXCHANGE_MODE_UNSUPPORTED"}
         async with self._cycle_lock:
             state = self.load_state(network, mode)
             trade = state.get("trade")
@@ -1138,19 +1169,31 @@ class BtcEmaPullbackService:
     def needs_cycle(self):
         """True when the loop must run even with new entries switched off."""
         cfg = self.config()
+        network = self.current_network(cfg)
+        if not network:
+            return False
         if cfg["enabled"]:
             return True
-        state = self.load_state(cfg["network"], self.mode(cfg))
+        state = self.load_state(network, self.mode(cfg))
         return bool(state.get("trade") or state.get("pending_entry") or state.get("phase") not in {IDLE, None})
 
     def reset_reconciliation(self):
         """Force a fresh exchange reconciliation on the next LIVE cycle."""
         cfg = self.config()
-        for mode in (TRADING_MODE_LIVE,):
-            state = self.load_state(cfg["network"], mode)
+        network = self.current_network(cfg)
+        if network:
+            state = self.load_state(network, TRADING_MODE_LIVE)
             state["reconciled"] = False
-            self.save_state(cfg["network"], mode, state)
+            self.save_state(network, TRADING_MODE_LIVE, state)
         self._account_verified.clear()
+
+    def owned_position_keys(self):
+        """Market ids whose live position belongs to this strategy (main engine must skip them)."""
+        network = self.current_network()
+        if not network:
+            return set()
+        state = self.load_state(network, TRADING_MODE_LIVE)
+        return {MARKET_ID} if (state.get("trade") or state.get("pending_entry")) else set()
 
 
 __all__ = ("BtcEmaPullbackService", "CCXT_SYMBOL", "MARKET_ID")

@@ -967,6 +967,28 @@ class SignalScannerMixin:
                     f"Signal poll_tick: fetch_positions failed, continuing without server positions ({e})"
                 )
 
+            # A position opened by the standalone BTC pullback strategy is
+            # managed only by that strategy (one futures strategy at a time):
+            # never adopt it into the scanner or apply this engine's exits.
+            pullback_owner = getattr(
+                getattr(self, 'ctrl', None), '_btc_pullback_owned_position_keys', None
+            )
+            if callable(pullback_owner):
+                try:
+                    pullback_keys = set(pullback_owner() or ())
+                except Exception:
+                    pullback_keys = set()
+                if pullback_keys:
+                    def _pullback_key(value):
+                        return str(value or '').upper().split(':', 1)[0].replace('/', '')
+
+                    active_position_symbols = {
+                        sym for sym in active_position_symbols
+                        if _pullback_key(sym) not in pullback_keys
+                    }
+                    if _pullback_key(self.scanner_active_symbol) in pullback_keys:
+                        self.scanner_active_symbol = None
+
             try:
                 orphan_cleanup = await self._cleanup_orphan_protection_orders(
                     reason='poll tick orphan protection sweep',

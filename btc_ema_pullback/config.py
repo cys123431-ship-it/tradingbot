@@ -34,7 +34,8 @@ def default_btc_pullback_config() -> dict:
     return {
         "enabled": False,
         "trading_mode": TRADING_MODE_DRY_RUN,
-        # testnet = Binance Futures Demo Trading (the 5,000 USDT account).
+        # The live network follows the bot's /setup exchange mode; this value
+        # is only a fallback for offline tests/backtests.
         "network": NETWORK_TESTNET,
         "symbol": "BTCUSDT",
         "strategy_name": STRATEGY_NAME,
@@ -100,9 +101,6 @@ def default_btc_pullback_config() -> dict:
         "allow_martingale": False,
         "allow_averaging": False,
         "allow_auto_raise_to_exchange_minimum": False,
-        # LIVE on the same account/network the main futures bot trades is
-        # refused unless explicitly allowed (the two would fight over BTCUSDT).
-        "allow_shared_account_with_main_bot": False,
     }
 
 
@@ -208,7 +206,7 @@ def normalize_btc_pullback_config(raw=None) -> dict:
     for key in ("allow_pyramiding", "allow_martingale", "allow_averaging"):
         cfg[key] = False
     cfg["allow_auto_raise_to_exchange_minimum"] = _bool(cfg.get("allow_auto_raise_to_exchange_minimum"), False)
-    cfg["allow_shared_account_with_main_bot"] = _bool(cfg.get("allow_shared_account_with_main_bot"), False)
+    cfg.pop("allow_shared_account_with_main_bot", None)
     return cfg
 
 
