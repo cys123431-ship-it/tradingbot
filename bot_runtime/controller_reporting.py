@@ -5,6 +5,7 @@ from __future__ import annotations
 from .daily_analysis_report import (
     _git_revision as _daily_report_git_revision,
     _trade_net_pnl as _daily_report_trade_net_pnl,
+    btc_pullback_summary,
     build_daily_analysis_report,
     collect_daily_report_inputs,
     consistency_checks as _daily_report_consistency_checks,
@@ -148,7 +149,13 @@ class ControllerReportingMixin:
                 f"{end.astimezone(_DAILY_REPORT_KST):%m-%d %H:%M} KST\n"
                 f"거래 {len(inputs.get('trades') or [])}건 / 청산 {len(closed)}건 / "
                 f"순손익 {pnl:+.4f} USDT (수수료·펀딩 포함)\n"
-                f"코드 점검: CRITICAL {critical} / WARNING {warning}"
+                + (
+                    "BTC 눌림목: 진입 {0}건 / 청산 {1}건 / 순손익 {2:+.4f} USDT\n".format(
+                        *btc_pullback_summary(inputs)
+                    )
+                    if inputs.get('btc_pullback') else ""
+                )
+                + f"코드 점검: CRITICAL {critical} / WARNING {warning}"
             )[:1000],
         )
         return {'start': start, 'end': end, 'complete': complete, 'filename': filename}

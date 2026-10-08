@@ -851,7 +851,8 @@ class BtcEmaPullbackService:
                 try:
                     await algo.create_conditional_order(
                         CCXT_SYMBOL, order_type, close_side, None, trigger_price=trigger,
-                        client_algo_id=client_id, close_position=True, working_type=cfg["working_type"],
+                        client_algo_id=client_id, close_position=True,
+                        working_type=cfg["working_type"] if kind == "sl" else cfg["tp_working_type"],
                     )
                 except Exception as exc:
                     last_error = f"{type(exc).__name__}: {exc}"
@@ -880,7 +881,7 @@ class BtcEmaPullbackService:
             return await self.failsafe_close(network, cfg, state, f"SL_{sl}")
         tp = await self.place_protection(network, cfg, trade, "tp")
         self.ledger(network).event("PROTECTION", network=network, kind="tp", result=tp, trigger=trade["take_profit_price"],
-                                   working_type=cfg["working_type"])
+                                   working_type=cfg["tp_working_type"])
         trade["tp_missing"] = tp != "OK"
         trade["last_protection_check_ms"] = self.now_ms()
         entry_id = trade.get("entry_client_order_id")

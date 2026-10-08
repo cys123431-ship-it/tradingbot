@@ -268,6 +268,7 @@ def test_live_entry_places_closeposition_sl_and_tp_from_actual_fill(tmp_path):
     kinds = {a["type"]: a for a in h.fake.algo_attempts}
     assert kinds["STOP_MARKET"]["closePosition"] == "true" and "quantity" not in kinds["STOP_MARKET"]
     assert kinds["STOP_MARKET"]["workingType"] == "MARK_PRICE"
+    assert kinds["TAKE_PROFIT_MARKET"]["workingType"] == "CONTRACT_PRICE"  # fill near the target
     assert kinds["STOP_MARKET"]["side"] == "SELL" and kinds["TAKE_PROFIT_MARKET"]["side"] == "SELL"
     assert kinds["STOP_MARKET"]["triggerPrice"] == "84320.0"
     assert kinds["TAKE_PROFIT_MARKET"]["triggerPrice"] == "86360.0"
@@ -641,3 +642,94 @@ def test_config_defaults_are_registered():
     config._ensure_defaults()
     assert config.config["btc_ema_pullback"]["trading_mode"] == "DRY_RUN"
     assert config.config["btc_ema_pullback"]["enabled"] is False
+
+
+# ------------------------------------------- main engine / daily report
+def test_main_reconciliation_ignores_the_pullback_position_and_orders(tmp_path):
+    from trading_safety.order_state import SQLiteTradingStateStore
+    from trading_safety.reconciliation import reconcile_exchange_state
+
+    position = {"symbol": "BTC/USDT:USDT", "side": "short", "contracts": 0.0341, "entryPrice": 83352.0}
+    stop = {"symbol": "BTCUSDT", "clientOrderId": "btcpb-btcusdt-s-sl-abc", "type": "stop_market",
+            "side": "buy", "reduceOnly": True, "closePosition": True}
+
+    async def positions():
+        return [position]
+
+    async def orders():
+        return [stop]
+
+    def run(**kwargs):
+        store = SQLiteTradingStateStore(tmp_path / f"main{len(kwargs)}.sqlite3")
+        try:
+            result = asyncio.run(reconcile_exchange_state(
+                object(), store, position_fetcher=positions, open_orders_fetcher=orders, **kwargs))
+            return result, store.list_by_states(["FILLED_UNPROTECTED"])
+        finally:
+            store.close()
+
+    plain, synthetic = run()
+    assert any("exchange_position_without_local_record" in issue for issue in plain.issues)
+    assert synthetic  # the old behaviour: a fake "external" record
+    excluded, synthetic = run(excluded_position_keys={"BTCUSDT"}, excluded_client_id_prefixes=("btcpb-",))
+    assert excluded.positions == [] and not synthetic
+    assert not any("BTCUSDT" in issue for issue in excluded.issues)
+
+
+def test_signal_runtime_passes_the_pullback_exclusion():
+    import inspect
+
+    from bot_runtime.signal_runtime import SignalRuntimeMixin
+
+    source = inspect.getsource(SignalRuntimeMixin._reconcile_crypto_exchange_state)
+    assert "excluded_position_keys=pullback_keys" in source
+    assert "excluded_client_id_prefixes=('btcpb-',)" in source
+
+
+def _report_inputs():
+    start = datetime(2026, 10, 7, 0, 0, tzinfo=timezone.utc)
+    trades = [
+        {"trade_id": "a", "status": "CLOSED", "side": "SHORT", "quantity": "0.0335", "entry_price": "84188.0",
+         "stop_price": "84861.5", "take_profit_price": "82841.0", "exit_price": "82919.0", "exit_reason": "TP",
+         "entry_time": "2026-10-07T06:30:00+00:00", "exit_time": "2026-10-07T15:07:00+00:00",
+         "net_pnl": "40.5541", "commission": "2.2392", "funding": "0.2818", "r_multiple": "1.80"},
+        {"trade_id": "b", "status": "OPEN", "side": "SHORT", "quantity": "0.0341", "entry_price": "83352.0",
+         "stop_price": "84018.8", "take_profit_price": "82018.4", "entry_time": "2026-10-07T17:00:00+00:00"},
+    ]
+    return {
+        "window_start": start.isoformat(), "window_end": (start + timedelta(days=1)).isoformat(),
+        "generated_at": start.isoformat(), "trades": [], "journal": [], "positions_known": True,
+        "positions": [{"symbol": "BTC/USDT:USDT", "side": "short", "contracts": 0.0341}],
+        "audit": [{"symbol": "BTC/USDT:USDT", "client_order_id": "recon-btcusdt-s-found-59658c3d5e6d",
+                   "new_state": "FAILED", "detail": {"last_error": "order not found"}}],
+        "btc_pullback": {"network": "testnet", "mode": "LIVE", "enabled": True, "trades": trades, "signals": 2,
+                         "skip_counts": {"CHOP_EMA_FLAT": 40}, "failsafe_events": [], "protection_failures": [],
+                         "owned_keys": ["BTCUSDT"]},
+    }
+
+
+def test_daily_report_counts_pullback_trades_without_false_warnings():
+    from bot_runtime.daily_analysis_report import (
+        btc_pullback_summary,
+        build_daily_analysis_report,
+        consistency_checks,
+    )
+
+    inputs = _report_inputs()
+    codes = {code for _, code, _ in consistency_checks(inputs)}
+    assert "EXCHANGE_POSITION_NOT_IN_DB" not in codes and "ORDER_FAILED" not in codes
+    assert btc_pullback_summary(inputs) == (2, 1, pytest.approx(40.5541))
+    text = build_daily_analysis_report(inputs)
+    assert "[1-5 BTC 눌림목 전략" in text and "TP @ 82919.0" in text and "보유 중" in text
+    assert "CHOP_EMA_FLAT" in text
+    # A main-bot position on another symbol is still reported.
+    inputs["positions"].append({"symbol": "ETH/USDT:USDT", "side": "long", "contracts": 1})
+    assert "EXCHANGE_POSITION_NOT_IN_DB" in {code for _, code, _ in consistency_checks(inputs)}
+
+
+def test_daily_report_flags_pullback_failsafe():
+    from bot_runtime.daily_analysis_report import consistency_checks
+
+    inputs = _report_inputs()
+    inputs["btc_pullback"]["failsafe_events"] = [{"reason": "SL_FAILED:timeout"}]
+    assert ("CRITICAL", "BTC_PULLBACK_FAILSAFE") in {(s, c) for s, c, _ in consistency_checks(inputs)}

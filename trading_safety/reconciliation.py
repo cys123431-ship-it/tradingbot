@@ -456,6 +456,8 @@ async def reconcile_exchange_state(
     user_stream_ready: bool = True,
     require_user_stream: bool = False,
     position_visibility_grace_seconds: float = 30.0,
+    excluded_position_keys: Any = (),
+    excluded_client_id_prefixes: Any = (),
 ) -> ReconciliationResult:
     """Reconcile without placing or canceling orders.
 
@@ -473,6 +475,16 @@ async def reconcile_exchange_state(
     positions = list(snapshot.positions)
     regular_orders = list(snapshot.regular_orders)
     algo_orders = list(snapshot.algo_orders)
+    # Positions/orders owned by an independently managed strategy (e.g. the
+    # BTC pullback strategy) are invisible to this engine's reconciliation:
+    # no synthetic "external" records, no protection bookkeeping on them.
+    excluded_keys = {_normalize_symbol(key) for key in excluded_position_keys or ()}
+    excluded_prefixes = tuple(str(p).lower() for p in excluded_client_id_prefixes or () if str(p))
+    if excluded_keys:
+        positions = [p for p in positions if _normalize_symbol(_position_symbol(p)) not in excluded_keys]
+    if excluded_prefixes:
+        regular_orders = [o for o in regular_orders if not str(_order_client_id(o) or "").lower().startswith(excluded_prefixes)]
+        algo_orders = [o for o in algo_orders if not str(_order_client_id(o) or "").lower().startswith(excluded_prefixes)]
     open_orders = regular_orders + algo_orders
     unresolved_records: list[str] = []
     closed_position_symbols: list[str] = []

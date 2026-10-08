@@ -169,7 +169,7 @@ class ControllerBtcPullbackMixin:
             f"단계: {state.get('phase')}",
             f"수량: {sizing_text}",
             f"손절 {_n(cfg['stop_loss_pct']) * 100:.1f}% · 익절 {_n(cfg['take_profit_pct']) * 100:.1f}% · "
-            f"{cfg['leverage']}x ISOLATED · 트리거 {cfg['working_type']}",
+            f"{cfg['leverage']}x ISOLATED · 트리거 손절 {cfg['working_type']} / 익절 {cfg['tp_working_type']}",
             f"오늘({status['day']} KST): 거래 {len(today)}/{cfg['max_trades_per_day']} · "
             f"순손익 {sum(_n(t.get('net_pnl')) for t in closed_today):+.4f} USDT · 연속 손실 {streak}/{cfg['max_consecutive_losses']}",
         ]
@@ -240,7 +240,7 @@ class ControllerBtcPullbackMixin:
             f"• 진입(15분봉 마감 기준): 최근 {cfg['pullback_lookback']}봉 안에 EMA20 근처 눌림 → EMA50 붕괴 없음 → "
             "확인 캔들 종가가 직전 봉 고점(숏은 저점) 돌파\n"
             f"• 추격 금지: 확인 캔들 범위 > ATR×{cfg['max_entry_candle_atr_multiple']} 또는 몸통 > ATR×{cfg['max_entry_body_atr_multiple']}\n"
-            f"• 손절 {_n(cfg['stop_loss_pct']) * 100:.1f}% / 익절 {_n(cfg['take_profit_pct']) * 100:.1f}% (실제 평균 체결가 기준, MARK_PRICE 트리거, 포지션 종료 전용 주문)\n"
+            f"• 손절 {_n(cfg['stop_loss_pct']) * 100:.1f}% / 익절 {_n(cfg['take_profit_pct']) * 100:.1f}% (실제 평균 체결가 기준, 손절 {cfg['working_type']} / 익절 {cfg['tp_working_type']} 트리거, 포지션 종료 전용 주문)\n"
             f"• 1회 위험 ≤ 지갑의 {_n(cfg['max_risk_per_trade_pct']) * 100:.1f}% (수수료·슬리피지 포함), 넘으면 SKIP\n"
             f"• 하루 {cfg['max_trades_per_day']}회 · {cfg['max_consecutive_losses']}연속 손실 · 하루 -{_n(cfg['max_daily_loss_pct']) * 100:.1f}% 도달 시 당일 신규 진입 중단 (KST 자정 기준)\n"
             "• 물타기·추가진입·마틴게일·손절 확대 없음, 동시에 BTCUSDT 1포지션만\n"

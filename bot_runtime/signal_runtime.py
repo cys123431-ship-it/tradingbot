@@ -388,6 +388,17 @@ class SignalRuntimeMixin:
     ):
         _ensure_trading_safety_runtime(self)
         common = self.get_runtime_common_settings() if hasattr(self, 'get_runtime_common_settings') else {}
+        # The standalone BTC pullback strategy manages its own position and
+        # btcpb- TP/SL orders; this engine must not book them as external.
+        pullback_keys = set()
+        pullback_owner = getattr(
+            getattr(self, 'ctrl', None), '_btc_pullback_owned_position_keys', None
+        )
+        if callable(pullback_owner):
+            try:
+                pullback_keys = set(pullback_owner() or ())
+            except Exception:
+                pullback_keys = set()
         result = await reconcile_exchange_state(
             self.exchange,
             self.trading_state_store,
@@ -395,6 +406,8 @@ class SignalRuntimeMixin:
             liquidation_config=common,
             user_stream_ready=bool(user_stream_ready),
             require_user_stream=bool(require_user_stream),
+            excluded_position_keys=pullback_keys,
+            excluded_client_id_prefixes=('btcpb-',),
         )
         accounting_results = await self._account_for_reconciled_flat_trades(result)
         rollout_state = update_tradfi_profile_rollout(

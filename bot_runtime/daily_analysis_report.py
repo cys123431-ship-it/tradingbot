@@ -462,6 +462,7 @@ async def collect_daily_report_inputs(ctrl, start, end, *, market_replay=True, l
         inputs["errors"].append("trading state store unavailable")
         inputs.update(trade_results=[], order_records=[], audit=[], runtime_state={})
     inputs["journal"] = attempt("journal", lambda: read_journal(start, end), [])
+    inputs["btc_pullback"] = attempt("btc_pullback", lambda: _btc_pullback_inputs(ctrl, start, end), {})
     paths = log_paths if log_paths is not None else default_log_paths()
     inputs["logs"] = await asyncio.to_thread(scan_logs, paths, start, end)
 
@@ -507,6 +508,74 @@ async def collect_daily_report_inputs(ctrl, start, end, *, market_replay=True, l
             if replay is not None:
                 inputs["market_replay"][str(trade["id"])] = replay
     return inputs
+
+
+def _market_key(symbol):
+    return str(symbol or "").upper().split(":", 1)[0].replace("/", "")
+
+
+def _btc_pullback_inputs(ctrl, start, end):
+    """Trades and decisions of the standalone /btcpullback strategy in the window."""
+    factory = getattr(ctrl, "_btc_pullback_service", None)
+    if not callable(factory):
+        return {}
+    service = factory()
+    network = service.current_network()
+    if not network:
+        return {}
+    ledger = service.ledger(network)
+
+    def inside(value):
+        moment = _aware(value)
+        return bool(moment and start <= moment < end)
+
+    trades = [
+        t for t in ledger.trades(network=network)
+        if inside(t.get("entry_time")) or inside(t.get("exit_time")) or t.get("status") == "OPEN"
+    ]
+    events = [e for e in ledger.recent_events(5000, kinds={"SIGNAL", "SKIP", "FAILSAFE", "PROTECTION"}) if inside(e.get("ts"))]
+    skips = Counter(
+        str(e.get("skip_reason") or "").split(":", 1)[0]
+        for e in events
+        if e.get("event") in {"SIGNAL", "SKIP"} and e.get("skip_reason")
+    )
+    cfg = service.config()
+    return {
+        "network": network,
+        "mode": service.mode(cfg),
+        "enabled": bool(cfg.get("enabled")),
+        "trades": trades,
+        "signals": sum(1 for e in events if e.get("event") == "SIGNAL" and e.get("side") and not e.get("skip_reason")),
+        "skip_counts": dict(skips.most_common(12)),
+        "failsafe_events": [e for e in events if e.get("event") == "FAILSAFE"],
+        "protection_failures": [e for e in events if e.get("event") == "PROTECTION" and e.get("result") != "OK"],
+        "owned_keys": sorted(service.owned_position_keys()),
+    }
+
+
+def btc_pullback_summary(inputs, start=None, end=None):
+    """(entries, closes, net_pnl) of /btcpullback trades in the report window."""
+    data = inputs.get("btc_pullback") or {}
+    start = start or _aware(inputs.get("window_start"))
+    end = end or _aware(inputs.get("window_end"))
+
+    def inside(value):
+        moment = _aware(value)
+        return bool(moment and start and end and start <= moment < end)
+
+    trades = data.get("trades") or []
+    entries = [t for t in trades if inside(t.get("entry_time"))]
+    closes = [t for t in trades if t.get("status") == "CLOSED" and inside(t.get("exit_time"))]
+    net = sum(float(t.get("net_pnl") or 0.0) for t in closes)
+    return len(entries), len(closes), net
+
+
+def _btc_pullback_keys(inputs):
+    data = inputs.get("btc_pullback") or {}
+    keys = {_market_key(k) for k in data.get("owned_keys") or []}
+    if data.get("trades"):
+        keys.add("BTCUSDT")
+    return keys
 
 
 # ------------------------------------------------------------------ analysis
@@ -586,8 +655,16 @@ def consistency_checks(inputs):
         findings.append(("WARNING", "DUPLICATE_REDUCE_ONLY_CLOSE",
                          f"청산 체결 후 같은 청산 주문이 다시 제출돼 reduce-only 거절 {len(duplicate_close)}건 "
                          f"({', '.join(sorted({str(r.get('symbol')) for r in duplicate_close}))}); 최종 CLOSED라 손실 없음, 중복 제출 경로 점검 필요"))
+    pullback_keys = _btc_pullback_keys(inputs)
     for row in failed:
         if row in duplicate_close:
+            continue
+        if (
+            str(row.get("client_order_id") or "").startswith("recon-")
+            and _market_key(row.get("symbol")) in pullback_keys
+        ):
+            # Synthetic record the main reconciliation made for a /btcpullback
+            # position (before it was excluded): not a failed main-bot order.
             continue
         findings.append(("WARNING", "ORDER_FAILED",
                          f"{row.get('symbol')} {row.get('client_order_id')}: {(row.get('detail') or {}).get('last_error')}"))
@@ -599,7 +676,10 @@ def consistency_checks(inputs):
     if lock:
         findings.append(("WARNING", "ENTRY_LOCK_ACTIVE", f"신규진입 잠금 유지 중: {lock}"))
     open_db = {t["symbol"] for t in inputs.get("trades") or [] if not t.get("exit_time") and not t.get("archived_at")}
-    open_ex = {p.get("symbol") for p in inputs.get("positions") or []}
+    open_ex = {
+        p.get("symbol") for p in inputs.get("positions") or []
+        if _market_key(p.get("symbol")) not in pullback_keys
+    }
     if inputs.get("positions_known"):
         for symbol in sorted(open_db - open_ex):
             findings.append(("WARNING", "DB_OPEN_NOT_ON_EXCHANGE", f"{symbol}: DB에는 미청산인데 거래소 포지션 없음"))
@@ -613,6 +693,13 @@ def consistency_checks(inputs):
     if serious:
         findings.append(("WARNING", "LOG_ERRORS",
                          f"ERROR/CRITICAL 로그 {sum(g['count'] for g in serious)}건 ({len(serious)}종)"))
+    pullback = inputs.get("btc_pullback") or {}
+    for event in pullback.get("failsafe_events") or []:
+        findings.append(("CRITICAL", "BTC_PULLBACK_FAILSAFE",
+                         f"BTC 눌림목 보호주문 실패로 비상 정리: {event.get('reason')}"))
+    for event in pullback.get("protection_failures") or []:
+        findings.append(("WARNING", "BTC_PULLBACK_PROTECTION_FAILED",
+                         f"BTC 눌림목 {event.get('kind')} 등록 결과 {event.get('result')}"))
     for item in inputs.get("errors") or []:
         findings.append(("INFO", "REPORT_DATA_GAP", item))
     order = {"CRITICAL": 0, "WARNING": 1, "INFO": 2}
@@ -820,6 +907,29 @@ def build_daily_analysis_report(inputs):
     lines.append(f"  사유별: {dict(Counter(e.get('gate') or 'exit_tf_alignment' for e in blocks))}")
     for block in blocks[-60:]:
         lines.append(f"  · {_kst(block.get('ts'))} {block.get('symbol')} {str(block.get('side') or '').upper()} [{block.get('gate') or 'exit_tf_alignment'}] {block.get('reason')}")
+    lines.append("")
+    pullback = inputs.get("btc_pullback") or {}
+    lines.append("[1-5 BTC 눌림목 전략 (/btcpullback, 별도 기록)]")
+    if not pullback:
+        lines.append("  사용 안 함")
+    else:
+        entries, closes, net = btc_pullback_summary(inputs, start, end)
+        lines.append(
+            f"  상태: {'ON' if pullback.get('enabled') else 'OFF'} · {pullback.get('mode')} · {pullback.get('network')} / "
+            f"진입 {entries}건 / 청산 {closes}건 / 순손익 {net:+.4f} USDT (수수료·펀딩 포함) / 진입 신호 {pullback.get('signals')}회"
+        )
+        lines.append(f"  미진입 사유 상위: {pullback.get('skip_counts')}")
+        for trade in pullback.get("trades") or []:
+            lines.append(
+                f"  · {trade.get('side')} {trade.get('quantity')} @ {trade.get('entry_price')} ({_kst(trade.get('entry_time'))}) "
+                f"손절 {trade.get('stop_price')} / 익절 {trade.get('take_profit_price')} → "
+                + (
+                    f"{trade.get('exit_reason')} @ {_num(trade.get('exit_price'), 1)} ({_kst(trade.get('exit_time'))}) "
+                    f"순손익 {_num(trade.get('net_pnl'))} (수수료 {_num(trade.get('commission'))}, 펀딩 {_num(trade.get('funding'))}) "
+                    f"{_num(trade.get('r_multiple'), 2)}R"
+                    if trade.get("status") == "CLOSED" else "보유 중"
+                )
+            )
     lines.append("")
 
     # ----------------------------------------------------------- PART 2

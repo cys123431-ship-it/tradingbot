@@ -87,7 +87,10 @@ def default_btc_pullback_config() -> dict:
         # Never use more than this share of available balance as margin.
         "max_margin_usage_pct": "0.9",
         # --- protection orders ---
+        # Stop on MARK_PRICE (no wick stop-outs); take profit on the last
+        # traded price so the market fill lands near the target.
         "working_type": "MARK_PRICE",
+        "tp_working_type": "CONTRACT_PRICE",
         "protection_retry_attempts": 3,
         "protection_retry_delays_seconds": [0.5, 1.0, 2.0],
         "protection_check_interval_seconds": 60,
@@ -192,6 +195,8 @@ def normalize_btc_pullback_config(raw=None) -> dict:
 
     working_type = str(cfg.get("working_type") or "MARK_PRICE").strip().upper()
     cfg["working_type"] = working_type if working_type in {"MARK_PRICE", "CONTRACT_PRICE"} else "MARK_PRICE"
+    tp_working_type = str(cfg.get("tp_working_type") or "CONTRACT_PRICE").strip().upper()
+    cfg["tp_working_type"] = tp_working_type if tp_working_type in {"MARK_PRICE", "CONTRACT_PRICE"} else "CONTRACT_PRICE"
     cfg["protection_retry_attempts"] = _int(cfg.get("protection_retry_attempts"), 3, 1, 6)
     delays = cfg.get("protection_retry_delays_seconds")
     if not isinstance(delays, (list, tuple)) or not delays:
