@@ -27,6 +27,11 @@ logger = logging.getLogger(__name__)
 _KST = ZoneInfo("Asia/Seoul")
 CONFIG_KEY = "btc_ema_pullback"
 NETWORK_LABELS = {NETWORK_TESTNET: "테스트넷(데모)", NETWORK_MAINNET: "메인넷(실계좌)"}
+# Standalone futures strategies: (config key, label, Telegram command).
+STANDALONE_STRATEGIES = (
+    (CONFIG_KEY, "BTC 눌림목", "/btcpullback"),
+    ("btc_ma_cross", "BTC 3/200 SMA", "/btcmacross"),
+)
 
 
 def _n(value, default=0.0):
@@ -287,6 +292,7 @@ class ControllerBtcPullbackMixin:
             # One futures strategy at a time: pause the main engine's entries.
             was_running = not getattr(self, "is_paused", False)
             self.is_paused = True
+            await self._turn_off_standalone_futures_strategies(except_key=CONFIG_KEY)
             if service.mode() == TRADING_MODE_LIVE and network == NETWORK_MAINNET:
                 turn_off = getattr(self, "_turn_off_options_for_futures_strategy", None)
                 if callable(turn_off):
@@ -352,30 +358,43 @@ class ControllerBtcPullbackMixin:
         self.tg_app.add_handler(CommandHandler("btcpullback", owner_only(btc_pullback_cmd)))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(btc_pullback_callback), pattern=r"^bp:"))
 
-    def _btc_pullback_owned_position_keys(self):
-        """Positions the main engine must not adopt or manage."""
-        service = getattr(self, "btc_pullback_service", None)
-        if service is None:
-            service = self._btc_pullback_service()
-        return service.owned_position_keys()
+    def _standalone_owned_position_keys(self):
+        """Positions of the standalone BTC strategies the main engine must not manage."""
+        keys = set()
+        for factory_name in ("_btc_pullback_service", "_btc_ma_cross_service"):
+            factory = getattr(self, factory_name, None)
+            if callable(factory):
+                keys |= set(factory().owned_position_keys())
+        return keys
+
+    # Backwards-compatible name used by older call sites.
+    _btc_pullback_owned_position_keys = _standalone_owned_position_keys
+
+    async def _turn_off_standalone_futures_strategies(self, except_key=None):
+        """Another futures strategy (or RESUME) took over: switch these OFF."""
+        switched = []
+        for key, label, command in STANDALONE_STRATEGIES:
+            if key == except_key:
+                continue
+            try:
+                if not (self.cfg.get(key, {}) or {}).get("enabled"):
+                    continue
+                await self.cfg.update_value([key, "enabled"], False)
+            except Exception:
+                logger.exception("Could not switch %s off", key)
+                continue
+            switched.append(key)
+            try:
+                await self.notify_plain(
+                    f"⏹ 다른 선물 전략이 켜져서 {label} 전략 신규 진입을 OFF 했습니다.\n"
+                    f"이 전략이 보유한 포지션은 계속 관리합니다. 다시 켜려면 {command}"
+                )
+            except Exception:
+                logger.exception("%s off notification failed", key)
+        return bool(switched)
 
     async def _turn_off_btc_pullback_for_futures_strategy(self):
-        """Another futures strategy (or RESUME) took over: switch new entries OFF."""
-        try:
-            if not (self.cfg.get(CONFIG_KEY, {}) or {}).get("enabled"):
-                return False
-            await self._set_btc_pullback_value("enabled", False)
-        except Exception:
-            logger.exception("Could not switch the BTC pullback strategy off")
-            return False
-        try:
-            await self.notify_plain(
-                "⏹ 다른 선물 전략이 켜져서 BTC 눌림목 전략 신규 진입을 OFF 했습니다.\n"
-                "이 전략이 보유한 포지션은 손절·익절 관리를 계속합니다. 다시 켜려면 /btcpullback"
-            )
-        except Exception:
-            logger.exception("BTC pullback off notification failed")
-        return True
+        return await self._turn_off_standalone_futures_strategies()
 
     async def _stop_btc_pullback_for_emergency(self):
         """STOP button: strategy OFF and its position closed (LIVE reduce-only / paper)."""

@@ -6057,6 +6057,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 /options - Binance European Options 전용 메뉴
 /btcoptions - BTC 전용 옵션 메뉴 (만기·스프레드 선택, Bid 기준 익절)
 /btcpullback - BTC EMA 눌림목 전략 (1h 추세+15m 눌림, 기본 DRY_RUN·테스트넷)
+/btcmacross - BTC SMA3/SMA200 크로스 전략 (반대 크로스 시 즉시 반대 진입, 증거금 +5%부터 수익 확보)
 /log - 최근 로그
 /close - 긴급 청산
 /stop - 긴급 정지: 선물 포지션 청산 + 옵션 OFF·봇 옵션 청산 + Prediction OFF
@@ -6114,6 +6115,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
         self._register_user_custom_entry_handlers(owner_only, text_filter)
         self._register_options_trading_handlers(owner_only)
         self._register_btc_pullback_handlers(owner_only)
+        self._register_btc_ma_cross_handlers(owner_only)
 
         setup_command_handler = CommandHandler('setup', owner_only(self.setup_entry))
         setup_text_handler = MessageHandler(filters.Regex(setup_trigger_pattern), owner_only(self.setup_entry))

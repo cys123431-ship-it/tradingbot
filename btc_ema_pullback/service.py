@@ -101,6 +101,14 @@ def _position_entry(position):
 
 
 class BtcEmaPullbackService:
+    # Overridable by subclasses (other standalone BTC strategies).
+    CLIENT_ID = CLIENT_ID_STRATEGY
+    RUNTIME_SUBDIR = "btc_ema_pullback"
+    LABEL = "BTC 눌림목"
+    PROTECTION_KINDS = ("sl", "tp")
+    EXIT_REASON_BY_KIND = {"sl": "SL", "tp": "TP"}
+    normalize_config = staticmethod(normalize_btc_pullback_config)
+
     def __init__(
         self,
         *,
@@ -117,7 +125,7 @@ class BtcEmaPullbackService:
         self.config_getter = config_getter
         self.credentials_getter = credentials_getter
         self.exchange_factory = exchange_factory
-        self.runtime_dir = Path(runtime_dir) / "btc_ema_pullback"
+        self.runtime_dir = Path(runtime_dir) / self.RUNTIME_SUBDIR
         self.notifier = notifier
         self.main_network_getter = main_network_getter
         self._clock = clock
@@ -134,7 +142,7 @@ class BtcEmaPullbackService:
 
     # ------------------------------------------------------------------ basics
     def config(self):
-        return normalize_btc_pullback_config(self.config_getter() or {})
+        return self.normalize_config(self.config_getter() or {})
 
     def mode(self, cfg=None):
         return effective_trading_mode(cfg or self.config(), self._environ)
@@ -144,6 +152,10 @@ class BtcEmaPullbackService:
         if self.main_network_getter is None:  # tests / offline backtests
             return (cfg or self.config()).get("network") or NETWORK_TESTNET
         return self._main_network()
+
+    @staticmethod
+    def _signal_bar(signal):
+        return int(signal.get("bar_open_ms") or signal.get("15m_bar_open_ms") or 0)
 
     def now_ms(self):
         return int(self._clock() * 1000)
@@ -354,7 +366,7 @@ class BtcEmaPullbackService:
                 if mode == TRADING_MODE_LIVE:
                     if not self.has_credentials(network):
                         await self._notify(
-                            f"⚠️ BTC 눌림목 전략: {network} API 키가 없어 LIVE를 진행할 수 없습니다.",
+                            f"⚠️ {self.LABEL} 전략: {network} API 키가 없어 LIVE를 진행할 수 없습니다.",
                             key="no_keys",
                         )
                         return {"action": "blocked", "reason": "API_KEYS_MISSING"}
@@ -419,7 +431,7 @@ class BtcEmaPullbackService:
             ledger.event("SKIP", mode=mode, network=network, signal_id=signal_id, side=signal["side"], skip_reason=reason, **context)
             self._set_phase(network, mode, state, IDLE)
             if reason.startswith(("DAILY_", "CONSECUTIVE_")):
-                await self._notify(f"⏸ BTC 눌림목 전략: 오늘 신규 진입 중단 — {reason}", key=f"daily:{context.get('day')}")
+                await self._notify(f"⏸ {self.LABEL} 전략: 오늘 신규 진입 중단 — {reason}", key=f"daily:{context.get('day')}")
             return {"action": "skip", "reason": reason}
         if mode == TRADING_MODE_LIVE:
             return await self.enter_live(network, cfg, state, signal, decision, context)
@@ -482,7 +494,7 @@ class BtcEmaPullbackService:
         return {
             "trade_id": trade_id,
             "signal_id": signal["signal_id"],
-            "signal_bar_ms": int(signal["15m_bar_open_ms"]),
+            "signal_bar_ms": self._signal_bar(signal),
             "mode": mode,
             "network": network,
             "status": "OPEN",
@@ -530,7 +542,7 @@ class BtcEmaPullbackService:
         fill = fill.quantize(decision["rules"].tick_size)
         now = self.now_ms()
         trade = self._new_trade(
-            network, mode, signal, decision, context, trade_id=f"paper-{signal['15m_bar_open_ms']}-{signal['side'][0]}",
+            network, mode, signal, decision, context, trade_id=f"paper-{self._signal_bar(signal)}-{signal['side'][0]}",
             entry_price=fill, quantity=decision["quantity"], entry_ms=now, rules=decision["rules"], cfg=cfg,
         )
         trade["paper_last_checked_ms"] = now
@@ -664,7 +676,7 @@ class BtcEmaPullbackService:
     def _entry_text(self, trade, mode):
         tag = "🧪 DRY_RUN" if mode == TRADING_MODE_DRY_RUN else "💥 LIVE"
         return (
-            f"📈 BTC 눌림목 진입 ({tag} · {trade['network']})\n"
+            f"📈 {self.LABEL} 진입 ({tag} · {trade['network']})\n"
             f"{trade['side']} {trade['quantity']} BTC @ {trade['entry_price']}\n"
             f"손절 {trade['stop_price']} · 익절 {trade['take_profit_price']}"
         )
@@ -672,7 +684,7 @@ class BtcEmaPullbackService:
     def _exit_text(self, trade, mode):
         tag = "🧪 DRY_RUN" if mode == TRADING_MODE_DRY_RUN else "💥 LIVE"
         return (
-            f"🏁 BTC 눌림목 청산 ({tag} · {trade['network']}) — {trade['exit_reason']}\n"
+            f"🏁 {self.LABEL} 청산 ({tag} · {trade['network']}) — {trade['exit_reason']}\n"
             f"{trade['side']} {trade['entry_price']} → {_f(trade['exit_price']):.1f}\n"
             f"순손익 {_f(trade['net_pnl']):+.4f} USDT (수수료 {_f(trade['commission']):.4f}, 펀딩 {_f(trade['funding']):+.4f}) · "
             f"{_f(trade['r_multiple']):+.2f}R"
@@ -759,7 +771,7 @@ class BtcEmaPullbackService:
         foreign = []
         for order in orders:
             client_id = str(order.get("clientAlgoId") or "")
-            if client_id.startswith(CLIENT_ID_STRATEGY):
+            if client_id.startswith(self.CLIENT_ID):
                 await self.cancel_algo(network, client_id)
                 self.ledger(network).event("CANCEL_STRAY_PROTECTION", network=network, client_algo_id=client_id)
             else:
@@ -776,23 +788,23 @@ class BtcEmaPullbackService:
         # Persist the deterministic clientOrderId *before* sending, so a crash
         # between submit and fill confirmation is reconciled to this signal.
         client_order_id = build_client_order_id(
-            CLIENT_ID_STRATEGY, CCXT_SYMBOL, signal["side"].lower(), int(signal["15m_bar_open_ms"]), "entry"
+            self.CLIENT_ID, CCXT_SYMBOL, signal["side"].lower(), self._signal_bar(signal), "entry"
         )
         self._set_phase(network, mode, state, ENTRY_SUBMITTED, pending_entry={
             "client_order_id": client_order_id, "signal": signal, "decision_qty": str(decision["quantity"]),
         })
         result = await order_gateway.submit_entry(
-            strategy=CLIENT_ID_STRATEGY,
+            strategy=self.CLIENT_ID,
             symbol=CCXT_SYMBOL,
             side=signal["side"].lower(),
-            signal_timestamp=int(signal["15m_bar_open_ms"]),
+            signal_timestamp=self._signal_bar(signal),
             qty=float(decision["quantity"]),
         )
         ledger.event("ENTRY_RESULT", mode=mode, network=network, signal_id=signal["signal_id"],
                      client_order_id=result.client_order_id, state=result.state, error=result.error)
         if result.state in {"BLOCKED", OrderState.FAILED.value, OrderState.CANCELED.value}:
             self._set_phase(network, mode, state, IDLE, pending_entry=None, last_error=f"ENTRY_REJECTED: {result.error}")
-            await self._notify(f"⚠️ BTC 눌림목 진입 실패: {result.error}")
+            await self._notify(f"⚠️ {self.LABEL} 진입 실패: {result.error}")
             return {"action": "rejected", "reason": result.error}
         try:
             position = result.position or await self.fetch_position(network)
@@ -822,15 +834,14 @@ class BtcEmaPullbackService:
 
     def _algo_client_id(self, trade, kind):
         revision = int(trade.get(f"{kind}_revision") or 0)
-        return build_client_order_id(CLIENT_ID_STRATEGY, MARKET_ID, trade["side"], trade["signal_bar_ms"], kind,
+        return build_client_order_id(self.CLIENT_ID, MARKET_ID, trade["side"], trade["signal_bar_ms"], kind,
                                      revision=revision or None)
 
     async def place_protection(self, network, cfg, trade, kind):
         """Place (or confirm) one closePosition trigger; returns 'OK', 'BREACHED' or 'FAILED:<why>'."""
         _, algo = await self.gateway(network)
         client_id = self._algo_client_id(trade, kind)
-        order_type = "STOP_MARKET" if kind == "sl" else "TAKE_PROFIT_MARKET"
-        trigger = trade["stop_price"] if kind == "sl" else trade["take_profit_price"]
+        spec = self._protection_spec(cfg, trade, kind)
         close_side = "SELL" if trade["side"] == "LONG" else "BUY"
         delays = list(cfg["protection_retry_delays_seconds"])
         last_error = ""
@@ -850,9 +861,10 @@ class BtcEmaPullbackService:
             else:
                 try:
                     await algo.create_conditional_order(
-                        CCXT_SYMBOL, order_type, close_side, None, trigger_price=trigger,
-                        client_algo_id=client_id, close_position=True,
-                        working_type=cfg["working_type"] if kind == "sl" else cfg["tp_working_type"],
+                        CCXT_SYMBOL, spec["order_type"], close_side, spec.get("quantity"),
+                        trigger_price=spec["trigger"], client_algo_id=client_id,
+                        close_position=spec.get("close_position", True),
+                        reduce_only=True, working_type=spec["working_type"],
                     )
                 except Exception as exc:
                     last_error = f"{type(exc).__name__}: {exc}"
@@ -868,6 +880,14 @@ class BtcEmaPullbackService:
             if attempt < len(delays):
                 await self._sleep(delays[attempt])
         return f"FAILED:{last_error}"
+
+    def _protection_spec(self, cfg, trade, kind):
+        """Order type / trigger / sizing of one protection kind."""
+        if kind == "sl":
+            return {"order_type": "STOP_MARKET", "trigger": trade["stop_price"],
+                    "close_position": True, "working_type": cfg["working_type"]}
+        return {"order_type": "TAKE_PROFIT_MARKET", "trigger": trade["take_profit_price"],
+                "close_position": True, "working_type": cfg["tp_working_type"]}
 
     async def attach_protection(self, network, cfg, state):
         mode = TRADING_MODE_LIVE
@@ -889,7 +909,7 @@ class BtcEmaPullbackService:
             self.store(network).transition(entry_id, OrderState.PROTECTED, stop_order_id=trade.get("sl_client_algo_id"))
         self._set_phase(network, mode, state, POSITION_OPEN, trade=trade)
         if trade["tp_missing"]:
-            await self._notify(f"⚠️ BTC 눌림목: 익절 주문 등록 실패({tp}). 손절은 걸려 있고 다음 주기에 재시도합니다.")
+            await self._notify(f"⚠️ {self.LABEL}: 익절 주문 등록 실패({tp}). 손절은 걸려 있고 다음 주기에 재시도합니다.")
         return {"action": "entered", "trade": trade}
 
     async def failsafe_close(self, network, cfg, state, reason):
@@ -903,7 +923,7 @@ class BtcEmaPullbackService:
             orders = await self.open_algo_orders(network)
         except Exception as exc:
             self._set_phase(network, mode, state, ERROR_RECOVERY, last_error=f"{reason}; state unknown: {exc}")
-            await self._notify(f"🚨 BTC 눌림목: 보호주문 실패 + 거래소 상태 확인 불가 ({exc}). 다음 주기에 재시도합니다.")
+            await self._notify(f"🚨 {self.LABEL}: 보호주문 실패 + 거래소 상태 확인 불가 ({exc}). 다음 주기에 재시도합니다.")
             return {"action": "error", "reason": reason}
         if not position:
             return await self.finalize_live(network, cfg, state, "FAILSAFE")
@@ -918,13 +938,13 @@ class BtcEmaPullbackService:
             return {"action": "managed", "reason": "STOP_FOUND"}
         order_gateway, _ = await self.gateway(network)
         result = await order_gateway.submit_reduce_only_close(
-            strategy=CLIENT_ID_STRATEGY, symbol=CCXT_SYMBOL, position_side=trade["side"].lower(),
+            strategy=self.CLIENT_ID, symbol=CCXT_SYMBOL, position_side=trade["side"].lower(),
             position_signature=trade["signal_bar_ms"], qty=_position_qty(position), reason="emergency_failsafe",
         )
         trade["failsafe"] = True
         state["trade"] = trade
         self.ledger(network).event("FAILSAFE_CLOSE", network=network, state=result.state, error=result.error)
-        await self._notify(f"🚨 BTC 눌림목: 손절 주문을 걸지 못해 포지션을 시장가로 정리했습니다 ({reason}) → {result.state}")
+        await self._notify(f"🚨 {self.LABEL}: 손절 주문을 걸지 못해 포지션을 시장가로 정리했습니다 ({reason}) → {result.state}")
         if result.state == OrderState.CLOSED.value:
             return await self.finalize_live(network, cfg, state, "FAILSAFE")
         self._set_phase(network, mode, state, ERROR_RECOVERY, trade=trade, last_error=f"FAILSAFE_CLOSE_{result.state}")
@@ -949,7 +969,7 @@ class BtcEmaPullbackService:
                 trade["rule_violation"] = (str(trade.get("rule_violation") or "") + " " + note).strip()
                 self.ledger(network).upsert_trade(trade)
                 self.ledger(network).event("RULE_VIOLATION", network=network, trade_id=trade["trade_id"], note=note)
-                await self._notify(f"⚠️ BTC 눌림목: 포지션이 외부에서 바뀌었습니다 ({note}). 추가 진입 없이 기존 손절/익절만 유지합니다.")
+                await self._notify(f"⚠️ {self.LABEL}: 포지션이 외부에서 바뀌었습니다 ({note}). 추가 진입 없이 기존 손절/익절만 유지합니다.")
         due = self.now_ms() - int(trade.get("last_protection_check_ms") or 0) >= int(cfg["protection_check_interval_seconds"]) * 1000
         if due or trade.get("tp_missing"):
             await self.verify_protection(network, cfg, state)
@@ -988,7 +1008,7 @@ class BtcEmaPullbackService:
         self._set_phase(network, mode, state, EXIT_FILLED)
         _, algo = await self.gateway(network)
         reason = forced_reason
-        for kind in ("sl", "tp"):
+        for kind in self.PROTECTION_KINDS:
             client_id = trade.get(f"{kind}_client_algo_id")
             if not client_id:
                 continue
@@ -1000,7 +1020,7 @@ class BtcEmaPullbackService:
                 except Exception as exc:
                     self.ledger(network).event("CANCEL_FAILED", network=network, client_algo_id=client_id, error=str(exc))
             elif lookup.status == AlgoLookupStatus.FOUND and reason is None and status in {"TRIGGERED", "FINISHED", "FILLED"}:
-                reason = kind.upper()
+                reason = self.EXIT_REASON_BY_KIND.get(kind, kind.upper())
         fills = await self._exit_fills(network, trade)
         exit_reason = reason or ("FAILSAFE" if trade.get("failsafe") else "MANUAL")
         result = self._close_trade(trade, fills["exit_price"], exit_reason, fills["exit_ms"],
@@ -1094,7 +1114,7 @@ class BtcEmaPullbackService:
                                         entry_price=D(str(entry)), quantity=D(str(qty)), entry_ms=self.now_ms(), rules=rules, cfg=cfg)
                 trade["entry_client_order_id"] = pending["client_order_id"]
             elif not trade and not any(
-                str(o.get("clientAlgoId") or "").startswith(CLIENT_ID_STRATEGY) for o in orders
+                str(o.get("clientAlgoId") or "").startswith(self.CLIENT_ID) for o in orders
             ):
                 # Shared /setup account: a BTCUSDT position without our own
                 # trade record or our own TP/SL belongs to the main bot or to
@@ -1112,7 +1132,7 @@ class BtcEmaPullbackService:
                 trade = self._new_trade(network, mode, signal, decision, {}, trade_id=f"recovered-{bar}",
                                         entry_price=D(str(entry)), quantity=D(str(qty)), entry_ms=bar, rules=rules, cfg=cfg)
                 trade["rule_violation"] = "RECOVERED_FROM_OWN_PROTECTION_ORDERS"
-                await self._notify(f"⚠️ BTC 눌림목: 이 전략의 손절/익절 주문이 걸린 BTCUSDT {side} {qty} 포지션을 기록 없이 발견해 관리 대상으로 복구합니다.")
+                await self._notify(f"⚠️ {self.LABEL}: 이 전략의 손절/익절 주문이 걸린 BTCUSDT {side} {qty} 포지션을 기록 없이 발견해 관리 대상으로 복구합니다.")
             else:
                 if side != trade["side"] or abs(qty - _f(trade["quantity"])) > 1e-9 or abs(entry - _f(trade["entry_price"])) > 1e-6:
                     ledger.event("RECONCILE_DIFF", network=network, bot=dict(side=trade["side"], qty=trade["quantity"], entry=trade["entry_price"]),
@@ -1132,7 +1152,7 @@ class BtcEmaPullbackService:
         state["pending_entry"] = None
         for order in orders:
             client_id = str(order.get("clientAlgoId") or "")
-            if client_id.startswith(CLIENT_ID_STRATEGY):
+            if client_id.startswith(self.CLIENT_ID):
                 await self.cancel_algo(network, client_id)
                 ledger.event("CANCEL_STRAY_PROTECTION", network=network, client_algo_id=client_id)
         state["reconciled"] = True
@@ -1160,7 +1180,7 @@ class BtcEmaPullbackService:
                 return await self.finalize_live(network, cfg, state, "MANUAL")
             order_gateway, _ = await self.gateway(network)
             result = await order_gateway.submit_reduce_only_close(
-                strategy=CLIENT_ID_STRATEGY, symbol=CCXT_SYMBOL, position_side=trade["side"].lower(),
+                strategy=self.CLIENT_ID, symbol=CCXT_SYMBOL, position_side=trade["side"].lower(),
                 position_signature=trade["signal_bar_ms"], qty=_position_qty(position), reason=reason,
             )
             if result.state == OrderState.CLOSED.value:

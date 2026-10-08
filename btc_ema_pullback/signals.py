@@ -6,7 +6,7 @@ for backtests.  Candle rows are ``[open_ms, open, high, low, close, volume]``.
 
 from __future__ import annotations
 
-TIMEFRAME_MS = {"1m": 60_000, "15m": 900_000, "1h": 3_600_000}
+TIMEFRAME_MS = {"1m": 60_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000}
 
 
 def closed_candles(rows, timeframe, now_ms):

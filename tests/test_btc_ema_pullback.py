@@ -609,9 +609,9 @@ def test_resume_and_scanner_respect_the_pullback_position():
     root = Path(__file__).parents[1] / "bot_runtime"
     telegram = (root / "controller_telegram.py").read_text(encoding="utf-8")
     resume = telegram[telegram.index('elif action == "RESUME":'):]
-    assert "_turn_off_btc_pullback_for_futures_strategy" in resume[: resume.index("return ConversationHandler.END")]
+    assert "_turn_off_standalone_futures_strategies" in resume[: resume.index("return ConversationHandler.END")]
     scanner = (root / "signal_scanner.py").read_text(encoding="utf-8")
-    sweep = scanner.index("_btc_pullback_owned_position_keys")
+    sweep = scanner.index("_standalone_owned_position_keys")
     assert sweep < scanner.index("# 0. Add Existing Positions to Targets (Safety Net)")
     assert sweep < scanner.index("Scanner adopted existing exchange position after startup")
 
@@ -683,7 +683,7 @@ def test_signal_runtime_passes_the_pullback_exclusion():
 
     source = inspect.getsource(SignalRuntimeMixin._reconcile_crypto_exchange_state)
     assert "excluded_position_keys=pullback_keys" in source
-    assert "excluded_client_id_prefixes=('btcpb-',)" in source
+    assert "excluded_client_id_prefixes=('btcpb-', 'btcma-')" in source
 
 
 def _report_inputs():

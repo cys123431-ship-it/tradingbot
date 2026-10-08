@@ -971,7 +971,7 @@ class SignalScannerMixin:
             # managed only by that strategy (one futures strategy at a time):
             # never adopt it into the scanner or apply this engine's exits.
             pullback_owner = getattr(
-                getattr(self, 'ctrl', None), '_btc_pullback_owned_position_keys', None
+                getattr(self, 'ctrl', None), '_standalone_owned_position_keys', None
             )
             if callable(pullback_owner):
                 try:

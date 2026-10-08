@@ -194,7 +194,7 @@ class ControllerOptionsMixin:
         strategy at a time) unless it is the strategy being activated.
         """
         if include_btc_pullback:
-            pullback_off = getattr(self, "_turn_off_btc_pullback_for_futures_strategy", None)
+            pullback_off = getattr(self, "_turn_off_standalone_futures_strategies", None)
             if callable(pullback_off):
                 await pullback_off()
         try:
@@ -249,9 +249,10 @@ class ControllerOptionsMixin:
         result = await self.emergency_stop()
         text = self._format_emergency_stop_reply(result)
         extra = await self._stop_all_auxiliary_trading()
-        stop_pullback = getattr(self, "_stop_btc_pullback_for_emergency", None)
-        if callable(stop_pullback):
-            extra = list(extra) + await stop_pullback()
+        for stop_name in ("_stop_btc_pullback_for_emergency", "_stop_btc_ma_cross_for_emergency"):
+            stop_standalone = getattr(self, stop_name, None)
+            if callable(stop_standalone):
+                extra = list(extra) + await stop_standalone()
         if extra:
             text += "\n\n" + "\n".join(extra)
         return text

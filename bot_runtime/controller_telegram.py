@@ -22,7 +22,7 @@ class ControllerTelegramMixin:
             return ConversationHandler.END
         elif action == "RESUME":
             # Resuming the main futures engine: one futures strategy at a time.
-            pullback_off = getattr(self, "_turn_off_btc_pullback_for_futures_strategy", None)
+            pullback_off = getattr(self, "_turn_off_standalone_futures_strategies", None)
             if callable(pullback_off):
                 await pullback_off()
             critical_pause = load_critical_pause_state()
@@ -2161,7 +2161,7 @@ class ControllerTelegramMixin:
             ],
             [KeyboardButton("/emastatus"), KeyboardButton("/emareset"), KeyboardButton("/dailyreport"), KeyboardButton("/weekend")],
             [KeyboardButton("/setup"), KeyboardButton("/customentry"), KeyboardButton("/options"), KeyboardButton("/btcoptions")],
-            [KeyboardButton("/btcpullback")],
+            [KeyboardButton("/btcpullback"), KeyboardButton("/btcmacross")],
             [KeyboardButton("/status"), KeyboardButton("/stats"), KeyboardButton("/log")],
         ]
         return ReplyKeyboardMarkup(kb, resize_keyboard=True)

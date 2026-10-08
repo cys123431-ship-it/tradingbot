@@ -392,7 +392,7 @@ class SignalRuntimeMixin:
         # btcpb- TP/SL orders; this engine must not book them as external.
         pullback_keys = set()
         pullback_owner = getattr(
-            getattr(self, 'ctrl', None), '_btc_pullback_owned_position_keys', None
+            getattr(self, 'ctrl', None), '_standalone_owned_position_keys', None
         )
         if callable(pullback_owner):
             try:
@@ -407,7 +407,7 @@ class SignalRuntimeMixin:
             user_stream_ready=bool(user_stream_ready),
             require_user_stream=bool(require_user_stream),
             excluded_position_keys=pullback_keys,
-            excluded_client_id_prefixes=('btcpb-',),
+            excluded_client_id_prefixes=('btcpb-', 'btcma-'),
         )
         accounting_results = await self._account_for_reconciled_flat_trades(result)
         rollout_state = update_tradfi_profile_rollout(

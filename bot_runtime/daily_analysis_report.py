@@ -462,7 +462,8 @@ async def collect_daily_report_inputs(ctrl, start, end, *, market_replay=True, l
         inputs["errors"].append("trading state store unavailable")
         inputs.update(trade_results=[], order_records=[], audit=[], runtime_state={})
     inputs["journal"] = attempt("journal", lambda: read_journal(start, end), [])
-    inputs["btc_pullback"] = attempt("btc_pullback", lambda: _btc_pullback_inputs(ctrl, start, end), {})
+    for key, factory_name, _label, _command in STANDALONE_REPORT_KEYS:
+        inputs[key] = attempt(key, lambda f=factory_name: _standalone_inputs(ctrl, f, start, end), {})
     paths = log_paths if log_paths is not None else default_log_paths()
     inputs["logs"] = await asyncio.to_thread(scan_logs, paths, start, end)
 
@@ -516,7 +517,12 @@ def _market_key(symbol):
 
 def _btc_pullback_inputs(ctrl, start, end):
     """Trades and decisions of the standalone /btcpullback strategy in the window."""
-    factory = getattr(ctrl, "_btc_pullback_service", None)
+    return _standalone_inputs(ctrl, "_btc_pullback_service", start, end)
+
+
+def _standalone_inputs(ctrl, factory_name, start, end):
+    """Trades and decisions of one standalone BTC strategy in the window."""
+    factory = getattr(ctrl, factory_name, None)
     if not callable(factory):
         return {}
     service = factory()
@@ -533,7 +539,7 @@ def _btc_pullback_inputs(ctrl, start, end):
         t for t in ledger.trades(network=network)
         if inside(t.get("entry_time")) or inside(t.get("exit_time")) or t.get("status") == "OPEN"
     ]
-    events = [e for e in ledger.recent_events(5000, kinds={"SIGNAL", "SKIP", "FAILSAFE", "PROTECTION"}) if inside(e.get("ts"))]
+    events = [e for e in ledger.recent_events(5000, kinds={"SIGNAL", "SKIP", "FAILSAFE", "PROTECTION", "PROFIT_LOCK"}) if inside(e.get("ts"))]
     skips = Counter(
         str(e.get("skip_reason") or "").split(":", 1)[0]
         for e in events
@@ -550,12 +556,24 @@ def _btc_pullback_inputs(ctrl, start, end):
         "failsafe_events": [e for e in events if e.get("event") == "FAILSAFE"],
         "protection_failures": [e for e in events if e.get("event") == "PROTECTION" and e.get("result") != "OK"],
         "owned_keys": sorted(service.owned_position_keys()),
+        "profit_locks": sum(1 for e in events if e.get("event") == "PROFIT_LOCK"),
     }
 
 
 def btc_pullback_summary(inputs, start=None, end=None):
     """(entries, closes, net_pnl) of /btcpullback trades in the report window."""
-    data = inputs.get("btc_pullback") or {}
+    return standalone_summary(inputs, "btc_pullback", start, end)
+
+
+STANDALONE_REPORT_KEYS = (
+    ("btc_pullback", "_btc_pullback_service", "BTC 눌림목", "/btcpullback"),
+    ("btc_ma_cross", "_btc_ma_cross_service", "BTC 3/200 SMA", "/btcmacross"),
+)
+
+
+def standalone_summary(inputs, key, start=None, end=None):
+    """(entries, closes, net_pnl) of one standalone strategy in the report window."""
+    data = inputs.get(key) or {}
     start = start or _aware(inputs.get("window_start"))
     end = end or _aware(inputs.get("window_end"))
 
@@ -571,10 +589,12 @@ def btc_pullback_summary(inputs, start=None, end=None):
 
 
 def _btc_pullback_keys(inputs):
-    data = inputs.get("btc_pullback") or {}
-    keys = {_market_key(k) for k in data.get("owned_keys") or []}
-    if data.get("trades"):
-        keys.add("BTCUSDT")
+    keys = set()
+    for key, _factory, _label, _command in STANDALONE_REPORT_KEYS:
+        data = inputs.get(key) or {}
+        keys |= {_market_key(k) for k in data.get("owned_keys") or []}
+        if data.get("trades"):
+            keys.add("BTCUSDT")
     return keys
 
 
@@ -693,13 +713,15 @@ def consistency_checks(inputs):
     if serious:
         findings.append(("WARNING", "LOG_ERRORS",
                          f"ERROR/CRITICAL 로그 {sum(g['count'] for g in serious)}건 ({len(serious)}종)"))
-    pullback = inputs.get("btc_pullback") or {}
-    for event in pullback.get("failsafe_events") or []:
-        findings.append(("CRITICAL", "BTC_PULLBACK_FAILSAFE",
-                         f"BTC 눌림목 보호주문 실패로 비상 정리: {event.get('reason')}"))
-    for event in pullback.get("protection_failures") or []:
-        findings.append(("WARNING", "BTC_PULLBACK_PROTECTION_FAILED",
-                         f"BTC 눌림목 {event.get('kind')} 등록 결과 {event.get('result')}"))
+    for key, _factory, label, _command in STANDALONE_REPORT_KEYS:
+        standalone = inputs.get(key) or {}
+        code = key.upper()
+        for event in standalone.get("failsafe_events") or []:
+            findings.append(("CRITICAL", f"{code}_FAILSAFE",
+                             f"{label} 보호주문 실패로 비상 정리: {event.get('reason')}"))
+        for event in standalone.get("protection_failures") or []:
+            findings.append(("WARNING", f"{code}_PROTECTION_FAILED",
+                             f"{label} {event.get('kind')} 등록 결과 {event.get('result')}"))
     for item in inputs.get("errors") or []:
         findings.append(("INFO", "REPORT_DATA_GAP", item))
     order = {"CRITICAL": 0, "WARNING": 1, "INFO": 2}
@@ -908,21 +930,26 @@ def build_daily_analysis_report(inputs):
     for block in blocks[-60:]:
         lines.append(f"  · {_kst(block.get('ts'))} {block.get('symbol')} {str(block.get('side') or '').upper()} [{block.get('gate') or 'exit_tf_alignment'}] {block.get('reason')}")
     lines.append("")
-    pullback = inputs.get("btc_pullback") or {}
-    lines.append("[1-5 BTC 눌림목 전략 (/btcpullback, 별도 기록)]")
-    if not pullback:
-        lines.append("  사용 안 함")
-    else:
-        entries, closes, net = btc_pullback_summary(inputs, start, end)
+    for number, (key, _factory, label, command) in enumerate(STANDALONE_REPORT_KEYS, 5):
+        standalone = inputs.get(key) or {}
+        lines.append(f"[1-{number} {label} 전략 ({command}, 별도 기록)]")
+        if not standalone:
+            lines.append("  사용 안 함")
+            lines.append("")
+            continue
+        entries, closes, net = standalone_summary(inputs, key, start, end)
         lines.append(
-            f"  상태: {'ON' if pullback.get('enabled') else 'OFF'} · {pullback.get('mode')} · {pullback.get('network')} / "
-            f"진입 {entries}건 / 청산 {closes}건 / 순손익 {net:+.4f} USDT (수수료·펀딩 포함) / 진입 신호 {pullback.get('signals')}회"
+            f"  상태: {'ON' if standalone.get('enabled') else 'OFF'} · {standalone.get('mode')} · {standalone.get('network')} / "
+            f"진입 {entries}건 / 청산 {closes}건 / 순손익 {net:+.4f} USDT (수수료·펀딩 포함) / 진입 신호 {standalone.get('signals')}회"
+            + (f" / 수익 확보 손절 상향 {standalone.get('profit_locks')}회" if standalone.get("profit_locks") else "")
         )
-        lines.append(f"  미진입 사유 상위: {pullback.get('skip_counts')}")
-        for trade in pullback.get("trades") or []:
+        lines.append(f"  미진입 사유 상위: {standalone.get('skip_counts')}")
+        for trade in standalone.get("trades") or []:
             lines.append(
                 f"  · {trade.get('side')} {trade.get('quantity')} @ {trade.get('entry_price')} ({_kst(trade.get('entry_time'))}) "
-                f"손절 {trade.get('stop_price')} / 익절 {trade.get('take_profit_price')} → "
+                f"손절 {trade.get('stop_price') or '-'} / 익절 {trade.get('take_profit_price') or '-'}"
+                + (f" / 확보 {trade.get('lock_price')}" if trade.get("lock_price") else "")
+                + " → "
                 + (
                     f"{trade.get('exit_reason')} @ {_num(trade.get('exit_price'), 1)} ({_kst(trade.get('exit_time'))}) "
                     f"순손익 {_num(trade.get('net_pnl'))} (수수료 {_num(trade.get('commission'))}, 펀딩 {_num(trade.get('funding'))}) "
@@ -930,7 +957,7 @@ def build_daily_analysis_report(inputs):
                     if trade.get("status") == "CLOSED" else "보유 중"
                 )
             )
-    lines.append("")
+        lines.append("")
 
     # ----------------------------------------------------------- PART 2
     lines.append("#" * 78)
