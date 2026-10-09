@@ -382,3 +382,89 @@ def test_daily_report_has_ma_cross_section():
     assert standalone_summary(inputs, "btc_ma_cross") == (1, 1, pytest.approx(212.3))
     text = build_daily_analysis_report(inputs)
     assert "BTC 3/200 SMA 전략 (/btcmacross" in text and "PROFIT_LOCK" in text and "수익 확보 손절 상향 2회" in text
+
+
+# ------------------------------------------- reversal cancels old protection
+def _open_algos(fake):
+    return [o for o in fake.algos.values() if o["algoStatus"] == "NEW"]
+
+
+def test_reversal_cancels_the_old_emergency_stop_and_places_a_new_one(tmp_path):
+    h = Harness(tmp_path)
+    h.run()
+    old_stop = h.state()["trade"]["sl_client_algo_id"]
+    assert h.fake.algos[old_stop]["side"] == "SELL"  # LONG's stop
+    h.next_bar(83_000.0)
+    assert h.run()["action"] == "reversed"
+    assert h.fake.algos[old_stop]["algoStatus"] == "CANCELED"
+    open_orders = _open_algos(h.fake)
+    assert len(open_orders) == 1  # only the new SHORT's emergency stop
+    new_stop = open_orders[0]
+    assert new_stop["clientAlgoId"] == h.state()["trade"]["sl_client_algo_id"] != old_stop
+    assert new_stop["side"] == "BUY" and new_stop["orderType"] == "STOP_MARKET"
+    assert float(new_stop["triggerPrice"]) > float(h.state()["trade"]["entry_price"])  # above a short entry
+
+
+def test_reversal_also_cancels_an_active_profit_lock(tmp_path):
+    h = Harness(tmp_path)
+    h.run()
+    h.fake.mark = 85_000 * 1.021  # lock +9% active
+    h.now_ms += 20_000
+    h.run()
+    trade = h.state()["trade"]
+    old_ids = {trade["sl_client_algo_id"], trade["lock_client_algo_id"]}
+    assert len(_open_algos(h.fake)) == 2
+    h.next_bar(83_000.0)
+    assert h.run()["action"] == "reversed"
+    assert all(h.fake.algos[i]["algoStatus"] == "CANCELED" for i in old_ids)
+    remaining = _open_algos(h.fake)
+    assert len(remaining) == 1 and remaining[0]["side"] == "BUY"
+    assert h.state()["trade"]["lock_price"] == ""  # fresh trade: no lock yet
+
+
+def test_reversal_never_enters_while_an_old_order_could_not_be_cancelled(tmp_path):
+    h = Harness(tmp_path)
+    h.run()
+    old_stop = h.state()["trade"]["sl_client_algo_id"]
+
+    def failing_cancel(params):
+        raise Exception("binance {\"code\":-1001,\"msg\":\"Internal error\"}")
+
+    real_cancel = h.fake.fapiPrivateDeleteAlgoOrder
+    h.fake.fapiPrivateDeleteAlgoOrder = failing_cancel
+    h.next_bar(83_000.0)
+    result = h.run()
+    assert "반대 진입 보류" in result["reason"]
+    assert h.fake.position is None  # the LONG was closed
+    assert h.fake.algos[old_stop]["algoStatus"] == "NEW"  # cancel failed
+    entries = [o for o in h.fake.orders if "entry" in o["clientOrderId"]]
+    assert len(entries) == 1  # no SHORT entry while the old stop is still open
+    assert h.state()["pending_reverse_entry"]["side"] == "SHORT"
+    h.now_ms += 20_000
+    assert h.run()["reason"].startswith("REVERSE_ENTRY_RETRY: OPEN_ORDERS_CANCEL_FAILED")
+    # The exchange recovers: the old stop is cleaned up and the SHORT is taken.
+    h.fake.fapiPrivateDeleteAlgoOrder = real_cancel
+    h.now_ms += 20_000
+    assert h.run()["action"] == "entered"
+    assert h.fake.algos[old_stop]["algoStatus"] == "CANCELED"
+    assert h.fake.position["side"] == "short" and h.state()["trade"]["side"] == "SHORT"
+    assert h.state()["pending_reverse_entry"] is None
+    assert len(_open_algos(h.fake)) == 1
+
+
+def test_reverse_retry_gives_up_after_the_window(tmp_path):
+    h = Harness(tmp_path)
+    h.run()
+
+    def failing_cancel(params):
+        raise Exception("binance {\"code\":-1001,\"msg\":\"Internal error\"}")
+
+    h.fake.fapiPrivateDeleteAlgoOrder = failing_cancel
+    h.next_bar(83_000.0)
+    h.run()
+    h.now_ms += 11 * 60_000  # past the 10-minute retry window
+    assert h.run()["reason"] == "REVERSE_ENTRY_EXPIRED"
+    assert h.state()["pending_reverse_entry"] is None
+    assert any("포기" in n for n in h.notes)
+    h.now_ms += 20_000
+    assert h.run()["reason"] == "WAITING_NEXT_CLOSE"  # waits for the next cross

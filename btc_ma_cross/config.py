@@ -60,6 +60,9 @@ def default_btc_ma_cross_config() -> dict:
         "lock_working_type": "CONTRACT_PRICE",
         "tp_working_type": "CONTRACT_PRICE",
         "signal_max_age_seconds": 180,
+        # A reverse entry blocked by a temporary exchange problem (e.g. the old
+        # stop could not be cancelled yet) is retried for this long.
+        "reverse_retry_window_seconds": 600,
         "estimated_taker_fee_rate": "0.0005",
         "slippage_buffer_pct": "0.0005",
         "max_margin_usage_pct": "0.95",
@@ -108,6 +111,7 @@ def normalize_btc_ma_cross_config(raw=None) -> dict:
         value = str(cfg.get(key) or default).strip().upper()
         cfg[key] = value if value in {"MARK_PRICE", "CONTRACT_PRICE"} else default
     cfg["signal_max_age_seconds"] = _int(cfg.get("signal_max_age_seconds"), 180, 30, 900)
+    cfg["reverse_retry_window_seconds"] = _int(cfg.get("reverse_retry_window_seconds"), 600, 60, 3600)
     cfg["estimated_taker_fee_rate"] = _decimal_text(cfg.get("estimated_taker_fee_rate"), "0.0005", 0.0, 0.005)
     cfg["slippage_buffer_pct"] = _decimal_text(cfg.get("slippage_buffer_pct"), "0.0005", 0.0, 0.01)
     cfg["max_margin_usage_pct"] = _decimal_text(cfg.get("max_margin_usage_pct"), "0.95", 0.1, 1.0)

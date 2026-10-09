@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from btc_ema_pullback.config import TRADING_MODE_DRY_RUN, TRADING_MODE_LIVE
 from btc_ema_pullback.rules import D, ceil_to_step, floor_to_step, round_price_to_tick
+from btc_ema_pullback.signals import TIMEFRAME_MS
 from btc_ema_pullback.service import (
     CCXT_SYMBOL,
     ERROR_RECOVERY,
@@ -33,6 +34,19 @@ from trading_safety.order_state import OrderState
 
 from .config import CLIENT_ID_STRATEGY, STRATEGY_VERSION, normalize_btc_ma_cross_config
 from .signals import emergency_stop_price, evaluate_cross, profit_lock_target
+
+# Skip reasons that can clear up within minutes; a reverse entry blocked by
+# one of them is retried instead of being dropped until the next cross.
+TRANSIENT_ENTRY_BLOCKS = (
+    "OPEN_ORDERS_UNKNOWN",
+    "OPEN_ORDERS_CANCEL_FAILED",
+    "POSITION_STATE_UNCERTAIN",
+    "ACCOUNT_POSITION_EXISTS",
+    "BALANCE_UNAVAILABLE",
+    "TRADING_RULES_UNAVAILABLE",
+    "ACCOUNT_SETUP_UNVERIFIED",
+    "POSITION_MODE_UNKNOWN",
+)
 
 
 class BtcMaCrossService(BtcEmaPullbackService):
@@ -73,6 +87,9 @@ class BtcMaCrossService(BtcEmaPullbackService):
 
     # -------------------------------------------------------------- entry
     async def maybe_enter(self, network, cfg, mode, state):
+        pending = state.get("pending_reverse_entry")
+        if pending:
+            return await self._retry_reverse_entry(network, cfg, mode, state, pending)
         signal, reason = await self._evaluate_new_bar(network, cfg, mode, state)
         if signal is None:
             return {"action": "waiting" if reason == "WAITING_NEXT_CLOSE" else "skip", "reason": reason}
@@ -345,7 +362,40 @@ class BtcMaCrossService(BtcEmaPullbackService):
         if not cfg["enabled"]:
             return {"action": "exited", "reason": "CROSS_REVERSE (신규진입 OFF라 반대 진입 안 함)"}
         entered = await self._enter_on_signal(network, cfg, TRADING_MODE_LIVE, state, signal)
+        if self._hold_for_retry(network, TRADING_MODE_LIVE, signal, entered):
+            return {"action": "exited", "reason": f"CROSS_REVERSE · 반대 진입 보류 후 재시도: {entered.get('reason')}"}
         return {"action": "reversed", "close": closed, "entry": entered}
+
+    def _hold_for_retry(self, network, mode, signal, entered):
+        """Keep a reverse entry that a temporary problem blocked; True if held."""
+        reason = str(entered.get("reason") or "")
+        if entered.get("action") != "skip" or not reason.startswith(TRANSIENT_ENTRY_BLOCKS):
+            return False
+        state = self.load_state(network, mode)
+        state["processed_signals"] = [s for s in state["processed_signals"] if s != signal["signal_id"]]
+        state["pending_reverse_entry"] = signal
+        self.save_state(network, mode, state)
+        self.ledger(network).event("REVERSE_ENTRY_HELD", mode=mode, network=network,
+                                   signal_id=signal["signal_id"], reason=reason)
+        return True
+
+    async def _retry_reverse_entry(self, network, cfg, mode, state, signal):
+        bar_close_ms = self._signal_bar(signal) + TIMEFRAME_MS[signal.get("timeframe") or cfg["timeframe"]]
+        if self.now_ms() - bar_close_ms > int(cfg["reverse_retry_window_seconds"]) * 1000:
+            state["pending_reverse_entry"] = None
+            if signal["signal_id"] not in state["processed_signals"]:
+                state["processed_signals"].append(signal["signal_id"])
+            self.save_state(network, mode, state)
+            self.ledger(network).event("REVERSE_ENTRY_EXPIRED", mode=mode, network=network, signal_id=signal["signal_id"])
+            await self._notify(f"⚠️ {self.LABEL}: 반대 진입을 {cfg['reverse_retry_window_seconds'] // 60}분 동안 재시도했지만 "
+                               "막혀 있어 포기했습니다. 다음 크로스까지 대기합니다.", key=f"expired:{signal['signal_id']}")
+            return {"action": "skip", "reason": "REVERSE_ENTRY_EXPIRED"}
+        state["pending_reverse_entry"] = None
+        self.save_state(network, mode, state)
+        entered = await self._enter_on_signal(network, cfg, mode, state, signal)
+        if self._hold_for_retry(network, mode, signal, entered):
+            return {"action": "waiting", "reason": f"REVERSE_ENTRY_RETRY: {entered.get('reason')}"}
+        return entered
 
     async def verify_protection(self, network, cfg, state):
         trade = state["trade"]

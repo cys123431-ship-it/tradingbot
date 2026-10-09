@@ -383,7 +383,7 @@ class BtcEmaPullbackService:
                     return {"action": "disabled"}
                 return await self.maybe_enter(network, cfg, mode, state)
             except Exception as exc:
-                logger.exception("BTC pullback cycle failed")
+                logger.exception("%s cycle failed", self.LABEL)
                 state["last_error"] = f"{type(exc).__name__}: {exc}"
                 self.save_state(network, mode, state)
                 self.ledger(network).event("ERROR", mode=mode, network=network, error=state["last_error"])
@@ -772,7 +772,10 @@ class BtcEmaPullbackService:
         for order in orders:
             client_id = str(order.get("clientAlgoId") or "")
             if client_id.startswith(self.CLIENT_ID):
-                await self.cancel_algo(network, client_id)
+                try:
+                    await self.cancel_algo(network, client_id)
+                except Exception as exc:
+                    return f"OPEN_ORDERS_CANCEL_FAILED: {client_id}: {exc}"
                 self.ledger(network).event("CANCEL_STRAY_PROTECTION", network=network, client_algo_id=client_id)
             else:
                 foreign.append(client_id or str(order.get("algoId")))
