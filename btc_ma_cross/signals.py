@@ -19,12 +19,25 @@ def sma(values, period):
     return out
 
 
-def evaluate_cross(rows, cfg, now_ms, symbol="BTCUSDT"):
-    """Cross of SMA(fast) over SMA(slow) on the last *closed* candle."""
+def evaluate_cross(rows, cfg, now_ms, symbol="BTCUSDT", ccxt_symbol=None):
+    """Cross of SMA(fast) over SMA(slow) on the last *closed* candle.
+
+    ``side`` is set only on a fresh cross; ``trend_side`` always reports
+    whether SMA(fast) is above (LONG) or below (SHORT) SMA(slow).
+    """
     timeframe = cfg["timeframe"]
     fast_p, slow_p = int(cfg["fast_period"]), int(cfg["slow_period"])
     closed = closed_candles(rows, timeframe, now_ms)
-    result = {"symbol": symbol, "timeframe": timeframe, "timestamp_ms": int(now_ms), "side": None}
+    result = {
+        "symbol": symbol,
+        "market_id": symbol,
+        "ccxt_symbol": ccxt_symbol or f"{symbol[:-4]}/USDT:USDT",
+        "timeframe": timeframe,
+        "timestamp_ms": int(now_ms),
+        "side": None,
+        "trend_side": None,
+        "stale": False,
+    }
     if len(closed) < slow_p + 1:
         result["skip_reason"] = f"INSUFFICIENT_CANDLES:{len(closed)}<{slow_p + 1}"
         return result
@@ -40,6 +53,8 @@ def evaluate_cross(rows, cfg, now_ms, symbol="BTCUSDT"):
         sma_slow_prev=slow[-2],
         signal_age_seconds=(int(now_ms) - bar[0] - TIMEFRAME_MS[timeframe]) / 1000.0,
     )
+    result["trend_side"] = "LONG" if fast[-1] > slow[-1] else ("SHORT" if fast[-1] < slow[-1] else None)
+    result["stale"] = result["signal_age_seconds"] > float(cfg["signal_max_age_seconds"])
     if fast[-2] <= slow[-2] and fast[-1] > slow[-1]:
         side = "LONG"
     elif fast[-2] >= slow[-2] and fast[-1] < slow[-1]:
@@ -47,7 +62,7 @@ def evaluate_cross(rows, cfg, now_ms, symbol="BTCUSDT"):
     else:
         result["skip_reason"] = "NO_CROSS_ABOVE" if fast[-1] > slow[-1] else "NO_CROSS_BELOW"
         return result
-    if result["signal_age_seconds"] > float(cfg["signal_max_age_seconds"]):
+    if result["stale"]:
         result["skip_reason"] = "SIGNAL_STALE"
         return result
     result["side"] = side

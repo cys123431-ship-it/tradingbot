@@ -20,6 +20,18 @@ logger = logging.getLogger(__name__)
 TIMEFRAME_LABELS = {"15m": "15분", "30m": "30분", "1h": "1시간", "2h": "2시간", "4h": "4시간"}
 
 
+def _scope_text(cfg):
+    if cfg.get("scan_scope") == "alts":
+        return f"알트 포함 24h 거래대금 상위 {cfg.get('alt_universe_size', 50)}개 (동시 신호 시 거래대금 1위)"
+    return "BTC만"
+
+
+def _entry_mode_text(cfg):
+    if cfg.get("entry_mode") == "trend":
+        return "방향 유지 중 진입 (SMA3이 SMA200 위=롱 / 아래=숏, 수익확보·손절 청산 후엔 그 코인 다음 크로스까지 대기)"
+    return "돌파 시 진입 (SMA3이 SMA200을 뚫는 봉)"
+
+
 class ControllerBtcMaCrossMixin:
     def _btc_ma_cross_service(self):
         service = getattr(self, "btc_ma_cross_service", None)
@@ -81,6 +93,15 @@ class ControllerBtcMaCrossMixin:
                 InlineKeyboardButton(mark(cfg.get("trading_mode") == TRADING_MODE_LIVE, "💥 LIVE"), callback_data="bm:mode:live"),
             ],
             [
+                InlineKeyboardButton(mark(cfg.get("scan_scope") != "alts", "🪙 BTC만"), callback_data="bm:scope:btc"),
+                InlineKeyboardButton(mark(cfg.get("scan_scope") == "alts", f"🌐 알트 상위{cfg.get('alt_universe_size', 50)}"),
+                                     callback_data="bm:scope:alts"),
+            ],
+            [
+                InlineKeyboardButton(mark(cfg.get("entry_mode") != "trend", "⚡ 돌파 시 진입"), callback_data="bm:entry:cross"),
+                InlineKeyboardButton(mark(cfg.get("entry_mode") == "trend", "📈 방향 유지 중 진입"), callback_data="bm:entry:trend"),
+            ],
+            [
                 InlineKeyboardButton(mark(cfg.get("timeframe") == tf, TIMEFRAME_LABELS[tf]), callback_data=f"bm:tf:{tf}")
                 for tf in TIMEFRAMES
             ],
@@ -123,18 +144,20 @@ class ControllerBtcMaCrossMixin:
         status = await service.status()
         if status.get("unsupported"):
             return (
-                "📏 BTC 3/200 SMA 크로스 전략\n"
+                "📏 3/200 SMA 크로스 전략\n"
                 "지금 /setup 거래소가 업비트라 사용할 수 없습니다. /setup에서 바이낸스(테스트넷 데모 또는 메인넷)를 선택하세요."
             )
         cfg, state, mode, network = status["config"], status["state"], status["mode"], status["network"]
         trade = state.get("trade") or {}
         stop = int(cfg["emergency_stop_roi_percent"])
         lines = [
-            "📏 BTC 3/200 SMA 크로스 전략 (반대 크로스 시 즉시 반대 진입)",
+            "📏 3/200 SMA 크로스 전략 (반대 크로스 시 즉시 반대 진입)",
             f"전략: {'ON' if cfg['enabled'] else 'OFF'} · 모드: {mode}"
             + (" (환경변수로 DRY_RUN 강제)" if cfg["trading_mode"] == TRADING_MODE_LIVE and mode == TRADING_MODE_DRY_RUN else ""),
             f"거래소: {NETWORK_LABELS.get(network, network)} (/setup 선택을 따름) · API 키: {'있음' if status['has_credentials'] else '없음'}",
             f"메인 선물 자동매매: {'일시정지' if getattr(self, 'is_paused', False) else '동작 중'} (선물 전략은 하나만 켜짐)",
+            f"종목: {_scope_text(cfg)}",
+            f"진입: {_entry_mode_text(cfg)}",
             f"봉: {TIMEFRAME_LABELS[cfg['timeframe']]} (마감봉 기준) · SMA {cfg['fast_period']}/{cfg['slow_period']}",
             f"레버리지 {cfg['leverage']}x ISOLATED 고정 · 증거금: 가용 잔고의 {_n(cfg['margin_fraction']) * 100:.0f}%",
             f"비상손절: {'OFF' if stop == 0 else f'증거금 -{stop}% (Mark 기준)'}",
@@ -145,7 +168,7 @@ class ControllerBtcMaCrossMixin:
         if trade:
             lines += [
                 "",
-                f"보유: {trade.get('side')} {trade.get('quantity')} BTC @ {trade.get('entry_price')} "
+                f"보유: {trade.get('market_id') or 'BTCUSDT'} {trade.get('side')} {trade.get('quantity')} @ {trade.get('entry_price')} "
                 f"(증거금 {_n(trade.get('margin_used')):.2f} USDT)",
                 f"비상손절 {trade.get('stop_price') or 'OFF'} · 수익 확보 "
                 + (f"+{_n(trade.get('lock_roi')):g}% @ {trade.get('lock_price')}" if trade.get("lock_price") else "아직 없음 (+5% 도달 전)"),
@@ -168,7 +191,7 @@ class ControllerBtcMaCrossMixin:
         s = status["stats"]
         pf = s["profit_factor"]
         return "\n".join([
-            f"📈 BTC 3/200 SMA 성과 ({status['mode']} · {status['network']})",
+            f"📈 3/200 SMA 성과 ({status['mode']} · {status['network']})",
             f"거래 {s['total_trades']}회 · 승 {s['wins']} / 패 {s['losses']} · 승률 {s['win_rate'] * 100:.1f}%",
             f"총이익 {s['gross_profit']:+.4f} · 총손실 {s['gross_loss']:+.4f} · 순손익 {s['net_pnl']:+.4f} USDT",
             f"평균 이익 {s['average_win']:+.4f} · 평균 손실 {s['average_loss']:+.4f}",
@@ -191,10 +214,14 @@ class ControllerBtcMaCrossMixin:
         for event in events:
             kind = event.get("event")
             if kind == "SIGNAL":
-                detail = (f"{event['side']} 크로스" if event.get("side") else event.get("skip_reason")) or "-"
-                detail += f" · SMA3 {_n(event.get('sma_fast')):.1f} / SMA200 {_n(event.get('sma_slow')):.1f}"
+                detail = (f"{event.get('market_id') or ''} {event['side']} 신호".strip() if event.get("side")
+                          else event.get("skip_reason")) or "-"
+                if event.get("scope") == "alts":
+                    detail += f" · {event.get('evaluated')}종목 평가, 크로스 {len(event.get('crosses') or [])}건"
+                else:
+                    detail += f" · SMA3 {_n(event.get('sma_fast')):.8g} / SMA200 {_n(event.get('sma_slow')):.8g}"
             elif kind == "ORDER":
-                detail = f"{event.get('side')} {event.get('quantity')} @ {event.get('actual_avg_entry')}"
+                detail = f"{event.get('symbol') or ''} {event.get('side')} {event.get('quantity')} @ {event.get('actual_avg_entry')}"
             elif kind == "PROFIT_LOCK":
                 detail = f"+{_n(event.get('reached_roi')):g}% 도달 → +{_n(event.get('locked_roi')):g}% 확보 @ {event.get('trigger')}"
             else:
@@ -205,14 +232,15 @@ class ControllerBtcMaCrossMixin:
     def _btc_ma_cross_rules_text(self, cfg):
         stop = int(cfg["emergency_stop_roi_percent"])
         return (
-            "📘 BTC 3/200 SMA 크로스 규칙\n"
+            "📘 3/200 SMA 크로스 규칙\n"
+            f"• 종목: {_scope_text(cfg)} (TradFi·스테이블코인 제외)\n"
+            f"• 진입: {_entry_mode_text(cfg)}\n"
             f"• 봉: {TIMEFRAME_LABELS[cfg['timeframe']]} 마감봉 기준 (텔레그램에서 15분~4시간 선택)\n"
-            "• 진입: SMA3이 SMA200 상향 돌파 → 롱 / 하향 돌파 → 숏\n"
             "• 보유 중 반대 크로스: 시장가(reduce-only) 청산 후 즉시 반대 방향 진입\n"
             f"• 수익 확보(증거금 기준): {self._btc_ma_cross_lock_table(cfg)} (항상 도달 칸 {cfg['lock_gap_percent']}% 아래, 한 번 올라간 손절은 내려가지 않음)\n"
             "• 수익 확보 손절로 청산되면 다음 크로스까지 대기\n"
             f"• 비상손절: {'OFF' if stop == 0 else f'증거금 -{stop}%'} (메뉴에서 선택, 거래소에 Mark 기준으로 걸림)\n"
-            f"• 레버리지 {cfg['leverage']}배 고정, 가용 증거금의 {_n(cfg['margin_fraction']) * 100:.0f}% 사용, BTCUSDT 1포지션\n"
+            f"• 레버리지 {cfg['leverage']}배 고정, 가용 증거금의 {_n(cfg['margin_fraction']) * 100:.0f}% 사용, 계좌 전체 1포지션\n"
             "• 거래소는 /setup 선택을 따르고, 켜면 다른 선물 자동전략은 멈춤\n"
             "• 수익을 보장하지 않는 전략입니다."
         )
@@ -241,8 +269,9 @@ class ControllerBtcMaCrossMixin:
 
         if action == "on":
             return (
-                "⚠️ BTC 3/200 SMA 크로스 전략을 켤까요?\n"
+                "⚠️ 3/200 SMA 크로스 전략을 켤까요?\n"
                 f"모드 {service.mode(cfg)} · {NETWORK_LABELS[network]} (/setup) · {TIMEFRAME_LABELS[cfg['timeframe']]}\n"
+                f"종목 {_scope_text(cfg)} · {'방향 유지 중 진입' if cfg['entry_mode'] == 'trend' else '돌파 시 진입'}\n"
                 "켜면 메인 선물 자동매매와 BTC 눌림목 전략의 신규 진입이 멈춥니다.\n"
                 + ("실제 주문이 나갑니다." if service.mode(cfg) == TRADING_MODE_LIVE else "DRY_RUN: 실제 주문 없이 가상 체결만 기록합니다."),
                 keyboard(("✅ 전략 시작", "bm:confirm_on")),
@@ -259,7 +288,7 @@ class ControllerBtcMaCrossMixin:
                 if callable(options_off):
                     await options_off(include_btc_pullback=False)
             note = "\n메인 선물 자동매매 신규 진입을 일시정지했습니다 (보유 포지션 관리는 계속)." if was_running else ""
-            return "✅ BTC 3/200 SMA 전략 ON" + note + "\n\n" + await self._format_btc_ma_cross_status(), keyboard()
+            return "✅ 3/200 SMA 전략 ON" + note + "\n\n" + await self._format_btc_ma_cross_status(), keyboard()
         if action == "off":
             await self._set_btc_ma_cross_value("enabled", False)
             return "⏹ 신규 진입 OFF (보유 포지션 관리는 계속)\n\n" + await self._format_btc_ma_cross_status(), keyboard()
@@ -280,6 +309,17 @@ class ControllerBtcMaCrossMixin:
             await self._set_btc_ma_cross_value("trading_mode", TRADING_MODE_LIVE)
             service.reset_reconciliation()
             return "💥 LIVE 전환 완료 (다음 주기에 거래소 상태를 먼저 대조합니다)\n\n" + await self._format_btc_ma_cross_status(), keyboard()
+        if action.startswith("scope:"):
+            scope = action.split(":", 1)[1]
+            if scope in ("btc", "alts"):
+                await self._set_btc_ma_cross_value("scan_scope", scope)
+            note = "\n(보유 중인 포지션은 그대로 관리, 다음 진입부터 적용)" if holding else ""
+            return f"🔎 종목: {_scope_text(service.config())}{note}\n\n" + await self._format_btc_ma_cross_status(), keyboard()
+        if action.startswith("entry:"):
+            entry_mode = action.split(":", 1)[1]
+            if entry_mode in ("cross", "trend"):
+                await self._set_btc_ma_cross_value("entry_mode", entry_mode)
+            return f"🎯 진입: {_entry_mode_text(service.config())}\n\n" + await self._format_btc_ma_cross_status(), keyboard()
         if action.startswith("tf:"):
             timeframe = action.split(":", 1)[1]
             if timeframe in TIMEFRAMES:
@@ -340,12 +380,12 @@ class ControllerBtcMaCrossMixin:
             await self._set_btc_ma_cross_value("enabled", False)
             result = await self._btc_ma_cross_service().close_position(reason="emergency_stop")
             if result.get("action") == "none":
-                lines.append("BTC 3/200 SMA: OFF" + ("" if was_on else " (이미 꺼져 있었음)"))
+                lines.append("3/200 SMA: OFF" + ("" if was_on else " (이미 꺼져 있었음)"))
             else:
-                lines.append(f"BTC 3/200 SMA: OFF · 포지션 청산 {result.get('action')} {result.get('reason') or ''}".strip())
+                lines.append(f"3/200 SMA: OFF · 포지션 청산 {result.get('action')} {result.get('reason') or ''}".strip())
         except Exception as exc:
             logger.exception("BTC MA cross emergency stop failed")
-            lines.append(f"⚠️ BTC 3/200 SMA 정지 처리 오류: {exc}")
+            lines.append(f"⚠️ 3/200 SMA 정지 처리 오류: {exc}")
         return lines
 
     async def _btc_ma_cross_loop(self):

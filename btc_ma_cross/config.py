@@ -26,6 +26,8 @@ CLIENT_ID_STRATEGY = "btcma"
 CONFIG_KEY = "btc_ma_cross"
 
 TIMEFRAMES = ("15m", "30m", "1h", "2h", "4h")
+SCAN_SCOPES = ("btc", "alts")          # BTC only / top-N 24h-volume USDT perpetuals
+ENTRY_MODES = ("cross", "trend")       # fresh cross only / SMA3 already above-below SMA200
 # Margin-ROI loss that triggers the emergency stop; 0 = OFF.
 EMERGENCY_STOP_CHOICES = (0, 10, 20, 30, 50)
 
@@ -40,6 +42,9 @@ def default_btc_ma_cross_config() -> dict:
         "symbol": "BTCUSDT",
         "strategy_name": STRATEGY_NAME,
         "timeframe": "1h",
+        "scan_scope": "btc",
+        "alt_universe_size": 50,
+        "entry_mode": "cross",
         "fast_period": 3,
         "slow_period": 200,
         "candle_history": 260,
@@ -91,6 +96,11 @@ def normalize_btc_ma_cross_config(raw=None) -> dict:
     cfg["strategy_name"] = STRATEGY_NAME
     timeframe = str(cfg.get("timeframe") or "1h").strip().lower()
     cfg["timeframe"] = timeframe if timeframe in TIMEFRAMES else "1h"
+    scope = str(cfg.get("scan_scope") or "btc").strip().lower()
+    cfg["scan_scope"] = scope if scope in SCAN_SCOPES else "btc"
+    cfg["alt_universe_size"] = _int(cfg.get("alt_universe_size"), 50, 5, 100)
+    entry_mode = str(cfg.get("entry_mode") or "cross").strip().lower()
+    cfg["entry_mode"] = entry_mode if entry_mode in ENTRY_MODES else "cross"
     cfg["fast_period"] = 3
     cfg["slow_period"] = 200
     cfg["candle_history"] = _int(cfg.get("candle_history"), 260, 210, 1000)
@@ -133,6 +143,8 @@ __all__ = (
     "CLIENT_ID_STRATEGY",
     "CONFIG_KEY",
     "EMERGENCY_STOP_CHOICES",
+    "ENTRY_MODES",
+    "SCAN_SCOPES",
     "STRATEGY_NAME",
     "STRATEGY_VERSION",
     "TIMEFRAMES",

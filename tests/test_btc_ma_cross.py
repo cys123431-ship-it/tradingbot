@@ -315,7 +315,7 @@ def test_telegram_menu_timeframe_emergency_stop_and_exclusivity(tmp_path):
     controller = _controller(tmp_path)
     press = lambda a: asyncio.run(controller._handle_btc_ma_cross_action(a))  # noqa: E731
     text, markup = press("status")
-    assert "BTC 3/200 SMA" in text and "/setup" in text
+    assert "3/200 SMA" in text and "/setup" in text
     callbacks = _callbacks(markup)
     for tf in ("15m", "30m", "1h", "2h", "4h"):
         assert f"bm:tf:{tf}" in callbacks
@@ -381,7 +381,7 @@ def test_daily_report_has_ma_cross_section():
                                "owned_keys": [], "profit_locks": 2}}
     assert standalone_summary(inputs, "btc_ma_cross") == (1, 1, pytest.approx(212.3))
     text = build_daily_analysis_report(inputs)
-    assert "BTC 3/200 SMA 전략 (/btcmacross" in text and "PROFIT_LOCK" in text and "수익 확보 손절 상향 2회" in text
+    assert "3/200 SMA 전략 (/btcmacross" in text and "PROFIT_LOCK" in text and "수익 확보 손절 상향 2회" in text
 
 
 # ------------------------------------------- reversal cancels old protection

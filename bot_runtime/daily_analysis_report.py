@@ -567,7 +567,7 @@ def btc_pullback_summary(inputs, start=None, end=None):
 
 STANDALONE_REPORT_KEYS = (
     ("btc_pullback", "_btc_pullback_service", "BTC 눌림목", "/btcpullback"),
-    ("btc_ma_cross", "_btc_ma_cross_service", "BTC 3/200 SMA", "/btcmacross"),
+    ("btc_ma_cross", "_btc_ma_cross_service", "3/200 SMA", "/btcmacross"),
 )
 
 
@@ -946,7 +946,7 @@ def build_daily_analysis_report(inputs):
         lines.append(f"  미진입 사유 상위: {standalone.get('skip_counts')}")
         for trade in standalone.get("trades") or []:
             lines.append(
-                f"  · {trade.get('side')} {trade.get('quantity')} @ {trade.get('entry_price')} ({_kst(trade.get('entry_time'))}) "
+                f"  · {trade.get('symbol') or 'BTCUSDT'} {trade.get('side')} {trade.get('quantity')} @ {trade.get('entry_price')} ({_kst(trade.get('entry_time'))}) "
                 f"손절 {trade.get('stop_price') or '-'} / 익절 {trade.get('take_profit_price') or '-'}"
                 + (f" / 확보 {trade.get('lock_price')}" if trade.get("lock_price") else "")
                 + " → "

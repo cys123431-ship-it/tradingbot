@@ -30,7 +30,7 @@ NETWORK_LABELS = {NETWORK_TESTNET: "테스트넷(데모)", NETWORK_MAINNET: "메
 # Standalone futures strategies: (config key, label, Telegram command).
 STANDALONE_STRATEGIES = (
     (CONFIG_KEY, "BTC 눌림목", "/btcpullback"),
-    ("btc_ma_cross", "BTC 3/200 SMA", "/btcmacross"),
+    ("btc_ma_cross", "3/200 SMA", "/btcmacross"),
 )
 
 
