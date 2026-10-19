@@ -19,6 +19,20 @@ def sma(values, period):
     return out
 
 
+def market_is_flat(closed, cfg, lookback=100):
+    """True for a frozen / untraded market (a horizontal-line chart)."""
+    recent = closed[-lookback:]
+    if not recent:
+        return True
+    ranges = sorted((r[2] - r[3]) / r[4] for r in recent if r[4] > 0)
+    if not ranges:
+        return True
+    median = ranges[len(ranges) // 2]
+    zero_share = sum(1 for value in ranges if value <= 0) / len(ranges)
+    return (median < float(cfg.get("min_median_bar_range_pct", 0.0005))
+            or zero_share > float(cfg.get("max_zero_range_bar_share", 0.1)))
+
+
 def evaluate_cross(rows, cfg, now_ms, symbol="BTCUSDT", ccxt_symbol=None):
     """Cross of SMA(fast) over SMA(slow) on the last *closed* candle.
 
@@ -40,6 +54,10 @@ def evaluate_cross(rows, cfg, now_ms, symbol="BTCUSDT", ccxt_symbol=None):
     }
     if len(closed) < slow_p + 1:
         result["skip_reason"] = f"INSUFFICIENT_CANDLES:{len(closed)}<{slow_p + 1}"
+        return result
+    if market_is_flat(closed, cfg):
+        result["flat"] = True
+        result["skip_reason"] = "FLAT_MARKET"
         return result
     closes = [r[4] for r in closed]
     fast, slow = sma(closes, fast_p), sma(closes, slow_p)
@@ -103,6 +121,7 @@ def emergency_stop_price(side, entry_price, leverage, roi_percent):
 __all__ = (
     "emergency_stop_price",
     "evaluate_cross",
+    "market_is_flat",
     "margin_roi",
     "profit_lock_target",
     "sma",

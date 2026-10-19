@@ -94,7 +94,13 @@ class BtcMaCrossService(BtcEmaPullbackService):
             return cached[1]
         exchange = await self.exchange(network)
         markets = getattr(exchange, "markets", None) or await self._call(exchange.load_markets)
-        tickers = await self._call(exchange.fetch_tickers)
+        tradable = markets
+        ranking = exchange
+        if network != "mainnet" and cfg["rank_testnet_by_mainnet_volume"]:
+            # Demo volumes are not real: rank by mainnet, trade only what demo lists.
+            ranking = await self._ranking_exchange()
+            markets = getattr(ranking, "markets", None) or await self._call(ranking.load_markets)
+        tickers = await self._call(ranking.fetch_tickers)
         rows = []
         for symbol, ticker in (tickers or {}).items():
             market = (markets or {}).get(symbol)
@@ -102,6 +108,12 @@ class BtcMaCrossService(BtcEmaPullbackService):
                 continue
             if not (market.get("active") is not False and market.get("swap") is True and market.get("linear") is True
                     and market.get("quote") == "USDT" and market.get("settle") == "USDT"):
+                continue
+            listed = (tradable or {}).get(symbol)
+            if not isinstance(listed, dict) or listed.get("active") is False:
+                continue
+            status = str((listed.get("info") or {}).get("status") or "TRADING").upper()
+            if status != "TRADING":
                 continue
             if str(market.get("base") or "").upper() in STABLE_BASES:
                 continue
@@ -121,6 +133,14 @@ class BtcMaCrossService(BtcEmaPullbackService):
             raise ValueError("empty volume universe")
         self._universe_cache[network] = (self.now_ms(), universe, cfg["alt_universe_size"])
         return universe
+
+    async def _ranking_exchange(self):
+        """Public mainnet client used only to rank coins by real 24h volume."""
+        if getattr(self, "_mainnet_ranking", None) is None:
+            exchange = self.exchange_factory("mainnet", {})
+            await self._call(exchange.load_markets)
+            self._mainnet_ranking = exchange
+        return self._mainnet_ranking
 
     # ------------------------------------------------------------- signal
     async def cross_signal(self, network, cfg, ccxt_symbol=CCXT_SYMBOL, market_id=MARKET_ID):

@@ -267,3 +267,33 @@ def test_scope_and_entry_mode_buttons(tmp_path):
     assert "종목: 알트 포함" in status and "진입: 방향 유지" in status
     labels = [b.text for row in markup.inline_keyboard for b in row]
     assert "✅ 🌐 알트 상위50" in labels and "✅ 📈 방향 유지 중 진입" in labels
+
+
+def test_testnet_universe_is_ranked_by_mainnet_volume(tmp_path):
+    demo = MultiFake({
+        "FXSUSDT": coin(99_999, 85_000),     # fake demo volume, not listed on mainnet
+        "BTCUSDT": coin(1, 85_000),
+        "ETHUSDT": coin(2, 85_000),
+    })
+    mainnet = MultiFake({
+        "BTCUSDT": coin(900, 85_000),
+        "ETHUSDT": coin(800, 85_000),
+        "SOLUSDT": coin(700, 85_000),        # not listed on demo
+    })
+
+    async def no_sleep(_):
+        return None
+
+    cfg = {"enabled": True, "trading_mode": "DRY_RUN", "scan_scope": "alts"}
+    service = BtcMaCrossService(
+        config_getter=lambda: cfg, credentials_getter=lambda n: {},
+        exchange_factory=lambda n, c: mainnet if n == "mainnet" else demo,
+        runtime_dir=tmp_path, notifier=lambda t: None, main_network_getter=lambda: "testnet",
+        sleep=no_sleep, environ={},
+    )
+    universe = asyncio.run(service.scan_universe("testnet", service.config()))
+    assert [m for _, m, _ in universe] == ["BTCUSDT", "ETHUSDT"]
+    cfg["rank_testnet_by_mainnet_volume"] = False
+    service._universe_cache.clear()
+    universe = asyncio.run(service.scan_universe("testnet", service.config()))
+    assert [m for _, m, _ in universe][0] == "FXSUSDT"

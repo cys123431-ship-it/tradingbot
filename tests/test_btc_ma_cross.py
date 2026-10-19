@@ -468,3 +468,64 @@ def test_reverse_retry_gives_up_after_the_window(tmp_path):
     assert any("포기" in n for n in h.notes)
     h.now_ms += 20_000
     assert h.run()["reason"] == "WAITING_NEXT_CLOSE"  # waits for the next cross
+
+
+# --------------------------------------- stuck order records (demo incident)
+def _stuck_fxs_record(service, network="testnet"):
+    from trading_safety.order_state import OrderRecord, OrderState
+
+    store = service.store(network)
+    record = OrderRecord(client_order_id="btcma-fxsusdt-l-entry-b5cff459a7a", symbol="FXS/USDT:USDT", side="LONG",
+                         strategy="btcma", signal_timestamp="1", requested_qty=10.0,
+                         order_state=OrderState.SUBMITTED_UNKNOWN.value)
+    store.upsert(record)
+    store.try_acquire_entry_lease("old-process", 120.0, "FXS/USDT:USDT", record.client_order_id)
+    return store, record
+
+
+def test_stuck_unknown_entry_on_another_coin_no_longer_blocks_entries(tmp_path):
+    h = Harness(tmp_path)
+    store, record = _stuck_fxs_record(h.service)
+    store.set_runtime_state("entry_lock_reason", "RECONCILIATION_REQUIRED:position_fetch:TimeoutError")
+    assert store.entry_block_reason("BTC/USDT:USDT").startswith("RUNTIME_ENTRY_LOCK")
+    result = h.run()
+    assert result["action"] == "entered", result      # BTC cross entered again
+    assert store.get(record.client_order_id).order_state == "CANCELED"
+    assert store.get_runtime_state("entry_lock_reason") is None
+    assert any("🧹" in n for n in h.notes)
+    events = [e["event"] for e in h.service.ledger("testnet").recent_events(30)]
+    assert "STALE_ORDER_RECORDS_RESOLVED" in events
+
+
+def test_stuck_record_is_kept_while_its_position_really_exists(tmp_path):
+    h = Harness(tmp_path)
+    store, record = _stuck_fxs_record(h.service)
+    real_positions = h.fake.fetch_positions
+
+    def with_fxs(symbols=None):
+        rows = real_positions(symbols)
+        return rows + [{"symbol": "FXS/USDT:USDT", "side": "long", "contracts": 10.0, "entryPrice": 1.0}]
+
+    h.fake.fetch_positions = with_fxs
+    resolved = asyncio.run(h.service.resolve_stale_entry_records("testnet"))
+    assert resolved == []
+    assert store.get(record.client_order_id).order_state == "SUBMITTED_UNKNOWN"
+
+
+def test_stuck_record_is_kept_when_the_exchange_cannot_be_checked(tmp_path):
+    h = Harness(tmp_path)
+    store, record = _stuck_fxs_record(h.service)
+    h.fake.raise_positions = True
+    assert asyncio.run(h.service.resolve_stale_entry_records("testnet")) == []
+    assert store.get(record.client_order_id).order_state == "SUBMITTED_UNKNOWN"
+
+
+def test_flat_market_is_never_traded():
+    from btc_ma_cross.signals import market_is_flat
+
+    flat = [[T0 + i * H1, 2.5, 2.5, 2.5, 2.5, 0.0] for i in range(204)]
+    flat.append([T0 + 204 * H1, 2.5, 2.51, 2.5, 2.51, 1.0])  # one tick up "crosses"
+    signal = evaluate_cross(flat, CFG, now_after(flat))
+    assert signal["side"] is None and signal["skip_reason"] == "FLAT_MARKET"
+    assert market_is_flat(flat, CFG) is True
+    assert market_is_flat(bars(86_000.0), CFG) is False

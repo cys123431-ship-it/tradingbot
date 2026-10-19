@@ -28,7 +28,12 @@ from pathlib import Path
 
 from trading_safety.binance_algo_gateway import AlgoLookupStatus, BinanceAlgoOrderGateway
 from trading_safety.order_gateway import IdempotentOrderGateway
-from trading_safety.order_state import OrderState, SQLiteTradingStateStore, build_client_order_id
+from trading_safety.order_state import (
+    ENTRY_BLOCKING_STATES,
+    OrderState,
+    SQLiteTradingStateStore,
+    build_client_order_id,
+)
 
 from .config import (
     CLIENT_ID_STRATEGY,
@@ -152,6 +157,7 @@ class BtcEmaPullbackService:
         self._account_verified = {}
         self._cycle_lock = asyncio.Lock()
         self._last_notice = {}
+        self._last_stale_check = {}
 
     # ------------------------------------------------------------------ basics
     def config(self):
@@ -397,6 +403,8 @@ class BtcEmaPullbackService:
                             return {"action": "blocked", "reason": "RECONCILIATION_PENDING"}
                     if state.get("trade"):
                         return await self.manage_live(network, cfg, state)
+                    if not state.get("pending_entry"):
+                        await self.resolve_stale_entry_records(network)
                 elif state.get("trade"):
                     return await self.manage_paper(network, cfg, state)
                 if not cfg["enabled"]:
@@ -818,6 +826,56 @@ class BtcEmaPullbackService:
         if foreign:
             return f"FOREIGN_OPEN_ORDERS: {', '.join(foreign[:3])}"
         return ""
+
+    async def resolve_stale_entry_records(self, network, *, min_interval_ms=60_000):
+        """Release entry blocks left by orders that never became a position.
+
+        The order gateway blocks every new entry while any record of this
+        strategy is in an entry-blocking state (e.g. SUBMITTED_UNKNOWN after a
+        timeout on an illiquid market).  While this strategy is flat, each
+        such record is checked on Binance: when its order is not open and
+        there is no position on that symbol, the record is closed and the
+        entry lease released.  A failed lookup or a real position keeps the
+        block (fail closed).
+        """
+        now = self.now_ms()
+        if now - self._last_stale_check.get(network, 0) < min_interval_ms:
+            return []
+        self._last_stale_check[network] = now
+        store = self.store(network)
+        order_gateway, _ = await self.gateway(network)
+        resolved, kept = [], []
+        for record in store.list_by_states(ENTRY_BLOCKING_STATES):
+            try:
+                order = await order_gateway._fetch_order_by_client_id(record.symbol, record.client_order_id)
+                position = await self.fetch_position(network, record.symbol)
+            except Exception as exc:
+                kept.append(f"{record.client_order_id}: lookup failed ({exc})")
+                continue
+            status = str((order or {}).get("status") or "").lower()
+            if position or status in {"open", "new", "partially_filled"}:
+                kept.append(f"{record.client_order_id}: {'position' if position else 'open order'} on exchange")
+                continue
+            final = OrderState.CANCELED if float(record.filled_qty or 0.0) <= 0 else OrderState.CLOSED
+            store.transition(record.client_order_id, final,
+                             last_error=f"resolved: no open order or position (was {record.order_state})")
+            store.release_entry_lease(record.client_order_id, final)
+            resolved.append(f"{record.symbol}:{record.client_order_id}:{record.order_state}")
+        if not kept:
+            lease = store.get_entry_lease()
+            if lease:
+                store.release_entry_lease_for_symbol(lease.get("symbol"), reconciliation_confirmed=True)
+            lock = store.get_runtime_state("entry_lock_reason")
+            if lock not in (None, ""):
+                store.delete_runtime_state("entry_lock_reason")
+                resolved.append(f"runtime_lock:{lock}")
+        if resolved:
+            self.ledger(network).event("STALE_ORDER_RECORDS_RESOLVED", network=network, resolved=resolved, kept=kept)
+            await self._notify(
+                f"🧹 {self.LABEL}: 체결되지 않고 남아 있던 주문 기록을 정리했습니다 ({len(resolved)}건). "
+                "신규 진입 차단이 풀렸습니다.\n" + "\n".join(resolved[:3])
+            )
+        return resolved
 
     # --------------------------------------------------------------- LIVE: entry
     async def enter_live(self, network, cfg, state, signal, decision, context):

@@ -44,6 +44,13 @@ def default_btc_ma_cross_config() -> dict:
         "timeframe": "1h",
         "scan_scope": "btc",
         "alt_universe_size": 50,
+        # Demo-trading volumes are synthetic: rank the testnet universe by the
+        # real mainnet 24h volume and keep only coins also tradable on demo.
+        "rank_testnet_by_mainnet_volume": True,
+        # Flat / frozen markets (no real trading) are never traded: median
+        # candle range below this share of price, or too many zero-range bars.
+        "min_median_bar_range_pct": "0.0005",
+        "max_zero_range_bar_share": "0.1",
         "entry_mode": "cross",
         "fast_period": 3,
         "slow_period": 200,
@@ -99,6 +106,9 @@ def normalize_btc_ma_cross_config(raw=None) -> dict:
     scope = str(cfg.get("scan_scope") or "btc").strip().lower()
     cfg["scan_scope"] = scope if scope in SCAN_SCOPES else "btc"
     cfg["alt_universe_size"] = _int(cfg.get("alt_universe_size"), 50, 5, 100)
+    cfg["rank_testnet_by_mainnet_volume"] = _bool(cfg.get("rank_testnet_by_mainnet_volume"), True)
+    cfg["min_median_bar_range_pct"] = _decimal_text(cfg.get("min_median_bar_range_pct"), "0.0005", 0.0, 0.01)
+    cfg["max_zero_range_bar_share"] = _decimal_text(cfg.get("max_zero_range_bar_share"), "0.1", 0.0, 1.0)
     entry_mode = str(cfg.get("entry_mode") or "cross").strip().lower()
     cfg["entry_mode"] = entry_mode if entry_mode in ENTRY_MODES else "cross"
     cfg["fast_period"] = 3
