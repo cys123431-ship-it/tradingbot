@@ -30,6 +30,9 @@ SCAN_SCOPES = ("btc", "alts")          # BTC only / top-N 24h-volume USDT perpet
 ENTRY_MODES = ("cross", "trend")       # fresh cross only / SMA3 already above-below SMA200
 # Margin-ROI loss that triggers the emergency stop; 0 = OFF.
 EMERGENCY_STOP_CHOICES = (0, 10, 20, 30, 50)
+# Trend mode: closed candles to wait after a profit-lock / stop / manual exit
+# before re-entering the same coin in the same direction; 0 = until the next cross.
+REENTRY_WAIT_CHOICES = (1, 3, 6, 0)
 
 
 def default_btc_ma_cross_config() -> dict:
@@ -52,6 +55,7 @@ def default_btc_ma_cross_config() -> dict:
         "min_median_bar_range_pct": "0.0005",
         "max_zero_range_bar_share": "0.1",
         "entry_mode": "cross",
+        "reentry_wait_bars": 3,
         "fast_period": 3,
         "slow_period": 200,
         "candle_history": 260,
@@ -111,6 +115,11 @@ def normalize_btc_ma_cross_config(raw=None) -> dict:
     cfg["max_zero_range_bar_share"] = _decimal_text(cfg.get("max_zero_range_bar_share"), "0.1", 0.0, 1.0)
     entry_mode = str(cfg.get("entry_mode") or "cross").strip().lower()
     cfg["entry_mode"] = entry_mode if entry_mode in ENTRY_MODES else "cross"
+    try:
+        wait = int(float(cfg.get("reentry_wait_bars")))
+    except (TypeError, ValueError):
+        wait = 3
+    cfg["reentry_wait_bars"] = wait if wait in REENTRY_WAIT_CHOICES else 3
     cfg["fast_period"] = 3
     cfg["slow_period"] = 200
     cfg["candle_history"] = _int(cfg.get("candle_history"), 260, 210, 1000)
@@ -154,6 +163,7 @@ __all__ = (
     "CONFIG_KEY",
     "EMERGENCY_STOP_CHOICES",
     "ENTRY_MODES",
+    "REENTRY_WAIT_CHOICES",
     "SCAN_SCOPES",
     "STRATEGY_NAME",
     "STRATEGY_VERSION",

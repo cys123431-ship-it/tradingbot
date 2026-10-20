@@ -11,7 +11,7 @@ from telegram.ext import CallbackQueryHandler, CommandHandler
 
 from btc_ema_pullback.config import NETWORK_MAINNET, NETWORK_TESTNET, TRADING_MODE_DRY_RUN, TRADING_MODE_ENV, TRADING_MODE_LIVE
 from btc_ma_cross import BtcMaCrossService
-from btc_ma_cross.config import CONFIG_KEY, EMERGENCY_STOP_CHOICES, TIMEFRAMES
+from btc_ma_cross.config import CONFIG_KEY, EMERGENCY_STOP_CHOICES, REENTRY_WAIT_CHOICES, TIMEFRAMES
 
 from .controller_btc_pullback import NETWORK_LABELS, _answer_quietly, _kst, _n
 from .strategy_registry import BINANCE_MAINNET, BINANCE_TESTNET
@@ -26,9 +26,15 @@ def _scope_text(cfg):
     return "BTC만"
 
 
+def _reentry_text(cfg):
+    wait = int(cfg.get("reentry_wait_bars", 3))
+    return "반대 크로스까지 대기" if wait == 0 else f"{wait}봉 대기 후 같은 방향 재진입 (반대 크로스 시 즉시)"
+
+
 def _entry_mode_text(cfg):
     if cfg.get("entry_mode") == "trend":
-        return "방향 유지 중 진입 (SMA3이 SMA200 위=롱 / 아래=숏, 수익확보·손절 청산 후엔 그 코인 다음 크로스까지 대기)"
+        return ("방향 유지 중 진입 (SMA3이 SMA200 위=롱 / 아래=숏, 수익확보·손절 청산 후 그 코인은 "
+                f"{_reentry_text(cfg)})")
     return "돌파 시 진입 (SMA3이 SMA200을 뚫는 봉)"
 
 
@@ -100,6 +106,14 @@ class ControllerBtcMaCrossMixin:
             [
                 InlineKeyboardButton(mark(cfg.get("entry_mode") != "trend", "⚡ 돌파 시 진입"), callback_data="bm:entry:cross"),
                 InlineKeyboardButton(mark(cfg.get("entry_mode") == "trend", "📈 방향 유지 중 진입"), callback_data="bm:entry:trend"),
+            ],
+            [
+                InlineKeyboardButton(
+                    mark(int(cfg.get("reentry_wait_bars", 3)) == choice,
+                         "재진입 크로스까지" if choice == 0 else f"재진입 {choice}봉 후"),
+                    callback_data=f"bm:rw:{choice}",
+                )
+                for choice in REENTRY_WAIT_CHOICES
             ],
             [
                 InlineKeyboardButton(mark(cfg.get("timeframe") == tf, TIMEFRAME_LABELS[tf]), callback_data=f"bm:tf:{tf}")
@@ -175,6 +189,8 @@ class ControllerBtcMaCrossMixin:
             ]
         else:
             lines += ["", "보유: 없음"]
+            for wait_line in service.reentry_wait_lines(cfg, state):
+                lines.append(f"⏳ {wait_line}")
         last = status.get("last_skip") or {}
         if last:
             detail = last.get("skip_reason") or (f"{last.get('side')} 크로스" if last.get("side") else "-")
@@ -320,6 +336,14 @@ class ControllerBtcMaCrossMixin:
             if entry_mode in ("cross", "trend"):
                 await self._set_btc_ma_cross_value("entry_mode", entry_mode)
             return f"🎯 진입: {_entry_mode_text(service.config())}\n\n" + await self._format_btc_ma_cross_status(), keyboard()
+        if action.startswith("rw:"):
+            try:
+                choice = int(action.split(":", 1)[1])
+            except ValueError:
+                choice = -1
+            if choice in REENTRY_WAIT_CHOICES:
+                await self._set_btc_ma_cross_value("reentry_wait_bars", choice)
+            return f"⏳ 익절·손절 후 재진입: {_reentry_text(service.config())}\n\n" + await self._format_btc_ma_cross_status(), keyboard()
         if action.startswith("tf:"):
             timeframe = action.split(":", 1)[1]
             if timeframe in TIMEFRAMES:

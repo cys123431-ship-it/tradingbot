@@ -226,7 +226,7 @@ def test_trend_mode_enters_when_sma3_is_already_above(tmp_path):
 
 
 def test_trend_mode_waits_for_the_next_cross_after_a_profit_lock_exit(tmp_path):
-    h = Harness(tmp_path, _trend_coins(), scan_scope="btc", entry_mode="trend")
+    h = Harness(tmp_path, _trend_coins(), scan_scope="btc", entry_mode="trend", reentry_wait_bars=0)
     rows = h.fake.coins["BTCUSDT"]["rows"]
     h.now_ms = now_after(rows)
     h.run()
@@ -236,7 +236,7 @@ def test_trend_mode_waits_for_the_next_cross_after_a_profit_lock_exit(tmp_path):
     h.fake.fire_lock("BTCUSDT", 86_530.0)
     h.now_ms += 20_000
     assert h.run()["trade"]["exit_reason"] == "PROFIT_LOCK"
-    assert h.state()["reentry_block"] == {"BTCUSDT": "LONG"}
+    assert h.state()["reentry_block"]["BTCUSDT"]["side"] == "LONG"
     # Next bar: SMA3 still above SMA200 -> no new LONG (wait for a cross).
     rows.append([rows[-1][0] + H1, 86_500.0, 86_700.0, 86_400.0, 86_600.0, 1.0])
     h.now_ms = now_after(rows)
@@ -297,3 +297,66 @@ def test_testnet_universe_is_ranked_by_mainnet_volume(tmp_path):
     service._universe_cache.clear()
     universe = asyncio.run(service.scan_universe("testnet", service.config()))
     assert [m for _, m, _ in universe][0] == "FXSUSDT"
+
+
+def _exit_by_profit_lock(h):
+    rows = h.fake.coins["BTCUSDT"]["rows"]
+    h.now_ms = now_after(rows)
+    h.run()
+    h.fake.coins["BTCUSDT"]["mark"] = 85_000 * 1.021
+    h.now_ms += 20_000
+    h.run()
+    h.fake.fire_lock("BTCUSDT", 86_530.0)
+    h.now_ms += 20_000
+    assert h.run()["trade"]["exit_reason"] == "PROFIT_LOCK"
+    return rows
+
+
+def _add_up_bar(rows, close):
+    rows.append([rows[-1][0] + H1, rows[-1][4], close * 1.001, rows[-1][4] * 0.999, close, 1.0])
+
+
+def test_trend_mode_reenters_the_same_direction_after_three_bars(tmp_path):
+    h = Harness(tmp_path, _trend_coins(), scan_scope="btc", entry_mode="trend")  # default: 3 bars
+    rows = _exit_by_profit_lock(h)
+    orders = len(h.fake.orders)
+    for i, close in enumerate((86_600.0, 86_700.0), start=1):
+        _add_up_bar(rows, close)
+        h.now_ms = now_after(rows)
+        h.run()
+        assert len(h.fake.orders) == orders, f"re-entered after {i} bar(s)"
+        last = h.service.ledger("testnet").recent_events(1, kinds={"SIGNAL"})[0]
+        assert last["skip_reason"].startswith("REENTRY_WAIT: BTCUSDT LONG")
+    _add_up_bar(rows, 86_800.0)
+    h.now_ms = now_after(rows)
+    h.fake.coins["BTCUSDT"]["mark"] = 86_800.0
+    result = h.run()
+    assert result["action"] == "entered"
+    assert h.state()["trade"]["side"] == "LONG" and h.state()["trade"]["entry_type"] == "TREND"
+
+
+def test_legacy_block_without_exit_time_is_already_over(tmp_path):
+    h = Harness(tmp_path, _trend_coins(), scan_scope="btc", entry_mode="trend")
+    state = h.state()
+    state["reentry_block"] = {"BTCUSDT": "LONG"}   # stored by the previous version
+    h.service.save_state("testnet", "LIVE", state)
+    h.now_ms = now_after(h.fake.coins["BTCUSDT"]["rows"])
+    assert h.run()["action"] == "entered"
+
+
+def test_status_shows_the_reentry_wait_and_the_button(tmp_path):
+    from tests.test_btc_ma_cross import _callbacks, _controller
+
+    controller = _controller(tmp_path)
+    press = lambda a: asyncio.run(controller._handle_btc_ma_cross_action(a))  # noqa: E731
+    _, markup = press("status")
+    for data in ("bm:rw:1", "bm:rw:3", "bm:rw:6", "bm:rw:0"):
+        assert data in _callbacks(markup)
+    press("rw:6")
+    assert controller.cfg.data["btc_ma_cross"]["reentry_wait_bars"] == 6
+    service = controller.btc_ma_cross_service
+    state = service.load_state("testnet", "DRY_RUN")
+    state["reentry_block"] = {"BTCUSDT": {"side": "LONG", "exit_ms": service.now_ms()}}
+    service.save_state("testnet", "DRY_RUN", state)
+    status, _ = press("status")
+    assert "⏳ BTCUSDT 롱 재진입 대기:" in status and "/6봉" in status

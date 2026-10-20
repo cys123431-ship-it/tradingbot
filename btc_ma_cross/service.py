@@ -176,14 +176,61 @@ class BtcMaCrossService(BtcEmaPullbackService):
         self.save_state(network, mode, state)
         return signal, signal.get("skip_reason") or ""
 
+    @staticmethod
+    def _block_side_and_exit(block):
+        """(side, exit_ms) of a re-entry block; legacy entries were plain sides."""
+        if isinstance(block, dict):
+            return block.get("side"), int(block.get("exit_ms") or 0)
+        return block, 0  # legacy: exit time unknown -> waiting period already over
+
+    def _bars_since_exit(self, cfg, result, exit_ms):
+        span = TIMEFRAME_MS[cfg["timeframe"]]
+        bar_close = int(result.get("bar_open_ms") or 0) + span
+        if bar_close <= exit_ms:
+            return 0
+        return (bar_close - exit_ms - 1) // span + 1
+
+    def _reentry_wait(self, cfg, state, result):
+        """(blocked, waited, needed) for a trend re-entry on this coin's current side."""
+        block = (state.get("reentry_block") or {}).get(result.get("market_id"))
+        side, exit_ms = self._block_side_and_exit(block)
+        if not side or side != result.get("trend_side"):
+            return False, 0, 0
+        needed = int(cfg["reentry_wait_bars"])
+        waited = self._bars_since_exit(cfg, result, exit_ms)
+        if needed == 0:
+            return True, waited, 0  # wait for the next cross
+        return waited < needed, waited, needed
+
     def _update_reentry_blocks(self, state, results):
         """A coin blocked after a profit/stop exit is released once its SMAs flip."""
         blocks = dict(state.get("reentry_block") or {})
         for result in results:
-            blocked = blocks.get(result.get("market_id"))
+            blocked, _exit_ms = self._block_side_and_exit(blocks.get(result.get("market_id")))
             if blocked and (result.get("side") or (result.get("trend_side") and result["trend_side"] != blocked)):
                 blocks.pop(result["market_id"], None)
         state["reentry_block"] = blocks
+
+    def reentry_wait_lines(self, cfg, state):
+        """Human-readable re-entry waits for the status screen."""
+        lines = []
+        span = TIMEFRAME_MS[cfg["timeframe"]]
+        latest = {"bar_open_ms": self._latest_closed_bar(cfg)}
+        for market, block in sorted((state.get("reentry_block") or {}).items()):
+            side, exit_ms = self._block_side_and_exit(block)
+            if not side:
+                continue
+            side_text = "롱" if side == "LONG" else "숏"
+            needed = int(cfg["reentry_wait_bars"])
+            if needed == 0:
+                lines.append(f"{market} {side_text} 재진입 대기: 반대 크로스까지")
+                continue
+            waited = self._bars_since_exit(cfg, latest, exit_ms) if exit_ms else needed
+            if waited >= needed:
+                lines.append(f"{market} {side_text}: 대기 끝 (다음 봉 마감 때 방향 유지 시 재진입)")
+            else:
+                lines.append(f"{market} {side_text} 재진입 대기: {waited}/{needed}봉 (반대 크로스 시 즉시 해제)")
+        return lines
 
     def _entry_signal(self, cfg, state, result):
         """Entry signal for one scanned coin, or None."""
@@ -191,8 +238,15 @@ class BtcMaCrossService(BtcEmaPullbackService):
             return result
         if cfg["entry_mode"] != "trend" or result.get("stale") or not result.get("trend_side"):
             return None
-        if (state.get("reentry_block") or {}).get(result.get("market_id")) == result["trend_side"]:
-            return None  # exited by profit lock / stop: wait for this coin's next cross
+        blocked, waited, needed = self._reentry_wait(cfg, state, result)
+        if blocked:
+            # Exited by profit lock / stop / manual: this coin waits N candles
+            # (or for its next cross) before re-entering the same direction.
+            result["skip_reason"] = (
+                f"REENTRY_WAIT: {result['market_id']} {result['trend_side']} "
+                + (f"{waited}/{needed}봉" if needed else "반대 크로스까지")
+            )
+            return None
         signal = dict(result)
         signal["side"] = result["trend_side"]
         signal["entry_type"] = "TREND"
@@ -419,7 +473,8 @@ class BtcMaCrossService(BtcEmaPullbackService):
         if trade.get("exit_reason") == "CROSS_REVERSE":
             blocks.pop(market, None)
         else:
-            blocks[market] = trade.get("side")
+            blocks[market] = {"side": trade.get("side"), "exit_ms": self.now_ms(),
+                              "exit_reason": trade.get("exit_reason")}
         state["reentry_block"] = blocks
 
     def _protection_spec(self, cfg, trade, kind):
