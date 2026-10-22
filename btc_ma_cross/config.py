@@ -56,6 +56,11 @@ def default_btc_ma_cross_config() -> dict:
         "max_zero_range_bar_share": "0.1",
         "entry_mode": "cross",
         "reentry_wait_bars": 3,
+        # Trend mode: right after a profit-lock / stop / manual exit, enter the
+        # highest-volume *other* coin at once (no candle-close wait).
+        "rotate_after_exit": False,
+        # The alt scope is alts only: BTC (always #1 by volume) is left out.
+        "alt_exclude_btc": True,
         "fast_period": 3,
         "slow_period": 200,
         "candle_history": 260,
@@ -120,6 +125,8 @@ def normalize_btc_ma_cross_config(raw=None) -> dict:
     except (TypeError, ValueError):
         wait = 3
     cfg["reentry_wait_bars"] = wait if wait in REENTRY_WAIT_CHOICES else 3
+    cfg["rotate_after_exit"] = _bool(cfg.get("rotate_after_exit"), False)
+    cfg["alt_exclude_btc"] = _bool(cfg.get("alt_exclude_btc"), True)
     cfg["fast_period"] = 3
     cfg["slow_period"] = 200
     cfg["candle_history"] = _int(cfg.get("candle_history"), 260, 210, 1000)

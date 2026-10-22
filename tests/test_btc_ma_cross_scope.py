@@ -180,7 +180,8 @@ def test_highest_volume_coin_with_a_signal_wins(tmp_path):
     assert all(a["symbol"] == "ETHUSDT" for a in h.fake.algo_attempts)
     assert h.service.owned_position_keys() == {"ETHUSDT"}
     signal = h.service.ledger("testnet").recent_events(1, kinds={"SIGNAL"})[0]
-    assert signal["evaluated"] == 3 and set(signal["crosses"]) == {"ETHUSDT:LONG", "SOLUSDT:SHORT"}
+    # BTC is left out of the alt scope.
+    assert signal["evaluated"] == 2 and set(signal["crosses"]) == {"ETHUSDT:LONG", "SOLUSDT:SHORT"}
 
 
 def test_unusable_coin_falls_through_to_the_next(tmp_path):
@@ -264,7 +265,7 @@ def test_scope_and_entry_mode_buttons(tmp_path):
     text, _ = press("entry:trend")
     assert controller.cfg.data["btc_ma_cross"]["entry_mode"] == "trend" and "방향 유지" in text
     status, markup = press("status")
-    assert "종목: 알트 포함" in status and "진입: 방향 유지" in status
+    assert "종목: 알트 전용" in status and "BTC 제외" in status and "진입: 방향 유지" in status
     labels = [b.text for row in markup.inline_keyboard for b in row]
     assert "✅ 🌐 알트 상위50" in labels and "✅ 📈 방향 유지 중 진입" in labels
 
@@ -292,7 +293,7 @@ def test_testnet_universe_is_ranked_by_mainnet_volume(tmp_path):
         sleep=no_sleep, environ={},
     )
     universe = asyncio.run(service.scan_universe("testnet", service.config()))
-    assert [m for _, m, _ in universe] == ["BTCUSDT", "ETHUSDT"]
+    assert [m for _, m, _ in universe] == ["ETHUSDT"]  # FXS: not on mainnet, SOL: not on demo, BTC: alts only
     cfg["rank_testnet_by_mainnet_volume"] = False
     service._universe_cache.clear()
     universe = asyncio.run(service.scan_universe("testnet", service.config()))
@@ -360,3 +361,94 @@ def test_status_shows_the_reentry_wait_and_the_button(tmp_path):
     service.save_state("testnet", "DRY_RUN", state)
     status, _ = press("status")
     assert "⏳ BTCUSDT 롱 재진입 대기:" in status and "/6봉" in status
+
+
+# ------------------------------------------------ post-exit coin rotation
+def _trend_rows(last_close, base):
+    """Cross up on the previous bar, still above on the last closed bar."""
+    rows = bars(last_close * base / 85_000.0, base=base)
+    rows.append([rows[-1][0] + H1, rows[-1][4], rows[-1][4] * 1.002, rows[-1][4] * 0.998, rows[-1][4] * 1.001, 1.0])
+    return rows
+
+
+def _down_rows(base):
+    rows = bars(84_000.0 * base / 85_000.0, base=base)
+    rows.append([rows[-1][0] + H1, rows[-1][4], rows[-1][4] * 1.002, rows[-1][4] * 0.998, rows[-1][4] * 0.999, 1.0])
+    return rows
+
+
+def _rotation_harness(tmp_path, **cfg):
+    coins = {
+        "BTCUSDT": {"volume": 1000, "rows": _trend_rows(86_000.0, 85_000.0), "mark": 85_000.0},
+        "ETHUSDT": {"volume": 800, "rows": _trend_rows(86_000.0, 3_000.0), "mark": 3_000.0},
+        "SOLUSDT": {"volume": 700, "rows": _down_rows(150.0), "mark": 150.0},
+    }
+    h = Harness(tmp_path, coins, **{"entry_mode": "trend", "rotate_after_exit": True, **cfg})
+    h.now_ms = now_after(coins["BTCUSDT"]["rows"])
+    return h
+
+
+def _lock_exit(h, market, mark_up):
+    h.fake.coins[market]["mark"] *= mark_up
+    h.now_ms += 20_000
+    h.run()
+    h.fake.fire_lock(market, h.fake.coins[market]["mark"])
+    h.now_ms += 20_000
+    return h.run()
+
+
+def test_after_an_exit_the_next_coin_is_entered_at_once(tmp_path):
+    h = _rotation_harness(tmp_path)                 # alts scope: ETH (#1 alt), SOL
+    assert h.run()["action"] == "entered"
+    assert h.state()["trade"]["market_id"] == "ETHUSDT"
+    assert _lock_exit(h, "ETHUSDT", 1.021)["trade"]["exit_reason"] == "PROFIT_LOCK"
+    assert h.state()["rotation_pending"]["exclude"] == "ETHUSDT"
+    h.now_ms += 10_000                               # same candle, no close waited for
+    result = h.run()
+    assert result["action"] == "entered", result
+    trade = h.state()["trade"]
+    assert trade["market_id"] == "SOLUSDT" and trade["side"] == "SHORT" and trade["entry_type"] == "ROTATE"
+    assert h.state()["rotation_pending"] is None
+
+
+def test_rotation_off_waits_for_the_next_candle(tmp_path):
+    h = _rotation_harness(tmp_path, rotate_after_exit=False)
+    h.run()
+    _lock_exit(h, "ETHUSDT", 1.021)
+    h.now_ms += 10_000
+    assert h.run()["reason"] == "WAITING_NEXT_CLOSE"
+    assert h.state()["trade"] is None
+
+
+def test_btc_only_scope_rotates_to_the_top_alt(tmp_path):
+    h = _rotation_harness(tmp_path, scan_scope="btc")
+    assert h.run()["action"] == "entered"
+    assert h.state()["trade"]["market_id"] == "BTCUSDT"
+    _lock_exit(h, "BTCUSDT", 1.021)
+    h.now_ms += 10_000
+    assert h.run()["action"] == "entered"
+    assert h.state()["trade"]["market_id"] == "ETHUSDT"   # #1 by volume is the coin just closed -> #2
+
+
+def test_cross_reverse_does_not_trigger_rotation(tmp_path):
+    h = _rotation_harness(tmp_path)
+    h.run()
+    state = h.state()
+    from btc_ma_cross.service import BtcMaCrossService as S  # noqa: F401
+    h.service._on_trade_closed("testnet", "LIVE", state, {"market_id": "ETHUSDT", "side": "LONG",
+                                                            "exit_reason": "CROSS_REVERSE"})
+    assert not state.get("rotation_pending")
+
+
+def test_rotation_button(tmp_path):
+    from tests.test_btc_ma_cross import _callbacks, _controller
+
+    controller = _controller(tmp_path)
+    press = lambda a: asyncio.run(controller._handle_btc_ma_cross_action(a))  # noqa: E731
+    _, markup = press("status")
+    assert "bm:rot:on" in _callbacks(markup)
+    text, markup = press("rot:on")
+    assert controller.cfg.data["btc_ma_cross"]["rotate_after_exit"] is True
+    assert "bm:rot:off" in _callbacks(markup) and "방향 유지 중 진입 모드에서만" in text
+    press("entry:trend")
+    assert "익절·손절 직후" in press("status")[0]

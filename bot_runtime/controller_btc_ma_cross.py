@@ -20,9 +20,17 @@ logger = logging.getLogger(__name__)
 TIMEFRAME_LABELS = {"15m": "15분", "30m": "30분", "1h": "1시간", "2h": "2시간", "4h": "4시간"}
 
 
+def _rotation_text(cfg):
+    if not cfg.get("rotate_after_exit"):
+        return "OFF"
+    if cfg.get("entry_mode") != "trend":
+        return "ON (방향 유지 중 진입 모드에서만 동작)"
+    return "ON — 익절·손절 직후 방금 코인을 뺀 거래대금 1위 코인에 바로 진입"
+
+
 def _scope_text(cfg):
     if cfg.get("scan_scope") == "alts":
-        return f"알트 포함 24h 거래대금 상위 {cfg.get('alt_universe_size', 50)}개 (동시 신호 시 거래대금 1위)"
+        return f"알트 전용 24h 거래대금 상위 {cfg.get('alt_universe_size', 50)}개 (BTC 제외, 동시 신호 시 거래대금 1위)"
     return "BTC만"
 
 
@@ -108,6 +116,10 @@ class ControllerBtcMaCrossMixin:
                 InlineKeyboardButton(mark(cfg.get("entry_mode") == "trend", "📈 방향 유지 중 진입"), callback_data="bm:entry:trend"),
             ],
             [
+                InlineKeyboardButton(mark(cfg.get("rotate_after_exit"), "🔁 청산 후 다른 코인 바로 진입"),
+                                     callback_data="bm:rot:" + ("off" if cfg.get("rotate_after_exit") else "on")),
+            ],
+            [
                 InlineKeyboardButton(
                     mark(int(cfg.get("reentry_wait_bars", 3)) == choice,
                          "재진입 크로스까지" if choice == 0 else f"재진입 {choice}봉 후"),
@@ -172,6 +184,7 @@ class ControllerBtcMaCrossMixin:
             f"메인 선물 자동매매: {'일시정지' if getattr(self, 'is_paused', False) else '동작 중'} (선물 전략은 하나만 켜짐)",
             f"종목: {_scope_text(cfg)}",
             f"진입: {_entry_mode_text(cfg)}",
+            f"청산 후 다른 코인 전환: {_rotation_text(cfg)}",
             f"봉: {TIMEFRAME_LABELS[cfg['timeframe']]} (마감봉 기준) · SMA {cfg['fast_period']}/{cfg['slow_period']}",
             f"레버리지 {cfg['leverage']}x ISOLATED 고정 · 증거금: 가용 잔고의 {_n(cfg['margin_fraction']) * 100:.0f}%",
             f"비상손절: {'OFF' if stop == 0 else f'증거금 -{stop}% (Mark 기준)'}",
@@ -251,6 +264,7 @@ class ControllerBtcMaCrossMixin:
             "📘 3/200 SMA 크로스 규칙\n"
             f"• 종목: {_scope_text(cfg)} (TradFi·스테이블코인 제외)\n"
             f"• 진입: {_entry_mode_text(cfg)}\n"
+            f"• 청산 후 다른 코인 전환: {_rotation_text(cfg)}\n"
             f"• 봉: {TIMEFRAME_LABELS[cfg['timeframe']]} 마감봉 기준 (텔레그램에서 15분~4시간 선택)\n"
             "• 보유 중 반대 크로스: 시장가(reduce-only) 청산 후 즉시 반대 방향 진입\n"
             f"• 수익 확보(증거금 기준): {self._btc_ma_cross_lock_table(cfg)} (항상 도달 칸 {cfg['lock_gap_percent']}% 아래, 한 번 올라간 손절은 내려가지 않음)\n"
@@ -336,6 +350,9 @@ class ControllerBtcMaCrossMixin:
             if entry_mode in ("cross", "trend"):
                 await self._set_btc_ma_cross_value("entry_mode", entry_mode)
             return f"🎯 진입: {_entry_mode_text(service.config())}\n\n" + await self._format_btc_ma_cross_status(), keyboard()
+        if action.startswith("rot:"):
+            await self._set_btc_ma_cross_value("rotate_after_exit", action.split(":", 1)[1] == "on")
+            return f"🔁 청산 후 다른 코인 전환: {_rotation_text(service.config())}\n\n" + await self._format_btc_ma_cross_status(), keyboard()
         if action.startswith("rw:"):
             try:
                 choice = int(action.split(":", 1)[1])

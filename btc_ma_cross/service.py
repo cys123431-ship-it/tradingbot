@@ -89,6 +89,10 @@ class BtcMaCrossService(BtcEmaPullbackService):
         """[(ccxt_symbol, market_id, quote_volume)] in descending 24h volume."""
         if cfg["scan_scope"] != "alts":
             return [(CCXT_SYMBOL, MARKET_ID, None)]
+        return await self._volume_universe(network, cfg)
+
+    async def _volume_universe(self, network, cfg):
+        """Top-N USDT perpetuals by real 24h volume (BTC left out when alt_exclude_btc)."""
         cached = self._universe_cache.get(network)
         if cached and self.now_ms() - cached[0] < 600_000 and cached[2] == cfg["alt_universe_size"]:
             return cached[1]
@@ -125,6 +129,8 @@ class BtcMaCrossService(BtcEmaPullbackService):
             info = ticker.get("info") if isinstance(ticker.get("info"), dict) else {}
             volume = _f(ticker.get("quoteVolume") if ticker.get("quoteVolume") is not None else info.get("quoteVolume"))
             market_id = str(market.get("id") or "").upper() or symbol.split(":")[0].replace("/", "")
+            if cfg.get("alt_exclude_btc", True) and market_id == MARKET_ID:
+                continue
             if volume > 0:
                 rows.append((symbol, market_id, volume))
         rows.sort(key=lambda row: (-row[2], row[1]))
@@ -257,9 +263,10 @@ class BtcMaCrossService(BtcEmaPullbackService):
         )
         return signal
 
-    async def _scan(self, network, cfg, mode, state):
+    async def _scan(self, network, cfg, mode, state, universe=None):
         """Evaluate the whole scope on the newest closed candle; volume order kept."""
-        universe = await self.scan_universe(network, cfg)
+        if universe is None:
+            universe = await self.scan_universe(network, cfg)
         semaphore = asyncio.Semaphore(SCAN_CONCURRENCY)
 
         async def one(item):
@@ -281,6 +288,12 @@ class BtcMaCrossService(BtcEmaPullbackService):
         pending = state.get("pending_reverse_entry")
         if pending:
             return await self._retry_reverse_entry(network, cfg, mode, state, pending)
+        rotation = state.get("rotation_pending")
+        if rotation:
+            rotated = await self._rotate_after_exit(network, cfg, mode, state, rotation)
+            if rotated is not None:
+                return rotated
+            state = self.load_state(network, mode)
         latest = self._latest_closed_bar(cfg)
         if latest == int(state.get("last_evaluated_bar") or 0):
             return {"action": "waiting", "reason": "WAITING_NEXT_CLOSE"}
@@ -333,6 +346,77 @@ class BtcMaCrossService(BtcEmaPullbackService):
             if last.get("action") == "skip" and str(last.get("reason") or "").startswith(SYMBOL_SPECIFIC_BLOCKS):
                 state = self.load_state(network, mode)
                 continue
+            return last
+        return last
+
+    async def _rotation_universe(self, network, cfg):
+        """Coins eligible for the post-exit switch (BTC first in BTC-only scope)."""
+        alts = list(await self._volume_universe(network, cfg))
+        if cfg["scan_scope"] == "alts":
+            return alts
+        return [(CCXT_SYMBOL, MARKET_ID, None)] + [item for item in alts if item[1] != MARKET_ID]
+
+    async def _rotate_after_exit(self, network, cfg, mode, state, rotation):
+        """Right after an exit, enter the highest-volume other coin on its current SMA side.
+
+        Uses the last closed candle (no wait for the next close).  Returns None
+        when nothing could be done so the normal scan runs.
+        """
+        if cfg["entry_mode"] != "trend" or not cfg["rotate_after_exit"]:
+            state["rotation_pending"] = None
+            self.save_state(network, mode, state)
+            return None
+        exit_ms = int(rotation.get("exit_ms") or 0)
+        if self.now_ms() - exit_ms > int(cfg["reverse_retry_window_seconds"]) * 1000:
+            state["rotation_pending"] = None
+            self.save_state(network, mode, state)
+            self.ledger(network).event("ROTATION_EXPIRED", mode=mode, network=network, exclude=rotation.get("exclude"))
+            return None
+        excluded = rotation.get("exclude")
+        try:
+            universe = [item for item in await self._rotation_universe(network, cfg) if item[1] != excluded]
+            _, results, errors = await self._scan(network, cfg, mode, state, universe=universe)
+        except Exception as exc:
+            self.ledger(network).event("SKIP", mode=mode, network=network,
+                                       skip_reason=f"ROTATION_DATA_UNAVAILABLE: {type(exc).__name__}: {exc}")
+            return {"action": "waiting", "reason": "ROTATION_RETRY"}
+        self._update_reentry_blocks(state, results)
+        candidates = []
+        for result in results:
+            side = result.get("side") or result.get("trend_side")
+            if not side or result.get("flat"):
+                continue
+            if self._reentry_wait(cfg, state, dict(result, trend_side=side))[0]:
+                continue
+            signal = dict(result)
+            signal.update(side=side, entry_type="ROTATE", skip_reason="",
+                          signal_id=(f"{result['market_id']}:SMA{cfg['fast_period']}/{cfg['slow_period']}:"
+                                     f"{cfg['timeframe']}:ROTATE:{side}:{exit_ms}"))
+            candidates.append(signal)
+        self.ledger(network).event(
+            "SIGNAL", mode=mode, network=network, rotation=True, exclude=excluded, evaluated=len(results),
+            failed=len(errors), candidates=[f"{s['market_id']}:{s['side']}" for s in candidates[:5]],
+            side=candidates[0]["side"] if candidates else None,
+            market_id=candidates[0]["market_id"] if candidates else None,
+            skip_reason="" if candidates else f"NO_ROTATION_CANDIDATE ({excluded} 제외 {len(results)}종목 평가)",
+        )
+        state["rotation_pending"] = None
+        self.save_state(network, mode, state)
+        if not candidates:
+            return {"action": "skip", "reason": "NO_ROTATION_CANDIDATE"}
+        last = None
+        for signal in candidates:
+            last = await self._enter_on_signal(network, cfg, mode, state, signal)
+            reason = str(last.get("reason") or "")
+            if last.get("action") == "skip" and reason.startswith(SYMBOL_SPECIFIC_BLOCKS):
+                state = self.load_state(network, mode)
+                continue
+            if last.get("action") == "skip" and reason.startswith(TRANSIENT_ENTRY_BLOCKS):
+                state = self.load_state(network, mode)
+                state["processed_signals"] = [s for s in state["processed_signals"] if s != signal["signal_id"]]
+                state["rotation_pending"] = rotation  # retry on the next cycles
+                self.save_state(network, mode, state)
+                return {"action": "waiting", "reason": f"ROTATION_RETRY: {reason}"}
             return last
         return last
 
@@ -475,6 +559,10 @@ class BtcMaCrossService(BtcEmaPullbackService):
         else:
             blocks[market] = {"side": trade.get("side"), "exit_ms": self.now_ms(),
                               "exit_reason": trade.get("exit_reason")}
+            cfg = self.config()
+            if cfg["entry_mode"] == "trend" and cfg["rotate_after_exit"]:
+                state["rotation_pending"] = {"exclude": market, "exit_ms": self.now_ms(),
+                                             "exit_reason": trade.get("exit_reason")}
         state["reentry_block"] = blocks
 
     def _protection_spec(self, cfg, trade, kind):
@@ -747,7 +835,7 @@ class BtcMaCrossService(BtcEmaPullbackService):
         market = trade.get("market_id") or MARKET_ID
         base = market[:-4] if market.endswith("USDT") else market
         stop = f"비상손절 {trade['stop_price']}" if trade.get("stop_price") else "비상손절 OFF"
-        kind = "방향 유지" if trade.get("entry_type") == "TREND" else "돌파"
+        kind = {"TREND": "방향 유지", "ROTATE": "청산 후 다른 코인 전환"}.get(trade.get("entry_type"), "돌파")
         return (
             f"📈 {self.LABEL} 진입 ({tag} · {trade['network']} · {trade.get('timeframe')} · {kind})\n"
             f"{market} {trade['side']} {trade['quantity']} {base} @ {trade['entry_price']} · "
