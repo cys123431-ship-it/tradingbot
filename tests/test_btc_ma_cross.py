@@ -529,3 +529,53 @@ def test_flat_market_is_never_traded():
     assert signal["side"] is None and signal["skip_reason"] == "FLAT_MARKET"
     assert market_is_flat(flat, CFG) is True
     assert market_is_flat(bars(86_000.0), CFG) is False
+
+
+# ----------------------------- reverse when the close confirmation lags (10-22 17:00)
+def _lagging_close(h, stale_reads):
+    """After the reduce-only close, Binance still reports the old position a few times."""
+    real_create, real_positions = h.fake.create_order, h.fake.fetch_positions
+    lag = {"left": 0, "snapshot": None}
+
+    def create_order(symbol, order_type, side, qty, price=None, params=None):
+        if (params or {}).get("reduceOnly") and h.fake.position:
+            lag["snapshot"], lag["left"] = dict(h.fake.position), stale_reads
+        return real_create(symbol, order_type, side, qty, price, params)
+
+    def fetch_positions(symbols=None):
+        if lag["left"] > 0:
+            lag["left"] -= 1
+            return [dict(lag["snapshot"], symbol="BTC/USDT:USDT")]
+        return real_positions(symbols)
+
+    h.fake.create_order, h.fake.fetch_positions = create_order, fetch_positions
+
+
+def test_reverse_survives_a_short_position_lag_in_the_same_cycle(tmp_path):
+    h = Harness(tmp_path)
+    h.run()
+    _lagging_close(h, stale_reads=3)
+    h.next_bar(83_000.0)
+    assert h.run()["action"] == "reversed"
+    closed = h.service.ledger("testnet").trades(mode="LIVE", status="CLOSED")
+    assert closed[-1]["exit_reason"] == "CROSS_REVERSE"
+    assert h.state()["trade"]["side"] == "SHORT"
+
+
+def test_reverse_is_kept_when_the_close_shows_up_only_next_cycle(tmp_path):
+    h = Harness(tmp_path)
+    h.run()
+    _lagging_close(h, stale_reads=20)       # longer than the in-cycle re-checks
+    h.next_bar(83_000.0)
+    first = h.run()
+    assert first["action"] == "closing" and h.state()["trade"]["pending_reverse"]
+    h.fake.fetch_positions.__defaults__  # noqa: B018 (keep the wrapper)
+    for _ in range(20):                     # let the stale reads run out
+        if not h.fake.fetch_positions():
+            break
+    h.now_ms += 10_000
+    result = h.run()
+    assert result["action"] == "reversed", result
+    closed = h.service.ledger("testnet").trades(mode="LIVE", status="CLOSED")
+    assert closed[-1]["exit_reason"] == "CROSS_REVERSE"   # not MANUAL
+    assert h.state()["trade"]["side"] == "SHORT"

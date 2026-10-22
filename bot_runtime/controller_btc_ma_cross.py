@@ -245,7 +245,9 @@ class ControllerBtcMaCrossMixin:
             if kind == "SIGNAL":
                 detail = (f"{event.get('market_id') or ''} {event['side']} 신호".strip() if event.get("side")
                           else event.get("skip_reason")) or "-"
-                if event.get("scope") == "alts":
+                if event.get("rotation"):
+                    detail += f" · 청산 후 다른 코인 전환 ({event.get('exclude')} 제외 {event.get('evaluated')}종목 평가)"
+                elif event.get("scope") == "alts":
                     detail += f" · {event.get('evaluated')}종목 평가, 크로스 {len(event.get('crosses') or [])}건"
                 else:
                     detail += f" · SMA3 {_n(event.get('sma_fast')):.8g} / SMA200 {_n(event.get('sma_slow')):.8g}"

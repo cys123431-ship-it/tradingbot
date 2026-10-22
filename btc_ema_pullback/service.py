@@ -30,6 +30,7 @@ from trading_safety.binance_algo_gateway import AlgoLookupStatus, BinanceAlgoOrd
 from trading_safety.order_gateway import IdempotentOrderGateway
 from trading_safety.order_state import (
     ENTRY_BLOCKING_STATES,
+    OrderIntent,
     OrderState,
     SQLiteTradingStateStore,
     build_client_order_id,
@@ -1132,6 +1133,14 @@ class BtcEmaPullbackService:
         if entry_id and store.get(entry_id):
             store.transition(entry_id, OrderState.CLOSED)
             store.release_entry_lease(entry_id, OrderState.CLOSED)
+        # The position is confirmed flat: our close orders for it are done even
+        # when the gateway saw a stale position right after the fill.  Left
+        # CLOSING, they would block the next (e.g. cross-reverse) entry.
+        for record in store.active_for_symbol(_symbol_pair(trade)[0]):
+            if record.order_intent in {OrderIntent.CLOSE.value, OrderIntent.EMERGENCY_CLOSE.value,
+                                       OrderIntent.MANUAL_CLOSE.value}:
+                store.transition(record.client_order_id, OrderState.CLOSED, last_error=None)
+                store.release_entry_lease(record.client_order_id, OrderState.CLOSED)
         self._on_trade_closed(network, mode, state, result)
         self._set_phase(network, mode, state, TRADE_RECORDED, trade=None, last_error="")
         self._set_phase(network, mode, state, IDLE)

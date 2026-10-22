@@ -659,6 +659,16 @@ class BtcMaCrossService(BtcEmaPullbackService):
                                    state=result.state, error=result.error)
         if result.state == OrderState.CLOSED.value:
             return await self.finalize_live(network, cfg, state, exit_reason)
+        # Binance can report the position for a moment after a filled market
+        # close; re-check before leaving it to the next cycle.
+        for delay in cfg["protection_retry_delays_seconds"]:
+            await self._sleep(delay)
+            try:
+                still_open = await self.fetch_position(network, ccxt_symbol)
+            except Exception:
+                continue
+            if not still_open:
+                return await self.finalize_live(network, cfg, state, exit_reason)
         state["last_error"] = f"CLOSE_{result.state}: {result.error or ''}".strip()
         self.save_state(network, TRADING_MODE_LIVE, state)
         return {"action": "closing", "reason": state["last_error"]}
@@ -672,11 +682,16 @@ class BtcMaCrossService(BtcEmaPullbackService):
         except Exception as exc:
             self.ledger(network).event("POSITION_FETCH_FAILED", network=network, error=str(exc))
             return {"action": "managed", "reason": "POSITION_UNKNOWN"}
+        pending = trade.get("pending_reverse")
         if not position:
+            if pending:
+                # Our reverse close filled after the last check: book it as the
+                # cross reverse (not MANUAL) and take the opposite side now.
+                closed = await self.finalize_live(network, cfg, state, "CROSS_REVERSE")
+                return await self._enter_reverse(network, cfg, pending, closed)
             return await self.finalize_live(network, cfg, state, None)
         if state.get("phase") in {PROTECTION_FAILED, ERROR_RECOVERY} or trade.get("failsafe"):
             return await self.failsafe_close(network, cfg, state, state.get("last_error") or "RETRY_FAILSAFE")
-        pending = trade.get("pending_reverse")
         if pending:
             return await self._reverse_live(network, cfg, state, pending)
         signal, _ = await self._evaluate_new_bar(network, cfg, mode, state, trade)
@@ -709,6 +724,10 @@ class BtcMaCrossService(BtcEmaPullbackService):
         closed = await self._close_live(network, cfg, state, "cross_reverse", "CROSS_REVERSE")
         if closed.get("action") != "exited":
             return closed
+        return await self._enter_reverse(network, cfg, signal, closed)
+
+    async def _enter_reverse(self, network, cfg, signal, closed):
+        """After the cross-reverse close: enter the opposite side (or hold it for a retry)."""
         state = self.load_state(network, TRADING_MODE_LIVE)
         if not cfg["enabled"]:
             return {"action": "exited", "reason": "CROSS_REVERSE (신규진입 OFF라 반대 진입 안 함)"}
