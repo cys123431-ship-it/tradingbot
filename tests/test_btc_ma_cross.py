@@ -579,3 +579,64 @@ def test_reverse_is_kept_when_the_close_shows_up_only_next_cycle(tmp_path):
     closed = h.service.ledger("testnet").trades(mode="LIVE", status="CLOSED")
     assert closed[-1]["exit_reason"] == "CROSS_REVERSE"   # not MANUAL
     assert h.state()["trade"]["side"] == "SHORT"
+
+
+# -------------------------------------------------- SMA200 / SMA120 selection
+def _between_rows():
+    """SMA3 (104) above SMA120 (~100) but below SMA200 (~108)."""
+    closes = [120.0] * 100 + [100.0] * 117 + [104.0] * 3
+    return [[T0 + i * H1, c, c * 1.001, c * 0.999, c, 10.0] for i, c in enumerate(closes)]
+
+
+def test_slow_period_choice_changes_the_trend():
+    rows = _between_rows()
+    now = now_after(rows)
+    assert evaluate_cross(rows, CFG, now)["trend_side"] == "SHORT"
+    cfg120 = normalize_btc_ma_cross_config({"slow_period": 120})
+    assert cfg120["slow_period"] == 120
+    assert evaluate_cross(rows, cfg120, now)["trend_side"] == "LONG"
+    assert normalize_btc_ma_cross_config({"slow_period": 150})["slow_period"] == 200
+
+
+def test_switching_to_sma120_while_holding_follows_the_new_line(tmp_path):
+    h = Harness(tmp_path, entry_mode="trend")
+    h.rows = _between_rows()
+    h.fake.bars["1h"] = h.rows
+    h.now_ms = now_after(h.rows)
+    assert h.run()["action"] == "entered"
+    assert h.state()["trade"]["side"] == "SHORT"            # SMA3 below SMA200
+    h.cfg["slow_period"] = 120                               # Telegram switch while holding
+    h.rows.append([h.rows[-1][0] + H1, 104.0, 104.1, 103.9, 104.0, 10.0])
+    h.now_ms = now_after(h.rows)
+    result = h.run()
+    assert result["action"] == "reversed", result
+    closed = h.service.ledger("testnet").trades(mode="LIVE", status="CLOSED")
+    assert closed[-1]["side"] == "SHORT" and closed[-1]["exit_reason"] == "CROSS_REVERSE"
+    trade = h.state()["trade"]
+    assert trade["side"] == "LONG" and trade["entry_type"] == "REALIGN" and trade["slow_period"] == 120
+
+
+def test_holding_on_the_right_side_is_not_touched(tmp_path):
+    h = Harness(tmp_path, entry_mode="trend", slow_period=120)
+    h.rows = _between_rows()
+    h.fake.bars["1h"] = h.rows
+    h.now_ms = now_after(h.rows)
+    h.run()
+    assert h.state()["trade"]["side"] == "LONG"
+    h.rows.append([h.rows[-1][0] + H1, 104.0, 104.1, 103.9, 104.0, 10.0])
+    h.now_ms = now_after(h.rows)
+    assert h.run()["action"] == "managed"
+    assert h.state()["trade"]["side"] == "LONG"
+
+
+def test_sma_buttons_and_header(tmp_path):
+    controller = _controller(tmp_path)
+    press = lambda a: asyncio.run(controller._handle_btc_ma_cross_action(a))  # noqa: E731
+    text, markup = press("status")
+    assert "bm:slow:200" in _callbacks(markup) and "bm:slow:120" in _callbacks(markup)
+    assert text.startswith("📏 3/200 SMA")
+    text, markup = press("slow:120")
+    assert controller.cfg.data["btc_ma_cross"]["slow_period"] == 120
+    assert "SMA3 / SMA120" in text and "📏 3/120 SMA" in text
+    labels = [b.text for row in markup.inline_keyboard for b in row]
+    assert "✅ SMA3 / SMA120" in labels

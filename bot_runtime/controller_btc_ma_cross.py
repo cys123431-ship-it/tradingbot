@@ -11,7 +11,13 @@ from telegram.ext import CallbackQueryHandler, CommandHandler
 
 from btc_ema_pullback.config import NETWORK_MAINNET, NETWORK_TESTNET, TRADING_MODE_DRY_RUN, TRADING_MODE_ENV, TRADING_MODE_LIVE
 from btc_ma_cross import BtcMaCrossService
-from btc_ma_cross.config import CONFIG_KEY, EMERGENCY_STOP_CHOICES, REENTRY_WAIT_CHOICES, TIMEFRAMES
+from btc_ma_cross.config import (
+    CONFIG_KEY,
+    EMERGENCY_STOP_CHOICES,
+    REENTRY_WAIT_CHOICES,
+    SLOW_PERIOD_CHOICES,
+    TIMEFRAMES,
+)
 
 from .controller_btc_pullback import NETWORK_LABELS, _answer_quietly, _kst, _n
 from .strategy_registry import BINANCE_MAINNET, BINANCE_TESTNET
@@ -128,6 +134,11 @@ class ControllerBtcMaCrossMixin:
                 for choice in REENTRY_WAIT_CHOICES
             ],
             [
+                InlineKeyboardButton(mark(int(cfg.get("slow_period", 200)) == slow, f"SMA3 / SMA{slow}"),
+                                     callback_data=f"bm:slow:{slow}")
+                for slow in SLOW_PERIOD_CHOICES
+            ],
+            [
                 InlineKeyboardButton(mark(cfg.get("timeframe") == tf, TIMEFRAME_LABELS[tf]), callback_data=f"bm:tf:{tf}")
                 for tf in TIMEFRAMES
             ],
@@ -177,7 +188,7 @@ class ControllerBtcMaCrossMixin:
         trade = state.get("trade") or {}
         stop = int(cfg["emergency_stop_roi_percent"])
         lines = [
-            "📏 3/200 SMA 크로스 전략 (반대 크로스 시 즉시 반대 진입)",
+            f"📏 3/{cfg['slow_period']} SMA 크로스 전략 (반대 크로스 시 즉시 반대 진입)",
             f"전략: {'ON' if cfg['enabled'] else 'OFF'} · 모드: {mode}"
             + (" (환경변수로 DRY_RUN 강제)" if cfg["trading_mode"] == TRADING_MODE_LIVE and mode == TRADING_MODE_DRY_RUN else ""),
             f"거래소: {NETWORK_LABELS.get(network, network)} (/setup 선택을 따름) · API 키: {'있음' if status['has_credentials'] else '없음'}",
@@ -263,12 +274,12 @@ class ControllerBtcMaCrossMixin:
     def _btc_ma_cross_rules_text(self, cfg):
         stop = int(cfg["emergency_stop_roi_percent"])
         return (
-            "📘 3/200 SMA 크로스 규칙\n"
+            f"📘 3/{cfg['slow_period']} SMA 크로스 규칙 (SMA200/SMA120 선택 가능)\n"
             f"• 종목: {_scope_text(cfg)} (TradFi·스테이블코인 제외)\n"
             f"• 진입: {_entry_mode_text(cfg)}\n"
             f"• 청산 후 다른 코인 전환: {_rotation_text(cfg)}\n"
             f"• 봉: {TIMEFRAME_LABELS[cfg['timeframe']]} 마감봉 기준 (텔레그램에서 15분~4시간 선택)\n"
-            "• 보유 중 반대 크로스: 시장가(reduce-only) 청산 후 즉시 반대 방향 진입\n"
+            "• 보유 중 반대 크로스(또는 봉 마감 때 SMA3이 반대편): 시장가(reduce-only) 청산 후 즉시 반대 방향 진입\n"
             f"• 수익 확보(증거금 기준): {self._btc_ma_cross_lock_table(cfg)} (항상 도달 칸 {cfg['lock_gap_percent']}% 아래, 한 번 올라간 손절은 내려가지 않음)\n"
             "• 수익 확보 손절로 청산되면 다음 크로스까지 대기\n"
             f"• 비상손절: {'OFF' if stop == 0 else f'증거금 -{stop}%'} (메뉴에서 선택, 거래소에 Mark 기준으로 걸림)\n"
@@ -363,6 +374,18 @@ class ControllerBtcMaCrossMixin:
             if choice in REENTRY_WAIT_CHOICES:
                 await self._set_btc_ma_cross_value("reentry_wait_bars", choice)
             return f"⏳ 익절·손절 후 재진입: {_reentry_text(service.config())}\n\n" + await self._format_btc_ma_cross_status(), keyboard()
+        if action.startswith("slow:"):
+            try:
+                slow = int(action.split(":", 1)[1])
+            except ValueError:
+                slow = -1
+            if slow in SLOW_PERIOD_CHOICES:
+                await self._set_btc_ma_cross_value("slow_period", slow)
+            note = (
+                f"\n보유 중 포지션도 다음 봉 마감부터 SMA3/SMA{slow} 기준으로 관리합니다. "
+                "그때 SMA3이 반대편에 있으면 반대 방향으로 전환합니다." if holding else ""
+            )
+            return f"📐 기준선: SMA3 / SMA{service.config()['slow_period']}{note}\n\n" + await self._format_btc_ma_cross_status(), keyboard()
         if action.startswith("tf:"):
             timeframe = action.split(":", 1)[1]
             if timeframe in TIMEFRAMES:

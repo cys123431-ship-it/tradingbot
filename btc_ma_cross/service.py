@@ -238,6 +238,27 @@ class BtcMaCrossService(BtcEmaPullbackService):
                 lines.append(f"{market} {side_text} 재진입 대기: {waited}/{needed}봉 (반대 크로스 시 즉시 해제)")
         return lines
 
+    def _opposite_signal(self, cfg, trade, signal):
+        """Signal to reverse the held position on, or None.
+
+        A fresh cross against the position reverses it.  So does SMA3 already
+        sitting on the other side of the selected SMA at a candle close -- after
+        switching SMA200 <-> SMA120 while holding, or a cross missed while the
+        bot was down -- so the position always follows the chosen line.
+        """
+        if not signal:
+            return None
+        if signal.get("side") and signal["side"] != trade["side"]:
+            return signal
+        trend = signal.get("trend_side")
+        if not trend or trend == trade["side"] or signal.get("flat"):
+            return None
+        realigned = dict(signal)
+        realigned.update(side=trend, entry_type="REALIGN", skip_reason="",
+                         signal_id=(f"{signal['market_id']}:SMA{cfg['fast_period']}/{cfg['slow_period']}:"
+                                    f"{cfg['timeframe']}:REALIGN:{trend}:{signal.get('bar_open_ms')}"))
+        return realigned
+
     def _entry_signal(self, cfg, state, result):
         """Entry signal for one scanned coin, or None."""
         if result.get("side"):
@@ -547,6 +568,7 @@ class BtcMaCrossService(BtcEmaPullbackService):
             "sl_revision": 0,
             "lock_revision": 0,
             "timeframe": cfg["timeframe"],
+            "slow_period": cfg["slow_period"],
             "tick_size": str(rules.tick_size),
         }
 
@@ -696,8 +718,9 @@ class BtcMaCrossService(BtcEmaPullbackService):
             return await self._reverse_live(network, cfg, state, pending)
         signal, _ = await self._evaluate_new_bar(network, cfg, mode, state, trade)
         trade = state["trade"]
-        if signal and signal.get("side") and signal["side"] != trade["side"]:
-            return await self._reverse_live(network, cfg, state, signal)
+        opposite = self._opposite_signal(cfg, trade, signal)
+        if opposite:
+            return await self._reverse_live(network, cfg, state, opposite)
         try:
             mark = (await self.premium_index(network, market))["mark_price"]
         except Exception as exc:
@@ -834,7 +857,8 @@ class BtcMaCrossService(BtcEmaPullbackService):
         state["trade"] = trade
         self.save_state(network, mode, state)
         signal, _ = await self._evaluate_new_bar(network, cfg, mode, state, trade)
-        if signal and signal.get("side") and signal["side"] != trade["side"]:
+        signal = self._opposite_signal(cfg, trade, signal)
+        if signal:
             try:
                 price = (await self.premium_index(network, market))["mark_price"]
             except Exception:
@@ -854,9 +878,10 @@ class BtcMaCrossService(BtcEmaPullbackService):
         market = trade.get("market_id") or MARKET_ID
         base = market[:-4] if market.endswith("USDT") else market
         stop = f"비상손절 {trade['stop_price']}" if trade.get("stop_price") else "비상손절 OFF"
-        kind = {"TREND": "방향 유지", "ROTATE": "청산 후 다른 코인 전환"}.get(trade.get("entry_type"), "돌파")
+        kind = {"TREND": "방향 유지", "ROTATE": "청산 후 다른 코인 전환",
+                "REALIGN": "SMA 반대편 전환"}.get(trade.get("entry_type"), "돌파")
         return (
-            f"📈 {self.LABEL} 진입 ({tag} · {trade['network']} · {trade.get('timeframe')} · {kind})\n"
+            f"📈 {self.LABEL} 진입 ({tag} · {trade['network']} · {trade.get('timeframe')} · SMA3/{trade.get('slow_period', 200)} · {kind})\n"
             f"{market} {trade['side']} {trade['quantity']} {base} @ {trade['entry_price']} · "
             f"증거금 {_f(trade['margin_used']):.2f} USDT x{trade['leverage']}\n"
             f"{stop} · 증거금 +5% 도달 시 수익 확보 손절 시작"

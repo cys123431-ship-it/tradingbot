@@ -26,6 +26,7 @@ CLIENT_ID_STRATEGY = "btcma"
 CONFIG_KEY = "btc_ma_cross"
 
 TIMEFRAMES = ("15m", "30m", "1h", "2h", "4h")
+SLOW_PERIOD_CHOICES = (200, 120)        # SMA3 against SMA200 or SMA120 (Telegram)
 SCAN_SCOPES = ("btc", "alts")          # BTC only / top-N 24h-volume USDT perpetuals
 ENTRY_MODES = ("cross", "trend")       # fresh cross only / SMA3 already above-below SMA200
 # Margin-ROI loss that triggers the emergency stop; 0 = OFF.
@@ -128,7 +129,11 @@ def normalize_btc_ma_cross_config(raw=None) -> dict:
     cfg["rotate_after_exit"] = _bool(cfg.get("rotate_after_exit"), False)
     cfg["alt_exclude_btc"] = _bool(cfg.get("alt_exclude_btc"), True)
     cfg["fast_period"] = 3
-    cfg["slow_period"] = 200
+    try:
+        slow = int(float(cfg.get("slow_period")))
+    except (TypeError, ValueError):
+        slow = 200
+    cfg["slow_period"] = slow if slow in SLOW_PERIOD_CHOICES else 200
     cfg["candle_history"] = _int(cfg.get("candle_history"), 260, 210, 1000)
     cfg["leverage"] = 5  # fixed by the strategy definition
     cfg["margin_type"] = "ISOLATED"
@@ -172,6 +177,7 @@ __all__ = (
     "ENTRY_MODES",
     "REENTRY_WAIT_CHOICES",
     "SCAN_SCOPES",
+    "SLOW_PERIOD_CHOICES",
     "STRATEGY_NAME",
     "STRATEGY_VERSION",
     "TIMEFRAMES",
