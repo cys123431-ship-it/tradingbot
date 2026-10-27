@@ -151,6 +151,50 @@ pub struct OptionsWireSnapshot {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
+pub struct StandaloneTrade {
+    pub symbol: String,
+    pub side: String,
+    pub quantity: Option<f64>,
+    pub entry_price: Option<f64>,
+    pub stop_price: Option<f64>,
+    pub lock_roi: Option<f64>,
+    pub lock_price: Option<f64>,
+    pub margin_used: Option<f64>,
+    pub leverage: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct StandaloneEvent {
+    pub ts: String,
+    pub text: String,
+}
+
+/// 3/200 SMA cross and BTC pullback strategies (own state, own ledgers).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct StandaloneStrategy {
+    pub key: String,
+    pub label: String,
+    pub enabled: bool,
+    pub mode: String,
+    pub network: Option<String>,
+    pub scope: String,
+    pub timeframe: String,
+    pub entry_mode: Option<String>,
+    pub trade: Option<StandaloneTrade>,
+    pub today_trades: u32,
+    pub today_pnl: f64,
+    pub total_trades: u32,
+    pub total_pnl: f64,
+    pub wins: u32,
+    pub last_error: String,
+    pub recent: Vec<StandaloneEvent>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
 pub struct WireSnapshot {
     pub kind: String,
     pub ts: f64,
@@ -163,6 +207,7 @@ pub struct WireSnapshot {
     pub candles: Vec<Candle>,
     pub candle: Option<Candle>,
     pub options: Option<OptionsWireSnapshot>,
+    pub standalone: Option<Vec<StandaloneStrategy>>,
     pub error: Option<String>,
 }
 
@@ -186,6 +231,7 @@ pub struct MonitorState {
     pub last_server_ts: f64,
     pub last_error: Option<String>,
     pub options: OptionsMonitorState,
+    pub standalone: Vec<StandaloneStrategy>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -241,6 +287,9 @@ impl MonitorState {
         }
         if let Some(options) = snapshot.options {
             self.options.apply(options);
+        }
+        if let Some(standalone) = snapshot.standalone {
+            self.standalone = standalone;
         }
         self.last_server_ts = snapshot.ts;
         self.last_error = snapshot.error.filter(|value| !value.is_empty());
@@ -332,6 +381,19 @@ mod tests {
         });
         assert_eq!(state.candles.len(), 1);
         assert_eq!(state.candles[0].close, 11.0);
+    }
+
+    #[test]
+    fn standalone_strategies_are_kept_until_the_next_update() {
+        let mut state = MonitorState::default();
+        let line = r#"{"kind":"snapshot","standalone":[{"key":"btc_ma_cross","label":"3/200 SMA","enabled":true,"mode":"LIVE","scope":"SOLUSDT","timeframe":"5m","trade":{"symbol":"SOLUSDT","side":"SHORT","entry_price":150.5,"lock_roi":4.0,"lock_price":149.3},"recent":[{"ts":"2026-10-27T00:00:00+00:00","text":"SIGNAL"}]}]}"#;
+        state.apply(serde_json::from_str(line).unwrap());
+        state.apply(WireSnapshot::default());
+        assert_eq!(state.standalone.len(), 1);
+        let trade = state.standalone[0].trade.as_ref().unwrap();
+        assert_eq!(trade.symbol, "SOLUSDT");
+        assert_eq!(trade.lock_roi, Some(4.0));
+        assert_eq!(state.standalone[0].recent.len(), 1);
     }
 
     #[test]

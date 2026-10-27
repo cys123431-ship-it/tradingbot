@@ -458,6 +458,121 @@ impl MonitorApp {
         }
     }
 
+    fn standalone_panel(&self, ui: &mut egui::Ui) {
+        ui.heading("단독 전략");
+        if self.state.standalone.is_empty() {
+            ui.label("상태 데이터 대기 중…");
+            return;
+        }
+        for strategy in &self.state.standalone {
+            let (color, state_label) = if strategy.error.is_some() {
+                (Color32::from_rgb(255, 138, 128), "오류")
+            } else if strategy.trade.is_some() {
+                (Color32::from_rgb(50, 205, 120), "보유 중")
+            } else if strategy.enabled {
+                (Color32::from_rgb(255, 193, 7), "대기")
+            } else {
+                (Color32::from_gray(110), "OFF")
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(color, "●");
+                ui.strong(&strategy.label);
+                ui.label(state_label);
+                if !strategy.mode.is_empty() {
+                    let mode_color = if strategy.mode == "LIVE" {
+                        Color32::from_rgb(255, 112, 112)
+                    } else {
+                        Color32::from_rgb(100, 181, 246)
+                    };
+                    ui.colored_label(mode_color, &strategy.mode);
+                }
+            });
+            if let Some(error) = &strategy.error {
+                ui.colored_label(Color32::from_rgb(255, 138, 128), error);
+                ui.add_space(5.0);
+                continue;
+            }
+            let entry = match strategy.entry_mode.as_deref() {
+                Some("trend") => " · 방향 유지",
+                Some("cross") => " · 돌파",
+                _ => "",
+            };
+            ui.label(
+                RichText::new(format!(
+                    "{} · {}봉{entry}",
+                    strategy.scope, strategy.timeframe
+                ))
+                .small()
+                .color(ui.visuals().weak_text_color()),
+            );
+            egui::Grid::new(format!("standalone_{}", strategy.key))
+                .num_columns(2)
+                .spacing([12.0, 3.0])
+                .show(ui, |ui| {
+                    if let Some(trade) = &strategy.trade {
+                        row(
+                            ui,
+                            "보유",
+                            &format!(
+                                "{} {} @ {}",
+                                trade.symbol,
+                                trade.side,
+                                price_text(trade.entry_price)
+                            ),
+                        );
+                        row(
+                            ui,
+                            "비상손절",
+                            &trade
+                                .stop_price
+                                .map(|value| format!("{value}"))
+                                .unwrap_or_else(|| "OFF".into()),
+                        );
+                        row(
+                            ui,
+                            "수익 확보",
+                            &match (trade.lock_roi, trade.lock_price) {
+                                (Some(roi), Some(price)) => format!("+{roi}% @ {price}"),
+                                _ => "아직 없음".into(),
+                            },
+                        );
+                    } else {
+                        row(ui, "보유", "없음");
+                    }
+                    row(
+                        ui,
+                        "오늘",
+                        &format!(
+                            "{}회 {:+.4} USDT",
+                            strategy.today_trades, strategy.today_pnl
+                        ),
+                    );
+                    row(
+                        ui,
+                        "누적",
+                        &format!(
+                            "{}회 (승 {}) {:+.4} USDT",
+                            strategy.total_trades, strategy.wins, strategy.total_pnl
+                        ),
+                    );
+                });
+            if !strategy.last_error.is_empty() {
+                ui.colored_label(
+                    Color32::from_rgb(255, 138, 128),
+                    format!("최근 오류: {}", strategy.last_error),
+                );
+            }
+            for event in strategy.recent.iter().take(3) {
+                ui.label(
+                    RichText::new(format!("{} {}", kst_time(&event.ts), event.text))
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
+            }
+            ui.add_space(6.0);
+        }
+    }
+
     fn account_panel(&self, ui: &mut egui::Ui) {
         if self.state.position.is_none() && !self.state.runtime.entry_diagnostic.message.is_empty()
         {
@@ -614,6 +729,8 @@ impl eframe::App for MonitorApp {
                         ui.separator();
                         self.options_position_panel(ui);
                         ui.separator();
+                        self.standalone_panel(ui);
+                        ui.separator();
                         self.strategy_panel(ui);
                         ui.separator();
                         self.account_panel(ui);
@@ -640,6 +757,24 @@ impl eframe::App for MonitorApp {
         });
         ui.ctx().request_repaint_after(Duration::from_millis(250));
     }
+}
+
+fn price_text(value: Option<f64>) -> String {
+    value
+        .map(|price| format!("{price}"))
+        .unwrap_or_else(|| "-".into())
+}
+
+/// "2026-10-27T03:04:05.123+00:00" -> "12:04:05" (KST).
+fn kst_time(iso: &str) -> String {
+    let Some(time) = iso.get(11..19) else {
+        return iso.to_string();
+    };
+    let mut parts = time.split(':').map(|part| part.parse::<u32>().unwrap_or(0));
+    let hour = parts.next().unwrap_or(0);
+    let minute = parts.next().unwrap_or(0);
+    let second = parts.next().unwrap_or(0);
+    format!("{:02}:{minute:02}:{second:02}", (hour + 9) % 24)
 }
 
 fn row(ui: &mut egui::Ui, label: &str, value: &str) {

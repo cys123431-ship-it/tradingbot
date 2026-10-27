@@ -24,6 +24,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from options_trading.client import BinanceOptionsClient  # noqa: E402
 from options_trading.config import normalize_options_config  # noqa: E402
+from bot_runtime.standalone_snapshot import strategy_snapshots  # noqa: E402
 
 
 RUNNING = True
@@ -595,6 +596,17 @@ def _fallback_symbol(runtime):
     return "BTC/USDT"
 
 
+STANDALONE_REFRESH_SECONDS = 10
+
+
+def _standalone(root):
+    """3/200 SMA and BTC pullback state (config re-read so Telegram changes show)."""
+    try:
+        return strategy_snapshots(root, _load_json(root / "config.json", {}) or {})
+    except Exception as exc:
+        return [{"key": "error", "label": "단독 전략", "error": _text(f"{type(exc).__name__}: {exc}", 300)}]
+
+
 def _emit(payload):
     try:
         print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
@@ -621,9 +633,14 @@ def stream(root, interval, timeframe, candle_limit):
     runtime_path = root / "runtime" / "desktop_monitor.json"
     last_symbol = None
     last_runtime_epoch = 0
+    standalone = []
+    standalone_at = 0.0
 
     while RUNNING:
         started = time.monotonic()
+        if started - standalone_at >= STANDALONE_REFRESH_SECONDS:
+            standalone = _standalone(root)
+            standalone_at = started
         runtime = _load_json(runtime_path, {})
         if options_future is not None and options_future.done():
             try:
@@ -663,6 +680,7 @@ def stream(root, interval, timeframe, candle_limit):
                 "candles": candles if symbol != last_symbol else [],
                 "candle": candles[-1] if candles else None,
                 "options": options_snapshot,
+                "standalone": standalone,
                 "error": None,
             }
             _emit(payload)
@@ -676,6 +694,7 @@ def stream(root, interval, timeframe, candle_limit):
                     "exchange_mode": mode,
                     "symbol": last_symbol,
                     "options": options_snapshot,
+                    "standalone": standalone,
                     "error": _text(f"{type(exc).__name__}: {exc}", 500),
                 }
             )
