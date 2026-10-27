@@ -23,7 +23,7 @@ from .controller_btc_pullback import NETWORK_LABELS, _answer_quietly, _kst, _n
 from .strategy_registry import BINANCE_MAINNET, BINANCE_TESTNET
 
 logger = logging.getLogger(__name__)
-TIMEFRAME_LABELS = {"15m": "15분", "30m": "30분", "1h": "1시간", "2h": "2시간", "4h": "4시간"}
+TIMEFRAME_LABELS = {"3m": "3분", "5m": "5분", "15m": "15분", "30m": "30분", "1h": "1시간", "2h": "2시간", "4h": "4시간"}
 
 
 def _rotation_text(cfg):
@@ -31,13 +31,31 @@ def _rotation_text(cfg):
         return "OFF"
     if cfg.get("entry_mode") != "trend":
         return "ON (방향 유지 중 진입 모드에서만 동작)"
+    if cfg.get("scan_scope") == "single":
+        return "ON (코인 지정 중에는 동작 안 함 — 지정 코인만 거래)"
     return "ON — 익절·손절 직후 방금 코인을 뺀 거래대금 1위 코인에 바로 진입"
 
 
 def _scope_text(cfg):
     if cfg.get("scan_scope") == "alts":
         return f"알트 전용 24h 거래대금 상위 {cfg.get('alt_universe_size', 50)}개 (BTC 제외, 동시 신호 시 거래대금 1위)"
+    if cfg.get("scan_scope") == "single":
+        return f"지정 코인 {cfg.get('single_symbol') or 'BTCUSDT'}만"
     return "BTC만"
+
+
+PICK_LIST_SIZE = 12
+
+
+def _coin_error_text(reason):
+    code, _, symbol = str(reason).partition(":")
+    return {
+        "SYMBOL_EMPTY": "코인 이름을 입력하세요. 예: /macoin SOL",
+        "SYMBOL_NOT_FOUND": f"{symbol} USDT 무기한 선물을 이 거래소에서 찾지 못했습니다.",
+        "NOT_TRADING": f"{symbol}은(는) 지금 거래가 중지된 상태입니다.",
+        "STABLECOIN": f"{symbol}은(는) 스테이블코인이라 지정할 수 없습니다.",
+        "TRADFI": f"{symbol}은(는) 주식·원자재(TradFi) 계약이라 지정할 수 없습니다.",
+    }.get(code, f"코인을 확인하지 못했습니다: {reason}")
 
 
 def _reentry_text(cfg):
@@ -113,9 +131,14 @@ class ControllerBtcMaCrossMixin:
                 InlineKeyboardButton(mark(cfg.get("trading_mode") == TRADING_MODE_LIVE, "💥 LIVE"), callback_data="bm:mode:live"),
             ],
             [
-                InlineKeyboardButton(mark(cfg.get("scan_scope") != "alts", "🪙 BTC만"), callback_data="bm:scope:btc"),
+                InlineKeyboardButton(mark(cfg.get("scan_scope") not in ("alts", "single"), "🪙 BTC만"), callback_data="bm:scope:btc"),
                 InlineKeyboardButton(mark(cfg.get("scan_scope") == "alts", f"🌐 알트 상위{cfg.get('alt_universe_size', 50)}"),
                                      callback_data="bm:scope:alts"),
+                InlineKeyboardButton(
+                    mark(True, f"🎯 {cfg.get('single_symbol') or 'BTCUSDT'}") if cfg.get("scan_scope") == "single"
+                    else "🎯 코인 지정",
+                    callback_data="bm:pick",
+                ),
             ],
             [
                 InlineKeyboardButton(mark(cfg.get("entry_mode") != "trend", "⚡ 돌파 시 진입"), callback_data="bm:entry:cross"),
@@ -140,7 +163,11 @@ class ControllerBtcMaCrossMixin:
             ],
             [
                 InlineKeyboardButton(mark(cfg.get("timeframe") == tf, TIMEFRAME_LABELS[tf]), callback_data=f"bm:tf:{tf}")
-                for tf in TIMEFRAMES
+                for tf in TIMEFRAMES[:4]
+            ],
+            [
+                InlineKeyboardButton(mark(cfg.get("timeframe") == tf, TIMEFRAME_LABELS[tf]), callback_data=f"bm:tf:{tf}")
+                for tf in TIMEFRAMES[4:]
             ],
             [
                 InlineKeyboardButton(
@@ -169,6 +196,45 @@ class ControllerBtcMaCrossMixin:
                 InlineKeyboardButton("취소", callback_data="bm:status"),
             ])
         return InlineKeyboardMarkup(rows)
+
+    async def _btc_ma_cross_pick_keyboard(self, network):
+        """BTC plus the top alts by 24h volume as one-tap coin buttons."""
+        service = self._btc_ma_cross_service()
+        cfg = service.config()
+        coins = ["BTCUSDT"]
+        try:
+            for _, market_id, _ in await service._volume_universe(network, cfg):
+                if market_id not in coins:
+                    coins.append(market_id)
+                if len(coins) >= PICK_LIST_SIZE:
+                    break
+        except Exception as exc:
+            logger.warning("3/200 SMA coin list unavailable: %s", exc)
+        current = cfg.get("single_symbol") if cfg.get("scan_scope") == "single" else None
+        buttons = [
+            InlineKeyboardButton(("✅ " if coin == current else "") + coin[:-4], callback_data=f"bm:coin:{coin}")
+            for coin in coins
+        ]
+        rows = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
+        rows.append([InlineKeyboardButton("↩️ 돌아가기", callback_data="bm:status")])
+        return InlineKeyboardMarkup(rows)
+
+    async def _set_btc_ma_cross_coin(self, network, text):
+        """Validate and store the single coin; returns (ok, message)."""
+        service = self._btc_ma_cross_service()
+        try:
+            _, market_id = await service.resolve_coin(network, text)
+        except ValueError as exc:
+            return False, "⚠️ " + _coin_error_text(exc)
+        except Exception as exc:
+            return False, f"⚠️ 거래소 종목 정보를 불러오지 못했습니다: {type(exc).__name__}"
+        await self._set_btc_ma_cross_value("single_symbol", market_id)
+        await self._set_btc_ma_cross_value("scan_scope", "single")
+        holding = service.load_state(network, service.mode()).get("trade") or {}
+        note = ''
+        if holding and (holding.get("market_id") or "BTCUSDT") != market_id:
+            note = f"\n(보유 중인 {holding.get('market_id') or 'BTCUSDT'} 포지션은 그대로 관리, 청산 후부터 {market_id}만 진입)"
+        return True, f"🎯 코인 지정: {market_id}만 거래합니다.{note}"
 
     @staticmethod
     def _btc_ma_cross_lock_table(cfg):
@@ -275,10 +341,10 @@ class ControllerBtcMaCrossMixin:
         stop = int(cfg["emergency_stop_roi_percent"])
         return (
             f"📘 3/{cfg['slow_period']} SMA 크로스 규칙 (SMA200/SMA120 선택 가능)\n"
-            f"• 종목: {_scope_text(cfg)} (TradFi·스테이블코인 제외)\n"
+            f"• 종목: {_scope_text(cfg)} (TradFi·스테이블코인 제외, 🎯 코인 지정 또는 /macoin SOL 로 1개 지정)\n"
             f"• 진입: {_entry_mode_text(cfg)}\n"
             f"• 청산 후 다른 코인 전환: {_rotation_text(cfg)}\n"
-            f"• 봉: {TIMEFRAME_LABELS[cfg['timeframe']]} 마감봉 기준 (텔레그램에서 15분~4시간 선택)\n"
+            f"• 봉: {TIMEFRAME_LABELS[cfg['timeframe']]} 마감봉 기준, 진입·청산(반대 크로스) 모두 같은 봉 (3분~4시간 선택)\n"
             "• 보유 중 반대 크로스(또는 봉 마감 때 SMA3이 반대편): 시장가(reduce-only) 청산 후 즉시 반대 방향 진입\n"
             f"• 수익 확보(증거금 기준): {self._btc_ma_cross_lock_table(cfg)} (항상 도달 칸 {cfg['lock_gap_percent']}% 아래, 한 번 올라간 손절은 내려가지 않음)\n"
             "• 수익 확보 손절로 청산되면 다음 크로스까지 대기\n"
@@ -352,6 +418,16 @@ class ControllerBtcMaCrossMixin:
             await self._set_btc_ma_cross_value("trading_mode", TRADING_MODE_LIVE)
             service.reset_reconciliation()
             return "💥 LIVE 전환 완료 (다음 주기에 거래소 상태를 먼저 대조합니다)\n\n" + await self._format_btc_ma_cross_status(), keyboard()
+        if action == "pick" or action == "scope:single":
+            return (
+                "🎯 거래할 코인 1개를 고르세요 (거래대금 상위 순).\n"
+                "목록에 없는 코인은 /macoin SOL 처럼 입력하면 됩니다.\n"
+                f"지금: {_scope_text(cfg)}",
+                await self._btc_ma_cross_pick_keyboard(network),
+            )
+        if action.startswith("coin:"):
+            _, message = await self._set_btc_ma_cross_coin(network, action.split(":", 1)[1])
+            return message + "\n\n" + await self._format_btc_ma_cross_status(), keyboard()
         if action.startswith("scope:"):
             scope = action.split(":", 1)[1]
             if scope in ("btc", "alts"):
@@ -414,7 +490,9 @@ class ControllerBtcMaCrossMixin:
         if action == "close":
             if not holding:
                 return "보유 중인 이 전략의 포지션이 없습니다.\n\n" + await self._format_btc_ma_cross_status(), keyboard()
-            return "⚠️ 이 전략의 BTCUSDT 포지션을 시장가(reduce-only)로 청산할까요?", keyboard(("✅ 청산 확인", "bm:confirm_close"))
+            held = service.load_state(network, service.mode(cfg)).get("trade") or {}
+            return (f"⚠️ 이 전략의 {held.get('market_id') or 'BTCUSDT'} 포지션을 시장가(reduce-only)로 청산할까요?",
+                    keyboard(("✅ 청산 확인", "bm:confirm_close")))
         if action == "confirm_close":
             result = await service.close_position()
             return f"🔻 청산 요청: {result.get('action')} {result.get('reason') or ''}\n\n" + await self._format_btc_ma_cross_status(), keyboard()
@@ -436,7 +514,27 @@ class ControllerBtcMaCrossMixin:
             text, keyboard = await self._handle_btc_ma_cross_action(action)
             await self._edit_btc_ma_cross(query, text, keyboard)
 
+        async def btc_ma_coin_cmd(update, context):
+            service = self._btc_ma_cross_service()
+            network = service.current_network()
+            if not network:
+                await update.message.reply_text(await self._format_btc_ma_cross_status())
+                return
+            args = list(getattr(context, "args", None) or [])
+            if not args:
+                await update.message.reply_text(
+                    "🎯 거래할 코인 1개를 고르세요. 직접 입력: /macoin SOL",
+                    reply_markup=await self._btc_ma_cross_pick_keyboard(network),
+                )
+                return
+            _, message = await self._set_btc_ma_cross_coin(network, args[0])
+            await update.message.reply_text(
+                message + "\n\n" + await self._format_btc_ma_cross_status(),
+                reply_markup=self._build_btc_ma_cross_keyboard(service.config()),
+            )
+
         self.tg_app.add_handler(CommandHandler("btcmacross", owner_only(btc_ma_cross_cmd)))
+        self.tg_app.add_handler(CommandHandler("macoin", owner_only(btc_ma_coin_cmd)))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(btc_ma_cross_callback), pattern=r"^bm:"))
 
     async def _stop_btc_ma_cross_for_emergency(self):

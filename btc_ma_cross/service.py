@@ -4,7 +4,7 @@ Inherits order execution, reconciliation, fail-safe, accounting and DRY_RUN
 plumbing from the BTC pullback service; only the signal, sizing and the
 exit logic differ:
 
-* scope: BTC only, or the top-N 24h-volume USDT perpetuals (Telegram)
+* scope: BTC only, the top-N 24h-volume USDT perpetuals, or one chosen coin
 * entry: a fresh SMA3/SMA200 cross on a closed candle, or (trend mode) the
   SMA3 already above / below SMA200; one position, highest volume first
 * opposite cross while holding: close (reduce-only) and enter the other way
@@ -87,9 +87,45 @@ class BtcMaCrossService(BtcEmaPullbackService):
     # ------------------------------------------------------------ universe
     async def scan_universe(self, network, cfg):
         """[(ccxt_symbol, market_id, quote_volume)] in descending 24h volume."""
+        if cfg["scan_scope"] == "single":
+            ccxt_symbol, market_id = await self.resolve_coin(network, cfg["single_symbol"])
+            return [(ccxt_symbol, market_id, None)]
         if cfg["scan_scope"] != "alts":
             return [(CCXT_SYMBOL, MARKET_ID, None)]
         return await self._volume_universe(network, cfg)
+
+    async def resolve_coin(self, network, text):
+        """(ccxt_symbol, market_id) of a tradable USDT perpetual typed as SOL / SOLUSDT / SOL/USDT.
+
+        Tries the 1000x contract too (PEPE -> 1000PEPEUSDT).  Raises ValueError
+        with a short reason when the coin cannot be traded on this exchange.
+        """
+        raw = str(text or "").upper().replace(":USDT", "").replace("PERP", "")
+        raw = "".join(ch for ch in raw if ch.isalnum())
+        base = raw[:-4] if raw.endswith("USDT") and len(raw) > 4 else raw
+        if not base:
+            raise ValueError("SYMBOL_EMPTY")
+        exchange = await self.exchange(network)
+        markets = getattr(exchange, "markets", None) or await self._call(exchange.load_markets)
+        by_id = {}
+        for symbol, market in (markets or {}).items():
+            if isinstance(market, dict) and market.get("swap") is True and market.get("linear") is True \
+                    and market.get("quote") == "USDT" and market.get("settle") == "USDT":
+                by_id[str(market.get("id") or "").upper()] = (symbol, market)
+        for market_id in (f"{base}USDT", f"1000{base}USDT"):
+            found = by_id.get(market_id)
+            if not found:
+                continue
+            symbol, market = found
+            status = str((market.get("info") or {}).get("status") or "TRADING").upper()
+            if market.get("active") is False or status != "TRADING":
+                raise ValueError(f"NOT_TRADING:{market_id}")
+            if str(market.get("base") or "").upper() in STABLE_BASES:
+                raise ValueError(f"STABLECOIN:{market_id}")
+            if market_is_tradifi_perpetual(symbol, market):
+                raise ValueError(f"TRADFI:{market_id}")
+            return symbol, market_id
+        raise ValueError(f"SYMBOL_NOT_FOUND:{base}USDT")
 
     async def _volume_universe(self, network, cfg):
         """Top-N USDT perpetuals by real 24h volume (BTC left out when alt_exclude_btc)."""
@@ -347,7 +383,7 @@ class BtcMaCrossService(BtcEmaPullbackService):
             "crosses": [f"{r['market_id']}:{r['side']}" for r in results if r.get("side")][:10],
             "candidates": [f"{s['market_id']}:{s['side']}" for s in candidates[:5]],
         }
-        if cfg["scan_scope"] == "btc":
+        if cfg["scan_scope"] in ("btc", "single"):
             chosen = candidates[0] if candidates else results[0]
             self.ledger(network).event("SIGNAL", mode=mode, network=network, **{**chosen, **summary})
         else:
@@ -383,7 +419,7 @@ class BtcMaCrossService(BtcEmaPullbackService):
         Uses the last closed candle (no wait for the next close).  Returns None
         when nothing could be done so the normal scan runs.
         """
-        if cfg["entry_mode"] != "trend" or not cfg["rotate_after_exit"]:
+        if cfg["entry_mode"] != "trend" or not cfg["rotate_after_exit"] or cfg["scan_scope"] == "single":
             state["rotation_pending"] = None
             self.save_state(network, mode, state)
             return None
@@ -582,7 +618,7 @@ class BtcMaCrossService(BtcEmaPullbackService):
             blocks[market] = {"side": trade.get("side"), "exit_ms": self.now_ms(),
                               "exit_reason": trade.get("exit_reason")}
             cfg = self.config()
-            if cfg["entry_mode"] == "trend" and cfg["rotate_after_exit"]:
+            if cfg["entry_mode"] == "trend" and cfg["rotate_after_exit"] and cfg["scan_scope"] != "single":
                 state["rotation_pending"] = {"exclude": market, "exit_ms": self.now_ms(),
                                              "exit_reason": trade.get("exit_reason")}
         state["reentry_block"] = blocks

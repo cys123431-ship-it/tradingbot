@@ -19,6 +19,11 @@ def sma(values, period):
     return out
 
 
+def _timeframe_scale(timeframe):
+    """Typical candle range grows ~sqrt(time): thresholds are set for 1h candles."""
+    return (TIMEFRAME_MS.get(timeframe, 3_600_000) / 3_600_000) ** 0.5
+
+
 def market_is_flat(closed, cfg, lookback=100):
     """True for a frozen / untraded market (a horizontal-line chart)."""
     recent = closed[-lookback:]
@@ -29,7 +34,8 @@ def market_is_flat(closed, cfg, lookback=100):
         return True
     median = ranges[len(ranges) // 2]
     zero_share = sum(1 for value in ranges if value <= 0) / len(ranges)
-    return (median < float(cfg.get("min_median_bar_range_pct", 0.0005))
+    min_range = float(cfg.get("min_median_bar_range_pct", 0.0005)) * _timeframe_scale(cfg.get("timeframe", "1h"))
+    return (median < min_range
             or zero_share > float(cfg.get("max_zero_range_bar_share", 0.1)))
 
 
@@ -72,7 +78,9 @@ def evaluate_cross(rows, cfg, now_ms, symbol="BTCUSDT", ccxt_symbol=None):
         signal_age_seconds=(int(now_ms) - bar[0] - TIMEFRAME_MS[timeframe]) / 1000.0,
     )
     result["trend_side"] = "LONG" if fast[-1] > slow[-1] else ("SHORT" if fast[-1] < slow[-1] else None)
-    result["stale"] = result["signal_age_seconds"] > float(cfg["signal_max_age_seconds"])
+    # On 3m/5m candles a signal older than half a candle is no longer fresh.
+    max_age = min(float(cfg["signal_max_age_seconds"]), TIMEFRAME_MS[timeframe] / 2000.0)
+    result["stale"] = result["signal_age_seconds"] > max_age
     if fast[-2] <= slow[-2] and fast[-1] > slow[-1]:
         side = "LONG"
     elif fast[-2] >= slow[-2] and fast[-1] < slow[-1]:

@@ -25,9 +25,9 @@ STRATEGY_VERSION = "1.0.0"
 CLIENT_ID_STRATEGY = "btcma"
 CONFIG_KEY = "btc_ma_cross"
 
-TIMEFRAMES = ("15m", "30m", "1h", "2h", "4h")
+TIMEFRAMES = ("3m", "5m", "15m", "30m", "1h", "2h", "4h")
 SLOW_PERIOD_CHOICES = (200, 120)        # SMA3 against SMA200 or SMA120 (Telegram)
-SCAN_SCOPES = ("btc", "alts")          # BTC only / top-N 24h-volume USDT perpetuals
+SCAN_SCOPES = ("btc", "alts", "single")  # BTC only / top-N 24h-volume USDT perpetuals / one chosen coin
 ENTRY_MODES = ("cross", "trend")       # fresh cross only / SMA3 already above-below SMA200
 # Margin-ROI loss that triggers the emergency stop; 0 = OFF.
 EMERGENCY_STOP_CHOICES = (0, 10, 20, 30, 50)
@@ -47,6 +47,8 @@ def default_btc_ma_cross_config() -> dict:
         "strategy_name": STRATEGY_NAME,
         "timeframe": "1h",
         "scan_scope": "btc",
+        # Coin traded in the "single" scope (Binance market id, e.g. SOLUSDT).
+        "single_symbol": "BTCUSDT",
         "alt_universe_size": 50,
         # Demo-trading volumes are synthetic: rank the testnet universe by the
         # real mainnet 24h volume and keep only coins also tradable on demo.
@@ -115,6 +117,8 @@ def normalize_btc_ma_cross_config(raw=None) -> dict:
     cfg["timeframe"] = timeframe if timeframe in TIMEFRAMES else "1h"
     scope = str(cfg.get("scan_scope") or "btc").strip().lower()
     cfg["scan_scope"] = scope if scope in SCAN_SCOPES else "btc"
+    single = "".join(ch for ch in str(cfg.get("single_symbol") or "").upper() if ch.isalnum())
+    cfg["single_symbol"] = single if single.endswith("USDT") and len(single) > 4 else "BTCUSDT"
     cfg["alt_universe_size"] = _int(cfg.get("alt_universe_size"), 50, 5, 100)
     cfg["rank_testnet_by_mainnet_volume"] = _bool(cfg.get("rank_testnet_by_mainnet_volume"), True)
     cfg["min_median_bar_range_pct"] = _decimal_text(cfg.get("min_median_bar_range_pct"), "0.0005", 0.0, 0.01)
