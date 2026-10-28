@@ -34,6 +34,9 @@ EMERGENCY_STOP_CHOICES = (0, 10, 20, 30, 50)
 # Trend mode: closed candles to wait after a profit-lock / stop / manual exit
 # before re-entering the same coin in the same direction; 0 = until the next cross.
 REENTRY_WAIT_CHOICES = (1, 3, 6, 0)
+# Profit-lock (익절) exits before the entry mode switches to a fresh cross.
+# 0 = OFF.
+PROFIT_LOCK_SWITCH_CHOICES = (0, 1, 2, 3, 4, 5)
 
 
 def default_btc_ma_cross_config() -> dict:
@@ -59,6 +62,10 @@ def default_btc_ma_cross_config() -> dict:
         "max_zero_range_bar_share": "0.1",
         "entry_mode": "cross",
         "reentry_wait_bars": 3,
+        # After this many profit-lock (익절) exits the next entry is forced to
+        # the fresh-cross mode (돌파 시 진입) and the count restarts at zero.
+        # 0 switches the feature off.
+        "profit_lock_switch_count": 3,
         # Trend mode: right after a profit-lock / stop / manual exit, enter the
         # highest-volume *other* coin at once (no candle-close wait).
         "rotate_after_exit": False,
@@ -130,6 +137,13 @@ def normalize_btc_ma_cross_config(raw=None) -> dict:
     except (TypeError, ValueError):
         wait = 3
     cfg["reentry_wait_bars"] = wait if wait in REENTRY_WAIT_CHOICES else 3
+    try:
+        switch_count = int(float(cfg.get("profit_lock_switch_count")))
+    except (TypeError, ValueError):
+        switch_count = defaults["profit_lock_switch_count"]
+    if switch_count != 0 and switch_count not in PROFIT_LOCK_SWITCH_CHOICES:
+        switch_count = defaults["profit_lock_switch_count"]
+    cfg["profit_lock_switch_count"] = switch_count
     cfg["rotate_after_exit"] = _bool(cfg.get("rotate_after_exit"), False)
     cfg["alt_exclude_btc"] = _bool(cfg.get("alt_exclude_btc"), True)
     cfg["fast_period"] = 3
@@ -179,6 +193,7 @@ __all__ = (
     "CONFIG_KEY",
     "EMERGENCY_STOP_CHOICES",
     "ENTRY_MODES",
+    "PROFIT_LOCK_SWITCH_CHOICES",
     "REENTRY_WAIT_CHOICES",
     "SCAN_SCOPES",
     "SLOW_PERIOD_CHOICES",

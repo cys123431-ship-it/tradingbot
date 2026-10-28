@@ -6057,7 +6057,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 /options - Binance European Options 전용 메뉴
 /btcoptions - BTC 전용 옵션 메뉴 (만기·스프레드 선택, Bid 기준 익절)
 /btcpullback - BTC EMA 눌림목 전략 (1h 추세+15m 눌림, 기본 DRY_RUN·테스트넷)
-/btcmacross - SMA3/SMA200 크로스 전략 (BTC·알트 상위50·지정 코인, 3분~4시간봉, 돌파/방향유지 진입, 반대 크로스 시 반대 진입, 증거금 +5%부터 수익 확보)
+/btcmacross - SMA3/SMA200 크로스 전략 (BTC·알트 상위50·지정 코인, 3분~4시간봉, 돌파/방향유지 진입, 반대 크로스 시 반대 진입, 증거금 +5%부터 수익 확보, 수익 확보 익절 3회 후 다음 진입부터 돌파 시 진입 강제)
 /macoin SOL - 3/200 SMA 전략이 거래할 코인 1개 지정
 /log - 최근 로그
 /close - 긴급 청산

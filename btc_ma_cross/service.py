@@ -43,6 +43,17 @@ from utbreakout.coinselector import market_is_tradifi_perpetual
 from .config import CLIENT_ID_STRATEGY, STRATEGY_VERSION, normalize_btc_ma_cross_config
 from .signals import emergency_stop_price, evaluate_cross, profit_lock_target
 
+PROFIT_LOCK_EXIT_REASON = "PROFIT_LOCK"
+FORCED_ENTRY_MODE = "cross"
+ENTRY_MODE_SWITCH_STATE_KEYS = ("pending_entry_mode_switch", "last_entry_mode_switch")
+
+
+def _int_or_zero(value):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
 # Skip reasons that can clear up within minutes; a reverse entry blocked by
 # one of them is retried instead of being dropped until the next cross.
 TRANSIENT_ENTRY_BLOCKS = (
@@ -80,9 +91,19 @@ class BtcMaCrossService(BtcEmaPullbackService):
     EXIT_REASON_BY_KIND = {"sl": "EMERGENCY_STOP", "lock": "PROFIT_LOCK"}
     normalize_config = staticmethod(normalize_btc_ma_cross_config)
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, config_writer=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._universe_cache = {}
+        # Optional async writer (the Telegram controller) used to persist a
+        # forced entry mode; the loop awaits it, never a background thread.
+        self.config_writer = config_writer
+
+    async def set_entry_mode(self, entry_mode):
+        """Persist ``entry_mode`` (used by the profit-lock switch).  True on success."""
+        writer = getattr(self.config_writer, "set_entry_mode", None)
+        if writer is None:
+            return False
+        return bool(await writer(entry_mode))
 
     # ------------------------------------------------------------ universe
     async def scan_universe(self, network, cfg):
@@ -342,6 +363,9 @@ class BtcMaCrossService(BtcEmaPullbackService):
 
     # -------------------------------------------------------------- entry
     async def maybe_enter(self, network, cfg, mode, state):
+        # A profit-lock exit was recorded: switch to 돌파 진입 BEFORE anything
+        # else in this cycle can open a position (rotation / reverse / scan).
+        cfg = await self.run_pending_entry_mode_switch(network, mode, cfg, state)
         pending = state.get("pending_reverse_entry")
         if pending:
             return await self._retry_reverse_entry(network, cfg, mode, state, pending)
@@ -610,6 +634,7 @@ class BtcMaCrossService(BtcEmaPullbackService):
 
     def _on_trade_closed(self, network, mode, state, trade):
         """After a profit-lock / stop / manual exit the coin waits for its next cross."""
+        self._count_profit_lock_exits(state, trade)
         blocks = dict(state.get("reentry_block") or {})
         market = trade.get("market_id") or trade.get("symbol") or MARKET_ID
         if trade.get("exit_reason") == "CROSS_REVERSE":
@@ -622,6 +647,108 @@ class BtcMaCrossService(BtcEmaPullbackService):
                 state["rotation_pending"] = {"exclude": market, "exit_ms": self.now_ms(),
                                              "exit_reason": trade.get("exit_reason")}
         state["reentry_block"] = blocks
+
+    # ------------------------------------------------------- profit lock switch
+    def _count_profit_lock_exits(self, state, trade):
+        """Count 익절 (profit lock) exits; the config switch flips before the next entry.
+
+        The count lives in the strategy state so a restart keeps it.  Reaching
+        ``profit_lock_switch_count`` writes ``entry_mode = "cross"`` through the
+        controller bridge (never from a background thread) and resets the count.
+        """
+        count = _int_or_zero(state.get("profit_lock_exit_count"))
+        switch_count = _int_or_zero(self.config().get("profit_lock_switch_count"))
+        forced = bool(state.get("entry_mode_forced_cross"))
+        changed = False
+        if trade.get("exit_reason") == PROFIT_LOCK_EXIT_REASON:
+            count = (count + 1) & 0x7FFF
+            if switch_count and not forced and count >= switch_count:
+                switch = {
+                    "entry_mode": "cross",
+                    "from_mode": self.config().get("entry_mode"),
+                    "exit_count": count,
+                    "ts": self.now_ms(),
+                    "trade_id": trade.get("trade_id"),
+                    "market_id": trade.get("market_id") or trade.get("symbol"),
+                }
+                state["pending_entry_mode_switch"] = switch
+                state["entry_mode_forced_cross"] = True
+                count = 0
+                changed = True
+        if count != state.get("profit_lock_exit_count"):
+            changed = True
+        state["profit_lock_exit_count"] = count
+        return changed
+
+    def entry_mode_switch_status(self, cfg=None, state=None):
+        """Telegram/status view of the profit-lock switch."""
+        cfg = self.config() if cfg is None else cfg
+        if state is None:
+            network = self.current_network(cfg)
+            state = self.load_state(network, self.mode(cfg)) if network else {}
+        return {
+            "switch_count": _int_or_zero(cfg.get("profit_lock_switch_count")),
+            "exit_count": _int_or_zero((state or {}).get("profit_lock_exit_count")),
+            "forced": bool((state or {}).get("entry_mode_forced_cross")),
+            "last_switch": dict((state or {}).get("last_entry_mode_switch") or {}),
+            "pending": dict((state or {}).get("pending_entry_mode_switch") or {}),
+        }
+
+    @staticmethod
+    def _apply_switch_to_config(cfg, switch):
+        """The normalized config with the forced entry mode already applied."""
+        forced = dict(cfg)
+        forced["entry_mode"] = switch.get("entry_mode") or FORCED_ENTRY_MODE
+        return forced
+
+    async def run_pending_entry_mode_switch(self, network, mode, cfg, state):
+        """Write the forced entry mode to the config, then return the effective cfg.
+
+        Only the strategy loop calls this, never a background thread.  When the
+        config cannot be written the switch stays ``pending`` and the in-memory
+        cfg is forced for this cycle, so no entry uses the old mode.  The last
+        evaluated candle is re-armed so the first 돌파-only scan really happens.
+        """
+        switch = dict(state.get("pending_entry_mode_switch") or {})
+        if not switch:
+            if state.get("entry_mode_forced_cross") and cfg.get("entry_mode") != FORCED_ENTRY_MODE:
+                # Config edited by hand after the switch: the user wins, stop forcing.
+                state["entry_mode_forced_cross"] = False
+                state["profit_lock_exit_count"] = 0
+                self.save_state(network, mode, state)
+            return cfg
+        ok = False
+        error = ""
+        try:
+            write = getattr(self.config_writer, "set_entry_mode", None)
+            if write is None:
+                raise RuntimeError("ENTRY_MODE_WRITER_MISSING")
+            ok = bool(await write(switch.get("entry_mode") or FORCED_ENTRY_MODE))
+        except Exception as exc:  # pragma: no cover - defensive
+            error = f"{type(exc).__name__}: {exc}"
+            logger.warning("3/200 SMA entry mode switch write failed: %s", error)
+        state["pending_entry_mode_switch"] = None if ok else switch
+        state["last_entry_mode_switch"] = {
+            **switch,
+            "applied_ms": self.now_ms(),
+            "applied": ok,
+            "error": error,
+        }
+        # The previous candle was already judged with the old entry mode: force a
+        # fresh 돌파 evaluation so the switch takes effect on the very next entry.
+        state["last_evaluated_bar"] = 0
+        self.save_state(network, mode, state)
+        self.ledger(network).event(
+            "ENTRY_MODE_SWITCH", mode=mode, network=network, applied=ok, error=error,
+            entry_mode=switch.get("entry_mode"), from_mode=switch.get("from_mode"),
+            exit_count=switch.get("exit_count"), market_id=switch.get("market_id"),
+        )
+        if ok:
+            await self._notify(
+                f"🔁 {self.LABEL}: 수익 확보 익절 {switch.get('exit_count')}회 달성 — "
+                f"다음 진입부터 '돌파 시 진입' 모드로 전환했습니다.", key="entry_mode_switch"
+            )
+        return self._apply_switch_to_config(cfg, switch)
 
     def _protection_spec(self, cfg, trade, kind):
         if kind == "sl":

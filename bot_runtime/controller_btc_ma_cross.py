@@ -18,7 +18,6 @@ from btc_ma_cross.config import (
     SLOW_PERIOD_CHOICES,
     TIMEFRAMES,
 )
-
 from .controller_btc_pullback import NETWORK_LABELS, _answer_quietly, _kst, _n
 from .strategy_registry import BINANCE_MAINNET, BINANCE_TESTNET
 
@@ -45,6 +44,30 @@ def _scope_text(cfg):
 
 
 PICK_LIST_SIZE = 12
+DEFAULT_PROFIT_LOCK_SWITCH_COUNT = 3
+
+
+def _profit_lock_switch_text(cfg, state=None):
+    """익절 N회 → 다음 진입부터 돌파 시 진입 강제 상태 문구."""
+    count = int(cfg.get("profit_lock_switch_count") or 0)
+    if count == 0:
+        return "OFF (익절 횟수와 상관없이 선택한 진입 모드를 유지)"
+    state = state or {}
+    done = int(state.get("profit_lock_exit_count") or 0)
+    text = f"수익 확보 익절 {count}회마다 다음 진입부터 '돌파 시 진입' 강제 (현재 {done}/{count})"
+    if state.get("entry_mode_forced_cross") or state.get("pending_entry_mode_switch"):
+        text += " · 돌파 강제 적용됨"
+    return text
+
+
+def _profit_lock_switch_button(cfg, state=None):
+    count = int(cfg.get("profit_lock_switch_count") or 0)
+    state = state or {}
+    if count == 0:
+        return "🔁 익절N회→돌파 강제: OFF"
+    done = int(state.get("profit_lock_exit_count") or 0)
+    forced = " ✅" if (state.get("entry_mode_forced_cross") or state.get("pending_entry_mode_switch")) else ""
+    return f"🔁 익절{count}회→돌파 강제: ON ({done}/{count}){forced}"
 
 
 def _coin_error_text(reason):
@@ -111,13 +134,21 @@ class ControllerBtcMaCrossMixin:
             runtime_dir=self.runtime_dir,
             notifier=notifier,
             main_network_getter=main_network_getter,
+            config_writer=self,
         )
         self.btc_ma_cross_service = service
         return service
 
+    async def set_entry_mode(self, entry_mode):
+        """Config writer used by the profit-lock switch (called from the strategy loop)."""
+        if entry_mode not in ("cross", "trend"):
+            return False
+        await self._set_btc_ma_cross_value("entry_mode", entry_mode)
+        return str((self.cfg.get(CONFIG_KEY, {}) or {}).get("entry_mode")) == entry_mode
+
     # ------------------------------------------------------------ rendering
     @staticmethod
-    def _build_btc_ma_cross_keyboard(cfg, *, confirm=None):
+    def _build_btc_ma_cross_keyboard(cfg, *, confirm=None, state=None):
         def mark(selected, label):
             return f"✅ {label}" if selected else label
 
@@ -143,6 +174,12 @@ class ControllerBtcMaCrossMixin:
             [
                 InlineKeyboardButton(mark(cfg.get("entry_mode") != "trend", "⚡ 돌파 시 진입"), callback_data="bm:entry:cross"),
                 InlineKeyboardButton(mark(cfg.get("entry_mode") == "trend", "📈 방향 유지 중 진입"), callback_data="bm:entry:trend"),
+            ],
+            [
+                InlineKeyboardButton(
+                    _profit_lock_switch_button(cfg, state),
+                    callback_data="bm:pls:" + ("off" if int(cfg.get("profit_lock_switch_count") or 0) else "on"),
+                ),
             ],
             [
                 InlineKeyboardButton(mark(cfg.get("rotate_after_exit"), "🔁 청산 후 다른 코인 바로 진입"),
@@ -261,6 +298,7 @@ class ControllerBtcMaCrossMixin:
             f"메인 선물 자동매매: {'일시정지' if getattr(self, 'is_paused', False) else '동작 중'} (선물 전략은 하나만 켜짐)",
             f"종목: {_scope_text(cfg)}",
             f"진입: {_entry_mode_text(cfg)}",
+            f"익절 자동 전환: {_profit_lock_switch_text(cfg, state)}",
             f"청산 후 다른 코인 전환: {_rotation_text(cfg)}",
             f"봉: {TIMEFRAME_LABELS[cfg['timeframe']]} (마감봉 기준) · SMA {cfg['fast_period']}/{cfg['slow_period']}",
             f"레버리지 {cfg['leverage']}x ISOLATED 고정 · 증거금: 가용 잔고의 {_n(cfg['margin_fraction']) * 100:.0f}%",
@@ -343,6 +381,7 @@ class ControllerBtcMaCrossMixin:
             f"📘 3/{cfg['slow_period']} SMA 크로스 규칙 (SMA200/SMA120 선택 가능)\n"
             f"• 종목: {_scope_text(cfg)} (TradFi·스테이블코인 제외, 🎯 코인 지정 또는 /macoin SOL 로 1개 지정)\n"
             f"• 진입: {_entry_mode_text(cfg)}\n"
+            f"• 익절 자동 전환: {_profit_lock_switch_text(cfg)}\n"
             f"• 청산 후 다른 코인 전환: {_rotation_text(cfg)}\n"
             f"• 봉: {TIMEFRAME_LABELS[cfg['timeframe']]} 마감봉 기준, 진입·청산(반대 크로스) 모두 같은 봉 (3분~4시간 선택)\n"
             "• 보유 중 반대 크로스(또는 봉 마감 때 SMA3이 반대편): 시장가(reduce-only) 청산 후 즉시 반대 방향 진입\n"
@@ -364,17 +403,35 @@ class ControllerBtcMaCrossMixin:
     async def _set_btc_ma_cross_value(self, key, value):
         await self.cfg.update_value([CONFIG_KEY, key], value)
 
+    def _btc_ma_cross_state(self):
+        """Current strategy state for the keyboard (empty when Upbit is selected)."""
+        service = self._btc_ma_cross_service()
+        cfg = service.config()
+        network = service.current_network(cfg)
+        return service.load_state(network, service.mode(cfg)) if network else {}
+
+    async def _reset_btc_ma_cross_counters(self, network):
+        """Clear the 익절 count and the forced-cross flag (manual mode choice)."""
+        service = self._btc_ma_cross_service()
+        state = service.load_state(network, service.mode(service.config()))
+        state["profit_lock_exit_count"] = 0
+        state["entry_mode_forced_cross"] = False
+        state["pending_entry_mode_switch"] = None
+        service.save_state(network, service.mode(service.config()), state)
+        return state
+
     async def _handle_btc_ma_cross_action(self, action):
         service = self._btc_ma_cross_service()
-
-        def keyboard(confirm=None):
-            return self._build_btc_ma_cross_keyboard(service.config(), confirm=confirm)
 
         cfg = service.config()
         network = service.current_network(cfg)
         if not network:
             return await self._format_btc_ma_cross_status(), keyboard()
-        holding = bool(service.load_state(network, service.mode(cfg)).get("trade"))
+        state = service.load_state(network, service.mode(cfg))
+        holding = bool(state.get("trade"))
+
+        def keyboard(confirm=None):
+            return self._build_btc_ma_cross_keyboard(service.config(), confirm=confirm, state=state)
 
         if action == "on":
             return (
@@ -438,7 +495,25 @@ class ControllerBtcMaCrossMixin:
             entry_mode = action.split(":", 1)[1]
             if entry_mode in ("cross", "trend"):
                 await self._set_btc_ma_cross_value("entry_mode", entry_mode)
+                if entry_mode == "trend":
+                    # A manual choice wins: stop forcing and restart the count.
+                    await self._reset_btc_ma_cross_counters(network)
+                    state = service.load_state(network, service.mode(service.config()))
             return f"🎯 진입: {_entry_mode_text(service.config())}\n\n" + await self._format_btc_ma_cross_status(), keyboard()
+        if action == "pls:on":
+            await self._set_btc_ma_cross_value("profit_lock_switch_count", DEFAULT_PROFIT_LOCK_SWITCH_COUNT)
+            return (
+                f"🔁 익절 자동 전환 ON: 수익 확보 익절 {DEFAULT_PROFIT_LOCK_SWITCH_COUNT}회마다 "
+                "다음 진입부터 '돌파 시 진입'으로 강제합니다.\n"
+                "(강제 전환 뒤 카운트는 0부터 다시 셉니다. '방향 유지 중 진입'을 직접 누르면 강제가 해제됩니다.)\n\n"
+                + await self._format_btc_ma_cross_status()
+            ), keyboard()
+        if action == "pls:off":
+            await self._set_btc_ma_cross_value("profit_lock_switch_count", 0)
+            return (
+                "🔁 익절 자동 전환 OFF: 익절 횟수와 상관없이 선택한 진입 모드를 유지합니다.\n\n"
+                + await self._format_btc_ma_cross_status()
+            ), keyboard()
         if action.startswith("rot:"):
             await self._set_btc_ma_cross_value("rotate_after_exit", action.split(":", 1)[1] == "on")
             return f"🔁 청산 후 다른 코인 전환: {_rotation_text(service.config())}\n\n" + await self._format_btc_ma_cross_status(), keyboard()
@@ -502,7 +577,10 @@ class ControllerBtcMaCrossMixin:
         async def btc_ma_cross_cmd(update, context):
             await update.message.reply_text(
                 await self._format_btc_ma_cross_status(),
-                reply_markup=self._build_btc_ma_cross_keyboard(self._btc_ma_cross_service().config()),
+                reply_markup=self._build_btc_ma_cross_keyboard(
+                    self._btc_ma_cross_service().config(),
+                    state=self._btc_ma_cross_state(),
+                ),
             )
 
         async def btc_ma_cross_callback(update, context):
@@ -530,7 +608,7 @@ class ControllerBtcMaCrossMixin:
             _, message = await self._set_btc_ma_cross_coin(network, args[0])
             await update.message.reply_text(
                 message + "\n\n" + await self._format_btc_ma_cross_status(),
-                reply_markup=self._build_btc_ma_cross_keyboard(service.config()),
+                reply_markup=self._build_btc_ma_cross_keyboard(service.config(), state=self._btc_ma_cross_state()),
             )
 
         self.tg_app.add_handler(CommandHandler("btcmacross", owner_only(btc_ma_cross_cmd)))
