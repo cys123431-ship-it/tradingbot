@@ -1,4 +1,4 @@
-"""Telegram controls (/btcmacross) and scheduler for the BTC SMA3/SMA200 cross strategy."""
+﻿"""Telegram controls (/btcmacross) and scheduler for the BTC SMA3/SMA200 cross strategy."""
 
 from __future__ import annotations
 
@@ -13,10 +13,17 @@ from btc_ema_pullback.config import NETWORK_MAINNET, NETWORK_TESTNET, TRADING_MO
 from btc_ma_cross import BtcMaCrossService
 from btc_ma_cross.config import (
     CONFIG_KEY,
+    DEFAULT_LEVERAGE,
     EMERGENCY_STOP_CHOICES,
+    LEVERAGE_CHOICES,
     REENTRY_WAIT_CHOICES,
     SLOW_PERIOD_CHOICES,
     TIMEFRAMES,
+    TRADFI_SCOPE,
+)
+from btc_ma_cross.service import (
+    TRADFI_MAINNET_ONLY_REASON,
+    TRADFI_SESSION_CLOSED_REASON,
 )
 from .controller_btc_pullback import NETWORK_LABELS, _answer_quietly, _kst, _n
 from .strategy_registry import BINANCE_MAINNET, BINANCE_TESTNET
@@ -36,11 +43,32 @@ def _rotation_text(cfg):
 
 
 def _scope_text(cfg):
+    if cfg.get("scan_scope") == TRADFI_SCOPE:
+        return f"🏦 TradFi만 — 바이낸스 메인넷 미국주식 + 금 (선물 상장 종목, 24h 거래대금 상위 {cfg.get('alt_universe_size', 50)}, 미국 정규장 시간에만 신규 진입)"
     if cfg.get("scan_scope") == "alts":
         return f"알트 전용 24h 거래대금 상위 {cfg.get('alt_universe_size', 50)}개 (BTC 제외, 동시 신호 시 거래대금 1위)"
     if cfg.get("scan_scope") == "single":
         return f"지정 코인 {cfg.get('single_symbol') or 'BTCUSDT'}만"
     return "BTC만"
+
+
+TRADFI_KO = {
+    "weekend": "주말 휴장",
+    "holiday": "미국 휴장일",
+    "outside_regular_session": "정규장 시간 아님",
+    "regular_session_open": "정규장 진행 중",
+}
+
+
+def _us_session_text(session):
+    """One-line US regular-session status for the Telegram status screen."""
+    if not session:
+        return "확인 불가"
+    reason = str(session.get("reason") or "")
+    label = TRADFI_KO.get(reason, reason or "-")
+    if session.get("open"):
+        return f"✅ {label} ({session.get('regular_close', '')[:19]})"
+    return f"⏸ {label} (다음 정규장 {session.get('regular_open', '')[:19]})"
 
 
 PICK_LIST_SIZE = 12
@@ -162,7 +190,7 @@ class ControllerBtcMaCrossMixin:
                 InlineKeyboardButton(mark(cfg.get("trading_mode") == TRADING_MODE_LIVE, "💥 LIVE"), callback_data="bm:mode:live"),
             ],
             [
-                InlineKeyboardButton(mark(cfg.get("scan_scope") not in ("alts", "single"), "🪙 BTC만"), callback_data="bm:scope:btc"),
+                InlineKeyboardButton(mark(cfg.get("scan_scope") not in ("alts", "single", TRADFI_SCOPE), "🪙 BTC만"), callback_data="bm:scope:btc"),
                 InlineKeyboardButton(mark(cfg.get("scan_scope") == "alts", f"🌐 알트 상위{cfg.get('alt_universe_size', 50)}"),
                                      callback_data="bm:scope:alts"),
                 InlineKeyboardButton(
@@ -170,6 +198,10 @@ class ControllerBtcMaCrossMixin:
                     else "🎯 코인 지정",
                     callback_data="bm:pick",
                 ),
+            ],
+            [
+                InlineKeyboardButton(mark(cfg.get("scan_scope") == TRADFI_SCOPE, "🏦 TradFi만 (메인넷)"),
+                                     callback_data="bm:scope:tradfi"),
             ],
             [
                 InlineKeyboardButton(mark(cfg.get("entry_mode") != "trend", "⚡ 돌파 시 진입"), callback_data="bm:entry:cross"),
@@ -207,9 +239,13 @@ class ControllerBtcMaCrossMixin:
                 for tf in TIMEFRAMES[4:]
             ],
             [
-                InlineKeyboardButton(
-                    mark(int(cfg.get("emergency_stop_roi_percent") or 0) == choice,
-                         "비상손절 OFF" if choice == 0 else f"-{choice}%"),
+                InlineKeyboardButton(mark(int(cfg.get("leverage") or DEFAULT_LEVERAGE) == lev, f"{lev}x"),
+                                     callback_data=f"bm:lev:{lev}")
+                for lev in LEVERAGE_CHOICES
+            ],
+            [
+                InlineKeyboardButton(mark(int(cfg.get("emergency_stop_roi_percent") or 0) == choice,
+                                         "비상손절 OFF" if choice == 0 else f"-{choice}%"),
                     callback_data=f"bm:es:{choice}",
                 )
                 for choice in EMERGENCY_STOP_CHOICES
@@ -301,10 +337,16 @@ class ControllerBtcMaCrossMixin:
             f"익절 자동 전환: {_profit_lock_switch_text(cfg, state)}",
             f"청산 후 다른 코인 전환: {_rotation_text(cfg)}",
             f"봉: {TIMEFRAME_LABELS[cfg['timeframe']]} (마감봉 기준) · SMA {cfg['fast_period']}/{cfg['slow_period']}",
-            f"레버리지 {cfg['leverage']}x ISOLATED 고정 · 증거금: 가용 잔고의 {_n(cfg['margin_fraction']) * 100:.0f}%",
+            f"레버리지 {cfg['leverage']}x ISOLATED (2~5x 선택, 다음 진입부터) · 증거금: 가용 잔고의 {_n(cfg['margin_fraction']) * 100:.0f}%",
             f"비상손절: {'OFF' if stop == 0 else f'증거금 -{stop}% (Mark 기준)'}",
             f"수익 확보 손절(증거금 기준, Last 기준 트리거): {self._btc_ma_cross_lock_table(cfg)}",
         ]
+        if cfg.get("scan_scope") == TRADFI_SCOPE:
+            _tradfi_state = service.tradifi_scope_state(network)
+            lines.append(
+                f"🏦 TradFi 신규 진입: {'가능' if _tradfi_state.get('allowed') else '차단 — ' + str(_tradfi_state.get('detail'))}"
+            )
+            lines.append(f"미국 정규장: {_us_session_text(service.us_session_status())}")
         if mode == TRADING_MODE_DRY_RUN and not status["has_credentials"]:
             lines.append(f"가상 잔고: {cfg['dry_run_balance_usdt']} USDT + 가상 손익 (API 키 없음)")
         if trade:
@@ -388,7 +430,8 @@ class ControllerBtcMaCrossMixin:
             f"• 수익 확보(증거금 기준): {self._btc_ma_cross_lock_table(cfg)} (항상 도달 칸 {cfg['lock_gap_percent']}% 아래, 한 번 올라간 손절은 내려가지 않음)\n"
             "• 수익 확보 손절로 청산되면 다음 크로스까지 대기\n"
             f"• 비상손절: {'OFF' if stop == 0 else f'증거금 -{stop}%'} (메뉴에서 선택, 거래소에 Mark 기준으로 걸림)\n"
-            f"• 레버리지 {cfg['leverage']}배 고정, 가용 증거금의 {_n(cfg['margin_fraction']) * 100:.0f}% 사용, 계좌 전체 1포지션\n"
+            f"• 레버리지 {cfg['leverage']}배 ISOLATED 선택(2~5배, 다음 진입부터), 가용 증거금의 {_n(cfg['margin_fraction']) * 100:.0f}% 사용, 계좌 전체 1포지션\n"
+            "• 🏦 TradFi만: 바이낸스 메인넷 전용 · 미국주식 TradFi + 금만 · 미국 정규장 시간에만 신규 진입\n"
             "• 거래소는 /setup 선택을 따르고, 켜면 다른 선물 자동전략은 멈춤\n"
             "• 수익을 보장하지 않는 전략입니다."
         )
@@ -402,6 +445,18 @@ class ControllerBtcMaCrossMixin:
 
     async def _set_btc_ma_cross_value(self, key, value):
         await self.cfg.update_value([CONFIG_KEY, key], value)
+
+    def _tradfi_scope_refusal(self, service, network):
+        """Message when TradFi cannot be used on the current exchange, else ''."""
+        if service.tradfi_network_allowed(network):
+            return ""
+        network_label = NETWORK_LABELS.get(network, network)
+        return (
+            "🚫 TradFi 전용은 바이낸스 메인넷에서만 사용할 수 있습니다.\n"
+            f"지금 거래소: {network_label} (/setup 선택을 따름)\n"
+            "테스트넷(데모)에는 미국주식 TradFi 계약이 거의 없어 모드를 켜지 않습니다.\n"
+            "/setup에서 바이낸스 메인넷으로 바꾼 뒤 다시 선택하세요."
+        )
 
     def _btc_ma_cross_state(self):
         """Current strategy state for the keyboard (empty when Upbit is selected)."""
@@ -487,10 +542,38 @@ class ControllerBtcMaCrossMixin:
             return message + "\n\n" + await self._format_btc_ma_cross_status(), keyboard()
         if action.startswith("scope:"):
             scope = action.split(":", 1)[1]
+            if scope == TRADFI_SCOPE:
+                refusal = self._tradfi_scope_refusal(service, network)
+                if refusal:
+                    return refusal, keyboard()
+                await self._set_btc_ma_cross_value("scan_scope", TRADFI_SCOPE)
+                note = "\n(보유 중인 포지션은 그대로 관리, 다음 진입부터 적용)" if holding else ""
+                session = service.us_session_status()
+                return (
+                    f"🏦 TradFi만 선택: {_scope_text(service.config())}\n"
+                    f"• 미국 정규장에서만 신규 진입합니다. 지금: {_us_session_text(session)}\n"
+                    f"• 장 마감·주말·휴장에는 새 진입을 하지 않고, 보유 포지션의 비상손절·수익 확보·"
+                    f"반대 크로스 청산은 계속 동작합니다.{note}\n\n"
+                    + await self._format_btc_ma_cross_status()
+                ), keyboard()
             if scope in ("btc", "alts"):
                 await self._set_btc_ma_cross_value("scan_scope", scope)
             note = "\n(보유 중인 포지션은 그대로 관리, 다음 진입부터 적용)" if holding else ""
             return f"🔎 종목: {_scope_text(service.config())}{note}\n\n" + await self._format_btc_ma_cross_status(), keyboard()
+        if action.startswith("lev:"):
+            try:
+                choice = int(action.split(":", 1)[1])
+            except ValueError:
+                choice = -1
+            if choice in LEVERAGE_CHOICES:
+                await self._set_btc_ma_cross_value("leverage", choice)
+            note = "\n(보유 중인 포지션은 기존 레버리지 유지, 다음 진입부터 적용)"
+            return (
+                f"⚙️ 레버리지: {service.config()['leverage']}x ISOLATED{note}\n"
+                f"증거금 비율은 가용 잔고의 {_n(service.config()['margin_fraction']) * 100:.0f}% 그대로이고, "
+                f"수익 확보·비상손절은 증거금 기준 %로 계산되므로 레버리지를 바꾸면 같은 %의 가격거리가 좁아집니다.\n\n"
+                + await self._format_btc_ma_cross_status()
+            ), keyboard()
         if action.startswith("entry:"):
             entry_mode = action.split(":", 1)[1]
             if entry_mode in ("cross", "trend"):

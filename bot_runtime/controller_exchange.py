@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+
 from utbreakout.coinselector import market_is_blocked_tradifi_commodity
 
 from .desktop_monitor import write_desktop_monitor_snapshot
+from .strategy_registry import BINANCE_MAINNET, BINANCE_TESTNET
+
+logger = logging.getLogger(__name__)
 
 
 class ControllerExchangeMixin:
@@ -566,12 +571,50 @@ class ControllerExchangeMixin:
                 scope or 'unset',
                 repaired_scope or 'unset',
             )
+        ma_cross_repair = await self._repair_btc_ma_cross_tradfi_scope(mode, persist=persist)
         return {
             'mode': mode,
             'changed': changed,
             'previous_scope': scope,
             'scan_scope': repaired_scope,
+            'btc_ma_cross': ma_cross_repair,
         }
+
+    async def _repair_btc_ma_cross_tradfi_scope(self, exchange_mode=None, *, persist=True):
+        """3/200 SMA: TradFi scope is Binance mainnet only -> switch to alts elsewhere.
+
+        Returning to mainnet does not restore it: the user picks the scope again
+        with the Telegram buttons (btc / alts / tradifi / single).
+        """
+        mode = exchange_mode or self.get_exchange_mode()
+        result = {'changed': False, 'previous_scope': None, 'scan_scope': None}
+        # Normalize so "mainnet", "binance_mainnet" and the emas aliases all match.
+        normalized = str(mode or '').strip().lower()
+        is_mainnet = normalized in {BINANCE_MAINNET, 'mainnet', 'binance_mainnet'}
+        ma_cfg = self.cfg.get('btc_ma_cross', {})
+        if not isinstance(ma_cfg, dict):
+            return result
+        scope = str(ma_cfg.get('scan_scope') or '').strip().lower()
+        result['previous_scope'] = scope
+        if is_mainnet or scope != 'tradfi':
+            result['scan_scope'] = scope
+            return result
+        result.update(changed=True, scan_scope='alts')
+        if persist:
+            await self._update_config_value(['btc_ma_cross', 'scan_scope'], 'alts')
+        logger.warning('3/200 SMA TradFi scope repaired for %s: tradfi -> alts', mode)
+        send_alert = getattr(self, 'notify_plain', None)
+        if persist and callable(send_alert):
+            try:
+                await send_alert(
+                    "🔁 3/200 SMA: TradFi 전용은 바이낸스 메인넷 전용이라 "
+                    f"{mode}에서는 '🌐 알트 전용'으로 변경했습니다.\n"
+                    "텔레그램 /btcmacross 버튼에서 BTC만 / 알트 전용 / 코인 지정으로 다시 선택할 수 있습니다.",
+                    event_type="CONFIG_REPAIRED",
+                )
+            except Exception as exc:  # pragma: no cover - notification only
+                logger.warning('3/200 SMA scope repair notice failed: %s', exc)
+        return result
 
     async def _sanitize_coin_selector_universe_for_exchange_mode(self, exchange_mode=None, markets=None, *, persist=True):
         mode = exchange_mode or self.get_exchange_mode()

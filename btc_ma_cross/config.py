@@ -27,7 +27,10 @@ CONFIG_KEY = "btc_ma_cross"
 
 TIMEFRAMES = ("3m", "5m", "15m", "30m", "1h", "2h", "4h")
 SLOW_PERIOD_CHOICES = (200, 120)        # SMA3 against SMA200 or SMA120 (Telegram)
-SCAN_SCOPES = ("btc", "alts", "single")  # BTC only / top-N 24h-volume USDT perpetuals / one chosen coin
+# btc / alts / single / tradfi.  tradfi = Binance mainnet US-equity TradFi
+# perpetuals plus gold, and only while the US regular session is open.
+SCAN_SCOPES = ("btc", "alts", "single", "tradfi")
+TRADFI_SCOPE = "tradfi"
 ENTRY_MODES = ("cross", "trend")       # fresh cross only / SMA3 already above-below SMA200
 # Margin-ROI loss that triggers the emergency stop; 0 = OFF.
 EMERGENCY_STOP_CHOICES = (0, 10, 20, 30, 50)
@@ -37,6 +40,9 @@ REENTRY_WAIT_CHOICES = (1, 3, 6, 0)
 # Profit-lock (익절) exits before the entry mode switches to a fresh cross.
 # 0 = OFF.
 PROFIT_LOCK_SWITCH_CHOICES = (0, 1, 2, 3, 4, 5)
+# Leverage is a Telegram choice (2x..5x); 5 is the default.
+LEVERAGE_CHOICES = (2, 3, 4, 5)
+DEFAULT_LEVERAGE = 5
 
 
 def default_btc_ma_cross_config() -> dict:
@@ -74,7 +80,7 @@ def default_btc_ma_cross_config() -> dict:
         "fast_period": 3,
         "slow_period": 200,
         "candle_history": 260,
-        "leverage": 5,
+        "leverage": DEFAULT_LEVERAGE,
         "margin_type": "ISOLATED",
         "position_mode": "ONE_WAY",
         # Share of the available futures balance used as margin per entry.
@@ -153,7 +159,12 @@ def normalize_btc_ma_cross_config(raw=None) -> dict:
         slow = 200
     cfg["slow_period"] = slow if slow in SLOW_PERIOD_CHOICES else 200
     cfg["candle_history"] = _int(cfg.get("candle_history"), 260, 210, 1000)
-    cfg["leverage"] = 5  # fixed by the strategy definition
+    try:
+        leverage = int(float(cfg.get("leverage")))
+    except (TypeError, ValueError):
+        leverage = DEFAULT_LEVERAGE
+    # 2x..5x only; anything else falls back to the 5x default.
+    cfg["leverage"] = leverage if leverage in LEVERAGE_CHOICES else DEFAULT_LEVERAGE
     cfg["margin_type"] = "ISOLATED"
     cfg["position_mode"] = "ONE_WAY"
     cfg["margin_fraction"] = _decimal_text(cfg.get("margin_fraction"), "0.5", 0.05, 0.95)
@@ -191,8 +202,10 @@ def normalize_btc_ma_cross_config(raw=None) -> dict:
 __all__ = (
     "CLIENT_ID_STRATEGY",
     "CONFIG_KEY",
+    "DEFAULT_LEVERAGE",
     "EMERGENCY_STOP_CHOICES",
     "ENTRY_MODES",
+    "LEVERAGE_CHOICES",
     "PROFIT_LOCK_SWITCH_CHOICES",
     "REENTRY_WAIT_CHOICES",
     "SCAN_SCOPES",
@@ -200,6 +213,7 @@ __all__ = (
     "STRATEGY_NAME",
     "STRATEGY_VERSION",
     "TIMEFRAMES",
+    "TRADFI_SCOPE",
     "default_btc_ma_cross_config",
     "normalize_btc_ma_cross_config",
 )

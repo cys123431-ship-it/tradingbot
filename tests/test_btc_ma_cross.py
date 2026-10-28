@@ -48,7 +48,12 @@ def test_timeframe_choices():
     rows = bars(86_000.0, span=4 * H1)
     assert evaluate_cross(rows, cfg, now_after(rows, span=4 * H1))["side"] == "LONG"
     assert normalize_btc_ma_cross_config({"timeframe": "3h"})["timeframe"] == "1h"
+    # Leverage is a Telegram choice (2x..5x); out-of-range values fall back to 5x.
+    assert normalize_btc_ma_cross_config({"leverage": 3})["leverage"] == 3
+    assert normalize_btc_ma_cross_config({"leverage": 2})["leverage"] == 2
     assert normalize_btc_ma_cross_config({"leverage": 20})["leverage"] == 5
+    assert normalize_btc_ma_cross_config({"leverage": 1})["leverage"] == 5
+    assert normalize_btc_ma_cross_config({})["leverage"] == 5
 
 
 @pytest.mark.parametrize("roi,locked", [(4.9, None), (5, 4), (9.99, 4), (10, 9), (14.9, 9), (15, 14), (20, 19), (27, 24)])

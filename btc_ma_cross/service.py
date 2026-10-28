@@ -1,4 +1,4 @@
-"""SMA3/SMA200 cross: stop-and-reverse with a margin-ROI profit lock.
+﻿"""SMA3/SMA200 cross: stop-and-reverse with a margin-ROI profit lock.
 
 Inherits order execution, reconciliation, fail-safe, accounting and DRY_RUN
 plumbing from the BTC pullback service; only the signal, sizing and the
@@ -38,10 +38,39 @@ from btc_ema_pullback.service import (
     _symbol_pair,
 )
 from trading_safety.order_state import OrderState
-from utbreakout.coinselector import market_is_tradifi_perpetual
+from trading_safety.market_session import us_equity_regular_session_status
+from utbreakout.coinselector import market_is_tradifi_perpetual, market_tradifi_underlying_type
 
-from .config import CLIENT_ID_STRATEGY, STRATEGY_VERSION, normalize_btc_ma_cross_config
+from .config import (
+    CLIENT_ID_STRATEGY,
+    STRATEGY_VERSION,
+    TRADFI_SCOPE,
+    normalize_btc_ma_cross_config,
+)
 from .signals import emergency_stop_price, evaluate_cross, profit_lock_target
+
+# TradFi scope: Binance USDⓈ-M US-equity contracts plus gold only.  Silver,
+# oil, gas and the other physical commodities stay excluded.
+TRADFI_GOLD_BASES = frozenset({
+    "XAU", "GOLD", "GC", "GLD", "IAU", "XAUT", "PAXG", "GOLDTRACKER",
+})
+TRADFI_GOLD_MARKERS = frozenset({
+    "GOLD", "GOLDSPOT", "GOLDTRACKER", "PRECIOUSMETALGOLD",
+})
+# Anything explicitly identified as another metal/energy contract is never gold.
+TRADFI_NON_GOLD_MARKERS = frozenset({
+    "SILVER", "XAG", "PLATINUM", "XPT", "PALLADIUM", "XPD", "COPPER", "HG",
+    "OIL", "WTI", "BRENT", "CRUDE", "NATGAS", "NATURALGAS", "ENERGY",
+    "ALUMINUM", "ALUMINIUM", "NICKEL", "ZINC", "LEAD", "TIN", "IRON",
+    "LITHIUM", "COBALT", "URANIUM", "SILVERSPOT",
+})
+TRADFI_EQUITY_MARKERS = frozenset({
+    "STOCK", "STOCKS", "EQUITY", "EQUITIES", "INDEX", "INDICES", "ETF", "SHARE", "SHARES",
+})
+# The bot's own mainnet label (btc_ema_pullback uses "mainnet"/"testnet").
+MAINNET_NETWORK = "mainnet"
+TRADFI_MAINNET_ONLY_REASON = "TRADFI_MAINNET_ONLY"
+TRADFI_SESSION_CLOSED_REASON = "TRADFI_US_SESSION_CLOSED"
 
 PROFIT_LOCK_EXIT_REASON = "PROFIT_LOCK"
 FORCED_ENTRY_MODE = "cross"
@@ -53,6 +82,88 @@ def _int_or_zero(value):
         return int(float(value))
     except (TypeError, ValueError):
         return 0
+
+
+def _market_base_tokens(symbol, market):
+    """Uppercase alphanumeric base candidates of a market (XAUUSDT -> XAU)."""
+    market = market if isinstance(market, dict) else {}
+    info = market.get("info") if isinstance(market.get("info"), dict) else {}
+    raw = {
+        str(market.get("base") or ""),
+        str(info.get("baseAsset") or ""),
+        str(info.get("underlying") or ""),
+        str(symbol or "").split(":", 1)[0].split("/")[0],
+    }
+    return {
+        "".join(ch for ch in value.upper() if ch.isalnum())
+        for value in raw
+        if value.strip()
+    }
+
+
+def market_is_tradfi_gold(symbol, market):
+    """True for TradFi gold contracts (XAU/GOLD/GC/GLD/...), never silver or oil."""
+    if not market_is_tradifi_perpetual(symbol, market):
+        return False
+    info = (market or {}).get("info") if isinstance((market or {}).get("info"), dict) else {}
+    base_tokens = _market_base_tokens(symbol, market)
+    gold_bases = base_tokens & TRADFI_GOLD_BASES
+    # Explicitly-classified non-gold commodities are rejected first: silver,
+    # oil, gas and industrial metals must never pass as gold.
+    if base_tokens & TRADFI_NON_GOLD_MARKERS:
+        return False
+    if gold_bases:
+        return True
+    metadata = set()
+    for source in (market or {}, info):
+        if not isinstance(source, dict):
+            continue
+        for key in ("underlyingType", "underlyingSubType", "assetType", "category",
+                    "sector", "subType", "productType", "name", "displayName"):
+            value = source.get(key)
+            token = "".join(ch for ch in str(value or "").upper() if ch.isalnum())
+            if not token:
+                continue
+            metadata.add(token)
+            if any(marker in token for marker in TRADFI_NON_GOLD_MARKERS):
+                return False
+    if metadata & TRADFI_GOLD_MARKERS or any("GOLD" in token for token in metadata):
+        return True
+    return bool(base_tokens & TRADFI_GOLD_BASES)
+
+
+def market_is_tradfi_us_equity(symbol, market):
+    """True for a TradFi US-equity contract (not a commodity).
+
+    Binance identifies these with an equity/stock/index marker.  Everything
+    that is neither gold nor a positively-identified equity stays out, so
+    silver, oil, gas and industrial metals can never leak into the scope.
+    """
+    if not market_is_tradifi_perpetual(symbol, market):
+        return False
+    if market_is_tradfi_gold(symbol, market):
+        return False
+    info = (market or {}).get("info") if isinstance((market or {}).get("info"), dict) else {}
+    metadata = set()
+    for source in (market or {}, info):
+        if not isinstance(source, dict):
+            continue
+        for key in ("underlyingType", "underlyingSubType", "assetType", "category",
+                    "sector", "subType", "productType"):
+            value = source.get(key)
+            token = "".join(ch for ch in str(value or "").upper() if ch.isalnum())
+            if token:
+                metadata.add(token)
+    if metadata & TRADFI_EQUITY_MARKERS:
+        return True
+    # No equity marker: accept only when it is also not a known commodity.
+    base_tokens = _market_base_tokens(symbol, market)
+    return not (base_tokens & TRADFI_NON_GOLD_MARKERS)
+
+
+def market_in_tradfi_scope(symbol, market):
+    """TradFi scope membership: US equity or gold only."""
+    return market_is_tradfi_us_equity(symbol, market) or market_is_tradfi_gold(symbol, market)
 
 # Skip reasons that can clear up within minutes; a reverse entry blocked by
 # one of them is retried instead of being dropped until the next cross.
@@ -108,6 +219,8 @@ class BtcMaCrossService(BtcEmaPullbackService):
     # ------------------------------------------------------------ universe
     async def scan_universe(self, network, cfg):
         """[(ccxt_symbol, market_id, quote_volume)] in descending 24h volume."""
+        if cfg["scan_scope"] == TRADFI_SCOPE:
+            return await self._tradfi_universe(network, cfg)
         if cfg["scan_scope"] == "single":
             ccxt_symbol, market_id = await self.resolve_coin(network, cfg["single_symbol"])
             return [(ccxt_symbol, market_id, None)]
@@ -120,12 +233,22 @@ class BtcMaCrossService(BtcEmaPullbackService):
 
         Tries the 1000x contract too (PEPE -> 1000PEPEUSDT).  Raises ValueError
         with a short reason when the coin cannot be traded on this exchange.
+        TradFi contracts are rejected; use ``resolve_tradfi_coin`` for them.
         """
+        return await self._resolve_market(network, text, requirement="crypto")
+
+    async def resolve_tradfi_coin(self, network, text):
+        """(ccxt_symbol, market_id) of a TradFi US-equity or gold contract."""
+        return await self._resolve_market(network, text, requirement="tradfi")
+
+    async def _resolve_market(self, network, text, *, requirement="crypto"):
         raw = str(text or "").upper().replace(":USDT", "").replace("PERP", "")
         raw = "".join(ch for ch in raw if ch.isalnum())
         base = raw[:-4] if raw.endswith("USDT") and len(raw) > 4 else raw
         if not base:
             raise ValueError("SYMBOL_EMPTY")
+        if requirement == "tradfi" and not self.tradfi_network_allowed(network):
+            raise ValueError(TRADFI_MAINNET_ONLY_REASON)
         exchange = await self.exchange(network)
         markets = getattr(exchange, "markets", None) or await self._call(exchange.load_markets)
         by_id = {}
@@ -141,6 +264,10 @@ class BtcMaCrossService(BtcEmaPullbackService):
             status = str((market.get("info") or {}).get("status") or "TRADING").upper()
             if market.get("active") is False or status != "TRADING":
                 raise ValueError(f"NOT_TRADING:{market_id}")
+            if requirement == "tradfi":
+                if not market_in_tradfi_scope(symbol, market):
+                    raise ValueError(f"NOT_TRADFI:{market_id}")
+                return symbol, market_id
             if str(market.get("base") or "").upper() in STABLE_BASES:
                 raise ValueError(f"STABLECOIN:{market_id}")
             if market_is_tradifi_perpetual(symbol, market):
@@ -204,6 +331,91 @@ class BtcMaCrossService(BtcEmaPullbackService):
             await self._call(exchange.load_markets)
             self._mainnet_ranking = exchange
         return self._mainnet_ranking
+
+    # --------------------------------------------------------- tradfi scope
+    @staticmethod
+    def tradfi_network_allowed(network):
+        """TradFi markets exist on the Binance mainnet only."""
+        return str(network or "").lower() == MAINNET_NETWORK
+
+    def tradifi_scope_state(self, network):
+        """Why the TradFi scope is active/blocked right now (Telegram + guard)."""
+        if not self.tradfi_network_allowed(network):
+            return {"allowed": False, "reason": TRADFI_MAINNET_ONLY_REASON,
+                    "detail": "TradFi는 바이낸스 메인넷에서만 지원됩니다."}
+        session = self.us_session_status()
+        if not session.get("open"):
+            return {"allowed": False, "reason": TRADFI_SESSION_CLOSED_REASON,
+                    "detail": f"미국 정규장 마감 ({session.get('reason')})", "session": session}
+        return {"allowed": True, "reason": "", "detail": "", "session": session}
+
+    def us_session_status(self):
+        """US regular-session snapshot (America/New_York, holidays + early close)."""
+        try:
+            return dict(us_equity_regular_session_status(self._now_utc()))
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("3/200 SMA US session lookup failed: %s", exc)
+            return {"open": False, "reason": f"session_unavailable: {type(exc).__name__}"}
+
+    def _now_utc(self):
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(self._clock(), timezone.utc)
+
+    def tradfi_entry_block(self, network, cfg):
+        """Reason new TradFi entries are blocked now ('' when they are allowed).
+
+        TradFi is Binance-mainnet only and only opens during the US regular
+        session.  Held positions are always managed regardless of this result.
+        """
+        if cfg.get("scan_scope") != TRADFI_SCOPE:
+            return ""
+        state = self.tradifi_scope_state(network)
+        return "" if state.get("allowed") else str(state.get("reason") or TRADFI_MAINNET_ONLY_REASON)
+
+    def _tradfi_gates(self, state, network):
+        """Extra status fields for a blocked/waiting TradFi cycle."""
+        session = self.us_session_status() if self.tradfi_network_allowed(network) else {}
+        scope_state = self.tradifi_scope_state(network)
+        return {"tradfi_gate": scope_state.get("reason") or "",
+                "tradfi_gate_detail": scope_state.get("detail") or "",
+                "us_session": session,
+                "scan_scope": TRADFI_SCOPE}
+
+    async def _tradfi_universe(self, network, cfg):
+        """TradFi perpetuals on mainnet: US equities plus gold, by 24h volume."""
+        if not self.tradfi_network_allowed(network):
+            raise ValueError(TRADFI_MAINNET_ONLY_REASON)
+        cache_key = f"tradfi:{network}"
+        cached = self._universe_cache.get(cache_key)
+        if cached and self.now_ms() - cached[0] < 600_000:
+            return cached[1]
+        exchange = await self.exchange(network)
+        markets = getattr(exchange, "markets", None) or await self._call(exchange.load_markets)
+        tickers = await self._call(exchange.fetch_tickers)
+        rows = []
+        for symbol, market in (markets or {}).items():
+            if not isinstance(market, dict) or not isinstance(tickers, dict):
+                continue
+            if not market_in_tradfi_scope(symbol, market):
+                continue
+            if market.get("active") is False:
+                continue
+            status = str((market.get("info") or {}).get("status") or "TRADING").upper()
+            if status != "TRADING":
+                continue
+            ticker = (tickers or {}).get(symbol) or {}
+            info = ticker.get("info") if isinstance(ticker.get("info"), dict) else {}
+            volume = _f(ticker.get("quoteVolume") if ticker.get("quoteVolume") is not None
+                        else info.get("quoteVolume"))
+            market_id = str(market.get("id") or "").upper() or symbol.split(":")[0].replace("/", "")
+            rows.append((symbol, market_id, volume))
+        rows.sort(key=lambda row: (-row[2], row[1]))
+        universe = rows[: int(cfg["alt_universe_size"])]
+        if not universe:
+            raise ValueError("empty tradfi universe")
+        self._universe_cache[cache_key] = (self.now_ms(), universe, len(universe))
+        return universe
+
 
     # ------------------------------------------------------------- signal
     async def cross_signal(self, network, cfg, ccxt_symbol=CCXT_SYMBOL, market_id=MARKET_ID):
@@ -366,6 +578,13 @@ class BtcMaCrossService(BtcEmaPullbackService):
         # A profit-lock exit was recorded: switch to 돌파 진입 BEFORE anything
         # else in this cycle can open a position (rotation / reverse / scan).
         cfg = await self.run_pending_entry_mode_switch(network, mode, cfg, state)
+        guard_reason = self.tradfi_entry_block(network, cfg)
+        if guard_reason:
+            # TradFi is mainnet-only and trades during the US regular session;
+            # outside it new entries stop, held positions keep being managed.
+            action = "waiting" if guard_reason == TRADFI_SESSION_CLOSED_REASON else "blocked"
+            return {"action": action, "reason": guard_reason,
+                    **self._tradfi_gates(state, network)}
         pending = state.get("pending_reverse_entry")
         if pending:
             return await self._retry_reverse_entry(network, cfg, mode, state, pending)
@@ -432,6 +651,13 @@ class BtcMaCrossService(BtcEmaPullbackService):
 
     async def _rotation_universe(self, network, cfg):
         """Coins eligible for the post-exit switch (BTC first in BTC-only scope)."""
+        if cfg["scan_scope"] == TRADFI_SCOPE:
+            # TradFi rotation stays inside the TradFi scope (US equities + gold).
+            try:
+                return list(await self._tradfi_universe(network, cfg))
+            except Exception as exc:
+                logger.warning("3/200 SMA tradfi rotation universe failed: %s", exc)
+                return []
         alts = list(await self._volume_universe(network, cfg))
         if cfg["scan_scope"] == "alts":
             return alts
