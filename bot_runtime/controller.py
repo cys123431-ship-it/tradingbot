@@ -11,6 +11,7 @@ from .controller_custom_entry import ControllerCustomEntryMixin
 from .controller_ema200_utbot_rsi import ControllerEMA200UTBotRSIMixin
 from .controller_emergency import ControllerEmergencyMixin
 from .controller_exchange import ControllerExchangeMixin
+from .controller_ma_cross import ControllerMaCrossMixin
 from .controller_options import ControllerOptionsMixin
 from .controller_reporting import ControllerReportingMixin
 from .controller_telegram import ControllerTelegramMixin
@@ -28,6 +29,7 @@ class MainController(
     ControllerOptionsMixin,
     ControllerBtcPullbackMixin,
     ControllerBtcMaCrossMixin,
+    ControllerMaCrossMixin,
     TelegramSetupMixin,
     ControllerReportingMixin,
     ControllerEmergencyMixin,

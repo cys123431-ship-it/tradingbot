@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from options_trading.config import default_options_config, normalize_options_config
 from btc_ema_pullback.config import default_btc_pullback_config, normalize_btc_pullback_config
 from btc_ma_cross.config import default_btc_ma_cross_config, normalize_btc_ma_cross_config
+from btc_ma_cross_plus.config import default_ma_cross_config, normalize_ma_cross_config
 
 from .ema200_utbot_rsi import (
     EMA200_UTBOT_RSI_CONFIG_KEY,
@@ -88,6 +89,7 @@ class TradingConfig:
             'options_trading': default_options_config(),
             'btc_ema_pullback': default_btc_pullback_config(),
             'btc_ma_cross': default_btc_ma_cross_config(),
+            'ma_cross': default_ma_cross_config(),
             'shannon_engine': {
                 'leverage': 5,
                 'daily_loss_limit': 5000,
@@ -1158,6 +1160,7 @@ class TradingConfig:
             "options_trading": default_options_config(),
             "btc_ema_pullback": default_btc_pullback_config(),
             "btc_ma_cross": default_btc_ma_cross_config(),
+            "ma_cross": default_ma_cross_config(),
             "exchange_watchlists": {
                 BINANCE_TESTNET: list(EXCHANGE_MODE_DEFAULT_WATCHLISTS[BINANCE_TESTNET]),
                 BINANCE_MAINNET: list(EXCHANGE_MODE_DEFAULT_WATCHLISTS[BINANCE_MAINNET]),

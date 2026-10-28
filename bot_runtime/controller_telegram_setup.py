@@ -6059,6 +6059,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
 /btcpullback - BTC EMA 눌림목 전략 (1h 추세+15m 눌림, 기본 DRY_RUN·테스트넷)
 /btcmacross - SMA3/SMA200 크로스 전략 (BTC·알트 상위50·지정 코인·TradFi 전용(메인넷 미국주식+금), 3분~4시간봉, 레버리지 2~5배 선택, 돌파/방향유지 진입, 반대 크로스 시 반대 진입, 증거금 +5%부터 수익 확보, 수익 확보 익절 3회 후 다음 진입부터 돌파 시 진입 강제)
 /macoin SOL - 3/200 SMA 전략이 거래할 코인 1개 지정
+/macross - SMA3/SMA120 + 기능 A~E 선택 전략 (A 추세필터·B ATR초기손절·C 변동성사이징·D 샹들리에·E Donchian, 최소 1개 필수, 테스트넷에서 조합 시험용)
 /log - 최근 로그
 /close - 긴급 청산
 /stop - 긴급 정지: 선물 포지션 청산 + 옵션 OFF·봇 옵션 청산 + Prediction OFF
@@ -6117,6 +6118,7 @@ BTC 4h: `{diag.get('direction_btc_4h_symbol') or 'n/a'}` | BTC 1d: `{diag.get('d
         self._register_options_trading_handlers(owner_only)
         self._register_btc_pullback_handlers(owner_only)
         self._register_btc_ma_cross_handlers(owner_only)
+        self._register_ma_cross_handlers(owner_only)
 
         setup_command_handler = CommandHandler('setup', owner_only(self.setup_entry))
         setup_text_handler = MessageHandler(filters.Regex(setup_trigger_pattern), owner_only(self.setup_entry))

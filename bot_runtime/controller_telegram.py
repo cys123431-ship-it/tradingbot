@@ -2161,7 +2161,7 @@ class ControllerTelegramMixin:
             ],
             [KeyboardButton("/emastatus"), KeyboardButton("/emareset"), KeyboardButton("/dailyreport"), KeyboardButton("/weekend")],
             [KeyboardButton("/setup"), KeyboardButton("/customentry"), KeyboardButton("/options"), KeyboardButton("/btcoptions")],
-            [KeyboardButton("/btcpullback"), KeyboardButton("/btcmacross")],
+            [KeyboardButton("/btcpullback"), KeyboardButton("/btcmacross"), KeyboardButton("/macross")],
             [KeyboardButton("/status"), KeyboardButton("/stats"), KeyboardButton("/log")],
         ]
         return ReplyKeyboardMarkup(kb, resize_keyboard=True)

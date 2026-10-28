@@ -31,6 +31,7 @@ NETWORK_LABELS = {NETWORK_TESTNET: "테스트넷(데모)", NETWORK_MAINNET: "메
 STANDALONE_STRATEGIES = (
     (CONFIG_KEY, "BTC 눌림목", "/btcpullback"),
     ("btc_ma_cross", "3/200 SMA", "/btcmacross"),
+    ("ma_cross", "SMA3/SMA120 A~E", "/macross"),
 )
 
 
