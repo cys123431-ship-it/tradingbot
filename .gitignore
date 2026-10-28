@@ -9,3 +9,6 @@ desktop_monitor/target/
 config.json
 prediction_paper_ledger.json
 prediction_paper_ledger.json.tmp
+btc_1h.json
+btc_4h.json
+btc_*.json

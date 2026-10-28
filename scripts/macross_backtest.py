@@ -36,7 +36,8 @@ from btc_ma_cross_plus.backtest import (  # noqa: E402
 )
 from btc_ma_cross_plus.config import FEATURES, normalize_ma_cross_config  # noqa: E402
 
-BAR_MS = 4 * 3_600_000  # requirement: 4h candles, BTC only
+TF_MS = {"15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000}
+BAR_MS = TF_MS["4h"]  # default; --timeframe overrides it
 
 
 def load_csv(path):
@@ -59,22 +60,23 @@ def load_json_cache(path):
     return [[int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])] for r in raw]
 
 
-def fetch_klines(network, symbol, months):
+def fetch_klines(network, symbol, months, timeframe="4h"):
     """Public klines from Binance (works for the demo endpoint too)."""
     import ccxt
 
+    bar_ms = TF_MS[timeframe]
     exchange = ccxt.binanceusdm({"enableRateLimit": True})
     if network == "testnet":
         exchange.set_sandbox_mode(True)
-    count = int(months * 30 * 24 * 3_600_000 / BAR_MS) + 200
+    count = int(months * 30 * 24 * 3_600_000 / bar_ms) + 200
     rows = []
-    since = exchange.milliseconds() - count * BAR_MS
+    since = exchange.milliseconds() - count * bar_ms
     while len(rows) < count:
-        batch = exchange.fetch_ohlcv(symbol, "4h", since=since, limit=1000)
+        batch = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
         if not batch:
             break
         rows.extend([[int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])] for r in batch])
-        since = rows[-1][0] + BAR_MS
+        since = rows[-1][0] + bar_ms
         if len(batch) < 2:
             break
     return rows[-count:]
@@ -98,6 +100,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Local-only /macross A~E comparison backtest")
     parser.add_argument("--symbol", default="BTCUSDT")
     parser.add_argument("--network", default="mainnet", choices=("mainnet", "testnet"))
+    parser.add_argument("--timeframe", default="4h", choices=tuple(TF_MS), help="candle interval")
     parser.add_argument("--months", type=float, default=24.0)
     parser.add_argument("--equity", type=float, default=10_000.0)
     parser.add_argument("--leverage", type=int, default=5)
@@ -105,6 +108,8 @@ def main(argv=None):
     parser.add_argument("--slippage", type=float, default=0.0005)
     parser.add_argument("--funding", type=float, default=0.0001, help="funding rate per 8h")
     parser.add_argument("--modes", default="", help="subset such as A,AB,ABCDE")
+    parser.add_argument("--lock", default="on", choices=("on", "off"),
+                        help="profit lock (+5%%->+4%% ratchet); 'off' keeps only the exit you choose")
     parser.add_argument("--csv", default="", help="local OHLCV csv to read")
     parser.add_argument("--cache", default="", help="cached json from a previous run")
     parser.add_argument("--csv-out", default="", help="write the used klines to this json path")
@@ -112,6 +117,7 @@ def main(argv=None):
     parser.add_argument("--top", type=int, default=0, help="show only the top N rows")
     parser.add_argument("--dump-trades", default="", help="write the best mode's trades to this csv")
     args = parser.parse_args(argv)
+    bar_ms = TF_MS[args.timeframe]
 
     if args.csv:
         rows, source = load_csv(args.csv), f"csv:{args.csv}"
@@ -121,15 +127,18 @@ def main(argv=None):
         parser.error("--offline needs --csv or --cache (no exchange access allowed)")
         return 2
     else:
-        rows = fetch_klines(args.network, args.symbol, args.months)
-        source = f"binance:{args.network}:{args.symbol}"
+        rows = fetch_klines(args.network, args.symbol, args.months, args.timeframe)
+        source = f"binance:{args.network}:{args.symbol}:{args.timeframe}"
 
     if len(rows) < 300:
         parser.error(f"not enough candles: {len(rows)} (need 300+)")
         return 2
 
-    base = normalize_ma_cross_config({"timeframe": "4h", "scan_scope": "btc",
+    base = normalize_ma_cross_config({"timeframe": args.timeframe, "scan_scope": "btc",
                                       "leverage": args.leverage})
+    if args.lock == "off":
+        base["locking"] = False
+        base["_locking_pinned"] = True
     modes = [m.strip().upper() for m in args.modes.split(",") if m.strip()] or all_feature_modes()
     unknown = [m for m in modes if not m or any(ch not in FEATURES for ch in m)]
     if unknown:
@@ -137,7 +146,7 @@ def main(argv=None):
         return 2
 
     print(f"# /macross local backtest — source={source} candles={len(rows)} "
-          f"({len(rows) * 4 / 24:.0f}일, 4h, {args.symbol})")
+          f"({len(rows) * bar_ms / 86_400_000:.0f}일, {args.timeframe}, {args.symbol})")
     print(f"# fee={args.fee:.4%} slippage={args.slippage:.4%} funding={args.funding:.4%}/8h "
           f"leverage={args.leverage}x equity={args.equity:.0f}")
 
@@ -147,7 +156,7 @@ def main(argv=None):
         print(f"# klines saved: {args.csv_out}")
 
     kwargs = dict(initial_equity=args.equity, fee_rate=args.fee, slippage=args.slippage,
-                  funding_rate_per_8h=args.funding, bar_ms=BAR_MS)
+                  funding_rate_per_8h=args.funding, bar_ms=bar_ms)
     if modes == all_feature_modes():
         results = compare_modes(rows, base, **kwargs)
     else:

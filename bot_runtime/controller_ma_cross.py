@@ -25,8 +25,8 @@ from .controller_btc_pullback import NETWORK_LABELS, _answer_quietly, _kst, _n
 logger = logging.getLogger(__name__)
 TIMEFRAME_LABELS = {"15m": "15분", "30m": "30분", "1h": "1시간", "2h": "2시간", "4h": "4시간"}
 NO_FEATURE_TEXT = (
-    "🚫 기능(A~E)을 최소 1개 선택해야 합니다.\n"
-    "지금은 A~E가 모두 OFF라 이 전략은 신호를 만들지 않고 진입하지 않습니다."
+    "🚫 이 전략은 C(변동성 타겟 사이징)가 고정 선택이라 이 상태가 나오면 안 됩니다.\n"
+    "설정이 손상되었을 수 있으니 /macross 를 다시 열어 주세요."
 )
 
 
@@ -61,10 +61,10 @@ class ControllerMaCrossMixin:
         def mark(selected, label):
             return f"✅ {label}" if selected else label
 
+        # UI is C-only: the other feature blocks stay in the code for reference but
+        # are never selected from Telegram.
         feature_rows = [
-            [InlineKeyboardButton(mark(bool(cfg.get(FEATURE_FIELDS[name])), f"{name} · {FEATURE_LABELS[name]}"),
-                                  callback_data=f"mc:feat:{name}")]
-            for name in FEATURES
+            [InlineKeyboardButton(mark(True, f"C · {FEATURE_LABELS['C']} (고정)"), callback_data="mc:status")]
         ]
         mode = feature_mode(cfg)
         rows = [
@@ -78,7 +78,7 @@ class ControllerMaCrossMixin:
                 InlineKeyboardButton(mark(cfg.get("trading_mode") == TRADING_MODE_LIVE, "💥 LIVE"),
                                      callback_data="mc:mode:live"),
             ],
-            [InlineKeyboardButton(f"🧩 기능: {mode or '없음(동작 안 함)'} — 최소 1개 선택", callback_data="mc:status")],
+            [InlineKeyboardButton(f"🧩 기능: {mode or '없음'} · 청산: 반대 크로스만", callback_data="mc:status")],
             *feature_rows,
             [
                 InlineKeyboardButton(mark(cfg.get("timeframe") == tf, TIMEFRAME_LABELS[tf]),
@@ -117,9 +117,10 @@ class ControllerMaCrossMixin:
         mode = feature_mode(cfg)
         enabled = bool(cfg.get("enabled"))
         lines = [
-            "🧩 /macross — SMA3 / SMA120 + 기능 선택",
+            "🧩 /macross — SMA3 / SMA120 + 변동성 타겟 사이징 (C 전용)",
             f"전략: {'ON' if enabled else 'OFF'} · 모드: {cfg.get('trading_mode')} · 봉: {TIMEFRAME_LABELS[cfg['timeframe']]}",
             f"기능: {_feature_summary(cfg)}",
+            "청산: 반대 크로스 시 종료 · 수익잠금 +5%→+4% 계단 · 비상손절 OFF",
             f"레버리지: {cfg['leverage']}x ISOLATED · 증거금: 가용 잔고 {_n(cfg['margin_fraction']) * 100:.0f}%",
             f"종목: {'BTC만' if cfg['scan_scope'] == 'btc' else '알트 상위' + str(cfg['alt_universe_size'])}",
         ]
@@ -131,26 +132,25 @@ class ControllerMaCrossMixin:
 
     @staticmethod
     def _ma_cross_rules_text(cfg):
-        mode = feature_mode(cfg)
         lines = [
-            "📘 /macross 규칙",
-            f"· 신호: SMA{cfg['fast_period']} / SMA{cfg['slow_period']} 크로스 (마감봉)",
-            f"· 봉: {TIMEFRAME_LABELS[cfg['timeframe']]} · 레버리지 {cfg['leverage']}x",
-            f"· 선택된 기능: {mode or '없음 (동작 안 함)'}",
+            "📘 /macross 규칙 (C 전용)",
+            f"· 신호: SMA{cfg['fast_period']} / SMA{cfg['slow_period']} 크로스 (완료된 {TIMEFRAME_LABELS[cfg['timeframe']]}봉)",
+            "· 상향 돌파 → LONG · 하향 돌파 → SHORT",
             "",
-            "A · 추세필터: SMA120 방향 일치 + ADX·효율 임계 통과",
-            f"     ADX ≥ {float(cfg['feature_a_adx_min']):g}, 효율 ≥ {float(cfg['feature_a_efficiency_min']):g}",
-            "B · ATR 초기손절: 진입 즉시 진입가 ± ATR×배수 손절",
-            f"     배수 {float(cfg['feature_b_atr_multiplier']):g}",
-            "C · 변동성 타겟 사이징: ATR/가격 비율로 수량 조절",
-            f"     목표 {float(cfg['feature_c_target_atr_pct']):g}, 배율 {float(cfg['feature_c_min_scale']):g}~{float(cfg['feature_c_max_scale']):g}",
-            "D · ATR 샹들리에: 고점/저점 기준 트레일링(수익 고정 대신)",
-            f"     배수 {float(cfg['feature_d_atr_multiplier']):g}",
-            "E · Donchian 돌파: N봉 최고/최저 돌파를 추가 트리거로",
-            f"     {cfg['feature_e_period']}봉",
+            "C · 변동성 타겟 사이징",
+            f"  수량 = 잔고 × {_n(cfg['margin_fraction']) * 100:.0f}% × 변동성배율 × {cfg['leverage']}x ÷ 가격",
+            f"  변동성배율 = 목표 {float(cfg['feature_c_target_atr_pct']) * 100:g}% ÷ (ATR/가격), "
+            f"범위 {float(cfg['feature_c_min_scale']):g}~{float(cfg['feature_c_max_scale']):g}",
+            "  → 조용한 장에서 크게, 요동치는 장에서 작게",
             "",
-            "· 보유 중 반대 신호 시 시장가 청산 후 반대 진입",
-            "· A~E는 독립 스위치이며 조합해서 시험할 수 있습니다.",
+            "청산",
+            "· 반대 크로스 발생 시 포지션 종료 (시장가)",
+            f"· 수익잠금: 최고 증거금 ROI +{float(cfg['lock_start_roi_percent']):g}% 도달 → "
+            f"+{float(cfg['lock_start_roi_percent']) - float(cfg['lock_gap_percent']):g}%에 Stop, "
+            f"이후 +{float(cfg['lock_step_percent']):g}%마다 한 칸 상향",
+            "· 비상손절: OFF (반대 크로스 전까지 손실을 그대로 보유)",
+            "",
+            "참고: 이 전략은 다른 선물 전략과 동시에 켜지지 않습니다.",
         ]
         return "\n".join(lines)
 
@@ -181,17 +181,11 @@ class ControllerMaCrossMixin:
             await self._set_ma_cross_value("enabled", False)
             return "⏹ /macross 신규 진입 OFF (보유 포지션은 계속 관리)\n\n" + self._ma_cross_status_text(), keyboard()
         if action.startswith("feat:"):
-            name = action.split(":", 1)[1].upper()
-            if name not in FEATURES:
-                return self._ma_cross_status_text(), keyboard()
-            changed, _ = await self._toggle_ma_cross_feature(name)
-            cfg = self._ma_cross_config()
-            if not changed:
-                text = f"🚫 마지막 남은 기능({name})은 끌 수 없습니다. 최소 1개는 선택해야 합니다."
-            else:
-                state = "ON" if cfg[FEATURE_FIELDS[name]] else "OFF"
-                text = f"🧩 기능 {name} {state} — 현재: {feature_mode(cfg) or '없음'}"
-            return text + "\n\n" + self._ma_cross_status_text(), keyboard()
+            return (
+                "🧩 이 전략은 C(변동성 타겟 사이징) 전용입니다.\n"
+                "기능 선택은 고정되어 있고, A·B·D·E는 사용하지 않습니다.\n\n"
+                + self._ma_cross_status_text()
+            ), keyboard()
         if action.startswith("tf:"):
             tf = action.split(":", 1)[1]
             if tf in TIMEFRAME_LABELS:

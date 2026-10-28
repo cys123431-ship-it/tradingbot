@@ -42,71 +42,61 @@ def test_config_defaults_and_normalization():
     assert cfg["timeframe"] == "4h"
     assert cfg["scan_scope"] == "btc"
     assert cfg["enabled"] is False
-    assert feature_mode(cfg) == ""          # every feature OFF by default
+    # C-only strategy: C is always on, A/B/D/E always off, no emergency stop.
+    assert feature_mode(cfg) == "C"
+    assert cfg["emergency_stop_roi_percent"] == 0
+    assert cfg["locking"] is True
     for lev, expected in ((2, 2), (3, 3), (5, 5), (0, 5), (9, 5), (20, 5)):
         assert normalize_ma_cross_config({"leverage": lev})["leverage"] == expected
 
 
-def test_feature_mode_is_canonical():
-    cfg = normalize_ma_cross_config({
-        "feature_e_donchian": 1, "feature_a_trend_filter": 1, "feature_c_vol_sizing": 1,
+def test_c_only_is_pinned_against_old_configs():
+    stale = normalize_ma_cross_config({
+        "feature_a_trend_filter": 1, "feature_b_atr_stop": 1,
+        "feature_d_chandelier": 1, "feature_e_donchian": 1,
+        "emergency_stop_roi_percent": 30, "locking": False, "feature_c_vol_sizing": 0,
     })
-    assert feature_mode(cfg) == "ACE"
+    assert feature_mode(stale) == "C"
+    assert stale["emergency_stop_roi_percent"] == 0
+    assert stale["locking"] is True
+
+
+def test_feature_mode_is_canonical():
     assert FEATURES == ("A", "B", "C", "D", "E")
+    assert feature_mode(normalize_ma_cross_config({})) == "C"
 
 
 # ------------------------------------------------------------------ strategy
-def test_no_feature_selected_makes_no_signals():
-    cfg = normalize_ma_cross_config({})
-    decision = evaluate(rows_from(LONG_THEN_SHORT), cfg)
-    assert decision["side"] is None
-    assert decision["skip_reason"] == "NO_FEATURE_SELECTED"
-
-
-def test_sma_cross_signal_and_features_are_reported():
+def test_c_only_entry_produces_sma_cross_signals():
     rows = rows_from(LONG_THEN_SHORT)
-    cfg = normalize_ma_cross_config({"feature_b_atr_stop": 1})
-    # find the candle index where the fast SMA crosses up
+    cfg = normalize_ma_cross_config({})
     index = None
     for i in range(1, len(rows)):
-        decision = evaluate(rows, cfg, i)
-        if decision["side"] == "LONG":
+        if evaluate(rows, cfg, i)["side"] == "LONG":
             index = i
             break
     assert index is not None
     decision = evaluate(rows, cfg, index)
     assert decision["side"] == "LONG" and decision["trigger"] == "SMA_CROSS"
-    assert decision["initial_stop"] is not None and decision["initial_stop"] < rows[index][4]
-    assert decision["atr_distance"] > 0
+    assert decision["features"] == "C"
+    # C only adjusts the size; it never adds a stop.
+    assert decision["initial_stop"] is None
+    assert 0.5 <= decision["size_multiplier"] <= 1.5
 
 
-def test_feature_a_blocks_when_trend_disagrees():
+def test_stop_related_features_are_not_active():
     rows = rows_from(LONG_THEN_SHORT)
-    base = normalize_ma_cross_config({"feature_b_atr_stop": 1})
-    strict = normalize_ma_cross_config({
-        "feature_a_trend_filter": 1, "feature_b_atr_stop": 1,
-        "feature_a_adx_min": "0", "feature_a_efficiency_min": "0",
-    })
-    plain_long = strict_long = 0
+    cfg = normalize_ma_cross_config({})
     for i in range(1, len(rows)):
-        plain = evaluate(rows, base, i)
-        gated = evaluate(rows, strict, i)
-        if plain["side"]:
-            plain_long += 1
-            if gated["side"]:
-                strict_long += 1
-            else:
-                assert gated["skip_reason"].startswith("REJECTED_TREND_FILTER")
-    # with ADX/ER floors at 0 the only extra rejection is the SMA side check,
-    # so the gated signal set can never be larger than the plain one
-    assert strict_long <= plain_long
+        decision = evaluate(rows, cfg, i)
+        if decision["side"]:
+            assert decision["initial_stop"] is None
+            break
 
 
 def test_feature_c_scales_size_with_volatility():
-    cfg_calm = normalize_ma_cross_config({"feature_c_vol_sizing": 1,
-                                          "feature_c_target_atr_pct": "0.10"})
-    cfg_wild = normalize_ma_cross_config({"feature_c_vol_sizing": 1,
-                                          "feature_c_target_atr_pct": "0.001"})
+    cfg_calm = normalize_ma_cross_config({"feature_c_target_atr_pct": "0.10"})
+    cfg_wild = normalize_ma_cross_config({"feature_c_target_atr_pct": "0.001"})
     rows = rows_from(LONG_THEN_SHORT)
     calm = wild = None
     for i in range(1, len(rows)):
@@ -122,13 +112,6 @@ def test_feature_c_scales_size_with_volatility():
     assert calm is not None and wild is not None
     assert calm >= wild          # a higher target allows a bigger size
     assert 0.5 <= wild <= 1.5 and 0.5 <= calm <= 1.5
-
-
-def test_feature_e_donchian_adds_breakout_trigger():
-    rows = rows_from(trend_series([(200, 0.0), (60, 0.2), (40, 2.0)]))
-    cfg = normalize_ma_cross_config({"feature_e_donchian": 1, "feature_e_period": 20})
-    triggers = {evaluate(rows, cfg, i)["trigger"] for i in range(150, len(rows))}
-    assert "DONCHIAN" in triggers
 
 
 # ------------------------------------------------------------------ backtest
@@ -211,51 +194,33 @@ def _callbacks(markup):
     return [b.callback_data for row in markup.inline_keyboard for b in row]
 
 
-def test_menu_has_every_feature_button():
+def test_menu_is_c_only():
     controller = _controller()
     _, markup = _press(controller, "status")
     callbacks = _callbacks(markup)
+    # A~E toggle buttons are gone; only the fixed C row remains.
     for name in FEATURES:
-        assert f"mc:feat:{name}" in callbacks
+        assert f"mc:feat:{name}" not in callbacks
     for lev in ("2", "3", "4", "5"):
         assert f"mc:lev:{lev}" in callbacks
     assert "mc:on" in callbacks and "mc:off" in callbacks
 
 
-def test_feature_toggles_are_independent_and_combinable():
+def test_feature_toggle_is_refused_because_c_is_fixed():
     controller = _controller()
-    cfg = controller.cfg.data["ma_cross"]
-    _press(controller, "feat:A")
-    assert feature_mode(controller._ma_cross_config()) == "A"
-    _press(controller, "feat:C")
-    assert feature_mode(controller._ma_cross_config()) == "AC"
-    _press(controller, "feat:E")
-    assert feature_mode(controller._ma_cross_config()) == "ACE"
-    _press(controller, "feat:A")                      # toggle back off
-    assert feature_mode(controller._ma_cross_config()) == "CE"
-    assert cfg["feature_a_trend_filter"] == 0
+    text, _ = _press(controller, "feat:A")
+    assert "C(변동성 타겟 사이징) 전용" in text
+    assert feature_mode(controller._ma_cross_config()) == "C"
 
 
-def test_last_feature_cannot_be_turned_off():
+def test_strategy_can_be_enabled_with_the_fixed_c_feature():
     controller = _controller()
-    _press(controller, "feat:B")
-    assert feature_mode(controller._ma_cross_config()) == "B"
-    text, _ = _press(controller, "feat:B")
-    assert "최소 1개" in text
-    assert feature_mode(controller._ma_cross_config()) == "B"
-
-
-def test_strategy_cannot_be_enabled_without_a_feature():
-    controller = _controller()
-    text, markup = _press(controller, "on")
-    assert "최소 1개" in text
     _press(controller, "confirm_on")
-    assert controller.cfg.data["ma_cross"].get("enabled") is not True
+    assert controller.cfg.data["ma_cross"]["enabled"] is True
 
 
 def test_enabling_turns_other_futures_strategies_off():
     controller = _controller()
-    _press(controller, "feat:B")
     _press(controller, "confirm_on")
     assert controller.cfg.data["ma_cross"]["enabled"] is True
     assert controller.cfg.data["btc_ema_pullback"]["enabled"] is False
@@ -263,11 +228,12 @@ def test_enabling_turns_other_futures_strategies_off():
     assert controller.is_paused is True
 
 
-def test_status_shows_the_selected_combination():
+def test_status_and_rules_describe_the_c_only_strategy():
     controller = _controller()
-    _press(controller, "feat:A")
-    _press(controller, "feat:D")
     text, _ = _press(controller, "status")
-    assert "A(추세필터" in text and "D(ATR 샹들리에" in text
+    assert "C(변동성 타겟 사이징)" in text
+    assert "반대 크로스" in text and "비상손절 OFF" in text
     rules = _press(controller, "rules")[0]
-    assert "SMA3 / SMA120" in rules and "Donchian" in rules
+    assert "SMA3 / SMA120" in rules
+    assert "반대 크로스 발생 시 포지션 종료" in rules
+    assert "변동성 타겟 사이징" in rules

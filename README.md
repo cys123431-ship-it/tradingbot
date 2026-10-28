@@ -44,37 +44,41 @@
   - `방향 유지 중 진입`을 직접 누르면 강제가 해제되고 카운트가 0이 됩니다(사용자 선택 우선).
   - 텔레그램 버튼 `🔁 익절3회→돌파 강제: ON (n/3)`으로 ON/OFF 전환하며, 상태 화면에도 현재 진행도가 표시됩니다.
 
-## /macross — SMA3/SMA120 + 기능 A~E 선택 전략
+## /macross — SMA3/SMA120 + 변동성 타겟 사이징 (C 전용)
 
-`/btcmacross`와 **완전히 별개**인 시험용 전략입니다. 신호는 **SMA3 / SMA120 크로스**(4시간봉)이고, 여기에 **A~E 기능을 하나씩 또는 조합해서** 켜고 끌 수 있습니다.
+`/btcmacross`와 **완전히 별개**인 시험용 전략입니다. 4시간봉 SMA3/SMA120 크로스에 **C(변동성 타겟 사이징)** 하나만 적용합니다.
 
-| 기능 | 내용 | 기본 파라미터 |
-|---|---|---|
-| **A** 추세필터 | SMA120 방향 일치 + ADX·효율(ER) 임계 통과 시에만 진입 | ADX ≥ 18, ER ≥ 0.20 |
-| **B** ATR 초기손절 | 진입 즉시 진입가 ± ATR×배수 손절(무방비 구간 제거) | ATR × 2.0 |
-| **C** 변동성 타겟 사이징 | ATR/가격 비율로 수량 조절(고변동 축소·저변동 확대) | 목표 3%, 배율 0.5~1.5 |
-| **D** ATR 샹들리에 | 고점/저점 기준 트레일링으로 추세 지속(수익 고정 대신) | ATR × 3.0 |
-| **E** Donchian 돌파 | N봉 최고/최저 돌파를 추가 트리거로 병행 | 20봉 |
+### 진입
+1. 완료된 봉에서 **SMA3이 SMA120 상향 돌파 → LONG / 하향 돌파 → SHORT**
+2. 수량 = `잔고 × 50% × 변동성배율 × 레버리지 ÷ 가격`
+   - 변동성배율 = `목표 3% ÷ (ATR/가격)`, 범위 **0.5 ~ 1.5**
+   - 조용한 장에서 크게, 요동치는 장에서 작게
 
-- **최소 1개 필수**: A~E를 모두 끄면 전략이 신호를 만들지 않으며, 마지막 남은 기능은 끌 수 없습니다.
-- 텔레그램 `/macross`의 `A · 추세필터` ~ `E · Donchian` 버튼으로 1~5개를 자유롭게 조합.
-- 켜면 다른 선물 전략(3/200 SMA, BTC 눌림목)은 **자동 OFF** 됩니다.
-- 거래소는 `/setup` 선택을 따르며(테스트넷 검증용), 기본은 **DRY_RUN**.
-- 봉·레버리지(2~5x)·종목(BTC만 / 알트)도 메뉴에서 변경할 수 있습니다.
+### 청산
+1. **반대 크로스 발생 시 포지션 종료** (시장가)
+2. **수익잠금**: 최고 증거금 ROI **+5%** 도달 → **+4%에 Stop**, 이후 +5%마다 한 칸 상향(항상 도달−1%, 내려가지 않음)
+3. **비상손절: OFF** — 반대 크로스 전까지 손실을 그대로 보유
+
+### 특징
+- 기능 A·B·D·E는 코드에 남아 있지만 **UI에서 노출되지 않고 항상 OFF**로 고정됩니다.
+- 정규화 단계에서 C=ON, A/B/D/E=OFF, 수익잠금=ON, 비상손절=OFF로 **강제**되므로 오래된 설정이 남아 있어도 동작이 바뀌지 않습니다.
+- 켜면 다른 선물 전략(3/200 SMA, BTC 눌림목)은 **자동 OFF**.
+- 거래소는 `/setup` 선택을 따르며 기본은 **DRY_RUN**.
+
+### 백테스트 결과 (BTCUSDT 4h · 753일 · 5x · 수익잠금 ON · 비상손절 OFF)
+
+| 체결 가정 | 거래 | 승률 | 수익률 | PF | MDD |
+|---|---:|---:|---:|---:|---:|
+| maker 0.02% | 76 | 56.6% | +172.37% | 1.36 | 38.27% |
+| taker 0.05% | 76 | 56.6% | +74.72% | 1.24 | 45.33% |
 
 ### 로컬 백테스트 (Azure 미배포)
 
-31가지 조합(1~5개)을 한 번에 비교하는 로컬 전용 스크립트입니다.
-
 ```bash
-# 과거 4h BTC 데이터를 받아 31조합 비교표 출력
-python scripts/macross_backtest.py --months 24 --csv-out btc_4h.json
-
-# 받은 데이터로 오프라인 재실행 (인터넷 없이)
-python scripts/macross_backtest.py --offline --cache btc_4h.json --top 15
-
-# 특정 조합만 비교 + 최우수 조합 거래내역 저장
-python scripts/macross_backtest.py --offline --cache btc_4h.json --modes A,B,AB,ABD --dump-trades trades.csv
+python scripts/macross_backtest.py --months 24 --csv-out btc_4h.json   # 4h 데이터 수집
+python scripts/macross_backtest.py --offline --cache btc_4h.json --modes C --lock on
+python scripts/macross_backtest.py --timeframe 1h --months 24           # 다른 봉 비교
+python scripts/macross_backtest.py --offline --cache btc_4h.json --modes C --lock off
 ```
 
 수수료·슬리피지·펀딩·레버리지를 반영하며, 출력은 `기능 | 거래수 | 승률 | 수익률 | PF | MDD | 평균손익` 순입니다.

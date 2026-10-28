@@ -77,7 +77,8 @@ def default_ma_cross_config() -> dict:
         "margin_type": "ISOLATED",
         "position_mode": "ONE_WAY",
         "margin_fraction": "0.5",
-        "emergency_stop_roi_percent": 30,
+        # C-only strategy: no emergency stop, exits are the opposite cross + profit lock.
+        "emergency_stop_roi_percent": 0,
         # Feature A
         "feature_a_trend_filter": 0,
         "feature_a_adx_min": "18",
@@ -85,8 +86,8 @@ def default_ma_cross_config() -> dict:
         # Feature B
         "feature_b_atr_stop": 0,
         "feature_b_atr_multiplier": "2.0",
-        # Feature C
-        "feature_c_vol_sizing": 0,
+        # Feature C (the only feature exposed in the Telegram UI)
+        "feature_c_vol_sizing": 1,
         "feature_c_target_atr_pct": "0.03",
         "feature_c_min_scale": "0.5",
         "feature_c_max_scale": "1.5",
@@ -178,6 +179,15 @@ def normalize_ma_cross_config(raw=None) -> dict:
     cfg["emergency_stop_roi_percent"] = stop if stop in EMERGENCY_STOP_CHOICES else defaults["emergency_stop_roi_percent"]
     for name, field in FEATURE_FIELDS.items():
         cfg[field] = 1 if _bool(cfg.get(field), False) else 0
+    # This strategy runs C-only: normalisation pins C on and the other blocks off,
+    # whatever an older config may still carry.
+    cfg["feature_c_vol_sizing"] = 1
+    for name in ("A", "B", "D", "E"):
+        cfg[FEATURE_FIELDS[name]] = 0
+    # Exit policy: opposite cross (+ profit lock).  No emergency stop, no
+    # chandelier trail, no ATR initial stop.
+    cfg["locking"] = True
+    cfg["emergency_stop_roi_percent"] = 0
     cfg["feature_a_adx_min"] = _decimal_text(cfg.get("feature_a_adx_min"), "18", 0.0, 60.0)
     cfg["feature_a_efficiency_min"] = _decimal_text(cfg.get("feature_a_efficiency_min"), "0.20", 0.0, 1.0)
     cfg["feature_b_atr_multiplier"] = _decimal_text(cfg.get("feature_b_atr_multiplier"), "2.0", 0.5, 6.0)

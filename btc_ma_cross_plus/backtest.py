@@ -28,12 +28,18 @@ def all_feature_modes(min_features=1, max_features=len(FEATURES)):
 
 
 def cfg_for_mode(mode, base_cfg):
-    """``base_cfg`` with exactly the features in ``mode`` switched on."""
+    """``base_cfg`` with exactly the features in ``mode`` switched on.
+
+    ``locking`` is only implied when the caller did not pin it: feature D
+    replaces the fixed profit lock with the chandelier trail, but an explicit
+    ``locking`` value in ``base_cfg`` always wins.
+    """
     cfg = dict(base_cfg)
     for name, field in FEATURE_FIELDS.items():
         cfg[field] = 1 if name in mode else 0
-    # Feature D replaces the fixed profit lock with the chandelier trail.
-    cfg["locking"] = "D" not in mode
+    if "_locking_pinned" not in cfg:
+        cfg["locking"] = "D" not in mode
+    cfg.pop("_locking_pinned", None)
     return cfg
 
 
