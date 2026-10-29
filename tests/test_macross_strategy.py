@@ -10,6 +10,7 @@ from btc_ma_cross_plus.config import (
     feature_mode,
 )
 from btc_ma_cross_plus.strategy import evaluate
+from btc_ma_cross_plus.tradfi import market_in_tradfi_scope
 
 BAR_MS = 4 * 3_600_000
 T0 = 1_700_000_000_000 - (1_700_000_000_000 % BAR_MS)
@@ -237,3 +238,57 @@ def test_status_and_rules_describe_the_c_only_strategy():
     assert "SMA3 / SMA120" in rules
     assert "반대 크로스 발생 시 포지션 종료" in rules
     assert "변동성 타겟 사이징" in rules
+
+
+# ------------------------------------------------------------------ TradFi
+def test_menu_has_the_tradfi_button():
+    controller = _controller()
+    _, markup = _press(controller, "status")
+    assert "mc:scope:tradfi" in _callbacks(markup)
+
+
+def test_tradfi_button_is_refused_outside_mainnet():
+    controller = _controller()
+    controller.get_exchange_mode = lambda: "binance_testnet"
+    text, _ = _press(controller, "scope:tradfi")
+    assert "메인넷에서만" in text
+    assert controller.cfg.data["ma_cross"].get("scan_scope") != "tradfi"
+
+
+def test_tradfi_button_selects_the_scope_on_mainnet(monkeypatch):
+    controller = _controller()
+    controller.get_exchange_mode = lambda: "binance_mainnet"
+
+    class _Service:
+        @staticmethod
+        def us_session_status():
+            return {"open": True, "reason": "regular_session_open",
+                    "regular_close": "2026-10-28T20:00:00+00:00"}
+
+    controller.ma_cross_service = _Service()
+    text, _ = _press(controller, "scope:tradfi")
+    assert controller.cfg.data["ma_cross"]["scan_scope"] == "tradfi"
+    assert "TradFi만 선택" in text and "미국 정규장" in text
+
+
+def test_tradfi_classification_matches_the_3_200_strategy():
+    from btc_ma_cross.service import market_in_tradfi_scope as btc_scope
+    from tests.test_btc_ma_cross_tradfi import tradfi_market
+
+    cases = [
+        ("AAPL/USDT:USDT", tradfi_market("AAPLUSDT")),
+        ("XAU/USDT:USDT", tradfi_market("XAUUSDT", underlying_type="COMMODITY", base="XAU")),
+        ("XAG/USDT:USDT", tradfi_market("XAGUSDT", underlying_type="METAL", base="XAG")),
+        ("WTI/USDT:USDT", tradfi_market("WTIUSDT", underlying_type="ENERGY", base="WTI")),
+    ]
+    for symbol, market in cases:
+        assert market_in_tradfi_scope(symbol, market) is btc_scope(symbol, market)
+
+
+def test_service_scope_wiring():
+    from btc_ma_cross_plus import MaCrossService
+
+    assert MaCrossService.tradfi_network_allowed("mainnet") is True
+    assert MaCrossService.tradfi_network_allowed("testnet") is False
+    assert normalize_ma_cross_config({"scan_scope": "tradfi"})["scan_scope"] == "tradfi"
+    assert normalize_ma_cross_config({"scan_scope": "bogus"})["scan_scope"] == "btc"

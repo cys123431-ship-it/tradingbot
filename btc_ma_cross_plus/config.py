@@ -22,6 +22,8 @@ from btc_ema_pullback.config import (
     _int,
 )
 
+from .tradfi import TRADFI_SCOPE
+
 STRATEGY_NAME = "sma3_sma120_macross"
 STRATEGY_VERSION = "1.0.0"
 CLIENT_ID_STRATEGY = "mcross"
@@ -44,7 +46,7 @@ FEATURE_FIELDS = {
     "D": "feature_d_chandelier",
     "E": "feature_e_donchian",
 }
-SCAN_SCOPES = ("btc", "alts", "single")
+SCAN_SCOPES = ("btc", "alts", "single", TRADFI_SCOPE)
 ENTRY_MODES = ("cross", "trend")
 EMERGENCY_STOP_CHOICES = (0, 10, 20, 30, 50)
 LEVERAGE_CHOICES = (2, 3, 4, 5)

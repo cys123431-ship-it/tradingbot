@@ -19,6 +19,12 @@ from btc_ma_cross_plus import (
     normalize_ma_cross_config,
 )
 from btc_ma_cross_plus.config import LEVERAGE_CHOICES
+from btc_ma_cross_plus.service import MaCrossService
+from btc_ma_cross_plus.tradfi import (
+    TRADFI_MAINNET_ONLY_REASON,
+    TRADFI_SCOPE,
+    TRADFI_SESSION_CLOSED_REASON,
+)
 
 from .controller_btc_pullback import NETWORK_LABELS, _answer_quietly, _kst, _n
 
@@ -28,6 +34,34 @@ NO_FEATURE_TEXT = (
     "🚫 이 전략은 C(변동성 타겟 사이징)가 고정 선택이라 이 상태가 나오면 안 됩니다.\n"
     "설정이 손상되었을 수 있으니 /macross 를 다시 열어 주세요."
 )
+TRADFI_KO = {
+    "weekend": "주말 휴장",
+    "holiday": "미국 휴장일",
+    "outside_regular_session": "정규장 시간 아님",
+    "regular_session_open": "정규장 진행 중",
+}
+
+
+def _scope_text(cfg):
+    if cfg.get("scan_scope") == TRADFI_SCOPE:
+        return (f"🏦 TradFi만 — 바이낸스 메인넷 미국주식 + 금 "
+                f"(24h 거래대금 상위 {cfg.get('alt_universe_size', 50)}, 미국 정규장에만 신규 진입)")
+    if cfg.get("scan_scope") == "alts":
+        return f"🌐 알트 전용 24h 거래대금 상위 {cfg.get('alt_universe_size', 50)}개 (BTC 제외)"
+    if cfg.get("scan_scope") == "single":
+        return f"🎯 지정 코인 {cfg.get('single_symbol') or 'BTCUSDT'}만"
+    return "🪙 BTC만"
+
+
+def _us_session_text(session):
+    """One-line US regular-session status for the Telegram status screen."""
+    if not session:
+        return "확인 불가"
+    reason = str(session.get("reason") or "")
+    label = TRADFI_KO.get(reason, reason or "-")
+    if session.get("open"):
+        return f"✅ {label} ({str(session.get('regular_close', ''))[:19]})"
+    return f"⏸ {label} (다음 정규장 {str(session.get('regular_open', ''))[:19]})"
 
 
 def _feature_summary(cfg):
@@ -45,6 +79,31 @@ class ControllerMaCrossMixin:
     async def _set_ma_cross_value(self, key, value):
         await self.cfg.update_value([CONFIG_KEY, key], value)
 
+    def _ma_cross_network(self):
+        """Network the /setup exchange maps to (None for Upbit)."""
+        from btc_ema_pullback.config import NETWORK_MAINNET, NETWORK_TESTNET
+        from .strategy_registry import BINANCE_MAINNET, BINANCE_TESTNET
+
+        mode = self.get_exchange_mode()
+        if mode == BINANCE_MAINNET:
+            return NETWORK_MAINNET
+        if mode == BINANCE_TESTNET:
+            return NETWORK_TESTNET
+        return None
+
+    def _ma_cross_tradfi_refusal(self):
+        """Message when TradFi cannot be used on the current exchange, else ''."""
+        network = self._ma_cross_network()
+        if network and MaCrossService.tradfi_network_allowed(network):
+            return ""
+        network_label = NETWORK_LABELS.get(network, network or "업비트")
+        return (
+            "🚫 TradFi 전용은 바이낸스 메인넷에서만 사용할 수 있습니다.\n"
+            f"지금 거래소: {network_label} (/setup 선택을 따름)\n"
+            "테스트넷(데모)에는 미국주식 TradFi 계약이 거의 없어 모드를 켜지 않습니다.\n"
+            "/setup에서 바이낸스 메인넷으로 바꾼 뒤 다시 선택하세요."
+        )
+
     async def _toggle_ma_cross_feature(self, name):
         """Toggle one feature; refuses to leave every feature OFF."""
         cfg = self._ma_cross_config()
@@ -54,6 +113,53 @@ class ControllerMaCrossMixin:
             return False, "LAST_FEATURE"
         await self._set_ma_cross_value(field, 0 if current else 1)
         return True, ""
+
+    # ------------------------------------------------------------ service
+    def _ma_cross_service(self):
+        """Live service reused from the 3/200 SMA plumbing, TradFi-capable."""
+        service = getattr(self, "ma_cross_service", None)
+        if service is not None:
+            return service
+
+        from btc_ema_pullback.config import NETWORK_MAINNET, NETWORK_TESTNET
+        from .strategy_registry import BINANCE_MAINNET, BINANCE_TESTNET
+
+        def exchange_factory(network, creds):
+            mode = BINANCE_TESTNET if network == NETWORK_TESTNET else BINANCE_MAINNET
+            exchange = self._build_exchange(creds, mode)
+            self._configure_exchange_network(exchange, mode)
+            return exchange
+
+        def main_network_getter():
+            mode = self.get_exchange_mode()
+            if mode == BINANCE_MAINNET:
+                return NETWORK_MAINNET
+            if mode == BINANCE_TESTNET:
+                return NETWORK_TESTNET
+            return None
+
+        async def notifier(text):
+            event_type = None
+            if "🚨" in text:
+                event_type = "EMERGENCY"
+            elif "진입 (" in text:
+                event_type = "ENTRY_FILLED"
+            elif "청산 (" in text:
+                event_type = "EXIT_FILLED"
+            await self.notify_plain(text, event_type=event_type)
+
+        service = MaCrossService(
+            config_getter=lambda: self.cfg.get(CONFIG_KEY, {}) or {},
+            credentials_getter=lambda network: self._get_exchange_credentials(
+                BINANCE_TESTNET if network == NETWORK_TESTNET else BINANCE_MAINNET
+            ) or {},
+            exchange_factory=exchange_factory,
+            runtime_dir=self.runtime_dir,
+            notifier=notifier,
+            main_network_getter=main_network_getter,
+        )
+        self.ma_cross_service = service
+        return service
 
     # --------------------------------------------------------------- keyboard
     @staticmethod
@@ -96,6 +202,10 @@ class ControllerMaCrossMixin:
                                      callback_data="mc:scope:alts"),
             ],
             [
+                InlineKeyboardButton(mark(cfg.get("scan_scope") == TRADFI_SCOPE, "🏦 TradFi만 (메인넷)"),
+                                     callback_data="mc:scope:tradfi"),
+            ],
+            [
                 InlineKeyboardButton("📊 상태", callback_data="mc:status"),
                 InlineKeyboardButton("📘 전략 규칙", callback_data="mc:rules"),
             ],
@@ -122,8 +232,26 @@ class ControllerMaCrossMixin:
             f"기능: {_feature_summary(cfg)}",
             "청산: 반대 크로스 시 종료 · 수익잠금 +5%→+4% 계단 · 비상손절 OFF",
             f"레버리지: {cfg['leverage']}x ISOLATED · 증거금: 가용 잔고 {_n(cfg['margin_fraction']) * 100:.0f}%",
-            f"종목: {'BTC만' if cfg['scan_scope'] == 'btc' else '알트 상위' + str(cfg['alt_universe_size'])}",
+            f"종목: {_scope_text(cfg)}",
         ]
+        if cfg.get("scan_scope") == TRADFI_SCOPE:
+            network = self._ma_cross_network()
+            service = self._ma_cross_service()
+            scope_state = {"allowed": False, "detail": "업비트에서는 사용할 수 없습니다."}
+            if network:
+                try:
+                    scope_state = service.tradifi_scope_state(network)
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning("macross TradFi status lookup failed: %s", exc)
+                    scope_state = {"allowed": False, "detail": f"상태 확인 실패 ({type(exc).__name__})"}
+            lines.append(
+                f"🏦 TradFi 신규 진입: {'가능' if scope_state.get('allowed') else '차단 — ' + str(scope_state.get('detail'))}"
+            )
+            if network:
+                try:
+                    lines.append(f"미국 정규장: {_us_session_text(service.us_session_status())}")
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning("macross US session lookup failed: %s", exc)
         if not mode:
             lines += ["", NO_FEATURE_TEXT]
         elif enabled:
@@ -201,9 +329,26 @@ class ControllerMaCrossMixin:
             return f"⚙️ 레버리지: {self._ma_cross_config()['leverage']}x\n\n" + self._ma_cross_status_text(), keyboard()
         if action.startswith("scope:"):
             scope = action.split(":", 1)[1]
+            if scope == TRADFI_SCOPE:
+                refusal = self._ma_cross_tradfi_refusal()
+                if refusal:
+                    return refusal, keyboard()
+                await self._set_ma_cross_value("scan_scope", TRADFI_SCOPE)
+                try:
+                    session = self._ma_cross_service().us_session_status()
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning("macross US session lookup failed: %s", exc)
+                    session = {}
+                return (
+                    f"🏦 TradFi만 선택: {_scope_text(self._ma_cross_config())}\n"
+                    f"• 미국 정규장에서만 신규 진입 · 지금: {_us_session_text(session)}\n"
+                    "• 장 마감·주말·휴장에는 새 진입을 하지 않고, 보유 포지션의 반대 크로스 청산과 "
+                    "수익잠금은 계속 동작합니다.\n\n"
+                    + self._ma_cross_status_text()
+                ), keyboard()
             if scope in ("btc", "alts"):
                 await self._set_ma_cross_value("scan_scope", scope)
-            return f"🔎 종목: {self._ma_cross_config()['scan_scope']}\n\n" + self._ma_cross_status_text(), keyboard()
+            return f"🔎 종목: {_scope_text(self._ma_cross_config())}\n\n" + self._ma_cross_status_text(), keyboard()
         if action == "mode:live":
             return (
                 "⚠️ LIVE로 전환할까요? 실제 주문이 나갑니다.\n"
