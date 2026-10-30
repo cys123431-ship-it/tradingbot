@@ -2,6 +2,8 @@
 //! subclass and `Harness` from tests/test_btc_ma_cross.py.
 #![allow(unused, dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 
+pub mod scope;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
