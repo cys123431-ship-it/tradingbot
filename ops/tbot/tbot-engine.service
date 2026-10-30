@@ -1,0 +1,19 @@
+[Unit]
+Description=tbot engine (Rust SMA strategies, local control API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=azureuser
+WorkingDirectory=/home/azureuser/tradingbot
+Environment=TBOT_CONFIG=/home/azureuser/tradingbot/config.json
+Environment=TBOT_RUNTIME_DIR=/home/azureuser/tradingbot/runtime
+ExecStart=/home/azureuser/tbot/bin/tbot-engine
+Restart=always
+RestartSec=10
+MemoryMax=300M
+StandardOutput=append:/home/azureuser/tbot-engine.log
+StandardError=append:/home/azureuser/tbot-engine.log
+
+[Install]
+WantedBy=multi-user.target

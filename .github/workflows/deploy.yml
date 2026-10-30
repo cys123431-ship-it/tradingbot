@@ -11,6 +11,11 @@ on:
       - "**/*.md"
       - ".github/workflows/deploy-kstockbot.yml"
       - ".github/workflows/feature-ema200-ci.yml"
+      # The Rust bot ships through deploy-tbot.yml.
+      - "tbot/**"
+      - "ops/tbot/**"
+      - "ops/TBOT_ENABLED"
+      - ".github/workflows/deploy-tbot.yml"
   workflow_dispatch:
 
 # Never run two deploys against the live server at the same time.

@@ -1,0 +1,19 @@
+[Unit]
+Description=tbot Telegram control (talks to tbot-engine over local IPC)
+After=network-online.target tbot-engine.service
+Wants=network-online.target
+
+[Service]
+User=azureuser
+WorkingDirectory=/home/azureuser/tradingbot
+Environment=TBOT_CONFIG=/home/azureuser/tradingbot/config.json
+Environment=TBOT_RUNTIME_DIR=/home/azureuser/tradingbot/runtime
+ExecStart=/home/azureuser/tbot/bin/tbot-telegram
+Restart=always
+RestartSec=10
+MemoryMax=150M
+StandardOutput=append:/home/azureuser/tbot-telegram.log
+StandardError=append:/home/azureuser/tbot-telegram.log
+
+[Install]
+WantedBy=multi-user.target

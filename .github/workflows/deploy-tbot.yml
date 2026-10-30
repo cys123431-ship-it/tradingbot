@@ -1,0 +1,76 @@
+name: Deploy Rust Bot
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "tbot/**"
+      - "ops/TBOT_ENABLED"
+      - "ops/tbot/**"
+      - ".github/workflows/deploy-tbot.yml"
+  workflow_dispatch:
+
+# Same group as the Python deploy: never touch the server twice at once.
+concurrency:
+  group: deploy-tradingbot
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Older glibc than the server, so the binaries run there.
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: tbot
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tbot
+      - name: Test
+        run: cargo test --locked
+      - name: Build release binaries
+        run: cargo build --release --locked --bins
+      - name: Bundle
+        working-directory: .
+        run: |
+          mkdir -p bundle
+          cp tbot/target/release/tbot-engine tbot/target/release/tbot-telegram bundle/
+          cp ops/tbot/*.service ops/tbot/install.sh bundle/
+          if [ -f ops/TBOT_ENABLED ]; then echo 1 > bundle/ENABLED; else echo 0 > bundle/ENABLED; fi
+          ls -la bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tbot-bundle
+          path: bundle/
+          retention-days: 7
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tbot-bundle
+          path: bundle
+      - name: Upload bundle
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.AZURE_HOST }}
+          username: ${{ secrets.AZURE_USERNAME }}
+          key: ${{ secrets.AZURE_SSH_PRIVATE_KEY }}
+          source: "bundle/*"
+          target: "/home/azureuser/tbot-incoming"
+          strip_components: 1
+          rm: true
+      - name: Install and (re)start
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.AZURE_HOST }}
+          username: ${{ secrets.AZURE_USERNAME }}
+          key: ${{ secrets.AZURE_SSH_PRIVATE_KEY }}
+          script: |
+            set -euo pipefail
+            cd /home/azureuser/tbot-incoming
+            bash ./install.sh "$PWD" "$(cat ENABLED)"

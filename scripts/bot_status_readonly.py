@@ -167,6 +167,24 @@ def top_memory_processes(limit=5, proc_root="/proc"):
     ]
 
 
+def tbot_status(root):
+    """Rust bot (tbot-engine / tbot-telegram): processes and engine heartbeat."""
+    info = {"engine_processes": None, "telegram_processes": None, "heartbeat_age_sec": None, "strategies": None}
+    for key, name in (("engine_processes", "tbot-engine"), ("telegram_processes", "tbot-telegram")):
+        try:
+            out = subprocess.run(["pgrep", "-x", name], capture_output=True, text=True, timeout=5)
+            info[key] = len([line for line in out.stdout.split() if line.strip()])
+        except (OSError, subprocess.SubprocessError):
+            pass
+    heartbeat = root / "runtime" / "tbot_engine_heartbeat.json"
+    try:
+        info["heartbeat_age_sec"] = round(time.time() - heartbeat.stat().st_mtime)
+        info["strategies"] = (_load_json(heartbeat, {}) or {}).get("strategies")
+    except OSError:
+        pass
+    return info
+
+
 def system_status(root):
     info = {
         "load_avg": None,
@@ -367,6 +385,7 @@ def collect(root, *, with_exchange=True):
         "generated_at": time.time(),
         "network": exchange_network(config) if config else None,
         "process": process_status(root),
+        "tbot": tbot_status(root),
         "main_engine": main_engine_status(root),
         "strategies": strategy_snapshots(root, config) if config else [],
         "exchange": None,
@@ -421,6 +440,12 @@ def render(report):
     lines.append(
         f"서버: 부하 {load_txt} (CPU {cpu_count_txt}개) · 메모리 가용 {avail}/{total} MB · 스왑 {swap_txt} · 봇 CPU {bot_cpu}% · 메모리 {rss} MB · 스레드 {threads}"
     )
+    tbot = report.get("tbot") or {}
+    if tbot.get("engine_processes") or tbot.get("telegram_processes") or tbot.get("heartbeat_age_sec") is not None:
+        lines.append(
+            f"러스트 봇: 엔진 {tbot.get('engine_processes')}개 · 텔레그램 {tbot.get('telegram_processes')}개"
+            f" · 하트비트 {tbot.get('heartbeat_age_sec')}초 전"
+        )
     top = sysinfo.get("top_memory") or []
     if top:
         lines.append("메모리 상위: " + " · ".join(
