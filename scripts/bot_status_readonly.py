@@ -75,6 +75,166 @@ def process_status(root):
     return info
 
 
+def _read_proc_text(path_str):
+    try:
+        with open(path_str, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def _proc_rss_kb(pid):
+    text = _read_proc_text(f"/proc/{pid}/status")
+    if not text:
+        return None
+    for line in text.splitlines():
+        if line.startswith("VmRSS:"):
+            try:
+                return int(line.split()[1])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def _proc_threads(pid):
+    text = _read_proc_text(f"/proc/{pid}/status")
+    if not text:
+        return None
+    for line in text.splitlines():
+        if line.startswith("Threads:"):
+            try:
+                return int(line.split()[1])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def _proc_cpu_ticks(pid):
+    text = _read_proc_text(f"/proc/{pid}/stat")
+    if not text:
+        return None
+    # Format: pid (comm) state ppid ... utime(14) stime(15) ...
+    # comm may contain spaces/parens; strip through last ')'.
+    try:
+        rparen = text.rfind(")")
+        if rparen < 0:
+            return None
+        rest = text[rparen + 2:].split()
+        # rest[0] is field 3 (state); utime is field 14 -> rest[11], stime 15 -> rest[12]
+        utime = int(rest[11])
+        stime = int(rest[12])
+        return utime + stime
+    except (IndexError, ValueError):
+        return None
+
+
+def system_status(root):
+    info = {
+        "load_avg": None,
+        "cpu_count": None,
+        "mem_total_mb": None,
+        "mem_available_mb": None,
+        "bot_pid": None,
+        "bot_rss_mb": None,
+        "bot_cpu_percent": None,
+        "bot_threads": None,
+        "watchdog": None,
+    }
+    try:
+        info["cpu_count"] = os.cpu_count()
+    except Exception:
+        pass
+
+    # load avg
+    try:
+        text = _read_proc_text("/proc/loadavg")
+        if text:
+            parts = text.split()
+            info["load_avg"] = [float(x) for x in parts[:3]]
+    except Exception:
+        pass
+
+    # Memory
+    try:
+        text = _read_proc_text("/proc/meminfo")
+        if text:
+            vals = {}
+            for line in text.splitlines():
+                if ":" in line:
+                    key, rest = line.split(":", 1)
+                    vals[key.strip()] = rest.strip()
+            def _kb_mb(key):
+                v = vals.get(key)
+                if not v:
+                    return None
+                try:
+                    return int(int(v.split()[0]) / 1024)
+                except (IndexError, ValueError):
+                    return None
+            info["mem_total_mb"] = _kb_mb("MemTotal")
+            info["mem_available_mb"] = _kb_mb("MemAvailable")
+    except Exception:
+        pass
+
+    # Bot pid: pick the pgrep emas match with the largest RSS.
+    pid = None
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", "emas"], capture_output=True, text=True, timeout=5
+        )
+        candidates = []
+        for token in out.stdout.split():
+            try:
+                p = int(token.strip())
+            except ValueError:
+                continue
+            rss = _proc_rss_kb(p)
+            if rss is not None:
+                candidates.append((rss, p))
+        if candidates:
+            candidates.sort(reverse=True)
+            pid = candidates[0][1]
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    info["bot_pid"] = pid
+    if pid is not None:
+        try:
+            rss_kb = _proc_rss_kb(pid)
+            if rss_kb is not None:
+                info["bot_rss_mb"] = round(rss_kb / 1024.0, 1)
+        except Exception:
+            pass
+        try:
+            info["bot_threads"] = _proc_threads(pid)
+        except Exception:
+            pass
+        try:
+            t1 = _proc_cpu_ticks(pid)
+            if t1 is not None:
+                time.sleep(1.0)
+                t2 = _proc_cpu_ticks(pid)
+                if t2 is not None:
+                    try:
+                        hz = os.sysconf("SC_CLK_TCK")
+                    except (ValueError, OSError):
+                        hz = 100
+                    if hz:
+                        info["bot_cpu_percent"] = round(
+                            (t2 - t1) / float(hz) * 100.0, 1
+                        )
+        except Exception:
+            pass
+
+    # Watchdog stats
+    try:
+        info["watchdog"] = _load_json(root / "runtime" / "loop_watchdog.json", None)
+    except Exception:
+        info["watchdog"] = None
+
+    return info
+
+
 def main_engine_status(root):
     runtime = _load_json(root / "runtime" / "desktop_monitor.json", {})
     if not isinstance(runtime, dict):
@@ -166,6 +326,7 @@ def collect(root, *, with_exchange=True):
         "strategies": strategy_snapshots(root, config) if config else [],
         "exchange": None,
         "log_errors": log_errors(),
+        "system": system_status(root),
     }
     if with_exchange and config and report["network"]:
         try:
@@ -191,6 +352,61 @@ def render(report):
     lines.append(
         f"프로세스: {'정상' if alive else '확인 필요'} · 실행 {proc.get('launcher_processes')}개 · 하트비트 {age}초 전"
     )
+    sysinfo = report.get("system") or {}
+    load = sysinfo.get("load_avg")
+    if load and len(load) >= 3:
+        load_txt = f"{load[0]:.2f}/{load[1]:.2f}/{load[2]:.2f}"
+    else:
+        load_txt = "-"
+    cpu_count_txt = sysinfo.get("cpu_count")
+    cpu_count_txt = "-" if cpu_count_txt is None else str(cpu_count_txt)
+    avail = sysinfo.get("mem_available_mb")
+    avail = "-" if avail is None else str(avail)
+    total = sysinfo.get("mem_total_mb")
+    total = "-" if total is None else str(total)
+    bot_cpu = sysinfo.get("bot_cpu_percent")
+    bot_cpu = "-" if bot_cpu is None else f"{bot_cpu:.1f}"
+    rss = sysinfo.get("bot_rss_mb")
+    rss = "-" if rss is None else f"{rss:.1f}"
+    threads = sysinfo.get("bot_threads")
+    threads = "-" if threads is None else str(threads)
+    lines.append(
+        f"서버: 부하 {load_txt} (CPU {cpu_count_txt}개) · 메모리 가용 {avail}/{total} MB · 봇 CPU {bot_cpu}% · 메모리 {rss} MB · 스레드 {threads}"
+    )
+    wd = sysinfo.get("watchdog")
+    if isinstance(wd, dict):
+        blocks_total = wd.get("blocks_total")
+        max_block = wd.get("max_block_sec")
+        last_block = wd.get("last_block_sec")
+        last_at = wd.get("last_block_at")
+        try:
+            max_txt = f"{float(max_block):.1f}"
+        except (TypeError, ValueError):
+            max_txt = "-"
+        if last_block is None:
+            last_txt = "-"
+        else:
+            try:
+                last_txt = f"{float(last_block):.1f}"
+            except (TypeError, ValueError):
+                last_txt = "-"
+        if last_at is None:
+            at_txt = "-"
+        else:
+            try:
+                at_txt = _kst(last_at)
+            except Exception:
+                at_txt = "-"
+        lines.append(
+            f"이벤트 루프 멈춤: {blocks_total}회 · 최대 {max_txt}s · 최근 {last_txt}s ({at_txt})"
+        )
+        stack_top = wd.get("last_block_stack_top")
+        if isinstance(stack_top, list):
+            for st_line in stack_top:
+                try:
+                    lines.append("    " + redact(str(st_line)))
+                except Exception:
+                    lines.append("    " + str(st_line))
     lines.append(f"거래소: {report.get('network') or '업비트/알 수 없음'} (/setup)")
     main = report["main_engine"]
     if main:

@@ -2029,6 +2029,14 @@ class ControllerExchangeMixin:
         await self.tg_app.start()
         await self.tg_app.updater.start_polling()
         self._write_heartbeat()
+        try:
+            from pathlib import Path as _Path
+            from .loop_watchdog import LoopWatchdog
+            self._loop_watchdog = LoopWatchdog(
+                _Path(self.runtime_dir) / "loop_watchdog.json", logger=logger)
+            self._loop_watchdog.start()
+        except Exception as watchdog_error:
+            logger.warning("Event loop watchdog start failed: %s", watchdog_error)
 
         # Startup notice + keyboard
         if self._startup_notice_enabled():
