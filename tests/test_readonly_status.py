@@ -110,3 +110,18 @@ def test_ledger_open_is_read_only(tmp_path):
     finally:
         conn.close()
     assert raised
+
+
+def test_top_memory_processes_groups_by_name(tmp_path):
+    from scripts import bot_status_readonly as status
+
+    for pid, name, rss, swap in ((10, "python3", 400000, 100000), (11, "python3", 10240, 0), (12, "node", 204800, 512000)):
+        d = tmp_path / str(pid)
+        d.mkdir()
+        (d / "status").write_text(f"Name:\t{name}\nVmRSS:\t{rss} kB\nVmSwap:\t{swap} kB\n", encoding="utf-8")
+    (tmp_path / "self").mkdir()
+    top = status.top_memory_processes(proc_root=str(tmp_path))
+    assert [e["name"] for e in top] == ["node", "python3"]
+    assert top[0]["swap_mb"] == 500.0
+    assert top[1]["count"] == 2
+    assert status.top_memory_processes(proc_root=str(tmp_path / "missing")) == []

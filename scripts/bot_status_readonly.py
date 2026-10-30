@@ -128,6 +128,45 @@ def _proc_cpu_ticks(pid):
         return None
 
 
+def top_memory_processes(limit=5, proc_root="/proc"):
+    """Largest memory users grouped by process name (RAM + swap, MB). Names only, no args."""
+    totals = {}
+    try:
+        entries = os.listdir(proc_root)
+    except OSError:
+        return []
+    for pid in entries:
+        if not pid.isdigit():
+            continue
+        fields = {}
+        try:
+            with open(os.path.join(proc_root, pid, "status"), encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    key, _, value = line.partition(":")
+                    if key in ("Name", "VmRSS", "VmSwap"):
+                        fields[key] = value.strip()
+        except OSError:
+            continue
+
+        def _mb(key):
+            try:
+                return int(fields.get(key, "0 kB").split()[0]) / 1024.0
+            except (ValueError, IndexError):
+                return 0.0
+
+        name = fields.get("Name") or "?"
+        entry = totals.setdefault(name, {"name": name, "count": 0, "rss_mb": 0.0, "swap_mb": 0.0})
+        entry["count"] += 1
+        entry["rss_mb"] += _mb("VmRSS")
+        entry["swap_mb"] += _mb("VmSwap")
+    ranked = sorted(totals.values(), key=lambda e: e["rss_mb"] + e["swap_mb"], reverse=True)
+    return [
+        {**e, "rss_mb": round(e["rss_mb"], 1), "swap_mb": round(e["swap_mb"], 1)}
+        for e in ranked[:limit]
+        if e["rss_mb"] + e["swap_mb"] > 0
+    ]
+
+
 def system_status(root):
     info = {
         "load_avg": None,
@@ -229,6 +268,8 @@ def system_status(root):
                         )
         except Exception:
             pass
+
+    info["top_memory"] = top_memory_processes()
 
     # Watchdog stats
     try:
@@ -380,6 +421,11 @@ def render(report):
     lines.append(
         f"서버: 부하 {load_txt} (CPU {cpu_count_txt}개) · 메모리 가용 {avail}/{total} MB · 스왑 {swap_txt} · 봇 CPU {bot_cpu}% · 메모리 {rss} MB · 스레드 {threads}"
     )
+    top = sysinfo.get("top_memory") or []
+    if top:
+        lines.append("메모리 상위: " + " · ".join(
+            f"{redact(e['name'])}×{e['count']} {e['rss_mb']:.0f}+스왑{e['swap_mb']:.0f}MB" for e in top
+        ))
     wd = sysinfo.get("watchdog")
     if isinstance(wd, dict):
         blocks_total = wd.get("blocks_total")
