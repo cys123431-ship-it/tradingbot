@@ -1,3 +1,4 @@
+#![allow(unused)] // ported test fixtures keep the Python helpers
 #![allow(
     clippy::type_complexity,
     clippy::ptr_arg,

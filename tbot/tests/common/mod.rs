@@ -1,6 +1,6 @@
 //! Shared test doubles for the SMA service tests: the Python `Fake(FakeBinance)`
 //! subclass and `Harness` from tests/test_btc_ma_cross.py.
-#![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
+#![allow(unused, dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -1975,7 +1975,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         Ok(trade)
     }
 
-    pub(crate) fn on_trade_closed(
+    pub fn on_trade_closed(
         &self,
         _network: &str,
         _mode: &str,
