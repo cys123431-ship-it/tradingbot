@@ -6,6 +6,7 @@ venv/
 *.db
 runtime/
 desktop_monitor/target/
+tbot/target/
 config.json
 prediction_paper_ledger.json
 prediction_paper_ledger.json.tmp
