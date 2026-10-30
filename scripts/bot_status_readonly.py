@@ -27,7 +27,7 @@ from bot_runtime.standalone_snapshot import exchange_network, strategy_snapshots
 
 KST = timezone(timedelta(hours=9))
 SECRET_PATTERNS = (
-    re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}\b"),                       # Telegram bot token
+    re.compile(r"(?<![0-9])\d{6,12}:[A-Za-z0-9_-]{30,}"),                 # Telegram bot token (also inside /bot<token> URLs)
     re.compile(r"(?i)\b(api[_-]?key|secret[_-]?key|secret|token|signature|password|jwt)\b(['\"]?\s*[:=]\s*['\"]?)[^\s'\",}]+"),
     re.compile(r"\b[A-Za-z0-9+_-]{40,}\b"),                                # long key-like strings (paths kept)
 )
@@ -569,8 +569,7 @@ def main(argv=None):
     parser.add_argument("--tbot-logs", action="store_true")
     args = parser.parse_args(argv)
     if args.tbot_logs:
-        print("
-".join(tbot_log_tail()))
+        print("\n".join(tbot_log_tail()))
         return 0
     if args.logs:
         print("\n".join(log_tail()))
