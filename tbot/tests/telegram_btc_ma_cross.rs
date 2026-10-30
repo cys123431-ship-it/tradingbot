@@ -643,3 +643,15 @@ async fn close_profit_lock(ctx: &Ctx, _state: Value) {
 // silence unused when a helper is only used by some tests
 #[allow(dead_code)]
 fn _touch(_s: OrderState) {}
+
+#[tokio::test]
+async fn updates_from_other_chats_are_ignored() {
+    let tmp = common::temp_dir("tg_owner");
+    let ctx = controller(&tmp);
+    let msg = json!({"update_id": 1, "message": {"chat": {"id": 999}, "text": "/stop"}});
+    assert!(ctx.bot.handle_update(&msg).await.is_empty());
+    let cb = json!({"update_id": 2, "callback_query": {"id": "q", "data": "bm:on",
+        "from": {"id": 999}, "message": {"chat": {"id": 999}, "message_id": 5}}});
+    assert!(ctx.bot.handle_update(&cb).await.is_empty());
+    assert_ne!(ctx.section()["enabled"], json!(true));
+}

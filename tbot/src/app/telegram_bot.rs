@@ -552,6 +552,10 @@ impl<A: EngineApi> TelegramBot<A> {
     // ------------------------------------------------------ update dispatch
 
     pub async fn handle_update(&self, update: &Value) -> Vec<Outgoing> {
+        // Only the configured owner chat may drive the bot (defence in depth: run() checks too).
+        if !self.is_authorized(update) {
+            return Vec::new();
+        }
         if let Some(query) = update.get("callback_query") {
             return self.handle_callback(query).await;
         }
