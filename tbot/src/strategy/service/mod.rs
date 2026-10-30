@@ -366,6 +366,11 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         self.variant.label()
     }
 
+    /// Python tests call `service._universe_cache.clear()` after a config change.
+    pub fn clear_universe_cache(&self) {
+        self.universe_cache.lock().unwrap().clear();
+    }
+
     pub(crate) fn cycle_lock(&self) -> &tokio::sync::Mutex<()> {
         &self.cycle_lock
     }

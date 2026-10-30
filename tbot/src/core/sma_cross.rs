@@ -36,7 +36,7 @@ pub struct CrossResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flat: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bar_open_ms: Option<f64>,
+    pub bar_open_ms: Option<i64>, // Python: int candle open time
     #[serde(skip_serializing_if = "Option::is_none")]
     pub close: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -161,7 +161,7 @@ pub fn evaluate_cross(
     let s_prev = slow[slow.len() - 2].unwrap_or(0.0);
     let bar = closed[closed.len() - 1];
     let span = timeframe_ms(&timeframe).unwrap_or(0);
-    result.bar_open_ms = Some(bar[0]);
+    result.bar_open_ms = Some(bar[0] as i64);
     result.close = Some(bar[4]);
     result.sma_fast = Some(f_now);
     result.sma_slow = Some(s_now);
