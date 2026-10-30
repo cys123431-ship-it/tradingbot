@@ -31,7 +31,7 @@ const STABLE_BASES: &[&str] = &[
 ];
 
 // Skip reasons recoverable within minutes: reverse/rotation retries them.
-const TRANSIENT_ENTRY_BLOCKS: &[&str] = &[
+pub(crate) const TRANSIENT_ENTRY_BLOCKS: &[&str] = &[
     "OPEN_ORDERS_UNKNOWN",
     "OPEN_ORDERS_CANCEL_FAILED",
     "POSITION_STATE_UNCERTAIN",
@@ -736,7 +736,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         (now / span) * span - span
     }
 
-    async fn evaluate_new_bar(
+    pub(crate) async fn evaluate_new_bar(
         &self,
         network: &str,
         cfg: &Value,
@@ -927,7 +927,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         lines
     }
 
-    fn opposite_signal(
+    pub(crate) fn opposite_signal(
         &self,
         cfg: &Value,
         trade: &Map<String, Value>,

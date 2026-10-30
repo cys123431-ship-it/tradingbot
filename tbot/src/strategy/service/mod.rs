@@ -14,10 +14,8 @@
 //! base methods.  Later stages append to `base.rs`'s `impl` blocks.
 
 pub mod base;
+pub mod manage;
 pub mod sma;
-mod stubs;
-mod stubs2;
-mod stubs3;
 pub mod trading;
 
 use std::collections::HashMap;

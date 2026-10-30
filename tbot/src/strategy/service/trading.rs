@@ -1742,7 +1742,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
 // Small helpers
 // ---------------------------------------------------------------------------
 
-fn py_int(v: &Value) -> i64 {
+pub(crate) fn py_int(v: &Value) -> i64 {
     match v {
         Value::Number(n) => n
             .as_i64()
