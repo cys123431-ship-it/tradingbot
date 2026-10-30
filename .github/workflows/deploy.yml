@@ -180,6 +180,18 @@ jobs:
             echo "=== Stop previous bot ==="
             PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" BOT_ENTRY="$BOT_ENTRY" "$BOT_CTL" stop
 
+            if [ -f ops/BOT_DISABLED ]; then
+              echo "=== Bot disabled by ops/BOT_DISABLED: removing reboot/health cron, not starting ==="
+              (crontab -l 2>/dev/null | grep -vF "$BOT_CTL" || true) | crontab -
+              crontab -l 2>/dev/null || echo "(crontab empty)"
+              if PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" STATE_DIR="$STATE_DIR" BOT_ENTRY="$BOT_ENTRY" "$BOT_CTL" status; then
+                echo "bot still running after stop"
+                exit 1
+              fi
+              echo "=== Deploy complete (bot stopped) ==="
+              exit 0
+            fi
+
             echo "=== Start bot ==="
             START_OK=0
             for ATTEMPT in 1 2 3; do

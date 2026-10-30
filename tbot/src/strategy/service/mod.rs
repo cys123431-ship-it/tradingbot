@@ -4,6 +4,7 @@
 //! base methods.  Later stages append to `base.rs`'s `impl` blocks.
 
 pub mod base;
+mod stubs;
 
 use std::collections::HashMap;
 use std::future::Future;
