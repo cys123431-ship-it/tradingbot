@@ -3,3 +3,4 @@ pub mod engine;
 pub mod ipc;
 pub mod telegram_api;
 pub mod telegram_bot;
+pub mod telegram_ma_cross;

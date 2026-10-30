@@ -45,6 +45,12 @@ async fn main() -> Result<(), String> {
             "3/200 SMA 크로스 전략 메뉴".to_string(),
         ),
         ("macoin".to_string(), "거래할 코인 1개 지정".to_string()),
+        ("macross".to_string(), "SMA3/SMA120 전략 메뉴".to_string()),
+        ("map".to_string(), "/macross SMA 기간 변경".to_string()),
+        (
+            "maperiod".to_string(),
+            "/macross SMA 기간 도움말".to_string(),
+        ),
         ("start".to_string(), "도움말".to_string()),
         ("help".to_string(), "도움말".to_string()),
         ("stop".to_string(), "모든 선물 전략 비상 정지".to_string()),

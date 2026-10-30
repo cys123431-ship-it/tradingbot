@@ -12,7 +12,7 @@ use crate::app::ipc::EngineApi;
 use crate::app::telegram_api::TelegramApi;
 use crate::core::periods::{
     is_default_periods, parse_period_command, periods_label, required_candle_history,
-    BTC_MA_PERIOD_COMMANDS, PERIOD_PRESETS,
+    BTC_MA_PERIOD_COMMANDS, MA_CROSS_PERIOD_COMMANDS, PERIOD_PRESETS,
 };
 
 const CONFIG_KEY: &str = "btc_ma_cross";
@@ -211,7 +211,7 @@ fn py_truthy(v: Option<&Value>) -> bool {
     }
 }
 
-fn cfg_get<'a>(cfg: &'a Value, key: &str) -> Option<&'a Value> {
+pub(crate) fn cfg_get<'a>(cfg: &'a Value, key: &str) -> Option<&'a Value> {
     cfg.as_object().and_then(|m| m.get(key))
 }
 
@@ -227,7 +227,7 @@ fn cfg_int(cfg: &Value, key: &str, default: i64) -> i64 {
         .unwrap_or(default)
 }
 
-fn markup_button(text: impl Into<String>, callback_data: impl Into<String>) -> Value {
+pub(crate) fn markup_button(text: impl Into<String>, callback_data: impl Into<String>) -> Value {
     json!({"text": text.into(), "callback_data": callback_data.into()})
 }
 
@@ -425,14 +425,14 @@ pub enum Outgoing {
 
 pub struct TelegramBot<A: EngineApi> {
     api: TelegramApi,
-    engine: Arc<A>,
+    pub(crate) engine: Arc<A>,
     owner_chat_id: i64,
     offset: i64,
     #[allow(dead_code)] // reserved for text-input prompts
     pending_input: Mutex<HashMap<i64, String>>,
 }
 
-impl<A: EngineApi> TelegramBot<A> {
+impl<A: EngineApi + 'static> TelegramBot<A> {
     pub fn new(api: TelegramApi, engine: Arc<A>, owner_chat_id: i64) -> Self {
         Self {
             api,
@@ -573,11 +573,13 @@ impl<A: EngineApi> TelegramBot<A> {
             .to_string();
         let data = query.get("data").and_then(|v| v.as_str()).unwrap_or("");
         let mut out = vec![Outgoing::Answer { callback_id }];
-        if !data.starts_with("bm:") {
+        let (text, markup) = if let Some(rest) = data.strip_prefix("bm:") {
+            self.handle_btc_ma_cross_action(rest).await
+        } else if let Some(rest) = data.strip_prefix("mc:") {
+            self.handle_ma_cross_action(rest).await
+        } else {
             return out;
-        }
-        let action = data.split_once(':').map(|x| x.1).unwrap_or("");
-        let (text, markup) = self.handle_btc_ma_cross_action(action).await;
+        };
         let (chat_id, message_id) = match query.get("message") {
             Some(msg) => (
                 msg.get("chat")
@@ -615,10 +617,21 @@ impl<A: EngineApi> TelegramBot<A> {
                 }]
             }
             "macoin" => self.handle_macoin(chat_id, &args).await,
+            "macross" => {
+                let (status, markup) = self.ma_cross_status_screen().await;
+                vec![Outgoing::Send {
+                    chat_id,
+                    text: status,
+                    markup: Some(markup),
+                }]
+            }
             "start" | "help" => self.handle_help(chat_id).await,
             "stop" => self.handle_stop(chat_id).await,
             other if BTC_MA_PERIOD_COMMANDS.contains(&other) => {
                 self.handle_period_cmd(chat_id, &args).await
+            }
+            other if MA_CROSS_PERIOD_COMMANDS.contains(&other) => {
+                self.handle_ma_period_cmd(chat_id, &args).await
             }
             _ => Vec::new(),
         }
@@ -627,9 +640,11 @@ impl<A: EngineApi> TelegramBot<A> {
     async fn handle_help(&self, chat_id: i64) -> Vec<Outgoing> {
         let text = "📖 사용 가능한 명령\n\
                     /btcmacross — 3/200 SMA 크로스 전략 메뉴\n\
+                    /macross — SMA3/SMA120 변동성 타겟 사이징 전략 메뉴\n\
                     /macoin <코인> — 거래할 코인 1개 지정 (예: /macoin SOL)\n\
                     /btcma <패스트> <슬로우> — SMA 기간 변경 (예: /btcma 1 200)\n\
                     /btcmaperiod — SMA 기간 도움말\n\
+                    /map <패스트> <슬로우> — /macross SMA 기간 변경 (예: /map 1 200)\n\
                     /stop — 모든 선물 전략 비상 정지"
             .to_string();
         vec![Outgoing::Send {
@@ -2010,7 +2025,7 @@ fn value_display(v: &Value) -> String {
 }
 
 /// Parse `text` into (command, args) the way `CommandHandler` would.
-fn parse_command(text: &str) -> (String, Vec<String>) {
+pub(crate) fn parse_command(text: &str) -> (String, Vec<String>) {
     let trimmed = text.trim();
     if !trimmed.starts_with('/') {
         return (String::new(), Vec::new());
