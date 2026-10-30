@@ -82,7 +82,7 @@ def test_report_renders_without_exchange_and_hides_keys(tmp_path, monkeypatch):
     monkeypatch.setenv("LOG_FILE", str(log))
     report = status.collect(tmp_path, with_exchange=False)
     text = status.render(report)
-    assert "3/200 SMA 크로스: ON · LIVE · 지정 SOLUSDT · 5m" in text
+    assert "3/200 SMA 크로스 (/btcmacross): ON · LIVE · 지정 SOLUSDT · 5m" in text
     assert "보유: SOLUSDT SHORT" in text and "수익확보 +4% @ 149.3" in text
     assert "ERROR boom token=[REDACTED]" in text
     dumped = json.dumps(report, default=str) + text

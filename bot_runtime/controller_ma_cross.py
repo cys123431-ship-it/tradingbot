@@ -20,7 +20,7 @@ from btc_ma_cross_plus import (
 )
 from btc_ma_cross_plus.config import LEVERAGE_CHOICES
 from trading_safety.sma_periods import (
-    PERIOD_COMMANDS,
+    MA_CROSS_PERIOD_COMMANDS,
     PERIOD_PRESETS,
     PeriodError,
     is_default_periods,
@@ -489,7 +489,7 @@ class ControllerMaCrossMixin:
             )
 
         self.tg_app.add_handler(CommandHandler("macross", owner_only(ma_cross_cmd)))
-        for name in PERIOD_COMMANDS:
+        for name in MA_CROSS_PERIOD_COMMANDS:
             self.tg_app.add_handler(CommandHandler(name, owner_only(ma_cross_period_cmd)))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(ma_cross_callback), pattern=r"^mc:"))
 

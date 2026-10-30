@@ -26,7 +26,7 @@ from btc_ma_cross.service import (
     TRADFI_SESSION_CLOSED_REASON,
 )
 from trading_safety.sma_periods import (
-    PERIOD_COMMANDS,
+    BTC_MA_PERIOD_COMMANDS,
     PERIOD_PRESETS,
     PeriodError,
     is_default_periods,
@@ -798,7 +798,7 @@ class ControllerBtcMaCrossMixin:
 
         self.tg_app.add_handler(CommandHandler("btcmacross", owner_only(btc_ma_cross_cmd)))
         self.tg_app.add_handler(CommandHandler("macoin", owner_only(btc_ma_coin_cmd)))
-        for name in PERIOD_COMMANDS:
+        for name in BTC_MA_PERIOD_COMMANDS:
             self.tg_app.add_handler(CommandHandler(name, owner_only(btc_ma_period_cmd)))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(btc_ma_cross_callback), pattern=r"^bm:"))
 

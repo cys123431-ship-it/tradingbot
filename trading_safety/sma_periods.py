@@ -17,8 +17,11 @@ DEFAULT_SLOW_PERIOD = 200
 MAX_PERIOD = 500
 MIN_WARMUP_BARS = 10
 
-# Text command aliases: "/btcma 1 200" and "/macross 5 60".
-PERIOD_COMMANDS = ("btcma", "btcmaperiod", "maperiod", "map")
+# Text commands, one set per strategy.  They must never overlap: Telegram runs
+# only the first matching handler, so a shared name would change the wrong strategy.
+BTC_MA_PERIOD_COMMANDS = ("btcma", "btcmaperiod")   # /btcmacross
+MA_CROSS_PERIOD_COMMANDS = ("map", "maperiod")      # /macross
+PERIOD_COMMANDS = BTC_MA_PERIOD_COMMANDS + MA_CROSS_PERIOD_COMMANDS
 
 # One-tap presets: (label, fast, slow).  Every slow value is a valid SMA line
 # the bot can compute with both strategies' candle_history floors.
@@ -139,6 +142,8 @@ __all__ = (
     "DEFAULT_SLOW_PERIOD",
     "MAX_PERIOD",
     "MIN_WARMUP_BARS",
+    "BTC_MA_PERIOD_COMMANDS",
+    "MA_CROSS_PERIOD_COMMANDS",
     "PERIOD_COMMANDS",
     "PERIOD_PRESETS",
     "PeriodError",

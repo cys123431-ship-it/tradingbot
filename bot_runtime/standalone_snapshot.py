@@ -15,10 +15,12 @@ from pathlib import Path
 from btc_ema_pullback.config import normalize_btc_pullback_config
 from btc_ema_pullback.ledger import trading_day_bounds
 from btc_ma_cross.config import normalize_btc_ma_cross_config
+from btc_ma_cross_plus import normalize_ma_cross_config
 
 STRATEGIES = (
     # (config key, runtime subdir, normalizer)
     ("btc_ma_cross", "btc_ma_cross", normalize_btc_ma_cross_config),
+    ("ma_cross", "ma_cross", normalize_ma_cross_config),
     ("btc_ema_pullback", "btc_ema_pullback", normalize_btc_pullback_config),
 )
 DECISION_EVENTS = {"SIGNAL", "SKIP", "ORDER", "EXIT", "FAILSAFE", "PROFIT_LOCK", "ERROR"}
@@ -119,7 +121,12 @@ def strategy_snapshots(root, config, *, now=None, events=5):
     rows = []
     for key, subdir, normalize in STRATEGIES:
         cfg = normalize(config.get(key) if isinstance(config.get(key), dict) else {})
-        label = f"3/{cfg['slow_period']} SMA 크로스" if key == "btc_ma_cross" else "BTC 눌림목"
+        if key == "btc_ma_cross":
+            label = f"{cfg.get('fast_period', 3)}/{cfg.get('slow_period', 200)} SMA 크로스 (/btcmacross)"
+        elif key == "ma_cross":
+            label = f"{cfg.get('fast_period', 3)}/{cfg.get('slow_period', 120)} SMA C (/macross)"
+        else:
+            label = "BTC 눌림목"
         mode = "LIVE" if cfg.get("trading_mode") == "LIVE" else "DRY_RUN"
         item = {
             "key": key,

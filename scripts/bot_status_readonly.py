@@ -117,15 +117,41 @@ def exchange_status(config):
     return result
 
 
-def log_errors(limit=8):
+def _log_lines(max_bytes=300_000):
     path = Path(os.environ.get("LOG_FILE") or Path.home() / "emas.log")
     try:
         with open(path, "rb") as handle:
             handle.seek(0, 2)
-            handle.seek(max(0, handle.tell() - 300_000))
-            lines = handle.read().decode("utf-8", "replace").splitlines()
+            handle.seek(max(0, handle.tell() - max_bytes))
+            return handle.read().decode("utf-8", "replace").splitlines()
     except OSError:
         return []
+
+
+def log_tail(lines=250):
+    """Last log lines plus every recent traceback in full, secrets redacted."""
+    rows = _log_lines(2_000_000)
+    blocks, i = [], 0
+    while i < len(rows):
+        if rows[i].startswith("Traceback"):
+            start = max(0, i - 2)
+            j = i + 1
+            while j < len(rows) and (rows[j].startswith((" ", "\t")) or not rows[j].strip()):
+                j += 1
+            blocks.append(rows[start:j + 1])
+            i = j
+        i += 1
+    out = ["===== 최근 traceback (최대 6개) ====="]
+    for block in blocks[-6:]:
+        out.extend(block)
+        out.append("-----")
+    out.append(f"===== 로그 마지막 {lines}줄 =====")
+    out.extend(rows[-lines:])
+    return [redact(line)[:500] for line in out]
+
+
+def log_errors(limit=8):
+    lines = _log_lines()
     hits = [line for line in lines if any(marker in line for marker in ERROR_MARKERS)]
     return [redact(line)[:300] for line in hits[-limit:]]
 
@@ -227,7 +253,11 @@ def main(argv=None):
     parser.add_argument("--root", default=str(REPO_ROOT))
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--no-exchange", action="store_true")
+    parser.add_argument("--logs", action="store_true")
     args = parser.parse_args(argv)
+    if args.logs:
+        print("\n".join(log_tail()))
+        return 0
     report = collect(Path(args.root).resolve(), with_exchange=not args.no_exchange)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, default=str))
