@@ -367,9 +367,12 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         );
         self.set_phase(network, mode, state, EXIT_FILLED, Map::new())?;
         {
+            // Release the ledger before exit_log, which reads it again.
             let ledger = self.ledger(network)?;
-            let l = ledger.lock().unwrap();
-            l.upsert_trade(&result)
+            ledger
+                .lock()
+                .unwrap()
+                .upsert_trade(&result)
                 .map_err(|e| ServiceError::new("StoreError", e.to_string()))?;
             let mut fields = Map::new();
             fields.insert("mode".into(), Value::String(mode.to_string()));
@@ -379,7 +382,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             for (k, v) in log {
                 fields.insert(k, v);
             }
-            l.event("EXIT", fields);
+            ledger.lock().unwrap().event("EXIT", fields);
         }
         self.on_trade_closed(network, mode, state, &result);
         self.set_phase(network, mode, state, TRADE_RECORDED, {
@@ -1122,9 +1125,12 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             Some(extra),
         );
         {
+            // Release the ledger before exit_log, which reads it again.
             let ledger = self.ledger(network)?;
-            let l = ledger.lock().unwrap();
-            l.upsert_trade(&result)
+            ledger
+                .lock()
+                .unwrap()
+                .upsert_trade(&result)
                 .map_err(|e| ServiceError::new("StoreError", e.to_string()))?;
             let mut fields = Map::new();
             fields.insert("mode".into(), Value::String(mode.into()));
@@ -1133,7 +1139,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             for (k, v) in log {
                 fields.insert(k, v);
             }
-            l.event("EXIT", fields);
+            ledger.lock().unwrap().event("EXIT", fields);
         }
         let (ccxt_symbol, _market) = symbol_pair(Some(&Value::Object(trade.clone())));
         let entry_id = get(&trade, "entry_client_order_id")

@@ -1642,7 +1642,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             return Ok(json!({"action": "skip", "reason": reason}));
         }
         let decision = decision.unwrap_or(Value::Null);
-        if self.mode(Some(cfg)) == "live" {
+        if mode == crate::strategy::config_base::TRADING_MODE_LIVE {
             return self
                 .enter_live(network, cfg, state, signal, &decision, &context)
                 .await;
@@ -1678,7 +1678,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             "balance_source".to_string(),
             Value::String(balance_source.to_string()),
         );
-        if mode == "live" {
+        if mode == crate::strategy::config_base::TRADING_MODE_LIVE {
             let positions = match self.fetch_account_positions(network).await {
                 Ok(p) => p,
                 Err(err) => {
