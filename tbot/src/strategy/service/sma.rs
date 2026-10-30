@@ -298,7 +298,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         ))
     }
 
-    async fn volume_universe(
+    pub async fn volume_universe(
         &self,
         network: &str,
         cfg: &Value,
@@ -574,7 +574,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         out
     }
 
-    pub(crate) async fn tradfi_universe(
+    pub async fn tradfi_universe(
         &self,
         network: &str,
         cfg: &Value,
