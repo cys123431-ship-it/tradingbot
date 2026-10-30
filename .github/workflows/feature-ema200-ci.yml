@@ -47,3 +47,29 @@ jobs:
         run: python -m pytest -q
       - name: Diff check
         run: git diff --check origin/main...HEAD
+
+  tbot-rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tbot
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python deps for golden data
+        working-directory: .
+        run: python -m pip install -r requirements.txt
+      - name: Golden data matches the Python originals
+        working-directory: .
+        run: |
+          python scripts/tbot_golden.py tbot/tests/golden.json
+          python scripts/tbot_golden_plus.py tbot/tests/golden_plus.json
+          python scripts/tbot_golden_store.py tbot/tests/golden_store.json
+          git diff --exit-code -- tbot/tests/
+      - name: Rust fmt, clippy, tests
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
