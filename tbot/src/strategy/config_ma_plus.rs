@@ -2,7 +2,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::core::ma_plus::{feature_mode, FEATURES, FEATURE_FIELDS};
+pub use crate::core::ma_plus::{feature_mode, FEATURES, FEATURE_FIELDS};
 use crate::core::periods::apply_periods;
 use crate::strategy::config_base::{
     py_bool, py_decimal_text, py_int, NETWORKS, NETWORK_TESTNET, TRADING_MODES,
