@@ -525,7 +525,7 @@ impl<E: FuturesExchange> IdempotentOrderGateway<E> {
         Ok(None)
     }
 
-    async fn fetch_order_by_client_id(
+    pub async fn fetch_order_by_client_id(
         &self,
         symbol: &str,
         client_order_id: &str,

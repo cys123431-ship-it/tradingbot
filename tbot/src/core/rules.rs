@@ -100,7 +100,7 @@ fn d_str(s: &str, default: Option<&str>) -> Result<Decimal, TradingRulesError> {
 }
 
 /// Parsed Binance trading rules for one symbol.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TradingRules {
     pub symbol: String,
     pub tick_size: Decimal,
