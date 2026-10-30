@@ -35,7 +35,6 @@ async fn main() {
 }
 
 /// Same checks through the ccxt-shaped facade the strategies use.
-
 async fn facade_smoke(symbol: &str, interval: &str) {
     use tbot::exchange::binance_futures::BinanceFutures;
     use tbot::exchange::FuturesExchange;
