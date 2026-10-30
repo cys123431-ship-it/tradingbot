@@ -530,7 +530,9 @@ class SignalScannerMixin:
                     rows,
                     columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'],
                 )
-                _, _, detail = self._calculate_utbot_signal(
+                # Row-wise pandas work; keep it off the event loop so Telegram stays responsive.
+                _, _, detail = await asyncio.to_thread(
+                    self._calculate_utbot_signal,
                     df,
                     self._get_ema200_utbot_signal_params(strategy_params),
                 )

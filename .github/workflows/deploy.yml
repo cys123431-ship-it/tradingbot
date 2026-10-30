@@ -109,6 +109,9 @@ jobs:
             git reset --hard origin/main
             git clean -fd -e venv/ -e runtime/
 
+            echo "=== Ensure swap ==="
+            bash scripts/ensure_swap.sh || true
+
             echo "=== Restore config ==="
             if [ -f "$CONFIG_BACKUP" ]; then
               cp "$CONFIG_BACKUP" config.json

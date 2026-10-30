@@ -134,6 +134,8 @@ def system_status(root):
         "cpu_count": None,
         "mem_total_mb": None,
         "mem_available_mb": None,
+        "swap_total_mb": None,
+        "swap_free_mb": None,
         "bot_pid": None,
         "bot_rss_mb": None,
         "bot_cpu_percent": None,
@@ -173,6 +175,8 @@ def system_status(root):
                     return None
             info["mem_total_mb"] = _kb_mb("MemTotal")
             info["mem_available_mb"] = _kb_mb("MemAvailable")
+            info["swap_total_mb"] = _kb_mb("SwapTotal")
+            info["swap_free_mb"] = _kb_mb("SwapFree")
     except Exception:
         pass
 
@@ -368,10 +372,13 @@ def render(report):
     bot_cpu = "-" if bot_cpu is None else f"{bot_cpu:.1f}"
     rss = sysinfo.get("bot_rss_mb")
     rss = "-" if rss is None else f"{rss:.1f}"
+    swap_total = sysinfo.get("swap_total_mb")
+    swap_free = sysinfo.get("swap_free_mb")
+    swap_txt = "-" if swap_total is None else (f"{swap_total - (swap_free or 0)}/{swap_total} MB" if swap_total else "없음")
     threads = sysinfo.get("bot_threads")
     threads = "-" if threads is None else str(threads)
     lines.append(
-        f"서버: 부하 {load_txt} (CPU {cpu_count_txt}개) · 메모리 가용 {avail}/{total} MB · 봇 CPU {bot_cpu}% · 메모리 {rss} MB · 스레드 {threads}"
+        f"서버: 부하 {load_txt} (CPU {cpu_count_txt}개) · 메모리 가용 {avail}/{total} MB · 스왑 {swap_txt} · 봇 CPU {bot_cpu}% · 메모리 {rss} MB · 스레드 {threads}"
     )
     wd = sysinfo.get("watchdog")
     if isinstance(wd, dict):

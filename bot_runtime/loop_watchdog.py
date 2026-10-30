@@ -178,10 +178,9 @@ class LoopWatchdog:
                 self._last_block_sec = float(block_sec)
                 self._last_block_at = now_wall
                 self._updated_at = now_wall
-                max_so_far = self._max_block_sec
             try:
                 self._logger.warning(
-                    "EVENT_LOOP_RESUMED after %.1fs", float(max_so_far)
+                    "EVENT_LOOP_RESUMED after %.1fs", float(block_sec)
                 )
             except Exception as exc:  # pragma: no cover
                 self._logger.debug("LoopWatchdog: resumed warn failed: %s", exc)
