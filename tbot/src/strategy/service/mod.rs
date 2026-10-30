@@ -15,6 +15,8 @@
 
 pub mod base;
 mod stubs;
+mod stubs2;
+pub mod trading;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -369,3 +371,9 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
 // Suppress unused warning for the Map import when later stages haven't needed it yet.
 #[allow(dead_code)]
 fn _assert_map_type(_m: Option<&Map<String, Value>>) {}
+
+/// `decision["rules"]` holds a serialized `TradingRules` (Python kept the object).
+pub fn rules_from_value(value: &Value) -> Result<crate::core::rules::TradingRules, ServiceError> {
+    serde_json::from_value(value.clone())
+        .map_err(|e| ServiceError::new("ValueError", format!("invalid trading rules: {e}")))
+}

@@ -38,16 +38,6 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         Err(ServiceError::new("NotImplemented", "manage_live"))
     }
 
-    // STUBS: reconcile_live(network,cfg,state) -> Result<(), ServiceError>
-    pub async fn reconcile_live(
-        &self,
-        _network: &str,
-        _cfg: &Value,
-        _state: &mut Map<String, Value>,
-    ) -> Result<(), ServiceError> {
-        Err(ServiceError::new("NotImplemented", "reconcile_live"))
-    }
-
     // STUBS: verify_protection(network,cfg,state) -> Result<(), ServiceError>
     pub async fn verify_protection(
         &self,
@@ -77,61 +67,6 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         _signal: &Value,
     ) -> Result<(Option<Value>, String, Map<String, Value>), ServiceError> {
         Err(ServiceError::new("NotImplemented", "pre_trade_validation"))
-    }
-
-    // STUBS: enter_paper(network,cfg,state,signal,decision,context) -> Result<Value,ServiceError>
-    pub async fn enter_paper(
-        &self,
-        _network: &str,
-        _cfg: &Value,
-        _state: &mut Map<String, Value>,
-        _signal: &Value,
-        _decision: &Value,
-        _context: &Map<String, Value>,
-    ) -> Result<Value, ServiceError> {
-        Err(ServiceError::new("NotImplemented", "enter_paper"))
-    }
-
-    // STUBS: enter_live(network,cfg,state,signal,decision,context) -> Result<Value,ServiceError>
-    pub async fn enter_live(
-        &self,
-        _network: &str,
-        _cfg: &Value,
-        _state: &mut Map<String, Value>,
-        _signal: &Value,
-        _decision: &Value,
-        _context: &Map<String, Value>,
-    ) -> Result<Value, ServiceError> {
-        Err(ServiceError::new("NotImplemented", "enter_live"))
-    }
-
-    // STUBS: finalize_paper(network,cfg,state,exit_price,exit_reason,exit_ms) -> Result<Value,ServiceError>
-    pub async fn finalize_paper(
-        &self,
-        _network: &str,
-        _cfg: &Value,
-        _state: &mut Map<String, Value>,
-        _exit_price: f64,
-        _exit_reason: &str,
-        _exit_ms: i64,
-    ) -> Result<Value, ServiceError> {
-        Err(ServiceError::new("NotImplemented", "finalize_paper"))
-    }
-
-    // STUBS: finalize_live(network,cfg,state,forced_reason: Option<&str>) -> Result<Value,ServiceError>
-    pub async fn finalize_live(
-        &self,
-        _network: &str,
-        _cfg: &Value,
-        _state: &mut Map<String, Value>,
-        _forced_reason: Option<&str>,
-    ) -> Result<Value, ServiceError> {
-        Err(ServiceError::new("NotImplemented", "finalize_live"))
-    }
-
-    // STUBS: close_position(reason: &str) -> Result<Value,ServiceError>
-    pub async fn close_position(&self, _reason: &str) -> Result<Value, ServiceError> {
-        Err(ServiceError::new("NotImplemented", "close_position"))
     }
 
     // STUBS: scan_universe(network,cfg) -> Result<Vec<(String,String,Option<f64>)>,ServiceError>
