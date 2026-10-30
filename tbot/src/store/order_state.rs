@@ -531,7 +531,7 @@ fn sha_hex12(input: &str) -> String {
     hex.chars().take(12).collect()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OrderRecord {
     pub client_order_id: String,
     pub symbol: String,
