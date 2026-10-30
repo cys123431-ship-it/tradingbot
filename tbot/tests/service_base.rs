@@ -39,8 +39,7 @@ fn build_service(
     let creds = Arc::new(creds);
     let exchange = FakeBinance::new(FakeOptions::default());
     let exchange = Arc::new(exchange);
-    let config_getter: Arc<dyn Fn() -> Value + Send + Sync> =
-        Arc::new(move || config.clone());
+    let config_getter: Arc<dyn Fn() -> Value + Send + Sync> = Arc::new(move || config.clone());
     let creds_arc = creds.clone();
     let credentials_getter: Arc<dyn Fn(&str) -> Value + Send + Sync> =
         Arc::new(move |_n: &str| (*creds_arc).clone());
@@ -153,4 +152,3 @@ fn _touches() {
     let _: HashSet<String> = HashSet::new();
     let _ = Mutex::new(());
 }
-

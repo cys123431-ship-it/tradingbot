@@ -9,6 +9,7 @@ use serde_json::{json, Map, Value};
 
 use crate::core::rules::rules_from_exchange_info;
 use crate::exchange::ExchangeError;
+use crate::exchange::FuturesExchange;
 use crate::safety::algo_gateway::BinanceAlgoOrderGateway;
 use crate::safety::order_gateway::IdempotentOrderGateway;
 use crate::store::ledger::{
@@ -20,7 +21,6 @@ use crate::strategy::service::{
     iso_ms, market_key, position_entry, position_qty, position_side, py_f, symbol_pair, BoxFut,
     ServiceError, SmaCrossService, IDLE, MARKET_ID, POSITION_RECONCILIATION,
 };
-use crate::exchange::FuturesExchange;
 
 impl<E: FuturesExchange + 'static> SmaCrossService<E> {
     // ------------------------------------------------------------------ basics
@@ -113,13 +113,17 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 return Ok(l.clone());
             }
         }
-        std::fs::create_dir_all(&self.runtime_dir).map_err(|e| {
-            ServiceError::new("StoreError", format!("ledger dir: {e}"))
-        })?;
+        std::fs::create_dir_all(&self.runtime_dir)
+            .map_err(|e| ServiceError::new("StoreError", format!("ledger dir: {e}")))?;
         let db = self.runtime_dir.join(format!("{network}_trades.sqlite3"));
         let events = self.runtime_dir.join(format!("{network}_events.jsonl"));
-        let ledger = StrategyLedger::open(&db, &events, self.deps.store_clock.clone(), self.variant.strategy_version())
-            .map_err(|e| ServiceError::new("StoreError", e.to_string()))?;
+        let ledger = StrategyLedger::open(
+            &db,
+            &events,
+            self.deps.store_clock.clone(),
+            self.variant.strategy_version(),
+        )
+        .map_err(|e| ServiceError::new("StoreError", e.to_string()))?;
         let arc = Arc::new(Mutex::new(ledger));
         self.ledgers
             .lock()
@@ -139,9 +143,8 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 return Ok(s.clone());
             }
         }
-        std::fs::create_dir_all(&self.runtime_dir).map_err(|e| {
-            ServiceError::new("StoreError", format!("store dir: {e}"))
-        })?;
+        std::fs::create_dir_all(&self.runtime_dir)
+            .map_err(|e| ServiceError::new("StoreError", format!("store dir: {e}")))?;
         let path = self.runtime_dir.join(format!("{network}_orders.sqlite3"));
         let store = SQLiteTradingStateStore::open(&path, self.deps.store_clock.clone())
             .map_err(|e| ServiceError::new("StoreError", e.to_string()))?;
@@ -228,7 +231,11 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
     }
 
     /// `load_state(network, mode)`.
-    pub fn load_state(&self, network: &str, mode: &str) -> Result<Map<String, Value>, ServiceError> {
+    pub fn load_state(
+        &self,
+        network: &str,
+        mode: &str,
+    ) -> Result<Map<String, Value>, ServiceError> {
         let ledger = self.ledger(network)?;
         let current = ledger
             .lock()
@@ -242,9 +249,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         state
             .entry("phase".to_string())
             .or_insert(Value::String(IDLE.to_string()));
-        state
-            .entry("trade".to_string())
-            .or_insert(Value::Null);
+        state.entry("trade".to_string()).or_insert(Value::Null);
         state
             .entry("processed_signals".to_string())
             .or_insert(Value::Array(Vec::new()));
@@ -301,10 +306,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         phase: &str,
         extra: Map<String, Value>,
     ) -> Result<(), ServiceError> {
-        let previous = state
-            .get("phase")
-            .cloned()
-            .unwrap_or(Value::Null);
+        let previous = state.get("phase").cloned().unwrap_or(Value::Null);
         state.insert("phase".to_string(), Value::String(phase.to_string()));
         for (k, v) in extra {
             state.insert(k, v);
@@ -338,7 +340,9 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             let map = self.rules.lock().unwrap();
             if let Some((at, cached)) = map.get(&key) {
                 if now - *at < refresh_ms {
-                    if let Ok(r) = serde_json::from_value::<crate::core::rules::TradingRules>(cached.clone()) {
+                    if let Ok(r) =
+                        serde_json::from_value::<crate::core::rules::TradingRules>(cached.clone())
+                    {
                         return Ok(r);
                     }
                 }
@@ -365,8 +369,8 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         };
         let rules = rules_from_exchange_info(&payload, market_id)
             .map_err(|e| ServiceError::new("TradingRulesError", format!("{e:?}")))?;
-        let rules_json =
-            serde_json::to_value(&rules).map_err(|e| ServiceError::new("TradingRulesError", e.to_string()))?;
+        let rules_json = serde_json::to_value(&rules)
+            .map_err(|e| ServiceError::new("TradingRulesError", e.to_string()))?;
         self.rules
             .lock()
             .unwrap()
@@ -421,7 +425,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             .ok_or_else(|| ServiceError::new("ValueError", "invalid premiumIndex response"))?;
         let mark_price = py_f(obj.get("markPrice"), 0.0);
         if mark_price <= 0.0 {
-            return Err(ServiceError::new("ValueError", "invalid premiumIndex response"));
+            return Err(ServiceError::new(
+                "ValueError",
+                "invalid premiumIndex response",
+            ));
         }
         let mut out = Map::new();
         out.insert("mark_price".to_string(), serde_json::json!(mark_price));
@@ -515,7 +522,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             .timestamp_opt(secs as i64, 0)
             .single()
             .unwrap_or_else(Utc::now);
-        let tz = cfg.get("day_timezone").and_then(|v| v.as_str()).unwrap_or("UTC");
+        let tz = cfg
+            .get("day_timezone")
+            .and_then(|v| v.as_str())
+            .unwrap_or("UTC");
         let (start, end, day_key) = trading_day_bounds(now_dt, tz);
         let key = format!("day_start_equity:{mode}");
         let ledger = self.ledger(network)?;
@@ -578,7 +588,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             .timestamp_opt(secs as i64, 0)
             .single()
             .unwrap_or_else(Utc::now);
-        let tz = cfg.get("day_timezone").and_then(|v| v.as_str()).unwrap_or("UTC");
+        let tz = cfg
+            .get("day_timezone")
+            .and_then(|v| v.as_str())
+            .unwrap_or("UTC");
         let (start, end, day_key) = trading_day_bounds(now_dt, tz);
         let ledger = self.ledger(&network)?;
         let trades_today = {
@@ -607,7 +620,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         map.insert("config".to_string(), cfg);
         map.insert("mode".to_string(), Value::String(mode));
         map.insert("network".to_string(), Value::String(network.clone()));
-        map.insert("has_credentials".to_string(), Value::Bool(self.has_credentials(&network)));
+        map.insert(
+            "has_credentials".to_string(),
+            Value::Bool(self.has_credentials(&network)),
+        );
         map.insert("state".to_string(), Value::Object(state));
         map.insert("day".to_string(), Value::String(day_key));
         map.insert(
@@ -619,7 +635,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             last_signal.unwrap_or(Value::Null),
         );
         map.insert("last_skip".to_string(), last_skip.unwrap_or(Value::Null));
-        map.insert("stats".to_string(), Value::Object(compute_stats(&all_trades)));
+        map.insert(
+            "stats".to_string(),
+            Value::Object(compute_stats(&all_trades)),
+        );
         Ok(Value::Object(map))
     }
 
@@ -643,7 +662,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         let mut state = self.load_state(&network, &mode)?;
         // Python wraps everything below in one try/except: any failure becomes
         // an "error" result recorded in state and the ledger.
-        match self.run_cycle_inner(&network, &cfg, &mode, &mut state).await {
+        match self
+            .run_cycle_inner(&network, &cfg, &mode, &mut state)
+            .await
+        {
             Ok(value) => Ok(value),
             Err(exc) => {
                 let msg = format!("{}: {}", exc.class, exc.message);
@@ -705,10 +727,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
     // --------------------------------------------------------------- LIVE: io
 
     /// `fetch_account_positions(network)`.
-    pub async fn fetch_account_positions(
-        &self,
-        network: &str,
-    ) -> Result<Vec<Value>, ServiceError> {
+    pub async fn fetch_account_positions(&self, network: &str) -> Result<Vec<Value>, ServiceError> {
         let exchange = self.exchange(network).await?;
         let positions = exchange.fetch_positions(None).await?;
         Ok(positions
@@ -724,7 +743,9 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         symbol: &str,
     ) -> Result<Option<Value>, ServiceError> {
         let exchange = self.exchange(network).await?;
-        let positions = exchange.fetch_positions(Some(vec![symbol.to_string()])).await?;
+        let positions = exchange
+            .fetch_positions(Some(vec![symbol.to_string()]))
+            .await?;
         let want = market_key(Some(symbol));
         for row in positions {
             let row_market = row
@@ -769,7 +790,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                     })
                     .unwrap_or_default();
                 if flag.to_lowercase() == "true" {
-                    return Ok("POSITION_MODE_HEDGE: 바이낸스에서 One-way 모드로 바꾼 뒤 다시 켜세요".to_string());
+                    return Ok(
+                        "POSITION_MODE_HEDGE: 바이낸스에서 One-way 모드로 바꾼 뒤 다시 켜세요"
+                            .to_string(),
+                    );
                 }
             }
             Err(exc) => {
@@ -817,7 +841,11 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             .to_lowercase();
         let want_lev = py_int_of(&cfg["leverage"]);
         if leverage != want_lev || margin_type != "isolated" {
-            let shown = if margin_type.is_empty() { "?" } else { margin_type.as_str() };
+            let shown = if margin_type.is_empty() {
+                "?"
+            } else {
+                margin_type.as_str()
+            };
             return Ok(format!(
                 "ACCOUNT_SETUP_MISMATCH: leverage {leverage}x / {shown} (need {want_lev}x isolated)"
             ));
@@ -832,7 +860,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         fields.insert("symbol".to_string(), Value::String(market));
         fields.insert("leverage".to_string(), json!(leverage));
         fields.insert("margin_type".to_string(), Value::String(margin_type));
-        fields.insert("position_mode".to_string(), Value::String("ONE_WAY".to_string()));
+        fields.insert(
+            "position_mode".to_string(),
+            Value::String("ONE_WAY".to_string()),
+        );
         ledger.lock().unwrap().event("ACCOUNT_SETUP", fields);
         Ok(String::new())
     }
@@ -846,7 +877,9 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         let (_, algo) = self.gateway(network).await?;
         let snapshot = algo.fetch_open_orders().await;
         if !snapshot.ok {
-            let err = snapshot.error.unwrap_or_else(|| "open algo orders unavailable".to_string());
+            let err = snapshot
+                .error
+                .unwrap_or_else(|| "open algo orders unavailable".to_string());
             return Err(ServiceError::new("RuntimeError", err));
         }
         if market_id.is_none() {
@@ -917,13 +950,19 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             }
             if client_id.starts_with(client_prefix) {
                 if let Err(exc) = self.cancel_algo(network, &client_id).await {
-                    return Ok(format!("OPEN_ORDERS_CANCEL_FAILED: {client_id}: {}", exc.message));
+                    return Ok(format!(
+                        "OPEN_ORDERS_CANCEL_FAILED: {client_id}: {}",
+                        exc.message
+                    ));
                 }
                 let ledger = self.ledger(network)?;
                 let mut fields = Map::new();
                 fields.insert("network".to_string(), Value::String(network.to_string()));
                 fields.insert("client_algo_id".to_string(), Value::String(client_id));
-                ledger.lock().unwrap().event("CANCEL_STRAY_PROTECTION", fields);
+                ledger
+                    .lock()
+                    .unwrap()
+                    .event("CANCEL_STRAY_PROTECTION", fields);
             } else {
                 let id = if client_id.is_empty() {
                     order
@@ -1033,7 +1072,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 .unwrap()
                 .release_entry_lease(&record.client_order_id, final_state)
                 .map_err(|e| ServiceError::new("StoreError", e.to_string()))?;
-            resolved.push(format!("{}:{}:{}", record.symbol, record.client_order_id, prior));
+            resolved.push(format!(
+                "{}:{}:{}",
+                record.symbol, record.client_order_id, prior
+            ));
         }
         if kept.is_empty() {
             let lease = store
@@ -1084,7 +1126,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 "kept".to_string(),
                 Value::Array(kept.iter().map(|s| Value::String(s.clone())).collect()),
             );
-            ledger.lock().unwrap().event("STALE_ORDER_RECORDS_RESOLVED", fields);
+            ledger
+                .lock()
+                .unwrap()
+                .event("STALE_ORDER_RECORDS_RESOLVED", fields);
             let head: Vec<String> = resolved.iter().take(3).cloned().collect();
             let body = format!(
                 "🧹 {}: 체결되지 않고 남아 있던 주문 기록을 정리했습니다 ({}건). 신규 진입 차단이 풀렸습니다.\n{}",
@@ -1103,7 +1148,11 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         let Some(network) = self.current_network(Some(&cfg)) else {
             return false;
         };
-        if cfg.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if cfg
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             return true;
         }
         let Ok(state) = self.load_state(&network, &self.mode(Some(&cfg))) else {
@@ -1155,7 +1204,9 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
 
     // ---------------------------------------------------------------- helpers
 
-    pub(crate) fn set_store_clock_validated(store_clock: Arc<dyn crate::store::clock::Clock>) -> Arc<dyn crate::store::clock::Clock> {
+    pub(crate) fn set_store_clock_validated(
+        store_clock: Arc<dyn crate::store::clock::Clock>,
+    ) -> Arc<dyn crate::store::clock::Clock> {
         store_clock
     }
 }
@@ -1177,11 +1228,7 @@ fn py_int_of(v: &Value) -> i64 {
                 0
             }
         }
-        Value::String(s) => s
-            .trim()
-            .parse::<f64>()
-            .map(|f| f as i64)
-            .unwrap_or(0),
+        Value::String(s) => s.trim().parse::<f64>().map(|f| f as i64).unwrap_or(0),
         _ => 0,
     }
 }
@@ -1195,10 +1242,7 @@ fn py_str_or_default(v: &Value) -> Option<String> {
 }
 
 fn has_trade(state: &Map<String, Value>) -> bool {
-    state
-        .get("trade")
-        .map(|v| !v.is_null())
-        .unwrap_or(false)
+    state.get("trade").map(|v| !v.is_null()).unwrap_or(false)
 }
 
 fn has_pending(state: &Map<String, Value>) -> bool {
@@ -1236,7 +1280,6 @@ fn phase_idle_or_missing(state: &Map<String, Value>) -> bool {
 // it remains dead-code-silent if the S2..S4 stubs are unused in tests.
 #[allow(dead_code)]
 fn _touch_box_fut(_: BoxFut<()>) {}
-
 
 /// Python truthiness of an optional JSON value.
 pub(crate) fn py_truthy(v: Option<&Value>) -> bool {

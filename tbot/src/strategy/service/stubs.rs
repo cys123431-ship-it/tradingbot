@@ -152,7 +152,9 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         _cfg: &Value,
         _state: &mut Map<String, Value>,
     ) -> Result<Value, ServiceError> {
-        Err(ServiceError::new("NotImplemented", "run_pending_entry_mode_switch"))
+        Err(ServiceError::new(
+            "NotImplemented",
+            "run_pending_entry_mode_switch",
+        ))
     }
 }
-
