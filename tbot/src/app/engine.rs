@@ -10,28 +10,32 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Map, Value};
 
 use crate::app::config_file::{credentials, dump_indent4, main_network, ConfigFile};
-use crate::app::ipc::{self, BoxFut, Handler, Request};
+use crate::app::ipc::{self, BoxFut, EngineApi, Handler, Request};
 use crate::app::telegram_api::TelegramApi;
 use crate::exchange::binance::{BinanceClient, Credentials, Network};
 use crate::exchange::binance_futures::BinanceFutures;
+use crate::exchange::FuturesExchange;
 use crate::store::clock::{Clock, SystemClock};
 use crate::strategy::service::{ServiceDeps, SmaCrossService, Variant};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HEARTBEAT_FILE: &str = "tbot_engine_heartbeat.json";
 
-pub struct Engine {
+/// Coin list size requested by the Telegram "pick a coin" keyboard.
+const PICK_LIST_SIZE: usize = 12;
+
+pub struct Engine<E: FuturesExchange + 'static> {
     cfg: Arc<ConfigFile>,
-    btc_ma: Arc<SmaCrossService<BinanceFutures>>,
-    ma_plus: Arc<SmaCrossService<BinanceFutures>>,
+    btc_ma: Arc<SmaCrossService<E>>,
+    ma_plus: Arc<SmaCrossService<E>>,
     #[allow(dead_code)] // notices go through the service notifier
     telegram: Option<TelegramApi>,
     started_at: i64,
     runtime_dir: PathBuf,
 }
 
-impl Engine {
-    pub fn from_env() -> Result<Engine, String> {
+impl Engine<BinanceFutures> {
+    pub fn from_env() -> Result<Engine<BinanceFutures>, String> {
         let cfg_path =
             std::env::var("TBOT_CONFIG").unwrap_or_else(|_| "../config.json".to_string());
         let runtime_dir = ipc::runtime_dir();
@@ -76,6 +80,25 @@ impl Engine {
             started_at,
             runtime_dir,
         })
+    }
+}
+
+impl<E: FuturesExchange + 'static> Engine<E> {
+    /// Build an engine around caller-provided services (used by tests).
+    pub fn with_services(
+        cfg: Arc<ConfigFile>,
+        runtime_dir: PathBuf,
+        btc_ma: Arc<SmaCrossService<E>>,
+        ma_plus: Arc<SmaCrossService<E>>,
+    ) -> Engine<E> {
+        Engine {
+            cfg,
+            btc_ma,
+            ma_plus,
+            telegram: None,
+            started_at: now_secs(),
+            runtime_dir,
+        }
     }
 
     pub async fn run(self: Arc<Self>) -> Result<(), String> {
@@ -137,7 +160,7 @@ impl Engine {
         Ok(())
     }
 
-    async fn strategy_loop(&self, service: Arc<SmaCrossService<BinanceFutures>>) {
+    async fn strategy_loop(&self, service: Arc<SmaCrossService<E>>) {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         loop {
             let mut interval: i64 = 10;
@@ -206,10 +229,7 @@ impl Engine {
         }
     }
 
-    async fn last_action(
-        &self,
-        service: &Arc<SmaCrossService<BinanceFutures>>,
-    ) -> Result<Value, String> {
+    async fn last_action(&self, service: &Arc<SmaCrossService<E>>) -> Result<Value, String> {
         let network = service
             .current_network(None)
             .ok_or_else(|| "ValueError: unsupported exchange mode".to_string())?;
@@ -221,13 +241,18 @@ impl Engine {
         Ok(state.get("last_action").cloned().unwrap_or(Value::Null))
     }
 
-    async fn handle(&self, req: Request) -> Result<Value, String> {
+    pub async fn handle(&self, req: Request) -> Result<Value, String> {
         match req.cmd.as_str() {
             "ping" => Ok(json!({
                 "pid": std::process::id(),
                 "started_at": self.started_at,
                 "version": VERSION,
             })),
+            // Python controllers read service.config(): the normalized section.
+            "config_get" if req.strategy.is_some() && req.arg_str("section").is_none() => {
+                let service = self.service_for(&req)?;
+                Ok(service.config())
+            }
             "config_get" => {
                 let section = req
                     .arg_str("section")
@@ -439,11 +464,61 @@ impl Engine {
                 Ok(Value::Array(events))
             }
             "emergency_stop" => self.emergency_stop().await,
+            "turn_off_others" => {
+                let except = req.arg_str("except").unwrap_or_default();
+                self.turn_off_others(&except).await
+            }
+            "reset_counters" => {
+                let service = self.service_for(&req)?;
+                let network = req
+                    .arg_str("network")
+                    .or_else(|| service.current_network(None))
+                    .ok_or_else(|| "ValueError: missing network".to_string())?;
+                let mut state = service
+                    .load_state(&network, &service.mode(None))
+                    .map_err(|e| e.to_string())?;
+                state.insert("profit_lock_exit_count".into(), json!(0));
+                state.insert("entry_mode_forced_cross".into(), json!(false));
+                state.insert("pending_entry_mode_switch".into(), Value::Null);
+                let mode = service.mode(None);
+                service
+                    .save_state(&network, &mode, &mut state)
+                    .map_err(|e| e.to_string())?;
+                Ok(Value::Object(state))
+            }
+            "pick_universe" => {
+                let service = self.service_for(&req)?;
+                let network = req
+                    .arg_str("network")
+                    .or_else(|| service.current_network(None))
+                    .ok_or_else(|| "ValueError: missing network".to_string())?;
+                let mut cfg = service.config();
+                if let Some(map) = cfg.as_object_mut() {
+                    map.insert("scan_scope".to_string(), Value::String("alts".to_string()));
+                }
+                let mut coins: Vec<String> = vec!["BTCUSDT".to_string()];
+                match service.scan_universe(&network, &cfg).await {
+                    Ok(items) => {
+                        for (_symbol, market_id, _vol) in items {
+                            if !coins.iter().any(|c| c == &market_id) {
+                                coins.push(market_id);
+                            }
+                            if coins.len() >= PICK_LIST_SIZE {
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log_line(&format!("3/200 SMA coin list unavailable: {e}"));
+                    }
+                }
+                Ok(Value::Array(coins.into_iter().map(Value::String).collect()))
+            }
             other => Err(format!("ValueError: unknown cmd {other}")),
         }
     }
 
-    fn service_for(&self, req: &Request) -> Result<Arc<SmaCrossService<BinanceFutures>>, String> {
+    fn service_for(&self, req: &Request) -> Result<Arc<SmaCrossService<E>>, String> {
         let variant = req
             .strategy
             .as_deref()
@@ -458,6 +533,57 @@ impl Engine {
             "btc_ma" => Ok(Arc::clone(&self.btc_ma)),
             "ma_plus" => Ok(Arc::clone(&self.ma_plus)),
             other => Err(format!("ValueError: unknown strategy {other}")),
+        }
+    }
+
+    /// Another futures strategy took over: switch the others OFF.
+    async fn turn_off_others(&self, except_key: &str) -> Result<Value, String> {
+        let strategies = [
+            ("btc_ma_cross", "3/200 SMA", "/btcmacross"),
+            ("ma_cross", "SMA3/120 C", "/macross"),
+        ];
+        for (key, label, command) in strategies {
+            if key == except_key {
+                continue;
+            }
+            let enabled = self
+                .cfg
+                .section(key)
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !enabled {
+                continue;
+            }
+            let mut changes = Map::new();
+            changes.insert("enabled".to_string(), Value::Bool(false));
+            if let Err(e) = self.cfg.update_values(key, changes).await {
+                log_line(&format!("engine: could not switch {key} off: {e}"));
+                continue;
+            }
+            let text = format!(
+                "⏹ 다른 선물 전략이 켜져서 {label} 전략 신규 진입을 OFF 했습니다.\n\
+                 이 전략이 보유한 포지션은 계속 관리합니다. 다시 켜려면 {command}"
+            );
+            self.notify(text).await;
+        }
+        Ok(Value::Null)
+    }
+
+    async fn notify(&self, text: String) {
+        let Some(api) = self.telegram.clone() else {
+            return;
+        };
+        let (_, chat) = telegram_settings(&self.cfg.load());
+        let Some(chat) = chat else {
+            return;
+        };
+        if chat.trim().is_empty() {
+            return;
+        }
+        match api.send_message(chat.trim(), &text, None).await {
+            Ok(_) => {}
+            Err(e) => log_line(&format!("engine: notify failed: {e}")),
         }
     }
 
@@ -510,6 +636,23 @@ impl Engine {
             }
         }
         Ok(json!({"lines": lines}))
+    }
+}
+
+impl<E: FuturesExchange + 'static> EngineApi for Arc<Engine<E>> {
+    fn call(
+        &self,
+        cmd: &str,
+        strategy: Option<&str>,
+        args: Value,
+    ) -> BoxFut<Result<Value, String>> {
+        let engine = Arc::clone(self);
+        let req = Request {
+            cmd: cmd.to_string(),
+            strategy: strategy.map(|s| s.to_string()),
+            args,
+        };
+        Box::pin(async move { engine.handle(req).await })
     }
 }
 

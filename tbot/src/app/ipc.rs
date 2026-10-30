@@ -18,6 +18,12 @@ pub const TOKEN_FILE: &str = "tbot_ipc.token";
 pub type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 pub type Handler = Arc<dyn Fn(Request) -> BoxFut<Result<Value, String>> + Send + Sync>;
 
+/// Uniform façade over the engine used by the Telegram process and tests.
+pub trait EngineApi: Send + Sync {
+    fn call(&self, cmd: &str, strategy: Option<&str>, args: Value)
+        -> BoxFut<Result<Value, String>>;
+}
+
 #[derive(Debug, Clone)]
 pub struct Request {
     pub cmd: String,
@@ -118,6 +124,7 @@ pub fn ensure_token(runtime: &std::path::Path) -> Result<String, String> {
     Ok(token)
 }
 
+#[derive(Clone)]
 pub struct IpcClient {
     addr: String,
     token: String,
@@ -191,6 +198,21 @@ impl IpcClient {
         })
         .await
         .map_err(|_| format!("ENGINE_UNREACHABLE: request to {} timed out", self.addr))?
+    }
+}
+
+impl EngineApi for IpcClient {
+    fn call(
+        &self,
+        cmd: &str,
+        strategy: Option<&str>,
+        args: Value,
+    ) -> BoxFut<Result<Value, String>> {
+        let cmd = cmd.to_string();
+        let strategy = strategy.map(|s| s.to_string());
+        // Wrap the inherent async method in a boxed future.
+        let client = self.clone();
+        Box::pin(async move { IpcClient::call(&client, &cmd, strategy.as_deref(), args).await })
     }
 }
 
