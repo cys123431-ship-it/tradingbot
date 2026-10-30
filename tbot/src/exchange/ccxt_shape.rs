@@ -12,6 +12,7 @@ const LINEAR_MAKER: f64 = 0.0002;
 
 const PRECISE_DIV_PRECISION: u32 = 28;
 
+#[derive(Debug, Clone, Default)]
 pub struct Markets {
     by_symbol: Map<String, Value>,
     by_id: HashMap<String, Vec<String>>,

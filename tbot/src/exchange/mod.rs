@@ -1,4 +1,9 @@
 pub mod binance;
+pub mod binance_futures;
 pub mod ccxt_shape;
-
+pub mod errors;
+pub mod facade;
+pub mod fake;
 pub use binance::*;
+pub use errors::ExchangeError;
+pub use facade::FuturesExchange;

@@ -31,4 +31,31 @@ async fn main() {
     let info = client.exchange_info().await.expect("exchange info");
     let count = info["symbols"].as_array().map(Vec::len).unwrap_or(0);
     println!("exchangeInfo symbols: {count}");
+    facade_smoke(symbol, interval).await;
+}
+
+/// Same checks through the ccxt-shaped facade the strategies use.
+
+async fn facade_smoke(symbol: &str, interval: &str) {
+    use tbot::exchange::binance_futures::BinanceFutures;
+    use tbot::exchange::FuturesExchange;
+
+    let ex = BinanceFutures::new(BinanceClient::new(Network::Mainnet, None));
+    let markets = ex.load_markets().await.expect("load_markets");
+    let ccxt_symbol = markets
+        .iter()
+        .find(|(_, m)| m["id"] == symbol && m["swap"] == true)
+        .map(|(s, _)| s.clone())
+        .expect("symbol in markets");
+    let rows = ex
+        .fetch_ohlcv(&ccxt_symbol, interval, None, Some(5))
+        .await
+        .expect("fetch_ohlcv");
+    let tickers = ex.fetch_tickers().await.expect("fetch_tickers");
+    println!(
+        "facade: {} markets, {ccxt_symbol} {} candles, quoteVolume {}",
+        markets.len(),
+        rows.len(),
+        tickers[&ccxt_symbol]["quoteVolume"]
+    );
 }

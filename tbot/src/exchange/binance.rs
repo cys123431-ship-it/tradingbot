@@ -117,6 +117,7 @@ fn encode_params(params: &[(String, String)]) -> String {
 // Order parameter structs
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Default)]
 pub struct NewOrder {
     pub symbol: String,
     pub side: String,
@@ -130,6 +131,7 @@ pub struct NewOrder {
     pub new_order_resp_type: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
 pub struct NewAlgoOrder {
     pub symbol: String,
     pub side: String,
@@ -395,41 +397,34 @@ impl BinanceClient {
             .await
     }
 
+    pub async fn klines_since(
+        &self,
+        symbol: &str,
+        interval: &str,
+        start_time_ms: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<Candle>, BinanceError> {
+        let mut params: Vec<(String, String)> = vec![
+            ("symbol".to_string(), symbol.to_string()),
+            ("interval".to_string(), interval.to_string()),
+        ];
+        if let Some(start) = start_time_ms {
+            params.push(("startTime".to_string(), start.to_string()));
+        }
+        params.push(("limit".to_string(), limit.to_string()));
+        let value = self
+            .send(Method::Get, "/fapi/v1/klines", params, false)
+            .await?;
+        parse_klines(&value)
+    }
+
     pub async fn klines(
         &self,
         symbol: &str,
         interval: &str,
         limit: u32,
     ) -> Result<Vec<Candle>, BinanceError> {
-        let params = vec![
-            ("symbol".to_string(), symbol.to_string()),
-            ("interval".to_string(), interval.to_string()),
-            ("limit".to_string(), limit.to_string()),
-        ];
-        let value = self
-            .send(Method::Get, "/fapi/v1/klines", params, false)
-            .await?;
-        let rows = value
-            .as_array()
-            .ok_or_else(|| BinanceError::Decode("klines: not an array".to_string()))?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let arr = row
-                .as_array()
-                .ok_or_else(|| BinanceError::Decode("klines: row not array".to_string()))?;
-            if arr.len() < 6 {
-                return Err(BinanceError::Decode("klines: row too short".to_string()));
-            }
-            let open_time = json_to_f64(&arr[0])?;
-            let open = json_to_f64(&arr[1])?;
-            let high = json_to_f64(&arr[2])?;
-            let low = json_to_f64(&arr[3])?;
-            let close = json_to_f64(&arr[4])?;
-            let volume = json_to_f64(&arr[5])?;
-            let candle: Candle = [open_time, open, high, low, close, volume];
-            out.push(candle);
-        }
-        Ok(out)
+        self.klines_since(symbol, interval, None, limit).await
     }
 
     pub async fn ticker_24h(&self) -> Result<Value, BinanceError> {
@@ -452,6 +447,15 @@ impl BinanceClient {
 
     pub async fn balance(&self) -> Result<Value, BinanceError> {
         self.send(Method::Get, "/fapi/v3/balance", Vec::new(), true)
+            .await
+    }
+
+    pub async fn position_risk_v2(&self, symbol: Option<&str>) -> Result<Value, BinanceError> {
+        let mut params: Vec<(String, String)> = Vec::new();
+        if let Some(s) = symbol {
+            params.push(("symbol".to_string(), s.to_string()));
+        }
+        self.send(Method::Get, "/fapi/v2/positionRisk", params, true)
             .await
     }
 
@@ -549,6 +553,19 @@ impl BinanceClient {
             ),
         ];
         self.send(Method::Get, "/fapi/v1/order", params, true).await
+    }
+
+    pub async fn cancel_order_by_id(
+        &self,
+        symbol: &str,
+        order_id: &str,
+    ) -> Result<Value, BinanceError> {
+        let params: Vec<(String, String)> = vec![
+            ("symbol".to_string(), symbol.to_string()),
+            ("orderId".to_string(), order_id.to_string()),
+        ];
+        self.send(Method::Delete, "/fapi/v1/order", params, true)
+            .await
     }
 
     pub async fn cancel_order(
@@ -714,4 +731,29 @@ fn chrono_like_now_ms() -> i64 {
         Ok(d) => d.as_millis() as i64,
         Err(_) => 0,
     }
+}
+
+/// Binance kline rows `[openTime, "o", "h", "l", "c", "v", ...]` as candles.
+fn parse_klines(value: &Value) -> Result<Vec<Candle>, BinanceError> {
+    let rows = value
+        .as_array()
+        .ok_or_else(|| BinanceError::Decode("klines: not an array".to_string()))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let arr = row
+            .as_array()
+            .ok_or_else(|| BinanceError::Decode("klines: row not array".to_string()))?;
+        if arr.len() < 6 {
+            return Err(BinanceError::Decode("klines: row too short".to_string()));
+        }
+        let open_time = json_to_f64(&arr[0])?;
+        let open = json_to_f64(&arr[1])?;
+        let high = json_to_f64(&arr[2])?;
+        let low = json_to_f64(&arr[3])?;
+        let close = json_to_f64(&arr[4])?;
+        let volume = json_to_f64(&arr[5])?;
+        let candle: Candle = [open_time, open, high, low, close, volume];
+        out.push(candle);
+    }
+    Ok(out)
 }
