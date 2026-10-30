@@ -21,7 +21,7 @@ case "${SSH_ORIGINAL_COMMAND:-status}" in
     exec "$PYTHON_BIN" scripts/desktop_monitor_stream.py --interval 2 --timeframe 1m --candles 240
     ;;
   *)
-    echo "read-only key: only 'status', 'status --json', 'logs' and the desktop monitor stream are allowed" >&2
+    echo "read-only key: only 'status', 'status --json', 'logs', 'tbot-logs' and the desktop monitor stream are allowed" >&2
     exit 2
     ;;
 esac

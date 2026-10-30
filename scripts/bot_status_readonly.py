@@ -373,6 +373,24 @@ def log_tail(lines=250):
     return [redact(line)[:500] for line in out]
 
 
+def tbot_log_tail(lines=150):
+    """Last lines of the Rust bot logs (engine + Telegram), secrets redacted."""
+    out = []
+    for name in ("tbot-engine", "tbot-telegram"):
+        path = Path.home() / f"{name}.log"
+        out.append(f"===== {name}.log =====")
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(0, 2)
+                handle.seek(max(0, handle.tell() - 400_000))
+                rows = handle.read().decode("utf-8", "replace").splitlines()
+        except OSError:
+            out.append("(no log)")
+            continue
+        out.extend(redact(line)[:500] for line in rows[-lines:])
+    return out
+
+
 def log_errors(limit=8):
     lines = _log_lines()
     hits = [line for line in lines if any(marker in line for marker in ERROR_MARKERS)]
@@ -548,7 +566,12 @@ def main(argv=None):
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--no-exchange", action="store_true")
     parser.add_argument("--logs", action="store_true")
+    parser.add_argument("--tbot-logs", action="store_true")
     args = parser.parse_args(argv)
+    if args.tbot_logs:
+        print("
+".join(tbot_log_tail()))
+        return 0
     if args.logs:
         print("\n".join(log_tail()))
         return 0

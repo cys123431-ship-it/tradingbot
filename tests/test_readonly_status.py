@@ -125,3 +125,15 @@ def test_top_memory_processes_groups_by_name(tmp_path):
     assert top[0]["swap_mb"] == 500.0
     assert top[1]["count"] == 2
     assert status.top_memory_processes(proc_root=str(tmp_path / "missing")) == []
+
+
+def test_tbot_log_tail_redacts_and_handles_missing_logs(tmp_path, monkeypatch):
+    from scripts import bot_status_readonly as status
+
+    monkeypatch.setattr(status.Path, "home", staticmethod(lambda: tmp_path))
+    (tmp_path / "tbot-engine.log").write_text(
+        "engine: listening\nbot123456:ABCdefGHIjklMNOpqrSTUvwxYZ0123456789ab sent\n", encoding="utf-8")
+    out = status.tbot_log_tail()
+    assert out[0] == "===== tbot-engine.log =====" and "engine: listening" in out[1]
+    assert "ABCdefGHIjklMNOpqrSTUvwxYZ0123456789ab" not in "\n".join(out)
+    assert out[-1] == "(no log)"
