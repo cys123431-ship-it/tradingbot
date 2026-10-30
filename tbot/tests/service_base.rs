@@ -1,3 +1,4 @@
+#![allow(clippy::ptr_arg, clippy::type_complexity)] // WIP service test helpers
 //! S1 smoke tests for `SmaCrossService`: config, paths, state, balances, rules.
 
 use std::collections::{HashMap, HashSet};
