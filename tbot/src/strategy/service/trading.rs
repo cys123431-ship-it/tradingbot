@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::store::ledger::py_float_repr;
 use rust_decimal::Decimal;
 use serde_json::{json, Map, Value};
 
@@ -418,20 +419,24 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         result.insert("exit_time".into(), Value::String(iso_ms(exit_ms)));
         result.insert("exit_price".into(), Value::String(exit_price.to_string()));
         result.insert("exit_reason".into(), Value::String(exit_reason.to_string()));
-        result.insert("gross_pnl".into(), Value::String(gross.to_string()));
-        result.insert("commission".into(), Value::String(commission.to_string()));
-        result.insert("funding".into(), Value::String(funding.to_string()));
-        result.insert("net_pnl".into(), Value::String(net.to_string()));
+        result.insert("gross_pnl".into(), Value::String(py_float_repr(gross)));
+        result.insert(
+            "commission".into(),
+            Value::String(py_float_repr(commission)),
+        );
+        result.insert("funding".into(), Value::String(py_float_repr(funding)));
+        result.insert("net_pnl".into(), Value::String(py_float_repr(net)));
+        // Python: str(net / (entry * qty) * 100 if entry and qty else 0)
         let pnl_pct = if entry != 0.0 && qty != 0.0 {
-            net / (entry * qty) * 100.0
+            py_float_repr(net / (entry * qty) * 100.0)
         } else {
-            0.0
+            "0".to_string()
         };
-        result.insert("pnl_pct".into(), Value::String(pnl_pct.to_string()));
+        result.insert("pnl_pct".into(), Value::String(pnl_pct));
         result.insert(
             "r_multiple".into(),
             Value::String(if risk > 0.0 {
-                (net / risk).to_string()
+                py_float_repr(net / risk)
             } else {
                 String::new()
             }),

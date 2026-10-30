@@ -14,8 +14,10 @@
 //! base methods.  Later stages append to `base.rs`'s `impl` blocks.
 
 pub mod base;
+pub mod sma;
 mod stubs;
 mod stubs2;
+mod stubs3;
 pub mod trading;
 
 use std::collections::HashMap;
@@ -333,6 +335,8 @@ pub struct SmaCrossService<E: FuturesExchange + 'static> {
     last_stale_check: Mutex<HashMap<String, i64>>,
     /// `variant` naming keeps later stages honest: it is a `(now_ms, list, count)`.
     pub(crate) universe_cache: Mutex<HashMap<String, Value>>,
+    /// Public mainnet client used only to rank coins by 24h volume.
+    pub(crate) ranking_exchange_cache: Mutex<Option<Arc<E>>>,
 }
 
 impl<E: FuturesExchange + 'static> SmaCrossService<E> {
@@ -352,6 +356,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             last_notice: Mutex::new(HashMap::new()),
             last_stale_check: Mutex::new(HashMap::new()),
             universe_cache: Mutex::new(HashMap::new()),
+            ranking_exchange_cache: Mutex::new(None),
         }
     }
 
