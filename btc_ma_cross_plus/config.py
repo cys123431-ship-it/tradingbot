@@ -23,6 +23,7 @@ from btc_ema_pullback.config import (
 )
 
 from .tradfi import TRADFI_SCOPE
+from trading_safety.sma_periods import apply_periods
 
 STRATEGY_NAME = "sma3_sma120_macross"
 STRATEGY_VERSION = "1.0.0"
@@ -163,9 +164,9 @@ def normalize_ma_cross_config(raw=None) -> dict:
     cfg["reentry_wait_bars"] = wait if wait in REENTRY_WAIT_CHOICES else 3
     cfg["rotate_after_exit"] = _bool(cfg.get("rotate_after_exit"), False)
     cfg["alt_exclude_btc"] = _bool(cfg.get("alt_exclude_btc"), True)
-    cfg["fast_period"] = 3
-    cfg["slow_period"] = 120
-    cfg["candle_history"] = _int(cfg.get("candle_history"), 500, 210, 1500)
+    # Both SMA lines are Telegram-controlled (presets + "/map 1 200").
+    apply_periods(cfg, default_fast=3, default_slow=120)
+    cfg["candle_history"] = _int(cfg.get("candle_history"), 500, 210, 2000)
     try:
         leverage = int(float(cfg.get("leverage")))
     except (TypeError, ValueError):

@@ -600,7 +600,20 @@ def test_slow_period_choice_changes_the_trend():
     cfg120 = normalize_btc_ma_cross_config({"slow_period": 120})
     assert cfg120["slow_period"] == 120
     assert evaluate_cross(rows, cfg120, now)["trend_side"] == "LONG"
-    assert normalize_btc_ma_cross_config({"slow_period": 150})["slow_period"] == 200
+    # Any valid pair is accepted now (was: only 200 / 120).
+    assert normalize_btc_ma_cross_config({"slow_period": 150})["slow_period"] == 150
+    # Invalid values fall back to the defaults instead of raising.
+    assert normalize_btc_ma_cross_config({"slow_period": 0})["slow_period"] == 200
+    assert normalize_btc_ma_cross_config({"fast_period": 500, "slow_period": 200})["fast_period"] == 3
+    assert normalize_btc_ma_cross_config({"slow_period": 9999})["slow_period"] == 200
+    assert normalize_btc_ma_cross_config({"fast_period": 2.5})["fast_period"] == 3
+
+
+def test_custom_periods_drive_the_signal_and_candle_history():
+    cfg = normalize_btc_ma_cross_config({"fast_period": 1, "slow_period": 300})
+    assert cfg["fast_period"] == 1 and cfg["slow_period"] == 300
+    # 300 + warm-up must fit the fetched history, or the signal would be silent.
+    assert cfg["candle_history"] >= 310
 
 
 def test_switching_to_sma120_while_holding_follows_the_new_line(tmp_path):
@@ -638,10 +651,47 @@ def test_sma_buttons_and_header(tmp_path):
     controller = _controller(tmp_path)
     press = lambda a: asyncio.run(controller._handle_btc_ma_cross_action(a))  # noqa: E731
     text, markup = press("status")
-    assert "bm:slow:200" in _callbacks(markup) and "bm:slow:120" in _callbacks(markup)
+    assert "bm:sma:3:200" in _callbacks(markup) and "bm:sma:3:120" in _callbacks(markup)
+    assert "bm:sma:1:200" in _callbacks(markup) and "bm:sma:5:60" in _callbacks(markup)
     assert text.startswith("📏 3/200 SMA")
-    text, markup = press("slow:120")
+    text, markup = press("sma:3:120")
     assert controller.cfg.data["btc_ma_cross"]["slow_period"] == 120
-    assert "SMA3 / SMA120" in text and "📏 3/120 SMA" in text
+    assert "✅ SMA 기간 변경: 3/120" in text and "📏 3/120 SMA" in text
     labels = [b.text for row in markup.inline_keyboard for b in row]
-    assert "✅ SMA3 / SMA120" in labels
+    assert "✅ SMA3/SMA120" in labels
+
+
+def test_preset_button_sets_the_fast_period_too(tmp_path):
+    controller = _controller(tmp_path)
+    press = lambda a: asyncio.run(controller._handle_btc_ma_cross_action(a))  # noqa: E731
+    text, _ = press("sma:1:200")
+    assert controller.cfg.data["btc_ma_cross"]["fast_period"] == 1
+    assert controller.cfg.data["btc_ma_cross"]["slow_period"] == 200
+    assert "패스트 1 · 슬로우 200" in text
+    assert "📏 1/200 SMA" in text
+
+
+def test_invalid_periods_are_rejected_without_changing_config(tmp_path):
+    controller = _controller(tmp_path)
+    press = lambda a: asyncio.run(controller._handle_btc_ma_cross_action(a))  # noqa: E731
+    press("sma:3:120")          # known-good baseline
+    for action in ("sma:200:3", "sma:120:120", "sma:0:200", "sma:3:9999", "sma:2.5:120", "sma:3"):
+        text, _ = press(action)
+        assert "기간 변경 실패" in text or "알 수 없는" in text, (action, text)
+    cfg = normalize_btc_ma_cross_config(controller.cfg.data["btc_ma_cross"])
+    assert (cfg["fast_period"], cfg["slow_period"]) == (3, 120)
+
+
+def test_sma_help_lists_the_text_command(tmp_path):
+    controller = _controller(tmp_path)
+    text, _ = asyncio.run(controller._handle_btc_ma_cross_action("sma_help"))
+    assert "/btcma <패스트> <슬로우>" in text
+    assert "/btcma 1 200" in text
+
+
+def test_large_slow_period_lifts_candle_history(tmp_path):
+    controller = _controller(tmp_path)
+    asyncio.run(controller._handle_btc_ma_cross_action("sma:2:400"))
+    cfg = controller.cfg.data["btc_ma_cross"]
+    assert (cfg["fast_period"], cfg["slow_period"]) == (2, 400)
+    assert cfg["candle_history"] >= 410

@@ -240,6 +240,105 @@ def test_status_and_rules_describe_the_c_only_strategy():
     assert "변동성 타겟 사이징" in rules
 
 
+from trading_safety.sma_periods import (
+    PERIOD_PRESETS,
+    PeriodError,
+    apply_periods,
+    normalize_periods,
+    parse_period_command,
+    required_candle_history,
+    validate_periods,
+)
+
+
+# ----------------------------------------------------------- periods (shared)
+def test_period_validation_accepts_valid_pairs():
+    assert validate_periods(1, 200) == (1, 200)
+    assert validate_periods("5", "60") == (5, 60)
+    assert validate_periods(3, "120") == (3, 120)
+
+
+def test_period_validation_rejects_bad_pairs():
+    for fast, slow in ((200, 3), (120, 120), (0, 200), (3, 1), (3, 501), (2.5, 120), ("a", 200)):
+        with pytest.raises(PeriodError):
+            validate_periods(fast, slow)
+
+
+def test_parse_period_command_variants():
+    assert parse_period_command(["1", "200"]) == (1, 200)
+    assert parse_period_command(["1/200"]) == (1, 200)
+    assert parse_period_command(["1,200"]) == (1, 200)
+    assert parse_period_command(["5", "60"]) == (5, 60)
+    for bad in ([], ["1"], ["1", "2", "3"], ["x", "200"]):
+        with pytest.raises(PeriodError):
+            parse_period_command(bad)
+
+
+def test_normalize_periods_falls_back_to_defaults():
+    assert normalize_periods({}, default_fast=3, default_slow=120) == (3, 120)
+    assert normalize_periods({"fast_period": 5, "slow_period": 60}, default_slow=120) == (5, 60)
+    # Corrupted values never raise; the defaults win.
+    assert normalize_periods({"fast_period": 0, "slow_period": 0}, default_slow=200) == (3, 200)
+
+
+def test_apply_periods_lifts_candle_history():
+    cfg = {"candle_history": 220}
+    assert apply_periods(cfg, default_slow=120) == (3, 120)
+    assert cfg["candle_history"] == 220          # 120 needs only 130
+    cfg = {"candle_history": 220}
+    apply_periods(cfg, default_slow=200)
+    assert cfg["candle_history"] == 220          # 200 needs 210
+    cfg = {}
+    apply_periods(cfg, default_slow=120)
+    assert cfg["candle_history"] == required_candle_history(120)
+    cfg = {"candle_history": 100}
+    apply_periods(cfg, default_slow=400)
+    assert cfg["candle_history"] >= 410
+
+
+def test_every_preset_is_valid():
+    for label, fast, slow in PERIOD_PRESETS:
+        assert validate_periods(fast, slow) == (fast, slow)
+        assert label == f"{fast}/{slow}"
+
+
+def test_macross_periods_presets_and_text_command():
+    controller = _controller()
+    _, markup = _press(controller, "status")
+    assert "mc:sma:3:120" in _callbacks(markup)
+    assert "mc:sma:5:60" in _callbacks(markup) and "mc:sma:1:200" in _callbacks(markup)
+
+    # The test stub has no exchange, so the holding lookup is skipped safely.
+    text, _ = _press(controller, "sma:1:200")
+    data = controller.cfg.data["ma_cross"]
+    assert (data["fast_period"], data["slow_period"]) == (1, 200)
+    assert "패스트 1 · 슬로우 200" in text
+    # Non-default pairs warn that 3/120 is the backtested optimum.
+    assert "3/120" in text
+    # The help text advertises the text command.
+    help_text, _ = _press(controller, "sma_help")
+    assert "/map <패스트> <슬로우>" in help_text and "지금: 1/200" in help_text
+
+
+def test_macross_invalid_period_is_refused():
+    controller = _controller()
+    text, _ = _press(controller, "sma:120:120")
+    assert "기간 변경 실패" in text
+    cfg = normalize_ma_cross_config(controller.cfg.data["ma_cross"])
+    assert (cfg["fast_period"], cfg["slow_period"]) == (3, 120)
+
+
+def test_macross_normalization_accepts_custom_periods():
+    cfg = normalize_ma_cross_config({"fast_period": 1, "slow_period": 200})
+    assert (cfg["fast_period"], cfg["slow_period"]) == (1, 200)
+    assert cfg["candle_history"] >= required_candle_history(200)
+    # Invalid -> defaults (3/120), never an exception.
+    for bad in ({"fast_period": 200, "slow_period": 3}, {"slow_period": 0},
+                {"fast_period": 3, "slow_period": 9000}):
+        cfg = normalize_ma_cross_config(bad)
+        assert (cfg["fast_period"], cfg["slow_period"]) == (3, 120)
+
+
 # ------------------------------------------------------------------ TradFi
 def test_menu_has_the_tradfi_button():
     controller = _controller()

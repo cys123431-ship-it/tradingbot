@@ -20,13 +20,18 @@ from btc_ema_pullback.config import (
     _int,
 )
 
+from trading_safety.sma_periods import apply_periods
+
 STRATEGY_NAME = "btc_sma3_sma200_cross"
 STRATEGY_VERSION = "1.0.0"
 CLIENT_ID_STRATEGY = "btcma"
 CONFIG_KEY = "btc_ma_cross"
 
 TIMEFRAMES = ("3m", "5m", "15m", "30m", "1h", "2h", "4h")
-SLOW_PERIOD_CHOICES = (200, 120)        # SMA3 against SMA200 or SMA120 (Telegram)
+# One-tap SMA pairs shown in Telegram; any pair is also accepted as text
+# ("/btcma 1 200").  Fast is no longer fixed at 3.
+SLOW_PERIOD_CHOICES = (200, 120)        # kept for older callers/tests
+FAST_PERIOD_CHOICES = (1, 3, 5, 9)
 # btc / alts / single / tradfi.  tradfi = Binance mainnet US-equity TradFi
 # perpetuals plus gold, and only while the US regular session is open.
 SCAN_SCOPES = ("btc", "alts", "single", "tradfi")
@@ -152,13 +157,10 @@ def normalize_btc_ma_cross_config(raw=None) -> dict:
     cfg["profit_lock_switch_count"] = switch_count
     cfg["rotate_after_exit"] = _bool(cfg.get("rotate_after_exit"), False)
     cfg["alt_exclude_btc"] = _bool(cfg.get("alt_exclude_btc"), True)
-    cfg["fast_period"] = 3
-    try:
-        slow = int(float(cfg.get("slow_period")))
-    except (TypeError, ValueError):
-        slow = 200
-    cfg["slow_period"] = slow if slow in SLOW_PERIOD_CHOICES else 200
-    cfg["candle_history"] = _int(cfg.get("candle_history"), 260, 210, 1000)
+    # Both SMA lines are Telegram-controlled (presets + "/btcma 1 200").
+    # candle_history is lifted automatically when the slow line needs more bars.
+    apply_periods(cfg, default_fast=3, default_slow=200)
+    cfg["candle_history"] = _int(cfg.get("candle_history"), 260, 210, 1500)
     try:
         leverage = int(float(cfg.get("leverage")))
     except (TypeError, ValueError):
@@ -210,6 +212,7 @@ __all__ = (
     "REENTRY_WAIT_CHOICES",
     "SCAN_SCOPES",
     "SLOW_PERIOD_CHOICES",
+    "FAST_PERIOD_CHOICES",
     "STRATEGY_NAME",
     "STRATEGY_VERSION",
     "TIMEFRAMES",

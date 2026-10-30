@@ -855,6 +855,7 @@ class BtcMaCrossService(BtcEmaPullbackService):
             "lock_revision": 0,
             "timeframe": cfg["timeframe"],
             "slow_period": cfg["slow_period"],
+            "fast_period": cfg["fast_period"],
             "tick_size": str(rules.tick_size),
         }
 
@@ -1270,7 +1271,8 @@ class BtcMaCrossService(BtcEmaPullbackService):
         kind = {"TREND": "방향 유지", "ROTATE": "청산 후 다른 코인 전환",
                 "REALIGN": "SMA 반대편 전환"}.get(trade.get("entry_type"), "돌파")
         return (
-            f"📈 {self.LABEL} 진입 ({tag} · {trade['network']} · {trade.get('timeframe')} · SMA3/{trade.get('slow_period', 200)} · {kind})\n"
+            f"📈 {self.LABEL} 진입 ({tag} · {trade['network']} · {trade.get('timeframe')} · "
+            f"SMA{trade.get('fast_period', 3)}/{trade.get('slow_period', 200)} · {kind})\n"
             f"{market} {trade['side']} {trade['quantity']} {base} @ {trade['entry_price']} · "
             f"증거금 {_f(trade['margin_used']):.2f} USDT x{trade['leverage']}\n"
             f"{stop} · 증거금 +5% 도달 시 수익 확보 손절 시작"

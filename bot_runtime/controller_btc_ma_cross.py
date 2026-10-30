@@ -1,4 +1,4 @@
-﻿"""Telegram controls (/btcmacross) and scheduler for the BTC SMA3/SMA200 cross strategy."""
+"""Telegram controls (/btcmacross) and scheduler for the BTC SMA3/SMA200 cross strategy."""
 
 from __future__ import annotations
 
@@ -25,11 +25,29 @@ from btc_ma_cross.service import (
     TRADFI_MAINNET_ONLY_REASON,
     TRADFI_SESSION_CLOSED_REASON,
 )
+from trading_safety.sma_periods import (
+    PERIOD_COMMANDS,
+    PERIOD_PRESETS,
+    PeriodError,
+    is_default_periods,
+    parse_period_command,
+    periods_label,
+    required_candle_history,
+)
 from .controller_btc_pullback import NETWORK_LABELS, _answer_quietly, _kst, _n
 from .strategy_registry import BINANCE_MAINNET, BINANCE_TESTNET
 
 logger = logging.getLogger(__name__)
 TIMEFRAME_LABELS = {"3m": "3분", "5m": "5분", "15m": "15분", "30m": "30분", "1h": "1시간", "2h": "2시간", "4h": "4시간"}
+
+
+def _btc_sma_button(cfg, mark, fast, slow):
+    """One SMA preset button; highlighted when the live pair matches."""
+    current = (int(cfg.get("fast_period") or 0), int(cfg.get("slow_period") or 0))
+    return InlineKeyboardButton(
+        mark(current == (fast, slow), f"SMA{fast}/SMA{slow}"),
+        callback_data=f"bm:sma:{fast}:{slow}",
+    )
 
 
 def _rotation_text(cfg):
@@ -226,9 +244,15 @@ class ControllerBtcMaCrossMixin:
                 for choice in REENTRY_WAIT_CHOICES
             ],
             [
-                InlineKeyboardButton(mark(int(cfg.get("slow_period", 200)) == slow, f"SMA3 / SMA{slow}"),
-                                     callback_data=f"bm:slow:{slow}")
-                for slow in SLOW_PERIOD_CHOICES
+                _btc_sma_button(cfg, mark, fast, slow)
+                for label, fast, slow in PERIOD_PRESETS[:2]
+            ],
+            [
+                _btc_sma_button(cfg, mark, fast, slow)
+                for label, fast, slow in PERIOD_PRESETS[2:]
+            ],
+            [
+                InlineKeyboardButton("✏️ 직접 입력: /btcma 1 200", callback_data="bm:sma_help"),
             ],
             [
                 InlineKeyboardButton(mark(cfg.get("timeframe") == tf, TIMEFRAME_LABELS[tf]), callback_data=f"bm:tf:{tf}")
@@ -292,8 +316,34 @@ class ControllerBtcMaCrossMixin:
         rows.append([InlineKeyboardButton("↩️ 돌아가기", callback_data="bm:status")])
         return InlineKeyboardMarkup(rows)
 
+    async def _set_btc_ma_cross_periods(self, fast, slow):
+        """Store a validated SMA pair; returns (ok, message).
+
+        A held position keeps the lines it was opened with, so the pair only
+        affects the next entry (the service stores ``slow_period`` on the trade).
+        """
+        try:
+            fast_p, slow_p = parse_period_command([fast, slow])
+        except PeriodError as exc:
+            return False, f"⚠️ 기간 변경 실패: {exc}\n예) /btcma 1 200"
+        service = self._btc_ma_cross_service()
+        cfg_before = service.config()
+        await self._set_btc_ma_cross_value("fast_period", fast_p)
+        await self._set_btc_ma_cross_value("slow_period", slow_p)
+        needed = required_candle_history(slow_p)
+        if int(cfg_before.get("candle_history") or 0) < needed:
+            await self._set_btc_ma_cross_value("candle_history", needed)
+        cfg = service.config()
+        network = service.current_network(cfg)
+        holding = bool((service.load_state(network, service.mode(cfg)).get("trade") or {})) if network else False
+        note = "\n(보유 중인 포지션은 진입 당시 기간 기준으로 관리, 다음 진입부터 새 기간 적용)" if holding else ""
+        return True, (
+            f"✅ SMA 기간 변경: {periods_label(fast_p, slow_p)} "
+            f"(패스트 {fast_p} · 슬로우 {slow_p})\n"
+            f"• 봉 {cfg['timeframe']} 기준 · 신호 계산에 {cfg['candle_history']}봉 사용{note}"
+        )
+
     async def _set_btc_ma_cross_coin(self, network, text):
-        """Validate and store the single coin; returns (ok, message)."""
         service = self._btc_ma_cross_service()
         try:
             _, market_id = await service.resolve_coin(network, text)
@@ -327,7 +377,7 @@ class ControllerBtcMaCrossMixin:
         trade = state.get("trade") or {}
         stop = int(cfg["emergency_stop_roi_percent"])
         lines = [
-            f"📏 3/{cfg['slow_period']} SMA 크로스 전략 (반대 크로스 시 즉시 반대 진입)",
+            f"📏 {cfg['fast_period']}/{cfg['slow_period']} SMA 크로스 전략 (반대 크로스 시 즉시 반대 진입)",
             f"전략: {'ON' if cfg['enabled'] else 'OFF'} · 모드: {mode}"
             + (" (환경변수로 DRY_RUN 강제)" if cfg["trading_mode"] == TRADING_MODE_LIVE and mode == TRADING_MODE_DRY_RUN else ""),
             f"거래소: {NETWORK_LABELS.get(network, network)} (/setup 선택을 따름) · API 키: {'있음' if status['has_credentials'] else '없음'}",
@@ -420,7 +470,7 @@ class ControllerBtcMaCrossMixin:
     def _btc_ma_cross_rules_text(self, cfg):
         stop = int(cfg["emergency_stop_roi_percent"])
         return (
-            f"📘 3/{cfg['slow_period']} SMA 크로스 규칙 (SMA200/SMA120 선택 가능)\n"
+            f"📘 {cfg['fast_period']}/{cfg['slow_period']} SMA 크로스 규칙 (기간은 /btcma 또는 버튼으로 변경)\n"
             f"• 종목: {_scope_text(cfg)} (TradFi·스테이블코인 제외, 🎯 코인 지정 또는 /macoin SOL 로 1개 지정)\n"
             f"• 진입: {_entry_mode_text(cfg)}\n"
             f"• 익절 자동 전환: {_profit_lock_switch_text(cfg)}\n"
@@ -637,6 +687,31 @@ class ControllerBtcMaCrossMixin:
             return f"🛑 비상손절: {label}{note}\n\n" + await self._format_btc_ma_cross_status(), keyboard()
         if action == "stats":
             return await self._format_btc_ma_cross_stats(), keyboard()
+        if action == "sma_help":
+            current = periods_label(cfg.get("fast_period", 3), cfg.get("slow_period", 200))
+            presets = " · ".join(label for label, _, _ in PERIOD_PRESETS)
+            return (
+                f"✏️ SMA 기간 직접 입력\n지금: {current}\n\n"
+                "명령: /btcma <패스트> <슬로우>\n"
+                "예) /btcma 1 200 → 패스트 1, 슬로우 200\n"
+                "예) /btcma 5 60 → 패스트 5, 슬로우 60\n"
+                "예) /btcma 9/21 형식도 가능\n\n"
+                f"버튼 프리셋: {presets}\n"
+                "• 패스트는 슬로우보다 작아야 합니다 (1 이상, 슬로우 500 이하).\n"
+                "• 보유 중에 바꾸면 다음 진입부터 적용되고, "
+                "보유 포지션은 진입 당시 기간으로 계속 관리됩니다.",
+                keyboard(),
+            )
+        if action.startswith("sma:"):
+            parts = action.split(":")
+            if len(parts) != 3:
+                return "⚠️ 알 수 없는 SMA 설정입니다.", keyboard()
+            _, message = await self._set_btc_ma_cross_periods(parts[1], parts[2])
+            return message + "\n\n" + await self._format_btc_ma_cross_status(), keyboard()
+        if action.startswith("slow:"):
+            # Backwards compatibility with older keyboards: SMA3 / SMA<slow>.
+            _, message = await self._set_btc_ma_cross_periods(3, action.split(":", 1)[1])
+            return message + "\n\n" + await self._format_btc_ma_cross_status(), keyboard()
         if action == "signals":
             return self._format_btc_ma_cross_signals(), keyboard()
         if action == "rules":
@@ -694,8 +769,37 @@ class ControllerBtcMaCrossMixin:
                 reply_markup=self._build_btc_ma_cross_keyboard(service.config(), state=self._btc_ma_cross_state()),
             )
 
+        async def btc_ma_period_cmd(update, context):
+            service = self._btc_ma_cross_service()
+            args = list(getattr(context, "args", None) or [])
+            if not args:
+                _, help_text = await self._handle_btc_ma_cross_action("sma_help")
+                await update.message.reply_text(
+                    help_text,
+                    reply_markup=self._build_btc_ma_cross_keyboard(
+                        service.config(), state=self._btc_ma_cross_state()),
+                )
+                return
+            try:
+                fast_p, slow_p = parse_period_command(args)
+            except PeriodError as exc:
+                current_cfg = service.config()
+                await update.message.reply_text(
+                    f"⚠️ 기간 변경 실패: {exc}\n예) /btcma 1 200\n"
+                    f"지금: {periods_label(current_cfg.get('fast_period', 3), current_cfg.get('slow_period', 200))}"
+                )
+                return
+            ok, message = await self._set_btc_ma_cross_periods(fast_p, slow_p)
+            await update.message.reply_text(
+                message + "\n\n" + await self._format_btc_ma_cross_status(),
+                reply_markup=self._build_btc_ma_cross_keyboard(
+                    service.config(), state=self._btc_ma_cross_state()),
+            )
+
         self.tg_app.add_handler(CommandHandler("btcmacross", owner_only(btc_ma_cross_cmd)))
         self.tg_app.add_handler(CommandHandler("macoin", owner_only(btc_ma_coin_cmd)))
+        for name in PERIOD_COMMANDS:
+            self.tg_app.add_handler(CommandHandler(name, owner_only(btc_ma_period_cmd)))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(btc_ma_cross_callback), pattern=r"^bm:"))
 
     async def _stop_btc_ma_cross_for_emergency(self):

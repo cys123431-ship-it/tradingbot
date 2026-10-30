@@ -19,6 +19,15 @@ from btc_ma_cross_plus import (
     normalize_ma_cross_config,
 )
 from btc_ma_cross_plus.config import LEVERAGE_CHOICES
+from trading_safety.sma_periods import (
+    PERIOD_COMMANDS,
+    PERIOD_PRESETS,
+    PeriodError,
+    is_default_periods,
+    parse_period_command,
+    periods_label,
+    required_candle_history,
+)
 from btc_ma_cross_plus.service import MaCrossService
 from btc_ma_cross_plus.tradfi import (
     TRADFI_MAINNET_ONLY_REASON,
@@ -71,6 +80,15 @@ def _feature_summary(cfg):
     return " + ".join(f"{name}({FEATURE_LABELS[name]})" for name in mode)
 
 
+def _sma_button(cfg, mark, fast, slow, prefix):
+    """One SMA preset button; highlighted when the live pair matches."""
+    current = (int(cfg.get("fast_period") or 0), int(cfg.get("slow_period") or 0))
+    return InlineKeyboardButton(
+        mark(current == (fast, slow), f"SMA{fast}/SMA{slow}"),
+        callback_data=f"{prefix}:sma:{fast}:{slow}",
+    )
+
+
 class ControllerMaCrossMixin:
     # ----------------------------------------------------------- config access
     def _ma_cross_config(self):
@@ -80,11 +98,12 @@ class ControllerMaCrossMixin:
         await self.cfg.update_value([CONFIG_KEY, key], value)
 
     def _ma_cross_network(self):
-        """Network the /setup exchange maps to (None for Upbit)."""
+        """Network the /setup exchange maps to (None for Upbit / unwired)."""
         from btc_ema_pullback.config import NETWORK_MAINNET, NETWORK_TESTNET
         from .strategy_registry import BINANCE_MAINNET, BINANCE_TESTNET
 
-        mode = self.get_exchange_mode()
+        getter = getattr(self, "get_exchange_mode", None)
+        mode = getter() if callable(getter) else None
         if mode == BINANCE_MAINNET:
             return NETWORK_MAINNET
         if mode == BINANCE_TESTNET:
@@ -184,6 +203,17 @@ class ControllerMaCrossMixin:
                 InlineKeyboardButton(mark(cfg.get("trading_mode") == TRADING_MODE_LIVE, "💥 LIVE"),
                                      callback_data="mc:mode:live"),
             ],
+            [
+                _sma_button(cfg, mark, fast, slow, "mc")
+                for label, fast, slow in PERIOD_PRESETS[:3]
+            ],
+            [
+                _sma_button(cfg, mark, fast, slow, "mc")
+                for label, fast, slow in PERIOD_PRESETS[3:]
+            ],
+            [
+                InlineKeyboardButton("✏️ 직접 입력: /map 1 200", callback_data="mc:sma_help"),
+            ],
             [InlineKeyboardButton(f"🧩 기능: {mode or '없음'} · 청산: 반대 크로스만", callback_data="mc:status")],
             *feature_rows,
             [
@@ -227,7 +257,7 @@ class ControllerMaCrossMixin:
         mode = feature_mode(cfg)
         enabled = bool(cfg.get("enabled"))
         lines = [
-            "🧩 /macross — SMA3 / SMA120 + 변동성 타겟 사이징 (C 전용)",
+            f"🧩 /macross — SMA{cfg['fast_period']} / SMA{cfg['slow_period']} + 변동성 타겟 사이징 (C 전용)",
             f"전략: {'ON' if enabled else 'OFF'} · 모드: {cfg.get('trading_mode')} · 봉: {TIMEFRAME_LABELS[cfg['timeframe']]}",
             f"기능: {_feature_summary(cfg)}",
             "청산: 반대 크로스 시 종료 · 수익잠금 +5%→+4% 계단 · 비상손절 OFF",
@@ -283,6 +313,36 @@ class ControllerMaCrossMixin:
         return "\n".join(lines)
 
     # ----------------------------------------------------------------- actions
+    async def _set_ma_cross_periods(self, fast, slow):
+        """Store a validated SMA pair; returns (ok, message)."""
+        try:
+            fast_p, slow_p = parse_period_command([fast, slow])
+        except PeriodError as exc:
+            return False, f"⚠️ 기간 변경 실패: {exc}\n예) /map 1 200"
+        cfg_before = self._ma_cross_config()
+        await self._set_ma_cross_value("fast_period", fast_p)
+        await self._set_ma_cross_value("slow_period", slow_p)
+        needed = required_candle_history(slow_p)
+        if int(cfg_before.get("candle_history") or 0) < needed:
+            await self._set_ma_cross_value("candle_history", needed)
+        cfg = self._ma_cross_config()
+        network = self._ma_cross_network()
+        holding = False
+        if network:
+            service = self._ma_cross_service()
+            try:
+                holding = bool(service.load_state(network, service.mode(cfg)).get("trade"))
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("macross holding lookup failed: %s", exc)
+        note = "\n(보유 중인 포지션은 진입 당시 기간 기준으로 관리, 다음 진입부터 새 기간 적용)" if holding else ""
+        if not is_default_periods(fast_p, slow_p, default_fast=3, default_slow=120):
+            note += "\n(참고: 이 전략의 백테스트 최적 조합은 3/120입니다 — 실제 성과 검증 없이 바꾸지 마세요)"
+        return True, (
+            f"✅ SMA 기간 변경: {periods_label(fast_p, slow_p)} "
+            f"(패스트 {fast_p} · 슬로우 {slow_p})\n"
+            f"• 봉 {cfg['timeframe']} 기준 · 신호 계산에 {cfg['candle_history']}봉 사용{note}"
+        )
+
     async def _handle_ma_cross_action(self, action):
         cfg = self._ma_cross_config()
         keyboard = lambda confirm=None: self._build_ma_cross_keyboard(self._ma_cross_config(), confirm=confirm)  # noqa: E731
@@ -363,6 +423,26 @@ class ControllerMaCrossMixin:
             return "💥 LIVE 전환 완료\n\n" + self._ma_cross_status_text(), keyboard()
         if action == "rules":
             return self._ma_cross_rules_text(cfg), keyboard()
+        if action == "sma_help":
+            presets = " · ".join(label for label, _, _ in PERIOD_PRESETS)
+            return (
+                f"✏️ SMA 기간 직접 입력\n지금: {periods_label(cfg['fast_period'], cfg['slow_period'])}\n\n"
+                "명령: /map <패스트> <슬로우>  (또는 /maperiod)\n"
+                "예) /map 1 200 → 패스트 1, 슬로우 200\n"
+                "예) /map 5 60 → 패스트 5, 슬로우 60\n\n"
+                f"버튼 프리셋: {presets}\n"
+                "• 패스트는 슬로우보다 작아야 합니다 (1 이상, 슬로우 500 이하).\n"
+                "• 보유 중에 바꾸면 다음 진입부터 적용되고, "
+                "보유 포지션은 진입 당시 기간으로 계속 관리됩니다.\n"
+                "• 이 전략의 백테스트 최적 조합은 3/120입니다.",
+                keyboard(),
+            )
+        if action.startswith("sma:"):
+            parts = action.split(":")
+            if len(parts) != 3:
+                return "⚠️ 알 수 없는 SMA 설정입니다.", keyboard()
+            _, message = await self._set_ma_cross_periods(parts[1], parts[2])
+            return message + "\n\n" + self._ma_cross_status_text(), keyboard()
         return self._ma_cross_status_text(), keyboard()
 
     # -------------------------------------------------------------- handlers
@@ -386,7 +466,31 @@ class ControllerMaCrossMixin:
                 if "message is not modified" not in str(exc).lower():
                     raise
 
+        async def ma_cross_period_cmd(update, context):
+            args = list(getattr(context, "args", None) or [])
+            if not args:
+                _, help_text = await self._handle_ma_cross_action("sma_help")
+                await update.message.reply_text(
+                    help_text, reply_markup=self._build_ma_cross_keyboard(self._ma_cross_config()))
+                return
+            try:
+                fast_p, slow_p = parse_period_command(args)
+            except PeriodError as exc:
+                cfg = self._ma_cross_config()
+                await update.message.reply_text(
+                    f"⚠️ 기간 변경 실패: {exc}\n예) /map 1 200\n"
+                    f"지금: {periods_label(cfg['fast_period'], cfg['slow_period'])}"
+                )
+                return
+            _, message = await self._set_ma_cross_periods(fast_p, slow_p)
+            await update.message.reply_text(
+                message + "\n\n" + self._ma_cross_status_text(),
+                reply_markup=self._build_ma_cross_keyboard(self._ma_cross_config()),
+            )
+
         self.tg_app.add_handler(CommandHandler("macross", owner_only(ma_cross_cmd)))
+        for name in PERIOD_COMMANDS:
+            self.tg_app.add_handler(CommandHandler(name, owner_only(ma_cross_period_cmd)))
         self.tg_app.add_handler(CallbackQueryHandler(owner_only(ma_cross_callback), pattern=r"^mc:"))
 
 
