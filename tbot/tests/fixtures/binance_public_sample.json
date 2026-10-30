@@ -1,0 +1,812 @@
+{
+ "exchangeInfo": {
+  "timezone": "UTC",
+  "serverTime": 1793352576477,
+  "futuresType": "U_MARGINED",
+  "rateLimits": [
+   {
+    "rateLimitType": "REQUEST_WEIGHT",
+    "interval": "MINUTE",
+    "intervalNum": 1,
+    "limit": 2400
+   },
+   {
+    "rateLimitType": "ORDERS",
+    "interval": "MINUTE",
+    "intervalNum": 1,
+    "limit": 1200
+   },
+   {
+    "rateLimitType": "ORDERS",
+    "interval": "SECOND",
+    "intervalNum": 10,
+    "limit": 300
+   }
+  ],
+  "exchangeFilters": [],
+  "assets": [
+   {
+    "asset": "USDT",
+    "marginAvailable": true,
+    "autoAssetExchange": "-10000"
+   },
+   {
+    "asset": "BTC",
+    "marginAvailable": true,
+    "autoAssetExchange": "-0.10000000"
+   },
+   {
+    "asset": "BNB",
+    "marginAvailable": true,
+    "autoAssetExchange": "0"
+   },
+   {
+    "asset": "ETH",
+    "marginAvailable": true,
+    "autoAssetExchange": "0"
+   },
+   {
+    "asset": "USDC",
+    "marginAvailable": true,
+    "autoAssetExchange": "-10000"
+   },
+   {
+    "asset": "FDUSD",
+    "marginAvailable": true,
+    "autoAssetExchange": "0"
+   },
+   {
+    "asset": "BNFCR",
+    "marginAvailable": true,
+    "autoAssetExchange": "-5000"
+   },
+   {
+    "asset": "BFUSD",
+    "marginAvailable": true,
+    "autoAssetExchange": "0"
+   },
+   {
+    "asset": "LDUSDT",
+    "marginAvailable": true,
+    "autoAssetExchange": "0"
+   },
+   {
+    "asset": "RWUSD",
+    "marginAvailable": true,
+    "autoAssetExchange": "0"
+   },
+   {
+    "asset": "USD1",
+    "marginAvailable": true,
+    "autoAssetExchange": "-5000"
+   },
+   {
+    "asset": "U",
+    "marginAvailable": true,
+    "autoAssetExchange": "-5000"
+   }
+  ],
+  "symbols": [
+   {
+    "symbol": "BTCUSDT",
+    "pair": "BTCUSDT",
+    "contractType": "PERPETUAL",
+    "deliveryDate": 4133404800000,
+    "onboardDate": 1567965300000,
+    "status": "TRADING",
+    "maintMarginPercent": "2.5000",
+    "requiredMarginPercent": "5.0000",
+    "baseAsset": "BTC",
+    "quoteAsset": "USDT",
+    "marginAsset": "USDT",
+    "pricePrecision": 2,
+    "quantityPrecision": 3,
+    "baseAssetPrecision": 8,
+    "quotePrecision": 8,
+    "underlyingType": "COIN",
+    "underlyingSubType": [
+     "PoW",
+     "Crypto"
+    ],
+    "triggerProtect": "0.0300",
+    "liquidationFee": "0.012500",
+    "marketTakeBound": "0.03",
+    "maxMoveOrderLimit": 10000,
+    "filters": [
+     {
+      "minPrice": "556.80",
+      "filterType": "PRICE_FILTER",
+      "tickSize": "0.10",
+      "maxPrice": "4529764"
+     },
+     {
+      "stepSize": "0.001",
+      "filterType": "LOT_SIZE",
+      "minQty": "0.001",
+      "maxQty": "1000"
+     },
+     {
+      "stepSize": "0.001",
+      "maxQty": "120",
+      "filterType": "MARKET_LOT_SIZE",
+      "minQty": "0.001"
+     },
+     {
+      "limit": 200,
+      "filterType": "MAX_NUM_ORDERS"
+     },
+     {
+      "notional": "50",
+      "filterType": "MIN_NOTIONAL"
+     },
+     {
+      "multiplierDecimal": "4",
+      "multiplierUp": "1.0300",
+      "filterType": "PERCENT_PRICE",
+      "multiplierDown": "0.9700"
+     },
+     {
+      "positionControlSide": "NONE",
+      "filterType": "POSITION_RISK_CONTROL"
+     }
+    ],
+    "orderTypes": [
+     "LIMIT",
+     "MARKET",
+     "STOP",
+     "STOP_MARKET",
+     "TAKE_PROFIT",
+     "TAKE_PROFIT_MARKET",
+     "TRAILING_STOP_MARKET"
+    ],
+    "timeInForce": [
+     "GTC",
+     "IOC",
+     "FOK",
+     "GTX",
+     "GTD"
+    ],
+    "permissionSets": [
+     "GRID",
+     "COPY",
+     "DCA",
+     "PSB"
+    ]
+   },
+   {
+    "symbol": "SOLUSDT",
+    "pair": "SOLUSDT",
+    "contractType": "PERPETUAL",
+    "deliveryDate": 4133404800000,
+    "onboardDate": 1600066800000,
+    "status": "TRADING",
+    "maintMarginPercent": "2.5000",
+    "requiredMarginPercent": "5.0000",
+    "baseAsset": "SOL",
+    "quoteAsset": "USDT",
+    "marginAsset": "USDT",
+    "pricePrecision": 4,
+    "quantityPrecision": 2,
+    "baseAssetPrecision": 8,
+    "quotePrecision": 8,
+    "underlyingType": "COIN",
+    "underlyingSubType": [
+     "Layer-1",
+     "Crypto"
+    ],
+    "triggerProtect": "0.0300",
+    "liquidationFee": "0.015000",
+    "marketTakeBound": "0.03",
+    "maxMoveOrderLimit": 10000,
+    "filters": [
+     {
+      "maxPrice": "6857",
+      "filterType": "PRICE_FILTER",
+      "minPrice": "0.4200",
+      "tickSize": "0.0100"
+     },
+     {
+      "stepSize": "0.01",
+      "minQty": "0.01",
+      "filterType": "LOT_SIZE",
+      "maxQty": "1000000"
+     },
+     {
+      "stepSize": "0.01",
+      "minQty": "0.01",
+      "filterType": "MARKET_LOT_SIZE",
+      "maxQty": "80000"
+     },
+     {
+      "filterType": "MAX_NUM_ORDERS",
+      "limit": 200
+     },
+     {
+      "filterType": "MIN_NOTIONAL",
+      "notional": "5"
+     },
+     {
+      "multiplierDown": "0.9700",
+      "multiplierUp": "1.0300",
+      "multiplierDecimal": "4",
+      "filterType": "PERCENT_PRICE"
+     },
+     {
+      "positionControlSide": "NONE",
+      "filterType": "POSITION_RISK_CONTROL"
+     }
+    ],
+    "orderTypes": [
+     "LIMIT",
+     "MARKET",
+     "STOP",
+     "STOP_MARKET",
+     "TAKE_PROFIT",
+     "TAKE_PROFIT_MARKET",
+     "TRAILING_STOP_MARKET"
+    ],
+    "timeInForce": [
+     "GTC",
+     "IOC",
+     "FOK",
+     "GTX",
+     "GTD"
+    ],
+    "permissionSets": [
+     "GRID",
+     "COPY",
+     "DCA",
+     "PSB"
+    ]
+   },
+   {
+    "symbol": "1000PEPEUSDT",
+    "pair": "1000PEPEUSDT",
+    "contractType": "PERPETUAL",
+    "deliveryDate": 4133404800000,
+    "onboardDate": 1683244800000,
+    "status": "TRADING",
+    "maintMarginPercent": "2.5000",
+    "requiredMarginPercent": "5.0000",
+    "baseAsset": "1000PEPE",
+    "quoteAsset": "USDT",
+    "marginAsset": "USDT",
+    "pricePrecision": 7,
+    "quantityPrecision": 0,
+    "baseAssetPrecision": 8,
+    "quotePrecision": 8,
+    "underlyingType": "COIN",
+    "underlyingSubType": [
+     "Meme",
+     "Crypto"
+    ],
+    "triggerProtect": "0.1500",
+    "liquidationFee": "0.015000",
+    "marketTakeBound": "0.15",
+    "maxMoveOrderLimit": 10000,
+    "filters": [
+     {
+      "maxPrice": "200",
+      "minPrice": "0.0000001",
+      "tickSize": "0.0000001",
+      "filterType": "PRICE_FILTER"
+     },
+     {
+      "filterType": "LOT_SIZE",
+      "maxQty": "800000000",
+      "stepSize": "1",
+      "minQty": "1"
+     },
+     {
+      "filterType": "MARKET_LOT_SIZE",
+      "minQty": "1",
+      "maxQty": "100000000",
+      "stepSize": "1"
+     },
+     {
+      "limit": 200,
+      "filterType": "MAX_NUM_ORDERS"
+     },
+     {
+      "filterType": "MIN_NOTIONAL",
+      "notional": "5"
+     },
+     {
+      "multiplierDecimal": "4",
+      "multiplierDown": "0.8500",
+      "multiplierUp": "1.1500",
+      "filterType": "PERCENT_PRICE"
+     },
+     {
+      "filterType": "POSITION_RISK_CONTROL",
+      "positionControlSide": "NONE"
+     }
+    ],
+    "orderTypes": [
+     "LIMIT",
+     "MARKET",
+     "STOP",
+     "STOP_MARKET",
+     "TAKE_PROFIT",
+     "TAKE_PROFIT_MARKET",
+     "TRAILING_STOP_MARKET"
+    ],
+    "timeInForce": [
+     "GTC",
+     "IOC",
+     "FOK",
+     "GTX",
+     "GTD"
+    ],
+    "permissionSets": [
+     "GRID",
+     "COPY",
+     "RPI",
+     "DCA",
+     "PSB"
+    ]
+   },
+   {
+    "symbol": "ETHUSDC",
+    "pair": "ETHUSDC",
+    "contractType": "PERPETUAL",
+    "deliveryDate": 4133404800000,
+    "onboardDate": 1704285300000,
+    "status": "TRADING",
+    "maintMarginPercent": "2.5000",
+    "requiredMarginPercent": "5.0000",
+    "baseAsset": "ETH",
+    "quoteAsset": "USDC",
+    "marginAsset": "USDC",
+    "pricePrecision": 2,
+    "quantityPrecision": 3,
+    "baseAssetPrecision": 8,
+    "quotePrecision": 8,
+    "underlyingType": "COIN",
+    "underlyingSubType": [
+     "USDC",
+     "Crypto"
+    ],
+    "triggerProtect": "0.0500",
+    "liquidationFee": "0.012500",
+    "marketTakeBound": "0.05",
+    "maxMoveOrderLimit": 10000,
+    "filters": [
+     {
+      "tickSize": "0.01",
+      "filterType": "PRICE_FILTER",
+      "minPrice": "0.01",
+      "maxPrice": "100000"
+     },
+     {
+      "maxQty": "8000",
+      "minQty": "0.001",
+      "filterType": "LOT_SIZE",
+      "stepSize": "0.001"
+     },
+     {
+      "stepSize": "0.001",
+      "filterType": "MARKET_LOT_SIZE",
+      "maxQty": "700",
+      "minQty": "0.001"
+     },
+     {
+      "limit": 200,
+      "filterType": "MAX_NUM_ORDERS"
+     },
+     {
+      "notional": "20",
+      "filterType": "MIN_NOTIONAL"
+     },
+     {
+      "multiplierDecimal": "4",
+      "multiplierDown": "0.9500",
+      "multiplierUp": "1.0500",
+      "filterType": "PERCENT_PRICE"
+     },
+     {
+      "filterType": "POSITION_RISK_CONTROL",
+      "positionControlSide": "NONE"
+     }
+    ],
+    "orderTypes": [
+     "LIMIT",
+     "MARKET",
+     "STOP",
+     "STOP_MARKET",
+     "TAKE_PROFIT",
+     "TAKE_PROFIT_MARKET",
+     "TRAILING_STOP_MARKET"
+    ],
+    "timeInForce": [
+     "GTC",
+     "IOC",
+     "FOK",
+     "GTX",
+     "GTD"
+    ],
+    "permissionSets": [
+     "GRID",
+     "DCA",
+     "PSB"
+    ]
+   },
+   {
+    "symbol": "XAUUSDT",
+    "pair": "XAUUSDT",
+    "contractType": "TRADIFI_PERPETUAL",
+    "deliveryDate": 4133404800000,
+    "onboardDate": 1765440300000,
+    "status": "TRADING",
+    "maintMarginPercent": "2.5000",
+    "requiredMarginPercent": "5.0000",
+    "baseAsset": "XAU",
+    "quoteAsset": "USDT",
+    "marginAsset": "USDT",
+    "pricePrecision": 2,
+    "quantityPrecision": 3,
+    "baseAssetPrecision": 8,
+    "quotePrecision": 8,
+    "underlyingType": "COMMODITY",
+    "underlyingSubType": [
+     "TradFi"
+    ],
+    "triggerProtect": "0.0200",
+    "liquidationFee": "0.015000",
+    "marketTakeBound": "0.02",
+    "maxMoveOrderLimit": 10000,
+    "filters": [
+     {
+      "filterType": "PRICE_FILTER",
+      "tickSize": "0.01",
+      "maxPrice": "200000",
+      "minPrice": "0.01"
+     },
+     {
+      "maxQty": "10000",
+      "stepSize": "0.001",
+      "filterType": "LOT_SIZE",
+      "minQty": "0.001"
+     },
+     {
+      "minQty": "0.001",
+      "maxQty": "1000",
+      "stepSize": "0.001",
+      "filterType": "MARKET_LOT_SIZE"
+     },
+     {
+      "limit": 200,
+      "filterType": "MAX_NUM_ORDERS"
+     },
+     {
+      "filterType": "MIN_NOTIONAL",
+      "notional": "5"
+     },
+     {
+      "multiplierUp": "1.0200",
+      "multiplierDown": "0.9800",
+      "filterType": "PERCENT_PRICE",
+      "multiplierDecimal": "4"
+     },
+     {
+      "filterType": "POSITION_RISK_CONTROL",
+      "positionControlSide": "NONE"
+     }
+    ],
+    "orderTypes": [
+     "LIMIT",
+     "MARKET",
+     "STOP",
+     "STOP_MARKET",
+     "TAKE_PROFIT",
+     "TAKE_PROFIT_MARKET",
+     "TRAILING_STOP_MARKET"
+    ],
+    "timeInForce": [
+     "GTC",
+     "IOC",
+     "FOK",
+     "GTX",
+     "GTD"
+    ],
+    "permissionSets": [
+     "GRID",
+     "COPY",
+     "RPI",
+     "DCA",
+     "PSB"
+    ]
+   },
+   {
+    "symbol": "TSLAUSDT",
+    "pair": "TSLAUSDT",
+    "contractType": "TRADIFI_PERPETUAL",
+    "deliveryDate": 4133404800000,
+    "onboardDate": 1769610600000,
+    "status": "TRADING",
+    "maintMarginPercent": "2.5000",
+    "requiredMarginPercent": "5.0000",
+    "baseAsset": "TSLA",
+    "quoteAsset": "USDT",
+    "marginAsset": "USDT",
+    "pricePrecision": 5,
+    "quantityPrecision": 2,
+    "baseAssetPrecision": 8,
+    "quotePrecision": 8,
+    "underlyingType": "EQUITY",
+    "underlyingSubType": [
+     "TradFi"
+    ],
+    "triggerProtect": "0.0300",
+    "liquidationFee": "0.015000",
+    "marketTakeBound": "0.03",
+    "maxMoveOrderLimit": 10000,
+    "filters": [
+     {
+      "maxPrice": "100000",
+      "filterType": "PRICE_FILTER",
+      "minPrice": "0.01000",
+      "tickSize": "0.01000"
+     },
+     {
+      "minQty": "0.01",
+      "filterType": "LOT_SIZE",
+      "maxQty": "20000",
+      "stepSize": "0.01"
+     },
+     {
+      "stepSize": "0.01",
+      "maxQty": "2000",
+      "filterType": "MARKET_LOT_SIZE",
+      "minQty": "0.01"
+     },
+     {
+      "filterType": "MAX_NUM_ORDERS",
+      "limit": 200
+     },
+     {
+      "filterType": "MIN_NOTIONAL",
+      "notional": "5"
+     },
+     {
+      "filterType": "PERCENT_PRICE",
+      "multiplierDown": "0.9700",
+      "multiplierDecimal": "4",
+      "multiplierUp": "1.0300"
+     },
+     {
+      "positionControlSide": "NONE",
+      "filterType": "POSITION_RISK_CONTROL"
+     }
+    ],
+    "orderTypes": [
+     "LIMIT",
+     "MARKET",
+     "STOP",
+     "STOP_MARKET",
+     "TAKE_PROFIT",
+     "TAKE_PROFIT_MARKET",
+     "TRAILING_STOP_MARKET"
+    ],
+    "timeInForce": [
+     "GTC",
+     "IOC",
+     "FOK",
+     "GTX",
+     "GTD"
+    ],
+    "permissionSets": [
+     "GRID",
+     "COPY",
+     "RPI",
+     "DCA",
+     "PSB"
+    ]
+   },
+   {
+    "symbol": "OMGUSDT",
+    "pair": "OMGUSDT",
+    "contractType": "PERPETUAL",
+    "deliveryDate": 1738314000000,
+    "onboardDate": 1593680400000,
+    "status": "SETTLING",
+    "maintMarginPercent": "2.5000",
+    "requiredMarginPercent": "5.0000",
+    "baseAsset": "OMG",
+    "quoteAsset": "USDT",
+    "marginAsset": "USDT",
+    "pricePrecision": 4,
+    "quantityPrecision": 1,
+    "baseAssetPrecision": 8,
+    "quotePrecision": 8,
+    "underlyingType": "COIN",
+    "underlyingSubType": [
+     "Layer-2"
+    ],
+    "triggerProtect": "0.1000",
+    "liquidationFee": "0.015000",
+    "marketTakeBound": "0.10",
+    "maxMoveOrderLimit": 10000,
+    "filters": [
+     {
+      "tickSize": "0.0001",
+      "minPrice": "0.1060",
+      "maxPrice": "1000",
+      "filterType": "PRICE_FILTER"
+     },
+     {
+      "stepSize": "0.1",
+      "filterType": "LOT_SIZE",
+      "maxQty": "1000000",
+      "minQty": "0.1"
+     },
+     {
+      "filterType": "MARKET_LOT_SIZE",
+      "maxQty": "100000",
+      "minQty": "0.1",
+      "stepSize": "0.1"
+     },
+     {
+      "filterType": "MAX_NUM_ORDERS",
+      "limit": 200
+     },
+     {
+      "notional": "5",
+      "filterType": "MIN_NOTIONAL"
+     },
+     {
+      "filterType": "PERCENT_PRICE",
+      "multiplierUp": "1.1000",
+      "multiplierDown": "0.9000",
+      "multiplierDecimal": "4"
+     },
+     {
+      "filterType": "POSITION_RISK_CONTROL",
+      "positionControlSide": "NONE"
+     }
+    ],
+    "orderTypes": [
+     "LIMIT",
+     "MARKET",
+     "STOP",
+     "STOP_MARKET",
+     "TAKE_PROFIT",
+     "TAKE_PROFIT_MARKET",
+     "TRAILING_STOP_MARKET"
+    ],
+    "timeInForce": [
+     "GTC",
+     "IOC",
+     "FOK",
+     "GTX",
+     "GTD"
+    ],
+    "permissionSets": [
+     "GRID",
+     "COPY",
+     "DCA"
+    ]
+   }
+  ]
+ },
+ "tickers": [
+  {
+   "closeTime": 1793355457322,
+   "count": 7556929,
+   "firstId": 2855295556,
+   "highPrice": "0.0056871",
+   "lastId": 2862856517,
+   "lastPrice": "0.0048991",
+   "lastQty": "43500",
+   "lowPrice": "0.0042980",
+   "openPrice": "0.0049371",
+   "openTime": 1793269020000,
+   "priceChange": "-0.0000380",
+   "priceChangePercent": "-0.770",
+   "quoteVolume": "1395988647.1821540",
+   "symbol": "1000PEPEUSDT",
+   "volume": "284749629281",
+   "weightedAvgPrice": "0.0049025"
+  },
+  {
+   "closeTime": 1793355456203,
+   "count": 3639039,
+   "firstId": 3614875324,
+   "highPrice": "103.1600",
+   "lastId": 3618531095,
+   "lastPrice": "96.3200",
+   "lastQty": "105.12",
+   "lowPrice": "92.2500",
+   "openPrice": "100.1200",
+   "openTime": 1793269020000,
+   "priceChange": "-3.8000",
+   "priceChangePercent": "-3.795",
+   "quoteVolume": "3317783341.3519",
+   "symbol": "SOLUSDT",
+   "volume": "34017407.99",
+   "weightedAvgPrice": "97.5319"
+  },
+  {
+   "closeTime": 1793355456415,
+   "count": 6322031,
+   "firstId": 8213661951,
+   "highPrice": "81953.70",
+   "lastId": 8219997910,
+   "lastPrice": "77336.60",
+   "lastQty": "0.002",
+   "lowPrice": "76444.00",
+   "openPrice": "80101.20",
+   "openTime": 1793269020000,
+   "priceChange": "-2764.60",
+   "priceChangePercent": "-3.451",
+   "quoteVolume": "25317883601.49",
+   "symbol": "BTCUSDT",
+   "volume": "320506.281",
+   "weightedAvgPrice": "78993.41"
+  },
+  {
+   "closeTime": 1793355455423,
+   "count": 1871781,
+   "firstId": 218877469,
+   "highPrice": "4046.62",
+   "lastId": 220753525,
+   "lastPrice": "3993.47",
+   "lastQty": "0.389",
+   "lowPrice": "3976.35",
+   "openPrice": "4039.84",
+   "openTime": 1793269020000,
+   "priceChange": "-46.37",
+   "priceChangePercent": "-1.148",
+   "quoteVolume": "2218358117.73",
+   "symbol": "XAUUSDT",
+   "volume": "552126.628",
+   "weightedAvgPrice": "4017.84"
+  },
+  {
+   "closeTime": 1793355457266,
+   "count": 424237,
+   "firstId": 54438630,
+   "highPrice": "407.51000",
+   "lastId": 54863291,
+   "lastPrice": "393.83000",
+   "lastQty": "0.25",
+   "lowPrice": "393.38000",
+   "openPrice": "403.23000",
+   "openTime": 1793269020000,
+   "priceChange": "-9.40000",
+   "priceChangePercent": "-2.331",
+   "quoteVolume": "144967171.51810",
+   "symbol": "TSLAUSDT",
+   "volume": "361574.54",
+   "weightedAvgPrice": "400.93302"
+  },
+  {
+   "closeTime": 1793355457535,
+   "count": 2200812,
+   "firstId": 937899182,
+   "highPrice": "2376.74",
+   "lastId": 940103842,
+   "lastPrice": "2218.41",
+   "lastQty": "0.001",
+   "lowPrice": "2167.83",
+   "openPrice": "2314.91",
+   "openTime": 1793269020000,
+   "priceChange": "-96.50",
+   "priceChangePercent": "-4.169",
+   "quoteVolume": "4313897493.47",
+   "symbol": "ETHUSDC",
+   "volume": "1897868.096",
+   "weightedAvgPrice": "2273.02"
+  }
+ ],
+ "premiumIndex": {
+  "symbol": "SOLUSDT",
+  "markPrice": "96.33000000",
+  "indexPrice": "96.33809609",
+  "estimatedSettlePrice": "96.62294472",
+  "lastFundingRate": "0.00008351",
+  "interestRate": "0.00010000",
+  "nextFundingTime": 1793376000000,
+  "time": 1793355459000
+ }
+}

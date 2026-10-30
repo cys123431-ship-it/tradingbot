@@ -445,6 +445,11 @@ impl BinanceClient {
 
     // -- signed endpoints --------------------------------------------------
 
+    pub async fn account(&self) -> Result<Value, BinanceError> {
+        self.send(Method::Get, "/fapi/v3/account", Vec::new(), true)
+            .await
+    }
+
     pub async fn balance(&self) -> Result<Value, BinanceError> {
         self.send(Method::Get, "/fapi/v3/balance", Vec::new(), true)
             .await

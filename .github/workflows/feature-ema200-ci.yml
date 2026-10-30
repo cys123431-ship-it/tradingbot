@@ -67,6 +67,7 @@ jobs:
           python scripts/tbot_golden.py tbot/tests/golden.json
           python scripts/tbot_golden_plus.py tbot/tests/golden_plus.json
           python scripts/tbot_golden_store.py tbot/tests/golden_store.json
+          python scripts/tbot_golden_ccxt.py tbot/tests/golden_ccxt.json
           git diff --exit-code -- tbot/tests/
       - name: Rust fmt, clippy, tests
         run: |
