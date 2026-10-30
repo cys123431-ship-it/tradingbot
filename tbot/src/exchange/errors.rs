@@ -36,6 +36,14 @@ impl ExchangeError {
         }
     }
 
+    /// ccxt NotSupported for a method this exchange object does not provide.
+    pub fn not_supported(method: &str) -> Self {
+        Self::new(
+            "NotSupported",
+            format!("binance {method}() is not supported"),
+        )
+    }
+
     pub fn from_binance(err: &BinanceError) -> Self {
         let unknown = err.outcome_unknown();
         let (class, message, code) = match err {
