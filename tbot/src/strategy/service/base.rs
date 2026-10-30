@@ -99,7 +99,8 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             return;
         };
         let fut = notifier(text);
-        let res = tokio::spawn(async move { fut.await }).await;
+        // Spawned so a panicking notifier cannot take the trading cycle down.
+        let res = tokio::spawn(fut).await;
         if res.is_err() {
             eprintln!("BTC pullback notification failed");
         }
