@@ -271,6 +271,10 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             markup_button(mark(enabled, "▶️ 전략 ON"), "mc:on"),
             markup_button(mark(!enabled, "⏹ 신규진입 OFF"), "mc:off"),
         ]);
+        rows.push(vec![markup_button(
+            "🛑 완전 끄기 (진입 OFF + 포지션 청산)",
+            "mc:full_off",
+        )]);
         rows.push(vec![
             markup_button(mark(trading_mode == "DRY_RUN", "🧪 DRY_RUN"), "mc:mode:dry"),
             markup_button(mark(trading_mode == "LIVE", "💥 LIVE"), "mc:mode:live"),
@@ -359,6 +363,52 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             );
         }
         json!({"inline_keyboard": rows})
+    }
+
+    /// Full stop: disable new entries, close this strategy's position in the
+    /// current mode, then read config and both modes' state back to prove it.
+    async fn ma_full_off(&self) -> String {
+        if let Err(e) = self.set_ma_raw("enabled", json!(false)).await {
+            return engine_error_text(&e);
+        }
+        let mut lines = vec!["🛑 /macross 완전 끄기".to_string()];
+        match self
+            .ma_call("close_position", json!({ "reason": "manual" }))
+            .await
+        {
+            Ok(v) => {
+                let action = v.get("action").map(value_display).unwrap_or_default();
+                let reason = v.get("reason").map(value_display).unwrap_or_default();
+                if reason == "NO_POSITION" {
+                    lines.push("· 청산: 지금 모드에 보유 포지션 없음".to_string());
+                } else {
+                    lines.push(format!("· 청산 요청: {action} {reason}"));
+                }
+            }
+            Err(e) => lines.push(format!("· ⚠️ 청산 실패: {e}")),
+        }
+
+        let cfg = self.ma_config().await;
+        if cfg_get(&cfg, "enabled").is_none() {
+            lines.push("· ⚠️ 설정을 다시 읽지 못했습니다 — 엔진 상태를 확인하세요".to_string());
+        } else if py_truthy(cfg_get(&cfg, "enabled")) {
+            lines.push("· ⚠️ 설정이 아직 ON 입니다 — 다시 눌러 주세요".to_string());
+        } else {
+            lines.push("· 신규 진입: OFF 확인".to_string());
+        }
+        if self.ma_network().await.is_some() {
+            for mode in ["LIVE", "DRY_RUN"] {
+                match self.ma_call("load_state", json!({ "mode": mode })).await {
+                    Ok(v) if py_truthy(v.get("trade")) => lines.push(format!(
+                        "· ⚠️ {mode} 포지션 남아 있음 — 모드를 {mode}로 바꾼 뒤 다시 완전 끄기"
+                    )),
+                    Ok(_) => lines.push(format!("· {mode} 포지션: 없음")),
+                    Err(e) => lines.push(format!("· ⚠️ {mode} 상태 확인 실패: {e}")),
+                }
+            }
+        }
+        let status = self.ma_status_text().await;
+        format!("{}\n\n{status}", lines.join("\n"))
     }
 
     async fn ma_status_text(&self) -> String {
@@ -466,6 +516,15 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 format!("⏹ /macross 신규 진입 OFF (보유 포지션은 계속 관리)\n\n{status}"),
                 keyboard!(),
             );
+        }
+        if action == "full_off" {
+            return (
+                "⚠️ /macross를 완전히 끌까요?\n· 신규 진입 OFF\n· 지금 모드에 이 전략의 포지션이 있으면 시장가(reduce-only)로 청산\n· 끈 뒤 설정·포지션을 다시 읽어 확인".to_string(),
+                keyboard!(("🛑 완전 끄기 확인", "mc:confirm_full_off")),
+            );
+        }
+        if action == "confirm_full_off" {
+            return (self.ma_full_off().await, keyboard!());
         }
         if action.starts_with("feat:") {
             let status = self.ma_status_text().await;
