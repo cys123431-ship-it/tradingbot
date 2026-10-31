@@ -379,6 +379,15 @@ fn reentry_text(cfg: &Value) -> String {
     }
 }
 
+fn lookback_text(cfg: &Value) -> String {
+    if cfg_int(cfg, "cross_lookback_bars", 1) >= 2 {
+        "직전 봉 또는 2봉 전 크로스 (2봉 전은 크로스 방향이 유지될 때만, 직전 봉 크로스 우선)"
+            .to_string()
+    } else {
+        "직전 봉 크로스만".to_string()
+    }
+}
+
 fn entry_mode_text(cfg: &Value) -> String {
     if cfg_str(cfg, "entry_mode", "") == "trend" {
         format!(
@@ -926,6 +935,11 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 "bm:entry:trend",
             ),
         ]);
+        let lookback_on = cfg_int(cfg, "cross_lookback_bars", 1) >= 2;
+        rows.push(vec![markup_button(
+            mark(lookback_on, "⏮ 2봉 전 크로스도 진입"),
+            if lookback_on { "bm:lb:1" } else { "bm:lb:2" },
+        )]);
         let pls_count = cfg_int(cfg, "profit_lock_switch_count", 0);
         let pls_cb = if pls_count == 0 {
             "bm:pls:on"
@@ -1449,6 +1463,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
              • 봉: {} 마감봉 기준, 진입·청산(반대 크로스) 모두 같은 봉 (3분~4시간 선택)\n\
              • 보유 중 반대 크로스(또는 봉 마감 때 SMA3이 반대편): 시장가(reduce-only) 청산 후 즉시 반대 방향 진입\n\
              • 진입 조건: 종가가 SMA25 기준 진입 방향 쪽에 있을 때만 (반대편이면 그 신호는 건너뜀)\n\
+             • 크로스 진입 범위: {}\n\
              • SMA25 손절: 봉 마감 종가가 SMA25를 반대로 이탈하면 시장가 청산, 이후 새 크로스까지 재진입 안 함 (같은 봉의 반대 크로스가 우선)\n\
              • 수익 확보(증거금 기준): {} (항상 도달 칸 {gap}% 아래, 한 번 올라간 손절은 내려가지 않음)\n\
              • 수익 확보 손절로 청산되면 다음 크로스까지 대기\n\
@@ -1462,6 +1477,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             profit_lock_switch_text(cfg, None),
             rotation_text(cfg),
             timeframe_labels(cfg_str(cfg, "timeframe", "")),
+            lookback_text(cfg),
             lock_table(cfg),
         )
     }
@@ -1884,6 +1900,24 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                         "🔁 익절 자동 전환 OFF: 익절 횟수와 상관없이 선택한 진입 모드를 유지합니다.\n\n{status}"
                     ),
                     kb!(),
+                )
+            }
+            a if a.starts_with("lb:") => {
+                let bars = if a == "lb:2" { 2 } else { 1 };
+                if let Err(e) = self
+                    .set_coin_value("cross_lookback_bars", json!(bars))
+                    .await
+                {
+                    return (Self::engine_error_text(&e), kb!());
+                }
+                let cfg_now = self.config().await;
+                let status = self.format_status().await;
+                (
+                    format!(
+                        "⏮ 크로스 진입 범위: {}\n\n{status}",
+                        lookback_text(&cfg_now)
+                    ),
+                    kb_owned!(),
                 )
             }
             a if a.starts_with("rot:") => {

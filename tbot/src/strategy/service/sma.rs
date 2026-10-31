@@ -1063,6 +1063,70 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         Some(Value::Object(realigned))
     }
 
+    /// With `cross_lookback_bars` = 2: a cross on the bar before the last one
+    /// that still holds now. Crosses older than an exit on that side, or
+    /// already acted on, do not count.
+    fn late_cross_signal(
+        &self,
+        cfg: &Value,
+        state: &Map<String, Value>,
+        result: &Value,
+    ) -> Option<Value> {
+        if int_or_zero(cfg.get("cross_lookback_bars")) < 2 {
+            return None;
+        }
+        if result.get("stale").map(value_truthy).unwrap_or(false) {
+            return None;
+        }
+        let side = result
+            .get("prev_cross_side")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())?
+            .to_string();
+        let cross_bar = int_or_zero(result.get("prev_cross_bar_ms"));
+        if cross_bar == 0 {
+            return None;
+        }
+        let market = result
+            .get("market_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let tf = cfg.get("timeframe").and_then(|v| v.as_str()).unwrap_or("");
+        let block = state
+            .get("reentry_block")
+            .and_then(|v| v.as_object())
+            .and_then(|m| m.get(&market));
+        let (blocked_side, exit_ms) = Self::block_side_and_exit(block);
+        if blocked_side == side {
+            let span = timeframe_ms(tf).unwrap_or(0);
+            if cross_bar + span <= exit_ms {
+                return None;
+            }
+        }
+        let fast = int_or_zero(cfg.get("fast_period"));
+        let slow = int_or_zero(cfg.get("slow_period"));
+        // Same id as the on-time cross of that bar, so one cross enters once.
+        let signal_id = format!("{market}:SMA{fast}/{slow}:{tf}:{side}:{cross_bar}");
+        let processed = state
+            .get("processed_signals")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().any(|s| s.as_str() == Some(signal_id.as_str())))
+            .unwrap_or(false);
+        if processed {
+            return None;
+        }
+        let mut signal = result.as_object().cloned().unwrap_or_default();
+        signal.insert("side".to_string(), Value::String(side));
+        signal.insert(
+            "entry_type".to_string(),
+            Value::String("CROSS_LATE".to_string()),
+        );
+        signal.insert("skip_reason".to_string(), Value::String(String::new()));
+        signal.insert("signal_id".to_string(), Value::String(signal_id));
+        Some(Value::Object(signal))
+    }
+
     /// Python mutates `result["skip_reason"]` when the coin is waiting to re-enter.
     fn entry_signal(
         &self,
@@ -1076,6 +1140,9 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             .unwrap_or(false)
         {
             return Some(result.clone());
+        }
+        if let Some(late) = self.late_cross_signal(cfg, state, result) {
+            return Some(late);
         }
         let mode = cfg.get("entry_mode").and_then(|v| v.as_str()).unwrap_or("");
         let stale = result.get("stale").map(value_truthy).unwrap_or(false);
@@ -1301,6 +1368,9 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 candidates.push(sig);
             }
         }
+        // On-time crosses first; one-bar-late crosses keep their volume order after.
+        candidates
+            .sort_by_key(|s| s.get("entry_type").and_then(|v| v.as_str()) == Some("CROSS_LATE"));
         let crosses: Vec<String> = results
             .iter()
             .filter(|r| {

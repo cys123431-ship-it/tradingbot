@@ -58,6 +58,7 @@ pub fn default_btc_ma_cross_config() -> Value {
         "lock_step_percent": "5",
         "lock_gap_percent": "1",
         "stop_ma_period": STOP_MA_PERIOD,
+        "cross_lookback_bars": 1,
         "working_type": "MARK_PRICE",
         "lock_working_type": "CONTRACT_PRICE",
         "tp_working_type": "CONTRACT_PRICE",
@@ -304,6 +305,10 @@ pub fn normalize_btc_ma_cross_config(raw: Option<&Value>) -> Value {
     let lock_gap = py_decimal_text(cfg_obj.get("lock_gap_percent"), 1.0, 0.1, lock_start_float);
     cfg_obj.insert("lock_gap_percent".into(), Value::String(lock_gap));
     cfg_obj.insert("stop_ma_period".into(), json!(STOP_MA_PERIOD));
+    // 1 = cross on the last closed bar only; 2 = also the bar before it.
+    let lookback =
+        crate::strategy::config_base::py_int(cfg_obj.get("cross_lookback_bars"), 1, 1, 2);
+    cfg_obj.insert("cross_lookback_bars".into(), json!(lookback));
 
     for (key, default) in [
         ("working_type", "MARK_PRICE"),

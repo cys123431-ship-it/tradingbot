@@ -871,3 +871,97 @@ async fn sma25_stop_also_applies_in_dry_run() {
         .unwrap();
     assert_eq!(closed.last().unwrap()["exit_reason"], json!("SMA25_STOP"));
 }
+
+// ------------------------------------------------- 2-bar cross lookback
+
+/// SMA3 crosses above SMA200 on the bar before the last and still holds:
+/// closes ... 100, 106, 107 (SMA200 ~100.1, SMA25 ~100.5).
+fn late_cross_rows() -> Vec<Value> {
+    let mut closes: Vec<f64> = vec![100.0; 218];
+    closes.push(106.0);
+    closes.push(107.0);
+    closes
+        .iter()
+        .enumerate()
+        .map(|(i, c)| json!([T0 + (i as i64) * H1, c, c * 1.001, c * 0.999, c, 10.0]))
+        .collect()
+}
+
+fn cross_harness(name: &str, lookback: i64, rows: Vec<Value>) -> Harness {
+    let root = temp_dir(name);
+    let mut extra = HashMap::new();
+    extra.insert("cross_lookback_bars".to_string(), json!(lookback));
+    let mut h = Harness::new(&root, true, "testnet", 86_000.0, extra);
+    h.rows = rows;
+    h.fake
+        .bars
+        .lock()
+        .unwrap()
+        .insert("1h".to_string(), h.rows.clone());
+    h.now_ms = now_after_default(&h.rows);
+    h.set_time_from_now();
+    h
+}
+
+#[tokio::test]
+async fn cross_from_the_bar_before_is_ignored_by_default() {
+    let h = cross_harness("late_off", 1, late_cross_rows());
+    let result = h.run().await;
+    assert_eq!(result["action"], json!("skip"), "{result}");
+    assert!(!h
+        .state_live()
+        .get("trade")
+        .map(|v| v.is_object())
+        .unwrap_or(false));
+}
+
+#[tokio::test]
+async fn cross_from_the_bar_before_enters_with_lookback_two() {
+    let h = cross_harness("late_on", 2, late_cross_rows());
+    let result = h.run().await;
+    assert_eq!(result["action"], json!("entered"), "{result}");
+    let trade = h.state_live()["trade"].as_object().cloned().unwrap();
+    assert_eq!(trade["side"], json!("LONG"));
+    assert_eq!(trade["entry_type"], json!("CROSS_LATE"));
+    assert_eq!(trade["stop_ma_period"], json!(25));
+    let cross_bar = h.rows[h.rows.len() - 2][0].as_i64().unwrap();
+    let processed = h.state_live()["processed_signals"].clone();
+    assert!(
+        processed.as_array().unwrap().iter().any(|s| s
+            .as_str()
+            .unwrap_or("")
+            .ends_with(&format!(":LONG:{cross_bar}"))),
+        "{processed}"
+    );
+}
+
+#[tokio::test]
+async fn late_cross_that_failed_does_not_enter() {
+    // Crossed up on the bar before, but the last bar fell back below SMA200.
+    let mut rows = late_cross_rows();
+    let n = rows.len();
+    let ts = rows[n - 1][0].as_i64().unwrap();
+    rows[n - 1] = json!([ts, 90.0, 90.09, 89.91, 90.0, 10.0]);
+    let h = cross_harness("late_failed", 2, rows);
+    // The drop is itself an on-time SHORT cross; the failed LONG is not used.
+    let result = h.run().await;
+    let trade = h.state_live()["trade"].as_object().cloned().unwrap();
+    assert_eq!(trade["side"], json!("SHORT"), "{result}");
+    assert_eq!(trade["entry_type"], json!("CROSS"));
+}
+
+#[tokio::test]
+async fn late_cross_older_than_an_exit_on_that_side_does_not_count() {
+    let h = cross_harness("late_after_exit", 2, late_cross_rows());
+    // An SMA25 stop on the LONG side after the cross bar closed.
+    let cross_bar = h.rows[h.rows.len() - 2][0].as_i64().unwrap();
+    let mut state = h.state_live();
+    state.insert(
+        "reentry_block".to_string(),
+        json!({"BTCUSDT": {"side": "LONG", "exit_ms": cross_bar + H1 + 1,
+                           "exit_reason": "SMA25_STOP", "until_cross": true}}),
+    );
+    h.service.save_state("testnet", "LIVE", &mut state).unwrap();
+    let result = h.run().await;
+    assert_ne!(result["action"], json!("entered"), "{result}");
+}

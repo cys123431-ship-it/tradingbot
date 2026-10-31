@@ -707,3 +707,25 @@ async fn full_off_warns_about_a_position_in_the_other_mode() {
     assert!(text.contains("LIVE 포지션 남아 있음"), "{text}");
     assert!(text.contains("DRY_RUN 포지션: 없음"), "{text}");
 }
+
+#[tokio::test]
+async fn lookback_button_toggles_two_bar_cross_entries() {
+    let tmp = common::temp_dir("bm_lookback");
+    let ctx = controller(&tmp);
+    let (_, markup) = press(&ctx, "status").await;
+    assert!(callbacks(&markup).contains(&"bm:lb:2".to_string()));
+
+    let (text, markup) = press(&ctx, "lb:2").await;
+    assert_eq!(ctx.section()["cross_lookback_bars"], json!(2));
+    assert!(text.contains("2봉 전 크로스"), "{text}");
+    assert!(callbacks(&markup).contains(&"bm:lb:1".to_string()));
+    let (rules, _) = press(&ctx, "rules").await;
+    assert!(
+        rules.contains("크로스 진입 범위: 직전 봉 또는 2봉 전"),
+        "{rules}"
+    );
+
+    let (text, _) = press(&ctx, "lb:1").await;
+    assert_eq!(ctx.section()["cross_lookback_bars"], json!(1));
+    assert!(text.contains("직전 봉 크로스만"), "{text}");
+}

@@ -23,6 +23,9 @@ pub struct CrossConfig {
     /// Stop SMA period (0 / missing = no stop line).
     #[serde(default)]
     pub stop_ma_period: Option<i64>,
+    /// 2 = also report a cross on the bar before the last one.
+    #[serde(default)]
+    pub cross_lookback_bars: Option<i64>,
 }
 
 /// Result of `evaluate_cross`.
@@ -52,6 +55,11 @@ pub struct CrossResult {
     pub sma_slow_prev: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sma_stop: Option<f64>,
+    /// Cross on the bar before the last one that still holds on the last bar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev_cross_side: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev_cross_bar_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signal_age_seconds: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -141,6 +149,8 @@ pub fn evaluate_cross(
         sma_fast_prev: None,
         sma_slow_prev: None,
         sma_stop: None,
+        prev_cross_side: None,
+        prev_cross_bar_ms: None,
         signal_age_seconds: None,
         skip_reason: None,
         signal_id: None,
@@ -186,6 +196,21 @@ pub fn evaluate_cross(
     } else {
         None
     };
+    if cfg.cross_lookback_bars.unwrap_or(1) >= 2 && fast.len() >= 3 && slow.len() >= 3 {
+        if let (Some(f2), Some(s2)) = (fast[fast.len() - 3], slow[slow.len() - 3]) {
+            let prev = if f2 <= s2 && f_prev > s_prev && f_now > s_now {
+                Some("LONG")
+            } else if f2 >= s2 && f_prev < s_prev && f_now < s_now {
+                Some("SHORT")
+            } else {
+                None
+            };
+            if let Some(p) = prev {
+                result.prev_cross_side = Some(p.to_string());
+                result.prev_cross_bar_ms = Some(closed[closed.len() - 2][0] as i64);
+            }
+        }
+    }
     let max_age = cfg.signal_max_age_seconds.min(span as f64 / 2000.0);
     let age = result.signal_age_seconds.unwrap_or(0.0);
     result.stale = age > max_age;
