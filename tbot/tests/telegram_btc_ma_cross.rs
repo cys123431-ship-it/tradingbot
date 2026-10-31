@@ -729,3 +729,20 @@ async fn lookback_button_toggles_two_bar_cross_entries() {
     assert_eq!(ctx.section()["cross_lookback_bars"], json!(1));
     assert!(text.contains("직전 봉 크로스만"), "{text}");
 }
+
+#[tokio::test]
+async fn all_coins_scope_button_is_separate_from_top_alts() {
+    let tmp = common::temp_dir("bm_scope_all");
+    let ctx = controller(&tmp);
+    let (_, markup) = press(&ctx, "status").await;
+    let cbs = callbacks(&markup);
+    assert!(cbs.contains(&"bm:scope:all".to_string()));
+    assert!(cbs.contains(&"bm:scope:alts".to_string()));
+
+    let (text, _) = press(&ctx, "scope:all").await;
+    assert_eq!(ctx.section()["scan_scope"], json!("all"));
+    assert!(text.contains("바이낸스 USDT 선물 전체 스캔"), "{text}");
+    let (text, _) = press(&ctx, "scope:alts").await;
+    assert_eq!(ctx.section()["scan_scope"], json!("alts"));
+    assert!(text.contains("상위"), "{text}");
+}

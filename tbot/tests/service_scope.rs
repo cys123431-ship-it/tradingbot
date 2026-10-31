@@ -543,3 +543,101 @@ async fn cross_reverse_does_not_trigger_rotation() {
         .unwrap_or(Value::Null);
     assert!(rotation_pending.is_null());
 }
+
+// ------------------------------------------------------- all-coins scope
+
+#[tokio::test]
+async fn all_scope_scans_every_crypto_perpetual_including_btc() {
+    let root = temp_dir("scope_all_universe");
+    let mut coins = Map::new();
+    for i in 0..60 {
+        coins.insert(
+            format!("C{i:02}USDT"),
+            coin_default(1000.0 - (i as f64), 85_000.0),
+        );
+    }
+    coins.insert("BTCUSDT".to_string(), coin_default(2000.0, 85_000.0));
+    coins.insert("USDCUSDT".to_string(), coin_default(5000.0, 85_000.0));
+    coins.insert(
+        "AAPLUSDT".to_string(),
+        coin_with(
+            4000.0,
+            85_000.0,
+            &[("contract_type", json!("TRADIFI_PERPETUAL"))],
+        ),
+    );
+    let h = ScopeHarness::new(
+        &root,
+        coins,
+        true,
+        cfg_map(vec![("scan_scope", json!("all"))]),
+    );
+    let cfg = h.service.config();
+    assert_eq!(cfg["scan_scope"], json!("all"));
+    let universe = h.service.scan_universe("testnet", &cfg).await.unwrap();
+    let markets: Vec<String> = universe.iter().map(|(_, m, _)| m.clone()).collect();
+    assert_eq!(markets.len(), 61);
+    assert_eq!(markets[0], "BTCUSDT");
+    assert_eq!(markets[1], "C00USDT");
+    assert_eq!(markets[markets.len() - 1], "C59USDT");
+    assert!(!markets.iter().any(|m| m == "USDCUSDT" || m == "AAPLUSDT"));
+
+    // The top-50 alt scope is unchanged and kept separately.
+    let mut alts_cfg = cfg.clone();
+    alts_cfg["scan_scope"] = json!("alts");
+    let alts = h.service.scan_universe("testnet", &alts_cfg).await.unwrap();
+    assert_eq!(alts.len(), 50);
+    assert_eq!(alts[0].1, "C00USDT");
+}
+
+#[tokio::test]
+async fn all_scope_enters_the_highest_volume_cross() {
+    let root = temp_dir("scope_all_entry");
+    let mut coins = Map::new();
+    coins.insert("BTCUSDT".to_string(), coin_default(900.0, 85_000.0));
+    coins.insert("ETHUSDT".to_string(), coin_default(800.0, 86_000.0));
+    coins.insert("SOLUSDT".to_string(), coin_default(700.0, 84_000.0));
+    let h = ScopeHarness::new(
+        &root,
+        coins,
+        true,
+        cfg_map(vec![("scan_scope", json!("all"))]),
+    );
+    let r = h.run().await;
+    assert_eq!(r["action"], json!("entered"), "{r}");
+    let trade = h.state_live()["trade"].as_object().cloned().unwrap();
+    assert_eq!(trade["market_id"], json!("ETHUSDT"));
+    let ledger = h.service.ledger("testnet").unwrap();
+    let mut kinds = std::collections::HashSet::new();
+    kinds.insert("SIGNAL".to_string());
+    let events = {
+        let g = ledger.lock().unwrap();
+        g.recent_events(1, Some(&kinds))
+    };
+    // BTC is part of the all-coins scan.
+    assert_eq!(events[0]["evaluated"], json!(3));
+    assert_eq!(events[0]["scope"], json!("all"));
+}
+
+#[tokio::test]
+async fn all_scope_scan_is_throttled() {
+    let root = temp_dir("scope_all_cooldown");
+    let mut coins = Map::new();
+    coins.insert("ETHUSDT".to_string(), coin_default(800.0, 86_000.0));
+    let h = ScopeHarness::new(
+        &root,
+        coins,
+        true,
+        cfg_map(vec![("scan_scope", json!("all"))]),
+    );
+    let mut state = h.state_live();
+    state.insert("all_scan_ms".to_string(), json!(h.service.now_ms()));
+    h.service.save_state("testnet", "LIVE", &mut state).unwrap();
+    let r = h.run().await;
+    assert_eq!(r["reason"], json!("ALL_SCAN_COOLDOWN"), "{r}");
+    assert!(!h
+        .state_live()
+        .get("trade")
+        .map(|v| v.is_object())
+        .unwrap_or(false));
+}

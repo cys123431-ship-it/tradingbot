@@ -272,6 +272,7 @@ fn scope_text(cfg: &Value) -> String {
             "🏦 TradFi만 — 바이낸스 메인넷 미국주식 + 금 (선물 상장 종목, 24h 거래대금 상위 {size}, 미국 정규장 시간에만 신규 진입)"
         ),
         "alts" => format!("알트 전용 24h 거래대금 상위 {size}개 (BTC 제외, 동시 신호 시 거래대금 1위)"),
+        "all" => "바이낸스 USDT 선물 전체 스캔 (BTC 포함, 스테이블·TradFi 제외, 동시 신호 시 거래대금 1위)".to_string(),
         "single" => {
             let single = cfg_str(cfg, "single_symbol", "");
             let single = if single.is_empty() { "BTCUSDT" } else { single };
@@ -910,7 +911,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         rows.push(vec![
             markup_button(
                 mark(
-                    !matches!(scan_scope, "alts" | "single" | TRADFI_SCOPE),
+                    !matches!(scan_scope, "alts" | "all" | "single" | TRADFI_SCOPE),
                     "🪙 BTC만",
                 ),
                 "bm:scope:btc",
@@ -921,6 +922,10 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             ),
             markup_button(pick_label, "bm:pick"),
         ]);
+        rows.push(vec![markup_button(
+            mark(scan_scope == "all", "🛰 전체 코인 스캔"),
+            "bm:scope:all",
+        )]);
         rows.push(vec![markup_button(
             mark(scan_scope == TRADFI_SCOPE, "🏦 TradFi만 (메인넷)"),
             "bm:scope:tradfi",
@@ -1393,7 +1398,10 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                         detail.push_str(&format!(
                             " · 청산 후 다른 코인 전환 ({exclude} 제외 {evaluated}종목 평가)"
                         ));
-                    } else if event.get("scope").and_then(|v| v.as_str()) == Some("alts") {
+                    } else if matches!(
+                        event.get("scope").and_then(|v| v.as_str()),
+                        Some("alts" | "all")
+                    ) {
                         let evaluated = event
                             .get("evaluated")
                             .map(value_display)
@@ -1806,7 +1814,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                     );
                     return (body, kb!());
                 }
-                if scope == "btc" || scope == "alts" {
+                if scope == "btc" || scope == "alts" || scope == "all" {
                     if let Err(e) = self.set_coin_value("scan_scope", json!(scope)).await {
                         return (Self::engine_error_text(&e), kb!());
                     }

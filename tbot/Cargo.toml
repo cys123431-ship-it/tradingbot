@@ -16,6 +16,7 @@ hex = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 
 [dev-dependencies]
 tempfile = "3"

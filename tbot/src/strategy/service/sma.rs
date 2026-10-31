@@ -24,6 +24,12 @@ use crate::strategy::tradfi;
 pub const PROFIT_LOCK_EXIT_REASON: &str = "PROFIT_LOCK";
 
 const SCAN_CONCURRENCY: usize = 5;
+/// Scope scanning every USDT perpetual (crypto only, BTC included).
+pub(crate) const ALL_SCOPE: &str = "all";
+/// Parallel kline requests for the all-coins scan.
+const ALL_SCAN_CONCURRENCY: usize = 8;
+/// Minimum gap between all-coins scans (one scan costs ~2 weight per coin).
+const ALL_SCAN_MIN_INTERVAL_MS: i64 = 60_000;
 const UNIVERSE_TTL_MS: i64 = 600_000;
 
 const STABLE_BASES: &[&str] = &[
@@ -195,7 +201,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             let (ccxt_symbol, market_id) = self.resolve_coin(network, &text).await?;
             return Ok(vec![(ccxt_symbol, market_id, None)]);
         }
-        if scope != "alts" {
+        if scope != "alts" && scope != ALL_SCOPE {
             return Ok(vec![(CCXT_SYMBOL.to_string(), MARKET_ID.to_string(), None)]);
         }
         self.volume_universe(network, cfg).await
@@ -343,8 +349,17 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         network: &str,
         cfg: &Value,
     ) -> Result<Vec<(String, String, Option<f64>)>, ServiceError> {
-        let universe_size = cfg.get("alt_universe_size").cloned().unwrap_or(Value::Null);
-        let cache_key = network.to_string();
+        let all_coins = cfg.get("scan_scope").and_then(|v| v.as_str()) == Some(ALL_SCOPE);
+        let universe_size = if all_coins {
+            Value::String(ALL_SCOPE.to_string())
+        } else {
+            cfg.get("alt_universe_size").cloned().unwrap_or(Value::Null)
+        };
+        let cache_key = if all_coins {
+            format!("{network}:{ALL_SCOPE}")
+        } else {
+            network.to_string()
+        };
         if let Some(cached) = self.universe_cache.lock().unwrap().get(&cache_key).cloned() {
             let ts = cached.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
             let cached_size = cached.get(2).cloned().unwrap_or(Value::Null);
@@ -375,7 +390,8 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         }
         let tickers = ranking.fetch_tickers().await?;
         let mut rows: Vec<(String, String, f64)> = Vec::new();
-        let exclude_btc = cfg.get("alt_exclude_btc").map(value_truthy).unwrap_or(true);
+        let exclude_btc =
+            !all_coins && cfg.get("alt_exclude_btc").map(value_truthy).unwrap_or(true);
         for (symbol, ticker) in tickers.iter() {
             let Some(market) = markets.get(symbol).and_then(|v| v.as_object()) else {
                 continue;
@@ -469,7 +485,11 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.1.cmp(&b.1))
         });
-        let size = int_or_zero(cfg.get("alt_universe_size")) as usize;
+        let size = if all_coins {
+            usize::MAX
+        } else {
+            int_or_zero(cfg.get("alt_universe_size")) as usize
+        };
         let universe: Vec<(String, String, Option<f64>)> = rows
             .into_iter()
             .take(size)
@@ -478,11 +498,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         if universe.is_empty() {
             return Err(ServiceError::new("ValueError", "empty volume universe"));
         }
-        let cached = json!([
-            self.now_ms(),
-            universe_to_value(&universe),
-            cfg.get("alt_universe_size").cloned().unwrap_or(Value::Null),
-        ]);
+        let cached = json!([self.now_ms(), universe_to_value(&universe), universe_size]);
         self.universe_cache
             .lock()
             .unwrap()
@@ -1216,13 +1232,19 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             };
             signal_futures.push(fut);
         }
-        // Simple sequential scan, preserving volume order (concurrency is a
-        // performance detail, not a behavioural one).
+        // Results keep the volume order; only the all-coins scope runs requests
+        // in parallel (hundreds of coins), the others stay sequential.
+        let all_coins = cfg.get("scan_scope").and_then(|v| v.as_str()) == Some(ALL_SCOPE);
+        let concurrency = if all_coins { ALL_SCAN_CONCURRENCY } else { 1 };
+        let _ = SCAN_CONCURRENCY;
+        use futures::stream::StreamExt as _;
+        let outcomes: Vec<_> = futures::stream::iter(signal_futures)
+            .buffered(concurrency)
+            .collect()
+            .await;
         let mut ok = Vec::new();
         let mut errors = Vec::new();
-        let _ = SCAN_CONCURRENCY;
-        for fut in signal_futures {
-            let (res, market_id, volume) = fut.await;
+        for (res, market_id, volume) in outcomes {
             match res {
                 Ok(mut result) => {
                     if let Some(obj) = result.as_object_mut() {
@@ -1299,6 +1321,16 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         let latest = self.latest_closed_bar(&cfg);
         if latest == int_or_zero(state.get("last_evaluated_bar")) {
             return Ok(json!({"action": "waiting", "reason": "WAITING_NEXT_CLOSE"}));
+        }
+        if cfg.get("scan_scope").and_then(|v| v.as_str()) == Some(ALL_SCOPE) {
+            // Keep the all-coins scan far below Binance's request-weight limit
+            // even if the bar is not ready and the scan has to be repeated.
+            let now = self.now_ms();
+            if now - int_or_zero(state.get("all_scan_ms")) < ALL_SCAN_MIN_INTERVAL_MS {
+                return Ok(json!({"action": "waiting", "reason": "ALL_SCAN_COOLDOWN"}));
+            }
+            state.insert("all_scan_ms".to_string(), json!(now));
+            self.save_state(network, mode, state)?;
         }
 
         let universe = match self.scan_universe(network, &cfg).await {
@@ -1489,7 +1521,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             }
         }
         let alts = self.volume_universe(network, cfg).await?;
-        if scope == "alts" {
+        if scope == "alts" || scope == ALL_SCOPE {
             return Ok(alts);
         }
         let mut result = vec![(CCXT_SYMBOL.to_string(), MARKET_ID.to_string(), None)];
