@@ -21,7 +21,7 @@ use crate::strategy::service::{
 
 // Re-exported helper used by the service (from trading.rs).
 use crate::strategy::config_base::TRADING_MODE_LIVE;
-use crate::strategy::service::sma::TRANSIENT_ENTRY_BLOCKS;
+use crate::strategy::service::sma::{STOP_MA_EXIT, TRANSIENT_ENTRY_BLOCKS};
 use crate::strategy::service::trading::py_int;
 
 // ---------------------------------------------------------------------------
@@ -680,8 +680,16 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             .and_then(|v| v.get("pending_reverse"))
             .cloned()
             .unwrap_or(Value::Null);
+        let stop_pending = get(&trade, "stop_ma_exit_pending")
+            .map(|v| py_truthy(Some(v)))
+            .unwrap_or(false);
         let flat = position.is_none();
         if flat {
+            if stop_pending {
+                return self
+                    .finalize_live(network, cfg, state, Some(STOP_MA_EXIT))
+                    .await;
+            }
             if py_truthy(Some(&pending)) {
                 let closed = self
                     .finalize_live(network, cfg, state, Some("CROSS_REVERSE"))
@@ -710,6 +718,12 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         if py_truthy(Some(&pending)) {
             return self.reverse_live(network, cfg, state, &pending).await;
         }
+        if stop_pending {
+            // A previous stop-SMA close did not complete: keep closing.
+            return self
+                .close_live(network, cfg, state, "stop_ma", STOP_MA_EXIT)
+                .await;
+        }
         let (signal, _) = self
             .evaluate_new_bar(network, cfg, mode, state, Some(&trade))
             .await?;
@@ -721,6 +735,15 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         let opposite = self.opposite_signal(cfg, &trade, signal.as_ref());
         if let Some(sig) = opposite {
             return self.reverse_live(network, cfg, state, &sig).await;
+        }
+        if self.stop_ma_hit(&trade, signal.as_ref()) {
+            // The SMA200 reversal above wins when both happen on one bar.
+            trade.insert("stop_ma_exit_pending".to_string(), Value::Bool(true));
+            state.insert("trade".to_string(), Value::Object(trade));
+            self.save_state(network, mode, state)?;
+            return self
+                .close_live(network, cfg, state, "stop_ma", STOP_MA_EXIT)
+                .await;
         }
         let mark = match self.premium_index(network, &market).await {
             Ok(map) => py_f(map.get("mark_price"), 0.0),
@@ -1054,7 +1077,32 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         let (signal, _) = self
             .evaluate_new_bar(network, cfg, mode, state, Some(&trade_ref))
             .await?;
-        let signal = self.opposite_signal(cfg, &trade_ref, signal.as_ref());
+        let raw_signal = signal;
+        let signal = self.opposite_signal(cfg, &trade_ref, raw_signal.as_ref());
+        if signal.is_none() && self.stop_ma_hit(&trade_ref, raw_signal.as_ref()) {
+            let price = match self.premium_index(network, &market).await {
+                Ok(map) => py_f(map.get("mark_price"), 0.0),
+                Err(_) => raw_signal
+                    .as_ref()
+                    .map(|s| py_f(s.get("close"), 0.0))
+                    .unwrap_or(0.0),
+            };
+            let price = if long {
+                price * (1.0 - slip)
+            } else {
+                price * (1.0 + slip)
+            };
+            self.finalize_paper(
+                network,
+                cfg,
+                state,
+                &crate::store::ledger::py_float_repr(price),
+                STOP_MA_EXIT,
+                now,
+            )
+            .await?;
+            return Ok(json!({"action": "exited", "reason": STOP_MA_EXIT}));
+        }
         if let Some(sig) = signal {
             let price = match self.premium_index(network, &market).await {
                 Ok(map) => py_f(map.get("mark_price"), 0.0),

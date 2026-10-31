@@ -24,6 +24,8 @@ pub const REENTRY_WAIT_CHOICES: &[i64] = &[1, 3, 6, 0];
 pub const PROFIT_LOCK_SWITCH_CHOICES: &[i64] = &[0, 1, 2, 3, 4, 5];
 pub const LEVERAGE_CHOICES: &[i64] = &[2, 3, 4, 5];
 pub const DEFAULT_LEVERAGE: i64 = 5;
+/// Fixed stop line: close beyond SMA25 against the position exits it.
+pub const STOP_MA_PERIOD: i64 = 25;
 
 pub fn default_btc_ma_cross_config() -> Value {
     json!({
@@ -55,6 +57,7 @@ pub fn default_btc_ma_cross_config() -> Value {
         "lock_start_roi_percent": "5",
         "lock_step_percent": "5",
         "lock_gap_percent": "1",
+        "stop_ma_period": STOP_MA_PERIOD,
         "working_type": "MARK_PRICE",
         "lock_working_type": "CONTRACT_PRICE",
         "tp_working_type": "CONTRACT_PRICE",
@@ -300,6 +303,7 @@ pub fn normalize_btc_ma_cross_config(raw: Option<&Value>) -> Value {
     let lock_start_float = lock_start.parse::<f64>().unwrap_or(5.0);
     let lock_gap = py_decimal_text(cfg_obj.get("lock_gap_percent"), 1.0, 0.1, lock_start_float);
     cfg_obj.insert("lock_gap_percent".into(), Value::String(lock_gap));
+    cfg_obj.insert("stop_ma_period".into(), json!(STOP_MA_PERIOD));
 
     for (key, default) in [
         ("working_type", "MARK_PRICE"),

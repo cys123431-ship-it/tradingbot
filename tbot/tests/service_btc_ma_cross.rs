@@ -596,13 +596,28 @@ fn between_rows() -> Vec<Value> {
         .collect()
 }
 
+/// Like `between_rows`, but the close also sits below SMA25 so the SHORT
+/// entry passes the SMA25 side gate (SMA25 ~107.5, SMA120 ~101.8, SMA200 ~109.1).
+fn between_rows_below_sma25() -> Vec<Value> {
+    let mut closes: Vec<f64> = Vec::with_capacity(220);
+    closes.extend(std::iter::repeat_n(120.0, 100));
+    closes.extend(std::iter::repeat_n(100.0, 92));
+    closes.extend(std::iter::repeat_n(108.0, 25));
+    closes.extend(std::iter::repeat_n(104.0, 3));
+    closes
+        .iter()
+        .enumerate()
+        .map(|(i, c)| json!([T0 + (i as i64) * H1, c, c * 1.001, c * 0.999, c, 10.0]))
+        .collect()
+}
+
 #[tokio::test]
 async fn switching_to_sma120_while_holding_follows_the_new_line() {
     let root = temp_dir("switch_sma");
     let mut extra = HashMap::new();
     extra.insert("entry_mode".to_string(), json!("trend"));
     let mut h = Harness::new(&root, true, "testnet", 86_000.0, extra);
-    h.rows = between_rows();
+    h.rows = between_rows_below_sma25();
     h.fake
         .bars
         .lock()
@@ -628,8 +643,9 @@ async fn switching_to_sma120_while_holding_follows_the_new_line() {
                 .and_then(|v| v.as_i64())
         })
         .unwrap();
+    // Closes above SMA120 and SMA25: the reversal wins over the SMA25 stop.
     h.rows
-        .push(json!([last_ts + H1, 104.0, 104.1, 103.9, 104.0, 10.0]));
+        .push(json!([last_ts + H1, 104.0, 112.1, 103.9, 112.0, 10.0]));
     h.fake
         .bars
         .lock()
@@ -700,4 +716,158 @@ fn _touches() {
     let _ = service::CCXT_SYMBOL;
     let _: Option<Map<String, Value>> = None;
     assert!(approx(1.0, 1.0));
+}
+
+// ---------------------------------------------------------- SMA25 stop line
+
+fn push_bar(h: &mut Harness, close: f64) {
+    let last_ts = h
+        .rows
+        .last()
+        .and_then(|r| {
+            r.as_array()
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_i64())
+        })
+        .unwrap();
+    h.rows.push(json!([
+        last_ts + H1,
+        close,
+        close * 1.001,
+        close * 0.999,
+        close,
+        10.0
+    ]));
+    h.fake
+        .bars
+        .lock()
+        .unwrap()
+        .insert("1h".to_string(), h.rows.clone());
+    h.now_ms = now_after_default(&h.rows);
+    h.set_time_from_now();
+}
+
+fn trend_harness(name: &str, rows: Vec<Value>) -> Harness {
+    let root = temp_dir(name);
+    let mut extra = HashMap::new();
+    extra.insert("entry_mode".to_string(), json!("trend"));
+    let mut h = Harness::new(&root, true, "testnet", 86_000.0, extra);
+    h.rows = rows;
+    h.fake
+        .bars
+        .lock()
+        .unwrap()
+        .insert("1h".to_string(), h.rows.clone());
+    h.now_ms = now_after_default(&h.rows);
+    h.set_time_from_now();
+    h
+}
+
+#[tokio::test]
+async fn entry_is_skipped_when_close_is_on_the_wrong_side_of_sma25() {
+    // SHORT trend (below SMA200) but the close 104 is above SMA25 (~100.5).
+    let h = trend_harness("sma25_gate", between_rows());
+    let result = h.run().await;
+    assert_eq!(result["action"], json!("skip"), "{result}");
+    let reason = result["reason"].as_str().unwrap_or("");
+    assert!(reason.starts_with("STOP_MA_SIDE_MISMATCH"), "{reason}");
+    assert!(!h
+        .state_live()
+        .get("trade")
+        .map(|v| v.is_object())
+        .unwrap_or(false));
+}
+
+#[tokio::test]
+async fn sma25_stop_closes_the_position_and_waits_for_a_new_cross() {
+    let mut h = trend_harness("sma25_stop", between_rows_below_sma25());
+    assert_eq!(h.run().await["action"], json!("entered"));
+    let trade = h.state_live()["trade"].as_object().cloned().unwrap();
+    assert_eq!(trade["side"], json!("SHORT"));
+    assert_eq!(trade["stop_ma_period"], json!(25));
+
+    // Same bar evaluated again: nothing happens.
+    assert_eq!(h.run().await["action"], json!("managed"));
+
+    // 108.9 closes above SMA25 (~107.56) but stays below SMA200 (~109.00):
+    // no SMA200 cross, so the SMA25 stop fires.
+    push_bar(&mut h, 108.9);
+    let result = h.run().await;
+    assert_eq!(result["action"], json!("exited"), "{result}");
+    let ledger = h.service.ledger("testnet").unwrap();
+    let closed = ledger
+        .lock()
+        .unwrap()
+        .trades(Some("LIVE"), None, None, None, Some("CLOSED"))
+        .unwrap();
+    let last = closed.last().unwrap();
+    assert_eq!(last["side"], json!("SHORT"));
+    assert_eq!(last["exit_reason"], json!("SMA25_STOP"));
+    let state = h.state_live();
+    assert!(!state.get("trade").map(|v| v.is_object()).unwrap_or(false));
+    let block = &state["reentry_block"]["BTCUSDT"];
+    assert_eq!(block["side"], json!("SHORT"));
+    assert_eq!(block["until_cross"], json!(true));
+
+    // Trend mode would normally re-enter after `reentry_wait_bars` (3); after
+    // an SMA25 stop it keeps waiting even with the close back below SMA25.
+    for _ in 0..5 {
+        push_bar(&mut h, 104.0);
+        let result = h.run().await;
+        assert_ne!(result["action"], json!("entered"), "{result}");
+    }
+    let state = h.state_live();
+    assert!(!state.get("trade").map(|v| v.is_object()).unwrap_or(false));
+    assert_eq!(
+        state["reentry_block"]["BTCUSDT"]["until_cross"],
+        json!(true)
+    );
+    let lines = h.service.reentry_wait_lines(&h.service.config(), &state);
+    assert!(lines.iter().any(|l| l.contains("SMA25 손절")), "{lines:?}");
+}
+
+#[tokio::test]
+async fn sma25_stop_is_not_armed_for_trades_opened_before_the_rule() {
+    let mut h = trend_harness("sma25_legacy", between_rows_below_sma25());
+    assert_eq!(h.run().await["action"], json!("entered"));
+    // Simulate a position opened by the previous version (no stop_ma_period).
+    let mut state = h.state_live();
+    state["trade"]
+        .as_object_mut()
+        .unwrap()
+        .remove("stop_ma_period");
+    h.service.save_state("testnet", "LIVE", &mut state).unwrap();
+
+    push_bar(&mut h, 108.9);
+    assert_eq!(h.run().await["action"], json!("managed"));
+    assert_eq!(h.state_live()["trade"]["side"], json!("SHORT"));
+}
+
+#[tokio::test]
+async fn sma25_stop_also_applies_in_dry_run() {
+    let root = temp_dir("sma25_paper");
+    let mut extra = HashMap::new();
+    extra.insert("entry_mode".to_string(), json!("trend"));
+    extra.insert("emergency_stop_roi_percent".to_string(), json!(0));
+    let mut h = Harness::new(&root, false, "testnet", 86_000.0, extra);
+    h.rows = between_rows_below_sma25();
+    h.fake
+        .bars
+        .lock()
+        .unwrap()
+        .insert("1h".to_string(), h.rows.clone());
+    h.now_ms = now_after_default(&h.rows);
+    h.set_time_from_now();
+    assert_eq!(h.run().await["action"], json!("entered"));
+    assert_eq!(h.state("DRY_RUN")["trade"]["side"], json!("SHORT"));
+    push_bar(&mut h, 108.9);
+    let result = h.run().await;
+    assert_eq!(result["action"], json!("exited"), "{result}");
+    let ledger = h.service.ledger("testnet").unwrap();
+    let closed = ledger
+        .lock()
+        .unwrap()
+        .trades(Some("DRY_RUN"), None, None, None, Some("CLOSED"))
+        .unwrap();
+    assert_eq!(closed.last().unwrap()["exit_reason"], json!("SMA25_STOP"));
 }

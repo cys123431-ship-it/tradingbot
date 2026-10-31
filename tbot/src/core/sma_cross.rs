@@ -20,6 +20,9 @@ pub struct CrossConfig {
     pub max_zero_range_bar_share: Option<f64>,
     #[serde(deserialize_with = "de_f64")]
     pub signal_max_age_seconds: f64,
+    /// Stop SMA period (0 / missing = no stop line).
+    #[serde(default)]
+    pub stop_ma_period: Option<i64>,
 }
 
 /// Result of `evaluate_cross`.
@@ -47,6 +50,8 @@ pub struct CrossResult {
     pub sma_fast_prev: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sma_slow_prev: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sma_stop: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signal_age_seconds: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -135,6 +140,7 @@ pub fn evaluate_cross(
         sma_slow: None,
         sma_fast_prev: None,
         sma_slow_prev: None,
+        sma_stop: None,
         signal_age_seconds: None,
         skip_reason: None,
         signal_id: None,
@@ -167,6 +173,11 @@ pub fn evaluate_cross(
     result.sma_slow = Some(s_now);
     result.sma_fast_prev = Some(f_prev);
     result.sma_slow_prev = Some(s_prev);
+    if let Some(p) = cfg.stop_ma_period.filter(|p| *p > 0) {
+        if let Some(Some(v)) = sma_opt(&closes, p as usize).last() {
+            result.sma_stop = Some(*v);
+        }
+    }
     result.signal_age_seconds = Some((now_ms - bar[0] as i64 - span) as f64 / 1000.0);
     result.trend_side = if f_now > s_now {
         Some("LONG".to_string())
@@ -207,6 +218,16 @@ pub fn evaluate_cross(
         symbol, fast_p, slow_p, timeframe, side, bar[0] as i64
     ));
     result
+}
+
+/// True when `close` sits on the losing side of the stop SMA for `side`
+/// (LONG below it, SHORT above it).
+pub fn beyond_stop_ma(side: &str, close: f64, sma_stop: f64) -> bool {
+    if side == "LONG" {
+        close < sma_stop
+    } else {
+        close > sma_stop
+    }
 }
 
 /// Margin ROI in percent.

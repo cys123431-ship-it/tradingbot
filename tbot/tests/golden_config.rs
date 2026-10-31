@@ -135,7 +135,12 @@ fn run_case(case: &Value) -> bool {
         }
         "normalize_btc_ma_cross_config" => {
             let raw = as_opt_value(&args, "raw");
-            normalize_btc_ma_cross_config(raw.as_ref())
+            let mut out = normalize_btc_ma_cross_config(raw.as_ref());
+            // Rust-only addition (SMA25 stop line); Python never had it.
+            if let Some(obj) = out.as_object_mut() {
+                assert_eq!(obj.remove("stop_ma_period"), Some(serde_json::json!(25)));
+            }
+            out
         }
         "normalize_ma_cross_config" => {
             let raw = as_opt_value(&args, "raw");

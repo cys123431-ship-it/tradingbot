@@ -42,8 +42,15 @@ pub(crate) const TRANSIENT_ENTRY_BLOCKS: &[&str] = &[
     "POSITION_MODE_UNKNOWN",
 ];
 
+/// Exit reason when the close crosses the stop SMA against the position.
+pub(crate) const STOP_MA_EXIT: &str = "SMA25_STOP";
+const STOP_MA_SIDE_MISMATCH: &str = "STOP_MA_SIDE_MISMATCH";
+const STOP_MA_UNAVAILABLE: &str = "STOP_MA_UNAVAILABLE";
+
 // Skip reasons tied to a single coin: the scan tries the next candidate.
 const SYMBOL_SPECIFIC_BLOCKS: &[&str] = &[
+    STOP_MA_SIDE_MISMATCH,
+    STOP_MA_UNAVAILABLE,
     "BELOW_EXCHANGE_MINIMUM",
     "ABOVE_MAX_QTY",
     "ACCOUNT_SETUP_MISMATCH",
@@ -126,6 +133,39 @@ fn value_truthy(value: &Value) -> bool {
 }
 
 /// Python `D(value)`: invalid input raises instead of becoming zero.
+fn as_f64(value: Option<&Value>) -> Option<f64> {
+    match value? {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// Entry gate: the close must already be on the signal's side of the stop
+/// SMA (LONG above, SHORT below); otherwise the signal is skipped.
+fn stop_ma_entry_block(cfg: &Value, signal: &Value) -> String {
+    let period = int_or_zero(cfg.get("stop_ma_period"));
+    if period <= 0 {
+        return String::new();
+    }
+    let side = signal.get("side").and_then(|v| v.as_str()).unwrap_or("");
+    match (as_f64(signal.get("close")), as_f64(signal.get("sma_stop"))) {
+        (Some(close), Some(stop)) => {
+            let ok = (side == "LONG" && close > stop) || (side == "SHORT" && close < stop);
+            if ok {
+                String::new()
+            } else {
+                format!(
+                    "{STOP_MA_SIDE_MISMATCH}: 종가 {} · SMA{period} {} (진입 방향과 반대편)",
+                    crate::store::ledger::py_float_repr(close),
+                    crate::store::ledger::py_float_repr(stop)
+                )
+            }
+        }
+        _ => format!("{STOP_MA_UNAVAILABLE}: SMA{period} 값 없음"),
+    }
+}
+
 fn py_dec(value: Option<&Value>) -> Result<Decimal, ServiceError> {
     crate::core::rules::d(value, None)
         .map_err(|e| ServiceError::new("TradingRulesError", e.to_string()))
@@ -814,6 +854,33 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         }
     }
 
+    fn block_until_cross(block: Option<&Value>) -> bool {
+        block
+            .and_then(|b| b.get("until_cross"))
+            .map(value_truthy)
+            .unwrap_or(false)
+    }
+
+    /// True when a freshly closed bar after the entry bar closed beyond the
+    /// stop SMA against `trade`. Only trades armed at entry are stopped.
+    pub(crate) fn stop_ma_hit(&self, trade: &Map<String, Value>, signal: Option<&Value>) -> bool {
+        let Some(signal) = signal else {
+            return false;
+        };
+        if int_or_zero(trade.get("stop_ma_period")) <= 0 {
+            return false;
+        }
+        let bar = int_or_zero(signal.get("bar_open_ms"));
+        if bar == 0 || bar <= int_or_zero(trade.get("signal_bar_ms")) {
+            return false;
+        }
+        let side = trade.get("side").and_then(|v| v.as_str()).unwrap_or("");
+        match (as_f64(signal.get("close")), as_f64(signal.get("sma_stop"))) {
+            (Some(close), Some(stop)) => crate::core::sma_cross::beyond_stop_ma(side, close, stop),
+            _ => false,
+        }
+    }
+
     fn bars_since_exit(&self, cfg: &Value, result: &Value, exit_ms: i64) -> i64 {
         let tf = cfg.get("timeframe").and_then(|v| v.as_str()).unwrap_or("");
         let span = timeframe_ms(tf).unwrap_or(0);
@@ -843,6 +910,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 _ => None,
             });
         let (side, exit_ms) = Self::block_side_and_exit(block);
+        let until_cross = Self::block_until_cross(block);
         let trend_side = result
             .get("trend_side")
             .and_then(|v| v.as_str())
@@ -852,6 +920,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         }
         let needed = int_or_zero(cfg.get("reentry_wait_bars"));
         let waited = self.bars_since_exit(cfg, result, exit_ms);
+        if until_cross {
+            // Stopped out at the stop SMA: only a new cross re-opens entries.
+            return (true, waited, 0);
+        }
         if needed == 0 {
             return (true, waited, 0);
         }
@@ -904,6 +976,12 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 continue;
             }
             let side_text = if side == "LONG" { "롱" } else { "숏" };
+            if Self::block_until_cross(Some(block)) {
+                lines.push(format!(
+                    "{market} {side_text} 재진입 대기: SMA25 손절 → 새 크로스까지"
+                ));
+                continue;
+            }
             let needed = int_or_zero(cfg.get("reentry_wait_bars"));
             if needed == 0 {
                 lines.push(format!("{market} {side_text} 재진입 대기: 반대 크로스까지"));
@@ -1600,9 +1678,13 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             )]),
         )?;
         self.set_phase(network, mode, state, PRE_TRADE_VALIDATION, Map::new())?;
-        let (decision, reason, context) = self
-            .pre_trade_validation(network, cfg, mode, signal)
-            .await?;
+        let gate = stop_ma_entry_block(cfg, signal);
+        let (decision, reason, context) = if gate.is_empty() {
+            self.pre_trade_validation(network, cfg, mode, signal)
+                .await?
+        } else {
+            (None, gate, Map::new())
+        };
         if let Some(list) = state
             .get_mut("processed_signals")
             .and_then(|v| v.as_array_mut())
@@ -1972,6 +2054,11 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             "tick_size".to_string(),
             Value::String(rules.tick_size.to_string()),
         );
+        // Entries passed the stop-SMA gate, so the stop line is armed.
+        let stop_period = int_or_zero(cfg.get("stop_ma_period"));
+        if stop_period > 0 {
+            trade.insert("stop_ma_period".to_string(), json!(stop_period));
+        }
         Ok(trade)
     }
 
@@ -2011,6 +2098,9 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 "exit_reason".to_string(),
                 trade.get("exit_reason").cloned().unwrap_or(Value::Null),
             );
+            if exit_reason == STOP_MA_EXIT {
+                block.insert("until_cross".to_string(), Value::Bool(true));
+            }
             blocks.insert(market.clone(), Value::Object(block));
             let cfg = self.config();
             let entry_mode = cfg.get("entry_mode").and_then(|v| v.as_str()).unwrap_or("");
@@ -2019,7 +2109,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 .map(value_truthy)
                 .unwrap_or(false);
             let scope = cfg.get("scan_scope").and_then(|v| v.as_str()).unwrap_or("");
-            if entry_mode == "trend" && rotate && scope != "single" {
+            if entry_mode == "trend" && rotate && scope != "single" && exit_reason != STOP_MA_EXIT {
                 let mut rotation = Map::new();
                 rotation.insert("exclude".to_string(), Value::String(market));
                 rotation.insert("exit_ms".to_string(), json!(self.now_ms()));
