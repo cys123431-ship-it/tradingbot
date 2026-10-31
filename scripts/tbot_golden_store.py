@@ -324,7 +324,7 @@ def main(out_path: str) -> None:
                 "daily_loss_entry_lock",
                 {"date": "2026-10-30", "reason": "LOSS_3"},
             )
-            return store.daily_loss_entry_lock_reason()
+            return store.daily_loss_entry_lock_reason(current_date="2026-10-30")
 
         do("store_daily_loss_lock", _daily_loss)
 
@@ -333,7 +333,7 @@ def main(out_path: str) -> None:
                 "daily_loss_entry_lock",
                 {"date": "2026-10-29", "reason": "OLD"},
             )
-            return [store.daily_loss_entry_lock_reason(), store.get_runtime_state("daily_loss_entry_lock")]
+            return [store.daily_loss_entry_lock_reason(current_date="2026-10-30"), store.get_runtime_state("daily_loss_entry_lock")]
 
         do("store_daily_loss_stale", _daily_loss_stale)
 
