@@ -14,6 +14,9 @@ case "${SSH_ORIGINAL_COMMAND:-status}" in
   logs)
     exec "$PYTHON_BIN" scripts/bot_status_readonly.py --logs
     ;;
+  tbot-logs)
+    exec "$PYTHON_BIN" scripts/bot_status_readonly.py --tbot-logs
+    ;;
   "status --json")
     exec "$PYTHON_BIN" scripts/bot_status_readonly.py --json
     ;;
