@@ -655,3 +655,55 @@ async fn updates_from_other_chats_are_ignored() {
     assert!(ctx.bot.handle_update(&cb).await.is_empty());
     assert_ne!(ctx.section()["enabled"], json!(true));
 }
+
+#[tokio::test]
+async fn full_off_disables_and_verifies() {
+    let tmp = common::temp_dir("bm_full_off");
+    let ctx = controller(&tmp);
+    press(&ctx, "confirm_on").await;
+    assert_eq!(ctx.section()["enabled"], json!(true));
+    let (_, markup) = press(&ctx, "status").await;
+    assert!(callbacks(&markup).contains(&"bm:full_off".to_string()));
+
+    let (ask, markup) = press(&ctx, "full_off").await;
+    assert!(ask.contains("완전히 끌까요"));
+    assert!(callbacks(&markup).contains(&"bm:confirm_full_off".to_string()));
+    assert_eq!(ctx.section()["enabled"], json!(true));
+
+    let (text, _) = press(&ctx, "confirm_full_off").await;
+    assert_eq!(ctx.section()["enabled"], json!(false));
+    assert!(text.contains("신규 진입: OFF 확인"), "{text}");
+    assert!(text.contains("보유 포지션 없음"), "{text}");
+    assert!(text.contains("LIVE 포지션: 없음"), "{text}");
+    assert!(text.contains("DRY_RUN 포지션: 없음"), "{text}");
+}
+
+#[tokio::test]
+async fn full_off_warns_about_a_position_in_the_other_mode() {
+    let tmp = common::temp_dir("bm_full_off_other_mode");
+    let ctx = controller(&tmp);
+    let engine = ctx.bot.engine();
+    let mode = engine
+        .call("mode", Some("btc_ma"), json!({}))
+        .await
+        .unwrap();
+    assert_eq!(mode, json!("DRY_RUN"));
+    let network = engine
+        .call("current_network", Some("btc_ma"), json!({}))
+        .await
+        .unwrap();
+    engine
+        .call(
+            "save_state",
+            Some("btc_ma"),
+            json!({"network": network, "mode": "LIVE",
+                   "state": {"trade": {"market_id": "BTCUSDT", "side": "LONG"}}}),
+        )
+        .await
+        .unwrap();
+
+    let (text, _) = press(&ctx, "confirm_full_off").await;
+    assert_eq!(ctx.section()["enabled"], json!(false));
+    assert!(text.contains("LIVE 포지션 남아 있음"), "{text}");
+    assert!(text.contains("DRY_RUN 포지션: 없음"), "{text}");
+}
