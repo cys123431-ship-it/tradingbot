@@ -27,6 +27,10 @@ pub const LEVERAGE_CHOICES: &[i64] = &[2, 3, 4, 5];
 pub const DEFAULT_LEVERAGE: i64 = 5;
 /// Fixed stop line: close beyond SMA25 against the position exits it.
 pub const STOP_MA_PERIOD: i64 = 25;
+/// LIVE: at or below this wallet balance (USDT) the strategy turns itself OFF
+/// before a new entry. 0 = off.
+pub const MIN_BALANCE_CHOICES: &[i64] = &[0, 60, 70, 80, 90, 100];
+pub const DEFAULT_MIN_BALANCE: i64 = 80;
 
 pub fn default_btc_ma_cross_config() -> Value {
     json!({
@@ -60,6 +64,7 @@ pub fn default_btc_ma_cross_config() -> Value {
         "lock_gap_percent": "1",
         "stop_ma_period": STOP_MA_PERIOD,
         "cross_lookback_bars": 1,
+        "min_balance_usdt": DEFAULT_MIN_BALANCE,
         "working_type": "MARK_PRICE",
         "lock_working_type": "CONTRACT_PRICE",
         "tp_working_type": "CONTRACT_PRICE",
@@ -310,6 +315,13 @@ pub fn normalize_btc_ma_cross_config(raw: Option<&Value>) -> Value {
     let lookback =
         crate::strategy::config_base::py_int(cfg_obj.get("cross_lookback_bars"), 1, 1, 2);
     cfg_obj.insert("cross_lookback_bars".into(), json!(lookback));
+    let min_balance = crate::strategy::config_base::py_int(
+        cfg_obj.get("min_balance_usdt"),
+        DEFAULT_MIN_BALANCE,
+        0,
+        100_000,
+    );
+    cfg_obj.insert("min_balance_usdt".into(), json!(min_balance));
 
     for (key, default) in [
         ("working_type", "MARK_PRICE"),

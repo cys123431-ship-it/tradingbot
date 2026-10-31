@@ -729,6 +729,18 @@ fn build_service(
             let cfg = Arc::clone(&cfg);
             let sec = sec.clone();
             Box::pin(async move {
+                if mode == "disable" {
+                    // Strategy turns itself OFF (minimum balance guard).
+                    let mut changes = Map::new();
+                    changes.insert("enabled".to_string(), Value::Bool(false));
+                    return match cfg.update_values(&sec, changes).await {
+                        Ok(saved) => saved.get("enabled").and_then(|v| v.as_bool()) == Some(false),
+                        Err(e) => {
+                            log_line(&format!("engine: disable failed: {e}"));
+                            false
+                        }
+                    };
+                }
                 if mode != "cross" && mode != "trend" {
                     return false;
                 }

@@ -51,6 +51,7 @@ pub(crate) const TRANSIENT_ENTRY_BLOCKS: &[&str] = &[
 /// Exit reason when the close crosses the stop SMA against the position.
 pub(crate) const STOP_MA_EXIT: &str = "SMA25_STOP";
 const STOP_MA_SIDE_MISMATCH: &str = "STOP_MA_SIDE_MISMATCH";
+const MIN_BALANCE_BLOCK: &str = "MIN_BALANCE";
 const STOP_MA_UNAVAILABLE: &str = "STOP_MA_UNAVAILABLE";
 
 // Skip reasons tied to a single coin: the scan tries the next candidate.
@@ -170,6 +171,18 @@ fn stop_ma_entry_block(cfg: &Value, signal: &Value) -> String {
         }
         _ => format!("{STOP_MA_UNAVAILABLE}: SMA{period} 값 없음"),
     }
+}
+
+/// LIVE only: non-empty when the wallet is at or below `min_balance_usdt`.
+fn min_balance_reason(cfg: &Value, mode: &str, wallet: f64) -> String {
+    if mode != crate::strategy::config_base::TRADING_MODE_LIVE {
+        return String::new();
+    }
+    let min = as_f64(cfg.get("min_balance_usdt")).unwrap_or(0.0);
+    if min <= 0.0 || wallet > min {
+        return String::new();
+    }
+    format!("{MIN_BALANCE_BLOCK}: 잔고 {wallet:.2} USDT ≤ 최소 {min} USDT")
 }
 
 fn py_dec(value: Option<&Value>) -> Result<Decimal, ServiceError> {
@@ -870,6 +883,26 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         }
     }
 
+    /// Minimum balance reached with no position: turn the strategy OFF.
+    async fn stop_for_min_balance(&self, reason: &str) {
+        let off = match self.deps.config_writer.clone() {
+            Some(writer) => writer("disable".to_string()).await,
+            None => false,
+        };
+        let text = if off {
+            format!(
+                "⏹ {}: {reason}\n전략을 OFF 했습니다. 입금 후 메뉴에서 다시 켜 주세요.",
+                self.label()
+            )
+        } else {
+            format!(
+                "⚠️ {}: {reason}\n신규 진입을 막았지만 전략 OFF 저장에 실패했습니다.",
+                self.label()
+            )
+        };
+        self.notify(text, Some("min_balance")).await;
+    }
+
     fn block_until_cross(block: Option<&Value>) -> bool {
         block
             .and_then(|b| b.get("until_cross"))
@@ -1321,6 +1354,17 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         let latest = self.latest_closed_bar(&cfg);
         if latest == int_or_zero(state.get("last_evaluated_bar")) {
             return Ok(json!({"action": "waiting", "reason": "WAITING_NEXT_CLOSE"}));
+        }
+        if mode == crate::strategy::config_base::TRADING_MODE_LIVE
+            && as_f64(cfg.get("min_balance_usdt")).unwrap_or(0.0) > 0.0
+        {
+            if let Ok((wallet, _, _, _)) = self.balances(network, &cfg, mode).await {
+                let low = min_balance_reason(&cfg, mode, wallet);
+                if !low.is_empty() {
+                    self.stop_for_min_balance(&low).await;
+                    return Ok(json!({"action": "blocked", "reason": low}));
+                }
+            }
         }
         if cfg.get("scan_scope").and_then(|v| v.as_str()) == Some(ALL_SCOPE) {
             // Keep the all-coins scan far below Binance's request-weight limit
@@ -1810,6 +1854,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             );
             ledger.lock().unwrap().event("SKIP", fields);
             self.set_phase(network, mode, state, IDLE, Map::new())?;
+            if reason.starts_with(MIN_BALANCE_BLOCK) {
+                self.stop_for_min_balance(&reason).await;
+                return Ok(json!({"action": "blocked", "reason": reason}));
+            }
             let market = signal
                 .get("market_id")
                 .map(py_string)
@@ -1862,6 +1910,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             "balance_source".to_string(),
             Value::String(balance_source.to_string()),
         );
+        let low = min_balance_reason(cfg, mode, wallet);
+        if !low.is_empty() {
+            return Ok((None, low, context));
+        }
         if mode == crate::strategy::config_base::TRADING_MODE_LIVE {
             let positions = match self.fetch_account_positions(network).await {
                 Ok(p) => p,

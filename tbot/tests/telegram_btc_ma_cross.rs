@@ -746,3 +746,30 @@ async fn all_coins_scope_button_is_separate_from_top_alts() {
     assert_eq!(ctx.section()["scan_scope"], json!("alts"));
     assert!(text.contains("상위"), "{text}");
 }
+
+#[tokio::test]
+async fn minimum_balance_submenu_sets_the_threshold() {
+    let tmp = common::temp_dir("bm_min_balance");
+    let ctx = controller(&tmp);
+    let (_, markup) = press(&ctx, "status").await;
+    assert!(callbacks(&markup).contains(&"bm:minbal".to_string()));
+
+    let (text, markup) = press(&ctx, "minbal").await;
+    assert!(text.contains("최소 잔고를 고르세요"), "{text}");
+    let cbs = callbacks(&markup);
+    for n in [0, 60, 70, 80, 90, 100] {
+        assert!(cbs.contains(&format!("bm:minbal:{n}")), "{cbs:?}");
+    }
+    assert!(cbs.contains(&"bm:status".to_string()));
+
+    let (text, _) = press(&ctx, "minbal:70").await;
+    assert_eq!(ctx.section()["min_balance_usdt"], json!(70));
+    assert!(text.contains("70 USDT 이하"), "{text}");
+    let (rules, _) = press(&ctx, "rules").await;
+    assert!(rules.contains("최소 잔고: LIVE 잔고 70 USDT"), "{rules}");
+
+    press(&ctx, "minbal:0").await;
+    assert_eq!(ctx.section()["min_balance_usdt"], json!(0));
+    press(&ctx, "minbal:55").await; // not a choice: ignored
+    assert_eq!(ctx.section()["min_balance_usdt"], json!(0));
+}

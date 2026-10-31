@@ -22,6 +22,7 @@ const PICK_LIST_SIZE: usize = 12;
 
 pub const TIMEFRAMES: &[&str] = &["3m", "5m", "15m", "30m", "1h", "2h", "4h"];
 pub const LEVERAGE_CHOICES: &[i64] = &[2, 3, 4, 5];
+use crate::strategy::config_btc_ma::MIN_BALANCE_CHOICES;
 pub const EMERGENCY_STOP_CHOICES: &[i64] = &[0, 10, 20, 30, 50];
 pub const REENTRY_WAIT_CHOICES: &[i64] = &[0, 1, 2, 3, 5];
 pub const SLOW_PERIOD_CHOICES: &[i64] = &[60, 120, 200];
@@ -377,6 +378,20 @@ fn reentry_text(cfg: &Value) -> String {
         "반대 크로스까지 대기".to_string()
     } else {
         format!("{wait}봉 대기 후 같은 방향 재진입 (반대 크로스 시 즉시)")
+    }
+}
+
+fn min_balance_label(cfg: &Value) -> String {
+    match cfg_int(cfg, "min_balance_usdt", 0) {
+        0 => "끔".to_string(),
+        n => format!("{n} USDT"),
+    }
+}
+
+fn min_balance_text(cfg: &Value) -> String {
+    match cfg_int(cfg, "min_balance_usdt", 0) {
+        0 => "끔".to_string(),
+        n => format!("LIVE 잔고 {n} USDT 이하면 (포지션 없을 때) 진입 전에 전략 자동 OFF"),
     }
 }
 
@@ -940,6 +955,10 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 "bm:entry:trend",
             ),
         ]);
+        rows.push(vec![markup_button(
+            format!("💰 최소 잔고: {}", min_balance_label(cfg)),
+            "bm:minbal",
+        )]);
         let lookback_on = cfg_int(cfg, "cross_lookback_bars", 1) >= 2;
         rows.push(vec![markup_button(
             mark(lookback_on, "⏮ 2봉 전 크로스도 진입"),
@@ -1472,6 +1491,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
              • 보유 중 반대 크로스(또는 봉 마감 때 SMA3이 반대편): 시장가(reduce-only) 청산 후 즉시 반대 방향 진입\n\
              • 진입 조건: 종가가 SMA25 기준 진입 방향 쪽에 있을 때만 (반대편이면 그 신호는 건너뜀)\n\
              • 크로스 진입 범위: {}\n\
+             • 최소 잔고: {}\n\
              • SMA25 손절: 봉 마감 종가가 SMA25를 반대로 이탈하면 시장가 청산, 이후 새 크로스까지 재진입 안 함 (같은 봉의 반대 크로스가 우선)\n\
              • 수익 확보(증거금 기준): {} (항상 도달 칸 {gap}% 아래, 한 번 올라간 손절은 내려가지 않음)\n\
              • 수익 확보 손절로 청산되면 다음 크로스까지 대기\n\
@@ -1486,6 +1506,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             rotation_text(cfg),
             timeframe_labels(cfg_str(cfg, "timeframe", "")),
             lookback_text(cfg),
+            min_balance_text(cfg),
             lock_table(cfg),
         )
     }
@@ -1758,6 +1779,49 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                         "💥 LIVE 전환 완료 (다음 주기에 거래소 상태를 먼저 대조합니다)\n\n{status}"
                     ),
                     kb!(),
+                )
+            }
+            "minbal" => {
+                let current = cfg_int(&cfg, "min_balance_usdt", 0);
+                let buttons: Vec<Value> = MIN_BALANCE_CHOICES
+                    .iter()
+                    .map(|n| {
+                        let label = if *n == 0 {
+                            "끄기".to_string()
+                        } else {
+                            format!("{n} USDT")
+                        };
+                        markup_button(mark(current == *n, &label), format!("bm:minbal:{n}"))
+                    })
+                    .collect();
+                let mut rows: Vec<Vec<Value>> = buttons.chunks(3).map(|c| c.to_vec()).collect();
+                rows.push(vec![markup_button("↩️ 돌아가기", "bm:status")]);
+                (
+                    format!(
+                        "💰 최소 잔고를 고르세요.\n\
+                         LIVE에서 포지션이 없을 때 잔고가 이 값 이하이면 새 진입 전에 전략을 OFF 합니다.\n\
+                         지금: {}",
+                        min_balance_text(&cfg)
+                    ),
+                    markup(rows),
+                )
+            }
+            a if a.starts_with("minbal:") => {
+                let choice = a
+                    .split_once(':')
+                    .map(|x| x.1)
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(-1);
+                if MIN_BALANCE_CHOICES.contains(&choice) {
+                    if let Err(e) = self.set_coin_value("min_balance_usdt", json!(choice)).await {
+                        return (Self::engine_error_text(&e), kb!());
+                    }
+                }
+                let cfg_now = self.config().await;
+                let status = self.format_status().await;
+                (
+                    format!("💰 최소 잔고: {}\n\n{status}", min_balance_text(&cfg_now)),
+                    kb_owned!(),
                 )
             }
             "pick" | "scope:single" => {

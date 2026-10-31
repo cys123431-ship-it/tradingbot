@@ -176,7 +176,10 @@ async fn emergency_stop_failure_triggers_failsafe() {
 #[tokio::test]
 async fn below_exchange_minimum_is_skipped() {
     let root = temp_dir("below_min");
-    let h = Harness::new(&root, true, "mainnet", 86_000.0, HashMap::new());
+    // The minimum-balance guard would stop a 10 USDT wallet first.
+    let mut extra = HashMap::new();
+    extra.insert("min_balance_usdt".to_string(), json!(0));
+    let h = Harness::new(&root, true, "mainnet", 86_000.0, extra);
     h.fake.with_state(|s| s.wallet = 10.0);
     let result = h.run().await;
     let reason = result["reason"].as_str().unwrap_or("");
@@ -964,4 +967,51 @@ async fn late_cross_older_than_an_exit_on_that_side_does_not_count() {
     h.service.save_state("testnet", "LIVE", &mut state).unwrap();
     let result = h.run().await;
     assert_ne!(result["action"], json!("entered"), "{result}");
+}
+
+// ------------------------------------------------------- minimum balance
+
+#[tokio::test]
+async fn low_balance_blocks_entry_and_turns_the_strategy_off() {
+    let h = trend_harness("min_balance_low", between_rows_below_sma25());
+    assert_eq!(h.service.config()["min_balance_usdt"], json!(80));
+    h.fake.with_state(|s| s.wallet = 79.5);
+    let result = h.run().await;
+    assert_eq!(result["action"], json!("blocked"), "{result}");
+    let reason = result["reason"].as_str().unwrap_or("");
+    assert!(reason.starts_with("MIN_BALANCE"), "{reason}");
+    assert!(reason.contains("79.50"), "{reason}");
+    assert!(!h
+        .state_live()
+        .get("trade")
+        .map(|v| v.is_object())
+        .unwrap_or(false));
+    let notes = h.notes.lock().unwrap().clone();
+    assert!(notes.iter().any(|n| n.contains("MIN_BALANCE")), "{notes:?}");
+}
+
+#[tokio::test]
+async fn balance_above_the_minimum_enters_normally() {
+    let h = trend_harness("min_balance_ok", between_rows_below_sma25());
+    h.fake.with_state(|s| s.wallet = 80.5);
+    assert_eq!(h.run().await["action"], json!("entered"));
+}
+
+#[tokio::test]
+async fn minimum_balance_can_be_turned_off() {
+    let root = temp_dir("min_balance_off");
+    let mut extra = HashMap::new();
+    extra.insert("entry_mode".to_string(), json!("trend"));
+    extra.insert("min_balance_usdt".to_string(), json!(0));
+    let mut h = Harness::new(&root, true, "testnet", 86_000.0, extra);
+    h.rows = between_rows_below_sma25();
+    h.fake
+        .bars
+        .lock()
+        .unwrap()
+        .insert("1h".to_string(), h.rows.clone());
+    h.now_ms = now_after_default(&h.rows);
+    h.set_time_from_now();
+    h.fake.with_state(|s| s.wallet = 50.0);
+    assert_eq!(h.run().await["action"], json!("entered"));
 }
