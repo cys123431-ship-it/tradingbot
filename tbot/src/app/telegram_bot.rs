@@ -388,6 +388,18 @@ fn coin_error_text(reason: &str) -> String {
     }
 }
 
+/// No position and at least one coin waiting for re-entry.
+fn has_reentry_wait(state: Option<&Value>) -> bool {
+    let Some(state) = state else {
+        return false;
+    };
+    !py_truthy(state.get("trade"))
+        && state
+            .get("reentry_block")
+            .and_then(|v| v.as_object())
+            .is_some_and(|m| !m.is_empty())
+}
+
 fn reentry_text(cfg: &Value) -> String {
     let wait = cfg_int(cfg, "reentry_wait_bars", 3);
     if wait == 0 {
@@ -961,6 +973,12 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             "🛑 완전 끄기 (진입 OFF + 포지션 청산)",
             "bm:full_off",
         )]);
+        if has_reentry_wait(state) {
+            rows.push(vec![markup_button(
+                "🔓 재진입 대기 해제",
+                "bm:reentry_clear",
+            )]);
+        }
         rows.push(vec![
             markup_button(mark(trading_mode == "DRY_RUN", "🧪 DRY_RUN"), "bm:mode:dry"),
             markup_button(mark(trading_mode == "LIVE", "💥 LIVE"), "bm:mode:live"),
@@ -1805,6 +1823,32 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                     .to_string(),
                 kb!(("🛑 완전 끄기 확인", "bm:confirm_full_off")),
             ),
+            "reentry_clear" => {
+                let released = match self.engine_call("clear_reentry", json!({})).await {
+                    Ok(Value::Array(list)) => list
+                        .iter()
+                        .map(value_display)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    Ok(_) => String::new(),
+                    Err(e) => return (Self::engine_error_text(&e), kb!()),
+                };
+                let text = if released.is_empty() {
+                    "재진입 대기 중인 코인이 없습니다.".to_string()
+                } else {
+                    format!(
+                        "🔓 재진입 대기 해제: {released}\n\
+                         다음 봉 마감부터 진입 조건이 맞으면 바로 진입합니다."
+                    )
+                };
+                let status = self.format_status().await;
+                let state_now = self.load_state_or_empty().await;
+                let cfg_now = self.config().await;
+                (
+                    format!("{text}\n\n{status}"),
+                    self.build_keyboard(&cfg_now, None, Some(&state_now)),
+                )
+            }
             "confirm_full_off" => {
                 let text = self.full_off().await;
                 let state_now = self.load_state_or_empty().await;

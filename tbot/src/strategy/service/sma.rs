@@ -1126,6 +1126,31 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         state.insert("reentry_block".to_string(), Value::Object(blocks));
     }
 
+    /// Manual release from Telegram: drop every re-entry block (incl. the
+    /// "until a new cross" block after an SMA25 stop). Entries resume from the
+    /// next closed bar. Returns the released market ids.
+    pub async fn clear_reentry_blocks(&self) -> Result<Vec<String>, ServiceError> {
+        let _guard = self.cycle_lock().lock().await;
+        let cfg = self.config();
+        let mode = self.mode(Some(&cfg));
+        let Some(network) = self.current_network(Some(&cfg)) else {
+            return Ok(Vec::new());
+        };
+        let mut state = self.load_state(&network, &mode)?;
+        let mut released: Vec<String> = state
+            .get("reentry_block")
+            .and_then(|v| v.as_object())
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        released.sort();
+        if released.is_empty() {
+            return Ok(released);
+        }
+        state.insert("reentry_block".to_string(), Value::Object(Map::new()));
+        self.save_state(&network, &mode, &mut state)?;
+        Ok(released)
+    }
+
     pub fn reentry_wait_lines(&self, cfg: &Value, state: &Map<String, Value>) -> Vec<String> {
         let mut lines = Vec::new();
         let latest = json!({"bar_open_ms": self.latest_closed_bar(cfg)});

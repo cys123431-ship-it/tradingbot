@@ -827,6 +827,13 @@ async fn sma25_stop_closes_the_position_and_waits_for_a_new_cross() {
     );
     let lines = h.service.reentry_wait_lines(&h.service.config(), &state);
     assert!(lines.iter().any(|l| l.contains("SMA25 손절")), "{lines:?}");
+
+    // Manual release: the next closed bar enters again (trend mode).
+    let released = h.service.clear_reentry_blocks().await.unwrap();
+    assert_eq!(released, vec!["BTCUSDT".to_string()]);
+    push_bar(&mut h, 104.0);
+    let result = h.run().await;
+    assert_eq!(result["action"], json!("entered"), "{result}");
 }
 
 #[tokio::test]

@@ -806,3 +806,39 @@ async fn loss_guard_submenu_sets_both_limits() {
     let (text, _) = press(&ctx, "mls:0").await;
     assert!(text.contains("손실 한도: 끔"), "{text}");
 }
+
+#[tokio::test]
+async fn reentry_clear_button_releases_the_wait() {
+    let tmp = common::temp_dir("bm_reentry_clear");
+    let ctx = controller(&tmp);
+    let (_, markup) = press(&ctx, "status").await;
+    assert!(!callbacks(&markup).contains(&"bm:reentry_clear".to_string()));
+
+    let engine = ctx.bot.engine();
+    let network = engine
+        .call("current_network", Some("btc_ma"), json!({}))
+        .await
+        .unwrap();
+    engine
+        .call(
+            "save_state",
+            Some("btc_ma"),
+            json!({"network": network, "mode": "DRY_RUN",
+                   "state": {"reentry_block": {"KORUUSDT": {
+                       "side": "LONG", "exit_ms": 1, "exit_reason": "SMA25_STOP",
+                       "until_cross": true}}}}),
+        )
+        .await
+        .unwrap();
+    let (_, markup) = press(&ctx, "status").await;
+    assert!(callbacks(&markup).contains(&"bm:reentry_clear".to_string()));
+
+    let (text, markup) = press(&ctx, "reentry_clear").await;
+    assert!(text.contains("재진입 대기 해제: KORUUSDT"), "{text}");
+    assert!(!callbacks(&markup).contains(&"bm:reentry_clear".to_string()));
+    let state = load_state(&ctx).await;
+    assert_eq!(state["reentry_block"], json!({}));
+
+    let (text, _) = press(&ctx, "reentry_clear").await;
+    assert!(text.contains("대기 중인 코인이 없습니다"), "{text}");
+}
