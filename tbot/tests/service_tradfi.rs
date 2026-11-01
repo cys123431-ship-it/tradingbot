@@ -394,3 +394,90 @@ async fn tradfi_universe_keeps_only_us_equities_and_gold() {
     );
     assert!(!id_set.contains("BTCUSDT"));
 }
+
+// ------------------------------------------------- pinned TradFi coin (/macoin)
+
+fn pinned_harness(root: &std::path::Path, network: &str) -> ScopeHarness {
+    let rows = trend_coins()["BTCUSDT"]["rows"].clone();
+    let mut coins = Map::new();
+    coins.insert(
+        "AAPLUSDT".to_string(),
+        json!({"volume": 900, "rows": rows.clone(), "mark": 200.0,
+               "contract_type": "TRADIFI_PERPETUAL"}),
+    );
+    coins.insert(
+        "XAGUSDT".to_string(),
+        json!({"volume": 800, "rows": rows.clone(), "mark": 30.0,
+               "contract_type": "TRADIFI_PERPETUAL"}),
+    );
+    coins.insert(
+        "ETHUSDT".to_string(),
+        json!({"volume": 700, "rows": rows, "mark": 3000.0}),
+    );
+    let cfg = vec![
+        ("scan_scope".to_string(), json!("single")),
+        ("single_symbol".to_string(), json!("AAPLUSDT")),
+    ];
+    let mut h = ScopeHarness::new(root, coins, true, cfg);
+    {
+        let mut markets = h.fake.markets.lock().unwrap();
+        markets["AAPL/USDT:USDT"]["info"]["underlyingType"] = json!("STOCK");
+        markets["XAG/USDT:USDT"]["info"]["underlyingType"] = json!("COMMODITY");
+        markets["ETH/USDT:USDT"]["info"]["contractType"] = json!("PERPETUAL");
+    }
+    h.service = build_with_network(&h, network);
+    h
+}
+
+#[tokio::test]
+async fn pinned_tradfi_coin_resolves_and_ignores_the_us_session() {
+    let root = temp_dir("tradfi_pinned");
+    let mut h = pinned_harness(&root, "mainnet");
+    h.set_now(SESSION_CLOSED_MS);
+    assert_eq!(h.service.us_session_status()["open"], json!(false));
+
+    let (_, market) = h
+        .service
+        .resolve_single_coin("mainnet", &json!("AAPL"))
+        .await
+        .unwrap();
+    assert_eq!(market, "AAPLUSDT");
+    // Crypto still resolves through the same path.
+    let (_, eth) = h
+        .service
+        .resolve_single_coin("mainnet", &json!("ETH"))
+        .await
+        .unwrap();
+    assert_eq!(eth, "ETHUSDT");
+    // Only US equities + gold are TradFi coins that can be pinned (not silver).
+    let err = h
+        .service
+        .resolve_single_coin("mainnet", &json!("XAG"))
+        .await
+        .unwrap_err();
+    assert!(err.message.starts_with("NOT_TRADFI"), "{}", err.message);
+
+    // The session gate belongs to the TradFi scope, not to a pinned coin.
+    let cfg = h.service.config();
+    assert_eq!(cfg["scan_scope"], json!("single"));
+    assert_eq!(h.service.tradfi_entry_block("mainnet", &cfg), "");
+    let universe = h.service.scan_universe("mainnet", &cfg).await.unwrap();
+    assert_eq!(universe.len(), 1);
+    assert_eq!(universe[0].1, "AAPLUSDT");
+}
+
+#[tokio::test]
+async fn pinned_tradfi_coin_is_mainnet_only() {
+    let root = temp_dir("tradfi_pinned_testnet");
+    let h = pinned_harness(&root, "testnet");
+    let err = h
+        .service
+        .resolve_single_coin("testnet", &json!("AAPL"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.message.starts_with("TRADFI_MAINNET_ONLY"),
+        "{}",
+        err.message
+    );
+}

@@ -355,6 +355,14 @@ fn profit_lock_switch_button(cfg: &Value, state: Option<&Value>) -> String {
     format!("🔁 익절{count}회→돌파 강제: ON ({done}/{count}){forced}")
 }
 
+/// True when `resolve_tradfi_coin` accepted `market_id` (a TradFi contract).
+fn resolved_tradfi(market_id: &str, resolved: &Result<Value, String>) -> bool {
+    matches!(
+        resolved,
+        Ok(v) if v.get("market_id").and_then(|m| m.as_str()) == Some(market_id)
+    )
+}
+
 fn coin_error_text(reason: &str) -> String {
     let (code, symbol) = match reason.split_once(':') {
         Some((c, s)) => (c, s),
@@ -368,6 +376,12 @@ fn coin_error_text(reason: &str) -> String {
         "NOT_TRADING" => format!("{symbol}은(는) 지금 거래가 중지된 상태입니다."),
         "STABLECOIN" => format!("{symbol}은(는) 스테이블코인이라 지정할 수 없습니다."),
         "TRADFI" => format!("{symbol}은(는) 주식·원자재(TradFi) 계약이라 지정할 수 없습니다."),
+        "NOT_TRADFI" => {
+            format!("{symbol}은(는) 지정할 수 있는 TradFi 종목이 아닙니다 (미국주식·금만 가능).")
+        }
+        "TRADFI_MAINNET_ONLY" => {
+            "TradFi 종목은 바이낸스 메인넷에서만 지정할 수 있습니다 (/setup).".to_string()
+        }
         _ => format!("코인을 확인하지 못했습니다: {reason}"),
     }
 }
@@ -1576,7 +1590,13 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 let code = e.split(':').next().unwrap_or("");
                 if matches!(
                     code,
-                    "SYMBOL_EMPTY" | "SYMBOL_NOT_FOUND" | "NOT_TRADING" | "STABLECOIN" | "TRADFI"
+                    "SYMBOL_EMPTY"
+                        | "SYMBOL_NOT_FOUND"
+                        | "NOT_TRADING"
+                        | "STABLECOIN"
+                        | "TRADFI"
+                        | "NOT_TRADFI"
+                        | "TRADFI_MAINNET_ONLY"
                 ) {
                     return (false, format!("⚠️ {}", coin_error_text(&e)));
                 }
@@ -1608,6 +1628,18 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                     "\n(보유 중인 {held_market} 포지션은 그대로 관리, 청산 후부터 {market_id}만 진입)"
                 );
             }
+        }
+        let tradfi = resolved_tradfi(
+            &market_id,
+            &self
+                .engine_call(
+                    "resolve_tradfi_coin",
+                    json!({ "network": network, "text": market_id }),
+                )
+                .await,
+        );
+        if tradfi {
+            note.push_str("\n🏦 TradFi 종목: 미국 정규장이 닫혀 있어도 신호가 나면 진입합니다.");
         }
         (
             true,
@@ -1829,6 +1861,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 let body = format!(
                     "🎯 거래할 코인 1개를 고르세요 (거래대금 상위 순).\n\
                      목록에 없는 코인은 /macoin SOL 처럼 입력하면 됩니다.\n\
+                     TradFi(미국주식·금)도 /macoin NVDA 처럼 지정할 수 있습니다 (메인넷, 장 시간 제한 없음).\n\
                      지금: {}",
                     scope_text(&cfg)
                 );

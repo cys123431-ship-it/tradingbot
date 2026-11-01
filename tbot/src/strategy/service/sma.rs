@@ -211,7 +211,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         }
         if scope == "single" {
             let text = cfg.get("single_symbol").cloned().unwrap_or(Value::Null);
-            let (ccxt_symbol, market_id) = self.resolve_coin(network, &text).await?;
+            let (ccxt_symbol, market_id) = self.resolve_single_coin(network, &text).await?;
             return Ok(vec![(ccxt_symbol, market_id, None)]);
         }
         if scope != "alts" && scope != ALL_SCOPE {
@@ -226,6 +226,22 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         text: &Value,
     ) -> Result<(String, String), ServiceError> {
         self.resolve_market(network, text, "crypto").await
+    }
+
+    /// Coin pinned with /macoin: crypto first, else a TradFi contract
+    /// (mainnet, US equities + gold). Pinned TradFi coins are not limited to
+    /// the US regular session; only the TradFi scope is.
+    pub async fn resolve_single_coin(
+        &self,
+        network: &str,
+        text: &Value,
+    ) -> Result<(String, String), ServiceError> {
+        match self.resolve_coin(network, text).await {
+            Err(err) if err.message.starts_with("TRADFI:") => {
+                self.resolve_tradfi_coin(network, text).await
+            }
+            other => other,
+        }
     }
 
     pub async fn resolve_tradfi_coin(

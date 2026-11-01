@@ -344,7 +344,7 @@ impl<E: FuturesExchange + 'static> Engine<E> {
                     .ok_or_else(|| "ValueError: missing network".to_string())?;
                 let text = req.arg("text").cloned().unwrap_or(Value::Null);
                 let (symbol, market) = service
-                    .resolve_coin(&network, &text)
+                    .resolve_single_coin(&network, &text)
                     .await
                     .map_err(|e| e.to_string())?;
                 Ok(json!({"ccxt_symbol": symbol, "market_id": market}))
