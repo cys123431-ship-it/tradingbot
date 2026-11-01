@@ -1128,3 +1128,62 @@ async fn loss_guards_can_be_turned_off() {
     closed_trade(&h, "c", "-1.0", now - 1_000);
     assert_eq!(h.run().await["action"], json!("entered"));
 }
+
+// ---------------------------------------------------------- manual adoption
+
+#[tokio::test]
+async fn adopted_manual_position_is_managed_by_the_rules() {
+    let mut h = trend_harness("adopt_manual", between_rows_below_sma25());
+    let refused = h.service.adopt_position(false).await.unwrap();
+    assert_eq!(refused["ok"], json!(false));
+    assert_eq!(refused["reason"], json!("NO_POSITION"));
+
+    h.fake.with_state(|s| {
+        s.leverage = 5;
+        s.position = Some(json!({"side": "short", "contracts": 0.002, "entryPrice": 86000.0}));
+    });
+    let preview = h.service.adopt_position(false).await.unwrap();
+    assert_eq!(preview["ok"], json!(true), "{preview}");
+    assert_eq!(preview["side"], json!("SHORT"));
+    assert_eq!(preview["leverage"], json!(5));
+    assert!(!h
+        .state_live()
+        .get("trade")
+        .map(|v| v.is_object())
+        .unwrap_or(false));
+
+    let adopted = h.service.adopt_position(true).await.unwrap();
+    assert_eq!(adopted["ok"], json!(true), "{adopted}");
+    let trade = h.state_live()["trade"].as_object().cloned().unwrap();
+    assert_eq!(trade["side"], json!("SHORT"));
+    assert_eq!(trade["entry_type"], json!("MANUAL"));
+    assert_eq!(trade["stop_ma_period"], json!(25));
+    assert_eq!(trade["leverage"], json!(5));
+    let again = h.service.adopt_position(false).await.unwrap();
+    assert_eq!(again["reason"], json!("STRATEGY_POSITION_EXISTS"));
+
+    // Same bar: managed only. Next close above SMA25: the SMA25 stop fires.
+    assert_eq!(h.run().await["action"], json!("managed"));
+    push_bar(&mut h, 108.9);
+    let result = h.run().await;
+    assert_eq!(result["action"], json!("exited"), "{result}");
+    let ledger = h.service.ledger("testnet").unwrap();
+    let closed = ledger
+        .lock()
+        .unwrap()
+        .trades(Some("LIVE"), None, None, None, Some("CLOSED"))
+        .unwrap();
+    assert_eq!(closed.last().unwrap()["exit_reason"], json!("SMA25_STOP"));
+}
+
+#[tokio::test]
+async fn adoption_warns_when_the_position_is_against_the_trend() {
+    let h = trend_harness("adopt_against", between_rows_below_sma25());
+    h.fake.with_state(|s| {
+        s.position = Some(json!({"side": "long", "contracts": 0.002, "entryPrice": 86000.0}));
+    });
+    let preview = h.service.adopt_position(false).await.unwrap();
+    assert_eq!(preview["ok"], json!(true), "{preview}");
+    let warnings = preview["warnings"].to_string();
+    assert!(warnings.contains("추세가 SHORT"), "{warnings}");
+}

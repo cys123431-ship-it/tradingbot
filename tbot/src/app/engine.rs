@@ -401,6 +401,14 @@ impl<E: FuturesExchange + 'static> Engine<E> {
                 let lines = service.reentry_wait_lines(&cfg, &state);
                 Ok(Value::Array(lines.into_iter().map(Value::String).collect()))
             }
+            "adopt_position" => {
+                let service = self.service_for(&req)?;
+                let apply = req.arg("apply").and_then(|v| v.as_bool()).unwrap_or(false);
+                service
+                    .adopt_position(apply)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
             "clear_reentry" => {
                 let service = self.service_for(&req)?;
                 let released = service

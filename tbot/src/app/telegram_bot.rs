@@ -400,6 +400,58 @@ fn has_reentry_wait(state: Option<&Value>) -> bool {
             .is_some_and(|m| !m.is_empty())
 }
 
+/// Telegram text for an `adopt_position` refusal.
+fn adopt_error_text(result: &Value) -> String {
+    let detail = result.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+    match result.get("reason").and_then(|v| v.as_str()).unwrap_or("") {
+        "NOT_LIVE" => "LIVE 모드에서만 맡길 수 있습니다.".to_string(),
+        "STRATEGY_POSITION_EXISTS" => "봇이 이미 포지션을 관리 중입니다.".to_string(),
+        "BUSY" => format!("봇이 주문을 처리 중입니다 ({detail}). 잠시 후 다시 눌러 주세요."),
+        "NO_POSITION" => "거래소에 열린 포지션이 없습니다.".to_string(),
+        "MULTIPLE_POSITIONS" => {
+            format!(
+                "포지션이 여러 개라 맡길 수 없습니다: {detail}\n하나만 남긴 뒤 다시 눌러 주세요."
+            )
+        }
+        other => format!("포지션을 확인하지 못했습니다: {other} {detail}"),
+    }
+}
+
+/// Position summary + warnings shown before and after adoption.
+fn adopt_summary(result: &Value) -> String {
+    let side = result.get("side").and_then(|v| v.as_str()).unwrap_or("");
+    let side_text = if side == "LONG" { "롱" } else { "숏" };
+    let mut text = format!(
+        "{} {side_text} {} @ {} · {}x · 증거금 {:.2} USDT",
+        result
+            .get("market_id")
+            .map(value_display)
+            .unwrap_or_default(),
+        result
+            .get("quantity")
+            .map(value_display)
+            .unwrap_or_default(),
+        result
+            .get("entry_price")
+            .map(value_display)
+            .unwrap_or_default(),
+        result
+            .get("leverage")
+            .map(value_display)
+            .unwrap_or_default(),
+        result.get("margin").and_then(|v| v.as_f64()).unwrap_or(0.0),
+    );
+    for w in result
+        .get("warnings")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        text.push_str(&format!("\n⚠️ {}", value_display(w)));
+    }
+    text
+}
+
 fn reentry_text(cfg: &Value) -> String {
     let wait = cfg_int(cfg, "reentry_wait_bars", 3);
     if wait == 0 {
@@ -973,6 +1025,13 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             "🛑 완전 끄기 (진입 OFF + 포지션 청산)",
             "bm:full_off",
         )]);
+        let holding = state.is_some_and(|s| py_truthy(s.get("trade")));
+        if trading_mode == "LIVE" && !holding {
+            rows.push(vec![markup_button(
+                "🤝 수동 포지션 관리 맡기기",
+                "bm:adopt",
+            )]);
+        }
         if has_reentry_wait(state) {
             rows.push(vec![markup_button(
                 "🔓 재진입 대기 해제",
@@ -1823,6 +1882,52 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                     .to_string(),
                 kb!(("🛑 완전 끄기 확인", "bm:confirm_full_off")),
             ),
+            "adopt" => {
+                let preview = match self
+                    .engine_call("adopt_position", json!({"apply": false}))
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => return (Self::engine_error_text(&e), kb!()),
+                };
+                if preview.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                    return (format!("🤝 {}", adopt_error_text(&preview)), kb!());
+                }
+                (
+                    format!(
+                        "🤝 이 포지션을 봇에게 맡길까요?\n{}\n\n\
+                         맡기면 봇이 연 포지션처럼 관리합니다:\n\
+                         · SMA200 반대 크로스 → 청산 후 반대 진입\n\
+                         · 봉 마감이 SMA25 반대편 → 손절\n\
+                         · 수익 잠금 (+5%부터 계단식)\n\
+                         · 오늘 손익·손실 한도 계산에 포함\n\
+                         직접 걸어 둔 TP/SL 주문은 그대로 남습니다.",
+                        adopt_summary(&preview)
+                    ),
+                    kb!(("✅ 관리 맡기기", "bm:confirm_adopt")),
+                )
+            }
+            "confirm_adopt" => {
+                let result = match self
+                    .engine_call("adopt_position", json!({"apply": true}))
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => return (Self::engine_error_text(&e), kb!()),
+                };
+                let text = if result.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                    format!("🤝 관리 시작: {}", adopt_summary(&result))
+                } else {
+                    format!("🤝 {}", adopt_error_text(&result))
+                };
+                let status = self.format_status().await;
+                let state_now = self.load_state_or_empty().await;
+                let cfg_now = self.config().await;
+                (
+                    format!("{text}\n\n{status}"),
+                    self.build_keyboard(&cfg_now, None, Some(&state_now)),
+                )
+            }
             "reentry_clear" => {
                 let released = match self.engine_call("clear_reentry", json!({})).await {
                     Ok(Value::Array(list)) => list

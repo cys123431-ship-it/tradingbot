@@ -842,3 +842,18 @@ async fn reentry_clear_button_releases_the_wait() {
     let (text, _) = press(&ctx, "reentry_clear").await;
     assert!(text.contains("대기 중인 코인이 없습니다"), "{text}");
 }
+
+#[tokio::test]
+async fn adopt_button_only_in_live_and_refuses_without_a_position() {
+    let tmp = common::temp_dir("bm_adopt");
+    let ctx = controller(&tmp);
+    let (_, markup) = press(&ctx, "status").await;
+    assert!(!callbacks(&markup).contains(&"bm:adopt".to_string()));
+    press(&ctx, "confirm_live").await;
+    assert_eq!(ctx.section()["trading_mode"], json!("LIVE"));
+    let (_, markup) = press(&ctx, "status").await;
+    assert!(callbacks(&markup).contains(&"bm:adopt".to_string()));
+    let (text, markup) = press(&ctx, "adopt").await;
+    assert!(text.contains("열린 포지션이 없습니다"), "{text}");
+    assert!(!callbacks(&markup).contains(&"bm:confirm_adopt".to_string()));
+}

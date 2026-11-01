@@ -1151,6 +1151,220 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         Ok(released)
     }
 
+    /// Hand a manually opened LIVE position to the strategy. It is recorded
+    /// as a strategy trade (`entry_type` MANUAL) and managed by the usual
+    /// rules: SMA200 reversal, SMA25 stop, profit lock, emergency stop if on.
+    /// `apply=false` only previews. Refuses unless the strategy holds nothing
+    /// and the account has exactly one position.
+    pub async fn adopt_position(&self, apply: bool) -> Result<Value, ServiceError> {
+        let _guard = self.cycle_lock().lock().await;
+        let cfg = self.config();
+        let mode = self.mode(Some(&cfg));
+        let refuse = |reason: &str, detail: String| {
+            Ok(json!({"ok": false, "reason": reason, "detail": detail}))
+        };
+        if mode != crate::strategy::config_base::TRADING_MODE_LIVE {
+            return refuse("NOT_LIVE", String::new());
+        }
+        let Some(network) = self.current_network(Some(&cfg)) else {
+            return refuse("EXCHANGE_MODE_UNSUPPORTED", String::new());
+        };
+        let mut state = self.load_state(&network, &mode)?;
+        if py_truthy(state.get("trade")) {
+            return refuse("STRATEGY_POSITION_EXISTS", String::new());
+        }
+        let phase = state
+            .get("phase")
+            .and_then(|v| v.as_str())
+            .unwrap_or(IDLE)
+            .to_string();
+        if phase != IDLE
+            || py_truthy(state.get("pending_entry"))
+            || py_truthy(state.get("pending_reverse_entry"))
+        {
+            return refuse("BUSY", phase);
+        }
+        let positions = match self.fetch_account_positions(&network).await {
+            Ok(p) => p,
+            Err(err) => return refuse("POSITION_STATE_UNCERTAIN", err.message),
+        };
+        if positions.is_empty() {
+            return refuse("NO_POSITION", String::new());
+        }
+        if positions.len() > 1 {
+            let held = positions
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{} {}",
+                        py_string(p.get("symbol").unwrap_or(&Value::Null)),
+                        crate::strategy::service::position_side(Some(p))
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return refuse("MULTIPLE_POSITIONS", held);
+        }
+        let pos = &positions[0];
+        let side = crate::strategy::service::position_side(Some(pos));
+        let qty = crate::strategy::service::position_qty(Some(pos));
+        let entry = crate::strategy::service::position_entry(Some(pos));
+        let ccxt_symbol = pos
+            .get("symbol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let market = crate::strategy::service::market_key(Some(&ccxt_symbol));
+        if side.is_empty() || qty <= 0.0 || entry <= 0.0 || market.is_empty() {
+            return refuse("POSITION_UNREADABLE", ccxt_symbol);
+        }
+        let leverage = self.position_leverage(&network, &market, pos, &cfg).await;
+        let mut cfg_lev = cfg.clone();
+        if let Some(obj) = cfg_lev.as_object_mut() {
+            obj.insert("leverage".to_string(), json!(leverage));
+        }
+
+        // Where the coin stands now, so the user sees what the next bar does.
+        let mut warnings = Vec::new();
+        let current = self
+            .cross_signal(&network, &cfg, &ccxt_symbol, &market)
+            .await;
+        let bar = match &current {
+            Ok(sig) => {
+                let trend = sig.get("trend_side").and_then(|v| v.as_str()).unwrap_or("");
+                if !trend.is_empty() && trend != side {
+                    warnings.push(format!(
+                        "SMA{} 기준 추세가 {trend}라 다음 봉 마감에 청산 후 {trend} 진입할 수 있습니다",
+                        int_or_zero(cfg.get("slow_period"))
+                    ));
+                }
+                if let (Some(close), Some(stop)) =
+                    (as_f64(sig.get("close")), as_f64(sig.get("sma_stop")))
+                {
+                    if crate::core::sma_cross::beyond_stop_ma(&side, close, stop) {
+                        warnings.push(format!(
+                            "종가 {close}가 SMA25 {stop:.6} 반대편이라 다음 봉 마감에 SMA25 손절될 수 있습니다"
+                        ));
+                    }
+                }
+                int_or_zero(sig.get("bar_open_ms"))
+            }
+            Err(err) => {
+                warnings.push(format!("시세를 읽지 못했습니다: {}", err.message));
+                self.latest_closed_bar(&cfg)
+            }
+        };
+        let preview = json!({
+            "ok": true,
+            "market_id": market,
+            "side": side,
+            "quantity": qty,
+            "entry_price": entry,
+            "leverage": leverage,
+            "margin": entry * qty / leverage as f64,
+            "warnings": warnings,
+        });
+        if !apply {
+            return Ok(preview);
+        }
+
+        let rules = self.trading_rules(&network, &cfg_lev, &market).await?;
+        let now = self.now_ms();
+        let signal = json!({
+            "ccxt_symbol": ccxt_symbol,
+            "market_id": market,
+            "side": side,
+            "signal_id": format!("adopt:{market}:{now}"),
+            "bar_open_ms": bar,
+            "entry_type": "MANUAL",
+        });
+        let qty_dec = Decimal::from_f64_retain(qty)
+            .unwrap_or(Decimal::ZERO)
+            .normalize();
+        let trade_id = format!("adopt-{market}-{now}");
+        let mut trade = self
+            .new_trade(
+                &network,
+                &mode,
+                &signal,
+                &json!({}),
+                &Map::new(),
+                &trade_id,
+                &format_f64(entry),
+                qty_dec,
+                now,
+                &rules,
+                &cfg_lev,
+            )
+            .await?;
+        trade.insert("adopted".to_string(), Value::Bool(true));
+        {
+            let ledger = self.ledger(&network)?;
+            let l = ledger.lock().unwrap();
+            l.upsert_trade(&trade)
+                .map_err(|e| ServiceError::new("StoreError", e.to_string()))?;
+            let mut fields = Map::new();
+            fields.insert("network".to_string(), Value::String(network.clone()));
+            fields.insert("market_id".to_string(), Value::String(market.clone()));
+            fields.insert("side".to_string(), Value::String(side.clone()));
+            fields.insert("quantity".to_string(), json!(qty));
+            fields.insert("entry_price".to_string(), json!(entry));
+            fields.insert("leverage".to_string(), json!(leverage));
+            l.event("ADOPT", fields);
+        }
+        // The current bar was seen at adoption; act from the next close on.
+        if bar != 0 {
+            state.insert("last_evaluated_bar".to_string(), json!(bar));
+        }
+        self.set_phase(
+            &network,
+            &mode,
+            &mut state,
+            crate::strategy::service::ENTRY_FILLED,
+            Map::from_iter([("trade".to_string(), Value::Object(trade))]),
+        )?;
+        let attached = self
+            .attach_protection(&network, &cfg_lev, &mut state)
+            .await?;
+        let mut out = preview;
+        out["attached"] = attached;
+        Ok(out)
+    }
+
+    /// Leverage of a live position: the parsed row, else positionRisk v2,
+    /// else notional / initial margin, else the configured leverage.
+    async fn position_leverage(
+        &self,
+        network: &str,
+        market: &str,
+        pos: &Value,
+        cfg: &Value,
+    ) -> i64 {
+        let lev = py_f(pos.get("leverage"), 0.0);
+        if lev >= 1.0 {
+            return lev.round() as i64;
+        }
+        if let Ok(exchange) = self.exchange(network).await {
+            if let Ok(rows) = exchange.position_risk_v2_raw(market).await {
+                let row = rows.as_array().and_then(|a| {
+                    a.iter()
+                        .find(|r| r.get("symbol").and_then(|v| v.as_str()) == Some(market))
+                });
+                let lev = py_f(row.and_then(|r| r.get("leverage")), 0.0);
+                if lev >= 1.0 {
+                    return lev.round() as i64;
+                }
+            }
+        }
+        let info = pos.get("info");
+        let notional = py_f(info.and_then(|i| i.get("notional")), 0.0).abs();
+        let initial = py_f(info.and_then(|i| i.get("initialMargin")), 0.0);
+        if notional > 0.0 && initial > 0.0 {
+            return ((notional / initial).round() as i64).max(1);
+        }
+        int_or_zero(cfg.get("leverage")).max(1)
+    }
+
     pub fn reentry_wait_lines(&self, cfg: &Value, state: &Map<String, Value>) -> Vec<String> {
         let mut lines = Vec::new();
         let latest = json!({"bar_open_ms": self.latest_closed_bar(cfg)});
